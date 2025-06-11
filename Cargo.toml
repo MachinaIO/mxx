@@ -7,3 +7,4 @@ edition = "2024"
 openfhe = { git = "https://github.com/MachinaIO/openfhe-rs.git", branch = "exp/reimpl_trapdoor" }
 num-bigint = "0.4"
 num-traits = "0.2.19"
+rayon = { version = "1.5" }

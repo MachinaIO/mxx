@@ -38,5 +38,5 @@ Arithmetic circuits that can be evaluated homomorphically through arithmetic gat
 ## License
 
 <sup>
-Licensed under the [MIT license](LICENSE).
+Licensed under the [MIT license](./LICENSE).
 </sup>

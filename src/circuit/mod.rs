@@ -1,7 +1,7 @@
 pub mod evaluable;
 pub mod gate;
 pub mod serde;
-pub mod utils;
+
 pub use evaluable::*;
 pub use gate::{PolyGate, PolyGateType};
 

@@ -221,15 +221,15 @@ impl Poly for DCRTPoly {
                     .collect::<Vec<_>>();
 
                 // Create a polynomial from these digit values
-                let poly_from_digits = DCRTPoly::from_coeffs(
+                
+
+                DCRTPoly::from_coeffs(
                     params,
                     &digit_values
                         .par_iter()
                         .map(|value| FinRingElem::new(value.clone(), params.modulus()))
                         .collect::<Vec<_>>(),
-                );
-
-                poly_from_digits
+                )
             })
             .collect()
     }

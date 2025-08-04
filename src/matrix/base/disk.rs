@@ -52,7 +52,7 @@ impl<T: MatrixElem> BaseMatrix<T> {
                 let aligned_offset = raw_offset - (raw_offset % page_size);
                 let offset_adjustment = raw_offset - aligned_offset;
                 let required_size = offset_adjustment + entry_size * cols.len();
-                let mapping_size = if required_size % page_size == 0 {
+                let mapping_size = if required_size.is_multiple_of(page_size) {
                     required_size
                 } else {
                     ((required_size / page_size) + 1) * page_size
@@ -301,7 +301,7 @@ impl<T: MatrixElem> BaseMatrix<T> {
                 other.block_entries(row_offsets, col_offsets)
             };
             new_matrix.replace_entries(0..self.nrow, col_acc..col_acc + other.ncol, other_f);
-            debug_mem(format!("the {}-th other replaced in concat_columns", idx));
+            debug_mem(format!("the {idx}-th other replaced in concat_columns"));
             col_acc += other.ncol;
         }
         debug_assert_eq!(col_acc, updated_ncol);
@@ -335,7 +335,7 @@ impl<T: MatrixElem> BaseMatrix<T> {
                 other.block_entries(row_offsets, col_offsets)
             };
             new_matrix.replace_entries(row_acc..row_acc + other.nrow, 0..self.ncol, other_f);
-            debug_mem(format!("the {}-th other replaced in concat_rows", idx));
+            debug_mem(format!("the {idx}-th other replaced in concat_rows"));
             row_acc += other.nrow;
         }
         debug_assert_eq!(row_acc, updated_nrow);
@@ -367,7 +367,7 @@ impl<T: MatrixElem> BaseMatrix<T> {
                 col_acc..col_acc + other.ncol,
                 other_f,
             );
-            debug_mem(format!("the {}-th other replaced in concat_diag", idx));
+            debug_mem(format!("the {idx}-th other replaced in concat_diag"));
             row_acc += other.nrow;
             col_acc += other.ncol;
         }
@@ -416,14 +416,14 @@ impl<T: MatrixElem> BaseMatrix<T> {
 
 impl<T: MatrixElem> Debug for BaseMatrix<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let fmt = f
+        
+        f
             .debug_struct("BaseMatrix")
             .field("params", &self.params)
             .field("nrow", &self.nrow)
             .field("ncol", &self.ncol)
             .field("file", &self.file)
-            .finish();
-        fmt
+            .finish()
     }
 }
 

@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [features]
-default = ["disk"]
+default = ["debug"]
 debug = []
 disk = ["libc", "memmap2"]
 

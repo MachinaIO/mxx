@@ -54,10 +54,7 @@ impl PolyMatrix for DCRTPolyMatrix {
         let mut matrix = Self::new_empty(params, nrow, ncol);
         let vec = &vec;
         let f = |row_offsets: Range<usize>, col_offsets: Range<usize>| -> Vec<Vec<Self::P>> {
-            row_offsets
-                .into_iter()
-                .map(|i| vec[i][col_offsets.clone()].to_vec())
-                .collect()
+            row_offsets.into_iter().map(|i| vec[i][col_offsets.clone()].to_vec()).collect()
         };
         matrix.replace_entries(0..nrow, 0..ncol, f);
         matrix
@@ -143,9 +140,7 @@ impl PolyMatrix for DCRTPolyMatrix {
                     let i = idx / log_base_q;
                     let k = idx % log_base_q;
 
-                    parallel_iter!(0..ncol)
-                        .map(|j| decomposed_entries[i][j][k].clone())
-                        .collect()
+                    parallel_iter!(0..ncol).map(|j| decomposed_entries[i][j][k].clone()).collect()
                 })
                 .collect()
         };
@@ -204,10 +199,7 @@ impl PolyMatrix for DCRTPolyMatrix {
     fn get_column_matrix_decompose(&self, j: usize) -> Self {
         Self::from_poly_vec(
             &self.params,
-            self.get_column(j)
-                .into_iter()
-                .map(|poly| vec![poly])
-                .collect(),
+            self.get_column(j).into_iter().map(|poly| vec![poly]).collect(),
         )
         .decompose()
     }
@@ -235,9 +227,7 @@ impl PolyMatrix for DCRTPolyMatrix {
             file.read_to_end(&mut buffer)
                 .unwrap_or_else(|_| panic!("Failed to read matrix file {path:?}"));
             let entries_bytes: Vec<Vec<Vec<u8>>> =
-                bincode::decode_from_slice(&buffer, bincode::config::standard())
-                    .unwrap()
-                    .0;
+                bincode::decode_from_slice(&buffer, bincode::config::standard()).unwrap().0;
             parallel_iter!(0..row_range.len())
                 .map(|i| {
                     parallel_iter!(0..col_range.len())
@@ -328,12 +318,7 @@ impl DCRTPolyMatrix {
         );
         for i in 0..nrow {
             for j in 0..ncol {
-                SetMatrixElement(
-                    matrix_ptr.as_mut().unwrap(),
-                    i,
-                    j,
-                    self.entry(i, j).get_poly(),
-                );
+                SetMatrixElement(matrix_ptr.as_mut().unwrap(), i, j, self.entry(i, j).get_poly());
             }
         }
         CppMatrix::new(&self.params, matrix_ptr)
@@ -343,11 +328,7 @@ impl DCRTPolyMatrix {
         let nrow = cpp_matrix.nrow();
         let ncol = cpp_matrix.ncol();
         let matrix_inner = parallel_iter!(0..nrow)
-            .map(|i| {
-                parallel_iter!(0..ncol)
-                    .map(|j| cpp_matrix.entry(i, j))
-                    .collect::<Vec<_>>()
-            })
+            .map(|i| parallel_iter!(0..ncol).map(|j| cpp_matrix.entry(i, j)).collect::<Vec<_>>())
             .collect::<Vec<_>>();
 
         DCRTPolyMatrix::from_poly_vec(params, matrix_inner)
@@ -368,9 +349,7 @@ impl DCRTPolyMatrix {
     fn dcrt_decompose_poly(&self, poly: &DCRTPoly, base_bits: u32) -> Vec<DCRTPoly> {
         let decomposed = poly.get_poly().Decompose(base_bits);
         let cpp_decomposed = CppMatrix::new(&self.params, decomposed);
-        parallel_iter!(0..cpp_decomposed.ncol())
-            .map(|idx| cpp_decomposed.entry(0, idx))
-            .collect()
+        parallel_iter!(0..cpp_decomposed.ncol()).map(|idx| cpp_decomposed.entry(0, idx)).collect()
     }
 }
 
@@ -493,21 +472,12 @@ mod tests {
 
         // Create a 2x2 matrix with values at (0,0) and (1,1)
         let matrix_vec = vec![
-            vec![
-                DCRTPoly::from_usize_to_constant(&params, value),
-                DCRTPoly::const_zero(&params),
-            ],
-            vec![
-                DCRTPoly::const_zero(&params),
-                DCRTPoly::from_usize_to_constant(&params, value),
-            ],
+            vec![DCRTPoly::from_usize_to_constant(&params, value), DCRTPoly::const_zero(&params)],
+            vec![DCRTPoly::const_zero(&params), DCRTPoly::from_usize_to_constant(&params, value)],
         ];
 
         let matrix1 = DCRTPolyMatrix::from_poly_vec(&params, matrix_vec);
-        assert_eq!(
-            matrix1.entry(0, 0).coeffs()[0].value(),
-            &BigUint::from(value)
-        );
+        assert_eq!(matrix1.entry(0, 0).coeffs()[0].value(), &BigUint::from(value));
         let matrix2 = matrix1.clone();
         assert_eq!(matrix1, matrix2);
 
@@ -535,10 +505,7 @@ mod tests {
 
         // Create first matrix with value at (0,0)
         let matrix1_vec = vec![
-            vec![
-                DCRTPoly::from_elem_to_constant(&params, &value),
-                DCRTPoly::const_zero(&params),
-            ],
+            vec![DCRTPoly::from_elem_to_constant(&params, &value), DCRTPoly::const_zero(&params)],
             vec![DCRTPoly::const_zero(&params), DCRTPoly::const_zero(&params)],
         ];
 
@@ -547,10 +514,7 @@ mod tests {
         // Create second matrix with value at (1,1)
         let matrix2_vec = vec![
             vec![DCRTPoly::const_zero(&params), DCRTPoly::const_zero(&params)],
-            vec![
-                DCRTPoly::const_zero(&params),
-                DCRTPoly::from_elem_to_constant(&params, &value),
-            ],
+            vec![DCRTPoly::const_zero(&params), DCRTPoly::from_elem_to_constant(&params, &value)],
         ];
 
         let matrix2 = DCRTPolyMatrix::from_poly_vec(&params, matrix2_vec);
@@ -584,10 +548,7 @@ mod tests {
 
         // Create first matrix with value at (0,0)
         let matrix1_vec = vec![
-            vec![
-                DCRTPoly::from_elem_to_constant(&params, &value),
-                DCRTPoly::const_zero(&params),
-            ],
+            vec![DCRTPoly::from_elem_to_constant(&params, &value), DCRTPoly::const_zero(&params)],
             vec![DCRTPoly::const_zero(&params), DCRTPoly::const_zero(&params)],
         ];
 
@@ -595,10 +556,7 @@ mod tests {
 
         // Create second matrix with value at (0,0)
         let matrix2_vec = vec![
-            vec![
-                DCRTPoly::from_elem_to_constant(&params, &value),
-                DCRTPoly::const_zero(&params),
-            ],
+            vec![DCRTPoly::from_elem_to_constant(&params, &value), DCRTPoly::const_zero(&params)],
             vec![DCRTPoly::const_zero(&params), DCRTPoly::const_zero(&params)],
         ];
 

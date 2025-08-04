@@ -29,12 +29,7 @@ where
     /// # Returns
     /// A new public key sampler
     pub fn new(hash_key: [u8; 32], d: usize) -> Self {
-        Self {
-            hash_key,
-            d,
-            _k: PhantomData,
-            _s: PhantomData,
-        }
+        Self { hash_key, d, _k: PhantomData, _s: PhantomData }
     }
 
     /// Sample a public key matrix
@@ -65,11 +60,7 @@ where
         );
         parallel_iter!(0..packed_input_size)
             .map(|idx| {
-                let reveal_plaintext = if idx == 0 {
-                    true
-                } else {
-                    reveal_plaintexts[idx - 1]
-                };
+                let reveal_plaintext = if idx == 0 { true } else { reveal_plaintexts[idx - 1] };
                 BggPublicKey::new(
                     all_matrix.slice_columns(columns * idx, columns * (idx + 1)),
                     reveal_plaintext,
@@ -114,11 +105,7 @@ where
         let mut secrets = secrets.to_vec();
         secrets.push(minus_one_poly);
         let secret_vec = S::M::from_poly_vec_row(params, secrets);
-        Self {
-            secret_vec,
-            error_sampler,
-            gauss_sigma,
-        }
+        Self { secret_vec, error_sampler, gauss_sigma }
     }
 
     /// This extend the given plaintexts +1 and insert constant 1 polynomial plaintext
@@ -132,29 +119,20 @@ where
         let secret_vec = &self.secret_vec;
         let log_base_q = params.modulus_digits();
         let packed_input_size = 1 + plaintexts.len(); // first slot is allocated to the constant 1 polynomial plaintext
-        let plaintexts: Vec<<S::M as PolyMatrix>::P> = [
-            &[<<S as PolyUniformSampler>::M as PolyMatrix>::P::const_one(
-                params,
-            )],
-            plaintexts,
-        ]
-        .concat();
+        let plaintexts: Vec<<S::M as PolyMatrix>::P> =
+            [&[<<S as PolyUniformSampler>::M as PolyMatrix>::P::const_one(params)], plaintexts]
+                .concat();
         let secret_vec_size = self.secret_vec.col_size();
         let columns = secret_vec_size * log_base_q * packed_input_size;
         let error: S::M = self.error_sampler.sample_uniform(
             params,
             1,
             columns,
-            DistType::GaussDist {
-                sigma: self.gauss_sigma,
-            },
+            DistType::GaussDist { sigma: self.gauss_sigma },
         );
-        let all_public_key_matrix: S::M = public_keys[0].matrix.concat_columns(
-            &public_keys[1..]
-                .par_iter()
-                .map(|pk| &pk.matrix)
-                .collect::<Vec<_>>(),
-        );
+        let all_public_key_matrix: S::M = public_keys[0]
+            .matrix
+            .concat_columns(&public_keys[1..].par_iter().map(|pk| &pk.matrix).collect::<Vec<_>>());
         let first_term = secret_vec.clone() * all_public_key_matrix;
 
         let gadget = S::M::gadget_matrix(params, secret_vec_size);
@@ -237,10 +215,7 @@ mod tests {
                 let multiplication = a.clone() * b.clone();
                 assert_eq!(multiplication.matrix.row_size(), d + 1);
                 assert_eq!(multiplication.matrix.col_size(), columns);
-                assert_eq!(
-                    multiplication.matrix,
-                    (a.matrix.clone() * b.matrix.decompose().clone())
-                )
+                assert_eq!(multiplication.matrix, (a.matrix.clone() * b.matrix.decompose().clone()))
             }
         }
     }
@@ -266,15 +241,15 @@ mod tests {
         assert_eq!(bgg_encodings.len(), packed_input_size + 1);
         assert_eq!(
             bgg_encodings[0].vector,
-            bgg_sampler.secret_vec.clone() * bgg_encodings[0].pubkey.matrix.clone()
-                - bgg_sampler.secret_vec.clone()
-                    * (g.clone() * bgg_encodings[0].plaintext.clone().unwrap())
+            bgg_sampler.secret_vec.clone() * bgg_encodings[0].pubkey.matrix.clone() -
+                bgg_sampler.secret_vec.clone() *
+                    (g.clone() * bgg_encodings[0].plaintext.clone().unwrap())
         );
         assert_eq!(
             bgg_encodings[1].vector,
-            bgg_sampler.secret_vec.clone() * bgg_encodings[1].pubkey.matrix.clone()
-                - bgg_sampler.secret_vec.clone()
-                    * (g * bgg_encodings[1].plaintext.clone().unwrap())
+            bgg_sampler.secret_vec.clone() * bgg_encodings[1].pubkey.matrix.clone() -
+                bgg_sampler.secret_vec.clone() *
+                    (g * bgg_encodings[1].plaintext.clone().unwrap())
         )
     }
 
@@ -308,8 +283,8 @@ mod tests {
                 assert_eq!(addition.vector, a.clone().vector + b.clone().vector);
                 assert_eq!(
                     addition.vector,
-                    bgg_sampler.secret_vec.clone()
-                        * (addition.pubkey.matrix - (g * addition.plaintext.unwrap()))
+                    bgg_sampler.secret_vec.clone() *
+                        (addition.pubkey.matrix - (g * addition.plaintext.unwrap()))
                 )
             }
         }
@@ -343,8 +318,8 @@ mod tests {
                 let g = DCRTPolyMatrix::gadget_matrix(&params, d + 1);
                 assert_eq!(
                     multiplication.vector,
-                    (bgg_sampler.secret_vec.clone()
-                        * (multiplication.pubkey.matrix - (g * multiplication.plaintext.unwrap())))
+                    (bgg_sampler.secret_vec.clone() *
+                        (multiplication.pubkey.matrix - (g * multiplication.plaintext.unwrap())))
                 )
             }
         }

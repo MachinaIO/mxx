@@ -29,19 +29,14 @@ pub fn init_storage_system() {
 
 /// Wait for all pending writes to complete
 pub async fn wait_for_all_writes() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let handles = WRITE_HANDLES
-        .get()
-        .ok_or("Storage system not initialized")?;
+    let handles = WRITE_HANDLES.get().ok_or("Storage system not initialized")?;
 
     let handles_vec: Vec<JoinHandle<()>> = {
         let mut guard = handles.lock().unwrap();
         std::mem::take(guard.as_mut())
     };
 
-    log_mem(format!(
-        "Waiting for {} pending writes to complete",
-        handles_vec.len()
-    ));
+    log_mem(format!("Waiting for {} pending writes to complete", handles_vec.len()));
 
     for handle in handles_vec {
         if let Err(e) = handle.await {
@@ -74,16 +69,8 @@ where
         id, block_size_val, row_range.start, row_range.end, col_range.start, col_range.end
     );
     let elapsed = start.elapsed();
-    log_mem(format!(
-        "Serialized matrix {} len {} bytes in {elapsed:?}",
-        id,
-        data.len()
-    ));
-    SerializedMatrix {
-        id: id.to_string(),
-        filename,
-        data,
-    }
+    log_mem(format!("Serialized matrix {} len {} bytes in {elapsed:?}", id, data.len()));
+    SerializedMatrix { id: id.to_string(), filename, data }
 }
 
 /// CPU preprocessing (blocking) + background I/O (non-blocking)

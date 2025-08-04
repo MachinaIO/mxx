@@ -21,12 +21,7 @@ pub struct BaseMatrix<T: MatrixElem> {
 impl<T: MatrixElem> BaseMatrix<T> {
     pub fn new_empty(params: &T::Params, nrow: usize, ncol: usize) -> Self {
         let inner = vec![vec![T::zero(params); ncol]; nrow];
-        Self {
-            params: params.clone(),
-            inner,
-            nrow,
-            ncol,
-        }
+        Self { params: params.clone(), inner, nrow, ncol }
     }
 
     pub fn entry_size(&self) -> usize {
@@ -49,12 +44,9 @@ impl<T: MatrixElem> BaseMatrix<T> {
         let polys = f(rows.clone(), cols.clone());
         debug_assert_eq!(polys.len(), rows.len());
         debug_assert_eq!(polys[0].len(), cols.len());
-        self.inner[rows.start..rows.end]
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(i, row_data)| {
-                row_data[cols.start..cols.end].clone_from_slice(&polys[i]);
-            });
+        self.inner[rows.start..rows.end].par_iter_mut().enumerate().for_each(|(i, row_data)| {
+            row_data[cols.start..cols.end].clone_from_slice(&polys[i]);
+        });
     }
 
     pub fn replace_entries_diag<F>(&mut self, diags: Range<usize>, f: F)
@@ -64,12 +56,9 @@ impl<T: MatrixElem> BaseMatrix<T> {
         let polys = f(diags.clone());
         debug_assert_eq!(polys.len(), diags.len());
         debug_assert_eq!(polys[0].len(), diags.len());
-        self.inner[diags.start..diags.end]
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(i, row_data)| {
-                row_data[diags.start..diags.end].clone_from_slice(&polys[i]);
-            });
+        self.inner[diags.start..diags.end].par_iter_mut().enumerate().for_each(|(i, row_data)| {
+            row_data[diags.start..diags.end].clone_from_slice(&polys[i]);
+        });
     }
 
     pub fn replace_entries_with_expand<F>(
@@ -102,10 +91,7 @@ impl<T: MatrixElem> BaseMatrix<T> {
     }
 
     pub fn get_column(&self, j: usize) -> Vec<T> {
-        self.block_entries(0..self.nrow, j..j + 1)
-            .iter()
-            .map(|row| row[0].clone())
-            .collect()
+        self.block_entries(0..self.nrow, j..j + 1).iter().map(|row| row[0].clone()).collect()
     }
 
     pub fn size(&self) -> (usize, usize) {
@@ -132,12 +118,7 @@ impl<T: MatrixElem> BaseMatrix<T> {
             })
             .collect();
 
-        Self {
-            inner,
-            params: self.params.clone(),
-            nrow,
-            ncol,
-        }
+        Self { inner, params: self.params.clone(), nrow, ncol }
     }
 
     pub fn zero(params: &T::Params, nrow: usize, ncol: usize) -> Self {
@@ -154,23 +135,12 @@ impl<T: MatrixElem> BaseMatrix<T> {
             .map(|i| {
                 (0..size)
                     .into_par_iter()
-                    .map(|j| {
-                        if i == j {
-                            scalar.clone()
-                        } else {
-                            zero_elem.clone()
-                        }
-                    })
+                    .map(|j| if i == j { scalar.clone() } else { zero_elem.clone() })
                     .collect()
             })
             .collect();
 
-        Self {
-            inner,
-            params: params.clone(),
-            nrow,
-            ncol,
-        }
+        Self { inner, params: params.clone(), nrow, ncol }
     }
 
     pub fn transpose(&self) -> Self {
@@ -179,19 +149,11 @@ impl<T: MatrixElem> BaseMatrix<T> {
         let inner: Vec<Vec<T>> = (0..self.ncol)
             .into_par_iter()
             .map(|i| {
-                (0..self.nrow)
-                    .into_par_iter()
-                    .map(|j| self.inner[j][i].clone())
-                    .collect::<Vec<T>>()
+                (0..self.nrow).into_par_iter().map(|j| self.inner[j][i].clone()).collect::<Vec<T>>()
             })
             .collect();
 
-        Self {
-            inner,
-            params: self.params.clone(),
-            nrow,
-            ncol,
-        }
+        Self { inner, params: self.params.clone(), nrow, ncol }
     }
 
     // (m * n1), (m * n2) -> (m * (n1 + n2))
@@ -217,12 +179,7 @@ impl<T: MatrixElem> BaseMatrix<T> {
             })
             .collect();
 
-        Self {
-            inner: result,
-            params: self.params.clone(),
-            nrow: self.nrow,
-            ncol,
-        }
+        Self { inner: result, params: self.params.clone(), nrow: self.nrow, ncol }
     }
 
     // (m1 * n), (m2 * n) -> ((m1 + m2) * n)
@@ -255,12 +212,7 @@ impl<T: MatrixElem> BaseMatrix<T> {
             }
         }
 
-        Self {
-            inner: result,
-            params: self.params.clone(),
-            nrow,
-            ncol: self.ncol,
-        }
+        Self { inner: result, params: self.params.clone(), nrow, ncol: self.ncol }
     }
 
     // (m1 * n1), (m2 * n2) -> ((m1 + m2) * (n1 + n2))
@@ -300,21 +252,15 @@ impl<T: MatrixElem> BaseMatrix<T> {
             col_offset += other.ncol;
         }
 
-        Self {
-            inner: result,
-            params: self.params.clone(),
-            nrow,
-            ncol,
-        }
+        Self { inner: result, params: self.params.clone(), nrow, ncol }
     }
 
     pub fn tensor(&self, other: &Self) -> Self {
         let nrow_total = self.nrow * other.nrow;
         let ncol_total = self.ncol * other.ncol;
 
-        let index_pairs: Vec<(usize, usize)> = (0..self.nrow)
-            .flat_map(|i1| (0..other.nrow).map(move |i2| (i1, i2)))
-            .collect();
+        let index_pairs: Vec<(usize, usize)> =
+            (0..self.nrow).flat_map(|i1| (0..other.nrow).map(move |i2| (i1, i2))).collect();
 
         let result: Vec<Vec<T>> = index_pairs
             .into_par_iter()
@@ -329,12 +275,7 @@ impl<T: MatrixElem> BaseMatrix<T> {
             })
             .collect();
 
-        Self {
-            params: self.params.clone(),
-            inner: result,
-            nrow: nrow_total,
-            ncol: ncol_total,
-        }
+        Self { params: self.params.clone(), inner: result, nrow: nrow_total, ncol: ncol_total }
     }
 
     #[inline]
@@ -361,10 +302,10 @@ impl<T: MatrixElem> Debug for BaseMatrix<T> {
 
 impl<T: MatrixElem> PartialEq for BaseMatrix<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.inner == other.inner
-            && self.params == other.params
-            && self.nrow == other.nrow
-            && self.ncol == other.ncol
+        self.inner == other.inner &&
+            self.params == other.params &&
+            self.nrow == other.nrow &&
+            self.ncol == other.ncol
     }
 }
 
@@ -580,22 +521,14 @@ pub fn block_offsets_distinct_block_sizes(
     for _ in 0..num_blocks_row {
         let last_row_offset = row_offsets.last().unwrap();
         let sub = rows.end - last_row_offset;
-        let len = if sub < row_block_size {
-            sub
-        } else {
-            row_block_size
-        };
+        let len = if sub < row_block_size { sub } else { row_block_size };
         row_offsets.push(last_row_offset + len);
     }
     let mut col_offsets = vec![cols.start];
     for _ in 0..num_blocks_col {
         let last_col_offset = col_offsets.last().unwrap();
         let sub = cols.end - last_col_offset;
-        let len = if sub < col_block_size {
-            sub
-        } else {
-            col_block_size
-        };
+        let len = if sub < col_block_size { sub } else { col_block_size };
         col_offsets.push(last_col_offset + len);
     }
     (row_offsets, col_offsets)
@@ -606,9 +539,7 @@ fn add_block_matrices<T: MatrixElem>(lhs: Vec<Vec<T>>, rhs: &[Vec<T>]) -> Vec<Ve
     let ncol = lhs[0].len();
     parallel_iter!(0..nrow)
         .map(|i| {
-            parallel_iter!(0..ncol)
-                .map(|j| lhs[i][j].clone() + &rhs[i][j])
-                .collect::<Vec<T>>()
+            parallel_iter!(0..ncol).map(|j| lhs[i][j].clone() + &rhs[i][j]).collect::<Vec<T>>()
         })
         .collect::<Vec<Vec<T>>>()
 }
@@ -618,9 +549,7 @@ fn sub_block_matrices<T: MatrixElem>(lhs: Vec<Vec<T>>, rhs: &[Vec<T>]) -> Vec<Ve
     let ncol = lhs[0].len();
     parallel_iter!(0..nrow)
         .map(|i| {
-            parallel_iter!(0..ncol)
-                .map(|j| lhs[i][j].clone() - &rhs[i][j])
-                .collect::<Vec<T>>()
+            parallel_iter!(0..ncol).map(|j| lhs[i][j].clone() - &rhs[i][j]).collect::<Vec<T>>()
         })
         .collect::<Vec<Vec<T>>>()
 }

@@ -27,10 +27,10 @@ pub struct PolyCircuit<P: Poly> {
 
 impl<P: Poly> PartialEq for PolyCircuit<P> {
     fn eq(&self, other: &Self) -> bool {
-        self.gates == other.gates
-            && self.sub_circuits == other.sub_circuits
-            && self.output_ids == other.output_ids
-            && self.num_input == other.num_input
+        self.gates == other.gates &&
+            self.sub_circuits == other.sub_circuits &&
+            self.output_ids == other.output_ids &&
+            self.num_input == other.num_input
     }
 }
 
@@ -83,12 +83,10 @@ impl<P: Poly> PolyCircuit<P> {
     pub fn input(&mut self, num_input: usize) -> Vec<usize> {
         #[cfg(debug_assertions)]
         assert_eq!(self.num_input, 0);
-        self.gates
-            .insert(0, PolyGate::new(0, PolyGateType::Input, vec![])); // input gate at index 0 reserved for constant 1 polynomial
+        self.gates.insert(0, PolyGate::new(0, PolyGateType::Input, vec![])); // input gate at index 0 reserved for constant 1 polynomial
         let mut input_gates = Vec::with_capacity(num_input);
         for idx in 1..(num_input + 1) {
-            self.gates
-                .insert(idx, PolyGate::new(idx, PolyGateType::Input, vec![]));
+            self.gates.insert(idx, PolyGate::new(idx, PolyGateType::Input, vec![]));
             input_gates.push(idx);
         }
         self.num_input = num_input;
@@ -185,12 +183,7 @@ impl<P: Poly> PolyCircuit<P> {
     }
 
     pub fn const_digits_poly(&mut self, digits: &[u32]) -> usize {
-        self.new_gate_generic(
-            vec![],
-            PolyGateType::Const {
-                digits: digits.to_vec(),
-            },
-        )
+        self.new_gate_generic(vec![], PolyGateType::Const { digits: digits.to_vec() })
     }
 
     pub fn public_lookup_gate(&mut self, input: usize, lookup_id: usize) -> usize {
@@ -208,8 +201,7 @@ impl<P: Poly> PolyCircuit<P> {
             }
         }
         let gate_id = self.gates.len();
-        self.gates
-            .insert(gate_id, PolyGate::new(gate_id, gate_type, inputs));
+        self.gates.insert(gate_id, PolyGate::new(gate_id, gate_type, inputs));
         gate_id
     }
 
@@ -264,8 +256,8 @@ impl<P: Poly> PolyCircuit<P> {
                 .iter()
                 .map(|id| *gate_levels.get(id).expect("input gate not found"))
                 .max()
-                .expect("max level not found")
-                + 1;
+                .expect("max level not found") +
+                1;
             gate_levels.insert(gate_id, level);
             if levels.len() <= level {
                 levels.resize(level + 1, vec![]);
@@ -324,42 +316,30 @@ impl<P: Poly> PolyCircuit<P> {
                     PolyGateType::Const { digits } => E::from_digits(params, one, digits),
                     PolyGateType::Add => {
                         debug_mem("Add gate start");
-                        let left = wires
-                            .get(&gate.input_gates[0])
-                            .expect("wire missing for Add")
-                            .clone();
-                        let right = wires
-                            .get(&gate.input_gates[1])
-                            .expect("wire missing for Add")
-                            .clone();
+                        let left =
+                            wires.get(&gate.input_gates[0]).expect("wire missing for Add").clone();
+                        let right =
+                            wires.get(&gate.input_gates[1]).expect("wire missing for Add").clone();
                         let result = left + right;
                         debug_mem("Add gate end");
                         result
                     }
                     PolyGateType::Sub => {
                         debug_mem("Sub gate start");
-                        let left = wires
-                            .get(&gate.input_gates[0])
-                            .expect("wire missing for Sub")
-                            .clone();
-                        let right = wires
-                            .get(&gate.input_gates[1])
-                            .expect("wire missing for Sub")
-                            .clone();
+                        let left =
+                            wires.get(&gate.input_gates[0]).expect("wire missing for Sub").clone();
+                        let right =
+                            wires.get(&gate.input_gates[1]).expect("wire missing for Sub").clone();
                         let result = left - right;
                         debug_mem("Sub gate end");
                         result
                     }
                     PolyGateType::Mul => {
                         debug_mem("Mul gate start");
-                        let left = wires
-                            .get(&gate.input_gates[0])
-                            .expect("wire missing for Mul")
-                            .clone();
-                        let right = wires
-                            .get(&gate.input_gates[1])
-                            .expect("wire missing for Mul")
-                            .clone();
+                        let left =
+                            wires.get(&gate.input_gates[0]).expect("wire missing for Mul").clone();
+                        let right =
+                            wires.get(&gate.input_gates[1]).expect("wire missing for Mul").clone();
                         let result = left * right;
                         debug_mem("Mul gate end");
                         result
@@ -383,11 +363,8 @@ impl<P: Poly> PolyCircuit<P> {
                             .get(&gate.input_gates[0])
                             .expect("wire missing for Public Lookup")
                             .clone();
-                        let lookup = self
-                            .lookups
-                            .get(lookup_id)
-                            .expect("lookup table missing")
-                            .as_ref();
+                        let lookup =
+                            self.lookups.get(lookup_id).expect("lookup table missing").as_ref();
                         let result = plt_evaluator
                             .as_ref()
                             .expect("public lookup evaluator missing")
@@ -474,11 +451,8 @@ impl<P: Poly> PolyCircuit<P> {
                 }
             }
             if all_inputs_inlined {
-                let main_inputs: Vec<usize> = gate
-                    .input_gates
-                    .iter()
-                    .map(|input_id| gate_map[input_id])
-                    .collect();
+                let main_inputs: Vec<usize> =
+                    gate.input_gates.iter().map(|input_id| gate_map[input_id]).collect();
                 let main_gate_id = self.new_gate_generic(main_inputs, gate.gate_type.clone());
                 gate_map.insert(current_gate_id, main_gate_id);
                 stack.pop();
@@ -786,9 +760,9 @@ mod tests {
         );
 
         // Expected result: (((poly1 + poly2) * (poly3 * poly4)) + (poly1 - poly3))^2
-        let expected = (((poly1.clone() + poly2.clone()) * (poly3.clone() * poly4.clone()))
-            + (poly1.clone() - poly3.clone()))
-            * (((poly1.clone() + poly2) * (poly3.clone() * poly4)) + (poly1 - poly3));
+        let expected = (((poly1.clone() + poly2.clone()) * (poly3.clone() * poly4.clone())) +
+            (poly1.clone() - poly3.clone())) *
+            (((poly1.clone() + poly2) * (poly3.clone() * poly4)) + (poly1 - poly3));
 
         // Verify the result
         assert_eq!(result.len(), 1);
@@ -910,8 +884,8 @@ mod tests {
             &[poly1.clone(), poly2.clone()],
             None::<PolyPltEvaluator>,
         );
-        let expected = (poly1.clone() + poly2.clone())
-            - (DCRTPoly::from_usize_to_constant(&params, 2) * poly1 * poly2);
+        let expected = (poly1.clone() + poly2.clone()) -
+            (DCRTPoly::from_usize_to_constant(&params, 2) * poly1 * poly2);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].coeffs(), expected.coeffs());
     }
@@ -931,9 +905,9 @@ mod tests {
             &[poly1.clone(), poly2.clone()],
             None::<PolyPltEvaluator>,
         );
-        let expected = DCRTPoly::const_one(&params)
-            - ((poly1.clone() + poly2.clone())
-                - (DCRTPoly::from_usize_to_constant(&params, 2) * poly1 * poly2));
+        let expected = DCRTPoly::const_one(&params) -
+            ((poly1.clone() + poly2.clone()) -
+                (DCRTPoly::from_usize_to_constant(&params, 2) * poly1 * poly2));
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].coeffs(), expected.coeffs());
     }
@@ -982,12 +956,8 @@ mod tests {
 
         // concatenate decomposed_c0 and decomposed_c1 and x
         let input = [a_bits, b_bits, vec![x.clone()]].concat();
-        let result = circuit.eval(
-            &params,
-            &DCRTPoly::const_one(&params),
-            &input,
-            None::<PolyPltEvaluator>,
-        );
+        let result =
+            circuit.eval(&params, &DCRTPoly::const_one(&params), &input, None::<PolyPltEvaluator>);
 
         assert_eq!(result.len(), log_q * 2);
 
@@ -1105,10 +1075,8 @@ mod tests {
         let middle_circuit_id = main_circuit.register_sub_circuit(middle_circuit);
 
         // Call the middle circuit with all inputs
-        let middle_outputs = main_circuit.call_sub_circuit(
-            middle_circuit_id,
-            &[main_inputs[0], main_inputs[1], main_inputs[2]],
-        );
+        let middle_outputs = main_circuit
+            .call_sub_circuit(middle_circuit_id, &[main_inputs[0], main_inputs[1], main_inputs[2]]);
 
         let scalar_mul_gate = main_circuit.mul_gate(middle_outputs[0], middle_outputs[0]);
 

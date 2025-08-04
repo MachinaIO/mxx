@@ -81,9 +81,7 @@ impl DCRTTrapdoor {
             );
             let vecs = parallel_iter!(0..n * dk)
                 .map(|i| {
-                    dgg_vectors
-                        .slice(i * padded_ncol, (i + 1) * padded_ncol, 0, 1)
-                        .transpose()
+                    dgg_vectors.slice(i * padded_ncol, (i + 1) * padded_ncol, 0, 1).transpose()
                 })
                 .collect::<Vec<_>>();
             vecs[0].concat_rows(&vecs[1..].iter().collect::<Vec<_>>())
@@ -150,9 +148,7 @@ fn sample_p1_for_pert_mat(
     let p1_mat_blocks = parallel_iter!(0..num_blocks)
         .map(|i| {
             let end_col = min((i + 1) * block_size, padded_ncol);
-            let mut tp2 = tp2
-                .slice_columns(i * block_size, end_col)
-                .to_cpp_matrix_ptr();
+            let mut tp2 = tp2.slice_columns(i * block_size, end_col).to_cpp_matrix_ptr();
             FormatMatrixCoefficient(tp2.inner.as_mut().unwrap());
             let tp2_arc = Arc::new(tp2);
             debug_mem("tp2 is converted to cpp matrices");

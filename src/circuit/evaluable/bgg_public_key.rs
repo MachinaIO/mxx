@@ -15,36 +15,22 @@ impl<M: PolyMatrix> Evaluable for BggPublicKey<M> {
     type P = M::P;
 
     fn rotate(self, params: &Self::Params, shift: usize) -> Self {
-        debug_mem(format!(
-            "BGGPublicKey::rotate {:?}, {:?}",
-            self.matrix.size(),
-            shift
-        ));
+        debug_mem(format!("BGGPublicKey::rotate {:?}, {:?}", self.matrix.size(), shift));
         let rotate_poly = <M::P>::const_rotate_poly(params, shift);
         debug_mem("BGGPublicKey::rotate rotate_poly");
         let matrix = self.matrix.clone() * rotate_poly;
         debug_mem("BGGPublicKey::rotate matrix multiplied");
-        Self {
-            matrix,
-            reveal_plaintext: self.reveal_plaintext,
-        }
+        Self { matrix, reveal_plaintext: self.reveal_plaintext }
     }
 
     fn from_digits(params: &Self::Params, one: &Self, digits: &[u32]) -> Self {
-        debug_mem(format!(
-            "BGGPublicKey::from_digits {:?}, {:?}",
-            one.matrix.size(),
-            digits.len()
-        ));
+        debug_mem(format!("BGGPublicKey::from_digits {:?}, {:?}", one.matrix.size(), digits.len()));
         let const_poly =
             <M::P as Evaluable>::from_digits(params, &<M::P>::const_one(params), digits);
         debug_mem("BGGPublicKey::from_digits const_poly");
         let matrix = one.matrix.clone() * const_poly;
         debug_mem("BGGPublicKey::from_digits matrix multiplied");
-        Self {
-            matrix,
-            reveal_plaintext: one.reveal_plaintext,
-        }
+        Self { matrix, reveal_plaintext: one.reveal_plaintext }
     }
 }
 
@@ -92,10 +78,7 @@ where
             id,
             &self.dir_path,
         );
-        BggPublicKey {
-            matrix: a_lt,
-            reveal_plaintext: true,
-        }
+        BggPublicKey { matrix: a_lt, reveal_plaintext: true }
     }
 }
 

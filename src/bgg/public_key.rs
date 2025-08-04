@@ -10,15 +10,11 @@ pub struct BggPublicKey<M: PolyMatrix> {
 
 impl<M: PolyMatrix> BggPublicKey<M> {
     pub fn new(matrix: M, reveal_plaintext: bool) -> Self {
-        Self {
-            matrix,
-            reveal_plaintext,
-        }
+        Self { matrix, reveal_plaintext }
     }
 
     pub fn concat_matrix(&self, others: &[Self]) -> M {
-        self.matrix
-            .concat_columns(&others.par_iter().map(|x| &x.matrix).collect::<Vec<_>>()[..])
+        self.matrix.concat_columns(&others.par_iter().map(|x| &x.matrix).collect::<Vec<_>>()[..])
     }
 
     /// Reads a public of given rows and cols with id from files under the given directory.
@@ -31,10 +27,7 @@ impl<M: PolyMatrix> BggPublicKey<M> {
         reveal_plaintext: bool,
     ) -> Self {
         let matrix = M::read_from_files(params, nrow, ncol, dir_path, id);
-        Self {
-            matrix,
-            reveal_plaintext,
-        }
+        Self { matrix, reveal_plaintext }
     }
 }
 
@@ -49,10 +42,7 @@ impl<M: PolyMatrix> Add<&Self> for BggPublicKey<M> {
     type Output = Self;
     fn add(self, other: &Self) -> Self {
         let reveal_plaintext = self.reveal_plaintext & other.reveal_plaintext;
-        Self {
-            matrix: self.matrix + &other.matrix,
-            reveal_plaintext,
-        }
+        Self { matrix: self.matrix + &other.matrix, reveal_plaintext }
     }
 }
 
@@ -67,10 +57,7 @@ impl<M: PolyMatrix> Sub<&Self> for BggPublicKey<M> {
     type Output = Self;
     fn sub(self, other: &Self) -> Self {
         let reveal_plaintext = self.reveal_plaintext & other.reveal_plaintext;
-        Self {
-            matrix: self.matrix - &other.matrix,
-            reveal_plaintext,
-        }
+        Self { matrix: self.matrix - &other.matrix, reveal_plaintext }
     }
 }
 
@@ -84,20 +71,13 @@ impl<M: PolyMatrix> Mul for BggPublicKey<M> {
 impl<M: PolyMatrix> Mul<&Self> for BggPublicKey<M> {
     type Output = Self;
     fn mul(self, other: &Self) -> Self {
-        debug_mem(format!(
-            "BGGPublicKey::mul {:?}, {:?}",
-            self.matrix.size(),
-            other.matrix.size()
-        ));
+        debug_mem(format!("BGGPublicKey::mul {:?}, {:?}", self.matrix.size(), other.matrix.size()));
         let decomposed = other.matrix.decompose();
         debug_mem("BGGPublicKey::mul decomposed");
         let matrix = self.matrix * decomposed;
         debug_mem("BGGPublicKey::mul matrix multiplied");
         let reveal_plaintext = self.reveal_plaintext & other.reveal_plaintext;
         debug_mem("BGGPublicKey::mul reveal_plaintext");
-        Self {
-            matrix,
-            reveal_plaintext,
-        }
+        Self { matrix, reveal_plaintext }
     }
 }

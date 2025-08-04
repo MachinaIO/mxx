@@ -31,12 +31,7 @@ impl<T: MatrixElem> BaseMatrix<T> {
         let path = file.path().to_path_buf();
         let file = file.persist(path).expect("failed to persist file");
         file.set_len(len as u64).expect("failed to set file length");
-        Self {
-            params: params.clone(),
-            file,
-            nrow,
-            ncol,
-        }
+        Self { params: params.clone(), file, nrow, ncol }
     }
 
     pub fn entry_size(&self) -> usize {
@@ -198,10 +193,7 @@ impl<T: MatrixElem> BaseMatrix<T> {
     }
 
     pub fn get_column(&self, j: usize) -> Vec<T> {
-        self.block_entries(0..self.nrow, j..j + 1)
-            .iter()
-            .map(|row| row[0].clone())
-            .collect()
+        self.block_entries(0..self.nrow, j..j + 1).iter().map(|row| row[0].clone()).collect()
     }
 
     pub fn size(&self) -> (usize, usize) {
@@ -240,13 +232,7 @@ impl<T: MatrixElem> BaseMatrix<T> {
             (0..len)
                 .map(|i| {
                     (0..len)
-                        .map(|j| {
-                            if i == j {
-                                scalar.clone()
-                            } else {
-                                T::zero(params)
-                            }
-                        })
+                        .map(|j| if i == j { scalar.clone() } else { T::zero(params) })
                         .collect()
                 })
                 .collect()
@@ -396,10 +382,10 @@ impl<T: MatrixElem> BaseMatrix<T> {
                                 // overlapped among threads
                                 unsafe {
                                     new_matrix.replace_block_entries(
-                                        i * sub_matrix.nrow + *cur_block_row_idx
-                                            ..i * sub_matrix.nrow + *next_block_row_idx,
-                                        j * sub_matrix.ncol + *cur_block_col_idx
-                                            ..j * sub_matrix.ncol + *next_block_col_idx,
+                                        i * sub_matrix.nrow + *cur_block_row_idx..
+                                            i * sub_matrix.nrow + *next_block_row_idx,
+                                        j * sub_matrix.ncol + *cur_block_col_idx..
+                                            j * sub_matrix.ncol + *next_block_col_idx,
                                         sub_block_polys,
                                     );
                                 }
@@ -416,9 +402,7 @@ impl<T: MatrixElem> BaseMatrix<T> {
 
 impl<T: MatrixElem> Debug for BaseMatrix<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        
-        f
-            .debug_struct("BaseMatrix")
+        f.debug_struct("BaseMatrix")
             .field("params", &self.params)
             .field("nrow", &self.nrow)
             .field("ncol", &self.ncol)
@@ -642,11 +626,7 @@ impl<T: MatrixElem> Mul<&T> for &BaseMatrix<T> {
         let f = |row_offsets: Range<usize>, col_offsets: Range<usize>| -> Vec<Vec<T>> {
             self.block_entries(row_offsets, col_offsets)
                 .into_par_iter()
-                .map(|row| {
-                    row.into_par_iter()
-                        .map(|elem| elem * rhs)
-                        .collect::<Vec<T>>()
-                })
+                .map(|row| row.into_par_iter().map(|elem| elem * rhs).collect::<Vec<T>>())
                 .collect::<Vec<Vec<T>>>()
         };
         new_matrix.replace_entries(0..self.nrow, 0..self.ncol, f);
@@ -718,22 +698,14 @@ pub fn block_offsets_distinct_block_sizes(
     for _ in 0..num_blocks_row {
         let last_row_offset = row_offsets.last().unwrap();
         let sub = rows.end - last_row_offset;
-        let len = if sub < row_block_size {
-            sub
-        } else {
-            row_block_size
-        };
+        let len = if sub < row_block_size { sub } else { row_block_size };
         row_offsets.push(last_row_offset + len);
     }
     let mut col_offsets = vec![cols.start];
     for _ in 0..num_blocks_col {
         let last_col_offset = col_offsets.last().unwrap();
         let sub = cols.end - last_col_offset;
-        let len = if sub < col_block_size {
-            sub
-        } else {
-            col_block_size
-        };
+        let len = if sub < col_block_size { sub } else { col_block_size };
         col_offsets.push(last_col_offset + len);
     }
     (row_offsets, col_offsets)
@@ -744,9 +716,7 @@ fn add_block_matrices<T: MatrixElem>(lhs: Vec<Vec<T>>, rhs: &[Vec<T>]) -> Vec<Ve
     let ncol = lhs[0].len();
     parallel_iter!(0..nrow)
         .map(|i| {
-            parallel_iter!(0..ncol)
-                .map(|j| lhs[i][j].clone() + &rhs[i][j])
-                .collect::<Vec<T>>()
+            parallel_iter!(0..ncol).map(|j| lhs[i][j].clone() + &rhs[i][j]).collect::<Vec<T>>()
         })
         .collect::<Vec<Vec<T>>>()
 }
@@ -756,9 +726,7 @@ fn sub_block_matrices<T: MatrixElem>(lhs: Vec<Vec<T>>, rhs: &[Vec<T>]) -> Vec<Ve
     let ncol = lhs[0].len();
     parallel_iter!(0..nrow)
         .map(|i| {
-            parallel_iter!(0..ncol)
-                .map(|j| lhs[i][j].clone() - &rhs[i][j])
-                .collect::<Vec<T>>()
+            parallel_iter!(0..ncol).map(|j| lhs[i][j].clone() - &rhs[i][j]).collect::<Vec<T>>()
         })
         .collect::<Vec<Vec<T>>>()
 }

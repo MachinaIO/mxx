@@ -7,34 +7,20 @@ pub struct PolyGate {
 
 impl PolyGate {
     pub fn new(gate_id: usize, gate_type: PolyGateType, input_gates: Vec<usize>) -> Self {
-        Self {
-            gate_id,
-            gate_type,
-            input_gates,
-        }
+        Self { gate_id, gate_type, input_gates }
     }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum PolyGateType {
     Input,
-    Const {
-        digits: Vec<u32>,
-    },
+    Const { digits: Vec<u32> },
     Add,
     Sub,
     Mul,
-    Rotate {
-        shift: usize,
-    },
-    Call {
-        circuit_id: usize,
-        num_input: usize,
-        output_id: usize,
-    },
-    PubLut {
-        lookup_id: usize,
-    },
+    Rotate { shift: usize },
+    Call { circuit_id: usize, num_input: usize, output_id: usize },
+    PubLut { lookup_id: usize },
 }
 
 impl PolyGateType {

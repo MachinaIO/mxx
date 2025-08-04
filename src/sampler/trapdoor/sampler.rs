@@ -68,11 +68,11 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
 
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
-        let s = SPECTRAL_CONSTANT
-            * (self.base as f64 + 1.0)
-            * SIGMA
-            * SIGMA
-            * (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+        let s = SPECTRAL_CONSTANT *
+            (self.base as f64 + 1.0) *
+            SIGMA *
+            SIGMA *
+            (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
         let dgg_large_std = (s * s - self.c * self.c).sqrt();
         let peikert = dgg_large_std < KARNEY_THRESHOLD;
         let (dgg_large_mean, dgg_large_table) = if dgg_large_std > KARNEY_THRESHOLD {
@@ -95,11 +95,8 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
             }
             (Some(m_a), Some(m_vals))
         };
-        let dgg_large_params = (
-            dgg_large_mean,
-            dgg_large_std,
-            dgg_large_table.as_ref().map(|v| &v[..]),
-        );
+        let dgg_large_params =
+            (dgg_large_mean, dgg_large_std, dgg_large_table.as_ref().map(|v| &v[..]));
         log_mem("preimage parameters computed");
         let p_hat = trapdoor.sample_pert_square_mat(
             s,
@@ -202,9 +199,7 @@ pub(crate) fn gauss_samp_gq_arb_base(
     // let mut matrix = I64Matrix::new_empty(&I64MatrixParams, k_res, n as usize);
     parallel_iter!(0..k_res_digits)
         .map(|i| {
-            parallel_iter!(0..n as usize)
-                .map(|j| result[i * n as usize + j])
-                .collect::<Vec<_>>()
+            parallel_iter!(0..n as usize).map(|j| result[i * n as usize + j]).collect::<Vec<_>>()
         })
         .collect::<Vec<_>>()
 }
@@ -271,10 +266,7 @@ mod test {
         for i in 0..public_matrix.row_size() {
             for j in 0..public_matrix.col_size() {
                 let poly = public_matrix.entry(i, j);
-                assert!(
-                    !poly.get_poly().is_null(),
-                    "Matrix entry should be a valid DCRTPoly"
-                );
+                assert!(!poly.get_poly().is_null(), "Matrix entry should be a valid DCRTPoly");
             }
         }
 
@@ -318,10 +310,7 @@ mod test {
 
         // public_matrix * preimage should be equal to target
         let product = public_matrix * &preimage;
-        assert_eq!(
-            product, target,
-            "Product of public matrix and preimage should equal target"
-        );
+        assert_eq!(product, target, "Product of public matrix and preimage should equal target");
     }
 
     #[test]
@@ -358,10 +347,7 @@ mod test {
         // public_matrix * preimage should be equal to target
         let product = public_matrix * &preimage;
 
-        assert_eq!(
-            product, target,
-            "Product of public matrix and preimage should equal target"
-        );
+        assert_eq!(product, target, "Product of public matrix and preimage should equal target");
     }
 
     #[test]
@@ -400,10 +386,7 @@ mod test {
         // public_matrix * preimage should be equal to target
         let product = public_matrix * &preimage;
 
-        assert_eq!(
-            product, target,
-            "Product of public matrix and preimage should equal target"
-        );
+        assert_eq!(product, target, "Product of public matrix and preimage should equal target");
     }
 
     #[test]
@@ -441,10 +424,7 @@ mod test {
         // public_matrix * preimage should be equal to target
         let product = public_matrix * &preimage;
 
-        assert_eq!(
-            product, target,
-            "Product of public matrix and preimage should equal target"
-        );
+        assert_eq!(product, target, "Product of public matrix and preimage should equal target");
     }
 
     #[test]
@@ -482,10 +462,7 @@ mod test {
         // public_matrix * preimage should be equal to target
         let product = public_matrix * &preimage;
 
-        assert_eq!(
-            product, target,
-            "Product of public matrix and preimage should equal target"
-        );
+        assert_eq!(product, target, "Product of public matrix and preimage should equal target");
     }
 
     #[test]
@@ -523,9 +500,6 @@ mod test {
         // public_matrix * preimage should be equal to target
         let product = public_matrix * &preimage;
 
-        assert_eq!(
-            product, target,
-            "Product of public matrix and preimage should equal target"
-        );
+        assert_eq!(product, target, "Product of public matrix and preimage should equal target");
     }
 }

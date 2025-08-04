@@ -18,16 +18,11 @@ impl<M: PolyMatrix> BggEncoding<M> {
         pubkey: BggPublicKey<M>,
         plaintext: Option<<M as PolyMatrix>::P>,
     ) -> Self {
-        Self {
-            vector,
-            pubkey,
-            plaintext,
-        }
+        Self { vector, pubkey, plaintext }
     }
 
     pub fn concat_vector(&self, others: &[Self]) -> M {
-        self.vector
-            .concat_columns(&others.par_iter().map(|x| &x.vector).collect::<Vec<_>>()[..])
+        self.vector.concat_columns(&others.par_iter().map(|x| &x.vector).collect::<Vec<_>>()[..])
     }
 
     /// Reads an encoding with id from files under the given directory.
@@ -56,20 +51,12 @@ impl<M: PolyMatrix> BggEncoding<M> {
 
         // If reveal_plaintext is true, read the plaintext
         let plaintext = if reveal_plaintext {
-            Some(M::P::read_from_file(
-                params,
-                &dir_path,
-                &format!("{id}_plaintext"),
-            ))
+            Some(M::P::read_from_file(params, &dir_path, &format!("{id}_plaintext")))
         } else {
             None
         };
 
-        Self {
-            vector,
-            pubkey,
-            plaintext,
-        }
+        Self { vector, pubkey, plaintext }
     }
 }
 
@@ -89,11 +76,7 @@ impl<M: PolyMatrix> Add<&Self> for BggEncoding<M> {
             (Some(a), Some(b)) => Some(a + b),
             _ => None,
         };
-        Self {
-            vector,
-            pubkey,
-            plaintext,
-        }
+        Self { vector, pubkey, plaintext }
     }
 }
 
@@ -113,11 +96,7 @@ impl<M: PolyMatrix> Sub<&Self> for BggEncoding<M> {
             (Some(a), Some(b)) => Some(a - b),
             _ => None,
         };
-        Self {
-            vector,
-            pubkey,
-            plaintext,
-        }
+        Self { vector, pubkey, plaintext }
     }
 }
 
@@ -147,11 +126,7 @@ impl<M: PolyMatrix> Mul<&Self> for BggEncoding<M> {
             matrix: self.pubkey.matrix * decomposed_b,
             reveal_plaintext: self.pubkey.reveal_plaintext & other.pubkey.reveal_plaintext,
         };
-        Self {
-            vector: new_vector,
-            pubkey: new_pubkey,
-            plaintext: new_plaintext,
-        }
+        Self { vector: new_vector, pubkey: new_pubkey, plaintext: new_plaintext }
     }
 }
 
@@ -620,8 +595,8 @@ impl<M: PolyMatrix> Mul<&Self> for BggEncoding<M> {
 //         let plaintexts = vec![DCRTPoly::from_usize_to_constant(&params, k)];
 
 //         // Create encoding sampler and encodings
-//         let bgg_encoding_sampler = BGGEncodingSampler::new(&params, &secrets, uniform_sampler, 0.0);
-//         let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &plaintexts);
+//         let bgg_encoding_sampler = BGGEncodingSampler::new(&params, &secrets, uniform_sampler,
+// 0.0);         let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &plaintexts);
 //         let enc_one = encodings[0].clone();
 //         let enc1 = encodings[1].clone();
 

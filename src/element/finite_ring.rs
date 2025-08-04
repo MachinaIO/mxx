@@ -22,10 +22,7 @@ impl FinRingElem {
             value % &modulus_bigint
         };
         let reduced_value = value.to_biguint().unwrap();
-        Self {
-            value: reduced_value,
-            modulus,
-        }
+        Self { value: reduced_value, modulus }
     }
 
     pub fn from_str(value: &str, modulus: &str) -> Result<Self, ParseBigIntError> {
@@ -55,10 +52,7 @@ impl FinRingElem {
     pub fn modulus_switch(&self, new_modulus: Arc<BigUint>) -> Self {
         let value =
             ((&self.value * new_modulus.as_ref()) / self.modulus.as_ref()) % new_modulus.as_ref();
-        Self {
-            value,
-            modulus: self.modulus.clone(),
-        }
+        Self { value, modulus: self.modulus.clone() }
     }
 }
 

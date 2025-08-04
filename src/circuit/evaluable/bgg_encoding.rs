@@ -20,15 +20,8 @@ impl<M: PolyMatrix> Evaluable for BggEncoding<M> {
         let rotate_poly = <M::P>::const_rotate_poly(params, shift);
         let vector = self.vector.clone() * &rotate_poly;
         let pubkey = self.pubkey.rotate(params, shift);
-        let plaintext = self
-            .plaintext
-            .clone()
-            .map(|plaintext| plaintext * rotate_poly);
-        Self {
-            vector,
-            pubkey,
-            plaintext,
-        }
+        let plaintext = self.plaintext.clone().map(|plaintext| plaintext * rotate_poly);
+        Self { vector, pubkey, plaintext }
     }
 
     fn from_digits(params: &Self::Params, one: &Self, digits: &[u32]) -> Self {
@@ -36,15 +29,8 @@ impl<M: PolyMatrix> Evaluable for BggEncoding<M> {
             <M::P as Evaluable>::from_digits(params, &<M::P>::const_one(params), digits);
         let vector = one.vector.clone() * &const_poly;
         let pubkey = BggPublicKey::from_digits(params, &one.pubkey, digits);
-        let plaintext = one
-            .plaintext
-            .clone()
-            .map(|plaintext| plaintext * const_poly);
-        Self {
-            vector,
-            pubkey,
-            plaintext,
-        }
+        let plaintext = one.plaintext.clone().map(|plaintext| plaintext * const_poly);
+        Self { vector, pubkey, plaintext }
     }
 }
 
@@ -72,9 +58,7 @@ where
         input: BggEncoding<M>,
         id: usize,
     ) -> BggEncoding<M> {
-        let z = &input
-            .plaintext
-            .expect("the BGG encoding should revealed plaintext");
+        let z = &input.plaintext.expect("the BGG encoding should revealed plaintext");
         info!("public lookup length is {}", plt.f.len());
         let (k, y_k) = plt
             .f
@@ -116,11 +100,6 @@ where
     SH: PolyHashSampler<[u8; 32], M = M>,
 {
     pub fn new(hash_key: [u8; 32], dir_path: PathBuf, p: M) -> Self {
-        Self {
-            hash_key,
-            dir_path,
-            p,
-            _marker: PhantomData,
-        }
+        Self { hash_key, dir_path, p, _marker: PhantomData }
     }
 }

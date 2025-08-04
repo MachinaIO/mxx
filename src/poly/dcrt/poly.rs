@@ -31,9 +31,7 @@ unsafe impl Sync for DCRTPoly {}
 
 impl DCRTPoly {
     pub fn new(ptr_poly: UniquePtr<DCRTPolyCxx>) -> Self {
-        Self {
-            ptr_poly: ptr_poly.into(),
-        }
+        Self { ptr_poly: ptr_poly.into() }
     }
 
     #[inline]
@@ -85,9 +83,7 @@ impl Poly for DCRTPoly {
         let parsed_values = parse_coefficients_bytes(&poly_encoding);
         let coeffs = parsed_values.coefficients;
         let modulus = parsed_values.modulus;
-        parallel_iter!(coeffs)
-            .map(|s| FinRingElem::new(s, Arc::new(modulus.clone())))
-            .collect()
+        parallel_iter!(coeffs).map(|s| FinRingElem::new(s, Arc::new(modulus.clone()))).collect()
     }
 
     #[inline]
@@ -166,10 +162,7 @@ impl Poly for DCRTPoly {
     /// `int` is limited as u64 or u32.
     fn from_usize_to_lsb(params: &Self::Params, int: usize) -> Self {
         let n = params.ring_dimension() as usize;
-        debug_assert!(
-            int < (1 << n),
-            "Input exceeds representable range for ring dimension"
-        );
+        debug_assert!(int < (1 << n), "Input exceeds representable range for ring dimension");
         let q = params.modulus();
         let one = FinRingElem::one(&q);
         let zero = FinRingElem::zero(&q);
@@ -221,7 +214,6 @@ impl Poly for DCRTPoly {
                     .collect::<Vec<_>>();
 
                 // Create a polynomial from these digit values
-                
 
                 DCRTPoly::from_coeffs(
                     params,
@@ -316,10 +308,8 @@ impl Poly for DCRTPoly {
     }
 
     fn from_bool_vec(params: &Self::Params, coeffs: &[bool]) -> Self {
-        let coeffs: Vec<_> = coeffs
-            .iter()
-            .map(|i| FinRingElem::constant(&params.modulus(), *i as u64))
-            .collect();
+        let coeffs: Vec<_> =
+            coeffs.iter().map(|i| FinRingElem::constant(&params.modulus(), *i as u64)).collect();
         DCRTPoly::from_coeffs(params, &coeffs)
     }
 }
@@ -509,11 +499,8 @@ fn reconstruct_single_coeff(
     let is_negative = (bit_vector[byte_idx] & (1 << bit_idx)) != 0;
 
     // Convert back from centered representation.
-    let final_value = if is_negative && !value.is_zero() {
-        modulus.as_ref() - &value
-    } else {
-        value
-    };
+    let final_value =
+        if is_negative && !value.is_zero() { modulus.as_ref() - &value } else { value };
 
     FinRingElem::new(final_value, modulus.clone())
 }
@@ -533,11 +520,8 @@ fn process_single_coeff(coeff: &FinRingElem) -> (bool, Vec<u8>) {
 
     if coeff_val > &q_half {
         let centered_value = coeff.modulus() - coeff_val;
-        let value_bytes = if centered_value.is_zero() {
-            Vec::new()
-        } else {
-            centered_value.to_bytes_le()
-        };
+        let value_bytes =
+            if centered_value.is_zero() { Vec::new() } else { centered_value.to_bytes_le() };
         (true, value_bytes)
     } else if coeff_val.is_zero() {
         (false, Vec::new())
@@ -634,17 +618,11 @@ mod tests {
 
         // 8. Make some assertions
         assert!(sum != poly1, "Sum should differ from original poly1");
-        assert!(
-            neg_poly2 != poly2,
-            "Negated polynomial should differ from original"
-        );
+        assert!(neg_poly2 != poly2, "Negated polynomial should differ from original");
         assert_eq!(difference + poly2, poly1, "p1 - p2 + p2 should be p1");
 
         assert_eq!(poly_add_assign, sum, "+= result should match separate +");
-        assert_eq!(
-            poly_mul_assign, product,
-            "*= result should match separate *"
-        );
+        assert_eq!(poly_mul_assign, product, "*= result should match separate *");
 
         // 9. Test from_const / const_zero / const_one
         let const_poly = DCRTPoly::from_usize_to_constant(&params, 123);
@@ -689,10 +667,7 @@ mod tests {
         // First four bytes contain `max_byte_size` (maximum byte size of any coefficient)
         // Since we're using BitDist, we expect max_byte_size to be equal to 1
         let max_byte_size = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-        assert_eq!(
-            max_byte_size, 1,
-            "Max byte size size should be 1 for BitDist"
-        );
+        assert_eq!(max_byte_size, 1, "Max byte size size should be 1 for BitDist");
 
         // Next ceil(n/8) bytes are the bit vector (1 bit per coefficient)
         let bit_vector_byte_size = ring_dimension.div_ceil(8);
@@ -700,20 +675,12 @@ mod tests {
         // Expected total size
         // 4 bytes for `max_byte_size` + bit_vector_byte_size + (ring_dimension * max_byte_size)
         let expected_total_size = 4 + bit_vector_byte_size + (ring_dimension * max_byte_size);
-        assert_eq!(
-            bytes.len(),
-            expected_total_size,
-            "Incorrect total byte size"
-        );
+        assert_eq!(bytes.len(), expected_total_size, "Incorrect total byte size");
 
         // Check that the structure is as expected
         // Verify bit vector section exists
         let bit_vector = &bytes[4..4 + bit_vector_byte_size];
-        assert_eq!(
-            bit_vector.len(),
-            bit_vector_byte_size,
-            "Bit vector size is incorrect"
-        );
+        assert_eq!(bit_vector.len(), bit_vector_byte_size, "Bit vector size is incorrect");
 
         // Verify coefficient values section exists
         let coeffs_section = &bytes[4 + bit_vector_byte_size..];
@@ -761,20 +728,12 @@ mod tests {
         // Expected total size
         // 4 bytes for `max_byte_size` + bit_vector_byte_size + (ring_dimension * max_byte_size)
         let expected_total_size = 4 + bit_vector_byte_size + (ring_dimension * max_byte_size);
-        assert_eq!(
-            bytes.len(),
-            expected_total_size,
-            "Incorrect total byte size"
-        );
+        assert_eq!(bytes.len(), expected_total_size, "Incorrect total byte size");
 
         // Check that the structure is as expected
         // Verify bit vector section exists
         let bit_vector = &bytes[4..4 + bit_vector_byte_size];
-        assert_eq!(
-            bit_vector.len(),
-            bit_vector_byte_size,
-            "Bit vector size is incorrect"
-        );
+        assert_eq!(bit_vector.len(), bit_vector_byte_size, "Bit vector size is incorrect");
 
         // Verify coefficient values section exists
         let coeffs_section = &bytes[4 + bit_vector_byte_size..];

@@ -18,10 +18,7 @@ unsafe impl Sync for CppMatrix {}
 
 impl CppMatrix {
     pub fn new(params: &DCRTPolyParams, inner: UniquePtr<Matrix>) -> Self {
-        CppMatrix {
-            params: params.clone(),
-            inner,
-        }
+        CppMatrix { params: params.clone(), inner }
     }
 
     pub(crate) fn nrow(&self) -> usize {

@@ -1,6 +1,6 @@
 use super::sampler::PolyUniformSampler;
-use crate::element::PolyElem;
 use crate::{
+    element::PolyElem,
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
     sampler::DistType,

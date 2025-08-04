@@ -87,14 +87,10 @@ impl<P: Poly> PublicLut<P> {
                     .map(|(x_k, (k, y_k))| {
                         let r_k =
                             uniform_sampler.sample_uniform(params, d + 1, m, DistType::FinRingDist);
-                        let target_k = (r_k.clone() * (*x_k).clone()) + a_lt
-                            - &(gadget.clone() * (*y_k).clone())
-                            - (a_z.clone() * r_k.decompose());
-                        (
-                            *k,
-                            r_k,
-                            trap_sampler.preimage(params, trapdoor, pub_matrix, &target_k),
-                        )
+                        let target_k = (r_k.clone() * (*x_k).clone()) + a_lt -
+                            &(gadget.clone() * (*y_k).clone()) -
+                            (a_z.clone() * r_k.decompose());
+                        (*k, r_k, trap_sampler.preimage(params, trapdoor, pub_matrix, &target_k))
                     })
                     .collect::<Vec<_>>()
             })

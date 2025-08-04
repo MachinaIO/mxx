@@ -10,6 +10,9 @@ debug = []
 disk = ["libc", "memmap2"]
 
 [dependencies]
+tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros"] }
+dashmap = "6.1.0"
+serde_json = "1.0"
 libc = { version = "0.2", optional = true }
 memmap2 = { version = "0.9.5", optional = true }
 openfhe = { git = "https://github.com/MachinaIO/openfhe-rs.git", branch = "exp/reimpl_trapdoor" }

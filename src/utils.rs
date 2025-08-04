@@ -1,5 +1,8 @@
 use memory_stats::memory_stats;
-use std::env;
+use std::{
+    env,
+    time::{Duration, Instant},
+};
 use tracing::{debug, info};
 
 use crate::{
@@ -103,4 +106,13 @@ pub fn create_random_poly(params: &DCRTPolyParams) -> DCRTPoly {
 pub fn create_bit_random_poly(params: &DCRTPolyParams) -> DCRTPoly {
     let sampler = DCRTPolyUniformSampler::new();
     sampler.sample_poly(params, &DistType::BitDist)
+}
+
+pub fn timed_read<T, F: FnOnce() -> T>(label: &str, f: F, total: &mut Duration) -> T {
+    let start = Instant::now();
+    let res = f();
+    let elapsed = start.elapsed();
+    *total += elapsed;
+    crate::utils::log_mem(format!("{label} loaded in {elapsed:?}"));
+    res
 }

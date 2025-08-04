@@ -1,9 +1,9 @@
+pub mod finite_ring;
+
 use std::{
     fmt::Debug,
     ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
 };
-
-pub mod fp;
 
 pub trait PolyElem:
     Sized
@@ -35,4 +35,5 @@ pub trait PolyElem:
     fn modulus(&self) -> &Self::Modulus;
     fn from_bytes(modulus: &Self::Modulus, bytes: &[u8]) -> Self;
     fn to_bytes(&self) -> Vec<u8>;
+    fn to_biguint(&self) -> &num_bigint::BigUint;
 }

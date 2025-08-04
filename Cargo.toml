@@ -2,9 +2,26 @@
 name = "mxx"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["debug"]
+debug = []
+disk = ["libc", "memmap2"]
 
 [dependencies]
+libc = { version = "0.2", optional = true }
+memmap2 = { version = "0.9.5", optional = true }
 openfhe = { git = "https://github.com/MachinaIO/openfhe-rs.git", branch = "exp/reimpl_trapdoor" }
 num-bigint = "0.4"
 num-traits = "0.2.19"
 rayon = { version = "1.5" }
+itertools = "0.14.0"
+serde = { version = "1.0", features = ["derive"] }
+rand = { version = "0.9.0", features = ["std_rng"] }
+bincode = "2.0.1"
+tracing = "0.1"
+memory-stats = "1.2.0"
+digest = "0.10"
+bitvec = "1"
+keccak-asm = { version = "0.1.4" }

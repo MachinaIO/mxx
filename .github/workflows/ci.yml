@@ -88,7 +88,7 @@ jobs:
     runs-on: ubuntu-latest
     if: always()
     needs:
-      - run-on-self-hosted
+      - run
       - fmt
     steps:
       - name: Decide whether the needed jobs succeeded or failed

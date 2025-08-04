@@ -2,6 +2,11 @@ use memory_stats::memory_stats;
 use std::env;
 use tracing::{debug, info};
 
+use crate::{
+    poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+    sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
+};
+
 /// ideal thread chunk size for parallel
 pub fn chunk_size_for(original: usize) -> usize {
     match original {
@@ -87,4 +92,15 @@ pub fn log_mem<T: Into<String>>(tag: T) {
     } else {
         info!("Couldn't get the current memory usage :(");
     }
+}
+
+// Helper function to create a random polynomial using UniformSampler
+pub fn create_random_poly(params: &DCRTPolyParams) -> DCRTPoly {
+    let sampler = DCRTPolyUniformSampler::new();
+    sampler.sample_poly(params, &DistType::FinRingDist)
+}
+
+pub fn create_bit_random_poly(params: &DCRTPolyParams) -> DCRTPoly {
+    let sampler = DCRTPolyUniformSampler::new();
+    sampler.sample_poly(params, &DistType::BitDist)
 }

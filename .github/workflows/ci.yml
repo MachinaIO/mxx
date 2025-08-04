@@ -28,7 +28,7 @@ jobs:
           components: rustfmt
       - run: cargo +nightly fmt --all --check
 
-  run-on-self-hosted:
+  run:
     runs-on: ubuntu-latest
     strategy:
         fail-fast: false

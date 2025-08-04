@@ -1,6 +1,6 @@
 use crate::{
+    matrix::{MatrixElem, MatrixParams},
     parallel_iter,
-    poly::{MatrixElem, MatrixParams},
     utils::{block_size, debug_mem},
 };
 use itertools::Itertools;

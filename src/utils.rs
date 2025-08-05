@@ -12,7 +12,10 @@ use crate::{
         sampler::{BGGEncodingSampler, BGGPublicKeySampler},
     },
     matrix::base::BaseMatrix,
-    poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+    poly::{
+        Poly,
+        dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+    },
     sampler::{
         DistType, PolyUniformSampler, hash::DCRTPolyHashSampler, uniform::DCRTPolyUniformSampler,
     },
@@ -112,6 +115,11 @@ pub fn create_random_poly(params: &DCRTPolyParams) -> DCRTPoly {
 pub fn create_bit_random_poly(params: &DCRTPolyParams) -> DCRTPoly {
     let sampler = DCRTPolyUniformSampler::new();
     sampler.sample_poly(params, &DistType::BitDist)
+}
+
+// Helper function to create a bit polynomial (0 or 1)
+pub fn create_bit_poly(params: &DCRTPolyParams, bit: bool) -> DCRTPoly {
+    if bit { DCRTPoly::const_one(params) } else { DCRTPoly::const_zero(params) }
 }
 
 pub fn random_bgg_encodings(

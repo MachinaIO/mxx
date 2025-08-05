@@ -41,10 +41,7 @@ impl NormBounds {
     pub fn from_norm_simulators(simulators: &[NormSimulator]) -> Self {
         let h_norms = simulators
             .iter()
-            .map(|simulator| {
-                
-                simulator.h_norm.0.iter().map(|coeff| coeff.to_string()).collect()
-            })
+            .map(|simulator| simulator.h_norm.0.iter().map(|coeff| coeff.to_string()).collect())
             .collect();
         Self { h_norms }
     }

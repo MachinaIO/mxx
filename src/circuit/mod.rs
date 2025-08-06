@@ -24,6 +24,7 @@ use crate::{
 #[derive(Debug, Clone, Default)]
 pub struct PolyCircuit<P: Poly> {
     gates: BTreeMap<GateId, PolyGate>,
+    print_value: BTreeMap<GateId, String>,
     sub_circuits: BTreeMap<usize, PolyCircuit<P>>,
     output_ids: Vec<GateId>,
     num_input: usize,
@@ -33,6 +34,7 @@ pub struct PolyCircuit<P: Poly> {
 impl<P: Poly> PartialEq for PolyCircuit<P> {
     fn eq(&self, other: &Self) -> bool {
         self.gates == other.gates &&
+            self.print_value == other.print_value &&
             self.sub_circuits == other.sub_circuits &&
             self.output_ids == other.output_ids &&
             self.num_input == other.num_input
@@ -45,6 +47,7 @@ impl<P: Poly> PolyCircuit<P> {
     pub fn new() -> Self {
         Self {
             gates: BTreeMap::new(),
+            print_value: BTreeMap::new(),
             sub_circuits: BTreeMap::new(),
             output_ids: vec![],
             num_input: 0,
@@ -85,6 +88,11 @@ impl<P: Poly> PolyCircuit<P> {
             sub.count_helper(counts);
         }
     }
+
+    pub fn print(&mut self, gate_id: GateId, prefix: String) {
+        self.print_value.insert(gate_id, prefix);
+    }
+
     pub fn input(&mut self, num_input: usize) -> Vec<GateId> {
         #[cfg(debug_assertions)]
         assert_eq!(self.num_input, 0);
@@ -303,7 +311,11 @@ impl<P: Poly> PolyCircuit<P> {
 
         wires.insert(GateId(0), one.clone());
         for (idx, input) in inputs.iter().enumerate() {
-            wires.insert(GateId(idx + 1), input.clone());
+            let id = GateId(idx + 1);
+            wires.insert(id, input.clone());
+            if let Some(prefix) = self.print_value.get(&id) {
+                debug_mem(format!("[{prefix}] Gate ID {id}, {:?}", input));
+            }
         }
         debug_mem("Input wires are set");
 
@@ -391,6 +403,9 @@ impl<P: Poly> PolyCircuit<P> {
                         result
                     }
                 };
+                if let Some(prefix) = self.print_value.get(&gate_id) {
+                    debug_mem(format!("[{prefix}] Gate ID {gate_id}, {:?}", result));
+                }
                 wires.insert(gate_id, result);
                 debug_mem(format!("Gate id {gate_id} finished"));
             });

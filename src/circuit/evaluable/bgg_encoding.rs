@@ -4,7 +4,7 @@ use tracing::info;
 
 use crate::{
     bgg::{encoding::BggEncoding, public_key::BggPublicKey},
-    circuit::{Evaluable, poly::PltEvaluator},
+    circuit::{Evaluable, gate::GateId, poly::PltEvaluator},
     lookup::public_lookup::PublicLut,
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
@@ -68,7 +68,7 @@ where
         params: &<BggEncoding<M> as Evaluable>::Params,
         plt: &PublicLut<<BggEncoding<M> as Evaluable>::P>,
         input: BggEncoding<M>,
-        id: usize,
+        id: GateId,
     ) -> BggEncoding<M> {
         let z = &input.plaintext.expect("the BGG encoding should revealed plaintext");
         info!("public lookup length is {}", plt.f.len());

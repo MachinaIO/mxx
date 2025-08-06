@@ -1,5 +1,5 @@
 use crate::{
-    circuit::{Evaluable, PolyCircuit, poly::PltEvaluator},
+    circuit::{Evaluable, PolyCircuit, gate::GateId, poly::PltEvaluator},
     element::PolyElem,
     impl_binop_with_refs,
     lookup::public_lookup::PublicLut,
@@ -130,7 +130,7 @@ impl PltEvaluator<NormSimulator> for NormPltEvaluator {
         _: &(),
         plt: &PublicLut<DCRTPoly>,
         input: NormSimulator,
-        _: usize,
+        _: GateId,
     ) -> NormSimulator {
         NormSimulator {
             // |c_z · r_k.decompose()| + c_lt_k

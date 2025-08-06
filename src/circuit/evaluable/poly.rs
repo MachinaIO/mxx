@@ -1,5 +1,5 @@
 use crate::{
-    circuit::evaluable::Evaluable,
+    circuit::{evaluable::Evaluable, gate::GateId},
     element::PolyElem,
     lookup::public_lookup::PublicLut,
     poly::{Poly, PolyParams},
@@ -36,13 +36,13 @@ impl<P: Poly> Evaluable for P {
 }
 
 pub trait PltEvaluator<E: Evaluable>: Send + Sync {
-    fn public_lookup(&self, params: &E::Params, plt: &PublicLut<E::P>, input: E, id: usize) -> E;
+    fn public_lookup(&self, params: &E::Params, plt: &PublicLut<E::P>, input: E, id: GateId) -> E;
 }
 
 #[derive(Debug, Clone)]
 pub struct PolyPltEvaluator {}
 impl<P: Poly> PltEvaluator<P> for PolyPltEvaluator {
-    fn public_lookup(&self, _: &P::Params, plt: &PublicLut<P>, input: P, _: usize) -> P {
+    fn public_lookup(&self, _: &P::Params, plt: &PublicLut<P>, input: P, _: GateId) -> P {
         plt.f.get(&input).expect("PolyPltEvaluator's public lookup cannot fetch y_k").1.clone()
     }
 }

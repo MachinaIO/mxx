@@ -1,7 +1,17 @@
 use num_bigint::BigUint;
+use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 
-pub type GateId = usize;
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct GateId(pub(crate) usize);
 
+impl Display for GateId {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolyGate {
     pub gate_id: GateId,

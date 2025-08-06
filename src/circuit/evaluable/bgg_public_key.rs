@@ -2,7 +2,7 @@ use std::{marker::PhantomData, path::PathBuf, sync::Arc};
 
 use crate::{
     bgg::public_key::BggPublicKey,
-    circuit::{Evaluable, poly::PltEvaluator},
+    circuit::{Evaluable, gate::GateId, poly::PltEvaluator},
     lookup::public_lookup::PublicLut,
     matrix::PolyMatrix,
     poly::Poly,
@@ -74,7 +74,7 @@ where
         params: &<BggPublicKey<M> as Evaluable>::Params,
         plt: &PublicLut<<BggPublicKey<M> as Evaluable>::P>,
         input: BggPublicKey<M>,
-        id: usize,
+        id: GateId,
     ) -> BggPublicKey<M> {
         let d = input.matrix.row_size() - 1;
         let a_lt = plt.derive_a_lt::<M, SH>(params, d, self.hash_key, id);

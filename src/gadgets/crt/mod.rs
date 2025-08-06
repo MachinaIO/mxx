@@ -172,7 +172,7 @@ mod tests {
         let base = 1u64 << LIMB_BIT_SIZE;
 
         // Create enough limbs for the largest modulus context
-        let (_, crt_bits, _crt_depth) = params.to_crt();
+        let (_, crt_bits, _) = params.to_crt();
         let num_limbs = crt_bits.div_ceil(LIMB_BIT_SIZE);
 
         for _ in 0..num_limbs {
@@ -248,7 +248,6 @@ mod tests {
         }
 
         let mut input_values = Vec::new();
-        let (_, crt_bits, _) = params.to_crt();
 
         for (i, _mont_ctx) in crt_ctx.mont_ctxes.iter().enumerate() {
             let val_a = values_a[i % values_a.len()];
@@ -359,7 +358,6 @@ mod tests {
         }
 
         let mut input_values = Vec::new();
-        let (_, crt_bits, _) = params.to_crt();
 
         for (i, _mont_ctx) in crt_ctx.mont_ctxes.iter().enumerate() {
             let val_a = values_a[i % values_a.len()];
@@ -476,7 +474,6 @@ mod tests {
         }
 
         let mut input_values = Vec::new();
-        let (_, crt_bits, _) = params.to_crt();
 
         for (i, _mont_ctx) in crt_ctx.mont_ctxes.iter().enumerate() {
             let val_a = values_a[i % values_a.len()];

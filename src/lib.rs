@@ -3,8 +3,8 @@
 
 pub mod bgg;
 pub mod circuit;
-pub mod crt;
 pub mod element;
+pub mod gadgets;
 pub mod lookup;
 pub mod matrix;
 pub mod poly;

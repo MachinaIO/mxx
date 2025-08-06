@@ -7,7 +7,7 @@ use num_bigint::BigUint;
 
 use crate::{
     circuit::{PolyCircuit, gate::GateId},
-    crt::poly::montgomery::{MontgomeryContext, MontgomeryPoly},
+    gadgets::crt::montgomery::{MontgomeryContext, MontgomeryPoly},
     poly::{Poly, PolyParams},
 };
 
@@ -142,8 +142,8 @@ mod tests {
     use super::*;
     use crate::{
         circuit::{gate::GateId, poly::PolyPltEvaluator},
-        crt::poly::bigunit::BigUintPoly,
         element::PolyElem,
+        gadgets::crt::bigunit::BigUintPoly,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
     use std::sync::Arc;

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     circuit::{PolyCircuit, gate::GateId},
-    crt::poly::bigunit::{BigUintPoly, BigUintPolyContext},
+    gadgets::crt::bigunit::{BigUintPoly, BigUintPolyContext},
     poly::Poly,
 };
 use num_bigint::BigUint;

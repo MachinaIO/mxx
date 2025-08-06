@@ -32,6 +32,18 @@ impl<M: PolyMatrix> Evaluable for BggEncoding<M> {
         let plaintext = one.plaintext.clone().map(|plaintext| plaintext * const_poly);
         Self { vector, pubkey, plaintext }
     }
+
+    fn large_scalar_mul(&self, params: &Self::Params, scalar: &[num_bigint::BigUint]) -> Self {
+        let scalar = Self::P::from_biguints(params, scalar);
+        let row_size = self.pubkey.matrix.row_size();
+        let scalar_gadget = M::gadget_matrix(params, row_size) * &scalar;
+        let decomposed = scalar_gadget.decompose();
+        let vector = self.vector.clone() * &decomposed;
+        let pubkey_matrix = self.pubkey.matrix.clone() * &decomposed;
+        let pubkey = BggPublicKey::new(pubkey_matrix, self.pubkey.reveal_plaintext);
+        let plaintext = self.plaintext.clone().map(|p| p * scalar);
+        Self { vector, pubkey, plaintext }
+    }
 }
 
 #[derive(Debug, Clone)]

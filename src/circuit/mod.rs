@@ -7,6 +7,7 @@ pub use evaluable::*;
 pub use gate::{PolyGate, PolyGateType};
 
 use dashmap::DashMap;
+use num_bigint::BigUint;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -179,6 +180,10 @@ impl<P: Poly> PolyCircuit<P> {
         self.new_gate_generic(vec![left_input, right_input], PolyGateType::Mul)
     }
 
+    pub fn large_scalar_mul(&mut self, input: usize, scalar: Vec<BigUint>) -> usize {
+        self.new_gate_generic(vec![input], PolyGateType::LargeScalarMul { scalar })
+    }
+
     pub fn rotate_gate(&mut self, input: usize, shift: usize) -> usize {
         self.new_gate_generic(vec![input], PolyGateType::Rotate { shift })
     }
@@ -345,6 +350,15 @@ impl<P: Poly> PolyCircuit<P> {
                         debug_mem("Mul gate end");
                         result
                     }
+                    PolyGateType::LargeScalarMul { scalar } => {
+                        let input = wires
+                            .get(&gate.input_gates[0])
+                            .expect("wire missing for LargeScalarMul")
+                            .clone();
+                        let result = input.large_scalar_mul(&params, &scalar);
+                        debug_mem("Large scalar mul gate end");
+                        result
+                    }
                     PolyGateType::Rotate { shift } => {
                         debug_mem("Rotate gate start");
                         let input = wires
@@ -468,6 +482,7 @@ mod tests {
     use super::*;
     use crate::{
         circuit::poly::PolyPltEvaluator,
+        element::PolyElem,
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
             Poly, PolyParams,

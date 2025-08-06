@@ -474,6 +474,7 @@ checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
 dependencies = [
  "num-integer",
  "num-traits",
+ "serde",
 ]
 
 [[package]]
@@ -512,7 +513,7 @@ checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 [[package]]
 name = "openfhe"
 version = "0.3.2"
-source = "git+https://github.com/MachinaIO/openfhe-rs.git?branch=exp%2Freimpl_trapdoor#17cb69e65dcaf66742673c3a2125807d102e58cd"
+source = "git+https://github.com/MachinaIO/openfhe-rs.git?branch=feat-crt-param#5baac44b7ad8b322679ea334770ac62989acd5e0"
 dependencies = [
  "cxx",
  "cxx-build",

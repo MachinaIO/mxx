@@ -2,6 +2,7 @@ use crate::{
     circuit::{PolyCircuit, gate::PolyGateType},
     poly::Poly,
 };
+use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::BTreeMap;
@@ -10,6 +11,7 @@ use std::collections::BTreeMap;
 pub enum SerializablePolyGateType {
     Input,
     Const { digits: Vec<u32> },
+    LargeScalarMul { scalar: Vec<BigUint> },
     Add,
     Sub,
     Mul,
@@ -22,7 +24,9 @@ impl SerializablePolyGateType {
     pub fn num_input(&self) -> usize {
         match self {
             SerializablePolyGateType::Input | SerializablePolyGateType::Const { .. } => 0,
-            SerializablePolyGateType::Rotate { .. } | SerializablePolyGateType::PubLut { .. } => 1,
+            SerializablePolyGateType::LargeScalarMul { .. } |
+            SerializablePolyGateType::Rotate { .. } |
+            SerializablePolyGateType::PubLut { .. } => 1,
             SerializablePolyGateType::Add |
             SerializablePolyGateType::Sub |
             SerializablePolyGateType::Mul => 2,
@@ -73,6 +77,9 @@ impl SerializablePolyCircuit {
                 PolyGateType::Input => SerializablePolyGateType::Input,
                 PolyGateType::Const { digits } => {
                     SerializablePolyGateType::Const { digits: digits.clone() }
+                }
+                PolyGateType::LargeScalarMul { scalar } => {
+                    SerializablePolyGateType::LargeScalarMul { scalar: scalar.to_vec() }
                 }
                 PolyGateType::Add => SerializablePolyGateType::Add,
                 PolyGateType::Sub => SerializablePolyGateType::Sub,
@@ -143,6 +150,10 @@ impl SerializablePolyCircuit {
                         serializable_gate.input_gates[0],
                         serializable_gate.input_gates[1],
                     );
+                    gate_idx += 1;
+                }
+                SerializablePolyGateType::LargeScalarMul { scalar } => {
+                    circuit.large_scalar_mul(serializable_gate.input_gates[0], scalar.to_vec());
                     gate_idx += 1;
                 }
                 SerializablePolyGateType::Rotate { shift } => {

@@ -3,7 +3,10 @@ pub mod finite_ring;
 use std::{
     fmt::Debug,
     ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
+    sync::Arc,
 };
+
+use num_bigint::{BigInt, BigUint};
 
 pub trait PolyElem:
     Sized
@@ -24,7 +27,8 @@ pub trait PolyElem:
     + for<'a> Sub<&'a Self, Output = Self>
     + for<'a> Mul<&'a Self, Output = Self>
 {
-    type Modulus: Debug + Clone;
+    type Modulus: Debug + Clone + Into<Arc<BigUint>>;
+    fn new<V: Into<BigInt>>(value: V, modulus: Self::Modulus) -> Self;
     fn zero(modulus: &Self::Modulus) -> Self;
     fn one(modulus: &Self::Modulus) -> Self;
     fn minus_one(modulus: &Self::Modulus) -> Self;
@@ -34,6 +38,7 @@ pub trait PolyElem:
     fn max_q(modulus: &Self::Modulus) -> Self;
     fn modulus(&self) -> &Self::Modulus;
     fn from_bytes(modulus: &Self::Modulus, bytes: &[u8]) -> Self;
+    fn from_int64(value: i64, modulus: &Self::Modulus) -> Self;
     fn to_bytes(&self) -> Vec<u8>;
-    fn to_biguint(&self) -> &num_bigint::BigUint;
+    fn value(&self) -> &num_bigint::BigUint;
 }

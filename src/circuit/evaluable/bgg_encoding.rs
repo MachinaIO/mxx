@@ -4,7 +4,7 @@ use tracing::info;
 
 use crate::{
     bgg::{encoding::BggEncoding, public_key::BggPublicKey},
-    circuit::{Evaluable, poly::PltEvaluator},
+    circuit::{Evaluable, gate::GateId, poly::PltEvaluator},
     lookup::public_lookup::PublicLut,
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
@@ -32,6 +32,18 @@ impl<M: PolyMatrix> Evaluable for BggEncoding<M> {
         let plaintext = one.plaintext.clone().map(|plaintext| plaintext * const_poly);
         Self { vector, pubkey, plaintext }
     }
+
+    fn large_scalar_mul(&self, params: &Self::Params, scalar: &[num_bigint::BigUint]) -> Self {
+        let scalar = Self::P::from_biguints(params, scalar);
+        let row_size = self.pubkey.matrix.row_size();
+        let scalar_gadget = M::gadget_matrix(params, row_size) * &scalar;
+        let decomposed = scalar_gadget.decompose();
+        let vector = self.vector.clone() * &decomposed;
+        let pubkey_matrix = self.pubkey.matrix.clone() * &decomposed;
+        let pubkey = BggPublicKey::new(pubkey_matrix, self.pubkey.reveal_plaintext);
+        let plaintext = self.plaintext.clone().map(|p| p * scalar);
+        Self { vector, pubkey, plaintext }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -56,7 +68,7 @@ where
         params: &<BggEncoding<M> as Evaluable>::Params,
         plt: &PublicLut<<BggEncoding<M> as Evaluable>::P>,
         input: BggEncoding<M>,
-        id: usize,
+        id: GateId,
     ) -> BggEncoding<M> {
         let z = &input.plaintext.expect("the BGG encoding should revealed plaintext");
         info!("public lookup length is {}", plt.f.len());

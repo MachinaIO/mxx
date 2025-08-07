@@ -1,5 +1,6 @@
 use crate::{
-    circuit::{Evaluable, PolyCircuit, poly::PltEvaluator},
+    circuit::{Evaluable, PolyCircuit, gate::GateId, poly::PltEvaluator},
+    element::PolyElem,
     impl_binop_with_refs,
     lookup::public_lookup::PublicLut,
     poly::dcrt::poly::DCRTPoly,
@@ -109,6 +110,16 @@ impl Evaluable for NormSimulator {
         let plaintext_norm = &one.plaintext_norm * &BigUint::from(*digit_max);
         Self { h_norm, plaintext_norm, dim_sqrt: one.dim_sqrt, base: one.base }
     }
+
+    fn large_scalar_mul(&self, _: &Self::Params, scalar: &[BigUint]) -> Self {
+        let scalar_max = scalar.iter().max().unwrap();
+        NormSimulator {
+            h_norm: self.h_norm.right_rotate(self.dim_sqrt as u64 * (self.base as u64 - 1)),
+            plaintext_norm: &self.plaintext_norm * scalar_max * BigUint::from(self.dim_sqrt as u64),
+            dim_sqrt: self.dim_sqrt,
+            base: self.base,
+        }
+    }
 }
 
 pub struct NormPltEvaluator {}
@@ -119,7 +130,7 @@ impl PltEvaluator<NormSimulator> for NormPltEvaluator {
         _: &(),
         plt: &PublicLut<DCRTPoly>,
         input: NormSimulator,
-        _: usize,
+        _: GateId,
     ) -> NormSimulator {
         NormSimulator {
             // |c_z · r_k.decompose()| + c_lt_k

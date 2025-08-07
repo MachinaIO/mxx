@@ -7,12 +7,13 @@ use std::{
     hash::Hash,
     ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
     path::Path,
+    sync::Arc,
 };
 
 use super::element::PolyElem;
 
 pub trait PolyParams: Clone + Debug + PartialEq + Eq + Send + Sync {
-    type Modulus: Debug + Clone;
+    type Modulus: Debug + Clone + Into<Arc<BigUint>>;
     /// Returns the modulus value `q` used for polynomial coefficients in the ring `Z_q[x]/(x^n -
     /// 1)`.
     fn modulus(&self) -> Self::Modulus;
@@ -26,6 +27,9 @@ pub trait PolyParams: Clone + Debug + PartialEq + Eq + Send + Sync {
     /// Returns the integer `n` that specifies the size of the polynomial ring used in this
     /// polynomial. Specifically, this is the degree parameter for the ring `Z_q[x]/(x^n - 1)`.
     fn ring_dimension(&self) -> u32;
+    /// Given the parameter, return the crt decomposed moduli as array along with the bit size and
+    /// depth of these moduli.
+    fn to_crt(&self) -> (Vec<u64>, usize, usize);
 }
 
 pub trait Poly:
@@ -52,6 +56,7 @@ pub trait Poly:
     type Params: PolyParams<Modulus = <Self::Elem as PolyElem>::Modulus>;
     fn from_bool_vec(params: &Self::Params, coeffs: &[bool]) -> Self;
     fn from_coeffs(params: &Self::Params, coeffs: &[Self::Elem]) -> Self;
+    fn from_biguints(params: &Self::Params, coeffs: &[BigUint]) -> Self;
     fn from_decomposed(params: &Self::Params, decomposed: &[Self]) -> Self;
     fn from_bytes(params: &Self::Params, bytes: &[u8]) -> Self {
         let log_q_bytes = params.modulus_bits().div_ceil(8);
@@ -69,7 +74,7 @@ pub trait Poly:
         self.coeffs()
             .iter()
             .map(|elem| {
-                let u32s = elem.to_biguint().to_u32_digits();
+                let u32s = elem.value().to_u32_digits();
                 debug_assert!(u32s.len() < 2);
                 if u32s.len() == 1 { u32s[0] } else { 0 }
             })

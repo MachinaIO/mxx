@@ -1,5 +1,5 @@
 use crate::{
-    element::finite_ring::FinRingElem,
+    element::{PolyElem, finite_ring::FinRingElem},
     matrix::{
         dcrt_poly::DCRTPolyMatrix,
         i64::{I64Matrix, I64MatrixParams},
@@ -88,7 +88,7 @@ pub(crate) fn split_int64_mat_to_elems(
                     .map(|j| {
                         let coeffs = i64_values[i * n..(i + 1) * n]
                             .par_iter()
-                            .map(|vec| FinRingElem::from_int64(vec[j], params.modulus()))
+                            .map(|vec| FinRingElem::from_int64(vec[j], &params.modulus()))
                             .collect::<Vec<_>>();
                         DCRTPoly::from_coeffs(params, &coeffs)
                     })
@@ -109,7 +109,7 @@ pub(crate) fn split_int64_mat_alt_to_elems(
         .map(|i| {
             let coeffs = matrix[i]
                 .par_iter()
-                .map(|x| FinRingElem::from_int64(*x, params.modulus()))
+                .map(|x| FinRingElem::from_int64(*x, &params.modulus()))
                 .collect::<Vec<_>>();
             vec![DCRTPoly::from_coeffs(params, &coeffs)]
         })

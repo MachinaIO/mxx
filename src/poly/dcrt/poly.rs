@@ -91,12 +91,18 @@ impl Poly for DCRTPoly {
         let new_coeffs = coeffs
             .par_iter()
             .map(|coeff| {
-                debug_assert_eq!(coeff.modulus(), params.modulus().as_ref());
+                debug_assert_eq!(coeff.modulus(), &params.modulus());
                 coeff.value().to_string()
             })
             .collect::<Vec<String>>();
 
         Self::poly_gen_from_vec(params, new_coeffs)
+    }
+
+    fn from_biguints(params: &Self::Params, coeffs: &[BigUint]) -> Self {
+        let fin_ring_coeffs: Vec<FinRingElem> =
+            coeffs.iter().map(|coeff| FinRingElem::new(coeff.clone(), params.modulus())).collect();
+        Self::from_coeffs(params, &fin_ring_coeffs)
     }
 
     fn from_decomposed(params: &DCRTPolyParams, decomposed: &[Self]) -> Self {
@@ -515,11 +521,11 @@ fn process_coeffs_chunked(coeffs: &[FinRingElem], chunk_size: usize) -> Vec<(boo
 #[inline(always)]
 fn process_single_coeff(coeff: &FinRingElem) -> (bool, Vec<u8>) {
     let coeff_val = coeff.value();
-    let modulus_big = coeff.modulus();
+    let modulus_big = coeff.modulus().as_ref();
     let q_half = modulus_big >> 1;
 
     if coeff_val > &q_half {
-        let centered_value = coeff.modulus() - coeff_val;
+        let centered_value = modulus_big - coeff_val;
         let value_bytes =
             if centered_value.is_zero() { Vec::new() } else { centered_value.to_bytes_le() };
         (true, value_bytes)

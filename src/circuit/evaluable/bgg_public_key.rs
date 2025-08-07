@@ -2,7 +2,7 @@ use std::{marker::PhantomData, path::PathBuf, sync::Arc};
 
 use crate::{
     bgg::public_key::BggPublicKey,
-    circuit::{Evaluable, poly::PltEvaluator},
+    circuit::{Evaluable, gate::GateId, poly::PltEvaluator},
     lookup::public_lookup::PublicLut,
     matrix::PolyMatrix,
     poly::Poly,
@@ -31,6 +31,16 @@ impl<M: PolyMatrix> Evaluable for BggPublicKey<M> {
         let matrix = one.matrix.clone() * const_poly;
         debug_mem("BGGPublicKey::from_digits matrix multiplied");
         Self { matrix, reveal_plaintext: one.reveal_plaintext }
+    }
+
+    fn large_scalar_mul(&self, params: &Self::Params, scalar: &[num_bigint::BigUint]) -> Self {
+        debug_mem(format!("BGGPublicKey::large_scalar_mul {:?}", scalar));
+        let scalar = Self::P::from_biguints(params, scalar);
+        let row_size = self.matrix.row_size();
+        let scalar_gadget = M::gadget_matrix(params, row_size) * scalar;
+        let decomposed = scalar_gadget.decompose();
+        let matrix = self.matrix.clone() * decomposed;
+        Self { matrix, reveal_plaintext: self.reveal_plaintext }
     }
 }
 
@@ -64,7 +74,7 @@ where
         params: &<BggPublicKey<M> as Evaluable>::Params,
         plt: &PublicLut<<BggPublicKey<M> as Evaluable>::P>,
         input: BggPublicKey<M>,
-        id: usize,
+        id: GateId,
     ) -> BggPublicKey<M> {
         let d = input.matrix.row_size() - 1;
         let a_lt = plt.derive_a_lt::<M, SH>(params, d, self.hash_key, id);

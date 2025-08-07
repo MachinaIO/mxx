@@ -1,5 +1,5 @@
 use crate::{
-    element::finite_ring::FinRingElem,
+    element::{PolyElem, finite_ring::FinRingElem},
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     parallel_iter,
     poly::{Poly, PolyParams, dcrt::poly::DCRTPoly},

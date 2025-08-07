@@ -2,6 +2,8 @@ pub mod bgg_encoding;
 pub mod bgg_public_key;
 pub mod poly;
 
+use num_bigint::BigUint;
+
 use crate::poly::Poly;
 use std::{
     fmt::Debug,
@@ -25,4 +27,5 @@ pub trait Evaluable:
 
     fn rotate(self, params: &Self::Params, shift: usize) -> Self;
     fn from_digits(params: &Self::Params, one: &Self, digits: &[u32]) -> Self;
+    fn large_scalar_mul(&self, params: &Self::Params, scalar: &[BigUint]) -> Self;
 }

@@ -55,6 +55,14 @@ impl PolyParams for DCRTPolyParams {
     fn modulus_digits(&self) -> usize {
         self.crt_bits.div_ceil(self.base_bits as usize) * self.crt_depth
     }
+
+    fn to_crt(&self) -> (Vec<u64>, usize, usize) {
+        let moduli = ffi::GenCRTBasis(self.ring_dimension, self.crt_depth, self.crt_bits)
+            .into_iter()
+            .map(|m| u64::from_str_radix(&m, 10).expect("invalid CRT modulus string"))
+            .collect();
+        (moduli, self.crt_bits, self.crt_depth)
+    }
 }
 
 impl Default for DCRTPolyParams {

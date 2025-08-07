@@ -1,5 +1,5 @@
-use num_bigint::{BigInt, BigUint, ParseBigIntError, ToBigInt};
-use num_traits::Signed;
+use crate::element::PolyElem;
+use num_bigint::{BigInt, BigUint, ParseBigIntError};
 use std::{
     ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
     str::FromStr,
@@ -13,40 +13,10 @@ pub struct FinRingElem {
 }
 
 impl FinRingElem {
-    pub fn new<V: Into<BigInt>>(value: V, modulus: Arc<BigUint>) -> Self {
-        let value = value.into();
-        let modulus_bigint = modulus.as_ref().to_bigint().unwrap();
-        let value = if value.is_negative() {
-            ((value % &modulus_bigint) + &modulus_bigint) % &modulus_bigint
-        } else {
-            value % &modulus_bigint
-        };
-        let reduced_value = value.to_biguint().unwrap();
-        Self { value: reduced_value, modulus }
-    }
-
     pub fn from_str(value: &str, modulus: &str) -> Result<Self, ParseBigIntError> {
         let value = BigInt::from_str(value)?;
         let modulus = BigUint::from_str(modulus)?.into();
         Ok(Self::new(value, modulus))
-    }
-
-    pub fn from_int64(value: i64, modulus: Arc<BigUint>) -> Self {
-        if value < 0 {
-            let abs_rem = value.unsigned_abs() % modulus.as_ref();
-            let value = modulus.as_ref() - abs_rem;
-            Self::new(value, modulus)
-        } else {
-            Self::new(value, modulus)
-        }
-    }
-
-    pub fn value(&self) -> &BigUint {
-        &self.value
-    }
-
-    pub fn modulus(&self) -> &BigUint {
-        &self.modulus
     }
 
     pub fn modulus_switch(&self, new_modulus: Arc<BigUint>) -> Self {
@@ -161,13 +131,13 @@ mod tests {
         let modulus = "17";
         let elem = FinRingElem::from_str("5", modulus).unwrap();
         assert_eq!(elem.value(), &BigUint::from(5u8));
-        assert_eq!(elem.modulus(), &BigUint::from(17u8));
+        assert_eq!(elem.modulus().as_ref(), &BigUint::from(17u8));
         let elem = FinRingElem::from_str("-5", modulus).unwrap();
         assert_eq!(elem.value(), &BigUint::from(12u8));
-        assert_eq!(elem.modulus(), &BigUint::from(17u8));
+        assert_eq!(elem.modulus().as_ref(), &BigUint::from(17u8));
         let elem = FinRingElem::from_str("-20", modulus).unwrap();
         assert_eq!(elem.value(), &BigUint::from(14u8));
-        assert_eq!(elem.modulus(), &BigUint::from(17u8));
+        assert_eq!(elem.modulus().as_ref(), &BigUint::from(17u8));
         let is_err = FinRingElem::from_str("0xabc", modulus).is_err();
         assert!(is_err)
     }
@@ -177,13 +147,13 @@ mod tests {
         let modulus = Arc::new(BigUint::from(17u8));
         let elem = FinRingElem::new(5, modulus.clone());
         assert_eq!(elem.value(), &BigUint::from(5u8));
-        assert_eq!(elem.modulus(), &BigUint::from(17u8));
+        assert_eq!(elem.modulus().as_ref(), &BigUint::from(17u8));
         let elem = FinRingElem::new(-5, modulus.clone());
         assert_eq!(elem.value(), &BigUint::from(12u8));
-        assert_eq!(elem.modulus(), &BigUint::from(17u8));
+        assert_eq!(elem.modulus().as_ref(), &BigUint::from(17u8));
         let elem = FinRingElem::new(-20, modulus.clone());
         assert_eq!(elem.value(), &BigUint::from(14u8));
-        assert_eq!(elem.modulus(), &BigUint::from(17u8));
+        assert_eq!(elem.modulus().as_ref(), &BigUint::from(17u8));
         let elem = FinRingElem::new(20, modulus.clone());
         assert_eq!(elem.value(), &BigUint::from(3u8));
     }
@@ -195,14 +165,14 @@ mod tests {
         let b = FinRingElem::new(16, modulus.clone());
         let c = a + b;
         assert_eq!(c.value(), &BigUint::from(1u8));
-        assert_eq!(c.modulus(), modulus.as_ref());
+        assert_eq!(c.modulus(), &modulus);
 
         let modulus = Arc::new(BigUint::from(10000usize));
         let a = FinRingElem::new(19 + 10000, modulus.clone());
         let b = FinRingElem::new(16 + 10000, modulus.clone());
         let c = a + b;
         assert_eq!(c.value(), &BigUint::from(35u8));
-        assert_eq!(c.modulus(), modulus.as_ref());
+        assert_eq!(c.modulus(), &modulus);
     }
 
     #[test]
@@ -212,14 +182,14 @@ mod tests {
         let b = FinRingElem::new(4, modulus.clone());
         let c = a - b;
         assert_eq!(c.value(), &BigUint::from(12u8));
-        assert_eq!(c.modulus(), modulus.as_ref());
+        assert_eq!(c.modulus(), &modulus);
 
         let modulus = Arc::new(BigUint::from(10000usize));
         let a = FinRingElem::new(-19, modulus.clone());
         let b = FinRingElem::new(16 + 10000, modulus.clone());
         let c = a - b;
         assert_eq!(c.value(), &BigUint::from(9965usize));
-        assert_eq!(c.modulus(), modulus.as_ref());
+        assert_eq!(c.modulus(), &modulus);
     }
 
     #[test]
@@ -229,14 +199,14 @@ mod tests {
         let b = FinRingElem::new(5, modulus.clone());
         let c = a * b;
         assert_eq!(c.value(), &BigUint::from(15u8)); // 3 * 5 ≡ 15 (mod 17)
-        assert_eq!(c.modulus(), modulus.as_ref());
+        assert_eq!(c.modulus(), &modulus);
 
         let modulus = Arc::new(BigUint::from(10000usize));
         let a = FinRingElem::new(200, modulus.clone());
         let b = FinRingElem::new(50, modulus.clone());
         let c = a * b;
         assert_eq!(c.value(), &BigUint::from(0usize)); // 200 * 50 ≡ 0 (mod 10000)
-        assert_eq!(c.modulus(), modulus.as_ref());
+        assert_eq!(c.modulus(), &modulus);
     }
 
     #[test]
@@ -245,12 +215,12 @@ mod tests {
         let a = FinRingElem::new(5, modulus.clone());
         let neg_a = -a;
         assert_eq!(neg_a.value(), &BigUint::from(12u8)); // -5 ≡ 12 (mod 17)
-        assert_eq!(neg_a.modulus(), modulus.as_ref());
+        assert_eq!(neg_a.modulus(), &modulus);
 
         let modulus = Arc::new(BigUint::from(10000usize));
         let a = FinRingElem::new(200, modulus.clone());
         let neg_a = -a;
         assert_eq!(neg_a.value(), &BigUint::from(9800usize)); // -200 ≡ 9800 (mod 10000)
-        assert_eq!(neg_a.modulus(), modulus.as_ref());
+        assert_eq!(neg_a.modulus(), &modulus);
     }
 }

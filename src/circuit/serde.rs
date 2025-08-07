@@ -1,7 +1,11 @@
 use crate::{
-    circuit::{PolyCircuit, gate::PolyGateType},
+    circuit::{
+        PolyCircuit,
+        gate::{GateId, PolyGateType},
+    },
     poly::Poly,
 };
+use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::BTreeMap;
@@ -10,6 +14,7 @@ use std::collections::BTreeMap;
 pub enum SerializablePolyGateType {
     Input,
     Const { digits: Vec<u32> },
+    LargeScalarMul { scalar: Vec<BigUint> },
     Add,
     Sub,
     Mul,
@@ -22,7 +27,9 @@ impl SerializablePolyGateType {
     pub fn num_input(&self) -> usize {
         match self {
             SerializablePolyGateType::Input | SerializablePolyGateType::Const { .. } => 0,
-            SerializablePolyGateType::Rotate { .. } | SerializablePolyGateType::PubLut { .. } => 1,
+            SerializablePolyGateType::LargeScalarMul { .. } |
+            SerializablePolyGateType::Rotate { .. } |
+            SerializablePolyGateType::PubLut { .. } => 1,
             SerializablePolyGateType::Add |
             SerializablePolyGateType::Sub |
             SerializablePolyGateType::Mul => 2,
@@ -33,16 +40,16 @@ impl SerializablePolyGateType {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SerializablePolyGate {
-    pub gate_id: usize,
+    pub gate_id: GateId,
     pub gate_type: SerializablePolyGateType,
-    pub input_gates: Vec<usize>,
+    pub input_gates: Vec<GateId>,
 }
 
 impl SerializablePolyGate {
     pub fn new(
-        gate_id: usize,
+        gate_id: GateId,
         gate_type: SerializablePolyGateType,
-        input_gates: Vec<usize>,
+        input_gates: Vec<GateId>,
     ) -> Self {
         Self { gate_id, gate_type, input_gates }
     }
@@ -50,17 +57,17 @@ impl SerializablePolyGate {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SerializablePolyCircuit {
-    gates: BTreeMap<usize, SerializablePolyGate>,
+    gates: BTreeMap<GateId, SerializablePolyGate>,
     sub_circuits: BTreeMap<usize, Self>,
-    output_ids: Vec<usize>,
+    output_ids: Vec<GateId>,
     num_input: usize,
 }
 
 impl SerializablePolyCircuit {
     pub fn new(
-        gates: BTreeMap<usize, SerializablePolyGate>,
+        gates: BTreeMap<GateId, SerializablePolyGate>,
         sub_circuits: BTreeMap<usize, Self>,
-        output_ids: Vec<usize>,
+        output_ids: Vec<GateId>,
         num_input: usize,
     ) -> Self {
         Self { gates, sub_circuits, output_ids, num_input }
@@ -73,6 +80,9 @@ impl SerializablePolyCircuit {
                 PolyGateType::Input => SerializablePolyGateType::Input,
                 PolyGateType::Const { digits } => {
                     SerializablePolyGateType::Const { digits: digits.clone() }
+                }
+                PolyGateType::LargeScalarMul { scalar } => {
+                    SerializablePolyGateType::LargeScalarMul { scalar: scalar.to_vec() }
                 }
                 PolyGateType::Add => SerializablePolyGateType::Add,
                 PolyGateType::Sub => SerializablePolyGateType::Sub,
@@ -115,7 +125,7 @@ impl SerializablePolyCircuit {
         // Process gates in ascending order of their usize keys
         let mut gate_idx = 0;
         while gate_idx < self.gates.len() {
-            let serializable_gate = &self.gates[&gate_idx];
+            let serializable_gate = self.gates.get(&GateId(gate_idx)).unwrap();
             match &serializable_gate.gate_type {
                 SerializablePolyGateType::Input => {
                     gate_idx += 1;
@@ -143,6 +153,10 @@ impl SerializablePolyCircuit {
                         serializable_gate.input_gates[0],
                         serializable_gate.input_gates[1],
                     );
+                    gate_idx += 1;
+                }
+                SerializablePolyGateType::LargeScalarMul { scalar } => {
+                    circuit.large_scalar_mul(serializable_gate.input_gates[0], scalar.to_vec());
                     gate_idx += 1;
                 }
                 SerializablePolyGateType::Rotate { shift } => {

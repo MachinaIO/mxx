@@ -34,7 +34,6 @@ pub enum PolyGateType {
     Mul,
     LargeScalarMul { scalar: Vec<BigUint> },
     Rotate { shift: usize },
-    Call { circuit_id: usize, num_input: usize, output_id: usize },
     PubLut { lookup_id: usize },
 }
 
@@ -46,7 +45,6 @@ impl PolyGateType {
             PolyGateType::LargeScalarMul { .. } |
             PolyGateType::PubLut { .. } => 1,
             PolyGateType::Add | PolyGateType::Sub | PolyGateType::Mul => 2,
-            PolyGateType::Call { num_input, .. } => *num_input,
         }
     }
 }

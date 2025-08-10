@@ -239,13 +239,14 @@ fn montogomery_reduce<P: Poly>(
             // x_low = x mod B, x_high = x / B
             let (x_low, x_high) = {
                 let temp1 = circuit.add_gate(t_limbs[i + j], m_n_j_low);
-                let temp1_low = circuit.public_lookup_gate(temp1, ctx.big_uint_ctx.add_lut_ids.0);
-                let temp1_high = circuit.public_lookup_gate(temp1, ctx.big_uint_ctx.add_lut_ids.1);
+                // Split temp1 into low/high using multiplication LUTs
+                let temp1_low = circuit.public_lookup_gate(temp1, ctx.big_uint_ctx.mul_lut_ids.0);
+                let temp1_high = circuit.public_lookup_gate(temp1, ctx.big_uint_ctx.mul_lut_ids.1);
 
                 let low_sum = circuit.add_gate(temp1_low, carry);
-                let x_low = circuit.public_lookup_gate(low_sum, ctx.big_uint_ctx.add_lut_ids.0);
+                let x_low = circuit.public_lookup_gate(low_sum, ctx.big_uint_ctx.mul_lut_ids.0);
                 let low_sum_high =
-                    circuit.public_lookup_gate(low_sum, ctx.big_uint_ctx.add_lut_ids.1);
+                    circuit.public_lookup_gate(low_sum, ctx.big_uint_ctx.mul_lut_ids.1);
                 // we assume 4B < B^2
                 let temp2 = circuit.add_gate(temp1_high, low_sum_high);
                 let x_high = circuit.add_gate(temp2, m_n_j_high);
@@ -262,8 +263,8 @@ fn montogomery_reduce<P: Poly>(
             }
 
             let x = circuit.add_gate(t_limbs[i + j], carry);
-            let x_low = circuit.public_lookup_gate(x, ctx.big_uint_ctx.add_lut_ids.0);
-            let x_high = circuit.public_lookup_gate(x, ctx.big_uint_ctx.add_lut_ids.1);
+            let x_low = circuit.public_lookup_gate(x, ctx.big_uint_ctx.mul_lut_ids.0);
+            let x_high = circuit.public_lookup_gate(x, ctx.big_uint_ctx.mul_lut_ids.1);
 
             t_limbs[i + j] = x_low;
             carry = x_high;

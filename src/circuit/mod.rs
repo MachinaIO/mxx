@@ -272,13 +272,14 @@ impl<P: Poly> PolyCircuit<P> {
                 levels[0].push(gate_id);
                 continue;
             }
-            let level = gate
+            // Find the maximum level among all input gates, then add 1.
+            let max_input_level = gate
                 .input_gates
                 .iter()
-                .map(|id| *gate_levels.get(id).expect("input gate not found"))
+                .map(|id| gate_levels[id])
                 .max()
-                .expect("max level not found") +
-                1;
+                .expect("gate has input_gates but max() returned None");
+            let level = max_input_level + 1;
             gate_levels.insert(gate_id, level);
             if levels.len() <= level {
                 levels.resize(level + 1, vec![]);

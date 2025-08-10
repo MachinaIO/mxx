@@ -215,7 +215,7 @@ fn montogomery_reduce<P: Poly>(
     for i in 0..r {
         // m = T[i] * N' mod B (where B is the base = 2^limb_bit_size)
         let m = circuit.mul_gate(t_limbs[i], ctx.const_n_prime.limbs[0]);
-        let m_mod_b = circuit.public_lookup_gate(m, ctx.big_uint_ctx.mul_lut_ids.0);
+        let m_mod_b = circuit.public_lookup_gate(m, ctx.big_uint_ctx.lut_ids.0);
 
         // Add m * N to T starting at position i
         let mut carry = circuit.const_zero_gate();
@@ -233,23 +233,18 @@ fn montogomery_reduce<P: Poly>(
                 circuit.const_zero_gate()
             };
             let m_n_j = circuit.mul_gate(m_mod_b, n_j);
-            let m_n_j_low = circuit.public_lookup_gate(m_n_j, ctx.big_uint_ctx.mul_lut_ids.0);
-            let m_n_j_high = circuit.public_lookup_gate(m_n_j, ctx.big_uint_ctx.mul_lut_ids.1);
+            let m_n_j_low = circuit.public_lookup_gate(m_n_j, ctx.big_uint_ctx.lut_ids.0);
+            let m_n_j_high = circuit.public_lookup_gate(m_n_j, ctx.big_uint_ctx.lut_ids.1);
 
             // x_low = x mod B, x_high = x / B
             let (x_low, x_high) = {
-                let temp1 = circuit.add_gate(t_limbs[i + j], m_n_j_low);
-                // Split temp1 into low/high using multiplication LUTs
-                let temp1_low = circuit.public_lookup_gate(temp1, ctx.big_uint_ctx.mul_lut_ids.0);
-                let temp1_high = circuit.public_lookup_gate(temp1, ctx.big_uint_ctx.mul_lut_ids.1);
-
-                let low_sum = circuit.add_gate(temp1_low, carry);
-                let x_low = circuit.public_lookup_gate(low_sum, ctx.big_uint_ctx.mul_lut_ids.0);
-                let low_sum_high =
-                    circuit.public_lookup_gate(low_sum, ctx.big_uint_ctx.mul_lut_ids.1);
-                // we assume 4B < B^2
-                let temp2 = circuit.add_gate(temp1_high, low_sum_high);
-                let x_high = circuit.add_gate(temp2, m_n_j_high);
+                // With the LUT domain covering up to base^2, we can split (T + m*N + carry)
+                // in a single pass: (sum % base, sum / base).
+                let sum1 = circuit.add_gate(t_limbs[i + j], m_n_j_low);
+                let sum_all = circuit.add_gate(sum1, carry);
+                let x_low = circuit.public_lookup_gate(sum_all, ctx.big_uint_ctx.lut_ids.0);
+                let carry_out = circuit.public_lookup_gate(sum_all, ctx.big_uint_ctx.lut_ids.1);
+                let x_high = circuit.add_gate(carry_out, m_n_j_high);
                 (x_low, x_high)
             };
 
@@ -263,8 +258,8 @@ fn montogomery_reduce<P: Poly>(
             }
 
             let x = circuit.add_gate(t_limbs[i + j], carry);
-            let x_low = circuit.public_lookup_gate(x, ctx.big_uint_ctx.mul_lut_ids.0);
-            let x_high = circuit.public_lookup_gate(x, ctx.big_uint_ctx.mul_lut_ids.1);
+            let x_low = circuit.public_lookup_gate(x, ctx.big_uint_ctx.lut_ids.0);
+            let x_high = circuit.public_lookup_gate(x, ctx.big_uint_ctx.lut_ids.1);
 
             t_limbs[i + j] = x_low;
             carry = x_high;

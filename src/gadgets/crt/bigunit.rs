@@ -11,7 +11,7 @@ pub struct BigUintPolyContext<P: Poly> {
     pub limb_bit_size: usize,
     pub const_zero: GateId,
     pub const_base: GateId,
-    pub mul_lut_ids: (usize, usize),
+    pub lut_ids: (usize, usize),
     _p: PhantomData<P>,
 }
 
@@ -23,12 +23,12 @@ impl<P: Poly> BigUintPolyContext<P> {
         let const_zero = circuit.const_zero_gate();
         let const_base = circuit.const_digits_poly(&[base as u32]);
         let mul_luts = Self::setup_split_lut(params, base, base * base);
-        let mul_lut_ids = (
+        let lut_ids = (
             circuit.register_public_lookup(mul_luts.0),
             circuit.register_public_lookup(mul_luts.1),
         );
-        // Note: Use only mul_lut_ids for both multiply and addition carries splitting.
-        Self { limb_bit_size, const_zero, const_base, mul_lut_ids, _p: PhantomData }
+        // Note: Use a single pair of LUTs (split into (x % base, x / base)) for all operations.
+        Self { limb_bit_size, const_zero, const_base, lut_ids, _p: PhantomData }
     }
 
     fn setup_split_lut(
@@ -114,9 +114,9 @@ impl<P: Poly> BigUintPoly<P> {
                 let tmp = circuit.add_gate(a[i], b[i]);
                 circuit.add_gate(tmp, carry)
             };
-            // Use multiplication LUTs to split sum: (sum % base, sum / base)
-            let sum_l = circuit.public_lookup_gate(sum, self.ctx.mul_lut_ids.0);
-            let sum_h = circuit.public_lookup_gate(sum, self.ctx.mul_lut_ids.1);
+            // Split sum: (sum % base, sum / base)
+            let sum_l = circuit.public_lookup_gate(sum, self.ctx.lut_ids.0);
+            let sum_h = circuit.public_lookup_gate(sum, self.ctx.lut_ids.1);
             limbs.push(sum_l);
             carry = sum_h;
         }
@@ -134,9 +134,9 @@ impl<P: Poly> BigUintPoly<P> {
             let tmp0 = circuit.add_gate(self.limbs[i], self.ctx.const_base);
             let tmp1 = circuit.sub_gate(tmp0, other.limbs[i]);
             let diff = circuit.sub_gate(tmp1, borrow);
-            // Split diff using multiplication LUTs: valid since diff < 2*base <= base^2
-            let diff_l = circuit.public_lookup_gate(diff, self.ctx.mul_lut_ids.0);
-            let diff_h = circuit.public_lookup_gate(diff, self.ctx.mul_lut_ids.1);
+            // Split diff: valid since diff < 2*base < base^2
+            let diff_l = circuit.public_lookup_gate(diff, self.ctx.lut_ids.0);
+            let diff_h = circuit.public_lookup_gate(diff, self.ctx.lut_ids.1);
             limbs.push(diff_l);
             borrow = circuit.sub_gate(one, diff_h);
         }
@@ -161,12 +161,12 @@ impl<P: Poly> BigUintPoly<P> {
                     continue; // skip if next index exceeds max limbs
                 }
                 let mul = circuit.mul_gate(self.limbs[i], other.limbs[j]);
-                let mul_l = circuit.public_lookup_gate(mul, self.ctx.mul_lut_ids.0);
+                let mul_l = circuit.public_lookup_gate(mul, self.ctx.lut_ids.0);
                 add_limbs[i + j].push(mul_l);
                 if i + j + 1 >= max_limbs {
                     continue; // skip if next index exceeds max limbs
                 }
-                let mul_h = circuit.public_lookup_gate(mul, self.ctx.mul_lut_ids.1);
+                let mul_h = circuit.public_lookup_gate(mul, self.ctx.lut_ids.1);
                 add_limbs[i + j + 1].push(mul_h);
             }
         }
@@ -180,9 +180,9 @@ impl<P: Poly> BigUintPoly<P> {
             let mut sum_l = add_limb[0];
             for limb in add_limb.iter().skip(1) {
                 let sum = circuit.add_gate(sum_l, *limb);
-                // Split intermediate sum using multiplication LUTs
-                sum_l = circuit.public_lookup_gate(sum, self.ctx.mul_lut_ids.0);
-                let sum_h = circuit.public_lookup_gate(sum, self.ctx.mul_lut_ids.1);
+                // Split intermediate sum once into (low, high)
+                sum_l = circuit.public_lookup_gate(sum, self.ctx.lut_ids.0);
+                let sum_h = circuit.public_lookup_gate(sum, self.ctx.lut_ids.1);
                 carry = circuit.add_gate(carry, sum_h);
             }
             limbs[i] = sum_l;

@@ -96,8 +96,7 @@ impl<P: Poly> PolyCircuit<P> {
     pub fn input(&mut self, num_input: usize) -> Vec<GateId> {
         // Ensure the reserved constant-one gate exists at GateId(0)
         if !self.gates.contains_key(&GateId(0)) {
-            self.gates
-                .insert(GateId(0), PolyGate::new(GateId(0), PolyGateType::Input, vec![]));
+            self.gates.insert(GateId(0), PolyGate::new(GateId(0), PolyGateType::Input, vec![]));
         }
         let mut input_gates = Vec::with_capacity(num_input);
         for _ in 0..num_input {
@@ -278,8 +277,8 @@ impl<P: Poly> PolyCircuit<P> {
                 .iter()
                 .map(|id| *gate_levels.get(id).expect("input gate not found"))
                 .max()
-                .expect("max level not found")
-                + 1;
+                .expect("max level not found") +
+                1;
             gate_levels.insert(gate_id, level);
             if levels.len() <= level {
                 levels.resize(level + 1, vec![]);
@@ -471,11 +470,7 @@ impl<P: Poly> PolyCircuit<P> {
             })
             .collect();
         sub_input_ids.sort_by_key(|gid| gid.0);
-        assert_eq!(
-            sub_input_ids.len(),
-            inputs.len(),
-            "sub-circuit input count mismatch"
-        );
+        assert_eq!(sub_input_ids.len(), inputs.len(), "sub-circuit input count mismatch");
         for (sub_in_id, &main_in_id) in sub_input_ids.into_iter().zip(inputs.iter()) {
             gate_map.insert(sub_in_id, main_in_id);
         }

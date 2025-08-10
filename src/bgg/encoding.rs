@@ -134,8 +134,7 @@ impl<M: PolyMatrix> Mul<&Self> for BggEncoding<M> {
 mod tests {
     use crate::{
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
-        circuit::PolyCircuit,
-        circuit::evaluable::bgg_encoding::BggEncodingPltEvaluator,
+        circuit::{PolyCircuit, evaluable::bgg_encoding::BggEncodingPltEvaluator},
         matrix::dcrt_poly::DCRTPolyMatrix,
         poly::dcrt::params::DCRTPolyParams,
         sampler::hash::DCRTPolyHashSampler,

@@ -80,4 +80,15 @@ pub trait PolyTrapdoorSampler {
         public_matrix: &Self::M,
         target: &Self::M,
     ) -> Self::M;
+
+    // Given a trapdoor of B, an extension matrix C, a target matrix U, return a preimage D s.t.
+    // [B,C]D = U.
+    fn preimage_extend(
+        &self,
+        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
+        trapdoor: &Self::Trapdoor,
+        public_matrix: &Self::M,
+        ext_matrix: &Self::M,
+        target: &Self::M,
+    ) -> Self::M;
 }

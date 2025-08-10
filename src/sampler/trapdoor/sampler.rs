@@ -154,6 +154,33 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         log_mem("z_hat generated");
         z_hat_former.concat_rows(&[&z_hat_latter])
     }
+
+    // Algorithm 5 of https://eprint.iacr.org/2017/601.pdf
+    fn preimage_extend(
+        &self,
+        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
+        trapdoor: &Self::Trapdoor,
+        public_matrix: &Self::M,
+        ext_matrix: &Self::M,
+        target: &Self::M,
+    ) -> Self::M {
+        let d = public_matrix.row_size();
+        let ext_ncol = ext_matrix.col_size();
+        let target_ncol = target.col_size();
+        let n = params.ring_dimension() as usize;
+        let k = params.modulus_digits();
+        let s = SPECTRAL_CONSTANT *
+            (self.base as f64 + 1.0) *
+            SIGMA *
+            SIGMA *
+            (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+        let dist = DistType::GaussDist { sigma: s };
+        let uniform_sampler = DCRTPolyUniformSampler::new();
+        let preimage_right = uniform_sampler.sample_uniform(params, ext_ncol, target_ncol, dist);
+        let t = target - &(ext_matrix * &preimage_right);
+        let preimage_left = self.preimage(params, trapdoor, public_matrix, &t);
+        preimage_left.concat_rows(&[&preimage_right])
+    }
 }
 
 pub(crate) fn decompose_dcrt_gadget(
@@ -500,6 +527,42 @@ mod test {
         // public_matrix * preimage should be equal to target
         let product = public_matrix * &preimage;
 
+        assert_eq!(product, target, "Product of public matrix and preimage should equal target");
+    }
+
+    #[test]
+    fn test_preimage_generation_extend() {
+        let params = DCRTPolyParams::default();
+        let size = 3;
+        let k = params.modulus_digits();
+        let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+
+        let uniform_sampler = DCRTPolyUniformSampler::new();
+        let target = uniform_sampler.sample_uniform(&params, size, 1, DistType::FinRingDist);
+        let m = size * params.modulus_digits();
+        let extend = uniform_sampler.sample_uniform(&params, size, m, DistType::FinRingDist);
+
+        let preimage =
+            trapdoor_sampler.preimage_extend(&params, &trapdoor, &public_matrix, &extend, &target);
+
+        let expected_rows = size * (k + 2) + m;
+        let expected_cols = 1;
+
+        assert_eq!(
+            preimage.row_size(),
+            expected_rows,
+            "Preimage matrix should have the correct number of rows"
+        );
+
+        assert_eq!(
+            preimage.col_size(),
+            expected_cols,
+            "Preimage matrix should have the correct number of columns"
+        );
+
+        // public_matrix * preimage should be equal to target
+        let product = public_matrix.concat_columns(&[&extend]) * &preimage;
         assert_eq!(product, target, "Product of public matrix and preimage should equal target");
     }
 }

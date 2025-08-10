@@ -133,11 +133,9 @@ impl<M: PolyMatrix> Mul<&Self> for BggEncoding<M> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        circuit::{PolyCircuit, evaluable::bgg_encoding::BggEncodingPltEvaluator},
-        matrix::dcrt_poly::DCRTPolyMatrix,
-        poly::dcrt::params::DCRTPolyParams,
-        sampler::hash::DCRTPolyHashSampler,
-        utils::random_bgg_encodings,
+        circuit::PolyCircuit, lookup::simple_eval::SimpleBggEncodingPltEvaluator,
+        matrix::dcrt_poly::DCRTPolyMatrix, poly::dcrt::params::DCRTPolyParams,
+        sampler::hash::DCRTPolyHashSampler, utils::random_bgg_encodings,
     };
     use keccak_asm::Keccak256;
 
@@ -163,7 +161,7 @@ mod tests {
             &params,
             &enc_one.clone(),
             &[enc1.clone(), enc2.clone()],
-            None::<BggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<SimpleBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result
@@ -198,7 +196,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone()],
-            None::<BggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<SimpleBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result
@@ -233,7 +231,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone()],
-            None::<BggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<SimpleBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result
@@ -278,7 +276,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone(), enc3.clone()],
-            None::<BggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<SimpleBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result: ((enc1 + enc2)^2) - enc3
@@ -336,7 +334,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone(), enc3.clone(), enc4.clone()],
-            None::<BggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<SimpleBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result: (((enc1 + enc2) * (enc3 * enc4)) + (enc1 - enc3)) * scalar
@@ -388,7 +386,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone()],
-            None::<BggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<SimpleBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected: enc1 + enc2
@@ -449,7 +447,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone()],
-            None::<BggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<SimpleBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result: (enc1 + enc2) - (enc1 * enc2)
@@ -517,7 +515,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone(), enc3.clone()],
-            None::<BggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<SimpleBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result: ((enc1 * enc2) + enc3)^2

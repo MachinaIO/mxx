@@ -94,15 +94,19 @@ impl<P: Poly> PolyCircuit<P> {
     }
 
     pub fn input(&mut self, num_input: usize) -> Vec<GateId> {
-        #[cfg(debug_assertions)]
-        assert_eq!(self.num_input, 0);
-        self.gates.insert(GateId(0), PolyGate::new(GateId(0), PolyGateType::Input, vec![])); // input gate at index 0 reserved for constant 1 polynomial
-        let mut input_gates = Vec::with_capacity(num_input);
-        for idx in 1..(num_input + 1) {
-            self.gates.insert(GateId(idx), PolyGate::new(GateId(idx), PolyGateType::Input, vec![]));
-            input_gates.push(GateId(idx));
+        // Ensure the reserved constant-one gate exists at GateId(0)
+        if !self.gates.contains_key(&GateId(0)) {
+            self.gates
+                .insert(GateId(0), PolyGate::new(GateId(0), PolyGateType::Input, vec![]));
         }
-        self.num_input = num_input;
+        let mut input_gates = Vec::with_capacity(num_input);
+        for _ in 0..num_input {
+            let next_id = self.gates.len();
+            let gid = GateId(next_id);
+            self.gates.insert(gid, PolyGate::new(gid, PolyGateType::Input, vec![]));
+            input_gates.push(gid);
+        }
+        self.num_input += num_input;
         input_gates
     }
 
@@ -256,15 +260,16 @@ impl<P: Poly> PolyCircuit<P> {
     /// Each non‐input gate's level is defined as max(levels of its inputs) + 1.
     fn compute_levels(&self) -> Vec<Vec<GateId>> {
         let mut gate_levels: HashMap<GateId, usize> = HashMap::new();
-        let mut levels: Vec<Vec<GateId>> = vec![vec![]];
-        for i in 0..=self.num_input {
-            gate_levels.insert(GateId(i), 0);
-        }
+        let mut levels: Vec<Vec<GateId>> = vec![];
         let orders = self.topological_order();
         for gate_id in orders.into_iter() {
             let gate = self.gates.get(&gate_id).expect("gate not found");
             if gate.input_gates.is_empty() {
+                // Inputs and consts have no dependencies; place them at level 0
                 gate_levels.insert(gate_id, 0);
+                if levels.is_empty() {
+                    levels.push(vec![]);
+                }
                 levels[0].push(gate_id);
                 continue;
             }
@@ -273,8 +278,8 @@ impl<P: Poly> PolyCircuit<P> {
                 .iter()
                 .map(|id| *gate_levels.get(id).expect("input gate not found"))
                 .max()
-                .expect("max level not found") +
-                1;
+                .expect("max level not found")
+                + 1;
             gate_levels.insert(gate_id, level);
             if levels.len() <= level {
                 levels.resize(level + 1, vec![]);
@@ -310,8 +315,22 @@ impl<P: Poly> PolyCircuit<P> {
         debug_mem("Levels are computed");
 
         wires.insert(GateId(0), one.clone());
-        for (idx, input) in inputs.iter().enumerate() {
-            let id = GateId(idx + 1);
+        // Collect all input gate IDs excluding the reserved constant-one gate (0)
+        let mut input_gate_ids: Vec<GateId> = self
+            .gates
+            .iter()
+            .filter_map(|(id, gate)| match gate.gate_type {
+                PolyGateType::Input if id.0 != 0 => Some(*id),
+                _ => None,
+            })
+            .collect();
+        input_gate_ids.sort_by_key(|gid| gid.0);
+        assert_eq!(
+            input_gate_ids.len(),
+            inputs.len(),
+            "number of provided inputs must match circuit inputs"
+        );
+        for (id, input) in input_gate_ids.into_iter().zip(inputs.iter()) {
             wires.insert(id, input.clone());
             if let Some(prefix) = self.print_value.get(&id) {
                 debug_mem(format!("[{prefix}] Gate ID {id}, {:?}", input));
@@ -384,9 +403,6 @@ impl<P: Poly> PolyCircuit<P> {
                         debug_mem("Rotate gate end");
                         result
                     }
-                    PolyGateType::Call { .. } => {
-                        panic!("no more call gate type during evaluation");
-                    }
                     PolyGateType::PubLut { lookup_id } => {
                         debug_mem("Public Lookup gate start");
                         let input = wires
@@ -443,12 +459,25 @@ impl<P: Poly> PolyCircuit<P> {
         }
         let mut gate_map: BTreeMap<GateId, GateId> = BTreeMap::new();
         let sub_circuit = self.sub_circuits.get(&circuit_id).unwrap().clone();
-        for i in 0..=sub_circuit.num_input {
-            if i == 0 {
-                gate_map.insert(GateId(i), GateId(0));
-            } else if i <= inputs.len() {
-                gate_map.insert(GateId(i), inputs[i - 1]);
-            }
+        // Map the reserved constant-one gate
+        gate_map.insert(GateId(0), GateId(0));
+        // Collect sub-circuit input gate IDs (excluding 0) in ascending order
+        let mut sub_input_ids: Vec<GateId> = sub_circuit
+            .gates
+            .iter()
+            .filter_map(|(id, gate)| match gate.gate_type {
+                PolyGateType::Input if id.0 != 0 => Some(*id),
+                _ => None,
+            })
+            .collect();
+        sub_input_ids.sort_by_key(|gid| gid.0);
+        assert_eq!(
+            sub_input_ids.len(),
+            inputs.len(),
+            "sub-circuit input count mismatch"
+        );
+        for (sub_in_id, &main_in_id) in sub_input_ids.into_iter().zip(inputs.iter()) {
+            gate_map.insert(sub_in_id, main_in_id);
         }
 
         let mut outputs = Vec::with_capacity(sub_circuit.num_output());
@@ -746,6 +775,50 @@ mod tests {
         assert_eq!(result[0], expected_add);
         assert_eq!(result[1], expected_sub);
         assert_eq!(result[2], expected_mul);
+    }
+
+    #[test]
+    fn test_multiple_input_calls_with_nonconsecutive_gate_ids() {
+        // Create parameters for testing
+        let params = DCRTPolyParams::default();
+
+        // Create input polynomials using UniformSampler
+        let poly1 = create_random_poly(&params);
+        let poly2 = create_random_poly(&params);
+
+        // Create a circuit
+        let mut circuit = PolyCircuit::new();
+
+        // First input call: creates GateId(1) as input
+        let inputs_first = circuit.input(1);
+        assert_eq!(inputs_first.len(), 1);
+
+        // Insert a gate between input calls so next input gate is non-consecutive
+        // Use a const-digits gate which introduces a new gate with no inputs
+        let _const_gate = circuit.const_digits_poly(&[1u32, 0u32, 1u32]);
+
+        // Second input call: creates a new input gate with a higher, non-consecutive GateId
+        let inputs_second = circuit.input(1);
+        assert_eq!(inputs_second.len(), 1);
+
+        // Ensure non-consecutive input GateIds (there should be a gap)
+        assert_ne!(inputs_second[0].0, inputs_first[0].0 + 1);
+
+        // Build a simple circuit that adds the two inputs together
+        let add_gate = circuit.add_gate(inputs_first[0], inputs_second[0]);
+        circuit.output(vec![add_gate]);
+
+        // Evaluate the circuit: inputs are assigned in ascending input GateId order
+        let result = circuit.eval(
+            &params,
+            &DCRTPoly::const_one(&params),
+            &[poly1.clone(), poly2.clone()],
+            None::<PolyPltEvaluator>,
+        );
+
+        let expected = poly1 + poly2;
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], expected);
     }
 
     #[test]

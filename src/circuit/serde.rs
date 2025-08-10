@@ -1,6 +1,6 @@
 use crate::{
     circuit::{
-        PolyCircuit,
+        PolyCircuit, PolyGate,
         gate::{GateId, PolyGateType},
     },
     poly::Poly,
@@ -19,7 +19,6 @@ pub enum SerializablePolyGateType {
     Sub,
     Mul,
     Rotate { shift: usize },
-    Call { circuit_id: usize, num_input: usize, output_id: usize },
     PubLut { lookup_id: usize },
 }
 
@@ -33,7 +32,6 @@ impl SerializablePolyGateType {
             SerializablePolyGateType::Add |
             SerializablePolyGateType::Sub |
             SerializablePolyGateType::Mul => 2,
-            SerializablePolyGateType::Call { num_input, .. } => *num_input,
         }
     }
 }
@@ -90,13 +88,6 @@ impl SerializablePolyCircuit {
                 PolyGateType::Rotate { shift } => {
                     SerializablePolyGateType::Rotate { shift: *shift }
                 }
-                PolyGateType::Call { circuit_id, num_input, output_id } => {
-                    SerializablePolyGateType::Call {
-                        circuit_id: *circuit_id,
-                        num_input: *num_input,
-                        output_id: *output_id,
-                    }
-                }
                 PolyGateType::PubLut { lookup_id } => {
                     SerializablePolyGateType::PubLut { lookup_id: *lookup_id }
                 }
@@ -116,65 +107,40 @@ impl SerializablePolyCircuit {
 
     pub fn to_circuit<P: Poly>(&self) -> PolyCircuit<P> {
         let mut circuit = PolyCircuit::new();
-        circuit.input(self.num_input);
+        // Restore sub-circuits first
         for (_, serializable_sub_circuit) in self.sub_circuits.iter() {
             let sub_circuit = serializable_sub_circuit.to_circuit();
             circuit.register_sub_circuit(sub_circuit);
         }
 
-        // Process gates in ascending order of their usize keys
-        let mut gate_idx = 0;
-        while gate_idx < self.gates.len() {
-            let serializable_gate = self.gates.get(&GateId(gate_idx)).unwrap();
-            match &serializable_gate.gate_type {
-                SerializablePolyGateType::Input => {
-                    gate_idx += 1;
-                }
+        // Insert gates preserving original GateIds
+        let total = self.gates.len();
+        for idx in 0..total {
+            let sg = self.gates.get(&GateId(idx)).expect("serialized gate id missing");
+            let gate_type = match &sg.gate_type {
+                SerializablePolyGateType::Input => PolyGateType::Input,
                 SerializablePolyGateType::Const { digits } => {
-                    circuit.const_digits_poly(digits);
-                    gate_idx += 1;
-                }
-                SerializablePolyGateType::Add => {
-                    circuit.add_gate(
-                        serializable_gate.input_gates[0],
-                        serializable_gate.input_gates[1],
-                    );
-                    gate_idx += 1;
-                }
-                SerializablePolyGateType::Sub => {
-                    circuit.sub_gate(
-                        serializable_gate.input_gates[0],
-                        serializable_gate.input_gates[1],
-                    );
-                    gate_idx += 1;
-                }
-                SerializablePolyGateType::Mul => {
-                    circuit.mul_gate(
-                        serializable_gate.input_gates[0],
-                        serializable_gate.input_gates[1],
-                    );
-                    gate_idx += 1;
+                    PolyGateType::Const { digits: digits.clone() }
                 }
                 SerializablePolyGateType::LargeScalarMul { scalar } => {
-                    circuit.large_scalar_mul(serializable_gate.input_gates[0], scalar.to_vec());
-                    gate_idx += 1;
+                    PolyGateType::LargeScalarMul { scalar: scalar.clone() }
                 }
+                SerializablePolyGateType::Add => PolyGateType::Add,
+                SerializablePolyGateType::Sub => PolyGateType::Sub,
+                SerializablePolyGateType::Mul => PolyGateType::Mul,
                 SerializablePolyGateType::Rotate { shift } => {
-                    circuit.rotate_gate(serializable_gate.input_gates[0], *shift);
-                    gate_idx += 1;
-                }
-                SerializablePolyGateType::Call { circuit_id, .. } => {
-                    let output_size = circuit.sub_circuits[circuit_id].num_output();
-                    circuit.call_sub_circuit(*circuit_id, &serializable_gate.input_gates);
-                    gate_idx += output_size;
+                    PolyGateType::Rotate { shift: *shift }
                 }
                 SerializablePolyGateType::PubLut { lookup_id } => {
-                    circuit.public_lookup_gate(serializable_gate.input_gates[0], *lookup_id);
-                    gate_idx += 1;
+                    PolyGateType::PubLut { lookup_id: *lookup_id }
                 }
             };
+            circuit
+                .gates
+                .insert(GateId(idx), PolyGate::new(GateId(idx), gate_type, sg.input_gates.clone()));
         }
-        circuit.output(self.output_ids.clone());
+        circuit.num_input = self.num_input;
+        circuit.output_ids = self.output_ids.clone();
         circuit
     }
 
@@ -189,7 +155,7 @@ impl SerializablePolyCircuit {
 
 #[cfg(test)]
 mod tests {
-    use crate::poly::dcrt::poly::DCRTPoly;
+    use crate::poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly};
 
     use super::*;
 
@@ -281,5 +247,41 @@ mod tests {
         // Verify that the circuits are identical by directly comparing them
         // This works because PolyCircuit implements the Eq trait
         assert_eq!(roundtrip_circuit, original_circuit);
+    }
+
+    #[test]
+    fn test_serialization_roundtrip_with_nonconsecutive_inputs() {
+        // Create a circuit where input() is called twice with a gate in between,
+        // resulting in non-consecutive input GateIds.
+        let mut circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
+        let first_inputs = circuit.input(1);
+        let _gap_gate = circuit.const_digits_poly(&[1u32, 0u32, 1u32]);
+        let second_inputs = circuit.input(1);
+        // Ensure the input GateIds are not consecutive
+        assert_ne!(second_inputs[0].0, first_inputs[0].0 + 1);
+
+        let add = circuit.add_gate(first_inputs[0], second_inputs[0]);
+        circuit.output(vec![add]);
+
+        let serializable = SerializablePolyCircuit::from_circuit(&circuit);
+        let roundtrip = serializable.to_circuit::<DCRTPoly>();
+
+        // Verify behavioral equivalence by evaluating both circuits
+        let params = DCRTPolyParams::default();
+        let a = DCRTPoly::const_one(&params);
+        let b = DCRTPoly::const_one(&params);
+        let out1 = circuit.eval(
+            &params,
+            &DCRTPoly::const_one(&params),
+            &[a.clone(), b.clone()],
+            None::<crate::circuit::poly::PolyPltEvaluator>,
+        );
+        let out2 = roundtrip.eval(
+            &params,
+            &DCRTPoly::const_one(&params),
+            &[a, b],
+            None::<crate::circuit::poly::PolyPltEvaluator>,
+        );
+        assert_eq!(out1, out2);
     }
 }

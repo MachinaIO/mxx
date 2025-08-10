@@ -133,7 +133,6 @@ impl<M: PolyMatrix> Mul<&Self> for BggEncoding<M> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         circuit::{PolyCircuit, evaluable::bgg_encoding::BggEncodingPltEvaluator},
         matrix::dcrt_poly::DCRTPolyMatrix,
         poly::dcrt::params::DCRTPolyParams,
@@ -141,10 +140,6 @@ mod tests {
         utils::random_bgg_encodings,
     };
     use keccak_asm::Keccak256;
-    use std::sync::Arc;
-    use tempfile::tempdir;
-
-    const SIGMA: f64 = 4.578;
 
     #[test]
     fn test_encoding_add() {

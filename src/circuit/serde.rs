@@ -56,7 +56,7 @@ impl SerializablePolyGate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SerializablePolyCircuit {
     gates: BTreeMap<GateId, SerializablePolyGate>,
-    sub_circuits: BTreeMap<usize, Self>,
+    sub_circuits: BTreeMap<usize, SerializablePolyCircuit>,
     output_ids: Vec<GateId>,
     num_input: usize,
 }
@@ -64,83 +64,73 @@ pub struct SerializablePolyCircuit {
 impl SerializablePolyCircuit {
     pub fn new(
         gates: BTreeMap<GateId, SerializablePolyGate>,
-        sub_circuits: BTreeMap<usize, Self>,
+        sub_circuits: BTreeMap<usize, SerializablePolyCircuit>,
         output_ids: Vec<GateId>,
         num_input: usize,
     ) -> Self {
         Self { gates, sub_circuits, output_ids, num_input }
     }
 
-    pub fn from_circuit<P: Poly>(circuit: &PolyCircuit<P>) -> Self {
+    pub fn from_circuit<P: Poly>(circuit: PolyCircuit<P>) -> Self {
         let mut gates = BTreeMap::new();
-        for (gate_id, gate) in circuit.gates.iter() {
-            let gate_type = match &gate.gate_type {
+        for (gate_id, gate) in circuit.gates.into_iter() {
+            let gate_type = match gate.gate_type {
                 PolyGateType::Input => SerializablePolyGateType::Input,
-                PolyGateType::Const { digits } => {
-                    SerializablePolyGateType::Const { digits: digits.clone() }
-                }
+                PolyGateType::Const { digits } => SerializablePolyGateType::Const { digits },
                 PolyGateType::LargeScalarMul { scalar } => {
-                    SerializablePolyGateType::LargeScalarMul { scalar: scalar.to_vec() }
+                    SerializablePolyGateType::LargeScalarMul { scalar }
                 }
                 PolyGateType::Add => SerializablePolyGateType::Add,
                 PolyGateType::Sub => SerializablePolyGateType::Sub,
                 PolyGateType::Mul => SerializablePolyGateType::Mul,
-                PolyGateType::Rotate { shift } => {
-                    SerializablePolyGateType::Rotate { shift: *shift }
-                }
+                PolyGateType::Rotate { shift } => SerializablePolyGateType::Rotate { shift },
                 PolyGateType::PubLut { lookup_id } => {
-                    SerializablePolyGateType::PubLut { lookup_id: *lookup_id }
+                    SerializablePolyGateType::PubLut { lookup_id }
                 }
             };
-            let serializable_gate =
-                SerializablePolyGate::new(*gate_id, gate_type, gate.input_gates.clone());
-            gates.insert(*gate_id, serializable_gate);
+            let serializable_gate = SerializablePolyGate::new(gate_id, gate_type, gate.input_gates);
+            gates.insert(gate_id, serializable_gate);
         }
 
         let mut sub_circuits = BTreeMap::new();
-        for (circuit_id, sub_circuit) in circuit.sub_circuits.iter() {
+        for (circuit_id, sub_circuit) in circuit.sub_circuits.into_iter() {
             let serializable_sub_circuit = Self::from_circuit(sub_circuit);
-            sub_circuits.insert(*circuit_id, serializable_sub_circuit);
+            sub_circuits.insert(circuit_id, serializable_sub_circuit);
         }
-        Self::new(gates, sub_circuits, circuit.output_ids.clone(), circuit.num_input)
+        Self::new(gates, sub_circuits, circuit.output_ids, circuit.num_input)
     }
 
-    pub fn to_circuit<P: Poly>(&self) -> PolyCircuit<P> {
+    pub fn to_circuit<P: Poly>(self) -> PolyCircuit<P> {
         let mut circuit = PolyCircuit::new();
         // Restore sub-circuits first
-        for (_, serializable_sub_circuit) in self.sub_circuits.iter() {
+        for (_, serializable_sub_circuit) in self.sub_circuits.into_iter() {
             let sub_circuit = serializable_sub_circuit.to_circuit();
             circuit.register_sub_circuit(sub_circuit);
         }
-
         // Insert gates preserving original GateIds
-        let total = self.gates.len();
-        for idx in 0..total {
-            let sg = self.gates.get(&GateId(idx)).expect("serialized gate id missing");
-            let gate_type = match &sg.gate_type {
+        let getes_len = self.gates.len();
+        for idx in 0..getes_len {
+            let sg = self.gates.get(&GateId(idx)).expect("serialized gate id missing").to_owned();
+            let gate_type = match sg.gate_type {
                 SerializablePolyGateType::Input => PolyGateType::Input,
-                SerializablePolyGateType::Const { digits } => {
-                    PolyGateType::Const { digits: digits.clone() }
-                }
+                SerializablePolyGateType::Const { digits } => PolyGateType::Const { digits },
                 SerializablePolyGateType::LargeScalarMul { scalar } => {
-                    PolyGateType::LargeScalarMul { scalar: scalar.clone() }
+                    PolyGateType::LargeScalarMul { scalar }
                 }
                 SerializablePolyGateType::Add => PolyGateType::Add,
                 SerializablePolyGateType::Sub => PolyGateType::Sub,
                 SerializablePolyGateType::Mul => PolyGateType::Mul,
-                SerializablePolyGateType::Rotate { shift } => {
-                    PolyGateType::Rotate { shift: *shift }
-                }
+                SerializablePolyGateType::Rotate { shift } => PolyGateType::Rotate { shift },
                 SerializablePolyGateType::PubLut { lookup_id } => {
-                    PolyGateType::PubLut { lookup_id: *lookup_id }
+                    PolyGateType::PubLut { lookup_id }
                 }
             };
             circuit
                 .gates
-                .insert(GateId(idx), PolyGate::new(GateId(idx), gate_type, sg.input_gates.clone()));
+                .insert(GateId(idx), PolyGate::new(GateId(idx), gate_type, sg.input_gates));
         }
         circuit.num_input = self.num_input;
-        circuit.output_ids = self.output_ids.clone();
+        circuit.output_ids = self.output_ids;
         circuit
     }
 
@@ -193,7 +183,7 @@ mod tests {
         original_circuit.output(vec![combined_gate, mul_gate, sub_outputs[1]]);
 
         // Convert to SerializablePolyCircuit
-        let serializable_circuit = SerializablePolyCircuit::from_circuit(&original_circuit);
+        let serializable_circuit = SerializablePolyCircuit::from_circuit(original_circuit.clone());
 
         // Convert back to PolyCircuit
         let roundtrip_circuit = serializable_circuit.to_circuit();
@@ -236,7 +226,7 @@ mod tests {
         original_circuit.output(vec![combined_gate, mul_gate, sub_outputs[1]]);
 
         // Convert to SerializablePolyCircuit
-        let serializable_circuit = SerializablePolyCircuit::from_circuit(&original_circuit);
+        let serializable_circuit = SerializablePolyCircuit::from_circuit(original_circuit.clone());
         let serializable_circuit_json = serializable_circuit.to_json_str();
         println!("{}", serializable_circuit_json);
         // Convert back to PolyCircuit
@@ -263,7 +253,7 @@ mod tests {
         let add = circuit.add_gate(first_inputs[0], second_inputs[0]);
         circuit.output(vec![add]);
 
-        let serializable = SerializablePolyCircuit::from_circuit(&circuit);
+        let serializable = SerializablePolyCircuit::from_circuit(circuit.clone());
         let roundtrip = serializable.to_circuit::<DCRTPoly>();
 
         // Verify behavioral equivalence by evaluating both circuits

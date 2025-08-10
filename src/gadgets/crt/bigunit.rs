@@ -1,6 +1,6 @@
 use crate::{
     circuit::{PolyCircuit, gate::GateId},
-    lookup::public_lookup::PublicLut,
+    lookup::PublicLut,
     poly::Poly,
 };
 use num_bigint::BigUint;
@@ -245,8 +245,8 @@ impl<P: Poly> BigUintPoly<P> {
 mod tests {
     use super::*;
     use crate::{
-        circuit::poly::PolyPltEvaluator,
         element::PolyElem,
+        lookup::poly::PolyPltEvaluator,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
     use std::sync::Arc;

@@ -1,5 +1,3 @@
-pub mod bgg_encoding;
-pub mod bgg_public_key;
 pub mod poly;
 
 use num_bigint::BigUint;

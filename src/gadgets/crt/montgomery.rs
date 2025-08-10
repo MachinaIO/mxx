@@ -288,8 +288,8 @@ fn montogomery_reduce<P: Poly>(
 mod tests {
     use super::*;
     use crate::{
-        circuit::poly::PolyPltEvaluator,
         element::PolyElem,
+        lookup::poly::PolyPltEvaluator,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
     use num_bigint::BigUint;

@@ -115,6 +115,7 @@ mod tests {
         lookup::poly::PolyPltEvaluator,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
+    use rand::Rng;
     use std::sync::Arc;
 
     const LIMB_BIT_SIZE: usize = 5;
@@ -202,7 +203,6 @@ mod tests {
         circuit.output(outputs);
 
         // Generate random values less than each CRT slot's modulus q_i
-        use rand::Rng;
         let mut rng = rand::rng();
         let mut values_a = Vec::new();
         let mut values_b = Vec::new();

@@ -14,10 +14,10 @@ use num_traits::One;
 #[derive(Debug, Clone)]
 pub struct MontgomeryContext<P: Poly> {
     pub big_uint_ctx: Arc<BigUintPolyContext<P>>,
-    pub num_limbs: usize,              // Number of limbs for N
-    pub const_n: BigUintPoly<P>,       // N
-    pub const_r2: BigUintPoly<P>,      // R^2 mod N
-    pub const_n_prime: BigUintPoly<P>, // N' s.t. N' * N = -1 mod B, B = 2^{limb_bit_size}
+    num_limbs: usize,              // Number of limbs for N
+    const_n: BigUintPoly<P>,       // N
+    const_r2: BigUintPoly<P>,      // R^2 mod N
+    const_n_prime: BigUintPoly<P>, // N' s.t. N' * N = -1 mod B, B = 2^{limb_bit_size}
 }
 
 impl<P: Poly> PartialEq for MontgomeryContext<P> {
@@ -88,8 +88,8 @@ impl<P: Poly> MontgomeryContext<P> {
 
 #[derive(Debug, Clone)]
 pub struct MontgomeryPoly<P: Poly> {
-    pub ctx: Arc<MontgomeryContext<P>>,
-    pub value: BigUintPoly<P>,
+    ctx: Arc<MontgomeryContext<P>>,
+    value: BigUintPoly<P>,
 }
 
 impl<P: Poly> MontgomeryPoly<P> {

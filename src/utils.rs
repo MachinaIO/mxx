@@ -161,17 +161,16 @@ pub fn timed_read<T, F: FnOnce() -> T>(label: &str, f: F, total: &mut Duration) 
 /// Exposed for reuse by other CRT components.
 pub fn mod_inverse(a: &BigUint, m: &BigUint) -> Option<BigUint> {
     if m == &BigUint::one() {
-        return Some(BigUint::zero());
+        return Some(BigUint::ZERO);
     }
 
     let (mut old_r, mut r) = (a.clone(), m.clone());
-    let (mut old_s, mut s) = (BigUint::one(), BigUint::zero());
+    let (mut old_s, mut s) = (BigUint::one(), BigUint::ZERO);
 
     while !r.is_zero() {
         let quotient = &old_r / &r;
         let temp_r = &old_r - &quotient * &r;
         old_r = std::mem::replace(&mut r, temp_r);
-
         let temp_s = if &quotient * &s <= old_s {
             &old_s - &quotient * &s
         } else {

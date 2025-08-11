@@ -7,7 +7,7 @@ use crate::{
     utils::mod_inverse,
 };
 use num_bigint::BigUint;
-use num_traits::{One, Zero};
+use num_traits::One;
 // ref: https://en.wikipedia.org/wiki/Montgomery_modular_multiplication
 // N: the modulus (assumed to be less than 2^64)
 // R: 2^{limb_bit_size * num_limbs}

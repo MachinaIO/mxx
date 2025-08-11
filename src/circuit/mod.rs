@@ -16,8 +16,8 @@ use std::{
 };
 
 use crate::{
-    circuit::{gate::GateId, poly::PltEvaluator},
-    lookup::public_lookup::PublicLut,
+    circuit::gate::GateId,
+    lookup::{PltEvaluator, PublicLut},
     poly::Poly,
     utils::debug_mem,
 };
@@ -524,8 +524,8 @@ impl<P: Poly> PolyCircuit<P> {
 mod tests {
     use super::*;
     use crate::{
-        circuit::poly::PolyPltEvaluator,
         element::PolyElem,
+        lookup::poly::PolyPltEvaluator,
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
             Poly, PolyParams,

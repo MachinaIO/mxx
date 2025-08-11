@@ -1,8 +1,8 @@
 use crate::{
-    circuit::{Evaluable, PolyCircuit, gate::GateId, poly::PltEvaluator},
+    circuit::{Evaluable, PolyCircuit, gate::GateId},
     element::PolyElem,
     impl_binop_with_refs,
-    lookup::public_lookup::PublicLut,
+    lookup::{PltEvaluator, PublicLut},
     poly::dcrt::poly::DCRTPoly,
 };
 use itertools::Itertools;

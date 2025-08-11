@@ -1,12 +1,10 @@
 use crate::{
-    circuit::{evaluable::Evaluable, gate::GateId},
+    circuit::evaluable::Evaluable,
     element::PolyElem,
-    lookup::public_lookup::PublicLut,
     poly::{Poly, PolyParams},
 };
 use num_bigint::BigUint;
 use rayon::prelude::*;
-use std::fmt::Debug;
 
 impl<P: Poly> Evaluable for P {
     type Params = P::Params;
@@ -32,29 +30,5 @@ impl<P: Poly> Evaluable for P {
             .map(|coeff| <P::Elem as PolyElem>::new(coeff.clone(), params.modulus()))
             .collect();
         self.clone() * Self::from_coeffs(params, &fin_ring_coeffs)
-    }
-}
-
-pub trait PltEvaluator<E: Evaluable>: Send + Sync {
-    fn public_lookup(&self, params: &E::Params, plt: &PublicLut<E::P>, input: E, id: GateId) -> E;
-}
-
-#[derive(Debug, Clone)]
-pub struct PolyPltEvaluator {}
-impl<P: Poly> PltEvaluator<P> for PolyPltEvaluator {
-    fn public_lookup(&self, _: &P::Params, plt: &PublicLut<P>, input: P, _: GateId) -> P {
-        plt.f.get(&input).expect("PolyPltEvaluator's public lookup cannot fetch y_k").1.clone()
-    }
-}
-
-impl Default for PolyPltEvaluator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PolyPltEvaluator {
-    pub fn new() -> Self {
-        Self {}
     }
 }

@@ -14,65 +14,6 @@ use crate::{
     utils::timed_read,
 };
 
-fn derive_a_lt_matrix<M, SH>(
-    params: &<M::P as Poly>::Params,
-    d: usize,
-    hash_key: [u8; 32],
-    id: GateId,
-) -> M
-where
-    M: PolyMatrix,
-    SH: PolyHashSampler<[u8; 32], M = M>,
-{
-    let m = (d + 1) * params.modulus_digits();
-    let hash_sampler = SH::new();
-    let tag = format!("A_LT_{id}");
-    hash_sampler.sample_hash(params, hash_key, tag.into_bytes(), d + 1, m, DistType::FinRingDist)
-}
-
-fn preimage_all<M, SU, ST, P>(
-    plt: &PublicLut<P>,
-    params: &<M::P as Poly>::Params,
-    trap_sampler: &ST,
-    pub_matrix: &M,
-    trapdoor: &ST::Trapdoor,
-    a_z: &M,
-    a_lt: &M,
-    id: &GateId,
-    dir_path: &PathBuf,
-) where
-    P: Poly,
-    M: PolyMatrix<P = P> + Send + 'static,
-    SU: PolyUniformSampler<M = M> + Send + Sync,
-    ST: PolyTrapdoorSampler<M = M> + Send + Sync,
-{
-    let d = pub_matrix.row_size() - 1;
-    let m = (d + 1) * params.modulus_digits();
-    let uniform_sampler = SU::new();
-    let gadget = M::gadget_matrix(params, d + 1);
-    let items: Vec<_> = plt.f.iter().collect();
-    let matrices = items
-        .par_chunks(8)
-        .flat_map(|batch| {
-            batch
-                .iter()
-                .map(|(x_k, (k, y_k))| {
-                    let r_k =
-                        uniform_sampler.sample_uniform(params, d + 1, m, DistType::FinRingDist);
-                    let target_k = (r_k.clone() * (*x_k).clone()) + a_lt -
-                        &(gadget.clone() * (*y_k).clone()) -
-                        (a_z.clone() * r_k.decompose());
-                    (*k, r_k, trap_sampler.preimage(params, trapdoor, pub_matrix, &target_k))
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    for (k, r_k, l_k) in matrices.into_iter() {
-        store_and_drop_matrix(r_k, dir_path, &format!("R_{id}_{k}"));
-        store_and_drop_matrix(l_k, dir_path, &format!("L_{id}_{k}"));
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SimpleBggEncodingPltEvaluator<M, SH>
 where
@@ -218,70 +159,61 @@ where
     }
 }
 
-// Evaluable implementations for Bgg types moved here.
-impl<M: PolyMatrix> crate::circuit::evaluable::Evaluable for BggEncoding<M> {
-    type Params = <M::P as Poly>::Params;
-    type P = M::P;
-
-    fn rotate(self, params: &Self::Params, shift: usize) -> Self {
-        let rotate_poly = <M::P>::const_rotate_poly(params, shift);
-        let vector = self.vector.clone() * &rotate_poly;
-        let pubkey = self.pubkey.rotate(params, shift);
-        let plaintext = self.plaintext.clone().map(|plaintext| plaintext * rotate_poly);
-        Self { vector, pubkey, plaintext }
-    }
-
-    fn from_digits(params: &Self::Params, one: &Self, digits: &[u32]) -> Self {
-        let const_poly = <M::P as crate::circuit::evaluable::Evaluable>::from_digits(
-            params,
-            &<M::P>::const_one(params),
-            digits,
-        );
-        let vector = one.vector.clone() * &const_poly;
-        let pubkey = BggPublicKey::from_digits(params, &one.pubkey, digits);
-        let plaintext = one.plaintext.clone().map(|plaintext| plaintext * const_poly);
-        Self { vector, pubkey, plaintext }
-    }
-
-    fn large_scalar_mul(&self, params: &Self::Params, scalar: &[num_bigint::BigUint]) -> Self {
-        let scalar = Self::P::from_biguints(params, scalar);
-        let row_size = self.pubkey.matrix.row_size();
-        let scalar_gadget = M::gadget_matrix(params, row_size) * &scalar;
-        let decomposed = scalar_gadget.decompose();
-        let vector = self.vector.clone() * &decomposed;
-        let pubkey_matrix = self.pubkey.matrix.clone() * &decomposed;
-        let pubkey = BggPublicKey::new(pubkey_matrix, self.pubkey.reveal_plaintext);
-        let plaintext = self.plaintext.clone().map(|p| p * scalar);
-        Self { vector, pubkey, plaintext }
-    }
+fn derive_a_lt_matrix<M, SH>(
+    params: &<M::P as Poly>::Params,
+    d: usize,
+    hash_key: [u8; 32],
+    id: GateId,
+) -> M
+where
+    M: PolyMatrix,
+    SH: PolyHashSampler<[u8; 32], M = M>,
+{
+    let m = (d + 1) * params.modulus_digits();
+    let hash_sampler = SH::new();
+    let tag = format!("A_LT_{id}");
+    hash_sampler.sample_hash(params, hash_key, tag.into_bytes(), d + 1, m, DistType::FinRingDist)
 }
 
-impl<M: PolyMatrix> crate::circuit::evaluable::Evaluable for BggPublicKey<M> {
-    type Params = <M::P as Poly>::Params;
-    type P = M::P;
-
-    fn rotate(self, params: &Self::Params, shift: usize) -> Self {
-        let rotate_poly = <M::P>::const_rotate_poly(params, shift);
-        let matrix = self.matrix.clone() * rotate_poly;
-        Self { matrix, reveal_plaintext: self.reveal_plaintext }
-    }
-
-    fn from_digits(params: &Self::Params, one: &Self, digits: &[u32]) -> Self {
-        let const_poly = <M::P as crate::circuit::evaluable::Evaluable>::from_digits(
-            params,
-            &<M::P>::const_one(params),
-            digits,
-        );
-        let matrix = one.matrix.clone() * const_poly;
-        Self { matrix, reveal_plaintext: one.reveal_plaintext }
-    }
-
-    fn large_scalar_mul(&self, params: &Self::Params, scalar: &[num_bigint::BigUint]) -> Self {
-        let scalar = Self::P::from_biguints(params, scalar);
-        let row_size = self.matrix.row_size();
-        let scalar_gadget = M::gadget_matrix(params, row_size) * scalar;
-        let decomposed = scalar_gadget.decompose();
-        let matrix = self.matrix.clone() * decomposed;
-        Self { matrix, reveal_plaintext: self.reveal_plaintext }
+fn preimage_all<M, SU, ST, P>(
+    plt: &PublicLut<P>,
+    params: &<M::P as Poly>::Params,
+    trap_sampler: &ST,
+    pub_matrix: &M,
+    trapdoor: &ST::Trapdoor,
+    a_z: &M,
+    a_lt: &M,
+    id: &GateId,
+    dir_path: &PathBuf,
+) where
+    P: Poly,
+    M: PolyMatrix<P = P> + Send + 'static,
+    SU: PolyUniformSampler<M = M> + Send + Sync,
+    ST: PolyTrapdoorSampler<M = M> + Send + Sync,
+{
+    let d = pub_matrix.row_size() - 1;
+    let m = (d + 1) * params.modulus_digits();
+    let uniform_sampler = SU::new();
+    let gadget = M::gadget_matrix(params, d + 1);
+    let items: Vec<_> = plt.f.iter().collect();
+    let matrices = items
+        .par_chunks(8)
+        .flat_map(|batch| {
+            batch
+                .iter()
+                .map(|(x_k, (k, y_k))| {
+                    let r_k =
+                        uniform_sampler.sample_uniform(params, d + 1, m, DistType::FinRingDist);
+                    let target_k = (r_k.clone() * (*x_k).clone()) + a_lt -
+                        &(gadget.clone() * (*y_k).clone()) -
+                        (a_z.clone() * r_k.decompose());
+                    (*k, r_k, trap_sampler.preimage(params, trapdoor, pub_matrix, &target_k))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for (k, r_k, l_k) in matrices.into_iter() {
+        store_and_drop_matrix(r_k, dir_path, &format!("R_{id}_{k}"));
+        store_and_drop_matrix(l_k, dir_path, &format!("L_{id}_{k}"));
     }
 }

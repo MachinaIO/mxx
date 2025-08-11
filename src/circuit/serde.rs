@@ -145,7 +145,10 @@ impl SerializablePolyCircuit {
 
 #[cfg(test)]
 mod tests {
-    use crate::poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly};
+    use crate::{
+        lookup::poly::PolyPltEvaluator,
+        poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+    };
 
     use super::*;
 
@@ -264,13 +267,13 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[a.clone(), b.clone()],
-            None::<crate::circuit::poly::PolyPltEvaluator>,
+            None::<PolyPltEvaluator>,
         );
         let out2 = roundtrip.eval(
             &params,
             &DCRTPoly::const_one(&params),
             &[a, b],
-            None::<crate::circuit::poly::PolyPltEvaluator>,
+            None::<PolyPltEvaluator>,
         );
         assert_eq!(out1, out2);
     }

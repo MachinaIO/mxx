@@ -141,9 +141,10 @@ impl<P: Poly> CrtPoly<P> {
 mod tests {
     use super::*;
     use crate::{
-        circuit::{gate::GateId, poly::PolyPltEvaluator},
+        circuit::gate::GateId,
         element::PolyElem,
         gadgets::crt::bigunit::BigUintPoly,
+        lookup::poly::PolyPltEvaluator,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
     use std::sync::Arc;

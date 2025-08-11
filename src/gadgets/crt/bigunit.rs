@@ -1,6 +1,6 @@
 use crate::{
     circuit::{PolyCircuit, gate::GateId},
-    lookup::public_lookup::PublicLut,
+    lookup::PublicLut,
     poly::Poly,
 };
 use num_bigint::BigUint;
@@ -11,29 +11,24 @@ pub struct BigUintPolyContext<P: Poly> {
     pub limb_bit_size: usize,
     pub const_zero: GateId,
     pub const_base: GateId,
-    pub add_lut_ids: (usize, usize),
-    pub mul_lut_ids: (usize, usize),
+    pub lut_ids: (usize, usize),
     _p: PhantomData<P>,
 }
 
 impl<P: Poly> BigUintPolyContext<P> {
     pub fn setup(circuit: &mut PolyCircuit<P>, params: &P::Params, limb_bit_size: usize) -> Self {
         let base = 1 << limb_bit_size;
-        // assume that base < 2^32
+        // Assume base < 2^32
         debug_assert!(limb_bit_size < 32);
         let const_zero = circuit.const_zero_gate();
         let const_base = circuit.const_digits_poly(&[base as u32]);
-        let add_luts = Self::setup_split_lut(params, base, 2 * base);
         let mul_luts = Self::setup_split_lut(params, base, base * base);
-        let add_lut_ids = (
-            circuit.register_public_lookup(add_luts.0),
-            circuit.register_public_lookup(add_luts.1),
-        );
-        let mul_lut_ids = (
+        let lut_ids = (
             circuit.register_public_lookup(mul_luts.0),
             circuit.register_public_lookup(mul_luts.1),
         );
-        Self { limb_bit_size, const_zero, const_base, add_lut_ids, mul_lut_ids, _p: PhantomData }
+        // Note: Use a single pair of LUTs (split into (x % base, x / base)) for all operations.
+        Self { limb_bit_size, const_zero, const_base, lut_ids, _p: PhantomData }
     }
 
     fn setup_split_lut(
@@ -119,8 +114,9 @@ impl<P: Poly> BigUintPoly<P> {
                 let tmp = circuit.add_gate(a[i], b[i]);
                 circuit.add_gate(tmp, carry)
             };
-            let sum_l = circuit.public_lookup_gate(sum, self.ctx.add_lut_ids.0);
-            let sum_h = circuit.public_lookup_gate(sum, self.ctx.add_lut_ids.1);
+            // Split sum: (sum % base, sum / base)
+            let sum_l = circuit.public_lookup_gate(sum, self.ctx.lut_ids.0);
+            let sum_h = circuit.public_lookup_gate(sum, self.ctx.lut_ids.1);
             limbs.push(sum_l);
             carry = sum_h;
         }
@@ -138,8 +134,9 @@ impl<P: Poly> BigUintPoly<P> {
             let tmp0 = circuit.add_gate(self.limbs[i], self.ctx.const_base);
             let tmp1 = circuit.sub_gate(tmp0, other.limbs[i]);
             let diff = circuit.sub_gate(tmp1, borrow);
-            let diff_l = circuit.public_lookup_gate(diff, self.ctx.add_lut_ids.0);
-            let diff_h = circuit.public_lookup_gate(diff, self.ctx.add_lut_ids.1);
+            // Split diff: valid since diff < 2*base < base^2
+            let diff_l = circuit.public_lookup_gate(diff, self.ctx.lut_ids.0);
+            let diff_h = circuit.public_lookup_gate(diff, self.ctx.lut_ids.1);
             limbs.push(diff_l);
             borrow = circuit.sub_gate(one, diff_h);
         }
@@ -164,12 +161,12 @@ impl<P: Poly> BigUintPoly<P> {
                     continue; // skip if next index exceeds max limbs
                 }
                 let mul = circuit.mul_gate(self.limbs[i], other.limbs[j]);
-                let mul_l = circuit.public_lookup_gate(mul, self.ctx.mul_lut_ids.0);
+                let mul_l = circuit.public_lookup_gate(mul, self.ctx.lut_ids.0);
                 add_limbs[i + j].push(mul_l);
                 if i + j + 1 >= max_limbs {
                     continue; // skip if next index exceeds max limbs
                 }
-                let mul_h = circuit.public_lookup_gate(mul, self.ctx.mul_lut_ids.1);
+                let mul_h = circuit.public_lookup_gate(mul, self.ctx.lut_ids.1);
                 add_limbs[i + j + 1].push(mul_h);
             }
         }
@@ -183,8 +180,9 @@ impl<P: Poly> BigUintPoly<P> {
             let mut sum_l = add_limb[0];
             for limb in add_limb.iter().skip(1) {
                 let sum = circuit.add_gate(sum_l, *limb);
-                sum_l = circuit.public_lookup_gate(sum, self.ctx.add_lut_ids.0);
-                let sum_h = circuit.public_lookup_gate(sum, self.ctx.add_lut_ids.1);
+                // Split intermediate sum once into (low, high)
+                sum_l = circuit.public_lookup_gate(sum, self.ctx.lut_ids.0);
+                let sum_h = circuit.public_lookup_gate(sum, self.ctx.lut_ids.1);
                 carry = circuit.add_gate(carry, sum_h);
             }
             limbs[i] = sum_l;
@@ -247,8 +245,8 @@ impl<P: Poly> BigUintPoly<P> {
 mod tests {
     use super::*;
     use crate::{
-        circuit::poly::PolyPltEvaluator,
         element::PolyElem,
+        lookup::poly::PolyPltEvaluator,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
     use std::sync::Arc;

@@ -4,6 +4,7 @@ use crate::{
     circuit::{PolyCircuit, gate::GateId},
     gadgets::crt::bigunit::{BigUintPoly, BigUintPolyContext},
     poly::Poly,
+    utils::mod_inverse,
 };
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
@@ -79,39 +80,9 @@ impl<P: Poly> MontgomeryContext<P> {
         // So we find the modular inverse of N modulo B, then multiply by (B-1)
 
         let n_inv =
-            Self::mod_inverse(n, b).expect("N and B must be coprime for Montgomery multiplication");
+            mod_inverse(n, b).expect("N and B must be coprime for Montgomery multiplication");
         let minus_one = b - BigUint::one();
         (n_inv * minus_one) % b
-    }
-
-    /// Calculate modular inverse using the extended Euclidean algorithm
-    fn mod_inverse(a: &BigUint, m: &BigUint) -> Option<BigUint> {
-        if m == &BigUint::one() {
-            return Some(BigUint::zero());
-        }
-
-        let (mut old_r, mut r) = (a.clone(), m.clone());
-        let (mut old_s, mut s) = (BigUint::one(), BigUint::zero());
-
-        while !r.is_zero() {
-            let quotient = &old_r / &r;
-            let temp_r = &old_r - &quotient * &r;
-            old_r = std::mem::replace(&mut r, temp_r);
-
-            let temp_s = if &quotient * &s <= old_s {
-                &old_s - &quotient * &s
-            } else {
-                // Handle underflow by adding m
-                m - ((&quotient * &s - &old_s) % m)
-            };
-            old_s = std::mem::replace(&mut s, temp_s);
-        }
-
-        if old_r == BigUint::one() {
-            Some(old_s % m)
-        } else {
-            None // No modular inverse exists
-        }
     }
 }
 

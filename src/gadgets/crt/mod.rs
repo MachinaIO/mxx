@@ -9,13 +9,14 @@ use crate::{
     circuit::{PolyCircuit, gate::GateId},
     gadgets::crt::montgomery::{MontgomeryContext, MontgomeryPoly},
     poly::{Poly, PolyParams},
+    utils::mod_inverse,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrtContext<P: Poly> {
     pub mont_ctxes: Vec<MontgomeryContext<P>>,
     pub q_over_qis: Vec<BigUint>,
-    // pub reconstruct_coeffs: Vec<GateId>,
+    pub reconstruct_coeffs: Vec<BigUint>,
 }
 
 impl<P: Poly> CrtContext<P> {
@@ -30,8 +31,23 @@ impl<P: Poly> CrtContext<P> {
             .collect();
 
         let total_modulus: Arc<BigUint> = params.modulus().into();
-        let q_over_qis =
+        let q_over_qis: Vec<BigUint> =
             moduli.iter().map(|modulus| total_modulus.as_ref() / BigUint::from(*modulus)).collect();
+
+        // Compute CRT reconstruction coefficients: c_i = M_i * inv(M_i mod q_i, q_i) mod q
+        // where M_i = q / q_i
+        let reconstruct_coeffs: Vec<BigUint> = moduli
+            .iter()
+            .enumerate()
+            .map(|(i, &qi)| {
+                let qi_big = BigUint::from(qi);
+                let m_i = &q_over_qis[i];
+                let m_i_mod_qi = m_i % &qi_big;
+                let inv = mod_inverse(&m_i_mod_qi, &qi_big)
+                    .expect("Moduli must be coprime for CRT reconstruction");
+                (m_i * inv) % total_modulus.as_ref()
+            })
+            .collect();
 
         // // Compute CRT reconstruction constants: \tilde{q_i} * q_i^*
         // // where \tilde{q_i} = q / q_i and q_i^* = (\tilde{q_i})^{-1} mod q_i
@@ -66,7 +82,7 @@ impl<P: Poly> CrtContext<P> {
         //     reconstruct_coeffs.push(coeff_gate);
         // }
 
-        Self { mont_ctxes, q_over_qis }
+        Self { mont_ctxes, q_over_qis, reconstruct_coeffs }
     }
 }
 
@@ -101,7 +117,7 @@ impl<P: Poly> CrtPoly<P> {
         Self::new(self.ctx.clone(), new_slots)
     }
 
-    pub fn finalize(&self, circuit: &mut PolyCircuit<P>) -> Vec<GateId> {
+    pub fn finalize_crt(&self, circuit: &mut PolyCircuit<P>) -> Vec<GateId> {
         let mut outputs = vec![];
         for (q_over_qi, mont_poly) in self.ctx.q_over_qis.iter().zip(self.slots.iter()) {
             let finalized = mont_poly.finalize(circuit);
@@ -109,33 +125,18 @@ impl<P: Poly> CrtPoly<P> {
         }
         outputs
     }
+
+    pub fn finalize_reconst(&self, circuit: &mut PolyCircuit<P>) -> GateId {
+        let mut output = circuit.const_zero_gate();
+        for (reconst_coeff, mont_poly) in self.ctx.reconstruct_coeffs.iter().zip(self.slots.iter())
+        {
+            let mont_finalized = mont_poly.finalize(circuit);
+            let scaled = circuit.large_scalar_mul(mont_finalized, vec![reconst_coeff.clone()]);
+            output = circuit.add_gate(output, scaled);
+        }
+        output
+    }
 }
-
-// Extended Euclidean algorithm to compute modular inverse
-// fn mod_inverse(a: u64, m: u64) -> u64 {
-//     if m == 1 {
-//         return 0;
-//     }
-
-//     let (mut a, mut m) = (a as i64, m as i64);
-//     let (m0, mut x0, mut x1) = (m, 0i64, 1i64);
-
-//     while a > 1 {
-//         let q = a / m;
-//         let t = m;
-//         m = a % m;
-//         a = t;
-//         let t = x0;
-//         x0 = x1 - q * x0;
-//         x1 = t;
-//     }
-
-//     if x1 < 0 {
-//         x1 += m0;
-//     }
-
-//     x1 as u64
-// }
 
 #[cfg(test)]
 mod tests {
@@ -228,7 +229,7 @@ mod tests {
         let crt_sum = crt_poly_a.add(&crt_poly_b, &mut circuit);
 
         // Finalize to get output
-        let outputs = crt_sum.finalize(&mut circuit);
+        let outputs = crt_sum.finalize_crt(&mut circuit);
         circuit.output(outputs);
 
         // Generate random values less than each CRT slot's modulus q_i
@@ -338,7 +339,7 @@ mod tests {
         let crt_diff = crt_poly_a.sub(&crt_poly_b, &mut circuit);
 
         // Finalize to get output
-        let outputs = crt_diff.finalize(&mut circuit);
+        let outputs = crt_diff.finalize_crt(&mut circuit);
         circuit.output(outputs);
 
         // Generate random values less than each CRT slot's modulus q_i
@@ -454,7 +455,7 @@ mod tests {
         let crt_product = crt_poly_a.mul(&crt_poly_b, &mut circuit);
 
         // Finalize to get output
-        let outputs = crt_product.finalize(&mut circuit);
+        let outputs = crt_product.finalize_crt(&mut circuit);
         circuit.output(outputs);
 
         // Generate random values less than each CRT slot's modulus q_i

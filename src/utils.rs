@@ -1,11 +1,3 @@
-use keccak_asm::Keccak256;
-use memory_stats::memory_stats;
-use std::{
-    env,
-    time::{Duration, Instant},
-};
-use tracing::{debug, info};
-
 use crate::{
     bgg::{
         encoding::BggEncoding,
@@ -20,6 +12,15 @@ use crate::{
         DistType, PolyUniformSampler, hash::DCRTPolyHashSampler, uniform::DCRTPolyUniformSampler,
     },
 };
+use keccak_asm::Keccak256;
+use memory_stats::memory_stats;
+use num_bigint::BigUint;
+use num_traits::{One, Zero};
+use std::{
+    env,
+    time::{Duration, Instant},
+};
+use tracing::{debug, info};
 
 /// ideal thread chunk size for parallel
 pub fn chunk_size_for(original: usize) -> usize {
@@ -154,4 +155,34 @@ pub fn timed_read<T, F: FnOnce() -> T>(label: &str, f: F, total: &mut Duration) 
     *total += elapsed;
     crate::utils::log_mem(format!("{label} loaded in {elapsed:?}"));
     res
+}
+
+/// Calculate modular inverse using the extended Euclidean algorithm
+/// Exposed for reuse by other CRT components.
+pub fn mod_inverse(a: &BigUint, m: &BigUint) -> Option<BigUint> {
+    if m == &BigUint::one() {
+        return Some(BigUint::ZERO);
+    }
+
+    let (mut old_r, mut r) = (a.clone(), m.clone());
+    let (mut old_s, mut s) = (BigUint::one(), BigUint::ZERO);
+
+    while !r.is_zero() {
+        let quotient = &old_r / &r;
+        let temp_r = &old_r - &quotient * &r;
+        old_r = std::mem::replace(&mut r, temp_r);
+        let temp_s = if &quotient * &s <= old_s {
+            &old_s - &quotient * &s
+        } else {
+            // Handle underflow by adding m
+            m - ((&quotient * &s - &old_s) % m)
+        };
+        old_s = std::mem::replace(&mut s, temp_s);
+    }
+
+    if old_r == BigUint::one() {
+        Some(old_s % m)
+    } else {
+        None // No modular inverse exists
+    }
 }

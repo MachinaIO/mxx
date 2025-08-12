@@ -9,13 +9,14 @@ use crate::{
     circuit::{PolyCircuit, gate::GateId},
     gadgets::crt::montgomery::{MontgomeryContext, MontgomeryPoly},
     poly::{Poly, PolyParams},
+    utils::mod_inverse,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrtContext<P: Poly> {
     pub mont_ctxes: Vec<MontgomeryContext<P>>,
     pub q_over_qis: Vec<BigUint>,
-    // pub reconstruct_coeffs: Vec<GateId>,
+    pub reconstruct_coeffs: Vec<BigUint>,
 }
 
 impl<P: Poly> CrtContext<P> {
@@ -30,43 +31,25 @@ impl<P: Poly> CrtContext<P> {
             .collect();
 
         let total_modulus: Arc<BigUint> = params.modulus().into();
-        let q_over_qis =
+        let q_over_qis: Vec<BigUint> =
             moduli.iter().map(|modulus| total_modulus.as_ref() / BigUint::from(*modulus)).collect();
 
-        // // Compute CRT reconstruction constants: \tilde{q_i} * q_i^*
-        // // where \tilde{q_i} = q / q_i and q_i^* = (\tilde{q_i})^{-1} mod q_i
-        // let mut reconstruct_coeffs = Vec::new();
+        // Compute CRT reconstruction coefficients: c_i = M_i * inv(M_i mod q_i, q_i) mod q
+        // where M_i = q / q_i
+        let reconstruct_coeffs: Vec<BigUint> = moduli
+            .iter()
+            .enumerate()
+            .map(|(i, &qi)| {
+                let qi_big = BigUint::from(qi);
+                let m_i = &q_over_qis[i];
+                let m_i_mod_qi = m_i % &qi_big;
+                let inv = mod_inverse(&m_i_mod_qi, &qi_big)
+                    .expect("Moduli must be coprime for CRT reconstruction");
+                (m_i * inv) % total_modulus.as_ref()
+            })
+            .collect();
 
-        // for i in 0..moduli.len() {
-        //     let qi = moduli[i];
-
-        //     // Compute \tilde{q_i} = q / q_i (product of all other moduli)
-        //     let mut q_tilde_i = 1u64;
-        //     for j in 0..moduli.len() {
-        //         if i != j {
-        //             q_tilde_i = (q_tilde_i * moduli[j]) % qi;
-        //         }
-        //     }
-
-        //     // Compute q_i^* = (\tilde{q_i})^{-1} mod q_i using extended Euclidean algorithm
-        //     let qi_star: u64 = mod_inverse(q_tilde_i, qi);
-
-        //     // Compute the reconstruction coefficient: \tilde{q_i} * q_i^* mod q_i
-        //     // Since we're working mod q_i, this simplifies to q_i^* mod q_i = 1
-        //     // But we need the full coefficient for reconstruction
-        //     let mut full_q_tilde_i = 1u64;
-        //     for j in 0..moduli.len() {
-        //         if i != j {
-        //             full_q_tilde_i = full_q_tilde_i.saturating_mul(moduli[j]);
-        //         }
-        //     }
-
-        //     let coeff = full_q_tilde_i.saturating_mul(qi_star);
-        //     let coeff_gate = circuit.add_constant(params, coeff.into());
-        //     reconstruct_coeffs.push(coeff_gate);
-        // }
-
-        Self { mont_ctxes, q_over_qis }
+        Self { mont_ctxes, q_over_qis, reconstruct_coeffs }
     }
 }
 
@@ -101,7 +84,7 @@ impl<P: Poly> CrtPoly<P> {
         Self::new(self.ctx.clone(), new_slots)
     }
 
-    pub fn finalize(&self, circuit: &mut PolyCircuit<P>) -> Vec<GateId> {
+    pub fn finalize_crt(&self, circuit: &mut PolyCircuit<P>) -> Vec<GateId> {
         let mut outputs = vec![];
         for (q_over_qi, mont_poly) in self.ctx.q_over_qis.iter().zip(self.slots.iter()) {
             let finalized = mont_poly.finalize(circuit);
@@ -109,33 +92,18 @@ impl<P: Poly> CrtPoly<P> {
         }
         outputs
     }
+
+    pub fn finalize_reconst(&self, circuit: &mut PolyCircuit<P>) -> GateId {
+        let mut output = circuit.const_zero_gate();
+        for (reconst_coeff, mont_poly) in self.ctx.reconstruct_coeffs.iter().zip(self.slots.iter())
+        {
+            let mont_finalized = mont_poly.finalize(circuit);
+            let scaled = circuit.large_scalar_mul(mont_finalized, vec![reconst_coeff.clone()]);
+            output = circuit.add_gate(output, scaled);
+        }
+        output
+    }
 }
-
-// Extended Euclidean algorithm to compute modular inverse
-// fn mod_inverse(a: u64, m: u64) -> u64 {
-//     if m == 1 {
-//         return 0;
-//     }
-
-//     let (mut a, mut m) = (a as i64, m as i64);
-//     let (m0, mut x0, mut x1) = (m, 0i64, 1i64);
-
-//     while a > 1 {
-//         let q = a / m;
-//         let t = m;
-//         m = a % m;
-//         a = t;
-//         let t = x0;
-//         x0 = x1 - q * x0;
-//         x1 = t;
-//     }
-
-//     if x1 < 0 {
-//         x1 += m0;
-//     }
-
-//     x1 as u64
-// }
 
 #[cfg(test)]
 mod tests {
@@ -147,6 +115,7 @@ mod tests {
         lookup::poly::PolyPltEvaluator,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
+    use rand::Rng;
     use std::sync::Arc;
 
     const LIMB_BIT_SIZE: usize = 5;
@@ -227,12 +196,13 @@ mod tests {
         // Perform addition
         let crt_sum = crt_poly_a.add(&crt_poly_b, &mut circuit);
 
-        // Finalize to get output
-        let outputs = crt_sum.finalize(&mut circuit);
+        // Finalize per-slot contributions and full CRT reconstruction
+        let mut outputs = crt_sum.finalize_crt(&mut circuit);
+        let reconst = crt_sum.finalize_reconst(&mut circuit);
+        outputs.push(reconst);
         circuit.output(outputs);
 
         // Generate random values less than each CRT slot's modulus q_i
-        use rand::Rng;
         let mut rng = rand::rng();
         let mut values_a = Vec::new();
         let mut values_b = Vec::new();
@@ -268,10 +238,11 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        // Verify the results
-        assert_eq!(eval_result.len(), crt_ctx.mont_ctxes.len());
+        // Verify the results for each CRT slot and the reconstructed integer
+        assert_eq!(eval_result.len(), crt_ctx.mont_ctxes.len() + 1);
 
-        for (i, result_poly) in eval_result.iter().enumerate() {
+        for i in 0..crt_ctx.mont_ctxes.len() {
+            let result_poly = &eval_result[i];
             let coeffs = result_poly.coeffs();
 
             // Verify it's a constant polynomial (only first coefficient is non-zero)
@@ -292,6 +263,21 @@ mod tests {
 
             assert_eq!(*coeffs[0].value(), expected_value);
         }
+
+        // Verify reconstructed integer modulo q
+        let q = params.modulus();
+        let q_ref: &BigUint = q.as_ref();
+        let mut expected_reconst = BigUint::from(0u32);
+        for (i, &q_i) in moduli.iter().enumerate() {
+            let val_a = values_a[i % values_a.len()];
+            let val_b = values_b[i % values_b.len()];
+            let slot_sum = BigUint::from(val_a + val_b) % BigUint::from(q_i);
+            let term = (&crt_ctx.reconstruct_coeffs[i] * slot_sum) % q_ref;
+            expected_reconst = (expected_reconst + term) % q_ref;
+        }
+        let reconst_poly = &eval_result[crt_ctx.mont_ctxes.len()];
+        let coeffs = reconst_poly.coeffs();
+        assert_eq!(*coeffs[0].value(), expected_reconst);
     }
 
     #[test]
@@ -337,8 +323,10 @@ mod tests {
         // Perform subtraction
         let crt_diff = crt_poly_a.sub(&crt_poly_b, &mut circuit);
 
-        // Finalize to get output
-        let outputs = crt_diff.finalize(&mut circuit);
+        // Finalize per-slot contributions and full CRT reconstruction
+        let mut outputs = crt_diff.finalize_crt(&mut circuit);
+        let reconst = crt_diff.finalize_reconst(&mut circuit);
+        outputs.push(reconst);
         circuit.output(outputs);
 
         // Generate random values less than each CRT slot's modulus q_i
@@ -378,10 +366,11 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        // Verify the results
-        assert_eq!(eval_result.len(), crt_ctx.mont_ctxes.len());
+        // Verify the results for each CRT slot and the reconstructed integer
+        assert_eq!(eval_result.len(), crt_ctx.mont_ctxes.len() + 1);
 
-        for (i, result_poly) in eval_result.iter().enumerate() {
+        for i in 0..crt_ctx.mont_ctxes.len() {
+            let result_poly = &eval_result[i];
             let coeffs = result_poly.coeffs();
 
             // Verify it's a constant polynomial (only first coefficient is non-zero)
@@ -408,6 +397,23 @@ mod tests {
 
             assert_eq!(*coeffs[0].value(), expected_value);
         }
+
+        // Verify reconstructed integer modulo q
+        let q = params.modulus();
+        let q_ref: &BigUint = q.as_ref();
+        let mut expected_reconst = BigUint::from(0u32);
+        for (i, &q_i) in moduli.iter().enumerate() {
+            let val_a = values_a[i % values_a.len()];
+            let val_b = values_b[i % values_b.len()];
+            let expected_slot_diff =
+                if val_a >= val_b { val_a - val_b } else { q_i - (val_b - val_a) };
+            let slot_diff = BigUint::from(expected_slot_diff) % BigUint::from(q_i);
+            let term = (&crt_ctx.reconstruct_coeffs[i] * slot_diff) % q_ref;
+            expected_reconst = (expected_reconst + term) % q_ref;
+        }
+        let reconst_poly = &eval_result[crt_ctx.mont_ctxes.len()];
+        let coeffs = reconst_poly.coeffs();
+        assert_eq!(*coeffs[0].value(), expected_reconst);
     }
 
     #[test]
@@ -453,8 +459,10 @@ mod tests {
         // Perform multiplication
         let crt_product = crt_poly_a.mul(&crt_poly_b, &mut circuit);
 
-        // Finalize to get output
-        let outputs = crt_product.finalize(&mut circuit);
+        // Finalize per-slot contributions and full CRT reconstruction
+        let mut outputs = crt_product.finalize_crt(&mut circuit);
+        let reconst = crt_product.finalize_reconst(&mut circuit);
+        outputs.push(reconst);
         circuit.output(outputs);
 
         // Generate random values less than each CRT slot's modulus q_i
@@ -494,10 +502,11 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        // Verify the results
-        assert_eq!(eval_result.len(), crt_ctx.mont_ctxes.len());
+        // Verify the results for each CRT slot and the reconstructed integer
+        assert_eq!(eval_result.len(), crt_ctx.mont_ctxes.len() + 1);
 
-        for (i, result_poly) in eval_result.iter().enumerate() {
+        for i in 0..crt_ctx.mont_ctxes.len() {
+            let result_poly = &eval_result[i];
             let coeffs = result_poly.coeffs();
 
             // Verify it's a constant polynomial (only first coefficient is non-zero)
@@ -518,5 +527,21 @@ mod tests {
 
             assert_eq!(*coeffs[0].value(), expected_value);
         }
+
+        // Verify reconstructed integer modulo q
+        let q = params.modulus();
+        let q_ref: &BigUint = q.as_ref();
+        let mut expected_reconst = BigUint::from(0u32);
+        for (i, &q_i) in moduli.iter().enumerate() {
+            let val_a = values_a[i % values_a.len()];
+            let val_b = values_b[i % values_b.len()];
+            let expected_slot_product = (val_a * val_b) % q_i;
+            let slot_prod = BigUint::from(expected_slot_product) % BigUint::from(q_i);
+            let term = (&crt_ctx.reconstruct_coeffs[i] * slot_prod) % q_ref;
+            expected_reconst = (expected_reconst + term) % q_ref;
+        }
+        let reconst_poly = &eval_result[crt_ctx.mont_ctxes.len()];
+        let coeffs = reconst_poly.coeffs();
+        assert_eq!(*coeffs[0].value(), expected_reconst);
     }
 }

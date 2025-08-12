@@ -7,7 +7,10 @@ use num_bigint::BigUint;
 
 use crate::{
     circuit::{PolyCircuit, gate::GateId},
-    gadgets::crt::montgomery::{MontgomeryContext, MontgomeryPoly},
+    gadgets::crt::{
+        bigunit::BigUintPoly,
+        montgomery::{MontgomeryContext, MontgomeryPoly},
+    },
     poly::{Poly, PolyParams},
     utils::mod_inverse,
 };
@@ -63,6 +66,62 @@ impl<P: Poly> CrtPoly<P> {
         Self { ctx, slots }
     }
 
+    /// Create a CrtPoly from regular BigUintPoly values, automatically converting to Montgomery
+    /// form.
+    pub fn from_regular(
+        circuit: &mut PolyCircuit<P>,
+        ctx: Arc<CrtContext<P>>,
+        values: Vec<BigUintPoly<P>>,
+    ) -> Self {
+        assert_eq!(
+            values.len(),
+            ctx.mont_ctxes.len(),
+            "Number of values must match number of CRT slots"
+        );
+
+        let slots: Vec<MontgomeryPoly<P>> = values
+            .into_iter()
+            .zip(&ctx.mont_ctxes)
+            .map(|(value, mont_ctx)| {
+                MontgomeryPoly::from_regular(circuit, Arc::new(mont_ctx.clone()), value)
+            })
+            .collect();
+
+        Self::new(ctx, slots)
+    }
+
+    /// Create a CrtPoly directly from input gates, handling all the complexity
+    ///
+    /// Interleaved input order: [A_slot0, B_slot0, A_slot1, B_slot1,
+    /// ...]
+    pub fn from_inputs_interleaved(
+        circuit: &mut PolyCircuit<P>,
+        ctx: Arc<CrtContext<P>>,
+        inputs: &[GateId],
+        limbs_per_slot: usize,
+        value_index: usize,
+        values_per_slot: usize,
+    ) -> Self {
+        let values: Vec<BigUintPoly<P>> = ctx
+            .mont_ctxes
+            .iter()
+            .enumerate()
+            .map(|(slot_idx, mont_ctx)| {
+                // Calculate the starting position for this value in this slot
+                let slot_start = slot_idx * limbs_per_slot * values_per_slot;
+                let value_start = slot_start + value_index * limbs_per_slot;
+                let value_end = value_start + limbs_per_slot;
+
+                BigUintPoly::new(
+                    mont_ctx.big_uint_ctx.clone(),
+                    inputs[value_start..value_end].to_vec(),
+                )
+            })
+            .collect();
+
+        Self::from_regular(circuit, ctx, values)
+    }
+
     pub fn add(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
         debug_assert_eq!(self.ctx, other.ctx);
         let new_slots =
@@ -111,7 +170,6 @@ mod tests {
     use crate::{
         circuit::gate::GateId,
         element::PolyElem,
-        gadgets::crt::bigunit::BigUintPoly,
         lookup::poly::PolyPltEvaluator,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
@@ -158,40 +216,26 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (inputs, params, crt_ctx) = create_test_context(&mut circuit, 2); // 2 values (a and b)
 
-        // Create two CrtPoly values from inputs
-        let mut slots_a = Vec::new();
-        let mut slots_b = Vec::new();
-        let mut input_offset = 0;
+        // Create CrtPoly values directly from inputs
         let (moduli, crt_bits, _) = params.to_crt();
         let num_limbs_per_slot = crt_bits.div_ceil(LIMB_BIT_SIZE);
 
-        for mont_ctx in &crt_ctx.mont_ctxes {
-            // Create BigUintPoly from input gates for value A
-            let big_uint_a = BigUintPoly::new(
-                mont_ctx.big_uint_ctx.clone(),
-                inputs[input_offset..input_offset + num_limbs_per_slot].to_vec(),
-            );
-            input_offset += num_limbs_per_slot;
-
-            // Create BigUintPoly from input gates for value B
-            let big_uint_b = BigUintPoly::new(
-                mont_ctx.big_uint_ctx.clone(),
-                inputs[input_offset..input_offset + num_limbs_per_slot].to_vec(),
-            );
-            input_offset += num_limbs_per_slot;
-
-            // Convert to Montgomery form
-            let mont_a =
-                MontgomeryPoly::from_regular(&mut circuit, Arc::new(mont_ctx.clone()), big_uint_a);
-            let mont_b =
-                MontgomeryPoly::from_regular(&mut circuit, Arc::new(mont_ctx.clone()), big_uint_b);
-
-            slots_a.push(mont_a);
-            slots_b.push(mont_b);
-        }
-
-        let crt_poly_a = CrtPoly::new(crt_ctx.clone(), slots_a);
-        let crt_poly_b = CrtPoly::new(crt_ctx.clone(), slots_b);
+        let crt_poly_a = CrtPoly::from_inputs_interleaved(
+            &mut circuit,
+            crt_ctx.clone(),
+            &inputs,
+            num_limbs_per_slot,
+            0,
+            2,
+        );
+        let crt_poly_b = CrtPoly::from_inputs_interleaved(
+            &mut circuit,
+            crt_ctx.clone(),
+            &inputs,
+            num_limbs_per_slot,
+            1,
+            2,
+        );
 
         // Perform addition
         let crt_sum = crt_poly_a.add(&crt_poly_b, &mut circuit);
@@ -259,7 +303,7 @@ mod tests {
             let (moduli, _, _) = params.to_crt();
             let q_i = BigUint::from(moduli[i]);
             let expected_slot_sum_mod = BigUint::from(expected_slot_sum) % &q_i;
-            let expected_value = &crt_ctx.q_over_qis[i] * expected_slot_sum_mod;
+            let expected_value = &crt_ctx.q_over_qis[i] * &expected_slot_sum_mod;
 
             assert_eq!(*coeffs[0].value(), expected_value);
         }
@@ -285,40 +329,26 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (inputs, params, crt_ctx) = create_test_context(&mut circuit, 2); // 2 values (a and b)
 
-        // Create two CrtPoly values from inputs
-        let mut slots_a = Vec::new();
-        let mut slots_b = Vec::new();
-        let mut input_offset = 0;
+        // Create CrtPoly values directly from inputs
         let (moduli, crt_bits, _) = params.to_crt();
         let num_limbs_per_slot = crt_bits.div_ceil(LIMB_BIT_SIZE);
 
-        for mont_ctx in &crt_ctx.mont_ctxes {
-            // Create BigUintPoly from input gates for value A
-            let big_uint_a = BigUintPoly::new(
-                mont_ctx.big_uint_ctx.clone(),
-                inputs[input_offset..input_offset + num_limbs_per_slot].to_vec(),
-            );
-            input_offset += num_limbs_per_slot;
-
-            // Create BigUintPoly from input gates for value B
-            let big_uint_b = BigUintPoly::new(
-                mont_ctx.big_uint_ctx.clone(),
-                inputs[input_offset..input_offset + num_limbs_per_slot].to_vec(),
-            );
-            input_offset += num_limbs_per_slot;
-
-            // Convert to Montgomery form
-            let mont_a =
-                MontgomeryPoly::from_regular(&mut circuit, Arc::new(mont_ctx.clone()), big_uint_a);
-            let mont_b =
-                MontgomeryPoly::from_regular(&mut circuit, Arc::new(mont_ctx.clone()), big_uint_b);
-
-            slots_a.push(mont_a);
-            slots_b.push(mont_b);
-        }
-
-        let crt_poly_a = CrtPoly::new(crt_ctx.clone(), slots_a);
-        let crt_poly_b = CrtPoly::new(crt_ctx.clone(), slots_b);
+        let crt_poly_a = CrtPoly::from_inputs_interleaved(
+            &mut circuit,
+            crt_ctx.clone(),
+            &inputs,
+            num_limbs_per_slot,
+            0,
+            2,
+        );
+        let crt_poly_b = CrtPoly::from_inputs_interleaved(
+            &mut circuit,
+            crt_ctx.clone(),
+            &inputs,
+            num_limbs_per_slot,
+            1,
+            2,
+        );
 
         // Perform subtraction
         let crt_diff = crt_poly_a.sub(&crt_poly_b, &mut circuit);
@@ -421,40 +451,26 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (inputs, params, crt_ctx) = create_test_context(&mut circuit, 2); // 2 values (a and b)
 
-        // Create two CrtPoly values from inputs
-        let mut slots_a = Vec::new();
-        let mut slots_b = Vec::new();
-        let mut input_offset = 0;
+        // Create CrtPoly values directly from inputs
         let (moduli, crt_bits, _) = params.to_crt();
         let num_limbs_per_slot = crt_bits.div_ceil(LIMB_BIT_SIZE);
 
-        for mont_ctx in &crt_ctx.mont_ctxes {
-            // Create BigUintPoly from input gates for value A
-            let big_uint_a = BigUintPoly::new(
-                mont_ctx.big_uint_ctx.clone(),
-                inputs[input_offset..input_offset + num_limbs_per_slot].to_vec(),
-            );
-            input_offset += num_limbs_per_slot;
-
-            // Create BigUintPoly from input gates for value B
-            let big_uint_b = BigUintPoly::new(
-                mont_ctx.big_uint_ctx.clone(),
-                inputs[input_offset..input_offset + num_limbs_per_slot].to_vec(),
-            );
-            input_offset += num_limbs_per_slot;
-
-            // Convert to Montgomery form
-            let mont_a =
-                MontgomeryPoly::from_regular(&mut circuit, Arc::new(mont_ctx.clone()), big_uint_a);
-            let mont_b =
-                MontgomeryPoly::from_regular(&mut circuit, Arc::new(mont_ctx.clone()), big_uint_b);
-
-            slots_a.push(mont_a);
-            slots_b.push(mont_b);
-        }
-
-        let crt_poly_a = CrtPoly::new(crt_ctx.clone(), slots_a);
-        let crt_poly_b = CrtPoly::new(crt_ctx.clone(), slots_b);
+        let crt_poly_a = CrtPoly::from_inputs_interleaved(
+            &mut circuit,
+            crt_ctx.clone(),
+            &inputs,
+            num_limbs_per_slot,
+            0,
+            2,
+        );
+        let crt_poly_b = CrtPoly::from_inputs_interleaved(
+            &mut circuit,
+            crt_ctx.clone(),
+            &inputs,
+            num_limbs_per_slot,
+            1,
+            2,
+        );
 
         // Perform multiplication
         let crt_product = crt_poly_a.mul(&crt_poly_b, &mut circuit);

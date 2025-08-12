@@ -121,47 +121,103 @@ impl<P: Poly> BigUintPoly<P> {
 
     pub fn add(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
         debug_assert_eq!(self.ctx, other.ctx);
-        let (max_num_limbs, a, b) = if self.limbs.len() >= other.limbs.len() {
+        let (w, a, b) = if self.limbs.len() >= other.limbs.len() {
             (self.limbs.len(), &self.limbs, &other.limbs)
         } else {
             (other.limbs.len(), &other.limbs, &self.limbs)
         };
-        let mut limbs = Vec::with_capacity(max_num_limbs + 1);
-        let mut carry = circuit.const_zero_gate();
-        for i in 0..max_num_limbs {
-            let sum = if i >= b.len() {
-                circuit.add_gate(a[i], carry)
-            } else {
-                let tmp = circuit.add_gate(a[i], b[i]);
-                circuit.add_gate(tmp, carry)
-            };
-            // Split sum: (sum % base, sum / base)
-            let sum_l = circuit.public_lookup_gate(sum, self.ctx.lut_ids.0);
-            let sum_h = circuit.public_lookup_gate(sum, self.ctx.lut_ids.1);
-            limbs.push(sum_l);
-            carry = sum_h;
+
+        // Build per-column t_k = a_k + b_k, then s_k, g_k, p_k
+        let mut ss = Vec::with_capacity(w);
+        let mut gs = Vec::with_capacity(w);
+        let mut ps = Vec::with_capacity(w);
+        let one = circuit.const_one_gate();
+        for i in 0..w {
+            let ai = a[i];
+            let bi = if i < b.len() { b[i] } else { self.ctx.const_zero };
+            let t = circuit.add_gate(ai, bi);
+            let s = circuit.public_lookup_gate(t, self.ctx.lut_ids.0);
+            let g = circuit.public_lookup_gate(t, self.ctx.lut_ids.1); // in {0,1}
+            // p = 1 iff s == B-1, i.e., floor((s + 1)/B) = 1
+            let s_plus = circuit.add_gate(s, one);
+            let p = circuit.public_lookup_gate(s_plus, self.ctx.lut_ids.1);
+            ss.push(s);
+            gs.push(g);
+            ps.push(p);
         }
-        limbs.push(carry);
+
+        // Parallel-prefix (Kogge–Stone) on (g,p)
+        let (g_pref, _) = Self::prefix_gp(circuit, &gs, &ps);
+
+        // carry_in for limb i is g_pref[i-1], with c0 = 0
+        let zero = circuit.const_zero_gate();
+        let mut limbs = Vec::with_capacity(w + 1);
+        for i in 0..w {
+            let carry_in = if i == 0 { zero } else { g_pref[i - 1] };
+            let t = circuit.add_gate(ss[i], carry_in);
+            let digit = circuit.public_lookup_gate(t, self.ctx.lut_ids.0);
+            limbs.push(digit);
+        }
+        let last_carry = if w == 0 { zero } else { g_pref[w - 1] };
+        limbs.push(last_carry);
         Self { ctx: self.ctx.clone(), limbs, _p: PhantomData }
     }
 
     pub fn less_than(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> (GateId, Self) {
+        // Parallel-prefix borrow-lookahead comparator with O(log t) depth.
         debug_assert_eq!(self.limbs.len(), other.limbs.len());
         debug_assert_eq!(self.ctx, other.ctx);
-        let mut limbs = Vec::with_capacity(self.limbs.len());
-        let mut borrow = circuit.const_zero_gate();
+
+        let w = self.limbs.len();
+        let zero = circuit.const_zero_gate();
         let one = circuit.const_one_gate();
-        for i in 0..self.limbs.len() {
-            let tmp0 = circuit.add_gate(self.limbs[i], self.ctx.const_base);
-            let tmp1 = circuit.sub_gate(tmp0, other.limbs[i]);
-            let diff = circuit.sub_gate(tmp1, borrow);
-            // Split diff: valid since diff < 2*base < base^2
-            let diff_l = circuit.public_lookup_gate(diff, self.ctx.lut_ids.0);
-            let diff_h = circuit.public_lookup_gate(diff, self.ctx.lut_ids.1);
-            limbs.push(diff_l);
-            borrow = circuit.sub_gate(one, diff_h);
+        let base_minus_one = {
+            let b_minus_1 = ((1u32 << self.ctx.limb_bit_size) - 1) as u32;
+            circuit.const_digits_poly(&[b_minus_1])
+        };
+
+        // For each limb i, compute t_i = a_i + (B-1) - b_i.
+        // Then: h_i = floor(t_i / B) is 1 iff a_i > b_i, 0 otherwise.
+        //        s_i = t_i % B; s_i == B-1 iff a_i == b_i.
+        // Borrow generate g_i = (a_i < b_i) = (!h_i) & (!eq_i)
+        // Borrow propagate p_i = (a_i == b_i) = eq_i
+        let mut g = Vec::with_capacity(w);
+        let mut p = Vec::with_capacity(w);
+        for i in 0..w {
+            let a = self.limbs[i];
+            let b = other.limbs[i];
+            let t0 = circuit.add_gate(a, base_minus_one);
+            let t = circuit.sub_gate(t0, b);
+            let s = circuit.public_lookup_gate(t, self.ctx.lut_ids.0);
+            let h = circuit.public_lookup_gate(t, self.ctx.lut_ids.1);
+            let not_h = circuit.not_gate(h);
+            // eq_i: s == B-1 <=> floor((s + 1)/B) == 1
+            let s_plus = circuit.add_gate(s, one);
+            let eq = circuit.public_lookup_gate(s_plus, self.ctx.lut_ids.1);
+            let not_eq = circuit.not_gate(eq);
+            let gi_and = circuit.and_gate(not_h, not_eq);
+            // p_i = eq_i (since eq_i=1 implies h_i=0, so (!h_i) is redundant)
+            g.push(gi_and);
+            p.push(eq);
         }
-        (borrow, Self { ctx: self.ctx.clone(), limbs, _p: PhantomData })
+
+        // Prefix on (g,p) to compute borrows: b_{i+1} = g_i OR (p_i AND b_i), with b_0 = 0.
+        let (g_pref, _) = Self::prefix_gp(circuit, &g, &p);
+
+        // Final difference digits using borrow-in b_i and constant base: a_i + B - b_i - b_in
+        let mut diff_limbs = Vec::with_capacity(w);
+        for i in 0..w {
+            let a = self.limbs[i];
+            let b = other.limbs[i];
+            let pre = circuit.add_gate(a, self.ctx.const_base);
+            let pre2 = circuit.sub_gate(pre, b);
+            let b_in = if i == 0 { zero } else { g_pref[i - 1] };
+            let t = circuit.sub_gate(pre2, b_in);
+            let d = circuit.public_lookup_gate(t, self.ctx.lut_ids.0);
+            diff_limbs.push(d);
+        }
+        let borrow_out = if w == 0 { zero } else { g_pref[w - 1] };
+        (borrow_out, Self { ctx: self.ctx.clone(), limbs: diff_limbs, _p: PhantomData })
     }
 
     pub fn mul(
@@ -174,24 +230,11 @@ impl<P: Poly> BigUintPoly<P> {
         let max_bit_size = max_bit_size.unwrap_or(self.bit_size() + other.bit_size());
         debug_assert!(max_bit_size % self.ctx.limb_bit_size == 0);
         let max_limbs = max_bit_size / self.ctx.limb_bit_size;
-
-        // 1) Schoolbook partial products with immediate split and column placement
-        let mut columns = Self::schoolbook_partial_products_columns(
-            circuit,
-            &self.limbs,
-            &other.limbs,
-            max_limbs,
-            self.ctx.lut_ids,
-        );
-
-        // 2) Compress columns (one-shot if H_max < B, else Wallace compressors)
-        // let base: usize = 1usize << self.ctx.limb_bit_size;
-        // let h_max = columns.iter().map(|c| c.len()).max().unwrap_or(0);
-        let (sum_vec, carry_vec) = self.compress_columns_wallace(circuit, &mut columns);
+        let (sum_vec, carry_vec) = self.mul_without_cpa(other, circuit, max_limbs);
 
         // 3) Final single normalization (ripple-style) to match the existing API
         // Note: We normalize S + (C shifted by 1) with exactly one pass of lookups.
-        let limbs = Self::final_normalize(circuit, sum_vec, carry_vec, self.ctx.lut_ids, max_limbs);
+        let limbs = Self::final_cpa(circuit, sum_vec, carry_vec, self.ctx.lut_ids, max_limbs);
 
         Self { ctx: self.ctx.clone(), limbs, _p: PhantomData }
     }
@@ -357,8 +400,8 @@ impl<P: Poly> BigUintPoly<P> {
         (sum_vec, carry_vec)
     }
 
-    // Final normalization: add S and C (shifted) once to produce base-B digits.
-    fn final_normalize(
+    // Final normalization by a parallel-prefix CPA: add S and C (shifted) once to produce digits.
+    pub(crate) fn final_cpa(
         circuit: &mut PolyCircuit<P>,
         mut sum_vec: Vec<GateId>,
         carry_vec: Vec<GateId>,
@@ -368,19 +411,87 @@ impl<P: Poly> BigUintPoly<P> {
         // Ensure width
         let w = sum_vec.len().min(max_limbs);
         sum_vec.truncate(w);
-        let mut limbs = Vec::with_capacity(w);
+        // Precompute t_k = S_k + C_k
         let zero = circuit.const_zero_gate();
-        let mut carry = zero;
+        let mut ss = Vec::with_capacity(w);
+        let mut gs = Vec::with_capacity(w);
+        let mut ps = Vec::with_capacity(w);
         for k in 0..w {
-            // t = S_k + C_k + carry_in, where C_k holds carries shifted from k-1
-            let t0 = circuit.add_gate(sum_vec[k], carry_vec.get(k).copied().unwrap_or(zero));
-            let t = circuit.add_gate(t0, carry);
-            let digit = circuit.public_lookup_gate(t, lut_ids.0);
-            let c_out = circuit.public_lookup_gate(t, lut_ids.1); // in {0,1}
-            limbs.push(digit);
-            carry = c_out;
+            let c = carry_vec.get(k).copied().unwrap_or(zero);
+            let t = circuit.add_gate(sum_vec[k], c);
+            let s = circuit.public_lookup_gate(t, lut_ids.0);
+            let g = circuit.public_lookup_gate(t, lut_ids.1);
+            // p = 1 iff s == B-1 <=> floor((s + 1)/B) = 1
+            let s_plus = circuit.add_gate(s, GateId(0));
+            let p = circuit.public_lookup_gate(s_plus, lut_ids.1);
+            ss.push(s);
+            gs.push(g);
+            ps.push(p);
         }
-        limbs
+        let (g_pref, _) = Self::prefix_gp(circuit, &gs, &ps);
+        let mut out = Vec::with_capacity(w);
+        for i in 0..w {
+            let carry_in = if i == 0 { zero } else { g_pref[i - 1] };
+            let t = circuit.add_gate(ss[i], carry_in);
+            let digit = circuit.public_lookup_gate(t, lut_ids.0);
+            out.push(digit);
+        }
+        out
+    }
+
+    // Kogge–Stone parallel prefix on (g, p)
+    fn prefix_gp(
+        circuit: &mut PolyCircuit<P>,
+        g: &[GateId],
+        p: &[GateId],
+    ) -> (Vec<GateId>, Vec<GateId>) {
+        let w = g.len();
+        let mut gs = g.to_vec();
+        let mut ps = p.to_vec();
+        let mut d = 1usize;
+        while d < w {
+            let mut gs_next = gs.clone();
+            let mut ps_next = ps.clone();
+            for k in 0..w {
+                if k >= d {
+                    let gj = gs[k - d];
+                    let pj = ps[k - d];
+                    let gk = gs[k];
+                    let pk = ps[k];
+                    // G' = gk OR (pk AND gj); P' = pk AND pj
+                    let pk_and_gj = circuit.and_gate(pk, gj);
+                    let g_new = circuit.or_gate(gk, pk_and_gj);
+                    let p_new = circuit.and_gate(pk, pj);
+                    gs_next[k] = g_new;
+                    ps_next[k] = p_new;
+                }
+            }
+            gs = gs_next;
+            ps = ps_next;
+            d <<= 1;
+        }
+        (gs, ps)
+    }
+
+    pub(crate) fn mul_without_cpa(
+        &self,
+        other: &Self,
+        circuit: &mut PolyCircuit<P>,
+        max_limbs: usize,
+    ) -> (Vec<GateId>, Vec<GateId>) {
+        // 1) Schoolbook partial products with immediate split and column placement
+        let mut columns = Self::schoolbook_partial_products_columns(
+            circuit,
+            &self.limbs,
+            &other.limbs,
+            max_limbs,
+            self.ctx.lut_ids,
+        );
+
+        // 2) Compress columns (one-shot if H_max < B, else Wallace compressors)
+        // let base: usize = 1usize << self.ctx.limb_bit_size;
+        // let h_max = columns.iter().map(|c| c.len()).max().unwrap_or(0);
+        self.compress_columns_wallace(circuit, &mut columns)
     }
 }
 

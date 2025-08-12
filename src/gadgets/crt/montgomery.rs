@@ -15,10 +15,11 @@ use num_traits::One;
 #[derive(Debug, Clone)]
 pub struct MontgomeryContext<P: Poly> {
     pub big_uint_ctx: Arc<BigUintPolyContext<P>>,
-    num_limbs: usize,              // Number of limbs for N
-    const_n: BigUintPoly<P>,       // N
-    const_r2: BigUintPoly<P>,      // R^2 mod N
-    const_n_prime: BigUintPoly<P>, // N' s.t. N' * N = -1 mod B, B = 2^{limb_bit_size}
+    num_limbs: usize,         // Number of limbs for N
+    const_n: BigUintPoly<P>,  // N
+    const_r2: BigUintPoly<P>, // R^2 mod N
+    const_n_prime: BigUintPoly<P>, /* N' s.t. N' * N = -1 mod R, R = 2^{limb_bit_size *
+                               * limb_bit_size} */
 }
 
 impl<P: Poly> PartialEq for MontgomeryContext<P> {
@@ -51,15 +52,14 @@ impl<P: Poly> MontgomeryContext<P> {
         let r2_big = (&r_big * &r_big) % &n_big;
         let r2 = r2_big.iter_u64_digits().next().unwrap_or(0);
 
-        // Calculate N' such that N * N' ≡ -1 (mod B) where B = 2^limb_bit_size
-        // For MultiPrecision REDC algorithm, N' is modulo the base B, not R
+        // Calculate N' such that N * N' ≡ -1 (mod B)
         let base_big = BigUint::one() << limb_bit_size;
-        let n_prime_big = Self::calculate_n_prime(&n_big, &base_big);
+        let n_prime_big = Self::calculate_n_prime(&n_big, &r_big);
         let n_prime = n_prime_big.iter_u64_digits().next().unwrap_or(0);
         debug_assert_eq!(
-            (&n_big * &n_prime_big) % &base_big,
-            &base_big - BigUint::one(),
-            "N' calculation failed"
+            (&n_big * &n_prime_big) % &r_big,
+            &r_big - BigUint::one(),
+            "N' (mod B) calculation failed"
         );
 
         // Create constant gates
@@ -69,6 +69,21 @@ impl<P: Poly> MontgomeryContext<P> {
 
         let const_r2 = BigUintPoly::const_u64(big_uint_ctx.clone(), circuit, r2);
         let const_n_prime = BigUintPoly::const_u64(big_uint_ctx.clone(), circuit, n_prime);
+
+        // // Precompute full N' modulo R as base-B digits (private)
+        // let wbits = limb_bit_size;
+        // let base = BigUint::one() << wbits;
+        // let r_big_full = BigUint::one() << (wbits * num_limbs);
+        // let n_inv_full = mod_inverse(&n_big, &r_big_full).expect("N and R must be coprime");
+        // let nprime_full_big = (&r_big_full - n_inv_full) % &r_big_full; // -N^{-1} mod R
+        // let mut nprime_full_limbs = Vec::with_capacity(num_limbs);
+        // let mut tmp = nprime_full_big.clone();
+        // for _ in 0..num_limbs {
+        //     let limb = (&tmp % &base).iter_u64_digits().next().unwrap_or(0) as u32;
+        //     nprime_full_limbs.push(circuit.const_digits_poly(&[limb]));
+        //     tmp /= &base;
+        // }
+        // let const_n_prime_full = BigUintPoly::new(big_uint_ctx.clone(), nprime_full_limbs);
 
         Self { big_uint_ctx, num_limbs, const_n, const_r2, const_n_prime }
     }
@@ -174,87 +189,25 @@ fn montgomery_reduce<P: Poly>(
     circuit: &mut PolyCircuit<P>,
     t: &BigUintPoly<P>,
 ) -> BigUintPoly<P> {
-    // Implementation based on MultiPrecision REDC algorithm from Wikipedia
-    // https://en.wikipedia.org/wiki/Montgomery_modular_multiplication
+    // Use N' (mod R) to compute m non-iteratively, then U = T + mN, divide by R, and
+    // conditionally subtract.
+    let r = ctx.num_limbs;
+    let limb_bits = ctx.big_uint_ctx.limb_bit_size;
 
-    let r = ctx.num_limbs; // r = logB R (number of limbs in modulus)
-    let p = ctx.num_limbs; // p = number of limbs in modulus N
+    // m = (T mod R) * N' mod R (truncate to r limbs)
+    let t_low = t.mod_limbs(r);
+    let m = t_low.mul(&ctx.const_n_prime, circuit, Some(r * limb_bits));
 
-    // Ensure T has enough limbs (r + p + 1 for extra carry)
-    let mut t_limbs = t.limbs.clone();
-    t_limbs.resize(r + p + 1, circuit.const_zero_gate());
+    // U = T + m*N
+    let m_times_n = m.mul(&ctx.const_n, circuit, None);
+    let u = t.add(&m_times_n, circuit);
 
-    // Main REDC algorithm loops
-    for i in 0..r {
-        // m = T[i] * N' mod B (where B is the base = 2^limb_bit_size)
-        let m = circuit.mul_gate(t_limbs[i], ctx.const_n_prime.limbs[0]);
-        let m_mod_b = circuit.public_lookup_gate(m, ctx.big_uint_ctx.lut_ids.0);
+    // REDC result = floor(U / R) mod N: take upper limbs after shifting by r
+    let u_div = u.left_shift(r).mod_limbs(r);
 
-        // Add m * N to T starting at position i
-        let mut carry = circuit.const_zero_gate();
-
-        // Inner loop: Add m * N[j] to T[i + j] with carry propagation
-        for j in 0..p {
-            if i + j >= t_limbs.len() {
-                break;
-            }
-
-            // x = T[i + j] + m * N[j] + c
-            let n_j: GateId = if j < ctx.const_n.limbs.len() {
-                ctx.const_n.limbs[j]
-            } else {
-                circuit.const_zero_gate()
-            };
-            let m_n_j = circuit.mul_gate(m_mod_b, n_j);
-            let m_n_j_low = circuit.public_lookup_gate(m_n_j, ctx.big_uint_ctx.lut_ids.0);
-            let m_n_j_high = circuit.public_lookup_gate(m_n_j, ctx.big_uint_ctx.lut_ids.1);
-
-            // x_low = x mod B, x_high = x / B
-            let (x_low, x_high) = {
-                // With the LUT domain covering up to base^2, we can split (T + m*N + carry)
-                // in a single pass: (sum % base, sum / base).
-                let sum1 = circuit.add_gate(t_limbs[i + j], m_n_j_low);
-                let sum_all = circuit.add_gate(sum1, carry);
-                let x_low = circuit.public_lookup_gate(sum_all, ctx.big_uint_ctx.lut_ids.0);
-                let carry_out = circuit.public_lookup_gate(sum_all, ctx.big_uint_ctx.lut_ids.1);
-                let x_high = circuit.add_gate(carry_out, m_n_j_high);
-                (x_low, x_high)
-            };
-
-            t_limbs[i + j] = x_low;
-            carry = x_high;
-        }
-
-        for j in p..(r + p - i).min(t_limbs.len() - i) {
-            if i + j >= t_limbs.len() {
-                break;
-            }
-
-            let x = circuit.add_gate(t_limbs[i + j], carry);
-            let x_low = circuit.public_lookup_gate(x, ctx.big_uint_ctx.lut_ids.0);
-            let x_high = circuit.public_lookup_gate(x, ctx.big_uint_ctx.lut_ids.1);
-
-            t_limbs[i + j] = x_low;
-            carry = x_high;
-        }
-    }
-
-    // Extract S = T[r..r+p] (the result limbs)
-    let mut s_limbs = Vec::with_capacity(p);
-    for i in 0..p {
-        if r + i < t_limbs.len() {
-            s_limbs.push(t_limbs[r + i]);
-        } else {
-            s_limbs.push(circuit.const_zero_gate());
-        }
-    }
-
-    let s = BigUintPoly::new(ctx.big_uint_ctx.clone(), s_limbs);
-
-    // if S >= N then return S - N else return S
-    let (is_less, diff) = s.less_than(&ctx.const_n, circuit);
-    let is_geq = circuit.not_gate(is_less);
-    diff.cmux(&s, is_geq, circuit)
+    let (is_less, diff) = u_div.less_than(&ctx.const_n, circuit);
+    // If u_div < N, keep u_div; otherwise use diff = u_div - N (mod B^r)
+    u_div.cmux(&diff, is_less, circuit)
 }
 
 #[cfg(test)]
@@ -324,7 +277,7 @@ mod tests {
         // but we can verify the structure is correct
         assert_eq!(ctx.num_limbs, NUM_LIMBS);
         assert_eq!(ctx.const_n.limbs.len(), NUM_LIMBS); // N is extended to NUM_LIMBS for algorithm
-        assert_eq!(ctx.const_n_prime.limbs.len(), 1); // N' should fit in one limb
+        assert_eq!(ctx.const_n_prime.limbs.len(), NUM_LIMBS); // N' mod R has r limbs
     }
 
     #[test]

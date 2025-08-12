@@ -113,7 +113,7 @@ impl<P: Poly> BigUintPoly<P> {
     pub fn extend_size(&self, new_bit_size: usize) -> Self {
         debug_assert!(new_bit_size >= self.bit_size());
         debug_assert_eq!(new_bit_size % self.ctx.limb_bit_size, 0);
-        let limb_len = new_bit_size / self.ctx.limb_bit_size + 1;
+        let limb_len = new_bit_size / self.ctx.limb_bit_size;
         let mut limbs = self.limbs.clone();
         limbs.resize(limb_len, self.ctx.const_zero);
         Self { ctx: self.ctx.clone(), limbs, _p: PhantomData }
@@ -857,7 +857,7 @@ mod tests {
         let eval_result =
             circuit.eval(&params, &DCRTPoly::const_one(&params), &a_value, Some(plt_evaluator));
 
-        let extended_limb_len = 25 / LIMB_BIT_SIZE + 1; // 6 limbs for 25 bits (with +1 from extend_size)
+        let extended_limb_len = 25 / LIMB_BIT_SIZE; // 6 limbs for 25 bits (with +1 from extend_size)
         assert_eq!(eval_result.len(), extended_limb_len);
 
         // Check that the original value is preserved in the first limbs

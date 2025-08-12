@@ -513,7 +513,7 @@ checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 [[package]]
 name = "openfhe"
 version = "0.3.2"
-source = "git+https://github.com/MachinaIO/openfhe-rs.git?branch=feat-crt-param#5baac44b7ad8b322679ea334770ac62989acd5e0"
+source = "git+https://github.com/MachinaIO/openfhe-rs.git#44bf8595e3c37a40b9e32b84e15bd9d91a4d7420"
 dependencies = [
  "cxx",
  "cxx-build",

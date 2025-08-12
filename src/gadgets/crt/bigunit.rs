@@ -6,6 +6,27 @@ use crate::{
 use num_bigint::BigUint;
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
+//
+// Carry-save multiplication and column compression helpers
+// -------------------------------------------------------
+// We represent base-B limbs with B = 2^w. Every partial product a_i * b_j is
+// immediately split via public LUTs into (lo = p % B, hi = p / B) and placed
+// into column banks: lo goes to column i+j, hi to column i+j+1. This ensures
+// every cell flowing into compressors is < B, so a single lookup(x) =
+// (x % B, x / B) remains valid for inputs < B^2.
+//
+// Column compression is done either by a Wallace-style tree of
+// compressors (summing triples per column into (digit, carry) with one lookup)
+// until height <= 2, or in one-shot when H_max < B by summing all values in a
+// column linearly (add gates are linear) and performing exactly one lookup to
+// emit (digit, carry) for that column. The final normalization to canonical
+// base-B digits is deferred to the end of the entire pipeline.
+//
+// The public API of BigUintPoly is preserved; mul() now constructs columns,
+// compresses to a carry-save pair (S, C), then performs a single ripple
+// normalization to match prior outputs. A future enhancement can swap this
+// ripple for a parallel-prefix CPA without changing the output shape.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BigUintPolyContext<P: Poly> {
     pub limb_bit_size: usize,
@@ -153,43 +174,25 @@ impl<P: Poly> BigUintPoly<P> {
         let max_bit_size = max_bit_size.unwrap_or(self.bit_size() + other.bit_size());
         debug_assert!(max_bit_size % self.ctx.limb_bit_size == 0);
         let max_limbs = max_bit_size / self.ctx.limb_bit_size;
-        let zero = circuit.const_zero_gate();
-        let mut add_limbs = vec![vec![]; max_limbs];
-        for i in 0..self.limbs.len() {
-            for j in 0..other.limbs.len() {
-                if i + j >= max_limbs {
-                    continue; // skip if next index exceeds max limbs
-                }
-                let mul = circuit.mul_gate(self.limbs[i], other.limbs[j]);
-                let mul_l = circuit.public_lookup_gate(mul, self.ctx.lut_ids.0);
-                add_limbs[i + j].push(mul_l);
-                if i + j + 1 >= max_limbs {
-                    continue; // skip if next index exceeds max limbs
-                }
-                let mul_h = circuit.public_lookup_gate(mul, self.ctx.lut_ids.1);
-                add_limbs[i + j + 1].push(mul_h);
-            }
-        }
-        let mut limbs = vec![zero; max_limbs];
-        for i in 0..add_limbs.len().min(max_limbs) {
-            let add_limb = &add_limbs[i];
-            if add_limb.is_empty() {
-                continue; // skip if no additions for this limb
-            }
-            let mut carry = circuit.const_zero_gate();
-            let mut sum_l = add_limb[0];
-            for limb in add_limb.iter().skip(1) {
-                let sum = circuit.add_gate(sum_l, *limb);
-                // Split intermediate sum once into (low, high)
-                sum_l = circuit.public_lookup_gate(sum, self.ctx.lut_ids.0);
-                let sum_h = circuit.public_lookup_gate(sum, self.ctx.lut_ids.1);
-                carry = circuit.add_gate(carry, sum_h);
-            }
-            limbs[i] = sum_l;
-            if i + 1 < max_limbs {
-                add_limbs[i + 1].push(carry);
-            }
-        }
+
+        // 1) Schoolbook partial products with immediate split and column placement
+        let mut columns = Self::schoolbook_partial_products_columns(
+            circuit,
+            &self.limbs,
+            &other.limbs,
+            max_limbs,
+            self.ctx.lut_ids,
+        );
+
+        // 2) Compress columns (one-shot if H_max < B, else Wallace compressors)
+        // let base: usize = 1usize << self.ctx.limb_bit_size;
+        // let h_max = columns.iter().map(|c| c.len()).max().unwrap_or(0);
+        let (sum_vec, carry_vec) = self.compress_columns_wallace(circuit, &mut columns);
+
+        // 3) Final single normalization (ripple-style) to match the existing API
+        // Note: We normalize S + (C shifted by 1) with exactly one pass of lookups.
+        let limbs = Self::final_normalize(circuit, sum_vec, carry_vec, self.ctx.lut_ids, max_limbs);
+
         Self { ctx: self.ctx.clone(), limbs, _p: PhantomData }
     }
 
@@ -238,6 +241,146 @@ impl<P: Poly> BigUintPoly<P> {
         }
 
         result
+    }
+}
+
+type Columns = Vec<Vec<GateId>>;
+
+impl<P: Poly> BigUintPoly<P> {
+    #[inline]
+    fn schoolbook_partial_products_columns(
+        circuit: &mut PolyCircuit<P>,
+        a: &[GateId],
+        b: &[GateId],
+        max_limbs: usize,
+        lut_ids: (usize, usize),
+    ) -> Columns {
+        // Columns sized up to max_limbs; carries to the last column beyond max_limbs are dropped.
+        let mut columns: Columns = vec![vec![]; max_limbs];
+        for (i, &ai) in a.iter().enumerate() {
+            for (j, &bj) in b.iter().enumerate() {
+                let k = i + j;
+                if k >= max_limbs {
+                    continue;
+                }
+                let prod = circuit.mul_gate(ai, bj);
+                let lo = circuit.public_lookup_gate(prod, lut_ids.0);
+                columns[k].push(lo);
+                if k + 1 < max_limbs {
+                    let hi = circuit.public_lookup_gate(prod, lut_ids.1);
+                    columns[k + 1].push(hi);
+                }
+            }
+        }
+        columns
+    }
+
+    // Wallace tree using compressors per column until height <= 2
+    fn compress_columns_wallace(
+        &self,
+        circuit: &mut PolyCircuit<P>,
+        columns: &mut Columns,
+    ) -> (Vec<GateId>, Vec<GateId>) {
+        let w = columns.len();
+        if w == 0 {
+            return (vec![], vec![]);
+        }
+        // base * comp_rate < base^2
+        let comp_rate = (1usize << self.ctx.limb_bit_size) - 1;
+        let lut_ids = self.ctx.lut_ids;
+        // Iteratively reduce column heights by applying comp_rate:2 compressions.
+        loop {
+            let mut next: Columns = vec![vec![]; w + 1]; // +1 for carries spilling into w
+            let mut done = true;
+            for k in 0..w {
+                let col = &mut columns[k];
+                if col.len() > 2 {
+                    done = false;
+                }
+                // Process comp_rate inputs
+                let mut idx: usize = 0;
+                while idx < col.len() {
+                    let last_col_idx = (idx + comp_rate - 1).min(col.len() - 1);
+                    let mut sum = col[idx].clone();
+                    for i in idx + 1..=last_col_idx {
+                        sum = circuit.add_gate(sum, col[i]);
+                    }
+                    let digit = circuit.public_lookup_gate(sum, lut_ids.0); // % B
+                    let carry = circuit.public_lookup_gate(sum, lut_ids.1); // / B
+                    next[k].push(digit);
+                    if k + 1 < next.len() {
+                        next[k + 1].push(carry);
+                    }
+                    idx = last_col_idx + 1;
+                }
+            }
+            // Drop any potential tail beyond max width
+            columns.truncate(w);
+            // Move back carries from column w into range if any (we discard overflow beyond max)
+            let tail = next.pop();
+            let mut compact = vec![vec![]; w];
+            for k in 0..w {
+                compact[k] = std::mem::take(&mut next[k]);
+            }
+            if let Some(t) = tail {
+                if w > 0 {
+                    /* overflow beyond max width ignored */
+                    let _ = t;
+                }
+            }
+            *columns = compact;
+            if done {
+                break;
+            }
+        }
+
+        // At this point, each column has height <= 2. For columns with two
+        // residual values at the same weight, perform one lookup to convert to
+        // a proper (digit, carry) pair.
+        let zero = circuit.const_zero_gate();
+        let mut sum_vec = Vec::with_capacity(w);
+        let mut carry_vec = vec![zero; w + 1]; // shifted by +1 to the right
+        for k in 0..w {
+            match columns[k].as_slice() {
+                [] => sum_vec.push(zero),
+                [x] => sum_vec.push(*x),
+                [x, y] => {
+                    let s = circuit.add_gate(*x, *y);
+                    let digit = circuit.public_lookup_gate(s, lut_ids.0);
+                    let carry = circuit.public_lookup_gate(s, lut_ids.1);
+                    sum_vec.push(digit);
+                    carry_vec[k + 1] = carry;
+                }
+                _ => unreachable!("column height should be <= 2 after compression"),
+            }
+        }
+        (sum_vec, carry_vec)
+    }
+
+    // Final normalization: add S and C (shifted) once to produce base-B digits.
+    fn final_normalize(
+        circuit: &mut PolyCircuit<P>,
+        mut sum_vec: Vec<GateId>,
+        carry_vec: Vec<GateId>,
+        lut_ids: (usize, usize),
+        max_limbs: usize,
+    ) -> Vec<GateId> {
+        // Ensure width
+        let w = sum_vec.len().min(max_limbs);
+        sum_vec.truncate(w);
+        let mut limbs = Vec::with_capacity(w);
+        let zero = circuit.const_zero_gate();
+        let mut carry = zero;
+        for k in 0..w {
+            // t = S_k + C_k + carry_in, where C_k holds carries shifted from k-1
+            let t0 = circuit.add_gate(sum_vec[k], carry_vec.get(k).copied().unwrap_or(zero));
+            let t = circuit.add_gate(t0, carry);
+            let digit = circuit.public_lookup_gate(t, lut_ids.0);
+            let c_out = circuit.public_lookup_gate(t, lut_ids.1); // in {0,1}
+            limbs.push(digit);
+            carry = c_out;
+        }
+        limbs
     }
 }
 

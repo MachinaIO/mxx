@@ -8,6 +8,7 @@ use crate::{
 };
 use num_bigint::BigUint;
 use num_traits::One;
+// Montgomery modular multiplication (REDC)
 // ref: https://en.wikipedia.org/wiki/Montgomery_modular_multiplication
 // N: the modulus (assumed to be less than 2^64)
 // R: 2^{limb_bit_size * num_limbs}
@@ -104,7 +105,7 @@ impl<P: Poly> MontgomeryPoly<P> {
         debug_assert_eq!(value.limbs.len(), ctx.num_limbs, "Value limbs do not match context");
         // Multiply by R^2 then apply REDC: a * R^2 * R^(-1) = a * R
         let r2_mul = value.mul(&ctx.const_r2, circuit, None);
-        let reduced = montogomery_reduce(&ctx, circuit, &r2_mul);
+        let reduced = montgomery_reduce(&ctx, circuit, &r2_mul);
         Self { ctx, value: reduced }
     }
 
@@ -149,7 +150,7 @@ impl<P: Poly> MontgomeryPoly<P> {
     pub fn mul(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
         debug_assert_eq!(self.ctx, other.ctx);
         let muled = self.value.mul(&other.value, circuit, None);
-        let reduced = montogomery_reduce(&self.ctx, circuit, &muled);
+        let reduced = montgomery_reduce(&self.ctx, circuit, &muled);
         Self { ctx: self.ctx.clone(), value: reduced }
     }
 
@@ -158,7 +159,7 @@ impl<P: Poly> MontgomeryPoly<P> {
     /// This recovers the original integer from Montgomery form
     pub fn to_regular(&self, circuit: &mut PolyCircuit<P>) -> BigUintPoly<P> {
         // Apply REDC to Montgomery representation: aR * 1 * R^(-1) = a
-        montogomery_reduce(&self.ctx, circuit, &self.value)
+        montgomery_reduce(&self.ctx, circuit, &self.value)
     }
 
     pub fn finalize(&self, circuit: &mut PolyCircuit<P>) -> GateId {
@@ -167,7 +168,8 @@ impl<P: Poly> MontgomeryPoly<P> {
     }
 }
 
-fn montogomery_reduce<P: Poly>(
+/// Montgomery reduction (REDC).
+fn montgomery_reduce<P: Poly>(
     ctx: &MontgomeryContext<P>,
     circuit: &mut PolyCircuit<P>,
     t: &BigUintPoly<P>,
@@ -333,7 +335,7 @@ mod tests {
         // Create input for T value
         let t =
             BigUintPoly::<DCRTPoly>::new(ctx.big_uint_ctx.clone(), inputs[0..NUM_LIMBS].to_vec());
-        let result = montogomery_reduce(&ctx, &mut circuit, &t);
+        let result = montgomery_reduce(&ctx, &mut circuit, &t);
 
         circuit.output(result.limbs.clone());
 
@@ -379,7 +381,7 @@ mod tests {
         // Create input for T value
         let t =
             BigUintPoly::<DCRTPoly>::new(ctx.big_uint_ctx.clone(), inputs[0..NUM_LIMBS].to_vec());
-        let result = montogomery_reduce(&ctx, &mut circuit, &t);
+        let result = montgomery_reduce(&ctx, &mut circuit, &t);
 
         circuit.output(result.limbs.clone());
 

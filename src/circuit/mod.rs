@@ -1456,47 +1456,41 @@ mod tests {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
         let lt_isolate_id = circuit.register_general_lt_isolate_lookup(&params, 2);
+        // only assumes binary polynomials of degree n as input
+        let norm_bound = 1;
+        let lt_isolate_id = circuit.register_general_lt_isolate_lookup(&params, norm_bound);
+
         let inputs = circuit.input(1);
-        let a_poly = inputs[0];
-        let k = 2;
+        let a_poly_id = inputs[0];
         let n = params.ring_dimension() as usize;
         let isolated_coeffs = circuit.isolate_coeffs(a_poly, k, lt_isolate_id, n);
         circuit.output(isolated_coeffs);
 
-        // Create a test polynomial with coefficients: [2, 1, 0, 0] (2 + 1x)
-        let mut coeffs = vec![
-            <DCRTPoly as Poly>::Elem::zero(&params.modulus());
-            params.ring_dimension() as usize
-        ];
-        coeffs[0] = <DCRTPoly as Poly>::Elem::constant(&params.modulus(), 2);
-        coeffs[1] = <DCRTPoly as Poly>::Elem::constant(&params.modulus(), 1);
-        let test_poly = DCRTPoly::from_coeffs(&params, &coeffs);
+        // Create a random binary polynomial
+        let sampler = DCRTPolyUniformSampler::new();
+        let a_poly = sampler.sample_poly(&params, &DistType::BitDist);
+
+        assert!(a_poly.coeffs().len() == n);
+
         let plt_evaluator = PolyPltEvaluator::new();
         let result = circuit.eval(
             &params,
             &DCRTPoly::const_one(&params),
-            &[test_poly.clone()],
+            &[a_poly.clone()],
             Some(plt_evaluator),
         );
 
         // verify
-        assert_eq!(result.len(), k + 1);
+        // should return a vector of n constant polynomials
+        assert_eq!(result.len(), n);
+
         for (i, output) in result.iter().enumerate() {
-            let output_coeffs = output.coeffs();
-            // Each output should have only the constant term non-zero
-            for (j, coeff) in output_coeffs.iter().enumerate() {
+            let output_coeff = output.coeffs();
+            assert_eq!(output_coeff.len(), n);
+            for (j, coeff) in output_coeff.iter().enumerate() {
                 if j == 0 {
-                    let expected_value = if i == 0 {
                         2
-                    } else if i == 1 {
-                        1
-                    } else {
-                        0
-                    };
-                    assert_eq!(
-                        coeff,
-                        &<DCRTPoly as Poly>::Elem::constant(&params.modulus(), expected_value)
-                    );
+                    assert_eq!(coeff, &a_poly.coeffs()[i]);
                 } else {
                     assert_eq!(coeff, &<DCRTPoly as Poly>::Elem::zero(&params.modulus()));
                 }

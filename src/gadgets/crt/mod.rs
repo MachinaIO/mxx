@@ -167,6 +167,101 @@ impl<P: Poly> CrtPoly<P> {
         }
         output
     }
+
+    /// Generate CRT + limb extended input values from multiple value arrays.
+    /// This creates the interleaved input format expected by CrtPoly::from_inputs_interleaved.
+    ///
+    /// # Arguments
+    /// * `params` - The polynomial parameters
+    /// * `ctx` - The CRT context with Montgomery contexts for each slot
+    /// * `values` - A slice of value arrays, where each inner array has one value per CRT slot
+    /// * `limb_bit_size` - The bit size of each limb
+    ///
+    /// # Returns
+    /// A vector of polynomial values in interleaved format: [val0_slot0, val1_slot0, ...,
+    /// valN_slot0, val0_slot1, ...]
+    pub fn generate_input_values(
+        params: &P::Params,
+        ctx: &CrtContext<P>,
+        values: &[Vec<u64>],
+        limb_bit_size: usize,
+    ) -> Vec<P> {
+        // Validate all value arrays have the correct length
+        for (i, value_array) in values.iter().enumerate() {
+            assert_eq!(
+                value_array.len(),
+                ctx.mont_ctxes.len(),
+                "values[{}] must have one value per CRT slot",
+                i
+            );
+        }
+
+        let mut input_values = Vec::new();
+        let (_, crt_bits, _) = params.to_crt();
+        let num_limbs = crt_bits.div_ceil(limb_bit_size);
+
+        // For each CRT slot
+        for (slot_idx, _mont_ctx) in ctx.mont_ctxes.iter().enumerate() {
+            // For each input value
+            for value_array in values {
+                let val = value_array[slot_idx];
+                // Create limb values in interleaved order
+                input_values.extend(Self::create_limbs_from_u64(
+                    params,
+                    val,
+                    num_limbs,
+                    limb_bit_size,
+                ));
+            }
+        }
+
+        input_values
+    }
+
+    /// Generate CRT + limb extended input values from single values.
+    /// This broadcasts the single values to all CRT slots.
+    ///
+    /// # Arguments
+    /// * `params` - The polynomial parameters
+    /// * `ctx` - The CRT context with Montgomery contexts for each slot
+    /// * `values` - Single values that will be reduced modulo each slot's modulus
+    /// * `limb_bit_size` - The bit size of each limb
+    ///
+    /// # Returns
+    /// A vector of polynomial values in interleaved format
+    pub fn generate_input_values_from_single(
+        params: &P::Params,
+        ctx: &CrtContext<P>,
+        values: &[u64],
+        limb_bit_size: usize,
+    ) -> Vec<P> {
+        let (moduli, _, _) = params.to_crt();
+
+        // For each input value, create an array with the value reduced modulo each slot's modulus
+        let value_arrays: Vec<Vec<u64>> =
+            values.iter().map(|&val| moduli.iter().map(|&q_i| val % q_i).collect()).collect();
+
+        Self::generate_input_values(params, ctx, &value_arrays, limb_bit_size)
+    }
+
+    /// Helper function to create limb representation from a u64 value.
+    fn create_limbs_from_u64(
+        params: &P::Params,
+        value: u64,
+        num_limbs: usize,
+        limb_bit_size: usize,
+    ) -> Vec<P> {
+        let mut limbs = Vec::new();
+        let mut remaining_value = value;
+        let base = 1u64 << limb_bit_size;
+
+        for _ in 0..num_limbs {
+            let limb_value = remaining_value % base;
+            limbs.push(P::from_usize_to_constant(params, limb_value as usize));
+            remaining_value /= base;
+        }
+        limbs
+    }
 }
 
 #[cfg(test)]
@@ -178,7 +273,6 @@ mod tests {
         lookup::poly::PolyPltEvaluator,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
-    use rand::Rng;
     use std::sync::Arc;
 
     const LIMB_BIT_SIZE: usize = 5;
@@ -197,23 +291,6 @@ mod tests {
         let inputs = circuit.input(total_limbs);
         let ctx = Arc::new(CrtContext::setup(circuit, &params, LIMB_BIT_SIZE));
         (inputs, params, ctx)
-    }
-
-    fn create_test_value_from_u64(params: &DCRTPolyParams, value: u64) -> Vec<DCRTPoly> {
-        let mut limbs = Vec::new();
-        let mut remaining_value = value;
-        let base = 1u64 << LIMB_BIT_SIZE;
-
-        // Create enough limbs for the largest modulus context
-        let (_, crt_bits, _) = params.to_crt();
-        let num_limbs = crt_bits.div_ceil(LIMB_BIT_SIZE);
-
-        for _ in 0..num_limbs {
-            let limb_value = remaining_value % base;
-            limbs.push(DCRTPoly::from_usize_to_constant(params, limb_value as usize));
-            remaining_value /= base;
-        }
-        limbs
     }
 
     #[test]
@@ -251,32 +328,22 @@ mod tests {
         outputs.push(reconst);
         circuit.output(outputs);
 
-        // Generate random values less than each CRT slot's modulus q_i
-        let mut rng = rand::rng();
-        let mut values_a = Vec::new();
-        let mut values_b = Vec::new();
+        // Set fixed values for a and b.
+        let a: u64 = 42;
+        let b: u64 = 17;
 
-        for &q_i in moduli.iter() {
-            // Sample random values less than q_i but keep them small enough for lookup table
-            // let max_val = std::cmp::min(q_i - 1, 30); // Cap at 30 to stay within lookup table
-            // limits
-            let a_i = rng.random_range(0..q_i);
-            let b_i = rng.random_range(0..q_i);
+        // Use the helper function to generate input values.
+        // This will automatically reduce a and b modulo each CRT slot's modulus.
+        let input_values = CrtPoly::<DCRTPoly>::generate_input_values_from_single(
+            &params,
+            &crt_ctx,
+            &[a, b],
+            LIMB_BIT_SIZE,
+        );
 
-            values_a.push(a_i);
-            values_b.push(b_i);
-        }
-
-        let mut input_values = Vec::new();
-
-        for (i, _mont_ctx) in crt_ctx.mont_ctxes.iter().enumerate() {
-            let val_a = values_a[i % values_a.len()];
-            let val_b = values_b[i % values_b.len()];
-
-            // Create limb values for each slot
-            input_values.extend(create_test_value_from_u64(&params, val_a));
-            input_values.extend(create_test_value_from_u64(&params, val_b));
-        }
+        // Generate the values_a and values_b arrays for verification.
+        let values_a: Vec<u64> = moduli.iter().map(|&q_i| a % q_i).collect();
+        let values_b: Vec<u64> = moduli.iter().map(|&q_i| b % q_i).collect();
 
         // Evaluate the circuit
         let plt_evaluator = PolyPltEvaluator::new();
@@ -364,33 +431,22 @@ mod tests {
         outputs.push(reconst);
         circuit.output(outputs);
 
-        // Generate random values less than each CRT slot's modulus q_i
-        use rand::Rng;
-        let mut rng = rand::rng();
-        let mut values_a = Vec::new();
-        let mut values_b = Vec::new();
+        // Set fixed values for a and b.
+        let a: u64 = 100;
+        let b: u64 = 45;
 
-        for &q_i in moduli.iter() {
-            // Sample random values less than q_i but keep them small enough for lookup table
-            // let max_val = std::cmp::min(q_i - 1, 30); // Cap at 30 to stay within lookup table
-            // limits
-            let a_i = rng.random_range(0..q_i);
-            let b_i = rng.random_range(0..q_i);
+        // Use the helper function to generate input values.
+        // This will automatically reduce a and b modulo each CRT slot's modulus.
+        let input_values = CrtPoly::<DCRTPoly>::generate_input_values_from_single(
+            &params,
+            &crt_ctx,
+            &[a, b],
+            LIMB_BIT_SIZE,
+        );
 
-            values_a.push(a_i);
-            values_b.push(b_i);
-        }
-
-        let mut input_values = Vec::new();
-
-        for (i, _mont_ctx) in crt_ctx.mont_ctxes.iter().enumerate() {
-            let val_a = values_a[i % values_a.len()];
-            let val_b = values_b[i % values_b.len()];
-
-            // Create limb values for each slot
-            input_values.extend(create_test_value_from_u64(&params, val_a));
-            input_values.extend(create_test_value_from_u64(&params, val_b));
-        }
+        // Generate the values_a and values_b arrays for verification.
+        let values_a: Vec<u64> = moduli.iter().map(|&q_i| a % q_i).collect();
+        let values_b: Vec<u64> = moduli.iter().map(|&q_i| b % q_i).collect();
 
         // Evaluate the circuit
         let plt_evaluator = PolyPltEvaluator::new();
@@ -486,33 +542,22 @@ mod tests {
         outputs.push(reconst);
         circuit.output(outputs);
 
-        // Generate random values less than each CRT slot's modulus q_i
-        use rand::Rng;
-        let mut rng = rand::rng();
-        let mut values_a = Vec::new();
-        let mut values_b = Vec::new();
+        // Set fixed values for a and b.
+        let a: u64 = 7;
+        let b: u64 = 6;
 
-        for &q_i in moduli.iter() {
-            // Sample random values less than q_i but keep them small enough for lookup table
-            // let max_val = std::cmp::min(q_i - 1, 30); // Cap at 30 to stay within lookup table
-            // limits
-            let a_i = rng.random_range(0..q_i);
-            let b_i = rng.random_range(0..q_i);
+        // Use the helper function to generate input values.
+        // This will automatically reduce a and b modulo each CRT slot's modulus.
+        let input_values = CrtPoly::<DCRTPoly>::generate_input_values_from_single(
+            &params,
+            &crt_ctx,
+            &[a, b],
+            LIMB_BIT_SIZE,
+        );
 
-            values_a.push(a_i);
-            values_b.push(b_i);
-        }
-
-        let mut input_values = Vec::new();
-
-        for (i, _mont_ctx) in crt_ctx.mont_ctxes.iter().enumerate() {
-            let val_a = values_a[i % values_a.len()];
-            let val_b = values_b[i % values_b.len()];
-
-            // Create limb values for each slot
-            input_values.extend(create_test_value_from_u64(&params, val_a));
-            input_values.extend(create_test_value_from_u64(&params, val_b));
-        }
+        // Generate the values_a and values_b arrays for verification.
+        let values_a: Vec<u64> = moduli.iter().map(|&q_i| a % q_i).collect();
+        let values_b: Vec<u64> = moduli.iter().map(|&q_i| b % q_i).collect();
 
         // Evaluate the circuit
         let plt_evaluator = PolyPltEvaluator::new();

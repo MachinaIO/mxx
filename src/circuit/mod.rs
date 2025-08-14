@@ -1454,8 +1454,8 @@ mod tests {
     #[test]
     fn test_isolate_coeffs_circuit() {
         let params = DCRTPolyParams::default();
-        let mut circuit = PolyCircuit::new();
-        let lt_isolate_id = circuit.register_general_lt_isolate_lookup(&params, 2);
+        let mut circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
+
         // only assumes binary polynomials of degree n as input
         let norm_bound = 1;
         let lt_isolate_id = circuit.register_general_lt_isolate_lookup(&params, norm_bound);
@@ -1463,7 +1463,7 @@ mod tests {
         let inputs = circuit.input(1);
         let a_poly_id = inputs[0];
         let n = params.ring_dimension() as usize;
-        let isolated_coeffs = circuit.isolate_coeffs(a_poly, k, lt_isolate_id, n);
+        let isolated_coeffs = circuit.isolate_coeffs(a_poly_id, n - 1, lt_isolate_id, n);
         circuit.output(isolated_coeffs);
 
         // Create a random binary polynomial
@@ -1489,7 +1489,6 @@ mod tests {
             assert_eq!(output_coeff.len(), n);
             for (j, coeff) in output_coeff.iter().enumerate() {
                 if j == 0 {
-                        2
                     assert_eq!(coeff, &a_poly.coeffs()[i]);
                 } else {
                     assert_eq!(coeff, &<DCRTPoly as Poly>::Elem::zero(&params.modulus()));

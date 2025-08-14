@@ -66,6 +66,11 @@ impl<P: Poly> CrtPoly<P> {
         Self { ctx, slots }
     }
 
+    /// Returns all limbs from all slots sequentially as a Vec<GateId>.
+    pub fn limb(&self) -> Vec<GateId> {
+        self.slots.iter().flat_map(|slot| slot.value.limbs.clone()).collect()
+    }
+
     /// Create a CrtPoly from regular BigUintPoly values, automatically converting to Montgomery
     /// form.
     pub fn from_regular(

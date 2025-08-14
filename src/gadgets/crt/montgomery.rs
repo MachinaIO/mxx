@@ -89,10 +89,14 @@ impl<P: Poly> MontgomeryContext<P> {
 #[derive(Debug, Clone)]
 pub struct MontgomeryPoly<P: Poly> {
     ctx: Arc<MontgomeryContext<P>>,
-    value: BigUintPoly<P>,
+    pub value: BigUintPoly<P>,
 }
 
 impl<P: Poly> MontgomeryPoly<P> {
+    pub fn limb(self) -> Vec<GateId> {
+        self.value.limbs
+    }
+
     /// Convert a regular integer (< N) to Montgomery representation
     /// Computes REDC((a mod N)(R^2 mod N)) = a*R mod N
     /// where R = 2^(limb_bit_size * num_limbs)

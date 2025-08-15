@@ -110,6 +110,8 @@ impl<P: Poly> BigUintPoly<P> {
         Self { ctx, limbs, _p: PhantomData }
     }
 
+    /// Creates a BigUintPoly from a u64 input value
+    /// Converts the input to polynomial limbs with the specified bit size
     pub fn input_u64(
         ctx: Arc<BigUintPolyContext<P>>,
         circuit: &mut PolyCircuit<P>,

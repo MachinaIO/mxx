@@ -1286,7 +1286,7 @@ mod tests {
         // We can compute -1 as 0 - 1
         let expected = DCRTPoly::const_zero(&params) - DCRTPoly::const_one(&params);
 
-        // Verify the result
+        // verify
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], expected);
     }

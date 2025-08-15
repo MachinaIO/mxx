@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     circuit::{PolyCircuit, gate::GateId},
-    gadgets::crt::bigunit::{BigUintPoly, BigUintPolyContext},
+    gadgets::crt::bigunit::{BigUintPoly, BigUintPolyContext, u64_to_biguint_poly},
     poly::Poly,
     utils::mod_inverse,
 };
@@ -126,7 +126,7 @@ impl<P: Poly> MontgomeryPoly<P> {
         input: Option<u64>,
     ) -> (Self, Option<Vec<P>>) {
         let r = ctx.num_limbs * ctx.big_uint_ctx.limb_bit_size;
-        let input_montgomery = input.map(|input| (input << r) % ctx.n);
+        let input_montgomery = input.map(|input| u64_to_montgomery_form(&ctx, input));
         let (value, limb_polys) =
             BigUintPoly::input_u64(ctx.big_uint_ctx.clone(), circuit, params, r, input_montgomery);
         (Self { ctx, value }, limb_polys)
@@ -231,6 +231,20 @@ fn montgomery_reduce<P: Poly>(
     let (is_less, diff) = u_div.less_than(&ctx.const_n, circuit);
     // If u_div < N, keep u_div; otherwise use diff = u_div - N (mod B^r)
     u_div.cmux(&diff, is_less, circuit)
+}
+
+pub fn u64_to_montgomery_poly<P: Poly>(
+    ctx: &MontgomeryContext<P>,
+    params: &P::Params,
+    input: u64,
+) -> Vec<P> {
+    let input_montgomery = u64_to_montgomery_form(ctx, input);
+    u64_to_biguint_poly(&ctx.big_uint_ctx, params, input_montgomery, Some(ctx.num_limbs))
+}
+
+fn u64_to_montgomery_form<P: Poly>(ctx: &MontgomeryContext<P>, input: u64) -> u64 {
+    let r = ctx.num_limbs * ctx.big_uint_ctx.limb_bit_size;
+    (input << r) % ctx.n
 }
 
 #[cfg(test)]

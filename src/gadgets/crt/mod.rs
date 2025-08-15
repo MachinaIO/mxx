@@ -1,9 +1,10 @@
 pub mod bigunit;
 pub mod montgomery;
-
+use num_traits::ToPrimitive;
 use std::sync::Arc;
 
 use num_bigint::BigUint;
+use num_traits::FromPrimitive;
 
 use crate::{
     circuit::{PolyCircuit, gate::GateId},
@@ -232,14 +233,21 @@ impl<P: Poly> CrtPoly<P> {
     pub fn generate_input_values_from_single(
         params: &P::Params,
         ctx: &CrtContext<P>,
-        values: &[u64],
+        values: &[BigUint],
         limb_bit_size: usize,
     ) -> Vec<P> {
         let (moduli, _, _) = params.to_crt();
 
         // For each input value, create an array with the value reduced modulo each slot's modulus
-        let value_arrays: Vec<Vec<u64>> =
-            values.iter().map(|&val| moduli.iter().map(|&q_i| val % q_i).collect()).collect();
+        let value_arrays: Vec<Vec<u64>> = values
+            .iter()
+            .map(|val| {
+                moduli
+                    .iter()
+                    .map(|&q_i| (val % BigUint::from_u64(q_i).unwrap()).to_u64().unwrap())
+                    .collect()
+            })
+            .collect();
 
         Self::generate_input_values(params, ctx, &value_arrays, limb_bit_size)
     }
@@ -329,21 +337,27 @@ mod tests {
         circuit.output(outputs);
 
         // Set fixed values for a and b.
-        let a: u64 = 42;
-        let b: u64 = 17;
+        let a: BigUint = BigUint::from_u64(42).unwrap();
+        let b: BigUint = BigUint::from_u64(17).unwrap();
 
         // Use the helper function to generate input values.
         // This will automatically reduce a and b modulo each CRT slot's modulus.
         let input_values = CrtPoly::<DCRTPoly>::generate_input_values_from_single(
             &params,
             &crt_ctx,
-            &[a, b],
+            &[a.clone(), b.clone()],
             LIMB_BIT_SIZE,
         );
 
         // Generate the values_a and values_b arrays for verification.
-        let values_a: Vec<u64> = moduli.iter().map(|&q_i| a % q_i).collect();
-        let values_b: Vec<u64> = moduli.iter().map(|&q_i| b % q_i).collect();
+        let values_a: Vec<u64> = moduli
+            .iter()
+            .map(|q_i| (a.clone() % BigUint::from_u64(*q_i).unwrap()).to_u64().unwrap())
+            .collect();
+        let values_b: Vec<u64> = moduli
+            .iter()
+            .map(|q_i| (b.clone() % BigUint::from_u64(*q_i).unwrap()).to_u64().unwrap())
+            .collect();
 
         // Evaluate the circuit
         let plt_evaluator = PolyPltEvaluator::new();
@@ -432,21 +446,27 @@ mod tests {
         circuit.output(outputs);
 
         // Set fixed values for a and b.
-        let a: u64 = 100;
-        let b: u64 = 45;
+        let a: BigUint = BigUint::from_u64(100).unwrap();
+        let b: BigUint = BigUint::from_u64(45).unwrap();
 
         // Use the helper function to generate input values.
         // This will automatically reduce a and b modulo each CRT slot's modulus.
         let input_values = CrtPoly::<DCRTPoly>::generate_input_values_from_single(
             &params,
             &crt_ctx,
-            &[a, b],
+            &[a.clone(), b.clone()],
             LIMB_BIT_SIZE,
         );
 
         // Generate the values_a and values_b arrays for verification.
-        let values_a: Vec<u64> = moduli.iter().map(|&q_i| a % q_i).collect();
-        let values_b: Vec<u64> = moduli.iter().map(|&q_i| b % q_i).collect();
+        let values_a: Vec<u64> = moduli
+            .iter()
+            .map(|q_i| (a.clone() % BigUint::from_u64(*q_i).unwrap()).to_u64().unwrap())
+            .collect();
+        let values_b: Vec<u64> = moduli
+            .iter()
+            .map(|q_i| (b.clone() % BigUint::from_u64(*q_i).unwrap()).to_u64().unwrap())
+            .collect();
 
         // Evaluate the circuit
         let plt_evaluator = PolyPltEvaluator::new();
@@ -543,21 +563,27 @@ mod tests {
         circuit.output(outputs);
 
         // Set fixed values for a and b.
-        let a: u64 = 7;
-        let b: u64 = 6;
+        let a: BigUint = BigUint::from_u64(7).unwrap();
+        let b: BigUint = BigUint::from_u64(6).unwrap();
 
         // Use the helper function to generate input values.
         // This will automatically reduce a and b modulo each CRT slot's modulus.
         let input_values = CrtPoly::<DCRTPoly>::generate_input_values_from_single(
             &params,
             &crt_ctx,
-            &[a, b],
+            &[a.clone(), b.clone()],
             LIMB_BIT_SIZE,
         );
 
         // Generate the values_a and values_b arrays for verification.
-        let values_a: Vec<u64> = moduli.iter().map(|&q_i| a % q_i).collect();
-        let values_b: Vec<u64> = moduli.iter().map(|&q_i| b % q_i).collect();
+        let values_a: Vec<u64> = moduli
+            .iter()
+            .map(|q_i| (a.clone() % BigUint::from_u64(*q_i).unwrap()).to_u64().unwrap())
+            .collect();
+        let values_b: Vec<u64> = moduli
+            .iter()
+            .map(|q_i| (b.clone() % BigUint::from_u64(*q_i).unwrap()).to_u64().unwrap())
+            .collect();
 
         // Evaluate the circuit
         let plt_evaluator = PolyPltEvaluator::new();

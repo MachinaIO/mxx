@@ -53,7 +53,6 @@ impl<P: Poly> MontgomeryContext<P> {
         let r2 = r2_big.iter_u64_digits().next().unwrap_or(0);
 
         // Calculate N' such that N * N' ≡ -1 (mod B)
-        let base_big = BigUint::one() << limb_bit_size;
         let n_prime_big = Self::calculate_n_prime(&n_big, &r_big);
         let n_prime = n_prime_big.iter_u64_digits().next().unwrap_or(0);
         debug_assert_eq!(

@@ -89,10 +89,24 @@ impl<P: Poly> BigUintPoly<P> {
         Self { ctx, limbs, _p: PhantomData }
     }
 
+    pub fn input_u64(
+        ctx: Arc<BigUintPolyContext<P>>,
+        circuit: &mut PolyCircuit<P>,
+        params: &P::Params,
+        input_bit_size: usize,
+        input: Option<u64>,
+    ) -> (Self, Option<Vec<P>>) {
+        let num_limbs = input_bit_size.div_ceil(ctx.limb_bit_size);
+        let limb_gateids = circuit.input(num_limbs);
+        let limb_polys =
+            input.map(|input| u64_to_biguint_poly(&ctx, params, input, Some(num_limbs)));
+        (Self { ctx, limbs: limb_gateids, _p: PhantomData }, limb_polys)
+    }
+
     pub fn extend_size(&self, new_bit_size: usize) -> Self {
         debug_assert!(new_bit_size >= self.bit_size());
         debug_assert_eq!(new_bit_size % self.ctx.limb_bit_size, 0);
-        let limb_len = new_bit_size / self.ctx.limb_bit_size + 1;
+        let limb_len = new_bit_size / self.ctx.limb_bit_size;
         let mut limbs = self.limbs.clone();
         limbs.resize(limb_len, self.ctx.const_zero);
         Self { ctx: self.ctx.clone(), limbs, _p: PhantomData }
@@ -241,6 +255,26 @@ impl<P: Poly> BigUintPoly<P> {
     }
 }
 
+pub fn u64_to_biguint_poly<P: Poly>(
+    ctx: &BigUintPolyContext<P>,
+    params: &P::Params,
+    input: u64,
+    num_limbs: Option<usize>,
+) -> Vec<P> {
+    let mut limbs = vec![];
+    let base = 1u64 << ctx.limb_bit_size;
+    let mut remaining_value = input;
+    while remaining_value > 0 {
+        let limb = (remaining_value % base) as usize;
+        limbs.push(P::from_usize_to_constant(params, limb));
+        remaining_value /= base;
+    }
+    if let Some(num_limbs) = num_limbs {
+        limbs.extend(vec![P::const_zero(params); num_limbs - limbs.len()]);
+    }
+    limbs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,45 +291,34 @@ mod tests {
 
     fn create_test_context(
         circuit: &mut PolyCircuit<DCRTPoly>,
-        total_limbs: usize,
-    ) -> (Vec<GateId>, DCRTPolyParams, Arc<BigUintPolyContext<DCRTPoly>>) {
+    ) -> (DCRTPolyParams, Arc<BigUintPolyContext<DCRTPoly>>) {
         let params = DCRTPolyParams::default();
-        let inputs = circuit.input(total_limbs);
         let ctx = Arc::new(BigUintPolyContext::setup(circuit, &params, LIMB_BIT_SIZE));
-        (inputs, params, ctx)
-    }
-
-    fn create_test_biguint_from_value(
-        ctx: Arc<BigUintPolyContext<DCRTPoly>>,
-        params: &DCRTPolyParams,
-        value: u32,
-    ) -> Vec<DCRTPoly> {
-        let limb_len = LIMB_LEN;
-        let mut limbs = Vec::with_capacity(limb_len);
-        let mut remaining_value = value;
-        let base = 1u32 << ctx.limb_bit_size;
-
-        for _ in 0..limb_len {
-            let limb_value = remaining_value % base;
-            limbs.push(DCRTPoly::from_usize_to_constant(&params, limb_value as usize));
-            remaining_value /= base;
-        }
-
-        debug_assert_eq!(remaining_value, 0);
-        limbs
+        (params, ctx)
     }
 
     #[test]
     fn test_biguint_add() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 2 * LIMB_LEN);
-        let big_a = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[0..LIMB_LEN].to_vec());
-        let big_b = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[LIMB_LEN..].to_vec());
-        let result = big_a.add(&big_b, &mut circuit);
+        let (params, ctx) = create_test_context(&mut circuit);
+        let (big_a, a) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(15),
+        );
+        let (big_b, b) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(20),
+        );
+        let result = big_a.add(&big_b, &mut circuit).mod_limbs(LIMB_LEN + 1);
         circuit.output(result.limbs.clone());
 
-        let a = create_test_biguint_from_value(ctx.clone(), &params, 15);
-        let b = create_test_biguint_from_value(ctx.clone(), &params, 20);
+        let (a, b) = (a.unwrap(), b.unwrap());
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
             &params,
@@ -325,15 +348,26 @@ mod tests {
     #[test]
     fn test_biguint_add_with_carry() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 2 * LIMB_LEN);
-        let big_a = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[0..LIMB_LEN].to_vec());
-        let big_b = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[LIMB_LEN..].to_vec());
+        let (params, ctx) = create_test_context(&mut circuit);
+        // Use values that will cause carry with 20-bit input size (4 limbs of 5 bits each)
+        let (big_a, a) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(1_048_575),
+        );
+        let (big_b, b) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(1),
+        );
         let result = big_a.add(&big_b, &mut circuit);
         circuit.output(result.limbs.clone());
 
-        // Use values that will cause carry with 20-bit input size (4 limbs of 5 bits each)
-        let a = create_test_biguint_from_value(ctx.clone(), &params, 1048575); // 2^20 - 1
-        let b = create_test_biguint_from_value(ctx.clone(), &params, 1);
+        let (a, b) = (a.unwrap(), b.unwrap());
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
             &params,
@@ -363,17 +397,28 @@ mod tests {
     #[test]
     fn test_biguint_less_than_smaller() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 2 * LIMB_LEN);
-        let big_a = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[0..LIMB_LEN].to_vec());
-        let big_b = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[LIMB_LEN..].to_vec());
+        let (params, ctx) = create_test_context(&mut circuit);
+        // a < b (500 < 1000), so less_than should return 1 (true)
+        let (big_a, a) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(500),
+        );
+        let (big_b, b) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(1000),
+        );
         let (lt_result, diff) = big_a.less_than(&big_b, &mut circuit);
         let mut output_gates = vec![lt_result];
         output_gates.extend(diff.limbs.clone());
         circuit.output(output_gates);
 
-        // a < b (500 < 1000), so less_than should return 1 (true)
-        let a = create_test_biguint_from_value(ctx.clone(), &params, 500);
-        let b = create_test_biguint_from_value(ctx.clone(), &params, 1000);
+        let (a, b) = (a.unwrap(), b.unwrap());
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
             &params,
@@ -406,17 +451,28 @@ mod tests {
     #[test]
     fn test_biguint_less_than_equal() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 2 * LIMB_LEN);
-        let big_a = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[0..LIMB_LEN].to_vec());
-        let big_b = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[LIMB_LEN..].to_vec());
+        let (params, ctx) = create_test_context(&mut circuit);
+        // a == b (12345 == 12345), so less_than should return 0 (false)
+        let (big_a, a) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(12345),
+        );
+        let (big_b, b) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(12345),
+        );
         let (lt_result, diff) = big_a.less_than(&big_b, &mut circuit);
         let mut output_gates = vec![lt_result];
         output_gates.extend(diff.limbs.clone());
         circuit.output(output_gates);
 
-        // a == b (12345 == 12345), so less_than should return 0 (false)
-        let a = create_test_biguint_from_value(ctx.clone(), &params, 12345);
-        let b = create_test_biguint_from_value(ctx.clone(), &params, 12345);
+        let (a, b) = (a.unwrap(), b.unwrap());
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
             &params,
@@ -449,17 +505,28 @@ mod tests {
     #[test]
     fn test_biguint_less_than_greater() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 2 * LIMB_LEN);
-        let big_a = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[0..LIMB_LEN].to_vec());
-        let big_b = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[LIMB_LEN..].to_vec());
+        let (params, ctx) = create_test_context(&mut circuit);
+        // a > b (1000 > 500), so less_than should return 0 (false)
+        let (big_a, a) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(1000),
+        );
+        let (big_b, b) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(500),
+        );
         let (lt_result, diff) = big_a.less_than(&big_b, &mut circuit);
         let mut output_gates = vec![lt_result];
         output_gates.extend(diff.limbs.clone());
         circuit.output(output_gates);
 
-        // a > b (1000 > 500), so less_than should return 0 (false)
-        let a = create_test_biguint_from_value(ctx.clone(), &params, 1000);
-        let b = create_test_biguint_from_value(ctx.clone(), &params, 500);
+        let (a, b) = (a.unwrap(), b.unwrap());
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
             &params,
@@ -492,14 +559,25 @@ mod tests {
     #[test]
     fn test_biguint_mul_simple() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 2 * LIMB_LEN);
-        let big_a = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[0..LIMB_LEN].to_vec());
-        let big_b = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[LIMB_LEN..].to_vec());
-        let result = big_a.mul(&big_b, &mut circuit, None);
+        let (params, ctx) = create_test_context(&mut circuit);
+        let (big_a, a) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(123),
+        );
+        let (big_b, b) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(456),
+        );
+        let result = big_a.mul(&big_b, &mut circuit, Some(40));
         circuit.output(result.limbs.clone());
 
-        let a = create_test_biguint_from_value(ctx.clone(), &params, 123);
-        let b = create_test_biguint_from_value(ctx.clone(), &params, 456);
+        let (a, b) = (a.unwrap(), b.unwrap());
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
             &params,
@@ -530,16 +608,26 @@ mod tests {
     #[test]
     fn test_biguint_mul_with_overflow() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 2 * LIMB_LEN);
-        let big_a = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[0..LIMB_LEN].to_vec());
-        let big_b = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[LIMB_LEN..].to_vec());
+        let (params, ctx) = create_test_context(&mut circuit);
         // Use values that will cause overflow with 20-bit input size
+        let (big_a, a) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(1023),
+        );
+        let (big_b, b) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(1023),
+        );
         let result = big_a.mul(&big_b, &mut circuit, Some(40));
         circuit.output(result.limbs.clone());
 
-        // Use larger values that will produce overflow across multiple limbs
-        let a = create_test_biguint_from_value(ctx.clone(), &params, 1023); // near max for 10 bits
-        let b = create_test_biguint_from_value(ctx.clone(), &params, 1023);
+        let (a, b) = (a.unwrap(), b.unwrap());
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
             &params,
@@ -570,15 +658,14 @@ mod tests {
     #[test]
     fn test_biguint_zero() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (_, params, ctx) = create_test_context(&mut circuit, LIMB_LEN);
+        let (params, ctx) = create_test_context(&mut circuit);
 
         let zero = BigUintPoly::zero(ctx.clone(), INPUT_BIT_SIZE);
         circuit.output(zero.limbs.clone());
 
-        let dummy_input = create_test_biguint_from_value(ctx.clone(), &params, 0);
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result =
-            circuit.eval(&params, &DCRTPoly::const_one(&params), &dummy_input, Some(plt_evaluator));
+            circuit.eval(&params, &DCRTPoly::const_one(&params), &[], Some(plt_evaluator));
 
         assert_eq!(eval_result.len(), LIMB_LEN);
 
@@ -591,19 +678,30 @@ mod tests {
     #[test]
     fn test_biguint_extend_size() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, LIMB_LEN);
-        let big_a = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[0..LIMB_LEN].to_vec());
+        let (params, ctx) = create_test_context(&mut circuit);
+        let (big_a_full, a_value) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(12345),
+        );
+        let big_a = big_a_full.mod_limbs(LIMB_LEN);
 
         // Extend from 20 bits to 25 bits (5 limbs)
         let extended = big_a.extend_size(25);
         circuit.output(extended.limbs.clone());
 
-        let a_value = create_test_biguint_from_value(ctx.clone(), &params, 12345);
+        let a_value = a_value.unwrap();
         let plt_evaluator = PolyPltEvaluator::new();
-        let eval_result =
-            circuit.eval(&params, &DCRTPoly::const_one(&params), &a_value, Some(plt_evaluator));
+        let eval_result = circuit.eval(
+            &params,
+            &DCRTPoly::const_one(&params),
+            &[a_value].concat(),
+            Some(plt_evaluator),
+        );
 
-        let extended_limb_len = 25 / LIMB_BIT_SIZE + 1; // 6 limbs for 25 bits (with +1 from extend_size)
+        let extended_limb_len = 25 / LIMB_BIT_SIZE; // 6 limbs for 25 bits (with +1 from extend_size)
         assert_eq!(eval_result.len(), extended_limb_len);
 
         // Check that the original value is preserved in the first limbs
@@ -627,25 +725,32 @@ mod tests {
     #[test]
     fn test_biguint_add_different_limb_sizes() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, LIMB_LEN + 2);
+        let (params, ctx) = create_test_context(&mut circuit);
 
         // Create BigUints with different limb sizes
-        let big_a = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[0..LIMB_LEN].to_vec());
-        let big_b =
-            BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[LIMB_LEN..LIMB_LEN + 2].to_vec()); // only 2 limbs
+        let (big_a, a) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(100),
+        );
+        let (big_b, b) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            2 * LIMB_BIT_SIZE,
+            Some(50),
+        );
         let result = big_a.add(&big_b, &mut circuit);
         circuit.output(result.limbs.clone());
 
-        let a = create_test_biguint_from_value(ctx.clone(), &params, 100);
-        let b_limbs = vec![
-            DCRTPoly::from_usize_to_constant(&params, 50 % (1u32 << ctx.limb_bit_size) as usize),
-            DCRTPoly::from_usize_to_constant(&params, 50 / (1u32 << ctx.limb_bit_size) as usize),
-        ];
+        let (a, b) = (a.unwrap(), b.unwrap());
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
             &params,
             &DCRTPoly::const_one(&params),
-            &[a, b_limbs].concat(),
+            &[a, b].concat(),
             Some(plt_evaluator),
         );
 
@@ -670,25 +775,32 @@ mod tests {
     #[test]
     fn test_biguint_mul_different_limb_sizes() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, LIMB_LEN + 2);
+        let (params, ctx) = create_test_context(&mut circuit);
 
         // Create BigUints with different limb sizes
-        let big_a = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[0..LIMB_LEN].to_vec());
-        let big_b =
-            BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[LIMB_LEN..LIMB_LEN + 2].to_vec()); // only 2 limbs
+        let (big_a, a) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(100),
+        );
+        let (big_b, b) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            2 * LIMB_BIT_SIZE,
+            Some(50),
+        );
         let result = big_a.mul(&big_b, &mut circuit, None);
         circuit.output(result.limbs.clone());
 
-        let a = create_test_biguint_from_value(ctx.clone(), &params, 100);
-        let b_limbs = vec![
-            DCRTPoly::from_usize_to_constant(&params, 50 % (1u32 << ctx.limb_bit_size) as usize),
-            DCRTPoly::from_usize_to_constant(&params, 50 / (1u32 << ctx.limb_bit_size) as usize),
-        ];
+        let (a, b) = (a.unwrap(), b.unwrap());
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
             &params,
             &DCRTPoly::const_one(&params),
-            &[a, b_limbs].concat(),
+            &[a, b].concat(),
             Some(plt_evaluator),
         );
 
@@ -714,15 +826,26 @@ mod tests {
     #[test]
     fn test_biguint_left_shift() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, LIMB_LEN);
-        let big_a = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[0..LIMB_LEN].to_vec());
+        let (params, ctx) = create_test_context(&mut circuit);
+        let (big_a, a) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(12345),
+        );
+        // After shift, restrict to the first LIMB_LEN - 1 limbs for assertion
         let shifted = big_a.left_shift(1);
         circuit.output(shifted.limbs.clone());
 
-        let a = create_test_biguint_from_value(ctx.clone(), &params, 12345);
+        let a = a.unwrap();
         let plt_evaluator = PolyPltEvaluator::new();
-        let eval_result =
-            circuit.eval(&params, &DCRTPoly::const_one(&params), &a, Some(plt_evaluator));
+        let eval_result = circuit.eval(
+            &params,
+            &DCRTPoly::const_one(&params),
+            &[a].concat(),
+            Some(plt_evaluator),
+        );
 
         // Left shift by 1 means removing the first limb
         let mut expected_value = 12345u32;
@@ -747,17 +870,27 @@ mod tests {
     #[test]
     fn test_biguint_cmux() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 2 * LIMB_LEN + 1);
+        let (params, ctx) = create_test_context(&mut circuit);
 
-        let big_a = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[0..LIMB_LEN].to_vec());
-        let big_b =
-            BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[LIMB_LEN..2 * LIMB_LEN].to_vec());
-        let selector = inputs[2 * LIMB_LEN];
+        let (big_a, a) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(123),
+        );
+        let (big_b, b) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(456),
+        );
+        let selector = circuit.input(1)[0];
         let result = big_a.cmux(&big_b, selector, &mut circuit);
         circuit.output(result.limbs.clone());
 
-        let a = create_test_biguint_from_value(ctx.clone(), &params, 123);
-        let b = create_test_biguint_from_value(ctx.clone(), &params, 456);
+        let (a, b) = (a.unwrap(), b.unwrap());
         let selector_value = vec![DCRTPoly::from_usize_to_constant(&params, 1)]; // selector = 1, should return 'a'
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -789,17 +922,27 @@ mod tests {
     #[test]
     fn test_biguint_cmux_select_other() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 2 * LIMB_LEN + 1);
+        let (params, ctx) = create_test_context(&mut circuit);
 
-        let big_a = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[0..LIMB_LEN].to_vec());
-        let big_b =
-            BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[LIMB_LEN..2 * LIMB_LEN].to_vec());
-        let selector = inputs[2 * LIMB_LEN];
+        let (big_a, a) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(123),
+        );
+        let (big_b, b) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(456),
+        );
+        let selector = circuit.input(1)[0];
         let result = big_a.cmux(&big_b, selector, &mut circuit);
         circuit.output(result.limbs.clone());
 
-        let a = create_test_biguint_from_value(ctx.clone(), &params, 123);
-        let b = create_test_biguint_from_value(ctx.clone(), &params, 456);
+        let (a, b) = (a.unwrap(), b.unwrap());
         let selector_value = vec![DCRTPoly::from_usize_to_constant(&params, 0)]; // selector = 0, should return 'b'
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -831,16 +974,25 @@ mod tests {
     #[test]
     fn test_biguint_finalize() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, LIMB_LEN);
-        let big_a = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[0..LIMB_LEN].to_vec());
+        let (params, ctx) = create_test_context(&mut circuit);
+        let test_value = 12345u32;
+        let (big_a, a) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(test_value as u64),
+        );
         let finalized = big_a.finalize(&mut circuit);
         circuit.output(vec![finalized]);
-
-        let test_value = 12345u32;
-        let a = create_test_biguint_from_value(ctx.clone(), &params, test_value);
+        let a = a.unwrap();
         let plt_evaluator = PolyPltEvaluator::new();
-        let eval_result =
-            circuit.eval(&params, &DCRTPoly::const_one(&params), &a, Some(plt_evaluator));
+        let eval_result = circuit.eval(
+            &params,
+            &DCRTPoly::const_one(&params),
+            &[a].concat(),
+            Some(plt_evaluator),
+        );
 
         assert_eq!(eval_result.len(), 1);
         let coeffs = eval_result[0].coeffs();
@@ -850,17 +1002,26 @@ mod tests {
     #[test]
     fn test_biguint_finalize_large_value() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, LIMB_LEN);
-        let big_a = BigUintPoly::<DCRTPoly>::new(ctx.clone(), inputs[0..LIMB_LEN].to_vec());
+        let (params, ctx) = create_test_context(&mut circuit);
+        // Use a value that spans multiple limbs (2^20 - 1 = 1048575)
+        let test_value = 1_048_575u32;
+        let (big_a, a) = BigUintPoly::<DCRTPoly>::input_u64(
+            ctx.clone(),
+            &mut circuit,
+            &params,
+            INPUT_BIT_SIZE,
+            Some(test_value as u64),
+        );
         let finalized = big_a.finalize(&mut circuit);
         circuit.output(vec![finalized]);
-
-        // Use a value that spans multiple limbs (2^20 - 1 = 1048575)
-        let test_value = 1048575u32;
-        let a = create_test_biguint_from_value(ctx.clone(), &params, test_value);
+        let a = a.unwrap();
         let plt_evaluator = PolyPltEvaluator::new();
-        let eval_result =
-            circuit.eval(&params, &DCRTPoly::const_one(&params), &a, Some(plt_evaluator));
+        let eval_result = circuit.eval(
+            &params,
+            &DCRTPoly::const_one(&params),
+            &[a].concat(),
+            Some(plt_evaluator),
+        );
 
         assert_eq!(eval_result.len(), 1);
         let coeffs = eval_result[0].coeffs();

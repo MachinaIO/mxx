@@ -46,8 +46,11 @@ impl<P: Poly> Eq for PolyCircuit<P> {}
 
 impl<P: Poly> PolyCircuit<P> {
     pub fn new() -> Self {
+        let mut gates = BTreeMap::new();
+        // Ensure the reserved constant-one gate exists at GateId(0)
+        gates.insert(GateId(0), PolyGate::new(GateId(0), PolyGateType::Input, vec![]));
         Self {
-            gates: BTreeMap::new(),
+            gates,
             print_value: BTreeMap::new(),
             sub_circuits: BTreeMap::new(),
             output_ids: vec![],
@@ -95,10 +98,6 @@ impl<P: Poly> PolyCircuit<P> {
     }
 
     pub fn input(&mut self, num_input: usize) -> Vec<GateId> {
-        // Ensure the reserved constant-one gate exists at GateId(0)
-        if !self.gates.contains_key(&GateId(0)) {
-            self.gates.insert(GateId(0), PolyGate::new(GateId(0), PolyGateType::Input, vec![]));
-        }
         let mut input_gates = Vec::with_capacity(num_input);
         for _ in 0..num_input {
             let next_id = self.gates.len();
@@ -214,7 +213,6 @@ impl<P: Poly> PolyCircuit<P> {
     fn new_gate_generic(&mut self, inputs: Vec<GateId>, gate_type: PolyGateType) -> GateId {
         #[cfg(debug_assertions)]
         {
-            assert_ne!(self.num_input, 0);
             assert_eq!(self.output_ids.len(), 0);
             assert_eq!(inputs.len(), gate_type.num_input());
             for gate_id in inputs.iter() {

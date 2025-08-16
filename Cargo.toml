@@ -16,7 +16,7 @@ serde_json = "1.0"
 libc = { version = "0.2", optional = true }
 memmap2 = { version = "0.9.5", optional = true }
 openfhe = { git = "https://github.com/MachinaIO/openfhe-rs.git" }
-num-bigint = { version = "0.4", features = ["serde"] }
+num-bigint = { version = "0.4", features = ["serde", "rand"] }
 num-traits = "0.2.19"
 rayon = { version = "1.5" }
 itertools = "0.14.0"

@@ -349,7 +349,7 @@ mod tests {
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
     use num_bigint::BigUint;
-    use num_traits::{ToPrimitive, Zero};
+    use num_traits::Zero;
     use rand::Rng;
     use std::sync::Arc;
 
@@ -386,7 +386,7 @@ mod tests {
         let (params, crt_ctx) = create_test_context(&mut circuit);
 
         // Generate random values for a and b within modulus bounds
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let modulus = params.modulus();
         let max_val = modulus.as_ref();
         let a: BigUint = gen_biguint_below(&mut rng, &max_val);
@@ -442,7 +442,7 @@ mod tests {
         let (params, crt_ctx) = create_test_context(&mut circuit);
 
         // Generate random values for a and b within modulus bounds
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let modulus = params.modulus();
         let max_val = modulus.as_ref();
         let a: BigUint = gen_biguint_below(&mut rng, &max_val);
@@ -500,7 +500,7 @@ mod tests {
 
         // Generate random values for a and b within modulus bounds (smaller range for
         // multiplication)
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let max_val = params.modulus();
         let a: BigUint = gen_biguint_below(&mut rng, &max_val);
         let b: BigUint = gen_biguint_below(&mut rng, &max_val);

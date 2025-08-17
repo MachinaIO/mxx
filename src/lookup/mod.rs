@@ -31,7 +31,6 @@ impl<P: Poly> PublicLut<P> {
         let in_coeffs = x.coeffs();
         let mut row_idxes = vec![];
         let mut out_coeffs = vec![];
-        println!("x coeffs {:?}", x.coeffs());
         for (i, f) in self.fs.iter().enumerate() {
             match f.get(&in_coeffs[i]) {
                 Some((out_idx, out_coeff)) => {

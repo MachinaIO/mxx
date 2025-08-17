@@ -1,8 +1,7 @@
 use crate::{
     circuit::gate::GateId,
-    element::PolyElem,
     lookup::{PltEvaluator, PublicLut},
-    poly::{Poly, PolyParams},
+    poly::Poly,
 };
 
 #[derive(Debug, Clone)]

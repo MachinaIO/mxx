@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash)]
 pub struct FinRingElem {
     pub(crate) value: BigUint,
     pub(crate) modulus: Arc<BigUint>,

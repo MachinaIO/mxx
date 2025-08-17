@@ -1,7 +1,8 @@
 use crate::{
     circuit::{PolyCircuit, gate::GateId},
+    element::PolyElem,
     lookup::PublicLut,
-    poly::Poly,
+    poly::{Poly, PolyParams},
 };
 use num_bigint::BigUint;
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
@@ -57,16 +58,16 @@ impl<P: Poly> BigUintPolyContext<P> {
         base: usize,
         nrows: usize,
     ) -> (PublicLut<P>, PublicLut<P>) {
-        let mut f = HashMap::with_capacity(nrows);
-        let mut g = HashMap::with_capacity(nrows);
+        let mut f = HashMap::<P::Elem, (usize, P::Elem)>::with_capacity(nrows);
+        let mut g = HashMap::<P::Elem, (usize, P::Elem)>::with_capacity(nrows);
         for k in 0..nrows {
-            let input = P::from_usize_to_constant(params, k);
-            let output_f = P::from_usize_to_constant(params, k % base);
-            let output_g = P::from_usize_to_constant(params, k / base);
+            let input = <P::Elem as PolyElem>::constant(&params.modulus(), k as u64);
+            let output_f = <P::Elem as PolyElem>::constant(&params.modulus(), (k % base) as u64);
+            let output_g = <P::Elem as PolyElem>::constant(&params.modulus(), (k / base) as u64);
             f.insert(input.clone(), (k, output_f));
             g.insert(input, (k, output_g));
         }
-        (PublicLut::new(f), PublicLut::new(g))
+        (PublicLut::new(vec![f]), PublicLut::new(vec![g]))
     }
 }
 

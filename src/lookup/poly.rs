@@ -1,16 +1,17 @@
 use crate::{
     circuit::gate::GateId,
+    element::PolyElem,
     lookup::{PltEvaluator, PublicLut},
-    poly::Poly,
+    poly::{Poly, PolyParams},
 };
 
 #[derive(Debug, Clone)]
 pub struct PolyPltEvaluator {}
 
 impl<P: Poly> PltEvaluator<P> for PolyPltEvaluator {
-    fn public_lookup(&self, _: &P::Params, plt: &PublicLut<P>, input: P, _: GateId) -> P {
-        // Lookup returns (k, y_k); we just return y_k for polynomial evaluation.
-        plt.f.get(&input).expect("PolyPltEvaluator's public lookup cannot fetch y_k").1.clone()
+    fn public_lookup(&self, params: &P::Params, plt: &PublicLut<P>, input: P, _: GateId) -> P {
+        let outputs = plt.get(params, &input).expect("output of the lookup evaluation not found");
+        outputs.1
     }
 }
 

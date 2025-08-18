@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrtContext<P: Poly> {
-    pub mont_ctxes: Vec<MontgomeryContext<P>>,
+    pub mont_ctxes: Vec<Arc<MontgomeryContext<P>>>,
     pub q_over_qis: Vec<BigUint>,
     pub reconstruct_coeffs: Vec<BigUint>,
 }
@@ -27,7 +27,13 @@ impl<P: Poly> CrtContext<P> {
         let mont_ctxes = moduli
             .iter()
             .map(|modulus| {
-                MontgomeryContext::setup(circuit, params, limb_bit_size, num_limbs, *modulus)
+                Arc::new(MontgomeryContext::setup(
+                    circuit,
+                    params,
+                    limb_bit_size,
+                    num_limbs,
+                    *modulus,
+                ))
             })
             .collect();
 
@@ -54,6 +60,7 @@ impl<P: Poly> CrtContext<P> {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct CrtPoly<P: Poly> {
     pub ctx: Arc<CrtContext<P>>,
     pub slots: Vec<MontgomeryPoly<P>>,
@@ -69,57 +76,15 @@ impl<P: Poly> CrtPoly<P> {
         self.slots.iter().flat_map(|slot| slot.value.limbs.clone()).collect()
     }
 
-    /// Creates a CrtPoly from a BigUint input by distributing it across CRT slots.
-    ///
-    /// This function takes a BigUint value, reduces it modulo each CRT slot's modulus,
-    /// and creates Montgomery polynomial representations for each slot.
-    ///
-    /// # Arguments
-    /// * `ctx` - The CRT context containing Montgomery contexts for each slot
-    /// * `circuit` - The polynomial circuit to add gates to
-    /// * `params` - The polynomial parameters
-    /// * `input` - Optional BigUint value to distribute across CRT slots
-    ///
-    /// # Returns
-    /// A tuple containing:
-    /// * `Self` - The created CrtPoly with values in each slot
-    /// * `Option<Vec<P>>` - Optional vector of limb polynomials from all slots
-    pub fn input_biguint(
-        ctx: Arc<CrtContext<P>>,
-        circuit: &mut PolyCircuit<P>,
-        params: &P::Params,
-        input: Option<BigUint>,
-    ) -> (Self, Option<Vec<P>>) {
-        let crted_inputs = input.as_ref().map(|input| biguint_to_crt_slots::<P>(params, input));
+    /// Allocate input polynomials for a CrtPoly
+    pub fn input(ctx: Arc<CrtContext<P>>, circuit: &mut PolyCircuit<P>) -> Self {
+        // let crted_inputs = input.as_ref().map(|input| biguint_to_crt_slots::<P>(params, input));
         let mut slots = vec![];
-        let mut limb_polys: Vec<P> = vec![];
-
-        match crted_inputs {
-            Some(inputs) => {
-                for (mont_ctx, &input_val) in ctx.mont_ctxes.iter().zip(inputs.iter()) {
-                    let (mont_poly, limbs) = MontgomeryPoly::input_u64(
-                        Arc::new(mont_ctx.clone()),
-                        circuit,
-                        params,
-                        Some(input_val),
-                    );
-                    slots.push(mont_poly);
-                    limb_polys.extend(limbs.unwrap());
-                }
-            }
-            None => {
-                for mont_ctx in &ctx.mont_ctxes {
-                    let (mont_poly, _) = MontgomeryPoly::input_u64(
-                        Arc::new(mont_ctx.clone()),
-                        circuit,
-                        params,
-                        None,
-                    );
-                    slots.push(mont_poly);
-                }
-            }
+        for mont_ctx in &ctx.mont_ctxes {
+            let mont_poly = MontgomeryPoly::input(mont_ctx.clone(), circuit);
+            slots.push(mont_poly);
         }
-        (Self { ctx, slots }, if limb_polys.is_empty() { None } else { Some(limb_polys) })
+        Self { ctx, slots }
     }
 
     /// Create a CrtPoly from regular BigUintPoly values, automatically converting to Montgomery
@@ -138,45 +103,11 @@ impl<P: Poly> CrtPoly<P> {
         let slots: Vec<MontgomeryPoly<P>> = values
             .into_iter()
             .zip(&ctx.mont_ctxes)
-            .map(|(value, mont_ctx)| {
-                MontgomeryPoly::from_regular(circuit, Arc::new(mont_ctx.clone()), value)
-            })
+            .map(|(value, mont_ctx)| MontgomeryPoly::from_regular(circuit, mont_ctx.clone(), value))
             .collect();
 
         Self::new(ctx, slots)
     }
-
-    // /// Create a CrtPoly directly from input gates, handling all the complexity
-    // ///
-    // /// Interleaved input order: [A_slot0, B_slot0, A_slot1, B_slot1,
-    // /// ...]
-    // pub fn from_inputs_interleaved(
-    //     circuit: &mut PolyCircuit<P>,
-    //     ctx: Arc<CrtContext<P>>,
-    //     inputs: &[GateId],
-    //     limbs_per_slot: usize,
-    //     value_index: usize,
-    //     values_per_slot: usize,
-    // ) -> Self {
-    //     let values: Vec<BigUintPoly<P>> = ctx
-    //         .mont_ctxes
-    //         .iter()
-    //         .enumerate()
-    //         .map(|(slot_idx, mont_ctx)| {
-    //             // Calculate the starting position for this value in this slot
-    //             let slot_start = slot_idx * limbs_per_slot * values_per_slot;
-    //             let value_start = slot_start + value_index * limbs_per_slot;
-    //             let value_end = value_start + limbs_per_slot;
-
-    //             BigUintPoly::new(
-    //                 mont_ctx.big_uint_ctx.clone(),
-    //                 inputs[value_start..value_end].to_vec(),
-    //             )
-    //         })
-    //         .collect();
-
-    //     Self::from_regular(circuit, ctx, values)
-    // }
 
     pub fn add(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
         debug_assert_eq!(self.ctx, other.ctx);
@@ -218,119 +149,19 @@ impl<P: Poly> CrtPoly<P> {
         }
         output
     }
-
-    // /// Generate CRT + limb extended input values from multiple value arrays.
-    // /// This creates the interleaved input format expected by CrtPoly::from_inputs_interleaved.
-    // ///
-    // /// # Arguments
-    // /// * `params` - The polynomial parameters
-    // /// * `ctx` - The CRT context with Montgomery contexts for each slot
-    // /// * `values` - A slice of value arrays, where each inner array has one value per CRT slot
-    // /// * `limb_bit_size` - The bit size of each limb
-    // ///
-    // /// # Returns
-    // /// A vector of polynomial values in interleaved format: [val0_slot0, val1_slot0, ...,
-    // /// valN_slot0, val0_slot1, ...]
-    // pub fn generate_input_values(
-    //     params: &P::Params,
-    //     ctx: &CrtContext<P>,
-    //     values: &[Vec<u64>],
-    //     limb_bit_size: usize,
-    // ) -> Vec<P> {
-    //     // Validate all value arrays have the correct length
-    //     for (i, value_array) in values.iter().enumerate() {
-    //         assert_eq!(
-    //             value_array.len(),
-    //             ctx.mont_ctxes.len(),
-    //             "values[{}] must have one value per CRT slot",
-    //             i
-    //         );
-    //     }
-
-    //     let mut input_values = Vec::new();
-    //     let (_, crt_bits, _) = params.to_crt();
-    //     let num_limbs = crt_bits.div_ceil(limb_bit_size);
-
-    //     // For each CRT slot
-    //     for (slot_idx, _mont_ctx) in ctx.mont_ctxes.iter().enumerate() {
-    //         // For each input value
-    //         for value_array in values {
-    //             let val = value_array[slot_idx];
-    //             // Create limb values in interleaved order
-    //             input_values.extend(Self::create_limbs_from_u64(
-    //                 params,
-    //                 val,
-    //                 num_limbs,
-    //                 limb_bit_size,
-    //             ));
-    //         }
-    //     }
-
-    //     input_values
-    // }
-
-    // /// Generate CRT + limb extended input values from single values.
-    // /// This broadcasts the single values to all CRT slots.
-    // ///
-    // /// # Arguments
-    // /// * `params` - The polynomial parameters
-    // /// * `ctx` - The CRT context with Montgomery contexts for each slot
-    // /// * `values` - Single values that will be reduced modulo each slot's modulus
-    // /// * `limb_bit_size` - The bit size of each limb
-    // ///
-    // /// # Returns
-    // /// A vector of polynomial values in interleaved format
-    // pub fn generate_input_values_from_single(
-    //     params: &P::Params,
-    //     ctx: &CrtContext<P>,
-    //     values: &[BigUint],
-    //     limb_bit_size: usize,
-    // ) -> Vec<P> {
-    //     let (moduli, _, _) = params.to_crt();
-
-    //     // For each input value, create an array with the value reduced modulo each slot's
-    // modulus     let value_arrays: Vec<Vec<u64>> = values
-    //         .iter()
-    //         .map(|val| {
-    //             moduli
-    //                 .iter()
-    //                 .map(|&q_i| (val % BigUint::from_u64(q_i).unwrap()).to_u64().unwrap())
-    //                 .collect()
-    //         })
-    //         .collect();
-
-    //     Self::generate_input_values(params, ctx, &value_arrays, limb_bit_size)
-    // }
-
-    // /// Helper function to create limb representation from a u64 value.
-    // fn create_limbs_from_u64(
-    //     params: &P::Params,
-    //     value: u64,
-    //     num_limbs: usize,
-    //     limb_bit_size: usize,
-    // ) -> Vec<P> {
-    //     let mut limbs = Vec::new();
-    //     let mut remaining_value = value;
-    //     let base = 1u64 << limb_bit_size;
-
-    //     for _ in 0..num_limbs {
-    //         let limb_value = remaining_value % base;
-    //         limbs.push(P::from_usize_to_constant(params, limb_value as usize));
-    //         remaining_value /= base;
-    //     }
-    //     limbs
-    // }
 }
 
 pub fn biguint_to_crt_poly<P: Poly>(
-    ctx: &CrtContext<P>,
+    limb_bit_size: usize,
     params: &P::Params,
     input: &BigUint,
 ) -> Vec<P> {
     let crted_inputs = biguint_to_crt_slots::<P>(params, input);
+    let (moduli, crt_bits, _crt_depth) = params.to_crt();
+    let num_limbs = crt_bits.div_ceil(limb_bit_size);
     let mut limb_polys: Vec<P> = vec![];
-    for (mont_ctx, input) in ctx.mont_ctxes.iter().zip(crted_inputs.into_iter()) {
-        limb_polys.extend(u64_to_montgomery_poly(mont_ctx, params, input));
+    for (module, input) in moduli.into_iter().zip(crted_inputs.into_iter()) {
+        limb_polys.extend(u64_to_montgomery_poly(limb_bit_size, num_limbs, module, params, input));
     }
     limb_polys
 }
@@ -395,10 +226,10 @@ mod tests {
         let expected_output_slots =
             biguint_to_crt_slots::<DCRTPoly>(&params, &expected_output_biguint);
 
-        let (crt_poly_a, values_a) =
-            CrtPoly::input_biguint(crt_ctx.clone(), &mut circuit, &params, Some(a));
-        let (crt_poly_b, values_b) =
-            CrtPoly::input_biguint(crt_ctx.clone(), &mut circuit, &params, Some(b));
+        let crt_poly_a = CrtPoly::input(crt_ctx.clone(), &mut circuit);
+        let values_a = biguint_to_crt_poly(LIMB_BIT_SIZE, &params, &a);
+        let crt_poly_b = CrtPoly::input(crt_ctx.clone(), &mut circuit);
+        let values_b = biguint_to_crt_poly(LIMB_BIT_SIZE, &params, &b);
 
         // Perform addition
         let crt_sum = crt_poly_a.add(&crt_poly_b, &mut circuit);
@@ -411,7 +242,7 @@ mod tests {
 
         // Evaluate the circuit
         let plt_evaluator = PolyPltEvaluator::new();
-        let input_values = [values_a.unwrap(), values_b.unwrap()].concat();
+        let input_values = [values_a, values_b].concat();
         let eval_result = circuit.eval(
             &params,
             &DCRTPoly::const_one(&params),
@@ -452,10 +283,10 @@ mod tests {
         let expected_output_slots =
             biguint_to_crt_slots::<DCRTPoly>(&params, &expected_output_biguint);
 
-        let (crt_poly_a, values_a) =
-            CrtPoly::input_biguint(crt_ctx.clone(), &mut circuit, &params, Some(a));
-        let (crt_poly_b, values_b) =
-            CrtPoly::input_biguint(crt_ctx.clone(), &mut circuit, &params, Some(b));
+        let crt_poly_a = CrtPoly::input(crt_ctx.clone(), &mut circuit);
+        let values_a = biguint_to_crt_poly(LIMB_BIT_SIZE, &params, &a);
+        let crt_poly_b = CrtPoly::input(crt_ctx.clone(), &mut circuit);
+        let values_b = biguint_to_crt_poly(LIMB_BIT_SIZE, &params, &b);
 
         // Perform subtraction
         let crt_diff = crt_poly_a.sub(&crt_poly_b, &mut circuit);
@@ -468,7 +299,7 @@ mod tests {
 
         // Evaluate the circuit
         let plt_evaluator = PolyPltEvaluator::new();
-        let input_values = [values_a.unwrap(), values_b.unwrap()].concat();
+        let input_values = [values_a, values_b].concat();
         let eval_result = circuit.eval(
             &params,
             &DCRTPoly::const_one(&params),
@@ -508,10 +339,10 @@ mod tests {
         let expected_output_slots =
             biguint_to_crt_slots::<DCRTPoly>(&params, &expected_output_biguint);
 
-        let (crt_poly_a, values_a) =
-            CrtPoly::input_biguint(crt_ctx.clone(), &mut circuit, &params, Some(a));
-        let (crt_poly_b, values_b) =
-            CrtPoly::input_biguint(crt_ctx.clone(), &mut circuit, &params, Some(b));
+        let crt_poly_a = CrtPoly::input(crt_ctx.clone(), &mut circuit);
+        let values_a = biguint_to_crt_poly(LIMB_BIT_SIZE, &params, &a);
+        let crt_poly_b = CrtPoly::input(crt_ctx.clone(), &mut circuit);
+        let values_b = biguint_to_crt_poly(LIMB_BIT_SIZE, &params, &b);
 
         // Perform multiplication
         let crt_product = crt_poly_a.mul(&crt_poly_b, &mut circuit);
@@ -524,7 +355,7 @@ mod tests {
 
         // Evaluate the circuit
         let plt_evaluator = PolyPltEvaluator::new();
-        let input_values = [values_a.unwrap(), values_b.unwrap()].concat();
+        let input_values = [values_a, values_b].concat();
         let eval_result = circuit.eval(
             &params,
             &DCRTPoly::const_one(&params),

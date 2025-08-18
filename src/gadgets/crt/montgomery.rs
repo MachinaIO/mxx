@@ -15,8 +15,8 @@ use num_traits::One;
 #[derive(Debug, Clone)]
 pub struct MontgomeryContext<P: Poly> {
     pub big_uint_ctx: Arc<BigUintPolyContext<P>>,
-    num_limbs: usize,         // Number of limbs for N
-    n: u64,                   // N
+    pub num_limbs: usize,     // Number of limbs for N
+    pub n: u64,               // N
     const_n: BigUintPoly<P>,  // N in the circuit
     const_r2: BigUintPoly<P>, // R^2 mod N
     const_n_prime: BigUintPoly<P>, /* N' s.t. N' * N = -1 mod R, R = 2^{limb_bit_size *
@@ -117,19 +117,14 @@ impl<P: Poly> MontgomeryPoly<P> {
         Self { ctx, value }
     }
 
-    /// Creates a MontgomeryPoly from a u64 input value
-    /// Converts the input to Montgomery representation before creating polynomial limbs
-    pub fn input_u64(
-        ctx: Arc<MontgomeryContext<P>>,
-        circuit: &mut PolyCircuit<P>,
-        params: &P::Params,
-        input: Option<u64>,
-    ) -> (Self, Option<Vec<P>>) {
-        let r = ctx.num_limbs * ctx.big_uint_ctx.limb_bit_size;
-        let input_montgomery = input.map(|input| u64_to_montgomery_form(&ctx, input));
-        let (value, limb_polys) =
-            BigUintPoly::input_u64(ctx.big_uint_ctx.clone(), circuit, params, r, input_montgomery);
-        (Self { ctx, value }, limb_polys)
+    /// Allocate input polynomials for a MontgomeryPoly
+    pub fn input(ctx: Arc<MontgomeryContext<P>>, circuit: &mut PolyCircuit<P>) -> Self {
+        let value = BigUintPoly::input(
+            ctx.big_uint_ctx.clone(),
+            circuit,
+            ctx.num_limbs * ctx.big_uint_ctx.limb_bit_size,
+        );
+        Self { ctx, value }
     }
 
     /// Convert a regular integer (< N) to Montgomery representation
@@ -234,17 +229,19 @@ fn montgomery_reduce<P: Poly>(
 }
 
 pub fn u64_to_montgomery_poly<P: Poly>(
-    ctx: &MontgomeryContext<P>,
+    limb_bit_size: usize,
+    num_limbs: usize,
+    n: u64,
     params: &P::Params,
     input: u64,
 ) -> Vec<P> {
-    let input_montgomery = u64_to_montgomery_form(ctx, input);
-    u64_to_biguint_poly(&ctx.big_uint_ctx, params, input_montgomery, Some(ctx.num_limbs))
+    let input_montgomery = u64_to_montgomery_form(limb_bit_size, num_limbs, n, input);
+    u64_to_biguint_poly(limb_bit_size, params, input_montgomery, Some(num_limbs))
 }
 
-fn u64_to_montgomery_form<P: Poly>(ctx: &MontgomeryContext<P>, input: u64) -> u64 {
-    let r = ctx.num_limbs * ctx.big_uint_ctx.limb_bit_size;
-    (input << r) % ctx.n
+fn u64_to_montgomery_form(limb_bit_size: usize, num_limbs: usize, n: u64, input: u64) -> u64 {
+    let r = num_limbs * limb_bit_size;
+    (input << r) % n
 }
 
 #[cfg(test)]
@@ -297,9 +294,9 @@ mod tests {
         // With T = 255, R = 2^20 = 1048576, N = 17
         // We expect: 255 * (2^20)^(-1) mod 17
         let test_value = 255u64; // Simple test value
-        let (t, input_values) =
-            MontgomeryPoly::input_u64(ctx.clone(), &mut circuit, &params, Some(test_value));
-        let input_values = input_values.unwrap();
+        let t = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values =
+            u64_to_montgomery_poly(LIMB_BIT_SIZE, NUM_LIMBS, 17u64, &params, test_value);
         let result = montgomery_reduce(&ctx, &mut circuit, &t.value);
         circuit.output(result.limbs.clone());
 
@@ -337,9 +334,9 @@ mod tests {
 
         // Test with T = 0 in Montgomery representation
         let test_value = 0u64;
-        let (t, input_values) =
-            MontgomeryPoly::input_u64(ctx.clone(), &mut circuit, &params, Some(test_value));
-        let input_values = input_values.unwrap();
+        let t = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values =
+            u64_to_montgomery_poly(LIMB_BIT_SIZE, NUM_LIMBS, 17u64, &params, test_value);
         let result = montgomery_reduce(&ctx, &mut circuit, &t.value);
         circuit.output(result.limbs.clone());
 
@@ -367,14 +364,13 @@ mod tests {
         // Test with regular value 5
         let test_value = 5u64;
         let r = ctx.num_limbs * ctx.big_uint_ctx.limb_bit_size;
-        let (regular_value, input_values) = BigUintPoly::input_u64(
-            ctx.big_uint_ctx.clone(),
-            &mut circuit,
+        let regular_value = BigUintPoly::input(ctx.big_uint_ctx.clone(), &mut circuit, r);
+        let input_values = u64_to_biguint_poly(
+            ctx.big_uint_ctx.limb_bit_size,
             &params,
-            r,
-            Some(test_value),
+            test_value,
+            Some(ctx.num_limbs),
         );
-        let input_values = input_values.unwrap();
 
         // Convert to Montgomery form and back to regular
         let montgomery_value =
@@ -410,11 +406,23 @@ mod tests {
         let test_a = 5u64;
         let test_b = 8u64;
 
-        let (mont_a, input_values_a) =
-            MontgomeryPoly::input_u64(ctx.clone(), &mut circuit, &params, Some(test_a));
-        let (mont_b, input_values_b) =
-            MontgomeryPoly::input_u64(ctx.clone(), &mut circuit, &params, Some(test_b));
-        let input_values = [input_values_a.unwrap(), input_values_b.unwrap()].concat();
+        let mont_a = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_a = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_a,
+        );
+        let mont_b = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_b = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_b,
+        );
+        let input_values = [input_values_a, input_values_b].concat();
 
         // Add in Montgomery form
         let mont_sum = mont_a.add(&mont_b, &mut circuit);
@@ -454,11 +462,23 @@ mod tests {
         let test_a = 15u64;
         let test_b = 8u64;
 
-        let (mont_a, input_values_a) =
-            MontgomeryPoly::input_u64(ctx.clone(), &mut circuit, &params, Some(test_a));
-        let (mont_b, input_values_b) =
-            MontgomeryPoly::input_u64(ctx.clone(), &mut circuit, &params, Some(test_b));
-        let input_values = [input_values_a.unwrap(), input_values_b.unwrap()].concat();
+        let mont_a = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_a = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_a,
+        );
+        let mont_b = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_b = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_b,
+        );
+        let input_values = [input_values_a, input_values_b].concat();
 
         // Subtract in Montgomery form
         let mont_diff = mont_a.sub(&mont_b, &mut circuit);
@@ -499,11 +519,23 @@ mod tests {
         let test_a = 3u64;
         let test_b = 8u64;
 
-        let (mont_a, input_values_a) =
-            MontgomeryPoly::input_u64(ctx.clone(), &mut circuit, &params, Some(test_a));
-        let (mont_b, input_values_b) =
-            MontgomeryPoly::input_u64(ctx.clone(), &mut circuit, &params, Some(test_b));
-        let input_values = [input_values_a.unwrap(), input_values_b.unwrap()].concat();
+        let mont_a = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_a = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_a,
+        );
+        let mont_b = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_b = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_b,
+        );
+        let input_values = [input_values_a, input_values_b].concat();
 
         // Subtract in Montgomery form (underflow case)
         let mont_diff = mont_a.sub(&mont_b, &mut circuit);
@@ -544,11 +576,23 @@ mod tests {
         let test_a = 5u64;
         let test_b = 8u64;
 
-        let (mont_a, input_values_a) =
-            MontgomeryPoly::input_u64(ctx.clone(), &mut circuit, &params, Some(test_a));
-        let (mont_b, input_values_b) =
-            MontgomeryPoly::input_u64(ctx.clone(), &mut circuit, &params, Some(test_b));
-        let input_values = [input_values_a.unwrap(), input_values_b.unwrap()].concat();
+        let mont_a = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_a = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_a,
+        );
+        let mont_b = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_b = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_b,
+        );
+        let input_values = [input_values_a, input_values_b].concat();
 
         // Multiply in Montgomery form
         let mont_product = mont_a.mul(&mont_b, &mut circuit);
@@ -589,11 +633,23 @@ mod tests {
         let test_a = 12u64;
         let test_b = 15u64;
 
-        let (mont_a, input_values_a) =
-            MontgomeryPoly::input_u64(ctx.clone(), &mut circuit, &params, Some(test_a));
-        let (mont_b, input_values_b) =
-            MontgomeryPoly::input_u64(ctx.clone(), &mut circuit, &params, Some(test_b));
-        let input_values = [input_values_a.unwrap(), input_values_b.unwrap()].concat();
+        let mont_a = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_a = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_a,
+        );
+        let mont_b = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_b = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_b,
+        );
+        let input_values = [input_values_a, input_values_b].concat();
 
         // Multiply in Montgomery form
         let mont_product = mont_a.mul(&mont_b, &mut circuit);
@@ -634,11 +690,23 @@ mod tests {
         let test_a = 0u64;
         let test_b = 16u64;
 
-        let (mont_a, input_values_a) =
-            MontgomeryPoly::input_u64(ctx.clone(), &mut circuit, &params, Some(test_a));
-        let (mont_b, input_values_b) =
-            MontgomeryPoly::input_u64(ctx.clone(), &mut circuit, &params, Some(test_b));
-        let input_values = [input_values_a.unwrap(), input_values_b.unwrap()].concat();
+        let mont_a = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_a = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_a,
+        );
+        let mont_b = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_b = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_b,
+        );
+        let input_values = [input_values_a, input_values_b].concat();
 
         // Multiply in Montgomery form
         let mont_product = mont_a.mul(&mont_b, &mut circuit);
@@ -678,9 +746,14 @@ mod tests {
         // Test with regular value 13
         let test_value = 13u64;
 
-        let (montgomery_value, input_values) =
-            MontgomeryPoly::input_u64(ctx.clone(), &mut circuit, &params, Some(test_value));
-        let input_values = input_values.unwrap();
+        let montgomery_value = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_value,
+        );
 
         // Finalize the Montgomery value (converts back to regular and finalizes)
         let finalized = montgomery_value.finalize(&mut circuit);
@@ -707,9 +780,14 @@ mod tests {
         // Test with regular value 0
         let test_value = 0u64;
 
-        let (montgomery_value, input_values) =
-            MontgomeryPoly::input_u64(ctx.clone(), &mut circuit, &params, Some(test_value));
-        let input_values = input_values.unwrap();
+        let montgomery_value = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_value,
+        );
 
         // Finalize the Montgomery value (converts back to regular and finalizes)
         let finalized = montgomery_value.finalize(&mut circuit);
@@ -736,9 +814,14 @@ mod tests {
         // Test with regular value 16 (close to modulus 17)
         let test_value = 16u64;
 
-        let (montgomery_value, input_values) =
-            MontgomeryPoly::input_u64(ctx.clone(), &mut circuit, &params, Some(test_value));
-        let input_values = input_values.unwrap();
+        let montgomery_value = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_value,
+        );
 
         // Finalize the Montgomery value (converts back to regular and finalizes)
         let finalized = montgomery_value.finalize(&mut circuit);
@@ -766,11 +849,23 @@ mod tests {
         let test_a = 7u64;
         let test_b = 9u64;
 
-        let (mont_a, input_values_a) =
-            MontgomeryPoly::input_u64(ctx.clone(), &mut circuit, &params, Some(test_a));
-        let (mont_b, input_values_b) =
-            MontgomeryPoly::input_u64(ctx.clone(), &mut circuit, &params, Some(test_b));
-        let input_values = [input_values_a.unwrap(), input_values_b.unwrap()].concat();
+        let mont_a = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_a = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_a,
+        );
+        let mont_b = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_b = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_b,
+        );
+        let input_values = [input_values_a, input_values_b].concat();
 
         // Perform operations: (a + b) * a mod 17
         let mont_sum = mont_a.add(&mont_b, &mut circuit);

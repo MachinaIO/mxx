@@ -26,7 +26,7 @@ impl<P: Poly> PackedCrtContext<P> {
     ) -> Self {
         debug_assert_eq!(pack_bit_size % limb_bit_size, 0);
         let crt_ctx = Arc::new(CrtContext::setup(circuit, params, limb_bit_size));
-        let max_degree = pack_bit_size.div_ceil(limb_bit_size) as u16;
+        let max_degree = pack_bit_size.div_ceil(limb_bit_size) as u16 - 1;
         let max_norm = 1 << limb_bit_size;
         let isolation_gadget =
             Arc::new(IsolationGadget::setup(circuit, params, max_degree, max_norm));
@@ -59,15 +59,19 @@ impl<P: Poly> PackedCrtPoly<P> {
     pub fn unpack(&self, circuit: &mut PolyCircuit<P>) -> Vec<CrtPoly<P>> {
         let mut const_polys = vec![];
         for poly in self.packed_polys.iter() {
-            const_polys.extend(self.ctx.isolation_gadget.isolate_terms(circuit, *poly));
+            let isolated = self.ctx.isolation_gadget.isolate_terms(circuit, *poly);
+            const_polys.extend(isolated);
         }
-        let total_limbs_needed = self.packed_polys.len() * self.ctx.total_limbs_per_crt_poly;
         let num_limbs_per_slot = self.ctx.crt_ctx.mont_ctxes[0].num_limbs;
         let mut crt_polys = vec![];
 
         // Group const_polys by complete CRT polynomial sets
+        let limbs_per_crt_poly = num_limbs_per_slot * self.ctx.crt_ctx.mont_ctxes.len();
+
+        let num_crt_polys = const_polys.len() / limbs_per_crt_poly;
+
         let mut poly_index = 0;
-        while poly_index < total_limbs_needed {
+        for _ in 0..num_crt_polys {
             let mut slots = vec![];
 
             // For each CRT slot, collect the required number of limbs
@@ -120,4 +124,262 @@ pub fn biguint_to_packed_crt_polys<P: Poly>(
         packed_polys.push(new_packed_poly);
     }
     packed_polys
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        element::PolyElem,
+        lookup::poly::PolyPltEvaluator,
+        poly::{
+            PolyParams,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
+    };
+    use num_bigint::BigUint;
+    use num_traits::Zero;
+    use rand::Rng;
+    use std::sync::Arc;
+
+    const LIMB_BIT_SIZE: usize = 5;
+    const PACK_BIT_SIZE: usize = 15; // 3 limbs per pack
+
+    // Helper function to generate a random BigUint below a given bound
+    fn gen_biguint_below<R: Rng>(rng: &mut R, bound: &BigUint) -> BigUint {
+        if bound.is_zero() {
+            return BigUint::zero();
+        }
+
+        // Fallback to modular arithmetic for large numbers
+        let bit_len = bound.bits() as usize;
+        let byte_len = (bit_len + 7) / 8;
+
+        // Generate a random number with same bit length and take modulo
+        let mut bytes = vec![0u8; byte_len];
+        rng.fill_bytes(&mut bytes);
+        let candidate = BigUint::from_bytes_be(&bytes);
+        candidate % bound
+    }
+
+    fn create_test_context(
+        circuit: &mut PolyCircuit<DCRTPoly>,
+    ) -> (DCRTPolyParams, Arc<PackedCrtContext<DCRTPoly>>) {
+        let params = DCRTPolyParams::default();
+        let ctx = Arc::new(PackedCrtContext::setup(circuit, &params, LIMB_BIT_SIZE, PACK_BIT_SIZE));
+        (params, ctx)
+    }
+
+    #[test]
+    fn test_packed_crt_add() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, packed_ctx) = create_test_context(&mut circuit);
+
+        // Generate random values for a and b within modulus bounds
+        let mut rng = rand::rng();
+        let modulus = params.modulus();
+        let max_val = modulus.as_ref();
+        let a: BigUint = gen_biguint_below(&mut rng, &max_val);
+        let b: BigUint = gen_biguint_below(&mut rng, &max_val);
+        let expected_output_biguint = (&a + &b) % params.modulus().as_ref();
+        let expected_output_slots =
+            biguint_to_crt_slots::<DCRTPoly>(&params, &expected_output_biguint);
+
+        // Create packed CRT polynomials for inputs
+        let packed_crt_polys = PackedCrtPoly::input(packed_ctx.clone(), &mut circuit, 2);
+
+        // Unpack to get CRT polynomials
+        let crt_polys = packed_crt_polys.unpack(&mut circuit);
+
+        let crt_poly_a = &crt_polys[0];
+        let crt_poly_b = &crt_polys[1];
+
+        // Perform addition
+        let crt_sum = crt_poly_a.add(crt_poly_b, &mut circuit);
+
+        // Finalize per-slot contributions and full CRT reconstruction
+        let mut outputs = crt_sum.finalize_crt(&mut circuit);
+        let reconst = crt_sum.finalize_reconst(&mut circuit);
+        outputs.push(reconst);
+        circuit.output(outputs);
+
+        // Generate input values for packed polynomials
+        let input_values =
+            biguint_to_packed_crt_polys(LIMB_BIT_SIZE, PACK_BIT_SIZE, &params, &[a, b]);
+
+        // Evaluate the circuit
+        let plt_evaluator = PolyPltEvaluator::new();
+        let eval_result = circuit.eval(
+            &params,
+            &DCRTPoly::const_one(&params),
+            &input_values,
+            Some(plt_evaluator),
+        );
+
+        // Verify the results for each CRT slot and the reconstructed integer
+        assert_eq!(eval_result.len(), packed_ctx.crt_ctx.mont_ctxes.len() + 1);
+
+        // Verify the output in the CRT form
+        for (i, expected_slot) in expected_output_slots.into_iter().enumerate() {
+            assert_eq!(
+                eval_result[i].coeffs()[0].value(),
+                &(&packed_ctx.crt_ctx.q_over_qis[i] * BigUint::from(expected_slot))
+            );
+        }
+        // Verify reconstructed integer modulo q
+        assert_eq!(
+            eval_result[packed_ctx.crt_ctx.mont_ctxes.len()].coeffs()[0].value(),
+            &expected_output_biguint
+        );
+    }
+
+    #[test]
+    fn test_packed_crt_sub() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, packed_ctx) = create_test_context(&mut circuit);
+
+        // Generate random values for a and b within modulus bounds
+        let mut rng = rand::rng();
+        let modulus = params.modulus();
+        let max_val = modulus.as_ref();
+        let a: BigUint = gen_biguint_below(&mut rng, &max_val);
+        let b: BigUint = gen_biguint_below(&mut rng, &max_val);
+        let expected_output_biguint =
+            if a >= b { &a - &b } else { params.modulus().as_ref() - &b + &a };
+        let expected_output_slots =
+            biguint_to_crt_slots::<DCRTPoly>(&params, &expected_output_biguint);
+
+        // Create packed CRT polynomials for inputs
+        let packed_crt_polys = PackedCrtPoly::input(packed_ctx.clone(), &mut circuit, 2);
+
+        // Unpack to get CRT polynomials
+        let crt_polys = packed_crt_polys.unpack(&mut circuit);
+
+        let crt_poly_a = &crt_polys[0];
+        let crt_poly_b = &crt_polys[1];
+
+        // Perform subtraction
+        let crt_diff = crt_poly_a.sub(crt_poly_b, &mut circuit);
+
+        // Finalize per-slot contributions and full CRT reconstruction
+        let mut outputs = crt_diff.finalize_crt(&mut circuit);
+        let reconst = crt_diff.finalize_reconst(&mut circuit);
+        outputs.push(reconst);
+        circuit.output(outputs);
+
+        // Generate input values for packed polynomials
+        let input_values =
+            biguint_to_packed_crt_polys(LIMB_BIT_SIZE, PACK_BIT_SIZE, &params, &[a, b]);
+
+        // Evaluate the circuit
+        let plt_evaluator = PolyPltEvaluator::new();
+        let eval_result = circuit.eval(
+            &params,
+            &DCRTPoly::const_one(&params),
+            &input_values,
+            Some(plt_evaluator),
+        );
+
+        // Verify the results for each CRT slot and the reconstructed integer
+        assert_eq!(eval_result.len(), packed_ctx.crt_ctx.mont_ctxes.len() + 1);
+
+        // Verify the output in the CRT form
+        for (i, expected_slot) in expected_output_slots.into_iter().enumerate() {
+            assert_eq!(
+                eval_result[i].coeffs()[0].value(),
+                &(&packed_ctx.crt_ctx.q_over_qis[i] * BigUint::from(expected_slot))
+            );
+        }
+        // Verify reconstructed integer modulo q
+        assert_eq!(
+            eval_result[packed_ctx.crt_ctx.mont_ctxes.len()].coeffs()[0].value(),
+            &expected_output_biguint
+        );
+    }
+
+    #[test]
+    fn test_packed_crt_mul() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, packed_ctx) = create_test_context(&mut circuit);
+
+        // Generate random values for a and b within modulus bounds (smaller range for
+        // multiplication)
+        let mut rng = rand::rng();
+        let max_val = params.modulus();
+        let a: BigUint = gen_biguint_below(&mut rng, &max_val);
+        let b: BigUint = gen_biguint_below(&mut rng, &max_val);
+        let expected_output_biguint = (&a * &b) % params.modulus().as_ref();
+        let expected_output_slots =
+            biguint_to_crt_slots::<DCRTPoly>(&params, &expected_output_biguint);
+
+        // Create packed CRT polynomials for inputs
+        let packed_crt_polys = PackedCrtPoly::input(packed_ctx.clone(), &mut circuit, 2);
+
+        // Unpack to get CRT polynomials
+        let crt_polys = packed_crt_polys.unpack(&mut circuit);
+
+        let crt_poly_a = &crt_polys[0];
+        let crt_poly_b = &crt_polys[1];
+
+        // Perform multiplication
+        let crt_product = crt_poly_a.mul(crt_poly_b, &mut circuit);
+
+        // Finalize per-slot contributions and full CRT reconstruction
+        let mut outputs = crt_product.finalize_crt(&mut circuit);
+        let reconst = crt_product.finalize_reconst(&mut circuit);
+        outputs.push(reconst);
+        circuit.output(outputs);
+
+        // Generate input values for packed polynomials
+        let input_values =
+            biguint_to_packed_crt_polys(LIMB_BIT_SIZE, PACK_BIT_SIZE, &params, &[a, b]);
+
+        // Evaluate the circuit
+        let plt_evaluator = PolyPltEvaluator::new();
+        let eval_result = circuit.eval(
+            &params,
+            &DCRTPoly::const_one(&params),
+            &input_values,
+            Some(plt_evaluator),
+        );
+
+        // Verify the results for each CRT slot and the reconstructed integer
+        assert_eq!(eval_result.len(), packed_ctx.crt_ctx.mont_ctxes.len() + 1);
+
+        // Verify the output in the CRT form
+        for (i, expected_slot) in expected_output_slots.into_iter().enumerate() {
+            assert_eq!(
+                eval_result[i].coeffs()[0].value(),
+                &(&packed_ctx.crt_ctx.q_over_qis[i] * BigUint::from(expected_slot))
+            );
+        }
+        // Verify reconstructed integer modulo q
+        assert_eq!(
+            eval_result[packed_ctx.crt_ctx.mont_ctxes.len()].coeffs()[0].value(),
+            &expected_output_biguint
+        );
+    }
+
+    #[test]
+    fn test_biguint_to_packed_crt_polys() {
+        let params = DCRTPolyParams::default();
+
+        // Test the helper function that converts BigUints to packed CRT polynomials
+        let a = BigUint::from(123u32);
+        let b = BigUint::from(456u32);
+
+        let packed_polys: Vec<DCRTPoly> =
+            biguint_to_packed_crt_polys(LIMB_BIT_SIZE, PACK_BIT_SIZE, &params, &[a, b]);
+
+        // The number should be reasonable based on the input size and packing parameters
+        let expected_limbs_per_input = {
+            let (moduli, crt_bits, _) = params.to_crt();
+            let num_limbs = crt_bits.div_ceil(LIMB_BIT_SIZE);
+            moduli.len() * num_limbs
+        };
+        let total_limbs: usize = 2 * expected_limbs_per_input; // for 2 inputs
+        let expected_packed_polys = total_limbs.div_ceil(PACK_BIT_SIZE / LIMB_BIT_SIZE);
+
+        assert_eq!(packed_polys.len(), expected_packed_polys);
+    }
 }

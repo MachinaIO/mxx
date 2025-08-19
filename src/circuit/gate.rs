@@ -33,7 +33,7 @@ pub enum PolyGateType {
     Sub,
     Mul,
     LargeScalarMul { scalar: Vec<BigUint> },
-    Rotate { shift: usize },
+    Rotate { shift: i32 },
     PubLut { lookup_id: usize },
 }
 

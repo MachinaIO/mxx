@@ -38,13 +38,18 @@ where
         input: BggEncoding<M>,
         id: GateId,
     ) -> BggEncoding<M> {
+        debug_assert_eq!(
+            plt.fs.len(),
+            1,
+            "SimpleBggEncodingPltEvaluator works only with constant polynomials"
+        );
         let z = &input.plaintext.expect("the BGG encoding should revealed plaintext");
-        info!("public lookup length is {}", plt.f.len());
-        let (k, y_k) = plt
-            .f
-            .get(z)
+        info!("public lookup length is {}", plt.len());
+        let (ks, y_k) = plt
+            .get(params, z)
             .unwrap_or_else(|| panic!("{:?} is not exist in public lookup f", z.to_const_int()));
-        info!("Performing public lookup, k={}", k);
+        let k = ks[0];
+        info!("Performing public lookup, ks={:?}", ks);
         let d = input.pubkey.matrix.row_size() - 1;
         let a_lt = derive_a_lt_matrix::<M, SH>(params, d, self.hash_key, id);
         let pubkey = BggPublicKey::new(a_lt, true);
@@ -115,6 +120,11 @@ where
         input: BggPublicKey<M>,
         id: GateId,
     ) -> BggPublicKey<M> {
+        debug_assert_eq!(
+            plt.fs.len(),
+            1,
+            "SimpleBggPubKeyEvaluator works only with constant polynomials"
+        );
         let d = input.matrix.row_size() - 1;
         let a_lt = derive_a_lt_matrix::<M, SH>(params, d, self.hash_key, id);
         preimage_all::<M, SU, ST, _>(
@@ -195,17 +205,19 @@ fn preimage_all<M, SU, ST, P>(
     let m = (d + 1) * params.modulus_digits();
     let uniform_sampler = SU::new();
     let gadget = M::gadget_matrix(params, d + 1);
-    let items: Vec<_> = plt.f.iter().collect();
+    let items: Vec<_> = plt.fs[0].iter().collect();
     let matrices = items
         .par_chunks(8)
         .flat_map(|batch| {
             batch
                 .iter()
                 .map(|(x_k, (k, y_k))| {
+                    let x_k = P::from_elem_to_constant(params, x_k);
+                    let y_k = P::from_elem_to_constant(params, y_k);
                     let r_k =
                         uniform_sampler.sample_uniform(params, d + 1, m, DistType::FinRingDist);
-                    let target_k = (r_k.clone() * (*x_k).clone()) + a_lt -
-                        &(gadget.clone() * (*y_k).clone()) -
+                    let target_k = (r_k.clone() * (x_k).clone()) + a_lt -
+                        &(gadget.clone() * (y_k).clone()) -
                         (a_z.clone() * r_k.decompose());
                     (*k, r_k, trap_sampler.preimage(params, trapdoor, pub_matrix, &target_k))
                 })

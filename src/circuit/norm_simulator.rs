@@ -99,7 +99,7 @@ impl Evaluable for NormSimulator {
     type Params = ();
     type P = DCRTPoly;
 
-    fn rotate(self, _: &Self::Params, _: usize) -> Self {
+    fn rotate(self, _: &Self::Params, _: i32) -> Self {
         self
     }
 
@@ -136,7 +136,7 @@ impl PltEvaluator<NormSimulator> for NormPltEvaluator {
             // |c_z · r_k.decompose()| + c_lt_k
             h_norm: input.h_norm.right_rotate(input.dim_sqrt as u64 * (input.base as u64 - 1)) +
                 MPolyCoeffs::one(),
-            plaintext_norm: plt.max_output_row().1.value().clone(),
+            plaintext_norm: plt.max_output_row().2.value().clone(),
             dim_sqrt: input.dim_sqrt,
             base: input.base,
         }

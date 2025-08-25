@@ -58,16 +58,16 @@ impl<P: Poly> BigUintPolyContext<P> {
         base: usize,
         nrows: usize,
     ) -> (PublicLut<P>, PublicLut<P>) {
-        let mut f = HashMap::<P::Elem, (usize, P::Elem)>::with_capacity(nrows);
-        let mut g = HashMap::<P::Elem, (usize, P::Elem)>::with_capacity(nrows);
+        let mut f = HashMap::<P, (usize, P)>::with_capacity(nrows);
+        let mut g = HashMap::<P, (usize, P)>::with_capacity(nrows);
         for k in 0..nrows {
-            let input = <P::Elem as PolyElem>::constant(&params.modulus(), k as u64);
-            let output_f = <P::Elem as PolyElem>::constant(&params.modulus(), (k % base) as u64);
-            let output_g = <P::Elem as PolyElem>::constant(&params.modulus(), (k / base) as u64);
+            let input = P::from_usize_to_constant(params, k);
+            let output_f = P::from_usize_to_constant(params, k % base);
+            let output_g = P::from_usize_to_constant(params, k / base);
             f.insert(input.clone(), (k, output_f));
             g.insert(input, (k, output_g));
         }
-        (PublicLut::new(vec![f]), PublicLut::new(vec![g]))
+        (PublicLut::new(f), PublicLut::new(g))
     }
 }
 

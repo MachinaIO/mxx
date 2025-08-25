@@ -2,6 +2,7 @@ pub mod finite_ring;
 
 use std::{
     fmt::Debug,
+    hash::Hash,
     ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
     sync::Arc,
 };
@@ -16,6 +17,7 @@ pub trait PolyElem:
     + Send
     + Sync
     + Clone
+    + Hash
     + Add<Output = Self>
     + Sub<Output = Self>
     + Mul<Output = Self>

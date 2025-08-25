@@ -18,7 +18,7 @@ pub enum SerializablePolyGateType {
     Add,
     Sub,
     Mul,
-    Rotate { shift: usize },
+    Rotate { shift: i32 },
     PubLut { lookup_id: usize },
 }
 

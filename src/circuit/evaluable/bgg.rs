@@ -2,17 +2,22 @@ use crate::{
     bgg::{encoding::BggEncoding, public_key::BggPublicKey},
     circuit::evaluable::Evaluable,
     matrix::PolyMatrix,
-    poly::Poly,
+    poly::{Poly, PolyParams},
 };
 
 impl<M: PolyMatrix> Evaluable for BggEncoding<M> {
     type Params = <M::P as Poly>::Params;
     type P = M::P;
 
-    fn rotate(self, params: &Self::Params, shift: usize) -> Self {
+    fn rotate(self, params: &Self::Params, shift: i32) -> Self {
+        let pubkey = self.pubkey.rotate(params, shift);
+        let shift = if shift >= 0 {
+            shift as usize
+        } else {
+            params.ring_dimension() as usize - shift.abs() as usize
+        };
         let rotate_poly = <M::P>::const_rotate_poly(params, shift);
         let vector = self.vector.clone() * &rotate_poly;
-        let pubkey = self.pubkey.rotate(params, shift);
         let plaintext = self.plaintext.clone().map(|plaintext| plaintext * rotate_poly);
         Self { vector, pubkey, plaintext }
     }
@@ -43,7 +48,12 @@ impl<M: PolyMatrix> Evaluable for BggPublicKey<M> {
     type Params = <M::P as Poly>::Params;
     type P = M::P;
 
-    fn rotate(self, params: &Self::Params, shift: usize) -> Self {
+    fn rotate(self, params: &Self::Params, shift: i32) -> Self {
+        let shift = if shift >= 0 {
+            shift as usize
+        } else {
+            params.ring_dimension() as usize - shift.abs() as usize
+        };
         let rotate_poly = <M::P>::const_rotate_poly(params, shift);
         let matrix = self.matrix.clone() * rotate_poly;
         Self { matrix, reveal_plaintext: self.reveal_plaintext }

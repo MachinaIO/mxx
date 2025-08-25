@@ -3,7 +3,6 @@ on:
   push:
     branches:
       - main
-      - ephemeral_runners
   pull_request:
     branches:
       - main

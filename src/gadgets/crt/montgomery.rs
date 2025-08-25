@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     circuit::{PolyCircuit, gate::GateId},
-    gadgets::crt::bigunit::{BigUintPoly, BigUintPolyContext},
+    gadgets::crt::bigunit::{BigUintPoly, BigUintPolyContext, u64_to_biguint_poly},
     poly::Poly,
     utils::mod_inverse,
 };
@@ -15,8 +15,9 @@ use num_traits::One;
 #[derive(Debug, Clone)]
 pub struct MontgomeryContext<P: Poly> {
     pub big_uint_ctx: Arc<BigUintPolyContext<P>>,
-    num_limbs: usize,         // Number of limbs for N
-    const_n: BigUintPoly<P>,  // N
+    pub num_limbs: usize,     // Number of limbs for N
+    pub n: u64,               // N
+    const_n: BigUintPoly<P>,  // N in the circuit
     const_r2: BigUintPoly<P>, // R^2 mod N
     const_n_prime: BigUintPoly<P>, /* N' s.t. N' * N = -1 mod R, R = 2^{limb_bit_size *
                                * limb_bit_size} */
@@ -84,7 +85,7 @@ impl<P: Poly> MontgomeryContext<P> {
         // }
         // let const_n_prime_full = BigUintPoly::new(big_uint_ctx.clone(), nprime_full_limbs);
 
-        Self { big_uint_ctx, num_limbs, const_n, const_r2, const_n_prime }
+        Self { big_uint_ctx, num_limbs, n, const_n, const_r2, const_n_prime }
     }
 
     /// Calculate N' such that N * N' ≡ -1 (mod B)
@@ -104,10 +105,28 @@ impl<P: Poly> MontgomeryContext<P> {
 #[derive(Debug, Clone)]
 pub struct MontgomeryPoly<P: Poly> {
     ctx: Arc<MontgomeryContext<P>>,
-    value: BigUintPoly<P>,
+    pub value: BigUintPoly<P>,
 }
 
 impl<P: Poly> MontgomeryPoly<P> {
+    pub fn limb(self) -> Vec<GateId> {
+        self.value.limbs
+    }
+
+    pub fn new(ctx: Arc<MontgomeryContext<P>>, value: BigUintPoly<P>) -> Self {
+        Self { ctx, value }
+    }
+
+    /// Allocate input polynomials for a MontgomeryPoly
+    pub fn input(ctx: Arc<MontgomeryContext<P>>, circuit: &mut PolyCircuit<P>) -> Self {
+        let value = BigUintPoly::input(
+            ctx.big_uint_ctx.clone(),
+            circuit,
+            ctx.num_limbs * ctx.big_uint_ctx.limb_bit_size,
+        );
+        Self { ctx, value }
+    }
+
     /// Convert a regular integer (< N) to Montgomery representation
     /// Computes REDC((a mod N)(R^2 mod N)) = a*R mod N
     /// where R = 2^(limb_bit_size * num_limbs)
@@ -209,6 +228,22 @@ fn montgomery_reduce<P: Poly>(
     u_div.cmux(&diff, is_less, circuit)
 }
 
+pub fn u64_to_montgomery_poly<P: Poly>(
+    limb_bit_size: usize,
+    num_limbs: usize,
+    n: u64,
+    params: &P::Params,
+    input: u64,
+) -> Vec<P> {
+    let input_montgomery = u64_to_montgomery_form(limb_bit_size, num_limbs, n, input);
+    u64_to_biguint_poly(limb_bit_size, params, input_montgomery, Some(num_limbs))
+}
+
+fn u64_to_montgomery_form(limb_bit_size: usize, num_limbs: usize, n: u64, input: u64) -> u64 {
+    let r = num_limbs * limb_bit_size;
+    (input << r) % n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,48 +252,18 @@ mod tests {
         lookup::poly::PolyPltEvaluator,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
-    use num_bigint::BigUint;
-    use num_traits::{One, Zero};
 
     const LIMB_BIT_SIZE: usize = 5;
     const NUM_LIMBS: usize = 4;
 
     fn create_test_context(
         circuit: &mut PolyCircuit<DCRTPoly>,
-        num_input_values: usize,
-    ) -> (Vec<GateId>, DCRTPolyParams, Arc<MontgomeryContext<DCRTPoly>>) {
+    ) -> (DCRTPolyParams, Arc<MontgomeryContext<DCRTPoly>>) {
         let params = DCRTPolyParams::default();
-        // Create inputs first before Montgomery context
-        let inputs = circuit.input(num_input_values * NUM_LIMBS);
         // Use a small modulus for testing: N = 17 (prime number)
         let n = 17u64;
         let ctx = Arc::new(MontgomeryContext::setup(circuit, &params, LIMB_BIT_SIZE, NUM_LIMBS, n));
-        (inputs, params, ctx)
-    }
-
-    fn create_test_value_from_u64(params: &DCRTPolyParams, value: u64) -> Vec<DCRTPoly> {
-        let mut limbs = Vec::with_capacity(NUM_LIMBS);
-        let mut remaining_value = value;
-        let base = 1u64 << LIMB_BIT_SIZE;
-        for _ in 0..NUM_LIMBS {
-            let limb_value = remaining_value % base;
-            limbs.push(DCRTPoly::from_usize_to_constant(params, limb_value as usize));
-            remaining_value /= base;
-        }
-        limbs
-    }
-
-    fn bigint_to_limbs(value: &BigUint, limb_bit_size: usize, num_limbs: usize) -> Vec<u64> {
-        let mut limbs = Vec::with_capacity(num_limbs);
-        let mut remaining = value.clone();
-        let base = BigUint::one() << limb_bit_size;
-
-        for _ in 0..num_limbs {
-            let limb = &remaining % &base;
-            limbs.push(limb.iter_u64_digits().next().unwrap_or(0));
-            remaining /= &base;
-        }
-        limbs
+        (params, ctx)
     }
 
     #[test]
@@ -282,21 +287,18 @@ mod tests {
     #[test]
     fn test_montgomery_reduce_basic() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 1);
-
-        // Create input for T value
-        let t =
-            BigUintPoly::<DCRTPoly>::new(ctx.big_uint_ctx.clone(), inputs[0..NUM_LIMBS].to_vec());
-        let result = montgomery_reduce(&ctx, &mut circuit, &t);
-
-        circuit.output(result.limbs.clone());
+        let (params, ctx) = create_test_context(&mut circuit);
 
         // Test with a simpler value: T = 255 (which is < R and < N*R)
         // For Montgomery reduction: REDC(T) = T * R^(-1) mod N
         // With T = 255, R = 2^20 = 1048576, N = 17
         // We expect: 255 * (2^20)^(-1) mod 17
         let test_value = 255u64; // Simple test value
-        let input_values = create_test_value_from_u64(&params, test_value);
+        let t = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values =
+            u64_to_montgomery_poly(LIMB_BIT_SIZE, NUM_LIMBS, 17u64, &params, test_value);
+        let result = montgomery_reduce(&ctx, &mut circuit, &t.value);
+        circuit.output(result.limbs.clone());
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -328,17 +330,15 @@ mod tests {
     #[test]
     fn test_montgomery_reduce_zero() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 1);
+        let (params, ctx) = create_test_context(&mut circuit);
 
-        // Create input for T value
-        let t =
-            BigUintPoly::<DCRTPoly>::new(ctx.big_uint_ctx.clone(), inputs[0..NUM_LIMBS].to_vec());
-        let result = montgomery_reduce(&ctx, &mut circuit, &t);
-
+        // Test with T = 0 in Montgomery representation
+        let test_value = 0u64;
+        let t = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values =
+            u64_to_montgomery_poly(LIMB_BIT_SIZE, NUM_LIMBS, 17u64, &params, test_value);
+        let result = montgomery_reduce(&ctx, &mut circuit, &t.value);
         circuit.output(result.limbs.clone());
-
-        // Test with T = 0
-        let input_values = create_test_value_from_u64(&params, 0);
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -349,33 +349,34 @@ mod tests {
         );
 
         // Expected result should be 0
-        let expected_limbs = bigint_to_limbs(&BigUint::zero(), LIMB_BIT_SIZE, NUM_LIMBS);
-
         assert_eq!(eval_result.len(), NUM_LIMBS);
         for i in 0..NUM_LIMBS {
             let coeffs = eval_result[i].coeffs();
-            assert_eq!(*coeffs[0].value(), expected_limbs[i].into());
+            assert_eq!(*coeffs[0].value(), 0u64.into());
         }
     }
 
     #[test]
     fn test_montgomery_regular() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 1);
+        let (params, ctx) = create_test_context(&mut circuit);
 
-        // Create regular value input
-        let regular_value =
-            BigUintPoly::<DCRTPoly>::new(ctx.big_uint_ctx.clone(), inputs[0..NUM_LIMBS].to_vec());
+        // Test with regular value 5
+        let test_value = 5u64;
+        let r = ctx.num_limbs * ctx.big_uint_ctx.limb_bit_size;
+        let regular_value = BigUintPoly::input(ctx.big_uint_ctx.clone(), &mut circuit, r);
+        let input_values = u64_to_biguint_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            &params,
+            test_value,
+            Some(ctx.num_limbs),
+        );
 
-        // Convert to Montgomery form
+        // Convert to Montgomery form and back to regular
         let montgomery_value =
             MontgomeryPoly::from_regular(&mut circuit, ctx.clone(), regular_value);
         let recovered_value = montgomery_value.to_regular(&mut circuit);
         circuit.output(recovered_value.limbs);
-
-        // Test with regular value 5
-        let test_value = 5u64;
-        let input_values = create_test_value_from_u64(&params, test_value);
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -384,46 +385,51 @@ mod tests {
             &input_values,
             Some(plt_evaluator),
         );
-        let expected_limbs = bigint_to_limbs(&BigUint::from(test_value), LIMB_BIT_SIZE, NUM_LIMBS);
 
+        // Should recover the original value
+        let mut remaining_value = test_value;
+        let base = 1u64 << ctx.big_uint_ctx.limb_bit_size;
         for i in 0..NUM_LIMBS {
+            let expected_limb = remaining_value % base;
             let coeffs = eval_result[i].coeffs();
-            assert_eq!(*coeffs[0].value(), expected_limbs[i].into());
+            assert_eq!(*coeffs[0].value(), expected_limb.into());
+            remaining_value /= base;
         }
     }
 
     #[test]
     fn test_montgomery_add() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 2);
+        let (params, ctx) = create_test_context(&mut circuit);
 
-        // Create two Montgomery values
-        let value_a =
-            BigUintPoly::<DCRTPoly>::new(ctx.big_uint_ctx.clone(), inputs[0..NUM_LIMBS].to_vec());
-        let value_b = BigUintPoly::<DCRTPoly>::new(
-            ctx.big_uint_ctx.clone(),
-            inputs[NUM_LIMBS..2 * NUM_LIMBS].to_vec(),
+        // Test with a=5, b=8, expected: (5+8) mod 17 = 13
+        let test_a = 5u64;
+        let test_b = 8u64;
+
+        let mont_a = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_a = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_a,
         );
-
-        let mont_a = MontgomeryPoly::from_regular(&mut circuit, ctx.clone(), value_a);
-        let mont_b = MontgomeryPoly::from_regular(&mut circuit, ctx.clone(), value_b);
+        let mont_b = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_b = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_b,
+        );
+        let input_values = [input_values_a, input_values_b].concat();
 
         // Add in Montgomery form
         let mont_sum = mont_a.add(&mont_b, &mut circuit);
 
         // Convert result back to regular form
         let regular_sum = mont_sum.to_regular(&mut circuit);
-
         circuit.output(regular_sum.limbs.clone());
-
-        // Test with a=5, b=8, expected: (5+8) mod 17 = 13
-        let test_a = 5u64;
-        let test_b = 8u64;
-        let input_values = [
-            create_test_value_from_u64(&params, test_a),
-            create_test_value_from_u64(&params, test_b),
-        ]
-        .concat();
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -435,31 +441,44 @@ mod tests {
 
         // Should get (5 + 8) mod 17 = 13
         let expected_sum = (test_a + test_b) % 17;
-        let expected_limbs =
-            bigint_to_limbs(&BigUint::from(expected_sum), LIMB_BIT_SIZE, NUM_LIMBS);
+        let mut remaining_value = expected_sum;
+        let base = 1u64 << ctx.big_uint_ctx.limb_bit_size;
 
         assert_eq!(eval_result.len(), NUM_LIMBS);
         for i in 0..NUM_LIMBS {
+            let expected_limb = remaining_value % base;
             let coeffs = eval_result[i].coeffs();
-            assert_eq!(*coeffs[0].value(), expected_limbs[i].into());
+            assert_eq!(*coeffs[0].value(), expected_limb.into());
+            remaining_value /= base;
         }
     }
 
     #[test]
     fn test_montgomery_sub() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 2);
+        let (params, ctx) = create_test_context(&mut circuit);
 
-        // Create two Montgomery values
-        let value_a =
-            BigUintPoly::<DCRTPoly>::new(ctx.big_uint_ctx.clone(), inputs[0..NUM_LIMBS].to_vec());
-        let value_b = BigUintPoly::<DCRTPoly>::new(
-            ctx.big_uint_ctx.clone(),
-            inputs[NUM_LIMBS..2 * NUM_LIMBS].to_vec(),
+        // Test with a=15, b=8, expected: (15-8) mod 17 = 7
+        let test_a = 15u64;
+        let test_b = 8u64;
+
+        let mont_a = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_a = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_a,
         );
-
-        let mont_a = MontgomeryPoly::from_regular(&mut circuit, ctx.clone(), value_a);
-        let mont_b = MontgomeryPoly::from_regular(&mut circuit, ctx.clone(), value_b);
+        let mont_b = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_b = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_b,
+        );
+        let input_values = [input_values_a, input_values_b].concat();
 
         // Subtract in Montgomery form
         let mont_diff = mont_a.sub(&mont_b, &mut circuit);
@@ -468,15 +487,6 @@ mod tests {
         let regular_diff = mont_diff.to_regular(&mut circuit);
 
         circuit.output(regular_diff.limbs.clone());
-
-        // Test with a=15, b=8, expected: (15-8) mod 17 = 7
-        let test_a = 15u64;
-        let test_b = 8u64;
-        let input_values = [
-            create_test_value_from_u64(&params, test_a),
-            create_test_value_from_u64(&params, test_b),
-        ]
-        .concat();
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -488,31 +498,44 @@ mod tests {
 
         // Should get (15 - 8) mod 17 = 7
         let expected_diff = (test_a - test_b) % 17;
-        let expected_limbs =
-            bigint_to_limbs(&BigUint::from(expected_diff), LIMB_BIT_SIZE, NUM_LIMBS);
+        let mut remaining_value = expected_diff;
+        let base = 1u64 << ctx.big_uint_ctx.limb_bit_size;
 
         assert_eq!(eval_result.len(), NUM_LIMBS);
         for i in 0..NUM_LIMBS {
+            let expected_limb = remaining_value % base;
             let coeffs = eval_result[i].coeffs();
-            assert_eq!(*coeffs[0].value(), expected_limbs[i].into());
+            assert_eq!(*coeffs[0].value(), expected_limb.into());
+            remaining_value /= base;
         }
     }
 
     #[test]
     fn test_montgomery_sub_underflow() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 2);
+        let (params, ctx) = create_test_context(&mut circuit);
 
-        // Create two Montgomery values
-        let value_a =
-            BigUintPoly::<DCRTPoly>::new(ctx.big_uint_ctx.clone(), inputs[0..NUM_LIMBS].to_vec());
-        let value_b = BigUintPoly::<DCRTPoly>::new(
-            ctx.big_uint_ctx.clone(),
-            inputs[NUM_LIMBS..2 * NUM_LIMBS].to_vec(),
+        // Test with a=3, b=8, expected: (3-8) mod 17 = -5 mod 17 = 12
+        let test_a = 3u64;
+        let test_b = 8u64;
+
+        let mont_a = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_a = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_a,
         );
-
-        let mont_a = MontgomeryPoly::from_regular(&mut circuit, ctx.clone(), value_a);
-        let mont_b = MontgomeryPoly::from_regular(&mut circuit, ctx.clone(), value_b);
+        let mont_b = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_b = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_b,
+        );
+        let input_values = [input_values_a, input_values_b].concat();
 
         // Subtract in Montgomery form (underflow case)
         let mont_diff = mont_a.sub(&mont_b, &mut circuit);
@@ -521,15 +544,6 @@ mod tests {
         let regular_diff = mont_diff.to_regular(&mut circuit);
 
         circuit.output(regular_diff.limbs.clone());
-
-        // Test with a=3, b=8, expected: (3-8) mod 17 = -5 mod 17 = 12
-        let test_a = 3u64;
-        let test_b = 8u64;
-        let input_values = [
-            create_test_value_from_u64(&params, test_a),
-            create_test_value_from_u64(&params, test_b),
-        ]
-        .concat();
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -541,31 +555,44 @@ mod tests {
 
         // Should get (3 - 8) mod 17 = -5 mod 17 = 12
         let expected_diff = ((test_a as i64 - test_b as i64).rem_euclid(17)) as u64;
-        let expected_limbs =
-            bigint_to_limbs(&BigUint::from(expected_diff), LIMB_BIT_SIZE, NUM_LIMBS);
+        let mut remaining_value = expected_diff;
+        let base = 1u64 << ctx.big_uint_ctx.limb_bit_size;
 
         assert_eq!(eval_result.len(), NUM_LIMBS);
         for i in 0..NUM_LIMBS {
+            let expected_limb = remaining_value % base;
             let coeffs = eval_result[i].coeffs();
-            assert_eq!(*coeffs[0].value(), expected_limbs[i].into());
+            assert_eq!(*coeffs[0].value(), expected_limb.into());
+            remaining_value /= base;
         }
     }
 
     #[test]
     fn test_montgomery_mul() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 2);
+        let (params, ctx) = create_test_context(&mut circuit);
 
-        // Create two Montgomery values
-        let value_a =
-            BigUintPoly::<DCRTPoly>::new(ctx.big_uint_ctx.clone(), inputs[0..NUM_LIMBS].to_vec());
-        let value_b = BigUintPoly::<DCRTPoly>::new(
-            ctx.big_uint_ctx.clone(),
-            inputs[NUM_LIMBS..2 * NUM_LIMBS].to_vec(),
+        // Test with a=5, b=8, expected: (5*8) mod 17 = 40 mod 17 = 6
+        let test_a = 5u64;
+        let test_b = 8u64;
+
+        let mont_a = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_a = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_a,
         );
-
-        let mont_a = MontgomeryPoly::from_regular(&mut circuit, ctx.clone(), value_a);
-        let mont_b = MontgomeryPoly::from_regular(&mut circuit, ctx.clone(), value_b);
+        let mont_b = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_b = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_b,
+        );
+        let input_values = [input_values_a, input_values_b].concat();
 
         // Multiply in Montgomery form
         let mont_product = mont_a.mul(&mont_b, &mut circuit);
@@ -574,15 +601,6 @@ mod tests {
         let regular_product = mont_product.to_regular(&mut circuit);
 
         circuit.output(regular_product.limbs.clone());
-
-        // Test with a=5, b=8, expected: (5*8) mod 17 = 40 mod 17 = 6
-        let test_a = 5u64;
-        let test_b = 8u64;
-        let input_values = [
-            create_test_value_from_u64(&params, test_a),
-            create_test_value_from_u64(&params, test_b),
-        ]
-        .concat();
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -594,31 +612,44 @@ mod tests {
 
         // Should get (5 * 8) mod 17 = 40 mod 17 = 6
         let expected_product = (test_a * test_b) % 17;
-        let expected_limbs =
-            bigint_to_limbs(&BigUint::from(expected_product), LIMB_BIT_SIZE, NUM_LIMBS);
+        let mut remaining_value = expected_product;
+        let base = 1u64 << ctx.big_uint_ctx.limb_bit_size;
 
         assert_eq!(eval_result.len(), NUM_LIMBS);
         for i in 0..NUM_LIMBS {
+            let expected_limb = remaining_value % base;
             let coeffs = eval_result[i].coeffs();
-            assert_eq!(*coeffs[0].value(), expected_limbs[i].into());
+            assert_eq!(*coeffs[0].value(), expected_limb.into());
+            remaining_value /= base;
         }
     }
 
     #[test]
     fn test_montgomery_mul_large() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 2);
+        let (params, ctx) = create_test_context(&mut circuit);
 
-        // Create two Montgomery values
-        let value_a =
-            BigUintPoly::<DCRTPoly>::new(ctx.big_uint_ctx.clone(), inputs[0..NUM_LIMBS].to_vec());
-        let value_b = BigUintPoly::<DCRTPoly>::new(
-            ctx.big_uint_ctx.clone(),
-            inputs[NUM_LIMBS..2 * NUM_LIMBS].to_vec(),
+        // Test with a=12, b=15, expected: (12*15) mod 17 = 180 mod 17 = 9
+        let test_a = 12u64;
+        let test_b = 15u64;
+
+        let mont_a = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_a = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_a,
         );
-
-        let mont_a = MontgomeryPoly::from_regular(&mut circuit, ctx.clone(), value_a);
-        let mont_b = MontgomeryPoly::from_regular(&mut circuit, ctx.clone(), value_b);
+        let mont_b = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_b = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_b,
+        );
+        let input_values = [input_values_a, input_values_b].concat();
 
         // Multiply in Montgomery form
         let mont_product = mont_a.mul(&mont_b, &mut circuit);
@@ -627,15 +658,6 @@ mod tests {
         let regular_product = mont_product.to_regular(&mut circuit);
 
         circuit.output(regular_product.limbs.clone());
-
-        // Test with a=12, b=15, expected: (12*15) mod 17 = 180 mod 17 = 9
-        let test_a = 12u64;
-        let test_b = 15u64;
-        let input_values = [
-            create_test_value_from_u64(&params, test_a),
-            create_test_value_from_u64(&params, test_b),
-        ]
-        .concat();
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -647,31 +669,44 @@ mod tests {
 
         // Should get (12 * 15) mod 17 = 180 mod 17 = 9
         let expected_product = (test_a * test_b) % 17;
-        let expected_limbs =
-            bigint_to_limbs(&BigUint::from(expected_product), LIMB_BIT_SIZE, NUM_LIMBS);
+        let mut remaining_value = expected_product;
+        let base = 1u64 << ctx.big_uint_ctx.limb_bit_size;
 
         assert_eq!(eval_result.len(), NUM_LIMBS);
         for i in 0..NUM_LIMBS {
+            let expected_limb = remaining_value % base;
             let coeffs = eval_result[i].coeffs();
-            assert_eq!(*coeffs[0].value(), expected_limbs[i].into());
+            assert_eq!(*coeffs[0].value(), expected_limb.into());
+            remaining_value /= base;
         }
     }
 
     #[test]
     fn test_montgomery_mul_input_0() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 2);
+        let (params, ctx) = create_test_context(&mut circuit);
 
-        // Create two Montgomery values
-        let value_a =
-            BigUintPoly::<DCRTPoly>::new(ctx.big_uint_ctx.clone(), inputs[0..NUM_LIMBS].to_vec());
-        let value_b = BigUintPoly::<DCRTPoly>::new(
-            ctx.big_uint_ctx.clone(),
-            inputs[NUM_LIMBS..2 * NUM_LIMBS].to_vec(),
+        // Test with a=0, b=16, expected: (0*16) mod 17 = 0
+        let test_a = 0u64;
+        let test_b = 16u64;
+
+        let mont_a = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_a = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_a,
         );
-
-        let mont_a = MontgomeryPoly::from_regular(&mut circuit, ctx.clone(), value_a);
-        let mont_b = MontgomeryPoly::from_regular(&mut circuit, ctx.clone(), value_b);
+        let mont_b = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_b = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_b,
+        );
+        let input_values = [input_values_a, input_values_b].concat();
 
         // Multiply in Montgomery form
         let mont_product = mont_a.mul(&mont_b, &mut circuit);
@@ -680,15 +715,6 @@ mod tests {
         let regular_product = mont_product.to_regular(&mut circuit);
 
         circuit.output(regular_product.limbs.clone());
-
-        // Test with a=0, b=16, expected: (0*16) mod 17 = 0
-        let test_a = 0u64;
-        let test_b = 16u64;
-        let input_values = [
-            create_test_value_from_u64(&params, test_a),
-            create_test_value_from_u64(&params, test_b),
-        ]
-        .concat();
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -700,34 +726,38 @@ mod tests {
 
         // Should get (0 * 16) mod 17 = 0
         let expected_product = (test_a * test_b) % 17;
-        let expected_limbs =
-            bigint_to_limbs(&BigUint::from(expected_product), LIMB_BIT_SIZE, NUM_LIMBS);
+        let mut remaining_value = expected_product;
+        let base = 1u64 << ctx.big_uint_ctx.limb_bit_size;
 
         assert_eq!(eval_result.len(), NUM_LIMBS);
         for i in 0..NUM_LIMBS {
+            let expected_limb = remaining_value % base;
             let coeffs = eval_result[i].coeffs();
-            assert_eq!(*coeffs[0].value(), expected_limbs[i].into());
+            assert_eq!(*coeffs[0].value(), expected_limb.into());
+            remaining_value /= base;
         }
     }
 
     #[test]
     fn test_montgomery_finalize() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 1);
-
-        // Create regular value input
-        let regular_value =
-            BigUintPoly::<DCRTPoly>::new(ctx.big_uint_ctx.clone(), inputs[0..NUM_LIMBS].to_vec());
-
-        // Convert to Montgomery form and finalize
-        let montgomery_value =
-            MontgomeryPoly::from_regular(&mut circuit, ctx.clone(), regular_value);
-        let finalized = montgomery_value.finalize(&mut circuit);
-        circuit.output(vec![finalized]);
+        let (params, ctx) = create_test_context(&mut circuit);
 
         // Test with regular value 13
         let test_value = 13u64;
-        let input_values = create_test_value_from_u64(&params, test_value);
+
+        let montgomery_value = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_value,
+        );
+
+        // Finalize the Montgomery value (converts back to regular and finalizes)
+        let finalized = montgomery_value.finalize(&mut circuit);
+        circuit.output(vec![finalized]);
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -745,21 +775,23 @@ mod tests {
     #[test]
     fn test_montgomery_finalize_zero() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 1);
-
-        // Create regular value input
-        let regular_value =
-            BigUintPoly::<DCRTPoly>::new(ctx.big_uint_ctx.clone(), inputs[0..NUM_LIMBS].to_vec());
-
-        // Convert to Montgomery form and finalize
-        let montgomery_value =
-            MontgomeryPoly::from_regular(&mut circuit, ctx.clone(), regular_value);
-        let finalized = montgomery_value.finalize(&mut circuit);
-        circuit.output(vec![finalized]);
+        let (params, ctx) = create_test_context(&mut circuit);
 
         // Test with regular value 0
         let test_value = 0u64;
-        let input_values = create_test_value_from_u64(&params, test_value);
+
+        let montgomery_value = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_value,
+        );
+
+        // Finalize the Montgomery value (converts back to regular and finalizes)
+        let finalized = montgomery_value.finalize(&mut circuit);
+        circuit.output(vec![finalized]);
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -777,21 +809,23 @@ mod tests {
     #[test]
     fn test_montgomery_finalize_large() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 1);
-
-        // Create regular value input
-        let regular_value =
-            BigUintPoly::<DCRTPoly>::new(ctx.big_uint_ctx.clone(), inputs[0..NUM_LIMBS].to_vec());
-
-        // Convert to Montgomery form and finalize
-        let montgomery_value =
-            MontgomeryPoly::from_regular(&mut circuit, ctx.clone(), regular_value);
-        let finalized = montgomery_value.finalize(&mut circuit);
-        circuit.output(vec![finalized]);
+        let (params, ctx) = create_test_context(&mut circuit);
 
         // Test with regular value 16 (close to modulus 17)
         let test_value = 16u64;
-        let input_values = create_test_value_from_u64(&params, test_value);
+
+        let montgomery_value = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_value,
+        );
+
+        // Finalize the Montgomery value (converts back to regular and finalizes)
+        let finalized = montgomery_value.finalize(&mut circuit);
+        circuit.output(vec![finalized]);
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -809,18 +843,29 @@ mod tests {
     #[test]
     fn test_montgomery_finalize_after_operations() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (inputs, params, ctx) = create_test_context(&mut circuit, 2);
+        let (params, ctx) = create_test_context(&mut circuit);
 
-        // Create two Montgomery values
-        let value_a =
-            BigUintPoly::<DCRTPoly>::new(ctx.big_uint_ctx.clone(), inputs[0..NUM_LIMBS].to_vec());
-        let value_b = BigUintPoly::<DCRTPoly>::new(
-            ctx.big_uint_ctx.clone(),
-            inputs[NUM_LIMBS..2 * NUM_LIMBS].to_vec(),
+        // Test with a=7, b=9, expected: ((7+9) * 7) mod 17 = (16 * 7) mod 17 = 112 mod 17 = 10
+        let test_a = 7u64;
+        let test_b = 9u64;
+
+        let mont_a = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_a = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_a,
         );
-
-        let mont_a = MontgomeryPoly::from_regular(&mut circuit, ctx.clone(), value_a);
-        let mont_b = MontgomeryPoly::from_regular(&mut circuit, ctx.clone(), value_b);
+        let mont_b = MontgomeryPoly::input(ctx.clone(), &mut circuit);
+        let input_values_b = u64_to_montgomery_poly(
+            ctx.big_uint_ctx.limb_bit_size,
+            ctx.num_limbs,
+            ctx.n,
+            &params,
+            test_b,
+        );
+        let input_values = [input_values_a, input_values_b].concat();
 
         // Perform operations: (a + b) * a mod 17
         let mont_sum = mont_a.add(&mont_b, &mut circuit);
@@ -829,15 +874,6 @@ mod tests {
         // Finalize the result
         let finalized = mont_product.finalize(&mut circuit);
         circuit.output(vec![finalized]);
-
-        // Test with a=7, b=9, expected: ((7+9) * 7) mod 17 = (16 * 7) mod 17 = 112 mod 17 = 10
-        let test_a = 7u64;
-        let test_b = 9u64;
-        let input_values = [
-            create_test_value_from_u64(&params, test_a),
-            create_test_value_from_u64(&params, test_b),
-        ]
-        .concat();
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(

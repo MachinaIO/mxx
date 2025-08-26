@@ -318,11 +318,13 @@ impl Poly for DCRTPoly {
 
     fn to_const_int(&self) -> usize {
         let mut sum = 0usize;
-        for (i, c) in self.coeffs_digits().into_iter().enumerate() {
+        for (i, coeff) in self.coeffs().into_iter().enumerate() {
             if i >= usize::BITS as usize {
                 break;
             }
-            sum = sum.saturating_add((1usize << i).saturating_mul(c as usize));
+            // Convert BigUint to usize safely, saturating if too large
+            let coeff_val = coeff.value().try_into().unwrap_or(usize::MAX);
+            sum = sum.saturating_add((1usize << i).saturating_mul(coeff_val));
         }
         sum
     }

@@ -482,8 +482,6 @@ impl<P: Poly> BigUintPoly<P> {
         let mut ps = p.to_vec();
         let mut d = 1usize;
         while d < w {
-                    let pk = ps[k];
-                    // G' = gk OR (pk AND gj); P' = pk AND pj
             for k in (d..w).rev() {
                 let gj = gs[k - d];
                 let pj = ps[k - d];

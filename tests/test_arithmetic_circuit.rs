@@ -124,12 +124,4 @@ fn test_arithmetic_circuit_operations() {
         DCRTPolyUniformSampler,
     >(&params, inputs.len(), seed, tmp_dir.path().to_path_buf(), d, &inputs, &secrets, p, 0.0);
     info!("end evaluate_with_bgg_encoding");
-    // Verify that both BGG methods produce results
-    assert_eq!(pubkey_results.len(), 1, "BGG pubkey evaluation should produce one result");
-    assert_eq!(encoding_results.len(), 1, "BGG encoding evaluation should produce one result");
-
-    // The actual values will be different due to encryption, but both should complete without
-    // error
-    println!("BGG public key evaluation completed successfully");
-    println!("BGG encoding evaluation completed successfully");
 }

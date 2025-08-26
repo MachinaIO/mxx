@@ -1,4 +1,5 @@
 use num_bigint::BigUint;
+use tracing::info;
 
 use crate::{
     circuit::PolyCircuit,
@@ -96,7 +97,9 @@ impl<P: Poly> ArithmeticCircuit<P> {
 
         let rhs_crt = &self.all_values[rhs_index];
         let lhs_crt = &self.all_values[lhs_index];
+        info!("mul st");
         let result_crt = rhs_crt.mul(lhs_crt, &mut self.poly_circuit);
+        info!("mul end");
 
         self.all_values.push(result_crt);
         self.all_values.len() - 1

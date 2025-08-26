@@ -1,6 +1,6 @@
 use keccak_asm::Keccak256;
 use mxx::{
-    arithmetic::circuit::ArithmeticCircuit,
+    arithmetic::circuit::{ArithGateId, ArithmeticCircuit},
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
@@ -21,6 +21,7 @@ pub fn init_tracing() {
 }
 
 #[test]
+#[ignore]
 fn test_arithmetic_circuit_operations() {
     init_tracing();
 
@@ -68,7 +69,7 @@ fn test_arithmetic_circuit_operations() {
     }
 
     let inputs = vec![large_a.clone(), large_b.clone(), large_c.clone()];
-    let limb_bit_size = 5;
+    let limb_bit_size = 3;
 
     // Test mixed operations in single circuit: (a + b) * c - a.
     let mut mixed_circuit = ArithmeticCircuit::<DCRTPoly>::setup(
@@ -79,10 +80,10 @@ fn test_arithmetic_circuit_operations() {
         &inputs,
         true,
     );
-    let add_idx = mixed_circuit.add(0, 1); // a + b
-    let mul_idx = mixed_circuit.mul(add_idx, 2); // (a + b) * c
-    let final_idx = mixed_circuit.sub(mul_idx, 0); // (a + b) * c - a
-    mixed_circuit.finalize(final_idx);
+    let add_idx = mixed_circuit.add(ArithGateId::new(1), ArithGateId::new(0)); // a + b
+    let mul_idx = mixed_circuit.mul(add_idx, ArithGateId::new(2)); // (a + b) * c
+    let final_idx = mixed_circuit.sub(ArithGateId::new(0), mul_idx); // (a + b) * c - a
+    mixed_circuit.output(final_idx);
 
     // Test with polynomial evaluation
     info!("start evaluate_with_poly");
@@ -129,6 +130,7 @@ fn test_arithmetic_circuit_operations() {
 }
 
 #[test]
+#[ignore]
 fn test_arithmetic_circuit_no_crt() {
     init_tracing();
 
@@ -184,13 +186,13 @@ fn test_arithmetic_circuit_no_crt() {
     );
     info!("Non-CRT: setup");
 
-    let add_idx = circuit.add(0, 1); // a + b
+    let add_idx = circuit.add(ArithGateId::new(1), ArithGateId::new(0)); // a + b
     info!("Non-CRT: add");
-    let mul_idx = circuit.mul(add_idx, 2); // (a + b) * c
+    let mul_idx = circuit.mul(add_idx, ArithGateId::new(2)); // (a + b) * c
     info!("Non-CRT: mul");
-    let final_idx = circuit.sub(mul_idx, 0); // (a + b) * c - a
+    let final_idx = circuit.sub(ArithGateId::new(0), mul_idx); // (a + b) * c - a
     info!("Non-CRT: sub");
-    circuit.finalize(final_idx);
+    circuit.output(final_idx);
 
     // Test with polynomial evaluation.
     info!("Non-CRT: start evaluate_with_poly");

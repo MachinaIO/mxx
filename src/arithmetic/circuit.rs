@@ -11,6 +11,31 @@ use crate::{
 };
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArithGateId(usize);
+
+impl ArithGateId {
+    pub fn new(id: usize) -> Self {
+        Self(id)
+    }
+
+    pub fn as_usize(&self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for ArithGateId {
+    fn from(id: usize) -> Self {
+        Self(id)
+    }
+}
+
+impl From<ArithGateId> for usize {
+    fn from(id: ArithGateId) -> Self {
+        id.0
+    }
+}
+
 #[derive(Clone)]
 pub struct ArithmeticCircuit<P: Poly> {
     pub limb_bit_size: usize,
@@ -65,51 +90,57 @@ impl<P: Poly> ArithmeticCircuit<P> {
     }
 
     /// rhs + lhs
-    pub fn add(&mut self, rhs_index: usize, lhs_index: usize) -> usize {
-        assert!(rhs_index < self.all_values.len(), "rhs_index out of bounds");
-        assert!(lhs_index < self.all_values.len(), "lhs_index out of bounds");
+    pub fn add(&mut self, lhs_index: ArithGateId, rhs_index: ArithGateId) -> ArithGateId {
+        let rhs_idx = rhs_index.as_usize();
+        let lhs_idx = lhs_index.as_usize();
+        assert!(rhs_idx < self.all_values.len(), "rhs_index out of bounds");
+        assert!(lhs_idx < self.all_values.len(), "lhs_index out of bounds");
 
-        let rhs_crt = &self.all_values[rhs_index];
-        let lhs_crt = &self.all_values[lhs_index];
+        let rhs_crt = &self.all_values[rhs_idx];
+        let lhs_crt = &self.all_values[lhs_idx];
         let result_crt = rhs_crt.add(lhs_crt, &mut self.poly_circuit);
 
         self.all_values.push(result_crt);
-        self.all_values.len() - 1
+        ArithGateId::new(self.all_values.len() - 1)
     }
 
     /// rhs - lhs
-    pub fn sub(&mut self, rhs_index: usize, lhs_index: usize) -> usize {
-        assert!(rhs_index < self.all_values.len(), "rhs_index out of bounds");
-        assert!(lhs_index < self.all_values.len(), "lhs_index out of bounds");
+    pub fn sub(&mut self, lhs_index: ArithGateId, rhs_index: ArithGateId) -> ArithGateId {
+        let rhs_idx = rhs_index.as_usize();
+        let lhs_idx = lhs_index.as_usize();
+        assert!(rhs_idx < self.all_values.len(), "rhs_index out of bounds");
+        assert!(lhs_idx < self.all_values.len(), "lhs_index out of bounds");
 
-        let rhs_crt = &self.all_values[rhs_index];
-        let lhs_crt = &self.all_values[lhs_index];
+        let rhs_crt = &self.all_values[rhs_idx];
+        let lhs_crt = &self.all_values[lhs_idx];
         let result_crt = rhs_crt.sub(lhs_crt, &mut self.poly_circuit);
 
         self.all_values.push(result_crt);
-        self.all_values.len() - 1
+        ArithGateId::new(self.all_values.len() - 1)
     }
 
     /// rhs * lhs
-    pub fn mul(&mut self, rhs_index: usize, lhs_index: usize) -> usize {
-        assert!(rhs_index < self.all_values.len(), "rhs_index out of bounds");
-        assert!(lhs_index < self.all_values.len(), "lhs_index out of bounds");
+    pub fn mul(&mut self, lhs_index: ArithGateId, rhs_index: ArithGateId) -> ArithGateId {
+        let rhs_idx = rhs_index.as_usize();
+        let lhs_idx = lhs_index.as_usize();
+        assert!(rhs_idx < self.all_values.len(), "rhs_index out of bounds");
+        assert!(lhs_idx < self.all_values.len(), "lhs_index out of bounds");
 
-        let rhs_crt = &self.all_values[rhs_index];
-        let lhs_crt = &self.all_values[lhs_index];
+        let rhs_crt = &self.all_values[rhs_idx];
+        let lhs_crt = &self.all_values[lhs_idx];
         info!("mul st");
         let result_crt = rhs_crt.mul(lhs_crt, &mut self.poly_circuit);
         info!("mul end");
 
         self.all_values.push(result_crt);
-        self.all_values.len() - 1
+        ArithGateId::new(self.all_values.len() - 1)
     }
 
-    /// Finalize a value at the given index and set it as output
-    pub fn finalize(&mut self, value_index: usize) {
-        assert!(value_index < self.all_values.len(), "value_index out of bounds");
-
-        let result_crt = &self.all_values[value_index];
+    /// Output a value at the given index and set it as output
+    pub fn output(&mut self, value_index: ArithGateId) {
+        let idx = value_index.as_usize();
+        assert!(idx < self.all_values.len(), "value_index out of bounds");
+        let result_crt = &self.all_values[idx];
         if self.use_reconstruction {
             let output_gate = result_crt.finalize_reconst(&mut self.poly_circuit);
             self.poly_circuit.output(vec![output_gate]);

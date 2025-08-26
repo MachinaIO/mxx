@@ -1,15 +1,29 @@
+use keccak_asm::Keccak256;
 use mxx::{
     arithmetic::circuit::ArithmeticCircuit,
+    matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
+    sampler::{
+        DistType, PolyTrapdoorSampler, PolyUniformSampler, hash::DCRTPolyHashSampler,
+        trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
+    },
 };
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
+use tempfile::tempdir;
+use tracing::info;
+
+pub fn init_tracing() {
+    tracing_subscriber::fmt::init();
+}
 
 #[test]
 fn test_arithmetic_circuit_operations() {
+    init_tracing();
+
     let params = DCRTPolyParams::default();
     let (moduli, _, _) = params.to_crt();
     let large_a = BigUint::from(140000u64);
@@ -69,12 +83,53 @@ fn test_arithmetic_circuit_operations() {
     let mul_idx = mixed_circuit.mul(add_idx, 2); // (a + b) * c
     let final_idx = mixed_circuit.sub(mul_idx, 0); // (a + b) * c - a
     mixed_circuit.finalize(final_idx);
-    let mixed_result = &mixed_circuit.evaluate_with_poly(&params, &inputs)[0];
 
+    // Test with polynomial evaluation
+    let mixed_result = &mixed_circuit.evaluate_with_poly(&params, &inputs)[0];
     let mixed_expected = ((&large_a + &large_b) * &large_c) - &large_a;
     assert_eq!(
         mixed_result.to_const_int(),
         mixed_expected.to_u64().unwrap() as usize,
         "Mixed operations should be correct"
     );
+
+    // Test with BGG public key evaluation
+    let tmp_dir = tempdir().unwrap();
+    let seed: [u8; 32] = [0u8; 32];
+    let d = 1;
+    let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, 1.0);
+    let (b_epsilon_trapdoor, b_epsilon) = trapdoor_sampler.trapdoor(&params, d + 1);
+    info!("start evaluate_with_bgg_pubkey");
+    let pubkey_results = mixed_circuit.evaluate_with_bgg_pubkey::<
+        DCRTPolyMatrix,
+        DCRTPolyHashSampler<Keccak256>,
+        DCRTPolyTrapdoorSampler,
+        DCRTPolyUniformSampler,
+    >(&params, inputs.len(), seed, tmp_dir.path().to_path_buf(), d, b_epsilon.clone(), b_epsilon_trapdoor, trapdoor_sampler.clone());
+    info!("end evaluate_with_bgg_pubkey");
+    // Test with BGG encoding evaluation
+    let uniform_sampler = DCRTPolyUniformSampler::new();
+    let secrets = uniform_sampler.sample_uniform(&params, 1, d, DistType::BitDist).get_row(0);
+    let s_x_l = {
+        let minus_one_poly = DCRTPoly::const_minus_one(&params);
+        let mut secrets = secrets.to_vec();
+        secrets.push(minus_one_poly);
+        DCRTPolyMatrix::from_poly_vec_row(&params, secrets)
+    };
+    let p = s_x_l * &b_epsilon;
+    info!("start evaluate_with_bgg_encoding");
+    let encoding_results = mixed_circuit.evaluate_with_bgg_encoding::<
+        DCRTPolyMatrix,
+        DCRTPolyHashSampler<Keccak256>,
+        DCRTPolyUniformSampler,
+    >(&params, inputs.len(), seed, tmp_dir.path().to_path_buf(), d, &inputs, &secrets, p, 0.0);
+    info!("end evaluate_with_bgg_encoding");
+    // Verify that both BGG methods produce results
+    assert_eq!(pubkey_results.len(), 1, "BGG pubkey evaluation should produce one result");
+    assert_eq!(encoding_results.len(), 1, "BGG encoding evaluation should produce one result");
+
+    // The actual values will be different due to encryption, but both should complete without
+    // error
+    println!("BGG public key evaluation completed successfully");
+    println!("BGG encoding evaluation completed successfully");
 }

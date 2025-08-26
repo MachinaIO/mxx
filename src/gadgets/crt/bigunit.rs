@@ -482,24 +482,20 @@ impl<P: Poly> BigUintPoly<P> {
         let mut ps = p.to_vec();
         let mut d = 1usize;
         while d < w {
-            let mut gs_next = gs.clone();
-            let mut ps_next = ps.clone();
-            for k in 0..w {
-                if k >= d {
-                    let gj = gs[k - d];
-                    let pj = ps[k - d];
-                    let gk = gs[k];
                     let pk = ps[k];
                     // G' = gk OR (pk AND gj); P' = pk AND pj
-                    let pk_and_gj = circuit.and_gate(pk, gj);
-                    let g_new = circuit.or_gate(gk, pk_and_gj);
-                    let p_new = circuit.and_gate(pk, pj);
-                    gs_next[k] = g_new;
-                    ps_next[k] = p_new;
-                }
+            for k in (d..w).rev() {
+                let gj = gs[k - d];
+                let pj = ps[k - d];
+                let pk = ps[k];
+
+                // G'[k] = G[k] OR (P[k] AND G[k-d])
+                let pk_and_gj = circuit.and_gate(pk, gj);
+                gs[k] = circuit.or_gate(gs[k], pk_and_gj);
+
+                // P'[k] = P[k] AND P[k-d]
+                ps[k] = circuit.and_gate(pk, pj);
             }
-            gs = gs_next;
-            ps = ps_next;
             d <<= 1;
         }
         (gs, ps)

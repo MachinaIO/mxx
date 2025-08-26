@@ -85,7 +85,9 @@ fn test_arithmetic_circuit_operations() {
     mixed_circuit.finalize(final_idx);
 
     // Test with polynomial evaluation
+    info!("start evaluate_with_poly");
     let mixed_result = &mixed_circuit.evaluate_with_poly(&params, &inputs)[0];
+    info!("end evaluate_with_poly");
     let mixed_expected = ((&large_a + &large_b) * &large_c) - &large_a;
     assert_eq!(
         mixed_result.to_const_int(),
@@ -100,7 +102,7 @@ fn test_arithmetic_circuit_operations() {
     let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, 1.0);
     let (b_epsilon_trapdoor, b_epsilon) = trapdoor_sampler.trapdoor(&params, d + 1);
     info!("start evaluate_with_bgg_pubkey");
-    let pubkey_results = mixed_circuit.evaluate_with_bgg_pubkey::<
+    let _ = mixed_circuit.evaluate_with_bgg_pubkey::<
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
         DCRTPolyTrapdoorSampler,
@@ -118,7 +120,7 @@ fn test_arithmetic_circuit_operations() {
     };
     let p = s_x_l * &b_epsilon;
     info!("start evaluate_with_bgg_encoding");
-    let encoding_results = mixed_circuit.evaluate_with_bgg_encoding::<
+    let _ = mixed_circuit.evaluate_with_bgg_encoding::<
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
         DCRTPolyUniformSampler,

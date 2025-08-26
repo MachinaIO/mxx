@@ -10,7 +10,7 @@ use crate::{
         DistType, PolyTrapdoorSampler, PolyUniformSampler, trapdoor::KARNEY_THRESHOLD,
         uniform::DCRTPolyUniformSampler,
     },
-    utils::{debug_mem, log_mem},
+    utils::debug_mem,
 };
 use openfhe::ffi::DCRTGaussSampGqArbBase;
 use rayon::iter::ParallelIterator;
@@ -97,7 +97,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         };
         let dgg_large_params =
             (dgg_large_mean, dgg_large_std, dgg_large_table.as_ref().map(|v| &v[..]));
-        log_mem("preimage parameters computed");
+        debug_mem("preimage parameters computed");
         let p_hat = trapdoor.sample_pert_square_mat(
             s,
             self.c,
@@ -106,7 +106,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
             peikert,
             target_cols,
         );
-        log_mem("p_hat generated");
+        debug_mem("p_hat generated");
         let perturbed_syndrome = target - &(public_matrix * &p_hat);
         debug_mem("perturbed_syndrome generated");
         let mut z_hat_mat = DCRTPolyMatrix::zero(params, d * k, target_cols);
@@ -143,7 +143,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
             block_matrix
         };
         z_hat_mat.replace_entries_with_expand(0..d, 0..target_cols, k, 1, f);
-        log_mem("z_hat_mat generated");
+        debug_mem("z_hat_mat generated");
         let r_z_hat = &trapdoor.r * &z_hat_mat;
         debug_mem("r_z_hat generated");
         let e_z_hat = &trapdoor.e * &z_hat_mat;
@@ -151,7 +151,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         let z_hat_former = (p_hat.slice_rows(0, d) + r_z_hat)
             .concat_rows(&[&(p_hat.slice_rows(d, 2 * d) + e_z_hat)]);
         let z_hat_latter = p_hat.slice_rows(2 * d, d * (k + 2)) + z_hat_mat;
-        log_mem("z_hat generated");
+        debug_mem("z_hat generated");
         z_hat_former.concat_rows(&[&z_hat_latter])
     }
 

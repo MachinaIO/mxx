@@ -19,7 +19,7 @@ pub struct ArithmeticCircuit<P: Poly> {
     pub poly_circuit: PolyCircuit<P>,
     pub ctx: Arc<CrtContext<P>>,
     pub use_reconstruction: bool,
-    //inputs + intermediate results
+    // inputs + intermediate results
     pub all_values: Vec<CrtPoly<P>>,
 }
 
@@ -111,7 +111,6 @@ impl<P: Poly> ArithmeticCircuit<P> {
             let output_gate = result_crt.finalize_reconst(&mut self.poly_circuit);
             self.poly_circuit.output(vec![output_gate]);
         } else {
-            // Output all CRT slots as specified in the spec
             let gates = result_crt.finalize_crt(&mut self.poly_circuit);
             self.poly_circuit.output(gates);
         };

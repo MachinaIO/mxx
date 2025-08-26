@@ -1,14 +1,22 @@
 use crate::{
     arithmetic::circuit::ArithmeticCircuit,
-    bgg::{encoding::BggEncoding, public_key::BggPublicKey, sampler::BGGPublicKeySampler},
+    bgg::{
+        encoding::BggEncoding,
+        public_key::BggPublicKey,
+        sampler::{BGGEncodingSampler, BGGPublicKeySampler},
+    },
     gadgets::crt::biguint_to_crt_poly,
-    lookup::{poly::PolyPltEvaluator, simple_eval::SimpleBggPubKeyEvaluator},
+    lookup::{
+        poly::PolyPltEvaluator,
+        simple_eval::{SimpleBggEncodingPltEvaluator, SimpleBggPubKeyEvaluator},
+    },
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
     sampler::{PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
 };
 use num_bigint::BigUint;
 use std::path::PathBuf;
+use tracing::info;
 
 const TAG_BGG_PUBKEY: &[u8] = b"BGG_PUBKEY";
 
@@ -50,6 +58,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
         let reveal_plaintexts = vec![true; num_packed_poly_inputs + 1];
         let bgg_pubkey_sampler = BGGPublicKeySampler::<_, SH>::new(seed, d);
         let pubkeys = bgg_pubkey_sampler.sample(&params, &TAG_BGG_PUBKEY, &reveal_plaintexts);
+        info!("sampled all pubkeys {}", pubkeys.len());
         let bgg_evaluator = SimpleBggPubKeyEvaluator::<M, SH, SU, ST>::new(
             seed,
             trapdoor_sampler,
@@ -85,6 +94,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
         let reveal_plaintexts = vec![true; num_packed_poly_inputs + 1];
         let bgg_pubkey_sampler = BGGPublicKeySampler::<_, SH>::new(seed, d);
         let pubkeys = bgg_pubkey_sampler.sample(&params, &TAG_BGG_PUBKEY, &reveal_plaintexts);
+        info!("sampled all pubkeys {}", pubkeys.len());
         let mut packed_inputs: Vec<P> = vec![];
         for input in inputs {
             let crt_limbs = biguint_to_crt_poly(self.limb_bit_size, params, input);
@@ -92,16 +102,10 @@ impl<P: Poly> ArithmeticCircuit<P> {
         }
 
         let uniform_sampler = SU::new();
-        let bgg_encoding_sampler = crate::bgg::sampler::BGGEncodingSampler::new(
-            params,
-            secret,
-            uniform_sampler,
-            error_sigma,
-        );
+        let bgg_encoding_sampler =
+            BGGEncodingSampler::new(params, secret, uniform_sampler, error_sigma);
         let encodings = bgg_encoding_sampler.sample(params, &pubkeys, &packed_inputs);
-        let bgg_evaluator = crate::lookup::simple_eval::SimpleBggEncodingPltEvaluator::<M, SH>::new(
-            seed, dir_path, p,
-        );
+        let bgg_evaluator = SimpleBggEncodingPltEvaluator::<M, SH>::new(seed, dir_path, p);
         let results =
             self.poly_circuit.eval(params, &encodings[0], &encodings[1..], Some(bgg_evaluator));
         results

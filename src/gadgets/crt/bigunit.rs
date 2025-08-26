@@ -184,7 +184,7 @@ impl<P: Poly> BigUintPoly<P> {
         let zero = circuit.const_zero_gate();
         let one = circuit.const_one_gate();
         let base_minus_one = {
-            let b_minus_1 = ((1u32 << self.ctx.limb_bit_size) - 1) as u32;
+            let b_minus_1 = (1u32 << self.ctx.limb_bit_size) - 1;
             circuit.const_digits_poly(&[b_minus_1])
         };
 
@@ -240,7 +240,7 @@ impl<P: Poly> BigUintPoly<P> {
     ) -> Self {
         debug_assert_eq!(self.ctx, other.ctx);
         let max_bit_size = max_bit_size.unwrap_or(self.bit_size() + other.bit_size());
-        debug_assert!(max_bit_size % self.ctx.limb_bit_size == 0);
+        debug_assert!(max_bit_size.is_multiple_of(self.ctx.limb_bit_size));
         let max_limbs = max_bit_size / self.ctx.limb_bit_size;
         let (sum_vec, carry_vec) = self.mul_without_cpa(other, circuit, max_limbs);
 
@@ -376,7 +376,7 @@ impl<P: Poly> BigUintPoly<P> {
                 let mut idx: usize = 0;
                 while idx < col.len() {
                     let last_col_idx = (idx + comp_rate - 1).min(col.len() - 1);
-                    let mut sum = col[idx].clone();
+                    let mut sum = col[idx];
                     for i in idx + 1..=last_col_idx {
                         sum = circuit.add_gate(sum, col[i]);
                     }
@@ -397,11 +397,11 @@ impl<P: Poly> BigUintPoly<P> {
             for k in 0..w {
                 compact[k] = std::mem::take(&mut next[k]);
             }
-            if let Some(t) = tail {
-                if w > 0 {
-                    /* overflow beyond max width ignored */
-                    let _ = t;
-                }
+            if let Some(t) = tail &&
+                w > 0
+            {
+                /* overflow beyond max width ignored */
+                let _ = t;
             }
             *columns = compact;
             if done {

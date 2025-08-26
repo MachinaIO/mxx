@@ -14,7 +14,7 @@ impl<M: PolyMatrix> Evaluable for BggEncoding<M> {
         let shift = if shift >= 0 {
             shift as usize
         } else {
-            params.ring_dimension() as usize - shift.abs() as usize
+            params.ring_dimension() as usize - shift.unsigned_abs() as usize
         };
         let rotate_poly = <M::P>::const_rotate_poly(params, shift);
         let vector = self.vector.clone() * &rotate_poly;
@@ -52,7 +52,7 @@ impl<M: PolyMatrix> Evaluable for BggPublicKey<M> {
         let shift = if shift >= 0 {
             shift as usize
         } else {
-            params.ring_dimension() as usize - shift.abs() as usize
+            params.ring_dimension() as usize - shift.unsigned_abs() as usize
         };
         let rotate_poly = <M::P>::const_rotate_poly(params, shift);
         let matrix = self.matrix.clone() * rotate_poly;

@@ -136,7 +136,7 @@ where
             &input.matrix,
             &a_lt,
             &id,
-            &self.dir_path,
+            self.dir_path.clone(),
         );
         BggPublicKey { matrix: a_lt, reveal_plaintext: true }
     }
@@ -194,7 +194,7 @@ fn preimage_all<M, SU, ST, P>(
     a_z: &M,
     a_lt: &M,
     id: &GateId,
-    dir_path: &PathBuf,
+    dir_path: PathBuf,
 ) where
     P: Poly,
     M: PolyMatrix<P = P> + Send + 'static,
@@ -225,7 +225,7 @@ fn preimage_all<M, SU, ST, P>(
         })
         .collect::<Vec<_>>();
     for (k, r_k, l_k) in matrices.into_iter() {
-        store_and_drop_matrix(r_k, dir_path, &format!("R_{id}_{k}"));
-        store_and_drop_matrix(l_k, dir_path, &format!("L_{id}_{k}"));
+        store_and_drop_matrix(r_k, &dir_path, &format!("R_{id}_{k}"));
+        store_and_drop_matrix(l_k, &dir_path, &format!("L_{id}_{k}"));
     }
 }

@@ -15,7 +15,7 @@ impl<P: Poly> Evaluable for P {
         let shift = if shift >= 0 {
             shift as usize
         } else {
-            params.ring_dimension() as usize - shift.abs() as usize
+            params.ring_dimension() as usize - shift.unsigned_abs() as usize
         };
         coeffs.rotate_right(shift);
         Self::from_coeffs(params, &coeffs)

@@ -1,24 +1,63 @@
 use mxx::{
     arithmetic::circuit::ArithmeticCircuit,
-    gadgets::crt::biguint_to_crt_poly,
-    lookup::poly::PolyPltEvaluator,
     poly::{
-        Poly, PolyParams,
+        PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
 };
 use num_bigint::BigUint;
+use num_traits::ToPrimitive;
 
 #[test]
-fn test_arithmetic_circuit_chaining() {
+fn test_arithmetic_circuit_operations() {
     let params = DCRTPolyParams::default();
-    // Test case: (10 + 20) * 5 - 3 = 30 * 5 - 3 = 150 - 3 = 147
-    let inputs =
-        vec![BigUint::from(10u64), BigUint::from(20u64), BigUint::from(5u64), BigUint::from(3u64)];
+    let (moduli, _, _) = params.to_crt();
+    let large_a = BigUint::from(140000u64);
+    let large_b = BigUint::from(132000u64);
+    let large_c = BigUint::from(50000u64);
 
+    // Expected results for each operation.
+    let add_expected = &large_a + &large_b;
+    let mul_expected = &large_a * &large_c;
+    let sub_expected = &large_a - &large_c;
+
+    // Verify modular arithmetic correctness for all operations.
+    for (i, &qi) in moduli.iter().enumerate() {
+        let a_mod_qi = (&large_a % qi as u64).to_u64().unwrap();
+        let b_mod_qi = (&large_b % qi as u64).to_u64().unwrap();
+        let c_mod_qi = (&large_c % qi as u64).to_u64().unwrap();
+
+        let add_mod_qi = (a_mod_qi + b_mod_qi) % qi as u64;
+        let mul_mod_qi = (a_mod_qi * c_mod_qi) % qi as u64;
+        let sub_mod_qi = if a_mod_qi >= c_mod_qi {
+            a_mod_qi - c_mod_qi
+        } else {
+            qi as u64 - (c_mod_qi - a_mod_qi)
+        };
+
+        let add_expected_mod_qi = (&add_expected % qi as u64).to_u64().unwrap();
+        let mul_expected_mod_qi = (&mul_expected % qi as u64).to_u64().unwrap();
+        let sub_expected_mod_qi = (&sub_expected % qi as u64).to_u64().unwrap();
+
+        assert_eq!(add_mod_qi, add_expected_mod_qi, "Addition should be consistent in slot {}", i);
+        assert_eq!(
+            mul_mod_qi, mul_expected_mod_qi,
+            "Multiplication should be consistent in slot {}",
+            i
+        );
+        assert_eq!(
+            sub_mod_qi, sub_expected_mod_qi,
+            "Subtraction should be consistent in slot {}",
+            i
+        );
+    }
+
+    let inputs = vec![large_a.clone(), large_b.clone(), large_c.clone()];
     let (_, crt_bits, _) = params.to_crt();
     let limb_bit_size = 5;
-    let mut circuit = ArithmeticCircuit::<DCRTPoly>::setup(
+
+    // Test mixed operations in single circuit: (a + b) * c - a.
+    let mut mixed_circuit = ArithmeticCircuit::<DCRTPoly>::setup(
         &params,
         crt_bits.div_ceil(limb_bit_size),
         limb_bit_size,
@@ -26,32 +65,16 @@ fn test_arithmetic_circuit_chaining() {
         &inputs,
         true,
     );
-    // (input[0] + input[1]) * input[2] - input[3]
-    // Initial indices: 0=10, 1=20, 2=5, 3=3
-    let sum_index = circuit.add(0, 1); // index 4: 10 + 20 = 30
-    let product_index = circuit.mul(sum_index, 2); // index 5: 30 * 5 = 150  
-    let final_index = circuit.sub(product_index, 3); // index 6: 150 - 3 = 147
-    circuit.finalize(final_index);
+    let add_idx = mixed_circuit.add(0, 1); // a + b
+    let mul_idx = mixed_circuit.mul(add_idx, 2); // (a + b) * c
+    let final_idx = mixed_circuit.sub(mul_idx, 0); // (a + b) * c - a
+    mixed_circuit.finalize(final_idx);
+    let mixed_result = mixed_circuit.evaluate(&params, &inputs)[0];
 
-    // Evaluate the circuit
-    let one = DCRTPoly::const_one(&params);
-    let mut all_input_polys = Vec::new();
-    for input in &inputs {
-        let crt_limbs = biguint_to_crt_poly(limb_bit_size, &params, input);
-        all_input_polys.extend(crt_limbs);
-    }
-
-    let plt_evaluator = PolyPltEvaluator::new();
-    let results = circuit.poly_circuit.eval(&params, &one, &all_input_polys, Some(plt_evaluator));
-    assert_eq!(results.len(), 1);
-    let actual_result = results[0].to_const_int();
-
-    println!("Chained operation result: {}", actual_result);
-    println!(
-        "Sum index: {}, Product index: {}, Final index: {}",
-        sum_index, product_index, final_index
+    let mixed_expected = ((&large_a + &large_b) * &large_c) - &large_a;
+    assert_eq!(
+        mixed_result,
+        mixed_expected.to_u64().unwrap() as usize,
+        "Mixed operations should be correct"
     );
-
-    // Verify: (10 + 20) * 5 - 3 = 30 * 5 - 3 = 150 - 3 = 147
-    assert_eq!(actual_result, 147, "Circuit should compute (10+20)*5-3 = 147");
 }

@@ -43,7 +43,6 @@ where
     ) -> BggPublicKey<M> {
         let row_size = input.matrix.row_size();
         let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, id);
-        println!("a_lt shape: {:?}", a_lt.size());
         preimage_all::<M, ST, _>(
             plt,
             params,
@@ -123,7 +122,7 @@ where
             || {
                 M::read_from_files(
                     params,
-                    row_size * (params.modulus_digits() + 2),
+                    row_size * (2 * params.modulus_digits() + 2),
                     m,
                     &self.dir_path,
                     &format!("L_{id}_{k}"),
@@ -224,7 +223,7 @@ mod test {
             hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
             uniform::DCRTPolyUniformSampler,
         },
-        storage::init_storage_system,
+        storage::{init_storage_system, wait_for_all_writes},
         utils::{create_bit_random_poly, create_random_poly, random_bgg_encodings},
     };
     use keccak_asm::Keccak256;
@@ -283,12 +282,11 @@ mod test {
 
         let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
         let (b_trapdoor, b) = trapdoor_sampler.trapdoor(&params, d + 1);
-        println!("b shape: {:?}", b.size());
         let s_vec = DCRTPolyMatrix::from_poly_vec_row(
             &params,
             vec![secrets, vec![DCRTPoly::const_minus_one(&params)]].concat(),
         );
-        let c_b = s_vec * &b;
+        let c_b = s_vec.clone() * &b;
 
         // Create a public key evaluator
         let dir_path = "test_lwe_plt_eval_data";
@@ -302,20 +300,19 @@ mod test {
         }
         let plt_pubkey_evaluator =
             LweBggPubKeyEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>, _>::new(
-                rand::random(),
+                key,
                 trapdoor_sampler,
                 Arc::new(b),
                 Arc::new(b_trapdoor),
                 dir_path.into(),
             );
-        println!("before eval");
         let result_pubkey = circuit.eval(
             &params,
             &enc_one.pubkey,
             &[enc1.pubkey.clone()],
             Some(plt_pubkey_evaluator),
         );
-        println!("after eval");
+        wait_for_all_writes().await.unwrap();
         assert_eq!(result_pubkey.len(), 1);
         let result_pubkey = &result_pubkey[0];
 
@@ -331,9 +328,11 @@ mod test {
         assert_eq!(result_encoding.len(), 1);
         let result_encoding = &result_encoding[0];
         assert_eq!(result_encoding.pubkey, result_pubkey.clone());
-        assert_eq!(
-            result_encoding.plaintext.clone().unwrap(),
-            plt.get(&params, &plaintexts[0].clone()).unwrap().1
-        );
+        let expected_plaintext = plt.get(&params, &plaintexts[0].clone()).unwrap().1;
+        assert_eq!(result_encoding.plaintext.clone().unwrap(), expected_plaintext);
+        let expected_vector = s_vec.clone() *
+            (result_encoding.pubkey.matrix.clone() -
+                (DCRTPolyMatrix::gadget_matrix(&params, d + 1) * expected_plaintext));
+        assert_eq!(result_encoding.vector, expected_vector);
     }
 }

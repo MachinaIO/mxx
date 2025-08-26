@@ -39,7 +39,7 @@ impl From<ArithGateId> for usize {
 #[derive(Clone)]
 pub struct ArithmeticCircuit<P: Poly> {
     pub limb_bit_size: usize,
-    pub num_crt_limbs: usize,
+    pub num_limbs: usize,
     pub packed_limbs: usize,
     pub num_inputs: usize,
     pub poly_circuit: PolyCircuit<P>,
@@ -62,7 +62,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
 
     pub fn setup(
         params: &<P as Poly>::Params,
-        num_crt_limbs: usize,
+        num_limbs: usize,
         limb_bit_size: usize,
         packed_limbs: usize,
         inputs: &[BigUint],
@@ -79,7 +79,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
 
         ArithmeticCircuit {
             limb_bit_size,
-            num_crt_limbs,
+            num_limbs,
             packed_limbs,
             num_inputs,
             poly_circuit,

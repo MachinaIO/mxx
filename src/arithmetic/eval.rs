@@ -53,7 +53,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
         SU: PolyUniformSampler<M = M> + Send + Sync,
     {
         let (_, _, crt_depth) = params.to_crt();
-        let total_limbs = self.num_crt_limbs * crt_depth * num_inputs;
+        let total_limbs = self.num_limbs * crt_depth * num_inputs;
         let num_packed_poly_inputs = total_limbs.div_ceil(self.packed_limbs);
         let reveal_plaintexts = vec![true; num_packed_poly_inputs + 1];
         let bgg_pubkey_sampler = BGGPublicKeySampler::<_, SH>::new(seed, d);
@@ -89,7 +89,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
         SU: PolyUniformSampler<M = M> + Send + Sync,
     {
         let (_, _, crt_depth) = params.to_crt();
-        let total_limbs = self.num_crt_limbs * crt_depth * num_inputs;
+        let total_limbs = self.num_limbs * crt_depth * num_inputs;
         let num_packed_poly_inputs = total_limbs.div_ceil(self.packed_limbs);
         let reveal_plaintexts = vec![true; num_packed_poly_inputs + 1];
         let bgg_pubkey_sampler = BGGPublicKeySampler::<_, SH>::new(seed, d);

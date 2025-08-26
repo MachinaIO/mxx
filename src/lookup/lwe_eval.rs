@@ -289,7 +289,7 @@ mod test {
         let c_b = s_vec.clone() * &b;
 
         // Create a public key evaluator
-        let dir_path = "test_lwe_plt_eval_data";
+        let dir_path = "test_data/test_lwe_plt_eval";
         let dir = Path::new(&dir_path);
         if !dir.exists() {
             fs::create_dir(dir).unwrap();

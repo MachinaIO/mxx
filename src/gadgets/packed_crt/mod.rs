@@ -101,7 +101,7 @@ pub fn biguint_to_packed_crt_polys<P: Poly>(
     inputs: &[BigUint],
 ) -> Vec<P> {
     let all_const_polys = inputs
-        .into_iter()
+        .iter()
         .flat_map(|input| biguint_to_crt_poly::<P>(limb_bit_size, params, input))
         .collect::<Vec<_>>();
     debug_assert_eq!(pack_bit_size % limb_bit_size, 0);
@@ -111,7 +111,7 @@ pub fn biguint_to_packed_crt_polys<P: Poly>(
     let mut new_packed_poly_deg = 0i32;
     for const_poly in all_const_polys.into_iter() {
         let rotated = const_poly.rotate(params, new_packed_poly_deg);
-        new_packed_poly = new_packed_poly + rotated;
+        new_packed_poly += rotated;
         if new_packed_poly_deg as usize == num_limbs_per_pack - 1 {
             new_packed_poly_deg = 0;
             packed_polys.push(new_packed_poly);

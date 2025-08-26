@@ -70,7 +70,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
     ) -> Self {
         let num_inputs = inputs.len();
         let mut poly_circuit = PolyCircuit::<P>::new();
-        let ctx = Arc::new(CrtContext::setup(&mut poly_circuit, &params, limb_bit_size));
+        let ctx = Arc::new(CrtContext::setup(&mut poly_circuit, params, limb_bit_size));
         let mut crt_inputs = Vec::with_capacity(num_inputs);
         for _ in 0..num_inputs {
             let crt_poly = CrtPoly::input(ctx.clone(), &mut poly_circuit);
@@ -89,47 +89,47 @@ impl<P: Poly> ArithmeticCircuit<P> {
         }
     }
 
-    /// rhs + lhs
+    /// lhs + rhs
     pub fn add(&mut self, lhs_index: ArithGateId, rhs_index: ArithGateId) -> ArithGateId {
         let rhs_idx = rhs_index.as_usize();
         let lhs_idx = lhs_index.as_usize();
         assert!(rhs_idx < self.all_values.len(), "rhs_index out of bounds");
         assert!(lhs_idx < self.all_values.len(), "lhs_index out of bounds");
 
-        let rhs_crt = &self.all_values[rhs_idx];
         let lhs_crt = &self.all_values[lhs_idx];
-        let result_crt = rhs_crt.add(lhs_crt, &mut self.poly_circuit);
+        let rhs_crt = &self.all_values[rhs_idx];
+        let result_crt = lhs_crt.add(rhs_crt, &mut self.poly_circuit);
 
         self.all_values.push(result_crt);
         ArithGateId::new(self.all_values.len() - 1)
     }
 
-    /// rhs - lhs
+    /// lhs - rhs
     pub fn sub(&mut self, lhs_index: ArithGateId, rhs_index: ArithGateId) -> ArithGateId {
         let rhs_idx = rhs_index.as_usize();
         let lhs_idx = lhs_index.as_usize();
         assert!(rhs_idx < self.all_values.len(), "rhs_index out of bounds");
         assert!(lhs_idx < self.all_values.len(), "lhs_index out of bounds");
 
-        let rhs_crt = &self.all_values[rhs_idx];
         let lhs_crt = &self.all_values[lhs_idx];
-        let result_crt = rhs_crt.sub(lhs_crt, &mut self.poly_circuit);
+        let rhs_crt = &self.all_values[rhs_idx];
+        let result_crt = lhs_crt.sub(rhs_crt, &mut self.poly_circuit);
 
         self.all_values.push(result_crt);
         ArithGateId::new(self.all_values.len() - 1)
     }
 
-    /// rhs * lhs
+    /// lhs * rhs
     pub fn mul(&mut self, lhs_index: ArithGateId, rhs_index: ArithGateId) -> ArithGateId {
         let rhs_idx = rhs_index.as_usize();
         let lhs_idx = lhs_index.as_usize();
         assert!(rhs_idx < self.all_values.len(), "rhs_index out of bounds");
         assert!(lhs_idx < self.all_values.len(), "lhs_index out of bounds");
 
-        let rhs_crt = &self.all_values[rhs_idx];
         let lhs_crt = &self.all_values[lhs_idx];
+        let rhs_crt = &self.all_values[rhs_idx];
         info!("mul st");
-        let result_crt = rhs_crt.mul(lhs_crt, &mut self.poly_circuit);
+        let result_crt = lhs_crt.mul(rhs_crt, &mut self.poly_circuit);
         info!("mul end");
 
         self.all_values.push(result_crt);

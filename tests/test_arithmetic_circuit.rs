@@ -80,9 +80,9 @@ fn test_arithmetic_circuit_operations() {
         &inputs,
         true,
     );
-    let add_idx = mixed_circuit.add(ArithGateId::new(1), ArithGateId::new(0)); // a + b
+    let add_idx = mixed_circuit.add(ArithGateId::new(0), ArithGateId::new(1)); // a + b
     let mul_idx = mixed_circuit.mul(add_idx, ArithGateId::new(2)); // (a + b) * c
-    let final_idx = mixed_circuit.sub(ArithGateId::new(0), mul_idx); // (a + b) * c - a
+    let final_idx = mixed_circuit.sub(mul_idx, ArithGateId::new(0)); // (a + b) * c - a
     mixed_circuit.output(final_idx);
 
     // Test with polynomial evaluation
@@ -101,14 +101,14 @@ fn test_arithmetic_circuit_operations() {
     let seed: [u8; 32] = [0u8; 32];
     let d = 1;
     let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, 1.0);
-    let (b_epsilon_trapdoor, b_epsilon) = trapdoor_sampler.trapdoor(&params, d + 1);
+    let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(&params, d + 1);
     info!("start evaluate_with_bgg_pubkey");
     let _ = mixed_circuit.evaluate_with_bgg_pubkey::<
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
         DCRTPolyTrapdoorSampler,
         DCRTPolyUniformSampler,
-    >(&params, inputs.len(), seed, tmp_dir.path().to_path_buf(), d, b_epsilon.clone(), b_epsilon_trapdoor, trapdoor_sampler.clone());
+    >(&params, inputs.len(), seed, tmp_dir.path().to_path_buf(), d, pub_matrix.clone(), trapdoor, trapdoor_sampler.clone());
     info!("end evaluate_with_bgg_pubkey");
     // Test with BGG encoding evaluation
     let uniform_sampler = DCRTPolyUniformSampler::new();
@@ -119,13 +119,13 @@ fn test_arithmetic_circuit_operations() {
         secrets.push(minus_one_poly);
         DCRTPolyMatrix::from_poly_vec_row(&params, secrets)
     };
-    let p = s_x_l * &b_epsilon;
+    let p = s_x_l * &pub_matrix;
     info!("start evaluate_with_bgg_encoding");
     let _ = mixed_circuit.evaluate_with_bgg_encoding::<
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
         DCRTPolyUniformSampler,
-    >(&params, inputs.len(), seed, tmp_dir.path().to_path_buf(), d, &inputs, &secrets, p, 0.0);
+    >(&params, seed, tmp_dir.path().to_path_buf(),  &inputs, &secrets, p, 0.0);
     info!("end evaluate_with_bgg_encoding");
 }
 
@@ -186,11 +186,11 @@ fn test_arithmetic_circuit_no_crt() {
     );
     info!("Non-CRT: setup");
 
-    let add_idx = circuit.add(ArithGateId::new(1), ArithGateId::new(0)); // a + b
+    let add_idx = circuit.add(ArithGateId::new(0), ArithGateId::new(1)); // a + b
     info!("Non-CRT: add");
     let mul_idx = circuit.mul(add_idx, ArithGateId::new(2)); // (a + b) * c
     info!("Non-CRT: mul");
-    let final_idx = circuit.sub(ArithGateId::new(0), mul_idx); // (a + b) * c - a
+    let final_idx = circuit.sub(mul_idx, ArithGateId::new(0)); // (a + b) * c - a
     info!("Non-CRT: sub");
     circuit.output(final_idx);
 
@@ -213,7 +213,7 @@ fn test_arithmetic_circuit_no_crt() {
     let seed: [u8; 32] = [0u8; 32];
     let d = 1;
     let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, 1.0);
-    let (b_epsilon_trapdoor, b_epsilon) = trapdoor_sampler.trapdoor(&params, d + 1);
+    let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(&params, d + 1);
 
     info!("Non-CRT: start evaluate_with_bgg_pubkey");
     let _ = circuit.evaluate_with_bgg_pubkey::<
@@ -221,7 +221,7 @@ fn test_arithmetic_circuit_no_crt() {
         DCRTPolyHashSampler<Keccak256>,
         DCRTPolyTrapdoorSampler,
         DCRTPolyUniformSampler,
-    >(&params, inputs.len(), seed, tmp_dir.path().to_path_buf(), d, b_epsilon.clone(), b_epsilon_trapdoor, trapdoor_sampler.clone());
+    >(&params, inputs.len(), seed, tmp_dir.path().to_path_buf(), d, pub_matrix.clone(), trapdoor, trapdoor_sampler.clone());
     info!("Non-CRT: end evaluate_with_bgg_pubkey");
 
     // Test with BGG encoding evaluation.
@@ -233,12 +233,12 @@ fn test_arithmetic_circuit_no_crt() {
         secrets.push(minus_one_poly);
         DCRTPolyMatrix::from_poly_vec_row(&params, secrets)
     };
-    let p = s_x_l * &b_epsilon;
+    let p = s_x_l * &pub_matrix;
 
     info!("Non-CRT: start evaluate_with_bgg_encoding");
     let _ = circuit.evaluate_with_bgg_encoding::<
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
         DCRTPolyUniformSampler,
-    >(&params, inputs.len(), seed, tmp_dir.path().to_path_buf(), d, &inputs, &secrets, p, 0.0);
+    >(&params, seed, tmp_dir.path().to_path_buf(), &inputs, &secrets, p, 0.0);
 }

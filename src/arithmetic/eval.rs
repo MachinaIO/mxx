@@ -31,8 +31,8 @@ impl<P: Poly> ArithmeticCircuit<P> {
         }
 
         let plt_evaluator = PolyPltEvaluator::new();
-        let results = self.poly_circuit.eval(params, &one, &all_input_polys, Some(plt_evaluator));
-        results
+        
+        self.poly_circuit.eval(params, &one, &all_input_polys, Some(plt_evaluator))
     }
 
     pub fn evaluate_with_bgg_pubkey<M, SH, ST, SU>(
@@ -42,8 +42,8 @@ impl<P: Poly> ArithmeticCircuit<P> {
         seed: [u8; 32],
         dir_path: PathBuf,
         d: usize,
-        b_epsilon: M,
-        b_epsilon_trapdoor: ST::Trapdoor,
+        pub_matrix: M,
+        trapdoor: ST::Trapdoor,
         trapdoor_sampler: ST,
     ) -> Vec<BggPublicKey<M>>
     where
@@ -57,27 +57,24 @@ impl<P: Poly> ArithmeticCircuit<P> {
         let num_packed_poly_inputs = total_limbs.div_ceil(self.packed_limbs);
         let reveal_plaintexts = vec![true; num_packed_poly_inputs + 1];
         let bgg_pubkey_sampler = BGGPublicKeySampler::<_, SH>::new(seed, d);
-        let pubkeys = bgg_pubkey_sampler.sample(&params, &TAG_BGG_PUBKEY, &reveal_plaintexts);
+        let pubkeys = bgg_pubkey_sampler.sample(params, TAG_BGG_PUBKEY, &reveal_plaintexts);
         info!("sampled all pubkeys {}", pubkeys.len());
         let bgg_evaluator = SimpleBggPubKeyEvaluator::<M, SH, SU, ST>::new(
             seed,
             trapdoor_sampler,
-            std::sync::Arc::new(b_epsilon),
-            std::sync::Arc::new(b_epsilon_trapdoor),
+            std::sync::Arc::new(pub_matrix),
+            std::sync::Arc::new(trapdoor),
             dir_path,
         );
-        let results =
-            self.poly_circuit.eval(params, &pubkeys[0], &pubkeys[1..], Some(bgg_evaluator));
-        results
+        
+        self.poly_circuit.eval(params, &pubkeys[0], &pubkeys[1..], Some(bgg_evaluator))
     }
 
     pub fn evaluate_with_bgg_encoding<M, SH, SU>(
         &self,
         params: &P::Params,
-        num_inputs: usize,
         seed: [u8; 32],
         dir_path: PathBuf,
-        d: usize,
         inputs: &[BigUint],
         secret: &[P],
         p: M,
@@ -89,11 +86,11 @@ impl<P: Poly> ArithmeticCircuit<P> {
         SU: PolyUniformSampler<M = M> + Send + Sync,
     {
         let (_, _, crt_depth) = params.to_crt();
-        let total_limbs = self.num_limbs * crt_depth * num_inputs;
+        let total_limbs = self.num_limbs * crt_depth * inputs.len();
         let num_packed_poly_inputs = total_limbs.div_ceil(self.packed_limbs);
         let reveal_plaintexts = vec![true; num_packed_poly_inputs + 1];
-        let bgg_pubkey_sampler = BGGPublicKeySampler::<_, SH>::new(seed, d);
-        let pubkeys = bgg_pubkey_sampler.sample(&params, &TAG_BGG_PUBKEY, &reveal_plaintexts);
+        let bgg_pubkey_sampler = BGGPublicKeySampler::<_, SH>::new(seed, secret.len());
+        let pubkeys = bgg_pubkey_sampler.sample(params, TAG_BGG_PUBKEY, &reveal_plaintexts);
         info!("sampled all pubkeys {}", pubkeys.len());
         let mut packed_inputs: Vec<P> = vec![];
         for input in inputs {
@@ -106,8 +103,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
             BGGEncodingSampler::new(params, secret, uniform_sampler, error_sigma);
         let encodings = bgg_encoding_sampler.sample(params, &pubkeys, &packed_inputs);
         let bgg_evaluator = SimpleBggEncodingPltEvaluator::<M, SH>::new(seed, dir_path, p);
-        let results =
-            self.poly_circuit.eval(params, &encodings[0], &encodings[1..], Some(bgg_evaluator));
-        results
+        
+        self.poly_circuit.eval(params, &encodings[0], &encodings[1..], Some(bgg_evaluator))
     }
 }

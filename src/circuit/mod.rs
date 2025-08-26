@@ -387,7 +387,7 @@ impl<P: Poly> PolyCircuit<P> {
                             .get(&gate.input_gates[0])
                             .expect("wire missing for LargeScalarMul")
                             .clone();
-                        let result = input.large_scalar_mul(&params, &scalar);
+                        let result = input.large_scalar_mul(params, scalar);
                         debug_mem("Large scalar mul gate end");
                         result
                     }

@@ -1,11 +1,19 @@
 use crate::{
-    arithmetic::circuit::ArithmeticCircuit, gadgets::crt::biguint_to_crt_poly,
-    lookup::poly::PolyPltEvaluator, poly::Poly,
+    arithmetic::circuit::ArithmeticCircuit,
+    bgg::{public_key::BggPublicKey, sampler::BGGPublicKeySampler},
+    gadgets::crt::biguint_to_crt_poly,
+    lookup::{poly::PolyPltEvaluator, simple_eval::SimpleBggPubKeyEvaluator},
+    matrix::PolyMatrix,
+    poly::{Poly, PolyParams},
+    sampler::{PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
 };
 use num_bigint::BigUint;
+use std::path::PathBuf;
+
+const TAG_BGG_PUBKEY: &[u8] = b"BGG_PUBKEY";
 
 impl<P: Poly> ArithmeticCircuit<P> {
-    pub fn evaluate(&self, params: &P::Params, inputs: &[BigUint]) -> Vec<usize> {
+    pub fn evaluate_with_poly(&self, params: &P::Params, inputs: &[BigUint]) -> Vec<P> {
         let one = P::const_one(params);
         let mut all_input_polys = Vec::new();
 
@@ -16,13 +24,41 @@ impl<P: Poly> ArithmeticCircuit<P> {
 
         let plt_evaluator = PolyPltEvaluator::new();
         let results = self.poly_circuit.eval(params, &one, &all_input_polys, Some(plt_evaluator));
+        results
+    }
 
-        if self.use_reconstruction {
-            // With reconstruction, only one result
-            vec![results[0].to_const_int()]
-        } else {
-            // Without reconstruction, all CRT slots
-            results.iter().map(|r| r.to_const_int()).collect()
-        }
+    pub fn evaluate_with_bgg_pubkey<M, SH, ST, SU>(
+        &self,
+        params: &P::Params,
+        num_inputs: usize,
+        seed: [u8; 32],
+        dir_path: PathBuf,
+        d: usize,
+        b_epsilon: M,
+        b_epsilon_trapdoor: ST::Trapdoor,
+        trapdoor_sampler: ST,
+    ) -> Vec<BggPublicKey<M>>
+    where
+        M: PolyMatrix<P = P> + Clone + Send + Sync + 'static,
+        SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+        ST: PolyTrapdoorSampler<M = M> + Clone + Send + Sync,
+        SU: PolyUniformSampler<M = M> + Send + Sync,
+    {
+        let (_, _, crt_depth) = params.to_crt();
+        let total_limbs = self.num_crt_limbs * crt_depth * num_inputs;
+        let num_packed_poly_inputs = total_limbs.div_ceil(self.packed_limbs);
+        let reveal_plaintexts = vec![true; num_packed_poly_inputs + 1];
+        let bgg_pubkey_sampler = BGGPublicKeySampler::<_, SH>::new(seed, d);
+        let pubkeys = bgg_pubkey_sampler.sample(&params, &TAG_BGG_PUBKEY, &reveal_plaintexts);
+        let bgg_evaluator = SimpleBggPubKeyEvaluator::<M, SH, SU, ST>::new(
+            seed,
+            trapdoor_sampler,
+            std::sync::Arc::new(b_epsilon),
+            std::sync::Arc::new(b_epsilon_trapdoor),
+            dir_path,
+        );
+        let results =
+            self.poly_circuit.eval(params, &pubkeys[0], &pubkeys[1..], Some(bgg_evaluator));
+        results
     }
 }

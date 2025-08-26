@@ -1,7 +1,7 @@
 use mxx::{
     arithmetic::circuit::ArithmeticCircuit,
     poly::{
-        PolyParams,
+        Poly, PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
 };
@@ -69,11 +69,11 @@ fn test_arithmetic_circuit_operations() {
     let mul_idx = mixed_circuit.mul(add_idx, 2); // (a + b) * c
     let final_idx = mixed_circuit.sub(mul_idx, 0); // (a + b) * c - a
     mixed_circuit.finalize(final_idx);
-    let mixed_result = mixed_circuit.evaluate(&params, &inputs)[0];
+    let mixed_result = &mixed_circuit.evaluate_with_poly(&params, &inputs)[0];
 
     let mixed_expected = ((&large_a + &large_b) * &large_c) - &large_a;
     assert_eq!(
-        mixed_result,
+        mixed_result.to_const_int(),
         mixed_expected.to_u64().unwrap() as usize,
         "Mixed operations should be correct"
     );

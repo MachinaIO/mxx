@@ -1,8 +1,10 @@
 use crate::{
     circuit::{PolyCircuit, gate::GateId},
     element::PolyElem,
+    gadgets::crt,
     lookup::PublicLut,
     poly::{Poly, PolyParams},
+    utils::crt_combine_residues,
 };
 use num_bigint::BigUint;
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
@@ -101,19 +103,32 @@ impl<P: Poly> IsolationGadget<P> {
         circuit.public_lookup_gate(t, self.plt_ids[crt_idx][slot_idx])
     }
 
-    /// Takes `crt_depth` inputs, each packing `max_degree` slot values in
-    /// evaluation format (for its own q_i). Returns D*N constants flattened as [i][j].
-    pub fn isolate_slots(&self, circuit: &mut PolyCircuit<P>, inputs: &[GateId]) -> Vec<GateId> {
-        assert_eq!(inputs.len(), self.crt_depth);
+    /// Takes 1 input that packs `crt_depth * max_degree` slots in
+    /// evaluation format for each q_i. Returns D*N constants flattened as [slot_idx][crt_idx].
+    pub fn isolate_slots(&self, circuit: &mut PolyCircuit<P>, input: GateId) -> Vec<GateId> {
         let mut all = Vec::with_capacity(self.crt_depth * self.max_degree);
-        for i in 0..self.crt_depth {
-            for j in 0..self.max_degree {
-                let out = self.isolate_single_slot(circuit, i, j, inputs[i]);
+        for slot_idx in 0..self.max_degree {
+            for crt_idx in 0..self.crt_depth {
+                let out = self.isolate_single_slot(circuit, crt_idx, slot_idx, input);
                 all.push(out);
             }
         }
         all
     }
+}
+
+pub fn pack_u64s_to_poly<P: Poly>(params: &P::Params, max_degree: usize, values: &[u64]) -> P {
+    let (_, _, crt_depth) = params.to_crt();
+    debug_assert!(values.len() <= crt_depth * max_degree);
+    debug_assert_eq!(values.len() % crt_depth, 0);
+    let mut slots = values
+        .chunks(crt_depth)
+        .map(|residues| crt_combine_residues::<P>(params, residues))
+        .collect::<Vec<_>>();
+    if slots.len() < params.ring_dimension() as usize {
+        slots.resize(params.ring_dimension() as usize, BigUint::from(0u8));
+    }
+    P::from_biguints_eval(params, &slots)
 }
 
 #[cfg(test)]
@@ -126,11 +141,19 @@ mod tests {
             Poly, PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
+        utils::*,
     };
 
-    fn make_slots(ring_n: usize, max_norm: usize) -> Vec<BigUint> {
-        // Deterministic small slot values in [0..max_norm)
-        (0..ring_n).map(|i| BigUint::from((i % max_norm) as u64)).collect()
+    fn crt_combine_slots(ring_n: usize, params: &DCRTPolyParams, max_norm: usize) -> Vec<Vec<u64>> {
+        let (_, _, crt_depth) = params.to_crt();
+        let mut slots = vec![vec![]; ring_n];
+        for slot_idx in 0..ring_n {
+            for crt_idx in 0..crt_depth {
+                let residue = ((crt_idx + slot_idx) % max_norm) as u64;
+                slots[slot_idx].push(residue);
+            }
+        }
+        slots
     }
 
     #[test]
@@ -144,32 +167,30 @@ mod tests {
         let gadget =
             IsolationGadget::<DCRTPoly>::setup(&mut circuit, &params, ring_n as u16, max_norm);
 
-        // Prepare D input packed polynomials in evaluation format (one per CRT tower)
-        let d = gadget.crt_depth;
-        let mut input_polys = Vec::with_capacity(d);
-        let mut slot_values = Vec::with_capacity(d);
-        for _i in 0..d {
-            let slots = make_slots(ring_n, max_norm as usize);
-            slot_values.push(slots.clone());
-            input_polys.push(DCRTPoly::from_biguints_eval(&params, &slots));
-        }
+        // Prepare single CRT-combined input packed polynomial in evaluation format
+        let slots = crt_combine_slots(ring_n, &params, max_norm as usize);
+        let input_poly = pack_u64s_to_poly(
+            &params,
+            ring_n,
+            slots.iter().flatten().copied().collect::<Vec<_>>().as_slice(),
+        );
 
-        // Wire inputs (D inputs)
-        let inputs = circuit.input(d);
+        // Wire single input
+        let inputs = circuit.input(1);
         let slot_idx = 1;
         let crt_idx = 0;
-        let out = gadget.isolate_single_slot(&mut circuit, crt_idx, slot_idx, inputs[crt_idx]);
+        let out = gadget.isolate_single_slot(&mut circuit, crt_idx, slot_idx, inputs[0]);
         circuit.output(vec![out]);
 
         // Evaluate
         let plt_eval = PolyPltEvaluator::new();
         let result =
-            circuit.eval(&params, &DCRTPoly::const_one(&params), &input_polys, Some(plt_eval));
+            circuit.eval(&params, &DCRTPoly::const_one(&params), &[input_poly], Some(plt_eval));
 
         // Expected: one constant poly with value slots[slot_idx] from crt_idx
         assert_eq!(result.len(), 1);
-        let expected_k = slot_values[crt_idx][slot_idx].clone();
-        let expected = DCRTPoly::from_biguint_to_constant(&params, expected_k);
+        let expected_k = slots[slot_idx][crt_idx] as usize;
+        let expected = DCRTPoly::from_usize_to_constant(&params, expected_k);
         assert_eq!(result[0], expected);
     }
 
@@ -184,33 +205,31 @@ mod tests {
         let gadget =
             IsolationGadget::<DCRTPoly>::setup(&mut circuit, &params, ring_n as u16, max_norm);
 
-        // Prepare D input packed polynomials in evaluation format (one per CRT tower)
-        let d = gadget.crt_depth;
-        let mut input_polys = Vec::with_capacity(d);
-        let mut slot_values = Vec::with_capacity(d);
-        for _i in 0..d {
-            let slots = make_slots(ring_n, max_norm as usize);
-            slot_values.push(slots.clone());
-            input_polys.push(DCRTPoly::from_biguints_eval(&params, &slots));
-        }
+        // Prepare single CRT-combined input packed polynomial in evaluation format
+        let slots = crt_combine_slots(ring_n, &params, max_norm as usize);
+        let input_poly = pack_u64s_to_poly(
+            &params,
+            ring_n,
+            slots.iter().flatten().copied().collect::<Vec<_>>().as_slice(),
+        );
 
-        // Wire inputs (D inputs)
-        let inputs = circuit.input(d);
-        let outs = gadget.isolate_slots(&mut circuit, &inputs);
+        // Wire single input
+        let inputs = circuit.input(1);
+        let outs = gadget.isolate_slots(&mut circuit, inputs[0]);
         circuit.output(outs.clone());
 
         // Evaluate
         let plt_eval = PolyPltEvaluator::new();
         let result =
-            circuit.eval(&params, &DCRTPoly::const_one(&params), &input_polys, Some(plt_eval));
+            circuit.eval(&params, &DCRTPoly::const_one(&params), &[input_poly], Some(plt_eval));
 
         // Expected: results flattened as [i-major][j]
         assert_eq!(result.len(), gadget.crt_depth * gadget.max_degree);
         let mut idx = 0;
-        for i in 0..gadget.crt_depth {
-            for j in 0..gadget.max_degree {
-                let expected_k = slot_values[i][j].clone();
-                let expected = DCRTPoly::from_biguint_to_constant(&params, expected_k);
+        for slot_idx in 0..gadget.max_degree {
+            for crt_idx in 0..gadget.crt_depth {
+                let expected_k = slots[slot_idx][crt_idx] as usize;
+                let expected = DCRTPoly::from_usize_to_constant(&params, expected_k);
                 assert_eq!(result[idx], expected);
                 idx += 1;
             }

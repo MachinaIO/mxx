@@ -62,6 +62,15 @@ impl DCRTPoly {
         ))
     }
 
+    fn poly_gen_from_vec_eval(params: &DCRTPolyParams, values: Vec<String>) -> Self {
+        DCRTPoly::new(ffi::DCRTPolyGenFromEvalVec(
+            params.ring_dimension(),
+            params.crt_depth(),
+            params.crt_bits(),
+            &values,
+        ))
+    }
+
     #[inline]
     fn poly_gen_from_const(params: &DCRTPolyParams, value: String) -> Self {
         DCRTPoly::new(ffi::DCRTPolyGenFromConst(
@@ -103,6 +112,11 @@ impl Poly for DCRTPoly {
         let fin_ring_coeffs: Vec<FinRingElem> =
             coeffs.iter().map(|coeff| FinRingElem::new(coeff.clone(), params.modulus())).collect();
         Self::from_coeffs(params, &fin_ring_coeffs)
+    }
+
+    fn from_biguints_eval(params: &Self::Params, slots: &[BigUint]) -> Self {
+        let values: Vec<String> = slots.iter().map(|slot| slot.to_string()).collect();
+        Self::poly_gen_from_vec_eval(params, values)
     }
 
     fn from_decomposed(params: &DCRTPolyParams, decomposed: &[Self]) -> Self {

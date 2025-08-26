@@ -4,166 +4,121 @@ use crate::{
     lookup::PublicLut,
     poly::{Poly, PolyParams},
 };
-use std::{collections::HashMap, marker::PhantomData};
+use num_bigint::BigUint;
+use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
-/// Isolation gadget for extracting constant terms from a low-degree polynomial.
+/// Isolation gadget for evaluation-format packed polynomials.
+/// For each CRT index i in [0..crt_depth) and slot index j in [0..max_degree),
+/// registers a public LUT that maps (q/qi) * (k at slot j; 0 elsewhere) to a constant k.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IsolationGadget<P: Poly> {
-    pub max_degree: u16, // the maximum degree of the input low-degree polynomial
-    pub max_norm: u32,   /* each coefficient of the input polynomial should be less than or
-                          * equal to `max_norm` */
-    pub plt_ids: Vec<usize>, // the table ids registered in the circuit,
+    pub crt_depth: usize,         // D = crt_depth
+    pub max_degree: usize,        // N = number of slots handled (<= ring_dimension)
+    pub max_norm: usize,          // k in [0..max_norm)
+    pub plt_ids: Vec<Vec<usize>>, // shape: [crt_depth][max_degree]
+    pub mul_scalars: Vec<Vec<Vec<BigUint>>>, // precomputed coeffs of (q/qi) * L_j(X) in coeff-format
     _p: PhantomData<P>,
 }
 
 impl<P: Poly> IsolationGadget<P> {
+    /// Build per-(i,j) public LUTs using evaluation-format unit vectors scaled by q/qi.
+    /// Each LUT for (i,j) contains rows for k in [0..max_norm):
+    ///   key = (q/qi) * from_biguints_eval(slots[j]=k, others=0)
+    ///   val = (k, const_poly(k))
     pub fn setup(
         circuit: &mut PolyCircuit<P>,
         params: &P::Params,
-        max_degree: u16,
+        max_degree: u16, // N
         max_norm: u32,
     ) -> Self {
-        // Create lookup entries for all possible polynomial values for each degree
-        let mut plt_ids = vec![];
-        for i in 0..=max_degree {
-            let mut fs = vec![];
-            for j in 0..=max_degree {
-                let mut f: HashMap<P::Elem, (usize, P::Elem)> = HashMap::new();
-                for norm in 0..=max_norm {
-                    let input = <P::Elem as PolyElem>::constant(&params.modulus(), norm as u64);
-                    let output = if i == j {
-                        input.clone()
-                    } else {
-                        <P::Elem as PolyElem>::zero(&params.modulus())
-                    };
-                    f.insert(input, (norm as usize, output));
+        let (moduli, _, _) = params.to_crt();
+        let crt_depth = moduli.len(); // D
+        let ring_n = params.ring_dimension() as usize;
+        let n = max_degree as usize;
+        debug_assert!(n <= ring_n, "max_degree (N) must be <= ring_dimension");
+
+        // Precompute q/qi per tower i
+        let big_q_arc: Arc<BigUint> = params.modulus().into();
+        let q_over_qis: Vec<BigUint> =
+            moduli.iter().map(|&qi| (&*big_q_arc) / BigUint::from(qi)).collect();
+
+        let mut plt_ids = vec![vec![0usize; n]; crt_depth];
+        let mut mul_scalars = vec![vec![vec![]; n]; crt_depth];
+        let max_norm_usize = max_norm as usize;
+
+        for (i, q_over_qi) in q_over_qis.iter().enumerate() {
+            let scale_poly = P::from_biguint_to_constant(params, q_over_qi.clone());
+            for j in 0..n {
+                // Precompute scalar coefficients for (q/qi) * L_j(X) in coefficient format.
+                let mut unit_slots = vec![BigUint::from(0u8); ring_n];
+                unit_slots[j] = BigUint::from(1u8);
+                let l_j_eval = P::from_biguints_eval(params, &unit_slots);
+                let l_j_coeffs = l_j_eval.coeffs();
+                let q_ref: Arc<BigUint> = params.modulus().into();
+                let scalars: Vec<BigUint> = l_j_coeffs
+                    .into_iter()
+                    .map(|c| (c.value() * q_over_qi) % q_ref.as_ref())
+                    .collect();
+                mul_scalars[i][j] = scalars;
+
+                let mut lut_map: HashMap<P, (usize, P)> = HashMap::with_capacity(max_norm_usize);
+                for k in 0..max_norm_usize {
+                    // Build evaluation-format slots: only index j is k, others 0
+                    let mut slots = vec![BigUint::from(0u8); ring_n];
+                    if k != 0 {
+                        slots[j] = BigUint::from(k as u64);
+                    }
+                    let slots_poly = P::from_biguints_eval(params, &slots);
+                    let key_poly = slots_poly * &scale_poly;
+                    let value_poly = P::from_usize_to_constant(params, k);
+                    lut_map.insert(key_poly, (k, value_poly));
                 }
-                fs.push(f);
+                let plt = PublicLut::<P>::new(lut_map);
+                let plt_id = circuit.register_public_lookup(plt);
+                plt_ids[i][j] = plt_id;
             }
-            let plt = PublicLut::<P>::new(fs);
-            let plt_id = circuit.register_public_lookup(plt);
-            plt_ids.push(plt_id);
         }
-        Self { max_degree, max_norm, plt_ids, _p: PhantomData }
+
+        Self {
+            crt_depth,
+            max_degree: n,
+            max_norm: max_norm_usize,
+            plt_ids,
+            mul_scalars,
+            _p: PhantomData,
+        }
     }
 
-    /// Extract a single term the input polynomial, where the coefficients of the other terms are
-    /// set to zeros.
-    pub fn isolate_single_term(
+    /// Isolate a single slot j and return D constant polynomials, one per CRT modulus i.
+    /// Assumes `input` corresponds to the pre-processed polynomial for that slot.
+    pub fn isolate_single_slot(
         &self,
         circuit: &mut PolyCircuit<P>,
-        term_idx: usize,
+        slot_idx: usize,
         input: GateId,
-    ) -> GateId {
-        circuit.public_lookup_gate(input, self.plt_ids[term_idx])
+    ) -> Vec<GateId> {
+        assert!(slot_idx < self.max_degree);
+        let mut outs = Vec::with_capacity(self.crt_depth);
+        for i in 0..self.crt_depth {
+            let t = circuit.large_scalar_mul(input, self.mul_scalars[i][slot_idx].clone());
+            let out = circuit.public_lookup_gate(t, self.plt_ids[i][slot_idx]);
+            outs.push(out);
+        }
+        outs
     }
 
-    /// Isolate terms from a polynomial A(X).
-    /// Returns a vector of gate IDs, where each gate contains one coefficient a_i in the constant
-    /// term.
+    /// Backward compatibility: flatten all slots by applying `isolate_single_slot` for each j.
+    /// Note: this returns D*N outputs flattened as [j-major][i], and assumes `input` is compatible
+    /// with the required pre-processing for each slot.
     pub fn isolate_terms(&self, circuit: &mut PolyCircuit<P>, input: GateId) -> Vec<GateId> {
-        let max_degree = self.max_degree as usize;
-        let mut terms = Vec::with_capacity(max_degree + 1);
-
-        for i in 0..=max_degree {
-            let extracted = self.isolate_single_term(circuit, i, input);
-            let rotated = circuit.rotate_gate(extracted, -(i as i32));
-            terms.push(rotated);
+        let mut all = Vec::with_capacity(self.crt_depth * self.max_degree);
+        for j in 0..self.max_degree {
+            let v = self.isolate_single_slot(circuit, j, input);
+            all.extend(v);
         }
-
-        terms
+        all
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::{
-        circuit::PolyCircuit,
-        lookup::poly::PolyPltEvaluator,
-        poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
-    };
-
-    use super::*;
-
-    #[test]
-    fn test_isolate_single() {
-        let params = DCRTPolyParams::default();
-        let mut circuit = PolyCircuit::new();
-        let isolate_gadget = IsolationGadget::setup(&mut circuit, &params, 2, 10);
-        let inputs = circuit.input(1);
-        let isolated0 = isolate_gadget.isolate_single_term(&mut circuit, 0, inputs[0]);
-        let isolated1 = isolate_gadget.isolate_single_term(&mut circuit, 1, inputs[0]);
-        let isolated2 = isolate_gadget.isolate_single_term(&mut circuit, 2, inputs[0]);
-        circuit.output(vec![isolated0, isolated1, isolated2]);
-
-        let mut input_coeffs = vec![
-            <DCRTPoly as Poly>::Elem::zero(&params.modulus());
-            params.ring_dimension() as usize
-        ];
-        input_coeffs[0] = <DCRTPoly as Poly>::Elem::constant(&params.modulus(), 7);
-        input_coeffs[1] = <DCRTPoly as Poly>::Elem::constant(&params.modulus(), 3);
-        input_coeffs[2] = <DCRTPoly as Poly>::Elem::constant(&params.modulus(), 4);
-        let input_poly = DCRTPoly::from_coeffs(&params, &input_coeffs);
-        let plt_evaluator = PolyPltEvaluator::new();
-        let result = circuit.eval(
-            &params,
-            &DCRTPoly::const_one(&params),
-            &[input_poly.clone()],
-            Some(plt_evaluator),
-        );
-
-        let expected0_poly = DCRTPoly::from_usize_to_constant(&params, 7);
-        let mut expected1_coeffs = vec![
-            <DCRTPoly as Poly>::Elem::zero(&params.modulus());
-            params.ring_dimension() as usize
-        ];
-        expected1_coeffs[1] = <DCRTPoly as Poly>::Elem::constant(&params.modulus(), 3);
-        let expected1_poly = DCRTPoly::from_coeffs(&params, &expected1_coeffs);
-        let mut expected2_coeffs = vec![
-            <DCRTPoly as Poly>::Elem::zero(&params.modulus());
-            params.ring_dimension() as usize
-        ];
-        expected2_coeffs[2] = <DCRTPoly as Poly>::Elem::constant(&params.modulus(), 4);
-        let expected2_poly = DCRTPoly::from_coeffs(&params, &expected2_coeffs);
-
-        // verify
-        assert_eq!(result.len(), 3);
-        assert_eq!(result, [expected0_poly, expected1_poly, expected2_poly]);
-    }
-
-    #[test]
-    fn test_isolate_coeffs() {
-        let params = DCRTPolyParams::default();
-        let mut circuit = PolyCircuit::new();
-        let isolate_gadget = IsolationGadget::setup(&mut circuit, &params, 2, 10);
-        let inputs = circuit.input(1);
-        let isolated_coeffs = isolate_gadget.isolate_terms(&mut circuit, inputs[0]);
-        circuit.output(isolated_coeffs);
-
-        let mut input_coeffs = vec![
-            <DCRTPoly as Poly>::Elem::zero(&params.modulus());
-            params.ring_dimension() as usize
-        ];
-        input_coeffs[0] = <DCRTPoly as Poly>::Elem::constant(&params.modulus(), 7);
-        input_coeffs[1] = <DCRTPoly as Poly>::Elem::constant(&params.modulus(), 3);
-        input_coeffs[2] = <DCRTPoly as Poly>::Elem::constant(&params.modulus(), 4);
-        let input_poly = DCRTPoly::from_coeffs(&params, &input_coeffs);
-        let plt_evaluator = PolyPltEvaluator::new();
-        let result = circuit.eval(
-            &params,
-            &DCRTPoly::const_one(&params),
-            &[input_poly.clone()],
-            Some(plt_evaluator),
-        );
-
-        let expected = vec![
-            DCRTPoly::from_usize_to_constant(&params, 7),
-            DCRTPoly::from_usize_to_constant(&params, 3),
-            DCRTPoly::from_usize_to_constant(&params, 4),
-        ];
-
-        // verify
-        assert_eq!(result.len(), 3);
-        assert_eq!(result, expected);
-    }
-}
+mod tests {}

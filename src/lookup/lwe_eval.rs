@@ -41,8 +41,9 @@ where
         input: BggPublicKey<M>,
         id: GateId,
     ) -> BggPublicKey<M> {
-        let d = input.matrix.row_size() - 1;
-        let a_lt = derive_a_lt_matrix::<M, SH>(params, d, self.hash_key, id);
+        let row_size = input.matrix.row_size();
+        let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, id);
+        println!("a_lt shape: {:?}", a_lt.size());
         preimage_all::<M, ST, _>(
             plt,
             params,
@@ -204,5 +205,135 @@ fn preimage_all<M, ST, P>(
         .collect::<Vec<_>>();
     for (k, l_k) in preimages.into_iter() {
         store_and_drop_matrix(l_k, dir_path, &format!("L_{id}_{k}"));
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::{collections::HashMap, fs, path::Path};
+
+    use super::*;
+
+    use crate::{
+        bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
+        circuit::PolyCircuit,
+        lookup::lwe_eval::LweBggEncodingPltEvaluator,
+        matrix::dcrt_poly::DCRTPolyMatrix,
+        poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        sampler::{
+            hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
+            uniform::DCRTPolyUniformSampler,
+        },
+        storage::init_storage_system,
+        utils::{create_bit_random_poly, create_random_poly, random_bgg_encodings},
+    };
+    use keccak_asm::Keccak256;
+    use rand::{Rng, rng};
+    use tokio;
+
+    fn setup_lsb_constant_binary_plt(t_n: usize, params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {
+        let mut f = HashMap::new();
+        for k in 0..t_n {
+            f.insert(
+                DCRTPoly::from_usize_to_constant(params, k),
+                (k, DCRTPoly::from_usize_to_lsb(params, k)),
+            );
+        }
+        PublicLut::<DCRTPoly>::new(f)
+    }
+
+    const SIGMA: f64 = 4.578;
+
+    #[tokio::test]
+    async fn test_lwe_plt_eval() {
+        init_storage_system();
+        // Create parameters for testing
+        let params = DCRTPolyParams::default();
+
+        // Create a lookup table
+        let plt = setup_lsb_constant_binary_plt(16, &params);
+        // Create a simple circuit with the lookup table
+        let mut circuit = PolyCircuit::new();
+        let inputs = circuit.input(1);
+        let plt_id = circuit.register_public_lookup(plt.clone());
+        let output = circuit.public_lookup_gate(inputs[0], plt_id);
+        circuit.output(vec![output]);
+
+        let d = 3;
+        let input_size = 1;
+        let key: [u8; 32] = rand::random();
+        let bgg_pubkey_sampler =
+            BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
+        let uniform_sampler = DCRTPolyUniformSampler::new();
+
+        let tag: u64 = rand::random();
+        let tag_bytes = tag.to_le_bytes();
+        // Create secret and plaintexts
+        let secrets = vec![create_bit_random_poly(&params); d];
+        let rand_int = (rand::random::<u64>() % 16) as usize;
+        let plaintexts = vec![DCRTPoly::from_usize_to_constant(&params, rand_int); input_size];
+
+        // Create random public keys and encodings
+        let reveal_plaintexts = vec![true; input_size + 1];
+        let bgg_encoding_sampler = BGGEncodingSampler::new(&params, &secrets, uniform_sampler, 0.0);
+        let pubkeys = bgg_pubkey_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
+        let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &plaintexts);
+        let enc_one = encodings[0].clone();
+        let enc1 = encodings[1].clone();
+
+        let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let (b_trapdoor, b) = trapdoor_sampler.trapdoor(&params, d + 1);
+        println!("b shape: {:?}", b.size());
+        let s_vec = DCRTPolyMatrix::from_poly_vec_row(
+            &params,
+            vec![secrets, vec![DCRTPoly::const_minus_one(&params)]].concat(),
+        );
+        let c_b = s_vec * &b;
+
+        // Create a public key evaluator
+        let dir_path = "test_lwe_plt_eval_data";
+        let dir = Path::new(&dir_path);
+        if !dir.exists() {
+            fs::create_dir(dir).unwrap();
+        } else {
+            // Clean it first to ensure no old files interfere
+            fs::remove_dir_all(dir).unwrap();
+            fs::create_dir(dir).unwrap();
+        }
+        let plt_pubkey_evaluator =
+            LweBggPubKeyEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>, _>::new(
+                rand::random(),
+                trapdoor_sampler,
+                Arc::new(b),
+                Arc::new(b_trapdoor),
+                dir_path.into(),
+            );
+        println!("before eval");
+        let result_pubkey = circuit.eval(
+            &params,
+            &enc_one.pubkey,
+            &[enc1.pubkey.clone()],
+            Some(plt_pubkey_evaluator),
+        );
+        println!("after eval");
+        assert_eq!(result_pubkey.len(), 1);
+        let result_pubkey = &result_pubkey[0];
+
+        //Create an encoding evaluator
+        let plt_encoding_evaluator = LweBggEncodingPltEvaluator::<
+            DCRTPolyMatrix,
+            DCRTPolyHashSampler<Keccak256>,
+        >::new(key, dir_path.into(), c_b);
+
+        // Evaluate the circuit
+        let result_encoding =
+            circuit.eval(&params, &enc_one.clone(), &[enc1.clone()], Some(plt_encoding_evaluator));
+        assert_eq!(result_encoding.len(), 1);
+        let result_encoding = &result_encoding[0];
+        assert_eq!(result_encoding.pubkey, result_pubkey.clone());
+        assert_eq!(
+            result_encoding.plaintext.clone().unwrap(),
+            plt.get(&params, &plaintexts[0].clone()).unwrap().1
+        );
     }
 }

@@ -141,7 +141,6 @@ mod tests {
             Poly, PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
-        utils::*,
     };
 
     fn crt_combine_slots(ring_n: usize, params: &DCRTPolyParams, max_norm: usize) -> Vec<Vec<u64>> {

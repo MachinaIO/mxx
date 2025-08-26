@@ -389,21 +389,9 @@ impl<P: Poly> BigUintPoly<P> {
                     idx = last_col_idx + 1;
                 }
             }
-            // Drop any potential tail beyond max width
-            columns.truncate(w);
-            // Move back carries from column w into range if any (we discard overflow beyond max)
-            let tail = next.pop();
-            let mut compact = vec![vec![]; w];
-            for k in 0..w {
-                compact[k] = std::mem::take(&mut next[k]);
-            }
-            if let Some(t) = tail {
-                if w > 0 {
-                    /* overflow beyond max width ignored */
-                    let _ = t;
-                }
-            }
-            *columns = compact;
+            // Keep only the first w columns; drop any overflow at index w
+            next.truncate(w);
+            *columns = next;
             if done {
                 break;
             }

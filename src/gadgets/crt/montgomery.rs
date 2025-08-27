@@ -8,7 +8,6 @@ use crate::{
 };
 use num_bigint::BigUint;
 use num_traits::One;
-use tracing::info;
 // Montgomery modular multiplication (REDC)
 // ref: https://en.wikipedia.org/wiki/Montgomery_modular_multiplication
 // N: the modulus (assumed to be less than 2^64)
@@ -208,7 +207,6 @@ fn montgomery_reduce<P: Poly>(
     circuit: &mut PolyCircuit<P>,
     t: &BigUintPoly<P>,
 ) -> BigUintPoly<P> {
-    info!("montgomery_reduce");
     // Use N' (mod R) to compute m non-iteratively, then U = T + mN, divide by R, and
     // conditionally subtract.
     let r = ctx.num_limbs;

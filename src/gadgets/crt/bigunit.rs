@@ -6,7 +6,6 @@ use crate::{
 };
 use num_bigint::BigUint;
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
-use tracing::info;
 
 //
 // Carry-save multiplication and column compression helpers
@@ -43,12 +42,6 @@ impl<P: Poly> BigUintPolyContext<P> {
         let base = 1 << limb_bit_size;
         // Assume base < 2^32
         debug_assert!(limb_bit_size < 32);
-        // Ensure limb_bit_size >= 2 to prevent infinite loops in compression.
-        assert!(
-            limb_bit_size >= 2,
-            "limb_bit_size must be >= 2 for proper compression (got {})",
-            limb_bit_size
-        );
         let const_zero = circuit.const_zero_gate();
         let const_base = circuit.const_digits_poly(&[base as u32]);
         let mul_luts = Self::setup_split_lut(params, base, base * base);
@@ -249,12 +242,10 @@ impl<P: Poly> BigUintPoly<P> {
         let max_bit_size = max_bit_size.unwrap_or(self.bit_size() + other.bit_size());
         debug_assert!(max_bit_size.is_multiple_of(self.ctx.limb_bit_size));
         let max_limbs = max_bit_size / self.ctx.limb_bit_size;
-        info!("st mul_without_cpa");
         let (sum_vec, carry_vec) = self.mul_without_cpa(other, circuit, max_limbs);
 
         // 3) Final single normalization (ripple-style) to match the existing API
         // Note: We normalize S + (C shifted by 1) with exactly one pass of lookups.
-        info!("end mul_without_cpa");
         let limbs = Self::final_cpa(circuit, sum_vec, carry_vec, self.ctx.lut_ids, max_limbs);
 
         Self { ctx: self.ctx.clone(), limbs, _p: PhantomData }
@@ -369,30 +360,16 @@ impl<P: Poly> BigUintPoly<P> {
         if w == 0 {
             return (vec![], vec![]);
         }
-        // base * comp_rate < base^2
-        let comp_rate = (1usize << self.ctx.limb_bit_size) - 1;
+        // Choose a safe compressor arity per column.
+        // Each cell is < B, and we reduce up to comp_rate cells in one shot
+        // using a single lookup pair (x % B, x / B) defined for inputs < B^2.
+        // Safety condition: comp_rate * (B-1) <= B^2 - 1  ==> comp_rate <= B + 1.
+        // To guarantee convergence for B=2 (limb_bit_size=1), use 3:2 compression.
+        let base = 1usize << self.ctx.limb_bit_size;
+        let comp_rate = if base == 2 { 3 } else { base + 1 };
         let lut_ids = self.ctx.lut_ids;
-        
-        // Safety check: ensure comp_rate > 2 for proper compression.
-        // This should be guaranteed by limb_bit_size >= 2 in setup, but double-check.
-        assert!(
-            comp_rate > 2,
-            "comp_rate must be > 2 for compression to reduce column heights (got {})",
-            comp_rate
-        );
-        
-        // Iteratively reduce column heights by applying comp_rate:2 compressions.
-        let mut iterations = 0;
-        const MAX_ITERATIONS: usize = 1000; // Safeguard against true infinite loops.
-        
+
         loop {
-            iterations += 1;
-            if iterations > MAX_ITERATIONS {
-                panic!(
-                    "Compression loop exceeded {} iterations. This indicates a bug in the compression logic.",
-                    MAX_ITERATIONS
-                );
-            }
             let mut next: Columns = vec![vec![]; w + 1]; // +1 for carries spilling into w
             let mut done = true;
             for k in 0..w {
@@ -403,8 +380,9 @@ impl<P: Poly> BigUintPoly<P> {
                 // Process comp_rate inputs
                 let mut idx: usize = 0;
                 while idx < col.len() {
-                    // Safe calculation to prevent underflow (though comp_rate > 2 should prevent this).
-                    let last_col_idx = idx.saturating_add(comp_rate).saturating_sub(1).min(col.len() - 1);
+                    // Safe calculation to prevent underflow (though comp_rate > 2 should prevent
+                    // this).
+                    let last_col_idx = (idx + comp_rate - 1).min(col.len() - 1);
                     let mut sum = col[idx];
                     for i in idx + 1..=last_col_idx {
                         sum = circuit.add_gate(sum, col[i]);
@@ -540,7 +518,6 @@ impl<P: Poly> BigUintPoly<P> {
         circuit: &mut PolyCircuit<P>,
         max_limbs: usize,
     ) -> (Vec<GateId>, Vec<GateId>) {
-        info!("st schoolbook_partial_products_columns");
         // 1) Schoolbook partial products with immediate split and column placement
         let mut columns = Self::schoolbook_partial_products_columns(
             circuit,
@@ -549,7 +526,6 @@ impl<P: Poly> BigUintPoly<P> {
             max_limbs,
             self.ctx.lut_ids,
         );
-        info!("st compress_columns_wallace");
         // 2) Compress columns (one-shot if H_max < B, else Wallace compressors)
         // let base: usize = 1usize << self.ctx.limb_bit_size;
         // let h_max = columns.iter().map(|c| c.len()).max().unwrap_or(0);

@@ -1,7 +1,6 @@
 use keccak_asm::Keccak256;
 use mxx::{
     arithmetic::circuit::{ArithGateId, ArithmeticCircuit},
-    gadgets::packed_crt::biguint_to_packed_crt_polys,
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
@@ -11,7 +10,6 @@ use mxx::{
         DistType, PolyTrapdoorSampler, PolyUniformSampler, hash::DCRTPolyHashSampler,
         trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
     },
-    storage::{init_storage_system, wait_for_all_writes},
 };
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
@@ -33,48 +31,8 @@ async fn test_arithmetic_circuit_operations() {
     let large_b = BigUint::from(132000u64);
     let large_c = BigUint::from(50000u64);
     let inputs = vec![large_a.clone(), large_b.clone(), large_c.clone()];
-    // Expected results for each operation.
-    // let add_expected = &large_a + &large_b;
-    // let mul_expected = &large_a * &large_c;
-    // let sub_expected = &large_a - &large_c;
-
-    // Verify modular arithmetic correctness for all operations.
-    // for (i, &qi) in moduli.iter().enumerate() {
-    //     let a_mod_qi = (&large_a % qi as u64).to_u64().unwrap();
-    //     let b_mod_qi = (&large_b % qi as u64).to_u64().unwrap();
-    //     let c_mod_qi = (&large_c % qi as u64).to_u64().unwrap();
-
-    //     let add_mod_qi = (a_mod_qi + b_mod_qi) % qi as u64;
-    //     let mul_mod_qi = (a_mod_qi * c_mod_qi) % qi as u64;
-    //     let sub_mod_qi = if a_mod_qi >= c_mod_qi {
-    //         a_mod_qi - c_mod_qi
-    //     } else {
-    //         qi as u64 - (c_mod_qi - a_mod_qi)
-    //     };
-
-    //     let add_expected_mod_qi = (&add_expected % qi as u64).to_u64().unwrap();
-    //     let mul_expected_mod_qi = (&mul_expected % qi as u64).to_u64().unwrap();
-    //     let sub_expected_mod_qi = (&sub_expected % qi as u64).to_u64().unwrap();
-
-    //     assert_eq!(add_mod_qi, add_expected_mod_qi, "Addition should be consistent in slot {}",
-    // i);     assert_eq!(
-    //         mul_mod_qi, mul_expected_mod_qi,
-    //         "Multiplication should be consistent in slot {}",
-    //         i
-    //     );
-    //     assert_eq!(
-    //         sub_mod_qi, sub_expected_mod_qi,
-    //         "Subtraction should be consistent in slot {}",
-    //         i
-    //     );
-    // }
 
     let limb_bit_size = 3;
-    // let inputs = biguint_to_packed_crt_polys::<DCRTPoly>(
-    //     limb_bit_size,
-    //     &params,
-    //     &[large_a, large_b, large_c],
-    // );
 
     // Test mixed operations in single circuit: (a + b) * c - a.
     let mut mixed_circuit =
@@ -144,7 +102,7 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
     // (crt_depth*crt_bit)
     let params = DCRTPolyParams::new(4, 1, 34, 1);
 
-    let (moduli, crt_bits, crt_depth) = params.to_crt();
+    let (moduli, _, crt_depth) = params.to_crt();
     assert_eq!(moduli.len(), 1, "Should have only one modulus for non-CRT");
     assert_eq!(crt_depth, 1, "CRT depth should be 1");
 
@@ -154,33 +112,11 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
     let large_b = BigUint::from(132000u64);
     let large_c = BigUint::from(50000u64);
 
-    // Expected results for each operation.
-    // let add_expected = &large_a + &large_b;
-    // let mul_expected = &large_a * &large_c;
-    // let sub_expected = &large_a - &large_c;
-
-    // Verify modular arithmetic correctness with single modulus.
-    // let a_mod = (&large_a % single_modulus).to_u64().unwrap();
-    // let b_mod = (&large_b % single_modulus).to_u64().unwrap();
-    // let c_mod = (&large_c % single_modulus).to_u64().unwrap();
-
-    // info!("Input values mod {}: a={}, b={}, c={}", single_modulus, a_mod, b_mod, c_mod);
-
-    // let add_mod = (a_mod + b_mod) % single_modulus;
-    // let mul_mod = (a_mod * c_mod) % single_modulus;
-    // let sub_mod = if a_mod >= c_mod { a_mod - c_mod } else { single_modulus - (c_mod - a_mod) };
-
-    // assert_eq!(add_mod, (&add_expected % single_modulus).to_u64().unwrap());
-    // assert_eq!(mul_mod, (&mul_expected % single_modulus).to_u64().unwrap());
-    // assert_eq!(sub_mod, (&sub_expected % single_modulus).to_u64().unwrap());
-
     let inputs = vec![large_a.clone(), large_b.clone(), large_c.clone()];
     let limb_bit_size = 1;
-    // let num_crt_limbs = crt_bits.div_ceil(limb_bit_size);
-    // info!("Non-CRT setup: {} limbs of {} bits each", num_crt_limbs, limb_bit_size);
 
     // Test mixed operations in single circuit: (a + b) * c - a.
-    let mut circuit = ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, 1, false, true);
+    let mut circuit = ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, 3, false, true);
     info!("Non-CRT: setup");
 
     let add_idx = circuit.add(ArithGateId::new(0), ArithGateId::new(1)); // a + b

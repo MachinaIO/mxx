@@ -97,7 +97,9 @@ where
             Ok(_) => {
                 log_mem(format!(
                     "Matrix {} written to {} ({} bytes)",
-                    id_async, filename_async, data_async.len()
+                    id_async,
+                    filename_async,
+                    data_async.len()
                 ));
             }
             Err(e) => {
@@ -111,9 +113,7 @@ where
         let write_handle = rt_handle.spawn(write_task);
         handles.lock().unwrap().push(write_handle);
     } else {
-        eprintln!(
-            "Warning: Storage system not initialized, falling back to blocking write"
-        );
+        eprintln!("Warning: Storage system not initialized, falling back to blocking write");
         let path = dir.join(&serialized_matrix.filename);
         if let Err(e) = std::fs::write(&path, &serialized_matrix.data) {
             eprintln!("Failed to write {}: {}", path.display(), e);

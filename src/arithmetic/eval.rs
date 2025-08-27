@@ -31,7 +31,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
         }
 
         let plt_evaluator = PolyPltEvaluator::new();
-        
+
         self.poly_circuit.eval(params, &one, &all_input_polys, Some(plt_evaluator))
     }
 
@@ -66,7 +66,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
             std::sync::Arc::new(trapdoor),
             dir_path,
         );
-        
+
         self.poly_circuit.eval(params, &pubkeys[0], &pubkeys[1..], Some(bgg_evaluator))
     }
 
@@ -103,7 +103,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
             BGGEncodingSampler::new(params, secret, uniform_sampler, error_sigma);
         let encodings = bgg_encoding_sampler.sample(params, &pubkeys, &packed_inputs);
         let bgg_evaluator = SimpleBggEncodingPltEvaluator::<M, SH>::new(seed, dir_path, p);
-        
+
         self.poly_circuit.eval(params, &encodings[0], &encodings[1..], Some(bgg_evaluator))
     }
 }

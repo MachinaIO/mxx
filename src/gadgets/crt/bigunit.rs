@@ -520,7 +520,7 @@ impl<P: Poly> BigUintPoly<P> {
             self.ctx.lut_ids,
         );
 
-        // 2) Compress columns (one-shot if H_max < B, else Wallace compressors)
+        // 2) Compress column
         // let base: usize = 1usize << self.ctx.limb_bit_size;
         // let h_max = columns.iter().map(|c| c.len()).max().unwrap_or(0);
         self.compress_columns_wallace(circuit, &mut columns)

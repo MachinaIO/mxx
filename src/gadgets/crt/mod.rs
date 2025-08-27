@@ -163,12 +163,19 @@ pub fn biguint_to_crt_poly<P: Poly>(
     for (module, input) in moduli.into_iter().zip(crted_inputs.into_iter()) {
         limb_polys.extend(u64_to_montgomery_poly(limb_bit_size, num_limbs, module, params, input));
     }
+    debug_assert_eq!(limb_polys.len(), num_limbs_of_crt_poly::<P>(limb_bit_size, params));
     limb_polys
 }
 
 pub fn biguint_to_crt_slots<P: Poly>(params: &P::Params, input: &BigUint) -> Vec<u64> {
     let (moduli, _, _) = params.to_crt();
     moduli.iter().map(|modulus| (input % modulus).to_u64().unwrap()).collect::<Vec<_>>()
+}
+
+pub fn num_limbs_of_crt_poly<P: Poly>(limb_bit_size: usize, params: &P::Params) -> usize {
+    let (_, crt_bits, crt_depth) = params.to_crt();
+    let num_limbs_per_slot = crt_bits.div_ceil(limb_bit_size);
+    num_limbs_per_slot * crt_depth
 }
 
 #[cfg(test)]

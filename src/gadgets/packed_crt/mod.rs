@@ -100,10 +100,25 @@ pub fn biguint_to_packed_crt_polys<P: Poly>(
             if const_coeff == BigUint::zero() { 0 } else { const_coeff.to_u64_digits()[0] as u64 }
         })
         .collect::<Vec<_>>();
-    limbs
+    let packed_limbs = limbs
         .chunks(ring_dim * crt_depth)
         .map(|chunk| pack_u64s_to_poly(params, ring_dim, chunk))
-        .collect::<Vec<_>>()
+        .collect::<Vec<_>>();
+    debug_assert_eq!(
+        packed_limbs.len(),
+        num_packed_crt_poly::<P>(limb_bit_size, params, inputs.len())
+    );
+    packed_limbs
+}
+
+pub fn num_packed_crt_poly<P: Poly>(
+    limb_bit_size: usize,
+    params: &P::Params,
+    num_crt_polys: usize,
+) -> usize {
+    let (_, _, crt_depth) = params.to_crt();
+    let total_crt_limbs = num_limbs_of_crt_poly::<P>(limb_bit_size, params) * num_crt_polys;
+    total_crt_limbs.div_ceil(params.ring_dimension() as usize * crt_depth)
 }
 
 #[cfg(test)]

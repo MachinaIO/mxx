@@ -360,10 +360,15 @@ impl<P: Poly> BigUintPoly<P> {
         if w == 0 {
             return (vec![], vec![]);
         }
-        // base * comp_rate < base^2
-        let comp_rate = (1usize << self.ctx.limb_bit_size) - 1;
+        // Choose a safe compressor arity per column.
+        // Each cell is < B, and we reduce up to comp_rate cells in one shot
+        // using a single lookup pair (x % B, x / B) defined for inputs < B^2.
+        // Safety condition: comp_rate * (B-1) <= B^2 - 1  ==> comp_rate <= B + 1.
+        // To guarantee convergence for B=2 (limb_bit_size=1), use 3:2 compression.
+        let base = 1usize << self.ctx.limb_bit_size;
+        let comp_rate = if base == 2 { 3 } else { base + 1 };
         let lut_ids = self.ctx.lut_ids;
-        // Iteratively reduce column heights by applying comp_rate:2 compressions.
+
         loop {
             let mut next: Columns = vec![vec![]; w + 1]; // +1 for carries spilling into w
             let mut done = true;
@@ -519,7 +524,6 @@ impl<P: Poly> BigUintPoly<P> {
             max_limbs,
             self.ctx.lut_ids,
         );
-
         // 2) Compress columns (one-shot if H_max < B, else Wallace compressors)
         // let base: usize = 1usize << self.ctx.limb_bit_size;
         // let h_max = columns.iter().map(|c| c.len()).max().unwrap_or(0);

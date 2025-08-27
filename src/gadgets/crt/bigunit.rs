@@ -380,8 +380,6 @@ impl<P: Poly> BigUintPoly<P> {
                 // Process comp_rate inputs
                 let mut idx: usize = 0;
                 while idx < col.len() {
-                    // Safe calculation to prevent underflow (though comp_rate > 2 should prevent
-                    // this).
                     let last_col_idx = (idx + comp_rate - 1).min(col.len() - 1);
                     let mut sum = col[idx];
                     for i in idx + 1..=last_col_idx {

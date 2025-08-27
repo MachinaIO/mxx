@@ -368,7 +368,7 @@ impl<P: Poly> BigUintPoly<P> {
         let base = 1usize << self.ctx.limb_bit_size;
         let comp_rate = if base == 2 { 3 } else { base + 1 };
         let lut_ids = self.ctx.lut_ids;
-        // Iteratively reduce column heights by applying comp_rate:2 compressions.
+
         loop {
             let mut next: Columns = vec![vec![]; w + 1]; // +1 for carries spilling into w
             let mut done = true;

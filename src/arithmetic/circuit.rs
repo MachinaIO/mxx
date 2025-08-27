@@ -1,6 +1,3 @@
-use num_bigint::BigUint;
-use tracing::info;
-
 use crate::{
     circuit::PolyCircuit,
     gadgets::{
@@ -10,6 +7,7 @@ use crate::{
     },
     poly::Poly,
 };
+use num_bigint::BigUint;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,9 +130,8 @@ impl<P: Poly> ArithmeticCircuit<P> {
 
         let lhs_crt = &self.all_values[lhs_idx];
         let rhs_crt = &self.all_values[rhs_idx];
-        info!("mul st");
+
         let result_crt = lhs_crt.mul(rhs_crt, &mut self.poly_circuit);
-        info!("mul end");
 
         self.all_values.push(result_crt);
         ArithGateId::new(self.all_values.len() - 1)

@@ -2,12 +2,10 @@ use crate::{
     circuit::PolyCircuit,
     gadgets::{
         crt::{CrtContext, CrtPoly},
-        isolate::IsolationGadget,
         packed_crt::{PackedCrtContext, PackedCrtPoly},
     },
     poly::Poly,
 };
-use num_bigint::BigUint;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

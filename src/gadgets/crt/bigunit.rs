@@ -1,8 +1,7 @@
 use crate::{
     circuit::{PolyCircuit, gate::GateId},
-    element::PolyElem,
     lookup::PublicLut,
-    poly::{Poly, PolyParams},
+    poly::Poly,
 };
 use num_bigint::BigUint;
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};

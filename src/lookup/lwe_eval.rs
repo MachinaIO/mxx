@@ -4,7 +4,7 @@ use crate::{
     lookup::{PltEvaluator, PublicLut},
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
-    sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
+    sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler},
     storage::store_and_drop_matrix,
     utils::timed_read,
 };
@@ -220,14 +220,13 @@ mod test {
         matrix::dcrt_poly::DCRTPolyMatrix,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         sampler::{
-            hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
+            PolyUniformSampler, hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
             uniform::DCRTPolyUniformSampler,
         },
         storage::{init_storage_system, wait_for_all_writes},
-        utils::{create_bit_random_poly, create_random_poly, random_bgg_encodings},
+        utils::create_bit_random_poly,
     };
     use keccak_asm::Keccak256;
-    use rand::{Rng, rng};
     use tokio;
 
     fn setup_lsb_constant_binary_plt(t_n: usize, params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {

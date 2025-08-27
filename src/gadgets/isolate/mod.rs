@@ -1,7 +1,6 @@
 use crate::{
     circuit::{PolyCircuit, gate::GateId},
     element::PolyElem,
-    gadgets::crt,
     lookup::PublicLut,
     poly::{Poly, PolyParams},
     utils::crt_combine_residues,

@@ -18,7 +18,7 @@ use tempfile::tempdir;
 use tokio;
 use tracing::info;
 
-pub fn init_tracing() {
+fn init_tracing() {
     tracing_subscriber::fmt::init();
 }
 

@@ -9,6 +9,7 @@ use crate::{
 };
 use num_bigint::BigUint;
 use num_traits::Zero;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,19 +92,20 @@ pub fn biguint_to_packed_crt_polys<P: Poly>(
 ) -> Vec<P> {
     let (_, _, crt_depth) = params.to_crt();
     let ring_dim = params.ring_dimension() as usize;
-
-    let limbs = inputs
-        .iter()
+    let packed_limbs = inputs
+        .par_iter()
         .flat_map(|input| biguint_to_crt_poly::<P>(limb_bit_size, params, input))
         .map(|poly| {
-            let const_coeff = poly.coeffs()[0].value().clone();
-            if const_coeff == BigUint::zero() { 0 } else { const_coeff.to_u64_digits()[0] as u64 }
+            if poly.coeffs()[0].value() == &BigUint::zero() {
+                0
+            } else {
+                poly.coeffs()[0].value().to_u64_digits()[0] as u64
+            }
         })
-        .collect::<Vec<_>>();
-    let packed_limbs = limbs
+        .collect::<Vec<u64>>()
         .chunks(ring_dim * crt_depth)
         .map(|chunk| pack_u64s_to_poly(params, ring_dim, chunk))
-        .collect::<Vec<_>>();
+        .collect::<Vec<P>>();
     debug_assert_eq!(
         packed_limbs.len(),
         num_packed_crt_poly::<P>(limb_bit_size, params, inputs.len())
@@ -137,7 +139,8 @@ mod tests {
     use rand::Rng;
     use std::sync::Arc;
 
-    const LIMB_BIT_SIZE: usize = 5;
+    // todo: 1 not working
+    const LIMB_BIT_SIZE: usize = 2;
 
     // Helper function to generate a random BigUint below a given bound
     fn gen_biguint_below<R: Rng>(rng: &mut R, bound: &BigUint) -> BigUint {

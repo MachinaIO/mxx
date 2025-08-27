@@ -24,6 +24,7 @@ fn init_tracing() {
 
 #[tokio::test]
 async fn test_arithmetic_circuit_operations() {
+    // Test mixed operations in single circuit: (a + b) * c - a.
     init_tracing();
     let params = DCRTPolyParams::new(4, 2, 31, 17);
     let (_, crt_bits, _) = params.to_crt();
@@ -32,10 +33,7 @@ async fn test_arithmetic_circuit_operations() {
     let large_b = BigUint::from(132000u64);
     let large_c = BigUint::from(50000u64);
     let inputs = vec![large_a.clone(), large_b.clone(), large_c.clone()];
-
     let limb_bit_size = 3;
-
-    // Test mixed operations in single circuit: (a + b) * c - a.
     let mut mixed_circuit =
         ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, inputs.len(), false, true);
     let add_idx = mixed_circuit.add(ArithGateId::new(0), ArithGateId::new(1)); // a + b

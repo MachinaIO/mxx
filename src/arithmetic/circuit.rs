@@ -36,8 +36,6 @@ impl From<ArithGateId> for usize {
 #[derive(Clone)]
 pub struct ArithmeticCircuit<P: Poly> {
     pub limb_bit_size: usize,
-    // pub num_limbs: usize,
-    // pub packed_limbs: usize,
     pub num_inputs: usize,
     pub poly_circuit: PolyCircuit<P>,
     pub ctx: Arc<CrtContext<P>>,
@@ -56,21 +54,21 @@ impl<P: Poly> ArithmeticCircuit<P> {
         use_reconstruction: bool,
     ) -> Self {
         let mut poly_circuit = PolyCircuit::<P>::new();
-        let mut crt_inputs = Vec::with_capacity(num_inputs);
-        let ctx = if use_packing {
+        let mut all_values = Vec::with_capacity(num_inputs);
+        let ctx: Arc<CrtContext<P>> = if use_packing {
             let pack_ctx =
                 Arc::new(PackedCrtContext::setup(&mut poly_circuit, params, limb_bit_size));
             let packed_inputs =
                 PackedCrtPoly::input(pack_ctx.clone(), &mut poly_circuit, num_inputs);
             let crt_polys = packed_inputs.unpack(&mut poly_circuit);
-            crt_inputs.extend(crt_polys);
+            all_values.extend(crt_polys);
             pack_ctx.crt_ctx.clone()
         } else {
             let ctx = Arc::new(CrtContext::setup(&mut poly_circuit, params, limb_bit_size));
             let crt_polys = (0..num_inputs)
                 .map(|_| CrtPoly::input(ctx.clone(), &mut poly_circuit))
                 .collect::<Vec<_>>();
-            crt_inputs.extend(crt_polys);
+            all_values.extend(crt_polys);
             ctx
         };
 
@@ -81,7 +79,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
             ctx,
             use_packing,
             use_reconstruction,
-            all_values: crt_inputs,
+            all_values,
         }
     }
 

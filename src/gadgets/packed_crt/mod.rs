@@ -6,10 +6,11 @@ use crate::{
         isolate::*,
     },
     poly::{Poly, PolyParams},
+    utils::mod_inverse,
 };
 use num_bigint::BigUint;
 use num_traits::Zero;
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,7 +86,21 @@ impl<P: Poly> PackedCrtPoly<P> {
     }
 }
 
-pub fn biguint_to_packed_crt_polys<P: Poly>(
+pub fn u64s_to_packed_poly<P: Poly>(params: &P::Params, max_degree: usize, values: &[u64]) -> P {
+    let (_, _, crt_depth) = params.to_crt();
+    debug_assert!(values.len() <= crt_depth * max_degree);
+    debug_assert_eq!(values.len() % crt_depth, 0);
+    let mut slots = values
+        .chunks(crt_depth)
+        .map(|residues| crt_combine_residues::<P>(params, residues))
+        .collect::<Vec<_>>();
+    if slots.len() < params.ring_dimension() as usize {
+        slots.resize(params.ring_dimension() as usize, BigUint::from(0u8));
+    }
+    P::from_biguints_eval(params, &slots)
+}
+
+pub fn biguints_to_packed_crt_polys<P: Poly>(
     limb_bit_size: usize,
     params: &P::Params,
     inputs: &[BigUint],
@@ -104,13 +119,39 @@ pub fn biguint_to_packed_crt_polys<P: Poly>(
         })
         .collect::<Vec<u64>>()
         .chunks(ring_dim * crt_depth)
-        .map(|chunk| pack_u64s_to_poly(params, ring_dim, chunk))
+        .map(|chunk| u64s_to_packed_poly(params, ring_dim, chunk))
         .collect::<Vec<P>>();
     debug_assert_eq!(
         packed_limbs.len(),
         num_packed_crt_poly::<P>(limb_bit_size, params, inputs.len())
     );
     packed_limbs
+}
+
+/// Combine CRT residues into a single BigUint modulo q.
+///
+/// - `residues[i]` corresponds to the residue modulo `q_i` where `(q_0, ..., q_{D-1}) = to_crt()`.
+/// - Returns the unique value in `[0, q)` satisfying `x ≡ residues[i] (mod q_i)` for all i.
+fn crt_combine_residues<P: Poly>(params: &P::Params, residues: &[u64]) -> BigUint {
+    let (moduli, _crt_bits, crt_depth) = params.to_crt();
+    assert_eq!(residues.len(), crt_depth, "residues length must match crt_depth");
+    let q_arc = params.modulus().into();
+    let q: &BigUint = q_arc.as_ref();
+
+    // Compute CRT reconstruction in parallel
+    moduli
+        .par_iter()
+        .zip(residues.par_iter())
+        .map(|(&qi, &r)| {
+            let qi_big = BigUint::from(qi);
+            let m_i = q / &qi_big;
+            let mi_mod_qi = &m_i % &qi_big;
+            let inv = mod_inverse(&mi_mod_qi, &qi_big)
+                .expect("CRT moduli must be pairwise coprime for reconstruction");
+            let c_i = (&m_i * inv) % q;
+            (BigUint::from(r) * c_i) % q
+        })
+        .reduce(|| BigUint::ZERO, |acc, term| (acc + term) % q)
 }
 
 pub fn num_packed_crt_poly<P: Poly>(
@@ -140,7 +181,7 @@ mod tests {
     use std::sync::Arc;
 
     // todo: 1 not working
-    const LIMB_BIT_SIZE: usize = 2;
+    const LIMB_BIT_SIZE: usize = 3;
 
     // Helper function to generate a random BigUint below a given bound
     fn gen_biguint_below<R: Rng>(rng: &mut R, bound: &BigUint) -> BigUint {
@@ -201,7 +242,7 @@ mod tests {
         circuit.output(outputs);
 
         // Generate input values for packed polynomials
-        let input_values = biguint_to_packed_crt_polys(LIMB_BIT_SIZE, &params, &[a, b]);
+        let input_values = biguints_to_packed_crt_polys(LIMB_BIT_SIZE, &params, &[a, b]);
 
         // Evaluate the circuit
         let plt_evaluator = PolyPltEvaluator::new();
@@ -264,7 +305,7 @@ mod tests {
         circuit.output(outputs);
 
         // Generate input values for packed polynomials
-        let input_values = biguint_to_packed_crt_polys(LIMB_BIT_SIZE, &params, &[a, b]);
+        let input_values = biguints_to_packed_crt_polys(LIMB_BIT_SIZE, &params, &[a, b]);
 
         // Evaluate the circuit
         let plt_evaluator = PolyPltEvaluator::new();
@@ -326,7 +367,7 @@ mod tests {
         circuit.output(outputs);
 
         // Generate input values for packed polynomials
-        let input_values = biguint_to_packed_crt_polys(LIMB_BIT_SIZE, &params, &[a, b]);
+        let input_values = biguints_to_packed_crt_polys(LIMB_BIT_SIZE, &params, &[a, b]);
 
         // Evaluate the circuit
         let plt_evaluator = PolyPltEvaluator::new();

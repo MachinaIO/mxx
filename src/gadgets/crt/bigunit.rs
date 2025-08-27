@@ -290,7 +290,7 @@ impl<P: Poly> BigUintPoly<P> {
             let power_exponent = self.ctx.limb_bit_size * i;
             let power_of_two = BigUint::from(1u32) << power_exponent;
 
-            let weighted_limb = circuit.large_scalar_mul(self.limbs[i], vec![power_of_two]);
+            let weighted_limb = circuit.large_scalar_mul(self.limbs[i], &[power_of_two]);
             result = circuit.add_gate(result, weighted_limb);
         }
 

@@ -7,7 +7,7 @@ use crate::{
     },
     gadgets::{
         crt::{biguint_to_crt_poly, num_limbs_of_crt_poly},
-        packed_crt::{biguint_to_packed_crt_polys, num_packed_crt_poly},
+        packed_crt::{biguints_to_packed_crt_polys, num_packed_crt_poly},
     },
     lookup::{
         lwe_eval::{LweBggEncodingPltEvaluator, LweBggPubKeyEvaluator},
@@ -28,7 +28,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
     pub fn evaluate_with_poly(&self, params: &P::Params, inputs: &[BigUint]) -> Vec<P> {
         let one = P::const_one(params);
         let input_polys = if self.use_packing {
-            biguint_to_packed_crt_polys::<P>(self.limb_bit_size, params, inputs)
+            biguints_to_packed_crt_polys::<P>(self.limb_bit_size, params, inputs)
         } else {
             inputs
                 .iter()
@@ -98,7 +98,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
         let bgg_encoding_sampler =
             BGGEncodingSampler::new(params, secret, uniform_sampler, error_sigma);
         let plaintexts = if self.use_packing {
-            biguint_to_packed_crt_polys(self.limb_bit_size, params, inputs)
+            biguints_to_packed_crt_polys(self.limb_bit_size, params, inputs)
         } else {
             inputs
                 .into_iter()

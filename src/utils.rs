@@ -5,7 +5,7 @@ use crate::{
     },
     matrix::base::BaseMatrix,
     poly::{
-        Poly, PolyParams,
+        Poly,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
     sampler::{
@@ -16,7 +16,6 @@ use keccak_asm::Keccak256;
 use memory_stats::memory_stats;
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
-use rayon::prelude::*;
 use std::{
     env,
     time::{Duration, Instant},
@@ -186,37 +185,4 @@ pub fn mod_inverse(a: &BigUint, m: &BigUint) -> Option<BigUint> {
     } else {
         None // No modular inverse exists
     }
-}
-
-/// Combine CRT residues into a single BigUint modulo q.
-///
-/// - `residues[i]` corresponds to the residue modulo `q_i` where `(q_0, ..., q_{D-1}) = to_crt()`.
-/// - Returns the unique value in `[0, q)` satisfying `x ≡ residues[i] (mod q_i)` for all i.
-pub fn crt_combine_residues<P: Poly>(params: &P::Params, residues: &[u64]) -> BigUint {
-    let (moduli, _crt_bits, crt_depth) = params.to_crt();
-    assert_eq!(residues.len(), crt_depth, "residues length must match crt_depth");
-    let q_arc = params.modulus().into();
-    let q: &BigUint = q_arc.as_ref();
-
-    // Precompute M_i = q / q_i and reconstruction coeffs c_i = M_i * inv(M_i mod q_i, q_i) mod q
-    let m_i: Vec<BigUint> = moduli.iter().map(|&qi| q / BigUint::from(qi)).collect();
-    let c_i: Vec<BigUint> = moduli
-        .par_iter()
-        .enumerate()
-        .map(|(i, &qi)| {
-            let qi_big = BigUint::from(qi);
-            let mi_mod_qi = &m_i[i] % &qi_big;
-            let inv = mod_inverse(&mi_mod_qi, &qi_big)
-                .expect("CRT moduli must be pairwise coprime for reconstruction");
-            (&m_i[i] * inv) % q
-        })
-        .collect();
-
-    // Combine
-    let mut acc = BigUint::from(0u8);
-    for (i, &r) in residues.iter().enumerate() {
-        let term = (BigUint::from(r) * &c_i[i]) % q;
-        acc = (acc + term) % q;
-    }
-    acc
 }

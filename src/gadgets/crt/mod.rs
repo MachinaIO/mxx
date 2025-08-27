@@ -134,7 +134,7 @@ impl<P: Poly> CrtPoly<P> {
         let mut outputs = vec![];
         for (q_over_qi, mont_poly) in self.ctx.q_over_qis.iter().zip(self.slots.iter()) {
             let finalized = mont_poly.finalize(circuit);
-            outputs.push(circuit.large_scalar_mul(finalized, vec![q_over_qi.clone()]));
+            outputs.push(circuit.large_scalar_mul(finalized, &[q_over_qi.to_owned()]));
         }
         outputs
     }
@@ -144,7 +144,7 @@ impl<P: Poly> CrtPoly<P> {
         for (reconst_coeff, mont_poly) in self.ctx.reconstruct_coeffs.iter().zip(self.slots.iter())
         {
             let mont_finalized = mont_poly.finalize(circuit);
-            let scaled = circuit.large_scalar_mul(mont_finalized, vec![reconst_coeff.clone()]);
+            let scaled = circuit.large_scalar_mul(mont_finalized, &[reconst_coeff.to_owned()]);
             output = circuit.add_gate(output, scaled);
         }
         output

@@ -3,7 +3,6 @@ use crate::{
     element::PolyElem,
     lookup::PublicLut,
     poly::{Poly, PolyParams},
-    utils::crt_combine_residues,
 };
 use num_bigint::BigUint;
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
@@ -29,7 +28,7 @@ impl<P: Poly> IsolationGadget<P> {
     pub fn setup(
         circuit: &mut PolyCircuit<P>,
         params: &P::Params,
-        max_degree: u16, // N
+        max_degree: u16,
         max_norm: u32,
     ) -> Self {
         let (moduli, _, _) = params.to_crt();
@@ -41,31 +40,31 @@ impl<P: Poly> IsolationGadget<P> {
         // Precompute q/qi per tower i
         let big_q_arc: Arc<BigUint> = params.modulus().into();
         let q_over_qis: Vec<BigUint> =
-            moduli.iter().map(|&qi| (&*big_q_arc) / BigUint::from(qi)).collect();
+            moduli.iter().map(|&qi| &*big_q_arc / BigUint::from(qi)).collect();
 
         let mut plt_ids = vec![vec![0usize; n]; crt_depth];
         let mut mul_scalars = vec![vec![vec![]; n]; crt_depth];
         let max_norm_usize = max_norm as usize;
 
-        for (i, q_over_qi) in q_over_qis.iter().enumerate() {
+        for (i, q_over_qi) in q_over_qis.into_iter().enumerate() {
             let scale_poly = P::from_biguint_to_constant(params, q_over_qi.clone());
             for j in 0..n {
                 // Precompute scalar coefficients for (q/qi) * L_j(X) in coefficient format.
-                let mut unit_slots = vec![BigUint::from(0u8); ring_n];
+                let mut unit_slots = vec![BigUint::ZERO; ring_n];
                 unit_slots[j] = BigUint::from(1u8);
                 let l_j_eval = P::from_biguints_eval(params, &unit_slots);
                 let l_j_coeffs = l_j_eval.coeffs();
                 let q_ref: Arc<BigUint> = params.modulus().into();
                 let scalars: Vec<BigUint> = l_j_coeffs
                     .into_iter()
-                    .map(|c| (c.value() * q_over_qi) % q_ref.as_ref())
+                    .map(|c| (c.value() * &q_over_qi) % q_ref.as_ref())
                     .collect();
                 mul_scalars[i][j] = scalars;
 
                 let mut lut_map: HashMap<P, (usize, P)> = HashMap::with_capacity(max_norm_usize);
                 for k in 0..max_norm_usize {
                     // Build evaluation-format slots: only index j is k, others 0
-                    let mut slots = vec![BigUint::from(0u8); ring_n];
+                    let mut slots = vec![BigUint::ZERO; ring_n];
                     slots[j] = BigUint::from(k as u64);
                     let slots_poly = P::from_biguints_eval(params, &slots);
                     let key_poly = slots_poly * &scale_poly;
@@ -88,20 +87,6 @@ impl<P: Poly> IsolationGadget<P> {
         }
     }
 
-    /// Isolate a single slot from a specific CRT input and return one constant polynomial.
-    pub fn isolate_single_slot(
-        &self,
-        circuit: &mut PolyCircuit<P>,
-        crt_idx: usize,
-        slot_idx: usize,
-        input: GateId,
-    ) -> GateId {
-        debug_assert!(crt_idx < self.crt_depth);
-        debug_assert!(slot_idx < self.max_degree);
-        let t = circuit.large_scalar_mul(input, self.mul_scalars[crt_idx][slot_idx].clone());
-        circuit.public_lookup_gate(t, self.plt_ids[crt_idx][slot_idx])
-    }
-
     /// Takes 1 input that packs `crt_depth * max_degree` slots in
     /// evaluation format for each q_i. Returns D*N constants flattened as [slot_idx][crt_idx].
     pub fn isolate_slots(&self, circuit: &mut PolyCircuit<P>, input: GateId) -> Vec<GateId> {
@@ -114,20 +99,20 @@ impl<P: Poly> IsolationGadget<P> {
         }
         all
     }
-}
 
-pub fn pack_u64s_to_poly<P: Poly>(params: &P::Params, max_degree: usize, values: &[u64]) -> P {
-    let (_, _, crt_depth) = params.to_crt();
-    debug_assert!(values.len() <= crt_depth * max_degree);
-    debug_assert_eq!(values.len() % crt_depth, 0);
-    let mut slots = values
-        .chunks(crt_depth)
-        .map(|residues| crt_combine_residues::<P>(params, residues))
-        .collect::<Vec<_>>();
-    if slots.len() < params.ring_dimension() as usize {
-        slots.resize(params.ring_dimension() as usize, BigUint::from(0u8));
+    /// Isolate a single slot from a specific CRT input and return one constant polynomial.
+    fn isolate_single_slot(
+        &self,
+        circuit: &mut PolyCircuit<P>,
+        crt_idx: usize,
+        slot_idx: usize,
+        input: GateId,
+    ) -> GateId {
+        debug_assert!(crt_idx < self.crt_depth);
+        debug_assert!(slot_idx < self.max_degree);
+        let t = circuit.large_scalar_mul(input, &self.mul_scalars[crt_idx][slot_idx]);
+        circuit.public_lookup_gate(t, self.plt_ids[crt_idx][slot_idx])
     }
-    P::from_biguints_eval(params, &slots)
 }
 
 #[cfg(test)]
@@ -135,6 +120,7 @@ mod tests {
     use super::*;
     use crate::{
         circuit::PolyCircuit,
+        gadgets::packed_crt::u64s_to_packed_poly,
         lookup::poly::PolyPltEvaluator,
         poly::{
             Poly, PolyParams,
@@ -167,7 +153,7 @@ mod tests {
 
         // Prepare single CRT-combined input packed polynomial in evaluation format
         let slots = crt_combine_slots(ring_n, &params, max_norm as usize);
-        let input_poly = pack_u64s_to_poly(
+        let input_poly = u64s_to_packed_poly(
             &params,
             ring_n,
             slots.iter().flatten().copied().collect::<Vec<_>>().as_slice(),
@@ -205,7 +191,7 @@ mod tests {
 
         // Prepare single CRT-combined input packed polynomial in evaluation format
         let slots = crt_combine_slots(ring_n, &params, max_norm as usize);
-        let input_poly = pack_u64s_to_poly(
+        let input_poly = u64s_to_packed_poly(
             &params,
             ring_n,
             slots.iter().flatten().copied().collect::<Vec<_>>().as_slice(),

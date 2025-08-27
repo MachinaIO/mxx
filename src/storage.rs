@@ -19,11 +19,15 @@ pub struct SerializedMatrix {
 }
 
 static WRITE_HANDLES: OnceLock<Arc<Mutex<Vec<JoinHandle<()>>>>> = OnceLock::new();
+static RUNTIME_HANDLE: OnceLock<tokio::runtime::Handle> = OnceLock::new();
 
 /// Initialize the storage system
 pub fn init_storage_system() {
     WRITE_HANDLES
         .set(Arc::new(Mutex::new(Vec::new())))
+        .expect("Storage system already initialized");
+    RUNTIME_HANDLE
+        .set(tokio::runtime::Handle::current())
         .expect("Storage system already initialized");
 }
 
@@ -82,32 +86,45 @@ where
     let id = id.to_owned();
 
     let serialized_matrix = preprocess_matrix_for_storage(matrix, &id);
-    let write_handle = tokio::spawn(async move {
-        let path = dir.join(&serialized_matrix.filename);
-
-        match tokio::fs::write(&path, &serialized_matrix.data).await {
+    // Prepare async write task
+    let dir_async = dir.clone();
+    let filename_async = serialized_matrix.filename.clone();
+    let id_async = serialized_matrix.id.clone();
+    let data_async = serialized_matrix.data.clone();
+    let write_task = async move {
+        let path = dir_async.join(&filename_async);
+        match tokio::fs::write(&path, &data_async).await {
             Ok(_) => {
                 log_mem(format!(
                     "Matrix {} written to {} ({} bytes)",
-                    serialized_matrix.id,
-                    serialized_matrix.filename,
-                    serialized_matrix.data.len()
+                    id_async, filename_async, data_async.len()
                 ));
             }
             Err(e) => {
                 eprintln!("Failed to write {}: {}", path.display(), e);
             }
         }
-    });
+    };
 
-    // Store handle for later synchronization
-    if let Some(handles) = WRITE_HANDLES.get() {
+    // Spawn on the captured runtime handle when available; otherwise fallback to blocking write
+    if let (Some(handles), Some(rt_handle)) = (WRITE_HANDLES.get(), RUNTIME_HANDLE.get()) {
+        let write_handle = rt_handle.spawn(write_task);
         handles.lock().unwrap().push(write_handle);
     } else {
-        eprintln!("Warning: Storage system not initialized, falling back to blocking write");
-        // Fallback: block on the async operation
-        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(write_handle))
-            .unwrap();
+        eprintln!(
+            "Warning: Storage system not initialized, falling back to blocking write"
+        );
+        let path = dir.join(&serialized_matrix.filename);
+        if let Err(e) = std::fs::write(&path, &serialized_matrix.data) {
+            eprintln!("Failed to write {}: {}", path.display(), e);
+        } else {
+            log_mem(format!(
+                "Matrix {} written to {} ({} bytes)",
+                serialized_matrix.id,
+                serialized_matrix.filename,
+                serialized_matrix.data.len()
+            ));
+        }
     }
 }
 

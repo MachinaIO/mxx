@@ -242,8 +242,17 @@ pub fn u64_to_montgomery_poly<P: Poly>(
 }
 
 fn u64_to_montgomery_form(limb_bit_size: usize, num_limbs: usize, n: u64, input: u64) -> u64 {
+    // Compute (input * 2^r) mod n using u128 to avoid overflow when r is large.
+    // r must be < 128 to safely shift within u128.
     let r = num_limbs * limb_bit_size;
-    (input << r) % n
+    debug_assert!(r < 128, "num_limbs * limb_bit_size (= {}) is too large for u128-based shift", r);
+
+    let n128 = n as u128;
+    let input128 = input as u128;
+    // Compute 2^r mod n in u128, then multiply by input and reduce mod n.
+    let pow2_mod = (1u128 << r) % n128;
+    let res = (input128 * pow2_mod) % n128;
+    res as u64
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 use keccak_asm::Keccak256;
 use mxx::{
     arithmetic::circuit::{ArithGateId, ArithmeticCircuit},
+    element::PolyElem,
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
@@ -24,7 +25,7 @@ pub fn init_tracing() {
 #[tokio::test]
 async fn test_arithmetic_circuit_operations() {
     init_tracing();
-    let params = DCRTPolyParams::default();
+    let params = DCRTPolyParams::new(4, 2, 31, 17);
     let (_, crt_bits, _) = params.to_crt();
     info!("crt_bits={}", crt_bits);
     let large_a = BigUint::from(140000u64);
@@ -36,7 +37,7 @@ async fn test_arithmetic_circuit_operations() {
 
     // Test mixed operations in single circuit: (a + b) * c - a.
     let mut mixed_circuit =
-        ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, inputs.len(), true, true);
+        ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, inputs.len(), false, true);
     let add_idx = mixed_circuit.add(ArithGateId::new(0), ArithGateId::new(1)); // a + b
     let mul_idx = mixed_circuit.mul(add_idx, ArithGateId::new(2)); // (a + b) * c
     let final_idx = mixed_circuit.sub(mul_idx, ArithGateId::new(0)); // (a + b) * c - a
@@ -46,10 +47,12 @@ async fn test_arithmetic_circuit_operations() {
     info!("start evaluate_with_poly");
     let mixed_poly_result = &mixed_circuit.evaluate_with_poly(&params, &inputs)[0];
     info!("end evaluate_with_poly");
-    let mixed_expected = ((&large_a + &large_b) * &large_c) - &large_a;
+    let mixed_expected =
+        (((&large_a + &large_b) * &large_c) - &large_a) % params.modulus().as_ref();
+    println!("coeffs {:?}", mixed_poly_result.coeffs());
     assert_eq!(
-        mixed_poly_result.to_const_int(),
-        mixed_expected.to_u64().unwrap() as usize,
+        mixed_poly_result.coeffs()[0].value().clone(),
+        mixed_expected,
         "Mixed operations should be correct"
     );
 
@@ -100,7 +103,7 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
 
     // this is curated to be have same CRT bit as test_arithmetic_circuit_operations
     // (crt_depth*crt_bit)
-    let params = DCRTPolyParams::new(4, 1, 34, 1);
+    let params = DCRTPolyParams::new(4, 1, 62, 17);
 
     let (moduli, _, crt_depth) = params.to_crt();
     assert_eq!(moduli.len(), 1, "Should have only one modulus for non-CRT");

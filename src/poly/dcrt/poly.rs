@@ -528,20 +528,36 @@ fn reconstruct_single_coeff(
 }
 
 fn process_coeffs_chunked(coeffs: &[FinRingElem], chunk_size: usize) -> Vec<(bool, Vec<u8>)> {
+    if coeffs.is_empty() {
+        return Vec::new();
+    }
+
+    // All coefficients in a poly share the same modulus; cache and precompute q/2 once.
+    let modulus_arc = coeffs[0].modulus().clone();
+    let modulus_ref = modulus_arc.as_ref();
+    let q_half = modulus_ref >> 1;
+
     coeffs
         .par_chunks(chunk_size)
-        .flat_map(|chunk| chunk.iter().map(process_single_coeff).collect::<Vec<_>>())
+        .flat_map(|chunk| {
+            chunk
+                .iter()
+                .map(|coeff| process_single_coeff_with(coeff, modulus_ref, &q_half))
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
 #[inline(always)]
-fn process_single_coeff(coeff: &FinRingElem) -> (bool, Vec<u8>) {
+fn process_single_coeff_with(
+    coeff: &FinRingElem,
+    modulus: &BigUint,
+    q_half: &BigUint,
+) -> (bool, Vec<u8>) {
     let coeff_val = coeff.value();
-    let modulus_big = coeff.modulus().as_ref();
-    let q_half = modulus_big >> 1;
 
-    if coeff_val > &q_half {
-        let centered_value = modulus_big - coeff_val;
+    if coeff_val > q_half {
+        let centered_value = modulus - coeff_val;
         let value_bytes =
             if centered_value.is_zero() { Vec::new() } else { centered_value.to_bytes_le() };
         (true, value_bytes)

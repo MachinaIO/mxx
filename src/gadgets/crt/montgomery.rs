@@ -66,7 +66,8 @@ impl<P: Poly> MontgomeryContext<P> {
         // Ensure N has exactly num_limbs limbs
         const_n.limbs.resize(num_limbs, circuit.const_zero_gate());
         let const_r2 = BigUintPoly::const_u64(big_uint_ctx.clone(), circuit, r2);
-        let const_n_prime = BigUintPoly::const_u64(big_uint_ctx.clone(), circuit, n_prime);
+        let mut const_n_prime = BigUintPoly::const_u64(big_uint_ctx.clone(), circuit, n_prime);
+        const_n_prime.limbs.resize(num_limbs, circuit.const_zero_gate());
 
         Self { big_uint_ctx, num_limbs, n, const_n, const_r2, const_n_prime }
     }
@@ -239,14 +240,16 @@ mod tests {
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
 
-    const LIMB_BIT_SIZE: usize = 5;
-    const NUM_LIMBS: usize = 4;
+    // works for 4,5 each also
+    const LIMB_BIT_SIZE: usize = 1;
+    const NUM_LIMBS: usize = 5;
 
     fn create_test_context(
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> (DCRTPolyParams, Arc<MontgomeryContext<DCRTPoly>>) {
         let params = DCRTPolyParams::default();
         // Use a small modulus for testing: N = 17 (prime number)
+        // With LIMB_BIT_SIZE = 1 and NUM_LIMBS = 5, R = 2^5 = 32 > N = 17
         let n = 17u64;
         let ctx = Arc::new(MontgomeryContext::setup(circuit, &params, LIMB_BIT_SIZE, NUM_LIMBS, n));
         (params, ctx)

@@ -94,7 +94,6 @@ async fn test_arithmetic_circuit_operations() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_arithmetic_circuit_no_crt_limb1() {
     init_tracing();
 

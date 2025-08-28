@@ -523,7 +523,7 @@ impl<P: Poly> BigUintPoly<P> {
         (gs, ps)
     }
 
-    // Single-bit addition using basic arithmetic gates
+    // Single-bit addition using parallel-prefix
     fn add_single_bit(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
         let (w, a, b) = if self.limbs.len() >= other.limbs.len() {
             (self.limbs.len(), &self.limbs, &other.limbs)
@@ -532,49 +532,88 @@ impl<P: Poly> BigUintPoly<P> {
         };
 
         let zero = circuit.const_zero_gate();
-        let mut limbs = Vec::with_capacity(w + 1);
-        let mut carry = zero;
+        
+        let mut gs = Vec::with_capacity(w);
+        let mut ps = Vec::with_capacity(w);
+        let mut sums = Vec::with_capacity(w);
+        
         for i in 0..w {
             let ai = a[i];
             let bi = if i < b.len() { b[i] } else { zero };
-            let a_xor_b = circuit.xor_gate(ai, bi);
-            let sum = circuit.xor_gate(a_xor_b, carry);
-            let a_and_b = circuit.and_gate(ai, bi);
-            let carry_and_xor = circuit.and_gate(carry, a_xor_b);
-            carry = circuit.or_gate(a_and_b, carry_and_xor);
-
+            
+            // g_i = a_i AND b_i (generate: both bits are 1).
+            let g = circuit.and_gate(ai, bi);
+            
+            // p_i = a_i XOR b_i (propagate: exactly one bit is 1).
+            let p = circuit.xor_gate(ai, bi);
+            
+            gs.push(g);
+            ps.push(p);
+            sums.push(p); // Store XOR for sum computation later.
+        }
+        
+        // Use parallel-prefix to compute carry prefixes.
+        let (g_pref, _) = Self::prefix_gp(circuit, &gs, &ps);
+        
+        // Compute final sum bits using carries.
+        let mut limbs = Vec::with_capacity(w + 1);
+        for i in 0..w {
+            let carry_in = if i == 0 { zero } else { g_pref[i - 1] };
+            let sum = circuit.xor_gate(sums[i], carry_in);
             limbs.push(sum);
         }
-        limbs.push(carry);
+        
+        // Final carry out.
+        let final_carry = if w == 0 { zero } else { g_pref[w - 1] };
+        limbs.push(final_carry);
 
         Self { ctx: self.ctx.clone(), limbs, _p: PhantomData }
     }
 
-    // Single-bit comparison using basic arithmetic gates
+    // Single-bit comparison using parallel-prefix
     fn less_than_single_bit(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> (GateId, Self) {
         debug_assert_eq!(self.limbs.len(), other.limbs.len());
         let w = self.limbs.len();
         let zero = circuit.const_zero_gate();
-        let mut diff_limbs = Vec::with_capacity(w);
-        let mut borrow = zero;
+        let mut gs = Vec::with_capacity(w);
+        let mut ps = Vec::with_capacity(w);
+        let mut xors = Vec::with_capacity(w);
+        
         for i in 0..w {
             let a = self.limbs[i];
             let b = other.limbs[i];
-            let a_xor_b = circuit.xor_gate(a, b);
-            let diff = circuit.xor_gate(a_xor_b, borrow);
+            
+            // g_i = !a_i AND b_i (borrow generate: a < b).
             let not_a = circuit.not_gate(a);
-            let not_a_and_b = circuit.and_gate(not_a, b);
-            let not_xor = circuit.not_gate(a_xor_b);
-            let borrow_and_not_xor = circuit.and_gate(borrow, not_xor);
-            borrow = circuit.or_gate(not_a_and_b, borrow_and_not_xor);
-
+            let g = circuit.and_gate(not_a, b);
+            
+            // p_i = !(a_i XOR b_i) (borrow propagate: a == b).
+            let xor_ab = circuit.xor_gate(a, b);
+            let p = circuit.not_gate(xor_ab);
+            
+            gs.push(g);
+            ps.push(p);
+            xors.push(xor_ab); // Store XOR for difference computation later.
+        }
+        
+        // Use parallel-prefix to compute borrow prefixes.
+        let (g_pref, _) = Self::prefix_gp(circuit, &gs, &ps);
+        
+        // Compute final difference bits using borrows.
+        let mut diff_limbs = Vec::with_capacity(w);
+        for i in 0..w {
+            let borrow_in = if i == 0 { zero } else { g_pref[i - 1] };
+            let diff = circuit.xor_gate(xors[i], borrow_in);
             diff_limbs.push(diff);
         }
+        
+        // Final borrow out indicates less than.
+        let final_borrow = if w == 0 { zero } else { g_pref[w - 1] };
 
-        (borrow, Self { ctx: self.ctx.clone(), limbs: diff_limbs, _p: PhantomData })
+        (final_borrow, Self { ctx: self.ctx.clone(), limbs: diff_limbs, _p: PhantomData })
     }
 
-    // Single-bit multiplication using basic arithmetic gates
+    // Single-bit multiplication using parallel-prefix
     fn mul_single_bit(
         &self,
         other: &Self,
@@ -584,26 +623,50 @@ impl<P: Poly> BigUintPoly<P> {
         let max_bit_size = max_bit_size.unwrap_or(self.bit_size() + other.bit_size());
         let max_limbs = max_bit_size / self.ctx.limb_bit_size;
         let zero = circuit.const_zero_gate();
-        let mut result = Self::zero(self.ctx.clone(), max_bit_size);
+        
+        // Collect all partial products.
+        let mut partial_products = Vec::new();
+        
         for (i, &bit) in other.limbs.iter().enumerate() {
+            // Create shifted version of self.
             let mut shifted_self = vec![zero; i];
             shifted_self.extend(self.limbs.iter().cloned());
-
             shifted_self.truncate(max_limbs);
             while shifted_self.len() < max_limbs {
                 shifted_self.push(zero);
             }
-            let shifted = Self { ctx: self.ctx.clone(), limbs: shifted_self, _p: PhantomData };
+            
+            // Mask with the current bit.
             let mut masked_limbs = Vec::with_capacity(max_limbs);
-            for &limb in &shifted.limbs {
+            for &limb in &shifted_self {
                 masked_limbs.push(circuit.and_gate(limb, bit));
             }
-            let masked = Self { ctx: self.ctx.clone(), limbs: masked_limbs, _p: PhantomData };
-            result = result.add_single_bit(&masked, circuit);
-            result.limbs.truncate(max_limbs);
+            
+            partial_products.push(Self { ctx: self.ctx.clone(), limbs: masked_limbs, _p: PhantomData });
         }
-
-        result
+        
+        // Use tree reduction with our parallel-prefix adder.
+        // This gives us O(log n * log w) depth where n is the number of bits in other.
+        let mut products = partial_products;
+        while products.len() > 1 {
+            let mut next_level = Vec::new();
+            let mut i = 0;
+            while i < products.len() {
+                if i + 1 < products.len() {
+                    let sum = products[i].add_single_bit(&products[i + 1], circuit);
+                    let mut truncated_limbs = sum.limbs;
+                    truncated_limbs.truncate(max_limbs);
+                    next_level.push(Self { ctx: self.ctx.clone(), limbs: truncated_limbs, _p: PhantomData });
+                    i += 2;
+                } else {
+                    next_level.push(products[i].clone());
+                    i += 1;
+                }
+            }
+            products = next_level;
+        }
+        
+        products.into_iter().next().unwrap_or_else(|| Self::zero(self.ctx.clone(), max_bit_size))
     }
 
     pub(crate) fn mul_without_cpa(
@@ -1275,6 +1338,7 @@ mod tests {
 
         assert_eq!(actual, expected, "Single-bit addition should produce correct result");
     }
+
 
     #[test]
     fn test_single_bit_less_than() {

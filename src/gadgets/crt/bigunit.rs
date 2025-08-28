@@ -636,6 +636,7 @@ mod tests {
         lookup::poly::PolyPltEvaluator,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
+    use num_traits::ToPrimitive;
     use std::sync::Arc;
 
     const INPUT_BIT_SIZE: usize = 20;
@@ -1236,5 +1237,163 @@ mod tests {
         assert_eq!(eval_result.len(), 1);
         let coeffs = eval_result[0].coeffs();
         assert_eq!(*coeffs[0].value(), test_value.into());
+    }
+
+    #[test]
+    fn test_single_bit_add() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let params = DCRTPolyParams::default();
+        let ctx = Arc::new(BigUintPolyContext::setup(&mut circuit, &params, 1)); // limb_bit_size = 1
+
+        // Test cases: 15 + 20 = 35
+        let a_value = 15u64;
+        let b_value = 20u64;
+        let expected = 35u64;
+
+        let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, 8);
+        let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, 8);
+
+        let a_limbs = u64_to_biguint_poly(1, &params, a_value, Some(8));
+        let b_limbs = u64_to_biguint_poly(1, &params, b_value, Some(8));
+
+        let result = big_a.add(&big_b, &mut circuit);
+        circuit.output(result.limbs.clone());
+
+        let eval_result = circuit.eval(
+            &params,
+            &DCRTPoly::const_one(&params),
+            &[a_limbs, b_limbs].concat(),
+            None::<PolyPltEvaluator>,
+        );
+
+        // Reconstruct the result from bits
+        let mut actual = 0u64;
+        for (i, limb_result) in eval_result.iter().enumerate() {
+            let bit_value = limb_result.coeffs()[0].value().to_u64().unwrap();
+            actual |= bit_value << i;
+        }
+
+        assert_eq!(actual, expected, "Single-bit addition should produce correct result");
+    }
+
+    #[test]
+    fn test_single_bit_less_than() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let params = DCRTPolyParams::default();
+        let ctx = Arc::new(BigUintPolyContext::setup(&mut circuit, &params, 1)); // limb_bit_size = 1
+
+        // Test case: 10 < 25 should return true (1)
+        let a_value = 10u64;
+        let b_value = 25u64;
+
+        let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, 8);
+        let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, 8);
+
+        let a_limbs = u64_to_biguint_poly(1, &params, a_value, Some(8));
+        let b_limbs = u64_to_biguint_poly(1, &params, b_value, Some(8));
+
+        let (lt_result, _diff) = big_a.less_than(&big_b, &mut circuit);
+        circuit.output(vec![lt_result]);
+        let eval_result = circuit.eval(
+            &params,
+            &DCRTPoly::const_one(&params),
+            &[a_limbs, b_limbs].concat(),
+            None::<PolyPltEvaluator>,
+        );
+
+        assert_eq!(eval_result.len(), 1);
+        let lt_value = eval_result[0].coeffs()[0].value().to_u64().unwrap();
+        assert_eq!(lt_value, 1, "10 < 25 should return 1");
+
+        // Test case 2: 25 < 10 should return false (0)
+        let mut circuit2 = PolyCircuit::<DCRTPoly>::new();
+        let ctx2 = Arc::new(BigUintPolyContext::setup(&mut circuit2, &params, 1));
+
+        let big_a2 = BigUintPoly::<DCRTPoly>::input(ctx2.clone(), &mut circuit2, 8);
+        let big_b2 = BigUintPoly::<DCRTPoly>::input(ctx2.clone(), &mut circuit2, 8);
+
+        let a2_limbs = u64_to_biguint_poly(1, &params, b_value, Some(8)); // 25
+        let b2_limbs = u64_to_biguint_poly(1, &params, a_value, Some(8)); // 10
+
+        let (lt_result2, _diff2) = big_a2.less_than(&big_b2, &mut circuit2);
+        circuit2.output(vec![lt_result2]);
+
+        let eval_result2 = circuit2.eval(
+            &params,
+            &DCRTPoly::const_one(&params),
+            &[a2_limbs, b2_limbs].concat(),
+            None::<PolyPltEvaluator>,
+        );
+
+        let lt_value2 = eval_result2[0].coeffs()[0].value().to_u64().unwrap();
+        assert_eq!(lt_value2, 0, "25 < 10 should return 0");
+    }
+
+    #[test]
+    fn test_single_bit_mul() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let params = DCRTPolyParams::default();
+        let ctx = Arc::new(BigUintPolyContext::setup(&mut circuit, &params, 1)); // limb_bit_size = 1
+
+        // Test case: 7 * 5 = 35
+        let a_value = 7u64;
+        let b_value = 5u64;
+        let expected = 35u64;
+
+        let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, 4);
+        let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, 4);
+
+        let a_limbs = u64_to_biguint_poly(1, &params, a_value, Some(4));
+        let b_limbs = u64_to_biguint_poly(1, &params, b_value, Some(4));
+
+        let result = big_a.mul(&big_b, &mut circuit, Some(8));
+        circuit.output(result.limbs.clone());
+        let eval_result = circuit.eval(
+            &params,
+            &DCRTPoly::const_one(&params),
+            &[a_limbs, b_limbs].concat(),
+            None::<PolyPltEvaluator>,
+        );
+
+        // Reconstruct the result from bits
+        let mut actual = 0u64;
+        for (i, limb_result) in eval_result.iter().enumerate() {
+            let bit_value = limb_result.coeffs()[0].value().to_u64().unwrap();
+            actual |= bit_value << i;
+        }
+
+        assert_eq!(actual, expected, "Single-bit multiplication should produce correct result");
+
+        // Test case 2: Larger numbers
+        let mut circuit2 = PolyCircuit::<DCRTPoly>::new();
+        let ctx2 = Arc::new(BigUintPolyContext::setup(&mut circuit2, &params, 1));
+
+        let a2_value = 13u64;
+        let b2_value = 11u64;
+        let expected2 = 143u64;
+
+        let big_a2 = BigUintPoly::<DCRTPoly>::input(ctx2.clone(), &mut circuit2, 8);
+        let big_b2 = BigUintPoly::<DCRTPoly>::input(ctx2.clone(), &mut circuit2, 8);
+
+        let a2_limbs = u64_to_biguint_poly(1, &params, a2_value, Some(8));
+        let b2_limbs = u64_to_biguint_poly(1, &params, b2_value, Some(8));
+
+        let result2 = big_a2.mul(&big_b2, &mut circuit2, Some(16));
+        circuit2.output(result2.limbs.clone());
+
+        let eval_result2 = circuit2.eval(
+            &params,
+            &DCRTPoly::const_one(&params),
+            &[a2_limbs, b2_limbs].concat(),
+            None::<PolyPltEvaluator>,
+        );
+
+        let mut actual2 = 0u64;
+        for (i, limb_result) in eval_result2.iter().enumerate() {
+            let bit_value = limb_result.coeffs()[0].value().to_u64().unwrap();
+            actual2 |= bit_value << i;
+        }
+
+        assert_eq!(actual2, expected2, "Single-bit multiplication of 13 * 11 should equal 143");
     }
 }

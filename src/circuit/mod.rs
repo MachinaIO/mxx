@@ -193,8 +193,8 @@ impl<P: Poly> PolyCircuit<P> {
         self.new_gate_generic(vec![left_input, right_input], PolyGateType::Mul)
     }
 
-    pub fn large_scalar_mul(&mut self, input: GateId, scalar: Vec<BigUint>) -> GateId {
-        self.new_gate_generic(vec![input], PolyGateType::LargeScalarMul { scalar })
+    pub fn large_scalar_mul(&mut self, input: GateId, scalar: &[BigUint]) -> GateId {
+        self.new_gate_generic(vec![input], PolyGateType::LargeScalarMul { scalar: scalar.to_vec() })
     }
 
     pub fn rotate_gate(&mut self, input: GateId, shift: i32) -> GateId {

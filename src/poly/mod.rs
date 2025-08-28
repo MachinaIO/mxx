@@ -57,6 +57,7 @@ pub trait Poly:
     fn from_bool_vec(params: &Self::Params, coeffs: &[bool]) -> Self;
     fn from_coeffs(params: &Self::Params, coeffs: &[Self::Elem]) -> Self;
     fn from_biguints(params: &Self::Params, coeffs: &[BigUint]) -> Self;
+    fn from_biguints_eval(params: &Self::Params, slots: &[BigUint]) -> Self;
     fn from_decomposed(params: &Self::Params, decomposed: &[Self]) -> Self;
     fn from_bytes(params: &Self::Params, bytes: &[u8]) -> Self {
         let log_q_bytes = params.modulus_bits().div_ceil(8);

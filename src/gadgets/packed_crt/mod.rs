@@ -1,46 +1,44 @@
 use crate::{
-    circuit::{PolyCircuit, evaluable::Evaluable, gate::GateId},
+    circuit::{PolyCircuit, gate::GateId},
+    element::PolyElem,
     gadgets::{
         crt::{bigunit::BigUintPoly, montgomery::MontgomeryPoly, *},
         isolate::*,
     },
-    poly::Poly,
+    poly::{Poly, PolyParams},
+    utils::mod_inverse,
 };
 use num_bigint::BigUint;
+use num_traits::Zero;
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackedCrtContext<P: Poly> {
     pub crt_ctx: Arc<CrtContext<P>>,
     pub isolation_gadget: Arc<IsolationGadget<P>>,
-    pub num_limbs_per_pack: usize,
-    pub total_limbs_per_crt_poly: usize,
 }
 
 impl<P: Poly> PackedCrtContext<P> {
-    pub fn setup(
-        circuit: &mut PolyCircuit<P>,
-        params: &P::Params,
-        limb_bit_size: usize,
-        pack_bit_size: usize,
-    ) -> Self {
-        debug_assert_eq!(pack_bit_size % limb_bit_size, 0);
+    pub fn setup(circuit: &mut PolyCircuit<P>, params: &P::Params, limb_bit_size: usize) -> Self {
         let crt_ctx = Arc::new(CrtContext::setup(circuit, params, limb_bit_size));
-        let max_degree = pack_bit_size.div_ceil(limb_bit_size) as u16 - 1;
+        let ring_dim = params.ring_dimension() as usize;
+
+        // Fix per spec:
+        // - max_norm = 2^{limb_bit_size}
+        // - pack_bit_size = limb_bit_size * ring_dimension * crt_depth
+        let max_degree = ring_dim as u16; // N = ring_dimension
         let max_norm = 1 << limb_bit_size;
         let isolation_gadget =
             Arc::new(IsolationGadget::setup(circuit, params, max_degree, max_norm));
-        let num_limbs_per_pack = pack_bit_size / limb_bit_size;
-        let num_crt_slots = crt_ctx.mont_ctxes.len();
-        let num_limbs_per_slot = crt_ctx.mont_ctxes[0].num_limbs;
-        let total_limbs_per_crt_poly = num_crt_slots * num_limbs_per_slot;
-        Self { crt_ctx, isolation_gadget, num_limbs_per_pack, total_limbs_per_crt_poly }
+        Self { crt_ctx, isolation_gadget }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct PackedCrtPoly<P: Poly> {
     pub ctx: Arc<PackedCrtContext<P>>,
+    pub num_crt_polys: usize,
     pub packed_polys: Vec<GateId>,
 }
 
@@ -50,80 +48,120 @@ impl<P: Poly> PackedCrtPoly<P> {
         circuit: &mut PolyCircuit<P>,
         num_crt_polys: usize,
     ) -> Self {
-        let total_limbs_needed = num_crt_polys * ctx.total_limbs_per_crt_poly;
-        let num_packed_poly = total_limbs_needed.div_ceil(ctx.num_limbs_per_pack);
-        let packed_polys = circuit.input(num_packed_poly);
-        Self { ctx, packed_polys }
+        let crt_depth = ctx.crt_ctx.mont_ctxes.len();
+        let ring_dim = ctx.isolation_gadget.max_degree as usize;
+        let num_limbs_per_biguint = ctx.crt_ctx.mont_ctxes[0].num_limbs;
+        let total_num_limbs = num_crt_polys * num_limbs_per_biguint * crt_depth;
+        let num_packed_polys = total_num_limbs.div_ceil(ring_dim * crt_depth); // each packed poly has ring_dim * crt_depth slots
+        let packed_polys = circuit.input(num_packed_polys);
+        Self { ctx, num_crt_polys, packed_polys }
     }
 
     pub fn unpack(&self, circuit: &mut PolyCircuit<P>) -> Vec<CrtPoly<P>> {
+        let ctx = &self.ctx;
+        let crt_depth = ctx.crt_ctx.mont_ctxes.len();
+        let num_limbs_per_biguint = ctx.crt_ctx.mont_ctxes[0].num_limbs;
         let mut const_polys = vec![];
-        for poly in self.packed_polys.iter() {
-            let isolated = self.ctx.isolation_gadget.isolate_terms(circuit, *poly);
-            const_polys.extend(isolated);
+        for packed_poly in self.packed_polys.iter() {
+            const_polys.extend(ctx.isolation_gadget.isolate_slots(circuit, *packed_poly));
         }
-        let num_limbs_per_slot = self.ctx.crt_ctx.mont_ctxes[0].num_limbs;
+        let num_limbs_per_crt_poly = num_limbs_per_biguint * crt_depth;
         let mut crt_polys = vec![];
-
-        // Group const_polys by complete CRT polynomial sets
-        let limbs_per_crt_poly = num_limbs_per_slot * self.ctx.crt_ctx.mont_ctxes.len();
-
-        let num_crt_polys = const_polys.len() / limbs_per_crt_poly;
-
-        let mut poly_index = 0;
-        for _ in 0..num_crt_polys {
-            let mut slots = vec![];
-
-            // For each CRT slot, collect the required number of limbs
-            for mont_ctx in &self.ctx.crt_ctx.mont_ctxes {
-                let mut limbs = vec![];
-                for _ in 0..num_limbs_per_slot {
-                    limbs.push(const_polys[poly_index]);
-                    poly_index += 1;
-                }
-
-                let value = BigUintPoly::new(mont_ctx.big_uint_ctx.clone(), limbs);
-                let mont_poly = MontgomeryPoly::new(mont_ctx.clone(), value);
-                slots.push(mont_poly);
+        for crt_poly_idx in 0..self.num_crt_polys {
+            let limbs_per_crt_poly = &const_polys[crt_poly_idx * num_limbs_per_crt_poly..
+                (crt_poly_idx + 1) * num_limbs_per_crt_poly];
+            let mut crt_slots = vec![];
+            for j in 0..crt_depth {
+                let limbs = limbs_per_crt_poly
+                    [j * num_limbs_per_biguint..(j + 1) * num_limbs_per_biguint]
+                    .to_vec();
+                let value = BigUintPoly::new(ctx.crt_ctx.mont_ctxes[j].big_uint_ctx.clone(), limbs);
+                let mont_poly = MontgomeryPoly::new(ctx.crt_ctx.mont_ctxes[j].clone(), value);
+                crt_slots.push(mont_poly);
             }
-            let crt_poly = CrtPoly::new(self.ctx.crt_ctx.clone(), slots);
+            let crt_poly = CrtPoly::new(ctx.crt_ctx.clone(), crt_slots);
             crt_polys.push(crt_poly);
         }
-
         crt_polys
     }
 }
 
-pub fn biguint_to_packed_crt_polys<P: Poly>(
+pub fn u64s_to_packed_poly<P: Poly>(params: &P::Params, max_degree: usize, values: &[u64]) -> P {
+    let (_, _, crt_depth) = params.to_crt();
+    debug_assert!(values.len() <= crt_depth * max_degree);
+    debug_assert_eq!(values.len() % crt_depth, 0);
+    let mut slots = values
+        .chunks(crt_depth)
+        .map(|residues| crt_combine_residues::<P>(params, residues))
+        .collect::<Vec<_>>();
+    if slots.len() < params.ring_dimension() as usize {
+        slots.resize(params.ring_dimension() as usize, BigUint::from(0u8));
+    }
+    P::from_biguints_eval(params, &slots)
+}
+
+pub fn biguints_to_packed_crt_polys<P: Poly>(
     limb_bit_size: usize,
-    pack_bit_size: usize,
     params: &P::Params,
     inputs: &[BigUint],
 ) -> Vec<P> {
-    let all_const_polys = inputs
-        .iter()
+    let (_, _, crt_depth) = params.to_crt();
+    let ring_dim = params.ring_dimension() as usize;
+    let packed_limbs = inputs
+        .par_iter()
         .flat_map(|input| biguint_to_crt_poly::<P>(limb_bit_size, params, input))
-        .collect::<Vec<_>>();
-    debug_assert_eq!(pack_bit_size % limb_bit_size, 0);
-    let num_limbs_per_pack = pack_bit_size / limb_bit_size;
-    let mut packed_polys = vec![];
-    let mut new_packed_poly = P::const_zero(params);
-    let mut new_packed_poly_deg = 0i32;
-    for const_poly in all_const_polys.into_iter() {
-        let rotated = const_poly.rotate(params, new_packed_poly_deg);
-        new_packed_poly += rotated;
-        if new_packed_poly_deg as usize == num_limbs_per_pack - 1 {
-            new_packed_poly_deg = 0;
-            packed_polys.push(new_packed_poly);
-            new_packed_poly = P::const_zero(params);
-        } else {
-            new_packed_poly_deg += 1;
-        }
-    }
-    if new_packed_poly_deg > 0 {
-        packed_polys.push(new_packed_poly);
-    }
-    packed_polys
+        .map(|poly| {
+            if poly.coeffs()[0].value() == &BigUint::zero() {
+                0
+            } else {
+                poly.coeffs()[0].value().to_u64_digits()[0] as u64
+            }
+        })
+        .collect::<Vec<u64>>()
+        .chunks(ring_dim * crt_depth)
+        .map(|chunk| u64s_to_packed_poly(params, ring_dim, chunk))
+        .collect::<Vec<P>>();
+    debug_assert_eq!(
+        packed_limbs.len(),
+        num_packed_crt_poly::<P>(limb_bit_size, params, inputs.len())
+    );
+    packed_limbs
+}
+
+/// Combine CRT residues into a single BigUint modulo q.
+///
+/// - `residues[i]` corresponds to the residue modulo `q_i` where `(q_0, ..., q_{D-1}) = to_crt()`.
+/// - Returns the unique value in `[0, q)` satisfying `x ≡ residues[i] (mod q_i)` for all i.
+fn crt_combine_residues<P: Poly>(params: &P::Params, residues: &[u64]) -> BigUint {
+    let (moduli, _crt_bits, crt_depth) = params.to_crt();
+    assert_eq!(residues.len(), crt_depth, "residues length must match crt_depth");
+    let q_arc = params.modulus().into();
+    let q: &BigUint = q_arc.as_ref();
+
+    // Compute CRT reconstruction in parallel
+    moduli
+        .par_iter()
+        .zip(residues.par_iter())
+        .map(|(&qi, &r)| {
+            let qi_big = BigUint::from(qi);
+            let m_i = q / &qi_big;
+            let mi_mod_qi = &m_i % &qi_big;
+            let inv = mod_inverse(&mi_mod_qi, &qi_big)
+                .expect("CRT moduli must be pairwise coprime for reconstruction");
+            let c_i = (&m_i * inv) % q;
+            (BigUint::from(r) * c_i) % q
+        })
+        .reduce(|| BigUint::ZERO, |acc, term| (acc + term) % q)
+}
+
+pub fn num_packed_crt_poly<P: Poly>(
+    limb_bit_size: usize,
+    params: &P::Params,
+    num_crt_polys: usize,
+) -> usize {
+    let (_, _, crt_depth) = params.to_crt();
+    let total_crt_limbs = num_limbs_of_crt_poly::<P>(limb_bit_size, params) * num_crt_polys;
+    total_crt_limbs.div_ceil(params.ring_dimension() as usize * crt_depth)
 }
 
 #[cfg(test)]
@@ -142,8 +180,8 @@ mod tests {
     use rand::Rng;
     use std::sync::Arc;
 
-    const LIMB_BIT_SIZE: usize = 5;
-    const PACK_BIT_SIZE: usize = 15; // 3 limbs per pack
+    // todo: 1 not working
+    const LIMB_BIT_SIZE: usize = 3;
 
     // Helper function to generate a random BigUint below a given bound
     fn gen_biguint_below<R: Rng>(rng: &mut R, bound: &BigUint) -> BigUint {
@@ -166,7 +204,7 @@ mod tests {
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> (DCRTPolyParams, Arc<PackedCrtContext<DCRTPoly>>) {
         let params = DCRTPolyParams::default();
-        let ctx = Arc::new(PackedCrtContext::setup(circuit, &params, LIMB_BIT_SIZE, PACK_BIT_SIZE));
+        let ctx = Arc::new(PackedCrtContext::setup(circuit, &params, LIMB_BIT_SIZE));
         (params, ctx)
     }
 
@@ -204,8 +242,7 @@ mod tests {
         circuit.output(outputs);
 
         // Generate input values for packed polynomials
-        let input_values =
-            biguint_to_packed_crt_polys(LIMB_BIT_SIZE, PACK_BIT_SIZE, &params, &[a, b]);
+        let input_values = biguints_to_packed_crt_polys(LIMB_BIT_SIZE, &params, &[a, b]);
 
         // Evaluate the circuit
         let plt_evaluator = PolyPltEvaluator::new();
@@ -268,8 +305,7 @@ mod tests {
         circuit.output(outputs);
 
         // Generate input values for packed polynomials
-        let input_values =
-            biguint_to_packed_crt_polys(LIMB_BIT_SIZE, PACK_BIT_SIZE, &params, &[a, b]);
+        let input_values = biguints_to_packed_crt_polys(LIMB_BIT_SIZE, &params, &[a, b]);
 
         // Evaluate the circuit
         let plt_evaluator = PolyPltEvaluator::new();
@@ -331,8 +367,7 @@ mod tests {
         circuit.output(outputs);
 
         // Generate input values for packed polynomials
-        let input_values =
-            biguint_to_packed_crt_polys(LIMB_BIT_SIZE, PACK_BIT_SIZE, &params, &[a, b]);
+        let input_values = biguints_to_packed_crt_polys(LIMB_BIT_SIZE, &params, &[a, b]);
 
         // Evaluate the circuit
         let plt_evaluator = PolyPltEvaluator::new();
@@ -358,28 +393,5 @@ mod tests {
             eval_result[packed_ctx.crt_ctx.mont_ctxes.len()].coeffs()[0].value(),
             &expected_output_biguint
         );
-    }
-
-    #[test]
-    fn test_biguint_to_packed_crt_polys() {
-        let params = DCRTPolyParams::default();
-
-        // Test the helper function that converts BigUints to packed CRT polynomials
-        let a = BigUint::from(123u32);
-        let b = BigUint::from(456u32);
-
-        let packed_polys: Vec<DCRTPoly> =
-            biguint_to_packed_crt_polys(LIMB_BIT_SIZE, PACK_BIT_SIZE, &params, &[a, b]);
-
-        // The number should be reasonable based on the input size and packing parameters
-        let expected_limbs_per_input = {
-            let (moduli, crt_bits, _) = params.to_crt();
-            let num_limbs = crt_bits.div_ceil(LIMB_BIT_SIZE);
-            moduli.len() * num_limbs
-        };
-        let total_limbs: usize = 2 * expected_limbs_per_input; // for 2 inputs
-        let expected_packed_polys = total_limbs.div_ceil(PACK_BIT_SIZE / LIMB_BIT_SIZE);
-
-        assert_eq!(packed_polys.len(), expected_packed_polys);
     }
 }

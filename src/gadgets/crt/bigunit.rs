@@ -132,6 +132,11 @@ impl<P: Poly> BigUintPoly<P> {
 
     pub fn add(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
         debug_assert_eq!(self.ctx, other.ctx);
+
+        if self.ctx.limb_bit_size == 1 {
+            return self.add_single_bit(other, circuit);
+        }
+
         let (w, a, b) = if self.limbs.len() >= other.limbs.len() {
             (self.limbs.len(), &self.limbs, &other.limbs)
         } else {
@@ -178,6 +183,10 @@ impl<P: Poly> BigUintPoly<P> {
         // Parallel-prefix borrow-lookahead comparator with O(log t) depth.
         debug_assert_eq!(self.limbs.len(), other.limbs.len());
         debug_assert_eq!(self.ctx, other.ctx);
+
+        if self.ctx.limb_bit_size == 1 {
+            return self.less_than_single_bit(other, circuit);
+        }
 
         let w = self.limbs.len();
         let zero = circuit.const_zero_gate();
@@ -238,6 +247,11 @@ impl<P: Poly> BigUintPoly<P> {
         max_bit_size: Option<usize>,
     ) -> Self {
         debug_assert_eq!(self.ctx, other.ctx);
+
+        if self.ctx.limb_bit_size == 1 {
+            return self.mul_single_bit(other, circuit, max_bit_size);
+        }
+
         let max_bit_size = max_bit_size.unwrap_or(self.bit_size() + other.bit_size());
         debug_assert!(max_bit_size.is_multiple_of(self.ctx.limb_bit_size));
         let max_limbs = max_bit_size / self.ctx.limb_bit_size;
@@ -507,6 +521,89 @@ impl<P: Poly> BigUintPoly<P> {
             d <<= 1;
         }
         (gs, ps)
+    }
+
+    // Single-bit addition using basic arithmetic gates
+    fn add_single_bit(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
+        let (w, a, b) = if self.limbs.len() >= other.limbs.len() {
+            (self.limbs.len(), &self.limbs, &other.limbs)
+        } else {
+            (other.limbs.len(), &other.limbs, &self.limbs)
+        };
+
+        let zero = circuit.const_zero_gate();
+        let mut limbs = Vec::with_capacity(w + 1);
+        let mut carry = zero;
+        for i in 0..w {
+            let ai = a[i];
+            let bi = if i < b.len() { b[i] } else { zero };
+            let a_xor_b = circuit.xor_gate(ai, bi);
+            let sum = circuit.xor_gate(a_xor_b, carry);
+            let a_and_b = circuit.and_gate(ai, bi);
+            let carry_and_xor = circuit.and_gate(carry, a_xor_b);
+            carry = circuit.or_gate(a_and_b, carry_and_xor);
+
+            limbs.push(sum);
+        }
+        limbs.push(carry);
+
+        Self { ctx: self.ctx.clone(), limbs, _p: PhantomData }
+    }
+
+    // Single-bit comparison using basic arithmetic gates
+    fn less_than_single_bit(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> (GateId, Self) {
+        debug_assert_eq!(self.limbs.len(), other.limbs.len());
+        let w = self.limbs.len();
+        let zero = circuit.const_zero_gate();
+        let mut diff_limbs = Vec::with_capacity(w);
+        let mut borrow = zero;
+        for i in 0..w {
+            let a = self.limbs[i];
+            let b = other.limbs[i];
+            let a_xor_b = circuit.xor_gate(a, b);
+            let diff = circuit.xor_gate(a_xor_b, borrow);
+            let not_a = circuit.not_gate(a);
+            let not_a_and_b = circuit.and_gate(not_a, b);
+            let not_xor = circuit.not_gate(a_xor_b);
+            let borrow_and_not_xor = circuit.and_gate(borrow, not_xor);
+            borrow = circuit.or_gate(not_a_and_b, borrow_and_not_xor);
+
+            diff_limbs.push(diff);
+        }
+
+        (borrow, Self { ctx: self.ctx.clone(), limbs: diff_limbs, _p: PhantomData })
+    }
+
+    // Single-bit multiplication using basic arithmetic gates
+    fn mul_single_bit(
+        &self,
+        other: &Self,
+        circuit: &mut PolyCircuit<P>,
+        max_bit_size: Option<usize>,
+    ) -> Self {
+        let max_bit_size = max_bit_size.unwrap_or(self.bit_size() + other.bit_size());
+        let max_limbs = max_bit_size / self.ctx.limb_bit_size;
+        let zero = circuit.const_zero_gate();
+        let mut result = Self::zero(self.ctx.clone(), max_bit_size);
+        for (i, &bit) in other.limbs.iter().enumerate() {
+            let mut shifted_self = vec![zero; i];
+            shifted_self.extend(self.limbs.iter().cloned());
+
+            shifted_self.truncate(max_limbs);
+            while shifted_self.len() < max_limbs {
+                shifted_self.push(zero);
+            }
+            let shifted = Self { ctx: self.ctx.clone(), limbs: shifted_self, _p: PhantomData };
+            let mut masked_limbs = Vec::with_capacity(max_limbs);
+            for &limb in &shifted.limbs {
+                masked_limbs.push(circuit.and_gate(limb, bit));
+            }
+            let masked = Self { ctx: self.ctx.clone(), limbs: masked_limbs, _p: PhantomData };
+            result = result.add_single_bit(&masked, circuit);
+            result.limbs.truncate(max_limbs);
+        }
+
+        result
     }
 
     pub(crate) fn mul_without_cpa(

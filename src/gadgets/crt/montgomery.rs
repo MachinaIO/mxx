@@ -61,29 +61,12 @@ impl<P: Poly> MontgomeryContext<P> {
             &r_big - BigUint::one(),
             "N' (mod B) calculation failed"
         );
-
         // Create constant gates
         let mut const_n = BigUintPoly::const_u64(big_uint_ctx.clone(), circuit, n);
         // Ensure N has exactly num_limbs limbs
         const_n.limbs.resize(num_limbs, circuit.const_zero_gate());
-
         let const_r2 = BigUintPoly::const_u64(big_uint_ctx.clone(), circuit, r2);
         let const_n_prime = BigUintPoly::const_u64(big_uint_ctx.clone(), circuit, n_prime);
-
-        // // Precompute full N' modulo R as base-B digits (private)
-        // let wbits = limb_bit_size;
-        // let base = BigUint::one() << wbits;
-        // let r_big_full = BigUint::one() << (wbits * num_limbs);
-        // let n_inv_full = mod_inverse(&n_big, &r_big_full).expect("N and R must be coprime");
-        // let nprime_full_big = (&r_big_full - n_inv_full) % &r_big_full; // -N^{-1} mod R
-        // let mut nprime_full_limbs = Vec::with_capacity(num_limbs);
-        // let mut tmp = nprime_full_big.clone();
-        // for _ in 0..num_limbs {
-        //     let limb = (&tmp % &base).iter_u64_digits().next().unwrap_or(0) as u32;
-        //     nprime_full_limbs.push(circuit.const_digits_poly(&[limb]));
-        //     tmp /= &base;
-        // }
-        // let const_n_prime_full = BigUintPoly::new(big_uint_ctx.clone(), nprime_full_limbs);
 
         Self { big_uint_ctx, num_limbs, n, const_n, const_r2, const_n_prime }
     }
@@ -94,7 +77,6 @@ impl<P: Poly> MontgomeryContext<P> {
         // We need to find N' such that N * N' ≡ -1 (mod B)
         // This is equivalent to N * N' ≡ B - 1 (mod B)
         // So we find the modular inverse of N modulo B, then multiply by (B-1)
-
         let n_inv =
             mod_inverse(n, b).expect("N and B must be coprime for Montgomery multiplication");
         let minus_one = b - BigUint::one();
@@ -109,10 +91,6 @@ pub struct MontgomeryPoly<P: Poly> {
 }
 
 impl<P: Poly> MontgomeryPoly<P> {
-    pub fn limb(self) -> Vec<GateId> {
-        self.value.limbs
-    }
-
     pub fn new(ctx: Arc<MontgomeryContext<P>>, value: BigUintPoly<P>) -> Self {
         Self { ctx, value }
     }
@@ -196,8 +174,7 @@ impl<P: Poly> MontgomeryPoly<P> {
     }
 
     pub fn finalize(&self, circuit: &mut PolyCircuit<P>) -> GateId {
-        let regulared = self.to_regular(circuit);
-        regulared.finalize(circuit)
+        self.to_regular(circuit).finalize(circuit)
     }
 }
 

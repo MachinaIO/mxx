@@ -13,7 +13,6 @@ use mxx::{
     },
 };
 use num_bigint::BigUint;
-use num_traits::ToPrimitive;
 use tempfile::tempdir;
 use tokio;
 use tracing::info;
@@ -101,50 +100,37 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
 
     // this is curated to be have same CRT bit as test_arithmetic_circuit_operations
     // (crt_depth*crt_bit)
-    let params = DCRTPolyParams::new(4, 1, 62, 17);
-
-    let (moduli, _, crt_depth) = params.to_crt();
+    let params = DCRTPolyParams::new(4, 1, 34, 17);
+    let (moduli, crt_bits, crt_depth) = params.to_crt();
+    info!("crt_bits={}", crt_bits);
     assert_eq!(moduli.len(), 1, "Should have only one modulus for non-CRT");
     assert_eq!(crt_depth, 1, "CRT depth should be 1");
-
     info!("Non-CRT mode: single modulus = {}", moduli[0]);
-
     let large_a = BigUint::from(140000u64);
     let large_b = BigUint::from(132000u64);
     let large_c = BigUint::from(50000u64);
-
     let inputs = vec![large_a.clone(), large_b.clone(), large_c.clone()];
     let limb_bit_size = 1;
 
     // Test mixed operations in single circuit: (a + b) * c - a.
-    let mut circuit = ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, 3, false, true);
-    info!("Non-CRT: setup");
+    let mut mixed_circuit =
+        ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, inputs.len(), false, true);
+    let add_idx = mixed_circuit.add(ArithGateId::new(0), ArithGateId::new(1)); // a + b
+    let mul_idx = mixed_circuit.mul(add_idx, ArithGateId::new(2)); // (a + b) * c
+    let final_idx = mixed_circuit.sub(mul_idx, ArithGateId::new(0)); // (a + b) * c - a
+    mixed_circuit.output(final_idx);
 
-    let add_idx = circuit.add(ArithGateId::new(0), ArithGateId::new(1)); // a + b
-    info!("Non-CRT: add");
-    let mul_idx = circuit.mul(add_idx, ArithGateId::new(2)); // (a + b) * c
-    info!("Non-CRT: mul");
-    let final_idx = circuit.sub(mul_idx, ArithGateId::new(0)); // (a + b) * c - a
-    info!("Non-CRT: sub");
-    circuit.output(final_idx);
-
-    // Test with polynomial evaluation.
-    info!("Non-CRT: start evaluate_with_poly");
-    let mixed_poly_result = &circuit.evaluate_with_poly(&params, &inputs)[0];
-    info!("Non-CRT: end evaluate_with_poly");
-
-    let expected = ((&large_a + &large_b) * &large_c) - &large_a;
-    let single_modulus = moduli[0];
-    let expected_mod = (&expected % single_modulus).to_u64().unwrap() as usize;
-
-    info!("Expected full result: {}", expected);
-    info!("Expected result mod {}: {}", single_modulus, expected_mod);
-    info!("Actual result: {}", mixed_poly_result.to_const_int());
-
+    // Test with polynomial evaluation
+    info!("start evaluate_with_poly");
+    let mixed_poly_result = &mixed_circuit.evaluate_with_poly(&params, &inputs)[0];
+    info!("end evaluate_with_poly");
+    let mixed_expected =
+        (((&large_a + &large_b) * &large_c) - &large_a) % params.modulus().as_ref();
+    println!("coeffs {:?}", mixed_poly_result.coeffs());
     assert_eq!(
-        mixed_poly_result.to_const_int(),
-        expected_mod,
-        "Non-CRT mixed operations should be correct"
+        mixed_poly_result.coeffs()[0].value().clone(),
+        mixed_expected,
+        "Mixed operations should be correct"
     );
 
     // Test with BGG public key evaluation.
@@ -155,7 +141,7 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
     let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(&params, d + 1);
 
     info!("Non-CRT: start evaluate_with_bgg_pubkey");
-    let mixed_pubkey_result = circuit.evaluate_with_bgg_pubkey::<
+    let mixed_pubkey_result = mixed_circuit.evaluate_with_bgg_pubkey::<
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
         DCRTPolyTrapdoorSampler,
@@ -176,7 +162,7 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
     let p = s.clone() * &pub_matrix;
 
     info!("Non-CRT: start evaluate_with_bgg_encoding");
-    let mixed_encoding_result = circuit.evaluate_with_bgg_encoding::<
+    let mixed_encoding_result = mixed_circuit.evaluate_with_bgg_encoding::<
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
         DCRTPolyUniformSampler,

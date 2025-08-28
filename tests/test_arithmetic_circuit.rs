@@ -99,9 +99,9 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
 
     // this is curated to be have same CRT bit as test_arithmetic_circuit_operations
     // (crt_depth*crt_bit)
-    let params = DCRTPolyParams::new(4, 1, 56, 17);
-    let (moduli, crt_bits, crt_depth) = params.to_crt();
-    info!("crt_bits={}", crt_bits);
+    let params = DCRTPolyParams::new(4, 1, 62, 17);
+
+    let (moduli, _, crt_depth) = params.to_crt();
     assert_eq!(moduli.len(), 1, "Should have only one modulus for non-CRT");
     assert_eq!(crt_depth, 1, "CRT depth should be 1");
     info!("Non-CRT mode: single modulus = {}", moduli[0]);

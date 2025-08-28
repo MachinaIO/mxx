@@ -2,11 +2,10 @@ use crate::{
     circuit::PolyCircuit,
     gadgets::{
         crt::{CrtContext, CrtPoly},
-        isolate::IsolationGadget,
+        packed_crt::{PackedCrtContext, PackedCrtPoly},
     },
     poly::Poly,
 };
-use num_bigint::BigUint;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,54 +36,55 @@ impl From<ArithGateId> for usize {
 #[derive(Clone)]
 pub struct ArithmeticCircuit<P: Poly> {
     pub limb_bit_size: usize,
-    pub num_limbs: usize,
-    pub packed_limbs: usize,
     pub num_inputs: usize,
     pub poly_circuit: PolyCircuit<P>,
     pub ctx: Arc<CrtContext<P>>,
+    pub use_packing: bool,
     pub use_reconstruction: bool,
     // inputs + intermediate results
     pub all_values: Vec<CrtPoly<P>>,
 }
 
 impl<P: Poly> ArithmeticCircuit<P> {
-    pub fn to_poly_circuit(&mut self, isolate_gadget: IsolationGadget<P>) {
-        let input_gates = self.poly_circuit.input(self.num_inputs);
-        let mut decomposed_outputs = Vec::with_capacity(input_gates.len() * self.packed_limbs);
-        for g in input_gates {
-            let isolated = isolate_gadget.isolate_terms(&mut self.poly_circuit, g);
-            decomposed_outputs.extend(isolated);
-        }
-        self.poly_circuit.output(decomposed_outputs);
-    }
-
     pub fn setup(
         params: &<P as Poly>::Params,
-        num_limbs: usize,
         limb_bit_size: usize,
-        packed_limbs: usize,
-        inputs: &[BigUint],
+        num_inputs: usize,
+        use_packing: bool,
         use_reconstruction: bool,
     ) -> Self {
-        let num_inputs = inputs.len();
         let mut poly_circuit = PolyCircuit::<P>::new();
-        let ctx = Arc::new(CrtContext::setup(&mut poly_circuit, params, limb_bit_size));
-        let mut crt_inputs = Vec::with_capacity(num_inputs);
-        for _ in 0..num_inputs {
-            let crt_poly = CrtPoly::input(ctx.clone(), &mut poly_circuit);
-            crt_inputs.push(crt_poly);
-        }
+        let mut all_values = Vec::with_capacity(num_inputs);
+        let ctx: Arc<CrtContext<P>> = if use_packing {
+            let pack_ctx =
+                Arc::new(PackedCrtContext::setup(&mut poly_circuit, params, limb_bit_size));
+            let packed_inputs =
+                PackedCrtPoly::input(pack_ctx.clone(), &mut poly_circuit, num_inputs);
+            let crt_polys = packed_inputs.unpack(&mut poly_circuit);
+            all_values.extend(crt_polys);
+            pack_ctx.crt_ctx.clone()
+        } else {
+            let ctx = Arc::new(CrtContext::setup(&mut poly_circuit, params, limb_bit_size));
+            let crt_polys = (0..num_inputs)
+                .map(|_| CrtPoly::input(ctx.clone(), &mut poly_circuit))
+                .collect::<Vec<_>>();
+            all_values.extend(crt_polys);
+            ctx
+        };
 
         ArithmeticCircuit {
             limb_bit_size,
-            num_limbs,
-            packed_limbs,
             num_inputs,
             poly_circuit,
             ctx,
+            use_packing,
             use_reconstruction,
-            all_values: crt_inputs,
+            all_values,
         }
+    }
+
+    pub fn to_poly_circuit(self) -> PolyCircuit<P> {
+        self.poly_circuit
     }
 
     /// lhs + rhs

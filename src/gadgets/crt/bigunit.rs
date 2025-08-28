@@ -327,7 +327,9 @@ pub fn u64_to_biguint_poly<P: Poly>(
         remaining_value /= base;
     }
     if let Some(num_limbs) = num_limbs {
-        limbs.extend(vec![P::const_zero(params); num_limbs - limbs.len()]);
+        if limbs.len() < num_limbs {
+            limbs.extend(vec![P::const_zero(params); num_limbs - limbs.len()]);
+        }
     }
     limbs
 }
@@ -463,6 +465,7 @@ impl<P: Poly> BigUintPoly<P> {
         sum_vec.truncate(w);
         // Precompute t_k = S_k + C_k
         let zero = circuit.const_zero_gate();
+        let one = circuit.const_one_gate();
         let mut ss = Vec::with_capacity(w);
         let mut gs = Vec::with_capacity(w);
         let mut ps = Vec::with_capacity(w);
@@ -472,7 +475,7 @@ impl<P: Poly> BigUintPoly<P> {
             let s = circuit.public_lookup_gate(t, lut_ids.0);
             let g = circuit.public_lookup_gate(t, lut_ids.1);
             // p = 1 iff s == B-1 <=> floor((s + 1)/B) = 1
-            let s_plus = circuit.add_gate(s, GateId(0));
+            let s_plus = circuit.add_gate(s, one);
             let p = circuit.public_lookup_gate(s_plus, lut_ids.1);
             ss.push(s);
             gs.push(g);
@@ -532,29 +535,29 @@ impl<P: Poly> BigUintPoly<P> {
         };
 
         let zero = circuit.const_zero_gate();
-        
+
         let mut gs = Vec::with_capacity(w);
         let mut ps = Vec::with_capacity(w);
         let mut sums = Vec::with_capacity(w);
-        
+
         for i in 0..w {
             let ai = a[i];
             let bi = if i < b.len() { b[i] } else { zero };
-            
+
             // g_i = a_i AND b_i (generate: both bits are 1).
             let g = circuit.and_gate(ai, bi);
-            
+
             // p_i = a_i XOR b_i (propagate: exactly one bit is 1).
             let p = circuit.xor_gate(ai, bi);
-            
+
             gs.push(g);
             ps.push(p);
             sums.push(p); // Store XOR for sum computation later.
         }
-        
+
         // Use parallel-prefix to compute carry prefixes.
         let (g_pref, _) = Self::prefix_gp(circuit, &gs, &ps);
-        
+
         // Compute final sum bits using carries.
         let mut limbs = Vec::with_capacity(w + 1);
         for i in 0..w {
@@ -562,7 +565,7 @@ impl<P: Poly> BigUintPoly<P> {
             let sum = circuit.xor_gate(sums[i], carry_in);
             limbs.push(sum);
         }
-        
+
         // Final carry out.
         let final_carry = if w == 0 { zero } else { g_pref[w - 1] };
         limbs.push(final_carry);
@@ -578,27 +581,27 @@ impl<P: Poly> BigUintPoly<P> {
         let mut gs = Vec::with_capacity(w);
         let mut ps = Vec::with_capacity(w);
         let mut xors = Vec::with_capacity(w);
-        
+
         for i in 0..w {
             let a = self.limbs[i];
             let b = other.limbs[i];
-            
+
             // g_i = !a_i AND b_i (borrow generate: a < b).
             let not_a = circuit.not_gate(a);
             let g = circuit.and_gate(not_a, b);
-            
+
             // p_i = !(a_i XOR b_i) (borrow propagate: a == b).
             let xor_ab = circuit.xor_gate(a, b);
             let p = circuit.not_gate(xor_ab);
-            
+
             gs.push(g);
             ps.push(p);
             xors.push(xor_ab); // Store XOR for difference computation later.
         }
-        
+
         // Use parallel-prefix to compute borrow prefixes.
         let (g_pref, _) = Self::prefix_gp(circuit, &gs, &ps);
-        
+
         // Compute final difference bits using borrows.
         let mut diff_limbs = Vec::with_capacity(w);
         for i in 0..w {
@@ -606,7 +609,7 @@ impl<P: Poly> BigUintPoly<P> {
             let diff = circuit.xor_gate(xors[i], borrow_in);
             diff_limbs.push(diff);
         }
-        
+
         // Final borrow out indicates less than.
         let final_borrow = if w == 0 { zero } else { g_pref[w - 1] };
 
@@ -623,10 +626,10 @@ impl<P: Poly> BigUintPoly<P> {
         let max_bit_size = max_bit_size.unwrap_or(self.bit_size() + other.bit_size());
         let max_limbs = max_bit_size / self.ctx.limb_bit_size;
         let zero = circuit.const_zero_gate();
-        
+
         // Collect all partial products.
         let mut partial_products = Vec::new();
-        
+
         for (i, &bit) in other.limbs.iter().enumerate() {
             // Create shifted version of self.
             let mut shifted_self = vec![zero; i];
@@ -635,16 +638,20 @@ impl<P: Poly> BigUintPoly<P> {
             while shifted_self.len() < max_limbs {
                 shifted_self.push(zero);
             }
-            
+
             // Mask with the current bit.
             let mut masked_limbs = Vec::with_capacity(max_limbs);
             for &limb in &shifted_self {
                 masked_limbs.push(circuit.and_gate(limb, bit));
             }
-            
-            partial_products.push(Self { ctx: self.ctx.clone(), limbs: masked_limbs, _p: PhantomData });
+
+            partial_products.push(Self {
+                ctx: self.ctx.clone(),
+                limbs: masked_limbs,
+                _p: PhantomData,
+            });
         }
-        
+
         // Use tree reduction with our parallel-prefix adder.
         // This gives us O(log n * log w) depth where n is the number of bits in other.
         let mut products = partial_products;
@@ -656,7 +663,11 @@ impl<P: Poly> BigUintPoly<P> {
                     let sum = products[i].add_single_bit(&products[i + 1], circuit);
                     let mut truncated_limbs = sum.limbs;
                     truncated_limbs.truncate(max_limbs);
-                    next_level.push(Self { ctx: self.ctx.clone(), limbs: truncated_limbs, _p: PhantomData });
+                    next_level.push(Self {
+                        ctx: self.ctx.clone(),
+                        limbs: truncated_limbs,
+                        _p: PhantomData,
+                    });
                     i += 2;
                 } else {
                     next_level.push(products[i].clone());
@@ -665,7 +676,7 @@ impl<P: Poly> BigUintPoly<P> {
             }
             products = next_level;
         }
-        
+
         products.into_iter().next().unwrap_or_else(|| Self::zero(self.ctx.clone(), max_bit_size))
     }
 
@@ -703,7 +714,8 @@ mod tests {
     use std::sync::Arc;
 
     const INPUT_BIT_SIZE: usize = 20;
-    const LIMB_BIT_SIZE: usize = 5;
+    // LIMB_BIT_SIZE for both 1 and 5 works
+    const LIMB_BIT_SIZE: usize = 1;
     const LIMB_LEN: usize = INPUT_BIT_SIZE / LIMB_BIT_SIZE;
 
     fn create_test_context(
@@ -743,7 +755,7 @@ mod tests {
             expected_sum /= 1u32 << ctx.limb_bit_size;
         }
 
-        assert_eq!(eval_result.len(), 5);
+        assert_eq!(eval_result.len(), LIMB_LEN + 1);
 
         for i in 0..eval_result.len() {
             let coeffs = eval_result[i].coeffs();
@@ -1063,10 +1075,18 @@ mod tests {
 
         // Create BigUints with different limb sizes
         let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let a = u64_to_biguint_poly(ctx.limb_bit_size, &params, 100, Some(LIMB_LEN));
-        let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, 2 * LIMB_BIT_SIZE);
-        let b_limb_len = (2 * LIMB_BIT_SIZE) / ctx.limb_bit_size;
-        let b = u64_to_biguint_poly(ctx.limb_bit_size, &params, 50, Some(b_limb_len));
+        // Choose a value that fits within INPUT_BIT_SIZE
+        let a_value = 100u64.min((1u64 << INPUT_BIT_SIZE) - 1);
+        let a = u64_to_biguint_poly(ctx.limb_bit_size, &params, a_value, Some(LIMB_LEN));
+
+        // For big_b, we're using a smaller bit size
+        let b_bit_size = 2 * LIMB_BIT_SIZE;
+        let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, b_bit_size);
+        let b_limb_len = b_bit_size / ctx.limb_bit_size;
+        // Choose a value that fits within b_bit_size
+        let b_value = 50u64.min((1u64 << b_bit_size) - 1);
+        let b = u64_to_biguint_poly(ctx.limb_bit_size, &params, b_value, Some(b_limb_len));
+
         let result = big_a.add(&big_b, &mut circuit);
         circuit.output(result.limbs.clone());
 
@@ -1078,7 +1098,7 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        let mut expected_sum = 100u32 + 50u32;
+        let mut expected_sum = (a_value + b_value) as u32;
         let mut expected_limbs = vec![0; LIMB_LEN + 1];
         for i in 0..LIMB_LEN + 1 {
             if expected_sum == 0 {
@@ -1103,10 +1123,18 @@ mod tests {
 
         // Create BigUints with different limb sizes
         let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let a = u64_to_biguint_poly(ctx.limb_bit_size, &params, 100, Some(LIMB_LEN));
-        let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, 2 * LIMB_BIT_SIZE);
-        let b_limb_len = (2 * LIMB_BIT_SIZE) / ctx.limb_bit_size;
-        let b = u64_to_biguint_poly(ctx.limb_bit_size, &params, 50, Some(b_limb_len));
+        // Choose a value that fits within INPUT_BIT_SIZE
+        let a_value = 100u64.min((1u64 << INPUT_BIT_SIZE) - 1);
+        let a = u64_to_biguint_poly(ctx.limb_bit_size, &params, a_value, Some(LIMB_LEN));
+
+        // For big_b, we're using a smaller bit size
+        let b_bit_size = 2 * LIMB_BIT_SIZE;
+        let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, b_bit_size);
+        let b_limb_len = b_bit_size / ctx.limb_bit_size;
+        // Choose a value that fits within b_bit_size
+        let b_value = 50u64.min((1u64 << b_bit_size) - 1);
+        let b = u64_to_biguint_poly(ctx.limb_bit_size, &params, b_value, Some(b_limb_len));
+
         let result = big_a.mul(&big_b, &mut circuit, None);
         circuit.output(result.limbs.clone());
 
@@ -1118,8 +1146,8 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        let mut expected_product = 100u32 * 50u32;
-        let output_limb_len = (INPUT_BIT_SIZE + 10) / LIMB_BIT_SIZE; // a bit size + b bit size
+        let mut expected_product = (a_value * b_value) as u32;
+        let output_limb_len = (INPUT_BIT_SIZE + b_bit_size) / LIMB_BIT_SIZE;
         let mut expected_limbs = vec![0; output_limb_len];
         for i in 0..output_limb_len {
             if expected_product == 0 {
@@ -1338,7 +1366,6 @@ mod tests {
 
         assert_eq!(actual, expected, "Single-bit addition should produce correct result");
     }
-
 
     #[test]
     fn test_single_bit_less_than() {

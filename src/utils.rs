@@ -145,7 +145,7 @@ pub fn random_bgg_encodings(
     let reveal_plaintexts = vec![true; input_size + 1];
     let bgg_encoding_sampler = BGGEncodingSampler::new(params, &secrets, uniform_sampler, 0.0);
     let pubkeys = bgg_pubkey_sampler.sample(params, &tag_bytes, &reveal_plaintexts);
-    bgg_encoding_sampler.sample(params, &pubkeys, &plaintexts)
+    bgg_encoding_sampler.sample(params, &pubkeys, &plaintexts, false)
 }
 
 pub fn timed_read<T, F: FnOnce() -> T>(label: &str, f: F, total: &mut Duration) -> T {

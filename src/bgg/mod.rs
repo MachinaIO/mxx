@@ -81,8 +81,8 @@ mod tests {
         let secrets = vec![create_bit_random_poly(&params); d];
         let plaintexts = vec![DCRTPoly::const_one(&params); packed_input_size];
         let bgg_sampler = BGGEncodingSampler::new(&params, &secrets, uniform_sampler, 0.0);
-        let bgg_encodings = bgg_sampler.sample(&params, &sampled_pub_keys, &plaintexts);
-        let g = DCRTPolyMatrix::gadget_matrix(&params, d + 1);
+        let bgg_encodings = bgg_sampler.sample(&params, &sampled_pub_keys, &plaintexts, false);
+        let g = DCRTPolyMatrix::gadget_matrix(&params, d);
         assert_eq!(bgg_encodings.len(), packed_input_size + 1);
         assert_eq!(
             bgg_encodings[0].vector,
@@ -114,7 +114,7 @@ mod tests {
         let plaintexts = vec![create_random_poly(&params); packed_input_size];
         // TODO: set the standard deviation to a non-zero value
         let bgg_sampler = BGGEncodingSampler::new(&params, &secrets, uniform_sampler, 0.0);
-        let bgg_encodings = bgg_sampler.sample(&params, &sampled_pub_keys, &plaintexts);
+        let bgg_encodings = bgg_sampler.sample(&params, &sampled_pub_keys, &plaintexts, false);
 
         for pair in bgg_encodings[1..].chunks(2) {
             if let [a, b] = pair {
@@ -124,7 +124,7 @@ mod tests {
                     addition.clone().plaintext.unwrap(),
                     a.plaintext.clone().unwrap() + b.plaintext.clone().unwrap()
                 );
-                let g = DCRTPolyMatrix::gadget_matrix(&params, d + 1);
+                let g = DCRTPolyMatrix::gadget_matrix(&params, d);
                 assert_eq!(addition.vector, a.clone().vector + b.clone().vector);
                 assert_eq!(
                     addition.vector,
@@ -150,7 +150,7 @@ mod tests {
         let secrets = vec![create_bit_random_poly(&params); d];
         let plaintexts = vec![create_random_poly(&params); packed_input_size];
         let bgg_sampler = BGGEncodingSampler::new(&params, &secrets, uniform_sampler, 0.0);
-        let bgg_encodings = bgg_sampler.sample(&params, &sampled_pub_keys, &plaintexts);
+        let bgg_encodings = bgg_sampler.sample(&params, &sampled_pub_keys, &plaintexts, false);
 
         for pair in bgg_encodings[1..].chunks(2) {
             if let [a, b] = pair {
@@ -160,7 +160,7 @@ mod tests {
                     multiplication.clone().plaintext.unwrap(),
                     a.clone().plaintext.unwrap() * b.clone().plaintext.unwrap()
                 );
-                let g = DCRTPolyMatrix::gadget_matrix(&params, d + 1);
+                let g = DCRTPolyMatrix::gadget_matrix(&params, d);
                 assert_eq!(
                     multiplication.vector,
                     (bgg_sampler.secret_vec.clone() *

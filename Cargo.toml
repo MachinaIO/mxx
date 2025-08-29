@@ -15,7 +15,7 @@ dashmap = "6.1.0"
 serde_json = "1.0"
 libc = { version = "0.2", optional = true }
 memmap2 = { version = "0.9.5", optional = true }
-openfhe = { git = "https://github.com/MachinaIO/openfhe-rs.git" }
+openfhe = { git = "https://github.com/MachinaIO/openfhe-rs.git", branch = "feat/ternary" }
 num-bigint = { version = "0.4.6", features = ["serde", "rand"] }
 num-traits = "0.2.19"
 rayon = { version = "1.5" }

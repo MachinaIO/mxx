@@ -106,7 +106,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
                 .collect()
         };
         let pubkeys = self.sample_input_pubkeys::<M, SH>(params, seed, secret.len());
-        let encodings = bgg_encoding_sampler.sample(params, &pubkeys, &plaintexts);
+        let encodings = bgg_encoding_sampler.sample(params, &pubkeys, &plaintexts, false);
         let bgg_evaluator = LweBggEncodingPltEvaluator::<M, SH>::new(seed, dir_path, p);
 
         self.poly_circuit.eval(params, &encodings[0], &encodings[1..], Some(bgg_evaluator))

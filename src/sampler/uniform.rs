@@ -46,6 +46,11 @@ impl PolyUniformSampler for DCRTPolyUniformSampler {
                 params.crt_depth(),
                 params.crt_bits(),
             ),
+            DistType::TernaryDist => ffi::DCRTPolyGenFromTug(
+                params.ring_dimension(),
+                params.crt_depth(),
+                params.crt_bits(),
+            ),
         };
         if sampled_poly.is_null() {
             panic!("Attempted to dereference a null pointer");
@@ -98,9 +103,35 @@ impl PolyUniformSampler for DCRTPolyUniformSampler {
 
 #[cfg(test)]
 mod tests {
+    use num_bigint::BigUint;
+
     use crate::poly::dcrt::params::DCRTPolyParams;
 
     use super::*;
+
+    #[test]
+    fn test_ternary_dist_values() {
+        // Test that TernaryDist actually produces values in {-1, 0, 1}
+        let params = DCRTPolyParams::default();
+        let sampler = DCRTPolyUniformSampler::new();
+
+        // Sample a small matrix to check values
+        let matrix = sampler.sample_uniform(&params, 1, 1, DistType::TernaryDist);
+        let poly = matrix.entry(0, 0);
+        let coeffs = poly.coeffs();
+
+        // Verify each coefficient is in {-1, 0, 1}
+        for coeff in coeffs.iter() {
+            let value = coeff.value.clone();
+            assert!(
+                value == BigUint::ZERO ||
+                    value == BigUint::from(1u32) ||
+                    value == params.modulus().as_ref() - BigUint::from(1u32),
+                "Coefficient value {:?} is not in {{-1, 0, 1}}",
+                value
+            );
+        }
+    }
 
     #[test]
     fn test_ring_dist() {

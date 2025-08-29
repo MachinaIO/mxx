@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use keccak_asm::Keccak256;
 use mxx::{
     arithmetic::circuit::{ArithGateId, ArithmeticCircuit},
@@ -59,13 +61,15 @@ async fn test_arithmetic_circuit_operations() {
     let d = 1;
     let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, 1.0);
     let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(&params, d + 1);
+    let trapdoor = Arc::new(trapdoor);
+    let pub_matrix = Arc::new(pub_matrix);
     info!("start evaluate_with_bgg_pubkey");
     let mixed_pubkey_result = mixed_circuit.evaluate_with_bgg_pubkey::<
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
         DCRTPolyTrapdoorSampler,
         DCRTPolyUniformSampler,
-    >(&params,  seed, tmp_dir.path().to_path_buf(), d, pub_matrix.clone(), trapdoor, trapdoor_sampler.clone()).await;
+    >(&params,  seed, tmp_dir.path().to_path_buf(), d, pub_matrix.clone(),  trapdoor.clone(), trapdoor_sampler.clone()).await;
     info!("end evaluate_with_bgg_pubkey");
     assert_eq!(mixed_pubkey_result.len(), 1);
     // Test with BGG encoding evaluation
@@ -77,7 +81,7 @@ async fn test_arithmetic_circuit_operations() {
         secrets.push(minus_one_poly);
         DCRTPolyMatrix::from_poly_vec_row(&params, secrets)
     };
-    let p = s.clone() * &pub_matrix;
+    let p = s.clone() * pub_matrix.as_ref();
     info!("start evaluate_with_bgg_encoding");
     let mixed_encoding_result = mixed_circuit.evaluate_with_bgg_encoding::<
         DCRTPolyMatrix,
@@ -138,14 +142,15 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
     let d = 1;
     let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, 1.0);
     let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(&params, d + 1);
-
-    info!("Non-CRT: start evaluate_with_bgg_pubkey");
+    let trapdoor = Arc::new(trapdoor);
+    let pub_matrix = Arc::new(pub_matrix);
+    info!("start evaluate_with_bgg_pubkey");
     let mixed_pubkey_result = mixed_circuit.evaluate_with_bgg_pubkey::<
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
         DCRTPolyTrapdoorSampler,
         DCRTPolyUniformSampler,
-    >(&params, seed, tmp_dir.path().to_path_buf(), d, pub_matrix.clone(), trapdoor, trapdoor_sampler.clone()).await;
+    >(&params,  seed, tmp_dir.path().to_path_buf(), d, pub_matrix.clone(),  trapdoor.clone(), trapdoor_sampler.clone()).await;
     info!("Non-CRT: end evaluate_with_bgg_pubkey");
     assert_eq!(mixed_pubkey_result.len(), 1);
 
@@ -158,7 +163,7 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
         secrets.push(minus_one_poly);
         DCRTPolyMatrix::from_poly_vec_row(&params, secrets)
     };
-    let p = s.clone() * &pub_matrix;
+    let p = s.clone() * pub_matrix.as_ref();
 
     info!("Non-CRT: start evaluate_with_bgg_encoding");
     let mixed_encoding_result = mixed_circuit.evaluate_with_bgg_encoding::<

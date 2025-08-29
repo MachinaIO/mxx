@@ -275,7 +275,7 @@ mod test {
         let reveal_plaintexts = vec![true; input_size + 1];
         let bgg_encoding_sampler = BGGEncodingSampler::new(&params, &secrets, uniform_sampler, 0.0);
         let pubkeys = bgg_pubkey_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
-        let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &plaintexts);
+        let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &plaintexts, false);
         let enc_one = encodings[0].clone();
         let enc1 = encodings[1].clone();
 

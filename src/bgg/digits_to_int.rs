@@ -167,7 +167,7 @@ mod tests {
 
         // Create encoding sampler and encodings
         let bgg_encoding_sampler = BGGEncodingSampler::new(&params, &secrets, uniform_sampler, 0.0);
-        let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &plaintexts);
+        let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &plaintexts, false);
 
         // Extract digit encodings (skip the first one which is the one encoding)
         let digit_encodings: Vec<BggEncoding<DCRTPolyMatrix>> =
@@ -205,7 +205,7 @@ mod tests {
 
         // Create encoding sampler and encodings
         let bgg_encoding_sampler = BGGEncodingSampler::new(&params, &secrets, uniform_sampler, 0.0);
-        let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &plaintexts);
+        let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &plaintexts, false);
 
         // Extract digit encodings (skip the first one which is the one encoding)
         let digit_encodings: Vec<BggEncoding<DCRTPolyMatrix>> =

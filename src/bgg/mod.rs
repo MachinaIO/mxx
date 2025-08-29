@@ -82,7 +82,7 @@ mod tests {
         let plaintexts = vec![DCRTPoly::const_one(&params); packed_input_size];
         let bgg_sampler = BGGEncodingSampler::new(&params, &secrets, uniform_sampler, 0.0);
         let bgg_encodings = bgg_sampler.sample(&params, &sampled_pub_keys, &plaintexts);
-        let g = DCRTPolyMatrix::gadget_matrix(&params, d + 1);
+        let g = DCRTPolyMatrix::gadget_matrix(&params, d);
         assert_eq!(bgg_encodings.len(), packed_input_size + 1);
         assert_eq!(
             bgg_encodings[0].vector,
@@ -124,7 +124,7 @@ mod tests {
                     addition.clone().plaintext.unwrap(),
                     a.plaintext.clone().unwrap() + b.plaintext.clone().unwrap()
                 );
-                let g = DCRTPolyMatrix::gadget_matrix(&params, d + 1);
+                let g = DCRTPolyMatrix::gadget_matrix(&params, d);
                 assert_eq!(addition.vector, a.clone().vector + b.clone().vector);
                 assert_eq!(
                     addition.vector,
@@ -160,7 +160,7 @@ mod tests {
                     multiplication.clone().plaintext.unwrap(),
                     a.clone().plaintext.unwrap() * b.clone().plaintext.unwrap()
                 );
-                let g = DCRTPolyMatrix::gadget_matrix(&params, d + 1);
+                let g = DCRTPolyMatrix::gadget_matrix(&params, d);
                 assert_eq!(
                     multiplication.vector,
                     (bgg_sampler.secret_vec.clone() *

@@ -280,11 +280,8 @@ mod test {
         let enc1 = encodings[1].clone();
 
         let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
-        let (b_trapdoor, b) = trapdoor_sampler.trapdoor(&params, d + 1);
-        let s_vec = DCRTPolyMatrix::from_poly_vec_row(
-            &params,
-            vec![secrets, vec![DCRTPoly::const_minus_one(&params)]].concat(),
-        );
+        let (b_trapdoor, b) = trapdoor_sampler.trapdoor(&params, d);
+        let s_vec = DCRTPolyMatrix::from_poly_vec_row(&params, secrets);
         let c_b = s_vec.clone() * &b;
 
         // Create a public key evaluator
@@ -331,7 +328,7 @@ mod test {
         assert_eq!(result_encoding.plaintext.clone().unwrap(), expected_plaintext);
         let expected_vector = s_vec.clone() *
             (result_encoding.pubkey.matrix.clone() -
-                (DCRTPolyMatrix::gadget_matrix(&params, d + 1) * expected_plaintext));
+                (DCRTPolyMatrix::gadget_matrix(&params, d) * expected_plaintext));
         assert_eq!(result_encoding.vector, expected_vector);
     }
 }

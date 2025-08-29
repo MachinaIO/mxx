@@ -9,6 +9,7 @@ use crate::{
     poly::{Poly, PolyParams},
     utils::mod_inverse,
 };
+use itertools::Itertools;
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 use std::sync::Arc;
@@ -22,39 +23,32 @@ pub struct CrtContext<P: Poly> {
 
 impl<P: Poly> CrtContext<P> {
     pub fn setup(circuit: &mut PolyCircuit<P>, params: &P::Params, limb_bit_size: usize) -> Self {
-        let (moduli, crt_bits, _crt_depth) = params.to_crt();
+        let (moduli, crt_bits, _) = params.to_crt();
         let num_limbs = crt_bits.div_ceil(limb_bit_size);
-        let mont_ctxes = moduli
+        let total_modulus: Arc<BigUint> = params.modulus().into();
+
+        let (mont_ctxes, q_over_qis, reconstruct_coeffs): (Vec<_>, Vec<_>, Vec<_>) = moduli
             .iter()
-            .map(|modulus| {
-                Arc::new(MontgomeryContext::setup(
+            .map(|&modulus| {
+                let mont_ctx = Arc::new(MontgomeryContext::setup(
                     circuit,
                     params,
                     limb_bit_size,
                     num_limbs,
-                    *modulus,
-                ))
-            })
-            .collect();
+                    modulus,
+                ));
 
-        let total_modulus: Arc<BigUint> = params.modulus().into();
-        let q_over_qis: Vec<BigUint> =
-            moduli.iter().map(|modulus| total_modulus.as_ref() / BigUint::from(*modulus)).collect();
-
-        // Compute CRT reconstruction coefficients: c_i = M_i * inv(M_i mod q_i, q_i) mod q
-        // where M_i = q / q_i
-        let reconstruct_coeffs: Vec<BigUint> = moduli
-            .iter()
-            .enumerate()
-            .map(|(i, &qi)| {
-                let qi_big = BigUint::from(qi);
-                let m_i = &q_over_qis[i];
-                let m_i_mod_qi = m_i % &qi_big;
-                let inv = mod_inverse(&m_i_mod_qi, &qi_big)
+                let modulus_big = BigUint::from(modulus);
+                let q_over_qi = total_modulus.as_ref() / &modulus_big;
+                // Compute CRT reconstruction coefficient: c_i = M_i * inv(M_i mod q_i, q_i) mod q.
+                let m_i_mod_qi = &q_over_qi % &modulus_big;
+                let inv = mod_inverse(&m_i_mod_qi, &modulus_big)
                     .expect("Moduli must be coprime for CRT reconstruction");
-                (m_i * inv) % total_modulus.as_ref()
+                let reconstruct_coeff = (&q_over_qi * inv) % total_modulus.as_ref();
+
+                (mont_ctx, q_over_qi, reconstruct_coeff)
             })
-            .collect();
+            .multiunzip();
 
         Self { mont_ctxes, q_over_qis, reconstruct_coeffs }
     }
@@ -71,18 +65,11 @@ impl<P: Poly> CrtPoly<P> {
         Self { ctx, slots }
     }
 
-    /// Returns all limbs from all slots sequentially as a Vec<GateId>.
-    pub fn limb(&self) -> Vec<GateId> {
-        self.slots.iter().flat_map(|slot| slot.value.limbs.clone()).collect()
-    }
-
     /// Allocate input polynomials for a CrtPoly
     pub fn input(ctx: Arc<CrtContext<P>>, circuit: &mut PolyCircuit<P>) -> Self {
-        // let crted_inputs = input.as_ref().map(|input| biguint_to_crt_slots::<P>(params, input));
         let mut slots = vec![];
         for mont_ctx in &ctx.mont_ctxes {
-            let mont_poly = MontgomeryPoly::input(mont_ctx.clone(), circuit);
-            slots.push(mont_poly);
+            slots.push(MontgomeryPoly::input(mont_ctx.clone(), circuit));
         }
         Self { ctx, slots }
     }

@@ -19,7 +19,7 @@ use crate::{
     storage::{init_storage_system, wait_for_all_writes},
 };
 use num_bigint::BigUint;
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 use tracing::info;
 
 const TAG_BGG_PUBKEY: &[u8] = b"BGG_PUBKEY";
@@ -49,8 +49,8 @@ impl<P: Poly> ArithmeticCircuit<P> {
         seed: [u8; 32],
         dir_path: PathBuf,
         d: usize,
-        pub_matrix: M,
-        trapdoor: ST::Trapdoor,
+        pub_matrix: Arc<M>,
+        trapdoor: Arc<ST::Trapdoor>,
         trapdoor_sampler: ST,
     ) -> Vec<BggPublicKey<M>>
     where
@@ -66,8 +66,8 @@ impl<P: Poly> ArithmeticCircuit<P> {
             Some(LweBggPubKeyEvaluator::<M, SH, ST>::new(
                 seed,
                 trapdoor_sampler,
-                std::sync::Arc::new(pub_matrix),
-                std::sync::Arc::new(trapdoor),
+                pub_matrix.clone(),
+                trapdoor.clone(),
                 dir_path,
             ))
         } else {

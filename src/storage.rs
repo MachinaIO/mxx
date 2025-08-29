@@ -1,7 +1,7 @@
 use crate::{
     matrix::PolyMatrix,
     poly::Poly,
-    utils::{block_size, log_mem},
+    utils::{block_size, debug_mem, log_mem},
 };
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::{
@@ -73,7 +73,7 @@ where
         id, block_size_val, row_range.start, row_range.end, col_range.start, col_range.end
     );
     let elapsed = start.elapsed();
-    log_mem(format!("Serialized matrix {} len {} bytes in {elapsed:?}", id, data.len()));
+    debug_mem(format!("Serialized matrix {} len {} bytes in {elapsed:?}", id, data.len()));
     SerializedMatrix { id: id.to_string(), filename, data }
 }
 

@@ -94,9 +94,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
         SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
         SU: PolyUniformSampler<M = M> + Send + Sync,
     {
-        let uniform_sampler = SU::new();
-        let bgg_encoding_sampler =
-            BGGEncodingSampler::new(params, secret, uniform_sampler, error_sigma);
+        let bgg_encoding_sampler = BGGEncodingSampler::<SU>::new(params, secret, Some(error_sigma));
         let plaintexts = if self.use_packing {
             biguints_to_packed_crt_polys(self.limb_bit_size, params, inputs)
         } else {
@@ -106,7 +104,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
                 .collect()
         };
         let pubkeys = self.sample_input_pubkeys::<M, SH>(params, seed, secret.len());
-        let encodings = bgg_encoding_sampler.sample(params, &pubkeys, &plaintexts, false);
+        let encodings = bgg_encoding_sampler.sample(params, &pubkeys, &plaintexts);
         let bgg_evaluator = LweBggEncodingPltEvaluator::<M, SH>::new(seed, dir_path, p);
 
         self.poly_circuit.eval(params, &encodings[0], &encodings[1..], Some(bgg_evaluator))

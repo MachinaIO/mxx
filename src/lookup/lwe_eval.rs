@@ -262,7 +262,6 @@ mod test {
         let key: [u8; 32] = rand::random();
         let bgg_pubkey_sampler =
             BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
-        let uniform_sampler = DCRTPolyUniformSampler::new();
 
         let tag: u64 = rand::random();
         let tag_bytes = tag.to_le_bytes();
@@ -273,9 +272,10 @@ mod test {
 
         // Create random public keys and encodings
         let reveal_plaintexts = vec![true; input_size + 1];
-        let bgg_encoding_sampler = BGGEncodingSampler::new(&params, &secrets, uniform_sampler, 0.0);
+        let bgg_encoding_sampler =
+            BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
         let pubkeys = bgg_pubkey_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
-        let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &plaintexts, false);
+        let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &plaintexts);
         let enc_one = encodings[0].clone();
         let enc1 = encodings[1].clone();
 

@@ -13,7 +13,7 @@ mod tests {
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
         sampler::{PolyUniformSampler, hash::DCRTPolyHashSampler, uniform::DCRTPolyUniformSampler},
-        utils::{create_bit_random_poly, create_random_poly},
+        utils::{create_random_poly, create_ternary_random_poly},
     };
     use keccak_asm::Keccak256;
 
@@ -77,11 +77,11 @@ mod tests {
         let bgg_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
         let reveal_plaintexts = vec![true; packed_input_size + 1];
         let sampled_pub_keys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
-        let uniform_sampler = DCRTPolyUniformSampler::new();
-        let secrets = vec![create_bit_random_poly(&params); d];
+        let secrets = vec![create_ternary_random_poly(&params); d];
         let plaintexts = vec![DCRTPoly::const_one(&params); packed_input_size];
-        let bgg_sampler = BGGEncodingSampler::new(&params, &secrets, uniform_sampler, 0.0);
-        let bgg_encodings = bgg_sampler.sample(&params, &sampled_pub_keys, &plaintexts, false);
+        let bgg_sampler =
+            BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
+        let bgg_encodings = bgg_sampler.sample(&params, &sampled_pub_keys, &plaintexts);
         let g = DCRTPolyMatrix::gadget_matrix(&params, d);
         assert_eq!(bgg_encodings.len(), packed_input_size + 1);
         assert_eq!(
@@ -109,12 +109,12 @@ mod tests {
         let bgg_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
         let reveal_plaintexts = vec![true; packed_input_size + 1];
         let sampled_pub_keys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
-        let uniform_sampler = DCRTPolyUniformSampler::new();
-        let secrets = vec![create_bit_random_poly(&params); d];
+        let secrets = vec![create_ternary_random_poly(&params); d];
         let plaintexts = vec![create_random_poly(&params); packed_input_size];
         // TODO: set the standard deviation to a non-zero value
-        let bgg_sampler = BGGEncodingSampler::new(&params, &secrets, uniform_sampler, 0.0);
-        let bgg_encodings = bgg_sampler.sample(&params, &sampled_pub_keys, &plaintexts, false);
+        let bgg_sampler =
+            BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
+        let bgg_encodings = bgg_sampler.sample(&params, &sampled_pub_keys, &plaintexts);
 
         for pair in bgg_encodings[1..].chunks(2) {
             if let [a, b] = pair {
@@ -146,11 +146,11 @@ mod tests {
         let bgg_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
         let reveal_plaintexts = vec![true; packed_input_size + 1];
         let sampled_pub_keys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
-        let uniform_sampler = DCRTPolyUniformSampler::new();
-        let secrets = vec![create_bit_random_poly(&params); d];
+        let secrets = vec![create_ternary_random_poly(&params); d];
         let plaintexts = vec![create_random_poly(&params); packed_input_size];
-        let bgg_sampler = BGGEncodingSampler::new(&params, &secrets, uniform_sampler, 0.0);
-        let bgg_encodings = bgg_sampler.sample(&params, &sampled_pub_keys, &plaintexts, false);
+        let bgg_sampler =
+            BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
+        let bgg_encodings = bgg_sampler.sample(&params, &sampled_pub_keys, &plaintexts);
 
         for pair in bgg_encodings[1..].chunks(2) {
             if let [a, b] = pair {

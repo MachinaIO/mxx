@@ -20,7 +20,8 @@ use tokio;
 use tracing::info;
 
 fn init_tracing() {
-    tracing_subscriber::fmt::init();
+    // Install a global tracing subscriber once; ignore if already set by another test.
+    let _ = tracing_subscriber::fmt::try_init();
 }
 
 #[tokio::test]

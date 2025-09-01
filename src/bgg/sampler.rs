@@ -73,13 +73,12 @@ where
 ///
 /// # Fields
 /// * `secret`: The secret vector.
-/// * `error_sampler`: The sampler to generate RLWE errors.
 /// * `gauss_sigma`: The standard deviation of the Gaussian distribution.
 #[derive(Clone)]
 pub struct BGGEncodingSampler<S: PolyUniformSampler> {
     pub(crate) secret_vec: S::M,
-    pub error_sampler: S,
-    pub gauss_sigma: f64,
+    pub gauss_sigma: Option<f64>,
+    _s: PhantomData<S>,
 }
 
 impl<S> BGGEncodingSampler<S>
@@ -89,33 +88,27 @@ where
     /// Create a new encoding sampler
     /// # Arguments
     /// * `secrets`: The secret polynomials
-    /// * `error_sampler`: The sampler to generate RLWE errors
     /// * `gauss_sigma`: The standard deviation of the Gaussian distribution
     /// # Returns
     /// A new encoding sampler
     pub fn new(
         params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
         secrets: &[<S::M as PolyMatrix>::P],
-        error_sampler: S,
-        gauss_sigma: f64,
+        gauss_sigma: Option<f64>,
     ) -> Self {
         Self {
             secret_vec: S::M::from_poly_vec_row(params, secrets.to_vec()),
-            error_sampler,
             gauss_sigma,
+            _s: PhantomData,
         }
     }
 
     /// This extend the given plaintexts +1 and insert constant 1 polynomial plaintext
-    /// Actually in new simplified construction, this sample is not used unless debug
-    ///
-    /// use_structured_error for sample BGGEncoding for ABE context: Algorithm 4.https://eprint.iacr.org/2017/601.pdf
     pub fn sample(
         &self,
         params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
         public_keys: &[BggPublicKey<S::M>],
         plaintexts: &[<S::M as PolyMatrix>::P],
-        use_structured_error: bool,
     ) -> Vec<BggEncoding<S::M>> {
         let secret_vec = &self.secret_vec;
         let log_base_q = params.modulus_digits();
@@ -126,15 +119,12 @@ where
                 .concat();
         let secret_vec_size = self.secret_vec.col_size();
         let columns = secret_vec_size * log_base_q * packed_input_size;
-        let error: S::M = if use_structured_error {
-            self.structured_error(params, secret_vec_size, log_base_q, packed_input_size)
-        } else {
-            self.error_sampler.sample_uniform(
-                params,
-                1,
-                columns,
-                DistType::GaussDist { sigma: self.gauss_sigma },
-            )
+        let error: S::M = match self.gauss_sigma {
+            None => S::M::zero(params, 1, columns),
+            Some(sigma) => {
+                let error_sampler = S::new();
+                error_sampler.sample_uniform(params, 1, columns, DistType::GaussDist { sigma })
+            }
         };
         let all_public_key_matrix: S::M = public_keys[0]
             .matrix
@@ -163,97 +153,5 @@ where
                 }
             })
             .collect()
-    }
-
-    /// Structured error is needed for sample BGGEncoding for ABE context
-    ///
-    /// Algorithm 4.https://eprint.iacr.org/2017/601.pdf
-    fn structured_error(
-        &self,
-        params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
-        secret_vec_size: usize,
-        log_base_q: usize,
-        packed_input_size: usize,
-    ) -> S::M {
-        let e_a: S::M = self.error_sampler.sample_uniform(
-            params,
-            1,
-            secret_vec_size,
-            DistType::GaussDist { sigma: self.gauss_sigma },
-        );
-        let mut lifted_cols = Vec::with_capacity(secret_vec_size * log_base_q);
-        for col_idx in 0..secret_vec_size {
-            let col = e_a.get_column(col_idx);
-            for _ in 0..log_base_q {
-                lifted_cols.extend(col.clone());
-            }
-        }
-        let lift = S::M::from_poly_vec(params, vec![lifted_cols]);
-        // e_0 = (e_A^T | e_A^T S_0 | … | e_A^T S_ℓ)^T
-        let mut cols = Vec::<S::M>::with_capacity(packed_input_size);
-        cols.push(lift.clone());
-
-        // each remaining block: S_i ← {±1}^{m×m}, then take e_A^T S_i and lift
-        for _ in 0..(packed_input_size - 1) {
-            let s_i = self.error_sampler.sample_uniform(
-                params,
-                secret_vec_size,
-                secret_vec_size,
-                DistType::TernaryDist,
-            );
-            // e_A^T S_i
-            let mixed_base = e_a.clone() * s_i;
-            // Lift to gadget width by repeating columns k times
-            let mut lifted_cols = Vec::with_capacity(secret_vec_size * log_base_q);
-            for col_idx in 0..secret_vec_size {
-                let col = mixed_base.get_column(col_idx);
-                for _ in 0..log_base_q {
-                    lifted_cols.extend(col.clone());
-                }
-            }
-            let mixed = S::M::from_poly_vec(params, vec![lifted_cols]);
-            cols.push(mixed);
-        }
-        // e_0
-        if cols.len() == 1 {
-            cols[0].clone()
-        } else {
-            let first = cols[0].clone();
-            let rest: Vec<&S::M> = cols[1..].iter().collect();
-            first.concat_columns(&rest)
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
-        sampler::uniform::DCRTPolyUniformSampler,
-    };
-
-    #[test]
-    fn test_structured_error_with_ternary_dist() {
-        let params = DCRTPolyParams::default();
-        let d = 3;
-        let log_base_q = params.modulus_digits();
-        let blocks = 4;
-        let gauss_sigma = 4.57825;
-        let secrets: Vec<DCRTPoly> =
-            (0..d).map(|_| DCRTPoly::from_usize_to_constant(&params, 1)).collect();
-        let error_sampler = DCRTPolyUniformSampler::new();
-        let encoding_sampler =
-            BGGEncodingSampler::new(&params, &secrets, error_sampler, gauss_sigma);
-        let error_vector = encoding_sampler.structured_error(&params, d, log_base_q, blocks);
-        assert_eq!(error_vector.row_size(), 1);
-        assert_eq!(error_vector.col_size(), blocks * d * log_base_q);
-        for block_idx in 0..blocks {
-            let start_col = block_idx * d * log_base_q;
-            let end_col = (block_idx + 1) * d * log_base_q;
-            let block = error_vector.slice_columns(start_col, end_col);
-            assert_eq!(block.row_size(), 1);
-            assert_eq!(block.col_size(), d * log_base_q);
-        }
     }
 }

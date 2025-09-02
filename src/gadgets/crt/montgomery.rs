@@ -244,7 +244,7 @@ mod tests {
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
 
-    const LIMB_BIT_SIZE: usize = 6;
+    const LIMB_BIT_SIZE: usize = 2;
     const NUM_LIMBS: usize = 5;
 
     fn create_test_context(

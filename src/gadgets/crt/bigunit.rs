@@ -568,54 +568,6 @@ impl<P: Poly> BigUintPoly<P> {
         self.compress_columns_wallace(circuit, &mut columns)
     }
 
-    // Single-bit addition using parallel-prefix
-    #[inline]
-    fn add_single_bit(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
-        let (w, a, b) = if self.limbs.len() >= other.limbs.len() {
-            (self.limbs.len(), &self.limbs, &other.limbs)
-        } else {
-            (other.limbs.len(), &other.limbs, &self.limbs)
-        };
-
-        let zero = circuit.const_zero_gate();
-
-        let mut gs = Vec::with_capacity(w);
-        let mut ps = Vec::with_capacity(w);
-        let mut sums = Vec::with_capacity(w);
-
-        for i in 0..w {
-            let ai = a[i];
-            let bi = if i < b.len() { b[i] } else { zero };
-
-            // g_i = a_i AND b_i (generate: both bits are 1).
-            let g = circuit.and_gate(ai, bi);
-
-            // p_i = a_i XOR b_i (propagate: exactly one bit is 1).
-            let p = circuit.xor_gate(ai, bi);
-
-            gs.push(g);
-            ps.push(p);
-            sums.push(p); // Store XOR for sum computation later.
-        }
-
-        // Use parallel-prefix to compute carry prefixes.
-        let (g_pref, _) = Self::prefix_gp(circuit, &gs, &ps);
-
-        // Compute final sum bits using carries.
-        let mut limbs = Vec::with_capacity(w + 1);
-        for i in 0..w {
-            let carry_in = if i == 0 { zero } else { g_pref[i - 1] };
-            let sum = circuit.xor_gate(sums[i], carry_in);
-            limbs.push(sum);
-        }
-
-        // Final carry out.
-        let final_carry = if w == 0 { zero } else { g_pref[w - 1] };
-        limbs.push(final_carry);
-
-        Self { ctx: self.ctx.clone(), limbs, _p: PhantomData }
-    }
-
     // Single-bit multiplication using parallel-prefix
     #[inline]
     fn mul_single_bit(
@@ -661,7 +613,7 @@ impl<P: Poly> BigUintPoly<P> {
             let mut i = 0;
             while i < products.len() {
                 if i + 1 < products.len() {
-                    let sum = products[i].add_single_bit(&products[i + 1], circuit);
+                    let sum = products[i].add(&products[i + 1], circuit);
                     let mut truncated_limbs = sum.limbs;
                     truncated_limbs.truncate(max_limbs);
                     next_level.push(Self {

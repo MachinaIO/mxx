@@ -178,7 +178,7 @@ mod tests {
     use rand::Rng;
     use std::sync::Arc;
 
-    const LIMB_BIT_SIZE: usize = 5;
+    const LIMB_BIT_SIZE: usize = 1;
 
     // Helper function to generate a random BigUint below a given bound
     fn gen_biguint_below<R: Rng>(rng: &mut R, bound: &BigUint) -> BigUint {

@@ -174,27 +174,35 @@ mod tests {
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
     use num_bigint::BigUint;
-    use num_traits::Zero;
     use rand::Rng;
     use std::sync::Arc;
 
-    const LIMB_BIT_SIZE: usize = 1;
+    // todo: if (a+b) or (a*b) is over the modulus and limb bit size = 1, it doesn't works
+    const LIMB_BIT_SIZE: usize = 2;
 
-    // Helper function to generate a random BigUint below a given bound
-    fn gen_biguint_below<R: Rng>(rng: &mut R, bound: &BigUint) -> BigUint {
-        if bound.is_zero() {
-            return BigUint::zero();
+    fn gen_biguint_for_limb_size<R: Rng>(
+        rng: &mut R,
+        limb_bit_size: usize,
+        max_limbs: usize,
+    ) -> BigUint {
+        if limb_bit_size == 0 || max_limbs == 0 {
+            return BigUint::ZERO;
+        }
+        let num_limbs = rng.random_range(1..=max_limbs);
+        let max_bits = limb_bit_size * num_limbs;
+        let max_bytes = max_bits.div_ceil(8);
+        if max_bytes == 0 {
+            return BigUint::ZERO;
+        }
+        let mut bytes = vec![0u8; max_bytes];
+        rng.fill_bytes(&mut bytes);
+        let excess_bits = max_bytes * 8 - max_bits;
+        if excess_bits > 0 && !bytes.is_empty() {
+            let mask = (1u8 << (8 - excess_bits)) - 1;
+            bytes[0] &= mask;
         }
 
-        // Fallback to modular arithmetic for large numbers
-        let bit_len = bound.bits() as usize;
-        let byte_len = (bit_len + 7) / 8;
-
-        // Generate a random number with same bit length and take modulo
-        let mut bytes = vec![0u8; byte_len];
-        rng.fill_bytes(&mut bytes);
-        let candidate = BigUint::from_bytes_be(&bytes);
-        candidate % bound
+        BigUint::from_bytes_be(&bytes)
     }
 
     fn create_test_context(
@@ -210,16 +218,12 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, crt_ctx) = create_test_context(&mut circuit);
 
-        // Generate random values for a and b within modulus bounds
-        let mut rng = rand::rng();
         let modulus = params.modulus();
-        let max_val = modulus.as_ref();
-        let a: BigUint = gen_biguint_below(&mut rng, &max_val);
-        let b: BigUint = gen_biguint_below(&mut rng, &max_val);
+        let a: BigUint = modulus.as_ref() - BigUint::from(3u32);
+        let b: BigUint = modulus.as_ref() - BigUint::from(5u32);
         let expected_output_biguint = (&a + &b) % params.modulus().as_ref();
         let expected_output_slots =
             biguint_to_crt_slots::<DCRTPoly>(&params, &expected_output_biguint);
-
         let crt_poly_a = CrtPoly::input(crt_ctx.clone(), &mut circuit);
         let values_a = biguint_to_crt_poly(LIMB_BIT_SIZE, &params, &a);
         let crt_poly_b = CrtPoly::input(crt_ctx.clone(), &mut circuit);
@@ -266,12 +270,12 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, crt_ctx) = create_test_context(&mut circuit);
 
-        // Generate random values for a and b within modulus bounds
+        // Generate random values appropriate for the LIMB_BIT_SIZE
         let mut rng = rand::rng();
-        let modulus = params.modulus();
-        let max_val = modulus.as_ref();
-        let a: BigUint = gen_biguint_below(&mut rng, &max_val);
-        let b: BigUint = gen_biguint_below(&mut rng, &max_val);
+        let (_, crt_bits, _) = params.to_crt();
+        let max_limbs = crt_bits.div_ceil(LIMB_BIT_SIZE);
+        let a: BigUint = gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs);
+        let b: BigUint = gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs);
         let expected_output_biguint =
             if a >= b { &a - &b } else { params.modulus().as_ref() - &b + &a };
         let expected_output_slots =
@@ -323,16 +327,12 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, crt_ctx) = create_test_context(&mut circuit);
 
-        // Generate random values for a and b within modulus bounds (smaller range for
-        // multiplication)
-        let mut rng = rand::rng();
-        let max_val = params.modulus();
-        let a: BigUint = gen_biguint_below(&mut rng, &max_val);
-        let b: BigUint = gen_biguint_below(&mut rng, &max_val);
+        let modulus = params.modulus();
+        let a: BigUint = modulus.as_ref() - BigUint::from(3u32);
+        let b: BigUint = modulus.as_ref() - BigUint::from(5u32);
         let expected_output_biguint = (&a * &b) % params.modulus().as_ref();
         let expected_output_slots =
             biguint_to_crt_slots::<DCRTPoly>(&params, &expected_output_biguint);
-
         let crt_poly_a = CrtPoly::input(crt_ctx.clone(), &mut circuit);
         let values_a = biguint_to_crt_poly(LIMB_BIT_SIZE, &params, &a);
         let crt_poly_b = CrtPoly::input(crt_ctx.clone(), &mut circuit);

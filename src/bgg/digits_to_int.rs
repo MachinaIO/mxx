@@ -63,7 +63,7 @@ mod tests {
         matrix::dcrt_poly::DCRTPolyMatrix,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         sampler::{PolyUniformSampler, hash::DCRTPolyHashSampler, uniform::DCRTPolyUniformSampler},
-        utils::{create_bit_random_poly, create_random_poly},
+        utils::{create_bit_random_poly, create_random_poly, create_ternary_random_poly},
     };
     use keccak_asm::Keccak256;
 
@@ -150,7 +150,6 @@ mod tests {
         let d = 3;
         let bgg_pubkey_sampler =
             BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
-        let uniform_sampler = DCRTPolyUniformSampler::new();
 
         // Generate random tag for sampling
         let tag: u64 = rand::random();
@@ -161,12 +160,13 @@ mod tests {
         let pubkeys = bgg_pubkey_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
 
         // Create secret and plaintexts (digit polynomials)
-        let secrets = vec![create_bit_random_poly(&params); d];
+        let secrets = vec![create_ternary_random_poly(&params); d];
         let int_poly = DCRTPoly::from_usize_to_constant(&params, 13);
         let plaintexts = int_poly.decompose_base(&params);
 
         // Create encoding sampler and encodings
-        let bgg_encoding_sampler = BGGEncodingSampler::new(&params, &secrets, uniform_sampler, 0.0);
+        let bgg_encoding_sampler =
+            BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
         let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &plaintexts);
 
         // Extract digit encodings (skip the first one which is the one encoding)
@@ -188,7 +188,6 @@ mod tests {
         let d = 3;
         let bgg_pubkey_sampler =
             BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
-        let uniform_sampler = DCRTPolyUniformSampler::new();
 
         // Generate random tag for sampling
         let tag: u64 = rand::random();
@@ -199,12 +198,13 @@ mod tests {
         let pubkeys = bgg_pubkey_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
 
         // Create secret and plaintexts (digit polynomials)
-        let secrets = vec![create_bit_random_poly(&params); d];
+        let secrets = vec![create_ternary_random_poly(&params); d];
         let int_poly = create_bit_random_poly(&params);
         let plaintexts = int_poly.decompose_base(&params);
 
         // Create encoding sampler and encodings
-        let bgg_encoding_sampler = BGGEncodingSampler::new(&params, &secrets, uniform_sampler, 0.0);
+        let bgg_encoding_sampler =
+            BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
         let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &plaintexts);
 
         // Extract digit encodings (skip the first one which is the one encoding)

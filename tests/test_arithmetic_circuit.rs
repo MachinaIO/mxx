@@ -20,7 +20,8 @@ use tokio;
 use tracing::info;
 
 fn init_tracing() {
-    tracing_subscriber::fmt::init();
+    // Install a global tracing subscriber once; ignore if already set by another test.
+    let _ = tracing_subscriber::fmt::try_init();
 }
 
 #[tokio::test]
@@ -60,7 +61,7 @@ async fn test_arithmetic_circuit_operations() {
     let seed: [u8; 32] = [0u8; 32];
     let d = 1;
     let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, 1.0);
-    let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(&params, d + 1);
+    let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(&params, d);
     let trapdoor = Arc::new(trapdoor);
     let pub_matrix = Arc::new(pub_matrix);
     info!("start evaluate_with_bgg_pubkey");
@@ -75,12 +76,7 @@ async fn test_arithmetic_circuit_operations() {
     // Test with BGG encoding evaluation
     let uniform_sampler = DCRTPolyUniformSampler::new();
     let secrets = uniform_sampler.sample_uniform(&params, 1, d, DistType::BitDist).get_row(0);
-    let s = {
-        let minus_one_poly = DCRTPoly::const_minus_one(&params);
-        let mut secrets = secrets.to_vec();
-        secrets.push(minus_one_poly);
-        DCRTPolyMatrix::from_poly_vec_row(&params, secrets)
-    };
+    let s = DCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
     let p = s.clone() * pub_matrix.as_ref();
     info!("start evaluate_with_bgg_encoding");
     let mixed_encoding_result = mixed_circuit.evaluate_with_bgg_encoding::<
@@ -93,7 +89,7 @@ async fn test_arithmetic_circuit_operations() {
     assert_eq!(mixed_encoding_result[0].plaintext.as_ref().unwrap(), mixed_poly_result);
     assert_eq!(mixed_encoding_result[0].pubkey, mixed_pubkey_result[0]);
     let mixed_encoding_expected = s.clone() * &mixed_pubkey_result[0].matrix -
-        s * (DCRTPolyMatrix::gadget_matrix(&params, d + 1) * mixed_poly_result);
+        s * (DCRTPolyMatrix::gadget_matrix(&params, d) * mixed_poly_result);
     assert_eq!(mixed_encoding_result[0].vector, mixed_encoding_expected);
 }
 
@@ -141,7 +137,7 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
     let seed: [u8; 32] = [0u8; 32];
     let d = 1;
     let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, 1.0);
-    let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(&params, d + 1);
+    let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(&params, d);
     let trapdoor = Arc::new(trapdoor);
     let pub_matrix = Arc::new(pub_matrix);
     info!("start evaluate_with_bgg_pubkey");
@@ -157,14 +153,8 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
     // Test with BGG encoding evaluation.
     let uniform_sampler = DCRTPolyUniformSampler::new();
     let secrets = uniform_sampler.sample_uniform(&params, 1, d, DistType::BitDist).get_row(0);
-    let s = {
-        let minus_one_poly = DCRTPoly::const_minus_one(&params);
-        let mut secrets = secrets.to_vec();
-        secrets.push(minus_one_poly);
-        DCRTPolyMatrix::from_poly_vec_row(&params, secrets)
-    };
+    let s = DCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
     let p = s.clone() * pub_matrix.as_ref();
-
     info!("Non-CRT: start evaluate_with_bgg_encoding");
     let mixed_encoding_result = mixed_circuit.evaluate_with_bgg_encoding::<
         DCRTPolyMatrix,
@@ -175,6 +165,6 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
     assert_eq!(mixed_encoding_result[0].plaintext.as_ref().unwrap(), mixed_poly_result);
     assert_eq!(mixed_encoding_result[0].pubkey, mixed_pubkey_result[0]);
     let mixed_encoding_expected = s.clone() * &mixed_pubkey_result[0].matrix -
-        s * (DCRTPolyMatrix::gadget_matrix(&params, d + 1) * mixed_poly_result);
+        s * (DCRTPolyMatrix::gadget_matrix(&params, d) * mixed_poly_result);
     assert_eq!(mixed_encoding_result[0].vector, mixed_encoding_expected);
 }

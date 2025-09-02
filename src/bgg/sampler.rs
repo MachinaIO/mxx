@@ -47,14 +47,13 @@ where
     ) -> Vec<BggPublicKey<<S as PolyHashSampler<K>>::M>> {
         let sampler = S::new();
         let log_base_q = params.modulus_digits();
-        let secret_vec_size = self.d + 1;
-        let columns = secret_vec_size * log_base_q;
+        let columns = self.d * log_base_q;
         let packed_input_size = reveal_plaintexts.len();
         let all_matrix = sampler.sample_hash(
             params,
             self.hash_key,
             tag,
-            secret_vec_size,
+            self.d,
             columns * packed_input_size,
             DistType::FinRingDist,
         );
@@ -74,13 +73,12 @@ where
 ///
 /// # Fields
 /// * `secret`: The secret vector.
-/// * `error_sampler`: The sampler to generate RLWE errors.
 /// * `gauss_sigma`: The standard deviation of the Gaussian distribution.
 #[derive(Clone)]
 pub struct BGGEncodingSampler<S: PolyUniformSampler> {
     pub(crate) secret_vec: S::M,
-    pub error_sampler: S,
-    pub gauss_sigma: f64,
+    pub gauss_sigma: Option<f64>,
+    _s: PhantomData<S>,
 }
 
 impl<S> BGGEncodingSampler<S>
@@ -90,26 +88,22 @@ where
     /// Create a new encoding sampler
     /// # Arguments
     /// * `secrets`: The secret polynomials
-    /// * `error_sampler`: The sampler to generate RLWE errors
     /// * `gauss_sigma`: The standard deviation of the Gaussian distribution
     /// # Returns
     /// A new encoding sampler
     pub fn new(
         params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
         secrets: &[<S::M as PolyMatrix>::P],
-        error_sampler: S,
-        gauss_sigma: f64,
+        gauss_sigma: Option<f64>,
     ) -> Self {
-        // s_init := (sampled secret, -1)
-        let minus_one_poly = <S::M as PolyMatrix>::P::const_minus_one(params);
-        let mut secrets = secrets.to_vec();
-        secrets.push(minus_one_poly);
-        let secret_vec = S::M::from_poly_vec_row(params, secrets);
-        Self { secret_vec, error_sampler, gauss_sigma }
+        Self {
+            secret_vec: S::M::from_poly_vec_row(params, secrets.to_vec()),
+            gauss_sigma,
+            _s: PhantomData,
+        }
     }
 
     /// This extend the given plaintexts +1 and insert constant 1 polynomial plaintext
-    /// Actually in new simplified construction, this sample is not used unless debug
     pub fn sample(
         &self,
         params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
@@ -118,18 +112,20 @@ where
     ) -> Vec<BggEncoding<S::M>> {
         let secret_vec = &self.secret_vec;
         let log_base_q = params.modulus_digits();
-        let packed_input_size = 1 + plaintexts.len(); // first slot is allocated to the constant 1 polynomial plaintext
+        // first slot is allocated to the constant 1 polynomial plaintext
+        let packed_input_size = 1 + plaintexts.len();
         let plaintexts: Vec<<S::M as PolyMatrix>::P> =
             [&[<<S as PolyUniformSampler>::M as PolyMatrix>::P::const_one(params)], plaintexts]
                 .concat();
         let secret_vec_size = self.secret_vec.col_size();
         let columns = secret_vec_size * log_base_q * packed_input_size;
-        let error: S::M = self.error_sampler.sample_uniform(
-            params,
-            1,
-            columns,
-            DistType::GaussDist { sigma: self.gauss_sigma },
-        );
+        let error: S::M = match self.gauss_sigma {
+            None => S::M::zero(params, 1, columns),
+            Some(sigma) => {
+                let error_sampler = S::new();
+                error_sampler.sample_uniform(params, 1, columns, DistType::GaussDist { sigma })
+            }
+        };
         let all_public_key_matrix: S::M = public_keys[0]
             .matrix
             .concat_columns(&public_keys[1..].par_iter().map(|pk| &pk.matrix).collect::<Vec<_>>());

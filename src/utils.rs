@@ -118,6 +118,11 @@ pub fn create_bit_random_poly(params: &DCRTPolyParams) -> DCRTPoly {
     sampler.sample_poly(params, &DistType::BitDist)
 }
 
+pub fn create_ternary_random_poly(params: &DCRTPolyParams) -> DCRTPoly {
+    let sampler = DCRTPolyUniformSampler::new();
+    sampler.sample_poly(params, &DistType::TernaryDist)
+}
+
 // Helper function to create a bit polynomial (0 or 1)
 pub fn create_bit_poly(params: &DCRTPolyParams, bit: bool) -> DCRTPoly {
     if bit { DCRTPoly::const_one(params) } else { DCRTPoly::const_zero(params) }
@@ -132,7 +137,6 @@ pub fn random_bgg_encodings(
     let key: [u8; 32] = rand::random();
     let bgg_pubkey_sampler =
         BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, secret_size);
-    let uniform_sampler = DCRTPolyUniformSampler::new();
 
     // Generate random tag for sampling
     let tag: u64 = rand::random();
@@ -143,7 +147,8 @@ pub fn random_bgg_encodings(
 
     // Create random public keys
     let reveal_plaintexts = vec![true; input_size + 1];
-    let bgg_encoding_sampler = BGGEncodingSampler::new(params, &secrets, uniform_sampler, 0.0);
+    let bgg_encoding_sampler =
+        BGGEncodingSampler::<DCRTPolyUniformSampler>::new(params, &secrets, None);
     let pubkeys = bgg_pubkey_sampler.sample(params, &tag_bytes, &reveal_plaintexts);
     bgg_encoding_sampler.sample(params, &pubkeys, &plaintexts)
 }

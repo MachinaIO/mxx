@@ -94,9 +94,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
         SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
         SU: PolyUniformSampler<M = M> + Send + Sync,
     {
-        let uniform_sampler = SU::new();
-        let bgg_encoding_sampler =
-            BGGEncodingSampler::new(params, secret, uniform_sampler, error_sigma);
+        let bgg_encoding_sampler = BGGEncodingSampler::<SU>::new(params, secret, Some(error_sigma));
         let plaintexts = if self.use_packing {
             biguints_to_packed_crt_polys(self.limb_bit_size, params, inputs)
         } else {

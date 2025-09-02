@@ -220,7 +220,7 @@ mod test {
         matrix::dcrt_poly::DCRTPolyMatrix,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         sampler::{
-            PolyUniformSampler, hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
+            hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
             uniform::DCRTPolyUniformSampler,
         },
         storage::{init_storage_system, wait_for_all_writes},

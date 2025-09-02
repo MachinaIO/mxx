@@ -12,7 +12,7 @@ mod tests {
             Poly, PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
-        sampler::{PolyUniformSampler, hash::DCRTPolyHashSampler, uniform::DCRTPolyUniformSampler},
+        sampler::{hash::DCRTPolyHashSampler, uniform::DCRTPolyUniformSampler},
         utils::{create_random_poly, create_ternary_random_poly},
     };
     use keccak_asm::Keccak256;

@@ -62,7 +62,7 @@ mod tests {
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         matrix::dcrt_poly::DCRTPolyMatrix,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
-        sampler::{PolyUniformSampler, hash::DCRTPolyHashSampler, uniform::DCRTPolyUniformSampler},
+        sampler::{hash::DCRTPolyHashSampler, uniform::DCRTPolyUniformSampler},
         utils::{create_bit_random_poly, create_random_poly, create_ternary_random_poly},
     };
     use keccak_asm::Keccak256;

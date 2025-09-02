@@ -213,8 +213,12 @@ pub fn u64_to_montgomery_poly<P: Poly>(
     params: &P::Params,
     input: u64,
 ) -> Vec<P> {
-    let input_montgomery = u64_to_montgomery_form(limb_bit_size, num_limbs, n, input);
-    u64_to_biguint_poly(limb_bit_size, params, input_montgomery, Some(num_limbs))
+    u64_to_biguint_poly(
+        limb_bit_size,
+        params,
+        u64_to_montgomery_form(limb_bit_size, num_limbs, n, input),
+        Some(num_limbs),
+    )
 }
 
 fn u64_to_montgomery_form(limb_bit_size: usize, num_limbs: usize, n: u64, input: u64) -> u64 {
@@ -240,8 +244,7 @@ mod tests {
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
 
-    // works for 4,5 each also
-    const LIMB_BIT_SIZE: usize = 1;
+    const LIMB_BIT_SIZE: usize = 6;
     const NUM_LIMBS: usize = 5;
 
     fn create_test_context(

@@ -18,6 +18,8 @@ pub enum DistType {
     GaussDist { sigma: f64 },
     /// Distribution that produces random bits (0 or 1).
     BitDist,
+    /// Distribution that produces random bits (-1,0,1).
+    TernaryDist,
 }
 
 /// Trait for sampling a polynomial based on a hash function.

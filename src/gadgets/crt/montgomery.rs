@@ -61,29 +61,13 @@ impl<P: Poly> MontgomeryContext<P> {
             &r_big - BigUint::one(),
             "N' (mod B) calculation failed"
         );
-
         // Create constant gates
         let mut const_n = BigUintPoly::const_u64(big_uint_ctx.clone(), circuit, n);
         // Ensure N has exactly num_limbs limbs
         const_n.limbs.resize(num_limbs, circuit.const_zero_gate());
-
         let const_r2 = BigUintPoly::const_u64(big_uint_ctx.clone(), circuit, r2);
-        let const_n_prime = BigUintPoly::const_u64(big_uint_ctx.clone(), circuit, n_prime);
-
-        // // Precompute full N' modulo R as base-B digits (private)
-        // let wbits = limb_bit_size;
-        // let base = BigUint::one() << wbits;
-        // let r_big_full = BigUint::one() << (wbits * num_limbs);
-        // let n_inv_full = mod_inverse(&n_big, &r_big_full).expect("N and R must be coprime");
-        // let nprime_full_big = (&r_big_full - n_inv_full) % &r_big_full; // -N^{-1} mod R
-        // let mut nprime_full_limbs = Vec::with_capacity(num_limbs);
-        // let mut tmp = nprime_full_big.clone();
-        // for _ in 0..num_limbs {
-        //     let limb = (&tmp % &base).iter_u64_digits().next().unwrap_or(0) as u32;
-        //     nprime_full_limbs.push(circuit.const_digits_poly(&[limb]));
-        //     tmp /= &base;
-        // }
-        // let const_n_prime_full = BigUintPoly::new(big_uint_ctx.clone(), nprime_full_limbs);
+        let mut const_n_prime = BigUintPoly::const_u64(big_uint_ctx.clone(), circuit, n_prime);
+        const_n_prime.limbs.resize(num_limbs, circuit.const_zero_gate());
 
         Self { big_uint_ctx, num_limbs, n, const_n, const_r2, const_n_prime }
     }
@@ -94,7 +78,6 @@ impl<P: Poly> MontgomeryContext<P> {
         // We need to find N' such that N * N' ≡ -1 (mod B)
         // This is equivalent to N * N' ≡ B - 1 (mod B)
         // So we find the modular inverse of N modulo B, then multiply by (B-1)
-
         let n_inv =
             mod_inverse(n, b).expect("N and B must be coprime for Montgomery multiplication");
         let minus_one = b - BigUint::one();
@@ -109,10 +92,6 @@ pub struct MontgomeryPoly<P: Poly> {
 }
 
 impl<P: Poly> MontgomeryPoly<P> {
-    pub fn limb(self) -> Vec<GateId> {
-        self.value.limbs
-    }
-
     pub fn new(ctx: Arc<MontgomeryContext<P>>, value: BigUintPoly<P>) -> Self {
         Self { ctx, value }
     }
@@ -148,22 +127,21 @@ impl<P: Poly> MontgomeryPoly<P> {
     pub fn add(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
         debug_assert_eq!(self.ctx, other.ctx);
 
-        let sum = self.value.add(&other.value, circuit);
+        // Compute full-width sum including carry
+        let sum_full = self.value.add(&other.value, circuit);
 
-        // Ensure sum has the same number of limbs as N for comparison
-        let sum_trimmed = BigUintPoly::new(
-            self.ctx.big_uint_ctx.clone(),
-            sum.limbs[0..self.ctx.num_limbs].to_vec(),
-        );
+        // Extend N by one limb for a correct comparison against the full sum (handles overflow)
+        let n_ext_bits = (self.ctx.num_limbs + 1) * self.ctx.big_uint_ctx.limb_bit_size;
+        let n_ext = self.ctx.const_n.extend_size(n_ext_bits);
 
-        // Check if sum >= N, and if so, subtract N
-        let (is_sum_less_n, diff_from_n) = sum_trimmed.less_than(&self.ctx.const_n, circuit);
+        // If sum_full < N then keep sum_full, else subtract N
+        let (is_less_than_n, diff_from_n) = sum_full.less_than(&n_ext, circuit);
+        let reduced_full = sum_full.cmux(&diff_from_n, is_less_than_n, circuit);
 
-        // cmux: selector=1 returns self, selector=0 returns other
-        // If sum < N (is_sum_less_n=1), use sum_trimmed, otherwise use diff_from_n
-        let result = sum_trimmed.cmux(&diff_from_n, is_sum_less_n, circuit);
+        // Return exactly r limbs; the top limb is zero after reduction
+        let reduced = reduced_full.mod_limbs(self.ctx.num_limbs);
 
-        Self { ctx: self.ctx.clone(), value: result }
+        Self { ctx: self.ctx.clone(), value: reduced }
     }
 
     /// Subtract two Montgomery representations  
@@ -196,8 +174,7 @@ impl<P: Poly> MontgomeryPoly<P> {
     }
 
     pub fn finalize(&self, circuit: &mut PolyCircuit<P>) -> GateId {
-        let regulared = self.to_regular(circuit);
-        regulared.finalize(circuit)
+        self.to_regular(circuit).finalize(circuit)
     }
 }
 
@@ -221,11 +198,15 @@ fn montgomery_reduce<P: Poly>(
     let u = t.add(&m_times_n, circuit);
 
     // REDC result = floor(U / R) mod N: take upper limbs after shifting by r
-    let u_div = u.left_shift(r).mod_limbs(r);
+    // Use full width for comparison to avoid losing the top carry limb
+    let u_shifted = u.left_shift(r);
+    let n_ext_bits = (r + 1) * limb_bits;
+    let n_ext = ctx.const_n.extend_size(n_ext_bits);
 
-    let (is_less, diff) = u_div.less_than(&ctx.const_n, circuit);
-    // If u_div < N, keep u_div; otherwise use diff = u_div - N (mod B^r)
-    u_div.cmux(&diff, is_less, circuit)
+    let (is_less, diff) = u_shifted.less_than(&n_ext, circuit);
+    // If u_shifted < N, keep u_shifted; otherwise use diff = u_shifted - N
+    let reduced_full = u_shifted.cmux(&diff, is_less, circuit);
+    reduced_full.mod_limbs(r)
 }
 
 pub fn u64_to_montgomery_poly<P: Poly>(
@@ -235,8 +216,12 @@ pub fn u64_to_montgomery_poly<P: Poly>(
     params: &P::Params,
     input: u64,
 ) -> Vec<P> {
-    let input_montgomery = u64_to_montgomery_form(limb_bit_size, num_limbs, n, input);
-    u64_to_biguint_poly(limb_bit_size, params, input_montgomery, Some(num_limbs))
+    u64_to_biguint_poly(
+        limb_bit_size,
+        params,
+        u64_to_montgomery_form(limb_bit_size, num_limbs, n, input),
+        Some(num_limbs),
+    )
 }
 
 fn u64_to_montgomery_form(limb_bit_size: usize, num_limbs: usize, n: u64, input: u64) -> u64 {
@@ -262,14 +247,15 @@ mod tests {
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
 
-    const LIMB_BIT_SIZE: usize = 5;
-    const NUM_LIMBS: usize = 4;
+    const LIMB_BIT_SIZE: usize = 2;
+    const NUM_LIMBS: usize = 5;
 
     fn create_test_context(
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> (DCRTPolyParams, Arc<MontgomeryContext<DCRTPoly>>) {
         let params = DCRTPolyParams::default();
         // Use a small modulus for testing: N = 17 (prime number)
+        // With LIMB_BIT_SIZE = 1 and NUM_LIMBS = 5, R = 2^5 = 32 > N = 17
         let n = 17u64;
         let ctx = Arc::new(MontgomeryContext::setup(circuit, &params, LIMB_BIT_SIZE, NUM_LIMBS, n));
         (params, ctx)

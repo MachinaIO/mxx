@@ -16,10 +16,9 @@ use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 // every cell flowing into compressors is < B, so a single lookup(x) =
 // (x % B, x / B) remains valid for inputs < B^2.
 //
-// Column compression is done either by a Wallace-style tree of
+// Column compression is done by a Wallace-style tree of
 // compressors (summing triples per column into (digit, carry) with one lookup)
-// until height <= 2, or in one-shot when H_max < B by summing all values in a
-// column linearly (add gates are linear) and performing exactly one lookup to
+// until height <= 2, and performing exactly one lookup to
 // emit (digit, carry) for that column. The final normalization to canonical
 // base-B digits is deferred to the end of the entire pipeline.
 //
@@ -46,9 +45,12 @@ impl<P: Poly> BigUintPolyContext<P> {
         let base = 1 << limb_bit_size;
         let const_zero = circuit.const_zero_gate();
         let const_base = circuit.const_digits_poly(&[base as u32]);
-        let (mod_lut, div_lut) = Self::setup_split_lut(params, base, base * base);
-        let lut_ids =
-            (circuit.register_public_lookup(mod_lut), circuit.register_public_lookup(div_lut));
+        let lut_ids = if limb_bit_size > 1 {
+            let (mod_lut, div_lut) = Self::setup_split_lut(params, base, base * base);
+            (circuit.register_public_lookup(mod_lut), circuit.register_public_lookup(div_lut))
+        } else {
+            (0, 0)
+        };
         Self { limb_bit_size, const_zero, const_base, lut_ids, _p: PhantomData }
     }
 
@@ -151,39 +153,31 @@ impl<P: Poly> BigUintPoly<P> {
         let mut gs = Vec::with_capacity(w);
         let mut ps = Vec::with_capacity(w);
 
-        // Build per-column g_k, p_k, and s'_k
-        if self.ctx.limb_bit_size == 1 {
-            // For single-bit limbs (B=2), we use direct bit operations.
-            for i in 0..w {
-                let ai = a[i];
-                let bi = if i < b.len() { b[i] } else { zero };
-                // g_i = a_i AND b_i
+        let one = circuit.const_one_gate();
+        for i in 0..w {
+            let ai = a[i];
+            let bi = if i < b.len() { b[i] } else { self.ctx.const_zero };
+            let (s, g) = if self.ctx.limb_bit_size == 1 {
+                let s = circuit.xor_gate(ai, bi);
                 let g = circuit.and_gate(ai, bi);
-                // p_i = a_i XOR b_i
-                let p = circuit.xor_gate(ai, bi);
-                // XOR is the sum without carry for single bit.
-                let s = p;
-
-                ss.push(s);
-                gs.push(g);
-                ps.push(p);
-            }
-        } else {
-            // For multi-bit limbs (B > 2), use lookup tables.
-            let one = circuit.const_one_gate();
-            for i in 0..w {
-                let ai = a[i];
-                let bi = if i < b.len() { b[i] } else { self.ctx.const_zero };
+                (s, g)
+            } else {
                 let t = circuit.add_gate(ai, bi);
-                let s = circuit.public_lookup_gate(t, self.ctx.lut_ids.0); // t mod B
-                let g = circuit.public_lookup_gate(t, self.ctx.lut_ids.1); // floor(t / B)
+                let s = circuit.public_lookup_gate(t, self.ctx.lut_ids.0);
+                let g = circuit.public_lookup_gate(t, self.ctx.lut_ids.1);
+                (s, g)
+            };
+            // p = 1 iff s == B-1, i.e., floor((s + 1)/B) = 1
+            let p = if self.ctx.limb_bit_size == 1 {
+                s
+            } else {
                 // p = 1 iff s == B-1, i.e., floor((s + 1)/B) = 1
                 let s_plus = circuit.add_gate(s, one);
-                let p = circuit.public_lookup_gate(s_plus, self.ctx.lut_ids.1);
-                ss.push(s);
-                gs.push(g);
-                ps.push(p);
-            }
+                circuit.public_lookup_gate(s_plus, self.ctx.lut_ids.1)
+            };
+            ss.push(s);
+            gs.push(g);
+            ps.push(p);
         }
 
         // Parallel-prefix (Kogge–Stone) on (g,p)
@@ -219,41 +213,31 @@ impl<P: Poly> BigUintPoly<P> {
         let zero = circuit.const_zero_gate();
         let mut g = Vec::with_capacity(w);
         let mut p = Vec::with_capacity(w);
-        let mut xor_values = Vec::new();
         let mut ab_pairs = Vec::new();
 
-        if self.ctx.limb_bit_size == 1 {
-            // For single-bit limbs (B=2), use direct bit operations.
-            for i in 0..w {
-                let a = self.limbs[i];
-                let b = other.limbs[i];
+        let one = circuit.const_one_gate();
+        let base_minus_one = {
+            let b_minus_1 = (1u32 << self.ctx.limb_bit_size) - 1;
+            circuit.const_digits_poly(&[b_minus_1])
+        };
+
+        // For each limb i, compute t_i = a_i + (B-1) - b_i.
+        // Then: h_i = floor(t_i / B) is 1 iff a_i >= b_i, 0 otherwise.
+        //        s_i = t_i % B; s_i == B-1 iff a_i == b_i.
+        // Borrow generate g_i = (a_i < b_i) = (!h_i) & (!eq_i)
+        // Borrow propagate p_i = (a_i == b_i) = eq_i
+        for i in 0..w {
+            let a = self.limbs[i];
+            let b = other.limbs[i];
+            let (g_i, p_i) = if self.ctx.limb_bit_size == 1 {
                 // g_i = !a_i AND b_i (borrow generate: a < b).
                 let not_a = circuit.not_gate(a);
                 let gi = circuit.and_gate(not_a, b);
                 // p_i = !(a_i XOR b_i) (borrow propagate: a == b).
                 let xor_ab = circuit.xor_gate(a, b);
                 let pi = circuit.not_gate(xor_ab);
-
-                g.push(gi);
-                p.push(pi);
-                xor_values.push(xor_ab);
-            }
-        } else {
-            // For multi-bit limbs (B > 2), use lookup tables.
-            let one = circuit.const_one_gate();
-            let base_minus_one = {
-                let b_minus_1 = (1u32 << self.ctx.limb_bit_size) - 1;
-                circuit.const_digits_poly(&[b_minus_1])
-            };
-
-            // For each limb i, compute t_i = a_i + (B-1) - b_i.
-            // Then: h_i = floor(t_i / B) is 1 iff a_i >= b_i, 0 otherwise.
-            //        s_i = t_i % B; s_i == B-1 iff a_i == b_i.
-            // Borrow generate g_i = (a_i < b_i) = (!h_i) & (!eq_i)
-            // Borrow propagate p_i = (a_i == b_i) = eq_i
-            for i in 0..w {
-                let a = self.limbs[i];
-                let b = other.limbs[i];
+                (gi, pi)
+            } else {
                 let t0 = circuit.add_gate(a, base_minus_one);
                 let t = circuit.sub_gate(t0, b);
                 let s = circuit.public_lookup_gate(t, self.ctx.lut_ids.0);
@@ -264,11 +248,11 @@ impl<P: Poly> BigUintPoly<P> {
                 let eq = circuit.public_lookup_gate(s_plus, self.ctx.lut_ids.1);
                 let not_eq = circuit.not_gate(eq);
                 let gi_and = circuit.and_gate(not_h, not_eq);
-                // p_i = eq_i
-                g.push(gi_and);
-                p.push(eq);
-                ab_pairs.push((a, b));
-            }
+                (gi_and, eq)
+            };
+            g.push(g_i);
+            p.push(p_i);
+            ab_pairs.push((a, b));
         }
 
         // Parallel-prefix (Kogge–Stone) on (g,p) - same for both cases.
@@ -278,8 +262,10 @@ impl<P: Poly> BigUintPoly<P> {
         let mut diff_limbs = Vec::with_capacity(w);
         for i in 0..w {
             let b_in = if i == 0 { zero } else { g_pref[i - 1] };
+            let (a, b) = ab_pairs[i];
             if self.ctx.limb_bit_size == 1 {
-                let diff = circuit.xor_gate(xor_values[i], b_in);
+                let xor = circuit.xor_gate(a, b);
+                let diff = circuit.xor_gate(xor, b_in);
                 diff_limbs.push(diff);
             } else {
                 let (a, b) = ab_pairs[i];
@@ -302,9 +288,6 @@ impl<P: Poly> BigUintPoly<P> {
     ) -> Self {
         debug_assert_eq!(self.ctx, other.ctx);
 
-        if self.ctx.limb_bit_size == 1 {
-            return self.mul_single_bit(other, circuit, max_bit_size);
-        }
         let max_bit_size = max_bit_size.unwrap_or(self.bit_size() + other.bit_size());
         debug_assert!(max_bit_size.is_multiple_of(self.ctx.limb_bit_size));
         let max_limbs = max_bit_size / self.ctx.limb_bit_size;
@@ -312,7 +295,7 @@ impl<P: Poly> BigUintPoly<P> {
 
         // Final single normalization (ripple-style) to match the existing API.
         // Note: We normalize S + (C shifted by 1) with exactly one pass of lookups.
-        let limbs = Self::final_cpa(circuit, sum_vec, carry_vec, self.ctx.lut_ids, max_limbs);
+        let limbs = self.final_cpa(circuit, sum_vec, carry_vec, self.ctx.lut_ids, max_limbs);
 
         Self { ctx: self.ctx.clone(), limbs, _p: PhantomData }
     }
@@ -368,6 +351,7 @@ impl<P: Poly> BigUintPoly<P> {
 
     #[inline]
     fn schoolbook_partial_products_columns(
+        &self,
         circuit: &mut PolyCircuit<P>,
         a: &[GateId],
         b: &[GateId],
@@ -384,11 +368,15 @@ impl<P: Poly> BigUintPoly<P> {
         for (i, j) in pairs {
             let k = i + j;
             let prod = circuit.mul_gate(a[i], b[j]);
-            let lo = circuit.public_lookup_gate(prod, mod_lut);
-            columns[k].push(lo);
-            if k + 1 < max_limbs {
-                let hi = circuit.public_lookup_gate(prod, div_lut);
-                columns[k + 1].push(hi);
+            if self.ctx.limb_bit_size == 1 {
+                columns[k].push(prod);
+            } else {
+                let lo = circuit.public_lookup_gate(prod, mod_lut);
+                columns[k].push(lo);
+                if k + 1 < max_limbs {
+                    let hi = circuit.public_lookup_gate(prod, div_lut);
+                    columns[k + 1].push(hi);
+                }
             }
         }
         columns
@@ -427,12 +415,25 @@ impl<P: Poly> BigUintPoly<P> {
                         next[k].extend_from_slice(&col[idx..idx + group_len]);
                     } else {
                         // Compress this chunk with one lookup pair.
-                        let mut sum = col[idx];
-                        for i in (idx + 1)..(idx + group_len) {
-                            sum = circuit.add_gate(sum, col[i]);
-                        }
-                        let digit = circuit.public_lookup_gate(sum, mod_lut); // x % B
-                        let carry = circuit.public_lookup_gate(sum, div_lut); // x / B
+                        let (digit, carry) = if self.ctx.limb_bit_size == 1 {
+                            let (a, b, c) = (col[idx], col[idx + 1], col[idx + 2]);
+                            // digit = a xor b xor c
+                            // carry = (a xor b) and c or (a and b)
+                            let xor_ab = circuit.xor_gate(a, b);
+                            let digit = circuit.xor_gate(xor_ab, c); // sum mod 2
+                            let and_ab = circuit.and_gate(a, b);
+                            let and_abc = circuit.and_gate(xor_ab, c);
+                            let carry = circuit.or_gate(and_ab, and_abc); // carry out
+                            (digit, carry)
+                        } else {
+                            let mut sum = col[idx];
+                            for i in (idx + 1)..(idx + group_len) {
+                                sum = circuit.add_gate(sum, col[i]);
+                            }
+                            let digit = circuit.public_lookup_gate(sum, mod_lut); // x % B
+                            let carry = circuit.public_lookup_gate(sum, div_lut); // x / B
+                            (digit, carry)
+                        };
                         next[k].push(digit);
                         next[k + 1].push(carry);
                     }
@@ -460,9 +461,16 @@ impl<P: Poly> BigUintPoly<P> {
                 [] => sum_vec.push(zero),
                 [x] => sum_vec.push(*x),
                 [x, y] => {
-                    let s = circuit.add_gate(*x, *y);
-                    let digit = circuit.public_lookup_gate(s, mod_lut); // % B
-                    let carry = circuit.public_lookup_gate(s, div_lut); // / B
+                    let (digit, carry) = if self.ctx.limb_bit_size == 1 {
+                        let digit = circuit.xor_gate(*x, *y);
+                        let carry = circuit.and_gate(*x, *y);
+                        (digit, carry)
+                    } else {
+                        let s = circuit.add_gate(*x, *y);
+                        let digit = circuit.public_lookup_gate(s, mod_lut); // % B
+                        let carry = circuit.public_lookup_gate(s, div_lut); // / B
+                        (digit, carry)
+                    };
                     sum_vec.push(digit);
                     carry_vec[k + 1] = carry;
                 }
@@ -475,6 +483,7 @@ impl<P: Poly> BigUintPoly<P> {
     // Final normalization by a parallel-prefix CPA: add S and C (shifted) once to produce digits.
     #[inline]
     pub(crate) fn final_cpa(
+        &self,
         circuit: &mut PolyCircuit<P>,
         mut sum_vec: Vec<GateId>,
         carry_vec: Vec<GateId>,
@@ -492,12 +501,20 @@ impl<P: Poly> BigUintPoly<P> {
         let mut ps = Vec::with_capacity(w);
         for k in 0..w {
             let c = carry_vec.get(k).copied().unwrap_or(zero);
-            let t = circuit.add_gate(sum_vec[k], c);
-            let s = circuit.public_lookup_gate(t, lut_ids.0);
-            let g = circuit.public_lookup_gate(t, lut_ids.1);
-            // p = 1 iff s == B-1 <=> floor((s + 1)/B) = 1
-            let s_plus = circuit.add_gate(s, one);
-            let p = circuit.public_lookup_gate(s_plus, lut_ids.1);
+            let (s, g, p) = if self.ctx.limb_bit_size == 1 {
+                let s = circuit.xor_gate(sum_vec[k], c);
+                let g = circuit.and_gate(sum_vec[k], c);
+                let p = s;
+                (s, g, p)
+            } else {
+                let t = circuit.add_gate(sum_vec[k], c);
+                let s = circuit.public_lookup_gate(t, lut_ids.0);
+                let g = circuit.public_lookup_gate(t, lut_ids.1);
+                // p = 1 iff s == B-1 <=> floor((s + 1)/B) = 1
+                let s_plus = circuit.add_gate(s, one);
+                let p = circuit.public_lookup_gate(s_plus, lut_ids.1);
+                (s, g, p)
+            };
             ss.push(s);
             gs.push(g);
             ps.push(p);
@@ -506,8 +523,12 @@ impl<P: Poly> BigUintPoly<P> {
         let mut out = Vec::with_capacity(w);
         for i in 0..w {
             let carry_in = if i == 0 { zero } else { g_pref[i - 1] };
-            let t = circuit.add_gate(ss[i], carry_in);
-            let digit = circuit.public_lookup_gate(t, lut_ids.0);
+            let digit = if self.ctx.limb_bit_size == 1 {
+                circuit.xor_gate(ss[i], carry_in)
+            } else {
+                let t = circuit.add_gate(ss[i], carry_in);
+                circuit.public_lookup_gate(t, lut_ids.0)
+            };
             out.push(digit);
         }
         out
@@ -556,7 +577,7 @@ impl<P: Poly> BigUintPoly<P> {
         max_limbs: usize,
     ) -> (Vec<GateId>, Vec<GateId>) {
         // 1) Schoolbook partial products with immediate split and column placement
-        let mut columns = Self::schoolbook_partial_products_columns(
+        let mut columns = self.schoolbook_partial_products_columns(
             circuit,
             &self.limbs,
             &other.limbs,
@@ -568,71 +589,99 @@ impl<P: Poly> BigUintPoly<P> {
         self.compress_columns_wallace(circuit, &mut columns)
     }
 
-    // Single-bit multiplication using parallel-prefix
-    #[inline]
-    fn mul_single_bit(
-        &self,
-        other: &Self,
-        circuit: &mut PolyCircuit<P>,
-        max_bit_size: Option<usize>,
-    ) -> Self {
-        let max_bit_size = max_bit_size.unwrap_or(self.bit_size() + other.bit_size());
-        let max_limbs = max_bit_size / self.ctx.limb_bit_size;
-        let zero = circuit.const_zero_gate();
+    // // Single-bit multiplication using parallel-prefix
+    // #[inline]
+    // fn mul_single_bit(
+    //     &self,
+    //     other: &Self,
+    //     circuit: &mut PolyCircuit<P>,
+    //     max_bit_size: Option<usize>,
+    // ) -> Self {
+    //     let max_bit_size = max_bit_size.unwrap_or(self.bit_size() + other.bit_size());
+    //     let max_limbs = max_bit_size / self.ctx.limb_bit_size;
+    //     let zero = circuit.const_zero_gate();
 
-        // Collect all partial products.
-        let mut partial_products = Vec::new();
+    //     // Collect all partial products.
+    //     let mut partial_products = Vec::new();
 
-        for (i, &bit) in other.limbs.iter().enumerate() {
-            // Create shifted version of self.
-            let mut shifted_self = vec![zero; i];
-            shifted_self.extend(self.limbs.iter().cloned());
-            shifted_self.truncate(max_limbs);
-            while shifted_self.len() < max_limbs {
-                shifted_self.push(zero);
-            }
+    //     for (i, &bit) in other.limbs.iter().enumerate() {
+    //         // Create shifted version of self.
+    //         let mut shifted_self = vec![zero; i];
+    //         shifted_self.extend(self.limbs.iter().cloned());
+    //         shifted_self.truncate(max_limbs);
+    //         while shifted_self.len() < max_limbs {
+    //             shifted_self.push(zero);
+    //         }
 
-            // Mask with the current bit.
-            let mut masked_limbs = Vec::with_capacity(max_limbs);
-            for &limb in &shifted_self {
-                masked_limbs.push(circuit.and_gate(limb, bit));
-            }
+    //         // Mask with the current bit.
+    //         let mut masked_limbs = Vec::with_capacity(max_limbs);
+    //         for &limb in &shifted_self {
+    //             masked_limbs.push(circuit.and_gate(limb, bit));
+    //         }
 
-            partial_products.push(Self {
-                ctx: self.ctx.clone(),
-                limbs: masked_limbs,
-                _p: PhantomData,
-            });
-        }
+    //         partial_products.push(Self {
+    //             ctx: self.ctx.clone(),
+    //             limbs: masked_limbs,
+    //             _p: PhantomData,
+    //         });
+    //     }
 
-        // Use tree reduction with our parallel-prefix adder.
-        // This gives us O(log n * log w) depth where n is the number of bits in other.
-        let mut products = partial_products;
-        while products.len() > 1 {
-            let mut next_level = Vec::new();
-            let mut i = 0;
-            while i < products.len() {
-                if i + 1 < products.len() {
-                    let sum = products[i].add(&products[i + 1], circuit);
-                    let mut truncated_limbs = sum.limbs;
-                    truncated_limbs.truncate(max_limbs);
-                    next_level.push(Self {
-                        ctx: self.ctx.clone(),
-                        limbs: truncated_limbs,
-                        _p: PhantomData,
-                    });
-                    i += 2;
-                } else {
-                    next_level.push(products[i].clone());
-                    i += 1;
-                }
-            }
-            products = next_level;
-        }
+    //     // Use tree reduction with our parallel-prefix adder.
+    //     // This gives us O(log n * log w) depth where n is the number of bits in other.
+    //     let mut products = partial_products;
+    //     while products.len() > 1 {
+    //         let mut next_level = Vec::new();
+    //         let mut i = 0;
+    //         while i < products.len() {
+    //             if i + 1 < products.len() {
+    //                 let sum = products[i].add(&products[i + 1], circuit);
+    //                 let mut truncated_limbs = sum.limbs;
+    //                 truncated_limbs.truncate(max_limbs);
+    //                 next_level.push(Self {
+    //                     ctx: self.ctx.clone(),
+    //                     limbs: truncated_limbs,
+    //                     _p: PhantomData,
+    //                 });
+    //                 i += 2;
+    //             } else {
+    //                 next_level.push(products[i].clone());
+    //                 i += 1;
+    //             }
+    //         }
+    //         products = next_level;
+    //     }
 
-        products.into_iter().next().unwrap_or_else(|| Self::zero(self.ctx.clone(), max_bit_size))
-    }
+    //     products.into_iter().next().unwrap_or_else(|| Self::zero(self.ctx.clone(), max_bit_size))
+    // }
 }
+
+// #[inline]
+// fn add_limbs_with_carry<P: Poly>(
+//     ctx: &BigUintPolyContext<P>,
+//     left: GateId,
+//     right: GateId,
+//     with_carry: bool,
+//     circuit: &mut PolyCircuit<P>,
+// ) -> (GateId, Option<GateId>) {
+//     if ctx.limb_bit_size > 1 {
+//         let sum = circuit.add_gate(left, right);
+//         let limb = circuit.public_lookup_gate(sum, ctx.lut_ids.0);
+//         if with_carry {
+//             let carry = circuit.public_lookup_gate(sum, ctx.lut_ids.1);
+//             (limb, Some(carry))
+//         } else {
+//             (limb, None)
+//         }
+//     } else {
+//         let sum = circuit.xor_gate(left, right);
+//         if with_carry {
+//             let carry = circuit.and_gate(left, right);
+//             (sum, Some(carry))
+//         } else {
+//             (sum, None)
+//         }
+//     }
+// }
 
 pub fn u64_to_biguint_poly<P: Poly>(
     limb_bit_size: usize,

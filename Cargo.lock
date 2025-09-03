@@ -562,7 +562,7 @@ checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 [[package]]
 name = "openfhe"
 version = "0.3.2"
-source = "git+https://github.com/MachinaIO/openfhe-rs.git#9c3326bce269e4d67a5761cd0a7c1fe8e5973c45"
+source = "git+https://github.com/MachinaIO/openfhe-rs.git#1845c23031b7c95040456003aafc892c3228741b"
 dependencies = [
  "cxx",
  "cxx-build",

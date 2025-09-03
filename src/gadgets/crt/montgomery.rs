@@ -127,22 +127,21 @@ impl<P: Poly> MontgomeryPoly<P> {
     pub fn add(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
         debug_assert_eq!(self.ctx, other.ctx);
 
-        let sum = self.value.add(&other.value, circuit);
+        // Compute full-width sum including carry
+        let sum_full = self.value.add(&other.value, circuit);
 
-        // Ensure sum has the same number of limbs as N for comparison
-        let sum_trimmed = BigUintPoly::new(
-            self.ctx.big_uint_ctx.clone(),
-            sum.limbs[0..self.ctx.num_limbs].to_vec(),
-        );
+        // Extend N by one limb for a correct comparison against the full sum (handles overflow)
+        let n_ext_bits = (self.ctx.num_limbs + 1) * self.ctx.big_uint_ctx.limb_bit_size;
+        let n_ext = self.ctx.const_n.extend_size(n_ext_bits);
 
-        // Check if sum >= N, and if so, subtract N
-        let (is_sum_less_n, diff_from_n) = sum_trimmed.less_than(&self.ctx.const_n, circuit);
+        // If sum_full < N then keep sum_full, else subtract N
+        let (is_less_than_n, diff_from_n) = sum_full.less_than(&n_ext, circuit);
+        let reduced_full = sum_full.cmux(&diff_from_n, is_less_than_n, circuit);
 
-        // cmux: selector=1 returns self, selector=0 returns other
-        // If sum < N (is_sum_less_n=1), use sum_trimmed, otherwise use diff_from_n
-        let result = sum_trimmed.cmux(&diff_from_n, is_sum_less_n, circuit);
+        // Return exactly r limbs; the top limb is zero after reduction
+        let reduced = reduced_full.mod_limbs(self.ctx.num_limbs);
 
-        Self { ctx: self.ctx.clone(), value: result }
+        Self { ctx: self.ctx.clone(), value: reduced }
     }
 
     /// Subtract two Montgomery representations  
@@ -199,11 +198,15 @@ fn montgomery_reduce<P: Poly>(
     let u = t.add(&m_times_n, circuit);
 
     // REDC result = floor(U / R) mod N: take upper limbs after shifting by r
-    let u_div = u.left_shift(r).mod_limbs(r);
+    // Use full width for comparison to avoid losing the top carry limb
+    let u_shifted = u.left_shift(r);
+    let n_ext_bits = (r + 1) * limb_bits;
+    let n_ext = ctx.const_n.extend_size(n_ext_bits);
 
-    let (is_less, diff) = u_div.less_than(&ctx.const_n, circuit);
-    // If u_div < N, keep u_div; otherwise use diff = u_div - N (mod B^r)
-    u_div.cmux(&diff, is_less, circuit)
+    let (is_less, diff) = u_shifted.less_than(&n_ext, circuit);
+    // If u_shifted < N, keep u_shifted; otherwise use diff = u_shifted - N
+    let reduced_full = u_shifted.cmux(&diff, is_less, circuit);
+    reduced_full.mod_limbs(r)
 }
 
 pub fn u64_to_montgomery_poly<P: Poly>(

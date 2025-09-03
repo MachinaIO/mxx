@@ -177,6 +177,8 @@ mod tests {
     use rand::Rng;
     use std::sync::Arc;
 
+    const LIMB_BIT_SIZE: usize = 3;
+
     fn gen_biguint_for_limb_size<R: Rng>(
         rng: &mut R,
         limb_bit_size: usize,
@@ -378,23 +380,22 @@ mod tests {
 
     #[test]
     fn test_crt_poly_add_multi_limb() {
-        let limb_bit_size = 3;
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (params, crt_ctx) = create_test_context(&mut circuit, limb_bit_size);
+        let (params, crt_ctx) = create_test_context(&mut circuit, LIMB_BIT_SIZE);
 
         let mut rng = rand::rng();
         let (_, crt_bits, _) = params.to_crt();
         let max_limbs = crt_bits.div_ceil(1);
-        let a: BigUint = gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs);
-        let b: BigUint = gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs);
+        let a: BigUint = gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs);
+        let b: BigUint = gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs);
         let expected_output_biguint = (&a + &b) % params.modulus().as_ref();
         let expected_output_slots =
             biguint_to_crt_slots::<DCRTPoly>(&params, &expected_output_biguint);
 
         let crt_poly_a = CrtPoly::input(crt_ctx.clone(), &mut circuit);
-        let values_a = biguint_to_crt_poly(limb_bit_size, &params, &a);
+        let values_a = biguint_to_crt_poly(LIMB_BIT_SIZE, &params, &a);
         let crt_poly_b = CrtPoly::input(crt_ctx.clone(), &mut circuit);
-        let values_b = biguint_to_crt_poly(limb_bit_size, &params, &b);
+        let values_b = biguint_to_crt_poly(LIMB_BIT_SIZE, &params, &b);
 
         let crt_sum = crt_poly_a.add(&crt_poly_b, &mut circuit);
 
@@ -426,25 +427,24 @@ mod tests {
     }
 
     #[test]
-    fn test_crt_poly_sub_limb3() {
-        let limb_bit_size = 3;
+    fn test_crt_poly_sub_multi_limb() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (params, crt_ctx) = create_test_context(&mut circuit, limb_bit_size);
+        let (params, crt_ctx) = create_test_context(&mut circuit, LIMB_BIT_SIZE);
 
         let mut rng = rand::rng();
         let (_, crt_bits, _) = params.to_crt();
-        let max_limbs = crt_bits.div_ceil(limb_bit_size);
-        let a: BigUint = gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs);
-        let b: BigUint = gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs);
+        let max_limbs = crt_bits.div_ceil(LIMB_BIT_SIZE);
+        let a: BigUint = gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs);
+        let b: BigUint = gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs);
         let expected_output_biguint =
             if a >= b { &a - &b } else { params.modulus().as_ref() - &b + &a };
         let expected_output_slots =
             biguint_to_crt_slots::<DCRTPoly>(&params, &expected_output_biguint);
 
         let crt_poly_a = CrtPoly::input(crt_ctx.clone(), &mut circuit);
-        let values_a = biguint_to_crt_poly(limb_bit_size, &params, &a);
+        let values_a = biguint_to_crt_poly(LIMB_BIT_SIZE, &params, &a);
         let crt_poly_b = CrtPoly::input(crt_ctx.clone(), &mut circuit);
-        let values_b = biguint_to_crt_poly(limb_bit_size, &params, &b);
+        let values_b = biguint_to_crt_poly(LIMB_BIT_SIZE, &params, &b);
 
         let crt_diff = crt_poly_a.sub(&crt_poly_b, &mut circuit);
 
@@ -476,24 +476,23 @@ mod tests {
     }
 
     #[test]
-    fn test_crt_poly_mul_limb3() {
-        let limb_bit_size = 3;
+    fn test_crt_poly_mul_multi_limb() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (params, crt_ctx) = create_test_context(&mut circuit, limb_bit_size);
+        let (params, crt_ctx) = create_test_context(&mut circuit, LIMB_BIT_SIZE);
 
         let mut rng = rand::rng();
         let (_, crt_bits, _) = params.to_crt();
         let max_limbs = crt_bits.div_ceil(1);
-        let a: BigUint = gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs);
-        let b: BigUint = gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs);
+        let a: BigUint = gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs);
+        let b: BigUint = gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs);
         let expected_output_biguint = (&a * &b) % params.modulus().as_ref();
         let expected_output_slots =
             biguint_to_crt_slots::<DCRTPoly>(&params, &expected_output_biguint);
 
         let crt_poly_a = CrtPoly::input(crt_ctx.clone(), &mut circuit);
-        let values_a = biguint_to_crt_poly(limb_bit_size, &params, &a);
+        let values_a = biguint_to_crt_poly(LIMB_BIT_SIZE, &params, &a);
         let crt_poly_b = CrtPoly::input(crt_ctx.clone(), &mut circuit);
-        let values_b = biguint_to_crt_poly(limb_bit_size, &params, &b);
+        let values_b = biguint_to_crt_poly(LIMB_BIT_SIZE, &params, &b);
 
         let crt_product = crt_poly_a.mul(&crt_poly_b, &mut circuit);
 

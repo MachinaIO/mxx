@@ -29,25 +29,25 @@ impl<T: MatrixElem> BaseMatrix<T> {
     }
 
     pub fn block_entries(&self, rows: Range<usize>, cols: Range<usize>) -> Vec<Vec<T>> {
-        debug_assert!(
+        assert!(
             rows.start <= rows.end,
             "Invalid row range: start {} > end {}",
             rows.start,
             rows.end
         );
-        debug_assert!(
+        assert!(
             cols.start <= cols.end,
             "Invalid column range: start {} > end {}",
             cols.start,
             cols.end
         );
-        debug_assert!(
+        assert!(
             rows.end <= self.nrow,
             "Row range end {} exceeds matrix rows {}",
             rows.end,
             self.nrow
         );
-        debug_assert!(
+        assert!(
             cols.end <= self.ncol,
             "Column range end {} exceeds matrix columns {}",
             cols.end,

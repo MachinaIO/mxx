@@ -55,7 +55,16 @@ impl<T: MatrixElem> BaseMatrix<T> {
         );
 
         parallel_iter!(rows)
-            .map(|i| self.inner[i][cols.start..cols.end].to_vec())
+            .map(|i| {
+                let row_len = self.inner[i].len();
+                if cols.end > row_len {
+                    panic!(
+                        "Matrix inconsistency: row {} has length {} but trying to access columns {}..{} (matrix claims ncol={})",
+                        i, row_len, cols.start, cols.end, self.ncol
+                    );
+                }
+                self.inner[i][cols.start..cols.end].to_vec()
+            })
             .collect::<Vec<Vec<_>>>()
     }
 

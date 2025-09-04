@@ -22,7 +22,7 @@ impl<P: Poly> PackedPlt<P> {
         params: &P::Params,
         crt_idx: usize,
         max_degree: usize,
-        hashmaps: Vec<HashMap<BigUint, (usize, BigUint)>>,
+        hashmap: HashMap<BigUint, (usize, BigUint)>,
     ) -> Self {
         let (moduli, _, crt_depth) = params.to_crt();
         debug_assert!(crt_idx <= crt_depth, "crt_idx must be <= crt_depth");
@@ -49,8 +49,8 @@ impl<P: Poly> PackedPlt<P> {
             // let q_ref: Arc<BigUint> = params.modulus().into();
             mul_scalars[i] = lag_basis.coeffs().iter().map(|c| c.value() * &q_over_qi).collect();
 
-            let mut lut_map: HashMap<P, (usize, P)> = HashMap::with_capacity(hashmaps[i].len());
-            for (input, (k, output)) in hashmaps[i].iter() {
+            let mut lut_map: HashMap<P, (usize, P)> = HashMap::with_capacity(hashmap.len());
+            for (input, (k, output)) in hashmap.iter() {
                 slots = vec![BigUint::ZERO; ring_n];
                 slots[i] = input.clone();
                 let key_poly =
@@ -117,10 +117,9 @@ mod tests {
             let value = BigUint::from(row_idx % 2);
             hashmap.insert(key, (row_idx, value));
         }
-        let hashmaps = vec![hashmap; ring_n];
         let slots = (0..ring_n).map(|i| BigUint::from(i)).collect::<Vec<_>>();
         let input_poly = DCRTPoly::from_biguints_eval_single_mod(&params, crt_idx, &slots);
-        let gadget = PackedPlt::setup(&mut circuit, &params, crt_idx, ring_n, hashmaps);
+        let gadget = PackedPlt::setup(&mut circuit, &params, crt_idx, ring_n, hashmap);
         let inputs = circuit.input(1);
         let slot_idx = 2;
         let out = gadget.lookup_single(&mut circuit, slot_idx, inputs[0]);
@@ -155,10 +154,9 @@ mod tests {
             let value = BigUint::from(row_idx % 2);
             hashmap.insert(key, (row_idx, value));
         }
-        let hashmaps = vec![hashmap; ring_n];
         let slots = (0..ring_n).map(|i| BigUint::from(i)).collect::<Vec<_>>();
         let input_poly = DCRTPoly::from_biguints_eval_single_mod(&params, crt_idx, &slots);
-        let gadget = PackedPlt::setup(&mut circuit, &params, crt_idx, ring_n, hashmaps);
+        let gadget = PackedPlt::setup(&mut circuit, &params, crt_idx, ring_n, hashmap);
         let inputs = circuit.input(1);
         let qi = moduli[crt_idx];
         let q_over_qi = params.modulus().as_ref() / BigUint::from(qi);

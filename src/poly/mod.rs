@@ -60,12 +60,12 @@ pub trait Poly:
     fn from_biguints_eval(params: &Self::Params, slots: &[BigUint]) -> Self;
     fn from_biguints_eval_single_mod(
         params: &Self::Params,
-        modulus_idx: usize,
+        crt_idx: usize,
         slots: &[BigUint],
     ) -> Self {
         let poly_q = Self::from_biguints_eval(params, slots);
         let (moduli, _, _) = params.to_crt();
-        let q_i = BigUint::from(moduli[modulus_idx]);
+        let q_i = BigUint::from(moduli[crt_idx]);
         let coeffs = poly_q.coeffs().into_iter().map(|c| c.value() % &q_i).collect::<Vec<_>>();
         Self::from_biguints(params, &coeffs)
     }

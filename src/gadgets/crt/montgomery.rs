@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crate::{
     circuit::{PolyCircuit, gate::GateId},
-    gadgets::crt::bigunit::{BigUintPoly, BigUintPolyContext, u64_to_biguint_poly},
-    poly::Poly,
+    gadgets::crt::bigunit::{BigUintPoly, BigUintPolyContext},
+    poly::{Poly, PolyParams},
     utils::mod_inverse,
 };
 use num_bigint::BigUint;
@@ -42,7 +42,13 @@ impl<P: Poly> MontgomeryContext<P> {
         num_limbs: usize,
         n: u64,
     ) -> Self {
-        let big_uint_ctx = Arc::new(BigUintPolyContext::setup(circuit, params, limb_bit_size));
+        let big_uint_ctx = Arc::new(BigUintPolyContext::setup(
+            circuit,
+            params,
+            limb_bit_size,
+            0, // use CRT index 0 for Montgomery tests
+            params.ring_dimension() as usize,
+        ));
 
         // Calculate R = 2^(limb_bit_size * num_limbs)
         let r_bits = limb_bit_size * num_limbs;
@@ -216,12 +222,16 @@ pub fn u64_to_montgomery_poly<P: Poly>(
     params: &P::Params,
     input: u64,
 ) -> Vec<P> {
-    u64_to_biguint_poly(
-        limb_bit_size,
-        params,
-        u64_to_montgomery_form(limb_bit_size, num_limbs, n, input),
-        Some(num_limbs),
-    )
+    // Build constant limbs across the ring for the Montgomery value
+    let base = 1u64 << limb_bit_size;
+    let mut v = u64_to_montgomery_form(limb_bit_size, num_limbs, n, input);
+    let mut limbs = Vec::with_capacity(num_limbs);
+    for _ in 0..num_limbs {
+        let limb = (v % base) as usize;
+        limbs.push(P::from_usize_to_constant(params, limb));
+        v /= base;
+    }
+    limbs
 }
 
 fn u64_to_montgomery_form(limb_bit_size: usize, num_limbs: usize, n: u64, input: u64) -> u64 {
@@ -360,12 +370,15 @@ mod tests {
         let test_value = 5u64;
         let r = ctx.num_limbs * ctx.big_uint_ctx.limb_bit_size;
         let regular_value = BigUintPoly::input(ctx.big_uint_ctx.clone(), &mut circuit, r);
-        let input_values = u64_to_biguint_poly(
-            ctx.big_uint_ctx.limb_bit_size,
-            &params,
-            test_value,
-            Some(ctx.num_limbs),
-        );
+        // Build constant-limb input for the regular value
+        let base = 1u64 << ctx.big_uint_ctx.limb_bit_size;
+        let mut v = test_value;
+        let mut input_values = Vec::with_capacity(ctx.num_limbs);
+        for _ in 0..ctx.num_limbs {
+            let limb = (v % base) as usize;
+            input_values.push(DCRTPoly::from_usize_to_constant(&params, limb));
+            v /= base;
+        }
 
         // Convert to Montgomery form and back to regular
         let montgomery_value =

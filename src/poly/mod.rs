@@ -58,6 +58,17 @@ pub trait Poly:
     fn from_coeffs(params: &Self::Params, coeffs: &[Self::Elem]) -> Self;
     fn from_biguints(params: &Self::Params, coeffs: &[BigUint]) -> Self;
     fn from_biguints_eval(params: &Self::Params, slots: &[BigUint]) -> Self;
+    fn from_biguints_eval_single_mod(
+        params: &Self::Params,
+        modulus_idx: usize,
+        slots: &[BigUint],
+    ) -> Self {
+        let poly_q = Self::from_biguints_eval(params, slots);
+        let (moduli, _, _) = params.to_crt();
+        let q_i = BigUint::from(moduli[modulus_idx]);
+        let coeffs = poly_q.coeffs().into_iter().map(|c| c.value() % &q_i).collect::<Vec<_>>();
+        Self::from_biguints(params, &coeffs)
+    }
     fn from_decomposed(params: &Self::Params, decomposed: &[Self]) -> Self;
     fn from_bytes(params: &Self::Params, bytes: &[u8]) -> Self {
         let log_q_bytes = params.modulus_bits().div_ceil(8);

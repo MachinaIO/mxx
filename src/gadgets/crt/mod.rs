@@ -4,7 +4,7 @@ use crate::{
     circuit::{PolyCircuit, gate::GateId},
     gadgets::crt::{
         bigunit::BigUintPoly,
-        montgomery::{MontgomeryContext, MontgomeryPoly, u64_to_montgomery_poly},
+        montgomery::{MontgomeryContext, MontgomeryPoly, u64_vec_to_montgomery_poly},
     },
     poly::{Poly, PolyParams},
     utils::mod_inverse,
@@ -29,13 +29,15 @@ impl<P: Poly> CrtContext<P> {
 
         let (mont_ctxes, q_over_qis, reconstruct_coeffs): (Vec<_>, Vec<_>, Vec<_>) = moduli
             .iter()
-            .map(|&modulus| {
+            .enumerate()
+            .map(|(crt_idx, &modulus)| {
                 let mont_ctx = Arc::new(MontgomeryContext::setup(
                     circuit,
                     params,
                     limb_bit_size,
                     num_limbs,
                     modulus,
+                    crt_idx,
                 ));
 
                 let modulus_big = BigUint::from(modulus);
@@ -138,17 +140,29 @@ impl<P: Poly> CrtPoly<P> {
     }
 }
 
-pub fn biguint_to_crt_poly<P: Poly>(
+pub fn biguint_vec_to_crt_poly<P: Poly>(
     limb_bit_size: usize,
     params: &P::Params,
-    input: &BigUint,
+    inputs: &[BigUint],
 ) -> Vec<P> {
-    let crted_inputs = biguint_to_crt_slots::<P>(params, input);
-    let (moduli, crt_bits, _crt_depth) = params.to_crt();
+    // For each CRT modulus q_i, pack inputs[j] % q_i into evaluation slot j, then
+    // convert to Montgomery form limbs and append. Total limbs = num_limbs_per_slot * crt_depth.
+    let (moduli, crt_bits, crt_depth) = params.to_crt();
     let num_limbs = crt_bits.div_ceil(limb_bit_size);
-    let mut limb_polys: Vec<P> = vec![];
-    for (module, input) in moduli.into_iter().zip(crted_inputs.into_iter()) {
-        limb_polys.extend(u64_to_montgomery_poly(limb_bit_size, num_limbs, module, params, input));
+    let ring_n = params.ring_dimension() as usize;
+    let mut limb_polys: Vec<P> = Vec::with_capacity(num_limbs * crt_depth);
+    for (i, &qi) in moduli.iter().enumerate() {
+        // Build per-slot residues for this modulus
+        let mut residues: Vec<u64> = vec![0; ring_n];
+        for (j, val) in inputs.iter().enumerate() {
+            if j < ring_n {
+                residues[j] = (val % qi).to_u64().unwrap_or(0);
+            }
+        }
+        // Convert to Montgomery limbs for this modulus tower, using crt_idx = i
+        let limbs_i =
+            u64_vec_to_montgomery_poly(limb_bit_size, num_limbs, i, qi, params, &residues);
+        limb_polys.extend(limbs_i);
     }
     debug_assert_eq!(limb_polys.len(), num_limbs_of_crt_poly::<P>(limb_bit_size, params));
     limb_polys
@@ -169,7 +183,6 @@ pub fn num_limbs_of_crt_poly<P: Poly>(limb_bit_size: usize, params: &P::Params) 
 mod tests {
     use super::*;
     use crate::{
-        element::PolyElem,
         lookup::poly::PolyPltEvaluator,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
@@ -219,17 +232,26 @@ mod tests {
         let (params, crt_ctx) = create_test_context(&mut circuit, 1);
 
         let mut rng = rand::rng();
-        let (_, crt_bits, _) = params.to_crt();
-        let max_limbs = crt_bits.div_ceil(1);
-        let a: BigUint = gen_biguint_for_limb_size(&mut rng, 1, max_limbs);
-        let b: BigUint = gen_biguint_for_limb_size(&mut rng, 1, max_limbs);
-        let expected_output_biguint = (&a + &b) % params.modulus().as_ref();
-        let expected_output_slots =
-            biguint_to_crt_slots::<DCRTPoly>(&params, &expected_output_biguint);
+        let (_, crt_bits, crt_depth) = params.to_crt();
+        let max_limbs = crt_bits.div_ceil(LIMB_BIT_SIZE);
+        let n = params.ring_dimension() as usize;
+        let a_vec: Vec<BigUint> =
+            (0..n).map(|_| gen_biguint_for_limb_size(&mut rng, 1, max_limbs)).collect::<Vec<_>>();
+        let b_vec: Vec<BigUint> =
+            (0..n).map(|_| gen_biguint_for_limb_size(&mut rng, 1, max_limbs)).collect::<Vec<_>>();
+        let expected_output_biguint = a_vec
+            .iter()
+            .zip(b_vec.iter())
+            .map(|(a, b)| (a + b) % params.modulus().as_ref())
+            .collect::<Vec<_>>();
+        let expected_output_slots = expected_output_biguint
+            .iter()
+            .map(|big| biguint_to_crt_slots::<DCRTPoly>(&params, big))
+            .collect::<Vec<_>>();
         let crt_poly_a = CrtPoly::input(crt_ctx.clone(), &mut circuit);
-        let values_a = biguint_to_crt_poly(1, &params, &a);
+        let values_a = biguint_vec_to_crt_poly(1, &params, &a_vec);
         let crt_poly_b = CrtPoly::input(crt_ctx.clone(), &mut circuit);
-        let values_b = biguint_to_crt_poly(1, &params, &b);
+        let values_b = biguint_vec_to_crt_poly(1, &params, &b_vec);
 
         // Perform addition
         let crt_sum = crt_poly_a.add(&crt_poly_b, &mut circuit);
@@ -251,20 +273,21 @@ mod tests {
         );
 
         // Verify the results for each CRT slot and the reconstructed integer
-        assert_eq!(eval_result.len(), crt_ctx.mont_ctxes.len() + 1);
+        assert_eq!(eval_result.len(), crt_depth + 1);
 
         // Verify the output in the CRT form
-        for (i, expected_slot) in expected_output_slots.into_iter().enumerate() {
-            assert_eq!(
-                eval_result[i].coeffs()[0].value(),
-                &(&crt_ctx.q_over_qis[i] * BigUint::from(expected_slot))
-            );
+        for i in 0..crt_depth {
+            let slots =
+                (0..n).map(|j| BigUint::from(expected_output_slots[j][i])).collect::<Vec<_>>();
+            let q_over_qi =
+                DCRTPoly::from_biguint_to_constant(&params, crt_ctx.q_over_qis[i].clone());
+            let expected_poly =
+                DCRTPoly::from_biguints_eval_single_mod(&params, i, &slots) * q_over_qi;
+            assert_eq!(eval_result[i], expected_poly);
         }
+        let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_output_biguint);
         // Verify reconstructed integer modulo q
-        assert_eq!(
-            eval_result[crt_ctx.mont_ctxes.len()].coeffs()[0].value(),
-            &expected_output_biguint
-        );
+        assert_eq!(eval_result[crt_ctx.mont_ctxes.len()], expected_poly);
     }
 
     #[test]
@@ -272,21 +295,28 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, crt_ctx) = create_test_context(&mut circuit, 1);
 
-        // Generate random values appropriate for the LIMB_BIT_SIZE
         let mut rng = rand::rng();
-        let (_, crt_bits, _) = params.to_crt();
+        let (_, crt_bits, crt_depth) = params.to_crt();
         let max_limbs = crt_bits.div_ceil(1);
-        let a: BigUint = gen_biguint_for_limb_size(&mut rng, 1, max_limbs);
-        let b: BigUint = gen_biguint_for_limb_size(&mut rng, 1, max_limbs);
-        let expected_output_biguint =
-            if a >= b { &a - &b } else { params.modulus().as_ref() - &b + &a };
-        let expected_output_slots =
-            biguint_to_crt_slots::<DCRTPoly>(&params, &expected_output_biguint);
+        let n = params.ring_dimension() as usize;
+        let a_vec: Vec<BigUint> =
+            (0..n).map(|_| gen_biguint_for_limb_size(&mut rng, 1, max_limbs)).collect::<Vec<_>>();
+        let b_vec: Vec<BigUint> =
+            (0..n).map(|_| gen_biguint_for_limb_size(&mut rng, 1, max_limbs)).collect::<Vec<_>>();
+        let expected_output_biguint = a_vec
+            .iter()
+            .zip(b_vec.iter())
+            .map(|(a, b)| if a >= b { a - b } else { params.modulus().as_ref() - b + a })
+            .collect::<Vec<_>>();
+        let expected_output_slots = expected_output_biguint
+            .iter()
+            .map(|big| biguint_to_crt_slots::<DCRTPoly>(&params, big))
+            .collect::<Vec<_>>();
 
         let crt_poly_a = CrtPoly::input(crt_ctx.clone(), &mut circuit);
-        let values_a = biguint_to_crt_poly(1, &params, &a);
+        let values_a = biguint_vec_to_crt_poly(1, &params, &a_vec);
         let crt_poly_b = CrtPoly::input(crt_ctx.clone(), &mut circuit);
-        let values_b = biguint_to_crt_poly(1, &params, &b);
+        let values_b = biguint_vec_to_crt_poly(1, &params, &b_vec);
 
         // Perform subtraction
         let crt_diff = crt_poly_a.sub(&crt_poly_b, &mut circuit);
@@ -308,20 +338,21 @@ mod tests {
         );
 
         // Verify the results for each CRT slot and the reconstructed integer
-        assert_eq!(eval_result.len(), crt_ctx.mont_ctxes.len() + 1);
+        assert_eq!(eval_result.len(), crt_depth + 1);
 
         // Verify the output in the CRT form
-        for (i, expected_slot) in expected_output_slots.into_iter().enumerate() {
-            assert_eq!(
-                eval_result[i].coeffs()[0].value(),
-                &(&crt_ctx.q_over_qis[i] * BigUint::from(expected_slot))
-            );
+        for i in 0..crt_depth {
+            let slots =
+                (0..n).map(|j| BigUint::from(expected_output_slots[j][i])).collect::<Vec<_>>();
+            let q_over_qi =
+                DCRTPoly::from_biguint_to_constant(&params, crt_ctx.q_over_qis[i].clone());
+            let expected_poly =
+                DCRTPoly::from_biguints_eval_single_mod(&params, i, &slots) * q_over_qi;
+            assert_eq!(eval_result[i], expected_poly);
         }
+        let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_output_biguint);
         // Verify reconstructed integer modulo q
-        assert_eq!(
-            eval_result[crt_ctx.mont_ctxes.len()].coeffs()[0].value(),
-            &expected_output_biguint
-        );
+        assert_eq!(eval_result[crt_ctx.mont_ctxes.len()], expected_poly);
     }
 
     #[test]
@@ -330,17 +361,26 @@ mod tests {
         let (params, crt_ctx) = create_test_context(&mut circuit, 1);
 
         let mut rng = rand::rng();
-        let (_, crt_bits, _) = params.to_crt();
+        let (_, crt_bits, crt_depth) = params.to_crt();
         let max_limbs = crt_bits.div_ceil(1);
-        let a: BigUint = gen_biguint_for_limb_size(&mut rng, 1, max_limbs);
-        let b: BigUint = gen_biguint_for_limb_size(&mut rng, 1, max_limbs);
-        let expected_output_biguint = (&a * &b) % params.modulus().as_ref();
-        let expected_output_slots =
-            biguint_to_crt_slots::<DCRTPoly>(&params, &expected_output_biguint);
+        let n = params.ring_dimension() as usize;
+        let a_vec: Vec<BigUint> =
+            (0..n).map(|_| gen_biguint_for_limb_size(&mut rng, 1, max_limbs)).collect::<Vec<_>>();
+        let b_vec: Vec<BigUint> =
+            (0..n).map(|_| gen_biguint_for_limb_size(&mut rng, 1, max_limbs)).collect::<Vec<_>>();
+        let expected_output_biguint = a_vec
+            .iter()
+            .zip(b_vec.iter())
+            .map(|(a, b)| (a * b) % params.modulus().as_ref())
+            .collect::<Vec<_>>();
+        let expected_output_slots = expected_output_biguint
+            .iter()
+            .map(|big| biguint_to_crt_slots::<DCRTPoly>(&params, big))
+            .collect::<Vec<_>>();
         let crt_poly_a = CrtPoly::input(crt_ctx.clone(), &mut circuit);
-        let values_a = biguint_to_crt_poly(1, &params, &a);
+        let values_a = biguint_vec_to_crt_poly(1, &params, &a_vec);
         let crt_poly_b = CrtPoly::input(crt_ctx.clone(), &mut circuit);
-        let values_b = biguint_to_crt_poly(1, &params, &b);
+        let values_b = biguint_vec_to_crt_poly(1, &params, &b_vec);
 
         // Perform multiplication
         let crt_product = crt_poly_a.mul(&crt_poly_b, &mut circuit);
@@ -362,20 +402,21 @@ mod tests {
         );
 
         // Verify the results for each CRT slot and the reconstructed integer
-        assert_eq!(eval_result.len(), crt_ctx.mont_ctxes.len() + 1);
+        assert_eq!(eval_result.len(), crt_depth + 1);
 
         // Verify the output in the CRT form
-        for (i, expected_slot) in expected_output_slots.into_iter().enumerate() {
-            assert_eq!(
-                eval_result[i].coeffs()[0].value(),
-                &(&crt_ctx.q_over_qis[i] * BigUint::from(expected_slot))
-            );
+        for i in 0..crt_depth {
+            let slots =
+                (0..n).map(|j| BigUint::from(expected_output_slots[j][i])).collect::<Vec<_>>();
+            let q_over_qi =
+                DCRTPoly::from_biguint_to_constant(&params, crt_ctx.q_over_qis[i].clone());
+            let expected_poly =
+                DCRTPoly::from_biguints_eval_single_mod(&params, i, &slots) * q_over_qi;
+            assert_eq!(eval_result[i], expected_poly);
         }
+        let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_output_biguint);
         // Verify reconstructed integer modulo q
-        assert_eq!(
-            eval_result[crt_ctx.mont_ctxes.len()].coeffs()[0].value(),
-            &expected_output_biguint
-        );
+        assert_eq!(eval_result[crt_ctx.mont_ctxes.len()], expected_poly);
     }
 
     #[test]
@@ -384,18 +425,29 @@ mod tests {
         let (params, crt_ctx) = create_test_context(&mut circuit, LIMB_BIT_SIZE);
 
         let mut rng = rand::rng();
-        let (_, crt_bits, _) = params.to_crt();
-        let max_limbs = crt_bits.div_ceil(1);
-        let a: BigUint = gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs);
-        let b: BigUint = gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs);
-        let expected_output_biguint = (&a + &b) % params.modulus().as_ref();
-        let expected_output_slots =
-            biguint_to_crt_slots::<DCRTPoly>(&params, &expected_output_biguint);
+        let (_, crt_bits, crt_depth) = params.to_crt();
+        let max_limbs = crt_bits.div_ceil(LIMB_BIT_SIZE);
+        let n = params.ring_dimension() as usize;
+        let a_vec: Vec<BigUint> = (0..n)
+            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs))
+            .collect::<Vec<_>>();
+        let b_vec: Vec<BigUint> = (0..n)
+            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs))
+            .collect::<Vec<_>>();
+        let expected_output_biguint = a_vec
+            .iter()
+            .zip(b_vec.iter())
+            .map(|(a, b)| (a + b) % params.modulus().as_ref())
+            .collect::<Vec<_>>();
+        let expected_output_slots = expected_output_biguint
+            .iter()
+            .map(|big| biguint_to_crt_slots::<DCRTPoly>(&params, big))
+            .collect::<Vec<_>>();
 
         let crt_poly_a = CrtPoly::input(crt_ctx.clone(), &mut circuit);
-        let values_a = biguint_to_crt_poly(LIMB_BIT_SIZE, &params, &a);
+        let values_a = biguint_vec_to_crt_poly(LIMB_BIT_SIZE, &params, &a_vec);
         let crt_poly_b = CrtPoly::input(crt_ctx.clone(), &mut circuit);
-        let values_b = biguint_to_crt_poly(LIMB_BIT_SIZE, &params, &b);
+        let values_b = biguint_vec_to_crt_poly(LIMB_BIT_SIZE, &params, &b_vec);
 
         let crt_sum = crt_poly_a.add(&crt_poly_b, &mut circuit);
 
@@ -413,17 +465,18 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        assert_eq!(eval_result.len(), crt_ctx.mont_ctxes.len() + 1);
-        for (i, expected_slot) in expected_output_slots.into_iter().enumerate() {
-            assert_eq!(
-                eval_result[i].coeffs()[0].value(),
-                &(&crt_ctx.q_over_qis[i] * BigUint::from(expected_slot))
-            );
+        assert_eq!(eval_result.len(), crt_depth + 1);
+        for i in 0..crt_depth {
+            let slots =
+                (0..n).map(|j| BigUint::from(expected_output_slots[j][i])).collect::<Vec<_>>();
+            let q_over_qi =
+                DCRTPoly::from_biguint_to_constant(&params, crt_ctx.q_over_qis[i].clone());
+            let expected_poly =
+                DCRTPoly::from_biguints_eval_single_mod(&params, i, &slots) * q_over_qi;
+            assert_eq!(eval_result[i], expected_poly);
         }
-        assert_eq!(
-            eval_result[crt_ctx.mont_ctxes.len()].coeffs()[0].value(),
-            &expected_output_biguint
-        );
+        let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_output_biguint);
+        assert_eq!(eval_result[crt_ctx.mont_ctxes.len()], expected_poly);
     }
 
     #[test]
@@ -432,19 +485,29 @@ mod tests {
         let (params, crt_ctx) = create_test_context(&mut circuit, LIMB_BIT_SIZE);
 
         let mut rng = rand::rng();
-        let (_, crt_bits, _) = params.to_crt();
+        let (_, crt_bits, crt_depth) = params.to_crt();
         let max_limbs = crt_bits.div_ceil(LIMB_BIT_SIZE);
-        let a: BigUint = gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs);
-        let b: BigUint = gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs);
-        let expected_output_biguint =
-            if a >= b { &a - &b } else { params.modulus().as_ref() - &b + &a };
-        let expected_output_slots =
-            biguint_to_crt_slots::<DCRTPoly>(&params, &expected_output_biguint);
+        let n = params.ring_dimension() as usize;
+        let a_vec: Vec<BigUint> = (0..n)
+            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs))
+            .collect::<Vec<_>>();
+        let b_vec: Vec<BigUint> = (0..n)
+            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs))
+            .collect::<Vec<_>>();
+        let expected_output_biguint = a_vec
+            .iter()
+            .zip(b_vec.iter())
+            .map(|(a, b)| if a >= b { a - b } else { params.modulus().as_ref() - b + a })
+            .collect::<Vec<_>>();
+        let expected_output_slots = expected_output_biguint
+            .iter()
+            .map(|big| biguint_to_crt_slots::<DCRTPoly>(&params, big))
+            .collect::<Vec<_>>();
 
         let crt_poly_a = CrtPoly::input(crt_ctx.clone(), &mut circuit);
-        let values_a = biguint_to_crt_poly(LIMB_BIT_SIZE, &params, &a);
+        let values_a = biguint_vec_to_crt_poly(LIMB_BIT_SIZE, &params, &a_vec);
         let crt_poly_b = CrtPoly::input(crt_ctx.clone(), &mut circuit);
-        let values_b = biguint_to_crt_poly(LIMB_BIT_SIZE, &params, &b);
+        let values_b = biguint_vec_to_crt_poly(LIMB_BIT_SIZE, &params, &b_vec);
 
         let crt_diff = crt_poly_a.sub(&crt_poly_b, &mut circuit);
 
@@ -462,17 +525,18 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        assert_eq!(eval_result.len(), crt_ctx.mont_ctxes.len() + 1);
-        for (i, expected_slot) in expected_output_slots.into_iter().enumerate() {
-            assert_eq!(
-                eval_result[i].coeffs()[0].value(),
-                &(&crt_ctx.q_over_qis[i] * BigUint::from(expected_slot))
-            );
+        assert_eq!(eval_result.len(), crt_depth + 1);
+        for i in 0..crt_depth {
+            let slots =
+                (0..n).map(|j| BigUint::from(expected_output_slots[j][i])).collect::<Vec<_>>();
+            let q_over_qi =
+                DCRTPoly::from_biguint_to_constant(&params, crt_ctx.q_over_qis[i].clone());
+            let expected_poly =
+                DCRTPoly::from_biguints_eval_single_mod(&params, i, &slots) * q_over_qi;
+            assert_eq!(eval_result[i], expected_poly);
         }
-        assert_eq!(
-            eval_result[crt_ctx.mont_ctxes.len()].coeffs()[0].value(),
-            &expected_output_biguint
-        );
+        let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_output_biguint);
+        assert_eq!(eval_result[crt_ctx.mont_ctxes.len()], expected_poly);
     }
 
     #[test]
@@ -481,18 +545,29 @@ mod tests {
         let (params, crt_ctx) = create_test_context(&mut circuit, LIMB_BIT_SIZE);
 
         let mut rng = rand::rng();
-        let (_, crt_bits, _) = params.to_crt();
-        let max_limbs = crt_bits.div_ceil(1);
-        let a: BigUint = gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs);
-        let b: BigUint = gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs);
-        let expected_output_biguint = (&a * &b) % params.modulus().as_ref();
-        let expected_output_slots =
-            biguint_to_crt_slots::<DCRTPoly>(&params, &expected_output_biguint);
+        let (_, crt_bits, crt_depth) = params.to_crt();
+        let max_limbs = crt_bits.div_ceil(LIMB_BIT_SIZE);
+        let n = params.ring_dimension() as usize;
+        let a_vec: Vec<BigUint> = (0..n)
+            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs))
+            .collect::<Vec<_>>();
+        let b_vec: Vec<BigUint> = (0..n)
+            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs))
+            .collect::<Vec<_>>();
+        let expected_output_biguint = a_vec
+            .iter()
+            .zip(b_vec.iter())
+            .map(|(a, b)| (a * b) % params.modulus().as_ref())
+            .collect::<Vec<_>>();
+        let expected_output_slots = expected_output_biguint
+            .iter()
+            .map(|big| biguint_to_crt_slots::<DCRTPoly>(&params, big))
+            .collect::<Vec<_>>();
 
         let crt_poly_a = CrtPoly::input(crt_ctx.clone(), &mut circuit);
-        let values_a = biguint_to_crt_poly(LIMB_BIT_SIZE, &params, &a);
+        let values_a = biguint_vec_to_crt_poly(LIMB_BIT_SIZE, &params, &a_vec);
         let crt_poly_b = CrtPoly::input(crt_ctx.clone(), &mut circuit);
-        let values_b = biguint_to_crt_poly(LIMB_BIT_SIZE, &params, &b);
+        let values_b = biguint_vec_to_crt_poly(LIMB_BIT_SIZE, &params, &b_vec);
 
         let crt_product = crt_poly_a.mul(&crt_poly_b, &mut circuit);
 
@@ -510,16 +585,17 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        assert_eq!(eval_result.len(), crt_ctx.mont_ctxes.len() + 1);
-        for (i, expected_slot) in expected_output_slots.into_iter().enumerate() {
-            assert_eq!(
-                eval_result[i].coeffs()[0].value(),
-                &(&crt_ctx.q_over_qis[i] * BigUint::from(expected_slot))
-            );
+        assert_eq!(eval_result.len(), crt_depth + 1);
+        for i in 0..crt_depth {
+            let slots =
+                (0..n).map(|j| BigUint::from(expected_output_slots[j][i])).collect::<Vec<_>>();
+            let q_over_qi =
+                DCRTPoly::from_biguint_to_constant(&params, crt_ctx.q_over_qis[i].clone());
+            let expected_poly =
+                DCRTPoly::from_biguints_eval_single_mod(&params, i, &slots) * q_over_qi;
+            assert_eq!(eval_result[i], expected_poly);
         }
-        assert_eq!(
-            eval_result[crt_ctx.mont_ctxes.len()].coeffs()[0].value(),
-            &expected_output_biguint
-        );
+        let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_output_biguint);
+        assert_eq!(eval_result[crt_ctx.mont_ctxes.len()], expected_poly);
     }
 }

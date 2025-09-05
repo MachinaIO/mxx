@@ -41,12 +41,13 @@ impl<P: Poly> MontgomeryContext<P> {
         limb_bit_size: usize,
         num_limbs: usize,
         n: u64,
+        crt_idx: usize,
     ) -> Self {
         let big_uint_ctx = Arc::new(BigUintPolyContext::setup(
             circuit,
             params,
             limb_bit_size,
-            0, // use CRT index 0 for Montgomery tests
+            crt_idx,
             params.ring_dimension() as usize,
         ));
 
@@ -264,7 +265,14 @@ mod tests {
         // Use a small modulus for testing: N = 17 (prime number)
         // With LIMB_BIT_SIZE = 1 and NUM_LIMBS = 5, R = 2^5 = 32 > N = 17
         let n = 17u64;
-        let ctx = Arc::new(MontgomeryContext::setup(circuit, &params, LIMB_BIT_SIZE, NUM_LIMBS, n));
+        let ctx = Arc::new(MontgomeryContext::setup(
+            circuit,
+            &params,
+            LIMB_BIT_SIZE,
+            NUM_LIMBS,
+            n,
+            CRT_IDX,
+        ));
         (params, ctx)
     }
 
@@ -277,7 +285,14 @@ mod tests {
         let _inputs = circuit.input(1);
 
         let n = 17u64;
-        let ctx = MontgomeryContext::setup(&mut circuit, &params, LIMB_BIT_SIZE, NUM_LIMBS, n);
+        let ctx = MontgomeryContext::setup(
+            &mut circuit,
+            &params,
+            LIMB_BIT_SIZE,
+            NUM_LIMBS,
+            n,
+            CRT_IDX,
+        );
 
         // We can't easily extract the actual value without running the circuit,
         // but we can verify the structure is correct

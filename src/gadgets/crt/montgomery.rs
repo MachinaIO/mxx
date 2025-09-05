@@ -42,13 +42,14 @@ impl<P: Poly> MontgomeryContext<P> {
         num_limbs: usize,
         n: u64,
         crt_idx: usize,
+        max_degree: usize,
     ) -> Self {
         let big_uint_ctx = Arc::new(BigUintPolyContext::setup(
             circuit,
             params,
             limb_bit_size,
             crt_idx,
-            params.ring_dimension() as usize,
+            max_degree,
         ));
 
         // Calculate R = 2^(limb_bit_size * num_limbs)
@@ -272,6 +273,7 @@ mod tests {
             NUM_LIMBS,
             n,
             CRT_IDX,
+            params.ring_dimension() as usize,
         ));
         (params, ctx)
     }
@@ -292,6 +294,7 @@ mod tests {
             NUM_LIMBS,
             n,
             CRT_IDX,
+            params.ring_dimension() as usize,
         );
 
         // We can't easily extract the actual value without running the circuit,

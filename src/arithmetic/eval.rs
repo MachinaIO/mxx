@@ -5,16 +5,15 @@ use crate::{
         public_key::BggPublicKey,
         sampler::{BGGEncodingSampler, BGGPublicKeySampler},
     },
-    gadgets::{
-        crt::{biguint_to_crt_poly, num_limbs_of_crt_poly},
-        packed_crt::{biguints_to_packed_crt_polys, num_packed_crt_poly},
+    gadgets::crt::{
+        biguint_vec_to_crt_poly, biguint_vec_to_packed_crt_poly, num_limbs_of_crt_poly,
     },
     lookup::{
         lwe_eval::{LweBggEncodingPltEvaluator, LweBggPubKeyEvaluator},
         poly::PolyPltEvaluator,
     },
     matrix::PolyMatrix,
-    poly::Poly,
+    poly::{Poly, PolyParams},
     sampler::{PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
     storage::{init_storage_system, wait_for_all_writes},
 };
@@ -25,15 +24,18 @@ use tracing::info;
 const TAG_BGG_PUBKEY: &[u8] = b"BGG_PUBKEY";
 
 impl<P: Poly> ArithmeticCircuit<P> {
-    pub fn evaluate_with_poly(&self, params: &P::Params, inputs: &[BigUint]) -> Vec<P> {
+    pub fn evaluate_with_poly(&self, params: &P::Params, inputs: &[&[BigUint]]) -> Vec<P> {
         let one = P::const_one(params);
         let input_polys = if self.use_packing {
-            biguints_to_packed_crt_polys::<P>(self.limb_bit_size, params, inputs)
+            inputs
+                .into_iter()
+                .flat_map(|input| biguint_vec_to_packed_crt_poly(self.limb_bit_size, params, input))
+                .collect::<Vec<_>>()
         } else {
             inputs
-                .iter()
-                .flat_map(|input| biguint_to_crt_poly(self.limb_bit_size, params, input))
-                .collect()
+                .into_iter()
+                .flat_map(|input| biguint_vec_to_crt_poly(self.limb_bit_size, params, input))
+                .collect::<Vec<_>>()
         };
         let plt_evaluator = if self.use_packing || self.limb_bit_size > 1 {
             Some(PolyPltEvaluator::new())
@@ -84,7 +86,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
         params: &P::Params,
         seed: [u8; 32],
         dir_path: PathBuf,
-        inputs: &[BigUint],
+        inputs: &[&[BigUint]],
         secret: &[P],
         p: M,
         error_sigma: f64,
@@ -96,12 +98,15 @@ impl<P: Poly> ArithmeticCircuit<P> {
     {
         let bgg_encoding_sampler = BGGEncodingSampler::<SU>::new(params, secret, Some(error_sigma));
         let plaintexts = if self.use_packing {
-            biguints_to_packed_crt_polys(self.limb_bit_size, params, inputs)
+            inputs
+                .into_iter()
+                .flat_map(|input| biguint_vec_to_packed_crt_poly(self.limb_bit_size, params, input))
+                .collect::<Vec<_>>()
         } else {
             inputs
                 .into_iter()
-                .flat_map(|input| biguint_to_crt_poly(self.limb_bit_size, params, input))
-                .collect()
+                .flat_map(|input| biguint_vec_to_crt_poly(self.limb_bit_size, params, input))
+                .collect::<Vec<_>>()
         };
         let pubkeys = self.sample_input_pubkeys::<M, SH>(params, seed, secret.len());
         let encodings = bgg_encoding_sampler.sample(params, &pubkeys, &plaintexts);
@@ -121,7 +126,9 @@ impl<P: Poly> ArithmeticCircuit<P> {
         SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     {
         let num_given_input_polys = if self.use_packing {
-            num_packed_crt_poly::<P>(self.limb_bit_size, params, self.num_inputs)
+            let (_, crt_bits, _) = params.to_crt();
+            let num_limbs_per_slot = crt_bits.div_ceil(self.limb_bit_size);
+            self.num_inputs * num_limbs_per_slot
         } else {
             self.num_inputs * num_limbs_of_crt_poly::<P>(self.limb_bit_size, params)
         };

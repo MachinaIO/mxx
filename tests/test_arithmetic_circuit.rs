@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use keccak_asm::Keccak256;
 use mxx::{
     arithmetic::circuit::{ArithGateId, ArithmeticCircuit},
@@ -13,8 +11,11 @@ use mxx::{
         DistType, PolyTrapdoorSampler, PolyUniformSampler, hash::DCRTPolyHashSampler,
         trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
     },
+    utils::gen_biguint_for_limb_size,
 };
 use num_bigint::BigUint;
+use rand::Rng;
+use std::sync::Arc;
 use tempfile::tempdir;
 use tokio;
 use tracing::info;
@@ -31,13 +32,22 @@ async fn test_arithmetic_circuit_operations() {
     let params = DCRTPolyParams::new(4, 2, 28, 17);
     let (_, crt_bits, _) = params.to_crt();
     info!("crt_bits={}", crt_bits);
-    let large_a = BigUint::from(140000u64);
-    let large_b = BigUint::from(132000u64);
-    let large_c = BigUint::from(50000u64);
-    let inputs = vec![large_a.clone(), large_b.clone(), large_c.clone()];
+    let n = params.ring_dimension() as usize;
     let limb_bit_size = 3;
+    let max_limbs = crt_bits.div_ceil(limb_bit_size);
+    let mut rng = rand::rng();
+    let a_vec: Vec<BigUint> = (0..n)
+        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs))
+        .collect::<Vec<_>>();
+    let b_vec: Vec<BigUint> = (0..n)
+        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs))
+        .collect::<Vec<_>>();
+    let c_vec: Vec<BigUint> = (0..n)
+        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs))
+        .collect::<Vec<_>>();
+    let inputs = vec![&a_vec[..], &b_vec[..], &c_vec[..]];
     let mut mixed_circuit =
-        ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, inputs.len(), false, true);
+        ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, n, inputs.len(), false, true);
     let add_idx = mixed_circuit.add(ArithGateId::new(0), ArithGateId::new(1)); // a + b
     let mul_idx = mixed_circuit.mul(add_idx, ArithGateId::new(2)); // (a + b) * c
     let final_idx = mixed_circuit.sub(mul_idx, ArithGateId::new(0)); // (a + b) * c - a
@@ -47,14 +57,13 @@ async fn test_arithmetic_circuit_operations() {
     info!("start evaluate_with_poly");
     let mixed_poly_result = &mixed_circuit.evaluate_with_poly(&params, &inputs)[0];
     info!("end evaluate_with_poly");
-    let mixed_expected =
-        (((&large_a + &large_b) * &large_c) - &large_a) % params.modulus().as_ref();
-    println!("coeffs {:?}", mixed_poly_result.coeffs());
-    assert_eq!(
-        mixed_poly_result.coeffs()[0].value().clone(),
-        mixed_expected,
-        "Mixed operations should be correct"
-    );
+    let expected_slots = a_vec
+        .iter()
+        .zip(b_vec.iter().zip(c_vec.iter()))
+        .map(|(a, (b, c))| (((a + b) * c) - a) % params.modulus().as_ref())
+        .collect::<Vec<_>>();
+    let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_slots);
+    assert_eq!(mixed_poly_result, &expected_poly, "Mixed operations should be correct");
 
     // Test with BGG public key evaluation
     let tmp_dir = tempdir().unwrap();
@@ -70,7 +79,8 @@ async fn test_arithmetic_circuit_operations() {
         DCRTPolyHashSampler<Keccak256>,
         DCRTPolyTrapdoorSampler,
         DCRTPolyUniformSampler,
-    >(&params,  seed, tmp_dir.path().to_path_buf(), d, pub_matrix.clone(),  trapdoor.clone(), trapdoor_sampler.clone()).await;
+    >(&params,  seed, tmp_dir.path().to_path_buf(), d, pub_matrix.clone(),  trapdoor.clone(),
+trapdoor_sampler.clone()).await;
     info!("end evaluate_with_bgg_pubkey");
     assert_eq!(mixed_pubkey_result.len(), 1);
     // Test with BGG encoding evaluation
@@ -101,19 +111,28 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
     // (crt_depth*crt_bit)
     let params = DCRTPolyParams::new(4, 1, 56, 17);
 
-    let (moduli, _, crt_depth) = params.to_crt();
+    let (moduli, crt_bits, crt_depth) = params.to_crt();
     assert_eq!(moduli.len(), 1, "Should have only one modulus for non-CRT");
     assert_eq!(crt_depth, 1, "CRT depth should be 1");
     info!("Non-CRT mode: single modulus = {}", moduli[0]);
-    let large_a = BigUint::from(140000u64);
-    let large_b = BigUint::from(132000u64);
-    let large_c = BigUint::from(50000u64);
-    let inputs = vec![large_a.clone(), large_b.clone(), large_c.clone()];
+    let n = params.ring_dimension() as usize;
     let limb_bit_size = 1;
+    let max_limbs = crt_bits.div_ceil(limb_bit_size);
+    let mut rng = rand::rng();
+    let a_vec: Vec<BigUint> = (0..n)
+        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs))
+        .collect::<Vec<_>>();
+    let b_vec: Vec<BigUint> = (0..n)
+        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs))
+        .collect::<Vec<_>>();
+    let c_vec: Vec<BigUint> = (0..n)
+        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs))
+        .collect::<Vec<_>>();
+    let inputs = vec![&a_vec[..], &b_vec[..], &c_vec[..]];
 
     // Test mixed operations in single circuit: (a + b) * c - a.
     let mut mixed_circuit =
-        ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, inputs.len(), false, true);
+        ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, n, inputs.len(), false, true);
     let add_idx = mixed_circuit.add(ArithGateId::new(0), ArithGateId::new(1)); // a + b
     let mul_idx = mixed_circuit.mul(add_idx, ArithGateId::new(2)); // (a + b) * c
     let final_idx = mixed_circuit.sub(mul_idx, ArithGateId::new(0)); // (a + b) * c - a
@@ -123,14 +142,13 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
     info!("start evaluate_with_poly");
     let mixed_poly_result = &mixed_circuit.evaluate_with_poly(&params, &inputs)[0];
     info!("end evaluate_with_poly");
-    let mixed_expected =
-        (((&large_a + &large_b) * &large_c) - &large_a) % params.modulus().as_ref();
-    println!("coeffs {:?}", mixed_poly_result.coeffs());
-    assert_eq!(
-        mixed_poly_result.coeffs()[0].value().clone(),
-        mixed_expected,
-        "Mixed operations should be correct"
-    );
+    let expected_slots = a_vec
+        .iter()
+        .zip(b_vec.iter().zip(c_vec.iter()))
+        .map(|(a, (b, c))| (((a + b) * c) - a) % params.modulus().as_ref())
+        .collect::<Vec<_>>();
+    let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_slots);
+    assert_eq!(mixed_poly_result, &expected_poly, "Mixed operations should be correct");
 
     // Test with BGG public key evaluation.
     let tmp_dir = tempdir().unwrap();
@@ -146,7 +164,8 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
         DCRTPolyHashSampler<Keccak256>,
         DCRTPolyTrapdoorSampler,
         DCRTPolyUniformSampler,
-    >(&params,  seed, tmp_dir.path().to_path_buf(), d, pub_matrix.clone(),  trapdoor.clone(), trapdoor_sampler.clone()).await;
+    >(&params,  seed, tmp_dir.path().to_path_buf(), d, pub_matrix.clone(),  trapdoor.clone(),
+trapdoor_sampler.clone()).await;
     info!("Non-CRT: end evaluate_with_bgg_pubkey");
     assert_eq!(mixed_pubkey_result.len(), 1);
 

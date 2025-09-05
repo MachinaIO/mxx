@@ -3,12 +3,9 @@ pub mod montgomery;
 use crate::{
     circuit::{PolyCircuit, gate::GateId},
     element::PolyElem,
-    gadgets::{
-        crt::{
-            bigunit::BigUintPoly,
-            montgomery::{MontgomeryContext, MontgomeryPoly, u64_vec_to_montgomery_poly},
-        },
-        packed_plt::PackedPlt,
+    gadgets::crt::{
+        bigunit::BigUintPoly,
+        montgomery::{MontgomeryContext, MontgomeryPoly, u64_vec_to_montgomery_poly},
     },
     lookup::PublicLut,
     poly::{Poly, PolyParams},
@@ -17,7 +14,6 @@ use crate::{
 use itertools::Itertools;
 use num_bigint::BigUint;
 use num_traits::{ToPrimitive, Zero};
-use rayon::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 
 #[derive(Debug, Clone)]
@@ -246,7 +242,7 @@ pub fn biguint_vec_to_packed_crt_poly<P: Poly>(
 ) -> Vec<P> {
     // For each CRT modulus q_i, pack inputs[j] % q_i into evaluation slot j, then
     // convert to Montgomery form limbs and append. Total limbs = num_limbs_per_slot * crt_depth.
-    let (moduli, crt_bits, crt_depth) = params.to_crt();
+    let (moduli, crt_bits, _) = params.to_crt();
     let num_limbs = crt_bits.div_ceil(limb_bit_size);
     let ring_n = params.ring_dimension() as usize;
     let q_arc = params.modulus().into();
@@ -295,37 +291,12 @@ mod tests {
     use crate::{
         lookup::poly::PolyPltEvaluator,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        utils::gen_biguint_for_limb_size,
     };
     use num_bigint::BigUint;
-    use rand::Rng;
     use std::sync::Arc;
 
     const LIMB_BIT_SIZE: usize = 3;
-
-    fn gen_biguint_for_limb_size<R: Rng>(
-        rng: &mut R,
-        limb_bit_size: usize,
-        max_limbs: usize,
-    ) -> BigUint {
-        if limb_bit_size == 0 || max_limbs == 0 {
-            return BigUint::ZERO;
-        }
-        let num_limbs = rng.random_range(1..=max_limbs);
-        let max_bits = limb_bit_size * num_limbs;
-        let max_bytes = max_bits.div_ceil(8);
-        if max_bytes == 0 {
-            return BigUint::ZERO;
-        }
-        let mut bytes = vec![0u8; max_bytes];
-        rng.fill_bytes(&mut bytes);
-        let excess_bits = max_bytes * 8 - max_bits;
-        if excess_bits > 0 && !bytes.is_empty() {
-            let mask = (1u8 << (8 - excess_bits)) - 1;
-            bytes[0] &= mask;
-        }
-
-        BigUint::from_bytes_be(&bytes)
-    }
 
     fn create_test_context(
         circuit: &mut PolyCircuit<DCRTPoly>,

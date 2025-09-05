@@ -16,6 +16,7 @@ use keccak_asm::Keccak256;
 use memory_stats::memory_stats;
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
+use rand::Rng;
 use std::{
     env,
     time::{Duration, Instant},
@@ -190,4 +191,29 @@ pub fn mod_inverse(a: &BigUint, m: &BigUint) -> Option<BigUint> {
     } else {
         None // No modular inverse exists
     }
+}
+
+pub fn gen_biguint_for_limb_size<R: Rng>(
+    rng: &mut R,
+    limb_bit_size: usize,
+    max_limbs: usize,
+) -> BigUint {
+    if limb_bit_size == 0 || max_limbs == 0 {
+        return BigUint::ZERO;
+    }
+    let num_limbs = rng.random_range(1..=max_limbs);
+    let max_bits = limb_bit_size * num_limbs;
+    let max_bytes = max_bits.div_ceil(8);
+    if max_bytes == 0 {
+        return BigUint::ZERO;
+    }
+    let mut bytes = vec![0u8; max_bytes];
+    rng.fill_bytes(&mut bytes);
+    let excess_bits = max_bytes * 8 - max_bits;
+    if excess_bits > 0 && !bytes.is_empty() {
+        let mask = (1u8 << (8 - excess_bits)) - 1;
+        bytes[0] &= mask;
+    }
+
+    BigUint::from_bytes_be(&bytes)
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     circuit::{PolyCircuit, gate::GateId},
     gadgets::crt::bigunit::{BigUintPoly, BigUintPolyContext, u64_vec_to_biguint_poly},
-    poly::{Poly, PolyParams},
+    poly::Poly,
     utils::mod_inverse,
 };
 use num_bigint::BigUint;
@@ -252,7 +252,10 @@ mod tests {
     use super::*;
     use crate::{
         lookup::poly::PolyPltEvaluator,
-        poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        poly::{
+            PolyParams,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
     };
 
     const LIMB_BIT_SIZE: usize = 2;

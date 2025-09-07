@@ -3,8 +3,12 @@ use crate::{
     poly::Poly,
     utils::{block_size, debug_mem, log_mem},
 };
-use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+};
 use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom},
     path::Path,
     sync::{Arc, Mutex, OnceLock},
     time::Instant,
@@ -84,28 +88,58 @@ where
     M: PolyMatrix + Send + 'static,
 {
     let start = Instant::now();
-
-    // Serialize all matrices into a single structure.
-    let batch_data: Vec<(usize, Vec<u8>)> = preimages
+    let mut sorted_preimages = preimages;
+    sorted_preimages.sort_by_key(|(k, _)| *k);
+    let num_matrices = sorted_preimages.len();
+    let indices: Vec<usize> = sorted_preimages.iter().map(|(k, _)| *k).collect();
+    let (matrix_data, max_bytes_per_matrix): (Vec<(usize, Vec<u8>)>, usize) = sorted_preimages
         .into_par_iter()
-        .map(|(k, matrix)| {
+        .enumerate()
+        .map(|(i, (_, matrix))| {
             let matrix_bytes = matrix.to_compact_bytes();
-            drop(matrix); // Drop immediately after serialization to free memory.
-            (k, matrix_bytes)
+            let byte_len = matrix_bytes.len();
+            drop(matrix);
+            ((i, matrix_bytes), byte_len)
         })
-        .collect();
+        .fold(
+            || (Vec::new(), 0usize),
+            |(mut vec, max_len), ((i, bytes), len)| {
+                vec.push((i, bytes));
+                (vec, max_len.max(len))
+            },
+        )
+        .reduce(
+            || (Vec::new(), 0usize),
+            |(mut vec1, max1), (vec2, max2)| {
+                vec1.extend(vec2);
+                (vec1, max1.max(max2))
+            },
+        );
 
-    // Encode the batch data.
-    let encoded = bincode::encode_to_vec(&batch_data, bincode::config::standard())
-        .expect("Failed to serialize batch matrices");
+    let max_bytes_per_matrix = max_bytes_per_matrix.saturating_add(16);
 
+    // Header format:
+    // - 8 bytes: number of matrices (u64)
+    // - 8 bytes: bytes per matrix (u64)
+    // - 8 * num_matrices bytes: indices (u64 each)
+    let header_size = 16 + 8 * num_matrices;
+    let total_size = header_size + max_bytes_per_matrix * num_matrices;
+    let mut encoded = vec![0u8; total_size];
+    encoded[0..8].copy_from_slice(&(num_matrices as u64).to_le_bytes());
+    encoded[8..16].copy_from_slice(&(max_bytes_per_matrix as u64).to_le_bytes());
+    for (i, &idx) in indices.iter().enumerate() {
+        let offset = 16 + i * 8;
+        encoded[offset..offset + 8].copy_from_slice(&(idx as u64).to_le_bytes());
+    }
+    for (i, matrix_bytes) in matrix_data {
+        let offset = header_size + i * max_bytes_per_matrix;
+        encoded[offset..offset + matrix_bytes.len()].copy_from_slice(&matrix_bytes);
+    }
     let filename = format!("{}_batch.matrices", id_prefix);
     let elapsed = start.elapsed();
     debug_mem(format!(
-        "Serialized {} matrices into batch file {} ({} bytes) in {elapsed:?}",
-        batch_data.len(),
-        filename,
-        encoded.len()
+        "Serialized {} matrices into fixed-size batch file {} ({} bytes, {} bytes per matrix) in {elapsed:?}",
+        num_matrices, filename, total_size, max_bytes_per_matrix
     ));
 
     // Write asynchronously.
@@ -196,46 +230,6 @@ where
     }
 }
 
-/// Read batch matrices from a single file.
-/// Returns a vector of (k, matrix) pairs in the order they were stored.
-pub fn read_batch_matrices<M>(
-    params: &<M::P as Poly>::Params,
-    dir: &Path,
-    id_prefix: &str,
-) -> Vec<(usize, M)>
-where
-    M: PolyMatrix,
-{
-    let filename = format!("{}_batch.matrices", id_prefix);
-    let path = dir.join(&filename);
-
-    let start = Instant::now();
-    let data = std::fs::read(&path)
-        .unwrap_or_else(|_| panic!("Failed to read batch matrices file {:?}", path));
-
-    let batch_data: Vec<(usize, Vec<u8>)> =
-        bincode::decode_from_slice(&data, bincode::config::standard())
-            .expect("Failed to deserialize batch matrices")
-            .0;
-
-    let matrices: Vec<(usize, M)> = batch_data
-        .into_par_iter()
-        .map(|(k, matrix_bytes)| {
-            let matrix = M::from_compact_bytes(params, &matrix_bytes);
-            (k, matrix)
-        })
-        .collect();
-
-    let elapsed = start.elapsed();
-    log_mem(format!(
-        "Loaded {} matrices from batch file {} in {elapsed:?}",
-        matrices.len(),
-        filename
-    ));
-
-    matrices
-}
-
 /// Read a specific matrix from a batch file by its index.
 /// This is more efficient than loading all matrices when only one is needed.
 pub fn read_single_matrix_from_batch<M>(
@@ -251,26 +245,45 @@ where
     let path = dir.join(&filename);
 
     let start = Instant::now();
-    let data = std::fs::read(&path)
-        .unwrap_or_else(|_| panic!("Failed to read batch matrices file {:?}", path));
+    let mut file = File::open(&path)
+        .unwrap_or_else(|_| panic!("Failed to open batch matrices file {:?}", path));
+    let mut header_buf = vec![0u8; 16];
+    file.read_exact(&mut header_buf).expect("Failed to read header");
+    let num_matrices = u64::from_le_bytes(header_buf[0..8].try_into().unwrap()) as usize;
+    let bytes_per_matrix = u64::from_le_bytes(header_buf[8..16].try_into().unwrap()) as usize;
+    let mut indices_buf = vec![0u8; 8 * num_matrices];
+    file.read_exact(&mut indices_buf).expect("Failed to read indices");
 
-    let batch_data: Vec<(usize, Vec<u8>)> =
-        bincode::decode_from_slice(&data, bincode::config::standard())
-            .expect("Failed to deserialize batch matrices")
-            .0;
-
-    // Find the specific matrix we need
-    let matrix = batch_data
-        .into_iter()
-        .find(|(k, _)| *k == target_k)
-        .map(|(_, matrix_bytes)| M::from_compact_bytes(params, &matrix_bytes));
-
-    let elapsed = start.elapsed();
-    if matrix.is_some() {
-        log_mem(format!("Loaded matrix {} from batch file {} in {elapsed:?}", target_k, filename));
+    let mut matrix_position = None;
+    for i in 0..num_matrices {
+        let offset = i * 8;
+        let idx = u64::from_le_bytes(indices_buf[offset..offset + 8].try_into().unwrap()) as usize;
+        if idx == target_k {
+            matrix_position = Some(i);
+            break;
+        }
     }
 
-    matrix
+    match matrix_position {
+        Some(pos) => {
+            let header_size = 16 + 8 * num_matrices;
+            let matrix_offset = header_size + pos * bytes_per_matrix;
+            file.seek(SeekFrom::Start(matrix_offset as u64)).expect("Failed to seek to matrix");
+            let mut matrix_buf = vec![0u8; bytes_per_matrix];
+            file.read_exact(&mut matrix_buf).expect("Failed to read matrix data");
+            let matrix = M::from_compact_bytes(params, &matrix_buf);
+            let elapsed = start.elapsed();
+            log_mem(format!(
+                "Loaded matrix {} from batch file {} at position {} in {elapsed:?}",
+                target_k, filename, pos
+            ));
+            Some(matrix)
+        }
+        None => {
+            log_mem(format!("Matrix {} not found in batch file {}", target_k, filename));
+            None
+        }
+    }
 }
 
 #[cfg(feature = "debug")]

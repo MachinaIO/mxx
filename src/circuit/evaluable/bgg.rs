@@ -1,11 +1,9 @@
 use crate::{
     bgg::{encoding::BggEncoding, public_key::BggPublicKey},
     circuit::evaluable::Evaluable,
-    element::PolyElem,
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
 };
-use rayon::prelude::*;
 
 impl<M: PolyMatrix> Evaluable for BggEncoding<M> {
     type Params = <M::P as Poly>::Params;

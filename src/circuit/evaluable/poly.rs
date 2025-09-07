@@ -1,10 +1,8 @@
 use crate::{
     circuit::evaluable::Evaluable,
-    element::PolyElem,
     poly::{Poly, PolyParams},
 };
 use num_bigint::BigUint;
-use rayon::prelude::*;
 
 impl<P: Poly> Evaluable for P {
     type Params = P::Params;

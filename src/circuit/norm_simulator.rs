@@ -89,7 +89,7 @@ impl_binop_with_refs!(NormSimulator => Sub::sub(self, rhs: &NormSimulator) -> No
 
 impl_binop_with_refs!(NormSimulator => Mul::mul(self, rhs: &NormSimulator) -> NormSimulator {
     NormSimulator {
-        h_norm: self.h_norm.double_right_rotate(self.dim_sqrt as u64 * (self.base as u64 - 1)) + &rhs.h_norm * &(&self.plaintext_norm * BigUint::from(self.dim_sqrt)),
+        h_norm: self.h_norm.right_rotate(self.dim_sqrt as u64 * (self.base as u64 - 1)) + &rhs.h_norm * &(&self.plaintext_norm * BigUint::from(self.dim_sqrt)),
         plaintext_norm: &self.plaintext_norm * &rhs.plaintext_norm * self.dim_sqrt,
         dim_sqrt: self.dim_sqrt,
         base: self.base,
@@ -117,7 +117,7 @@ impl Evaluable for NormSimulator {
     fn large_scalar_mul(&self, _: &Self::Params, scalar: &[BigUint]) -> Self {
         let scalar_max = scalar.iter().max().unwrap();
         NormSimulator {
-            h_norm: self.h_norm.double_right_rotate(self.dim_sqrt as u64 * (self.base as u64 - 1)),
+            h_norm: self.h_norm.right_rotate(self.dim_sqrt as u64 * (self.base as u64 - 1)),
             plaintext_norm: &self.plaintext_norm * scalar_max * BigUint::from(self.dim_sqrt as u64),
             dim_sqrt: self.dim_sqrt,
             base: self.base,
@@ -151,8 +151,7 @@ impl PltEvaluator<NormSimulator> for NormPltLweEvaluator {
         _: GateId,
     ) -> NormSimulator {
         let left_h_norm = self.norm_preimage.clone();
-        let right_h_norm =
-            input.h_norm.double_right_rotate(input.dim_sqrt as u64) * &self.norm_preimage;
+        let right_h_norm = input.h_norm.right_rotate(input.dim_sqrt as u64) * &self.norm_preimage;
         let h_norm = left_h_norm + right_h_norm;
         NormSimulator {
             h_norm,
@@ -181,14 +180,6 @@ impl MSqrtPolyCoeffs {
     #[inline]
     pub fn right_rotate(&self, scale: u64) -> Self {
         let mut coeffs = vec![BigUint::ZERO];
-        coeffs.extend(self.0.iter().map(|coeff| coeff * scale).collect_vec());
-        Self(coeffs)
-    }
-
-    // corresponding to multiplying m
-    #[inline]
-    pub fn double_right_rotate(&self, scale: u64) -> Self {
-        let mut coeffs = vec![BigUint::ZERO, BigUint::ZERO];
         coeffs.extend(self.0.iter().map(|coeff| coeff * scale).collect_vec());
         Self(coeffs)
     }
@@ -306,19 +297,16 @@ mod tests {
         let result = sim1 * sim2;
 
         // Verify the result
-        // h_norm = sim1.h_norm.double_right_rotate(4) + sim2.h_norm * (sim1.plaintext_norm * 4)
+        // h_norm = sim1.h_norm.right_rotate(4) + sim2.h_norm * (sim1.plaintext_norm * 4)
 
         // Check the length of the h_norm vector
-        assert_eq!(result.h_norm.0.len(), 3);
+        assert_eq!(result.h_norm.0.len(), 2);
 
         // First element should be 20 * 5 * 4 (from sim2.h_norm * sim1.plaintext_norm * dim_sqrt)
         assert_eq!(result.h_norm.0[0], BigUint::from(400u32)); // 20 * 5
 
-        // Second element should be 0 (double_right_rotate inserts two zeros)
-        assert_eq!(result.h_norm.0[1], BigUint::from(0u32));
-
-        // Third element should be 10 * 4 (from double_right_rotate)
-        assert_eq!(result.h_norm.0[2], BigUint::from(40u32));
+        // Second element should be 10 * 4 (from right_rotate)
+        assert_eq!(result.h_norm.0[1], BigUint::from(40u32));
 
         assert_eq!(result.plaintext_norm, BigUint::from(140u32)); // 5 * 7 * 4
         assert_eq!(result.dim_sqrt.pow(2), 16);

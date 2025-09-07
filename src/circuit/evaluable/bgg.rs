@@ -1,15 +1,17 @@
 use crate::{
     bgg::{encoding::BggEncoding, public_key::BggPublicKey},
     circuit::evaluable::Evaluable,
+    element::PolyElem,
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
 };
+use rayon::prelude::*;
 
 impl<M: PolyMatrix> Evaluable for BggEncoding<M> {
     type Params = <M::P as Poly>::Params;
     type P = M::P;
 
-    fn rotate(self, params: &Self::Params, shift: i32) -> Self {
+    fn rotate(&self, params: &Self::Params, shift: i32) -> Self {
         let pubkey = self.pubkey.rotate(params, shift);
         let shift = if shift >= 0 {
             shift as usize
@@ -22,12 +24,12 @@ impl<M: PolyMatrix> Evaluable for BggEncoding<M> {
         Self { vector, pubkey, plaintext }
     }
 
-    fn from_digits(params: &Self::Params, one: &Self, digits: &[u32]) -> Self {
-        let const_poly =
-            <M::P as Evaluable>::from_digits(params, &<M::P>::const_one(params), digits);
-        let vector = one.vector.clone() * &const_poly;
-        let pubkey = BggPublicKey::from_digits(params, &one.pubkey, digits);
-        let plaintext = one.plaintext.clone().map(|plaintext| plaintext * const_poly);
+    fn small_scalar_mul(&self, params: &Self::Params, scalar: &[u32]) -> Self {
+        let scalar = Self::P::from_u32s(params, scalar);
+        let vector = self.vector.clone() * &scalar;
+        let pubkey_matrix = self.pubkey.matrix.clone() * &scalar;
+        let pubkey = BggPublicKey::new(pubkey_matrix, self.pubkey.reveal_plaintext);
+        let plaintext = self.plaintext.clone().map(|p| p * scalar);
         Self { vector, pubkey, plaintext }
     }
 
@@ -48,7 +50,7 @@ impl<M: PolyMatrix> Evaluable for BggPublicKey<M> {
     type Params = <M::P as Poly>::Params;
     type P = M::P;
 
-    fn rotate(self, params: &Self::Params, shift: i32) -> Self {
+    fn rotate(&self, params: &Self::Params, shift: i32) -> Self {
         let shift = if shift >= 0 {
             shift as usize
         } else {
@@ -59,11 +61,10 @@ impl<M: PolyMatrix> Evaluable for BggPublicKey<M> {
         Self { matrix, reveal_plaintext: self.reveal_plaintext }
     }
 
-    fn from_digits(params: &Self::Params, one: &Self, digits: &[u32]) -> Self {
-        let const_poly =
-            <M::P as Evaluable>::from_digits(params, &<M::P>::const_one(params), digits);
-        let matrix = one.matrix.clone() * const_poly;
-        Self { matrix, reveal_plaintext: one.reveal_plaintext }
+    fn small_scalar_mul(&self, params: &Self::Params, scalar: &[u32]) -> Self {
+        let scalar = Self::P::from_u32s(params, scalar);
+        let matrix = self.matrix.clone() * scalar;
+        Self { matrix, reveal_plaintext: self.reveal_plaintext }
     }
 
     fn large_scalar_mul(&self, params: &Self::Params, scalar: &[num_bigint::BigUint]) -> Self {

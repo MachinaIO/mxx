@@ -108,6 +108,14 @@ impl Poly for DCRTPoly {
         Self::poly_gen_from_vec(params, new_coeffs)
     }
 
+    fn from_u32s(params: &Self::Params, coeffs: &[u32]) -> Self {
+        let coeffs: Vec<Self::Elem> = coeffs
+            .par_iter()
+            .map(|&digit| <Self::Elem as PolyElem>::constant(&params.modulus(), digit as u64))
+            .collect();
+        Self::from_coeffs(params, &coeffs)
+    }
+
     fn from_biguints(params: &Self::Params, coeffs: &[BigUint]) -> Self {
         let fin_ring_coeffs: Vec<FinRingElem> =
             coeffs.iter().map(|coeff| FinRingElem::new(coeff.clone(), params.modulus())).collect();

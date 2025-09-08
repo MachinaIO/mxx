@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SerializablePolyGateType {
     Input,
-    Const { digits: Vec<u32> },
+    SmallScalarMul { scalar: Vec<u32> },
     LargeScalarMul { scalar: Vec<BigUint> },
     Add,
     Sub,
@@ -25,7 +25,8 @@ pub enum SerializablePolyGateType {
 impl SerializablePolyGateType {
     pub fn num_input(&self) -> usize {
         match self {
-            SerializablePolyGateType::Input | SerializablePolyGateType::Const { .. } => 0,
+            SerializablePolyGateType::Input => 0,
+            SerializablePolyGateType::SmallScalarMul { .. } |
             SerializablePolyGateType::LargeScalarMul { .. } |
             SerializablePolyGateType::Rotate { .. } |
             SerializablePolyGateType::PubLut { .. } => 1,
@@ -76,7 +77,9 @@ impl SerializablePolyCircuit {
         for (gate_id, gate) in circuit.gates.into_iter() {
             let gate_type = match gate.gate_type {
                 PolyGateType::Input => SerializablePolyGateType::Input,
-                PolyGateType::Const { digits } => SerializablePolyGateType::Const { digits },
+                PolyGateType::SmallScalarMul { scalar } => {
+                    SerializablePolyGateType::SmallScalarMul { scalar }
+                }
                 PolyGateType::LargeScalarMul { scalar } => {
                     SerializablePolyGateType::LargeScalarMul { scalar }
                 }
@@ -113,7 +116,9 @@ impl SerializablePolyCircuit {
             let sg = self.gates.get(&GateId(idx)).expect("serialized gate id missing").to_owned();
             let gate_type = match sg.gate_type {
                 SerializablePolyGateType::Input => PolyGateType::Input,
-                SerializablePolyGateType::Const { digits } => PolyGateType::Const { digits },
+                SerializablePolyGateType::SmallScalarMul { scalar } => {
+                    PolyGateType::SmallScalarMul { scalar }
+                }
                 SerializablePolyGateType::LargeScalarMul { scalar } => {
                     PolyGateType::LargeScalarMul { scalar }
                 }

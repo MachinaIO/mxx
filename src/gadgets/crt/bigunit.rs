@@ -440,7 +440,7 @@ impl<P: Poly> BigUintPoly<P> {
                     idx += group_len;
                 }
             }
-            if next.last().map_or(false, |v| v.is_empty()) {
+            if next.last().is_some_and(|v| v.is_empty()) {
                 next.pop();
             }
             let need_more = next.iter().any(|col| col.len() > 2);
@@ -604,10 +604,10 @@ pub fn u64_to_biguint_poly<P: Poly>(
         limbs.push(P::from_usize_to_constant(params, limb));
         remaining_value /= base;
     }
-    if let Some(num_limbs) = num_limbs {
-        if limbs.len() < num_limbs {
-            limbs.extend(vec![P::const_zero(params); num_limbs - limbs.len()]);
-        }
+    if let Some(num_limbs) = num_limbs &&
+        limbs.len() < num_limbs
+    {
+        limbs.extend(vec![P::const_zero(params); num_limbs - limbs.len()]);
     }
     limbs
 }

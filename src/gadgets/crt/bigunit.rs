@@ -604,10 +604,11 @@ pub fn u64_to_biguint_poly<P: Poly>(
         limbs.push(P::from_usize_to_constant(params, limb));
         remaining_value /= base;
     }
-    if let Some(num_limbs) = num_limbs
-        && limbs.len() < num_limbs {
-            limbs.extend(vec![P::const_zero(params); num_limbs - limbs.len()]);
-        }
+    if let Some(num_limbs) = num_limbs &&
+        limbs.len() < num_limbs
+    {
+        limbs.extend(vec![P::const_zero(params); num_limbs - limbs.len()]);
+    }
     limbs
 }
 

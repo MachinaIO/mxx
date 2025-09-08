@@ -99,7 +99,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
             biguints_to_packed_crt_polys(self.limb_bit_size, params, inputs)
         } else {
             inputs
-                .into_iter()
+                .iter()
                 .flat_map(|input| biguint_to_crt_poly(self.limb_bit_size, params, input))
                 .collect()
         };

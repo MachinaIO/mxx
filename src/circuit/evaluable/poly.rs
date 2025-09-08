@@ -20,7 +20,7 @@ impl<P: Poly> Evaluable for P {
     }
 
     fn small_scalar_mul(&self, params: &Self::Params, scalar: &[u32]) -> Self {
-        self.clone() * Self::from_u32s(params, &scalar)
+        self.clone() * Self::from_u32s(params, scalar)
     }
 
     fn large_scalar_mul(&self, params: &Self::Params, scalar: &[BigUint]) -> Self {

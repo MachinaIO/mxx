@@ -9,7 +9,11 @@ use crate::{
     utils::timed_read,
 };
 use rayon::prelude::*;
-use std::{marker::PhantomData, path::PathBuf, sync::Arc};
+use std::{
+    marker::PhantomData,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tracing::info;
 
 #[derive(Debug)]
@@ -171,7 +175,7 @@ fn preimage_all<M, ST, P>(
     a_z: &M,
     a_lt: &M,
     id: &GateId,
-    dir_path: &PathBuf,
+    dir_path: &Path,
 ) where
     P: Poly,
     M: PolyMatrix<P = P> + Send + 'static,
@@ -184,7 +188,7 @@ fn preimage_all<M, ST, P>(
         .par_chunks(8)
         .flat_map(|batch| {
             batch
-                .into_iter()
+                .iter()
                 .map(|(x_k, (k, y_k))| {
                     let ext_matrix = a_z.clone() - &(gadget.clone() * *x_k);
                     let target = a_lt.clone() - &(gadget.clone() * y_k);

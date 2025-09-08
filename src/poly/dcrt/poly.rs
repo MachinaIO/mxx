@@ -34,6 +34,15 @@ impl DCRTPoly {
         Self { ptr_poly: ptr_poly.into() }
     }
 
+    fn from_slice_with_map<T, F>(params: &DCRTPolyParams, slice: &[T], map_fn: F) -> Self
+    where
+        T: Sync,
+        F: Fn(&T) -> FinRingElem + Sync + Send,
+    {
+        let coeffs: Vec<FinRingElem> = slice.par_iter().map(map_fn).collect();
+        Self::from_coeffs(params, &coeffs)
+    }
+
     #[inline]
     pub fn get_poly(&self) -> &UniquePtr<DCRTPolyCxx> {
         &self.ptr_poly
@@ -108,10 +117,22 @@ impl Poly for DCRTPoly {
         Self::poly_gen_from_vec(params, new_coeffs)
     }
 
+    fn from_u32s(params: &Self::Params, coeffs: &[u32]) -> Self {
+        Self::from_slice_with_map(params, coeffs, |&digit| {
+            <Self::Elem as PolyElem>::constant(&params.modulus(), digit as u64)
+        })
+    }
+
     fn from_biguints(params: &Self::Params, coeffs: &[BigUint]) -> Self {
-        let fin_ring_coeffs: Vec<FinRingElem> =
-            coeffs.iter().map(|coeff| FinRingElem::new(coeff.clone(), params.modulus())).collect();
-        Self::from_coeffs(params, &fin_ring_coeffs)
+        Self::from_slice_with_map(params, coeffs, |coeff| {
+            FinRingElem::new(coeff.clone(), params.modulus())
+        })
+    }
+
+    fn from_bool_vec(params: &Self::Params, coeffs: &[bool]) -> Self {
+        Self::from_slice_with_map(params, coeffs, |&i| {
+            FinRingElem::constant(&params.modulus(), i as u64)
+        })
     }
 
     fn from_biguints_eval(params: &Self::Params, slots: &[BigUint]) -> Self {
@@ -327,12 +348,6 @@ impl Poly for DCRTPoly {
             sum = sum.saturating_add((1usize << i).saturating_mul(coeff_val));
         }
         sum
-    }
-
-    fn from_bool_vec(params: &Self::Params, coeffs: &[bool]) -> Self {
-        let coeffs: Vec<_> =
-            coeffs.iter().map(|i| FinRingElem::constant(&params.modulus(), *i as u64)).collect();
-        DCRTPoly::from_coeffs(params, &coeffs)
     }
 }
 

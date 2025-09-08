@@ -49,7 +49,7 @@ impl<P: Poly> PackedCrtPoly<P> {
         num_crt_polys: usize,
     ) -> Self {
         let crt_depth = ctx.crt_ctx.mont_ctxes.len();
-        let ring_dim = ctx.isolation_gadget.max_degree as usize;
+        let ring_dim = ctx.isolation_gadget.max_degree;
         let num_limbs_per_biguint = ctx.crt_ctx.mont_ctxes[0].num_limbs;
         let total_num_limbs = num_crt_polys * num_limbs_per_biguint * crt_depth;
         let num_packed_polys = total_num_limbs.div_ceil(ring_dim * crt_depth); // each packed poly has ring_dim * crt_depth slots
@@ -114,7 +114,7 @@ pub fn biguints_to_packed_crt_polys<P: Poly>(
             if poly.coeffs()[0].value() == &BigUint::zero() {
                 0
             } else {
-                poly.coeffs()[0].value().to_u64_digits()[0] as u64
+                poly.coeffs()[0].value().to_u64_digits()[0]
             }
         })
         .collect::<Vec<u64>>()

@@ -21,14 +21,15 @@ impl PolyCircuit<DCRTPoly> {
     where
         NormSimulator: Evaluable<P = DCRTPoly>,
     {
-        let one = NormSimulator::new(MPolyCoeffs::one(), BigUint::one(), dim, base_bits);
+        let one = NormSimulator::new(MSqrtPolyCoeffs::one(), BigUint::one(), dim, base_bits);
         let inputs = packed_input_norms
             .into_iter()
             .map(|plaintext_norm| {
-                NormSimulator::new(MPolyCoeffs::one(), plaintext_norm, dim, base_bits)
+                NormSimulator::new(MSqrtPolyCoeffs::one(), plaintext_norm, dim, base_bits)
             })
             .collect::<Vec<_>>();
-        let outputs = self.eval(&(), &one, &inputs, Some(NormPltEvaluator::new()));
+        let plt_evaluator = NormPltLweEvaluator::new(dim, 1 << base_bits);
+        let outputs = self.eval(&(), &one, &inputs, Some(plt_evaluator));
         NormBounds::from_norm_simulators(&outputs)
     }
 }
@@ -52,14 +53,14 @@ impl NormBounds {
 // In such a case, the error after circuit evaluation could be too large.
 #[derive(Debug, Clone)]
 pub struct NormSimulator {
-    pub h_norm: MPolyCoeffs,
+    pub h_norm: MSqrtPolyCoeffs,
     pub plaintext_norm: BigUint,
     pub dim_sqrt: u32,
     pub base: u32,
 }
 
 impl NormSimulator {
-    pub fn new(h_norm: MPolyCoeffs, plaintext_norm: BigUint, dim: u32, base_bits: u32) -> Self {
+    pub fn new(h_norm: MSqrtPolyCoeffs, plaintext_norm: BigUint, dim: u32, base_bits: u32) -> Self {
         let base = 1 << base_bits;
         let dim_sqrt = (dim as f64).sqrt().ceil() as u32;
         Self { h_norm, plaintext_norm, dim_sqrt, base }
@@ -99,16 +100,18 @@ impl Evaluable for NormSimulator {
     type Params = ();
     type P = DCRTPoly;
 
-    fn rotate(self, _: &Self::Params, _: i32) -> Self {
-        self
+    fn rotate(&self, _: &Self::Params, _: i32) -> Self {
+        self.clone()
     }
 
-    fn from_digits(_: &Self::Params, one: &Self, digits: &[u32]) -> Self {
-        let digit_max = digits.iter().max().unwrap();
-        let dim_sqrt = one.dim_sqrt;
-        let h_norm = &one.h_norm * &BigUint::from(digit_max * dim_sqrt);
-        let plaintext_norm = &one.plaintext_norm * &BigUint::from(*digit_max);
-        Self { h_norm, plaintext_norm, dim_sqrt: one.dim_sqrt, base: one.base }
+    fn small_scalar_mul(&self, _: &Self::Params, scalar: &[u32]) -> Self {
+        let scalar_max = BigUint::from(*scalar.iter().max().unwrap());
+        NormSimulator {
+            h_norm: self.h_norm.clone() * &scalar_max,
+            plaintext_norm: &self.plaintext_norm * &scalar_max,
+            dim_sqrt: self.dim_sqrt,
+            base: self.base,
+        }
     }
 
     fn large_scalar_mul(&self, _: &Self::Params, scalar: &[BigUint]) -> Self {
@@ -122,9 +125,24 @@ impl Evaluable for NormSimulator {
     }
 }
 
-pub struct NormPltEvaluator {}
+pub struct NormPltLweEvaluator {
+    norm_preimage: MSqrtPolyCoeffs,
+}
 
-impl PltEvaluator<NormSimulator> for NormPltEvaluator {
+impl NormPltLweEvaluator {
+    pub fn new(dim: u32, base: u32) -> Self {
+        let c_0 = 6.0;
+        let sigma = 4.578;
+        let scale = c_0 * sigma * (base as f64 + 1.0) * sigma;
+        let dim_sqrt = (dim as f64).sqrt();
+        let m_sqrt_coeff = BigUint::from((scale * dim_sqrt).ceil() as u128);
+        let const_coeff = BigUint::from((scale * (1.414 * dim_sqrt + 4.7)).ceil() as u128);
+        let norm_preimage = MSqrtPolyCoeffs::new(vec![const_coeff, m_sqrt_coeff]);
+        Self { norm_preimage }
+    }
+}
+
+impl PltEvaluator<NormSimulator> for NormPltLweEvaluator {
     fn public_lookup(
         &self,
         _: &(),
@@ -132,10 +150,11 @@ impl PltEvaluator<NormSimulator> for NormPltEvaluator {
         input: NormSimulator,
         _: GateId,
     ) -> NormSimulator {
+        let left_h_norm = self.norm_preimage.clone();
+        let right_h_norm = input.h_norm.right_rotate(input.dim_sqrt as u64) * &self.norm_preimage;
+        let h_norm = left_h_norm + right_h_norm;
         NormSimulator {
-            // |c_z · r_k.decompose()| + c_lt_k
-            h_norm: input.h_norm.right_rotate(input.dim_sqrt as u64 * (input.base as u64 - 1)) +
-                MPolyCoeffs::one(),
+            h_norm,
             plaintext_norm: plt.max_output_row().1.value().clone(),
             dim_sqrt: input.dim_sqrt,
             base: input.base,
@@ -143,22 +162,11 @@ impl PltEvaluator<NormSimulator> for NormPltEvaluator {
     }
 }
 
-impl Default for NormPltEvaluator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl NormPltEvaluator {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
-
+// each variable X = \sqrt{m} = \sqrt{d log_{base} q}
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MPolyCoeffs(Vec<BigUint>);
+pub struct MSqrtPolyCoeffs(Vec<BigUint>);
 
-impl MPolyCoeffs {
+impl MSqrtPolyCoeffs {
     pub fn new(coeffs: Vec<BigUint>) -> Self {
         Self(coeffs)
     }
@@ -168,6 +176,7 @@ impl MPolyCoeffs {
         Self::new(vec![BigUint::one()])
     }
 
+    // corresponding to multiplying \sqrt{m}
     #[inline]
     pub fn right_rotate(&self, scale: u64) -> Self {
         let mut coeffs = vec![BigUint::ZERO];
@@ -176,7 +185,7 @@ impl MPolyCoeffs {
     }
 }
 
-impl_binop_with_refs!(MPolyCoeffs => Add::add(self, rhs: &MPolyCoeffs) -> MPolyCoeffs {
+impl_binop_with_refs!(MSqrtPolyCoeffs => Add::add(self, rhs: &MSqrtPolyCoeffs) -> MSqrtPolyCoeffs {
     let self_len = self.0.len();
     let rhs_len = rhs.0.len();
     let max_len = self_len.max(rhs_len);
@@ -189,27 +198,47 @@ impl_binop_with_refs!(MPolyCoeffs => Add::add(self, rhs: &MPolyCoeffs) -> MPolyC
         result.push(a + b);
     }
 
-    MPolyCoeffs(result)
+    MSqrtPolyCoeffs(result)
 });
 
-impl Mul<BigUint> for MPolyCoeffs {
+impl_binop_with_refs!(MSqrtPolyCoeffs => Mul::mul(self, rhs: &MSqrtPolyCoeffs) -> MSqrtPolyCoeffs {
+    let self_len = self.0.len();
+    let rhs_len = rhs.0.len();
+
+    if self_len == 0 || rhs_len == 0 {
+        return MSqrtPolyCoeffs(Vec::new());
+    }
+
+    let mut result = vec![BigUint::ZERO; self_len + rhs_len - 1];
+
+    for (i, a) in self.0.iter().enumerate() {
+        for (j, b) in rhs.0.iter().enumerate() {
+            let prod = a * b;
+            result[i + j] += &prod;
+        }
+    }
+
+    MSqrtPolyCoeffs(result)
+});
+
+impl Mul<BigUint> for MSqrtPolyCoeffs {
     type Output = Self;
     fn mul(self, rhs: BigUint) -> Self::Output {
         self * &rhs
     }
 }
 
-impl Mul<&BigUint> for MPolyCoeffs {
+impl Mul<&BigUint> for MSqrtPolyCoeffs {
     type Output = Self;
     fn mul(self, rhs: &BigUint) -> Self {
         &self * rhs
     }
 }
 
-impl Mul<&BigUint> for &MPolyCoeffs {
-    type Output = MPolyCoeffs;
-    fn mul(self, rhs: &BigUint) -> MPolyCoeffs {
-        MPolyCoeffs(self.0.iter().map(|a| a * rhs).collect())
+impl Mul<&BigUint> for &MSqrtPolyCoeffs {
+    type Output = MSqrtPolyCoeffs;
+    fn mul(self, rhs: &BigUint) -> MSqrtPolyCoeffs {
+        MSqrtPolyCoeffs(self.0.iter().map(|a| a * rhs).collect())
     }
 }
 
@@ -223,7 +252,7 @@ mod tests {
         h_norm_values: Vec<u32>,
         plaintext_norm: u32,
     ) -> NormSimulator {
-        let h_norm = MPolyCoeffs::new(h_norm_values.into_iter().map(BigUint::from).collect());
+        let h_norm = MSqrtPolyCoeffs::new(h_norm_values.into_iter().map(BigUint::from).collect());
         let plaintext_norm = BigUint::from(plaintext_norm);
         NormSimulator::new(h_norm, plaintext_norm, ring_dim, 1)
     }
@@ -268,7 +297,7 @@ mod tests {
         let result = sim1 * sim2;
 
         // Verify the result
-        // h_norm should be sim1.h_norm.right_rotate(8) + sim2.h_norm * sim1.plaintext_norm
+        // h_norm = sim1.h_norm.right_rotate(4) + sim2.h_norm * (sim1.plaintext_norm * 4)
 
         // Check the length of the h_norm vector
         assert_eq!(result.h_norm.0.len(), 2);
@@ -299,7 +328,7 @@ mod tests {
         // Manually calculate the expected norm
         // Create NormSimulator instances for inputs
         let input1 =
-            NormSimulator::new(MPolyCoeffs::new(vec![BigUint::one()]), BigUint::one(), 16, 1);
+            NormSimulator::new(MSqrtPolyCoeffs::new(vec![BigUint::one()]), BigUint::one(), 16, 1);
         let input2 = input1.clone();
         let input3 = input1.clone();
 

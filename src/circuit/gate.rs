@@ -28,10 +28,10 @@ impl PolyGate {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum PolyGateType {
     Input,
-    Const { digits: Vec<u32> },
     Add,
     Sub,
     Mul,
+    SmallScalarMul { scalar: Vec<u32> },
     LargeScalarMul { scalar: Vec<BigUint> },
     Rotate { shift: i32 },
     PubLut { lookup_id: usize },
@@ -40,8 +40,9 @@ pub enum PolyGateType {
 impl PolyGateType {
     pub fn num_input(&self) -> usize {
         match self {
-            PolyGateType::Input | PolyGateType::Const { .. } => 0,
+            PolyGateType::Input => 0,
             PolyGateType::Rotate { .. } |
+            PolyGateType::SmallScalarMul { .. } |
             PolyGateType::LargeScalarMul { .. } |
             PolyGateType::PubLut { .. } => 1,
             PolyGateType::Add | PolyGateType::Sub | PolyGateType::Mul => 2,

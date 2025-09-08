@@ -81,11 +81,7 @@ impl<P: Poly> PolyCircuit<P> {
 
     fn count_helper(&self, counts: &mut HashMap<PolyGateType, usize>) {
         for gate in self.gates.values() {
-            let key = match &gate.gate_type {
-                PolyGateType::Const { digits: _ } => PolyGateType::Const { digits: vec![] },
-                other => other.clone(),
-            };
-            *counts.entry(key).or_insert(0) += 1;
+            *counts.entry(gate.gate_type.clone()).or_insert(0) += 1;
         }
         for sub in self.sub_circuits.values() {
             sub.count_helper(counts);
@@ -181,6 +177,11 @@ impl<P: Poly> PolyCircuit<P> {
         self.not_gate(xor_result) // NOT XOR
     }
 
+    pub fn const_digits_poly(&mut self, digits: &[u32]) -> GateId {
+        let one = self.const_one_gate();
+        self.small_scalar_mul(one, digits)
+    }
+
     pub fn add_gate(&mut self, left_input: GateId, right_input: GateId) -> GateId {
         self.new_gate_generic(vec![left_input, right_input], PolyGateType::Add)
     }
@@ -193,16 +194,16 @@ impl<P: Poly> PolyCircuit<P> {
         self.new_gate_generic(vec![left_input, right_input], PolyGateType::Mul)
     }
 
+    pub fn small_scalar_mul(&mut self, input: GateId, scalar: &[u32]) -> GateId {
+        self.new_gate_generic(vec![input], PolyGateType::SmallScalarMul { scalar: scalar.to_vec() })
+    }
+
     pub fn large_scalar_mul(&mut self, input: GateId, scalar: &[BigUint]) -> GateId {
         self.new_gate_generic(vec![input], PolyGateType::LargeScalarMul { scalar: scalar.to_vec() })
     }
 
     pub fn rotate_gate(&mut self, input: GateId, shift: i32) -> GateId {
         self.new_gate_generic(vec![input], PolyGateType::Rotate { shift })
-    }
-
-    pub fn const_digits_poly(&mut self, digits: &[u32]) -> GateId {
-        self.new_gate_generic(vec![], PolyGateType::Const { digits: digits.to_vec() })
     }
 
     pub fn public_lookup_gate(&mut self, input: GateId, lookup_id: usize) -> GateId {
@@ -351,7 +352,6 @@ impl<P: Poly> PolyCircuit<P> {
                     PolyGateType::Input => {
                         panic!("Input gate {gate:?} should already be preloaded");
                     }
-                    PolyGateType::Const { digits } => E::from_digits(params, one, digits),
                     PolyGateType::Add => {
                         debug_mem("Add gate start");
                         let left =
@@ -380,6 +380,15 @@ impl<P: Poly> PolyCircuit<P> {
                             wires.get(&gate.input_gates[1]).expect("wire missing for Mul").clone();
                         let result = left * right;
                         debug_mem("Mul gate end");
+                        result
+                    }
+                    PolyGateType::SmallScalarMul { scalar } => {
+                        let input = wires
+                            .get(&gate.input_gates[0])
+                            .expect("wire missing for LargeScalarMul")
+                            .clone();
+                        let result = input.small_scalar_mul(params, scalar);
+                        debug_mem("Large scalar mul gate end");
                         result
                     }
                     PolyGateType::LargeScalarMul { scalar } => {

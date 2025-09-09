@@ -24,7 +24,7 @@ pub trait Evaluable:
     type Params: Debug + Clone + Send + Sync;
     type P: Poly;
 
-    fn rotate(self, params: &Self::Params, shift: i32) -> Self;
-    fn from_digits(params: &Self::Params, one: &Self, digits: &[u32]) -> Self;
+    fn rotate(&self, params: &Self::Params, shift: i32) -> Self;
+    fn small_scalar_mul(&self, params: &Self::Params, scalar: &[u32]) -> Self;
     fn large_scalar_mul(&self, params: &Self::Params, scalar: &[BigUint]) -> Self;
 }

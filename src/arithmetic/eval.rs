@@ -99,12 +99,12 @@ impl<P: Poly> ArithmeticCircuit<P> {
         let bgg_encoding_sampler = BGGEncodingSampler::<SU>::new(params, secret, Some(error_sigma));
         let plaintexts = if self.use_packing {
             inputs
-                .into_iter()
+                .iter()
                 .flat_map(|input| biguint_vec_to_packed_crt_poly(self.limb_bit_size, params, input))
                 .collect::<Vec<_>>()
         } else {
             inputs
-                .into_iter()
+                .iter()
                 .flat_map(|input| biguint_vec_to_crt_poly(self.limb_bit_size, params, input))
                 .collect::<Vec<_>>()
         };

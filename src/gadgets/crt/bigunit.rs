@@ -470,7 +470,7 @@ impl<P: Poly> BigUintPoly<P> {
                     idx += group_len;
                 }
             }
-            if next.last().map_or(false, |v| v.is_empty()) {
+            if next.last().is_some_and(|v| v.is_empty()) {
                 next.pop();
             }
             let need_more = next.iter().any(|col| col.len() > 2);

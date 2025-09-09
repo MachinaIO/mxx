@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolyNorm {
     pub ctx: Arc<SimulatorContext>,
     pub norm: BigDecimal,

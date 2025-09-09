@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolyMatrixNorm {
     pub nrow: usize,
     pub ncol: usize,
@@ -66,26 +66,20 @@ impl PolyMatrixNorm {
     }
 
     // this only support d = 1
-    pub fn sample_preimage(ctx: Arc<SimulatorContext>) -> Self {
-        let ncol = ctx.log_base_q + 2;
-        let c_0 = BigDecimal::from_f64(1.8).unwrap();
-        let c_1 = BigDecimal::from_f64(4.7).unwrap();
-        let sigma = BigDecimal::from_f64(4.578).unwrap();
-        let two_sqrt = BigDecimal::from(2).sqrt().unwrap();
-        let log_base_q_sqrt =
-            BigDecimal::from(ctx.log_base_q as u64).sqrt().expect("sqrt(log_base_q) failed");
-        let term = ctx.ring_dim_sqrt.clone() * log_base_q_sqrt +
-            two_sqrt * ctx.ring_dim_sqrt.clone() +
-            c_1.clone();
-        let norm = c_0 * 6 * sigma.clone() * ((ctx.base.clone() + 1) * sigma) * term;
-        PolyMatrixNorm {
-            nrow: 1,
-            ncol,
-            ncol_sqrt: BigDecimal::from(ncol as u64).sqrt().expect("sqrt(ncol) failed"),
-            poly_norm: PolyNorm { ctx, norm },
-            zero_rows: None,
-        }
-    }
+    // pub fn sample_preimage(
+    //     ctx: Arc<SimulatorContext>,
+    //     nrow: usize,
+    //     ncol: usize,
+    //     norm: BigDecimal,
+    // ) -> Self {
+    //     PolyMatrixNorm {
+    //         nrow,
+    //         ncol,
+    //         ncol_sqrt: BigDecimal::from(ncol as u64).sqrt().expect("sqrt(ncol) failed"),
+    //         poly_norm: PolyNorm { ctx, norm },
+    //         zero_rows: None,
+    //     }
+    // }
 
     #[inline]
     pub fn ctx(&self) -> &SimulatorContext {

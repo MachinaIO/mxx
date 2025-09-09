@@ -1,69 +1,109 @@
 use super::poly_norm::PolyNorm;
-use std::ops::{Add, AddAssign, Mul, MulAssign};
-use crate::impl_binop_with_refs;
+use crate::{impl_binop_with_refs, simulator::SimulatorContext};
+use bigdecimal::BigDecimal;
+use num_traits::{FromPrimitive, One};
+use std::{
+    ops::{Add, AddAssign, Mul, MulAssign},
+    sync::Arc,
+};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PolyMatrixNorm {
     pub nrow: usize,
     pub ncol: usize,
-    pub ncol_sqrt: f64,
+    pub ncol_sqrt: BigDecimal,
     pub poly_norm: PolyNorm,
     pub zero_rows: Option<usize>,
 }
 
 impl PolyMatrixNorm {
-    pub fn sample_uniform(nrow: usize, ncol: usize, ring_dim_sqrt: f64, bound: f64) -> Self {
+    pub fn one(ctx: Arc<SimulatorContext>, nrow: usize, ncol: usize) -> Self {
+        Self::sample_bound(ctx, nrow, ncol, BigDecimal::one())
+    }
+
+    pub fn sample_bound(
+        ctx: Arc<SimulatorContext>,
+        nrow: usize,
+        ncol: usize,
+        bound: BigDecimal,
+    ) -> Self {
         PolyMatrixNorm {
             nrow,
             ncol,
-            ncol_sqrt: (ncol as f64).sqrt(),
-            poly_norm: PolyNorm::sample_uniform(ring_dim_sqrt, bound),
+            ncol_sqrt: BigDecimal::from(ncol as u64).sqrt().expect("sqrt(ncol) to failed"),
+            poly_norm: PolyNorm::sample_bound(ctx, bound),
             zero_rows: None,
         }
     }
 
     pub fn sample_gauss(
+        ctx: Arc<SimulatorContext>,
         nrow: usize,
         ncol: usize,
-        ring_dim_sqrt: f64,
-        secpar_sqrt: f64,
-        sigma: f64,
+        sigma: BigDecimal,
     ) -> Self {
         PolyMatrixNorm {
             nrow,
             ncol,
-            ncol_sqrt: (ncol as f64).sqrt(),
-            poly_norm: PolyNorm::sample_gauss(ring_dim_sqrt, secpar_sqrt, sigma),
+            ncol_sqrt: BigDecimal::from(ncol as u64).sqrt().expect("sqrt(ncol) to failed"),
+            poly_norm: PolyNorm::sample_gauss(ctx, sigma),
             zero_rows: None,
         }
     }
 
-    pub fn sample_preimage(ring_dim_sqrt: f64, base: f64, log_base_q: usize) -> Self {
-        let ncol = log_base_q + 2;
-        let c_0 = 1.8_f64;
-        let c_1 = 4.7_f64;
-        let sigma = 4.578_f64;
-        let norm = 6.0 *
-            c_0 *
-            sigma *
-            ((base + 1.0) * sigma) *
-            (ring_dim_sqrt * ring_dim_sqrt.sqrt() + 1.414 * ring_dim_sqrt + c_1);
+    // this only support d = 1
+    pub fn gadget_decomposed(ctx: Arc<SimulatorContext>, ncol: usize) -> Self {
+        PolyMatrixNorm {
+            nrow: ctx.log_base_q,
+            ncol,
+            ncol_sqrt: BigDecimal::from(ncol as u64).sqrt().expect("sqrt(ncol) to failed"),
+            poly_norm: PolyNorm::sample_bound(
+                ctx.clone(),
+                ctx.base.clone() - BigDecimal::from(1u64),
+            ),
+            zero_rows: None,
+        }
+    }
+
+    // this only support d = 1
+    pub fn sample_preimage(ctx: Arc<SimulatorContext>) -> Self {
+        let ncol = ctx.log_base_q + 2;
+        let c_0 = BigDecimal::from_f64(1.8).unwrap();
+        let c_1 = BigDecimal::from_f64(4.7).unwrap();
+        let sigma = BigDecimal::from_f64(4.578).unwrap();
+        let two_sqrt = BigDecimal::from(2).sqrt().unwrap();
+        let log_base_q_sqrt =
+            BigDecimal::from(ctx.log_base_q as u64).sqrt().expect("sqrt(log_base_q) failed");
+        let term = ctx.ring_dim_sqrt.clone() * log_base_q_sqrt +
+            two_sqrt * ctx.ring_dim_sqrt.clone() +
+            c_1.clone();
+        let norm = c_0 * 6 * sigma.clone() * ((ctx.base.clone() + 1) * sigma) * term;
         PolyMatrixNorm {
             nrow: 1,
             ncol,
-            ncol_sqrt: (ncol as f64).sqrt(),
-            poly_norm: PolyNorm { ring_dim_sqrt, norm },
+            ncol_sqrt: BigDecimal::from(ncol as u64).sqrt().expect("sqrt(ncol) failed"),
+            poly_norm: PolyNorm { ctx, norm },
             zero_rows: None,
         }
+    }
+
+    #[inline]
+    pub fn ctx(&self) -> &SimulatorContext {
+        &self.poly_norm.ctx
+    }
+    #[inline]
+    pub fn clone_ctx(&self) -> Arc<SimulatorContext> {
+        self.poly_norm.ctx.clone()
     }
 }
 
 impl_binop_with_refs!(PolyMatrixNorm => Add::add(self, rhs: &PolyMatrixNorm) -> PolyMatrixNorm {
+    assert!(self.poly_norm.ctx == rhs.poly_norm.ctx, "ctx must match");
     assert!(self.nrow == rhs.nrow && self.ncol == rhs.ncol, "matrix dims must match");
     PolyMatrixNorm {
         nrow: self.nrow,
         ncol: self.ncol,
-        ncol_sqrt: self.ncol_sqrt,
+        ncol_sqrt: self.ncol_sqrt.clone(),
         poly_norm: &self.poly_norm + &rhs.poly_norm,
         zero_rows: None,
     }
@@ -72,26 +112,33 @@ impl_binop_with_refs!(PolyMatrixNorm => Add::add(self, rhs: &PolyMatrixNorm) -> 
 impl AddAssign for PolyMatrixNorm {
     fn add_assign(&mut self, rhs: Self) {
         assert!(self.nrow == rhs.nrow && self.ncol == rhs.ncol, "matrix dims must match");
-        self.poly_norm = self.poly_norm + rhs.poly_norm;
+        self.poly_norm += rhs.poly_norm;
         self.zero_rows = None;
         // nrow, ncol, ncol_sqrt unchanged
     }
 }
 
 impl_binop_with_refs!(PolyMatrixNorm => Mul::mul(self, rhs: &PolyMatrixNorm) -> PolyMatrixNorm {
+    assert!(self.poly_norm.ctx == rhs.poly_norm.ctx, "ctx must match");
     assert!(self.ncol == rhs.nrow, "inner dims must match for multiplication");
-    let zero_rows_f = rhs.zero_rows.map(|z| z as f64).unwrap_or(0.0);
-    let scale = self.ncol_sqrt - zero_rows_f;
+    let zero_rows_bd = rhs
+        .zero_rows
+        .and_then(|z| BigDecimal::from_u64(z as u64))
+        .unwrap_or_else(|| BigDecimal::from_f64(0.0).unwrap());
+    let scale = self.ncol_sqrt.clone() - zero_rows_bd;
     let pn = (&self.poly_norm * &rhs.poly_norm) * scale;
-    PolyMatrixNorm { nrow: self.nrow, ncol: rhs.ncol, ncol_sqrt: rhs.ncol_sqrt, poly_norm: pn, zero_rows: None }
+    PolyMatrixNorm { nrow: self.nrow, ncol: rhs.ncol, ncol_sqrt: rhs.ncol_sqrt.clone(), poly_norm: pn, zero_rows: None }
 });
 
 impl MulAssign for PolyMatrixNorm {
     fn mul_assign(&mut self, rhs: Self) {
         assert!(self.ncol == rhs.nrow, "inner dims must match for multiplication");
-        let zero_rows_f = rhs.zero_rows.map(|z| z as f64).unwrap_or(0.0);
-        let scale = self.ncol_sqrt - zero_rows_f;
-        self.poly_norm = (self.poly_norm * rhs.poly_norm) * scale;
+        let zero_rows_bd = rhs
+            .zero_rows
+            .and_then(|z| BigDecimal::from_u64(z as u64))
+            .unwrap_or_else(|| BigDecimal::from_f64(0.0).unwrap());
+        let scale = self.ncol_sqrt.clone() - zero_rows_bd;
+        self.poly_norm = (self.poly_norm.clone() * rhs.poly_norm) * scale;
         self.nrow = self.nrow;
         self.ncol = rhs.ncol;
         self.ncol_sqrt = rhs.ncol_sqrt;
@@ -99,9 +146,10 @@ impl MulAssign for PolyMatrixNorm {
     }
 }
 
-impl Mul<PolyNorm> for PolyMatrixNorm {
+impl Mul<&PolyNorm> for PolyMatrixNorm {
     type Output = Self;
-    fn mul(self, rhs: PolyNorm) -> Self::Output {
+    fn mul(self, rhs: &PolyNorm) -> Self::Output {
+        assert!(self.poly_norm.ctx == rhs.ctx, "ctx must match");
         PolyMatrixNorm {
             nrow: self.nrow,
             ncol: self.ncol,
@@ -115,40 +163,20 @@ impl Mul<PolyNorm> for PolyMatrixNorm {
 impl Mul<PolyMatrixNorm> for PolyNorm {
     type Output = PolyMatrixNorm;
     fn mul(self, rhs: PolyMatrixNorm) -> Self::Output {
-        rhs * self
+        rhs * &self
     }
 }
 
-// reference-reference heterogeneous multiplication
-impl<'a, 'b> Mul<&'b PolyNorm> for &'a PolyMatrixNorm {
-    type Output = PolyMatrixNorm;
-    fn mul(self, rhs: &'b PolyNorm) -> Self::Output {
-        PolyMatrixNorm {
-            nrow: self.nrow,
-            ncol: self.ncol,
-            ncol_sqrt: self.ncol_sqrt,
-            poly_norm: &self.poly_norm * rhs,
-            zero_rows: None,
-        }
-    }
-}
-
-impl<'a, 'b> Mul<&'b PolyMatrixNorm> for &'a PolyNorm {
-    type Output = PolyMatrixNorm;
-    fn mul(self, rhs: &'b PolyMatrixNorm) -> Self::Output {
-        PolyMatrixNorm {
-            nrow: rhs.nrow,
-            ncol: rhs.ncol,
-            ncol_sqrt: rhs.ncol_sqrt,
-            poly_norm: &rhs.poly_norm * self,
-            zero_rows: None,
-        }
-    }
-}
-
-impl Mul<f64> for PolyMatrixNorm {
+impl Mul<BigDecimal> for PolyMatrixNorm {
     type Output = Self;
-    fn mul(self, rhs: f64) -> Self::Output {
+    fn mul(self, rhs: BigDecimal) -> Self::Output {
+        self * &rhs
+    }
+}
+
+impl Mul<&BigDecimal> for PolyMatrixNorm {
+    type Output = Self;
+    fn mul(self, rhs: &BigDecimal) -> Self::Output {
         PolyMatrixNorm {
             nrow: self.nrow,
             ncol: self.ncol,
@@ -159,7 +187,7 @@ impl Mul<f64> for PolyMatrixNorm {
     }
 }
 
-impl Mul<PolyMatrixNorm> for f64 {
+impl Mul<PolyMatrixNorm> for BigDecimal {
     type Output = PolyMatrixNorm;
     fn mul(self, rhs: PolyMatrixNorm) -> Self::Output {
         rhs * self

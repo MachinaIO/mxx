@@ -87,6 +87,15 @@ impl PolyMatrixNorm {
     pub fn clone_ctx(&self) -> Arc<SimulatorContext> {
         self.poly_norm.ctx.clone()
     }
+
+    pub fn split_rows(&self, top_row_size: usize) -> (Self, Self) {
+        assert!(top_row_size <= self.nrow);
+        let mut top = self.clone();
+        top.nrow = top_row_size;
+        let mut bottom = self.clone();
+        bottom.nrow = self.nrow - top_row_size;
+        (top, bottom)
+    }
 }
 
 impl_binop_with_refs!(PolyMatrixNorm => Add::add(self, rhs: &PolyMatrixNorm) -> PolyMatrixNorm {

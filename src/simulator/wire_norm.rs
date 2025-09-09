@@ -119,8 +119,8 @@ impl Evaluable for WireNorm {
 
 #[derive(Debug, Clone)]
 pub struct NormPltLweEvaluator {
-    preimage1_norm: PolyMatrixNorm,
-    preimage2_norm: PolyMatrixNorm,
+    pub preimage1_norm: PolyMatrixNorm,
+    pub preimage2_norm: PolyMatrixNorm,
 }
 
 impl NormPltLweEvaluator {

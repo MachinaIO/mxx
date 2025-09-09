@@ -11,5 +11,6 @@ pub mod matrix;
 pub mod poly;
 pub mod rlwe_enc;
 pub mod sampler;
+pub mod simulator;
 pub mod storage;
 pub mod utils;

@@ -140,7 +140,7 @@ pub fn run_lattice_estimator_cli_with_path(
     q: &BigUint,
     s_dist: &Distribution,
     e_dist: &Distribution,
-    m: Option<u64>,
+    m: Option<&BigUint>,
     exact: bool,
 ) -> Result<u64, EstimatorCliError> {
     // Prepare string arguments so they can be passed as discrete argv entries.
@@ -153,8 +153,8 @@ pub fn run_lattice_estimator_cli_with_path(
     // lattice-estimator-cli <ring_dim> <q> --s-dist <json> --e-dist <json> [--m <m>] [--exact]
     let mut cmd = Command::new(cli_path.as_ref());
     cmd.arg(&ring_dim_s).arg(&q_s).arg("--s-dist").arg(&s_json).arg("--e-dist").arg(&e_json);
-    if let Some(mv) = m {
-        cmd.arg("--m").arg(mv.to_string());
+    if let Some(m) = m {
+        cmd.arg("--m").arg(m.to_string());
     }
     if exact {
         cmd.arg("--exact");
@@ -180,7 +180,7 @@ pub fn run_lattice_estimator_cli(
     q: &BigUint,
     s_dist: &Distribution,
     e_dist: &Distribution,
-    m: Option<u64>,
+    m: Option<&BigUint>,
     exact: bool,
 ) -> Result<u64, EstimatorCliError> {
     run_lattice_estimator_cli_with_path(

@@ -5,7 +5,7 @@ use crate::{
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
     sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler},
-    storage::{read_single_matrix_from_batch, store_and_drop_matrices},
+    storage::{read_single_matrix_from_multi_batch, store_and_drop_matrices},
     utils::timed_read,
 };
 use rayon::prelude::*;
@@ -123,8 +123,13 @@ where
         let l_k = timed_read(
             &format!("L_{id}_{k}"),
             || {
-                read_single_matrix_from_batch::<M>(params, &self.dir_path, &format!("L_{id}"), k)
-                    .unwrap_or_else(|| panic!("Matrix with index {} not found in batch", k))
+                read_single_matrix_from_multi_batch::<M>(
+                    params,
+                    &self.dir_path,
+                    &format!("L_{id}"),
+                    k,
+                )
+                .unwrap_or_else(|| panic!("Matrix with index {} not found in batch", k))
             },
             &mut std::time::Duration::default(),
         );
@@ -200,6 +205,9 @@ fn preimage_all<M, ST, P>(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+
+    // Use the standard storage for now.
+    // TODO: Integrate the new multi-lookup table batching system properly.
     store_and_drop_matrices(preimages, dir_path, &format!("L_{id}"));
 }
 
@@ -219,7 +227,7 @@ mod test {
             hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
             uniform::DCRTPolyUniformSampler,
         },
-        storage::{init_storage_system, wait_for_all_writes},
+        storage::wait_for_all_writes,
         utils::create_bit_random_poly,
     };
     use keccak_asm::Keccak256;
@@ -240,7 +248,8 @@ mod test {
 
     #[tokio::test]
     async fn test_lwe_plt_eval() {
-        init_storage_system();
+        // Use a small threshold for testing to ensure immediate flush.
+        crate::storage::init_storage_system_with_threshold(1024); // 1KB threshold
         // Create parameters for testing
         let params = DCRTPolyParams::default();
 

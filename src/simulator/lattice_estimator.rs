@@ -1,5 +1,5 @@
 use num_bigint::BigUint;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{path::Path, process::Command, result::Result};
 /// Enum describing supported noise distributions.
 /// This mirrors the JSON spec expected by the Python CLI.
@@ -104,29 +104,21 @@ impl Distribution {
 }
 
 /// Errors that can occur when invoking the CLI.
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum EstimatorCliError {
-    Io(std::io::Error),
-    Utf8(std::string::FromUtf8Error),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("UTF-8 error: {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
+
+    #[error("lattice-estimator-cli exited with code {0:?}. stdout: {1} stderr: {2}")]
     NonZeroExit(Option<i32>, String, String), // (exit_code, stdout, stderr)
-    ParseInt(std::num::ParseIntError),
+
+    #[error("parse int error: {0}")]
+    ParseInt(#[from] std::num::ParseIntError),
 }
 
-impl From<std::io::Error> for EstimatorCliError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-impl From<std::string::FromUtf8Error> for EstimatorCliError {
-    fn from(e: std::string::FromUtf8Error) -> Self {
-        Self::Utf8(e)
-    }
-}
-impl From<std::num::ParseIntError> for EstimatorCliError {
-    fn from(e: std::num::ParseIntError) -> Self {
-        Self::ParseInt(e)
-    }
-}
 
 /// Invoke `lattice-estimator-cli` and return the security parameter as u64.
 /// - `cli_path`: path to the `lattice-estimator-cli` wrapper (or a filename on PATH).

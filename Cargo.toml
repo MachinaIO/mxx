@@ -19,6 +19,7 @@ openfhe = { git = "https://github.com/MachinaIO/openfhe-rs.git" }
 num-bigint = { version = "0.4.6", features = ["serde", "rand"] }
 num-traits = "0.2.19"
 bigdecimal = { version = "0.4" }
+thiserror = "1"
 rayon = { version = "1.5" }
 itertools = "0.14.0"
 serde = { version = "1.0", features = ["derive"] }

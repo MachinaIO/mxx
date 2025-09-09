@@ -1,5 +1,5 @@
 use num_bigint::BigUint;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{path::Path, process::Command, result::Result};
 /// Enum describing supported noise distributions.
 /// This mirrors the JSON spec expected by the Python CLI.
@@ -119,7 +119,6 @@ pub enum EstimatorCliError {
     ParseInt(#[from] std::num::ParseIntError),
 }
 
-
 /// Invoke `lattice-estimator-cli` and return the security parameter as u64.
 /// - `cli_path`: path to the `lattice-estimator-cli` wrapper (or a filename on PATH).
 /// - `ring_dim`, `q`: large integers represented as `BigUint`.
@@ -161,8 +160,14 @@ pub fn run_lattice_estimator_cli_with_path(
         return Err(EstimatorCliError::NonZeroExit(output.status.code(), stdout, stderr));
     }
 
-    // The CLI prints a single integer on stdout.
-    let secpar: u64 = stdout.trim().parse()?;
+    // The CLI may print logs; parse only the last (non-empty) line as integer.
+    let last_line = stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let secpar: u64 = last_line.parse()?;
     Ok(secpar)
 }
 

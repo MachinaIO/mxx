@@ -30,7 +30,7 @@ impl PolyCircuit<DCRTPoly> {
             PolyMatrixNorm::one(ctx.clone(), nrow, ctx.log_base_q),
         );
         let input_wire = WireNorm::new(
-            PolyNorm::sample_bound(ctx.clone(), input_norm_bound),
+            PolyNorm::new(ctx.clone(), input_norm_bound),
             PolyMatrixNorm::one(ctx.clone(), nrow, ctx.log_base_q),
         );
         let plt_evaluator = NormPltLweEvaluator::new(ctx.clone(), input_size);
@@ -98,7 +98,7 @@ impl Evaluable for WireNorm {
 
     fn small_scalar_mul(&self, _: &Self::Params, scalar: &[u32]) -> Self {
         let scalar_max = BigDecimal::from(*scalar.iter().max().unwrap());
-        let scalar_poly = PolyNorm::sample_bound(self.clone_ctx(), scalar_max);
+        let scalar_poly = PolyNorm::new(self.clone_ctx(), scalar_max);
         WireNorm {
             h_norm: self.h_norm.clone() * &scalar_poly,
             plaintext_norm: self.plaintext_norm.clone() * &scalar_poly,
@@ -108,7 +108,7 @@ impl Evaluable for WireNorm {
     fn large_scalar_mul(&self, _: &Self::Params, scalar: &[BigUint]) -> Self {
         let scalar_max = scalar.iter().max().unwrap().clone();
         let scalar_bd = BigDecimal::from(num_bigint::BigInt::from(scalar_max));
-        let scalar_poly = PolyNorm::sample_bound(self.clone_ctx(), scalar_bd);
+        let scalar_poly = PolyNorm::new(self.clone_ctx(), scalar_bd);
         WireNorm {
             h_norm: self.h_norm.clone() *
                 PolyMatrixNorm::gadget_decomposed(self.clone_ctx(), self.ctx().log_base_q),
@@ -136,21 +136,15 @@ impl NormPltLweEvaluator {
             c_1.clone();
         let norm: BigDecimal = c_0 * 6 * sigma.clone() * ((ctx.base.clone() + 1) * sigma) * term;
         let ncol = ctx.log_base_q;
-        let ncol_sqrt = BigDecimal::from(ncol as u64).sqrt().unwrap();
-        let preimage1_norm = PolyMatrixNorm {
-            nrow: get_nrow_for_input(&ctx, input_size),
+        let preimage1_norm = PolyMatrixNorm::new(
+            ctx.clone(),
+            get_nrow_for_input(&ctx, input_size),
             ncol,
-            ncol_sqrt: ncol_sqrt.clone(),
-            poly_norm: PolyNorm { ctx: ctx.clone(), norm: norm.clone() },
-            zero_rows: None,
-        };
-        let preimage2_norm = PolyMatrixNorm {
-            nrow: ctx.log_base_q,
-            ncol,
-            ncol_sqrt,
-            poly_norm: PolyNorm { ctx, norm },
-            zero_rows: None,
-        };
+            norm.clone(),
+            None,
+        );
+        let preimage2_norm =
+            PolyMatrixNorm::new(ctx.clone(), ctx.log_base_q, ncol, norm.clone(), None);
         Self { preimage1_norm, preimage2_norm }
     }
 }
@@ -166,7 +160,7 @@ impl PltEvaluator<WireNorm> for NormPltLweEvaluator {
         let h_norm = &self.preimage1_norm + (&input.h_norm * &self.preimage2_norm);
         let plaintext_bd =
             BigDecimal::from(num_bigint::BigInt::from(plt.max_output_row().1.value().clone()));
-        let plaintext_norm = PolyNorm::sample_bound(input.clone_ctx(), plaintext_bd);
+        let plaintext_norm = PolyNorm::new(input.clone_ctx(), plaintext_bd);
         WireNorm { h_norm, plaintext_norm }
     }
 }
@@ -213,7 +207,7 @@ mod tests {
         assert_eq!(out.len(), 2);
         let nrow = (ctx.log_base_q + 2) + 2 * ctx.log_base_q;
         let expected = WireNorm::new(
-            PolyNorm::sample_bound(ctx.clone(), input_bound),
+            PolyNorm::new(ctx.clone(), input_bound),
             PolyMatrixNorm::one(ctx.clone(), nrow, ctx.log_base_q),
         );
         assert_eq!(out[0], expected);
@@ -235,7 +229,7 @@ mod tests {
         // Build expected from input wires and add them
         let nrow = (ctx.log_base_q + 2) + 2 * ctx.log_base_q;
         let in_wire = WireNorm::new(
-            PolyNorm::sample_bound(ctx.clone(), input_bound),
+            PolyNorm::new(ctx.clone(), input_bound),
             PolyMatrixNorm::one(ctx.clone(), nrow, ctx.log_base_q),
         );
         let expected = &in_wire + &in_wire;
@@ -254,7 +248,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         let nrow = (ctx.log_base_q + 2) + 2 * ctx.log_base_q;
         let in_wire = WireNorm::new(
-            PolyNorm::sample_bound(ctx.clone(), input_bound),
+            PolyNorm::new(ctx.clone(), input_bound),
             PolyMatrixNorm::one(ctx.clone(), nrow, ctx.log_base_q),
         );
         let expected = &in_wire - &in_wire; // subtraction bound equals addition bound
@@ -276,7 +270,7 @@ mod tests {
         // Build expected = in_wire * in_wire
         let nrow = (ctx.log_base_q + 2) + 2 * ctx.log_base_q;
         let in_wire = WireNorm::new(
-            PolyNorm::sample_bound(ctx.clone(), input_bound),
+            PolyNorm::new(ctx.clone(), input_bound),
             PolyMatrixNorm::one(ctx.clone(), nrow, ctx.log_base_q),
         );
         let expected = &in_wire * &in_wire;

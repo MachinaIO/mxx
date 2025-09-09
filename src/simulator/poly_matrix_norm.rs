@@ -17,23 +17,24 @@ pub struct PolyMatrixNorm {
 }
 
 impl PolyMatrixNorm {
-    pub fn one(ctx: Arc<SimulatorContext>, nrow: usize, ncol: usize) -> Self {
-        Self::sample_bound(ctx, nrow, ncol, BigDecimal::one())
-    }
-
-    pub fn sample_bound(
+    pub fn new(
         ctx: Arc<SimulatorContext>,
         nrow: usize,
         ncol: usize,
-        bound: BigDecimal,
+        norm: BigDecimal,
+        zero_rows: Option<usize>,
     ) -> Self {
         PolyMatrixNorm {
             nrow,
             ncol,
             ncol_sqrt: BigDecimal::from(ncol as u64).sqrt().expect("sqrt(ncol) to failed"),
-            poly_norm: PolyNorm::sample_bound(ctx, bound),
-            zero_rows: None,
+            poly_norm: PolyNorm::new(ctx, norm),
+            zero_rows,
         }
+    }
+
+    pub fn one(ctx: Arc<SimulatorContext>, nrow: usize, ncol: usize) -> Self {
+        Self::new(ctx, nrow, ncol, BigDecimal::one(), None)
     }
 
     pub fn sample_gauss(
@@ -57,10 +58,7 @@ impl PolyMatrixNorm {
             nrow: ctx.log_base_q,
             ncol,
             ncol_sqrt: BigDecimal::from(ncol as u64).sqrt().expect("sqrt(ncol) to failed"),
-            poly_norm: PolyNorm::sample_bound(
-                ctx.clone(),
-                ctx.base.clone() - BigDecimal::from(1u64),
-            ),
+            poly_norm: PolyNorm::new(ctx.clone(), ctx.base.clone() - BigDecimal::from(1u64)),
             zero_rows: None,
         }
     }

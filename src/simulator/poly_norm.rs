@@ -13,12 +13,12 @@ pub struct PolyNorm {
 }
 
 impl PolyNorm {
-    pub fn one(ctx: Arc<SimulatorContext>) -> Self {
-        Self::sample_bound(ctx, BigDecimal::one())
+    pub fn new(ctx: Arc<SimulatorContext>, norm: BigDecimal) -> Self {
+        PolyNorm { ctx, norm }
     }
 
-    pub fn sample_bound(ctx: Arc<SimulatorContext>, bound: BigDecimal) -> Self {
-        PolyNorm { ctx, norm: bound }
+    pub fn one(ctx: Arc<SimulatorContext>) -> Self {
+        Self::new(ctx, BigDecimal::one())
     }
 
     pub fn sample_gauss(ctx: Arc<SimulatorContext>, sigma: BigDecimal) -> Self {

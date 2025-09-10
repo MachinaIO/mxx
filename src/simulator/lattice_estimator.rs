@@ -383,37 +383,10 @@ exit {}
         assert_eq!(json, r#"{"name":"Binary"}"#);
     }
 
-    // Helper to create a wrapper script that activates conda environment.
-    fn create_conda_wrapper(dir: &TempDir, cli_path: &str) -> std::path::PathBuf {
-        let wrapper_path = dir.path().join("conda-wrapper-cli");
-        let script_content = format!(
-            r#"#!/bin/bash
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate sage
-"{}" "$@"
-exit_code=$?
-conda deactivate
-exit $exit_code
-"#,
-            cli_path
-        );
-        fs::write(&wrapper_path, script_content).expect("write wrapper script");
-
-        // Make it executable.
-        let mut perms = fs::metadata(&wrapper_path).expect("get metadata").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&wrapper_path, perms).expect("set permissions");
-
-        wrapper_path
-    }
-
     // Integration test with actual CLI (requires lattice-estimator-cli in PATH).
     #[test]
     #[ignore] // Use `cargo test -- --ignored` to run this test.
     fn test_integration_with_actual_cli() {
-        let temp_dir = TempDir::new().expect("create temp dir");
-        let wrapper_path = create_conda_wrapper(&temp_dir, "lattice-estimator-cli");
-
         let ring_dim = BigUint::from(1024u32);
         let q = BigUint::from(12289u32);
         let s_dist = Distribution::Binary;
@@ -421,15 +394,7 @@ exit $exit_code
         let m = BigUint::from(100000u32);
 
         // Test with exact mode.
-        let result = run_lattice_estimator_cli_with_path(
-            wrapper_path.clone(),
-            &ring_dim,
-            &q,
-            &s_dist,
-            &e_dist,
-            Some(&m),
-            true,
-        );
+        let result = run_lattice_estimator_cli(&ring_dim, &q, &s_dist, &e_dist, Some(&m), true);
 
         match result {
             Ok(secpar) => {
@@ -443,15 +408,7 @@ exit $exit_code
         }
 
         // Test without exact mode.
-        let result_rough = run_lattice_estimator_cli_with_path(
-            wrapper_path,
-            &ring_dim,
-            &q,
-            &s_dist,
-            &e_dist,
-            None,
-            false,
-        );
+        let result_rough = run_lattice_estimator_cli(&ring_dim, &q, &s_dist, &e_dist, None, false);
 
         match result_rough {
             Ok(secpar) => {
@@ -469,22 +426,15 @@ exit $exit_code
     #[test]
     #[ignore] // Use `cargo test -- --ignored` to run this test.
     fn test_integration_with_custom_cli_path() {
-        let temp_dir = TempDir::new().expect("create temp dir");
-        let cli_path = "../lattice-estimator-cli/scripts/lattice-estimator-cli";
-        let wrapper_path = create_conda_wrapper(&temp_dir, cli_path);
+        let cli_path =
+            "/Users/piapark/Documents/GitHub/lattice-estimator-cli/scripts/lattice-estimator-cli";
         let ring_dim = BigUint::from(2048u32);
         let q = BigUint::from(65537u32);
         let s_dist = Distribution::CenteredBinomial { eta: 2, n: None };
         let e_dist = Distribution::CenteredBinomial { eta: 2, n: None };
 
         let result = run_lattice_estimator_cli_with_path(
-            wrapper_path,
-            &ring_dim,
-            &q,
-            &s_dist,
-            &e_dist,
-            None,
-            false,
+            cli_path, &ring_dim, &q, &s_dist, &e_dist, None, false,
         );
 
         match result {

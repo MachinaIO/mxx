@@ -16,7 +16,7 @@ use crate::{
     matrix::PolyMatrix,
     poly::Poly,
     sampler::{PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
-    storage::{init_storage_system, wait_for_all_writes},
+    storage::write::{init_storage_system, wait_for_all_writes},
 };
 use num_bigint::BigUint;
 use std::{path::PathBuf, sync::Arc};

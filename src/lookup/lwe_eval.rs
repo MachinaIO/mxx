@@ -6,7 +6,8 @@ use crate::{
     poly::{Poly, PolyParams},
     sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler},
     storage::{
-        BatchLookupBuffer, add_lookup_buffer, get_lookup_buffer, read_matrix_from_multi_batch,
+        read::read_matrix_from_multi_batch,
+        write::{BatchLookupBuffer, add_lookup_buffer, get_lookup_buffer},
     },
     utils::timed_read,
 };
@@ -203,10 +204,7 @@ where
 
 #[cfg(test)]
 mod test {
-    use std::{collections::HashMap, fs, path::Path};
-
     use super::*;
-
     use crate::{
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         circuit::PolyCircuit,
@@ -217,10 +215,11 @@ mod test {
             hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
             uniform::DCRTPolyUniformSampler,
         },
-        storage::{init_storage_system, wait_for_all_writes},
+        storage::write::{init_storage_system, wait_for_all_writes},
         utils::create_bit_random_poly,
     };
     use keccak_asm::Keccak256;
+    use std::{collections::HashMap, fs, path::Path};
     use tokio;
 
     fn setup_lsb_constant_binary_plt(t_n: usize, params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {

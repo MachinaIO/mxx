@@ -1,7 +1,6 @@
 use keccak_asm::Keccak256;
 use mxx::{
     arithmetic::circuit::{ArithGateId, ArithmeticCircuit},
-    element::PolyElem,
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
@@ -14,7 +13,6 @@ use mxx::{
     utils::gen_biguint_for_limb_size,
 };
 use num_bigint::BigUint;
-use rand::Rng;
 use std::sync::Arc;
 use tempfile::tempdir;
 use tokio;

@@ -33,36 +33,33 @@ impl<P: Poly> PackedPlt<P> {
         let big_q_arc: Arc<BigUint> = params.modulus().into();
         let qi = moduli[crt_idx];
         let q_over_qi = &*big_q_arc / BigUint::from(qi);
-        let q_over_qi_poly = P::from_biguint_to_constant(params, q_over_qi.clone());
+        // let q_over_qi_poly = P::from_biguint_to_constant(params, q_over_qi.clone());
         // let q_over_qis: Vec<BigUint> =
         //     moduli.iter().map(|&qi| &*big_q_arc / BigUint::from(qi)).collect();
 
         let mut plt_ids = vec![0usize; max_degree];
         let mut mul_scalars = vec![vec![]; max_degree];
 
-        for i in 0..max_degree {
+        for j in 0..max_degree {
             // Precompute scalar coefficients for (q/qi) * L_j(X) in coefficient format.
             let mut slots = vec![BigUint::ZERO; ring_n];
-            slots[i] = BigUint::from(1u8);
+            slots[j] = BigUint::from(1u8);
             let lag_basis = P::from_biguints_eval(params, &slots);
-            // let l_j_coeffs = l_j_eval.coeffs();
-            // let q_ref: Arc<BigUint> = params.modulus().into();
-            mul_scalars[i] = lag_basis.coeffs().iter().map(|c| c.value() * &q_over_qi).collect();
+            mul_scalars[j] = lag_basis.coeffs().iter().map(|c| c.value() * &q_over_qi).collect();
 
             let mut lut_map: HashMap<P, (usize, P)> = HashMap::with_capacity(hashmap.len());
             for (input, (k, output)) in hashmap.iter() {
+                let mut slots = vec![BigUint::ZERO; ring_n];
+                slots[j] = input.clone() * &q_over_qi;
+                let key_poly = P::from_biguints_eval(params, &slots);
                 slots = vec![BigUint::ZERO; ring_n];
-                slots[i] = input.clone();
-                let key_poly =
-                    P::from_biguints_eval_single_mod(params, crt_idx, &slots) * &q_over_qi_poly;
-                slots = vec![BigUint::ZERO; ring_n];
-                slots[i] = output.clone();
+                slots[j] = output.clone();
                 let value_poly = P::from_biguints_eval_single_mod(params, crt_idx, &slots);
                 lut_map.insert(key_poly, (*k, value_poly));
             }
             let plt = PublicLut::<P>::new(lut_map);
             let plt_id = circuit.register_public_lookup(plt);
-            plt_ids[i] = plt_id;
+            plt_ids[j] = plt_id;
         }
 
         Self { crt_idx, max_degree, plt_ids, mul_scalars, _p: PhantomData }

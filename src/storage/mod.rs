@@ -8,7 +8,7 @@ use rayon::iter::{
 };
 use std::{
     collections::HashMap,
-    fs::File,
+    fs::{self, File},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
@@ -18,6 +18,11 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
+
+pub mod batch_lookup;
+pub use batch_lookup::{flush_all_batches, flush_all_batches_combined};
+
+use batch_lookup::{BatchCommand, BATCH_CHANNEL as BATCH_LOOKUP_CHANNEL};
 
 #[derive(Debug)]
 pub struct SerializedMatrix {
@@ -37,12 +42,12 @@ struct BatchedLookupTable {
     dir_path: PathBuf,
 }
 
-struct BatchCommand {
+struct BatchLookupCommand {
     lookup_table: BatchedLookupTable,
     response_tx: oneshot::Sender<String>,
 }
 static PENDING_LOOKUPS: OnceLock<Arc<Mutex<HashMap<String, String>>>> = OnceLock::new();
-static BATCH_CHANNEL: OnceLock<mpsc::UnboundedSender<BatchCommand>> = OnceLock::new();
+static BATCH_CHANNEL: OnceLock<mpsc::UnboundedSender<BatchLookupCommand>> = OnceLock::new();
 static BATCH_WORKER_HANDLE: OnceLock<JoinHandle<()>> = OnceLock::new();
 
 /// Initialize the storage system with optional batch threshold (in bytes).
@@ -64,7 +69,7 @@ pub fn init_storage_system_with_threshold(threshold_bytes: usize) {
         .expect("Pending lookups already initialized");
 
     // Initialize the batch channel and worker.
-    let (tx, mut rx) = mpsc::unbounded_channel::<BatchCommand>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<BatchLookupCommand>();
     BATCH_CHANNEL.set(tx).expect("Batch channel already initialized");
 
     let rt_handle = tokio::runtime::Handle::current();
@@ -289,67 +294,98 @@ where
     SerializedMatrix { id: id.to_string(), filename, data }
 }
 
-/// Batch serialize and store multiple matrices using the new multi-lookup table batching system.
-/// This will buffer the lookup table until the threshold is reached.
+// Overhead accounting: 8 bytes index + 8 bytes size + data
+#[inline]
+fn per_item_bytes(len: usize) -> usize {
+    16 + len
+}
+
+/// Store matrices using the multi-lookup batch system (recommended).
+/// Multiple lookup tables are combined into single batch files.
+pub async fn store_matrices_multi_batch<M>(
+    preimages: Vec<(usize, M)>,
+    dir: PathBuf,
+    id_prefix: String,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>>
+where
+    M: PolyMatrix + Send + 'static,
+{
+    let channel = BATCH_CHANNEL.get()
+        .ok_or("Main batch channel not initialized. Call init_storage_system_with_threshold(...) first.")?;
+
+    // Serialize in parallel
+    let start = Instant::now();
+    let matrices: Vec<(usize, Vec<u8>)> =
+        preimages.into_par_iter().map(|(idx, matrix)| (idx, matrix.to_compact_bytes())).collect();
+    let serialize_time = start.elapsed();
+
+    let total_bytes: usize = matrices.iter().map(|(_, bytes)| per_item_bytes(bytes.len())).sum();
+
+    log_mem(format!(
+        "Serialized {} matrices for lookup '{}' in {:?} ({} bytes incl. overhead)",
+        matrices.len(),
+        id_prefix,
+        serialize_time,
+        total_bytes
+    ));
+
+    let (tx, rx) = oneshot::channel();
+    let lookup_table = BatchedLookupTable {
+        lookup_id: id_prefix,
+        matrices,
+        total_bytes,
+        dir_path: dir,
+    };
+
+    channel.send(BatchLookupCommand {
+        lookup_table,
+        response_tx: tx,
+    }).map_err(|_| "Batch worker dropped")?;
+
+    let batch_filename = rx.await.map_err(|_| "Failed to receive batch filename")?;
+    Ok(batch_filename)
+}
+
+/// Batch serialize and enqueue matrices. The worker will flush when the threshold is met.
+/// NOTE: This uses the single-lookup batch system. Use store_matrices_multi_batch for better efficiency.
 pub fn store_and_drop_matrices_batched<M>(
     preimages: Vec<(usize, M)>,
     dir: PathBuf,
     id_prefix: String,
-) -> impl std::future::Future<Output = String>
-where
+) where
     M: PolyMatrix + Send + 'static,
 {
-    async move {
-        // Check if the batching system is initialized.
-        let channel = match BATCH_CHANNEL.get() {
-            Some(channel) => channel,
-            None => {
-                // Batching system not initialized, fall back to old method.
-                return store_and_drop_matrices(preimages, &dir, &id_prefix);
-            }
-        };
+    let channel = BATCH_LOOKUP_CHANNEL.get().expect("Batch lookup channel not initialized. Call batch_lookup::start_batcher(...) at program init.");
 
-        // Serialize all matrices in parallel using rayon.
-        let start = Instant::now();
-        let matrices: Vec<(usize, Vec<u8>)> = preimages
-            .into_par_iter()
-            .map(|(idx, matrix)| (idx, matrix.to_compact_bytes()))
-            .collect();
+    // Serialize in parallel to minimize the time we keep M alive.
+    let start = Instant::now();
+    let matrices: Vec<(usize, Vec<u8>)> =
+        preimages.into_par_iter().map(|(idx, matrix)| (idx, matrix.to_compact_bytes())).collect();
+    let serialize_time = start.elapsed();
 
-        let serialize_time = start.elapsed();
+    let total_bytes: usize = matrices.iter().map(|(_, bytes)| per_item_bytes(bytes.len())).sum();
 
-        // Calculate total bytes for this lookup table.
-        let total_bytes = matrices
-            .iter()
-            .map(|(_, bytes)| 16 + bytes.len()) // 8 bytes index + 8 bytes size + data
-            .sum::<usize>();
-
-        log_mem(format!(
-            "Serialized {} matrices for lookup '{}' in {:?} ({} bytes total)",
-            matrices.len(),
-            id_prefix,
-            serialize_time,
-            total_bytes
-        ));
-
-        let lookup_table =
-            BatchedLookupTable { lookup_id: id_prefix, matrices, total_bytes, dir_path: dir };
-        let lookup_id = lookup_table.lookup_id.clone();
-        let (response_tx, response_rx) = oneshot::channel();
-        let batch_command = BatchCommand { lookup_table, response_tx };
-        if let Err(_) = channel.send(batch_command) {
-            return format!("{}_batch.matrices", lookup_id);
-        }
-
-        match response_rx.await {
-            Ok(filename) => filename,
-            Err(_) => {
-                format!("{}_batch.matrices", lookup_id)
-            }
-        }
+    // Replace with your logging macro:
+    #[allow(unused_macros)]
+    macro_rules! log_mem {
+        ($($t:tt)*) => { eprintln!($($t)*) }
+    }
+    log_mem!(
+        "Serialized {} matrices for lookup '{}' in {:?} ({} bytes incl. overhead)",
+        matrices.len(),
+        id_prefix,
+        serialize_time,
+        total_bytes
+    );
+    if let Err(e) = channel.send(BatchCommand::AddMany {
+        lookup_id: id_prefix,
+        dir_path: dir,
+        matrices,
+        total_bytes,
+    }) {
+        eprintln!("Batcher task dropped: {e}");
     }
 }
-
 /// Batch serialize and store multiple matrices in a single file.
 /// Returns the base filename that was created.
 /// This is the original implementation for backward compatibility.
@@ -614,6 +650,132 @@ where
     read_single_matrix_from_batch(params, dir, lookup_id, target_k)
 }
 
+/// Read a specific matrix from a combined multi-lookup batch file.
+fn read_from_combined_batch_file<M>(
+    params: &<M::P as Poly>::Params,
+    file: &mut File,
+    lookup_id: &str,
+    target_k: usize,
+) -> Option<M>
+where
+    M: PolyMatrix,
+{
+    // Read the entire file
+    let mut data = Vec::new();
+    if file.read_to_end(&mut data).is_err() {
+        return None;
+    }
+    
+    let mut offset = 0;
+    
+    // Read number of lookup tables
+    if data.len() < 8 {
+        return None;
+    }
+    let num_lookups = u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?) as usize;
+    offset += 8;
+    
+    // Find the target lookup table
+    let mut target_lookup_info = None;
+    
+    for _ in 0..num_lookups {
+        // Read lookup ID length
+        if offset + 8 > data.len() {
+            return None;
+        }
+        let id_len = u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?) as usize;
+        offset += 8;
+        
+        // Read lookup ID
+        if offset + id_len > data.len() {
+            return None;
+        }
+        let id = String::from_utf8_lossy(&data[offset..offset + id_len]);
+        offset += id_len;
+        
+        // Read lookup info
+        if offset + 24 > data.len() {
+            return None;
+        }
+        let num_matrices = u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?) as usize;
+        let data_offset = u64::from_le_bytes(data[offset + 8..offset + 16].try_into().ok()?) as usize;
+        let data_size = u64::from_le_bytes(data[offset + 16..offset + 24].try_into().ok()?) as usize;
+        offset += 24;
+        
+        if id == lookup_id {
+            target_lookup_info = Some((num_matrices, data_offset, data_size));
+            break;
+        }
+    }
+    
+    let (num_matrices, data_offset, data_size) = target_lookup_info?;
+    
+    // Calculate absolute data offset (header_end + relative_data_offset)
+    let header_end = offset;
+    let absolute_data_offset = header_end + data_offset;
+    
+    if absolute_data_offset >= data.len() {
+        return None;
+    }
+    
+    // Search for the target matrix in the data section
+    let mut current_pos = absolute_data_offset;
+    let end_pos = absolute_data_offset + data_size;
+    
+    while current_pos + 16 <= end_pos && current_pos + 16 <= data.len() {
+        // Read matrix index
+        let idx = u64::from_le_bytes(data[current_pos..current_pos + 8].try_into().ok()?) as usize;
+        current_pos += 8;
+        
+        // Read matrix size
+        let matrix_size = u64::from_le_bytes(data[current_pos..current_pos + 8].try_into().ok()?) as usize;
+        current_pos += 8;
+        
+        if idx == target_k {
+            // Found the target matrix
+            if current_pos + matrix_size <= data.len() {
+                let matrix_bytes = &data[current_pos..current_pos + matrix_size];
+                return Some(M::from_compact_bytes(params, matrix_bytes));
+            }
+            return None;
+        }
+        
+        // Skip this matrix
+        current_pos += matrix_size;
+    }
+    
+    None
+}
+
+/// Read a specific matrix from a sequenced batch file (new format).
+fn read_from_sequenced_batch_file<M>(
+    params: &<M::P as Poly>::Params,
+    file: &mut File,
+    target_k: usize,
+) -> Option<M>
+where
+    M: PolyMatrix,
+{
+    // Read the entire file
+    let mut data = Vec::new();
+    if file.read_to_end(&mut data).is_err() {
+        return None;
+    }
+    
+    // Decode using bincode
+    let matrices: Vec<(usize, Vec<u8>)> = 
+        bincode::decode_from_slice(&data, bincode::config::standard()).ok()?.0;
+    
+    // Find the target matrix
+    for (idx, matrix_bytes) in matrices {
+        if idx == target_k {
+            return Some(M::from_compact_bytes(params, &matrix_bytes));
+        }
+    }
+    
+    None
+}
+
 /// Read a specific matrix from a batch file by its index.
 /// This is more efficient than loading all matrices when only one is needed.
 pub fn read_single_matrix_from_batch<M>(
@@ -625,6 +787,47 @@ pub fn read_single_matrix_from_batch<M>(
 where
     M: PolyMatrix,
 {
+    // First try the combined batch format
+    log_mem(format!("Searching for combined batch files in directory: {:?}", dir));
+    for seq in 1..=10 {
+        let filename = format!("combined_batch_{:03}.matrices", seq);
+        let path = dir.join(&filename);
+        
+        log_mem(format!("Trying to open combined batch: {:?}", path));
+        if let Ok(mut file) = File::open(&path) {
+            log_mem(format!("Found combined batch file: {:?}", path));
+            if let Some(matrix) = read_from_combined_batch_file::<M>(params, &mut file, id_prefix, target_k) {
+                return Some(matrix);
+            }
+        }
+    }
+    
+    // Then try single-lookup batch format with sequence numbers
+    log_mem(format!("Searching for sequenced batch files in directory: {:?}", dir));
+    for seq in 1..=10 {  // Reduced from 999 to avoid spam
+        let filename = format!("{}_batch_{:03}.matrices", id_prefix, seq);
+        let path = dir.join(&filename);
+        
+        log_mem(format!("Trying to open: {:?}", path));
+        if let Ok(mut file) = File::open(&path) {
+            log_mem(format!("Found sequenced batch file: {:?}", path));
+            if let Some(matrix) = read_from_sequenced_batch_file::<M>(params, &mut file, target_k) {
+                return Some(matrix);
+            }
+        }
+    }
+    
+    // Debug: List all files in the directory
+    if let Ok(entries) = fs::read_dir(dir) {
+        log_mem(format!("Files in directory {:?}:", dir));
+        for entry in entries {
+            if let Ok(entry) = entry {
+                log_mem(format!("  - {:?}", entry.file_name()));
+            }
+        }
+    }
+    
+    // Fall back to old format
     let filename = format!("{}_batch.matrices", id_prefix);
     let path = dir.join(&filename);
 

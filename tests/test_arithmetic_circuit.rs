@@ -23,7 +23,7 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt::try_init();
 }
 
-#[tokio::test]
+#[t87okio::test]
 async fn test_arithmetic_circuit_operations() {
     // Test mixed operations in single circuit: (a + b) * c - a.
     init_tracing();

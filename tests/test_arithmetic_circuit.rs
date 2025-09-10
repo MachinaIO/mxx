@@ -57,10 +57,20 @@ async fn test_arithmetic_circuit_operations() {
     info!("start evaluate_with_poly");
     let mixed_poly_result = &mixed_circuit.evaluate_with_poly(&params, &inputs)[0];
     info!("end evaluate_with_poly");
+    let q = params.modulus();
+    let q = q.as_ref();
     let expected_slots = a_vec
         .iter()
         .zip(b_vec.iter().zip(c_vec.iter()))
-        .map(|(a, (b, c))| (((a + b) * c) - a) % params.modulus().as_ref())
+        .map(|(a, (b, c))| {
+            // Compute ((a + b) * c - a) mod q without underflow
+            let aa = a % q;
+            let bb = b % q;
+            let cc = c % q;
+            let t = (&aa + &bb) % q; // (a + b) mod q
+            let t = (t * &cc) % q; // ((a + b) * c) mod q
+            (t + (q - &aa)) % q // subtract a mod q safely
+        })
         .collect::<Vec<_>>();
     let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_slots);
     assert_eq!(mixed_poly_result, &expected_poly, "Mixed operations should be correct");
@@ -103,7 +113,6 @@ trapdoor_sampler.clone()).await;
     assert_eq!(mixed_encoding_result[0].vector, mixed_encoding_expected);
 }
 
-#[ignore = "todo need to fix"]
 #[tokio::test]
 async fn test_arithmetic_circuit_no_crt_limb1() {
     init_tracing();
@@ -143,10 +152,20 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
     info!("start evaluate_with_poly");
     let mixed_poly_result = &mixed_circuit.evaluate_with_poly(&params, &inputs)[0];
     info!("end evaluate_with_poly");
+    let q = params.modulus();
+    let q = q.as_ref();
     let expected_slots = a_vec
         .iter()
         .zip(b_vec.iter().zip(c_vec.iter()))
-        .map(|(a, (b, c))| (((a + b) * c) - a) % params.modulus().as_ref())
+        .map(|(a, (b, c))| {
+            // Compute ((a + b) * c - a) mod q without underflow
+            let aa = a % q;
+            let bb = b % q;
+            let cc = c % q;
+            let t = (&aa + &bb) % q; // (a + b) mod q
+            let t = (t * &cc) % q; // ((a + b) * c) mod q
+            (t + (q - &aa)) % q // subtract a mod q safely
+        })
         .collect::<Vec<_>>();
     let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_slots);
     assert_eq!(mixed_poly_result, &expected_poly, "Mixed operations should be correct");

@@ -5,15 +5,13 @@ use crate::{
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
     sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler},
-    storage::{read_single_matrix_from_batch, store_and_drop_matrices},
+    storage::{
+        BatchLookupBuffer, add_lookup_buffer, get_lookup_buffer, read_matrix_from_multi_batch,
+    },
     utils::timed_read,
 };
 use rayon::prelude::*;
-use std::{
-    marker::PhantomData,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{marker::PhantomData, path::PathBuf, sync::Arc};
 use tracing::info;
 
 #[derive(Debug)]
@@ -47,7 +45,7 @@ where
     ) -> BggPublicKey<M> {
         let row_size = input.matrix.row_size();
         let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, id);
-        preimage_all::<M, ST, _>(
+        let buffer = preimage_all::<M, ST, _>(
             plt,
             params,
             &self.trap_sampler,
@@ -56,8 +54,8 @@ where
             &input.matrix,
             &a_lt,
             &id,
-            &self.dir_path,
         );
+        add_lookup_buffer(buffer);
         BggPublicKey { matrix: a_lt, reveal_plaintext: true }
     }
 }
@@ -123,7 +121,7 @@ where
         let l_k = timed_read(
             &format!("L_{id}_{k}"),
             || {
-                read_single_matrix_from_batch::<M>(params, &self.dir_path, &format!("L_{id}"), k)
+                read_matrix_from_multi_batch::<M>(params, &self.dir_path, &format!("L_{id}"), k)
                     .unwrap_or_else(|| panic!("Matrix with index {} not found in batch", k))
             },
             &mut std::time::Duration::default(),
@@ -169,8 +167,8 @@ fn preimage_all<M, ST, P>(
     a_z: &M,
     a_lt: &M,
     id: &GateId,
-    dir_path: &Path,
-) where
+) -> BatchLookupBuffer
+where
     P: Poly,
     M: PolyMatrix<P = P> + Send + 'static,
     ST: PolyTrapdoorSampler<M = M> + Send + Sync,
@@ -200,7 +198,7 @@ fn preimage_all<M, ST, P>(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    store_and_drop_matrices(preimages, dir_path, &format!("L_{id}"));
+    get_lookup_buffer(preimages, &format!("L_{id}"))
 }
 
 #[cfg(test)]
@@ -241,10 +239,8 @@ mod test {
     #[tokio::test]
     async fn test_lwe_plt_eval() {
         init_storage_system();
-        // Create parameters for testing
+        tracing_subscriber::fmt::init();
         let params = DCRTPolyParams::default();
-
-        // Create a lookup table
         let plt = setup_lsb_constant_binary_plt(16, &params);
         // Create a simple circuit with the lookup table
         let mut circuit = PolyCircuit::new();
@@ -304,7 +300,7 @@ mod test {
             &[enc1.pubkey.clone()],
             Some(plt_pubkey_evaluator),
         );
-        wait_for_all_writes().await.unwrap();
+        wait_for_all_writes(dir.to_path_buf()).await.unwrap();
         assert_eq!(result_pubkey.len(), 1);
         let result_pubkey = &result_pubkey[0];
 

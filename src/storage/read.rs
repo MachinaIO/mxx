@@ -5,7 +5,11 @@ use std::{
     time::Instant,
 };
 
-use crate::{matrix::PolyMatrix, poly::Poly, utils::log_mem};
+use crate::{
+    matrix::PolyMatrix,
+    poly::Poly,
+    utils::{debug_mem, log_mem},
+};
 
 /// Read a specific matrix from a multi-batch file by its ID prefix and index.
 /// This reads from the combined batch file that contains multiple lookup tables.
@@ -84,14 +88,17 @@ where
 
                     let matrix = M::from_compact_bytes(params, &matrix_buf);
                     let elapsed = start.elapsed();
-                    log_mem(format!(
+                    debug_mem(format!(
                         "Loaded matrix {} from multi-batch file (table: {}) in {elapsed:?}",
                         target_k, id_prefix
                     ));
                     return Some(matrix);
                 }
                 None => {
-                    log_mem(format!("Matrix {} not found in lookup table {}", target_k, id_prefix));
+                    debug_mem(format!(
+                        "Matrix {} not found in lookup table {}",
+                        target_k, id_prefix
+                    ));
                     return None;
                 }
             }

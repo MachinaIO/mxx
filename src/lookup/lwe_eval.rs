@@ -13,7 +13,7 @@ use crate::{
 };
 use rayon::prelude::*;
 use std::{marker::PhantomData, path::PathBuf, sync::Arc};
-use tracing::info;
+use tracing::debug;
 
 #[derive(Debug)]
 pub struct LweBggPubKeyEvaluator<M, SH, ST>
@@ -111,11 +111,11 @@ where
         id: GateId,
     ) -> BggEncoding<M> {
         let z = &input.plaintext.expect("the BGG encoding should revealed plaintext");
-        info!("public lookup length is {}", plt.len());
+        debug!("public lookup length is {}", plt.len());
         let (k, y_k) = plt
             .get(params, z)
             .unwrap_or_else(|| panic!("{:?} is not exist in public lookup f", z.to_const_int()));
-        info!("Performing public lookup, k={k}");
+        debug!("Performing public lookup, k={k}");
         let row_size = input.pubkey.matrix.row_size();
         let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, id);
         let pubkey = BggPublicKey::new(a_lt, true);

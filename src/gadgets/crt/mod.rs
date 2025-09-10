@@ -323,10 +323,12 @@ mod tests {
         let (_, crt_bits, crt_depth) = params.to_crt();
         let max_limbs = crt_bits.div_ceil(LIMB_BIT_SIZE);
         let n = params.ring_dimension() as usize;
-        let a_vec: Vec<BigUint> =
-            (0..n).map(|_| gen_biguint_for_limb_size(&mut rng, 1, max_limbs)).collect::<Vec<_>>();
-        let b_vec: Vec<BigUint> =
-            (0..n).map(|_| gen_biguint_for_limb_size(&mut rng, 1, max_limbs)).collect::<Vec<_>>();
+        let a_vec: Vec<BigUint> = (0..n)
+            .map(|_| gen_biguint_for_limb_size(&mut rng, 1, max_limbs * crt_depth))
+            .collect::<Vec<_>>();
+        let b_vec: Vec<BigUint> = (0..n)
+            .map(|_| gen_biguint_for_limb_size(&mut rng, 1, max_limbs * crt_depth))
+            .collect::<Vec<_>>();
         let expected_output_biguint = a_vec
             .iter()
             .zip(b_vec.iter())
@@ -387,10 +389,12 @@ mod tests {
         let (_, crt_bits, crt_depth) = params.to_crt();
         let max_limbs = crt_bits.div_ceil(1);
         let n = params.ring_dimension() as usize;
-        let a_vec: Vec<BigUint> =
-            (0..n).map(|_| gen_biguint_for_limb_size(&mut rng, 1, max_limbs)).collect::<Vec<_>>();
-        let b_vec: Vec<BigUint> =
-            (0..n).map(|_| gen_biguint_for_limb_size(&mut rng, 1, max_limbs)).collect::<Vec<_>>();
+        let a_vec: Vec<BigUint> = (0..n)
+            .map(|_| gen_biguint_for_limb_size(&mut rng, 1, max_limbs * crt_depth))
+            .collect::<Vec<_>>();
+        let b_vec: Vec<BigUint> = (0..n)
+            .map(|_| gen_biguint_for_limb_size(&mut rng, 1, max_limbs * crt_depth))
+            .collect::<Vec<_>>();
         let expected_output_biguint = a_vec
             .iter()
             .zip(b_vec.iter())
@@ -452,10 +456,12 @@ mod tests {
         let (_, crt_bits, crt_depth) = params.to_crt();
         let max_limbs = crt_bits.div_ceil(1);
         let n = params.ring_dimension() as usize;
-        let a_vec: Vec<BigUint> =
-            (0..n).map(|_| gen_biguint_for_limb_size(&mut rng, 1, max_limbs)).collect::<Vec<_>>();
-        let b_vec: Vec<BigUint> =
-            (0..n).map(|_| gen_biguint_for_limb_size(&mut rng, 1, max_limbs)).collect::<Vec<_>>();
+        let a_vec: Vec<BigUint> = (0..n)
+            .map(|_| gen_biguint_for_limb_size(&mut rng, 1, max_limbs * crt_depth))
+            .collect::<Vec<_>>();
+        let b_vec: Vec<BigUint> = (0..n)
+            .map(|_| gen_biguint_for_limb_size(&mut rng, 1, max_limbs * crt_depth))
+            .collect::<Vec<_>>();
         let expected_output_biguint = a_vec
             .iter()
             .zip(b_vec.iter())
@@ -517,10 +523,10 @@ mod tests {
         let max_limbs = crt_bits.div_ceil(LIMB_BIT_SIZE);
         let n = params.ring_dimension() as usize;
         let a_vec: Vec<BigUint> = (0..n)
-            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs))
+            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs * crt_depth))
             .collect::<Vec<_>>();
         let b_vec: Vec<BigUint> = (0..n)
-            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs))
+            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs * crt_depth))
             .collect::<Vec<_>>();
         let expected_output_biguint = a_vec
             .iter()
@@ -577,10 +583,10 @@ mod tests {
         let max_limbs = crt_bits.div_ceil(LIMB_BIT_SIZE);
         let n = params.ring_dimension() as usize;
         let a_vec: Vec<BigUint> = (0..n)
-            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs))
+            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs * crt_depth))
             .collect::<Vec<_>>();
         let b_vec: Vec<BigUint> = (0..n)
-            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs))
+            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs * crt_depth))
             .collect::<Vec<_>>();
         let expected_output_biguint = a_vec
             .iter()
@@ -637,10 +643,10 @@ mod tests {
         let max_limbs = crt_bits.div_ceil(LIMB_BIT_SIZE);
         let n = params.ring_dimension() as usize;
         let a_vec: Vec<BigUint> = (0..n)
-            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs))
+            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs * crt_depth))
             .collect::<Vec<_>>();
         let b_vec: Vec<BigUint> = (0..n)
-            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs))
+            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs * crt_depth))
             .collect::<Vec<_>>();
         let expected_output_biguint = a_vec
             .iter()
@@ -697,10 +703,10 @@ mod tests {
         let max_limbs = crt_bits.div_ceil(LIMB_BIT_SIZE);
         let n = params.ring_dimension() as usize;
         let a_vec: Vec<BigUint> = (0..n)
-            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs))
+            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs * crt_depth))
             .collect::<Vec<_>>();
         let b_vec: Vec<BigUint> = (0..n)
-            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs))
+            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs * crt_depth))
             .collect::<Vec<_>>();
         let expected_output_biguint = a_vec
             .iter()
@@ -759,10 +765,10 @@ mod tests {
         let max_limbs = crt_bits.div_ceil(LIMB_BIT_SIZE);
         let n = params.ring_dimension() as usize;
         let a_vec: Vec<BigUint> = (0..n)
-            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs))
+            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs * crt_depth))
             .collect::<Vec<_>>();
         let b_vec: Vec<BigUint> = (0..n)
-            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs))
+            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs * crt_depth))
             .collect::<Vec<_>>();
         let expected_output_biguint = a_vec
             .iter()
@@ -821,10 +827,10 @@ mod tests {
         let max_limbs = crt_bits.div_ceil(LIMB_BIT_SIZE);
         let n = params.ring_dimension() as usize;
         let a_vec: Vec<BigUint> = (0..n)
-            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs))
+            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs * crt_depth))
             .collect::<Vec<_>>();
         let b_vec: Vec<BigUint> = (0..n)
-            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs))
+            .map(|_| gen_biguint_for_limb_size(&mut rng, LIMB_BIT_SIZE, max_limbs * crt_depth))
             .collect::<Vec<_>>();
         let expected_output_biguint = a_vec
             .iter()

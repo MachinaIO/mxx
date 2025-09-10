@@ -30,20 +30,20 @@ async fn test_arithmetic_circuit_operations() {
     // Test mixed operations in single circuit: (a + b) * c - a.
     init_tracing();
     let params = DCRTPolyParams::new(4, 2, 28, 17);
-    let (_, crt_bits, _) = params.to_crt();
+    let (_, crt_bits, crt_depth) = params.to_crt();
     info!("crt_bits={}", crt_bits);
     let n = params.ring_dimension() as usize;
     let limb_bit_size = 3;
     let max_limbs = crt_bits.div_ceil(limb_bit_size);
     let mut rng = rand::rng();
     let a_vec: Vec<BigUint> = (0..n)
-        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs))
+        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs * crt_depth))
         .collect::<Vec<_>>();
     let b_vec: Vec<BigUint> = (0..n)
-        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs))
+        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs * crt_depth))
         .collect::<Vec<_>>();
     let c_vec: Vec<BigUint> = (0..n)
-        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs))
+        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs * crt_depth))
         .collect::<Vec<_>>();
     let inputs = vec![&a_vec[..], &b_vec[..], &c_vec[..]];
     let mut mixed_circuit =
@@ -130,13 +130,13 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
     let max_limbs = crt_bits.div_ceil(limb_bit_size);
     let mut rng = rand::rng();
     let a_vec: Vec<BigUint> = (0..n)
-        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs))
+        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs * crt_depth))
         .collect::<Vec<_>>();
     let b_vec: Vec<BigUint> = (0..n)
-        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs))
+        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs * crt_depth))
         .collect::<Vec<_>>();
     let c_vec: Vec<BigUint> = (0..n)
-        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs))
+        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs * crt_depth))
         .collect::<Vec<_>>();
     let inputs = vec![&a_vec[..], &b_vec[..], &c_vec[..]];
 

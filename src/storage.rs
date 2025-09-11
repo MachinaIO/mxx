@@ -3,7 +3,7 @@ use crate::{
     poly::Poly,
     utils::{block_size, debug_mem, log_mem},
 };
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use std::{
     path::Path,
     sync::{Arc, Mutex, OnceLock},
@@ -77,6 +77,74 @@ where
     SerializedMatrix { id: id.to_string(), filename, data }
 }
 
+/// Batch serialize and store multiple matrices in a single file.
+/// Returns the base filename that was created.
+pub fn store_and_drop_matrices<M>(preimages: Vec<(usize, M)>, dir: &Path, id_prefix: &str) -> String
+where
+    M: PolyMatrix + Send + 'static,
+{
+    let start = Instant::now();
+
+    // Serialize all matrices into a single structure.
+    let batch_data: Vec<(usize, Vec<u8>)> = preimages
+        .into_par_iter()
+        .map(|(k, matrix)| {
+            let matrix_bytes = matrix.to_compact_bytes();
+            drop(matrix); // Drop immediately after serialization to free memory.
+            (k, matrix_bytes)
+        })
+        .collect();
+
+    // Encode the batch data.
+    let encoded = bincode::encode_to_vec(&batch_data, bincode::config::standard())
+        .expect("Failed to serialize batch matrices");
+
+    let filename = format!("{}_batch.matrices", id_prefix);
+    let elapsed = start.elapsed();
+    debug_mem(format!(
+        "Serialized {} matrices into batch file {} ({} bytes) in {elapsed:?}",
+        batch_data.len(),
+        filename,
+        encoded.len()
+    ));
+
+    // Write asynchronously.
+    let dir_async = dir.to_path_buf();
+    let filename_async = filename.clone();
+    let encoded_async = encoded.clone();
+    let write_task = async move {
+        let path = dir_async.join(&filename_async);
+        match tokio::fs::write(&path, &encoded_async).await {
+            Ok(_) => {
+                log_mem(format!(
+                    "Batch matrices written to {} ({} bytes)",
+                    filename_async,
+                    encoded_async.len()
+                ));
+            }
+            Err(e) => {
+                eprintln!("Failed to write {}: {}", path.display(), e);
+            }
+        }
+    };
+
+    // Spawn on the captured runtime handle when available; otherwise fallback to blocking write.
+    if let (Some(handles), Some(rt_handle)) = (WRITE_HANDLES.get(), RUNTIME_HANDLE.get()) {
+        let write_handle = rt_handle.spawn(write_task);
+        handles.lock().unwrap().push(write_handle);
+    } else {
+        eprintln!("Warning: Storage system not initialized, falling back to blocking write");
+        let path = dir.join(&filename);
+        if let Err(e) = std::fs::write(&path, &encoded) {
+            eprintln!("Failed to write {}: {}", path.display(), e);
+        } else {
+            log_mem(format!("Batch matrices written to {} ({} bytes)", filename, encoded.len()));
+        }
+    }
+
+    filename
+}
+
 /// CPU preprocessing (blocking) + background I/O (non-blocking)
 pub fn store_and_drop_matrix<M>(matrix: M, dir: &Path, id: &str)
 where
@@ -126,6 +194,83 @@ where
             ));
         }
     }
+}
+
+/// Read batch matrices from a single file.
+/// Returns a vector of (k, matrix) pairs in the order they were stored.
+pub fn read_batch_matrices<M>(
+    params: &<M::P as Poly>::Params,
+    dir: &Path,
+    id_prefix: &str,
+) -> Vec<(usize, M)>
+where
+    M: PolyMatrix,
+{
+    let filename = format!("{}_batch.matrices", id_prefix);
+    let path = dir.join(&filename);
+
+    let start = Instant::now();
+    let data = std::fs::read(&path)
+        .unwrap_or_else(|_| panic!("Failed to read batch matrices file {:?}", path));
+
+    let batch_data: Vec<(usize, Vec<u8>)> =
+        bincode::decode_from_slice(&data, bincode::config::standard())
+            .expect("Failed to deserialize batch matrices")
+            .0;
+
+    let matrices: Vec<(usize, M)> = batch_data
+        .into_par_iter()
+        .map(|(k, matrix_bytes)| {
+            let matrix = M::from_compact_bytes(params, &matrix_bytes);
+            (k, matrix)
+        })
+        .collect();
+
+    let elapsed = start.elapsed();
+    log_mem(format!(
+        "Loaded {} matrices from batch file {} in {elapsed:?}",
+        matrices.len(),
+        filename
+    ));
+
+    matrices
+}
+
+/// Read a specific matrix from a batch file by its index.
+/// This is more efficient than loading all matrices when only one is needed.
+pub fn read_single_matrix_from_batch<M>(
+    params: &<M::P as Poly>::Params,
+    dir: &Path,
+    id_prefix: &str,
+    target_k: usize,
+) -> Option<M>
+where
+    M: PolyMatrix,
+{
+    let filename = format!("{}_batch.matrices", id_prefix);
+    let path = dir.join(&filename);
+
+    let start = Instant::now();
+    let data = std::fs::read(&path)
+        .unwrap_or_else(|_| panic!("Failed to read batch matrices file {:?}", path));
+
+    let batch_data: Vec<(usize, Vec<u8>)> =
+        bincode::decode_from_slice(&data, bincode::config::standard())
+            .expect("Failed to deserialize batch matrices")
+            .0;
+
+    // Find the specific matrix we need
+    let matrix = batch_data
+        .into_iter()
+        .find(|(k, _)| *k == target_k)
+        .map(|(_, matrix_bytes)| M::from_compact_bytes(params, &matrix_bytes));
+
+    let elapsed = start.elapsed();
+    if matrix.is_some() {
+        log_mem(format!("Loaded matrix {} from batch file {} in {elapsed:?}", target_k, filename));
+    }
+
+    matrix
 }
 
 #[cfg(feature = "debug")]

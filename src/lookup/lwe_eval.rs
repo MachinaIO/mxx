@@ -5,7 +5,7 @@ use crate::{
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
     sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler},
-    storage::store_and_drop_matrix,
+    storage::{read_single_matrix_from_batch, store_and_drop_matrices},
     utils::timed_read,
 };
 use rayon::prelude::*;
@@ -120,17 +120,11 @@ where
         let row_size = input.pubkey.matrix.row_size();
         let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, id);
         let pubkey = BggPublicKey::new(a_lt, true);
-        let m = row_size * params.modulus_digits();
         let l_k = timed_read(
             &format!("L_{id}_{k}"),
             || {
-                M::read_from_files(
-                    params,
-                    row_size * (2 * params.modulus_digits() + 2),
-                    m,
-                    &self.dir_path,
-                    &format!("L_{id}_{k}"),
-                )
+                read_single_matrix_from_batch::<M>(params, &self.dir_path, &format!("L_{id}"), k)
+                    .unwrap_or_else(|| panic!("Matrix with index {} not found in batch", k))
             },
             &mut std::time::Duration::default(),
         );
@@ -206,9 +200,7 @@ fn preimage_all<M, ST, P>(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    for (k, l_k) in preimages.into_iter() {
-        store_and_drop_matrix(l_k, dir_path, &format!("L_{id}_{k}"));
-    }
+    store_and_drop_matrices(preimages, dir_path, &format!("L_{id}"));
 }
 
 #[cfg(test)]

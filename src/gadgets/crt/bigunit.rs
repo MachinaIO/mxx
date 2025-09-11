@@ -1,9 +1,10 @@
 use crate::{
     circuit::{PolyCircuit, gate::GateId},
-    lookup::PublicLut,
-    poly::Poly,
+    gadgets::packed_plt::PackedPlt,
+    poly::{Poly, PolyParams},
 };
 use num_bigint::BigUint;
+use num_traits::Zero;
 use rayon::prelude::*;
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
@@ -32,49 +33,64 @@ type Columns = Vec<Vec<GateId>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BigUintPolyContext<P: Poly> {
     pub limb_bit_size: usize,
+    pub crt_idx: usize,
+    pub max_degree: usize,
     pub const_zero: GateId,
     pub const_base: GateId,
-    pub lut_ids: (usize, usize),
-    _p: PhantomData<P>,
+    pub luts: Option<(PackedPlt<P>, PackedPlt<P>)>,
 }
 
 impl<P: Poly> BigUintPolyContext<P> {
-    pub fn setup(circuit: &mut PolyCircuit<P>, params: &P::Params, limb_bit_size: usize) -> Self {
+    pub fn setup(
+        circuit: &mut PolyCircuit<P>,
+        params: &P::Params,
+        limb_bit_size: usize,
+        crt_idx: usize,
+        max_degree: usize,
+    ) -> Self {
         // Assume base < 2^32
         debug_assert!(limb_bit_size < 32);
         let base = 1 << limb_bit_size;
         let const_zero = circuit.const_zero_gate();
         let const_base = circuit.const_digits_poly(&[base as u32]);
-        let lut_ids = if limb_bit_size > 1 {
-            let (mod_lut, div_lut) = Self::setup_split_lut(params, base, base * base);
-            (circuit.register_public_lookup(mod_lut), circuit.register_public_lookup(div_lut))
+        let luts = if limb_bit_size > 1 {
+            let (mod_lut, floor_lut) =
+                Self::setup_packed_luts(circuit, params, base, base * base, crt_idx, max_degree);
+            Some((mod_lut, floor_lut))
         } else {
-            (0, 0)
+            None
         };
-        Self { limb_bit_size, const_zero, const_base, lut_ids, _p: PhantomData }
+        Self { limb_bit_size, crt_idx, max_degree, const_zero, const_base, luts }
     }
 
-    fn setup_split_lut(
+    fn setup_packed_luts(
+        circuit: &mut PolyCircuit<P>,
         params: &P::Params,
         base: usize,
         nrows: usize,
-    ) -> (PublicLut<P>, PublicLut<P>) {
+        crt_idx: usize,
+        max_degree: usize,
+    ) -> (PackedPlt<P>, PackedPlt<P>) {
         let entries: Vec<_> = (0..nrows)
             .into_par_iter()
             .map(|k| {
-                let input = P::from_usize_to_constant(params, k);
-                let output_f = P::from_usize_to_constant(params, k % base);
-                let output_g = P::from_usize_to_constant(params, k / base);
-                (input, k, output_f, output_g)
+                let input = BigUint::from(k);
+                let output_mod = BigUint::from(k % base);
+                let output_floor = BigUint::from(k / base);
+                P::from_usize_to_constant(params, k % base);
+                (input, k, output_mod, output_floor)
             })
             .collect();
-        let mut f = HashMap::<P, (usize, P)>::with_capacity(nrows);
-        let mut g = HashMap::<P, (usize, P)>::with_capacity(nrows);
-        for (input, k, output_f, output_g) in entries {
-            f.insert(input.clone(), (k, output_f));
-            g.insert(input, (k, output_g));
+        let mut map_mod = HashMap::with_capacity(nrows);
+        let mut map_floor = HashMap::with_capacity(nrows);
+        for (input, k, output_mod, output_floor) in entries {
+            map_mod.insert(input.clone(), (k, output_mod));
+            map_floor.insert(input, (k, output_floor));
         }
-        (PublicLut::new(f), PublicLut::new(g))
+        (
+            PackedPlt::setup(circuit, params, crt_idx, max_degree, map_mod),
+            PackedPlt::setup(circuit, params, crt_idx, max_degree, map_floor),
+        )
     }
 }
 
@@ -157,23 +173,27 @@ impl<P: Poly> BigUintPoly<P> {
         for i in 0..w {
             let ai = a[i];
             let bi = if i < b.len() { b[i] } else { self.ctx.const_zero };
-            let (s, g) = if self.ctx.limb_bit_size == 1 {
-                let s = circuit.xor_gate(ai, bi);
-                let g = circuit.and_gate(ai, bi);
-                (s, g)
-            } else {
-                let t = circuit.add_gate(ai, bi);
-                let s = circuit.public_lookup_gate(t, self.ctx.lut_ids.0);
-                let g = circuit.public_lookup_gate(t, self.ctx.lut_ids.1);
-                (s, g)
+            let (s, g) = match self.ctx.luts.as_ref() {
+                None => {
+                    let s = circuit.xor_gate(ai, bi);
+                    let g = circuit.and_gate(ai, bi);
+                    (s, g)
+                }
+                Some((mod_lut, floor_lut)) => {
+                    let t = circuit.add_gate(ai, bi);
+                    let s = mod_lut.lookup_all(circuit, t);
+                    let g = floor_lut.lookup_all(circuit, t);
+                    (s, g)
+                }
             };
+
             // p = 1 iff s == B-1, i.e., floor((s + 1)/B) = 1
-            let p = if self.ctx.limb_bit_size == 1 {
-                s
-            } else {
-                // p = 1 iff s == B-1, i.e., floor((s + 1)/B) = 1
-                let s_plus = circuit.add_gate(s, one);
-                circuit.public_lookup_gate(s_plus, self.ctx.lut_ids.1)
+            let p = match self.ctx.luts.as_ref() {
+                None => s,
+                Some((_, floor_lut)) => {
+                    let s_plus = circuit.add_gate(s, one);
+                    floor_lut.lookup_all(circuit, s_plus)
+                }
             };
             ss.push(s);
             gs.push(g);
@@ -187,16 +207,18 @@ impl<P: Poly> BigUintPoly<P> {
         let mut limbs = Vec::with_capacity(w + 1);
         for i in 0..w {
             let carry_in = if i == 0 { zero } else { g_pref[i - 1] };
-
-            if self.ctx.limb_bit_size == 1 {
-                // For single bit: (s'_i + c_i) mod 2 = s'_i XOR c_i
-                let digit = circuit.xor_gate(ss[i], carry_in);
-                limbs.push(digit);
-            } else {
-                // For multi-bit: use lookup table for modular reduction.
-                let t = circuit.add_gate(ss[i], carry_in);
-                let digit = circuit.public_lookup_gate(t, self.ctx.lut_ids.0);
-                limbs.push(digit);
+            match self.ctx.luts.as_ref() {
+                None => {
+                    // For single bit: (s'_i + c_i) mod 2 = s'_i XOR c_i
+                    let digit = circuit.xor_gate(ss[i], carry_in);
+                    limbs.push(digit);
+                }
+                Some((mod_lut, _)) => {
+                    // For multi-bit: use lookup table for modular reduction.
+                    let t = circuit.add_gate(ss[i], carry_in);
+                    let digit = mod_lut.lookup_all(circuit, t);
+                    limbs.push(digit);
+                }
             }
         }
         let last_carry = if w == 0 { zero } else { g_pref[w - 1] };
@@ -229,26 +251,29 @@ impl<P: Poly> BigUintPoly<P> {
         for i in 0..w {
             let a = self.limbs[i];
             let b = other.limbs[i];
-            let (g_i, p_i) = if self.ctx.limb_bit_size == 1 {
-                // g_i = !a_i AND b_i (borrow generate: a < b).
-                let not_a = circuit.not_gate(a);
-                let gi = circuit.and_gate(not_a, b);
-                // p_i = !(a_i XOR b_i) (borrow propagate: a == b).
-                let xor_ab = circuit.xor_gate(a, b);
-                let pi = circuit.not_gate(xor_ab);
-                (gi, pi)
-            } else {
-                let t0 = circuit.add_gate(a, base_minus_one);
-                let t = circuit.sub_gate(t0, b);
-                let s = circuit.public_lookup_gate(t, self.ctx.lut_ids.0);
-                let h = circuit.public_lookup_gate(t, self.ctx.lut_ids.1);
-                let not_h = circuit.not_gate(h);
-                // eq_i: s == B-1 <=> floor((s + 1)/B) == 1
-                let s_plus = circuit.add_gate(s, one);
-                let eq = circuit.public_lookup_gate(s_plus, self.ctx.lut_ids.1);
-                let not_eq = circuit.not_gate(eq);
-                let gi_and = circuit.and_gate(not_h, not_eq);
-                (gi_and, eq)
+            let (g_i, p_i) = match self.ctx.luts.as_ref() {
+                None => {
+                    // g_i = !a_i AND b_i (borrow generate: a < b).
+                    let not_a = circuit.not_gate(a);
+                    let gi = circuit.and_gate(not_a, b);
+                    // p_i = !(a_i XOR b_i) (borrow propagate: a == b).
+                    let xor_ab = circuit.xor_gate(a, b);
+                    let pi = circuit.not_gate(xor_ab);
+                    (gi, pi)
+                }
+                Some((mod_lut, floor_lut)) => {
+                    let t0 = circuit.add_gate(a, base_minus_one);
+                    let t = circuit.sub_gate(t0, b);
+                    let s = mod_lut.lookup_all(circuit, t);
+                    let h = floor_lut.lookup_all(circuit, t);
+                    let not_h = circuit.not_gate(h);
+                    // eq_i: s == B-1 <=> floor((s + 1)/B) == 1
+                    let s_plus = circuit.add_gate(s, one);
+                    let eq = floor_lut.lookup_all(circuit, s_plus);
+                    let not_eq = circuit.not_gate(eq);
+                    let gi_and = circuit.and_gate(not_h, not_eq);
+                    (gi_and, eq)
+                }
             };
             g.push(g_i);
             p.push(p_i);
@@ -263,17 +288,20 @@ impl<P: Poly> BigUintPoly<P> {
         for i in 0..w {
             let b_in = if i == 0 { zero } else { g_pref[i - 1] };
             let (a, b) = ab_pairs[i];
-            if self.ctx.limb_bit_size == 1 {
-                let xor = circuit.xor_gate(a, b);
-                let diff = circuit.xor_gate(xor, b_in);
-                diff_limbs.push(diff);
-            } else {
-                let (a, b) = ab_pairs[i];
-                let pre = circuit.add_gate(a, self.ctx.const_base);
-                let pre2 = circuit.sub_gate(pre, b);
-                let t = circuit.sub_gate(pre2, b_in);
-                let d = circuit.public_lookup_gate(t, self.ctx.lut_ids.0);
-                diff_limbs.push(d);
+            match self.ctx.luts.as_ref() {
+                None => {
+                    let xor = circuit.xor_gate(a, b);
+                    let diff = circuit.xor_gate(xor, b_in);
+                    diff_limbs.push(diff);
+                }
+                Some((mod_lut, _)) => {
+                    let (a, b) = ab_pairs[i];
+                    let pre = circuit.add_gate(a, self.ctx.const_base);
+                    let pre2 = circuit.sub_gate(pre, b);
+                    let t = circuit.sub_gate(pre2, b_in);
+                    let d = mod_lut.lookup_all(circuit, t);
+                    diff_limbs.push(d);
+                }
             }
         }
         let borrow_out = if w == 0 { zero } else { g_pref[w - 1] };
@@ -295,7 +323,7 @@ impl<P: Poly> BigUintPoly<P> {
 
         // Final single normalization (ripple-style) to match the existing API.
         // Note: We normalize S + (C shifted by 1) with exactly one pass of lookups.
-        let limbs = self.final_cpa(circuit, sum_vec, carry_vec, self.ctx.lut_ids, max_limbs);
+        let limbs = self.final_cpa(circuit, sum_vec, carry_vec, max_limbs);
 
         Self { ctx: self.ctx.clone(), limbs, _p: PhantomData }
     }
@@ -330,8 +358,8 @@ impl<P: Poly> BigUintPoly<P> {
     }
 
     // return a gate id of an integeter corresponding to the big-integer representation of `limbs`.
-    // namely, `out = limbs[0] + 2^{limb_bit_size} * limbs[1] + ... + 2^{limb_bit_size * (k-1)} *
-    // limbs[k-1]`
+    // namely, `out = (limbs[0] + 2^{limb_bit_size} * limbs[1] + ... + 2^{limb_bit_size * (k-1)} *
+    // limbs[k-1]) * (q/q_i)`
     pub fn finalize(&self, circuit: &mut PolyCircuit<P>) -> GateId {
         debug_assert!(!self.limbs.is_empty(), "limbs should not be empty");
 
@@ -345,7 +373,6 @@ impl<P: Poly> BigUintPoly<P> {
             let weighted_limb = circuit.large_scalar_mul(self.limbs[i], &[power_of_two]);
             result = circuit.add_gate(result, weighted_limb);
         }
-
         result
     }
 
@@ -356,9 +383,7 @@ impl<P: Poly> BigUintPoly<P> {
         a: &[GateId],
         b: &[GateId],
         max_limbs: usize,
-        lut_ids: (usize, usize),
     ) -> Columns {
-        let (mod_lut, div_lut) = lut_ids;
         // Columns sized up to max_limbs; carries to the last column beyond max_limbs are dropped.
         let mut columns: Columns = vec![vec![]; max_limbs];
         let pairs: Vec<(usize, usize)> = (0..a.len())
@@ -368,16 +393,19 @@ impl<P: Poly> BigUintPoly<P> {
         for (i, j) in pairs {
             let k = i + j;
             let prod = circuit.mul_gate(a[i], b[j]);
-            if self.ctx.limb_bit_size == 1 {
-                columns[k].push(prod);
-            } else {
-                let lo = circuit.public_lookup_gate(prod, mod_lut);
-                columns[k].push(lo);
-                if k + 1 < max_limbs {
-                    let hi = circuit.public_lookup_gate(prod, div_lut);
-                    columns[k + 1].push(hi);
+            match self.ctx.luts.as_ref() {
+                None => {
+                    columns[k].push(prod);
                 }
-            }
+                Some((mod_lut, floor_lut)) => {
+                    let lo = mod_lut.lookup_all(circuit, prod);
+                    columns[k].push(lo);
+                    if k + 1 < max_limbs {
+                        let hi = floor_lut.lookup_all(circuit, prod);
+                        columns[k + 1].push(hi);
+                    }
+                }
+            };
         }
         columns
     }
@@ -400,7 +428,6 @@ impl<P: Poly> BigUintPoly<P> {
         // To guarantee convergence for B=2 (limb_bit_size=1), use 3:2 compression.
         let base = 1usize << self.ctx.limb_bit_size;
         let comp_rate = if base == 2 { 3 } else { base + 1 };
-        let (mod_lut, div_lut) = self.ctx.lut_ids;
 
         loop {
             let w = columns.len();
@@ -415,24 +442,27 @@ impl<P: Poly> BigUintPoly<P> {
                         next[k].extend_from_slice(&col[idx..idx + group_len]);
                     } else {
                         // Compress this chunk with one lookup pair.
-                        let (digit, carry) = if self.ctx.limb_bit_size == 1 {
-                            let (a, b, c) = (col[idx], col[idx + 1], col[idx + 2]);
-                            // digit = a xor b xor c
-                            // carry = (a xor b) and c or (a and b)
-                            let xor_ab = circuit.xor_gate(a, b);
-                            let digit = circuit.xor_gate(xor_ab, c); // sum mod 2
-                            let and_ab = circuit.and_gate(a, b);
-                            let and_abc = circuit.and_gate(xor_ab, c);
-                            let carry = circuit.or_gate(and_ab, and_abc); // carry out
-                            (digit, carry)
-                        } else {
-                            let mut sum = col[idx];
-                            for i in (idx + 1)..(idx + group_len) {
-                                sum = circuit.add_gate(sum, col[i]);
+                        let (digit, carry) = match self.ctx.luts.as_ref() {
+                            None => {
+                                let (a, b, c) = (col[idx], col[idx + 1], col[idx + 2]);
+                                // digit = a xor b xor c
+                                // carry = (a xor b) and c or (a and b)
+                                let xor_ab = circuit.xor_gate(a, b);
+                                let digit = circuit.xor_gate(xor_ab, c); // sum mod 2
+                                let and_ab = circuit.and_gate(a, b);
+                                let and_abc = circuit.and_gate(xor_ab, c);
+                                let carry = circuit.or_gate(and_ab, and_abc); // carry out
+                                (digit, carry)
                             }
-                            let digit = circuit.public_lookup_gate(sum, mod_lut); // x % B
-                            let carry = circuit.public_lookup_gate(sum, div_lut); // x / B
-                            (digit, carry)
+                            Some((mod_lut, floor_lut)) => {
+                                let mut sum = col[idx];
+                                for i in (idx + 1)..(idx + group_len) {
+                                    sum = circuit.add_gate(sum, col[i]);
+                                }
+                                let digit = mod_lut.lookup_all(circuit, sum); // x % B
+                                let carry = floor_lut.lookup_all(circuit, sum); // x / B
+                                (digit, carry)
+                            }
                         };
                         next[k].push(digit);
                         next[k + 1].push(carry);
@@ -461,15 +491,18 @@ impl<P: Poly> BigUintPoly<P> {
                 [] => sum_vec.push(zero),
                 [x] => sum_vec.push(*x),
                 [x, y] => {
-                    let (digit, carry) = if self.ctx.limb_bit_size == 1 {
-                        let digit = circuit.xor_gate(*x, *y);
-                        let carry = circuit.and_gate(*x, *y);
-                        (digit, carry)
-                    } else {
-                        let s = circuit.add_gate(*x, *y);
-                        let digit = circuit.public_lookup_gate(s, mod_lut); // % B
-                        let carry = circuit.public_lookup_gate(s, div_lut); // / B
-                        (digit, carry)
+                    let (digit, carry) = match self.ctx.luts.as_ref() {
+                        None => {
+                            let digit = circuit.xor_gate(*x, *y);
+                            let carry = circuit.and_gate(*x, *y);
+                            (digit, carry)
+                        }
+                        Some((mod_lut, floor_lut)) => {
+                            let s = circuit.add_gate(*x, *y);
+                            let digit = mod_lut.lookup_all(circuit, s);
+                            let carry = floor_lut.lookup_all(circuit, s);
+                            (digit, carry)
+                        }
                     };
                     sum_vec.push(digit);
                     carry_vec[k + 1] = carry;
@@ -487,7 +520,6 @@ impl<P: Poly> BigUintPoly<P> {
         circuit: &mut PolyCircuit<P>,
         mut sum_vec: Vec<GateId>,
         carry_vec: Vec<GateId>,
-        lut_ids: (usize, usize),
         max_limbs: usize,
     ) -> Vec<GateId> {
         // Ensure width
@@ -501,19 +533,22 @@ impl<P: Poly> BigUintPoly<P> {
         let mut ps = Vec::with_capacity(w);
         for k in 0..w {
             let c = carry_vec.get(k).copied().unwrap_or(zero);
-            let (s, g, p) = if self.ctx.limb_bit_size == 1 {
-                let s = circuit.xor_gate(sum_vec[k], c);
-                let g = circuit.and_gate(sum_vec[k], c);
-                let p = s;
-                (s, g, p)
-            } else {
-                let t = circuit.add_gate(sum_vec[k], c);
-                let s = circuit.public_lookup_gate(t, lut_ids.0);
-                let g = circuit.public_lookup_gate(t, lut_ids.1);
-                // p = 1 iff s == B-1 <=> floor((s + 1)/B) = 1
-                let s_plus = circuit.add_gate(s, one);
-                let p = circuit.public_lookup_gate(s_plus, lut_ids.1);
-                (s, g, p)
+            let (s, g, p) = match self.ctx.luts.as_ref() {
+                None => {
+                    let s = circuit.xor_gate(sum_vec[k], c);
+                    let g = circuit.and_gate(sum_vec[k], c);
+                    let p = s;
+                    (s, g, p)
+                }
+                Some((mod_lut, floor_lut)) => {
+                    let t = circuit.add_gate(sum_vec[k], c);
+                    let s = mod_lut.lookup_all(circuit, t);
+                    let g = floor_lut.lookup_all(circuit, t);
+                    // p = 1 iff s == B-1 <=> floor((s + 1)/B) = 1
+                    let s_plus = circuit.add_gate(s, one);
+                    let p = floor_lut.lookup_all(circuit, s_plus);
+                    (s, g, p)
+                }
             };
             ss.push(s);
             gs.push(g);
@@ -523,11 +558,12 @@ impl<P: Poly> BigUintPoly<P> {
         let mut out = Vec::with_capacity(w);
         for i in 0..w {
             let carry_in = if i == 0 { zero } else { g_pref[i - 1] };
-            let digit = if self.ctx.limb_bit_size == 1 {
-                circuit.xor_gate(ss[i], carry_in)
-            } else {
-                let t = circuit.add_gate(ss[i], carry_in);
-                circuit.public_lookup_gate(t, lut_ids.0)
+            let digit = match self.ctx.luts.as_ref() {
+                None => circuit.xor_gate(ss[i], carry_in),
+                Some((mod_lut, _)) => {
+                    let t = circuit.add_gate(ss[i], carry_in);
+                    mod_lut.lookup_all(circuit, t)
+                }
             };
             out.push(digit);
         }
@@ -577,39 +613,57 @@ impl<P: Poly> BigUintPoly<P> {
         max_limbs: usize,
     ) -> (Vec<GateId>, Vec<GateId>) {
         // 1) Schoolbook partial products with immediate split and column placement
-        let mut columns = self.schoolbook_partial_products_columns(
-            circuit,
-            &self.limbs,
-            &other.limbs,
-            max_limbs,
-            self.ctx.lut_ids,
-        );
+        let mut columns =
+            self.schoolbook_partial_products_columns(circuit, &self.limbs, &other.limbs, max_limbs);
 
         // 2) Compress column
         self.compress_columns_wallace(circuit, &mut columns)
     }
 }
 
-pub fn u64_to_biguint_poly<P: Poly>(
+pub fn u64_vec_to_biguint_poly<P: Poly>(
     limb_bit_size: usize,
+    crt_idx: usize,
     params: &P::Params,
-    input: u64,
+    inputs: &[u64],
     num_limbs: Option<usize>,
 ) -> Vec<P> {
-    let mut limbs = vec![];
+    let ring_n = params.ring_dimension() as usize;
     let base = 1u64 << limb_bit_size;
-    let mut remaining_value = input;
-    while remaining_value > 0 {
-        let limb = (remaining_value % base) as usize;
-        limbs.push(P::from_usize_to_constant(params, limb));
-        remaining_value /= base;
+
+    // Determine total limbs to output
+    let mut max_needed_limbs = 1usize;
+    for &v in inputs.iter() {
+        let mut x = v;
+        let mut cnt = 0usize;
+        while x > 0 {
+            cnt += 1;
+            x /= base;
+        }
+        if cnt == 0 {
+            cnt = 1;
+        }
+        if cnt > max_needed_limbs {
+            max_needed_limbs = cnt;
+        }
     }
-    if let Some(num_limbs) = num_limbs &&
-        limbs.len() < num_limbs
-    {
-        limbs.extend(vec![P::const_zero(params); num_limbs - limbs.len()]);
+    let total_limbs = num_limbs.map(|n| n.max(max_needed_limbs)).unwrap_or(max_needed_limbs);
+
+    // Build slots for each limb as a ring_n-sized vector with first `degree` populated
+    let mut limb_slots: Vec<Vec<BigUint>> = vec![vec![BigUint::zero(); ring_n]; total_limbs];
+    for (idx, &v0) in inputs.iter().enumerate() {
+        let mut v = v0;
+        for limb_idx in 0..total_limbs {
+            let digit = (v % base) as u64;
+            limb_slots[limb_idx][idx] = BigUint::from(digit);
+            v /= base;
+        }
     }
-    limbs
+
+    limb_slots
+        .iter()
+        .map(|slots| P::from_biguints_eval_single_mod(params, crt_idx, slots))
+        .collect::<Vec<_>>()
 }
 
 #[cfg(test)]
@@ -618,21 +672,30 @@ mod tests {
     use crate::{
         element::PolyElem,
         lookup::poly::PolyPltEvaluator,
-        poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        poly::{
+            PolyParams,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
     };
-    use num_traits::ToPrimitive;
     use std::sync::Arc;
 
     const INPUT_BIT_SIZE: usize = 20;
     // LIMB_BIT_SIZE works if INPUT_BIT_SIZE % LIMB_BIT_SIZE = 0. (3 doesn't works)
     const LIMB_BIT_SIZE: usize = 3;
     const LIMB_LEN: usize = INPUT_BIT_SIZE.div_ceil(LIMB_BIT_SIZE);
+    const CRT_IDX: usize = 1;
 
     fn create_test_context(
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> (DCRTPolyParams, Arc<BigUintPolyContext<DCRTPoly>>) {
         let params = DCRTPolyParams::default();
-        let ctx = Arc::new(BigUintPolyContext::setup(circuit, &params, LIMB_BIT_SIZE));
+        let ctx = Arc::new(BigUintPolyContext::setup(
+            circuit,
+            &params,
+            LIMB_BIT_SIZE,
+            CRT_IDX,
+            params.ring_dimension() as usize,
+        ));
         (params, ctx)
     }
 
@@ -641,11 +704,23 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
         let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let a = u64_to_biguint_poly(ctx.limb_bit_size, &params, 15, Some(LIMB_LEN));
+        let a_u64s: [u64; 4] = [15, 1, 8, 9];
+        let a =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &a_u64s, Some(LIMB_LEN));
         let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let b = u64_to_biguint_poly(ctx.limb_bit_size, &params, 20, Some(LIMB_LEN));
+        let b_u64s: [u64; 4] = [20, 11, 4, 6];
+        let b =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &b_u64s, Some(LIMB_LEN));
         let result = big_a.add(&big_b, &mut circuit).mod_limbs(LIMB_LEN + 1);
-        circuit.output(result.limbs.clone());
+        let (moduli, _, _) = params.to_crt();
+        let q_over_qi = params.modulus().as_ref() / BigUint::from(moduli[CRT_IDX]);
+        let scalar = [q_over_qi.clone()];
+        let outs = result
+            .limbs
+            .into_iter()
+            .map(|l| circuit.large_scalar_mul(l, &scalar))
+            .collect::<Vec<_>>();
+        circuit.output(outs);
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -655,21 +730,28 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        let mut expected_sum = 15u32 + 20u32;
-        let mut expected_limbs = vec![0; LIMB_LEN + 1];
-        for i in 0..LIMB_LEN + 1 {
-            if expected_sum == 0 {
-                break;
+        let d = params.ring_dimension() as usize;
+        let mut expected_sums =
+            a_u64s.iter().zip(b_u64s.iter()).map(|(a, b)| a + b).collect::<Vec<_>>();
+        let mut expected_limbs = vec![vec![BigUint::zero(); d]; LIMB_LEN + 1];
+        for i in 0..d {
+            for j in 0..LIMB_LEN + 1 {
+                if expected_sums[i] == 0 {
+                    break;
+                }
+                expected_limbs[j][i] =
+                    BigUint::from(expected_sums[i] % (1u64 << ctx.limb_bit_size));
+                expected_sums[i] /= 1u64 << ctx.limb_bit_size;
             }
-            expected_limbs[i] = expected_sum % (1u32 << ctx.limb_bit_size);
-            expected_sum /= 1u32 << ctx.limb_bit_size;
         }
-
         assert_eq!(eval_result.len(), LIMB_LEN + 1);
 
+        let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
         for i in 0..eval_result.len() {
-            let coeffs = eval_result[i].coeffs();
-            assert_eq!(*coeffs[0].value(), expected_limbs[i].into());
+            let expected_poly =
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i]) *
+                    &q_over_qi;
+            assert_eq!(eval_result[i], expected_poly);
         }
     }
 
@@ -677,13 +759,27 @@ mod tests {
     fn test_biguint_add_with_carry() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
-        // Use values that will cause carry with 20-bit input size (4 limbs of 5 bits each)
+        // Use values that will cause carry for some slots
         let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let a = u64_to_biguint_poly(ctx.limb_bit_size, &params, 1_048_575, Some(LIMB_LEN));
+        let a_u64s: [u64; 4] = [(1u64 << INPUT_BIT_SIZE) - 1, 123, (1u64 << INPUT_BIT_SIZE) - 2, 0];
+        let a =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &a_u64s, Some(LIMB_LEN));
         let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let b = u64_to_biguint_poly(ctx.limb_bit_size, &params, 1, Some(LIMB_LEN));
-        let result = big_a.add(&big_b, &mut circuit);
-        circuit.output(result.limbs.clone());
+        let b_u64s: [u64; 4] = [1, 456, 3, 0];
+        let b =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &b_u64s, Some(LIMB_LEN));
+        let result = big_a.add(&big_b, &mut circuit).mod_limbs(LIMB_LEN + 1);
+
+        // Scale outputs to the selected CRT slot for direct comparison
+        let (moduli, _, _) = params.to_crt();
+        let q_over_qi = params.modulus().as_ref() / BigUint::from(moduli[CRT_IDX]);
+        let scalar = [q_over_qi.clone()];
+        let outs = result
+            .limbs
+            .into_iter()
+            .map(|l| circuit.large_scalar_mul(l, &scalar))
+            .collect::<Vec<_>>();
+        circuit.output(outs);
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -693,21 +789,28 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        let mut expected_sum = 1048575u32 + 1u32; // This will be 1048576 = 2^20
-        let mut expected_limbs = vec![0; LIMB_LEN + 1];
-        for i in 0..LIMB_LEN + 1 {
-            if expected_sum == 0 {
-                break;
+        let d = params.ring_dimension() as usize;
+        let mut expected_sums =
+            a_u64s.iter().zip(b_u64s.iter()).map(|(a, b)| a + b).collect::<Vec<_>>();
+        let mut expected_limbs = vec![vec![BigUint::zero(); d]; LIMB_LEN + 1];
+        for i in 0..d {
+            for j in 0..LIMB_LEN + 1 {
+                if i >= expected_sums.len() || expected_sums[i] == 0 {
+                    break;
+                }
+                expected_limbs[j][i] =
+                    BigUint::from(expected_sums[i] % (1u64 << ctx.limb_bit_size));
+                expected_sums[i] /= 1u64 << ctx.limb_bit_size;
             }
-            expected_limbs[i] = expected_sum % (1u32 << ctx.limb_bit_size);
-            expected_sum /= 1u32 << ctx.limb_bit_size;
         }
-
         assert_eq!(eval_result.len(), LIMB_LEN + 1);
 
+        let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
         for i in 0..eval_result.len() {
-            let coeffs = eval_result[i].coeffs();
-            assert_eq!(*coeffs[0].value(), expected_limbs[i].into());
+            let expected_poly =
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i]) *
+                    &q_over_qi;
+            assert_eq!(eval_result[i], expected_poly);
         }
     }
 
@@ -717,12 +820,21 @@ mod tests {
         let (params, ctx) = create_test_context(&mut circuit);
         // a < b (500 < 1000), so less_than should return 1 (true)
         let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let a = u64_to_biguint_poly(ctx.limb_bit_size, &params, 500, Some(LIMB_LEN));
+        let a_u64s: [u64; 4] = [500, 7, 10, 1];
+        let a =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &a_u64s, Some(LIMB_LEN));
         let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let b = u64_to_biguint_poly(ctx.limb_bit_size, &params, 1000, Some(LIMB_LEN));
+        let b_u64s: [u64; 4] = [1000, 8, 20, 2];
+        let b =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &b_u64s, Some(LIMB_LEN));
         let (lt_result, diff) = big_a.less_than(&big_b, &mut circuit);
-        let mut output_gates = vec![lt_result];
-        output_gates.extend(diff.limbs.clone());
+        let (moduli, _, _) = params.to_crt();
+        let q_over_qi = params.modulus().as_ref() / BigUint::from(moduli[CRT_IDX]);
+        let scalar = [q_over_qi.clone()];
+        let mut output_gates = vec![circuit.large_scalar_mul(lt_result, &scalar)];
+        for limb in diff.limbs.into_iter() {
+            output_gates.push(circuit.large_scalar_mul(limb, &scalar));
+        }
         circuit.output(output_gates);
 
         let plt_evaluator = PolyPltEvaluator::new();
@@ -735,27 +847,41 @@ mod tests {
 
         assert_eq!(eval_result.len(), 1 + LIMB_LEN);
 
-        let lt_coeffs = eval_result[0].coeffs();
-        assert_eq!(*lt_coeffs[0].value(), 1u32.into());
-
-        // For the difference calculation in less_than, when a < b,
-        // the result represents (a - b) computed with borrowing.
-        // Instead of calculating exact expected values, just verify the result structure is valid.
-        assert_eq!(eval_result.len(), 1 + LIMB_LEN);
+        // Expected lt_result is all ones in active slots
+        let d = params.ring_dimension() as usize;
+        let mut ones = vec![BigUint::zero(); d];
+        for i in 0..a_u64s.len() {
+            if a_u64s[i] < b_u64s[i] {
+                ones[i] = BigUint::from(1u32);
+            }
+        }
+        let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
+        let expected_lt =
+            DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &ones) * &q_over_qi;
+        assert_eq!(eval_result[0], expected_lt);
     }
 
     #[test]
     fn test_biguint_less_than_equal() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
-        // a == b (12345 == 12345), so less_than should return 0 (false)
+        // a == b in all slots, so less_than should return 0 (false)
         let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let a = u64_to_biguint_poly(ctx.limb_bit_size, &params, 12345, Some(LIMB_LEN));
+        let a_u64s: [u64; 4] = [12345, 0, 1, 999];
+        let a =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &a_u64s, Some(LIMB_LEN));
         let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let b = u64_to_biguint_poly(ctx.limb_bit_size, &params, 12345, Some(LIMB_LEN));
+        let b_u64s = a_u64s;
+        let b =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &b_u64s, Some(LIMB_LEN));
         let (lt_result, diff) = big_a.less_than(&big_b, &mut circuit);
-        let mut output_gates = vec![lt_result];
-        output_gates.extend(diff.limbs.clone());
+        let (moduli, _, _) = params.to_crt();
+        let q_over_qi = params.modulus().as_ref() / BigUint::from(moduli[CRT_IDX]);
+        let scalar = [q_over_qi.clone()];
+        let mut output_gates = vec![circuit.large_scalar_mul(lt_result, &scalar)];
+        for limb in diff.limbs.into_iter() {
+            output_gates.push(circuit.large_scalar_mul(limb, &scalar));
+        }
         circuit.output(output_gates);
 
         let plt_evaluator = PolyPltEvaluator::new();
@@ -768,13 +894,17 @@ mod tests {
 
         assert_eq!(eval_result.len(), 1 + LIMB_LEN);
 
-        let lt_coeffs = eval_result[0].coeffs();
-        assert_eq!(*lt_coeffs[0].value(), 0u32.into());
-
-        // When a == b, the difference should be 0
+        let d = params.ring_dimension() as usize;
+        let zeros = vec![BigUint::zero(); d];
+        let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
+        let expected_lt =
+            DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &zeros) * &q_over_qi;
+        assert_eq!(eval_result[0], expected_lt);
+        // Diff should be zero in all limbs
         for i in 1..eval_result.len() {
-            let coeffs = eval_result[i].coeffs();
-            assert_eq!(*coeffs[0].value(), 0u32.into());
+            let expected_poly =
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &zeros) * &q_over_qi;
+            assert_eq!(eval_result[i], expected_poly);
         }
     }
 
@@ -782,14 +912,23 @@ mod tests {
     fn test_biguint_less_than_greater() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
-        // a > b (1000 > 500), so less_than should return 0 (false)
+        // a > b in all slots
         let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let a = u64_to_biguint_poly(ctx.limb_bit_size, &params, 1000, Some(LIMB_LEN));
+        let a_u64s: [u64; 4] = [1000, 15, 100, 7];
+        let a =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &a_u64s, Some(LIMB_LEN));
         let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let b = u64_to_biguint_poly(ctx.limb_bit_size, &params, 500, Some(LIMB_LEN));
+        let b_u64s: [u64; 4] = [500, 10, 99, 3];
+        let b =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &b_u64s, Some(LIMB_LEN));
         let (lt_result, diff) = big_a.less_than(&big_b, &mut circuit);
-        let mut output_gates = vec![lt_result];
-        output_gates.extend(diff.limbs.clone());
+        let (moduli, _, _) = params.to_crt();
+        let q_over_qi = params.modulus().as_ref() / BigUint::from(moduli[CRT_IDX]);
+        let scalar = [q_over_qi.clone()];
+        let mut output_gates = vec![circuit.large_scalar_mul(lt_result, &scalar)];
+        for limb in diff.limbs.clone().into_iter() {
+            output_gates.push(circuit.large_scalar_mul(limb, &scalar));
+        }
         circuit.output(output_gates);
 
         let plt_evaluator = PolyPltEvaluator::new();
@@ -802,22 +941,31 @@ mod tests {
 
         assert_eq!(eval_result.len(), 1 + LIMB_LEN);
 
-        let lt_coeffs = eval_result[0].coeffs();
-        assert_eq!(*lt_coeffs[0].value(), 0u32.into());
+        // Expected lt_result is all zeros
+        let d = params.ring_dimension() as usize;
+        let zeros = vec![BigUint::zero(); d];
+        let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
+        let expected_lt =
+            DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &zeros) * &q_over_qi;
+        assert_eq!(eval_result[0], expected_lt);
 
-        let mut expected_diff = 1000u32 - 500u32;
-        let mut expected_limbs = vec![0; LIMB_LEN];
-        for i in 0..LIMB_LEN {
-            if expected_diff == 0 {
-                break;
+        // Expected diff = a - b per slot
+        let mut diffs = a_u64s.iter().zip(b_u64s.iter()).map(|(a, b)| a - b).collect::<Vec<_>>();
+        let mut expected_cols = vec![vec![BigUint::zero(); d]; LIMB_LEN];
+        for i in 0..d {
+            for j in 0..LIMB_LEN {
+                if i >= diffs.len() || diffs[i] == 0 {
+                    break;
+                }
+                expected_cols[j][i] = BigUint::from(diffs[i] % (1u64 << ctx.limb_bit_size));
+                diffs[i] /= 1u64 << ctx.limb_bit_size;
             }
-            expected_limbs[i] = expected_diff % (1u32 << ctx.limb_bit_size);
-            expected_diff /= 1u32 << ctx.limb_bit_size;
         }
-
-        for i in 1..eval_result.len() {
-            let coeffs = eval_result[i].coeffs();
-            assert_eq!(*coeffs[0].value(), expected_limbs[i - 1].into());
+        for i in 0..LIMB_LEN {
+            let expected_poly =
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_cols[i]) *
+                    &q_over_qi;
+            assert_eq!(eval_result[i + 1], expected_poly);
         }
     }
 
@@ -826,11 +974,23 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
         let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let a = u64_to_biguint_poly(ctx.limb_bit_size, &params, 123, Some(LIMB_LEN));
+        let a_u64s: [u64; 4] = [123, 5, 17, 0];
+        let a =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &a_u64s, Some(LIMB_LEN));
         let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let b = u64_to_biguint_poly(ctx.limb_bit_size, &params, 456, Some(LIMB_LEN));
+        let b_u64s: [u64; 4] = [456, 3, 2, 7];
+        let b =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &b_u64s, Some(LIMB_LEN));
         let result = big_a.mul(&big_b, &mut circuit, Some(LIMB_LEN * LIMB_BIT_SIZE));
-        circuit.output(result.limbs.clone());
+        let (moduli, _, _) = params.to_crt();
+        let q_over_qi = params.modulus().as_ref() / BigUint::from(moduli[CRT_IDX]);
+        let scalar = [q_over_qi.clone()];
+        let outs = result
+            .limbs
+            .into_iter()
+            .map(|l| circuit.large_scalar_mul(l, &scalar))
+            .collect::<Vec<_>>();
+        circuit.output(outs);
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -840,23 +1000,31 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        let mut expected_product = 123u32 * 456u32;
+        let d = params.ring_dimension() as usize;
+        let mut expected_products =
+            a_u64s.iter().zip(b_u64s.iter()).map(|(a, b)| a * b).collect::<Vec<_>>();
         let max_bit_size = LIMB_LEN * LIMB_BIT_SIZE;
         let output_limb_len = max_bit_size / LIMB_BIT_SIZE;
-        let mut expected_limbs = vec![0; output_limb_len];
-        for i in 0..output_limb_len {
-            if expected_product == 0 {
-                break;
+        let mut expected_limbs = vec![vec![BigUint::zero(); d]; output_limb_len];
+        for i in 0..d {
+            for j in 0..output_limb_len {
+                if i >= expected_products.len() || expected_products[i] == 0 {
+                    break;
+                }
+                expected_limbs[j][i] =
+                    BigUint::from(expected_products[i] % (1u64 << ctx.limb_bit_size));
+                expected_products[i] /= 1u64 << ctx.limb_bit_size;
             }
-            expected_limbs[i] = expected_product % (1u32 << ctx.limb_bit_size);
-            expected_product /= 1u32 << ctx.limb_bit_size;
         }
 
         assert_eq!(eval_result.len(), output_limb_len);
 
+        let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
         for i in 0..eval_result.len() {
-            let coeffs = eval_result[i].coeffs();
-            assert_eq!(*coeffs[0].value(), expected_limbs[i].into());
+            let expected_poly =
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i]) *
+                    &q_over_qi;
+            assert_eq!(eval_result[i], expected_poly);
         }
     }
 
@@ -866,11 +1034,23 @@ mod tests {
         let (params, ctx) = create_test_context(&mut circuit);
         // Use values that will cause overflow with 20-bit input size
         let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let a = u64_to_biguint_poly(ctx.limb_bit_size, &params, 1023, Some(LIMB_LEN));
+        let a_u64s: [u64; 4] = [1023, 2047, 1, 0];
+        let a =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &a_u64s, Some(LIMB_LEN));
         let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let b = u64_to_biguint_poly(ctx.limb_bit_size, &params, 1023, Some(LIMB_LEN));
+        let b_u64s: [u64; 4] = [1023, 1023, 2, 0];
+        let b =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &b_u64s, Some(LIMB_LEN));
         let result = big_a.mul(&big_b, &mut circuit, Some(LIMB_LEN * LIMB_BIT_SIZE));
-        circuit.output(result.limbs.clone());
+        let (moduli, _, _) = params.to_crt();
+        let q_over_qi = params.modulus().as_ref() / BigUint::from(moduli[CRT_IDX]);
+        let scalar = [q_over_qi.clone()];
+        let outs = result
+            .limbs
+            .into_iter()
+            .map(|l| circuit.large_scalar_mul(l, &scalar))
+            .collect::<Vec<_>>();
+        circuit.output(outs);
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -880,23 +1060,31 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        let mut expected_product = 1023u32 * 1023u32;
+        let d = params.ring_dimension() as usize;
+        let mut expected_products =
+            a_u64s.iter().zip(b_u64s.iter()).map(|(a, b)| a * b).collect::<Vec<_>>();
         let max_bit_size = LIMB_LEN * LIMB_BIT_SIZE;
         let output_limb_len = max_bit_size / LIMB_BIT_SIZE;
-        let mut expected_limbs = vec![0; output_limb_len];
-        for i in 0..output_limb_len {
-            if expected_product == 0 {
-                break;
+        let mut expected_limbs = vec![vec![BigUint::zero(); d]; output_limb_len];
+        for i in 0..d {
+            for j in 0..output_limb_len {
+                if i >= expected_products.len() || expected_products[i] == 0 {
+                    break;
+                }
+                expected_limbs[j][i] =
+                    BigUint::from(expected_products[i] % (1u64 << ctx.limb_bit_size));
+                expected_products[i] /= 1u64 << ctx.limb_bit_size;
             }
-            expected_limbs[i] = expected_product % (1u32 << ctx.limb_bit_size);
-            expected_product /= 1u32 << ctx.limb_bit_size;
         }
 
         assert_eq!(eval_result.len(), output_limb_len);
 
+        let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
         for i in 0..eval_result.len() {
-            let coeffs = eval_result[i].coeffs();
-            assert_eq!(*coeffs[0].value(), expected_limbs[i].into());
+            let expected_poly =
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i]) *
+                    &q_over_qi;
+            assert_eq!(eval_result[i], expected_poly);
         }
     }
 
@@ -925,13 +1113,23 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
         let big_a_full = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let a_value = u64_to_biguint_poly(ctx.limb_bit_size, &params, 12345, Some(LIMB_LEN));
+        let a_u64s: [u64; 4] = [12345, 7, 0, 999];
+        let a_value =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &a_u64s, Some(LIMB_LEN));
         let big_a = big_a_full.mod_limbs(LIMB_LEN);
 
         // Extend to next multiple of LIMB_BIT_SIZE after INPUT_BIT_SIZE
         let new_bit_size = ((INPUT_BIT_SIZE / LIMB_BIT_SIZE) + 1) * LIMB_BIT_SIZE;
         let extended = big_a.extend_size(new_bit_size);
-        circuit.output(extended.limbs.clone());
+        let (moduli, _, _) = params.to_crt();
+        let q_over_qi = params.modulus().as_ref() / BigUint::from(moduli[CRT_IDX]);
+        let scalar = [q_over_qi.clone()];
+        let outs = extended
+            .limbs
+            .into_iter()
+            .map(|l| circuit.large_scalar_mul(l, &scalar))
+            .collect::<Vec<_>>();
+        circuit.output(outs);
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -944,21 +1142,25 @@ mod tests {
         let extended_limb_len = new_bit_size / LIMB_BIT_SIZE; // limb +1 from extend_size
         assert_eq!(eval_result.len(), extended_limb_len);
 
-        // Check that the original value is preserved in the first limbs
-        let mut expected_value = 12345u32;
-        let mut expected_limbs = vec![0; extended_limb_len];
-        for i in 0..LIMB_LEN {
-            if expected_value == 0 {
-                break;
+        // Check that the original values are preserved in the first limbs
+        let d = params.ring_dimension() as usize;
+        let mut expected_limbs = vec![vec![BigUint::zero(); d]; extended_limb_len];
+        for i in 0..d {
+            let mut v = if i < a_u64s.len() { a_u64s[i] } else { 0 };
+            for j in 0..LIMB_LEN {
+                if v == 0 {
+                    break;
+                }
+                expected_limbs[j][i] = BigUint::from(v % (1u64 << ctx.limb_bit_size));
+                v /= 1u64 << ctx.limb_bit_size;
             }
-            expected_limbs[i] = expected_value % (1u32 << ctx.limb_bit_size);
-            expected_value /= 1u32 << ctx.limb_bit_size;
         }
-        // Remaining limbs should be 0
-
+        let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
         for i in 0..eval_result.len() {
-            let coeffs = eval_result[i].coeffs();
-            assert_eq!(*coeffs[0].value(), expected_limbs[i].into());
+            let expected_poly =
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i]) *
+                    &q_over_qi;
+            assert_eq!(eval_result[i], expected_poly);
         }
     }
 
@@ -969,20 +1171,29 @@ mod tests {
 
         // Create BigUints with different limb sizes
         let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        // Choose a value that fits within INPUT_BIT_SIZE
-        let a_value = 100u64.min((1u64 << INPUT_BIT_SIZE) - 1);
-        let a = u64_to_biguint_poly(ctx.limb_bit_size, &params, a_value, Some(LIMB_LEN));
+        let a_u64s: [u64; 4] = [100, 10, 5, 3];
+        let a =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &a_u64s, Some(LIMB_LEN));
 
         // For big_b, we're using a smaller bit size
         let b_bit_size = 2 * LIMB_BIT_SIZE;
         let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, b_bit_size);
         let b_limb_len = b_bit_size / ctx.limb_bit_size;
-        // Choose a value that fits within b_bit_size
-        let b_value = 50u64.min((1u64 << b_bit_size) - 1);
-        let b = u64_to_biguint_poly(ctx.limb_bit_size, &params, b_value, Some(b_limb_len));
+        // Choose values that fit within b_bit_size
+        let b_u64s: [u64; 4] = [50, 1, 2, 0];
+        let b =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &b_u64s, Some(b_limb_len));
 
-        let result = big_a.add(&big_b, &mut circuit);
-        circuit.output(result.limbs.clone());
+        let result = big_a.add(&big_b, &mut circuit).mod_limbs(LIMB_LEN + 1);
+        let (moduli, _, _) = params.to_crt();
+        let q_over_qi = params.modulus().as_ref() / BigUint::from(moduli[CRT_IDX]);
+        let scalar = [q_over_qi.clone()];
+        let outs = result
+            .limbs
+            .into_iter()
+            .map(|l| circuit.large_scalar_mul(l, &scalar))
+            .collect::<Vec<_>>();
+        circuit.output(outs);
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -992,21 +1203,29 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        let mut expected_sum = (a_value + b_value) as u32;
-        let mut expected_limbs = vec![0; LIMB_LEN + 1];
-        for i in 0..LIMB_LEN + 1 {
-            if expected_sum == 0 {
-                break;
+        let d = params.ring_dimension() as usize;
+        let mut expected_sums =
+            a_u64s.iter().zip(b_u64s.iter()).map(|(a, b)| a + b).collect::<Vec<_>>();
+        let mut expected_limbs = vec![vec![BigUint::zero(); d]; LIMB_LEN + 1];
+        for i in 0..d {
+            for j in 0..LIMB_LEN + 1 {
+                if i >= expected_sums.len() || expected_sums[i] == 0 {
+                    break;
+                }
+                expected_limbs[j][i] =
+                    BigUint::from(expected_sums[i] % (1u64 << ctx.limb_bit_size));
+                expected_sums[i] /= 1u64 << ctx.limb_bit_size;
             }
-            expected_limbs[i] = expected_sum % (1u32 << ctx.limb_bit_size);
-            expected_sum /= 1u32 << ctx.limb_bit_size;
         }
 
         assert_eq!(eval_result.len(), LIMB_LEN + 1);
 
+        let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
         for i in 0..eval_result.len() {
-            let coeffs = eval_result[i].coeffs();
-            assert_eq!(*coeffs[0].value(), expected_limbs[i].into());
+            let expected_poly =
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i]) *
+                    &q_over_qi;
+            assert_eq!(eval_result[i], expected_poly);
         }
     }
 
@@ -1017,20 +1236,28 @@ mod tests {
 
         // Create BigUints with different limb sizes
         let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        // Choose a value that fits within INPUT_BIT_SIZE
-        let a_value = 100u64.min((1u64 << INPUT_BIT_SIZE) - 1);
-        let a = u64_to_biguint_poly(ctx.limb_bit_size, &params, a_value, Some(LIMB_LEN));
+        let a_u64s: [u64; 4] = [100, 3, 7, 8];
+        let a =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &a_u64s, Some(LIMB_LEN));
 
         // For big_b, we're using a smaller bit size
         let b_bit_size = 2 * LIMB_BIT_SIZE;
         let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, b_bit_size);
         let b_limb_len = b_bit_size / ctx.limb_bit_size;
-        // Choose a value that fits within b_bit_size
-        let b_value = 50u64.min((1u64 << b_bit_size) - 1);
-        let b = u64_to_biguint_poly(ctx.limb_bit_size, &params, b_value, Some(b_limb_len));
+        let b_u64s: [u64; 4] = [50, 2, 0, 9];
+        let b =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &b_u64s, Some(b_limb_len));
 
         let result = big_a.mul(&big_b, &mut circuit, None);
-        circuit.output(result.limbs.clone());
+        let (moduli, _, _) = params.to_crt();
+        let q_over_qi = params.modulus().as_ref() / BigUint::from(moduli[CRT_IDX]);
+        let scalar = [q_over_qi.clone()];
+        let outs = result
+            .limbs
+            .into_iter()
+            .map(|l| circuit.large_scalar_mul(l, &scalar))
+            .collect::<Vec<_>>();
+        circuit.output(outs);
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -1040,23 +1267,31 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        let mut expected_product = (a_value * b_value) as u32;
+        let d = params.ring_dimension() as usize;
+        let mut expected_products =
+            a_u64s.iter().zip(b_u64s.iter()).map(|(a, b)| a * b).collect::<Vec<_>>();
         let max_bit_size = INPUT_BIT_SIZE + b_bit_size;
         let output_limb_len = max_bit_size.div_ceil(LIMB_BIT_SIZE);
-        let mut expected_limbs = vec![0; output_limb_len];
-        for i in 0..output_limb_len {
-            if expected_product == 0 {
-                break;
+        let mut expected_limbs = vec![vec![BigUint::zero(); d]; output_limb_len];
+        for i in 0..d {
+            for j in 0..output_limb_len {
+                if i >= expected_products.len() || expected_products[i] == 0 {
+                    break;
+                }
+                expected_limbs[j][i] =
+                    BigUint::from(expected_products[i] % (1u64 << ctx.limb_bit_size));
+                expected_products[i] /= 1u64 << ctx.limb_bit_size;
             }
-            expected_limbs[i] = expected_product % (1u32 << ctx.limb_bit_size);
-            expected_product /= 1u32 << ctx.limb_bit_size;
         }
 
         assert_eq!(eval_result.len(), output_limb_len);
 
+        let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
         for i in 0..eval_result.len() {
-            let coeffs = eval_result[i].coeffs();
-            assert_eq!(*coeffs[0].value(), expected_limbs[i].into());
+            let expected_poly =
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i]) *
+                    &q_over_qi;
+            assert_eq!(eval_result[i], expected_poly);
         }
     }
 
@@ -1065,10 +1300,20 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
         let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let a = u64_to_biguint_poly(ctx.limb_bit_size, &params, 12345, Some(LIMB_LEN));
+        let a_u64s: [u64; 4] = [12345, 7, 0, 999];
+        let a =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &a_u64s, Some(LIMB_LEN));
         // After shift, restrict to the first LIMB_LEN - 1 limbs for assertion
         let shifted = big_a.left_shift(1);
-        circuit.output(shifted.limbs.clone());
+        let (moduli, _, _) = params.to_crt();
+        let q_over_qi = params.modulus().as_ref() / BigUint::from(moduli[CRT_IDX]);
+        let scalar = [q_over_qi.clone()];
+        let outs = shifted
+            .limbs
+            .into_iter()
+            .map(|l| circuit.large_scalar_mul(l, &scalar))
+            .collect::<Vec<_>>();
+        circuit.output(outs);
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -1079,22 +1324,28 @@ mod tests {
         );
 
         // Left shift by 1 means removing the first limb
-        let mut expected_value = 12345u32;
-        let mut expected_limbs = vec![0; LIMB_LEN];
-        for i in 0..LIMB_LEN {
-            if expected_value == 0 {
-                break;
+        let d = params.ring_dimension() as usize;
+        let expected_vals = a_u64s.map(|x| x);
+        let mut expected_limbs = vec![vec![BigUint::zero(); d]; LIMB_LEN];
+        for i in 0..d {
+            let mut v = if i < expected_vals.len() { expected_vals[i] } else { 0 };
+            for j in 0..LIMB_LEN {
+                if v == 0 {
+                    break;
+                }
+                expected_limbs[j][i] = BigUint::from(v % (1u64 << ctx.limb_bit_size));
+                v /= 1u64 << ctx.limb_bit_size;
             }
-            expected_limbs[i] = expected_value % (1u32 << ctx.limb_bit_size);
-            expected_value /= 1u32 << ctx.limb_bit_size;
         }
-
         // After shifting by 1, we expect to see limbs[1..] from the original
         assert_eq!(eval_result.len(), LIMB_LEN - 1);
 
+        let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
         for i in 0..eval_result.len() {
-            let coeffs = eval_result[i].coeffs();
-            assert_eq!(*coeffs[0].value(), expected_limbs[i + 1].into());
+            let expected_poly =
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i + 1]) *
+                    &q_over_qi;
+            assert_eq!(eval_result[i], expected_poly);
         }
     }
 
@@ -1104,14 +1355,33 @@ mod tests {
         let (params, ctx) = create_test_context(&mut circuit);
 
         let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let a = u64_to_biguint_poly(ctx.limb_bit_size, &params, 123, Some(LIMB_LEN));
+        let a_u64s: [u64; 4] = [123, 7, 88, 5];
+        let a =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &a_u64s, Some(LIMB_LEN));
         let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let b = u64_to_biguint_poly(ctx.limb_bit_size, &params, 456, Some(LIMB_LEN));
+        let b_u64s: [u64; 4] = [456, 6, 22, 9];
+        let b =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &b_u64s, Some(LIMB_LEN));
         let selector = circuit.input(1)[0];
         let result = big_a.cmux(&big_b, selector, &mut circuit);
-        circuit.output(result.limbs.clone());
+        let (moduli, _, _) = params.to_crt();
+        let q_over_qi = params.modulus().as_ref() / BigUint::from(moduli[CRT_IDX]);
+        let scalar = [q_over_qi.clone()];
+        let outs = result
+            .limbs
+            .into_iter()
+            .map(|l| circuit.large_scalar_mul(l, &scalar))
+            .collect::<Vec<_>>();
+        circuit.output(outs);
 
-        let selector_value = vec![DCRTPoly::from_usize_to_constant(&params, 1)]; // selector = 1, should return 'a'
+        // selector per slot: [1,0,1,0]
+        let d = params.ring_dimension() as usize;
+        let mut sel_slots = vec![BigUint::zero(); d];
+        for (idx, &v) in [1u64, 0, 1, 0].iter().enumerate() {
+            sel_slots[idx] = BigUint::from(v);
+        }
+        let selector_value =
+            vec![DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &sel_slots)];
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
             &params,
@@ -1120,22 +1390,30 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        // With selector = 1, expect to get 'a' (123)
-        let mut expected_value = 123u32;
-        let mut expected_limbs = vec![0; LIMB_LEN];
-        for i in 0..LIMB_LEN {
-            if expected_value == 0 {
-                break;
+        // Expected per slot selection
+        let mut expected_vals = [0u64; 4];
+        for i in 0..4 {
+            expected_vals[i] = if i % 2 == 0 { a_u64s[i] } else { b_u64s[i] };
+        }
+        let mut expected_limbs = vec![vec![BigUint::zero(); d]; LIMB_LEN];
+        for i in 0..d {
+            let mut v = if i < expected_vals.len() { expected_vals[i] } else { 0 };
+            for j in 0..LIMB_LEN {
+                if v == 0 {
+                    break;
+                }
+                expected_limbs[j][i] = BigUint::from(v % (1u64 << ctx.limb_bit_size));
+                v /= 1u64 << ctx.limb_bit_size;
             }
-            expected_limbs[i] = expected_value % (1u32 << ctx.limb_bit_size);
-            expected_value /= 1u32 << ctx.limb_bit_size;
         }
 
         assert_eq!(eval_result.len(), LIMB_LEN);
-
+        let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
         for i in 0..eval_result.len() {
-            let coeffs = eval_result[i].coeffs();
-            assert_eq!(*coeffs[0].value(), expected_limbs[i].into());
+            let expected_poly =
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i]) *
+                    &q_over_qi;
+            assert_eq!(eval_result[i], expected_poly);
         }
     }
 
@@ -1145,14 +1423,30 @@ mod tests {
         let (params, ctx) = create_test_context(&mut circuit);
 
         let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let a = u64_to_biguint_poly(ctx.limb_bit_size, &params, 123, Some(LIMB_LEN));
+        let a_u64s: [u64; 4] = [123, 7, 88, 5];
+        let a =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &a_u64s, Some(LIMB_LEN));
         let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let b = u64_to_biguint_poly(ctx.limb_bit_size, &params, 456, Some(LIMB_LEN));
+        let b_u64s: [u64; 4] = [456, 6, 22, 9];
+        let b =
+            u64_vec_to_biguint_poly(ctx.limb_bit_size, CRT_IDX, &params, &b_u64s, Some(LIMB_LEN));
         let selector = circuit.input(1)[0];
         let result = big_a.cmux(&big_b, selector, &mut circuit);
-        circuit.output(result.limbs.clone());
+        let (moduli, _, _) = params.to_crt();
+        let q_over_qi = params.modulus().as_ref() / BigUint::from(moduli[CRT_IDX]);
+        let scalar = [q_over_qi.clone()];
+        let outs = result
+            .limbs
+            .into_iter()
+            .map(|l| circuit.large_scalar_mul(l, &scalar))
+            .collect::<Vec<_>>();
+        circuit.output(outs);
 
-        let selector_value = vec![DCRTPoly::from_usize_to_constant(&params, 0)]; // selector = 0, should return 'b'
+        // selector per slot: all zeros
+        let d = params.ring_dimension() as usize;
+        let zeros_slots = vec![BigUint::zero(); d];
+        let selector_value =
+            vec![DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &zeros_slots)];
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
             &params,
@@ -1161,22 +1455,26 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        // With selector = 0, expect to get 'b' (456)
-        let mut expected_value = 456u32;
-        let mut expected_limbs = vec![0; LIMB_LEN];
-        for i in 0..LIMB_LEN {
-            if expected_value == 0 {
-                break;
+        // Expected per slot selection equals b
+        let mut expected_limbs = vec![vec![BigUint::zero(); d]; LIMB_LEN];
+        for i in 0..d {
+            let mut v = if i < b_u64s.len() { b_u64s[i] } else { 0 };
+            for j in 0..LIMB_LEN {
+                if v == 0 {
+                    break;
+                }
+                expected_limbs[j][i] = BigUint::from(v % (1u64 << ctx.limb_bit_size));
+                v /= 1u64 << ctx.limb_bit_size;
             }
-            expected_limbs[i] = expected_value % (1u32 << ctx.limb_bit_size);
-            expected_value /= 1u32 << ctx.limb_bit_size;
         }
 
         assert_eq!(eval_result.len(), LIMB_LEN);
-
+        let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
         for i in 0..eval_result.len() {
-            let coeffs = eval_result[i].coeffs();
-            assert_eq!(*coeffs[0].value(), expected_limbs[i].into());
+            let expected_poly =
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i]) *
+                    &q_over_qi;
+            assert_eq!(eval_result[i], expected_poly);
         }
     }
 
@@ -1184,11 +1482,21 @@ mod tests {
     fn test_biguint_finalize() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
-        let test_value = 12345u32;
+        let test_values: [u64; 4] = [12345, 7, 0, 999];
         let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let a = u64_to_biguint_poly(ctx.limb_bit_size, &params, test_value as u64, Some(LIMB_LEN));
+        let a = u64_vec_to_biguint_poly(
+            ctx.limb_bit_size,
+            CRT_IDX,
+            &params,
+            &test_values,
+            Some(LIMB_LEN),
+        );
         let finalized = big_a.finalize(&mut circuit);
-        circuit.output(vec![finalized]);
+        let (moduli, _, _) = params.to_crt();
+        let q_over_qi = params.modulus().as_ref() / BigUint::from(moduli[CRT_IDX]);
+        let scalar = [q_over_qi.clone()];
+        let out = circuit.large_scalar_mul(finalized, &scalar);
+        circuit.output(vec![out]);
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
             &params,
@@ -1198,20 +1506,37 @@ mod tests {
         );
 
         assert_eq!(eval_result.len(), 1);
-        let coeffs = eval_result[0].coeffs();
-        assert_eq!(*coeffs[0].value(), test_value.into());
+        let d = params.ring_dimension() as usize;
+        let mut expected = vec![BigUint::zero(); d];
+        for i in 0..test_values.len() {
+            expected[i] = BigUint::from(test_values[i]);
+        }
+        let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
+        let expected_poly =
+            DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected) * &q_over_qi;
+        assert_eq!(eval_result[0], expected_poly);
     }
 
     #[test]
     fn test_biguint_finalize_large_value() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
-        // Use a value that spans multiple limbs (2^20 - 1 = 1048575)
-        let test_value = 1_048_575u32;
+        // Use values that span multiple limbs
+        let test_values: [u64; 4] = [1_048_575, 1, 2, (1 << 19)];
         let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, INPUT_BIT_SIZE);
-        let a = u64_to_biguint_poly(ctx.limb_bit_size, &params, test_value as u64, Some(LIMB_LEN));
+        let a = u64_vec_to_biguint_poly(
+            ctx.limb_bit_size,
+            CRT_IDX,
+            &params,
+            &test_values,
+            Some(LIMB_LEN),
+        );
         let finalized = big_a.finalize(&mut circuit);
-        circuit.output(vec![finalized]);
+        let (moduli, _, _) = params.to_crt();
+        let q_over_qi = params.modulus().as_ref() / BigUint::from(moduli[CRT_IDX]);
+        let scalar = [q_over_qi.clone()];
+        let out = circuit.large_scalar_mul(finalized, &scalar);
+        circuit.output(vec![out]);
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
             &params,
@@ -1221,165 +1546,188 @@ mod tests {
         );
 
         assert_eq!(eval_result.len(), 1);
-        let coeffs = eval_result[0].coeffs();
-        assert_eq!(*coeffs[0].value(), test_value.into());
+        let d = params.ring_dimension() as usize;
+        let mut expected = vec![BigUint::zero(); d];
+        for i in 0..test_values.len() {
+            expected[i] = BigUint::from(test_values[i]);
+        }
+        let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
+        let expected_poly =
+            DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected) * &q_over_qi;
+        assert_eq!(eval_result[0], expected_poly);
     }
 
     #[test]
     fn test_single_bit_add() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let params = DCRTPolyParams::default();
-        let ctx = Arc::new(BigUintPolyContext::setup(&mut circuit, &params, 1)); // limb_bit_size = 1
+        let ctx = Arc::new(BigUintPolyContext::setup(
+            &mut circuit,
+            &params,
+            1, // limb_bit_size = 1
+            CRT_IDX,
+            params.ring_dimension() as usize,
+        ));
 
-        // Test cases: 15 + 20 = 35
-        let a_value = 15u64;
-        let b_value = 20u64;
-        let expected = 35u64;
+        // SIMD cases: element-wise add
+        let a_u64s: [u64; 4] = [15, 1, 8, 9];
+        let b_u64s: [u64; 4] = [20, 11, 4, 6];
 
         let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, 8);
         let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, 8);
 
-        let a_limbs = u64_to_biguint_poly(1, &params, a_value, Some(8));
-        let b_limbs = u64_to_biguint_poly(1, &params, b_value, Some(8));
+        let a = u64_vec_to_biguint_poly(1, CRT_IDX, &params, &a_u64s, Some(8));
+        let b = u64_vec_to_biguint_poly(1, CRT_IDX, &params, &b_u64s, Some(8));
 
-        let result = big_a.add(&big_b, &mut circuit);
-        circuit.output(result.limbs.clone());
+        let result = big_a.add(&big_b, &mut circuit).mod_limbs(9);
+        let (moduli, _, _) = params.to_crt();
+        let q_over_qi = params.modulus().as_ref() / BigUint::from(moduli[CRT_IDX]);
+        let scalar = [q_over_qi.clone()];
+        let outs = result
+            .limbs
+            .into_iter()
+            .map(|l| circuit.large_scalar_mul(l, &scalar))
+            .collect::<Vec<_>>();
+        circuit.output(outs);
 
         let eval_result = circuit.eval(
             &params,
             &DCRTPoly::const_one(&params),
-            &[a_limbs, b_limbs].concat(),
+            &[a, b].concat(),
             None::<PolyPltEvaluator>,
         );
 
-        // Reconstruct the result from bits
-        let mut actual = 0u64;
-        for (i, limb_result) in eval_result.iter().enumerate() {
-            let bit_value = limb_result.coeffs()[0].value().to_u64().unwrap();
-            actual |= bit_value << i;
+        let d = params.ring_dimension() as usize;
+        let mut expected_sums =
+            a_u64s.iter().zip(b_u64s.iter()).map(|(a, b)| a + b).collect::<Vec<_>>();
+        let mut expected_limbs = vec![vec![BigUint::zero(); d]; 9];
+        for i in 0..d {
+            for j in 0..9 {
+                if i >= expected_sums.len() || expected_sums[i] == 0 {
+                    break;
+                }
+                expected_limbs[j][i] = BigUint::from(expected_sums[i] % 2);
+                expected_sums[i] /= 2;
+            }
         }
-
-        assert_eq!(actual, expected, "Single-bit addition should produce correct result");
+        assert_eq!(eval_result.len(), 9);
+        let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
+        for i in 0..eval_result.len() {
+            let expected_poly =
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i]) *
+                    &q_over_qi;
+            assert_eq!(eval_result[i], expected_poly);
+        }
     }
 
     #[test]
     fn test_single_bit_less_than() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let params = DCRTPolyParams::default();
-        let ctx = Arc::new(BigUintPolyContext::setup(&mut circuit, &params, 1)); // limb_bit_size = 1
+        let ctx = Arc::new(BigUintPolyContext::setup(
+            &mut circuit,
+            &params,
+            1, // limb_bit_size = 1
+            CRT_IDX,
+            params.ring_dimension() as usize,
+        ));
 
-        // Test case: 10 < 25 should return true (1)
-        let a_value = 10u64;
-        let b_value = 25u64;
+        // SIMD: choose mixed cases
+        let a_u64s: [u64; 4] = [10, 25, 30, 3];
+        let b_u64s: [u64; 4] = [25, 10, 30, 4];
 
         let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, 8);
         let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, 8);
 
-        let a_limbs = u64_to_biguint_poly(1, &params, a_value, Some(8));
-        let b_limbs = u64_to_biguint_poly(1, &params, b_value, Some(8));
+        let a = u64_vec_to_biguint_poly(1, CRT_IDX, &params, &a_u64s, Some(8));
+        let b = u64_vec_to_biguint_poly(1, CRT_IDX, &params, &b_u64s, Some(8));
 
         let (lt_result, _diff) = big_a.less_than(&big_b, &mut circuit);
-        circuit.output(vec![lt_result]);
+        let (moduli, _, _) = params.to_crt();
+        let q_over_qi = params.modulus().as_ref() / BigUint::from(moduli[CRT_IDX]);
+        let scalar = [q_over_qi.clone()];
+        let scaled_lt = circuit.large_scalar_mul(lt_result, &scalar);
+        circuit.output(vec![scaled_lt]);
         let eval_result = circuit.eval(
             &params,
             &DCRTPoly::const_one(&params),
-            &[a_limbs, b_limbs].concat(),
+            &[a, b].concat(),
             None::<PolyPltEvaluator>,
         );
 
         assert_eq!(eval_result.len(), 1);
-        let lt_value = eval_result[0].coeffs()[0].value().to_u64().unwrap();
-        assert_eq!(lt_value, 1, "10 < 25 should return 1");
-
-        // Test case 2: 25 < 10 should return false (0)
-        let mut circuit2 = PolyCircuit::<DCRTPoly>::new();
-        let ctx2 = Arc::new(BigUintPolyContext::setup(&mut circuit2, &params, 1));
-
-        let big_a2 = BigUintPoly::<DCRTPoly>::input(ctx2.clone(), &mut circuit2, 8);
-        let big_b2 = BigUintPoly::<DCRTPoly>::input(ctx2.clone(), &mut circuit2, 8);
-
-        let a2_limbs = u64_to_biguint_poly(1, &params, b_value, Some(8)); // 25
-        let b2_limbs = u64_to_biguint_poly(1, &params, a_value, Some(8)); // 10
-
-        let (lt_result2, _diff2) = big_a2.less_than(&big_b2, &mut circuit2);
-        circuit2.output(vec![lt_result2]);
-
-        let eval_result2 = circuit2.eval(
-            &params,
-            &DCRTPoly::const_one(&params),
-            &[a2_limbs, b2_limbs].concat(),
-            None::<PolyPltEvaluator>,
-        );
-
-        let lt_value2 = eval_result2[0].coeffs()[0].value().to_u64().unwrap();
-        assert_eq!(lt_value2, 0, "25 < 10 should return 0");
+        let d = params.ring_dimension() as usize;
+        let mut expected = vec![BigUint::zero(); d];
+        for i in 0..a_u64s.len() {
+            expected[i] = BigUint::from((a_u64s[i] < b_u64s[i]) as u32);
+        }
+        let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
+        let expected_poly =
+            DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected) * &q_over_qi;
+        assert_eq!(eval_result[0], expected_poly);
     }
 
     #[test]
     fn test_single_bit_mul() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let params = DCRTPolyParams::default();
-        let ctx = Arc::new(BigUintPolyContext::setup(&mut circuit, &params, 1)); // limb_bit_size = 1
+        let ctx = Arc::new(BigUintPolyContext::setup(
+            &mut circuit,
+            &params,
+            1, // limb_bit_size = 1
+            CRT_IDX,
+            params.ring_dimension() as usize,
+        ));
 
-        // Test case: 7 * 5 = 35
-        let a_value = 7u64;
-        let b_value = 5u64;
-        let expected = 35u64;
+        // SIMD: element-wise mul in base-2
+        let a_u64s: [u64; 4] = [7, 2, 3, 1];
+        let b_u64s: [u64; 4] = [5, 3, 4, 1];
 
         let big_a = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, 4);
         let big_b = BigUintPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, 4);
 
-        let a_limbs = u64_to_biguint_poly(1, &params, a_value, Some(4));
-        let b_limbs = u64_to_biguint_poly(1, &params, b_value, Some(4));
+        let a = u64_vec_to_biguint_poly(1, CRT_IDX, &params, &a_u64s, Some(4));
+        let b = u64_vec_to_biguint_poly(1, CRT_IDX, &params, &b_u64s, Some(4));
 
         let result = big_a.mul(&big_b, &mut circuit, Some(8));
-        circuit.output(result.limbs.clone());
+        let (moduli, _, _) = params.to_crt();
+        let q_over_qi = params.modulus().as_ref() / BigUint::from(moduli[CRT_IDX]);
+        let scalar = [q_over_qi.clone()];
+        let outs = result
+            .limbs
+            .into_iter()
+            .map(|l| circuit.large_scalar_mul(l, &scalar))
+            .collect::<Vec<_>>();
+        circuit.output(outs);
+
         let eval_result = circuit.eval(
             &params,
             &DCRTPoly::const_one(&params),
-            &[a_limbs, b_limbs].concat(),
+            &[a, b].concat(),
             None::<PolyPltEvaluator>,
         );
 
-        // Reconstruct the result from bits
-        let mut actual = 0u64;
-        for (i, limb_result) in eval_result.iter().enumerate() {
-            let bit_value = limb_result.coeffs()[0].value().to_u64().unwrap();
-            actual |= bit_value << i;
+        let d = params.ring_dimension() as usize;
+        let mut expected_products =
+            a_u64s.iter().zip(b_u64s.iter()).map(|(a, b)| a * b).collect::<Vec<_>>();
+        let mut expected_limbs = vec![vec![BigUint::zero(); d]; 8];
+        for i in 0..d {
+            for j in 0..8 {
+                if i >= expected_products.len() || expected_products[i] == 0 {
+                    break;
+                }
+                expected_limbs[j][i] = BigUint::from(expected_products[i] % 2);
+                expected_products[i] /= 2;
+            }
         }
 
-        assert_eq!(actual, expected, "Single-bit multiplication should produce correct result");
-
-        // Test case 2: Larger numbers
-        let mut circuit2 = PolyCircuit::<DCRTPoly>::new();
-        let ctx2 = Arc::new(BigUintPolyContext::setup(&mut circuit2, &params, 1));
-
-        let a2_value = 13u64;
-        let b2_value = 11u64;
-        let expected2 = 143u64;
-
-        let big_a2 = BigUintPoly::<DCRTPoly>::input(ctx2.clone(), &mut circuit2, 8);
-        let big_b2 = BigUintPoly::<DCRTPoly>::input(ctx2.clone(), &mut circuit2, 8);
-
-        let a2_limbs = u64_to_biguint_poly(1, &params, a2_value, Some(8));
-        let b2_limbs = u64_to_biguint_poly(1, &params, b2_value, Some(8));
-
-        let result2 = big_a2.mul(&big_b2, &mut circuit2, Some(16));
-        circuit2.output(result2.limbs.clone());
-
-        let eval_result2 = circuit2.eval(
-            &params,
-            &DCRTPoly::const_one(&params),
-            &[a2_limbs, b2_limbs].concat(),
-            None::<PolyPltEvaluator>,
-        );
-
-        let mut actual2 = 0u64;
-        for (i, limb_result) in eval_result2.iter().enumerate() {
-            let bit_value = limb_result.coeffs()[0].value().to_u64().unwrap();
-            actual2 |= bit_value << i;
+        assert_eq!(eval_result.len(), 8);
+        let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
+        for i in 0..eval_result.len() {
+            let expected_poly =
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i]) *
+                    &q_over_qi;
+            assert_eq!(eval_result[i], expected_poly);
         }
-
-        assert_eq!(actual2, expected2, "Single-bit multiplication of 13 * 11 should equal 143");
     }
 }

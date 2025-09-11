@@ -96,7 +96,9 @@ impl<P: Poly> ArithmeticCircuit<P> {
         SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
         SU: PolyUniformSampler<M = M> + Send + Sync,
     {
-        let bgg_encoding_sampler = BGGEncodingSampler::<SU>::new(params, secret, Some(error_sigma));
+        // If error_sigma <= 0.0, disable noise to allow exact equality in tests.
+        let gauss_sigma = if error_sigma > 0.0 { Some(error_sigma) } else { None };
+        let bgg_encoding_sampler = BGGEncodingSampler::<SU>::new(params, secret, gauss_sigma);
         let plaintexts = if self.use_packing {
             inputs
                 .iter()

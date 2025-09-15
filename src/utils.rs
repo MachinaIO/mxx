@@ -193,27 +193,20 @@ pub fn mod_inverse(a: &BigUint, m: &BigUint) -> Option<BigUint> {
     }
 }
 
-pub fn gen_biguint_for_limb_size<R: Rng>(
+pub fn gen_biguint_for_modulus<R: Rng>(
     rng: &mut R,
     limb_bit_size: usize,
-    max_limbs: usize,
+    modulus: &BigUint,
 ) -> BigUint {
-    if limb_bit_size == 0 || max_limbs == 0 {
+    if limb_bit_size == 0 || modulus.is_zero() {
         return BigUint::ZERO;
     }
-    let num_limbs = rng.random_range(1..=max_limbs);
-    let max_bits = limb_bit_size * num_limbs;
+    let max_bits = modulus.bits() as usize;
     let max_bytes = max_bits.div_ceil(8);
     if max_bytes == 0 {
         return BigUint::ZERO;
     }
     let mut bytes = vec![0u8; max_bytes];
     rng.fill_bytes(&mut bytes);
-    let excess_bits = max_bytes * 8 - max_bits;
-    if excess_bits > 0 && !bytes.is_empty() {
-        let mask = (1u8 << (8 - excess_bits)) - 1;
-        bytes[0] &= mask;
-    }
-
-    BigUint::from_bytes_be(&bytes)
+    BigUint::from_bytes_be(&bytes) % modulus
 }

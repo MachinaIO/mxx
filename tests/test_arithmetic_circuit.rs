@@ -10,7 +10,7 @@ use mxx::{
         DistType, PolyTrapdoorSampler, PolyUniformSampler, hash::DCRTPolyHashSampler,
         trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
     },
-    utils::gen_biguint_for_limb_size,
+    utils::gen_biguint_for_modulus,
 };
 use num_bigint::BigUint;
 use std::sync::Arc;
@@ -28,20 +28,19 @@ async fn test_arithmetic_circuit_operations() {
     // Test mixed operations in single circuit: (a + b) * c - a.
     init_tracing();
     let params = DCRTPolyParams::new(4, 2, 28, 17);
-    let (_, crt_bits, crt_depth) = params.to_crt();
+    let (_, crt_bits, _) = params.to_crt();
     info!("crt_bits={}", crt_bits);
     let n = params.ring_dimension() as usize;
     let limb_bit_size = 3;
-    let max_limbs = crt_bits.div_ceil(limb_bit_size);
     let mut rng = rand::rng();
     let a_vec: Vec<BigUint> = (0..n)
-        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs * crt_depth))
+        .map(|_| gen_biguint_for_modulus(&mut rng, limb_bit_size, &params.modulus()))
         .collect::<Vec<_>>();
     let b_vec: Vec<BigUint> = (0..n)
-        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs * crt_depth))
+        .map(|_| gen_biguint_for_modulus(&mut rng, limb_bit_size, &params.modulus()))
         .collect::<Vec<_>>();
     let c_vec: Vec<BigUint> = (0..n)
-        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs * crt_depth))
+        .map(|_| gen_biguint_for_modulus(&mut rng, limb_bit_size, &params.modulus()))
         .collect::<Vec<_>>();
     let inputs = vec![&a_vec[..], &b_vec[..], &c_vec[..]];
     let mut mixed_circuit =
@@ -111,7 +110,6 @@ trapdoor_sampler.clone()).await;
     assert_eq!(mixed_encoding_result[0].vector, mixed_encoding_expected);
 }
 
-#[ignore = "the last assert_eq fails"]
 #[tokio::test]
 async fn test_arithmetic_circuit_no_crt_limb1() {
     init_tracing();
@@ -120,22 +118,21 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
     // (crt_depth*crt_bit)
     let params = DCRTPolyParams::new(4, 1, 56, 17);
 
-    let (moduli, crt_bits, crt_depth) = params.to_crt();
+    let (moduli, _, crt_depth) = params.to_crt();
     assert_eq!(moduli.len(), 1, "Should have only one modulus for non-CRT");
     assert_eq!(crt_depth, 1, "CRT depth should be 1");
     info!("Non-CRT mode: single modulus = {}", moduli[0]);
     let n = params.ring_dimension() as usize;
     let limb_bit_size = 1;
-    let max_limbs = crt_bits.div_ceil(limb_bit_size);
     let mut rng = rand::rng();
     let a_vec: Vec<BigUint> = (0..n)
-        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs * crt_depth))
+        .map(|_| gen_biguint_for_modulus(&mut rng, limb_bit_size, &params.modulus()))
         .collect::<Vec<_>>();
     let b_vec: Vec<BigUint> = (0..n)
-        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs * crt_depth))
+        .map(|_| gen_biguint_for_modulus(&mut rng, limb_bit_size, &params.modulus()))
         .collect::<Vec<_>>();
     let c_vec: Vec<BigUint> = (0..n)
-        .map(|_| gen_biguint_for_limb_size(&mut rng, limb_bit_size, max_limbs * crt_depth))
+        .map(|_| gen_biguint_for_modulus(&mut rng, limb_bit_size, &params.modulus()))
         .collect::<Vec<_>>();
     let inputs = vec![&a_vec[..], &b_vec[..], &c_vec[..]];
 

@@ -1,6 +1,6 @@
 pub mod evaluable;
 pub mod gate;
-pub mod norm_simulator;
+// pub mod norm_simulator;
 pub mod serde;
 
 pub use evaluable::*;

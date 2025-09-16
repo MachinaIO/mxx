@@ -29,8 +29,42 @@ impl<T: MatrixElem> BaseMatrix<T> {
     }
 
     pub fn block_entries(&self, rows: Range<usize>, cols: Range<usize>) -> Vec<Vec<T>> {
+        assert!(
+            rows.start <= rows.end,
+            "Invalid row range: start {} > end {}",
+            rows.start,
+            rows.end
+        );
+        assert!(
+            cols.start <= cols.end,
+            "Invalid column range: start {} > end {}",
+            cols.start,
+            cols.end
+        );
+        assert!(
+            rows.end <= self.nrow,
+            "Row range end {} exceeds matrix rows {}",
+            rows.end,
+            self.nrow
+        );
+        assert!(
+            cols.end <= self.ncol,
+            "Column range end {} exceeds matrix columns {}",
+            cols.end,
+            self.ncol
+        );
+
         parallel_iter!(rows)
-            .map(|i| self.inner[i][cols.start..cols.end].to_vec())
+            .map(|i| {
+                let row_len = self.inner[i].len();
+                if cols.end > row_len {
+                    panic!(
+                        "Matrix inconsistency: row {} has length {} but trying to access columns {}..{} (matrix claims ncol={})",
+                        i, row_len, cols.start, cols.end, self.ncol
+                    );
+                }
+                self.inner[i][cols.start..cols.end].to_vec()
+            })
             .collect::<Vec<Vec<_>>>()
     }
 

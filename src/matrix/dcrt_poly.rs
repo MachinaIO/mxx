@@ -1,4 +1,5 @@
 use crate::{
+    element::PolyElem,
     matrix::{MatrixElem, MatrixParams, PolyMatrix, cpp_matrix::CppMatrix},
     parallel_iter,
     poly::{
@@ -8,6 +9,7 @@ use crate::{
     utils::block_size,
 };
 use itertools::Itertools;
+use num_bigint::BigUint;
 use openfhe::ffi::{DCRTPolyGadgetVector, MatrixGen, SetMatrixElement};
 use rayon::prelude::*;
 use std::{io::Read, ops::Range, path::Path};
@@ -347,9 +349,35 @@ impl DCRTPolyMatrix {
     }
 
     fn dcrt_decompose_poly(&self, poly: &DCRTPoly, base_bits: u32) -> Vec<DCRTPoly> {
+        // Use OpenFHE's native decomposition for consistency with its gadget vector,
+        // but clamp each digit to its valid bit-width, especially for the most-significant
+        // digit when base_bits does not divide crt_bits.
         let decomposed = poly.get_poly().Decompose(base_bits);
         let cpp_decomposed = CppMatrix::new(&self.params, decomposed);
-        parallel_iter!(0..cpp_decomposed.ncol()).map(|idx| cpp_decomposed.entry(0, idx)).collect()
+        parallel_iter!(0..cpp_decomposed.ncol())
+            .map(|idx| match self.params.decompose_last_mask() {
+                None => cpp_decomposed.entry(0, idx),
+                Some(decompose_last_mask) => {
+                    let digits_per_tower = self.params.crt_bits().div_ceil(base_bits as usize);
+                    let digit_poly = cpp_decomposed.entry(0, idx);
+                    // Determine effective bit-width for this digit within its CRT tower
+                    let pos_in_tower = idx % digits_per_tower;
+                    let is_last_in_tower = pos_in_tower + 1 == digits_per_tower;
+                    if !is_last_in_tower {
+                        return digit_poly;
+                    }
+
+                    // Clamp the coefficients of this digit to the mask
+                    let masked_values: Vec<BigUint> = digit_poly
+                        .coeffs()
+                        .into_par_iter()
+                        .map(|c| c.value() & BigUint::from(decompose_last_mask))
+                        .collect();
+
+                    DCRTPoly::from_biguints(&self.params, &masked_values)
+                }
+            })
+            .collect()
     }
 }
 
@@ -450,6 +478,54 @@ mod tests {
         assert_eq!(gadget_matrix.size().1, 2 * digits_length);
 
         let decomposed = matrix.decompose();
+        assert_eq!(decomposed.size().0, 2 * digits_length);
+        assert_eq!(decomposed.size().1, 8);
+
+        let expected_matrix = gadget_matrix * decomposed;
+        assert_eq!(expected_matrix.size().0, 2);
+        assert_eq!(expected_matrix.size().1, 8);
+        assert_eq!(matrix, expected_matrix);
+    }
+
+    #[test]
+    fn test_matrix_decompose_with_unaligned_base() {
+        let params = DCRTPolyParams::new(4, 1, 52, 17);
+        let digits_length = params.modulus_digits();
+
+        // Create a simple 2x8 matrix with some non-zero values
+        let mut matrix_vec = Vec::with_capacity(2);
+        let value = 5;
+
+        // Create first row
+        let mut row1 = Vec::with_capacity(8);
+        row1.push(DCRTPoly::from_usize_to_constant(&params, value));
+        for _ in 1..8 {
+            row1.push(DCRTPoly::const_zero(&params));
+        }
+
+        // Create second row
+        let mut row2 = Vec::with_capacity(8);
+        row2.push(DCRTPoly::const_zero(&params));
+        row2.push(DCRTPoly::from_usize_to_constant(&params, value));
+        for _ in 2..8 {
+            row2.push(DCRTPoly::const_zero(&params));
+        }
+
+        matrix_vec.push(row1);
+        matrix_vec.push(row2);
+
+        let matrix = DCRTPolyMatrix::from_poly_vec(&params, matrix_vec);
+        println!("matrix {:?}", matrix);
+        assert_eq!(matrix.size().0, 2);
+        assert_eq!(matrix.size().1, 8);
+
+        let gadget_matrix = DCRTPolyMatrix::gadget_matrix(&params, 2);
+        println!("gadget_matrix {:?}", gadget_matrix);
+        assert_eq!(gadget_matrix.size().0, 2);
+        assert_eq!(gadget_matrix.size().1, 2 * digits_length);
+
+        let decomposed = matrix.decompose();
+        println!("decomposed {:?}", decomposed);
         assert_eq!(decomposed.size().0, 2 * digits_length);
         assert_eq!(decomposed.size().1, 8);
 

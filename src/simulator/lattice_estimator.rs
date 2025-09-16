@@ -161,12 +161,7 @@ pub fn run_lattice_estimator_cli_with_path(
     }
 
     // The CLI may print logs; parse only the last (non-empty) line as integer.
-    let last_line = stdout
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
-        .trim();
+    let last_line = stdout.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
     let secpar: u64 = last_line.parse()?;
     Ok(secpar)
 }
@@ -189,4 +184,268 @@ pub fn run_lattice_estimator_cli(
         m,
         exact,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use num_bigint::BigUint;
+    use std::{fs, os::unix::fs::PermissionsExt};
+    use tempfile::TempDir;
+
+    // Helper to create a mock CLI executable for unit tests.
+    fn create_mock_cli(dir: &TempDir, output: &str, exit_code: i32) -> std::path::PathBuf {
+        let mock_path = dir.path().join("mock-lattice-estimator-cli");
+        let script_content = format!(
+            r#"#!/bin/sh
+echo "{}"
+exit {}
+"#,
+            output, exit_code
+        );
+        fs::write(&mock_path, script_content).expect("write mock script");
+
+        // Make it executable.
+        let mut perms = fs::metadata(&mock_path).expect("get metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&mock_path, perms).expect("set permissions");
+
+        mock_path
+    }
+
+    #[test]
+    fn test_run_lattice_estimator_cli_success() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let mock_path = create_mock_cli(&temp_dir, "128", 0);
+
+        let ring_dim = BigUint::from(2048u32);
+        let q = BigUint::from(3329u32);
+        let s_dist = Distribution::CenteredBinomial { eta: 2, n: None };
+        let e_dist = Distribution::CenteredBinomial { eta: 2, n: None };
+
+        let result = run_lattice_estimator_cli_with_path(
+            mock_path, &ring_dim, &q, &s_dist, &e_dist, None, false,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 128);
+    }
+
+    #[test]
+    fn test_run_lattice_estimator_cli_with_logs() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        // Simulate CLI output with logs before the actual result.
+        let mock_path = create_mock_cli(
+            &temp_dir,
+            "INFO: Starting estimation...\nDEBUG: Parameters loaded\n256",
+            0,
+        );
+
+        let ring_dim = BigUint::from(4096u32);
+        let q = BigUint::from(8192u32);
+        let s_dist = Distribution::DiscreteGaussian { stddev: 3.2, mean: None, n: None };
+        let e_dist = Distribution::DiscreteGaussian { stddev: 3.2, mean: None, n: None };
+
+        let result = run_lattice_estimator_cli_with_path(
+            mock_path, &ring_dim, &q, &s_dist, &e_dist, None, false,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 256);
+    }
+
+    #[test]
+    fn test_run_lattice_estimator_cli_with_exact_and_m() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let mock_path = create_mock_cli(&temp_dir, "512", 0);
+
+        let ring_dim = BigUint::from(8192u32);
+        let q = BigUint::from(16384u32);
+        let s_dist = Distribution::Uniform { a: -1, b: 1, n: None };
+        let e_dist = Distribution::Uniform { a: -1, b: 1, n: None };
+        let m = BigUint::from(1000u32);
+
+        let result = run_lattice_estimator_cli_with_path(
+            mock_path,
+            &ring_dim,
+            &q,
+            &s_dist,
+            &e_dist,
+            Some(&m),
+            true,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 512);
+    }
+
+    #[test]
+    fn test_run_lattice_estimator_cli_non_zero_exit() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let mock_path = create_mock_cli(&temp_dir, "Error: Invalid parameters", 1);
+
+        let ring_dim = BigUint::from(1024u32);
+        let q = BigUint::from(2048u32);
+        let s_dist = Distribution::Binary;
+        let e_dist = Distribution::Binary;
+
+        let result = run_lattice_estimator_cli_with_path(
+            mock_path, &ring_dim, &q, &s_dist, &e_dist, None, false,
+        );
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            EstimatorCliError::NonZeroExit(code, stdout, _stderr) => {
+                assert_eq!(code, Some(1));
+                assert!(stdout.contains("Error: Invalid parameters"));
+            }
+            _ => panic!("Expected NonZeroExit error"),
+        }
+    }
+
+    #[test]
+    fn test_run_lattice_estimator_cli_parse_error() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let mock_path = create_mock_cli(&temp_dir, "not_a_number", 0);
+
+        let ring_dim = BigUint::from(1024u32);
+        let q = BigUint::from(2048u32);
+        let s_dist = Distribution::Ternary;
+        let e_dist = Distribution::Ternary;
+
+        let result = run_lattice_estimator_cli_with_path(
+            mock_path, &ring_dim, &q, &s_dist, &e_dist, None, false,
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), EstimatorCliError::ParseInt(_)));
+    }
+
+    #[test]
+    fn test_run_lattice_estimator_cli_empty_output() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let mock_path = create_mock_cli(&temp_dir, "", 0);
+
+        let ring_dim = BigUint::from(2048u32);
+        let q = BigUint::from(3329u32);
+        let s_dist = Distribution::SparseTernary { p: 64, m: 128, n: None };
+        let e_dist = Distribution::SparseTernary { p: 64, m: 128, n: None };
+
+        let result = run_lattice_estimator_cli_with_path(
+            mock_path, &ring_dim, &q, &s_dist, &e_dist, None, false,
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), EstimatorCliError::ParseInt(_)));
+    }
+
+    #[test]
+    fn test_run_lattice_estimator_cli_whitespace_output() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let mock_path = create_mock_cli(&temp_dir, "  \n  192  \n  ", 0);
+
+        let ring_dim = BigUint::from(3072u32);
+        let q = BigUint::from(8192u32);
+        let s_dist = Distribution::SparseBinary { hw: 64, n: None };
+        let e_dist = Distribution::SparseBinary { hw: 64, n: None };
+
+        let result = run_lattice_estimator_cli_with_path(
+            mock_path, &ring_dim, &q, &s_dist, &e_dist, None, false,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 192);
+    }
+
+    #[test]
+    fn test_distribution_to_json_string() {
+        // Test various distribution types serialize correctly.
+        let dist = Distribution::DiscreteGaussian { stddev: 3.19, mean: Some(0.0), n: Some(256) };
+        let json = dist.to_json_string();
+        assert!(json.contains(r#""name":"DiscreteGaussian""#));
+        assert!(json.contains(r#""stddev":3.19"#));
+        assert!(json.contains(r#""mean":0.0"#));
+        assert!(json.contains(r#""n":256"#));
+
+        let dist = Distribution::CenteredBinomial { eta: 3, n: None };
+        let json = dist.to_json_string();
+        assert!(json.contains(r#""name":"CenteredBinomial""#));
+        assert!(json.contains(r#""eta":3"#));
+        assert!(!json.contains(r#""n""#));
+
+        let dist = Distribution::UniformMod { n: Some(512) };
+        let json = dist.to_json_string();
+        assert!(json.contains(r#""name":"UniformMod""#));
+        assert!(json.contains(r#""n":512"#));
+
+        let dist = Distribution::Binary;
+        let json = dist.to_json_string();
+        assert_eq!(json, r#"{"name":"Binary"}"#);
+    }
+
+    // Integration test with actual CLI (requires lattice-estimator-cli in PATH).
+    #[test]
+    #[ignore] // Use `cargo test -- --ignored` to run this test.
+    fn test_integration_with_actual_cli() {
+        let ring_dim = BigUint::from(1024u32);
+        let q = BigUint::from(12289u32);
+        let s_dist = Distribution::Binary;
+        let e_dist = Distribution::DiscreteGaussian { stddev: 3.2, mean: None, n: None };
+        let m = BigUint::from(100000u32);
+
+        // Test with exact mode.
+        let result = run_lattice_estimator_cli(&ring_dim, &q, &s_dist, &e_dist, Some(&m), true);
+
+        match result {
+            Ok(secpar) => {
+                println!("Security parameter (exact): {}", secpar);
+                assert!(secpar > 0);
+            }
+            Err(e) => {
+                eprintln!("CLI not found or error: {}", e);
+                panic!("Integration test failed");
+            }
+        }
+
+        // Test without exact mode.
+        let result_rough = run_lattice_estimator_cli(&ring_dim, &q, &s_dist, &e_dist, None, false);
+
+        match result_rough {
+            Ok(secpar) => {
+                println!("Security parameter (rough): {}", secpar);
+                assert!(secpar > 0);
+            }
+            Err(e) => {
+                eprintln!("CLI not found or error: {}", e);
+                panic!("Integration test failed");
+            }
+        }
+    }
+
+    // Test with custom path to CLI.
+    #[test]
+    #[ignore] // Use `cargo test -- --ignored` to run this test.
+    fn test_integration_with_custom_cli_path() {
+        let cli_path =
+            "/Users/piapark/Documents/GitHub/lattice-estimator-cli/scripts/lattice-estimator-cli";
+        let ring_dim = BigUint::from(2048u32);
+        let q = BigUint::from(65537u32);
+        let s_dist = Distribution::CenteredBinomial { eta: 2, n: None };
+        let e_dist = Distribution::CenteredBinomial { eta: 2, n: None };
+
+        let result = run_lattice_estimator_cli_with_path(
+            cli_path, &ring_dim, &q, &s_dist, &e_dist, None, false,
+        );
+
+        match result {
+            Ok(secpar) => {
+                println!("Security parameter: {}", secpar);
+                assert!(secpar > 0);
+            }
+            Err(e) => {
+                eprintln!("CLI not found at custom path or error: {}", e);
+                panic!("Integration test failed");
+            }
+        }
+    }
 }

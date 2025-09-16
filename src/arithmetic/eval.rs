@@ -16,7 +16,7 @@ use crate::{
     matrix::PolyMatrix,
     poly::Poly,
     sampler::{PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
-    storage::write::{init_storage_system, wait_for_all_writes},
+    storage::write::{init_storage_system_with_limit, wait_for_all_writes_with_limit},
 };
 use num_bigint::BigUint;
 use std::{path::PathBuf, sync::Arc};
@@ -59,7 +59,8 @@ impl<P: Poly> ArithmeticCircuit<P> {
         ST: PolyTrapdoorSampler<M = M> + Clone + Send + Sync,
         SU: PolyUniformSampler<M = M> + Send + Sync,
     {
-        init_storage_system();
+        // Initialize storage with 100MB limit per file.
+        init_storage_system_with_limit(Some(1000 * 1024 * 1024));
         let pubkeys = self.sample_input_pubkeys::<M, SH>(params, seed, d);
         info!("sampled all pubkeys {}", pubkeys.len());
         let plt_evaluator = if self.use_packing || self.limb_bit_size > 1 {
@@ -75,7 +76,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
         };
         let outputs = self.poly_circuit.eval(params, &pubkeys[0], &pubkeys[1..], plt_evaluator);
         info!("finished evaluation of pubkeys");
-        wait_for_all_writes(dir_path).await.unwrap();
+        wait_for_all_writes_with_limit(dir_path, Some(1024 * 1024)).await.unwrap();
         info!("finished write files");
         outputs
     }

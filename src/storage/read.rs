@@ -28,6 +28,11 @@ where
     let mut file = match File::open(&path) {
         Ok(f) => f,
         Err(_) => {
+            // Try split batch files first
+            if let Some(matrix) = read_matrix_from_split_batch(params, dir, id_prefix, target_k) {
+                return Some(matrix);
+            }
+            // Fall back to single batch files
             return read_single_matrix_from_batch(params, dir, id_prefix, target_k);
         }
     };
@@ -109,6 +114,148 @@ where
     }
 
     log_mem(format!("Lookup table {} not found in multi-batch file", id_prefix));
+    None
+}
+
+/// Read a specific matrix from split batch files by its ID prefix and index.
+/// This reads from numbered batch files (lookup_tables_batch_0.bin, lookup_tables_batch_1.bin,
+/// etc.).
+pub fn read_matrix_from_split_batch<M>(
+    params: &<M::P as Poly>::Params,
+    dir: &Path,
+    id_prefix: &str,
+    target_k: usize,
+) -> Option<M>
+where
+    M: PolyMatrix,
+{
+    let start = Instant::now();
+
+    // Try reading from split batch files
+    let mut file_index = 0;
+    loop {
+        let filename = format!("lookup_tables_batch_{}.bin", file_index);
+        let path = dir.join(&filename);
+
+        // Check if the file exists
+        if !path.exists() {
+            // No more batch files to check
+            break;
+        }
+
+        let mut file = match File::open(&path) {
+            Ok(f) => f,
+            Err(_) => {
+                file_index += 1;
+                continue;
+            }
+        };
+
+        // Read number of lookup tables
+        let mut num_tables_buf = [0u8; 8];
+        if file.read_exact(&mut num_tables_buf).is_err() {
+            file_index += 1;
+            continue;
+        }
+        let num_tables = u64::from_le_bytes(num_tables_buf) as usize;
+
+        // Search for the matching lookup table
+        for _ in 0..num_tables {
+            // Read id_prefix length and string
+            let mut id_len_buf = [0u8; 8];
+            if file.read_exact(&mut id_len_buf).is_err() {
+                break;
+            }
+            let id_len = u64::from_le_bytes(id_len_buf) as usize;
+
+            let mut id_buf = vec![0u8; id_len];
+            if file.read_exact(&mut id_buf).is_err() {
+                break;
+            }
+            let current_id = match String::from_utf8(id_buf) {
+                Ok(s) => s,
+                Err(_) => {
+                    break;
+                }
+            };
+
+            // Read metadata
+            let mut metadata_buf = [0u8; 32]; // data_len, num_matrices, bytes_per_matrix, indices_len
+            if file.read_exact(&mut metadata_buf).is_err() {
+                break;
+            }
+            let data_len = u64::from_le_bytes(metadata_buf[0..8].try_into().unwrap()) as usize;
+            let num_matrices = u64::from_le_bytes(metadata_buf[8..16].try_into().unwrap()) as usize;
+            let bytes_per_matrix =
+                u64::from_le_bytes(metadata_buf[16..24].try_into().unwrap()) as usize;
+            let indices_len = u64::from_le_bytes(metadata_buf[24..32].try_into().unwrap()) as usize;
+
+            // Read indices
+            let mut indices_buf = vec![0u8; indices_len * 8];
+            if file.read_exact(&mut indices_buf).is_err() {
+                break;
+            }
+
+            if current_id == id_prefix {
+                // Found the right lookup table, now find the matrix
+                let mut matrix_position = None;
+                for i in 0..indices_len {
+                    let offset = i * 8;
+                    let idx =
+                        u64::from_le_bytes(indices_buf[offset..offset + 8].try_into().unwrap())
+                            as usize;
+                    if idx == target_k {
+                        matrix_position = Some(i);
+                        break;
+                    }
+                }
+
+                match matrix_position {
+                    Some(pos) => {
+                        // Calculate offset within the data section
+                        let header_size = 16 + 8 * num_matrices; // Original batch header
+                        let matrix_offset = header_size + pos * bytes_per_matrix;
+
+                        // Seek to the matrix within the data
+                        if file.seek(SeekFrom::Current(matrix_offset as i64)).is_err() {
+                            return None;
+                        }
+                        let mut matrix_buf = vec![0u8; bytes_per_matrix];
+                        if file.read_exact(&mut matrix_buf).is_err() {
+                            return None;
+                        }
+
+                        let matrix = M::from_compact_bytes(params, &matrix_buf);
+                        let elapsed = start.elapsed();
+                        debug_mem(format!(
+                            "Loaded matrix {} from split batch file {} (table: {}) in {elapsed:?}",
+                            target_k, filename, id_prefix
+                        ));
+                        return Some(matrix);
+                    }
+                    None => {
+                        debug_mem(format!(
+                            "Matrix {} not found in lookup table {} in file {}",
+                            target_k, id_prefix, filename
+                        ));
+                        // Continue searching in the same file
+                    }
+                }
+            }
+
+            // Skip this lookup table's data
+            if file.seek(SeekFrom::Current(data_len as i64)).is_err() {
+                break;
+            }
+        }
+
+        file_index += 1;
+    }
+
+    log_mem(format!(
+        "Matrix {} with id_prefix {} not found in any split batch file",
+        target_k, id_prefix
+    ));
     None
 }
 

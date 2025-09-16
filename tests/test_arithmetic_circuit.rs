@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use keccak_asm::Keccak256;
 use mxx::{
     arithmetic::circuit::{ArithGateId, ArithmeticCircuit},
@@ -15,6 +13,7 @@ use mxx::{
     },
 };
 use num_bigint::BigUint;
+use std::sync::Arc;
 use tempfile::tempdir;
 use tokio;
 use tracing::info;
@@ -77,6 +76,9 @@ async fn test_arithmetic_circuit_operations() {
     let secrets = uniform_sampler.sample_uniform(&params, 1, d, DistType::BitDist).get_row(0);
     let s = DCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
     let p = s.clone() * pub_matrix.as_ref();
+    // Wait for batch matrices to be written before encoding evaluation
+    mxx::storage::write::wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
+    
     info!("start evaluate_with_bgg_encoding");
     let mixed_encoding_result = mixed_circuit.evaluate_with_bgg_encoding::<
         DCRTPolyMatrix,
@@ -154,6 +156,9 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
     let secrets = uniform_sampler.sample_uniform(&params, 1, d, DistType::BitDist).get_row(0);
     let s = DCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
     let p = s.clone() * pub_matrix.as_ref();
+    // Wait for batch matrices to be written before encoding evaluation
+    mxx::storage::write::wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
+    
     info!("Non-CRT: start evaluate_with_bgg_encoding");
     let mixed_encoding_result = mixed_circuit.evaluate_with_bgg_encoding::<
         DCRTPolyMatrix,

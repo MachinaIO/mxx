@@ -33,6 +33,7 @@ pub struct BatchLookupBuffer {
 pub struct MultiBatchLookupBuffer {
     pub lookup_tables: Vec<BatchLookupBuffer>,
     pub total_size: usize,
+    pub bytes_limit: Option<usize>,
 }
 
 static WRITE_HANDLES: OnceLock<Arc<Mutex<Vec<JoinHandle<()>>>>> = OnceLock::new();
@@ -41,20 +42,40 @@ static LOOKUP_BUFFERS: OnceLock<Arc<Mutex<MultiBatchLookupBuffer>>> = OnceLock::
 
 /// Initialize the storage system
 pub fn init_storage_system() {
+    init_storage_system_with_limit(None);
+}
+
+/// Initialize the storage system with an optional byte limit for batched lookup tables.
+pub fn init_storage_system_with_limit(bytes_limit: Option<usize>) {
     WRITE_HANDLES
         .set(Arc::new(Mutex::new(Vec::new())))
         .expect("Storage system already initialized");
     RUNTIME_HANDLE
         .set(tokio::runtime::Handle::current())
         .expect("Storage system already initialized");
+    
+    let buffer = if let Some(limit) = bytes_limit {
+        MultiBatchLookupBuffer::with_limit(limit)
+    } else {
+        MultiBatchLookupBuffer::new()
+    };
+    
     LOOKUP_BUFFERS
-        .set(Arc::new(Mutex::new(MultiBatchLookupBuffer::new())))
+        .set(Arc::new(Mutex::new(buffer)))
         .expect("Storage system already initialized");
 }
 
 /// Wait for all pending writes to complete and write batched lookup tables
 pub async fn wait_for_all_writes(
     dir_path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    wait_for_all_writes_with_limit(dir_path, None).await
+}
+
+/// Wait for all pending writes to complete and write batched lookup tables with optional byte limit
+pub async fn wait_for_all_writes_with_limit(
+    dir_path: PathBuf,
+    bytes_limit: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(buffers) = LOOKUP_BUFFERS.get() {
         let multi_buffer = {
@@ -64,9 +85,24 @@ pub async fn wait_for_all_writes(
 
         if !multi_buffer.lookup_tables.is_empty() {
             log_mem(format!("Writing {} batched lookup tables", multi_buffer.lookup_tables.len()));
-            let filename = "lookup_tables_combined.batch";
-            if let Err(e) = multi_buffer.write_to_file(dir_path, filename.to_string()).await {
-                eprintln!("Failed to write batched lookup tables: {}", e);
+            
+            if let Some(limit) = bytes_limit {
+                // Split into multiple files based on byte limit
+                let file_groups = split_buffers_by_limit(&multi_buffer, limit);
+                log_mem(format!("Split into {} files with byte limit {}", file_groups.len(), limit));
+                
+                for (i, group) in file_groups.into_iter().enumerate() {
+                    let filename = format!("lookup_tables_batch_{}.bin", i);
+                    if let Err(e) = group.write_to_file(dir_path.clone(), filename.clone()).await {
+                        eprintln!("Failed to write batched lookup tables {}: {}", filename, e);
+                    }
+                }
+            } else {
+                // Write as single file
+                let filename = "lookup_tables_combined.batch";
+                if let Err(e) = multi_buffer.write_to_file(dir_path, filename.to_string()).await {
+                    eprintln!("Failed to write batched lookup tables: {}", e);
+                }
             }
         }
     }
@@ -83,6 +119,35 @@ pub async fn wait_for_all_writes(
     }
     log_mem("All writes completed");
     Ok(())
+}
+
+/// Split a MultiBatchLookupBuffer into multiple buffers based on byte limit.
+fn split_buffers_by_limit(
+    multi_buffer: &MultiBatchLookupBuffer,
+    bytes_limit: usize,
+) -> Vec<MultiBatchLookupBuffer> {
+    let mut result = Vec::new();
+    let mut current_buffer = MultiBatchLookupBuffer::with_limit(bytes_limit);
+    
+    for batch in &multi_buffer.lookup_tables {
+        let batch_size = batch.data.len();
+        
+        // If this batch would exceed the limit and we already have some batches, start a new buffer
+        if current_buffer.would_exceed_limit(batch_size) && !current_buffer.lookup_tables.is_empty() {
+            result.push(current_buffer);
+            current_buffer = MultiBatchLookupBuffer::with_limit(bytes_limit);
+        }
+        
+        // Add the batch to the current buffer
+        current_buffer.add_batch(batch.clone());
+    }
+    
+    // Add the last buffer if it has content
+    if !current_buffer.lookup_tables.is_empty() {
+        result.push(current_buffer);
+    }
+    
+    result
 }
 
 fn preprocess_matrix_for_storage<M>(matrix: M, id: &str) -> SerializedMatrix
@@ -112,13 +177,26 @@ where
 
 impl MultiBatchLookupBuffer {
     pub fn new() -> Self {
-        Self { lookup_tables: Vec::new(), total_size: 0 }
+        Self { lookup_tables: Vec::new(), total_size: 0, bytes_limit: None }
+    }
+    
+    pub fn with_limit(bytes_limit: usize) -> Self {
+        Self { lookup_tables: Vec::new(), total_size: 0, bytes_limit: Some(bytes_limit) }
     }
 
     /// Add a batch lookup buffer to the collection.
     pub fn add_batch(&mut self, batch: BatchLookupBuffer) {
         self.total_size += batch.data.len() + 32; // Extra space for metadata.
         self.lookup_tables.push(batch);
+    }
+    
+    /// Check if adding a batch would exceed the byte limit.
+    pub fn would_exceed_limit(&self, batch_size: usize) -> bool {
+        if let Some(limit) = self.bytes_limit {
+            self.total_size + batch_size + 32 > limit
+        } else {
+            false
+        }
     }
 
     /// Serialize all batches into a single buffer.
@@ -190,12 +268,22 @@ impl MultiBatchLookupBuffer {
 }
 
 /// Add a batch lookup buffer to the global collection.
-pub fn add_lookup_buffer(buffer: BatchLookupBuffer) {
+/// Returns true if the buffer was added successfully, false if it would exceed the limit.
+pub fn add_lookup_buffer(buffer: BatchLookupBuffer) -> bool {
     if let Some(buffers) = LOOKUP_BUFFERS.get() {
         let mut guard = buffers.lock().unwrap();
-        guard.add_batch(buffer);
+        
+        // Check if adding this buffer would exceed the limit
+        if guard.would_exceed_limit(buffer.data.len()) {
+            // Buffer would exceed limit - caller should handle this
+            false
+        } else {
+            guard.add_batch(buffer);
+            true
+        }
     } else {
         eprintln!("Warning: Storage system not initialized, cannot store lookup buffer");
+        false
     }
 }
 

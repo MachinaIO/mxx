@@ -9,7 +9,7 @@ use crate::{
         read::read_matrix_from_multi_batch,
         write::{BatchLookupBuffer, add_lookup_buffer, get_lookup_buffer},
     },
-    utils::timed_read,
+    utils::{timed_read, log_mem},
 };
 use rayon::prelude::*;
 use std::{marker::PhantomData, path::PathBuf, sync::Arc};
@@ -56,7 +56,19 @@ where
             &a_lt,
             &id,
         );
-        add_lookup_buffer(buffer);
+        if !add_lookup_buffer(buffer.clone()) {
+            eprintln!("Warning: Lookup buffer exceeds byte limit for gate {}", id);
+            // Write this buffer as an individual file
+            let filename = format!("{}_batch.matrices", buffer.id_prefix);
+            if let Err(e) = std::fs::write(self.dir_path.join(&filename), &buffer.data) {
+                eprintln!("Failed to write oversized buffer to {}: {}", filename, e);
+            } else {
+                log_mem(format!(
+                    "Wrote oversized lookup buffer {} to {} ({} bytes)",
+                    buffer.id_prefix, filename, buffer.data.len()
+                ));
+            }
+        }
         BggPublicKey { matrix: a_lt, reveal_plaintext: true }
     }
 }

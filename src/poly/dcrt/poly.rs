@@ -25,7 +25,7 @@ pub struct DCRTPoly {
     ptr_poly: Arc<UniquePtr<DCRTPolyCxx>>,
 }
 
-// SAFETY: DCRTPoly is plain old data and is shared across threads in C++ OpenFHE as well.
+/// # Safety DCRTPoly is plain old data and is shared across threads in C++ OpenFHE as well.
 unsafe impl Send for DCRTPoly {}
 unsafe impl Sync for DCRTPoly {}
 

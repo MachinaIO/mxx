@@ -19,6 +19,7 @@ pub struct DCRTPolyParams {
     modulus: Arc<BigUint>,
     /// bit size of the base for the gadget vector and decomposition
     base_bits: u32,
+    decompose_last_mask: Option<u64>,
 }
 
 impl Debug for DCRTPolyParams {
@@ -77,12 +78,22 @@ impl DCRTPolyParams {
         // assert that ring_dimension is a power of 2
         assert!(ring_dimension.is_power_of_two(), "ring_dimension must be a power of 2");
         let modulus = ffi::GenModulus(ring_dimension, crt_depth, crt_bits);
+        let decompose_last_mask = if crt_bits % base_bits as usize == 0 {
+            None
+        } else {
+            let digits_per_tower = crt_bits.div_ceil(base_bits as usize);
+            // Determine effective bit-width for this digit within its CRT tower
+            let last_bits = crt_bits - base_bits as usize * (digits_per_tower - 1);
+            let mask = (1u64 << last_bits) - 1u64;
+            Some(mask)
+        };
         Self {
             ring_dimension,
             crt_depth,
             crt_bits,
             modulus: Arc::new(BigUint::from_str_radix(&modulus, 10).expect("invalid string")),
             base_bits,
+            decompose_last_mask,
         }
     }
 
@@ -92,6 +103,10 @@ impl DCRTPolyParams {
 
     pub fn crt_bits(&self) -> usize {
         self.crt_bits
+    }
+
+    pub fn decompose_last_mask(&self) -> Option<u64> {
+        self.decompose_last_mask
     }
 }
 

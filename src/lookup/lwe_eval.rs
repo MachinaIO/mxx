@@ -5,7 +5,7 @@ use crate::{
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
     sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler},
-    storage::{read_single_matrix_from_batch, store_and_drop_matrices},
+    storage::{read_single_matrix_from_multi_batch, store_and_drop_matrices_batched},
     utils::timed_read,
 };
 use rayon::prelude::*;
@@ -123,8 +123,13 @@ where
         let l_k = timed_read(
             &format!("L_{id}_{k}"),
             || {
-                read_single_matrix_from_batch::<M>(params, &self.dir_path, &format!("L_{id}"), k)
-                    .unwrap_or_else(|| panic!("Matrix with index {} not found in batch", k))
+                read_single_matrix_from_multi_batch::<M>(
+                    params,
+                    &self.dir_path,
+                    &format!("L_{id}"),
+                    k,
+                )
+                .unwrap_or_else(|| panic!("Matrix with index {} not found in batch", k))
             },
             &mut std::time::Duration::default(),
         );
@@ -200,15 +205,15 @@ fn preimage_all<M, ST, P>(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    store_and_drop_matrices(preimages, dir_path, &format!("L_{id}"));
+
+    let dir_path = dir_path.to_path_buf();
+    let id_str = format!("L_{id}");
+    let _ = store_and_drop_matrices_batched(preimages, dir_path, id_str);
 }
 
 #[cfg(test)]
 mod test {
-    use std::{collections::HashMap, fs, path::Path};
-
     use super::*;
-
     use crate::{
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         circuit::PolyCircuit,
@@ -219,10 +224,15 @@ mod test {
             hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
             uniform::DCRTPolyUniformSampler,
         },
-        storage::{init_storage_system, wait_for_all_writes},
+        storage::{
+            batch_lookup::{BatchConfig, start_batcher},
+            flush_all_batches, flush_all_batches_combined, init_storage_system_with_threshold,
+            wait_for_all_writes,
+        },
         utils::create_bit_random_poly,
     };
     use keccak_asm::Keccak256;
+    use std::{collections::HashMap, fs, path::Path};
     use tokio;
 
     fn setup_lsb_constant_binary_plt(t_n: usize, params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {
@@ -240,7 +250,12 @@ mod test {
 
     #[tokio::test]
     async fn test_lwe_plt_eval() {
-        init_storage_system();
+        tracing_subscriber::fmt::init();
+        init_storage_system_with_threshold(1024); // 1KB 
+
+        // Initialize the batch lookup system
+
+        start_batcher(BatchConfig { byte_threshold: 1024, _io_buffer_bytes: 8192 });
         // Create parameters for testing
         let params = DCRTPolyParams::default();
 
@@ -304,7 +319,12 @@ mod test {
             &[enc1.pubkey.clone()],
             Some(plt_pubkey_evaluator),
         );
+        // Give the batching system a moment to complete
+        std::thread::sleep(std::time::Duration::from_millis(100));
         wait_for_all_writes().await.unwrap();
+
+        // Flush the batch system to ensure files are written
+        flush_all_batches().await.unwrap();
         assert_eq!(result_pubkey.len(), 1);
         let result_pubkey = &result_pubkey[0];
 
@@ -326,5 +346,133 @@ mod test {
             (result_encoding.pubkey.matrix.clone() -
                 (DCRTPolyMatrix::gadget_matrix(&params, d) * expected_plaintext));
         assert_eq!(result_encoding.vector, expected_vector);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_lwe_plt_eval() {
+        tracing_subscriber::fmt::init();
+        init_storage_system_with_threshold(1024); // 1KB 
+
+        // Initialize the batch lookup system
+        start_batcher(BatchConfig { byte_threshold: 1024, _io_buffer_bytes: 8192 });
+
+        let params = DCRTPolyParams::default();
+
+        // Create multiple lookup tables with different sizes
+        let plt1 = setup_lsb_constant_binary_plt(8, &params);
+        let plt2 = setup_lsb_constant_binary_plt(16, &params);
+        let plt3 = setup_lsb_constant_binary_plt(4, &params);
+
+        // Create a circuit with multiple lookup tables
+        let mut circuit = PolyCircuit::new();
+        let inputs = circuit.input(3);
+        let plt_id1 = circuit.register_public_lookup(plt1.clone());
+        let plt_id2 = circuit.register_public_lookup(plt2.clone());
+        let plt_id3 = circuit.register_public_lookup(plt3.clone());
+
+        let output1 = circuit.public_lookup_gate(inputs[0], plt_id1);
+        let output2 = circuit.public_lookup_gate(inputs[1], plt_id2);
+        let output3 = circuit.public_lookup_gate(inputs[2], plt_id3);
+        circuit.output(vec![output1, output2, output3]);
+
+        let d = 3;
+        let input_size = 3;
+        let key: [u8; 32] = rand::random();
+        let bgg_pubkey_sampler =
+            BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
+
+        let tag: u64 = rand::random();
+        let tag_bytes = tag.to_le_bytes();
+        let secrets = vec![create_bit_random_poly(&params); d];
+
+        // Create plaintexts that are valid for each lookup table
+        let rand_int1 = (rand::random::<u64>() % 8) as usize;
+        let rand_int2 = (rand::random::<u64>() % 16) as usize;
+        let rand_int3 = (rand::random::<u64>() % 4) as usize;
+        let plaintexts = vec![
+            DCRTPoly::from_usize_to_constant(&params, rand_int1),
+            DCRTPoly::from_usize_to_constant(&params, rand_int2),
+            DCRTPoly::from_usize_to_constant(&params, rand_int3),
+        ];
+
+        let reveal_plaintexts = vec![true; input_size + 1]; // +1 for constant
+        let bgg_encoding_sampler =
+            BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
+        let pubkeys = bgg_pubkey_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
+        let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &plaintexts);
+
+        let enc_one = encodings[0].clone();
+        let input_encs = vec![encodings[1].clone(), encodings[2].clone(), encodings[3].clone()];
+
+        let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let (b_trapdoor, b) = trapdoor_sampler.trapdoor(&params, d);
+        let s_vec = DCRTPolyMatrix::from_poly_vec_row(&params, secrets);
+        let c_b = s_vec.clone() * &b;
+
+        // Create directories for each lookup table
+        let base_dir = "test_data/test_multiple_lwe_plt_eval";
+        if Path::new(&base_dir).exists() {
+            fs::remove_dir_all(base_dir).unwrap();
+        }
+        fs::create_dir_all(base_dir).unwrap();
+
+        let plt_pubkey_evaluator =
+            LweBggPubKeyEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>, _>::new(
+                key,
+                trapdoor_sampler.clone(),
+                Arc::new(b.clone()),
+                Arc::new(b_trapdoor.clone()),
+                base_dir.into(),
+            );
+
+        // Evaluate public keys (this will generate matrices for all lookup tables)
+        let result_pubkeys = circuit.eval(
+            &params,
+            &enc_one.pubkey,
+            &input_encs.iter().map(|e| e.pubkey.clone()).collect::<Vec<_>>(),
+            Some(plt_pubkey_evaluator),
+        );
+
+        // Give the batching system time to complete and flush
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        wait_for_all_writes().await.unwrap();
+
+        // Combine all lookup tables into a single batch file
+        let _combined_file = flush_all_batches_combined(base_dir.into()).await.unwrap();
+
+        assert_eq!(result_pubkeys.len(), 3);
+
+        // Create encoding evaluator and test each lookup
+        let plt_encoding_evaluator = LweBggEncodingPltEvaluator::<
+            DCRTPolyMatrix,
+            DCRTPolyHashSampler<Keccak256>,
+        >::new(key, base_dir.into(), c_b);
+
+        let result_encodings =
+            circuit.eval(&params, &enc_one.clone(), &input_encs, Some(plt_encoding_evaluator));
+        assert_eq!(result_encodings.len(), 3);
+
+        // Verify each result
+        let expected_plaintext1 = plt1.get(&params, &plaintexts[0]).unwrap().1;
+        let expected_plaintext2 = plt2.get(&params, &plaintexts[1]).unwrap().1;
+        let expected_plaintext3 = plt3.get(&params, &plaintexts[2]).unwrap().1;
+
+        assert_eq!(result_encodings[0].plaintext.clone().unwrap(), expected_plaintext1);
+        assert_eq!(result_encodings[1].plaintext.clone().unwrap(), expected_plaintext2);
+        assert_eq!(result_encodings[2].plaintext.clone().unwrap(), expected_plaintext3);
+
+        // Verify public keys match
+        assert_eq!(result_encodings[0].pubkey, result_pubkeys[0]);
+        assert_eq!(result_encodings[1].pubkey, result_pubkeys[1]);
+        assert_eq!(result_encodings[2].pubkey, result_pubkeys[2]);
+
+        // Verify vectors are correct
+        for i in 0..3 {
+            let expected_vector = s_vec.clone() *
+                (result_encodings[i].pubkey.matrix.clone() -
+                    (DCRTPolyMatrix::gadget_matrix(&params, d) *
+                        result_encodings[i].plaintext.clone().unwrap()));
+            assert_eq!(result_encodings[i].vector, expected_vector);
+        }
     }
 }

@@ -520,6 +520,7 @@ dependencies = [
  "memory-stats",
  "num-bigint",
  "num-traits",
+ "once_cell",
  "openfhe",
  "rand 0.9.2",
  "rayon",

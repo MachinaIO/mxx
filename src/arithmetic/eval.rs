@@ -15,7 +15,10 @@ use crate::{
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
     sampler::{PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
-    storage::{init_storage_system, wait_for_all_writes},
+    storage::{
+        batch_lookup::{BatchConfig, start_batcher},
+        init_storage_system_with_threshold, wait_for_all_writes,
+    },
 };
 use num_bigint::BigUint;
 use std::{path::PathBuf, sync::Arc};
@@ -61,7 +64,9 @@ impl<P: Poly> ArithmeticCircuit<P> {
         ST: PolyTrapdoorSampler<M = M> + Clone + Send + Sync,
         SU: PolyUniformSampler<M = M> + Send + Sync,
     {
-        init_storage_system();
+        init_storage_system_with_threshold(10240);
+        // Initialize the batch lookup system
+        start_batcher(BatchConfig { byte_threshold: 10240, _io_buffer_bytes: 81920 });
         let pubkeys = self.sample_input_pubkeys::<M, SH>(params, seed, d);
         info!("sampled all pubkeys {}", pubkeys.len());
         let plt_evaluator = if self.use_packing || self.limb_bit_size > 1 {

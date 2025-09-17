@@ -9,7 +9,7 @@ use crate::{
         read::read_matrix_from_multi_batch,
         write::{BatchLookupBuffer, add_lookup_buffer, get_lookup_buffer},
     },
-    utils::{timed_read, log_mem},
+    utils::{log_mem, timed_read},
 };
 use rayon::prelude::*;
 use std::{marker::PhantomData, path::PathBuf, sync::Arc};
@@ -65,7 +65,9 @@ where
             } else {
                 log_mem(format!(
                     "Wrote oversized lookup buffer {} to {} ({} bytes)",
-                    buffer.id_prefix, filename, buffer.data.len()
+                    buffer.id_prefix,
+                    filename,
+                    buffer.data.len()
                 ));
             }
         }

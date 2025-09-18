@@ -53,16 +53,14 @@ pub fn init_storage_system_with_limit(bytes_limit: Option<usize>) {
     RUNTIME_HANDLE
         .set(tokio::runtime::Handle::current())
         .expect("Storage system already initialized");
-    
+
     let buffer = if let Some(limit) = bytes_limit {
         MultiBatchLookupBuffer::with_limit(limit)
     } else {
         MultiBatchLookupBuffer::new()
     };
-    
-    LOOKUP_BUFFERS
-        .set(Arc::new(Mutex::new(buffer)))
-        .expect("Storage system already initialized");
+
+    LOOKUP_BUFFERS.set(Arc::new(Mutex::new(buffer))).expect("Storage system already initialized");
 }
 
 /// Wait for all pending writes to complete and write batched lookup tables
@@ -85,12 +83,16 @@ pub async fn wait_for_all_writes_with_limit(
 
         if !multi_buffer.lookup_tables.is_empty() {
             log_mem(format!("Writing {} batched lookup tables", multi_buffer.lookup_tables.len()));
-            
+
             if let Some(limit) = bytes_limit {
                 // Split into multiple files based on byte limit
                 let file_groups = split_buffers_by_limit(&multi_buffer, limit);
-                log_mem(format!("Split into {} files with byte limit {}", file_groups.len(), limit));
-                
+                log_mem(format!(
+                    "Split into {} files with byte limit {}",
+                    file_groups.len(),
+                    limit
+                ));
+
                 for (i, group) in file_groups.into_iter().enumerate() {
                     let filename = format!("lookup_tables_batch_{}.bin", i);
                     if let Err(e) = group.write_to_file(dir_path.clone(), filename.clone()).await {
@@ -128,25 +130,26 @@ fn split_buffers_by_limit(
 ) -> Vec<MultiBatchLookupBuffer> {
     let mut result = Vec::new();
     let mut current_buffer = MultiBatchLookupBuffer::with_limit(bytes_limit);
-    
+
     for batch in &multi_buffer.lookup_tables {
         let batch_size = batch.data.len();
-        
+
         // If this batch would exceed the limit and we already have some batches, start a new buffer
-        if current_buffer.would_exceed_limit(batch_size) && !current_buffer.lookup_tables.is_empty() {
+        if current_buffer.would_exceed_limit(batch_size) && !current_buffer.lookup_tables.is_empty()
+        {
             result.push(current_buffer);
             current_buffer = MultiBatchLookupBuffer::with_limit(bytes_limit);
         }
-        
+
         // Add the batch to the current buffer
         current_buffer.add_batch(batch.clone());
     }
-    
+
     // Add the last buffer if it has content
     if !current_buffer.lookup_tables.is_empty() {
         result.push(current_buffer);
     }
-    
+
     result
 }
 
@@ -179,7 +182,7 @@ impl MultiBatchLookupBuffer {
     pub fn new() -> Self {
         Self { lookup_tables: Vec::new(), total_size: 0, bytes_limit: None }
     }
-    
+
     pub fn with_limit(bytes_limit: usize) -> Self {
         Self { lookup_tables: Vec::new(), total_size: 0, bytes_limit: Some(bytes_limit) }
     }
@@ -189,7 +192,7 @@ impl MultiBatchLookupBuffer {
         self.total_size += batch.data.len() + 32; // Extra space for metadata.
         self.lookup_tables.push(batch);
     }
-    
+
     /// Check if adding a batch would exceed the byte limit.
     pub fn would_exceed_limit(&self, batch_size: usize) -> bool {
         if let Some(limit) = self.bytes_limit {
@@ -272,7 +275,7 @@ impl MultiBatchLookupBuffer {
 pub fn add_lookup_buffer(buffer: BatchLookupBuffer) -> bool {
     if let Some(buffers) = LOOKUP_BUFFERS.get() {
         let mut guard = buffers.lock().unwrap();
-        
+
         // Check if adding this buffer would exceed the limit
         if guard.would_exceed_limit(buffer.data.len()) {
             // Buffer would exceed limit - caller should handle this

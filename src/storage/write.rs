@@ -12,6 +12,7 @@ use std::{
     time::Instant,
 };
 use tokio::task::JoinHandle;
+use tracing::info;
 
 #[derive(Debug)]
 pub struct SerializedMatrix {
@@ -40,26 +41,21 @@ static WRITE_HANDLES: OnceLock<Arc<Mutex<Vec<JoinHandle<()>>>>> = OnceLock::new(
 static RUNTIME_HANDLE: OnceLock<tokio::runtime::Handle> = OnceLock::new();
 static LOOKUP_BUFFERS: OnceLock<Arc<Mutex<MultiBatchLookupBuffer>>> = OnceLock::new();
 
-/// Initialize the storage system
-pub fn init_storage_system() {
-    init_storage_system_with_limit(None);
-}
-
 /// Initialize the storage system with an optional byte limit for batched lookup tables.
-pub fn init_storage_system_with_limit(bytes_limit: Option<usize>) {
+pub fn init_storage_system() {
     WRITE_HANDLES
         .set(Arc::new(Mutex::new(Vec::new())))
         .expect("Storage system already initialized");
     RUNTIME_HANDLE
         .set(tokio::runtime::Handle::current())
         .expect("Storage system already initialized");
-
+    let bytes_limit = std::env::var("LUT_BYTES_LIMIT").ok().and_then(|s| s.parse::<usize>().ok());
+    info!("LUT_BYTES_LIMIT={:?}", bytes_limit);
     let buffer = if let Some(limit) = bytes_limit {
         MultiBatchLookupBuffer::with_limit(limit)
     } else {
         MultiBatchLookupBuffer::new()
     };
-
     LOOKUP_BUFFERS.set(Arc::new(Mutex::new(buffer))).expect("Storage system already initialized");
 }
 

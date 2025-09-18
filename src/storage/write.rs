@@ -63,10 +63,60 @@ pub fn init_storage_system() {
 pub async fn wait_for_all_writes(
     dir_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    wait_for_all_writes_with_limit(dir_path, None).await
+    let bytes_limit = std::env::var("LUT_BYTES_LIMIT").ok().and_then(|s| s.parse::<usize>().ok());
+    info!("LUT_BYTES_LIMIT={:?}", bytes_limit);
+    if let Some(buffers) = LOOKUP_BUFFERS.get() {
+        let multi_buffer = {
+            let mut guard = buffers.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
+
+        if !multi_buffer.lookup_tables.is_empty() {
+            log_mem(format!("Writing {} batched lookup tables", multi_buffer.lookup_tables.len()));
+
+            if let Some(limit) = bytes_limit {
+                // Split into multiple files based on byte limit
+                let file_groups = split_buffers_by_limit(&multi_buffer, limit);
+                log_mem(format!(
+                    "Split into {} files with byte limit {}",
+                    file_groups.len(),
+                    limit
+                ));
+
+                for (i, group) in file_groups.into_iter().enumerate() {
+                    let filename = format!("lookup_tables_batch_{}.bin", i);
+                    if let Err(e) = group.write_to_file(dir_path.clone(), filename.clone()).await {
+                        eprintln!("Failed to write batched lookup tables {}: {}", filename, e);
+                    }
+                }
+            } else {
+                // Write as single file
+                let filename = "lookup_tables_combined.batch";
+                if let Err(e) = multi_buffer.write_to_file(dir_path, filename.to_string()).await {
+                    eprintln!("Failed to write batched lookup tables: {}", e);
+                }
+            }
+        }
+    }
+    let handles = WRITE_HANDLES.get().ok_or("Storage system not initialized")?;
+    let handles_vec: Vec<JoinHandle<()>> = {
+        let mut guard = handles.lock().unwrap();
+        std::mem::take(guard.as_mut())
+    };
+    log_mem(format!("Waiting for {} pending writes to complete", handles_vec.len()));
+    for handle in handles_vec {
+        if let Err(e) = handle.await {
+            eprintln!("Write task failed: {e}");
+        }
+    }
+    log_mem("All writes completed");
+    Ok(())
 }
 
 /// Wait for all pending writes to complete and write batched lookup tables with optional byte limit
+/// Deprecated: Use wait_for_all_writes() instead, which reads the byte limit from LUT_BYTES_LIMIT
+/// env var
+#[deprecated(since = "0.1.0", note = "Use wait_for_all_writes() instead")]
 pub async fn wait_for_all_writes_with_limit(
     dir_path: PathBuf,
     bytes_limit: Option<usize>,
@@ -191,7 +241,7 @@ impl MultiBatchLookupBuffer {
 
     /// Add a batch lookup buffer to the collection.
     pub fn add_batch(&mut self, batch: BatchLookupBuffer) {
-        self.total_size += batch.data.len() + 32; // Extra space for metadata.
+        self.total_size += batch.data.len() + 32;
         self.lookup_tables.push(batch);
     }
 
@@ -246,20 +296,6 @@ impl MultiBatchLookupBuffer {
         let data = self.to_bytes();
         let path = dir.join(&filename);
         tokio::fs::write(&path, &data).await?;
-        log_mem(format!(
-            "Multi-batch lookup table written to {} ({} bytes, {} tables)",
-            filename,
-            data.len(),
-            self.lookup_tables.len()
-        ));
-        Ok(())
-    }
-
-    /// Write all batches to a single file synchronously.
-    pub fn write_to_file_sync(&self, dir: &Path, filename: &str) -> std::io::Result<()> {
-        let data = self.to_bytes();
-        let path = dir.join(filename);
-        std::fs::write(&path, &data)?;
         log_mem(format!(
             "Multi-batch lookup table written to {} ({} bytes, {} tables)",
             filename,

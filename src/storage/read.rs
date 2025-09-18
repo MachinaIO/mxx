@@ -22,7 +22,7 @@ pub fn read_matrix_from_multi_batch<M>(
 where
     M: PolyMatrix,
 {
-    let filename = format!("lookup_tables_combined.batch");
+    let filename = "lookup_tables_combined.batch".to_string();
     let path = dir.join(filename);
     let start = Instant::now();
     let mut file = match File::open(&path) {

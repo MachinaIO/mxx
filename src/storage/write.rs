@@ -78,7 +78,7 @@ pub async fn wait_for_all_writes_with_limit(
     if let Some(buffers) = LOOKUP_BUFFERS.get() {
         let multi_buffer = {
             let mut guard = buffers.lock().unwrap();
-            std::mem::replace(&mut *guard, MultiBatchLookupBuffer::new())
+            std::mem::take(&mut *guard)
         };
 
         if !multi_buffer.lookup_tables.is_empty() {
@@ -178,6 +178,12 @@ where
     SerializedMatrix { id: id.to_string(), filename, data }
 }
 
+impl Default for MultiBatchLookupBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MultiBatchLookupBuffer {
     pub fn new() -> Self {
         Self { lookup_tables: Vec::new(), total_size: 0, bytes_limit: None }
@@ -236,23 +242,21 @@ impl MultiBatchLookupBuffer {
     }
 
     /// Create a future that will write all batches to a single file.
-    pub fn write_to_file(
+    pub async fn write_to_file(
         self,
         dir: std::path::PathBuf,
         filename: String,
-    ) -> impl std::future::Future<Output = Result<(), std::io::Error>> {
-        async move {
-            let data = self.to_bytes();
-            let path = dir.join(&filename);
-            tokio::fs::write(&path, &data).await?;
-            log_mem(format!(
-                "Multi-batch lookup table written to {} ({} bytes, {} tables)",
-                filename,
-                data.len(),
-                self.lookup_tables.len()
-            ));
-            Ok(())
-        }
+    ) -> Result<(), std::io::Error> {
+        let data = self.to_bytes();
+        let path = dir.join(&filename);
+        tokio::fs::write(&path, &data).await?;
+        log_mem(format!(
+            "Multi-batch lookup table written to {} ({} bytes, {} tables)",
+            filename,
+            data.len(),
+            self.lookup_tables.len()
+        ));
+        Ok(())
     }
 
     /// Write all batches to a single file synchronously.

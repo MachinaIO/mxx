@@ -113,62 +113,6 @@ pub async fn wait_for_all_writes(
     Ok(())
 }
 
-/// Wait for all pending writes to complete and write batched lookup tables with optional byte limit
-/// Deprecated: Use wait_for_all_writes() instead, which reads the byte limit from LUT_BYTES_LIMIT
-/// env var
-#[deprecated(since = "0.1.0", note = "Use wait_for_all_writes() instead")]
-pub async fn wait_for_all_writes_with_limit(
-    dir_path: PathBuf,
-    bytes_limit: Option<usize>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(buffers) = LOOKUP_BUFFERS.get() {
-        let multi_buffer = {
-            let mut guard = buffers.lock().unwrap();
-            std::mem::take(&mut *guard)
-        };
-
-        if !multi_buffer.lookup_tables.is_empty() {
-            log_mem(format!("Writing {} batched lookup tables", multi_buffer.lookup_tables.len()));
-
-            if let Some(limit) = bytes_limit {
-                // Split into multiple files based on byte limit
-                let file_groups = split_buffers_by_limit(&multi_buffer, limit);
-                log_mem(format!(
-                    "Split into {} files with byte limit {}",
-                    file_groups.len(),
-                    limit
-                ));
-
-                for (i, group) in file_groups.into_iter().enumerate() {
-                    let filename = format!("lookup_tables_batch_{}.bin", i);
-                    if let Err(e) = group.write_to_file(dir_path.clone(), filename.clone()).await {
-                        eprintln!("Failed to write batched lookup tables {}: {}", filename, e);
-                    }
-                }
-            } else {
-                // Write as single file
-                let filename = "lookup_tables_combined.batch";
-                if let Err(e) = multi_buffer.write_to_file(dir_path, filename.to_string()).await {
-                    eprintln!("Failed to write batched lookup tables: {}", e);
-                }
-            }
-        }
-    }
-    let handles = WRITE_HANDLES.get().ok_or("Storage system not initialized")?;
-    let handles_vec: Vec<JoinHandle<()>> = {
-        let mut guard = handles.lock().unwrap();
-        std::mem::take(guard.as_mut())
-    };
-    log_mem(format!("Waiting for {} pending writes to complete", handles_vec.len()));
-    for handle in handles_vec {
-        if let Err(e) = handle.await {
-            eprintln!("Write task failed: {e}");
-        }
-    }
-    log_mem("All writes completed");
-    Ok(())
-}
-
 /// Split a MultiBatchLookupBuffer into multiple buffers based on byte limit.
 fn split_buffers_by_limit(
     multi_buffer: &MultiBatchLookupBuffer,

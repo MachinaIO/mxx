@@ -78,7 +78,7 @@ impl DCRTPolyParams {
         // assert that ring_dimension is a power of 2
         assert!(ring_dimension.is_power_of_two(), "ring_dimension must be a power of 2");
         let modulus = ffi::GenModulus(ring_dimension, crt_depth, crt_bits);
-        let decompose_last_mask = if crt_bits % base_bits as usize == 0 {
+        let decompose_last_mask = if crt_bits.is_multiple_of(base_bits as usize) {
             None
         } else {
             let digits_per_tower = crt_bits.div_ceil(base_bits as usize);

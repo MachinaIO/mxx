@@ -140,7 +140,6 @@ impl MulAssign for PolyMatrixNorm {
             .unwrap_or_else(|| BigDecimal::from_f64(0.0).unwrap());
         let scale = self.ncol_sqrt.clone() - zero_rows_bd;
         self.poly_norm = (self.poly_norm.clone() * rhs.poly_norm) * scale;
-        self.nrow = self.nrow;
         self.ncol = rhs.ncol;
         self.ncol_sqrt = rhs.ncol_sqrt;
         self.zero_rows = None;

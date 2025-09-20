@@ -179,7 +179,7 @@ where
     let items: Vec<_> = plt.f.iter().collect();
     info!("start collecting preimages {}", id);
     let preimages = items
-        .par_chunks(8)
+        .par_chunks(4)
         .flat_map(|batch| {
             batch
                 .iter()

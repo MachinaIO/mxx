@@ -6,7 +6,9 @@ use crate::{
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
+use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::Instant,
@@ -28,6 +30,93 @@ pub struct BatchLookupBuffer {
     pub bytes_per_matrix: usize,
     pub indices: Vec<usize>,
     pub id_prefix: String,
+}
+
+impl BatchLookupBuffer {
+    /// Return the raw matrix payload (no inner header/indices).
+    /// Layout of `data` produced by `get_lookup_buffer`:
+    ///   [ u64 num_matrices | u64 bytes_per_matrix | u64[idx]*num_matrices | payload ]
+    /// We expose only `payload`, whose length is `num_matrices * bytes_per_matrix`.
+    pub fn payload(&self) -> &[u8] {
+        let header_size = 16 + 8 * self.num_matrices;
+        let payload_len = self.num_matrices * self.bytes_per_matrix;
+        &self.data[header_size..header_size + payload_len]
+    }
+
+    /// Split this buffer into multiple smaller buffers that fit within the given size limit.
+    /// Each split buffer will have a suffix added to its id_prefix to distinguish them.
+    pub fn split_by_size(&self, size_limit: usize) -> Vec<BatchLookupBuffer> {
+        if self.data.len() <= size_limit {
+            return vec![self.clone()];
+        }
+        let mut result = Vec::new();
+        let header_size = 16 + 8 * self.num_matrices;
+        let available_data_size = size_limit.saturating_sub(header_size);
+
+        if available_data_size == 0 {
+            return vec![self.clone()];
+        }
+        let matrices_per_chunk = available_data_size / self.bytes_per_matrix;
+        if matrices_per_chunk == 0 {
+            return vec![self.clone()];
+        }
+
+        let total_matrices = self.num_matrices;
+        let num_chunks = total_matrices.div_ceil(matrices_per_chunk);
+
+        for chunk_idx in 0..num_chunks {
+            let start_matrix = chunk_idx * matrices_per_chunk;
+            let end_matrix = ((chunk_idx + 1) * matrices_per_chunk).min(total_matrices);
+            let chunk_size = end_matrix - start_matrix;
+            let chunk_indices = self.indices[start_matrix..end_matrix].to_vec();
+            let chunk_header_size = 16 + 8 * chunk_size;
+            let chunk_data_size = chunk_size * self.bytes_per_matrix;
+            let mut chunk_data = vec![0u8; chunk_header_size + chunk_data_size];
+
+            // Write header
+            chunk_data[0..8].copy_from_slice(&(chunk_size as u64).to_le_bytes());
+            chunk_data[8..16].copy_from_slice(&(self.bytes_per_matrix as u64).to_le_bytes());
+            for (i, &idx) in chunk_indices.iter().enumerate() {
+                let offset = 16 + i * 8;
+                chunk_data[offset..offset + 8].copy_from_slice(&(idx as u64).to_le_bytes());
+            }
+
+            // matrix data
+            let original_data_start = 16 + 8 * self.num_matrices;
+            let chunk_data_start = chunk_header_size;
+            for i in 0..chunk_size {
+                let src_offset = original_data_start + (start_matrix + i) * self.bytes_per_matrix;
+                let dst_offset = chunk_data_start + i * self.bytes_per_matrix;
+                chunk_data[dst_offset..dst_offset + self.bytes_per_matrix]
+                    .copy_from_slice(&self.data[src_offset..src_offset + self.bytes_per_matrix]);
+            }
+
+            let id_suffix =
+                if num_chunks > 1 { format!("_part{}", chunk_idx) } else { String::new() };
+
+            result.push(BatchLookupBuffer {
+                data: chunk_data,
+                num_matrices: chunk_size,
+                bytes_per_matrix: self.bytes_per_matrix,
+                indices: chunk_indices,
+                id_prefix: format!("{}{}", self.id_prefix, id_suffix),
+            });
+        }
+
+        result
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableIndexEntry {
+    pub file_index: usize,
+    pub file_offset: u64,
+    pub num_matrices: usize,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct GlobalTableIndex {
+    pub entries: HashMap<String, TableIndexEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,60 +146,6 @@ pub fn init_storage_system() {
         MultiBatchLookupBuffer::new()
     };
     LOOKUP_BUFFERS.set(Arc::new(Mutex::new(buffer))).expect("Storage system already initialized");
-}
-
-/// Wait for all pending writes to complete and write batched lookup tables
-pub async fn wait_for_all_writes(
-    dir_path: PathBuf,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let bytes_limit = std::env::var("LUT_BYTES_LIMIT").ok().and_then(|s| s.parse::<usize>().ok());
-    info!("LUT_BYTES_LIMIT={:?}", bytes_limit);
-    if let Some(buffers) = LOOKUP_BUFFERS.get() {
-        let multi_buffer = {
-            let mut guard = buffers.lock().unwrap();
-            std::mem::take(&mut *guard)
-        };
-
-        if !multi_buffer.lookup_tables.is_empty() {
-            log_mem(format!("Writing {} batched lookup tables", multi_buffer.lookup_tables.len()));
-
-            if let Some(limit) = bytes_limit {
-                // Split into multiple files based on byte limit
-                let file_groups = split_buffers_by_limit(&multi_buffer, limit);
-                log_mem(format!(
-                    "Split into {} files with byte limit {}",
-                    file_groups.len(),
-                    limit
-                ));
-
-                for (i, group) in file_groups.into_iter().enumerate() {
-                    let filename = format!("lookup_tables_batch_{}.bin", i);
-                    if let Err(e) = group.write_to_file(dir_path.clone(), filename.clone()).await {
-                        eprintln!("Failed to write batched lookup tables {}: {}", filename, e);
-                    }
-                }
-            } else {
-                // Write as single file
-                let filename = "lookup_tables_combined.batch";
-                if let Err(e) = multi_buffer.write_to_file(dir_path, filename.to_string()).await {
-                    eprintln!("Failed to write batched lookup tables: {}", e);
-                }
-            }
-        }
-    }
-    let handles = WRITE_HANDLES.get().ok_or("Storage system not initialized")?;
-    let handles_vec: Vec<JoinHandle<()>> = {
-        let mut guard = handles.lock().unwrap();
-        std::mem::take(guard.as_mut())
-    };
-    log_mem(format!("Waiting for {} pending writes to complete", handles_vec.len()));
-    for handle in handles_vec {
-        if let Err(e) = handle.await {
-            eprintln!("Write task failed: {e}");
-        }
-    }
-    log_mem("All writes completed");
-    Ok(())
 }
 
 /// Split a MultiBatchLookupBuffer into multiple buffers based on byte limit.
@@ -198,34 +233,65 @@ impl MultiBatchLookupBuffer {
         }
     }
 
-    /// Serialize all batches into a single buffer.
+    /// Serialize all batches into a single buffer with an index for O(1) access.
     /// Format:
+    /// - 8 bytes: file format version (u64) - set to 2 for indexed format
     /// - 8 bytes: number of lookup tables (u64)
-    /// - For each lookup table:
+    /// - 8 bytes: index section size (u64) Index section (for each lookup table):
     ///   - 8 bytes: id_prefix length (u64)
     ///   - N bytes: id_prefix string
+    ///   - 8 bytes: file offset to table data (u64)
+    ///
+    ///     Data section (for each lookup table):
     ///   - 8 bytes: data length (u64)
     ///   - 8 bytes: num_matrices (u64)
     ///   - 8 bytes: bytes_per_matrix (u64)
     ///   - 8 bytes: indices length (u64)
     ///   - M*8 bytes: indices data
-    ///   - K bytes: matrix data
+    ///   - K bytes: matrix payload (no inner header)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut result = Vec::with_capacity(self.total_size + 8);
-        result.extend_from_slice(&(self.lookup_tables.len() as u64).to_le_bytes());
+        const FORMAT_VERSION: u64 = 2;
 
+        // index size: [u64 id_len | id_bytes | u64 file_offset] per table
+        let index_size: usize = self.lookup_tables.iter().map(|b| 8 + b.id_prefix.len() + 8).sum();
+        let header_size = 8 + 8 + 8;
+        let data_start = header_size + index_size;
+        let mut current_offset = data_start;
+        let mut offsets = Vec::with_capacity(self.lookup_tables.len());
         for batch in &self.lookup_tables {
+            offsets.push(current_offset);
+            let payload_len = batch.num_matrices * batch.bytes_per_matrix;
+            let table_size = 8 + 8 + 8 + 8 + batch.indices.len() * 8 + payload_len;
+            current_offset += table_size;
+        }
+
+        // allocate final buffer
+        let mut result = Vec::with_capacity(current_offset);
+
+        // header
+        result.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        result.extend_from_slice(&(self.lookup_tables.len() as u64).to_le_bytes());
+        result.extend_from_slice(&(index_size as u64).to_le_bytes());
+
+        // index
+        for (batch, &offset) in self.lookup_tables.iter().zip(offsets.iter()) {
             let id_bytes = batch.id_prefix.as_bytes();
             result.extend_from_slice(&(id_bytes.len() as u64).to_le_bytes());
             result.extend_from_slice(id_bytes);
-            result.extend_from_slice(&(batch.data.len() as u64).to_le_bytes());
+            result.extend_from_slice(&(offset as u64).to_le_bytes());
+        }
+
+        // data section (metadata + indices + payload)
+        for batch in &self.lookup_tables {
+            let payload = batch.payload();
+            result.extend_from_slice(&(payload.len() as u64).to_le_bytes());
             result.extend_from_slice(&(batch.num_matrices as u64).to_le_bytes());
             result.extend_from_slice(&(batch.bytes_per_matrix as u64).to_le_bytes());
             result.extend_from_slice(&(batch.indices.len() as u64).to_le_bytes());
             for &idx in &batch.indices {
                 result.extend_from_slice(&(idx as u64).to_le_bytes());
             }
-            result.extend_from_slice(&batch.data);
+            result.extend_from_slice(payload);
         }
 
         result
@@ -251,15 +317,33 @@ impl MultiBatchLookupBuffer {
 }
 
 /// Add a batch lookup buffer to the global collection.
-/// Returns true if the buffer was added successfully, false if it would exceed the limit.
+/// If the buffer exceeds the limit, it will be split into smaller chunks.
+/// Returns true if at least one buffer was added successfully.
 pub fn add_lookup_buffer(buffer: BatchLookupBuffer) -> bool {
     if let Some(buffers) = LOOKUP_BUFFERS.get() {
         let mut guard = buffers.lock().unwrap();
 
         // Check if adding this buffer would exceed the limit
         if guard.would_exceed_limit(buffer.data.len()) {
-            // Buffer would exceed limit - caller should handle this
-            false
+            if let Some(limit) = guard.bytes_limit {
+                let split_buffers = buffer.split_by_size(limit);
+                if split_buffers.len() > 1 {
+                    log_mem(format!(
+                        "Split oversized lookup buffer {} into {} parts",
+                        buffer.id_prefix,
+                        split_buffers.len()
+                    ));
+                }
+                let mut added_any = false;
+                for split_buffer in split_buffers {
+                    guard.add_batch(split_buffer);
+                    added_any = true;
+                }
+                added_any
+            } else {
+                guard.add_batch(buffer);
+                true
+            }
         } else {
             guard.add_batch(buffer);
             true
@@ -397,4 +481,117 @@ pub fn store_and_drop_poly<P: Poly>(poly: P, dir: &Path, id: &str) {
     poly.write_to_file(dir, id);
     drop(poly);
     log_mem(format!("Stored {id}"));
+}
+
+fn build_index_for_file(
+    multi_buffer: &MultiBatchLookupBuffer,
+    file_index: usize,
+) -> HashMap<String, TableIndexEntry> {
+    let mut entries = HashMap::new();
+
+    // header: [version | num_tables | index_size]
+    let header_size = 8 + 8 + 8;
+
+    // index size: [u64 id_len | id_bytes | u64 file_offset] per table
+    let index_size: usize =
+        multi_buffer.lookup_tables.iter().map(|b| 8 + b.id_prefix.len() + 8).sum();
+
+    // first data offset
+    let data_start = header_size + index_size;
+    let mut current_offset = data_start;
+
+    for batch in &multi_buffer.lookup_tables {
+        entries.insert(
+            batch.id_prefix.clone(),
+            TableIndexEntry {
+                file_index,
+                file_offset: current_offset as u64,
+                num_matrices: batch.num_matrices,
+            },
+        );
+
+        // table size uses payload length (no inner header)
+        let payload_len = batch.num_matrices * batch.bytes_per_matrix;
+        let table_size = 8 + 8 + 8 + 8 +           // metadata
+            batch.indices.len() * 8 + // indices
+            payload_len; // payload only
+        current_offset += table_size;
+    }
+
+    entries
+}
+
+/// Write the global index to a file.
+async fn write_global_index(index: &GlobalTableIndex, path: &Path) -> Result<(), std::io::Error> {
+    let json = serde_json::to_string_pretty(index)?;
+    tokio::fs::write(path, json.as_bytes()).await
+}
+
+/// Wait for all pending writes to complete and write batched lookup tables
+pub async fn wait_for_all_writes(
+    dir_path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let bytes_limit = std::env::var("LUT_BYTES_LIMIT").ok().and_then(|s| s.parse::<usize>().ok());
+    info!("LUT_BYTES_LIMIT={:?}", bytes_limit);
+    if let Some(buffers) = LOOKUP_BUFFERS.get() {
+        let multi_buffer = {
+            let mut guard = buffers.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
+
+        if !multi_buffer.lookup_tables.is_empty() {
+            log_mem(format!("Writing {} batched lookup tables", multi_buffer.lookup_tables.len()));
+
+            let mut global_index = GlobalTableIndex::default();
+
+            if let Some(limit) = bytes_limit {
+                // Split into multiple files based on byte limit
+                let file_groups = split_buffers_by_limit(&multi_buffer, limit);
+                log_mem(format!(
+                    "Split into {} files with byte limit {}",
+                    file_groups.len(),
+                    limit
+                ));
+
+                for (i, group) in file_groups.into_iter().enumerate() {
+                    // Build index entries for this file
+                    let file_index_entries = build_index_for_file(&group, i);
+                    for (id_prefix, entry) in file_index_entries {
+                        global_index.entries.insert(id_prefix, entry);
+                    }
+
+                    let filename = format!("lookup_tables_batch_{}.bin", i);
+                    if let Err(e) = group.write_to_file(dir_path.clone(), filename.clone()).await {
+                        eprintln!("Failed to write batched lookup tables {}: {}", filename, e);
+                    }
+                }
+            } else {
+                panic!("LUT_BYTES_LIMIT environment variable must be set");
+            }
+
+            // Write the global index
+            let index_path = dir_path.join("lookup_tables.index");
+            if let Err(e) = write_global_index(&global_index, &index_path).await {
+                eprintln!("Failed to write global index: {}", e);
+            } else {
+                log_mem(format!(
+                    "Global index written with {} entries",
+                    global_index.entries.len()
+                ));
+            }
+        }
+    }
+    let handles = WRITE_HANDLES.get().ok_or("Storage system not initialized")?;
+    let handles_vec: Vec<JoinHandle<()>> = {
+        let mut guard = handles.lock().unwrap();
+        std::mem::take(guard.as_mut())
+    };
+    log_mem(format!("Waiting for {} pending writes to complete", handles_vec.len()));
+    for handle in handles_vec {
+        if let Err(e) = handle.await {
+            eprintln!("Write task failed: {e}");
+        }
+    }
+    log_mem("All writes completed");
+    Ok(())
 }

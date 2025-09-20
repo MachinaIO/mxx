@@ -13,7 +13,7 @@ use crate::{
 };
 use rayon::prelude::*;
 use std::{marker::PhantomData, path::PathBuf, sync::Arc};
-use tracing::debug;
+use tracing::{debug, info};
 
 #[derive(Debug)]
 pub struct LweBggPubKeyEvaluator<M, SH, ST>
@@ -191,6 +191,7 @@ where
     let row_size = pub_matrix.row_size();
     let gadget = M::gadget_matrix(params, row_size);
     let items: Vec<_> = plt.f.iter().collect();
+    info!("start collecting preimages {}", id);
     let preimages = items
         .par_chunks(8)
         .flat_map(|batch| {
@@ -213,6 +214,7 @@ where
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    info!("finish collecting preimages {}", id);
     get_lookup_buffer(preimages, &format!("L_{id}"))
 }
 

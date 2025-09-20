@@ -325,7 +325,7 @@ where
         encoded[offset..offset + matrix_bytes.len()].copy_from_slice(&matrix_bytes);
     }
     let elapsed = start.elapsed();
-    debug_mem(format!(
+    log_mem(format!(
         "Serialized {} matrices for {} ({} bytes, {} bytes per matrix) in {elapsed:?}",
         num_matrices, id_prefix, total_size, max_bytes_per_matrix
     ));

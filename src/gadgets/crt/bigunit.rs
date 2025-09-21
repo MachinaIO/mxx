@@ -666,7 +666,7 @@ pub fn u64_vec_to_biguint_poly<P: Poly>(
     for (idx, &v0) in inputs.iter().enumerate() {
         let mut v = v0;
         for limb_idx in 0..total_limbs {
-            let digit = (v % base) as u64;
+            let digit = v % base;
             limb_slots[limb_idx][idx] = BigUint::from(digit);
             v /= base;
         }

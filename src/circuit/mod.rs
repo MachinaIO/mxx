@@ -910,7 +910,7 @@ mod tests {
         let result = circuit.eval(
             &params,
             &DCRTPoly::const_one(&params),
-            &[poly1.clone()],
+            std::slice::from_ref(&poly1),
             None::<PolyPltEvaluator>,
         );
         let expected = DCRTPoly::const_one(&params) - poly1.clone();

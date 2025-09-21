@@ -15,7 +15,6 @@ use mxx::{
 use num_bigint::BigUint;
 use std::sync::Arc;
 use tempfile::tempdir;
-use tokio;
 use tracing::info;
 
 fn init_tracing() {

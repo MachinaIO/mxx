@@ -24,6 +24,10 @@ impl<P: Poly> PublicLut<P> {
         self.f.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.f.is_empty()
+    }
+
     pub fn get(&self, _: &P::Params, x: &P) -> Option<(usize, P)> {
         self.f.get(x).cloned()
     }

@@ -344,7 +344,7 @@ mod tests {
         for i in 0..d {
             let mut v = if i < a_vals.len() { a_vals[i] % ctx.n } else { 0 };
             for j in 0..NUM_LIMBS {
-                expected_limbs[j][i] = BigUint::from((v % base) as u64);
+                expected_limbs[j][i] = BigUint::from(v % base);
                 v /= base;
             }
         }
@@ -445,7 +445,7 @@ mod tests {
         for i in 0..d {
             let mut v = if i < test_values.len() { test_values[i] % ctx.n } else { 0 };
             for j in 0..NUM_LIMBS {
-                expected_limbs[j][i] = BigUint::from((v % base) as u64);
+                expected_limbs[j][i] = BigUint::from(v % base);
                 v /= base;
             }
         }
@@ -520,7 +520,7 @@ mod tests {
         for i in 0..d {
             let mut v = if i < sums.len() { sums[i] } else { 0 };
             for j in 0..NUM_LIMBS {
-                expected_limbs[j][i] = BigUint::from((v % base) as u64);
+                expected_limbs[j][i] = BigUint::from(v % base);
                 v /= base;
             }
         }
@@ -593,7 +593,7 @@ mod tests {
         for i in 0..d {
             let mut v = if i < diffs.len() { diffs[i] } else { 0 };
             for j in 0..NUM_LIMBS {
-                expected_limbs[j][i] = BigUint::from((v % base) as u64);
+                expected_limbs[j][i] = BigUint::from(v % base);
                 v /= base;
             }
         }
@@ -665,7 +665,7 @@ mod tests {
         for i in 0..d {
             let mut v = if i < diffs.len() { diffs[i] } else { 0 };
             for j in 0..NUM_LIMBS {
-                expected_limbs[j][i] = BigUint::from((v % base) as u64);
+                expected_limbs[j][i] = BigUint::from(v % base);
                 v /= base;
             }
         }
@@ -736,7 +736,7 @@ mod tests {
         for i in 0..d {
             let mut v = if i < prods.len() { prods[i] } else { 0 };
             for j in 0..NUM_LIMBS {
-                expected_limbs[j][i] = BigUint::from((v % base) as u64);
+                expected_limbs[j][i] = BigUint::from(v % base);
                 v /= base;
             }
         }
@@ -806,7 +806,7 @@ mod tests {
         for i in 0..d {
             let mut v = if i < prods.len() { prods[i] } else { 0 };
             for j in 0..NUM_LIMBS {
-                expected_limbs[j][i] = BigUint::from((v % base) as u64);
+                expected_limbs[j][i] = BigUint::from(v % base);
                 v /= base;
             }
         }
@@ -876,7 +876,7 @@ mod tests {
         for i in 0..d {
             let mut v = if i < prods.len() { prods[i] } else { 0 };
             for j in 0..NUM_LIMBS {
-                expected_limbs[j][i] = BigUint::from((v % base) as u64);
+                expected_limbs[j][i] = BigUint::from(v % base);
                 v /= base;
             }
         }

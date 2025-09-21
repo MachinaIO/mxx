@@ -301,7 +301,7 @@ mod test {
         let result_pubkey = circuit.eval(
             &params,
             &enc_one.pubkey,
-            &[enc1.pubkey.clone()],
+            std::slice::from_ref(&enc1.pubkey),
             Some(plt_pubkey_evaluator),
         );
         wait_for_all_writes().await.unwrap();
@@ -315,8 +315,12 @@ mod test {
         >::new(key, dir_path.into(), c_b);
 
         // Evaluate the circuit
-        let result_encoding =
-            circuit.eval(&params, &enc_one.clone(), &[enc1.clone()], Some(plt_encoding_evaluator));
+        let result_encoding = circuit.eval(
+            &params,
+            &enc_one.clone(),
+            std::slice::from_ref(&enc1),
+            Some(plt_encoding_evaluator),
+        );
         assert_eq!(result_encoding.len(), 1);
         let result_encoding = &result_encoding[0];
         assert_eq!(result_encoding.pubkey, result_pubkey.clone());

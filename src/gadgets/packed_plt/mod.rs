@@ -114,7 +114,7 @@ mod tests {
             let value = BigUint::from(row_idx % 2);
             hashmap.insert(key, (row_idx, value));
         }
-        let slots = (0..ring_n).map(|i| BigUint::from(i)).collect::<Vec<_>>();
+        let slots = (0..ring_n).map(BigUint::from).collect::<Vec<_>>();
         let input_poly = DCRTPoly::from_biguints_eval_single_mod(&params, crt_idx, &slots);
         let gadget = PackedPlt::setup(&mut circuit, &params, crt_idx, ring_n, hashmap);
         let inputs = circuit.input(1);
@@ -151,7 +151,7 @@ mod tests {
             let value = BigUint::from(row_idx % 2);
             hashmap.insert(key, (row_idx, value));
         }
-        let slots = (0..ring_n).map(|i| BigUint::from(i)).collect::<Vec<_>>();
+        let slots = (0..ring_n).map(BigUint::from).collect::<Vec<_>>();
         let input_poly = DCRTPoly::from_biguints_eval_single_mod(&params, crt_idx, &slots);
         let gadget = PackedPlt::setup(&mut circuit, &params, crt_idx, ring_n, hashmap);
         let inputs = circuit.input(1);
@@ -159,7 +159,7 @@ mod tests {
         let q_over_qi = params.modulus().as_ref() / BigUint::from(qi);
         // let q_over_qi_poly = DCRTPoly::from_biguint_to_constant(params, q_over_qi.clone());
         let out = gadget.lookup_all(&mut circuit, inputs[0]);
-        let scaled_out = circuit.large_scalar_mul(out, &[q_over_qi.clone()]);
+        let scaled_out = circuit.large_scalar_mul(out, std::slice::from_ref(&q_over_qi));
         circuit.output(vec![scaled_out]);
 
         // Evaluate

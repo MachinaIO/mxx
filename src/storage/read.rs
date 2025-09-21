@@ -25,24 +25,26 @@ where
 {
     let start = Instant::now();
     let index_path = dir.join("lookup_tables.index");
-    if let Ok(index_data) = read_to_string(&index_path)
-        && let Ok(global_index) = serde_json::from_str::<GlobalTableIndex>(&index_data)
-            && let Some(entry) = global_index.entries.get(id_prefix) {
-                let filename = format!("lookup_tables_batch_{}.bin", entry.file_index);
-                let path = dir.join(&filename);
-                if let Ok(mut file) = File::open(&path)
-                    && let Some(matrix) = read_matrix_from_indexed_file_with_hint(
-                        &mut file,
-                        params,
-                        id_prefix,
-                        target_k,
-                        &filename,
-                        start,
-                        Some(entry.file_offset),
-                    ) {
-                        return Some(matrix);
-                    }
-            }
+    if let Ok(index_data) = read_to_string(&index_path) &&
+        let Ok(global_index) = serde_json::from_str::<GlobalTableIndex>(&index_data) &&
+        let Some(entry) = global_index.entries.get(id_prefix)
+    {
+        let filename = format!("lookup_tables_batch_{}.bin", entry.file_index);
+        let path = dir.join(&filename);
+        if let Ok(mut file) = File::open(&path) &&
+            let Some(matrix) = read_matrix_from_indexed_file_with_hint(
+                &mut file,
+                params,
+                id_prefix,
+                target_k,
+                &filename,
+                start,
+                Some(entry.file_offset),
+            )
+        {
+            return Some(matrix);
+        }
+    }
     None
 }
 
@@ -60,49 +62,49 @@ fn read_matrix_from_indexed_file_with_hint<M>(
 where
     M: PolyMatrix,
 {
-    if let Some(offset) = offset_hint
-        && file.seek(SeekFrom::Start(offset)).is_ok() {
-            // Read table metadata: [u64 data_len | u64 num_matrices | u64 bytes_per_matrix | u64
-            // indices_len]
-            let mut header = [0u8; 32];
-            if file.read_exact(&mut header).is_ok() {
-                let _data_len = u64::from_le_bytes(header[0..8].try_into().unwrap()) as usize;
-                let _num_matrices = u64::from_le_bytes(header[8..16].try_into().unwrap()) as usize;
-                let bytes_per_matrix =
-                    u64::from_le_bytes(header[16..24].try_into().unwrap()) as usize;
-                let indices_len = u64::from_le_bytes(header[24..32].try_into().unwrap()) as usize;
+    if let Some(offset) = offset_hint &&
+        file.seek(SeekFrom::Start(offset)).is_ok()
+    {
+        // Read table metadata: [u64 data_len | u64 num_matrices | u64 bytes_per_matrix | u64
+        // indices_len]
+        let mut header = [0u8; 32];
+        if file.read_exact(&mut header).is_ok() {
+            let _data_len = u64::from_le_bytes(header[0..8].try_into().unwrap()) as usize;
+            let _num_matrices = u64::from_le_bytes(header[8..16].try_into().unwrap()) as usize;
+            let bytes_per_matrix = u64::from_le_bytes(header[16..24].try_into().unwrap()) as usize;
+            let indices_len = u64::from_le_bytes(header[24..32].try_into().unwrap()) as usize;
 
-                // Read indices (u64 * indices_len)
-                let mut indices_data = vec![0u8; indices_len * 8];
-                if file.read_exact(&mut indices_data).is_ok() {
-                    // Find target_k position
-                    for i in 0..indices_len {
-                        let idx = u64::from_le_bytes(
-                            indices_data[i * 8..(i + 1) * 8].try_into().unwrap(),
-                        ) as usize;
-                        if idx == target_k {
-                            // Seek to the matrix payload position and read exactly bytes_per_matrix
-                            let matrix_offset = i * bytes_per_matrix;
-                            if file.seek(SeekFrom::Current(matrix_offset as i64)).is_ok() {
-                                let mut matrix_data = vec![0u8; bytes_per_matrix];
-                                if file.read_exact(&mut matrix_data).is_ok() {
-                                    let matrix = M::from_compact_bytes(params, &matrix_data);
-                                    log_mem(format!(
-                                        "Found matrix {} with id_prefix {} in {} (using index hint) in {:?}",
-                                        target_k,
-                                        id_prefix,
-                                        filename,
-                                        start.elapsed()
-                                    ));
-                                    return Some(matrix);
-                                }
+            // Read indices (u64 * indices_len)
+            let mut indices_data = vec![0u8; indices_len * 8];
+            if file.read_exact(&mut indices_data).is_ok() {
+                // Find target_k position
+                for i in 0..indices_len {
+                    let idx =
+                        u64::from_le_bytes(indices_data[i * 8..(i + 1) * 8].try_into().unwrap())
+                            as usize;
+                    if idx == target_k {
+                        // Seek to the matrix payload position and read exactly bytes_per_matrix
+                        let matrix_offset = i * bytes_per_matrix;
+                        if file.seek(SeekFrom::Current(matrix_offset as i64)).is_ok() {
+                            let mut matrix_data = vec![0u8; bytes_per_matrix];
+                            if file.read_exact(&mut matrix_data).is_ok() {
+                                let matrix = M::from_compact_bytes(params, &matrix_data);
+                                log_mem(format!(
+                                    "Found matrix {} with id_prefix {} in {} (using index hint) in {:?}",
+                                    target_k,
+                                    id_prefix,
+                                    filename,
+                                    start.elapsed()
+                                ));
+                                return Some(matrix);
                             }
-                            return None;
                         }
+                        return None;
                     }
                 }
             }
         }
+    }
 
     // Fallback to full indexed read if hint path fails
     file.rewind().ok()?;

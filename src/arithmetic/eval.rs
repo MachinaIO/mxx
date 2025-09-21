@@ -139,3 +139,50 @@ impl<P: Poly> ArithmeticCircuit<P> {
         bgg_pubkey_sampler.sample(params, TAG_BGG_PUBKEY, &reveal_plaintexts)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly};
+    use num_bigint::BigUint;
+    use num_traits::One;
+
+    #[test]
+    fn test_benchmark_multiplication_tree_evaluation() {
+        let params = DCRTPolyParams::default();
+        let ring_degree = params.ring_dimension() as usize;
+        let height = 4;
+        let limb_bit_size = 3usize;
+        let circuit = ArithmeticCircuit::<DCRTPoly>::benchmark_multiplication_tree(
+            &params,
+            limb_bit_size,
+            ring_degree,
+            true,
+            true,
+            height,
+        );
+
+        let ring_n = params.ring_dimension() as usize;
+        let num_inputs = 1usize << height;
+        let inputs: Vec<Vec<BigUint>> = (0..num_inputs)
+            .map(|i| {
+                (0..ring_n).map(|slot| BigUint::from(((i + slot + 1) % 13 + 1) as u64)).collect()
+            })
+            .collect();
+
+        let modulus = params.modulus();
+        let modulus_ref = modulus.as_ref();
+        let expected_slots = (0..ring_n)
+            .map(|slot| {
+                inputs.iter().fold(BigUint::one(), |acc, input| (acc * &input[slot]) % modulus_ref)
+            })
+            .collect::<Vec<_>>();
+        let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_slots);
+
+        let input_refs = inputs.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let result = circuit.evaluate_with_poly(&params, &input_refs);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], expected_poly);
+    }
+}

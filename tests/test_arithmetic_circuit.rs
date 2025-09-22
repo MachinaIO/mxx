@@ -19,7 +19,6 @@ use tokio;
 use tracing::info;
 
 fn init_tracing() {
-    // Install a global tracing subscriber once; ignore if already set by another test.
     let _ = tracing_subscriber::fmt::try_init();
 }
 
@@ -95,6 +94,9 @@ trapdoor_sampler.clone()).await;
     let secrets = uniform_sampler.sample_uniform(&params, 1, d, DistType::BitDist).get_row(0);
     let s = DCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
     let p = s.clone() * pub_matrix.as_ref();
+    // Wait for batch matrices to be written before encoding evaluation
+    mxx::storage::write::wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
+
     info!("start evaluate_with_bgg_encoding");
     let mixed_encoding_result = mixed_circuit.evaluate_with_bgg_encoding::<
         DCRTPolyMatrix,
@@ -190,6 +192,9 @@ trapdoor_sampler.clone()).await;
     let secrets = uniform_sampler.sample_uniform(&params, 1, d, DistType::BitDist).get_row(0);
     let s = DCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
     let p = s.clone() * pub_matrix.as_ref();
+    // Wait for batch matrices to be written before encoding evaluation
+    mxx::storage::write::wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
+
     info!("Non-CRT: start evaluate_with_bgg_encoding");
     let mixed_encoding_result = mixed_circuit.evaluate_with_bgg_encoding::<
         DCRTPolyMatrix,

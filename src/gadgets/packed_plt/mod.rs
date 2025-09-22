@@ -5,6 +5,7 @@ use crate::{
     poly::{Poly, PolyParams},
 };
 use num_bigint::BigUint;
+use num_traits::One;
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,14 +48,18 @@ impl<P: Poly> PackedPlt<P> {
             let lag_basis = P::from_biguints_eval(params, &slots);
             mul_scalars[j] = lag_basis.coeffs().iter().map(|c| c.value() * &q_over_qi).collect();
 
+            let mut slots = vec![BigUint::ZERO; ring_n];
+            slots[j] = BigUint::one();
+            let input_base_poly = P::from_biguints_eval(params, &slots);
+            let value_base_poly = P::from_biguints_eval_single_mod(params, crt_idx, &slots);
+
             let mut lut_map: HashMap<P, (usize, P)> = HashMap::with_capacity(hashmap.len());
             for (input, (k, output)) in hashmap.iter() {
-                let mut slots = vec![BigUint::ZERO; ring_n];
                 slots[j] = input.clone() * &q_over_qi;
-                let key_poly = P::from_biguints_eval(params, &slots);
-                slots = vec![BigUint::ZERO; ring_n];
-                slots[j] = output.clone();
-                let value_poly = P::from_biguints_eval_single_mod(params, crt_idx, &slots);
+                let key_poly =
+                    P::from_biguint_to_constant(&params, input * &q_over_qi) * &input_base_poly;
+                let value_poly =
+                    P::from_biguint_to_constant(&params, output.clone()) * &value_base_poly;
                 lut_map.insert(key_poly, (*k, value_poly));
             }
             let plt = PublicLut::<P>::new(lut_map);

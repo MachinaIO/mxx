@@ -162,4 +162,44 @@ impl<P: Poly> ArithmeticCircuit<P> {
             self.poly_circuit.output(gates);
         };
     }
+
+    pub fn benchmark_multiplication_tree(
+        params: &<P as Poly>::Params,
+        limb_bit_size: usize,
+        max_degree: usize,
+        use_packing: bool,
+        use_reconstruction: bool,
+        height: usize,
+    ) -> Self {
+        assert!(height >= 1, "height must be at least 1 to build a multiplication tree");
+        let num_inputs =
+            1usize.checked_shl(height as u32).expect("height is too large to represent 2^h inputs");
+
+        let mut circuit = Self::setup(
+            params,
+            limb_bit_size,
+            max_degree,
+            num_inputs,
+            use_packing,
+            use_reconstruction,
+        );
+
+        // Collect the leaf identifiers representing the primary inputs.
+        let mut current_layer: Vec<ArithGateId> = (0..num_inputs).map(ArithGateId::from).collect();
+
+        // Repeatedly pairwise multiply adjacent nodes until a single root remains.
+        while current_layer.len() > 1 {
+            debug_assert!(current_layer.len().is_multiple_of(2), "layer size must stay even");
+            let mut next_layer = Vec::with_capacity(current_layer.len() / 2);
+            for pair in current_layer.chunks(2) {
+                let parent = circuit.mul(pair[0], pair[1]);
+                next_layer.push(parent);
+            }
+            current_layer = next_layer;
+        }
+
+        let root = current_layer.pop().expect("multiplication tree must contain at least one node");
+        circuit.output(root);
+        circuit
+    }
 }

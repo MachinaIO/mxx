@@ -7,7 +7,7 @@ use crate::{
         montgomery::{MontgomeryContext, MontgomeryPoly, u64_vec_to_montgomery_poly},
     },
     poly::{Poly, PolyParams},
-    utils::{log_mem, mod_inverse},
+    utils::{debug_mem, mod_inverse},
 };
 use itertools::Itertools;
 use num_bigint::BigUint;
@@ -108,7 +108,7 @@ impl<P: Poly> CrtPoly<P> {
             let mont_poly = MontgomeryPoly::new(ctx.mont_ctxes[i].clone(), biguint_poly);
             slots.push(mont_poly);
         }
-        log_mem(format!("num gates {:?} at input_packed", circuit.count_gates_by_type_vec()));
+        debug_mem(format!("num gates {:?} at input_packed", circuit.count_gates_by_type_vec()));
         Self { ctx, slots }
     }
 
@@ -137,21 +137,21 @@ impl<P: Poly> CrtPoly<P> {
     pub fn add(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
         let new_slots =
             self.slots.iter().zip(other.slots.iter()).map(|(a, b)| a.add(b, circuit)).collect();
-        log_mem(format!("num gates {:?} at CRTPoly::add", circuit.count_gates_by_type_vec()));
+        debug_mem(format!("num gates {:?} at CRTPoly::add", circuit.count_gates_by_type_vec()));
         Self::new(self.ctx.clone(), new_slots)
     }
 
     pub fn sub(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
         let new_slots =
             self.slots.iter().zip(other.slots.iter()).map(|(a, b)| a.sub(b, circuit)).collect();
-        log_mem(format!("num gates {:?} at CRTPoly::sub", circuit.count_gates_by_type_vec()));
+        debug_mem(format!("num gates {:?} at CRTPoly::sub", circuit.count_gates_by_type_vec()));
         Self::new(self.ctx.clone(), new_slots)
     }
 
     pub fn mul(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
         let new_slots =
             self.slots.iter().zip(other.slots.iter()).map(|(a, b)| a.mul(b, circuit)).collect();
-        log_mem(format!("num gates {:?} at CRTPoly::mul", circuit.count_gates_by_type_vec()));
+        debug_mem(format!("num gates {:?} at CRTPoly::mul", circuit.count_gates_by_type_vec()));
         Self::new(self.ctx.clone(), new_slots)
     }
 

@@ -4,7 +4,7 @@ pub mod gate;
 pub mod serde;
 
 pub use evaluable::*;
-pub use gate::{PolyGate, PolyGateType};
+pub use gate::{PolyGate, PolyGateKind, PolyGateType};
 
 use dashmap::DashMap;
 use num_bigint::BigUint;
@@ -28,6 +28,7 @@ pub struct PolyCircuit<P: Poly> {
     sub_circuits: BTreeMap<usize, PolyCircuit<P>>,
     output_ids: Vec<GateId>,
     num_input: usize,
+    gate_counts: HashMap<PolyGateKind, usize>,
     pub lookups: HashMap<usize, Arc<PublicLut<P>>>,
 }
 
@@ -37,6 +38,7 @@ impl<P: Poly> PartialEq for PolyCircuit<P> {
             self.print_value == other.print_value &&
             self.sub_circuits == other.sub_circuits &&
             self.output_ids == other.output_ids &&
+            self.gate_counts == other.gate_counts &&
             self.num_input == other.num_input
     }
 }
@@ -48,12 +50,15 @@ impl<P: Poly> PolyCircuit<P> {
         let mut gates = BTreeMap::new();
         // Ensure the reserved constant-one gate exists at GateId(0)
         gates.insert(GateId(0), PolyGate::new(GateId(0), PolyGateType::Input, vec![]));
+        let mut gate_counts = HashMap::new();
+        gate_counts.insert(PolyGateKind::Input, 1);
         Self {
             gates,
             print_value: BTreeMap::new(),
             sub_circuits: BTreeMap::new(),
             output_ids: vec![],
             num_input: 0,
+            gate_counts,
             lookups: HashMap::new(),
         }
     }
@@ -73,15 +78,15 @@ impl<P: Poly> PolyCircuit<P> {
         self.gates.len()
     }
 
-    pub fn count_gates_by_type_vec(&self) -> HashMap<PolyGateType, usize> {
+    pub fn count_gates_by_type_vec(&self) -> HashMap<PolyGateKind, usize> {
         let mut counts = HashMap::new();
         self.count_helper(&mut counts);
         counts
     }
 
-    fn count_helper(&self, counts: &mut HashMap<PolyGateType, usize>) {
-        for gate in self.gates.values() {
-            *counts.entry(gate.gate_type.clone()).or_insert(0) += 1;
+    fn count_helper(&self, counts: &mut HashMap<PolyGateKind, usize>) {
+        for (&kind, &count) in &self.gate_counts {
+            *counts.entry(kind).or_insert(0) += count;
         }
         for sub in self.sub_circuits.values() {
             sub.count_helper(counts);
@@ -97,6 +102,7 @@ impl<P: Poly> PolyCircuit<P> {
         for _ in 0..num_input {
             let next_id = self.gates.len();
             let gid = GateId(next_id);
+            self.increment_gate_kind(PolyGateKind::Input);
             self.gates.insert(gid, PolyGate::new(gid, PolyGateType::Input, vec![]));
             input_gates.push(gid);
         }
@@ -220,8 +226,14 @@ impl<P: Poly> PolyCircuit<P> {
             }
         }
         let gate_id = self.gates.len();
+        let gate_kind = gate_type.kind();
+        self.increment_gate_kind(gate_kind);
         self.gates.insert(GateId(gate_id), PolyGate::new(GateId(gate_id), gate_type, inputs));
         GateId(gate_id)
+    }
+
+    fn increment_gate_kind(&mut self, kind: PolyGateKind) {
+        *self.gate_counts.entry(kind).or_insert(0) += 1;
     }
 
     /// Computes a topological order (as a vector of gate IDs) for all gates that

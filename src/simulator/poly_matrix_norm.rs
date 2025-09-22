@@ -35,12 +35,7 @@ impl PolyMatrixNorm {
         Self::new(ctx, nrow, ncol, 1.0, None)
     }
 
-    pub fn sample_gauss(
-        ctx: Arc<SimulatorContext>,
-        nrow: usize,
-        ncol: usize,
-        sigma: f64,
-    ) -> Self {
+    pub fn sample_gauss(ctx: Arc<SimulatorContext>, nrow: usize, ncol: usize, sigma: f64) -> Self {
         PolyMatrixNorm {
             nrow,
             ncol,

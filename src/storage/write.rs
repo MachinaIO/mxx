@@ -566,7 +566,16 @@ pub async fn wait_for_all_writes(
                     }
                 }
             } else {
-                panic!("LUT_BYTES_LIMIT environment variable must be set");
+                log_mem("No LUT_BYTES_LIMIT set - writing all buffers to single file");
+                let file_index_entries = build_index_for_file(&multi_buffer, 0);
+                for (id_prefix, entry) in file_index_entries {
+                    global_index.entries.insert(id_prefix, entry);
+                }
+                let filename = "lookup_tables_batch_0.bin".to_string();
+                if let Err(e) = multi_buffer.write_to_file(dir_path.clone(), filename.clone()).await
+                {
+                    eprintln!("Failed to write batched lookup tables {}: {}", filename, e);
+                }
             }
 
             // Write the global index

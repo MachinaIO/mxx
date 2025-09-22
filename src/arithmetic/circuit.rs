@@ -168,21 +168,14 @@ impl<P: Poly> ArithmeticCircuit<P> {
         limb_bit_size: usize,
         max_degree: usize,
         use_packing: bool,
-        use_reconstruction: bool,
         height: usize,
     ) -> Self {
         assert!(height >= 1, "height must be at least 1 to build a multiplication tree");
         let num_inputs =
             1usize.checked_shl(height as u32).expect("height is too large to represent 2^h inputs");
 
-        let mut circuit = Self::setup(
-            params,
-            limb_bit_size,
-            max_degree,
-            num_inputs,
-            use_packing,
-            use_reconstruction,
-        );
+        let mut circuit =
+            Self::setup(params, limb_bit_size, max_degree, num_inputs, use_packing, true);
 
         // Collect the leaf identifiers representing the primary inputs.
         let mut current_layer: Vec<ArithGateId> = (0..num_inputs).map(ArithGateId::from).collect();

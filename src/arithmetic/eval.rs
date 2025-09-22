@@ -158,7 +158,6 @@ mod tests {
             limb_bit_size,
             ring_degree,
             true,
-            true,
             height,
         );
 

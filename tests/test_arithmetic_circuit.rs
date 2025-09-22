@@ -25,7 +25,7 @@ fn init_tracing() {
 async fn test_arithmetic_circuit_operations() {
     // Test mixed operations in single circuit: (a + b) * c - a.
     init_tracing();
-    let params = DCRTPolyParams::new(4, 2, 15, 17);
+    let params = DCRTPolyParams::new(4, 2, 15, 13);
     let (_, crt_bits, _) = params.to_crt();
     info!("crt_bits={}", crt_bits);
     let n = 1;
@@ -118,7 +118,7 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
 
     // this is curated to be have same CRT bit as test_arithmetic_circuit_operations
     // (crt_depth*crt_bit)
-    let params = DCRTPolyParams::new(4, 1, 30, 17);
+    let params = DCRTPolyParams::new(4, 1, 30, 13);
 
     let (moduli, _, crt_depth) = params.to_crt();
     assert_eq!(moduli.len(), 1, "Should have only one modulus for non-CRT");

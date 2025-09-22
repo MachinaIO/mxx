@@ -5,16 +5,15 @@ use crate::{
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
     sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler},
-    storage::{read_single_matrix_from_batch, store_and_drop_matrices},
+    storage::{
+        read::read_matrix_from_multi_batch,
+        write::{BatchLookupBuffer, add_lookup_buffer, get_lookup_buffer},
+    },
     utils::timed_read,
 };
 use rayon::prelude::*;
-use std::{
-    marker::PhantomData,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
-use tracing::info;
+use std::{marker::PhantomData, path::PathBuf, sync::Arc};
+use tracing::{debug, info};
 
 #[derive(Debug)]
 pub struct LweBggPubKeyEvaluator<M, SH, ST>
@@ -47,7 +46,7 @@ where
     ) -> BggPublicKey<M> {
         let row_size = input.matrix.row_size();
         let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, id);
-        preimage_all::<M, ST, _>(
+        let buffer = preimage_all::<M, ST, _>(
             plt,
             params,
             &self.trap_sampler,
@@ -56,8 +55,8 @@ where
             &input.matrix,
             &a_lt,
             &id,
-            &self.dir_path,
         );
+        add_lookup_buffer(buffer);
         BggPublicKey { matrix: a_lt, reveal_plaintext: true }
     }
 }
@@ -112,18 +111,18 @@ where
         id: GateId,
     ) -> BggEncoding<M> {
         let z = &input.plaintext.expect("the BGG encoding should revealed plaintext");
-        info!("public lookup length is {}", plt.len());
+        debug!("public lookup length is {}", plt.len());
         let (k, y_k) = plt
             .get(params, z)
             .unwrap_or_else(|| panic!("{:?} is not exist in public lookup f", z.to_const_int()));
-        info!("Performing public lookup, k={k}");
+        debug!("Performing public lookup, k={k}");
         let row_size = input.pubkey.matrix.row_size();
         let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, id);
         let pubkey = BggPublicKey::new(a_lt, true);
         let l_k = timed_read(
             &format!("L_{id}_{k}"),
             || {
-                read_single_matrix_from_batch::<M>(params, &self.dir_path, &format!("L_{id}"), k)
+                read_matrix_from_multi_batch::<M>(params, &self.dir_path, &format!("L_{id}"), k)
                     .unwrap_or_else(|| panic!("Matrix with index {} not found in batch", k))
             },
             &mut std::time::Duration::default(),
@@ -169,8 +168,8 @@ fn preimage_all<M, ST, P>(
     a_z: &M,
     a_lt: &M,
     id: &GateId,
-    dir_path: &Path,
-) where
+) -> BatchLookupBuffer
+where
     P: Poly,
     M: PolyMatrix<P = P> + Send + 'static,
     ST: PolyTrapdoorSampler<M = M> + Send + Sync,
@@ -178,8 +177,9 @@ fn preimage_all<M, ST, P>(
     let row_size = pub_matrix.row_size();
     let gadget = M::gadget_matrix(params, row_size);
     let items: Vec<_> = plt.f.iter().collect();
+    info!("start collecting preimages {}", id);
     let preimages = items
-        .par_chunks(8)
+        .par_chunks(4)
         .flat_map(|batch| {
             batch
                 .iter()
@@ -200,15 +200,13 @@ fn preimage_all<M, ST, P>(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    store_and_drop_matrices(preimages, dir_path, &format!("L_{id}"));
+    info!("finish collecting preimages {}", id);
+    get_lookup_buffer(preimages, &format!("L_{id}"))
 }
 
 #[cfg(test)]
 mod test {
-    use std::{collections::HashMap, fs, path::Path};
-
     use super::*;
-
     use crate::{
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         circuit::PolyCircuit,
@@ -219,10 +217,11 @@ mod test {
             hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
             uniform::DCRTPolyUniformSampler,
         },
-        storage::{init_storage_system, wait_for_all_writes},
+        storage::write::{init_storage_system, wait_for_all_writes},
         utils::create_bit_random_poly,
     };
     use keccak_asm::Keccak256;
+    use std::{collections::HashMap, fs, path::Path};
     use tokio;
 
     fn setup_lsb_constant_binary_plt(t_n: usize, params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {
@@ -241,10 +240,8 @@ mod test {
     #[tokio::test]
     async fn test_lwe_plt_eval() {
         init_storage_system();
-        // Create parameters for testing
+        tracing_subscriber::fmt::init();
         let params = DCRTPolyParams::default();
-
-        // Create a lookup table
         let plt = setup_lsb_constant_binary_plt(16, &params);
         // Create a simple circuit with the lookup table
         let mut circuit = PolyCircuit::new();
@@ -304,7 +301,7 @@ mod test {
             std::slice::from_ref(&enc1.pubkey),
             Some(plt_pubkey_evaluator),
         );
-        wait_for_all_writes().await.unwrap();
+        wait_for_all_writes(dir.to_path_buf()).await.unwrap();
         assert_eq!(result_pubkey.len(), 1);
         let result_pubkey = &result_pubkey[0];
 

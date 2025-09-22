@@ -15,7 +15,7 @@ use crate::{
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
     sampler::{PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
-    storage::{init_storage_system, wait_for_all_writes},
+    storage::write::{init_storage_system, wait_for_all_writes},
 };
 use num_bigint::BigUint;
 use std::{path::PathBuf, sync::Arc};
@@ -70,14 +70,15 @@ impl<P: Poly> ArithmeticCircuit<P> {
                 trapdoor_sampler,
                 pub_matrix.clone(),
                 trapdoor.clone(),
-                dir_path,
+                dir_path.clone(),
             ))
         } else {
             None
         };
-
         let outputs = self.poly_circuit.eval(params, &pubkeys[0], &pubkeys[1..], plt_evaluator);
-        wait_for_all_writes().await.unwrap();
+        info!("finished evaluation of pubkeys");
+        wait_for_all_writes(dir_path).await.unwrap();
+        info!("finished write files");
         outputs
     }
 
@@ -113,7 +114,6 @@ impl<P: Poly> ArithmeticCircuit<P> {
         let pubkeys = self.sample_input_pubkeys::<M, SH>(params, seed, secret.len());
         let encodings = bgg_encoding_sampler.sample(params, &pubkeys, &plaintexts);
         let bgg_evaluator = LweBggEncodingPltEvaluator::<M, SH>::new(seed, dir_path, p);
-
         self.poly_circuit.eval(params, &encodings[0], &encodings[1..], Some(bgg_evaluator))
     }
 

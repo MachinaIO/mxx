@@ -6,6 +6,7 @@ use crate::{
 };
 use num_bigint::BigUint;
 use num_traits::One;
+use rayon::prelude::*;
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,6 +16,12 @@ pub struct PackedPlt<P: Poly> {
     pub plt_ids: Vec<usize>, // len <= max_degree
     pub mul_scalars: Vec<Vec<BigUint>>, /* precomputed coeffs of (q/qi) * L_j(X) */
     _p: PhantomData<P>,
+}
+
+struct SlotSetup<P: Poly> {
+    slot_idx: usize,
+    scalars: Vec<BigUint>,
+    lut_map: HashMap<P, (usize, P)>,
 }
 
 impl<P: Poly> PackedPlt<P> {
@@ -38,33 +45,37 @@ impl<P: Poly> PackedPlt<P> {
         // let q_over_qis: Vec<BigUint> =
         //     moduli.iter().map(|&qi| &*big_q_arc / BigUint::from(qi)).collect();
 
+        let results: Vec<SlotSetup<P>> = (0..max_degree)
+            .into_par_iter()
+            .map(|j| {
+                // Precompute scalar coefficients for (q/qi) * L_j(X) in coefficient format.
+                let mut slots = vec![BigUint::ZERO; ring_n];
+                slots[j] = BigUint::one();
+                let lag_basis = P::from_biguints_eval(params, &slots);
+                let scalars = lag_basis.coeffs().iter().map(|c| c.value() * &q_over_qi).collect();
+                let lut_map: HashMap<P, (usize, P)> = hashmap
+                    .iter()
+                    .map(|(input, (k, output))| {
+                        let key_poly =
+                            P::from_biguint_to_constant(params, input.clone() * &q_over_qi) *
+                                &lag_basis;
+                        let mut slots = vec![BigUint::ZERO; ring_n];
+                        slots[j] = output.clone();
+                        let value_poly = P::from_biguints_eval_single_mod(params, crt_idx, &slots);
+                        (key_poly, (*k, value_poly))
+                    })
+                    .collect();
+                SlotSetup { slot_idx: j, scalars, lut_map }
+            })
+            .collect();
+
         let mut plt_ids = vec![0usize; max_degree];
         let mut mul_scalars = vec![vec![]; max_degree];
-
-        for j in 0..max_degree {
-            // Precompute scalar coefficients for (q/qi) * L_j(X) in coefficient format.
-            let mut slots = vec![BigUint::ZERO; ring_n];
-            slots[j] = BigUint::from(1u8);
-            let lag_basis = P::from_biguints_eval(params, &slots);
-            mul_scalars[j] = lag_basis.coeffs().iter().map(|c| c.value() * &q_over_qi).collect();
-
-            let mut slots = vec![BigUint::ZERO; ring_n];
-            slots[j] = BigUint::one();
-            let input_base_poly = P::from_biguints_eval(params, &slots);
-            let value_base_poly = P::from_biguints_eval_single_mod(params, crt_idx, &slots);
-
-            let mut lut_map: HashMap<P, (usize, P)> = HashMap::with_capacity(hashmap.len());
-            for (input, (k, output)) in hashmap.iter() {
-                slots[j] = input.clone() * &q_over_qi;
-                let key_poly =
-                    P::from_biguint_to_constant(&params, input * &q_over_qi) * &input_base_poly;
-                let value_poly =
-                    P::from_biguint_to_constant(&params, output.clone()) * &value_base_poly;
-                lut_map.insert(key_poly, (*k, value_poly));
-            }
+        for SlotSetup { slot_idx, scalars, lut_map } in results {
+            mul_scalars[slot_idx] = scalars;
             let plt = PublicLut::<P>::new(lut_map);
             let plt_id = circuit.register_public_lookup(plt);
-            plt_ids[j] = plt_id;
+            plt_ids[slot_idx] = plt_id;
         }
 
         Self { crt_idx, max_degree, plt_ids, mul_scalars, _p: PhantomData }

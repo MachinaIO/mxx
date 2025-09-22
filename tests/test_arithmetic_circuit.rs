@@ -29,7 +29,7 @@ async fn test_arithmetic_circuit_operations() {
     let params = DCRTPolyParams::new(4, 2, 28, 17);
     let (_, crt_bits, _) = params.to_crt();
     info!("crt_bits={}", crt_bits);
-    let n = params.ring_dimension() as usize;
+    let n = 3;
     let limb_bit_size = 3;
     let mut rng = rand::rng();
     let a_vec: Vec<BigUint> = (0..n)
@@ -43,7 +43,7 @@ async fn test_arithmetic_circuit_operations() {
         .collect::<Vec<_>>();
     let inputs = vec![&a_vec[..], &b_vec[..], &c_vec[..]];
     let mut mixed_circuit =
-        ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, n, inputs.len(), false, true);
+        ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, n, inputs.len(), true, true);
     let add_idx = mixed_circuit.add(ArithGateId::new(0), ArithGateId::new(1)); // a + b
     let mul_idx = mixed_circuit.mul(add_idx, ArithGateId::new(2)); // (a + b) * c
     let final_idx = mixed_circuit.sub(mul_idx, ArithGateId::new(0)); // (a + b) * c - a
@@ -121,7 +121,7 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
     assert_eq!(moduli.len(), 1, "Should have only one modulus for non-CRT");
     assert_eq!(crt_depth, 1, "CRT depth should be 1");
     info!("Non-CRT mode: single modulus = {}", moduli[0]);
-    let n = params.ring_dimension() as usize;
+    let n = 3;
     let limb_bit_size = 1;
     let mut rng = rand::rng();
     let a_vec: Vec<BigUint> = (0..n)

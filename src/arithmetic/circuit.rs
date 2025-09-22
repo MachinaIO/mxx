@@ -55,11 +55,6 @@ impl<P: Poly> ArithmeticCircuit<P> {
         let mut poly_circuit = PolyCircuit::<P>::new();
         let mut all_values = Vec::with_capacity(num_inputs);
         let ctx: Arc<CrtContext<P>> = if use_packing {
-            // let pack_ctx =
-            //     Arc::new(PackedCrtContext::setup(&mut poly_circuit, params, limb_bit_size));
-            // let packed_inputs =
-            //     PackedCrtPoly::input(pack_ctx.clone(), &mut poly_circuit, num_inputs);
-            // let crt_polys =
             let ctx = Arc::new(CrtContext::setup(
                 &mut poly_circuit,
                 params,

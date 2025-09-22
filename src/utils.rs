@@ -19,6 +19,7 @@ use num_traits::{One, Zero};
 use rand::Rng;
 use std::{
     env,
+    future::Future,
     time::{Duration, Instant},
 };
 use tracing::{debug, info};
@@ -157,6 +158,24 @@ pub fn random_bgg_encodings(
 pub fn timed_read<T, F: FnOnce() -> T>(label: &str, f: F, total: &mut Duration) -> T {
     let start = Instant::now();
     let res = f();
+    let elapsed = start.elapsed();
+    *total += elapsed;
+    crate::utils::log_mem(format!("{label} loaded in {elapsed:?}"));
+    res
+}
+
+/// Async variant of `timed_read` that awaits the provided future-producing closure.
+pub async fn timed_read_async<T, F, Fut>(
+    label: &str,
+    f: F,
+    total: &mut Duration,
+) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
+    let start = Instant::now();
+    let res = f().await;
     let elapsed = start.elapsed();
     *total += elapsed;
     crate::utils::log_mem(format!("{label} loaded in {elapsed:?}"));

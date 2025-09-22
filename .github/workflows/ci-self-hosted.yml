@@ -10,9 +10,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-permissions:
-  id-token: write
-  contents: read
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -29,7 +26,7 @@ jobs:
       - run: cargo +nightly fmt --all --check
 
   run:
-    runs-on: ubuntu-latest
+    runs-on: ci-self-hosted
     strategy:
         fail-fast: false
     steps:

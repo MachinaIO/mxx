@@ -165,11 +165,7 @@ pub fn timed_read<T, F: FnOnce() -> T>(label: &str, f: F, total: &mut Duration) 
 }
 
 /// Async variant of `timed_read` that awaits the provided future-producing closure.
-pub async fn timed_read_async<T, F, Fut>(
-    label: &str,
-    f: F,
-    total: &mut Duration,
-) -> T
+pub async fn timed_read_async<T, F, Fut>(label: &str, f: F, total: &mut Duration) -> T
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = T>,

@@ -2,19 +2,17 @@ pub mod bigunit;
 pub mod montgomery;
 use crate::{
     circuit::{PolyCircuit, gate::GateId},
-    element::PolyElem,
     gadgets::crt::{
         bigunit::BigUintPoly,
         montgomery::{MontgomeryContext, MontgomeryPoly, u64_vec_to_montgomery_poly},
     },
-    lookup::PublicLut,
     poly::{Poly, PolyParams},
     utils::mod_inverse,
 };
 use itertools::Itertools;
 use num_bigint::BigUint;
-use num_traits::{ToPrimitive, Zero};
-use std::{collections::HashMap, sync::Arc};
+use num_traits::ToPrimitive;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct CrtContext<P: Poly> {
@@ -22,7 +20,8 @@ pub struct CrtContext<P: Poly> {
     pub q_over_qis: Vec<BigUint>,
     pub max_degree: usize,
     pub reconstruct_coeffs: Vec<BigUint>,
-    pub pack_lut: Option<Vec<Vec<usize>>>, // shape: [crt_idx][eval_idx]
+    pub enable_packed_input: bool, /* pub pack_lut: Option<Vec<Vec<usize>>>, // shape:
+                                    * [crt_idx][eval_idx] */
 }
 
 impl<P: Poly> CrtContext<P> {
@@ -62,31 +61,7 @@ impl<P: Poly> CrtContext<P> {
                 (mont_ctx, q_over_qi, reconstruct_coeff)
             })
             .multiunzip();
-        let pack_lut = if enable_packed_input {
-            let row_size = 1 << limb_bit_size;
-            let ring_dimension = params.ring_dimension() as usize;
-            let mut plt_ids = vec![];
-            for (i, q_over_qi) in q_over_qis.iter().enumerate() {
-                plt_ids.push(vec![]);
-                let q_over_qi = P::from_biguint_to_constant(params, q_over_qi.clone());
-                for j in 0..max_degree {
-                    let mut f = HashMap::new();
-                    for k in 0..row_size {
-                        let mut slots = vec![BigUint::zero(); ring_dimension];
-                        slots[j] = BigUint::from(k);
-                        let k_eval_poly = P::from_biguints_eval_single_mod(params, i, &slots);
-                        let key_poly = k_eval_poly.clone() * &q_over_qi;
-                        let value_poly = k_eval_poly;
-                        f.insert(key_poly, (k, value_poly));
-                    }
-                    plt_ids[i].push(circuit.register_public_lookup(PublicLut::new(f)));
-                }
-            }
-            Some(plt_ids)
-        } else {
-            None
-        };
-        Self { mont_ctxes, q_over_qis, max_degree, reconstruct_coeffs, pack_lut }
+        Self { mont_ctxes, q_over_qis, max_degree, reconstruct_coeffs, enable_packed_input }
     }
 }
 
@@ -110,34 +85,24 @@ impl<P: Poly> CrtPoly<P> {
         Self { ctx, slots }
     }
 
-    pub fn input_packed(
-        ctx: Arc<CrtContext<P>>,
-        circuit: &mut PolyCircuit<P>,
-        params: &P::Params,
-    ) -> Self {
+    pub fn input_packed(ctx: Arc<CrtContext<P>>, circuit: &mut PolyCircuit<P>) -> Self {
         let num_limbs = ctx.mont_ctxes[0].num_limbs;
         let mut slots = vec![];
         let inputs = circuit.input(num_limbs);
-        let pack_luts = ctx
-            .pack_lut
-            .as_ref()
-            .expect("enable_packed_input should be true when you call input_packed");
-        for (i, q_over_qi) in ctx.q_over_qis.iter().enumerate() {
+        debug_assert!(
+            ctx.enable_packed_input,
+            "enable_packed_input must be true to call input_packed"
+        );
+        for i in 0..ctx.q_over_qis.len() {
             let mut limbs = vec![circuit.const_zero_gate(); num_limbs];
-            for j in 0..ctx.max_degree {
-                let mut slots = vec![BigUint::zero(); params.ring_dimension() as usize];
-                slots[j] = q_over_qi.clone();
-                let scalar = P::from_biguints_eval(params, &slots)
-                    .coeffs()
-                    .into_iter()
-                    .map(|c| c.value().clone())
-                    .collect::<Vec<_>>();
-                let lut = pack_luts[i][j];
-                for k in 0..num_limbs {
-                    let scaled_input = circuit.large_scalar_mul(inputs[k], &scalar);
-                    let extracted = circuit.public_lookup_gate(scaled_input, lut);
-                    limbs[k] = circuit.add_gate(limbs[k], extracted);
-                }
+            let (_, _, refresh_lut) = ctx.mont_ctxes[i]
+                .big_uint_ctx
+                .luts
+                .as_ref()
+                .expect("luts must be precomputed for packed input");
+            for k in 0..num_limbs {
+                let extracted = refresh_lut.lookup_all(circuit, inputs[k]);
+                limbs[k] = circuit.add_gate(limbs[k], extracted);
             }
             let biguint_poly = BigUintPoly::new(ctx.mont_ctxes[i].big_uint_ctx.clone(), limbs);
             let mont_poly = MontgomeryPoly::new(ctx.mont_ctxes[i].clone(), biguint_poly);
@@ -712,9 +677,9 @@ mod tests {
             .map(|big| biguint_to_crt_slots::<DCRTPoly>(&params, big))
             .collect::<Vec<_>>();
 
-        let crt_poly_a = CrtPoly::input_packed(crt_ctx.clone(), &mut circuit, &params);
+        let crt_poly_a = CrtPoly::input_packed(crt_ctx.clone(), &mut circuit);
         let values_a = biguint_vec_to_packed_crt_poly(LIMB_BIT_SIZE, &params, &a_vec);
-        let crt_poly_b = CrtPoly::input_packed(crt_ctx.clone(), &mut circuit, &params);
+        let crt_poly_b = CrtPoly::input_packed(crt_ctx.clone(), &mut circuit);
         let values_b = biguint_vec_to_packed_crt_poly(LIMB_BIT_SIZE, &params, &b_vec);
         assert_eq!(values_a.len(), max_limbs);
         assert_eq!(values_b.len(), max_limbs);
@@ -774,9 +739,9 @@ mod tests {
             .map(|big| biguint_to_crt_slots::<DCRTPoly>(&params, big))
             .collect::<Vec<_>>();
 
-        let crt_poly_a = CrtPoly::input_packed(crt_ctx.clone(), &mut circuit, &params);
+        let crt_poly_a = CrtPoly::input_packed(crt_ctx.clone(), &mut circuit);
         let values_a = biguint_vec_to_packed_crt_poly(LIMB_BIT_SIZE, &params, &a_vec);
-        let crt_poly_b = CrtPoly::input_packed(crt_ctx.clone(), &mut circuit, &params);
+        let crt_poly_b = CrtPoly::input_packed(crt_ctx.clone(), &mut circuit);
         let values_b = biguint_vec_to_packed_crt_poly(LIMB_BIT_SIZE, &params, &b_vec);
         assert_eq!(values_a.len(), max_limbs);
         assert_eq!(values_b.len(), max_limbs);
@@ -836,9 +801,9 @@ mod tests {
             .map(|big| biguint_to_crt_slots::<DCRTPoly>(&params, big))
             .collect::<Vec<_>>();
 
-        let crt_poly_a = CrtPoly::input_packed(crt_ctx.clone(), &mut circuit, &params);
+        let crt_poly_a = CrtPoly::input_packed(crt_ctx.clone(), &mut circuit);
         let values_a = biguint_vec_to_packed_crt_poly(LIMB_BIT_SIZE, &params, &a_vec);
-        let crt_poly_b = CrtPoly::input_packed(crt_ctx.clone(), &mut circuit, &params);
+        let crt_poly_b = CrtPoly::input_packed(crt_ctx.clone(), &mut circuit);
         let values_b = biguint_vec_to_packed_crt_poly(LIMB_BIT_SIZE, &params, &b_vec);
         assert_eq!(values_a.len(), max_limbs);
         assert_eq!(values_b.len(), max_limbs);

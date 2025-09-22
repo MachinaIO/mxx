@@ -68,7 +68,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
                 true,
             ));
             let crt_polys = (0..num_inputs)
-                .map(|_| CrtPoly::input_packed(ctx.clone(), &mut poly_circuit, params))
+                .map(|_| CrtPoly::input_packed(ctx.clone(), &mut poly_circuit))
                 .collect::<Vec<_>>();
             all_values.extend(crt_polys);
             ctx

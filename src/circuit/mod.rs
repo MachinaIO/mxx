@@ -93,6 +93,14 @@ impl<P: Poly> PolyCircuit<P> {
         }
     }
 
+    pub fn recompute_gate_counts(&mut self) {
+        self.gate_counts.clear();
+        for gate in self.gates.values() {
+            let kind = gate.gate_type.kind();
+            *self.gate_counts.entry(kind).or_insert(0) += 1;
+        }
+    }
+
     pub fn print(&mut self, gate_id: GateId, prefix: String) {
         self.print_value.insert(gate_id, prefix);
     }

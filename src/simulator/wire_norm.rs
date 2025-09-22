@@ -6,8 +6,9 @@ use crate::{
     poly::dcrt::poly::DCRTPoly,
     simulator::{SimulatorContext, poly_matrix_norm::PolyMatrixNorm, poly_norm::PolyNorm},
 };
+use bigdecimal::BigDecimal;
 use num_bigint::BigUint;
-use num_traits::ToPrimitive;
+use num_traits::FromPrimitive;
 use std::{
     ops::{Add, Mul, Sub},
     sync::Arc,
@@ -17,7 +18,7 @@ impl PolyCircuit<DCRTPoly> {
     pub fn simulate_max_h_norm(
         &self,
         ctx: Arc<SimulatorContext>,
-        input_norm_bound: f64,
+        input_norm_bound: BigDecimal,
         input_size: usize,
     ) -> Vec<WireNorm>
     where
@@ -39,7 +40,7 @@ impl PolyCircuit<DCRTPoly> {
 
 // Note: h_norm and plaintext_norm computed here can be larger than the modulus `q`.
 // In such a case, the error after circuit evaluation could be too large.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireNorm {
     pub plaintext_norm: PolyNorm,
     pub h_norm: PolyMatrixNorm,
@@ -96,7 +97,7 @@ impl Evaluable for WireNorm {
     }
 
     fn small_scalar_mul(&self, _: &Self::Params, scalar: &[u32]) -> Self {
-        let scalar_max = *scalar.iter().max().unwrap() as f64;
+        let scalar_max = BigDecimal::from(*scalar.iter().max().unwrap());
         let scalar_poly = PolyNorm::new(self.clone_ctx(), scalar_max);
         WireNorm {
             h_norm: self.h_norm.clone() * &scalar_poly,
@@ -106,8 +107,8 @@ impl Evaluable for WireNorm {
 
     fn large_scalar_mul(&self, _: &Self::Params, scalar: &[BigUint]) -> Self {
         let scalar_max = scalar.iter().max().unwrap().clone();
-        let scalar_f64 = scalar_max.to_f64().expect("scalar fits into f64");
-        let scalar_poly = PolyNorm::new(self.clone_ctx(), scalar_f64);
+        let scalar_bd = BigDecimal::from(num_bigint::BigInt::from(scalar_max));
+        let scalar_poly = PolyNorm::new(self.clone_ctx(), scalar_bd);
         WireNorm {
             h_norm: self.h_norm.clone() *
                 PolyMatrixNorm::gadget_decomposed(self.clone_ctx(), self.ctx().log_base_q),
@@ -124,22 +125,26 @@ pub struct NormPltLweEvaluator {
 
 impl NormPltLweEvaluator {
     pub fn new(ctx: Arc<SimulatorContext>, input_size: usize) -> Self {
-        let c_0 = 1.8f64;
-        let c_1 = 4.7f64;
-        let sigma = 4.578f64;
-        let two_sqrt = (2.0f64).sqrt();
-        let log_base_q_sqrt = (ctx.log_base_q as f64).sqrt();
-        let term = ctx.ring_dim_sqrt * log_base_q_sqrt + two_sqrt * ctx.ring_dim_sqrt + c_1;
-        let norm = c_0 * 6.0 * sigma * ((ctx.base + 1.0) * sigma) * term;
+        let c_0 = BigDecimal::from_f64(1.8).unwrap();
+        let c_1 = BigDecimal::from_f64(4.7).unwrap();
+        let sigma = BigDecimal::from_f64(4.578).unwrap();
+        let two_sqrt = BigDecimal::from(2).sqrt().unwrap();
+        let log_base_q_sqrt =
+            BigDecimal::from(ctx.log_base_q as u64).sqrt().expect("sqrt(log_base_q) failed");
+        let term = ctx.ring_dim_sqrt.clone() * log_base_q_sqrt +
+            two_sqrt * ctx.ring_dim_sqrt.clone() +
+            c_1.clone();
+        let norm: BigDecimal = c_0 * 6 * sigma.clone() * ((ctx.base.clone() + 1) * sigma) * term;
         let ncol = ctx.log_base_q;
         let preimage1_norm = PolyMatrixNorm::new(
             ctx.clone(),
             get_nrow_for_input(&ctx, input_size),
             ncol,
-            norm,
+            norm.clone(),
             None,
         );
-        let preimage2_norm = PolyMatrixNorm::new(ctx.clone(), ctx.log_base_q, ncol, norm, None);
+        let preimage2_norm =
+            PolyMatrixNorm::new(ctx.clone(), ctx.log_base_q, ncol, norm.clone(), None);
         Self { preimage1_norm, preimage2_norm }
     }
 }
@@ -153,10 +158,9 @@ impl PltEvaluator<WireNorm> for NormPltLweEvaluator {
         id: GateId,
     ) -> WireNorm {
         let h_norm = &self.preimage1_norm + (&input.h_norm * &self.preimage2_norm);
-        let (_, elem) = plt.max_output_row();
-        let plaintext_f64 =
-            elem.value().to_f64().expect("lookup plaintext coefficient fits into f64");
-        let plaintext_norm = PolyNorm::new(input.clone_ctx(), plaintext_f64);
+        let plaintext_bd =
+            BigDecimal::from(num_bigint::BigInt::from(plt.max_output_row().1.value().clone()));
+        let plaintext_norm = PolyNorm::new(input.clone_ctx(), plaintext_bd);
         WireNorm { h_norm, plaintext_norm }
     }
 }
@@ -177,15 +181,16 @@ mod tests {
         },
         simulator::SimulatorContext,
     };
+    use bigdecimal::BigDecimal;
     use std::collections::HashMap;
 
     fn make_ctx() -> Arc<SimulatorContext> {
         // secpar_sqrt=50, ring_dim_sqrt=1024, base=32, log_base_q=(128/32)*7 = 28
         Arc::new(SimulatorContext::new(
-            50.0,   // secpar_sqrt
-            1024.0, // ring_dim_sqrt
-            32.0,   // base
-            28,     // log_base_q
+            BigDecimal::from(50u64),   // secpar_sqrt
+            BigDecimal::from(1024u64), // ring_dim_sqrt
+            BigDecimal::from(32u64),   // base
+            28,                        // log_base_q
         ))
     }
 
@@ -197,8 +202,8 @@ mod tests {
         // Output both inputs unchanged
         circuit.output(vec![inputs[0], inputs[1]]);
 
-        let input_bound = 1.0f64;
-        let out = circuit.simulate_max_h_norm(ctx.clone(), input_bound, 2);
+        let input_bound = BigDecimal::from(1u64);
+        let out = circuit.simulate_max_h_norm(ctx.clone(), input_bound.clone(), 2);
         assert_eq!(out.len(), 2);
         let nrow = (ctx.log_base_q + 2) + 2 * ctx.log_base_q;
         let expected = WireNorm::new(
@@ -211,15 +216,14 @@ mod tests {
 
     #[test]
     fn test_wire_norm_addition() {
-        // Circuit: out = in0 + in1
         let ctx = make_ctx();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ins = circuit.input(2);
         let out_gid = circuit.add_gate(ins[0], ins[1]);
         circuit.output(vec![out_gid]);
-        let input_bound = 5.0f64;
+        let input_bound = BigDecimal::from(5u64);
 
-        let out = circuit.simulate_max_h_norm(ctx.clone(), input_bound, 2);
+        let out = circuit.simulate_max_h_norm(ctx.clone(), input_bound.clone(), 2);
         assert_eq!(out.len(), 1);
         // Build expected from input wires and add them
         let nrow = (ctx.log_base_q + 2) + 2 * ctx.log_base_q;
@@ -238,8 +242,8 @@ mod tests {
         let ins = circuit.input(2);
         let out_gid = circuit.sub_gate(ins[0], ins[1]);
         circuit.output(vec![out_gid]);
-        let input_bound = 5.0f64;
-        let out = circuit.simulate_max_h_norm(ctx.clone(), input_bound, 2);
+        let input_bound = BigDecimal::from(5u64);
+        let out = circuit.simulate_max_h_norm(ctx.clone(), input_bound.clone(), 2);
         assert_eq!(out.len(), 1);
         let nrow = (ctx.log_base_q + 2) + 2 * ctx.log_base_q;
         let in_wire = WireNorm::new(
@@ -258,8 +262,8 @@ mod tests {
         let ins = circuit.input(2);
         let out_gid = circuit.mul_gate(ins[0], ins[1]);
         circuit.output(vec![out_gid]);
-        let input_bound = 5.0f64;
-        let out = circuit.simulate_max_h_norm(ctx.clone(), input_bound, 2);
+        let input_bound = BigDecimal::from(5u64);
+        let out = circuit.simulate_max_h_norm(ctx.clone(), input_bound.clone(), 2);
         assert_eq!(out.len(), 1);
 
         // Build expected = in_wire * in_wire
@@ -295,10 +299,10 @@ mod tests {
         circuit.output(vec![out_gate]);
 
         let ctx = make_ctx();
-        let input_bound = 5.0f64;
-        let out = circuit.simulate_max_h_norm(ctx.clone(), input_bound, 1);
+        let input_bound = BigDecimal::from(5u64);
+        let out = circuit.simulate_max_h_norm(ctx.clone(), input_bound.clone(), 1);
         assert_eq!(out.len(), 1);
         // Bound must be max output coeff across LUT entries (7)
-        assert_eq!(out[0].plaintext_norm.norm, 7.0);
+        assert_eq!(out[0].plaintext_norm.norm, BigDecimal::from(7u64));
     }
 }

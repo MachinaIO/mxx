@@ -2,6 +2,7 @@ use crate::{
     circuit::PolyCircuit,
     gadgets::crt::{CrtContext, CrtPoly},
     poly::Poly,
+    utils::log_mem,
 };
 use std::sync::Arc;
 
@@ -55,6 +56,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
         let mut poly_circuit = PolyCircuit::<P>::new();
         let mut all_values = Vec::with_capacity(num_inputs);
         let ctx: Arc<CrtContext<P>> = if use_packing {
+            log_mem("before CrtContext setup");
             let ctx = Arc::new(CrtContext::setup(
                 &mut poly_circuit,
                 params,
@@ -62,6 +64,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
                 max_degree,
                 true,
             ));
+            log_mem("after CrtContext setup");
             let crt_polys = (0..num_inputs)
                 .map(|_| CrtPoly::input_packed(ctx.clone(), &mut poly_circuit))
                 .collect::<Vec<_>>();
@@ -179,10 +182,12 @@ impl<P: Poly> ArithmeticCircuit<P> {
         while current_layer.len() > 1 {
             debug_assert!(current_layer.len().is_multiple_of(2), "layer size must stay even");
             let mut next_layer = Vec::with_capacity(current_layer.len() / 2);
+            log_mem(format!("before layer size {}", current_layer.len()));
             for pair in current_layer.chunks(2) {
                 let parent = circuit.mul(pair[0], pair[1]);
                 next_layer.push(parent);
             }
+            log_mem(format!("after layer size {}", current_layer.len()));
             current_layer = next_layer;
         }
 

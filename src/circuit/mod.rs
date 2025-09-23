@@ -308,6 +308,17 @@ impl<P: Poly> PolyCircuit<P> {
         levels
     }
 
+    /// Returns the circuit depth defined as the maximum level index among
+    /// all gates required to compute the outputs.
+    ///
+    /// - Inputs and constant-one gate reside at level 0.
+    /// - Each non-input gate is assigned level = max(input levels) + 1.
+    /// - If there are no outputs, depth is 0.
+    pub fn depth(&self) -> usize {
+        let levels = self.compute_levels();
+        if levels.is_empty() { 0 } else { levels.len() - 1 }
+    }
+
     /// Evaluate the circuit using an iterative approach over a precomputed topological order.
     ///
     /// `helper_lookup` is P_{x_L}
@@ -1316,5 +1327,32 @@ mod tests {
         // verify
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], expected);
+    }
+
+    #[test]
+    fn test_depth_zero_with_direct_input_output() {
+        let mut circuit = PolyCircuit::new();
+        let inputs = circuit.input(1);
+        circuit.output(vec![inputs[0]]);
+        assert_eq!(circuit.depth(), 0);
+    }
+
+    #[test]
+    fn test_depth_one_with_add() {
+        let mut circuit = PolyCircuit::new();
+        let inputs = circuit.input(2);
+        let add = circuit.add_gate(inputs[0], inputs[1]);
+        circuit.output(vec![add]);
+        assert_eq!(circuit.depth(), 1);
+    }
+
+    #[test]
+    fn test_depth_two_with_chain() {
+        let mut circuit = PolyCircuit::new();
+        let inputs = circuit.input(3);
+        let add = circuit.add_gate(inputs[0], inputs[1]);
+        let mul = circuit.mul_gate(add, inputs[2]);
+        circuit.output(vec![mul]);
+        assert_eq!(circuit.depth(), 2);
     }
 }

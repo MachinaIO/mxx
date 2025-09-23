@@ -37,7 +37,7 @@ pub struct BigUintPolyContext<P: Poly> {
     pub max_degree: usize,
     pub const_zero: GateId,
     pub const_base: GateId,
-    pub luts: Option<(PackedPlt<P>, PackedPlt<P>)>,
+    pub luts: Option<(PackedPlt<P>, PackedPlt<P>, PackedPlt<P>)>,
 }
 
 impl<P: Poly> BigUintPolyContext<P> {
@@ -54,9 +54,9 @@ impl<P: Poly> BigUintPolyContext<P> {
         let const_zero = circuit.const_zero_gate();
         let const_base = circuit.const_digits_poly(&[base as u32]);
         let luts = if limb_bit_size > 1 {
-            let (mod_lut, floor_lut) =
-                Self::setup_packed_luts(circuit, params, base, base * base, crt_idx, max_degree);
-            Some((mod_lut, floor_lut))
+            let (mod_lut, floor_lut, refresh_lut) =
+                Self::setup_packed_luts(circuit, params, base, crt_idx, max_degree);
+            Some((mod_lut, floor_lut, refresh_lut))
         } else {
             None
         };
@@ -67,29 +67,29 @@ impl<P: Poly> BigUintPolyContext<P> {
         circuit: &mut PolyCircuit<P>,
         params: &P::Params,
         base: usize,
-        nrows: usize,
         crt_idx: usize,
         max_degree: usize,
-    ) -> (PackedPlt<P>, PackedPlt<P>) {
-        let entries: Vec<_> = (0..nrows)
-            .into_par_iter()
-            .map(|k| {
-                let input = BigUint::from(k);
-                let output_mod = BigUint::from(k % base);
-                let output_floor = BigUint::from(k / base);
-                P::from_usize_to_constant(params, k % base);
-                (input, k, output_mod, output_floor)
-            })
-            .collect();
-        let mut map_mod = HashMap::with_capacity(nrows);
-        let mut map_floor = HashMap::with_capacity(nrows);
-        for (input, k, output_mod, output_floor) in entries {
-            map_mod.insert(input.clone(), (k, output_mod));
-            map_floor.insert(input, (k, output_floor));
-        }
+    ) -> (PackedPlt<P>, PackedPlt<P>, PackedPlt<P>) {
+        let nrows = (base - 1) * (base - 1) + 1;
+        let map_mod = HashMap::from_par_iter((0..nrows).into_par_iter().map(|k| {
+            let input = BigUint::from(k);
+            let output = BigUint::from(k % base);
+            (input, (k, output))
+        }));
+        let map_floor = HashMap::from_par_iter((0..nrows).into_par_iter().map(|k| {
+            let input = BigUint::from(k);
+            let output = BigUint::from(k / base);
+            (input, (k, output))
+        }));
+        let map_refresh = HashMap::from_par_iter((0..base).into_par_iter().map(|k| {
+            let input = BigUint::from(k);
+            let output = BigUint::from(k);
+            (input, (k, output))
+        }));
         (
             PackedPlt::setup(circuit, params, crt_idx, max_degree, map_mod),
             PackedPlt::setup(circuit, params, crt_idx, max_degree, map_floor),
+            PackedPlt::setup(circuit, params, crt_idx, max_degree, map_refresh),
         )
     }
 }
@@ -179,7 +179,7 @@ impl<P: Poly> BigUintPoly<P> {
                     let g = circuit.and_gate(ai, bi);
                     (s, g)
                 }
-                Some((mod_lut, floor_lut)) => {
+                Some((mod_lut, floor_lut, _)) => {
                     let t = circuit.add_gate(ai, bi);
                     let s = mod_lut.lookup_all(circuit, t);
                     let g = floor_lut.lookup_all(circuit, t);
@@ -190,7 +190,7 @@ impl<P: Poly> BigUintPoly<P> {
             // p = 1 iff s == B-1, i.e., floor((s + 1)/B) = 1
             let p = match self.ctx.luts.as_ref() {
                 None => s,
-                Some((_, floor_lut)) => {
+                Some((_, floor_lut, _)) => {
                     let s_plus = circuit.add_gate(s, one);
                     floor_lut.lookup_all(circuit, s_plus)
                 }
@@ -201,7 +201,7 @@ impl<P: Poly> BigUintPoly<P> {
         }
 
         // Parallel-prefix (Kogge–Stone) on (g,p)
-        let (g_pref, _) = Self::prefix_gp(circuit, &gs, &ps);
+        let (g_pref, _) = self.prefix_gp(circuit, &gs, &ps);
 
         // Compute final limbs: s_i = (s'_i + c_i) mod B
         let mut limbs = Vec::with_capacity(w + 1);
@@ -213,7 +213,7 @@ impl<P: Poly> BigUintPoly<P> {
                     let digit = circuit.xor_gate(ss[i], carry_in);
                     limbs.push(digit);
                 }
-                Some((mod_lut, _)) => {
+                Some((mod_lut, _, _)) => {
                     // For multi-bit: use lookup table for modular reduction.
                     let t = circuit.add_gate(ss[i], carry_in);
                     let digit = mod_lut.lookup_all(circuit, t);
@@ -222,7 +222,11 @@ impl<P: Poly> BigUintPoly<P> {
             }
         }
         let last_carry = if w == 0 { zero } else { g_pref[w - 1] };
-        limbs.push(last_carry);
+        let last_carry_freshed = match self.ctx.luts.as_ref() {
+            None => last_carry,
+            Some((_, _, refresh_lut)) => refresh_lut.lookup_all(circuit, last_carry),
+        };
+        limbs.push(last_carry_freshed);
         Self { ctx: self.ctx.clone(), limbs, _p: PhantomData }
     }
 
@@ -261,7 +265,7 @@ impl<P: Poly> BigUintPoly<P> {
                     let pi = circuit.not_gate(xor_ab);
                     (gi, pi)
                 }
-                Some((mod_lut, floor_lut)) => {
+                Some((mod_lut, floor_lut, refresh_lut)) => {
                     let t0 = circuit.add_gate(a, base_minus_one);
                     let t = circuit.sub_gate(t0, b);
                     let s = mod_lut.lookup_all(circuit, t);
@@ -272,7 +276,8 @@ impl<P: Poly> BigUintPoly<P> {
                     let eq = floor_lut.lookup_all(circuit, s_plus);
                     let not_eq = circuit.not_gate(eq);
                     let gi_and = circuit.and_gate(not_h, not_eq);
-                    (gi_and, eq)
+                    let refreshed_gi = refresh_lut.lookup_all(circuit, gi_and);
+                    (refreshed_gi, eq)
                 }
             };
             g.push(g_i);
@@ -281,7 +286,7 @@ impl<P: Poly> BigUintPoly<P> {
         }
 
         // Parallel-prefix (Kogge–Stone) on (g,p) - same for both cases.
-        let (g_pref, _) = Self::prefix_gp(circuit, &g, &p);
+        let (g_pref, _) = self.prefix_gp(circuit, &g, &p);
 
         // Compute final difference limbs: d_i = (a_i + B - b_i - b_{in,i}) mod B
         let mut diff_limbs = Vec::with_capacity(w);
@@ -294,7 +299,7 @@ impl<P: Poly> BigUintPoly<P> {
                     let diff = circuit.xor_gate(xor, b_in);
                     diff_limbs.push(diff);
                 }
-                Some((mod_lut, _)) => {
+                Some((mod_lut, _, _)) => {
                     let (a, b) = ab_pairs[i];
                     let pre = circuit.add_gate(a, self.ctx.const_base);
                     let pre2 = circuit.sub_gate(pre, b);
@@ -305,6 +310,10 @@ impl<P: Poly> BigUintPoly<P> {
             }
         }
         let borrow_out = if w == 0 { zero } else { g_pref[w - 1] };
+        let borrow_out = match self.ctx.luts.as_ref() {
+            None => borrow_out,
+            Some((_, _, refresh_lut)) => refresh_lut.lookup_all(circuit, borrow_out),
+        };
         (borrow_out, Self { ctx: self.ctx.clone(), limbs: diff_limbs, _p: PhantomData })
     }
 
@@ -352,7 +361,11 @@ impl<P: Poly> BigUintPoly<P> {
             let case1 = circuit.mul_gate(self.limbs[i], selector);
             let case2 = circuit.mul_gate(other.limbs[i], not);
             let cmuxed = circuit.add_gate(case1, case2);
-            limbs.push(cmuxed);
+            let refreshed = match self.ctx.luts.as_ref() {
+                None => cmuxed,
+                Some((_, _, refresh_lut)) => refresh_lut.lookup_all(circuit, cmuxed),
+            };
+            limbs.push(refreshed);
         }
         Self { ctx: self.ctx.clone(), limbs, _p: PhantomData }
     }
@@ -397,7 +410,7 @@ impl<P: Poly> BigUintPoly<P> {
                 None => {
                     columns[k].push(prod);
                 }
-                Some((mod_lut, floor_lut)) => {
+                Some((mod_lut, floor_lut, _)) => {
                     let lo = mod_lut.lookup_all(circuit, prod);
                     columns[k].push(lo);
                     if k + 1 < max_limbs {
@@ -424,10 +437,10 @@ impl<P: Poly> BigUintPoly<P> {
         // Choose a safe compressor arity per column.
         // Each cell is < B, and we reduce up to comp_rate cells in one shot
         // using a single lookup pair (x % B, x / B) defined for inputs < B^2.
-        // Safety condition: comp_rate * (B-1) <= B^2 - 1  ==> comp_rate <= B + 1.
+        // Safety condition: comp_rate * (B-1) <= (B-1)^{2} ==> comp_rate <= B + 1.
         // To guarantee convergence for B=2 (limb_bit_size=1), use 3:2 compression.
         let base = 1usize << self.ctx.limb_bit_size;
-        let comp_rate = if base == 2 { 3 } else { base + 1 };
+        let comp_rate = if base == 2 { 3 } else { base - 1 };
 
         loop {
             let w = columns.len();
@@ -454,7 +467,7 @@ impl<P: Poly> BigUintPoly<P> {
                                 let carry = circuit.or_gate(and_ab, and_abc); // carry out
                                 (digit, carry)
                             }
-                            Some((mod_lut, floor_lut)) => {
+                            Some((mod_lut, floor_lut, _)) => {
                                 let mut sum = col[idx];
                                 for i in (idx + 1)..(idx + group_len) {
                                     sum = circuit.add_gate(sum, col[i]);
@@ -497,7 +510,7 @@ impl<P: Poly> BigUintPoly<P> {
                             let carry = circuit.and_gate(*x, *y);
                             (digit, carry)
                         }
-                        Some((mod_lut, floor_lut)) => {
+                        Some((mod_lut, floor_lut, _)) => {
                             let s = circuit.add_gate(*x, *y);
                             let digit = mod_lut.lookup_all(circuit, s);
                             let carry = floor_lut.lookup_all(circuit, s);
@@ -540,7 +553,7 @@ impl<P: Poly> BigUintPoly<P> {
                     let p = s;
                     (s, g, p)
                 }
-                Some((mod_lut, floor_lut)) => {
+                Some((mod_lut, floor_lut, _)) => {
                     let t = circuit.add_gate(sum_vec[k], c);
                     let s = mod_lut.lookup_all(circuit, t);
                     let g = floor_lut.lookup_all(circuit, t);
@@ -554,13 +567,13 @@ impl<P: Poly> BigUintPoly<P> {
             gs.push(g);
             ps.push(p);
         }
-        let (g_pref, _) = Self::prefix_gp(circuit, &gs, &ps);
+        let (g_pref, _) = self.prefix_gp(circuit, &gs, &ps);
         let mut out = Vec::with_capacity(w);
         for i in 0..w {
             let carry_in = if i == 0 { zero } else { g_pref[i - 1] };
             let digit = match self.ctx.luts.as_ref() {
                 None => circuit.xor_gate(ss[i], carry_in),
-                Some((mod_lut, _)) => {
+                Some((mod_lut, _, _)) => {
                     let t = circuit.add_gate(ss[i], carry_in);
                     mod_lut.lookup_all(circuit, t)
                 }
@@ -573,6 +586,7 @@ impl<P: Poly> BigUintPoly<P> {
     // Kogge–Stone parallel prefix on (g, p)
     #[inline]
     fn prefix_gp(
+        &self,
         circuit: &mut PolyCircuit<P>,
         g: &[GateId],
         p: &[GateId],
@@ -594,8 +608,14 @@ impl<P: Poly> BigUintPoly<P> {
                     let pk_and_gj = circuit.and_gate(pk, gj);
                     let g_new = circuit.or_gate(gk, pk_and_gj);
                     let p_new = circuit.and_gate(pk, pj);
-                    gs_next[k] = g_new;
-                    ps_next[k] = p_new;
+                    gs_next[k] = match self.ctx.luts.as_ref() {
+                        Some((_, _, refresh_lut)) => refresh_lut.lookup_all(circuit, g_new),
+                        None => g_new,
+                    };
+                    ps_next[k] = match self.ctx.luts.as_ref() {
+                        Some((_, _, refresh_lut)) => refresh_lut.lookup_all(circuit, p_new),
+                        None => p_new,
+                    };
                 }
             }
             gs = gs_next;

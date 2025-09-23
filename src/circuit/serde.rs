@@ -136,6 +136,7 @@ impl SerializablePolyCircuit {
         }
         circuit.num_input = self.num_input;
         circuit.output_ids = self.output_ids;
+        circuit.recompute_gate_counts();
         circuit
     }
 

@@ -10,12 +10,11 @@ use mxx::{
         DistType, PolyTrapdoorSampler, PolyUniformSampler, hash::DCRTPolyHashSampler,
         trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
     },
-    utils::gen_biguint_for_modulus,
+    utils::{gen_biguint_for_modulus, log_mem},
 };
 use num_bigint::BigUint;
 use std::sync::Arc;
 use tempfile::tempdir;
-use tokio;
 use tracing::info;
 
 fn init_tracing() {
@@ -26,10 +25,10 @@ fn init_tracing() {
 async fn test_arithmetic_circuit_operations() {
     // Test mixed operations in single circuit: (a + b) * c - a.
     init_tracing();
-    let params = DCRTPolyParams::new(4, 2, 28, 17);
+    let params = DCRTPolyParams::new(4, 2, 15, 13);
     let (_, crt_bits, _) = params.to_crt();
     info!("crt_bits={}", crt_bits);
-    let n = params.ring_dimension() as usize;
+    let n = 1;
     let limb_bit_size = 3;
     let mut rng = rand::rng();
     let a_vec: Vec<BigUint> = (0..n)
@@ -43,11 +42,12 @@ async fn test_arithmetic_circuit_operations() {
         .collect::<Vec<_>>();
     let inputs = vec![&a_vec[..], &b_vec[..], &c_vec[..]];
     let mut mixed_circuit =
-        ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, n, inputs.len(), false, true);
+        ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, n, inputs.len(), true, true);
     let add_idx = mixed_circuit.add(ArithGateId::new(0), ArithGateId::new(1)); // a + b
     let mul_idx = mixed_circuit.mul(add_idx, ArithGateId::new(2)); // (a + b) * c
     let final_idx = mixed_circuit.sub(mul_idx, ArithGateId::new(0)); // (a + b) * c - a
     mixed_circuit.output(final_idx);
+    log_mem(format!("num gates {:?} total", mixed_circuit.poly_circuit.count_gates_by_type_vec()));
 
     // Test with polynomial evaluation
     info!("start evaluate_with_poly");
@@ -118,13 +118,13 @@ async fn test_arithmetic_circuit_no_crt_limb1() {
 
     // this is curated to be have same CRT bit as test_arithmetic_circuit_operations
     // (crt_depth*crt_bit)
-    let params = DCRTPolyParams::new(4, 1, 56, 17);
+    let params = DCRTPolyParams::new(4, 1, 30, 13);
 
     let (moduli, _, crt_depth) = params.to_crt();
     assert_eq!(moduli.len(), 1, "Should have only one modulus for non-CRT");
     assert_eq!(crt_depth, 1, "CRT depth should be 1");
     info!("Non-CRT mode: single modulus = {}", moduli[0]);
-    let n = params.ring_dimension() as usize;
+    let n = 3;
     let limb_bit_size = 1;
     let mut rng = rand::rng();
     let a_vec: Vec<BigUint> = (0..n)

@@ -12,6 +12,19 @@ impl Display for GateId {
         write!(f, "{}", self.0)
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PolyGateKind {
+    Input,
+    Add,
+    Sub,
+    Mul,
+    SmallScalarMul,
+    LargeScalarMul,
+    Rotate,
+    PubLut(usize),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolyGate {
     pub gate_id: GateId,
@@ -46,6 +59,19 @@ impl PolyGateType {
             PolyGateType::LargeScalarMul { .. } |
             PolyGateType::PubLut { .. } => 1,
             PolyGateType::Add | PolyGateType::Sub | PolyGateType::Mul => 2,
+        }
+    }
+
+    pub fn kind(&self) -> PolyGateKind {
+        match self {
+            PolyGateType::Input => PolyGateKind::Input,
+            PolyGateType::Add => PolyGateKind::Add,
+            PolyGateType::Sub => PolyGateKind::Sub,
+            PolyGateType::Mul => PolyGateKind::Mul,
+            PolyGateType::SmallScalarMul { .. } => PolyGateKind::SmallScalarMul,
+            PolyGateType::LargeScalarMul { .. } => PolyGateKind::LargeScalarMul,
+            PolyGateType::Rotate { .. } => PolyGateKind::Rotate,
+            PolyGateType::PubLut { lookup_id } => PolyGateKind::PubLut(*lookup_id),
         }
     }
 }

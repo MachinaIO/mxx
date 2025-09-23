@@ -2,6 +2,7 @@ use crate::{
     circuit::PolyCircuit,
     gadgets::crt::{CrtContext, CrtPoly},
     poly::Poly,
+    utils::log_mem,
 };
 use std::sync::Arc;
 
@@ -55,11 +56,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
         let mut poly_circuit = PolyCircuit::<P>::new();
         let mut all_values = Vec::with_capacity(num_inputs);
         let ctx: Arc<CrtContext<P>> = if use_packing {
-            // let pack_ctx =
-            //     Arc::new(PackedCrtContext::setup(&mut poly_circuit, params, limb_bit_size));
-            // let packed_inputs =
-            //     PackedCrtPoly::input(pack_ctx.clone(), &mut poly_circuit, num_inputs);
-            // let crt_polys =
+            log_mem("before CrtContext setup");
             let ctx = Arc::new(CrtContext::setup(
                 &mut poly_circuit,
                 params,
@@ -67,8 +64,9 @@ impl<P: Poly> ArithmeticCircuit<P> {
                 max_degree,
                 true,
             ));
+            log_mem("after CrtContext setup");
             let crt_polys = (0..num_inputs)
-                .map(|_| CrtPoly::input_packed(ctx.clone(), &mut poly_circuit, params))
+                .map(|_| CrtPoly::input_packed(ctx.clone(), &mut poly_circuit))
                 .collect::<Vec<_>>();
             all_values.extend(crt_polys);
             ctx
@@ -161,5 +159,40 @@ impl<P: Poly> ArithmeticCircuit<P> {
             let gates = result_crt.finalize_crt(&mut self.poly_circuit);
             self.poly_circuit.output(gates);
         };
+    }
+
+    pub fn benchmark_multiplication_tree(
+        params: &<P as Poly>::Params,
+        limb_bit_size: usize,
+        max_degree: usize,
+        use_packing: bool,
+        height: usize,
+    ) -> Self {
+        assert!(height >= 1, "height must be at least 1 to build a multiplication tree");
+        let num_inputs =
+            1usize.checked_shl(height as u32).expect("height is too large to represent 2^h inputs");
+
+        let mut circuit =
+            Self::setup(params, limb_bit_size, max_degree, num_inputs, use_packing, true);
+
+        // Collect the leaf identifiers representing the primary inputs.
+        let mut current_layer: Vec<ArithGateId> = (0..num_inputs).map(ArithGateId::from).collect();
+
+        // Repeatedly pairwise multiply adjacent nodes until a single root remains.
+        while current_layer.len() > 1 {
+            debug_assert!(current_layer.len().is_multiple_of(2), "layer size must stay even");
+            let mut next_layer = Vec::with_capacity(current_layer.len() / 2);
+            log_mem(format!("before layer size {}", current_layer.len()));
+            for pair in current_layer.chunks(2) {
+                let parent = circuit.mul(pair[0], pair[1]);
+                next_layer.push(parent);
+            }
+            log_mem(format!("after layer size {}", current_layer.len()));
+            current_layer = next_layer;
+        }
+
+        let root = current_layer.pop().expect("multiplication tree must contain at least one node");
+        circuit.output(root);
+        circuit
     }
 }

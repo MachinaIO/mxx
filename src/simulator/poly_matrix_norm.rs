@@ -1,7 +1,7 @@
 use super::poly_norm::PolyNorm;
 use crate::{impl_binop_with_refs, simulator::SimulatorContext};
 use bigdecimal::BigDecimal;
-use num_traits::{FromPrimitive, One};
+use num_traits::One;
 use std::{
     ops::{Add, AddAssign, Mul, MulAssign},
     sync::Arc,

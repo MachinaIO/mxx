@@ -155,7 +155,7 @@ impl PltEvaluator<WireNorm> for NormPltLweEvaluator {
         _: &(),
         plt: &PublicLut<DCRTPoly>,
         input: WireNorm,
-        id: GateId,
+        _: GateId,
     ) -> WireNorm {
         let h_norm = &self.preimage1_norm + (&input.h_norm * &self.preimage2_norm);
         let plaintext_bd =

@@ -201,7 +201,7 @@ impl<P: Poly> BigUintPoly<P> {
         }
 
         // Parallel-prefix (Kogge–Stone) on (g,p)
-        let (g_pref, _) = Self::prefix_gp(circuit, &gs, &ps);
+        let (g_pref, _) = self.prefix_gp(circuit, &gs, &ps);
 
         // Compute final limbs: s_i = (s'_i + c_i) mod B
         let mut limbs = Vec::with_capacity(w + 1);
@@ -265,7 +265,7 @@ impl<P: Poly> BigUintPoly<P> {
                     let pi = circuit.not_gate(xor_ab);
                     (gi, pi)
                 }
-                Some((mod_lut, floor_lut, _)) => {
+                Some((mod_lut, floor_lut, refresh_lut)) => {
                     let t0 = circuit.add_gate(a, base_minus_one);
                     let t = circuit.sub_gate(t0, b);
                     let s = mod_lut.lookup_all(circuit, t);
@@ -276,7 +276,8 @@ impl<P: Poly> BigUintPoly<P> {
                     let eq = floor_lut.lookup_all(circuit, s_plus);
                     let not_eq = circuit.not_gate(eq);
                     let gi_and = circuit.and_gate(not_h, not_eq);
-                    (gi_and, eq)
+                    let refreshed_gi = refresh_lut.lookup_all(circuit, gi_and);
+                    (refreshed_gi, eq)
                 }
             };
             g.push(g_i);
@@ -285,7 +286,7 @@ impl<P: Poly> BigUintPoly<P> {
         }
 
         // Parallel-prefix (Kogge–Stone) on (g,p) - same for both cases.
-        let (g_pref, _) = Self::prefix_gp(circuit, &g, &p);
+        let (g_pref, _) = self.prefix_gp(circuit, &g, &p);
 
         // Compute final difference limbs: d_i = (a_i + B - b_i - b_{in,i}) mod B
         let mut diff_limbs = Vec::with_capacity(w);
@@ -566,7 +567,7 @@ impl<P: Poly> BigUintPoly<P> {
             gs.push(g);
             ps.push(p);
         }
-        let (g_pref, _) = Self::prefix_gp(circuit, &gs, &ps);
+        let (g_pref, _) = self.prefix_gp(circuit, &gs, &ps);
         let mut out = Vec::with_capacity(w);
         for i in 0..w {
             let carry_in = if i == 0 { zero } else { g_pref[i - 1] };
@@ -585,6 +586,7 @@ impl<P: Poly> BigUintPoly<P> {
     // Kogge–Stone parallel prefix on (g, p)
     #[inline]
     fn prefix_gp(
+        &self,
         circuit: &mut PolyCircuit<P>,
         g: &[GateId],
         p: &[GateId],
@@ -606,8 +608,14 @@ impl<P: Poly> BigUintPoly<P> {
                     let pk_and_gj = circuit.and_gate(pk, gj);
                     let g_new = circuit.or_gate(gk, pk_and_gj);
                     let p_new = circuit.and_gate(pk, pj);
-                    gs_next[k] = g_new;
-                    ps_next[k] = p_new;
+                    gs_next[k] = match self.ctx.luts.as_ref() {
+                        Some((_, _, refresh_lut)) => refresh_lut.lookup_all(circuit, g_new),
+                        None => g_new,
+                    };
+                    ps_next[k] = match self.ctx.luts.as_ref() {
+                        Some((_, _, refresh_lut)) => refresh_lut.lookup_all(circuit, p_new),
+                        None => p_new,
+                    };
                 }
             }
             gs = gs_next;

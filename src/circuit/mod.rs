@@ -1331,7 +1331,7 @@ mod tests {
 
     #[test]
     fn test_depth_zero_with_direct_input_output() {
-        let mut circuit = PolyCircuit::new();
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let inputs = circuit.input(1);
         circuit.output(vec![inputs[0]]);
         assert_eq!(circuit.depth(), 0);
@@ -1339,7 +1339,7 @@ mod tests {
 
     #[test]
     fn test_depth_one_with_add() {
-        let mut circuit = PolyCircuit::new();
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let inputs = circuit.input(2);
         let add = circuit.add_gate(inputs[0], inputs[1]);
         circuit.output(vec![add]);
@@ -1348,7 +1348,7 @@ mod tests {
 
     #[test]
     fn test_depth_two_with_chain() {
-        let mut circuit = PolyCircuit::new();
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let inputs = circuit.input(3);
         let add = circuit.add_gate(inputs[0], inputs[1]);
         let mul = circuit.mul_gate(add, inputs[2]);

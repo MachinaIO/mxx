@@ -43,13 +43,8 @@ impl<P: Poly> PackedPlt<P> {
         let mut reconstruct_coeffs = Vec::with_capacity(crt_depth);
 
         for (i, &qi) in moduli.iter().enumerate() {
-            let modulus_big = BigUint::from(qi);
-            let q_over_qi = &*big_q_arc / &modulus_big;
-            let m_i_mod_qi = &q_over_qi % &modulus_big;
-            let inv = crate::utils::mod_inverse(&m_i_mod_qi, &modulus_big)
-                .expect("Moduli must be coprime for CRT reconstruction");
-            let reconstruct_coeff = (&q_over_qi * &inv) % big_q_arc.as_ref();
-            reconstruct_coeffs.push(reconstruct_coeff.clone());
+            let (q_over_qi, reconstruct_coeff) = params.to_crt_coeffs(i);
+            reconstruct_coeffs.push(reconstruct_coeff);
 
             for slot_idx in 0..max_degree {
                 let lag_basis = &lag_bases[slot_idx];

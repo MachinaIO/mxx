@@ -25,10 +25,10 @@ pub struct MontgomeryContext<P: Poly> {
 
 impl<P: Poly> PartialEq for MontgomeryContext<P> {
     fn eq(&self, other: &Self) -> bool {
-        self.big_uint_ctx == other.big_uint_ctx &&
-            self.const_n.limbs == other.const_n.limbs &&
-            self.const_r2.limbs == other.const_r2.limbs &&
-            self.const_n_prime.limbs == other.const_n_prime.limbs
+        self.big_uint_ctx == other.big_uint_ctx
+            && self.const_n.limbs == other.const_n.limbs
+            && self.const_r2.limbs == other.const_r2.limbs
+            && self.const_n_prime.limbs == other.const_n_prime.limbs
     }
 }
 
@@ -48,7 +48,6 @@ impl<P: Poly> MontgomeryContext<P> {
             circuit,
             params,
             limb_bit_size,
-            crt_idx,
             max_degree,
         ));
 
@@ -220,7 +219,6 @@ fn montgomery_reduce<P: Poly>(
 pub fn u64_vec_to_montgomery_poly<P: Poly>(
     limb_bit_size: usize,
     num_limbs: usize,
-    crt_idx: usize,
     n: u64,
     params: &P::Params,
     inputs: &[u64],
@@ -230,7 +228,7 @@ pub fn u64_vec_to_montgomery_poly<P: Poly>(
         .iter()
         .map(|inp| u64_to_montgomery_form(limb_bit_size, num_limbs, n, *inp))
         .collect::<Vec<_>>();
-    u64_vec_to_biguint_poly(limb_bit_size, crt_idx, params, &vs, Some(num_limbs))
+    u64_vec_to_biguint_poly(limb_bit_size, params, &vs, Some(num_limbs))
 }
 
 fn u64_to_montgomery_form(limb_bit_size: usize, num_limbs: usize, n: u64, input: u64) -> u64 {
@@ -352,8 +350,8 @@ mod tests {
         let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
         for i in 0..NUM_LIMBS {
             let expected_poly =
-                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i]) *
-                    &q_over_qi;
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i])
+                    * &q_over_qi;
             assert_eq!(eval_result[i], expected_poly);
         }
     }
@@ -453,8 +451,8 @@ mod tests {
         assert_eq!(eval_result.len(), NUM_LIMBS);
         for i in 0..NUM_LIMBS {
             let expected_poly =
-                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i]) *
-                    &q_over_qi;
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i])
+                    * &q_over_qi;
             assert_eq!(eval_result[i], expected_poly);
         }
     }
@@ -527,8 +525,8 @@ mod tests {
         let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
         for i in 0..NUM_LIMBS {
             let expected_poly =
-                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i]) *
-                    &q_over_qi;
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i])
+                    * &q_over_qi;
             assert_eq!(eval_result[i], expected_poly);
         }
     }
@@ -600,8 +598,8 @@ mod tests {
         let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
         for i in 0..NUM_LIMBS {
             let expected_poly =
-                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i]) *
-                    &q_over_qi;
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i])
+                    * &q_over_qi;
             assert_eq!(eval_result[i], expected_poly);
         }
     }
@@ -672,8 +670,8 @@ mod tests {
         let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
         for i in 0..NUM_LIMBS {
             let expected_poly =
-                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i]) *
-                    &q_over_qi;
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i])
+                    * &q_over_qi;
             assert_eq!(eval_result[i], expected_poly);
         }
     }
@@ -743,8 +741,8 @@ mod tests {
         let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
         for i in 0..NUM_LIMBS {
             let expected_poly =
-                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i]) *
-                    &q_over_qi;
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i])
+                    * &q_over_qi;
             assert_eq!(eval_result[i], expected_poly);
         }
     }
@@ -813,8 +811,8 @@ mod tests {
         let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
         for i in 0..NUM_LIMBS {
             let expected_poly =
-                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i]) *
-                    &q_over_qi;
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i])
+                    * &q_over_qi;
             assert_eq!(eval_result[i], expected_poly);
         }
     }
@@ -883,8 +881,8 @@ mod tests {
         let q_over_qi = DCRTPoly::from_biguint_to_constant(&params, q_over_qi);
         for i in 0..NUM_LIMBS {
             let expected_poly =
-                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i]) *
-                    &q_over_qi;
+                DCRTPoly::from_biguints_eval_single_mod(&params, CRT_IDX, &expected_limbs[i])
+                    * &q_over_qi;
             assert_eq!(eval_result[i], expected_poly);
         }
     }

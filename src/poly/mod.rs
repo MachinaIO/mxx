@@ -10,6 +10,8 @@ use std::{
     sync::Arc,
 };
 
+use crate::utils::mod_inverse;
+
 use super::element::PolyElem;
 
 pub trait PolyParams: Clone + Debug + PartialEq + Eq + Send + Sync {
@@ -30,6 +32,17 @@ pub trait PolyParams: Clone + Debug + PartialEq + Eq + Send + Sync {
     /// Given the parameter, return the crt decomposed moduli as array along with the bit size and
     /// depth of these moduli.
     fn to_crt(&self) -> (Vec<u64>, usize, usize);
+    // return `q/q_i` and the coefficient for CRT reconstruction.
+    fn to_crt_coeffs(&self, crt_idx: usize) -> (BigUint, BigUint) {
+        let (moduli, _, _) = self.to_crt();
+        let qi_big = BigUint::from(moduli[crt_idx]);
+        let modulus_big: Arc<BigUint> = self.modulus().into();
+        let q_over_qi = modulus_big.as_ref() / &qi_big;
+        let q_over_qi_mod = &q_over_qi % &qi_big;
+        let inv = mod_inverse(&q_over_qi_mod, &qi_big).expect("CRT moduli must be coprime");
+        let reconst_coeff = (&q_over_qi * inv) % modulus_big.as_ref();
+        (q_over_qi, reconst_coeff)
+    }
 }
 
 pub trait Poly:

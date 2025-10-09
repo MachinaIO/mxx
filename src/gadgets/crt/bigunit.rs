@@ -37,7 +37,16 @@ pub struct BigUintPolyContext<P: Poly> {
     pub max_degree: usize,
     pub const_zero: GateId,
     pub const_base: GateId,
-    pub luts: Option<(PackedPlt<P>, PackedPlt<P>, PackedPlt<P>)>,
+    pub scalar_base: BigUint,
+    // (add_mod, add_floor, mul_mod, mul_floor, kss_g, kss_p)
+    pub luts: Option<(
+        PackedPlt<P>,
+        PackedPlt<P>,
+        PackedPlt<P>,
+        PackedPlt<P>,
+        PackedPlt<P>,
+        PackedPlt<P>,
+    )>,
 }
 
 impl<P: Poly> BigUintPolyContext<P> {
@@ -53,14 +62,14 @@ impl<P: Poly> BigUintPolyContext<P> {
         let base = 1 << limb_bit_size;
         let const_zero = circuit.const_zero_gate();
         let const_base = circuit.const_digits_poly(&[base as u32]);
+        let scalar_base = BigUint::from(base);
         let luts = if limb_bit_size > 1 {
-            let (mod_lut, floor_lut, refresh_lut) =
-                Self::setup_packed_luts(circuit, params, base, crt_idx, max_degree);
-            Some((mod_lut, floor_lut, refresh_lut))
+            let luts = Self::setup_packed_luts(circuit, params, base, crt_idx, max_degree);
+            Some(luts)
         } else {
             None
         };
-        Self { limb_bit_size, crt_idx, max_degree, const_zero, const_base, luts }
+        Self { limb_bit_size, crt_idx, max_degree, const_zero, const_base, scalar_base, luts }
     }
 
     fn setup_packed_luts(
@@ -69,27 +78,72 @@ impl<P: Poly> BigUintPolyContext<P> {
         base: usize,
         crt_idx: usize,
         max_degree: usize,
-    ) -> (PackedPlt<P>, PackedPlt<P>, PackedPlt<P>) {
-        let nrows = (base - 1) * (base - 1) + 1;
-        let map_mod = HashMap::from_par_iter((0..nrows).into_par_iter().map(|k| {
-            let input = BigUint::from(k);
-            let output = BigUint::from(k % base);
-            (input, (k, output))
-        }));
-        let map_floor = HashMap::from_par_iter((0..nrows).into_par_iter().map(|k| {
-            let input = BigUint::from(k);
-            let output = BigUint::from(k / base);
-            (input, (k, output))
-        }));
-        let map_refresh = HashMap::from_par_iter((0..base).into_par_iter().map(|k| {
-            let input = BigUint::from(k);
-            let output = BigUint::from(k);
-            (input, (k, output))
-        }));
+    ) -> (PackedPlt<P>, PackedPlt<P>, PackedPlt<P>, PackedPlt<P>, PackedPlt<P>, PackedPlt<P>) {
+        // B_p base
+        let b = base;
+
+        // Addition LUTs over D_+ x D_+
+        // D_+ = [0, floor((B^2 - 1)/2)]
+        // Key t = k1 + k2 ∈ [0, 2*add_max] (<= B^2 - 1)
+        let add_max = (b * b - 1) / 2;
+        let add_rows = 2 * add_max + 1; // inclusive range [0, 2*add_max]
+        let add_map_mod: HashMap<BigUint, (usize, BigUint)> =
+            HashMap::from_par_iter((0..add_rows).into_par_iter().map(|t| {
+                let input = BigUint::from(t);
+                let output = BigUint::from(t % b);
+                (input, (t, output))
+            }));
+        let add_map_floor: HashMap<BigUint, (usize, BigUint)> =
+            HashMap::from_par_iter((0..add_rows).into_par_iter().map(|t| {
+                let input = BigUint::from(t);
+                let output = BigUint::from(t / b);
+                (input, (t, output))
+            }));
+
+        // Multiplication LUTs over D_x x D_x with key t = k1 + k2*B
+        // k1, k2 ∈ [0, B-1] => t ∈ [0, B^2 - 1]
+        let mul_rows = b * b;
+        let mul_map_mod: HashMap<BigUint, (usize, BigUint)> =
+            HashMap::from_par_iter((0..mul_rows).into_par_iter().map(|t| {
+                let k1 = t % b;
+                let k2 = t / b;
+                let out = (k1 * k2) % b;
+                (BigUint::from(t), (t, BigUint::from(out)))
+            }));
+        let mul_map_floor: HashMap<BigUint, (usize, BigUint)> =
+            HashMap::from_par_iter((0..mul_rows).into_par_iter().map(|t| {
+                let k1 = t % b;
+                let k2 = t / b;
+                let out = (k1 * k2) / b;
+                (BigUint::from(t), (t, BigUint::from(out)))
+            }));
+
+        // Kogge–Stone LUTs
+        // L_g: key t = g_k + 2*g_{k-d} + 4*p_k in [0,7], output: g_k OR (p_k AND g_{k-d})
+        let or_and_map: HashMap<BigUint, (usize, BigUint)> =
+            HashMap::from_par_iter((0..8).into_par_iter().map(|t| {
+                let gk = (t & 1) != 0;
+                let gj = (t & 2) != 0; // bit1
+                let pk = (t & 4) != 0; // bit2
+                let out = (gk as u8) | ((pk as u8) & (gj as u8));
+                (BigUint::from(t), (t, BigUint::from(out)))
+            }));
+        // L_p: key t = p_k + 2*p_{k-d} in [0,3], output: p_k AND p_{k-d}
+        let and_map: HashMap<BigUint, (usize, BigUint)> =
+            HashMap::from_par_iter((0..4).into_par_iter().map(|t| {
+                let pk = (t & 1) != 0;
+                let pj = (t & 2) != 0;
+                let out = (pk as u8) & (pj as u8);
+                (BigUint::from(t), (t, BigUint::from(out)))
+            }));
+
         (
-            PackedPlt::setup(circuit, params, crt_idx, max_degree, map_mod),
-            PackedPlt::setup(circuit, params, crt_idx, max_degree, map_floor),
-            PackedPlt::setup(circuit, params, crt_idx, max_degree, map_refresh),
+            PackedPlt::setup(circuit, params, max_degree, add_map_mod),
+            PackedPlt::setup(circuit, params, max_degree, add_map_floor),
+            PackedPlt::setup(circuit, params, max_degree, mul_map_mod),
+            PackedPlt::setup(circuit, params, max_degree, mul_map_floor),
+            PackedPlt::setup(circuit, params, max_degree, or_and_map),
+            PackedPlt::setup(circuit, params, max_degree, and_map),
         )
     }
 }
@@ -173,28 +227,11 @@ impl<P: Poly> BigUintPoly<P> {
         for i in 0..w {
             let ai = a[i];
             let bi = if i < b.len() { b[i] } else { self.ctx.const_zero };
-            let (s, g) = match self.ctx.luts.as_ref() {
-                None => {
-                    let s = circuit.xor_gate(ai, bi);
-                    let g = circuit.and_gate(ai, bi);
-                    (s, g)
-                }
-                Some((mod_lut, floor_lut, _)) => {
-                    let t = circuit.add_gate(ai, bi);
-                    let s = mod_lut.lookup_all(circuit, t);
-                    let g = floor_lut.lookup_all(circuit, t);
-                    (s, g)
-                }
-            };
+            // s_i, g_i from IntMod&Floor_{+,Bp}
+            let (s, g) = self.add_mod_floor(circuit, ai, bi);
 
-            // p = 1 iff s == B-1, i.e., floor((s + 1)/B) = 1
-            let p = match self.ctx.luts.as_ref() {
-                None => s,
-                Some((_, floor_lut, _)) => {
-                    let s_plus = circuit.add_gate(s, one);
-                    floor_lut.lookup_all(circuit, s_plus)
-                }
-            };
+            // p_i = floor((s_i + 1)/B) via another IntMod&Floor_{+,Bp}
+            let p = self.add_floor(circuit, s, one);
             ss.push(s);
             gs.push(g);
             ps.push(p);
@@ -207,27 +244,56 @@ impl<P: Poly> BigUintPoly<P> {
         let mut limbs = Vec::with_capacity(w + 1);
         for i in 0..w {
             let carry_in = if i == 0 { zero } else { g_pref[i - 1] };
-            match self.ctx.luts.as_ref() {
-                None => {
-                    // For single bit: (s'_i + c_i) mod 2 = s'_i XOR c_i
-                    let digit = circuit.xor_gate(ss[i], carry_in);
-                    limbs.push(digit);
-                }
-                Some((mod_lut, _, _)) => {
-                    // For multi-bit: use lookup table for modular reduction.
-                    let t = circuit.add_gate(ss[i], carry_in);
-                    let digit = mod_lut.lookup_all(circuit, t);
-                    limbs.push(digit);
-                }
-            }
+            let digit = self.add_mod(circuit, ss[i], carry_in);
+            limbs.push(digit);
         }
         let last_carry = if w == 0 { zero } else { g_pref[w - 1] };
-        let last_carry_freshed = match self.ctx.luts.as_ref() {
-            None => last_carry,
-            Some((_, _, refresh_lut)) => refresh_lut.lookup_all(circuit, last_carry),
-        };
-        limbs.push(last_carry_freshed);
+        limbs.push(last_carry);
         Self { ctx: self.ctx.clone(), limbs, _p: PhantomData }
+    }
+
+    #[inline]
+    fn add_mod_floor(
+        &self,
+        circuit: &mut PolyCircuit<P>,
+        x: GateId,
+        y: GateId,
+    ) -> (GateId, GateId) {
+        match self.ctx.luts.as_ref() {
+            None => {
+                let s = circuit.xor_gate(x, y);
+                let g = circuit.and_gate(x, y);
+                (s, g)
+            }
+            Some((add_mod_lut, add_floor_lut, _, _, _, _)) => {
+                let t = circuit.add_gate(x, y);
+                let s = add_mod_lut.lookup_all(circuit, t);
+                let g = add_floor_lut.lookup_all(circuit, t);
+                (s, g)
+            }
+        }
+    }
+
+    #[inline]
+    fn add_mod(&self, circuit: &mut PolyCircuit<P>, x: GateId, y: GateId) -> GateId {
+        match self.ctx.luts.as_ref() {
+            None => circuit.xor_gate(x, y),
+            Some((add_mod_lut, _, _, _, _, _)) => {
+                let t = circuit.add_gate(x, y);
+                add_mod_lut.lookup_all(circuit, t)
+            }
+        }
+    }
+
+    #[inline]
+    fn add_floor(&self, circuit: &mut PolyCircuit<P>, x: GateId, y: GateId) -> GateId {
+        match self.ctx.luts.as_ref() {
+            None => circuit.and_gate(x, y),
+            Some((_, add_floor_lut, _, _, _, _)) => {
+                let t = circuit.add_gate(x, y);
+                add_floor_lut.lookup_all(circuit, t)
+            }
+        }
     }
 
     pub fn less_than(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> (GateId, Self) {
@@ -265,19 +331,18 @@ impl<P: Poly> BigUintPoly<P> {
                     let pi = circuit.not_gate(xor_ab);
                     (gi, pi)
                 }
-                Some((mod_lut, floor_lut, refresh_lut)) => {
-                    let t0 = circuit.add_gate(a, base_minus_one);
-                    let t = circuit.sub_gate(t0, b);
-                    let s = mod_lut.lookup_all(circuit, t);
-                    let h = floor_lut.lookup_all(circuit, t);
-                    let not_h = circuit.not_gate(h);
+                Some((_, _, _, _, _, and_map)) => {
+                    let y = circuit.sub_gate(base_minus_one, b);
+                    let (s, h) = self.add_mod_floor(circuit, a, y);
                     // eq_i: s == B-1 <=> floor((s + 1)/B) == 1
-                    let s_plus = circuit.add_gate(s, one);
-                    let eq = floor_lut.lookup_all(circuit, s_plus);
+                    let eq = self.add_floor(circuit, s, one);
+                    let not_h = circuit.not_gate(h);
                     let not_eq = circuit.not_gate(eq);
-                    let gi_and = circuit.and_gate(not_h, not_eq);
-                    let refreshed_gi = refresh_lut.lookup_all(circuit, gi_and);
-                    (refreshed_gi, eq)
+                    // gi = (1-h_i) AND (1-p_i) via and_map with key = x + 2*y
+                    let two_not_eq = circuit.add_gate(not_eq, not_eq);
+                    let key = circuit.add_gate(not_h, two_not_eq);
+                    let gi_and = and_map.lookup_all(circuit, key);
+                    (gi_and, eq)
                 }
             };
             g.push(g_i);
@@ -299,21 +364,16 @@ impl<P: Poly> BigUintPoly<P> {
                     let diff = circuit.xor_gate(xor, b_in);
                     diff_limbs.push(diff);
                 }
-                Some((mod_lut, _, _)) => {
-                    let (a, b) = ab_pairs[i];
-                    let pre = circuit.add_gate(a, self.ctx.const_base);
-                    let pre2 = circuit.sub_gate(pre, b);
-                    let t = circuit.sub_gate(pre2, b_in);
-                    let d = mod_lut.lookup_all(circuit, t);
-                    diff_limbs.push(d);
+                Some((_, _, _, _, _, _)) => {
+                    // Difference digit via IntMod&Floor_{+,B}(a, B - b - b_in)
+                    let b_comp = circuit.sub_gate(self.ctx.const_base, b);
+                    let y = circuit.sub_gate(b_comp, b_in);
+                    let digit = self.add_mod(circuit, a, y);
+                    diff_limbs.push(digit);
                 }
             }
         }
         let borrow_out = if w == 0 { zero } else { g_pref[w - 1] };
-        let borrow_out = match self.ctx.luts.as_ref() {
-            None => borrow_out,
-            Some((_, _, refresh_lut)) => refresh_lut.lookup_all(circuit, borrow_out),
-        };
         (borrow_out, Self { ctx: self.ctx.clone(), limbs: diff_limbs, _p: PhantomData })
     }
 
@@ -358,14 +418,10 @@ impl<P: Poly> BigUintPoly<P> {
         let mut limbs = Vec::with_capacity(self.limbs.len());
         let not = circuit.not_gate(selector);
         for i in 0..self.limbs.len() {
-            let case1 = circuit.mul_gate(self.limbs[i], selector);
-            let case2 = circuit.mul_gate(other.limbs[i], not);
+            let (case1, _) = self.mul_mod_floor(circuit, self.limbs[i], selector, false);
+            let (case2, _) = self.mul_mod_floor(circuit, other.limbs[i], not, false);
             let cmuxed = circuit.add_gate(case1, case2);
-            let refreshed = match self.ctx.luts.as_ref() {
-                None => cmuxed,
-                Some((_, _, refresh_lut)) => refresh_lut.lookup_all(circuit, cmuxed),
-            };
-            limbs.push(refreshed);
+            limbs.push(cmuxed);
         }
         Self { ctx: self.ctx.clone(), limbs, _p: PhantomData }
     }
@@ -390,144 +446,28 @@ impl<P: Poly> BigUintPoly<P> {
     }
 
     #[inline]
-    fn schoolbook_partial_products_columns(
+    fn mul_mod_floor(
         &self,
         circuit: &mut PolyCircuit<P>,
-        a: &[GateId],
-        b: &[GateId],
-        max_limbs: usize,
-    ) -> Columns {
-        // Columns sized up to max_limbs; carries to the last column beyond max_limbs are dropped.
-        let mut columns: Columns = vec![vec![]; max_limbs];
-        let pairs: Vec<(usize, usize)> = (0..a.len())
-            .flat_map(|i| (0..b.len()).map(move |j| (i, j)))
-            .filter(|(i, j)| i + j < max_limbs)
-            .collect();
-        for (i, j) in pairs {
-            let k = i + j;
-            let prod = circuit.mul_gate(a[i], b[j]);
-            match self.ctx.luts.as_ref() {
-                None => {
-                    columns[k].push(prod);
-                }
-                Some((mod_lut, floor_lut, _)) => {
-                    let lo = mod_lut.lookup_all(circuit, prod);
-                    columns[k].push(lo);
-                    if k + 1 < max_limbs {
-                        let hi = floor_lut.lookup_all(circuit, prod);
-                        columns[k + 1].push(hi);
-                    }
-                }
-            };
+        x: GateId,
+        y: GateId,
+        output_floor: bool,
+    ) -> (GateId, Option<GateId>) {
+        match self.ctx.luts.as_ref() {
+            None => (circuit.and_gate(x, y), None),
+            Some((_, _, mul_mod_lut, mul_floor_lut, _, _)) => {
+                let shifted = circuit.large_scalar_mul(y, &[self.ctx.scalar_base.clone()]);
+                let key = circuit.add_gate(x, shifted);
+                let mod_out = mul_mod_lut.lookup_all(circuit, key);
+                let floor_out =
+                    if output_floor { Some(mul_floor_lut.lookup_all(circuit, key)) } else { None };
+                (mod_out, floor_out)
+            }
         }
-        columns
     }
 
-    // Wallace tree using compressors per column until height <= 2
     #[inline]
-    fn compress_columns_wallace(
-        &self,
-        circuit: &mut PolyCircuit<P>,
-        columns: &mut Columns,
-    ) -> (Vec<GateId>, Vec<GateId>) {
-        let w = columns.len();
-        if w == 0 {
-            return (vec![], vec![]);
-        }
-        // Choose a safe compressor arity per column.
-        // Each cell is < B, and we reduce up to comp_rate cells in one shot
-        // using a single lookup pair (x % B, x / B) defined for inputs < B^2.
-        // Safety condition: comp_rate * (B-1) <= (B-1)^{2} ==> comp_rate <= B + 1.
-        // To guarantee convergence for B=2 (limb_bit_size=1), use 3:2 compression.
-        let base = 1usize << self.ctx.limb_bit_size;
-        let comp_rate = if base == 2 { 3 } else { base - 1 };
-
-        loop {
-            let w = columns.len();
-            let mut next: Columns = vec![vec![]; w + 1];
-            for k in 0..w {
-                let col = &columns[k];
-                let mut idx = 0;
-                while idx < col.len() {
-                    let group_len = comp_rate.min(col.len() - idx);
-                    if group_len <= 2 {
-                        // Preserve <= 2 items
-                        next[k].extend_from_slice(&col[idx..idx + group_len]);
-                    } else {
-                        // Compress this chunk with one lookup pair.
-                        let (digit, carry) = match self.ctx.luts.as_ref() {
-                            None => {
-                                let (a, b, c) = (col[idx], col[idx + 1], col[idx + 2]);
-                                // digit = a xor b xor c
-                                // carry = (a xor b) and c or (a and b)
-                                let xor_ab = circuit.xor_gate(a, b);
-                                let digit = circuit.xor_gate(xor_ab, c); // sum mod 2
-                                let and_ab = circuit.and_gate(a, b);
-                                let and_abc = circuit.and_gate(xor_ab, c);
-                                let carry = circuit.or_gate(and_ab, and_abc); // carry out
-                                (digit, carry)
-                            }
-                            Some((mod_lut, floor_lut, _)) => {
-                                let mut sum = col[idx];
-                                for i in (idx + 1)..(idx + group_len) {
-                                    sum = circuit.add_gate(sum, col[i]);
-                                }
-                                let digit = mod_lut.lookup_all(circuit, sum); // x % B
-                                let carry = floor_lut.lookup_all(circuit, sum); // x / B
-                                (digit, carry)
-                            }
-                        };
-                        next[k].push(digit);
-                        next[k + 1].push(carry);
-                    }
-                    idx += group_len;
-                }
-            }
-            if next.last().is_some_and(|v| v.is_empty()) {
-                next.pop();
-            }
-            let need_more = next.iter().any(|col| col.len() > 2);
-            *columns = next;
-            if !need_more {
-                break;
-            }
-        }
-
-        // with height <= 2 per column, split any pair into (digit, carry).
-        let w = columns.len();
-        let zero = circuit.const_zero_gate();
-        let mut sum_vec = Vec::with_capacity(w);
-        let mut carry_vec = vec![zero; w + 1];
-
-        for k in 0..w {
-            match columns[k].as_slice() {
-                [] => sum_vec.push(zero),
-                [x] => sum_vec.push(*x),
-                [x, y] => {
-                    let (digit, carry) = match self.ctx.luts.as_ref() {
-                        None => {
-                            let digit = circuit.xor_gate(*x, *y);
-                            let carry = circuit.and_gate(*x, *y);
-                            (digit, carry)
-                        }
-                        Some((mod_lut, floor_lut, _)) => {
-                            let s = circuit.add_gate(*x, *y);
-                            let digit = mod_lut.lookup_all(circuit, s);
-                            let carry = floor_lut.lookup_all(circuit, s);
-                            (digit, carry)
-                        }
-                    };
-                    sum_vec.push(digit);
-                    carry_vec[k + 1] = carry;
-                }
-                _ => unreachable!("column height should be <= 2 after compression"),
-            }
-        }
-        (sum_vec, carry_vec)
-    }
-
     // Final normalization by a parallel-prefix CPA: add S and C (shifted) once to produce digits.
-    #[inline]
     pub(crate) fn final_cpa(
         &self,
         circuit: &mut PolyCircuit<P>,
@@ -546,23 +486,8 @@ impl<P: Poly> BigUintPoly<P> {
         let mut ps = Vec::with_capacity(w);
         for k in 0..w {
             let c = carry_vec.get(k).copied().unwrap_or(zero);
-            let (s, g, p) = match self.ctx.luts.as_ref() {
-                None => {
-                    let s = circuit.xor_gate(sum_vec[k], c);
-                    let g = circuit.and_gate(sum_vec[k], c);
-                    let p = s;
-                    (s, g, p)
-                }
-                Some((mod_lut, floor_lut, _)) => {
-                    let t = circuit.add_gate(sum_vec[k], c);
-                    let s = mod_lut.lookup_all(circuit, t);
-                    let g = floor_lut.lookup_all(circuit, t);
-                    // p = 1 iff s == B-1 <=> floor((s + 1)/B) = 1
-                    let s_plus = circuit.add_gate(s, one);
-                    let p = floor_lut.lookup_all(circuit, s_plus);
-                    (s, g, p)
-                }
-            };
+            let (s, g) = self.add_mod_floor(circuit, sum_vec[k], c);
+            let p = self.add_floor(circuit, s, one);
             ss.push(s);
             gs.push(g);
             ps.push(p);
@@ -571,13 +496,7 @@ impl<P: Poly> BigUintPoly<P> {
         let mut out = Vec::with_capacity(w);
         for i in 0..w {
             let carry_in = if i == 0 { zero } else { g_pref[i - 1] };
-            let digit = match self.ctx.luts.as_ref() {
-                None => circuit.xor_gate(ss[i], carry_in),
-                Some((mod_lut, _, _)) => {
-                    let t = circuit.add_gate(ss[i], carry_in);
-                    mod_lut.lookup_all(circuit, t)
-                }
-            };
+            let digit = self.add_mod(circuit, ss[i], carry_in);
             out.push(digit);
         }
         out
@@ -604,18 +523,31 @@ impl<P: Poly> BigUintPoly<P> {
                     let pj = ps[k - d];
                     let gk = gs[k];
                     let pk = ps[k];
-                    // G' = gk OR (pk AND gj); P' = pk AND pj
-                    let pk_and_gj = circuit.and_gate(pk, gj);
-                    let g_new = circuit.or_gate(gk, pk_and_gj);
-                    let p_new = circuit.and_gate(pk, pj);
-                    gs_next[k] = match self.ctx.luts.as_ref() {
-                        Some((_, _, refresh_lut)) => refresh_lut.lookup_all(circuit, g_new),
-                        None => g_new,
-                    };
-                    ps_next[k] = match self.ctx.luts.as_ref() {
-                        Some((_, _, refresh_lut)) => refresh_lut.lookup_all(circuit, p_new),
-                        None => p_new,
-                    };
+                    match self.ctx.luts.as_ref() {
+                        None => {
+                            // G' = gk OR (pk AND gj); P' = pk AND pj
+                            let pk_and_gj = circuit.and_gate(pk, gj);
+                            let g_new = circuit.or_gate(gk, pk_and_gj);
+                            let p_new = circuit.and_gate(pk, pj);
+                            gs_next[k] = g_new;
+                            ps_next[k] = p_new;
+                        }
+                        Some((_, _, _, _, kss_g_lut, kss_p_lut)) => {
+                            // key_g = gk + 2*gj + 4*pk
+                            let two_gj = circuit.add_gate(gj, gj);
+                            let two_pk = circuit.add_gate(pk, pk);
+                            let four_pk = circuit.add_gate(two_pk, two_pk);
+                            let sum = circuit.add_gate(two_gj, four_pk);
+                            let key_g = circuit.add_gate(gk, sum);
+                            let g_new = kss_g_lut.lookup_all(circuit, key_g);
+                            // key_p = pk + 2*pj
+                            let two_pj = circuit.add_gate(pj, pj);
+                            let key_p = circuit.add_gate(pk, two_pj);
+                            let p_new = kss_p_lut.lookup_all(circuit, key_p);
+                            gs_next[k] = g_new;
+                            ps_next[k] = p_new;
+                        }
+                    }
                 }
             }
             gs = gs_next;
@@ -632,12 +564,104 @@ impl<P: Poly> BigUintPoly<P> {
         circuit: &mut PolyCircuit<P>,
         max_limbs: usize,
     ) -> (Vec<GateId>, Vec<GateId>) {
-        // 1) Schoolbook partial products with immediate split and column placement
-        let mut columns =
-            self.schoolbook_partial_products_columns(circuit, &self.limbs, &other.limbs, max_limbs);
+        // Columns sized up to max_limbs; carries to the last column beyond max_limbs are dropped.
+        let mut columns: Columns = vec![vec![]; max_limbs];
+        for (i, &ai) in self.limbs.iter().enumerate() {
+            for (j, &bj) in other.limbs.iter().enumerate() {
+                let k = i + j;
+                if k >= max_limbs {
+                    continue;
+                }
+                match self.ctx.luts.as_ref() {
+                    None => {
+                        let (prod, _) = self.mul_mod_floor(circuit, ai, bj, false);
+                        columns[k].push(prod);
+                    }
+                    Some((_, _, _, _, _, _)) => {
+                        let (lo, hi) = self.mul_mod_floor(circuit, ai, bj, k + 1 < max_limbs);
+                        columns[k].push(lo);
+                        if let Some(hi) = hi {
+                            columns[k + 1].push(hi);
+                        }
+                    }
+                }
+            }
+        }
 
-        // 2) Compress column
-        self.compress_columns_wallace(circuit, &mut columns)
+        // Wallace tree compression until column height <= 2
+        let base = 1usize << self.ctx.limb_bit_size;
+        let comp_rate = if base == 2 { 3 } else { base - 1 };
+
+        loop {
+            let w = columns.len();
+            let mut next: Columns = vec![vec![]; w + 1];
+            for k in 0..w {
+                let col = &columns[k];
+                let mut idx = 0;
+                while idx < col.len() {
+                    let group_len = comp_rate.min(col.len() - idx);
+                    if group_len <= 2 {
+                        next[k].extend_from_slice(&col[idx..idx + group_len]);
+                    } else {
+                        let (digit, carry) = match self.ctx.luts.as_ref() {
+                            None => {
+                                let (a, b, c) = (col[idx], col[idx + 1], col[idx + 2]);
+                                let xor_ab = circuit.xor_gate(a, b);
+                                let digit = circuit.xor_gate(xor_ab, c);
+                                let and_ab = circuit.and_gate(a, b);
+                                let and_abc = circuit.and_gate(xor_ab, c);
+                                let carry = circuit.or_gate(and_ab, and_abc);
+                                (digit, carry)
+                            }
+                            Some((add_mod_lut, add_floor_lut, _, _, _, _)) => {
+                                let mut sum = col[idx];
+                                for item in &col[(idx + 1)..(idx + group_len)] {
+                                    sum = circuit.add_gate(sum, *item);
+                                }
+                                let digit = add_mod_lut.lookup_all(circuit, sum);
+                                let carry = add_floor_lut.lookup_all(circuit, sum);
+                                (digit, carry)
+                            }
+                        };
+                        next[k].push(digit);
+                        next[k + 1].push(carry);
+                    }
+                    idx += group_len;
+                }
+            }
+            if next.last().is_some_and(|v| v.is_empty()) {
+                next.pop();
+            }
+            let need_more = next.iter().any(|col| col.len() > 2);
+            columns = next;
+            if !need_more {
+                break;
+            }
+        }
+
+        let w = columns.len();
+        if w == 0 {
+            return (vec![], vec![]);
+        }
+
+        let zero = circuit.const_zero_gate();
+        let mut sum_vec = Vec::with_capacity(w);
+        let mut carry_vec = vec![zero; w + 1];
+
+        for k in 0..w {
+            match columns[k].as_slice() {
+                [] => sum_vec.push(zero),
+                [x] => sum_vec.push(*x),
+                [x, y] => {
+                    let (digit, carry) = self.add_mod_floor(circuit, *x, *y);
+                    sum_vec.push(digit);
+                    carry_vec[k + 1] = carry;
+                }
+                _ => unreachable!("column height should be <= 2 after compression"),
+            }
+        }
+
+        (sum_vec, carry_vec)
     }
 }
 

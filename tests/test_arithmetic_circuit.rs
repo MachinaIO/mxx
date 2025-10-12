@@ -42,7 +42,7 @@ async fn test_arithmetic_circuit_operations() {
         .collect::<Vec<_>>();
     let inputs = vec![&a_vec[..], &b_vec[..], &c_vec[..]];
     let mut mixed_circuit =
-        ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, n, inputs.len());
+        ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, n, inputs.len(), false);
     let add_idx = mixed_circuit.add(ArithGateId::new(0), ArithGateId::new(1)); // a + b
     let mul_idx = mixed_circuit.mul(add_idx, ArithGateId::new(2)); // (a + b) * c
     let final_idx = mixed_circuit.sub(mul_idx, ArithGateId::new(0)); // (a + b) * c - a
@@ -136,7 +136,7 @@ async fn test_arithmetic_circuit_single_limb() {
 
     // Test mixed operations in single circuit: (a + b) * c - a.
     let mut mixed_circuit =
-        ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, n, inputs.len());
+        ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, n, inputs.len(), false);
     let add_idx = mixed_circuit.add(ArithGateId::new(0), ArithGateId::new(1)); // a + b
     let mul_idx = mixed_circuit.mul(add_idx, ArithGateId::new(2)); // (a + b) * c
     let final_idx = mixed_circuit.sub(mul_idx, ArithGateId::new(0)); // (a + b) * c - a

@@ -137,6 +137,7 @@ mod tests {
             limb_bit_size,
             ring_degree,
             height,
+            false,
         );
 
         let ring_n = params.ring_dimension() as usize;

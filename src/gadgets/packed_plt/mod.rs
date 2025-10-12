@@ -52,6 +52,7 @@ impl<P: Poly> PackedPlt<P> {
             return Self { max_degree, plt_ids, mul_scalars, reconstruct_coeffs, _p: PhantomData };
         }
 
+        plt_ids = vec![vec![0; max_degree]; crt_depth];
         let lag_bases: Vec<P> = (0..max_degree)
             .map(|j| {
                 let mut slots = vec![BigUint::ZERO; ring_n];

@@ -45,11 +45,9 @@ impl<P: Poly> PackedPlt<P> {
                     P::const_zero(params),
                     (0, P::from_biguint_to_constant(params, qi_big)),
                 );
-                for slot_idx in 0..max_degree {
-                    let plt = PublicLut::<P>::new(hashmap.clone());
-                    let plt_id = circuit.register_public_lookup(plt);
-                    plt_ids[i][slot_idx] = plt_id;
-                }
+                let plt = PublicLut::<P>::new(hashmap.clone());
+                let plt_id = circuit.register_public_lookup(plt);
+                plt_ids[i] = vec![plt_id; max_degree];
             }
             return Self { max_degree, plt_ids, mul_scalars, reconstruct_coeffs, _p: PhantomData };
         }

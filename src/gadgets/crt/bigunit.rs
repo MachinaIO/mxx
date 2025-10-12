@@ -78,6 +78,18 @@ impl<P: Poly> BigUintPolyContext<P> {
         max_degree: usize,
         dummy_scalar: bool,
     ) -> (PackedPlt<P>, PackedPlt<P>, PackedPlt<P>, PackedPlt<P>, PackedPlt<P>, PackedPlt<P>) {
+        if dummy_scalar {
+            let mut dummy_hashmap = HashMap::new();
+            dummy_hashmap.insert(BigUint::zero(), (0, BigUint::zero()));
+            return (
+                PackedPlt::setup(circuit, params, max_degree, dummy_hashmap.clone(), dummy_scalar),
+                PackedPlt::setup(circuit, params, max_degree, dummy_hashmap.clone(), dummy_scalar),
+                PackedPlt::setup(circuit, params, max_degree, dummy_hashmap.clone(), dummy_scalar),
+                PackedPlt::setup(circuit, params, max_degree, dummy_hashmap.clone(), dummy_scalar),
+                PackedPlt::setup(circuit, params, max_degree, dummy_hashmap.clone(), dummy_scalar),
+                PackedPlt::setup(circuit, params, max_degree, dummy_hashmap, dummy_scalar),
+            );
+        }
         // B_p base
         let b = base;
 

@@ -5,9 +5,7 @@ use crate::{
         public_key::BggPublicKey,
         sampler::{BGGEncodingSampler, BGGPublicKeySampler},
     },
-    gadgets::crt::{
-        biguint_vec_to_crt_poly, biguint_vec_to_packed_crt_poly, num_limbs_of_crt_poly,
-    },
+    gadgets::crt::encode_modulo_poly,
     lookup::{
         lwe_eval::{LweBggEncodingPltEvaluator, LweBggPubKeyEvaluator},
         poly::PolyPltEvaluator,
@@ -26,22 +24,12 @@ const TAG_BGG_PUBKEY: &[u8] = b"BGG_PUBKEY";
 impl<P: Poly> ArithmeticCircuit<P> {
     pub fn evaluate_with_poly(&self, params: &P::Params, inputs: &[&[BigUint]]) -> Vec<P> {
         let one = P::const_one(params);
-        let input_polys = if self.use_packing {
-            inputs
-                .iter()
-                .flat_map(|input| biguint_vec_to_packed_crt_poly(self.limb_bit_size, params, input))
-                .collect::<Vec<_>>()
-        } else {
-            inputs
-                .iter()
-                .flat_map(|input| biguint_vec_to_crt_poly(self.limb_bit_size, params, input))
-                .collect::<Vec<_>>()
-        };
-        let plt_evaluator = if self.use_packing || self.limb_bit_size > 1 {
-            Some(PolyPltEvaluator::new())
-        } else {
-            None
-        };
+        let input_polys = inputs
+            .iter()
+            .flat_map(|input| encode_modulo_poly(self.limb_bit_size, params, input))
+            .collect::<Vec<_>>();
+        let plt_evaluator =
+            if self.limb_bit_size > 1 { Some(PolyPltEvaluator::new()) } else { None };
         self.poly_circuit.eval(params, &one, &input_polys, plt_evaluator)
     }
 
@@ -64,7 +52,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
         init_storage_system();
         let pubkeys = self.sample_input_pubkeys::<M, SH>(params, seed, d);
         info!("sampled all pubkeys {}", pubkeys.len());
-        let plt_evaluator = if self.use_packing || self.limb_bit_size > 1 {
+        let plt_evaluator = if self.limb_bit_size > 1 {
             Some(LweBggPubKeyEvaluator::<M, SH, ST>::new(
                 seed,
                 trapdoor_sampler,
@@ -100,17 +88,10 @@ impl<P: Poly> ArithmeticCircuit<P> {
         // If error_sigma <= 0.0, disable noise to allow exact equality in tests.
         let gauss_sigma = if error_sigma > 0.0 { Some(error_sigma) } else { None };
         let bgg_encoding_sampler = BGGEncodingSampler::<SU>::new(params, secret, gauss_sigma);
-        let plaintexts = if self.use_packing {
-            inputs
-                .iter()
-                .flat_map(|input| biguint_vec_to_packed_crt_poly(self.limb_bit_size, params, input))
-                .collect::<Vec<_>>()
-        } else {
-            inputs
-                .iter()
-                .flat_map(|input| biguint_vec_to_crt_poly(self.limb_bit_size, params, input))
-                .collect::<Vec<_>>()
-        };
+        let plaintexts = inputs
+            .iter()
+            .flat_map(|input| encode_modulo_poly(self.limb_bit_size, params, input))
+            .collect::<Vec<_>>();
         let pubkeys = self.sample_input_pubkeys::<M, SH>(params, seed, secret.len());
         let encodings = bgg_encoding_sampler.sample(params, &pubkeys, &plaintexts);
         let bgg_evaluator = LweBggEncodingPltEvaluator::<M, SH>::new(seed, dir_path, p);
@@ -127,15 +108,59 @@ impl<P: Poly> ArithmeticCircuit<P> {
         M: PolyMatrix<P = P> + Clone + Send + Sync + 'static,
         SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     {
-        let num_given_input_polys = if self.use_packing {
+        let num_given_input_polys = {
             let (_, crt_bits, _) = params.to_crt();
             let num_limbs_per_slot = crt_bits.div_ceil(self.limb_bit_size);
             self.num_inputs * num_limbs_per_slot
-        } else {
-            self.num_inputs * num_limbs_of_crt_poly::<P>(self.limb_bit_size, params)
         };
         let reveal_plaintexts = vec![true; num_given_input_polys + 1];
         let bgg_pubkey_sampler = BGGPublicKeySampler::<_, SH>::new(seed, d);
         bgg_pubkey_sampler.sample(params, TAG_BGG_PUBKEY, &reveal_plaintexts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly};
+    use num_bigint::BigUint;
+    use num_traits::One;
+
+    #[test]
+    fn test_benchmark_multiplication_tree_evaluation() {
+        let params = DCRTPolyParams::default();
+        let ring_degree = params.ring_dimension() as usize;
+        let height = 4;
+        let limb_bit_size = 3usize;
+        let circuit = ArithmeticCircuit::<DCRTPoly>::benchmark_multiplication_tree(
+            &params,
+            limb_bit_size,
+            ring_degree,
+            height,
+            false,
+        );
+
+        let ring_n = params.ring_dimension() as usize;
+        let num_inputs = 1usize << height;
+        let inputs: Vec<Vec<BigUint>> = (0..num_inputs)
+            .map(|i| {
+                (0..ring_n).map(|slot| BigUint::from(((i + slot + 1) % 13 + 1) as u64)).collect()
+            })
+            .collect();
+
+        let modulus = params.modulus();
+        let modulus_ref = modulus.as_ref();
+        let expected_slots = (0..ring_n)
+            .map(|slot| {
+                inputs.iter().fold(BigUint::one(), |acc, input| (acc * &input[slot]) % modulus_ref)
+            })
+            .collect::<Vec<_>>();
+        let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_slots);
+
+        let input_refs = inputs.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let result = circuit.evaluate_with_poly(&params, &input_refs);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], expected_poly);
     }
 }

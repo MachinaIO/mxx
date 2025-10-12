@@ -315,7 +315,7 @@ mod tests {
         assert_eq!(first_inputs.len(), 1);
 
         // Insert a const gate between input() calls to force a gap in GateIds
-        let _const_gate = circuit.const_digits_poly(&[1u32, 0u32, 1u32]);
+        let _const_gate = circuit.const_digits(&[1u32, 0u32, 1u32]);
 
         // Second input call: next input gate id should not be consecutive to the first
         let second_inputs = circuit.input(1);

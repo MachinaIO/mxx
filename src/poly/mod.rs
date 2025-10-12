@@ -2,6 +2,7 @@ pub mod dcrt;
 
 use itertools::Itertools;
 use num_bigint::BigUint;
+use num_traits::ToPrimitive;
 use std::{
     fmt::Debug,
     hash::Hash,
@@ -9,6 +10,8 @@ use std::{
     path::Path,
     sync::Arc,
 };
+
+use crate::utils::mod_inverse;
 
 use super::element::PolyElem;
 
@@ -30,6 +33,22 @@ pub trait PolyParams: Clone + Debug + PartialEq + Eq + Send + Sync {
     /// Given the parameter, return the crt decomposed moduli as array along with the bit size and
     /// depth of these moduli.
     fn to_crt(&self) -> (Vec<u64>, usize, usize);
+    // return `q/q_i` and the coefficient for CRT reconstruction.
+    fn to_crt_coeffs(&self, crt_idx: usize) -> (BigUint, BigUint) {
+        let (moduli, _, _) = self.to_crt();
+        let qi_big = BigUint::from(moduli[crt_idx]);
+        let modulus_big: Arc<BigUint> = self.modulus().into();
+        let q_over_qi = modulus_big.as_ref() / &qi_big;
+        let q_over_qi_mod = &q_over_qi % &qi_big;
+        let inv = mod_inverse(
+            q_over_qi_mod.to_u64().expect("CRT residue must fit in u64"),
+            qi_big.to_u64().expect("CRT modulus must fit in u64"),
+        )
+        .expect("CRT moduli must be coprime");
+        let inv_big = BigUint::from(inv);
+        let reconst_coeff = (&q_over_qi * inv_big) % modulus_big.as_ref();
+        (q_over_qi, reconst_coeff)
+    }
 }
 
 pub trait Poly:
@@ -92,6 +111,9 @@ pub trait Poly:
                 if u32s.len() == 1 { u32s[0] } else { 0 }
             })
             .collect()
+    }
+    fn coeffs_biguints(&self) -> Vec<BigUint> {
+        self.coeffs().iter().map(|elem| elem.value().clone()).collect()
     }
     fn const_zero(params: &Self::Params) -> Self;
     fn const_one(params: &Self::Params) -> Self;

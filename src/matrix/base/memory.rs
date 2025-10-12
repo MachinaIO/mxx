@@ -323,14 +323,12 @@ impl<T: MatrixElem> BaseMatrix<T> {
 
 impl<T: MatrixElem> Debug for BaseMatrix<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let fmt = f
-            .debug_struct("BaseMatrix")
+        f.debug_struct("BaseMatrix")
             .field("params", &self.params)
             .field("nrow", &self.nrow)
             .field("ncol", &self.ncol)
             .field("inner", &self.inner)
-            .finish();
-        fmt
+            .finish()
     }
 }
 

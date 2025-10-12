@@ -132,20 +132,19 @@ static LOOKUP_BUFFERS: OnceLock<Arc<Mutex<MultiBatchLookupBuffer>>> = OnceLock::
 
 /// Initialize the storage system with an optional byte limit for batched lookup tables.
 pub fn init_storage_system() {
-    WRITE_HANDLES
-        .set(Arc::new(Mutex::new(Vec::new())))
-        .expect("Storage system already initialized");
-    RUNTIME_HANDLE
-        .set(tokio::runtime::Handle::current())
-        .expect("Storage system already initialized");
-    let bytes_limit = std::env::var("LUT_BYTES_LIMIT").ok().and_then(|s| s.parse::<usize>().ok());
-    info!("LUT_BYTES_LIMIT={:?}", bytes_limit);
-    let buffer = if let Some(limit) = bytes_limit {
-        MultiBatchLookupBuffer::with_limit(limit)
-    } else {
-        MultiBatchLookupBuffer::new()
-    };
-    LOOKUP_BUFFERS.set(Arc::new(Mutex::new(buffer))).expect("Storage system already initialized");
+    let _ = WRITE_HANDLES.get_or_init(|| Arc::new(Mutex::new(Vec::new())));
+    let _ = RUNTIME_HANDLE.get_or_init(|| tokio::runtime::Handle::current());
+    let _ = LOOKUP_BUFFERS.get_or_init(|| {
+        let bytes_limit =
+            std::env::var("LUT_BYTES_LIMIT").ok().and_then(|s| s.parse::<usize>().ok());
+        info!("LUT_BYTES_LIMIT={:?}", bytes_limit);
+        let buffer = if let Some(limit) = bytes_limit {
+            MultiBatchLookupBuffer::with_limit(limit)
+        } else {
+            MultiBatchLookupBuffer::new()
+        };
+        Arc::new(Mutex::new(buffer))
+    });
 }
 
 /// Split a MultiBatchLookupBuffer into multiple buffers based on byte limit.

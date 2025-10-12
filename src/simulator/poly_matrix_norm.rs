@@ -1,7 +1,7 @@
 use super::poly_norm::PolyNorm;
 use crate::{impl_binop_with_refs, simulator::SimulatorContext};
 use bigdecimal::BigDecimal;
-use num_traits::{FromPrimitive, One};
+use num_traits::One;
 use std::{
     ops::{Add, AddAssign, Mul, MulAssign},
     sync::Arc,
@@ -122,11 +122,11 @@ impl AddAssign for PolyMatrixNorm {
 impl_binop_with_refs!(PolyMatrixNorm => Mul::mul(self, rhs: &PolyMatrixNorm) -> PolyMatrixNorm {
     assert!(self.poly_norm.ctx == rhs.poly_norm.ctx, "ctx must match");
     assert!(self.ncol == rhs.nrow, "inner dims must match for multiplication");
-    let zero_rows_bd = rhs
-        .zero_rows
-        .and_then(|z| BigDecimal::from_u64(z as u64))
-        .unwrap_or_else(|| BigDecimal::from_f64(0.0).unwrap());
-    let scale = self.ncol_sqrt.clone() - zero_rows_bd;
+    let scale = if let Some(z) = rhs.zero_rows {
+        BigDecimal::from(self.ncol as u64 - z as u64).sqrt().expect("sqrt(ncol) to failed")
+    } else {
+        self.ncol_sqrt.clone()
+    };
     let pn = (&self.poly_norm * &rhs.poly_norm) * scale;
     PolyMatrixNorm { nrow: self.nrow, ncol: rhs.ncol, ncol_sqrt: rhs.ncol_sqrt.clone(), poly_norm: pn, zero_rows: None }
 });
@@ -134,11 +134,11 @@ impl_binop_with_refs!(PolyMatrixNorm => Mul::mul(self, rhs: &PolyMatrixNorm) -> 
 impl MulAssign for PolyMatrixNorm {
     fn mul_assign(&mut self, rhs: Self) {
         assert!(self.ncol == rhs.nrow, "inner dims must match for multiplication");
-        let zero_rows_bd = rhs
-            .zero_rows
-            .and_then(|z| BigDecimal::from_u64(z as u64))
-            .unwrap_or_else(|| BigDecimal::from_f64(0.0).unwrap());
-        let scale = self.ncol_sqrt.clone() - zero_rows_bd;
+        let scale = if let Some(z) = rhs.zero_rows {
+            BigDecimal::from(self.ncol as u64 - z as u64).sqrt().expect("sqrt(ncol) to failed")
+        } else {
+            self.ncol_sqrt.clone()
+        };
         self.poly_norm = (self.poly_norm.clone() * rhs.poly_norm) * scale;
         self.ncol = rhs.ncol;
         self.ncol_sqrt = rhs.ncol_sqrt;

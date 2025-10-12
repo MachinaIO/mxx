@@ -1,7 +1,8 @@
 use crate::{
     circuit::PolyCircuit,
-    gadgets::crt::{CrtContext, CrtPoly},
+    gadgets::crt::{ModuloPoly, ModuloPolyContext},
     poly::Poly,
+    utils::log_mem,
 };
 use std::sync::Arc;
 
@@ -36,11 +37,11 @@ pub struct ArithmeticCircuit<P: Poly> {
     pub max_degree: usize,
     pub num_inputs: usize,
     pub poly_circuit: PolyCircuit<P>,
-    pub ctx: Arc<CrtContext<P>>,
-    pub use_packing: bool,
-    pub use_reconstruction: bool,
+    pub ctx: Arc<ModuloPolyContext<P>>,
+    // pub use_packing: bool,
+    // pub use_reconstruction: bool,
     // inputs + intermediate results
-    pub all_values: Vec<CrtPoly<P>>,
+    pub all_values: Vec<ModuloPoly<P>>,
 }
 
 impl<P: Poly> ArithmeticCircuit<P> {
@@ -49,54 +50,25 @@ impl<P: Poly> ArithmeticCircuit<P> {
         limb_bit_size: usize,
         max_degree: usize,
         num_inputs: usize,
-        use_packing: bool,
-        use_reconstruction: bool,
+        dummy_scalar: bool,
     ) -> Self {
         let mut poly_circuit = PolyCircuit::<P>::new();
         let mut all_values = Vec::with_capacity(num_inputs);
-        let ctx: Arc<CrtContext<P>> = if use_packing {
-            // let pack_ctx =
-            //     Arc::new(PackedCrtContext::setup(&mut poly_circuit, params, limb_bit_size));
-            // let packed_inputs =
-            //     PackedCrtPoly::input(pack_ctx.clone(), &mut poly_circuit, num_inputs);
-            // let crt_polys =
-            let ctx = Arc::new(CrtContext::setup(
-                &mut poly_circuit,
-                params,
-                limb_bit_size,
-                max_degree,
-                true,
-            ));
-            let crt_polys = (0..num_inputs)
-                .map(|_| CrtPoly::input_packed(ctx.clone(), &mut poly_circuit, params))
-                .collect::<Vec<_>>();
-            all_values.extend(crt_polys);
-            ctx
-        } else {
-            let ctx = Arc::new(CrtContext::setup(
-                &mut poly_circuit,
-                params,
-                limb_bit_size,
-                max_degree,
-                false,
-            ));
-            let crt_polys = (0..num_inputs)
-                .map(|_| CrtPoly::input(ctx.clone(), &mut poly_circuit))
-                .collect::<Vec<_>>();
-            all_values.extend(crt_polys);
-            ctx
-        };
-
-        ArithmeticCircuit {
+        log_mem("before ModuloPolyContext setup");
+        let ctx = Arc::new(ModuloPolyContext::setup(
+            &mut poly_circuit,
+            params,
             limb_bit_size,
             max_degree,
-            num_inputs,
-            poly_circuit,
-            ctx,
-            use_packing,
-            use_reconstruction,
-            all_values,
-        }
+            dummy_scalar,
+        ));
+        log_mem("after ModuloPolyContext setup");
+        let crt_polys = (0..num_inputs)
+            .map(|_| ModuloPoly::input(ctx.clone(), &mut poly_circuit))
+            .collect::<Vec<_>>();
+        all_values.extend(crt_polys);
+
+        ArithmeticCircuit { limb_bit_size, max_degree, num_inputs, poly_circuit, ctx, all_values }
     }
 
     pub fn to_poly_circuit(self) -> PolyCircuit<P> {
@@ -154,12 +126,42 @@ impl<P: Poly> ArithmeticCircuit<P> {
         let idx = value_index.as_usize();
         assert!(idx < self.all_values.len(), "value_index out of bounds");
         let result_crt = &self.all_values[idx];
-        if self.use_reconstruction {
-            let output_gate = result_crt.finalize_reconst(&mut self.poly_circuit);
-            self.poly_circuit.output(vec![output_gate]);
-        } else {
-            let gates = result_crt.finalize_crt(&mut self.poly_circuit);
-            self.poly_circuit.output(gates);
-        };
+        let out = result_crt.finalize(&mut self.poly_circuit);
+
+        self.poly_circuit.output(vec![out]);
+    }
+
+    pub fn benchmark_multiplication_tree(
+        params: &<P as Poly>::Params,
+        limb_bit_size: usize,
+        max_degree: usize,
+        height: usize,
+        dummy_scalar: bool,
+    ) -> Self {
+        assert!(height >= 1, "height must be at least 1 to build a multiplication tree");
+        let num_inputs =
+            1usize.checked_shl(height as u32).expect("height is too large to represent 2^h inputs");
+
+        let mut circuit = Self::setup(params, limb_bit_size, max_degree, num_inputs, dummy_scalar);
+
+        // Collect the leaf identifiers representing the primary inputs.
+        let mut current_layer: Vec<ArithGateId> = (0..num_inputs).map(ArithGateId::from).collect();
+
+        // Repeatedly pairwise multiply adjacent nodes until a single root remains.
+        while current_layer.len() > 1 {
+            debug_assert!(current_layer.len().is_multiple_of(2), "layer size must stay even");
+            let mut next_layer = Vec::with_capacity(current_layer.len() / 2);
+            log_mem(format!("before layer size {}", current_layer.len()));
+            for pair in current_layer.chunks(2) {
+                let parent = circuit.mul(pair[0], pair[1]);
+                next_layer.push(parent);
+            }
+            log_mem(format!("after layer size {}", current_layer.len()));
+            current_layer = next_layer;
+        }
+
+        let root = current_layer.pop().expect("multiplication tree must contain at least one node");
+        circuit.output(root);
+        circuit
     }
 }

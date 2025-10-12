@@ -43,11 +43,17 @@ impl<P: Poly> ModuloPolyContext<P> {
         params: &P::Params,
         limb_bit_size: usize,
         max_degree: usize,
+        dummy_scalar: bool,
     ) -> Self {
         let (moduli, crt_bits, crt_depth) = params.to_crt();
         let num_limbs = crt_bits.div_ceil(limb_bit_size);
-        let biguint_ctx =
-            Arc::new(BigUintPolyContext::setup(circuit, params, limb_bit_size, max_degree));
+        let biguint_ctx = Arc::new(BigUintPolyContext::setup(
+            circuit,
+            params,
+            limb_bit_size,
+            max_degree,
+            dummy_scalar,
+        ));
 
         let moduli_poly =
             Self::constant_biguint_poly(circuit, params, biguint_ctx.clone(), num_limbs, &moduli);
@@ -241,6 +247,7 @@ mod tests {
             &params,
             limb_bit_size,
             params.ring_dimension() as usize,
+            false,
         ));
         (params, ctx)
     }

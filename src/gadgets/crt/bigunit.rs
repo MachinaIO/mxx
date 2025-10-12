@@ -54,6 +54,7 @@ impl<P: Poly> BigUintPolyContext<P> {
         params: &P::Params,
         limb_bit_size: usize,
         max_degree: usize,
+        dummy_scalar: bool,
     ) -> Self {
         // Assume base < 2^32
         debug_assert!(limb_bit_size < 32);
@@ -62,7 +63,7 @@ impl<P: Poly> BigUintPolyContext<P> {
         let const_base = circuit.const_digits(&[base as u32]);
         let scalar_base = BigUint::from(base);
         let luts = if limb_bit_size > 1 {
-            let luts = Self::setup_packed_luts(circuit, params, base, max_degree);
+            let luts = Self::setup_packed_luts(circuit, params, base, max_degree, dummy_scalar);
             Some(luts)
         } else {
             None
@@ -75,6 +76,7 @@ impl<P: Poly> BigUintPolyContext<P> {
         params: &P::Params,
         base: usize,
         max_degree: usize,
+        dummy_scalar: bool,
     ) -> (PackedPlt<P>, PackedPlt<P>, PackedPlt<P>, PackedPlt<P>, PackedPlt<P>, PackedPlt<P>) {
         // B_p base
         let b = base;
@@ -135,12 +137,12 @@ impl<P: Poly> BigUintPolyContext<P> {
             }));
 
         (
-            PackedPlt::setup(circuit, params, max_degree, add_map_mod),
-            PackedPlt::setup(circuit, params, max_degree, add_map_floor),
-            PackedPlt::setup(circuit, params, max_degree, mul_map_mod),
-            PackedPlt::setup(circuit, params, max_degree, mul_map_floor),
-            PackedPlt::setup(circuit, params, max_degree, or_and_map),
-            PackedPlt::setup(circuit, params, max_degree, and_map),
+            PackedPlt::setup(circuit, params, max_degree, add_map_mod, dummy_scalar),
+            PackedPlt::setup(circuit, params, max_degree, add_map_floor, dummy_scalar),
+            PackedPlt::setup(circuit, params, max_degree, mul_map_mod, dummy_scalar),
+            PackedPlt::setup(circuit, params, max_degree, mul_map_floor, dummy_scalar),
+            PackedPlt::setup(circuit, params, max_degree, or_and_map, dummy_scalar),
+            PackedPlt::setup(circuit, params, max_degree, and_map, dummy_scalar),
         )
     }
 }
@@ -718,6 +720,7 @@ mod tests {
             &params,
             LIMB_BIT_SIZE,
             params.ring_dimension() as usize,
+            false,
         ));
         (params, ctx)
     }
@@ -1449,6 +1452,7 @@ mod tests {
             &params,
             1, // limb_bit_size = 1
             params.ring_dimension() as usize,
+            false,
         ));
 
         // SIMD cases: element-wise add
@@ -1492,6 +1496,7 @@ mod tests {
             &params,
             1, // limb_bit_size = 1
             params.ring_dimension() as usize,
+            false,
         ));
 
         // SIMD: choose mixed cases
@@ -1538,6 +1543,7 @@ mod tests {
             &params,
             1, // limb_bit_size = 1
             params.ring_dimension() as usize,
+            false,
         ));
 
         // SIMD: element-wise mul in base-2

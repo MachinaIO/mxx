@@ -5,8 +5,8 @@ use crate::{
     poly::{Poly, PolyParams},
 };
 use num_bigint::BigUint;
-use num_traits::{One, Zero};
-use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+use num_traits::One;
+use std::{collections::HashMap, marker::PhantomData};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackedPlt<P: Poly> {
@@ -23,12 +23,36 @@ impl<P: Poly> PackedPlt<P> {
         params: &P::Params,
         max_degree: usize,
         hashmap: HashMap<BigUint, (usize, BigUint)>,
+        dummy_scalar: bool,
     ) -> Self {
         let (moduli, _, crt_depth) = params.to_crt();
         let ring_n = params.ring_dimension() as usize;
         debug_assert!(max_degree <= ring_n, "max_degree must be <= ring_dimension");
 
-        let big_q_arc: Arc<BigUint> = params.modulus().into();
+        let mut mul_scalars = vec![vec![vec![]; max_degree]; crt_depth];
+        let mut reconstruct_coeffs = Vec::with_capacity(crt_depth);
+        let mut plt_ids = vec![vec![0usize; max_degree]; crt_depth];
+
+        if dummy_scalar {
+            // let mul_scalars = vec![vec![vec![BigUint::one()]; max_degree]; crt_depth];
+            // let reconstruct_coeffs = vec![BigUint::one(); crt_depth];
+            for i in 0..crt_depth {
+                let qi_big = BigUint::from(moduli[i]);
+                mul_scalars[i] = vec![vec![qi_big.clone()]; max_degree];
+                reconstruct_coeffs[i] = qi_big.clone();
+                let mut hashmap = HashMap::new();
+                hashmap.insert(
+                    P::const_zero(params),
+                    (0, P::from_biguint_to_constant(params, qi_big)),
+                );
+                for slot_idx in 0..max_degree {
+                    let plt = PublicLut::<P>::new(hashmap.clone());
+                    let plt_id = circuit.register_public_lookup(plt);
+                    plt_ids[i][slot_idx] = plt_id;
+                }
+            }
+            return Self { max_degree, plt_ids, mul_scalars, reconstruct_coeffs, _p: PhantomData };
+        }
 
         let lag_bases: Vec<P> = (0..max_degree)
             .map(|j| {
@@ -38,11 +62,7 @@ impl<P: Poly> PackedPlt<P> {
             })
             .collect();
 
-        let mut plt_ids = vec![vec![0usize; max_degree]; crt_depth];
-        let mut mul_scalars = vec![vec![vec![]; max_degree]; crt_depth];
-        let mut reconstruct_coeffs = Vec::with_capacity(crt_depth);
-
-        for (i, &qi) in moduli.iter().enumerate() {
+        for i in 0..crt_depth {
             let (q_over_qi, reconstruct_coeff) = params.to_crt_coeffs(i);
             reconstruct_coeffs.push(reconstruct_coeff);
 
@@ -129,7 +149,7 @@ mod tests {
         }
         let slots = (0..ring_n).map(BigUint::from).collect::<Vec<_>>();
         let input_poly = DCRTPoly::from_biguints_eval(&params, &slots);
-        let gadget = PackedPlt::setup(&mut circuit, &params, ring_n, hashmap);
+        let gadget = PackedPlt::setup(&mut circuit, &params, ring_n, hashmap, false);
         let inputs = circuit.input(1);
         let slot_idx = 2;
         let out = gadget.lookup_single(&mut circuit, slot_idx, inputs[0]);
@@ -163,7 +183,7 @@ mod tests {
         }
         let slots = (0..ring_n).map(BigUint::from).collect::<Vec<_>>();
         let input_poly = DCRTPoly::from_biguints_eval(&params, &slots);
-        let gadget = PackedPlt::setup(&mut circuit, &params, ring_n, hashmap);
+        let gadget = PackedPlt::setup(&mut circuit, &params, ring_n, hashmap, false);
         let inputs = circuit.input(1);
         let out = gadget.lookup_all(&mut circuit, inputs[0]);
         circuit.output(vec![out]);

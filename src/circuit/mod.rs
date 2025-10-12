@@ -93,6 +93,48 @@ impl<P: Poly> PolyCircuit<P> {
         }
     }
 
+    /// Computes the circuit depth excluding Add gates.
+    ///
+    /// Definition:
+    /// - Inputs and the reserved constant-one gate contribute 0 to depth.
+    /// - An Add gate does not increase depth: level(add) = max(level(inputs)).
+    /// - Any other non-input gate increases depth by 1: level(g) = max(level(inputs)) + 1.
+    /// - If there are no outputs, returns 0.
+    pub fn non_free_depth(&self) -> usize {
+        if self.output_ids.is_empty() {
+            return 0;
+        }
+
+        // Compute a topo order of all gates needed for outputs
+        let order = self.topological_order();
+        let mut level_map: HashMap<GateId, usize> = HashMap::new();
+
+        for gate_id in order.iter() {
+            let gate = self.gates.get(gate_id).expect("gate not found");
+            if gate.input_gates.is_empty() {
+                // Inputs and consts
+                level_map.insert(*gate_id, 0);
+                continue;
+            }
+
+            let max_in = gate
+                .input_gates
+                .iter()
+                .map(|id| level_map[id])
+                .max()
+                .expect("non-input gate must have inputs");
+
+            let incr = match gate.gate_type {
+                PolyGateType::Add => 0,
+                _ => 1,
+            };
+            level_map.insert(*gate_id, max_in + incr);
+        }
+
+        // Max depth among outputs
+        self.output_ids.iter().map(|id| level_map[id]).max().unwrap_or(0)
+    }
+
     pub fn recompute_gate_counts(&mut self) {
         self.gate_counts.clear();
         for gate in self.gates.values() {

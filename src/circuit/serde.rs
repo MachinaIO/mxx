@@ -254,7 +254,7 @@ mod tests {
         // resulting in non-consecutive input GateIds.
         let mut circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
         let first_inputs = circuit.input(1);
-        let _gap_gate = circuit.const_digits_poly(&[1u32, 0u32, 1u32]);
+        let _gap_gate = circuit.const_digits(&[1u32, 0u32, 1u32]);
         let second_inputs = circuit.input(1);
         // Ensure the input GateIds are not consecutive
         assert_ne!(second_inputs[0].0, first_inputs[0].0 + 1);

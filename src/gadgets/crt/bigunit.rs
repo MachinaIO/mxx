@@ -59,7 +59,7 @@ impl<P: Poly> BigUintPolyContext<P> {
         debug_assert!(limb_bit_size < 32);
         let base = 1 << limb_bit_size;
         let const_zero = circuit.const_zero_gate();
-        let const_base = circuit.const_digits_poly(&[base as u32]);
+        let const_base = circuit.const_digits(&[base as u32]);
         let scalar_base = BigUint::from(base);
         let luts = if limb_bit_size > 1 {
             let luts = Self::setup_packed_luts(circuit, params, base, max_degree);
@@ -168,20 +168,12 @@ impl<P: Poly> BigUintPoly<P> {
         Self { ctx, limbs, _p: PhantomData }
     }
 
-    pub fn const_u64(
+    pub fn const_limbs(
         ctx: Arc<BigUintPolyContext<P>>,
         circuit: &mut PolyCircuit<P>,
-        value: u64,
+        limbs: &[P],
     ) -> Self {
-        let mut limbs = vec![];
-        let mut remaining_value = value;
-        let base = 1u64 << ctx.limb_bit_size;
-        while remaining_value > 0 {
-            limbs.push(circuit.const_digits_poly(&[(remaining_value % base) as u32]));
-            remaining_value /= base;
-        }
-
-        debug_assert_eq!(remaining_value, 0);
+        let limbs = limbs.into_iter().map(|poly| circuit.const_poly(poly)).collect();
         Self { ctx, limbs, _p: PhantomData }
     }
 
@@ -307,7 +299,7 @@ impl<P: Poly> BigUintPoly<P> {
         let one = circuit.const_one_gate();
         let base_minus_one = {
             let b_minus_1 = (1u32 << self.ctx.limb_bit_size) - 1;
-            circuit.const_digits_poly(&[b_minus_1])
+            circuit.const_digits(&[b_minus_1])
         };
 
         // For each limb i, compute t_i = a_i + (B-1) - b_i.
@@ -699,28 +691,6 @@ pub fn encode_biguint_poly<P: Poly>(
     }
     limb_slots.iter().map(|slots| P::from_biguints_eval(params, slots)).collect::<Vec<_>>()
 }
-
-// pub fn biguint_to_biguint_poly<P: Poly>(
-//     limb_bit_size: usize,
-//     params: &P::Params,
-//     inputs: &[BigUint],
-//     num_limbs: Option<usize>,
-// ) -> Vec<P> {
-//     let (moduli, _, crt_depth) = params.to_crt();
-//     let ring_n = params.ring_dimension() as usize;
-//     let mut residues: Vec<Vec<u64>> = vec![vec![0u64; ring_n]; crt_depth];
-//     for (eval_idx, value) in inputs.iter().enumerate() {
-//         if eval_idx >= ring_n {
-//             break;
-//         }
-//         for (crt_idx, &qi) in moduli.iter().enumerate() {
-//             let qi_big = BigUint::from(qi);
-//             let residue = (value % &qi_big).to_u64().unwrap_or(0);
-//             residues[crt_idx][eval_idx] = residue;
-//         }
-//     }
-//     u64_vec_to_biguint_poly(limb_bit_size, params, &residues, num_limbs)
-// }
 
 #[cfg(test)]
 mod tests {

@@ -15,7 +15,7 @@ use crate::{
 use keccak_asm::Keccak256;
 use memory_stats::memory_stats;
 use num_bigint::BigUint;
-use num_traits::{One, Zero};
+use num_traits::Zero;
 use rand::Rng;
 use std::{
     env,
@@ -178,34 +178,39 @@ where
     res
 }
 
-/// Calculate modular inverse using the extended Euclidean algorithm
-/// Exposed for reuse by other CRT components.
-pub fn mod_inverse(a: &BigUint, m: &BigUint) -> Option<BigUint> {
-    if m == &BigUint::one() {
-        return Some(BigUint::ZERO);
+/// Calculate modular inverse using the extended Euclidean algorithm for `u64` values.
+/// Returns `Some(x)` such that `(a * x) % m == 1`, or `None` if no inverse exists.
+pub fn mod_inverse(a: u64, m: u64) -> Option<u64> {
+    if m == 0 {
+        return None;
     }
 
-    let (mut old_r, mut r) = (a.clone(), m.clone());
-    let (mut old_s, mut s) = (BigUint::one(), BigUint::ZERO);
+    let mut r0: i128 = m as i128;
+    let mut r1: i128 = (a % m) as i128;
+    let mut t0: i128 = 0;
+    let mut t1: i128 = 1;
 
-    while !r.is_zero() {
-        let quotient = &old_r / &r;
-        let temp_r = &old_r - &quotient * &r;
-        old_r = std::mem::replace(&mut r, temp_r);
-        let temp_s = if &quotient * &s <= old_s {
-            &old_s - &quotient * &s
-        } else {
-            // Handle underflow by adding m
-            m - ((&quotient * &s - &old_s) % m)
-        };
-        old_s = std::mem::replace(&mut s, temp_s);
+    while r1 != 0 {
+        let q = r0 / r1;
+
+        let r_next = r0 - q * r1;
+        r0 = r1;
+        r1 = r_next;
+
+        let t_next = t0 - q * t1;
+        t0 = t1;
+        t1 = t_next;
     }
 
-    if old_r == BigUint::one() {
-        Some(old_s % m)
-    } else {
-        None // No modular inverse exists
+    if r0 != 1 {
+        return None;
     }
+
+    let mut result = t0 % m as i128;
+    if result < 0 {
+        result += m as i128;
+    }
+    Some(result as u64)
 }
 
 pub fn gen_biguint_for_modulus<R: Rng>(

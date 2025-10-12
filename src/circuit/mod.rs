@@ -191,9 +191,14 @@ impl<P: Poly> PolyCircuit<P> {
         self.not_gate(xor_result) // NOT XOR
     }
 
-    pub fn const_digits_poly(&mut self, digits: &[u32]) -> GateId {
+    pub fn const_digits(&mut self, digits: &[u32]) -> GateId {
         let one = self.const_one_gate();
         self.small_scalar_mul(one, digits)
+    }
+
+    pub fn const_poly(&mut self, poly: &P) -> GateId {
+        let one = self.const_one_gate();
+        self.large_scalar_mul(one, &poly.coeffs_biguints())
     }
 
     pub fn add_gate(&mut self, left_input: GateId, right_input: GateId) -> GateId {
@@ -669,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn test_const_digits_poly() {
+    fn test_const_digits() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
 
@@ -683,7 +688,7 @@ mod tests {
         // [1, 0, 1, 1]
         // (where 1 is at positions 0, 2, 3, and 4)
         let digits = vec![1u32, 0u32, 1u32, 1u32];
-        let digits_poly_gate = circuit.const_digits_poly(&digits);
+        let digits_poly_gate = circuit.const_digits(&digits);
         circuit.output(vec![digits_poly_gate]);
 
         // Evaluate the circuit with any input (it won't be used)
@@ -829,7 +834,7 @@ mod tests {
 
         // Insert a gate between input calls so next input gate is non-consecutive
         // Use a const-digits gate which introduces a new gate with no inputs
-        let _const_gate = circuit.const_digits_poly(&[1u32, 0u32, 1u32]);
+        let _const_gate = circuit.const_digits(&[1u32, 0u32, 1u32]);
 
         // Second input call: creates a new input gate with a higher, non-consecutive GateId
         let inputs_second = circuit.input(1);

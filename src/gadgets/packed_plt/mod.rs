@@ -186,10 +186,10 @@ mod tests {
         let big_q = params.modulus();
         let mut acc = DCRTPoly::const_zero(params);
         for i in 0..crt_depth {
-            let qi = BigUint::from(moduli[i]);
+            let qi = moduli[i];
             let q_over_qi = big_q.as_ref() / &qi;
-            let m_i_mod_qi = &q_over_qi % &qi;
-            let inv = mod_inverse(&m_i_mod_qi, &qi).expect("Moduli must be coprime");
+            let m_i_mod_qi = (&q_over_qi % &qi).to_u64_digits()[0];
+            let inv = mod_inverse(m_i_mod_qi, qi).expect("Moduli must be coprime");
             let reconstruct_coeff = (&q_over_qi * inv) % big_q.as_ref();
 
             let expected_single = DCRTPoly::from_biguints_eval_single_mod(params, i, slots);

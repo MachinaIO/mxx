@@ -1,7 +1,7 @@
 pub mod bigunit;
 
 use crate::{
-    circuit::PolyCircuit,
+    circuit::{PolyCircuit, gate::GateId},
     gadgets::crt::bigunit::{BigUintPoly, BigUintPolyContext, encode_biguint_poly},
     poly::{Poly, PolyParams},
     utils::{debug_mem, mod_inverse},
@@ -173,6 +173,11 @@ impl<P: Poly> ModuloPoly<P> {
         Self::montgomery_reduce(self.ctx.as_ref(), circuit, &self.value)
     }
 
+    pub fn finalize(&self, circuit: &mut PolyCircuit<P>) -> GateId {
+        let regulared = self.to_regular(circuit);
+        regulared.finalize(circuit)
+    }
+
     fn montgomery_reduce(
         ctx: &ModuloPolyContext<P>,
         circuit: &mut PolyCircuit<P>,
@@ -258,28 +263,6 @@ mod tests {
         create_test_context_with_limb(circuit, LIMB_BIT_SIZE)
     }
 
-    fn encode_regular_values(
-        ctx: &ModuloPolyContext<DCRTPoly>,
-        params: &DCRTPolyParams,
-        values: &[BigUint],
-    ) -> Vec<DCRTPoly> {
-        let (moduli, _, crt_depth) = params.to_crt();
-        let ring_n = params.ring_dimension() as usize;
-        let mut residues = vec![vec![0u64; ring_n]; crt_depth];
-        for (crt_idx, &qi) in moduli.iter().enumerate() {
-            let qi_big = BigUint::from(qi);
-            for (eval_idx, value) in values.iter().enumerate() {
-                if eval_idx >= ring_n {
-                    break;
-                }
-                let digits = (value % &qi_big).to_u64_digits();
-                let residue = digits.first().copied().unwrap_or(0);
-                residues[crt_idx][eval_idx] = residue;
-            }
-        }
-        encode_biguint_poly(ctx.biguint_ctx.limb_bit_size, ctx.num_limbs, params, &residues)
-    }
-
     #[test]
     fn test_modulo_poly_add() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -315,8 +298,8 @@ mod tests {
         let b_inputs = encode_modulo_poly(limb_bit_size, &params, &b_values);
 
         let sum = poly_a.add(&poly_b, &mut circuit);
-        let regular_sum = sum.to_regular(&mut circuit);
-        circuit.output(regular_sum.limbs.clone());
+        let finalized = sum.finalize(&mut circuit);
+        circuit.output(vec![finalized]);
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -326,11 +309,11 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        assert_eq!(eval_result.len(), ctx.num_limbs);
+        assert_eq!(eval_result.len(), 1);
         let expected_values: Vec<BigUint> =
             (0..ring_n).map(|i| (&a_values[i] + &b_values[i]) % modulus.as_ref()).collect();
-        let expected_limbs = encode_regular_values(ctx.as_ref(), &params, &expected_values);
-        assert_eq!(eval_result, expected_limbs);
+        let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_values);
+        assert_eq!(eval_result[0], expected_poly);
     }
 
     #[test]
@@ -368,8 +351,8 @@ mod tests {
         let b_inputs = encode_modulo_poly(limb_bit_size, &params, &b_values);
 
         let diff = poly_a.sub(&poly_b, &mut circuit);
-        let regular_diff = diff.to_regular(&mut circuit);
-        circuit.output(regular_diff.limbs.clone());
+        let finalized = diff.finalize(&mut circuit);
+        circuit.output(vec![finalized]);
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -379,15 +362,15 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        assert_eq!(eval_result.len(), ctx.num_limbs);
+        assert_eq!(eval_result.len(), 1);
         let expected_values: Vec<BigUint> = (0..ring_n)
             .map(|i| {
                 let sum = &a_values[i] + modulus.as_ref();
                 (&sum - &b_values[i]) % modulus.as_ref()
             })
             .collect();
-        let expected_limbs = encode_regular_values(ctx.as_ref(), &params, &expected_values);
-        assert_eq!(eval_result, expected_limbs);
+        let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_values);
+        assert_eq!(eval_result[0], expected_poly);
     }
 
     #[test]
@@ -425,8 +408,8 @@ mod tests {
         let b_inputs = encode_modulo_poly(limb_bit_size, &params, &b_values);
 
         let product = poly_a.mul(&poly_b, &mut circuit);
-        let regular_prod = product.to_regular(&mut circuit);
-        circuit.output(regular_prod.limbs.clone());
+        let finalized = product.finalize(&mut circuit);
+        circuit.output(vec![finalized]);
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -436,11 +419,11 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        assert_eq!(eval_result.len(), ctx.num_limbs);
+        assert_eq!(eval_result.len(), 1);
         let expected_values: Vec<BigUint> =
             (0..ring_n).map(|i| (&a_values[i] * &b_values[i]) % modulus.as_ref()).collect();
-        let expected_limbs = encode_regular_values(ctx.as_ref(), &params, &expected_values);
-        assert_eq!(eval_result, expected_limbs);
+        let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_values);
+        assert_eq!(eval_result[0], expected_poly);
     }
 
     #[test]
@@ -465,8 +448,8 @@ mod tests {
         let b_inputs = encode_modulo_poly(1, &params, &b_values);
 
         let sum = poly_a.add(&poly_b, &mut circuit);
-        let regular_sum = sum.to_regular(&mut circuit);
-        circuit.output(regular_sum.limbs.clone());
+        let finalized = sum.finalize(&mut circuit);
+        circuit.output(vec![finalized]);
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -476,11 +459,11 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        assert_eq!(eval_result.len(), ctx.num_limbs);
+        assert_eq!(eval_result.len(), 1);
         let expected_values: Vec<BigUint> =
             (0..ring_n).map(|i| (&a_values[i] + &b_values[i]) % modulus.as_ref()).collect();
-        let expected_limbs = encode_regular_values(ctx.as_ref(), &params, &expected_values);
-        assert_eq!(eval_result, expected_limbs);
+        let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_values);
+        assert_eq!(eval_result[0], expected_poly);
     }
 
     #[test]
@@ -505,8 +488,8 @@ mod tests {
         let b_inputs = encode_modulo_poly(1, &params, &b_values);
 
         let diff = poly_a.sub(&poly_b, &mut circuit);
-        let regular_diff = diff.to_regular(&mut circuit);
-        circuit.output(regular_diff.limbs.clone());
+        let finalized = diff.finalize(&mut circuit);
+        circuit.output(vec![finalized]);
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -516,15 +499,15 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        assert_eq!(eval_result.len(), ctx.num_limbs);
+        assert_eq!(eval_result.len(), 1);
         let expected_values: Vec<BigUint> = (0..ring_n)
             .map(|i| {
                 let sum = &a_values[i] + modulus.as_ref();
                 (&sum - &b_values[i]) % modulus.as_ref()
             })
             .collect();
-        let expected_limbs = encode_regular_values(ctx.as_ref(), &params, &expected_values);
-        assert_eq!(eval_result, expected_limbs);
+        let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_values);
+        assert_eq!(eval_result[0], expected_poly);
     }
 
     #[test]
@@ -549,8 +532,8 @@ mod tests {
         let b_inputs = encode_modulo_poly(1, &params, &b_values);
 
         let product = poly_a.mul(&poly_b, &mut circuit);
-        let regular_prod = product.to_regular(&mut circuit);
-        circuit.output(regular_prod.limbs.clone());
+        let finalized = product.finalize(&mut circuit);
+        circuit.output(vec![finalized]);
 
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_result = circuit.eval(
@@ -560,10 +543,10 @@ mod tests {
             Some(plt_evaluator),
         );
 
-        assert_eq!(eval_result.len(), ctx.num_limbs);
+        assert_eq!(eval_result.len(), 1);
         let expected_values: Vec<BigUint> =
             (0..ring_n).map(|i| (&a_values[i] * &b_values[i]) % modulus.as_ref()).collect();
-        let expected_limbs = encode_regular_values(ctx.as_ref(), &params, &expected_values);
-        assert_eq!(eval_result, expected_limbs);
+        let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_values);
+        assert_eq!(eval_result[0], expected_poly);
     }
 }

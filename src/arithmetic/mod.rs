@@ -1,2 +1,2 @@
-// pub mod circuit;
-// pub mod eval;
+pub mod circuit;
+pub mod eval;

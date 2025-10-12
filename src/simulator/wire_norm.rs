@@ -216,7 +216,6 @@ mod tests {
 
     #[test]
     fn test_wire_norm_addition() {
-        // Circuit: out = in0 + in1
         let ctx = make_ctx();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ins = circuit.input(2);

@@ -10,7 +10,7 @@ use mxx::{
         DistType, PolyTrapdoorSampler, PolyUniformSampler, hash::DCRTPolyHashSampler,
         trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
     },
-    utils::{gen_biguint_for_modulus, log_mem},
+    utils::gen_biguint_for_modulus,
 };
 use num_bigint::BigUint;
 use std::sync::Arc;
@@ -22,14 +22,15 @@ fn init_tracing() {
 }
 
 #[tokio::test]
-async fn test_arithmetic_circuit_operations() {
-    // Test mixed operations in single circuit: (a + b) * c - a.
+async fn test_arithmetic_circuit_single_limb() {
     init_tracing();
+
+    // this is curated to be have same CRT bit as test_arithmetic_circuit_operations
+    // (crt_depth*crt_bit)
     let params = DCRTPolyParams::new(4, 2, 15, 13);
-    let (_, crt_bits, _) = params.to_crt();
-    info!("crt_bits={}", crt_bits);
-    let n = 1;
-    let limb_bit_size = 3;
+
+    let n = 3;
+    let limb_bit_size = 1;
     let mut rng = rand::rng();
     let a_vec: Vec<BigUint> = (0..n)
         .map(|_| gen_biguint_for_modulus(&mut rng, limb_bit_size, &params.modulus()))
@@ -41,13 +42,14 @@ async fn test_arithmetic_circuit_operations() {
         .map(|_| gen_biguint_for_modulus(&mut rng, limb_bit_size, &params.modulus()))
         .collect::<Vec<_>>();
     let inputs = vec![&a_vec[..], &b_vec[..], &c_vec[..]];
+
+    // Test mixed operations in single circuit: (a + b) * c - a.
     let mut mixed_circuit =
         ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, n, inputs.len(), false);
     let add_idx = mixed_circuit.add(ArithGateId::new(0), ArithGateId::new(1)); // a + b
     let mul_idx = mixed_circuit.mul(add_idx, ArithGateId::new(2)); // (a + b) * c
     let final_idx = mixed_circuit.sub(mul_idx, ArithGateId::new(0)); // (a + b) * c - a
     mixed_circuit.output(final_idx);
-    log_mem(format!("num gates {:?} total", mixed_circuit.poly_circuit.count_gates_by_type_vec()));
 
     // Test with polynomial evaluation
     info!("start evaluate_with_poly");
@@ -71,7 +73,7 @@ async fn test_arithmetic_circuit_operations() {
     let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_slots);
     assert_eq!(mixed_poly_result, &expected_poly, "Mixed operations should be correct");
 
-    // Test with BGG public key evaluation
+    // Test with BGG public key evaluation.
     let tmp_dir = tempdir().unwrap();
     let seed: [u8; 32] = [0u8; 32];
     let d = 1;
@@ -87,9 +89,10 @@ async fn test_arithmetic_circuit_operations() {
         DCRTPolyUniformSampler,
     >(&params,  seed, tmp_dir.path().to_path_buf(), d, pub_matrix.clone(),  trapdoor.clone(),
 trapdoor_sampler.clone()).await;
-    info!("end evaluate_with_bgg_pubkey");
+    info!("Non-CRT: end evaluate_with_bgg_pubkey");
     assert_eq!(mixed_pubkey_result.len(), 1);
-    // Test with BGG encoding evaluation
+
+    // Test with BGG encoding evaluation.
     let uniform_sampler = DCRTPolyUniformSampler::new();
     let secrets = uniform_sampler.sample_uniform(&params, 1, d, DistType::BitDist).get_row(0);
     let s = DCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
@@ -97,13 +100,13 @@ trapdoor_sampler.clone()).await;
     // Wait for batch matrices to be written before encoding evaluation
     mxx::storage::write::wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
 
-    info!("start evaluate_with_bgg_encoding");
+    info!("Non-CRT: start evaluate_with_bgg_encoding");
     let mixed_encoding_result = mixed_circuit.evaluate_with_bgg_encoding::<
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
         DCRTPolyUniformSampler,
-    >(&params, seed, tmp_dir.path().to_path_buf(),  &inputs, &secrets, p, 0.0);
-    info!("end evaluate_with_bgg_encoding");
+    >(&params, seed, tmp_dir.path().to_path_buf(), &inputs, &secrets, p, 0.0);
+    info!("Non-CRT: end evaluate_with_bgg_encoding");
     assert_eq!(mixed_encoding_result.len(), 1);
     assert_eq!(mixed_encoding_result[0].plaintext.as_ref().unwrap(), mixed_poly_result);
     assert_eq!(mixed_encoding_result[0].pubkey, mixed_pubkey_result[0]);

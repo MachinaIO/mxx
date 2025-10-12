@@ -4,7 +4,7 @@ pub mod gate;
 pub mod serde;
 
 pub use evaluable::*;
-pub use gate::{PolyGate, PolyGateType};
+pub use gate::{PolyGate, PolyGateKind, PolyGateType};
 
 use dashmap::DashMap;
 use num_bigint::BigUint;
@@ -28,6 +28,7 @@ pub struct PolyCircuit<P: Poly> {
     sub_circuits: BTreeMap<usize, PolyCircuit<P>>,
     output_ids: Vec<GateId>,
     num_input: usize,
+    gate_counts: HashMap<PolyGateKind, usize>,
     pub lookups: HashMap<usize, Arc<PublicLut<P>>>,
 }
 
@@ -37,6 +38,7 @@ impl<P: Poly> PartialEq for PolyCircuit<P> {
             self.print_value == other.print_value &&
             self.sub_circuits == other.sub_circuits &&
             self.output_ids == other.output_ids &&
+            self.gate_counts == other.gate_counts &&
             self.num_input == other.num_input
     }
 }
@@ -48,12 +50,15 @@ impl<P: Poly> PolyCircuit<P> {
         let mut gates = BTreeMap::new();
         // Ensure the reserved constant-one gate exists at GateId(0)
         gates.insert(GateId(0), PolyGate::new(GateId(0), PolyGateType::Input, vec![]));
+        let mut gate_counts = HashMap::new();
+        gate_counts.insert(PolyGateKind::Input, 1);
         Self {
             gates,
             print_value: BTreeMap::new(),
             sub_circuits: BTreeMap::new(),
             output_ids: vec![],
             num_input: 0,
+            gate_counts,
             lookups: HashMap::new(),
         }
     }
@@ -73,18 +78,68 @@ impl<P: Poly> PolyCircuit<P> {
         self.gates.len()
     }
 
-    pub fn count_gates_by_type_vec(&self) -> HashMap<PolyGateType, usize> {
+    pub fn count_gates_by_type_vec(&self) -> HashMap<PolyGateKind, usize> {
         let mut counts = HashMap::new();
         self.count_helper(&mut counts);
         counts
     }
 
-    fn count_helper(&self, counts: &mut HashMap<PolyGateType, usize>) {
-        for gate in self.gates.values() {
-            *counts.entry(gate.gate_type.clone()).or_insert(0) += 1;
+    fn count_helper(&self, counts: &mut HashMap<PolyGateKind, usize>) {
+        for (&kind, &count) in &self.gate_counts {
+            *counts.entry(kind).or_insert(0) += count;
         }
         for sub in self.sub_circuits.values() {
             sub.count_helper(counts);
+        }
+    }
+
+    /// Computes the circuit depth excluding Add gates.
+    ///
+    /// Definition:
+    /// - Inputs and the reserved constant-one gate contribute 0 to depth.
+    /// - An Add gate does not increase depth: level(add) = max(level(inputs)).
+    /// - Any other non-input gate increases depth by 1: level(g) = max(level(inputs)) + 1.
+    /// - If there are no outputs, returns 0.
+    pub fn non_free_depth(&self) -> usize {
+        if self.output_ids.is_empty() {
+            return 0;
+        }
+
+        // Compute a topo order of all gates needed for outputs
+        let order = self.topological_order();
+        let mut level_map: HashMap<GateId, usize> = HashMap::new();
+
+        for gate_id in order.iter() {
+            let gate = self.gates.get(gate_id).expect("gate not found");
+            if gate.input_gates.is_empty() {
+                // Inputs and consts
+                level_map.insert(*gate_id, 0);
+                continue;
+            }
+
+            let max_in = gate
+                .input_gates
+                .iter()
+                .map(|id| level_map[id])
+                .max()
+                .expect("non-input gate must have inputs");
+
+            let incr = match gate.gate_type {
+                PolyGateType::Add => 0,
+                _ => 1,
+            };
+            level_map.insert(*gate_id, max_in + incr);
+        }
+
+        // Max depth among outputs
+        self.output_ids.iter().map(|id| level_map[id]).max().unwrap_or(0)
+    }
+
+    pub fn recompute_gate_counts(&mut self) {
+        self.gate_counts.clear();
+        for gate in self.gates.values() {
+            let kind = gate.gate_type.kind();
+            *self.gate_counts.entry(kind).or_insert(0) += 1;
         }
     }
 
@@ -97,6 +152,7 @@ impl<P: Poly> PolyCircuit<P> {
         for _ in 0..num_input {
             let next_id = self.gates.len();
             let gid = GateId(next_id);
+            self.increment_gate_kind(PolyGateKind::Input);
             self.gates.insert(gid, PolyGate::new(gid, PolyGateType::Input, vec![]));
             input_gates.push(gid);
         }
@@ -177,9 +233,14 @@ impl<P: Poly> PolyCircuit<P> {
         self.not_gate(xor_result) // NOT XOR
     }
 
-    pub fn const_digits_poly(&mut self, digits: &[u32]) -> GateId {
+    pub fn const_digits(&mut self, digits: &[u32]) -> GateId {
         let one = self.const_one_gate();
         self.small_scalar_mul(one, digits)
+    }
+
+    pub fn const_poly(&mut self, poly: &P) -> GateId {
+        let one = self.const_one_gate();
+        self.large_scalar_mul(one, &poly.coeffs_biguints())
     }
 
     pub fn add_gate(&mut self, left_input: GateId, right_input: GateId) -> GateId {
@@ -220,8 +281,14 @@ impl<P: Poly> PolyCircuit<P> {
             }
         }
         let gate_id = self.gates.len();
+        let gate_kind = gate_type.kind();
+        self.increment_gate_kind(gate_kind);
         self.gates.insert(GateId(gate_id), PolyGate::new(GateId(gate_id), gate_type, inputs));
         GateId(gate_id)
+    }
+
+    fn increment_gate_kind(&mut self, kind: PolyGateKind) {
+        *self.gate_counts.entry(kind).or_insert(0) += 1;
     }
 
     /// Computes a topological order (as a vector of gate IDs) for all gates that
@@ -286,6 +353,17 @@ impl<P: Poly> PolyCircuit<P> {
             levels[level].push(gate_id);
         }
         levels
+    }
+
+    /// Returns the circuit depth defined as the maximum level index among
+    /// all gates required to compute the outputs.
+    ///
+    /// - Inputs and constant-one gate reside at level 0.
+    /// - Each non-input gate is assigned level = max(input levels) + 1.
+    /// - If there are no outputs, depth is 0.
+    pub fn depth(&self) -> usize {
+        let levels = self.compute_levels();
+        if levels.is_empty() { 0 } else { levels.len() - 1 }
     }
 
     /// Evaluate the circuit using an iterative approach over a precomputed topological order.
@@ -638,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn test_const_digits_poly() {
+    fn test_const_digits() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
 
@@ -652,7 +730,7 @@ mod tests {
         // [1, 0, 1, 1]
         // (where 1 is at positions 0, 2, 3, and 4)
         let digits = vec![1u32, 0u32, 1u32, 1u32];
-        let digits_poly_gate = circuit.const_digits_poly(&digits);
+        let digits_poly_gate = circuit.const_digits(&digits);
         circuit.output(vec![digits_poly_gate]);
 
         // Evaluate the circuit with any input (it won't be used)
@@ -798,7 +876,7 @@ mod tests {
 
         // Insert a gate between input calls so next input gate is non-consecutive
         // Use a const-digits gate which introduces a new gate with no inputs
-        let _const_gate = circuit.const_digits_poly(&[1u32, 0u32, 1u32]);
+        let _const_gate = circuit.const_digits(&[1u32, 0u32, 1u32]);
 
         // Second input call: creates a new input gate with a higher, non-consecutive GateId
         let inputs_second = circuit.input(1);
@@ -910,7 +988,7 @@ mod tests {
         let result = circuit.eval(
             &params,
             &DCRTPoly::const_one(&params),
-            &[poly1.clone()],
+            std::slice::from_ref(&poly1),
             None::<PolyPltEvaluator>,
         );
         let expected = DCRTPoly::const_one(&params) - poly1.clone();
@@ -1296,5 +1374,32 @@ mod tests {
         // verify
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], expected);
+    }
+
+    #[test]
+    fn test_depth_zero_with_direct_input_output() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let inputs = circuit.input(1);
+        circuit.output(vec![inputs[0]]);
+        assert_eq!(circuit.depth(), 0);
+    }
+
+    #[test]
+    fn test_depth_one_with_add() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let inputs = circuit.input(2);
+        let add = circuit.add_gate(inputs[0], inputs[1]);
+        circuit.output(vec![add]);
+        assert_eq!(circuit.depth(), 1);
+    }
+
+    #[test]
+    fn test_depth_two_with_chain() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let inputs = circuit.input(3);
+        let add = circuit.add_gate(inputs[0], inputs[1]);
+        let mul = circuit.mul_gate(add, inputs[2]);
+        circuit.output(vec![mul]);
+        assert_eq!(circuit.depth(), 2);
     }
 }

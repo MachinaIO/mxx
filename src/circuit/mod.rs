@@ -73,9 +73,19 @@ impl<P: Poly> PolyCircuit<P> {
         self.output_ids.len()
     }
 
+    /// Returns the slice of gate identifiers marking circuit outputs.
+    pub fn output_ids(&self) -> &[GateId] {
+        &self.output_ids
+    }
+
     /// Get number of gates
     pub fn num_gates(&self) -> usize {
         self.gates.len()
+    }
+
+    /// Returns the gate definition for the provided identifier.
+    pub fn gate(&self, gate_id: GateId) -> Option<&PolyGate> {
+        self.gates.get(&gate_id)
     }
 
     pub fn count_gates_by_type_vec(&self) -> HashMap<PolyGateKind, usize> {

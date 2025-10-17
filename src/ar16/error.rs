@@ -1,34 +1,38 @@
 use crate::circuit::gate::GateId;
-use std::fmt::{Display, Formatter};
+use thiserror::Error;
 
-/// Error type returned by AR16 evaluation helpers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+use super::Level;
+
+/// Errors that can arise while running the AR16 evaluation algorithms.
+#[derive(Debug, Error)]
 pub enum Ar16Error {
-    /// Advice encodings required for the current level or gate are missing.
-    MissingAdvice { level: usize, gate: Option<GateId> },
-    /// Circuit metadata (e.g., modulus tower or gate layering) does not meet the assumptions.
-    LayerMismatch { message: &'static str },
-    /// The circuit contains operations that are not supported by the current evaluator.
+    #[error("missing AR16 advice for level {level:?} (gate {gate:?})")]
+    MissingAdvice { level: Level, gate: Option<GateId> },
+
+    #[error("AR16 input for gate {gate:?} was not provided")]
+    MissingInput { gate: GateId },
+
+    #[error("unsupported gate {gate:?} in AR16 evaluation")]
     UnsupportedGate { gate: GateId },
-    /// Placeholder variant while the full algorithms are being implemented.
-    Unimplemented(&'static str),
+
+    #[error("level mismatch: expected {expected:?}, got {actual:?}")]
+    LevelMismatch { expected: Level, actual: Level },
 }
 
-impl Display for Ar16Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Ar16Error::MissingAdvice { level, gate } => {
-                write!(f, "missing advice for level {level}")?;
-                if let Some(id) = gate {
-                    write!(f, " (gate {id})")?;
-                }
-                Ok(())
-            }
-            Ar16Error::LayerMismatch { message } => write!(f, "layer mismatch: {message}"),
-            Ar16Error::UnsupportedGate { gate } => write!(f, "unsupported gate {gate}"),
-            Ar16Error::Unimplemented(msg) => write!(f, "unimplemented: {msg}"),
-        }
+impl Ar16Error {
+    pub fn missing_advice(level: Level, gate: Option<GateId>) -> Self {
+        Ar16Error::MissingAdvice { level, gate }
+    }
+
+    pub fn missing_input(gate: GateId) -> Self {
+        Ar16Error::MissingInput { gate }
+    }
+
+    pub fn level_mismatch(expected: Level, actual: Level) -> Self {
+        Ar16Error::LevelMismatch { expected, actual }
+    }
+
+    pub fn unsupported_gate(gate: GateId) -> Self {
+        Ar16Error::UnsupportedGate { gate }
     }
 }
-
-impl std::error::Error for Ar16Error {}

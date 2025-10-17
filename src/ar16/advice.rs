@@ -1,71 +1,111 @@
-use crate::{
-    ar16::{AR16Encoding, AR16PublicKey},
-    circuit::gate::GateId,
-    poly::Poly,
-};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
-/// Logical label for advice encodings within a level set.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AdviceLabel(pub String);
+use crate::{circuit::gate::GateId, poly::Poly};
 
-impl AdviceLabel {
-    pub fn new(label: impl Into<String>) -> Self {
-        Self(label.into())
+use super::{AR16Encoding, Level};
+
+/// Index into advice tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AdviceKey {
+    /// Advice corresponding to a gate's output message.
+    Msg(GateId),
+    /// Advice holding `E_k(s^2)` at level `k`.
+    S2(Level),
+}
+
+/// Storage for all advice encodings required by AR16 evaluation.
+#[derive(Debug, Clone)]
+pub struct Advice<P: Poly> {
+    c1_x: BTreeMap<GateId, AR16Encoding<P>>,
+    c1_s: Option<AR16Encoding<P>>,
+    lift: Vec<BTreeMap<AdviceKey, AR16Encoding<P>>>,
+    lift_s: Vec<BTreeMap<AdviceKey, AR16Encoding<P>>>,
+}
+
+impl<P: Poly> Advice<P> {
+    pub fn new() -> Self {
+        Self { c1_x: BTreeMap::new(), c1_s: None, lift: Vec::new(), lift_s: Vec::new() }
+    }
+
+    pub fn with_capacity(levels: usize) -> Self {
+        Self {
+            c1_x: BTreeMap::new(),
+            c1_s: None,
+            lift: vec![BTreeMap::new(); levels],
+            lift_s: vec![BTreeMap::new(); levels],
+        }
     }
 }
 
-impl From<&str> for AdviceLabel {
-    fn from(value: &str) -> Self {
-        Self(value.to_owned())
+impl<P: Poly> Default for Advice<P> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-/// Descriptor identifying level-specific advice requirements.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum AdviceRole {
-    /// Encoding of `E_k(s^2)`.
-    SecretSquare,
-    /// Encoding of `E_k(s)`.
-    SecretPlain,
-    /// Encoding of `E_k(c_{k-1}·s)` for a given gate.
-    LiftedCipher { gate: GateId },
-    /// Encoding of `E_k(c_{k-1})` replicated at this level.
-    LiftedPlain { gate: GateId },
-    /// Custom label originating from higher-level algorithms.
-    Custom(AdviceLabel),
-}
-
-/// Advice set supplied by the encryptor for a single circuit level.
-#[derive(Debug, Clone, Default)]
-pub struct AdviceSet<P: Poly> {
-    level: usize,
-    encodings: HashMap<AdviceRole, AR16Encoding<P>>,
-    public_keys: HashMap<AdviceRole, AR16PublicKey<P>>,
-}
-
-impl<P: Poly> AdviceSet<P> {
-    pub fn new(level: usize) -> Self {
-        Self { level, encodings: HashMap::new(), public_keys: HashMap::new() }
+impl<P: Poly> Advice<P> {
+    pub fn insert_e1_x(&mut self, gate: GateId, encoding: AR16Encoding<P>) {
+        self.c1_x.insert(gate, encoding);
     }
 
-    pub fn level(&self) -> usize {
-        self.level
+    pub fn insert_e1_s(&mut self, encoding: AR16Encoding<P>) {
+        self.c1_s = Some(encoding);
     }
 
-    pub fn insert_encoding(&mut self, role: AdviceRole, encoding: AR16Encoding<P>) {
-        self.encodings.insert(role, encoding);
+    pub fn e1_x(&self, gate: GateId) -> Option<&AR16Encoding<P>> {
+        self.c1_x.get(&gate)
     }
 
-    pub fn insert_public_key(&mut self, role: AdviceRole, key: AR16PublicKey<P>) {
-        self.public_keys.insert(role, key);
+    pub fn e1_s(&self) -> Option<&AR16Encoding<P>> {
+        self.c1_s.as_ref()
     }
 
-    pub fn get_encoding(&self, role: &AdviceRole) -> Option<&AR16Encoding<P>> {
-        self.encodings.get(role)
+    pub fn insert_ek(&mut self, level: Level, key: AdviceKey, encoding: AR16Encoding<P>) {
+        if level.0 < 2 {
+            return;
+        }
+        let idx = (level.0 - 2) as usize;
+        if self.lift.len() <= idx {
+            self.lift.resize(idx + 1, BTreeMap::new());
+        }
+        self.lift[idx].insert(key, encoding);
     }
 
-    pub fn get_public_key(&self, role: &AdviceRole) -> Option<&AR16PublicKey<P>> {
-        self.public_keys.get(role)
+    pub fn insert_ek_times_s(&mut self, level: Level, key: AdviceKey, encoding: AR16Encoding<P>) {
+        if level.0 < 2 {
+            return;
+        }
+        let idx = (level.0 - 2) as usize;
+        if self.lift_s.len() <= idx {
+            self.lift_s.resize(idx + 1, BTreeMap::new());
+        }
+        self.lift_s[idx].insert(key, encoding);
+    }
+
+    pub fn ek_s2(&self, level: Level) -> Option<&AR16Encoding<P>> {
+        if level.0 < 2 {
+            return None;
+        }
+        let idx = (level.0 - 2) as usize;
+        self.lift.get(idx)?.get(&AdviceKey::S2(level))
+    }
+
+    pub fn ek_of(&self, level: Level, gate: GateId) -> Option<&AR16Encoding<P>> {
+        if level.0 == 1 {
+            return self.c1_x.get(&gate);
+        }
+        if level.0 < 2 {
+            return None;
+        }
+        let idx = (level.0 - 2) as usize;
+        self.lift.get(idx)?.get(&AdviceKey::Msg(gate))
+    }
+
+    pub fn ek_times_s_of(&self, level: Level, gate: GateId) -> Option<&AR16Encoding<P>> {
+        if level.0 < 2 {
+            return None;
+        }
+        let idx = (level.0 - 2) as usize;
+        self.lift_s.get(idx)?.get(&AdviceKey::Msg(gate))
     }
 }

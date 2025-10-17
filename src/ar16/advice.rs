@@ -7,10 +7,14 @@ use super::{AR16Encoding, Level};
 /// Index into advice tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AdviceKey {
-    /// Advice corresponding to a gate's output message.
+    /// Advice corresponding to a gate's output message `E_k(c^{k-1}_g)`.
     Msg(GateId),
+    /// Advice corresponding to the lifted encoding of `E_{k-1}(c^{k-2}_g · s)`.
+    MsgTimes(GateId),
     /// Advice holding `E_k(s^2)` at level `k`.
     S2(Level),
+    /// Advice holding `E_k(E_{k-1}(s^2) · s)` at level `k`.
+    S2Times(Level),
 }
 
 /// Storage for all advice encodings required by AR16 evaluation.
@@ -101,11 +105,71 @@ impl<P: Poly> Advice<P> {
         self.lift.get(idx)?.get(&AdviceKey::Msg(gate))
     }
 
+    pub fn ek_of_times(&self, level: Level, gate: GateId) -> Option<&AR16Encoding<P>> {
+        if level.0 < 2 {
+            return None;
+        }
+        let idx = (level.0 - 2) as usize;
+        self.lift.get(idx)?.get(&AdviceKey::MsgTimes(gate))
+    }
+
     pub fn ek_times_s_of(&self, level: Level, gate: GateId) -> Option<&AR16Encoding<P>> {
         if level.0 < 2 {
             return None;
         }
         let idx = (level.0 - 2) as usize;
         self.lift_s.get(idx)?.get(&AdviceKey::Msg(gate))
+    }
+
+    pub fn ek_times_s_of_times(&self, level: Level, gate: GateId) -> Option<&AR16Encoding<P>> {
+        if level.0 < 2 {
+            return None;
+        }
+        let idx = (level.0 - 2) as usize;
+        self.lift_s.get(idx)?.get(&AdviceKey::MsgTimes(gate))
+    }
+
+    pub fn ek_times_s_s2(&self, level: Level) -> Option<&AR16Encoding<P>> {
+        if level.0 < 2 {
+            return None;
+        }
+        let idx = (level.0 - 2) as usize;
+        self.lift_s.get(idx)?.get(&AdviceKey::S2Times(level))
+    }
+
+    /// Populate the level-`k` advice tables using caller-provided lifting closures.
+    ///
+    /// The `lift` closure must return `E_k(z)` for the supplied `AdviceKey`, while `lift_times`
+    /// must return `E_k(z·s)` for the same key. This helper enforces insertion of both linear and
+    /// times‑`s` components for every gate required at level `k`, including the `s^2` entry.
+    pub fn populate_level_with<F, G>(
+        &mut self,
+        level: Level,
+        gates: &[GateId],
+        mut lift: F,
+        mut lift_times: G,
+    ) where
+        F: FnMut(AdviceKey) -> AR16Encoding<P>,
+        G: FnMut(AdviceKey) -> AR16Encoding<P>,
+    {
+        if level.0 < 2 {
+            return;
+        }
+        self.insert_ek(level, AdviceKey::S2(level), lift(AdviceKey::S2(level)));
+        self.insert_ek_times_s(
+            level,
+            AdviceKey::S2Times(level),
+            lift_times(AdviceKey::S2Times(level)),
+        );
+        for &gate in gates {
+            self.insert_ek(level, AdviceKey::Msg(gate), lift(AdviceKey::Msg(gate)));
+            self.insert_ek_times_s(level, AdviceKey::Msg(gate), lift_times(AdviceKey::Msg(gate)));
+            self.insert_ek(level, AdviceKey::MsgTimes(gate), lift(AdviceKey::MsgTimes(gate)));
+            self.insert_ek_times_s(
+                level,
+                AdviceKey::MsgTimes(gate),
+                lift_times(AdviceKey::MsgTimes(gate)),
+            );
+        }
     }
 }

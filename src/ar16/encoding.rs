@@ -71,12 +71,24 @@ pub fn eval_ct_gate<P: Poly>(
             let rhs = gate_def.input_gates[1];
             let lhs_ct = eval_ct_gate(circuit, lhs, ctx, input_keys, input_encodings)?;
             let rhs_ct = eval_ct_gate(circuit, rhs, ctx, input_keys, input_encodings)?;
-            let lhs_pk = eval_pk_gate(circuit, lhs, ctx, input_keys)?;
-            let rhs_pk = eval_pk_gate(circuit, rhs, ctx, input_keys)?;
+            let lhs_pk = eval_pk_gate(circuit, lhs, ctx, input_keys, input_encodings)?;
+            let rhs_pk = eval_pk_gate(circuit, rhs, ctx, input_keys, input_encodings)?;
             if level.0 < 2 {
                 return Err(Ar16Error::missing_advice(level, Some(gate)));
             }
-            combine_encodings(level, ctx, lhs, rhs, &lhs_ct, &rhs_ct, &lhs_pk, &rhs_pk)?
+            combine_encodings(
+                circuit,
+                level,
+                ctx,
+                lhs,
+                rhs,
+                input_keys,
+                input_encodings,
+                &lhs_ct,
+                &rhs_ct,
+                &lhs_pk,
+                &rhs_pk,
+            )?
         }
         _ => return Err(Ar16Error::unsupported_gate(gate)),
     };

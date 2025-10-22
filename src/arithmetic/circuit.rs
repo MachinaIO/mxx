@@ -1,6 +1,6 @@
 use crate::{
     circuit::PolyCircuit,
-    gadgets::crt::{ModuloPoly, ModuloPolyContext},
+    gadgets::arith::{ModuloPoly, ModuloPolyContext},
     poly::Poly,
     utils::log_mem,
 };

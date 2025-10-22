@@ -5,9 +5,11 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [features]
-default = ["debug"]
+default = ["debug", "arith-basic"]
 debug = []
 disk = ["libc", "memmap2"]
+arith-basic = []
+arith-nested-crt = []
 
 [dependencies]
 tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros"] }

@@ -213,12 +213,8 @@ pub fn mod_inverse(a: u64, m: u64) -> Option<u64> {
     Some(result as u64)
 }
 
-pub fn gen_biguint_for_modulus<R: Rng>(
-    rng: &mut R,
-    limb_bit_size: usize,
-    modulus: &BigUint,
-) -> BigUint {
-    if limb_bit_size == 0 || modulus.is_zero() {
+pub fn gen_biguint_for_modulus<R: Rng>(rng: &mut R, modulus: &BigUint) -> BigUint {
+    if modulus.is_zero() {
         return BigUint::ZERO;
     }
     let max_bits = modulus.bits() as usize;

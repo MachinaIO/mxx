@@ -320,6 +320,8 @@ mod tests {
         let expected_values: Vec<BigUint> =
             (0..ring_n).map(|i| (&a_values[i] + &b_values[i]) % modulus.as_ref()).collect();
         println!("expected_values {:?}", expected_values);
+        let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_values);
+        debug_assert_eq!(eval_result[0], expected_poly);
         // let expected_polys = encode_nested_crt_poly(L1_MODULI_BITS, &params, &expected_values);
         // println!("expected_polys {:?}", expected_polys);
         // for (i, expected_poly) in expected_polys.into_iter().enumerate() {

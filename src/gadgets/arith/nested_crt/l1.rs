@@ -6,6 +6,7 @@ use crate::{
     poly::{Poly, PolyParams},
 };
 use num_bigint::BigUint;
+use num_traits::Zero;
 use primal::Primes;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,18 +26,20 @@ impl<P: Poly> L1PolyContext<P> {
         max_degree: usize,
         dummy_scalar: bool,
     ) -> Self {
-        let (_, crt_bits, _) = params.to_crt();
-        let l1_moduli_depth = crt_bits.div_ceil(l1_moduli_bits);
+        let (_, crt_bits, crt_depth) = params.to_crt();
+        let l1_moduli_depth = (2 * crt_bits).div_ceil(l1_moduli_bits);
         let l1_moduli = sample_crt_primes(l1_moduli_bits, l1_moduli_depth);
         let mut add_luts = Vec::with_capacity(l1_moduli_depth);
         let mut mul_luts = Vec::with_capacity(l1_moduli_depth);
         let mut l1_moduli_wires = Vec::with_capacity(l1_moduli_depth);
+        let reconst_coeffs = (0..crt_depth).map(|i| params.to_crt_coeffs(i).1).collect::<Vec<_>>();
+        let q = params.modulus().into();
         for &modulus in l1_moduli.iter() {
-            let add_max = 2 * modulus as usize;
+            let add_max = (1 << (l1_moduli_bits + 1)) as u64 - 1;
             let add_map_slot: HashMap<BigUint, (usize, BigUint)> =
                 HashMap::from_iter((0..=add_max).map(|t| {
-                    let input = BigUint::from(t as u64);
-                    let output = BigUint::from(t as u64 % modulus);
+                    let input = BigUint::from(t);
+                    let output = BigUint::from(t % modulus);
                     (input, (t as usize, output))
                 }));
             add_luts.push(PackedPlt::setup(
@@ -46,10 +49,10 @@ impl<P: Poly> L1PolyContext<P> {
                 add_map_slot,
                 dummy_scalar,
             ));
-            let mul_max = modulus * (modulus - 1);
+            let mul_max = (1 << (2 * l1_moduli_bits)) as u64 - 1;
             let mul_map_slot: HashMap<BigUint, (usize, BigUint)> =
                 HashMap::from_iter((0..=mul_max).map(|t| {
-                    let input = BigUint::from(t as u64);
+                    let input = BigUint::from(t);
                     let t0 = t % modulus;
                     let t1 = t / modulus;
                     let output = BigUint::from((t0 * t1) % modulus);
@@ -62,7 +65,11 @@ impl<P: Poly> L1PolyContext<P> {
                 mul_map_slot,
                 dummy_scalar,
             ));
-            let wire_id = circuit.const_digits(&[modulus as u32]);
+            let mut modulus_const = BigUint::zero();
+            for reconst_coeff in reconst_coeffs.iter() {
+                modulus_const = (&modulus_const + reconst_coeff * modulus) % q.as_ref();
+            }
+            let wire_id = circuit.const_poly(&P::from_biguint_to_constant(params, modulus_const));
             l1_moduli_wires.push(wire_id);
         }
         let luts = (add_luts, mul_luts);
@@ -75,7 +82,7 @@ impl<P: Poly> L1PolyContext<P> {
 }
 
 /// Return the first `count` primes that fall within the requested `bit_width`.
-fn sample_crt_primes(bit_width: usize, count: usize) -> Vec<u64> {
+pub(crate) fn sample_crt_primes(bit_width: usize, count: usize) -> Vec<u64> {
     assert!(bit_width > 1, "bit_width must be at least 2 bits");
     assert!(bit_width < 32, "bit_width must be less than 32 bits");
     assert!(
@@ -124,6 +131,25 @@ impl<P: Poly> L1Poly<P> {
         Self { ctx, inner }
     }
 
+    pub fn constant(ctx: Arc<L1PolyContext<P>>, circuit: &mut PolyCircuit<P>, polys: &[P]) -> Self {
+        let inner = polys.into_iter().map(|poly| circuit.const_poly(poly)).collect::<Vec<_>>();
+        Self { ctx, inner }
+    }
+
+    pub fn zero(ctx: Arc<L1PolyContext<P>>, circuit: &mut PolyCircuit<P>) -> Self {
+        let inner = vec![circuit.const_zero_gate(); ctx.l1_moduli_depth()];
+        Self { ctx, inner }
+    }
+
+    pub fn rotate(&self, shift: usize) -> Self {
+        let mut new_inner = Vec::with_capacity(self.ctx.l1_moduli_depth());
+        for i in 0..self.ctx.l1_moduli_depth() {
+            let idx = (i + shift) % self.ctx.l1_moduli_depth();
+            new_inner.push(self.inner[idx]);
+        }
+        Self { ctx: self.ctx.clone(), inner: new_inner }
+    }
+
     pub fn add(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
         debug_assert_eq!(self.ctx, other.ctx);
         let mut new_inner = Vec::with_capacity(self.ctx.l1_moduli_depth());
@@ -139,6 +165,8 @@ impl<P: Poly> L1Poly<P> {
         let mut new_inner = Vec::with_capacity(self.ctx.l1_moduli_depth());
         for (i, (&l, &r)) in self.inner.iter().zip(other.inner.iter()).enumerate() {
             let t = circuit.add_gate(l, self.ctx.l1_moduli_wires[i]);
+            circuit.print(t, format!("L1 sub intermediate t at mod {}", self.ctx.l1_moduli[i]));
+            // circuit.output(vec![t]);
             let t = circuit.sub_gate(t, r);
             new_inner.push(self.ctx.luts.0[i].lookup_all(circuit, t));
         }

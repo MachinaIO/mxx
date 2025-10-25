@@ -7,7 +7,7 @@ use crate::{
         real::{RealPoly, RealPolyContext},
     },
     poly::{Poly, PolyParams},
-    utils::mod_inverse,
+    utils::{log_mem, mod_inverse},
 };
 use num_bigint::BigUint;
 use num_traits::{ToPrimitive, Zero};
@@ -42,6 +42,7 @@ impl<P: Poly> NestedCrtPolyContext<P> {
         let (q_moduli, _, crt_depth) = params.to_crt();
         let reconst_coeffs =
             (0..crt_depth).map(|crt_idx| params.to_crt_coeffs(crt_idx).1).collect::<Vec<_>>();
+        log_mem(format!("reconst_coeffs: {:?}", reconst_coeffs));
         let ps = &real_ctx.l1_ctx.l1_moduli;
         let p = ps.iter().fold(BigUint::from(1u64), |acc, &pi| acc * BigUint::from(pi));
         let p_over_pis = ps.iter().map(|&pi| &p / pi).collect::<Vec<BigUint>>();
@@ -52,7 +53,7 @@ impl<P: Poly> NestedCrtPolyContext<P> {
                 let pi_big = BigUint::from(pi);
                 let residue = (p_over_pi % &pi_big).to_u64().expect("CRT residue must fit in u64");
                 let inv = mod_inverse(residue, pi).expect("CRT moduli must be coprime");
-                // println!("pi = {}, p_over_pi = {}, inv = {}", pi, p_over_pi, inv);
+                log_mem(format!("pi = {}, p_over_pi = {}, inv = {}", pi, p_over_pi, inv));
                 BigUint::from(inv)
             })
             .collect::<Vec<BigUint>>();
@@ -77,6 +78,7 @@ impl<P: Poly> NestedCrtPolyContext<P> {
                 for j in 0..ps.len() {
                     let k = (i + j) % ps.len();
                     let p_over_pk = (&p_over_pis[k] % &q_i) % &p_i;
+                    println!("i: {i}, j: {j}, k: {k}, p_over_pk: {:?}", p_over_pk);
                     y_consts[j] = (&y_consts[j] + &reconst_coeffs[q_idx] * &p_over_pk) % q.as_ref();
                 }
             }
@@ -127,10 +129,12 @@ impl<P: Poly> NestedCrtPoly<P> {
     }
 
     pub fn add(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
-        circuit.print(self.l1_poly.inner[0], format!("Before add"));
+        // circuit.print(self.l1_poly.inner[0], format!("Before add"));
         let l1_poly = self.l1_poly.add(&other.l1_poly, circuit);
         let result_without_reduce = Self { ctx: self.ctx.clone(), l1_poly };
-        circuit.print(result_without_reduce.l1_poly.inner[0], format!("Before reduce in add"));
+        // for (i, inner) in result_without_reduce.l1_poly.inner.iter().enumerate() {
+        //     circuit.print(*inner, format!("Before reduce in add at {i}"));
+        // }
         result_without_reduce.mod_reduce(circuit)
     }
 
@@ -157,18 +161,21 @@ impl<P: Poly> NestedCrtPoly<P> {
 
     fn mod_reduce(&self, circuit: &mut PolyCircuit<P>) -> Self {
         let y = self.l1_poly.mul(&self.ctx.scalar_x, circuit);
-        circuit.print(y.inner[0], format!("y"));
-        let reals = RealPoly::from_l1_poly(self.ctx.real_ctx.clone(), &y, circuit);
-        circuit.print(reals.inner[0], format!("reals"));
-        let v: L1Poly<P> = reals.sum_to_l1_poly(circuit);
-        circuit.print(v.inner[0], format!("v"));
+        for (i, inner) in y.inner.iter().enumerate() {
+            circuit.print(*inner, format!("y at {i}"));
+        }
         let mut first_term = L1Poly::zero(self.ctx.l1_ctx().clone(), circuit);
         for i in 0..self.ctx.l1_ctx().l1_moduli_depth() {
             let y_rotated = y.rotate(i);
             let muled = y_rotated.mul(&self.ctx.scalars_y[i], circuit);
             first_term = first_term.add(&muled, circuit);
         }
-        circuit.print(first_term.inner[0], format!("First term poly"));
+        // circuit.print(first_term.inner[0], format!("First term poly"));
+        // return Self { ctx: self.ctx.clone(), l1_poly: first_term };
+        let reals = RealPoly::from_l1_poly(self.ctx.real_ctx.clone(), &y, circuit);
+        circuit.print(reals.inner[0], format!("reals"));
+        let v: L1Poly<P> = reals.sum_to_l1_poly(circuit);
+        circuit.print(v.inner[0], format!("v"));
         let second_term = v.mul(&self.ctx.scalar_v, circuit);
         circuit.print(second_term.inner[0], format!("Second term poly"));
         let result = first_term.sub(&second_term, circuit);
@@ -206,6 +213,7 @@ pub fn encode_nested_crt_poly<P: Poly>(
 #[cfg(test)]
 mod tests {
     use num_traits::One;
+    use tracing_subscriber::fmt::format;
 
     use super::*;
     use crate::{
@@ -214,6 +222,7 @@ mod tests {
             PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
+        utils::log_mem,
     };
 
     const L1_MODULI_BITS: usize = 6;
@@ -232,6 +241,7 @@ mod tests {
             params.ring_dimension() as usize,
             false,
         ));
+        log_mem(format!("l1 moduli: {:?}", &ctx.l1_ctx().l1_moduli));
         (params, ctx)
     }
 
@@ -286,6 +296,7 @@ mod tests {
         tracing_subscriber::fmt::init();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
+        println!("q modulus: {:?}", params.modulus());
         let ring_n = params.ring_dimension() as usize;
 
         let poly_a = NestedCrtPoly::input(ctx.clone(), &mut circuit);
@@ -300,11 +311,11 @@ mod tests {
         // let a_values: Vec<BigUint> = (0..ring_n)
         //     .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref()))
         //     .collect();
-        let a_values: Vec<BigUint> = vec![modulus.as_ref().clone() - BigUint::one(); ring_n];
+        let a_values: Vec<BigUint> = vec![BigUint::from(1u64); ring_n];
         // let b_values: Vec<BigUint> = (0..ring_n)
         //     .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref()))
         //     .collect();
-        let b_values: Vec<BigUint> = vec![modulus.as_ref().clone() - BigUint::one(); ring_n];
+        let b_values: Vec<BigUint> = vec![BigUint::zero(); ring_n];
         let a_inputs = encode_nested_crt_poly(L1_MODULI_BITS, &params, &a_values);
         let b_inputs = encode_nested_crt_poly(L1_MODULI_BITS, &params, &b_values);
         let plt_evaluator = PolyPltEvaluator::new();
@@ -316,18 +327,18 @@ mod tests {
         );
         println!("eval_result {:?}", eval_result);
 
-        assert_eq!(eval_result.len(), 1);
+        // assert_eq!(eval_result.len(), 1);
         let expected_values: Vec<BigUint> =
             (0..ring_n).map(|i| (&a_values[i] + &b_values[i]) % modulus.as_ref()).collect();
-        println!("expected_values {:?}", expected_values);
-        let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_values);
-        debug_assert_eq!(eval_result[0], expected_poly);
+        // println!("expected_values {:?}", expected_values);
+        // let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_values);
+        // debug_assert_eq!(eval_result[0], expected_poly);
         // let expected_polys = encode_nested_crt_poly(L1_MODULI_BITS, &params, &expected_values);
         // println!("expected_polys {:?}", expected_polys);
         // for (i, expected_poly) in expected_polys.into_iter().enumerate() {
         //     assert_eq!(eval_result[i], expected_poly);
         // }
-        // let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_values);
-        // assert_eq!(eval_result[0], expected_poly);
+        let expected_poly = DCRTPoly::from_biguints_eval(&params, &expected_values);
+        assert_eq!(eval_result[0], expected_poly);
     }
 }

@@ -226,3 +226,12 @@ pub fn gen_biguint_for_modulus<R: Rng>(rng: &mut R, modulus: &BigUint) -> BigUin
     rng.fill_bytes(&mut bytes);
     BigUint::from_bytes_be(&bytes) % modulus
 }
+
+pub fn round_div(a: u64, b: u64) -> u64 {
+    assert!(b != 0, "divisor must be non-zero");
+    let a128 = a as u128;
+    let b128 = b as u128;
+    let half = b128 / 2;
+    let rounded = (a128 + half) / b128;
+    rounded as u64
+}

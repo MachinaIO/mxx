@@ -50,11 +50,12 @@ impl<P: Poly> L1PolyContext<P> {
                 dummy_scalar,
             ));
             let mul_max = (1 << (2 * l1_moduli_bits)) as u64 - 1;
+            let base = 1u64 << l1_moduli_bits;
             let mul_map_slot: HashMap<BigUint, (usize, BigUint)> =
                 HashMap::from_iter((0..=mul_max).map(|t| {
                     let input = BigUint::from(t);
-                    let t0 = t % modulus;
-                    let t1 = t / modulus;
+                    let t0 = t % base;
+                    let t1 = t / base;
                     let output = BigUint::from((t0 * t1) % modulus);
                     (input, (t as usize, output))
                 }));
@@ -165,7 +166,7 @@ impl<P: Poly> L1Poly<P> {
         let mut new_inner = Vec::with_capacity(self.ctx.l1_moduli_depth());
         for (i, (&l, &r)) in self.inner.iter().zip(other.inner.iter()).enumerate() {
             let t = circuit.add_gate(l, self.ctx.l1_moduli_wires[i]);
-            circuit.print(t, format!("L1 sub intermediate t at mod {}", self.ctx.l1_moduli[i]));
+            // circuit.print(t, format!("L1 sub intermediate t at mod {}", self.ctx.l1_moduli[i]));
             // circuit.output(vec![t]);
             let t = circuit.sub_gate(t, r);
             new_inner.push(self.ctx.luts.0[i].lookup_all(circuit, t));
@@ -177,7 +178,7 @@ impl<P: Poly> L1Poly<P> {
         debug_assert_eq!(self.ctx, other.ctx);
         let mut new_inner = Vec::with_capacity(self.ctx.l1_moduli_depth());
         for (i, (&l, &r)) in self.inner.iter().zip(other.inner.iter()).enumerate() {
-            let scaled = circuit.small_scalar_mul(r, &[self.ctx.l1_moduli[i] as u32]);
+            let scaled = circuit.small_scalar_mul(r, &[1u32 << self.ctx.l1_moduli_bits]);
             let t = circuit.add_gate(l, scaled);
             new_inner.push(self.ctx.luts.1[i].lookup_all(circuit, t));
         }

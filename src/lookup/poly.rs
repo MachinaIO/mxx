@@ -12,10 +12,7 @@ impl<P: Poly> PltEvaluator<P> for PolyPltEvaluator {
         match plt.get(params, &input) {
             Some(outputs) => outputs.1,
             None => {
-                panic!(
-                    "output of the lookup evaluation not found; input: {:?}",
-                    input
-                );
+                panic!("output of the lookup evaluation not found; input: {:?}", input);
             }
         }
     }

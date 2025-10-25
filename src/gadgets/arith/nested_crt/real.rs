@@ -5,6 +5,7 @@ use crate::{
         packed_plt::PackedPlt,
     },
     poly::Poly,
+    utils::round_div,
 };
 use num_bigint::BigUint;
 use std::{collections::HashMap, sync::Arc};
@@ -35,7 +36,7 @@ impl<P: Poly> RealPolyContext<P> {
             let l1_to_real_map_slot: HashMap<BigUint, (usize, BigUint)> =
                 HashMap::from_iter((0..(modulus as usize)).map(|t| {
                     let input = BigUint::from(t as u64);
-                    let output = BigUint::from(t as u64 * scale / modulus);
+                    let output = BigUint::from(round_div(t as u64 * scale, modulus));
                     (input, (t as usize, output))
                 }));
             l1_to_real_luts.push(PackedPlt::setup(
@@ -50,7 +51,7 @@ impl<P: Poly> RealPolyContext<P> {
         let real_to_int_map_slot: HashMap<BigUint, (usize, BigUint)> =
             HashMap::from_iter((0..=max_real as usize).map(|t| {
                 let input = BigUint::from(t as u64);
-                let output = BigUint::from(t as u64 / scale);
+                let output = BigUint::from(round_div(t as u64, scale));
                 (input, (t as usize, output))
             }));
         let real_to_int_lut =

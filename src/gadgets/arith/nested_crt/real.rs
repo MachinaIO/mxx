@@ -8,6 +8,7 @@ use crate::{
     utils::round_div,
 };
 use num_bigint::BigUint;
+use rayon::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +35,7 @@ impl<P: Poly> RealPolyContext<P> {
         let mut l1_to_real_luts = Vec::with_capacity(l1_moduli.len());
         for &modulus in l1_moduli.iter() {
             let l1_to_real_map_slot: HashMap<BigUint, (usize, BigUint)> =
-                HashMap::from_iter((0..(modulus as usize)).map(|t| {
+                HashMap::from_par_iter((0..(modulus as usize)).into_par_iter().map(|t| {
                     let input = BigUint::from(t as u64);
                     let output = BigUint::from(round_div(t as u64 * scale, modulus));
                     (input, (t as usize, output))
@@ -49,7 +50,7 @@ impl<P: Poly> RealPolyContext<P> {
         }
         let max_real = scale * max_add_count;
         let real_to_int_map_slot: HashMap<BigUint, (usize, BigUint)> =
-            HashMap::from_iter((0..=max_real as usize).map(|t| {
+            HashMap::from_par_iter((0..=max_real as usize).into_par_iter().map(|t| {
                 let input = BigUint::from(t as u64);
                 let output = BigUint::from(round_div(t as u64, scale));
                 (input, (t as usize, output))
@@ -78,11 +79,8 @@ impl<P: Poly> RealPoly<P> {
     ) -> Self {
         debug_assert_eq!(ctx.l1_ctx.as_ref(), l1_poly.ctx.as_ref());
         let mut new_inner = Vec::with_capacity(l1_poly.inner.len());
-        for (idx, (lut, &input)) in ctx.l1_to_real_luts.iter().zip(l1_poly.inner.iter()).enumerate()
-        {
-            circuit.print(input, format!("Input to L1->Real LUT idx {idx}"));
+        for (lut, &input) in ctx.l1_to_real_luts.iter().zip(l1_poly.inner.iter()) {
             let output = lut.lookup_all(circuit, input);
-            circuit.print(output, format!("Real LUT output idx {idx}"));
             new_inner.push(output);
         }
         Self { ctx, inner: new_inner }
@@ -90,13 +88,10 @@ impl<P: Poly> RealPoly<P> {
 
     pub fn sum_to_l1_poly(&self, circuit: &mut PolyCircuit<P>) -> L1Poly<P> {
         let mut sum = circuit.const_zero_gate();
-        // println!("Summing real polys: {:?}", self.inner);
         for poly in self.inner.iter() {
             sum = circuit.add_gate(sum, *poly);
         }
-        circuit.print(sum, format!("Real sum before LUT"));
         let int = self.ctx.real_to_int_lut.lookup_all(circuit, sum);
-        // println!("After Real to Int LUT: {:?}", int);
         let new_inner = vec![int; self.ctx.l1_ctx.l1_moduli.len()];
         L1Poly::new(self.ctx.l1_ctx.clone(), new_inner)
     }

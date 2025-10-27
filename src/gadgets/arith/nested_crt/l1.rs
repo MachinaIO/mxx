@@ -8,6 +8,7 @@ use crate::{
 use num_bigint::BigUint;
 use num_traits::Zero;
 use primal::Primes;
+use rayon::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct L1PolyContext<P: Poly> {
@@ -37,7 +38,7 @@ impl<P: Poly> L1PolyContext<P> {
         for &modulus in l1_moduli.iter() {
             let add_max = (1 << (l1_moduli_bits + 1)) as u64 - 1;
             let add_map_slot: HashMap<BigUint, (usize, BigUint)> =
-                HashMap::from_iter((0..=add_max).map(|t| {
+                HashMap::from_par_iter((0..=add_max).into_par_iter().map(|t| {
                     let input = BigUint::from(t);
                     let output = BigUint::from(t % modulus);
                     (input, (t as usize, output))
@@ -52,7 +53,7 @@ impl<P: Poly> L1PolyContext<P> {
             let mul_max = (1 << (2 * l1_moduli_bits)) as u64 - 1;
             let base = 1u64 << l1_moduli_bits;
             let mul_map_slot: HashMap<BigUint, (usize, BigUint)> =
-                HashMap::from_iter((0..=mul_max).map(|t| {
+                HashMap::from_par_iter((0..=mul_max).into_par_iter().map(|t| {
                     let input = BigUint::from(t);
                     let t0 = t % base;
                     let t1 = t / base;
@@ -166,8 +167,6 @@ impl<P: Poly> L1Poly<P> {
         let mut new_inner = Vec::with_capacity(self.ctx.l1_moduli_depth());
         for (i, (&l, &r)) in self.inner.iter().zip(other.inner.iter()).enumerate() {
             let t = circuit.add_gate(l, self.ctx.l1_moduli_wires[i]);
-            // circuit.print(t, format!("L1 sub intermediate t at mod {}", self.ctx.l1_moduli[i]));
-            // circuit.output(vec![t]);
             let t = circuit.sub_gate(t, r);
             new_inner.push(self.ctx.luts.0[i].lookup_all(circuit, t));
         }

@@ -1,4 +1,5 @@
 pub mod basic;
 pub mod nested_crt;
 
-pub use basic::{BasicModuloPoly as ModuloPoly, BasicModuloPolyContext as ModuloPolyContext};
+pub use basic::{BasicModuloPoly, BasicModuloPolyContext};
+pub use nested_crt::{NestedCrtPoly, NestedCrtPolyContext};

@@ -22,7 +22,7 @@ pub struct NestedCrtPolyContext<P: Poly> {
     pub scalar_x: L1Poly<P>,
     pub scalars_y: Vec<L1Poly<P>>,
     pub scalar_v: L1Poly<P>,
-    pub is_zero_luts: Vec<PackedPlt<P>>, // pub p_reconsts: Vec<P>,
+    pub is_zero_luts: Vec<PackedPlt<P>>,
 }
 
 impl<P: Poly> NestedCrtPolyContext<P> {
@@ -176,13 +176,13 @@ impl<P: Poly> NestedCrtPoly<P> {
         result_without_reduce.mod_reduce(circuit)
     }
 
-    pub fn is_zero(&self, circuit: &mut PolyCircuit<P>) -> Vec<GateId> {
-        self.l1_poly
-            .inner
-            .iter()
-            .zip(self.ctx.is_zero_luts.iter())
-            .map(|(inner, lut)| lut.lookup_all(circuit, *inner))
-            .collect()
+    pub fn is_zero(&self, circuit: &mut PolyCircuit<P>) -> GateId {
+        let mut sum = circuit.const_zero_gate();
+        for (inner, lut) in self.l1_poly.inner.iter().zip(self.ctx.is_zero_luts.iter()) {
+            let refreshed = lut.lookup_all(circuit, *inner);
+            sum = circuit.add_gate(sum, refreshed);
+        }
+        sum
     }
 
     fn mod_reduce(&self, circuit: &mut PolyCircuit<P>) -> Self {
@@ -372,8 +372,8 @@ mod tests {
         let sum = poly_a.add(&poly_b, &mut circuit);
         // let one = NestedCrtPoly::constant(ctx, &mut circuit, &params, &[BigUint::one; ring_n]);
         let zero = sum.sub(&expected_out, &mut circuit);
-        let are_zeros = zero.is_zero(&mut circuit);
-        circuit.output(are_zeros);
+        let is_zero = zero.is_zero(&mut circuit);
+        circuit.output(vec![is_zero]);
         println!("non-free depth {}", circuit.non_free_depth());
 
         let modulus = params.modulus();
@@ -391,7 +391,7 @@ mod tests {
         );
         println!("eval_results {:?}", eval_results);
 
-        assert_eq!(eval_results, vec![DCRTPoly::const_zero(&params); L1_MODULI_DEPTH]);
+        assert_eq!(eval_results, vec![DCRTPoly::const_zero(&params)]);
     }
 
     fn test_nested_crt_poly_sub_generic(
@@ -407,8 +407,8 @@ mod tests {
         let expected_out = NestedCrtPoly::input(ctx.clone(), &mut circuit);
         let diff = poly_a.sub(&poly_b, &mut circuit);
         let zero = diff.sub(&expected_out, &mut circuit);
-        let are_zeros = zero.is_zero(&mut circuit);
-        circuit.output(are_zeros);
+        let is_zero = zero.is_zero(&mut circuit);
+        circuit.output(vec![is_zero]);
         println!("non-free depth {}", circuit.non_free_depth());
 
         let modulus = params.modulus();
@@ -433,7 +433,7 @@ mod tests {
         );
         println!("eval_results {:?}", eval_results);
 
-        assert_eq!(eval_results, vec![DCRTPoly::const_zero(&params); L1_MODULI_DEPTH]);
+        assert_eq!(eval_results, vec![DCRTPoly::const_zero(&params)]);
     }
 
     fn test_nested_crt_poly_mul_generic(
@@ -449,8 +449,8 @@ mod tests {
         let expected_out = NestedCrtPoly::input(ctx.clone(), &mut circuit);
         let product = poly_a.mul(&poly_b, &mut circuit);
         let zero = product.sub(&expected_out, &mut circuit);
-        let are_zeros = zero.is_zero(&mut circuit);
-        circuit.output(are_zeros);
+        let is_zero = zero.is_zero(&mut circuit);
+        circuit.output(vec![is_zero]);
         println!("non-free depth {}", circuit.non_free_depth());
 
         let modulus = params.modulus();
@@ -469,6 +469,6 @@ mod tests {
         );
         println!("eval_results {:?}", eval_results);
 
-        assert_eq!(eval_results, vec![DCRTPoly::const_zero(&params); L1_MODULI_DEPTH]);
+        assert_eq!(eval_results, vec![DCRTPoly::const_zero(&params)]);
     }
 }

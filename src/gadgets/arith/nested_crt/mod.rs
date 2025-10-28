@@ -259,7 +259,6 @@ mod tests {
 
     const L1_MODULI_BITS: usize = 6;
     const SCALE: u64 = 1 << 8;
-    const L1_MODULI_DEPTH: usize = 6;
 
     fn create_test_context(
         circuit: &mut PolyCircuit<DCRTPoly>,

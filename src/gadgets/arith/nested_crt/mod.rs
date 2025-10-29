@@ -25,6 +25,12 @@ pub struct NestedCrtPolyContext<P: Poly> {
     pub is_zero_luts: Vec<PackedPlt<P>>,
 }
 
+fn dummy_lut_map() -> HashMap<BigUint, (usize, BigUint)> {
+    let mut map = HashMap::new();
+    map.insert(BigUint::zero(), (0, BigUint::zero()));
+    map
+}
+
 impl<P: Poly> NestedCrtPolyContext<P> {
     pub fn setup(
         circuit: &mut PolyCircuit<P>,
@@ -95,33 +101,49 @@ impl<P: Poly> NestedCrtPolyContext<P> {
             .map(|y_polys_per_j| L1Poly::constant(real_ctx.l1_ctx.clone(), circuit, &y_polys_per_j))
             .collect::<Vec<_>>();
 
-        let max_qi_error =
-            (real_ctx.l1_ctx.l1_moduli.len() as u64 + ps.iter().sum::<u64>()).div_ceil(2);
-        let mut is_zero_maps = vec![
-            vec![HashMap::<BigUint, (usize, BigUint)>::new(); crt_depth];
-            real_ctx.l1_ctx.l1_moduli.len()
-        ];
-        for e in 0..=max_qi_error {
-            for (q_idx, &q_i) in q_moduli.iter().enumerate() {
-                let qe = BigUint::from(q_i * e);
-                for (i, &p_i) in real_ctx.l1_ctx.l1_moduli.iter().enumerate() {
-                    let qe_i = &qe % p_i;
-                    is_zero_maps[i][q_idx].insert(qe_i, (e as usize, BigUint::zero()));
+        let is_zero_luts = if dummy_scalar {
+            (0..real_ctx.l1_ctx.l1_moduli.len())
+                .map(|_| {
+                    let maps: Vec<HashMap<BigUint, (usize, BigUint)>> =
+                        std::iter::repeat_with(dummy_lut_map).take(crt_depth).collect();
+                    PackedPlt::setup_with_multi_hashmaps(
+                        circuit,
+                        params,
+                        max_degree,
+                        maps,
+                        dummy_scalar,
+                    )
+                })
+                .collect()
+        } else {
+            let max_qi_error =
+                (real_ctx.l1_ctx.l1_moduli.len() as u64 + ps.iter().sum::<u64>()).div_ceil(2);
+            let mut is_zero_maps = vec![
+                vec![HashMap::<BigUint, (usize, BigUint)>::new(); crt_depth];
+                real_ctx.l1_ctx.l1_moduli.len()
+            ];
+            for e in 0..=max_qi_error {
+                for (q_idx, &q_i) in q_moduli.iter().enumerate() {
+                    let qe = BigUint::from(q_i * e);
+                    for (i, &p_i) in real_ctx.l1_ctx.l1_moduli.iter().enumerate() {
+                        let qe_i = &qe % p_i;
+                        is_zero_maps[i][q_idx].insert(qe_i, (e as usize, BigUint::zero()));
+                    }
                 }
             }
-        }
-        let is_zero_luts = is_zero_maps
-            .into_iter()
-            .map(|maps| {
-                PackedPlt::setup_with_multi_hashmaps(
-                    circuit,
-                    params,
-                    max_degree,
-                    maps,
-                    dummy_scalar,
-                )
-            })
-            .collect::<Vec<_>>();
+            is_zero_maps
+                .into_iter()
+                .map(|maps| {
+                    PackedPlt::setup_with_multi_hashmaps(
+                        circuit,
+                        params,
+                        max_degree,
+                        maps,
+                        dummy_scalar,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
 
         Self { real_ctx: Arc::new(real_ctx), scalar_x, scalars_y, scalar_v, is_zero_luts }
     }
@@ -183,6 +205,31 @@ impl<P: Poly> NestedCrtPoly<P> {
             sum = circuit.add_gate(sum, refreshed);
         }
         sum
+    }
+
+    pub fn benchmark_multiplication_tree(
+        ctx: Arc<NestedCrtPolyContext<P>>,
+        circuit: &mut PolyCircuit<P>,
+        height: usize,
+    ) {
+        let num_inputs =
+            1usize.checked_shl(height as u32).expect("height is too large to represent 2^h inputs");
+        let mut current_layer: Vec<NestedCrtPoly<P>> =
+            (0..num_inputs).map(|_| NestedCrtPoly::input(ctx.clone(), circuit)).collect();
+        while current_layer.len() > 1 {
+            debug_assert!(current_layer.len().is_multiple_of(2), "layer size must stay even");
+            let mut next_layer = Vec::with_capacity(current_layer.len() / 2);
+            log_mem(format!("before layer size {}", current_layer.len()));
+            for pair in current_layer.chunks(2) {
+                let parent = pair[0].mul(&pair[1], circuit);
+                next_layer.push(parent);
+            }
+            log_mem(format!("after layer size {}", current_layer.len()));
+            current_layer = next_layer;
+        }
+        let root = current_layer.pop().expect("multiplication tree must contain at least one node");
+        let is_zero = root.is_zero(circuit);
+        circuit.output(vec![is_zero]);
     }
 
     fn mod_reduce(&self, circuit: &mut PolyCircuit<P>) -> Self {
@@ -559,70 +606,26 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_crt_poly_mul_depth_measure() {
-        let depth = 3usize;
+    fn test_nested_crt_benchmark_multiplication_tree() {
+        let height = 3usize;
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
-        let modulus = params.modulus();
-        let ring_n = params.ring_dimension() as usize;
-        let mut rng = rand::rng();
-        let operand_values: Vec<Vec<BigUint>> = (0..=depth)
-            .map(|_| {
-                (0..ring_n)
-                    .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref()))
-                    .collect()
-            })
-            .collect();
-        test_nested_crt_poly_mul_depth_measure_generic(circuit, params, ctx, operand_values);
-    }
-
-    fn test_nested_crt_poly_mul_depth_measure_generic(
-        mut circuit: PolyCircuit<DCRTPoly>,
-        params: DCRTPolyParams,
-        ctx: Arc<NestedCrtPolyContext<DCRTPoly>>,
-        operand_values: Vec<Vec<BigUint>>,
-    ) {
-        assert!(operand_values.len() >= 2, "operand_values must contain at least two polynomials");
-        let ring_n = params.ring_dimension() as usize;
-        for values in &operand_values {
-            assert_eq!(values.len(), ring_n, "operand length must match ring dimension");
-        }
-
-        let inputs: Vec<NestedCrtPoly<DCRTPoly>> = operand_values
-            .iter()
-            .map(|_| NestedCrtPoly::input(ctx.clone(), &mut circuit))
-            .collect();
-        let expected_out = NestedCrtPoly::input(ctx.clone(), &mut circuit);
-
-        let mut accumulator = inputs[0].clone();
-        for poly in inputs.iter().skip(1) {
-            accumulator = accumulator.mul(poly, &mut circuit);
-            println!("mul called");
-        }
-        // let zero = accumulator.sub(&expected_out, &mut circuit);
-        // let is_zero = zero.is_zero(&mut circuit);
-        circuit.output(accumulator.l1_poly.inner);
+        let ctx_for_benchmark = ctx.clone();
+        NestedCrtPoly::benchmark_multiplication_tree(ctx_for_benchmark, &mut circuit, height);
         println!("non-free depth {}", circuit.non_free_depth());
 
-        let modulus = params.modulus();
-        let modulus_ref = modulus.as_ref();
-        let mut eval_inputs: Vec<DCRTPoly> = Vec::new();
-        for values in &operand_values {
-            eval_inputs.extend(encode_nested_crt_poly(L1_MODULI_BITS, &params, values));
+        let ring_n = params.ring_dimension() as usize;
+        let zero_values = vec![BigUint::zero(); ring_n];
+        let num_inputs = 1usize << height;
+        let mut eval_inputs: Vec<DCRTPoly> =
+            Vec::with_capacity(num_inputs * ctx.l1_ctx().l1_moduli_depth());
+        for _ in 0..num_inputs {
+            eval_inputs.extend(encode_nested_crt_poly(L1_MODULI_BITS, &params, &zero_values));
         }
-        let expected_values: Vec<BigUint> = (0..ring_n)
-            .map(|idx| {
-                operand_values
-                    .iter()
-                    .fold(BigUint::from(1u64), |acc, values| (&acc * &values[idx]) % modulus_ref)
-            })
-            .collect();
-        eval_inputs.extend(encode_nested_crt_poly(L1_MODULI_BITS, &params, &expected_values));
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_results =
             circuit.eval(&params, &DCRTPoly::const_one(&params), &eval_inputs, Some(plt_evaluator));
-        println!("eval_results {:?}", eval_results);
 
-        // assert_eq!(eval_results, vec![DCRTPoly::const_zero(&params)]);
+        assert_eq!(eval_results, vec![DCRTPoly::const_zero(&params)]);
     }
 }

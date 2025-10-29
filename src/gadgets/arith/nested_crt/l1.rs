@@ -19,6 +19,12 @@ pub struct L1PolyContext<P: Poly> {
     pub l1_moduli_wires: Vec<GateId>,
 }
 
+fn dummy_lut_map() -> HashMap<BigUint, (usize, BigUint)> {
+    let mut map = HashMap::new();
+    map.insert(BigUint::zero(), (0, BigUint::zero()));
+    map
+}
+
 impl<P: Poly> L1PolyContext<P> {
     pub fn setup(
         circuit: &mut PolyCircuit<P>,
@@ -36,13 +42,16 @@ impl<P: Poly> L1PolyContext<P> {
         let reconst_coeffs = (0..crt_depth).map(|i| params.to_crt_coeffs(i).1).collect::<Vec<_>>();
         let q = params.modulus().into();
         for &modulus in l1_moduli.iter() {
-            let add_max = (1 << (l1_moduli_bits + 1)) as u64 - 1;
-            let add_map_slot: HashMap<BigUint, (usize, BigUint)> =
+            let add_map_slot = if dummy_scalar {
+                dummy_lut_map()
+            } else {
+                let add_max = (1 << (l1_moduli_bits + 1)) as u64 - 1;
                 HashMap::from_par_iter((0..=add_max).into_par_iter().map(|t| {
                     let input = BigUint::from(t);
                     let output = BigUint::from(t % modulus);
                     (input, (t as usize, output))
-                }));
+                }))
+            };
             add_luts.push(PackedPlt::setup(
                 circuit,
                 params,
@@ -50,16 +59,19 @@ impl<P: Poly> L1PolyContext<P> {
                 add_map_slot,
                 dummy_scalar,
             ));
-            let mul_max = (1 << (2 * l1_moduli_bits)) as u64 - 1;
-            let base = 1u64 << l1_moduli_bits;
-            let mul_map_slot: HashMap<BigUint, (usize, BigUint)> =
+            let mul_map_slot = if dummy_scalar {
+                dummy_lut_map()
+            } else {
+                let mul_max = (1 << (2 * l1_moduli_bits)) as u64 - 1;
+                let base = 1u64 << l1_moduli_bits;
                 HashMap::from_par_iter((0..=mul_max).into_par_iter().map(|t| {
                     let input = BigUint::from(t);
                     let t0 = t % base;
                     let t1 = t / base;
                     let output = BigUint::from((t0 * t1) % modulus);
                     (input, (t as usize, output))
-                }));
+                }))
+            };
             mul_luts.push(PackedPlt::setup(
                 circuit,
                 params,

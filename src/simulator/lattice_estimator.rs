@@ -5,7 +5,7 @@ use std::{path::Path, process::Command, result::Result};
 /// This mirrors the JSON spec expected by the Python CLI.
 #[derive(Debug, Clone)]
 pub enum Distribution {
-    DiscreteGaussian { stddev: f64, mean: Option<f64>, n: Option<u64> },
+    DiscreteGaussian { stddev: String, mean: Option<f64>, n: Option<u64> },
     DiscreteGaussianAlpha { alpha: f64, mean: Option<f64>, n: Option<u64> }, /* 'q' is taken
                                                                               * from top-level
                                                                               * <q> */
@@ -243,8 +243,10 @@ exit {}
 
         let ring_dim = BigUint::from(4096u32);
         let q = BigUint::from(8192u32);
-        let s_dist = Distribution::DiscreteGaussian { stddev: 3.2, mean: None, n: None };
-        let e_dist = Distribution::DiscreteGaussian { stddev: 3.2, mean: None, n: None };
+        let s_dist =
+            Distribution::DiscreteGaussian { stddev: 3.2.to_string(), mean: None, n: None };
+        let e_dist =
+            Distribution::DiscreteGaussian { stddev: 3.2.to_string(), mean: None, n: None };
 
         let result = run_lattice_estimator_cli_with_path(
             mock_path, &ring_dim, &q, &s_dist, &e_dist, None, false,
@@ -360,10 +362,14 @@ exit {}
     #[test]
     fn test_distribution_to_json_string() {
         // Test various distribution types serialize correctly.
-        let dist = Distribution::DiscreteGaussian { stddev: 3.19, mean: Some(0.0), n: Some(256) };
+        let dist = Distribution::DiscreteGaussian {
+            stddev: 3.19.to_string(),
+            mean: Some(0.0),
+            n: Some(256),
+        };
         let json = dist.to_json_string();
         assert!(json.contains(r#""name":"DiscreteGaussian""#));
-        assert!(json.contains(r#""stddev":3.19"#));
+        assert!(json.contains(r#""stddev":"3.19""#));
         assert!(json.contains(r#""mean":0.0"#));
         assert!(json.contains(r#""n":256"#));
 
@@ -390,7 +396,8 @@ exit {}
         let ring_dim = BigUint::from(1024u32);
         let q = BigUint::from(12289u32);
         let s_dist = Distribution::Binary;
-        let e_dist = Distribution::DiscreteGaussian { stddev: 3.2, mean: None, n: None };
+        let e_dist =
+            Distribution::DiscreteGaussian { stddev: 3.2.to_string(), mean: None, n: None };
         let m = BigUint::from(100000u32);
 
         // Test with exact mode.

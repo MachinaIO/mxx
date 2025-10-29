@@ -35,6 +35,27 @@ impl<P: Poly> L1PolyContext<P> {
     ) -> Self {
         let (_, crt_bits, crt_depth) = params.to_crt();
         let l1_moduli_depth = (2 * crt_bits).div_ceil(l1_moduli_bits);
+        if dummy_scalar {
+            let l1_moduli = vec![0; l1_moduli_depth];
+            let add_luts =
+                vec![
+                    PackedPlt::setup(circuit, params, max_degree, dummy_lut_map(), dummy_scalar);
+                    l1_moduli_depth
+                ];
+            let mul_luts =
+                vec![
+                    PackedPlt::setup(circuit, params, max_degree, dummy_lut_map(), dummy_scalar);
+                    l1_moduli_depth
+                ];
+            let l1_moduli_wires = vec![circuit.const_zero_gate(); l1_moduli_depth];
+            return Self {
+                l1_moduli,
+                l1_moduli_bits,
+                max_degree,
+                luts: (add_luts, mul_luts),
+                l1_moduli_wires,
+            };
+        }
         let l1_moduli = sample_crt_primes(l1_moduli_bits, l1_moduli_depth);
         let mut add_luts = Vec::with_capacity(l1_moduli_depth);
         let mut mul_luts = Vec::with_capacity(l1_moduli_depth);
@@ -42,9 +63,7 @@ impl<P: Poly> L1PolyContext<P> {
         let reconst_coeffs = (0..crt_depth).map(|i| params.to_crt_coeffs(i).1).collect::<Vec<_>>();
         let q = params.modulus().into();
         for &modulus in l1_moduli.iter() {
-            let add_map_slot = if dummy_scalar {
-                dummy_lut_map()
-            } else {
+            let add_map_slot = {
                 let add_max = (1 << (l1_moduli_bits + 1)) as u64 - 1;
                 HashMap::from_par_iter((0..=add_max).into_par_iter().map(|t| {
                     let input = BigUint::from(t);
@@ -59,9 +78,7 @@ impl<P: Poly> L1PolyContext<P> {
                 add_map_slot,
                 dummy_scalar,
             ));
-            let mul_map_slot = if dummy_scalar {
-                dummy_lut_map()
-            } else {
+            let mul_map_slot = {
                 let mul_max = (1 << (2 * l1_moduli_bits)) as u64 - 1;
                 let base = 1u64 << l1_moduli_bits;
                 HashMap::from_par_iter((0..=mul_max).into_par_iter().map(|t| {

@@ -37,19 +37,27 @@ impl<P: Poly> RealPolyContext<P> {
     ) -> Self {
         let l1_ctx =
             L1PolyContext::setup(circuit, params, l1_moduli_bits, max_degree, dummy_scalar);
+        if dummy_scalar {
+            let l1_moduli_depth = l1_ctx.l1_moduli_depth();
+            let l1_to_real_luts =
+                vec![
+                    PackedPlt::setup(circuit, params, max_degree, dummy_lut_map(), dummy_scalar);
+                    l1_moduli_depth
+                ];
+            let real_to_int_lut =
+                PackedPlt::setup(circuit, params, max_degree, dummy_lut_map(), dummy_scalar);
+            return Self { scale, l1_ctx: Arc::new(l1_ctx), l1_to_real_luts, real_to_int_lut };
+        }
         let l1_moduli = &l1_ctx.l1_moduli;
         let max_add_count = l1_moduli.len() as u64;
         let mut l1_to_real_luts = Vec::with_capacity(l1_moduli.len());
         for &modulus in l1_moduli.iter() {
-            let l1_to_real_map_slot = if dummy_scalar {
-                dummy_lut_map()
-            } else {
+            let l1_to_real_map_slot =
                 HashMap::from_par_iter((0..(modulus as usize)).into_par_iter().map(|t| {
                     let input = BigUint::from(t as u64);
                     let output = BigUint::from(round_div(t as u64 * scale, modulus));
                     (input, (t as usize, output))
-                }))
-            };
+                }));
             l1_to_real_luts.push(PackedPlt::setup(
                 circuit,
                 params,
@@ -59,15 +67,12 @@ impl<P: Poly> RealPolyContext<P> {
             ));
         }
         let max_real = scale * max_add_count;
-        let real_to_int_map_slot = if dummy_scalar {
-            dummy_lut_map()
-        } else {
+        let real_to_int_map_slot =
             HashMap::from_par_iter((0..=max_real as usize).into_par_iter().map(|t| {
                 let input = BigUint::from(t as u64);
                 let output = BigUint::from(round_div(t as u64, scale));
                 (input, (t as usize, output))
-            }))
-        };
+            }));
         let real_to_int_lut =
             PackedPlt::setup(circuit, params, max_degree, real_to_int_map_slot, dummy_scalar);
         Self { scale, l1_ctx: Arc::new(l1_ctx), l1_to_real_luts, real_to_int_lut }

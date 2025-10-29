@@ -5,6 +5,7 @@ use crate::{
     lookup::{PltEvaluator, PublicLut},
     poly::dcrt::poly::DCRTPoly,
     simulator::{SimulatorContext, poly_matrix_norm::PolyMatrixNorm, poly_norm::PolyNorm},
+    utils::log_mem,
 };
 use bigdecimal::BigDecimal;
 use num_bigint::BigUint;
@@ -135,6 +136,20 @@ impl NormPltLweEvaluator {
             two_sqrt * ctx.ring_dim_sqrt.clone() +
             c_1.clone();
         let norm: BigDecimal = c_0 * 6 * sigma.clone() * ((ctx.base.clone() + 1) * sigma) * term;
+        let norm_bits = {
+            let s = norm.with_scale_round(0, bigdecimal::RoundingMode::Ceiling).to_string();
+            if let Some(n) = BigUint::parse_bytes(s.as_bytes(), 10) {
+                let bytes = n.to_bytes_be();
+                if bytes.is_empty() {
+                    0usize
+                } else {
+                    (bytes.len() - 1) * 8 + (8 - bytes[0].leading_zeros() as usize)
+                }
+            } else {
+                0usize
+            }
+        };
+        log_mem(format!("preimage norm bits {}", norm_bits));
         let ncol = ctx.log_base_q;
         let preimage1_norm = PolyMatrixNorm::new(
             ctx.clone(),
@@ -157,7 +172,44 @@ impl PltEvaluator<WireNorm> for NormPltLweEvaluator {
         input: WireNorm,
         _: GateId,
     ) -> WireNorm {
+        let h_norm_bits = {
+            let s = input
+                .h_norm
+                .poly_norm
+                .norm
+                .with_scale_round(0, bigdecimal::RoundingMode::Ceiling)
+                .to_string();
+            if let Some(n) = BigUint::parse_bytes(s.as_bytes(), 10) {
+                let bytes = n.to_bytes_be();
+                if bytes.is_empty() {
+                    0usize
+                } else {
+                    (bytes.len() - 1) * 8 + (8 - bytes[0].leading_zeros() as usize)
+                }
+            } else {
+                0usize
+            }
+        };
+        log_mem(format!("h_norm before LUT: {}", h_norm_bits));
         let h_norm = &self.preimage1_norm + (&input.h_norm * &self.preimage2_norm);
+        let h_norm_bits = {
+            let s = h_norm
+                .poly_norm
+                .norm
+                .with_scale_round(0, bigdecimal::RoundingMode::Ceiling)
+                .to_string();
+            if let Some(n) = BigUint::parse_bytes(s.as_bytes(), 10) {
+                let bytes = n.to_bytes_be();
+                if bytes.is_empty() {
+                    0usize
+                } else {
+                    (bytes.len() - 1) * 8 + (8 - bytes[0].leading_zeros() as usize)
+                }
+            } else {
+                0usize
+            }
+        };
+        log_mem(format!("h_norm after LUT: {}", h_norm_bits));
         let plaintext_bd =
             BigDecimal::from(num_bigint::BigInt::from(plt.max_output_row().1.value().clone()));
         let plaintext_norm = PolyNorm::new(input.clone_ctx(), plaintext_bd);

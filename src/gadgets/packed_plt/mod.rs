@@ -53,15 +53,15 @@ impl<P: Poly> PackedPlt<P> {
         if dummy_scalar {
             // let mul_scalars = vec![vec![vec![BigUint::one()]; max_degree]; crt_depth];
             // let reconstruct_coeffs = vec![BigUint::one(); crt_depth];
-            for i in 0..crt_depth {
-                let qi_big = BigUint::from(moduli[i]);
-                mul_scalars[i] = vec![vec![qi_big.clone()]; max_degree];
-                reconstruct_coeffs.push(qi_big.clone());
-                let mut hashmap = HashMap::new();
-                hashmap.insert(
-                    P::const_zero(params),
-                    (0, P::from_biguint_to_constant(params, qi_big)),
-                );
+            let qi_max = *moduli.iter().max().unwrap();
+            let qi_big = BigUint::from(qi_max);
+            let input = P::const_zero(params);
+            let output = P::from_biguint_to_constant(params, qi_big.clone());
+            let mut hashmap = HashMap::new();
+            hashmap.insert(input.clone(), (0, output.clone()));
+            mul_scalars = vec![vec![vec![qi_big.clone()]; max_degree]; crt_depth];
+            reconstruct_coeffs = vec![qi_big.clone(); crt_depth];
+            for _ in 0..crt_depth {
                 let plt = PublicLut::<P>::new(hashmap.clone());
                 let plt_id = circuit.register_public_lookup(plt);
                 plt_ids.push(vec![plt_id; max_degree]);

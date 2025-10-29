@@ -10,7 +10,7 @@ use crate::{
         packed_plt::PackedPlt,
     },
     poly::{Poly, PolyParams},
-    utils::{log_mem, mod_inverse},
+    utils::mod_inverse,
 };
 use num_bigint::BigUint;
 use num_traits::{ToPrimitive, Zero};
@@ -48,12 +48,44 @@ impl<P: Poly> NestedCrtPolyContext<P> {
             max_degree,
             dummy_scalar,
         );
+        // If dummy_scalar, create zeros and minimal lookups, then return early.
+        if dummy_scalar {
+            let (_, _, crt_depth) = params.to_crt();
+            let is_zero_luts = (0..real_ctx.l1_ctx.l1_moduli.len())
+                .map(|_| {
+                    let maps: Vec<HashMap<BigUint, (usize, BigUint)>> =
+                        std::iter::repeat_with(dummy_lut_map).take(crt_depth).collect();
+                    PackedPlt::setup_with_multi_hashmaps(
+                        circuit,
+                        params,
+                        max_degree,
+                        maps,
+                        dummy_scalar,
+                    )
+                })
+                .collect();
+
+            let zero = L1Poly::zero(real_ctx.l1_ctx.clone(), circuit);
+            let scalar_x = zero.clone();
+            let scalar_v = zero.clone();
+            let scalars_y = vec![zero.clone(); real_ctx.l1_ctx.l1_moduli.len()];
+            return Self {
+                real_ctx: Arc::new(real_ctx),
+                scalar_x,
+                scalars_y,
+                scalar_v,
+                is_zero_luts,
+            };
+        }
+
+        // Non-dummy path: compute constants as before (sequential).
         let (q_moduli, _, crt_depth) = params.to_crt();
         let reconst_coeffs =
             (0..crt_depth).map(|crt_idx| params.to_crt_coeffs(crt_idx).1).collect::<Vec<_>>();
         let ps = &real_ctx.l1_ctx.l1_moduli;
         let p = ps.iter().fold(BigUint::from(1u64), |acc, &pi| acc * BigUint::from(pi));
         let p_over_pis = ps.iter().map(|&pi| &p / pi).collect::<Vec<BigUint>>();
+        // Keep inverses sequential to preserve logging order and avoid contention
         let p_over_pis_inv = ps
             .iter()
             .zip(p_over_pis.iter())
@@ -61,19 +93,17 @@ impl<P: Poly> NestedCrtPolyContext<P> {
                 let pi_big = BigUint::from(pi);
                 let residue = (p_over_pi % &pi_big).to_u64().expect("CRT residue must fit in u64");
                 let inv = mod_inverse(residue, pi).expect("CRT moduli must be coprime");
-                log_mem(format!("pi = {}, p_over_pi = {}, inv = {}", pi, p_over_pi, inv));
+                // log_mem(format!("pi = {}, p_over_pi = {}, inv = {}", pi, p_over_pi, inv));
                 BigUint::from(inv)
             })
             .collect::<Vec<BigUint>>();
-        let mut x_polys = Vec::with_capacity(real_ctx.l1_ctx.l1_moduli.len());
-        let mut y_polys = vec![
-            Vec::with_capacity(real_ctx.l1_ctx.l1_moduli.len());
-            real_ctx.l1_ctx.l1_moduli.len()
-        ];
-        let mut v_polys = Vec::with_capacity(real_ctx.l1_ctx.l1_moduli.len());
+
         let q = params.modulus().into();
-        for (i, &p_i) in real_ctx.l1_ctx.l1_moduli.iter().enumerate() {
-            let p_i = BigUint::from(p_i);
+        let mut x_polys = Vec::with_capacity(ps.len());
+        let mut y_polys = vec![Vec::with_capacity(ps.len()); ps.len()];
+        let mut v_polys = Vec::with_capacity(ps.len());
+        for (i, &p_i_u64) in ps.iter().enumerate() {
+            let p_i = BigUint::from(p_i_u64);
             let mut x_const = BigUint::zero();
             let mut y_consts = vec![BigUint::zero(); ps.len()];
             let mut v_const = BigUint::zero();
@@ -101,21 +131,7 @@ impl<P: Poly> NestedCrtPolyContext<P> {
             .map(|y_polys_per_j| L1Poly::constant(real_ctx.l1_ctx.clone(), circuit, &y_polys_per_j))
             .collect::<Vec<_>>();
 
-        let is_zero_luts = if dummy_scalar {
-            (0..real_ctx.l1_ctx.l1_moduli.len())
-                .map(|_| {
-                    let maps: Vec<HashMap<BigUint, (usize, BigUint)>> =
-                        std::iter::repeat_with(dummy_lut_map).take(crt_depth).collect();
-                    PackedPlt::setup_with_multi_hashmaps(
-                        circuit,
-                        params,
-                        max_degree,
-                        maps,
-                        dummy_scalar,
-                    )
-                })
-                .collect()
-        } else {
+        let is_zero_luts = {
             let max_qi_error =
                 (real_ctx.l1_ctx.l1_moduli.len() as u64 + ps.iter().sum::<u64>()).div_ceil(2);
             let mut is_zero_maps = vec![
@@ -219,12 +235,10 @@ impl<P: Poly> NestedCrtPoly<P> {
         while current_layer.len() > 1 {
             debug_assert!(current_layer.len().is_multiple_of(2), "layer size must stay even");
             let mut next_layer = Vec::with_capacity(current_layer.len() / 2);
-            log_mem(format!("before layer size {}", current_layer.len()));
             for pair in current_layer.chunks(2) {
                 let parent = pair[0].mul(&pair[1], circuit);
                 next_layer.push(parent);
             }
-            log_mem(format!("after layer size {}", current_layer.len()));
             current_layer = next_layer;
         }
         let root = current_layer.pop().expect("multiplication tree must contain at least one node");

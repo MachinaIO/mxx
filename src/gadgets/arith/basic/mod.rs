@@ -2,7 +2,7 @@ pub mod bigunit;
 
 use crate::{
     circuit::{PolyCircuit, gate::GateId},
-    gadgets::crt::bigunit::{BigUintPoly, BigUintPolyContext, encode_biguint_poly},
+    gadgets::arith::basic::bigunit::{BigUintPoly, BigUintPolyContext, encode_biguint_poly},
     poly::{Poly, PolyParams},
     utils::{debug_mem, mod_inverse},
 };
@@ -11,7 +11,7 @@ use num_bigint::BigUint;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
-pub struct ModuloPolyContext<P: Poly> {
+pub struct BasicModuloPolyContext<P: Poly> {
     pub biguint_ctx: Arc<BigUintPolyContext<P>>,
     pub num_limbs: usize,
     pub moduli_poly: BigUintPoly<P>,
@@ -22,7 +22,7 @@ pub struct ModuloPolyContext<P: Poly> {
     pub max_degree: usize,
 }
 
-impl<P: Poly> PartialEq for ModuloPolyContext<P> {
+impl<P: Poly> PartialEq for BasicModuloPolyContext<P> {
     fn eq(&self, other: &Self) -> bool {
         self.biguint_ctx == other.biguint_ctx &&
             self.num_limbs == other.num_limbs &&
@@ -35,9 +35,9 @@ impl<P: Poly> PartialEq for ModuloPolyContext<P> {
     }
 }
 
-impl<P: Poly> Eq for ModuloPolyContext<P> {}
+impl<P: Poly> Eq for BasicModuloPolyContext<P> {}
 
-impl<P: Poly> ModuloPolyContext<P> {
+impl<P: Poly> BasicModuloPolyContext<P> {
     pub fn setup(
         circuit: &mut PolyCircuit<P>,
         params: &P::Params,
@@ -110,17 +110,17 @@ impl<P: Poly> ModuloPolyContext<P> {
 }
 
 #[derive(Debug, Clone)]
-pub struct ModuloPoly<P: Poly> {
-    pub ctx: Arc<ModuloPolyContext<P>>,
+pub struct BasicModuloPoly<P: Poly> {
+    pub ctx: Arc<BasicModuloPolyContext<P>>,
     pub value: BigUintPoly<P>,
 }
 
-impl<P: Poly> ModuloPoly<P> {
-    pub fn new(ctx: Arc<ModuloPolyContext<P>>, value: BigUintPoly<P>) -> Self {
+impl<P: Poly> BasicModuloPoly<P> {
+    pub fn new(ctx: Arc<BasicModuloPolyContext<P>>, value: BigUintPoly<P>) -> Self {
         Self { ctx, value }
     }
 
-    pub fn input(ctx: Arc<ModuloPolyContext<P>>, circuit: &mut PolyCircuit<P>) -> Self {
+    pub fn input(ctx: Arc<BasicModuloPolyContext<P>>, circuit: &mut PolyCircuit<P>) -> Self {
         let bit_size = ctx.num_limbs * ctx.biguint_ctx.limb_bit_size;
         let value = BigUintPoly::input(ctx.biguint_ctx.clone(), circuit, bit_size);
         Self { ctx, value }
@@ -128,7 +128,7 @@ impl<P: Poly> ModuloPoly<P> {
 
     pub fn from_regular(
         circuit: &mut PolyCircuit<P>,
-        ctx: Arc<ModuloPolyContext<P>>,
+        ctx: Arc<BasicModuloPolyContext<P>>,
         mut value: BigUintPoly<P>,
     ) -> Self {
         if value.limbs.len() != ctx.num_limbs {
@@ -179,7 +179,7 @@ impl<P: Poly> ModuloPoly<P> {
     }
 
     fn montgomery_reduce(
-        ctx: &ModuloPolyContext<P>,
+        ctx: &BasicModuloPolyContext<P>,
         circuit: &mut PolyCircuit<P>,
         t: &BigUintPoly<P>,
     ) -> BigUintPoly<P> {
@@ -245,9 +245,9 @@ mod tests {
     fn create_test_context_with_limb(
         circuit: &mut PolyCircuit<DCRTPoly>,
         limb_bit_size: usize,
-    ) -> (DCRTPolyParams, Arc<ModuloPolyContext<DCRTPoly>>) {
+    ) -> (DCRTPolyParams, Arc<BasicModuloPolyContext<DCRTPoly>>) {
         let params = DCRTPolyParams::default();
-        let ctx = Arc::new(ModuloPolyContext::setup(
+        let ctx = Arc::new(BasicModuloPolyContext::setup(
             circuit,
             &params,
             limb_bit_size,
@@ -259,7 +259,7 @@ mod tests {
 
     fn create_test_context(
         circuit: &mut PolyCircuit<DCRTPoly>,
-    ) -> (DCRTPolyParams, Arc<ModuloPolyContext<DCRTPoly>>) {
+    ) -> (DCRTPolyParams, Arc<BasicModuloPolyContext<DCRTPoly>>) {
         create_test_context_with_limb(circuit, LIMB_BIT_SIZE)
     }
 
@@ -272,26 +272,14 @@ mod tests {
         let modulus = params.modulus();
         let mut rng = rand::rng();
         let a_values: Vec<BigUint> = (0..ring_n)
-            .map(|_| {
-                crate::utils::gen_biguint_for_modulus(
-                    &mut rng,
-                    ctx.biguint_ctx.limb_bit_size,
-                    modulus.as_ref(),
-                )
-            })
+            .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref()))
             .collect();
         let b_values: Vec<BigUint> = (0..ring_n)
-            .map(|_| {
-                crate::utils::gen_biguint_for_modulus(
-                    &mut rng,
-                    ctx.biguint_ctx.limb_bit_size,
-                    modulus.as_ref(),
-                )
-            })
+            .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref()))
             .collect();
 
-        let poly_a = ModuloPoly::input(ctx.clone(), &mut circuit);
-        let poly_b = ModuloPoly::input(ctx.clone(), &mut circuit);
+        let poly_a = BasicModuloPoly::input(ctx.clone(), &mut circuit);
+        let poly_b = BasicModuloPoly::input(ctx.clone(), &mut circuit);
 
         let limb_bit_size = ctx.biguint_ctx.limb_bit_size;
         let a_inputs = encode_modulo_poly(limb_bit_size, &params, &a_values);
@@ -325,26 +313,14 @@ mod tests {
         let modulus = params.modulus();
         let mut rng = rand::rng();
         let a_values: Vec<BigUint> = (0..ring_n)
-            .map(|_| {
-                crate::utils::gen_biguint_for_modulus(
-                    &mut rng,
-                    ctx.biguint_ctx.limb_bit_size,
-                    modulus.as_ref(),
-                )
-            })
+            .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref()))
             .collect();
         let b_values: Vec<BigUint> = (0..ring_n)
-            .map(|_| {
-                crate::utils::gen_biguint_for_modulus(
-                    &mut rng,
-                    ctx.biguint_ctx.limb_bit_size,
-                    modulus.as_ref(),
-                )
-            })
+            .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref()))
             .collect();
 
-        let poly_a = ModuloPoly::input(ctx.clone(), &mut circuit);
-        let poly_b = ModuloPoly::input(ctx.clone(), &mut circuit);
+        let poly_a = BasicModuloPoly::input(ctx.clone(), &mut circuit);
+        let poly_b = BasicModuloPoly::input(ctx.clone(), &mut circuit);
 
         let limb_bit_size = ctx.biguint_ctx.limb_bit_size;
         let a_inputs = encode_modulo_poly(limb_bit_size, &params, &a_values);
@@ -382,26 +358,14 @@ mod tests {
         let modulus = params.modulus();
         let mut rng = rand::rng();
         let a_values: Vec<BigUint> = (0..ring_n)
-            .map(|_| {
-                crate::utils::gen_biguint_for_modulus(
-                    &mut rng,
-                    ctx.biguint_ctx.limb_bit_size,
-                    modulus.as_ref(),
-                )
-            })
+            .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref()))
             .collect();
         let b_values: Vec<BigUint> = (0..ring_n)
-            .map(|_| {
-                crate::utils::gen_biguint_for_modulus(
-                    &mut rng,
-                    ctx.biguint_ctx.limb_bit_size,
-                    modulus.as_ref(),
-                )
-            })
+            .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref()))
             .collect();
 
-        let poly_a = ModuloPoly::input(ctx.clone(), &mut circuit);
-        let poly_b = ModuloPoly::input(ctx.clone(), &mut circuit);
+        let poly_a = BasicModuloPoly::input(ctx.clone(), &mut circuit);
+        let poly_b = BasicModuloPoly::input(ctx.clone(), &mut circuit);
 
         let limb_bit_size = ctx.biguint_ctx.limb_bit_size;
         let a_inputs = encode_modulo_poly(limb_bit_size, &params, &a_values);
@@ -435,14 +399,14 @@ mod tests {
         let modulus = params.modulus();
         let mut rng = rand::rng();
         let a_values: Vec<BigUint> = (0..ring_n)
-            .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, 1, modulus.as_ref()))
+            .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref()))
             .collect();
         let b_values: Vec<BigUint> = (0..ring_n)
-            .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, 1, modulus.as_ref()))
+            .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref()))
             .collect();
 
-        let poly_a = ModuloPoly::input(ctx.clone(), &mut circuit);
-        let poly_b = ModuloPoly::input(ctx.clone(), &mut circuit);
+        let poly_a = BasicModuloPoly::input(ctx.clone(), &mut circuit);
+        let poly_b = BasicModuloPoly::input(ctx.clone(), &mut circuit);
 
         let a_inputs = encode_modulo_poly(1, &params, &a_values);
         let b_inputs = encode_modulo_poly(1, &params, &b_values);
@@ -475,14 +439,14 @@ mod tests {
         let modulus = params.modulus();
         let mut rng = rand::rng();
         let a_values: Vec<BigUint> = (0..ring_n)
-            .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, 1, modulus.as_ref()))
+            .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref()))
             .collect();
         let b_values: Vec<BigUint> = (0..ring_n)
-            .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, 1, modulus.as_ref()))
+            .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref()))
             .collect();
 
-        let poly_a = ModuloPoly::input(ctx.clone(), &mut circuit);
-        let poly_b = ModuloPoly::input(ctx.clone(), &mut circuit);
+        let poly_a = BasicModuloPoly::input(ctx.clone(), &mut circuit);
+        let poly_b = BasicModuloPoly::input(ctx.clone(), &mut circuit);
 
         let a_inputs = encode_modulo_poly(1, &params, &a_values);
         let b_inputs = encode_modulo_poly(1, &params, &b_values);
@@ -519,14 +483,14 @@ mod tests {
         let modulus = params.modulus();
         let mut rng = rand::rng();
         let a_values: Vec<BigUint> = (0..ring_n)
-            .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, 1, modulus.as_ref()))
+            .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref()))
             .collect();
         let b_values: Vec<BigUint> = (0..ring_n)
-            .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, 1, modulus.as_ref()))
+            .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref()))
             .collect();
 
-        let poly_a = ModuloPoly::input(ctx.clone(), &mut circuit);
-        let poly_b = ModuloPoly::input(ctx.clone(), &mut circuit);
+        let poly_a = BasicModuloPoly::input(ctx.clone(), &mut circuit);
+        let poly_b = BasicModuloPoly::input(ctx.clone(), &mut circuit);
 
         let a_inputs = encode_modulo_poly(1, &params, &a_values);
         let b_inputs = encode_modulo_poly(1, &params, &b_values);

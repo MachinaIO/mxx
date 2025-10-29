@@ -5,7 +5,7 @@ use crate::{
         public_key::BggPublicKey,
         sampler::{BGGEncodingSampler, BGGPublicKeySampler},
     },
-    gadgets::crt::encode_modulo_poly,
+    gadgets::arith::basic::encode_modulo_poly,
     lookup::{
         lwe_eval::{LweBggEncodingPltEvaluator, LweBggPubKeyEvaluator},
         poly::PolyPltEvaluator,

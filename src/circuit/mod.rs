@@ -19,7 +19,7 @@ use crate::{
     circuit::gate::GateId,
     lookup::{PltEvaluator, PublicLut},
     poly::Poly,
-    utils::debug_mem,
+    utils::{debug_mem, log_mem},
 };
 #[derive(Debug, Clone, Default)]
 pub struct PolyCircuit<P: Poly> {
@@ -163,7 +163,6 @@ impl<P: Poly> PolyCircuit<P> {
     pub fn output(&mut self, outputs: Vec<GateId>) {
         #[cfg(debug_assertions)]
         assert_eq!(self.output_ids.len(), 0);
-
         for gate_id in outputs.into_iter() {
             self.output_ids.push(gate_id);
         }
@@ -261,6 +260,13 @@ impl<P: Poly> PolyCircuit<P> {
 
     pub fn large_scalar_mul(&mut self, input: GateId, scalar: &[BigUint]) -> GateId {
         self.new_gate_generic(vec![input], PolyGateType::LargeScalarMul { scalar: scalar.to_vec() })
+    }
+
+    pub fn poly_scalar_mul(&mut self, input: GateId, scalar: &P) -> GateId {
+        self.new_gate_generic(
+            vec![input],
+            PolyGateType::LargeScalarMul { scalar: scalar.coeffs_biguints() },
+        )
     }
 
     pub fn rotate_gate(&mut self, input: GateId, shift: i32) -> GateId {
@@ -410,7 +416,7 @@ impl<P: Poly> PolyCircuit<P> {
         for (id, input) in input_gate_ids.into_iter().zip(inputs.iter()) {
             wires.insert(id, input.clone());
             if let Some(prefix) = self.print_value.get(&id) {
-                debug_mem(format!("[{prefix}] Gate ID {id}, {:?}", input));
+                log_mem(format!("[{prefix}] Gate ID {id}, {:?}", input));
             }
         }
         debug_mem("Input wires are set");
@@ -505,7 +511,7 @@ impl<P: Poly> PolyCircuit<P> {
                     }
                 };
                 if let Some(prefix) = self.print_value.get(&gate_id) {
-                    debug_mem(format!("[{prefix}] Gate ID {gate_id}, {:?}", result));
+                    log_mem(format!("[{prefix}] Gate ID {gate_id}, {:?}", result));
                 }
                 wires.insert(gate_id, result);
                 debug_mem(format!("Gate id {gate_id} finished"));

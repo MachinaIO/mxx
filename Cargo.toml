@@ -32,6 +32,7 @@ bitvec = "1"
 keccak-asm = { version = "0.1.4" }
 tempfile = { version = "3.19.1" }
 tracing-subscriber = "0.3"
+primal = "0.3"
 
 [profile.dev]
 debug = "line-tables-only"

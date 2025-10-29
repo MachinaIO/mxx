@@ -32,15 +32,12 @@ async fn test_arithmetic_circuit_single_limb() {
     let n = 3;
     let limb_bit_size = 1;
     let mut rng = rand::rng();
-    let a_vec: Vec<BigUint> = (0..n)
-        .map(|_| gen_biguint_for_modulus(&mut rng, limb_bit_size, &params.modulus()))
-        .collect::<Vec<_>>();
-    let b_vec: Vec<BigUint> = (0..n)
-        .map(|_| gen_biguint_for_modulus(&mut rng, limb_bit_size, &params.modulus()))
-        .collect::<Vec<_>>();
-    let c_vec: Vec<BigUint> = (0..n)
-        .map(|_| gen_biguint_for_modulus(&mut rng, limb_bit_size, &params.modulus()))
-        .collect::<Vec<_>>();
+    let a_vec: Vec<BigUint> =
+        (0..n).map(|_| gen_biguint_for_modulus(&mut rng, &params.modulus())).collect::<Vec<_>>();
+    let b_vec: Vec<BigUint> =
+        (0..n).map(|_| gen_biguint_for_modulus(&mut rng, &params.modulus())).collect::<Vec<_>>();
+    let c_vec: Vec<BigUint> =
+        (0..n).map(|_| gen_biguint_for_modulus(&mut rng, &params.modulus())).collect::<Vec<_>>();
     let inputs = vec![&a_vec[..], &b_vec[..], &c_vec[..]];
 
     // Test mixed operations in single circuit: (a + b) * c - a.

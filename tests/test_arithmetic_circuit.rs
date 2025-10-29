@@ -31,15 +31,12 @@ async fn test_arithmetic_circuit_operations() {
     let n = 1;
     let limb_bit_size = 3;
     let mut rng = rand::rng();
-    let a_vec: Vec<BigUint> = (0..n)
-        .map(|_| gen_biguint_for_modulus(&mut rng, limb_bit_size, &params.modulus()))
-        .collect::<Vec<_>>();
-    let b_vec: Vec<BigUint> = (0..n)
-        .map(|_| gen_biguint_for_modulus(&mut rng, limb_bit_size, &params.modulus()))
-        .collect::<Vec<_>>();
-    let c_vec: Vec<BigUint> = (0..n)
-        .map(|_| gen_biguint_for_modulus(&mut rng, limb_bit_size, &params.modulus()))
-        .collect::<Vec<_>>();
+    let a_vec: Vec<BigUint> =
+        (0..n).map(|_| gen_biguint_for_modulus(&mut rng, &params.modulus())).collect::<Vec<_>>();
+    let b_vec: Vec<BigUint> =
+        (0..n).map(|_| gen_biguint_for_modulus(&mut rng, &params.modulus())).collect::<Vec<_>>();
+    let c_vec: Vec<BigUint> =
+        (0..n).map(|_| gen_biguint_for_modulus(&mut rng, &params.modulus())).collect::<Vec<_>>();
     let inputs = vec![&a_vec[..], &b_vec[..], &c_vec[..]];
     let mut mixed_circuit =
         ArithmeticCircuit::<DCRTPoly>::setup(&params, limb_bit_size, n, inputs.len(), false);

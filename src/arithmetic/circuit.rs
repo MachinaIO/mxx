@@ -1,6 +1,6 @@
 use crate::{
     circuit::PolyCircuit,
-    gadgets::crt::{ModuloPoly, ModuloPolyContext},
+    gadgets::arith::basic::{BasicModuloPoly, BasicModuloPolyContext},
     poly::Poly,
     utils::log_mem,
 };
@@ -37,11 +37,11 @@ pub struct ArithmeticCircuit<P: Poly> {
     pub max_degree: usize,
     pub num_inputs: usize,
     pub poly_circuit: PolyCircuit<P>,
-    pub ctx: Arc<ModuloPolyContext<P>>,
+    pub ctx: Arc<BasicModuloPolyContext<P>>,
     // pub use_packing: bool,
     // pub use_reconstruction: bool,
     // inputs + intermediate results
-    pub all_values: Vec<ModuloPoly<P>>,
+    pub all_values: Vec<BasicModuloPoly<P>>,
 }
 
 impl<P: Poly> ArithmeticCircuit<P> {
@@ -55,7 +55,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
         let mut poly_circuit = PolyCircuit::<P>::new();
         let mut all_values = Vec::with_capacity(num_inputs);
         log_mem("before ModuloPolyContext setup");
-        let ctx = Arc::new(ModuloPolyContext::setup(
+        let ctx = Arc::new(BasicModuloPolyContext::setup(
             &mut poly_circuit,
             params,
             limb_bit_size,
@@ -64,7 +64,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
         ));
         log_mem("after ModuloPolyContext setup");
         let crt_polys = (0..num_inputs)
-            .map(|_| ModuloPoly::input(ctx.clone(), &mut poly_circuit))
+            .map(|_| BasicModuloPoly::input(ctx.clone(), &mut poly_circuit))
             .collect::<Vec<_>>();
         all_values.extend(crt_polys);
 

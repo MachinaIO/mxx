@@ -146,7 +146,7 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         self.open_matrix(&matrix)
     }
 
-    pub fn verify(
+    pub fn verify_matrix(
         &self,
         params: &<M::P as Poly>::Params,
         msg: &M,
@@ -171,7 +171,7 @@ impl<M: PolyMatrix> Wee25Commit<M> {
     ) -> bool {
         let identity = M::identity(params, self.secret_size, None);
         let matrix = msg.tensor(&identity);
-        self.verify(params, &matrix, commit, opening)
+        self.verify_matrix(params, &matrix, commit, opening)
     }
 
     fn commit_matrix_recursive(&self, msg: &M) -> M {
@@ -341,7 +341,7 @@ mod tests {
         let commitment = commit_params.commit_matrix(&zero_matrix);
         let opening = commit_params.open_matrix(&zero_matrix);
 
-        assert!(commit_params.verify(&params, &zero_matrix, &commitment, &opening));
+        assert!(commit_params.verify_matrix(&params, &zero_matrix, &commitment, &opening));
     }
 
     #[test]
@@ -362,7 +362,7 @@ mod tests {
         zero_matrix.set_entry(0, 0, DCRTPoly::one(&params));
         let opening = commit_params.open_matrix(&zero_matrix);
 
-        assert!(!commit_params.verify(&params, &zero_matrix, &commitment, &opening));
+        assert!(!commit_params.verify_matrix(&params, &zero_matrix, &commitment, &opening));
     }
 
     #[test]
@@ -385,7 +385,7 @@ mod tests {
         let commitment = commit_params.commit_matrix(&msg_matrix);
         let opening = commit_params.open_matrix(&msg_matrix);
 
-        assert!(commit_params.verify(&params, &msg_matrix, &commitment, &opening));
+        assert!(commit_params.verify_matrix(&params, &msg_matrix, &commitment, &opening));
     }
 
     #[test]
@@ -412,6 +412,29 @@ mod tests {
 
         let opening = commit_params.open_matrix(&tampered);
 
-        assert!(!commit_params.verify(&params, &tampered, &commitment, &opening));
+        assert!(!commit_params.verify_matrix(&params, &tampered, &commitment, &opening));
+    }
+
+    #[test]
+    fn test_wee25_random_vector_commit_verify() {
+        let params = DCRTPolyParams::new(4, 2, 17, 15);
+        let secret_size = 2;
+        let m_b = (&params.modulus_digits() + 2) * secret_size;
+        let base_len = 2 * m_b;
+        let msg_size = 2 * base_len;
+
+        let commit_params = Wee25Commit::<DCRTPolyMatrix>::setup::<
+            DCRTPolyUniformSampler,
+            DCRTPolyTrapdoorSampler,
+        >(&params, msg_size, secret_size, SIGMA);
+
+        let uniform_sampler = DCRTPolyUniformSampler::new();
+        let msg_vector =
+            uniform_sampler.sample_uniform(&params, 1, msg_size / 2, DistType::FinRingDist);
+
+        let commitment = commit_params.commit_vector(&params, &msg_vector);
+        let opening = commit_params.open_vector(&params, &msg_vector);
+
+        assert!(commit_params.verify_vector(&params, &msg_vector, &commitment, &opening));
     }
 }

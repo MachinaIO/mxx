@@ -7,23 +7,19 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 #[derive(Debug, Clone)]
 pub struct Wee25Commit<M: PolyMatrix> {
-    params: <M::P as Poly>::Params,
-    msg_size: usize,
-    secret_size: usize,
-    m_b: usize,
-    m_g: usize,
-    b: M,
-    w: M,
-    t_top: M,
-    t_bottom: M,
-    j_2m: M,
-    v: M,
+    pub secret_size: usize,
+    pub m_b: usize,
+    pub m_g: usize,
+    pub b: M,
+    pub w: M,
+    pub t_top: M,
+    pub t_bottom: M,
+    pub j_2m: M,
 }
 
 impl<M: PolyMatrix> Wee25Commit<M> {
     pub fn setup<US: PolyUniformSampler<M = M>, TS: PolyTrapdoorSampler<M = M>>(
         params: &<M::P as Poly>::Params,
-        msg_size: usize,
         secret_size: usize,
         trapdoor_sigma: f64,
     ) -> Self {
@@ -77,73 +73,37 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             mul2.decompose()
         };
 
-        let v_2m = t_bottom.clone() * &j_2m;
-        let base_len = 2 * m_b;
-        assert!(
-            msg_size >= base_len,
-            "msg_size ({msg_size}) must be at least 2 * b_ncol ({base_len})"
-        );
-        assert_eq!(
-            msg_size % base_len,
-            0,
-            "msg_size ({msg_size}) must be a multiple of 2 * b_ncol ({base_len})"
-        );
-        let ratio = msg_size / base_len;
-        assert!(
-            ratio.is_power_of_two(),
-            "msg_size / (2 * b_ncol) must be a power of two, got {ratio}"
-        );
-        let mut v = v_2m.clone();
-        let mut current_len = base_len;
-        while current_len < msg_size {
-            v = v_2m.mul_tensor_identity_decompose(&v, 2);
-            current_len *= 2;
-        }
-
-        Self {
-            params: params.clone(),
-            msg_size,
-            secret_size,
-            m_b,
-            m_g,
-            b,
-            w,
-            t_top,
-            t_bottom,
-            j_2m,
-            v,
-        }
+        Self { secret_size, m_b, m_g, b, w, t_top, t_bottom, j_2m }
     }
 
     pub fn setup_vector<US: PolyUniformSampler<M = M>, TS: PolyTrapdoorSampler<M = M>>(
         params: &<M::P as Poly>::Params,
-        msg_size: usize,
         secret_size: usize,
         trapdoor_sigma: f64,
     ) -> Self {
-        Self::setup::<US, TS>(params, msg_size * secret_size, secret_size, trapdoor_sigma)
+        Self::setup::<US, TS>(params, secret_size, trapdoor_sigma)
     }
 
-    pub fn commit_matrix(&self, msg: &M) -> M {
-        debug_assert_eq!(msg.size(), (self.secret_size, self.msg_size));
-        self.commit_matrix_recursive(msg)
+    pub fn commit_matrix(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
+        debug_assert_eq!(msg.row_size(), self.secret_size);
+        self.commit_matrix_recursive(params, msg)
     }
 
     pub fn commit_vector(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
         let identity = M::identity(params, self.secret_size, None);
         let matrix = msg.tensor(&identity);
-        self.commit_matrix(&matrix)
+        self.commit_matrix(params, &matrix)
     }
 
-    pub fn open_matrix(&self, msg: &M) -> M {
-        debug_assert_eq!(msg.size(), (self.secret_size, self.msg_size));
-        self.open_matrix_recursive(msg)
+    pub fn open_matrix(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
+        debug_assert_eq!(msg.row_size(), self.secret_size);
+        self.open_matrix_recursive(params, msg)
     }
 
     pub fn open_vector(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
         let identity = M::identity(params, self.secret_size, None);
         let matrix = msg.tensor(&identity);
-        self.open_matrix(&matrix)
+        self.open_matrix(params, &matrix)
     }
 
     pub fn verify_matrix(
@@ -153,9 +113,11 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         commit: &M,
         opening: &M,
     ) -> bool {
-        debug_assert_eq!(msg.size(), (self.secret_size, self.msg_size));
-        let g_l = M::gadget_matrix(params, self.msg_size);
-        let lhs = commit.clone() * self.v.clone();
+        debug_assert_eq!(msg.row_size(), self.secret_size);
+        let msg_size = msg.col_size();
+        let g_l = M::gadget_matrix(params, msg_size);
+        let v = self.verifier_for_length(msg_size);
+        let lhs = commit.clone() * v;
         let rhs_msg = msg.clone() * g_l;
         let rhs_open = self.b.clone() * opening.clone();
         let rhs = rhs_msg - rhs_open;
@@ -174,7 +136,7 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         self.verify_matrix(params, &matrix, commit, opening)
     }
 
-    fn commit_matrix_recursive(&self, msg: &M) -> M {
+    fn commit_matrix_recursive(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
         let cols = msg.col_size();
         debug_assert!(
             cols % self.m_b == 0,
@@ -183,7 +145,7 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             cols
         );
         if cols == 2 * self.m_b {
-            return self.commit_base(msg);
+            return self.commit_base(params, msg);
         }
         debug_assert!(
             cols % 2 == 0,
@@ -193,13 +155,13 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         let mid = cols / 2;
         let left = msg.slice_columns(0, mid);
         let right = msg.slice_columns(mid, cols);
-        let c0 = self.commit_matrix_recursive(&left);
-        let c1 = self.commit_matrix_recursive(&right);
+        let c0 = self.commit_matrix_recursive(params, &left);
+        let c1 = self.commit_matrix_recursive(params, &right);
         let combined = c0.concat_columns(&[&c1]);
-        self.commit_base(&combined)
+        self.commit_base(params, &combined)
     }
 
-    fn commit_base(&self, msg: &M) -> M {
+    fn commit_base(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
         debug_assert_eq!(
             msg.size(),
             (self.secret_size, 2 * self.m_b),
@@ -208,12 +170,12 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             2 * self.m_b
         );
         let bits_row = self.bits_row(msg);
-        let identity = M::identity(&self.params, self.secret_size, None);
+        let identity = M::identity(&params, self.secret_size, None);
         let bits_tensor = bits_row.tensor(&identity);
         bits_tensor * &self.w
     }
 
-    fn open_matrix_recursive(&self, msg: &M) -> M {
+    fn open_matrix_recursive(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
         let cols = msg.col_size();
         debug_assert!(
             cols % self.m_b == 0,
@@ -222,7 +184,7 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             cols
         );
         if cols == 2 * self.m_b {
-            return self.open_base(msg);
+            return self.open_base(params, msg);
         }
         debug_assert!(
             cols % 2 == 0,
@@ -232,19 +194,19 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         let mid = cols / 2;
         let left = msg.slice_columns(0, mid);
         let right = msg.slice_columns(mid, cols);
-        let z0 = self.open_matrix_recursive(&left);
-        let z1 = self.open_matrix_recursive(&right);
-        let c0 = self.commit_matrix_recursive(&left);
-        let c1 = self.commit_matrix_recursive(&right);
+        let z0 = self.open_matrix_recursive(params, &left);
+        let z1 = self.open_matrix_recursive(params, &right);
+        let c0 = self.commit_matrix_recursive(params, &left);
+        let c1 = self.commit_matrix_recursive(params, &right);
         let combined_c = c0.concat_columns(&[&c1]);
-        let z_prime = self.open_base(&combined_c);
+        let z_prime = self.open_base(params, &combined_c);
         let v_half = self.verifier_for_length(mid);
         let adjusted = z_prime.mul_tensor_identity_decompose(&v_half, 2);
         let z_concat = z0.concat_columns(&[&z1]);
         adjusted + z_concat
     }
 
-    fn open_base(&self, msg: &M) -> M {
+    fn open_base(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
         debug_assert_eq!(
             msg.size(),
             (self.secret_size, 2 * self.m_b),
@@ -254,7 +216,7 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         );
         let bits_row = self.bits_row(msg);
         let m_b = self.b.col_size();
-        let identity = M::identity(&self.params, m_b, None);
+        let identity = M::identity(params, m_b, None);
         let bits_tensor = bits_row.tensor(&identity);
         // let t_matrix = self.t_top.clone().concat_rows(&[&self.t_bottom]);
         let intermediate = bits_tensor * &self.t_top;
@@ -288,7 +250,7 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         }
     }
 
-    fn verifier_for_length(&self, cols: usize) -> M {
+    pub fn verifier_for_length(&self, cols: usize) -> M {
         let base_len = 2 * self.m_b;
         debug_assert!(
             cols % base_len == 0,
@@ -335,11 +297,11 @@ mod tests {
         let commit_params = Wee25Commit::<DCRTPolyMatrix>::setup::<
             DCRTPolyUniformSampler,
             DCRTPolyTrapdoorSampler,
-        >(&params, msg_size, secret_size, SIGMA);
+        >(&params, secret_size, SIGMA);
 
         let zero_matrix = DCRTPolyMatrix::zero(&params, secret_size, msg_size);
-        let commitment = commit_params.commit_matrix(&zero_matrix);
-        let opening = commit_params.open_matrix(&zero_matrix);
+        let commitment = commit_params.commit_matrix(&params, &zero_matrix);
+        let opening = commit_params.open_matrix(&params, &zero_matrix);
 
         assert!(commit_params.verify_matrix(&params, &zero_matrix, &commitment, &opening));
     }
@@ -355,12 +317,12 @@ mod tests {
         let commit_params = Wee25Commit::<DCRTPolyMatrix>::setup::<
             DCRTPolyUniformSampler,
             DCRTPolyTrapdoorSampler,
-        >(&params, msg_size, secret_size, SIGMA);
+        >(&params, secret_size, SIGMA);
 
         let mut zero_matrix = DCRTPolyMatrix::zero(&params, secret_size, msg_size);
-        let commitment = commit_params.commit_matrix(&zero_matrix);
+        let commitment = commit_params.commit_matrix(&params, &zero_matrix);
         zero_matrix.set_entry(0, 0, DCRTPoly::one(&params));
-        let opening = commit_params.open_matrix(&zero_matrix);
+        let opening = commit_params.open_matrix(&params, &zero_matrix);
 
         assert!(!commit_params.verify_matrix(&params, &zero_matrix, &commitment, &opening));
     }
@@ -376,14 +338,14 @@ mod tests {
         let commit_params = Wee25Commit::<DCRTPolyMatrix>::setup::<
             DCRTPolyUniformSampler,
             DCRTPolyTrapdoorSampler,
-        >(&params, msg_size, secret_size, SIGMA);
+        >(&params, secret_size, SIGMA);
 
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let msg_matrix =
             uniform_sampler.sample_uniform(&params, secret_size, msg_size, DistType::FinRingDist);
 
-        let commitment = commit_params.commit_matrix(&msg_matrix);
-        let opening = commit_params.open_matrix(&msg_matrix);
+        let commitment = commit_params.commit_matrix(&params, &msg_matrix);
+        let opening = commit_params.open_matrix(&params, &msg_matrix);
 
         assert!(commit_params.verify_matrix(&params, &msg_matrix, &commitment, &opening));
     }
@@ -399,18 +361,18 @@ mod tests {
         let commit_params = Wee25Commit::<DCRTPolyMatrix>::setup::<
             DCRTPolyUniformSampler,
             DCRTPolyTrapdoorSampler,
-        >(&params, msg_size, secret_size, SIGMA);
+        >(&params, secret_size, SIGMA);
 
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let msg_matrix =
             uniform_sampler.sample_uniform(&params, secret_size, msg_size, DistType::FinRingDist);
-        let commitment = commit_params.commit_matrix(&msg_matrix);
+        let commitment = commit_params.commit_matrix(&params, &msg_matrix);
 
         let mut tampered = msg_matrix.clone();
         let original_entry = tampered.entry(0, 0);
         tampered.set_entry(0, 0, original_entry + DCRTPoly::const_one(&params));
 
-        let opening = commit_params.open_matrix(&tampered);
+        let opening = commit_params.open_matrix(&params, &tampered);
 
         assert!(!commit_params.verify_matrix(&params, &tampered, &commitment, &opening));
     }
@@ -426,7 +388,7 @@ mod tests {
         let commit_params = Wee25Commit::<DCRTPolyMatrix>::setup::<
             DCRTPolyUniformSampler,
             DCRTPolyTrapdoorSampler,
-        >(&params, msg_size, secret_size, SIGMA);
+        >(&params, secret_size, SIGMA);
 
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let msg_vector =

@@ -1,4 +1,6 @@
 pub mod dcrt;
+pub mod element;
+pub mod integer_ring;
 
 use itertools::Itertools;
 use num_bigint::BigUint;

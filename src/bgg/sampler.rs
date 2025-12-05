@@ -1,5 +1,5 @@
 use crate::{
-    bgg::{encoding::BggEncoding, public_key::BggPublicKey},
+    bgg::{encoding::BGGEncoding, public_key::BGGPublicKey},
     matrix::PolyMatrix,
     parallel_iter,
     poly::{Poly, PolyParams},
@@ -45,7 +45,7 @@ where
         params: &<<<S as PolyHashSampler<K>>::M as PolyMatrix>::P as Poly>::Params,
         tag: &[u8],
         reveal_plaintexts: &[bool],
-    ) -> Vec<BggPublicKey<<S as PolyHashSampler<K>>::M>> {
+    ) -> Vec<BGGPublicKey<<S as PolyHashSampler<K>>::M>> {
         let sampler = S::new();
         let log_base_q = params.modulus_digits();
         let columns = self.d * log_base_q;
@@ -61,7 +61,7 @@ where
         parallel_iter!(0..input_size)
             .map(|idx| {
                 let reveal_plaintext = if idx == 0 { true } else { reveal_plaintexts[idx - 1] };
-                BggPublicKey::new(
+                BGGPublicKey::new(
                     all_matrix.slice_columns(columns * idx, columns * (idx + 1)),
                     reveal_plaintext,
                 )
@@ -108,9 +108,9 @@ where
     pub fn sample(
         &self,
         params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
-        public_keys: &[BggPublicKey<S::M>],
+        public_keys: &[BGGPublicKey<S::M>],
         plaintexts: &[<S::M as PolyMatrix>::P],
-    ) -> Vec<BggEncoding<S::M>> {
+    ) -> Vec<BGGEncoding<S::M>> {
         let secret_vec = &self.secret_vec;
         let log_base_q = params.modulus_digits();
         // first slot is allocated to the constant 1 polynomial plaintext
@@ -142,8 +142,8 @@ where
             .enumerate()
             .map(|(idx, plaintext)| {
                 let vector = all_vector.slice_columns(m * idx, m * (idx + 1));
-                debug_mem("before constructing BggEncoding");
-                BggEncoding {
+                debug_mem("before constructing BGGEncoding");
+                BGGEncoding {
                     vector,
                     pubkey: public_keys[idx].clone(),
                     plaintext: if public_keys[idx].reveal_plaintext {

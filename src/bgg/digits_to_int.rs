@@ -1,7 +1,7 @@
 use rayon::prelude::*;
 
 use crate::{
-    bgg::{encoding::BggEncoding, public_key::BggPublicKey},
+    bgg::{encoding::BGGEncoding, public_key::BGGPublicKey},
     circuit::Evaluable,
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
@@ -28,7 +28,7 @@ impl<P: Poly> DigitsToInt<P> for P {
     }
 }
 
-impl<M: PolyMatrix> DigitsToInt<M::P> for BggPublicKey<M> {
+impl<M: PolyMatrix> DigitsToInt<M::P> for BGGPublicKey<M> {
     fn power_of_base(&self, params: &<M::P as crate::poly::Poly>::Params, k: usize) -> Self {
         let scalar = M::P::from_power_of_base_to_constant(params, k);
         // d+1
@@ -41,7 +41,7 @@ impl<M: PolyMatrix> DigitsToInt<M::P> for BggPublicKey<M> {
     }
 }
 
-impl<M: PolyMatrix> DigitsToInt<M::P> for BggEncoding<M> {
+impl<M: PolyMatrix> DigitsToInt<M::P> for BGGEncoding<M> {
     fn power_of_base(&self, params: &<M::P as crate::poly::Poly>::Params, k: usize) -> Self {
         let scalar = M::P::from_power_of_base_to_constant(params, k);
         // d+1
@@ -118,11 +118,11 @@ mod tests {
         let pubkeys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
 
         // Extract digit public keys
-        let digit_pubkeys: Vec<BggPublicKey<DCRTPolyMatrix>> =
+        let digit_pubkeys: Vec<BGGPublicKey<DCRTPolyMatrix>> =
             pubkeys.into_iter().skip(1).collect();
 
         // Compute the integer representation
-        let result = BggPublicKey::<DCRTPolyMatrix>::digits_to_int(&digit_pubkeys, &params);
+        let result = BGGPublicKey::<DCRTPolyMatrix>::digits_to_int(&digit_pubkeys, &params);
 
         // Verify the result by manually computing the expected value
         let mut expected = digit_pubkeys[0].power_of_base(&params, 0);
@@ -170,11 +170,11 @@ mod tests {
         let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &plaintexts);
 
         // Extract digit encodings (skip the first one which is the one encoding)
-        let digit_encodings: Vec<BggEncoding<DCRTPolyMatrix>> =
+        let digit_encodings: Vec<BGGEncoding<DCRTPolyMatrix>> =
             encodings.into_iter().skip(1).collect();
 
         // Compute the integer representation
-        let result = BggEncoding::<DCRTPolyMatrix>::digits_to_int(&digit_encodings, &params);
+        let result = BGGEncoding::<DCRTPolyMatrix>::digits_to_int(&digit_encodings, &params);
         assert_eq!(result.plaintext.unwrap(), int_poly);
     }
 
@@ -208,11 +208,11 @@ mod tests {
         let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &plaintexts);
 
         // Extract digit encodings (skip the first one which is the one encoding)
-        let digit_encodings: Vec<BggEncoding<DCRTPolyMatrix>> =
+        let digit_encodings: Vec<BGGEncoding<DCRTPolyMatrix>> =
             encodings.into_iter().skip(1).collect();
 
         // Compute the integer representation
-        let result = BggEncoding::<DCRTPolyMatrix>::digits_to_int(&digit_encodings, &params);
+        let result = BGGEncoding::<DCRTPolyMatrix>::digits_to_int(&digit_encodings, &params);
 
         // Verify the result by manually computing the expected value
         let mut expected = digit_encodings[0].power_of_base(&params, 0);
@@ -220,7 +220,7 @@ mod tests {
             expected = expected + digit_encoding.power_of_base(&params, i);
         }
 
-        let expected_pubkey = BggPublicKey::digits_to_int(&pubkeys[1..], &params);
+        let expected_pubkey = BGGPublicKey::digits_to_int(&pubkeys[1..], &params);
 
         assert_eq!(
             result.vector, expected.vector,

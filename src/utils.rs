@@ -1,6 +1,6 @@
 use crate::{
     bgg::{
-        encoding::BggEncoding,
+        encoding::BGGEncoding,
         sampler::{BGGEncodingSampler, BGGPublicKeySampler},
     },
     matrix::base::BaseMatrix,
@@ -134,7 +134,7 @@ pub fn random_bgg_encodings(
     input_size: usize,
     secret_size: usize,
     params: &DCRTPolyParams,
-) -> Vec<BggEncoding<BaseMatrix<DCRTPoly>>> {
+) -> Vec<BGGEncoding<BaseMatrix<DCRTPoly>>> {
     // Create samplers
     let key: [u8; 32] = rand::random();
     let bgg_pubkey_sampler =

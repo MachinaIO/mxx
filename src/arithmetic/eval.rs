@@ -1,13 +1,13 @@
 use crate::{
     arithmetic::circuit::ArithmeticCircuit,
     bgg::{
-        encoding::BggEncoding,
-        public_key::BggPublicKey,
+        encoding::BGGEncoding,
+        public_key::BGGPublicKey,
         sampler::{BGGEncodingSampler, BGGPublicKeySampler},
     },
     gadgets::crt::encode_modulo_poly,
     lookup::{
-        lwe_eval::{LweBggEncodingPltEvaluator, LweBggPubKeyEvaluator},
+        lwe_eval::{LweBGGEncodingPltEvaluator, LweBggPubKeyEvaluator},
         poly::PolyPltEvaluator,
     },
     matrix::PolyMatrix,
@@ -42,7 +42,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
         pub_matrix: Arc<M>,
         trapdoor: Arc<ST::Trapdoor>,
         trapdoor_sampler: ST,
-    ) -> Vec<BggPublicKey<M>>
+    ) -> Vec<BGGPublicKey<M>>
     where
         M: PolyMatrix<P = P> + Clone + Send + Sync + 'static,
         SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
@@ -79,7 +79,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
         secret: &[P],
         p: M,
         error_sigma: f64,
-    ) -> Vec<BggEncoding<M>>
+    ) -> Vec<BGGEncoding<M>>
     where
         M: PolyMatrix<P = P> + Clone + Send + Sync + 'static,
         SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
@@ -94,7 +94,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
             .collect::<Vec<_>>();
         let pubkeys = self.sample_input_pubkeys::<M, SH>(params, seed, secret.len());
         let encodings = bgg_encoding_sampler.sample(params, &pubkeys, &plaintexts);
-        let bgg_evaluator = LweBggEncodingPltEvaluator::<M, SH>::new(seed, dir_path, p);
+        let bgg_evaluator = LweBGGEncodingPltEvaluator::<M, SH>::new(seed, dir_path, p);
         self.poly_circuit.eval(params, &encodings[0], &encodings[1..], Some(bgg_evaluator))
     }
 
@@ -103,7 +103,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
         params: &P::Params,
         seed: [u8; 32],
         d: usize,
-    ) -> Vec<BggPublicKey<M>>
+    ) -> Vec<BGGPublicKey<M>>
     where
         M: PolyMatrix<P = P> + Clone + Send + Sync + 'static,
         SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,

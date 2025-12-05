@@ -1,4 +1,4 @@
-use crate::{bgg::public_key::BggPublicKey, matrix::PolyMatrix, poly::Poly};
+use crate::{bgg::public_key::BGGPublicKey, matrix::PolyMatrix, poly::Poly};
 use rayon::prelude::*;
 use std::{
     fmt::Debug,
@@ -6,16 +6,16 @@ use std::{
 };
 
 #[derive(Debug, Clone)]
-pub struct BggEncoding<M: PolyMatrix> {
+pub struct BGGEncoding<M: PolyMatrix> {
     pub vector: M,
-    pub pubkey: BggPublicKey<M>,
+    pub pubkey: BGGPublicKey<M>,
     pub plaintext: Option<<M as PolyMatrix>::P>,
 }
 
-impl<M: PolyMatrix> BggEncoding<M> {
+impl<M: PolyMatrix> BGGEncoding<M> {
     pub fn new(
         vector: M,
-        pubkey: BggPublicKey<M>,
+        pubkey: BGGPublicKey<M>,
         plaintext: Option<<M as PolyMatrix>::P>,
     ) -> Self {
         Self { vector, pubkey, plaintext }
@@ -40,7 +40,7 @@ impl<M: PolyMatrix> BggEncoding<M> {
         let vector = M::read_from_files(params, 1, ncol, &dir_path, &format!("{id}_vector"));
 
         // Read the pubkey
-        let pubkey = BggPublicKey::read_from_files(
+        let pubkey = BGGPublicKey::read_from_files(
             params,
             d1,
             ncol,
@@ -60,14 +60,14 @@ impl<M: PolyMatrix> BggEncoding<M> {
     }
 }
 
-impl<M: PolyMatrix> Add for BggEncoding<M> {
+impl<M: PolyMatrix> Add for BGGEncoding<M> {
     type Output = Self;
     fn add(self, other: Self) -> Self {
         self + &other
     }
 }
 
-impl<M: PolyMatrix> Add<&Self> for BggEncoding<M> {
+impl<M: PolyMatrix> Add<&Self> for BGGEncoding<M> {
     type Output = Self;
     fn add(self, other: &Self) -> Self {
         let vector = self.vector + &other.vector;
@@ -80,14 +80,14 @@ impl<M: PolyMatrix> Add<&Self> for BggEncoding<M> {
     }
 }
 
-impl<M: PolyMatrix> Sub for BggEncoding<M> {
+impl<M: PolyMatrix> Sub for BGGEncoding<M> {
     type Output = Self;
     fn sub(self, other: Self) -> Self {
         self - &other
     }
 }
 
-impl<M: PolyMatrix> Sub<&Self> for BggEncoding<M> {
+impl<M: PolyMatrix> Sub<&Self> for BGGEncoding<M> {
     type Output = Self;
     fn sub(self, other: &Self) -> Self {
         let vector = self.vector - &other.vector;
@@ -100,14 +100,14 @@ impl<M: PolyMatrix> Sub<&Self> for BggEncoding<M> {
     }
 }
 
-impl<M: PolyMatrix> Mul for BggEncoding<M> {
+impl<M: PolyMatrix> Mul for BGGEncoding<M> {
     type Output = Self;
     fn mul(self, other: Self) -> Self {
         self * &other
     }
 }
 
-impl<M: PolyMatrix> Mul<&Self> for BggEncoding<M> {
+impl<M: PolyMatrix> Mul<&Self> for BGGEncoding<M> {
     type Output = Self;
     fn mul(self, other: &Self) -> Self {
         if self.plaintext.is_none() {
@@ -122,7 +122,7 @@ impl<M: PolyMatrix> Mul<&Self> for BggEncoding<M> {
             _ => None,
         };
 
-        let new_pubkey = BggPublicKey {
+        let new_pubkey = BGGPublicKey {
             matrix: self.pubkey.matrix * decomposed_b,
             reveal_plaintext: self.pubkey.reveal_plaintext & other.pubkey.reveal_plaintext,
         };

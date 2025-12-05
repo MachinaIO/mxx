@@ -1,5 +1,5 @@
 use crate::{
-    bgg::{encoding::BggEncoding, public_key::BggPublicKey},
+    bgg::{encoding::BGGEncoding, public_key::BGGPublicKey},
     circuit::{evaluable::Evaluable, gate::GateId},
     lookup::{PltEvaluator, PublicLut},
     matrix::PolyMatrix,
@@ -31,7 +31,7 @@ where
     _st: PhantomData<ST>,
 }
 
-impl<M, SH, ST> PltEvaluator<BggPublicKey<M>> for LweBggPubKeyEvaluator<M, SH, ST>
+impl<M, SH, ST> PltEvaluator<BGGPublicKey<M>> for LweBggPubKeyEvaluator<M, SH, ST>
 where
     M: PolyMatrix + Send + 'static,
     SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
@@ -39,11 +39,11 @@ where
 {
     fn public_lookup(
         &self,
-        params: &<BggPublicKey<M> as Evaluable>::Params,
-        plt: &PublicLut<<BggPublicKey<M> as Evaluable>::P>,
-        input: BggPublicKey<M>,
+        params: &<BGGPublicKey<M> as Evaluable>::Params,
+        plt: &PublicLut<<BGGPublicKey<M> as Evaluable>::P>,
+        input: BGGPublicKey<M>,
         id: GateId,
-    ) -> BggPublicKey<M> {
+    ) -> BGGPublicKey<M> {
         let row_size = input.matrix.row_size();
         let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, id);
         let buffer = preimage_all::<M, ST, _>(
@@ -57,7 +57,7 @@ where
             &id,
         );
         add_lookup_buffer(buffer);
-        BggPublicKey { matrix: a_lt, reveal_plaintext: true }
+        BGGPublicKey { matrix: a_lt, reveal_plaintext: true }
     }
 }
 
@@ -87,7 +87,7 @@ where
 }
 
 #[derive(Debug, Clone)]
-pub struct LweBggEncodingPltEvaluator<M, SH>
+pub struct LweBGGEncodingPltEvaluator<M, SH>
 where
     M: PolyMatrix,
     SH: PolyHashSampler<[u8; 32], M = M>,
@@ -98,18 +98,18 @@ where
     _marker: PhantomData<SH>,
 }
 
-impl<M, SH> PltEvaluator<BggEncoding<M>> for LweBggEncodingPltEvaluator<M, SH>
+impl<M, SH> PltEvaluator<BGGEncoding<M>> for LweBGGEncodingPltEvaluator<M, SH>
 where
     M: PolyMatrix,
     SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
 {
     fn public_lookup(
         &self,
-        params: &<BggEncoding<M> as Evaluable>::Params,
-        plt: &PublicLut<<BggEncoding<M> as Evaluable>::P>,
-        input: BggEncoding<M>,
+        params: &<BGGEncoding<M> as Evaluable>::Params,
+        plt: &PublicLut<<BGGEncoding<M> as Evaluable>::P>,
+        input: BGGEncoding<M>,
         id: GateId,
-    ) -> BggEncoding<M> {
+    ) -> BGGEncoding<M> {
         let z = &input.plaintext.expect("the BGG encoding should revealed plaintext");
         debug!("public lookup length is {}", plt.len());
         let (k, y_k) = plt
@@ -118,7 +118,7 @@ where
         debug!("Performing public lookup, k={k}");
         let row_size = input.pubkey.matrix.row_size();
         let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, id);
-        let pubkey = BggPublicKey::new(a_lt, true);
+        let pubkey = BGGPublicKey::new(a_lt, true);
         let l_k = timed_read(
             &format!("L_{id}_{k}"),
             || {
@@ -129,11 +129,11 @@ where
         );
         let concat = self.c_b.clone().concat_columns(&[&input.vector]);
         let vector = concat * l_k;
-        BggEncoding::new(vector, pubkey, Some(y_k.clone()))
+        BGGEncoding::new(vector, pubkey, Some(y_k.clone()))
     }
 }
 
-impl<M, SH> LweBggEncodingPltEvaluator<M, SH>
+impl<M, SH> LweBGGEncodingPltEvaluator<M, SH>
 where
     M: PolyMatrix,
     SH: PolyHashSampler<[u8; 32], M = M>,
@@ -210,7 +210,7 @@ mod test {
     use crate::{
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         circuit::PolyCircuit,
-        lookup::lwe_eval::LweBggEncodingPltEvaluator,
+        lookup::lwe_eval::LweBGGEncodingPltEvaluator,
         matrix::dcrt_poly::DCRTPolyMatrix,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         sampler::{
@@ -306,7 +306,7 @@ mod test {
         let result_pubkey = &result_pubkey[0];
 
         //Create an encoding evaluator
-        let plt_encoding_evaluator = LweBggEncodingPltEvaluator::<
+        let plt_encoding_evaluator = LweBGGEncodingPltEvaluator::<
             DCRTPolyMatrix,
             DCRTPolyHashSampler<Keccak256>,
         >::new(key, dir_path.into(), c_b);

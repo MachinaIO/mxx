@@ -4,7 +4,7 @@ use rayon::prelude::*;
 use tracing::info;
 
 use crate::{
-    bgg::{encoding::BggEncoding, public_key::BggPublicKey},
+    bgg::{encoding::BGGEncoding, public_key::BGGPublicKey},
     circuit::{evaluable::Evaluable, gate::GateId},
     lookup::{PltEvaluator, PublicLut},
     matrix::PolyMatrix,
@@ -15,7 +15,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
-pub struct SimpleBggEncodingPltEvaluator<M, SH>
+pub struct SimpleBGGEncodingPltEvaluator<M, SH>
 where
     M: PolyMatrix,
     SH: PolyHashSampler<[u8; 32], M = M>,
@@ -26,22 +26,22 @@ where
     _marker: PhantomData<SH>,
 }
 
-impl<M, SH> PltEvaluator<BggEncoding<M>> for SimpleBggEncodingPltEvaluator<M, SH>
+impl<M, SH> PltEvaluator<BGGEncoding<M>> for SimpleBGGEncodingPltEvaluator<M, SH>
 where
     M: PolyMatrix,
     SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
 {
     fn public_lookup(
         &self,
-        params: &<BggEncoding<M> as Evaluable>::Params,
-        plt: &PublicLut<<BggEncoding<M> as Evaluable>::P>,
-        input: BggEncoding<M>,
+        params: &<BGGEncoding<M> as Evaluable>::Params,
+        plt: &PublicLut<<BGGEncoding<M> as Evaluable>::P>,
+        input: BGGEncoding<M>,
         id: GateId,
-    ) -> BggEncoding<M> {
+    ) -> BGGEncoding<M> {
         debug_assert_eq!(
             plt.fs.len(),
             1,
-            "SimpleBggEncodingPltEvaluator works only with constant polynomials"
+            "SimpleBGGEncodingPltEvaluator works only with constant polynomials"
         );
         let z = &input.plaintext.expect("the BGG encoding should revealed plaintext");
         info!("public lookup length is {}", plt.len());
@@ -52,7 +52,7 @@ where
         info!("Performing public lookup, ks={:?}", ks);
         let d = input.pubkey.matrix.row_size() - 1;
         let a_lt = derive_a_lt_matrix::<M, SH>(params, d, self.hash_key, id);
-        let pubkey = BggPublicKey::new(a_lt, true);
+        let pubkey = BGGPublicKey::new(a_lt, true);
         let m = (d + 1) * params.modulus_digits();
         let r_k = timed_read(
             &format!("R_{id}_{k}"),
@@ -74,11 +74,11 @@ where
         );
         let c_lt_k = self.p.clone() * l_k;
         let vector = input.vector * &r_k.decompose() + c_lt_k;
-        BggEncoding::new(vector, pubkey, Some(y_k.clone()))
+        BGGEncoding::new(vector, pubkey, Some(y_k.clone()))
     }
 }
 
-impl<M, SH> SimpleBggEncodingPltEvaluator<M, SH>
+impl<M, SH> SimpleBGGEncodingPltEvaluator<M, SH>
 where
     M: PolyMatrix,
     SH: PolyHashSampler<[u8; 32], M = M>,
@@ -106,7 +106,7 @@ where
     _st: PhantomData<ST>,
 }
 
-impl<M, SH, SU, ST> PltEvaluator<BggPublicKey<M>> for SimpleBggPubKeyEvaluator<M, SH, SU, ST>
+impl<M, SH, SU, ST> PltEvaluator<BGGPublicKey<M>> for SimpleBggPubKeyEvaluator<M, SH, SU, ST>
 where
     M: PolyMatrix + Send + 'static,
     SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
@@ -115,11 +115,11 @@ where
 {
     fn public_lookup(
         &self,
-        params: &<BggPublicKey<M> as Evaluable>::Params,
-        plt: &PublicLut<<BggPublicKey<M> as Evaluable>::P>,
-        input: BggPublicKey<M>,
+        params: &<BGGPublicKey<M> as Evaluable>::Params,
+        plt: &PublicLut<<BGGPublicKey<M> as Evaluable>::P>,
+        input: BGGPublicKey<M>,
         id: GateId,
-    ) -> BggPublicKey<M> {
+    ) -> BGGPublicKey<M> {
         debug_assert_eq!(
             plt.fs.len(),
             1,
@@ -138,7 +138,7 @@ where
             &id,
             self.dir_path.clone(),
         );
-        BggPublicKey { matrix: a_lt, reveal_plaintext: true }
+        BGGPublicKey { matrix: a_lt, reveal_plaintext: true }
     }
 }
 

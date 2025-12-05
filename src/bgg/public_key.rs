@@ -3,12 +3,12 @@ use rayon::prelude::*;
 use std::ops::{Add, Mul, Sub};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BggPublicKey<M: PolyMatrix> {
+pub struct BGGPublicKey<M: PolyMatrix> {
     pub matrix: M,
     pub reveal_plaintext: bool,
 }
 
-impl<M: PolyMatrix> BggPublicKey<M> {
+impl<M: PolyMatrix> BGGPublicKey<M> {
     pub fn new(matrix: M, reveal_plaintext: bool) -> Self {
         Self { matrix, reveal_plaintext }
     }
@@ -31,14 +31,14 @@ impl<M: PolyMatrix> BggPublicKey<M> {
     }
 }
 
-impl<M: PolyMatrix> Add for BggPublicKey<M> {
+impl<M: PolyMatrix> Add for BGGPublicKey<M> {
     type Output = Self;
     fn add(self, other: Self) -> Self {
         self + &other
     }
 }
 
-impl<M: PolyMatrix> Add<&Self> for BggPublicKey<M> {
+impl<M: PolyMatrix> Add<&Self> for BGGPublicKey<M> {
     type Output = Self;
     fn add(self, other: &Self) -> Self {
         let reveal_plaintext = self.reveal_plaintext & other.reveal_plaintext;
@@ -46,14 +46,14 @@ impl<M: PolyMatrix> Add<&Self> for BggPublicKey<M> {
     }
 }
 
-impl<M: PolyMatrix> Sub for BggPublicKey<M> {
+impl<M: PolyMatrix> Sub for BGGPublicKey<M> {
     type Output = Self;
     fn sub(self, other: Self) -> Self {
         self - &other
     }
 }
 
-impl<M: PolyMatrix> Sub<&Self> for BggPublicKey<M> {
+impl<M: PolyMatrix> Sub<&Self> for BGGPublicKey<M> {
     type Output = Self;
     fn sub(self, other: &Self) -> Self {
         let reveal_plaintext = self.reveal_plaintext & other.reveal_plaintext;
@@ -61,14 +61,14 @@ impl<M: PolyMatrix> Sub<&Self> for BggPublicKey<M> {
     }
 }
 
-impl<M: PolyMatrix> Mul for BggPublicKey<M> {
+impl<M: PolyMatrix> Mul for BGGPublicKey<M> {
     type Output = Self;
     fn mul(self, other: Self) -> Self {
         self * &other
     }
 }
 
-impl<M: PolyMatrix> Mul<&Self> for BggPublicKey<M> {
+impl<M: PolyMatrix> Mul<&Self> for BGGPublicKey<M> {
     type Output = Self;
     fn mul(self, other: &Self) -> Self {
         debug_mem(format!("BGGPublicKey::mul {:?}, {:?}", self.matrix.size(), other.matrix.size()));

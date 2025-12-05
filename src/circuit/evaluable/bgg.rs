@@ -1,11 +1,11 @@
 use crate::{
-    bgg::{encoding::BggEncoding, public_key::BggPublicKey},
+    bgg::{encoding::BGGEncoding, public_key::BGGPublicKey},
     circuit::evaluable::Evaluable,
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
 };
 
-impl<M: PolyMatrix> Evaluable for BggEncoding<M> {
+impl<M: PolyMatrix> Evaluable for BGGEncoding<M> {
     type Params = <M::P as Poly>::Params;
     type P = M::P;
 
@@ -26,7 +26,7 @@ impl<M: PolyMatrix> Evaluable for BggEncoding<M> {
         let scalar = Self::P::from_u32s(params, scalar);
         let vector = self.vector.clone() * &scalar;
         let pubkey_matrix = self.pubkey.matrix.clone() * &scalar;
-        let pubkey = BggPublicKey::new(pubkey_matrix, self.pubkey.reveal_plaintext);
+        let pubkey = BGGPublicKey::new(pubkey_matrix, self.pubkey.reveal_plaintext);
         let plaintext = self.plaintext.clone().map(|p| p * scalar);
         Self { vector, pubkey, plaintext }
     }
@@ -38,13 +38,13 @@ impl<M: PolyMatrix> Evaluable for BggEncoding<M> {
         let decomposed = scalar_gadget.decompose();
         let vector = self.vector.clone() * &decomposed;
         let pubkey_matrix = self.pubkey.matrix.clone() * &decomposed;
-        let pubkey = BggPublicKey::new(pubkey_matrix, self.pubkey.reveal_plaintext);
+        let pubkey = BGGPublicKey::new(pubkey_matrix, self.pubkey.reveal_plaintext);
         let plaintext = self.plaintext.clone().map(|p| p * scalar);
         Self { vector, pubkey, plaintext }
     }
 }
 
-impl<M: PolyMatrix> Evaluable for BggPublicKey<M> {
+impl<M: PolyMatrix> Evaluable for BGGPublicKey<M> {
     type Params = <M::P as Poly>::Params;
     type P = M::P;
 
@@ -78,7 +78,7 @@ impl<M: PolyMatrix> Evaluable for BggPublicKey<M> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        circuit::PolyCircuit, lookup::lwe_eval::LweBggEncodingPltEvaluator,
+        circuit::PolyCircuit, lookup::lwe_eval::LweBGGEncodingPltEvaluator,
         matrix::dcrt_poly::DCRTPolyMatrix, poly::dcrt::params::DCRTPolyParams,
         sampler::hash::DCRTPolyHashSampler, utils::random_bgg_encodings,
     };
@@ -106,7 +106,7 @@ mod tests {
             &params,
             &enc_one.clone(),
             &[enc1.clone(), enc2.clone()],
-            None::<LweBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<LweBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result
@@ -141,7 +141,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone()],
-            None::<LweBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<LweBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result
@@ -176,7 +176,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone()],
-            None::<LweBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<LweBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result
@@ -221,7 +221,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone(), enc3.clone()],
-            None::<LweBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<LweBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result: ((enc1 + enc2)^2) - enc3
@@ -279,7 +279,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone(), enc3.clone(), enc4.clone()],
-            None::<LweBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<LweBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result: (((enc1 + enc2) * (enc3 * enc4)) + (enc1 - enc3)) * scalar
@@ -331,7 +331,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone()],
-            None::<LweBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<LweBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected: enc1 + enc2
@@ -392,7 +392,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone()],
-            None::<LweBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<LweBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result: (enc1 + enc2) - (enc1 * enc2)
@@ -460,7 +460,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone(), enc3.clone()],
-            None::<LweBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<LweBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result: ((enc1 * enc2) + enc3)^2

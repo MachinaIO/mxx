@@ -264,7 +264,7 @@ mod test {
         let plaintexts = vec![DCRTPoly::from_usize_to_constant(&params, rand_int); input_size];
 
         // Create random public keys and encodings
-        let reveal_plaintexts = vec![true; input_size + 1];
+        let reveal_plaintexts = vec![true; input_size];
         let bgg_encoding_sampler =
             BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
         let pubkeys = bgg_pubkey_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);

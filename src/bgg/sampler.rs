@@ -38,7 +38,8 @@ where
     /// * `reveal_plaintexts`: A vector of booleans indicating whether the plaintexts associated to
     ///   the public keys should be revealed
     /// # Returns
-    /// A vector of public key matrices
+    /// A vector of reveal_plaintexts.len()+1 public key matrices, where the first one is for a
+    /// constant 1
     pub fn sample(
         &self,
         params: &<<<S as PolyHashSampler<K>>::M as PolyMatrix>::P as Poly>::Params,
@@ -48,16 +49,16 @@ where
         let sampler = S::new();
         let log_base_q = params.modulus_digits();
         let columns = self.d * log_base_q;
-        let packed_input_size = reveal_plaintexts.len();
+        let input_size = reveal_plaintexts.len() + 1;
         let all_matrix = sampler.sample_hash(
             params,
             self.hash_key,
             tag,
             self.d,
-            columns * packed_input_size,
+            columns * input_size,
             DistType::FinRingDist,
         );
-        parallel_iter!(0..packed_input_size)
+        parallel_iter!(0..input_size)
             .map(|idx| {
                 let reveal_plaintext = if idx == 0 { true } else { reveal_plaintexts[idx - 1] };
                 BggPublicKey::new(
@@ -113,12 +114,12 @@ where
         let secret_vec = &self.secret_vec;
         let log_base_q = params.modulus_digits();
         // first slot is allocated to the constant 1 polynomial plaintext
-        let packed_input_size = 1 + plaintexts.len();
+        let input_size = 1 + plaintexts.len();
         let plaintexts: Vec<<S::M as PolyMatrix>::P> =
             [&[<<S as PolyUniformSampler>::M as PolyMatrix>::P::const_one(params)], plaintexts]
                 .concat();
         let secret_vec_size = self.secret_vec.col_size();
-        let columns = secret_vec_size * log_base_q * packed_input_size;
+        let columns = secret_vec_size * log_base_q * input_size;
         let error: S::M = match self.gauss_sigma {
             None => S::M::zero(params, 1, columns),
             Some(sigma) => {

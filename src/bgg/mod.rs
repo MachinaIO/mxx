@@ -29,16 +29,14 @@ mod tests {
         let reveal_plaintexts = vec![true; packed_input_size];
         let sampled_pub_keys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
         let log_base_q = params.modulus_digits();
-        let columns = (d + 1) * log_base_q;
+        let columns = d * log_base_q;
 
-        for pair in sampled_pub_keys[1..].chunks(2) {
-            if let [a, b] = pair {
-                let addition = a.clone() + b.clone();
-                assert_eq!(addition.matrix.row_size(), d + 1);
-                assert_eq!(addition.matrix.col_size(), columns);
-                assert_eq!(addition.matrix, a.matrix.clone() + b.matrix.clone());
-            }
-        }
+        let a = sampled_pub_keys[1].clone();
+        let b = sampled_pub_keys[2].clone();
+        let addition = a.clone() + b.clone();
+        assert_eq!(addition.matrix.row_size(), d);
+        assert_eq!(addition.matrix.col_size(), columns);
+        assert_eq!(addition.matrix, a.matrix.clone() + b.matrix.clone());
     }
 
     #[test]
@@ -53,16 +51,14 @@ mod tests {
         let reveal_plaintexts = vec![true; packed_input_size];
         let sampled_pub_keys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
         let log_base_q = params.modulus_digits();
-        let columns = (d + 1) * log_base_q;
+        let columns = d * log_base_q;
 
-        for pair in sampled_pub_keys[1..].chunks(2) {
-            if let [a, b] = pair {
-                let multiplication = a.clone() * b.clone();
-                assert_eq!(multiplication.matrix.row_size(), d + 1);
-                assert_eq!(multiplication.matrix.col_size(), columns);
-                assert_eq!(multiplication.matrix, (a.matrix.clone() * b.matrix.decompose().clone()))
-            }
-        }
+        let a = sampled_pub_keys[1].clone();
+        let b = sampled_pub_keys[2].clone();
+        let multiplication = a.clone() * b.clone();
+        assert_eq!(multiplication.matrix.row_size(), d);
+        assert_eq!(multiplication.matrix.col_size(), columns);
+        assert_eq!(multiplication.matrix, (a.matrix.clone() * b.matrix.decompose().clone()))
     }
 
     #[test]
@@ -75,7 +71,7 @@ mod tests {
         let packed_input_size = input_size.div_ceil(params.ring_dimension().try_into().unwrap());
         let d = 3;
         let bgg_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
-        let reveal_plaintexts = vec![true; packed_input_size + 1];
+        let reveal_plaintexts = vec![true; packed_input_size];
         let sampled_pub_keys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
         let secrets = vec![create_ternary_random_poly(&params); d];
         let plaintexts = vec![DCRTPoly::const_one(&params); packed_input_size];
@@ -107,7 +103,7 @@ mod tests {
         let packed_input_size = 2;
         let d = 3;
         let bgg_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
-        let reveal_plaintexts = vec![true; packed_input_size + 1];
+        let reveal_plaintexts = vec![true; packed_input_size];
         let sampled_pub_keys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
         let secrets = vec![create_ternary_random_poly(&params); d];
         let plaintexts = vec![create_random_poly(&params); packed_input_size];
@@ -144,7 +140,7 @@ mod tests {
         let packed_input_size = 2;
         let d = 3;
         let bgg_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
-        let reveal_plaintexts = vec![true; packed_input_size + 1];
+        let reveal_plaintexts = vec![true; packed_input_size];
         let sampled_pub_keys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
         let secrets = vec![create_ternary_random_poly(&params); d];
         let plaintexts = vec![create_random_poly(&params); packed_input_size];

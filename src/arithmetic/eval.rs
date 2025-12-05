@@ -113,7 +113,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
             let num_limbs_per_slot = crt_bits.div_ceil(self.limb_bit_size);
             self.num_inputs * num_limbs_per_slot
         };
-        let reveal_plaintexts = vec![true; num_given_input_polys + 1];
+        let reveal_plaintexts = vec![true; num_given_input_polys];
         let bgg_pubkey_sampler = BGGPublicKeySampler::<_, SH>::new(seed, d);
         bgg_pubkey_sampler.sample(params, TAG_BGG_PUBKEY, &reveal_plaintexts)
     }

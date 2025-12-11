@@ -4,6 +4,7 @@
 pub mod arithmetic;
 pub mod bgg;
 pub mod circuit;
+pub mod commit;
 pub mod element;
 pub mod gadgets;
 pub mod lookup;

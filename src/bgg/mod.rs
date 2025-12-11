@@ -1,3 +1,4 @@
+pub mod commit_sampler;
 pub mod digits_to_int;
 pub mod encoding;
 pub mod public_key;
@@ -26,17 +27,19 @@ mod tests {
         let packed_input_size = 2;
         let d = 3;
         let bgg_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
-        let reveal_plaintexts = vec![true; packed_input_size];
+        let reveal_plaintexts = vec![true; packed_input_size + 1];
         let sampled_pub_keys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
         let log_base_q = params.modulus_digits();
-        let columns = (d + 1) * log_base_q;
+        let columns = d * log_base_q;
 
         for pair in sampled_pub_keys[1..].chunks(2) {
             if let [a, b] = pair {
                 let addition = a.clone() + b.clone();
-                assert_eq!(addition.matrix.row_size(), d + 1);
+                assert_eq!(addition.matrix.row_size(), d);
                 assert_eq!(addition.matrix.col_size(), columns);
                 assert_eq!(addition.matrix, a.matrix.clone() + b.matrix.clone());
+            } else {
+                panic!("pair should have two public keys");
             }
         }
     }
@@ -50,17 +53,19 @@ mod tests {
         let packed_input_size = 2;
         let d = 3;
         let bgg_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
-        let reveal_plaintexts = vec![true; packed_input_size];
+        let reveal_plaintexts = vec![true; packed_input_size + 1];
         let sampled_pub_keys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
         let log_base_q = params.modulus_digits();
-        let columns = (d + 1) * log_base_q;
+        let columns = d * log_base_q;
 
         for pair in sampled_pub_keys[1..].chunks(2) {
             if let [a, b] = pair {
                 let multiplication = a.clone() * b.clone();
-                assert_eq!(multiplication.matrix.row_size(), d + 1);
+                assert_eq!(multiplication.matrix.row_size(), d);
                 assert_eq!(multiplication.matrix.col_size(), columns);
                 assert_eq!(multiplication.matrix, (a.matrix.clone() * b.matrix.decompose().clone()))
+            } else {
+                panic!("pair should have two public keys");
             }
         }
     }
@@ -131,6 +136,8 @@ mod tests {
                     bgg_sampler.secret_vec.clone() *
                         (addition.pubkey.matrix - (g * addition.plaintext.unwrap()))
                 )
+            } else {
+                panic!("pair should have two encodings");
             }
         }
     }
@@ -166,6 +173,8 @@ mod tests {
                     (bgg_sampler.secret_vec.clone() *
                         (multiplication.pubkey.matrix - (g * multiplication.plaintext.unwrap())))
                 )
+            } else {
+                panic!("pair should have two encodings");
             }
         }
     }

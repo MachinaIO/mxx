@@ -97,7 +97,8 @@ impl<P: Poly> PolyCircuit<P> {
     ///
     /// Definition:
     /// - Inputs and the reserved constant-one gate contribute 0 to depth.
-    /// - Add, Sub, SmallScalarMul gates do not increase depth: level(add) = max(level(inputs)).
+    /// - Add, Sub, SmallScalarMul, Rotate gates do not increase depth: level(add) =
+    ///   max(level(inputs)).
     /// - Any other non-input gate increases depth by 1: level(g) = max(level(inputs)) + 1.
     /// - If there are no outputs, returns 0.
     pub fn non_free_depth(&self) -> usize {
@@ -127,7 +128,8 @@ impl<P: Poly> PolyCircuit<P> {
             let incr = match gate.gate_type {
                 PolyGateType::Add |
                 PolyGateType::Sub |
-                PolyGateType::SmallScalarMul { scalar: _ } => 0,
+                PolyGateType::SmallScalarMul { scalar: _ } |
+                PolyGateType::Rotate { shift: _ } => 0,
                 _ => 1,
             };
             level_map.insert(*gate_id, max_in + incr);

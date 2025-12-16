@@ -1,7 +1,6 @@
 use crate::{
     bgg::{encoding::BggEncoding, public_key::BggPublicKey},
     circuit::{evaluable::Evaluable, gate::GateId},
-    element::finite_ring::FinRingElem,
     lookup::{PltEvaluator, PublicLut},
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
@@ -219,6 +218,7 @@ mod test {
     use crate::{
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         circuit::PolyCircuit,
+        element::finite_ring::FinRingElem,
         lookup::lwe_eval::LweBggEncodingPltEvaluator,
         matrix::dcrt_poly::DCRTPolyMatrix,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},

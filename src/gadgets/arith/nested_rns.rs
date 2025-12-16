@@ -41,7 +41,7 @@ impl NestedRnsPolyContext {
         dummy_scalar: bool,
     ) -> Self {
         let (q_moduli, q_moduli_bits, q_moduli_depth) = params.to_crt();
-        let p_moduli_depth = (2 * q_moduli_bits).div_ceil(p_moduli_bits);
+        let p_moduli_depth = (2 * q_moduli_bits).div_ceil(p_moduli_bits - 1);
         if dummy_scalar {
             let p_moduli = vec![0; p_moduli_depth];
             let dummy_map = dummy_lut_map();
@@ -124,9 +124,8 @@ impl NestedRnsPolyContext {
             wires_p_moduli.push(circuit.const_digits(&[p_i as u32]));
 
             for (q_idx, q_k) in q_moduli.iter().enumerate() {
-                for (p_j_idx, &p_j) in p_moduli.iter().enumerate() {
-                    let p_over_pj = p_over_pis[p_j_idx].clone();
-                    let p_over_pj_mod_qk = (&p_over_pj % BigUint::from(*q_k))
+                for (p_j_idx, p_over_pj) in p_over_pis.iter().enumerate() {
+                    let p_over_pj_mod_qk = (p_over_pj % BigUint::from(*q_k))
                         .to_u64()
                         .expect("CRT residue must fit in u64");
                     let p_over_pj_mod_qk_mod_pi = p_over_pj_mod_qk % p_i;
@@ -301,6 +300,7 @@ impl<P: Poly> NestedRnsPoly<P> {
             for p_idx in 0..self.ctx.p_moduli.len() {
                 let mul_gate =
                     circuit.mul_gate(self.inner[q_idx][p_idx], other.inner[q_idx][p_idx]);
+                // let mul_mod = circuit.public_lookup_gate(mul_gate, self.ctx.lut_mod_p[p_idx]);
                 result_p_moduli.push(mul_gate);
             }
             result_inner.push(result_p_moduli);
@@ -406,7 +406,7 @@ pub fn encode_nested_rns_poly<P: Poly>(
     input: &BigUint,
 ) -> Vec<P> {
     let (q_moduli, q_moduli_bits, _) = params.to_crt();
-    let p_moduli_depth = (2 * q_moduli_bits).div_ceil(p_moduli_bits);
+    let p_moduli_depth = (2 * q_moduli_bits).div_ceil(p_moduli_bits - 1);
     let p_moduli = sample_crt_primes(p_moduli_bits, p_moduli_depth);
     let mut polys = vec![Vec::with_capacity(p_moduli_depth); q_moduli.len()];
     for (q_idx, &q_i) in q_moduli.iter().enumerate() {
@@ -429,16 +429,18 @@ mod tests {
         },
     };
 
-    const P_MODULI_BITS: usize = 6;
+    const P_MODULI_BITS: usize = 7;
     const SCALE: u64 = 1 << 8;
 
     fn create_test_context(
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> (DCRTPolyParams, Arc<NestedRnsPolyContext>) {
-        let params = DCRTPolyParams::new(4, 2, 18, 1);
+        let params = DCRTPolyParams::new(4, 6, 18, 1);
         let ctx =
             Arc::new(NestedRnsPolyContext::setup(circuit, &params, P_MODULI_BITS, SCALE, false));
-        println!("p moduli: {:?}", &ctx.p_moduli);
+        // println!("p moduli: {:?}", &ctx.p_moduli);
+        let p = ctx.p_moduli.iter().fold(BigUint::from(1u64), |acc, &pi| acc * BigUint::from(pi));
+        // println!("p: {}", p);
         (params, ctx)
     }
 
@@ -536,15 +538,16 @@ mod tests {
         let out = sum.reconstruct(&params, &mut circuit);
         circuit.output(vec![out]);
         println!("non-free depth {}", circuit.non_free_depth());
+        println!("circuit size {:?}", circuit.count_gates_by_type_vec());
 
         let modulus = params.modulus();
-        println!("modulus {:?}", &modulus);
-        println!("a_value {:?}", &a_value);
-        println!("b_value {:?}", &b_value);
+        // println!("modulus {:?}", &modulus);
+        // println!("a_value {:?}", &a_value);
+        // println!("b_value {:?}", &b_value);
         let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value);
         let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value);
         let expected_out = (&a_value + &b_value) % modulus.as_ref();
-        println!("expected_out {:?}", &expected_out);
+        // println!("expected_out {:?}", &expected_out);
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_results = circuit.eval(
             &params,
@@ -552,7 +555,7 @@ mod tests {
             &[a_inputs, b_inputs].concat(),
             Some(plt_evaluator),
         );
-        println!("eval_results {:?}", eval_results);
+        // println!("eval_results {:?}", eval_results);
         assert_eq!(eval_results.len(), 1);
         assert_eq!(eval_results[0].coeffs_biguints()[0], expected_out);
     }
@@ -570,11 +573,12 @@ mod tests {
         let out = sum.reconstruct(&params, &mut circuit);
         circuit.output(vec![out]);
         println!("non-free depth {}", circuit.non_free_depth());
+        println!("circuit size {:?}", circuit.count_gates_by_type_vec());
 
         let modulus = params.modulus();
-        println!("modulus {:?}", &modulus);
-        println!("a_value {:?}", &a_value);
-        println!("b_value {:?}", &b_value);
+        // println!("modulus {:?}", &modulus);
+        // println!("a_value {:?}", &a_value);
+        // println!("b_value {:?}", &b_value);
         let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value);
         let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value);
         let expected_out = {
@@ -583,7 +587,7 @@ mod tests {
             value %= modulus.as_ref();
             value
         };
-        println!("expected_out {:?}", &expected_out);
+        // println!("expected_out {:?}", &expected_out);
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_results = circuit.eval(
             &params,
@@ -591,7 +595,7 @@ mod tests {
             &[a_inputs, b_inputs].concat(),
             Some(plt_evaluator),
         );
-        println!("eval_results {:?}", eval_results);
+        // println!("eval_results {:?}", eval_results);
         assert_eq!(eval_results.len(), 1);
         assert_eq!(eval_results[0].coeffs_biguints()[0], expected_out);
     }
@@ -609,15 +613,16 @@ mod tests {
         let out = sum.reconstruct(&params, &mut circuit);
         circuit.output(vec![out]);
         println!("non-free depth {}", circuit.non_free_depth());
+        println!("circuit size {:?}", circuit.count_gates_by_type_vec());
 
         let modulus = params.modulus();
-        println!("modulus {:?}", &modulus);
-        println!("a_value {:?}", &a_value);
-        println!("b_value {:?}", &b_value);
+        // println!("modulus {:?}", &modulus);
+        // println!("a_value {:?}", &a_value);
+        // println!("b_value {:?}", &b_value);
         let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value);
         let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value);
         let expected_out = (&a_value * &b_value) % modulus.as_ref();
-        println!("expected_out {:?}", &expected_out);
+        // println!("expected_out {:?}", &expected_out);
         let plt_evaluator = PolyPltEvaluator::new();
         let eval_results = circuit.eval(
             &params,
@@ -625,7 +630,7 @@ mod tests {
             &[a_inputs, b_inputs].concat(),
             Some(plt_evaluator),
         );
-        println!("eval_results {:?}", eval_results);
+        // println!("eval_results {:?}", eval_results);
         assert_eq!(eval_results.len(), 1);
         assert_eq!(eval_results[0].coeffs_biguints()[0], expected_out);
     }

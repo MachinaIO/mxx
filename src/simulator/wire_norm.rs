@@ -1,6 +1,6 @@
 use crate::{
     circuit::{Evaluable, PolyCircuit, gate::GateId},
-    element::{PolyElem, finite_ring::FinRingElem},
+    element::PolyElem,
     impl_binop_with_refs,
     lookup::{PltEvaluator, PublicLut},
     poly::dcrt::poly::DCRTPoly,
@@ -226,6 +226,7 @@ mod tests {
     use super::*;
     use crate::{
         circuit::PolyCircuit,
+        element::finite_ring::FinRingElem,
         lookup::PublicLut,
         poly::{
             PolyParams,

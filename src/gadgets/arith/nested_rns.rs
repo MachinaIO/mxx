@@ -239,6 +239,30 @@ impl<P: Poly> NestedRnsPoly<P> {
         sum_mod_q
     }
 
+    pub fn benchmark_multiplication_tree(
+        ctx: Arc<NestedRnsPolyContext>,
+        params: &P::Params,
+        circuit: &mut PolyCircuit<P>,
+        height: usize,
+    ) {
+        let num_inputs =
+            1usize.checked_shl(height as u32).expect("height is too large to represent 2^h inputs");
+        let mut current_layer: Vec<NestedRnsPoly<P>> =
+            (0..num_inputs).map(|_| NestedRnsPoly::input(ctx.clone(), circuit)).collect();
+        while current_layer.len() > 1 {
+            debug_assert!(current_layer.len().is_multiple_of(2), "layer size must stay even");
+            let mut next_layer = Vec::with_capacity(current_layer.len() / 2);
+            for pair in current_layer.chunks(2) {
+                let parent = pair[0].mul_full_reduce(&pair[1], circuit);
+                next_layer.push(parent);
+            }
+            current_layer = next_layer;
+        }
+        let root = current_layer.pop().expect("multiplication tree must contain at least one node");
+        let out = root.reconstruct(params, circuit);
+        circuit.output(vec![out]);
+    }
+
     pub(crate) fn add_without_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
         assert_eq!(
             self.ctx.p_moduli, other.ctx.p_moduli,
@@ -522,6 +546,29 @@ mod tests {
         test_nested_rns_poly_mul_full_reduce_generic(circuit, params, ctx, a_value, b_value);
     }
 
+    #[test]
+    fn test_nested_crt_benchmark_multiplication_tree() {
+        let height = 3usize;
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let num_inputs = 1usize << height;
+        NestedRnsPoly::benchmark_multiplication_tree(ctx.clone(), &params, &mut circuit, height);
+        println!("non-free depth {}", circuit.non_free_depth());
+        println!("circuit size {:?}", circuit.count_gates_by_type_vec());
+
+        let mut eval_inputs: Vec<DCRTPoly> =
+            Vec::with_capacity(num_inputs * ctx.q_moduli_depth * ctx.p_moduli.len());
+        for _ in 0..num_inputs {
+            eval_inputs.extend(encode_nested_rns_poly(P_MODULI_BITS, &params, &BigUint::zero()));
+        }
+        let plt_evaluator = PolyPltEvaluator::new();
+        let eval_results =
+            circuit.eval(&params, &DCRTPoly::const_one(&params), &eval_inputs, Some(plt_evaluator));
+
+        assert_eq!(eval_results.len(), 1);
+        assert_eq!(eval_results[0], DCRTPoly::const_zero(&params));
+    }
+
     // #[test]
     // fn test_nested_crt_poly_mul_depth_random() {
     //     let depth = 3usize;
@@ -649,78 +696,4 @@ mod tests {
         assert_eq!(eval_results.len(), 1);
         assert_eq!(eval_results[0].coeffs_biguints()[0], expected_out);
     }
-
-    // fn test_nested_crt_poly_mul_depth_generic(
-    //     mut circuit: PolyCircuit<DCRTPoly>,
-    //     params: DCRTPolyParams,
-    //     ctx: Arc<NestedCrtPolyContext<DCRTPoly>>,
-    //     operand_values: Vec<Vec<BigUint>>,
-    // ) {
-    //     assert!(operand_values.len() >= 2, "operand_values must contain at least two
-    // polynomials");     let ring_n = params.ring_dimension() as usize;
-    //     for values in &operand_values {
-    //         assert_eq!(values.len(), ring_n, "operand length must match ring dimension");
-    //     }
-
-    //     let inputs: Vec<NestedCrtPoly<DCRTPoly>> = operand_values
-    //         .iter()
-    //         .map(|_| NestedCrtPoly::input(ctx.clone(), &mut circuit))
-    //         .collect();
-    //     let expected_out = NestedCrtPoly::input(ctx.clone(), &mut circuit);
-
-    //     let mut accumulator = inputs[0].clone();
-    //     for poly in inputs.iter().skip(1) {
-    //         accumulator = accumulator.mul(poly, &mut circuit);
-    //     }
-    //     let zero = accumulator.sub(&expected_out, &mut circuit);
-    //     let is_zero = zero.is_zero(&mut circuit);
-    //     circuit.output(vec![is_zero]);
-    //     println!("non-free depth {}", circuit.non_free_depth());
-
-    //     let modulus = params.modulus();
-    //     let modulus_ref = modulus.as_ref();
-    //     let mut eval_inputs: Vec<DCRTPoly> = Vec::new();
-    //     for values in &operand_values {
-    //         eval_inputs.extend(encode_nested_crt_poly(L1_MODULI_BITS, &params, values));
-    //     }
-    //     let expected_values: Vec<BigUint> = (0..ring_n)
-    //         .map(|idx| {
-    //             operand_values
-    //                 .iter()
-    //                 .fold(BigUint::from(1u64), |acc, values| (&acc * &values[idx]) % modulus_ref)
-    //         })
-    //         .collect();
-    //     eval_inputs.extend(encode_nested_crt_poly(L1_MODULI_BITS, &params, &expected_values));
-    //     let plt_evaluator = PolyPltEvaluator::new();
-    //     let eval_results =
-    //         circuit.eval(&params, &DCRTPoly::const_one(&params), &eval_inputs,
-    // Some(plt_evaluator));     println!("eval_results {:?}", eval_results);
-
-    //     assert_eq!(eval_results, vec![DCRTPoly::const_zero(&params)]);
-    // }
-
-    // #[test]
-    // fn test_nested_crt_benchmark_multiplication_tree() {
-    //     let height = 3usize;
-    //     let mut circuit = PolyCircuit::<DCRTPoly>::new();
-    //     let (params, ctx) = create_test_context(&mut circuit);
-    //     let ctx_for_benchmark = ctx.clone();
-    //     NestedCrtPoly::benchmark_multiplication_tree(ctx_for_benchmark, &mut circuit, height);
-    //     println!("non-free depth {}", circuit.non_free_depth());
-
-    //     let ring_n = params.ring_dimension() as usize;
-    //     let zero_values = vec![BigUint::zero(); ring_n];
-    //     let num_inputs = 1usize << height;
-    //     let mut eval_inputs: Vec<DCRTPoly> =
-    //         Vec::with_capacity(num_inputs * ctx.l1_ctx().l1_moduli_depth());
-    //     for _ in 0..num_inputs {
-    //         eval_inputs.extend(encode_nested_crt_poly(L1_MODULI_BITS, &params, &zero_values));
-    //     }
-    //     let plt_evaluator = PolyPltEvaluator::new();
-    //     let eval_results =
-    //         circuit.eval(&params, &DCRTPoly::const_one(&params), &eval_inputs,
-    // Some(plt_evaluator));
-
-    //     assert_eq!(eval_results, vec![DCRTPoly::const_zero(&params)]);
-    // }
 }

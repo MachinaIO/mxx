@@ -129,13 +129,11 @@ mod tests {
     #[test]
     fn test_benchmark_multiplication_tree_evaluation() {
         let params = DCRTPolyParams::default();
-        let ring_degree = params.ring_dimension() as usize;
         let height = 4;
         let limb_bit_size = 3usize;
         let circuit = ArithmeticCircuit::<DCRTPoly>::benchmark_multiplication_tree(
             &params,
             limb_bit_size,
-            ring_degree,
             height,
             false,
         );

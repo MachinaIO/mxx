@@ -34,7 +34,6 @@ impl From<ArithGateId> for usize {
 #[derive(Clone)]
 pub struct ArithmeticCircuit<P: Poly> {
     pub limb_bit_size: usize,
-    pub max_degree: usize,
     pub num_inputs: usize,
     pub poly_circuit: PolyCircuit<P>,
     pub ctx: Arc<BasicModuloPolyContext<P>>,
@@ -48,7 +47,6 @@ impl<P: Poly> ArithmeticCircuit<P> {
     pub fn setup(
         params: &<P as Poly>::Params,
         limb_bit_size: usize,
-        max_degree: usize,
         num_inputs: usize,
         dummy_scalar: bool,
     ) -> Self {
@@ -59,7 +57,6 @@ impl<P: Poly> ArithmeticCircuit<P> {
             &mut poly_circuit,
             params,
             limb_bit_size,
-            max_degree,
             dummy_scalar,
         ));
         log_mem("after ModuloPolyContext setup");
@@ -68,7 +65,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
             .collect::<Vec<_>>();
         all_values.extend(crt_polys);
 
-        ArithmeticCircuit { limb_bit_size, max_degree, num_inputs, poly_circuit, ctx, all_values }
+        ArithmeticCircuit { limb_bit_size, num_inputs, poly_circuit, ctx, all_values }
     }
 
     pub fn to_poly_circuit(self) -> PolyCircuit<P> {
@@ -134,7 +131,6 @@ impl<P: Poly> ArithmeticCircuit<P> {
     pub fn benchmark_multiplication_tree(
         params: &<P as Poly>::Params,
         limb_bit_size: usize,
-        max_degree: usize,
         height: usize,
         dummy_scalar: bool,
     ) -> Self {
@@ -142,7 +138,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
         let num_inputs =
             1usize.checked_shl(height as u32).expect("height is too large to represent 2^h inputs");
 
-        let mut circuit = Self::setup(params, limb_bit_size, max_degree, num_inputs, dummy_scalar);
+        let mut circuit = Self::setup(params, limb_bit_size, num_inputs, dummy_scalar);
 
         // Collect the leaf identifiers representing the primary inputs.
         let mut current_layer: Vec<ArithGateId> = (0..num_inputs).map(ArithGateId::from).collect();

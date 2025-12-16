@@ -2,9 +2,11 @@ pub mod poly;
 // pub mod simple_eval;
 pub mod lwe_eval;
 
+use crate::{
+    circuit::gate::GateId,
+    poly::{Poly, PolyParams},
+};
 use rayon::prelude::*;
-
-use crate::{circuit::gate::GateId, poly::Poly};
 use std::collections::HashMap;
 
 pub trait PltEvaluator<E: crate::circuit::evaluable::Evaluable>: Send + Sync {
@@ -30,6 +32,24 @@ impl<P: Poly> PublicLut<P> {
             .max_by(|a, b| a.1.cmp(&b.1))
             .expect("no coefficients found in any y_k");
         Self { f, max_output_row }
+    }
+
+    /// Build a PublicLut from BigUint keys/values, converting them into field elements
+    /// using the provided parameters' modulus.
+    pub fn new_biguint(
+        params: &P::Params,
+        f_big: HashMap<num_bigint::BigUint, (usize, num_bigint::BigUint)>,
+    ) -> Self {
+        use crate::element::PolyElem;
+        let f = f_big
+            .into_par_iter()
+            .map(|(k, (idx, v))| {
+                let key = <P as Poly>::Elem::new(k, params.modulus().clone());
+                let val = <P as Poly>::Elem::new(v, params.modulus().clone());
+                (key, (idx, val))
+            })
+            .collect();
+        Self::new(f)
     }
     pub fn len(&self) -> usize {
         self.f.len()

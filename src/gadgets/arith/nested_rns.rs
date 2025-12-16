@@ -1,0 +1,706 @@
+use crate::{
+    circuit::{PolyCircuit, gate::GateId},
+    lookup::PublicLut,
+    poly::{Poly, PolyParams},
+    utils::{mod_inverse, round_div},
+};
+use num_bigint::BigUint;
+use num_traits::{ToPrimitive, Zero};
+use primal::Primes;
+use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+
+#[derive(Debug, Clone)]
+pub struct NestedRnsPolyContext {
+    pub p_moduli: Vec<u64>,
+    pub p_moduli_bits: usize,
+    pub q_moduli_bits: usize,
+    pub q_moduli_depth: usize,
+    pub scale: u64,
+    pub lut_mod_p: Vec<usize>,
+    pub lut_x_to_y: Vec<usize>,
+    pub lut_x_to_real: Vec<usize>,
+    pub lut_real_to_v: usize,
+    pub wires_p_moduli: Vec<GateId>,
+    pub scalars_y: Vec<Vec<Vec<u32>>>, /* scalars_y[q_k][p_i][p_j] =
+                                        * [[\hat{p_j}]_{q_k}]_{p_i} */
+    pub scalars_v: Vec<Vec<u32>>, // scalars_v[q_k][p_i] = [[p]_{q_k}]_{p_i}
+}
+
+fn dummy_lut_map() -> HashMap<BigUint, (usize, BigUint)> {
+    let mut map = HashMap::new();
+    map.insert(BigUint::zero(), (0, BigUint::zero()));
+    map
+}
+
+impl NestedRnsPolyContext {
+    pub fn setup<P: Poly>(
+        circuit: &mut PolyCircuit<P>,
+        params: &P::Params,
+        p_moduli_bits: usize,
+        scale: u64,
+        dummy_scalar: bool,
+    ) -> Self {
+        let (q_moduli, q_moduli_bits, q_moduli_depth) = params.to_crt();
+        let p_moduli_depth = (2 * q_moduli_bits).div_ceil(p_moduli_bits);
+        if dummy_scalar {
+            let p_moduli = vec![0; p_moduli_depth];
+            let dummy_map = dummy_lut_map();
+            let dummy_lut = PublicLut::<P>::new_biguint(params, dummy_map);
+            let lut_mod_p = circuit.register_public_lookup(dummy_lut.clone());
+            let lut_x_to_y = circuit.register_public_lookup(dummy_lut.clone());
+            let lut_x_to_real = circuit.register_public_lookup(dummy_lut.clone());
+            let lut_real_to_v = circuit.register_public_lookup(dummy_lut);
+            return Self {
+                p_moduli,
+                p_moduli_bits,
+                q_moduli_bits,
+                q_moduli_depth,
+                scale,
+                lut_mod_p: vec![lut_mod_p; p_moduli_depth],
+                lut_x_to_y: vec![lut_x_to_y; p_moduli_depth],
+                lut_x_to_real: vec![lut_x_to_real; p_moduli_depth],
+                lut_real_to_v,
+                wires_p_moduli: vec![circuit.const_zero_gate(); p_moduli_depth],
+                scalars_y: vec![vec![vec![0; p_moduli_depth]; p_moduli_depth]; q_moduli_depth],
+                scalars_v: vec![vec![0; p_moduli_depth]; q_moduli_depth],
+            };
+        }
+
+        let p_moduli = sample_crt_primes(p_moduli_bits, p_moduli_depth);
+        let p = p_moduli.iter().fold(BigUint::from(1u64), |acc, &pi| acc * BigUint::from(pi));
+        let p_over_pis = p_moduli.iter().map(|&p_i| &p / BigUint::from(p_i)).collect::<Vec<_>>();
+
+        let mut lut_mod_p = Vec::with_capacity(p_moduli_depth);
+        let mut lut_x_to_y = Vec::with_capacity(p_moduli_depth);
+        let mut lut_x_to_real = Vec::with_capacity(p_moduli_depth);
+        let mut wires_p_moduli = Vec::with_capacity(p_moduli_depth);
+        let mut scalars_y = vec![vec![vec![0; p_moduli_depth]; p_moduli_depth]; q_moduli_depth];
+        let mut scalars_v = vec![vec![0; p_moduli_depth]; q_moduli_depth];
+
+        for (p_i_idx, &p_i) in p_moduli.iter().enumerate() {
+            let p_moduli_square = p_i as u64 * p_i as u64;
+            let lut_mod_p_map_size = p_moduli_square * p_moduli_depth as u64;
+            let lut_mod_p_map = HashMap::from_iter((0..(lut_mod_p_map_size as usize)).map(|t| {
+                let input = BigUint::from(t as u64);
+                let output = BigUint::from(t as u64 % p_i);
+                (input, (t as usize, output))
+            }));
+            lut_mod_p.push(
+                circuit.register_public_lookup(PublicLut::<P>::new_biguint(params, lut_mod_p_map)),
+            );
+
+            let p_moduli_big = BigUint::from(p_i);
+            let p_over_pi_inv = {
+                let residue = (&p_over_pis[p_i_idx] % &p_moduli_big)
+                    .to_u64()
+                    .expect("CRT residue must fit in u64");
+                let inv = mod_inverse(residue, p_i).expect("CRT moduli must be coprime");
+                // log_mem(format!("pi = {}, p_over_pi = {}, inv = {}", pi, p_over_pi, inv));
+                BigUint::from(inv)
+            };
+
+            let lut_x_to_y_map = HashMap::from_iter((0..(p_moduli_square as usize)).map(|t| {
+                let input = BigUint::from(t as u64);
+                let output = (&input * &p_over_pi_inv) % &p_moduli_big;
+                (input, (t as usize, output))
+            }));
+            lut_x_to_y.push(
+                circuit.register_public_lookup(PublicLut::<P>::new_biguint(params, lut_x_to_y_map)),
+            );
+
+            let lut_x_to_real_map = HashMap::from_iter((0..(p_moduli_square as usize)).map(|t| {
+                let input = BigUint::from(t as u64);
+                let y = ((&input * &p_over_pi_inv) % &p_moduli_big)
+                    .to_u64()
+                    .expect("y must fit in u64");
+                let output = BigUint::from(round_div(y * scale, p_i));
+                (input, (t as usize, output))
+            }));
+            lut_x_to_real.push(
+                circuit
+                    .register_public_lookup(PublicLut::<P>::new_biguint(params, lut_x_to_real_map)),
+            );
+
+            wires_p_moduli.push(circuit.const_digits(&[p_i as u32]));
+
+            for (q_idx, q_k) in q_moduli.iter().enumerate() {
+                for (p_j_idx, &p_j) in p_moduli.iter().enumerate() {
+                    let p_over_pj = p_over_pis[p_j_idx].clone();
+                    let p_over_pj_mod_qk = (&p_over_pj % BigUint::from(*q_k))
+                        .to_u64()
+                        .expect("CRT residue must fit in u64");
+                    let p_over_pj_mod_qk_mod_pi = p_over_pj_mod_qk % p_i;
+                    scalars_y[q_idx][p_i_idx][p_j_idx] = p_over_pj_mod_qk_mod_pi as u32;
+                }
+                let p_mod_qk =
+                    (&p % BigUint::from(*q_k)).to_u64().expect("CRT residue must fit in u64");
+                let p_mod_qk_mod_pi = p_mod_qk % p_i;
+                scalars_v[q_idx][p_i_idx] = p_mod_qk_mod_pi as u32;
+            }
+        }
+
+        let max_real = scale * p_moduli_depth as u64;
+        let lut_real_to_v_map = HashMap::from_iter((0..=max_real as usize).map(|t| {
+            let input = BigUint::from(t as u64);
+            let output = BigUint::from(round_div(t as u64, scale));
+            (input, (t as usize, output))
+        }));
+        let lut_real_to_v =
+            circuit.register_public_lookup(PublicLut::<P>::new_biguint(params, lut_real_to_v_map));
+        Self {
+            p_moduli,
+            p_moduli_bits,
+            q_moduli_bits,
+            q_moduli_depth,
+            scale,
+            lut_mod_p,
+            lut_x_to_y,
+            lut_x_to_real,
+            lut_real_to_v,
+            wires_p_moduli,
+            scalars_y,
+            scalars_v,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NestedRnsPoly<P: Poly> {
+    pub ctx: Arc<NestedRnsPolyContext>,
+    pub inner: Vec<Vec<GateId>>, // inner[q_moduli_idx][p_moduli_idx]
+    _p: PhantomData<P>,
+}
+
+impl<P: Poly> NestedRnsPoly<P> {
+    pub fn new(ctx: Arc<NestedRnsPolyContext>, inner: Vec<Vec<GateId>>) -> Self {
+        Self { ctx, inner, _p: PhantomData }
+    }
+
+    pub fn input(ctx: Arc<NestedRnsPolyContext>, circuit: &mut PolyCircuit<P>) -> Self {
+        let inner = (0..ctx.q_moduli_depth).map(|_| circuit.input(ctx.p_moduli.len())).collect();
+        Self { ctx, inner, _p: PhantomData }
+    }
+
+    pub fn add_lazy_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
+        let sum = self.add_without_reduce(other, circuit);
+        sum.lazy_reduce(circuit)
+    }
+
+    pub fn sub_lazy_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
+        let diff = self.sub_without_reduce(other, circuit);
+        diff.lazy_reduce(circuit)
+    }
+
+    pub fn mul_lazy_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
+        let prod = self.mul_without_reduce(other, circuit);
+        prod.lazy_reduce(circuit)
+    }
+
+    pub fn add_full_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
+        let sum = self.add_without_reduce(other, circuit);
+        sum.full_reduce(circuit)
+    }
+
+    pub fn sub_full_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
+        let diff = self.sub_without_reduce(other, circuit);
+        diff.full_reduce(circuit)
+    }
+
+    pub fn mul_full_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
+        let prod = self.mul_without_reduce(other, circuit);
+        prod.full_reduce(circuit)
+    }
+
+    pub fn reconstruct(&self, params: &P::Params, circuit: &mut PolyCircuit<P>) -> GateId {
+        let mut sum_mod_q = circuit.const_zero_gate();
+        let p =
+            self.ctx.p_moduli.iter().fold(BigUint::from(1u64), |acc, &pi| acc * BigUint::from(pi));
+        let p_over_pis =
+            self.ctx.p_moduli.iter().map(|&p_i| &p / BigUint::from(p_i)).collect::<Vec<_>>();
+
+        for q_idx in 0..self.ctx.q_moduli_depth {
+            let mut sum_without_reduce = circuit.const_zero_gate();
+            let mut real_sum = circuit.const_zero_gate();
+            let inner_mod_q_k = &self.inner[q_idx];
+            for p_idx in 0..self.ctx.p_moduli.len() {
+                let y_i =
+                    circuit.public_lookup_gate(inner_mod_q_k[p_idx], self.ctx.lut_x_to_y[p_idx]);
+                let y_i_p_j_hat = circuit.large_scalar_mul(y_i, &[p_over_pis[p_idx].clone()]);
+                sum_without_reduce = circuit.add_gate(sum_without_reduce, y_i_p_j_hat);
+                let real_i =
+                    circuit.public_lookup_gate(inner_mod_q_k[p_idx], self.ctx.lut_x_to_real[p_idx]);
+                real_sum = circuit.add_gate(real_sum, real_i);
+            }
+            let v = circuit.public_lookup_gate(real_sum, self.ctx.lut_real_to_v);
+            let pv = circuit.large_scalar_mul(v, &[p.clone()]);
+            let sum_q_k = circuit.sub_gate(sum_without_reduce, pv);
+            let (_, reconst_coeff) = params.to_crt_coeffs(q_idx);
+            let sum_q_k_scaled = circuit.large_scalar_mul(sum_q_k, &[reconst_coeff]);
+            sum_mod_q = circuit.add_gate(sum_mod_q, sum_q_k_scaled);
+        }
+        sum_mod_q
+    }
+
+    pub(crate) fn add_without_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
+        assert_eq!(
+            self.ctx.p_moduli, other.ctx.p_moduli,
+            "cannot add NestedRnsPoly with different p_moduli"
+        );
+        assert_eq!(
+            self.ctx.q_moduli_depth, other.ctx.q_moduli_depth,
+            "cannot add NestedRnsPoly with different q_moduli_depth"
+        );
+        let mut result_inner = Vec::with_capacity(self.ctx.q_moduli_depth);
+        for q_idx in 0..self.ctx.q_moduli_depth {
+            let mut result_p_moduli = Vec::with_capacity(self.ctx.p_moduli.len());
+            for p_idx in 0..self.ctx.p_moduli.len() {
+                let sum_gate =
+                    circuit.add_gate(self.inner[q_idx][p_idx], other.inner[q_idx][p_idx]);
+                result_p_moduli.push(sum_gate);
+            }
+            result_inner.push(result_p_moduli);
+        }
+        Self { ctx: self.ctx.clone(), inner: result_inner, _p: PhantomData }
+    }
+
+    pub(crate) fn sub_without_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
+        assert_eq!(
+            self.ctx.p_moduli, other.ctx.p_moduli,
+            "cannot add NestedRnsPoly with different p_moduli"
+        );
+        assert_eq!(
+            self.ctx.q_moduli_depth, other.ctx.q_moduli_depth,
+            "cannot add NestedRnsPoly with different q_moduli_depth"
+        );
+        let mut result_inner = Vec::with_capacity(self.ctx.q_moduli_depth);
+        for q_idx in 0..self.ctx.q_moduli_depth {
+            let mut result_p_moduli = Vec::with_capacity(self.ctx.p_moduli.len());
+            for p_idx in 0..self.ctx.p_moduli.len() {
+                let sum_gate =
+                    circuit.add_gate(self.inner[q_idx][p_idx], self.ctx.wires_p_moduli[p_idx]);
+                let sub_gate = circuit.sub_gate(sum_gate, other.inner[q_idx][p_idx]);
+                result_p_moduli.push(sub_gate);
+            }
+            result_inner.push(result_p_moduli);
+        }
+        Self { ctx: self.ctx.clone(), inner: result_inner, _p: PhantomData }
+    }
+
+    pub(crate) fn mul_without_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
+        assert_eq!(
+            self.ctx.p_moduli, other.ctx.p_moduli,
+            "cannot mul NestedRnsPoly with different p_moduli"
+        );
+        assert_eq!(
+            self.ctx.q_moduli_depth, other.ctx.q_moduli_depth,
+            "cannot mul NestedRnsPoly with different q_moduli_depth"
+        );
+        let mut result_inner = Vec::with_capacity(self.ctx.q_moduli_depth);
+        for q_idx in 0..self.ctx.q_moduli_depth {
+            let mut result_p_moduli = Vec::with_capacity(self.ctx.p_moduli.len());
+            for p_idx in 0..self.ctx.p_moduli.len() {
+                let mul_gate =
+                    circuit.mul_gate(self.inner[q_idx][p_idx], other.inner[q_idx][p_idx]);
+                result_p_moduli.push(mul_gate);
+            }
+            result_inner.push(result_p_moduli);
+        }
+        Self { ctx: self.ctx.clone(), inner: result_inner, _p: PhantomData }
+    }
+
+    pub(crate) fn lazy_reduce(&self, circuit: &mut PolyCircuit<P>) -> Self {
+        let mut result_inner = Vec::with_capacity(self.ctx.q_moduli_depth);
+        for q_idx in 0..self.ctx.q_moduli_depth {
+            let mut result_p_moduli = Vec::with_capacity(self.ctx.p_moduli.len());
+            for p_idx in 0..self.ctx.p_moduli.len() {
+                let reduced_gate =
+                    circuit.public_lookup_gate(self.inner[q_idx][p_idx], self.ctx.lut_mod_p[p_idx]);
+                result_p_moduli.push(reduced_gate);
+            }
+            result_inner.push(result_p_moduli);
+        }
+        Self { ctx: self.ctx.clone(), inner: result_inner, _p: PhantomData }
+    }
+
+    pub(crate) fn full_reduce(&self, circuit: &mut PolyCircuit<P>) -> Self {
+        let mut result_inner = Vec::with_capacity(self.ctx.q_moduli_depth);
+        for q_idx in 0..self.ctx.q_moduli_depth {
+            // 1. y_i = [[x]_{p_i} * (p/p_oi)^(-1} mod p_i] mod p_i
+            let ys = (0..self.ctx.p_moduli.len())
+                .map(|p_idx| {
+                    circuit.public_lookup_gate(self.inner[q_idx][p_idx], self.ctx.lut_x_to_y[p_idx])
+                })
+                .collect::<Vec<_>>();
+            // 2. real_i = round_div(y_i * scale, p_i), but the input is x_i rather than y_i
+            let reals = (0..self.ctx.p_moduli.len())
+                .map(|p_idx| {
+                    circuit
+                        .public_lookup_gate(self.inner[q_idx][p_idx], self.ctx.lut_x_to_real[p_idx])
+                })
+                .collect::<Vec<_>>();
+            // 3. sum_i real_i
+            let mut real_sum = circuit.const_zero_gate();
+            for &real in reals.iter() {
+                real_sum = circuit.add_gate(real_sum, real);
+            }
+            // 4. v = round_div(real_sum, scale)
+            let v = circuit.public_lookup_gate(real_sum, self.ctx.lut_real_to_v);
+            // 5. p_i_sum = (sum_j y_j * [[\hat{p_j}]_{q_k}]_{p_i}) - v * [[p]_{q_k}]_{p_i}
+            let mut p_i_sums = Vec::with_capacity(self.ctx.p_moduli.len());
+            for p_idx in 0..self.ctx.p_moduli.len() {
+                let mut p_i_sum = circuit.const_zero_gate();
+                for p_j_idx in 0..self.ctx.p_moduli.len() {
+                    let y_j = ys[p_j_idx];
+                    let term =
+                        circuit.small_scalar_mul(y_j, &[self.ctx.scalars_y[q_idx][p_idx][p_j_idx]]);
+                    p_i_sum = circuit.add_gate(p_i_sum, term);
+                }
+                let term = circuit.small_scalar_mul(v, &[self.ctx.scalars_v[q_idx][p_idx]]);
+                p_i_sum = circuit.sub_gate(p_i_sum, term);
+                let p_i_sum_mod_p = circuit.public_lookup_gate(p_i_sum, self.ctx.lut_mod_p[p_idx]);
+                p_i_sums.push(p_i_sum_mod_p);
+            }
+            result_inner.push(p_i_sums);
+        }
+        Self { ctx: self.ctx.clone(), inner: result_inner, _p: PhantomData }
+    }
+}
+
+/// Return the first `count` primes that fall within the requested `bit_width`.
+pub(crate) fn sample_crt_primes(bit_width: usize, count: usize) -> Vec<u64> {
+    assert!(bit_width > 1, "bit_width must be at least 2 bits");
+    assert!(bit_width < 32, "bit_width must be less than 32 bits");
+    assert!(
+        bit_width <= usize::BITS as usize,
+        "bit_width {bit_width} exceeds target pointer width {}",
+        usize::BITS
+    );
+    assert!(count > 0, "count must be greater than 0");
+
+    let lower = 1u64 << (bit_width - 1);
+    let upper = 1u64 << bit_width;
+    let mut results: Vec<u64> = Vec::with_capacity(count);
+
+    for prime in
+        Primes::all().skip_while(|&p| (p as u64) < lower).take_while(|&p| (p as u64) < upper)
+    {
+        results.push(prime as u64);
+        if results.len() == count {
+            break;
+        }
+    }
+
+    if results.len() != count {
+        panic!(
+            "failed to find {count} primes with bit width {bit_width}; only {} found",
+            results.len()
+        );
+    }
+
+    results
+}
+
+pub fn encode_nested_rns_poly<P: Poly>(
+    p_moduli_bits: usize,
+    params: &P::Params,
+    input: &BigUint,
+) -> Vec<P> {
+    let (q_moduli, q_moduli_bits, _) = params.to_crt();
+    let p_moduli_depth = (2 * q_moduli_bits).div_ceil(p_moduli_bits);
+    let p_moduli = sample_crt_primes(p_moduli_bits, p_moduli_depth);
+    let mut polys = vec![Vec::with_capacity(p_moduli_depth); q_moduli.len()];
+    for (q_idx, &q_i) in q_moduli.iter().enumerate() {
+        let input_qi = input % BigUint::from(q_i);
+        for &p_i in p_moduli.iter() {
+            polys[q_idx].push(P::from_biguint_to_constant(params, &input_qi % p_i));
+        }
+    }
+    polys.into_iter().flatten().collect::<Vec<_>>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        lookup::poly::PolyPltEvaluator,
+        poly::{
+            PolyParams,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
+    };
+
+    const P_MODULI_BITS: usize = 6;
+    const SCALE: u64 = 1 << 8;
+
+    fn create_test_context(
+        circuit: &mut PolyCircuit<DCRTPoly>,
+    ) -> (DCRTPolyParams, Arc<NestedRnsPolyContext>) {
+        let params = DCRTPolyParams::new(4, 2, 18, 1);
+        let ctx =
+            Arc::new(NestedRnsPolyContext::setup(circuit, &params, P_MODULI_BITS, SCALE, false));
+        println!("p moduli: {:?}", &ctx.p_moduli);
+        (params, ctx)
+    }
+
+    #[test]
+    fn test_nested_rns_poly_add_full_reduce_maxes() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let modulus = params.modulus();
+        let a_value: BigUint = modulus.as_ref() - BigUint::from(1u64);
+        let b_value: BigUint = modulus.as_ref() - BigUint::from(1u64);
+        test_nested_rns_poly_add_full_reduce_generic(circuit, params, ctx, a_value, b_value);
+    }
+
+    #[test]
+    fn test_nested_rns_poly_add_full_reduce_random() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let modulus = params.modulus();
+        let mut rng = rand::rng();
+        let a_value: BigUint = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+        let b_value: BigUint = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+        test_nested_rns_poly_add_full_reduce_generic(circuit, params, ctx, a_value, b_value);
+    }
+
+    #[test]
+    fn test_nested_rns_poly_sub_full_reduce_maxes() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let modulus = params.modulus();
+        let a_value: BigUint = modulus.as_ref() - BigUint::from(1u64);
+        let b_value: BigUint = modulus.as_ref() - BigUint::from(1u64);
+        test_nested_rns_poly_sub_full_reduce_generic(circuit, params, ctx, a_value, b_value);
+    }
+
+    #[test]
+    fn test_nested_rns_poly_sub_full_reduce_random() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let modulus = params.modulus();
+        let mut rng = rand::rng();
+        let a_value: BigUint = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+        let b_value: BigUint = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+        test_nested_rns_poly_sub_full_reduce_generic(circuit, params, ctx, a_value, b_value);
+    }
+
+    #[test]
+    fn test_nested_rns_poly_mul_full_reduce_maxes() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let modulus = params.modulus();
+        let a_value: BigUint = modulus.as_ref() - BigUint::from(1u64);
+        let b_value: BigUint = modulus.as_ref() - BigUint::from(1u64);
+        test_nested_rns_poly_mul_full_reduce_generic(circuit, params, ctx, a_value, b_value);
+    }
+
+    #[test]
+    fn test_nested_rns_poly_mul_full_reduce_random() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let modulus = params.modulus();
+        let mut rng = rand::rng();
+        let a_value: BigUint = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+        let b_value: BigUint = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+        test_nested_rns_poly_mul_full_reduce_generic(circuit, params, ctx, a_value, b_value);
+    }
+
+    // #[test]
+    // fn test_nested_crt_poly_mul_depth_random() {
+    //     let depth = 3usize;
+    //     let mut circuit = PolyCircuit::<DCRTPoly>::new();
+    //     let (params, ctx) = create_test_context(&mut circuit);
+    //     let modulus = params.modulus();
+    //     let ring_n = params.ring_dimension() as usize;
+    //     let mut rng = rand::rng();
+    //     let operand_values: Vec<Vec<BigUint>> = (0..=depth)
+    //         .map(|_| {
+    //             (0..ring_n)
+    //                 .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref()))
+    //                 .collect()
+    //         })
+    //         .collect();
+    //     test_nested_crt_poly_mul_depth_generic(circuit, params, ctx, operand_values);
+    // }
+
+    fn test_nested_rns_poly_add_full_reduce_generic(
+        mut circuit: PolyCircuit<DCRTPoly>,
+        params: DCRTPolyParams,
+        ctx: Arc<NestedRnsPolyContext>,
+        a_value: BigUint,
+        b_value: BigUint,
+    ) {
+        let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
+        let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
+        let sum = poly_a.add_full_reduce(&poly_b, &mut circuit);
+        let out = sum.reconstruct(&params, &mut circuit);
+        circuit.output(vec![out]);
+        println!("non-free depth {}", circuit.non_free_depth());
+
+        let modulus = params.modulus();
+        println!("modulus {:?}", &modulus);
+        println!("a_value {:?}", &a_value);
+        println!("b_value {:?}", &b_value);
+        let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value);
+        let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value);
+        let expected_out = (&a_value + &b_value) % modulus.as_ref();
+        println!("expected_out {:?}", &expected_out);
+        let plt_evaluator = PolyPltEvaluator::new();
+        let eval_results = circuit.eval(
+            &params,
+            &DCRTPoly::const_one(&params),
+            &[a_inputs, b_inputs].concat(),
+            Some(plt_evaluator),
+        );
+        println!("eval_results {:?}", eval_results);
+        assert_eq!(eval_results.len(), 1);
+        assert_eq!(eval_results[0].coeffs_biguints()[0], expected_out);
+    }
+
+    fn test_nested_rns_poly_sub_full_reduce_generic(
+        mut circuit: PolyCircuit<DCRTPoly>,
+        params: DCRTPolyParams,
+        ctx: Arc<NestedRnsPolyContext>,
+        a_value: BigUint,
+        b_value: BigUint,
+    ) {
+        let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
+        let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
+        let sum = poly_a.sub_full_reduce(&poly_b, &mut circuit);
+        let out = sum.reconstruct(&params, &mut circuit);
+        circuit.output(vec![out]);
+        println!("non-free depth {}", circuit.non_free_depth());
+
+        let modulus = params.modulus();
+        println!("modulus {:?}", &modulus);
+        println!("a_value {:?}", &a_value);
+        println!("b_value {:?}", &b_value);
+        let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value);
+        let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value);
+        let expected_out = {
+            let mut value = &a_value + modulus.as_ref();
+            value -= &b_value;
+            value %= modulus.as_ref();
+            value
+        };
+        println!("expected_out {:?}", &expected_out);
+        let plt_evaluator = PolyPltEvaluator::new();
+        let eval_results = circuit.eval(
+            &params,
+            &DCRTPoly::const_one(&params),
+            &[a_inputs, b_inputs].concat(),
+            Some(plt_evaluator),
+        );
+        println!("eval_results {:?}", eval_results);
+        assert_eq!(eval_results.len(), 1);
+        assert_eq!(eval_results[0].coeffs_biguints()[0], expected_out);
+    }
+
+    fn test_nested_rns_poly_mul_full_reduce_generic(
+        mut circuit: PolyCircuit<DCRTPoly>,
+        params: DCRTPolyParams,
+        ctx: Arc<NestedRnsPolyContext>,
+        a_value: BigUint,
+        b_value: BigUint,
+    ) {
+        let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
+        let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
+        let sum = poly_a.mul_full_reduce(&poly_b, &mut circuit);
+        let out = sum.reconstruct(&params, &mut circuit);
+        circuit.output(vec![out]);
+        println!("non-free depth {}", circuit.non_free_depth());
+
+        let modulus = params.modulus();
+        println!("modulus {:?}", &modulus);
+        println!("a_value {:?}", &a_value);
+        println!("b_value {:?}", &b_value);
+        let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value);
+        let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value);
+        let expected_out = (&a_value * &b_value) % modulus.as_ref();
+        println!("expected_out {:?}", &expected_out);
+        let plt_evaluator = PolyPltEvaluator::new();
+        let eval_results = circuit.eval(
+            &params,
+            &DCRTPoly::const_one(&params),
+            &[a_inputs, b_inputs].concat(),
+            Some(plt_evaluator),
+        );
+        println!("eval_results {:?}", eval_results);
+        assert_eq!(eval_results.len(), 1);
+        assert_eq!(eval_results[0].coeffs_biguints()[0], expected_out);
+    }
+
+    // fn test_nested_crt_poly_mul_depth_generic(
+    //     mut circuit: PolyCircuit<DCRTPoly>,
+    //     params: DCRTPolyParams,
+    //     ctx: Arc<NestedCrtPolyContext<DCRTPoly>>,
+    //     operand_values: Vec<Vec<BigUint>>,
+    // ) {
+    //     assert!(operand_values.len() >= 2, "operand_values must contain at least two
+    // polynomials");     let ring_n = params.ring_dimension() as usize;
+    //     for values in &operand_values {
+    //         assert_eq!(values.len(), ring_n, "operand length must match ring dimension");
+    //     }
+
+    //     let inputs: Vec<NestedCrtPoly<DCRTPoly>> = operand_values
+    //         .iter()
+    //         .map(|_| NestedCrtPoly::input(ctx.clone(), &mut circuit))
+    //         .collect();
+    //     let expected_out = NestedCrtPoly::input(ctx.clone(), &mut circuit);
+
+    //     let mut accumulator = inputs[0].clone();
+    //     for poly in inputs.iter().skip(1) {
+    //         accumulator = accumulator.mul(poly, &mut circuit);
+    //     }
+    //     let zero = accumulator.sub(&expected_out, &mut circuit);
+    //     let is_zero = zero.is_zero(&mut circuit);
+    //     circuit.output(vec![is_zero]);
+    //     println!("non-free depth {}", circuit.non_free_depth());
+
+    //     let modulus = params.modulus();
+    //     let modulus_ref = modulus.as_ref();
+    //     let mut eval_inputs: Vec<DCRTPoly> = Vec::new();
+    //     for values in &operand_values {
+    //         eval_inputs.extend(encode_nested_crt_poly(L1_MODULI_BITS, &params, values));
+    //     }
+    //     let expected_values: Vec<BigUint> = (0..ring_n)
+    //         .map(|idx| {
+    //             operand_values
+    //                 .iter()
+    //                 .fold(BigUint::from(1u64), |acc, values| (&acc * &values[idx]) % modulus_ref)
+    //         })
+    //         .collect();
+    //     eval_inputs.extend(encode_nested_crt_poly(L1_MODULI_BITS, &params, &expected_values));
+    //     let plt_evaluator = PolyPltEvaluator::new();
+    //     let eval_results =
+    //         circuit.eval(&params, &DCRTPoly::const_one(&params), &eval_inputs,
+    // Some(plt_evaluator));     println!("eval_results {:?}", eval_results);
+
+    //     assert_eq!(eval_results, vec![DCRTPoly::const_zero(&params)]);
+    // }
+
+    // #[test]
+    // fn test_nested_crt_benchmark_multiplication_tree() {
+    //     let height = 3usize;
+    //     let mut circuit = PolyCircuit::<DCRTPoly>::new();
+    //     let (params, ctx) = create_test_context(&mut circuit);
+    //     let ctx_for_benchmark = ctx.clone();
+    //     NestedCrtPoly::benchmark_multiplication_tree(ctx_for_benchmark, &mut circuit, height);
+    //     println!("non-free depth {}", circuit.non_free_depth());
+
+    //     let ring_n = params.ring_dimension() as usize;
+    //     let zero_values = vec![BigUint::zero(); ring_n];
+    //     let num_inputs = 1usize << height;
+    //     let mut eval_inputs: Vec<DCRTPoly> =
+    //         Vec::with_capacity(num_inputs * ctx.l1_ctx().l1_moduli_depth());
+    //     for _ in 0..num_inputs {
+    //         eval_inputs.extend(encode_nested_crt_poly(L1_MODULI_BITS, &params, &zero_values));
+    //     }
+    //     let plt_evaluator = PolyPltEvaluator::new();
+    //     let eval_results =
+    //         circuit.eval(&params, &DCRTPoly::const_one(&params), &eval_inputs,
+    // Some(plt_evaluator));
+
+    //     assert_eq!(eval_results, vec![DCRTPoly::const_zero(&params)]);
+    // }
+}

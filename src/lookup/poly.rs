@@ -8,7 +8,13 @@ use crate::{
 pub struct PolyPltEvaluator {}
 
 impl<P: Poly> PltEvaluator<P> for PolyPltEvaluator {
-    fn public_lookup(&self, params: &P::Params, plt: &PublicLut<P>, input: P, _: GateId) -> P {
+    fn public_lookup(
+        &self,
+        params: &P::Params,
+        plt: &PublicLut<P>,
+        input: P,
+        gate_id: GateId,
+    ) -> P {
         // Input is assumed to be a constant polynomial; use its constant coefficient as the key.
         let const_coeff = input
             .coeffs()
@@ -18,7 +24,10 @@ impl<P: Poly> PltEvaluator<P> for PolyPltEvaluator {
 
         let output_coeff = match plt.get(params, &const_coeff) {
             Some(outputs) => outputs.1,
-            None => panic!("output of the lookup evaluation not found; input: {:?}", input),
+            None => panic!(
+                "output of the lookup evaluation not found; gate_id: {:?}, input: {:?}",
+                gate_id, input
+            ),
         };
 
         P::from_elem_to_constant(params, &output_coeff)

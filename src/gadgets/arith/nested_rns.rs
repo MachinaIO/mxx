@@ -6,7 +6,6 @@ use crate::{
 };
 use num_bigint::BigUint;
 use num_traits::{ToPrimitive, Zero};
-use primal::Primes;
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
 #[derive(Debug, Clone)]
@@ -366,7 +365,18 @@ impl<P: Poly> NestedRnsPoly<P> {
     }
 }
 
-/// Return the first `count` primes that fall within the requested `bit_width`.
+fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
+}
+
+/// Return the first `count` pairwise coprime integers within the requested `bit_width`.
+///
+/// Deterministic: the output depends only on `bit_width` and `count` (no randomness).
 pub(crate) fn sample_crt_primes(bit_width: usize, count: usize) -> Vec<u64> {
     assert!(bit_width > 1, "bit_width must be at least 2 bits");
     assert!(bit_width < 32, "bit_width must be less than 32 bits");
@@ -381,18 +391,23 @@ pub(crate) fn sample_crt_primes(bit_width: usize, count: usize) -> Vec<u64> {
     let upper = 1u64 << bit_width;
     let mut results: Vec<u64> = Vec::with_capacity(count);
 
-    for prime in
-        Primes::all().skip_while(|&p| (p as u64) < lower).take_while(|&p| (p as u64) < upper)
-    {
-        results.push(prime as u64);
-        if results.len() == count {
-            break;
+    // Prefer larger moduli (bigger `p = ∏ p_i` for the same depth), but keep selection
+    // deterministic.
+    for candidate in (lower..upper).rev() {
+        if candidate < 2 {
+            continue;
+        }
+        if results.iter().all(|&chosen| gcd_u64(candidate, chosen) == 1) {
+            results.push(candidate);
+            if results.len() == count {
+                break;
+            }
         }
     }
 
     if results.len() != count {
         panic!(
-            "failed to find {count} primes with bit width {bit_width}; only {} found",
+            "failed to find {count} pairwise coprime integers with bit width {bit_width}; only {} found",
             results.len()
         );
     }
@@ -429,7 +444,7 @@ mod tests {
         },
     };
 
-    const P_MODULI_BITS: usize = 7;
+    const P_MODULI_BITS: usize = 6;
     const SCALE: u64 = 1 << 8;
 
     fn create_test_context(
@@ -439,8 +454,8 @@ mod tests {
         let ctx =
             Arc::new(NestedRnsPolyContext::setup(circuit, &params, P_MODULI_BITS, SCALE, false));
         // println!("p moduli: {:?}", &ctx.p_moduli);
-        let p = ctx.p_moduli.iter().fold(BigUint::from(1u64), |acc, &pi| acc * BigUint::from(pi));
-        // println!("p: {}", p);
+        // let _p = ctx.p_moduli.iter().fold(BigUint::from(1u64), |acc, &pi| acc *
+        // BigUint::from(pi)); println!("p: {}", p);
         (params, ctx)
     }
 

@@ -25,6 +25,23 @@ impl<P: Poly> PackedPlt<P> {
         hashmap: HashMap<BigUint, (usize, BigUint)>,
         dummy_scalar: bool,
     ) -> Self {
+        let (_, _, crt_depth) = params.to_crt();
+        Self::setup_with_multi_hashmaps(
+            circuit,
+            params,
+            max_degree,
+            vec![hashmap; crt_depth],
+            dummy_scalar,
+        )
+    }
+
+    pub fn setup_with_multi_hashmaps(
+        circuit: &mut PolyCircuit<P>,
+        params: &P::Params,
+        max_degree: usize,
+        multi_hashmaps: Vec<HashMap<BigUint, (usize, BigUint)>>,
+        dummy_scalar: bool,
+    ) -> Self {
         let (moduli, _, crt_depth) = params.to_crt();
         let ring_n = params.ring_dimension() as usize;
         debug_assert!(max_degree <= ring_n, "max_degree must be <= ring_dimension");
@@ -36,15 +53,15 @@ impl<P: Poly> PackedPlt<P> {
         if dummy_scalar {
             // let mul_scalars = vec![vec![vec![BigUint::one()]; max_degree]; crt_depth];
             // let reconstruct_coeffs = vec![BigUint::one(); crt_depth];
-            for i in 0..crt_depth {
-                let qi_big = BigUint::from(moduli[i]);
-                mul_scalars[i] = vec![vec![qi_big.clone()]; max_degree];
-                reconstruct_coeffs.push(qi_big.clone());
-                let mut hashmap = HashMap::new();
-                hashmap.insert(
-                    P::const_zero(params),
-                    (0, P::from_biguint_to_constant(params, qi_big)),
-                );
+            let qi_max = *moduli.iter().max().unwrap();
+            let qi_big = BigUint::from(qi_max);
+            let input = P::const_zero(params);
+            let output = P::from_biguint_to_constant(params, qi_big.clone());
+            let mut hashmap = HashMap::new();
+            hashmap.insert(input.clone(), (0, output.clone()));
+            mul_scalars = vec![vec![vec![qi_big.clone()]; max_degree]; crt_depth];
+            reconstruct_coeffs = vec![qi_big.clone(); crt_depth];
+            for _ in 0..crt_depth {
                 let plt = PublicLut::<P>::new(hashmap.clone());
                 let plt_id = circuit.register_public_lookup(plt);
                 plt_ids.push(vec![plt_id; max_degree]);
@@ -69,6 +86,8 @@ impl<P: Poly> PackedPlt<P> {
                 let lag_basis = &lag_bases[slot_idx];
                 let scalars = lag_basis.coeffs().iter().map(|c| c.value() * &q_over_qi).collect();
                 mul_scalars[i][slot_idx] = scalars;
+
+                let hashmap = &multi_hashmaps[i];
 
                 let lut_map: HashMap<P, (usize, P)> = hashmap
                     .iter()

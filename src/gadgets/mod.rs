@@ -1,2 +1,2 @@
-pub mod crt;
+pub mod arith;
 pub mod packed_plt;

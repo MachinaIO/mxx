@@ -9,12 +9,19 @@ pub struct PolyPltEvaluator {}
 
 impl<P: Poly> PltEvaluator<P> for PolyPltEvaluator {
     fn public_lookup(&self, params: &P::Params, plt: &PublicLut<P>, input: P, _: GateId) -> P {
-        match plt.get(params, &input) {
+        // Input is assumed to be a constant polynomial; use its constant coefficient as the key.
+        let const_coeff = input
+            .coeffs()
+            .first()
+            .cloned()
+            .expect("input polynomial must contain at least one coefficient");
+
+        let output_coeff = match plt.get(params, &const_coeff) {
             Some(outputs) => outputs.1,
-            None => {
-                panic!("output of the lookup evaluation not found; input: {:?}", input);
-            }
-        }
+            None => panic!("output of the lookup evaluation not found; input: {:?}", input),
+        };
+
+        P::from_elem_to_constant(params, &output_coeff)
     }
 }
 

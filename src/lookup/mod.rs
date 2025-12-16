@@ -13,18 +13,20 @@ pub trait PltEvaluator<E: crate::circuit::evaluable::Evaluable>: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct PublicLut<P: Poly> {
-    pub f: HashMap<P, (usize, P)>, /* the `i`-th hashmap in `Vec` corresponds
-                                    * the lookup table for the `i`-th
-                                    * coefficient */
+    pub f: HashMap<<P as Poly>::Elem, (usize, <P as Poly>::Elem)>, /* the `i`-th hashmap in
+                                                                    * `Vec` corresponds
+                                                                    * the lookup table for the
+                                                                    * `i`-th
+                                                                    * coefficient */
     pub max_output_row: (usize, <P as Poly>::Elem),
 }
 
 impl<P: Poly> PublicLut<P> {
-    pub fn new(f: HashMap<P, (usize, P)>) -> Self {
+    pub fn new(f: HashMap<<P as Poly>::Elem, (usize, <P as Poly>::Elem)>) -> Self {
         assert!(!f.is_empty(), "f must contain at least one element");
         let max_output_row = f
             .par_iter()
-            .filter_map(|(_, (k, y_k))| y_k.coeffs().iter().max().cloned().map(|coeff| (*k, coeff)))
+            .map(|(_, (k, y_k))| (*k, y_k.clone()))
             .max_by(|a, b| a.1.cmp(&b.1))
             .expect("no coefficients found in any y_k");
         Self { f, max_output_row }
@@ -37,7 +39,7 @@ impl<P: Poly> PublicLut<P> {
         self.f.is_empty()
     }
 
-    pub fn get(&self, _: &P::Params, x: &P) -> Option<(usize, P)> {
+    pub fn get(&self, _: &P::Params, x: &<P as Poly>::Elem) -> Option<(usize, <P as Poly>::Elem)> {
         self.f.get(x).cloned()
     }
 

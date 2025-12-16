@@ -1,6 +1,7 @@
 use crate::{
     bgg::{encoding::BggEncoding, public_key::BggPublicKey},
     circuit::{evaluable::Evaluable, gate::GateId},
+    element::finite_ring::FinRingElem,
     lookup::{PltEvaluator, PublicLut},
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
@@ -111,9 +112,14 @@ where
         id: GateId,
     ) -> BggEncoding<M> {
         let z = &input.plaintext.expect("the BGG encoding should revealed plaintext");
+        let z_coeff = z
+            .coeffs()
+            .first()
+            .cloned()
+            .expect("z polynomial must contain at least one coefficient");
         debug!("public lookup length is {}", plt.len());
-        let (k, y_k) = plt
-            .get(params, z)
+        let (k, y_k_coeff) = plt
+            .get(params, &z_coeff)
             .unwrap_or_else(|| panic!("{:?} is not exist in public lookup f", z.to_const_int()));
         debug!("Performing public lookup, k={k}");
         let row_size = input.pubkey.matrix.row_size();
@@ -129,7 +135,8 @@ where
         );
         let concat = self.c_b.clone().concat_columns(&[&input.vector]);
         let vector = concat * l_k;
-        BggEncoding::new(vector, pubkey, Some(y_k.clone()))
+        let y_k = <M::P as Poly>::from_elem_to_constant(params, &y_k_coeff);
+        BggEncoding::new(vector, pubkey, Some(y_k))
     }
 }
 
@@ -184,7 +191,9 @@ where
             batch
                 .iter()
                 .map(|(x_k, (k, y_k))| {
-                    let ext_matrix = a_z.clone() - &(gadget.clone() * *x_k);
+                    let x_k = P::from_elem_to_constant(params, x_k);
+                    let y_k = P::from_elem_to_constant(params, y_k);
+                    let ext_matrix = a_z.clone() - &(gadget.clone() * x_k);
                     let target = a_lt.clone() - &(gadget.clone() * y_k);
                     (
                         *k,
@@ -226,11 +235,11 @@ mod test {
 
     fn setup_lsb_constant_binary_plt(t_n: usize, params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {
         let mut f = HashMap::new();
+        let modulus = params.modulus();
         for k in 0..t_n {
-            f.insert(
-                DCRTPoly::from_usize_to_constant(params, k),
-                (k, DCRTPoly::from_usize_to_lsb(params, k)),
-            );
+            let const_elem = FinRingElem::from_u64(k as u64, modulus.clone());
+            let lsb_elem = FinRingElem::from_u64((k & 1) as u64, modulus.clone());
+            f.insert(const_elem, (k, lsb_elem));
         }
         PublicLut::<DCRTPoly>::new(f)
     }
@@ -321,7 +330,14 @@ mod test {
         assert_eq!(result_encoding.len(), 1);
         let result_encoding = &result_encoding[0];
         assert_eq!(result_encoding.pubkey, result_pubkey.clone());
-        let expected_plaintext = plt.get(&params, &plaintexts[0].clone()).unwrap().1;
+        let plaintext_const_coeff = plaintexts[0]
+            .coeffs()
+            .first()
+            .cloned()
+            .expect("plaintext poly must have at least one coefficient");
+        let expected_plaintext_coeff = plt.get(&params, &plaintext_const_coeff).unwrap().1;
+        let expected_plaintext =
+            DCRTPoly::from_elem_to_constant(&params, &expected_plaintext_coeff);
         assert_eq!(result_encoding.plaintext.clone().unwrap(), expected_plaintext);
         let expected_vector = s_vec.clone() *
             (result_encoding.pubkey.matrix.clone() -

@@ -1,6 +1,6 @@
 use crate::{
     circuit::{Evaluable, PolyCircuit, gate::GateId},
-    element::PolyElem,
+    element::{PolyElem, finite_ring::FinRingElem},
     impl_binop_with_refs,
     lookup::{PltEvaluator, PublicLut},
     poly::dcrt::poly::DCRTPoly,
@@ -228,7 +228,7 @@ mod tests {
         circuit::PolyCircuit,
         lookup::PublicLut,
         poly::{
-            Poly,
+            PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
         simulator::SimulatorContext,
@@ -333,13 +333,14 @@ mod tests {
         // Build a tiny LUT on DCRTPoly where the maximum output coeff is known (e.g., 7)
         let params = DCRTPolyParams::default();
         let mut f = HashMap::new();
+        let modulus = params.modulus();
         f.insert(
-            DCRTPoly::from_usize_to_constant(&params, 0),
-            (0usize, DCRTPoly::from_usize_to_constant(&params, 5)),
+            FinRingElem::from_u64(0, modulus.clone()),
+            (0usize, FinRingElem::from_u64(5, modulus.clone())),
         );
         f.insert(
-            DCRTPoly::from_usize_to_constant(&params, 1),
-            (1usize, DCRTPoly::from_usize_to_constant(&params, 7)),
+            FinRingElem::from_u64(1, modulus.clone()),
+            (1usize, FinRingElem::from_u64(7, modulus.clone())),
         );
         let plt = PublicLut::<DCRTPoly>::new(f);
 

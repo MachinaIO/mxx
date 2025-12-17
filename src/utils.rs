@@ -12,9 +12,10 @@ use crate::{
         DistType, PolyUniformSampler, hash::DCRTPolyHashSampler, uniform::DCRTPolyUniformSampler,
     },
 };
+use bigdecimal::BigDecimal;
 use keccak_asm::Keccak256;
 use memory_stats::memory_stats;
-use num_bigint::BigUint;
+use num_bigint::{BigInt, BigUint};
 use num_traits::Zero;
 use rand::Rng;
 use std::{
@@ -234,4 +235,18 @@ pub fn round_div(a: u64, b: u64) -> u64 {
     let half = b128 / 2;
     let rounded = (a128 + half) / b128;
     rounded as u64
+}
+
+pub fn bigdecimal_bits_ceil(x: &BigDecimal) -> u64 {
+    let (coeff, exp) = x.as_bigint_and_exponent();
+    let exp_abs_u32: u32 =
+        exp.unsigned_abs().try_into().expect("BigDecimal exponent must fit in u32");
+    let pow10 = BigInt::from(10u8).pow(exp_abs_u32);
+    let ceil_int = if exp >= 0 {
+        let numer = coeff + (&pow10 - BigInt::from(1u8));
+        numer / &pow10
+    } else {
+        coeff * &pow10
+    };
+    ceil_int.to_biguint().expect("norm should be non-negative").bits()
 }

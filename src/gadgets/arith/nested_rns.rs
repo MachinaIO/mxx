@@ -41,8 +41,8 @@ impl NestedRnsPolyContext {
     ) -> Self {
         let (q_moduli, q_moduli_bits, q_moduli_depth) = params.to_crt();
         let p_moduli_depth = (2 * q_moduli_bits).div_ceil(p_moduli_bits - 1);
+        let p_moduli = sample_crt_primes(p_moduli_bits, p_moduli_depth);
         if dummy_scalar {
-            let p_moduli = vec![0; p_moduli_depth];
             let dummy_map = dummy_lut_map();
             let dummy_lut = PublicLut::<P>::new_biguint(params, dummy_map);
             let lut_mod_p = circuit.register_public_lookup(dummy_lut.clone());
@@ -65,7 +65,6 @@ impl NestedRnsPolyContext {
             };
         }
 
-        let p_moduli = sample_crt_primes(p_moduli_bits, p_moduli_depth);
         let p = p_moduli.iter().fold(BigUint::from(1u64), |acc, &pi| acc * BigUint::from(pi));
         let p_over_pis = p_moduli.iter().map(|&p_i| &p / BigUint::from(p_i)).collect::<Vec<_>>();
 

@@ -7,7 +7,7 @@ use crate::{
     sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
     storage::{
         read::read_matrix_from_multi_batch,
-        write::{BatchLookupBuffer, add_lookup_buffer, get_lookup_buffer},
+        write::{add_lookup_buffer, get_lookup_buffer},
     },
 };
 use rayon::prelude::*;
@@ -16,15 +16,9 @@ use std::{
     marker::PhantomData,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Instant,
 };
-
-fn enqueue_single_matrix<M>(matrix: M, id_prefix: &str)
-where
-    M: PolyMatrix + Send + 'static,
-{
-    let buffer: BatchLookupBuffer = get_lookup_buffer(vec![(0usize, matrix)], id_prefix);
-    add_lookup_buffer(buffer);
-}
+use tracing::info;
 
 #[derive(Debug)]
 pub struct GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
@@ -200,6 +194,8 @@ where
             }
         }
         if need_lut {
+            info!("Preparing LUT for LUT id {}", lut_id);
+            let start = Instant::now();
             let k_l_preimages: Vec<(usize, M)> = plt
                 .f
                 .par_iter()
@@ -227,6 +223,7 @@ where
                     )
                 })
                 .collect();
+            info!("Prepared LUT for LUT id {} in {:?}", lut_id, start.elapsed());
             let kl_id = format!("ggh15_lut_{}", lut_id);
             add_lookup_buffer(get_lookup_buffer(k_l_preimages, &kl_id));
         }
@@ -243,11 +240,11 @@ where
         let target_dec = target_dec_top.concat_rows(&[&M::zero(params, d, m), &a_out]);
         let k_dec = trap_sampler.preimage(params, &self.b1_trapdoor, &self.b1_matrix, &target_dec);
 
-        enqueue_single_matrix(b_g, &format!("ggh15_bg_gate_{}", gate_id));
-        enqueue_single_matrix(k_to_ggh, &format!("ggh15_kggh_gate_{}", gate_id));
-        enqueue_single_matrix(k_g, &format!("ggh15_kg_gate_{}", gate_id));
-        enqueue_single_matrix(k_to_bgg, &format!("ggh15_kbgg_gate_{}", gate_id));
-        enqueue_single_matrix(k_dec, &format!("ggh15_kdec_gate {}", gate_id));
+        let gate_bundle_id = format!("ggh15_gate_bundle_{}", gate_id);
+        add_lookup_buffer(get_lookup_buffer(
+            vec![(0, b_g), (1, k_to_ggh), (2, k_g), (3, k_to_bgg), (4, k_dec)],
+            &gate_bundle_id,
+        ));
 
         // Output public key for this LUT gate.
         BggPublicKey { matrix: a_out, reveal_plaintext: true }
@@ -355,44 +352,20 @@ where
         let hash_sampler = HS::new();
 
         let dir = std::path::Path::new(&self.dir_path);
-        let b_g = read_matrix_from_multi_batch::<M>(
-            params,
-            dir,
-            &format!("ggh15_bg_gate_{}", gate_id),
-            0,
-        )
-        .unwrap_or_else(|| panic!("b_g for gate {} not found", gate_id));
-        let k_to_ggh = read_matrix_from_multi_batch::<M>(
-            params,
-            dir,
-            &format!("ggh15_kggh_gate_{}", gate_id),
-            0,
-        )
-        .unwrap_or_else(|| panic!("k_to_ggh for gate {} not found", gate_id));
-        let k_g = read_matrix_from_multi_batch::<M>(
-            params,
-            dir,
-            &format!("ggh15_kg_gate_{}", gate_id),
-            0,
-        )
-        .unwrap_or_else(|| panic!("k_g for gate {} not found", gate_id));
-        let k_to_bgg = read_matrix_from_multi_batch::<M>(
-            params,
-            dir,
-            &format!("ggh15_kbgg_gate_{}", gate_id),
-            0,
-        )
-        .unwrap_or_else(|| panic!("k_to_bgg for gate {} not found", gate_id));
+        let gate_bundle_id = format!("ggh15_gate_bundle_{}", gate_id);
+        let b_g = read_matrix_from_multi_batch::<M>(params, dir, &gate_bundle_id, 0)
+            .unwrap_or_else(|| panic!("b_g for gate {} not found", gate_id));
+        let k_to_ggh = read_matrix_from_multi_batch::<M>(params, dir, &gate_bundle_id, 1)
+            .unwrap_or_else(|| panic!("k_to_ggh for gate {} not found", gate_id));
+        let k_g = read_matrix_from_multi_batch::<M>(params, dir, &gate_bundle_id, 2)
+            .unwrap_or_else(|| panic!("k_g for gate {} not found", gate_id));
+        let k_to_bgg = read_matrix_from_multi_batch::<M>(params, dir, &gate_bundle_id, 3)
+            .unwrap_or_else(|| panic!("k_to_bgg for gate {} not found", gate_id));
+        let k_dec = read_matrix_from_multi_batch::<M>(params, dir, &gate_bundle_id, 4)
+            .unwrap_or_else(|| panic!("decoder for gate {} not found", gate_id));
         let k_lut =
             read_matrix_from_multi_batch::<M>(params, dir, &format!("ggh15_lut_{}", lut_id), k)
                 .unwrap_or_else(|| panic!("k_lut (index {}) for lut {} not found", k, lut_id));
-        let k_dec = read_matrix_from_multi_batch::<M>(
-            params,
-            dir,
-            &format!("ggh15_kdec_gate {}", gate_id),
-            0,
-        )
-        .unwrap_or_else(|| panic!("decoder for gate {} not found", gate_id));
 
         let d_to_ggh = self.c_b0.clone() * k_to_ggh;
         let b_g1 = b_g.slice_rows(0, d);
@@ -511,7 +484,7 @@ mod test {
         let c_b0 = s_vec.clone() * &b0;
 
         // Storage directory
-        let dir_path = "test_data/test_ggh15_plt_eval";
+        let dir_path = "test_data/test_ggh15_plt_eval_single_input";
         let dir = Path::new(&dir_path);
         if !dir.exists() {
             fs::create_dir(dir).unwrap();

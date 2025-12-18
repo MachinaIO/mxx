@@ -4,7 +4,7 @@ use mxx::{
     circuit::PolyCircuit,
     gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly},
     lookup::{
-        lwe_eval::{LweBggEncodingPltEvaluator, LweBggPubKeyEvaluator},
+        lwe_eval::{LWEBGGEncodingPltEvaluator, LWEBGGPubKeyPltEvaluator},
         poly::PolyPltEvaluator,
     },
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
@@ -95,7 +95,7 @@ async fn test_arithmetic_circuit_operations() {
     let pk_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(seed, d);
     let pubkeys = pk_sampler.sample(&params, b"BGG_PUBKEY", &reveal_plaintexts);
 
-    let pk_evaluator = LweBggPubKeyEvaluator::<
+    let pk_evaluator = LWEBGGPubKeyPltEvaluator::<
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
         DCRTPolyTrapdoorSampler,
@@ -125,7 +125,7 @@ async fn test_arithmetic_circuit_operations() {
     let zero_plaintexts = vec![DCRTPoly::const_zero(&params); circuit.num_input()];
     let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &zero_plaintexts);
     let enc_evaluator =
-        LweBggEncodingPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::new(
+        LWEBGGEncodingPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::new(
             seed,
             tmp_dir.path().to_path_buf(),
             p,

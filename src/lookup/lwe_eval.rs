@@ -16,7 +16,7 @@ use std::{marker::PhantomData, path::PathBuf, sync::Arc};
 use tracing::{debug, info};
 
 #[derive(Debug)]
-pub struct LweBggPubKeyEvaluator<M, SH, ST>
+pub struct LWEBGGPubKeyPltEvaluator<M, SH, ST>
 where
     M: PolyMatrix,
     SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
@@ -31,7 +31,7 @@ where
     _st: PhantomData<ST>,
 }
 
-impl<M, SH, ST> PltEvaluator<BggPublicKey<M>> for LweBggPubKeyEvaluator<M, SH, ST>
+impl<M, SH, ST> PltEvaluator<BggPublicKey<M>> for LWEBGGPubKeyPltEvaluator<M, SH, ST>
 where
     M: PolyMatrix + Send + 'static,
     SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
@@ -62,7 +62,7 @@ where
     }
 }
 
-impl<M, SH, ST> LweBggPubKeyEvaluator<M, SH, ST>
+impl<M, SH, ST> LWEBGGPubKeyPltEvaluator<M, SH, ST>
 where
     M: PolyMatrix,
     SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
@@ -88,7 +88,7 @@ where
 }
 
 #[derive(Debug, Clone)]
-pub struct LweBggEncodingPltEvaluator<M, SH>
+pub struct LWEBGGEncodingPltEvaluator<M, SH>
 where
     M: PolyMatrix,
     SH: PolyHashSampler<[u8; 32], M = M>,
@@ -99,7 +99,7 @@ where
     _marker: PhantomData<SH>,
 }
 
-impl<M, SH> PltEvaluator<BggEncoding<M>> for LweBggEncodingPltEvaluator<M, SH>
+impl<M, SH> PltEvaluator<BggEncoding<M>> for LWEBGGEncodingPltEvaluator<M, SH>
 where
     M: PolyMatrix,
     SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
@@ -146,7 +146,7 @@ where
     }
 }
 
-impl<M, SH> LweBggEncodingPltEvaluator<M, SH>
+impl<M, SH> LWEBGGEncodingPltEvaluator<M, SH>
 where
     M: PolyMatrix,
     SH: PolyHashSampler<[u8; 32], M = M>,
@@ -226,7 +226,7 @@ mod test {
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         circuit::PolyCircuit,
         element::finite_ring::FinRingElem,
-        lookup::lwe_eval::LweBggEncodingPltEvaluator,
+        lookup::lwe_eval::LWEBGGEncodingPltEvaluator,
         matrix::dcrt_poly::DCRTPolyMatrix,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         sampler::{
@@ -304,7 +304,7 @@ mod test {
             fs::create_dir(dir).unwrap();
         }
         let plt_pubkey_evaluator =
-            LweBggPubKeyEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>, _>::new(
+            LWEBGGPubKeyPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>, _>::new(
                 key,
                 trapdoor_sampler,
                 Arc::new(b),
@@ -322,7 +322,7 @@ mod test {
         let result_pubkey = &result_pubkey[0];
 
         //Create an encoding evaluator
-        let plt_encoding_evaluator = LweBggEncodingPltEvaluator::<
+        let plt_encoding_evaluator = LWEBGGEncodingPltEvaluator::<
             DCRTPolyMatrix,
             DCRTPolyHashSampler<Keccak256>,
         >::new(key, dir_path.into(), c_b);

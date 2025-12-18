@@ -27,7 +27,7 @@ where
 }
 
 #[derive(Debug)]
-pub struct Ggh15BggPubKeyPltEvaluator<M, US, HS, TS>
+pub struct GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
 where
     M: PolyMatrix,
     US: PolyUniformSampler<M = M>,
@@ -54,7 +54,7 @@ where
     _ts: PhantomData<TS>,
 }
 
-impl<M, US, HS, TS> Ggh15BggPubKeyPltEvaluator<M, US, HS, TS>
+impl<M, US, HS, TS> GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
 where
     M: PolyMatrix,
     US: PolyUniformSampler<M = M>,
@@ -127,7 +127,7 @@ where
     }
 }
 
-impl<M, US, HS, TS> PltEvaluator<BggPublicKey<M>> for Ggh15BggPubKeyPltEvaluator<M, US, HS, TS>
+impl<M, US, HS, TS> PltEvaluator<BggPublicKey<M>> for GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
 where
     M: PolyMatrix + Send + Sync + 'static,
     US: PolyUniformSampler<M = M> + Send + Sync,
@@ -255,7 +255,7 @@ where
 }
 
 #[derive(Debug, Clone)]
-pub struct Ggh15BggEncodingPltEvaluator<M, HS>
+pub struct GGH15BGGEncodingPltEvaluator<M, HS>
 where
     M: PolyMatrix,
     HS: PolyHashSampler<[u8; 32], M = M>,
@@ -270,7 +270,7 @@ where
     _hs: PhantomData<HS>,
 }
 
-impl<M, HS> Ggh15BggEncodingPltEvaluator<M, HS>
+impl<M, HS> GGH15BGGEncodingPltEvaluator<M, HS>
 where
     M: PolyMatrix,
     HS: PolyHashSampler<[u8; 32], M = M>,
@@ -322,7 +322,7 @@ where
     }
 }
 
-impl<M, HS> PltEvaluator<BggEncoding<M>> for Ggh15BggEncodingPltEvaluator<M, HS>
+impl<M, HS> PltEvaluator<BggEncoding<M>> for GGH15BGGEncodingPltEvaluator<M, HS>
 where
     M: PolyMatrix + Send + Sync,
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
@@ -522,7 +522,7 @@ mod test {
 
         let error_sigma = 0.0;
         let insert_1_to_s = false;
-        let plt_pubkey_evaluator = Ggh15BggPubKeyPltEvaluator::<
+        let plt_pubkey_evaluator = GGH15BGGPubKeyPltEvaluator::<
             DCRTPolyMatrix,
             DCRTPolyUniformSampler,
             DCRTPolyHashSampler<Keccak256>,
@@ -549,7 +549,7 @@ mod test {
         assert_eq!(result_pubkey.len(), 1);
         let result_pubkey = &result_pubkey[0];
 
-        let plt_encoding_evaluator = Ggh15BggEncodingPltEvaluator::<
+        let plt_encoding_evaluator = GGH15BGGEncodingPltEvaluator::<
             DCRTPolyMatrix,
             DCRTPolyHashSampler<Keccak256>,
         >::new(
@@ -645,7 +645,7 @@ mod test {
 
         let error_sigma = 0.0;
         let insert_1_to_s = false;
-        let plt_pubkey_evaluator = Ggh15BggPubKeyPltEvaluator::<
+        let plt_pubkey_evaluator = GGH15BGGPubKeyPltEvaluator::<
             DCRTPolyMatrix,
             DCRTPolyUniformSampler,
             DCRTPolyHashSampler<Keccak256>,
@@ -667,7 +667,7 @@ mod test {
         wait_for_all_writes(dir.to_path_buf()).await.unwrap();
         assert_eq!(result_pubkey.len(), input_size);
 
-        let plt_encoding_evaluator = Ggh15BggEncodingPltEvaluator::<
+        let plt_encoding_evaluator = GGH15BGGEncodingPltEvaluator::<
             DCRTPolyMatrix,
             DCRTPolyHashSampler<Keccak256>,
         >::new(

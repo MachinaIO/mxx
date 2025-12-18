@@ -1,6 +1,7 @@
 use crate::{matrix::PolyMatrix, poly::Poly};
 
 pub mod hash;
+pub mod preimage_pool;
 pub mod trapdoor;
 pub mod uniform;
 

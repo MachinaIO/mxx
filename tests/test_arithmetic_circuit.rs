@@ -27,12 +27,12 @@ use tempfile::tempdir;
 async fn test_arithmetic_circuit_operations() {
     // Mixed operations in a single circuit: (a + b) * c - a.
     const P_MODULI_BITS: usize = 6;
-    const SCALE: u64 = 1 << 12;
-    const BASE_BITS: u32 = 13;
+    const SCALE: u64 = 1 << 6;
+    const BASE_BITS: u32 = 8;
     tracing_subscriber::fmt::init();
 
     // Use parameters where NestedRnsPoly is known to be correct.
-    let params = DCRTPolyParams::new(4, 6, 18, BASE_BITS);
+    let params = DCRTPolyParams::new(4096, 9, 24, BASE_BITS);
     let mut rng = rand::rng();
 
     let modulus = params.modulus();
@@ -85,7 +85,7 @@ async fn test_arithmetic_circuit_operations() {
     let tmp_dir = tempdir().unwrap();
     let seed: [u8; 32] = [0u8; 32];
     let d = 1usize;
-    let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, 1.0);
+    let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, 4.578);
     let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(&params, d);
     let trapdoor = Arc::new(trapdoor);
     let pub_matrix = Arc::new(pub_matrix);
@@ -121,7 +121,7 @@ async fn test_arithmetic_circuit_operations() {
     let p = s.clone() * pub_matrix.as_ref();
 
     let bgg_encoding_sampler =
-        BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
+        BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, Some(4.0));
     let zero_plaintexts = vec![DCRTPoly::const_zero(&params); circuit.num_input()];
     let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &zero_plaintexts);
     let enc_evaluator =

@@ -114,7 +114,7 @@ async fn test_arithmetic_circuit_operations_ggh15() {
         tmp_dir.path().to_path_buf(),
         insert_1_to_s,
     );
-    log_mem("starr pubkey evaluation");
+    log_mem("start pubkey evaluation");
     let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(pk_evaluator));
     log_mem("end pubkey evaluation");
     assert_eq!(pubkey_out.len(), 1);

@@ -1,6 +1,6 @@
-pub mod poly;
-// pub mod simple_eval;
+pub mod ggh15_eval;
 pub mod lwe_eval;
+pub mod poly;
 
 use crate::{
     circuit::gate::GateId,
@@ -10,7 +10,14 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 
 pub trait PltEvaluator<E: crate::circuit::evaluable::Evaluable>: Send + Sync {
-    fn public_lookup(&self, params: &E::Params, plt: &PublicLut<E::P>, input: E, id: GateId) -> E;
+    fn public_lookup(
+        &self,
+        params: &E::Params,
+        plt: &PublicLut<E::P>,
+        input: E,
+        gate_id: GateId,
+        lut_id: usize,
+    ) -> E;
 }
 
 #[derive(Debug, Clone)]

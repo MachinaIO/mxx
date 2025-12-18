@@ -171,6 +171,7 @@ impl PltEvaluator<WireNorm> for NormPltLweEvaluator {
         plt: &PublicLut<DCRTPoly>,
         input: WireNorm,
         _: GateId,
+        _: usize,
     ) -> WireNorm {
         let h_norm_bits = {
             let s = input

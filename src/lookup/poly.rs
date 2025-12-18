@@ -14,6 +14,7 @@ impl<P: Poly> PltEvaluator<P> for PolyPltEvaluator {
         plt: &PublicLut<P>,
         input: P,
         gate_id: GateId,
+        _: usize,
     ) -> P {
         // Input is assumed to be a constant polynomial; use its constant coefficient as the key.
         let const_coeff = input

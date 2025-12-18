@@ -42,10 +42,11 @@ where
         params: &<BggPublicKey<M> as Evaluable>::Params,
         plt: &PublicLut<<BggPublicKey<M> as Evaluable>::P>,
         input: BggPublicKey<M>,
-        id: GateId,
+        gate_id: GateId,
+        _: usize,
     ) -> BggPublicKey<M> {
         let row_size = input.matrix.row_size();
-        let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, id);
+        let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, gate_id);
         let buffer = preimage_all::<M, ST, _>(
             plt,
             params,
@@ -54,7 +55,7 @@ where
             &self.trapdoor,
             &input.matrix,
             &a_lt,
-            &id,
+            &gate_id,
         );
         add_lookup_buffer(buffer);
         BggPublicKey { matrix: a_lt, reveal_plaintext: true }
@@ -108,7 +109,8 @@ where
         params: &<BggEncoding<M> as Evaluable>::Params,
         plt: &PublicLut<<BggEncoding<M> as Evaluable>::P>,
         input: BggEncoding<M>,
-        id: GateId,
+        gate_id: GateId,
+        _: usize,
     ) -> BggEncoding<M> {
         let z = &input.plaintext.expect("the BGG encoding should revealed plaintext");
         let z_coeff = z
@@ -122,13 +124,18 @@ where
             .unwrap_or_else(|| panic!("{:?} is not exist in public lookup f", z.to_const_int()));
         debug!("Performing public lookup, k={k}");
         let row_size = input.pubkey.matrix.row_size();
-        let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, id);
+        let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, gate_id);
         let pubkey = BggPublicKey::new(a_lt, true);
         let l_k = timed_read(
-            &format!("L_{id}_{k}"),
+            &format!("L_{gate_id}_{k}"),
             || {
-                read_matrix_from_multi_batch::<M>(params, &self.dir_path, &format!("L_{id}"), k)
-                    .unwrap_or_else(|| panic!("Matrix with index {} not found in batch", k))
+                read_matrix_from_multi_batch::<M>(
+                    params,
+                    &self.dir_path,
+                    &format!("L_{gate_id}"),
+                    k,
+                )
+                .unwrap_or_else(|| panic!("Matrix with index {} not found in batch", k))
             },
             &mut std::time::Duration::default(),
         );

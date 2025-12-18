@@ -277,8 +277,8 @@ impl<P: Poly> PolyCircuit<P> {
         self.new_gate_generic(vec![input], PolyGateType::Rotate { shift })
     }
 
-    pub fn public_lookup_gate(&mut self, input: GateId, lookup_id: usize) -> GateId {
-        self.new_gate_generic(vec![input], PolyGateType::PubLut { lookup_id })
+    pub fn public_lookup_gate(&mut self, input: GateId, lut_id: usize) -> GateId {
+        self.new_gate_generic(vec![input], PolyGateType::PubLut { lut_id })
     }
 
     fn new_gate_generic(&mut self, inputs: Vec<GateId>, gate_type: PolyGateType) -> GateId {
@@ -498,18 +498,18 @@ impl<P: Poly> PolyCircuit<P> {
                         debug_mem("Rotate gate end");
                         result
                     }
-                    PolyGateType::PubLut { lookup_id } => {
+                    PolyGateType::PubLut { lut_id } => {
                         debug_mem("Public Lookup gate start");
                         let input = wires
                             .get(&gate.input_gates[0])
                             .expect("wire missing for Public Lookup")
                             .clone();
                         let lookup =
-                            self.lookups.get(lookup_id).expect("lookup table missing").as_ref();
+                            self.lookups.get(lut_id).expect("lookup table missing").as_ref();
                         let result = plt_evaluator
                             .as_ref()
                             .expect("public lookup evaluator missing")
-                            .public_lookup(params, lookup, input, gate_id);
+                            .public_lookup(params, lookup, input, gate_id, *lut_id);
                         debug_mem("Public Lookup gate end");
                         result
                     }

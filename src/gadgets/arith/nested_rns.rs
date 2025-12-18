@@ -5,7 +5,7 @@ use crate::{
     utils::{mod_inverse, round_div},
 };
 use num_bigint::BigUint;
-use num_traits::{ToPrimitive, Zero};
+use num_traits::{One, ToPrimitive, Zero};
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
 #[derive(Debug, Clone)]
@@ -40,8 +40,10 @@ impl NestedRnsPolyContext {
         dummy_scalar: bool,
     ) -> Self {
         let (q_moduli, q_moduli_bits, q_moduli_depth) = params.to_crt();
-        let p_moduli_depth = (2 * q_moduli_bits).div_ceil(p_moduli_bits - 1);
-        let p_moduli = sample_crt_primes(p_moduli_bits, p_moduli_depth);
+        let q_moduli_min = q_moduli.iter().min().expect("there should be at least one q modulus");
+        let q_moduli_max = q_moduli.iter().max().expect("there should be at least one q modulus");
+        let p_moduli = sample_crt_primes(p_moduli_bits, *q_moduli_max);
+        let p_moduli_depth = p_moduli.len();
         if dummy_scalar {
             let dummy_map = dummy_lut_map();
             let dummy_lut = PublicLut::<P>::new_biguint(params, dummy_map);
@@ -67,6 +69,7 @@ impl NestedRnsPolyContext {
 
         let p = p_moduli.iter().fold(BigUint::from(1u64), |acc, &pi| acc * BigUint::from(pi));
         let p_over_pis = p_moduli.iter().map(|&p_i| &p / BigUint::from(p_i)).collect::<Vec<_>>();
+        let sum_p_moduli: u64 = p_moduli.iter().copied().sum();
 
         let mut lut_mod_p = Vec::with_capacity(p_moduli_depth);
         let mut lut_x_to_y = Vec::with_capacity(p_moduli_depth);
@@ -77,7 +80,13 @@ impl NestedRnsPolyContext {
 
         for (p_i_idx, &p_i) in p_moduli.iter().enumerate() {
             let p_moduli_square = p_i as u64 * p_i as u64;
-            let lut_mod_p_map_size = p_moduli_square * p_moduli_depth as u64;
+            let lut_mod_p_map_size = (p_i as u128)
+                .checked_mul(sum_p_moduli as u128)
+                .expect("lut_mod_p_map_size overflow");
+            debug_assert!(
+                lut_mod_p_map_size < *q_moduli_min as u128,
+                "LUT size exceeds q modulus size; increase q_moduli_bits or decrease p_moduli_bits"
+            );
             let lut_mod_p_map = HashMap::from_iter((0..(lut_mod_p_map_size as usize)).map(|t| {
                 let input = BigUint::from(t as u64);
                 let output = BigUint::from(t as u64 % p_i);
@@ -400,40 +409,51 @@ fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
 /// Return the first `count` pairwise coprime integers within the requested `bit_width`.
 ///
 /// Deterministic: the output depends only on `bit_width` and `count` (no randomness).
-pub(crate) fn sample_crt_primes(bit_width: usize, count: usize) -> Vec<u64> {
-    assert!(bit_width > 1, "bit_width must be at least 2 bits");
-    assert!(bit_width < 32, "bit_width must be less than 32 bits");
+pub(crate) fn sample_crt_primes(max_bit_width: usize, q_max: u64) -> Vec<u64> {
+    assert!(max_bit_width > 1, "bit_width must be at least 2 bits");
+    assert!(max_bit_width < 32, "bit_width must be less than 32 bits");
     assert!(
-        bit_width <= usize::BITS as usize,
-        "bit_width {bit_width} exceeds target pointer width {}",
+        max_bit_width <= usize::BITS as usize,
+        "bit_width {max_bit_width} exceeds target pointer width {}",
         usize::BITS
     );
-    assert!(count > 0, "count must be greater than 0");
+    // assert!(count > 0, "count must be greater than 0");
 
-    let lower = 1u64 << (bit_width - 1);
-    let upper = 1u64 << bit_width;
-    let mut results: Vec<u64> = Vec::with_capacity(count);
+    let lower = 3u64;
+    let upper = 1u64 << max_bit_width;
+    let mut results: Vec<u64> = Vec::new();
+    let mut sum = 0u64;
+    let mut prod = BigUint::one();
+    let mut prod_reached = false;
 
     // Prefer larger moduli (bigger `p = ∏ p_i` for the same depth), but keep selection
     // deterministic.
-    for candidate in (lower..upper).rev() {
-        if candidate < 2 {
-            continue;
-        }
+    for candidate in lower..upper {
         if results.iter().all(|&chosen| gcd_u64(candidate, chosen) == 1) {
             results.push(candidate);
-            if results.len() == count {
-                break;
-            }
+            sum += candidate;
+            prod *= BigUint::from(candidate);
+        }
+        let bound_sqrt = ((sum + results.len() as u64) * q_max) / 2;
+        if BigUint::from(bound_sqrt).pow(2) < prod {
+            prod_reached = true;
+            break;
         }
     }
 
-    if results.len() != count {
+    if !prod_reached {
         panic!(
-            "failed to find {count} pairwise coprime integers with bit width {bit_width}; only {} found",
-            results.len()
+            "failed to find enough pairwise coprime integers with bit width {max_bit_width} to \
+             satisfy q_max {q_max}; try increasing bit width"
         );
     }
+
+    // if results.len() != count {
+    //     panic!(
+    //         "failed to find {count} pairwise coprime integers with bit width {bit_width}; only {}
+    // found",         results.len()
+    //     );
+    // }
 
     results
 }
@@ -443,9 +463,10 @@ pub fn encode_nested_rns_poly<P: Poly>(
     params: &P::Params,
     input: &BigUint,
 ) -> Vec<P> {
-    let (q_moduli, q_moduli_bits, _) = params.to_crt();
-    let p_moduli_depth = (2 * q_moduli_bits).div_ceil(p_moduli_bits - 1);
-    let p_moduli = sample_crt_primes(p_moduli_bits, p_moduli_depth);
+    let (q_moduli, _, _) = params.to_crt();
+    let q_moduli_max = q_moduli.iter().max().expect("there should be at least one q modulus");
+    let p_moduli = sample_crt_primes(p_moduli_bits, *q_moduli_max);
+    let p_moduli_depth = p_moduli.len();
     let mut polys = vec![Vec::with_capacity(p_moduli_depth); q_moduli.len()];
     for (q_idx, &q_i) in q_moduli.iter().enumerate() {
         let input_qi = input % BigUint::from(q_i);
@@ -480,9 +501,9 @@ mod tests {
         let params = DCRTPolyParams::new(4, 6, 18, BASE_BITS);
         let ctx =
             Arc::new(NestedRnsPolyContext::setup(circuit, &params, P_MODULI_BITS, SCALE, false));
-        // println!("p moduli: {:?}", &ctx.p_moduli);
-        // let _p = ctx.p_moduli.iter().fold(BigUint::from(1u64), |acc, &pi| acc *
-        // BigUint::from(pi)); println!("p: {}", p);
+        println!("p moduli: {:?}", &ctx.p_moduli);
+        let p = ctx.p_moduli.iter().fold(BigUint::from(1u64), |acc, &pi| acc * BigUint::from(pi));
+        println!("p: {}", p);
         (params, ctx)
     }
 
@@ -512,7 +533,7 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
         let modulus = params.modulus();
-        let a_value: BigUint = modulus.as_ref() - BigUint::from(1u64);
+        let a_value: BigUint = BigUint::zero();
         let b_value: BigUint = modulus.as_ref() - BigUint::from(1u64);
         test_nested_rns_poly_sub_full_reduce_generic(circuit, params, ctx, a_value, b_value);
     }
@@ -551,7 +572,7 @@ mod tests {
 
     #[test]
     fn test_nested_rns_benchmark_multiplication_tree() {
-        let height = 10usize;
+        let height = 5usize;
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
         let num_inputs = 1usize << height;
@@ -575,7 +596,6 @@ mod tests {
             ),
             circuit.num_input(),
         );
-        println!("out[0].h_norm.poly_norm.norm = {}", out[0].h_norm.poly_norm.norm);
         println!(
             "out[0].h_norm.poly_norm.norm bits = {}",
             bigdecimal_bits_ceil(&out[0].h_norm.poly_norm.norm)

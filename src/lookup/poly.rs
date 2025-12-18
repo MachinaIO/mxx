@@ -14,7 +14,7 @@ impl<P: Poly> PltEvaluator<P> for PolyPltEvaluator {
         plt: &PublicLut<P>,
         input: P,
         gate_id: GateId,
-        _: usize,
+        lut_id: usize,
     ) -> P {
         // Input is assumed to be a constant polynomial; use its constant coefficient as the key.
         let const_coeff = input
@@ -26,8 +26,8 @@ impl<P: Poly> PltEvaluator<P> for PolyPltEvaluator {
         let output_coeff = match plt.get(params, &const_coeff) {
             Some(outputs) => outputs.1,
             None => panic!(
-                "output of the lookup evaluation not found; gate_id: {:?}, input: {:?}",
-                gate_id, input
+                "output of the lookup evaluation not found; gate_id: {:?}, lut_id: {:?}, input: {:?}",
+                gate_id, lut_id, input
             ),
         };
 

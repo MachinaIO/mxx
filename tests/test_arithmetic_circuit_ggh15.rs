@@ -115,8 +115,9 @@ async fn test_arithmetic_circuit_operations_ggh15() {
         insert_1_to_s,
     );
     log_mem("start pubkey evaluation");
+    let start = std::time::Instant::now();
     let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(pk_evaluator));
-    log_mem("end pubkey evaluation");
+    log_mem(format!("end pubkey evaluation in {:?}", start.elapsed()));
     assert_eq!(pubkey_out.len(), 1);
     log_mem("wait for all writes");
     wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
@@ -139,8 +140,9 @@ async fn test_arithmetic_circuit_operations_ggh15() {
         seed, &params, tmp_dir.path().to_path_buf(), encodings[0].clone(), c_b0
     );
     log_mem("start encoding evaluation");
+    let start = std::time::Instant::now();
     let encoding_out = circuit.eval(&params, &encodings[0], &encodings[1..], Some(enc_evaluator));
-    log_mem("end encoding evaluation");
+    log_mem(format!("end encoding evaluation in {:?}", start.elapsed()));
     assert_eq!(encoding_out.len(), 1);
     assert_eq!(encoding_out[0].plaintext.as_ref().unwrap(), &DCRTPoly::const_zero(&params));
     assert_eq!(encoding_out[0].pubkey, pubkey_out[0]);

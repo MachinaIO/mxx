@@ -8,7 +8,7 @@ use crate::{
     parallel_iter,
     poly::{PolyParams, dcrt::params::DCRTPolyParams},
     sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
-    utils::{block_size, debug_mem},
+    utils::{block_size, debug_mem, log_mem},
 };
 use openfhe::ffi::{ExtractMatrixCols, FormatMatrixCoefficient, SampleP1ForPertMat};
 use rayon::iter::ParallelIterator;
@@ -144,7 +144,7 @@ fn sample_p1_for_pert_mat(
     FormatMatrixCoefficient(d_mat.inner.as_mut().unwrap());
     let d_mat_arc = Arc::new(d_mat);
     debug_mem("a_mat, b_mat, d_mat are converted to cpp matrices");
-
+    log_mem(format!("block_size {}", block_size));
     let p1_mat_blocks = parallel_iter!(0..num_blocks)
         .map(|i| {
             let end_col = min((i + 1) * block_size, padded_ncol);
@@ -154,6 +154,7 @@ fn sample_p1_for_pert_mat(
             debug_mem("tp2 is converted to cpp matrices");
             let ncol = end_col - i * block_size;
             let ncol_per_thread = ncol.div_ceil(num_threads_for_cpp);
+            log_mem(format!("ncol_per_thread {}", ncol_per_thread));
             let p1_blocks = parallel_iter!(0..ncol.div_ceil(ncol_per_thread))
                 .map(|j| {
                     let start_col = j * ncol_per_thread;

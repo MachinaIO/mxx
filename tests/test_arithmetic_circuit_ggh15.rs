@@ -13,8 +13,11 @@ use mxx::{
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
     sampler::{
-        DistType, PolyTrapdoorSampler, PolyUniformSampler, hash::DCRTPolyHashSampler,
-        trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
+        DistType, PolyTrapdoorSampler, PolyUniformSampler,
+        hash::DCRTPolyHashSampler,
+        preimage_pool::{PreimagePool, TrapdoorId},
+        trapdoor::DCRTPolyTrapdoorSampler,
+        uniform::DCRTPolyUniformSampler,
     },
     storage::write::{init_storage_system, wait_for_all_writes},
     utils::{gen_biguint_for_modulus, log_mem},
@@ -26,13 +29,13 @@ use tempfile::tempdir;
 #[tokio::test]
 async fn test_arithmetic_circuit_operations_ggh15() {
     // Mixed operations in a single circuit: (a + b) * c - a.
-    const P_MODULI_BITS: usize = 6;
+    const P_MODULI_BITS: usize = 5;
     const SCALE: u64 = 1 << 7;
-    const BASE_BITS: u32 = 8;
+    const BASE_BITS: u32 = 9;
     tracing_subscriber::fmt::init();
 
     // Use parameters where NestedRnsPoly is known to be correct.
-    let params = DCRTPolyParams::new(4, 3, 18, BASE_BITS);
+    let params = DCRTPolyParams::new(4, 3, 15, BASE_BITS);
     let mut rng = rand::rng();
 
     let modulus = params.modulus();
@@ -87,10 +90,18 @@ async fn test_arithmetic_circuit_operations_ggh15() {
     let d = 1usize;
     let trapdoor_sigma = 4.578;
     let error_sigma = 0.0;
-    let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, trapdoor_sigma);
+    let trapdoor_sampler = Arc::new(DCRTPolyTrapdoorSampler::new(&params, trapdoor_sigma));
     let (b0_trapdoor, b0_matrix) = trapdoor_sampler.trapdoor(&params, d);
-    let b0_trapdoor = Arc::new(b0_trapdoor);
     let b0_matrix = Arc::new(b0_matrix);
+    let preimage_pool =
+        Arc::new(PreimagePool::<DCRTPolyTrapdoorSampler>::new(tmp_dir.path(), None));
+    let b0_trapdoor_id = TrapdoorId::new("ggh15_b0");
+    preimage_pool.register_trapdoor(
+        b0_trapdoor_id.clone(),
+        Arc::clone(&trapdoor_sampler),
+        Arc::new(b0_trapdoor),
+        Arc::clone(&b0_matrix),
+    );
 
     init_storage_system();
     let reveal_plaintexts = vec![true; circuit.num_input()];
@@ -108,19 +119,20 @@ async fn test_arithmetic_circuit_operations_ggh15() {
         trapdoor_sigma,
         error_sigma,
         &params,
-        b0_matrix.clone(),
-        b0_trapdoor.clone(),
+        Arc::clone(&preimage_pool),
+        b0_trapdoor_id.clone(),
         pubkeys[0].clone(),
-        tmp_dir.path().to_path_buf(),
         insert_1_to_s,
     );
     log_mem("start pubkey evaluation");
+    let start = std::time::Instant::now();
     let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(pk_evaluator));
-    log_mem("end pubkey evaluation");
+    log_mem(&format!("end pubkey evaluation in {:?}", start.elapsed()));
     assert_eq!(pubkey_out.len(), 1);
     log_mem("wait for all writes");
+    let start = std::time::Instant::now();
     wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
-    log_mem("finish writing");
+    log_mem(&format!("finish writing in {:?}", start.elapsed()));
 
     // 3) BGG+ encoding evaluation.
     let uniform_sampler = DCRTPolyUniformSampler::new();
@@ -135,12 +147,20 @@ async fn test_arithmetic_circuit_operations_ggh15() {
     let enc_evaluator = GGH15BGGEncodingPltEvaluator::<
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
+        DCRTPolyTrapdoorSampler,
     >::new(
-        seed, &params, tmp_dir.path().to_path_buf(), encodings[0].clone(), c_b0
+        seed,
+        &params,
+        tmp_dir.path().to_path_buf(),
+        preimage_pool,
+        b0_trapdoor_id,
+        encodings[0].clone(),
+        c_b0,
     );
     log_mem("start encoding evaluation");
+    let start = std::time::Instant::now();
     let encoding_out = circuit.eval(&params, &encodings[0], &encodings[1..], Some(enc_evaluator));
-    log_mem("end encoding evaluation");
+    log_mem(&format!("end encoding evaluation in {:?}", start.elapsed()));
     assert_eq!(encoding_out.len(), 1);
     assert_eq!(encoding_out[0].plaintext.as_ref().unwrap(), &DCRTPoly::const_zero(&params));
     assert_eq!(encoding_out[0].pubkey, pubkey_out[0]);

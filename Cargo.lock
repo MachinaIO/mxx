@@ -519,7 +519,7 @@ checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 [[package]]
 name = "openfhe"
 version = "0.3.2"
-source = "git+https://github.com/MachinaIO/openfhe-rs.git#7654f31b6ff666e08cbe07a26c21d1bc011e872b"
+source = "git+https://github.com/MachinaIO/openfhe-rs.git?branch=feat%2Fimprove_gauss_samp_1219#65a76eab577a213c9fa4cf15c18d62dc6acd1fb3"
 dependencies = [
  "cxx",
  "cxx-build",

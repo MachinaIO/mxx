@@ -57,7 +57,7 @@ where
             &a_lt,
             &gate_id,
         );
-        add_lookup_buffer(buffer);
+        add_lookup_buffer(&self.dir_path, buffer);
         BggPublicKey { matrix: a_lt, reveal_plaintext: true }
     }
 }

@@ -422,20 +422,23 @@ pub(crate) fn sample_crt_primes(max_bit_width: usize, q_max: u64) -> Vec<u64> {
     let lower = 3u64;
     let upper = 1u64 << max_bit_width;
     let mut results: Vec<u64> = Vec::new();
-    let mut sum = 0u64;
+    // let mut sum = 0u64;
     let mut prod = BigUint::one();
     let mut prod_reached = false;
+    let q_max_squared = BigUint::from(q_max).pow(2);
 
     // Prefer larger moduli (bigger `p = ∏ p_i` for the same depth), but keep selection
     // deterministic.
     for candidate in lower..upper {
         if results.iter().all(|&chosen| gcd_u64(candidate, chosen) == 1) {
             results.push(candidate);
-            sum += candidate;
+            // sum += candidate;
             prod *= BigUint::from(candidate);
+        } else {
+            continue;
         }
-        let bound_sqrt = ((sum + results.len() as u64) * q_max) / 2;
-        if BigUint::from(bound_sqrt).pow(2) < prod {
+        // let bound = ((sum + results.len() as u64) * q_max) / 2;
+        if &q_max_squared * BigUint::from(candidate) < prod {
             prod_reached = true;
             break;
         }
@@ -444,7 +447,7 @@ pub(crate) fn sample_crt_primes(max_bit_width: usize, q_max: u64) -> Vec<u64> {
     if !prod_reached {
         panic!(
             "failed to find enough pairwise coprime integers with bit width {max_bit_width} to \
-             satisfy q_max {q_max}; try increasing bit width"
+             satisfy q_max {q_max}; try increasing bit width",
         );
     }
 
@@ -491,14 +494,14 @@ mod tests {
     };
     use bigdecimal::BigDecimal;
 
-    const P_MODULI_BITS: usize = 6;
-    const SCALE: u64 = 1 << 8;
-    const BASE_BITS: u32 = 6;
+    const P_MODULI_BITS: usize = 5;
+    const SCALE: u64 = 1 << 7;
+    const BASE_BITS: u32 = 8;
 
     fn create_test_context(
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> (DCRTPolyParams, Arc<NestedRnsPolyContext>) {
-        let params = DCRTPolyParams::new(4, 6, 18, BASE_BITS);
+        let params = DCRTPolyParams::new(4, 3, 15, BASE_BITS);
         let ctx =
             Arc::new(NestedRnsPolyContext::setup(circuit, &params, P_MODULI_BITS, SCALE, false));
         println!("p moduli: {:?}", &ctx.p_moduli);

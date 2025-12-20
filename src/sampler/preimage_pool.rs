@@ -1,12 +1,20 @@
-use crate::{matrix::PolyMatrix, poly::Poly, sampler::PolyTrapdoorSampler};
+use crate::{
+    matrix::PolyMatrix,
+    poly::Poly,
+    sampler::PolyTrapdoorSampler,
+    storage::{
+        read::read_matrix_from_multi_batch,
+        write::{add_lookup_buffer, get_lookup_buffer},
+    },
+    utils::log_mem,
+};
 use dashmap::{DashMap, DashSet};
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
+use digest::Digest;
+use keccak_asm::Keccak256;
 use std::{
     collections::HashMap,
     fmt::Debug,
     hash::{Hash, Hasher},
-    ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -66,41 +74,33 @@ where
 
 #[derive(Clone, Debug)]
 pub struct FlushedPreimageBatch {
-    /// Directory written for this trapdoor: `dir_path/<trapdoor_id>/`.
-    pub trapdoor_dir: PathBuf,
-    /// Bytes file written for this trapdoor.
-    pub bytes_path: PathBuf,
-    /// Metadata file written for this trapdoor.
-    pub meta_path: PathBuf,
-    /// Sorted request ids written under `trapdoor_dir` as:
-    /// - a single `<bytes_path>` containing all compact bytes concatenated
-    /// - a single `<meta_path>` containing the per-id byte ranges
+    pub trapdoor_id: TrapdoorId,
+    pub id_prefix: String,
     pub ids: Vec<String>,
+    pub indices: Vec<usize>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PreimageSliceMetadata {
-    pub start: usize,
-    pub end: usize, // exclusive
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PreimageBatchMetadata {
-    pub format_version: u32,
-    pub trapdoor_id: String,
-    pub total_bytes: usize,
-    /// Map: `id -> (start,end)` within `preimages.bin`.
-    pub entries: HashMap<String, PreimageSliceMetadata>,
+fn request_index(id: &str) -> usize {
+    let digest = Keccak256::digest(id.as_bytes());
+    let mut first8 = [0u8; 8];
+    first8.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(first8) as usize
 }
 
 /// A thread-safe request pool that batches many preimage computations by concatenating target
 /// matrices column-wise, computing one preimage, then slicing the result back into per-request
 /// chunks.
 ///
+/// Storage format:
+/// - One lookup table per `trapdoor_id`, stored via `storage::write` using:
+///   - `id_prefix = trapdoor_id`
+///   - `target_k = keccak64(request.id)`
+///
 /// Notes:
 /// - This batching changes the joint distribution of sampled preimages across columns (they become
 ///   correlated). If you require independent samples per target, do not batch.
 /// - `flush()` must be called after all enqueues, typically after circuit evaluation completes.
+/// - The storage system must be initialized via `storage::write::init_storage_system()`.
 pub struct PreimagePool<TS>
 where
     TS: PolyTrapdoorSampler + Send + Sync,
@@ -112,10 +112,19 @@ where
     max_batch_cols: Option<usize>,
 }
 
+impl<TS> Debug for PreimagePool<TS>
+where
+    TS: PolyTrapdoorSampler + Send + Sync,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreimagePool").field("dir_path", &self.dir_path).finish()
+    }
+}
+
 impl<TS> Default for PreimagePool<TS>
 where
     TS: PolyTrapdoorSampler + Send + Sync,
-    TS::M: PolyMatrix,
+    TS::M: PolyMatrix + Send + Sync + 'static,
 {
     fn default() -> Self {
         Self::new(PathBuf::from("."), None)
@@ -125,7 +134,7 @@ where
 impl<TS> PreimagePool<TS>
 where
     TS: PolyTrapdoorSampler + Send + Sync,
-    TS::M: PolyMatrix,
+    TS::M: PolyMatrix + Send + Sync + 'static,
 {
     pub fn new<P: AsRef<Path>>(dir_path: P, max_batch_cols: Option<usize>) -> Self {
         Self {
@@ -135,6 +144,10 @@ where
             seen: DashSet::new(),
             max_batch_cols,
         }
+    }
+
+    pub fn dir_path(&self) -> &Path {
+        &self.dir_path
     }
 
     /// Register a (sampler, trapdoor, public matrix) tuple for a specific trapdoor id.
@@ -152,11 +165,6 @@ where
     }
 
     /// Enqueue a target matrix to be preimaged under `trapdoor_id`.
-    ///
-    /// `id` identifies which segment within the eventual batched preimage corresponds to this
-    /// target matrix. During `flush`, requests are sorted by `id` (ascending), targets are
-    /// concatenated in that order, and the corresponding preimage slice is written to:
-    /// `dir_path/<trapdoor_id>/preimages.bin` (indexed by `preimages.json`).
     ///
     /// Returns true if the request was newly enqueued (deduplicated by trapdoor_id + id).
     pub fn enqueue<S: Into<String>>(&self, trapdoor_id: &TrapdoorId, id: S, target: TS::M) -> bool {
@@ -178,27 +186,18 @@ where
         true
     }
 
-    /// Flush all queued requests, returning a map:
-    ///   `trapdoor_id -> { trapdoor_dir, ids }`.
-    ///
-    /// File writes are scheduled concurrently, and this function does not return until all writes
-    /// (across all trapdoors) complete.
-    pub async fn flush(
+    /// Compute all queued preimages and enqueue them into the storage system as lookup tables.
+    pub fn flush(
         &self,
         params: &<<TS::M as PolyMatrix>::P as Poly>::Params,
     ) -> HashMap<TrapdoorId, FlushedPreimageBatch> {
         let mut out: HashMap<TrapdoorId, FlushedPreimageBatch> = HashMap::new();
-        let mut write_handles: Vec<tokio::task::JoinHandle<Result<(), String>>> = Vec::new();
-
-        std::fs::create_dir_all(&self.dir_path).unwrap_or_else(|e| {
-            panic!("failed to create preimage pool dir {:?}: {e}", self.dir_path)
-        });
 
         // Drain queues. We snapshot keys first to avoid holding a map lock across expensive work.
         let trapdoor_ids: Vec<TrapdoorId> = self.queues.iter().map(|e| e.key().clone()).collect();
 
         for trapdoor_id in trapdoor_ids {
-            // Clone context out of the DashMap guard so we can `await` later without holding locks.
+            // Clone context out of the DashMap guard so we can do expensive work without locks.
             let (sampler, trapdoor, public_matrix) = {
                 let ctx = self.contexts.get(&trapdoor_id).unwrap_or_else(|| {
                     panic!("trapdoor not registered for {}", trapdoor_id.as_str())
@@ -215,114 +214,95 @@ where
                 continue;
             }
 
-            let mut reqs = pending;
-            reqs.sort_by(|a, b| a.id.cmp(&b.id));
+            // Keep large temporaries (requests/targets/preimage matrices) scoped so they can be
+            // dropped before we enqueue the (much smaller) serialized lookup buffer for I/O.
+            let (buffer, ids, indices) = {
+                let mut reqs = pending;
+                reqs.sort_by(|a, b| a.id.cmp(&b.id));
 
-            let total_cols: usize = reqs.iter().map(|r| r.ncol).sum();
-            if let Some(limit) = self.max_batch_cols {
-                assert!(
-                    total_cols <= limit,
-                    "preimage batch for {} has {total_cols} cols > limit {limit}; consider increasing max_batch_cols or flushing more frequently",
-                    trapdoor_id.as_str()
+                let total_cols: usize = reqs.iter().map(|r| r.ncol).sum();
+                if let Some(limit) = self.max_batch_cols {
+                    assert!(
+                        total_cols <= limit,
+                        "preimage batch for {} has {total_cols} cols > limit {limit}; consider increasing max_batch_cols or flushing more frequently",
+                        trapdoor_id.as_str()
+                    );
+                }
+
+                let targets_refs: Vec<&TS::M> = reqs.iter().map(|r| &r.target).collect();
+                let target_all = targets_refs[0].concat_columns(&targets_refs[1..]);
+                log_mem(format!(
+                    "start preimage sampling for {} with {} cols",
+                    trapdoor_id.as_str(),
+                    total_cols,
+                ));
+                let start = std::time::Instant::now();
+                let preimage_all = sampler.preimage(
+                    params,
+                    trapdoor.as_ref(),
+                    public_matrix.as_ref(),
+                    &target_all,
                 );
-            }
+                log_mem(format!(
+                    "finished preimage sampling for {} with {} cols in {:?}",
+                    trapdoor_id.as_str(),
+                    total_cols,
+                    start.elapsed()
+                ));
 
-            let targets_refs: Vec<&TS::M> = reqs.iter().map(|r| &r.target).collect();
-            let target_all = targets_refs[0].concat_columns(&targets_refs[1..]);
-            let preimage_all =
-                sampler.preimage(params, trapdoor.as_ref(), public_matrix.as_ref(), &target_all);
+                // No longer need the concatenated target.
+                drop(target_all);
+                drop(targets_refs);
 
-            // 1) Enumerate per-id column ranges in a deterministic serial pass.
-            let mut spans: Vec<(String, Range<usize>)> = Vec::with_capacity(reqs.len());
-            let mut col_offset = 0usize;
-            for req in &reqs {
-                let col_start = col_offset;
-                let col_end = col_offset + req.ncol;
-                col_offset = col_end;
-                spans.push((req.id.to_string(), col_start..col_end));
-            }
-            debug_assert_eq!(col_offset, total_cols, "batched column accounting mismatch");
+                // Slice back into per-request matrices.
+                let mut col_offset = 0usize;
+                let mut used_indices: HashMap<usize, String> = HashMap::with_capacity(reqs.len());
+                let mut ids: Vec<String> = Vec::with_capacity(reqs.len());
+                let mut preimages: Vec<(usize, TS::M)> = Vec::with_capacity(reqs.len());
+                for req in &reqs {
+                    let col_start = col_offset;
+                    let col_end = col_offset + req.ncol;
+                    col_offset = col_end;
 
-            // 2) Convert each slice into compact bytes in parallel (order-preserving collect).
-            let slice_bytes: Vec<Vec<u8>> = spans
-                .par_iter()
-                .map(|(_, col_range)| {
-                    let slice = preimage_all.slice_columns(col_range.start, col_range.end);
-                    slice.to_compact_bytes()
-                })
-                .collect();
+                    let idx = request_index(&req.id);
+                    if let Some(prev) = used_indices.insert(idx, req.id.clone()) {
+                        panic!(
+                            "keccak index collision for trapdoor {}: {} and {} both map to {}",
+                            trapdoor_id.as_str(),
+                            prev,
+                            req.id,
+                            idx
+                        );
+                    }
+                    ids.push(req.id.clone());
 
-            // Pack slices into a single bytes buffer and compute per-id byte ranges.
-            let ids: Vec<String> = spans.iter().map(|(id, _)| id.clone()).collect();
-            let total_bytes: usize = slice_bytes.iter().map(|b| b.len()).sum();
-            let mut bytes: Vec<u8> = Vec::with_capacity(total_bytes);
-            let mut entries: HashMap<String, PreimageSliceMetadata> =
-                HashMap::with_capacity(ids.len());
+                    let slice = preimage_all.slice_columns(col_start, col_end);
+                    preimages.push((idx, slice));
+                }
+                debug_assert_eq!(col_offset, total_cols, "batched column accounting mismatch");
 
-            let mut offset = 0usize;
-            for ((id, _), b) in spans.into_iter().zip(slice_bytes.into_iter()) {
-                let start = offset;
-                bytes.extend_from_slice(&b);
-                offset += b.len();
-                entries.insert(id, PreimageSliceMetadata { start, end: offset });
-            }
-            debug_assert_eq!(offset, total_bytes);
+                // Drop large data before serializing to bytes (reduces peak memory usage).
+                drop(used_indices);
+                drop(preimage_all);
+                drop(reqs);
 
-            // Write as one file per trapdoor:
-            //   dir_path/<trapdoor_id>/preimages.bin
-            //   dir_path/<trapdoor_id>/preimages.json
-            let trapdoor_dir = self.dir_path.join(trapdoor_id.as_str());
-            std::fs::create_dir_all(&trapdoor_dir).unwrap_or_else(|e| {
-                panic!("failed to create trapdoor output dir {:?}: {e}", trapdoor_dir)
-            });
-
-            let bytes_path = trapdoor_dir.join("preimages.bin");
-            let meta_path = trapdoor_dir.join("preimages.json");
-            let bytes_path_task = bytes_path.clone();
-            let meta_path_task = meta_path.clone();
-
-            let trapdoor_id_str = trapdoor_id.as_str().to_string();
-            let meta = PreimageBatchMetadata {
-                format_version: 1,
-                trapdoor_id: trapdoor_id_str,
-                total_bytes: bytes.len(),
-                entries,
+                let buffer = get_lookup_buffer(preimages, trapdoor_id.as_str());
+                let indices = buffer.indices.clone();
+                (buffer, ids, indices)
             };
-            let meta_bytes =
-                serde_json::to_vec_pretty(&meta).expect("failed to serialize preimage metadata");
 
-            write_handles.push(tokio::spawn(async move {
-                let (w1, w2) = tokio::join!(
-                    tokio::fs::write(&bytes_path_task, bytes),
-                    tokio::fs::write(&meta_path_task, meta_bytes)
-                );
-                if let Err(e) = w1 {
-                    return Err(format!(
-                        "failed to write preimage bytes to {:?}: {e}",
-                        bytes_path_task
-                    ));
-                }
-                if let Err(e) = w2 {
-                    return Err(format!(
-                        "failed to write preimage metadata to {:?}: {e}",
-                        meta_path_task
-                    ));
-                }
-                Ok(())
-            }));
-
-            out.insert(
-                trapdoor_id,
-                FlushedPreimageBatch { trapdoor_dir, bytes_path, meta_path, ids },
+            let ok = add_lookup_buffer(&self.dir_path, buffer);
+            assert!(
+                ok,
+                "failed to add lookup buffer for {}; did you call init_storage_system()?",
+                trapdoor_id.as_str()
             );
-        }
 
-        for h in write_handles {
-            match h.await {
-                Ok(Ok(())) => {}
-                Ok(Err(msg)) => panic!("{msg}"),
-                Err(e) => panic!("preimage write task failed: {e}"),
-            }
+            let id_prefix = trapdoor_id.as_str().to_string();
+            out.insert(
+                trapdoor_id.clone(),
+                FlushedPreimageBatch { trapdoor_id: trapdoor_id.clone(), id_prefix, ids, indices },
+            );
         }
 
         // Reset dedup state after flushing.
@@ -331,9 +311,9 @@ where
         out
     }
 
-    /// Read a previously flushed preimage from:
-    /// - `dir_path/<trapdoor_id>/preimages.json` (metadata)
-    /// - `dir_path/<trapdoor_id>/preimages.bin` (compact bytes)
+    /// Read a previously flushed preimage from the storage directory using:
+    /// - `id_prefix = trapdoor_id`
+    /// - `target_k = keccak64(id)`
     pub fn read_preimage<S: AsRef<str>>(
         &self,
         params: &<<TS::M as PolyMatrix>::P as Poly>::Params,
@@ -341,42 +321,15 @@ where
         id: S,
     ) -> TS::M {
         let id = id.as_ref();
-        let trapdoor_dir = self.dir_path.join(trapdoor_id.as_str());
-
-        let meta_path = trapdoor_dir.join("preimages.json");
-        let meta_bytes = std::fs::read(&meta_path).unwrap_or_else(|e| {
-            panic!("failed to read preimage metadata from {:?}: {e}", meta_path)
-        });
-        let meta: PreimageBatchMetadata = serde_json::from_slice(&meta_bytes).unwrap_or_else(|e| {
-            panic!("failed to deserialize preimage metadata from {:?}: {e}", meta_path)
-        });
-        assert_eq!(meta.format_version, 1, "unsupported preimage format_version");
-        assert_eq!(meta.trapdoor_id, trapdoor_id.as_str(), "preimage trapdoor_id mismatch");
-
-        let entry = meta.entries.get(id).unwrap_or_else(|| {
-            panic!("preimage id not found in metadata: {}/{}", trapdoor_id.as_str(), id)
-        });
-        assert!(
-            entry.start <= entry.end && entry.end <= meta.total_bytes,
-            "invalid byte slice range in metadata"
-        );
-
-        let bytes_path = trapdoor_dir.join("preimages.bin");
-        let mut f = std::fs::File::open(&bytes_path)
-            .unwrap_or_else(|e| panic!("failed to open preimage bytes file {:?}: {e}", bytes_path));
-        let len = entry.end - entry.start;
-        let mut buf = vec![0u8; len];
-        use std::io::{Read, Seek, SeekFrom};
-        f.seek(SeekFrom::Start(entry.start as u64)).unwrap_or_else(|e| {
-            panic!("failed to seek preimage bytes file {:?} to {}: {e}", bytes_path, entry.start)
-        });
-        f.read_exact(&mut buf).unwrap_or_else(|e| {
-            panic!(
-                "failed to read preimage bytes file {:?} [{}, {}): {e}",
-                bytes_path, entry.start, entry.end
-            )
-        });
-
-        TS::M::from_compact_bytes(params, &buf)
+        let k = request_index(id);
+        read_matrix_from_multi_batch::<TS::M>(params, &self.dir_path, trapdoor_id.as_str(), k)
+            .unwrap_or_else(|| {
+                panic!(
+                    "preimage not found; trapdoor_id: {}, id: {}, target_k: {}",
+                    trapdoor_id.as_str(),
+                    id,
+                    k
+                )
+            })
     }
 }

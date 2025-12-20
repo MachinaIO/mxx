@@ -128,53 +128,25 @@ pub struct MultiBatchLookupBuffer {
 
 static WRITE_HANDLES: OnceLock<Arc<Mutex<Vec<JoinHandle<()>>>>> = OnceLock::new();
 static RUNTIME_HANDLE: OnceLock<tokio::runtime::Handle> = OnceLock::new();
-static LOOKUP_BUFFERS: OnceLock<Arc<Mutex<MultiBatchLookupBuffer>>> = OnceLock::new();
+
+#[derive(Debug, Default)]
+struct DirIndexState {
+    next_file_index: usize,
+    global_index: GlobalTableIndex,
+}
+
+static DIR_INDEX_STATES: OnceLock<Arc<Mutex<HashMap<PathBuf, DirIndexState>>>> = OnceLock::new();
+
+fn lut_bytes_limit() -> Option<usize> {
+    std::env::var("LUT_BYTES_LIMIT").ok().and_then(|s| s.parse::<usize>().ok())
+}
 
 /// Initialize the storage system with an optional byte limit for batched lookup tables.
 pub fn init_storage_system() {
     let _ = WRITE_HANDLES.get_or_init(|| Arc::new(Mutex::new(Vec::new())));
     let _ = RUNTIME_HANDLE.get_or_init(|| tokio::runtime::Handle::current());
-    let _ = LOOKUP_BUFFERS.get_or_init(|| {
-        let bytes_limit =
-            std::env::var("LUT_BYTES_LIMIT").ok().and_then(|s| s.parse::<usize>().ok());
-        info!("LUT_BYTES_LIMIT={:?}", bytes_limit);
-        let buffer = if let Some(limit) = bytes_limit {
-            MultiBatchLookupBuffer::with_limit(limit)
-        } else {
-            MultiBatchLookupBuffer::new()
-        };
-        Arc::new(Mutex::new(buffer))
-    });
-}
-
-/// Split a MultiBatchLookupBuffer into multiple buffers based on byte limit.
-fn split_buffers_by_limit(
-    multi_buffer: &MultiBatchLookupBuffer,
-    bytes_limit: usize,
-) -> Vec<MultiBatchLookupBuffer> {
-    let mut result = Vec::new();
-    let mut current_buffer = MultiBatchLookupBuffer::with_limit(bytes_limit);
-
-    for batch in &multi_buffer.lookup_tables {
-        let batch_size = batch.data.len();
-
-        // If this batch would exceed the limit and we already have some batches, start a new buffer
-        if current_buffer.would_exceed_limit(batch_size) && !current_buffer.lookup_tables.is_empty()
-        {
-            result.push(current_buffer);
-            current_buffer = MultiBatchLookupBuffer::with_limit(bytes_limit);
-        }
-
-        // Add the batch to the current buffer
-        current_buffer.add_batch(batch.clone());
-    }
-
-    // Add the last buffer if it has content
-    if !current_buffer.lookup_tables.is_empty() {
-        result.push(current_buffer);
-    }
-
-    result
+    let _ = DIR_INDEX_STATES.get_or_init(|| Arc::new(Mutex::new(HashMap::new())));
+    info!("LUT_BYTES_LIMIT={:?}", lut_bytes_limit());
 }
 
 fn preprocess_matrix_for_storage<M>(matrix: M, id: &str) -> SerializedMatrix
@@ -221,15 +193,6 @@ impl MultiBatchLookupBuffer {
     pub fn add_batch(&mut self, batch: BatchLookupBuffer) {
         self.total_size += batch.data.len() + 32;
         self.lookup_tables.push(batch);
-    }
-
-    /// Check if adding a batch would exceed the byte limit.
-    pub fn would_exceed_limit(&self, batch_size: usize) -> bool {
-        if let Some(limit) = self.bytes_limit {
-            self.total_size + batch_size + 32 > limit
-        } else {
-            false
-        }
     }
 
     /// Serialize all batches into a single buffer with an index for O(1) access.
@@ -318,39 +281,77 @@ impl MultiBatchLookupBuffer {
 /// Add a batch lookup buffer to the global collection.
 /// If the buffer exceeds the limit, it will be split into smaller chunks.
 /// Returns true if at least one buffer was added successfully.
-pub fn add_lookup_buffer(buffer: BatchLookupBuffer) -> bool {
-    if let Some(buffers) = LOOKUP_BUFFERS.get() {
-        let mut guard = buffers.lock().unwrap();
+pub fn add_lookup_buffer(dir_path: &Path, buffer: BatchLookupBuffer) -> bool {
+    let Some(dir_index_states) = DIR_INDEX_STATES.get() else {
+        eprintln!("Warning: Storage system not initialized, cannot store lookup buffer");
+        return false;
+    };
 
-        // Check if adding this buffer would exceed the limit
-        if guard.would_exceed_limit(buffer.data.len()) {
-            if let Some(limit) = guard.bytes_limit {
-                let split_buffers = buffer.split_by_size(limit);
-                if split_buffers.len() > 1 {
-                    log_mem(format!(
-                        "Split oversized lookup buffer {} into {} parts",
-                        buffer.id_prefix,
-                        split_buffers.len()
+    if let Err(e) = std::fs::create_dir_all(dir_path) {
+        eprintln!(
+            "Warning: failed to create storage dir {}: {}",
+            dir_path.display(),
+            e
+        );
+        return false;
+    }
+
+    let buffers = if let Some(limit) = lut_bytes_limit() {
+        buffer.split_by_size(limit)
+    } else {
+        vec![buffer]
+    };
+
+    for split_buffer in buffers {
+        let mut multi_buffer = MultiBatchLookupBuffer::new();
+        multi_buffer.add_batch(split_buffer);
+
+        let (file_index, filename, index_entries) = {
+            let mut guard = dir_index_states.lock().unwrap();
+            let state = guard.entry(dir_path.to_path_buf()).or_default();
+            let file_index = state.next_file_index;
+            state.next_file_index += 1;
+            let entries = build_index_for_file(&multi_buffer, file_index);
+            (file_index, format!("lookup_tables_batch_{}.bin", file_index), entries)
+        };
+
+        {
+            let mut guard = dir_index_states.lock().unwrap();
+            let state = guard.entry(dir_path.to_path_buf()).or_default();
+            for (id_prefix, entry) in index_entries {
+                state.global_index.entries.insert(id_prefix, entry);
+            }
+        }
+
+        if let (Some(handles), Some(rt_handle)) = (WRITE_HANDLES.get(), RUNTIME_HANDLE.get()) {
+            let dir = dir_path.to_path_buf();
+            let write_handle = rt_handle.spawn(async move {
+                if let Err(e) = multi_buffer.write_to_file(dir.clone(), filename.clone()).await {
+                    eprintln!(
+                        "Failed to write batched lookup tables {} in {}: {}",
+                        filename,
+                        dir.display(),
+                        e
+                    );
+                } else {
+                    debug_mem(format!(
+                        "Finished write for lookup_tables_batch_{}.bin ({} tables)",
+                        file_index, 1usize
                     ));
                 }
-                let mut added_any = false;
-                for split_buffer in split_buffers {
-                    guard.add_batch(split_buffer);
-                    added_any = true;
-                }
-                added_any
-            } else {
-                guard.add_batch(buffer);
-                true
-            }
+            });
+            handles.lock().unwrap().push(write_handle);
         } else {
-            guard.add_batch(buffer);
-            true
+            eprintln!("Warning: Storage system not initialized, falling back to blocking write");
+            let path = dir_path.join(&filename);
+            let data = multi_buffer.to_bytes();
+            if let Err(e) = std::fs::write(&path, &data) {
+                eprintln!("Failed to write {}: {}", path.display(), e);
+            }
         }
-    } else {
-        eprintln!("Warning: Storage system not initialized, cannot store lookup buffer");
-        false
     }
+
+    true
 }
 
 /// Batch serialize and store multiple matrices in a single file.
@@ -530,65 +531,6 @@ async fn write_global_index(index: &GlobalTableIndex, path: &Path) -> Result<(),
 pub async fn wait_for_all_writes(
     dir_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let bytes_limit = std::env::var("LUT_BYTES_LIMIT").ok().and_then(|s| s.parse::<usize>().ok());
-    info!("LUT_BYTES_LIMIT={:?}", bytes_limit);
-    if let Some(buffers) = LOOKUP_BUFFERS.get() {
-        let multi_buffer = {
-            let mut guard = buffers.lock().unwrap();
-            std::mem::take(&mut *guard)
-        };
-
-        if !multi_buffer.lookup_tables.is_empty() {
-            log_mem(format!("Writing {} batched lookup tables", multi_buffer.lookup_tables.len()));
-
-            let mut global_index = GlobalTableIndex::default();
-
-            if let Some(limit) = bytes_limit {
-                // Split into multiple files based on byte limit
-                let file_groups = split_buffers_by_limit(&multi_buffer, limit);
-                log_mem(format!(
-                    "Split into {} files with byte limit {}",
-                    file_groups.len(),
-                    limit
-                ));
-
-                for (i, group) in file_groups.into_iter().enumerate() {
-                    // Build index entries for this file
-                    let file_index_entries = build_index_for_file(&group, i);
-                    for (id_prefix, entry) in file_index_entries {
-                        global_index.entries.insert(id_prefix, entry);
-                    }
-
-                    let filename = format!("lookup_tables_batch_{}.bin", i);
-                    if let Err(e) = group.write_to_file(dir_path.clone(), filename.clone()).await {
-                        eprintln!("Failed to write batched lookup tables {}: {}", filename, e);
-                    }
-                }
-            } else {
-                log_mem("No LUT_BYTES_LIMIT set - writing all buffers to single file");
-                let file_index_entries = build_index_for_file(&multi_buffer, 0);
-                for (id_prefix, entry) in file_index_entries {
-                    global_index.entries.insert(id_prefix, entry);
-                }
-                let filename = "lookup_tables_batch_0.bin".to_string();
-                if let Err(e) = multi_buffer.write_to_file(dir_path.clone(), filename.clone()).await
-                {
-                    eprintln!("Failed to write batched lookup tables {}: {}", filename, e);
-                }
-            }
-
-            // Write the global index
-            let index_path = dir_path.join("lookup_tables.index");
-            if let Err(e) = write_global_index(&global_index, &index_path).await {
-                eprintln!("Failed to write global index: {}", e);
-            } else {
-                log_mem(format!(
-                    "Global index written with {} entries",
-                    global_index.entries.len()
-                ));
-            }
-        }
-    }
     let handles = WRITE_HANDLES.get().ok_or("Storage system not initialized")?;
     let handles_vec: Vec<JoinHandle<()>> = {
         let mut guard = handles.lock().unwrap();
@@ -600,6 +542,26 @@ pub async fn wait_for_all_writes(
             eprintln!("Write task failed: {e}");
         }
     }
+
+    if let Some(dir_index_states) = DIR_INDEX_STATES.get() {
+        let index = {
+            let mut guard = dir_index_states.lock().unwrap();
+            guard.remove(&dir_path).map(|s| s.global_index)
+        };
+
+        if let Some(global_index) = index {
+            let index_path = dir_path.join("lookup_tables.index");
+            if let Err(e) = write_global_index(&global_index, &index_path).await {
+                eprintln!("Failed to write global index: {}", e);
+            } else {
+                log_mem(format!(
+                    "Global index written with {} entries",
+                    global_index.entries.len()
+                ));
+            }
+        }
+    }
+
     log_mem("All writes completed");
     Ok(())
 }

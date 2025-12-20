@@ -4,11 +4,15 @@ use crate::{
     lookup::{PltEvaluator, PublicLut},
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
-    sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
+    sampler::{
+        DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler,
+        preimage_pool::{PreimagePool, TrapdoorId},
+    },
     storage::{
         read::read_matrix_from_multi_batch,
         write::{add_lookup_buffer, get_lookup_buffer},
     },
+    utils::log_mem,
 };
 use rayon::prelude::*;
 use std::{
@@ -18,29 +22,29 @@ use std::{
     sync::{Arc, Mutex},
     time::Instant,
 };
-use tracing::info;
 
 #[derive(Debug)]
 pub struct GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
 where
-    M: PolyMatrix,
-    US: PolyUniformSampler<M = M>,
-    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
-    TS: PolyTrapdoorSampler<M = M> + Send + Sync,
+    M: PolyMatrix + Send + Sync + 'static,
+    US: PolyUniformSampler<M = M> + Send + Sync + 'static,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync + 'static,
+    TS: PolyTrapdoorSampler<M = M> + Send + Sync + 'static,
 {
+    pub params: <M::P as Poly>::Params,
     pub hash_key: [u8; 32],
     pub trapdoor_sigma: f64,
     pub error_sigma: f64,
-    pub b0_matrix: Arc<M>,
-    pub b0_trapdoor: Arc<TS::Trapdoor>,
-    pub b1_matrix: Arc<M>,              // B in the spec
-    pub b1_trapdoor: Arc<TS::Trapdoor>, // trapdoor of B
+    pub trap_sampler: Arc<TS>,
+    pub preimage_pool: Arc<PreimagePool<TS>>,
+    pub b0_trapdoor_id: TrapdoorId,
+    pub b1_trapdoor_id: TrapdoorId,
+    pub b1_matrix: Arc<M>,
     pub pubkey_1: BggPublicKey<M>,
     pub a_x_prime: Arc<M>,
     pub a_l_prime: Arc<M>,
     pub a_s_prime: Arc<M>,
     pub a_out_prime: Arc<M>,
-    pub dir_path: PathBuf,
     pub insert_1_to_s: bool,
     lut_ready: Arc<Mutex<HashSet<usize>>>,
     _us: PhantomData<US>,
@@ -50,24 +54,23 @@ where
 
 impl<M, US, HS, TS> GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
 where
-    M: PolyMatrix,
-    US: PolyUniformSampler<M = M>,
-    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
-    TS: PolyTrapdoorSampler<M = M> + Send + Sync,
+    M: PolyMatrix + Send + Sync + 'static,
+    US: PolyUniformSampler<M = M> + Send + Sync + 'static,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync + 'static,
+    TS: PolyTrapdoorSampler<M = M> + Send + Sync + 'static,
 {
     pub fn new(
         hash_key: [u8; 32],
         trapdoor_sigma: f64,
         error_sigma: f64,
         params: &<M::P as Poly>::Params,
-        b0_matrix: Arc<M>,
-        b0_trapdoor: Arc<TS::Trapdoor>,
+        preimage_pool: Arc<PreimagePool<TS>>,
+        b0_trapdoor_id: TrapdoorId,
         pubkey_1: BggPublicKey<M>,
-        dir_path: PathBuf,
         insert_1_to_s: bool,
     ) -> Self {
-        let trap_sampler = TS::new(params, trapdoor_sigma);
-        let d = b0_matrix.row_size();
+        let trap_sampler = Arc::new(TS::new(params, trapdoor_sigma));
+        let d = pubkey_1.matrix.row_size();
         debug_assert!(!insert_1_to_s || d > 1, "cannot insert 1 into s when d = 1");
         let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, 3 * d);
         let m = d * params.modulus_digits();
@@ -98,20 +101,37 @@ where
         ));
         let a_out_prime = Arc::new(a_l_prime.as_ref().clone() * a_s_prime.decompose());
 
+        let b1_trapdoor_id = TrapdoorId::new("ggh15_b1");
+
+        let b1_trapdoor = Arc::new(b1_trapdoor);
+        let b1_matrix = Arc::new(b1_matrix);
+        let inserted = preimage_pool.register_trapdoor(
+            b1_trapdoor_id.clone(),
+            Arc::clone(&trap_sampler),
+            Arc::clone(&b1_trapdoor),
+            Arc::clone(&b1_matrix),
+        );
+        assert!(
+            inserted,
+            "b1 trapdoor id {} already registered in PreimagePool",
+            b1_trapdoor_id.as_str()
+        );
+
         Self {
+            params: params.clone(),
             hash_key,
             trapdoor_sigma,
             error_sigma,
-            b0_matrix,
-            b0_trapdoor,
-            b1_matrix: Arc::new(b1_matrix),
-            b1_trapdoor: Arc::new(b1_trapdoor),
+            trap_sampler,
+            preimage_pool,
+            b0_trapdoor_id,
+            b1_trapdoor_id,
+            b1_matrix,
             pubkey_1,
             a_x_prime,
             a_l_prime,
             a_s_prime,
             a_out_prime,
-            dir_path,
             insert_1_to_s,
             lut_ready: Arc::new(Mutex::new(HashSet::new())),
             _us: PhantomData,
@@ -121,12 +141,24 @@ where
     }
 }
 
+impl<M, US, HS, TS> Drop for GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
+where
+    M: PolyMatrix + Send + Sync + 'static,
+    US: PolyUniformSampler<M = M> + Send + Sync + 'static,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync + 'static,
+    TS: PolyTrapdoorSampler<M = M> + Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        let _ = self.preimage_pool.flush(&self.params);
+    }
+}
+
 impl<M, US, HS, TS> PltEvaluator<BggPublicKey<M>> for GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
 where
     M: PolyMatrix + Send + Sync + 'static,
-    US: PolyUniformSampler<M = M> + Send + Sync,
-    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
-    TS: PolyTrapdoorSampler<M = M> + Send + Sync,
+    US: PolyUniformSampler<M = M> + Send + Sync + 'static,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync + 'static,
+    TS: PolyTrapdoorSampler<M = M> + Send + Sync + 'static,
 {
     fn public_lookup(
         &self,
@@ -140,15 +172,17 @@ where
         let m = d * params.modulus_digits();
         let hash_sampler = HS::new();
 
-        let trap_sampler = TS::new(params, self.trapdoor_sigma);
-        let (b_g_trapdoor, b_g) = trap_sampler.trapdoor(params, 2 * d);
+        let (b_g_trapdoor, b_g) = self.trap_sampler.trapdoor(params, 2 * d);
         let b_g1 = b_g.slice_rows(0, d);
         let b_g2 = b_g.slice_rows(d, 2 * d);
         let a1_ginv = self.pubkey_1.matrix.clone() * b_g1.decompose();
         let ax_ginv = input.matrix.clone() * b_g2.decompose();
         let target_to_ggh = a1_ginv + ax_ginv;
-        let k_to_ggh =
-            trap_sampler.preimage(params, &self.b0_trapdoor, &self.b0_matrix, &target_to_ggh);
+        self.preimage_pool.enqueue(
+            &self.b0_trapdoor_id,
+            format!("ggh15_gate_{}_k_to_ggh", gate_id),
+            target_to_ggh,
+        );
 
         let uniform_sampler = US::new();
         let s_g = if self.insert_1_to_s {
@@ -170,7 +204,14 @@ where
             );
             secret_extend * self.b1_matrix.as_ref() + error
         };
-        let k_g = trap_sampler.preimage(params, &b_g_trapdoor, &b_g, &k_g_target);
+        let b_g_trapdoor_id = TrapdoorId::new(format!("ggh15_bg_gate_{}", gate_id));
+        self.preimage_pool.register_trapdoor(
+            b_g_trapdoor_id.clone(),
+            Arc::clone(&self.trap_sampler),
+            Arc::new(b_g_trapdoor),
+            Arc::new(b_g.clone()),
+        );
+        self.preimage_pool.enqueue(&b_g_trapdoor_id, "k_g", k_g_target);
 
         let gadget_matrix = M::gadget_matrix(params, d);
         let target_to_bgg = {
@@ -182,8 +223,11 @@ where
             top.concat_rows(&[&bottom])
         };
 
-        let k_to_bgg =
-            trap_sampler.preimage(params, &self.b1_trapdoor, &self.b1_matrix, &target_to_bgg);
+        self.preimage_pool.enqueue(
+            &self.b1_trapdoor_id,
+            format!("ggh15_gate_{}_k_to_bgg", gate_id),
+            target_to_bgg,
+        );
 
         let mut need_lut = false;
         {
@@ -194,14 +238,36 @@ where
             }
         }
         if need_lut {
-            info!("Preparing LUT for LUT id {}", lut_id);
+            log_mem(format!("start building target for LUT id {}", lut_id));
             let start = Instant::now();
-            let k_l_preimages: Vec<(usize, M)> = plt
+            let pool = Arc::clone(&self.preimage_pool);
+            let trapdoor_id = self.b1_trapdoor_id.clone();
+            // plt.f.par_iter().for_each(|(_, (idx, y_elem))| {
+            // let y_poly = M::P::from_elem_to_constant(params, y_elem);
+            // let gadget_matrix = M::gadget_matrix(params, d);
+            // let r_idx = hash_sampler.sample_hash(
+            //     params,
+            //     self.hash_key,
+            //     format!("ggh15_r_{}_idx_{}", lut_id, idx),
+            //     d,
+            //     m,
+            //     DistType::FinRingDist,
+            // );
+            // let idx_poly = M::P::from_usize_to_constant(params, *idx);
+
+            // let target_top = self.a_l_prime.as_ref().clone() -
+            //     gadget_matrix.clone() * y_poly -
+            //     self.a_x_prime.as_ref().clone() * &r_idx.decompose() +
+            //     r_idx * idx_poly;
+            // let target = target_top.concat_rows(&[&M::zero(params, 2 * d, m)]);
+            // pool.enqueue(&trapdoor_id, format!("ggh15_lut_{}_idx_{}", lut_id, idx), target);
+            // });
+            // let gadget_matrix_arc = Arc::new(M::gadget_matrix(params, d));
+            let idx_y_r_vec = plt
                 .f
                 .par_iter()
                 .map(|(_, (idx, y_elem))| {
                     let y_poly = M::P::from_elem_to_constant(params, y_elem);
-                    let gadget_matrix = M::gadget_matrix(params, d);
                     let r_idx = hash_sampler.sample_hash(
                         params,
                         self.hash_key,
@@ -211,21 +277,52 @@ where
                         DistType::FinRingDist,
                     );
                     let idx_poly = M::P::from_usize_to_constant(params, *idx);
-
-                    let target_top = self.a_l_prime.as_ref().clone() -
-                        gadget_matrix.clone() * y_poly -
-                        self.a_x_prime.as_ref().clone() * &r_idx.decompose() +
-                        r_idx * idx_poly;
-                    let target = target_top.concat_rows(&[&M::zero(params, 2 * d, m)]);
-                    (
-                        *idx,
-                        trap_sampler.preimage(params, &self.b1_trapdoor, &self.b1_matrix, &target),
-                    )
+                    let r_decomposed = r_idx.decompose();
+                    let r_idx_muled = r_idx * idx_poly;
+                    (*idx, y_poly, r_idx_muled, r_decomposed)
                 })
-                .collect();
-            info!("Prepared LUT for LUT id {} in {:?}", lut_id, start.elapsed());
-            let kl_id = format!("ggh15_lut_{}", lut_id);
-            add_lookup_buffer(get_lookup_buffer(k_l_preimages, &kl_id));
+                .collect::<Vec<_>>();
+            let a_l_copied =
+                self.a_l_prime
+                    .as_ref()
+                    .clone()
+                    .concat_columns(&vec![self.a_l_prime.as_ref(); plt.f.len() - 1]);
+            let y_vec = M::from_poly_vec_row(
+                params,
+                idx_y_r_vec.iter().map(|(_, y_poly, _, _)| y_poly.clone()).collect(),
+            );
+            let y_vec_tensored = y_vec.tensor(&gadget_matrix);
+            let r_decomposed_concat = idx_y_r_vec[0].3.concat_columns(
+                &idx_y_r_vec[1..]
+                    .iter()
+                    .map(|(_, _, _, r_decomposed)| r_decomposed)
+                    .collect::<Vec<_>>(),
+            );
+            let a_x_times_r_decomposed = self.a_x_prime.as_ref().clone() * r_decomposed_concat;
+            let r_times_idx_concat = idx_y_r_vec[0].2.concat_columns(
+                &idx_y_r_vec[1..]
+                    .iter()
+                    .map(|(_, _, r_idx_muled, _)| r_idx_muled)
+                    .collect::<Vec<_>>(),
+            );
+            let target_top =
+                a_l_copied - y_vec_tensored - a_x_times_r_decomposed + r_times_idx_concat;
+            let target = target_top.concat_rows(&[&M::zero(params, 2 * d, m * plt.f.len())]);
+            log_mem(format!(
+                "finished building target for LUT id {} in {:?}",
+                lut_id,
+                start.elapsed()
+            ));
+            idx_y_r_vec.into_par_iter().enumerate().for_each(|(k, (idx, _, _, _))| {
+                let slice = target.slice_columns(k * m, (k + 1) * m);
+                pool.enqueue(&trapdoor_id, format!("ggh15_lut_{}_idx_{}", lut_id, idx), slice);
+            });
+            // plt.f.into_par_iter()..par_iter().enumerate();
+            // .for_each(|(k, (_, (idx, _)))| {
+            //     let slice = target.slice_columns(k * m, (k + 1) * m);
+            //     pool.enqueue(&trapdoor_id, format!("ggh15_lut_{}_idx_{}", lut_id, idx), slice);
+            // });
+            // let r_matrix =
         }
 
         let target_dec_top = -self.a_out_prime.as_ref().clone();
@@ -238,13 +335,17 @@ where
             DistType::FinRingDist,
         );
         let target_dec = target_dec_top.concat_rows(&[&M::zero(params, d, m), &a_out]);
-        let k_dec = trap_sampler.preimage(params, &self.b1_trapdoor, &self.b1_matrix, &target_dec);
+        self.preimage_pool.enqueue(
+            &self.b1_trapdoor_id,
+            format!("ggh15_gate_{}_k_dec", gate_id),
+            target_dec,
+        );
 
         let gate_bundle_id = format!("ggh15_gate_bundle_{}", gate_id);
-        add_lookup_buffer(get_lookup_buffer(
-            vec![(0, b_g), (1, k_to_ggh), (2, k_g), (3, k_to_bgg), (4, k_dec)],
-            &gate_bundle_id,
-        ));
+        add_lookup_buffer(
+            self.preimage_pool.dir_path(),
+            get_lookup_buffer(vec![(0, b_g)], &gate_bundle_id),
+        );
 
         // Output public key for this LUT gate.
         BggPublicKey { matrix: a_out, reveal_plaintext: true }
@@ -252,30 +353,38 @@ where
 }
 
 #[derive(Debug, Clone)]
-pub struct GGH15BGGEncodingPltEvaluator<M, HS>
+pub struct GGH15BGGEncodingPltEvaluator<M, HS, TS>
 where
-    M: PolyMatrix,
-    HS: PolyHashSampler<[u8; 32], M = M>,
+    M: PolyMatrix + Send + Sync + 'static,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync + 'static,
+    TS: PolyTrapdoorSampler<M = M> + Send + Sync + 'static,
 {
     pub hash_key: [u8; 32],
     pub dir_path: PathBuf,
+    pub preimage_pool: Arc<PreimagePool<TS>>,
+    pub b0_trapdoor_id: TrapdoorId,
+    pub b1_trapdoor_id: TrapdoorId,
     pub const_one: BggEncoding<M>,
     pub a_x_prime: M,
     pub a_l_prime: M,
     pub a_s_prime: M,
     pub c_b0: M,
     _hs: PhantomData<HS>,
+    _ts: PhantomData<TS>,
 }
 
-impl<M, HS> GGH15BGGEncodingPltEvaluator<M, HS>
+impl<M, HS, TS> GGH15BGGEncodingPltEvaluator<M, HS, TS>
 where
-    M: PolyMatrix,
-    HS: PolyHashSampler<[u8; 32], M = M>,
+    M: PolyMatrix + Send + Sync + 'static,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync + 'static,
+    TS: PolyTrapdoorSampler<M = M> + Send + Sync + 'static,
 {
     pub fn new(
         hash_key: [u8; 32],
         params: &<M::P as Poly>::Params,
         dir_path: PathBuf,
+        preimage_pool: Arc<PreimagePool<TS>>,
+        b0_trapdoor_id: TrapdoorId,
         const_one: BggEncoding<M>,
         c_b0: M,
     ) -> Self {
@@ -309,20 +418,25 @@ where
         Self {
             hash_key,
             dir_path,
+            preimage_pool,
+            b0_trapdoor_id,
+            b1_trapdoor_id: TrapdoorId::new("ggh15_b1"),
             const_one,
             a_x_prime,
             a_l_prime,
             a_s_prime,
             c_b0,
             _hs: PhantomData,
+            _ts: PhantomData,
         }
     }
 }
 
-impl<M, HS> PltEvaluator<BggEncoding<M>> for GGH15BGGEncodingPltEvaluator<M, HS>
+impl<M, HS, TS> PltEvaluator<BggEncoding<M>> for GGH15BGGEncodingPltEvaluator<M, HS, TS>
 where
-    M: PolyMatrix + Send + Sync,
-    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    M: PolyMatrix + Send + Sync + 'static,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync + 'static,
+    TS: PolyTrapdoorSampler<M = M> + Send + Sync + 'static,
 {
     fn public_lookup(
         &self,
@@ -355,17 +469,28 @@ where
         let gate_bundle_id = format!("ggh15_gate_bundle_{}", gate_id);
         let b_g = read_matrix_from_multi_batch::<M>(params, dir, &gate_bundle_id, 0)
             .unwrap_or_else(|| panic!("b_g for gate {} not found", gate_id));
-        let k_to_ggh = read_matrix_from_multi_batch::<M>(params, dir, &gate_bundle_id, 1)
-            .unwrap_or_else(|| panic!("k_to_ggh for gate {} not found", gate_id));
-        let k_g = read_matrix_from_multi_batch::<M>(params, dir, &gate_bundle_id, 2)
-            .unwrap_or_else(|| panic!("k_g for gate {} not found", gate_id));
-        let k_to_bgg = read_matrix_from_multi_batch::<M>(params, dir, &gate_bundle_id, 3)
-            .unwrap_or_else(|| panic!("k_to_bgg for gate {} not found", gate_id));
-        let k_dec = read_matrix_from_multi_batch::<M>(params, dir, &gate_bundle_id, 4)
-            .unwrap_or_else(|| panic!("decoder for gate {} not found", gate_id));
-        let k_lut =
-            read_matrix_from_multi_batch::<M>(params, dir, &format!("ggh15_lut_{}", lut_id), k)
-                .unwrap_or_else(|| panic!("k_lut (index {}) for lut {} not found", k, lut_id));
+        let k_to_ggh = self.preimage_pool.read_preimage(
+            params,
+            &self.b0_trapdoor_id,
+            format!("ggh15_gate_{}_k_to_ggh", gate_id),
+        );
+        let b_g_trapdoor_id = TrapdoorId::new(format!("ggh15_bg_gate_{}", gate_id));
+        let k_g = self.preimage_pool.read_preimage(params, &b_g_trapdoor_id, "k_g");
+        let k_to_bgg = self.preimage_pool.read_preimage(
+            params,
+            &self.b1_trapdoor_id,
+            format!("ggh15_gate_{}_k_to_bgg", gate_id),
+        );
+        let k_dec = self.preimage_pool.read_preimage(
+            params,
+            &self.b1_trapdoor_id,
+            format!("ggh15_gate_{}_k_dec", gate_id),
+        );
+        let k_lut = self.preimage_pool.read_preimage(
+            params,
+            &self.b1_trapdoor_id,
+            format!("ggh15_lut_{}_idx_{}", lut_id, k),
+        );
 
         let d_to_ggh = self.c_b0.clone() * k_to_ggh;
         let b_g1 = b_g.slice_rows(0, d);
@@ -478,7 +603,7 @@ mod test {
         let enc_one = encodings[0].clone();
         let enc1 = encodings[1].clone();
 
-        let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let trapdoor_sampler = Arc::new(DCRTPolyTrapdoorSampler::new(&params, SIGMA));
         let (b0_trapdoor, b0) = trapdoor_sampler.trapdoor(&params, d);
         let s_vec = DCRTPolyMatrix::from_poly_vec_row(&params, secrets);
         let c_b0 = s_vec.clone() * &b0;
@@ -495,6 +620,14 @@ mod test {
 
         let error_sigma = 0.0;
         let insert_1_to_s = false;
+        let preimage_pool = Arc::new(PreimagePool::<DCRTPolyTrapdoorSampler>::new(dir_path, None));
+        let b0_trapdoor_id = TrapdoorId::new("ggh15_b0");
+        preimage_pool.register_trapdoor(
+            b0_trapdoor_id.clone(),
+            trapdoor_sampler,
+            Arc::new(b0_trapdoor),
+            Arc::new(b0),
+        );
         let plt_pubkey_evaluator = GGH15BGGPubKeyPltEvaluator::<
             DCRTPolyMatrix,
             DCRTPolyUniformSampler,
@@ -505,10 +638,9 @@ mod test {
             SIGMA,
             error_sigma,
             &params,
-            Arc::new(b0),
-            Arc::new(b0_trapdoor),
+            Arc::clone(&preimage_pool),
+            b0_trapdoor_id.clone(),
             enc_one.pubkey.clone(),
-            dir_path.into(),
             insert_1_to_s,
         );
 
@@ -525,8 +657,15 @@ mod test {
         let plt_encoding_evaluator = GGH15BGGEncodingPltEvaluator::<
             DCRTPolyMatrix,
             DCRTPolyHashSampler<Keccak256>,
+            DCRTPolyTrapdoorSampler,
         >::new(
-            key, &params, dir_path.into(), enc_one.clone(), c_b0
+            key,
+            &params,
+            dir_path.into(),
+            preimage_pool,
+            b0_trapdoor_id,
+            enc_one.clone(),
+            c_b0,
         );
 
         let result_encoding = circuit.eval(
@@ -601,7 +740,7 @@ mod test {
         let input_pubkeys = pubkeys[1..].to_vec();
         let input_encodings = encodings[1..].to_vec();
 
-        let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let trapdoor_sampler = Arc::new(DCRTPolyTrapdoorSampler::new(&params, SIGMA));
         let (b0_trapdoor, b0) = trapdoor_sampler.trapdoor(&params, d);
         let s_vec = DCRTPolyMatrix::from_poly_vec_row(&params, secrets);
         let c_b0 = s_vec.clone() * &b0;
@@ -618,6 +757,14 @@ mod test {
 
         let error_sigma = 0.0;
         let insert_1_to_s = false;
+        let preimage_pool = Arc::new(PreimagePool::<DCRTPolyTrapdoorSampler>::new(dir_path, None));
+        let b0_trapdoor_id = TrapdoorId::new("ggh15_b0");
+        preimage_pool.register_trapdoor(
+            b0_trapdoor_id.clone(),
+            trapdoor_sampler,
+            Arc::new(b0_trapdoor),
+            Arc::new(b0),
+        );
         let plt_pubkey_evaluator = GGH15BGGPubKeyPltEvaluator::<
             DCRTPolyMatrix,
             DCRTPolyUniformSampler,
@@ -628,10 +775,9 @@ mod test {
             SIGMA,
             error_sigma,
             &params,
-            Arc::new(b0),
-            Arc::new(b0_trapdoor),
+            Arc::clone(&preimage_pool),
+            b0_trapdoor_id.clone(),
             enc_one.pubkey.clone(),
-            dir_path.into(),
             insert_1_to_s,
         );
 
@@ -643,8 +789,15 @@ mod test {
         let plt_encoding_evaluator = GGH15BGGEncodingPltEvaluator::<
             DCRTPolyMatrix,
             DCRTPolyHashSampler<Keccak256>,
+            DCRTPolyTrapdoorSampler,
         >::new(
-            key, &params, dir_path.into(), enc_one.clone(), c_b0
+            key,
+            &params,
+            dir_path.into(),
+            preimage_pool,
+            b0_trapdoor_id,
+            enc_one.clone(),
+            c_b0,
         );
 
         let result_encoding =

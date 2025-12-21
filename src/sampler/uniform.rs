@@ -27,9 +27,9 @@ struct NttWarmupKey {
 
 impl PartialEq for NttWarmupKey {
     fn eq(&self, other: &Self) -> bool {
-        self.ring_dimension == other.ring_dimension
-            && self.crt_depth == other.crt_depth
-            && self.crt_bits == other.crt_bits
+        self.ring_dimension == other.ring_dimension &&
+            self.crt_depth == other.crt_depth &&
+            self.crt_bits == other.crt_bits
     }
 }
 

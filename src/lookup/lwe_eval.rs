@@ -256,7 +256,7 @@ mod test {
     #[tokio::test]
     async fn test_lwe_plt_eval() {
         init_storage_system();
-        tracing_subscriber::fmt::init();
+        let _ = tracing_subscriber::fmt::try_init();
         let params = DCRTPolyParams::default();
         let plt = setup_lsb_constant_binary_plt(16, &params);
         // Create a simple circuit with the lookup table

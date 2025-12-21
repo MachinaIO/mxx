@@ -29,7 +29,7 @@ async fn test_arithmetic_circuit_operations_ggh15() {
     const P_MODULI_BITS: usize = 6;
     const SCALE: u64 = 1 << 7;
     const BASE_BITS: u32 = 8;
-    tracing_subscriber::fmt::init();
+    let _ = tracing_subscriber::fmt::try_init();
 
     // Use parameters where NestedRnsPoly is known to be correct.
     let params = DCRTPolyParams::new(4, 3, 18, BASE_BITS);

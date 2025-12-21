@@ -76,6 +76,7 @@ pub trait Poly:
     fn from_bool_vec(params: &Self::Params, coeffs: &[bool]) -> Self;
     fn from_coeffs(params: &Self::Params, coeffs: &[Self::Elem]) -> Self;
     fn from_u32s(params: &Self::Params, coeffs: &[u32]) -> Self;
+    fn from_u64_vecs(params: &Self::Params, coeffs: &[Vec<u64>]) -> Self;
     fn from_biguints(params: &Self::Params, coeffs: &[BigUint]) -> Self;
     fn from_biguints_eval(params: &Self::Params, slots: &[BigUint]) -> Self;
     fn from_biguints_eval_single_mod(

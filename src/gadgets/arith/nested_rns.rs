@@ -448,13 +448,6 @@ pub(crate) fn sample_crt_primes(max_bit_width: usize, q_max: u64) -> Vec<u64> {
         );
     }
 
-    // if results.len() != count {
-    //     panic!(
-    //         "failed to find {count} pairwise coprime integers with bit width {bit_width}; only {}
-    // found",         results.len()
-    //     );
-    // }
-
     results
 }
 
@@ -486,10 +479,7 @@ mod tests {
             PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
-        simulator::SimulatorContext,
-        utils::bigdecimal_bits_ceil,
     };
-    use bigdecimal::BigDecimal;
 
     const P_MODULI_BITS: usize = 6;
     const SCALE: u64 = 1 << 8;
@@ -568,50 +558,6 @@ mod tests {
         let a_value: BigUint = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
         let b_value: BigUint = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
         test_nested_rns_poly_mul_full_reduce_generic(circuit, params, ctx, a_value, b_value);
-    }
-
-    #[test]
-    fn test_nested_rns_benchmark_multiplication_tree() {
-        let height = 5usize;
-        let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (params, ctx) = create_test_context(&mut circuit);
-        let num_inputs = 1usize << height;
-        NestedRnsPoly::benchmark_multiplication_tree(ctx.clone(), &params, &mut circuit, height);
-        println!("non-free depth {}", circuit.non_free_depth());
-        println!("circuit size {:?}", circuit.count_gates_by_type_vec());
-
-        let sim_ctx = Arc::new(SimulatorContext::new(
-            BigDecimal::from(100u64).sqrt().expect("sqrt(100) should succeed"),
-            BigDecimal::from(params.ring_dimension() as u64)
-                .sqrt()
-                .expect("sqrt(ring_dimension) should succeed"),
-            BigDecimal::from(1u64 << BASE_BITS),
-            params.modulus_digits(),
-        ));
-        let out = circuit.simulate_max_h_norm(
-            sim_ctx,
-            BigDecimal::from(
-                1u64.checked_shl(P_MODULI_BITS as u32)
-                    .expect("P_MODULI_BITS is too large to shift"),
-            ),
-            circuit.num_input(),
-        );
-        println!(
-            "out[0].h_norm.poly_norm.norm bits = {}",
-            bigdecimal_bits_ceil(&out[0].h_norm.poly_norm.norm)
-        );
-
-        let mut eval_inputs: Vec<DCRTPoly> =
-            Vec::with_capacity(num_inputs * ctx.q_moduli_depth * ctx.p_moduli.len());
-        for _ in 0..num_inputs {
-            eval_inputs.extend(encode_nested_rns_poly(P_MODULI_BITS, &params, &BigUint::zero()));
-        }
-        let plt_evaluator = PolyPltEvaluator::new();
-        let eval_results =
-            circuit.eval(&params, &DCRTPoly::const_one(&params), &eval_inputs, Some(plt_evaluator));
-
-        assert_eq!(eval_results.len(), 1);
-        assert_eq!(eval_results[0], DCRTPoly::const_zero(&params));
     }
 
     fn test_nested_rns_poly_add_full_reduce_generic(

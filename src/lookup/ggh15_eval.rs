@@ -169,6 +169,7 @@ where
             );
             secret_extend * self.b1_matrix.as_ref() + error
         };
+        info!("k_g_target done");
         let k_g = trap_sampler.preimage(params, &b_g_trapdoor, &b_g, &k_g_target);
         info!("k_g done");
 
@@ -181,7 +182,7 @@ where
             let bottom = M::zero(params, d, m).concat_columns(&[&minus_gadget]);
             top.concat_rows(&[&bottom])
         };
-
+        info!("target_to_bgg done");
         let k_to_bgg =
             trap_sampler.preimage(params, &self.b1_trapdoor, &self.b1_matrix, &target_to_bgg);
         info!("k_to_bgg done");
@@ -239,7 +240,9 @@ where
             DistType::FinRingDist,
         );
         let target_dec = target_dec_top.concat_rows(&[&M::zero(params, d, m), &a_out]);
+        info!("target_dec done");
         let k_dec = trap_sampler.preimage(params, &self.b1_trapdoor, &self.b1_matrix, &target_dec);
+        info!("k_dec done");
 
         let gate_bundle_id = format!("ggh15_gate_bundle_{}", gate_id);
         add_lookup_buffer(get_lookup_buffer(

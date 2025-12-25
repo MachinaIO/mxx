@@ -251,7 +251,6 @@ mod tests {
     fn make_ctx() -> Arc<SimulatorContext> {
         // secpar_sqrt=50, ring_dim_sqrt=1024, base=32, log_base_q=(128/32)*7 = 28
         Arc::new(SimulatorContext::new(
-            BigDecimal::from(50u64),   // secpar_sqrt
             BigDecimal::from(1024u64), // ring_dim_sqrt
             BigDecimal::from(32u64),   // base
             2,

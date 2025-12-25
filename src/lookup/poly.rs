@@ -12,6 +12,7 @@ impl<P: Poly> PltEvaluator<P> for PolyPltEvaluator {
         &self,
         params: &P::Params,
         plt: &PublicLut<P>,
+        _: P,
         input: P,
         gate_id: GateId,
         lut_id: usize,

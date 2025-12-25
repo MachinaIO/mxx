@@ -150,6 +150,7 @@ impl PltEvaluator<ErrorNorm> for NormPltLWEEvaluator {
         &self,
         _: &(),
         plt: &PublicLut<DCRTPoly>,
+        _: ErrorNorm,
         input: ErrorNorm,
         _: GateId,
         _: usize,
@@ -164,7 +165,6 @@ impl PltEvaluator<ErrorNorm> for NormPltLWEEvaluator {
 
 #[derive(Debug, Clone)]
 pub struct NormPltGGH15Evaluator {
-    pub one_error: ErrorNorm,
     pub e_b_times_k_to_ggh: PolyMatrixNorm,
     pub k_g: PolyMatrixNorm,
     pub k_to_bgg: PolyMatrixNorm,
@@ -173,7 +173,7 @@ pub struct NormPltGGH15Evaluator {
 }
 
 impl NormPltGGH15Evaluator {
-    pub fn new(ctx: Arc<SimulatorContext>, one_error: ErrorNorm, e_b_sigma: &BigDecimal) -> Self {
+    pub fn new(ctx: Arc<SimulatorContext>, e_b_sigma: &BigDecimal) -> Self {
         let c_0 = BigDecimal::from_f64(1.8).unwrap();
         let c_1 = BigDecimal::from_f64(4.7).unwrap();
         let sigma = BigDecimal::from_f64(4.578).unwrap();
@@ -192,7 +192,7 @@ impl NormPltGGH15Evaluator {
         let k_to_bgg = PolyMatrixNorm::new(ctx.clone(), ctx.m_b, 2 * ctx.m_g, norm.clone(), None);
         let k_dec = PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, norm.clone(), None);
         let k_lut = PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, norm.clone(), None);
-        Self { one_error, e_b_times_k_to_ggh, k_g, k_to_bgg, k_dec, k_lut }
+        Self { e_b_times_k_to_ggh, k_g, k_to_bgg, k_dec, k_lut }
     }
 }
 
@@ -201,6 +201,7 @@ impl PltEvaluator<ErrorNorm> for NormPltGGH15Evaluator {
         &self,
         _: &(),
         plt: &PublicLut<DCRTPoly>,
+        one: ErrorNorm,
         input: ErrorNorm,
         _: GateId,
         _: usize,
@@ -211,8 +212,7 @@ impl PltEvaluator<ErrorNorm> for NormPltGGH15Evaluator {
         let plaintext_norm = PolyNorm::new(input.clone_ctx(), plaintext_bd);
         let matrix_norm = {
             let p_g = self.e_b_times_k_to_ggh.clone() +
-                self.one_error.matrix_norm.clone() *
-                    PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_b) +
+                one.matrix_norm.clone() * PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_b) +
                 input.matrix_norm.clone() *
                     PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_b);
             let p_g_prime = p_g * &self.k_g;
@@ -402,14 +402,8 @@ mod tests {
 
         let ctx = make_ctx();
         let input_bound = BigDecimal::from(5u64);
-        let plt_evaluator = NormPltGGH15Evaluator::new(
-            ctx.clone(),
-            ErrorNorm::new(
-                PolyNorm::one(ctx.clone()),
-                PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, BigDecimal::from(E_INIT_NORM), None),
-            ),
-            &BigDecimal::from_f64(E_B_SIGMA).unwrap(),
-        );
+        let plt_evaluator =
+            NormPltGGH15Evaluator::new(ctx.clone(), &BigDecimal::from_f64(E_B_SIGMA).unwrap());
         let out = circuit.simulate_max_error_norm(
             ctx.clone(),
             input_bound.clone(),

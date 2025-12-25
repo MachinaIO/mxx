@@ -35,7 +35,6 @@ where
     pub b0_trapdoor: Arc<TS::Trapdoor>,
     pub b1_matrix: Arc<M>,              // B in the spec
     pub b1_trapdoor: Arc<TS::Trapdoor>, // trapdoor of B
-    pub pubkey_1: BggPublicKey<M>,
     pub a_x_prime: Arc<M>,
     pub a_l_prime: Arc<M>,
     pub a_s_prime: Arc<M>,
@@ -62,7 +61,6 @@ where
         params: &<M::P as Poly>::Params,
         b0_matrix: Arc<M>,
         b0_trapdoor: Arc<TS::Trapdoor>,
-        pubkey_1: BggPublicKey<M>,
         dir_path: PathBuf,
         insert_1_to_s: bool,
     ) -> Self {
@@ -106,7 +104,6 @@ where
             b0_trapdoor,
             b1_matrix: Arc::new(b1_matrix),
             b1_trapdoor: Arc::new(b1_trapdoor),
-            pubkey_1,
             a_x_prime,
             a_l_prime,
             a_s_prime,
@@ -132,6 +129,7 @@ where
         &self,
         params: &<BggPublicKey<M> as Evaluable>::Params,
         plt: &PublicLut<<BggPublicKey<M> as Evaluable>::P>,
+        one: BggPublicKey<M>,
         input: BggPublicKey<M>,
         gate_id: GateId,
         lut_id: usize,
@@ -144,11 +142,12 @@ where
         let (b_g_trapdoor, b_g) = trap_sampler.trapdoor(params, 2 * d);
         let b_g1 = b_g.slice_rows(0, d);
         let b_g2 = b_g.slice_rows(d, 2 * d);
-        let a1_ginv = self.pubkey_1.matrix.clone() * b_g1.decompose();
+        let a1_ginv = one.matrix.clone() * b_g1.decompose();
         let ax_ginv = input.matrix.clone() * b_g2.decompose();
         let target_to_ggh = a1_ginv + ax_ginv;
         let k_to_ggh =
             trap_sampler.preimage(params, &self.b0_trapdoor, &self.b0_matrix, &target_to_ggh);
+        info!("k_to_ggh done");
 
         let uniform_sampler = US::new();
         let s_g = if self.insert_1_to_s {
@@ -171,6 +170,7 @@ where
             secret_extend * self.b1_matrix.as_ref() + error
         };
         let k_g = trap_sampler.preimage(params, &b_g_trapdoor, &b_g, &k_g_target);
+        info!("k_g done");
 
         let gadget_matrix = M::gadget_matrix(params, d);
         let target_to_bgg = {
@@ -184,6 +184,7 @@ where
 
         let k_to_bgg =
             trap_sampler.preimage(params, &self.b1_trapdoor, &self.b1_matrix, &target_to_bgg);
+        info!("k_to_bgg done");
 
         let mut need_lut = false;
         {
@@ -259,7 +260,6 @@ where
 {
     pub hash_key: [u8; 32],
     pub dir_path: PathBuf,
-    pub const_one: BggEncoding<M>,
     pub a_x_prime: M,
     pub a_l_prime: M,
     pub a_s_prime: M,
@@ -276,10 +276,10 @@ where
         hash_key: [u8; 32],
         params: &<M::P as Poly>::Params,
         dir_path: PathBuf,
-        const_one: BggEncoding<M>,
+        secret_size: usize,
         c_b0: M,
     ) -> Self {
-        let d = const_one.pubkey.matrix.row_size();
+        let d = secret_size;
         let m = d * params.modulus_digits();
         let hash_sampler = HS::new();
         let a_x_prime = hash_sampler.sample_hash(
@@ -306,16 +306,7 @@ where
             m,
             DistType::FinRingDist,
         );
-        Self {
-            hash_key,
-            dir_path,
-            const_one,
-            a_x_prime,
-            a_l_prime,
-            a_s_prime,
-            c_b0,
-            _hs: PhantomData,
-        }
+        Self { hash_key, dir_path, a_x_prime, a_l_prime, a_s_prime, c_b0, _hs: PhantomData }
     }
 }
 
@@ -328,6 +319,7 @@ where
         &self,
         params: &<BggEncoding<M> as Evaluable>::Params,
         plt: &PublicLut<<BggEncoding<M> as Evaluable>::P>,
+        one: BggEncoding<M>,
         input: BggEncoding<M>,
         gate_id: GateId,
         lut_id: usize,
@@ -370,7 +362,7 @@ where
         let d_to_ggh = self.c_b0.clone() * k_to_ggh;
         let b_g1 = b_g.slice_rows(0, d);
         let b_g2 = b_g.slice_rows(d, 2 * d);
-        let term_const = self.const_one.vector.clone() * b_g1.decompose();
+        let term_const = one.vector.clone() * b_g1.decompose();
         let term_input = input.vector.clone() * b_g2.decompose();
         let p_g = d_to_ggh - &(term_const + term_input);
 
@@ -507,7 +499,6 @@ mod test {
             &params,
             Arc::new(b0),
             Arc::new(b0_trapdoor),
-            enc_one.pubkey.clone(),
             dir_path.into(),
             insert_1_to_s,
         );
@@ -525,9 +516,7 @@ mod test {
         let plt_encoding_evaluator = GGH15BGGEncodingPltEvaluator::<
             DCRTPolyMatrix,
             DCRTPolyHashSampler<Keccak256>,
-        >::new(
-            key, &params, dir_path.into(), enc_one.clone(), c_b0
-        );
+        >::new(key, &params, dir_path.into(), d, c_b0);
 
         let result_encoding = circuit.eval(
             &params,
@@ -630,7 +619,6 @@ mod test {
             &params,
             Arc::new(b0),
             Arc::new(b0_trapdoor),
-            enc_one.pubkey.clone(),
             dir_path.into(),
             insert_1_to_s,
         );
@@ -643,9 +631,7 @@ mod test {
         let plt_encoding_evaluator = GGH15BGGEncodingPltEvaluator::<
             DCRTPolyMatrix,
             DCRTPolyHashSampler<Keccak256>,
-        >::new(
-            key, &params, dir_path.into(), enc_one.clone(), c_b0
-        );
+        >::new(key, &params, dir_path.into(), d, c_b0);
 
         let result_encoding =
             circuit.eval(&params, &enc_one, &input_encodings, Some(plt_encoding_evaluator));

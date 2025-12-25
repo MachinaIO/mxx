@@ -16,7 +16,7 @@ use std::{
 };
 
 impl PolyCircuit<DCRTPoly> {
-    pub fn simulate_max_h_norm<P: PltEvaluator<ErrorNorm>>(
+    pub fn simulate_max_error_norm<P: PltEvaluator<ErrorNorm>>(
         &self,
         ctx: Arc<SimulatorContext>,
         input_norm_bound: BigDecimal,
@@ -270,7 +270,7 @@ mod tests {
         circuit.output(vec![out_gid]);
         let input_bound = BigDecimal::from(5u64);
 
-        let out = circuit.simulate_max_h_norm(
+        let out = circuit.simulate_max_error_norm(
             ctx.clone(),
             input_bound.clone(),
             2,
@@ -295,7 +295,7 @@ mod tests {
         let out_gid = circuit.sub_gate(ins[0], ins[1]);
         circuit.output(vec![out_gid]);
         let input_bound = BigDecimal::from(5u64);
-        let out = circuit.simulate_max_h_norm(
+        let out = circuit.simulate_max_error_norm(
             ctx.clone(),
             input_bound.clone(),
             2,
@@ -320,7 +320,7 @@ mod tests {
         let out_gid = circuit.mul_gate(ins[0], ins[1]);
         circuit.output(vec![out_gid]);
         let input_bound = BigDecimal::from(5u64);
-        let out = circuit.simulate_max_h_norm(
+        let out = circuit.simulate_max_error_norm(
             ctx.clone(),
             input_bound.clone(),
             2,
@@ -365,7 +365,7 @@ mod tests {
         let input_bound = BigDecimal::from(5u64);
         let plt_evaluator =
             NormPltLWEEvaluator::new(ctx.clone(), &BigDecimal::from_f64(E_B_SIGMA).unwrap());
-        let out = circuit.simulate_max_h_norm(
+        let out = circuit.simulate_max_error_norm(
             ctx.clone(),
             input_bound.clone(),
             1,
@@ -410,7 +410,7 @@ mod tests {
             ),
             &BigDecimal::from_f64(E_B_SIGMA).unwrap(),
         );
-        let out = circuit.simulate_max_h_norm(
+        let out = circuit.simulate_max_error_norm(
             ctx.clone(),
             input_bound.clone(),
             1,

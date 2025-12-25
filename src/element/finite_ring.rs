@@ -13,6 +13,16 @@ pub struct FinRingElem {
 }
 
 impl FinRingElem {
+    #[inline]
+    pub fn from_u64(value: u64, modulus: Arc<BigUint>) -> Self {
+        Self::new(value, modulus)
+    }
+
+    #[inline]
+    pub fn from_biguint(value: BigUint, modulus: Arc<BigUint>) -> Self {
+        Self::new(value, modulus)
+    }
+
     pub fn from_str(value: &str, modulus: &str) -> Result<Self, ParseBigIntError> {
         let value = BigInt::from_str(value)?;
         let modulus = BigUint::from_str(modulus)?.into();

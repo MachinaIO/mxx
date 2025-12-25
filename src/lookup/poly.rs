@@ -8,9 +8,31 @@ use crate::{
 pub struct PolyPltEvaluator {}
 
 impl<P: Poly> PltEvaluator<P> for PolyPltEvaluator {
-    fn public_lookup(&self, params: &P::Params, plt: &PublicLut<P>, input: P, _: GateId) -> P {
-        let outputs = plt.get(params, &input).expect("output of the lookup evaluation not found");
-        outputs.1
+    fn public_lookup(
+        &self,
+        params: &P::Params,
+        plt: &PublicLut<P>,
+        _: P,
+        input: P,
+        gate_id: GateId,
+        lut_id: usize,
+    ) -> P {
+        // Input is assumed to be a constant polynomial; use its constant coefficient as the key.
+        let const_coeff = input
+            .coeffs()
+            .first()
+            .cloned()
+            .expect("input polynomial must contain at least one coefficient");
+
+        let output_coeff = match plt.get(params, &const_coeff) {
+            Some(outputs) => outputs.1,
+            None => panic!(
+                "output of the lookup evaluation not found; gate_id: {:?}, lut_id: {:?}, input: {:?}",
+                gate_id, lut_id, input
+            ),
+        };
+
+        P::from_elem_to_constant(params, &output_coeff)
     }
 }
 

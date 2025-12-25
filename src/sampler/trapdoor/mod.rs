@@ -25,6 +25,10 @@ pub(crate) const KARNEY_THRESHOLD: f64 = 300.0;
 pub struct DCRTTrapdoor {
     pub r: DCRTPolyMatrix,
     pub e: DCRTPolyMatrix,
+    pub a_mat: DCRTPolyMatrix,
+    pub b_mat: DCRTPolyMatrix,
+    pub d_mat: DCRTPolyMatrix,
+    pub re: DCRTPolyMatrix,
 }
 
 impl DCRTTrapdoor {
@@ -34,7 +38,12 @@ impl DCRTTrapdoor {
         let dist = DistType::GaussDist { sigma };
         let r = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
         let e = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
-        Self { r, e }
+        let a_mat = r.clone() * r.transpose(); // d x d
+        let e_transpose = e.transpose();
+        let b_mat = r.clone() * &e_transpose; // d x d
+        let d_mat = e.clone() * &e_transpose; // d x d
+        let re = r.concat_rows(&[&e]);
+        Self { r, e, a_mat, b_mat, d_mat, re }
     }
 
     pub fn sample_pert_square_mat(
@@ -47,7 +56,6 @@ impl DCRTTrapdoor {
         total_ncol: usize,
     ) -> DCRTPolyMatrix {
         let r = &self.r;
-        let e = &self.e;
         let params = &r.params;
         let n = params.ring_dimension() as usize;
         let (d, dk) = r.size();
@@ -95,15 +103,25 @@ impl DCRTTrapdoor {
         // debug_mem("p2_vecs generated");
         // let p2 = p2_vecs[0].concat_columns(&p2_vecs[1..].iter().collect::<Vec<_>>());
         debug_mem("p2 generated");
-        let a_mat = r.clone() * r.transpose(); // d x d
-        let b_mat = r.clone() * e.transpose(); // d x d
-        let d_mat = e.clone() * e.transpose(); // d x d
-        debug_mem("a_mat, b_mat, d_mat generated");
-        let re = r.concat_rows(&[e]);
-        debug_mem("re generated");
-        let tp2 = re * &p2;
+        // let a_mat = r.clone() * r.transpose(); // d x d
+        // let b_mat = r.clone() * e.transpose(); // d x d
+        // let d_mat = e.clone() * e.transpose(); // d x d
+        // debug_mem("a_mat, b_mat, d_mat generated");
+        // let re = r.concat_rows(&[e]);
+        // debug_mem("re generated");
+        let tp2 = self.re.clone() * &p2;
         debug_mem("tp2 generated");
-        let p1 = sample_p1_for_pert_mat(a_mat, b_mat, d_mat, tp2, params, c, s, dgg, padded_ncol);
+        let p1 = sample_p1_for_pert_mat(
+            self.a_mat.clone(),
+            self.b_mat.clone(),
+            self.d_mat.clone(),
+            tp2,
+            params,
+            c,
+            s,
+            dgg,
+            padded_ncol,
+        );
         debug_mem("p1 generated");
         let mut p = p1.concat_rows(&[&p2]);
         debug_mem("p1 and p2 concatenated");

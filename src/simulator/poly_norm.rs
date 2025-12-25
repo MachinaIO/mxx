@@ -22,7 +22,7 @@ impl PolyNorm {
     }
 
     pub fn sample_gauss(ctx: Arc<SimulatorContext>, sigma: BigDecimal) -> Self {
-        let norm = &ctx.secpar_sqrt * sigma;
+        let norm = sigma * 6;
         PolyNorm { ctx, norm }
     }
 }

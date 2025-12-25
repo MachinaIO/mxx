@@ -27,7 +27,7 @@ mod tests {
         let packed_input_size = 2;
         let d = 3;
         let bgg_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
-        let reveal_plaintexts = vec![true; packed_input_size + 1];
+        let reveal_plaintexts = vec![true; packed_input_size];
         let sampled_pub_keys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
         let log_base_q = params.modulus_digits();
         let columns = d * log_base_q;
@@ -53,7 +53,7 @@ mod tests {
         let packed_input_size = 2;
         let d = 3;
         let bgg_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
-        let reveal_plaintexts = vec![true; packed_input_size + 1];
+        let reveal_plaintexts = vec![true; packed_input_size];
         let sampled_pub_keys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
         let log_base_q = params.modulus_digits();
         let columns = d * log_base_q;
@@ -80,7 +80,7 @@ mod tests {
         let packed_input_size = input_size.div_ceil(params.ring_dimension().try_into().unwrap());
         let d = 3;
         let bgg_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
-        let reveal_plaintexts = vec![true; packed_input_size + 1];
+        let reveal_plaintexts = vec![true; packed_input_size];
         let sampled_pub_keys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
         let secrets = vec![create_ternary_random_poly(&params); d];
         let plaintexts = vec![DCRTPoly::const_one(&params); packed_input_size];
@@ -112,7 +112,7 @@ mod tests {
         let packed_input_size = 2;
         let d = 3;
         let bgg_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
-        let reveal_plaintexts = vec![true; packed_input_size + 1];
+        let reveal_plaintexts = vec![true; packed_input_size];
         let sampled_pub_keys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
         let secrets = vec![create_ternary_random_poly(&params); d];
         let plaintexts = vec![create_random_poly(&params); packed_input_size];
@@ -151,7 +151,7 @@ mod tests {
         let packed_input_size = 2;
         let d = 3;
         let bgg_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
-        let reveal_plaintexts = vec![true; packed_input_size + 1];
+        let reveal_plaintexts = vec![true; packed_input_size];
         let sampled_pub_keys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
         let secrets = vec![create_ternary_random_poly(&params); d];
         let plaintexts = vec![create_random_poly(&params); packed_input_size];

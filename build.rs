@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo::rerun-if-changed=src/main.rs");
@@ -16,8 +16,20 @@ fn main() {
     println!("cargo::rustc-link-arg=-Wl,-rpath,/usr/local/lib");
 
     if env::var("CARGO_FEATURE_GPU").is_ok() {
+        println!("cargo::rerun-if-changed=gpu-setup.sh");
         println!("cargo::rerun-if-changed=cuda/GpuPoly.cu");
         println!("cargo::rerun-if-changed=cuda/GpuPoly.h");
+
+        let manifest_dir =
+            PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
+        let status = Command::new("bash")
+            .current_dir(&manifest_dir)
+            .arg("gpu-setup.sh")
+            .status()
+            .expect("failed to run gpu-setup.sh");
+        if !status.success() {
+            panic!("gpu-setup.sh failed with status {status}");
+        }
 
         let fides_root = env::var("FIDESLIB_ROOT").unwrap_or_else(|_| "third_party/FIDESlib".to_string());
         let fides_include =

@@ -24,10 +24,35 @@ fn main() {
             env::var("FIDESLIB_INCLUDE_DIR").unwrap_or_else(|_| format!("{fides_root}/include"));
         let fides_lib_dir =
             env::var("FIDESLIB_LIB_DIR").unwrap_or_else(|_| "/usr/local/lib".to_string());
+        let openfhe_include =
+            env::var("OPENFHE_INCLUDE_DIR").unwrap_or_else(|_| "/usr/local/include/openfhe".to_string());
+        let openfhe_core_include = format!("{openfhe_include}/core");
+        let openfhe_pke_include = format!("{openfhe_include}/pke");
+        let openfhe_binfhe_include = format!("{openfhe_include}/binfhe");
 
         if !PathBuf::from(&fides_include).exists() {
             println!(
                 "cargo::warning=FIDESlib include dir not found at {fides_include} (set FIDESLIB_INCLUDE_DIR)"
+            );
+        }
+        if !PathBuf::from(&openfhe_include).exists() {
+            println!(
+                "cargo::warning=OpenFHE include dir not found at {openfhe_include} (set OPENFHE_INCLUDE_DIR)"
+            );
+        }
+        if !PathBuf::from(&openfhe_core_include).exists() {
+            println!(
+                "cargo::warning=OpenFHE core include dir not found at {openfhe_core_include} (set OPENFHE_INCLUDE_DIR)"
+            );
+        }
+        if !PathBuf::from(&openfhe_pke_include).exists() {
+            println!(
+                "cargo::warning=OpenFHE pke include dir not found at {openfhe_pke_include} (set OPENFHE_INCLUDE_DIR)"
+            );
+        }
+        if !PathBuf::from(&openfhe_binfhe_include).exists() {
+            println!(
+                "cargo::warning=OpenFHE binfhe include dir not found at {openfhe_binfhe_include} (set OPENFHE_INCLUDE_DIR)"
             );
         }
 
@@ -41,6 +66,10 @@ fn main() {
             .cuda(true)
             .file("cuda/GpuPoly.cu")
             .include(&fides_include)
+            .include(&openfhe_include)
+            .include(&openfhe_core_include)
+            .include(&openfhe_pke_include)
+            .include(&openfhe_binfhe_include)
             .flag("-std=c++17")
             .flag("-lineinfo")
             .flag("-Xcompiler")

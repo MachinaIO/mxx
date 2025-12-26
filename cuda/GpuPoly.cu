@@ -1,6 +1,7 @@
 #include "GpuPoly.h"
 
 #include <exception>
+#include <memory>
 #include <new>
 #include <string>
 #include <vector>
@@ -10,6 +11,14 @@
 #include "../third_party/FIDESlib/include/CKKS/Parameters.cuh"
 #include "../third_party/FIDESlib/include/LimbUtils.cuh"
 #include "../third_party/FIDESlib/include/CKKS/RNSPoly.cuh"
+
+namespace CKKS = FIDESlib::CKKS;
+
+enum class PolyFormat
+{
+    Coeff,
+    Eval,
+};
 
 namespace
 {
@@ -42,7 +51,50 @@ struct GpuPoly
     CKKS::RNSPoly *poly;
     GpuContext *ctx;
     int level;
+    PolyFormat format;
 };
+
+namespace
+{
+    int default_batch(const GpuContext *ctx)
+    {
+        return static_cast<int>(ctx && ctx->batch != 0 ? ctx->batch : 1);
+    }
+
+    void ensure_eval(GpuPoly *poly, int batch)
+    {
+        if (poly->format == PolyFormat::Coeff)
+        {
+            poly->poly->NTT(batch);
+            poly->format = PolyFormat::Eval;
+        }
+    }
+
+    void ensure_coeff(GpuPoly *poly, int batch)
+    {
+        if (poly->format == PolyFormat::Eval)
+        {
+            poly->poly->INTT(batch);
+            poly->format = PolyFormat::Coeff;
+        }
+    }
+
+    void convert_format(CKKS::RNSPoly &poly, PolyFormat from, PolyFormat to, int batch)
+    {
+        if (from == to)
+        {
+            return;
+        }
+        if (to == PolyFormat::Eval)
+        {
+            poly.NTT(batch);
+        }
+        else
+        {
+            poly.INTT(batch);
+        }
+    }
+}
 
 extern "C"
 {
@@ -86,16 +138,17 @@ extern "C"
             params.logN = logN;
             params.dnum = dnum == 0 ? static_cast<uint32_t>(gpu_list.size()) : dnum;
             params.batch = batch;
-            params.ModReduceFactor = 1.0;
-            params.ScalingFactorReal = 1.0;
-            params.ScalingFactorRealBig = 1.0;
-            params.scalingTechnique = CKKS::ScalingTechnique::FIXEDMANUAL;
+            const size_t level_len = static_cast<size_t>(params.L + 1);
+            params.ModReduceFactor.assign(level_len, 1.0);
+            params.ScalingFactorReal.assign(level_len, 1.0);
+            params.ScalingFactorRealBig.assign(level_len, 1.0);
+            params.scalingTechnique = lbcrypto::ScalingTechnique::FIXEDMANUAL;
 
             params.primes.clear();
             params.primes.reserve(moduli_len);
             for (size_t i = 0; i < moduli_len; ++i)
             {
-                params.primes.emplace_back(moduli[i]);
+                params.primes.push_back(FIDESlib::PrimeRecord{.p = moduli[i], .type = FIDESlib::U64});
             }
             params.Sprimes.clear();
 
@@ -143,7 +196,7 @@ extern "C"
                 return set_error("invalid gpu_poly_create arguments");
             }
             auto *poly = new CKKS::RNSPoly(*ctx->ctx, level, true);
-            *out_poly = new GpuPoly{poly, ctx, level};
+            *out_poly = new GpuPoly{poly, ctx, level, PolyFormat::Eval};
             return 0;
         }
         catch (const std::exception &e)
@@ -174,8 +227,8 @@ extern "C"
             {
                 return set_error("invalid gpu_poly_clone arguments");
             }
-            auto *poly = new CKKS::RNSPoly(*src->poly);
-            *out_poly = new GpuPoly{poly, src->ctx, src->level};
+            auto *poly = new CKKS::RNSPoly(src->poly->clone());
+            *out_poly = new GpuPoly{poly, src->ctx, src->level, src->format};
             return 0;
         }
         catch (const std::exception &e)
@@ -196,8 +249,9 @@ extern "C"
             {
                 return set_error("invalid gpu_poly_copy arguments");
             }
-            *dst->poly = *src->poly;
+            dst->poly->copy(*src->poly);
             dst->level = src->level;
+            dst->format = src->format;
             return 0;
         }
         catch (const std::exception &e)
@@ -247,6 +301,7 @@ extern "C"
 
             std::vector<uint64_t> moduli_subset(poly->ctx->moduli.begin(), poly->ctx->moduli.begin() + level + 1);
             poly->poly->load(data, moduli_subset);
+            poly->format = PolyFormat::Coeff;
             return 0;
         }
         catch (const std::exception &e)
@@ -259,7 +314,7 @@ extern "C"
         }
     }
 
-    int gpu_poly_store_rns(const GpuPoly *poly, uint64_t *coeffs_flat_out, size_t coeffs_len)
+    int gpu_poly_store_rns(GpuPoly *poly, uint64_t *coeffs_flat_out, size_t coeffs_len)
     {
         try
         {
@@ -274,6 +329,9 @@ extern "C"
             {
                 return set_error("coeffs_len mismatch in gpu_poly_store_rns");
             }
+
+            const int batch = default_batch(poly->ctx);
+            ensure_coeff(poly, batch);
 
             std::vector<std::vector<uint64_t>> data;
             poly->poly->store(data);
@@ -314,8 +372,33 @@ extern "C"
             {
                 return set_error("invalid gpu_poly_add arguments");
             }
-            *out->poly = *a->poly;
-            out->poly->add(*b->poly);
+
+            const int batch = default_batch(a->ctx);
+            const PolyFormat desired_format = a->format;
+            std::unique_ptr<CKKS::RNSPoly> b_tmp;
+            const CKKS::RNSPoly *b_poly = b->poly;
+            if (b->format != desired_format)
+            {
+                b_tmp = std::make_unique<CKKS::RNSPoly>(b->poly->clone());
+                convert_format(*b_tmp, b->format, desired_format, batch);
+                b_poly = b_tmp.get();
+            }
+
+            if (out == a && out->level <= b->level && out->format == desired_format)
+            {
+                out->poly->add(*b_poly);
+            }
+            else if (out->level == a->level && out->level <= b->level && out->format == desired_format)
+            {
+                out->poly->add(*a->poly, *b_poly);
+            }
+            else
+            {
+                out->poly->copy(*a->poly);
+                out->poly->add(*b_poly);
+            }
+            out->level = a->level;
+            out->format = desired_format;
             return 0;
         }
         catch (const std::exception &e)
@@ -336,8 +419,29 @@ extern "C"
             {
                 return set_error("invalid gpu_poly_sub arguments");
             }
-            *out->poly = *a->poly;
-            out->poly->sub(*b->poly);
+
+            const int batch = default_batch(a->ctx);
+            const PolyFormat desired_format = a->format;
+            std::unique_ptr<CKKS::RNSPoly> b_tmp;
+            const CKKS::RNSPoly *b_poly = b->poly;
+            if (b->format != desired_format)
+            {
+                b_tmp = std::make_unique<CKKS::RNSPoly>(b->poly->clone());
+                convert_format(*b_tmp, b->format, desired_format, batch);
+                b_poly = b_tmp.get();
+            }
+
+            if (out == a && out->level <= b->level && out->format == desired_format)
+            {
+                out->poly->sub(*b_poly);
+            }
+            else
+            {
+                out->poly->copy(*a->poly);
+                out->poly->sub(*b_poly);
+            }
+            out->level = a->level;
+            out->format = desired_format;
             return 0;
         }
         catch (const std::exception &e)
@@ -358,14 +462,26 @@ extern "C"
             {
                 return set_error("invalid gpu_poly_mul arguments");
             }
-            CKKS::RNSPoly tmpA(*a->poly);
-            CKKS::RNSPoly tmpB(*b->poly);
-            const int batch = static_cast<int>(a->ctx->batch == 0 ? 1 : a->ctx->batch);
-            tmpA.NTT(batch);
-            tmpB.NTT(batch);
-            tmpA.multElement(tmpB);
-            tmpA.INTT(batch);
-            *out->poly = tmpA;
+            const int batch = default_batch(a->ctx);
+            std::unique_ptr<CKKS::RNSPoly> b_tmp;
+            const CKKS::RNSPoly *b_poly = b->poly;
+            if (b->format != PolyFormat::Eval)
+            {
+                b_tmp = std::make_unique<CKKS::RNSPoly>(b->poly->clone());
+                convert_format(*b_tmp, b->format, PolyFormat::Eval, batch);
+                b_poly = b_tmp.get();
+            }
+
+            if (out != a)
+            {
+                out->poly->copy(*a->poly);
+                out->level = a->level;
+                out->format = a->format;
+            }
+            ensure_eval(out, batch);
+            out->poly->multElement(*b_poly);
+            out->level = a->level;
+            out->format = PolyFormat::Eval;
             return 0;
         }
         catch (const std::exception &e)
@@ -386,7 +502,7 @@ extern "C"
             {
                 return set_error("invalid gpu_poly_ntt arguments");
             }
-            poly->poly->NTT(batch);
+            ensure_eval(poly, batch);
             return 0;
         }
         catch (const std::exception &e)
@@ -407,7 +523,7 @@ extern "C"
             {
                 return set_error("invalid gpu_poly_intt arguments");
             }
-            poly->poly->INTT(batch);
+            ensure_coeff(poly, batch);
             return 0;
         }
         catch (const std::exception &e)

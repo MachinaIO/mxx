@@ -29,7 +29,7 @@ struct GpuPolyOpaque {
     _private: [u8; 0],
 }
 
-extern "C" {
+unsafe extern "C" {
     fn gpu_context_create(
         log_n: u32,
         l: u32,
@@ -48,13 +48,11 @@ extern "C" {
         -> c_int;
     fn gpu_poly_destroy(poly: *mut GpuPolyOpaque);
     fn gpu_poly_clone(src: *const GpuPolyOpaque, out_poly: *mut *mut GpuPolyOpaque) -> c_int;
-    fn gpu_poly_copy(dst: *mut GpuPolyOpaque, src: *const GpuPolyOpaque) -> c_int;
-    fn gpu_poly_get_level(poly: *const GpuPolyOpaque, out_level: *mut c_int) -> c_int;
 
     fn gpu_poly_load_rns(poly: *mut GpuPolyOpaque, coeffs_flat: *const u64, coeffs_len: usize)
         -> c_int;
     fn gpu_poly_store_rns(
-        poly: *const GpuPolyOpaque,
+        poly: *mut GpuPolyOpaque,
         coeffs_flat_out: *mut u64,
         coeffs_len: usize,
     ) -> c_int;
@@ -245,11 +243,11 @@ impl GpuDCRTPolyParams {
 #[derive(Debug)]
 pub struct GpuContext {
     raw: *mut GpuContextOpaque,
-    n: usize,
-    moduli: Vec<u64>,
-    gpu_ids: Vec<i32>,
-    dnum: u32,
-    batch: u32,
+    pub n: usize,
+    pub moduli: Vec<u64>,
+    pub gpu_ids: Vec<i32>,
+    pub dnum: u32,
+    pub batch: u32,
 }
 
 /// # Safety
@@ -330,7 +328,7 @@ impl GpuDCRTPoly {
     }
 
     fn from_flat(params: Arc<GpuDCRTPolyParams>, level: usize, flat: Vec<u64>, is_ntt: bool) -> Self {
-        let mut poly = Self::new_empty(params, level, is_ntt);
+        let poly = Self::new_empty(params, level, is_ntt);
         let status = unsafe { gpu_poly_load_rns(poly.raw, flat.as_ptr(), flat.len()) };
         check_status(status, "gpu_poly_load_rns");
         poly
@@ -365,14 +363,6 @@ impl GpuDCRTPoly {
         self.is_ntt = true;
     }
 
-    fn intt_in_place(&mut self) {
-        if !self.is_ntt {
-            return;
-        }
-        let status = unsafe { gpu_poly_intt(self.raw, self.params.batch() as c_int) };
-        check_status(status, "gpu_poly_intt");
-        self.is_ntt = false;
-    }
 
     fn assert_compatible(&self, other: &Self) {
         assert_eq!(self.level, other.level, "GPU polynomials must have the same level");
@@ -720,7 +710,7 @@ impl Poly for GpuDCRTPoly {
 
 impl_binop_with_refs!(GpuDCRTPoly => Add::add(self, rhs: &GpuDCRTPoly) -> GpuDCRTPoly {
     self.assert_compatible(rhs);
-    let mut out = GpuDCRTPoly::new_empty(self.params.clone(), self.level, self.is_ntt);
+    let out = GpuDCRTPoly::new_empty(self.params.clone(), self.level, self.is_ntt);
     let status = unsafe { gpu_poly_add(out.raw, self.raw, rhs.raw) };
     check_status(status, "gpu_poly_add");
     out
@@ -728,7 +718,7 @@ impl_binop_with_refs!(GpuDCRTPoly => Add::add(self, rhs: &GpuDCRTPoly) -> GpuDCR
 
 impl_binop_with_refs!(GpuDCRTPoly => Sub::sub(self, rhs: &GpuDCRTPoly) -> GpuDCRTPoly {
     self.assert_compatible(rhs);
-    let mut out = GpuDCRTPoly::new_empty(self.params.clone(), self.level, self.is_ntt);
+    let out = GpuDCRTPoly::new_empty(self.params.clone(), self.level, self.is_ntt);
     let status = unsafe { gpu_poly_sub(out.raw, self.raw, rhs.raw) };
     check_status(status, "gpu_poly_sub");
     out
@@ -739,7 +729,7 @@ impl_binop_with_refs!(GpuDCRTPoly => Mul::mul(self, rhs: &GpuDCRTPoly) -> GpuDCR
     if self.is_ntt {
         panic!("gpu_poly_mul expects coefficient-domain inputs");
     }
-    let mut out = GpuDCRTPoly::new_empty(self.params.clone(), self.level, false);
+    let out = GpuDCRTPoly::new_empty(self.params.clone(), self.level, false);
     let status = unsafe { gpu_poly_mul(out.raw, self.raw, rhs.raw) };
     check_status(status, "gpu_poly_mul");
     out

@@ -378,9 +378,7 @@ impl GpuDCRTPoly {
             let modulus = BigUint::from(params.moduli[limb]);
             let residue = (value % &modulus).to_u64().unwrap_or(0);
             let base = limb * n;
-            for i in 0..n {
-                flat[base + i] = residue;
-            }
+            flat[base] = residue;
         }
         Self::from_flat(params.clone(), level, flat, false)
     }
@@ -611,7 +609,12 @@ impl Poly for GpuDCRTPoly {
 
     fn from_usize_to_lsb(params: &Self::Params, int: usize) -> Self {
         let n = params.ring_dimension as usize;
-        debug_assert!(int < (1 << n), "Input exceeds representable range for ring dimension");
+        if n <= usize::BITS as usize {
+            debug_assert!(
+                int < (1usize << n),
+                "Input exceeds representable range for ring dimension"
+            );
+        }
         let q = params.modulus();
         let one = FinRingElem::one(&q);
         let zero = FinRingElem::zero(&q);
@@ -701,6 +704,7 @@ impl Poly for GpuDCRTPoly {
             if i >= usize::BITS as usize {
                 break;
             }
+            // Convert BigUint to usize safely, saturating if too large
             let coeff_val = coeff.value().try_into().unwrap_or(usize::MAX);
             sum = sum.saturating_add((1usize << i).saturating_mul(coeff_val));
         }
@@ -819,6 +823,267 @@ fn build_compact_bytes(processed_coeffs: Vec<(bool, Vec<u8>)>, ring_dimension: u
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
+    };
+    use rand::prelude::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static GPU_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        GPU_TEST_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("gpu test mutex poisoned")
+    }
+
+    fn gpu_test_params() -> DCRTPolyParams {
+        DCRTPolyParams::new(128, 2, 17, 1)
+    }
+
+    fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {
+        let (moduli, _crt_bits, _crt_depth) = params.to_crt();
+        GpuDCRTPolyParams::new(params.ring_dimension(), moduli, params.base_bits())
+    }
+
+    fn gpu_poly_from_cpu(poly: &DCRTPoly, gpu_params: &GpuDCRTPolyParams) -> GpuDCRTPoly {
+        GpuDCRTPoly::from_coeffs(gpu_params, &poly.coeffs())
+    }
+
+    #[test]
+    fn test_gpu_dcrtpoly_const_int_roundtrip() {
+        let _guard = gpu_test_lock();
+        let mut rng = rand::rng();
+        let params = gpu_test_params();
+        let gpu_params = gpu_params_from_cpu(&params);
+        let max_value = 1usize << 33;
+
+        for _ in 0..10 {
+            let value = rng.random_range(0..max_value);
+            let lsb_poly = GpuDCRTPoly::from_usize_to_lsb(&gpu_params, value);
+            let poly = GpuDCRTPoly::from_usize_to_constant(&gpu_params, value);
+            let back = poly.to_const_int();
+            let back_from_lsb = lsb_poly.to_const_int();
+            assert_eq!(value, back);
+            assert_eq!(value, back_from_lsb);
+        }
+    }
+
+    #[test]
+    fn test_gpu_dcrtpoly_coeffs() {
+        let _guard = gpu_test_lock();
+        let mut rng = rand::rng();
+        let x = rng.random_range(12..20);
+        let size = rng.random_range(1..20);
+        let n = 2_i32.pow(x) as u32;
+        let params = DCRTPolyParams::new(n, size, 51, 2);
+        let gpu_params = gpu_params_from_cpu(&params);
+        let q = gpu_params.modulus();
+        let n = gpu_params.ring_dimension() as usize;
+        let mut coeffs: Vec<FinRingElem> = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            let value = rng.random_range(0..10000);
+            coeffs.push(FinRingElem::new(value, q.clone()));
+        }
+        let poly = GpuDCRTPoly::from_coeffs(&gpu_params, &coeffs);
+        let extracted_coeffs = poly.coeffs();
+        assert_eq!(coeffs, extracted_coeffs);
+    }
+
+    #[test]
+    fn test_gpu_dcrtpoly_arithmetic() {
+        let _guard = gpu_test_lock();
+        let params = gpu_test_params();
+        let gpu_params = gpu_params_from_cpu(&params);
+        let q = gpu_params.modulus();
+        let n = gpu_params.ring_dimension() as usize;
+
+        let mut coeffs1 = vec![FinRingElem::zero(&q); n];
+        let mut coeffs2 = vec![FinRingElem::zero(&q); n];
+        coeffs1[0] = FinRingElem::new(100u32, q.clone());
+        coeffs1[1] = FinRingElem::new(200u32, q.clone());
+        coeffs1[2] = FinRingElem::new(300u32, q.clone());
+        coeffs1[3] = FinRingElem::new(400u32, q.clone());
+        coeffs2[0] = FinRingElem::new(500u32, q.clone());
+        coeffs2[1] = FinRingElem::new(600u32, q.clone());
+        coeffs2[2] = FinRingElem::new(700u32, q.clone());
+        coeffs2[3] = FinRingElem::new(800u32, q.clone());
+
+        let poly1 = GpuDCRTPoly::from_coeffs(&gpu_params, &coeffs1);
+        let poly2 = GpuDCRTPoly::from_coeffs(&gpu_params, &coeffs2);
+
+        let sum = poly1.clone() + poly2.clone();
+        let product = &poly1 * &poly2;
+
+        let neg_poly2 = poly2.clone().neg();
+        let difference = poly1.clone() - poly2.clone();
+
+        let mut poly_add_assign = poly1.clone();
+        poly_add_assign += poly2.clone();
+
+        let mut poly_mul_assign = poly1.clone();
+        poly_mul_assign *= poly2.clone();
+
+        assert!(sum != poly1, "Sum should differ from original poly1");
+        assert!(neg_poly2 != poly2, "Negated polynomial should differ from original");
+        assert_eq!(difference + poly2, poly1, "p1 - p2 + p2 should be p1");
+
+        assert_eq!(poly_add_assign, sum, "+= result should match separate +");
+        assert_eq!(poly_mul_assign, product, "*= result should match separate *");
+
+        let const_poly = GpuDCRTPoly::from_usize_to_constant(&gpu_params, 123);
+        let mut const_coeffs = vec![FinRingElem::zero(&q); n];
+        const_coeffs[0] = FinRingElem::new(123, q.clone());
+        assert_eq!(
+            const_poly,
+            GpuDCRTPoly::from_coeffs(&gpu_params, &const_coeffs),
+            "from_const should produce a polynomial with constant term = 123"
+        );
+        let zero_poly = GpuDCRTPoly::const_zero(&gpu_params);
+        assert_eq!(
+            zero_poly,
+            GpuDCRTPoly::from_coeffs(&gpu_params, &vec![FinRingElem::new(0, q.clone()); n]),
+            "const_zero should produce a polynomial with all coeffs = 0"
+        );
+
+        let one_poly = GpuDCRTPoly::const_one(&gpu_params);
+        let mut one_coeffs = vec![FinRingElem::zero(&q); n];
+        one_coeffs[0] = FinRingElem::new(1, q);
+        assert_eq!(
+            one_poly,
+            GpuDCRTPoly::from_coeffs(&gpu_params, &one_coeffs),
+            "one_poly should produce a polynomial with constant term = 1"
+        );
+    }
+
+    #[test]
+    fn test_gpu_dcrtpoly_decompose() {
+        let _guard = gpu_test_lock();
+        let params = gpu_test_params();
+        let gpu_params = gpu_params_from_cpu(&params);
+        let sampler = DCRTPolyUniformSampler::new();
+        let cpu_poly = sampler.sample_poly(&params, &DistType::FinRingDist);
+        let poly = gpu_poly_from_cpu(&cpu_poly, &gpu_params);
+        let decomposed = poly.decompose_base(&gpu_params);
+        assert_eq!(decomposed.len(), { gpu_params.modulus_digits() });
+    }
+
+    #[test]
+    fn test_gpu_dcrtpoly_to_compact_bytes_bit_dist() {
+        let _guard = gpu_test_lock();
+        let params = gpu_test_params();
+        let gpu_params = gpu_params_from_cpu(&params);
+        let sampler = DCRTPolyUniformSampler::new();
+        let cpu_poly = sampler.sample_poly(&params, &DistType::BitDist);
+        let poly = gpu_poly_from_cpu(&cpu_poly, &gpu_params);
+        let bytes = poly.to_compact_bytes();
+
+        let ring_dimension = gpu_params.ring_dimension() as usize;
+
+        let max_byte_size = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        assert_eq!(max_byte_size, 1, "Max byte size size should be 1 for BitDist");
+
+        let bit_vector_byte_size = ring_dimension.div_ceil(8);
+
+        let expected_total_size = 4 + bit_vector_byte_size + (ring_dimension * max_byte_size);
+        assert_eq!(bytes.len(), expected_total_size, "Incorrect total byte size");
+
+        let bit_vector = &bytes[4..4 + bit_vector_byte_size];
+        assert_eq!(bit_vector.len(), bit_vector_byte_size, "Bit vector size is incorrect");
+
+        let coeffs_section = &bytes[4 + bit_vector_byte_size..];
+        assert_eq!(
+            coeffs_section.len(),
+            ring_dimension * max_byte_size,
+            "Coefficient section size is incorrect"
+        );
+
+        for (i, &coeff_byte) in coeffs_section.iter().enumerate() {
+            assert!(
+                coeff_byte == 0 || coeff_byte == 1,
+                "Coefficient at position {} should be 0 or 1, got {}",
+                i,
+                coeff_byte
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpu_dcrtpoly_to_compact_bytes_uniform_dist() {
+        let _guard = gpu_test_lock();
+        let params = gpu_test_params();
+        let gpu_params = gpu_params_from_cpu(&params);
+        let sampler = DCRTPolyUniformSampler::new();
+        let cpu_poly = sampler.sample_poly(&params, &DistType::FinRingDist);
+        let poly = gpu_poly_from_cpu(&cpu_poly, &gpu_params);
+        let bytes = poly.to_compact_bytes();
+        let modulus = gpu_params.modulus();
+        let modulus_byte_size = modulus.to_bytes_le().len();
+
+        let ring_dimension = gpu_params.ring_dimension() as usize;
+
+        let max_byte_size = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        assert!(
+            max_byte_size <= modulus_byte_size,
+            "Max byte size should be less than or equal to modulus byte size"
+        );
+
+        let bit_vector_byte_size = ring_dimension.div_ceil(8);
+
+        let expected_total_size = 4 + bit_vector_byte_size + (ring_dimension * max_byte_size);
+        assert_eq!(bytes.len(), expected_total_size, "Incorrect total byte size");
+
+        let bit_vector = &bytes[4..4 + bit_vector_byte_size];
+        assert_eq!(bit_vector.len(), bit_vector_byte_size, "Bit vector size is incorrect");
+
+        let coeffs_section = &bytes[4 + bit_vector_byte_size..];
+        assert_eq!(
+            coeffs_section.len(),
+            ring_dimension * max_byte_size,
+            "Coefficient section size is incorrect"
+        );
+    }
+
+    #[test]
+    fn test_gpu_dcrtpoly_from_compact_bytes() {
+        let _guard = gpu_test_lock();
+        let params = gpu_test_params();
+        let gpu_params = gpu_params_from_cpu(&params);
+        let sampler = DCRTPolyUniformSampler::new();
+
+        let original_cpu_poly = sampler.sample_poly(&params, &DistType::BitDist);
+        let original_poly = gpu_poly_from_cpu(&original_cpu_poly, &gpu_params);
+        let bytes = original_poly.to_compact_bytes();
+        let reconstructed_poly = GpuDCRTPoly::from_compact_bytes(&gpu_params, &bytes);
+        assert_eq!(
+            original_poly, reconstructed_poly,
+            "Reconstructed polynomial does not match original (BitDist)"
+        );
+
+        let original_cpu_poly = sampler.sample_poly(&params, &DistType::FinRingDist);
+        let original_poly = gpu_poly_from_cpu(&original_cpu_poly, &gpu_params);
+        let bytes = original_poly.to_compact_bytes();
+        let reconstructed_poly = GpuDCRTPoly::from_compact_bytes(&gpu_params, &bytes);
+        assert_eq!(
+            original_poly, reconstructed_poly,
+            "Reconstructed polynomial does not match original (FinRingDist)"
+        );
+
+        let original_cpu_poly = sampler.sample_poly(&params, &DistType::GaussDist { sigma: 3.2 });
+        let original_poly = gpu_poly_from_cpu(&original_cpu_poly, &gpu_params);
+        let bytes = original_poly.to_compact_bytes();
+        let reconstructed_poly = GpuDCRTPoly::from_compact_bytes(&gpu_params, &bytes);
+        assert_eq!(
+            original_poly, reconstructed_poly,
+            "Reconstructed polynomial does not match original (GaussDist)"
+        );
+    }
 }
 
 fn reconstruct_coeffs_chunked(

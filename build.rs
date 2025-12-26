@@ -78,9 +78,21 @@ fn main() {
         build.compile("gpupoly");
 
         println!("cargo::rustc-link-search=native={fides_lib_dir}");
-        println!("cargo::rustc-link-lib=fideslib");
+        let fideslib_prefixed = PathBuf::from(&fides_lib_dir).join("libfideslib.a");
+        let fideslib_unprefixed = PathBuf::from(&fides_lib_dir).join("fideslib.a");
+        if fideslib_prefixed.exists() {
+            println!("cargo::rustc-link-lib=static=fideslib");
+        } else if fideslib_unprefixed.exists() {
+            println!("cargo::rustc-link-arg={}", fideslib_unprefixed.display());
+        } else {
+            println!(
+                "cargo::warning=FIDESlib library not found in {fides_lib_dir} (expected libfideslib.a or fideslib.a)"
+            );
+            println!("cargo::rustc-link-lib=fideslib");
+        }
 
         println!("cargo::rustc-link-search=native={cuda_lib_dir}");
         println!("cargo::rustc-link-lib=cudart");
+        println!("cargo::rustc-link-lib=cudadevrt");
     }
 }

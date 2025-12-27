@@ -318,7 +318,7 @@ unsafe impl Send for GpuDCRTPoly {}
 unsafe impl Sync for GpuDCRTPoly {}
 
 impl GpuDCRTPoly {
-    fn new_empty(params: Arc<GpuDCRTPolyParams>, level: usize, is_ntt: bool) -> Self {
+    pub(crate) fn new_empty(params: Arc<GpuDCRTPolyParams>, level: usize, is_ntt: bool) -> Self {
         let mut poly_ptr: *mut GpuPolyOpaque = ptr::null_mut();
         let status = unsafe {
             gpu_poly_create(params.ctx.raw, level as c_int, &mut poly_ptr as *mut *mut GpuPolyOpaque)
@@ -343,7 +343,7 @@ impl GpuDCRTPoly {
         flat
     }
 
-    fn ensure_coeff_domain(&self) -> Self {
+    pub(crate) fn ensure_coeff_domain(&self) -> Self {
         if !self.is_ntt {
             return self.clone();
         }
@@ -354,7 +354,11 @@ impl GpuDCRTPoly {
         tmp
     }
 
-    fn ntt_in_place(&mut self) {
+    pub(crate) fn is_ntt(&self) -> bool {
+        self.is_ntt
+    }
+
+    pub(crate) fn ntt_in_place(&mut self) {
         if self.is_ntt {
             return;
         }
@@ -363,11 +367,87 @@ impl GpuDCRTPoly {
         self.is_ntt = true;
     }
 
-
     fn assert_compatible(&self, other: &Self) {
         assert_eq!(self.level, other.level, "GPU polynomials must have the same level");
         assert_eq!(self.params.as_ref(), other.params.as_ref(), "GPU params must match");
         assert_eq!(self.is_ntt, other.is_ntt, "GPU polynomials must share the same domain");
+    }
+
+    pub(crate) fn load_from_compact_bytes(&mut self, bytes: &[u8]) {
+        let ring_dimension = self.params.ring_dimension() as usize;
+        if ring_dimension == 0 {
+            return;
+        }
+        let max_byte_size = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let bit_vector_byte_size = ring_dimension.div_ceil(8);
+        let bit_vector = &bytes[4..4 + bit_vector_byte_size];
+        let coeffs_base_offset = 4 + bit_vector_byte_size;
+        let modulus = self.params.modulus();
+        let coeffs: Vec<FinRingElem> = reconstruct_coeffs_chunked(
+            bytes,
+            ring_dimension,
+            max_byte_size,
+            bit_vector,
+            coeffs_base_offset,
+            &modulus,
+            chunk_size_for(ring_dimension),
+        );
+
+        let n = ring_dimension;
+        let level = self.level;
+        let mut flat = vec![0u64; (level + 1) * n];
+        let moduli = self.params.moduli();
+        for (i, coeff) in coeffs.iter().enumerate() {
+            let value = coeff.value();
+            for limb in 0..=level {
+                let modulus = BigUint::from(moduli[limb]);
+                let residue = (value % modulus).to_u64().unwrap_or(0);
+                flat[limb * n + i] = residue;
+            }
+        }
+
+        let status = unsafe { gpu_poly_load_rns(self.raw, flat.as_ptr(), flat.len()) };
+        check_status(status, "gpu_poly_load_rns");
+        self.is_ntt = false;
+    }
+
+    pub(crate) fn add_into(out: &mut GpuDCRTPoly, a: &GpuDCRTPoly, b: &GpuDCRTPoly) {
+        a.assert_compatible(b);
+        assert_eq!(out.level, a.level, "GPU polynomials must have the same level");
+        assert_eq!(out.params.as_ref(), a.params.as_ref(), "GPU params must match");
+        let status = unsafe { gpu_poly_add(out.raw, a.raw, b.raw) };
+        check_status(status, "gpu_poly_add");
+        out.is_ntt = a.is_ntt;
+    }
+
+    pub(crate) fn sub_into(out: &mut GpuDCRTPoly, a: &GpuDCRTPoly, b: &GpuDCRTPoly) {
+        a.assert_compatible(b);
+        assert_eq!(out.level, a.level, "GPU polynomials must have the same level");
+        assert_eq!(out.params.as_ref(), a.params.as_ref(), "GPU params must match");
+        let status = unsafe { gpu_poly_sub(out.raw, a.raw, b.raw) };
+        check_status(status, "gpu_poly_sub");
+        out.is_ntt = a.is_ntt;
+    }
+
+    pub(crate) fn mul_into(out: &mut GpuDCRTPoly, a: &GpuDCRTPoly, b: &GpuDCRTPoly) {
+        a.assert_compatible(b);
+        assert_eq!(out.level, a.level, "GPU polynomials must have the same level");
+        assert_eq!(out.params.as_ref(), a.params.as_ref(), "GPU params must match");
+        let status = unsafe { gpu_poly_mul(out.raw, a.raw, b.raw) };
+        check_status(status, "gpu_poly_mul");
+        out.is_ntt = true;
+    }
+
+    pub(crate) fn add_in_place(&mut self, rhs: &GpuDCRTPoly) {
+        self.assert_compatible(rhs);
+        let status = unsafe { gpu_poly_add(self.raw, self.raw, rhs.raw) };
+        check_status(status, "gpu_poly_add");
+    }
+
+    pub(crate) fn sub_in_place(&mut self, rhs: &GpuDCRTPoly) {
+        self.assert_compatible(rhs);
+        let status = unsafe { gpu_poly_sub(self.raw, self.raw, rhs.raw) };
+        check_status(status, "gpu_poly_sub");
     }
 
     fn constant_with_value(params: &Arc<GpuDCRTPolyParams>, value: &BigUint) -> Self {

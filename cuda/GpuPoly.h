@@ -29,13 +29,19 @@ int gpu_context_get_N(const GpuContext* ctx, int* out_N);
 int gpu_poly_create(GpuContext* ctx, int level, GpuPoly** out_poly);
 void gpu_poly_destroy(GpuPoly* poly);
 
+int gpu_pinned_alloc(size_t bytes, void** out_ptr);
+int gpu_pinned_free(void* ptr);
+
 int gpu_poly_clone(const GpuPoly* src, GpuPoly** out_poly);
 int gpu_poly_copy(GpuPoly* dst, const GpuPoly* src);
 
 int gpu_poly_get_level(const GpuPoly* poly, int* out_level);
 
 int gpu_poly_load_rns(GpuPoly* poly, const uint64_t* coeffs_flat, size_t coeffs_len);
+int gpu_poly_load_rns_async(GpuPoly* poly, const uint64_t* coeffs_flat, size_t coeffs_len);
 int gpu_poly_store_rns(GpuPoly* poly, uint64_t* coeffs_flat_out, size_t coeffs_len);
+int gpu_poly_store_rns_async(GpuPoly* poly, uint64_t* coeffs_flat_out, size_t coeffs_len);
+int gpu_poly_sync(GpuPoly* poly);
 
 int gpu_poly_add(GpuPoly* out, const GpuPoly* a, const GpuPoly* b);
 int gpu_poly_sub(GpuPoly* out, const GpuPoly* a, const GpuPoly* b);

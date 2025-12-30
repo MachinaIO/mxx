@@ -90,7 +90,12 @@ impl GpuDCRTPolyMatrix {
         Self::from_compact_bytes(params, &bytes)
     }
 
-    fn write_block(out: &mut GpuDCRTPolyMatrix, rows: Range<usize>, cols: Range<usize>, block: &GpuBlock) {
+    fn write_block(
+        out: &mut GpuDCRTPolyMatrix,
+        rows: &Range<usize>,
+        cols: &Range<usize>,
+        block: &mut GpuBlock,
+    ) {
         let rows_len = rows.end - rows.start;
         let cols_len = cols.end - cols.start;
         for i in 0..rows_len {
@@ -224,7 +229,7 @@ impl GpuDCRTPolyMatrix {
                     }
                 }
 
-                Self::write_block(&mut out, rows, cols, &block_out);
+                Self::write_block(&mut out, &rows, &cols, &mut block_out);
             }
         }
 
@@ -473,6 +478,14 @@ impl MulSlot {
         let count = rows_len * cols_len;
         self.acc_init.clear();
         self.acc_init.resize(count, false);
+        if self.scratch.is_none() {
+            let scratch = GpuDCRTPoly::new_empty(
+                self.block_acc.params.clone(),
+                self.block_acc.level,
+                false,
+            );
+            self.scratch = Some(scratch);
+        }
 
         for ip_pair in ip_offsets.windows(2) {
             let ips = ip_pair[0]..ip_pair[1];
@@ -493,12 +506,9 @@ impl MulSlot {
                             GpuDCRTPoly::mul_into(&mut self.block_acc.polys[acc_idx], a, b);
                             self.acc_init[acc_idx] = true;
                         } else {
-                            {
-                                let scratch = self.scratch_poly();
-                                GpuDCRTPoly::mul_into(scratch, a, b);
-                            }
-                            let scratch_ref = self.scratch.as_ref().expect("scratch poly should exist");
-                            self.block_acc.polys[acc_idx].add_in_place(scratch_ref);
+                            let scratch = self.scratch.as_mut().expect("scratch poly should exist");
+                            GpuDCRTPoly::mul_into(scratch, a, b);
+                            self.block_acc.polys[acc_idx].add_in_place(scratch);
                         }
                     }
                 }
@@ -820,7 +830,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
 
                         let out_rows = i * other.nrow + rows.start..i * other.nrow + rows.end;
                         let out_cols = j * other.ncol + cols.start..j * other.ncol + cols.end;
-                        Self::write_block(&mut out, out_rows, out_cols, &block_out);
+                        Self::write_block(&mut out, &out_rows, &out_cols, &mut block_out);
                     }
                 }
             }
@@ -1206,9 +1216,16 @@ fn fill_one_rns_flat(params: &GpuDCRTPolyParams, level: usize, out: &mut [u64]) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{element::finite_ring::FinRingElem, poly::dcrt::params::DCRTPolyParams};
+    use crate::{
+        element::{finite_ring::FinRingElem, PolyElem},
+        poly::dcrt::params::DCRTPolyParams,
+    };
     use num_bigint::BigUint;
     use std::sync::Arc;
+
+    fn gpu_test_params() -> DCRTPolyParams {
+        DCRTPolyParams::new(128, 2, 17, 1)
+    }
 
     fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {
         let (moduli, _crt_bits, _crt_depth) = params.to_crt();
@@ -1216,9 +1233,9 @@ mod tests {
     }
 
     #[test]
-    fn test_matrix_gadget_matrix() {
+    fn test_gpu_matrix_gadget_matrix() {
         let _guard = crate::poly::dcrt::gpu::gpu_test_lock();
-        let params = DCRTPolyParams::default();
+        let params = gpu_test_params();
         let gpu_params = gpu_params_from_cpu(&params);
         let size = 3;
         let gadget_matrix = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, size);
@@ -1227,9 +1244,9 @@ mod tests {
     }
 
     #[test]
-    fn test_matrix_decompose() {
+    fn test_gpu_matrix_decompose() {
         let _guard = crate::poly::dcrt::gpu::gpu_test_lock();
-        let params = DCRTPolyParams::default();
+        let params = gpu_test_params();
         let gpu_params = gpu_params_from_cpu(&params);
         let bit_length = gpu_params.modulus_bits();
 
@@ -1271,9 +1288,9 @@ mod tests {
     }
 
     #[test]
-    fn test_matrix_decompose_with_base8() {
+    fn test_gpu_matrix_decompose_with_base8() {
         let _guard = crate::poly::dcrt::gpu::gpu_test_lock();
-        let params = DCRTPolyParams::new(4, 2, 17, 3);
+        let params = DCRTPolyParams::new(128, 2, 17, 3);
         let gpu_params = gpu_params_from_cpu(&params);
         let digits_length = gpu_params.modulus_digits();
 
@@ -1315,9 +1332,9 @@ mod tests {
     }
 
     #[test]
-    fn test_matrix_decompose_with_unaligned_base() {
+    fn test_gpu_matrix_decompose_with_unaligned_base() {
         let _guard = crate::poly::dcrt::gpu::gpu_test_lock();
-        let params = DCRTPolyParams::new(4, 1, 52, 17);
+        let params = DCRTPolyParams::new(128, 1, 52, 17);
         let gpu_params = gpu_params_from_cpu(&params);
         let digits_length = gpu_params.modulus_digits();
 
@@ -1359,9 +1376,9 @@ mod tests {
     }
 
     #[test]
-    fn test_matrix_basic_operations() {
+    fn test_gpu_matrix_basic_operations() {
         let _guard = crate::poly::dcrt::gpu::gpu_test_lock();
-        let params = DCRTPolyParams::default();
+        let params = gpu_test_params();
         let gpu_params = gpu_params_from_cpu(&params);
 
         let zero = GpuDCRTPolyMatrix::zero(&gpu_params, 2, 2);
@@ -1399,9 +1416,9 @@ mod tests {
     }
 
     #[test]
-    fn test_matrix_concatenation() {
+    fn test_gpu_matrix_concatenation() {
         let _guard = crate::poly::dcrt::gpu::gpu_test_lock();
-        let params = DCRTPolyParams::default();
+        let params = gpu_test_params();
         let gpu_params = gpu_params_from_cpu(&params);
         let value = FinRingElem::new(5u32, gpu_params.modulus());
 
@@ -1445,9 +1462,9 @@ mod tests {
     }
 
     #[test]
-    fn test_matrix_tensor_product() {
+    fn test_gpu_matrix_tensor_product() {
         let _guard = crate::poly::dcrt::gpu::gpu_test_lock();
-        let params = DCRTPolyParams::default();
+        let params = gpu_test_params();
         let gpu_params = gpu_params_from_cpu(&params);
         let value = FinRingElem::new(5u32, gpu_params.modulus());
 
@@ -1480,9 +1497,9 @@ mod tests {
     }
 
     #[test]
-    fn test_matrix_modulus_switch() {
+    fn test_gpu_matrix_modulus_switch() {
         let _guard = crate::poly::dcrt::gpu::gpu_test_lock();
-        let params = DCRTPolyParams::default();
+        let params = gpu_test_params();
         let gpu_params = gpu_params_from_cpu(&params);
 
         let value00 = FinRingElem::new(1023782870921908217643761278891282178u128, gpu_params.modulus());
@@ -1530,9 +1547,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "Addition requires matrices of same dimensions")]
     #[cfg(debug_assertions)]
-    fn test_matrix_addition_mismatch() {
+    fn test_gpu_matrix_addition_mismatch() {
         let _guard = crate::poly::dcrt::gpu::gpu_test_lock();
-        let params = DCRTPolyParams::default();
+        let params = gpu_test_params();
         let gpu_params = gpu_params_from_cpu(&params);
         let matrix1 = GpuDCRTPolyMatrix::zero(&gpu_params, 2, 2);
         let matrix2 = GpuDCRTPolyMatrix::zero(&gpu_params, 2, 3);
@@ -1542,9 +1559,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "Multiplication condition failed")]
     #[cfg(debug_assertions)]
-    fn test_matrix_multiplication_mismatch() {
+    fn test_gpu_matrix_multiplication_mismatch() {
         let _guard = crate::poly::dcrt::gpu::gpu_test_lock();
-        let params = DCRTPolyParams::default();
+        let params = gpu_test_params();
         let gpu_params = gpu_params_from_cpu(&params);
         let matrix1 = GpuDCRTPolyMatrix::zero(&gpu_params, 2, 2);
         let matrix2 = GpuDCRTPolyMatrix::zero(&gpu_params, 3, 2);

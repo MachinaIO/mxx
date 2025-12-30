@@ -46,6 +46,9 @@ int gpu_poly_intt(GpuPoly* poly, int batch);
 
 const char* gpu_last_error();
 
+void* gpu_pinned_alloc(size_t bytes);
+void gpu_pinned_free(void* ptr);
+
 #ifdef __cplusplus
 }
 #endif

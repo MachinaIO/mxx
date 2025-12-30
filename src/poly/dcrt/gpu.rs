@@ -12,10 +12,15 @@ use std::{
     fmt::Debug,
     hash::Hash,
     ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
+    mem,
     os::raw::{c_char, c_int},
-    ptr,
+    ptr::{self, NonNull},
+    slice,
     sync::Arc,
 };
+
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 #[allow(non_camel_case_types)]
 #[repr(C)]
@@ -68,6 +73,9 @@ unsafe extern "C" {
     fn gpu_poly_intt(poly: *mut GpuPolyOpaque, batch: c_int) -> c_int;
 
     fn gpu_last_error() -> *const c_char;
+
+    fn gpu_pinned_alloc(bytes: usize) -> *mut u8;
+    fn gpu_pinned_free(ptr: *mut u8);
 }
 
 fn last_error_string() -> String {
@@ -86,6 +94,128 @@ fn check_status(code: c_int, context: &str) {
     }
 }
 
+fn pinned_alloc<T>(len: usize) -> NonNull<T> {
+    if len == 0 {
+        return NonNull::dangling();
+    }
+    let bytes = len
+        .checked_mul(mem::size_of::<T>())
+        .expect("pinned buffer size overflow");
+    let ptr = unsafe { gpu_pinned_alloc(bytes) } as *mut T;
+    if ptr.is_null() {
+        panic!("gpu_pinned_alloc failed: {}", last_error_string());
+    }
+    NonNull::new(ptr).expect("gpu_pinned_alloc returned null")
+}
+
+pub struct PinnedHostBuffer<T> {
+    ptr: NonNull<T>,
+    len: usize,
+    cap: usize,
+}
+
+unsafe impl<T: Send> Send for PinnedHostBuffer<T> {}
+unsafe impl<T: Sync> Sync for PinnedHostBuffer<T> {}
+
+impl<T> PinnedHostBuffer<T> {
+    pub(crate) fn new() -> Self {
+        Self { ptr: NonNull::dangling(), len: 0, cap: 0 }
+    }
+
+    pub(crate) fn as_slice(&self) -> &[T] {
+        if self.len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        }
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
+        if self.len == 0 {
+            &mut []
+        } else {
+            unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl<T: Copy> PinnedHostBuffer<T> {
+    pub(crate) fn from_slice(slice: &[T]) -> Self {
+        if slice.is_empty() {
+            return Self::new();
+        }
+        let ptr = pinned_alloc::<T>(slice.len());
+        unsafe {
+            ptr::copy_nonoverlapping(slice.as_ptr(), ptr.as_ptr(), slice.len());
+        }
+        Self { ptr, len: slice.len(), cap: slice.len() }
+    }
+
+    pub(crate) fn to_vec(&self) -> Vec<T> {
+        self.as_slice().to_vec()
+    }
+
+    pub(crate) fn set_slice(&mut self, slice: &[T]) {
+        if slice.len() > self.cap {
+            self.reserve(slice.len());
+        }
+        if !slice.is_empty() {
+            unsafe {
+                ptr::copy_nonoverlapping(slice.as_ptr(), self.ptr.as_ptr(), slice.len());
+            }
+        }
+        self.len = slice.len();
+    }
+
+    pub(crate) fn reserve(&mut self, capacity: usize) {
+        if capacity <= self.cap {
+            return;
+        }
+        let new_ptr = pinned_alloc::<T>(capacity);
+        if self.len > 0 {
+            unsafe {
+                ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr.as_ptr(), self.len);
+            }
+        }
+        if self.cap > 0 {
+            unsafe {
+                gpu_pinned_free(self.ptr.as_ptr() as *mut u8);
+            }
+        }
+        self.ptr = new_ptr;
+        self.cap = capacity;
+    }
+}
+
+impl<T: Copy> Clone for PinnedHostBuffer<T> {
+    fn clone(&self) -> Self {
+        Self::from_slice(self.as_slice())
+    }
+}
+
+impl<T: PartialEq> PartialEq for PinnedHostBuffer<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<T: Eq> Eq for PinnedHostBuffer<T> {}
+
+impl<T> Drop for PinnedHostBuffer<T> {
+    fn drop(&mut self) {
+        if self.cap == 0 {
+            return;
+        }
+        unsafe {
+            gpu_pinned_free(self.ptr.as_ptr() as *mut u8);
+        }
+    }
+}
+
 fn bits_in_u64(value: u64) -> usize {
     (u64::BITS - value.leading_zeros()) as usize
 }
@@ -93,6 +223,15 @@ fn bits_in_u64(value: u64) -> usize {
 fn log2_u32(value: u32) -> u32 {
     assert!(value.is_power_of_two(), "ring_dimension must be a power of 2");
     value.trailing_zeros()
+}
+
+#[cfg(test)]
+pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static GPU_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    GPU_TEST_MUTEX
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("gpu test mutex poisoned")
 }
 
 #[derive(Clone)]
@@ -913,15 +1052,7 @@ mod tests {
         sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
     };
     use rand::prelude::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static GPU_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-        GPU_TEST_MUTEX
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("gpu test mutex poisoned")
-    }
+    use super::gpu_test_lock;
 
     fn gpu_test_params() -> DCRTPolyParams {
         DCRTPolyParams::new(128, 2, 17, 1)

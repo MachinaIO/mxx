@@ -5,6 +5,7 @@
 #include <new>
 #include <string>
 #include <vector>
+#include <cuda_runtime.h>
 
 // FIDESlib headers (expected under third_party/FIDESlib/include).
 #include "../third_party/FIDESlib/include/CKKS/Context.cuh"
@@ -539,6 +540,48 @@ extern "C"
     const char *gpu_last_error()
     {
         return last_error.c_str();
+    }
+
+    void *gpu_pinned_alloc(size_t bytes)
+    {
+        try
+        {
+            if (bytes == 0)
+            {
+                return nullptr;
+            }
+            void *ptr = nullptr;
+            cudaError_t err = cudaMallocHost(&ptr, bytes);
+            if (err != cudaSuccess)
+            {
+                set_error(cudaGetErrorString(err));
+                return nullptr;
+            }
+            return ptr;
+        }
+        catch (const std::exception &e)
+        {
+            set_error(e);
+            return nullptr;
+        }
+        catch (...)
+        {
+            set_error("unknown exception in gpu_pinned_alloc");
+            return nullptr;
+        }
+    }
+
+    void gpu_pinned_free(void *ptr)
+    {
+        if (!ptr)
+        {
+            return;
+        }
+        cudaError_t err = cudaFreeHost(ptr);
+        if (err != cudaSuccess)
+        {
+            set_error(cudaGetErrorString(err));
+        }
     }
 
 } // extern "C"

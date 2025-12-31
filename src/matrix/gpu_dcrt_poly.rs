@@ -36,10 +36,31 @@ impl Debug for GpuDCRTPolyMatrix {
 
 impl PartialEq for GpuDCRTPolyMatrix {
     fn eq(&self, other: &Self) -> bool {
-        self.params == other.params &&
-            self.nrow == other.nrow &&
-            self.ncol == other.ncol &&
-            self.entries == other.entries
+        if self.params != other.params || self.nrow != other.nrow || self.ncol != other.ncol {
+            return false;
+        }
+        if self.entries == other.entries {
+            return true;
+        }
+
+        let total = self.nrow.saturating_mul(self.ncol);
+        for idx in 0..total {
+            let mut lhs = GpuDCRTPoly::from_compact_bytes(
+                &self.params,
+                self.entries[idx].as_slice(),
+            );
+            let mut rhs = GpuDCRTPoly::from_compact_bytes(
+                &other.params,
+                other.entries[idx].as_slice(),
+            );
+            // Align to eval format before comparing to avoid mismatches across domains.
+            lhs.ntt_in_place();
+            rhs.ntt_in_place();
+            if lhs.to_compact_bytes() != rhs.to_compact_bytes() {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -83,9 +104,26 @@ impl GpuDCRTPolyMatrix {
         super::dcrt_poly::DCRTPolyMatrix::from_compact_bytes(&cpu_params, &bytes)
     }
 
-    fn from_cpu_matrix(params: &GpuDCRTPolyParams, matrix: &super::dcrt_poly::DCRTPolyMatrix) -> Self {
-        let bytes = matrix.to_compact_bytes();
-        Self::from_compact_bytes(params, &bytes)
+    pub fn from_cpu_matrix(
+        params: &GpuDCRTPolyParams,
+        matrix: &super::dcrt_poly::DCRTPolyMatrix,
+    ) -> Self {
+        let (nrow, ncol) = matrix.size();
+        if nrow == 0 || ncol == 0 {
+            return Self { params: params.clone(), nrow, ncol, entries: Vec::new() };
+        }
+
+        let mut entries = Vec::with_capacity(nrow.saturating_mul(ncol));
+        for i in 0..nrow {
+            let row = matrix.get_row(i);
+            for poly in row {
+                let bytes = poly.to_compact_bytes();
+                let  gpu_poly = GpuDCRTPoly::from_compact_bytes(params, &bytes);
+                entries.push(PinnedHostBuffer::from_slice(&gpu_poly.to_compact_bytes()));
+            }
+        }
+
+        Self { params: params.clone(), nrow, ncol, entries }
     }
 
     fn write_block(
@@ -296,6 +334,7 @@ impl GpuBlock {
                 let idx = self.idx(i, j);
                 let entry_idx = (rows.start + i) * ncol + (cols.start + j);
                 self.polys[idx].load_from_compact_bytes(entries[entry_idx].as_slice());
+                self.polys[idx].ntt_in_place();
             }
         }
     }
@@ -347,6 +386,9 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         }
         let nrow = vec.len();
         let ncol = vec[0].len();
+        if ncol == 0 {
+            return Self { params: params.clone(), nrow, ncol, entries: Vec::new()};
+        }
         let mut entries = Vec::with_capacity(nrow.saturating_mul(ncol));
         for row in vec {
             for poly in row {
@@ -358,7 +400,9 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
     }
 
     fn entry(&self, i: usize, j: usize) -> Self::P {
-        GpuDCRTPoly::from_compact_bytes(&self.params, self.entry_bytes(i, j))
+        let mut poly = GpuDCRTPoly::from_compact_bytes(&self.params, self.entry_bytes(i, j));
+        poly.ntt_in_place();
+        poly
     }
 
     fn set_entry(&mut self, i: usize, j: usize, elem: Self::P) {
@@ -368,13 +412,23 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
 
     fn get_row(&self, i: usize) -> Vec<Self::P> {
         (0..self.ncol)
-            .map(|j| GpuDCRTPoly::from_compact_bytes(&self.params, self.entry_bytes(i, j)))
+            .map(|j| {
+                let mut poly =
+                    GpuDCRTPoly::from_compact_bytes(&self.params, self.entry_bytes(i, j));
+                poly.ntt_in_place();
+                poly
+            })
             .collect()
     }
 
     fn get_column(&self, j: usize) -> Vec<Self::P> {
         (0..self.nrow)
-            .map(|i| GpuDCRTPoly::from_compact_bytes(&self.params, self.entry_bytes(i, j)))
+            .map(|i| {
+                let mut poly =
+                    GpuDCRTPoly::from_compact_bytes(&self.params, self.entry_bytes(i, j));
+                poly.ntt_in_place();
+                poly
+            })
             .collect()
     }
 
@@ -406,9 +460,11 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
 
     fn identity(params: &<Self::P as Poly>::Params, size: usize, scalar: Option<Self::P>) -> Self {
         let zero_bytes = zero_compact_bytes(params);
-        let scalar_bytes = match scalar {
-            Some(poly) => poly.to_compact_bytes(),
-            None => one_compact_bytes(params),
+        let scalar_bytes = {
+            match scalar {
+                Some(poly) => poly.to_compact_bytes(),
+                None => one_compact_bytes(params),
+            }
         };
         let mut entries = Vec::with_capacity(size.saturating_mul(size));
         for _ in 0..size.saturating_mul(size) {
@@ -532,6 +588,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         for i in 0..self.nrow {
             for j in 0..self.ncol {
                 scalar.load_from_compact_bytes(self.entry_bytes(i, j));
+                scalar.ntt_in_place();
                 for row_pair in row_offsets.windows(2) {
                     let rows = row_pair[0]..row_pair[1];
                     for col_pair in col_offsets.windows(2) {
@@ -585,7 +642,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
     ) -> Self {
         let cpu_matrix = self.to_cpu_matrix();
         let switched = cpu_matrix.modulus_switch(new_modulus);
-        Self::from_compact_bytes(&self.params, &switched.to_compact_bytes())
+        Self::from_cpu_matrix(&self.params, &switched)
     }
 
     fn mul_tensor_identity(&self, other: &Self, identity_size: usize) -> Self {
@@ -709,10 +766,12 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         for i in 0..rows_len {
             let mut row = Vec::with_capacity(cols_len);
             for j in 0..cols_len {
-                row.push(GpuDCRTPoly::from_compact_bytes(
+                let mut poly = GpuDCRTPoly::from_compact_bytes(
                     &self.params,
                     self.entry_bytes(rows.start + i, cols.start + j),
-                ));
+                );
+                poly.ntt_in_place();
+                row.push(poly);
             }
             result.push(row);
         }

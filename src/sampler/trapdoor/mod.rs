@@ -13,11 +13,15 @@ use crate::{
 use openfhe::ffi::{ExtractMatrixCols, FormatMatrixCoefficient, SampleP1ForPertMat};
 use rayon::iter::ParallelIterator;
 pub use sampler::DCRTPolyTrapdoorSampler;
+#[cfg(feature = "gpu")]
+pub use gpu::{GpuDCRTPolyTrapdoorSampler, GpuDCRTTrapdoor};
 use std::{cmp::min, ops::Range, sync::Arc};
 use utils::{gen_dgg_int_vec, gen_int_karney, split_int64_mat_to_elems};
 
 pub mod sampler;
 pub mod utils;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 
 pub(crate) const KARNEY_THRESHOLD: f64 = 300.0;
 

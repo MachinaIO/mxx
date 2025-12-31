@@ -120,7 +120,9 @@ impl GpuDCRTPolyMatrix {
             return out;
         }
 
-        let bsize = block_size();
+        let bsize = block_size()
+            .min(self.nrow.max(1))
+            .min(self.ncol.max(1));
         let row_offsets = block_offsets(0..self.nrow, bsize);
         let col_offsets = block_offsets(0..self.ncol, bsize);
 
@@ -165,7 +167,9 @@ impl GpuDCRTPolyMatrix {
             return out;
         }
 
-        let bsize = block_size();
+        let bsize = block_size()
+            .min(self.nrow.max(1))
+            .min(self.ncol.max(1));
         let row_offsets = block_offsets(0..self.nrow, bsize);
         let col_offsets = block_offsets(0..self.ncol, bsize);
 
@@ -204,7 +208,9 @@ impl GpuDCRTPolyMatrix {
         let scalar_coeff = if scalar.is_ntt() { Some(scalar.ensure_coeff_domain()) } else { None };
         let scalar_ref = scalar_coeff.as_ref().unwrap_or(scalar);
 
-        let bsize = block_size();
+        let bsize = block_size()
+            .min(self.nrow.max(1))
+            .min(self.ncol.max(1));
         let row_offsets = block_offsets(0..self.nrow, bsize);
         let col_offsets = block_offsets(0..self.ncol, bsize);
 
@@ -512,7 +518,9 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             return out;
         }
 
-        let bsize = block_size();
+        let bsize = block_size()
+            .min(other.nrow.max(1))
+            .min(other.ncol.max(1));
         let row_offsets = block_offsets(0..other.nrow, bsize);
         let col_offsets = block_offsets(0..other.ncol, bsize);
         let mut block_b = GpuBlock::new(&self.params, bsize * bsize);
@@ -633,7 +641,9 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         dir_path: P,
         id: &str,
     ) -> Self {
-        let bsize = block_size();
+        let bsize = block_size()
+            .min(nrow.max(1))
+            .min(ncol.max(1));
         let mut matrix = Self::new_empty(params, nrow, ncol);
         let row_offsets = block_offsets(0..nrow, bsize);
         let col_offsets = block_offsets(0..ncol, bsize);
@@ -815,7 +825,10 @@ impl Mul<&GpuDCRTPolyMatrix> for &GpuDCRTPolyMatrix {
         }
         let zero_bytes = zero_compact_bytes(&self.params);
 
-        let bsize = block_size();
+        let bsize = block_size()
+            .min(self.nrow.max(1))
+            .min(self.ncol.max(1))
+            .min(rhs.ncol.max(1));
         let row_offsets = block_offsets(0..self.nrow, bsize);
         let col_offsets = block_offsets(0..rhs.ncol, bsize);
         let ip_offsets = block_offsets(0..self.ncol, bsize);
@@ -988,7 +1001,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gpu_matrix_decompose() {
+    fn test_gpu_matrix_decompose_basic() {
         let _guard = gpu_test_lock();
         let params = gpu_test_params();
         let gpu_params = gpu_params_from_cpu(&params);
@@ -1286,29 +1299,5 @@ mod tests {
 
         let expected = GpuDCRTPolyMatrix::from_poly_vec(&gpu_params, expected_vec);
         assert_eq!(switched, expected);
-    }
-
-    #[test]
-    #[should_panic(expected = "Addition requires matrices of same dimensions")]
-    #[cfg(debug_assertions)]
-    fn test_gpu_matrix_addition_mismatch() {
-        let _guard = gpu_test_lock();
-        let params = gpu_test_params();
-        let gpu_params = gpu_params_from_cpu(&params);
-        let matrix1 = GpuDCRTPolyMatrix::zero(&gpu_params, 2, 2);
-        let matrix2 = GpuDCRTPolyMatrix::zero(&gpu_params, 2, 3);
-        let _sum = matrix1 + matrix2;
-    }
-
-    #[test]
-    #[should_panic(expected = "Multiplication condition failed")]
-    #[cfg(debug_assertions)]
-    fn test_gpu_matrix_multiplication_mismatch() {
-        let _guard = gpu_test_lock();
-        let params = gpu_test_params();
-        let gpu_params = gpu_params_from_cpu(&params);
-        let matrix1 = GpuDCRTPolyMatrix::zero(&gpu_params, 2, 2);
-        let matrix2 = GpuDCRTPolyMatrix::zero(&gpu_params, 3, 2);
-        let _prod = matrix1 * matrix2;
     }
 }

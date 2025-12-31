@@ -24,6 +24,7 @@ fn main() {
             PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
         let status = Command::new("bash")
             .current_dir(&manifest_dir)
+            .env("FIDESLIB_SKIP_INSTALL", "1")
             .arg("gpu-setup.sh")
             .status()
             .expect("failed to run gpu-setup.sh");
@@ -34,8 +35,15 @@ fn main() {
         let fides_root = env::var("FIDESLIB_ROOT").unwrap_or_else(|_| "third_party/FIDESlib".to_string());
         let fides_include =
             env::var("FIDESLIB_INCLUDE_DIR").unwrap_or_else(|_| format!("{fides_root}/include"));
-        let fides_lib_dir =
-            env::var("FIDESLIB_LIB_DIR").unwrap_or_else(|_| "/usr/local/lib".to_string());
+        let fides_build_lib_dir = format!("{fides_root}/build");
+        let fides_build_lib = PathBuf::from(&fides_build_lib_dir).join("fideslib.a");
+        let fides_lib_dir = env::var("FIDESLIB_LIB_DIR").unwrap_or_else(|_| {
+            if fides_build_lib.exists() {
+                fides_build_lib_dir
+            } else {
+                "/usr/local/lib".to_string()
+            }
+        });
         let openfhe_include =
             env::var("OPENFHE_INCLUDE_DIR").unwrap_or_else(|_| "/usr/local/include/openfhe".to_string());
         let openfhe_core_include = format!("{openfhe_include}/core");
@@ -72,6 +80,14 @@ fn main() {
         let cuda_home = env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
         let cuda_lib_dir =
             env::var("CUDA_LIB_DIR").unwrap_or_else(|_| format!("{cuda_home}/lib64"));
+        if env::var("NVCC").is_err() {
+            let nvcc_path = format!("{cuda_home}/bin/nvcc");
+            if PathBuf::from(&nvcc_path).exists() {
+                unsafe {
+                    env::set_var("NVCC", nvcc_path);
+                }
+            }
+        }
 
         let mut build = cc::Build::new();
         build

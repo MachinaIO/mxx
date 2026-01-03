@@ -1,3 +1,5 @@
+#[cfg(feature = "gpu")]
+use crate::poly::dcrt::gpu::gpu_device_sync;
 use crate::{
     matrix::{
         PolyMatrix,
@@ -10,18 +12,18 @@ use crate::{
     sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
     utils::{block_size, debug_mem},
 };
+#[cfg(feature = "gpu")]
+pub use gpu::{GpuDCRTPolyTrapdoorSampler, GpuDCRTTrapdoor};
 use openfhe::ffi::{ExtractMatrixCols, FormatMatrixCoefficient, SampleP1ForPertMat};
 use rayon::iter::ParallelIterator;
 pub use sampler::DCRTPolyTrapdoorSampler;
-#[cfg(feature = "gpu")]
-pub use gpu::{GpuDCRTPolyTrapdoorSampler, GpuDCRTTrapdoor};
 use std::{cmp::min, ops::Range, sync::Arc};
 use utils::{gen_dgg_int_vec, gen_int_karney, split_int64_mat_to_elems};
 
-pub mod sampler;
-pub mod utils;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+pub mod sampler;
+pub mod utils;
 
 pub(crate) const KARNEY_THRESHOLD: f64 = 300.0;
 
@@ -158,51 +160,70 @@ fn sample_p1_for_pert_mat(
     debug_mem("sample_p1_for_pert_square_mat parameters computed");
     let mut a_mat = a_mat.to_cpp_matrix_ptr();
     FormatMatrixCoefficient(a_mat.inner.as_mut().unwrap());
+    #[cfg(feature = "gpu")]
+    gpu_device_sync();
     let a_mat_arc = Arc::new(a_mat);
     let mut b_mat = b_mat.to_cpp_matrix_ptr();
     FormatMatrixCoefficient(b_mat.inner.as_mut().unwrap());
+    #[cfg(feature = "gpu")]
+    gpu_device_sync();
     let b_mat_arc = Arc::new(b_mat);
     let mut d_mat = d_mat.to_cpp_matrix_ptr();
     FormatMatrixCoefficient(d_mat.inner.as_mut().unwrap());
+    #[cfg(feature = "gpu")]
+    gpu_device_sync();
     let d_mat_arc = Arc::new(d_mat);
     debug_mem("a_mat, b_mat, d_mat are converted to cpp matrices");
 
-    let p1_mat_blocks = parallel_iter!(0..num_blocks)
-        .map(|i| {
-            let end_col = min((i + 1) * block_size, padded_ncol);
-            let mut tp2 = tp2.slice_columns(i * block_size, end_col).to_cpp_matrix_ptr();
-            FormatMatrixCoefficient(tp2.inner.as_mut().unwrap());
-            let tp2_arc = Arc::new(tp2);
-            debug_mem("tp2 is converted to cpp matrices");
-            let ncol = end_col - i * block_size;
-            let ncol_per_thread = ncol.div_ceil(num_threads_for_cpp);
-            let p1_blocks = parallel_iter!(0..ncol.div_ceil(ncol_per_thread))
-                .map(|j| {
-                    let start_col = j * ncol_per_thread;
-                    let end_col = min((j + 1) * ncol_per_thread, ncol);
-                    let tp2_cols =
-                        ExtractMatrixCols(&Arc::clone(&tp2_arc).as_ref().inner, start_col, end_col);
-                    debug_mem("extracting rows from tp2");
-                    let cpp_matrix = SampleP1ForPertMat(
-                        &Arc::clone(&a_mat_arc).as_ref().inner,
-                        &Arc::clone(&b_mat_arc).as_ref().inner,
-                        &Arc::clone(&d_mat_arc).as_ref().inner,
-                        &tp2_cols,
-                        n,
-                        depth,
-                        k_res,
-                        end_col - start_col,
-                        c,
-                        s,
-                        dgg_stddev,
-                    );
-                    debug_mem("SampleP1ForPertSquareMat called");
-                    DCRTPolyMatrix::from_cpp_matrix_ptr(params, &CppMatrix::new(params, cpp_matrix))
-                })
-                .collect::<Vec<_>>();
-            p1_blocks[0].concat_columns(&p1_blocks[1..].iter().collect::<Vec<_>>())
-        })
-        .collect::<Vec<_>>();
+    let mut p1_mat_blocks = Vec::with_capacity(num_blocks);
+    for i in 0..num_blocks {
+        let end_col = min((i + 1) * block_size, padded_ncol);
+        let mut tp2 = tp2.slice_columns(i * block_size, end_col).to_cpp_matrix_ptr();
+        FormatMatrixCoefficient(tp2.inner.as_mut().unwrap());
+        #[cfg(feature = "gpu")]
+        gpu_device_sync();
+        let tp2_arc = Arc::new(tp2);
+        debug_mem("tp2 is converted to cpp matrices");
+        let ncol = end_col - i * block_size;
+        let ncol_per_thread = ncol.div_ceil(num_threads_for_cpp);
+        let mut p1_blocks = Vec::with_capacity(ncol.div_ceil(ncol_per_thread));
+        for j in 0..ncol.div_ceil(ncol_per_thread) {
+            let start_col = j * ncol_per_thread;
+            let end_col = min((j + 1) * ncol_per_thread, ncol);
+            let tp2_cols =
+                ExtractMatrixCols(&Arc::clone(&tp2_arc).as_ref().inner, start_col, end_col);
+            debug_mem("extracting rows from tp2");
+            let cpp_matrix = SampleP1ForPertMat(
+                &Arc::clone(&a_mat_arc).as_ref().inner,
+                &Arc::clone(&b_mat_arc).as_ref().inner,
+                &Arc::clone(&d_mat_arc).as_ref().inner,
+                &tp2_cols,
+                n,
+                depth,
+                k_res,
+                end_col - start_col,
+                c,
+                s,
+                dgg_stddev,
+            );
+            #[cfg(feature = "gpu")]
+            gpu_device_sync();
+            debug_mem("SampleP1ForPertSquareMat called");
+            p1_blocks.push(DCRTPolyMatrix::from_cpp_matrix_ptr(
+                params,
+                &CppMatrix::new(params, cpp_matrix),
+            ));
+        }
+        let mut refs = Vec::with_capacity(p1_blocks.len().saturating_sub(1));
+        for idx in 1..p1_blocks.len() {
+            refs.push(&p1_blocks[idx]);
+        }
+        p1_mat_blocks.push(p1_blocks[0].concat_columns(&refs));
+    }
 
-    p1_mat_blocks[0].concat_columns(&p1_mat_blocks[1..].iter().collect::<Vec<_>>())
+    let mut refs = Vec::with_capacity(p1_mat_blocks.len().saturating_sub(1));
+    for idx in 1..p1_mat_blocks.len() {
+        refs.push(&p1_mat_blocks[idx]);
+    }
+    p1_mat_blocks[0].concat_columns(&refs)
 }

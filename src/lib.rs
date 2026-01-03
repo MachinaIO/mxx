@@ -1,6 +1,14 @@
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]
 
+#[cfg(test)]
+use sequential_test::sequential;
+
+#[cfg(test)]
+#[test]
+#[sequential]
+fn __gpu_sequential_anchor() {}
+
 pub mod bgg;
 pub mod circuit;
 pub mod commit;

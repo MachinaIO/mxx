@@ -32,7 +32,8 @@ fn main() {
             panic!("gpu-setup.sh failed with status {status}");
         }
 
-        let fides_root = env::var("FIDESLIB_ROOT").unwrap_or_else(|_| "third_party/FIDESlib".to_string());
+        let fides_root =
+            env::var("FIDESLIB_ROOT").unwrap_or_else(|_| "third_party/FIDESlib".to_string());
         let fides_include =
             env::var("FIDESLIB_INCLUDE_DIR").unwrap_or_else(|_| format!("{fides_root}/include"));
         let fides_build_lib_dir = format!("{fides_root}/build");
@@ -44,8 +45,8 @@ fn main() {
                 "/usr/local/lib".to_string()
             }
         });
-        let openfhe_include =
-            env::var("OPENFHE_INCLUDE_DIR").unwrap_or_else(|_| "/usr/local/include/openfhe".to_string());
+        let openfhe_include = env::var("OPENFHE_INCLUDE_DIR")
+            .unwrap_or_else(|_| "/usr/local/include/openfhe".to_string());
         let openfhe_core_include = format!("{openfhe_include}/core");
         let openfhe_pke_include = format!("{openfhe_include}/pke");
         let openfhe_binfhe_include = format!("{openfhe_include}/binfhe");

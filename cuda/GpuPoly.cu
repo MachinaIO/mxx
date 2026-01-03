@@ -55,6 +55,16 @@ struct GpuPoly
     PolyFormat format;
 };
 
+struct GpuEventSet
+{
+    struct Entry
+    {
+        cudaEvent_t event;
+        int device;
+    };
+    std::vector<Entry> entries;
+};
+
 namespace
 {
     int default_batch(const GpuContext *ctx)
@@ -94,6 +104,20 @@ namespace
         {
             poly.INTT(batch);
         }
+    }
+
+    void destroy_event_set(GpuEventSet *events)
+    {
+        if (!events)
+        {
+            return;
+        }
+        for (const auto &entry : events->entries)
+        {
+            cudaSetDevice(entry.device);
+            cudaEventDestroy(entry.event);
+        }
+        delete events;
     }
 }
 
@@ -315,14 +339,15 @@ extern "C"
         }
     }
 
-    int gpu_poly_store_rns(GpuPoly *poly, uint64_t *coeffs_flat_out, size_t coeffs_len)
+    int gpu_poly_store_rns(GpuPoly *poly, uint64_t *coeffs_flat_out, size_t coeffs_len, GpuEventSet **out_events)
     {
         try
         {
-            if (!poly || !coeffs_flat_out)
+            if (!poly || !coeffs_flat_out || !out_events)
             {
                 return set_error("invalid gpu_poly_store_rns arguments");
             }
+            *out_events = nullptr;
             const int level = poly->level;
             const int N = poly->ctx->N;
             const size_t expected = static_cast<size_t>(level + 1) * static_cast<size_t>(N);
@@ -334,25 +359,74 @@ extern "C"
             const int batch = default_batch(poly->ctx);
             ensure_coeff(poly, batch);
 
-            std::vector<std::vector<uint64_t>> data;
-            poly->poly->store(data);
-            if (data.size() != static_cast<size_t>(level + 1))
+            auto *ctx = poly->ctx->ctx;
+            if (ctx->limbGPUid.size() < static_cast<size_t>(level + 1))
             {
-                return set_error("unexpected RNS limb count in gpu_poly_store_rns");
+                return set_error("unexpected limb mapping size in gpu_poly_store_rns");
             }
 
+            auto *event_set = new GpuEventSet();
+            event_set->entries.reserve(static_cast<size_t>(level + 1));
             for (int limb = 0; limb <= level; ++limb)
             {
-                if (data[limb].size() != static_cast<size_t>(N))
+                const dim3 limb_id = ctx->limbGPUid[static_cast<size_t>(limb)];
+                if (limb_id.x >= poly->poly->GPU.size())
                 {
-                    return set_error("unexpected limb size in gpu_poly_store_rns");
+                    destroy_event_set(event_set);
+                    return set_error("unexpected limb GPU partition in gpu_poly_store_rns");
                 }
-                for (int i = 0; i < N; ++i)
+                auto &partition = poly->poly->GPU[limb_id.x];
+                if (limb_id.y >= partition.limb.size())
                 {
-                    coeffs_flat_out[static_cast<size_t>(limb) * N + i] = data[limb][i];
+                    destroy_event_set(event_set);
+                    return set_error("unexpected limb index in gpu_poly_store_rns");
                 }
+                auto &limb_impl = partition.limb[limb_id.y];
+                if (limb_impl.index() != FIDESlib::U64)
+                {
+                    destroy_event_set(event_set);
+                    return set_error("unsupported limb type in gpu_poly_store_rns");
+                }
+                auto &limb_u64 = std::get<FIDESlib::U64>(limb_impl);
+
+                cudaError_t err = cudaSetDevice(partition.device);
+                if (err != cudaSuccess)
+                {
+                    destroy_event_set(event_set);
+                    return set_error(cudaGetErrorString(err));
+                }
+
+                uint64_t *dst = coeffs_flat_out + static_cast<size_t>(limb) * static_cast<size_t>(N);
+                err = cudaMemcpyAsync(
+                    dst,
+                    limb_u64.v.data,
+                    static_cast<size_t>(N) * sizeof(uint64_t),
+                    cudaMemcpyDeviceToHost,
+                    limb_u64.stream.ptr);
+                if (err != cudaSuccess)
+                {
+                    destroy_event_set(event_set);
+                    return set_error(cudaGetErrorString(err));
+                }
+
+                cudaEvent_t ev = nullptr;
+                err = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+                if (err != cudaSuccess)
+                {
+                    destroy_event_set(event_set);
+                    return set_error(cudaGetErrorString(err));
+                }
+                err = cudaEventRecord(ev, limb_u64.stream.ptr);
+                if (err != cudaSuccess)
+                {
+                    cudaEventDestroy(ev);
+                    destroy_event_set(event_set);
+                    return set_error(cudaGetErrorString(err));
+                }
+                event_set->entries.push_back(GpuEventSet::Entry{ev, partition.device});
             }
 
+            *out_events = event_set;
             return 0;
         }
         catch (const std::exception &e)
@@ -363,6 +437,33 @@ extern "C"
         {
             return set_error("unknown exception in gpu_poly_store_rns");
         }
+    }
+
+    int gpu_event_set_wait(GpuEventSet *events)
+    {
+        if (!events)
+        {
+            return set_error("invalid gpu_event_set_wait arguments");
+        }
+        for (const auto &entry : events->entries)
+        {
+            cudaError_t err = cudaSetDevice(entry.device);
+            if (err != cudaSuccess)
+            {
+                return set_error(cudaGetErrorString(err));
+            }
+            err = cudaEventSynchronize(entry.event);
+            if (err != cudaSuccess)
+            {
+                return set_error(cudaGetErrorString(err));
+            }
+        }
+        return 0;
+    }
+
+    void gpu_event_set_destroy(GpuEventSet *events)
+    {
+        destroy_event_set(events);
     }
 
     int gpu_poly_add(GpuPoly *out, const GpuPoly *a, const GpuPoly *b)
@@ -535,6 +636,26 @@ extern "C"
         {
             return set_error("unknown exception in gpu_poly_intt");
         }
+    }
+
+    int gpu_device_synchronize()
+    {
+        cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess)
+        {
+            return set_error(cudaGetErrorString(err));
+        }
+        return 0;
+    }
+
+    int gpu_device_reset()
+    {
+        cudaError_t err = cudaDeviceReset();
+        if (err != cudaSuccess)
+        {
+            return set_error(cudaGetErrorString(err));
+        }
+        return 0;
     }
 
     const char *gpu_last_error()

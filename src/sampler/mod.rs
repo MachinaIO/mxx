@@ -1,12 +1,12 @@
 use crate::{matrix::PolyMatrix, poly::Poly};
 
-pub mod hash;
-pub mod trapdoor;
-pub mod uniform;
 #[cfg(feature = "gpu")]
 pub mod gpu_hash;
 #[cfg(feature = "gpu")]
 pub mod gpu_uniform;
+pub mod hash;
+pub mod trapdoor;
+pub mod uniform;
 
 #[derive(Debug, Clone, Copy)]
 /// Enum representing different types of distributions for random sampling.

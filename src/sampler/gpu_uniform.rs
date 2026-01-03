@@ -2,7 +2,10 @@ use crate::{
     matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
-        dcrt::{gpu::{GpuDCRTPoly, GpuDCRTPolyParams}, params::DCRTPolyParams},
+        dcrt::{
+            gpu::{GpuDCRTPoly, GpuDCRTPolyParams},
+            params::DCRTPolyParams,
+        },
     },
     sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
 };

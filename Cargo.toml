@@ -34,6 +34,10 @@ keccak-asm = { version = "0.1.4" }
 tempfile = { version = "3.19.1" }
 tracing-subscriber = "0.3"
 primal = "0.3"
+sequential-test = "0.2.4"
+
+[dev-dependencies]
+ctor = "0.2.9"
 
 [build-dependencies]
 cc = "1"

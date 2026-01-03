@@ -1,26 +1,36 @@
 use crate::{
     element::{PolyElem, finite_ring::FinRingElem},
-    impl_binop_with_refs, parallel_iter,
+    impl_binop_with_refs,
     poly::{Poly, PolyParams},
-    utils::{chunk_size_for, mod_inverse},
+    utils::{chunk_size_for, log_mem, mod_inverse},
 };
+#[cfg(all(test, feature = "gpu"))]
+use ctor::ctor;
 use num_bigint::BigUint;
 use num_traits::{One, ToPrimitive, Zero};
 use rayon::prelude::*;
+#[cfg(test)]
+use sequential_test::sequential;
 use std::{
     ffi::CStr,
     fmt::Debug,
     hash::Hash,
-    ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
     mem,
+    ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
     os::raw::{c_char, c_int},
     ptr::{self, NonNull},
     slice,
     sync::Arc,
 };
 
-#[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+#[cfg(all(test, feature = "gpu"))]
+#[ctor]
+fn force_single_test_thread() {
+    // Safety: executed at test startup to enforce single-threaded GPU tests.
+    unsafe {
+        std::env::set_var("RUST_TEST_THREADS", "1");
+    }
+}
 
 #[allow(non_camel_case_types)]
 #[repr(C)]
@@ -31,6 +41,12 @@ struct GpuContextOpaque {
 #[allow(non_camel_case_types)]
 #[repr(C)]
 struct GpuPolyOpaque {
+    _private: [u8; 0],
+}
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
+struct GpuEventSetOpaque {
     _private: [u8; 0],
 }
 
@@ -49,28 +65,47 @@ unsafe extern "C" {
     fn gpu_context_destroy(ctx: *mut GpuContextOpaque);
     fn gpu_context_get_N(ctx: *const GpuContextOpaque, out_n: *mut c_int) -> c_int;
 
-    fn gpu_poly_create(ctx: *mut GpuContextOpaque, level: c_int, out_poly: *mut *mut GpuPolyOpaque)
-        -> c_int;
+    fn gpu_poly_create(
+        ctx: *mut GpuContextOpaque,
+        level: c_int,
+        out_poly: *mut *mut GpuPolyOpaque,
+    ) -> c_int;
     fn gpu_poly_destroy(poly: *mut GpuPolyOpaque);
     fn gpu_poly_clone(src: *const GpuPolyOpaque, out_poly: *mut *mut GpuPolyOpaque) -> c_int;
 
-    fn gpu_poly_load_rns(poly: *mut GpuPolyOpaque, coeffs_flat: *const u64, coeffs_len: usize)
-        -> c_int;
+    fn gpu_poly_load_rns(
+        poly: *mut GpuPolyOpaque,
+        coeffs_flat: *const u64,
+        coeffs_len: usize,
+    ) -> c_int;
     fn gpu_poly_store_rns(
         poly: *mut GpuPolyOpaque,
         coeffs_flat_out: *mut u64,
         coeffs_len: usize,
+        out_events: *mut *mut GpuEventSetOpaque,
     ) -> c_int;
+    fn gpu_event_set_wait(events: *mut GpuEventSetOpaque) -> c_int;
+    fn gpu_event_set_destroy(events: *mut GpuEventSetOpaque);
 
-    fn gpu_poly_add(out: *mut GpuPolyOpaque, a: *const GpuPolyOpaque, b: *const GpuPolyOpaque)
-        -> c_int;
-    fn gpu_poly_sub(out: *mut GpuPolyOpaque, a: *const GpuPolyOpaque, b: *const GpuPolyOpaque)
-        -> c_int;
-    fn gpu_poly_mul(out: *mut GpuPolyOpaque, a: *const GpuPolyOpaque, b: *const GpuPolyOpaque)
-        -> c_int;
+    fn gpu_poly_add(
+        out: *mut GpuPolyOpaque,
+        a: *const GpuPolyOpaque,
+        b: *const GpuPolyOpaque,
+    ) -> c_int;
+    fn gpu_poly_sub(
+        out: *mut GpuPolyOpaque,
+        a: *const GpuPolyOpaque,
+        b: *const GpuPolyOpaque,
+    ) -> c_int;
+    fn gpu_poly_mul(
+        out: *mut GpuPolyOpaque,
+        a: *const GpuPolyOpaque,
+        b: *const GpuPolyOpaque,
+    ) -> c_int;
 
     fn gpu_poly_ntt(poly: *mut GpuPolyOpaque, batch: c_int) -> c_int;
     fn gpu_poly_intt(poly: *mut GpuPolyOpaque, batch: c_int) -> c_int;
+    fn gpu_device_synchronize() -> c_int;
 
     fn gpu_last_error() -> *const c_char;
 
@@ -94,13 +129,27 @@ fn check_status(code: c_int, context: &str) {
     }
 }
 
+fn should_sync() -> bool {
+    true
+}
+
+fn maybe_sync() {
+    if should_sync() {
+        let status = unsafe { gpu_device_synchronize() };
+        check_status(status, "gpu_device_synchronize");
+    }
+}
+
+pub(crate) fn gpu_device_sync() {
+    let status = unsafe { gpu_device_synchronize() };
+    check_status(status, "gpu_device_synchronize");
+}
+
 fn pinned_alloc<T>(len: usize) -> NonNull<T> {
     if len == 0 {
         return NonNull::dangling();
     }
-    let bytes = len
-        .checked_mul(mem::size_of::<T>())
-        .expect("pinned buffer size overflow");
+    let bytes = len.checked_mul(mem::size_of::<T>()).expect("pinned buffer size overflow");
     let ptr = unsafe { gpu_pinned_alloc(bytes) } as *mut T;
     if ptr.is_null() {
         panic!("gpu_pinned_alloc failed: {}", last_error_string());
@@ -130,17 +179,17 @@ impl<T> PinnedHostBuffer<T> {
         }
     }
 
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
-        if self.len == 0 {
-            &mut []
-        } else {
-            unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
-        }
-    }
+    // pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
+    //     if self.len == 0 {
+    //         &mut []
+    //     } else {
+    //         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    //     }
+    // }
 
-    pub(crate) fn len(&self) -> usize {
-        self.len
-    }
+    // pub(crate) fn len(&self) -> usize {
+    //     self.len
+    // }
 }
 
 impl<T: Copy> PinnedHostBuffer<T> {
@@ -155,9 +204,9 @@ impl<T: Copy> PinnedHostBuffer<T> {
         Self { ptr, len: slice.len(), cap: slice.len() }
     }
 
-    pub(crate) fn to_vec(&self) -> Vec<T> {
-        self.as_slice().to_vec()
-    }
+    // pub(crate) fn to_vec(&self) -> Vec<T> {
+    //     self.as_slice().to_vec()
+    // }
 
     pub(crate) fn set_slice(&mut self, slice: &[T]) {
         if slice.len() > self.cap {
@@ -223,15 +272,6 @@ fn bits_in_u64(value: u64) -> usize {
 fn log2_u32(value: u32) -> u32 {
     assert!(value.is_power_of_two(), "ring_dimension must be a power of 2");
     value.trailing_zeros()
-}
-
-#[cfg(test)]
-pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static GPU_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-    GPU_TEST_MUTEX
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("gpu test mutex poisoned")
 }
 
 #[derive(Clone)]
@@ -320,8 +360,9 @@ impl GpuDCRTPolyParams {
         let crt_depth = moduli.len();
         let crt_bits = moduli.iter().map(|m| bits_in_u64(*m)).max().unwrap_or(0);
         let modulus = moduli.iter().fold(BigUint::one(), |acc, m| acc * m);
+        let dnum =
+            dnum.unwrap_or_else(|| if gpu_ids.is_empty() { 1 } else { gpu_ids.len() as u32 });
         let log_n = log2_u32(ring_dimension);
-        let dnum = dnum.unwrap_or_else(|| if gpu_ids.is_empty() { 1 } else { gpu_ids.len() as u32 });
         let ctx = Arc::new(GpuContext::create(log_n, &moduli, &gpu_ids, dnum, batch));
 
         Self {
@@ -355,10 +396,7 @@ impl GpuDCRTPolyParams {
     }
 
     fn modulus_for_level(&self, level: usize) -> BigUint {
-        self.moduli
-            .iter()
-            .take(level + 1)
-            .fold(BigUint::one(), |acc, m| acc * m)
+        self.moduli.iter().take(level + 1).fold(BigUint::one(), |acc, m| acc * m)
     }
 
     fn reconstruct_coeffs_for_level(&self, level: usize) -> Vec<BigUint> {
@@ -396,6 +434,10 @@ unsafe impl Sync for GpuContext {}
 
 impl GpuContext {
     fn create(log_n: u32, moduli: &[u64], gpu_ids: &[i32], dnum: u32, batch: u32) -> Self {
+        log_mem(&format!(
+            "Creating GPU context with log_n={}, moduli={:?}, gpu_ids={:?}, dnum={}, batch={}",
+            log_n, moduli, gpu_ids, dnum, batch
+        ));
         let l = moduli.len().saturating_sub(1) as u32;
         let mut ctx_ptr: *mut GpuContextOpaque = ptr::null_mut();
         let (gpu_ids_ptr, gpu_ids_len) = if gpu_ids.is_empty() {
@@ -423,32 +465,37 @@ impl GpuContext {
         check_status(status, "gpu_context_get_N");
         let n = if n_out > 0 { n_out as usize } else { 1usize << log_n };
 
-        Self {
-            raw: ctx_ptr,
-            n,
-            moduli: moduli.to_vec(),
-            gpu_ids: gpu_ids.to_vec(),
-            dnum,
-            batch,
-        }
+        Self { raw: ctx_ptr, n, moduli: moduli.to_vec(), gpu_ids: gpu_ids.to_vec(), dnum, batch }
     }
 }
 
 impl Drop for GpuContext {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            #[cfg(test)]
+            gpu_device_sync();
             unsafe { gpu_context_destroy(self.raw) };
             self.raw = ptr::null_mut();
+            log_mem("GPU context destroyed");
         }
     }
 }
 
-#[derive(Debug)]
 pub struct GpuDCRTPoly {
     params: Arc<GpuDCRTPolyParams>,
     raw: *mut GpuPolyOpaque,
     level: usize,
     is_ntt: bool,
+}
+
+impl Debug for GpuDCRTPoly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuDCRTPoly")
+            .field("level", &self.level)
+            .field("is_ntt", &self.is_ntt)
+            .field("coeffs", &self.coeffs())
+            .finish()
+    }
 }
 
 /// # Safety
@@ -460,16 +507,26 @@ impl GpuDCRTPoly {
     pub(crate) fn new_empty(params: Arc<GpuDCRTPolyParams>, level: usize, is_ntt: bool) -> Self {
         let mut poly_ptr: *mut GpuPolyOpaque = ptr::null_mut();
         let status = unsafe {
-            gpu_poly_create(params.ctx.raw, level as c_int, &mut poly_ptr as *mut *mut GpuPolyOpaque)
+            gpu_poly_create(
+                params.ctx.raw,
+                level as c_int,
+                &mut poly_ptr as *mut *mut GpuPolyOpaque,
+            )
         };
         check_status(status, "gpu_poly_create");
         Self { params, raw: poly_ptr, level, is_ntt }
     }
 
-    fn from_flat(params: Arc<GpuDCRTPolyParams>, level: usize, flat: Vec<u64>, is_ntt: bool) -> Self {
+    fn from_flat(
+        params: Arc<GpuDCRTPolyParams>,
+        level: usize,
+        flat: Vec<u64>,
+        is_ntt: bool,
+    ) -> Self {
         let poly = Self::new_empty(params, level, is_ntt);
         let status = unsafe { gpu_poly_load_rns(poly.raw, flat.as_ptr(), flat.len()) };
         check_status(status, "gpu_poly_load_rns");
+        maybe_sync();
         poly
     }
 
@@ -477,8 +534,14 @@ impl GpuDCRTPoly {
         let n = self.params.ring_dimension as usize;
         let len = (self.level + 1) * n;
         let mut flat = vec![0u64; len];
-        let status = unsafe { gpu_poly_store_rns(self.raw, flat.as_mut_ptr(), flat.len()) };
+        let mut events: *mut GpuEventSetOpaque = ptr::null_mut();
+        let status =
+            unsafe { gpu_poly_store_rns(self.raw, flat.as_mut_ptr(), flat.len(), &mut events) };
         check_status(status, "gpu_poly_store_rns");
+        let wait_status = unsafe { gpu_event_set_wait(events) };
+        unsafe { gpu_event_set_destroy(events) };
+        check_status(wait_status, "gpu_event_set_wait");
+        maybe_sync();
         flat
     }
 
@@ -489,6 +552,7 @@ impl GpuDCRTPoly {
         let mut tmp = self.clone();
         let status = unsafe { gpu_poly_intt(tmp.raw, self.params.batch() as c_int) };
         check_status(status, "gpu_poly_intt");
+        maybe_sync();
         tmp.is_ntt = false;
         tmp
     }
@@ -503,6 +567,7 @@ impl GpuDCRTPoly {
         }
         let status = unsafe { gpu_poly_ntt(self.raw, self.params.batch() as c_int) };
         check_status(status, "gpu_poly_ntt");
+        maybe_sync();
         self.is_ntt = true;
     }
 
@@ -547,6 +612,7 @@ impl GpuDCRTPoly {
 
         let status = unsafe { gpu_poly_load_rns(self.raw, flat.as_ptr(), flat.len()) };
         check_status(status, "gpu_poly_load_rns");
+        maybe_sync();
         self.is_ntt = false;
     }
 
@@ -556,6 +622,7 @@ impl GpuDCRTPoly {
         assert_eq!(out.params.as_ref(), a.params.as_ref(), "GPU params must match");
         let status = unsafe { gpu_poly_add(out.raw, a.raw, b.raw) };
         check_status(status, "gpu_poly_add");
+        maybe_sync();
         out.is_ntt = a.is_ntt;
     }
 
@@ -565,6 +632,7 @@ impl GpuDCRTPoly {
         assert_eq!(out.params.as_ref(), a.params.as_ref(), "GPU params must match");
         let status = unsafe { gpu_poly_sub(out.raw, a.raw, b.raw) };
         check_status(status, "gpu_poly_sub");
+        maybe_sync();
         out.is_ntt = a.is_ntt;
     }
 
@@ -574,6 +642,7 @@ impl GpuDCRTPoly {
         assert_eq!(out.params.as_ref(), a.params.as_ref(), "GPU params must match");
         let status = unsafe { gpu_poly_mul(out.raw, a.raw, b.raw) };
         check_status(status, "gpu_poly_mul");
+        maybe_sync();
         out.is_ntt = true;
     }
 
@@ -581,13 +650,15 @@ impl GpuDCRTPoly {
         self.assert_compatible(rhs);
         let status = unsafe { gpu_poly_add(self.raw, self.raw, rhs.raw) };
         check_status(status, "gpu_poly_add");
+        maybe_sync();
     }
 
-    pub(crate) fn sub_in_place(&mut self, rhs: &GpuDCRTPoly) {
-        self.assert_compatible(rhs);
-        let status = unsafe { gpu_poly_sub(self.raw, self.raw, rhs.raw) };
-        check_status(status, "gpu_poly_sub");
-    }
+    // pub(crate) fn sub_in_place(&mut self, rhs: &GpuDCRTPoly) {
+    //     self.assert_compatible(rhs);
+    //     let status = unsafe { gpu_poly_sub(self.raw, self.raw, rhs.raw) };
+    //     check_status(status, "gpu_poly_sub");
+    //     maybe_sync();
+    // }
 
     fn constant_with_value(params: &Arc<GpuDCRTPolyParams>, value: &BigUint) -> Self {
         let n = params.ring_dimension as usize;
@@ -624,18 +695,15 @@ impl Clone for GpuDCRTPoly {
         let mut poly_ptr: *mut GpuPolyOpaque = ptr::null_mut();
         let status = unsafe { gpu_poly_clone(self.raw, &mut poly_ptr as *mut *mut GpuPolyOpaque) };
         check_status(status, "gpu_poly_clone");
-        Self {
-            params: self.params.clone(),
-            raw: poly_ptr,
-            level: self.level,
-            is_ntt: self.is_ntt,
-        }
+        Self { params: self.params.clone(), raw: poly_ptr, level: self.level, is_ntt: self.is_ntt }
     }
 }
 
 impl Drop for GpuDCRTPoly {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            #[cfg(test)]
+            gpu_device_sync();
             unsafe { gpu_poly_destroy(self.raw) };
             self.raw = ptr::null_mut();
         }
@@ -669,10 +737,7 @@ impl Poly for GpuDCRTPoly {
         let coeffs = coeffs.iter().map(|&b| if b { 1u64 } else { 0u64 }).collect::<Vec<_>>();
         Self::from_u64_vecs(
             params,
-            &coeffs
-                .iter()
-                .map(|v| vec![*v; params.crt_depth()])
-                .collect::<Vec<_>>(),
+            &coeffs.iter().map(|v| vec![*v; params.crt_depth()]).collect::<Vec<_>>(),
         )
     }
 
@@ -707,10 +772,7 @@ impl Poly for GpuDCRTPoly {
         let n = params.ring_dimension as usize;
         assert_eq!(coeffs.len(), n, "coeffs length must match ring dimension");
         let num_limbs = coeffs.iter().map(|v| v.len()).max().unwrap_or(0).max(1);
-        assert!(
-            num_limbs <= params.crt_depth,
-            "coeff limb count exceeds CRT depth"
-        );
+        assert!(num_limbs <= params.crt_depth, "coeff limb count exceeds CRT depth");
         let level = num_limbs.saturating_sub(1);
 
         let mut flat = vec![0u64; num_limbs * n];
@@ -776,17 +838,17 @@ impl Poly for GpuDCRTPoly {
         let reconstruct_coeffs = poly.params.reconstruct_coeffs_for_level(level);
         let modulus_level = Arc::new(poly.params.modulus_for_level(level));
 
-        parallel_iter!(0..n)
-            .map(|i| {
-                let mut acc = BigUint::zero();
-                for limb in 0..=level {
-                    let residue = flat[limb * n + i];
-                    acc += &reconstruct_coeffs[limb] * BigUint::from(residue);
-                }
-                acc %= &*modulus_level;
-                FinRingElem::new(acc, modulus.clone())
-            })
-            .collect()
+        let mut coeffs = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut acc = BigUint::zero();
+            for limb in 0..=level {
+                let residue = flat[limb * n + i];
+                acc += &reconstruct_coeffs[limb] * BigUint::from(residue);
+            }
+            acc %= &*modulus_level;
+            coeffs.push(FinRingElem::new(acc, modulus.clone()));
+        }
+        coeffs
     }
 
     fn const_zero(params: &Self::Params) -> Self {
@@ -936,6 +998,7 @@ impl_binop_with_refs!(GpuDCRTPoly => Add::add(self, rhs: &GpuDCRTPoly) -> GpuDCR
     let out = GpuDCRTPoly::new_empty(self.params.clone(), self.level, self.is_ntt);
     let status = unsafe { gpu_poly_add(out.raw, self.raw, rhs.raw) };
     check_status(status, "gpu_poly_add");
+    maybe_sync();
     out
 });
 
@@ -944,17 +1007,17 @@ impl_binop_with_refs!(GpuDCRTPoly => Sub::sub(self, rhs: &GpuDCRTPoly) -> GpuDCR
     let out = GpuDCRTPoly::new_empty(self.params.clone(), self.level, self.is_ntt);
     let status = unsafe { gpu_poly_sub(out.raw, self.raw, rhs.raw) };
     check_status(status, "gpu_poly_sub");
+    maybe_sync();
     out
 });
 
 impl_binop_with_refs!(GpuDCRTPoly => Mul::mul(self, rhs: &GpuDCRTPoly) -> GpuDCRTPoly {
     self.assert_compatible(rhs);
-    if self.is_ntt {
-        panic!("gpu_poly_mul expects coefficient-domain inputs");
-    }
-    let out = GpuDCRTPoly::new_empty(self.params.clone(), self.level, false);
+    let mut out = GpuDCRTPoly::new_empty(self.params.clone(), self.level, false);
     let status = unsafe { gpu_poly_mul(out.raw, self.raw, rhs.raw) };
     check_status(status, "gpu_poly_mul");
+    maybe_sync();
+    out.is_ntt = true;
     out
 });
 
@@ -1048,11 +1111,11 @@ fn build_compact_bytes(processed_coeffs: Vec<(bool, Vec<u8>)>, ring_dimension: u
 mod tests {
     use super::*;
     use crate::{
+        __PAIR, __TestState,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
     };
     use rand::prelude::*;
-    use super::gpu_test_lock;
 
     fn gpu_test_params() -> DCRTPolyParams {
         DCRTPolyParams::new(128, 2, 17, 1)
@@ -1068,8 +1131,9 @@ mod tests {
     }
 
     #[test]
+    #[sequential]
     fn test_gpu_dcrtpoly_const_int_roundtrip() {
-        let _guard = gpu_test_lock();
+        gpu_device_sync();
         let mut rng = rand::rng();
         let params = gpu_test_params();
         let gpu_params = gpu_params_from_cpu(&params);
@@ -1087,13 +1151,11 @@ mod tests {
     }
 
     #[test]
+    #[sequential]
     fn test_gpu_dcrtpoly_coeffs() {
-        let _guard = gpu_test_lock();
+        gpu_device_sync();
         let mut rng = rand::rng();
-        let x = rng.random_range(12..20);
-        let size = rng.random_range(1..20);
-        let n = 2_i32.pow(x) as u32;
-        let params = DCRTPolyParams::new(n, size, 51, 2);
+        let params = gpu_test_params();
         let gpu_params = gpu_params_from_cpu(&params);
         let q = gpu_params.modulus();
         let n = gpu_params.ring_dimension() as usize;
@@ -1108,8 +1170,9 @@ mod tests {
     }
 
     #[test]
+    #[sequential]
     fn test_gpu_dcrtpoly_arithmetic() {
-        let _guard = gpu_test_lock();
+        gpu_device_sync();
         let params = gpu_test_params();
         let gpu_params = gpu_params_from_cpu(&params);
         let q = gpu_params.modulus();
@@ -1174,8 +1237,9 @@ mod tests {
     }
 
     #[test]
+    #[sequential]
     fn test_gpu_dcrtpoly_decompose() {
-        let _guard = gpu_test_lock();
+        gpu_device_sync();
         let params = gpu_test_params();
         let gpu_params = gpu_params_from_cpu(&params);
         let sampler = DCRTPolyUniformSampler::new();
@@ -1186,8 +1250,9 @@ mod tests {
     }
 
     #[test]
+    #[sequential]
     fn test_gpu_dcrtpoly_to_compact_bytes_bit_dist() {
-        let _guard = gpu_test_lock();
+        gpu_device_sync();
         let params = gpu_test_params();
         let gpu_params = gpu_params_from_cpu(&params);
         let sampler = DCRTPolyUniformSampler::new();
@@ -1226,8 +1291,9 @@ mod tests {
     }
 
     #[test]
+    #[sequential]
     fn test_gpu_dcrtpoly_to_compact_bytes_uniform_dist() {
-        let _guard = gpu_test_lock();
+        gpu_device_sync();
         let params = gpu_test_params();
         let gpu_params = gpu_params_from_cpu(&params);
         let sampler = DCRTPolyUniformSampler::new();
@@ -1262,8 +1328,9 @@ mod tests {
     }
 
     #[test]
+    #[sequential]
     fn test_gpu_dcrtpoly_from_compact_bytes() {
-        let _guard = gpu_test_lock();
+        gpu_device_sync();
         let params = gpu_test_params();
         let gpu_params = gpu_params_from_cpu(&params);
         let sampler = DCRTPolyUniformSampler::new();
@@ -1390,7 +1457,8 @@ fn process_single_coeff_with(
 
     if coeff_val > q_half {
         let centered_value = modulus - coeff_val;
-        let value_bytes = if centered_value.is_zero() { Vec::new() } else { centered_value.to_bytes_le() };
+        let value_bytes =
+            if centered_value.is_zero() { Vec::new() } else { centered_value.to_bytes_le() };
         (true, value_bytes)
     } else if coeff_val.is_zero() {
         (false, Vec::new())

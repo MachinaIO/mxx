@@ -7,7 +7,6 @@ use crate::{
 };
 use bitvec::prelude::*;
 use digest::OutputSizeUser;
-use num_bigint::BigUint;
 use rayon::prelude::*;
 use std::marker::PhantomData;
 

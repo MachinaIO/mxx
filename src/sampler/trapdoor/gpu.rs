@@ -1,5 +1,5 @@
 use super::{
-    DCRTTrapdoor, KARNEY_THRESHOLD, sample_p1_for_pert_mat,
+    KARNEY_THRESHOLD, sample_p1_for_pert_mat,
     sampler::decompose_dcrt_gadget,
     utils::{gen_dgg_int_vec, gen_int_karney, split_int64_mat_to_elems},
 };
@@ -16,7 +16,6 @@ use crate::{
         dcrt::{
             gpu::{GpuDCRTPoly, GpuDCRTPolyParams},
             params::DCRTPolyParams,
-            poly::DCRTPoly,
         },
     },
     sampler::{
@@ -330,7 +329,7 @@ fn cpu_params_from_gpu(params: &GpuDCRTPolyParams) -> DCRTPolyParams {
         params.crt_bits(),
         params.base_bits(),
     );
-    debug_assert_eq!(cpu_params.to_crt().0.as_slice(), params.moduli());
+    assert_eq!(cpu_params.to_crt().0.as_slice(), params.moduli());
     cpu_params
 }
 
@@ -359,6 +358,7 @@ mod tests {
         let size: usize = 3;
         let cpu_params = cpu_test_params();
         let params = gpu_params_from_cpu(&cpu_params);
+        eprintln!("crt_bits cpu={}, gpu={}", cpu_params.crt_bits(), params.crt_bits());
         let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
 
         let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
@@ -377,14 +377,12 @@ mod tests {
             "Public matrix should have the correct number of columns"
         );
 
-        let muled = {
-            let k = params.modulus_digits();
-            let identity = GpuDCRTPolyMatrix::identity(&params, size * k, None);
-            let trapdoor_matrix = trapdoor.r.concat_rows(&[&trapdoor.e, &identity]);
-            public_matrix * trapdoor_matrix
-        };
+        let k = params.modulus_digits();
+        let identity = GpuDCRTPolyMatrix::identity(&params, size * k, None);
+        let trapdoor_matrix = trapdoor.r.concat_rows(&[&trapdoor.e, &identity]);
+        let muled = &public_matrix * &trapdoor_matrix;
         let gadget_matrix = GpuDCRTPolyMatrix::gadget_matrix(&params, size);
-        assert_eq!(muled, gadget_matrix);
+        assert_eq!(muled, gadget_matrix, "Product should equal gadget matrix");
     }
 
     #[test]

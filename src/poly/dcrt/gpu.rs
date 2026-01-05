@@ -129,17 +129,6 @@ fn check_status(code: c_int, context: &str) {
     }
 }
 
-fn should_sync() -> bool {
-    true
-}
-
-fn maybe_sync() {
-    if should_sync() {
-        let status = unsafe { gpu_device_synchronize() };
-        check_status(status, "gpu_device_synchronize");
-    }
-}
-
 pub(crate) fn gpu_device_sync() {
     let status = unsafe { gpu_device_synchronize() };
     check_status(status, "gpu_device_synchronize");
@@ -526,7 +515,6 @@ impl GpuDCRTPoly {
         let poly = Self::new_empty(params, level, is_ntt);
         let status = unsafe { gpu_poly_load_rns(poly.raw, flat.as_ptr(), flat.len()) };
         check_status(status, "gpu_poly_load_rns");
-        maybe_sync();
         poly
     }
 
@@ -541,7 +529,6 @@ impl GpuDCRTPoly {
         let wait_status = unsafe { gpu_event_set_wait(events) };
         unsafe { gpu_event_set_destroy(events) };
         check_status(wait_status, "gpu_event_set_wait");
-        maybe_sync();
         flat
     }
 
@@ -552,7 +539,6 @@ impl GpuDCRTPoly {
         let mut tmp = self.clone();
         let status = unsafe { gpu_poly_intt(tmp.raw, self.params.batch() as c_int) };
         check_status(status, "gpu_poly_intt");
-        maybe_sync();
         tmp.is_ntt = false;
         tmp
     }
@@ -567,7 +553,6 @@ impl GpuDCRTPoly {
         }
         let status = unsafe { gpu_poly_ntt(self.raw, self.params.batch() as c_int) };
         check_status(status, "gpu_poly_ntt");
-        maybe_sync();
         self.is_ntt = true;
     }
 
@@ -612,7 +597,6 @@ impl GpuDCRTPoly {
 
         let status = unsafe { gpu_poly_load_rns(self.raw, flat.as_ptr(), flat.len()) };
         check_status(status, "gpu_poly_load_rns");
-        maybe_sync();
         self.is_ntt = false;
     }
 
@@ -622,7 +606,6 @@ impl GpuDCRTPoly {
         assert_eq!(out.params.as_ref(), a.params.as_ref(), "GPU params must match");
         let status = unsafe { gpu_poly_add(out.raw, a.raw, b.raw) };
         check_status(status, "gpu_poly_add");
-        maybe_sync();
         out.is_ntt = a.is_ntt;
     }
 
@@ -632,7 +615,6 @@ impl GpuDCRTPoly {
         assert_eq!(out.params.as_ref(), a.params.as_ref(), "GPU params must match");
         let status = unsafe { gpu_poly_sub(out.raw, a.raw, b.raw) };
         check_status(status, "gpu_poly_sub");
-        maybe_sync();
         out.is_ntt = a.is_ntt;
     }
 
@@ -642,7 +624,6 @@ impl GpuDCRTPoly {
         assert_eq!(out.params.as_ref(), a.params.as_ref(), "GPU params must match");
         let status = unsafe { gpu_poly_mul(out.raw, a.raw, b.raw) };
         check_status(status, "gpu_poly_mul");
-        maybe_sync();
         out.is_ntt = true;
     }
 
@@ -650,27 +631,22 @@ impl GpuDCRTPoly {
         self.assert_compatible(rhs);
         let status = unsafe { gpu_poly_add(self.raw, self.raw, rhs.raw) };
         check_status(status, "gpu_poly_add");
-        maybe_sync();
     }
 
     // pub(crate) fn sub_in_place(&mut self, rhs: &GpuDCRTPoly) {
     //     self.assert_compatible(rhs);
     //     let status = unsafe { gpu_poly_sub(self.raw, self.raw, rhs.raw) };
     //     check_status(status, "gpu_poly_sub");
-    //     maybe_sync();
     // }
 
     fn constant_with_value(params: &Arc<GpuDCRTPolyParams>, value: &BigUint) -> Self {
         let n = params.ring_dimension as usize;
-        let level = params.crt_depth.saturating_sub(1);
-        let mut flat = vec![0u64; (level + 1) * n];
-        for limb in 0..=level {
-            let modulus = BigUint::from(params.moduli[limb]);
-            let residue = (value % &modulus).to_u64().unwrap_or(0);
-            let base = limb * n;
-            flat[base] = residue;
+        let q = params.modulus();
+        let mut coeffs = vec![FinRingElem::zero(&q); n];
+        if n > 0 {
+            coeffs[0] = FinRingElem::new(value.clone(), q.clone());
         }
-        Self::from_flat(params.clone(), level, flat, false)
+        Self::from_coeffs(params.as_ref(), &coeffs)
     }
 
     fn residues_from_biguints(params: &GpuDCRTPolyParams, coeffs: &[BigUint]) -> Vec<Vec<u64>> {
@@ -695,6 +671,7 @@ impl Clone for GpuDCRTPoly {
         let mut poly_ptr: *mut GpuPolyOpaque = ptr::null_mut();
         let status = unsafe { gpu_poly_clone(self.raw, &mut poly_ptr as *mut *mut GpuPolyOpaque) };
         check_status(status, "gpu_poly_clone");
+        gpu_device_sync();
         Self { params: self.params.clone(), raw: poly_ptr, level: self.level, is_ntt: self.is_ntt }
     }
 }
@@ -986,7 +963,7 @@ impl Poly for GpuDCRTPoly {
                 break;
             }
             // Convert BigUint to usize safely, saturating if too large
-            let coeff_val = coeff.value().try_into().unwrap_or(usize::MAX);
+            let coeff_val = coeff.value().try_into().expect("coeff_val is an invalid usize");
             sum = sum.saturating_add((1usize << i).saturating_mul(coeff_val));
         }
         sum
@@ -998,7 +975,6 @@ impl_binop_with_refs!(GpuDCRTPoly => Add::add(self, rhs: &GpuDCRTPoly) -> GpuDCR
     let out = GpuDCRTPoly::new_empty(self.params.clone(), self.level, self.is_ntt);
     let status = unsafe { gpu_poly_add(out.raw, self.raw, rhs.raw) };
     check_status(status, "gpu_poly_add");
-    maybe_sync();
     out
 });
 
@@ -1007,7 +983,6 @@ impl_binop_with_refs!(GpuDCRTPoly => Sub::sub(self, rhs: &GpuDCRTPoly) -> GpuDCR
     let out = GpuDCRTPoly::new_empty(self.params.clone(), self.level, self.is_ntt);
     let status = unsafe { gpu_poly_sub(out.raw, self.raw, rhs.raw) };
     check_status(status, "gpu_poly_sub");
-    maybe_sync();
     out
 });
 
@@ -1016,7 +991,6 @@ impl_binop_with_refs!(GpuDCRTPoly => Mul::mul(self, rhs: &GpuDCRTPoly) -> GpuDCR
     let mut out = GpuDCRTPoly::new_empty(self.params.clone(), self.level, false);
     let status = unsafe { gpu_poly_mul(out.raw, self.raw, rhs.raw) };
     check_status(status, "gpu_poly_mul");
-    maybe_sync();
     out.is_ntt = true;
     out
 });

@@ -1,5 +1,3 @@
-#[cfg(feature = "gpu")]
-use crate::poly::dcrt::gpu::gpu_device_sync;
 use crate::{
     matrix::{
         PolyMatrix,
@@ -160,18 +158,12 @@ fn sample_p1_for_pert_mat(
     debug_mem("sample_p1_for_pert_square_mat parameters computed");
     let mut a_mat = a_mat.to_cpp_matrix_ptr();
     FormatMatrixCoefficient(a_mat.inner.as_mut().unwrap());
-    #[cfg(feature = "gpu")]
-    gpu_device_sync();
     let a_mat_arc = Arc::new(a_mat);
     let mut b_mat = b_mat.to_cpp_matrix_ptr();
     FormatMatrixCoefficient(b_mat.inner.as_mut().unwrap());
-    #[cfg(feature = "gpu")]
-    gpu_device_sync();
     let b_mat_arc = Arc::new(b_mat);
     let mut d_mat = d_mat.to_cpp_matrix_ptr();
     FormatMatrixCoefficient(d_mat.inner.as_mut().unwrap());
-    #[cfg(feature = "gpu")]
-    gpu_device_sync();
     let d_mat_arc = Arc::new(d_mat);
     debug_mem("a_mat, b_mat, d_mat are converted to cpp matrices");
 
@@ -180,8 +172,6 @@ fn sample_p1_for_pert_mat(
         let end_col = min((i + 1) * block_size, padded_ncol);
         let mut tp2 = tp2.slice_columns(i * block_size, end_col).to_cpp_matrix_ptr();
         FormatMatrixCoefficient(tp2.inner.as_mut().unwrap());
-        #[cfg(feature = "gpu")]
-        gpu_device_sync();
         let tp2_arc = Arc::new(tp2);
         debug_mem("tp2 is converted to cpp matrices");
         let ncol = end_col - i * block_size;
@@ -206,8 +196,6 @@ fn sample_p1_for_pert_mat(
                 s,
                 dgg_stddev,
             );
-            #[cfg(feature = "gpu")]
-            gpu_device_sync();
             debug_mem("SampleP1ForPertSquareMat called");
             p1_blocks.push(DCRTPolyMatrix::from_cpp_matrix_ptr(
                 params,

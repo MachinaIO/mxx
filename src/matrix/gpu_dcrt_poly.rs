@@ -1,10 +1,12 @@
 use crate::{
+    element::PolyElem,
     matrix::PolyMatrix,
     poly::{
         Poly, PolyParams,
         dcrt::{
             gpu::{GpuDCRTPoly, GpuDCRTPolyParams, PinnedHostBuffer},
             params::DCRTPolyParams,
+            poly::DCRTPoly,
         },
     },
     utils::block_size,
@@ -28,10 +30,27 @@ pub struct GpuDCRTPolyMatrix {
 
 impl Debug for GpuDCRTPolyMatrix {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cpu_params = self.cpu_params();
+        let mut coeffs = Vec::with_capacity(self.nrow);
+        for row in 0..self.nrow {
+            let mut row_coeffs = Vec::with_capacity(self.ncol);
+            for col in 0..self.ncol {
+                let bytes = self.entry_bytes(row, col);
+                let poly = DCRTPoly::from_compact_bytes(&cpu_params, bytes);
+                let values = poly
+                    .coeffs()
+                    .into_iter()
+                    .map(|coeff| coeff.value().clone())
+                    .collect::<Vec<_>>();
+                row_coeffs.push(values);
+            }
+            coeffs.push(row_coeffs);
+        }
         f.debug_struct("GpuDCRTPolyMatrix")
             .field("params", &self.params)
             .field("nrow", &self.nrow)
             .field("ncol", &self.ncol)
+            .field("coeffs", &coeffs)
             .finish()
     }
 }
@@ -45,20 +64,16 @@ impl PartialEq for GpuDCRTPolyMatrix {
             return true;
         }
 
-        let total = self.nrow.saturating_mul(self.ncol);
-        for idx in 0..total {
-            let mut lhs =
-                GpuDCRTPoly::from_compact_bytes(&self.params, self.entries[idx].as_slice());
-            let mut rhs =
-                GpuDCRTPoly::from_compact_bytes(&other.params, other.entries[idx].as_slice());
-            // Align to eval format before comparing to avoid mismatches across domains.
-            lhs.ntt_in_place();
-            rhs.ntt_in_place();
-            if lhs.to_compact_bytes() != rhs.to_compact_bytes() {
-                return false;
-            }
-        }
-        true
+        let cpu_params = self.cpu_params();
+        let lhs = super::dcrt_poly::DCRTPolyMatrix::from_compact_bytes(
+            &cpu_params,
+            &self.to_compact_bytes(),
+        );
+        let rhs = super::dcrt_poly::DCRTPolyMatrix::from_compact_bytes(
+            &cpu_params,
+            &other.to_compact_bytes(),
+        );
+        lhs == rhs
     }
 }
 
@@ -78,7 +93,7 @@ impl GpuDCRTPolyMatrix {
         row * self.ncol + col
     }
 
-    fn entry_bytes(&self, row: usize, col: usize) -> &[u8] {
+    pub(crate) fn entry_bytes(&self, row: usize, col: usize) -> &[u8] {
         self.entries[self.entry_index(row, col)].as_slice()
     }
 
@@ -114,10 +129,9 @@ impl GpuDCRTPolyMatrix {
         let mut entries = Vec::with_capacity(nrow.saturating_mul(ncol));
         for i in 0..nrow {
             let row = matrix.get_row(i);
-            for poly in row {
+            for poly in row.into_iter() {
                 let bytes = poly.to_compact_bytes();
-                let gpu_poly = GpuDCRTPoly::from_compact_bytes(params, &bytes);
-                entries.push(PinnedHostBuffer::from_slice(&gpu_poly.to_compact_bytes()));
+                entries.push(PinnedHostBuffer::from_slice(&bytes));
             }
         }
 
@@ -388,8 +402,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
     }
 
     fn entry(&self, i: usize, j: usize) -> Self::P {
-        let mut poly = GpuDCRTPoly::from_compact_bytes(&self.params, self.entry_bytes(i, j));
-        poly.ntt_in_place();
+        let poly = GpuDCRTPoly::from_compact_bytes(&self.params, self.entry_bytes(i, j));
         poly
     }
 

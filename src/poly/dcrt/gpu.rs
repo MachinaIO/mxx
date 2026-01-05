@@ -4,8 +4,6 @@ use crate::{
     poly::{Poly, PolyParams},
     utils::{chunk_size_for, log_mem, mod_inverse},
 };
-#[cfg(all(test, feature = "gpu"))]
-use ctor::ctor;
 use num_bigint::BigUint;
 use num_traits::{One, ToPrimitive, Zero};
 use rayon::prelude::*;
@@ -21,16 +19,8 @@ use std::{
     ptr::{self, NonNull},
     slice,
     sync::Arc,
+    time::Instant,
 };
-
-#[cfg(all(test, feature = "gpu"))]
-#[ctor]
-fn force_single_test_thread() {
-    // Safety: executed at test startup to enforce single-threaded GPU tests.
-    unsafe {
-        std::env::set_var("RUST_TEST_THREADS", "1");
-    }
-}
 
 #[allow(non_camel_case_types)]
 #[repr(C)]
@@ -582,18 +572,20 @@ impl GpuDCRTPoly {
             chunk_size_for(ring_dimension),
         );
 
-        let n = ring_dimension;
         let level = self.level;
-        let mut flat = vec![0u64; (level + 1) * n];
         let moduli = self.params.moduli();
-        for (i, coeff) in coeffs.iter().enumerate() {
-            let value = coeff.value();
-            for limb in 0..=level {
-                let modulus = BigUint::from(moduli[limb]);
-                let residue = (value % modulus).to_u64().unwrap_or(0);
-                flat[limb * n + i] = residue;
-            }
-        }
+        let modulus_bigints =
+            moduli[..=level].iter().map(|m| BigUint::from(*m)).collect::<Vec<_>>();
+        let residues_by_limb = modulus_bigints
+            .iter()
+            .map(|modulus| {
+                coeffs
+                    .par_iter()
+                    .map(|coeff| (coeff.value() % modulus).to_u64().unwrap_or(0))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let flat = residues_by_limb.into_iter().flatten().collect::<Vec<_>>();
 
         let status = unsafe { gpu_poly_load_rns(self.raw, flat.as_ptr(), flat.len()) };
         check_status(status, "gpu_poly_load_rns");
@@ -810,7 +802,14 @@ impl Poly for GpuDCRTPoly {
         let poly = self.ensure_coeff_domain();
         let n = poly.params.ring_dimension as usize;
         let level = poly.level;
+        let flat_time = Instant::now();
         let flat = poly.store_rns_flat();
+        log_mem(&format!(
+            "GpuDCRTPoly::coeffs: stored RNS flat for n={}, level={} in {:?}",
+            n,
+            level,
+            flat_time.elapsed()
+        ));
         let modulus = poly.params.modulus();
         let reconstruct_coeffs = poly.params.reconstruct_coeffs_for_level(level);
         let modulus_level = Arc::new(poly.params.modulus_for_level(level));

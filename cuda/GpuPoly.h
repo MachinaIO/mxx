@@ -10,6 +10,11 @@ extern "C" {
 typedef struct GpuContext GpuContext;
 typedef struct GpuPoly GpuPoly;
 typedef struct GpuEventSet GpuEventSet;
+typedef enum GpuPolyFormat
+{
+    GPU_POLY_FORMAT_COEFF = 0,
+    GPU_POLY_FORMAT_EVAL = 1,
+} GpuPolyFormat;
 
 int gpu_context_create(
     uint32_t logN,
@@ -35,14 +40,43 @@ int gpu_poly_copy(GpuPoly* dst, const GpuPoly* src);
 
 int gpu_poly_get_level(const GpuPoly* poly, int* out_level);
 
-int gpu_poly_load_rns(GpuPoly* poly, const uint64_t* coeffs_flat, size_t coeffs_len);
-int gpu_poly_store_rns(GpuPoly* poly, uint64_t* coeffs_flat_out, size_t coeffs_len, GpuEventSet** out_events);
+int gpu_poly_load_rns(
+    GpuPoly* poly,
+    const uint64_t* rns_flat,
+    size_t rns_len,
+    int format);
+int gpu_poly_store_rns(
+    GpuPoly* poly,
+    uint64_t* rns_flat_out,
+    size_t rns_len,
+    int format,
+    GpuEventSet** out_events);
+int gpu_poly_load_rns_batch(
+    GpuPoly* const* polys,
+    size_t poly_count,
+    const uint8_t* bytes,
+    size_t bytes_per_poly,
+    int format);
+int gpu_poly_store_rns_batch(
+    GpuPoly* const* polys,
+    size_t poly_count,
+    uint8_t* bytes_out,
+    size_t bytes_per_poly,
+    int format,
+    GpuEventSet** out_events);
 int gpu_event_set_wait(GpuEventSet* events);
 void gpu_event_set_destroy(GpuEventSet* events);
 
 int gpu_poly_add(GpuPoly* out, const GpuPoly* a, const GpuPoly* b);
 int gpu_poly_sub(GpuPoly* out, const GpuPoly* a, const GpuPoly* b);
 int gpu_poly_mul(GpuPoly* out, const GpuPoly* a, const GpuPoly* b);
+int gpu_block_add(GpuPoly* const* out, const GpuPoly* const* lhs, const GpuPoly* const* rhs, size_t count);
+int gpu_block_sub(GpuPoly* const* out, const GpuPoly* const* lhs, const GpuPoly* const* rhs, size_t count);
+int gpu_block_entrywise_mul(
+    GpuPoly* const* out,
+    const GpuPoly* const* lhs,
+    const GpuPoly* const* rhs,
+    size_t count);
 
 int gpu_poly_ntt(GpuPoly* poly, int batch);
 int gpu_poly_intt(GpuPoly* poly, int batch);

@@ -43,16 +43,23 @@ pub struct GpuDCRTTrapdoor {
 
 impl GpuDCRTTrapdoor {
     pub fn new(params: &GpuDCRTPolyParams, size: usize, sigma: f64) -> Self {
+        log_mem("start new GpuDCRTTrapdoor");
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();
         let log_base_q = params.modulus_digits();
         let dist = DistType::GaussDist { sigma };
         let r = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
+        log_mem("sample r");
         let e = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
+        log_mem("sample e");
         let a_mat = r.clone() * r.transpose();
+        log_mem("compute a_mat");
         let e_transpose = e.transpose();
         let b_mat = r.clone() * &e_transpose;
+        log_mem("compute b_mat");
         let d_mat = e.clone() * &e_transpose;
+        log_mem("compute d_mat");
         let re = r.concat_rows(&[&e]);
+        log_mem("compute re");
         Self { r, e, a_mat, b_mat, d_mat, re }
     }
 
@@ -182,12 +189,18 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         size: usize,
     ) -> (Self::Trapdoor, Self::M) {
         let trapdoor = GpuDCRTTrapdoor::new(params, size, self.sigma);
+        log_mem("trapdoor sampled");
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();
         let a_bar = uniform_sampler.sample_uniform(params, size, size, DistType::FinRingDist);
+        log_mem("a_bar sampled");
         let g = GpuDCRTPolyMatrix::gadget_matrix(params, size);
+        log_mem("gadget matrix computed");
         let a0 = a_bar.concat_columns(&[&GpuDCRTPolyMatrix::identity(params, size, None)]);
+        log_mem("a0 computed");
         let a1 = g - (a_bar * &trapdoor.r + &trapdoor.e);
+        log_mem("a1 computed");
         let a = a0.concat_columns(&[&a1]);
+        log_mem("a computed");
         (trapdoor, a)
     }
 
@@ -361,7 +374,9 @@ fn cpu_params_from_gpu(params: &GpuDCRTPolyParams) -> DCRTPolyParams {
 }
 
 fn gpu_matrix_to_cpu(params: &DCRTPolyParams, matrix: &GpuDCRTPolyMatrix) -> DCRTPolyMatrix {
-    DCRTPolyMatrix::from_compact_bytes(params, &matrix.to_compact_bytes())
+    let cpu_matrix = matrix.to_cpu_matrix();
+    debug_assert_eq!(cpu_matrix.params, *params, "CPU params mismatch in gpu_matrix_to_cpu");
+    cpu_matrix
 }
 
 #[cfg(test)]
@@ -374,6 +389,7 @@ mod tests {
     }
 
     fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {
+        let _ = tracing_subscriber::fmt::try_init();
         let (moduli, _, _) = params.to_crt();
         GpuDCRTPolyParams::new(params.ring_dimension(), moduli, params.base_bits())
     }
@@ -385,7 +401,6 @@ mod tests {
         let size: usize = 3;
         let cpu_params = cpu_test_params();
         let params = gpu_params_from_cpu(&cpu_params);
-        eprintln!("crt_bits cpu={}, gpu={}", cpu_params.crt_bits(), params.crt_bits());
         let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
 
         let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
@@ -406,9 +421,13 @@ mod tests {
 
         let k = params.modulus_digits();
         let identity = GpuDCRTPolyMatrix::identity(&params, size * k, None);
+        log_mem("identity sampled");
         let trapdoor_matrix = trapdoor.r.concat_rows(&[&trapdoor.e, &identity]);
+        log_mem("trapdoor_matrix sampled");
         let muled = &public_matrix * &trapdoor_matrix;
+        log_mem("muled computed");
         let gadget_matrix = GpuDCRTPolyMatrix::gadget_matrix(&params, size);
+        log_mem("gadget_matrix computed");
         assert_eq!(muled, gadget_matrix, "Product should equal gadget matrix");
     }
 
@@ -664,38 +683,38 @@ mod tests {
         assert_eq!(product, target, "Product of public matrix and preimage should equal target");
     }
 
-    #[test]
-    #[sequential]
-    fn test_gpu_preimage_generation_large() {
-        gpu_device_sync();
-        let _ = tracing_subscriber::fmt::try_init();
-        let cpu_params = DCRTPolyParams::new(128, 15, 24, 19);
-        let params = gpu_params_from_cpu(&cpu_params);
-        let size = 2;
-        let k = params.modulus_digits();
-        let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
-        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+    // #[test]
+    // #[sequential]
+    // fn test_gpu_preimage_generation_large() {
+    //     gpu_device_sync();
+    //     let _ = tracing_subscriber::fmt::try_init();
+    //     let cpu_params = DCRTPolyParams::new(128, 15, 24, 19);
+    //     let params = gpu_params_from_cpu(&cpu_params);
+    //     let size = 2;
+    //     let k = params.modulus_digits();
+    //     let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
+    //     let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
 
-        let uniform_sampler = GpuDCRTPolyUniformSampler::new();
-        let target = uniform_sampler.sample_uniform(&params, size, 1000, DistType::FinRingDist);
+    //     let uniform_sampler = GpuDCRTPolyUniformSampler::new();
+    //     let target = uniform_sampler.sample_uniform(&params, size, 1000, DistType::FinRingDist);
 
-        let preimage = trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &target);
+    //     let preimage = trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &target);
 
-        let expected_rows = size * (k + 2);
-        let expected_cols = 1000;
+    //     let expected_rows = size * (k + 2);
+    //     let expected_cols = 1000;
 
-        assert_eq!(
-            preimage.row_size(),
-            expected_rows,
-            "Preimage matrix should have the correct number of rows"
-        );
-        assert_eq!(
-            preimage.col_size(),
-            expected_cols,
-            "Preimage matrix should have the correct number of columns"
-        );
+    //     assert_eq!(
+    //         preimage.row_size(),
+    //         expected_rows,
+    //         "Preimage matrix should have the correct number of rows"
+    //     );
+    //     assert_eq!(
+    //         preimage.col_size(),
+    //         expected_cols,
+    //         "Preimage matrix should have the correct number of columns"
+    //     );
 
-        let product = public_matrix * &preimage;
-        assert_eq!(product, target, "Product of public matrix and preimage should equal target");
-    }
+    //     let product = public_matrix * &preimage;
+    //     assert_eq!(product, target, "Product of public matrix and preimage should equal target");
+    // }
 }

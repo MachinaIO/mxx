@@ -1,25 +1,12 @@
-#include "GpuPoly.h"
+#include "GpuPolyInternal.h"
 
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <new>
 #include <string>
 #include <vector>
 #include <cuda_runtime.h>
-
-// FIDESlib headers (expected under third_party/FIDESlib/include).
-#include "../third_party/FIDESlib/include/CKKS/Context.cuh"
-#include "../third_party/FIDESlib/include/CKKS/Parameters.cuh"
-#include "../third_party/FIDESlib/include/LimbUtils.cuh"
-#include "../third_party/FIDESlib/include/CKKS/RNSPoly.cuh"
-
-namespace CKKS = FIDESlib::CKKS;
-
-enum class PolyFormat
-{
-    Coeff,
-    Eval,
-};
 
 namespace
 {
@@ -38,38 +25,38 @@ namespace
     }
 }
 
-struct GpuContext
+extern "C" int gpu_set_last_error(const char *msg)
 {
-    CKKS::Context *ctx;
-    std::vector<uint64_t> moduli;
-    int N;
-    std::vector<int> gpu_ids;
-    uint32_t batch;
-};
-
-struct GpuPoly
-{
-    CKKS::RNSPoly *poly;
-    GpuContext *ctx;
-    int level;
-    PolyFormat format;
-};
-
-struct GpuEventSet
-{
-    struct Entry
-    {
-        cudaEvent_t event;
-        int device;
-    };
-    std::vector<Entry> entries;
-};
+    return set_error(msg);
+}
 
 namespace
 {
     int default_batch(const GpuContext *ctx)
     {
         return static_cast<int>(ctx && ctx->batch != 0 ? ctx->batch : 1);
+    }
+
+    bool parse_format(int format, PolyFormat &out)
+    {
+        switch (format)
+        {
+        case GPU_POLY_FORMAT_COEFF:
+            out = PolyFormat::Coeff;
+            return true;
+        case GPU_POLY_FORMAT_EVAL:
+            out = PolyFormat::Eval;
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    size_t expected_rns_len(const GpuPoly *poly)
+    {
+        const int level = poly->level;
+        const int N = poly->ctx->N;
+        return static_cast<size_t>(level + 1) * static_cast<size_t>(N);
     }
 
     void ensure_eval(GpuPoly *poly, int batch)
@@ -299,20 +286,25 @@ extern "C"
         return 0;
     }
 
-    int gpu_poly_load_rns(GpuPoly *poly, const uint64_t *coeffs_flat, size_t coeffs_len)
+    int gpu_poly_load_rns(GpuPoly *poly, const uint64_t *rns_flat, size_t rns_len, int format)
     {
         try
         {
-            if (!poly || !coeffs_flat)
+            if (!poly || !rns_flat)
             {
                 return set_error("invalid gpu_poly_load_rns arguments");
+            }
+            PolyFormat target_format;
+            if (!parse_format(format, target_format))
+            {
+                return set_error("invalid format in gpu_poly_load_rns");
             }
             const int level = poly->level;
             const int N = poly->ctx->N;
             const size_t expected = static_cast<size_t>(level + 1) * static_cast<size_t>(N);
-            if (coeffs_len != expected)
+            if (rns_len != expected)
             {
-                return set_error("coeffs_len mismatch in gpu_poly_load_rns");
+                return set_error("rns_len mismatch in gpu_poly_load_rns");
             }
 
             std::vector<std::vector<uint64_t>> data(level + 1, std::vector<uint64_t>(N));
@@ -320,13 +312,13 @@ extern "C"
             {
                 for (int i = 0; i < N; ++i)
                 {
-                    data[limb][i] = coeffs_flat[static_cast<size_t>(limb) * N + i];
+                    data[limb][i] = rns_flat[static_cast<size_t>(limb) * N + i];
                 }
             }
 
             std::vector<uint64_t> moduli_subset(poly->ctx->moduli.begin(), poly->ctx->moduli.begin() + level + 1);
             poly->poly->load(data, moduli_subset);
-            poly->format = PolyFormat::Coeff;
+            poly->format = target_format;
             return 0;
         }
         catch (const std::exception &e)
@@ -339,25 +331,42 @@ extern "C"
         }
     }
 
-    int gpu_poly_store_rns(GpuPoly *poly, uint64_t *coeffs_flat_out, size_t coeffs_len, GpuEventSet **out_events)
+    int gpu_poly_store_rns(
+        GpuPoly *poly,
+        uint64_t *rns_flat_out,
+        size_t rns_len,
+        int format,
+        GpuEventSet **out_events)
     {
         try
         {
-            if (!poly || !coeffs_flat_out || !out_events)
+            if (!poly || !rns_flat_out || !out_events)
             {
                 return set_error("invalid gpu_poly_store_rns arguments");
+            }
+            PolyFormat target_format;
+            if (!parse_format(format, target_format))
+            {
+                return set_error("invalid format in gpu_poly_store_rns");
             }
             *out_events = nullptr;
             const int level = poly->level;
             const int N = poly->ctx->N;
             const size_t expected = static_cast<size_t>(level + 1) * static_cast<size_t>(N);
-            if (coeffs_len != expected)
+            if (rns_len != expected)
             {
-                return set_error("coeffs_len mismatch in gpu_poly_store_rns");
+                return set_error("rns_len mismatch in gpu_poly_store_rns");
             }
 
             const int batch = default_batch(poly->ctx);
-            ensure_coeff(poly, batch);
+            if (target_format == PolyFormat::Eval)
+            {
+                ensure_eval(poly, batch);
+            }
+            else
+            {
+                ensure_coeff(poly, batch);
+            }
 
             auto *ctx = poly->ctx->ctx;
             if (ctx->limbGPUid.size() < static_cast<size_t>(level + 1))
@@ -396,7 +405,7 @@ extern "C"
                     return set_error(cudaGetErrorString(err));
                 }
 
-                uint64_t *dst = coeffs_flat_out + static_cast<size_t>(limb) * static_cast<size_t>(N);
+                uint64_t *dst = rns_flat_out + static_cast<size_t>(limb) * static_cast<size_t>(N);
                 err = cudaMemcpyAsync(
                     dst,
                     limb_u64.v.data,
@@ -436,6 +445,248 @@ extern "C"
         catch (...)
         {
             return set_error("unknown exception in gpu_poly_store_rns");
+        }
+    }
+
+    int gpu_poly_load_rns_batch(
+        GpuPoly *const *polys,
+        size_t poly_count,
+        const uint8_t *bytes,
+        size_t bytes_per_poly,
+        int format)
+    {
+        try
+        {
+            if (!polys || (!bytes && poly_count > 0))
+            {
+                return set_error("invalid gpu_poly_load_rns_batch arguments");
+            }
+            if (poly_count == 0)
+            {
+                return 0;
+            }
+            PolyFormat target_format;
+            if (!parse_format(format, target_format))
+            {
+                return set_error("invalid format in gpu_poly_load_rns_batch");
+            }
+            if (bytes_per_poly == 0 || bytes_per_poly % sizeof(uint64_t) != 0)
+            {
+                return set_error("bytes_per_poly must be a non-zero multiple of 8");
+            }
+
+            GpuPoly *first = polys[0];
+            if (!first || !first->ctx)
+            {
+                return set_error("null poly in gpu_poly_load_rns_batch");
+            }
+            const size_t expected_len = expected_rns_len(first);
+            const size_t expected_bytes = expected_len * sizeof(uint64_t);
+            if (bytes_per_poly < expected_bytes)
+            {
+                return set_error("bytes_per_poly too small in gpu_poly_load_rns_batch");
+            }
+            const int level = first->level;
+            const int N = first->ctx->N;
+            std::vector<uint64_t> moduli_subset(first->ctx->moduli.begin(),
+                                                first->ctx->moduli.begin() + level + 1);
+
+            std::vector<std::vector<uint64_t>> data(level + 1);
+            for (int limb = 0; limb <= level; ++limb)
+            {
+                data[limb].resize(N);
+            }
+
+            for (size_t i = 0; i < poly_count; ++i)
+            {
+                GpuPoly *poly = polys[i];
+                if (!poly || !poly->ctx)
+                {
+                    return set_error("null poly in gpu_poly_load_rns_batch");
+                }
+                if (poly->ctx != first->ctx || poly->level != level)
+                {
+                    return set_error("mismatched poly context or level in gpu_poly_load_rns_batch");
+                }
+
+                const uint8_t *base = bytes + i * bytes_per_poly;
+                const uint64_t *rns_flat = reinterpret_cast<const uint64_t *>(base);
+                std::vector<uint64_t> tmp;
+                if (reinterpret_cast<uintptr_t>(base) % alignof(uint64_t) != 0)
+                {
+                    tmp.resize(expected_len);
+                    std::memcpy(tmp.data(), base, expected_bytes);
+                    rns_flat = tmp.data();
+                }
+
+                for (int limb = 0; limb <= level; ++limb)
+                {
+                    const uint64_t *src = rns_flat + static_cast<size_t>(limb) * static_cast<size_t>(N);
+                    std::memcpy(data[limb].data(), src, static_cast<size_t>(N) * sizeof(uint64_t));
+                }
+
+                poly->poly->load(data, moduli_subset);
+                poly->format = target_format;
+            }
+            return 0;
+        }
+        catch (const std::exception &e)
+        {
+            return set_error(e);
+        }
+        catch (...)
+        {
+            return set_error("unknown exception in gpu_poly_load_rns_batch");
+        }
+    }
+
+    int gpu_poly_store_rns_batch(
+        GpuPoly *const *polys,
+        size_t poly_count,
+        uint8_t *bytes_out,
+        size_t bytes_per_poly,
+        int format,
+        GpuEventSet **out_events)
+    {
+        try
+        {
+            if (!polys || (!bytes_out && poly_count > 0) || !out_events)
+            {
+                return set_error("invalid gpu_poly_store_rns_batch arguments");
+            }
+            *out_events = nullptr;
+            if (poly_count == 0)
+            {
+                return 0;
+            }
+            PolyFormat target_format;
+            if (!parse_format(format, target_format))
+            {
+                return set_error("invalid format in gpu_poly_store_rns_batch");
+            }
+            if (bytes_per_poly == 0 || bytes_per_poly % sizeof(uint64_t) != 0)
+            {
+                return set_error("bytes_per_poly must be a non-zero multiple of 8");
+            }
+
+            GpuPoly *first = polys[0];
+            if (!first || !first->ctx)
+            {
+                return set_error("null poly in gpu_poly_store_rns_batch");
+            }
+            const size_t expected_len = expected_rns_len(first);
+            const size_t expected_bytes = expected_len * sizeof(uint64_t);
+            if (bytes_per_poly < expected_bytes)
+            {
+                return set_error("bytes_per_poly too small in gpu_poly_store_rns_batch");
+            }
+            const int level = first->level;
+            const int N = first->ctx->N;
+            auto *ctx = first->ctx->ctx;
+            if (ctx->limbGPUid.size() < static_cast<size_t>(level + 1))
+            {
+                return set_error("unexpected limb mapping size in gpu_poly_store_rns_batch");
+            }
+
+            auto *event_set = new GpuEventSet();
+            event_set->entries.reserve(static_cast<size_t>(level + 1) * poly_count);
+
+            const int batch = default_batch(first->ctx);
+
+            for (size_t i = 0; i < poly_count; ++i)
+            {
+                GpuPoly *poly = polys[i];
+                if (!poly || !poly->ctx)
+                {
+                    destroy_event_set(event_set);
+                    return set_error("null poly in gpu_poly_store_rns_batch");
+                }
+                if (poly->ctx != first->ctx || poly->level != level)
+                {
+                    destroy_event_set(event_set);
+                    return set_error("mismatched poly context or level in gpu_poly_store_rns_batch");
+                }
+
+                if (target_format == PolyFormat::Eval)
+                {
+                    ensure_eval(poly, batch);
+                }
+                else
+                {
+                    ensure_coeff(poly, batch);
+                }
+
+                for (int limb = 0; limb <= level; ++limb)
+                {
+                    const dim3 limb_id = ctx->limbGPUid[static_cast<size_t>(limb)];
+                    if (limb_id.x >= poly->poly->GPU.size())
+                    {
+                        destroy_event_set(event_set);
+                        return set_error("unexpected limb GPU partition in gpu_poly_store_rns_batch");
+                    }
+                    auto &partition = poly->poly->GPU[limb_id.x];
+                    if (limb_id.y >= partition.limb.size())
+                    {
+                        destroy_event_set(event_set);
+                        return set_error("unexpected limb index in gpu_poly_store_rns_batch");
+                    }
+                    auto &limb_impl = partition.limb[limb_id.y];
+                    if (limb_impl.index() != FIDESlib::U64)
+                    {
+                        destroy_event_set(event_set);
+                        return set_error("unsupported limb type in gpu_poly_store_rns_batch");
+                    }
+                    auto &limb_u64 = std::get<FIDESlib::U64>(limb_impl);
+
+                    cudaError_t err = cudaSetDevice(partition.device);
+                    if (err != cudaSuccess)
+                    {
+                        destroy_event_set(event_set);
+                        return set_error(cudaGetErrorString(err));
+                    }
+
+                    uint8_t *dst_bytes = bytes_out + i * bytes_per_poly +
+                                         static_cast<size_t>(limb) * static_cast<size_t>(N) * sizeof(uint64_t);
+                    err = cudaMemcpyAsync(
+                        dst_bytes,
+                        limb_u64.v.data,
+                        static_cast<size_t>(N) * sizeof(uint64_t),
+                        cudaMemcpyDeviceToHost,
+                        limb_u64.stream.ptr);
+                    if (err != cudaSuccess)
+                    {
+                        destroy_event_set(event_set);
+                        return set_error(cudaGetErrorString(err));
+                    }
+
+                    cudaEvent_t ev = nullptr;
+                    err = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+                    if (err != cudaSuccess)
+                    {
+                        destroy_event_set(event_set);
+                        return set_error(cudaGetErrorString(err));
+                    }
+                    err = cudaEventRecord(ev, limb_u64.stream.ptr);
+                    if (err != cudaSuccess)
+                    {
+                        cudaEventDestroy(ev);
+                        destroy_event_set(event_set);
+                        return set_error(cudaGetErrorString(err));
+                    }
+                    event_set->entries.push_back({ev, partition.device});
+                }
+            }
+
+            *out_events = event_set;
+            return 0;
+        }
+        catch (const std::exception &e)
+        {
+            return set_error(e);
+        }
+        catch (...)
+        {
+            return set_error("unknown exception in gpu_poly_store_rns_batch");
         }
     }
 

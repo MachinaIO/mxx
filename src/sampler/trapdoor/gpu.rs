@@ -683,38 +683,38 @@ mod tests {
         assert_eq!(product, target, "Product of public matrix and preimage should equal target");
     }
 
-    // #[test]
-    // #[sequential]
-    // fn test_gpu_preimage_generation_large() {
-    //     gpu_device_sync();
-    //     let _ = tracing_subscriber::fmt::try_init();
-    //     let cpu_params = DCRTPolyParams::new(128, 15, 24, 19);
-    //     let params = gpu_params_from_cpu(&cpu_params);
-    //     let size = 2;
-    //     let k = params.modulus_digits();
-    //     let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
-    //     let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+    #[test]
+    #[sequential]
+    fn test_gpu_preimage_generation_large() {
+        gpu_device_sync();
+        let _ = tracing_subscriber::fmt::try_init();
+        let cpu_params = DCRTPolyParams::new(128, 15, 24, 19);
+        let params = gpu_params_from_cpu(&cpu_params);
+        let size = 2;
+        let k = params.modulus_digits();
+        let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
 
-    //     let uniform_sampler = GpuDCRTPolyUniformSampler::new();
-    //     let target = uniform_sampler.sample_uniform(&params, size, 1000, DistType::FinRingDist);
+        let uniform_sampler = GpuDCRTPolyUniformSampler::new();
+        let target = uniform_sampler.sample_uniform(&params, size, 1000, DistType::FinRingDist);
 
-    //     let preimage = trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &target);
+        let preimage = trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &target);
 
-    //     let expected_rows = size * (k + 2);
-    //     let expected_cols = 1000;
+        let expected_rows = size * (k + 2);
+        let expected_cols = 1000;
 
-    //     assert_eq!(
-    //         preimage.row_size(),
-    //         expected_rows,
-    //         "Preimage matrix should have the correct number of rows"
-    //     );
-    //     assert_eq!(
-    //         preimage.col_size(),
-    //         expected_cols,
-    //         "Preimage matrix should have the correct number of columns"
-    //     );
+        assert_eq!(
+            preimage.row_size(),
+            expected_rows,
+            "Preimage matrix should have the correct number of rows"
+        );
+        assert_eq!(
+            preimage.col_size(),
+            expected_cols,
+            "Preimage matrix should have the correct number of columns"
+        );
 
-    //     let product = public_matrix * &preimage;
-    //     assert_eq!(product, target, "Product of public matrix and preimage should equal target");
-    // }
+        let product = public_matrix * &preimage;
+        assert_eq!(product, target, "Product of public matrix and preimage should equal target");
+    }
 }

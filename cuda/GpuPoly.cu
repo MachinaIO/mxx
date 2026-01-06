@@ -889,6 +889,61 @@ extern "C"
         }
     }
 
+    int gpu_device_count(int *out_count)
+    {
+        if (!out_count)
+        {
+            return set_error("invalid gpu_device_count arguments");
+        }
+        int count = 0;
+        cudaError_t err = cudaGetDeviceCount(&count);
+        if (err == cudaErrorNoDevice)
+        {
+            *out_count = 0;
+            return 0;
+        }
+        if (err != cudaSuccess)
+        {
+            return set_error(cudaGetErrorString(err));
+        }
+        *out_count = count;
+        return 0;
+    }
+
+    int gpu_device_mem_info(int device, size_t *out_free, size_t *out_total)
+    {
+        if (!out_free || !out_total)
+        {
+            return set_error("invalid gpu_device_mem_info arguments");
+        }
+        int current = 0;
+        cudaError_t err = cudaGetDevice(&current);
+        if (err != cudaSuccess)
+        {
+            return set_error(cudaGetErrorString(err));
+        }
+        err = cudaSetDevice(device);
+        if (err != cudaSuccess)
+        {
+            return set_error(cudaGetErrorString(err));
+        }
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        err = cudaMemGetInfo(&free_bytes, &total_bytes);
+        cudaError_t restore_err = cudaSetDevice(current);
+        if (err != cudaSuccess)
+        {
+            return set_error(cudaGetErrorString(err));
+        }
+        if (restore_err != cudaSuccess)
+        {
+            return set_error(cudaGetErrorString(restore_err));
+        }
+        *out_free = free_bytes;
+        *out_total = total_bytes;
+        return 0;
+    }
+
     int gpu_device_synchronize()
     {
         cudaError_t err = cudaDeviceSynchronize();

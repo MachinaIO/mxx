@@ -82,6 +82,8 @@ int gpu_poly_ntt(GpuPoly* poly, int batch);
 int gpu_poly_intt(GpuPoly* poly, int batch);
 int gpu_device_synchronize();
 int gpu_device_reset();
+int gpu_device_count(int* out_count);
+int gpu_device_mem_info(int device, size_t* out_free, size_t* out_total);
 
 const char* gpu_last_error();
 

@@ -98,16 +98,57 @@ pub fn debug_mem<T: Into<String>>(tag: T) {
 }
 
 pub fn log_mem<T: Into<String>>(tag: T) {
+    let tag = tag.into();
+    let gpu_suffix = gpu_mem_log_suffix();
     if let Some(usage) = memory_stats() {
-        info!(
-            "{} || Current physical/virtual memory usage: {} | {}",
-            tag.into(),
-            usage.physical_mem,
-            usage.virtual_mem,
-        );
+        if let Some(gpu_suffix) = gpu_suffix {
+            info!(
+                "{} || Current physical/virtual memory usage: {} | {} || {}",
+                tag, usage.physical_mem, usage.virtual_mem, gpu_suffix,
+            );
+        } else {
+            info!(
+                "{} || Current physical/virtual memory usage: {} | {}",
+                tag, usage.physical_mem, usage.virtual_mem,
+            );
+        }
     } else {
-        info!("Couldn't get the current memory usage :(");
+        if let Some(gpu_suffix) = gpu_suffix {
+            info!("Couldn't get the current memory usage :( || {}", gpu_suffix);
+        } else {
+            info!("Couldn't get the current memory usage :(");
+        }
     }
+}
+
+#[cfg(feature = "gpu")]
+fn gpu_mem_log_suffix() -> Option<String> {
+    match crate::poly::dcrt::gpu::gpu_memory_infos() {
+        Ok(infos) => {
+            if infos.is_empty() {
+                return Some("GPU memory: no devices".to_string());
+            }
+            let entries = infos
+                .into_iter()
+                .map(|info| {
+                    let used = info.total.saturating_sub(info.free);
+                    let percent = if info.total == 0 {
+                        0u128
+                    } else {
+                        (used as u128).saturating_mul(100) / info.total as u128
+                    };
+                    format!("gpu{} {}/{} ({}%)", info.device, used, info.total, percent)
+                })
+                .collect::<Vec<_>>();
+            Some(format!("GPU memory: {}", entries.join(", ")))
+        }
+        Err(err) => Some(format!("GPU memory: unavailable ({err})")),
+    }
+}
+
+#[cfg(not(feature = "gpu"))]
+fn gpu_mem_log_suffix() -> Option<String> {
+    None
 }
 
 // Helper function to create a random polynomial using UniformSampler

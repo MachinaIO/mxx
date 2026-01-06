@@ -131,6 +131,8 @@ unsafe extern "C" {
     fn gpu_poly_ntt(poly: *mut GpuPolyOpaque, batch: c_int) -> c_int;
     fn gpu_poly_intt(poly: *mut GpuPolyOpaque, batch: c_int) -> c_int;
     fn gpu_device_synchronize() -> c_int;
+    fn gpu_device_count(out_count: *mut c_int) -> c_int;
+    fn gpu_device_mem_info(device: c_int, out_free: *mut usize, out_total: *mut usize) -> c_int;
 
     fn gpu_last_error() -> *const c_char;
 
@@ -160,6 +162,39 @@ fn check_status(code: c_int, context: &str) {
 pub(crate) fn gpu_device_sync() {
     let status = unsafe { gpu_device_synchronize() };
     check_status(status, "gpu_device_synchronize");
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GpuMemoryInfo {
+    pub device: c_int,
+    pub free: usize,
+    pub total: usize,
+}
+
+pub(crate) fn gpu_memory_infos() -> Result<Vec<GpuMemoryInfo>, String> {
+    let mut count: c_int = 0;
+    let status = unsafe { gpu_device_count(&mut count) };
+    if status != 0 {
+        return Err(last_error_string());
+    }
+    if count < 0 {
+        return Err("invalid GPU device count".to_string());
+    }
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut infos = Vec::with_capacity(count as usize);
+    for device in 0..count {
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        let status = unsafe { gpu_device_mem_info(device, &mut free, &mut total) };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        infos.push(GpuMemoryInfo { device, free, total });
+    }
+    Ok(infos)
 }
 
 fn pinned_alloc<T>(len: usize) -> NonNull<T> {
@@ -682,7 +717,6 @@ impl GpuDCRTPoly {
     fn assert_compatible(&self, other: &Self) {
         assert_eq!(self.level, other.level, "GPU polynomials must have the same level");
         assert_eq!(self.params.as_ref(), other.params.as_ref(), "GPU params must match");
-        assert_eq!(self.is_ntt, other.is_ntt, "GPU polynomials must share the same domain");
     }
 
     pub(crate) fn load_from_compact_bytes(&mut self, bytes: &[u8]) {
@@ -996,7 +1030,21 @@ impl Poly for GpuDCRTPoly {
 
     fn from_u64_vecs(params: &Self::Params, coeffs: &[Vec<u64>]) -> Self {
         let n = params.ring_dimension as usize;
-        assert_eq!(coeffs.len(), n, "coeffs length must match ring dimension");
+        assert!(
+            coeffs.len() <= n,
+            "coeffs length must be <= ring dimension (got {}, expected <= {})",
+            coeffs.len(),
+            n
+        );
+        let mut coeffs_buf;
+        let coeffs = if coeffs.len() == n {
+            coeffs
+        } else {
+            coeffs_buf = Vec::with_capacity(n);
+            coeffs_buf.extend(coeffs.iter().cloned());
+            coeffs_buf.resize_with(n, Vec::new);
+            &coeffs_buf
+        };
         let num_limbs = coeffs.iter().map(|v| v.len()).max().unwrap_or(0).max(1);
         assert!(num_limbs <= params.crt_depth, "coeff limb count exceeds CRT depth");
         let level = num_limbs.saturating_sub(1);

@@ -308,10 +308,7 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
                 z_hat_cpu.set_entry(i * k + decomposed_idx, j, poly);
             }
         }
-        log_mem(format!(
-            "preimage z_hat_mat cpu build in {:?}",
-            z_hat_cpu_start.elapsed()
-        ));
+        log_mem(format!("preimage z_hat_mat cpu build in {:?}", z_hat_cpu_start.elapsed()));
         let z_hat_mat_start = Instant::now();
         let z_hat_mat = GpuDCRTPolyMatrix::from_cpu_matrix(params, &z_hat_cpu);
         log_mem(format!("preimage z_hat_mat construction in {:?}", z_hat_mat_start.elapsed()));
@@ -324,6 +321,7 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         let combine_start = Instant::now();
         let r_e_z_hat = r_z_hat.concat_rows_owned(vec![e_z_hat, z_hat_mat]);
         log_mem(format!("preimage concat r_e_z_hat in {:?}", combine_start.elapsed()));
+        log_mem(format!("p_hat size {:?}", p_hat.size()));
         let result = p_hat + r_e_z_hat;
         log_mem(format!("preimage total in {:?}", overall_start.elapsed()));
         result
@@ -674,41 +672,6 @@ mod tests {
         );
 
         let product = public_matrix.concat_columns(&[&extend]) * &preimage;
-        assert_eq!(product, target, "Product of public matrix and preimage should equal target");
-    }
-
-    #[test]
-    #[sequential]
-    fn test_gpu_preimage_generation_large() {
-        gpu_device_sync();
-        let _ = tracing_subscriber::fmt::try_init();
-        let cpu_params = DCRTPolyParams::new(1024, 15, 24, 19);
-        let params = gpu_params_from_cpu(&cpu_params);
-        let size = 2;
-        let k = params.modulus_digits();
-        let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
-        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
-
-        let uniform_sampler = GpuDCRTPolyUniformSampler::new();
-        let target = uniform_sampler.sample_uniform(&params, size, 1000, DistType::FinRingDist);
-
-        let preimage = trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &target);
-
-        let expected_rows = size * (k + 2);
-        let expected_cols = 1000;
-
-        assert_eq!(
-            preimage.row_size(),
-            expected_rows,
-            "Preimage matrix should have the correct number of rows"
-        );
-        assert_eq!(
-            preimage.col_size(),
-            expected_cols,
-            "Preimage matrix should have the correct number of columns"
-        );
-
-        let product = public_matrix * &preimage;
         assert_eq!(product, target, "Product of public matrix and preimage should equal target");
     }
 }

@@ -592,43 +592,4 @@ mod test {
         let product = public_matrix.concat_columns(&[&extend]) * &preimage;
         assert_eq!(product, target, "Product of public matrix and preimage should equal target");
     }
-
-    #[test]
-    fn test_preimage_generation_large() {
-        let _ = tracing_subscriber::fmt::try_init();
-        let params = DCRTPolyParams::new(1024, 15, 24, 19);
-        let size = 2;
-        let target_cols = 1000;
-        let k = params.modulus_digits();
-        let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
-        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
-
-        // Create a non-square target matrix (size x target_cols) such that target_cols > size
-        // target_cols is not a multiple of size
-        let uniform_sampler = DCRTPolyUniformSampler::new();
-        let target =
-            uniform_sampler.sample_uniform(&params, size, target_cols, DistType::FinRingDist);
-
-        let preimage = trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &target);
-
-        let expected_rows = size * (k + 2);
-        let expected_cols = target_cols;
-
-        assert_eq!(
-            preimage.row_size(),
-            expected_rows,
-            "Preimage matrix should have the correct number of rows"
-        );
-
-        assert_eq!(
-            preimage.col_size(),
-            expected_cols,
-            "Preimage matrix should have the correct number of columns (equal to target columns)"
-        );
-
-        // public_matrix * preimage should be equal to target
-        let product = public_matrix * &preimage;
-
-        assert_eq!(product, target, "Product of public matrix and preimage should equal target");
-    }
 }

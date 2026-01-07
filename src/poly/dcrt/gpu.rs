@@ -127,6 +127,14 @@ unsafe extern "C" {
         rhs: *const *const GpuPolyOpaque,
         count: usize,
     ) -> c_int;
+    fn gpu_block_mul(
+        out: *const *mut GpuPolyOpaque,
+        lhs: *const *const GpuPolyOpaque,
+        rhs: *const *const GpuPolyOpaque,
+        rows: usize,
+        inner: usize,
+        cols: usize,
+    ) -> c_int;
     fn gpu_poly_decompose_base(
         src: *const GpuPolyOpaque,
         base_bits: u32,
@@ -165,7 +173,8 @@ fn check_status(code: c_int, context: &str) {
     }
 }
 
-pub(crate) fn gpu_device_sync() {
+#[doc(hidden)]
+pub fn gpu_device_sync() {
     let status = unsafe { gpu_device_synchronize() };
     check_status(status, "gpu_device_synchronize");
 }
@@ -845,8 +854,72 @@ impl GpuDCRTPoly {
         Self::block_op_into(out, a, b, gpu_block_sub, "gpu_block_sub");
     }
 
-    pub(crate) fn block_mul_into(out: &mut [GpuDCRTPoly], a: &[GpuDCRTPoly], b: &[GpuDCRTPoly]) {
-        Self::block_op_into(out, a, b, gpu_block_entrywise_mul, "gpu_block_entrywise_mul");
+    // pub(crate) fn block_entrywise_mul_into(
+    //     out: &mut [GpuDCRTPoly],
+    //     a: &[GpuDCRTPoly],
+    //     b: &[GpuDCRTPoly],
+    // ) {
+    //     Self::block_op_into(out, a, b, gpu_block_entrywise_mul, "gpu_block_entrywise_mul");
+    // }
+
+    pub(crate) fn block_mul_into(
+        out: &mut [GpuDCRTPoly],
+        a: &[GpuDCRTPoly],
+        b: &[GpuDCRTPoly],
+        rows: usize,
+        inner: usize,
+        cols: usize,
+    ) {
+        let expected_out = rows.saturating_mul(cols);
+        let expected_a = rows.saturating_mul(inner);
+        let expected_b = inner.saturating_mul(cols);
+        assert_eq!(out.len(), expected_out, "GPU matmul requires rows*cols outputs");
+        assert_eq!(a.len(), expected_a, "GPU matmul requires rows*inner lhs polys");
+        assert_eq!(b.len(), expected_b, "GPU matmul requires inner*cols rhs polys");
+        if out.is_empty() || rows == 0 || inner == 0 || cols == 0 {
+            return;
+        }
+
+        let first = &a[0];
+        debug_assert!(
+            a.iter().all(|lhs| {
+                lhs.level == first.level &&
+                    lhs.params.as_ref() == first.params.as_ref() &&
+                    lhs.is_ntt == first.is_ntt
+            }) && b.iter().all(|rhs| {
+                rhs.level == first.level &&
+                    rhs.params.as_ref() == first.params.as_ref() &&
+                    rhs.is_ntt == first.is_ntt
+            }) && out.iter().all(|poly| {
+                poly.level == first.level &&
+                    poly.params.as_ref() == first.params.as_ref() &&
+                    poly.is_ntt == first.is_ntt
+            }),
+            "GPU matmul requires compatible inputs"
+        );
+
+        let out_ptrs = out.iter_mut().map(|poly| poly.raw).collect::<Vec<_>>();
+        let lhs_ptrs = a.iter().map(|poly| poly.raw as *const GpuPolyOpaque).collect::<Vec<_>>();
+        let rhs_ptrs = b.iter().map(|poly| poly.raw as *const GpuPolyOpaque).collect::<Vec<_>>();
+
+        let status = unsafe {
+            gpu_block_mul(
+                out_ptrs.as_ptr(),
+                lhs_ptrs.as_ptr(),
+                rhs_ptrs.as_ptr(),
+                rows,
+                inner,
+                cols,
+            )
+        };
+        check_status(status, "gpu_block_mul");
+
+        let is_ntt = a[0].is_ntt;
+        let level = a[0].level;
+        for poly in out.iter_mut() {
+            poly.is_ntt = is_ntt;
+            poly.level = level;
+        }
     }
 
     pub(crate) fn block_mul_into_refs(

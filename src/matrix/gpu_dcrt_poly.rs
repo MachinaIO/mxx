@@ -1245,29 +1245,34 @@ impl Mul<&GpuDCRTPolyMatrix> for &GpuDCRTPolyMatrix {
                     // log_mem(format!("load b with ips={:?} in {:?}", ips, b_start.elapsed()));
                     let op_start = Instant::now();
                     block_tmp.prepare(rows_len, cols_len);
-                    for k in 0..ip_len {
-                        let lhs_refs = parallel_iter!(0..total)
-                            .map(|idx| {
-                                let i = idx / cols_len;
-                                block_a.poly(i, k)
-                            })
-                            .collect::<Vec<_>>();
-                        let rhs_refs = parallel_iter!(0..total)
-                            .map(|idx| {
-                                let j = idx % cols_len;
-                                block_b.poly(k, j)
-                            })
-                            .collect::<Vec<_>>();
-                        GpuDCRTPoly::block_mul_into_refs(
-                            &mut block_tmp.polys[..total],
-                            &lhs_refs,
-                            &rhs_refs,
-                        );
-                        GpuDCRTPoly::block_add_assign(
-                            &mut block_acc.polys[..total],
-                            &block_tmp.polys[..total],
-                        );
-                    }
+                    let block_mul_start = Instant::now();
+                    GpuDCRTPoly::block_mul_into(
+                        &mut block_tmp.polys[..total],
+                        &block_a.polys[..rows_len * ip_len],
+                        &block_b.polys[..ip_len * cols_len],
+                        rows_len,
+                        ip_len,
+                        cols_len,
+                    );
+                    // log_mem(format!(
+                    //     "block_mul_into rows={:?} cols={:?} ips={:?} in {:?}",
+                    //     rows,
+                    //     cols,
+                    //     ips,
+                    //     block_mul_start.elapsed()
+                    // ));
+                    let block_add_start = Instant::now();
+                    GpuDCRTPoly::block_add_assign(
+                        &mut block_acc.polys[..total],
+                        &block_tmp.polys[..total],
+                    );
+                    // log_mem(format!(
+                    //     "block_add_assign rows={:?} cols={:?} ips={:?} in {:?}",
+                    //     rows,
+                    //     cols,
+                    //     ips,
+                    //     block_add_start.elapsed()
+                    // ));
                     // log_mem(format!(
                     //     "mul op rows={:?} cols={:?} ips={:?} in {:?}",
                     //     rows,
@@ -1284,12 +1289,12 @@ impl Mul<&GpuDCRTPolyMatrix> for &GpuDCRTPolyMatrix {
                     &cols,
                     &mut block_acc,
                 );
-                // log_mem(format!(
-                //     "mul write rows={:?} cols={:?} in {:?}",
-                //     rows,
-                //     cols,
-                //     write_start.elapsed()
-                // ));
+                log_mem(format!(
+                    "mul write rows={:?} cols={:?} in {:?}",
+                    rows,
+                    cols,
+                    write_start.elapsed()
+                ));
             }
             // log_mem("finish col loop");
         }

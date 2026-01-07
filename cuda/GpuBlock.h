@@ -15,6 +15,13 @@ int gpu_block_entrywise_mul(
     const GpuPoly *const *lhs,
     const GpuPoly *const *rhs,
     size_t count);
+int gpu_block_mul(
+    GpuPoly *const *out,
+    const GpuPoly *const *lhs,
+    const GpuPoly *const *rhs,
+    size_t rows,
+    size_t inner,
+    size_t cols);
 
 #ifdef __cplusplus
 }

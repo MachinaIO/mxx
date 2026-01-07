@@ -60,7 +60,11 @@ unsafe extern "C" {
         out_poly: *mut *mut GpuPolyOpaque,
     ) -> c_int;
     fn gpu_poly_destroy(poly: *mut GpuPolyOpaque);
-    fn gpu_poly_clone(src: *const GpuPolyOpaque, out_poly: *mut *mut GpuPolyOpaque) -> c_int;
+    fn gpu_poly_clone_async(
+        src: *const GpuPolyOpaque,
+        out_poly: *mut *mut GpuPolyOpaque,
+        out_events: *mut *mut GpuEventSetOpaque,
+    ) -> c_int;
 
     fn gpu_poly_load_rns(
         poly: *mut GpuPolyOpaque,
@@ -1024,9 +1028,20 @@ impl GpuDCRTPoly {
 impl Clone for GpuDCRTPoly {
     fn clone(&self) -> Self {
         let mut poly_ptr: *mut GpuPolyOpaque = ptr::null_mut();
-        let status = unsafe { gpu_poly_clone(self.raw, &mut poly_ptr as *mut *mut GpuPolyOpaque) };
-        check_status(status, "gpu_poly_clone");
-        gpu_device_sync();
+        let mut events: *mut GpuEventSetOpaque = ptr::null_mut();
+        let status = unsafe {
+            gpu_poly_clone_async(
+                self.raw,
+                &mut poly_ptr as *mut *mut GpuPolyOpaque,
+                &mut events as *mut *mut GpuEventSetOpaque,
+            )
+        };
+        check_status(status, "gpu_poly_clone_async");
+        if !events.is_null() {
+            let wait_status = unsafe { gpu_event_set_wait(events) };
+            unsafe { gpu_event_set_destroy(events) };
+            check_status(wait_status, "gpu_event_set_wait");
+        }
         Self { params: self.params.clone(), raw: poly_ptr, level: self.level, is_ntt: self.is_ntt }
     }
 }

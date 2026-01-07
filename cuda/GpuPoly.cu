@@ -280,6 +280,65 @@ extern "C"
         }
     }
 
+    int gpu_poly_clone_async(const GpuPoly *src, GpuPoly **out_poly, GpuEventSet **out_events)
+    {
+        try
+        {
+            if (!src || !out_poly || !out_events)
+            {
+                return set_error("invalid gpu_poly_clone_async arguments");
+            }
+            *out_poly = nullptr;
+            *out_events = nullptr;
+
+            auto *poly = new CKKS::RNSPoly(src->poly->clone());
+            auto *gpu_poly = new GpuPoly{poly, src->ctx, src->level, src->format};
+            auto *event_set = new GpuEventSet();
+            event_set->entries.reserve(gpu_poly->poly->GPU.size());
+
+            for (auto &partition : gpu_poly->poly->GPU)
+            {
+                cudaError_t err = cudaSetDevice(partition.device);
+                if (err != cudaSuccess)
+                {
+                    destroy_event_set(event_set);
+                    gpu_poly_destroy(gpu_poly);
+                    return set_error(cudaGetErrorString(err));
+                }
+
+                cudaEvent_t ev = nullptr;
+                err = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+                if (err != cudaSuccess)
+                {
+                    destroy_event_set(event_set);
+                    gpu_poly_destroy(gpu_poly);
+                    return set_error(cudaGetErrorString(err));
+                }
+                err = cudaEventRecord(ev, partition.s.ptr);
+                if (err != cudaSuccess)
+                {
+                    cudaEventDestroy(ev);
+                    destroy_event_set(event_set);
+                    gpu_poly_destroy(gpu_poly);
+                    return set_error(cudaGetErrorString(err));
+                }
+                event_set->entries.push_back(GpuEventSet::Entry{ev, partition.device});
+            }
+
+            *out_poly = gpu_poly;
+            *out_events = event_set;
+            return 0;
+        }
+        catch (const std::exception &e)
+        {
+            return set_error(e);
+        }
+        catch (...)
+        {
+            return set_error("unknown exception in gpu_poly_clone_async");
+        }
+    }
+
     int gpu_poly_copy(GpuPoly *dst, const GpuPoly *src)
     {
         try

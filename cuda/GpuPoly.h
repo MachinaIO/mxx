@@ -36,6 +36,7 @@ int gpu_poly_create(GpuContext* ctx, int level, GpuPoly** out_poly);
 void gpu_poly_destroy(GpuPoly* poly);
 
 int gpu_poly_clone(const GpuPoly* src, GpuPoly** out_poly);
+int gpu_poly_clone_async(const GpuPoly* src, GpuPoly** out_poly, GpuEventSet** out_events);
 int gpu_poly_copy(GpuPoly* dst, const GpuPoly* src);
 
 int gpu_poly_get_level(const GpuPoly* poly, int* out_level);

@@ -192,10 +192,11 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         // log_mem("a_bar sampled");
         let g = GpuDCRTPolyMatrix::gadget_matrix(params, size);
         // log_mem("gadget matrix computed");
-        let a0 = a_bar.concat_columns(&[&GpuDCRTPolyMatrix::identity(params, size, None)]);
-        // log_mem("a0 computed");
-        let a1 = g - (a_bar * &trapdoor.r + &trapdoor.e);
+        let a1 = g - (&a_bar * &trapdoor.r + &trapdoor.e);
         // log_mem("a1 computed");
+        let identity = GpuDCRTPolyMatrix::identity(params, size, None);
+        let a0 = a_bar.concat_columns_owned(vec![identity]);
+        // log_mem("a0 computed");
         let a = a0.concat_columns_owned(vec![a1]);
         // log_mem("a computed");
         (trapdoor, a)
@@ -668,7 +669,7 @@ mod tests {
             "Preimage matrix should have the correct number of columns"
         );
 
-        let product = public_matrix.concat_columns(&[&extend]) * &preimage;
+        let product = public_matrix.concat_columns_owned(vec![extend]) * &preimage;
         assert_eq!(product, target, "Product of public matrix and preimage should equal target");
     }
 }

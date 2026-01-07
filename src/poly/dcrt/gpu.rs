@@ -19,7 +19,6 @@ use std::{
     ptr::{self, NonNull},
     slice,
     sync::Arc,
-    time::Instant,
 };
 
 #[allow(non_camel_case_types)]
@@ -116,12 +115,6 @@ unsafe extern "C" {
         count: usize,
     ) -> c_int;
     fn gpu_block_sub(
-        out: *const *mut GpuPolyOpaque,
-        lhs: *const *const GpuPolyOpaque,
-        rhs: *const *const GpuPolyOpaque,
-        count: usize,
-    ) -> c_int;
-    fn gpu_block_entrywise_mul(
         out: *const *mut GpuPolyOpaque,
         lhs: *const *const GpuPolyOpaque,
         rhs: *const *const GpuPolyOpaque,
@@ -734,56 +727,56 @@ impl GpuDCRTPoly {
         assert_eq!(self.params.as_ref(), other.params.as_ref(), "GPU params must match");
     }
 
-    pub(crate) fn load_from_compact_bytes(&mut self, bytes: &[u8]) {
-        let ring_dimension = self.params.ring_dimension() as usize;
-        if ring_dimension == 0 {
-            return;
-        }
-        let max_byte_size = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-        let bit_vector_byte_size = ring_dimension.div_ceil(8);
-        let bit_vector = &bytes[4..4 + bit_vector_byte_size];
-        let coeffs_base_offset = 4 + bit_vector_byte_size;
-        let modulus = self.params.modulus();
-        let coeffs: Vec<FinRingElem> = reconstruct_coeffs_chunked(
-            bytes,
-            ring_dimension,
-            max_byte_size,
-            bit_vector,
-            coeffs_base_offset,
-            &modulus,
-            chunk_size_for(ring_dimension),
-        );
+    // pub(crate) fn load_from_compact_bytes(&mut self, bytes: &[u8]) {
+    //     let ring_dimension = self.params.ring_dimension() as usize;
+    //     if ring_dimension == 0 {
+    //         return;
+    //     }
+    //     let max_byte_size = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as
+    // usize;     let bit_vector_byte_size = ring_dimension.div_ceil(8);
+    //     let bit_vector = &bytes[4..4 + bit_vector_byte_size];
+    //     let coeffs_base_offset = 4 + bit_vector_byte_size;
+    //     let modulus = self.params.modulus();
+    //     let coeffs: Vec<FinRingElem> = reconstruct_coeffs_chunked(
+    //         bytes,
+    //         ring_dimension,
+    //         max_byte_size,
+    //         bit_vector,
+    //         coeffs_base_offset,
+    //         &modulus,
+    //         chunk_size_for(ring_dimension),
+    //     );
 
-        let level = self.level;
-        let moduli = self.params.moduli();
-        let modulus_bigints =
-            moduli[..=level].iter().map(|m| BigUint::from(*m)).collect::<Vec<_>>();
-        let residues_by_limb = modulus_bigints
-            .iter()
-            .map(|modulus| {
-                coeffs
-                    .par_iter()
-                    .map(|coeff| (coeff.value() % modulus).to_u64().unwrap_or(0))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let flat = residues_by_limb.into_iter().flatten().collect::<Vec<_>>();
+    //     let level = self.level;
+    //     let moduli = self.params.moduli();
+    //     let modulus_bigints =
+    //         moduli[..=level].iter().map(|m| BigUint::from(*m)).collect::<Vec<_>>();
+    //     let residues_by_limb = modulus_bigints
+    //         .iter()
+    //         .map(|modulus| {
+    //             coeffs
+    //                 .par_iter()
+    //                 .map(|coeff| (coeff.value() % modulus).to_u64().unwrap_or(0))
+    //                 .collect::<Vec<_>>()
+    //         })
+    //         .collect::<Vec<_>>();
+    //     let flat = residues_by_limb.into_iter().flatten().collect::<Vec<_>>();
 
-        let status = unsafe {
-            gpu_poly_load_rns(self.raw, flat.as_ptr(), flat.len(), GPU_POLY_FORMAT_COEFF)
-        };
-        check_status(status, "gpu_poly_load_rns");
-        self.is_ntt = false;
-    }
+    //     let status = unsafe {
+    //         gpu_poly_load_rns(self.raw, flat.as_ptr(), flat.len(), GPU_POLY_FORMAT_COEFF)
+    //     };
+    //     check_status(status, "gpu_poly_load_rns");
+    //     self.is_ntt = false;
+    // }
 
-    pub(crate) fn add_into(out: &mut GpuDCRTPoly, a: &GpuDCRTPoly, b: &GpuDCRTPoly) {
-        a.assert_compatible(b);
-        assert_eq!(out.level, a.level, "GPU polynomials must have the same level");
-        assert_eq!(out.params.as_ref(), a.params.as_ref(), "GPU params must match");
-        let status = unsafe { gpu_poly_add(out.raw, a.raw, b.raw) };
-        check_status(status, "gpu_poly_add");
-        out.is_ntt = a.is_ntt;
-    }
+    // pub(crate) fn add_into(out: &mut GpuDCRTPoly, a: &GpuDCRTPoly, b: &GpuDCRTPoly) {
+    //     a.assert_compatible(b);
+    //     assert_eq!(out.level, a.level, "GPU polynomials must have the same level");
+    //     assert_eq!(out.params.as_ref(), a.params.as_ref(), "GPU params must match");
+    //     let status = unsafe { gpu_poly_add(out.raw, a.raw, b.raw) };
+    //     check_status(status, "gpu_poly_add");
+    //     out.is_ntt = a.is_ntt;
+    // }
 
     pub(crate) fn sub_into(out: &mut GpuDCRTPoly, a: &GpuDCRTPoly, b: &GpuDCRTPoly) {
         a.assert_compatible(b);
@@ -922,47 +915,47 @@ impl GpuDCRTPoly {
         }
     }
 
-    pub(crate) fn block_mul_into_refs(
-        out: &mut [GpuDCRTPoly],
-        a: &[&GpuDCRTPoly],
-        b: &[&GpuDCRTPoly],
-    ) {
-        assert_eq!(out.len(), a.len(), "GPU block op requires equal lengths");
-        assert_eq!(out.len(), b.len(), "GPU block op requires equal lengths");
-        if out.is_empty() {
-            return;
-        }
+    // pub(crate) fn block_mul_into_refs(
+    //     out: &mut [GpuDCRTPoly],
+    //     a: &[&GpuDCRTPoly],
+    //     b: &[&GpuDCRTPoly],
+    // ) {
+    //     assert_eq!(out.len(), a.len(), "GPU block op requires equal lengths");
+    //     assert_eq!(out.len(), b.len(), "GPU block op requires equal lengths");
+    //     if out.is_empty() {
+    //         return;
+    //     }
 
-        debug_assert!(
-            a.iter().zip(b.iter()).all(|(lhs, rhs)| {
-                lhs.level == rhs.level &&
-                    lhs.params.as_ref() == rhs.params.as_ref() &&
-                    lhs.is_ntt == rhs.is_ntt
-            }),
-            "GPU block op requires compatible inputs"
-        );
+    //     debug_assert!(
+    //         a.iter().zip(b.iter()).all(|(lhs, rhs)| {
+    //             lhs.level == rhs.level &&
+    //                 lhs.params.as_ref() == rhs.params.as_ref() &&
+    //                 lhs.is_ntt == rhs.is_ntt
+    //         }),
+    //         "GPU block op requires compatible inputs"
+    //     );
 
-        let out_ptrs = out.iter_mut().map(|poly| poly.raw).collect::<Vec<_>>();
-        let lhs_ptrs = a.iter().map(|poly| poly.raw as *const GpuPolyOpaque).collect::<Vec<_>>();
-        let rhs_ptrs = b.iter().map(|poly| poly.raw as *const GpuPolyOpaque).collect::<Vec<_>>();
+    //     let out_ptrs = out.iter_mut().map(|poly| poly.raw).collect::<Vec<_>>();
+    //     let lhs_ptrs = a.iter().map(|poly| poly.raw as *const GpuPolyOpaque).collect::<Vec<_>>();
+    //     let rhs_ptrs = b.iter().map(|poly| poly.raw as *const GpuPolyOpaque).collect::<Vec<_>>();
 
-        let status = unsafe {
-            gpu_block_entrywise_mul(
-                out_ptrs.as_ptr(),
-                lhs_ptrs.as_ptr(),
-                rhs_ptrs.as_ptr(),
-                out.len(),
-            )
-        };
-        check_status(status, "gpu_block_entrywise_mul");
+    //     let status = unsafe {
+    //         gpu_block_entrywise_mul(
+    //             out_ptrs.as_ptr(),
+    //             lhs_ptrs.as_ptr(),
+    //             rhs_ptrs.as_ptr(),
+    //             out.len(),
+    //         )
+    //     };
+    //     check_status(status, "gpu_block_entrywise_mul");
 
-        let is_ntt = a[0].is_ntt;
-        let level = a[0].level;
-        for poly in out.iter_mut() {
-            poly.is_ntt = is_ntt;
-            poly.level = level;
-        }
-    }
+    //     let is_ntt = a[0].is_ntt;
+    //     let level = a[0].level;
+    //     for poly in out.iter_mut() {
+    //         poly.is_ntt = is_ntt;
+    //         poly.level = level;
+    //     }
+    // }
 
     pub(crate) fn block_add_assign(out: &mut [GpuDCRTPoly], rhs: &[GpuDCRTPoly]) {
         assert_eq!(out.len(), rhs.len(), "GPU block op requires equal lengths");
@@ -989,11 +982,11 @@ impl GpuDCRTPoly {
         check_status(status, "gpu_block_add");
     }
 
-    pub(crate) fn add_in_place(&mut self, rhs: &GpuDCRTPoly) {
-        self.assert_compatible(rhs);
-        let status = unsafe { gpu_poly_add(self.raw, self.raw, rhs.raw) };
-        check_status(status, "gpu_poly_add");
-    }
+    // pub(crate) fn add_in_place(&mut self, rhs: &GpuDCRTPoly) {
+    //     self.assert_compatible(rhs);
+    //     let status = unsafe { gpu_poly_add(self.raw, self.raw, rhs.raw) };
+    //     check_status(status, "gpu_poly_add");
+    // }
 
     // pub(crate) fn sub_in_place(&mut self, rhs: &GpuDCRTPoly) {
     //     self.assert_compatible(rhs);
@@ -1186,7 +1179,7 @@ impl Poly for GpuDCRTPoly {
         let poly = self.ensure_coeff_domain();
         let n = poly.params.ring_dimension as usize;
         let level = poly.level;
-        let flat_time = Instant::now();
+        // let flat_time = Instant::now();
         let flat = poly.store_rns_flat();
         let modulus = poly.params.modulus();
         let reconstruct_coeffs = poly.params.reconstruct_coeffs_for_level(level);

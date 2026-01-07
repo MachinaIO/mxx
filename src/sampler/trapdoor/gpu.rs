@@ -13,10 +13,7 @@ use crate::{
     parallel_iter,
     poly::{
         Poly, PolyParams,
-        dcrt::{
-            gpu::{GpuDCRTPoly, GpuDCRTPolyParams},
-            params::DCRTPolyParams,
-        },
+        dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams},
     },
     sampler::{
         DistType, PolyTrapdoorSampler, PolyUniformSampler, gpu_uniform::GpuDCRTPolyUniformSampler,

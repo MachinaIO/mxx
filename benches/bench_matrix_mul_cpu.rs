@@ -7,7 +7,7 @@ use mxx::{
 
 fn bench_cpu_matrix_mul() {
     let _ = tracing_subscriber::fmt::try_init();
-    let params = DCRTPolyParams::new(2048, 15, 24, 19);
+    let params = DCRTPolyParams::new(8192, 7, 51, 30);
     let uniform_sampler = DCRTPolyUniformSampler::new();
     let left = uniform_sampler.sample_uniform(&params, 200, 200, DistType::FinRingDist);
     let right = uniform_sampler.sample_uniform(&params, 200, 200, DistType::FinRingDist);

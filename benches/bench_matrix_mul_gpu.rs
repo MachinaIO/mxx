@@ -14,7 +14,7 @@ fn bench_gpu_matrix_mul() {
 
     gpu_device_sync();
     let _ = tracing_subscriber::fmt::try_init();
-    let cpu_params = DCRTPolyParams::new(2048, 15, 24, 19);
+    let cpu_params = DCRTPolyParams::new(8192, 7, 51, 30);
     let (moduli, _, _) = cpu_params.to_crt();
     let params =
         GpuDCRTPolyParams::new(cpu_params.ring_dimension(), moduli, cpu_params.base_bits());

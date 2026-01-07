@@ -14,6 +14,10 @@ namespace
         Mul,
     };
 
+    constexpr int kMatmulTileM = 16;
+    constexpr int kMatmulTileN = 16;
+    constexpr int kMatmulTileK = 8;
+
     int set_error(const char *msg)
     {
         return gpu_set_last_error(msg);
@@ -146,34 +150,79 @@ namespace
         size_t n,
         T modulus)
     {
-        size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        size_t total = rows * cols * n;
-        if (idx >= total)
+        __shared__ T lhs_tile[kMatmulTileM][kMatmulTileK];
+        __shared__ T rhs_tile[kMatmulTileK][kMatmulTileN];
+
+        const size_t row_base = static_cast<size_t>(blockIdx.y) * kMatmulTileM;
+        const size_t col_base = static_cast<size_t>(blockIdx.x) * kMatmulTileN;
+        const size_t row = row_base + threadIdx.y;
+        const size_t col = col_base + threadIdx.x;
+        const size_t coeff_idx = static_cast<size_t>(blockIdx.z);
+        if (coeff_idx >= n)
         {
             return;
         }
-        size_t out_idx = idx / n;
-        size_t coeff_idx = idx - out_idx * n;
-        size_t row = out_idx / cols;
-        size_t col = out_idx - row * cols;
+
+        const int tid = static_cast<int>(threadIdx.y) * blockDim.x + threadIdx.x;
+        const int threads = blockDim.x * blockDim.y;
+
         T acc = 0;
-        for (size_t k = 0; k < inner; ++k)
+        for (size_t k0 = 0; k0 < inner; k0 += kMatmulTileK)
         {
-            const T *lhs_poly = lhs[row * inner + k];
-            const T *rhs_poly = rhs[k * cols + col];
-            T prod;
-            if constexpr (std::is_same_v<T, uint64_t>)
+            for (int i = tid; i < kMatmulTileM * kMatmulTileK; i += threads)
             {
-                prod = mul_mod_u64(lhs_poly[coeff_idx], rhs_poly[coeff_idx], modulus);
-                acc = add_mod_u64(acc, prod, modulus);
+                const int r = i / kMatmulTileK;
+                const int k = i - r * kMatmulTileK;
+                const size_t lhs_row = row_base + static_cast<size_t>(r);
+                const size_t lhs_k = k0 + static_cast<size_t>(k);
+                T val = 0;
+                if (lhs_row < rows && lhs_k < inner)
+                {
+                    const T *lhs_poly = lhs[lhs_row * inner + lhs_k];
+                    val = lhs_poly[coeff_idx];
+                }
+                lhs_tile[r][k] = val;
             }
-            else
+            for (int i = tid; i < kMatmulTileK * kMatmulTileN; i += threads)
             {
-                prod = mul_mod_u32(lhs_poly[coeff_idx], rhs_poly[coeff_idx], modulus);
-                acc = add_mod_u32(acc, prod, modulus);
+                const int k = i / kMatmulTileN;
+                const int c = i - k * kMatmulTileN;
+                const size_t rhs_k = k0 + static_cast<size_t>(k);
+                const size_t rhs_col = col_base + static_cast<size_t>(c);
+                T val = 0;
+                if (rhs_k < inner && rhs_col < cols)
+                {
+                    const T *rhs_poly = rhs[rhs_k * cols + rhs_col];
+                    val = rhs_poly[coeff_idx];
+                }
+                rhs_tile[k][c] = val;
             }
+            __syncthreads();
+
+            if (row < rows && col < cols)
+            {
+                for (int kk = 0; kk < kMatmulTileK; ++kk)
+                {
+                    T prod;
+                    if constexpr (std::is_same_v<T, uint64_t>)
+                    {
+                        prod = mul_mod_u64(lhs_tile[threadIdx.y][kk], rhs_tile[kk][threadIdx.x], modulus);
+                        acc = add_mod_u64(acc, prod, modulus);
+                    }
+                    else
+                    {
+                        prod = mul_mod_u32(lhs_tile[threadIdx.y][kk], rhs_tile[kk][threadIdx.x], modulus);
+                        acc = add_mod_u32(acc, prod, modulus);
+                    }
+                }
+            }
+            __syncthreads();
         }
-        out[out_idx][coeff_idx] = acc;
+
+        if (row < rows && col < cols)
+        {
+            out[row * cols + col][coeff_idx] = acc;
+        }
     }
 
     template <typename T>
@@ -357,9 +406,11 @@ namespace
             return set_error(err);
         }
 
-        const int threads = 256;
-        const size_t total = out_count * n;
-        const int blocks = static_cast<int>((total + threads - 1) / threads);
+        const dim3 threads(kMatmulTileN, kMatmulTileM);
+        const dim3 blocks(
+            static_cast<unsigned int>((cols + kMatmulTileN - 1) / kMatmulTileN),
+            static_cast<unsigned int>((rows + kMatmulTileM - 1) / kMatmulTileM),
+            static_cast<unsigned int>(n));
 
         block_matmul_kernel<<<blocks, threads, 0, stream>>>(d_lhs, d_rhs, d_out, rows, inner, cols, n, modulus);
 

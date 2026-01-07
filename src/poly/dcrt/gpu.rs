@@ -209,6 +209,15 @@ pub(crate) fn gpu_memory_infos() -> Result<Vec<GpuMemoryInfo>, String> {
     Ok(infos)
 }
 
+fn available_gpu_ids() -> Vec<i32> {
+    let mut count: c_int = 0;
+    let status = unsafe { gpu_device_count(&mut count) };
+    if status != 0 || count <= 0 {
+        return Vec::new();
+    }
+    (0..count).map(|idx| idx as i32).collect()
+}
+
 fn pinned_alloc<T>(len: usize) -> NonNull<T> {
     if len == 0 {
         return NonNull::dangling();
@@ -409,7 +418,8 @@ impl PolyParams for GpuDCRTPolyParams {
 
 impl GpuDCRTPolyParams {
     pub fn new(ring_dimension: u32, moduli: Vec<u64>, base_bits: u32) -> Self {
-        Self::new_with_gpu(ring_dimension, moduli, base_bits, Vec::new(), None, 1)
+        let gpu_ids = available_gpu_ids();
+        Self::new_with_gpu(ring_dimension, moduli, base_bits, gpu_ids, None, 1)
     }
 
     pub fn new_with_gpu(

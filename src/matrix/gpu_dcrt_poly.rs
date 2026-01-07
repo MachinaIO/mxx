@@ -128,54 +128,26 @@ impl GpuDCRTPolyMatrix {
         let level = cpu_params.crt_depth().saturating_sub(1);
         let n = cpu_params.ring_dimension() as usize;
         let expected_len = (level + 1).saturating_mul(n);
+        let reconstruct_coeffs = Arc::new(self.params.reconstruct_coeffs_for_level(level));
+        let modulus_level = Arc::new(self.params.modulus_for_level(level));
 
-        let mut polys = parallel_iter!(0..total)
-            .map(|_| GpuDCRTPoly::new_empty(Arc::new(self.params.clone()), level, true))
-            .collect::<Vec<_>>();
-
-        let mut eval_bytes = vec![0u8; total.saturating_mul(bytes_per_poly)];
-        eval_bytes.par_chunks_mut(bytes_per_poly).zip(self.entries.par_iter()).for_each(
-            |(chunk, entry)| {
+        let polys_cpu = parallel_iter!(0..total)
+            .map(|idx| {
+                let entry = &self.entries[idx];
                 let entry_bytes = entry.as_slice();
                 debug_assert_eq!(
                     entry_bytes.len(),
                     bytes_per_poly,
                     "entry bytes must match rns byte size"
                 );
-                chunk.copy_from_slice(entry_bytes);
-            },
-        );
-        GpuDCRTPoly::load_rns_bytes_batch(
-            &mut polys,
-            &eval_bytes,
-            bytes_per_poly,
-            GPU_POLY_FORMAT_EVAL,
-        );
-
-        let mut coeff_bytes = vec![0u8; total.saturating_mul(bytes_per_poly)];
-        GpuDCRTPoly::store_rns_bytes_batch(
-            &mut polys,
-            &mut coeff_bytes,
-            bytes_per_poly,
-            GPU_POLY_FORMAT_COEFF,
-        );
-
-        let reconstruct_coeffs = Arc::new(self.params.reconstruct_coeffs_for_level(level));
-        let modulus_level = Arc::new(self.params.modulus_for_level(level));
-        let modulus = cpu_params.modulus();
-
-        let polys_cpu = parallel_iter!(0..total)
-            .map(|idx| {
-                let offset = idx * bytes_per_poly;
-                let chunk = &coeff_bytes[offset..offset + bytes_per_poly];
                 let mut flat = Vec::with_capacity(expected_len);
-                for limb_bytes in chunk.chunks_exact(std::mem::size_of::<u64>()) {
+                for limb_bytes in entry_bytes.chunks_exact(std::mem::size_of::<u64>()) {
                     let bytes: [u8; 8] = limb_bytes.try_into().expect("u64 chunk size mismatch");
                     flat.push(u64::from_le_bytes(bytes));
                 }
                 debug_assert_eq!(flat.len(), expected_len, "RNS flat length mismatch");
 
-                let mut coeffs = Vec::with_capacity(n);
+                let mut eval_slots = Vec::with_capacity(n);
                 for i in 0..n {
                     let mut acc = BigUint::zero();
                     for limb in 0..=level {
@@ -183,9 +155,9 @@ impl GpuDCRTPolyMatrix {
                         acc += &reconstruct_coeffs[limb] * BigUint::from(residue);
                     }
                     acc %= &*modulus_level;
-                    coeffs.push(FinRingElem::new(acc, modulus.clone()));
+                    eval_slots.push(acc);
                 }
-                DCRTPoly::from_coeffs(&cpu_params, &coeffs)
+                DCRTPoly::from_biguints_eval(&cpu_params, &eval_slots)
             })
             .collect::<Vec<_>>();
 
@@ -213,79 +185,93 @@ impl GpuDCRTPolyMatrix {
         debug_assert_eq!(bytes_per_poly, expected_bytes, "rns_bytes_len must match moduli*n*u64");
 
         let mut out = Self::new_empty(params, nrow, ncol);
+        out.entries.par_iter_mut().enumerate().for_each(|(idx, entry)| {
+            let row = idx / ncol;
+            let col = idx % ncol;
+            let poly = matrix.entry(row, col);
+            let eval_slots = poly.eval_slots();
 
-        let block_nrow = block_size().min(nrow.max(1));
-        let block_ncol = block_size().min(ncol.max(1));
-        let row_offsets = block_offsets(0..nrow, block_nrow);
-        let col_offsets = block_offsets(0..ncol, block_ncol);
-        let mut block = GpuBlock::new(params, block_nrow * block_ncol);
+            let mut flat = vec![0u64; expected_len];
+            for (limb, modulus) in moduli_big.iter().enumerate() {
+                let base = limb * n;
+                for coeff_idx in 0..n {
+                    let value = eval_slots.get(coeff_idx).cloned().unwrap_or_default();
+                    let residue = (value % modulus).to_u64().unwrap_or(0);
+                    flat[base + coeff_idx] = residue;
+                }
+            }
 
-        for row_pair in row_offsets.windows(2) {
-            let rows = row_pair[0]..row_pair[1];
-            let rows_len = rows.end - rows.start;
-            for col_pair in col_offsets.windows(2) {
-                let cols = col_pair[0]..col_pair[1];
-                let cols_len = cols.end - cols.start;
-                let total = rows_len * cols_len;
-                block.prepare(rows_len, cols_len);
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    flat.as_ptr() as *const u8,
+                    flat.len() * std::mem::size_of::<u64>(),
+                )
+            };
+            entry.set_slice(bytes);
+        });
 
-                let mut flat = vec![0u64; total.saturating_mul(expected_len)];
-                flat.par_chunks_mut(expected_len).enumerate().for_each(|(idx, chunk)| {
-                    let i = idx / cols_len;
-                    let j = idx % cols_len;
-                    let poly = matrix.entry(rows.start + i, cols.start + j);
-                    let coeffs = poly.coeffs();
-                    for (limb, modulus) in moduli_big.iter().enumerate() {
-                        let base = limb * n;
-                        for (coeff_idx, coeff) in coeffs.iter().enumerate() {
-                            let residue = (coeff.value() % modulus).to_u64().unwrap_or(0);
-                            chunk[base + coeff_idx] = residue;
-                        }
-                    }
-                });
+        out
+    }
 
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        flat.as_ptr() as *const u8,
-                        flat.len() * std::mem::size_of::<u64>(),
-                    )
-                };
-                GpuDCRTPoly::load_rns_bytes_batch(
-                    &mut block.polys[..total],
-                    bytes,
-                    bytes_per_poly,
-                    GPU_POLY_FORMAT_COEFF,
+    pub fn concat_rows_owned(self, mut others: Vec<Self>) -> Self {
+        #[cfg(debug_assertions)]
+        for (idx, other) in others.iter().enumerate() {
+            if self.ncol != other.ncol {
+                panic!(
+                    "Concat error: while the shape of the first matrix is ({}, {}), that of the {}-th matrix is ({},{})",
+                    self.nrow, self.ncol, idx, other.nrow, other.ncol
                 );
-                block.polys[..total].par_iter_mut().for_each(|poly| poly.ntt_in_place());
-
-                let mut eval_bytes = vec![0u8; total.saturating_mul(bytes_per_poly)];
-                GpuDCRTPoly::store_rns_bytes_batch(
-                    &mut block.polys[..total],
-                    &mut eval_bytes,
-                    bytes_per_poly,
-                    GPU_POLY_FORMAT_EVAL,
+            }
+            if self.params != other.params {
+                panic!(
+                    "Concat error: mismatched params at index {} (lhs={:?}, rhs={:?})",
+                    idx, self.params, other.params
                 );
+            }
+        }
+        let nrow = self.nrow + others.iter().map(|x| x.nrow).sum::<usize>();
+        let ncol = self.ncol;
+        let params = self.params;
+        let mut entries = self.entries;
+        entries.reserve(others.iter().map(|x| x.entries.len()).sum::<usize>());
+        for other in others.iter_mut() {
+            entries.append(&mut other.entries);
+        }
+        Self { params, nrow, ncol, entries }
+    }
 
-                out.entries.par_chunks_mut(out.ncol).enumerate().for_each(
-                    |(row_idx, row_entries)| {
-                        if row_idx < rows.start || row_idx >= rows.end {
-                            return;
-                        }
-                        let local_row = row_idx - rows.start;
-                        let base = local_row * cols_len;
-                        row_entries[cols.start..cols.start + cols_len]
-                            .par_iter_mut()
-                            .enumerate()
-                            .for_each(|(j, entry)| {
-                                let offset = (base + j) * bytes_per_poly;
-                                entry.set_slice(&eval_bytes[offset..offset + bytes_per_poly]);
-                            });
-                    },
+    pub fn concat_columns_owned(self, mut others: Vec<Self>) -> Self {
+        #[cfg(debug_assertions)]
+        for (idx, other) in others.iter().enumerate() {
+            if self.nrow != other.nrow {
+                panic!(
+                    "Concat error: while the shape of the first matrix is ({}, {}), that of the {}-th matrix is ({},{})",
+                    self.nrow, self.ncol, idx, other.nrow, other.ncol
+                );
+            }
+            if self.params != other.params {
+                panic!(
+                    "Concat error: mismatched params at index {} (lhs={:?}, rhs={:?})",
+                    idx, self.params, other.params
                 );
             }
         }
 
-        out
+        let nrow = self.nrow;
+        let ncol = self.ncol + others.iter().map(|x| x.ncol).sum::<usize>();
+        let params = self.params;
+        let mut entries = Vec::with_capacity(nrow.saturating_mul(ncol));
+        let mut sources = Vec::with_capacity(1 + others.len());
+        sources.push((self.ncol, self.entries.into_iter()));
+        for other in others.into_iter() {
+            sources.push((other.ncol, other.entries.into_iter()));
+        }
+        for _ in 0..nrow {
+            for (row_ncol, iter) in sources.iter_mut() {
+                entries.extend(iter.by_ref().take(*row_ncol));
+            }
+        }
+        Self { params, nrow, ncol, entries }
     }
 
     fn write_block(

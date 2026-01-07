@@ -127,6 +127,12 @@ unsafe extern "C" {
         rhs: *const *const GpuPolyOpaque,
         count: usize,
     ) -> c_int;
+    fn gpu_poly_decompose_base(
+        src: *const GpuPolyOpaque,
+        base_bits: u32,
+        out_polys: *const *mut GpuPolyOpaque,
+        out_count: usize,
+    ) -> c_int;
 
     fn gpu_poly_ntt(poly: *mut GpuPolyOpaque, batch: c_int) -> c_int;
     fn gpu_poly_intt(poly: *mut GpuPolyOpaque, batch: c_int) -> c_int;
@@ -1189,31 +1195,21 @@ impl Poly for GpuDCRTPoly {
     }
 
     fn decompose_base(&self, params: &Self::Params) -> Vec<Self> {
-        let n = params.ring_dimension as usize;
-        let base_bits = params.base_bits() as usize;
-        let digits_per_tower = params.crt_bits().div_ceil(base_bits);
-        let num_digits = digits_per_tower * params.crt_depth();
-        let base_mask = (1u64 << base_bits) - 1u64;
+        let num_digits = params.modulus_digits();
+        if num_digits == 0 {
+            return Vec::new();
+        }
 
-        let poly = self.ensure_coeff_domain();
-        let flat = poly.store_rns_flat();
+        let mut out = (0..num_digits)
+            .map(|_| GpuDCRTPoly::new_empty(self.params.clone(), self.level, false))
+            .collect::<Vec<_>>();
+        let out_ptrs = out.iter_mut().map(|poly| poly.raw).collect::<Vec<_>>();
 
-        (0..num_digits)
-            .into_par_iter()
-            .map(|digit_idx| {
-                let tower = digit_idx / digits_per_tower;
-                let shift = (digit_idx % digits_per_tower) * base_bits;
-
-                let mut values = vec![vec![0u64; params.crt_depth()]; n];
-                for i in 0..n {
-                    let residue = flat[tower * n + i];
-                    let digit = (residue >> shift) & base_mask;
-                    values[i][tower] = digit;
-                }
-
-                GpuDCRTPoly::from_u64_vecs(params, &values)
-            })
-            .collect()
+        let status = unsafe {
+            gpu_poly_decompose_base(self.raw, params.base_bits(), out_ptrs.as_ptr(), out_ptrs.len())
+        };
+        check_status(status, "gpu_poly_decompose_base");
+        out
     }
 
     fn extract_bits_with_threshold(&self, params: &Self::Params) -> Vec<bool> {

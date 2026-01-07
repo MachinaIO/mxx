@@ -1,7 +1,9 @@
 #include "GpuPolyInternal.h"
 
+#include <algorithm>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <new>
 #include <string>
@@ -105,6 +107,31 @@ namespace
             cudaEventDestroy(entry.event);
         }
         delete events;
+    }
+
+    uint32_t bit_width_u64(uint64_t v)
+    {
+        if (v == 0)
+        {
+            return 0;
+        }
+        return static_cast<uint32_t>(64 - __builtin_clzll(v));
+    }
+
+    __global__ void decompose_base_kernel(
+        const uint64_t *src,
+        uint64_t *dst,
+        size_t n,
+        uint32_t shift,
+        uint64_t mask)
+    {
+        size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx < n)
+        {
+            uint64_t residue = src[idx];
+            uint64_t digit = shift >= 64 ? 0 : ((residue >> shift) & mask);
+            dst[idx] = digit;
+        }
     }
 }
 
@@ -844,6 +871,205 @@ extern "C"
         catch (...)
         {
             return set_error("unknown exception in gpu_poly_mul");
+        }
+    }
+
+    int gpu_poly_decompose_base(
+        const GpuPoly *src,
+        uint32_t base_bits,
+        GpuPoly *const *out_polys,
+        size_t out_count)
+    {
+        try
+        {
+            if (!src || !out_polys)
+            {
+                return set_error("invalid gpu_poly_decompose_base arguments");
+            }
+            if (out_count == 0)
+            {
+                return 0;
+            }
+            if (base_bits == 0)
+            {
+                return set_error("base_bits must be non-zero in gpu_poly_decompose_base");
+            }
+
+            const int level = src->level;
+            const int N = src->ctx->N;
+            const size_t crt_depth = static_cast<size_t>(level + 1);
+            uint32_t crt_bits = 0;
+            for (const auto &modulus : src->ctx->moduli)
+            {
+                crt_bits = std::max(crt_bits, bit_width_u64(modulus));
+            }
+            if (crt_bits == 0)
+            {
+                return set_error("invalid crt_bits in gpu_poly_decompose_base");
+            }
+            const uint32_t digits_per_tower =
+                static_cast<uint32_t>((crt_bits + base_bits - 1) / base_bits);
+            if (digits_per_tower == 0)
+            {
+                return set_error("invalid digits_per_tower in gpu_poly_decompose_base");
+            }
+            const size_t expected_out = static_cast<size_t>(digits_per_tower) * crt_depth;
+            if (out_count != expected_out)
+            {
+                return set_error("output size mismatch in gpu_poly_decompose_base");
+            }
+
+            const int batch = default_batch(src->ctx);
+            const GpuPoly *input = src;
+            std::unique_ptr<CKKS::RNSPoly> tmp_poly;
+            GpuPoly tmp_wrapper{nullptr, nullptr, 0, PolyFormat::Coeff};
+            if (src->format == PolyFormat::Eval)
+            {
+                tmp_poly = std::make_unique<CKKS::RNSPoly>(src->poly->clone());
+                tmp_wrapper = GpuPoly{tmp_poly.get(), src->ctx, src->level, src->format};
+                ensure_coeff(&tmp_wrapper, batch);
+                input = &tmp_wrapper;
+            }
+            if (input->format != PolyFormat::Coeff)
+            {
+                return set_error("input poly must be in coeff format for decomposition");
+            }
+            input->poly->sync();
+
+            auto *ctx = input->ctx->ctx;
+            if (ctx->limbGPUid.size() < crt_depth)
+            {
+                return set_error("unexpected limb mapping size in gpu_poly_decompose_base");
+            }
+
+            for (size_t idx = 0; idx < out_count; ++idx)
+            {
+                GpuPoly *out = out_polys[idx];
+                if (!out || !out->ctx)
+                {
+                    return set_error("null output poly in gpu_poly_decompose_base");
+                }
+                if (out->ctx != input->ctx || out->level != level)
+                {
+                    return set_error("mismatched output poly in gpu_poly_decompose_base");
+                }
+
+                for (int limb = 0; limb <= level; ++limb)
+                {
+                    const dim3 limb_id = ctx->limbGPUid[static_cast<size_t>(limb)];
+                    if (limb_id.x >= out->poly->GPU.size())
+                    {
+                        return set_error("unexpected limb GPU partition in gpu_poly_decompose_base");
+                    }
+                    auto &partition = out->poly->GPU[limb_id.x];
+                    if (limb_id.y >= partition.limb.size())
+                    {
+                        return set_error("unexpected limb index in gpu_poly_decompose_base");
+                    }
+                    auto &limb_impl = partition.limb[limb_id.y];
+                    if (limb_impl.index() != FIDESlib::U64)
+                    {
+                        return set_error("unsupported limb type in gpu_poly_decompose_base");
+                    }
+                    auto &limb_u64 = std::get<FIDESlib::U64>(limb_impl);
+
+                    cudaError_t err = cudaSetDevice(partition.device);
+                    if (err != cudaSuccess)
+                    {
+                        return set_error(cudaGetErrorString(err));
+                    }
+                    err = cudaMemsetAsync(
+                        limb_u64.v.data,
+                        0,
+                        static_cast<size_t>(N) * sizeof(uint64_t),
+                        limb_u64.stream.ptr);
+                    if (err != cudaSuccess)
+                    {
+                        return set_error(cudaGetErrorString(err));
+                    }
+                }
+
+                out->format = PolyFormat::Coeff;
+                out->level = level;
+            }
+
+            const uint64_t base_mask =
+                base_bits >= 64 ? std::numeric_limits<uint64_t>::max() : ((1ULL << base_bits) - 1);
+            const int threads = 256;
+            const int blocks = static_cast<int>((static_cast<size_t>(N) + threads - 1) / threads);
+
+            for (int limb = 0; limb <= level; ++limb)
+            {
+                const dim3 limb_id = ctx->limbGPUid[static_cast<size_t>(limb)];
+                if (limb_id.x >= input->poly->GPU.size())
+                {
+                    return set_error("unexpected limb GPU partition in gpu_poly_decompose_base");
+                }
+                auto &in_partition = input->poly->GPU[limb_id.x];
+                if (limb_id.y >= in_partition.limb.size())
+                {
+                    return set_error("unexpected limb index in gpu_poly_decompose_base");
+                }
+                auto &in_limb_impl = in_partition.limb[limb_id.y];
+                if (in_limb_impl.index() != FIDESlib::U64)
+                {
+                    return set_error("unsupported limb type in gpu_poly_decompose_base");
+                }
+                auto &in_limb_u64 = std::get<FIDESlib::U64>(in_limb_impl);
+
+                for (uint32_t digit_idx = 0; digit_idx < digits_per_tower; ++digit_idx)
+                {
+                    const size_t out_idx =
+                        static_cast<size_t>(limb) * static_cast<size_t>(digits_per_tower) +
+                        static_cast<size_t>(digit_idx);
+                    GpuPoly *out = out_polys[out_idx];
+                    auto &out_partition = out->poly->GPU[limb_id.x];
+                    if (limb_id.y >= out_partition.limb.size())
+                    {
+                        return set_error("unexpected output limb index in gpu_poly_decompose_base");
+                    }
+                    auto &out_limb_impl = out_partition.limb[limb_id.y];
+                    if (out_limb_impl.index() != FIDESlib::U64)
+                    {
+                        return set_error("unsupported output limb type in gpu_poly_decompose_base");
+                    }
+                    auto &out_limb_u64 = std::get<FIDESlib::U64>(out_limb_impl);
+
+                    if (out_partition.device != in_partition.device)
+                    {
+                        return set_error("input/output limb device mismatch in gpu_poly_decompose_base");
+                    }
+
+                    cudaError_t err = cudaSetDevice(out_partition.device);
+                    if (err != cudaSuccess)
+                    {
+                        return set_error(cudaGetErrorString(err));
+                    }
+
+                    const uint32_t shift = digit_idx * base_bits;
+                    decompose_base_kernel<<<blocks, threads, 0, out_limb_u64.stream.ptr>>>(
+                        in_limb_u64.v.data,
+                        out_limb_u64.v.data,
+                        static_cast<size_t>(N),
+                        shift,
+                        base_mask);
+                    err = cudaGetLastError();
+                    if (err != cudaSuccess)
+                    {
+                        return set_error(cudaGetErrorString(err));
+                    }
+                }
+            }
+
+            return 0;
+        }
+        catch (const std::exception &e)
+        {
+            return set_error(e);
+        }
+        catch (...)
+        {
+            return set_error("unknown exception in gpu_poly_decompose_base");
         }
     }
 

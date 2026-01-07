@@ -77,6 +77,11 @@ int gpu_block_entrywise_mul(
     const GpuPoly* const* lhs,
     const GpuPoly* const* rhs,
     size_t count);
+int gpu_poly_decompose_base(
+    const GpuPoly* src,
+    uint32_t base_bits,
+    GpuPoly* const* out_polys,
+    size_t out_count);
 
 int gpu_poly_ntt(GpuPoly* poly, int batch);
 int gpu_poly_intt(GpuPoly* poly, int batch);

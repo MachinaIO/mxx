@@ -8,14 +8,14 @@ use crate::{
     parallel_iter,
     poly::{PolyParams, dcrt::params::DCRTPolyParams},
     sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
-    utils::{block_size, debug_mem},
+    utils::{block_size, debug_mem, log_mem},
 };
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuDCRTPolyTrapdoorSampler, GpuDCRTTrapdoor};
 use openfhe::ffi::{ExtractMatrixCols, FormatMatrixCoefficient, SampleP1ForPertMat};
 use rayon::iter::ParallelIterator;
 pub use sampler::DCRTPolyTrapdoorSampler;
-use std::{cmp::min, ops::Range, sync::Arc};
+use std::{cmp::min, ops::Range, sync::Arc, time::Instant};
 use utils::{gen_dgg_int_vec, gen_int_karney, split_int64_mat_to_elems};
 
 #[cfg(feature = "gpu")]
@@ -37,16 +37,23 @@ pub struct DCRTTrapdoor {
 
 impl DCRTTrapdoor {
     pub fn new(params: &DCRTPolyParams, size: usize, sigma: f64) -> Self {
+        log_mem("start new DCRTTrapdoor");
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let log_base_q = params.modulus_digits();
         let dist = DistType::GaussDist { sigma };
         let r = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
+        log_mem("sample r");
         let e = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
+        log_mem("sample e");
         let a_mat = r.clone() * r.transpose(); // d x d
+        log_mem("compute a_mat");
         let e_transpose = e.transpose();
         let b_mat = r.clone() * &e_transpose; // d x d
+        log_mem("compute b_mat");
         let d_mat = e.clone() * &e_transpose; // d x d
+        log_mem("compute d_mat");
         let re = r.concat_rows(&[&e]);
+        log_mem("compute re");
         Self { r, e, a_mat, b_mat, d_mat, re }
     }
 
@@ -59,6 +66,7 @@ impl DCRTTrapdoor {
         peikert: bool,
         total_ncol: usize,
     ) -> DCRTPolyMatrix {
+        let overall_start = Instant::now();
         let r = &self.r;
         let params = &r.params;
         let n = params.ring_dimension() as usize;
@@ -99,8 +107,10 @@ impl DCRTTrapdoor {
             vecs[0].concat_rows(&vecs[1..].iter().collect::<Vec<_>>())
         };
         debug_mem("p2z_vec generated");
+        let p2_start = Instant::now();
         // create a matrix of d*k x padded_ncol ring elements in coefficient representation
         let p2 = split_int64_mat_to_elems(&p2z_vec, params);
+        log_mem(format!("sample_pert_square_mat p2 in {:?}", p2_start.elapsed()));
         // parallel_iter!(0..padded_ncol)
         //     .map(|i| split_int64_vec_to_elems(&p2z_vec.slice(0, n * dk, i, i + 1), params))
         //     .collect::<Vec<_>>();
@@ -113,8 +123,11 @@ impl DCRTTrapdoor {
         // debug_mem("a_mat, b_mat, d_mat generated");
         // let re = r.concat_rows(&[e]);
         // debug_mem("re generated");
+        let tp2_start = Instant::now();
         let tp2 = self.re.clone() * &p2;
+        log_mem(format!("sample_pert_square_mat tp2 in {:?}", tp2_start.elapsed()));
         debug_mem("tp2 generated");
+        let p1_start = Instant::now();
         let p1 = sample_p1_for_pert_mat(
             self.a_mat.clone(),
             self.b_mat.clone(),
@@ -126,12 +139,18 @@ impl DCRTTrapdoor {
             dgg,
             padded_ncol,
         );
+        log_mem(format!("sample_pert_square_mat p1 in {:?}", p1_start.elapsed()));
         debug_mem("p1 generated");
+        let concat_start = Instant::now();
         let mut p = p1.concat_rows(&[&p2]);
+        log_mem(format!("sample_pert_square_mat concat in {:?}", concat_start.elapsed()));
         debug_mem("p1 and p2 concatenated");
         if padding_ncol > 0 {
+            let slice_start = Instant::now();
             p = p.slice_columns(0, total_ncol);
+            log_mem(format!("sample_pert_square_mat slice in {:?}", slice_start.elapsed()));
         }
+        log_mem(format!("sample_pert_square_mat total in {:?}", overall_start.elapsed()));
         p
     }
 }

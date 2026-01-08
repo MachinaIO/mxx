@@ -176,38 +176,38 @@ pub fn gpu_device_sync() {
     check_status(status, "gpu_device_synchronize");
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct GpuMemoryInfo {
-    pub device: c_int,
-    pub free: usize,
-    pub total: usize,
-}
+// #[derive(Clone, Copy, Debug)]
+// pub(crate) struct GpuMemoryInfo {
+//     pub device: c_int,
+//     pub free: usize,
+//     pub total: usize,
+// }
 
-pub(crate) fn gpu_memory_infos() -> Result<Vec<GpuMemoryInfo>, String> {
-    let mut count: c_int = 0;
-    let status = unsafe { gpu_device_count(&mut count) };
-    if status != 0 {
-        return Err(last_error_string());
-    }
-    if count < 0 {
-        return Err("invalid GPU device count".to_string());
-    }
-    if count == 0 {
-        return Ok(Vec::new());
-    }
+// pub(crate) fn gpu_memory_infos() -> Result<Vec<GpuMemoryInfo>, String> {
+//     let mut count: c_int = 0;
+//     let status = unsafe { gpu_device_count(&mut count) };
+//     if status != 0 {
+//         return Err(last_error_string());
+//     }
+//     if count < 0 {
+//         return Err("invalid GPU device count".to_string());
+//     }
+//     if count == 0 {
+//         return Ok(Vec::new());
+//     }
 
-    let mut infos = Vec::with_capacity(count as usize);
-    for device in 0..count {
-        let mut free: usize = 0;
-        let mut total: usize = 0;
-        let status = unsafe { gpu_device_mem_info(device, &mut free, &mut total) };
-        if status != 0 {
-            return Err(last_error_string());
-        }
-        infos.push(GpuMemoryInfo { device, free, total });
-    }
-    Ok(infos)
-}
+//     let mut infos = Vec::with_capacity(count as usize);
+//     for device in 0..count {
+//         let mut free: usize = 0;
+//         let mut total: usize = 0;
+//         let status = unsafe { gpu_device_mem_info(device, &mut free, &mut total) };
+//         if status != 0 {
+//             return Err(last_error_string());
+//         }
+//         infos.push(GpuMemoryInfo { device, free, total });
+//     }
+//     Ok(infos)
+// }
 
 fn available_gpu_ids() -> Vec<i32> {
     let mut count: c_int = 0;

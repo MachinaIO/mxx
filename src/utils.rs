@@ -14,7 +14,7 @@ use crate::{
 };
 use bigdecimal::BigDecimal;
 use keccak_asm::Keccak256;
-use memory_stats::memory_stats;
+// use memory_stats::memory_stats;
 use num_bigint::{BigInt, BigUint};
 use num_traits::Zero;
 use rand::Rng;
@@ -85,30 +85,62 @@ macro_rules! impl_binop_with_refs {
 }
 
 pub fn debug_mem<T: Into<String>>(tag: T) {
-    if let Some(usage) = memory_stats() {
-        debug!(
-            "{} || Current physical/virtual memory usage: {} | {}",
-            tag.into(),
-            usage.physical_mem,
-            usage.virtual_mem
-        );
-    } else {
-        debug!("Couldn't get the current memory usage :(");
-    }
+    // if let Some(usage) = memory_stats() {
+    //     debug!(
+    //         "{} || Current physical/virtual memory usage: {} | {}",
+    //         tag.into(),
+    //         usage.physical_mem,
+    //         usage.virtual_mem
+    //     );
+    // } else {
+    //     debug!("Couldn't get the current memory usage :(");
+    // }
+    debug!("{}", tag.into());
 }
 
 pub fn log_mem<T: Into<String>>(tag: T) {
-    if let Some(usage) = memory_stats() {
-        info!(
-            "{} || Current physical/virtual memory usage: {} | {}",
-            tag.into(),
-            usage.physical_mem,
-            usage.virtual_mem,
-        );
-    } else {
-        info!("Couldn't get the current memory usage :(");
-    }
+    // let tag = tag.into();
+    // // let gpu_suffix = gpu_mem_log_suffix();
+    // if let Some(usage) = memory_stats() {
+    //     info!(
+    //         "{} || Current physical/virtual memory usage: {} | {}",
+    //         tag, usage.physical_mem, usage.virtual_mem,
+    //     );
+    // } else {
+    //     info!("Couldn't get the current memory usage :(");
+    // }
+    info!("{}", tag.into());
 }
+
+// #[cfg(feature = "gpu")]
+// fn gpu_mem_log_suffix() -> Option<String> {
+//     match crate::poly::dcrt::gpu::gpu_memory_infos() {
+//         Ok(infos) => {
+//             if infos.is_empty() {
+//                 return Some("GPU memory: no devices".to_string());
+//             }
+//             let entries = infos
+//                 .into_iter()
+//                 .map(|info| {
+//                     let used = info.total.saturating_sub(info.free);
+//                     let percent = if info.total == 0 {
+//                         0u128
+//                     } else {
+//                         (used as u128).saturating_mul(100) / info.total as u128
+//                     };
+//                     format!("gpu{} {}/{} ({}%)", info.device, used, info.total, percent)
+//                 })
+//                 .collect::<Vec<_>>();
+//             Some(format!("GPU memory: {}", entries.join(", ")))
+//         }
+//         Err(err) => Some(format!("GPU memory: unavailable ({err})")),
+//     }
+// }
+
+// #[cfg(not(feature = "gpu"))]
+// fn gpu_mem_log_suffix() -> Option<String> {
+//     None
+// }
 
 // Helper function to create a random polynomial using UniformSampler
 pub fn create_random_poly(params: &DCRTPolyParams) -> DCRTPoly {

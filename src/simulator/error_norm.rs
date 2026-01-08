@@ -234,6 +234,8 @@ impl PltEvaluator<ErrorNorm> for NormPltGGH15Evaluator {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use super::*;
     use crate::{
         circuit::PolyCircuit,
@@ -262,6 +264,7 @@ mod tests {
     const E_INIT_NORM: u32 = 1 << 14;
 
     #[test]
+    #[sequential_test::sequential]
     fn test_wire_norm_addition() {
         let ctx = make_ctx();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -288,6 +291,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_wire_norm_subtraction() {
         let ctx = make_ctx();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -312,6 +316,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_wire_norm_multiplication() {
         // ctx: secpar_sqrt=50, ring_dim_sqrt=1024, base=32, log_base_q=28
         let ctx = make_ctx();
@@ -339,6 +344,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_wire_norm_lwe_plt_bounds() {
         // Build a tiny LUT on DCRTPoly where the maximum output coeff is known (e.g., 7)
         let params = DCRTPolyParams::default();
@@ -378,6 +384,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_wire_norm_ggh15_plt_bounds() {
         // Build a tiny LUT on DCRTPoly where the maximum output coeff is known (e.g., 7)
         let params = DCRTPolyParams::default();

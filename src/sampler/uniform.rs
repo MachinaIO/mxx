@@ -1,5 +1,6 @@
 use crate::{
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+    openfhe_guard::ensure_openfhe_warmup,
     parallel_iter,
     poly::{Poly, PolyParams, dcrt::poly::DCRTPoly},
     sampler::{DistType, PolyUniformSampler},
@@ -8,101 +9,13 @@ use openfhe::ffi;
 use rayon::prelude::*;
 #[cfg(feature = "disk")]
 use std::ops::Range;
-use std::{
-    collections::HashSet,
-    hash::{Hash, Hasher},
-    sync::{Mutex, OnceLock},
-};
 
 use crate::poly::dcrt::params::DCRTPolyParams;
 
 pub struct DCRTPolyUniformSampler {}
 
-#[derive(Clone, Copy, Eq)]
-struct NttWarmupKey {
-    ring_dimension: u32,
-    crt_depth: usize,
-    crt_bits: usize,
-}
-
-impl PartialEq for NttWarmupKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.ring_dimension == other.ring_dimension &&
-            self.crt_depth == other.crt_depth &&
-            self.crt_bits == other.crt_bits
-    }
-}
-
-impl Hash for NttWarmupKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.ring_dimension.hash(state);
-        self.crt_depth.hash(state);
-        self.crt_bits.hash(state);
-    }
-}
-
-static NTT_WARMED: OnceLock<Mutex<HashSet<NttWarmupKey>>> = OnceLock::new();
-
 impl DCRTPolyUniformSampler {
-    fn ntt_warmup_key(params: &DCRTPolyParams) -> NttWarmupKey {
-        NttWarmupKey {
-            ring_dimension: params.ring_dimension(),
-            crt_depth: params.crt_depth(),
-            crt_bits: params.crt_bits(),
-        }
-    }
-
-    /// Warm up OpenFHE's NTT precomputation for the given parameters in a single thread.
-    ///
-    /// OpenFHE's first-time NTT table initialization is not thread-safe; calling into the DCRTPoly
-    /// generators in parallel can race and cause a segfault. This ensures the first call happens
-    /// once per parameter set, serialized across threads.
-    fn ensure_ntt_warmup(&self, params: &DCRTPolyParams) {
-        let key = Self::ntt_warmup_key(params);
-        let warmed = NTT_WARMED.get_or_init(|| Mutex::new(HashSet::new()));
-
-        let mut guard = warmed.lock().expect("NTT warmup lock poisoned");
-        if guard.contains(&key) {
-            return;
-        }
-
-        // Call all generator entry points used by `sample_poly` once, single-threaded, and drop
-        // the result immediately.
-        //
-        // Note: this intentionally discards the output; it's only for triggering OpenFHE's lazy
-        // NTT table initialization.
-        let warmups = [
-            DistType::FinRingDist,
-            DistType::BitDist,
-            DistType::TernaryDist,
-            DistType::GaussDist { sigma: 3.2 },
-        ];
-        for dist in warmups {
-            let _ = self.sample_poly(params, &dist);
-        }
-
-        guard.insert(key);
-    }
-}
-
-impl Default for DCRTPolyUniformSampler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PolyUniformSampler for DCRTPolyUniformSampler {
-    type M = DCRTPolyMatrix;
-
-    fn new() -> Self {
-        Self {}
-    }
-
-    fn sample_poly(
-        &self,
-        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
-        dist: &DistType,
-    ) -> <Self::M as PolyMatrix>::P {
+    fn sample_poly_unchecked(&self, params: &DCRTPolyParams, dist: &DistType) -> DCRTPoly {
         let sampled_poly = match dist {
             DistType::FinRingDist => ffi::DCRTPolyGenFromDug(
                 params.ring_dimension(),
@@ -131,6 +44,29 @@ impl PolyUniformSampler for DCRTPolyUniformSampler {
         }
         DCRTPoly::new(sampled_poly)
     }
+}
+
+impl Default for DCRTPolyUniformSampler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PolyUniformSampler for DCRTPolyUniformSampler {
+    type M = DCRTPolyMatrix;
+
+    fn new() -> Self {
+        Self {}
+    }
+
+    fn sample_poly(
+        &self,
+        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
+        dist: &DistType,
+    ) -> <Self::M as PolyMatrix>::P {
+        ensure_openfhe_warmup(params);
+        self.sample_poly_unchecked(params, dist)
+    }
 
     fn sample_uniform(
         &self,
@@ -141,7 +77,7 @@ impl PolyUniformSampler for DCRTPolyUniformSampler {
     ) -> Self::M {
         // Ensure OpenFHE's NTT tables for these parameters are initialized before we enter the
         // parallel sampling loop.
-        self.ensure_ntt_warmup(params);
+        ensure_openfhe_warmup(params);
 
         #[cfg(feature = "disk")]
         {
@@ -150,7 +86,7 @@ impl PolyUniformSampler for DCRTPolyUniformSampler {
                 parallel_iter!(row_offsets)
                     .map(|_| {
                         parallel_iter!(col_offsets.clone())
-                            .map(|_| self.sample_poly(params, &dist))
+                            .map(|_| self.sample_poly_unchecked(params, &dist))
                             .collect()
                     })
                     .collect()
@@ -164,11 +100,7 @@ impl PolyUniformSampler for DCRTPolyUniformSampler {
                 .map(|_| {
                     parallel_iter!(0..ncol)
                         .map(|_| {
-                            let sampled_poly = self.sample_poly(params, &dist);
-                            if sampled_poly.get_poly().is_null() {
-                                panic!("Attempted to dereference a null pointer");
-                            }
-                            sampled_poly
+                            self.sample_poly_unchecked(params, &dist)
                         })
                         .collect()
                 })
@@ -181,6 +113,8 @@ impl PolyUniformSampler for DCRTPolyUniformSampler {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use num_bigint::BigUint;
 
     use crate::poly::dcrt::params::DCRTPolyParams;
@@ -188,6 +122,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[sequential_test::sequential]
     fn test_ternary_dist_values() {
         // Test that TernaryDist actually produces values in {-1, 0, 1}
         let params = DCRTPolyParams::default();
@@ -212,6 +147,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_ring_dist() {
         let params = DCRTPolyParams::default();
 
@@ -238,6 +174,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_gaussian_dist() {
         let params = DCRTPolyParams::default();
 
@@ -266,6 +203,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_bit_dist() {
         let params = DCRTPolyParams::default();
 
@@ -293,6 +231,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_matrix_mul_tensor_identity_simple() {
         let params = DCRTPolyParams::default();
         let sampler = DCRTPolyUniformSampler::new();
@@ -318,6 +257,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_matrix_mul_tensor_identity_decompose_naive() {
         let params = DCRTPolyParams::default();
         let sampler = DCRTPolyUniformSampler::new();
@@ -346,6 +286,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_matrix_mul_tensor_identity_decompose_optimal() {
         let params = DCRTPolyParams::default();
         let sampler = DCRTPolyUniformSampler::new();
@@ -389,6 +330,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_matrix_compact_bytes() {
         let params = DCRTPolyParams::default();
         let sampler = DCRTPolyUniformSampler::new();

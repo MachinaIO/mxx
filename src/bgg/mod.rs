@@ -6,6 +6,8 @@ pub mod sampler;
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use crate::{
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
@@ -19,6 +21,7 @@ mod tests {
     use keccak_asm::Keccak256;
 
     #[test]
+    #[sequential_test::sequential]
     fn test_bgg_pub_key_addition() {
         let key: [u8; 32] = rand::random();
         let tag: u64 = rand::random();
@@ -45,6 +48,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_bgg_pub_key_multiplication() {
         let key: [u8; 32] = rand::random();
         let tag: u64 = rand::random();
@@ -71,6 +75,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_bgg_encoding_sampling() {
         let input_size = 10_usize;
         let key: [u8; 32] = rand::random();
@@ -104,6 +109,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_bgg_encoding_addition() {
         let key: [u8; 32] = rand::random();
         let tag: u64 = rand::random();
@@ -143,6 +149,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_bgg_encoding_multiplication() {
         let key: [u8; 32] = rand::random();
         let tag: u64 = rand::random();

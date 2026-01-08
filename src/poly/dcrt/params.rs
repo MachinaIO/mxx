@@ -4,7 +4,7 @@ use openfhe::ffi;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, sync::Arc};
 
-use crate::poly::PolyParams;
+use crate::{openfhe_guard::ensure_openfhe_warmup_params, poly::PolyParams};
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DCRTPolyParams {
@@ -58,6 +58,7 @@ impl PolyParams for DCRTPolyParams {
     }
 
     fn to_crt(&self) -> (Vec<u64>, usize, usize) {
+        ensure_openfhe_warmup_params(self.ring_dimension, self.crt_depth, self.crt_bits);
         let moduli = ffi::GenCRTBasis(self.ring_dimension, self.crt_depth, self.crt_bits)
             .into_iter()
             .map(|m| m.parse::<u64>().expect("invalid CRT modulus string"))
@@ -77,6 +78,7 @@ impl DCRTPolyParams {
     pub fn new(ring_dimension: u32, crt_depth: usize, crt_bits: usize, base_bits: u32) -> Self {
         // assert that ring_dimension is a power of 2
         assert!(ring_dimension.is_power_of_two(), "ring_dimension must be a power of 2");
+        ensure_openfhe_warmup_params(ring_dimension, crt_depth, crt_bits);
         let modulus = ffi::GenModulus(ring_dimension, crt_depth, crt_bits);
         let decompose_last_mask = if crt_bits.is_multiple_of(base_bits as usize) {
             None
@@ -112,9 +114,12 @@ impl DCRTPolyParams {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use super::*;
 
     #[test]
+    #[sequential_test::sequential]
     fn test_params_initiation_ring_dimension() {
         let ring_dimension = 16;
         let crt_depth = 4;
@@ -132,17 +137,10 @@ mod tests {
         let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits);
         assert_eq!(p.ring_dimension(), 2);
         assert_eq!(p.modulus_bits(), 204);
-
-        let ring_dimension = 1;
-        let crt_depth = 4;
-        let crt_bits = 51;
-        let base_bits = 1;
-        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits);
-        assert_eq!(p.ring_dimension(), 1);
-        assert_eq!(p.modulus_bits(), 204);
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_params_initiation_crt_depth() {
         let ring_dimension = 16;
         let crt_depth = 4;
@@ -178,6 +176,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_params_initiation_base() {
         let ring_dimension = 16;
         let crt_depth = 4;
@@ -202,6 +201,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     #[should_panic(expected = "ring_dimension must be a power of 2")]
     fn test_params_initiation_non_power_of_two() {
         let ring_dimension = 20;

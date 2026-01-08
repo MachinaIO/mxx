@@ -24,6 +24,7 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 #[tokio::test]
+#[sequential_test::sequential]
 #[ignore]
 async fn test_arithmetic_circuit_operations_lwe() {
     // Mixed operations in a single circuit: (a + b) * c - a.

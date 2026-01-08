@@ -5,6 +5,7 @@ use crate::{
         dcrt_poly::DCRTPolyMatrix,
         i64::{I64Matrix, I64MatrixParams},
     },
+    openfhe_guard::ensure_openfhe_warmup,
     parallel_iter,
     poly::{PolyParams, dcrt::params::DCRTPolyParams},
     sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
@@ -167,6 +168,7 @@ fn sample_p1_for_pert_mat(
     dgg_stddev: f64,
     padded_ncol: usize,
 ) -> DCRTPolyMatrix {
+    ensure_openfhe_warmup(params);
     let n = params.ring_dimension();
     let depth = params.crt_depth();
     let k_res = params.crt_bits();

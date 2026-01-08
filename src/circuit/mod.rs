@@ -617,6 +617,8 @@ impl<P: Poly> PolyCircuit<P> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use super::*;
     use crate::{
         element::PolyElem,
@@ -633,6 +635,7 @@ mod tests {
     use num_bigint::BigUint;
 
     #[test]
+    #[sequential_test::sequential]
     fn test_eval_add() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -664,6 +667,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_eval_sub() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -695,6 +699,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_eval_mul() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -726,6 +731,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_const_digits() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -787,6 +793,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_eval_complex() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -825,6 +832,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_eval_multiple_outputs() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -869,6 +877,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_multiple_input_calls_with_nonconsecutive_gate_ids() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -913,6 +922,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_eval_deep_complex() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -968,6 +978,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_boolean_gate_and() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
@@ -988,6 +999,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_boolean_gate_not() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
@@ -1007,6 +1019,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_boolean_gate_or() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
@@ -1027,6 +1040,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_boolean_gate_nand() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
@@ -1047,6 +1061,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_boolean_gate_nor() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
@@ -1068,6 +1083,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_boolean_gate_xor() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
@@ -1089,6 +1105,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_boolean_gate_xnor() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
@@ -1111,6 +1128,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_mul_fhe_poly_bits_mul_by_poly_circuit() {
         let mut circuit = PolyCircuit::new();
         let params = DCRTPolyParams::default();
@@ -1176,6 +1194,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_register_and_call_sub_circuit() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -1235,6 +1254,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_nested_sub_circuits() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -1299,6 +1319,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_const_zero_gate() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -1328,6 +1349,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_const_one_gate() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -1357,6 +1379,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_const_minus_one_gate() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -1387,6 +1410,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_depth_zero_with_direct_input_output() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let inputs = circuit.input(1);
@@ -1395,6 +1419,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_depth_one_with_add() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let inputs = circuit.input(2);
@@ -1404,6 +1429,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_depth_two_with_chain() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let inputs = circuit.input(3);

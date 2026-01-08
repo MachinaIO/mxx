@@ -188,6 +188,8 @@ pub fn run_lattice_estimator_cli(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use super::*;
     use num_bigint::BigUint;
     use std::{fs, os::unix::fs::PermissionsExt};
@@ -214,6 +216,7 @@ exit {}
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_run_lattice_estimator_cli_success() {
         let temp_dir = TempDir::new().expect("create temp dir");
         let mock_path = create_mock_cli(&temp_dir, "128", 0);
@@ -232,6 +235,7 @@ exit {}
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_run_lattice_estimator_cli_with_logs() {
         let temp_dir = TempDir::new().expect("create temp dir");
         // Simulate CLI output with logs before the actual result.
@@ -257,6 +261,7 @@ exit {}
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_run_lattice_estimator_cli_with_exact_and_m() {
         let temp_dir = TempDir::new().expect("create temp dir");
         let mock_path = create_mock_cli(&temp_dir, "512", 0);
@@ -282,6 +287,7 @@ exit {}
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_run_lattice_estimator_cli_non_zero_exit() {
         let temp_dir = TempDir::new().expect("create temp dir");
         let mock_path = create_mock_cli(&temp_dir, "Error: Invalid parameters", 1);
@@ -306,6 +312,7 @@ exit {}
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_run_lattice_estimator_cli_parse_error() {
         let temp_dir = TempDir::new().expect("create temp dir");
         let mock_path = create_mock_cli(&temp_dir, "not_a_number", 0);
@@ -324,6 +331,7 @@ exit {}
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_run_lattice_estimator_cli_empty_output() {
         let temp_dir = TempDir::new().expect("create temp dir");
         let mock_path = create_mock_cli(&temp_dir, "", 0);
@@ -342,6 +350,7 @@ exit {}
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_run_lattice_estimator_cli_whitespace_output() {
         let temp_dir = TempDir::new().expect("create temp dir");
         let mock_path = create_mock_cli(&temp_dir, "  \n  192  \n  ", 0);
@@ -360,6 +369,7 @@ exit {}
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_distribution_to_json_string() {
         // Test various distribution types serialize correctly.
         let dist = Distribution::DiscreteGaussian {
@@ -391,6 +401,7 @@ exit {}
 
     // Integration test with actual CLI (requires lattice-estimator-cli in PATH).
     #[test]
+    #[sequential_test::sequential]
     #[ignore] // Use `cargo test -- --ignored` to run this test.
     fn test_integration_with_actual_cli() {
         let ring_dim = BigUint::from(1024u32);
@@ -431,6 +442,7 @@ exit {}
 
     // Test with custom path to CLI.
     #[test]
+    #[sequential_test::sequential]
     #[ignore] // Use `cargo test -- --ignored` to run this test.
     fn test_integration_with_custom_cli_path() {
         let cli_path =

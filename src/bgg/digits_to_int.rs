@@ -57,6 +57,8 @@ impl<M: PolyMatrix> DigitsToInt<M::P> for BggEncoding<M> {
 }
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use super::*;
     use crate::{
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
@@ -68,6 +70,7 @@ mod tests {
     use keccak_asm::Keccak256;
 
     #[test]
+    #[sequential_test::sequential]
     fn test_dcrtpoly_digits_to_int_random() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -83,6 +86,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_dcrtpoly_digits_to_int_static() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -100,6 +104,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_bggpublickey_digits_to_int() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -141,6 +146,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_bggencoding_digits_to_int_static() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -179,6 +185,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_bggencoding_digits_to_int_random() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();

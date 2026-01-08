@@ -134,9 +134,12 @@ impl Neg for FinRingElem {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use super::*;
 
     #[test]
+    #[sequential_test::sequential]
     fn test_element_new_str() {
         let modulus = "17";
         let elem = FinRingElem::from_str("5", modulus).unwrap();
@@ -153,6 +156,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_element_new() {
         let modulus = Arc::new(BigUint::from(17u8));
         let elem = FinRingElem::new(5, modulus.clone());
@@ -169,6 +173,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_element_add() {
         let modulus = Arc::new(BigUint::from(17u8));
         let a = FinRingElem::new(19, modulus.clone());
@@ -186,6 +191,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_element_sub() {
         let modulus = Arc::new(BigUint::from(17u8));
         let a = FinRingElem::new(-1, modulus.clone());
@@ -203,6 +209,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_element_mul() {
         let modulus = Arc::new(BigUint::from(17u8));
         let a = FinRingElem::new(3, modulus.clone());
@@ -220,6 +227,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_element_neg() {
         let modulus = Arc::new(BigUint::from(17u8));
         let a = FinRingElem::new(5, modulus.clone());

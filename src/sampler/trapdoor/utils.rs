@@ -4,6 +4,7 @@ use crate::{
         dcrt_poly::DCRTPolyMatrix,
         i64::{I64Matrix, I64MatrixParams},
     },
+    openfhe_guard::ensure_openfhe_global_warmup,
     parallel_iter,
     poly::{
         Poly, PolyParams,
@@ -16,6 +17,7 @@ use rayon::prelude::*;
 use std::ops::Range;
 
 pub(crate) fn gen_int_karney(mean: f64, stddev: f64) -> i64 {
+    ensure_openfhe_global_warmup();
     GenerateIntegerKarney(mean, stddev)
 }
 

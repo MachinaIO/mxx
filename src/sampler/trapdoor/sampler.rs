@@ -1,6 +1,7 @@
 use super::{DCRTTrapdoor, utils::split_int64_mat_alt_to_elems};
 use crate::{
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+    openfhe_guard::ensure_openfhe_warmup,
     parallel_iter,
     poly::{
         Poly, PolyParams,
@@ -237,6 +238,7 @@ pub(crate) fn gauss_samp_gq_arb_base(
     sigma: f64,
     tower_idx: usize,
 ) -> Vec<Vec<i64>> {
+    ensure_openfhe_warmup(params);
     let n = params.ring_dimension();
     let depth = params.crt_depth();
     let k_res_bits = params.crt_bits();
@@ -263,6 +265,8 @@ pub(crate) fn gauss_samp_gq_arb_base(
 
 #[cfg(test)]
 mod test {
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use super::*;
     use crate::{
         poly::PolyParams,
@@ -272,6 +276,7 @@ mod test {
     const SIGMA: f64 = 4.578;
 
     #[test]
+    #[sequential_test::sequential]
     fn test_decompose_dcrt_gadget() {
         let params = DCRTPolyParams::default();
         let uniform_sampler = DCRTPolyUniformSampler::new();
@@ -285,6 +290,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_decompose_dcrt_gadget_base_8() {
         let params = DCRTPolyParams::new(4, 2, 17, 3);
         let uniform_sampler = DCRTPolyUniformSampler::new();
@@ -298,6 +304,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_trapdoor_generation() {
         let size: usize = 3;
         let params = DCRTPolyParams::default();
@@ -338,6 +345,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_square() {
         let params = DCRTPolyParams::default();
         let size = 3;
@@ -371,6 +379,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_non_square_target_lt() {
         let params = DCRTPolyParams::default();
         let size = 4;
@@ -408,6 +417,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_non_square_target_gt_multiple() {
         let params = DCRTPolyParams::default();
         let size = 4;
@@ -447,6 +457,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_non_square_target_gt_non_multiple() {
         let params = DCRTPolyParams::default();
         let size = 4;
@@ -485,6 +496,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_base_8() {
         let params = DCRTPolyParams::new(4, 2, 17, 3);
         let size = 4;
@@ -523,6 +535,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_base_1024() {
         let params = DCRTPolyParams::new(4, 2, 17, 10);
         let size = 4;
@@ -561,6 +574,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_extend() {
         let params = DCRTPolyParams::default();
         let size = 3;

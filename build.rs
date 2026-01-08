@@ -80,7 +80,7 @@ fn main() {
             );
         }
 
-        let cuda_arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "70".to_string());
+        let cuda_arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "89".to_string());
         let cuda_home = env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
         let cuda_lib_dir =
             env::var("CUDA_LIB_DIR").unwrap_or_else(|_| format!("{cuda_home}/lib64"));

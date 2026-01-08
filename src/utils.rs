@@ -14,7 +14,7 @@ use crate::{
 };
 use bigdecimal::BigDecimal;
 use keccak_asm::Keccak256;
-use memory_stats::memory_stats;
+// use memory_stats::memory_stats;
 use num_bigint::{BigInt, BigUint};
 use num_traits::Zero;
 use rand::Rng;
@@ -85,29 +85,31 @@ macro_rules! impl_binop_with_refs {
 }
 
 pub fn debug_mem<T: Into<String>>(tag: T) {
-    if let Some(usage) = memory_stats() {
-        debug!(
-            "{} || Current physical/virtual memory usage: {} | {}",
-            tag.into(),
-            usage.physical_mem,
-            usage.virtual_mem
-        );
-    } else {
-        debug!("Couldn't get the current memory usage :(");
-    }
+    // if let Some(usage) = memory_stats() {
+    //     debug!(
+    //         "{} || Current physical/virtual memory usage: {} | {}",
+    //         tag.into(),
+    //         usage.physical_mem,
+    //         usage.virtual_mem
+    //     );
+    // } else {
+    //     debug!("Couldn't get the current memory usage :(");
+    // }
+    debug!("{}", tag.into());
 }
 
 pub fn log_mem<T: Into<String>>(tag: T) {
-    let tag = tag.into();
-    // let gpu_suffix = gpu_mem_log_suffix();
-    if let Some(usage) = memory_stats() {
-        info!(
-            "{} || Current physical/virtual memory usage: {} | {}",
-            tag, usage.physical_mem, usage.virtual_mem,
-        );
-    } else {
-        info!("Couldn't get the current memory usage :(");
-    }
+    // let tag = tag.into();
+    // // let gpu_suffix = gpu_mem_log_suffix();
+    // if let Some(usage) = memory_stats() {
+    //     info!(
+    //         "{} || Current physical/virtual memory usage: {} | {}",
+    //         tag, usage.physical_mem, usage.virtual_mem,
+    //     );
+    // } else {
+    //     info!("Couldn't get the current memory usage :(");
+    // }
+    info!("{}", tag.into());
 }
 
 // #[cfg(feature = "gpu")]

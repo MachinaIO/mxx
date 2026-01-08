@@ -134,10 +134,12 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
             let nrow = row_offsets.len();
             let ncol = col_offsets.len();
             let perturbed_syndromes = perturbed_syndrome.block_entries(row_offsets, col_offsets);
+            // let decompose_start = Instant::now();
             let decomposed_results = parallel_iter!(0..nrow)
                 .map(|i| {
                     let row_results: Vec<_> = parallel_iter!(0..ncol)
                         .map(|j| {
+                            // let start = Instant::now();
                             let decomposed = decompose_dcrt_gadget(
                                 &perturbed_syndromes[i][j],
                                 self.c,
@@ -145,6 +147,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
                                 self.base,
                                 self.sigma,
                             );
+                            // log_mem(format!("decompose_dcrt_gadget in {:?}", start.elapsed()));
                             (i, j, decomposed)
                         })
                         .collect();
@@ -152,7 +155,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
                 })
                 .flatten()
                 .collect::<Vec<_>>();
-
+            // log_mem(format!("decomposed_results in {:?}", decompose_start.elapsed()));
             let mut block_matrix = vec![vec![DCRTPoly::const_zero(params); ncol]; k * nrow];
             for (i, j, decomposed) in decomposed_results {
                 debug_assert_eq!(decomposed[0].len(), 1);

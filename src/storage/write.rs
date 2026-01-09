@@ -463,12 +463,14 @@ fn record_pending_bytes(pending: &PendingHandle, payload_len: usize) {
     let (lock, _) = &**pending;
     let mut state = lock.lock().unwrap();
     state.pending_bytes = state.pending_bytes.saturating_add(payload_len);
+    log_mem(format!("Recorded {} bytes; pending={} bytes", payload_len, state.pending_bytes));
 }
 
 fn release_pending_bytes(pending: &PendingHandle, payload_len: usize) {
     let (lock, cvar) = &**pending;
     let mut state = lock.lock().unwrap();
     state.pending_bytes = state.pending_bytes.saturating_sub(payload_len);
+    log_mem(format!("Released {} bytes; pending={} bytes", payload_len, state.pending_bytes));
     update_throttle_locked(&mut state, cvar);
 }
 

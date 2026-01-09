@@ -440,7 +440,6 @@ mod test {
     #[tokio::test]
     #[sequential_test::sequential]
     async fn test_ggh15_plt_eval_single_input() {
-        init_storage_system();
         let _ = tracing_subscriber::fmt::try_init();
 
         let params = DCRTPolyParams::default();
@@ -490,6 +489,7 @@ mod test {
             fs::remove_dir_all(dir).unwrap();
             fs::create_dir(dir).unwrap();
         }
+        init_storage_system(dir.to_path_buf());
 
         let error_sigma = 0.0;
         let insert_1_to_s = false;
@@ -553,7 +553,6 @@ mod test {
     #[tokio::test]
     #[sequential_test::sequential]
     async fn test_ggh15_plt_eval_multi_inputs() {
-        init_storage_system();
         let _ = tracing_subscriber::fmt::try_init();
 
         let params = DCRTPolyParams::default();
@@ -611,6 +610,7 @@ mod test {
             fs::remove_dir_all(dir).unwrap();
             fs::create_dir(dir).unwrap();
         }
+        init_storage_system(dir.to_path_buf());
 
         let error_sigma = 0.0;
         let insert_1_to_s = false;

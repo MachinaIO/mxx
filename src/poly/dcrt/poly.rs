@@ -2,6 +2,7 @@ use super::params::DCRTPolyParams;
 use crate::{
     element::{PolyElem, finite_ring::FinRingElem},
     impl_binop_with_refs, parallel_iter,
+    openfhe_guard::ensure_openfhe_warmup,
     poly::{Poly, PolyParams},
     utils::chunk_size_for,
 };
@@ -48,6 +49,21 @@ impl DCRTPoly {
         &self.ptr_poly
     }
 
+    #[inline]
+    pub(crate) fn coeffs_bytes(&self) -> Vec<u8> {
+        self.ptr_poly.GetCoefficientsBytes()
+    }
+
+    #[inline]
+    pub(crate) fn eval_bytes(&self) -> Vec<u8> {
+        self.ptr_poly.GetEvaluationBytes()
+    }
+
+    #[inline]
+    pub fn eval_slots(&self) -> Vec<BigUint> {
+        parse_coefficients_bytes(&self.eval_bytes()).coefficients
+    }
+
     pub fn modulus_switch(
         &self,
         params: &DCRTPolyParams,
@@ -63,6 +79,7 @@ impl DCRTPoly {
     }
 
     fn poly_gen_from_vec(params: &DCRTPolyParams, values: &[Vec<u64>]) -> Self {
+        ensure_openfhe_warmup(params);
         let limbs_per_int = values.iter().map(|vs| vs.len()).max().unwrap_or(0);
         let values_refs = values.iter().map(|vs| vs.as_slice()).collect::<Vec<_>>();
         let values_limbs = pack_dcrtpoly_u64_limbs_le(&values_refs, limbs_per_int);
@@ -76,6 +93,7 @@ impl DCRTPoly {
     }
 
     fn poly_gen_from_vec_eval(params: &DCRTPolyParams, values: &[Vec<u64>]) -> Self {
+        ensure_openfhe_warmup(params);
         let limbs_per_int = values.iter().map(|vs| vs.len()).max().unwrap_or(0);
         let values_refs = values.iter().map(|vs| vs.as_slice()).collect::<Vec<_>>();
         let values_limbs = pack_dcrtpoly_u64_limbs_le(&values_refs, limbs_per_int);
@@ -90,6 +108,7 @@ impl DCRTPoly {
 
     #[inline]
     fn poly_gen_from_const(params: &DCRTPolyParams, value: &[u64]) -> Self {
+        ensure_openfhe_warmup(params);
         DCRTPoly::new(ffi::DCRTPolyGenFromConst(
             params.ring_dimension(),
             params.crt_depth(),
@@ -105,7 +124,7 @@ impl Poly for DCRTPoly {
 
     #[inline]
     fn coeffs(&self) -> Vec<Self::Elem> {
-        let poly_encoding = self.ptr_poly.GetCoefficientsBytes();
+        let poly_encoding = self.coeffs_bytes();
         let parsed_values = parse_coefficients_bytes(&poly_encoding);
         let coeffs = parsed_values.coefficients;
         let modulus = parsed_values.modulus;
@@ -590,6 +609,8 @@ fn process_single_coeff_with(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use super::*;
     use crate::{
         poly::PolyParams,
@@ -598,6 +619,7 @@ mod tests {
     use rand::prelude::*;
 
     #[test]
+    #[sequential_test::sequential]
     fn test_const_int_roundtrip() {
         let mut rng = rand::rng();
         let params = DCRTPolyParams::default();
@@ -614,6 +636,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_dcrtpoly_coeffs() {
         let mut rng = rand::rng();
         /*
@@ -636,6 +659,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_dcrtpoly_arithmetic() {
         let params = DCRTPolyParams::default();
         let q = params.modulus();
@@ -705,6 +729,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_dcrtpoly_decompose() {
         let params = DCRTPolyParams::default();
         let sampler = DCRTPolyUniformSampler::new();
@@ -714,6 +739,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_dcrtpoly_to_compact_bytes_bit_dist() {
         let params = DCRTPolyParams::default();
         let sampler = DCRTPolyUniformSampler::new();
@@ -761,6 +787,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_dcrtpoly_to_compact_bytes_uniform_dist() {
         let params = DCRTPolyParams::default();
         let sampler = DCRTPolyUniformSampler::new();
@@ -804,6 +831,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_dcrtpoly_from_compact_bytes() {
         let params = DCRTPolyParams::default();
         let sampler = DCRTPolyUniformSampler::new();

@@ -1,6 +1,7 @@
 use crate::{
     element::PolyElem,
     matrix::{MatrixElem, MatrixParams, PolyMatrix, cpp_matrix::CppMatrix},
+    openfhe_guard::ensure_openfhe_warmup,
     parallel_iter,
     poly::{
         Poly, PolyParams,
@@ -309,6 +310,7 @@ impl PolyMatrix for DCRTPolyMatrix {
 
 impl DCRTPolyMatrix {
     pub(crate) fn to_cpp_matrix_ptr(&self) -> CppMatrix {
+        ensure_openfhe_warmup(&self.params);
         let nrow = self.nrow;
         let ncol = self.ncol;
         let mut matrix_ptr = MatrixGen(
@@ -337,6 +339,7 @@ impl DCRTPolyMatrix {
     }
 
     pub(crate) fn gadget_vector(params: &DCRTPolyParams) -> DCRTPolyMatrix {
+        ensure_openfhe_warmup(params);
         let base = 1 << params.base_bits();
         let g_vec_cpp = DCRTPolyGadgetVector(
             params.ring_dimension(),
@@ -349,6 +352,7 @@ impl DCRTPolyMatrix {
     }
 
     fn dcrt_decompose_poly(&self, poly: &DCRTPoly, base_bits: u32) -> Vec<DCRTPoly> {
+        ensure_openfhe_warmup(&self.params);
         // Use OpenFHE's native decomposition for consistency with its gadget vector,
         // but clamp each digit to its valid bit-width, especially for the most-significant
         // digit when base_bits does not divide crt_bits.
@@ -383,6 +387,8 @@ impl DCRTPolyMatrix {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use crate::element::{PolyElem, finite_ring::FinRingElem};
 
     use super::*;
@@ -390,6 +396,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    #[sequential_test::sequential]
     fn test_matrix_gadget_matrix() {
         let params = DCRTPolyParams::default();
         let size = 3;
@@ -399,6 +406,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_matrix_decompose() {
         let params = DCRTPolyParams::default();
         let bit_length = params.modulus_bits();
@@ -443,6 +451,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_matrix_decompose_with_base8() {
         let params = DCRTPolyParams::new(4, 2, 17, 3);
         let digits_length = params.modulus_digits();
@@ -488,6 +497,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_matrix_decompose_with_unaligned_base() {
         let params = DCRTPolyParams::new(4, 1, 52, 17);
         let digits_length = params.modulus_digits();
@@ -536,6 +546,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_matrix_basic_operations() {
         let params = DCRTPolyParams::default();
 
@@ -575,6 +586,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_matrix_concatenation() {
         let params = DCRTPolyParams::default();
         let value = FinRingElem::new(5u32, params.modulus());
@@ -618,6 +630,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_matrix_tensor_product() {
         let params = DCRTPolyParams::default();
         let value = FinRingElem::new(5u32, params.modulus());
@@ -648,6 +661,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_matrix_modulus_switch() {
         let params = DCRTPolyParams::default();
 
@@ -695,6 +709,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     #[should_panic(expected = "Addition requires matrices of same dimensions")]
     #[cfg(debug_assertions)]
     fn test_matrix_addition_mismatch() {
@@ -705,6 +720,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     #[should_panic(expected = "Multiplication condition failed")]
     #[cfg(debug_assertions)]
     fn test_matrix_multiplication_mismatch() {

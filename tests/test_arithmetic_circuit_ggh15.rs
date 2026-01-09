@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 #[tokio::test]
-#[ignore]
+#[sequential_test::sequential]
 async fn test_arithmetic_circuit_operations_ggh15() {
     // Mixed operations in a single circuit: (a + b) * c - a.
     const P_MODULI_BITS: usize = 6;

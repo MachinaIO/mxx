@@ -147,6 +147,8 @@ impl SerializablePolyCircuit {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use crate::{
         lookup::poly::PolyPltEvaluator,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
@@ -155,6 +157,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[sequential_test::sequential]
     fn test_serialization_roundtrip() {
         // Create a complex circuit with various operations
         let mut original_circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
@@ -199,6 +202,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_serialization_roundtrip_json() {
         // Create a complex circuit with various operations
         let mut original_circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
@@ -245,6 +249,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_serialization_roundtrip_with_nonconsecutive_inputs() {
         // Create a circuit where input() is called twice with a gate in between,
         // resulting in non-consecutive input GateIds.

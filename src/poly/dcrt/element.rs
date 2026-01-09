@@ -87,9 +87,12 @@ impl PolyElem for FinRingElem {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use super::*;
 
     #[test]
+    #[sequential_test::sequential]
     fn test_element_zero() {
         let modulus = Arc::new(BigUint::from(17u8));
         let zero = FinRingElem::zero(&modulus);
@@ -103,6 +106,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_element_one() {
         let modulus = Arc::new(BigUint::from(17u8));
         let one = FinRingElem::one(&modulus);
@@ -116,6 +120,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_element_minus_one() {
         let modulus = Arc::new(BigUint::from(17u8));
         let minus_one = FinRingElem::minus_one(&modulus);

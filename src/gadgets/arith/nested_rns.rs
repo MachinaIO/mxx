@@ -472,6 +472,8 @@ pub fn encode_nested_rns_poly<P: Poly>(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use super::*;
     use crate::{
         lookup::poly::PolyPltEvaluator,
@@ -498,6 +500,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_nested_rns_poly_add_full_reduce_maxes() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
@@ -508,6 +511,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_nested_rns_poly_add_full_reduce_random() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
@@ -519,6 +523,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_nested_rns_poly_sub_full_reduce_maxes() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
@@ -529,6 +534,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_nested_rns_poly_sub_full_reduce_random() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
@@ -540,6 +546,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_nested_rns_poly_mul_full_reduce_maxes() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
@@ -550,6 +557,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_nested_rns_poly_mul_full_reduce_random() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);

@@ -223,6 +223,8 @@ where
 
 #[cfg(test)]
 mod test {
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use super::*;
     use crate::{
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
@@ -256,6 +258,7 @@ mod test {
     const SIGMA: f64 = 4.578;
 
     #[tokio::test]
+    #[sequential_test::sequential]
     async fn test_lwe_plt_eval() {
         init_storage_system();
         let _ = tracing_subscriber::fmt::try_init();

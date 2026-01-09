@@ -1,45 +1,57 @@
+#![cfg(feature = "gpu")]
+
 use keccak_asm::Keccak256;
 use mxx::{
     bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
     circuit::PolyCircuit,
     gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly},
     lookup::{
-        lwe_eval::{LWEBGGEncodingPltEvaluator, LWEBGGPubKeyPltEvaluator},
+        ggh15_eval::{GGH15BGGEncodingPltEvaluator, GGH15BGGPubKeyPltEvaluator},
         poly::PolyPltEvaluator,
     },
-    matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+    matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
-        dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        dcrt::{
+            gpu::{GpuDCRTPoly, GpuDCRTPolyParams},
+            params::DCRTPolyParams,
+        },
     },
     sampler::{
-        DistType, PolyTrapdoorSampler, PolyUniformSampler, hash::DCRTPolyHashSampler,
-        trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
+        DistType, PolyTrapdoorSampler, PolyUniformSampler, gpu_hash::GpuDCRTPolyHashSampler,
+        gpu_uniform::GpuDCRTPolyUniformSampler, trapdoor::GpuDCRTPolyTrapdoorSampler,
     },
     storage::write::{init_storage_system, wait_for_all_writes},
     utils::{gen_biguint_for_modulus, log_mem},
 };
 use num_bigint::BigUint;
+use sequential_test::sequential;
 use std::sync::Arc;
 use tempfile::tempdir;
 
+fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (moduli, _crt_bits, _crt_depth) = params.to_crt();
+    GpuDCRTPolyParams::new(params.ring_dimension(), moduli, params.base_bits())
+}
+
 #[tokio::test]
-#[sequential_test::sequential]
-#[ignore]
-async fn test_arithmetic_circuit_operations_lwe() {
+#[sequential]
+async fn test_arithmetic_circuit_operations_gpu_ggh15() {
     // Mixed operations in a single circuit: (a + b) * c - a.
     const P_MODULI_BITS: usize = 6;
-    const SCALE: u64 = 1 << 6;
+    const SCALE: u64 = 1 << 7;
     const BASE_BITS: u32 = 8;
     let _ = tracing_subscriber::fmt::try_init();
 
     // Use parameters where NestedRnsPoly is known to be correct.
-    let params = DCRTPolyParams::new(4, 6, 24, BASE_BITS);
+    let cpu_params = DCRTPolyParams::new(128, 3, 18, BASE_BITS);
+    let params = gpu_params_from_cpu(&cpu_params);
     let mut rng = rand::rng();
 
     let modulus = params.modulus();
 
-    let mut circuit = PolyCircuit::<DCRTPoly>::new();
+    let mut circuit = PolyCircuit::<GpuDCRTPoly>::new();
     let ctx =
         Arc::new(NestedRnsPolyContext::setup(&mut circuit, &params, P_MODULI_BITS, SCALE, false));
 
@@ -58,19 +70,21 @@ async fn test_arithmetic_circuit_operations_lwe() {
     let a_value: BigUint = gen_biguint_for_modulus(&mut rng, modulus.as_ref());
     let b_value: BigUint = gen_biguint_for_modulus(&mut rng, modulus.as_ref());
     let c_value: BigUint = gen_biguint_for_modulus(&mut rng, modulus.as_ref());
-    let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value);
-    let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value);
-    let c_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &c_value);
+    let a_inputs = encode_nested_rns_poly::<GpuDCRTPoly>(P_MODULI_BITS, &params, &a_value);
+    let b_inputs = encode_nested_rns_poly::<GpuDCRTPoly>(P_MODULI_BITS, &params, &b_value);
+    let c_inputs = encode_nested_rns_poly::<GpuDCRTPoly>(P_MODULI_BITS, &params, &c_value);
     let plaintext_inputs = [a_inputs.clone(), b_inputs.clone(), c_inputs.clone()].concat();
 
+    log_mem("start plain evaluation");
     let plt_evaluator = PolyPltEvaluator::new();
     let eval_results = circuit.eval(
         &params,
-        &DCRTPoly::const_one(&params),
+        &GpuDCRTPoly::const_one(&params),
         &plaintext_inputs,
         Some(plt_evaluator),
     );
     assert_eq!(eval_results.len(), 1);
+    log_mem("end plain evaluation");
 
     let q = modulus.as_ref();
     let aa = &a_value % q;
@@ -79,64 +93,72 @@ async fn test_arithmetic_circuit_operations_lwe() {
     let t = (&aa + &bb) % q;
     let t = (t * &cc) % q;
     let expected = (t + (q - &aa)) % q;
-    let expected_poly = DCRTPoly::from_biguint_to_constant(&params, expected);
+    let expected_poly = GpuDCRTPoly::from_biguint_to_constant(&params, expected);
 
     assert_eq!(eval_results[0], expected_poly, "mixed operations should be correct");
+    log_mem("plain evaluation worked");
 
-    // 2) BGG+ public key evaluation.
+    // 2) BGG+ public key evaluation (GGH15 PLT).
     let tmp_dir = tempdir().unwrap();
     let seed: [u8; 32] = [0u8; 32];
     let d = 1usize;
-    let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, 4.578);
-    let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(&params, d);
-    let trapdoor = Arc::new(trapdoor);
-    let pub_matrix = Arc::new(pub_matrix);
+    let trapdoor_sigma = 4.578;
+    let error_sigma = 0.0;
+    let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, trapdoor_sigma);
+    let (b0_trapdoor, b0_matrix) = trapdoor_sampler.trapdoor(&params, d);
+    let b0_trapdoor = Arc::new(b0_trapdoor);
+    let b0_matrix = Arc::new(b0_matrix);
 
     init_storage_system();
     let reveal_plaintexts = vec![true; circuit.num_input()];
-    let pk_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(seed, d);
+    let pk_sampler = BGGPublicKeySampler::<_, GpuDCRTPolyHashSampler<Keccak256>>::new(seed, d);
     let pubkeys = pk_sampler.sample(&params, b"BGG_PUBKEY", &reveal_plaintexts);
 
-    let pk_evaluator = LWEBGGPubKeyPltEvaluator::<
-        DCRTPolyMatrix,
-        DCRTPolyHashSampler<Keccak256>,
-        DCRTPolyTrapdoorSampler,
+    let insert_1_to_s = false;
+    let pk_evaluator = GGH15BGGPubKeyPltEvaluator::<
+        GpuDCRTPolyMatrix,
+        GpuDCRTPolyUniformSampler,
+        GpuDCRTPolyHashSampler<Keccak256>,
+        GpuDCRTPolyTrapdoorSampler,
     >::new(
         seed,
-        trapdoor_sampler.clone(),
-        pub_matrix.clone(),
-        trapdoor.clone(),
+        trapdoor_sigma,
+        error_sigma,
+        &params,
+        b0_matrix.clone(),
+        b0_trapdoor.clone(),
         tmp_dir.path().to_path_buf(),
+        insert_1_to_s,
     );
-    log_mem("starr pubkey evaluation");
+    log_mem("start pubkey evaluation");
+    let start = std::time::Instant::now();
     let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(pk_evaluator));
-    log_mem("end pubkey evaluation");
+    log_mem(format!("end pubkey evaluation in {:?}", start.elapsed()));
     assert_eq!(pubkey_out.len(), 1);
     log_mem("wait for all writes");
     wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
     log_mem("finish writing");
 
     // 3) BGG+ encoding evaluation.
-    let uniform_sampler = DCRTPolyUniformSampler::new();
+    let uniform_sampler = GpuDCRTPolyUniformSampler::new();
     let secrets = uniform_sampler.sample_uniform(&params, 1, d, DistType::BitDist).get_row(0);
-    let s = DCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
-    let p = s.clone() * pub_matrix.as_ref();
+    let s = GpuDCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
+    let c_b0 = s.clone() * b0_matrix.as_ref();
 
     let bgg_encoding_sampler =
-        BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
-    let zero_plaintexts = vec![DCRTPoly::const_zero(&params); circuit.num_input()];
+        BGGEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
+    let zero_plaintexts = vec![GpuDCRTPoly::const_zero(&params); circuit.num_input()];
     let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &zero_plaintexts);
-    let enc_evaluator =
-        LWEBGGEncodingPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::new(
-            seed,
-            tmp_dir.path().to_path_buf(),
-            p,
-        );
+    let enc_evaluator = GGH15BGGEncodingPltEvaluator::<
+        GpuDCRTPolyMatrix,
+        GpuDCRTPolyHashSampler<Keccak256>,
+    >::new(seed, &params, tmp_dir.path().to_path_buf(), d, c_b0);
     log_mem("start encoding evaluation");
+    let start = std::time::Instant::now();
     let encoding_out = circuit.eval(&params, &encodings[0], &encodings[1..], Some(enc_evaluator));
-    log_mem("end encoding evaluation");
+    log_mem(format!("end encoding evaluation in {:?}", start.elapsed()));
     assert_eq!(encoding_out.len(), 1);
-    assert_eq!(encoding_out[0].plaintext.as_ref().unwrap(), &DCRTPoly::const_zero(&params));
+    assert_eq!(encoding_out[0].plaintext.as_ref().unwrap(), &GpuDCRTPoly::const_zero(&params));
     assert_eq!(encoding_out[0].pubkey, pubkey_out[0]);
 
     let encoding_expected = s.clone() * &pubkey_out[0].matrix;

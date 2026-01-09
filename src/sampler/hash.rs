@@ -115,11 +115,14 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use super::*;
     use crate::poly::dcrt::params::DCRTPolyParams;
     use keccak_asm::Keccak256;
 
     #[test]
+    #[sequential_test::sequential]
     fn test_poly_hash_sampler() {
         let key = [0u8; 32];
         let params = DCRTPolyParams::default();
@@ -136,6 +139,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_poly_hash_sampler_fin_ring_dist() {
         let key = [0u8; 32];
         let params = DCRTPolyParams::default();

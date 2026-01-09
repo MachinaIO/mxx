@@ -406,6 +406,8 @@ where
 
 #[cfg(test)]
 mod test {
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use super::*;
     use crate::{
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
@@ -436,6 +438,7 @@ mod test {
     const SIGMA: f64 = 4.578;
 
     #[tokio::test]
+    #[sequential_test::sequential]
     async fn test_ggh15_plt_eval_single_input() {
         init_storage_system();
         let _ = tracing_subscriber::fmt::try_init();
@@ -548,6 +551,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[sequential_test::sequential]
     async fn test_ggh15_plt_eval_multi_inputs() {
         init_storage_system();
         let _ = tracing_subscriber::fmt::try_init();

@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 default = []
 # debug = []
 disk = ["libc", "memmap2"]
+gpu = []
 
 [dependencies]
 tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros"] }
@@ -33,6 +34,10 @@ keccak-asm = { version = "0.1.4" }
 tempfile = { version = "3.19.1" }
 tracing-subscriber = "0.3"
 primal = "0.3"
+sequential-test = "0.2.4"
+
+[build-dependencies]
+cc = "1"
 
 [profile.dev]
 debug = "line-tables-only"
@@ -52,3 +57,19 @@ codegen-units = 16
 inherits = "release"
 debug = "full"
 strip = "none"
+
+[[bench]]
+name = "bench_matrix_mul_cpu"
+harness = false
+
+[[bench]]
+name = "bench_matrix_mul_gpu"
+harness = false
+
+[[bench]]
+name = "preimage_cpu"
+harness = false
+
+[[bench]]
+name = "preimage_gpu"
+harness = false

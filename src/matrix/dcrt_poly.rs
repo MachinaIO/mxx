@@ -387,9 +387,9 @@ impl DCRTPolyMatrix {
 
 #[cfg(test)]
 mod tests {
+    use crate::element::{PolyElem, finite_ring::FinRingElem};
     #[allow(unused_imports)]
     use crate::{__PAIR, __TestState};
-    use crate::element::{PolyElem, finite_ring::FinRingElem};
 
     use super::*;
     use num_bigint::BigUint;

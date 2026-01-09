@@ -223,9 +223,9 @@ where
 
 #[cfg(test)]
 mod test {
+    use super::*;
     #[allow(unused_imports)]
     use crate::{__PAIR, __TestState};
-    use super::*;
     use crate::{
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         circuit::PolyCircuit,

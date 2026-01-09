@@ -234,9 +234,9 @@ impl PltEvaluator<ErrorNorm> for NormPltGGH15Evaluator {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[allow(unused_imports)]
     use crate::{__PAIR, __TestState};
-    use super::*;
     use crate::{
         circuit::PolyCircuit,
         element::finite_ring::FinRingElem,

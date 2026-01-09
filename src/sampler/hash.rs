@@ -115,10 +115,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use crate::{__PAIR, __TestState};
     use super::*;
     use crate::poly::dcrt::params::DCRTPolyParams;
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use keccak_asm::Keccak256;
 
     #[test]

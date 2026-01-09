@@ -5,12 +5,7 @@ use std::{
     time::Instant,
 };
 
-use crate::{
-    matrix::PolyMatrix,
-    poly::Poly,
-    storage::write::GlobalTableIndex,
-    utils::log_mem,
-};
+use crate::{matrix::PolyMatrix, poly::Poly, storage::write::GlobalTableIndex, utils::log_mem};
 
 /// Read a specific matrix from split batch files by its ID prefix and index.
 /// Uses indexed format for O(1) access to lookup tables.

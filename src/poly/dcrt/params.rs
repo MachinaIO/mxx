@@ -114,9 +114,9 @@ impl DCRTPolyParams {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[allow(unused_imports)]
     use crate::{__PAIR, __TestState};
-    use super::*;
 
     #[test]
     #[sequential_test::sequential]

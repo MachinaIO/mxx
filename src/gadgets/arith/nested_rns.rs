@@ -472,9 +472,9 @@ pub fn encode_nested_rns_poly<P: Poly>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[allow(unused_imports)]
     use crate::{__PAIR, __TestState};
-    use super::*;
     use crate::{
         lookup::poly::PolyPltEvaluator,
         poly::{

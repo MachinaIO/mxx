@@ -38,9 +38,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[allow(unused_imports)]
     use crate::{__PAIR, __TestState};
-    use super::*;
 
     use crate::{
         matrix::dcrt_poly::DCRTPolyMatrix,

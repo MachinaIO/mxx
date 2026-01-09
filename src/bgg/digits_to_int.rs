@@ -57,9 +57,9 @@ impl<M: PolyMatrix> DigitsToInt<M::P> for BggEncoding<M> {
 }
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[allow(unused_imports)]
     use crate::{__PAIR, __TestState};
-    use super::*;
     use crate::{
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         matrix::dcrt_poly::DCRTPolyMatrix,

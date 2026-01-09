@@ -1,8 +1,9 @@
 use super::params::DCRTPolyParams;
 use crate::{
     element::{PolyElem, finite_ring::FinRingElem},
-    impl_binop_with_refs, parallel_iter,
+    impl_binop_with_refs,
     openfhe_guard::ensure_openfhe_warmup,
+    parallel_iter,
     poly::{Poly, PolyParams},
     utils::chunk_size_for,
 };
@@ -609,9 +610,9 @@ fn process_single_coeff_with(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[allow(unused_imports)]
     use crate::{__PAIR, __TestState};
-    use super::*;
     use crate::{
         poly::PolyParams,
         sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},

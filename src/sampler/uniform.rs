@@ -99,9 +99,7 @@ impl PolyUniformSampler for DCRTPolyUniformSampler {
             let c: Vec<Vec<DCRTPoly>> = parallel_iter!(0..nrow)
                 .map(|_| {
                     parallel_iter!(0..ncol)
-                        .map(|_| {
-                            self.sample_poly_unchecked(params, &dist)
-                        })
+                        .map(|_| self.sample_poly_unchecked(params, &dist))
                         .collect()
                 })
                 .collect();

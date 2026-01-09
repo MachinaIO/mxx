@@ -278,9 +278,9 @@ impl<M: PolyMatrix> Wee25Commit<M> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[allow(unused_imports)]
     use crate::{__PAIR, __TestState};
-    use super::*;
     use crate::{
         matrix::{MatrixElem, dcrt_poly::DCRTPolyMatrix},
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},

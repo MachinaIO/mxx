@@ -188,9 +188,9 @@ pub fn run_lattice_estimator_cli(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[allow(unused_imports)]
     use crate::{__PAIR, __TestState};
-    use super::*;
     use num_bigint::BigUint;
     use std::{fs, os::unix::fs::PermissionsExt};
     use tempfile::TempDir;

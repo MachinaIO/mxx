@@ -617,9 +617,9 @@ impl<P: Poly> PolyCircuit<P> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[allow(unused_imports)]
     use crate::{__PAIR, __TestState};
-    use super::*;
     use crate::{
         element::PolyElem,
         lookup::poly::PolyPltEvaluator,

@@ -265,9 +265,9 @@ pub(crate) fn gauss_samp_gq_arb_base(
 
 #[cfg(test)]
 mod test {
+    use super::*;
     #[allow(unused_imports)]
     use crate::{__PAIR, __TestState};
-    use super::*;
     use crate::{
         poly::PolyParams,
         sampler::{PolyUniformSampler, uniform::DCRTPolyUniformSampler},

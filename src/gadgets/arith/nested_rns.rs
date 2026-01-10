@@ -102,7 +102,7 @@ impl NestedRnsPolyContext {
                     .to_u64()
                     .expect("CRT residue must fit in u64");
                 let inv = mod_inverse(residue, p_i).expect("CRT moduli must be coprime");
-                // log_mem(format!("pi = {}, p_over_pi = {}, inv = {}", pi, p_over_pi, inv));
+                // info!("{}", format!("pi = {}, p_over_pi = {}, inv = {}", pi, p_over_pi, inv));
                 BigUint::from(inv)
             };
 

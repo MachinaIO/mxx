@@ -17,11 +17,12 @@ use mxx::{
         trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
     },
     storage::write::{init_storage_system, wait_for_all_writes},
-    utils::{gen_biguint_for_modulus, log_mem},
+    utils::gen_biguint_for_modulus,
 };
 use num_bigint::BigUint;
 use std::sync::Arc;
 use tempfile::tempdir;
+use tracing::info;
 
 #[tokio::test]
 #[sequential_test::sequential]
@@ -51,7 +52,7 @@ async fn test_arithmetic_circuit_operations_ggh15() {
     let out_poly = prod.sub_full_reduce(&poly_a, &mut circuit);
     let out = out_poly.reconstruct(&params, &mut circuit);
     circuit.output(vec![out]);
-    log_mem(format!("non-free depth: {}", circuit.non_free_depth()));
+    info!("{}", format!("non-free depth: {}", circuit.non_free_depth()));
 
     // 1) Plain polynomial evaluation.
     let a_value: BigUint = gen_biguint_for_modulus(&mut rng, modulus.as_ref());
@@ -114,14 +115,14 @@ async fn test_arithmetic_circuit_operations_ggh15() {
         tmp_dir.path().to_path_buf(),
         insert_1_to_s,
     );
-    log_mem("start pubkey evaluation");
+    info!("start pubkey evaluation");
     let start = std::time::Instant::now();
     let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(pk_evaluator));
-    log_mem(format!("end pubkey evaluation in {:?}", start.elapsed()));
+    info!("{}", format!("end pubkey evaluation in {:?}", start.elapsed()));
     assert_eq!(pubkey_out.len(), 1);
-    log_mem("wait for all writes");
+    info!("wait for all writes");
     wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
-    log_mem("finish writing");
+    info!("finish writing");
 
     // 3) BGG+ encoding evaluation.
     let uniform_sampler = DCRTPolyUniformSampler::new();
@@ -137,10 +138,10 @@ async fn test_arithmetic_circuit_operations_ggh15() {
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
     >::new(seed, &params, tmp_dir.path().to_path_buf(), d, c_b0);
-    log_mem("start encoding evaluation");
+    info!("start encoding evaluation");
     let start = std::time::Instant::now();
     let encoding_out = circuit.eval(&params, &encodings[0], &encodings[1..], Some(enc_evaluator));
-    log_mem(format!("end encoding evaluation in {:?}", start.elapsed()));
+    info!("{}", format!("end encoding evaluation in {:?}", start.elapsed()));
     assert_eq!(encoding_out.len(), 1);
     assert_eq!(encoding_out[0].plaintext.as_ref().unwrap(), &DCRTPoly::const_zero(&params));
     assert_eq!(encoding_out[0].pubkey, pubkey_out[0]);

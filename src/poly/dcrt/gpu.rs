@@ -2,7 +2,7 @@ use crate::{
     element::{PolyElem, finite_ring::FinRingElem},
     impl_binop_with_refs,
     poly::{Poly, PolyParams},
-    utils::{chunk_size_for, log_mem, mod_inverse},
+    utils::{chunk_size_for, mod_inverse},
 };
 use num_bigint::BigUint;
 use num_traits::{One, ToPrimitive, Zero};
@@ -20,6 +20,7 @@ use std::{
     slice,
     sync::Arc,
 };
+use tracing::info;
 
 #[allow(non_camel_case_types)]
 #[repr(C)]
@@ -143,7 +144,7 @@ unsafe extern "C" {
     fn gpu_poly_intt(poly: *mut GpuPolyOpaque, batch: c_int) -> c_int;
     fn gpu_device_synchronize() -> c_int;
     fn gpu_device_count(out_count: *mut c_int) -> c_int;
-    fn gpu_device_mem_info(device: c_int, out_free: *mut usize, out_total: *mut usize) -> c_int;
+    // fn gpu_device_mem_info(device: c_int, out_free: *mut usize, out_total: *mut usize) -> c_int;
 
     fn gpu_last_error() -> *const c_char;
 
@@ -508,7 +509,7 @@ unsafe impl Sync for GpuContext {}
 
 impl GpuContext {
     fn create(log_n: u32, moduli: &[u64], gpu_ids: &[i32], dnum: u32, batch: u32) -> Self {
-        log_mem(&format!(
+        info!("{}", format!(
             "Creating GPU context with log_n={}, moduli={:?}, gpu_ids={:?}, dnum={}, batch={}",
             log_n, moduli, gpu_ids, dnum, batch
         ));
@@ -550,7 +551,7 @@ impl Drop for GpuContext {
             gpu_device_sync();
             unsafe { gpu_context_destroy(self.raw) };
             self.raw = ptr::null_mut();
-            log_mem("GPU context destroyed");
+            info!("GPU context destroyed");
         }
     }
 }

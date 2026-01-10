@@ -17,11 +17,12 @@ use mxx::{
         trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
     },
     storage::write::{init_storage_system, wait_for_all_writes},
-    utils::{gen_biguint_for_modulus, log_mem},
+    utils::gen_biguint_for_modulus,
 };
 use num_bigint::BigUint;
 use std::sync::Arc;
 use tempfile::tempdir;
+use tracing::info;
 
 #[tokio::test]
 #[sequential_test::sequential]
@@ -52,7 +53,7 @@ async fn test_arithmetic_circuit_operations_lwe() {
     let out_poly = prod.sub_full_reduce(&poly_a, &mut circuit);
     let out = out_poly.reconstruct(&params, &mut circuit);
     circuit.output(vec![out]);
-    log_mem(format!("non-free depth: {}", circuit.non_free_depth()));
+    info!("{}", format!("non-free depth: {}", circuit.non_free_depth()));
 
     // 1) Plain polynomial evaluation.
     let a_value: BigUint = gen_biguint_for_modulus(&mut rng, modulus.as_ref());
@@ -108,13 +109,13 @@ async fn test_arithmetic_circuit_operations_lwe() {
         trapdoor.clone(),
         tmp_dir.path().to_path_buf(),
     );
-    log_mem("starr pubkey evaluation");
+    info!("starr pubkey evaluation");
     let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(pk_evaluator));
-    log_mem("end pubkey evaluation");
+    info!("end pubkey evaluation");
     assert_eq!(pubkey_out.len(), 1);
-    log_mem("wait for all writes");
+    info!("wait for all writes");
     wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
-    log_mem("finish writing");
+    info!("finish writing");
 
     // 3) BGG+ encoding evaluation.
     let uniform_sampler = DCRTPolyUniformSampler::new();
@@ -132,9 +133,9 @@ async fn test_arithmetic_circuit_operations_lwe() {
             tmp_dir.path().to_path_buf(),
             p,
         );
-    log_mem("start encoding evaluation");
+    info!("start encoding evaluation");
     let encoding_out = circuit.eval(&params, &encodings[0], &encodings[1..], Some(enc_evaluator));
-    log_mem("end encoding evaluation");
+    info!("end encoding evaluation");
     assert_eq!(encoding_out.len(), 1);
     assert_eq!(encoding_out[0].plaintext.as_ref().unwrap(), &DCRTPoly::const_zero(&params));
     assert_eq!(encoding_out[0].pubkey, pubkey_out[0]);

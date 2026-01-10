@@ -1,6 +1,7 @@
-use crate::{matrix::PolyMatrix, poly::Poly, utils::debug_mem};
+use crate::{matrix::PolyMatrix, poly::Poly};
 use rayon::prelude::*;
 use std::ops::{Add, Mul, Sub};
+use tracing::debug;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BggPublicKey<M: PolyMatrix> {
@@ -71,13 +72,13 @@ impl<M: PolyMatrix> Mul for BggPublicKey<M> {
 impl<M: PolyMatrix> Mul<&Self> for BggPublicKey<M> {
     type Output = Self;
     fn mul(self, other: &Self) -> Self {
-        debug_mem(format!("BGGPublicKey::mul {:?}, {:?}", self.matrix.size(), other.matrix.size()));
+        debug!("{}", format!("BGGPublicKey::mul {:?}, {:?}", self.matrix.size(), other.matrix.size()));
         let decomposed = other.matrix.decompose();
-        debug_mem("BGGPublicKey::mul decomposed");
+        debug!("BGGPublicKey::mul decomposed");
         let matrix = self.matrix * decomposed;
-        debug_mem("BGGPublicKey::mul matrix multiplied");
+        debug!("BGGPublicKey::mul matrix multiplied");
         let reveal_plaintext = self.reveal_plaintext & other.reveal_plaintext;
-        debug_mem("BGGPublicKey::mul reveal_plaintext");
+        debug!("BGGPublicKey::mul reveal_plaintext");
         Self { matrix, reveal_plaintext }
     }
 }

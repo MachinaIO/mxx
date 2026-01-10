@@ -18,12 +18,12 @@ use crate::{
     sampler::{
         DistType, PolyTrapdoorSampler, PolyUniformSampler, gpu_uniform::GpuDCRTPolyUniformSampler,
     },
-    utils::log_mem,
 };
 use rayon::prelude::*;
 #[cfg(test)]
 use sequential_test::sequential;
 use std::{ops::Range, time::Instant};
+use tracing::info;
 
 const SIGMA: f64 = 4.578;
 const SPECTRAL_CONSTANT: f64 = 1.8;
@@ -40,23 +40,23 @@ pub struct GpuDCRTTrapdoor {
 
 impl GpuDCRTTrapdoor {
     pub fn new(params: &GpuDCRTPolyParams, size: usize, sigma: f64) -> Self {
-        // log_mem("start new GpuDCRTTrapdoor");
+        // info!("start new GpuDCRTTrapdoor");
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();
         let log_base_q = params.modulus_digits();
         let dist = DistType::GaussDist { sigma };
         let r = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
-        // log_mem("sample r");
+        // info!("sample r");
         let e = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
-        // log_mem("sample e");
+        // info!("sample e");
         let a_mat = r.clone() * r.transpose();
-        // log_mem("compute a_mat");
+        // info!("compute a_mat");
         let e_transpose = e.transpose();
         let b_mat = r.clone() * &e_transpose;
-        // log_mem("compute b_mat");
+        // info!("compute b_mat");
         let d_mat = e.clone() * &e_transpose;
-        // log_mem("compute d_mat");
+        // info!("compute d_mat");
         let re = r.concat_rows(&[&e]);
-        // log_mem("compute re");
+        // info!("compute re");
         Self { r, e, a_mat, b_mat, d_mat, re }
     }
 
@@ -112,14 +112,14 @@ impl GpuDCRTTrapdoor {
         let p2_cpu = split_int64_mat_to_elems(&p2z_vec, &cpu_params);
         let p2_gpu_start = Instant::now();
         let p2_gpu = GpuDCRTPolyMatrix::from_cpu_matrix(params, &p2_cpu);
-        log_mem(format!("sample_pert_square_mat p2_gpu in {:?}", p2_gpu_start.elapsed()));
+        info!("{}", format!("sample_pert_square_mat p2_gpu in {:?}", p2_gpu_start.elapsed()));
 
         let tp2_gpu_start = Instant::now();
         let tp2_gpu = self.re.clone() * &p2_gpu;
-        log_mem(format!("sample_pert_square_mat tp2_gpu mul in {:?}", tp2_gpu_start.elapsed()));
+        info!("{}", format!("sample_pert_square_mat tp2_gpu mul in {:?}", tp2_gpu_start.elapsed()));
         let tp2_cpu_start = Instant::now();
         let tp2_cpu = gpu_matrix_to_cpu(&cpu_params, &tp2_gpu);
-        log_mem(format!("sample_pert_square_mat tp2_cpu in {:?}", tp2_cpu_start.elapsed()));
+        info!("{}", format!("sample_pert_square_mat tp2_cpu in {:?}", tp2_cpu_start.elapsed()));
 
         let a_mat_cpu = gpu_matrix_to_cpu(&cpu_params, &self.a_mat);
         let b_mat_cpu = gpu_matrix_to_cpu(&cpu_params, &self.b_mat);
@@ -137,17 +137,17 @@ impl GpuDCRTTrapdoor {
         );
         let p1_gpu_start = Instant::now();
         let p1_gpu = GpuDCRTPolyMatrix::from_cpu_matrix(params, &p1_cpu);
-        log_mem(format!("sample_pert_square_mat p1_gpu in {:?}", p1_gpu_start.elapsed()));
+        info!("{}", format!("sample_pert_square_mat p1_gpu in {:?}", p1_gpu_start.elapsed()));
 
         let concat_start = Instant::now();
         let mut p = p1_gpu.concat_rows_owned(vec![p2_gpu]);
-        log_mem(format!("sample_pert_square_mat concat in {:?}", concat_start.elapsed()));
+        info!("{}", format!("sample_pert_square_mat concat in {:?}", concat_start.elapsed()));
         if padding_ncol > 0 {
             let slice_start = Instant::now();
             p = p.slice_columns(0, total_ncol);
-            log_mem(format!("sample_pert_square_mat slice in {:?}", slice_start.elapsed()));
+            info!("{}", format!("sample_pert_square_mat slice in {:?}", slice_start.elapsed()));
         }
-        log_mem(format!("sample_pert_square_mat total in {:?}", overall_start.elapsed()));
+        info!("{}", format!("sample_pert_square_mat total in {:?}", overall_start.elapsed()));
         p
     }
 
@@ -186,19 +186,19 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         size: usize,
     ) -> (Self::Trapdoor, Self::M) {
         let trapdoor = GpuDCRTTrapdoor::new(params, size, self.sigma);
-        // log_mem("trapdoor sampled");
+        // info!("trapdoor sampled");
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();
         let a_bar = uniform_sampler.sample_uniform(params, size, size, DistType::FinRingDist);
-        // log_mem("a_bar sampled");
+        // info!("a_bar sampled");
         let g = GpuDCRTPolyMatrix::gadget_matrix(params, size);
-        // log_mem("gadget matrix computed");
+        // info!("gadget matrix computed");
         let a1 = g - (&a_bar * &trapdoor.r + &trapdoor.e);
-        // log_mem("a1 computed");
+        // info!("a1 computed");
         let identity = GpuDCRTPolyMatrix::identity(params, size, None);
         let a0 = a_bar.concat_columns_owned(vec![identity]);
-        // log_mem("a0 computed");
+        // info!("a0 computed");
         let a = a0.concat_columns_owned(vec![a1]);
-        // log_mem("a computed");
+        // info!("a computed");
         (trapdoor, a)
     }
 
@@ -212,7 +212,7 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         let overall_start = Instant::now();
         let d = public_matrix.row_size();
         let target_cols = target.col_size();
-        log_mem(format!(
+        info!("{}", format!(
             "preimage start d={}, target_cols={}, n={}",
             d,
             target_cols,
@@ -256,7 +256,7 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         };
         let dgg_large_params =
             (dgg_large_mean, dgg_large_std, dgg_large_table.as_ref().map(|v| &v[..]));
-        log_mem(format!("preimage dgg params in {:?}", dgg_start.elapsed()));
+        info!("{}", format!("preimage dgg params in {:?}", dgg_start.elapsed()));
 
         let p_hat_start = Instant::now();
         let p_hat = trapdoor.sample_pert_square_mat(
@@ -267,10 +267,10 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             peikert,
             target_cols,
         );
-        log_mem(format!("preimage p_hat in {:?}", p_hat_start.elapsed()));
+        info!("{}", format!("preimage p_hat in {:?}", p_hat_start.elapsed()));
         let perturbed_start = Instant::now();
         let perturbed_syndrome = target - &(public_matrix * &p_hat);
-        log_mem(format!("preimage perturbed_syndrome in {:?}", perturbed_start.elapsed()));
+        info!("{}", format!("preimage perturbed_syndrome in {:?}", perturbed_start.elapsed()));
 
         let decomp_start = Instant::now();
         let cpu_params = cpu_params_from_gpu(params);
@@ -293,7 +293,7 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             })
             .collect::<Vec<_>>();
         let decomposed_results = decomposed_rows.into_iter().flatten().collect::<Vec<_>>();
-        log_mem(format!("preimage decomposition in {:?}", decomp_start.elapsed()));
+        info!("{}", format!("preimage decomposition in {:?}", decomp_start.elapsed()));
 
         let zhat_start = Instant::now();
         let z_hat_cpu_start = Instant::now();
@@ -306,22 +306,22 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
                 z_hat_cpu.set_entry(i * k + decomposed_idx, j, poly);
             }
         }
-        log_mem(format!("preimage z_hat_mat cpu build in {:?}", z_hat_cpu_start.elapsed()));
+        info!("{}", format!("preimage z_hat_mat cpu build in {:?}", z_hat_cpu_start.elapsed()));
         let z_hat_mat_start = Instant::now();
         let z_hat_mat = GpuDCRTPolyMatrix::from_cpu_matrix(params, &z_hat_cpu);
-        log_mem(format!("preimage z_hat_mat construction in {:?}", z_hat_mat_start.elapsed()));
-        log_mem(format!("preimage z_hat_mat in {:?}", zhat_start.elapsed()));
+        info!("{}", format!("preimage z_hat_mat construction in {:?}", z_hat_mat_start.elapsed()));
+        info!("{}", format!("preimage z_hat_mat in {:?}", zhat_start.elapsed()));
 
         let r_e_z_hat_start = Instant::now();
         let r_z_hat = &trapdoor.r * &z_hat_mat;
         let e_z_hat = &trapdoor.e * &z_hat_mat;
-        log_mem(format!("preimage r_z_hat and e_z_hat in {:?}", r_e_z_hat_start.elapsed()));
+        info!("{}", format!("preimage r_z_hat and e_z_hat in {:?}", r_e_z_hat_start.elapsed()));
         let combine_start = Instant::now();
         let r_e_z_hat = r_z_hat.concat_rows_owned(vec![e_z_hat, z_hat_mat]);
-        log_mem(format!("preimage concat r_e_z_hat in {:?}", combine_start.elapsed()));
-        log_mem(format!("p_hat size {:?}", p_hat.size()));
+        info!("{}", format!("preimage concat r_e_z_hat in {:?}", combine_start.elapsed()));
+        info!("{}", format!("p_hat size {:?}", p_hat.size()));
         let result = p_hat + r_e_z_hat;
-        log_mem(format!("preimage total in {:?}", overall_start.elapsed()));
+        info!("{}", format!("preimage total in {:?}", overall_start.elapsed()));
         result
     }
 
@@ -411,13 +411,13 @@ mod tests {
 
         let k = params.modulus_digits();
         let identity = GpuDCRTPolyMatrix::identity(&params, size * k, None);
-        log_mem("identity sampled");
+        info!("identity sampled");
         let trapdoor_matrix = trapdoor.r.concat_rows(&[&trapdoor.e, &identity]);
-        log_mem("trapdoor_matrix sampled");
+        info!("trapdoor_matrix sampled");
         let muled = &public_matrix * &trapdoor_matrix;
-        log_mem("muled computed");
+        info!("muled computed");
         let gadget_matrix = GpuDCRTPolyMatrix::gadget_matrix(&params, size);
-        log_mem("gadget_matrix computed");
+        info!("gadget_matrix computed");
         assert_eq!(muled, gadget_matrix, "Product should equal gadget matrix");
     }
 

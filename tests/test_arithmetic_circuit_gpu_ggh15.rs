@@ -22,12 +22,13 @@ use mxx::{
         gpu_uniform::GpuDCRTPolyUniformSampler, trapdoor::GpuDCRTPolyTrapdoorSampler,
     },
     storage::write::{init_storage_system, wait_for_all_writes},
-    utils::{gen_biguint_for_modulus, log_mem},
+    utils::gen_biguint_for_modulus,
 };
 use num_bigint::BigUint;
 use sequential_test::sequential;
 use std::sync::Arc;
 use tempfile::tempdir;
+use tracing::info;
 
 fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {
     let _ = tracing_subscriber::fmt::try_init();
@@ -64,7 +65,7 @@ async fn test_arithmetic_circuit_operations_gpu_ggh15() {
     let out_poly = prod.sub_full_reduce(&poly_a, &mut circuit);
     let out = out_poly.reconstruct(&params, &mut circuit);
     circuit.output(vec![out]);
-    log_mem(format!("non-free depth: {}", circuit.non_free_depth()));
+    info!("{}", format!("non-free depth: {}", circuit.non_free_depth()));
 
     // 1) Plain polynomial evaluation.
     let a_value: BigUint = gen_biguint_for_modulus(&mut rng, modulus.as_ref());
@@ -75,7 +76,7 @@ async fn test_arithmetic_circuit_operations_gpu_ggh15() {
     let c_inputs = encode_nested_rns_poly::<GpuDCRTPoly>(P_MODULI_BITS, &params, &c_value);
     let plaintext_inputs = [a_inputs.clone(), b_inputs.clone(), c_inputs.clone()].concat();
 
-    log_mem("start plain evaluation");
+    info!("start plain evaluation");
     let plt_evaluator = PolyPltEvaluator::new();
     let eval_results = circuit.eval(
         &params,
@@ -84,7 +85,7 @@ async fn test_arithmetic_circuit_operations_gpu_ggh15() {
         Some(plt_evaluator),
     );
     assert_eq!(eval_results.len(), 1);
-    log_mem("end plain evaluation");
+    info!("end plain evaluation");
 
     let q = modulus.as_ref();
     let aa = &a_value % q;
@@ -96,7 +97,7 @@ async fn test_arithmetic_circuit_operations_gpu_ggh15() {
     let expected_poly = GpuDCRTPoly::from_biguint_to_constant(&params, expected);
 
     assert_eq!(eval_results[0], expected_poly, "mixed operations should be correct");
-    log_mem("plain evaluation worked");
+    info!("plain evaluation worked");
 
     // 2) BGG+ public key evaluation (GGH15 PLT).
     let tmp_dir = tempdir().unwrap();
@@ -130,14 +131,14 @@ async fn test_arithmetic_circuit_operations_gpu_ggh15() {
         tmp_dir.path().to_path_buf(),
         insert_1_to_s,
     );
-    log_mem("start pubkey evaluation");
+    info!("start pubkey evaluation");
     let start = std::time::Instant::now();
     let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(pk_evaluator));
-    log_mem(format!("end pubkey evaluation in {:?}", start.elapsed()));
+    info!("{}", format!("end pubkey evaluation in {:?}", start.elapsed()));
     assert_eq!(pubkey_out.len(), 1);
-    log_mem("wait for all writes");
+    info!("wait for all writes");
     wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
-    log_mem("finish writing");
+    info!("finish writing");
 
     // 3) BGG+ encoding evaluation.
     let uniform_sampler = GpuDCRTPolyUniformSampler::new();
@@ -153,10 +154,10 @@ async fn test_arithmetic_circuit_operations_gpu_ggh15() {
         GpuDCRTPolyMatrix,
         GpuDCRTPolyHashSampler<Keccak256>,
     >::new(seed, &params, tmp_dir.path().to_path_buf(), d, c_b0);
-    log_mem("start encoding evaluation");
+    info!("start encoding evaluation");
     let start = std::time::Instant::now();
     let encoding_out = circuit.eval(&params, &encodings[0], &encodings[1..], Some(enc_evaluator));
-    log_mem(format!("end encoding evaluation in {:?}", start.elapsed()));
+    info!("{}", format!("end encoding evaluation in {:?}", start.elapsed()));
     assert_eq!(encoding_out.len(), 1);
     assert_eq!(encoding_out[0].plaintext.as_ref().unwrap(), &GpuDCRTPoly::const_zero(&params));
     assert_eq!(encoding_out[0].pubkey, pubkey_out[0]);

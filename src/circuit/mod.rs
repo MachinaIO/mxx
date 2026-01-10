@@ -19,8 +19,8 @@ use crate::{
     circuit::gate::GateId,
     lookup::{PltEvaluator, PublicLut},
     poly::Poly,
-    utils::{debug_mem, log_mem},
 };
+use tracing::{debug, info};
 #[derive(Debug, Clone, Default)]
 pub struct PolyCircuit<P: Poly> {
     gates: BTreeMap<GateId, PolyGate>,
@@ -398,8 +398,8 @@ impl<P: Poly> PolyCircuit<P> {
 
         let wires = DashMap::new();
         let levels = self.compute_levels();
-        debug_mem(format!("Levels: {levels:?}"));
-        debug_mem("Levels are computed");
+        debug!("{}", format!("Levels: {levels:?}"));
+        debug!("Levels are computed");
 
         wires.insert(GateId(0), one.clone());
         // Collect all input gate IDs excluding the reserved constant-one gate (0)
@@ -420,54 +420,54 @@ impl<P: Poly> PolyCircuit<P> {
         for (id, input) in input_gate_ids.into_iter().zip(inputs.iter()) {
             wires.insert(id, input.clone());
             if let Some(prefix) = self.print_value.get(&id) {
-                log_mem(format!("[{prefix}] Gate ID {id}, {:?}", input));
+                info!("{}", format!("[{prefix}] Gate ID {id}, {:?}", input));
             }
         }
-        debug_mem("Input wires are set");
+        debug!("Input wires are set");
 
         for level in levels.iter() {
-            debug_mem("New level started");
+            debug!("New level started");
             // All gates in the same level can be processed in parallel.
             level.par_iter().for_each(|&gate_id| {
-                debug_mem(format!("Gate id {gate_id} started"));
+                debug!("{}", format!("Gate id {gate_id} started"));
                 if wires.contains_key(&gate_id) {
-                    debug_mem(format!("Gate id {gate_id} already evaluated"));
+                    debug!("{}", format!("Gate id {gate_id} already evaluated"));
                     return;
                 }
                 let gate = self.gates.get(&gate_id).expect("gate not found").clone();
-                debug_mem("Get gate");
+                debug!("Get gate");
                 let result = match &gate.gate_type {
                     PolyGateType::Input => {
                         panic!("Input gate {gate:?} should already be preloaded");
                     }
                     PolyGateType::Add => {
-                        debug_mem("Add gate start");
+                        debug!("Add gate start");
                         let left =
                             wires.get(&gate.input_gates[0]).expect("wire missing for Add").clone();
                         let right =
                             wires.get(&gate.input_gates[1]).expect("wire missing for Add").clone();
                         let result = left + right;
-                        debug_mem("Add gate end");
+                        debug!("Add gate end");
                         result
                     }
                     PolyGateType::Sub => {
-                        debug_mem("Sub gate start");
+                        debug!("Sub gate start");
                         let left =
                             wires.get(&gate.input_gates[0]).expect("wire missing for Sub").clone();
                         let right =
                             wires.get(&gate.input_gates[1]).expect("wire missing for Sub").clone();
                         let result = left - right;
-                        debug_mem("Sub gate end");
+                        debug!("Sub gate end");
                         result
                     }
                     PolyGateType::Mul => {
-                        debug_mem("Mul gate start");
+                        debug!("Mul gate start");
                         let left =
                             wires.get(&gate.input_gates[0]).expect("wire missing for Mul").clone();
                         let right =
                             wires.get(&gate.input_gates[1]).expect("wire missing for Mul").clone();
                         let result = left * right;
-                        debug_mem("Mul gate end");
+                        debug!("Mul gate end");
                         result
                     }
                     PolyGateType::SmallScalarMul { scalar } => {
@@ -476,7 +476,7 @@ impl<P: Poly> PolyCircuit<P> {
                             .expect("wire missing for LargeScalarMul")
                             .clone();
                         let result = input.small_scalar_mul(params, scalar);
-                        debug_mem("Large scalar mul gate end");
+                        debug!("Large scalar mul gate end");
                         result
                     }
                     PolyGateType::LargeScalarMul { scalar } => {
@@ -485,21 +485,21 @@ impl<P: Poly> PolyCircuit<P> {
                             .expect("wire missing for LargeScalarMul")
                             .clone();
                         let result = input.large_scalar_mul(params, scalar);
-                        debug_mem("Large scalar mul gate end");
+                        debug!("Large scalar mul gate end");
                         result
                     }
                     PolyGateType::Rotate { shift } => {
-                        debug_mem("Rotate gate start");
+                        debug!("Rotate gate start");
                         let input = wires
                             .get(&gate.input_gates[0])
                             .expect("wire missing for Rotate")
                             .clone();
                         let result = input.rotate(params, *shift);
-                        debug_mem("Rotate gate end");
+                        debug!("Rotate gate end");
                         result
                     }
                     PolyGateType::PubLut { lut_id } => {
-                        debug_mem("Public Lookup gate start");
+                        debug!("Public Lookup gate start");
                         let input = wires
                             .get(&gate.input_gates[0])
                             .expect("wire missing for Public Lookup")
@@ -510,17 +510,17 @@ impl<P: Poly> PolyCircuit<P> {
                             .as_ref()
                             .expect("public lookup evaluator missing")
                             .public_lookup(params, lookup, one.clone(), input, gate_id, *lut_id);
-                        debug_mem("Public Lookup gate end");
+                        debug!("Public Lookup gate end");
                         result
                     }
                 };
                 if let Some(prefix) = self.print_value.get(&gate_id) {
-                    log_mem(format!("[{prefix}] Gate ID {gate_id}, {:?}", result));
+                    info!("{}", format!("[{prefix}] Gate ID {gate_id}, {:?}", result));
                 }
                 wires.insert(gate_id, result);
-                debug_mem(format!("Gate id {gate_id} finished"));
+                debug!("{}", format!("Gate id {gate_id} finished"));
             });
-            debug_mem("Evaluated gate in parallel");
+            debug!("Evaluated gate in parallel");
         }
 
         let outputs = self
@@ -528,7 +528,7 @@ impl<P: Poly> PolyCircuit<P> {
             .par_iter()
             .map(|&id| wires.get(&id).expect("output missing").clone())
             .collect();
-        debug_mem("Outputs are collected");
+        debug!("Outputs are collected");
         outputs
     }
 

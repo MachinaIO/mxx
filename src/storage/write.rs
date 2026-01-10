@@ -1,4 +1,4 @@
-use crate::{matrix::PolyMatrix, utils::log_mem};
+use crate::matrix::PolyMatrix;
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -281,7 +281,7 @@ fn writer_thread_loop(
                     let id_prefix = buffer.id_prefix.clone();
                     let chunks = buffer.split_by_payload_limit(limit);
                     if chunks.len() > 1 {
-                        log_mem(format!(
+                        info!("{}", format!(
                             "Split oversized lookup buffer {} into {} parts",
                             id_prefix,
                             chunks.len()
@@ -404,7 +404,7 @@ fn write_buffer(
 //         id, block_size_val, row_range.start, row_range.end, col_range.start, col_range.end
 //     );
 //     let elapsed = start.elapsed();
-//     debug_mem(format!("Serialized matrix {} len {} bytes in {elapsed:?}", id, data.len()));
+//     debug!("{}", format!("Serialized matrix {} len {} bytes in {elapsed:?}", id, data.len()));
 //     SerializedMatrix { id: id.to_string(), filename, data }
 // }
 
@@ -511,7 +511,7 @@ impl MultiBatchLookupBuffer {
         let data = self.to_bytes();
         let path = dir.join(&filename);
         tokio::fs::write(&path, &data).await?;
-        log_mem(format!(
+        info!("{}", format!(
             "Multi-batch lookup table written to {} ({} bytes, {} tables)",
             filename,
             data.len(),
@@ -591,7 +591,7 @@ where
         encoded[offset..offset + matrix_bytes.len()].copy_from_slice(&matrix_bytes);
     }
     let elapsed = start.elapsed();
-    log_mem(format!(
+    info!("{}", format!(
         "Serialized {} matrices for {} ({} bytes, {} bytes per matrix) in {elapsed:?}",
         num_matrices, id_prefix, total_size, max_bytes_per_matrix
     ));
@@ -624,7 +624,7 @@ where
 //         let path = dir_async.join(&filename_async);
 //         match tokio::fs::write(&path, &data_async).await {
 //             Ok(_) => {
-//                 log_mem(format!(
+//                 info!("{}", format!(
 //                     "Matrix {} written to {} ({} bytes)",
 //                     id_async,
 //                     filename_async,
@@ -647,7 +647,7 @@ where
 //         if let Err(e) = std::fs::write(&path, &serialized_matrix.data) {
 //             eprintln!("Failed to write {}: {}", path.display(), e);
 //         } else {
-//             log_mem(format!(
+//             info!("{}", format!(
 //                 "Matrix {} written to {} ({} bytes)",
 //                 serialized_matrix.id,
 //                 serialized_matrix.filename,
@@ -659,10 +659,10 @@ where
 
 // #[cfg(feature = "debug")]
 // pub fn store_and_drop_poly<P: Poly>(poly: P, dir: &Path, id: &str) {
-//     log_mem(format!("Storing {id}"));
+//     info!("{}", format!("Storing {id}"));
 //     poly.write_to_file(dir, id);
 //     drop(poly);
-//     log_mem(format!("Stored {id}"));
+//     info!("{}", format!("Stored {id}"));
 // }
 
 #[allow(dead_code)]
@@ -728,7 +728,7 @@ pub async fn wait_for_all_writes(
         let snapshot = { metadata.lock().unwrap().clone() };
         let total_indices: usize = snapshot.entries.values().map(|entry| entry.indices.len()).sum();
         let approx_bytes = total_indices.saturating_mul(std::mem::size_of::<usize>());
-        log_mem(format!(
+        info!("{}", format!(
             "Metadata entries={}, total_indices={}, approx_indices_bytes={}",
             snapshot.entries.len(),
             total_indices,
@@ -738,11 +738,11 @@ pub async fn wait_for_all_writes(
         if let Err(e) = write_global_index(&snapshot, &index_path).await {
             eprintln!("Failed to write global index: {}", e);
         } else {
-            log_mem(format!("Global index written with {} entries", snapshot.entries.len()));
+            info!("{}", format!("Global index written with {} entries", snapshot.entries.len()));
         }
         metadata.lock().unwrap().entries.clear();
     }
 
-    log_mem("All writes completed");
+    info!("All writes completed");
     Ok(())
 }

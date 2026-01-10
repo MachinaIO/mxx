@@ -5,7 +5,7 @@ use crate::{
     lookup::{PltEvaluator, PublicLut},
     poly::dcrt::poly::DCRTPoly,
     simulator::{SimulatorContext, poly_matrix_norm::PolyMatrixNorm, poly_norm::PolyNorm},
-    utils::{bigdecimal_bits_ceil, log_mem},
+    utils::bigdecimal_bits_ceil,
 };
 use bigdecimal::BigDecimal;
 use num_bigint::BigUint;
@@ -14,6 +14,7 @@ use std::{
     ops::{Add, Mul, Sub},
     sync::Arc,
 };
+use tracing::info;
 
 impl PolyCircuit<DCRTPoly> {
     pub fn simulate_max_error_norm<P: PltEvaluator<ErrorNorm>>(
@@ -136,7 +137,7 @@ impl NormPltLWEEvaluator {
             c_1.clone();
         let norm: BigDecimal = c_0 * 6 * sigma.clone() * ((ctx.base.clone() + 1) * sigma) * term;
         let norm_bits = bigdecimal_bits_ceil(&norm);
-        log_mem(format!("preimage norm bits {}", norm_bits));
+        info!("{}", format!("preimage norm bits {}", norm_bits));
         let e_b_init = PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_b, e_b_sigma * 6, None);
         let e_b_times_preimage =
             &e_b_init * &PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, norm.clone(), None);
@@ -181,7 +182,7 @@ impl NormPltGGH15Evaluator {
         // : BigDecimal =
         //     c_0 * 6 * sigma.clone() * ((ctx.base.clone() + 1) * sigma) * term;
         // let preimage_norm_bits = bigdecimal_bits_ceil(&preimage_norm);
-        // log_mem(format!("preimage norm bits {}", preimage_norm_bits));
+        // info!("{}", format!("preimage norm bits {}", preimage_norm_bits));
         let e_b_init = PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_b, e_b_sigma * 6, None);
 
         let k_to_ggh =
@@ -199,11 +200,11 @@ impl NormPltGGH15Evaluator {
             &k_lut;
         let const_term = e_b_init * k_to_ggh * &k_lut + &s_times_errs + &s_times_errs;
         let const_term_bits = bigdecimal_bits_ceil(&const_term.poly_norm.norm);
-        log_mem(format!("GGH15 PLT const term norm bits {}", const_term_bits));
+        info!("{}", format!("GGH15 PLT const term norm bits {}", const_term_bits));
         let decomposed = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_b);
         let e_one_multiplier = &decomposed * &k_lut;
         let e_one_multiplier_bits = bigdecimal_bits_ceil(&e_one_multiplier.poly_norm.norm);
-        log_mem(format!("GGH15 PLT e_one multiplier norm bits {}", e_one_multiplier_bits));
+        info!("{}", format!("GGH15 PLT e_one multiplier norm bits {}", e_one_multiplier_bits));
         let e_input_multiplier = decomposed * &k_lut;
         Self { const_term, e_one_multiplier, e_input_multiplier }
     }
@@ -242,7 +243,7 @@ pub fn compute_preimage_norm(
     let term = ring_dim_sqrt.clone() * m_g_sqrt + two_sqrt * ring_dim_sqrt + c_1;
     let preimage_norm = c_0 * 6 * sigma.clone() * ((base + 1) * sigma) * term;
     let preimage_norm_bits = bigdecimal_bits_ceil(&preimage_norm);
-    log_mem(format!("preimage norm bits {}", preimage_norm_bits));
+    info!("{}", format!("preimage norm bits {}", preimage_norm_bits));
     preimage_norm
 }
 

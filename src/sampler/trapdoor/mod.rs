@@ -9,7 +9,7 @@ use crate::{
     parallel_iter,
     poly::{PolyParams, dcrt::params::DCRTPolyParams},
     sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
-    utils::{block_size, debug_mem, log_mem},
+    utils::block_size,
 };
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuDCRTPolyTrapdoorSampler, GpuDCRTTrapdoor};
@@ -17,6 +17,7 @@ use openfhe::ffi::{ExtractMatrixCols, FormatMatrixCoefficient, SampleP1ForPertMa
 use rayon::iter::ParallelIterator;
 pub use sampler::DCRTPolyTrapdoorSampler;
 use std::{cmp::min, ops::Range, sync::Arc, time::Instant};
+use tracing::{debug, info};
 use utils::{gen_dgg_int_vec, gen_int_karney, split_int64_mat_to_elems};
 
 #[cfg(feature = "gpu")]
@@ -69,7 +70,7 @@ impl DCRTTrapdoor {
         let num_blocks = total_ncol.div_ceil(d);
         let padded_ncol = num_blocks * d;
         let padding_ncol = padded_ncol - total_ncol;
-        debug_mem("sample_pert_square_mat parameters computed");
+        debug!("sample_pert_square_mat parameters computed");
         // for distribution parameters up to the experimentally found threshold, use
         // the Peikert's inversion method otherwise, use Karney's method
         let p2z_vec = if sigma_large > KARNEY_THRESHOLD {
@@ -100,27 +101,27 @@ impl DCRTTrapdoor {
                 .collect::<Vec<_>>();
             vecs[0].concat_rows(&vecs[1..].iter().collect::<Vec<_>>())
         };
-        debug_mem("p2z_vec generated");
+        debug!("p2z_vec generated");
         let p2_start = Instant::now();
         // create a matrix of d*k x padded_ncol ring elements in coefficient representation
         let p2 = split_int64_mat_to_elems(&p2z_vec, params);
-        log_mem(format!("sample_pert_square_mat p2 in {:?}", p2_start.elapsed()));
+        info!("{}", format!("sample_pert_square_mat p2 in {:?}", p2_start.elapsed()));
         // parallel_iter!(0..padded_ncol)
         //     .map(|i| split_int64_vec_to_elems(&p2z_vec.slice(0, n * dk, i, i + 1), params))
         //     .collect::<Vec<_>>();
-        // debug_mem("p2_vecs generated");
+        // debug!("p2_vecs generated");
         // let p2 = p2_vecs[0].concat_columns(&p2_vecs[1..].iter().collect::<Vec<_>>());
-        debug_mem("p2 generated");
+        debug!("p2 generated");
         // let a_mat = r.clone() * r.transpose(); // d x d
         // let b_mat = r.clone() * e.transpose(); // d x d
         // let d_mat = e.clone() * e.transpose(); // d x d
-        // debug_mem("a_mat, b_mat, d_mat generated");
+        // debug!("a_mat, b_mat, d_mat generated");
         // let re = r.concat_rows(&[e]);
-        // debug_mem("re generated");
+        // debug!("re generated");
         let tp2_start = Instant::now();
         let tp2 = self.re.clone() * &p2;
-        log_mem(format!("sample_pert_square_mat tp2 in {:?}", tp2_start.elapsed()));
-        debug_mem("tp2 generated");
+        info!("{}", format!("sample_pert_square_mat tp2 in {:?}", tp2_start.elapsed()));
+        debug!("tp2 generated");
         let p1_start = Instant::now();
         let p1 = sample_p1_for_pert_mat(
             self.a_mat.clone(),
@@ -133,18 +134,18 @@ impl DCRTTrapdoor {
             dgg,
             padded_ncol,
         );
-        log_mem(format!("sample_pert_square_mat p1 in {:?}", p1_start.elapsed()));
-        debug_mem("p1 generated");
+        info!("{}", format!("sample_pert_square_mat p1 in {:?}", p1_start.elapsed()));
+        debug!("p1 generated");
         let concat_start = Instant::now();
         let mut p = p1.concat_rows(&[&p2]);
-        log_mem(format!("sample_pert_square_mat concat in {:?}", concat_start.elapsed()));
-        debug_mem("p1 and p2 concatenated");
+        info!("{}", format!("sample_pert_square_mat concat in {:?}", concat_start.elapsed()));
+        debug!("p1 and p2 concatenated");
         if padding_ncol > 0 {
             let slice_start = Instant::now();
             p = p.slice_columns(0, total_ncol);
-            log_mem(format!("sample_pert_square_mat slice in {:?}", slice_start.elapsed()));
+            info!("{}", format!("sample_pert_square_mat slice in {:?}", slice_start.elapsed()));
         }
-        log_mem(format!("sample_pert_square_mat total in {:?}", overall_start.elapsed()));
+        info!("{}", format!("sample_pert_square_mat total in {:?}", overall_start.elapsed()));
         p
     }
 }
@@ -169,7 +170,7 @@ fn sample_p1_for_pert_mat(
     let num_blocks = padded_ncol.div_ceil(block_size);
     let num_threads = rayon::current_num_threads();
     let num_threads_for_cpp = num_threads.div_ceil(num_blocks);
-    debug_mem("sample_p1_for_pert_square_mat parameters computed");
+    debug!("sample_p1_for_pert_square_mat parameters computed");
     let mut a_mat = a_mat.to_cpp_matrix_ptr();
     FormatMatrixCoefficient(a_mat.inner.as_mut().unwrap());
     let a_mat_arc = Arc::new(a_mat);
@@ -179,7 +180,7 @@ fn sample_p1_for_pert_mat(
     let mut d_mat = d_mat.to_cpp_matrix_ptr();
     FormatMatrixCoefficient(d_mat.inner.as_mut().unwrap());
     let d_mat_arc = Arc::new(d_mat);
-    debug_mem("a_mat, b_mat, d_mat are converted to cpp matrices");
+    debug!("a_mat, b_mat, d_mat are converted to cpp matrices");
 
     let tp2_arc = Arc::new(tp2);
     let p1_mat_blocks: Vec<DCRTPolyMatrix> = parallel_iter!(0..num_blocks)
@@ -188,7 +189,7 @@ fn sample_p1_for_pert_mat(
             let mut tp2 = tp2_arc.slice_columns(i * block_size, end_col).to_cpp_matrix_ptr();
             FormatMatrixCoefficient(tp2.inner.as_mut().unwrap());
             let tp2_arc = Arc::new(tp2);
-            debug_mem("tp2 is converted to cpp matrices");
+            debug!("tp2 is converted to cpp matrices");
             let ncol = end_col - i * block_size;
             let ncol_per_thread = ncol.div_ceil(num_threads_for_cpp);
             let num_sub_blocks = ncol.div_ceil(ncol_per_thread);
@@ -198,7 +199,7 @@ fn sample_p1_for_pert_mat(
                     let end_col = min((j + 1) * ncol_per_thread, ncol);
                     let tp2_cols =
                         ExtractMatrixCols(&Arc::clone(&tp2_arc).as_ref().inner, start_col, end_col);
-                    debug_mem("extracting rows from tp2");
+                    debug!("extracting rows from tp2");
                     let cpp_matrix = SampleP1ForPertMat(
                         &Arc::clone(&a_mat_arc).as_ref().inner,
                         &Arc::clone(&b_mat_arc).as_ref().inner,
@@ -212,7 +213,7 @@ fn sample_p1_for_pert_mat(
                         s,
                         dgg_stddev,
                     );
-                    debug_mem("SampleP1ForPertSquareMat called");
+                    debug!("SampleP1ForPertSquareMat called");
                     DCRTPolyMatrix::from_cpp_matrix_ptr(params, &CppMatrix::new(params, cpp_matrix))
                 })
                 .collect();

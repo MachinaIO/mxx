@@ -23,7 +23,7 @@ use std::{
     future::Future,
     time::{Duration, Instant},
 };
-use tracing::{debug, info};
+use tracing::info;
 
 /// ideal thread chunk size for parallel
 pub fn chunk_size_for(original: usize) -> usize {
@@ -82,34 +82,6 @@ macro_rules! impl_binop_with_refs {
             fn $f $($t)*
         }
     };
-}
-
-pub fn debug_mem<T: Into<String>>(tag: T) {
-    // if let Some(usage) = memory_stats() {
-    //     debug!(
-    //         "{} || Current physical/virtual memory usage: {} | {}",
-    //         tag.into(),
-    //         usage.physical_mem,
-    //         usage.virtual_mem
-    //     );
-    // } else {
-    //     debug!("Couldn't get the current memory usage :(");
-    // }
-    debug!("{}", tag.into());
-}
-
-pub fn log_mem<T: Into<String>>(tag: T) {
-    // let tag = tag.into();
-    // // let gpu_suffix = gpu_mem_log_suffix();
-    // if let Some(usage) = memory_stats() {
-    //     info!(
-    //         "{} || Current physical/virtual memory usage: {} | {}",
-    //         tag, usage.physical_mem, usage.virtual_mem,
-    //     );
-    // } else {
-    //     info!("Couldn't get the current memory usage :(");
-    // }
-    info!("{}", tag.into());
 }
 
 // #[cfg(feature = "gpu")]
@@ -193,7 +165,7 @@ pub fn timed_read<T, F: FnOnce() -> T>(label: &str, f: F, total: &mut Duration) 
     let res = f();
     let elapsed = start.elapsed();
     *total += elapsed;
-    crate::utils::log_mem(format!("{label} loaded in {elapsed:?}"));
+    info!("{label} loaded in {elapsed:?}");
     res
 }
 
@@ -207,7 +179,7 @@ where
     let res = f().await;
     let elapsed = start.elapsed();
     *total += elapsed;
-    crate::utils::log_mem(format!("{label} loaded in {elapsed:?}"));
+    info!("{label} loaded in {elapsed:?}");
     res
 }
 

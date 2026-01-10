@@ -177,18 +177,11 @@ impl NormPltGGH15Evaluator {
         e_mat_sigma: &BigDecimal,
         secret_sigma: Option<BigDecimal>,
     ) -> Self {
-        let c_0 = BigDecimal::from_f64(1.8).unwrap();
-        let c_1 = BigDecimal::from_f64(4.7).unwrap();
-        let sigma = BigDecimal::from_f64(4.578).unwrap();
-        let two_sqrt = BigDecimal::from(2).sqrt().unwrap();
-        let m_g_sqrt = BigDecimal::from(ctx.m_g as u64).sqrt().expect("sqrt(m_g) failed");
-        let term = ctx.ring_dim_sqrt.clone() * m_g_sqrt +
-            two_sqrt * ctx.ring_dim_sqrt.clone() +
-            c_1.clone();
-        let preimage_norm: BigDecimal =
-            c_0 * 6 * sigma.clone() * ((ctx.base.clone() + 1) * sigma) * term;
-        let preimage_norm_bits = bigdecimal_bits_ceil(&preimage_norm);
-        log_mem(format!("preimage norm bits {}", preimage_norm_bits));
+        let preimage_norm = compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base);
+        // : BigDecimal =
+        //     c_0 * 6 * sigma.clone() * ((ctx.base.clone() + 1) * sigma) * term;
+        // let preimage_norm_bits = bigdecimal_bits_ceil(&preimage_norm);
+        // log_mem(format!("preimage norm bits {}", preimage_norm_bits));
         let e_b_init = PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_b, e_b_sigma * 6, None);
 
         let k_to_ggh =
@@ -205,8 +198,12 @@ impl NormPltGGH15Evaluator {
             PolyMatrixNorm::new(ctx.clone(), ctx.secret_size, ctx.m_b, e_mat_sigma * 6, None) *
             &k_lut;
         let const_term = e_b_init * k_to_ggh * &k_lut + &s_times_errs + &s_times_errs;
+        let const_term_bits = bigdecimal_bits_ceil(&const_term.poly_norm.norm);
+        log_mem(format!("GGH15 PLT const term norm bits {}", const_term_bits));
         let decomposed = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_b);
-        let e_one_multiplier = (&decomposed + &decomposed) * &k_lut;
+        let e_one_multiplier = &decomposed * &k_lut;
+        let e_one_multiplier_bits = bigdecimal_bits_ceil(&e_one_multiplier.poly_norm.norm);
+        log_mem(format!("GGH15 PLT e_one multiplier norm bits {}", e_one_multiplier_bits));
         let e_input_multiplier = decomposed * &k_lut;
         Self { const_term, e_one_multiplier, e_input_multiplier }
     }
@@ -230,6 +227,23 @@ impl PltEvaluator<ErrorNorm> for NormPltGGH15Evaluator {
             &input.matrix_norm * &self.e_input_multiplier;
         ErrorNorm { matrix_norm, plaintext_norm }
     }
+}
+
+pub fn compute_preimage_norm(
+    ring_dim_sqrt: &BigDecimal,
+    m_g: u64,
+    base: &BigDecimal,
+) -> BigDecimal {
+    let c_0 = BigDecimal::from_f64(1.8).unwrap();
+    let c_1 = BigDecimal::from_f64(4.7).unwrap();
+    let sigma = BigDecimal::from_f64(4.578).unwrap();
+    let two_sqrt = BigDecimal::from(2).sqrt().unwrap();
+    let m_g_sqrt = BigDecimal::from(m_g).sqrt().expect("sqrt(m_g) failed");
+    let term = ring_dim_sqrt.clone() * m_g_sqrt + two_sqrt * ring_dim_sqrt + c_1;
+    let preimage_norm = c_0 * 6 * sigma.clone() * ((base + 1) * sigma) * term;
+    let preimage_norm_bits = bigdecimal_bits_ceil(&preimage_norm);
+    log_mem(format!("preimage norm bits {}", preimage_norm_bits));
+    preimage_norm
 }
 
 #[cfg(test)]

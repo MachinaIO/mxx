@@ -533,18 +533,14 @@ pub fn add_lookup_buffer(buffer: BatchLookupBuffer) -> bool {
         }
     };
 
-    if sender.send(WriteCommand::Append(buffer)).is_ok() {
-        true
-    } else {
-        false
-    }
+    if sender.send(WriteCommand::Append(buffer)).is_ok() { true } else { false }
 }
 
 /// Batch serialize and store multiple matrices in a single file.
 /// Returns a BatchLookupBuffer containing the serialized data and metadata.
 pub fn get_lookup_buffer<M>(preimages: Vec<(usize, M)>, id_prefix: &str) -> BatchLookupBuffer
 where
-    M: PolyMatrix + Send + 'static,
+    M: PolyMatrix + Send,
 {
     let start = Instant::now();
     let mut sorted_preimages = preimages;

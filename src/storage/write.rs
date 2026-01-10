@@ -6,7 +6,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, OnceLock, mpsc},
+    sync::{Arc, Mutex, OnceLock, mpsc},
     thread,
     time::Instant,
 };
@@ -188,14 +188,6 @@ struct WriterState {
     last_error: Option<io::Error>,
 }
 
-struct PendingState {
-    pending_bytes: usize,
-    limit: Option<usize>,
-    throttled: bool,
-}
-
-type PendingHandle = Arc<(Mutex<PendingState>, Condvar)>;
-
 impl WriterState {
     fn new(dir_path: PathBuf, bytes_limit: Option<usize>) -> Self {
         Self {
@@ -247,78 +239,19 @@ pub struct MultiBatchLookupBuffer {
 
 static WRITE_SENDER: OnceLock<mpsc::Sender<WriteCommand>> = OnceLock::new();
 static METADATA: OnceLock<Arc<Mutex<GlobalTableIndex>>> = OnceLock::new();
-static PENDING_BYTES: OnceLock<PendingHandle> = OnceLock::new();
-
-fn default_pending_limit() -> Option<usize> {
-    let total_bytes = read_total_memory_bytes()?;
-    let limit = total_bytes.saturating_mul(66) / 100;
-    usize::try_from(limit).ok()
-}
-
-#[cfg(target_os = "linux")]
-fn read_total_memory_bytes() -> Option<u128> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemTotal:") {
-            let mut parts = rest.split_whitespace();
-            let value_kb = parts.next()?.parse::<u128>().ok()?;
-            return Some(value_kb.saturating_mul(1024));
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "macos")]
-fn read_total_memory_bytes() -> Option<u128> {
-    let output = std::process::Command::new("sysctl").args(["-n", "hw.memsize"]).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value = String::from_utf8(output.stdout).ok()?;
-    let value = value.trim().parse::<u128>().ok()?;
-    Some(value)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn read_total_memory_bytes() -> Option<u128> {
-    None
-}
 
 /// Initialize the storage system with an optional byte limit for batched lookup tables.
 pub fn init_storage_system(dir_path: PathBuf) {
     let bytes_limit = std::env::var("LUT_BYTES_LIMIT").ok().and_then(|s| s.parse::<usize>().ok());
-    let pending_limit = std::env::var("LUT_PENDING_BYTES_LIMIT")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .or_else(default_pending_limit);
     info!("LUT_BYTES_LIMIT={:?}", bytes_limit);
-    info!("LUT_PENDING_BYTES_LIMIT={:?}", pending_limit);
     let metadata = METADATA.get_or_init(|| Arc::new(Mutex::new(GlobalTableIndex::default())));
-    let pending = PENDING_BYTES.get_or_init(|| {
-        Arc::new((
-            Mutex::new(PendingState { pending_bytes: 0, limit: pending_limit, throttled: false }),
-            Condvar::new(),
-        ))
-    });
-
-    {
-        let (lock, cvar) = &**pending;
-        let mut state = lock.lock().unwrap();
-        state.pending_bytes = 0;
-        state.limit = pending_limit;
-        state.throttled = false;
-        cvar.notify_all();
-    }
 
     if WRITE_SENDER.get().is_none() {
         let (sender, receiver) = mpsc::channel();
         let _ = WRITE_SENDER.set(sender);
         let metadata = metadata.clone();
         let dir_for_thread = dir_path.clone();
-        let pending = pending.clone();
-        thread::spawn(move || {
-            writer_thread_loop(receiver, metadata, pending, dir_for_thread, bytes_limit);
-        });
+        thread::spawn(move || writer_thread_loop(receiver, metadata, dir_for_thread, bytes_limit));
     }
 
     if let Some(meta) = METADATA.get() {
@@ -336,7 +269,6 @@ pub fn init_storage_system(dir_path: PathBuf) {
 fn writer_thread_loop(
     receiver: mpsc::Receiver<WriteCommand>,
     metadata: Arc<Mutex<GlobalTableIndex>>,
-    pending: PendingHandle,
     dir_path: PathBuf,
     bytes_limit: Option<usize>,
 ) {
@@ -356,10 +288,10 @@ fn writer_thread_loop(
                         ));
                     }
                     for chunk in chunks {
-                        write_buffer(&mut state, chunk, &metadata, &pending);
+                        write_buffer(&mut state, chunk, &metadata);
                     }
                 } else {
-                    write_buffer(&mut state, buffer, &metadata, &pending);
+                    write_buffer(&mut state, buffer, &metadata);
                 }
             }
             WriteCommand::Flush(reply) => {
@@ -373,11 +305,6 @@ fn writer_thread_loop(
             }
             WriteCommand::Reset { dir_path, bytes_limit, reply } => {
                 state.reset(dir_path, bytes_limit);
-                let (lock, cvar) = &*pending;
-                let mut state = lock.lock().unwrap();
-                state.pending_bytes = 0;
-                state.throttled = false;
-                cvar.notify_all();
                 let _ = reply.send(());
             }
         }
@@ -388,11 +315,9 @@ fn write_buffer(
     state: &mut WriterState,
     buffer: BatchLookupBuffer,
     metadata: &Arc<Mutex<GlobalTableIndex>>,
-    pending: &PendingHandle,
 ) {
     let payload = buffer.payload();
     let payload_len = payload.len();
-    update_throttle(pending);
 
     if let Some(limit) = state.bytes_limit {
         if state.current_file_size + payload_len > limit && state.current_file_size > 0 {
@@ -402,7 +327,6 @@ fn write_buffer(
 
     if let Err(err) = state.ensure_file() {
         state.record_error(err);
-        release_pending_bytes(pending, payload_len);
         return;
     }
 
@@ -412,13 +336,11 @@ fn write_buffer(
     if let Some(file) = state.file.as_mut() {
         if let Err(err) = file.write_all(payload) {
             state.record_error(err);
-            release_pending_bytes(pending, payload_len);
             return;
         }
     }
 
     state.current_file_size += payload_len;
-    release_pending_bytes(pending, payload_len);
 
     let entry = TableIndexEntry {
         file_index,
@@ -428,50 +350,6 @@ fn write_buffer(
         indices: buffer.indices.clone(),
     };
     metadata.lock().unwrap().entries.insert(buffer.id_prefix, entry);
-}
-
-fn update_throttle(pending: &PendingHandle) {
-    let (lock, cvar) = &**pending;
-    let mut state = lock.lock().unwrap();
-    update_throttle_locked(&mut state, cvar);
-}
-
-fn update_throttle_locked(state: &mut PendingState, cvar: &Condvar) {
-    let limit = match state.limit {
-        Some(limit) if limit > 0 => limit,
-        _ => return,
-    };
-    if !state.throttled && state.pending_bytes > limit {
-        state.throttled = true;
-        cvar.notify_all();
-    } else if state.throttled && state.pending_bytes <= limit / 2 {
-        state.throttled = false;
-        cvar.notify_all();
-    }
-}
-
-fn wait_for_throttle(pending: &PendingHandle) {
-    let (lock, cvar) = &**pending;
-    let mut state = lock.lock().unwrap();
-    while state.throttled {
-        log_mem("Backpressure active; waiting for pending writes to drain");
-        state = cvar.wait(state).unwrap();
-    }
-}
-
-fn record_pending_bytes(pending: &PendingHandle, payload_len: usize) {
-    let (lock, _) = &**pending;
-    let mut state = lock.lock().unwrap();
-    state.pending_bytes = state.pending_bytes.saturating_add(payload_len);
-    log_mem(format!("Recorded {} bytes; pending={} bytes", payload_len, state.pending_bytes));
-}
-
-fn release_pending_bytes(pending: &PendingHandle, payload_len: usize) {
-    let (lock, cvar) = &**pending;
-    let mut state = lock.lock().unwrap();
-    state.pending_bytes = state.pending_bytes.saturating_sub(payload_len);
-    log_mem(format!("Released {} bytes; pending={} bytes", payload_len, state.pending_bytes));
-    update_throttle_locked(&mut state, cvar);
 }
 
 // /// Split a MultiBatchLookupBuffer into multiple buffers based on byte limit.
@@ -655,19 +533,9 @@ pub fn add_lookup_buffer(buffer: BatchLookupBuffer) -> bool {
         }
     };
 
-    let payload_len = buffer.num_matrices * buffer.bytes_per_matrix;
-    let pending = PENDING_BYTES.get();
-    if let Some(pending) = pending {
-        wait_for_throttle(pending);
-        record_pending_bytes(pending, payload_len);
-    }
-
     if sender.send(WriteCommand::Append(buffer)).is_ok() {
         true
     } else {
-        if let Some(pending) = pending {
-            release_pending_bytes(pending, payload_len);
-        }
         false
     }
 }
@@ -862,6 +730,14 @@ pub async fn wait_for_all_writes(
 
     if let Some(metadata) = METADATA.get() {
         let snapshot = { metadata.lock().unwrap().clone() };
+        let total_indices: usize = snapshot.entries.values().map(|entry| entry.indices.len()).sum();
+        let approx_bytes = total_indices.saturating_mul(std::mem::size_of::<usize>());
+        log_mem(format!(
+            "Metadata entries={}, total_indices={}, approx_indices_bytes={}",
+            snapshot.entries.len(),
+            total_indices,
+            approx_bytes
+        ));
         let index_path = dir_path.join("lookup_tables.index");
         if let Err(e) = write_global_index(&snapshot, &index_path).await {
             eprintln!("Failed to write global index: {}", e);

@@ -109,7 +109,7 @@ async fn test_arithmetic_circuit_operations_gpu_ggh15() {
     let b0_trapdoor = Arc::new(b0_trapdoor);
     let b0_matrix = Arc::new(b0_matrix);
 
-    init_storage_system();
+    init_storage_system(tmp_dir.path().to_path_buf());
     let reveal_plaintexts = vec![true; circuit.num_input()];
     let pk_sampler = BGGPublicKeySampler::<_, GpuDCRTPolyHashSampler<Keccak256>>::new(seed, d);
     let pubkeys = pk_sampler.sample(&params, b"BGG_PUBKEY", &reveal_plaintexts);

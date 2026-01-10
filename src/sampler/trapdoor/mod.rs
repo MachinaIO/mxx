@@ -38,23 +38,16 @@ pub struct DCRTTrapdoor {
 
 impl DCRTTrapdoor {
     pub fn new(params: &DCRTPolyParams, size: usize, sigma: f64) -> Self {
-        log_mem("start new DCRTTrapdoor");
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let log_base_q = params.modulus_digits();
         let dist = DistType::GaussDist { sigma };
         let r = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
-        log_mem("sample r");
         let e = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
-        log_mem("sample e");
         let a_mat = r.clone() * r.transpose(); // d x d
-        log_mem("compute a_mat");
         let e_transpose = e.transpose();
         let b_mat = r.clone() * &e_transpose; // d x d
-        log_mem("compute b_mat");
         let d_mat = e.clone() * &e_transpose; // d x d
-        log_mem("compute d_mat");
         let re = r.concat_rows(&[&e]);
-        log_mem("compute re");
         Self { r, e, a_mat, b_mat, d_mat, re }
     }
 

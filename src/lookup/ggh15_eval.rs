@@ -198,36 +198,75 @@ where
         if need_lut {
             info!("Preparing LUT for LUT id {}", lut_id);
             let start = Instant::now();
-            let k_l_preimages: Vec<(usize, M)> = plt
-                .f
-                .par_iter()
-                .map(|(_, (idx, y_elem))| {
-                    let y_poly = M::P::from_elem_to_constant(params, y_elem);
-                    let gadget_matrix = M::gadget_matrix(params, d);
-                    let r_idx = hash_sampler.sample_hash(
-                        params,
-                        self.hash_key,
-                        format!("ggh15_r_{}_idx_{}", lut_id, idx),
-                        d,
-                        m,
-                        DistType::FinRingDist,
-                    );
-                    let idx_poly = M::P::from_usize_to_constant(params, *idx);
+            let chunk_size = std::env::var("LUT_PREIMAGE_CHUNK_SIZE")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(8);
+            let mut part_idx = 0usize;
+            let mut total_matrices = 0usize;
+            let mut batch: Vec<(usize, <M::P as Poly>::Elem)> = Vec::with_capacity(chunk_size);
 
-                    let target_top = self.a_l_prime.as_ref().clone() -
-                        gadget_matrix.clone() * y_poly -
-                        self.a_x_prime.as_ref().clone() * &r_idx.decompose() +
-                        r_idx * idx_poly;
-                    let target = target_top.concat_rows(&[&M::zero(params, 2 * d, m)]);
-                    (
-                        *idx,
-                        trap_sampler.preimage(params, &self.b1_trapdoor, &self.b1_matrix, &target),
-                    )
-                })
-                .collect();
-            info!("Prepared LUT for LUT id {} in {:?}", lut_id, start.elapsed());
-            let kl_id = format!("ggh15_lut_{}", lut_id);
-            add_lookup_buffer(get_lookup_buffer(k_l_preimages, &kl_id));
+            let flush_batch = |batch: Vec<(usize, <M::P as Poly>::Elem)>, part_idx: usize| {
+                let k_l_preimages: Vec<(usize, M)> = batch
+                    .par_iter()
+                    .map(|(idx, y_elem)| {
+                        let y_poly = M::P::from_elem_to_constant(params, y_elem);
+                        let gadget_matrix = M::gadget_matrix(params, d);
+                        let r_idx = hash_sampler.sample_hash(
+                            params,
+                            self.hash_key,
+                            format!("ggh15_r_{}_idx_{}", lut_id, idx),
+                            d,
+                            m,
+                            DistType::FinRingDist,
+                        );
+                        let idx_poly = M::P::from_usize_to_constant(params, *idx);
+
+                        let target_top = self.a_l_prime.as_ref().clone() -
+                            gadget_matrix.clone() * y_poly -
+                            self.a_x_prime.as_ref().clone() * &r_idx.decompose() +
+                            r_idx * idx_poly;
+                        let target = target_top.concat_rows(&[&M::zero(params, 2 * d, m)]);
+                        (
+                            *idx,
+                            trap_sampler.preimage(
+                                params,
+                                &self.b1_trapdoor,
+                                &self.b1_matrix,
+                                &target,
+                            ),
+                        )
+                    })
+                    .collect();
+                let kl_id = if part_idx == 0 {
+                    format!("ggh15_lut_{}", lut_id)
+                } else {
+                    format!("ggh15_lut_{}_part{}", lut_id, part_idx)
+                };
+                add_lookup_buffer(get_lookup_buffer(k_l_preimages, &kl_id));
+            };
+
+            for (_, (idx, y_elem)) in plt.f.iter() {
+                batch.push((*idx, y_elem.clone()));
+                if batch.len() >= chunk_size {
+                    let current = std::mem::replace(&mut batch, Vec::with_capacity(chunk_size));
+                    total_matrices += current.len();
+                    flush_batch(current, part_idx);
+                    part_idx += 1;
+                }
+            }
+            if !batch.is_empty() {
+                total_matrices += batch.len();
+                flush_batch(batch, part_idx);
+                part_idx += 1;
+            }
+            info!(
+                "Prepared LUT for LUT id {} in {:?} ({} matrices, {} parts)",
+                lut_id,
+                start.elapsed(),
+                total_matrices,
+                part_idx
+            );
         }
 
         let target_dec_top = -self.a_out_prime.as_ref().clone();

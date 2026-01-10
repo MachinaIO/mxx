@@ -66,13 +66,16 @@ where
     let mut matrix_data = vec![0u8; entry.bytes_per_matrix];
     file.read_exact(&mut matrix_data).ok()?;
     let matrix = M::from_compact_bytes(params, &matrix_data);
-    info!("{}", format!(
-        "Loaded matrix {} from batch file {} (table: {}) in {:?}",
-        target_k,
-        filename,
-        id_prefix,
-        start.elapsed()
-    ));
+    info!(
+        "{}",
+        format!(
+            "Loaded matrix {} from batch file {} (table: {}) in {:?}",
+            target_k,
+            filename,
+            id_prefix,
+            start.elapsed()
+        )
+    );
     Some(matrix)
 }
 

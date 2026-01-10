@@ -509,10 +509,13 @@ unsafe impl Sync for GpuContext {}
 
 impl GpuContext {
     fn create(log_n: u32, moduli: &[u64], gpu_ids: &[i32], dnum: u32, batch: u32) -> Self {
-        info!("{}", format!(
-            "Creating GPU context with log_n={}, moduli={:?}, gpu_ids={:?}, dnum={}, batch={}",
-            log_n, moduli, gpu_ids, dnum, batch
-        ));
+        info!(
+            "{}",
+            format!(
+                "Creating GPU context with log_n={}, moduli={:?}, gpu_ids={:?}, dnum={}, batch={}",
+                log_n, moduli, gpu_ids, dnum, batch
+            )
+        );
         let l = moduli.len().saturating_sub(1) as u32;
         let mut ctx_ptr: *mut GpuContextOpaque = ptr::null_mut();
         let (gpu_ids_ptr, gpu_ids_len) = if gpu_ids.is_empty() {

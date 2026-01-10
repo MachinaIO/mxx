@@ -212,12 +212,15 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         let overall_start = Instant::now();
         let d = public_matrix.row_size();
         let target_cols = target.col_size();
-        info!("{}", format!(
-            "preimage start d={}, target_cols={}, n={}",
-            d,
-            target_cols,
-            params.ring_dimension()
-        ));
+        info!(
+            "{}",
+            format!(
+                "preimage start d={}, target_cols={}, n={}",
+                d,
+                target_cols,
+                params.ring_dimension()
+            )
+        );
         assert_eq!(
             target.row_size(),
             d,

@@ -281,11 +281,14 @@ fn writer_thread_loop(
                     let id_prefix = buffer.id_prefix.clone();
                     let chunks = buffer.split_by_payload_limit(limit);
                     if chunks.len() > 1 {
-                        info!("{}", format!(
-                            "Split oversized lookup buffer {} into {} parts",
-                            id_prefix,
-                            chunks.len()
-                        ));
+                        info!(
+                            "{}",
+                            format!(
+                                "Split oversized lookup buffer {} into {} parts",
+                                id_prefix,
+                                chunks.len()
+                            )
+                        );
                     }
                     for chunk in chunks {
                         write_buffer(&mut state, chunk, &metadata);
@@ -511,12 +514,15 @@ impl MultiBatchLookupBuffer {
         let data = self.to_bytes();
         let path = dir.join(&filename);
         tokio::fs::write(&path, &data).await?;
-        info!("{}", format!(
-            "Multi-batch lookup table written to {} ({} bytes, {} tables)",
-            filename,
-            data.len(),
-            self.lookup_tables.len()
-        ));
+        info!(
+            "{}",
+            format!(
+                "Multi-batch lookup table written to {} ({} bytes, {} tables)",
+                filename,
+                data.len(),
+                self.lookup_tables.len()
+            )
+        );
         Ok(())
     }
 }
@@ -591,10 +597,13 @@ where
         encoded[offset..offset + matrix_bytes.len()].copy_from_slice(&matrix_bytes);
     }
     let elapsed = start.elapsed();
-    info!("{}", format!(
-        "Serialized {} matrices for {} ({} bytes, {} bytes per matrix) in {elapsed:?}",
-        num_matrices, id_prefix, total_size, max_bytes_per_matrix
-    ));
+    info!(
+        "{}",
+        format!(
+            "Serialized {} matrices for {} ({} bytes, {} bytes per matrix) in {elapsed:?}",
+            num_matrices, id_prefix, total_size, max_bytes_per_matrix
+        )
+    );
 
     // Return the buffer with metadata.
     BatchLookupBuffer {
@@ -728,12 +737,15 @@ pub async fn wait_for_all_writes(
         let snapshot = { metadata.lock().unwrap().clone() };
         let total_indices: usize = snapshot.entries.values().map(|entry| entry.indices.len()).sum();
         let approx_bytes = total_indices.saturating_mul(std::mem::size_of::<usize>());
-        info!("{}", format!(
-            "Metadata entries={}, total_indices={}, approx_indices_bytes={}",
-            snapshot.entries.len(),
-            total_indices,
-            approx_bytes
-        ));
+        info!(
+            "{}",
+            format!(
+                "Metadata entries={}, total_indices={}, approx_indices_bytes={}",
+                snapshot.entries.len(),
+                total_indices,
+                approx_bytes
+            )
+        );
         let index_path = dir_path.join("lookup_tables.index");
         if let Err(e) = write_global_index(&snapshot, &index_path).await {
             eprintln!("Failed to write global index: {}", e);

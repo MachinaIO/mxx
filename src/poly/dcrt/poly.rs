@@ -1,16 +1,18 @@
 use super::params::DCRTPolyParams;
 use crate::{
     element::{PolyElem, finite_ring::FinRingElem},
-    impl_binop_with_refs, parallel_iter,
+    impl_binop_with_refs,
+    openfhe_guard::ensure_openfhe_warmup,
+    parallel_iter,
     poly::{Poly, PolyParams},
     utils::chunk_size_for,
 };
 use num_bigint::BigUint;
-use num_traits::Zero;
+use num_traits::{One, Zero};
 use openfhe::{
     cxx::UniquePtr,
     ffi::{self, DCRTPoly as DCRTPolyCxx},
-    parse_coefficients_bytes,
+    pack_dcrtpoly_u64_limbs_le, parse_coefficients_bytes,
 };
 use rayon::prelude::*;
 use std::{
@@ -20,9 +22,18 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DCRTPoly {
-    ptr_poly: Arc<UniquePtr<DCRTPolyCxx>>,
+    ptr_poly: UniquePtr<DCRTPolyCxx>,
+}
+
+impl Clone for DCRTPoly {
+    fn clone(&self) -> Self {
+        if self.ptr_poly.is_null() {
+            return Self { ptr_poly: UniquePtr::null() };
+        }
+        Self::new(self.ptr_poly.Clone())
+    }
 }
 
 /// # Safety DCRTPoly is plain old data and is shared across threads in C++ OpenFHE as well.
@@ -31,7 +42,7 @@ unsafe impl Sync for DCRTPoly {}
 
 impl DCRTPoly {
     pub fn new(ptr_poly: UniquePtr<DCRTPolyCxx>) -> Self {
-        Self { ptr_poly: ptr_poly.into() }
+        Self { ptr_poly }
     }
 
     fn from_slice_with_map<T, F>(params: &DCRTPolyParams, slice: &[T], map_fn: F) -> Self
@@ -48,6 +59,21 @@ impl DCRTPoly {
         &self.ptr_poly
     }
 
+    #[inline]
+    pub(crate) fn coeffs_bytes(&self) -> Vec<u8> {
+        self.ptr_poly.GetCoefficientsBytes()
+    }
+
+    #[inline]
+    pub(crate) fn eval_bytes(&self) -> Vec<u8> {
+        self.ptr_poly.GetEvaluationBytes()
+    }
+
+    #[inline]
+    pub fn eval_slots(&self) -> Vec<BigUint> {
+        parse_coefficients_bytes(&self.eval_bytes()).coefficients
+    }
+
     pub fn modulus_switch(
         &self,
         params: &DCRTPolyParams,
@@ -62,26 +88,37 @@ impl DCRTPoly {
         DCRTPoly::from_coeffs(params, &new_coeffs)
     }
 
-    fn poly_gen_from_vec(params: &DCRTPolyParams, values: Vec<String>) -> Self {
+    fn poly_gen_from_vec(params: &DCRTPolyParams, values: &[Vec<u64>]) -> Self {
+        ensure_openfhe_warmup(params);
+        let limbs_per_int = values.iter().map(|vs| vs.len()).max().unwrap_or(0);
+        let values_refs = values.iter().map(|vs| vs.as_slice()).collect::<Vec<_>>();
+        let values_limbs = pack_dcrtpoly_u64_limbs_le(&values_refs, limbs_per_int);
         DCRTPoly::new(ffi::DCRTPolyGenFromVec(
             params.ring_dimension(),
             params.crt_depth(),
             params.crt_bits(),
-            &values,
+            values_limbs.as_slice(),
+            limbs_per_int,
         ))
     }
 
-    fn poly_gen_from_vec_eval(params: &DCRTPolyParams, values: Vec<String>) -> Self {
+    fn poly_gen_from_vec_eval(params: &DCRTPolyParams, values: &[Vec<u64>]) -> Self {
+        ensure_openfhe_warmup(params);
+        let limbs_per_int = values.iter().map(|vs| vs.len()).max().unwrap_or(0);
+        let values_refs = values.iter().map(|vs| vs.as_slice()).collect::<Vec<_>>();
+        let values_limbs = pack_dcrtpoly_u64_limbs_le(&values_refs, limbs_per_int);
         DCRTPoly::new(ffi::DCRTPolyGenFromEvalVec(
             params.ring_dimension(),
             params.crt_depth(),
             params.crt_bits(),
-            &values,
+            values_limbs.as_slice(),
+            limbs_per_int,
         ))
     }
 
     #[inline]
-    fn poly_gen_from_const(params: &DCRTPolyParams, value: String) -> Self {
+    fn poly_gen_from_const(params: &DCRTPolyParams, value: &[u64]) -> Self {
+        ensure_openfhe_warmup(params);
         DCRTPoly::new(ffi::DCRTPolyGenFromConst(
             params.ring_dimension(),
             params.crt_depth(),
@@ -97,7 +134,7 @@ impl Poly for DCRTPoly {
 
     #[inline]
     fn coeffs(&self) -> Vec<Self::Elem> {
-        let poly_encoding = self.ptr_poly.GetCoefficientsBytes();
+        let poly_encoding = self.coeffs_bytes();
         let parsed_values = parse_coefficients_bytes(&poly_encoding);
         let coeffs = parsed_values.coefficients;
         let modulus = parsed_values.modulus;
@@ -110,17 +147,20 @@ impl Poly for DCRTPoly {
             .par_iter()
             .map(|coeff| {
                 debug_assert_eq!(coeff.modulus(), &params.modulus());
-                coeff.value().to_string()
+                coeff.value().to_u64_digits()
             })
-            .collect::<Vec<String>>();
+            .collect::<Vec<Vec<u64>>>();
 
-        Self::poly_gen_from_vec(params, new_coeffs)
+        Self::poly_gen_from_vec(params, &new_coeffs)
     }
 
     fn from_u32s(params: &Self::Params, coeffs: &[u32]) -> Self {
-        Self::from_slice_with_map(params, coeffs, |&digit| {
-            <Self::Elem as PolyElem>::constant(&params.modulus(), digit as u64)
-        })
+        let coeffs = coeffs.into_iter().map(|v| vec![*v as u64]).collect::<Vec<_>>();
+        Self::poly_gen_from_vec(params, &coeffs)
+    }
+
+    fn from_u64_vecs(params: &Self::Params, coeffs: &[Vec<u64>]) -> Self {
+        Self::poly_gen_from_vec(params, &coeffs)
     }
 
     fn from_biguints(params: &Self::Params, coeffs: &[BigUint]) -> Self {
@@ -136,8 +176,8 @@ impl Poly for DCRTPoly {
     }
 
     fn from_biguints_eval(params: &Self::Params, slots: &[BigUint]) -> Self {
-        let values: Vec<String> = slots.iter().map(|slot| slot.to_string()).collect();
-        Self::poly_gen_from_vec_eval(params, values)
+        let values: Vec<Vec<u64>> = slots.iter().map(|slot| slot.to_u64_digits()).collect();
+        Self::poly_gen_from_vec_eval(params, &values)
     }
 
     fn from_decomposed(params: &DCRTPolyParams, decomposed: &[Self]) -> Self {
@@ -152,19 +192,19 @@ impl Poly for DCRTPoly {
 
     #[inline]
     fn const_zero(params: &Self::Params) -> Self {
-        Self::poly_gen_from_const(params, BigUint::ZERO.to_string())
+        Self::poly_gen_from_const(params, &BigUint::ZERO.to_u64_digits())
     }
 
     #[inline]
     fn const_one(params: &Self::Params) -> Self {
-        Self::poly_gen_from_const(params, "1".to_owned())
+        Self::poly_gen_from_const(params, &BigUint::one().to_u64_digits())
     }
 
     #[inline]
     fn const_minus_one(params: &Self::Params) -> Self {
         Self::poly_gen_from_const(
             params,
-            (params.modulus().as_ref() - BigUint::from(1u32)).to_string(),
+            &(params.modulus().as_ref() - BigUint::from(1u32)).to_u64_digits(),
         )
     }
 
@@ -177,26 +217,26 @@ impl Poly for DCRTPoly {
     /// from `PolyElem` to `DCRTPoly` type and generate constant polynomial.
     #[inline]
     fn from_elem_to_constant(params: &Self::Params, elem: &Self::Elem) -> Self {
-        Self::poly_gen_from_const(params, elem.value().to_string())
+        Self::poly_gen_from_const(params, &elem.value().to_u64_digits())
     }
 
     /// from `BigUint` to `DCRTPoly` type and generate constant polynomial.
     #[inline]
     fn from_biguint_to_constant(params: &Self::Params, int: BigUint) -> Self {
-        Self::poly_gen_from_const(params, int.to_string())
+        Self::poly_gen_from_const(params, &int.to_u64_digits())
     }
 
     /// from `usize` to `DCRTPoly` type and generate constant polynomial.
     #[inline]
     fn from_usize_to_constant(params: &Self::Params, int: usize) -> Self {
-        Self::poly_gen_from_const(params, int.to_string())
+        Self::poly_gen_from_const(params, &[int as u64])
     }
 
     /// from k which is power of base to `DCRTPoly` type and generate constant polynomial.
     #[inline]
     fn from_power_of_base_to_constant(params: &Self::Params, k: usize) -> Self {
         let base = 1u32 << params.base_bits();
-        Self::poly_gen_from_const(params, BigUint::from(base).pow(k as u32).to_string())
+        Self::poly_gen_from_const(params, &BigUint::from(base).pow(k as u32).to_u64_digits())
     }
 
     /// Encode `int` in little-endian bit order
@@ -247,22 +287,16 @@ impl Poly for DCRTPoly {
                     .par_iter()
                     .map(|coeff| {
                         if shift_amount >= log_q {
-                            BigUint::from(0u32) // Handle the case where shift exceeds modulus bits
+                            vec![0u64] // Handle the case where shift exceeds modulus bits
                         } else {
-                            (coeff.value() >> shift_amount) & &base_mask
+                            let masked = (coeff.value() >> shift_amount) & &base_mask;
+                            if masked.is_zero() { vec![0u64] } else { masked.to_u64_digits() }
                         }
                     })
                     .collect::<Vec<_>>();
 
                 // Create a polynomial from these digit values
-
-                DCRTPoly::from_coeffs(
-                    params,
-                    &digit_values
-                        .par_iter()
-                        .map(|value| FinRingElem::new(value.clone(), params.modulus()))
-                        .collect::<Vec<_>>(),
-                )
+                DCRTPoly::from_u64_vecs(params, &digit_values)
             })
             .collect()
     }
@@ -586,6 +620,8 @@ fn process_single_coeff_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use crate::{
         poly::PolyParams,
         sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
@@ -593,6 +629,7 @@ mod tests {
     use rand::prelude::*;
 
     #[test]
+    #[sequential_test::sequential]
     fn test_const_int_roundtrip() {
         let mut rng = rand::rng();
         let params = DCRTPolyParams::default();
@@ -609,6 +646,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_dcrtpoly_coeffs() {
         let mut rng = rand::rng();
         /*
@@ -631,6 +669,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_dcrtpoly_arithmetic() {
         let params = DCRTPolyParams::default();
         let q = params.modulus();
@@ -700,6 +739,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_dcrtpoly_decompose() {
         let params = DCRTPolyParams::default();
         let sampler = DCRTPolyUniformSampler::new();
@@ -709,6 +749,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_dcrtpoly_to_compact_bytes_bit_dist() {
         let params = DCRTPolyParams::default();
         let sampler = DCRTPolyUniformSampler::new();
@@ -756,6 +797,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_dcrtpoly_to_compact_bytes_uniform_dist() {
         let params = DCRTPolyParams::default();
         let sampler = DCRTPolyUniformSampler::new();
@@ -799,6 +841,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_dcrtpoly_from_compact_bytes() {
         let params = DCRTPolyParams::default();
         let sampler = DCRTPolyUniformSampler::new();

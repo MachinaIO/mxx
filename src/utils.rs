@@ -12,9 +12,10 @@ use crate::{
         DistType, PolyUniformSampler, hash::DCRTPolyHashSampler, uniform::DCRTPolyUniformSampler,
     },
 };
+use bigdecimal::BigDecimal;
 use keccak_asm::Keccak256;
-use memory_stats::memory_stats;
-use num_bigint::BigUint;
+// use memory_stats::memory_stats;
+use num_bigint::{BigInt, BigUint};
 use num_traits::Zero;
 use rand::Rng;
 use std::{
@@ -22,7 +23,7 @@ use std::{
     future::Future,
     time::{Duration, Instant},
 };
-use tracing::{debug, info};
+use tracing::info;
 
 /// ideal thread chunk size for parallel
 pub fn chunk_size_for(original: usize) -> usize {
@@ -83,31 +84,35 @@ macro_rules! impl_binop_with_refs {
     };
 }
 
-pub fn debug_mem<T: Into<String>>(tag: T) {
-    if let Some(usage) = memory_stats() {
-        debug!(
-            "{} || Current physical/virtual memory usage: {} | {}",
-            tag.into(),
-            usage.physical_mem,
-            usage.virtual_mem
-        );
-    } else {
-        debug!("Couldn't get the current memory usage :(");
-    }
-}
+// #[cfg(feature = "gpu")]
+// fn gpu_mem_log_suffix() -> Option<String> {
+//     match crate::poly::dcrt::gpu::gpu_memory_infos() {
+//         Ok(infos) => {
+//             if infos.is_empty() {
+//                 return Some("GPU memory: no devices".to_string());
+//             }
+//             let entries = infos
+//                 .into_iter()
+//                 .map(|info| {
+//                     let used = info.total.saturating_sub(info.free);
+//                     let percent = if info.total == 0 {
+//                         0u128
+//                     } else {
+//                         (used as u128).saturating_mul(100) / info.total as u128
+//                     };
+//                     format!("gpu{} {}/{} ({}%)", info.device, used, info.total, percent)
+//                 })
+//                 .collect::<Vec<_>>();
+//             Some(format!("GPU memory: {}", entries.join(", ")))
+//         }
+//         Err(err) => Some(format!("GPU memory: unavailable ({err})")),
+//     }
+// }
 
-pub fn log_mem<T: Into<String>>(tag: T) {
-    if let Some(usage) = memory_stats() {
-        info!(
-            "{} || Current physical/virtual memory usage: {} | {}",
-            tag.into(),
-            usage.physical_mem,
-            usage.virtual_mem,
-        );
-    } else {
-        info!("Couldn't get the current memory usage :(");
-    }
-}
+// #[cfg(not(feature = "gpu"))]
+// fn gpu_mem_log_suffix() -> Option<String> {
+//     None
+// }
 
 // Helper function to create a random polynomial using UniformSampler
 pub fn create_random_poly(params: &DCRTPolyParams) -> DCRTPoly {
@@ -148,7 +153,7 @@ pub fn random_bgg_encodings(
     let plaintexts = vec![create_random_poly(params); input_size];
 
     // Create random public keys
-    let reveal_plaintexts = vec![true; input_size + 1];
+    let reveal_plaintexts = vec![true; input_size];
     let bgg_encoding_sampler =
         BGGEncodingSampler::<DCRTPolyUniformSampler>::new(params, &secrets, None);
     let pubkeys = bgg_pubkey_sampler.sample(params, &tag_bytes, &reveal_plaintexts);
@@ -160,7 +165,7 @@ pub fn timed_read<T, F: FnOnce() -> T>(label: &str, f: F, total: &mut Duration) 
     let res = f();
     let elapsed = start.elapsed();
     *total += elapsed;
-    crate::utils::log_mem(format!("{label} loaded in {elapsed:?}"));
+    info!("{label} loaded in {elapsed:?}");
     res
 }
 
@@ -174,7 +179,7 @@ where
     let res = f().await;
     let elapsed = start.elapsed();
     *total += elapsed;
-    crate::utils::log_mem(format!("{label} loaded in {elapsed:?}"));
+    info!("{label} loaded in {elapsed:?}");
     res
 }
 
@@ -213,12 +218,8 @@ pub fn mod_inverse(a: u64, m: u64) -> Option<u64> {
     Some(result as u64)
 }
 
-pub fn gen_biguint_for_modulus<R: Rng>(
-    rng: &mut R,
-    limb_bit_size: usize,
-    modulus: &BigUint,
-) -> BigUint {
-    if limb_bit_size == 0 || modulus.is_zero() {
+pub fn gen_biguint_for_modulus<R: Rng>(rng: &mut R, modulus: &BigUint) -> BigUint {
+    if modulus.is_zero() {
         return BigUint::ZERO;
     }
     let max_bits = modulus.bits() as usize;
@@ -229,4 +230,27 @@ pub fn gen_biguint_for_modulus<R: Rng>(
     let mut bytes = vec![0u8; max_bytes];
     rng.fill_bytes(&mut bytes);
     BigUint::from_bytes_be(&bytes) % modulus
+}
+
+pub fn round_div(a: u64, b: u64) -> u64 {
+    assert!(b != 0, "divisor must be non-zero");
+    let a128 = a as u128;
+    let b128 = b as u128;
+    let half = b128 / 2;
+    let rounded = (a128 + half) / b128;
+    rounded as u64
+}
+
+pub fn bigdecimal_bits_ceil(x: &BigDecimal) -> u64 {
+    let (coeff, exp) = x.as_bigint_and_exponent();
+    let exp_abs_u32: u32 =
+        exp.unsigned_abs().try_into().expect("BigDecimal exponent must fit in u32");
+    let pow10 = BigInt::from(10u8).pow(exp_abs_u32);
+    let ceil_int = if exp >= 0 {
+        let numer = coeff + (&pow10 - BigInt::from(1u8));
+        numer / &pow10
+    } else {
+        coeff * &pow10
+    };
+    ceil_int.to_biguint().expect("norm should be non-negative").bits()
 }

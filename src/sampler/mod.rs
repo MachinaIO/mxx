@@ -1,5 +1,9 @@
 use crate::{matrix::PolyMatrix, poly::Poly};
 
+#[cfg(feature = "gpu")]
+pub mod gpu_hash;
+#[cfg(feature = "gpu")]
+pub mod gpu_uniform;
 pub mod hash;
 pub mod trapdoor;
 pub mod uniform;

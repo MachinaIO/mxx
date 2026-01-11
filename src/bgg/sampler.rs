@@ -4,10 +4,10 @@ use crate::{
     parallel_iter,
     poly::{Poly, PolyParams},
     sampler::{DistType, PolyHashSampler, PolyUniformSampler},
-    utils::debug_mem,
 };
 use rayon::prelude::*;
 use std::marker::PhantomData;
+use tracing::debug;
 
 /// A sampler of a public key A in the BGG+ RLWE encoding scheme
 #[derive(Clone)]
@@ -48,16 +48,16 @@ where
         let sampler = S::new();
         let log_base_q = params.modulus_digits();
         let columns = self.d * log_base_q;
-        let packed_input_size = reveal_plaintexts.len();
+        let input_size = reveal_plaintexts.len() + 1; // +1 for the constant 1 polynomial
         let all_matrix = sampler.sample_hash(
             params,
             self.hash_key,
             tag,
             self.d,
-            columns * packed_input_size,
+            columns * input_size,
             DistType::FinRingDist,
         );
-        parallel_iter!(0..packed_input_size)
+        parallel_iter!(0..input_size)
             .map(|idx| {
                 let reveal_plaintext = if idx == 0 { true } else { reveal_plaintexts[idx - 1] };
                 BggPublicKey::new(
@@ -141,7 +141,7 @@ where
             .enumerate()
             .map(|(idx, plaintext)| {
                 let vector = all_vector.slice_columns(m * idx, m * (idx + 1));
-                debug_mem("before constructing BggEncoding");
+                debug!("before constructing BggEncoding");
                 BggEncoding {
                     vector,
                     pubkey: public_keys[idx].clone(),

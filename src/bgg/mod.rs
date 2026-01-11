@@ -6,6 +6,8 @@ pub mod sampler;
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use crate::{
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
@@ -19,6 +21,7 @@ mod tests {
     use keccak_asm::Keccak256;
 
     #[test]
+    #[sequential_test::sequential]
     fn test_bgg_pub_key_addition() {
         let key: [u8; 32] = rand::random();
         let tag: u64 = rand::random();
@@ -27,7 +30,7 @@ mod tests {
         let packed_input_size = 2;
         let d = 3;
         let bgg_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
-        let reveal_plaintexts = vec![true; packed_input_size + 1];
+        let reveal_plaintexts = vec![true; packed_input_size];
         let sampled_pub_keys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
         let log_base_q = params.modulus_digits();
         let columns = d * log_base_q;
@@ -45,6 +48,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_bgg_pub_key_multiplication() {
         let key: [u8; 32] = rand::random();
         let tag: u64 = rand::random();
@@ -53,7 +57,7 @@ mod tests {
         let packed_input_size = 2;
         let d = 3;
         let bgg_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
-        let reveal_plaintexts = vec![true; packed_input_size + 1];
+        let reveal_plaintexts = vec![true; packed_input_size];
         let sampled_pub_keys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
         let log_base_q = params.modulus_digits();
         let columns = d * log_base_q;
@@ -71,6 +75,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_bgg_encoding_sampling() {
         let input_size = 10_usize;
         let key: [u8; 32] = rand::random();
@@ -80,7 +85,7 @@ mod tests {
         let packed_input_size = input_size.div_ceil(params.ring_dimension().try_into().unwrap());
         let d = 3;
         let bgg_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
-        let reveal_plaintexts = vec![true; packed_input_size + 1];
+        let reveal_plaintexts = vec![true; packed_input_size];
         let sampled_pub_keys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
         let secrets = vec![create_ternary_random_poly(&params); d];
         let plaintexts = vec![DCRTPoly::const_one(&params); packed_input_size];
@@ -104,6 +109,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_bgg_encoding_addition() {
         let key: [u8; 32] = rand::random();
         let tag: u64 = rand::random();
@@ -112,7 +118,7 @@ mod tests {
         let packed_input_size = 2;
         let d = 3;
         let bgg_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
-        let reveal_plaintexts = vec![true; packed_input_size + 1];
+        let reveal_plaintexts = vec![true; packed_input_size];
         let sampled_pub_keys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
         let secrets = vec![create_ternary_random_poly(&params); d];
         let plaintexts = vec![create_random_poly(&params); packed_input_size];
@@ -143,6 +149,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_bgg_encoding_multiplication() {
         let key: [u8; 32] = rand::random();
         let tag: u64 = rand::random();
@@ -151,7 +158,7 @@ mod tests {
         let packed_input_size = 2;
         let d = 3;
         let bgg_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
-        let reveal_plaintexts = vec![true; packed_input_size + 1];
+        let reveal_plaintexts = vec![true; packed_input_size];
         let sampled_pub_keys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
         let secrets = vec![create_ternary_random_poly(&params); d];
         let plaintexts = vec![create_random_poly(&params); packed_input_size];

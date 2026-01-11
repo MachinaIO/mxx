@@ -8,6 +8,8 @@ use std::{
 pub mod base;
 pub(crate) mod cpp_matrix;
 pub mod dcrt_poly;
+#[cfg(feature = "gpu")]
+pub mod gpu_dcrt_poly;
 pub mod i64;
 
 pub trait MatrixParams: Debug + Clone + PartialEq + Eq + Send + Sync {

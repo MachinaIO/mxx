@@ -5,7 +5,7 @@ use std::{path::Path, process::Command, result::Result};
 /// This mirrors the JSON spec expected by the Python CLI.
 #[derive(Debug, Clone)]
 pub enum Distribution {
-    DiscreteGaussian { stddev: f64, mean: Option<f64>, n: Option<u64> },
+    DiscreteGaussian { stddev: String, mean: Option<f64>, n: Option<u64> },
     DiscreteGaussianAlpha { alpha: f64, mean: Option<f64>, n: Option<u64> }, /* 'q' is taken
                                                                               * from top-level
                                                                               * <q> */
@@ -189,6 +189,8 @@ pub fn run_lattice_estimator_cli(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use num_bigint::BigUint;
     use std::{fs, os::unix::fs::PermissionsExt};
     use tempfile::TempDir;
@@ -214,6 +216,7 @@ exit {}
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_run_lattice_estimator_cli_success() {
         let temp_dir = TempDir::new().expect("create temp dir");
         let mock_path = create_mock_cli(&temp_dir, "128", 0);
@@ -232,6 +235,7 @@ exit {}
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_run_lattice_estimator_cli_with_logs() {
         let temp_dir = TempDir::new().expect("create temp dir");
         // Simulate CLI output with logs before the actual result.
@@ -243,8 +247,10 @@ exit {}
 
         let ring_dim = BigUint::from(4096u32);
         let q = BigUint::from(8192u32);
-        let s_dist = Distribution::DiscreteGaussian { stddev: 3.2, mean: None, n: None };
-        let e_dist = Distribution::DiscreteGaussian { stddev: 3.2, mean: None, n: None };
+        let s_dist =
+            Distribution::DiscreteGaussian { stddev: 3.2.to_string(), mean: None, n: None };
+        let e_dist =
+            Distribution::DiscreteGaussian { stddev: 3.2.to_string(), mean: None, n: None };
 
         let result = run_lattice_estimator_cli_with_path(
             mock_path, &ring_dim, &q, &s_dist, &e_dist, None, false,
@@ -255,6 +261,7 @@ exit {}
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_run_lattice_estimator_cli_with_exact_and_m() {
         let temp_dir = TempDir::new().expect("create temp dir");
         let mock_path = create_mock_cli(&temp_dir, "512", 0);
@@ -280,6 +287,7 @@ exit {}
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_run_lattice_estimator_cli_non_zero_exit() {
         let temp_dir = TempDir::new().expect("create temp dir");
         let mock_path = create_mock_cli(&temp_dir, "Error: Invalid parameters", 1);
@@ -304,6 +312,7 @@ exit {}
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_run_lattice_estimator_cli_parse_error() {
         let temp_dir = TempDir::new().expect("create temp dir");
         let mock_path = create_mock_cli(&temp_dir, "not_a_number", 0);
@@ -322,6 +331,7 @@ exit {}
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_run_lattice_estimator_cli_empty_output() {
         let temp_dir = TempDir::new().expect("create temp dir");
         let mock_path = create_mock_cli(&temp_dir, "", 0);
@@ -340,6 +350,7 @@ exit {}
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_run_lattice_estimator_cli_whitespace_output() {
         let temp_dir = TempDir::new().expect("create temp dir");
         let mock_path = create_mock_cli(&temp_dir, "  \n  192  \n  ", 0);
@@ -358,12 +369,17 @@ exit {}
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_distribution_to_json_string() {
         // Test various distribution types serialize correctly.
-        let dist = Distribution::DiscreteGaussian { stddev: 3.19, mean: Some(0.0), n: Some(256) };
+        let dist = Distribution::DiscreteGaussian {
+            stddev: 3.19.to_string(),
+            mean: Some(0.0),
+            n: Some(256),
+        };
         let json = dist.to_json_string();
         assert!(json.contains(r#""name":"DiscreteGaussian""#));
-        assert!(json.contains(r#""stddev":3.19"#));
+        assert!(json.contains(r#""stddev":"3.19""#));
         assert!(json.contains(r#""mean":0.0"#));
         assert!(json.contains(r#""n":256"#));
 
@@ -385,12 +401,14 @@ exit {}
 
     // Integration test with actual CLI (requires lattice-estimator-cli in PATH).
     #[test]
+    #[sequential_test::sequential]
     #[ignore] // Use `cargo test -- --ignored` to run this test.
     fn test_integration_with_actual_cli() {
         let ring_dim = BigUint::from(1024u32);
         let q = BigUint::from(12289u32);
         let s_dist = Distribution::Binary;
-        let e_dist = Distribution::DiscreteGaussian { stddev: 3.2, mean: None, n: None };
+        let e_dist =
+            Distribution::DiscreteGaussian { stddev: 3.2.to_string(), mean: None, n: None };
         let m = BigUint::from(100000u32);
 
         // Test with exact mode.
@@ -424,6 +442,7 @@ exit {}
 
     // Test with custom path to CLI.
     #[test]
+    #[sequential_test::sequential]
     #[ignore] // Use `cargo test -- --ignored` to run this test.
     fn test_integration_with_custom_cli_path() {
         let cli_path =

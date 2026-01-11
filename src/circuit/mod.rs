@@ -19,8 +19,8 @@ use crate::{
     circuit::gate::GateId,
     lookup::{PltEvaluator, PublicLut},
     poly::Poly,
-    utils::debug_mem,
 };
+use tracing::{debug, info};
 #[derive(Debug, Clone, Default)]
 pub struct PolyCircuit<P: Poly> {
     gates: BTreeMap<GateId, PolyGate>,
@@ -97,7 +97,8 @@ impl<P: Poly> PolyCircuit<P> {
     ///
     /// Definition:
     /// - Inputs and the reserved constant-one gate contribute 0 to depth.
-    /// - An Add gate does not increase depth: level(add) = max(level(inputs)).
+    /// - Add, Sub, SmallScalarMul, Rotate gates do not increase depth: level(add) =
+    ///   max(level(inputs)).
     /// - Any other non-input gate increases depth by 1: level(g) = max(level(inputs)) + 1.
     /// - If there are no outputs, returns 0.
     pub fn non_free_depth(&self) -> usize {
@@ -125,7 +126,10 @@ impl<P: Poly> PolyCircuit<P> {
                 .expect("non-input gate must have inputs");
 
             let incr = match gate.gate_type {
-                PolyGateType::Add => 0,
+                PolyGateType::Add |
+                PolyGateType::Sub |
+                PolyGateType::SmallScalarMul { scalar: _ } |
+                PolyGateType::Rotate { shift: _ } => 0,
                 _ => 1,
             };
             level_map.insert(*gate_id, max_in + incr);
@@ -163,7 +167,6 @@ impl<P: Poly> PolyCircuit<P> {
     pub fn output(&mut self, outputs: Vec<GateId>) {
         #[cfg(debug_assertions)]
         assert_eq!(self.output_ids.len(), 0);
-
         for gate_id in outputs.into_iter() {
             self.output_ids.push(gate_id);
         }
@@ -263,12 +266,19 @@ impl<P: Poly> PolyCircuit<P> {
         self.new_gate_generic(vec![input], PolyGateType::LargeScalarMul { scalar: scalar.to_vec() })
     }
 
+    pub fn poly_scalar_mul(&mut self, input: GateId, scalar: &P) -> GateId {
+        self.new_gate_generic(
+            vec![input],
+            PolyGateType::LargeScalarMul { scalar: scalar.coeffs_biguints() },
+        )
+    }
+
     pub fn rotate_gate(&mut self, input: GateId, shift: i32) -> GateId {
         self.new_gate_generic(vec![input], PolyGateType::Rotate { shift })
     }
 
-    pub fn public_lookup_gate(&mut self, input: GateId, lookup_id: usize) -> GateId {
-        self.new_gate_generic(vec![input], PolyGateType::PubLut { lookup_id })
+    pub fn public_lookup_gate(&mut self, input: GateId, lut_id: usize) -> GateId {
+        self.new_gate_generic(vec![input], PolyGateType::PubLut { lut_id })
     }
 
     fn new_gate_generic(&mut self, inputs: Vec<GateId>, gate_type: PolyGateType) -> GateId {
@@ -388,8 +398,8 @@ impl<P: Poly> PolyCircuit<P> {
 
         let wires = DashMap::new();
         let levels = self.compute_levels();
-        debug_mem(format!("Levels: {levels:?}"));
-        debug_mem("Levels are computed");
+        debug!("{}", format!("Levels: {levels:?}"));
+        debug!("Levels are computed");
 
         wires.insert(GateId(0), one.clone());
         // Collect all input gate IDs excluding the reserved constant-one gate (0)
@@ -410,54 +420,54 @@ impl<P: Poly> PolyCircuit<P> {
         for (id, input) in input_gate_ids.into_iter().zip(inputs.iter()) {
             wires.insert(id, input.clone());
             if let Some(prefix) = self.print_value.get(&id) {
-                debug_mem(format!("[{prefix}] Gate ID {id}, {:?}", input));
+                info!("{}", format!("[{prefix}] Gate ID {id}, {:?}", input));
             }
         }
-        debug_mem("Input wires are set");
+        debug!("Input wires are set");
 
         for level in levels.iter() {
-            debug_mem("New level started");
+            debug!("New level started");
             // All gates in the same level can be processed in parallel.
-            level.par_iter().for_each(|&gate_id| {
-                debug_mem(format!("Gate id {gate_id} started"));
+            level.iter().for_each(|&gate_id| {
+                debug!("{}", format!("Gate id {gate_id} started"));
                 if wires.contains_key(&gate_id) {
-                    debug_mem(format!("Gate id {gate_id} already evaluated"));
+                    debug!("{}", format!("Gate id {gate_id} already evaluated"));
                     return;
                 }
                 let gate = self.gates.get(&gate_id).expect("gate not found").clone();
-                debug_mem("Get gate");
+                debug!("Get gate");
                 let result = match &gate.gate_type {
                     PolyGateType::Input => {
                         panic!("Input gate {gate:?} should already be preloaded");
                     }
                     PolyGateType::Add => {
-                        debug_mem("Add gate start");
+                        debug!("Add gate start");
                         let left =
                             wires.get(&gate.input_gates[0]).expect("wire missing for Add").clone();
                         let right =
                             wires.get(&gate.input_gates[1]).expect("wire missing for Add").clone();
                         let result = left + right;
-                        debug_mem("Add gate end");
+                        debug!("Add gate end");
                         result
                     }
                     PolyGateType::Sub => {
-                        debug_mem("Sub gate start");
+                        debug!("Sub gate start");
                         let left =
                             wires.get(&gate.input_gates[0]).expect("wire missing for Sub").clone();
                         let right =
                             wires.get(&gate.input_gates[1]).expect("wire missing for Sub").clone();
                         let result = left - right;
-                        debug_mem("Sub gate end");
+                        debug!("Sub gate end");
                         result
                     }
                     PolyGateType::Mul => {
-                        debug_mem("Mul gate start");
+                        debug!("Mul gate start");
                         let left =
                             wires.get(&gate.input_gates[0]).expect("wire missing for Mul").clone();
                         let right =
                             wires.get(&gate.input_gates[1]).expect("wire missing for Mul").clone();
                         let result = left * right;
-                        debug_mem("Mul gate end");
+                        debug!("Mul gate end");
                         result
                     }
                     PolyGateType::SmallScalarMul { scalar } => {
@@ -466,7 +476,7 @@ impl<P: Poly> PolyCircuit<P> {
                             .expect("wire missing for LargeScalarMul")
                             .clone();
                         let result = input.small_scalar_mul(params, scalar);
-                        debug_mem("Large scalar mul gate end");
+                        debug!("Large scalar mul gate end");
                         result
                     }
                     PolyGateType::LargeScalarMul { scalar } => {
@@ -475,42 +485,42 @@ impl<P: Poly> PolyCircuit<P> {
                             .expect("wire missing for LargeScalarMul")
                             .clone();
                         let result = input.large_scalar_mul(params, scalar);
-                        debug_mem("Large scalar mul gate end");
+                        debug!("Large scalar mul gate end");
                         result
                     }
                     PolyGateType::Rotate { shift } => {
-                        debug_mem("Rotate gate start");
+                        debug!("Rotate gate start");
                         let input = wires
                             .get(&gate.input_gates[0])
                             .expect("wire missing for Rotate")
                             .clone();
                         let result = input.rotate(params, *shift);
-                        debug_mem("Rotate gate end");
+                        debug!("Rotate gate end");
                         result
                     }
-                    PolyGateType::PubLut { lookup_id } => {
-                        debug_mem("Public Lookup gate start");
+                    PolyGateType::PubLut { lut_id } => {
+                        debug!("Public Lookup gate start");
                         let input = wires
                             .get(&gate.input_gates[0])
                             .expect("wire missing for Public Lookup")
                             .clone();
                         let lookup =
-                            self.lookups.get(lookup_id).expect("lookup table missing").as_ref();
+                            self.lookups.get(lut_id).expect("lookup table missing").as_ref();
                         let result = plt_evaluator
                             .as_ref()
                             .expect("public lookup evaluator missing")
-                            .public_lookup(params, lookup, input, gate_id);
-                        debug_mem("Public Lookup gate end");
+                            .public_lookup(params, lookup, one.clone(), input, gate_id, *lut_id);
+                        debug!("Public Lookup gate end");
                         result
                     }
                 };
                 if let Some(prefix) = self.print_value.get(&gate_id) {
-                    debug_mem(format!("[{prefix}] Gate ID {gate_id}, {:?}", result));
+                    info!("{}", format!("[{prefix}] Gate ID {gate_id}, {:?}", result));
                 }
                 wires.insert(gate_id, result);
-                debug_mem(format!("Gate id {gate_id} finished"));
+                debug!("{}", format!("Gate id {gate_id} finished"));
             });
-            debug_mem("Evaluated gate in parallel");
+            debug!("Evaluated gate in parallel");
         }
 
         let outputs = self
@@ -518,7 +528,7 @@ impl<P: Poly> PolyCircuit<P> {
             .par_iter()
             .map(|&id| wires.get(&id).expect("output missing").clone())
             .collect();
-        debug_mem("Outputs are collected");
+        debug!("Outputs are collected");
         outputs
     }
 
@@ -608,6 +618,8 @@ impl<P: Poly> PolyCircuit<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use crate::{
         element::PolyElem,
         lookup::poly::PolyPltEvaluator,
@@ -623,6 +635,7 @@ mod tests {
     use num_bigint::BigUint;
 
     #[test]
+    #[sequential_test::sequential]
     fn test_eval_add() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -654,6 +667,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_eval_sub() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -685,6 +699,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_eval_mul() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -716,6 +731,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_const_digits() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -777,6 +793,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_eval_complex() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -815,6 +832,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_eval_multiple_outputs() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -859,6 +877,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_multiple_input_calls_with_nonconsecutive_gate_ids() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -903,6 +922,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_eval_deep_complex() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -958,6 +978,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_boolean_gate_and() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
@@ -978,6 +999,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_boolean_gate_not() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
@@ -997,6 +1019,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_boolean_gate_or() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
@@ -1017,6 +1040,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_boolean_gate_nand() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
@@ -1037,6 +1061,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_boolean_gate_nor() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
@@ -1058,6 +1083,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_boolean_gate_xor() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
@@ -1079,6 +1105,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_boolean_gate_xnor() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
@@ -1101,6 +1128,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_mul_fhe_poly_bits_mul_by_poly_circuit() {
         let mut circuit = PolyCircuit::new();
         let params = DCRTPolyParams::default();
@@ -1166,6 +1194,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_register_and_call_sub_circuit() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -1225,6 +1254,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_nested_sub_circuits() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -1289,6 +1319,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_const_zero_gate() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -1318,6 +1349,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_const_one_gate() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -1347,6 +1379,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_const_minus_one_gate() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -1377,6 +1410,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_depth_zero_with_direct_input_output() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let inputs = circuit.input(1);
@@ -1385,6 +1419,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_depth_one_with_add() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let inputs = circuit.input(2);
@@ -1394,6 +1429,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_depth_two_with_chain() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let inputs = circuit.input(3);

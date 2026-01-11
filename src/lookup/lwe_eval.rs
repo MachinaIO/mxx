@@ -16,7 +16,7 @@ use std::{marker::PhantomData, path::PathBuf, sync::Arc};
 use tracing::{debug, info};
 
 #[derive(Debug)]
-pub struct LweBggPubKeyEvaluator<M, SH, ST>
+pub struct LWEBGGPubKeyPltEvaluator<M, SH, ST>
 where
     M: PolyMatrix,
     SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
@@ -31,7 +31,7 @@ where
     _st: PhantomData<ST>,
 }
 
-impl<M, SH, ST> PltEvaluator<BggPublicKey<M>> for LweBggPubKeyEvaluator<M, SH, ST>
+impl<M, SH, ST> PltEvaluator<BggPublicKey<M>> for LWEBGGPubKeyPltEvaluator<M, SH, ST>
 where
     M: PolyMatrix + Send + 'static,
     SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
@@ -41,11 +41,13 @@ where
         &self,
         params: &<BggPublicKey<M> as Evaluable>::Params,
         plt: &PublicLut<<BggPublicKey<M> as Evaluable>::P>,
+        _: BggPublicKey<M>,
         input: BggPublicKey<M>,
-        id: GateId,
+        gate_id: GateId,
+        _: usize,
     ) -> BggPublicKey<M> {
         let row_size = input.matrix.row_size();
-        let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, id);
+        let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, gate_id);
         let buffer = preimage_all::<M, ST, _>(
             plt,
             params,
@@ -54,14 +56,14 @@ where
             &self.trapdoor,
             &input.matrix,
             &a_lt,
-            &id,
+            &gate_id,
         );
         add_lookup_buffer(buffer);
         BggPublicKey { matrix: a_lt, reveal_plaintext: true }
     }
 }
 
-impl<M, SH, ST> LweBggPubKeyEvaluator<M, SH, ST>
+impl<M, SH, ST> LWEBGGPubKeyPltEvaluator<M, SH, ST>
 where
     M: PolyMatrix,
     SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
@@ -87,7 +89,7 @@ where
 }
 
 #[derive(Debug, Clone)]
-pub struct LweBggEncodingPltEvaluator<M, SH>
+pub struct LWEBGGEncodingPltEvaluator<M, SH>
 where
     M: PolyMatrix,
     SH: PolyHashSampler<[u8; 32], M = M>,
@@ -98,7 +100,7 @@ where
     _marker: PhantomData<SH>,
 }
 
-impl<M, SH> PltEvaluator<BggEncoding<M>> for LweBggEncodingPltEvaluator<M, SH>
+impl<M, SH> PltEvaluator<BggEncoding<M>> for LWEBGGEncodingPltEvaluator<M, SH>
 where
     M: PolyMatrix,
     SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
@@ -107,33 +109,46 @@ where
         &self,
         params: &<BggEncoding<M> as Evaluable>::Params,
         plt: &PublicLut<<BggEncoding<M> as Evaluable>::P>,
+        _: BggEncoding<M>,
         input: BggEncoding<M>,
-        id: GateId,
+        gate_id: GateId,
+        _: usize,
     ) -> BggEncoding<M> {
         let z = &input.plaintext.expect("the BGG encoding should revealed plaintext");
+        let z_coeff = z
+            .coeffs()
+            .first()
+            .cloned()
+            .expect("z polynomial must contain at least one coefficient");
         debug!("public lookup length is {}", plt.len());
-        let (k, y_k) = plt
-            .get(params, z)
+        let (k, y_k_coeff) = plt
+            .get(params, &z_coeff)
             .unwrap_or_else(|| panic!("{:?} is not exist in public lookup f", z.to_const_int()));
         debug!("Performing public lookup, k={k}");
         let row_size = input.pubkey.matrix.row_size();
-        let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, id);
+        let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, gate_id);
         let pubkey = BggPublicKey::new(a_lt, true);
         let l_k = timed_read(
-            &format!("L_{id}_{k}"),
+            &format!("L_{gate_id}_{k}"),
             || {
-                read_matrix_from_multi_batch::<M>(params, &self.dir_path, &format!("L_{id}"), k)
-                    .unwrap_or_else(|| panic!("Matrix with index {} not found in batch", k))
+                read_matrix_from_multi_batch::<M>(
+                    params,
+                    &self.dir_path,
+                    &format!("L_{gate_id}"),
+                    k,
+                )
+                .unwrap_or_else(|| panic!("Matrix with index {} not found in batch", k))
             },
             &mut std::time::Duration::default(),
         );
         let concat = self.c_b.clone().concat_columns(&[&input.vector]);
         let vector = concat * l_k;
-        BggEncoding::new(vector, pubkey, Some(y_k.clone()))
+        let y_k = <M::P as Poly>::from_elem_to_constant(params, &y_k_coeff);
+        BggEncoding::new(vector, pubkey, Some(y_k))
     }
 }
 
-impl<M, SH> LweBggEncodingPltEvaluator<M, SH>
+impl<M, SH> LWEBGGEncodingPltEvaluator<M, SH>
 where
     M: PolyMatrix,
     SH: PolyHashSampler<[u8; 32], M = M>,
@@ -184,7 +199,9 @@ where
             batch
                 .iter()
                 .map(|(x_k, (k, y_k))| {
-                    let ext_matrix = a_z.clone() - &(gadget.clone() * *x_k);
+                    let x_k = P::from_elem_to_constant(params, x_k);
+                    let y_k = P::from_elem_to_constant(params, y_k);
+                    let ext_matrix = a_z.clone() - &(gadget.clone() * x_k);
                     let target = a_lt.clone() - &(gadget.clone() * y_k);
                     (
                         *k,
@@ -207,10 +224,13 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use crate::{
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         circuit::PolyCircuit,
-        lookup::lwe_eval::LweBggEncodingPltEvaluator,
+        element::finite_ring::FinRingElem,
+        lookup::lwe_eval::LWEBGGEncodingPltEvaluator,
         matrix::dcrt_poly::DCRTPolyMatrix,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         sampler::{
@@ -226,11 +246,11 @@ mod test {
 
     fn setup_lsb_constant_binary_plt(t_n: usize, params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {
         let mut f = HashMap::new();
+        let modulus = params.modulus();
         for k in 0..t_n {
-            f.insert(
-                DCRTPoly::from_usize_to_constant(params, k),
-                (k, DCRTPoly::from_usize_to_lsb(params, k)),
-            );
+            let const_elem = FinRingElem::from_u64(k as u64, modulus.clone());
+            let lsb_elem = FinRingElem::from_u64((k & 1) as u64, modulus.clone());
+            f.insert(const_elem, (k, lsb_elem));
         }
         PublicLut::<DCRTPoly>::new(f)
     }
@@ -238,9 +258,9 @@ mod test {
     const SIGMA: f64 = 4.578;
 
     #[tokio::test]
+    #[sequential_test::sequential]
     async fn test_lwe_plt_eval() {
-        init_storage_system();
-        tracing_subscriber::fmt::init();
+        let _ = tracing_subscriber::fmt::try_init();
         let params = DCRTPolyParams::default();
         let plt = setup_lsb_constant_binary_plt(16, &params);
         // Create a simple circuit with the lookup table
@@ -264,7 +284,7 @@ mod test {
         let plaintexts = vec![DCRTPoly::from_usize_to_constant(&params, rand_int); input_size];
 
         // Create random public keys and encodings
-        let reveal_plaintexts = vec![true; input_size + 1];
+        let reveal_plaintexts = vec![true; input_size];
         let bgg_encoding_sampler =
             BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
         let pubkeys = bgg_pubkey_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
@@ -287,8 +307,9 @@ mod test {
             fs::remove_dir_all(dir).unwrap();
             fs::create_dir(dir).unwrap();
         }
+        init_storage_system(dir.to_path_buf());
         let plt_pubkey_evaluator =
-            LweBggPubKeyEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>, _>::new(
+            LWEBGGPubKeyPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>, _>::new(
                 key,
                 trapdoor_sampler,
                 Arc::new(b),
@@ -306,7 +327,7 @@ mod test {
         let result_pubkey = &result_pubkey[0];
 
         //Create an encoding evaluator
-        let plt_encoding_evaluator = LweBggEncodingPltEvaluator::<
+        let plt_encoding_evaluator = LWEBGGEncodingPltEvaluator::<
             DCRTPolyMatrix,
             DCRTPolyHashSampler<Keccak256>,
         >::new(key, dir_path.into(), c_b);
@@ -321,7 +342,14 @@ mod test {
         assert_eq!(result_encoding.len(), 1);
         let result_encoding = &result_encoding[0];
         assert_eq!(result_encoding.pubkey, result_pubkey.clone());
-        let expected_plaintext = plt.get(&params, &plaintexts[0].clone()).unwrap().1;
+        let plaintext_const_coeff = plaintexts[0]
+            .coeffs()
+            .first()
+            .cloned()
+            .expect("plaintext poly must have at least one coefficient");
+        let expected_plaintext_coeff = plt.get(&params, &plaintext_const_coeff).unwrap().1;
+        let expected_plaintext =
+            DCRTPoly::from_elem_to_constant(&params, &expected_plaintext_coeff);
         assert_eq!(result_encoding.plaintext.clone().unwrap(), expected_plaintext);
         let expected_vector = s_vec.clone() *
             (result_encoding.pubkey.matrix.clone() -

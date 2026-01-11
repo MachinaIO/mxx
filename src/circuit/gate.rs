@@ -47,7 +47,7 @@ pub enum PolyGateType {
     SmallScalarMul { scalar: Vec<u32> },
     LargeScalarMul { scalar: Vec<BigUint> },
     Rotate { shift: i32 },
-    PubLut { lookup_id: usize },
+    PubLut { lut_id: usize },
 }
 
 impl PolyGateType {
@@ -71,7 +71,7 @@ impl PolyGateType {
             PolyGateType::SmallScalarMul { .. } => PolyGateKind::SmallScalarMul,
             PolyGateType::LargeScalarMul { .. } => PolyGateKind::LargeScalarMul,
             PolyGateType::Rotate { .. } => PolyGateKind::Rotate,
-            PolyGateType::PubLut { lookup_id } => PolyGateKind::PubLut(*lookup_id),
+            PolyGateType::PubLut { lut_id } => PolyGateKind::PubLut(*lut_id),
         }
     }
 }

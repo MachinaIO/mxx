@@ -77,14 +77,17 @@ impl<M: PolyMatrix> Evaluable for BggPublicKey<M> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use crate::{
-        circuit::PolyCircuit, lookup::lwe_eval::LweBggEncodingPltEvaluator,
+        circuit::PolyCircuit, lookup::lwe_eval::LWEBGGEncodingPltEvaluator,
         matrix::dcrt_poly::DCRTPolyMatrix, poly::dcrt::params::DCRTPolyParams,
         sampler::hash::DCRTPolyHashSampler, utils::random_bgg_encodings,
     };
     use keccak_asm::Keccak256;
 
     #[test]
+    #[sequential_test::sequential]
     fn test_encoding_add() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -106,7 +109,7 @@ mod tests {
             &params,
             &enc_one.clone(),
             &[enc1.clone(), enc2.clone()],
-            None::<LweBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result
@@ -120,6 +123,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_encoding_sub() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -141,7 +145,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone()],
-            None::<LweBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result
@@ -155,6 +159,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_encoding_mul() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -176,7 +181,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone()],
-            None::<LweBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result
@@ -190,6 +195,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_encoding_circuit_operations() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -221,7 +227,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone(), enc3.clone()],
-            None::<LweBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result: ((enc1 + enc2)^2) - enc3
@@ -236,6 +242,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_encoding_complex_circuit() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -279,7 +286,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone(), enc3.clone(), enc4.clone()],
-            None::<LweBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result: (((enc1 + enc2) * (enc3 * enc4)) + (enc1 - enc3)) * scalar
@@ -298,6 +305,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_encoding_multiple_input_calls_with_nonconsecutive_gate_ids() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -331,7 +339,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone()],
-            None::<LweBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected: enc1 + enc2
@@ -343,6 +351,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_encoding_register_and_call_sub_circuit() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -392,7 +401,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone()],
-            None::<LweBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result: (enc1 + enc2) - (enc1 * enc2)
@@ -406,6 +415,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_encoding_nested_sub_circuits() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -460,7 +470,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone(), enc3.clone()],
-            None::<LweBggEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result: ((enc1 * enc2) + enc3)^2

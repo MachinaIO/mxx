@@ -39,6 +39,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
 
     use crate::{
         matrix::dcrt_poly::DCRTPolyMatrix,
@@ -47,6 +49,7 @@ mod tests {
     };
 
     #[test]
+    #[sequential_test::sequential]
     fn test_rlwe_encrypt_decrypt() {
         let params = DCRTPolyParams::default();
         let sampler = DCRTPolyUniformSampler::new();

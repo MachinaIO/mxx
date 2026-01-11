@@ -13,6 +13,16 @@ pub struct FinRingElem {
 }
 
 impl FinRingElem {
+    #[inline]
+    pub fn from_u64(value: u64, modulus: Arc<BigUint>) -> Self {
+        Self::new(value, modulus)
+    }
+
+    #[inline]
+    pub fn from_biguint(value: BigUint, modulus: Arc<BigUint>) -> Self {
+        Self::new(value, modulus)
+    }
+
     pub fn from_str(value: &str, modulus: &str) -> Result<Self, ParseBigIntError> {
         let value = BigInt::from_str(value)?;
         let modulus = BigUint::from_str(modulus)?.into();
@@ -125,8 +135,11 @@ impl Neg for FinRingElem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
 
     #[test]
+    #[sequential_test::sequential]
     fn test_element_new_str() {
         let modulus = "17";
         let elem = FinRingElem::from_str("5", modulus).unwrap();
@@ -143,6 +156,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_element_new() {
         let modulus = Arc::new(BigUint::from(17u8));
         let elem = FinRingElem::new(5, modulus.clone());
@@ -159,6 +173,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_element_add() {
         let modulus = Arc::new(BigUint::from(17u8));
         let a = FinRingElem::new(19, modulus.clone());
@@ -176,6 +191,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_element_sub() {
         let modulus = Arc::new(BigUint::from(17u8));
         let a = FinRingElem::new(-1, modulus.clone());
@@ -193,6 +209,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_element_mul() {
         let modulus = Arc::new(BigUint::from(17u8));
         let a = FinRingElem::new(3, modulus.clone());
@@ -210,6 +227,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_element_neg() {
         let modulus = Arc::new(BigUint::from(17u8));
         let a = FinRingElem::new(5, modulus.clone());

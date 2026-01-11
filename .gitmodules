@@ -1,0 +1,3 @@
+[submodule "third_party/FIDESlib"]
+	path = third_party/FIDESlib
+	url = https://github.com/CAPS-UMU/FIDESlib.git

@@ -279,6 +279,8 @@ impl<M: PolyMatrix> Wee25Commit<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use crate::{
         matrix::{MatrixElem, dcrt_poly::DCRTPolyMatrix},
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
@@ -287,8 +289,9 @@ mod tests {
     const SIGMA: f64 = 4.578;
 
     #[test]
+    #[sequential_test::sequential]
     fn test_wee25_zero_commit_verify() {
-        let params = DCRTPolyParams::new(4, 2, 17, 15);
+        let params = DCRTPolyParams::new(4, 2, 17, 10);
         let secret_size = 1;
         let m_b = (&params.modulus_digits() + 2) * secret_size;
         let base_len = 2 * m_b;
@@ -307,8 +310,9 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_wee25_zero_commit_invalid_verify() {
-        let params = DCRTPolyParams::new(4, 2, 17, 15);
+        let params = DCRTPolyParams::new(4, 2, 17, 10);
         let secret_size = 1;
         let m_b = (&params.modulus_digits() + 2) * secret_size;
         let base_len = 2 * m_b;
@@ -328,8 +332,9 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_wee25_random_commit_verify() {
-        let params = DCRTPolyParams::new(4, 2, 17, 15);
+        let params = DCRTPolyParams::new(4, 2, 17, 10);
         let secret_size = 1;
         let m_b = (&params.modulus_digits() + 2) * secret_size;
         let base_len = 2 * m_b;
@@ -351,8 +356,9 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_wee25_random_commit_invalid_verify() {
-        let params = DCRTPolyParams::new(4, 2, 17, 15);
+        let params = DCRTPolyParams::new(4, 2, 17, 10);
         let secret_size = 1;
         let m_b = (&params.modulus_digits() + 2) * secret_size;
         let base_len = 2 * m_b;
@@ -378,8 +384,9 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_wee25_random_vector_commit_verify() {
-        let params = DCRTPolyParams::new(4, 2, 17, 15);
+        let params = DCRTPolyParams::new(4, 2, 17, 10);
         let secret_size = 2;
         let m_b = (&params.modulus_digits() + 2) * secret_size;
         let base_len = 2 * m_b;

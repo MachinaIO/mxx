@@ -3,9 +3,12 @@ use openfhe::{
     ffi::{GetMatrixCols, GetMatrixElement, GetMatrixRows, Matrix},
 };
 
-use crate::poly::{
-    Poly,
-    dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+use crate::{
+    openfhe_guard::ensure_openfhe_warmup,
+    poly::{
+        Poly,
+        dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+    },
 };
 
 pub(crate) struct CppMatrix {
@@ -22,14 +25,17 @@ impl CppMatrix {
     }
 
     pub(crate) fn nrow(&self) -> usize {
+        ensure_openfhe_warmup(&self.params);
         GetMatrixRows(&self.inner)
     }
 
     pub(crate) fn ncol(&self) -> usize {
+        ensure_openfhe_warmup(&self.params);
         GetMatrixCols(&self.inner)
     }
 
     pub(crate) fn entry(&self, i: usize, j: usize) -> DCRTPoly {
+        ensure_openfhe_warmup(&self.params);
         let poly = DCRTPoly::new(GetMatrixElement(&self.inner, i, j));
         // This ensures that coefficients are rounded to Z_q.
         DCRTPoly::from_coeffs(&self.params, &poly.coeffs())

@@ -58,6 +58,8 @@ impl<M: PolyMatrix> DigitsToInt<M::P> for BggEncoding<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::{__PAIR, __TestState};
     use crate::{
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         matrix::dcrt_poly::DCRTPolyMatrix,
@@ -68,6 +70,7 @@ mod tests {
     use keccak_asm::Keccak256;
 
     #[test]
+    #[sequential_test::sequential]
     fn test_dcrtpoly_digits_to_int_random() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -83,6 +86,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_dcrtpoly_digits_to_int_static() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -100,6 +104,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_bggpublickey_digits_to_int() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -114,7 +119,7 @@ mod tests {
         let tag_bytes = tag.to_le_bytes();
 
         // Create random public keys with reveal_plaintext set to true
-        let reveal_plaintexts = vec![true; params.modulus_digits() + 1];
+        let reveal_plaintexts = vec![true; params.modulus_digits()];
         let pubkeys = bgg_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
 
         // Extract digit public keys
@@ -141,6 +146,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_bggencoding_digits_to_int_static() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -156,7 +162,7 @@ mod tests {
         let tag_bytes = tag.to_le_bytes();
 
         // Create random public keys
-        let reveal_plaintexts = vec![true; params.modulus_digits() + 1]; // +1 for the one encoding
+        let reveal_plaintexts = vec![true; params.modulus_digits()];
         let pubkeys = bgg_pubkey_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
 
         // Create secret and plaintexts (digit polynomials)
@@ -179,6 +185,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_bggencoding_digits_to_int_random() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
@@ -194,7 +201,7 @@ mod tests {
         let tag_bytes = tag.to_le_bytes();
 
         // Create random public keys
-        let reveal_plaintexts = vec![true; params.modulus_digits() + 1]; // +1 for the one encoding
+        let reveal_plaintexts = vec![true; params.modulus_digits()];
         let pubkeys = bgg_pubkey_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
 
         // Create secret and plaintexts (digit polynomials)

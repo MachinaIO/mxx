@@ -428,7 +428,7 @@ impl<P: Poly> PolyCircuit<P> {
         for level in levels.iter() {
             debug!("New level started");
             // All gates in the same level can be processed in parallel.
-            level.par_iter().for_each(|&gate_id| {
+            level.iter().for_each(|&gate_id| {
                 debug!("{}", format!("Gate id {gate_id} started"));
                 if wires.contains_key(&gate_id) {
                     debug!("{}", format!("Gate id {gate_id} already evaluated"));

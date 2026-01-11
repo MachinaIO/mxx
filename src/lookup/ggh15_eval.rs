@@ -107,7 +107,7 @@ where
         let chunk_size = std::env::var("LUT_PREIMAGE_CHUNK_SIZE")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(8);
+            .unwrap_or(80);
         let mut part_idx = 0usize;
         let mut total_matrices = 0usize;
         let mut batch: Vec<(usize, <M::P as Poly>::Elem)> = Vec::with_capacity(chunk_size);

@@ -22,9 +22,18 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DCRTPoly {
-    ptr_poly: Arc<UniquePtr<DCRTPolyCxx>>,
+    ptr_poly: UniquePtr<DCRTPolyCxx>,
+}
+
+impl Clone for DCRTPoly {
+    fn clone(&self) -> Self {
+        if self.ptr_poly.is_null() {
+            return Self { ptr_poly: UniquePtr::null() };
+        }
+        Self::new(self.ptr_poly.Clone())
+    }
 }
 
 /// # Safety DCRTPoly is plain old data and is shared across threads in C++ OpenFHE as well.
@@ -33,7 +42,7 @@ unsafe impl Sync for DCRTPoly {}
 
 impl DCRTPoly {
     pub fn new(ptr_poly: UniquePtr<DCRTPolyCxx>) -> Self {
-        Self { ptr_poly: ptr_poly.into() }
+        Self { ptr_poly }
     }
 
     fn from_slice_with_map<T, F>(params: &DCRTPolyParams, slice: &[T], map_fn: F) -> Self

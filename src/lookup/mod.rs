@@ -5,6 +5,7 @@ pub mod lwe_eval;
 use rayon::prelude::*;
 
 use crate::{circuit::gate::GateId, poly::Poly};
+use num_bigint::BigUint;
 use std::collections::HashMap;
 
 pub trait PltEvaluator<E: crate::circuit::evaluable::Evaluable>: Send + Sync {
@@ -28,6 +29,21 @@ impl<P: Poly> PublicLut<P> {
             .max_by(|a, b| a.1.cmp(&b.1))
             .expect("no coefficients found in any y_k");
         Self { f, max_output_row }
+    }
+
+    pub fn new_biguint(
+        params: &P::Params,
+        f_big: HashMap<BigUint, (usize, BigUint)>,
+    ) -> Self {
+        let f = f_big
+            .into_par_iter()
+            .map(|(key, (idx, value))| {
+                let key_poly = P::from_biguint_to_constant(params, key);
+                let value_poly = P::from_biguint_to_constant(params, value);
+                (key_poly, (idx, value_poly))
+            })
+            .collect();
+        Self::new(f)
     }
     pub fn len(&self) -> usize {
         self.f.len()

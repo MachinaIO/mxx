@@ -186,12 +186,8 @@ pub fn mod_inverse(a: u64, m: u64) -> Option<u64> {
     Some(result as u64)
 }
 
-pub fn gen_biguint_for_modulus<R: Rng>(
-    rng: &mut R,
-    limb_bit_size: usize,
-    modulus: &BigUint,
-) -> BigUint {
-    if limb_bit_size == 0 || modulus.is_zero() {
+pub fn gen_biguint_for_modulus<R: Rng>(rng: &mut R, modulus: &BigUint) -> BigUint {
+    if modulus.is_zero() {
         return BigUint::ZERO;
     }
     let max_bits = modulus.bits() as usize;
@@ -202,4 +198,13 @@ pub fn gen_biguint_for_modulus<R: Rng>(
     let mut bytes = vec![0u8; max_bytes];
     rng.fill_bytes(&mut bytes);
     BigUint::from_bytes_be(&bytes) % modulus
+}
+
+pub fn round_div(a: u64, b: u64) -> u64 {
+    assert!(b != 0, "divisor must be non-zero");
+    let a128 = a as u128;
+    let b128 = b as u128;
+    let half = b128 / 2;
+    let rounded = (a128 + half) / b128;
+    rounded as u64
 }

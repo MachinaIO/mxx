@@ -13,7 +13,6 @@ use crate::{
     },
 };
 use keccak_asm::Keccak256;
-use memory_stats::memory_stats;
 use num_bigint::BigUint;
 use num_traits::Zero;
 use rand::Rng;
@@ -22,7 +21,7 @@ use std::{
     future::Future,
     time::{Duration, Instant},
 };
-use tracing::{debug, info};
+use tracing::info;
 
 /// ideal thread chunk size for parallel
 pub fn chunk_size_for(original: usize) -> usize {
@@ -83,32 +82,6 @@ macro_rules! impl_binop_with_refs {
     };
 }
 
-pub fn debug_mem<T: Into<String>>(tag: T) {
-    if let Some(usage) = memory_stats() {
-        debug!(
-            "{} || Current physical/virtual memory usage: {} | {}",
-            tag.into(),
-            usage.physical_mem,
-            usage.virtual_mem
-        );
-    } else {
-        debug!("Couldn't get the current memory usage :(");
-    }
-}
-
-pub fn log_mem<T: Into<String>>(tag: T) {
-    if let Some(usage) = memory_stats() {
-        info!(
-            "{} || Current physical/virtual memory usage: {} | {}",
-            tag.into(),
-            usage.physical_mem,
-            usage.virtual_mem,
-        );
-    } else {
-        info!("Couldn't get the current memory usage :(");
-    }
-}
-
 // Helper function to create a random polynomial using UniformSampler
 pub fn create_random_poly(params: &DCRTPolyParams) -> DCRTPoly {
     let sampler = DCRTPolyUniformSampler::new();
@@ -148,7 +121,7 @@ pub fn random_bgg_encodings(
     let plaintexts = vec![create_random_poly(params); input_size];
 
     // Create random public keys
-    let reveal_plaintexts = vec![true; input_size + 1];
+    let reveal_plaintexts = vec![true; input_size];
     let bgg_encoding_sampler =
         BGGEncodingSampler::<DCRTPolyUniformSampler>::new(params, &secrets, None);
     let pubkeys = bgg_pubkey_sampler.sample(params, &tag_bytes, &reveal_plaintexts);
@@ -160,7 +133,7 @@ pub fn timed_read<T, F: FnOnce() -> T>(label: &str, f: F, total: &mut Duration) 
     let res = f();
     let elapsed = start.elapsed();
     *total += elapsed;
-    crate::utils::log_mem(format!("{label} loaded in {elapsed:?}"));
+    info!("{}", format!("{label} loaded in {elapsed:?}"));
     res
 }
 
@@ -174,7 +147,7 @@ where
     let res = f().await;
     let elapsed = start.elapsed();
     *total += elapsed;
-    crate::utils::log_mem(format!("{label} loaded in {elapsed:?}"));
+    info!("{}", format!("{label} loaded in {elapsed:?}"));
     res
 }
 

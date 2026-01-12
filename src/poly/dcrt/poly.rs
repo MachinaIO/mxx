@@ -94,7 +94,7 @@ impl DCRTPoly {
             params.ring_dimension(),
             params.crt_depth(),
             params.crt_bits(),
-            &value,
+            value,
         ))
     }
 }

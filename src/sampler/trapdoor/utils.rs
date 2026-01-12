@@ -16,7 +16,8 @@ use rayon::prelude::*;
 use std::ops::Range;
 
 pub(crate) fn gen_int_karney(mean: f64, stddev: f64) -> i64 {
-    GenerateIntegerKarney(mean, stddev)
+    let out = GenerateIntegerKarney(mean, stddev);
+    out
 }
 
 fn find_in_vec(vec: &[f64], search: f64) -> u32 {

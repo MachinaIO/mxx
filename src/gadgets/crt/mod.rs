@@ -149,7 +149,10 @@ impl<P: Poly> ModuloPoly<P> {
         let (is_less, diff) = sum_full.less_than(&n_ext, circuit);
         let reduced_full = sum_full.cmux(&diff, is_less, circuit);
         let reduced = reduced_full.mod_limbs(self.ctx.num_limbs);
-        debug!("{}", format!("num gates {:?} at ModuloPoly::add", circuit.count_gates_by_type_vec()));
+        debug!(
+            "{}",
+            format!("num gates {:?} at ModuloPoly::add", circuit.count_gates_by_type_vec())
+        );
         Self { ctx: self.ctx.clone(), value: reduced }
     }
 
@@ -158,7 +161,10 @@ impl<P: Poly> ModuloPoly<P> {
         let (is_less, raw_sub) = self.value.less_than(&other.value, circuit);
         let added = raw_sub.add(&self.ctx.moduli_poly, circuit).mod_limbs(self.ctx.num_limbs);
         let result = added.cmux(&raw_sub, is_less, circuit);
-        debug!("{}", format!("num gates {:?} at ModuloPoly::sub", circuit.count_gates_by_type_vec()));
+        debug!(
+            "{}",
+            format!("num gates {:?} at ModuloPoly::sub", circuit.count_gates_by_type_vec())
+        );
         Self { ctx: self.ctx.clone(), value: result }
     }
 
@@ -166,7 +172,10 @@ impl<P: Poly> ModuloPoly<P> {
         debug_assert_eq!(self.ctx, other.ctx);
         let product = self.value.mul(&other.value, circuit, None);
         let reduced = Self::montgomery_reduce(self.ctx.as_ref(), circuit, &product);
-        debug!("{}", format!("num gates {:?} at ModuloPoly::mul", circuit.count_gates_by_type_vec()));
+        debug!(
+            "{}",
+            format!("num gates {:?} at ModuloPoly::mul", circuit.count_gates_by_type_vec())
+        );
         Self { ctx: self.ctx.clone(), value: reduced }
     }
 

@@ -13,8 +13,8 @@ use openfhe::ffi::{FormatMatrixCoefficient, SampleP1ForPertMat};
 use rayon::iter::ParallelIterator;
 pub use sampler::DCRTPolyTrapdoorSampler;
 use std::ops::Range;
-use utils::{gen_dgg_int_vec, gen_int_karney, split_int64_mat_to_elems};
 use tracing::debug;
+use utils::{gen_dgg_int_vec, gen_int_karney, split_int64_mat_to_elems};
 
 pub mod sampler;
 pub mod utils;

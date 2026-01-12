@@ -8,36 +8,18 @@ use crate::{
     parallel_iter,
     poly::{PolyParams, dcrt::params::DCRTPolyParams},
     sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
-    utils::{block_size, debug_mem},
+    utils::debug_mem,
 };
 use openfhe::ffi::{FormatMatrixCoefficient, SampleP1ForPertMat};
 use rayon::iter::ParallelIterator;
 pub use sampler::DCRTPolyTrapdoorSampler;
-use std::{
-    cmp::min,
-    ops::Range,
-    sync::{Arc, Mutex, OnceLock},
-};
+use std::ops::Range;
 use utils::{gen_dgg_int_vec, gen_int_karney, log_openfhe, split_int64_mat_to_elems};
 
 pub mod sampler;
 pub mod utils;
 
 pub(crate) const KARNEY_THRESHOLD: f64 = 300.0;
-
-fn with_trapdoor_ffi_lock<F, R>(f: F) -> R
-where
-    F: FnOnce() -> R,
-{
-    if std::env::var_os("OPENFHE_TRAPDOOR_SERIALIZE").is_none() {
-        return f();
-    }
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let guard = LOCK.get_or_init(|| Mutex::new(())).lock().expect("trapdoor FFI lock poisoned");
-    let out = f();
-    drop(guard);
-    out
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DCRTTrapdoor {
@@ -149,10 +131,6 @@ fn sample_p1_for_pert_mat(
     let n = params.ring_dimension();
     let depth = params.crt_depth();
     let k_res = params.crt_bits();
-    let block_size = block_size();
-    let num_blocks = padded_ncol.div_ceil(block_size);
-    let num_threads = rayon::current_num_threads();
-    let num_threads_for_cpp = num_threads.div_ceil(num_blocks);
     debug_mem("sample_p1_for_pert_square_mat parameters computed");
     log_openfhe("to_cpp_matrix_ptr a_mat start");
     let mut a_mat = a_mat.to_cpp_matrix_ptr();
@@ -160,79 +138,40 @@ fn sample_p1_for_pert_mat(
     log_openfhe("FormatMatrixCoefficient a_mat start");
     FormatMatrixCoefficient(a_mat.inner.as_mut().unwrap());
     log_openfhe("FormatMatrixCoefficient a_mat end");
-    let a_mat_arc = Arc::new(a_mat);
     log_openfhe("to_cpp_matrix_ptr b_mat start");
     let mut b_mat = b_mat.to_cpp_matrix_ptr();
     log_openfhe("to_cpp_matrix_ptr b_mat end");
     log_openfhe("FormatMatrixCoefficient b_mat start");
     FormatMatrixCoefficient(b_mat.inner.as_mut().unwrap());
     log_openfhe("FormatMatrixCoefficient b_mat end");
-    let b_mat_arc = Arc::new(b_mat);
     log_openfhe("to_cpp_matrix_ptr d_mat start");
     let mut d_mat = d_mat.to_cpp_matrix_ptr();
     log_openfhe("to_cpp_matrix_ptr d_mat end");
     log_openfhe("FormatMatrixCoefficient d_mat start");
     FormatMatrixCoefficient(d_mat.inner.as_mut().unwrap());
     log_openfhe("FormatMatrixCoefficient d_mat end");
-    let d_mat_arc = Arc::new(d_mat);
     debug_mem("a_mat, b_mat, d_mat are converted to cpp matrices");
-
-    let p1_mat_blocks = parallel_iter!(0..num_blocks)
-        .map(|i| {
-            let end_col = min((i + 1) * block_size, padded_ncol);
-            let tp2_slice = tp2.slice_columns(i * block_size, end_col);
-            let tp2_arc = Arc::new(tp2_slice);
-            debug_mem("tp2 slice ready");
-            let ncol = end_col - i * block_size;
-            let ncol_per_thread = ncol.div_ceil(num_threads_for_cpp);
-            let p1_blocks = parallel_iter!(0..ncol.div_ceil(ncol_per_thread))
-                .map(|j| {
-                    let start_col = j * ncol_per_thread;
-                    let end_col = min((j + 1) * ncol_per_thread, ncol);
-                    log_openfhe(&format!(
-                        "to_cpp_matrix_ptr tp2_cols start block={i} cols={start_col}..{end_col}"
-                    ));
-                    let tp2_cols = Arc::clone(&tp2_arc).slice_columns(start_col, end_col);
-                    let mut tp2_cols_cpp = tp2_cols.to_cpp_matrix_ptr();
-                    log_openfhe(&format!(
-                        "to_cpp_matrix_ptr tp2_cols end block={i} cols={start_col}..{end_col}"
-                    ));
-                    log_openfhe(&format!(
-                        "FormatMatrixCoefficient tp2_cols start block={i} cols={start_col}..{end_col}"
-                    ));
-                    FormatMatrixCoefficient(tp2_cols_cpp.inner.as_mut().unwrap());
-                    log_openfhe(&format!(
-                        "FormatMatrixCoefficient tp2_cols end block={i} cols={start_col}..{end_col}"
-                    ));
-                    debug_mem("extracting rows from tp2");
-                    log_openfhe(&format!(
-                        "SampleP1ForPertMat start block={i} cols={start_col}..{end_col}"
-                    ));
-                    let cpp_matrix = with_trapdoor_ffi_lock(|| {
-                        SampleP1ForPertMat(
-                            &Arc::clone(&a_mat_arc).as_ref().inner,
-                            &Arc::clone(&b_mat_arc).as_ref().inner,
-                            &Arc::clone(&d_mat_arc).as_ref().inner,
-                            &tp2_cols_cpp.inner,
-                            n,
-                            depth,
-                            k_res,
-                            end_col - start_col,
-                            c,
-                            s,
-                            dgg_stddev,
-                        )
-                    });
-                    log_openfhe(&format!(
-                        "SampleP1ForPertMat end block={i} cols={start_col}..{end_col}"
-                    ));
-                    debug_mem("SampleP1ForPertSquareMat called");
-                    DCRTPolyMatrix::from_cpp_matrix_ptr(params, &CppMatrix::new(params, cpp_matrix))
-                })
-                .collect::<Vec<_>>();
-            p1_blocks[0].concat_columns(&p1_blocks[1..].iter().collect::<Vec<_>>())
-        })
-        .collect::<Vec<_>>();
-
-    p1_mat_blocks[0].concat_columns(&p1_mat_blocks[1..].iter().collect::<Vec<_>>())
+    log_openfhe("to_cpp_matrix_ptr tp2 start");
+    let mut tp2_cpp = tp2.to_cpp_matrix_ptr();
+    log_openfhe("to_cpp_matrix_ptr tp2 end");
+    log_openfhe("FormatMatrixCoefficient tp2 start");
+    FormatMatrixCoefficient(tp2_cpp.inner.as_mut().unwrap());
+    log_openfhe("FormatMatrixCoefficient tp2 end");
+    log_openfhe("SampleP1ForPertMat start");
+    let cpp_matrix = SampleP1ForPertMat(
+        &a_mat.inner,
+        &b_mat.inner,
+        &d_mat.inner,
+        &tp2_cpp.inner,
+        n,
+        depth,
+        k_res,
+        padded_ncol,
+        c,
+        s,
+        dgg_stddev,
+    );
+    log_openfhe("SampleP1ForPertMat end");
+    debug_mem("SampleP1ForPertSquareMat called");
+    DCRTPolyMatrix::from_cpp_matrix_ptr(params, &CppMatrix::new(params, cpp_matrix))
 }

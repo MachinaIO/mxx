@@ -19,7 +19,7 @@ pub enum SerializablePolyGateType {
     Sub,
     Mul,
     Rotate { shift: i32 },
-    PubLut { lookup_id: usize },
+    PubLut { lut_id: usize },
 }
 
 impl SerializablePolyGateType {
@@ -87,9 +87,7 @@ impl SerializablePolyCircuit {
                 PolyGateType::Sub => SerializablePolyGateType::Sub,
                 PolyGateType::Mul => SerializablePolyGateType::Mul,
                 PolyGateType::Rotate { shift } => SerializablePolyGateType::Rotate { shift },
-                PolyGateType::PubLut { lookup_id } => {
-                    SerializablePolyGateType::PubLut { lookup_id }
-                }
+                PolyGateType::PubLut { lut_id } => SerializablePolyGateType::PubLut { lut_id },
             };
             let serializable_gate = SerializablePolyGate::new(gate_id, gate_type, gate.input_gates);
             gates.insert(gate_id, serializable_gate);
@@ -126,9 +124,7 @@ impl SerializablePolyCircuit {
                 SerializablePolyGateType::Sub => PolyGateType::Sub,
                 SerializablePolyGateType::Mul => PolyGateType::Mul,
                 SerializablePolyGateType::Rotate { shift } => PolyGateType::Rotate { shift },
-                SerializablePolyGateType::PubLut { lookup_id } => {
-                    PolyGateType::PubLut { lookup_id }
-                }
+                SerializablePolyGateType::PubLut { lut_id } => PolyGateType::PubLut { lut_id },
             };
             circuit
                 .gates

@@ -2,9 +2,9 @@ use crate::{
     circuit::PolyCircuit,
     gadgets::crt::{ModuloPoly, ModuloPolyContext},
     poly::Poly,
-    utils::log_mem,
 };
 use std::sync::Arc;
+use tracing::info;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArithGateId(usize);
@@ -54,7 +54,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
     ) -> Self {
         let mut poly_circuit = PolyCircuit::<P>::new();
         let mut all_values = Vec::with_capacity(num_inputs);
-        log_mem("before ModuloPolyContext setup");
+        info!("{}", "before ModuloPolyContext setup");
         let ctx = Arc::new(ModuloPolyContext::setup(
             &mut poly_circuit,
             params,
@@ -62,7 +62,7 @@ impl<P: Poly> ArithmeticCircuit<P> {
             max_degree,
             dummy_scalar,
         ));
-        log_mem("after ModuloPolyContext setup");
+        info!("{}", "after ModuloPolyContext setup");
         let crt_polys = (0..num_inputs)
             .map(|_| ModuloPoly::input(ctx.clone(), &mut poly_circuit))
             .collect::<Vec<_>>();
@@ -151,12 +151,12 @@ impl<P: Poly> ArithmeticCircuit<P> {
         while current_layer.len() > 1 {
             debug_assert!(current_layer.len().is_multiple_of(2), "layer size must stay even");
             let mut next_layer = Vec::with_capacity(current_layer.len() / 2);
-            log_mem(format!("before layer size {}", current_layer.len()));
+            info!("{}", format!("before layer size {}", current_layer.len()));
             for pair in current_layer.chunks(2) {
                 let parent = circuit.mul(pair[0], pair[1]);
                 next_layer.push(parent);
             }
-            log_mem(format!("after layer size {}", current_layer.len()));
+            info!("{}", format!("after layer size {}", current_layer.len()));
             current_layer = next_layer;
         }
 

@@ -1,4 +1,4 @@
-use super::{DCRTTrapdoor, utils::{log_openfhe, split_int64_mat_alt_to_elems}};
+use super::{DCRTTrapdoor, utils::split_int64_mat_alt_to_elems};
 use crate::{
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     parallel_iter,
@@ -10,11 +10,11 @@ use crate::{
         DistType, PolyTrapdoorSampler, PolyUniformSampler, trapdoor::KARNEY_THRESHOLD,
         uniform::DCRTPolyUniformSampler,
     },
-    utils::debug_mem,
 };
 use openfhe::ffi::DCRTGaussSampGqArbBase;
 use rayon::iter::ParallelIterator;
 use std::ops::Range;
+use tracing::debug;
 
 const SIGMA: f64 = 4.578;
 const SPECTRAL_CONSTANT: f64 = 1.8;
@@ -60,7 +60,6 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
     ) -> Self::M {
         let d = public_matrix.row_size();
         let target_cols = target.col_size();
-        log_openfhe(&format!("preimage start d={d} target_cols={target_cols}"));
         assert_eq!(
             target.row_size(),
             d,
@@ -98,7 +97,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         };
         let dgg_large_params =
             (dgg_large_mean, dgg_large_std, dgg_large_table.as_ref().map(|v| &v[..]));
-        debug_mem("preimage parameters computed");
+        debug!("{}", "preimage parameters computed");
         let p_hat = trapdoor.sample_pert_square_mat(
             s,
             self.c,
@@ -107,9 +106,9 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
             peikert,
             target_cols,
         );
-        debug_mem("p_hat generated");
+        debug!("{}", "p_hat generated");
         let perturbed_syndrome = target - &(public_matrix * &p_hat);
-        debug_mem("perturbed_syndrome generated");
+        debug!("{}", "perturbed_syndrome generated");
         let mut z_hat_mat = DCRTPolyMatrix::zero(params, d * k, target_cols);
         let f = |row_offsets: Range<usize>, col_offsets: Range<usize>| -> Vec<Vec<DCRTPoly>> {
             let nrow = row_offsets.len();
@@ -144,17 +143,16 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
             block_matrix
         };
         z_hat_mat.replace_entries_with_expand(0..d, 0..target_cols, k, 1, f);
-        debug_mem("z_hat_mat generated");
+        debug!("{}", "z_hat_mat generated");
         let r_z_hat = &trapdoor.r * &z_hat_mat;
-        debug_mem("r_z_hat generated");
+        debug!("{}", "r_z_hat generated");
         let e_z_hat = &trapdoor.e * &z_hat_mat;
-        debug_mem("e_z_hat generated");
+        debug!("{}", "e_z_hat generated");
         let z_hat_former = (p_hat.slice_rows(0, d) + r_z_hat)
             .concat_rows(&[&(p_hat.slice_rows(d, 2 * d) + e_z_hat)]);
         let z_hat_latter = p_hat.slice_rows(2 * d, d * (k + 2)) + z_hat_mat;
-        debug_mem("z_hat generated");
+        debug!("{}", "z_hat generated");
         let out = z_hat_former.concat_rows(&[&z_hat_latter]);
-        log_openfhe(&format!("preimage end d={d} target_cols={target_cols}"));
         out
     }
 
@@ -170,9 +168,6 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         let d = public_matrix.row_size();
         let ext_ncol = ext_matrix.col_size();
         let target_ncol = target.col_size();
-        log_openfhe(&format!(
-            "preimage_extend start d={d} ext_ncol={ext_ncol} target_ncol={target_ncol}"
-        ));
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
         let s = SPECTRAL_CONSTANT *
@@ -186,9 +181,6 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         let t = target - &(ext_matrix * &preimage_right);
         let preimage_left = self.preimage(params, trapdoor, public_matrix, &t);
         let out = preimage_left.concat_rows(&[&preimage_right]);
-        log_openfhe(&format!(
-            "preimage_extend end d={d} ext_ncol={ext_ncol} target_ncol={target_ncol}"
-        ));
         out
     }
 }
@@ -221,7 +213,6 @@ pub(crate) fn gauss_samp_gq_arb_base(
     let depth = params.crt_depth();
     let k_res_bits = params.crt_bits();
     let k_res_digits = params.modulus_digits() / depth;
-    log_openfhe(&format!("DCRTGaussSampGqArbBase start tower={tower_idx}"));
     let result = DCRTGaussSampGqArbBase(
         syndrome.get_poly(),
         c,
@@ -233,7 +224,6 @@ pub(crate) fn gauss_samp_gq_arb_base(
         sigma,
         tower_idx,
     );
-    log_openfhe(&format!("DCRTGaussSampGqArbBase end tower={tower_idx}"));
     debug_assert_eq!(result.len(), n as usize * k_res_digits);
     // let mut matrix = I64Matrix::new_empty(&I64MatrixParams, k_res, n as usize);
     parallel_iter!(0..k_res_digits)

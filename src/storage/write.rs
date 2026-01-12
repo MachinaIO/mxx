@@ -1,7 +1,7 @@
 use crate::{
     matrix::PolyMatrix,
     poly::Poly,
-    utils::{block_size, debug_mem, log_mem},
+    utils::block_size,
 };
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
@@ -14,7 +14,7 @@ use std::{
     time::Instant,
 };
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{debug, info};
 
 #[derive(Debug)]
 pub struct SerializedMatrix {
@@ -198,7 +198,7 @@ where
         id, block_size_val, row_range.start, row_range.end, col_range.start, col_range.end
     );
     let elapsed = start.elapsed();
-    debug_mem(format!("Serialized matrix {} len {} bytes in {elapsed:?}", id, data.len()));
+    debug!("{}", format!("Serialized matrix {} len {} bytes in {elapsed:?}", id, data.len()));
     SerializedMatrix { id: id.to_string(), filename, data }
 }
 
@@ -305,7 +305,7 @@ impl MultiBatchLookupBuffer {
         let data = self.to_bytes();
         let path = dir.join(&filename);
         tokio::fs::write(&path, &data).await?;
-        log_mem(format!(
+        info!("{}", format!(
             "Multi-batch lookup table written to {} ({} bytes, {} tables)",
             filename,
             data.len(),
@@ -327,7 +327,7 @@ pub fn add_lookup_buffer(buffer: BatchLookupBuffer) -> bool {
             if let Some(limit) = guard.bytes_limit {
                 let split_buffers = buffer.split_by_size(limit);
                 if split_buffers.len() > 1 {
-                    log_mem(format!(
+                    info!("{}", format!(
                         "Split oversized lookup buffer {} into {} parts",
                         buffer.id_prefix,
                         split_buffers.len()
@@ -408,7 +408,7 @@ where
         encoded[offset..offset + matrix_bytes.len()].copy_from_slice(&matrix_bytes);
     }
     let elapsed = start.elapsed();
-    log_mem(format!(
+    info!("{}", format!(
         "Serialized {} matrices for {} ({} bytes, {} bytes per matrix) in {elapsed:?}",
         num_matrices, id_prefix, total_size, max_bytes_per_matrix
     ));
@@ -441,7 +441,7 @@ where
         let path = dir_async.join(&filename_async);
         match tokio::fs::write(&path, &data_async).await {
             Ok(_) => {
-                log_mem(format!(
+                info!("{}", format!(
                     "Matrix {} written to {} ({} bytes)",
                     id_async,
                     filename_async,
@@ -464,7 +464,7 @@ where
         if let Err(e) = std::fs::write(&path, &serialized_matrix.data) {
             eprintln!("Failed to write {}: {}", path.display(), e);
         } else {
-            log_mem(format!(
+            info!("{}", format!(
                 "Matrix {} written to {} ({} bytes)",
                 serialized_matrix.id,
                 serialized_matrix.filename,
@@ -476,10 +476,10 @@ where
 
 #[cfg(feature = "debug")]
 pub fn store_and_drop_poly<P: Poly>(poly: P, dir: &Path, id: &str) {
-    log_mem(format!("Storing {id}"));
+    info!("{}", format!("Storing {id}"));
     poly.write_to_file(dir, id);
     drop(poly);
-    log_mem(format!("Stored {id}"));
+    info!("{}", format!("Stored {id}"));
 }
 
 fn build_index_for_file(
@@ -539,14 +539,14 @@ pub async fn wait_for_all_writes(
         };
 
         if !multi_buffer.lookup_tables.is_empty() {
-            log_mem(format!("Writing {} batched lookup tables", multi_buffer.lookup_tables.len()));
+            info!("{}", format!("Writing {} batched lookup tables", multi_buffer.lookup_tables.len()));
 
             let mut global_index = GlobalTableIndex::default();
 
             if let Some(limit) = bytes_limit {
                 // Split into multiple files based on byte limit
                 let file_groups = split_buffers_by_limit(&multi_buffer, limit);
-                log_mem(format!(
+                info!("{}", format!(
                     "Split into {} files with byte limit {}",
                     file_groups.len(),
                     limit
@@ -565,7 +565,7 @@ pub async fn wait_for_all_writes(
                     }
                 }
             } else {
-                log_mem("No LUT_BYTES_LIMIT set - writing all buffers to single file");
+                info!("{}", "No LUT_BYTES_LIMIT set - writing all buffers to single file");
                 let file_index_entries = build_index_for_file(&multi_buffer, 0);
                 for (id_prefix, entry) in file_index_entries {
                     global_index.entries.insert(id_prefix, entry);
@@ -582,7 +582,7 @@ pub async fn wait_for_all_writes(
             if let Err(e) = write_global_index(&global_index, &index_path).await {
                 eprintln!("Failed to write global index: {}", e);
             } else {
-                log_mem(format!(
+                info!("{}", format!(
                     "Global index written with {} entries",
                     global_index.entries.len()
                 ));
@@ -594,12 +594,12 @@ pub async fn wait_for_all_writes(
         let mut guard = handles.lock().unwrap();
         std::mem::take(guard.as_mut())
     };
-    log_mem(format!("Waiting for {} pending writes to complete", handles_vec.len()));
+    info!("{}", format!("Waiting for {} pending writes to complete", handles_vec.len()));
     for handle in handles_vec {
         if let Err(e) = handle.await {
             eprintln!("Write task failed: {e}");
         }
     }
-    log_mem("All writes completed");
+    info!("{}", "All writes completed");
     Ok(())
 }

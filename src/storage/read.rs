@@ -9,8 +9,8 @@ use crate::{
     matrix::PolyMatrix,
     poly::Poly,
     storage::write::GlobalTableIndex,
-    utils::{debug_mem, log_mem},
 };
+use tracing::{debug, info};
 
 /// Read a specific matrix from split batch files by its ID prefix and index.
 /// Uses indexed format for O(1) access to lookup tables.
@@ -89,7 +89,7 @@ where
                             let mut matrix_data = vec![0u8; bytes_per_matrix];
                             if file.read_exact(&mut matrix_data).is_ok() {
                                 let matrix = M::from_compact_bytes(params, &matrix_data);
-                                log_mem(format!(
+                                info!("{}", format!(
                                     "Found matrix {} with id_prefix {} in {} (using index hint) in {:?}",
                                     target_k,
                                     id_prefix,
@@ -137,7 +137,7 @@ where
     let index_size = u64::from_le_bytes(header_buf[16..24].try_into().unwrap()) as usize;
 
     if version != 2 {
-        log_mem(format!("Unsupported file version: {} in {}", version, filename));
+        info!("{}", format!("Unsupported file version: {} in {}", version, filename));
         return None;
     }
 
@@ -173,7 +173,7 @@ where
     file.read_exact(&mut matrix_buf).ok()?;
     let matrix = M::from_compact_bytes(params, &matrix_buf);
 
-    debug_mem(format!(
+    debug!("{}", format!(
         "Loaded matrix {} from indexed batch file {} (table: {}) in {:?} [O(1) access]",
         target_k,
         filename,

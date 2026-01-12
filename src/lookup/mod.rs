@@ -31,10 +31,7 @@ impl<P: Poly> PublicLut<P> {
         Self { f, max_output_row }
     }
 
-    pub fn new_biguint(
-        params: &P::Params,
-        f_big: HashMap<BigUint, (usize, BigUint)>,
-    ) -> Self {
+    pub fn new_biguint(params: &P::Params, f_big: HashMap<BigUint, (usize, BigUint)>) -> Self {
         let f = f_big
             .into_par_iter()
             .map(|(key, (idx, value))| {

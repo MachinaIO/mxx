@@ -1,7 +1,7 @@
 use crate::{
     matrix::{MatrixElem, MatrixParams},
     parallel_iter,
-    utils::{block_size, debug_mem},
+    utils::block_size,
 };
 use itertools::Itertools;
 use libc;
@@ -13,6 +13,7 @@ use std::{
     ops::{Add, Mul, Neg, Range, Sub},
 };
 use tempfile::NamedTempFile;
+use tracing::debug;
 
 #[cfg_attr(not(feature = "disk"), derive(Clone))]
 pub struct BaseMatrix<T: MatrixElem> {
@@ -278,7 +279,7 @@ impl<T: MatrixElem> BaseMatrix<T> {
             self.block_entries(row_offsets, col_offsets)
         };
         new_matrix.replace_entries(0..self.nrow, 0..self.ncol, self_f);
-        debug_mem("self replaced in concat_columns");
+        debug!("{}", "self replaced in concat_columns");
 
         let mut col_acc = self.ncol;
         for (idx, other) in others.iter().enumerate() {
@@ -287,7 +288,7 @@ impl<T: MatrixElem> BaseMatrix<T> {
                 other.block_entries(row_offsets, col_offsets)
             };
             new_matrix.replace_entries(0..self.nrow, col_acc..col_acc + other.ncol, other_f);
-            debug_mem(format!("the {idx}-th other replaced in concat_columns"));
+            debug!("{}", format!("the {idx}-th other replaced in concat_columns"));
             col_acc += other.ncol;
         }
         debug_assert_eq!(col_acc, updated_ncol);
@@ -312,7 +313,7 @@ impl<T: MatrixElem> BaseMatrix<T> {
             self.block_entries(row_offsets, col_offsets)
         };
         new_matrix.replace_entries(0..self.nrow, 0..self.ncol, self_f);
-        debug_mem("self replaced in concat_rows");
+        debug!("{}", "self replaced in concat_rows");
 
         let mut row_acc = self.nrow;
         for (idx, other) in others.iter().enumerate() {
@@ -321,7 +322,7 @@ impl<T: MatrixElem> BaseMatrix<T> {
                 other.block_entries(row_offsets, col_offsets)
             };
             new_matrix.replace_entries(row_acc..row_acc + other.nrow, 0..self.ncol, other_f);
-            debug_mem(format!("the {idx}-th other replaced in concat_rows"));
+            debug!("{}", format!("the {idx}-th other replaced in concat_rows"));
             row_acc += other.nrow;
         }
         debug_assert_eq!(row_acc, updated_nrow);
@@ -338,7 +339,7 @@ impl<T: MatrixElem> BaseMatrix<T> {
             self.block_entries(row_offsets, col_offsets)
         };
         new_matrix.replace_entries(0..self.nrow, 0..self.ncol, self_f);
-        debug_mem("self replaced in concat_diag");
+        debug!("{}", "self replaced in concat_diag");
 
         let mut row_acc = self.nrow;
         let mut col_acc = self.ncol;
@@ -353,7 +354,7 @@ impl<T: MatrixElem> BaseMatrix<T> {
                 col_acc..col_acc + other.ncol,
                 other_f,
             );
-            debug_mem(format!("the {idx}-th other replaced in concat_diag"));
+            debug!("{}", format!("the {idx}-th other replaced in concat_diag"));
             row_acc += other.nrow;
             col_acc += other.ncol;
         }

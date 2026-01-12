@@ -239,7 +239,6 @@ mod test {
 
     #[tokio::test]
     async fn test_lwe_plt_eval() {
-        init_storage_system();
         let _ = tracing_subscriber::fmt::try_init();
         let params = DCRTPolyParams::default();
         let plt = setup_lsb_constant_binary_plt(16, &params);
@@ -287,6 +286,7 @@ mod test {
             fs::remove_dir_all(dir).unwrap();
             fs::create_dir(dir).unwrap();
         }
+        init_storage_system(dir.to_path_buf());
         let plt_pubkey_evaluator =
             LweBggPubKeyEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>, _>::new(
                 key,

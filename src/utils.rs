@@ -83,30 +83,30 @@ macro_rules! impl_binop_with_refs {
     };
 }
 
-pub fn debug_mem<T: Into<String>>(tag: T) {
-    if let Some(usage) = memory_stats() {
-        debug!(
-            "{} || Current physical/virtual memory usage: {} | {}",
-            tag.into(),
-            usage.physical_mem,
-            usage.virtual_mem
-        );
-    } else {
-        debug!("Couldn't get the current memory usage :(");
-    }
+pub fn debug_mem<T: Into<String>>(_tag: T) {
+    // if let Some(usage) = memory_stats() {
+    //     debug!(
+    //         "{} || Current physical/virtual memory usage: {} | {}",
+    //         tag.into(),
+    //         usage.physical_mem,
+    //         usage.virtual_mem
+    //     );
+    // } else {
+    //     debug!("Couldn't get the current memory usage :(");
+    // }
 }
 
-pub fn log_mem<T: Into<String>>(tag: T) {
-    if let Some(usage) = memory_stats() {
-        info!(
-            "{} || Current physical/virtual memory usage: {} | {}",
-            tag.into(),
-            usage.physical_mem,
-            usage.virtual_mem,
-        );
-    } else {
-        info!("Couldn't get the current memory usage :(");
-    }
+pub fn log_mem<T: Into<String>>(_tag: T) {
+    // if let Some(usage) = memory_stats() {
+    //     info!(
+    //         "{} || Current physical/virtual memory usage: {} | {}",
+    //         tag.into(),
+    //         usage.physical_mem,
+    //         usage.virtual_mem,
+    //     );
+    // } else {
+    //     info!("Couldn't get the current memory usage :(");
+    // }
 }
 
 // Helper function to create a random polynomial using UniformSampler

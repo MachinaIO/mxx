@@ -14,9 +14,17 @@ use openfhe::ffi::GenerateIntegerKarney;
 use rand::{Rng, distr::Uniform, rng};
 use rayon::prelude::*;
 use std::ops::Range;
+use tracing::info;
+
+pub(crate) fn log_openfhe(tag: &str) {
+    // info!("[openfhe-ffi] {tag}");
+}
 
 pub(crate) fn gen_int_karney(mean: f64, stddev: f64) -> i64 {
-    GenerateIntegerKarney(mean, stddev)
+    log_openfhe("GenerateIntegerKarney start");
+    let out = GenerateIntegerKarney(mean, stddev);
+    log_openfhe("GenerateIntegerKarney end");
+    out
 }
 
 fn find_in_vec(vec: &[f64], search: f64) -> u32 {

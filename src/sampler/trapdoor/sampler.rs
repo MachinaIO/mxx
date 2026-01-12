@@ -1,4 +1,4 @@
-use super::{DCRTTrapdoor, utils::split_int64_mat_alt_to_elems};
+use super::{DCRTTrapdoor, utils::{log_openfhe, split_int64_mat_alt_to_elems}};
 use crate::{
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     parallel_iter,
@@ -60,6 +60,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
     ) -> Self::M {
         let d = public_matrix.row_size();
         let target_cols = target.col_size();
+        log_openfhe(&format!("preimage start d={d} target_cols={target_cols}"));
         assert_eq!(
             target.row_size(),
             d,
@@ -152,7 +153,9 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
             .concat_rows(&[&(p_hat.slice_rows(d, 2 * d) + e_z_hat)]);
         let z_hat_latter = p_hat.slice_rows(2 * d, d * (k + 2)) + z_hat_mat;
         debug_mem("z_hat generated");
-        z_hat_former.concat_rows(&[&z_hat_latter])
+        let out = z_hat_former.concat_rows(&[&z_hat_latter]);
+        log_openfhe(&format!("preimage end d={d} target_cols={target_cols}"));
+        out
     }
 
     // Algorithm 5 of https://eprint.iacr.org/2017/601.pdf
@@ -167,6 +170,9 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         let d = public_matrix.row_size();
         let ext_ncol = ext_matrix.col_size();
         let target_ncol = target.col_size();
+        log_openfhe(&format!(
+            "preimage_extend start d={d} ext_ncol={ext_ncol} target_ncol={target_ncol}"
+        ));
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
         let s = SPECTRAL_CONSTANT *
@@ -179,7 +185,11 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         let preimage_right = uniform_sampler.sample_uniform(params, ext_ncol, target_ncol, dist);
         let t = target - &(ext_matrix * &preimage_right);
         let preimage_left = self.preimage(params, trapdoor, public_matrix, &t);
-        preimage_left.concat_rows(&[&preimage_right])
+        let out = preimage_left.concat_rows(&[&preimage_right]);
+        log_openfhe(&format!(
+            "preimage_extend end d={d} ext_ncol={ext_ncol} target_ncol={target_ncol}"
+        ));
+        out
     }
 }
 
@@ -211,6 +221,7 @@ pub(crate) fn gauss_samp_gq_arb_base(
     let depth = params.crt_depth();
     let k_res_bits = params.crt_bits();
     let k_res_digits = params.modulus_digits() / depth;
+    log_openfhe(&format!("DCRTGaussSampGqArbBase start tower={tower_idx}"));
     let result = DCRTGaussSampGqArbBase(
         syndrome.get_poly(),
         c,
@@ -222,6 +233,7 @@ pub(crate) fn gauss_samp_gq_arb_base(
         sigma,
         tower_idx,
     );
+    log_openfhe(&format!("DCRTGaussSampGqArbBase end tower={tower_idx}"));
     debug_assert_eq!(result.len(), n as usize * k_res_digits);
     // let mut matrix = I64Matrix::new_empty(&I64MatrixParams, k_res, n as usize);
     parallel_iter!(0..k_res_digits)

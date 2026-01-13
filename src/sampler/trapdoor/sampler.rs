@@ -1,6 +1,7 @@
 use super::{DCRTTrapdoor, utils::split_int64_mat_alt_to_elems};
 use crate::{
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+    openfhe_guard::ensure_openfhe_warmup,
     parallel_iter,
     poly::{
         Poly, PolyParams,
@@ -13,8 +14,8 @@ use crate::{
 };
 use openfhe::ffi::DCRTGaussSampGqArbBase;
 use rayon::iter::ParallelIterator;
-use std::ops::Range;
-use tracing::debug;
+use std::{ops::Range, time::Instant};
+use tracing::{debug, info};
 
 const SIGMA: f64 = 4.578;
 const SPECTRAL_CONSTANT: f64 = 1.8;
@@ -42,12 +43,19 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         size: usize,
     ) -> (Self::Trapdoor, Self::M) {
         let trapdoor = DCRTTrapdoor::new(params, size, self.sigma);
+        debug!("{}", "trapdoor generated");
         let uniform_sampler = DCRTPolyUniformSampler::new();
+        debug!("{}", "uniform sampler created");
         let a_bar = uniform_sampler.sample_uniform(params, size, size, DistType::FinRingDist);
+        debug!("{}", "a_bar generated");
         let g = DCRTPolyMatrix::gadget_matrix(params, size);
+        debug!("{}", "gadget matrix generated");
         let a0 = a_bar.concat_columns(&[&DCRTPolyMatrix::identity(params, size, None)]);
+        debug!("{}", "a0 generated");
         let a1 = g - (a_bar * &trapdoor.r + &trapdoor.e);
+        debug!("{}", "a1 generated");
         let a = a0.concat_columns(&[&a1]);
+        debug!("{}", "public matrix generated");
         (trapdoor, a)
     }
 
@@ -58,9 +66,10 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         public_matrix: &Self::M,
         target: &Self::M,
     ) -> Self::M {
+        let preimage_start = Instant::now();
         let d = public_matrix.row_size();
         let target_cols = target.col_size();
-        assert_eq!(
+        debug_assert_eq!(
             target.row_size(),
             d,
             "Target matrix should have the same number of rows as the public matrix"
@@ -144,6 +153,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         };
         z_hat_mat.replace_entries_with_expand(0..d, 0..target_cols, k, 1, f);
         debug!("{}", "z_hat_mat generated");
+        drop(perturbed_syndrome);
         let r_z_hat = &trapdoor.r * &z_hat_mat;
         debug!("{}", "r_z_hat generated");
         let e_z_hat = &trapdoor.e * &z_hat_mat;
@@ -152,7 +162,9 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
             .concat_rows(&[&(p_hat.slice_rows(d, 2 * d) + e_z_hat)]);
         let z_hat_latter = p_hat.slice_rows(2 * d, d * (k + 2)) + z_hat_mat;
         debug!("{}", "z_hat generated");
+        drop(p_hat);
         let out = z_hat_former.concat_rows(&[&z_hat_latter]);
+        info!("preimage total time: {:?}", preimage_start.elapsed());
         out
     }
 
@@ -209,6 +221,7 @@ pub(crate) fn gauss_samp_gq_arb_base(
     sigma: f64,
     tower_idx: usize,
 ) -> Vec<Vec<i64>> {
+    ensure_openfhe_warmup(params);
     let n = params.ring_dimension();
     let depth = params.crt_depth();
     let k_res_bits = params.crt_bits();
@@ -237,6 +250,7 @@ pub(crate) fn gauss_samp_gq_arb_base(
 mod test {
     use super::*;
     use crate::{
+        __PAIR, __TestState,
         poly::PolyParams,
         sampler::{PolyUniformSampler, uniform::DCRTPolyUniformSampler},
     };
@@ -270,6 +284,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_trapdoor_generation() {
         let size: usize = 3;
         let params = DCRTPolyParams::default();
@@ -310,6 +325,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_square() {
         let params = DCRTPolyParams::default();
         let size = 3;
@@ -343,6 +359,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_non_square_target_lt() {
         let params = DCRTPolyParams::default();
         let size = 4;
@@ -380,6 +397,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_non_square_target_gt_multiple() {
         let params = DCRTPolyParams::default();
         let size = 4;
@@ -419,6 +437,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_non_square_target_gt_non_multiple() {
         let params = DCRTPolyParams::default();
         let size = 4;
@@ -457,6 +476,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_base_8() {
         let params = DCRTPolyParams::new(4, 2, 17, 3);
         let size = 4;
@@ -495,6 +515,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_base_1024() {
         let params = DCRTPolyParams::new(4, 2, 17, 10);
         let size = 4;
@@ -533,6 +554,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_extend() {
         let params = DCRTPolyParams::default();
         let size = 3;

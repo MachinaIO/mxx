@@ -1,7 +1,6 @@
 use super::poly_norm::PolyNorm;
 use crate::{impl_binop_with_refs, simulator::SimulatorContext};
 use bigdecimal::BigDecimal;
-use num_traits::One;
 use std::{
     ops::{Add, AddAssign, Mul, MulAssign},
     sync::Arc,
@@ -33,10 +32,6 @@ impl PolyMatrixNorm {
         }
     }
 
-    pub fn one(ctx: Arc<SimulatorContext>, nrow: usize, ncol: usize) -> Self {
-        Self::new(ctx, nrow, ncol, BigDecimal::one(), None)
-    }
-
     pub fn sample_gauss(
         ctx: Arc<SimulatorContext>,
         nrow: usize,
@@ -55,29 +50,13 @@ impl PolyMatrixNorm {
     // this only support d = 1
     pub fn gadget_decomposed(ctx: Arc<SimulatorContext>, ncol: usize) -> Self {
         PolyMatrixNorm {
-            nrow: ctx.log_base_q,
+            nrow: ctx.m_g,
             ncol,
             ncol_sqrt: BigDecimal::from(ncol as u64).sqrt().expect("sqrt(ncol) to failed"),
             poly_norm: PolyNorm::new(ctx.clone(), ctx.base.clone() - BigDecimal::from(1u64)),
             zero_rows: None,
         }
     }
-
-    // this only support d = 1
-    // pub fn sample_preimage(
-    //     ctx: Arc<SimulatorContext>,
-    //     nrow: usize,
-    //     ncol: usize,
-    //     norm: BigDecimal,
-    // ) -> Self {
-    //     PolyMatrixNorm {
-    //         nrow,
-    //         ncol,
-    //         ncol_sqrt: BigDecimal::from(ncol as u64).sqrt().expect("sqrt(ncol) failed"),
-    //         poly_norm: PolyNorm { ctx, norm },
-    //         zero_rows: None,
-    //     }
-    // }
 
     #[inline]
     pub fn ctx(&self) -> &SimulatorContext {
@@ -95,6 +74,18 @@ impl PolyMatrixNorm {
         let mut bottom = self.clone();
         bottom.nrow = self.nrow - top_row_size;
         (top, bottom)
+    }
+
+    pub fn split_cols(&self, left_col_size: usize) -> (Self, Self) {
+        assert!(left_col_size <= self.ncol);
+        let mut left = self.clone();
+        left.ncol = left_col_size;
+        left.ncol_sqrt =
+            BigDecimal::from(left_col_size as u64).sqrt().expect("sqrt(ncol) to failed");
+        let mut right = self.clone();
+        right.ncol = self.ncol - left_col_size;
+        right.ncol_sqrt = BigDecimal::from(right.ncol as u64).sqrt().expect("sqrt(ncol) to failed");
+        (left, right)
     }
 }
 

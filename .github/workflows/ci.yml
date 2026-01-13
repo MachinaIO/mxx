@@ -58,7 +58,7 @@ jobs:
         run: |
           cd openfhe
           mkdir -p build && cd build
-          cmake ..
+          cmake .. -DWITH_OPENMP=OFF
           make -j"$(nproc)"
           sudo make install
 
@@ -81,7 +81,7 @@ jobs:
           RUSTFLAGS: -A unused
 
       - name: Run test
-        run: cargo test
+        run: RUST_TEST_NOCAPTURE=1 cargo test -r -- --test-threads=1
   
   ci-success:
     name: ci success

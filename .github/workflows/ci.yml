@@ -58,7 +58,7 @@ jobs:
         run: |
           cd openfhe
           mkdir -p build && cd build
-          cmake ..
+          cmake .. -DWITH_OPENMP=OFF
           make -j"$(nproc)"
           sudo make install
 

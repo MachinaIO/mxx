@@ -15,7 +15,7 @@ use crate::{
 use openfhe::ffi::DCRTGaussSampGqArbBase;
 use rayon::iter::ParallelIterator;
 use std::ops::Range;
-use tracing::{debug, info};
+use tracing::debug;
 
 const SIGMA: f64 = 4.578;
 const SPECTRAL_CONSTANT: f64 = 1.8;
@@ -43,19 +43,19 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         size: usize,
     ) -> (Self::Trapdoor, Self::M) {
         let trapdoor = DCRTTrapdoor::new(params, size, self.sigma);
-        info!("{}", "trapdoor generated");
+        debug!("{}", "trapdoor generated");
         let uniform_sampler = DCRTPolyUniformSampler::new();
-        info!("{}", "uniform sampler created");
+        debug!("{}", "uniform sampler created");
         let a_bar = uniform_sampler.sample_uniform(params, size, size, DistType::FinRingDist);
-        info!("{}", "a_bar generated");
+        debug!("{}", "a_bar generated");
         let g = DCRTPolyMatrix::gadget_matrix(params, size);
-        info!("{}", "gadget matrix generated");
+        debug!("{}", "gadget matrix generated");
         let a0 = a_bar.concat_columns(&[&DCRTPolyMatrix::identity(params, size, None)]);
-        info!("{}", "a0 generated");
+        debug!("{}", "a0 generated");
         let a1 = g - (a_bar * &trapdoor.r + &trapdoor.e);
-        info!("{}", "a1 generated");
+        debug!("{}", "a1 generated");
         let a = a0.concat_columns(&[&a1]);
-        info!("{}", "public matrix generated");
+        debug!("{}", "public matrix generated");
         (trapdoor, a)
     }
 

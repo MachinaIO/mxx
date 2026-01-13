@@ -1,6 +1,7 @@
 use super::{DCRTTrapdoor, utils::split_int64_mat_alt_to_elems};
 use crate::{
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+    openfhe_guard::ensure_openfhe_warmup,
     parallel_iter,
     poly::{
         Poly, PolyParams,
@@ -14,7 +15,7 @@ use crate::{
 use openfhe::ffi::DCRTGaussSampGqArbBase;
 use rayon::iter::ParallelIterator;
 use std::ops::Range;
-use tracing::debug;
+use tracing::{debug, info};
 
 const SIGMA: f64 = 4.578;
 const SPECTRAL_CONSTANT: f64 = 1.8;
@@ -42,12 +43,19 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         size: usize,
     ) -> (Self::Trapdoor, Self::M) {
         let trapdoor = DCRTTrapdoor::new(params, size, self.sigma);
+        info!("{}", "trapdoor generated");
         let uniform_sampler = DCRTPolyUniformSampler::new();
+        info!("{}", "uniform sampler created");
         let a_bar = uniform_sampler.sample_uniform(params, size, size, DistType::FinRingDist);
+        info!("{}", "a_bar generated");
         let g = DCRTPolyMatrix::gadget_matrix(params, size);
+        info!("{}", "gadget matrix generated");
         let a0 = a_bar.concat_columns(&[&DCRTPolyMatrix::identity(params, size, None)]);
+        info!("{}", "a0 generated");
         let a1 = g - (a_bar * &trapdoor.r + &trapdoor.e);
+        info!("{}", "a1 generated");
         let a = a0.concat_columns(&[&a1]);
+        info!("{}", "public matrix generated");
         (trapdoor, a)
     }
 
@@ -209,6 +217,7 @@ pub(crate) fn gauss_samp_gq_arb_base(
     sigma: f64,
     tower_idx: usize,
 ) -> Vec<Vec<i64>> {
+    ensure_openfhe_warmup(params);
     let n = params.ring_dimension();
     let depth = params.crt_depth();
     let k_res_bits = params.crt_bits();

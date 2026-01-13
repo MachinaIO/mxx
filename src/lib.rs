@@ -8,6 +8,7 @@ pub mod element;
 pub mod gadgets;
 pub mod lookup;
 pub mod matrix;
+pub(crate) mod openfhe_guard;
 pub mod poly;
 pub mod rlwe_enc;
 pub mod sampler;

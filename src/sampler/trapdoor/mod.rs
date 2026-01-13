@@ -5,6 +5,7 @@ use crate::{
         dcrt_poly::DCRTPolyMatrix,
         i64::{I64Matrix, I64MatrixParams},
     },
+    openfhe_guard::ensure_openfhe_warmup,
     parallel_iter,
     poly::{PolyParams, dcrt::params::DCRTPolyParams},
     sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
@@ -53,6 +54,7 @@ impl DCRTTrapdoor {
         let r = &self.r;
         let e = &self.e;
         let params = &r.params;
+        ensure_openfhe_warmup(params);
         let n = params.ring_dimension() as usize;
         let (d, dk) = r.size();
         let sigma_large = dgg_large_params.1;
@@ -130,6 +132,7 @@ fn sample_p1_for_pert_mat(
     dgg_stddev: f64,
     padded_ncol: usize,
 ) -> DCRTPolyMatrix {
+    ensure_openfhe_warmup(params);
     let n = params.ring_dimension();
     let depth = params.crt_depth();
     let k_res = params.crt_bits();

@@ -7,7 +7,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct PolyPltEvaluator {}
 
-impl<P: Poly> PltEvaluator<P> for PolyPltEvaluator {
+impl<P: Poly + 'static> PltEvaluator<P> for PolyPltEvaluator {
     fn public_lookup(
         &self,
         params: &P::Params,

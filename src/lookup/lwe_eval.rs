@@ -11,7 +11,7 @@ use crate::{
     },
     utils::timed_read,
 };
-use rayon::prelude::*;
+use rayon::{iter::ParallelBridge, prelude::*};
 use std::{marker::PhantomData, path::PathBuf, sync::Arc};
 use tracing::{debug, info};
 
@@ -36,6 +36,7 @@ where
     M: PolyMatrix + Send + 'static,
     SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     ST: PolyTrapdoorSampler<M = M> + Send + Sync,
+    M::P: 'static,
 {
     fn public_lookup(
         &self,
@@ -104,6 +105,7 @@ impl<M, SH> PltEvaluator<BggEncoding<M>> for LWEBGGEncodingPltEvaluator<M, SH>
 where
     M: PolyMatrix,
     SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    M::P: 'static,
 {
     fn public_lookup(
         &self,
@@ -179,34 +181,23 @@ fn preimage_all<M, ST, P>(
     id: &GateId,
 ) -> BatchLookupBuffer
 where
-    P: Poly,
+    P: Poly + 'static,
     M: PolyMatrix<P = P> + Send + 'static,
     ST: PolyTrapdoorSampler<M = M> + Send + Sync,
 {
     let row_size = pub_matrix.row_size();
     let gadget = M::gadget_matrix(params, row_size);
-    let items: Vec<_> = plt.f.iter().collect();
     info!("start collecting preimages {}", id);
-    let preimages = items
-        .par_chunks(4)
-        .flat_map(|batch| {
-            batch
-                .iter()
-                .map(|(x_k, (k, y_k))| {
-                    let ext_matrix = a_z.clone() - &(gadget.clone() * *x_k);
-                    let target = a_lt.clone() - &(gadget.clone() * y_k.clone());
-                    (
-                        *k,
-                        trap_sampler.preimage_extend(
-                            params,
-                            trapdoor,
-                            pub_matrix,
-                            &ext_matrix,
-                            &target,
-                        ),
-                    )
-                })
-                .collect::<Vec<_>>()
+    let preimages = plt
+        .entries(params)
+        .par_bridge()
+        .map(|(x_k, (k, y_k))| {
+            let ext_matrix = a_z.clone() - &(gadget.clone() * x_k);
+            let target = a_lt.clone() - &(gadget.clone() * y_k);
+            (
+                k,
+                trap_sampler.preimage_extend(params, trapdoor, pub_matrix, &ext_matrix, &target),
+            )
         })
         .collect::<Vec<_>>();
     info!("finish collecting preimages {}", id);
@@ -230,17 +221,15 @@ mod test {
         utils::create_bit_random_poly,
     };
     use keccak_asm::Keccak256;
-    use std::{collections::HashMap, fs, path::Path};
+    use std::{fs, path::Path};
 
     fn setup_lsb_constant_binary_plt(t_n: usize, params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {
-        let mut f = HashMap::new();
-        for k in 0..t_n {
-            f.insert(
-                DCRTPoly::from_usize_to_constant(params, k),
-                (k, DCRTPoly::from_usize_to_lsb(params, k)),
-            );
-        }
-        PublicLut::<DCRTPoly>::new(f)
+        PublicLut::<DCRTPoly>::new_from_usize_range(
+            params,
+            t_n,
+            |params, k| (k, DCRTPoly::from_usize_to_lsb(params, k)),
+            None,
+        )
     }
 
     const SIGMA: f64 = 4.578;

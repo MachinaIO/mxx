@@ -48,6 +48,7 @@ where
     US: PolyUniformSampler<M = M>,
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
+    M::P: 'static,
 {
     pub fn new(
         hash_key: [u8; 32],
@@ -141,8 +142,8 @@ where
             add_lookup_buffer(get_lookup_buffer(k_l_preimages, &kl_id));
         };
 
-        for (_, (idx, y_poly)) in plt.f.iter() {
-            batch.push((*idx, y_poly.clone()));
+        for (_, (idx, y_poly)) in plt.entries(params) {
+            batch.push((idx, y_poly));
             if batch.len() >= chunk_size {
                 let current = std::mem::replace(&mut batch, Vec::with_capacity(chunk_size));
                 total_matrices += current.len();
@@ -171,6 +172,7 @@ where
     US: PolyUniformSampler<M = M> + Send + Sync,
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
+    M::P: 'static,
 {
     fn public_lookup(
         &self,
@@ -323,6 +325,7 @@ impl<M, HS> PltEvaluator<BggEncoding<M>> for GGH15BGGEncodingPltEvaluator<M, HS>
 where
     M: PolyMatrix + Send + Sync,
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    M::P: 'static,
 {
     fn public_lookup(
         &self,
@@ -382,17 +385,15 @@ mod test {
         storage::write::{init_storage_system, storage_test_lock, wait_for_all_writes},
     };
     use keccak_asm::Keccak256;
-    use std::{collections::HashMap, fs, path::Path, sync::Arc};
+    use std::{fs, path::Path, sync::Arc};
 
     fn setup_lsb_constant_binary_plt(t_n: usize, params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {
-        let mut f = HashMap::new();
-        for k in 0..t_n {
-            f.insert(
-                DCRTPoly::from_usize_to_constant(params, k),
-                (k, DCRTPoly::from_usize_to_lsb(params, k)),
-            );
-        }
-        PublicLut::<DCRTPoly>::new(f)
+        PublicLut::<DCRTPoly>::new_from_usize_range(
+            params,
+            t_n,
+            |params, k| (k, DCRTPoly::from_usize_to_lsb(params, k)),
+            None,
+        )
     }
 
     const SIGMA: f64 = 4.578;

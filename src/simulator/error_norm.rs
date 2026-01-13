@@ -260,7 +260,6 @@ mod tests {
         simulator::SimulatorContext,
     };
     use bigdecimal::BigDecimal;
-    use std::collections::HashMap;
 
     fn make_ctx() -> Arc<SimulatorContext> {
         // secpar_sqrt=50, ring_dim_sqrt=1024, base=32, log_base_q=(128/32)*7 = 28
@@ -356,16 +355,16 @@ mod tests {
     fn test_wire_norm_lwe_plt_bounds() {
         // Build a tiny LUT on DCRTPoly where the maximum output coeff is known (e.g., 7)
         let params = DCRTPolyParams::default();
-        let mut f = HashMap::new();
-        f.insert(
-            DCRTPoly::from_usize_to_constant(&params, 0),
-            (0usize, DCRTPoly::from_usize_to_constant(&params, 5)),
+        let plt = PublicLut::<DCRTPoly>::new_from_usize_range(
+            &params,
+            2,
+            |params, idx| match idx {
+                0 => (0usize, DCRTPoly::from_usize_to_constant(params, 5)),
+                1 => (1usize, DCRTPoly::from_usize_to_constant(params, 7)),
+                _ => unreachable!("index out of range for test LUT"),
+            },
+            None,
         );
-        f.insert(
-            DCRTPoly::from_usize_to_constant(&params, 1),
-            (1usize, DCRTPoly::from_usize_to_constant(&params, 7)),
-        );
-        let plt = PublicLut::<DCRTPoly>::new(f);
 
         // Circuit: out = PLT(in)
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -394,16 +393,16 @@ mod tests {
     fn test_wire_norm_ggh15_plt_bounds() {
         // Build a tiny LUT on DCRTPoly where the maximum output coeff is known (e.g., 7)
         let params = DCRTPolyParams::default();
-        let mut f = HashMap::new();
-        f.insert(
-            DCRTPoly::from_usize_to_constant(&params, 0),
-            (0usize, DCRTPoly::from_usize_to_constant(&params, 5)),
+        let plt = PublicLut::<DCRTPoly>::new_from_usize_range(
+            &params,
+            2,
+            |params, idx| match idx {
+                0 => (0usize, DCRTPoly::from_usize_to_constant(params, 5)),
+                1 => (1usize, DCRTPoly::from_usize_to_constant(params, 7)),
+                _ => unreachable!("index out of range for test LUT"),
+            },
+            None,
         );
-        f.insert(
-            DCRTPoly::from_usize_to_constant(&params, 1),
-            (1usize, DCRTPoly::from_usize_to_constant(&params, 7)),
-        );
-        let plt = PublicLut::<DCRTPoly>::new(f);
 
         // Circuit: out = PLT(in)
         let mut circuit = PolyCircuit::<DCRTPoly>::new();

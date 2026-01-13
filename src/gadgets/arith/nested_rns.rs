@@ -5,8 +5,9 @@ use crate::{
     utils::{mod_inverse, round_div},
 };
 use num_bigint::BigUint;
-use num_traits::{One, ToPrimitive, Zero};
-use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+use num_traits::{One, ToPrimitive};
+use std::{marker::PhantomData, sync::Arc};
+use tracing::debug;
 
 #[derive(Debug, Clone)]
 pub struct NestedRnsPolyContext {
@@ -25,14 +26,28 @@ pub struct NestedRnsPolyContext {
     pub scalars_v: Vec<Vec<u32>>, // scalars_v[q_k][p_i] = [[p]_{q_k}]_{p_i}
 }
 
-fn dummy_lut_map() -> HashMap<BigUint, (usize, BigUint)> {
-    let mut map = HashMap::new();
-    map.insert(BigUint::zero(), (0, BigUint::zero()));
-    map
+fn dummy_lut<P: Poly + 'static>(params: &P::Params) -> PublicLut<P> {
+    PublicLut::new_from_usize_range(
+        params,
+        1,
+        |params, _| (0, P::from_usize_to_constant(params, 0)),
+        None,
+    )
+}
+
+fn max_output_row_from_biguint<P: Poly>(
+    params: &P::Params,
+    idx: usize,
+    value: BigUint,
+) -> (usize, P::Elem) {
+    let poly = P::from_biguint_to_constant(params, value);
+    let coeff =
+        poly.coeffs().into_iter().max().expect("max_output_row requires at least one coefficient");
+    (idx, coeff)
 }
 
 impl NestedRnsPolyContext {
-    pub fn setup<P: Poly>(
+    pub fn setup<P: Poly + 'static>(
         circuit: &mut PolyCircuit<P>,
         params: &P::Params,
         p_moduli_bits: usize,
@@ -43,10 +58,13 @@ impl NestedRnsPolyContext {
         let q_moduli_min = q_moduli.iter().min().expect("there should be at least one q modulus");
         let q_moduli_max = q_moduli.iter().max().expect("there should be at least one q modulus");
         let p_moduli = sample_crt_primes(p_moduli_bits, *q_moduli_max);
+        debug!(
+            "NestedRnsPolyContext setup: p_moduli = {:?}, q_moduli = {:?}, scale = {}",
+            p_moduli, q_moduli, scale
+        );
         let p_moduli_depth = p_moduli.len();
         if dummy_scalar {
-            let dummy_map = dummy_lut_map();
-            let dummy_lut = PublicLut::<P>::new_biguint(params, dummy_map);
+            let dummy_lut = dummy_lut::<P>(params);
             let lut_mod_p = circuit.register_public_lookup(dummy_lut.clone());
             let lut_x_to_y = circuit.register_public_lookup(dummy_lut.clone());
             let lut_x_to_real = circuit.register_public_lookup(dummy_lut.clone());
@@ -87,49 +105,88 @@ impl NestedRnsPolyContext {
                 lut_mod_p_map_size < *q_moduli_min as u128,
                 "LUT size exceeds q modulus size; increase q_moduli_bits or decrease p_moduli_bits"
             );
-            let lut_mod_p_map = HashMap::from_iter((0..(lut_mod_p_map_size as usize)).map(|t| {
-                let input = BigUint::from(t as u64);
-                let output = BigUint::from(t as u64 % p_i);
-                (input, (t as usize, output))
-            }));
-            lut_mod_p.push(
-                circuit.register_public_lookup(PublicLut::<P>::new_biguint(params, lut_mod_p_map)),
+            let lut_mod_p_len = lut_mod_p_map_size as usize;
+            let max_mod_p_row = max_output_row_from_biguint::<P>(
+                params,
+                (p_i - 1) as usize,
+                BigUint::from(p_i - 1),
             );
+            let lut_mod_p_lut = PublicLut::<P>::new_from_usize_range(
+                params,
+                lut_mod_p_len,
+                move |params, t| {
+                    let output = BigUint::from((t as u64) % p_i);
+                    (t, P::from_biguint_to_constant(params, output))
+                },
+                Some(max_mod_p_row),
+            );
+            debug!("Constructed lut_mod_p for p_{} = {}", p_i_idx, p_i);
+            lut_mod_p.push(circuit.register_public_lookup(lut_mod_p_lut));
 
             let p_moduli_big = BigUint::from(p_i);
+            let p_over_pi_mod_pi = (&p_over_pis[p_i_idx] % &p_moduli_big)
+                .to_u64()
+                .expect("CRT residue must fit in u64");
             let p_over_pi_inv = {
-                let residue = (&p_over_pis[p_i_idx] % &p_moduli_big)
-                    .to_u64()
-                    .expect("CRT residue must fit in u64");
-                let inv = mod_inverse(residue, p_i).expect("CRT moduli must be coprime");
+                let inv = mod_inverse(p_over_pi_mod_pi, p_i).expect("CRT moduli must be coprime");
                 // info!("{}", format!("pi = {}, p_over_pi = {}, inv = {}", pi, p_over_pi, inv));
                 BigUint::from(inv)
             };
 
-            let lut_x_to_y_map = HashMap::from_iter((0..(p_moduli_square as usize)).map(|t| {
-                let input = BigUint::from(t as u64);
-                let output = (&input * &p_over_pi_inv) % &p_moduli_big;
-                (input, (t as usize, output))
-            }));
-            lut_x_to_y.push(
-                circuit.register_public_lookup(PublicLut::<P>::new_biguint(params, lut_x_to_y_map)),
+            let max_idx_mod_pi =
+                (((p_i - 1) as u128 * p_over_pi_mod_pi as u128) % p_i as u128) as usize;
+            let max_x_to_y_row =
+                max_output_row_from_biguint::<P>(params, max_idx_mod_pi, BigUint::from(p_i - 1));
+            let max_x_to_real_value = round_div((p_i - 1) * scale, p_i);
+            let max_x_to_real_row = max_output_row_from_biguint::<P>(
+                params,
+                max_idx_mod_pi,
+                BigUint::from(max_x_to_real_value),
             );
 
-            let lut_x_to_real_map = HashMap::from_iter((0..(p_moduli_square as usize)).map(|t| {
-                let input = BigUint::from(t as u64);
-                let y = ((&input * &p_over_pi_inv) % &p_moduli_big)
-                    .to_u64()
-                    .expect("y must fit in u64");
-                let output = BigUint::from(round_div(y * scale, p_i));
-                (input, (t as usize, output))
-            }));
-            lut_x_to_real.push(
-                circuit
-                    .register_public_lookup(PublicLut::<P>::new_biguint(params, lut_x_to_real_map)),
+            let p_over_pi_inv = Arc::new(p_over_pi_inv);
+            let p_moduli_big = Arc::new(p_moduli_big);
+            let lut_x_to_y_len = p_moduli_square as usize;
+            let lut_x_to_y_lut = PublicLut::<P>::new_from_usize_range(
+                params,
+                lut_x_to_y_len,
+                {
+                    let p_over_pi_inv = Arc::clone(&p_over_pi_inv);
+                    let p_moduli_big = Arc::clone(&p_moduli_big);
+                    move |params, t| {
+                        let input = BigUint::from(t as u64);
+                        let output = (&input * p_over_pi_inv.as_ref()) % p_moduli_big.as_ref();
+                        (t, P::from_biguint_to_constant(params, output))
+                    }
+                },
+                Some(max_x_to_y_row),
             );
+            debug!("Constructed lut_x_to_y for p_{} = {}", p_i_idx, p_i);
+            lut_x_to_y.push(circuit.register_public_lookup(lut_x_to_y_lut));
+
+            let lut_x_to_real_len = p_moduli_square as usize;
+            let lut_x_to_real_lut = PublicLut::<P>::new_from_usize_range(
+                params,
+                lut_x_to_real_len,
+                {
+                    let p_over_pi_inv = Arc::clone(&p_over_pi_inv);
+                    let p_moduli_big = Arc::clone(&p_moduli_big);
+                    move |params, t| {
+                        let input = BigUint::from(t as u64);
+                        let y = ((&input * p_over_pi_inv.as_ref()) % p_moduli_big.as_ref())
+                            .to_u64()
+                            .expect("y must fit in u64");
+                        let output = BigUint::from(round_div(y * scale, p_i));
+                        (t, P::from_biguint_to_constant(params, output))
+                    }
+                },
+                Some(max_x_to_real_row),
+            );
+            debug!("Constructed lut_x_to_real for p_{} = {}", p_i_idx, p_i);
+            lut_x_to_real.push(circuit.register_public_lookup(lut_x_to_real_lut));
 
             wires_p_moduli.push(circuit.const_digits(&[p_i as u32]));
-
+            debug!("Computed LUTs for p_{} = {}", p_i_idx, p_i);
             for (q_idx, q_k) in q_moduli.iter().enumerate() {
                 for (p_j_idx, p_over_pj) in p_over_pis.iter().enumerate() {
                     let p_over_pj_mod_qk = (p_over_pj % BigUint::from(*q_k))
@@ -142,17 +199,27 @@ impl NestedRnsPolyContext {
                     (&p % BigUint::from(*q_k)).to_u64().expect("CRT residue must fit in u64");
                 let p_mod_qk_mod_pi = p_mod_qk % p_i;
                 scalars_v[q_idx][p_i_idx] = p_mod_qk_mod_pi as u32;
+                debug!("Computed scalars for q_{} = {} and p_{} = {}", q_idx, q_k, p_i_idx, p_i);
             }
         }
 
         let max_real = scale * p_moduli_depth as u64;
-        let lut_real_to_v_map = HashMap::from_iter((0..=max_real as usize).map(|t| {
-            let input = BigUint::from(t as u64);
-            let output = BigUint::from(round_div(t as u64, scale));
-            (input, (t as usize, output))
-        }));
-        let lut_real_to_v =
-            circuit.register_public_lookup(PublicLut::<P>::new_biguint(params, lut_real_to_v_map));
+        let lut_real_to_v_len = max_real as usize + 1;
+        let max_real_to_v_row = max_output_row_from_biguint::<P>(
+            params,
+            max_real as usize,
+            BigUint::from(round_div(max_real, scale)),
+        );
+        let lut_real_to_v_lut = PublicLut::<P>::new_from_usize_range(
+            params,
+            lut_real_to_v_len,
+            move |params, t| {
+                let output = BigUint::from(round_div(t as u64, scale));
+                (t, P::from_biguint_to_constant(params, output))
+            },
+            Some(max_real_to_v_row),
+        );
+        let lut_real_to_v = circuit.register_public_lookup(lut_real_to_v_lut);
         Self {
             p_moduli,
             p_moduli_bits,
@@ -523,7 +590,7 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
         let modulus = params.modulus();
-        let a_value: BigUint = BigUint::zero();
+        let a_value: BigUint = BigUint::ZERO;
         let b_value: BigUint = modulus.as_ref() - BigUint::from(1u64);
         test_nested_rns_poly_sub_full_reduce_generic(circuit, params, ctx, a_value, b_value);
     }

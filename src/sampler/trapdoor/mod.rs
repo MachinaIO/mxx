@@ -5,6 +5,7 @@ use crate::{
         dcrt_poly::DCRTPolyMatrix,
         i64::{I64Matrix, I64MatrixParams},
     },
+    openfhe_guard::ensure_openfhe_warmup,
     parallel_iter,
     poly::{PolyParams, dcrt::params::DCRTPolyParams},
     sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
@@ -12,7 +13,10 @@ use crate::{
 use openfhe::ffi::{FormatMatrixCoefficient, SampleP1ForPertMat};
 use rayon::iter::ParallelIterator;
 pub use sampler::DCRTPolyTrapdoorSampler;
-use std::ops::Range;
+use std::{
+    ops::Range,
+    sync::{Mutex, OnceLock},
+};
 use tracing::debug;
 use utils::{gen_dgg_int_vec, gen_int_karney, split_int64_mat_to_elems};
 
@@ -20,11 +24,16 @@ pub mod sampler;
 pub mod utils;
 
 pub(crate) const KARNEY_THRESHOLD: f64 = 300.0;
+static SAMPLE_P1_FOR_PERT_MAT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DCRTTrapdoor {
     pub r: DCRTPolyMatrix,
     pub e: DCRTPolyMatrix,
+    pub a_mat: DCRTPolyMatrix,
+    pub b_mat: DCRTPolyMatrix,
+    pub d_mat: DCRTPolyMatrix,
+    pub re: DCRTPolyMatrix,
 }
 
 impl DCRTTrapdoor {
@@ -34,7 +43,11 @@ impl DCRTTrapdoor {
         let dist = DistType::GaussDist { sigma };
         let r = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
         let e = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
-        Self { r, e }
+        let a_mat = &r * &r.transpose(); // d x d
+        let b_mat = &r * &e.transpose(); // d x d
+        let d_mat = &e * &e.transpose(); // d x d
+        let re = r.concat_rows(&[&e]);
+        Self { r, e, a_mat, b_mat, d_mat, re }
     }
 
     pub fn sample_pert_square_mat(
@@ -47,8 +60,8 @@ impl DCRTTrapdoor {
         total_ncol: usize,
     ) -> DCRTPolyMatrix {
         let r = &self.r;
-        let e = &self.e;
         let params = &r.params;
+        ensure_openfhe_warmup(params);
         let n = params.ring_dimension() as usize;
         let (d, dk) = r.size();
         let sigma_large = dgg_large_params.1;
@@ -89,23 +102,26 @@ impl DCRTTrapdoor {
         debug!("{}", "p2z_vec generated");
         // create a matrix of d*k x padded_ncol ring elements in coefficient representation
         let p2 = split_int64_mat_to_elems(&p2z_vec, params);
+        drop(p2z_vec);
         // parallel_iter!(0..padded_ncol)
         //     .map(|i| split_int64_vec_to_elems(&p2z_vec.slice(0, n * dk, i, i + 1), params))
         //     .collect::<Vec<_>>();
         // debug_mem("p2_vecs generated");
         // let p2 = p2_vecs[0].concat_columns(&p2_vecs[1..].iter().collect::<Vec<_>>());
         debug!("{}", "p2 generated");
-        let a_mat = r.clone() * r.transpose(); // d x d
-        let b_mat = r.clone() * e.transpose(); // d x d
-        let d_mat = e.clone() * e.transpose(); // d x d
-        debug!("{}", "a_mat, b_mat, d_mat generated");
-        let re = r.concat_rows(&[e]);
-        debug!("{}", "re generated");
+        let a_mat = self.a_mat.clone();
+        let b_mat = self.b_mat.clone();
+        let d_mat = self.d_mat.clone();
+        debug!("{}", "a_mat, b_mat, d_mat loaded");
+        let re = &self.re;
+        debug!("{}", "re loaded");
         let tp2 = re * &p2;
         debug!("{}", "tp2 generated");
         let p1 = sample_p1_for_pert_mat(a_mat, b_mat, d_mat, tp2, params, c, s, dgg, padded_ncol);
         debug!("{}", "p1 generated");
         let mut p = p1.concat_rows(&[&p2]);
+        drop(p1);
+        drop(p2);
         debug!("{}", "p1 and p2 concatenated");
         if padding_ncol > 0 {
             p = p.slice_columns(0, total_ncol);
@@ -126,6 +142,7 @@ fn sample_p1_for_pert_mat(
     dgg_stddev: f64,
     padded_ncol: usize,
 ) -> DCRTPolyMatrix {
+    ensure_openfhe_warmup(params);
     let n = params.ring_dimension();
     let depth = params.crt_depth();
     let k_res = params.crt_bits();
@@ -139,19 +156,27 @@ fn sample_p1_for_pert_mat(
     debug!("{}", "a_mat, b_mat, d_mat are converted to cpp matrices");
     let mut tp2_cpp = tp2.to_cpp_matrix_ptr();
     FormatMatrixCoefficient(tp2_cpp.inner.as_mut().unwrap());
-    let cpp_matrix = SampleP1ForPertMat(
-        &a_mat.inner,
-        &b_mat.inner,
-        &d_mat.inner,
-        &tp2_cpp.inner,
-        n,
-        depth,
-        k_res,
-        padded_ncol,
-        c,
-        s,
-        dgg_stddev,
-    );
+    drop(tp2);
+    let cpp_matrix = {
+        let _lock = SAMPLE_P1_FOR_PERT_MAT_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        SampleP1ForPertMat(
+            &a_mat.inner,
+            &b_mat.inner,
+            &d_mat.inner,
+            &tp2_cpp.inner,
+            n,
+            depth,
+            k_res,
+            padded_ncol,
+            c,
+            s,
+            dgg_stddev,
+        )
+    };
     debug!("{}", "SampleP1ForPertSquareMat called");
-    DCRTPolyMatrix::from_cpp_matrix_ptr(params, &CppMatrix::new(params, cpp_matrix))
+    drop(a_mat);
+    drop(b_mat);
+    drop(d_mat);
+    drop(tp2_cpp);
+    DCRTPolyMatrix::from_cpp_matrix_ptr(params, &CppMatrix::new(cpp_matrix))
 }

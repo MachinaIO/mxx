@@ -280,6 +280,7 @@ impl<M: PolyMatrix> Wee25Commit<M> {
 mod tests {
     use super::*;
     use crate::{
+        __PAIR, __TestState,
         matrix::{MatrixElem, dcrt_poly::DCRTPolyMatrix},
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         sampler::{trapdoor::sampler::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler},
@@ -287,6 +288,7 @@ mod tests {
     const SIGMA: f64 = 4.578;
 
     #[test]
+    #[sequential_test::sequential]
     fn test_wee25_zero_commit_verify() {
         let params = DCRTPolyParams::new(4, 2, 17, 15);
         let secret_size = 1;
@@ -307,6 +309,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_wee25_zero_commit_invalid_verify() {
         let params = DCRTPolyParams::new(4, 2, 17, 15);
         let secret_size = 1;
@@ -328,6 +331,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_wee25_random_commit_verify() {
         let params = DCRTPolyParams::new(4, 2, 17, 15);
         let secret_size = 1;
@@ -351,6 +355,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_wee25_random_commit_invalid_verify() {
         let params = DCRTPolyParams::new(4, 2, 17, 15);
         let secret_size = 1;
@@ -378,6 +383,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_wee25_random_vector_commit_verify() {
         let params = DCRTPolyParams::new(4, 2, 17, 15);
         let secret_size = 2;

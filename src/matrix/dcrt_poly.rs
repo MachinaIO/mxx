@@ -9,7 +9,7 @@ use crate::{
     utils::block_size,
 };
 use itertools::Itertools;
-use num_bigint::BigUint;
+use num_traits::ToPrimitive;
 use openfhe::ffi::{DCRTPolyGadgetVector, MatrixGen, SetMatrixElement};
 use rayon::prelude::*;
 use std::{io::Read, ops::Range, path::Path};
@@ -137,14 +137,15 @@ impl PolyMatrix for DCRTPolyMatrix {
                         .collect()
                 })
                 .collect();
-            parallel_iter!(0..new_nrow)
+            let out = parallel_iter!(0..new_nrow)
                 .map(|idx| {
                     let i = idx / log_base_q;
                     let k = idx % log_base_q;
 
                     parallel_iter!(0..ncol).map(|j| decomposed_entries[i][j][k].clone()).collect()
                 })
-                .collect()
+                .collect();
+            out
         };
         new_matrix.replace_entries_with_expand(0..self.nrow, 0..self.ncol, log_base_q, 1, f);
         new_matrix
@@ -323,7 +324,7 @@ impl DCRTPolyMatrix {
                 SetMatrixElement(matrix_ptr.as_mut().unwrap(), i, j, self.entry(i, j).get_poly());
             }
         }
-        CppMatrix::new(&self.params, matrix_ptr)
+        CppMatrix::new(matrix_ptr)
     }
 
     pub(crate) fn from_cpp_matrix_ptr(params: &DCRTPolyParams, cpp_matrix: &CppMatrix) -> Self {
@@ -345,7 +346,7 @@ impl DCRTPolyMatrix {
             params.modulus_digits(),
             base,
         );
-        DCRTPolyMatrix::from_cpp_matrix_ptr(params, &CppMatrix::new(params, g_vec_cpp))
+        DCRTPolyMatrix::from_cpp_matrix_ptr(params, &CppMatrix::new(g_vec_cpp))
     }
 
     fn dcrt_decompose_poly(&self, poly: &DCRTPoly, base_bits: u32) -> Vec<DCRTPoly> {
@@ -353,29 +354,39 @@ impl DCRTPolyMatrix {
         // but clamp each digit to its valid bit-width, especially for the most-significant
         // digit when base_bits does not divide crt_bits.
         let decomposed = poly.get_poly().Decompose(base_bits);
-        let cpp_decomposed = CppMatrix::new(&self.params, decomposed);
+        let cpp_decomposed = CppMatrix::new(decomposed);
+        let decompose_last_mask = match self.params.decompose_last_mask() {
+            Some(mask) => mask,
+            None => {
+                return parallel_iter!(0..cpp_decomposed.ncol())
+                    .map(|idx| cpp_decomposed.entry(0, idx))
+                    .collect()
+            }
+        };
+        let digits_per_tower = self.params.crt_bits().div_ceil(base_bits as usize);
+        let last_digit_in_tower = digits_per_tower - 1;
         parallel_iter!(0..cpp_decomposed.ncol())
-            .map(|idx| match self.params.decompose_last_mask() {
-                None => cpp_decomposed.entry(0, idx),
-                Some(decompose_last_mask) => {
-                    let digits_per_tower = self.params.crt_bits().div_ceil(base_bits as usize);
-                    let digit_poly = cpp_decomposed.entry(0, idx);
-                    // Determine effective bit-width for this digit within its CRT tower
-                    let pos_in_tower = idx % digits_per_tower;
-                    let is_last_in_tower = pos_in_tower + 1 == digits_per_tower;
-                    if !is_last_in_tower {
-                        return digit_poly;
-                    }
-
-                    // Clamp the coefficients of this digit to the mask
-                    let masked_values: Vec<BigUint> = digit_poly
-                        .coeffs()
-                        .into_par_iter()
-                        .map(|c| c.value() & BigUint::from(decompose_last_mask))
-                        .collect();
-
-                    DCRTPoly::from_biguints(&self.params, &masked_values)
+            .map(|idx| {
+                let digit_poly = cpp_decomposed.entry(0, idx);
+                // Determine effective bit-width for this digit within its CRT tower
+                if idx % digits_per_tower != last_digit_in_tower {
+                    return digit_poly;
                 }
+
+                // Clamp the coefficients of this digit to the mask (u64 assumed)
+                let masked_values: Vec<Vec<u64>> = digit_poly
+                    .coeffs()
+                    .into_par_iter()
+                    .map(|c| {
+                        let value = c
+                            .value()
+                            .to_u64()
+                            .expect("coefficient must fit in u64 for masked decomposition");
+                        vec![value & decompose_last_mask]
+                    })
+                    .collect();
+
+                DCRTPoly::poly_gen_from_vec(&self.params, &masked_values)
             })
             .collect()
     }

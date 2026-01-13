@@ -163,5 +163,5 @@ fn sample_p1_for_pert_mat(
         )
     };
     debug!("{}", "SampleP1ForPertSquareMat called");
-    DCRTPolyMatrix::from_cpp_matrix_ptr(params, &CppMatrix::new(params, cpp_matrix))
+    DCRTPolyMatrix::from_cpp_matrix_ptr(params, &CppMatrix::new(cpp_matrix))
 }

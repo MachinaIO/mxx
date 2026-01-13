@@ -62,7 +62,7 @@ impl DCRTPoly {
         DCRTPoly::from_coeffs(params, &new_coeffs)
     }
 
-    fn poly_gen_from_vec(params: &DCRTPolyParams, values: &[Vec<u64>]) -> Self {
+    pub(crate) fn poly_gen_from_vec(params: &DCRTPolyParams, values: &[Vec<u64>]) -> Self {
         let limbs_per_int = values.iter().map(|vs| vs.len()).max().unwrap_or(0);
         let values_refs = values.iter().map(|vs| vs.as_slice()).collect::<Vec<_>>();
         let values_limbs = pack_dcrtpoly_u64_limbs_le(&values_refs, limbs_per_int);

@@ -244,9 +244,7 @@ static STORAGE_TEST_SEM: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new()
 
 #[cfg(test)]
 pub async fn storage_test_lock() -> tokio::sync::OwnedSemaphorePermit {
-    let sem = STORAGE_TEST_SEM
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
-        .clone();
+    let sem = STORAGE_TEST_SEM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1))).clone();
     sem.acquire_owned().await.expect("storage test lock closed")
 }
 

@@ -337,9 +337,9 @@ where
             .plaintext
             .as_ref()
             .expect("the BGG encoding should reveal plaintext for public lookup");
-        let (k, y) = plt
-            .get(params, x)
-            .unwrap_or_else(|| panic!("{:?} not found in LUT for gate {}", x.to_const_int(), gate_id));
+        let (k, y) = plt.get(params, x).unwrap_or_else(|| {
+            panic!("{:?} not found in LUT for gate {}", x.to_const_int(), gate_id)
+        });
 
         let dir = std::path::Path::new(&self.dir_path);
         let gate_bundle_id = format!("ggh15_gate_bundle_{}", gate_id);

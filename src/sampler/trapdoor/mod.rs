@@ -102,6 +102,7 @@ impl DCRTTrapdoor {
         debug!("{}", "p2z_vec generated");
         // create a matrix of d*k x padded_ncol ring elements in coefficient representation
         let p2 = split_int64_mat_to_elems(&p2z_vec, params);
+        drop(p2z_vec);
         // parallel_iter!(0..padded_ncol)
         //     .map(|i| split_int64_vec_to_elems(&p2z_vec.slice(0, n * dk, i, i + 1), params))
         //     .collect::<Vec<_>>();
@@ -119,6 +120,8 @@ impl DCRTTrapdoor {
         let p1 = sample_p1_for_pert_mat(a_mat, b_mat, d_mat, tp2, params, c, s, dgg, padded_ncol);
         debug!("{}", "p1 generated");
         let mut p = p1.concat_rows(&[&p2]);
+        drop(p1);
+        drop(p2);
         debug!("{}", "p1 and p2 concatenated");
         if padding_ncol > 0 {
             p = p.slice_columns(0, total_ncol);
@@ -153,6 +156,7 @@ fn sample_p1_for_pert_mat(
     debug!("{}", "a_mat, b_mat, d_mat are converted to cpp matrices");
     let mut tp2_cpp = tp2.to_cpp_matrix_ptr();
     FormatMatrixCoefficient(tp2_cpp.inner.as_mut().unwrap());
+    drop(tp2);
     let cpp_matrix = {
         let _lock = SAMPLE_P1_FOR_PERT_MAT_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         SampleP1ForPertMat(
@@ -170,5 +174,9 @@ fn sample_p1_for_pert_mat(
         )
     };
     debug!("{}", "SampleP1ForPertSquareMat called");
+    drop(a_mat);
+    drop(b_mat);
+    drop(d_mat);
+    drop(tp2_cpp);
     DCRTPolyMatrix::from_cpp_matrix_ptr(params, &CppMatrix::new(cpp_matrix))
 }

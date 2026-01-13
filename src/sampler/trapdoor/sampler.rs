@@ -14,8 +14,8 @@ use crate::{
 };
 use openfhe::ffi::DCRTGaussSampGqArbBase;
 use rayon::iter::ParallelIterator;
-use std::ops::Range;
-use tracing::debug;
+use std::{ops::Range, time::Instant};
+use tracing::{debug, info};
 
 const SIGMA: f64 = 4.578;
 const SPECTRAL_CONSTANT: f64 = 1.8;
@@ -66,9 +66,10 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         public_matrix: &Self::M,
         target: &Self::M,
     ) -> Self::M {
+        let preimage_start = Instant::now();
         let d = public_matrix.row_size();
         let target_cols = target.col_size();
-        assert_eq!(
+        debug_assert_eq!(
             target.row_size(),
             d,
             "Target matrix should have the same number of rows as the public matrix"
@@ -152,6 +153,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         };
         z_hat_mat.replace_entries_with_expand(0..d, 0..target_cols, k, 1, f);
         debug!("{}", "z_hat_mat generated");
+        drop(perturbed_syndrome);
         let r_z_hat = &trapdoor.r * &z_hat_mat;
         debug!("{}", "r_z_hat generated");
         let e_z_hat = &trapdoor.e * &z_hat_mat;
@@ -160,7 +162,9 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
             .concat_rows(&[&(p_hat.slice_rows(d, 2 * d) + e_z_hat)]);
         let z_hat_latter = p_hat.slice_rows(2 * d, d * (k + 2)) + z_hat_mat;
         debug!("{}", "z_hat generated");
+        drop(p_hat);
         let out = z_hat_former.concat_rows(&[&z_hat_latter]);
+        info!("preimage total time: {:?}", preimage_start.elapsed());
         out
     }
 

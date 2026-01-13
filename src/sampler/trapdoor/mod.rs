@@ -13,7 +13,10 @@ use crate::{
 use openfhe::ffi::{FormatMatrixCoefficient, SampleP1ForPertMat};
 use rayon::iter::ParallelIterator;
 pub use sampler::DCRTPolyTrapdoorSampler;
-use std::ops::Range;
+use std::{
+    ops::Range,
+    sync::{Mutex, OnceLock},
+};
 use tracing::debug;
 use utils::{gen_dgg_int_vec, gen_int_karney, split_int64_mat_to_elems};
 
@@ -21,6 +24,7 @@ pub mod sampler;
 pub mod utils;
 
 pub(crate) const KARNEY_THRESHOLD: f64 = 300.0;
+static SAMPLE_P1_FOR_PERT_MAT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DCRTTrapdoor {
@@ -142,19 +146,22 @@ fn sample_p1_for_pert_mat(
     debug!("{}", "a_mat, b_mat, d_mat are converted to cpp matrices");
     let mut tp2_cpp = tp2.to_cpp_matrix_ptr();
     FormatMatrixCoefficient(tp2_cpp.inner.as_mut().unwrap());
-    let cpp_matrix = SampleP1ForPertMat(
-        &a_mat.inner,
-        &b_mat.inner,
-        &d_mat.inner,
-        &tp2_cpp.inner,
-        n,
-        depth,
-        k_res,
-        padded_ncol,
-        c,
-        s,
-        dgg_stddev,
-    );
+    let cpp_matrix = {
+        let _lock = SAMPLE_P1_FOR_PERT_MAT_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        SampleP1ForPertMat(
+            &a_mat.inner,
+            &b_mat.inner,
+            &d_mat.inner,
+            &tp2_cpp.inner,
+            n,
+            depth,
+            k_res,
+            padded_ncol,
+            c,
+            s,
+            dgg_stddev,
+        )
+    };
     debug!("{}", "SampleP1ForPertSquareMat called");
     DCRTPolyMatrix::from_cpp_matrix_ptr(params, &CppMatrix::new(cpp_matrix))
 }

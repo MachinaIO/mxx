@@ -81,7 +81,7 @@ jobs:
           RUSTFLAGS: -A unused
 
       - name: Run test
-        run: cargo test
+        run: RAYON_NUM_THREADS=1 cargo test -r
   
   ci-success:
     name: ci success

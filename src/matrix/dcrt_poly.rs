@@ -265,8 +265,8 @@ impl PolyMatrix for DCRTPolyMatrix {
     fn to_compact_bytes(&self) -> Vec<u8> {
         let entries = self.block_entries(0..self.nrow, 0..self.ncol);
         let entries_bytes: Vec<Vec<Vec<u8>>> = entries
-            .iter()
-            .map(|row| row.iter().map(|poly| poly.to_compact_bytes()).collect())
+            .par_iter()
+            .map(|row| row.par_iter().map(|poly| poly.to_compact_bytes()).collect())
             .collect();
 
         bincode::encode_to_vec(&entries_bytes, bincode::config::standard())
@@ -284,10 +284,9 @@ impl PolyMatrix for DCRTPolyMatrix {
         let mut matrix = Self::new_empty(params, nrow, ncol);
 
         let f = |row_range: Range<usize>, col_range: Range<usize>| -> Vec<Vec<DCRTPoly>> {
-            row_range
+            parallel_iter!(row_range)
                 .map(|i| {
-                    col_range
-                        .clone()
+                    parallel_iter!(col_range.clone())
                         .map(|j| DCRTPoly::from_compact_bytes(params, &entries_bytes[i][j]))
                         .collect()
                 })

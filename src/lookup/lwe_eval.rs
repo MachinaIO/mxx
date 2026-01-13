@@ -194,10 +194,7 @@ where
         .map(|(x_k, (k, y_k))| {
             let ext_matrix = a_z.clone() - &(gadget.clone() * x_k);
             let target = a_lt.clone() - &(gadget.clone() * y_k);
-            (
-                k,
-                trap_sampler.preimage_extend(params, trapdoor, pub_matrix, &ext_matrix, &target),
-            )
+            (k, trap_sampler.preimage_extend(params, trapdoor, pub_matrix, &ext_matrix, &target))
         })
         .collect::<Vec<_>>();
     info!("finish collecting preimages {}", id);

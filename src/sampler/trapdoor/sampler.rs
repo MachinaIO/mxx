@@ -246,6 +246,7 @@ pub(crate) fn gauss_samp_gq_arb_base(
 mod test {
     use super::*;
     use crate::{
+        __PAIR, __TestState,
         poly::PolyParams,
         sampler::{PolyUniformSampler, uniform::DCRTPolyUniformSampler},
     };
@@ -279,6 +280,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_trapdoor_generation() {
         let size: usize = 3;
         let params = DCRTPolyParams::default();
@@ -319,6 +321,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_square() {
         let params = DCRTPolyParams::default();
         let size = 3;
@@ -352,6 +355,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_non_square_target_lt() {
         let params = DCRTPolyParams::default();
         let size = 4;
@@ -389,6 +393,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_non_square_target_gt_multiple() {
         let params = DCRTPolyParams::default();
         let size = 4;
@@ -428,6 +433,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_non_square_target_gt_non_multiple() {
         let params = DCRTPolyParams::default();
         let size = 4;
@@ -466,6 +472,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_base_8() {
         let params = DCRTPolyParams::new(4, 2, 17, 3);
         let size = 4;
@@ -504,6 +511,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_base_1024() {
         let params = DCRTPolyParams::new(4, 2, 17, 10);
         let size = 4;
@@ -542,6 +550,7 @@ mod test {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_preimage_generation_extend() {
         let params = DCRTPolyParams::default();
         let size = 3;

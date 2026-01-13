@@ -205,6 +205,7 @@ where
 mod test {
     use super::*;
     use crate::{
+        __PAIR, __TestState,
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         circuit::PolyCircuit,
         lookup::lwe_eval::LWEBGGEncodingPltEvaluator,
@@ -232,6 +233,7 @@ mod test {
     const SIGMA: f64 = 4.578;
 
     #[tokio::test]
+    #[sequential_test::sequential]
     async fn test_lwe_plt_eval() {
         let _storage_lock = storage_test_lock().await;
         let _ = tracing_subscriber::fmt::try_init();

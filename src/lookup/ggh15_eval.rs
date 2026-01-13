@@ -374,6 +374,7 @@ where
 mod test {
     use super::*;
     use crate::{
+        __PAIR, __TestState,
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         circuit::PolyCircuit,
         matrix::dcrt_poly::DCRTPolyMatrix,
@@ -399,6 +400,7 @@ mod test {
     const SIGMA: f64 = 4.578;
 
     #[tokio::test]
+    #[sequential_test::sequential]
     async fn test_ggh15_plt_eval_single_input() {
         let _storage_lock = storage_test_lock().await;
         let _ = tracing_subscriber::fmt::try_init();
@@ -505,6 +507,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[sequential_test::sequential]
     async fn test_ggh15_plt_eval_multi_inputs() {
         let _storage_lock = storage_test_lock().await;
         let _ = tracing_subscriber::fmt::try_init();

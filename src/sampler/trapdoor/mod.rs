@@ -30,6 +30,10 @@ static SAMPLE_P1_FOR_PERT_MAT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 pub struct DCRTTrapdoor {
     pub r: DCRTPolyMatrix,
     pub e: DCRTPolyMatrix,
+    pub a_mat: DCRTPolyMatrix,
+    pub b_mat: DCRTPolyMatrix,
+    pub d_mat: DCRTPolyMatrix,
+    pub re: DCRTPolyMatrix,
 }
 
 impl DCRTTrapdoor {
@@ -39,7 +43,11 @@ impl DCRTTrapdoor {
         let dist = DistType::GaussDist { sigma };
         let r = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
         let e = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
-        Self { r, e }
+        let a_mat = &r * &r.transpose(); // d x d
+        let b_mat = &r * &e.transpose(); // d x d
+        let d_mat = &e * &e.transpose(); // d x d
+        let re = r.concat_rows(&[&e]);
+        Self { r, e, a_mat, b_mat, d_mat, re }
     }
 
     pub fn sample_pert_square_mat(
@@ -52,7 +60,6 @@ impl DCRTTrapdoor {
         total_ncol: usize,
     ) -> DCRTPolyMatrix {
         let r = &self.r;
-        let e = &self.e;
         let params = &r.params;
         ensure_openfhe_warmup(params);
         let n = params.ring_dimension() as usize;
@@ -101,12 +108,12 @@ impl DCRTTrapdoor {
         // debug_mem("p2_vecs generated");
         // let p2 = p2_vecs[0].concat_columns(&p2_vecs[1..].iter().collect::<Vec<_>>());
         debug!("{}", "p2 generated");
-        let a_mat = r.clone() * r.transpose(); // d x d
-        let b_mat = r.clone() * e.transpose(); // d x d
-        let d_mat = e.clone() * e.transpose(); // d x d
-        debug!("{}", "a_mat, b_mat, d_mat generated");
-        let re = r.concat_rows(&[e]);
-        debug!("{}", "re generated");
+        let a_mat = self.a_mat.clone();
+        let b_mat = self.b_mat.clone();
+        let d_mat = self.d_mat.clone();
+        debug!("{}", "a_mat, b_mat, d_mat loaded");
+        let re = &self.re;
+        debug!("{}", "re loaded");
         let tp2 = re * &p2;
         debug!("{}", "tp2 generated");
         let p1 = sample_p1_for_pert_mat(a_mat, b_mat, d_mat, tp2, params, c, s, dgg, padded_ncol);

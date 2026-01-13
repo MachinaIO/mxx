@@ -239,6 +239,16 @@ pub struct MultiBatchLookupBuffer {
 
 static WRITE_SENDER: OnceLock<mpsc::Sender<WriteCommand>> = OnceLock::new();
 static METADATA: OnceLock<Arc<Mutex<GlobalTableIndex>>> = OnceLock::new();
+#[cfg(test)]
+static STORAGE_TEST_SEM: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
+#[cfg(test)]
+pub async fn storage_test_lock() -> tokio::sync::OwnedSemaphorePermit {
+    let sem = STORAGE_TEST_SEM
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone();
+    sem.acquire_owned().await.expect("storage test lock closed")
+}
 
 /// Initialize the storage system with an optional byte limit for batched lookup tables.
 pub fn init_storage_system(dir_path: PathBuf) {

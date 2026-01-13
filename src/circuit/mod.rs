@@ -508,7 +508,7 @@ impl<P: Poly> PolyCircuit<P> {
                         let result = plt_evaluator
                             .as_ref()
                             .expect("public lookup evaluator missing")
-                            .public_lookup(params, lookup, input, gate_id);
+                            .public_lookup(params, lookup, one.clone(), input, gate_id, *lut_id);
                         debug!("Public Lookup gate end");
                         result
                     }

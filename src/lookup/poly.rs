@@ -8,9 +8,24 @@ use crate::{
 pub struct PolyPltEvaluator {}
 
 impl<P: Poly> PltEvaluator<P> for PolyPltEvaluator {
-    fn public_lookup(&self, params: &P::Params, plt: &PublicLut<P>, input: P, _: GateId) -> P {
-        let outputs = plt.get(params, &input).expect("output of the lookup evaluation not found");
-        outputs.1
+    fn public_lookup(
+        &self,
+        params: &P::Params,
+        plt: &PublicLut<P>,
+        _: P,
+        input: P,
+        gate_id: GateId,
+        lut_id: usize,
+    ) -> P {
+        let output = match plt.get(params, &input) {
+            Some(outputs) => outputs.1,
+            None => panic!(
+                "output of the lookup evaluation not found; gate_id: {:?}, lut_id: {:?}, input: {:?}",
+                gate_id, lut_id, input
+            ),
+        };
+
+        output
     }
 }
 

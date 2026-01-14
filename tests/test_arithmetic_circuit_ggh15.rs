@@ -49,7 +49,7 @@ async fn test_arithmetic_circuit_operations_ggh15() {
     let sum = poly_a.add_full_reduce(&poly_b, None, &mut circuit);
     let prod = sum.mul_full_reduce(&poly_c, None, &mut circuit);
     let out_poly = prod.sub_full_reduce(&poly_a, None, &mut circuit);
-    let out = out_poly.reconstruct(&params, None, &mut circuit);
+    let out = out_poly.reconstruct(None, &mut circuit);
     circuit.output(vec![out]);
     info!("{}", format!("non-free depth: {}", circuit.non_free_depth()));
 

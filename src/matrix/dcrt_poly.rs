@@ -199,6 +199,15 @@ impl PolyMatrix for DCRTPolyMatrix {
         output[0].concat_columns(&output[1..].iter().collect::<Vec<_>>())
     }
 
+    fn mul_decompose(&self, other: &Self) -> Self {
+        let log_base_q = self.params.modulus_digits();
+        debug_assert_eq!(self.ncol, other.nrow * log_base_q);
+        let ncol = other.ncol;
+        debug_assert!(ncol > 0, "mul_decompose expects at least one column");
+        let output = (0..ncol).map(|j| self * &other.get_column_matrix_decompose(j)).collect_vec();
+        output[0].concat_columns(&output[1..].iter().collect::<Vec<_>>())
+    }
+
     fn get_column_matrix_decompose(&self, j: usize) -> Self {
         Self::from_poly_vec(
             &self.params,

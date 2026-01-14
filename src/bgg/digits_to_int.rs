@@ -35,8 +35,7 @@ impl<M: PolyMatrix> DigitsToInt<M::P> for BggPublicKey<M> {
         let d1 = self.matrix.row_size();
         let unit_vector = M::unit_column_vector(params, d1, d1 - 1);
         let scalared = unit_vector * scalar;
-        let decomposed = scalared.decompose();
-        let matrix = self.matrix.clone() * decomposed;
+        let matrix = self.matrix.mul_decompose(&scalared);
         Self { matrix, reveal_plaintext: self.reveal_plaintext }
     }
 }
@@ -48,8 +47,7 @@ impl<M: PolyMatrix> DigitsToInt<M::P> for BggEncoding<M> {
         let d1 = self.pubkey.matrix.row_size();
         let unit_vector = M::unit_column_vector(params, d1, d1 - 1);
         let scalared = unit_vector * &scalar;
-        let decomposed = scalared.decompose();
-        let vector = self.vector.clone() * decomposed;
+        let vector = self.vector.mul_decompose(&scalared);
         let pubkey = self.pubkey.power_of_base(params, k);
         let plaintext = self.plaintext.clone().map(|plaintext| plaintext * scalar);
         Self { vector, pubkey, plaintext }

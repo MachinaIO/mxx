@@ -342,9 +342,10 @@ where
                             s_g.clone() * b_matrix_lut_3.as_ref() + error
                         };
                         let k_to_ggh_target = {
-                            let one_muled = one_pubkey.matrix.clone() *
-                                (b_matrix_lut_1.as_ref().decompose() + c_matrix_1.decompose());
-                            let input_muled = input_matrix.clone() * c_matrix_2.decompose();
+                            let one_matrix = &one_pubkey.matrix;
+                            let one_muled = one_matrix.mul_decompose(b_matrix_lut_1.as_ref()) +
+                                one_matrix.mul_decompose(&c_matrix_1);
+                            let input_muled = input_matrix.mul_decompose(&c_matrix_2);
                             one_muled + input_muled
                         };
                         let k_to_ggh = trap_sampler.preimage(
@@ -523,8 +524,10 @@ where
             .unwrap_or_else(|| panic!("a_out for gate {} not found", gate_id));
 
         let d_to_ggh = self.c_b0.clone() * k_to_ggh;
-        let term_const = one.vector.clone() * (b_matrix_lut_1.decompose() + c_matrix_1.decompose());
-        let term_input = input.vector.clone() * c_matrix_2.decompose();
+        let one_vector = &one.vector;
+        let term_const =
+            one_vector.mul_decompose(&b_matrix_lut_1) + one_vector.mul_decompose(&c_matrix_1);
+        let term_input = input.vector.mul_decompose(&c_matrix_2);
         let p_g = d_to_ggh - &(term_const + term_input);
         let c_out = p_g * k_lut;
         let output_pubkey = BggPublicKey { matrix: a_out, reveal_plaintext: true };

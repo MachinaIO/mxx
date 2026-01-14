@@ -76,9 +76,8 @@ impl<M: PolyMatrix> Mul<&Self> for BggPublicKey<M> {
             "{}",
             format!("BGGPublicKey::mul {:?}, {:?}", self.matrix.size(), other.matrix.size())
         );
-        let decomposed = other.matrix.decompose();
-        debug!("BGGPublicKey::mul decomposed");
-        let matrix = self.matrix * decomposed;
+        let matrix = self.matrix.mul_decompose(&other.matrix);
+        debug!("BGGPublicKey::mul on-the-fly decomposed");
         debug!("BGGPublicKey::mul matrix multiplied");
         let reveal_plaintext = self.reveal_plaintext & other.reveal_plaintext;
         debug!("BGGPublicKey::mul reveal_plaintext");

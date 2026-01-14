@@ -26,9 +26,12 @@ where
     M: PolyMatrix,
 {
     lut_id: usize,
-    s_g: M,
-    input_pubkey: BggPublicKey<M>,
-    output_pubkey: BggPublicKey<M>,
+    s_g_bytes: Vec<u8>,
+    input_pubkey_bytes: Vec<u8>,
+    input_pubkey_reveal_plaintext: bool,
+    output_pubkey_bytes: Vec<u8>,
+    output_pubkey_reveal_plaintext: bool,
+    _m: PhantomData<M>,
 }
 
 pub struct GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
@@ -108,10 +111,7 @@ where
     }
 
     fn get_one_pubkey(&self) -> Arc<BggPublicKey<M>> {
-        self.one_pubkey
-            .get()
-            .unwrap_or_else(|| panic!("one_pubkey is not set"))
-            .clone()
+        self.one_pubkey.get().unwrap_or_else(|| panic!("one_pubkey is not set")).clone()
     }
 
     fn sample_lut_preimages(
@@ -159,11 +159,7 @@ where
 
     fn format_duration(duration: Duration) -> String {
         let secs = duration.as_secs_f64();
-        if secs >= 1.0 {
-            format!("{secs:.3}s")
-        } else {
-            format!("{:.1}ms", secs * 1000.0)
-        }
+        if secs >= 1.0 { format!("{secs:.3}s") } else { format!("{:.1}ms", secs * 1000.0) }
     }
 
     pub fn sample_aux_matrices(&self, params: &<M::P as Poly>::Params) {
@@ -256,11 +252,7 @@ where
             drop(b_trapdoor_lut);
             b_matrix_entries.push((lut_id, b_matrix_lut.clone()));
             b_matrix_map.insert(lut_id, Arc::new(b_matrix_lut));
-            debug!(
-                "LUT {} complete in {}",
-                lut_id,
-                Self::format_duration(lut_start.elapsed())
-            );
+            debug!("LUT {} complete in {}", lut_id, Self::format_duration(lut_start.elapsed()));
         }
 
         if !b_matrix_entries.is_empty() {
@@ -276,11 +268,7 @@ where
         }
 
         let total_gate_count = gate_entries.len();
-        debug!(
-            "Gate sampling start: total_gates={}, chunk_size={}",
-            total_gate_count,
-            chunk_size
-        );
+        debug!("Gate sampling start: total_gates={}, chunk_size={}", total_gate_count, chunk_size);
 
         if gate_entries.is_empty() {
             info!("No gate auxiliary matrices to sample");
@@ -319,9 +307,17 @@ where
                         let uniform_sampler = US::new();
                         let trap_sampler = TS::new(params, trapdoor_sigma);
                         let one_pubkey = self.get_one_pubkey();
-                        let s_g = state.s_g;
-                        let input_matrix = state.input_pubkey.matrix;
-                        let a_out = state.output_pubkey.matrix;
+                        let s_g = M::from_compact_bytes(params, &state.s_g_bytes);
+                        let input_pubkey = BggPublicKey {
+                            matrix: M::from_compact_bytes(params, &state.input_pubkey_bytes),
+                            reveal_plaintext: state.input_pubkey_reveal_plaintext,
+                        };
+                        let output_pubkey = BggPublicKey {
+                            matrix: M::from_compact_bytes(params, &state.output_pubkey_bytes),
+                            reveal_plaintext: state.output_pubkey_reveal_plaintext,
+                        };
+                        let input_matrix = input_pubkey.matrix;
+                        let a_out = output_pubkey.matrix;
 
                         let c_matrix_1 = {
                             let error = uniform_sampler.sample_uniform(
@@ -403,15 +399,15 @@ where
         &self,
         params: &<BggPublicKey<M> as Evaluable>::Params,
         plt: &PublicLut<<BggPublicKey<M> as Evaluable>::P>,
-        one: BggPublicKey<M>,
-        input: BggPublicKey<M>,
+        one: &BggPublicKey<M>,
+        input: &BggPublicKey<M>,
         gate_id: GateId,
         lut_id: usize,
     ) -> BggPublicKey<M> {
         let d = input.matrix.row_size();
         let uniform_sampler = US::new();
-        info!("Starting public lookup for gate {}", gate_id);
-        self.set_one_pubkey(&one);
+        debug!("Starting public lookup for gate {}", gate_id);
+        self.set_one_pubkey(one);
         self.lut_state.entry(lut_id).or_insert_with(|| plt.clone());
 
         let s_g = if self.insert_1_to_s {
@@ -433,9 +429,19 @@ where
         let output_pubkey = BggPublicKey { matrix: a_out, reveal_plaintext: true };
         self.gate_state.insert(
             gate_id,
-            GateState { lut_id, s_g, input_pubkey: input, output_pubkey: output_pubkey.clone() },
+            GateState {
+                lut_id,
+                s_g_bytes: s_g.to_compact_bytes(),
+                input_pubkey_bytes: input.matrix.to_compact_bytes(),
+                // input_pubkey_bytes: Vec::new(),
+                input_pubkey_reveal_plaintext: input.reveal_plaintext,
+                output_pubkey_bytes: output_pubkey.matrix.to_compact_bytes(),
+                // output_pubkey_bytes: Vec::new(),
+                output_pubkey_reveal_plaintext: output_pubkey.reveal_plaintext,
+                _m: PhantomData,
+            },
         );
-
+        debug!("Public lookup for gate {} recorded", gate_id);
         output_pubkey
     }
 }
@@ -490,8 +496,8 @@ where
         &self,
         params: &<BggEncoding<M> as Evaluable>::Params,
         plt: &PublicLut<<BggEncoding<M> as Evaluable>::P>,
-        one: BggEncoding<M>,
-        input: BggEncoding<M>,
+        one: &BggEncoding<M>,
+        input: &BggEncoding<M>,
         gate_id: GateId,
         lut_id: usize,
     ) -> BggEncoding<M> {

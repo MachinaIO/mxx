@@ -42,8 +42,8 @@ where
         &self,
         params: &<BggPublicKey<M> as Evaluable>::Params,
         plt: &PublicLut<<BggPublicKey<M> as Evaluable>::P>,
-        _: BggPublicKey<M>,
-        input: BggPublicKey<M>,
+        _: &BggPublicKey<M>,
+        input: &BggPublicKey<M>,
         gate_id: GateId,
         _: usize,
     ) -> BggPublicKey<M> {
@@ -111,12 +111,15 @@ where
         &self,
         params: &<BggEncoding<M> as Evaluable>::Params,
         plt: &PublicLut<<BggEncoding<M> as Evaluable>::P>,
-        _: BggEncoding<M>,
-        input: BggEncoding<M>,
+        _: &BggEncoding<M>,
+        input: &BggEncoding<M>,
         gate_id: GateId,
         _: usize,
     ) -> BggEncoding<M> {
-        let z = &input.plaintext.expect("the BGG encoding should revealed plaintext");
+        let z = input
+            .plaintext
+            .as_ref()
+            .expect("the BGG encoding should revealed plaintext");
         debug!("public lookup length is {}", plt.len());
         let (k, y_k) = plt
             .get(params, z)

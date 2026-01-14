@@ -151,8 +151,8 @@ impl PltEvaluator<ErrorNorm> for NormPltLWEEvaluator {
         &self,
         _: &(),
         plt: &PublicLut<DCRTPoly>,
-        _: ErrorNorm,
-        input: ErrorNorm,
+        _: &ErrorNorm,
+        input: &ErrorNorm,
         _: GateId,
         _: usize,
     ) -> ErrorNorm {
@@ -215,8 +215,8 @@ impl PltEvaluator<ErrorNorm> for NormPltGGH15Evaluator {
         &self,
         _: &(),
         plt: &PublicLut<DCRTPoly>,
-        one: ErrorNorm,
-        input: ErrorNorm,
+        one: &ErrorNorm,
+        input: &ErrorNorm,
         _: GateId,
         _: usize,
     ) -> ErrorNorm {

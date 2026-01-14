@@ -269,13 +269,13 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[a.clone(), b.clone()],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
         let out2 = roundtrip.eval(
             &params,
             &DCRTPoly::const_one(&params),
             &[a, b],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
         assert_eq!(out1, out2);
     }

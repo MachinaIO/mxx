@@ -63,7 +63,7 @@ mod tests {
                 let multiplication = a.clone() * b.clone();
                 assert_eq!(multiplication.matrix.row_size(), d);
                 assert_eq!(multiplication.matrix.col_size(), columns);
-                assert_eq!(multiplication.matrix, (a.matrix.clone() * b.matrix.decompose().clone()))
+                assert_eq!(multiplication.matrix, (&a.matrix).mul_decompose(&b.matrix))
             } else {
                 panic!("pair should have two public keys");
             }

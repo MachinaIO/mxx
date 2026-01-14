@@ -15,7 +15,7 @@ use crate::{
 use openfhe::ffi::DCRTGaussSampGqArbBase;
 use rayon::iter::ParallelIterator;
 use std::{ops::Range, time::Instant};
-use tracing::{debug, info};
+use tracing::debug;
 
 const SIGMA: f64 = 4.578;
 const SPECTRAL_CONSTANT: f64 = 1.8;
@@ -164,7 +164,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         debug!("{}", "z_hat generated");
         drop(p_hat);
         let out = z_hat_former.concat_rows(&[&z_hat_latter]);
-        info!("preimage total time: {:?}", preimage_start.elapsed());
+        debug!("preimage total time: {:?}", preimage_start.elapsed());
         out
     }
 

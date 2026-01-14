@@ -18,7 +18,6 @@ use num_bigint::{BigInt, BigUint};
 use num_traits::Zero;
 use rand::Rng;
 use std::{
-    env,
     future::Future,
     time::{Duration, Instant},
 };
@@ -35,7 +34,7 @@ pub fn chunk_size_for(original: usize) -> usize {
 }
 
 pub fn block_size() -> usize {
-    env::var("BLOCK_SIZE").map(|str| str.parse::<usize>().unwrap()).unwrap_or(100)
+    crate::env::block_size()
 }
 
 #[macro_export]

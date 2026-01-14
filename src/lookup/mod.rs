@@ -10,8 +10,8 @@ pub trait PltEvaluator<E: crate::circuit::evaluable::Evaluable>: Send + Sync {
         &self,
         params: &E::Params,
         plt: &PublicLut<E::P>,
-        one: E,
-        input: E,
+        one: &E,
+        input: &E,
         gate_id: GateId,
         lut_id: usize,
     ) -> E;

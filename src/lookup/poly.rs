@@ -12,12 +12,12 @@ impl<P: Poly + 'static> PltEvaluator<P> for PolyPltEvaluator {
         &self,
         params: &P::Params,
         plt: &PublicLut<P>,
-        _: P,
-        input: P,
+        _: &P,
+        input: &P,
         gate_id: GateId,
         lut_id: usize,
     ) -> P {
-        let output = match plt.get(params, &input) {
+        let output = match plt.get(params, input) {
             Some(outputs) => outputs.1,
             None => panic!(
                 "output of the lookup evaluation not found; gate_id: {:?}, lut_id: {:?}, input: {:?}",

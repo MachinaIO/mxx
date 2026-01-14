@@ -655,7 +655,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[a_inputs, b_inputs].concat(),
-            Some(plt_evaluator),
+            Some(&plt_evaluator),
         );
         // println!("eval_results {:?}", eval_results);
         assert_eq!(eval_results.len(), 1);
@@ -695,7 +695,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[a_inputs, b_inputs].concat(),
-            Some(plt_evaluator),
+            Some(&plt_evaluator),
         );
         // println!("eval_results {:?}", eval_results);
         assert_eq!(eval_results.len(), 1);
@@ -730,7 +730,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[a_inputs, b_inputs].concat(),
-            Some(plt_evaluator),
+            Some(&plt_evaluator),
         );
         // println!("eval_results {:?}", eval_results);
         assert_eq!(eval_results.len(), 1);

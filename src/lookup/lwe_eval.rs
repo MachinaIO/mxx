@@ -42,8 +42,8 @@ where
         &self,
         params: &<BggPublicKey<M> as Evaluable>::Params,
         plt: &PublicLut<<BggPublicKey<M> as Evaluable>::P>,
-        _: BggPublicKey<M>,
-        input: BggPublicKey<M>,
+        _: &BggPublicKey<M>,
+        input: &BggPublicKey<M>,
         gate_id: GateId,
         _: usize,
     ) -> BggPublicKey<M> {
@@ -111,12 +111,12 @@ where
         &self,
         params: &<BggEncoding<M> as Evaluable>::Params,
         plt: &PublicLut<<BggEncoding<M> as Evaluable>::P>,
-        _: BggEncoding<M>,
-        input: BggEncoding<M>,
+        _: &BggEncoding<M>,
+        input: &BggEncoding<M>,
         gate_id: GateId,
         _: usize,
     ) -> BggEncoding<M> {
-        let z = &input.plaintext.expect("the BGG encoding should revealed plaintext");
+        let z = input.plaintext.as_ref().expect("the BGG encoding should revealed plaintext");
         debug!("public lookup length is {}", plt.len());
         let (k, y_k) = plt
             .get(params, z)
@@ -296,7 +296,7 @@ mod test {
             &params,
             &enc_one.pubkey,
             std::slice::from_ref(&enc1.pubkey),
-            Some(plt_pubkey_evaluator),
+            Some(&plt_pubkey_evaluator),
         );
         wait_for_all_writes(dir.to_path_buf()).await.unwrap();
         assert_eq!(result_pubkey.len(), 1);
@@ -313,7 +313,7 @@ mod test {
             &params,
             &enc_one.clone(),
             std::slice::from_ref(&enc1),
-            Some(plt_encoding_evaluator),
+            Some(&plt_encoding_evaluator),
         );
         assert_eq!(result_encoding.len(), 1);
         let result_encoding = &result_encoding[0];

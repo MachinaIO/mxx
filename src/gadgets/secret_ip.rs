@@ -73,7 +73,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &poly_inputs,
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
         assert_eq!(poly_out.len(), 1);
         let expected_poly = b.clone() + (a.clone() * &neg_t);
@@ -89,7 +89,7 @@ mod tests {
             &pubkeys[0],
             &pubkeys[1..],
             None::<
-                LWEBGGPubKeyPltEvaluator<
+                &LWEBGGPubKeyPltEvaluator<
                     DCRTPolyMatrix,
                     DCRTPolyHashSampler<Keccak256>,
                     DCRTPolyTrapdoorSampler,
@@ -110,7 +110,7 @@ mod tests {
             &params,
             &encodings[0],
             &encodings[1..],
-            None::<LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
         assert_eq!(enc_out.len(), 1);
         let enc_expected = (encodings[1].clone() * encodings[3].clone()) +

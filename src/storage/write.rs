@@ -250,7 +250,7 @@ pub async fn storage_test_lock() -> tokio::sync::OwnedSemaphorePermit {
 
 /// Initialize the storage system with an optional byte limit for batched lookup tables.
 pub fn init_storage_system(dir_path: PathBuf) {
-    let bytes_limit = std::env::var("LUT_BYTES_LIMIT").ok().and_then(|s| s.parse::<usize>().ok());
+    let bytes_limit = crate::env::lut_bytes_limit();
     info!("LUT_BYTES_LIMIT={:?}", bytes_limit);
     let metadata = METADATA.get_or_init(|| Arc::new(Mutex::new(GlobalTableIndex::default())));
 

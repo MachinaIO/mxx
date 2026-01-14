@@ -144,6 +144,9 @@ pub trait PolyMatrix:
     /// Performs the operation S * (identity ⊗ G^-1(other)),
     /// where G^-1(other) is bit decomposition of other matrix
     fn mul_tensor_identity_decompose(&self, other: &Self, identity_size: usize) -> Self;
+    /// Performs the operation S * G^-1(other),
+    /// where G^-1(other) is digit decomposition of other matrix
+    fn mul_decompose(&self, other: &Self) -> Self;
     /// j is column and return decomposed matrix of target column
     fn get_column_matrix_decompose(&self, j: usize) -> Self;
     /// Reads a matrix of given rows and cols with id from files under the given directory.

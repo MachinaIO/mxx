@@ -13,6 +13,7 @@ pub mod bgg;
 pub mod circuit;
 pub mod commit;
 pub mod element;
+pub mod env;
 pub mod gadgets;
 pub mod lookup;
 pub mod matrix;

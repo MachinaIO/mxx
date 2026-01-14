@@ -47,10 +47,10 @@ async fn test_arithmetic_circuit_operations_lwe() {
     let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
     let poly_c = NestedRnsPoly::input(ctx.clone(), &mut circuit);
 
-    let sum = poly_a.add_full_reduce(&poly_b, &mut circuit);
-    let prod = sum.mul_full_reduce(&poly_c, &mut circuit);
-    let out_poly = prod.sub_full_reduce(&poly_a, &mut circuit);
-    let out = out_poly.reconstruct(&params, &mut circuit);
+    let sum = poly_a.add_full_reduce(&poly_b, None, &mut circuit);
+    let prod = sum.mul_full_reduce(&poly_c, None, &mut circuit);
+    let out_poly = prod.sub_full_reduce(&poly_a, None, &mut circuit);
+    let out = out_poly.reconstruct(&params, None, &mut circuit);
     circuit.output(vec![out]);
     info!("{}", format!("non-free depth: {}", circuit.non_free_depth()));
 

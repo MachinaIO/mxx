@@ -19,10 +19,7 @@ pub fn lut_preimage_chunk_size() -> usize {
 
 /// `BLOCK_SIZE`: generic processing block size used in utilities (default: 100).
 pub fn block_size() -> usize {
-    std::env::var("BLOCK_SIZE")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(100)
+    std::env::var("BLOCK_SIZE").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(100)
 }
 
 /// `LUT_BYTES_LIMIT`: max size of batched lookup tables in bytes (unset = no limit).

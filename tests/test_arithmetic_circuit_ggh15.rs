@@ -116,8 +116,7 @@ async fn test_arithmetic_circuit_operations_ggh15() {
     );
     info!("start pubkey evaluation");
     let start = std::time::Instant::now();
-    let pubkey_out =
-        circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(&pk_evaluator));
+    let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(&pk_evaluator));
     info!("{}", format!("end pubkey evaluation in {:?}", start.elapsed()));
     assert_eq!(pubkey_out.len(), 1);
     info!("wait for all writes");

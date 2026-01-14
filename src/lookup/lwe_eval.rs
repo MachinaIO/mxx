@@ -116,10 +116,7 @@ where
         gate_id: GateId,
         _: usize,
     ) -> BggEncoding<M> {
-        let z = input
-            .plaintext
-            .as_ref()
-            .expect("the BGG encoding should revealed plaintext");
+        let z = input.plaintext.as_ref().expect("the BGG encoding should revealed plaintext");
         debug!("public lookup length is {}", plt.len());
         let (k, y_k) = plt
             .get(params, z)

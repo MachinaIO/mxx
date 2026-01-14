@@ -17,7 +17,10 @@ use keccak_asm::Keccak256;
 use num_bigint::{BigInt, BigUint};
 use num_traits::Zero;
 use rand::Rng;
-use std::{future::Future, time::{Duration, Instant}};
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
 use tracing::info;
 
 /// ideal thread chunk size for parallel

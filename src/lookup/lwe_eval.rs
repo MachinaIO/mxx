@@ -296,7 +296,7 @@ mod test {
             &params,
             &enc_one.pubkey,
             std::slice::from_ref(&enc1.pubkey),
-            Some(plt_pubkey_evaluator),
+            Some(&plt_pubkey_evaluator),
         );
         wait_for_all_writes(dir.to_path_buf()).await.unwrap();
         assert_eq!(result_pubkey.len(), 1);
@@ -313,7 +313,7 @@ mod test {
             &params,
             &enc_one.clone(),
             std::slice::from_ref(&enc1),
-            Some(plt_encoding_evaluator),
+            Some(&plt_encoding_evaluator),
         );
         assert_eq!(result_encoding.len(), 1);
         let result_encoding = &result_encoding[0];

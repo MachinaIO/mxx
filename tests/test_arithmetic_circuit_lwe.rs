@@ -68,7 +68,7 @@ async fn test_arithmetic_circuit_operations_lwe() {
         &params,
         &DCRTPoly::const_one(&params),
         &plaintext_inputs,
-        Some(plt_evaluator),
+        Some(&plt_evaluator),
     );
     assert_eq!(eval_results.len(), 1);
 
@@ -109,7 +109,7 @@ async fn test_arithmetic_circuit_operations_lwe() {
         tmp_dir.path().to_path_buf(),
     );
     info!("starr pubkey evaluation");
-    let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(pk_evaluator));
+    let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(&pk_evaluator));
     info!("end pubkey evaluation");
     assert_eq!(pubkey_out.len(), 1);
     info!("wait for all writes");
@@ -133,7 +133,7 @@ async fn test_arithmetic_circuit_operations_lwe() {
             p,
         );
     info!("start encoding evaluation");
-    let encoding_out = circuit.eval(&params, &encodings[0], &encodings[1..], Some(enc_evaluator));
+    let encoding_out = circuit.eval(&params, &encodings[0], &encodings[1..], Some(&enc_evaluator));
     info!("end encoding evaluation");
     assert_eq!(encoding_out.len(), 1);
     assert_eq!(encoding_out[0].plaintext.as_ref().unwrap(), &DCRTPoly::const_zero(&params));

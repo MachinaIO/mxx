@@ -383,7 +383,7 @@ impl<P: Poly> PolyCircuit<P> {
         params: &E::Params,
         one: &E,
         inputs: &[E],
-        plt_evaluator: Option<PE>,
+        plt_evaluator: Option<&PE>,
     ) -> Vec<E>
     where
         E: Evaluable<P = P>,
@@ -424,7 +424,8 @@ impl<P: Poly> PolyCircuit<P> {
         }
         debug!("Input wires are set");
 
-        let force_single_thread = std::env::var_os("MXX_CIRCUIT_SINGLE_THREAD").is_some();
+        let parallel_gates = crate::env::circuit_parallel_gates();
+        let use_parallel = parallel_gates.map(|n| n != 1).unwrap_or(true);
         let eval_gate = |gate_id: GateId| {
             debug!("{}", format!("Gate id {gate_id} started"));
             if wires.contains_key(&gate_id) {
@@ -501,7 +502,6 @@ impl<P: Poly> PolyCircuit<P> {
                         .clone();
                     let lookup = self.lookups.get(lut_id).expect("lookup table missing").as_ref();
                     let result = plt_evaluator
-                        .as_ref()
                         .expect("public lookup evaluator missing")
                         .public_lookup(params, lookup, one.clone(), input, gate_id, *lut_id);
                     debug!("Public Lookup gate end");
@@ -518,23 +518,41 @@ impl<P: Poly> PolyCircuit<P> {
         for level in levels.iter() {
             debug!("New level started");
             // All gates in the same level can be processed in parallel.
-            if force_single_thread {
+            if use_parallel {
+                if let Some(chunk_size) = parallel_gates {
+                    level.chunks(chunk_size).for_each(|chunk| {
+                        chunk.par_iter().copied().for_each(|gate_id| eval_gate(gate_id));
+                    });
+                } else {
+                    level.par_iter().copied().for_each(|gate_id| eval_gate(gate_id));
+                }
+                debug!("Evaluated gate in parallel");
+            } else {
                 level.iter().copied().for_each(|gate_id| eval_gate(gate_id));
                 debug!("Evaluated gate in single thread");
-            } else {
-                level.par_iter().copied().for_each(|gate_id| eval_gate(gate_id));
-                debug!("Evaluated gate in parallel");
             }
         }
 
-        let outputs = if force_single_thread {
-            self.output_ids
-                .iter()
-                .map(|&id| wires.get(&id).expect("output missing").clone())
-                .collect()
+        let outputs = if use_parallel {
+            if let Some(chunk_size) = parallel_gates {
+                let mut out = Vec::with_capacity(self.output_ids.len());
+                for chunk in self.output_ids.chunks(chunk_size) {
+                    let mut chunk_out: Vec<E> = chunk
+                        .par_iter()
+                        .map(|&id| wires.get(&id).expect("output missing").clone())
+                        .collect();
+                    out.append(&mut chunk_out);
+                }
+                out
+            } else {
+                self.output_ids
+                    .par_iter()
+                    .map(|&id| wires.get(&id).expect("output missing").clone())
+                    .collect()
+            }
         } else {
             self.output_ids
-                .par_iter()
+                .iter()
                 .map(|&id| wires.get(&id).expect("output missing").clone())
                 .collect()
         };
@@ -662,7 +680,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
 
         // Expected result: poly1 + poly2
@@ -693,7 +711,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
 
         // Expected result: poly1 - poly2
@@ -724,7 +742,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
 
         // Expected result: poly1 * poly2
@@ -759,7 +777,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[dummy_input],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
 
         // Verify the result
@@ -823,7 +841,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone(), poly3.clone()],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
 
         // Expected result: (poly1 + poly2) - poly3
@@ -863,7 +881,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
 
         // Expected results
@@ -914,7 +932,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
 
         let expected = poly1 + poly2;
@@ -964,7 +982,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone(), poly3.clone(), poly4.clone()],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
 
         // Expected result: (((poly1 + poly2) * (poly3 * poly4)) + (poly1 - poly3))^2
@@ -990,7 +1008,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
         let expected = poly1.clone() * poly2;
         assert_eq!(result.len(), 1);
@@ -1009,7 +1027,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             std::slice::from_ref(&poly1),
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
         let expected = DCRTPoly::const_one(&params) - poly1.clone();
         assert_eq!(result.len(), 1);
@@ -1029,7 +1047,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
         let expected = (poly1.clone() + poly2.clone()) - (poly1 * poly2);
         assert_eq!(result.len(), 1);
@@ -1049,7 +1067,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
         let expected = DCRTPoly::const_one(&params) - (poly1 * poly2);
         assert_eq!(result.len(), 1);
@@ -1069,7 +1087,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
         let expected =
             DCRTPoly::const_one(&params) - ((poly1.clone() + poly2.clone()) - (poly1 * poly2));
@@ -1090,7 +1108,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
         let expected = (poly1.clone() + poly2.clone()) -
             (DCRTPoly::from_usize_to_constant(&params, 2) * poly1 * poly2);
@@ -1111,7 +1129,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
         let expected = DCRTPoly::const_one(&params) -
             ((poly1.clone() + poly2.clone()) -
@@ -1165,7 +1183,7 @@ mod tests {
         // concatenate decomposed_c0 and decomposed_c1 and x
         let input = [a_bits, b_bits, vec![x.clone()]].concat();
         let result =
-            circuit.eval(&params, &DCRTPoly::const_one(&params), &input, None::<PolyPltEvaluator>);
+            circuit.eval(&params, &DCRTPoly::const_one(&params), &input, None::<&PolyPltEvaluator>);
 
         assert_eq!(result.len(), log_q * 2);
 
@@ -1233,7 +1251,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
 
         // Expected result: (poly1 + poly2) - (poly1 * poly2)
@@ -1296,7 +1314,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone(), poly3.clone()],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
 
         // Expected result: ((poly1 * poly2) + poly3)^2
@@ -1326,7 +1344,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[dummy_input],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
 
         // Expected result: 0
@@ -1355,7 +1373,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[dummy_input],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
 
         // Expected result: 1
@@ -1384,7 +1402,7 @@ mod tests {
             &params,
             &DCRTPoly::const_one(&params),
             &[dummy_input],
-            None::<PolyPltEvaluator>,
+            None::<&PolyPltEvaluator>,
         );
 
         // Expected result: -1

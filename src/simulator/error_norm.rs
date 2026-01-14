@@ -23,7 +23,7 @@ impl PolyCircuit<DCRTPoly> {
         input_norm_bound: BigDecimal,
         input_size: usize,
         e_init_norm: &BigDecimal,
-        plt_evaluator: Option<P>,
+        plt_evaluator: Option<&P>,
     ) -> Vec<ErrorNorm>
     where
         ErrorNorm: Evaluable<P = DCRTPoly>,
@@ -288,7 +288,7 @@ mod tests {
             input_bound.clone(),
             2,
             &BigDecimal::from(E_INIT_NORM),
-            None::<NormPltLWEEvaluator>,
+            None::<&NormPltLWEEvaluator>,
         );
         assert_eq!(out.len(), 1);
         // Build expected from input wires and add them
@@ -313,7 +313,7 @@ mod tests {
             input_bound.clone(),
             2,
             &BigDecimal::from(E_INIT_NORM),
-            None::<NormPltLWEEvaluator>,
+            None::<&NormPltLWEEvaluator>,
         );
         assert_eq!(out.len(), 1);
         let in_wire = ErrorNorm::new(
@@ -338,7 +338,7 @@ mod tests {
             input_bound.clone(),
             2,
             &BigDecimal::from(E_INIT_NORM),
-            None::<NormPltLWEEvaluator>,
+            None::<&NormPltLWEEvaluator>,
         );
         assert_eq!(out.len(), 1);
 
@@ -382,7 +382,7 @@ mod tests {
             input_bound.clone(),
             1,
             &BigDecimal::from(E_INIT_NORM),
-            Some(plt_evaluator),
+            Some(&plt_evaluator),
         );
         assert_eq!(out.len(), 1);
         // Bound must be max output coeff across LUT entries (7)
@@ -424,7 +424,7 @@ mod tests {
             input_bound.clone(),
             1,
             &BigDecimal::from(E_INIT_NORM),
-            Some(plt_evaluator),
+            Some(&plt_evaluator),
         );
         assert_eq!(out.len(), 1);
         // Bound must be max output coeff across LUT entries (7)

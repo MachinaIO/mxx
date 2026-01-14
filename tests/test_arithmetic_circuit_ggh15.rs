@@ -67,7 +67,7 @@ async fn test_arithmetic_circuit_operations_ggh15() {
         &params,
         &DCRTPoly::const_one(&params),
         &plaintext_inputs,
-        Some(plt_evaluator),
+        Some(&plt_evaluator),
     );
     assert_eq!(eval_results.len(), 1);
 
@@ -116,10 +116,12 @@ async fn test_arithmetic_circuit_operations_ggh15() {
     );
     info!("start pubkey evaluation");
     let start = std::time::Instant::now();
-    let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(pk_evaluator));
+    let pubkey_out =
+        circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(&pk_evaluator));
     info!("{}", format!("end pubkey evaluation in {:?}", start.elapsed()));
     assert_eq!(pubkey_out.len(), 1);
     info!("wait for all writes");
+    pk_evaluator.sample_aux_matrices(&params);
     wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
     info!("finish writing");
 
@@ -139,7 +141,7 @@ async fn test_arithmetic_circuit_operations_ggh15() {
     >::new(seed, &params, tmp_dir.path().to_path_buf(), d, c_b0);
     info!("start encoding evaluation");
     let start = std::time::Instant::now();
-    let encoding_out = circuit.eval(&params, &encodings[0], &encodings[1..], Some(enc_evaluator));
+    let encoding_out = circuit.eval(&params, &encodings[0], &encodings[1..], Some(&enc_evaluator));
     info!("{}", format!("end encoding evaluation in {:?}", start.elapsed()));
     assert_eq!(encoding_out.len(), 1);
     assert_eq!(encoding_out[0].plaintext.as_ref().unwrap(), &DCRTPoly::const_zero(&params));

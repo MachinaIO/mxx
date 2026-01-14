@@ -106,7 +106,7 @@ mod tests {
             &params,
             &enc_one.clone(),
             &[enc1.clone(), enc2.clone()],
-            None::<LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result
@@ -141,7 +141,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone()],
-            None::<LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result
@@ -176,7 +176,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone()],
-            None::<LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result
@@ -221,7 +221,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone(), enc3.clone()],
-            None::<LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result: ((enc1 + enc2)^2) - enc3
@@ -279,7 +279,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone(), enc3.clone(), enc4.clone()],
-            None::<LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result: (((enc1 + enc2) * (enc3 * enc4)) + (enc1 - enc3)) * scalar
@@ -331,7 +331,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone()],
-            None::<LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected: enc1 + enc2
@@ -392,7 +392,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone()],
-            None::<LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result: (enc1 + enc2) - (enc1 * enc2)
@@ -460,7 +460,7 @@ mod tests {
             &params,
             &enc_one,
             &[enc1.clone(), enc2.clone(), enc3.clone()],
-            None::<LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
         // Expected result: ((enc1 * enc2) + enc3)^2

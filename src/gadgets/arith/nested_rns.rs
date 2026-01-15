@@ -778,6 +778,7 @@ impl<P: Poly> NestedRnsPoly<P> {
         ctx: Arc<NestedRnsPolyContext>,
         circuit: &mut PolyCircuit<P>,
         height: usize,
+        enable_levels: Option<usize>,
     ) {
         let num_inputs =
             1usize.checked_shl(height as u32).expect("height is too large to represent 2^h inputs");
@@ -787,13 +788,13 @@ impl<P: Poly> NestedRnsPoly<P> {
             debug_assert!(current_layer.len().is_multiple_of(2), "layer size must stay even");
             let mut next_layer = Vec::with_capacity(current_layer.len() / 2);
             for pair in current_layer.chunks(2) {
-                let parent = pair[0].mul_full_reduce(&pair[1], None, circuit);
+                let parent = pair[0].mul_full_reduce(&pair[1], enable_levels, circuit);
                 next_layer.push(parent);
             }
             current_layer = next_layer;
         }
         let root = current_layer.pop().expect("multiplication tree must contain at least one node");
-        let out = root.reconstruct(None, circuit);
+        let out = root.reconstruct(enable_levels, circuit);
         circuit.output(vec![out]);
     }
 

@@ -74,21 +74,24 @@ impl NestedRnsPolyContext {
             let add_lazy_reduce_ids = (0..q_moduli_depth)
                 .map(|_| {
                     circuit.register_sub_circuit(Self::add_lazy_reduce_subcircuit::<P>(
-                        &p_moduli, &lut_mod_p_ids,
+                        &p_moduli,
+                        &lut_mod_p_ids,
                     ))
                 })
                 .collect::<Vec<_>>();
             let sub_lazy_reduce_ids = (0..q_moduli_depth)
                 .map(|_| {
                     circuit.register_sub_circuit(Self::sub_lazy_reduce_subcircuit::<P>(
-                        &p_moduli, &lut_mod_p_ids,
+                        &p_moduli,
+                        &lut_mod_p_ids,
                     ))
                 })
                 .collect::<Vec<_>>();
             let mul_lazy_reduce_ids = (0..q_moduli_depth)
                 .map(|_| {
                     circuit.register_sub_circuit(Self::mul_lazy_reduce_subcircuit::<P>(
-                        &p_moduli, &lut_mod_p_ids,
+                        &p_moduli,
+                        &lut_mod_p_ids,
                     ))
                 })
                 .collect::<Vec<_>>();
@@ -309,21 +312,24 @@ impl NestedRnsPolyContext {
         let add_lazy_reduce_ids = (0..q_moduli_depth)
             .map(|_| {
                 circuit.register_sub_circuit(Self::add_lazy_reduce_subcircuit::<P>(
-                    &p_moduli, &lut_mod_p_ids,
+                    &p_moduli,
+                    &lut_mod_p_ids,
                 ))
             })
             .collect::<Vec<_>>();
         let sub_lazy_reduce_ids = (0..q_moduli_depth)
             .map(|_| {
                 circuit.register_sub_circuit(Self::sub_lazy_reduce_subcircuit::<P>(
-                    &p_moduli, &lut_mod_p_ids,
+                    &p_moduli,
+                    &lut_mod_p_ids,
                 ))
             })
             .collect::<Vec<_>>();
         let mul_lazy_reduce_ids = (0..q_moduli_depth)
             .map(|_| {
                 circuit.register_sub_circuit(Self::mul_lazy_reduce_subcircuit::<P>(
-                    &p_moduli, &lut_mod_p_ids,
+                    &p_moduli,
+                    &lut_mod_p_ids,
                 ))
             })
             .collect::<Vec<_>>();
@@ -904,6 +910,7 @@ pub fn encode_nested_rns_poly<P: Poly>(
 mod tests {
     use super::*;
     use crate::{
+        __PAIR, __TestState,
         lookup::poly::PolyPltEvaluator,
         poly::{
             PolyParams,
@@ -918,6 +925,7 @@ mod tests {
     fn create_test_context(
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> (DCRTPolyParams, Arc<NestedRnsPolyContext>) {
+        let _ = tracing_subscriber::fmt::try_init();
         let params = DCRTPolyParams::new(4, 6, 18, BASE_BITS);
         let ctx =
             Arc::new(NestedRnsPolyContext::setup(circuit, &params, P_MODULI_BITS, SCALE, false));
@@ -927,6 +935,7 @@ mod tests {
         (params, ctx)
     }
 
+    #[sequential_test::sequential]
     #[test]
     fn test_nested_rns_poly_add_full_reduce_maxes() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -937,6 +946,7 @@ mod tests {
         test_nested_rns_poly_add_full_reduce_generic(circuit, params, ctx, a_value, b_value);
     }
 
+    #[sequential_test::sequential]
     #[test]
     fn test_nested_rns_poly_add_full_reduce_random() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -948,6 +958,7 @@ mod tests {
         test_nested_rns_poly_add_full_reduce_generic(circuit, params, ctx, a_value, b_value);
     }
 
+    #[sequential_test::sequential]
     #[test]
     fn test_nested_rns_poly_sub_full_reduce_maxes() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -958,6 +969,7 @@ mod tests {
         test_nested_rns_poly_sub_full_reduce_generic(circuit, params, ctx, a_value, b_value);
     }
 
+    #[sequential_test::sequential]
     #[test]
     fn test_nested_rns_poly_sub_full_reduce_random() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -969,6 +981,7 @@ mod tests {
         test_nested_rns_poly_sub_full_reduce_generic(circuit, params, ctx, a_value, b_value);
     }
 
+    #[sequential_test::sequential]
     #[test]
     fn test_nested_rns_poly_mul_full_reduce_maxes() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -979,6 +992,7 @@ mod tests {
         test_nested_rns_poly_mul_full_reduce_generic(circuit, params, ctx, a_value, b_value);
     }
 
+    #[sequential_test::sequential]
     #[test]
     fn test_nested_rns_poly_mul_full_reduce_random() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();

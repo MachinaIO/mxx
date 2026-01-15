@@ -337,7 +337,6 @@ impl<T: Copy> PinnedHostBuffer<T> {
     // pub(crate) fn to_vec(&self) -> Vec<T> {
     //     self.as_slice().to_vec()
     // }
-
 }
 
 impl<T: Copy> Clone for PinnedHostBuffer<T> {

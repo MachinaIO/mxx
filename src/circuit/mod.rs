@@ -730,10 +730,7 @@ impl<P: Poly> PolyCircuit<P> {
                 }
             }
             if !subcircuit_gates.is_empty() {
-                subcircuit_gates
-                    .iter()
-                    .copied()
-                    .for_each(|gate_id| eval_gate(gate_id));
+                subcircuit_gates.iter().copied().for_each(|gate_id| eval_gate(gate_id));
                 debug!("Evaluated sub-circuit gates in single thread");
             }
             if use_parallel {

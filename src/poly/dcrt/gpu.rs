@@ -24,19 +24,25 @@ use tracing::info;
 
 #[allow(non_camel_case_types)]
 #[repr(C)]
-struct GpuContextOpaque {
+pub(crate) struct GpuContextOpaque {
     _private: [u8; 0],
 }
 
 #[allow(non_camel_case_types)]
 #[repr(C)]
-struct GpuPolyOpaque {
+pub(crate) struct GpuPolyOpaque {
     _private: [u8; 0],
 }
 
 #[allow(non_camel_case_types)]
 #[repr(C)]
-struct GpuEventSetOpaque {
+pub(crate) struct GpuMatrixOpaque {
+    _private: [u8; 0],
+}
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub(crate) struct GpuEventSetOpaque {
     _private: [u8; 0],
 }
 
@@ -80,13 +86,6 @@ unsafe extern "C" {
         format: c_int,
         out_events: *mut *mut GpuEventSetOpaque,
     ) -> c_int;
-    fn gpu_poly_load_rns_batch(
-        polys: *const *mut GpuPolyOpaque,
-        poly_count: usize,
-        bytes: *const u8,
-        bytes_per_poly: usize,
-        format: c_int,
-    ) -> c_int;
     fn gpu_poly_store_rns_batch(
         polys: *const *mut GpuPolyOpaque,
         poly_count: usize,
@@ -95,8 +94,8 @@ unsafe extern "C" {
         format: c_int,
         out_events: *mut *mut GpuEventSetOpaque,
     ) -> c_int;
-    fn gpu_event_set_wait(events: *mut GpuEventSetOpaque) -> c_int;
-    fn gpu_event_set_destroy(events: *mut GpuEventSetOpaque);
+    pub(crate) fn gpu_event_set_wait(events: *mut GpuEventSetOpaque) -> c_int;
+    pub(crate) fn gpu_event_set_destroy(events: *mut GpuEventSetOpaque);
 
     fn gpu_poly_add(
         out: *mut GpuPolyOpaque,
@@ -113,40 +112,88 @@ unsafe extern "C" {
         a: *const GpuPolyOpaque,
         b: *const GpuPolyOpaque,
     ) -> c_int;
-    fn gpu_block_add(
-        out: *const *mut GpuPolyOpaque,
-        lhs: *const *const GpuPolyOpaque,
-        rhs: *const *const GpuPolyOpaque,
-        count: usize,
-    ) -> c_int;
-    fn gpu_block_sub(
-        out: *const *mut GpuPolyOpaque,
-        lhs: *const *const GpuPolyOpaque,
-        rhs: *const *const GpuPolyOpaque,
-        count: usize,
-    ) -> c_int;
-    fn gpu_block_mul(
-        out: *const *mut GpuPolyOpaque,
-        lhs: *const *const GpuPolyOpaque,
-        rhs: *const *const GpuPolyOpaque,
-        rows: usize,
-        inner: usize,
-        cols: usize,
-    ) -> c_int;
-    fn gpu_block_mul_timed(
-        out: *const *mut GpuPolyOpaque,
-        lhs: *const *const GpuPolyOpaque,
-        rhs: *const *const GpuPolyOpaque,
-        rows: usize,
-        inner: usize,
-        cols: usize,
-        out_kernel_ms: *mut f64,
-    ) -> c_int;
     fn gpu_poly_decompose_base(
         src: *const GpuPolyOpaque,
         base_bits: u32,
         out_polys: *const *mut GpuPolyOpaque,
         out_count: usize,
+    ) -> c_int;
+
+    pub(crate) fn gpu_matrix_create(
+        ctx: *mut GpuContextOpaque,
+        level: c_int,
+        rows: usize,
+        cols: usize,
+        format: c_int,
+        out_mat: *mut *mut GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_destroy(mat: *mut GpuMatrixOpaque);
+    pub(crate) fn gpu_matrix_copy(dst: *mut GpuMatrixOpaque, src: *const GpuMatrixOpaque) -> c_int;
+    pub(crate) fn gpu_matrix_entry_clone(
+        mat: *const GpuMatrixOpaque,
+        row: usize,
+        col: usize,
+        out_poly: *mut *mut GpuPolyOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_copy_entry(
+        mat: *mut GpuMatrixOpaque,
+        row: usize,
+        col: usize,
+        src: *const GpuPolyOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_load_rns_batch(
+        mat: *mut GpuMatrixOpaque,
+        bytes: *const u8,
+        bytes_per_poly: usize,
+        format: c_int,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_store_rns_batch(
+        mat: *const GpuMatrixOpaque,
+        bytes_out: *mut u8,
+        bytes_per_poly: usize,
+        format: c_int,
+        out_events: *mut *mut GpuEventSetOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_add(
+        out: *mut GpuMatrixOpaque,
+        lhs: *const GpuMatrixOpaque,
+        rhs: *const GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_sub(
+        out: *mut GpuMatrixOpaque,
+        lhs: *const GpuMatrixOpaque,
+        rhs: *const GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_mul(
+        out: *mut GpuMatrixOpaque,
+        lhs: *const GpuMatrixOpaque,
+        rhs: *const GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_mul_timed(
+        out: *mut GpuMatrixOpaque,
+        lhs: *const GpuMatrixOpaque,
+        rhs: *const GpuMatrixOpaque,
+        out_kernel_ms: *mut f64,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_mul_scalar(
+        out: *mut GpuMatrixOpaque,
+        lhs: *const GpuMatrixOpaque,
+        scalar: *const GpuPolyOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_copy_block(
+        out: *mut GpuMatrixOpaque,
+        src: *const GpuMatrixOpaque,
+        dst_row: usize,
+        dst_col: usize,
+        src_row: usize,
+        src_col: usize,
+        rows: usize,
+        cols: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_decompose_base(
+        src: *const GpuMatrixOpaque,
+        base_bits: u32,
+        out: *mut GpuMatrixOpaque,
     ) -> c_int;
 
     fn gpu_poly_ntt(poly: *mut GpuPolyOpaque, batch: c_int) -> c_int;
@@ -164,7 +211,7 @@ unsafe extern "C" {
 pub(crate) const GPU_POLY_FORMAT_COEFF: c_int = 0;
 pub(crate) const GPU_POLY_FORMAT_EVAL: c_int = 1;
 
-fn last_error_string() -> String {
+pub(crate) fn last_error_string() -> String {
     unsafe {
         let ptr = gpu_last_error();
         if ptr.is_null() {
@@ -174,7 +221,7 @@ fn last_error_string() -> String {
     }
 }
 
-fn check_status(code: c_int, context: &str) {
+pub(crate) fn check_status(code: c_int, context: &str) {
     if code != 0 {
         panic!("{context} failed: {}", last_error_string());
     }
@@ -291,36 +338,6 @@ impl<T: Copy> PinnedHostBuffer<T> {
     //     self.as_slice().to_vec()
     // }
 
-    pub(crate) fn set_slice(&mut self, slice: &[T]) {
-        if slice.len() > self.cap {
-            self.reserve(slice.len());
-        }
-        if !slice.is_empty() {
-            unsafe {
-                ptr::copy_nonoverlapping(slice.as_ptr(), self.ptr.as_ptr(), slice.len());
-            }
-        }
-        self.len = slice.len();
-    }
-
-    pub(crate) fn reserve(&mut self, capacity: usize) {
-        if capacity <= self.cap {
-            return;
-        }
-        let new_ptr = pinned_alloc::<T>(capacity);
-        if self.len > 0 {
-            unsafe {
-                ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr.as_ptr(), self.len);
-            }
-        }
-        if self.cap > 0 {
-            unsafe {
-                gpu_pinned_free(self.ptr.as_ptr() as *mut u8);
-            }
-        }
-        self.ptr = new_ptr;
-        self.cap = capacity;
-    }
 }
 
 impl<T: Copy> Clone for PinnedHostBuffer<T> {
@@ -479,6 +496,10 @@ impl GpuDCRTPolyParams {
         self.batch
     }
 
+    pub(crate) fn ctx_raw(&self) -> *mut GpuContextOpaque {
+        self.ctx.raw_ptr()
+    }
+
     pub(crate) fn modulus_for_level(&self, level: usize) -> BigUint {
         self.moduli.iter().take(level + 1).fold(BigUint::one(), |acc, m| acc * m)
     }
@@ -554,6 +575,10 @@ impl GpuContext {
 
         Self { raw: ctx_ptr, n, moduli: moduli.to_vec(), gpu_ids: gpu_ids.to_vec(), dnum, batch }
     }
+
+    pub(crate) fn raw_ptr(&self) -> *mut GpuContextOpaque {
+        self.raw
+    }
 }
 
 impl Drop for GpuContext {
@@ -602,6 +627,19 @@ impl GpuDCRTPoly {
         };
         check_status(status, "gpu_poly_create");
         Self { params, raw: poly_ptr, level, is_ntt }
+    }
+
+    pub(crate) fn raw_ptr(&self) -> *mut GpuPolyOpaque {
+        self.raw
+    }
+
+    pub(crate) unsafe fn from_raw(
+        params: Arc<GpuDCRTPolyParams>,
+        raw: *mut GpuPolyOpaque,
+        level: usize,
+        is_ntt: bool,
+    ) -> Self {
+        Self { params, raw, level, is_ntt }
     }
 
     fn from_flat(
@@ -665,18 +703,6 @@ impl GpuDCRTPoly {
         flat
     }
 
-    pub(crate) fn load_rns_bytes(&mut self, bytes: &[u8], format: c_int) {
-        if bytes.is_empty() {
-            return;
-        }
-        let ptrs = [self.raw];
-        let status = unsafe {
-            gpu_poly_load_rns_batch(ptrs.as_ptr(), 1, bytes.as_ptr(), bytes.len(), format)
-        };
-        check_status(status, "gpu_poly_load_rns_batch");
-        self.is_ntt = format == GPU_POLY_FORMAT_EVAL;
-    }
-
     pub(crate) fn store_rns_bytes(&mut self, bytes_out: &mut [u8], format: c_int) {
         if bytes_out.is_empty() {
             return;
@@ -698,32 +724,6 @@ impl GpuDCRTPoly {
         unsafe { gpu_event_set_destroy(events) };
         check_status(wait_status, "gpu_event_set_wait");
         self.is_ntt = format == GPU_POLY_FORMAT_EVAL;
-    }
-
-    pub(crate) fn load_rns_bytes_batch(
-        polys: &mut [GpuDCRTPoly],
-        bytes: &[u8],
-        bytes_per_poly: usize,
-        format: c_int,
-    ) {
-        if polys.is_empty() || bytes.is_empty() {
-            return;
-        }
-        let ptrs = polys.iter_mut().map(|poly| poly.raw).collect::<Vec<_>>();
-        let status = unsafe {
-            gpu_poly_load_rns_batch(
-                ptrs.as_ptr(),
-                polys.len(),
-                bytes.as_ptr(),
-                bytes_per_poly,
-                format,
-            )
-        };
-        check_status(status, "gpu_poly_load_rns_batch");
-        let is_ntt = format == GPU_POLY_FORMAT_EVAL;
-        for poly in polys.iter_mut() {
-            poly.is_ntt = is_ntt;
-        }
     }
 
     pub(crate) fn store_rns_bytes_batch(
@@ -837,75 +837,6 @@ impl GpuDCRTPoly {
     //     out.is_ntt = a.is_ntt;
     // }
 
-    pub(crate) fn sub_into(out: &mut GpuDCRTPoly, a: &GpuDCRTPoly, b: &GpuDCRTPoly) {
-        a.assert_compatible(b);
-        assert_eq!(out.level, a.level, "GPU polynomials must have the same level");
-        assert_eq!(out.params.as_ref(), a.params.as_ref(), "GPU params must match");
-        let status = unsafe { gpu_poly_sub(out.raw, a.raw, b.raw) };
-        check_status(status, "gpu_poly_sub");
-        out.is_ntt = a.is_ntt;
-    }
-
-    pub(crate) fn mul_into(out: &mut GpuDCRTPoly, a: &GpuDCRTPoly, b: &GpuDCRTPoly) {
-        a.assert_compatible(b);
-        assert_eq!(out.level, a.level, "GPU polynomials must have the same level");
-        assert_eq!(out.params.as_ref(), a.params.as_ref(), "GPU params must match");
-        let status = unsafe { gpu_poly_mul(out.raw, a.raw, b.raw) };
-        check_status(status, "gpu_poly_mul");
-        out.is_ntt = true;
-    }
-
-    fn block_op_into(
-        out: &mut [GpuDCRTPoly],
-        a: &[GpuDCRTPoly],
-        b: &[GpuDCRTPoly],
-        op: unsafe extern "C" fn(
-            *const *mut GpuPolyOpaque,
-            *const *const GpuPolyOpaque,
-            *const *const GpuPolyOpaque,
-            usize,
-        ) -> c_int,
-        context: &str,
-    ) {
-        assert_eq!(out.len(), a.len(), "GPU block op requires equal lengths");
-        assert_eq!(out.len(), b.len(), "GPU block op requires equal lengths");
-        if out.is_empty() {
-            return;
-        }
-
-        debug_assert!(
-            a.iter().zip(b.iter()).all(|(lhs, rhs)| {
-                lhs.level == rhs.level &&
-                    lhs.params.as_ref() == rhs.params.as_ref() &&
-                    lhs.is_ntt == rhs.is_ntt
-            }),
-            "GPU block op requires compatible inputs"
-        );
-
-        let out_ptrs = out.iter_mut().map(|poly| poly.raw).collect::<Vec<_>>();
-        let lhs_ptrs = a.iter().map(|poly| poly.raw as *const GpuPolyOpaque).collect::<Vec<_>>();
-        let rhs_ptrs = b.iter().map(|poly| poly.raw as *const GpuPolyOpaque).collect::<Vec<_>>();
-
-        let status =
-            unsafe { op(out_ptrs.as_ptr(), lhs_ptrs.as_ptr(), rhs_ptrs.as_ptr(), out.len()) };
-        check_status(status, context);
-
-        let is_ntt = a[0].is_ntt;
-        let level = a[0].level;
-        for poly in out.iter_mut() {
-            poly.is_ntt = is_ntt;
-            poly.level = level;
-        }
-    }
-
-    pub(crate) fn block_add_into(out: &mut [GpuDCRTPoly], a: &[GpuDCRTPoly], b: &[GpuDCRTPoly]) {
-        Self::block_op_into(out, a, b, gpu_block_add, "gpu_block_add");
-    }
-
-    pub(crate) fn block_sub_into(out: &mut [GpuDCRTPoly], a: &[GpuDCRTPoly], b: &[GpuDCRTPoly]) {
-        Self::block_op_into(out, a, b, gpu_block_sub, "gpu_block_sub");
-    }
-
     // pub(crate) fn block_entrywise_mul_into(
     //     out: &mut [GpuDCRTPoly],
     //     a: &[GpuDCRTPoly],
@@ -913,129 +844,6 @@ impl GpuDCRTPoly {
     // ) {
     //     Self::block_op_into(out, a, b, gpu_block_entrywise_mul, "gpu_block_entrywise_mul");
     // }
-
-    pub(crate) fn block_mul_into(
-        out: &mut [GpuDCRTPoly],
-        a: &[GpuDCRTPoly],
-        b: &[GpuDCRTPoly],
-        rows: usize,
-        inner: usize,
-        cols: usize,
-    ) {
-        let expected_out = rows.saturating_mul(cols);
-        let expected_a = rows.saturating_mul(inner);
-        let expected_b = inner.saturating_mul(cols);
-        assert_eq!(out.len(), expected_out, "GPU matmul requires rows*cols outputs");
-        assert_eq!(a.len(), expected_a, "GPU matmul requires rows*inner lhs polys");
-        assert_eq!(b.len(), expected_b, "GPU matmul requires inner*cols rhs polys");
-        if out.is_empty() || rows == 0 || inner == 0 || cols == 0 {
-            return;
-        }
-
-        let first = &a[0];
-        debug_assert!(
-            a.iter().all(|lhs| {
-                lhs.level == first.level &&
-                    lhs.params.as_ref() == first.params.as_ref() &&
-                    lhs.is_ntt == first.is_ntt
-            }) && b.iter().all(|rhs| {
-                rhs.level == first.level &&
-                    rhs.params.as_ref() == first.params.as_ref() &&
-                    rhs.is_ntt == first.is_ntt
-            }) && out.iter().all(|poly| {
-                poly.level == first.level &&
-                    poly.params.as_ref() == first.params.as_ref() &&
-                    poly.is_ntt == first.is_ntt
-            }),
-            "GPU matmul requires compatible inputs"
-        );
-
-        let out_ptrs = out.iter_mut().map(|poly| poly.raw).collect::<Vec<_>>();
-        let lhs_ptrs = a.iter().map(|poly| poly.raw as *const GpuPolyOpaque).collect::<Vec<_>>();
-        let rhs_ptrs = b.iter().map(|poly| poly.raw as *const GpuPolyOpaque).collect::<Vec<_>>();
-
-        let status = unsafe {
-            gpu_block_mul(
-                out_ptrs.as_ptr(),
-                lhs_ptrs.as_ptr(),
-                rhs_ptrs.as_ptr(),
-                rows,
-                inner,
-                cols,
-            )
-        };
-        check_status(status, "gpu_block_mul");
-
-        let is_ntt = a[0].is_ntt;
-        let level = a[0].level;
-        for poly in out.iter_mut() {
-            poly.is_ntt = is_ntt;
-            poly.level = level;
-        }
-    }
-
-    pub(crate) fn block_mul_into_timed(
-        out: &mut [GpuDCRTPoly],
-        a: &[GpuDCRTPoly],
-        b: &[GpuDCRTPoly],
-        rows: usize,
-        inner: usize,
-        cols: usize,
-    ) -> f64 {
-        let expected_out = rows.saturating_mul(cols);
-        let expected_a = rows.saturating_mul(inner);
-        let expected_b = inner.saturating_mul(cols);
-        assert_eq!(out.len(), expected_out, "GPU matmul requires rows*cols outputs");
-        assert_eq!(a.len(), expected_a, "GPU matmul requires rows*inner lhs polys");
-        assert_eq!(b.len(), expected_b, "GPU matmul requires inner*cols rhs polys");
-        if out.is_empty() || rows == 0 || inner == 0 || cols == 0 {
-            return 0.0;
-        }
-
-        let first = &a[0];
-        debug_assert!(
-            a.iter().all(|lhs| {
-                lhs.level == first.level &&
-                    lhs.params.as_ref() == first.params.as_ref() &&
-                    lhs.is_ntt == first.is_ntt
-            }) && b.iter().all(|rhs| {
-                rhs.level == first.level &&
-                    rhs.params.as_ref() == first.params.as_ref() &&
-                    rhs.is_ntt == first.is_ntt
-            }) && out.iter().all(|poly| {
-                poly.level == first.level &&
-                    poly.params.as_ref() == first.params.as_ref() &&
-                    poly.is_ntt == first.is_ntt
-            }),
-            "GPU matmul requires compatible inputs"
-        );
-
-        let out_ptrs = out.iter_mut().map(|poly| poly.raw).collect::<Vec<_>>();
-        let lhs_ptrs = a.iter().map(|poly| poly.raw as *const GpuPolyOpaque).collect::<Vec<_>>();
-        let rhs_ptrs = b.iter().map(|poly| poly.raw as *const GpuPolyOpaque).collect::<Vec<_>>();
-
-        let mut kernel_ms = 0.0f64;
-        let status = unsafe {
-            gpu_block_mul_timed(
-                out_ptrs.as_ptr(),
-                lhs_ptrs.as_ptr(),
-                rhs_ptrs.as_ptr(),
-                rows,
-                inner,
-                cols,
-                &mut kernel_ms as *mut f64,
-            )
-        };
-        check_status(status, "gpu_block_mul_timed");
-
-        let is_ntt = a[0].is_ntt;
-        let level = a[0].level;
-        for poly in out.iter_mut() {
-            poly.is_ntt = is_ntt;
-            poly.level = level;
-        }
-        kernel_ms
-    }
 
     // pub(crate) fn block_mul_into_refs(
     //     out: &mut [GpuDCRTPoly],
@@ -1078,31 +886,6 @@ impl GpuDCRTPoly {
     //         poly.level = level;
     //     }
     // }
-
-    pub(crate) fn block_add_assign(out: &mut [GpuDCRTPoly], rhs: &[GpuDCRTPoly]) {
-        assert_eq!(out.len(), rhs.len(), "GPU block op requires equal lengths");
-        if out.is_empty() {
-            return;
-        }
-
-        debug_assert!(
-            out.iter().zip(rhs.iter()).all(|(lhs, rhs)| {
-                lhs.level == rhs.level &&
-                    lhs.params.as_ref() == rhs.params.as_ref() &&
-                    lhs.is_ntt == rhs.is_ntt
-            }),
-            "GPU block op requires compatible inputs"
-        );
-
-        let out_ptrs = out.iter_mut().map(|poly| poly.raw).collect::<Vec<_>>();
-        let lhs_ptrs = out.iter().map(|poly| poly.raw as *const GpuPolyOpaque).collect::<Vec<_>>();
-        let rhs_ptrs = rhs.iter().map(|poly| poly.raw as *const GpuPolyOpaque).collect::<Vec<_>>();
-
-        let status = unsafe {
-            gpu_block_add(out_ptrs.as_ptr(), lhs_ptrs.as_ptr(), rhs_ptrs.as_ptr(), out.len())
-        };
-        check_status(status, "gpu_block_add");
-    }
 
     // pub(crate) fn add_in_place(&mut self, rhs: &GpuDCRTPoly) {
     //     self.assert_compatible(rhs);

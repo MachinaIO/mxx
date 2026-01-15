@@ -48,4 +48,14 @@ struct GpuEventSet
     std::vector<Entry> entries;
 };
 
+struct GpuMatrix
+{
+    GpuContext *ctx;
+    size_t rows;
+    size_t cols;
+    int level;
+    PolyFormat format;
+    std::vector<GpuPoly *> polys;
+};
+
 extern "C" int gpu_set_last_error(const char *msg);

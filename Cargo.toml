@@ -57,3 +57,11 @@ codegen-units = 16
 inherits = "release"
 debug = "full"
 strip = "none"
+
+[[bench]]
+name = "bench_matrix_mul_cpu"
+harness = false
+
+[[bench]]
+name = "bench_matrix_mul_gpu"
+harness = false

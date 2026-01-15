@@ -5,7 +5,15 @@ use crate::{
     poly::{
         Poly, PolyParams,
         dcrt::{
-            gpu::{GPU_POLY_FORMAT_EVAL, GpuDCRTPoly, GpuDCRTPolyParams, PinnedHostBuffer},
+            gpu::{
+                GPU_POLY_FORMAT_EVAL, GpuDCRTPoly, GpuDCRTPolyParams, GpuEventSetOpaque,
+                GpuMatrixOpaque, check_status, gpu_event_set_destroy, gpu_event_set_wait,
+                gpu_matrix_add, gpu_matrix_copy, gpu_matrix_copy_block, gpu_matrix_copy_entry,
+                gpu_matrix_create, gpu_matrix_decompose_base, gpu_matrix_destroy,
+                gpu_matrix_entry_clone, gpu_matrix_load_rns_batch, gpu_matrix_mul,
+                gpu_matrix_mul_scalar, gpu_matrix_mul_timed, gpu_matrix_store_rns_batch,
+                gpu_matrix_sub,
+            },
             params::DCRTPolyParams,
             poly::DCRTPoly,
         },
@@ -21,15 +29,41 @@ use std::{
     fmt::Debug,
     ops::{Add, Mul, Neg, Range, Sub},
     path::Path,
+    ptr,
     sync::Arc,
 };
 
-#[derive(Clone)]
 pub struct GpuDCRTPolyMatrix {
     pub params: GpuDCRTPolyParams,
     pub nrow: usize,
     pub ncol: usize,
-    entries: Vec<PinnedHostBuffer<u8>>,
+    raw: *mut GpuMatrixOpaque,
+}
+
+/// # Safety
+/// GpuDCRTPolyMatrix owns an opaque GPU handle managed on the C++ side.
+unsafe impl Send for GpuDCRTPolyMatrix {}
+unsafe impl Sync for GpuDCRTPolyMatrix {}
+
+impl Drop for GpuDCRTPolyMatrix {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe { gpu_matrix_destroy(self.raw) };
+            self.raw = ptr::null_mut();
+        }
+    }
+}
+
+impl Clone for GpuDCRTPolyMatrix {
+    fn clone(&self) -> Self {
+        if self.nrow == 0 || self.ncol == 0 {
+            return Self::new_empty(&self.params, self.nrow, self.ncol);
+        }
+        let out = Self::new_empty(&self.params, self.nrow, self.ncol);
+        let status = unsafe { gpu_matrix_copy(out.raw, self.raw) };
+        check_status(status, "gpu_matrix_copy");
+        out
+    }
 }
 
 impl Debug for GpuDCRTPolyMatrix {
@@ -61,7 +95,7 @@ impl PartialEq for GpuDCRTPolyMatrix {
         if self.params != other.params || self.nrow != other.nrow || self.ncol != other.ncol {
             return false;
         }
-        if self.entries == other.entries {
+        if self.raw == other.raw {
             return true;
         }
         let lhs = self.to_cpu_matrix();
@@ -74,32 +108,91 @@ impl Eq for GpuDCRTPolyMatrix {}
 
 impl GpuDCRTPolyMatrix {
     fn new_empty(params: &GpuDCRTPolyParams, nrow: usize, ncol: usize) -> Self {
-        let zero_bytes = zero_rns_bytes(params);
-        let entries = parallel_iter!(0..nrow.saturating_mul(ncol))
-            .map(|_| PinnedHostBuffer::from_slice(&zero_bytes))
-            .collect::<Vec<_>>();
-        Self { params: params.clone(), nrow, ncol, entries }
+        let level = params.crt_depth().saturating_sub(1) as i32;
+        let mut raw: *mut GpuMatrixOpaque = ptr::null_mut();
+        let status = unsafe {
+            gpu_matrix_create(
+                params.ctx_raw(),
+                level,
+                nrow,
+                ncol,
+                GPU_POLY_FORMAT_EVAL,
+                &mut raw as *mut *mut GpuMatrixOpaque,
+            )
+        };
+        check_status(status, "gpu_matrix_create");
+        Self { params: params.clone(), nrow, ncol, raw }
     }
 
-    fn entry_index(&self, row: usize, col: usize) -> usize {
-        row * self.ncol + col
+    fn new_zero(params: &GpuDCRTPolyParams, nrow: usize, ncol: usize) -> Self {
+        let mut out = Self::new_empty(params, nrow, ncol);
+        if nrow == 0 || ncol == 0 {
+            return out;
+        }
+        let bytes_per_poly = rns_bytes_len(params);
+        if bytes_per_poly == 0 {
+            return out;
+        }
+        let total = nrow.saturating_mul(ncol);
+        let bytes = vec![0u8; total.saturating_mul(bytes_per_poly)];
+        out.load_rns_bytes(&bytes, bytes_per_poly);
+        out
     }
 
-    fn poly_from_rns_bytes(&self, bytes: &[u8]) -> GpuDCRTPoly {
-        let params = Arc::new(self.params.clone());
-        let level = params.crt_depth().saturating_sub(1);
-        let mut poly = GpuDCRTPoly::new_empty(params, level, true);
-        poly.load_rns_bytes(bytes, GPU_POLY_FORMAT_EVAL);
-        poly
+    fn copy_block_from(
+        &mut self,
+        src: &Self,
+        dst_row: usize,
+        dst_col: usize,
+        src_row: usize,
+        src_col: usize,
+        rows: usize,
+        cols: usize,
+    ) {
+        if rows == 0 || cols == 0 {
+            return;
+        }
+        let status = unsafe {
+            gpu_matrix_copy_block(self.raw, src.raw, dst_row, dst_col, src_row, src_col, rows, cols)
+        };
+        check_status(status, "gpu_matrix_copy_block");
     }
 
-    pub(crate) fn entry_bytes(&self, row: usize, col: usize) -> &[u8] {
-        self.entries[self.entry_index(row, col)].as_slice()
+    fn store_rns_bytes(&self, bytes_out: &mut [u8], bytes_per_poly: usize) {
+        if bytes_out.is_empty() || bytes_per_poly == 0 {
+            return;
+        }
+        let mut events: *mut GpuEventSetOpaque = ptr::null_mut();
+        let status = unsafe {
+            gpu_matrix_store_rns_batch(
+                self.raw,
+                bytes_out.as_mut_ptr(),
+                bytes_per_poly,
+                GPU_POLY_FORMAT_EVAL,
+                &mut events as *mut *mut GpuEventSetOpaque,
+            )
+        };
+        check_status(status, "gpu_matrix_store_rns_batch");
+        if !events.is_null() {
+            let wait_status = unsafe { gpu_event_set_wait(events) };
+            unsafe { gpu_event_set_destroy(events) };
+            check_status(wait_status, "gpu_event_set_wait");
+        }
     }
 
-    fn set_entry_bytes(&mut self, row: usize, col: usize, bytes: &[u8]) {
-        let idx = self.entry_index(row, col);
-        self.entries[idx].set_slice(bytes);
+    fn load_rns_bytes(&mut self, bytes: &[u8], bytes_per_poly: usize) {
+        if bytes.is_empty() || bytes_per_poly == 0 {
+            return;
+        }
+        let status = unsafe {
+            gpu_matrix_load_rns_batch(
+                self.raw,
+                bytes.as_ptr(),
+                bytes_per_poly,
+                GPU_POLY_FORMAT_EVAL,
+            )
+        };
+        check_status(status, "gpu_matrix_load_rns_batch");
     }
 
     fn cpu_params(&self) -> DCRTPolyParams {
@@ -121,6 +214,8 @@ impl GpuDCRTPolyMatrix {
             return super::dcrt_poly::DCRTPolyMatrix::new_empty(&cpu_params, self.nrow, self.ncol);
         }
         let total = self.nrow.saturating_mul(self.ncol);
+        let mut bytes = vec![0u8; total.saturating_mul(bytes_per_poly)];
+        self.store_rns_bytes(&mut bytes, bytes_per_poly);
         let level = cpu_params.crt_depth().saturating_sub(1);
         let n = cpu_params.ring_dimension() as usize;
         let expected_len = (level + 1).saturating_mul(n);
@@ -129,13 +224,8 @@ impl GpuDCRTPolyMatrix {
 
         let polys_cpu = parallel_iter!(0..total)
             .map(|idx| {
-                let entry = &self.entries[idx];
-                let entry_bytes = entry.as_slice();
-                debug_assert_eq!(
-                    entry_bytes.len(),
-                    bytes_per_poly,
-                    "entry bytes must match rns byte size"
-                );
+                let entry_bytes =
+                    &bytes[idx * bytes_per_poly..(idx + 1).saturating_mul(bytes_per_poly)];
                 let mut flat = Vec::with_capacity(expected_len);
                 for limb_bytes in entry_bytes.chunks_exact(std::mem::size_of::<u64>()) {
                     let bytes: [u8; 8] = limb_bytes.try_into().expect("u64 chunk size mismatch");
@@ -167,7 +257,7 @@ impl GpuDCRTPolyMatrix {
     ) -> Self {
         let (nrow, ncol) = matrix.size();
         if nrow == 0 || ncol == 0 {
-            return Self { params: params.clone(), nrow, ncol, entries: Vec::new() };
+            return Self::new_empty(params, nrow, ncol);
         }
         let bytes_per_poly = rns_bytes_len(params);
         if bytes_per_poly == 0 {
@@ -180,8 +270,8 @@ impl GpuDCRTPolyMatrix {
         let expected_bytes = expected_len * std::mem::size_of::<u64>();
         debug_assert_eq!(bytes_per_poly, expected_bytes, "rns_bytes_len must match moduli*n*u64");
 
-        let mut out = Self::new_empty(params, nrow, ncol);
-        out.entries.par_iter_mut().enumerate().for_each(|(idx, entry)| {
+        let mut bytes = vec![0u8; nrow.saturating_mul(ncol).saturating_mul(bytes_per_poly)];
+        bytes.par_chunks_mut(bytes_per_poly).enumerate().for_each(|(idx, chunk)| {
             let row = idx / ncol;
             let col = idx % ncol;
             let poly = matrix.entry(row, col);
@@ -203,13 +293,15 @@ impl GpuDCRTPolyMatrix {
                     flat.len() * std::mem::size_of::<u64>(),
                 )
             };
-            entry.set_slice(bytes);
+            chunk.copy_from_slice(bytes);
         });
 
+        let mut out = Self::new_empty(params, nrow, ncol);
+        out.load_rns_bytes(&bytes, bytes_per_poly);
         out
     }
 
-    pub fn concat_rows_owned(self, mut others: Vec<Self>) -> Self {
+    pub fn concat_rows_owned(self, others: Vec<Self>) -> Self {
         #[cfg(debug_assertions)]
         for (idx, other) in others.iter().enumerate() {
             if self.ncol != other.ncol {
@@ -227,13 +319,14 @@ impl GpuDCRTPolyMatrix {
         }
         let nrow = self.nrow + others.iter().map(|x| x.nrow).sum::<usize>();
         let ncol = self.ncol;
-        let params = self.params;
-        let mut entries = self.entries;
-        entries.reserve(others.iter().map(|x| x.entries.len()).sum::<usize>());
-        for other in others.iter_mut() {
-            entries.append(&mut other.entries);
+        let mut out = Self::new_empty(&self.params, nrow, ncol);
+        out.copy_block_from(&self, 0, 0, 0, 0, self.nrow, self.ncol);
+        let mut row_offset = self.nrow;
+        for other in others.iter() {
+            out.copy_block_from(other, row_offset, 0, 0, 0, other.nrow, other.ncol);
+            row_offset += other.nrow;
         }
-        Self { params, nrow, ncol, entries }
+        out
     }
 
     pub fn concat_columns_owned(self, others: Vec<Self>) -> Self {
@@ -255,275 +348,14 @@ impl GpuDCRTPolyMatrix {
 
         let nrow = self.nrow;
         let ncol = self.ncol + others.iter().map(|x| x.ncol).sum::<usize>();
-        let params = self.params;
-        let mut entries = Vec::with_capacity(nrow.saturating_mul(ncol));
-        let mut sources = Vec::with_capacity(1 + others.len());
-        sources.push((self.ncol, self.entries.into_iter()));
-        for other in others.into_iter() {
-            sources.push((other.ncol, other.entries.into_iter()));
+        let mut out = Self::new_empty(&self.params, nrow, ncol);
+        out.copy_block_from(&self, 0, 0, 0, 0, self.nrow, self.ncol);
+        let mut col_offset = self.ncol;
+        for other in others.iter() {
+            out.copy_block_from(other, 0, col_offset, 0, 0, other.nrow, other.ncol);
+            col_offset += other.ncol;
         }
-        for _ in 0..nrow {
-            for (row_ncol, iter) in sources.iter_mut() {
-                entries.extend(iter.by_ref().take(*row_ncol));
-            }
-        }
-        Self { params, nrow, ncol, entries }
-    }
-
-    fn write_block(
-        entries: &mut [PinnedHostBuffer<u8>],
-        ncol: usize,
-        rows: &Range<usize>,
-        cols: &Range<usize>,
-        block: &mut GpuBlock,
-    ) {
-        let rows_len = rows.end - rows.start;
-        let cols_len = cols.end - cols.start;
-        let total = rows_len * cols_len;
-        // let bytes_time = Instant::now();
-        let bytes_per_poly = rns_bytes_len(&block.params);
-        let mut bytes = vec![0u8; total.saturating_mul(bytes_per_poly)];
-        GpuDCRTPoly::store_rns_bytes_batch(
-            &mut block.polys[..total],
-            &mut bytes,
-            bytes_per_poly,
-            GPU_POLY_FORMAT_EVAL,
-        );
-        // info!("{}", format!(
-        //     "write_block to rns bytes rows={:?} cols={:?} in {:?}",
-        //     rows,
-        //     cols,
-        //     bytes_time.elapsed()
-        // ));
-        entries.par_chunks_mut(ncol).enumerate().for_each(|(row_idx, row_entries)| {
-            if row_idx < rows.start || row_idx >= rows.end {
-                return;
-            }
-            let local_row = row_idx - rows.start;
-            let base = local_row * cols_len;
-            row_entries[cols.start..cols.start + cols_len].par_iter_mut().enumerate().for_each(
-                |(j, entry)| {
-                    let offset = (base + j) * bytes_per_poly;
-                    entry.set_slice(&bytes[offset..offset + bytes_per_poly]);
-                },
-            );
-        });
-    }
-
-    fn elementwise_block_binary(&self, rhs: &Self, op: BlockOp) -> Self {
-        debug_assert!(
-            self.nrow == rhs.nrow && self.ncol == rhs.ncol,
-            "Elementwise operation requires same dimensions"
-        );
-        debug_assert_eq!(self.params, rhs.params, "Elementwise operation requires same params");
-        let mut out = Self::new_empty(&self.params, self.nrow, self.ncol);
-        if self.nrow == 0 || self.ncol == 0 {
-            return out;
-        }
-
-        let block_nrow = block_size().min(self.nrow.max(1));
-        let block_ncol = block_size().min(self.ncol.max(1));
-        let row_offsets = block_offsets(0..self.nrow, block_nrow);
-        let col_offsets = block_offsets(0..self.ncol, block_ncol);
-
-        let mut block_lhs = GpuBlock::new(&self.params, block_nrow * block_ncol);
-        let mut block_rhs = GpuBlock::new(&self.params, block_nrow * block_ncol);
-        let mut block_out = GpuBlock::new(&self.params, block_nrow * block_ncol);
-
-        for row_pair in row_offsets.windows(2) {
-            let rows = row_pair[0]..row_pair[1];
-            // info!("{}", format!("rows {:?}", rows));
-            for col_pair in col_offsets.windows(2) {
-                let cols = col_pair[0]..col_pair[1];
-                // info!("{}", format!("cols {:?}", cols));
-                block_lhs.load_from_entries(&self.entries, self.ncol, rows.clone(), cols.clone());
-                block_rhs.load_from_entries(&rhs.entries, rhs.ncol, rows.clone(), cols.clone());
-                let rows_len = rows.end - rows.start;
-                let cols_len = cols.end - cols.start;
-                block_out.prepare(rows_len, cols_len);
-
-                let total = rows_len * cols_len;
-                let out_slice = &mut block_out.polys[..total];
-                let lhs_slice = &block_lhs.polys[..total];
-                let rhs_slice = &block_rhs.polys[..total];
-                match op {
-                    BlockOp::Add => GpuDCRTPoly::block_add_into(out_slice, lhs_slice, rhs_slice),
-                    BlockOp::Sub => GpuDCRTPoly::block_sub_into(out_slice, lhs_slice, rhs_slice),
-                }
-
-                Self::write_block(&mut out.entries, out.ncol, &rows, &cols, &mut block_out);
-            }
-        }
-
         out
-    }
-
-    fn elementwise_unary_with_zero<F>(&self, op: F) -> Self
-    where
-        F: Fn(&mut GpuDCRTPoly, &GpuDCRTPoly, &GpuDCRTPoly) + Sync + Send,
-    {
-        let mut out = Self::new_empty(&self.params, self.nrow, self.ncol);
-        if self.nrow == 0 || self.ncol == 0 {
-            return out;
-        }
-
-        let block_nrow = block_size().min(self.nrow.max(1));
-        let block_ncol = block_size().min(self.ncol.max(1));
-        let row_offsets = block_offsets(0..self.nrow, block_nrow);
-        let col_offsets = block_offsets(0..self.ncol, block_ncol);
-
-        let mut block_lhs = GpuBlock::new(&self.params, block_nrow * block_ncol);
-        let mut block_out = GpuBlock::new(&self.params, block_nrow * block_ncol);
-        let mut zero = GpuDCRTPoly::const_zero(&self.params);
-        zero.ntt_in_place();
-
-        for row_pair in row_offsets.windows(2) {
-            let rows = row_pair[0]..row_pair[1];
-            for col_pair in col_offsets.windows(2) {
-                let cols = col_pair[0]..col_pair[1];
-                block_lhs.load_from_entries(&self.entries, self.ncol, rows.clone(), cols.clone());
-                let rows_len = rows.end - rows.start;
-                let cols_len = cols.end - cols.start;
-                block_out.prepare(rows_len, cols_len);
-
-                let total = rows_len * cols_len;
-                block_out.polys[..total].par_iter_mut().enumerate().for_each(|(idx, poly)| {
-                    let i = idx / cols_len;
-                    let j = idx % cols_len;
-                    op(poly, &zero, block_lhs.poly(i, j));
-                });
-
-                Self::write_block(&mut out.entries, out.ncol, &rows, &cols, &mut block_out);
-            }
-        }
-
-        out
-    }
-
-    fn mul_scalar(&self, scalar: &GpuDCRTPoly) -> Self {
-        let mut out = Self::new_empty(&self.params, self.nrow, self.ncol);
-        if self.nrow == 0 || self.ncol == 0 {
-            return out;
-        }
-        let scalar_coeff = if scalar.is_ntt() { Some(scalar.ensure_coeff_domain()) } else { None };
-        let scalar_ref = scalar_coeff.as_ref().unwrap_or(scalar);
-
-        let block_nrow = block_size().min(self.nrow.max(1));
-        let block_ncol = block_size().min(self.ncol.max(1));
-        let row_offsets = block_offsets(0..self.nrow, block_nrow);
-        let col_offsets = block_offsets(0..self.ncol, block_ncol);
-
-        let mut block_lhs = GpuBlock::new(&self.params, block_nrow * block_ncol);
-        let mut block_out = GpuBlock::new(&self.params, block_nrow * block_ncol);
-
-        for row_pair in row_offsets.windows(2) {
-            let rows = row_pair[0]..row_pair[1];
-            for col_pair in col_offsets.windows(2) {
-                let cols = col_pair[0]..col_pair[1];
-                block_lhs.load_from_entries(&self.entries, self.ncol, rows.clone(), cols.clone());
-                let rows_len = rows.end - rows.start;
-                let cols_len = cols.end - cols.start;
-                block_out.prepare(rows_len, cols_len);
-
-                let total = rows_len * cols_len;
-                block_out.polys[..total].par_iter_mut().enumerate().for_each(|(idx, poly)| {
-                    let i = idx / cols_len;
-                    let j = idx % cols_len;
-                    GpuDCRTPoly::mul_into(poly, block_lhs.poly(i, j), scalar_ref);
-                });
-
-                Self::write_block(&mut out.entries, out.ncol, &rows, &cols, &mut block_out);
-            }
-        }
-
-        out
-    }
-}
-
-#[derive(Copy, Clone)]
-enum BlockOp {
-    Add,
-    Sub,
-}
-
-struct GpuBlock {
-    polys: Vec<GpuDCRTPoly>,
-    rows: usize,
-    cols: usize,
-    params: Arc<GpuDCRTPolyParams>,
-    level: usize,
-}
-
-impl GpuBlock {
-    fn new(params: &GpuDCRTPolyParams, capacity: usize) -> Self {
-        let params = Arc::new(params.clone());
-        let level = params.crt_depth().saturating_sub(1);
-        let mut polys = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            polys.push(GpuDCRTPoly::new_empty(params.clone(), level, false));
-        }
-        Self { polys, rows: 0, cols: 0, params, level }
-    }
-
-    fn ensure_capacity(&mut self, capacity: usize) {
-        if self.polys.len() >= capacity {
-            return;
-        }
-        let current = self.polys.len();
-        for _ in current..capacity {
-            self.polys.push(GpuDCRTPoly::new_empty(self.params.clone(), self.level, false));
-        }
-    }
-
-    fn prepare(&mut self, rows: usize, cols: usize) {
-        let needed = rows * cols;
-        self.ensure_capacity(needed);
-        self.rows = rows;
-        self.cols = cols;
-    }
-
-    fn load_from_entries(
-        &mut self,
-        entries: &[PinnedHostBuffer<u8>],
-        ncol: usize,
-        rows: Range<usize>,
-        cols: Range<usize>,
-    ) {
-        let rows_len = rows.end - rows.start;
-        let cols_len = cols.end - cols.start;
-        self.prepare(rows_len, cols_len);
-        let total = rows_len * cols_len;
-        let bytes_per_poly = rns_bytes_len(&self.params);
-        if bytes_per_poly == 0 {
-            return;
-        }
-        let mut bytes = vec![0u8; total.saturating_mul(bytes_per_poly)];
-        bytes.par_chunks_mut(bytes_per_poly).enumerate().for_each(|(idx, chunk)| {
-            let i = idx / cols_len;
-            let j = idx % cols_len;
-            let entry_idx = (rows.start + i) * ncol + (cols.start + j);
-            let entry_bytes = entries[entry_idx].as_slice();
-            debug_assert_eq!(
-                entry_bytes.len(),
-                bytes_per_poly,
-                "entry bytes must match rns byte size"
-            );
-            chunk.copy_from_slice(entry_bytes);
-        });
-        GpuDCRTPoly::load_rns_bytes_batch(
-            &mut self.polys[..total],
-            &bytes,
-            bytes_per_poly,
-            GPU_POLY_FORMAT_EVAL,
-        );
-    }
-
-    fn idx(&self, row: usize, col: usize) -> usize {
-        row * self.cols + col
-    }
-
-    fn poly(&self, row: usize, col: usize) -> &GpuDCRTPoly {
-        &self.polys[self.idx(row, col)]
     }
 }
 
@@ -531,14 +363,21 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
     type P = GpuDCRTPoly;
 
     fn to_compact_bytes(&self) -> Vec<u8> {
-        let entries = parallel_iter!(0..self.nrow)
-            .map(|i| {
-                let mut row = Vec::with_capacity(self.ncol);
-                let cols = parallel_iter!(0..self.ncol)
-                    .map(|j| self.entry_bytes(i, j).to_vec())
-                    .collect::<Vec<_>>();
-                row.extend(cols);
-                row
+        let bytes_per_poly = rns_bytes_len(&self.params);
+        let total = self.nrow.saturating_mul(self.ncol);
+        let mut bytes = vec![0u8; total.saturating_mul(bytes_per_poly)];
+        self.store_rns_bytes(&mut bytes, bytes_per_poly);
+
+        let entries = (0..self.nrow)
+            .map(|row| {
+                (0..self.ncol)
+                    .map(|col| {
+                        let idx = row * self.ncol + col;
+                        let start = idx * bytes_per_poly;
+                        let end = start + bytes_per_poly;
+                        bytes.get(start..end).unwrap_or_default().to_vec()
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         bincode::encode_to_vec(&entries, bincode::config::standard())
@@ -552,27 +391,39 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
                 .0;
         let nrow = entries_bytes.len();
         let ncol = if nrow > 0 { entries_bytes[0].len() } else { 0 };
-        let rows = parallel_iter!(entries_bytes)
-            .map(|row| {
-                row.into_iter()
-                    .map(|bytes| PinnedHostBuffer::from_slice(&bytes))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let entries = rows.into_iter().flatten().collect::<Vec<_>>();
-        Self { params: params.clone(), nrow, ncol, entries }
+        let bytes_per_poly = rns_bytes_len(params);
+        let total = nrow.saturating_mul(ncol);
+        let mut flat = vec![0u8; total.saturating_mul(bytes_per_poly)];
+        for row in 0..nrow {
+            for col in 0..ncol {
+                let idx = row * ncol + col;
+                let start = idx * bytes_per_poly;
+                if let Some(src) = entries_bytes.get(row).and_then(|r| r.get(col)) {
+                    if bytes_per_poly > 0 {
+                        let len = bytes_per_poly.min(src.len());
+                        flat[start..start + len].copy_from_slice(&src[..len]);
+                    }
+                }
+            }
+        }
+        let mut out = Self::new_empty(params, nrow, ncol);
+        out.load_rns_bytes(&flat, bytes_per_poly);
+        out
     }
 
     fn from_poly_vec(params: &<Self::P as Poly>::Params, vec: Vec<Vec<Self::P>>) -> Self {
         if vec.is_empty() {
-            return Self { params: params.clone(), nrow: 0, ncol: 0, entries: Vec::new() };
+            return Self::new_empty(params, 0, 0);
         }
         let nrow = vec.len();
         let ncol = vec[0].len();
         if ncol == 0 {
-            return Self { params: params.clone(), nrow, ncol, entries: Vec::new() };
+            return Self::new_empty(params, nrow, ncol);
         }
         let bytes_per_poly = rns_bytes_len(params);
+        if bytes_per_poly == 0 {
+            return Self::new_empty(params, nrow, ncol);
+        }
         let total = nrow.saturating_mul(ncol);
         let mut polys = vec.into_iter().flatten().collect::<Vec<_>>();
         polys.par_iter_mut().for_each(|poly| {
@@ -580,23 +431,25 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
                 poly.ntt_in_place();
             }
         });
-        let entries = if bytes_per_poly == 0 {
-            (0..total).map(|_| PinnedHostBuffer::from_slice(&[])).collect::<Vec<_>>()
-        } else {
-            let mut bytes = vec![0u8; total.saturating_mul(bytes_per_poly)];
-            GpuDCRTPoly::store_rns_bytes_batch(
-                &mut polys,
-                &mut bytes,
-                bytes_per_poly,
-                GPU_POLY_FORMAT_EVAL,
-            );
-            bytes.chunks(bytes_per_poly).map(PinnedHostBuffer::from_slice).collect::<Vec<_>>()
-        };
-        Self { params: params.clone(), nrow, ncol, entries }
+        let mut bytes = vec![0u8; total.saturating_mul(bytes_per_poly)];
+        GpuDCRTPoly::store_rns_bytes_batch(
+            &mut polys,
+            &mut bytes,
+            bytes_per_poly,
+            GPU_POLY_FORMAT_EVAL,
+        );
+        let mut out = Self::new_empty(params, nrow, ncol);
+        out.load_rns_bytes(&bytes, bytes_per_poly);
+        out
     }
 
     fn entry(&self, i: usize, j: usize) -> Self::P {
-        self.poly_from_rns_bytes(self.entry_bytes(i, j))
+        let mut poly_ptr: *mut _ = ptr::null_mut();
+        let status = unsafe { gpu_matrix_entry_clone(self.raw, i, j, &mut poly_ptr) };
+        check_status(status, "gpu_matrix_entry_clone");
+        let params = Arc::new(self.params.clone());
+        let level = params.crt_depth().saturating_sub(1);
+        unsafe { GpuDCRTPoly::from_raw(params, poly_ptr, level, true) }
     }
 
     fn set_entry(&mut self, i: usize, j: usize, elem: Self::P) {
@@ -604,22 +457,16 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         if !elem.is_ntt() {
             elem.ntt_in_place();
         }
-        let bytes_per_poly = rns_bytes_len(&self.params);
-        let mut bytes = vec![0u8; bytes_per_poly];
-        elem.store_rns_bytes(&mut bytes, GPU_POLY_FORMAT_EVAL);
-        self.set_entry_bytes(i, j, &bytes);
+        let status = unsafe { gpu_matrix_copy_entry(self.raw, i, j, elem.raw_ptr()) };
+        check_status(status, "gpu_matrix_copy_entry");
     }
 
     fn get_row(&self, i: usize) -> Vec<Self::P> {
-        parallel_iter!(0..self.ncol)
-            .map(|j| self.poly_from_rns_bytes(self.entry_bytes(i, j)))
-            .collect::<Vec<_>>()
+        parallel_iter!(0..self.ncol).map(|j| self.entry(i, j)).collect::<Vec<_>>()
     }
 
     fn get_column(&self, j: usize) -> Vec<Self::P> {
-        parallel_iter!(0..self.nrow)
-            .map(|i| self.poly_from_rns_bytes(self.entry_bytes(i, j)))
-            .collect::<Vec<_>>()
+        parallel_iter!(0..self.nrow).map(|i| self.entry(i, j)).collect::<Vec<_>>()
     }
 
     fn size(&self) -> (usize, usize) {
@@ -629,59 +476,55 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
     fn slice(&self, row_start: usize, row_end: usize, col_start: usize, col_end: usize) -> Self {
         let nrow = row_end - row_start;
         let ncol = col_end - col_start;
-        let rows = parallel_iter!(row_start..row_end)
-            .map(|i| {
-                parallel_iter!(col_start..col_end)
-                    .map(|j| self.entries[self.entry_index(i, j)].clone())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let entries = rows.into_iter().flatten().collect::<Vec<_>>();
-        Self { params: self.params.clone(), nrow, ncol, entries }
+        let mut out = Self::new_empty(&self.params, nrow, ncol);
+        out.copy_block_from(self, 0, 0, row_start, col_start, nrow, ncol);
+        out
     }
 
     fn zero(params: &<Self::P as Poly>::Params, nrow: usize, ncol: usize) -> Self {
-        Self::new_empty(params, nrow, ncol)
+        Self::new_zero(params, nrow, ncol)
     }
 
     fn identity(params: &<Self::P as Poly>::Params, size: usize, scalar: Option<Self::P>) -> Self {
-        let zero_bytes = zero_rns_bytes(params);
+        let bytes_per_poly = rns_bytes_len(params);
+        let mut out = Self::new_empty(params, size, size);
+        if bytes_per_poly == 0 || size == 0 {
+            return out;
+        }
+        let total = size.saturating_mul(size);
+        let mut bytes = vec![0u8; total.saturating_mul(bytes_per_poly)];
         let scalar_bytes = match scalar {
             Some(mut poly) => {
                 if !poly.is_ntt() {
                     poly.ntt_in_place();
                 }
-                let bytes_per_poly = rns_bytes_len(params);
-                let mut bytes = vec![0u8; bytes_per_poly];
-                poly.store_rns_bytes(&mut bytes, GPU_POLY_FORMAT_EVAL);
-                bytes
+                let mut tmp = vec![0u8; bytes_per_poly];
+                poly.store_rns_bytes(&mut tmp, GPU_POLY_FORMAT_EVAL);
+                tmp
             }
             None => one_rns_bytes(params),
         };
-        let entries = parallel_iter!(0..size.saturating_mul(size))
-            .map(|idx| {
-                let row = idx / size;
-                let col = idx % size;
-                if row == col {
-                    PinnedHostBuffer::from_slice(&scalar_bytes)
-                } else {
-                    PinnedHostBuffer::from_slice(&zero_bytes)
-                }
-            })
-            .collect::<Vec<_>>();
-        Self { params: params.clone(), nrow: size, ncol: size, entries }
+        for idx in 0..total {
+            let row = idx / size;
+            let col = idx % size;
+            if row == col {
+                let start = idx * bytes_per_poly;
+                let end = start + bytes_per_poly;
+                bytes[start..end].copy_from_slice(&scalar_bytes);
+            }
+        }
+        out.load_rns_bytes(&bytes, bytes_per_poly);
+        out
     }
 
     fn transpose(&self) -> Self {
-        let rows = parallel_iter!(0..self.ncol)
-            .map(|i| {
-                parallel_iter!(0..self.nrow)
-                    .map(|j| self.entries[self.entry_index(j, i)].clone())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let entries = rows.into_iter().flatten().collect::<Vec<_>>();
-        Self { params: self.params.clone(), nrow: self.ncol, ncol: self.nrow, entries }
+        let mut out = Self::new_empty(&self.params, self.ncol, self.nrow);
+        for i in 0..self.nrow {
+            for j in 0..self.ncol {
+                out.copy_block_from(self, j, i, i, j, 1, 1);
+            }
+        }
+        out
     }
 
     fn concat_columns(&self, others: &[&Self]) -> Self {
@@ -695,22 +538,14 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             }
         }
         let ncol = self.ncol + others.iter().map(|x| x.ncol).sum::<usize>();
-        let rows = parallel_iter!(0..self.nrow)
-            .map(|i| {
-                let mut row = Vec::with_capacity(ncol);
-                let self_start = i * self.ncol;
-                let self_end = self_start + self.ncol;
-                row.extend(self.entries[self_start..self_end].iter().cloned());
-                for other in others {
-                    let other_start = i * other.ncol;
-                    let other_end = other_start + other.ncol;
-                    row.extend(other.entries[other_start..other_end].iter().cloned());
-                }
-                row
-            })
-            .collect::<Vec<_>>();
-        let entries = rows.into_iter().flatten().collect::<Vec<_>>();
-        Self { params: self.params.clone(), nrow: self.nrow, ncol, entries }
+        let mut out = Self::new_empty(&self.params, self.nrow, ncol);
+        out.copy_block_from(self, 0, 0, 0, 0, self.nrow, self.ncol);
+        let mut col_offset = self.ncol;
+        for other in others {
+            out.copy_block_from(other, 0, col_offset, 0, 0, other.nrow, other.ncol);
+            col_offset += other.ncol;
+        }
+        out
     }
 
     fn concat_rows(&self, others: &[&Self]) -> Self {
@@ -724,74 +559,29 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             }
         }
         let nrow = self.nrow + others.iter().map(|x| x.nrow).sum::<usize>();
-        let mut entries = Vec::with_capacity(nrow.saturating_mul(self.ncol));
-        entries.extend(self.entries.iter().cloned());
+        let mut out = Self::new_empty(&self.params, nrow, self.ncol);
+        out.copy_block_from(self, 0, 0, 0, 0, self.nrow, self.ncol);
+        let mut row_offset = self.nrow;
         for other in others {
-            entries.extend(other.entries.iter().cloned());
+            out.copy_block_from(other, row_offset, 0, 0, 0, other.nrow, other.ncol);
+            row_offset += other.nrow;
         }
-        Self { params: self.params.clone(), nrow, ncol: self.ncol, entries }
+        out
     }
 
     fn concat_diag(&self, others: &[&Self]) -> Self {
         let nrow = self.nrow + others.iter().map(|x| x.nrow).sum::<usize>();
         let ncol = self.ncol + others.iter().map(|x| x.ncol).sum::<usize>();
-        let zero_bytes = zero_rns_bytes(&self.params);
-        struct DiagBlock<'a> {
-            row_start: usize,
-            col_start: usize,
-            nrow: usize,
-            ncol: usize,
-            entries: &'a [PinnedHostBuffer<u8>],
-        }
-
-        let mut blocks = Vec::with_capacity(1 + others.len());
-        let mut row_offset = 0usize;
-        let mut col_offset = 0usize;
-        blocks.push(DiagBlock {
-            row_start: row_offset,
-            col_start: col_offset,
-            nrow: self.nrow,
-            ncol: self.ncol,
-            entries: &self.entries,
-        });
-        row_offset += self.nrow;
-        col_offset += self.ncol;
+        let mut out = Self::new_zero(&self.params, nrow, ncol);
+        out.copy_block_from(self, 0, 0, 0, 0, self.nrow, self.ncol);
+        let mut row_offset = self.nrow;
+        let mut col_offset = self.ncol;
         for other in others {
-            blocks.push(DiagBlock {
-                row_start: row_offset,
-                col_start: col_offset,
-                nrow: other.nrow,
-                ncol: other.ncol,
-                entries: &other.entries,
-            });
+            out.copy_block_from(other, row_offset, col_offset, 0, 0, other.nrow, other.ncol);
             row_offset += other.nrow;
             col_offset += other.ncol;
         }
-
-        let rows = parallel_iter!(0..nrow)
-            .map(|row_idx| {
-                let block = blocks
-                    .iter()
-                    .find(|b| row_idx >= b.row_start && row_idx < b.row_start + b.nrow)
-                    .expect("row index should fall within a diagonal block");
-                let local_row = row_idx - block.row_start;
-                let mut row = Vec::with_capacity(ncol);
-                if block.col_start > 0 {
-                    row.extend(
-                        (0..block.col_start).map(|_| PinnedHostBuffer::from_slice(&zero_bytes)),
-                    );
-                }
-                let base = local_row * block.ncol;
-                row.extend(block.entries[base..base + block.ncol].iter().cloned());
-                let tail = ncol - block.col_start - block.ncol;
-                if tail > 0 {
-                    row.extend((0..tail).map(|_| PinnedHostBuffer::from_slice(&zero_bytes)));
-                }
-                row
-            })
-            .collect::<Vec<_>>();
-        let entries = rows.into_iter().flatten().collect::<Vec<_>>();
-        Self { params: self.params.clone(), nrow, ncol, entries }
+        out
     }
 
     fn tensor(&self, other: &Self) -> Self {
@@ -802,54 +592,19 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         if self.nrow == 0 || self.ncol == 0 || other.nrow == 0 || other.ncol == 0 {
             return out;
         }
-
-        let block_nrow = block_size().min(other.nrow.max(1));
-        let block_ncol = block_size().min(other.ncol.max(1));
-        let row_offsets = block_offsets(0..other.nrow, block_nrow);
-        let col_offsets = block_offsets(0..other.ncol, block_ncol);
-        let mut block_b = GpuBlock::new(&self.params, block_nrow * block_ncol);
-        let mut block_out = GpuBlock::new(&self.params, block_nrow * block_ncol);
-        let params = Arc::new(self.params.clone());
-        let level = params.crt_depth().saturating_sub(1);
-        let mut scalar = GpuDCRTPoly::new_empty(params, level, false);
-
         for i in 0..self.nrow {
             for j in 0..self.ncol {
-                scalar.load_rns_bytes(self.entry_bytes(i, j), GPU_POLY_FORMAT_EVAL);
-                for row_pair in row_offsets.windows(2) {
-                    let rows = row_pair[0]..row_pair[1];
-                    for col_pair in col_offsets.windows(2) {
-                        let cols = col_pair[0]..col_pair[1];
-                        block_b.load_from_entries(
-                            &other.entries,
-                            other.ncol,
-                            rows.clone(),
-                            cols.clone(),
-                        );
-                        let rows_len = rows.end - rows.start;
-                        let cols_len = cols.end - cols.start;
-                        block_out.prepare(rows_len, cols_len);
-
-                        let total = rows_len * cols_len;
-                        block_out.polys[..total].par_iter_mut().enumerate().for_each(
-                            |(idx, poly)| {
-                                let r = idx / cols_len;
-                                let c = idx % cols_len;
-                                GpuDCRTPoly::mul_into(poly, block_b.poly(r, c), &scalar);
-                            },
-                        );
-
-                        let out_rows = i * other.nrow + rows.start..i * other.nrow + rows.end;
-                        let out_cols = j * other.ncol + cols.start..j * other.ncol + cols.end;
-                        Self::write_block(
-                            &mut out.entries,
-                            out.ncol,
-                            &out_rows,
-                            &out_cols,
-                            &mut block_out,
-                        );
-                    }
-                }
+                let scalar = self.entry(i, j);
+                let block = other.mul_scalar(&scalar);
+                out.copy_block_from(
+                    &block,
+                    i * other.nrow,
+                    j * other.ncol,
+                    0,
+                    0,
+                    other.nrow,
+                    other.ncol,
+                );
             }
         }
         out
@@ -867,9 +622,13 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
     }
 
     fn decompose(&self) -> Self {
-        let cpu_matrix = self.to_cpu_matrix();
-        let decomposed = cpu_matrix.decompose();
-        Self::from_cpu_matrix(&self.params, &decomposed)
+        let log_base_q = self.params.modulus_digits();
+        let nrow = self.nrow.saturating_mul(log_base_q);
+        let out = Self::new_empty(&self.params, nrow, self.ncol);
+        let status =
+            unsafe { gpu_matrix_decompose_base(self.raw, self.params.base_bits(), out.raw) };
+        check_status(status, "gpu_matrix_decompose_base");
+        out
     }
 
     fn modulus_switch(
@@ -967,18 +726,26 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
                     .unwrap_or_else(|_| panic!("Failed to read matrix file {path:?}"));
                 let entries_bytes: Vec<Vec<Vec<u8>>> =
                     bincode::decode_from_slice(&bytes, bincode::config::standard()).unwrap().0;
+                let rows_len = rows.end - rows.start;
                 let cols_len = cols.end - cols.start;
-                matrix.entries.par_chunks_mut(ncol).enumerate().for_each(
-                    |(row_idx, row_entries)| {
-                        if row_idx < rows.start || row_idx >= rows.end {
-                            return;
+                let bytes_per_poly = rns_bytes_len(params);
+                let mut flat =
+                    vec![0u8; rows_len.saturating_mul(cols_len).saturating_mul(bytes_per_poly)];
+                for i in 0..rows_len {
+                    for j in 0..cols_len {
+                        let idx = i * cols_len + j;
+                        let start = idx * bytes_per_poly;
+                        if let Some(src) = entries_bytes.get(i).and_then(|row| row.get(j)) {
+                            if bytes_per_poly > 0 {
+                                let len = bytes_per_poly.min(src.len());
+                                flat[start..start + len].copy_from_slice(&src[..len]);
+                            }
                         }
-                        let local_row = row_idx - rows.start;
-                        for j in 0..cols_len {
-                            row_entries[cols.start + j].set_slice(&entries_bytes[local_row][j]);
-                        }
-                    },
-                );
+                    }
+                }
+                let mut block = Self::new_empty(params, rows_len, cols_len);
+                block.load_rns_bytes(&flat, bytes_per_poly);
+                matrix.copy_block_from(&block, rows.start, cols.start, 0, 0, rows_len, cols_len);
             }
         }
         matrix
@@ -1013,14 +780,9 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         let cols_len = cols.end - cols.start;
         parallel_iter!(0..rows_len)
             .map(|i| {
-                let mut row = Vec::with_capacity(cols_len);
-                let cols = parallel_iter!(0..cols_len)
-                    .map(|j| {
-                        self.poly_from_rns_bytes(self.entry_bytes(rows.start + i, cols.start + j))
-                    })
-                    .collect::<Vec<_>>();
-                row.extend(cols);
-                row
+                parallel_iter!(0..cols_len)
+                    .map(|j| self.entry(rows.start + i, cols.start + j))
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>()
     }
@@ -1054,7 +816,13 @@ impl Add<&GpuDCRTPolyMatrix> for &GpuDCRTPolyMatrix {
             rhs.nrow,
             rhs.ncol
         );
-        self.elementwise_block_binary(rhs, BlockOp::Add)
+        let out = GpuDCRTPolyMatrix::new_empty(&self.params, self.nrow, self.ncol);
+        if self.nrow == 0 || self.ncol == 0 {
+            return out;
+        }
+        let status = unsafe { gpu_matrix_add(out.raw, self.raw, rhs.raw) };
+        check_status(status, "gpu_matrix_add");
+        out
     }
 }
 
@@ -1086,15 +854,40 @@ impl Sub<&GpuDCRTPolyMatrix> for &GpuDCRTPolyMatrix {
             rhs.nrow,
             rhs.ncol
         );
-        self.elementwise_block_binary(rhs, BlockOp::Sub)
+        let out = GpuDCRTPolyMatrix::new_empty(&self.params, self.nrow, self.ncol);
+        if self.nrow == 0 || self.ncol == 0 {
+            return out;
+        }
+        let status = unsafe { gpu_matrix_sub(out.raw, self.raw, rhs.raw) };
+        check_status(status, "gpu_matrix_sub");
+        out
     }
 }
 
 impl GpuDCRTPolyMatrix {
+    fn mul_scalar(&self, scalar: &GpuDCRTPoly) -> GpuDCRTPolyMatrix {
+        let out = GpuDCRTPolyMatrix::new_empty(&self.params, self.nrow, self.ncol);
+        if self.nrow == 0 || self.ncol == 0 {
+            return out;
+        }
+        let scalar_eval;
+        let scalar_ref = if scalar.is_ntt() {
+            scalar
+        } else {
+            let mut tmp = scalar.clone();
+            tmp.ntt_in_place();
+            scalar_eval = tmp;
+            &scalar_eval
+        };
+        let status = unsafe { gpu_matrix_mul_scalar(out.raw, self.raw, scalar_ref.raw_ptr()) };
+        check_status(status, "gpu_matrix_mul_scalar");
+        out
+    }
+
     fn mul_internal(
         &self,
         rhs: &GpuDCRTPolyMatrix,
-        mut kernel_ms: Option<&mut f64>,
+        kernel_ms: Option<&mut f64>,
     ) -> GpuDCRTPolyMatrix {
         debug_assert!(
             self.ncol == rhs.nrow,
@@ -1103,133 +896,22 @@ impl GpuDCRTPolyMatrix {
             rhs.nrow
         );
         debug_assert_eq!(self.params, rhs.params, "Multiplication requires same params");
-        let mut out = GpuDCRTPolyMatrix::new_empty(&self.params, self.nrow, rhs.ncol);
+        let out = GpuDCRTPolyMatrix::new_empty(&self.params, self.nrow, rhs.ncol);
         if self.nrow == 0 || rhs.ncol == 0 || self.ncol == 0 {
             return out;
         }
-        let zero_bytes = zero_rns_bytes(&self.params);
-
-        let block_nrow = block_size().min(self.nrow.max(1));
-        let block_ncol = block_size().min(rhs.ncol.max(1));
-        let block_nip = block_size().min(self.ncol.max(1));
-        let row_offsets = block_offsets(0..self.nrow, block_nrow);
-        let col_offsets = block_offsets(0..rhs.ncol, block_ncol);
-        let ip_offsets = block_offsets(0..self.ncol, block_nip);
-
-        let mut block_a = GpuBlock::new(&self.params, block_nrow * block_nip);
-        let mut block_b = GpuBlock::new(&self.params, block_nip * block_ncol);
-        let mut block_acc = GpuBlock::new(&self.params, block_nrow * block_ncol);
-        let mut block_tmp = GpuBlock::new(&self.params, block_nrow * block_ncol);
-
-        for row_pair in row_offsets.windows(2) {
-            let rows = row_pair[0]..row_pair[1];
-            // info!("{}", format!("rows {:?}", rows));
-            let rows_len = rows.end - rows.start;
-            for col_pair in col_offsets.windows(2) {
-                let cols = col_pair[0]..col_pair[1];
-                // info!("{}", format!("cols {:?}", cols));
-                let cols_len = cols.end - cols.start;
-                // let prepare_start = Instant::now();
-                block_acc.prepare(rows_len, cols_len);
-                let total = rows_len * cols_len;
-                let bytes_per_poly = zero_bytes.len();
-                if bytes_per_poly != 0 {
-                    let zero_block = vec![0u8; total.saturating_mul(bytes_per_poly)];
-                    GpuDCRTPoly::load_rns_bytes_batch(
-                        &mut block_acc.polys[..total],
-                        &zero_block,
-                        bytes_per_poly,
-                        GPU_POLY_FORMAT_EVAL,
-                    );
-                }
-
-                for ip_pair in ip_offsets.windows(2) {
-                    let ips = ip_pair[0]..ip_pair[1];
-                    let ip_len = ips.end - ips.start;
-                    if ip_len == 0 {
-                        continue;
-                    }
-                    // let a_start = Instant::now();
-                    block_a.load_from_entries(&self.entries, self.ncol, rows.clone(), ips.clone());
-                    // info!("{}", format!("load a with ips={:?} in {:?}", ips, a_start.elapsed()));
-                    // let b_start = Instant::now();
-                    block_b.load_from_entries(&rhs.entries, rhs.ncol, ips.clone(), cols.clone());
-                    // info!("{}", format!("load b with ips={:?} in {:?}", ips, b_start.elapsed()));
-                    // let op_start = Instant::now();
-                    // let prepare_start = Instant::now();
-                    block_tmp.prepare(rows_len, cols_len);
-                    // info!("{}", format!("prepare with ips={:?} in {:?}", ips,
-                    // prepare_start.elapsed())); let block_mul_start =
-                    // Instant::now();
-                    if let Some(ref mut acc) = kernel_ms {
-                        **acc += GpuDCRTPoly::block_mul_into_timed(
-                            &mut block_tmp.polys[..total],
-                            &block_a.polys[..rows_len * ip_len],
-                            &block_b.polys[..ip_len * cols_len],
-                            rows_len,
-                            ip_len,
-                            cols_len,
-                        );
-                    } else {
-                        GpuDCRTPoly::block_mul_into(
-                            &mut block_tmp.polys[..total],
-                            &block_a.polys[..rows_len * ip_len],
-                            &block_b.polys[..ip_len * cols_len],
-                            rows_len,
-                            ip_len,
-                            cols_len,
-                        );
-                    }
-                    // info!("{}", format!(
-                    //     "block_mul_into rows={:?} cols={:?} ips={:?} in {:?}",
-                    //     rows,
-                    //     cols,
-                    //     ips,
-                    //     block_mul_start.elapsed()
-                    // ));
-                    // let block_add_start = Instant::now();
-                    GpuDCRTPoly::block_add_assign(
-                        &mut block_acc.polys[..total],
-                        &block_tmp.polys[..total],
-                    );
-                    // info!("{}", format!(
-                    //     "block_add_assign rows={:?} cols={:?} ips={:?} in {:?}",
-                    //     rows,
-                    //     cols,
-                    //     ips,
-                    //     block_add_start.elapsed()
-                    // ));
-                    // info!("{}", format!(
-                    //     "mul op rows={:?} cols={:?} ips={:?} in {:?}",
-                    //     rows,
-                    //     cols,
-                    //     ips,
-                    //     op_start.elapsed()
-                    // ));
-                }
-                // let write_start = Instant::now();
-                GpuDCRTPolyMatrix::write_block(
-                    &mut out.entries,
-                    out.ncol,
-                    &rows,
-                    &cols,
-                    &mut block_acc,
-                );
-                // info!("{}", format!(
-                //     "mul write rows={:?} cols={:?} in {:?}",
-                //     rows,
-                //     cols,
-                //     write_start.elapsed()
-                // ));
-            }
+        if let Some(acc) = kernel_ms {
+            let status =
+                unsafe { gpu_matrix_mul_timed(out.raw, self.raw, rhs.raw, acc as *mut f64) };
+            check_status(status, "gpu_matrix_mul_timed");
+        } else {
+            let status = unsafe { gpu_matrix_mul(out.raw, self.raw, rhs.raw) };
+            check_status(status, "gpu_matrix_mul");
         }
         out
     }
 
-    pub fn mul_with_kernel_time(
-        &self,
-        rhs: &GpuDCRTPolyMatrix,
-    ) -> (GpuDCRTPolyMatrix, f64) {
+    pub fn mul_with_kernel_time(&self, rhs: &GpuDCRTPolyMatrix) -> (GpuDCRTPolyMatrix, f64) {
         let mut kernel_ms = 0.0f64;
         let out = self.mul_internal(rhs, Some(&mut kernel_ms));
         (out, kernel_ms)
@@ -1312,7 +994,8 @@ impl Neg for &GpuDCRTPolyMatrix {
     type Output = GpuDCRTPolyMatrix;
 
     fn neg(self) -> Self::Output {
-        self.elementwise_unary_with_zero(GpuDCRTPoly::sub_into)
+        let zero = GpuDCRTPolyMatrix::new_zero(&self.params, self.nrow, self.ncol);
+        &zero - self
     }
 }
 
@@ -1332,10 +1015,6 @@ fn rns_bytes_len(params: &GpuDCRTPolyParams) -> usize {
     let n = params.ring_dimension() as usize;
     let level = params.crt_depth().saturating_sub(1);
     (level + 1).saturating_mul(n).saturating_mul(std::mem::size_of::<u64>())
-}
-
-fn zero_rns_bytes(params: &GpuDCRTPolyParams) -> Vec<u8> {
-    vec![0u8; rns_bytes_len(params)]
 }
 
 fn one_rns_bytes(params: &GpuDCRTPolyParams) -> Vec<u8> {

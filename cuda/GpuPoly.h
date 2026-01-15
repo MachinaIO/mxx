@@ -9,6 +9,7 @@ extern "C" {
 
 typedef struct GpuContext GpuContext;
 typedef struct GpuPoly GpuPoly;
+typedef struct GpuMatrix GpuMatrix;
 typedef struct GpuEventSet GpuEventSet;
 typedef enum GpuPolyFormat
 {
@@ -83,6 +84,34 @@ int gpu_poly_decompose_base(
     uint32_t base_bits,
     GpuPoly* const* out_polys,
     size_t out_count);
+
+int gpu_matrix_create(GpuContext* ctx, int level, size_t rows, size_t cols, int format, GpuMatrix** out);
+void gpu_matrix_destroy(GpuMatrix* mat);
+int gpu_matrix_copy(GpuMatrix* dst, const GpuMatrix* src);
+int gpu_matrix_entry_clone(const GpuMatrix* mat, size_t row, size_t col, GpuPoly** out_poly);
+int gpu_matrix_copy_entry(GpuMatrix* mat, size_t row, size_t col, const GpuPoly* src);
+int gpu_matrix_load_rns_batch(GpuMatrix* mat, const uint8_t* bytes, size_t bytes_per_poly, int format);
+int gpu_matrix_store_rns_batch(
+    const GpuMatrix* mat,
+    uint8_t* bytes_out,
+    size_t bytes_per_poly,
+    int format,
+    GpuEventSet** out_events);
+int gpu_matrix_add(GpuMatrix* out, const GpuMatrix* lhs, const GpuMatrix* rhs);
+int gpu_matrix_sub(GpuMatrix* out, const GpuMatrix* lhs, const GpuMatrix* rhs);
+int gpu_matrix_mul(GpuMatrix* out, const GpuMatrix* lhs, const GpuMatrix* rhs);
+int gpu_matrix_mul_timed(GpuMatrix* out, const GpuMatrix* lhs, const GpuMatrix* rhs, double* out_kernel_ms);
+int gpu_matrix_mul_scalar(GpuMatrix* out, const GpuMatrix* lhs, const GpuPoly* scalar);
+int gpu_matrix_copy_block(
+    GpuMatrix* out,
+    const GpuMatrix* src,
+    size_t dst_row,
+    size_t dst_col,
+    size_t src_row,
+    size_t src_col,
+    size_t rows,
+    size_t cols);
+int gpu_matrix_decompose_base(const GpuMatrix* src, uint32_t base_bits, GpuMatrix* out);
 
 int gpu_poly_ntt(GpuPoly* poly, int batch);
 int gpu_poly_intt(GpuPoly* poly, int batch);

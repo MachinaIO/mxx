@@ -19,8 +19,8 @@ fn main() {
         println!("cargo::rerun-if-changed=gpu-setup.sh");
         println!("cargo::rerun-if-changed=cuda/GpuPoly.cu");
         println!("cargo::rerun-if-changed=cuda/GpuPoly.h");
-        println!("cargo::rerun-if-changed=cuda/GpuBlock.cu");
-        println!("cargo::rerun-if-changed=cuda/GpuBlock.h");
+        println!("cargo::rerun-if-changed=cuda/GpuMatrix.cu");
+        println!("cargo::rerun-if-changed=cuda/GpuMatrix.h");
         println!("cargo::rerun-if-changed=cuda/GpuPolyInternal.h");
 
         let manifest_dir =
@@ -97,7 +97,7 @@ fn main() {
         build
             .cuda(true)
             .file("cuda/GpuPoly.cu")
-            .file("cuda/GpuBlock.cu")
+            .file("cuda/GpuMatrix.cu")
             .include(&fides_include)
             .include(&openfhe_include)
             .include(&openfhe_core_include)

@@ -163,7 +163,7 @@ impl NestedRnsPolyContext {
 
         let p = p_moduli.iter().fold(BigUint::from(1u64), |acc, &pi| acc * BigUint::from(pi));
         let p_over_pis = p_moduli.iter().map(|&p_i| &p / BigUint::from(p_i)).collect::<Vec<_>>();
-        let sum_p_moduli: u64 = p_moduli.iter().copied().sum();
+        let max_p_modulus = *p_moduli.iter().max().expect("p_moduli must not be empty");
 
         let mut lut_mod_p = Vec::with_capacity(p_moduli_depth);
         let mut lut_x_to_y = Vec::with_capacity(p_moduli_depth);
@@ -174,7 +174,7 @@ impl NestedRnsPolyContext {
         for (p_i_idx, &p_i) in p_moduli.iter().enumerate() {
             let p_moduli_square = p_i as u64 * p_i as u64;
             let lut_mod_p_map_size = (p_i as u128)
-                .checked_mul(sum_p_moduli as u128)
+                .checked_mul(max_p_modulus as u128)
                 .expect("lut_mod_p_map_size overflow");
             debug_assert!(
                 lut_mod_p_map_size < *q_moduli_min as u128,
@@ -195,7 +195,7 @@ impl NestedRnsPolyContext {
                 },
                 Some(max_mod_p_row),
             );
-            debug!("Constructed lut_mod_p for p_{} = {}", p_i_idx, p_i);
+            debug!("Constructed lut_mod_p for p_{} = {} with size {}", p_i_idx, p_i, lut_mod_p_len);
             lut_mod_p.push(lut_mod_p_lut);
 
             let p_moduli_big = BigUint::from(p_i);
@@ -236,7 +236,10 @@ impl NestedRnsPolyContext {
                 },
                 Some(max_x_to_y_row),
             );
-            debug!("Constructed lut_x_to_y for p_{} = {}", p_i_idx, p_i);
+            debug!(
+                "Constructed lut_x_to_y for p_{} = {} with size {}",
+                p_i_idx, p_i, lut_x_to_y_len
+            );
             lut_x_to_y.push(lut_x_to_y_lut);
 
             let lut_x_to_real_len = p_moduli_square as usize;
@@ -257,7 +260,10 @@ impl NestedRnsPolyContext {
                 },
                 Some(max_x_to_real_row),
             );
-            debug!("Constructed lut_x_to_real for p_{} = {}", p_i_idx, p_i);
+            debug!(
+                "Constructed lut_x_to_real for p_{} = {} with size {}",
+                p_i_idx, p_i, lut_x_to_real_len
+            );
             lut_x_to_real.push(lut_x_to_real_lut);
 
             debug!("Computed LUTs for p_{} = {}", p_i_idx, p_i);
@@ -293,6 +299,7 @@ impl NestedRnsPolyContext {
             },
             Some(max_real_to_v_row),
         );
+        debug!("Constructed lut_real_to_v with size {}", lut_real_to_v_len);
         let lut_real_to_v = lut_real_to_v_lut;
 
         let lut_mod_p_ids = lut_mod_p
@@ -634,17 +641,23 @@ impl NestedRnsPolyContext {
         }
         // 4. v = round_div(real_sum, scale)
         let v = circuit.public_lookup_gate(real_sum, lut_real_to_v_id);
-        // 5. p_i_sum = (sum_j y_j * [[\hat{p_j}]_{q_k}]_{p_i}) - v * [[p]_{q_k}]_{p_i}
+        // 5. p_i_sum = (sum_j (y_j * [[\hat{p_j}]_{q_k}]_{p_i}) mod p_i) - v * [[p]_{q_k}]_{p_i}
+        //    Keep the running sum reduced to avoid negative ranges before the final mod.
         let mut p_i_sums = Vec::with_capacity(p_moduli_depth);
         for p_idx in 0..p_moduli_depth {
             let mut p_i_sum = circuit.const_zero_gate();
             for p_j_idx in 0..p_moduli_depth {
                 let y_j = ys[p_j_idx];
                 let term = circuit.small_scalar_mul(y_j, &[scalars_y[p_idx][p_j_idx]]);
-                p_i_sum = circuit.add_gate(p_i_sum, term);
+                let term_mod_p = circuit.public_lookup_gate(term, lut_mod_p_ids[p_idx]);
+                let sum = circuit.add_gate(p_i_sum, term_mod_p);
+                p_i_sum = circuit.public_lookup_gate(sum, lut_mod_p_ids[p_idx]);
             }
             let term = circuit.small_scalar_mul(v, &[scalars_v[p_idx]]);
-            p_i_sum = circuit.sub_gate(p_i_sum, term);
+            let term_mod_p = circuit.public_lookup_gate(term, lut_mod_p_ids[p_idx]);
+            let p_i_const = circuit.const_digits(&[p_moduli[p_idx] as u32]);
+            let sum = circuit.add_gate(p_i_sum, p_i_const);
+            let p_i_sum = circuit.sub_gate(sum, term_mod_p);
             let p_i_sum_mod_p = circuit.public_lookup_gate(p_i_sum, lut_mod_p_ids[p_idx]);
             p_i_sums.push(p_i_sum_mod_p);
         }

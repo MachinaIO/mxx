@@ -364,7 +364,6 @@ fn write_buffer(
 }
 
 // /// Split a MultiBatchLookupBuffer into multiple buffers based on byte limit.
-// #[allow(dead_code)]
 // fn split_buffers_by_limit(
 //     multi_buffer: &MultiBatchLookupBuffer,
 //     bytes_limit: usize,
@@ -681,47 +680,6 @@ where
 //     drop(poly);
 //     info!("{}", format!("Stored {id}"));
 // }
-
-#[allow(dead_code)]
-fn build_index_for_file(
-    multi_buffer: &MultiBatchLookupBuffer,
-    file_index: usize,
-) -> HashMap<String, TableIndexEntry> {
-    let mut entries = HashMap::new();
-
-    // header: [version | num_tables | index_size]
-    let header_size = 8 + 8 + 8;
-
-    // index size: [u64 id_len | id_bytes | u64 file_offset] per table
-    let index_size: usize =
-        multi_buffer.lookup_tables.iter().map(|b| 8 + b.id_prefix.len() + 8).sum();
-
-    // first data offset
-    let data_start = header_size + index_size;
-    let mut current_offset = data_start;
-
-    for batch in &multi_buffer.lookup_tables {
-        entries.insert(
-            batch.id_prefix.clone(),
-            TableIndexEntry {
-                file_index,
-                file_offset: current_offset as u64,
-                num_matrices: batch.num_matrices,
-                bytes_per_matrix: batch.bytes_per_matrix,
-                indices: batch.indices.clone(),
-            },
-        );
-
-        // table size uses payload length (no inner header)
-        let payload_len = batch.num_matrices * batch.bytes_per_matrix;
-        let table_size = 8 + 8 + 8 + 8 +           // metadata
-            batch.indices.len() * 8 + // indices
-            payload_len; // payload only
-        current_offset += table_size;
-    }
-
-    entries
-}
 
 /// Write the global index to a file.
 async fn write_global_index(index: &GlobalTableIndex, path: &Path) -> Result<(), std::io::Error> {

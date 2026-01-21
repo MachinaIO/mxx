@@ -168,31 +168,53 @@ impl<P: Poly> PolyCircuit<P> {
         counts
     }
 
-    /// Computes the circuit depth excluding Add gates.
+    /// Computes the circuit depth excluding Add gates, including sub-circuits.
     ///
     /// Definition:
     /// - Inputs and the reserved constant-one gate contribute 0 to depth.
     /// - Add, Sub, SmallScalarMul, Rotate gates do not increase depth: level(add) =
     ///   max(level(inputs)).
     /// - Any other non-input gate increases depth by 1: level(g) = max(level(inputs)) + 1.
+    /// - Sub-circuits contribute their internal non-free depth based on the call inputs.
     /// - If there are no outputs, returns 0.
     pub fn non_free_depth(&self) -> usize {
         if self.output_ids.is_empty() {
             return 0;
         }
+        let input_levels = vec![0; self.num_input()];
+        let output_levels = self.non_free_depths_with_input_levels(&input_levels);
+        output_levels.into_iter().max().unwrap_or(0)
+    }
 
-        // Compute a topo order of all gates needed for outputs
-        let order = self.topological_order();
+    fn non_free_depths_with_input_levels(&self, input_levels: &[usize]) -> Vec<usize> {
+        if self.output_ids.is_empty() {
+            return vec![];
+        }
+
         let mut level_map: HashMap<GateId, usize> = HashMap::new();
+        level_map.insert(GateId(0), 0);
 
-        for gate_id in order.iter() {
-            let gate = self.gates.get(gate_id).expect("gate not found");
-            if gate.input_gates.is_empty() {
-                // Inputs and consts
-                level_map.insert(*gate_id, 0);
+        let mut input_gate_ids: Vec<GateId> = self
+            .gates
+            .iter()
+            .filter_map(|(id, gate)| match gate.gate_type {
+                PolyGateType::Input if id.0 != 0 => Some(*id),
+                _ => None,
+            })
+            .collect();
+        input_gate_ids.sort_by_key(|gid| gid.0);
+        debug_assert_eq!(input_gate_ids.len(), input_levels.len());
+        for (gid, level) in input_gate_ids.into_iter().zip(input_levels.iter().copied()) {
+            level_map.insert(gid, level);
+        }
+
+        let order = self.topological_order();
+        let mut call_output_levels: HashMap<usize, Vec<usize>> = HashMap::new();
+        for gate_id in order.iter().copied() {
+            if level_map.contains_key(&gate_id) {
                 continue;
             }
-
+            let gate = self.gates.get(&gate_id).expect("gate not found");
             let max_in = gate
                 .input_gates
                 .iter()
@@ -200,18 +222,38 @@ impl<P: Poly> PolyCircuit<P> {
                 .max()
                 .expect("non-input gate must have inputs");
 
-            let incr = match gate.gate_type {
+            let level = match &gate.gate_type {
                 PolyGateType::Add |
                 PolyGateType::Sub |
-                PolyGateType::SmallScalarMul { scalar: _ } |
-                PolyGateType::Rotate { shift: _ } => 0,
-                _ => 1,
+                PolyGateType::SmallScalarMul { .. } |
+                PolyGateType::Rotate { .. } => max_in,
+                PolyGateType::SubCircuitOutput { call_id, output_idx, .. } => {
+                    let outputs = call_output_levels.entry(*call_id).or_insert_with(|| {
+                        let call = self
+                            .sub_circuit_calls
+                            .get(call_id)
+                            .expect("sub-circuit call missing");
+                        let sub_circuit = self
+                            .sub_circuits
+                            .get(&call.sub_circuit_id)
+                            .expect("sub-circuit missing");
+                        let sub_input_levels: Vec<usize> = call
+                            .inputs
+                            .iter()
+                            .map(|id| level_map[id])
+                            .collect();
+                        sub_circuit.non_free_depths_with_input_levels(&sub_input_levels)
+                    });
+                    outputs.get(*output_idx).copied().unwrap_or_else(|| {
+                        panic!("sub-circuit output index {} out of range", output_idx)
+                    })
+                }
+                _ => max_in + 1,
             };
-            level_map.insert(*gate_id, max_in + incr);
+            level_map.insert(gate_id, level);
         }
 
-        // Max depth among outputs
-        self.output_ids.iter().map(|id| level_map[id]).max().unwrap_or(0)
+        self.output_ids.iter().map(|id| level_map[id]).collect()
     }
 
     pub fn recompute_gate_counts(&mut self) {
@@ -1640,5 +1682,40 @@ mod tests {
         let mul = circuit.mul_gate(add, inputs[2]);
         circuit.output(vec![mul]);
         assert_eq!(circuit.depth(), 2);
+    }
+
+    #[test]
+    fn test_non_free_depth_counts_sub_circuit() {
+        let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
+        let sub_inputs = sub_circuit.input(1);
+        let mul1 = sub_circuit.mul_gate(sub_inputs[0], sub_inputs[0]);
+        let mul2 = sub_circuit.mul_gate(mul1, sub_inputs[0]);
+        sub_circuit.output(vec![mul2]);
+
+        let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
+        let main_inputs = main_circuit.input(1);
+        let sub_id = main_circuit.register_sub_circuit(sub_circuit);
+        let sub_outputs = main_circuit.call_sub_circuit(sub_id, &[main_inputs[0]]);
+        main_circuit.output(vec![sub_outputs[0]]);
+
+        assert_eq!(main_circuit.non_free_depth(), 2);
+    }
+
+    #[test]
+    fn test_non_free_depth_respects_sub_circuit_inputs() {
+        let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
+        let sub_inputs = sub_circuit.input(2);
+        sub_circuit.output(vec![sub_inputs[0]]);
+
+        let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
+        let main_inputs = main_circuit.input(3);
+        let mul1 = main_circuit.mul_gate(main_inputs[1], main_inputs[2]);
+        let mul2 = main_circuit.mul_gate(mul1, main_inputs[1]);
+
+        let sub_id = main_circuit.register_sub_circuit(sub_circuit);
+        let sub_outputs = main_circuit.call_sub_circuit(sub_id, &[main_inputs[0], mul2]);
+        main_circuit.output(vec![sub_outputs[0]]);
+
+        assert_eq!(main_circuit.non_free_depth(), 0);
     }
 }

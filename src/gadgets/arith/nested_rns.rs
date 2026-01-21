@@ -66,11 +66,26 @@ impl NestedRnsPolyContext {
             let lut_x_to_y_ids = vec![dummy_lut_id; p_moduli_depth];
             let lut_x_to_real_ids = vec![dummy_lut_id; p_moduli_depth];
             let lut_real_to_v_id = dummy_lut_id;
-            let scalars_y = vec![vec![vec![0; p_moduli_depth]; p_moduli_depth]; q_moduli_depth];
-            let scalars_v = vec![vec![0; p_moduli_depth]; q_moduli_depth];
             let p = p_moduli.iter().fold(BigUint::from(1u64), |acc, &pi| acc * BigUint::from(pi));
             let p_over_pis =
                 p_moduli.iter().map(|&p_i| &p / BigUint::from(p_i)).collect::<Vec<_>>();
+            let mut scalars_y = vec![vec![vec![0; p_moduli_depth]; p_moduli_depth]; q_moduli_depth];
+            let mut scalars_v = vec![vec![0; p_moduli_depth]; q_moduli_depth];
+            for (p_i_idx, &p_i) in p_moduli.iter().enumerate() {
+                for (q_idx, q_k) in q_moduli.iter().enumerate() {
+                    for (p_j_idx, p_over_pj) in p_over_pis.iter().enumerate() {
+                        let p_over_pj_mod_qk = (p_over_pj % BigUint::from(*q_k))
+                            .to_u64()
+                            .expect("CRT residue must fit in u64");
+                        let p_over_pj_mod_qk_mod_pi = p_over_pj_mod_qk % p_i;
+                        scalars_y[q_idx][p_i_idx][p_j_idx] = p_over_pj_mod_qk_mod_pi as u32;
+                    }
+                    let p_mod_qk =
+                        (&p % BigUint::from(*q_k)).to_u64().expect("CRT residue must fit in u64");
+                    let p_mod_qk_mod_pi = p_mod_qk % p_i;
+                    scalars_v[q_idx][p_i_idx] = p_mod_qk_mod_pi as u32;
+                }
+            }
             let add_lazy_reduce_ids = (0..q_moduli_depth)
                 .map(|_| {
                     circuit.register_sub_circuit(Self::add_lazy_reduce_subcircuit::<P>(
@@ -172,10 +187,10 @@ impl NestedRnsPolyContext {
         let mut scalars_v = vec![vec![0; p_moduli_depth]; q_moduli_depth];
 
         for (p_i_idx, &p_i) in p_moduli.iter().enumerate() {
-            let p_moduli_square = p_i as u64 * p_i as u64;
-            let lut_mod_p_map_size = (p_i as u128)
-                .checked_mul(max_p_modulus as u128)
-                .expect("lut_mod_p_map_size overflow");
+            let lut_mod_p_map_size = (p_i as u128 * max_p_modulus as u128)
+                .max(p_i as u128 * (2 * p_moduli.len()) as u128);
+            // .checked_mul(max_p_modulus as u128)
+            // .expect("lut_mod_p_map_size overflow");
             debug_assert!(
                 lut_mod_p_map_size < *q_moduli_min as u128,
                 "LUT size exceeds q modulus size; increase q_moduli_bits or decrease p_moduli_bits"
@@ -221,7 +236,7 @@ impl NestedRnsPolyContext {
 
             let p_over_pi_inv = Arc::new(p_over_pi_inv);
             let p_moduli_big = Arc::new(p_moduli_big);
-            let lut_x_to_y_len = p_moduli_square as usize;
+            let lut_x_to_y_len = p_i as usize;
             let lut_x_to_y_lut = PublicLut::<P>::new_from_usize_range(
                 params,
                 lut_x_to_y_len,
@@ -242,7 +257,7 @@ impl NestedRnsPolyContext {
             );
             lut_x_to_y.push(lut_x_to_y_lut);
 
-            let lut_x_to_real_len = p_moduli_square as usize;
+            let lut_x_to_real_len = p_i as usize;
             let lut_x_to_real_lut = PublicLut::<P>::new_from_usize_range(
                 params,
                 lut_x_to_real_len,
@@ -407,36 +422,6 @@ impl NestedRnsPolyContext {
         }
     }
 
-    fn add_full_reduce_subcircuit<P: Poly>(
-        p_moduli: &[u64],
-        lut_mod_p_ids: &[usize],
-        lut_x_to_y_ids: &[usize],
-        lut_x_to_real_ids: &[usize],
-        lut_real_to_v_id: usize,
-        scalars_y: &[Vec<u32>],
-        scalars_v: &[u32],
-    ) -> PolyCircuit<P> {
-        let mut circuit = PolyCircuit::<P>::new();
-        let add_circuit = Self::add_without_reduce_subcircuit::<P>(p_moduli);
-        let reduce_circuit = Self::full_reduce_subcircuit::<P>(
-            p_moduli,
-            lut_mod_p_ids,
-            lut_x_to_y_ids,
-            lut_x_to_real_ids,
-            lut_real_to_v_id,
-            scalars_y,
-            scalars_v,
-        );
-        let p_moduli_depth = p_moduli.len();
-        let inputs = circuit.input(p_moduli_depth * 2);
-        let add_circuit_id = circuit.register_sub_circuit(add_circuit);
-        let sum = circuit.call_sub_circuit(add_circuit_id, &inputs);
-        let reduce_circuit_id = circuit.register_sub_circuit(reduce_circuit);
-        let reduced = circuit.call_sub_circuit(reduce_circuit_id, &sum);
-        circuit.output(reduced);
-        circuit
-    }
-
     fn add_lazy_reduce_subcircuit<P: Poly>(
         p_moduli: &[u64],
         lut_mod_p_ids: &[usize],
@@ -488,6 +473,36 @@ impl NestedRnsPolyContext {
         circuit
     }
 
+    fn add_full_reduce_subcircuit<P: Poly>(
+        p_moduli: &[u64],
+        lut_mod_p_ids: &[usize],
+        lut_x_to_y_ids: &[usize],
+        lut_x_to_real_ids: &[usize],
+        lut_real_to_v_id: usize,
+        scalars_y: &[Vec<u32>],
+        scalars_v: &[u32],
+    ) -> PolyCircuit<P> {
+        let mut circuit = PolyCircuit::<P>::new();
+        let add_circuit = Self::add_lazy_reduce_subcircuit::<P>(p_moduli, lut_mod_p_ids);
+        let reduce_circuit = Self::full_reduce_subcircuit::<P>(
+            p_moduli,
+            lut_mod_p_ids,
+            lut_x_to_y_ids,
+            lut_x_to_real_ids,
+            lut_real_to_v_id,
+            scalars_y,
+            scalars_v,
+        );
+        let p_moduli_depth = p_moduli.len();
+        let inputs = circuit.input(p_moduli_depth * 2);
+        let add_circuit_id = circuit.register_sub_circuit(add_circuit);
+        let sum = circuit.call_sub_circuit(add_circuit_id, &inputs);
+        let reduce_circuit_id = circuit.register_sub_circuit(reduce_circuit);
+        let reduced = circuit.call_sub_circuit(reduce_circuit_id, &sum);
+        circuit.output(reduced);
+        circuit
+    }
+
     fn sub_full_reduce_subcircuit<P: Poly>(
         p_moduli: &[u64],
         lut_mod_p_ids: &[usize],
@@ -498,7 +513,7 @@ impl NestedRnsPolyContext {
         scalars_v: &[u32],
     ) -> PolyCircuit<P> {
         let mut circuit = PolyCircuit::<P>::new();
-        let sub_circuit = Self::sub_without_reduce_subcircuit::<P>(p_moduli);
+        let sub_circuit = Self::sub_lazy_reduce_subcircuit::<P>(p_moduli, lut_mod_p_ids);
         let reduce_circuit = Self::full_reduce_subcircuit::<P>(
             p_moduli,
             lut_mod_p_ids,
@@ -528,7 +543,7 @@ impl NestedRnsPolyContext {
         scalars_v: &[u32],
     ) -> PolyCircuit<P> {
         let mut circuit = PolyCircuit::<P>::new();
-        let mul_circuit = Self::mul_without_reduce_subcircuit::<P>(p_moduli);
+        let mul_circuit = Self::mul_lazy_reduce_subcircuit::<P>(p_moduli, lut_mod_p_ids);
         let reduce_circuit = Self::full_reduce_subcircuit::<P>(
             p_moduli,
             lut_mod_p_ids,
@@ -650,14 +665,12 @@ impl NestedRnsPolyContext {
                 let y_j = ys[p_j_idx];
                 let term = circuit.small_scalar_mul(y_j, &[scalars_y[p_idx][p_j_idx]]);
                 let term_mod_p = circuit.public_lookup_gate(term, lut_mod_p_ids[p_idx]);
-                let sum = circuit.add_gate(p_i_sum, term_mod_p);
-                p_i_sum = circuit.public_lookup_gate(sum, lut_mod_p_ids[p_idx]);
+                p_i_sum = circuit.add_gate(p_i_sum, term_mod_p);
             }
             let term = circuit.small_scalar_mul(v, &[scalars_v[p_idx]]);
-            let term_mod_p = circuit.public_lookup_gate(term, lut_mod_p_ids[p_idx]);
-            let p_i_const = circuit.const_digits(&[p_moduli[p_idx] as u32]);
+            let p_i_const = circuit.const_digits(&[p_moduli.len() as u32 * p_moduli[p_idx] as u32]);
             let sum = circuit.add_gate(p_i_sum, p_i_const);
-            let p_i_sum = circuit.sub_gate(sum, term_mod_p);
+            let p_i_sum = circuit.sub_gate(sum, term);
             let p_i_sum_mod_p = circuit.public_lookup_gate(p_i_sum, lut_mod_p_ids[p_idx]);
             p_i_sums.push(p_i_sum_mod_p);
         }

@@ -14,7 +14,7 @@ use std::{
     ops::{Add, Mul, Sub},
     sync::Arc,
 };
-use tracing::info;
+use tracing::{debug, info};
 
 impl PolyCircuit<DCRTPoly> {
     pub fn simulate_max_error_norm<P: PltEvaluator<ErrorNorm>>(
@@ -36,6 +36,7 @@ impl PolyCircuit<DCRTPoly> {
             PolyNorm::new(ctx.clone(), input_norm_bound),
             PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, e_init_norm.clone(), None),
         );
+        info!("e_init_norm bits {}", bigdecimal_bits_ceil(e_init_norm));
         self.eval(&(), &one_error, &vec![input_error; input_size], plt_evaluator)
     }
 }
@@ -202,15 +203,15 @@ impl NormPltGGH15Evaluator {
         let s_times_errs = s_vec *
             PolyMatrixNorm::new(ctx.clone(), ctx.secret_size, 3 * ctx.m_b, e_mat_sigma * 6, None) *
             &k_lut;
-        println!("s_times_errs norm bits {}", bigdecimal_bits_ceil(&s_times_errs.poly_norm.norm));
+        debug!("s_times_errs norm bits {}", bigdecimal_bits_ceil(&s_times_errs.poly_norm.norm));
         let const_term = e_b_init * k_to_ggh * &k_g * &k_lut + &s_times_errs;
         let const_term_bits = bigdecimal_bits_ceil(&const_term.poly_norm.norm);
-        println!("const_term norm bits {}", const_term_bits);
+        debug!("const_term norm bits {}", const_term_bits);
         info!("{}", format!("GGH15 PLT const term norm bits {}", const_term_bits));
         let decomposed = PolyMatrixNorm::gadget_decomposed(ctx.clone(), 2 * ctx.m_b);
         let e_one_multiplier = &decomposed * &k_g * &k_lut;
         let e_one_multiplier_bits = bigdecimal_bits_ceil(&e_one_multiplier.poly_norm.norm);
-        println!("e_one_multiplier norm bits {}", e_one_multiplier_bits);
+        debug!("e_one_multiplier norm bits {}", e_one_multiplier_bits);
         info!("{}", format!("GGH15 PLT e_one multiplier norm bits {}", e_one_multiplier_bits));
         let e_input_multiplier = decomposed * &k_g * &k_lut;
         Self { const_term, s_times_errs, e_one_multiplier, e_input_multiplier }
@@ -224,8 +225,8 @@ impl PltEvaluator<ErrorNorm> for NormPltGGH15Evaluator {
         plt: &PublicLut<DCRTPoly>,
         one: &ErrorNorm,
         input: &ErrorNorm,
-        _: GateId,
-        _: usize,
+        gate_id: GateId,
+        lut_id: usize,
     ) -> ErrorNorm {
         let plaintext_bd =
             BigDecimal::from(num_bigint::BigInt::from(plt.max_output_row().1.value().clone()));
@@ -234,10 +235,25 @@ impl PltEvaluator<ErrorNorm> for NormPltGGH15Evaluator {
             input.clone_ctx(),
             BigDecimal::from(num_bigint::BigInt::from(plt.len() as u64 - 1u64)),
         );
+        let input_bits = bigdecimal_bits_ceil(&input.matrix_norm.poly_norm.norm);
+        debug!(
+            "{}",
+            format!(
+                "GGH15 PLT input matrix bits {} (gate {}, lut {})",
+                input_bits, gate_id, lut_id
+            )
+        );
         let matrix_norm = &self.const_term +
             &self.s_times_errs * &max_input_norm +
             &one.matrix_norm * &self.e_one_multiplier +
             &input.matrix_norm * &self.e_input_multiplier;
+        debug!(
+            "{}",
+            format!(
+                "GGH15 PLT output matrix bits {}",
+                bigdecimal_bits_ceil(&matrix_norm.poly_norm.norm)
+            )
+        );
         ErrorNorm { matrix_norm, plaintext_norm }
     }
 }

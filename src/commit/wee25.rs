@@ -101,7 +101,9 @@ impl<M: PolyMatrix> Wee25Commit<M> {
 
     pub fn open_matrix(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
         debug_assert_eq!(msg.row_size(), self.secret_size);
-        self.open_matrix_recursive(params, msg)
+        let mut verifier_cache = std::collections::HashMap::new();
+        let (opening, _commitment) = self.open_matrix_recursive(params, msg, &mut verifier_cache);
+        opening
     }
 
     pub fn open_vector(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
@@ -199,7 +201,12 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             .reduce(|| M::zero(params, self.secret_size, self.m_b), |left, right| left + right)
     }
 
-    fn open_matrix_recursive(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
+    fn open_matrix_recursive(
+        &self,
+        params: &<M::P as Poly>::Params,
+        msg: &M,
+        verifier_cache: &mut std::collections::HashMap<usize, M>,
+    ) -> (M, M) {
         let cols = msg.col_size();
         debug_assert!(
             cols % self.m_b == 0,
@@ -209,7 +216,9 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         );
         let base_cols = self.tree_base * self.m_b;
         if cols == base_cols {
-            return self.open_base(params, msg);
+            let opening = self.open_base(params, msg);
+            let commitment = self.commit_base(params, msg);
+            return (opening, commitment);
         }
         debug_assert!(
             cols % self.tree_base == 0,
@@ -224,17 +233,27 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             let start = idx * part_cols;
             let end = start + part_cols;
             let part = msg.slice_columns(start, end);
-            zs.push(self.open_matrix_recursive(params, &part));
-            cs.push(self.commit_matrix_recursive(params, &part));
+            let (z, c) = self.open_matrix_recursive(params, &part, verifier_cache);
+            zs.push(z);
+            cs.push(c);
         }
         let c_refs = cs.iter().collect::<Vec<_>>();
         let combined_c = cs[0].concat_columns(&c_refs[1..]);
         let z_prime = self.open_base(params, &combined_c);
-        let v_part = self.verifier_for_length(part_cols);
+        let v_part = match verifier_cache.get(&part_cols) {
+            Some(v) => v.clone(),
+            None => {
+                let v = self.verifier_for_length(part_cols);
+                verifier_cache.insert(part_cols, v.clone());
+                v
+            }
+        };
         let adjusted = z_prime.mul_tensor_identity_decompose(&v_part, self.tree_base);
         let z_refs = zs.iter().collect::<Vec<_>>();
         let z_concat = zs[0].concat_columns(&z_refs[1..]);
-        adjusted + z_concat
+        let opening = adjusted + z_concat;
+        let commitment = self.commit_base(params, &combined_c);
+        (opening, commitment)
     }
 
     fn open_base(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {

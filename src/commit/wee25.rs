@@ -101,9 +101,9 @@ impl<M: PolyMatrix> Wee25Commit<M> {
 
     pub fn open_matrix(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
         debug_assert_eq!(msg.row_size(), self.secret_size);
-        let mut verifier_cache = std::collections::HashMap::new();
-        let (opening, _commitment) = self.open_matrix_recursive(params, msg, &mut verifier_cache);
-        opening
+        let log_base_q = self.m_g / self.secret_size;
+        let total_cols = msg.col_size() * log_base_q;
+        self.opening_for_length_columns(params, msg, 0..total_cols)
     }
 
     pub fn open_vector(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
@@ -130,6 +130,40 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         lhs == rhs
     }
 
+    pub fn verify_matrix_columns(
+        &self,
+        params: &<M::P as Poly>::Params,
+        msg: &M,
+        commit: &M,
+        opening_cols: &M,
+        col_range: std::ops::Range<usize>,
+    ) -> bool {
+        debug_assert_eq!(msg.row_size(), self.secret_size);
+        debug_assert!(col_range.start < col_range.end, "column range must be non-empty");
+        let msg_size = msg.col_size();
+        let log_base_q = self.m_g / self.secret_size;
+        let total_cols = msg_size * log_base_q;
+        debug_assert!(
+            col_range.end <= total_cols,
+            "column range end {} exceeds total columns {}",
+            col_range.end,
+            total_cols
+        );
+        debug_assert_eq!(
+            opening_cols.col_size(),
+            col_range.end - col_range.start,
+            "opening column count must match range length"
+        );
+        let g_l = M::gadget_matrix(params, msg_size);
+        let g_l_slice = g_l.slice_columns(col_range.start, col_range.end);
+        let v = self.verifier_for_length_columns(msg_size, col_range);
+        let lhs = commit.clone() * v;
+        let rhs_msg = msg.clone() * g_l_slice;
+        let rhs_open = self.b.clone() * opening_cols.clone();
+        let rhs = rhs_msg - rhs_open;
+        lhs == rhs
+    }
+
     pub fn verify_vector(
         &self,
         params: &<M::P as Poly>::Params,
@@ -141,6 +175,22 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         let matrix = msg.tensor(&identity);
         self.verify_matrix(params, &matrix, commit, opening)
     }
+
+    pub fn verify_vector_range(
+        &self,
+        params: &<M::P as Poly>::Params,
+        msg_vector: &M,
+        commit: &M,
+        opening_cols: &M,
+        vector_range: std::ops::Range<usize>,
+    ) -> bool {
+        let vector_len = msg_vector.col_size();
+        let col_range = self.vector_range_to_opening_columns(vector_len, vector_range);
+        let identity = M::identity(params, self.secret_size, None);
+        let matrix = msg_vector.tensor(&identity);
+        self.verify_matrix_columns(params, &matrix, commit, opening_cols, col_range)
+    }
+
 
     fn commit_matrix_recursive(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
         let cols = msg.col_size();
@@ -174,12 +224,13 @@ impl<M: PolyMatrix> Wee25Commit<M> {
     }
 
     fn commit_base(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
+        let base_cols = self.tree_base * self.m_b;
         debug_assert_eq!(
             msg.size(),
-            (self.secret_size, 2 * self.m_b),
+            (self.secret_size, base_cols),
             "base commit expects shape ({}, {})",
             self.secret_size,
-            2 * self.m_b
+            base_cols
         );
         let cols = msg.col_size();
         (0..cols)
@@ -257,15 +308,21 @@ impl<M: PolyMatrix> Wee25Commit<M> {
     }
 
     fn open_base(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
+        let base_cols = self.tree_base * self.m_b;
         debug_assert_eq!(
             msg.size(),
-            (self.secret_size, 2 * self.m_b),
+            (self.secret_size, base_cols),
             "base open expects shape ({}, {})",
             self.secret_size,
-            2 * self.m_b
+            base_cols
         );
+        let acc = self.open_base_intermediate(params, msg);
+        acc * &self.j_2m
+    }
+
+    fn open_base_intermediate(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
         let cols = msg.col_size();
-        let acc = (0..cols)
+        (0..cols)
             .into_par_iter()
             .fold(
                 || M::zero(params, self.m_b, self.t_top.col_size()),
@@ -281,14 +338,41 @@ impl<M: PolyMatrix> Wee25Commit<M> {
                     acc
                 },
             )
-            .reduce(
-                || M::zero(params, self.m_b, self.t_top.col_size()),
-                |left, right| left + right,
-            );
-        acc * &self.j_2m
+            .reduce(|| M::zero(params, self.m_b, self.t_top.col_size()), |left, right| left + right)
+    }
+
+    fn open_base_columns_from_acc(&self, acc: &M, col_range: std::ops::Range<usize>) -> M {
+        debug_assert!(
+            col_range.start < col_range.end,
+            "open_base_columns expects non-empty column range"
+        );
+        debug_assert!(
+            col_range.end <= self.j_2m.col_size(),
+            "open_base_columns range end {} exceeds {}",
+            col_range.end,
+            self.j_2m.col_size()
+        );
+        let j_slice = self.j_2m.slice_columns(col_range.start, col_range.end);
+        acc.clone() * &j_slice
+    }
+
+    fn open_base_columns(
+        &self,
+        params: &<M::P as Poly>::Params,
+        msg: &M,
+        col_range: std::ops::Range<usize>,
+    ) -> M {
+        let acc = self.open_base_intermediate(params, msg);
+        self.open_base_columns_from_acc(&acc, col_range)
     }
 
     pub fn verifier_for_length(&self, cols: usize) -> M {
+        let log_base_q = self.m_g / self.secret_size;
+        let total_cols = cols * log_base_q;
+        self.verifier_for_length_columns(cols, 0..total_cols)
+    }
+
+    fn verifier_for_length_full(&self, cols: usize) -> M {
         let base_len = self.tree_base * self.m_b;
         debug_assert!(
             cols % base_len == 0,
@@ -307,6 +391,203 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             current_len *= self.tree_base;
         }
         current
+    }
+
+    pub fn verifier_for_length_columns(&self, cols: usize, col_range: std::ops::Range<usize>) -> M {
+        debug_assert!(col_range.start < col_range.end, "column range must be non-empty");
+        let log_base_q = self.m_g / self.secret_size;
+        let total_cols = cols * log_base_q;
+        debug_assert!(
+            col_range.end <= total_cols,
+            "column range end {} exceeds total columns {}",
+            col_range.end,
+            total_cols
+        );
+        if col_range.start == 0 && col_range.end == total_cols {
+            return self.verifier_for_length_full(cols);
+        }
+        let base = self.verifier_base();
+        let mut iter = col_range.into_iter();
+        let first_idx = iter.next().expect("column range must be non-empty");
+        let first = self.verifier_column_with_base(&base, cols, first_idx, log_base_q);
+        let mut cols_vec = Vec::new();
+        for idx in iter {
+            cols_vec.push(self.verifier_column_with_base(&base, cols, idx, log_base_q));
+        }
+        if cols_vec.is_empty() {
+            first
+        } else {
+            let refs = cols_vec.iter().collect::<Vec<_>>();
+            first.concat_columns(&refs)
+        }
+    }
+
+    pub fn verifier_for_vector_range(
+        &self,
+        vector_len: usize,
+        vector_range: std::ops::Range<usize>,
+    ) -> M {
+        let col_range = self.vector_range_to_opening_columns(vector_len, vector_range);
+        let cols = vector_len * self.secret_size;
+        self.verifier_for_length_columns(cols, col_range)
+    }
+
+    pub fn opening_for_vector_range(
+        &self,
+        params: &<M::P as Poly>::Params,
+        msg_vector: &M,
+        vector_range: std::ops::Range<usize>,
+    ) -> M {
+        let vector_len = msg_vector.col_size();
+        let col_range = self.vector_range_to_opening_columns(vector_len, vector_range);
+        let identity = M::identity(params, self.secret_size, None);
+        let matrix = msg_vector.tensor(&identity);
+        self.opening_for_length_columns(params, &matrix, col_range)
+    }
+
+    fn verifier_column_with_base(
+        &self,
+        base: &M,
+        cols: usize,
+        col_idx: usize,
+        log_base_q: usize,
+    ) -> M {
+        let base_len = self.tree_base * self.m_b;
+        debug_assert!(
+            cols % base_len == 0,
+            "verifier_for_length expects multiple of {} cols (got {})",
+            base_len,
+            cols
+        );
+        if cols == base_len {
+            return base.slice_columns(col_idx, col_idx + 1);
+        }
+        let part_cols = cols / self.tree_base;
+        let child_ncol = part_cols * log_base_q;
+        let i = col_idx / child_ncol;
+        let j = col_idx % child_ncol;
+        let child_col = self.verifier_column_with_base(base, part_cols, j, log_base_q);
+        let slice_width = self.m_b * log_base_q;
+        let slice = base.slice(0, base.row_size(), i * slice_width, (i + 1) * slice_width);
+        let decomposed = child_col.get_column_matrix_decompose(0);
+        slice * &decomposed
+    }
+
+    fn vector_range_to_opening_columns(
+        &self,
+        vector_len: usize,
+        vector_range: std::ops::Range<usize>,
+    ) -> std::ops::Range<usize> {
+        debug_assert!(vector_range.start < vector_range.end, "vector range must be non-empty");
+        debug_assert!(
+            vector_range.end <= vector_len,
+            "vector range end {} exceeds vector length {}",
+            vector_range.end,
+            vector_len
+        );
+        let log_base_q = self.m_g / self.secret_size;
+        let start = vector_range.start * self.secret_size * log_base_q;
+        let end = vector_range.end * self.secret_size * log_base_q;
+        start..end
+    }
+
+    pub fn opening_for_length_columns(
+        &self,
+        params: &<M::P as Poly>::Params,
+        msg: &M,
+        col_range: std::ops::Range<usize>,
+    ) -> M {
+        debug_assert_eq!(msg.row_size(), self.secret_size);
+        debug_assert!(col_range.start < col_range.end, "opening column range must be non-empty");
+        let log_base_q = self.m_g / self.secret_size;
+        let total_cols = msg.col_size() * log_base_q;
+        debug_assert!(
+            col_range.end <= total_cols,
+            "opening column range end {} exceeds total columns {}",
+            col_range.end,
+            total_cols
+        );
+        if col_range.start == 0 && col_range.end == total_cols {
+            let mut verifier_cache = std::collections::HashMap::new();
+            let (opening, _commitment) =
+                self.open_matrix_recursive(params, msg, &mut verifier_cache);
+            return opening;
+        }
+        self.opening_columns_recursive(params, msg, col_range, log_base_q)
+    }
+
+    fn opening_columns_recursive(
+        &self,
+        params: &<M::P as Poly>::Params,
+        msg: &M,
+        col_range: std::ops::Range<usize>,
+        log_base_q: usize,
+    ) -> M {
+        let cols = msg.col_size();
+        let base_cols = self.tree_base * self.m_b;
+        if cols == base_cols {
+            return self.open_base_columns(params, msg, col_range);
+        }
+        let part_cols = cols / self.tree_base;
+        let part_open_cols = part_cols * log_base_q;
+
+        let mut commits = Vec::with_capacity(self.tree_base);
+        let mut parts = Vec::with_capacity(self.tree_base);
+        for idx in 0..self.tree_base {
+            let start = idx * part_cols;
+            let end = start + part_cols;
+            let part = msg.slice_columns(start, end);
+            commits.push(self.commit_matrix_recursive(params, &part));
+            parts.push(part);
+        }
+        let commit_refs = commits.iter().collect::<Vec<_>>();
+        let combined_c = commits[0].concat_columns(&commit_refs[1..]);
+        let acc_prime = self.open_base_intermediate(params, &combined_c);
+
+        let mut adjusted_segments = Vec::new();
+        for i in 0..self.tree_base {
+            let block_start = i * part_open_cols;
+            let block_end = block_start + part_open_cols;
+            let start = col_range.start.max(block_start);
+            let end = col_range.end.min(block_end);
+            if start >= end {
+                continue;
+            }
+            let sub_range = (start - block_start)..(end - block_start);
+            let v_part_cols = self.verifier_for_length_columns(part_cols, sub_range);
+            let slice_width = self.m_b * log_base_q;
+            let z_slice_range = (i * slice_width)..((i + 1) * slice_width);
+            let z_prime_slice = self.open_base_columns_from_acc(&acc_prime, z_slice_range);
+            let adjusted_block = z_prime_slice.mul_decompose(&v_part_cols);
+            adjusted_segments.push(adjusted_block);
+        }
+        let adjusted = if adjusted_segments.is_empty() {
+            M::zero(params, self.m_b, 0)
+        } else {
+            let refs = adjusted_segments.iter().collect::<Vec<_>>();
+            adjusted_segments[0].concat_columns(&refs[1..])
+        };
+
+        let mut z_segments = Vec::new();
+        for (idx, part) in parts.iter().enumerate() {
+            let block_start = idx * part_open_cols;
+            let block_end = block_start + part_open_cols;
+            let start = col_range.start.max(block_start);
+            let end = col_range.end.min(block_end);
+            if start >= end {
+                continue;
+            }
+            let sub_range = (start - block_start)..(end - block_start);
+            let z_part = self.opening_columns_recursive(params, part, sub_range, log_base_q);
+            z_segments.push(z_part);
+        }
+        let z_concat = if z_segments.is_empty() {
+            M::zero(params, self.m_b, 0)
+        } else {
+            let refs = z_segments.iter().collect::<Vec<_>>();
+            z_segments[0].concat_columns(&refs[1..])
+        };
+        adjusted + z_concat
     }
 
     fn verifier_base(&self) -> M {
@@ -499,5 +780,97 @@ mod tests {
         info!("opening generated in {:?}", start.elapsed());
 
         assert!(commit_params.verify_vector(&params, &msg_vector, &commitment, &opening));
+    }
+
+    #[test]
+    #[sequential_test::sequential]
+    fn test_wee25_partial_matrix_verify() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let params = DCRTPolyParams::new(4, 2, 17, 15);
+        let secret_size = 1;
+        let m_b = (&params.modulus_digits() + 2) * secret_size;
+        let tree_base = 2;
+        let base_len = tree_base * m_b;
+        let msg_size = base_len * 2;
+        let log_base_q = params.modulus_digits();
+        let part_open_cols = base_len * log_base_q;
+        let total_cols = msg_size * log_base_q;
+
+        let commit_params = Wee25Commit::<DCRTPolyMatrix>::setup::<
+            DCRTPolyUniformSampler,
+            DCRTPolyTrapdoorSampler,
+        >(&params, secret_size, SIGMA, tree_base);
+
+        let uniform_sampler = DCRTPolyUniformSampler::new();
+        let msg_matrix =
+            uniform_sampler.sample_uniform(&params, secret_size, msg_size, DistType::FinRingDist);
+
+        let commitment = commit_params.commit_matrix(&params, &msg_matrix);
+        let full_opening = commit_params.open_matrix(&params, &msg_matrix);
+        let start = part_open_cols - 1;
+        let end = (part_open_cols + 2).min(total_cols);
+        let partial_opening =
+            commit_params.opening_for_length_columns(&params, &msg_matrix, start..end);
+        let expected = full_opening.slice_columns(start, end);
+        assert_eq!(partial_opening, expected);
+        assert!(commit_params.verify_matrix_columns(
+            &params,
+            &msg_matrix,
+            &commitment,
+            &partial_opening,
+            start..end
+        ));
+    }
+
+    #[test]
+    #[sequential_test::sequential]
+    fn test_wee25_partial_vector_verify() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let params = DCRTPolyParams::new(4, 2, 17, 15);
+        let secret_size = 1;
+        let m_b = (&params.modulus_digits() + 2) * secret_size;
+        let tree_base = 2;
+        let base_len = tree_base * m_b;
+        let msg_size = 2 * base_len;
+        let log_base_q = params.modulus_digits();
+
+        let commit_params = Wee25Commit::<DCRTPolyMatrix>::setup::<
+            DCRTPolyUniformSampler,
+            DCRTPolyTrapdoorSampler,
+        >(&params, secret_size, SIGMA, tree_base);
+
+        let uniform_sampler = DCRTPolyUniformSampler::new();
+        let msg_vector = uniform_sampler.sample_uniform(
+            &params,
+            1,
+            msg_size / secret_size,
+            DistType::FinRingDist,
+        );
+
+        let commitment = commit_params.commit_vector(&params, &msg_vector);
+        let full_opening = commit_params.open_vector(&params, &msg_vector);
+        let full_verifier = commit_params.verifier_for_length(msg_size);
+
+        let vec_start = 1usize;
+        let vec_end = msg_vector.col_size().min(3);
+        let partial_opening =
+            commit_params.opening_for_vector_range(&params, &msg_vector, vec_start..vec_end);
+        let partial_verifier =
+            commit_params.verifier_for_vector_range(msg_vector.col_size(), vec_start..vec_end);
+
+        let col_start = vec_start * secret_size * log_base_q;
+        let col_end = vec_end * secret_size * log_base_q;
+        let expected_opening = full_opening.slice_columns(col_start, col_end);
+        let expected_verifier = full_verifier.slice_columns(col_start, col_end);
+
+        assert_eq!(partial_opening, expected_opening);
+        assert_eq!(partial_verifier, expected_verifier);
+        assert!(commit_params.verify_vector_range(
+            &params,
+            &msg_vector,
+            &commitment,
+            &partial_opening,
+            vec_start..vec_end
+        ));
     }
 }

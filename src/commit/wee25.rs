@@ -169,10 +169,24 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             self.secret_size,
             2 * self.m_b
         );
-        let bits_row = self.bits_row(msg);
-        let identity = M::identity(&params, self.secret_size, None);
-        let bits_tensor = bits_row.tensor(&identity);
-        bits_tensor * &self.w
+        let cols = msg.col_size();
+        (0..cols)
+            .into_par_iter()
+            .fold(
+                || M::zero(params, self.secret_size, self.m_b),
+                |mut acc, j| {
+                    let decomposed_col = msg.get_column_matrix_decompose(j);
+                    for r in 0..self.m_g {
+                        let a = decomposed_col.entry(r, 0);
+                        let row_start = (j * self.m_g + r) * self.secret_size;
+                        let row_end = row_start + self.secret_size;
+                        let w_block = self.w.slice_rows(row_start, row_end);
+                        acc = acc + (w_block * &a);
+                    }
+                    acc
+                },
+            )
+            .reduce(|| M::zero(params, self.secret_size, self.m_b), |left, right| left + right)
     }
 
     fn open_matrix_recursive(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
@@ -214,40 +228,28 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             self.secret_size,
             2 * self.m_b
         );
-        let bits_row = self.bits_row(msg);
-        let m_b = self.b.col_size();
-        let identity = M::identity(params, m_b, None);
-        let bits_tensor = bits_row.tensor(&identity);
-        // let t_matrix = self.t_top.clone().concat_rows(&[&self.t_bottom]);
-        let intermediate = bits_tensor * &self.t_top;
-        intermediate * &self.j_2m
-    }
-
-    fn bits_row(&self, msg: &M) -> M {
-        let decomposed = msg.decompose();
-        debug_assert_eq!(
-            decomposed.row_size(),
-            self.m_g,
-            "decomposed row size {} must equal m_g={}",
-            decomposed.row_size(),
-            self.m_g
-        );
-        let cols = decomposed.col_size();
-        debug_assert!(cols > 0, "bits_row expects at least one column in the decomposed matrix");
-        let mut transposed_cols = Vec::with_capacity(cols);
-        for j in 0..cols {
-            let col = decomposed.slice_columns(j, j + 1);
-            transposed_cols.push(col.transpose());
-        }
-        let mut iter = transposed_cols.into_iter();
-        let first = iter.next().expect("transposed_cols not empty");
-        let rest: Vec<M> = iter.collect();
-        if rest.is_empty() {
-            first
-        } else {
-            let rest_refs = rest.iter().collect::<Vec<_>>();
-            first.concat_columns(&rest_refs)
-        }
+        let cols = msg.col_size();
+        let acc = (0..cols)
+            .into_par_iter()
+            .fold(
+                || M::zero(params, self.m_b, self.t_top.col_size()),
+                |mut acc, j| {
+                    let decomposed_col = msg.get_column_matrix_decompose(j);
+                    for r in 0..self.m_g {
+                        let a = decomposed_col.entry(r, 0);
+                        let row_start = (j * self.m_g + r) * self.m_b;
+                        let row_end = row_start + self.m_b;
+                        let t_block = self.t_top.slice_rows(row_start, row_end);
+                        acc = acc + (t_block * &a);
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || M::zero(params, self.m_b, self.t_top.col_size()),
+                |left, right| left + right,
+            );
+        acc * &self.j_2m
     }
 
     pub fn verifier_for_length(&self, cols: usize) -> M {

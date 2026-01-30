@@ -149,6 +149,8 @@ pub trait PolyMatrix:
     fn mul_decompose(&self, other: &Self) -> Self;
     /// j is column and return decomposed matrix of target column
     fn get_column_matrix_decompose(&self, j: usize) -> Self;
+    /// Stack columns into a single column vector (column-wise vectorization).
+    fn vectorize_columns(&self) -> Self;
     /// Reads a matrix of given rows and cols with id from files under the given directory.
     fn read_from_files<P: AsRef<Path> + Send + Sync>(
         params: &<Self::P as Poly>::Params,

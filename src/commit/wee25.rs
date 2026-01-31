@@ -1002,6 +1002,44 @@ mod tests {
         assert!(!commit_params.verify(&msg_matrix2, &commitment, &opening, None));
     }
 
+    #[test]
+    #[sequential_test::sequential]
+    fn test_wee25_random_partial_open_verify() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let params = DCRTPolyParams::new(4, 2, 17, 15);
+        let secret_size = 1;
+        let m_b = (&params.modulus_digits() + 2) * secret_size;
+        let tree_base = 2;
+        let cols = 4;
+
+        let start = Instant::now();
+        let commit_params = Wee25Commit::<DCRTPolyMatrix>::setup::<
+            DCRTPolyUniformSampler,
+            DCRTPolyTrapdoorSampler,
+        >(&params, secret_size, SIGMA, tree_base);
+        info!("commit params generated in {:?}", start.elapsed());
+
+        let uniform_sampler = DCRTPolyUniformSampler::new();
+        let msg_blocks = (0..cols)
+            .map(|_| {
+                uniform_sampler.sample_uniform(&params, secret_size, m_b, DistType::FinRingDist)
+            })
+            .collect::<Vec<_>>();
+        let msg_matrix = concat_blocks(&msg_blocks);
+        let msg_stream = MsgMatrixStream::from_blocks(msg_blocks);
+
+        let start = Instant::now();
+        let commitment = commit_params.commit(&params, &msg_stream);
+        info!("commitment generated in {:?}", start.elapsed());
+
+        let col_range = 1..3;
+        let start = Instant::now();
+        let opening = commit_params.open(&params, &msg_stream, Some(col_range.clone()));
+        info!("opening generated in {:?}", start.elapsed());
+
+        assert!(commit_params.verify(&msg_matrix, &commitment, &opening, Some(col_range)));
+    }
+
     // #[test]
     // #[sequential_test::sequential]
     // fn test_wee25_zero_commit_invalid_verify() {

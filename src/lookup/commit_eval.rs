@@ -23,7 +23,6 @@ struct GateState<M: PolyMatrix> {
 pub struct CommitBGGPubKeyPltEvaluator<M, HS>
 where
     M: PolyMatrix,
-    M::P: 'static,
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
 {
     pub hash_key: [u8; 32],
@@ -291,7 +290,6 @@ fn build_committed_matrix<M, HS>(
 ) -> M
 where
     M: PolyMatrix,
-    M::P: 'static,
     HS: PolyHashSampler<[u8; 32], M = M>,
 {
     let secret_size = gate_states[0].2.matrix.row_size();
@@ -326,19 +324,13 @@ where
     committed_matrices[0].concat_columns(&committed_matrices[1..].iter().collect::<Vec<_>>())
 }
 
-fn map_lut_gate_start_ids<P: Poly + 'static>(
-    circuit: &PolyCircuit<P>,
-) -> (HashMap<GateId, usize>, usize) {
+fn map_lut_gate_start_ids<P: Poly>(circuit: &PolyCircuit<P>) -> (HashMap<GateId, usize>, usize) {
     let mut start_ids = HashMap::new();
     let mut cursor = 0usize;
     for (gate_id, gate) in circuit.gates_in_id_order() {
         if let PolyGateType::PubLut { lut_id } = gate.gate_type {
-            let lut = circuit
-                .lookups
-                .get(&lut_id)
-                .unwrap_or_else(|| panic!("missing lookup table for lut_id {lut_id}"));
             start_ids.insert(*gate_id, cursor);
-            cursor += lut.len();
+            cursor += circuit.lookup_len(lut_id);
         }
     }
     (start_ids, cursor)

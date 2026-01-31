@@ -43,11 +43,9 @@ pub trait PolyParams: Clone + Debug + PartialEq + Eq + Send + Sync {
                 let qi_big = BigUint::from(qi);
                 let q_over_qi = modulus_big.as_ref() / &qi_big;
                 let q_over_qi_mod = &q_over_qi % &qi_big;
-                let inv = mod_inverse(
-                    q_over_qi_mod.to_u64().expect("CRT residue must fit in u64"),
-                    qi,
-                )
-                .expect("CRT moduli must be coprime");
+                let inv =
+                    mod_inverse(q_over_qi_mod.to_u64().expect("CRT residue must fit in u64"), qi)
+                        .expect("CRT moduli must be coprime");
                 (&q_over_qi * BigUint::from(inv)) % modulus_big.as_ref()
             })
             .collect()

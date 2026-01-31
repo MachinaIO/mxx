@@ -77,6 +77,10 @@ impl<P: Poly> PolyCircuit<P> {
         self.gates.len()
     }
 
+    pub fn gates_in_id_order(&self) -> impl Iterator<Item = (&GateId, &PolyGate)> {
+        self.gates.iter()
+    }
+
     pub fn count_gates_by_type_vec(&self) -> HashMap<PolyGateKind, usize> {
         let mut counts = HashMap::new();
         self.count_helper(&mut counts);

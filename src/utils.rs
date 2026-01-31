@@ -5,7 +5,7 @@ use crate::{
     },
     matrix::base::BaseMatrix,
     poly::{
-        Poly,
+        Poly, PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
     sampler::{
@@ -15,10 +15,11 @@ use crate::{
 use bigdecimal::BigDecimal;
 use keccak_asm::Keccak256;
 use num_bigint::{BigInt, BigUint};
-use num_traits::Zero;
+use num_traits::{ToPrimitive, Zero};
 use rand::Rng;
 use std::{
     future::Future,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tracing::info;
@@ -184,6 +185,28 @@ pub fn mod_inverse(a: u64, m: u64) -> Option<u64> {
         result += m as i128;
     }
     Some(result as u64)
+}
+
+/// Calculates the modular inverse of `a` modulo the CRT-composed modulus `q`.
+/// Each CRT modulus `q_i` is used to compute `a^{-1} mod q_i`, then results are recombined.
+pub fn mod_inverse_mod_q<P: Poly>(
+    a: u64,
+    params: &P::Params,
+    reconst_coeffs: &[BigUint],
+) -> Option<BigUint> {
+    let (moduli, _, _) = params.to_crt();
+    if moduli.is_empty() {
+        return None;
+    }
+    let modulus: Arc<BigUint> = params.modulus().into();
+    let mut acc = BigUint::ZERO;
+    for (idx, &qi) in moduli.iter().enumerate() {
+        let inv_i = mod_inverse(a, qi)?;
+        let term = (BigUint::from(inv_i) * &reconst_coeffs[idx]) % modulus.as_ref();
+        acc += term;
+        acc %= modulus.as_ref();
+    }
+    Some(acc)
 }
 
 pub fn gen_biguint_for_modulus<R: Rng>(rng: &mut R, modulus: &BigUint) -> BigUint {

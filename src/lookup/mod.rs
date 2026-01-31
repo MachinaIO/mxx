@@ -1,3 +1,4 @@
+pub mod commit_eval;
 pub mod ggh15_eval;
 pub mod lwe_eval;
 pub mod poly;

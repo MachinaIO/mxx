@@ -229,19 +229,14 @@ impl<P: Poly> PolyCircuit<P> {
                 PolyGateType::Rotate { .. } => max_in,
                 PolyGateType::SubCircuitOutput { call_id, output_idx, .. } => {
                     let outputs = call_output_levels.entry(*call_id).or_insert_with(|| {
-                        let call = self
-                            .sub_circuit_calls
-                            .get(call_id)
-                            .expect("sub-circuit call missing");
+                        let call =
+                            self.sub_circuit_calls.get(call_id).expect("sub-circuit call missing");
                         let sub_circuit = self
                             .sub_circuits
                             .get(&call.sub_circuit_id)
                             .expect("sub-circuit missing");
-                        let sub_input_levels: Vec<usize> = call
-                            .inputs
-                            .iter()
-                            .map(|id| level_map[id])
-                            .collect();
+                        let sub_input_levels: Vec<usize> =
+                            call.inputs.iter().map(|id| level_map[id]).collect();
                         sub_circuit.non_free_depths_with_input_levels(&sub_input_levels)
                     });
                     outputs.get(*output_idx).copied().unwrap_or_else(|| {

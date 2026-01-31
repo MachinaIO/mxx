@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 
 use crate::{
     matrix::PolyMatrix,
@@ -20,6 +20,68 @@ pub struct Wee25Commit<M: PolyMatrix> {
     pub t_bottom: M,
     pub j_2m: M,
     pub j_2m_last: M,
+}
+
+#[derive(Clone)]
+pub struct MsgMatrixStream<'a, M: PolyMatrix> {
+    reader: Arc<dyn Fn(Range<usize>) -> Vec<M> + Send + Sync + 'a>,
+    offset: usize,
+    len: usize,
+}
+
+impl<'a, M: PolyMatrix + 'a> MsgMatrixStream<'a, M> {
+    pub fn new<F>(len: usize, reader: F) -> Self
+    where
+        F: Fn(Range<usize>) -> Vec<M> + Send + Sync + 'a,
+    {
+        Self { reader: Arc::new(reader), offset: 0, len }
+    }
+
+    pub fn from_blocks(blocks: Vec<M>) -> Self {
+        let len = blocks.len();
+        Self::new(len, move |range: Range<usize>| {
+            blocks[range.start..range.end].iter().cloned().collect()
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn slice(&self, range: Range<usize>) -> Self {
+        debug_assert!(range.start <= range.end, "stream slice must be ordered");
+        debug_assert!(
+            range.end <= self.len,
+            "stream slice end {} exceeds length {}",
+            range.end,
+            self.len
+        );
+        Self {
+            reader: Arc::clone(&self.reader),
+            offset: self.offset + range.start,
+            len: range.end - range.start,
+        }
+    }
+
+    pub fn read(&self, range: Range<usize>) -> Vec<M> {
+        debug_assert!(range.start <= range.end, "read range must be ordered");
+        debug_assert!(
+            range.end <= self.len,
+            "read range end {} exceeds length {}",
+            range.end,
+            self.len
+        );
+        let absolute = (self.offset + range.start)..(self.offset + range.end);
+        let out = (self.reader)(absolute);
+        debug_assert_eq!(
+            out.len(),
+            range.end - range.start,
+            "reader returned {} blocks, expected {}",
+            out.len(),
+            range.end - range.start
+        );
+        out
+    }
 }
 
 impl<M: PolyMatrix> Wee25Commit<M> {
@@ -88,9 +150,13 @@ impl<M: PolyMatrix> Wee25Commit<M> {
     //     Self::setup::<US, TS>(params, secret_size, trapdoor_sigma, tree_base)
     // }
 
-    pub fn commit(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
-        debug_assert_eq!(msg.row_size(), self.secret_size);
-        self.commit_recursive(params, msg)
+    pub fn commit(
+        &self,
+        params: &<M::P as Poly>::Params,
+        msg_stream: &MsgMatrixStream<'_, M>,
+    ) -> M {
+        self.assert_stream_len(msg_stream.len());
+        self.commit_recursive(params, msg_stream)
     }
 
     // pub fn commit_vector(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
@@ -105,24 +171,24 @@ impl<M: PolyMatrix> Wee25Commit<M> {
     //     self.open_matrix(params, &matrix)
     // }
 
-    pub fn verify_matrix(
-        &self,
-        params: &<M::P as Poly>::Params,
-        msg: &M,
-        commit: &M,
-        opening: &M,
-        col_range: Option<Range<usize>>,
-    ) -> bool {
-        debug_assert_eq!(msg.row_size(), self.secret_size);
-        let msg_size = msg.col_size();
-        let g_l = M::gadget_matrix(params, msg_size);
-        let v = self.verifier(msg_size, col_range);
-        let lhs = commit.clone() * v;
-        let rhs_msg = msg.clone() * g_l;
-        let rhs_open = self.b.clone() * opening.clone();
-        let rhs = rhs_msg - rhs_open;
-        lhs == rhs
-    }
+    // pub fn verify_matrix(
+    //     &self,
+    //     params: &<M::P as Poly>::Params,
+    //     msg: &M,
+    //     commit: &M,
+    //     opening: &M,
+    //     col_range: Option<Range<usize>>,
+    // ) -> bool {
+    //     debug_assert_eq!(msg.row_size(), self.secret_size);
+    //     let msg_size = msg.col_size();
+    //     let g_l = M::gadget_matrix(params, msg_size);
+    //     let v = self.verifier(msg_size, col_range);
+    //     let lhs = commit.clone() * v;
+    //     let rhs_msg = msg.clone() * g_l;
+    //     let rhs_open = self.b.clone() * opening.clone();
+    //     let rhs = rhs_msg - rhs_open;
+    //     lhs == rhs
+    // }
 
     pub fn verify(
         &self,
@@ -195,32 +261,39 @@ impl<M: PolyMatrix> Wee25Commit<M> {
     //     self.verify_matrix_columns(params, &matrix, commit, opening_cols, col_range)
     // }
 
-    fn commit_recursive(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
-        let cols = msg.col_size();
+    fn commit_recursive(
+        &self,
+        params: &<M::P as Poly>::Params,
+        msg_stream: &MsgMatrixStream<'_, M>,
+    ) -> M {
+        let cols = msg_stream.len();
         debug_assert!(
-            cols % self.m_b == 0,
-            "commit_matrix expects column count divisible by m_b={} (got {})",
-            self.m_b,
-            cols
-        );
-        let base_cols = self.tree_base * self.m_b;
-        if cols == base_cols {
-            return self.commit_base(params, msg);
-        }
-        debug_assert!(
-            cols % self.tree_base == 0,
-            "commit_matrix expects column count divisible by tree_base={} (got {})",
+            cols >= self.tree_base,
+            "commit expects at least tree_base={} blocks (got {})",
             self.tree_base,
             cols
         );
-        let part_cols = cols / self.tree_base;
-        let mut commits = Vec::with_capacity(self.tree_base);
-        for idx in 0..self.tree_base {
-            let start = idx * part_cols;
-            let end = start + part_cols;
-            let part = msg.slice_columns(start, end);
-            commits.push(self.commit_recursive(params, &part));
+        if cols == self.tree_base {
+            let parts = msg_stream.read(0..cols);
+            let refs = parts.iter().collect::<Vec<_>>();
+            let msg = parts[0].concat_columns(&refs[1..]);
+            return self.commit_base(params, &msg);
         }
+        debug_assert!(
+            cols % self.tree_base == 0,
+            "commit expects block count divisible by tree_base={} (got {})",
+            self.tree_base,
+            cols
+        );
+        let child_cols = cols / self.tree_base;
+        let commits = parallel_iter!(0..self.tree_base)
+            .map(|idx| {
+                let start = idx * child_cols;
+                let end = start + child_cols;
+                let part_stream = msg_stream.slice(start..end);
+                self.commit_recursive(params, &part_stream)
+            })
+            .collect::<Vec<_>>();
         let commit_refs = commits.iter().collect::<Vec<_>>();
         let combined = commits[0].concat_columns(&commit_refs[1..]);
         self.commit_base(params, &combined)
@@ -349,21 +422,28 @@ impl<M: PolyMatrix> Wee25Commit<M> {
     pub fn open(
         &self,
         params: &<M::P as Poly>::Params,
-        msg: &M,
+        msg_stream: &MsgMatrixStream<'_, M>,
         col_range: Option<Range<usize>>,
     ) -> M {
-        debug_assert_eq!(msg.row_size(), self.secret_size);
-        debug_assert_eq!(msg.col_size() % self.m_b, 0);
+        self.assert_stream_len(msg_stream.len());
         let v_base = self.verifier_base(false);
         let v_base_last = self.verifier_base(true);
         let top_j = self.t_top.clone() * &self.j_2m;
         let top_j_last = self.t_top.clone() * &self.j_2m_last;
-        let col_range = col_range.unwrap_or(0..msg.col_size() / self.m_b);
+        let cols = msg_stream.len();
+        let col_range = col_range.unwrap_or(0..cols);
+        debug_assert!(col_range.start < col_range.end, "column range must be non-empty");
+        debug_assert!(
+            col_range.end <= cols,
+            "column range end {} exceeds total columns {}",
+            col_range.end,
+            cols
+        );
         let openings = parallel_iter!(col_range)
             .map(|col_idx| {
                 self.open_recursive(
                     params,
-                    msg,
+                    msg_stream,
                     col_idx,
                     &v_base,
                     &v_base_last,
@@ -378,38 +458,39 @@ impl<M: PolyMatrix> Wee25Commit<M> {
     fn open_recursive(
         &self,
         params: &<M::P as Poly>::Params,
-        msg: &M,
+        msg_stream: &MsgMatrixStream<'_, M>,
         col_idx: usize,
         v_base: &M,
         v_base_last: &M,
         t_top_j: &M,
         t_top_j_last: &M,
     ) -> M {
-        let cols = msg.col_size() / self.m_b;
+        let cols = msg_stream.len();
         if cols == self.tree_base {
-            return self.open_base(params, msg, col_idx, t_top_j, t_top_j_last, true);
+            let parts = msg_stream.read(0..cols);
+            let refs = parts.iter().collect::<Vec<_>>();
+            let msg = parts[0].concat_columns(&refs[1..]);
+            return self.open_base(params, &msg, col_idx, t_top_j, t_top_j_last, true);
         }
         let child_cols = cols / self.tree_base;
         let child_col_idx = col_idx % child_cols;
         let sibling_idx = col_idx / child_cols;
         let commits = parallel_iter!(0..self.tree_base)
             .map(|j| {
-                let start = j * child_cols * self.m_b;
-                let end = start + child_cols * self.m_b;
-                let part = msg.slice_columns(start, end);
-                self.commit_recursive(params, &part)
+                let start = j * child_cols;
+                let end = start + child_cols;
+                let part_stream = msg_stream.slice(start..end);
+                self.commit_recursive(params, &part_stream)
             })
             .collect::<Vec<_>>();
         let commits_msg = commits[0].concat_columns(&commits[1..].iter().collect::<Vec<_>>());
         let z_prime =
             self.open_base(params, &commits_msg, sibling_idx, t_top_j, t_top_j_last, false);
-        let child_msg = msg.slice_columns(
-            self.m_b * child_cols * sibling_idx,
-            self.m_b * child_cols * (sibling_idx + 1),
-        );
+        let child_stream =
+            msg_stream.slice(child_cols * sibling_idx..child_cols * (sibling_idx + 1));
         let z_child = self.open_recursive(
             params,
-            &child_msg,
+            &child_stream,
             child_col_idx,
             v_base,
             v_base_last,
@@ -645,6 +726,30 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         self.t_bottom.clone() * j_2m
     }
 
+    fn assert_stream_len(&self, cols: usize) {
+        debug_assert!(
+            cols >= self.tree_base,
+            "message block count must be at least tree_base={} (got {})",
+            self.tree_base,
+            cols
+        );
+        let mut cursor = cols;
+        while cursor > self.tree_base {
+            debug_assert!(
+                cursor % self.tree_base == 0,
+                "message block count must be divisible by tree_base={} (got {})",
+                self.tree_base,
+                cursor
+            );
+            cursor /= self.tree_base;
+        }
+        debug_assert_eq!(
+            cursor, self.tree_base,
+            "message block count must be a power of tree_base (got {})",
+            cols
+        );
+    }
+
     // fn vector_range_to_opening_columns(
     //     &self,
     //     vector_len: usize,
@@ -776,6 +881,11 @@ mod tests {
     use tracing::info;
     const SIGMA: f64 = 4.578;
 
+    fn concat_blocks<M: PolyMatrix>(blocks: &[M]) -> M {
+        let refs = blocks.iter().collect::<Vec<_>>();
+        blocks[0].concat_columns(&refs[1..])
+    }
+
     #[test]
     #[sequential_test::sequential]
     fn test_wee25_zero_commit_verify() {
@@ -785,7 +895,6 @@ mod tests {
         let m_b = (&params.modulus_digits() + 2) * secret_size;
         let tree_base = 2;
         let cols = 4;
-        let msg_size = cols * m_b;
 
         let start = Instant::now();
         let commit_params = Wee25Commit::<DCRTPolyMatrix>::setup::<
@@ -794,18 +903,21 @@ mod tests {
         >(&params, secret_size, SIGMA, tree_base);
         info!("commit params generated in {:?}", start.elapsed());
 
-        let zero_matrix = DCRTPolyMatrix::zero(&params, secret_size, msg_size);
+        let msg_blocks =
+            (0..cols).map(|_| DCRTPolyMatrix::zero(&params, secret_size, m_b)).collect::<Vec<_>>();
+        let msg_matrix = concat_blocks(&msg_blocks);
+        let msg_stream = MsgMatrixStream::from_blocks(msg_blocks);
         let start = Instant::now();
-        let commitment = commit_params.commit(&params, &zero_matrix);
+        let commitment = commit_params.commit(&params, &msg_stream);
         info!("commitment generated in {:?}", start.elapsed());
         let start = Instant::now();
         let _verifier = commit_params.verifier(cols, None);
         info!("verifier generated in {:?}", start.elapsed());
         let start = Instant::now();
-        let opening = commit_params.open(&params, &zero_matrix, None);
+        let opening = commit_params.open(&params, &msg_stream, None);
         info!("opening generated in {:?}", start.elapsed());
 
-        assert!(commit_params.verify(&zero_matrix, &commitment, &opening, None));
+        assert!(commit_params.verify(&msg_matrix, &commitment, &opening, None));
     }
 
     #[test]
@@ -817,7 +929,6 @@ mod tests {
         let m_b = (&params.modulus_digits() + 2) * secret_size;
         let tree_base = 2;
         let cols = 4;
-        let msg_size = cols * m_b;
 
         let start = Instant::now();
         let commit_params = Wee25Commit::<DCRTPolyMatrix>::setup::<
@@ -827,16 +938,21 @@ mod tests {
         info!("commit params generated in {:?}", start.elapsed());
 
         let uniform_sampler = DCRTPolyUniformSampler::new();
-        let msg_matrix =
-            uniform_sampler.sample_uniform(&params, secret_size, msg_size, DistType::FinRingDist);
+        let msg_blocks = (0..cols)
+            .map(|_| {
+                uniform_sampler.sample_uniform(&params, secret_size, m_b, DistType::FinRingDist)
+            })
+            .collect::<Vec<_>>();
+        let msg_matrix = concat_blocks(&msg_blocks);
+        let msg_stream = MsgMatrixStream::from_blocks(msg_blocks);
         let start = Instant::now();
-        let commitment = commit_params.commit(&params, &msg_matrix);
+        let commitment = commit_params.commit(&params, &msg_stream);
         info!("commitment generated in {:?}", start.elapsed());
         let start = Instant::now();
         let _verifier = commit_params.verifier(cols, None);
         info!("verifier generated in {:?}", start.elapsed());
         let start = Instant::now();
-        let opening = commit_params.open(&params, &msg_matrix, None);
+        let opening = commit_params.open(&params, &msg_stream, None);
         info!("opening generated in {:?}", start.elapsed());
 
         assert!(commit_params.verify(&msg_matrix, &commitment, &opening, None));
@@ -851,7 +967,6 @@ mod tests {
         let m_b = (&params.modulus_digits() + 2) * secret_size;
         let tree_base = 2;
         let cols = 4;
-        let msg_size = cols * m_b;
 
         let start = Instant::now();
         let commit_params = Wee25Commit::<DCRTPolyMatrix>::setup::<
@@ -861,18 +976,27 @@ mod tests {
         info!("commit params generated in {:?}", start.elapsed());
 
         let uniform_sampler = DCRTPolyUniformSampler::new();
-        let msg_matrix1 =
-            uniform_sampler.sample_uniform(&params, secret_size, msg_size, DistType::FinRingDist);
+        let msg_blocks1 = (0..cols)
+            .map(|_| {
+                uniform_sampler.sample_uniform(&params, secret_size, m_b, DistType::FinRingDist)
+            })
+            .collect::<Vec<_>>();
+        let msg_stream1 = MsgMatrixStream::from_blocks(msg_blocks1);
         let start = Instant::now();
-        let commitment = commit_params.commit(&params, &msg_matrix1);
+        let commitment = commit_params.commit(&params, &msg_stream1);
         info!("commitment generated in {:?}", start.elapsed());
         let start = Instant::now();
         let _verifier = commit_params.verifier(cols, None);
         info!("verifier generated in {:?}", start.elapsed());
-        let msg_matrix2 =
-            uniform_sampler.sample_uniform(&params, secret_size, msg_size, DistType::FinRingDist);
+        let msg_blocks2 = (0..cols)
+            .map(|_| {
+                uniform_sampler.sample_uniform(&params, secret_size, m_b, DistType::FinRingDist)
+            })
+            .collect::<Vec<_>>();
+        let msg_matrix2 = concat_blocks(&msg_blocks2);
+        let msg_stream2 = MsgMatrixStream::from_blocks(msg_blocks2);
         let start = Instant::now();
-        let opening = commit_params.open(&params, &msg_matrix2, None);
+        let opening = commit_params.open(&params, &msg_stream2, None);
         info!("opening generated in {:?}", start.elapsed());
 
         assert!(!commit_params.verify(&msg_matrix2, &commitment, &opening, None));

@@ -6,6 +6,7 @@ use crate::{
     poly::{Poly, PolyParams},
     sampler::{DistType, PolyTrapdoorSampler, PolyUniformSampler},
 };
+use dashmap::DashMap;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 #[derive(Debug, Clone)]
@@ -430,6 +431,9 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         let v_base_last = self.verifier_base(true);
         let top_j = self.t_top.clone() * &self.j_2m;
         let top_j_last = self.t_top.clone() * &self.j_2m_last;
+        let commit_cache: DashMap<(usize, usize), M> = DashMap::new();
+        let z_prime_cache: DashMap<(usize, usize, usize), M> = DashMap::new();
+        let verifier_cache: DashMap<(usize, usize), M> = DashMap::new();
         let cols = msg_stream.len();
         let col_range = col_range.unwrap_or(0..cols);
         debug_assert!(col_range.start < col_range.end, "column range must be non-empty");
@@ -449,6 +453,9 @@ impl<M: PolyMatrix> Wee25Commit<M> {
                     &v_base_last,
                     &top_j,
                     &top_j_last,
+                    &commit_cache,
+                    &z_prime_cache,
+                    &verifier_cache,
                 )
             })
             .collect::<Vec<_>>();
@@ -464,6 +471,9 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         v_base_last: &M,
         t_top_j: &M,
         t_top_j_last: &M,
+        commit_cache: &DashMap<(usize, usize), M>,
+        z_prime_cache: &DashMap<(usize, usize, usize), M>,
+        verifier_cache: &DashMap<(usize, usize), M>,
     ) -> M {
         let cols = msg_stream.len();
         if cols == self.tree_base {
@@ -480,12 +490,25 @@ impl<M: PolyMatrix> Wee25Commit<M> {
                 let start = j * child_cols;
                 let end = start + child_cols;
                 let part_stream = msg_stream.slice(start..end);
-                self.commit_recursive(params, &part_stream)
+                let key = (part_stream.offset, part_stream.len);
+                if let Some(entry) = commit_cache.get(&key) {
+                    return entry.clone();
+                }
+                let commit = self.commit_recursive(params, &part_stream);
+                commit_cache.insert(key, commit.clone());
+                commit
             })
             .collect::<Vec<_>>();
         let commits_msg = commits[0].concat_columns(&commits[1..].iter().collect::<Vec<_>>());
-        let z_prime =
-            self.open_base(params, &commits_msg, sibling_idx, t_top_j, t_top_j_last, false);
+        let z_prime_key = (msg_stream.offset, cols, sibling_idx);
+        let z_prime = if let Some(entry) = z_prime_cache.get(&z_prime_key) {
+            entry.clone()
+        } else {
+            let value =
+                self.open_base(params, &commits_msg, sibling_idx, t_top_j, t_top_j_last, false);
+            z_prime_cache.insert(z_prime_key, value.clone());
+            value
+        };
         let child_stream =
             msg_stream.slice(child_cols * sibling_idx..child_cols * (sibling_idx + 1));
         let z_child = self.open_recursive(
@@ -496,8 +519,12 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             v_base_last,
             t_top_j,
             t_top_j_last,
+            commit_cache,
+            z_prime_cache,
+            verifier_cache,
         );
-        let verifier = self.verifier_recursive(v_base, v_base_last, child_cols, child_col_idx);
+        let verifier =
+            self.verifier_recursive(v_base, v_base_last, child_cols, child_col_idx, verifier_cache);
         z_prime * verifier.decompose() + z_child
 
         // let part_cols = cols / self.tree_base;
@@ -657,8 +684,9 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         // }
         let base = self.verifier_base(false);
         let base_last = self.verifier_base(true);
+        let cache: DashMap<(usize, usize), M> = DashMap::new();
         let cols_vec = parallel_iter!(col_range)
-            .map(|col_idx| self.verifier_recursive(&base, &base_last, cols, col_idx))
+            .map(|col_idx| self.verifier_recursive(&base, &base_last, cols, col_idx, &cache))
             .collect::<Vec<_>>();
         cols_vec[0].concat_columns(&cols_vec[1..].iter().collect::<Vec<_>>())
         // let mut iter = col_range.into_iter();
@@ -705,20 +733,28 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         base_last: &M,
         cols: usize,
         col_idx: usize,
+        cache: &DashMap<(usize, usize), M>,
         // log_base_q: usize,
     ) -> M {
+        if let Some(entry) = cache.get(&(cols, col_idx)) {
+            return entry.clone();
+        }
         if cols == self.tree_base {
             // verifier for tree_base * msg matrices, each of which has m_b columns
-            return base_last.slice_columns(self.m_b * col_idx, self.m_b * (col_idx + 1));
+            let result = base_last.slice_columns(self.m_b * col_idx, self.m_b * (col_idx + 1));
+            cache.insert((cols, col_idx), result.clone());
+            return result;
         }
         let child_cols = cols / self.tree_base;
         let child_idx = col_idx % child_cols;
-        let child_col = self.verifier_recursive(base, base_last, child_cols, child_idx);
+        let child_col = self.verifier_recursive(base, base_last, child_cols, child_idx, cache);
         let slice_width = base.col_size() / self.tree_base;
         let sibling_idx = col_idx / child_cols;
         let slice = base.slice_columns(slice_width * sibling_idx, slice_width * (sibling_idx + 1));
         let decomposed = child_col.decompose();
-        slice * &decomposed
+        let result = slice * &decomposed;
+        cache.insert((cols, col_idx), result.clone());
+        result
     }
 
     fn verifier_base(&self, is_leaf: bool) -> M {

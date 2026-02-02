@@ -14,7 +14,7 @@ use crate::{
 };
 use dashmap::DashMap;
 use rayon::prelude::*;
-use std::{collections::HashMap, marker::PhantomData, path::PathBuf};
+use std::{collections::HashMap, marker::PhantomData, path::PathBuf, sync::Arc};
 
 #[derive(Debug, Clone)]
 struct GateState<M: PolyMatrix> {
@@ -97,8 +97,8 @@ where
             }
         }
         tracing::debug!("commit_all_lut_matrices build msg_stream start");
-        let (msg_stream, _verifier, _, _lut_gate_start_ids, _lut_vector_len) =
-            self.build_msg_stream_verifier_and_cancelers(params, luts, gate_states);
+        let (msg_stream, _, _, _) =
+            self.build_msg_stream_verifier_and_cancelers(params, &luts, &gate_states);
         tracing::debug!("commit_all_lut_matrices build msg_stream done");
         let commit = self.wee25_commit.commit(params, &msg_stream);
         let target = commit + &self.b_1;
@@ -111,9 +111,9 @@ where
     fn build_msg_stream_verifier_and_cancelers<'a>(
         &'a self,
         params: &'a <M::P as Poly>::Params,
-        luts: HashMap<usize, PublicLut<M::P>>,
-        gate_states: Vec<(GateId, usize, BggPublicKey<M>)>,
-    ) -> (MsgMatrixStream<'a, M>, M, Vec<M>, HashMap<GateId, usize>, usize)
+        luts: &'a HashMap<usize, PublicLut<M::P>>,
+        gate_states: &'a [(GateId, usize, BggPublicKey<M>)],
+    ) -> (MsgMatrixStream<'a, M>, usize, HashMap<GateId, usize>, usize)
     where
         M: 'a,
     {
@@ -130,7 +130,7 @@ where
         let hash_key = self.hash_key;
         let tree_base = self.wee25_commit.tree_base;
         let (lut_gate_start_ids, lut_vector_len, mut gate_ranges) =
-            build_lut_gate_layout(&luts, &gate_states);
+            build_lut_gate_layout(luts, gate_states);
         let mut padded_len = tree_base;
         while padded_len < lut_vector_len {
             padded_len *= tree_base;
@@ -138,45 +138,14 @@ where
         tracing::debug!(
             "build_msg_stream_verifier_and_cancelers padded_len={padded_len} lut_vector_len={lut_vector_len}"
         );
-        let verifier = self.wee25_commit.verifier(padded_len, None);
-        tracing::debug!("build_msg_stream_verifier_and_cancelers verifier done");
-        let verifier_for_stream = verifier.clone();
         gate_ranges.sort_by_key(|(start_idx, _, _, _, _)| *start_idx);
-        tracing::debug!("build_msg_stream_verifier_and_cancelers cancelers start");
-        let cancelers = (0..lut_vector_len)
-            .into_par_iter()
-            .map(|global_idx| {
-                let (start_idx, _, gate_id, lut_id, _) = gate_ranges
-                    .iter()
-                    .find(|(start, end, _, _, _)| global_idx >= *start && global_idx < *end)
-                    .unwrap_or_else(|| panic!("missing LUT range for index {global_idx}"));
-                tracing::debug!("build_msg_stream_verifier_and_cancelers cancelers global_idx={global_idx} gate_id={gate_id} lut_id={lut_id}");
-                let start_idx = *start_idx;
-                let gate_id = *gate_id;
-                let lut_id = *lut_id;
-                let lut_input_index = global_idx - start_idx;
-                let lut = luts.get(&lut_id).unwrap();
-                let input = M::P::from_usize_to_constant(params, lut_input_index);
-                let (idx, _) = lut
-                    .get(params, &input)
-                    .unwrap_or_else(|| panic!("LUT entry {} missing", lut_input_index));
-                let r_g_i =
-                    derive_r_g_i_matrix::<M, HS>(params, secret_size, m_b, hash_key, gate_id, idx);
-                tracing::debug!("r_g_i done");
-                let idx_inverse =
-                    mod_inverse_mod_q::<M::P>(idx as u64 + 1, params, &reconst_coeffs).unwrap();
-                tracing::debug!("idx_inverse done");
-                let verifier = verifier_for_stream
-                    .slice_columns(m_b * (start_idx + idx), m_b * (start_idx + idx + 1));
-                tracing::debug!("sliced verifier done");
-                (b_1.clone() * verifier + &r_g_i) *
-                    M::P::from_biguint_to_constant(params, idx_inverse)
-            })
-            .collect::<Vec<_>>();
-        tracing::debug!("build_msg_stream_verifier_and_cancelers cancelers done");
-        let cancelers_for_stream = cancelers.clone();
+        let reconst_coeffs = Arc::new(reconst_coeffs);
         let msg_stream = MsgMatrixStream::new(padded_len, move |range| {
-            (range.start..range.end)
+            let range_start = range.start;
+            let range_end = range.end;
+            let verifier_range =
+                self.wee25_commit.verifier(padded_len, Some(range_start..range_end));
+            (range_start..range_end)
                 .into_par_iter()
                 .map(|global_idx| {
                     if global_idx >= lut_vector_len {
@@ -195,6 +164,15 @@ where
                     let (idx, y_poly) = lut
                         .get(params, &input)
                         .unwrap_or_else(|| panic!("LUT entry {} missing", lut_input_index));
+                    let verifier_idx = start_idx + idx;
+                    let verifier_slice = if verifier_idx >= range_start && verifier_idx < range_end
+                    {
+                        let local_idx = verifier_idx - range_start;
+                        verifier_range.slice_columns(m_b * local_idx, m_b * (local_idx + 1))
+                    } else {
+                        self.wee25_commit
+                            .verifier(padded_len, Some(verifier_idx..(verifier_idx + 1)))
+                    };
                     let a_out =
                         derive_a_out_matrix::<M, HS>(params, secret_size, hash_key, gate_id);
                     let r_g_i = derive_r_g_i_matrix::<M, HS>(
@@ -205,7 +183,14 @@ where
                         gate_id,
                         idx,
                     );
-                    let canceler = cancelers_for_stream[global_idx].clone();
+                    let canceler = derive_canceler_matrix::<M>(
+                        params,
+                        &b_1,
+                        &verifier_slice,
+                        &r_g_i,
+                        idx,
+                        reconst_coeffs.as_slice(),
+                    );
                     let padded = (a_out.clone() - gadget.clone() * y_poly)
                         .concat_columns(&[&M::zero(params, secret_size, m_b - m_g)]);
                     padded + &r_g_i - input_pubkey.matrix.clone() * canceler.decompose()
@@ -213,7 +198,7 @@ where
                 .collect::<Vec<_>>()
         });
         tracing::debug!("build_msg_stream_verifier_and_cancelers done");
-        (msg_stream, verifier, cancelers, lut_gate_start_ids, lut_vector_len)
+        (msg_stream, padded_len, lut_gate_start_ids, lut_vector_len)
     }
 }
 
@@ -253,8 +238,10 @@ where
     pub commit_pubkey_evaluator: CommitBGGPubKeyPltEvaluator<M, HS>,
     pub c_b: M,
     pub c_commit: M,
-    pub lut_helpers: Vec<(M, M, M)>,
+    pub luts: HashMap<usize, PublicLut<M::P>>,
+    pub gate_states: Vec<(GateId, usize, BggPublicKey<M>)>,
     pub lut_gate_start_ids: HashMap<GateId, usize>,
+    pub reconst_coeffs: Vec<num_bigint::BigUint>,
     _hs: PhantomData<HS>,
 }
 
@@ -304,33 +291,15 @@ where
                 (state.gate_id, state.lut_id, state.input_pubkey.clone())
             })
             .collect::<Vec<_>>();
-        let m_b = commit_pubkey_evaluator.wee25_commit.m_b;
-        let (verifier, cancelers, opening_all, lut_gate_start_ids, lut_vector_len) = {
-            let (msg_stream, verifier, cancelers, lut_gate_start_ids, lut_vector_len) =
-                commit_pubkey_evaluator.build_msg_stream_verifier_and_cancelers(
-                    params,
-                    luts,
-                    gate_states,
-                );
-            tracing::debug!("CommitBGGEncodingPltEvaluator::setup opening start");
-            let opening_all = commit_pubkey_evaluator.wee25_commit.open(params, &msg_stream, None);
-            tracing::debug!("CommitBGGEncodingPltEvaluator::setup opening done");
-            (verifier, cancelers, opening_all, lut_gate_start_ids, lut_vector_len)
-        };
-        let lut_helpers = (0..lut_vector_len)
-            .into_par_iter()
-            .map(|idx| {
-                let verifier_slice = verifier.slice_columns(m_b * idx, m_b * (idx + 1));
-                let opening = opening_all.slice_columns(m_b * idx, m_b * (idx + 1));
-                (verifier_slice, opening, cancelers[idx].clone())
-            })
-            .collect::<Vec<_>>();
+        let (lut_gate_start_ids, _lut_vector_len, _) = build_lut_gate_layout(&luts, &gate_states);
         let result = Self {
             commit_pubkey_evaluator,
             c_b: c_b.clone(),
             c_commit,
-            lut_helpers,
+            luts,
+            gate_states,
             lut_gate_start_ids,
+            reconst_coeffs: params.reconst_coeffs(),
             _hs: PhantomData,
         };
         tracing::debug!("CommitBGGEncodingPltEvaluator::setup done");
@@ -363,7 +332,36 @@ where
             panic!("{:?} not found in LUT for gate {}", x.to_const_int(), gate_id)
         });
         let lut_vector_idx = lut_gate_index(&self.lut_gate_start_ids, gate_id, k);
-        let (verifier, opening, canceler) = &self.lut_helpers[lut_vector_idx];
+        let (msg_stream, padded_len, _, _) = self
+            .commit_pubkey_evaluator
+            .build_msg_stream_verifier_and_cancelers(params, &self.luts, &self.gate_states);
+        let opening = self.commit_pubkey_evaluator.wee25_commit.open(
+            params,
+            &msg_stream,
+            Some(lut_vector_idx..(lut_vector_idx + 1)),
+        );
+        let verifier = self
+            .commit_pubkey_evaluator
+            .wee25_commit
+            .verifier(padded_len, Some(lut_vector_idx..(lut_vector_idx + 1)));
+        let secret_size = input.pubkey.matrix.row_size();
+        let m_b = self.commit_pubkey_evaluator.wee25_commit.m_b;
+        let r_g_i = derive_r_g_i_matrix::<M, HS>(
+            params,
+            secret_size,
+            m_b,
+            self.commit_pubkey_evaluator.hash_key,
+            gate_id,
+            k,
+        );
+        let canceler = derive_canceler_matrix::<M>(
+            params,
+            &self.commit_pubkey_evaluator.b_1,
+            &verifier,
+            &r_g_i,
+            k,
+            self.reconst_coeffs.as_slice(),
+        );
         let c_lut = self.c_commit.clone() * verifier + self.c_b.clone() * opening;
         let c_x = (input.vector.clone() + &one.vector) * canceler.decompose();
         let c_out = c_lut + c_x;
@@ -450,6 +448,18 @@ where
         m_b,
         DistType::FinRingDist,
     )
+}
+
+fn derive_canceler_matrix<M: PolyMatrix>(
+    params: &<M::P as Poly>::Params,
+    b_1: &M,
+    verifier_slice: &M,
+    r_g_i: &M,
+    idx: usize,
+    reconst_coeffs: &[num_bigint::BigUint],
+) -> M {
+    let idx_inverse = mod_inverse_mod_q::<M::P>(idx as u64 + 1, params, reconst_coeffs).unwrap();
+    (b_1.clone() * verifier_slice + r_g_i) * M::P::from_biguint_to_constant(params, idx_inverse)
 }
 
 #[cfg(test)]

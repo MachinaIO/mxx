@@ -1,6 +1,6 @@
 use crate::{
     bgg::{encoding::BggEncoding, public_key::BggPublicKey},
-    circuit::{PolyCircuit, PolyGateType, gate::GateId},
+    circuit::{PolyCircuit, gate::GateId},
     commit::wee25::{MsgMatrixStream, Wee25Commit},
     lookup::{PltEvaluator, PublicLut},
     matrix::PolyMatrix,
@@ -32,8 +32,6 @@ where
     pub hash_key: [u8; 32],
     pub trapdoor_sigma: f64,
     pub wee25_commit: Wee25Commit<M>,
-    pub lut_gate_start_ids: HashMap<GateId, usize>,
-    pub lut_vector_len: usize,
     pub b_1: M,
     gate_states: DashMap<GateId, GateState<M>>,
     luts: DashMap<usize, PublicLut<M::P>>,
@@ -51,12 +49,10 @@ where
         trapdoor_sigma: f64,
         tree_base: usize,
         hash_key: [u8; 32],
-        circuit: &PolyCircuit<M::P>,
     ) -> Self {
         tracing::debug!("CommitBGGPubKeyPltEvaluator::setup start");
         let wee25_commit =
             Wee25Commit::<M>::setup::<US, TS>(params, secret_size, trapdoor_sigma, tree_base);
-        let (lut_gate_start_ids, lut_vector_len) = map_lut_gate_start_ids(circuit);
         let hash_sampler = HS::new();
         let b_1 = hash_sampler.sample_hash(
             params,
@@ -70,8 +66,6 @@ where
             hash_key,
             trapdoor_sigma,
             wee25_commit,
-            lut_gate_start_ids,
-            lut_vector_len,
             b_1,
             gate_states: DashMap::new(),
             luts: DashMap::new(),
@@ -103,7 +97,7 @@ where
             }
         }
         tracing::debug!("commit_all_lut_matrices build msg_stream start");
-        let (msg_stream, _verifier, _) =
+        let (msg_stream, _verifier, _, _lut_gate_start_ids, _lut_vector_len) =
             self.build_msg_stream_verifier_and_cancelers(params, luts, gate_states);
         tracing::debug!("commit_all_lut_matrices build msg_stream done");
         let commit = self.wee25_commit.commit(params, &msg_stream);
@@ -119,11 +113,14 @@ where
         params: &'a <M::P as Poly>::Params,
         luts: HashMap<usize, PublicLut<M::P>>,
         gate_states: Vec<(GateId, usize, BggPublicKey<M>)>,
-    ) -> (MsgMatrixStream<'a, M>, M, Vec<M>)
+    ) -> (MsgMatrixStream<'a, M>, M, Vec<M>, HashMap<GateId, usize>, usize)
     where
         M: 'a,
     {
         tracing::debug!("build_msg_stream_verifier_and_cancelers start");
+        if gate_states.is_empty() {
+            panic!("no LUT gates found for commit evaluator");
+        }
         let secret_size = gate_states[0].2.matrix.row_size();
         let reconst_coeffs = params.reconst_coeffs();
         let gadget = M::gadget_matrix(params, secret_size);
@@ -132,45 +129,46 @@ where
         let b_1 = self.b_1.clone();
         let hash_key = self.hash_key;
         let tree_base = self.wee25_commit.tree_base;
+        let (lut_gate_start_ids, lut_vector_len, mut gate_ranges) =
+            build_lut_gate_layout(&luts, &gate_states);
         let mut padded_len = tree_base;
-        while padded_len < self.lut_vector_len {
+        while padded_len < lut_vector_len {
             padded_len *= tree_base;
         }
+        tracing::debug!(
+            "build_msg_stream_verifier_and_cancelers padded_len={padded_len} lut_vector_len={lut_vector_len}"
+        );
         let verifier = self.wee25_commit.verifier(padded_len, None);
+        tracing::debug!("build_msg_stream_verifier_and_cancelers verifier done");
         let verifier_for_stream = verifier.clone();
-        let mut gate_ranges = gate_states
-            .par_iter()
-            .map(|(gate_id, lut_id, input_pubkey)| {
-                let lut = luts.get(lut_id).unwrap();
-                let start_idx = self.lut_gate_start_ids[gate_id];
-                let end_idx = start_idx + lut.len();
-                (start_idx, end_idx, *gate_id, *lut_id, input_pubkey.clone())
-            })
-            .collect::<Vec<_>>();
         gate_ranges.sort_by_key(|(start_idx, _, _, _, _)| *start_idx);
         tracing::debug!("build_msg_stream_verifier_and_cancelers cancelers start");
-        let cancelers = (0..self.lut_vector_len)
+        let cancelers = (0..lut_vector_len)
             .into_par_iter()
             .map(|global_idx| {
-                let (start_idx, _end_idx, gate_id, lut_id, _input_pubkey) = gate_ranges
+                let (start_idx, _, gate_id, lut_id, _) = gate_ranges
                     .iter()
                     .find(|(start, end, _, _, _)| global_idx >= *start && global_idx < *end)
                     .unwrap_or_else(|| panic!("missing LUT range for index {global_idx}"));
+                tracing::debug!("build_msg_stream_verifier_and_cancelers cancelers global_idx={global_idx} gate_id={gate_id} lut_id={lut_id}");
                 let start_idx = *start_idx;
                 let gate_id = *gate_id;
                 let lut_id = *lut_id;
                 let lut_input_index = global_idx - start_idx;
                 let lut = luts.get(&lut_id).unwrap();
                 let input = M::P::from_usize_to_constant(params, lut_input_index);
-                let (idx, _y_poly) = lut
+                let (idx, _) = lut
                     .get(params, &input)
                     .unwrap_or_else(|| panic!("LUT entry {} missing", lut_input_index));
                 let r_g_i =
                     derive_r_g_i_matrix::<M, HS>(params, secret_size, m_b, hash_key, gate_id, idx);
+                tracing::debug!("r_g_i done");
                 let idx_inverse =
                     mod_inverse_mod_q::<M::P>(idx as u64 + 1, params, &reconst_coeffs).unwrap();
+                tracing::debug!("idx_inverse done");
                 let verifier = verifier_for_stream
                     .slice_columns(m_b * (start_idx + idx), m_b * (start_idx + idx + 1));
+                tracing::debug!("sliced verifier done");
                 (b_1.clone() * verifier + &r_g_i) *
                     M::P::from_biguint_to_constant(params, idx_inverse)
             })
@@ -181,7 +179,7 @@ where
             (range.start..range.end)
                 .into_par_iter()
                 .map(|global_idx| {
-                    if global_idx >= self.lut_vector_len {
+                    if global_idx >= lut_vector_len {
                         return M::zero(params, secret_size, m_b);
                     }
                     let (start_idx, _end_idx, gate_id, lut_id, input_pubkey) = gate_ranges
@@ -215,7 +213,7 @@ where
                 .collect::<Vec<_>>()
         });
         tracing::debug!("build_msg_stream_verifier_and_cancelers done");
-        (msg_stream, verifier, cancelers)
+        (msg_stream, verifier, cancelers, lut_gate_start_ids, lut_vector_len)
     }
 }
 
@@ -256,6 +254,7 @@ where
     pub c_b: M,
     pub c_commit: M,
     pub lut_helpers: Vec<(M, M, M)>,
+    pub lut_gate_start_ids: HashMap<GateId, usize>,
     _hs: PhantomData<HS>,
 }
 
@@ -284,7 +283,6 @@ where
             trapdoor_sigma,
             tree_base,
             hash_key,
-            circuit,
         );
         // setup pubkeys for all LUT gates
         let _ = circuit.eval(params, one_pubkey, input_pubkeys, Some(&commit_pubkey_evaluator));
@@ -307,15 +305,19 @@ where
             })
             .collect::<Vec<_>>();
         let m_b = commit_pubkey_evaluator.wee25_commit.m_b;
-        let (verifier, cancelers, opening_all) = {
-            let (msg_stream, verifier, cancelers) = commit_pubkey_evaluator
-                .build_msg_stream_verifier_and_cancelers(params, luts, gate_states);
+        let (verifier, cancelers, opening_all, lut_gate_start_ids, lut_vector_len) = {
+            let (msg_stream, verifier, cancelers, lut_gate_start_ids, lut_vector_len) =
+                commit_pubkey_evaluator.build_msg_stream_verifier_and_cancelers(
+                    params,
+                    luts,
+                    gate_states,
+                );
             tracing::debug!("CommitBGGEncodingPltEvaluator::setup opening start");
             let opening_all = commit_pubkey_evaluator.wee25_commit.open(params, &msg_stream, None);
             tracing::debug!("CommitBGGEncodingPltEvaluator::setup opening done");
-            (verifier, cancelers, opening_all)
+            (verifier, cancelers, opening_all, lut_gate_start_ids, lut_vector_len)
         };
-        let lut_helpers = (0..commit_pubkey_evaluator.lut_vector_len)
+        let lut_helpers = (0..lut_vector_len)
             .into_par_iter()
             .map(|idx| {
                 let verifier_slice = verifier.slice_columns(m_b * idx, m_b * (idx + 1));
@@ -328,6 +330,7 @@ where
             c_b: c_b.clone(),
             c_commit,
             lut_helpers,
+            lut_gate_start_ids,
             _hs: PhantomData,
         };
         tracing::debug!("CommitBGGEncodingPltEvaluator::setup done");
@@ -359,8 +362,7 @@ where
         let (k, y) = plt.get(params, x).unwrap_or_else(|| {
             panic!("{:?} not found in LUT for gate {}", x.to_const_int(), gate_id)
         });
-        let lut_vector_idx =
-            lut_gate_index(&self.commit_pubkey_evaluator.lut_gate_start_ids, gate_id, k);
+        let lut_vector_idx = lut_gate_index(&self.lut_gate_start_ids, gate_id, k);
         let (verifier, opening, canceler) = &self.lut_helpers[lut_vector_idx];
         let c_lut = self.c_commit.clone() * verifier + self.c_b.clone() * opening;
         let c_x = (input.vector.clone() + &one.vector) * canceler.decompose();
@@ -379,16 +381,24 @@ where
     }
 }
 
-fn map_lut_gate_start_ids<P: Poly>(circuit: &PolyCircuit<P>) -> (HashMap<GateId, usize>, usize) {
+fn build_lut_gate_layout<M: PolyMatrix>(
+    luts: &HashMap<usize, PublicLut<M::P>>,
+    gate_states: &[(GateId, usize, BggPublicKey<M>)],
+) -> (HashMap<GateId, usize>, usize, Vec<(usize, usize, GateId, usize, BggPublicKey<M>)>) {
+    let mut sorted = gate_states.to_vec();
+    sorted.sort_by_key(|(gate_id, _, _)| *gate_id);
     let mut start_ids = HashMap::new();
+    let mut gate_ranges = Vec::with_capacity(sorted.len());
     let mut cursor = 0usize;
-    for (gate_id, gate) in circuit.gates_in_id_order() {
-        if let PolyGateType::PubLut { lut_id } = gate.gate_type {
-            start_ids.insert(*gate_id, cursor);
-            cursor += circuit.lookup_len(lut_id);
-        }
+    for (gate_id, lut_id, input_pubkey) in sorted.into_iter() {
+        let lut = luts.get(&lut_id).unwrap_or_else(|| panic!("missing LUT for lut_id={lut_id}"));
+        let start_idx = cursor;
+        let end_idx = start_idx + lut.len();
+        start_ids.insert(gate_id, start_idx);
+        gate_ranges.push((start_idx, end_idx, gate_id, lut_id, input_pubkey));
+        cursor = end_idx;
     }
-    (start_ids, cursor)
+    (start_ids, cursor, gate_ranges)
 }
 
 fn lut_gate_index(
@@ -531,7 +541,7 @@ mod tests {
             CommitBGGPubKeyPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup::<
                 DCRTPolyUniformSampler,
                 DCRTPolyTrapdoorSampler,
-            >(&params, d, SIGMA, tree_base, key, &circuit);
+            >(&params, d, SIGMA, tree_base, key);
         info!("plt pubkey evaluator setup done");
 
         info!("circuit eval pubkey start");
@@ -655,7 +665,7 @@ mod tests {
             CommitBGGPubKeyPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup::<
                 DCRTPolyUniformSampler,
                 DCRTPolyTrapdoorSampler,
-            >(&params, d, SIGMA, tree_base, key, &circuit);
+            >(&params, d, SIGMA, tree_base, key);
         info!("plt pubkey evaluator setup done");
 
         info!("circuit eval pubkey start");

@@ -23,6 +23,7 @@ pub enum PolyGateKind {
     LargeScalarMul,
     Rotate,
     PubLut(usize),
+    SubCircuitOutput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +49,7 @@ pub enum PolyGateType {
     LargeScalarMul { scalar: Vec<BigUint> },
     Rotate { shift: i32 },
     PubLut { lut_id: usize },
+    SubCircuitOutput { call_id: usize, output_idx: usize, num_inputs: usize },
 }
 
 impl PolyGateType {
@@ -58,6 +60,7 @@ impl PolyGateType {
             PolyGateType::SmallScalarMul { .. } |
             PolyGateType::LargeScalarMul { .. } |
             PolyGateType::PubLut { .. } => 1,
+            PolyGateType::SubCircuitOutput { num_inputs, .. } => *num_inputs,
             PolyGateType::Add | PolyGateType::Sub | PolyGateType::Mul => 2,
         }
     }
@@ -72,6 +75,7 @@ impl PolyGateType {
             PolyGateType::LargeScalarMul { .. } => PolyGateKind::LargeScalarMul,
             PolyGateType::Rotate { .. } => PolyGateKind::Rotate,
             PolyGateType::PubLut { lut_id } => PolyGateKind::PubLut(*lut_id),
+            PolyGateType::SubCircuitOutput { .. } => PolyGateKind::SubCircuitOutput,
         }
     }
 }

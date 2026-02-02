@@ -12,18 +12,14 @@ use tracing::debug;
 #[derive(Debug, Clone)]
 pub struct NestedRnsPolyContext {
     pub p_moduli: Vec<u64>,
-    pub p_moduli_bits: usize,
-    pub q_moduli_bits: usize,
     pub q_moduli_depth: usize,
-    pub scale: u64,
-    pub lut_mod_p: Vec<usize>,
-    pub lut_x_to_y: Vec<usize>,
-    pub lut_x_to_real: Vec<usize>,
-    pub lut_real_to_v: usize,
-    pub wires_p_moduli: Vec<GateId>,
-    pub scalars_y: Vec<Vec<Vec<u32>>>, /* scalars_y[q_k][p_i][p_j] =
-                                        * [[\hat{p_j}]_{q_k}]_{p_i} */
-    pub scalars_v: Vec<Vec<u32>>, // scalars_v[q_k][p_i] = [[p]_{q_k}]_{p_i}
+    add_lazy_reduce_ids: Vec<usize>,
+    sub_lazy_reduce_ids: Vec<usize>,
+    mul_lazy_reduce_ids: Vec<usize>,
+    add_full_reduce_ids: Vec<usize>,
+    sub_full_reduce_ids: Vec<usize>,
+    mul_full_reduce_ids: Vec<usize>,
+    reconstruct_ids: Vec<usize>,
 }
 
 fn dummy_lut<P: Poly + 'static>(params: &P::Params) -> PublicLut<P> {
@@ -54,7 +50,7 @@ impl NestedRnsPolyContext {
         scale: u64,
         dummy_scalar: bool,
     ) -> Self {
-        let (q_moduli, q_moduli_bits, q_moduli_depth) = params.to_crt();
+        let (q_moduli, _q_moduli_bits, q_moduli_depth) = params.to_crt();
         let q_moduli_min = q_moduli.iter().min().expect("there should be at least one q modulus");
         let q_moduli_max = q_moduli.iter().max().expect("there should be at least one q modulus");
         let p_moduli = sample_crt_primes(p_moduli_bits, *q_moduli_max);
@@ -65,42 +61,136 @@ impl NestedRnsPolyContext {
         let p_moduli_depth = p_moduli.len();
         if dummy_scalar {
             let dummy_lut = dummy_lut::<P>(params);
-            let lut_mod_p = circuit.register_public_lookup(dummy_lut.clone());
-            let lut_x_to_y = circuit.register_public_lookup(dummy_lut.clone());
-            let lut_x_to_real = circuit.register_public_lookup(dummy_lut.clone());
-            let lut_real_to_v = circuit.register_public_lookup(dummy_lut);
+            let dummy_lut_id = circuit.register_public_lookup(dummy_lut);
+            let lut_mod_p_ids = vec![dummy_lut_id; p_moduli_depth];
+            let lut_x_to_y_ids = vec![dummy_lut_id; p_moduli_depth];
+            let lut_x_to_real_ids = vec![dummy_lut_id; p_moduli_depth];
+            let lut_real_to_v_id = dummy_lut_id;
+            let p = p_moduli.iter().fold(BigUint::from(1u64), |acc, &pi| acc * BigUint::from(pi));
+            let p_over_pis =
+                p_moduli.iter().map(|&p_i| &p / BigUint::from(p_i)).collect::<Vec<_>>();
+            let mut scalars_y = vec![vec![vec![0; p_moduli_depth]; p_moduli_depth]; q_moduli_depth];
+            let mut scalars_v = vec![vec![0; p_moduli_depth]; q_moduli_depth];
+            for (p_i_idx, &p_i) in p_moduli.iter().enumerate() {
+                for (q_idx, q_k) in q_moduli.iter().enumerate() {
+                    for (p_j_idx, p_over_pj) in p_over_pis.iter().enumerate() {
+                        let p_over_pj_mod_qk = (p_over_pj % BigUint::from(*q_k))
+                            .to_u64()
+                            .expect("CRT residue must fit in u64");
+                        let p_over_pj_mod_qk_mod_pi = p_over_pj_mod_qk % p_i;
+                        scalars_y[q_idx][p_i_idx][p_j_idx] = p_over_pj_mod_qk_mod_pi as u32;
+                    }
+                    let p_mod_qk =
+                        (&p % BigUint::from(*q_k)).to_u64().expect("CRT residue must fit in u64");
+                    let p_mod_qk_mod_pi = p_mod_qk % p_i;
+                    scalars_v[q_idx][p_i_idx] = p_mod_qk_mod_pi as u32;
+                }
+            }
+            let add_lazy_reduce_ids = (0..q_moduli_depth)
+                .map(|_| {
+                    circuit.register_sub_circuit(Self::add_lazy_reduce_subcircuit::<P>(
+                        &p_moduli,
+                        &lut_mod_p_ids,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let sub_lazy_reduce_ids = (0..q_moduli_depth)
+                .map(|_| {
+                    circuit.register_sub_circuit(Self::sub_lazy_reduce_subcircuit::<P>(
+                        &p_moduli,
+                        &lut_mod_p_ids,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let mul_lazy_reduce_ids = (0..q_moduli_depth)
+                .map(|_| {
+                    circuit.register_sub_circuit(Self::mul_lazy_reduce_subcircuit::<P>(
+                        &p_moduli,
+                        &lut_mod_p_ids,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let add_full_reduce_ids = (0..q_moduli_depth)
+                .map(|q_idx| {
+                    circuit.register_sub_circuit(Self::add_full_reduce_subcircuit::<P>(
+                        &p_moduli,
+                        &lut_mod_p_ids,
+                        &lut_x_to_y_ids,
+                        &lut_x_to_real_ids,
+                        lut_real_to_v_id,
+                        &scalars_y[q_idx],
+                        &scalars_v[q_idx],
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let sub_full_reduce_ids = (0..q_moduli_depth)
+                .map(|q_idx| {
+                    circuit.register_sub_circuit(Self::sub_full_reduce_subcircuit::<P>(
+                        &p_moduli,
+                        &lut_mod_p_ids,
+                        &lut_x_to_y_ids,
+                        &lut_x_to_real_ids,
+                        lut_real_to_v_id,
+                        &scalars_y[q_idx],
+                        &scalars_v[q_idx],
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let mul_full_reduce_ids = (0..q_moduli_depth)
+                .map(|q_idx| {
+                    circuit.register_sub_circuit(Self::mul_full_reduce_subcircuit::<P>(
+                        &p_moduli,
+                        &lut_mod_p_ids,
+                        &lut_x_to_y_ids,
+                        &lut_x_to_real_ids,
+                        lut_real_to_v_id,
+                        &scalars_y[q_idx],
+                        &scalars_v[q_idx],
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let reconstruct_ids = (0..q_moduli_depth)
+                .map(|q_idx| {
+                    let (_, reconst_coeff) = params.to_crt_coeffs(q_idx);
+                    circuit.register_sub_circuit(Self::reconstruct_subcircuit::<P>(
+                        &p_moduli,
+                        &lut_x_to_y_ids,
+                        &lut_x_to_real_ids,
+                        lut_real_to_v_id,
+                        &p_over_pis,
+                        &p,
+                        &reconst_coeff,
+                    ))
+                })
+                .collect::<Vec<_>>();
             return Self {
                 p_moduli,
-                p_moduli_bits,
-                q_moduli_bits,
                 q_moduli_depth,
-                scale,
-                lut_mod_p: vec![lut_mod_p; p_moduli_depth],
-                lut_x_to_y: vec![lut_x_to_y; p_moduli_depth],
-                lut_x_to_real: vec![lut_x_to_real; p_moduli_depth],
-                lut_real_to_v,
-                wires_p_moduli: vec![circuit.const_zero_gate(); p_moduli_depth],
-                scalars_y: vec![vec![vec![0; p_moduli_depth]; p_moduli_depth]; q_moduli_depth],
-                scalars_v: vec![vec![0; p_moduli_depth]; q_moduli_depth],
+                add_lazy_reduce_ids,
+                sub_lazy_reduce_ids,
+                mul_lazy_reduce_ids,
+                add_full_reduce_ids,
+                sub_full_reduce_ids,
+                mul_full_reduce_ids,
+                reconstruct_ids,
             };
         }
 
         let p = p_moduli.iter().fold(BigUint::from(1u64), |acc, &pi| acc * BigUint::from(pi));
         let p_over_pis = p_moduli.iter().map(|&p_i| &p / BigUint::from(p_i)).collect::<Vec<_>>();
-        let sum_p_moduli: u64 = p_moduli.iter().copied().sum();
+        let max_p_modulus = *p_moduli.iter().max().expect("p_moduli must not be empty");
 
         let mut lut_mod_p = Vec::with_capacity(p_moduli_depth);
         let mut lut_x_to_y = Vec::with_capacity(p_moduli_depth);
         let mut lut_x_to_real = Vec::with_capacity(p_moduli_depth);
-        let mut wires_p_moduli = Vec::with_capacity(p_moduli_depth);
         let mut scalars_y = vec![vec![vec![0; p_moduli_depth]; p_moduli_depth]; q_moduli_depth];
         let mut scalars_v = vec![vec![0; p_moduli_depth]; q_moduli_depth];
 
         for (p_i_idx, &p_i) in p_moduli.iter().enumerate() {
-            let p_moduli_square = p_i as u64 * p_i as u64;
-            let lut_mod_p_map_size = (p_i as u128)
-                .checked_mul(sum_p_moduli as u128)
-                .expect("lut_mod_p_map_size overflow");
+            let lut_mod_p_map_size = (p_i as u128 * max_p_modulus as u128)
+                .max(p_i as u128 * (2 * p_moduli.len()) as u128);
+            // .checked_mul(max_p_modulus as u128)
+            // .expect("lut_mod_p_map_size overflow");
             debug_assert!(
                 lut_mod_p_map_size < *q_moduli_min as u128,
                 "LUT size exceeds q modulus size; increase q_moduli_bits or decrease p_moduli_bits"
@@ -120,8 +210,8 @@ impl NestedRnsPolyContext {
                 },
                 Some(max_mod_p_row),
             );
-            debug!("Constructed lut_mod_p for p_{} = {}", p_i_idx, p_i);
-            lut_mod_p.push(circuit.register_public_lookup(lut_mod_p_lut));
+            debug!("Constructed lut_mod_p for p_{} = {} with size {}", p_i_idx, p_i, lut_mod_p_len);
+            lut_mod_p.push(lut_mod_p_lut);
 
             let p_moduli_big = BigUint::from(p_i);
             let p_over_pi_mod_pi = (&p_over_pis[p_i_idx] % &p_moduli_big)
@@ -146,7 +236,7 @@ impl NestedRnsPolyContext {
 
             let p_over_pi_inv = Arc::new(p_over_pi_inv);
             let p_moduli_big = Arc::new(p_moduli_big);
-            let lut_x_to_y_len = p_moduli_square as usize;
+            let lut_x_to_y_len = p_i as usize;
             let lut_x_to_y_lut = PublicLut::<P>::new_from_usize_range(
                 params,
                 lut_x_to_y_len,
@@ -161,10 +251,13 @@ impl NestedRnsPolyContext {
                 },
                 Some(max_x_to_y_row),
             );
-            debug!("Constructed lut_x_to_y for p_{} = {}", p_i_idx, p_i);
-            lut_x_to_y.push(circuit.register_public_lookup(lut_x_to_y_lut));
+            debug!(
+                "Constructed lut_x_to_y for p_{} = {} with size {}",
+                p_i_idx, p_i, lut_x_to_y_len
+            );
+            lut_x_to_y.push(lut_x_to_y_lut);
 
-            let lut_x_to_real_len = p_moduli_square as usize;
+            let lut_x_to_real_len = p_i as usize;
             let lut_x_to_real_lut = PublicLut::<P>::new_from_usize_range(
                 params,
                 lut_x_to_real_len,
@@ -182,10 +275,12 @@ impl NestedRnsPolyContext {
                 },
                 Some(max_x_to_real_row),
             );
-            debug!("Constructed lut_x_to_real for p_{} = {}", p_i_idx, p_i);
-            lut_x_to_real.push(circuit.register_public_lookup(lut_x_to_real_lut));
+            debug!(
+                "Constructed lut_x_to_real for p_{} = {} with size {}",
+                p_i_idx, p_i, lut_x_to_real_len
+            );
+            lut_x_to_real.push(lut_x_to_real_lut);
 
-            wires_p_moduli.push(circuit.const_digits(&[p_i as u32]));
             debug!("Computed LUTs for p_{} = {}", p_i_idx, p_i);
             for (q_idx, q_k) in q_moduli.iter().enumerate() {
                 for (p_j_idx, p_over_pj) in p_over_pis.iter().enumerate() {
@@ -219,21 +314,398 @@ impl NestedRnsPolyContext {
             },
             Some(max_real_to_v_row),
         );
-        let lut_real_to_v = circuit.register_public_lookup(lut_real_to_v_lut);
+        debug!("Constructed lut_real_to_v with size {}", lut_real_to_v_len);
+        let lut_real_to_v = lut_real_to_v_lut;
+
+        let lut_mod_p_ids = lut_mod_p
+            .iter()
+            .map(|lut| circuit.register_public_lookup(lut.clone()))
+            .collect::<Vec<_>>();
+        let lut_x_to_y_ids = lut_x_to_y
+            .iter()
+            .map(|lut| circuit.register_public_lookup(lut.clone()))
+            .collect::<Vec<_>>();
+        let lut_x_to_real_ids = lut_x_to_real
+            .iter()
+            .map(|lut| circuit.register_public_lookup(lut.clone()))
+            .collect::<Vec<_>>();
+        let lut_real_to_v_id = circuit.register_public_lookup(lut_real_to_v.clone());
+
+        let add_lazy_reduce_ids = (0..q_moduli_depth)
+            .map(|_| {
+                circuit.register_sub_circuit(Self::add_lazy_reduce_subcircuit::<P>(
+                    &p_moduli,
+                    &lut_mod_p_ids,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let sub_lazy_reduce_ids = (0..q_moduli_depth)
+            .map(|_| {
+                circuit.register_sub_circuit(Self::sub_lazy_reduce_subcircuit::<P>(
+                    &p_moduli,
+                    &lut_mod_p_ids,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mul_lazy_reduce_ids = (0..q_moduli_depth)
+            .map(|_| {
+                circuit.register_sub_circuit(Self::mul_lazy_reduce_subcircuit::<P>(
+                    &p_moduli,
+                    &lut_mod_p_ids,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let add_full_reduce_ids = (0..q_moduli_depth)
+            .map(|q_idx| {
+                circuit.register_sub_circuit(Self::add_full_reduce_subcircuit::<P>(
+                    &p_moduli,
+                    &lut_mod_p_ids,
+                    &lut_x_to_y_ids,
+                    &lut_x_to_real_ids,
+                    lut_real_to_v_id,
+                    &scalars_y[q_idx],
+                    &scalars_v[q_idx],
+                ))
+            })
+            .collect::<Vec<_>>();
+        let sub_full_reduce_ids = (0..q_moduli_depth)
+            .map(|q_idx| {
+                circuit.register_sub_circuit(Self::sub_full_reduce_subcircuit::<P>(
+                    &p_moduli,
+                    &lut_mod_p_ids,
+                    &lut_x_to_y_ids,
+                    &lut_x_to_real_ids,
+                    lut_real_to_v_id,
+                    &scalars_y[q_idx],
+                    &scalars_v[q_idx],
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mul_full_reduce_ids = (0..q_moduli_depth)
+            .map(|q_idx| {
+                circuit.register_sub_circuit(Self::mul_full_reduce_subcircuit::<P>(
+                    &p_moduli,
+                    &lut_mod_p_ids,
+                    &lut_x_to_y_ids,
+                    &lut_x_to_real_ids,
+                    lut_real_to_v_id,
+                    &scalars_y[q_idx],
+                    &scalars_v[q_idx],
+                ))
+            })
+            .collect::<Vec<_>>();
+        let reconstruct_ids = (0..q_moduli_depth)
+            .map(|q_idx| {
+                let (_, reconst_coeff) = params.to_crt_coeffs(q_idx);
+                circuit.register_sub_circuit(Self::reconstruct_subcircuit::<P>(
+                    &p_moduli,
+                    &lut_x_to_y_ids,
+                    &lut_x_to_real_ids,
+                    lut_real_to_v_id,
+                    &p_over_pis,
+                    &p,
+                    &reconst_coeff,
+                ))
+            })
+            .collect::<Vec<_>>();
+
         Self {
             p_moduli,
-            p_moduli_bits,
-            q_moduli_bits,
             q_moduli_depth,
-            scale,
-            lut_mod_p,
-            lut_x_to_y,
-            lut_x_to_real,
-            lut_real_to_v,
-            wires_p_moduli,
+            add_lazy_reduce_ids,
+            sub_lazy_reduce_ids,
+            mul_lazy_reduce_ids,
+            add_full_reduce_ids,
+            sub_full_reduce_ids,
+            mul_full_reduce_ids,
+            reconstruct_ids,
+        }
+    }
+
+    fn add_lazy_reduce_subcircuit<P: Poly>(
+        p_moduli: &[u64],
+        lut_mod_p_ids: &[usize],
+    ) -> PolyCircuit<P> {
+        let mut circuit = PolyCircuit::<P>::new();
+        let add_circuit = Self::add_without_reduce_subcircuit::<P>(p_moduli);
+        let reduce_circuit = Self::lazy_reduce_subcircuit::<P>(p_moduli, lut_mod_p_ids);
+        let p_moduli_depth = p_moduli.len();
+        let inputs = circuit.input(p_moduli_depth * 2);
+        let add_circuit_id = circuit.register_sub_circuit(add_circuit);
+        let sum = circuit.call_sub_circuit(add_circuit_id, &inputs);
+        let reduce_circuit_id = circuit.register_sub_circuit(reduce_circuit);
+        let reduced = circuit.call_sub_circuit(reduce_circuit_id, &sum);
+        circuit.output(reduced);
+        circuit
+    }
+
+    fn sub_lazy_reduce_subcircuit<P: Poly>(
+        p_moduli: &[u64],
+        lut_mod_p_ids: &[usize],
+    ) -> PolyCircuit<P> {
+        let mut circuit = PolyCircuit::<P>::new();
+        let sub_circuit = Self::sub_without_reduce_subcircuit::<P>(p_moduli);
+        let reduce_circuit = Self::lazy_reduce_subcircuit::<P>(p_moduli, lut_mod_p_ids);
+        let p_moduli_depth = p_moduli.len();
+        let inputs = circuit.input(p_moduli_depth * 2);
+        let sub_circuit_id = circuit.register_sub_circuit(sub_circuit);
+        let diff = circuit.call_sub_circuit(sub_circuit_id, &inputs);
+        let reduce_circuit_id = circuit.register_sub_circuit(reduce_circuit);
+        let reduced = circuit.call_sub_circuit(reduce_circuit_id, &diff);
+        circuit.output(reduced);
+        circuit
+    }
+
+    fn mul_lazy_reduce_subcircuit<P: Poly>(
+        p_moduli: &[u64],
+        lut_mod_p_ids: &[usize],
+    ) -> PolyCircuit<P> {
+        let mut circuit = PolyCircuit::<P>::new();
+        let mul_circuit = Self::mul_without_reduce_subcircuit::<P>(p_moduli);
+        let reduce_circuit = Self::lazy_reduce_subcircuit::<P>(p_moduli, lut_mod_p_ids);
+        let p_moduli_depth = p_moduli.len();
+        let inputs = circuit.input(p_moduli_depth * 2);
+        let mul_circuit_id = circuit.register_sub_circuit(mul_circuit);
+        let prod = circuit.call_sub_circuit(mul_circuit_id, &inputs);
+        let reduce_circuit_id = circuit.register_sub_circuit(reduce_circuit);
+        let reduced = circuit.call_sub_circuit(reduce_circuit_id, &prod);
+        circuit.output(reduced);
+        circuit
+    }
+
+    fn add_full_reduce_subcircuit<P: Poly>(
+        p_moduli: &[u64],
+        lut_mod_p_ids: &[usize],
+        lut_x_to_y_ids: &[usize],
+        lut_x_to_real_ids: &[usize],
+        lut_real_to_v_id: usize,
+        scalars_y: &[Vec<u32>],
+        scalars_v: &[u32],
+    ) -> PolyCircuit<P> {
+        let mut circuit = PolyCircuit::<P>::new();
+        let add_circuit = Self::add_lazy_reduce_subcircuit::<P>(p_moduli, lut_mod_p_ids);
+        let reduce_circuit = Self::full_reduce_subcircuit::<P>(
+            p_moduli,
+            lut_mod_p_ids,
+            lut_x_to_y_ids,
+            lut_x_to_real_ids,
+            lut_real_to_v_id,
             scalars_y,
             scalars_v,
+        );
+        let p_moduli_depth = p_moduli.len();
+        let inputs = circuit.input(p_moduli_depth * 2);
+        let add_circuit_id = circuit.register_sub_circuit(add_circuit);
+        let sum = circuit.call_sub_circuit(add_circuit_id, &inputs);
+        let reduce_circuit_id = circuit.register_sub_circuit(reduce_circuit);
+        let reduced = circuit.call_sub_circuit(reduce_circuit_id, &sum);
+        circuit.output(reduced);
+        circuit
+    }
+
+    fn sub_full_reduce_subcircuit<P: Poly>(
+        p_moduli: &[u64],
+        lut_mod_p_ids: &[usize],
+        lut_x_to_y_ids: &[usize],
+        lut_x_to_real_ids: &[usize],
+        lut_real_to_v_id: usize,
+        scalars_y: &[Vec<u32>],
+        scalars_v: &[u32],
+    ) -> PolyCircuit<P> {
+        let mut circuit = PolyCircuit::<P>::new();
+        let sub_circuit = Self::sub_lazy_reduce_subcircuit::<P>(p_moduli, lut_mod_p_ids);
+        let reduce_circuit = Self::full_reduce_subcircuit::<P>(
+            p_moduli,
+            lut_mod_p_ids,
+            lut_x_to_y_ids,
+            lut_x_to_real_ids,
+            lut_real_to_v_id,
+            scalars_y,
+            scalars_v,
+        );
+        let p_moduli_depth = p_moduli.len();
+        let inputs = circuit.input(p_moduli_depth * 2);
+        let sub_circuit_id = circuit.register_sub_circuit(sub_circuit);
+        let diff = circuit.call_sub_circuit(sub_circuit_id, &inputs);
+        let reduce_circuit_id = circuit.register_sub_circuit(reduce_circuit);
+        let reduced = circuit.call_sub_circuit(reduce_circuit_id, &diff);
+        circuit.output(reduced);
+        circuit
+    }
+
+    fn mul_full_reduce_subcircuit<P: Poly>(
+        p_moduli: &[u64],
+        lut_mod_p_ids: &[usize],
+        lut_x_to_y_ids: &[usize],
+        lut_x_to_real_ids: &[usize],
+        lut_real_to_v_id: usize,
+        scalars_y: &[Vec<u32>],
+        scalars_v: &[u32],
+    ) -> PolyCircuit<P> {
+        let mut circuit = PolyCircuit::<P>::new();
+        let mul_circuit = Self::mul_lazy_reduce_subcircuit::<P>(p_moduli, lut_mod_p_ids);
+        let reduce_circuit = Self::full_reduce_subcircuit::<P>(
+            p_moduli,
+            lut_mod_p_ids,
+            lut_x_to_y_ids,
+            lut_x_to_real_ids,
+            lut_real_to_v_id,
+            scalars_y,
+            scalars_v,
+        );
+        let p_moduli_depth = p_moduli.len();
+        let inputs = circuit.input(p_moduli_depth * 2);
+        let mul_circuit_id = circuit.register_sub_circuit(mul_circuit);
+        let prod = circuit.call_sub_circuit(mul_circuit_id, &inputs);
+        let reduce_circuit_id = circuit.register_sub_circuit(reduce_circuit);
+        let reduced = circuit.call_sub_circuit(reduce_circuit_id, &prod);
+        circuit.output(reduced);
+        circuit
+    }
+
+    fn add_without_reduce_subcircuit<P: Poly>(p_moduli: &[u64]) -> PolyCircuit<P> {
+        let mut circuit = PolyCircuit::<P>::new();
+        let p_moduli_depth = p_moduli.len();
+        let inputs = circuit.input(p_moduli_depth * 2);
+        let mut result_p_moduli = Vec::with_capacity(p_moduli_depth);
+        let left = inputs[..p_moduli_depth].to_vec();
+        let right = inputs[p_moduli_depth..].to_vec();
+        for p_idx in 0..p_moduli_depth {
+            let sum_gate = circuit.add_gate(left[p_idx], right[p_idx]);
+            result_p_moduli.push(sum_gate);
         }
+        circuit.output(result_p_moduli);
+        circuit
+    }
+
+    fn sub_without_reduce_subcircuit<P: Poly>(p_moduli: &[u64]) -> PolyCircuit<P> {
+        let mut circuit = PolyCircuit::<P>::new();
+        let p_moduli_depth = p_moduli.len();
+        let inputs = circuit.input(p_moduli_depth * 2);
+        let mut result_p_moduli = Vec::with_capacity(p_moduli_depth);
+        let left = inputs[..p_moduli_depth].to_vec();
+        let right = inputs[p_moduli_depth..].to_vec();
+        for p_idx in 0..p_moduli_depth {
+            let p_i = circuit.const_digits(&[p_moduli[p_idx] as u32]);
+            let sum_gate = circuit.add_gate(left[p_idx], p_i);
+            let sub_gate = circuit.sub_gate(sum_gate, right[p_idx]);
+            result_p_moduli.push(sub_gate);
+        }
+        circuit.output(result_p_moduli);
+        circuit
+    }
+
+    fn mul_without_reduce_subcircuit<P: Poly>(p_moduli: &[u64]) -> PolyCircuit<P> {
+        let mut circuit = PolyCircuit::<P>::new();
+        let p_moduli_depth = p_moduli.len();
+        let inputs = circuit.input(p_moduli_depth * 2);
+        let mut result_p_moduli = Vec::with_capacity(p_moduli_depth);
+        let left = inputs[..p_moduli_depth].to_vec();
+        let right = inputs[p_moduli_depth..].to_vec();
+        for p_idx in 0..p_moduli_depth {
+            let mul_gate = circuit.mul_gate(left[p_idx], right[p_idx]);
+            result_p_moduli.push(mul_gate);
+        }
+        circuit.output(result_p_moduli);
+        circuit
+    }
+
+    fn lazy_reduce_subcircuit<P: Poly>(
+        p_moduli: &[u64],
+        lut_mod_p_ids: &[usize],
+    ) -> PolyCircuit<P> {
+        let mut circuit = PolyCircuit::<P>::new();
+        let p_moduli_depth = p_moduli.len();
+        let inputs = circuit.input(p_moduli_depth);
+
+        let mut result_p_moduli = Vec::with_capacity(p_moduli_depth);
+        for p_idx in 0..p_moduli_depth {
+            let reduced_gate = circuit.public_lookup_gate(inputs[p_idx], lut_mod_p_ids[p_idx]);
+            result_p_moduli.push(reduced_gate);
+        }
+        circuit.output(result_p_moduli);
+        circuit
+    }
+
+    fn full_reduce_subcircuit<P: Poly>(
+        p_moduli: &[u64],
+        lut_mod_p_ids: &[usize],
+        lut_x_to_y_ids: &[usize],
+        lut_x_to_real_ids: &[usize],
+        lut_real_to_v_id: usize,
+        scalars_y: &[Vec<u32>],
+        scalars_v: &[u32],
+    ) -> PolyCircuit<P> {
+        let mut circuit = PolyCircuit::<P>::new();
+        let p_moduli_depth = p_moduli.len();
+        let inputs = circuit.input(p_moduli_depth);
+        let x = &inputs[0..p_moduli_depth];
+
+        // 1. y_i = [[x]_{p_i} * (p/p_oi)^(-1} mod p_i] mod p_i
+        let ys = (0..p_moduli_depth)
+            .map(|p_idx| circuit.public_lookup_gate(x[p_idx], lut_x_to_y_ids[p_idx]))
+            .collect::<Vec<_>>();
+        // 2. real_i = round_div(y_i * scale, p_i), but the input is x_i rather than y_i
+        let reals = (0..p_moduli_depth)
+            .map(|p_idx| circuit.public_lookup_gate(x[p_idx], lut_x_to_real_ids[p_idx]))
+            .collect::<Vec<_>>();
+        // 3. sum_i real_i
+        let mut real_sum = circuit.const_zero_gate();
+        for &real in reals.iter() {
+            real_sum = circuit.add_gate(real_sum, real);
+        }
+        // 4. v = round_div(real_sum, scale)
+        let v = circuit.public_lookup_gate(real_sum, lut_real_to_v_id);
+        // 5. p_i_sum = (sum_j (y_j * [[\hat{p_j}]_{q_k}]_{p_i}) mod p_i) - v * [[p]_{q_k}]_{p_i}
+        //    Keep the running sum reduced to avoid negative ranges before the final mod.
+        let mut p_i_sums = Vec::with_capacity(p_moduli_depth);
+        for p_idx in 0..p_moduli_depth {
+            let mut p_i_sum = circuit.const_zero_gate();
+            for p_j_idx in 0..p_moduli_depth {
+                let y_j = ys[p_j_idx];
+                let term = circuit.small_scalar_mul(y_j, &[scalars_y[p_idx][p_j_idx]]);
+                let term_mod_p = circuit.public_lookup_gate(term, lut_mod_p_ids[p_idx]);
+                p_i_sum = circuit.add_gate(p_i_sum, term_mod_p);
+            }
+            let term = circuit.small_scalar_mul(v, &[scalars_v[p_idx]]);
+            let p_i_const = circuit.const_digits(&[p_moduli.len() as u32 * p_moduli[p_idx] as u32]);
+            let sum = circuit.add_gate(p_i_sum, p_i_const);
+            let p_i_sum = circuit.sub_gate(sum, term);
+            let p_i_sum_mod_p = circuit.public_lookup_gate(p_i_sum, lut_mod_p_ids[p_idx]);
+            p_i_sums.push(p_i_sum_mod_p);
+        }
+        circuit.output(p_i_sums);
+        circuit
+    }
+
+    fn reconstruct_subcircuit<P: Poly>(
+        p_moduli: &[u64],
+        lut_x_to_y_ids: &[usize],
+        lut_x_to_real_ids: &[usize],
+        lut_real_to_v_id: usize,
+        p_over_pis: &[BigUint],
+        p: &BigUint,
+        reconst_coeff: &BigUint,
+    ) -> PolyCircuit<P> {
+        let mut circuit = PolyCircuit::<P>::new();
+        let p_moduli_depth = p_moduli.len();
+        let inputs = circuit.input(p_moduli_depth);
+
+        let mut sum_without_reduce = circuit.const_zero_gate();
+        let mut real_sum = circuit.const_zero_gate();
+        for p_idx in 0..p_moduli_depth {
+            let y_i = circuit.public_lookup_gate(inputs[p_idx], lut_x_to_y_ids[p_idx]);
+            let y_i_p_j_hat = circuit.large_scalar_mul(y_i, &[p_over_pis[p_idx].clone()]);
+            sum_without_reduce = circuit.add_gate(sum_without_reduce, y_i_p_j_hat);
+            let real_i = circuit.public_lookup_gate(inputs[p_idx], lut_x_to_real_ids[p_idx]);
+            real_sum = circuit.add_gate(real_sum, real_i);
+        }
+        let v = circuit.public_lookup_gate(real_sum, lut_real_to_v_id);
+        let pv = circuit.large_scalar_mul(v, &[p.clone()]);
+        let sum_q_k = circuit.sub_gate(sum_without_reduce, pv);
+        let sum_q_k_scaled = circuit.large_scalar_mul(sum_q_k, &[reconst_coeff.clone()]);
+        circuit.output(vec![sum_q_k_scaled]);
+        circuit
     }
 }
 
@@ -254,71 +726,85 @@ impl<P: Poly> NestedRnsPoly<P> {
         Self { ctx, inner, _p: PhantomData }
     }
 
-    pub fn add_lazy_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
-        let sum = self.add_without_reduce(other, circuit);
-        sum.lazy_reduce(circuit)
+    pub fn add_lazy_reduce(
+        &self,
+        other: &Self,
+        enable_levels: Option<usize>,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        self.call_binary_subcircuit(other, enable_levels, circuit, &self.ctx.add_lazy_reduce_ids)
     }
 
-    pub fn sub_lazy_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
-        let diff = self.sub_without_reduce(other, circuit);
-        diff.lazy_reduce(circuit)
+    pub fn sub_lazy_reduce(
+        &self,
+        other: &Self,
+        enable_levels: Option<usize>,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        self.call_binary_subcircuit(other, enable_levels, circuit, &self.ctx.sub_lazy_reduce_ids)
     }
 
-    pub fn mul_lazy_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
-        let prod = self.mul_without_reduce(other, circuit);
-        prod.lazy_reduce(circuit)
+    pub fn mul_lazy_reduce(
+        &self,
+        other: &Self,
+        enable_levels: Option<usize>,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        self.call_binary_subcircuit(other, enable_levels, circuit, &self.ctx.mul_lazy_reduce_ids)
     }
 
-    pub fn add_full_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
-        let sum = self.add_without_reduce(other, circuit);
-        sum.full_reduce(circuit)
+    pub fn add_full_reduce(
+        &self,
+        other: &Self,
+        enable_levels: Option<usize>,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        self.call_binary_subcircuit(other, enable_levels, circuit, &self.ctx.add_full_reduce_ids)
     }
 
-    pub fn sub_full_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
-        let diff = self.sub_without_reduce(other, circuit);
-        diff.full_reduce(circuit)
+    pub fn sub_full_reduce(
+        &self,
+        other: &Self,
+        enable_levels: Option<usize>,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        self.call_binary_subcircuit(other, enable_levels, circuit, &self.ctx.sub_full_reduce_ids)
     }
 
-    pub fn mul_full_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
-        let prod = self.mul_without_reduce(other, circuit);
-        prod.full_reduce(circuit)
+    pub fn mul_full_reduce(
+        &self,
+        other: &Self,
+        enable_levels: Option<usize>,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        self.call_binary_subcircuit(other, enable_levels, circuit, &self.ctx.mul_full_reduce_ids)
     }
 
-    pub fn reconstruct(&self, params: &P::Params, circuit: &mut PolyCircuit<P>) -> GateId {
+    pub fn reconstruct(
+        &self,
+        enable_levels: Option<usize>,
+        circuit: &mut PolyCircuit<P>,
+    ) -> GateId {
+        let levels = self.resolve_enable_levels(enable_levels);
         let mut sum_mod_q = circuit.const_zero_gate();
-        let p =
-            self.ctx.p_moduli.iter().fold(BigUint::from(1u64), |acc, &pi| acc * BigUint::from(pi));
-        let p_over_pis =
-            self.ctx.p_moduli.iter().map(|&p_i| &p / BigUint::from(p_i)).collect::<Vec<_>>();
-
-        for q_idx in 0..self.ctx.q_moduli_depth {
-            let mut sum_without_reduce = circuit.const_zero_gate();
-            let mut real_sum = circuit.const_zero_gate();
-            let inner_mod_q_k = &self.inner[q_idx];
-            for p_idx in 0..self.ctx.p_moduli.len() {
-                let y_i =
-                    circuit.public_lookup_gate(inner_mod_q_k[p_idx], self.ctx.lut_x_to_y[p_idx]);
-                let y_i_p_j_hat = circuit.large_scalar_mul(y_i, &[p_over_pis[p_idx].clone()]);
-                sum_without_reduce = circuit.add_gate(sum_without_reduce, y_i_p_j_hat);
-                let real_i =
-                    circuit.public_lookup_gate(inner_mod_q_k[p_idx], self.ctx.lut_x_to_real[p_idx]);
-                real_sum = circuit.add_gate(real_sum, real_i);
-            }
-            let v = circuit.public_lookup_gate(real_sum, self.ctx.lut_real_to_v);
-            let pv = circuit.large_scalar_mul(v, &[p.clone()]);
-            let sum_q_k = circuit.sub_gate(sum_without_reduce, pv);
-            let (_, reconst_coeff) = params.to_crt_coeffs(q_idx);
-            let sum_q_k_scaled = circuit.large_scalar_mul(sum_q_k, &[reconst_coeff]);
-            sum_mod_q = circuit.add_gate(sum_mod_q, sum_q_k_scaled);
+        assert!(
+            levels <= self.ctx.reconstruct_ids.len(),
+            "enable_levels exceeds reconstruct subcircuits"
+        );
+        for q_idx in 0..levels {
+            let sum_q_k_scaled =
+                circuit.call_sub_circuit(self.ctx.reconstruct_ids[q_idx], &self.inner[q_idx]);
+            debug_assert_eq!(sum_q_k_scaled.len(), 1);
+            sum_mod_q = circuit.add_gate(sum_mod_q, sum_q_k_scaled[0]);
         }
         sum_mod_q
     }
 
     pub fn benchmark_multiplication_tree(
         ctx: Arc<NestedRnsPolyContext>,
-        params: &P::Params,
         circuit: &mut PolyCircuit<P>,
         height: usize,
+        enable_levels: Option<usize>,
     ) {
         let num_inputs =
             1usize.checked_shl(height as u32).expect("height is too large to represent 2^h inputs");
@@ -328,139 +814,49 @@ impl<P: Poly> NestedRnsPoly<P> {
             debug_assert!(current_layer.len().is_multiple_of(2), "layer size must stay even");
             let mut next_layer = Vec::with_capacity(current_layer.len() / 2);
             for pair in current_layer.chunks(2) {
-                let parent = pair[0].mul_full_reduce(&pair[1], circuit);
+                let parent = pair[0].mul_full_reduce(&pair[1], enable_levels, circuit);
                 next_layer.push(parent);
             }
             current_layer = next_layer;
         }
         let root = current_layer.pop().expect("multiplication tree must contain at least one node");
-        let out = root.reconstruct(params, circuit);
+        let out = root.reconstruct(enable_levels, circuit);
         circuit.output(vec![out]);
     }
 
-    pub(crate) fn add_without_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
-        assert_eq!(
-            self.ctx.p_moduli, other.ctx.p_moduli,
-            "cannot add NestedRnsPoly with different p_moduli"
-        );
-        assert_eq!(
-            self.ctx.q_moduli_depth, other.ctx.q_moduli_depth,
-            "cannot add NestedRnsPoly with different q_moduli_depth"
-        );
-        let mut result_inner = Vec::with_capacity(self.ctx.q_moduli_depth);
-        for q_idx in 0..self.ctx.q_moduli_depth {
-            let mut result_p_moduli = Vec::with_capacity(self.ctx.p_moduli.len());
-            for p_idx in 0..self.ctx.p_moduli.len() {
-                let sum_gate =
-                    circuit.add_gate(self.inner[q_idx][p_idx], other.inner[q_idx][p_idx]);
-                result_p_moduli.push(sum_gate);
-            }
-            result_inner.push(result_p_moduli);
+    fn call_binary_subcircuit(
+        &self,
+        other: &Self,
+        enable_levels: Option<usize>,
+        circuit: &mut PolyCircuit<P>,
+        subcircuit_ids: &[usize],
+    ) -> Self {
+        assert_eq!(self.inner.len(), other.inner.len(), "mismatched q_moduli depth");
+        let levels = self.resolve_enable_levels(enable_levels);
+        assert!(levels <= subcircuit_ids.len(), "enable_levels exceeds subcircuit depth");
+        let mut result_inner = Vec::with_capacity(levels);
+        for q_idx in 0..levels {
+            let left = &self.inner[q_idx];
+            let right = &other.inner[q_idx];
+            assert_eq!(left.len(), right.len(), "mismatched p_moduli depth");
+            let mut inputs = Vec::with_capacity(left.len() + right.len());
+            inputs.extend_from_slice(left);
+            inputs.extend_from_slice(right);
+            let outputs = circuit.call_sub_circuit(subcircuit_ids[q_idx], &inputs);
+            result_inner.push(outputs);
         }
         Self { ctx: self.ctx.clone(), inner: result_inner, _p: PhantomData }
     }
 
-    pub(crate) fn sub_without_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
-        assert_eq!(
-            self.ctx.p_moduli, other.ctx.p_moduli,
-            "cannot add NestedRnsPoly with different p_moduli"
-        );
-        assert_eq!(
-            self.ctx.q_moduli_depth, other.ctx.q_moduli_depth,
-            "cannot add NestedRnsPoly with different q_moduli_depth"
-        );
-        let mut result_inner = Vec::with_capacity(self.ctx.q_moduli_depth);
-        for q_idx in 0..self.ctx.q_moduli_depth {
-            let mut result_p_moduli = Vec::with_capacity(self.ctx.p_moduli.len());
-            for p_idx in 0..self.ctx.p_moduli.len() {
-                let sum_gate =
-                    circuit.add_gate(self.inner[q_idx][p_idx], self.ctx.wires_p_moduli[p_idx]);
-                let sub_gate = circuit.sub_gate(sum_gate, other.inner[q_idx][p_idx]);
-                result_p_moduli.push(sub_gate);
+    fn resolve_enable_levels(&self, enable_levels: Option<usize>) -> usize {
+        let max_levels = self.inner.len();
+        match enable_levels {
+            Some(levels) => {
+                assert!(levels <= max_levels, "enable_levels exceeds available levels");
+                levels
             }
-            result_inner.push(result_p_moduli);
+            None => max_levels,
         }
-        Self { ctx: self.ctx.clone(), inner: result_inner, _p: PhantomData }
-    }
-
-    pub(crate) fn mul_without_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
-        assert_eq!(
-            self.ctx.p_moduli, other.ctx.p_moduli,
-            "cannot mul NestedRnsPoly with different p_moduli"
-        );
-        assert_eq!(
-            self.ctx.q_moduli_depth, other.ctx.q_moduli_depth,
-            "cannot mul NestedRnsPoly with different q_moduli_depth"
-        );
-        let mut result_inner = Vec::with_capacity(self.ctx.q_moduli_depth);
-        for q_idx in 0..self.ctx.q_moduli_depth {
-            let mut result_p_moduli = Vec::with_capacity(self.ctx.p_moduli.len());
-            for p_idx in 0..self.ctx.p_moduli.len() {
-                let mul_gate =
-                    circuit.mul_gate(self.inner[q_idx][p_idx], other.inner[q_idx][p_idx]);
-                // let mul_mod = circuit.public_lookup_gate(mul_gate, self.ctx.lut_mod_p[p_idx]);
-                result_p_moduli.push(mul_gate);
-            }
-            result_inner.push(result_p_moduli);
-        }
-        Self { ctx: self.ctx.clone(), inner: result_inner, _p: PhantomData }
-    }
-
-    pub(crate) fn lazy_reduce(&self, circuit: &mut PolyCircuit<P>) -> Self {
-        let mut result_inner = Vec::with_capacity(self.ctx.q_moduli_depth);
-        for q_idx in 0..self.ctx.q_moduli_depth {
-            let mut result_p_moduli = Vec::with_capacity(self.ctx.p_moduli.len());
-            for p_idx in 0..self.ctx.p_moduli.len() {
-                let reduced_gate =
-                    circuit.public_lookup_gate(self.inner[q_idx][p_idx], self.ctx.lut_mod_p[p_idx]);
-                result_p_moduli.push(reduced_gate);
-            }
-            result_inner.push(result_p_moduli);
-        }
-        Self { ctx: self.ctx.clone(), inner: result_inner, _p: PhantomData }
-    }
-
-    pub(crate) fn full_reduce(&self, circuit: &mut PolyCircuit<P>) -> Self {
-        let mut result_inner = Vec::with_capacity(self.ctx.q_moduli_depth);
-        for q_idx in 0..self.ctx.q_moduli_depth {
-            // 1. y_i = [[x]_{p_i} * (p/p_oi)^(-1} mod p_i] mod p_i
-            let ys = (0..self.ctx.p_moduli.len())
-                .map(|p_idx| {
-                    circuit.public_lookup_gate(self.inner[q_idx][p_idx], self.ctx.lut_x_to_y[p_idx])
-                })
-                .collect::<Vec<_>>();
-            // 2. real_i = round_div(y_i * scale, p_i), but the input is x_i rather than y_i
-            let reals = (0..self.ctx.p_moduli.len())
-                .map(|p_idx| {
-                    circuit
-                        .public_lookup_gate(self.inner[q_idx][p_idx], self.ctx.lut_x_to_real[p_idx])
-                })
-                .collect::<Vec<_>>();
-            // 3. sum_i real_i
-            let mut real_sum = circuit.const_zero_gate();
-            for &real in reals.iter() {
-                real_sum = circuit.add_gate(real_sum, real);
-            }
-            // 4. v = round_div(real_sum, scale)
-            let v = circuit.public_lookup_gate(real_sum, self.ctx.lut_real_to_v);
-            // 5. p_i_sum = (sum_j y_j * [[\hat{p_j}]_{q_k}]_{p_i}) - v * [[p]_{q_k}]_{p_i}
-            let mut p_i_sums = Vec::with_capacity(self.ctx.p_moduli.len());
-            for p_idx in 0..self.ctx.p_moduli.len() {
-                let mut p_i_sum = circuit.const_zero_gate();
-                for p_j_idx in 0..self.ctx.p_moduli.len() {
-                    let y_j = ys[p_j_idx];
-                    let term =
-                        circuit.small_scalar_mul(y_j, &[self.ctx.scalars_y[q_idx][p_idx][p_j_idx]]);
-                    p_i_sum = circuit.add_gate(p_i_sum, term);
-                }
-                let term = circuit.small_scalar_mul(v, &[self.ctx.scalars_v[q_idx][p_idx]]);
-                p_i_sum = circuit.sub_gate(p_i_sum, term);
-                let p_i_sum_mod_p = circuit.public_lookup_gate(p_i_sum, self.ctx.lut_mod_p[p_idx]);
-                p_i_sums.push(p_i_sum_mod_p);
-            }
-            result_inner.push(p_i_sums);
-        }
-        Self { ctx: self.ctx.clone(), inner: result_inner, _p: PhantomData }
     }
 }
 
@@ -541,6 +937,7 @@ pub fn encode_nested_rns_poly<P: Poly>(
 mod tests {
     use super::*;
     use crate::{
+        __PAIR, __TestState,
         lookup::poly::PolyPltEvaluator,
         poly::{
             PolyParams,
@@ -555,6 +952,7 @@ mod tests {
     fn create_test_context(
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> (DCRTPolyParams, Arc<NestedRnsPolyContext>) {
+        let _ = tracing_subscriber::fmt::try_init();
         let params = DCRTPolyParams::new(4, 6, 18, BASE_BITS);
         let ctx =
             Arc::new(NestedRnsPolyContext::setup(circuit, &params, P_MODULI_BITS, SCALE, false));
@@ -564,6 +962,7 @@ mod tests {
         (params, ctx)
     }
 
+    #[sequential_test::sequential]
     #[test]
     fn test_nested_rns_poly_add_full_reduce_maxes() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -574,6 +973,7 @@ mod tests {
         test_nested_rns_poly_add_full_reduce_generic(circuit, params, ctx, a_value, b_value);
     }
 
+    #[sequential_test::sequential]
     #[test]
     fn test_nested_rns_poly_add_full_reduce_random() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -585,6 +985,7 @@ mod tests {
         test_nested_rns_poly_add_full_reduce_generic(circuit, params, ctx, a_value, b_value);
     }
 
+    #[sequential_test::sequential]
     #[test]
     fn test_nested_rns_poly_sub_full_reduce_maxes() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -595,6 +996,7 @@ mod tests {
         test_nested_rns_poly_sub_full_reduce_generic(circuit, params, ctx, a_value, b_value);
     }
 
+    #[sequential_test::sequential]
     #[test]
     fn test_nested_rns_poly_sub_full_reduce_random() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -606,6 +1008,7 @@ mod tests {
         test_nested_rns_poly_sub_full_reduce_generic(circuit, params, ctx, a_value, b_value);
     }
 
+    #[sequential_test::sequential]
     #[test]
     fn test_nested_rns_poly_mul_full_reduce_maxes() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -616,6 +1019,7 @@ mod tests {
         test_nested_rns_poly_mul_full_reduce_generic(circuit, params, ctx, a_value, b_value);
     }
 
+    #[sequential_test::sequential]
     #[test]
     fn test_nested_rns_poly_mul_full_reduce_random() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -636,8 +1040,8 @@ mod tests {
     ) {
         let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
         let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-        let sum = poly_a.add_full_reduce(&poly_b, &mut circuit);
-        let out = sum.reconstruct(&params, &mut circuit);
+        let sum = poly_a.add_full_reduce(&poly_b, None, &mut circuit);
+        let out = sum.reconstruct(None, &mut circuit);
         circuit.output(vec![out]);
         println!("non-free depth {}", circuit.non_free_depth());
         println!("circuit size {:?}", circuit.count_gates_by_type_vec());
@@ -671,8 +1075,8 @@ mod tests {
     ) {
         let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
         let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-        let sum = poly_a.sub_full_reduce(&poly_b, &mut circuit);
-        let out = sum.reconstruct(&params, &mut circuit);
+        let sum = poly_a.sub_full_reduce(&poly_b, None, &mut circuit);
+        let out = sum.reconstruct(None, &mut circuit);
         circuit.output(vec![out]);
         println!("non-free depth {}", circuit.non_free_depth());
         println!("circuit size {:?}", circuit.count_gates_by_type_vec());
@@ -711,8 +1115,8 @@ mod tests {
     ) {
         let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
         let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-        let sum = poly_a.mul_full_reduce(&poly_b, &mut circuit);
-        let out = sum.reconstruct(&params, &mut circuit);
+        let sum = poly_a.mul_full_reduce(&poly_b, None, &mut circuit);
+        let out = sum.reconstruct(None, &mut circuit);
         circuit.output(vec![out]);
         println!("non-free depth {}", circuit.non_free_depth());
         println!("circuit size {:?}", circuit.count_gates_by_type_vec());

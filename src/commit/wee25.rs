@@ -437,26 +437,26 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         col_idx: usize,
         cache: &DashMap<(usize, usize), M>,
     ) -> M {
-        tracing::debug!(
-            "verifier_recursive start cols={} col_idx={} tree_base={}",
-            cols,
-            col_idx,
-            self.tree_base
-        );
+        // tracing::debug!(
+        //     "verifier_recursive start cols={} col_idx={} tree_base={}",
+        //     cols,
+        //     col_idx,
+        //     self.tree_base
+        // );
         if let Some(entry) = cache.get(&(cols, col_idx)) {
-            tracing::debug!("verifier_recursive cache hit cols={} col_idx={}", cols, col_idx);
+            // tracing::debug!("verifier_recursive cache hit cols={} col_idx={}", cols, col_idx);
             return entry.clone();
         }
         if cols == self.tree_base {
             // verifier for tree_base * msg matrices, each of which has m_b columns
             let result = base_last.slice_columns(self.m_b * col_idx, self.m_b * (col_idx + 1));
             cache.insert((cols, col_idx), result.clone());
-            tracing::debug!(
-                "verifier_recursive leaf cols={} col_idx={} m_b={}",
-                cols,
-                col_idx,
-                self.m_b
-            );
+            // tracing::debug!(
+            //     "verifier_recursive leaf cols={} col_idx={} m_b={}",
+            //     cols,
+            //     col_idx,
+            //     self.m_b
+            // );
             return result;
         }
         let child_cols = cols / self.tree_base;
@@ -468,14 +468,14 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         let decomposed = child_col.decompose();
         let result = slice * &decomposed;
         cache.insert((cols, col_idx), result.clone());
-        tracing::debug!(
-            "verifier_recursive computed cols={} col_idx={} child_cols={} child_idx={} sibling_idx={}",
-            cols,
-            col_idx,
-            child_cols,
-            child_idx,
-            sibling_idx
-        );
+        // tracing::debug!(
+        //     "verifier_recursive computed cols={} col_idx={} child_cols={} child_idx={}
+        // sibling_idx={}",     cols,
+        //     col_idx,
+        //     child_cols,
+        //     child_idx,
+        //     sibling_idx
+        // );
         result
     }
 

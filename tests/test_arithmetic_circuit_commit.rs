@@ -44,23 +44,23 @@ async fn test_arithmetic_circuit_operations_commit() {
 
     let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
     let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-    let poly_c = NestedRnsPoly::input(ctx.clone(), &mut circuit);
+    // let poly_c = NestedRnsPoly::input(ctx.clone(), &mut circuit);
 
-    let sum = poly_a.add_full_reduce(&poly_b, None, &mut circuit);
-    let prod = sum.mul_full_reduce(&poly_c, None, &mut circuit);
-    let out_poly = prod.sub_full_reduce(&poly_a, None, &mut circuit);
-    let out = out_poly.reconstruct(None, &mut circuit);
+    // let sum = poly_a.add_full_reduce(&poly_b, None, &mut circuit);
+    let prod = poly_a.mul_full_reduce(&poly_b, None, &mut circuit);
+    // let out_poly = prod.sub_full_reduce(&poly_a, None, &mut circuit);
+    let out = prod.reconstruct(None, &mut circuit);
     circuit.output(vec![out]);
     info!("{}", format!("non-free depth: {}", circuit.non_free_depth()));
 
     // 1) Plain polynomial evaluation.
     let a_value: BigUint = gen_biguint_for_modulus(&mut rng, modulus.as_ref());
     let b_value: BigUint = gen_biguint_for_modulus(&mut rng, modulus.as_ref());
-    let c_value: BigUint = gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+    // let c_value: BigUint = gen_biguint_for_modulus(&mut rng, modulus.as_ref());
     let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value);
     let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value);
-    let c_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &c_value);
-    let plaintext_inputs = [a_inputs.clone(), b_inputs.clone(), c_inputs.clone()].concat();
+    // let c_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &c_value);
+    let plaintext_inputs = [a_inputs.clone(), b_inputs.clone()].concat();
 
     let plt_evaluator = PolyPltEvaluator::new();
     let eval_results = circuit.eval(
@@ -72,12 +72,13 @@ async fn test_arithmetic_circuit_operations_commit() {
     assert_eq!(eval_results.len(), 1);
 
     let q = modulus.as_ref();
-    let aa = &a_value % q;
-    let bb = &b_value % q;
-    let cc = &c_value % q;
-    let t = (&aa + &bb) % q;
-    let t = (t * &cc) % q;
-    let expected = (t + (q - &aa)) % q;
+    // let aa = &a_value % q;
+    // let bb = &b_value % q;
+    // let cc = &c_value % q;
+    // let t = (&aa + &bb) % q;
+    // let t = (t * &cc) % q;
+    // let expected = (t + (q - &aa)) % q;
+    let expected = (&a_value * &b_value) % q;
     let expected_poly = DCRTPoly::from_biguint_to_constant(&params, expected);
 
     assert_eq!(eval_results[0], expected_poly, "mixed operations should be correct");

@@ -850,14 +850,6 @@ impl<P: Poly> PolyCircuit<P> {
         self.lookup_registry.register(public_lookup)
     }
 
-    pub fn lookup_len(&self, lut_id: usize) -> usize {
-        self.lookup_registry
-            .lookups
-            .get(&lut_id)
-            .map(|lut| lut.len())
-            .unwrap_or_else(|| panic!("missing lookup table for lut_id {lut_id}"))
-    }
-
     pub fn register_sub_circuit(&mut self, mut sub_circuit: Self) -> usize {
         sub_circuit.inherit_lookup_registry(Arc::clone(&self.lookup_registry));
         let circuit_id = self.sub_circuits.len();

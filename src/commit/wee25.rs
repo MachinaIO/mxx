@@ -269,7 +269,7 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             col_range.end,
             cols
         );
-        let openings = parallel_iter!(col_range)
+        let openings = col_range
             .map(|col_idx| {
                 self.open_recursive(
                     params,
@@ -423,7 +423,7 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         let base = self.verifier_base(false);
         let base_last = self.verifier_base(true);
         let cache: DashMap<(usize, usize), M> = DashMap::new();
-        let cols_vec = parallel_iter!(col_range)
+        let cols_vec = col_range
             .map(|col_idx| self.verifier_recursive(&base, &base_last, cols, col_idx, &cache))
             .collect::<Vec<_>>();
         cols_vec[0].concat_columns(&cols_vec[1..].iter().collect::<Vec<_>>())

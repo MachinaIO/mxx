@@ -15,7 +15,7 @@ use crate::{
 use bigdecimal::BigDecimal;
 use keccak_asm::Keccak256;
 use num_bigint::{BigInt, BigUint};
-use num_traits::{ToPrimitive, Zero};
+use num_traits::Zero;
 use rand::Rng;
 use std::{
     future::Future,

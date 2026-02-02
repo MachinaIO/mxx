@@ -390,7 +390,22 @@ impl<M: PolyMatrix> Wee25Commit<M> {
     pub fn verifier(&self, cols: usize, col_range: Option<Range<usize>>) -> M {
         let col_range = col_range.unwrap_or(0..cols);
         debug_assert!(col_range.start < col_range.end, "column range must be non-empty");
-        debug_assert!(cols.is_power_of_two(), "cols must be a power of two (got {})", cols);
+        let mut cursor = cols;
+        while cursor > self.tree_base {
+            debug_assert!(
+                cursor % self.tree_base == 0,
+                "cols must be a power of tree_base={} (got {})",
+                self.tree_base,
+                cols
+            );
+            cursor /= self.tree_base;
+        }
+        debug_assert_eq!(
+            cursor, self.tree_base,
+            "cols must be a power of tree_base={} (got {})",
+            self.tree_base,
+            cols
+        );
         let log_base_q = self.m_g / self.secret_size;
         let total_cols = cols * log_base_q;
         debug_assert!(

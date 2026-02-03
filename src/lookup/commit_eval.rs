@@ -1,7 +1,7 @@
 use crate::{
     bgg::{encoding::BggEncoding, public_key::BggPublicKey},
     circuit::{PolyCircuit, gate::GateId},
-    commit::wee25::{MsgMatrixStream, Wee25Commit},
+    commit::wee25::{MsgMatrixStream, Wee25Commit, Wee25PublicParams},
     lookup::{PltEvaluator, PublicLut},
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
@@ -20,7 +20,60 @@ use std::{collections::HashMap, marker::PhantomData, path::PathBuf, sync::Arc};
 struct GateState<M: PolyMatrix> {
     gate_id: GateId,
     lut_id: usize,
+    one_pubkey: BggPublicKey<M>,
     input_pubkey: BggPublicKey<M>,
+}
+
+#[derive(Debug, Clone)]
+struct GateStateCollector<M, HS>
+where
+    M: PolyMatrix,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+{
+    hash_key: [u8; 32],
+    gate_states: DashMap<GateId, GateState<M>>,
+    luts: DashMap<usize, PublicLut<M::P>>,
+    _hs: PhantomData<HS>,
+}
+
+impl<M, HS> GateStateCollector<M, HS>
+where
+    M: PolyMatrix,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+{
+    fn new(hash_key: [u8; 32]) -> Self {
+        Self { hash_key, gate_states: DashMap::new(), luts: DashMap::new(), _hs: PhantomData }
+    }
+}
+
+impl<M, HS> PltEvaluator<BggPublicKey<M>> for GateStateCollector<M, HS>
+where
+    M: PolyMatrix,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+{
+    fn public_lookup(
+        &self,
+        params: &<M::P as Poly>::Params,
+        plt: &PublicLut<M::P>,
+        one: &BggPublicKey<M>,
+        input: &BggPublicKey<M>,
+        gate_id: GateId,
+        lut_id: usize,
+    ) -> BggPublicKey<M> {
+        self.luts.entry(lut_id).or_insert_with(|| plt.clone());
+        let row_size = input.matrix.row_size();
+        self.gate_states.insert(
+            gate_id,
+            GateState {
+                gate_id,
+                lut_id,
+                one_pubkey: one.clone(),
+                input_pubkey: input.clone(),
+            },
+        );
+        let a_out = derive_a_out_matrix::<M, HS>(params, row_size, self.hash_key, gate_id);
+        BggPublicKey { matrix: a_out, reveal_plaintext: true }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +85,7 @@ where
     pub hash_key: [u8; 32],
     pub trapdoor_sigma: f64,
     pub wee25_commit: Wee25Commit<M>,
+    pub wee25_public_params: Wee25PublicParams<M>,
     pub b_1: M,
     gate_states: DashMap<GateId, GateState<M>>,
     luts: DashMap<usize, PublicLut<M::P>>,
@@ -51,9 +105,10 @@ where
         hash_key: [u8; 32],
     ) -> Self {
         tracing::debug!("CommitBGGPubKeyPltEvaluator::setup start");
-        let wee25_commit =
-            Wee25Commit::<M>::setup::<US, TS>(params, secret_size, trapdoor_sigma, tree_base);
-        tracing::debug!("Wee25Commit setup done");
+        let wee25_commit = Wee25Commit::<M>::new(params, secret_size, tree_base);
+        let wee25_public_params =
+            wee25_commit.sample_public_params::<US, TS>(params, trapdoor_sigma);
+        tracing::debug!("Wee25PublicParams setup done");
         let hash_sampler = HS::new();
         let b_1 = hash_sampler.sample_hash(
             params,
@@ -67,6 +122,7 @@ where
             hash_key,
             trapdoor_sigma,
             wee25_commit,
+            wee25_public_params,
             b_1,
             gate_states: DashMap::new(),
             luts: DashMap::new(),
@@ -74,6 +130,41 @@ where
         };
         tracing::debug!("CommitBGGPubKeyPltEvaluator::setup done");
         result
+    }
+
+    pub fn from_public_params(
+        params: &<M::P as Poly>::Params,
+        secret_size: usize,
+        trapdoor_sigma: f64,
+        tree_base: usize,
+        hash_key: [u8; 32],
+        wee25_public_params: Wee25PublicParams<M>,
+    ) -> Self {
+        let wee25_commit = Wee25Commit::<M>::new(params, secret_size, tree_base);
+        debug_assert_eq!(
+            wee25_public_params.b.col_size(),
+            wee25_commit.m_b,
+            "wee25 public params column size mismatch"
+        );
+        let hash_sampler = HS::new();
+        let b_1 = hash_sampler.sample_hash(
+            params,
+            hash_key,
+            b"COMMIT_LUT_B1".to_vec(),
+            secret_size,
+            wee25_commit.m_b,
+            DistType::FinRingDist,
+        );
+        Self {
+            hash_key,
+            trapdoor_sigma,
+            wee25_commit,
+            wee25_public_params,
+            b_1,
+            gate_states: DashMap::new(),
+            luts: DashMap::new(),
+            _hs: PhantomData,
+        }
     }
 
     pub fn commit_all_lut_matrices<TS: PolyTrapdoorSampler<M = M> + Send + Sync>(
@@ -94,14 +185,22 @@ where
         let mut gate_states = Vec::with_capacity(gate_ids.len());
         for gate_id in gate_ids {
             if let Some((_, state)) = self.gate_states.remove(&gate_id) {
-                gate_states.push((state.gate_id, state.lut_id, state.input_pubkey));
+                gate_states.push((state.gate_id, state.lut_id, state.one_pubkey, state.input_pubkey));
             }
         }
         tracing::debug!("commit_all_lut_matrices build msg_stream start");
-        let (msg_stream, _, _, _) =
-            self.build_msg_stream_verifier_and_cancelers(params, &luts, &gate_states);
+        let (msg_stream, _, _, _) = build_msg_stream_for_lut_eval::<M, HS>(
+            params,
+            &self.wee25_commit,
+            &self.wee25_public_params,
+            &self.b_1,
+            self.hash_key,
+            &luts,
+            &gate_states,
+        );
         tracing::debug!("commit_all_lut_matrices build msg_stream done");
-        let commit = self.wee25_commit.commit(params, &msg_stream);
+        self.wee25_public_params.write_to_storage(Wee25PublicParams::<M>::default_storage_prefix());
+        let commit = self.wee25_commit.commit(params, &msg_stream, &self.wee25_public_params);
         let target = commit + &self.b_1;
         let trapdoor_sampler = TS::new(params, self.trapdoor_sigma);
         let preimage = trapdoor_sampler.preimage(params, b0_trapdoor, b0_matrix, &target);
@@ -109,96 +208,6 @@ where
         tracing::debug!("commit_all_lut_matrices done");
     }
 
-    fn build_msg_stream_verifier_and_cancelers<'a>(
-        &'a self,
-        params: &'a <M::P as Poly>::Params,
-        luts: &'a HashMap<usize, PublicLut<M::P>>,
-        gate_states: &'a [(GateId, usize, BggPublicKey<M>)],
-    ) -> (MsgMatrixStream<'a, M>, usize, HashMap<GateId, usize>, usize)
-    where
-        M: 'a,
-    {
-        tracing::debug!("build_msg_stream_verifier_and_cancelers start");
-        if gate_states.is_empty() {
-            panic!("no LUT gates found for commit evaluator");
-        }
-        let secret_size = gate_states[0].2.matrix.row_size();
-        let reconst_coeffs = params.reconst_coeffs();
-        let gadget = M::gadget_matrix(params, secret_size);
-        let m_g = self.wee25_commit.m_g;
-        let m_b = self.wee25_commit.m_b;
-        let b_1 = self.b_1.clone();
-        let hash_key = self.hash_key;
-        let tree_base = self.wee25_commit.tree_base;
-        let lut_layout = build_lut_layout_for_eval::<M>(luts, gate_states, tree_base);
-        let padded_len = lut_layout.padded_len;
-        let lut_vector_len = lut_layout.lut_vector_len;
-        let lut_gate_start_ids = lut_layout.lut_gate_start_ids;
-        let gate_ranges = lut_layout.gate_ranges;
-        tracing::debug!(
-            "build_msg_stream_verifier_and_cancelers padded_len={padded_len} lut_vector_len={lut_vector_len}"
-        );
-        let reconst_coeffs = Arc::new(reconst_coeffs);
-        let msg_stream = MsgMatrixStream::new(padded_len, move |range| {
-            let range_start = range.start;
-            let range_end = range.end;
-            let verifier_range =
-                self.wee25_commit.verifier(padded_len, Some(range_start..range_end));
-            (range_start..range_end)
-                .into_par_iter()
-                .map(|global_idx| {
-                    if global_idx >= lut_vector_len {
-                        return M::zero(params, secret_size, m_b);
-                    }
-                    let (start_idx, _end_idx, gate_id, lut_id, input_pubkey) = gate_ranges
-                        .iter()
-                        .find(|(start, end, _, _, _)| global_idx >= *start && global_idx < *end)
-                        .unwrap_or_else(|| panic!("missing LUT range for index {global_idx}"));
-                    let start_idx = *start_idx;
-                    let gate_id = *gate_id;
-                    let lut_id = *lut_id;
-                    let lut_input_index = global_idx - start_idx;
-                    let lut = luts.get(&lut_id).unwrap();
-                    let input = M::P::from_usize_to_constant(params, lut_input_index);
-                    let (idx, y_poly) = lut
-                        .get(params, &input)
-                        .unwrap_or_else(|| panic!("LUT entry {} missing", lut_input_index));
-                    let verifier_idx = start_idx + idx;
-                    let verifier_slice = if verifier_idx >= range_start && verifier_idx < range_end
-                    {
-                        let local_idx = verifier_idx - range_start;
-                        verifier_range.slice_columns(m_b * local_idx, m_b * (local_idx + 1))
-                    } else {
-                        self.wee25_commit
-                            .verifier(padded_len, Some(verifier_idx..(verifier_idx + 1)))
-                    };
-                    let a_out =
-                        derive_a_out_matrix::<M, HS>(params, secret_size, hash_key, gate_id);
-                    let r_g_i = derive_r_g_i_matrix::<M, HS>(
-                        params,
-                        secret_size,
-                        m_b,
-                        hash_key,
-                        gate_id,
-                        idx,
-                    );
-                    let canceler = derive_canceler_matrix::<M>(
-                        params,
-                        &b_1,
-                        &verifier_slice,
-                        &r_g_i,
-                        idx,
-                        reconst_coeffs.as_slice(),
-                    );
-                    let padded = (a_out.clone() - gadget.clone() * y_poly)
-                        .concat_columns(&[&M::zero(params, secret_size, m_b - m_g)]);
-                    padded + &r_g_i - input_pubkey.matrix.clone() * canceler.decompose()
-                })
-                .collect::<Vec<_>>()
-        });
-        tracing::debug!("build_msg_stream_verifier_and_cancelers done");
-        (msg_stream, padded_len, lut_gate_start_ids, lut_vector_len)
-    }
 }
 
 impl<M, HS> PltEvaluator<BggPublicKey<M>> for CommitBGGPubKeyPltEvaluator<M, HS>
@@ -210,7 +219,7 @@ where
         &self,
         params: &<M::P as Poly>::Params,
         plt: &PublicLut<M::P>,
-        _: &BggPublicKey<M>,
+        one: &BggPublicKey<M>,
         input: &BggPublicKey<M>,
         gate_id: GateId,
         lut_id: usize,
@@ -220,8 +229,15 @@ where
         );
         self.luts.entry(lut_id).or_insert_with(|| plt.clone());
         let row_size = input.matrix.row_size();
-        self.gate_states
-            .insert(gate_id, GateState { gate_id, lut_id, input_pubkey: input.clone() });
+        self.gate_states.insert(
+            gate_id,
+            GateState {
+                gate_id,
+                lut_id,
+                one_pubkey: one.clone(),
+                input_pubkey: input.clone(),
+            },
+        );
         let a_out = derive_a_out_matrix::<M, HS>(params, row_size, self.hash_key, gate_id);
         BggPublicKey { matrix: a_out, reveal_plaintext: true }
     }
@@ -234,11 +250,14 @@ where
     M::P: 'static,
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
 {
-    pub commit_pubkey_evaluator: CommitBGGPubKeyPltEvaluator<M, HS>,
+    pub wee25_commit: Wee25Commit<M>,
+    pub wee25_public_params: Wee25PublicParams<M>,
+    pub hash_key: [u8; 32],
+    pub b_1: M,
     pub c_b: M,
     pub c_commit: M,
     pub luts: HashMap<usize, PublicLut<M::P>>,
-    pub gate_states: Vec<(GateId, usize, BggPublicKey<M>)>,
+    pub gate_states: Vec<(GateId, usize, BggPublicKey<M>, BggPublicKey<M>)>,
     pub lut_gate_start_ids: HashMap<GateId, usize>,
     pub reconst_coeffs: Vec<num_bigint::BigUint>,
     _hs: PhantomData<HS>,
@@ -249,9 +268,8 @@ where
     M: PolyMatrix,
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
 {
-    pub fn setup<US: PolyUniformSampler<M = M>, TS: PolyTrapdoorSampler<M = M>>(
+    pub fn setup(
         params: &<M::P as Poly>::Params,
-        trapdoor_sigma: f64,
         tree_base: usize,
         hash_key: [u8; 32],
         circuit: &PolyCircuit<M::P>,
@@ -263,36 +281,50 @@ where
     ) -> Self {
         tracing::debug!("CommitBGGEncodingPltEvaluator::setup start");
         let secret_size = one_pubkey.matrix.row_size();
-        let commit_pubkey_evaluator = CommitBGGPubKeyPltEvaluator::<M, HS>::setup::<US, TS>(
-            params,
-            secret_size,
-            trapdoor_sigma,
-            tree_base,
-            hash_key,
-        );
-        // setup pubkeys for all LUT gates
-        let _ = circuit.eval(params, one_pubkey, input_pubkeys, Some(&commit_pubkey_evaluator));
         let dir = std::path::Path::new(dir_path);
+        let wee25_commit = Wee25Commit::<M>::new(params, secret_size, tree_base);
+        let wee25_public_params = Wee25PublicParams::<M>::read_from_storage(
+            params,
+            dir,
+            Wee25PublicParams::<M>::default_storage_prefix(),
+        )
+        .unwrap_or_else(|| panic!("wee25 public params not found"));
+        let hash_sampler = HS::new();
+        let b_1 = hash_sampler.sample_hash(
+            params,
+            hash_key,
+            b"COMMIT_LUT_B1".to_vec(),
+            secret_size,
+            wee25_commit.m_b,
+            DistType::FinRingDist,
+        );
+
+        let gate_state_collector = GateStateCollector::<M, HS>::new(hash_key);
+        // setup pubkeys for all LUT gates
+        let _ = circuit.eval(params, one_pubkey, input_pubkeys, Some(&gate_state_collector));
         let preimage =
             read_matrix_from_multi_batch::<M>(params, dir, &format!("preimage_of_commit"), 0)
                 .unwrap_or_else(|| panic!("preimage_of_commit not found"));
         let c_commit = c_b0.clone() * preimage;
-        let luts = commit_pubkey_evaluator
+        let luts = gate_state_collector
             .luts
             .iter()
             .map(|entry| (*entry.key(), entry.value().clone()))
             .collect::<HashMap<_, _>>();
-        let gate_states = commit_pubkey_evaluator
+        let gate_states = gate_state_collector
             .gate_states
             .iter()
             .map(|entry| {
                 let state = entry.value();
-                (state.gate_id, state.lut_id, state.input_pubkey.clone())
+                (state.gate_id, state.lut_id, state.one_pubkey.clone(), state.input_pubkey.clone())
             })
             .collect::<Vec<_>>();
         let (lut_gate_start_ids, _lut_vector_len, _) = build_lut_gate_layout(&luts, &gate_states);
         let result = Self {
-            commit_pubkey_evaluator,
+            wee25_commit,
+            wee25_public_params,
+            hash_key,
+            b_1,
             c_b: c_b.clone(),
             c_commit,
             luts,
@@ -331,31 +363,33 @@ where
             panic!("{:?} not found in LUT for gate {}", x.to_const_int(), gate_id)
         });
         let lut_vector_idx = lut_gate_index(&self.lut_gate_start_ids, gate_id, k);
-        let (msg_stream, padded_len, _, _) = self
-            .commit_pubkey_evaluator
-            .build_msg_stream_verifier_and_cancelers(params, &self.luts, &self.gate_states);
-        let opening = self.commit_pubkey_evaluator.wee25_commit.open(
+        let (msg_stream, padded_len, _, _) = build_msg_stream_for_lut_eval::<M, HS>(
+            params,
+            &self.wee25_commit,
+            &self.wee25_public_params,
+            &self.b_1,
+            self.hash_key,
+            &self.luts,
+            &self.gate_states,
+        );
+        let opening = self.wee25_commit.open(
             params,
             &msg_stream,
             Some(lut_vector_idx..(lut_vector_idx + 1)),
+            &self.wee25_public_params,
         );
-        let verifier = self
-            .commit_pubkey_evaluator
-            .wee25_commit
-            .verifier(padded_len, Some(lut_vector_idx..(lut_vector_idx + 1)));
+        let verifier = self.wee25_commit.verifier(
+            padded_len,
+            Some(lut_vector_idx..(lut_vector_idx + 1)),
+            &self.wee25_public_params,
+        );
         let secret_size = input.pubkey.matrix.row_size();
-        let m_b = self.commit_pubkey_evaluator.wee25_commit.m_b;
-        let r_g_i = derive_r_g_i_matrix::<M, HS>(
-            params,
-            secret_size,
-            m_b,
-            self.commit_pubkey_evaluator.hash_key,
-            gate_id,
-            k,
-        );
+        let m_b = self.wee25_commit.m_b;
+        let r_g_i =
+            derive_r_g_i_matrix::<M, HS>(params, secret_size, m_b, self.hash_key, gate_id, k);
         let canceler = derive_canceler_matrix::<M>(
             params,
-            &self.commit_pubkey_evaluator.b_1,
+            &self.b_1,
             &verifier,
             &r_g_i,
             k,
@@ -363,11 +397,11 @@ where
         );
         let c_lut = self.c_commit.clone() * verifier + self.c_b.clone() * opening;
         let c_x = (input.vector.clone() + &one.vector) * canceler.decompose();
-        let c_out = c_lut + c_x;
+        let c_out = (c_lut + c_x).slice_columns(0, self.wee25_commit.m_g);
         let a_out = derive_a_out_matrix::<M, HS>(
             params,
             input.pubkey.matrix.row_size(),
-            self.commit_pubkey_evaluator.hash_key,
+            self.hash_key,
             gate_id,
         );
         BggEncoding {
@@ -378,21 +412,122 @@ where
     }
 }
 
+impl<M, HS> CommitBGGEncodingPltEvaluator<M, HS>
+where
+    M: PolyMatrix,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+{
+}
+
+fn build_msg_stream_for_lut_eval<'a, M, HS>(
+    params: &'a <M::P as Poly>::Params,
+    wee25_commit: &'a Wee25Commit<M>,
+    wee25_public_params: &'a Wee25PublicParams<M>,
+    b_1: &'a M,
+    hash_key: [u8; 32],
+    luts: &'a HashMap<usize, PublicLut<M::P>>,
+    gate_states: &'a [(GateId, usize, BggPublicKey<M>, BggPublicKey<M>)],
+) -> (MsgMatrixStream<'a, M>, usize, HashMap<GateId, usize>, usize)
+where
+    M: PolyMatrix + 'a,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+{
+    tracing::debug!("build_msg_stream_for_lut_eval start");
+    if gate_states.is_empty() {
+        panic!("no LUT gates found for commit evaluator");
+    }
+    let secret_size = gate_states[0].2.matrix.row_size();
+    let reconst_coeffs = params.reconst_coeffs();
+    let gadget = M::gadget_matrix(params, secret_size);
+    let m_g = wee25_commit.m_g;
+    let m_b = wee25_commit.m_b;
+    let b_1 = b_1.clone();
+    let tree_base = wee25_commit.tree_base;
+    let lut_layout = build_lut_layout_for_eval::<M>(luts, gate_states, tree_base);
+    let padded_len = lut_layout.padded_len;
+    let lut_vector_len = lut_layout.lut_vector_len;
+    let lut_gate_start_ids = lut_layout.lut_gate_start_ids;
+    let gate_ranges = lut_layout.gate_ranges;
+    tracing::debug!(
+        "build_msg_stream_for_lut_eval padded_len={padded_len} lut_vector_len={lut_vector_len}"
+    );
+    let reconst_coeffs = Arc::new(reconst_coeffs);
+    let msg_stream = MsgMatrixStream::new(padded_len, move |range| {
+        let range_start = range.start;
+        let range_end = range.end;
+        let verifier_range =
+            wee25_commit.verifier(padded_len, Some(range_start..range_end), wee25_public_params);
+        (range_start..range_end)
+            .into_par_iter()
+            .map(|global_idx| {
+                if global_idx >= lut_vector_len {
+                    return M::zero(params, secret_size, m_b);
+                }
+                let (start_idx, _end_idx, gate_id, lut_id, one_pubkey, input_pubkey) = gate_ranges
+                    .iter()
+                    .find(|(start, end, _, _, _, _)| global_idx >= *start && global_idx < *end)
+                    .unwrap_or_else(|| panic!("missing LUT range for index {global_idx}"));
+                let start_idx = *start_idx;
+                let gate_id = *gate_id;
+                let lut_id = *lut_id;
+                let lut_input_index = global_idx - start_idx;
+                let lut = luts.get(&lut_id).unwrap();
+                let input = M::P::from_usize_to_constant(params, lut_input_index);
+                let (idx, y_poly) = lut
+                    .get(params, &input)
+                    .unwrap_or_else(|| panic!("LUT entry {} missing", lut_input_index));
+                let verifier_idx = start_idx + idx;
+                let verifier_slice = if verifier_idx >= range_start && verifier_idx < range_end {
+                    let local_idx = verifier_idx - range_start;
+                    verifier_range.slice_columns(m_b * local_idx, m_b * (local_idx + 1))
+                } else {
+                    wee25_commit.verifier(
+                        padded_len,
+                        Some(verifier_idx..(verifier_idx + 1)),
+                        wee25_public_params,
+                    )
+                };
+                let a_out = derive_a_out_matrix::<M, HS>(params, secret_size, hash_key, gate_id);
+                let r_g_i =
+                    derive_r_g_i_matrix::<M, HS>(params, secret_size, m_b, hash_key, gate_id, idx);
+                let canceler = derive_canceler_matrix::<M>(
+                    params,
+                    &b_1,
+                    &verifier_slice,
+                    &r_g_i,
+                    idx,
+                    reconst_coeffs.as_slice(),
+                );
+                let padded = (a_out.clone() - gadget.clone() * y_poly)
+                    .concat_columns(&[&M::zero(params, secret_size, m_b - m_g)]);
+                let pubkey_sum = input_pubkey.matrix.clone() + &one_pubkey.matrix;
+                padded + &r_g_i - pubkey_sum * canceler.decompose()
+            })
+            .collect::<Vec<_>>()
+    });
+    tracing::debug!("build_msg_stream_for_lut_eval done");
+    (msg_stream, padded_len, lut_gate_start_ids, lut_vector_len)
+}
+
 fn build_lut_gate_layout<M: PolyMatrix>(
     luts: &HashMap<usize, PublicLut<M::P>>,
-    gate_states: &[(GateId, usize, BggPublicKey<M>)],
-) -> (HashMap<GateId, usize>, usize, Vec<(usize, usize, GateId, usize, BggPublicKey<M>)>) {
+    gate_states: &[(GateId, usize, BggPublicKey<M>, BggPublicKey<M>)],
+) -> (
+    HashMap<GateId, usize>,
+    usize,
+    Vec<(usize, usize, GateId, usize, BggPublicKey<M>, BggPublicKey<M>)>,
+) {
     let mut sorted = gate_states.to_vec();
-    sorted.sort_by_key(|(gate_id, _, _)| *gate_id);
+    sorted.sort_by_key(|(gate_id, _, _, _)| *gate_id);
     let mut start_ids = HashMap::new();
     let mut gate_ranges = Vec::with_capacity(sorted.len());
     let mut cursor = 0usize;
-    for (gate_id, lut_id, input_pubkey) in sorted.into_iter() {
+    for (gate_id, lut_id, one_pubkey, input_pubkey) in sorted.into_iter() {
         let lut = luts.get(&lut_id).unwrap_or_else(|| panic!("missing LUT for lut_id={lut_id}"));
         let start_idx = cursor;
         let end_idx = start_idx + lut.len();
         start_ids.insert(gate_id, start_idx);
-        gate_ranges.push((start_idx, end_idx, gate_id, lut_id, input_pubkey));
+        gate_ranges.push((start_idx, end_idx, gate_id, lut_id, one_pubkey, input_pubkey));
         cursor = end_idx;
     }
     (start_ids, cursor, gate_ranges)
@@ -403,17 +538,17 @@ struct LutLayout<M: PolyMatrix> {
     lut_gate_start_ids: HashMap<GateId, usize>,
     lut_vector_len: usize,
     padded_len: usize,
-    gate_ranges: Vec<(usize, usize, GateId, usize, BggPublicKey<M>)>,
+    gate_ranges: Vec<(usize, usize, GateId, usize, BggPublicKey<M>, BggPublicKey<M>)>,
 }
 
 fn build_lut_layout_for_eval<M: PolyMatrix>(
     luts: &HashMap<usize, PublicLut<M::P>>,
-    gate_states: &[(GateId, usize, BggPublicKey<M>)],
+    gate_states: &[(GateId, usize, BggPublicKey<M>, BggPublicKey<M>)],
     tree_base: usize,
 ) -> LutLayout<M> {
     let (lut_gate_start_ids, lut_vector_len, mut gate_ranges) =
         build_lut_gate_layout::<M>(luts, gate_states);
-    gate_ranges.sort_by_key(|(start_idx, _, _, _, _)| *start_idx);
+    gate_ranges.sort_by_key(|(start_idx, _, _, _, _, _)| *start_idx);
     let padded_len = compute_padded_len(tree_base, lut_vector_len);
     LutLayout { lut_gate_start_ids, lut_vector_len, padded_len, gate_ranges }
 }
@@ -600,23 +735,20 @@ mod tests {
         assert_eq!(result_pubkey.len(), 1);
         let result_pubkey = &result_pubkey[0];
 
-        let c_b = s_vec.clone() * plt_pubkey_evaluator.wee25_commit.b.clone();
+        let c_b = s_vec.clone() * plt_pubkey_evaluator.wee25_public_params.b.clone();
         info!("plt encoding evaluator setup start");
-        let plt_encoding_evaluator = CommitBGGEncodingPltEvaluator::<
-            DCRTPolyMatrix,
-            DCRTPolyHashSampler<Keccak256>,
-        >::setup::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
-            &params,
-            SIGMA,
-            tree_base,
-            key,
-            &circuit,
-            &enc_one.pubkey,
-            std::slice::from_ref(&enc1.pubkey),
-            &c_b0,
-            &c_b,
-            &dir.to_path_buf(),
-        );
+        let plt_encoding_evaluator =
+            CommitBGGEncodingPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup(
+                &params,
+                tree_base,
+                key,
+                &circuit,
+                &enc_one.pubkey,
+                std::slice::from_ref(&enc1.pubkey),
+                &c_b0,
+                &c_b,
+                &dir.to_path_buf(),
+            );
         info!("plt encoding evaluator setup done");
 
         info!("circuit eval encoding start");
@@ -632,7 +764,12 @@ mod tests {
         assert_eq!(result_encoding.pubkey, result_pubkey.clone());
 
         let expected_plaintext = plt.get(&params, &plaintexts[0]).unwrap().1;
-        assert_eq!(result_encoding.plaintext.clone().unwrap(), expected_plaintext);
+        assert_eq!(result_encoding.plaintext.clone().unwrap(), expected_plaintext.clone());
+
+        let expected_vector = s_vec.clone() *
+            (result_encoding.pubkey.matrix.clone() -
+                (DCRTPolyMatrix::gadget_matrix(&params, d) * expected_plaintext));
+        assert_eq!(result_encoding.vector, expected_vector);
     }
 
     #[tokio::test]
@@ -719,23 +856,20 @@ mod tests {
         wait_for_all_writes(dir.to_path_buf()).await.unwrap();
         assert_eq!(result_pubkey.len(), input_size);
 
-        let c_b = s_vec.clone() * plt_pubkey_evaluator.wee25_commit.b.clone();
+        let c_b = s_vec.clone() * plt_pubkey_evaluator.wee25_public_params.b.clone();
         info!("plt encoding evaluator setup start");
-        let plt_encoding_evaluator = CommitBGGEncodingPltEvaluator::<
-            DCRTPolyMatrix,
-            DCRTPolyHashSampler<Keccak256>,
-        >::setup::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
-            &params,
-            SIGMA,
-            tree_base,
-            key,
-            &circuit,
-            &enc_one.pubkey,
-            &input_pubkeys,
-            &c_b0,
-            &c_b,
-            &dir.to_path_buf(),
-        );
+        let plt_encoding_evaluator =
+            CommitBGGEncodingPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup(
+                &params,
+                tree_base,
+                key,
+                &circuit,
+                &enc_one.pubkey,
+                &input_pubkeys,
+                &c_b0,
+                &c_b,
+                &dir.to_path_buf(),
+            );
         info!("plt encoding evaluator setup done");
 
         info!("circuit eval encoding start");
@@ -746,7 +880,12 @@ mod tests {
 
         for (idx, encoding) in result_encoding.iter().enumerate() {
             let expected_plaintext = plt.get(&params, &plaintexts[idx]).unwrap().1;
-            assert_eq!(encoding.plaintext.clone().unwrap(), expected_plaintext);
+            assert_eq!(encoding.plaintext.clone().unwrap(), expected_plaintext.clone());
+
+            let expected_vector = s_vec.clone() *
+                (encoding.pubkey.matrix.clone() -
+                    (DCRTPolyMatrix::gadget_matrix(&params, d) * expected_plaintext));
+            assert_eq!(encoding.vector, expected_vector);
         }
     }
 }

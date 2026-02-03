@@ -215,14 +215,13 @@ async fn test_commit_modp_chain_rounding() {
     info!("commit_all_lut_matrices done");
     wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
 
-    let c_b = s_vec.clone() * plt_pubkey_evaluator.wee25_commit.b.clone();
+    let c_b = s_vec.clone() * plt_pubkey_evaluator.wee25_public_params.b.clone();
     info!("plt encoding evaluator setup start");
     let plt_encoding_evaluator = CommitBGGEncodingPltEvaluator::<
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
-    >::setup::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
+    >::setup(
         &params,
-        trapdoor_sigma,
         TREE_BASE,
         key,
         &circuit,

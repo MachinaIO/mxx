@@ -122,7 +122,7 @@ async fn test_arithmetic_circuit_operations_commit() {
     let secrets = uniform_sampler.sample_uniform(&params, 1, d, DistType::BitDist).get_row(0);
     let s = DCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
     let c_b0 = s.clone() * &b0_matrix;
-    let c_b = s.clone() * pk_evaluator.wee25_commit.b.clone();
+    let c_b = s.clone() * pk_evaluator.wee25_public_params.b.clone();
 
     let bgg_encoding_sampler =
         BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
@@ -131,9 +131,8 @@ async fn test_arithmetic_circuit_operations_commit() {
     let enc_evaluator = CommitBGGEncodingPltEvaluator::<
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
-    >::setup::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
+    >::setup(
         &params,
-        trapdoor_sigma,
         tree_base,
         seed,
         &circuit,

@@ -53,6 +53,7 @@ where
         tracing::debug!("CommitBGGPubKeyPltEvaluator::setup start");
         let wee25_commit =
             Wee25Commit::<M>::setup::<US, TS>(params, secret_size, trapdoor_sigma, tree_base);
+        tracing::debug!("Wee25Commit setup done");
         let hash_sampler = HS::new();
         let b_1 = hash_sampler.sample_hash(
             params,

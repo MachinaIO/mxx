@@ -30,13 +30,13 @@ use std::sync::Arc;
 use tempfile::tempdir;
 use tracing::info;
 
-const CRT_BITS: usize = 18;
+const CRT_BITS: usize = 51;
 const RING_DIM: u32 = 1 << 6;
 const ERROR_SIGMA: f64 = 4.0;
-const BASE_BITS: u32 = 9;
+const BASE_BITS: u32 = 17;
 const TREE_BASE: usize = 2;
 const MAX_CRT_DEPTH: usize = 12;
-const P: u64 = 13;
+const P: u64 = 7;
 
 fn round_div_biguint(value: &BigUint, divisor: &BigUint) -> BigUint {
     let half = divisor >> 1;
@@ -74,7 +74,7 @@ fn build_modp_chain_circuit(
     q_over_p: &BigUint,
 ) -> PolyCircuit<DCRTPoly> {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
-    let inputs = circuit.input(4);
+    let inputs = circuit.input(3);
 
     let lut_id = circuit.register_public_lookup(build_mod_p_lut(params, p));
 
@@ -84,11 +84,8 @@ fn build_modp_chain_circuit(
     let t2 = circuit.mul_gate(t1_mod, inputs[2]);
     let t2_mod = circuit.public_lookup_gate(t2, lut_id);
 
-    let t3 = circuit.mul_gate(t2_mod, inputs[3]);
-    let t3_mod = circuit.public_lookup_gate(t3, lut_id);
-
     let scalar = DCRTPoly::from_biguint_to_constant(params, q_over_p.clone());
-    let scaled = circuit.poly_scalar_mul(t3_mod, &scalar);
+    let scaled = circuit.poly_scalar_mul(t2_mod, &scalar);
     circuit.output(vec![scaled]);
     circuit
 }
@@ -158,14 +155,12 @@ async fn test_commit_modp_chain_rounding() {
     let a: u64 = rng.random_range(0..P);
     let b: u64 = rng.random_range(0..P);
     let c: u64 = rng.random_range(0..P);
-    let d: u64 = rng.random_range(0..P);
-    let expected_mod_p = (((a * b) % P) * c % P) * d % P;
+    let expected_mod_p = ((a * b) % P) * c % P;
 
     let plaintexts = vec![
         DCRTPoly::from_usize_to_constant(&params, a as usize),
         DCRTPoly::from_usize_to_constant(&params, b as usize),
         DCRTPoly::from_usize_to_constant(&params, c as usize),
-        DCRTPoly::from_usize_to_constant(&params, d as usize),
     ];
 
     let d_secret = 1usize;

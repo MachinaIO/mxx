@@ -17,7 +17,8 @@ pub struct Wee25Commit<M: PolyMatrix> {
     pub m_g: usize,
     pub b: M,
     pub w: M,
-    pub t_top: M,
+    pub top_j: M,
+    pub top_j_last: M,
     pub t_bottom: M,
     pub j_2m: M,
     pub j_2m_last: M,
@@ -120,19 +121,6 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             t_ncol,
             DistType::GaussDist { sigma: trapdoor_sigma },
         );
-        let mut t_tops = Vec::with_capacity(pp_size);
-        let gadget = M::gadget_matrix(params, secret_size);
-        for idx in 0..pp_size {
-            let target = {
-                let zeros_before_g = M::zero(params, secret_size, idx * m_g);
-                let zeros_after_g = M::zero(params, secret_size, (pp_size - idx - 1) * m_g);
-                let g_concated = zeros_before_g.concat_columns(&[&gadget, &zeros_after_g]);
-                let wt = w.slice_rows(idx * secret_size, (idx + 1) * secret_size) * &t_bottom;
-                g_concated - wt
-            };
-            t_tops.push(trapdoor_sampler.preimage(params, &trapdoor, &b, &target));
-        }
-        let t_top = t_tops[0].concat_rows(&t_tops[1..].iter().collect::<Vec<_>>());
         let identity_m = M::identity(params, m_g, None);
         let identity_m_vectorized = identity_m.vectorize_columns();
         let l = tree_base * m_b;
@@ -145,8 +133,42 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             let mul2 = mul1 * g_l;
             mul2.decompose()
         };
+        let gadget = M::gadget_matrix(params, secret_size);
+        let t_top_parts: Vec<(M, M)> = parallel_iter!(0..pp_size)
+            .map(|idx| {
+                let target = {
+                    let zeros_before_g = M::zero(params, secret_size, idx * m_g);
+                    let zeros_after_g = M::zero(params, secret_size, (pp_size - idx - 1) * m_g);
+                    let g_concated = zeros_before_g.concat_columns(&[&gadget, &zeros_after_g]);
+                    let wt = w.slice_rows(idx * secret_size, (idx + 1) * secret_size) * &t_bottom;
+                    g_concated - wt
+                };
+                let local_sampler = TS::new(params, trapdoor_sigma);
+                let t_top_block = local_sampler.preimage(params, &trapdoor, &b, &target);
+                let top_j_block = t_top_block.clone() * &j_2m;
+                let top_j_last_block = t_top_block * &j_2m_last;
+                (top_j_block, top_j_last_block)
+            })
+            .collect::<Vec<_>>();
+        let (top_j_parts, top_j_last_parts): (Vec<M>, Vec<M>) = t_top_parts.into_iter().unzip();
+        let top_j_refs = top_j_parts.iter().collect::<Vec<_>>();
+        let top_j = top_j_parts[0].concat_rows(&top_j_refs[1..]);
+        let top_j_last_refs = top_j_last_parts.iter().collect::<Vec<_>>();
+        let top_j_last = top_j_last_parts[0].concat_rows(&top_j_last_refs[1..]);
 
-        Self { secret_size, tree_base, m_b, m_g, b, w, t_top, t_bottom, j_2m, j_2m_last }
+        Self {
+            secret_size,
+            tree_base,
+            m_b,
+            m_g,
+            b,
+            w,
+            top_j,
+            top_j_last,
+            t_bottom,
+            j_2m,
+            j_2m_last,
+        }
     }
 
     pub fn commit(
@@ -255,8 +277,6 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         self.assert_stream_len(msg_stream.len());
         let v_base = self.verifier_base(false);
         let v_base_last = self.verifier_base(true);
-        let top_j = self.t_top.clone() * &self.j_2m;
-        let top_j_last = self.t_top.clone() * &self.j_2m_last;
         let commit_cache: DashMap<(usize, usize), M> = DashMap::new();
         let z_prime_cache: DashMap<(usize, usize, usize), M> = DashMap::new();
         let verifier_cache: DashMap<(usize, usize), M> = DashMap::new();
@@ -277,8 +297,8 @@ impl<M: PolyMatrix> Wee25Commit<M> {
                     col_idx,
                     &v_base,
                     &v_base_last,
-                    &top_j,
-                    &top_j_last,
+                    &self.top_j,
+                    &self.top_j_last,
                     &commit_cache,
                     &z_prime_cache,
                     &verifier_cache,

@@ -360,7 +360,7 @@ impl PltEvaluator<ErrorNorm> for NormPltCommitEvaluator {
         let m_g = ctx.m_g;
         let matrix_norm =
             &self.lut_term + &input.matrix_norm * PolyMatrixNorm::gadget_decomposed(ctx, m_b);
-        info!("matrix_norm norm bits {}", bigdecimal_bits_ceil(&matrix_norm.poly_norm.norm));
+        // info!("matrix_norm norm bits {}", bigdecimal_bits_ceil(&matrix_norm.poly_norm.norm));
         let (matrix_norm, _) = matrix_norm.split_cols(m_g);
         ErrorNorm { matrix_norm, plaintext_norm }
     }
@@ -378,8 +378,8 @@ pub fn compute_preimage_norm(
     let m_g_sqrt = BigDecimal::from(m_g).sqrt().expect("sqrt(m_g) failed");
     let term = ring_dim_sqrt.clone() * m_g_sqrt + two_sqrt * ring_dim_sqrt + c_1;
     let preimage_norm = c_0 * 6 * sigma.clone() * ((base + 1) * sigma) * term;
-    let preimage_norm_bits = bigdecimal_bits_ceil(&preimage_norm);
-    info!("{}", format!("preimage norm bits {}", preimage_norm_bits));
+    // let preimage_norm_bits = bigdecimal_bits_ceil(&preimage_norm);
+    // info!("{}", format!("preimage norm bits {}", preimage_norm_bits));
     preimage_norm
 }
 

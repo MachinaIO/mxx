@@ -850,6 +850,22 @@ impl<P: Poly> PolyCircuit<P> {
         self.lookup_registry.register(public_lookup)
     }
 
+    pub fn lut_vector_len_with_subcircuits(&self) -> usize {
+        let mut total = 0usize;
+        for gate in self.gates.values() {
+            if let PolyGateType::PubLut { lut_id } = gate.gate_type {
+                let lookup =
+                    self.lookup_registry.lookups.get(&lut_id).expect("lookup table missing");
+                total += lookup.len();
+            }
+        }
+        for call in self.sub_circuit_calls.values() {
+            let sub = self.sub_circuits.get(&call.sub_circuit_id).expect("sub-circuit not found");
+            total += sub.lut_vector_len_with_subcircuits();
+        }
+        total
+    }
+
     pub fn register_sub_circuit(&mut self, mut sub_circuit: Self) -> usize {
         sub_circuit.inherit_lookup_registry(Arc::clone(&self.lookup_registry));
         let circuit_id = self.sub_circuits.len();

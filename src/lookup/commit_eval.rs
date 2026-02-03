@@ -129,16 +129,14 @@ where
         let b_1 = self.b_1.clone();
         let hash_key = self.hash_key;
         let tree_base = self.wee25_commit.tree_base;
-        let (lut_gate_start_ids, lut_vector_len, mut gate_ranges) =
-            build_lut_gate_layout(luts, gate_states);
-        let mut padded_len = tree_base;
-        while padded_len < lut_vector_len {
-            padded_len *= tree_base;
-        }
+        let lut_layout = build_lut_layout_for_eval::<M>(luts, gate_states, tree_base);
+        let padded_len = lut_layout.padded_len;
+        let lut_vector_len = lut_layout.lut_vector_len;
+        let lut_gate_start_ids = lut_layout.lut_gate_start_ids;
+        let gate_ranges = lut_layout.gate_ranges;
         tracing::debug!(
             "build_msg_stream_verifier_and_cancelers padded_len={padded_len} lut_vector_len={lut_vector_len}"
         );
-        gate_ranges.sort_by_key(|(start_idx, _, _, _, _)| *start_idx);
         let reconst_coeffs = Arc::new(reconst_coeffs);
         let msg_stream = MsgMatrixStream::new(padded_len, move |range| {
             let range_start = range.start;
@@ -397,6 +395,34 @@ fn build_lut_gate_layout<M: PolyMatrix>(
         cursor = end_idx;
     }
     (start_ids, cursor, gate_ranges)
+}
+
+#[derive(Debug)]
+struct LutLayout<M: PolyMatrix> {
+    lut_gate_start_ids: HashMap<GateId, usize>,
+    lut_vector_len: usize,
+    padded_len: usize,
+    gate_ranges: Vec<(usize, usize, GateId, usize, BggPublicKey<M>)>,
+}
+
+fn build_lut_layout_for_eval<M: PolyMatrix>(
+    luts: &HashMap<usize, PublicLut<M::P>>,
+    gate_states: &[(GateId, usize, BggPublicKey<M>)],
+    tree_base: usize,
+) -> LutLayout<M> {
+    let (lut_gate_start_ids, lut_vector_len, mut gate_ranges) =
+        build_lut_gate_layout::<M>(luts, gate_states);
+    gate_ranges.sort_by_key(|(start_idx, _, _, _, _)| *start_idx);
+    let padded_len = compute_padded_len(tree_base, lut_vector_len);
+    LutLayout { lut_gate_start_ids, lut_vector_len, padded_len, gate_ranges }
+}
+
+pub(crate) fn compute_padded_len(tree_base: usize, lut_vector_len: usize) -> usize {
+    let mut padded_len = tree_base;
+    while padded_len < lut_vector_len {
+        padded_len *= tree_base;
+    }
+    padded_len
 }
 
 fn lut_gate_index(

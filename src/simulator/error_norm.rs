@@ -336,7 +336,9 @@ impl NormPltCommitEvaluator {
         };
 
         let init_error = PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_b, error_sigma * 6, None);
-        let lut_term = &init_error * verifier_norm + init_error * opening_norm;
+        let preimage =
+            PolyMatrixNorm::new(ctx.clone(), ctx.m_b, verifier_norm.nrow, preimage_norm, None);
+        let lut_term = &init_error * preimage * verifier_norm + init_error * opening_norm;
         info!("lut_term norm bits {}", bigdecimal_bits_ceil(&lut_term.poly_norm.norm));
         Self { lut_term }
     }

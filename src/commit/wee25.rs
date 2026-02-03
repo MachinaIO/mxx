@@ -98,15 +98,7 @@ impl<'a, M: PolyMatrix + 'a> MsgMatrixStream<'a, M> {
 }
 
 impl<M: PolyMatrix> Wee25PublicParams<M> {
-    pub fn new(
-        b: M,
-        w: M,
-        top_j: M,
-        top_j_last: M,
-        t_bottom: M,
-        j_2m: M,
-        j_2m_last: M,
-    ) -> Self {
+    pub fn new(b: M, w: M, top_j: M, top_j_last: M, t_bottom: M, j_2m: M, j_2m_last: M) -> Self {
         Self { b, w, top_j, top_j_last, t_bottom, j_2m, j_2m_last }
     }
 
@@ -155,22 +147,13 @@ impl<M: PolyMatrix> Wee25PublicParams<M> {
         let w = read_matrix_from_multi_batch::<M>(params, dir, &format!("{id_prefix}_w"), 0)?;
         let top_j =
             read_matrix_from_multi_batch::<M>(params, dir, &format!("{id_prefix}_top_j"), 0)?;
-        let top_j_last = read_matrix_from_multi_batch::<M>(
-            params,
-            dir,
-            &format!("{id_prefix}_top_j_last"),
-            0,
-        )?;
+        let top_j_last =
+            read_matrix_from_multi_batch::<M>(params, dir, &format!("{id_prefix}_top_j_last"), 0)?;
         let t_bottom =
             read_matrix_from_multi_batch::<M>(params, dir, &format!("{id_prefix}_t_bottom"), 0)?;
-        let j_2m =
-            read_matrix_from_multi_batch::<M>(params, dir, &format!("{id_prefix}_j_2m"), 0)?;
-        let j_2m_last = read_matrix_from_multi_batch::<M>(
-            params,
-            dir,
-            &format!("{id_prefix}_j_2m_last"),
-            0,
-        )?;
+        let j_2m = read_matrix_from_multi_batch::<M>(params, dir, &format!("{id_prefix}_j_2m"), 0)?;
+        let j_2m_last =
+            read_matrix_from_multi_batch::<M>(params, dir, &format!("{id_prefix}_j_2m_last"), 0)?;
         Some(Self { b, w, top_j, top_j_last, t_bottom, j_2m, j_2m_last })
     }
 
@@ -180,11 +163,7 @@ impl<M: PolyMatrix> Wee25PublicParams<M> {
 }
 
 impl<M: PolyMatrix> Wee25Commit<M> {
-    pub fn new(
-        params: &<M::P as Poly>::Params,
-        secret_size: usize,
-        tree_base: usize,
-    ) -> Self {
+    pub fn new(params: &<M::P as Poly>::Params, secret_size: usize, tree_base: usize) -> Self {
         debug_assert!(tree_base >= 2, "tree_base must be at least 2");
         let log_base_q = params.modulus_digits();
         let m_g = secret_size * log_base_q;
@@ -247,6 +226,7 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             mul2.decompose()
         };
         let gadget = M::gadget_matrix(params, secret_size);
+        let t_top_parts_start = std::time::Instant::now();
         let t_top_parts: Vec<(M, M)> = parallel_iter!(0..pp_size)
             .map(|idx| {
                 let target = {
@@ -263,6 +243,10 @@ impl<M: PolyMatrix> Wee25Commit<M> {
                 (top_j_block, top_j_last_block)
             })
             .collect();
+        tracing::info!(
+            "Wee25Commit::sample_public_params t_top_parts elapsed_s={}",
+            t_top_parts_start.elapsed().as_secs()
+        );
         let (top_j_parts, top_j_last_parts): (Vec<M>, Vec<M>) = t_top_parts.into_iter().unzip();
         let top_j_refs = top_j_parts.iter().collect::<Vec<_>>();
         let top_j = top_j_parts[0].concat_rows(&top_j_refs[1..]);
@@ -676,16 +660,15 @@ mod tests {
 
         let start = Instant::now();
         let commit_params = Wee25Commit::<DCRTPolyMatrix>::new(&params, secret_size, tree_base);
-        let public_params = commit_params.sample_public_params::<
-            DCRTPolyUniformSampler,
-            DCRTPolyTrapdoorSampler,
-        >(&params, SIGMA);
+        let public_params = commit_params
+            .sample_public_params::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
+                &params, SIGMA,
+            );
         info!("commit params generated in {:?}", start.elapsed());
 
-        let msg_blocks =
-            (0..cols)
-                .map(|_| DCRTPolyMatrix::zero(&params, secret_size, commit_params.m_b))
-                .collect::<Vec<_>>();
+        let msg_blocks = (0..cols)
+            .map(|_| DCRTPolyMatrix::zero(&params, secret_size, commit_params.m_b))
+            .collect::<Vec<_>>();
         let msg_matrix = concat_blocks(&msg_blocks);
         let msg_stream = MsgMatrixStream::from_blocks(msg_blocks);
         let start = Instant::now();
@@ -712,10 +695,10 @@ mod tests {
 
         let start = Instant::now();
         let commit_params = Wee25Commit::<DCRTPolyMatrix>::new(&params, secret_size, tree_base);
-        let public_params = commit_params.sample_public_params::<
-            DCRTPolyUniformSampler,
-            DCRTPolyTrapdoorSampler,
-        >(&params, SIGMA);
+        let public_params = commit_params
+            .sample_public_params::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
+                &params, SIGMA,
+            );
         info!("commit params generated in {:?}", start.elapsed());
 
         let uniform_sampler = DCRTPolyUniformSampler::new();
@@ -755,10 +738,10 @@ mod tests {
 
         let start = Instant::now();
         let commit_params = Wee25Commit::<DCRTPolyMatrix>::new(&params, secret_size, tree_base);
-        let public_params = commit_params.sample_public_params::<
-            DCRTPolyUniformSampler,
-            DCRTPolyTrapdoorSampler,
-        >(&params, SIGMA);
+        let public_params = commit_params
+            .sample_public_params::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
+                &params, SIGMA,
+            );
         info!("commit params generated in {:?}", start.elapsed());
 
         let uniform_sampler = DCRTPolyUniformSampler::new();
@@ -809,10 +792,10 @@ mod tests {
 
         let start = Instant::now();
         let commit_params = Wee25Commit::<DCRTPolyMatrix>::new(&params, secret_size, tree_base);
-        let public_params = commit_params.sample_public_params::<
-            DCRTPolyUniformSampler,
-            DCRTPolyTrapdoorSampler,
-        >(&params, SIGMA);
+        let public_params = commit_params
+            .sample_public_params::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
+                &params, SIGMA,
+            );
         info!("commit params generated in {:?}", start.elapsed());
 
         let uniform_sampler = DCRTPolyUniformSampler::new();
@@ -835,7 +818,8 @@ mod tests {
 
         let col_range = 1..3;
         let start = Instant::now();
-        let opening = commit_params.open(&params, &msg_stream, Some(col_range.clone()), &public_params);
+        let opening =
+            commit_params.open(&params, &msg_stream, Some(col_range.clone()), &public_params);
         info!("opening generated in {:?}", start.elapsed());
 
         assert!(commit_params.verify(

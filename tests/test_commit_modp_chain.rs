@@ -31,7 +31,7 @@ use tempfile::tempdir;
 use tracing::info;
 
 const CRT_BITS: usize = 51;
-const RING_DIM: u32 = 1 << 6;
+const RING_DIM: u32 = 1 << 4;
 const ERROR_SIGMA: f64 = 4.0;
 const BASE_BITS: u32 = 17;
 const TREE_BASE: usize = 2;
@@ -217,20 +217,18 @@ async fn test_commit_modp_chain_rounding() {
 
     let c_b = s_vec.clone() * plt_pubkey_evaluator.wee25_public_params.b.clone();
     info!("plt encoding evaluator setup start");
-    let plt_encoding_evaluator = CommitBGGEncodingPltEvaluator::<
-        DCRTPolyMatrix,
-        DCRTPolyHashSampler<Keccak256>,
-    >::setup(
-        &params,
-        TREE_BASE,
-        key,
-        &circuit,
-        &enc_one.pubkey,
-        &input_pubkeys,
-        &c_b0,
-        &c_b,
-        &tmp_dir.path().to_path_buf(),
-    );
+    let plt_encoding_evaluator =
+        CommitBGGEncodingPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup(
+            &params,
+            TREE_BASE,
+            key,
+            &circuit,
+            &enc_one.pubkey,
+            &input_pubkeys,
+            &c_b0,
+            &c_b,
+            &tmp_dir.path().to_path_buf(),
+        );
     info!("plt encoding evaluator setup done");
 
     info!("circuit eval encoding start");

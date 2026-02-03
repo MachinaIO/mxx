@@ -64,12 +64,7 @@ where
         let row_size = input.matrix.row_size();
         self.gate_states.insert(
             gate_id,
-            GateState {
-                gate_id,
-                lut_id,
-                one_pubkey: one.clone(),
-                input_pubkey: input.clone(),
-            },
+            GateState { gate_id, lut_id, one_pubkey: one.clone(), input_pubkey: input.clone() },
         );
         let a_out = derive_a_out_matrix::<M, HS>(params, row_size, self.hash_key, gate_id);
         BggPublicKey { matrix: a_out, reveal_plaintext: true }
@@ -185,7 +180,12 @@ where
         let mut gate_states = Vec::with_capacity(gate_ids.len());
         for gate_id in gate_ids {
             if let Some((_, state)) = self.gate_states.remove(&gate_id) {
-                gate_states.push((state.gate_id, state.lut_id, state.one_pubkey, state.input_pubkey));
+                gate_states.push((
+                    state.gate_id,
+                    state.lut_id,
+                    state.one_pubkey,
+                    state.input_pubkey,
+                ));
             }
         }
         tracing::debug!("commit_all_lut_matrices build msg_stream start");
@@ -207,7 +207,6 @@ where
         add_lookup_buffer(get_lookup_buffer(vec![(0, preimage)], &format!("preimage_of_commit")));
         tracing::debug!("commit_all_lut_matrices done");
     }
-
 }
 
 impl<M, HS> PltEvaluator<BggPublicKey<M>> for CommitBGGPubKeyPltEvaluator<M, HS>
@@ -231,12 +230,7 @@ where
         let row_size = input.matrix.row_size();
         self.gate_states.insert(
             gate_id,
-            GateState {
-                gate_id,
-                lut_id,
-                one_pubkey: one.clone(),
-                input_pubkey: input.clone(),
-            },
+            GateState { gate_id, lut_id, one_pubkey: one.clone(), input_pubkey: input.clone() },
         );
         let a_out = derive_a_out_matrix::<M, HS>(params, row_size, self.hash_key, gate_id);
         BggPublicKey { matrix: a_out, reveal_plaintext: true }
@@ -498,8 +492,11 @@ where
                     idx,
                     reconst_coeffs.as_slice(),
                 );
-                let padded = (a_out.clone() - gadget.clone() * y_poly)
-                    .concat_columns(&[&M::zero(params, secret_size, m_b - m_g)]);
+                let padded = (a_out.clone() - gadget.clone() * y_poly).concat_columns(&[&M::zero(
+                    params,
+                    secret_size,
+                    m_b - m_g,
+                )]);
                 let pubkey_sum = input_pubkey.matrix.clone() + &one_pubkey.matrix;
                 padded + &r_g_i - pubkey_sum * canceler.decompose()
             })

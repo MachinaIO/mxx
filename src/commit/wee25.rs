@@ -363,55 +363,96 @@ where
         tracing::debug!("Wee25Commit::sample_public_params completed t_block sampling");
 
         // Reverse the loop order: outer over j_2m columns (idx), inner over t_block/j_2m rows.
-        let top_j_parts: Vec<(Vec<u8>, Vec<u8>)> = (0..pp_size)
-            .into_par_iter()
-            .map(|idx| {
-                let mut tag = Vec::with_capacity(b"wee25_w_block_".len() + 8);
-                tag.extend_from_slice(b"wee25_w_block_");
-                tag.extend_from_slice(&idx.to_le_bytes());
-                let w_block = hash_sampler.sample_hash(
-                    params,
-                    hash_key,
-                    tag,
-                    secret_size,
-                    m_b,
-                    DistType::FinRingDist,
-                );
-                let mut top_j_acc = zero_top_j.clone();
-                let mut top_j_last_acc = zero_top_j_last.clone();
-                for block_idx in 0..pp_size {
-                    let t_block = M::from_compact_bytes(params, &t_block_bytes[block_idx]);
-                    let block_group = block_idx / m_g;
-                    let block_in_group = block_idx % m_g;
-                    let unit_row = M::unit_row_vector(params, l, block_group);
-                    let j_2m_block = build_j_2m_block(block_idx, block_group);
-                    let wt = w_block.clone() * &t_block;
-                    let target_block = if idx == block_idx { gadget.clone() - &wt } else { -wt };
-                    let local_sampler = TS::new(params, trapdoor_sigma);
-                    let t_top_piece = local_sampler.preimage(params, &trapdoor, &b, &target_block);
-                    let contrib_j = t_top_piece.clone() * &j_2m_block;
-                    let t_top_col = t_top_piece.slice_columns(block_in_group, block_in_group + 1);
-                    let contrib_j_last = t_top_col * &unit_row;
-                    top_j_acc = top_j_acc + contrib_j;
-                    top_j_last_acc = top_j_last_acc + contrib_j_last;
-                }
-                debug_assert_eq!(
-                    top_j_acc.row_size(),
-                    m_b,
-                    "top_j_acc row_size {} must equal m_b {}",
-                    top_j_acc.row_size(),
-                    m_b
-                );
-                debug_assert_eq!(
-                    top_j_last_acc.row_size(),
-                    m_b,
-                    "top_j_last_acc row_size {} must equal m_b {}",
-                    top_j_last_acc.row_size(),
-                    m_b
-                );
-                (top_j_acc.to_compact_bytes(), top_j_last_acc.to_compact_bytes())
-            })
-            .collect();
+        let top_j_batch = std::env::var("WEE25_TOPJ_PARALLEL_BATCH")
+            .ok()
+            .and_then(|val| val.parse::<usize>().ok())
+            .filter(|&val| val > 0)
+            .unwrap_or(5);
+        let mut top_j_parts = Vec::with_capacity(pp_size);
+        for chunk_start in (0..pp_size).step_by(top_j_batch) {
+            let chunk_end = (chunk_start + top_j_batch).min(pp_size);
+            tracing::debug!(
+                "Wee25Commit::sample_public_params top_j_parts processing idx {}..{} of {}",
+                chunk_start,
+                chunk_end,
+                pp_size
+            );
+            let chunk_parts = (chunk_start..chunk_end)
+                .into_par_iter()
+                .map(|idx| {
+                    tracing::debug!(
+                        "Wee25Commit::sample_public_params top_j_parts idx={}/{}",
+                        idx,
+                        pp_size
+                    );
+                    let mut tag = Vec::with_capacity(b"wee25_w_block_".len() + 8);
+                    tag.extend_from_slice(b"wee25_w_block_");
+                    tag.extend_from_slice(&idx.to_le_bytes());
+                    let w_block = hash_sampler.sample_hash(
+                        params,
+                        hash_key,
+                        tag,
+                        secret_size,
+                        m_b,
+                        DistType::FinRingDist,
+                    );
+                    let mut top_j_acc = zero_top_j.clone();
+                    let mut top_j_last_acc = zero_top_j_last.clone();
+                    for block_idx in 0..pp_size {
+                        if block_idx % 100 == 0 {
+                            tracing::debug!(
+                                "Wee25Commit::sample_public_params top_j_parts idx={}/{} block_idx={}/{}",
+                                idx,
+                                pp_size,
+                                block_idx,
+                                pp_size
+                            );
+                        }
+                        let t_block = M::from_compact_bytes(params, &t_block_bytes[block_idx]);
+                        let block_group = block_idx / m_g;
+                        let block_in_group = block_idx % m_g;
+                        let unit_row = M::unit_row_vector(params, l, block_group);
+                        let j_2m_block = build_j_2m_block(block_idx, block_group);
+                        let wt = w_block.clone() * &t_block;
+                        let target_block = if idx == block_idx { gadget.clone() - &wt } else { -wt };
+                        let local_sampler = TS::new(params, trapdoor_sigma);
+                        let t_top_piece =
+                            local_sampler.preimage(params, &trapdoor, &b, &target_block);
+                        let contrib_j = t_top_piece.clone() * &j_2m_block;
+                        let t_top_col =
+                            t_top_piece.slice_columns(block_in_group, block_in_group + 1);
+                        let contrib_j_last = t_top_col * &unit_row;
+                        top_j_acc = top_j_acc + contrib_j;
+                        top_j_last_acc = top_j_last_acc + contrib_j_last;
+                    }
+                    debug_assert_eq!(
+                        top_j_acc.row_size(),
+                        m_b,
+                        "top_j_acc row_size {} must equal m_b {}",
+                        top_j_acc.row_size(),
+                        m_b
+                    );
+                    debug_assert_eq!(
+                        top_j_last_acc.row_size(),
+                        m_b,
+                        "top_j_last_acc row_size {} must equal m_b {}",
+                        top_j_last_acc.row_size(),
+                        m_b
+                    );
+                    tracing::debug!(
+                        "Wee25Commit::sample_public_params top_j_parts idx={}/{} done",
+                        idx,
+                        pp_size
+                    );
+                    (idx, top_j_acc.to_compact_bytes(), top_j_last_acc.to_compact_bytes())
+                })
+                .collect::<Vec<_>>();
+            let mut chunk_parts = chunk_parts;
+            chunk_parts.sort_by_key(|(idx, _, _)| *idx);
+            for (_, top_j, top_j_last) in chunk_parts {
+                top_j_parts.push((top_j, top_j_last));
+            }
+        }
         tracing::info!(
             "Wee25Commit::sample_public_params t_top_parts elapsed_s={}",
             t_top_parts_start.elapsed().as_secs()

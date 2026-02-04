@@ -6,12 +6,12 @@ use mxx::{
         sampler::{BGGEncodingSampler, BGGPublicKeySampler},
     },
     circuit::PolyCircuit,
+    commit::wee25::{Wee25Commit, Wee25PublicParams},
     element::PolyElem,
     lookup::{
         PublicLut,
         commit_eval::{CommitBGGEncodingPltEvaluator, CommitBGGPubKeyPltEvaluator},
     },
-    commit::wee25::{Wee25Commit, Wee25PublicParams},
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
@@ -202,19 +202,12 @@ async fn test_commit_modp_chain_rounding() {
         TREE_BASE,
         trapdoor_sigma,
     );
-    wee25_commit.sample_public_params::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
-        &params,
-        key,
-        dir,
-    );
+    wee25_commit
+        .sample_public_params::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(&params, key, dir);
     wait_for_all_writes(dir.to_path_buf()).await.unwrap();
-    let wee25_public_params = Wee25PublicParams::<DCRTPolyMatrix>::read_from_storage(
-        &params,
-        dir,
-        &wee25_commit,
-        key,
-    )
-    .expect("wee25 public params not found");
+    let wee25_public_params =
+        Wee25PublicParams::<DCRTPolyMatrix>::read_from_storage(&params, dir, &wee25_commit, key)
+            .expect("wee25 public params not found");
     info!("wee25 public params sampling done");
 
     info!("plt pubkey evaluator setup start");

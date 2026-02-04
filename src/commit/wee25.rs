@@ -173,16 +173,19 @@ impl<M: PolyMatrix> Wee25PublicParams<M> {
             let chunk_prefix = format!("{id_prefix}_top_j_part_{chunk_start}");
             let first = read_matrix_from_multi_batch::<M>(params, dir, &chunk_prefix, chunk_start);
             let chunk_len = chunk_end - chunk_start;
-            let first_last =
-                read_matrix_from_multi_batch::<M>(params, dir, &chunk_prefix, chunk_start + chunk_len);
+            let first_last = read_matrix_from_multi_batch::<M>(
+                params,
+                dir,
+                &chunk_prefix,
+                chunk_start + chunk_len,
+            );
             if first.is_none() || first_last.is_none() {
                 break;
             }
             for offset in 0..chunk_len {
                 let top_idx = chunk_start + offset;
                 let last_idx = chunk_start + chunk_len + offset;
-                let part =
-                    read_matrix_from_multi_batch::<M>(params, dir, &chunk_prefix, top_idx)?;
+                let part = read_matrix_from_multi_batch::<M>(params, dir, &chunk_prefix, top_idx)?;
                 let part_last =
                     read_matrix_from_multi_batch::<M>(params, dir, &chunk_prefix, last_idx)?;
                 top_j_parts.push(part.to_compact_bytes());
@@ -190,8 +193,7 @@ impl<M: PolyMatrix> Wee25PublicParams<M> {
             }
         }
         let t_bottom_prefix = format!("{id_prefix}_t_bottom_j_2m");
-        let t_bottom_j_2m =
-            read_matrix_from_multi_batch::<M>(params, dir, &t_bottom_prefix, 0)?;
+        let t_bottom_j_2m = read_matrix_from_multi_batch::<M>(params, dir, &t_bottom_prefix, 0)?;
         let t_bottom_j_2m_last =
             read_matrix_from_multi_batch::<M>(params, dir, &t_bottom_prefix, 1)?;
         if top_j_parts.len() != pp_size || top_j_last_parts.len() != pp_size {
@@ -517,10 +519,18 @@ where
             for offset in 0..chunk_len {
                 let top_idx = chunk_start + offset;
                 let last_idx = chunk_start + chunk_len + offset;
-                let part =
-                    read_matrix_from_multi_batch::<M>(params, checkpoint_dir, &chunk_prefix, top_idx);
-                let part_last =
-                    read_matrix_from_multi_batch::<M>(params, checkpoint_dir, &chunk_prefix, last_idx);
+                let part = read_matrix_from_multi_batch::<M>(
+                    params,
+                    checkpoint_dir,
+                    &chunk_prefix,
+                    top_idx,
+                );
+                let part_last = read_matrix_from_multi_batch::<M>(
+                    params,
+                    checkpoint_dir,
+                    &chunk_prefix,
+                    last_idx,
+                );
                 match (part, part_last) {
                     (Some(_), Some(_)) => {}
                     _ => {

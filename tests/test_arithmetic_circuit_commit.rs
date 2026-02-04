@@ -2,12 +2,12 @@ use keccak_asm::Keccak256;
 use mxx::{
     bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
     circuit::PolyCircuit,
+    commit::wee25::{Wee25Commit, Wee25PublicParams},
     gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly},
     lookup::{
         commit_eval::{CommitBGGEncodingPltEvaluator, CommitBGGPubKeyPltEvaluator},
         poly::PolyPltEvaluator,
     },
-    commit::wee25::{Wee25Commit, Wee25PublicParams},
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     poly::{
         Poly, PolyParams,

@@ -92,7 +92,7 @@ where
     M: PolyMatrix,
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
 {
-    pub fn setup<US: PolyUniformSampler<M = M>, TS: PolyTrapdoorSampler<M = M>>(
+    pub fn setup<US: PolyUniformSampler<M = M> + Send + Sync, TS: PolyTrapdoorSampler<M = M>>(
         params: &<M::P as Poly>::Params,
         secret_size: usize,
         trapdoor_sigma: f64,

@@ -30,9 +30,8 @@ pub struct Wee25PublicParams<M: PolyMatrix> {
     pub w: M,
     pub top_j: M,
     pub top_j_last: M,
-    pub t_bottom: M,
-    pub j_2m: M,
-    pub j_2m_last: M,
+    pub t_bottom_j_2m: M,
+    pub t_bottom_j_2m_last: M,
 }
 
 #[derive(Clone)]
@@ -98,8 +97,15 @@ impl<'a, M: PolyMatrix + 'a> MsgMatrixStream<'a, M> {
 }
 
 impl<M: PolyMatrix> Wee25PublicParams<M> {
-    pub fn new(b: M, w: M, top_j: M, top_j_last: M, t_bottom: M, j_2m: M, j_2m_last: M) -> Self {
-        Self { b, w, top_j, top_j_last, t_bottom, j_2m, j_2m_last }
+    pub fn new(
+        b: M,
+        w: M,
+        top_j: M,
+        top_j_last: M,
+        t_bottom_j_2m: M,
+        t_bottom_j_2m_last: M,
+    ) -> Self {
+        Self { b, w, top_j, top_j_last, t_bottom_j_2m, t_bottom_j_2m_last }
     }
 
     pub fn write_to_storage(&self, id_prefix: &str) -> bool
@@ -124,16 +130,12 @@ impl<M: PolyMatrix> Wee25PublicParams<M> {
             &format!("{id_prefix}_top_j_last"),
         ));
         ok &= add_lookup_buffer(get_lookup_buffer(
-            vec![(0, self.t_bottom.clone())],
-            &format!("{id_prefix}_t_bottom"),
+            vec![(0, self.t_bottom_j_2m.clone())],
+            &format!("{id_prefix}_t_bottom_j_2m"),
         ));
         ok &= add_lookup_buffer(get_lookup_buffer(
-            vec![(0, self.j_2m.clone())],
-            &format!("{id_prefix}_j_2m"),
-        ));
-        ok &= add_lookup_buffer(get_lookup_buffer(
-            vec![(0, self.j_2m_last.clone())],
-            &format!("{id_prefix}_j_2m_last"),
+            vec![(0, self.t_bottom_j_2m_last.clone())],
+            &format!("{id_prefix}_t_bottom_j_2m_last"),
         ));
         ok
     }
@@ -149,12 +151,19 @@ impl<M: PolyMatrix> Wee25PublicParams<M> {
             read_matrix_from_multi_batch::<M>(params, dir, &format!("{id_prefix}_top_j"), 0)?;
         let top_j_last =
             read_matrix_from_multi_batch::<M>(params, dir, &format!("{id_prefix}_top_j_last"), 0)?;
-        let t_bottom =
-            read_matrix_from_multi_batch::<M>(params, dir, &format!("{id_prefix}_t_bottom"), 0)?;
-        let j_2m = read_matrix_from_multi_batch::<M>(params, dir, &format!("{id_prefix}_j_2m"), 0)?;
-        let j_2m_last =
-            read_matrix_from_multi_batch::<M>(params, dir, &format!("{id_prefix}_j_2m_last"), 0)?;
-        Some(Self { b, w, top_j, top_j_last, t_bottom, j_2m, j_2m_last })
+        let t_bottom_j_2m = read_matrix_from_multi_batch::<M>(
+            params,
+            dir,
+            &format!("{id_prefix}_t_bottom_j_2m"),
+            0,
+        )?;
+        let t_bottom_j_2m_last = read_matrix_from_multi_batch::<M>(
+            params,
+            dir,
+            &format!("{id_prefix}_t_bottom_j_2m_last"),
+            0,
+        )?;
+        Some(Self { b, w, top_j, top_j_last, t_bottom_j_2m, t_bottom_j_2m_last })
     }
 
     pub fn default_storage_prefix() -> &'static str {
@@ -172,7 +181,10 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         Self { secret_size, tree_base, m_b, m_g, _marker: PhantomData }
     }
 
-    pub fn sample_public_params<US: PolyUniformSampler<M = M>, TS: PolyTrapdoorSampler<M = M>>(
+    pub fn sample_public_params<
+        US: PolyUniformSampler<M = M> + Send + Sync,
+        TS: PolyTrapdoorSampler<M = M>,
+    >(
         &self,
         params: &<M::P as Poly>::Params,
         trapdoor_sigma: f64,
@@ -206,11 +218,10 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             m_b,
             DistType::FinRingDist,
         );
-        let t_ncol = pp_size * m_g;
         let t_bottom = uniform_sampler.sample_uniform(
             params,
             m_b,
-            t_ncol,
+            pp_size * m_g,
             DistType::GaussDist { sigma: trapdoor_sigma },
         );
         let identity_m = M::identity(params, m_g, None);
@@ -253,7 +264,10 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         let top_j_last_refs = top_j_last_parts.iter().collect::<Vec<_>>();
         let top_j_last = top_j_last_parts[0].concat_rows(&top_j_last_refs[1..]);
 
-        Wee25PublicParams::new(b, w, top_j, top_j_last, t_bottom, j_2m, j_2m_last)
+        let t_bottom_j_2m = t_bottom.clone() * &j_2m;
+        let t_bottom_j_2m_last = t_bottom * &j_2m_last;
+
+        Wee25PublicParams::new(b, w, top_j, top_j_last, t_bottom_j_2m, t_bottom_j_2m_last)
     }
 
     pub fn commit(
@@ -602,8 +616,11 @@ impl<M: PolyMatrix> Wee25Commit<M> {
     }
 
     fn verifier_base(&self, public_params: &Wee25PublicParams<M>, is_leaf: bool) -> M {
-        let j_2m = if is_leaf { &public_params.j_2m_last } else { &public_params.j_2m };
-        public_params.t_bottom.clone() * j_2m
+        if is_leaf {
+            public_params.t_bottom_j_2m_last.clone()
+        } else {
+            public_params.t_bottom_j_2m.clone()
+        }
     }
 
     fn assert_stream_len(&self, cols: usize) {

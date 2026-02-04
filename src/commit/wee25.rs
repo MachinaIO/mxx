@@ -259,6 +259,7 @@ where
         let j_2m_cols = l * log_base_q;
         let gadget_vec = M::gadget_matrix(params, 1);
         let gadget_row = gadget_vec.get_row(0);
+        drop(gadget_vec);
         debug_assert_eq!(
             gadget_row.len(),
             log_base_q,
@@ -355,6 +356,10 @@ where
                 t_bottom_j_2m_last = t_bottom_j_2m_last + contrib_j_2m_last;
             }
         }
+        let t_bottom_j_2m_bytes = t_bottom_j_2m.to_compact_bytes();
+        drop(t_bottom_j_2m);
+        let t_bottom_j_2m_last_bytes = t_bottom_j_2m_last.to_compact_bytes();
+        drop(t_bottom_j_2m_last);
         tracing::debug!("Wee25Commit::sample_public_params completed t_block sampling");
 
         // Reverse the loop order: outer over j_2m columns (idx), inner over t_block/j_2m rows.
@@ -413,12 +418,15 @@ where
         );
         let (top_j_parts, top_j_last_parts): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
             top_j_parts.into_iter().unzip();
+        drop(t_block_bytes);
+        drop(zero_top_j);
+        drop(zero_top_j_last);
         Wee25PublicParams::new(
             b,
             top_j_parts,
             top_j_last_parts,
-            t_bottom_j_2m.to_compact_bytes(),
-            t_bottom_j_2m_last.to_compact_bytes(),
+            t_bottom_j_2m_bytes,
+            t_bottom_j_2m_last_bytes,
             hash_key,
         )
     }

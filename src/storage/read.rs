@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{matrix::PolyMatrix, poly::Poly, storage::write::GlobalTableIndex};
-use tracing::info;
+use tracing::{debug, info};
 
 /// Read a specific matrix from split batch files by its ID prefix and index.
 /// Uses indexed format for O(1) access to lookup tables.
@@ -25,11 +25,21 @@ where
         let Ok(global_index) = serde_json::from_str::<GlobalTableIndex>(&index_data) &&
         !global_index.entries.is_empty()
     {
+        debug!(
+            "read_matrix_from_multi_batch: lookup_tables.index loaded with {} entries",
+            global_index.entries.len()
+        );
         if let Some(entry) = global_index.entries.get(id_prefix) {
+            debug!("read_matrix_from_multi_batch: found entry for id_prefix {}", id_prefix);
             if let Some(matrix) =
                 read_matrix_from_entry(params, dir, id_prefix, target_k, entry, start)
             {
                 return Some(matrix);
+            } else {
+                debug!(
+                    "read_matrix_from_multi_batch: matrix not found in entry for id_prefix {}",
+                    id_prefix
+                );
             }
         }
         let part_prefix = format!("{}_part", id_prefix);
@@ -61,6 +71,7 @@ where
     let filename = format!("lookup_tables_batch_{}.bin", entry.file_index);
     let path = dir.join(&filename);
     let mut file = File::open(&path).ok()?;
+    debug!("read_matrix_from_entry: opened file {} for id_prefix {}", filename, id_prefix);
     let offset = entry.file_offset + (matrix_position * entry.bytes_per_matrix) as u64;
     file.seek(SeekFrom::Start(offset)).ok()?;
     let mut matrix_data = vec![0u8; entry.bytes_per_matrix];

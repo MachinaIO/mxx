@@ -279,17 +279,6 @@ where
         let trapdoor_sigma = self.trapdoor_sigma;
         let checkpoint_prefix = self.checkpoint_prefix(params, hash_key);
         let t_block_checkpoint_prefix = format!("{checkpoint_prefix}_t_block_ckpt");
-
-        let trapdoor_sampler = TS::new(params, trapdoor_sigma);
-        let (trapdoor, b) = trapdoor_sampler.trapdoor(params, secret_size);
-        debug_assert_eq!(
-            b.col_size(),
-            m_b,
-            "Wee25PublicParams m_b mismatch: expected {}, got {}",
-            m_b,
-            b.col_size()
-        );
-        let uniform_sampler = US::new();
         let pp_size = tree_base * m_b * m_g;
         tracing::debug!(
             "Wee25Commit::sample_public_params secret_size={} m_b={} m_g={} pp_size={}",
@@ -298,11 +287,6 @@ where
             m_g,
             pp_size
         );
-        add_lookup_buffer(get_lookup_buffer(
-            vec![(0, b.clone())],
-            &format!("{checkpoint_prefix}_b"),
-        ));
-        let hash_sampler = HS::new();
         let l = tree_base * m_b;
         let log_base_q = params.modulus_digits();
         let j_2m_cols = l * log_base_q;
@@ -379,24 +363,24 @@ where
             let chunk_start = t_block_resume_start;
             let chunk_end = (chunk_start + t_block_batch).min(pp_size);
             let chunk_prefix = format!("{t_block_checkpoint_prefix}_chunk_{chunk_start}");
-            let first = read_matrix_from_multi_batch::<M>(
-                params,
-                checkpoint_dir,
-                &chunk_prefix,
-                chunk_start,
-            );
-            let Some(first) = first else { break };
-            t_block_bytes[chunk_start] = first.to_compact_bytes();
+            let read_chunks = parallel_iter!(chunk_start..chunk_end)
+                .map(|block_idx| {
+                    (
+                        block_idx,
+                        read_matrix_from_multi_batch::<M>(
+                            params,
+                            checkpoint_dir,
+                            &chunk_prefix,
+                            block_idx,
+                        )
+                        .map(|m| m.to_compact_bytes()),
+                    )
+                })
+                .collect::<Vec<_>>();
             let mut chunk_ok = true;
-            for block_idx in (chunk_start + 1)..chunk_end {
-                let mat = read_matrix_from_multi_batch::<M>(
-                    params,
-                    checkpoint_dir,
-                    &chunk_prefix,
-                    block_idx,
-                );
-                match mat {
-                    Some(mat) => t_block_bytes[block_idx] = mat.to_compact_bytes(),
+            for (block_idx, chunk) in read_chunks {
+                match chunk {
+                    Some(bytes) => t_block_bytes[block_idx] = bytes,
                     None => {
                         chunk_ok = false;
                         break;
@@ -430,6 +414,71 @@ where
                 t_block_resume_start = 0;
             }
         }
+
+        // Also probe top_j checkpoints before sampling trapdoor/b.
+        let top_j_batch = std::env::var("WEE25_TOPJ_PARALLEL_BATCH")
+            .ok()
+            .and_then(|val| val.parse::<usize>().ok())
+            .filter(|&val| val > 0)
+            .unwrap_or(5);
+        let mut top_j_resume_start = 0usize;
+        loop {
+            if top_j_resume_start >= pp_size {
+                break;
+            }
+            let chunk_start = top_j_resume_start;
+            let chunk_end = (chunk_start + top_j_batch).min(pp_size);
+            let chunk_prefix = format!("{checkpoint_prefix}_top_j_part_{chunk_start}");
+            let chunk_len = chunk_end - chunk_start;
+            let chunk_ok = parallel_iter!(0..chunk_len).all(|offset| {
+                let top_idx = chunk_start + offset;
+                let last_idx = chunk_start + chunk_len + offset;
+                let part = read_matrix_from_multi_batch::<M>(
+                    params,
+                    checkpoint_dir,
+                    &chunk_prefix,
+                    top_idx,
+                );
+                let part_last = read_matrix_from_multi_batch::<M>(
+                    params,
+                    checkpoint_dir,
+                    &chunk_prefix,
+                    last_idx,
+                );
+                match (part, part_last) {
+                    (Some(_), Some(_)) => true,
+                    _ => false,
+                }
+            });
+            if !chunk_ok {
+                break;
+            }
+            top_j_resume_start = chunk_end;
+        }
+        if top_j_resume_start > 0 {
+            tracing::debug!(
+                "Wee25Commit::sample_public_params resumed top_j_parts at {} of {}",
+                top_j_resume_start,
+                pp_size
+            );
+        }
+
+        // Now that checkpoint reads are done, sample trapdoor/b.
+        let trapdoor_sampler = TS::new(params, trapdoor_sigma);
+        let (trapdoor, b) = trapdoor_sampler.trapdoor(params, secret_size);
+        debug_assert_eq!(
+            b.col_size(),
+            m_b,
+            "Wee25PublicParams m_b mismatch: expected {}, got {}",
+            m_b,
+            b.col_size()
+        );
+        let uniform_sampler = US::new();
+        add_lookup_buffer(get_lookup_buffer(
+            vec![(0, b.clone())],
+            &format!("{checkpoint_prefix}_b"),
+        ));
+        let hash_sampler = HS::new();
         for chunk_start in (0..pp_size).step_by(t_block_batch) {
             if chunk_start < t_block_resume_start {
                 continue;
@@ -488,69 +537,6 @@ where
         tracing::debug!("Wee25Commit::sample_public_params completed t_block sampling");
 
         // Reverse the loop order: outer over j_2m columns (idx), inner over t_block/j_2m rows.
-        let top_j_batch = std::env::var("WEE25_TOPJ_PARALLEL_BATCH")
-            .ok()
-            .and_then(|val| val.parse::<usize>().ok())
-            .filter(|&val| val > 0)
-            .unwrap_or(5);
-        let mut top_j_resume_start = 0usize;
-        loop {
-            if top_j_resume_start >= pp_size {
-                break;
-            }
-            let chunk_start = top_j_resume_start;
-            let chunk_end = (chunk_start + top_j_batch).min(pp_size);
-            let chunk_prefix = format!("{checkpoint_prefix}_top_j_part_{chunk_start}");
-            let chunk_len = chunk_end - chunk_start;
-            let first = read_matrix_from_multi_batch::<M>(
-                params,
-                checkpoint_dir,
-                &chunk_prefix,
-                chunk_start,
-            );
-            let first_last = read_matrix_from_multi_batch::<M>(
-                params,
-                checkpoint_dir,
-                &chunk_prefix,
-                chunk_start + chunk_len,
-            );
-            let (Some(_first), Some(_first_last)) = (first, first_last) else { break };
-            let mut chunk_ok = true;
-            for offset in 0..chunk_len {
-                let top_idx = chunk_start + offset;
-                let last_idx = chunk_start + chunk_len + offset;
-                let part = read_matrix_from_multi_batch::<M>(
-                    params,
-                    checkpoint_dir,
-                    &chunk_prefix,
-                    top_idx,
-                );
-                let part_last = read_matrix_from_multi_batch::<M>(
-                    params,
-                    checkpoint_dir,
-                    &chunk_prefix,
-                    last_idx,
-                );
-                match (part, part_last) {
-                    (Some(_), Some(_)) => {}
-                    _ => {
-                        chunk_ok = false;
-                        break;
-                    }
-                }
-            }
-            if !chunk_ok {
-                break;
-            }
-            top_j_resume_start = chunk_end;
-        }
-        if top_j_resume_start > 0 {
-            tracing::debug!(
-                "Wee25Commit::sample_public_params resumed top_j_parts at {} of {}",
-                top_j_resume_start,
-                pp_size
-            );
-        }
         for chunk_start in (0..pp_size).step_by(top_j_batch) {
             if chunk_start < top_j_resume_start {
                 continue;
@@ -584,7 +570,7 @@ where
                     let mut top_j_acc = zero_top_j.clone();
                     let mut top_j_last_acc = zero_top_j_last.clone();
                     for block_idx in 0..pp_size {
-                        if block_idx % 100 == 0 {
+                        if block_idx % 10 == 0 {
                             tracing::debug!(
                                 "Wee25Commit::sample_public_params top_j_parts idx={}/{} block_idx={}/{}",
                                 idx,

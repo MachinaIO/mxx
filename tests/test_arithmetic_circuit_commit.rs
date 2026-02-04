@@ -7,6 +7,7 @@ use mxx::{
         commit_eval::{CommitBGGEncodingPltEvaluator, CommitBGGPubKeyPltEvaluator},
         poly::PolyPltEvaluator,
     },
+    commit::wee25::{Wee25Commit, Wee25PublicParams},
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
@@ -97,11 +98,36 @@ async fn test_arithmetic_circuit_operations_commit() {
     let pubkeys = pk_sampler.sample(&params, b"BGG_PUBKEY", &reveal_plaintexts);
 
     let tree_base = 4;
+    info!("wee25 public params sampling start");
+    let wee25_commit = Wee25Commit::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::new(
+        &params,
+        d,
+        tree_base,
+        trapdoor_sigma,
+    );
+    wee25_commit.sample_public_params::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
+        &params,
+        seed,
+        tmp_dir.path(),
+    );
+    wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
+    let wee25_public_params = Wee25PublicParams::<DCRTPolyMatrix>::read_from_storage(
+        &params,
+        tmp_dir.path(),
+        &wee25_commit,
+        seed,
+    )
+    .expect("wee25 public params not found");
+    info!("wee25 public params sampling done");
     let pk_evaluator =
-        CommitBGGPubKeyPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup::<
-            DCRTPolyUniformSampler,
-            DCRTPolyTrapdoorSampler,
-        >(&params, d, trapdoor_sigma, tree_base, seed);
+        CommitBGGPubKeyPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup(
+            &params,
+            d,
+            trapdoor_sigma,
+            tree_base,
+            seed,
+            wee25_public_params,
+        );
     info!("start pubkey evaluation");
     let start = std::time::Instant::now();
     let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(&pk_evaluator));
@@ -139,6 +165,7 @@ async fn test_arithmetic_circuit_operations_commit() {
             &c_b0,
             &c_b,
             &tmp_dir.path().to_path_buf(),
+            pk_evaluator.wee25_public_params.clone(),
         );
     info!("start encoding evaluation");
     let start = std::time::Instant::now();
@@ -150,4 +177,5 @@ async fn test_arithmetic_circuit_operations_commit() {
 
     let encoding_expected = s.clone() * &pubkey_out[0].matrix;
     assert_eq!(encoding_out[0].vector, encoding_expected);
+    drop(tmp_dir);
 }

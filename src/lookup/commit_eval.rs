@@ -5,7 +5,7 @@ use crate::{
     lookup::{PltEvaluator, PublicLut},
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
-    sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
+    sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler},
     storage::{
         read::read_matrix_from_multi_batch,
         write::{add_lookup_buffer, get_lookup_buffer},
@@ -92,18 +92,22 @@ where
     M: PolyMatrix,
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
 {
-    pub fn setup<US: PolyUniformSampler<M = M> + Send + Sync, TS: PolyTrapdoorSampler<M = M>>(
+    pub fn setup(
         params: &<M::P as Poly>::Params,
         secret_size: usize,
         trapdoor_sigma: f64,
         tree_base: usize,
         hash_key: [u8; 32],
+        wee25_public_params: Wee25PublicParams<M>,
     ) -> Self {
         tracing::debug!("CommitBGGPubKeyPltEvaluator::setup start");
-        let wee25_commit = Wee25Commit::<M, HS>::new(params, secret_size, tree_base);
-        let wee25_public_params =
-            wee25_commit.sample_public_params::<US, TS>(params, hash_key, trapdoor_sigma);
-        tracing::debug!("Wee25PublicParams setup done");
+        let wee25_commit =
+            Wee25Commit::<M, HS>::new(params, secret_size, tree_base, trapdoor_sigma);
+        debug_assert_eq!(
+            wee25_public_params.b.col_size(),
+            wee25_commit.m_b,
+            "wee25 public params column size mismatch"
+        );
         let hash_sampler = HS::new();
         let b_1 = hash_sampler.sample_hash(
             params,
@@ -125,41 +129,6 @@ where
         };
         tracing::debug!("CommitBGGPubKeyPltEvaluator::setup done");
         result
-    }
-
-    pub fn from_public_params(
-        params: &<M::P as Poly>::Params,
-        secret_size: usize,
-        trapdoor_sigma: f64,
-        tree_base: usize,
-        hash_key: [u8; 32],
-        wee25_public_params: Wee25PublicParams<M>,
-    ) -> Self {
-        let wee25_commit = Wee25Commit::<M, HS>::new(params, secret_size, tree_base);
-        debug_assert_eq!(
-            wee25_public_params.b.col_size(),
-            wee25_commit.m_b,
-            "wee25 public params column size mismatch"
-        );
-        let hash_sampler = HS::new();
-        let b_1 = hash_sampler.sample_hash(
-            params,
-            hash_key,
-            b"COMMIT_LUT_B1".to_vec(),
-            secret_size,
-            wee25_commit.m_b,
-            DistType::FinRingDist,
-        );
-        Self {
-            hash_key,
-            trapdoor_sigma,
-            wee25_commit,
-            wee25_public_params,
-            b_1,
-            gate_states: DashMap::new(),
-            luts: DashMap::new(),
-            _hs: PhantomData,
-        }
     }
 
     pub fn commit_all_lut_matrices<TS: PolyTrapdoorSampler<M = M> + Send + Sync>(
@@ -199,8 +168,6 @@ where
             &gate_states,
         );
         tracing::debug!("commit_all_lut_matrices build msg_stream done");
-        self.wee25_public_params
-            .write_to_storage(params, Wee25PublicParams::<M>::default_storage_prefix());
         let commit = self.wee25_commit.commit(params, &msg_stream, &self.wee25_public_params);
         let target = commit + &self.b_1;
         let trapdoor_sampler = TS::new(params, self.trapdoor_sigma);
@@ -273,18 +240,12 @@ where
         c_b0: &M,
         c_b: &M,
         dir_path: &PathBuf,
+        wee25_public_params: Wee25PublicParams<M>,
     ) -> Self {
         tracing::debug!("CommitBGGEncodingPltEvaluator::setup start");
         let secret_size = one_pubkey.matrix.row_size();
-        let dir = std::path::Path::new(dir_path);
-        let wee25_commit = Wee25Commit::<M, HS>::new(params, secret_size, tree_base);
-        let wee25_public_params = Wee25PublicParams::<M>::read_from_storage(
-            params,
-            dir,
-            Wee25PublicParams::<M>::default_storage_prefix(),
-            hash_key,
-        )
-        .unwrap_or_else(|| panic!("wee25 public params not found"));
+        let _dir = std::path::Path::new(dir_path);
+        let wee25_commit = Wee25Commit::<M, HS>::new(params, secret_size, tree_base, 0.0);
         let hash_sampler = HS::new();
         let b_1 = hash_sampler.sample_hash(
             params,
@@ -299,7 +260,7 @@ where
         // setup pubkeys for all LUT gates
         let _ = circuit.eval(params, one_pubkey, input_pubkeys, Some(&gate_state_collector));
         let preimage =
-            read_matrix_from_multi_batch::<M>(params, dir, &format!("preimage_of_commit"), 0)
+            read_matrix_from_multi_batch::<M>(params, dir_path, &format!("preimage_of_commit"), 0)
                 .unwrap_or_else(|| panic!("preimage_of_commit not found"));
         let c_commit = c_b0.clone() * preimage;
         let luts = gate_state_collector
@@ -639,7 +600,7 @@ mod tests {
         matrix::dcrt_poly::DCRTPolyMatrix,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         sampler::{
-            hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
+            PolyUniformSampler, hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
             uniform::DCRTPolyUniformSampler,
         },
         storage::write::{init_storage_system, storage_test_lock, wait_for_all_writes},
@@ -713,12 +674,30 @@ mod tests {
         init_storage_system(dir.to_path_buf());
 
         let tree_base = 2;
+        info!("wee25 public params sampling start");
+        let wee25_commit = Wee25Commit::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::new(
+            &params, d, tree_base, SIGMA,
+        );
+        wee25_commit.sample_public_params::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
+            &params, key, dir,
+        );
+        wait_for_all_writes(dir.to_path_buf()).await.unwrap();
+        let wee25_public_params = Wee25PublicParams::<DCRTPolyMatrix>::read_from_storage(
+            &params,
+            dir,
+            &wee25_commit,
+            key,
+        )
+        .expect("wee25 public params not found");
+        info!("wee25 public params sampling done");
+
         info!("plt pubkey evaluator setup start");
-        let plt_pubkey_evaluator =
-            CommitBGGPubKeyPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup::<
-                DCRTPolyUniformSampler,
-                DCRTPolyTrapdoorSampler,
-            >(&params, d, SIGMA, tree_base, key);
+        let plt_pubkey_evaluator = CommitBGGPubKeyPltEvaluator::<
+            DCRTPolyMatrix,
+            DCRTPolyHashSampler<Keccak256>,
+        >::setup(
+            &params, d, SIGMA, tree_base, key, wee25_public_params
+        );
         info!("plt pubkey evaluator setup done");
 
         info!("circuit eval pubkey start");
@@ -753,6 +732,7 @@ mod tests {
                 &c_b0,
                 &c_b,
                 &dir.to_path_buf(),
+                plt_pubkey_evaluator.wee25_public_params.clone(),
             );
         info!("plt encoding evaluator setup done");
 
@@ -775,6 +755,7 @@ mod tests {
             (result_encoding.pubkey.matrix.clone() -
                 (DCRTPolyMatrix::gadget_matrix(&params, d) * expected_plaintext));
         assert_eq!(result_encoding.vector, expected_vector);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
@@ -839,12 +820,30 @@ mod tests {
         init_storage_system(dir.to_path_buf());
 
         let tree_base = 2;
+        info!("wee25 public params sampling start");
+        let wee25_commit = Wee25Commit::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::new(
+            &params, d, tree_base, SIGMA,
+        );
+        wee25_commit.sample_public_params::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
+            &params, key, dir,
+        );
+        wait_for_all_writes(dir.to_path_buf()).await.unwrap();
+        let wee25_public_params = Wee25PublicParams::<DCRTPolyMatrix>::read_from_storage(
+            &params,
+            dir,
+            &wee25_commit,
+            key,
+        )
+        .expect("wee25 public params not found");
+        info!("wee25 public params sampling done");
+
         info!("plt pubkey evaluator setup start");
-        let plt_pubkey_evaluator =
-            CommitBGGPubKeyPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup::<
-                DCRTPolyUniformSampler,
-                DCRTPolyTrapdoorSampler,
-            >(&params, d, SIGMA, tree_base, key);
+        let plt_pubkey_evaluator = CommitBGGPubKeyPltEvaluator::<
+            DCRTPolyMatrix,
+            DCRTPolyHashSampler<Keccak256>,
+        >::setup(
+            &params, d, SIGMA, tree_base, key, wee25_public_params
+        );
         info!("plt pubkey evaluator setup done");
 
         info!("circuit eval pubkey start");
@@ -874,6 +873,7 @@ mod tests {
                 &c_b0,
                 &c_b,
                 &dir.to_path_buf(),
+                plt_pubkey_evaluator.wee25_public_params.clone(),
             );
         info!("plt encoding evaluator setup done");
 
@@ -892,5 +892,6 @@ mod tests {
                     (DCRTPolyMatrix::gadget_matrix(&params, d) * expected_plaintext));
             assert_eq!(encoding.vector, expected_vector);
         }
+        fs::remove_dir_all(dir).unwrap();
     }
 }

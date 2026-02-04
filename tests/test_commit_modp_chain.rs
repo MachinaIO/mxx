@@ -11,6 +11,7 @@ use mxx::{
         PublicLut,
         commit_eval::{CommitBGGEncodingPltEvaluator, CommitBGGPubKeyPltEvaluator},
     },
+    commit::wee25::{Wee25Commit, Wee25PublicParams},
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
@@ -26,8 +27,7 @@ use mxx::{
 };
 use num_bigint::BigUint;
 use rand::Rng;
-use std::sync::Arc;
-use tempfile::tempdir;
+use std::{fs, path::Path, sync::Arc};
 use tracing::info;
 
 const CRT_BITS: usize = 51;
@@ -189,15 +189,44 @@ async fn test_commit_modp_chain_rounding() {
     let (b0_trapdoor, b0_matrix) = trapdoor_sampler.trapdoor(&params, d_secret);
     let c_b0 = s_vec.clone() * &b0_matrix;
 
-    let tmp_dir = tempdir().unwrap();
-    init_storage_system(tmp_dir.path().to_path_buf());
+    let dir = Path::new("test_data/commit_modp_chain_rounding");
+    if !dir.exists() {
+        fs::create_dir_all(dir).unwrap();
+    }
+    init_storage_system(dir.to_path_buf());
+
+    info!("wee25 public params sampling start");
+    let wee25_commit = Wee25Commit::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::new(
+        &params,
+        d_secret,
+        TREE_BASE,
+        trapdoor_sigma,
+    );
+    wee25_commit.sample_public_params::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
+        &params,
+        key,
+        dir,
+    );
+    wait_for_all_writes(dir.to_path_buf()).await.unwrap();
+    let wee25_public_params = Wee25PublicParams::<DCRTPolyMatrix>::read_from_storage(
+        &params,
+        dir,
+        &wee25_commit,
+        key,
+    )
+    .expect("wee25 public params not found");
+    info!("wee25 public params sampling done");
 
     info!("plt pubkey evaluator setup start");
     let plt_pubkey_evaluator =
-        CommitBGGPubKeyPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup::<
-            DCRTPolyUniformSampler,
-            DCRTPolyTrapdoorSampler,
-        >(&params, d_secret, trapdoor_sigma, TREE_BASE, key);
+        CommitBGGPubKeyPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup(
+            &params,
+            d_secret,
+            trapdoor_sigma,
+            TREE_BASE,
+            key,
+            wee25_public_params,
+        );
     info!("plt pubkey evaluator setup done");
 
     info!("circuit eval pubkey start");
@@ -213,7 +242,7 @@ async fn test_commit_modp_chain_rounding() {
         &b0_trapdoor,
     );
     info!("commit_all_lut_matrices done");
-    wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
+    wait_for_all_writes(dir.to_path_buf()).await.unwrap();
 
     let c_b = s_vec.clone() * plt_pubkey_evaluator.wee25_public_params.b.clone();
     info!("plt encoding evaluator setup start");
@@ -227,7 +256,8 @@ async fn test_commit_modp_chain_rounding() {
             &input_pubkeys,
             &c_b0,
             &c_b,
-            &tmp_dir.path().to_path_buf(),
+            &dir.to_path_buf(),
+            plt_pubkey_evaluator.wee25_public_params.clone(),
         );
     info!("plt encoding evaluator setup done");
 

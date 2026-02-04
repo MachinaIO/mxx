@@ -31,7 +31,7 @@ use tempfile::tempdir;
 use tracing::info;
 
 const CRT_BITS: usize = 51;
-const RING_DIM: u32 = 1 << 4;
+const RING_DIM: u32 = 1 << 14;
 const ERROR_SIGMA: f64 = 4.0;
 const BASE_BITS: u32 = 17;
 const TREE_BASE: usize = 2;

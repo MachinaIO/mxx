@@ -79,7 +79,7 @@ where
 {
     pub hash_key: [u8; 32],
     pub trapdoor_sigma: f64,
-    pub wee25_commit: Wee25Commit<M>,
+    pub wee25_commit: Wee25Commit<M, HS>,
     pub wee25_public_params: Wee25PublicParams<M>,
     pub b_1: M,
     gate_states: DashMap<GateId, GateState<M>>,
@@ -100,9 +100,9 @@ where
         hash_key: [u8; 32],
     ) -> Self {
         tracing::debug!("CommitBGGPubKeyPltEvaluator::setup start");
-        let wee25_commit = Wee25Commit::<M>::new(params, secret_size, tree_base);
+        let wee25_commit = Wee25Commit::<M, HS>::new(params, secret_size, tree_base);
         let wee25_public_params =
-            wee25_commit.sample_public_params::<US, TS>(params, trapdoor_sigma);
+            wee25_commit.sample_public_params::<US, TS>(params, hash_key, trapdoor_sigma);
         tracing::debug!("Wee25PublicParams setup done");
         let hash_sampler = HS::new();
         let b_1 = hash_sampler.sample_hash(
@@ -135,7 +135,7 @@ where
         hash_key: [u8; 32],
         wee25_public_params: Wee25PublicParams<M>,
     ) -> Self {
-        let wee25_commit = Wee25Commit::<M>::new(params, secret_size, tree_base);
+        let wee25_commit = Wee25Commit::<M, HS>::new(params, secret_size, tree_base);
         debug_assert_eq!(
             wee25_public_params.b.col_size(),
             wee25_commit.m_b,
@@ -199,7 +199,8 @@ where
             &gate_states,
         );
         tracing::debug!("commit_all_lut_matrices build msg_stream done");
-        self.wee25_public_params.write_to_storage(Wee25PublicParams::<M>::default_storage_prefix());
+        self.wee25_public_params
+            .write_to_storage(params, Wee25PublicParams::<M>::default_storage_prefix());
         let commit = self.wee25_commit.commit(params, &msg_stream, &self.wee25_public_params);
         let target = commit + &self.b_1;
         let trapdoor_sampler = TS::new(params, self.trapdoor_sigma);
@@ -244,7 +245,7 @@ where
     M::P: 'static,
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
 {
-    pub wee25_commit: Wee25Commit<M>,
+    pub wee25_commit: Wee25Commit<M, HS>,
     pub wee25_public_params: Wee25PublicParams<M>,
     pub hash_key: [u8; 32],
     pub b_1: M,
@@ -276,11 +277,12 @@ where
         tracing::debug!("CommitBGGEncodingPltEvaluator::setup start");
         let secret_size = one_pubkey.matrix.row_size();
         let dir = std::path::Path::new(dir_path);
-        let wee25_commit = Wee25Commit::<M>::new(params, secret_size, tree_base);
+        let wee25_commit = Wee25Commit::<M, HS>::new(params, secret_size, tree_base);
         let wee25_public_params = Wee25PublicParams::<M>::read_from_storage(
             params,
             dir,
             Wee25PublicParams::<M>::default_storage_prefix(),
+            hash_key,
         )
         .unwrap_or_else(|| panic!("wee25 public params not found"));
         let hash_sampler = HS::new();
@@ -373,6 +375,7 @@ where
             &self.wee25_public_params,
         );
         let verifier = self.wee25_commit.verifier(
+            params,
             padded_len,
             Some(lut_vector_idx..(lut_vector_idx + 1)),
             &self.wee25_public_params,
@@ -415,7 +418,7 @@ where
 
 fn build_msg_stream_for_lut_eval<'a, M, HS>(
     params: &'a <M::P as Poly>::Params,
-    wee25_commit: &'a Wee25Commit<M>,
+    wee25_commit: &'a Wee25Commit<M, HS>,
     wee25_public_params: &'a Wee25PublicParams<M>,
     b_1: &'a M,
     hash_key: [u8; 32],
@@ -449,8 +452,12 @@ where
     let msg_stream = MsgMatrixStream::new(padded_len, move |range| {
         let range_start = range.start;
         let range_end = range.end;
-        let verifier_range =
-            wee25_commit.verifier(padded_len, Some(range_start..range_end), wee25_public_params);
+        let verifier_range = wee25_commit.verifier(
+            params,
+            padded_len,
+            Some(range_start..range_end),
+            wee25_public_params,
+        );
         (range_start..range_end)
             .into_par_iter()
             .map(|global_idx| {
@@ -476,6 +483,7 @@ where
                     verifier_range.slice_columns(m_b * local_idx, m_b * (local_idx + 1))
                 } else {
                     wee25_commit.verifier(
+                        params,
                         padded_len,
                         Some(verifier_idx..(verifier_idx + 1)),
                         wee25_public_params,

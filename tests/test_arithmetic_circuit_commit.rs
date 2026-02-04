@@ -122,27 +122,24 @@ async fn test_arithmetic_circuit_operations_commit() {
     let secrets = uniform_sampler.sample_uniform(&params, 1, d, DistType::BitDist).get_row(0);
     let s = DCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
     let c_b0 = s.clone() * &b0_matrix;
-    let c_b = s.clone() * pk_evaluator.wee25_commit.b.clone();
+    let c_b = s.clone() * pk_evaluator.wee25_public_params.b.clone();
 
     let bgg_encoding_sampler =
         BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
     let zero_plaintexts = vec![DCRTPoly::const_zero(&params); circuit.num_input()];
     let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &zero_plaintexts);
-    let enc_evaluator = CommitBGGEncodingPltEvaluator::<
-        DCRTPolyMatrix,
-        DCRTPolyHashSampler<Keccak256>,
-    >::setup::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
-        &params,
-        trapdoor_sigma,
-        tree_base,
-        seed,
-        &circuit,
-        &pubkeys[0],
-        &pubkeys[1..],
-        &c_b0,
-        &c_b,
-        &tmp_dir.path().to_path_buf(),
-    );
+    let enc_evaluator =
+        CommitBGGEncodingPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup(
+            &params,
+            tree_base,
+            seed,
+            &circuit,
+            &pubkeys[0],
+            &pubkeys[1..],
+            &c_b0,
+            &c_b,
+            &tmp_dir.path().to_path_buf(),
+        );
     info!("start encoding evaluation");
     let start = std::time::Instant::now();
     let encoding_out = circuit.eval(&params, &encodings[0], &encodings[1..], Some(&enc_evaluator));

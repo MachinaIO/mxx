@@ -1,13 +1,19 @@
-use std::{ops::Range, sync::Arc};
+use std::{marker::PhantomData, ops::Range, sync::Arc};
 
 use crate::{
     matrix::PolyMatrix,
     parallel_iter,
     poly::{Poly, PolyParams},
     sampler::{DistType, PolyTrapdoorSampler, PolyUniformSampler},
+    storage::{
+        read::read_matrix_from_multi_batch,
+        write::{add_lookup_buffer, get_lookup_buffer},
+    },
 };
 use dashmap::DashMap;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+pub const WEE25_PUBLIC_PARAMS_PREFIX: &str = "wee25_public_params";
 
 #[derive(Debug, Clone)]
 pub struct Wee25Commit<M: PolyMatrix> {
@@ -15,9 +21,15 @@ pub struct Wee25Commit<M: PolyMatrix> {
     pub tree_base: usize,
     pub m_b: usize,
     pub m_g: usize,
+    _marker: PhantomData<M>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Wee25PublicParams<M: PolyMatrix> {
     pub b: M,
     pub w: M,
-    pub t_top: M,
+    pub top_j: M,
+    pub top_j_last: M,
     pub t_bottom: M,
     pub j_2m: M,
     pub j_2m_last: M,
@@ -85,23 +97,104 @@ impl<'a, M: PolyMatrix + 'a> MsgMatrixStream<'a, M> {
     }
 }
 
-impl<M: PolyMatrix> Wee25Commit<M> {
-    pub fn setup<US: PolyUniformSampler<M = M>, TS: PolyTrapdoorSampler<M = M>>(
+impl<M: PolyMatrix> Wee25PublicParams<M> {
+    pub fn new(b: M, w: M, top_j: M, top_j_last: M, t_bottom: M, j_2m: M, j_2m_last: M) -> Self {
+        Self { b, w, top_j, top_j_last, t_bottom, j_2m, j_2m_last }
+    }
+
+    pub fn write_to_storage(&self, id_prefix: &str) -> bool
+    where
+        M: Send,
+    {
+        let mut ok = true;
+        ok &= add_lookup_buffer(get_lookup_buffer(
+            vec![(0, self.b.clone())],
+            &format!("{id_prefix}_b"),
+        ));
+        ok &= add_lookup_buffer(get_lookup_buffer(
+            vec![(0, self.w.clone())],
+            &format!("{id_prefix}_w"),
+        ));
+        ok &= add_lookup_buffer(get_lookup_buffer(
+            vec![(0, self.top_j.clone())],
+            &format!("{id_prefix}_top_j"),
+        ));
+        ok &= add_lookup_buffer(get_lookup_buffer(
+            vec![(0, self.top_j_last.clone())],
+            &format!("{id_prefix}_top_j_last"),
+        ));
+        ok &= add_lookup_buffer(get_lookup_buffer(
+            vec![(0, self.t_bottom.clone())],
+            &format!("{id_prefix}_t_bottom"),
+        ));
+        ok &= add_lookup_buffer(get_lookup_buffer(
+            vec![(0, self.j_2m.clone())],
+            &format!("{id_prefix}_j_2m"),
+        ));
+        ok &= add_lookup_buffer(get_lookup_buffer(
+            vec![(0, self.j_2m_last.clone())],
+            &format!("{id_prefix}_j_2m_last"),
+        ));
+        ok
+    }
+
+    pub fn read_from_storage(
         params: &<M::P as Poly>::Params,
-        secret_size: usize,
-        trapdoor_sigma: f64,
-        tree_base: usize,
-    ) -> Self {
+        dir: &std::path::Path,
+        id_prefix: &str,
+    ) -> Option<Self> {
+        let b = read_matrix_from_multi_batch::<M>(params, dir, &format!("{id_prefix}_b"), 0)?;
+        let w = read_matrix_from_multi_batch::<M>(params, dir, &format!("{id_prefix}_w"), 0)?;
+        let top_j =
+            read_matrix_from_multi_batch::<M>(params, dir, &format!("{id_prefix}_top_j"), 0)?;
+        let top_j_last =
+            read_matrix_from_multi_batch::<M>(params, dir, &format!("{id_prefix}_top_j_last"), 0)?;
+        let t_bottom =
+            read_matrix_from_multi_batch::<M>(params, dir, &format!("{id_prefix}_t_bottom"), 0)?;
+        let j_2m = read_matrix_from_multi_batch::<M>(params, dir, &format!("{id_prefix}_j_2m"), 0)?;
+        let j_2m_last =
+            read_matrix_from_multi_batch::<M>(params, dir, &format!("{id_prefix}_j_2m_last"), 0)?;
+        Some(Self { b, w, top_j, top_j_last, t_bottom, j_2m, j_2m_last })
+    }
+
+    pub fn default_storage_prefix() -> &'static str {
+        WEE25_PUBLIC_PARAMS_PREFIX
+    }
+}
+
+impl<M: PolyMatrix> Wee25Commit<M> {
+    pub fn new(params: &<M::P as Poly>::Params, secret_size: usize, tree_base: usize) -> Self {
         debug_assert!(tree_base >= 2, "tree_base must be at least 2");
-        let trapdoor_sampler = TS::new(params, trapdoor_sigma);
-        let (trapdoor, b) = trapdoor_sampler.trapdoor(params, secret_size);
-        let uniform_sampler = US::new();
-        let m_b = b.col_size();
         let log_base_q = params.modulus_digits();
         let m_g = secret_size * log_base_q;
+        // For the current trapdoor sampler, b has size d x (2d + d*log_base_q).
+        let m_b = secret_size * (2 + log_base_q);
+        Self { secret_size, tree_base, m_b, m_g, _marker: PhantomData }
+    }
+
+    pub fn sample_public_params<US: PolyUniformSampler<M = M>, TS: PolyTrapdoorSampler<M = M>>(
+        &self,
+        params: &<M::P as Poly>::Params,
+        trapdoor_sigma: f64,
+    ) -> Wee25PublicParams<M> {
+        let secret_size = self.secret_size;
+        let tree_base = self.tree_base;
+        let m_b = self.m_b;
+        let m_g = self.m_g;
+
+        let trapdoor_sampler = TS::new(params, trapdoor_sigma);
+        let (trapdoor, b) = trapdoor_sampler.trapdoor(params, secret_size);
+        debug_assert_eq!(
+            b.col_size(),
+            m_b,
+            "Wee25PublicParams m_b mismatch: expected {}, got {}",
+            m_b,
+            b.col_size()
+        );
+        let uniform_sampler = US::new();
         let pp_size = tree_base * m_b * m_g;
         tracing::debug!(
-            "Wee25Commit::setup secret_size={} m_b={} m_g={} pp_size={}",
+            "Wee25Commit::sample_public_params secret_size={} m_b={} m_g={} pp_size={}",
             secret_size,
             m_b,
             m_g,
@@ -120,19 +213,6 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             t_ncol,
             DistType::GaussDist { sigma: trapdoor_sigma },
         );
-        let mut t_tops = Vec::with_capacity(pp_size);
-        let gadget = M::gadget_matrix(params, secret_size);
-        for idx in 0..pp_size {
-            let target = {
-                let zeros_before_g = M::zero(params, secret_size, idx * m_g);
-                let zeros_after_g = M::zero(params, secret_size, (pp_size - idx - 1) * m_g);
-                let g_concated = zeros_before_g.concat_columns(&[&gadget, &zeros_after_g]);
-                let wt = w.slice_rows(idx * secret_size, (idx + 1) * secret_size) * &t_bottom;
-                g_concated - wt
-            };
-            t_tops.push(trapdoor_sampler.preimage(params, &trapdoor, &b, &target));
-        }
-        let t_top = t_tops[0].concat_rows(&t_tops[1..].iter().collect::<Vec<_>>());
         let identity_m = M::identity(params, m_g, None);
         let identity_m_vectorized = identity_m.vectorize_columns();
         let l = tree_base * m_b;
@@ -145,17 +225,45 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             let mul2 = mul1 * g_l;
             mul2.decompose()
         };
+        let gadget = M::gadget_matrix(params, secret_size);
+        let t_top_parts_start = std::time::Instant::now();
+        let t_top_parts: Vec<(M, M)> = parallel_iter!(0..pp_size)
+            .map(|idx| {
+                let target = {
+                    let zeros_before_g = M::zero(params, secret_size, idx * m_g);
+                    let zeros_after_g = M::zero(params, secret_size, (pp_size - idx - 1) * m_g);
+                    let g_concated = zeros_before_g.concat_columns(&[&gadget, &zeros_after_g]);
+                    let wt = w.slice_rows(idx * secret_size, (idx + 1) * secret_size) * &t_bottom;
+                    g_concated - wt
+                };
+                let local_sampler = TS::new(params, trapdoor_sigma);
+                let t_top_block = local_sampler.preimage(params, &trapdoor, &b, &target);
+                let top_j_block = t_top_block.clone() * &j_2m;
+                let top_j_last_block = t_top_block * &j_2m_last;
+                (top_j_block, top_j_last_block)
+            })
+            .collect();
+        tracing::info!(
+            "Wee25Commit::sample_public_params t_top_parts elapsed_s={}",
+            t_top_parts_start.elapsed().as_secs()
+        );
+        let (top_j_parts, top_j_last_parts): (Vec<M>, Vec<M>) = t_top_parts.into_iter().unzip();
+        let top_j_refs = top_j_parts.iter().collect::<Vec<_>>();
+        let top_j = top_j_parts[0].concat_rows(&top_j_refs[1..]);
+        let top_j_last_refs = top_j_last_parts.iter().collect::<Vec<_>>();
+        let top_j_last = top_j_last_parts[0].concat_rows(&top_j_last_refs[1..]);
 
-        Self { secret_size, tree_base, m_b, m_g, b, w, t_top, t_bottom, j_2m, j_2m_last }
+        Wee25PublicParams::new(b, w, top_j, top_j_last, t_bottom, j_2m, j_2m_last)
     }
 
     pub fn commit(
         &self,
         params: &<M::P as Poly>::Params,
         msg_stream: &MsgMatrixStream<'_, M>,
+        public_params: &Wee25PublicParams<M>,
     ) -> M {
         self.assert_stream_len(msg_stream.len());
-        self.commit_recursive(params, msg_stream)
+        self.commit_recursive(params, msg_stream, public_params)
     }
 
     pub fn verify(
@@ -164,18 +272,19 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         commit: &M,
         opening: &M,
         col_range: Option<std::ops::Range<usize>>,
+        public_params: &Wee25PublicParams<M>,
     ) -> bool {
         debug_assert_eq!(msg.row_size(), self.secret_size);
         debug_assert_eq!(msg.col_size() % self.m_b, 0);
         let msg_size = msg.col_size() / self.m_b;
-        let verifier = self.verifier(msg_size, col_range.clone());
+        let verifier = self.verifier(msg_size, col_range.clone(), public_params);
         let target_msg = if let Some(col_range) = col_range {
             msg.slice_columns(self.m_b * col_range.start, self.m_b * col_range.end)
         } else {
             msg.clone()
         };
         let lhs = commit.clone() * verifier;
-        let rhs = target_msg - self.b.clone() * opening;
+        let rhs = target_msg - public_params.b.clone() * opening;
         lhs == rhs
     }
 
@@ -183,6 +292,7 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         &self,
         params: &<M::P as Poly>::Params,
         msg_stream: &MsgMatrixStream<'_, M>,
+        public_params: &Wee25PublicParams<M>,
     ) -> M {
         let cols = msg_stream.len();
         debug_assert!(
@@ -195,7 +305,7 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             let parts = msg_stream.read(0..cols);
             let refs = parts.iter().collect::<Vec<_>>();
             let msg = parts[0].concat_columns(&refs[1..]);
-            return self.commit_base(params, &msg);
+            return self.commit_base(params, &msg, public_params);
         }
         debug_assert!(
             cols % self.tree_base == 0,
@@ -209,15 +319,20 @@ impl<M: PolyMatrix> Wee25Commit<M> {
                 let start = idx * child_cols;
                 let end = start + child_cols;
                 let part_stream = msg_stream.slice(start..end);
-                self.commit_recursive(params, &part_stream)
+                self.commit_recursive(params, &part_stream, public_params)
             })
             .collect::<Vec<_>>();
         let commit_refs = commits.iter().collect::<Vec<_>>();
         let combined = commits[0].concat_columns(&commit_refs[1..]);
-        self.commit_base(params, &combined)
+        self.commit_base(params, &combined, public_params)
     }
 
-    fn commit_base(&self, params: &<M::P as Poly>::Params, msg: &M) -> M {
+    fn commit_base(
+        &self,
+        params: &<M::P as Poly>::Params,
+        msg: &M,
+        public_params: &Wee25PublicParams<M>,
+    ) -> M {
         let base_cols = self.tree_base * self.m_b;
         debug_assert_eq!(
             msg.size(),
@@ -237,7 +352,7 @@ impl<M: PolyMatrix> Wee25Commit<M> {
                         let a = decomposed_col.entry(r, 0);
                         let row_start = (j * self.m_g + r) * self.secret_size;
                         let row_end = row_start + self.secret_size;
-                        let w_block = self.w.slice_rows(row_start, row_end);
+                        let w_block = public_params.w.slice_rows(row_start, row_end);
                         acc = acc + (w_block * &a);
                     }
                     acc
@@ -251,12 +366,11 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         params: &<M::P as Poly>::Params,
         msg_stream: &MsgMatrixStream<'_, M>,
         col_range: Option<Range<usize>>,
+        public_params: &Wee25PublicParams<M>,
     ) -> M {
         self.assert_stream_len(msg_stream.len());
-        let v_base = self.verifier_base(false);
-        let v_base_last = self.verifier_base(true);
-        let top_j = self.t_top.clone() * &self.j_2m;
-        let top_j_last = self.t_top.clone() * &self.j_2m_last;
+        let v_base = self.verifier_base(public_params, false);
+        let v_base_last = self.verifier_base(public_params, true);
         let commit_cache: DashMap<(usize, usize), M> = DashMap::new();
         let z_prime_cache: DashMap<(usize, usize, usize), M> = DashMap::new();
         let verifier_cache: DashMap<(usize, usize), M> = DashMap::new();
@@ -277,11 +391,12 @@ impl<M: PolyMatrix> Wee25Commit<M> {
                     col_idx,
                     &v_base,
                     &v_base_last,
-                    &top_j,
-                    &top_j_last,
+                    &public_params.top_j,
+                    &public_params.top_j_last,
                     &commit_cache,
                     &z_prime_cache,
                     &verifier_cache,
+                    public_params,
                 )
             })
             .collect::<Vec<_>>();
@@ -300,6 +415,7 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         commit_cache: &DashMap<(usize, usize), M>,
         z_prime_cache: &DashMap<(usize, usize, usize), M>,
         verifier_cache: &DashMap<(usize, usize), M>,
+        public_params: &Wee25PublicParams<M>,
     ) -> M {
         let cols = msg_stream.len();
         if cols == self.tree_base {
@@ -320,7 +436,7 @@ impl<M: PolyMatrix> Wee25Commit<M> {
                 if let Some(entry) = commit_cache.get(&key) {
                     return entry.clone();
                 }
-                let commit = self.commit_recursive(params, &part_stream);
+                let commit = self.commit_recursive(params, &part_stream, public_params);
                 commit_cache.insert(key, commit.clone());
                 commit
             })
@@ -348,6 +464,7 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             commit_cache,
             z_prime_cache,
             verifier_cache,
+            public_params,
         );
         let verifier =
             self.verifier_recursive(v_base, v_base_last, child_cols, child_col_idx, verifier_cache);
@@ -394,7 +511,12 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             .reduce(|| M::zero(params, self.m_b, slice_width), |left, right| left + right)
     }
 
-    pub fn verifier(&self, cols: usize, col_range: Option<Range<usize>>) -> M {
+    pub fn verifier(
+        &self,
+        cols: usize,
+        col_range: Option<Range<usize>>,
+        public_params: &Wee25PublicParams<M>,
+    ) -> M {
         let col_range = col_range.unwrap_or(0..cols);
         debug_assert!(col_range.start < col_range.end, "column range must be non-empty");
         let mut cursor = cols;
@@ -420,8 +542,8 @@ impl<M: PolyMatrix> Wee25Commit<M> {
             col_range.end,
             total_cols
         );
-        let base = self.verifier_base(false);
-        let base_last = self.verifier_base(true);
+        let base = self.verifier_base(public_params, false);
+        let base_last = self.verifier_base(public_params, true);
         let cache: DashMap<(usize, usize), M> = DashMap::new();
         let cols_vec = col_range
             .map(|col_idx| self.verifier_recursive(&base, &base_last, cols, col_idx, &cache))
@@ -479,9 +601,9 @@ impl<M: PolyMatrix> Wee25Commit<M> {
         result
     }
 
-    fn verifier_base(&self, is_leaf: bool) -> M {
-        let j_2m = if is_leaf { &self.j_2m_last } else { &self.j_2m };
-        self.t_bottom.clone() * j_2m
+    fn verifier_base(&self, public_params: &Wee25PublicParams<M>, is_leaf: bool) -> M {
+        let j_2m = if is_leaf { &public_params.j_2m_last } else { &public_params.j_2m };
+        public_params.t_bottom.clone() * j_2m
     }
 
     fn assert_stream_len(&self, cols: usize) {
@@ -533,32 +655,33 @@ mod tests {
         let _ = tracing_subscriber::fmt::try_init();
         let params = DCRTPolyParams::new(4, 2, 17, 15);
         let secret_size = 1;
-        let m_b = (&params.modulus_digits() + 2) * secret_size;
         let tree_base = 2;
         let cols = 4;
 
         let start = Instant::now();
-        let commit_params = Wee25Commit::<DCRTPolyMatrix>::setup::<
-            DCRTPolyUniformSampler,
-            DCRTPolyTrapdoorSampler,
-        >(&params, secret_size, SIGMA, tree_base);
+        let commit_params = Wee25Commit::<DCRTPolyMatrix>::new(&params, secret_size, tree_base);
+        let public_params = commit_params
+            .sample_public_params::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
+                &params, SIGMA,
+            );
         info!("commit params generated in {:?}", start.elapsed());
 
-        let msg_blocks =
-            (0..cols).map(|_| DCRTPolyMatrix::zero(&params, secret_size, m_b)).collect::<Vec<_>>();
+        let msg_blocks = (0..cols)
+            .map(|_| DCRTPolyMatrix::zero(&params, secret_size, commit_params.m_b))
+            .collect::<Vec<_>>();
         let msg_matrix = concat_blocks(&msg_blocks);
         let msg_stream = MsgMatrixStream::from_blocks(msg_blocks);
         let start = Instant::now();
-        let commitment = commit_params.commit(&params, &msg_stream);
+        let commitment = commit_params.commit(&params, &msg_stream, &public_params);
         info!("commitment generated in {:?}", start.elapsed());
         let start = Instant::now();
-        let _verifier = commit_params.verifier(cols, None);
+        let _verifier = commit_params.verifier(cols, None, &public_params);
         info!("verifier generated in {:?}", start.elapsed());
         let start = Instant::now();
-        let opening = commit_params.open(&params, &msg_stream, None);
+        let opening = commit_params.open(&params, &msg_stream, None, &public_params);
         info!("opening generated in {:?}", start.elapsed());
 
-        assert!(commit_params.verify(&msg_matrix, &commitment, &opening, None));
+        assert!(commit_params.verify(&msg_matrix, &commitment, &opening, None, &public_params));
     }
 
     #[test]
@@ -567,36 +690,41 @@ mod tests {
         let _ = tracing_subscriber::fmt::try_init();
         let params = DCRTPolyParams::new(4, 2, 17, 15);
         let secret_size = 1;
-        let m_b = (&params.modulus_digits() + 2) * secret_size;
         let tree_base = 2;
         let cols = 4;
 
         let start = Instant::now();
-        let commit_params = Wee25Commit::<DCRTPolyMatrix>::setup::<
-            DCRTPolyUniformSampler,
-            DCRTPolyTrapdoorSampler,
-        >(&params, secret_size, SIGMA, tree_base);
+        let commit_params = Wee25Commit::<DCRTPolyMatrix>::new(&params, secret_size, tree_base);
+        let public_params = commit_params
+            .sample_public_params::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
+                &params, SIGMA,
+            );
         info!("commit params generated in {:?}", start.elapsed());
 
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let msg_blocks = (0..cols)
             .map(|_| {
-                uniform_sampler.sample_uniform(&params, secret_size, m_b, DistType::FinRingDist)
+                uniform_sampler.sample_uniform(
+                    &params,
+                    secret_size,
+                    commit_params.m_b,
+                    DistType::FinRingDist,
+                )
             })
             .collect::<Vec<_>>();
         let msg_matrix = concat_blocks(&msg_blocks);
         let msg_stream = MsgMatrixStream::from_blocks(msg_blocks);
         let start = Instant::now();
-        let commitment = commit_params.commit(&params, &msg_stream);
+        let commitment = commit_params.commit(&params, &msg_stream, &public_params);
         info!("commitment generated in {:?}", start.elapsed());
         let start = Instant::now();
-        let _verifier = commit_params.verifier(cols, None);
+        let _verifier = commit_params.verifier(cols, None, &public_params);
         info!("verifier generated in {:?}", start.elapsed());
         let start = Instant::now();
-        let opening = commit_params.open(&params, &msg_stream, None);
+        let opening = commit_params.open(&params, &msg_stream, None, &public_params);
         info!("opening generated in {:?}", start.elapsed());
 
-        assert!(commit_params.verify(&msg_matrix, &commitment, &opening, None));
+        assert!(commit_params.verify(&msg_matrix, &commitment, &opening, None, &public_params));
     }
 
     #[test]
@@ -605,42 +733,52 @@ mod tests {
         let _ = tracing_subscriber::fmt::try_init();
         let params = DCRTPolyParams::new(4, 2, 17, 15);
         let secret_size = 1;
-        let m_b = (&params.modulus_digits() + 2) * secret_size;
         let tree_base = 2;
         let cols = 4;
 
         let start = Instant::now();
-        let commit_params = Wee25Commit::<DCRTPolyMatrix>::setup::<
-            DCRTPolyUniformSampler,
-            DCRTPolyTrapdoorSampler,
-        >(&params, secret_size, SIGMA, tree_base);
+        let commit_params = Wee25Commit::<DCRTPolyMatrix>::new(&params, secret_size, tree_base);
+        let public_params = commit_params
+            .sample_public_params::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
+                &params, SIGMA,
+            );
         info!("commit params generated in {:?}", start.elapsed());
 
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let msg_blocks1 = (0..cols)
             .map(|_| {
-                uniform_sampler.sample_uniform(&params, secret_size, m_b, DistType::FinRingDist)
+                uniform_sampler.sample_uniform(
+                    &params,
+                    secret_size,
+                    commit_params.m_b,
+                    DistType::FinRingDist,
+                )
             })
             .collect::<Vec<_>>();
         let msg_stream1 = MsgMatrixStream::from_blocks(msg_blocks1);
         let start = Instant::now();
-        let commitment = commit_params.commit(&params, &msg_stream1);
+        let commitment = commit_params.commit(&params, &msg_stream1, &public_params);
         info!("commitment generated in {:?}", start.elapsed());
         let start = Instant::now();
-        let _verifier = commit_params.verifier(cols, None);
+        let _verifier = commit_params.verifier(cols, None, &public_params);
         info!("verifier generated in {:?}", start.elapsed());
         let msg_blocks2 = (0..cols)
             .map(|_| {
-                uniform_sampler.sample_uniform(&params, secret_size, m_b, DistType::FinRingDist)
+                uniform_sampler.sample_uniform(
+                    &params,
+                    secret_size,
+                    commit_params.m_b,
+                    DistType::FinRingDist,
+                )
             })
             .collect::<Vec<_>>();
         let msg_matrix2 = concat_blocks(&msg_blocks2);
         let msg_stream2 = MsgMatrixStream::from_blocks(msg_blocks2);
         let start = Instant::now();
-        let opening = commit_params.open(&params, &msg_stream2, None);
+        let opening = commit_params.open(&params, &msg_stream2, None, &public_params);
         info!("opening generated in {:?}", start.elapsed());
 
-        assert!(!commit_params.verify(&msg_matrix2, &commitment, &opening, None));
+        assert!(!commit_params.verify(&msg_matrix2, &commitment, &opening, None, &public_params));
     }
 
     #[test]
@@ -649,35 +787,47 @@ mod tests {
         let _ = tracing_subscriber::fmt::try_init();
         let params = DCRTPolyParams::new(4, 2, 17, 15);
         let secret_size = 1;
-        let m_b = (&params.modulus_digits() + 2) * secret_size;
         let tree_base = 2;
         let cols = 4;
 
         let start = Instant::now();
-        let commit_params = Wee25Commit::<DCRTPolyMatrix>::setup::<
-            DCRTPolyUniformSampler,
-            DCRTPolyTrapdoorSampler,
-        >(&params, secret_size, SIGMA, tree_base);
+        let commit_params = Wee25Commit::<DCRTPolyMatrix>::new(&params, secret_size, tree_base);
+        let public_params = commit_params
+            .sample_public_params::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
+                &params, SIGMA,
+            );
         info!("commit params generated in {:?}", start.elapsed());
 
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let msg_blocks = (0..cols)
             .map(|_| {
-                uniform_sampler.sample_uniform(&params, secret_size, m_b, DistType::FinRingDist)
+                uniform_sampler.sample_uniform(
+                    &params,
+                    secret_size,
+                    commit_params.m_b,
+                    DistType::FinRingDist,
+                )
             })
             .collect::<Vec<_>>();
         let msg_matrix = concat_blocks(&msg_blocks);
         let msg_stream = MsgMatrixStream::from_blocks(msg_blocks);
 
         let start = Instant::now();
-        let commitment = commit_params.commit(&params, &msg_stream);
+        let commitment = commit_params.commit(&params, &msg_stream, &public_params);
         info!("commitment generated in {:?}", start.elapsed());
 
         let col_range = 1..3;
         let start = Instant::now();
-        let opening = commit_params.open(&params, &msg_stream, Some(col_range.clone()));
+        let opening =
+            commit_params.open(&params, &msg_stream, Some(col_range.clone()), &public_params);
         info!("opening generated in {:?}", start.elapsed());
 
-        assert!(commit_params.verify(&msg_matrix, &commitment, &opening, Some(col_range)));
+        assert!(commit_params.verify(
+            &msg_matrix,
+            &commitment,
+            &opening,
+            Some(col_range),
+            &public_params
+        ));
     }
 }

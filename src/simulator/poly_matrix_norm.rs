@@ -151,6 +151,20 @@ impl Mul<&PolyNorm> for PolyMatrixNorm {
     }
 }
 
+impl Mul<&PolyNorm> for &PolyMatrixNorm {
+    type Output = PolyMatrixNorm;
+    fn mul(self, rhs: &PolyNorm) -> Self::Output {
+        assert!(self.poly_norm.ctx == rhs.ctx, "ctx must match");
+        PolyMatrixNorm {
+            nrow: self.nrow,
+            ncol: self.ncol,
+            ncol_sqrt: self.ncol_sqrt.clone(),
+            poly_norm: &self.poly_norm * rhs,
+            zero_rows: None,
+        }
+    }
+}
+
 impl Mul<PolyMatrixNorm> for PolyNorm {
     type Output = PolyMatrixNorm;
     fn mul(self, rhs: PolyMatrixNorm) -> Self::Output {

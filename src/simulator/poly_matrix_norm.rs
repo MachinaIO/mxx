@@ -58,6 +58,20 @@ impl PolyMatrixNorm {
         }
     }
 
+    pub fn gadget_decomposed_with_secret_size(
+        ctx: Arc<SimulatorContext>,
+        secret_size: usize,
+        ncol: usize,
+    ) -> Self {
+        PolyMatrixNorm {
+            nrow: secret_size * ctx.log_base_q,
+            ncol,
+            ncol_sqrt: BigDecimal::from(ncol as u64).sqrt().expect("sqrt(ncol) to failed"),
+            poly_norm: PolyNorm::new(ctx.clone(), ctx.base.clone() - BigDecimal::from(1u64)),
+            zero_rows: None,
+        }
+    }
+
     #[inline]
     pub fn ctx(&self) -> &SimulatorContext {
         &self.poly_norm.ctx
@@ -196,5 +210,19 @@ impl Mul<PolyMatrixNorm> for BigDecimal {
     type Output = PolyMatrixNorm;
     fn mul(self, rhs: PolyMatrixNorm) -> Self::Output {
         rhs * self
+    }
+}
+
+impl Mul<u32> for PolyMatrixNorm {
+    type Output = Self;
+    fn mul(self, rhs: u32) -> Self::Output {
+        self * BigDecimal::from(rhs)
+    }
+}
+
+impl Mul<u32> for &PolyMatrixNorm {
+    type Output = PolyMatrixNorm;
+    fn mul(self, rhs: u32) -> Self::Output {
+        self.clone() * BigDecimal::from(rhs)
     }
 }

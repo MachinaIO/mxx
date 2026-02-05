@@ -216,6 +216,19 @@ impl PolyMatrix for DCRTPolyMatrix {
         .decompose()
     }
 
+    fn vectorize_columns(&self) -> Self {
+        let (nrow, ncol) = self.size();
+        let total = nrow * ncol;
+        if total == 0 {
+            return Self::zero(&self.params, 0, 1);
+        }
+        let mut elems = Vec::with_capacity(total);
+        for j in 0..ncol {
+            elems.extend(self.get_column(j));
+        }
+        Self::from_poly_vec_column(&self.params, elems)
+    }
+
     #[inline]
     fn read_from_files<P: AsRef<Path> + Send + Sync>(
         params: &<Self::P as Poly>::Params,

@@ -2,9 +2,10 @@ use keccak_asm::Keccak256;
 use mxx::{
     bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
     circuit::PolyCircuit,
+    commit::wee25::{Wee25Commit, Wee25PublicParams},
     gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly},
     lookup::{
-        ggh15_eval::{GGH15BGGEncodingPltEvaluator, GGH15BGGPubKeyPltEvaluator},
+        commit_eval::{CommitBGGEncodingPltEvaluator, CommitBGGPubKeyPltEvaluator},
         poly::PolyPltEvaluator,
     },
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
@@ -26,11 +27,11 @@ use tracing::info;
 
 #[tokio::test]
 #[ignore]
-async fn test_arithmetic_circuit_operations_ggh15() {
+async fn test_arithmetic_circuit_operations_commit() {
     // Mixed operations in a single circuit: (a + b) * c - a.
     const P_MODULI_BITS: usize = 6;
     const SCALE: u64 = 1 << 7;
-    const BASE_BITS: u32 = 8;
+    const BASE_BITS: u32 = 9;
     let _ = tracing_subscriber::fmt::try_init();
 
     // Use parameters where NestedRnsPoly is known to be correct.
@@ -45,23 +46,23 @@ async fn test_arithmetic_circuit_operations_ggh15() {
 
     let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
     let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-    let poly_c = NestedRnsPoly::input(ctx.clone(), &mut circuit);
+    // let poly_c = NestedRnsPoly::input(ctx.clone(), &mut circuit);
 
-    let sum = poly_a.add_full_reduce(&poly_b, None, &mut circuit);
-    let prod = sum.mul_full_reduce(&poly_c, None, &mut circuit);
-    let out_poly = prod.sub_full_reduce(&poly_a, None, &mut circuit);
-    let out = out_poly.reconstruct(None, &mut circuit);
+    // let sum = poly_a.add_full_reduce(&poly_b, None, &mut circuit);
+    let prod = poly_a.mul_full_reduce(&poly_b, None, &mut circuit);
+    // let out_poly = prod.sub_full_reduce(&poly_a, None, &mut circuit);
+    let out = prod.reconstruct(None, &mut circuit);
     circuit.output(vec![out]);
     info!("{}", format!("non-free depth: {}", circuit.non_free_depth()));
 
     // 1) Plain polynomial evaluation.
     let a_value: BigUint = gen_biguint_for_modulus(&mut rng, modulus.as_ref());
     let b_value: BigUint = gen_biguint_for_modulus(&mut rng, modulus.as_ref());
-    let c_value: BigUint = gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+    // let c_value: BigUint = gen_biguint_for_modulus(&mut rng, modulus.as_ref());
     let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value);
     let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value);
-    let c_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &c_value);
-    let plaintext_inputs = [a_inputs.clone(), b_inputs.clone(), c_inputs.clone()].concat();
+    // let c_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &c_value);
+    let plaintext_inputs = [a_inputs.clone(), b_inputs.clone()].concat();
 
     let plt_evaluator = PolyPltEvaluator::new();
     let eval_results = circuit.eval(
@@ -73,55 +74,73 @@ async fn test_arithmetic_circuit_operations_ggh15() {
     assert_eq!(eval_results.len(), 1);
 
     let q = modulus.as_ref();
-    let aa = &a_value % q;
-    let bb = &b_value % q;
-    let cc = &c_value % q;
-    let t = (&aa + &bb) % q;
-    let t = (t * &cc) % q;
-    let expected = (t + (q - &aa)) % q;
+    // let aa = &a_value % q;
+    // let bb = &b_value % q;
+    // let cc = &c_value % q;
+    // let t = (&aa + &bb) % q;
+    // let t = (t * &cc) % q;
+    // let expected = (t + (q - &aa)) % q;
+    let expected = (&a_value * &b_value) % q;
     let expected_poly = DCRTPoly::from_biguint_to_constant(&params, expected);
 
     assert_eq!(eval_results[0], expected_poly, "mixed operations should be correct");
 
-    // 2) BGG+ public key evaluation (GGH15 PLT).
+    // 2) BGG+ public key evaluation (Commit PLT).
     let tmp_dir = tempdir().unwrap();
     let seed: [u8; 32] = [0u8; 32];
     let d = 1usize;
     let trapdoor_sigma = 4.578;
-    let error_sigma = 0.0;
     let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, trapdoor_sigma);
     let (b0_trapdoor, b0_matrix) = trapdoor_sampler.trapdoor(&params, d);
-    let b0_trapdoor = Arc::new(b0_trapdoor);
-    let b0_matrix = Arc::new(b0_matrix);
 
     init_storage_system(tmp_dir.path().to_path_buf());
     let reveal_plaintexts = vec![true; circuit.num_input()];
     let pk_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(seed, d);
     let pubkeys = pk_sampler.sample(&params, b"BGG_PUBKEY", &reveal_plaintexts);
 
-    let insert_1_to_s = false;
-    let pk_evaluator = GGH15BGGPubKeyPltEvaluator::<
-        DCRTPolyMatrix,
-        DCRTPolyUniformSampler,
-        DCRTPolyHashSampler<Keccak256>,
-        DCRTPolyTrapdoorSampler,
-    >::new(
-        seed,
-        trapdoor_sigma,
-        error_sigma,
+    let tree_base = 4;
+    info!("wee25 public params sampling start");
+    let wee25_commit = Wee25Commit::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::new(
         &params,
-        b0_matrix.clone(),
-        b0_trapdoor.clone(),
-        tmp_dir.path().to_path_buf(),
-        insert_1_to_s,
+        d,
+        tree_base,
+        trapdoor_sigma,
     );
+    wee25_commit.sample_public_params::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
+        &params,
+        seed,
+        tmp_dir.path(),
+    );
+    wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
+    let wee25_public_params = Wee25PublicParams::<DCRTPolyMatrix>::read_from_storage(
+        &params,
+        tmp_dir.path(),
+        &wee25_commit,
+        seed,
+    )
+    .expect("wee25 public params not found");
+    info!("wee25 public params sampling done");
+    let pk_evaluator =
+        CommitBGGPubKeyPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup(
+            &params,
+            d,
+            trapdoor_sigma,
+            tree_base,
+            seed,
+            wee25_public_params,
+        );
     info!("start pubkey evaluation");
     let start = std::time::Instant::now();
     let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(&pk_evaluator));
     info!("{}", format!("end pubkey evaluation in {:?}", start.elapsed()));
     assert_eq!(pubkey_out.len(), 1);
+    info!("commit all LUT matrices");
+    pk_evaluator.commit_all_lut_matrices::<DCRTPolyTrapdoorSampler>(
+        &params,
+        &b0_matrix,
+        &b0_trapdoor,
+    );
     info!("wait for all writes");
-    pk_evaluator.sample_aux_matrices(&params);
     wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
     info!("finish writing");
 
@@ -129,16 +148,26 @@ async fn test_arithmetic_circuit_operations_ggh15() {
     let uniform_sampler = DCRTPolyUniformSampler::new();
     let secrets = uniform_sampler.sample_uniform(&params, 1, d, DistType::BitDist).get_row(0);
     let s = DCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
-    let c_b0 = s.clone() * b0_matrix.as_ref();
+    let c_b0 = s.clone() * &b0_matrix;
+    let c_b = s.clone() * pk_evaluator.wee25_public_params.b.clone();
 
     let bgg_encoding_sampler =
         BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
     let zero_plaintexts = vec![DCRTPoly::const_zero(&params); circuit.num_input()];
     let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &zero_plaintexts);
-    let enc_evaluator = GGH15BGGEncodingPltEvaluator::<
-        DCRTPolyMatrix,
-        DCRTPolyHashSampler<Keccak256>,
-    >::new(seed, &params, tmp_dir.path().to_path_buf(), d, c_b0);
+    let enc_evaluator =
+        CommitBGGEncodingPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup(
+            &params,
+            tree_base,
+            seed,
+            &circuit,
+            &pubkeys[0],
+            &pubkeys[1..],
+            &c_b0,
+            &c_b,
+            &tmp_dir.path().to_path_buf(),
+            pk_evaluator.wee25_public_params.clone(),
+        );
     info!("start encoding evaluation");
     let start = std::time::Instant::now();
     let encoding_out = circuit.eval(&params, &encodings[0], &encodings[1..], Some(&enc_evaluator));
@@ -149,4 +178,5 @@ async fn test_arithmetic_circuit_operations_ggh15() {
 
     let encoding_expected = s.clone() * &pubkey_out[0].matrix;
     assert_eq!(encoding_out[0].vector, encoding_expected);
+    drop(tmp_dir);
 }

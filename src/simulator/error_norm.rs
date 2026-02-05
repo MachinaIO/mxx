@@ -2,7 +2,7 @@ use crate::{
     circuit::{Evaluable, PolyCircuit, gate::GateId},
     element::PolyElem,
     impl_binop_with_refs,
-    lookup::{PltEvaluator, PublicLut},
+    lookup::{PltEvaluator, PublicLut, commit_eval::compute_padded_len},
     poly::dcrt::poly::DCRTPoly,
     simulator::{SimulatorContext, poly_matrix_norm::PolyMatrixNorm, poly_norm::PolyNorm},
     utils::bigdecimal_bits_ceil,
@@ -258,6 +258,116 @@ impl PltEvaluator<ErrorNorm> for NormPltGGH15Evaluator {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct NormPltCommitEvaluator {
+    pub lut_term: PolyMatrixNorm,
+}
+
+impl NormPltCommitEvaluator {
+    pub fn new(
+        ctx: Arc<SimulatorContext>,
+        error_sigma: &BigDecimal,
+        tree_base: usize,
+        circuit: &PolyCircuit<DCRTPoly>,
+    ) -> Self {
+        let lut_vector_len = circuit.lut_vector_len_with_subcircuits();
+        let padded_len = compute_padded_len(tree_base, lut_vector_len);
+        debug!(
+            "NormPltCommitEvaluator padded_len={} lut_vector_len={}",
+            padded_len, lut_vector_len
+        );
+        let preimage_norm = compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base);
+        let t_bottom = PolyMatrixNorm::new(
+            ctx.clone(),
+            ctx.m_b,
+            tree_base * ctx.m_b * ctx.m_g * ctx.m_g,
+            preimage_norm.clone(),
+            None,
+        );
+        let j_mat = PolyMatrixNorm::new(
+            ctx.clone(),
+            t_bottom.ncol,
+            ctx.m_b * ctx.log_base_q,
+            ctx.base.clone() - BigDecimal::from(1u64),
+            None,
+        );
+        let verifier_base = t_bottom * &j_mat;
+        let verifier_norm = verifier_base *
+            PolyMatrixNorm::gadget_decomposed_with_secret_size(ctx.clone(), ctx.m_b, ctx.m_b);
+        let t_top = PolyMatrixNorm::new(
+            ctx.clone(),
+            tree_base * ctx.m_b * ctx.m_b * ctx.m_g,
+            tree_base * ctx.m_b * ctx.m_g * ctx.m_g,
+            preimage_norm.clone(),
+            None,
+        );
+        let t_top_j_mat = &t_top * &j_mat;
+        let msg_tensor_identity = PolyMatrixNorm::new(
+            ctx.clone(),
+            ctx.m_b,
+            t_top.nrow,
+            ctx.base.clone() - BigDecimal::from(1u64),
+            Some(ctx.m_b - 1),
+        );
+        let opening_base = &msg_tensor_identity * t_top_j_mat;
+        let j_mat_last = PolyMatrixNorm::new(
+            ctx.clone(),
+            tree_base * ctx.m_b * ctx.m_g * ctx.m_g,
+            ctx.m_b,
+            ctx.base.clone() - BigDecimal::from(1u64),
+            Some(tree_base * ctx.m_b * ctx.m_g * ctx.m_g - ctx.m_b),
+        );
+        let opening_base_last = &msg_tensor_identity * &t_top * &j_mat_last;
+        let log_tree_base_len = {
+            let mut padded_len = padded_len;
+            let mut depth = 0;
+            while padded_len > 1 {
+                debug_assert!(padded_len % tree_base == 0);
+                padded_len /= tree_base;
+                depth += 1;
+            }
+            depth
+        };
+        let opening_norm = {
+            let lhs = opening_base *
+                PolyMatrixNorm::gadget_decomposed_with_secret_size(ctx.clone(), ctx.m_b, ctx.m_b) *
+                (log_tree_base_len - 1);
+            lhs + opening_base_last
+        };
+
+        let init_error = PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_b, error_sigma * 6, None);
+        let preimage =
+            PolyMatrixNorm::new(ctx.clone(), ctx.m_b, verifier_norm.nrow, preimage_norm, None);
+        let lut_term = &init_error * preimage * verifier_norm + init_error * opening_norm;
+        info!("lut_term norm bits {}", bigdecimal_bits_ceil(&lut_term.poly_norm.norm));
+        Self { lut_term }
+    }
+}
+
+impl PltEvaluator<ErrorNorm> for NormPltCommitEvaluator {
+    fn public_lookup(
+        &self,
+        _: &<ErrorNorm as Evaluable>::Params,
+        plt: &PublicLut<<ErrorNorm as Evaluable>::P>,
+        _: &ErrorNorm,
+        input: &ErrorNorm,
+        _: GateId,
+        _: usize,
+    ) -> ErrorNorm {
+        let plaintext_bd =
+            BigDecimal::from(num_bigint::BigInt::from(plt.max_output_row().1.value().clone()));
+        let plaintext_norm = PolyNorm::new(input.clone_ctx(), plaintext_bd);
+        let ctx = input.clone_ctx();
+        let m_b = ctx.m_b;
+        let m_g = ctx.m_g;
+        let matrix_norm =
+            &self.lut_term + &input.matrix_norm * PolyMatrixNorm::gadget_decomposed(ctx, m_b);
+        // info!("matrix_norm norm bits {}", bigdecimal_bits_ceil(&matrix_norm.poly_norm.norm));
+        let (matrix_norm, _) = matrix_norm.split_cols(m_g);
+        ErrorNorm { matrix_norm, plaintext_norm }
+    }
+}
+
 pub fn compute_preimage_norm(
     ring_dim_sqrt: &BigDecimal,
     m_g: u64,
@@ -270,8 +380,8 @@ pub fn compute_preimage_norm(
     let m_g_sqrt = BigDecimal::from(m_g).sqrt().expect("sqrt(m_g) failed");
     let term = ring_dim_sqrt.clone() * m_g_sqrt + two_sqrt * ring_dim_sqrt + c_1;
     let preimage_norm = c_0 * 6 * sigma.clone() * ((base + 1) * sigma) * term;
-    let preimage_norm_bits = bigdecimal_bits_ceil(&preimage_norm);
-    info!("{}", format!("preimage norm bits {}", preimage_norm_bits));
+    // let preimage_norm_bits = bigdecimal_bits_ceil(&preimage_norm);
+    // info!("{}", format!("preimage norm bits {}", preimage_norm_bits));
     preimage_norm
 }
 
@@ -446,6 +556,49 @@ mod tests {
             &BigDecimal::from_f64(E_B_SIGMA).unwrap(),
             &BigDecimal::from_f64(E_B_SIGMA).unwrap(),
             None,
+        );
+        let out = circuit.simulate_max_error_norm(
+            ctx.clone(),
+            input_bound.clone(),
+            1,
+            &BigDecimal::from(E_INIT_NORM),
+            Some(&plt_evaluator),
+        );
+        assert_eq!(out.len(), 1);
+        // Bound must be max output coeff across LUT entries (7)
+        assert_eq!(out[0].plaintext_norm.norm, BigDecimal::from(7u64));
+    }
+
+    #[test]
+    fn test_wire_norm_commit_plt_bounds() {
+        // Build a tiny LUT on DCRTPoly where the maximum output coeff is known (e.g., 7)
+        let params = DCRTPolyParams::default();
+        let plt = PublicLut::<DCRTPoly>::new_from_usize_range(
+            &params,
+            2,
+            |params, idx| match idx {
+                0 => (0usize, DCRTPoly::from_usize_to_constant(params, 5)),
+                1 => (1usize, DCRTPoly::from_usize_to_constant(params, 7)),
+                _ => unreachable!("index out of range for test LUT"),
+            },
+            None,
+        );
+
+        // Circuit: out = PLT(in)
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let inputs = circuit.input(1);
+        let plt_id = circuit.register_public_lookup(plt);
+        let out_gate = circuit.public_lookup_gate(inputs[0], plt_id);
+        circuit.output(vec![out_gate]);
+
+        let ctx = make_ctx();
+        let input_bound = BigDecimal::from(5u64);
+        let tree_base = 2;
+        let plt_evaluator = NormPltCommitEvaluator::new(
+            ctx.clone(),
+            &BigDecimal::from_f64(E_B_SIGMA).unwrap(),
+            tree_base,
+            &circuit,
         );
         let out = circuit.simulate_max_error_norm(
             ctx.clone(),

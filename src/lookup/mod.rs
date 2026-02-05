@@ -1,3 +1,4 @@
+pub mod commit_eval;
 pub mod ggh15_eval;
 pub mod lwe_eval;
 pub mod poly;
@@ -24,7 +25,7 @@ pub struct PublicLut<P: Poly> {
     max_output_row: (usize, <P as Poly>::Elem),
 }
 
-impl<P: Poly + 'static> PublicLut<P> {
+impl<P: Poly> PublicLut<P> {
     pub fn new<F>(
         params: &P::Params,
         len: usize,

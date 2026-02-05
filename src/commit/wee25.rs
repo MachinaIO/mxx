@@ -281,11 +281,7 @@ where
                     .map(|block_idx| {
                         (
                             block_idx,
-                            read_bytes_from_multi_batch(
-                                checkpoint_dir,
-                                &chunk_prefix,
-                                block_idx,
-                            ),
+                            read_bytes_from_multi_batch(checkpoint_dir, &chunk_prefix, block_idx),
                         )
                     })
                     .collect::<Vec<_>>();
@@ -342,8 +338,7 @@ where
                 let chunk_ok = parallel_iter!(0..chunk_len).all(|offset| {
                     let top_idx = chunk_start + offset;
                     let last_idx = chunk_start + chunk_len + offset;
-                    let part =
-                        read_bytes_from_multi_batch(checkpoint_dir, &chunk_prefix, top_idx);
+                    let part = read_bytes_from_multi_batch(checkpoint_dir, &chunk_prefix, top_idx);
                     let part_last =
                         read_bytes_from_multi_batch(checkpoint_dir, &chunk_prefix, last_idx);
                     match (part, part_last) {

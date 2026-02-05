@@ -343,12 +343,10 @@ mod test {
         let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
         let (trapdoor, _public_matrix) = trapdoor_sampler.trapdoor(&params, size);
 
-        let bytes =
-            <DCRTPolyTrapdoorSampler as PolyTrapdoorSampler>::trapdoor_to_bytes(&trapdoor);
-        let decoded = <DCRTPolyTrapdoorSampler as PolyTrapdoorSampler>::trapdoor_from_bytes(
-            &params, &bytes,
-        )
-        .expect("trapdoor bytes should decode");
+        let bytes = <DCRTPolyTrapdoorSampler as PolyTrapdoorSampler>::trapdoor_to_bytes(&trapdoor);
+        let decoded =
+            <DCRTPolyTrapdoorSampler as PolyTrapdoorSampler>::trapdoor_from_bytes(&params, &bytes)
+                .expect("trapdoor bytes should decode");
 
         assert_eq!(trapdoor, decoded);
     }

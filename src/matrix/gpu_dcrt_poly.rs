@@ -702,6 +702,19 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         column_matrix.decompose()
     }
 
+    fn vectorize_columns(&self) -> Self {
+        let total = self.nrow.saturating_mul(self.ncol);
+        if total == 0 {
+            return Self::new_zero(&self.params, 0, 1);
+        }
+        let mut out = Self::new_empty(&self.params, total, 1);
+        for j in 0..self.ncol {
+            let dst_row = j.saturating_mul(self.nrow);
+            out.copy_block_from(self, dst_row, 0, 0, j, self.nrow, 1);
+        }
+        out
+    }
+
     fn read_from_files<P: AsRef<Path> + Send + Sync>(
         params: &<Self::P as Poly>::Params,
         nrow: usize,

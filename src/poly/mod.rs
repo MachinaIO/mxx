@@ -33,6 +33,23 @@ pub trait PolyParams: Clone + Debug + PartialEq + Eq + Send + Sync {
     /// Given the parameter, return the crt decomposed moduli as array along with the bit size and
     /// depth of these moduli.
     fn to_crt(&self) -> (Vec<u64>, usize, usize);
+    /// Return CRT reconstruction coefficients for each CRT modulus.
+    fn reconst_coeffs(&self) -> Vec<BigUint> {
+        let (moduli, _, _) = self.to_crt();
+        let modulus_big: Arc<BigUint> = self.modulus().into();
+        moduli
+            .into_iter()
+            .map(|qi| {
+                let qi_big = BigUint::from(qi);
+                let q_over_qi = modulus_big.as_ref() / &qi_big;
+                let q_over_qi_mod = &q_over_qi % &qi_big;
+                let inv =
+                    mod_inverse(q_over_qi_mod.to_u64().expect("CRT residue must fit in u64"), qi)
+                        .expect("CRT moduli must be coprime");
+                (&q_over_qi * BigUint::from(inv)) % modulus_big.as_ref()
+            })
+            .collect()
+    }
     // return `q/q_i` and the coefficient for CRT reconstruction.
     fn to_crt_coeffs(&self, crt_idx: usize) -> (BigUint, BigUint) {
         let (moduli, _, _) = self.to_crt();

@@ -3,14 +3,14 @@ use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterato
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions},
+    fs::{File, OpenOptions, write as write_file},
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, mpsc},
     thread,
     time::Instant,
 };
-use tracing::info;
+use tracing::{debug, info};
 
 #[derive(Debug)]
 pub struct SerializedMatrix {
@@ -263,7 +263,24 @@ pub fn init_storage_system(dir_path: PathBuf) {
     }
 
     if let Some(meta) = METADATA.get() {
-        meta.lock().unwrap().entries.clear();
+        let index_path = dir_path.join("lookup_tables.index");
+        if let Ok(index_data) = std::fs::read_to_string(&index_path) {
+            debug!("init_storage_system: lookup_tables.index read ok");
+            if let Ok(global_index) = serde_json::from_str::<GlobalTableIndex>(&index_data) {
+                debug!("init_storage_system: lookup_tables.index parsed ok");
+                if !global_index.entries.is_empty() {
+                    debug!("init_storage_system: lookup_tables.index entries non-empty");
+                    debug!("init_storage_system: loaded {} entries", global_index.entries.len());
+                    meta.lock().unwrap().entries = global_index.entries;
+                } else {
+                    meta.lock().unwrap().entries.clear();
+                }
+            } else {
+                meta.lock().unwrap().entries.clear();
+            }
+        } else {
+            meta.lock().unwrap().entries.clear();
+        }
     }
 
     if let Some(sender) = WRITE_SENDER.get() {
@@ -361,6 +378,13 @@ fn write_buffer(
         indices: buffer.indices.clone(),
     };
     metadata.lock().unwrap().entries.insert(buffer.id_prefix, entry);
+
+    // Write index after each append so readers can resume mid-run.
+    let snapshot = { metadata.lock().unwrap().clone() };
+    let index_path = state.dir_path.join("lookup_tables.index");
+    if let Err(e) = write_global_index_sync(&snapshot, &index_path) {
+        eprintln!("Failed to write global index: {}", e);
+    }
 }
 
 // /// Split a MultiBatchLookupBuffer into multiple buffers based on byte limit.
@@ -622,6 +646,42 @@ where
     }
 }
 
+pub fn get_lookup_buffer_bytes(
+    payloads: Vec<(usize, Vec<u8>)>,
+    id_prefix: &str,
+) -> BatchLookupBuffer {
+    debug_assert!(!payloads.is_empty(), "payloads must be non-empty");
+    let bytes_per_matrix = payloads[0].1.len();
+    debug_assert!(
+        payloads.iter().all(|(_, bytes)| bytes.len() == bytes_per_matrix),
+        "all payloads must have the same length"
+    );
+    let mut sorted_payloads = payloads;
+    sorted_payloads.sort_by_key(|(k, _)| *k);
+    let num_matrices = sorted_payloads.len();
+    let indices: Vec<usize> = sorted_payloads.iter().map(|(k, _)| *k).collect();
+    let header_size = 16 + 8 * num_matrices;
+    let total_size = header_size + bytes_per_matrix * num_matrices;
+    let mut encoded = vec![0u8; total_size];
+    encoded[0..8].copy_from_slice(&(num_matrices as u64).to_le_bytes());
+    encoded[8..16].copy_from_slice(&(bytes_per_matrix as u64).to_le_bytes());
+    for (i, &idx) in indices.iter().enumerate() {
+        let offset = 16 + i * 8;
+        encoded[offset..offset + 8].copy_from_slice(&(idx as u64).to_le_bytes());
+    }
+    for (i, (_, bytes)) in sorted_payloads.into_iter().enumerate() {
+        let offset = header_size + i * bytes_per_matrix;
+        encoded[offset..offset + bytes_per_matrix].copy_from_slice(&bytes);
+    }
+    BatchLookupBuffer {
+        data: encoded,
+        num_matrices,
+        bytes_per_matrix,
+        indices,
+        id_prefix: id_prefix.to_string(),
+    }
+}
+
 /// CPU preprocessing (blocking) + background I/O (non-blocking)
 // pub fn store_and_drop_matrix<M>(matrix: M, dir: &Path, id: &str)
 // where
@@ -685,6 +745,11 @@ where
 async fn write_global_index(index: &GlobalTableIndex, path: &Path) -> Result<(), std::io::Error> {
     let json = serde_json::to_string_pretty(index)?;
     tokio::fs::write(path, json.as_bytes()).await
+}
+
+fn write_global_index_sync(index: &GlobalTableIndex, path: &Path) -> Result<(), std::io::Error> {
+    let json = serde_json::to_string_pretty(index)?;
+    write_file(path, json.as_bytes())
 }
 
 /// Wait for all pending writes to complete and write batched lookup tables

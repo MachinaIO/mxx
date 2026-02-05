@@ -48,6 +48,16 @@ impl DCRTPoly {
         &self.ptr_poly
     }
 
+    #[inline]
+    pub(crate) fn eval_bytes(&self) -> Vec<u8> {
+        self.ptr_poly.GetEvaluationBytes()
+    }
+
+    #[inline]
+    pub fn eval_slots(&self) -> Vec<BigUint> {
+        parse_coefficients_bytes(&self.eval_bytes()).coefficients
+    }
+
     pub fn modulus_switch(
         &self,
         params: &DCRTPolyParams,

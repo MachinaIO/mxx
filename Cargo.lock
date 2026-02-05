@@ -443,6 +443,7 @@ dependencies = [
  "bigdecimal",
  "bincode",
  "bitvec",
+ "cc",
  "dashmap",
  "digest",
  "itertools",

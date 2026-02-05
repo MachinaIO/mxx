@@ -59,6 +59,17 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         (trapdoor, a)
     }
 
+    fn trapdoor_to_bytes(trapdoor: &Self::Trapdoor) -> Vec<u8> {
+        trapdoor.to_compact_bytes()
+    }
+
+    fn trapdoor_from_bytes(
+        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
+        bytes: &[u8],
+    ) -> Option<Self::Trapdoor> {
+        DCRTTrapdoor::from_compact_bytes(params, bytes)
+    }
+
     fn preimage(
         &self,
         params: &<<Self::M as PolyMatrix>::P as crate::poly::Poly>::Params,
@@ -322,6 +333,24 @@ mod test {
         };
         let gadget_matrix = DCRTPolyMatrix::gadget_matrix(&params, size);
         assert_eq!(muled, gadget_matrix);
+    }
+
+    #[test]
+    #[sequential_test::sequential]
+    fn test_trapdoor_round_trip_bytes() {
+        let size: usize = 3;
+        let params = DCRTPolyParams::default();
+        let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let (trapdoor, _public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+
+        let bytes =
+            <DCRTPolyTrapdoorSampler as PolyTrapdoorSampler>::trapdoor_to_bytes(&trapdoor);
+        let decoded = <DCRTPolyTrapdoorSampler as PolyTrapdoorSampler>::trapdoor_from_bytes(
+            &params, &bytes,
+        )
+        .expect("trapdoor bytes should decode");
+
+        assert_eq!(trapdoor, decoded);
     }
 
     #[test]

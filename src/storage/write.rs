@@ -647,6 +647,42 @@ where
     }
 }
 
+pub fn get_lookup_buffer_bytes(
+    payloads: Vec<(usize, Vec<u8>)>,
+    id_prefix: &str,
+) -> BatchLookupBuffer {
+    debug_assert!(!payloads.is_empty(), "payloads must be non-empty");
+    let bytes_per_matrix = payloads[0].1.len();
+    debug_assert!(
+        payloads.iter().all(|(_, bytes)| bytes.len() == bytes_per_matrix),
+        "all payloads must have the same length"
+    );
+    let mut sorted_payloads = payloads;
+    sorted_payloads.sort_by_key(|(k, _)| *k);
+    let num_matrices = sorted_payloads.len();
+    let indices: Vec<usize> = sorted_payloads.iter().map(|(k, _)| *k).collect();
+    let header_size = 16 + 8 * num_matrices;
+    let total_size = header_size + bytes_per_matrix * num_matrices;
+    let mut encoded = vec![0u8; total_size];
+    encoded[0..8].copy_from_slice(&(num_matrices as u64).to_le_bytes());
+    encoded[8..16].copy_from_slice(&(bytes_per_matrix as u64).to_le_bytes());
+    for (i, &idx) in indices.iter().enumerate() {
+        let offset = 16 + i * 8;
+        encoded[offset..offset + 8].copy_from_slice(&(idx as u64).to_le_bytes());
+    }
+    for (i, (_, bytes)) in sorted_payloads.into_iter().enumerate() {
+        let offset = header_size + i * bytes_per_matrix;
+        encoded[offset..offset + bytes_per_matrix].copy_from_slice(&bytes);
+    }
+    BatchLookupBuffer {
+        data: encoded,
+        num_matrices,
+        bytes_per_matrix,
+        indices,
+        id_prefix: id_prefix.to_string(),
+    }
+}
+
 /// CPU preprocessing (blocking) + background I/O (non-blocking)
 // pub fn store_and_drop_matrix<M>(matrix: M, dir: &Path, id: &str)
 // where

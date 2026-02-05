@@ -50,6 +50,59 @@ impl DCRTTrapdoor {
         Self { r, e, a_mat, b_mat, d_mat, re }
     }
 
+    pub fn to_compact_bytes(&self) -> Vec<u8> {
+        let mats = [&self.r, &self.e, &self.a_mat, &self.b_mat, &self.d_mat, &self.re];
+        let mut parts = Vec::with_capacity(mats.len());
+        let mut total_len = 0usize;
+        for mat in mats {
+            let bytes = mat.to_compact_bytes();
+            total_len += 8 + bytes.len();
+            parts.push(bytes);
+        }
+        let mut out = Vec::with_capacity(total_len);
+        for bytes in parts {
+            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            out.extend_from_slice(&bytes);
+        }
+        out
+    }
+
+    pub fn from_compact_bytes(params: &DCRTPolyParams, bytes: &[u8]) -> Option<Self> {
+        let mut offset = 0usize;
+        let next = |buf: &[u8], offset: &mut usize| -> Option<Vec<u8>> {
+            if *offset + 8 > buf.len() {
+                return None;
+            }
+            let mut len_bytes = [0u8; 8];
+            len_bytes.copy_from_slice(&buf[*offset..*offset + 8]);
+            let len = u64::from_le_bytes(len_bytes) as usize;
+            *offset += 8;
+            if *offset + len > buf.len() {
+                return None;
+            }
+            let out = buf[*offset..*offset + len].to_vec();
+            *offset += len;
+            Some(out)
+        };
+        let r_bytes = next(bytes, &mut offset)?;
+        let e_bytes = next(bytes, &mut offset)?;
+        let a_bytes = next(bytes, &mut offset)?;
+        let b_bytes = next(bytes, &mut offset)?;
+        let d_bytes = next(bytes, &mut offset)?;
+        let re_bytes = next(bytes, &mut offset)?;
+        if offset != bytes.len() {
+            return None;
+        }
+        Some(Self {
+            r: DCRTPolyMatrix::from_compact_bytes(params, &r_bytes),
+            e: DCRTPolyMatrix::from_compact_bytes(params, &e_bytes),
+            a_mat: DCRTPolyMatrix::from_compact_bytes(params, &a_bytes),
+            b_mat: DCRTPolyMatrix::from_compact_bytes(params, &b_bytes),
+            d_mat: DCRTPolyMatrix::from_compact_bytes(params, &d_bytes),
+            re: DCRTPolyMatrix::from_compact_bytes(params, &re_bytes),
+        })
+    }
+
     pub fn sample_pert_square_mat(
         &self,
         s: f64,

@@ -75,6 +75,13 @@ pub trait PolyTrapdoorSampler {
         size: usize,
     ) -> (Self::Trapdoor, Self::M);
 
+    fn trapdoor_to_bytes(trapdoor: &Self::Trapdoor) -> Vec<u8>;
+
+    fn trapdoor_from_bytes(
+        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
+        bytes: &[u8],
+    ) -> Option<Self::Trapdoor>;
+
     fn preimage(
         &self,
         params: &<<Self::M as PolyMatrix>::P as Poly>::Params,

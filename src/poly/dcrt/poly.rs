@@ -49,7 +49,6 @@ impl DCRTPoly {
     }
 
     #[inline]
-    #[inline]
     pub(crate) fn eval_bytes(&self) -> Vec<u8> {
         self.ptr_poly.GetEvaluationBytes()
     }

@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, ops::Range, sync::Arc};
+use std::{marker::PhantomData, ops::Range, path::Path, sync::Arc};
 
 use crate::{
     matrix::PolyMatrix,
@@ -14,6 +14,7 @@ use dashmap::DashMap;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 pub const WEE25_PUBLIC_PARAMS_PREFIX: &str = "wee25_public_params";
+pub const WEE25_COMMIT_CACHE_PREFIX: &str = "wee25_commit_cache";
 const DEFAULT_TBLOCK_BATCH: usize = 200;
 const DEFAULT_TOPJ_BATCH: usize = 5;
 const DEFAULT_TBOTTOM_BATCH: usize = 7;
@@ -116,6 +117,76 @@ impl<'a, M: PolyMatrix + 'a> MsgMatrixStream<'a, M> {
             range.end - range.start
         );
         out
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CommitCache<M: PolyMatrix> {
+    pub id_prefix: String,
+    pub cols: usize,
+    nodes: Arc<DashMap<(usize, usize), M>>,
+}
+
+impl<M: PolyMatrix> CommitCache<M> {
+    pub fn new(id_prefix: String, cols: usize) -> Self {
+        Self { id_prefix, cols, nodes: Arc::new(DashMap::new()) }
+    }
+
+    fn node_id(&self, offset: usize, len: usize) -> String {
+        format!("{}_o{}_l{}", self.id_prefix, offset, len)
+    }
+
+    pub fn get(&self, offset: usize, len: usize) -> Option<M> {
+        self.nodes.get(&(offset, len)).map(|entry| entry.clone())
+    }
+
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn load<HS>(
+        params: &<M::P as Poly>::Params,
+        dir: &Path,
+        wee25_commit: &Wee25Commit<M, HS>,
+        hash_key: [u8; 32],
+        cols: usize,
+    ) -> Option<Self>
+    where
+        HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    {
+        wee25_commit.assert_stream_len(cols);
+        let id_prefix = wee25_commit.commit_cache_prefix(params, hash_key, cols);
+        let cache = Self::new(id_prefix, cols);
+        cache.load_subtree(params, dir, wee25_commit.tree_base, 0, cols)?;
+        Some(cache)
+    }
+
+    fn load_subtree(
+        &self,
+        params: &<M::P as Poly>::Params,
+        dir: &Path,
+        tree_base: usize,
+        offset: usize,
+        len: usize,
+    ) -> Option<()> {
+        let node_id = self.node_id(offset, len);
+        let commit = read_matrix_from_multi_batch::<M>(params, dir, &node_id, 0)?;
+        self.nodes.insert((offset, len), commit);
+        if len == tree_base {
+            return Some(());
+        }
+        let child_len = len / tree_base;
+        for idx in 0..tree_base {
+            let child_offset = offset + idx * child_len;
+            self.load_subtree(params, dir, tree_base, child_offset, child_len)?;
+        }
+        Some(())
+    }
+
+    fn insert_and_persist(&self, offset: usize, len: usize, commit: M) {
+        let node_id = self.node_id(offset, len);
+        let ok = add_lookup_buffer(get_lookup_buffer(vec![(0, commit)], &node_id));
+        debug_assert!(ok, "failed to enqueue commit cache node {}", node_id);
     }
 }
 
@@ -395,6 +466,30 @@ where
             t_block_batch,
             top_j_batch,
             t_bottom_batch,
+            hash_key.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+        )
+    }
+
+    pub fn commit_cache_prefix(
+        &self,
+        params: &<M::P as Poly>::Params,
+        hash_key: [u8; 32],
+        cols: usize,
+    ) -> String {
+        let (_crt_moduli, crt_bits, crt_depth) = params.to_crt();
+        format!(
+            "{}_s{}_tb{}_mb{}_mg{}_crtbits{}_crtdepth{}_ring{}_base{}_sigma{:.6}_cols{}_key{}",
+            WEE25_COMMIT_CACHE_PREFIX,
+            self.secret_size,
+            self.tree_base,
+            self.m_b,
+            self.m_g,
+            crt_bits,
+            crt_depth,
+            params.ring_dimension(),
+            params.base_bits(),
+            self.trapdoor_sigma,
+            cols,
             hash_key.iter().map(|b| format!("{:02x}", b)).collect::<String>()
         )
     }
@@ -698,7 +793,10 @@ where
         public_params: &Wee25PublicParams<M>,
     ) -> M {
         self.assert_stream_len(msg_stream.len());
-        self.commit_recursive(params, msg_stream, public_params)
+        let cache_prefix =
+            self.commit_cache_prefix(params, public_params.hash_key, msg_stream.len());
+        let commit_cache = CommitCache::<M>::new(cache_prefix, msg_stream.len());
+        self.commit_recursive(params, msg_stream, public_params, &commit_cache)
     }
 
     pub fn verify(
@@ -729,6 +827,7 @@ where
         params: &<M::P as Poly>::Params,
         msg_stream: &MsgMatrixStream<'_, M>,
         public_params: &Wee25PublicParams<M>,
+        commit_cache: &CommitCache<M>,
     ) -> M {
         let cols = msg_stream.len();
         debug_assert!(
@@ -741,7 +840,9 @@ where
             let parts = msg_stream.read(0..cols);
             let refs = parts.iter().collect::<Vec<_>>();
             let msg = parts[0].concat_columns(&refs[1..]);
-            return self.commit_base(params, &msg, public_params);
+            let commit = self.commit_base(params, &msg, public_params);
+            commit_cache.insert_and_persist(msg_stream.offset, cols, commit.clone());
+            return commit;
         }
         debug_assert!(
             cols % self.tree_base == 0,
@@ -755,12 +856,14 @@ where
                 let start = idx * child_cols;
                 let end = start + child_cols;
                 let part_stream = msg_stream.slice(start..end);
-                self.commit_recursive(params, &part_stream, public_params)
+                self.commit_recursive(params, &part_stream, public_params, commit_cache)
             })
             .collect::<Vec<_>>();
         let commit_refs = commits.iter().collect::<Vec<_>>();
         let combined = commits[0].concat_columns(&commit_refs[1..]);
-        self.commit_base(params, &combined, public_params)
+        let commit = self.commit_base(params, &combined, public_params);
+        commit_cache.insert_and_persist(msg_stream.offset, cols, commit.clone());
+        commit
     }
 
     fn commit_base(
@@ -813,11 +916,18 @@ where
         msg_stream: &MsgMatrixStream<'_, M>,
         col_range: Option<Range<usize>>,
         public_params: &Wee25PublicParams<M>,
+        commit_cache: &CommitCache<M>,
     ) -> M {
         self.assert_stream_len(msg_stream.len());
+        debug_assert_eq!(
+            commit_cache.cols,
+            msg_stream.len(),
+            "commit cache cols {} mismatch msg cols {}",
+            commit_cache.cols,
+            msg_stream.len()
+        );
         let v_base = self.verifier_base(params, public_params, false);
         let v_base_last = self.verifier_base(params, public_params, true);
-        let commit_cache: DashMap<(usize, usize), M> = DashMap::new();
         let z_prime_cache: DashMap<(usize, usize, usize), M> = DashMap::new();
         let verifier_cache: DashMap<(usize, usize), M> = DashMap::new();
         let cols = msg_stream.len();
@@ -839,10 +949,9 @@ where
                     &v_base_last,
                     &public_params.top_j,
                     &public_params.top_j_last,
-                    &commit_cache,
+                    commit_cache,
                     &z_prime_cache,
                     &verifier_cache,
-                    public_params,
                 )
             })
             .collect::<Vec<_>>();
@@ -858,10 +967,9 @@ where
         v_base_last: &M,
         t_top_j: &[Vec<u8>],
         t_top_j_last: &[Vec<u8>],
-        commit_cache: &DashMap<(usize, usize), M>,
+        commit_cache: &CommitCache<M>,
         z_prime_cache: &DashMap<(usize, usize, usize), M>,
         verifier_cache: &DashMap<(usize, usize), M>,
-        public_params: &Wee25PublicParams<M>,
     ) -> M {
         let cols = msg_stream.len();
         if cols == self.tree_base {
@@ -873,18 +981,15 @@ where
         let child_cols = cols / self.tree_base;
         let child_col_idx = col_idx % child_cols;
         let sibling_idx = col_idx / child_cols;
-        let commits = parallel_iter!(0..self.tree_base)
+        let commits = (0..self.tree_base)
             .map(|j| {
-                let start = j * child_cols;
-                let end = start + child_cols;
-                let part_stream = msg_stream.slice(start..end);
-                let key = (part_stream.offset, part_stream.len);
-                if let Some(entry) = commit_cache.get(&key) {
-                    return entry.clone();
-                }
-                let commit = self.commit_recursive(params, &part_stream, public_params);
-                commit_cache.insert(key, commit.clone());
-                commit
+                let child_offset = msg_stream.offset + j * child_cols;
+                commit_cache.get(child_offset, child_cols).unwrap_or_else(|| {
+                    panic!(
+                        "missing commit cache node for offset={} len={}",
+                        child_offset, child_cols
+                    )
+                })
             })
             .collect::<Vec<_>>();
         let commits_msg = commits[0].concat_columns(&commits[1..].iter().collect::<Vec<_>>());
@@ -910,7 +1015,6 @@ where
             commit_cache,
             z_prime_cache,
             verifier_cache,
-            public_params,
         );
         let verifier =
             self.verifier_recursive(v_base, v_base_last, child_cols, child_col_idx, verifier_cache);
@@ -1144,7 +1248,7 @@ mod tests {
         >,
         params: &DCRTPolyParams,
         hash_key: [u8; 32],
-    ) -> Wee25PublicParams<DCRTPolyMatrix> {
+    ) -> (Wee25PublicParams<DCRTPolyMatrix>, tempfile::TempDir) {
         let tmp_dir = tempdir().unwrap();
         init_storage_system(tmp_dir.path().to_path_buf());
         wee25_commit.sample_public_params::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
@@ -1155,13 +1259,14 @@ mod tests {
         let rt = Runtime::new().unwrap();
         rt.block_on(wait_for_all_writes(tmp_dir.path().to_path_buf()))
             .expect("wait_for_all_writes failed");
-        Wee25PublicParams::<DCRTPolyMatrix>::read_from_storage(
+        let public_params = Wee25PublicParams::<DCRTPolyMatrix>::read_from_storage(
             params,
             tmp_dir.path(),
             wee25_commit,
             hash_key,
         )
-        .expect("wee25 public params not found")
+        .expect("wee25 public params not found");
+        (public_params, tmp_dir)
     }
 
     #[test]
@@ -1172,13 +1277,15 @@ mod tests {
         let secret_size = 1;
         let tree_base = 2;
         let cols = 4;
+        let hash_key = [0u8; 32];
 
         let start = Instant::now();
         let wee25_commit = Wee25Commit::<
             DCRTPolyMatrix,
             crate::sampler::hash::DCRTPolyHashSampler<keccak_asm::Keccak256>,
         >::new(&params, secret_size, tree_base, SIGMA);
-        let public_params = sample_public_params_for_test(&wee25_commit, &params, [0u8; 32]);
+        let (public_params, tmp_dir) =
+            sample_public_params_for_test(&wee25_commit, &params, hash_key);
         info!("commit params generated in {:?}", start.elapsed());
 
         let msg_blocks = (0..cols)
@@ -1188,12 +1295,23 @@ mod tests {
         let msg_stream = MsgMatrixStream::from_blocks(msg_blocks);
         let start = Instant::now();
         let commitment = wee25_commit.commit(&params, &msg_stream, &public_params);
+        let rt = Runtime::new().unwrap();
+        rt.block_on(wait_for_all_writes(tmp_dir.path().to_path_buf()))
+            .expect("wait_for_all_writes failed");
+        let commit_cache = CommitCache::<DCRTPolyMatrix>::load(
+            &params,
+            tmp_dir.path(),
+            &wee25_commit,
+            hash_key,
+            cols,
+        )
+        .expect("commit cache not found");
         info!("commitment generated in {:?}", start.elapsed());
         let start = Instant::now();
         let _verifier = wee25_commit.verifier(&params, cols, None, &public_params);
         info!("verifier generated in {:?}", start.elapsed());
         let start = Instant::now();
-        let opening = wee25_commit.open(&params, &msg_stream, None, &public_params);
+        let opening = wee25_commit.open(&params, &msg_stream, None, &public_params, &commit_cache);
         info!("opening generated in {:?}", start.elapsed());
 
         assert!(wee25_commit.verify(
@@ -1214,13 +1332,15 @@ mod tests {
         let secret_size = 1;
         let tree_base = 2;
         let cols = 4;
+        let hash_key = [0u8; 32];
 
         let start = Instant::now();
         let wee25_commit = Wee25Commit::<
             DCRTPolyMatrix,
             crate::sampler::hash::DCRTPolyHashSampler<keccak_asm::Keccak256>,
         >::new(&params, secret_size, tree_base, SIGMA);
-        let public_params = sample_public_params_for_test(&wee25_commit, &params, [0u8; 32]);
+        let (public_params, tmp_dir) =
+            sample_public_params_for_test(&wee25_commit, &params, hash_key);
         info!("commit params generated in {:?}", start.elapsed());
 
         let uniform_sampler = DCRTPolyUniformSampler::new();
@@ -1238,12 +1358,23 @@ mod tests {
         let msg_stream = MsgMatrixStream::from_blocks(msg_blocks);
         let start = Instant::now();
         let commitment = wee25_commit.commit(&params, &msg_stream, &public_params);
+        let rt = Runtime::new().unwrap();
+        rt.block_on(wait_for_all_writes(tmp_dir.path().to_path_buf()))
+            .expect("wait_for_all_writes failed");
+        let commit_cache = CommitCache::<DCRTPolyMatrix>::load(
+            &params,
+            tmp_dir.path(),
+            &wee25_commit,
+            hash_key,
+            cols,
+        )
+        .expect("commit cache not found");
         info!("commitment generated in {:?}", start.elapsed());
         let start = Instant::now();
         let _verifier = wee25_commit.verifier(&params, cols, None, &public_params);
         info!("verifier generated in {:?}", start.elapsed());
         let start = Instant::now();
-        let opening = wee25_commit.open(&params, &msg_stream, None, &public_params);
+        let opening = wee25_commit.open(&params, &msg_stream, None, &public_params, &commit_cache);
         info!("opening generated in {:?}", start.elapsed());
 
         assert!(wee25_commit.verify(
@@ -1264,13 +1395,15 @@ mod tests {
         let secret_size = 1;
         let tree_base = 2;
         let cols = 4;
+        let hash_key = [0u8; 32];
 
         let start = Instant::now();
         let wee25_commit = Wee25Commit::<
             DCRTPolyMatrix,
             crate::sampler::hash::DCRTPolyHashSampler<keccak_asm::Keccak256>,
         >::new(&params, secret_size, tree_base, SIGMA);
-        let public_params = sample_public_params_for_test(&wee25_commit, &params, [0u8; 32]);
+        let (public_params, tmp_dir) =
+            sample_public_params_for_test(&wee25_commit, &params, hash_key);
         info!("commit params generated in {:?}", start.elapsed());
 
         let uniform_sampler = DCRTPolyUniformSampler::new();
@@ -1287,6 +1420,17 @@ mod tests {
         let msg_stream1 = MsgMatrixStream::from_blocks(msg_blocks1);
         let start = Instant::now();
         let commitment = wee25_commit.commit(&params, &msg_stream1, &public_params);
+        let rt = Runtime::new().unwrap();
+        rt.block_on(wait_for_all_writes(tmp_dir.path().to_path_buf()))
+            .expect("wait_for_all_writes failed");
+        let commit_cache = CommitCache::<DCRTPolyMatrix>::load(
+            &params,
+            tmp_dir.path(),
+            &wee25_commit,
+            hash_key,
+            cols,
+        )
+        .expect("commit cache not found");
         info!("commitment generated in {:?}", start.elapsed());
         let start = Instant::now();
         let _verifier = wee25_commit.verifier(&params, cols, None, &public_params);
@@ -1304,7 +1448,7 @@ mod tests {
         let msg_matrix2 = concat_blocks(&msg_blocks2);
         let msg_stream2 = MsgMatrixStream::from_blocks(msg_blocks2);
         let start = Instant::now();
-        let opening = wee25_commit.open(&params, &msg_stream2, None, &public_params);
+        let opening = wee25_commit.open(&params, &msg_stream2, None, &public_params, &commit_cache);
         info!("opening generated in {:?}", start.elapsed());
 
         assert!(!wee25_commit.verify(
@@ -1325,13 +1469,15 @@ mod tests {
         let secret_size = 1;
         let tree_base = 2;
         let cols = 4;
+        let hash_key = [0u8; 32];
 
         let start = Instant::now();
         let wee25_commit = Wee25Commit::<
             DCRTPolyMatrix,
             crate::sampler::hash::DCRTPolyHashSampler<keccak_asm::Keccak256>,
         >::new(&params, secret_size, tree_base, SIGMA);
-        let public_params = sample_public_params_for_test(&wee25_commit, &params, [0u8; 32]);
+        let (public_params, tmp_dir) =
+            sample_public_params_for_test(&wee25_commit, &params, hash_key);
         info!("commit params generated in {:?}", start.elapsed());
 
         let uniform_sampler = DCRTPolyUniformSampler::new();
@@ -1350,12 +1496,28 @@ mod tests {
 
         let start = Instant::now();
         let commitment = wee25_commit.commit(&params, &msg_stream, &public_params);
+        let rt = Runtime::new().unwrap();
+        rt.block_on(wait_for_all_writes(tmp_dir.path().to_path_buf()))
+            .expect("wait_for_all_writes failed");
+        let commit_cache = CommitCache::<DCRTPolyMatrix>::load(
+            &params,
+            tmp_dir.path(),
+            &wee25_commit,
+            hash_key,
+            cols,
+        )
+        .expect("commit cache not found");
         info!("commitment generated in {:?}", start.elapsed());
 
         let col_range = 1..3;
         let start = Instant::now();
-        let opening =
-            wee25_commit.open(&params, &msg_stream, Some(col_range.clone()), &public_params);
+        let opening = wee25_commit.open(
+            &params,
+            &msg_stream,
+            Some(col_range.clone()),
+            &public_params,
+            &commit_cache,
+        );
         info!("opening generated in {:?}", start.elapsed());
 
         assert!(wee25_commit.verify(
@@ -1364,6 +1526,77 @@ mod tests {
             &commitment,
             &opening,
             Some(col_range),
+            &public_params
+        ));
+    }
+
+    #[test]
+    #[sequential_test::sequential]
+    fn test_wee25_commit_cache_load_open_verify() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let params = DCRTPolyParams::new(4, 2, 17, 15);
+        let secret_size = 1;
+        let tree_base = 2;
+        let cols = 4;
+        let hash_key = [7u8; 32];
+
+        let tmp_dir = tempdir().unwrap();
+        init_storage_system(tmp_dir.path().to_path_buf());
+
+        let wee25_commit = Wee25Commit::<
+            DCRTPolyMatrix,
+            crate::sampler::hash::DCRTPolyHashSampler<keccak_asm::Keccak256>,
+        >::new(&params, secret_size, tree_base, SIGMA);
+        wee25_commit.sample_public_params::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
+            &params,
+            hash_key,
+            tmp_dir.path(),
+        );
+        let rt = Runtime::new().unwrap();
+        rt.block_on(wait_for_all_writes(tmp_dir.path().to_path_buf()))
+            .expect("wait_for_all_writes failed");
+        let public_params = Wee25PublicParams::<DCRTPolyMatrix>::read_from_storage(
+            &params,
+            tmp_dir.path(),
+            &wee25_commit,
+            hash_key,
+        )
+        .expect("wee25 public params not found");
+
+        let uniform_sampler = DCRTPolyUniformSampler::new();
+        let msg_blocks = (0..cols)
+            .map(|_| {
+                uniform_sampler.sample_uniform(
+                    &params,
+                    secret_size,
+                    wee25_commit.m_b,
+                    DistType::FinRingDist,
+                )
+            })
+            .collect::<Vec<_>>();
+        let msg_matrix = concat_blocks(&msg_blocks);
+        let msg_stream = MsgMatrixStream::from_blocks(msg_blocks);
+        let commitment = wee25_commit.commit(&params, &msg_stream, &public_params);
+        rt.block_on(wait_for_all_writes(tmp_dir.path().to_path_buf()))
+            .expect("wait_for_all_writes failed");
+
+        let loaded_cache = CommitCache::<DCRTPolyMatrix>::load(
+            &params,
+            tmp_dir.path(),
+            &wee25_commit,
+            hash_key,
+            cols,
+        )
+        .expect("commit cache not found");
+        assert!(loaded_cache.len() > 0);
+        let opening = wee25_commit.open(&params, &msg_stream, None, &public_params, &loaded_cache);
+
+        assert!(wee25_commit.verify(
+            &params,
+            &msg_matrix,
+            &commitment,
+            &opening,
+            None,
             &public_params
         ));
     }

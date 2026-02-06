@@ -247,6 +247,7 @@ async fn test_commit_modp_chain_rounding() {
     let plt_encoding_evaluator =
         CommitBGGEncodingPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup(
             &params,
+            trapdoor_sigma,
             TREE_BASE,
             key,
             &circuit,

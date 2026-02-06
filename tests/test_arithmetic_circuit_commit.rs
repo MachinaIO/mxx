@@ -158,6 +158,7 @@ async fn test_arithmetic_circuit_operations_commit() {
     let enc_evaluator =
         CommitBGGEncodingPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup(
             &params,
+            trapdoor_sigma,
             tree_base,
             seed,
             &circuit,

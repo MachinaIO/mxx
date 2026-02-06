@@ -1,6 +1,16 @@
-use std::{marker::PhantomData, ops::Range, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    marker::PhantomData,
+    ops::Range,
+    path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use crate::{
+    env,
     matrix::PolyMatrix,
     parallel_iter,
     poly::{Poly, PolyParams},
@@ -15,28 +25,6 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 pub const WEE25_PUBLIC_PARAMS_PREFIX: &str = "wee25_public_params";
 pub const WEE25_COMMIT_CACHE_PREFIX: &str = "wee25_commit_cache";
-const DEFAULT_TBLOCK_BATCH: usize = 200;
-const DEFAULT_TOPJ_BATCH: usize = 5;
-const DEFAULT_TBOTTOM_BATCH: usize = 7;
-
-fn read_parallel_batches() -> (usize, usize, usize) {
-    let t_block_batch = std::env::var("WEE25_TBLOCK_PARALLEL_BATCH")
-        .ok()
-        .and_then(|val| val.parse::<usize>().ok())
-        .filter(|&val| val > 0)
-        .unwrap_or(DEFAULT_TBLOCK_BATCH);
-    let top_j_batch = std::env::var("WEE25_TOPJ_PARALLEL_BATCH")
-        .ok()
-        .and_then(|val| val.parse::<usize>().ok())
-        .filter(|&val| val > 0)
-        .unwrap_or(DEFAULT_TOPJ_BATCH);
-    let t_bottom_batch = std::env::var("WEE25_TBOTTOM_PARALLEL_BATCH")
-        .ok()
-        .and_then(|val| val.parse::<usize>().ok())
-        .filter(|&val| val > 0)
-        .unwrap_or(DEFAULT_TBOTTOM_BATCH);
-    (t_block_batch, top_j_batch, t_bottom_batch)
-}
 
 #[derive(Debug, Clone)]
 pub struct Wee25Commit<M: PolyMatrix, HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync> {
@@ -124,16 +112,68 @@ impl<'a, M: PolyMatrix + 'a> MsgMatrixStream<'a, M> {
 pub struct CommitCache<M: PolyMatrix> {
     pub id_prefix: String,
     pub cols: usize,
+    tree_base: usize,
     nodes: Arc<DashMap<(usize, usize), M>>,
+    persist_batch_size: usize,
+    pending_persist: Arc<Mutex<Vec<(usize, M)>>>,
+    next_chunk_seq: Arc<AtomicUsize>,
 }
 
 impl<M: PolyMatrix> CommitCache<M> {
-    pub fn new(id_prefix: String, cols: usize) -> Self {
-        Self { id_prefix, cols, nodes: Arc::new(DashMap::new()) }
+    pub fn new(id_prefix: String, cols: usize, tree_base: usize) -> Self {
+        Self {
+            id_prefix,
+            cols,
+            tree_base,
+            nodes: Arc::new(DashMap::new()),
+            persist_batch_size: env::wee25_commit_cache_persist_batch(),
+            pending_persist: Arc::new(Mutex::new(Vec::new())),
+            next_chunk_seq: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
-    fn node_id(&self, offset: usize, len: usize) -> String {
-        format!("{}_o{}_l{}", self.id_prefix, offset, len)
+    fn chunk_key_prefix(&self) -> String {
+        format!("{}_chunk_", self.id_prefix)
+    }
+
+    fn node_index(&self, offset: usize, len: usize) -> usize {
+        debug_assert!(
+            len >= self.tree_base,
+            "node len {} must be at least tree_base {}",
+            len,
+            self.tree_base
+        );
+        debug_assert_eq!(offset % len, 0, "offset {} must align with len {}", offset, len);
+        let mut level_len = self.cols;
+        let mut level_nodes = 1usize;
+        let mut nodes_before_level = 0usize;
+        while level_len > len {
+            debug_assert_eq!(
+                level_len % self.tree_base,
+                0,
+                "level_len {} must be divisible by tree_base {}",
+                level_len,
+                self.tree_base
+            );
+            nodes_before_level += level_nodes;
+            level_nodes = level_nodes
+                .checked_mul(self.tree_base)
+                .expect("node count overflow while indexing commit cache");
+            level_len /= self.tree_base;
+        }
+        debug_assert_eq!(
+            level_len, len,
+            "cannot map offset/len ({},{}) into tree rooted at {}",
+            offset, len, self.cols
+        );
+        let pos_in_level = offset / len;
+        debug_assert!(
+            pos_in_level < level_nodes,
+            "position {} exceeds nodes at level {}",
+            pos_in_level,
+            level_nodes
+        );
+        nodes_before_level + pos_in_level
     }
 
     pub fn get(&self, offset: usize, len: usize) -> Option<M> {
@@ -156,8 +196,24 @@ impl<M: PolyMatrix> CommitCache<M> {
     {
         wee25_commit.assert_stream_len(cols);
         let id_prefix = wee25_commit.commit_cache_prefix(params, hash_key, cols);
-        let cache = Self::new(id_prefix, cols);
-        cache.load_subtree(params, dir, wee25_commit.tree_base, 0, cols)?;
+        let cache = Self::new(id_prefix, cols, wee25_commit.tree_base);
+        let index_path = dir.join("lookup_tables.index");
+        let index_json = std::fs::read_to_string(&index_path).ok()?;
+        let global_index =
+            serde_json::from_str::<crate::storage::write::GlobalTableIndex>(&index_json).ok()?;
+        let mut node_index_to_chunk = HashMap::new();
+        let chunk_key_prefix = cache.chunk_key_prefix();
+        for (key, entry) in global_index.entries.iter() {
+            if key.starts_with(&chunk_key_prefix) {
+                for node_index in entry.indices.iter() {
+                    node_index_to_chunk.insert(*node_index, key.clone());
+                }
+            }
+        }
+        if node_index_to_chunk.is_empty() {
+            return None;
+        }
+        cache.load_subtree(params, dir, wee25_commit.tree_base, 0, cols, &node_index_to_chunk)?;
         Some(cache)
     }
 
@@ -168,9 +224,11 @@ impl<M: PolyMatrix> CommitCache<M> {
         tree_base: usize,
         offset: usize,
         len: usize,
+        node_index_to_chunk: &HashMap<usize, String>,
     ) -> Option<()> {
-        let node_id = self.node_id(offset, len);
-        let commit = read_matrix_from_multi_batch::<M>(params, dir, &node_id, 0)?;
+        let node_index = self.node_index(offset, len);
+        let chunk_prefix = node_index_to_chunk.get(&node_index)?;
+        let commit = read_matrix_from_multi_batch::<M>(params, dir, chunk_prefix, node_index)?;
         self.nodes.insert((offset, len), commit);
         if len == tree_base {
             return Some(());
@@ -178,15 +236,52 @@ impl<M: PolyMatrix> CommitCache<M> {
         let child_len = len / tree_base;
         for idx in 0..tree_base {
             let child_offset = offset + idx * child_len;
-            self.load_subtree(params, dir, tree_base, child_offset, child_len)?;
+            self.load_subtree(
+                params,
+                dir,
+                tree_base,
+                child_offset,
+                child_len,
+                node_index_to_chunk,
+            )?;
         }
         Some(())
     }
 
     fn insert_and_persist(&self, offset: usize, len: usize, commit: M) {
-        let node_id = self.node_id(offset, len);
-        let ok = add_lookup_buffer(get_lookup_buffer(vec![(0, commit)], &node_id));
-        debug_assert!(ok, "failed to enqueue commit cache node {}", node_id);
+        if self.persist_batch_size <= 1 {
+            self.persist_batch(vec![(self.node_index(offset, len), commit)]);
+            return;
+        }
+        let mut batch: Option<Vec<(usize, M)>> = None;
+        {
+            let mut pending = self.pending_persist.lock().expect("pending_persist lock poisoned");
+            pending.push((self.node_index(offset, len), commit));
+            if pending.len() >= self.persist_batch_size {
+                batch = Some(std::mem::take(&mut *pending));
+            }
+        }
+        if let Some(batch) = batch {
+            self.persist_batch(batch);
+        }
+    }
+
+    fn persist_batch(&self, batch: Vec<(usize, M)>) {
+        let chunk_seq = self.next_chunk_seq.fetch_add(1, Ordering::Relaxed);
+        let chunk_id = format!("{}_chunk_{}", self.id_prefix, chunk_seq);
+        let ok = add_lookup_buffer(get_lookup_buffer(batch, &chunk_id));
+        debug_assert!(ok, "failed to enqueue commit cache chunk {}", chunk_id);
+    }
+
+    fn flush_pending_persist(&self) {
+        let batch = {
+            let mut pending = self.pending_persist.lock().expect("pending_persist lock poisoned");
+            if pending.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *pending)
+        };
+        self.persist_batch(batch);
     }
 }
 
@@ -254,7 +349,7 @@ impl<M: PolyMatrix> Wee25PublicParams<M> {
         let id_prefix = wee25_commit.checkpoint_prefix(params, hash_key);
         let b = read_matrix_from_multi_batch::<M>(params, dir, &format!("{id_prefix}_b"), 0)?;
         let pp_size = wee25_commit.tree_base * wee25_commit.m_b * wee25_commit.m_g;
-        let (_t_block_batch, top_j_batch, _t_bottom_batch) = read_parallel_batches();
+        let (_t_block_batch, top_j_batch, _t_bottom_batch) = env::wee25_parallel_batches();
         let mut top_j_parts = Vec::with_capacity(pp_size);
         let mut top_j_last_parts = Vec::with_capacity(pp_size);
         for chunk_start in (0..pp_size).step_by(top_j_batch) {
@@ -337,7 +432,7 @@ where
             }
         }
 
-        let (t_block_batch, top_j_batch, _) = read_parallel_batches();
+        let (t_block_batch, top_j_batch, _) = env::wee25_parallel_batches();
         let mut t_block_bytes = vec![Vec::new(); pp_size];
         let mut t_block_resume_start = 0usize;
         if can_resume {
@@ -450,7 +545,7 @@ where
 
     pub fn checkpoint_prefix(&self, params: &<M::P as Poly>::Params, hash_key: [u8; 32]) -> String {
         let (_crt_moduli, crt_bits, crt_depth) = params.to_crt();
-        let (t_block_batch, top_j_batch, t_bottom_batch) = read_parallel_batches();
+        let (t_block_batch, top_j_batch, t_bottom_batch) = env::wee25_parallel_batches();
         format!(
             "{}_s{}_tb{}_mb{}_mg{}_crtbits{}_crtdepth{}_ring{}_base{}_sigma{:.6}_tblock{}_topj{}_tbottom{}_key{}",
             Wee25PublicParams::<M>::default_storage_prefix(),
@@ -585,7 +680,7 @@ where
         };
 
         // Sample t_block once, store compact bytes, and update t_bottom aggregates.
-        let (t_block_batch, top_j_batch, t_bottom_batch) = read_parallel_batches();
+        let (t_block_batch, top_j_batch, t_bottom_batch) = env::wee25_parallel_batches();
         if b.is_none() || trapdoor.is_none() {
             let trapdoor_sampler = TS::new(params, trapdoor_sigma);
             let (td, b_mat) = trapdoor_sampler.trapdoor(params, secret_size);
@@ -612,7 +707,7 @@ where
         );
         let uniform_sampler = US::new();
         let hash_sampler = HS::new();
-        tracing::debug!(
+        tracing::info!(
             "Wee25Commit::sample_public_params sampling t_block from {}",
             t_block_resume_start
         );
@@ -651,7 +746,7 @@ where
         }
 
         if !t_bottom_ready {
-            tracing::debug!("Wee25Commit::sample_public_params computing t_bottom_j_2m aggregates");
+            tracing::info!("Wee25Commit::sample_public_params computing t_bottom_j_2m aggregates");
             let mut t_bottom_j_2m = M::zero(params, m_b, j_2m_cols);
             let mut t_bottom_j_2m_last = M::zero(params, m_b, l);
             for chunk_start in (0..pp_size).step_by(t_bottom_batch) {
@@ -690,6 +785,10 @@ where
         tracing::debug!("Wee25Commit::sample_public_params completed t_block sampling");
 
         // Reverse the loop order: outer over j_2m columns (idx), inner over t_block/j_2m rows.
+        tracing::info!(
+            "Wee25Commit::sample_public_params computing top_j_parts from {}",
+            top_j_resume_start
+        );
         for chunk_start in (top_j_resume_start..pp_size).step_by(top_j_batch) {
             let chunk_end = (chunk_start + top_j_batch).min(pp_size);
             tracing::debug!(
@@ -795,8 +894,10 @@ where
         self.assert_stream_len(msg_stream.len());
         let cache_prefix =
             self.commit_cache_prefix(params, public_params.hash_key, msg_stream.len());
-        let commit_cache = CommitCache::<M>::new(cache_prefix, msg_stream.len());
-        self.commit_recursive(params, msg_stream, public_params, &commit_cache)
+        let commit_cache = CommitCache::<M>::new(cache_prefix, msg_stream.len(), self.tree_base);
+        let commitment = self.commit_recursive(params, msg_stream, public_params, &commit_cache);
+        commit_cache.flush_pending_persist();
+        commitment
     }
 
     pub fn verify(

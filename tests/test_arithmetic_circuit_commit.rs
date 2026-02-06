@@ -21,12 +21,10 @@ use mxx::{
     utils::gen_biguint_for_modulus,
 };
 use num_bigint::BigUint;
-use std::sync::Arc;
-use tempfile::tempdir;
+use std::{fs, path::Path, sync::Arc};
 use tracing::info;
 
 #[tokio::test]
-#[ignore]
 async fn test_arithmetic_circuit_operations_commit() {
     // Mixed operations in a single circuit: (a + b) * c - a.
     const P_MODULI_BITS: usize = 6;
@@ -86,14 +84,17 @@ async fn test_arithmetic_circuit_operations_commit() {
     assert_eq!(eval_results[0], expected_poly, "mixed operations should be correct");
 
     // 2) BGG+ public key evaluation (Commit PLT).
-    let tmp_dir = tempdir().unwrap();
+    let storage_dir = Path::new("test_data/arithmetic_circuit_operations_commit");
+    if !storage_dir.exists() {
+        fs::create_dir_all(storage_dir).unwrap();
+    }
     let seed: [u8; 32] = [0u8; 32];
     let d = 1usize;
     let trapdoor_sigma = 4.578;
     let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, trapdoor_sigma);
     let (b0_trapdoor, b0_matrix) = trapdoor_sampler.trapdoor(&params, d);
 
-    init_storage_system(tmp_dir.path().to_path_buf());
+    init_storage_system(storage_dir.to_path_buf());
     let reveal_plaintexts = vec![true; circuit.num_input()];
     let pk_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(seed, d);
     let pubkeys = pk_sampler.sample(&params, b"BGG_PUBKEY", &reveal_plaintexts);
@@ -109,12 +110,12 @@ async fn test_arithmetic_circuit_operations_commit() {
     wee25_commit.sample_public_params::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(
         &params,
         seed,
-        tmp_dir.path(),
+        storage_dir,
     );
-    wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
+    wait_for_all_writes(storage_dir.to_path_buf()).await.unwrap();
     let wee25_public_params = Wee25PublicParams::<DCRTPolyMatrix>::read_from_storage(
         &params,
-        tmp_dir.path(),
+        storage_dir,
         &wee25_commit,
         seed,
     )
@@ -141,7 +142,7 @@ async fn test_arithmetic_circuit_operations_commit() {
         &b0_trapdoor,
     );
     info!("wait for all writes");
-    wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
+    wait_for_all_writes(storage_dir.to_path_buf()).await.unwrap();
     info!("finish writing");
 
     // 3) BGG+ encoding evaluation.
@@ -166,7 +167,7 @@ async fn test_arithmetic_circuit_operations_commit() {
             &pubkeys[1..],
             &c_b0,
             &c_b,
-            &tmp_dir.path().to_path_buf(),
+            &storage_dir.to_path_buf(),
             pk_evaluator.wee25_public_params.clone(),
         );
     info!("start encoding evaluation");
@@ -179,5 +180,4 @@ async fn test_arithmetic_circuit_operations_commit() {
 
     let encoding_expected = s.clone() * &pubkey_out[0].matrix;
     assert_eq!(encoding_out[0].vector, encoding_expected);
-    drop(tmp_dir);
 }

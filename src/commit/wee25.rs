@@ -297,46 +297,6 @@ impl<M: PolyMatrix> Wee25PublicParams<M> {
         Self { b, top_j, top_j_last, t_bottom_j_2m, t_bottom_j_2m_last, hash_key }
     }
 
-    pub fn write_to_storage<HS>(
-        &self,
-        params: &<M::P as Poly>::Params,
-        wee25_commit: &Wee25Commit<M, HS>,
-    ) -> bool
-    where
-        M: Send,
-        HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
-    {
-        let id_prefix = wee25_commit.checkpoint_prefix(params, self.hash_key);
-        let mut ok = true;
-        ok &= add_lookup_buffer(get_lookup_buffer(
-            vec![(0, self.b.clone())],
-            &format!("{id_prefix}_b"),
-        ));
-        for (idx, bytes) in self.top_j.iter().enumerate() {
-            let part = M::from_compact_bytes(params, bytes);
-            ok &= add_lookup_buffer(get_lookup_buffer(
-                vec![(0, part)],
-                &format!("{id_prefix}_top_j_part_{idx}"),
-            ));
-        }
-        let top_j_last_offset = self.top_j.len();
-        for (idx, bytes) in self.top_j_last.iter().enumerate() {
-            let part = M::from_compact_bytes(params, bytes);
-            ok &= add_lookup_buffer(get_lookup_buffer(
-                vec![(0, part)],
-                &format!("{id_prefix}_top_j_part_{}", top_j_last_offset + idx),
-            ));
-        }
-        let t_bottom_j_2m = M::from_compact_bytes(params, &self.t_bottom_j_2m);
-        let t_bottom_j_2m_last = M::from_compact_bytes(params, &self.t_bottom_j_2m_last);
-        let t_bottom_prefix = format!("{id_prefix}_t_bottom_j_2m");
-        ok &= add_lookup_buffer(get_lookup_buffer(
-            vec![(0, t_bottom_j_2m), (1, t_bottom_j_2m_last)],
-            &t_bottom_prefix,
-        ));
-        ok
-    }
-
     pub fn read_from_storage<HS>(
         params: &<M::P as Poly>::Params,
         dir: &std::path::Path,

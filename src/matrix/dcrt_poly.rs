@@ -381,7 +381,7 @@ impl DCRTPolyMatrix {
             None => {
                 return parallel_iter!(0..cpp_decomposed.ncol())
                     .map(|idx| cpp_decomposed.entry(0, idx))
-                    .collect()
+                    .collect();
             }
         };
         let digits_per_tower = self.params.crt_bits().div_ceil(base_bits as usize);

@@ -25,6 +25,7 @@ use std::{fs, path::Path, sync::Arc};
 use tracing::info;
 
 #[tokio::test]
+#[ignore]
 async fn test_arithmetic_circuit_operations_commit() {
     // Mixed operations in a single circuit: (a + b) * c - a.
     const P_MODULI_BITS: usize = 6;

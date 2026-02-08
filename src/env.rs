@@ -26,3 +26,50 @@ pub fn block_size() -> usize {
 pub fn lut_bytes_limit() -> Option<usize> {
     std::env::var("LUT_BYTES_LIMIT").ok().and_then(|s| s.parse::<usize>().ok())
 }
+
+const DEFAULT_WEE25_TBLOCK_BATCH: usize = 200;
+const DEFAULT_WEE25_TOPJ_BATCH: usize = 5;
+const DEFAULT_WEE25_TBOTTOM_BATCH: usize = 7;
+const DEFAULT_WEE25_COMMIT_CACHE_PERSIST_BATCH: usize = 100;
+
+/// `WEE25_TBLOCK_PARALLEL_BATCH`: block batch size for t_block sampling (default: 200).
+pub fn wee25_tblock_parallel_batch() -> usize {
+    std::env::var("WEE25_TBLOCK_PARALLEL_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_WEE25_TBLOCK_BATCH)
+}
+
+/// `WEE25_TOPJ_PARALLEL_BATCH`: block batch size for top_j generation (default: 5).
+pub fn wee25_topj_parallel_batch() -> usize {
+    std::env::var("WEE25_TOPJ_PARALLEL_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_WEE25_TOPJ_BATCH)
+}
+
+/// `WEE25_TBOTTOM_PARALLEL_BATCH`: block batch size for t_bottom aggregation (default: 7).
+pub fn wee25_tbottom_parallel_batch() -> usize {
+    std::env::var("WEE25_TBOTTOM_PARALLEL_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_WEE25_TBOTTOM_BATCH)
+}
+
+/// Combined Wee25 parallel batch settings.
+pub fn wee25_parallel_batches() -> (usize, usize, usize) {
+    (wee25_tblock_parallel_batch(), wee25_topj_parallel_batch(), wee25_tbottom_parallel_batch())
+}
+
+/// `WEE25_COMMIT_CACHE_PERSIST_BATCH`: number of commit-cache nodes buffered before persisting
+/// (default: 1).
+pub fn wee25_commit_cache_persist_batch() -> usize {
+    std::env::var("WEE25_COMMIT_CACHE_PERSIST_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_WEE25_COMMIT_CACHE_PERSIST_BATCH)
+}

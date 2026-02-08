@@ -1,7 +1,7 @@
 use crate::{
     bgg::{encoding::BggEncoding, public_key::BggPublicKey},
     circuit::{PolyCircuit, gate::GateId},
-    commit::wee25::{MsgMatrixStream, Wee25Commit, Wee25PublicParams},
+    commit::wee25::{CommitCache, MsgMatrixStream, Wee25Commit, Wee25PublicParams},
     lookup::{PltEvaluator, PublicLut},
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
@@ -218,6 +218,7 @@ where
     pub b_1: M,
     pub c_b: M,
     pub c_commit: M,
+    pub commit_cache: CommitCache<M>,
     pub luts: HashMap<usize, PublicLut<M::P>>,
     pub gate_states: Vec<(GateId, usize, BggPublicKey<M>, BggPublicKey<M>)>,
     pub lut_gate_start_ids: HashMap<GateId, usize>,
@@ -232,6 +233,7 @@ where
 {
     pub fn setup(
         params: &<M::P as Poly>::Params,
+        trapdoor_sigma: f64,
         tree_base: usize,
         hash_key: [u8; 32],
         circuit: &PolyCircuit<M::P>,
@@ -245,7 +247,8 @@ where
         tracing::debug!("CommitBGGEncodingPltEvaluator::setup start");
         let secret_size = one_pubkey.matrix.row_size();
         let _dir = std::path::Path::new(dir_path);
-        let wee25_commit = Wee25Commit::<M, HS>::new(params, secret_size, tree_base, 0.0);
+        let wee25_commit =
+            Wee25Commit::<M, HS>::new(params, secret_size, tree_base, trapdoor_sigma);
         let hash_sampler = HS::new();
         let b_1 = hash_sampler.sample_hash(
             params,
@@ -259,10 +262,6 @@ where
         let gate_state_collector = GateStateCollector::<M, HS>::new(hash_key);
         // setup pubkeys for all LUT gates
         let _ = circuit.eval(params, one_pubkey, input_pubkeys, Some(&gate_state_collector));
-        let preimage =
-            read_matrix_from_multi_batch::<M>(params, dir_path, &format!("preimage_of_commit"), 0)
-                .unwrap_or_else(|| panic!("preimage_of_commit not found"));
-        let c_commit = c_b0.clone() * preimage;
         let luts = gate_state_collector
             .luts
             .iter()
@@ -276,6 +275,28 @@ where
                 (state.gate_id, state.lut_id, state.one_pubkey.clone(), state.input_pubkey.clone())
             })
             .collect::<Vec<_>>();
+        let (msg_stream, padded_len, _, _) = build_msg_stream_for_lut_eval::<M, HS>(
+            params,
+            &wee25_commit,
+            &wee25_public_params,
+            &b_1,
+            hash_key,
+            &luts,
+            &gate_states,
+        );
+        drop(msg_stream);
+        let commit_cache =
+            CommitCache::<M>::load(params, dir_path.as_path(), &wee25_commit, hash_key, padded_len)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "commit cache not found for prefix {}",
+                        wee25_commit.commit_cache_prefix(params, hash_key, padded_len)
+                    )
+                });
+        let preimage =
+            read_matrix_from_multi_batch::<M>(params, dir_path, &format!("preimage_of_commit"), 0)
+                .unwrap_or_else(|| panic!("preimage_of_commit not found"));
+        let c_commit = c_b0.clone() * preimage;
         let (lut_gate_start_ids, _lut_vector_len, _) = build_lut_gate_layout(&luts, &gate_states);
         let result = Self {
             wee25_commit,
@@ -284,6 +305,7 @@ where
             b_1,
             c_b: c_b.clone(),
             c_commit,
+            commit_cache,
             luts,
             gate_states,
             lut_gate_start_ids,
@@ -334,6 +356,7 @@ where
             &msg_stream,
             Some(lut_vector_idx..(lut_vector_idx + 1)),
             &self.wee25_public_params,
+            &self.commit_cache,
         );
         let verifier = self.wee25_commit.verifier(
             params,
@@ -724,6 +747,7 @@ mod tests {
         let plt_encoding_evaluator =
             CommitBGGEncodingPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup(
                 &params,
+                SIGMA,
                 tree_base,
                 key,
                 &circuit,
@@ -865,6 +889,7 @@ mod tests {
         let plt_encoding_evaluator =
             CommitBGGEncodingPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup(
                 &params,
+                SIGMA,
                 tree_base,
                 key,
                 &circuit,

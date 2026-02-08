@@ -1015,9 +1015,8 @@ where
         let log_base_q = self.m_g / self.secret_size;
         let slice_width = self.m_b * log_base_q;
         let col_start = slice_width * col_idx;
-        let part_col_starts = (0..log_base_q)
-            .map(|digit_idx| col_start + self.m_b * digit_idx)
-            .collect::<Vec<_>>();
+        let part_col_starts =
+            (0..log_base_q).map(|digit_idx| col_start + self.m_b * digit_idx).collect::<Vec<_>>();
         let cols = msg.col_size();
         let base_open = (0..cols)
             .into_par_iter()

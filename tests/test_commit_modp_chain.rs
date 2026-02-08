@@ -31,7 +31,7 @@ use std::{fs, path::Path, sync::Arc};
 use tracing::info;
 
 const CRT_BITS: usize = 51;
-const RING_DIM: u32 = 1 << 14;
+const RING_DIM: u32 = 1 << 8;
 const ERROR_SIGMA: f64 = 4.0;
 const BASE_BITS: u32 = 17;
 const TREE_BASE: usize = 2;
@@ -146,7 +146,6 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_commit_modp_chain_rounding() {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -247,6 +246,7 @@ async fn test_commit_modp_chain_rounding() {
     let plt_encoding_evaluator =
         CommitBGGEncodingPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup(
             &params,
+            trapdoor_sigma,
             TREE_BASE,
             key,
             &circuit,

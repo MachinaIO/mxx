@@ -1,15 +1,17 @@
 use crate::{
     matrix::{
-        PolyMatrix,
         cpp_matrix::CppMatrix,
         dcrt_poly::DCRTPolyMatrix,
         i64::{I64Matrix, I64MatrixParams},
+        PolyMatrix,
     },
     openfhe_guard::ensure_openfhe_warmup,
     parallel_iter,
-    poly::{PolyParams, dcrt::params::DCRTPolyParams},
-    sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
+    poly::{dcrt::params::DCRTPolyParams, PolyParams},
+    sampler::{uniform::DCRTPolyUniformSampler, DistType, PolyUniformSampler},
 };
+#[cfg(feature = "gpu")]
+pub use gpu::{GpuDCRTPolyTrapdoorSampler, GpuDCRTTrapdoor};
 use openfhe::ffi::{FormatMatrixCoefficient, SampleP1ForPertMat};
 use rayon::iter::ParallelIterator;
 pub use sampler::DCRTPolyTrapdoorSampler;
@@ -20,6 +22,8 @@ use std::{
 use tracing::debug;
 use utils::{gen_dgg_int_vec, gen_int_karney, split_int64_mat_to_elems};
 
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod sampler;
 pub mod utils;
 

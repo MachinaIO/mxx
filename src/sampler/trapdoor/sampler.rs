@@ -1,24 +1,29 @@
-use super::{DCRTTrapdoor, utils::split_int64_mat_alt_to_elems};
+use super::{utils::split_int64_mat_alt_to_elems, DCRTTrapdoor};
 use crate::{
-    matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+    matrix::{dcrt_poly::DCRTPolyMatrix, PolyMatrix},
     openfhe_guard::ensure_openfhe_warmup,
     parallel_iter,
     poly::{
-        Poly, PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        Poly, PolyParams,
     },
     sampler::{
-        DistType, PolyTrapdoorSampler, PolyUniformSampler, trapdoor::KARNEY_THRESHOLD,
-        uniform::DCRTPolyUniformSampler,
+        trapdoor::KARNEY_THRESHOLD, uniform::DCRTPolyUniformSampler, DistType, PolyTrapdoorSampler,
+        PolyUniformSampler,
     },
 };
 use openfhe::ffi::DCRTGaussSampGqArbBase;
 use rayon::iter::ParallelIterator;
-use std::{ops::Range, time::Instant};
+use std::{
+    ops::Range,
+    sync::{Mutex, OnceLock},
+    time::Instant,
+};
 use tracing::debug;
 
 const SIGMA: f64 = 4.578;
 const SPECTRAL_CONSTANT: f64 = 1.8;
+static GAUSS_SAMP_GQ_ARB_BASE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct DCRTPolyTrapdoorSampler {
@@ -88,11 +93,11 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
 
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
-        let s = SPECTRAL_CONSTANT *
-            (self.base as f64 + 1.0) *
-            SIGMA *
-            SIGMA *
-            (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+        let s = SPECTRAL_CONSTANT
+            * (self.base as f64 + 1.0)
+            * SIGMA
+            * SIGMA
+            * (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
         let dgg_large_std = (s * s - self.c * self.c).sqrt();
         let peikert = dgg_large_std < KARNEY_THRESHOLD;
         let (dgg_large_mean, dgg_large_table) = if dgg_large_std > KARNEY_THRESHOLD {
@@ -193,11 +198,11 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         let target_ncol = target.col_size();
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
-        let s = SPECTRAL_CONSTANT *
-            (self.base as f64 + 1.0) *
-            SIGMA *
-            SIGMA *
-            (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+        let s = SPECTRAL_CONSTANT
+            * (self.base as f64 + 1.0)
+            * SIGMA
+            * SIGMA
+            * (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
         let dist = DistType::GaussDist { sigma: s };
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let preimage_right = uniform_sampler.sample_uniform(params, ext_ncol, target_ncol, dist);
@@ -237,17 +242,22 @@ pub(crate) fn gauss_samp_gq_arb_base(
     let depth = params.crt_depth();
     let k_res_bits = params.crt_bits();
     let k_res_digits = params.modulus_digits() / depth;
-    let result = DCRTGaussSampGqArbBase(
-        syndrome.get_poly(),
-        c,
-        n,
-        depth,
-        k_res_bits,
-        k_res_digits,
-        base as i64,
-        sigma,
-        tower_idx,
-    );
+    // OpenFHE's GaussSampGqArbBase can race across threads depending on backend state.
+    // Keep this FFI call serialized for stability.
+    let result = {
+        let _guard = GAUSS_SAMP_GQ_ARB_BASE_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        DCRTGaussSampGqArbBase(
+            syndrome.get_poly(),
+            c,
+            n,
+            depth,
+            k_res_bits,
+            k_res_digits,
+            base as i64,
+            sigma,
+            tower_idx,
+        )
+    };
     debug_assert_eq!(result.len(), n as usize * k_res_digits);
     // let mut matrix = I64Matrix::new_empty(&I64MatrixParams, k_res, n as usize);
     parallel_iter!(0..k_res_digits)
@@ -261,9 +271,10 @@ pub(crate) fn gauss_samp_gq_arb_base(
 mod test {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
+        __TestState,
         poly::PolyParams,
-        sampler::{PolyUniformSampler, uniform::DCRTPolyUniformSampler},
+        sampler::{uniform::DCRTPolyUniformSampler, PolyUniformSampler},
+        __PAIR,
     };
 
     const SIGMA: f64 = 4.578;

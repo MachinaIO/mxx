@@ -112,6 +112,11 @@ unsafe extern "C" {
         a: *const GpuPolyOpaque,
         b: *const GpuPolyOpaque,
     ) -> c_int;
+    fn gpu_poly_equal(
+        lhs: *const GpuPolyOpaque,
+        rhs: *const GpuPolyOpaque,
+        out_equal: *mut c_int,
+    ) -> c_int;
     fn gpu_poly_decompose_base(
         src: *const GpuPolyOpaque,
         base_bits: u32,
@@ -169,6 +174,11 @@ unsafe extern "C" {
         lhs: *const GpuMatrixOpaque,
         rhs: *const GpuMatrixOpaque,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_equal(
+        lhs: *const GpuMatrixOpaque,
+        rhs: *const GpuMatrixOpaque,
+        out_equal: *mut c_int,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_mul_timed(
         out: *mut GpuMatrixOpaque,
         lhs: *const GpuMatrixOpaque,
@@ -190,10 +200,39 @@ unsafe extern "C" {
         rows: usize,
         cols: usize,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_fill_gadget(
+        out: *mut GpuMatrixOpaque,
+        base_bits: u32,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_decompose_base(
         src: *const GpuMatrixOpaque,
         base_bits: u32,
         out: *mut GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_gauss_samp_gq_arb_base(
+        src: *const GpuMatrixOpaque,
+        base_bits: u32,
+        c: f64,
+        dgg_stddev: f64,
+        seed: u64,
+        out: *mut GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_sample_p1_full(
+        a_mat: *const GpuMatrixOpaque,
+        b_mat: *const GpuMatrixOpaque,
+        d_mat: *const GpuMatrixOpaque,
+        tp2: *const GpuMatrixOpaque,
+        sigma: f64,
+        s: f64,
+        dgg_stddev: f64,
+        seed: u64,
+        out: *mut GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_sample_distribution(
+        out: *mut GpuMatrixOpaque,
+        dist_type: c_int,
+        sigma: f64,
+        seed: u64,
     ) -> c_int;
 
     fn gpu_poly_ntt(poly: *mut GpuPolyOpaque, batch: c_int) -> c_int;
@@ -210,6 +249,10 @@ unsafe extern "C" {
 
 pub(crate) const GPU_POLY_FORMAT_COEFF: c_int = 0;
 pub(crate) const GPU_POLY_FORMAT_EVAL: c_int = 1;
+pub(crate) const GPU_MATRIX_DIST_UNIFORM: c_int = 0;
+pub(crate) const GPU_MATRIX_DIST_GAUSS: c_int = 1;
+pub(crate) const GPU_MATRIX_DIST_BIT: c_int = 2;
+pub(crate) const GPU_MATRIX_DIST_TERNARY: c_int = 3;
 
 pub(crate) fn last_error_string() -> String {
     unsafe {
@@ -959,10 +1002,24 @@ impl Drop for GpuDCRTPoly {
 
 impl PartialEq for GpuDCRTPoly {
     fn eq(&self, other: &Self) -> bool {
-        if self.params.as_ref() != other.params.as_ref() {
+        if self.params.as_ref() != other.params.as_ref() || self.level != other.level {
             return false;
         }
-        self.coeffs() == other.coeffs()
+        if self.raw == other.raw {
+            return true;
+        }
+        let mut out_equal: c_int = 0;
+        if self.is_ntt == other.is_ntt {
+            let status =
+                unsafe { gpu_poly_equal(self.raw, other.raw, &mut out_equal as *mut c_int) };
+            check_status(status, "gpu_poly_equal");
+            return out_equal != 0;
+        }
+        let lhs = self.ensure_coeff_domain();
+        let rhs = other.ensure_coeff_domain();
+        let status = unsafe { gpu_poly_equal(lhs.raw, rhs.raw, &mut out_equal as *mut c_int) };
+        check_status(status, "gpu_poly_equal");
+        out_equal != 0
     }
 }
 
@@ -1451,6 +1508,20 @@ mod tests {
             GpuDCRTPoly::from_coeffs(&gpu_params, &one_coeffs),
             "one_poly should produce a polynomial with constant term = 1"
         );
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_dcrtpoly_partial_eq_across_domains() {
+        gpu_device_sync();
+        let params = gpu_test_params();
+        let gpu_params = gpu_params_from_cpu(&params);
+        let sampler = DCRTPolyUniformSampler::new();
+        let cpu_poly = sampler.sample_poly(&params, &DistType::FinRingDist);
+        let coeff_poly = gpu_poly_from_cpu(&cpu_poly, &gpu_params);
+        let mut eval_poly = coeff_poly.clone();
+        eval_poly.ntt_in_place();
+        assert_eq!(coeff_poly, eval_poly, "PartialEq should match across coeff/eval domains");
     }
 
     #[test]

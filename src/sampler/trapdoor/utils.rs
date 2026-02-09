@@ -1,17 +1,17 @@
 use crate::{
-    element::{finite_ring::FinRingElem, PolyElem},
+    element::{PolyElem, finite_ring::FinRingElem},
     matrix::{
         dcrt_poly::DCRTPolyMatrix,
         i64::{I64Matrix, I64MatrixParams},
     },
     parallel_iter,
     poly::{
-        dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         Poly, PolyParams,
+        dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
 };
 use openfhe::ffi::GenerateIntegerKarney;
-use rand::{distr::Uniform, rng, Rng};
+use rand::{Rng, distr::Uniform, rng};
 use rayon::prelude::*;
 use std::{
     ops::Range,

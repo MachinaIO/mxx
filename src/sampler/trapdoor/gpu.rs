@@ -1,19 +1,16 @@
 use super::DCRTTrapdoor;
 use crate::{
     matrix::{
-        gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuMatrixSampleDist},
         PolyMatrix,
+        gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuMatrixSampleDist},
     },
     poly::{
-        dcrt::{
-            gpu::GpuDCRTPolyParams,
-            params::DCRTPolyParams,
-        },
         Poly, PolyParams,
+        dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams},
     },
     sampler::{DistType, PolyTrapdoorSampler},
 };
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 
 const SIGMA: f64 = 4.578;
 const SPECTRAL_CONSTANT: f64 = 1.8;
@@ -129,11 +126,11 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
 
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
-        let s = SPECTRAL_CONSTANT
-            * (self.base as f64 + 1.0)
-            * SIGMA
-            * SIGMA
-            * (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+        let s = SPECTRAL_CONSTANT *
+            (self.base as f64 + 1.0) *
+            SIGMA *
+            SIGMA *
+            (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
         let dgg_large_std = (s * s - self.c * self.c).sqrt();
         let p_hat = sample_pert_square_mat_gpu_native(
             params,
@@ -173,11 +170,11 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         let target_ncol = target.col_size();
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
-        let s = SPECTRAL_CONSTANT
-            * (self.base as f64 + 1.0)
-            * SIGMA
-            * SIGMA
-            * (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+        let s = SPECTRAL_CONSTANT *
+            (self.base as f64 + 1.0) *
+            SIGMA *
+            SIGMA *
+            (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
 
         let dist = DistType::GaussDist { sigma: s };
         let preimage_right = sample_gpu_matrix_native(params, ext_ncol, target_ncol, dist);
@@ -212,7 +209,12 @@ fn sample_pert_square_mat_gpu_native(
     let padding_ncol = padded_ncol - total_ncol;
 
     // p2 is sampled directly on GPU as in the Karney branch of OpenFHE.
-    let p2 = sample_gpu_matrix_native(params, dk, padded_ncol, DistType::GaussDist { sigma: sigma_large });
+    let p2 = sample_gpu_matrix_native(
+        params,
+        dk,
+        padded_ncol,
+        DistType::GaussDist { sigma: sigma_large },
+    );
     let tp2 = &trapdoor.re * &p2;
 
     // Keep perturbation generation on device: this sampler uses the full
@@ -288,13 +290,12 @@ fn sample_gpu_matrix_native(
 mod tests {
     use super::*;
     use crate::{
-        __TestState,
+        __PAIR, __TestState,
         matrix::PolyMatrix,
         poly::{
-            dcrt::{gpu::gpu_device_sync, params::DCRTPolyParams},
             PolyParams,
+            dcrt::{gpu::gpu_device_sync, params::DCRTPolyParams},
         },
-        __PAIR,
     };
     use sequential_test::sequential;
 
@@ -387,8 +388,7 @@ mod tests {
         // Deterministic gadget preimage baseline:
         // z_plain = [R*z; E*z; z], where z = decompose(target).
         let z_plain = target.decompose();
-        let z_plain_former =
-            (&trapdoor.r * &z_plain).concat_rows(&[&(&trapdoor.e * &z_plain)]);
+        let z_plain_former = (&trapdoor.r * &z_plain).concat_rows(&[&(&trapdoor.e * &z_plain)]);
         let z_plain_full = z_plain_former.concat_rows(&[&z_plain]);
         assert_eq!(&public_matrix * &z_plain_full, target);
 

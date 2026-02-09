@@ -3,25 +3,23 @@ use crate::{
     matrix::PolyMatrix,
     parallel_iter,
     poly::{
+        Poly, PolyParams,
         dcrt::{
             gpu::{
-                check_status, gpu_event_set_destroy, gpu_event_set_wait, gpu_matrix_add,
-                gpu_matrix_copy, gpu_matrix_copy_block, gpu_matrix_copy_entry, gpu_matrix_create,
-                gpu_matrix_decompose_base, gpu_matrix_destroy, gpu_matrix_entry_clone,
-                gpu_matrix_fill_gadget,
-                gpu_matrix_gauss_samp_gq_arb_base,
+                GPU_MATRIX_DIST_BIT, GPU_MATRIX_DIST_GAUSS, GPU_MATRIX_DIST_TERNARY,
+                GPU_MATRIX_DIST_UNIFORM, GPU_POLY_FORMAT_EVAL, GpuDCRTPoly, GpuDCRTPolyParams,
+                GpuEventSetOpaque, GpuMatrixOpaque, check_status, gpu_event_set_destroy,
+                gpu_event_set_wait, gpu_matrix_add, gpu_matrix_copy, gpu_matrix_copy_block,
+                gpu_matrix_copy_entry, gpu_matrix_create, gpu_matrix_decompose_base,
+                gpu_matrix_destroy, gpu_matrix_entry_clone, gpu_matrix_equal,
+                gpu_matrix_fill_gadget, gpu_matrix_gauss_samp_gq_arb_base,
                 gpu_matrix_load_rns_batch, gpu_matrix_mul, gpu_matrix_mul_scalar,
-                gpu_matrix_mul_timed, gpu_matrix_sample_p1_full, gpu_matrix_store_rns_batch,
-                gpu_matrix_equal,
-                gpu_matrix_sub, GpuDCRTPoly,
-                GpuDCRTPolyParams, GpuEventSetOpaque, GpuMatrixOpaque, GPU_MATRIX_DIST_BIT,
-                GPU_MATRIX_DIST_GAUSS, GPU_MATRIX_DIST_TERNARY, GPU_MATRIX_DIST_UNIFORM,
-                GPU_POLY_FORMAT_EVAL, gpu_matrix_sample_distribution,
+                gpu_matrix_mul_timed, gpu_matrix_sample_distribution, gpu_matrix_sample_p1_full,
+                gpu_matrix_store_rns_batch, gpu_matrix_sub,
             },
             params::DCRTPolyParams,
             poly::DCRTPoly,
         },
-        Poly, PolyParams,
     },
     utils::block_size,
 };
@@ -195,9 +193,7 @@ impl GpuDCRTPolyMatrix {
         if nrow == 0 || ncol == 0 {
             return out;
         }
-        let status = unsafe {
-            gpu_matrix_sample_distribution(out.raw, dist.as_ffi(), sigma, seed)
-        };
+        let status = unsafe { gpu_matrix_sample_distribution(out.raw, dist.as_ffi(), sigma, seed) };
         check_status(status, "gpu_matrix_sample_distribution");
         out
     }
@@ -245,15 +241,7 @@ impl GpuDCRTPolyMatrix {
         }
         let status = unsafe {
             gpu_matrix_sample_p1_full(
-                a_mat.raw,
-                b_mat.raw,
-                d_mat.raw,
-                tp2.raw,
-                sigma,
-                s,
-                dgg_stddev,
-                seed,
-                out.raw,
+                a_mat.raw, b_mat.raw, d_mat.raw, tp2.raw, sigma, s, dgg_stddev, seed, out.raw,
             )
         };
         check_status(status, "gpu_matrix_sample_p1_full");
@@ -718,9 +706,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         }
         let log_base_q = params.modulus_digits();
         let out = Self::new_empty(params, size, size * log_base_q);
-        let status = unsafe {
-            gpu_matrix_fill_gadget(out.raw, params.base_bits())
-        };
+        let status = unsafe { gpu_matrix_fill_gadget(out.raw, params.base_bits()) };
         check_status(status, "gpu_matrix_fill_gadget");
         out
     }
@@ -1163,10 +1149,9 @@ fn one_rns_bytes(params: &GpuDCRTPolyParams) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::{
-        __TestState,
-        element::{finite_ring::FinRingElem, PolyElem},
+        __PAIR, __TestState,
+        element::{PolyElem, finite_ring::FinRingElem},
         poly::dcrt::gpu::gpu_device_sync,
-        __PAIR,
     };
     use num_bigint::BigUint;
     use rand::{Rng, rng};
@@ -1321,7 +1306,8 @@ mod tests {
         let varied_matrix = GpuDCRTPolyMatrix::from_poly_vec(&gpu_params, vec![vec![varied_poly]]);
         let varied_gadget = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, 1);
         for offset in 0..16u64 {
-            let sampled = varied_matrix.gauss_samp_gq_arb_base(c, 4.578, 0x00de_adbe_efu64 + offset);
+            let sampled =
+                varied_matrix.gauss_samp_gq_arb_base(c, 4.578, 0x00de_adbe_efu64 + offset);
             let reconstructed = &varied_gadget * &sampled;
             assert_eq!(reconstructed, varied_matrix);
         }
@@ -1345,7 +1331,8 @@ mod tests {
         );
         let wide_gadget = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, wide_matrix.row_size());
         for offset in 0..16u64 {
-            let sampled = wide_matrix.gauss_samp_gq_arb_base(c, 4.578, 0x55aa_aa55_1357_2468u64 + offset);
+            let sampled =
+                wide_matrix.gauss_samp_gq_arb_base(c, 4.578, 0x55aa_aa55_1357_2468u64 + offset);
             let reconstructed = &wide_gadget * &sampled;
             assert_eq!(reconstructed, wide_matrix);
         }
@@ -1366,7 +1353,8 @@ mod tests {
         let random_matrix = GpuDCRTPolyMatrix::from_poly_vec(&gpu_params, random_matrix_vec);
         let random_gadget = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, random_matrix.row_size());
         for offset in 0..8u64 {
-            let sampled = random_matrix.gauss_samp_gq_arb_base(c, 4.578, 0x0f0f_f0f0_2468_1357u64 + offset);
+            let sampled =
+                random_matrix.gauss_samp_gq_arb_base(c, 4.578, 0x0f0f_f0f0_2468_1357u64 + offset);
             let reconstructed = &random_gadget * &sampled;
             if reconstructed != random_matrix {
                 let sampled_cpu = sampled.to_cpu_matrix();
@@ -1398,19 +1386,23 @@ mod tests {
                                 let mut accum = 0u64;
                                 let mut base_pow = 1u64 % q;
                                 for digit in 0..digits_per_tower {
-                                    let sampled_row = row * log_base_q + tower * digits_per_tower + digit;
+                                    let sampled_row =
+                                        row * log_base_q + tower * digits_per_tower + digit;
                                     let digit_poly = sampled_cpu.entry(sampled_row, col);
-                                    let digit_coeff = digit_poly.coeffs()[coeff_idx].value().clone();
+                                    let digit_coeff =
+                                        digit_poly.coeffs()[coeff_idx].value().clone();
                                     let digit_res = (&digit_coeff % q_big)
                                         .to_u64_digits()
                                         .first()
                                         .copied()
                                         .unwrap_or(0);
-                                    let term =
-                                        ((u128::from(base_pow) * u128::from(digit_res)) % u128::from(q)) as u64;
+                                    let term = ((u128::from(base_pow) * u128::from(digit_res)) %
+                                        u128::from(q))
+                                        as u64;
                                     accum = (accum + term) % q;
-                                    base_pow =
-                                        ((u128::from(base_pow) * u128::from(base_u64)) % u128::from(q)) as u64;
+                                    base_pow = ((u128::from(base_pow) * u128::from(base_u64)) %
+                                        u128::from(q))
+                                        as u64;
                                 }
                                 if accum != src_res {
                                     violation = format!(

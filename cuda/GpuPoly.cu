@@ -61,11 +61,63 @@ namespace
         return static_cast<size_t>(level + 1) * static_cast<size_t>(N);
     }
 
+    void propagate_partition_stream_to_limbs(CKKS::RNSPoly *poly)
+    {
+        for (auto &partition : poly->GPU)
+        {
+            cudaError_t err = cudaSetDevice(partition.device);
+            if (err != cudaSuccess)
+            {
+                throw std::runtime_error(cudaGetErrorString(err));
+            }
+            for (auto &limb_impl : partition.limb)
+            {
+                cudaStream_t limb_stream = nullptr;
+                if (limb_impl.index() == FIDESlib::U64)
+                {
+                    limb_stream = std::get<FIDESlib::U64>(limb_impl).stream.ptr;
+                }
+                else if (limb_impl.index() == FIDESlib::U32)
+                {
+                    limb_stream = std::get<FIDESlib::U32>(limb_impl).stream.ptr;
+                }
+                if (!limb_stream || limb_stream == partition.s.ptr)
+                {
+                    continue;
+                }
+
+                cudaEvent_t ready = nullptr;
+                err = cudaEventCreateWithFlags(&ready, cudaEventDisableTiming);
+                if (err != cudaSuccess)
+                {
+                    throw std::runtime_error(cudaGetErrorString(err));
+                }
+                err = cudaEventRecord(ready, partition.s.ptr);
+                if (err != cudaSuccess)
+                {
+                    cudaEventDestroy(ready);
+                    throw std::runtime_error(cudaGetErrorString(err));
+                }
+                err = cudaStreamWaitEvent(limb_stream, ready, 0);
+                cudaError_t destroy_err = cudaEventDestroy(ready);
+                if (err != cudaSuccess)
+                {
+                    throw std::runtime_error(cudaGetErrorString(err));
+                }
+                if (destroy_err != cudaSuccess)
+                {
+                    throw std::runtime_error(cudaGetErrorString(destroy_err));
+                }
+            }
+        }
+    }
+
     void ensure_eval(GpuPoly *poly, int batch)
     {
         if (poly->format == PolyFormat::Coeff)
         {
             poly->poly->NTT(batch);
+            propagate_partition_stream_to_limbs(poly->poly);
             poly->format = PolyFormat::Eval;
         }
     }
@@ -75,6 +127,7 @@ namespace
         if (poly->format == PolyFormat::Eval)
         {
             poly->poly->INTT(batch);
+            propagate_partition_stream_to_limbs(poly->poly);
             poly->format = PolyFormat::Coeff;
         }
     }

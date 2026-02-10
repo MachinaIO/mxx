@@ -54,6 +54,86 @@ namespace
         }
     }
 
+    int sync_poly_limb_streams(const GpuPoly *poly, const char *context)
+    {
+        if (!poly || !poly->ctx || !poly->poly)
+        {
+            return set_error(context);
+        }
+        const int level = poly->level;
+        if (level < 0)
+        {
+            return set_error(context);
+        }
+        auto &limb_map = poly->ctx->ctx->limbGPUid;
+        if (limb_map.size() < static_cast<size_t>(level + 1))
+        {
+            return set_error(context);
+        }
+        for (int limb = 0; limb <= level; ++limb)
+        {
+            const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
+            if (limb_id.x >= poly->poly->GPU.size())
+            {
+                return set_error(context);
+            }
+            const auto &partition = poly->poly->GPU[limb_id.x];
+            if (limb_id.y >= partition.limb.size())
+            {
+                return set_error(context);
+            }
+
+            cudaError_t err = cudaSetDevice(partition.device);
+            if (err != cudaSuccess)
+            {
+                return set_error(err);
+            }
+
+            const auto &limb_impl = partition.limb[limb_id.y];
+            cudaStream_t stream = nullptr;
+            if (limb_impl.index() == FIDESlib::U64)
+            {
+                stream = std::get<FIDESlib::U64>(limb_impl).stream.ptr;
+            }
+            else if (limb_impl.index() == FIDESlib::U32)
+            {
+                stream = std::get<FIDESlib::U32>(limb_impl).stream.ptr;
+            }
+            else
+            {
+                return set_error(context);
+            }
+            err = cudaStreamSynchronize(stream);
+            if (err != cudaSuccess)
+            {
+                return set_error(err);
+            }
+        }
+        return 0;
+    }
+
+    int sync_poly_partition_streams(const GpuPoly *poly, const char *context)
+    {
+        if (!poly || !poly->poly)
+        {
+            return set_error(context);
+        }
+        for (const auto &partition : poly->poly->GPU)
+        {
+            cudaError_t err = cudaSetDevice(partition.device);
+            if (err != cudaSuccess)
+            {
+                return set_error(err);
+            }
+            err = cudaStreamSynchronize(partition.s.ptr);
+            if (err != cudaSuccess)
+            {
+                return set_error(err);
+            }
+        }
+        return 0;
+    }
+
     uint32_t bit_width_u64(uint64_t v)
     {
         if (v == 0)
@@ -3281,6 +3361,29 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         tmp_inputs.reserve(count);
         for (size_t i = 0; i < count; ++i)
         {
+            int sync_status = sync_poly_partition_streams(
+                src->polys[i],
+                "failed to synchronize source partition stream in gpu_matrix_gauss_samp_gq_arb_base");
+            if (sync_status != 0)
+            {
+                for (auto *p : tmp_inputs)
+                {
+                    gpu_poly_destroy(p);
+                }
+                return sync_status;
+            }
+            sync_status = sync_poly_limb_streams(
+                src->polys[i],
+                "failed to synchronize source limb stream in gpu_matrix_gauss_samp_gq_arb_base");
+            if (sync_status != 0)
+            {
+                for (auto *p : tmp_inputs)
+                {
+                    gpu_poly_destroy(p);
+                }
+                return sync_status;
+            }
+
             GpuPoly *clone = nullptr;
             int status = gpu_poly_clone(src->polys[i], &clone);
             if (status != 0)
@@ -3290,6 +3393,30 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                     gpu_poly_destroy(p);
                 }
                 return status;
+            }
+            sync_status = sync_poly_partition_streams(
+                clone,
+                "failed to synchronize clone partition stream in gpu_matrix_gauss_samp_gq_arb_base");
+            if (sync_status != 0)
+            {
+                gpu_poly_destroy(clone);
+                for (auto *p : tmp_inputs)
+                {
+                    gpu_poly_destroy(p);
+                }
+                return sync_status;
+            }
+            sync_status = sync_poly_limb_streams(
+                clone,
+                "failed to synchronize clone limb stream in gpu_matrix_gauss_samp_gq_arb_base");
+            if (sync_status != 0)
+            {
+                gpu_poly_destroy(clone);
+                for (auto *p : tmp_inputs)
+                {
+                    gpu_poly_destroy(p);
+                }
+                return sync_status;
             }
             status = gpu_poly_intt(clone, batch);
             if (status != 0)
@@ -3310,30 +3437,6 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         for (size_t i = 0; i < count; ++i)
         {
             inputs.push_back(src->polys[i]);
-        }
-    }
-
-    // Ensure all pending INTT work has completed before reading source limbs
-    // from other streams in the decomposition kernels.
-    for (int device : src->ctx->gpu_ids)
-    {
-        cudaError_t err = cudaSetDevice(device);
-        if (err != cudaSuccess)
-        {
-            for (auto *p : tmp_inputs)
-            {
-                gpu_poly_destroy(p);
-            }
-            return set_error(err);
-        }
-        err = cudaDeviceSynchronize();
-        if (err != cudaSuccess)
-        {
-            for (auto *p : tmp_inputs)
-            {
-                gpu_poly_destroy(p);
-            }
-            return set_error(err);
         }
     }
 
@@ -3463,6 +3566,8 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                 static_cast<size_t>(digit_idx);
             std::vector<const uint64_t *> src_ptrs;
             src_ptrs.reserve(count);
+            std::vector<cudaStream_t> src_streams;
+            src_streams.reserve(count);
             for (size_t idx = 0; idx < count; ++idx)
             {
                 const auto &in_partition = inputs[idx]->poly->GPU[src_limb_id.x];
@@ -3484,6 +3589,34 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                     return set_error("unsupported input source limb type in gpu_matrix_gauss_samp_gq_arb_base");
                 }
                 const auto &in_limb_u64 = std::get<FIDESlib::U64>(in_limb_impl);
+                cudaStream_t src_stream = in_limb_u64.stream.ptr;
+                bool seen_src_stream = false;
+                for (cudaStream_t s : src_streams)
+                {
+                    if (s == src_stream)
+                    {
+                        seen_src_stream = true;
+                        break;
+                    }
+                }
+                if (!seen_src_stream)
+                {
+                    src_streams.push_back(src_stream);
+                }
+                cudaStream_t src_partition_stream = in_partition.s.ptr;
+                seen_src_stream = false;
+                for (cudaStream_t s : src_streams)
+                {
+                    if (s == src_partition_stream)
+                    {
+                        seen_src_stream = true;
+                        break;
+                    }
+                }
+                if (!seen_src_stream)
+                {
+                    src_streams.push_back(src_partition_stream);
+                }
                 src_ptrs.push_back(in_limb_u64.v.data);
             }
 
@@ -3493,6 +3626,8 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                 std::vector<uint64_t *> dst_ptrs;
                 dst_ptrs.reserve(count);
                 cudaStream_t out_stream = nullptr;
+                std::vector<cudaStream_t> dst_streams;
+                dst_streams.reserve(count);
 
                 for (size_t idx = 0; idx < count; ++idx)
                 {
@@ -3532,7 +3667,126 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                     {
                         out_stream = out_limb_u64.stream.ptr;
                     }
+                    cudaStream_t dst_stream = out_limb_u64.stream.ptr;
+                    bool seen_stream = false;
+                    for (cudaStream_t s : dst_streams)
+                    {
+                        if (s == dst_stream)
+                        {
+                            seen_stream = true;
+                            break;
+                        }
+                    }
+                    if (!seen_stream)
+                    {
+                        dst_streams.push_back(dst_stream);
+                    }
+                    cudaStream_t dst_partition_stream = out_partition.s.ptr;
+                    seen_stream = false;
+                    for (cudaStream_t s : dst_streams)
+                    {
+                        if (s == dst_partition_stream)
+                        {
+                            seen_stream = true;
+                            break;
+                        }
+                    }
+                    if (!seen_stream)
+                    {
+                        dst_streams.push_back(dst_partition_stream);
+                    }
                     dst_ptrs.push_back(out_limb_u64.v.data);
+                }
+
+                for (cudaStream_t dst_stream : dst_streams)
+                {
+                    if (dst_stream == out_stream)
+                    {
+                        continue;
+                    }
+                    cudaEvent_t ready = nullptr;
+                    cudaError_t err = cudaEventCreateWithFlags(&ready, cudaEventDisableTiming);
+                    if (err != cudaSuccess)
+                    {
+                        for (auto *p : tmp_inputs)
+                        {
+                            gpu_poly_destroy(p);
+                        }
+                        return set_error(err);
+                    }
+                    err = cudaEventRecord(ready, dst_stream);
+                    if (err != cudaSuccess)
+                    {
+                        cudaEventDestroy(ready);
+                        for (auto *p : tmp_inputs)
+                        {
+                            gpu_poly_destroy(p);
+                        }
+                        return set_error(err);
+                    }
+                    err = cudaStreamWaitEvent(out_stream, ready, 0);
+                    cudaError_t destroy_err = cudaEventDestroy(ready);
+                    if (err != cudaSuccess)
+                    {
+                        for (auto *p : tmp_inputs)
+                        {
+                            gpu_poly_destroy(p);
+                        }
+                        return set_error(err);
+                    }
+                    if (destroy_err != cudaSuccess)
+                    {
+                        for (auto *p : tmp_inputs)
+                        {
+                            gpu_poly_destroy(p);
+                        }
+                        return set_error(destroy_err);
+                    }
+                }
+                for (cudaStream_t src_stream : src_streams)
+                {
+                    if (src_stream == out_stream)
+                    {
+                        continue;
+                    }
+                    cudaEvent_t ready = nullptr;
+                    cudaError_t err = cudaEventCreateWithFlags(&ready, cudaEventDisableTiming);
+                    if (err != cudaSuccess)
+                    {
+                        for (auto *p : tmp_inputs)
+                        {
+                            gpu_poly_destroy(p);
+                        }
+                        return set_error(err);
+                    }
+                    err = cudaEventRecord(ready, src_stream);
+                    if (err != cudaSuccess)
+                    {
+                        cudaEventDestroy(ready);
+                        for (auto *p : tmp_inputs)
+                        {
+                            gpu_poly_destroy(p);
+                        }
+                        return set_error(err);
+                    }
+                    err = cudaStreamWaitEvent(out_stream, ready, 0);
+                    cudaError_t destroy_err = cudaEventDestroy(ready);
+                    if (err != cudaSuccess)
+                    {
+                        for (auto *p : tmp_inputs)
+                        {
+                            gpu_poly_destroy(p);
+                        }
+                        return set_error(err);
+                    }
+                    if (destroy_err != cudaSuccess)
+                    {
+                        for (auto *p : tmp_inputs)
+                        {
+                            gpu_poly_destroy(p);
+                        }
+                        return set_error(destroy_err);
+                    }
                 }
 
                 int status = launch_gauss_samp_gq_arb_base_kernel(
@@ -3555,6 +3809,52 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                         gpu_poly_destroy(p);
                     }
                     return status;
+                }
+                cudaEvent_t done = nullptr;
+                cudaError_t err = cudaEventCreateWithFlags(&done, cudaEventDisableTiming);
+                if (err != cudaSuccess)
+                {
+                    for (auto *p : tmp_inputs)
+                    {
+                        gpu_poly_destroy(p);
+                    }
+                    return set_error(err);
+                }
+                err = cudaEventRecord(done, out_stream);
+                if (err != cudaSuccess)
+                {
+                    cudaEventDestroy(done);
+                    for (auto *p : tmp_inputs)
+                    {
+                        gpu_poly_destroy(p);
+                    }
+                    return set_error(err);
+                }
+                for (cudaStream_t dst_stream : dst_streams)
+                {
+                    if (dst_stream == out_stream)
+                    {
+                        continue;
+                    }
+                    err = cudaStreamWaitEvent(dst_stream, done, 0);
+                    if (err != cudaSuccess)
+                    {
+                        cudaEventDestroy(done);
+                        for (auto *p : tmp_inputs)
+                        {
+                            gpu_poly_destroy(p);
+                        }
+                        return set_error(err);
+                    }
+                }
+                cudaError_t destroy_err = cudaEventDestroy(done);
+                if (destroy_err != cudaSuccess)
+                {
+                    for (auto *p : tmp_inputs)
+                    {
+                        gpu_poly_destroy(p);
+                    }
+                    return set_error(destroy_err);
                 }
             }
         }

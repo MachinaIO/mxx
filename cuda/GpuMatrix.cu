@@ -1,4 +1,5 @@
 #include "GpuMatrix.h"
+#include "GpuChaCha.cuh"
 #include "GpuPolyInternal.h"
 
 #include <algorithm>
@@ -173,18 +174,14 @@ namespace
         dst[poly_idx][coeff_idx] = digit;
     }
 
-    __device__ __forceinline__ uint64_t splitmix64_next(uint64_t &state)
-    {
-        uint64_t z = (state += 0x9e3779b97f4a7c15ULL);
-        z = (z ^ (z >> 30U)) * 0xbf58476d1ce4e5b9ULL;
-        z = (z ^ (z >> 27U)) * 0x94d049bb133111ebULL;
-        return z ^ (z >> 31U);
-    }
+    using gpu_chacha::DeviceChaChaRng;
+    using gpu_chacha::rng_init;
+    using gpu_chacha::rng_next_u64;
 
-    __device__ __forceinline__ double uniform_open01(uint64_t &state)
+    __device__ __forceinline__ double uniform_open01(DeviceChaChaRng &rng)
     {
         constexpr double kScale = 1.0 / 9007199254740992.0; // 2^53
-        double u = static_cast<double>(splitmix64_next(state) >> 11U) * kScale;
+        double u = static_cast<double>(rng_next_u64(rng) >> 11U) * kScale;
         if (u <= 0.0)
         {
             u = kScale;
@@ -196,30 +193,30 @@ namespace
         return u;
     }
 
-    __device__ __forceinline__ double sample_standard_normal(uint64_t &state)
+    __device__ __forceinline__ double sample_standard_normal(DeviceChaChaRng &rng)
     {
-        double u1 = uniform_open01(state);
-        double u2 = uniform_open01(state);
+        double u1 = uniform_open01(rng);
+        double u2 = uniform_open01(rng);
         double r = sqrt(-2.0 * log(u1));
         double theta = kTwoPi * u2;
         return r * cos(theta);
     }
 
-    __device__ __forceinline__ bool karney_algorithm_h(uint64_t &state)
+    __device__ __forceinline__ bool karney_algorithm_h(DeviceChaChaRng &rng)
     {
-        double h_a = uniform_open01(state);
+        double h_a = uniform_open01(rng);
         if (!(h_a < 0.5))
         {
             return true;
         }
         for (;;)
         {
-            double h_b = uniform_open01(state);
+            double h_b = uniform_open01(rng);
             if (!(h_b < h_a))
             {
                 return false;
             }
-            h_a = uniform_open01(state);
+            h_a = uniform_open01(rng);
             if (!(h_a < h_b))
             {
                 return true;
@@ -227,10 +224,10 @@ namespace
         }
     }
 
-    __device__ __forceinline__ int32_t karney_algorithm_g(uint64_t &state)
+    __device__ __forceinline__ int32_t karney_algorithm_g(DeviceChaChaRng &rng)
     {
         int32_t n = 0;
-        while (karney_algorithm_h(state))
+        while (karney_algorithm_h(rng))
         {
             ++n;
             if (n > 1024)
@@ -241,27 +238,27 @@ namespace
         return n;
     }
 
-    __device__ __forceinline__ bool karney_algorithm_p(uint64_t &state, int32_t n)
+    __device__ __forceinline__ bool karney_algorithm_p(DeviceChaChaRng &rng, int32_t n)
     {
-        while (n-- && karney_algorithm_h(state))
+        while (n-- && karney_algorithm_h(rng))
         {
         }
         return n < 0;
     }
 
-    __device__ __forceinline__ bool karney_algorithm_b(uint64_t &state, int32_t k, double x)
+    __device__ __forceinline__ bool karney_algorithm_b(DeviceChaChaRng &rng, int32_t k, double x)
     {
         double y = x;
         int32_t n = 0;
         double m = static_cast<double>(2 * k + 2);
         for (;; ++n)
         {
-            double z = uniform_open01(state);
+            double z = uniform_open01(rng);
             if (!(z < y))
             {
                 break;
             }
-            double r = uniform_open01(state);
+            double r = uniform_open01(rng);
             if (!(r < (2.0 * static_cast<double>(k) + x) / m))
             {
                 break;
@@ -275,7 +272,7 @@ namespace
         return (n % 2) == 0;
     }
 
-    __device__ __forceinline__ int64_t sample_integer_karney(uint64_t &state, double mean, double stddev)
+    __device__ __forceinline__ int64_t sample_integer_karney(DeviceChaChaRng &rng, double mean, double stddev)
     {
         if (!(stddev > 0.0) || !isfinite(mean) || !isfinite(stddev))
         {
@@ -290,17 +287,17 @@ namespace
 
         for (int iter = 0; iter < 1 << 16; ++iter)
         {
-            int32_t k = karney_algorithm_g(state);
-            if (!karney_algorithm_p(state, k * (k - 1)))
+            int32_t k = karney_algorithm_g(rng);
+            if (!karney_algorithm_p(rng, k * (k - 1)))
             {
                 continue;
             }
 
-            int64_t s = (splitmix64_next(state) & 1ULL) ? 1 : -1;
+            int64_t s = (rng_next_u64(rng) & 1ULL) ? 1 : -1;
             double di0 = stddev * static_cast<double>(k) + static_cast<double>(s) * mean;
             int64_t i0 = static_cast<int64_t>(ceil(di0));
             double x0 = (static_cast<double>(i0) - di0) / stddev;
-            int64_t j = static_cast<int64_t>(splitmix64_next(state) % static_cast<uint64_t>(ceil_std));
+            int64_t j = static_cast<int64_t>(rng_next_u64(rng) % static_cast<uint64_t>(ceil_std));
             double x = x0 + static_cast<double>(j) / stddev;
 
             if (!(x < 1.0) || (x == 0.0 && s < 0 && k == 0))
@@ -309,7 +306,7 @@ namespace
             }
 
             int32_t h = k + 1;
-            while (h-- > 0 && karney_algorithm_b(state, k, x))
+            while (h-- > 0 && karney_algorithm_b(rng, k, x))
             {
             }
             if (h >= 0)
@@ -321,7 +318,7 @@ namespace
         }
 
         // Fallback in case the rejection loop takes too long.
-        return static_cast<int64_t>(llround(mean + stddev * sample_standard_normal(state)));
+        return static_cast<int64_t>(llround(mean + stddev * sample_standard_normal(rng)));
     }
 
     __device__ __forceinline__ void get_base_digits_u64(
@@ -352,7 +349,7 @@ namespace
         return rem == 0 ? 0 : (modulus - rem);
     }
 
-    __device__ __forceinline__ uint64_t sample_uniform_mod(uint64_t &state, uint64_t modulus)
+    __device__ __forceinline__ uint64_t sample_uniform_mod(DeviceChaChaRng &rng, uint64_t modulus)
     {
         if (modulus == 0)
         {
@@ -362,7 +359,7 @@ namespace
         const uint64_t threshold = kU64Max - (kU64Max % modulus);
         for (;;)
         {
-            uint64_t x = splitmix64_next(state);
+            uint64_t x = rng_next_u64(rng);
             if (x < threshold)
             {
                 return x % modulus;
@@ -405,29 +402,55 @@ namespace
         size_t poly_idx = idx / n;
         size_t coeff_idx = idx - poly_idx * n;
 
-        uint64_t rng_state = seed;
-        rng_state ^= 0x9e3779b97f4a7c15ULL * static_cast<uint64_t>(poly_idx + 1);
-        rng_state ^= 0xbf58476d1ce4e5b9ULL * static_cast<uint64_t>(coeff_idx + 1);
-
         uint64_t sample = 0;
         if (dist_type == GPU_MATRIX_DIST_UNIFORM)
         {
-            // For uniform CRT sampling, each tower is sampled independently.
-            rng_state ^= 0x94d049bb133111ebULL * static_cast<uint64_t>(limb_idx + 1);
-            sample = sample_uniform_mod(rng_state, modulus);
+            DeviceChaChaRng rng;
+            rng_init(
+                rng,
+                seed,
+                static_cast<uint64_t>(poly_idx + 1),
+                static_cast<uint64_t>(coeff_idx + 1),
+                static_cast<uint64_t>(limb_idx + 1),
+                0x6f70656e66686531ULL);
+            sample = sample_uniform_mod(rng, modulus);
         }
         else if (dist_type == GPU_MATRIX_DIST_GAUSS)
         {
-            int64_t z = sample_integer_karney(rng_state, 0.0, sigma);
+            DeviceChaChaRng rng;
+            rng_init(
+                rng,
+                seed,
+                static_cast<uint64_t>(poly_idx + 1),
+                static_cast<uint64_t>(coeff_idx + 1),
+                0,
+                0x6f70656e66686532ULL);
+            int64_t z = sample_integer_karney(rng, 0.0, sigma);
             sample = signed_mod_i64(z, modulus);
         }
         else if (dist_type == GPU_MATRIX_DIST_BIT)
         {
-            sample = (splitmix64_next(rng_state) & 1ULL) % modulus;
+            DeviceChaChaRng rng;
+            rng_init(
+                rng,
+                seed,
+                static_cast<uint64_t>(poly_idx + 1),
+                static_cast<uint64_t>(coeff_idx + 1),
+                0,
+                0x6f70656e66686533ULL);
+            sample = (rng_next_u64(rng) & 1ULL) % modulus;
         }
         else if (dist_type == GPU_MATRIX_DIST_TERNARY)
         {
-            uint64_t pick = splitmix64_next(rng_state) % 3ULL;
+            DeviceChaChaRng rng;
+            rng_init(
+                rng,
+                seed,
+                static_cast<uint64_t>(poly_idx + 1),
+                static_cast<uint64_t>(coeff_idx + 1),
+                0,
+                0x6f70656e66686534ULL);
+            uint64_t pick = rng_next_u64(rng) % 3ULL;
             int64_t z = pick == 0 ? 0 : (pick == 1 ? 1 : -1);
             sample = signed_mod_i64(z, modulus);
         }
@@ -545,10 +568,14 @@ namespace
         double *col_buf = col_workspace + idx * vec_stride;
         int64_t *sampled = sampled_workspace + idx * vec_stride;
 
-        uint64_t rng_state = seed;
-        rng_state ^= 0x9e3779b97f4a7c15ULL * static_cast<uint64_t>(col_idx + 1);
-        rng_state ^= 0xbf58476d1ce4e5b9ULL * static_cast<uint64_t>(coeff_idx + 1);
-        rng_state ^= 0x94d049bb133111ebULL * static_cast<uint64_t>(limb_idx + 1);
+        DeviceChaChaRng rng;
+        rng_init(
+            rng,
+            seed,
+            static_cast<uint64_t>(col_idx + 1),
+            static_cast<uint64_t>(coeff_idx + 1),
+            static_cast<uint64_t>(limb_idx + 1),
+            0x7065727475726231ULL);
 
         const double sigma2 = sigma * sigma;
         const double s2 = s * s;
@@ -600,7 +627,7 @@ namespace
                 var = fallback_var;
             }
             const double mu = mean[tt];
-            const int64_t z = sample_integer_karney(rng_state, mu, sqrt(var));
+            const int64_t z = sample_integer_karney(rng, mu, sqrt(var));
             sampled[tt] = z;
 
             if (t == 0)
@@ -710,15 +737,18 @@ namespace
             c_vec[i] = (c_vec[i - 1] + static_cast<double>(m_digits[i])) / base_f;
         }
 
-        uint64_t rng_state = seed;
-        rng_state ^= 0x9e3779b97f4a7c15ULL * static_cast<uint64_t>(tower_idx + 1);
-        rng_state ^= 0xbf58476d1ce4e5b9ULL * static_cast<uint64_t>(poly_idx + 1);
-        rng_state ^= 0x94d049bb133111ebULL * static_cast<uint64_t>(coeff_idx + 1);
-        rng_state ^= 0x632be59bd9b4e019ULL;
+        DeviceChaChaRng rng;
+        rng_init(
+            rng,
+            seed,
+            static_cast<uint64_t>(tower_idx + 1),
+            static_cast<uint64_t>(poly_idx + 1),
+            static_cast<uint64_t>(coeff_idx + 1),
+            0x6761646765746731ULL);
 
         for (uint32_t i = 0; i < digits_per_tower; ++i)
         {
-            zf[i] = sigma * sample_standard_normal(rng_state);
+            zf[i] = sigma * sample_standard_normal(rng);
         }
         for (uint32_t i = 0; i + 1 < digits_per_tower; ++i)
         {
@@ -733,14 +763,14 @@ namespace
         }
 
         const uint32_t last = digits_per_tower - 1;
-        z[last] = sample_integer_karney(rng_state, -a[last] / c_vec[last], sigma / c_vec[last]);
+        z[last] = sample_integer_karney(rng, -a[last] / c_vec[last], sigma / c_vec[last]);
         for (uint32_t i = 0; i < digits_per_tower; ++i)
         {
             a[i] += static_cast<double>(z[last]) * c_vec[i];
         }
         for (uint32_t i = 0; i < last; ++i)
         {
-            z[i] = sample_integer_karney(rng_state, -a[i], sigma);
+            z[i] = sample_integer_karney(rng, -a[i], sigma);
         }
 
         int64_t out_digit = 0;

@@ -193,10 +193,13 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         );
 
         let assemble_start = Instant::now();
-        let z_hat_former = (p_hat.slice_rows(0, d) + r_z_hat)
-            .concat_rows(&[&(p_hat.slice_rows(d, 2 * d) + e_z_hat)]);
-        let z_hat_latter = p_hat.slice_rows(2 * d, d * (k + 2)) + z_hat_mat;
-        let out = z_hat_former.concat_rows(&[&z_hat_latter]);
+        let correction_start = Instant::now();
+        let correction = r_z_hat.concat_rows(&[&e_z_hat, &z_hat_mat]);
+        tracing::debug!(
+            elapsed_ms = correction_start.elapsed().as_secs_f64() * 1_000.0,
+            "gpu preimage: assembled correction matrix"
+        );
+        let out = &p_hat + &correction;
         tracing::debug!(
             elapsed_ms = assemble_start.elapsed().as_secs_f64() * 1_000.0,
             "gpu preimage: assembled output matrix"

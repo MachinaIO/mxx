@@ -11,6 +11,7 @@ use crate::{
     sampler::{DistType, PolyTrapdoorSampler},
 };
 use rand::{Rng, rng};
+use std::time::Instant;
 
 const SIGMA: f64 = 4.578;
 const SPECTRAL_CONSTANT: f64 = 1.8;
@@ -116,6 +117,7 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         public_matrix: &Self::M,
         target: &Self::M,
     ) -> Self::M {
+        let preimage_start = Instant::now();
         let d = public_matrix.row_size();
         let target_cols = target.col_size();
         debug_assert_eq!(
@@ -123,7 +125,9 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             d,
             "Target matrix should have the same number of rows as the public matrix",
         );
+        tracing::debug!(d = d, target_cols = target_cols, "gpu preimage: start");
 
+        let param_start = Instant::now();
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
         let s = SPECTRAL_CONSTANT *
@@ -132,6 +136,17 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             SIGMA *
             (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
         let dgg_large_std = (s * s - self.c * self.c).sqrt();
+        tracing::debug!(
+            elapsed_ms = param_start.elapsed().as_secs_f64() * 1_000.0,
+            d = d,
+            n = n,
+            k = k,
+            s = s,
+            dgg_large_std = dgg_large_std,
+            "gpu preimage: parameters derived"
+        );
+
+        let p_hat_start = Instant::now();
         let p_hat = sample_pert_square_mat_gpu_native(
             params,
             trapdoor,
@@ -141,20 +156,56 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             dgg_large_std,
             target_cols,
         );
+        tracing::debug!(
+            elapsed_ms = p_hat_start.elapsed().as_secs_f64() * 1_000.0,
+            "gpu preimage: sampled p_hat"
+        );
 
+        let perturb_start = Instant::now();
         let perturbed_syndrome = target - &(public_matrix * &p_hat);
+        tracing::debug!(
+            elapsed_ms = perturb_start.elapsed().as_secs_f64() * 1_000.0,
+            "gpu preimage: computed perturbed_syndrome"
+        );
+
         // OpenFHE-equivalent GaussSampGqArbBase path on GPU:
         // this keeps the perturbation + gadget preimage step randomized.
         let mut rng = rng();
         let z_seed: u64 = rng.random();
+        let gauss_start = Instant::now();
         let z_hat_mat = perturbed_syndrome.gauss_samp_gq_arb_base(self.c, self.sigma, z_seed);
+        tracing::debug!(
+            elapsed_ms = gauss_start.elapsed().as_secs_f64() * 1_000.0,
+            "gpu preimage: sampled z_hat_mat with gauss_samp_gq_arb_base"
+        );
 
+        let r_mul_start = Instant::now();
         let r_z_hat = &trapdoor.r * &z_hat_mat;
+        tracing::debug!(
+            elapsed_ms = r_mul_start.elapsed().as_secs_f64() * 1_000.0,
+            "gpu preimage: computed r * z_hat"
+        );
+        let e_mul_start = Instant::now();
         let e_z_hat = &trapdoor.e * &z_hat_mat;
+        tracing::debug!(
+            elapsed_ms = e_mul_start.elapsed().as_secs_f64() * 1_000.0,
+            "gpu preimage: computed e * z_hat"
+        );
+
+        let assemble_start = Instant::now();
         let z_hat_former = (p_hat.slice_rows(0, d) + r_z_hat)
             .concat_rows(&[&(p_hat.slice_rows(d, 2 * d) + e_z_hat)]);
         let z_hat_latter = p_hat.slice_rows(2 * d, d * (k + 2)) + z_hat_mat;
-        z_hat_former.concat_rows(&[&z_hat_latter])
+        let out = z_hat_former.concat_rows(&[&z_hat_latter]);
+        tracing::debug!(
+            elapsed_ms = assemble_start.elapsed().as_secs_f64() * 1_000.0,
+            "gpu preimage: assembled output matrix"
+        );
+        tracing::debug!(
+            elapsed_ms = preimage_start.elapsed().as_secs_f64() * 1_000.0,
+            "gpu preimage: finished"
+        );
+        out
     }
 
     fn preimage_extend(

@@ -1378,6 +1378,7 @@ namespace
         uint32_t tower_idx,
         uint64_t seed,
         uint64_t out_modulus,
+        int device,
         cudaStream_t stream)
     {
         const size_t count = src_ptrs.size();
@@ -1390,34 +1391,40 @@ namespace
             return set_error("unexpected pointer counts in matrix_gauss_samp_gq_arb_base_kernel");
         }
 
-        const uint64_t **d_src = nullptr;
-        uint64_t **d_dst = nullptr;
-        const size_t bytes = count * sizeof(uint64_t *);
-
-        cudaError_t err = cudaMalloc(&d_src, bytes);
+        cudaError_t err = cudaSetDevice(device);
         if (err != cudaSuccess)
         {
             return set_error(err);
         }
-        err = cudaMalloc(&d_dst, bytes);
+
+        const uint64_t **d_src = nullptr;
+        uint64_t **d_dst = nullptr;
+        const size_t bytes = count * sizeof(uint64_t *);
+
+        err = cudaMallocAsync(&d_src, bytes, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_src);
+            return set_error(err);
+        }
+        err = cudaMallocAsync(&d_dst, bytes, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFreeAsync(d_src, stream);
             return set_error(err);
         }
 
         err = cudaMemcpyAsync(d_src, src_ptrs.data(), bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_src);
-            cudaFree(d_dst);
+            cudaFreeAsync(d_src, stream);
+            cudaFreeAsync(d_dst, stream);
             return set_error(err);
         }
         err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_src);
-            cudaFree(d_dst);
+            cudaFreeAsync(d_src, stream);
+            cudaFreeAsync(d_dst, stream);
             return set_error(err);
         }
 
@@ -1441,21 +1448,21 @@ namespace
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            cudaFree(d_src);
-            cudaFree(d_dst);
+            cudaFreeAsync(d_src, stream);
+            cudaFreeAsync(d_dst, stream);
             return set_error(err);
         }
 
-        err = cudaStreamSynchronize(stream);
+        err = cudaFreeAsync(d_src, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_src);
-            cudaFree(d_dst);
             return set_error(err);
         }
-
-        cudaFree(d_src);
-        cudaFree(d_dst);
+        err = cudaFreeAsync(d_dst, stream);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
         return 0;
     }
 
@@ -2910,6 +2917,20 @@ extern "C" int gpu_matrix_fill_gadget(
         {
             return status;
         }
+        status = sync_poly_partition_streams(
+            poly,
+            "failed to synchronize output partition stream after gpu_poly_ntt in gpu_matrix_fill_gadget");
+        if (status != 0)
+        {
+            return status;
+        }
+        status = sync_poly_limb_streams(
+            poly,
+            "failed to synchronize output limb stream after gpu_poly_ntt in gpu_matrix_fill_gadget");
+        if (status != 0)
+        {
+            return status;
+        }
         poly->format = PolyFormat::Eval;
     }
     out->format = PolyFormat::Eval;
@@ -3281,6 +3302,28 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
             }
             return status;
         }
+        status = sync_poly_partition_streams(
+            poly,
+            "failed to synchronize output partition stream after gpu_poly_ntt in gpu_matrix_decompose_base");
+        if (status != 0)
+        {
+            for (auto *p : tmp_inputs)
+            {
+                gpu_poly_destroy(p);
+            }
+            return status;
+        }
+        status = sync_poly_limb_streams(
+            poly,
+            "failed to synchronize output limb stream after gpu_poly_ntt in gpu_matrix_decompose_base");
+        if (status != 0)
+        {
+            for (auto *p : tmp_inputs)
+            {
+                gpu_poly_destroy(p);
+            }
+            return status;
+        }
         poly->format = PolyFormat::Eval;
     }
     out->format = PolyFormat::Eval;
@@ -3626,6 +3669,7 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                 std::vector<uint64_t *> dst_ptrs;
                 dst_ptrs.reserve(count);
                 cudaStream_t out_stream = nullptr;
+                int out_device = -1;
                 std::vector<cudaStream_t> dst_streams;
                 dst_streams.reserve(count);
 
@@ -3666,6 +3710,15 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                     if (!out_stream)
                     {
                         out_stream = out_limb_u64.stream.ptr;
+                        out_device = out_partition.device;
+                    }
+                    else if (out_device != out_partition.device)
+                    {
+                        for (auto *p : tmp_inputs)
+                        {
+                            gpu_poly_destroy(p);
+                        }
+                        return set_error("inconsistent output limb device in gpu_matrix_gauss_samp_gq_arb_base");
                     }
                     cudaStream_t dst_stream = out_limb_u64.stream.ptr;
                     bool seen_stream = false;
@@ -3801,6 +3854,7 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                     static_cast<uint32_t>(src_limb),
                     seed,
                     src->ctx->moduli[static_cast<size_t>(out_limb)],
+                    out_device,
                     out_stream);
                 if (status != 0)
                 {

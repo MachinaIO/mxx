@@ -185,6 +185,7 @@ where
 
         let trap_sampler = TS::new(params, self.trapdoor_sigma);
         let d = self.b0_matrix.row_size();
+        let mut b_matrix_entries: Vec<(usize, M)> = Vec::with_capacity(lut_entries.len());
         let mut b_matrix_map: HashMap<usize, Arc<M>> = HashMap::with_capacity(lut_entries.len());
         let mut processed_lut_rows = 0usize;
 
@@ -249,8 +250,13 @@ where
                 );
             }
             drop(b_trapdoor_lut);
+            b_matrix_entries.push((lut_id, b_matrix_lut.clone()));
             b_matrix_map.insert(lut_id, Arc::new(b_matrix_lut));
             debug!("LUT {} complete in {}", lut_id, Self::format_duration(lut_start.elapsed()));
+        }
+
+        if !b_matrix_entries.is_empty() {
+            add_lookup_buffer(get_lookup_buffer(b_matrix_entries, "ggh15_b_matrix_lut"));
         }
 
         let gate_ids: Vec<GateId> = self.gate_state.iter().map(|entry| *entry.key()).collect();
@@ -282,18 +288,20 @@ where
 
         for (lut_id, mut gates) in gates_by_lut {
             let lut_gate_start = Instant::now();
-            let b_lut_matrix = b_matrix_map[&lut_id].clone();
-            let d = b_lut_matrix.row_size() / 3;
-            // let b_matrix_lut_1 = Arc::new(b_matrix_lut.slice_rows(0, d));
-            // let b_matrix_lut_2 = Arc::new(b_matrix_lut.slice_rows(d, 2 * d));
-            // let b_matrix_lut_3 = Arc::new(b_matrix_lut.slice_rows(2 * d, 3 * d));
+            let b_matrix_lut = b_matrix_map[&lut_id].clone();
+            let d = b_matrix_lut.row_size() / 3;
+            let b_matrix_lut_1 = Arc::new(b_matrix_lut.slice_rows(0, d));
+            let b_matrix_lut_2 = Arc::new(b_matrix_lut.slice_rows(d, 2 * d));
+            let b_matrix_lut_3 = Arc::new(b_matrix_lut.slice_rows(2 * d, 3 * d));
 
             while !gates.is_empty() {
                 let take = gates.len().min(chunk_size);
                 let current: Vec<(GateId, GateState<M>)> = gates.drain(..take).collect();
                 total_gates += current.len();
-                let b_lut_matrix = b_lut_matrix.clone();
-                let results: Vec<(GateId, M, M, M, M)> = current
+                let b_matrix_lut_1 = b_matrix_lut_1.clone();
+                let b_matrix_lut_2 = b_matrix_lut_2.clone();
+                let b_matrix_lut_3 = b_matrix_lut_3.clone();
+                let results: Vec<(GateId, M, M, M, M, M)> = current
                     .into_par_iter()
                     .map(|(gate_id, state)| {
                         let uniform_sampler = US::new();
@@ -311,32 +319,29 @@ where
                         let input_matrix = input_pubkey.matrix;
                         let a_out = output_pubkey.matrix;
 
-                        let (b_g_trapdoor, b_g_matrix) = trap_sampler.trapdoor(params, 2 * d);
-
-                        // let c_matrix_1 = {
-                        //     let error = uniform_sampler.sample_uniform(
-                        //         params,
-                        //         d,
-                        //         b_matrix_lut_2.col_size(),
-                        //         DistType::GaussDist { sigma: error_sigma },
-                        //     );
-                        //     s_g.clone() * b_matrix_lut_2.as_ref() + error
-                        // };
-                        // let c_matrix_2 = {
-                        //     let error = uniform_sampler.sample_uniform(
-                        //         params,
-                        //         d,
-                        //         b_matrix_lut_3.col_size(),
-                        //         DistType::GaussDist { sigma: error_sigma },
-                        //     );
-                        //     s_g.clone() * b_matrix_lut_3.as_ref() + error
-                        // };
-                        let b_g_matrix_1 = b_g_matrix.slice_rows(0, d);
-                        let b_g_matrix_2 = b_g_matrix.slice_rows(d, 2 * d);
+                        let c_matrix_1 = {
+                            let error = uniform_sampler.sample_uniform(
+                                params,
+                                d,
+                                b_matrix_lut_2.col_size(),
+                                DistType::GaussDist { sigma: error_sigma },
+                            );
+                            s_g.clone() * b_matrix_lut_2.as_ref() + error
+                        };
+                        let c_matrix_2 = {
+                            let error = uniform_sampler.sample_uniform(
+                                params,
+                                d,
+                                b_matrix_lut_3.col_size(),
+                                DistType::GaussDist { sigma: error_sigma },
+                            );
+                            s_g.clone() * b_matrix_lut_3.as_ref() + error
+                        };
                         let k_to_ggh_target = {
                             let one_matrix = &one_pubkey.matrix;
-                            let one_muled = one_matrix.mul_decompose(&b_g_matrix_1);
-                            let input_muled = input_matrix.mul_decompose(&b_g_matrix_2);
+                            let one_muled = one_matrix.mul_decompose(b_matrix_lut_1.as_ref()) +
+                                one_matrix.mul_decompose(&c_matrix_1);
+                            let input_muled = input_matrix.mul_decompose(&c_matrix_2);
                             one_muled + input_muled
                         };
                         let k_to_ggh = trap_sampler.preimage(
@@ -345,27 +350,13 @@ where
                             &b0_matrix,
                             &k_to_ggh_target,
                         );
-                        let k_g_target = {
-                            let left =
-                                M::identity(params, d, None).concat_rows(&[&M::zero(params, d, d)]);
-                            let right = s_g.concat_diag(&[&s_g]);
-                            let error = uniform_sampler.sample_uniform(
-                                params,
-                                2 * d,
-                                b_lut_matrix.col_size(),
-                                DistType::GaussDist { sigma: error_sigma },
-                            );
-                            left.concat_columns(&[&right]) * b_lut_matrix.as_ref() + error
-                        };
-                        let k_g =
-                            trap_sampler.preimage(params, &b_g_trapdoor, &b_g_matrix, &k_g_target);
-                        (gate_id, b_g_matrix, k_to_ggh, k_g, a_out)
+                        (gate_id, c_matrix_1, c_matrix_2, k_to_ggh_target, k_to_ggh, a_out)
                     })
                     .collect();
 
-                for (gate_id, b_g_matrix, k_to_ggh, k_g, a_out) in results {
+                for (gate_id, c1, c2, target, k_to_ggh, a_out) in results {
                     let gate_aux_entries =
-                        vec![(0, b_g_matrix), (1, k_to_ggh), (2, k_g), (3, a_out)];
+                        vec![(0, c1), (1, c2), (2, target), (3, k_to_ggh), (4, a_out)];
                     let gate_aux_id = format!("ggh15_gate_aux_{}", gate_id);
                     add_lookup_buffer(get_lookup_buffer(gate_aux_entries, &gate_aux_id));
                 }
@@ -519,34 +510,32 @@ where
         });
 
         let dir = std::path::Path::new(&self.dir_path);
-        // let b_matrix_lut =
-        //     read_matrix_from_multi_batch::<M>(params, dir, "ggh15_b_matrix_lut", lut_id)
-        //         .unwrap_or_else(|| panic!("b_matrix_lut for lut {} not found", lut_id));
-        // debug_assert_eq!(b_matrix_lut.row_size() % 3, 0);
-        let d = input.pubkey.matrix.row_size();
-        // let b_matrix_lut_1 = b_matrix_lut.slice_rows(0, d);
+        let b_matrix_lut =
+            read_matrix_from_multi_batch::<M>(params, dir, "ggh15_b_matrix_lut", lut_id)
+                .unwrap_or_else(|| panic!("b_matrix_lut for lut {} not found", lut_id));
+        debug_assert_eq!(b_matrix_lut.row_size() % 3, 0);
+        let d = b_matrix_lut.row_size() / 3;
+        let b_matrix_lut_1 = b_matrix_lut.slice_rows(0, d);
         let gate_aux_id = format!("ggh15_gate_aux_{}", gate_id);
-        let b_g_matrix = read_matrix_from_multi_batch::<M>(params, dir, &gate_aux_id, 0)
-            .unwrap_or_else(|| panic!("b_g_matrix for gate {} not found", gate_id));
-        let k_to_ggh = read_matrix_from_multi_batch::<M>(params, dir, &gate_aux_id, 1)
+        let c_matrix_1 = read_matrix_from_multi_batch::<M>(params, dir, &gate_aux_id, 0)
+            .unwrap_or_else(|| panic!("c_matrix_1 for gate {} not found", gate_id));
+        let c_matrix_2 = read_matrix_from_multi_batch::<M>(params, dir, &gate_aux_id, 1)
+            .unwrap_or_else(|| panic!("c_matrix_2 for gate {} not found", gate_id));
+        let k_to_ggh = read_matrix_from_multi_batch::<M>(params, dir, &gate_aux_id, 3)
             .unwrap_or_else(|| panic!("k_to_ggh for gate {} not found", gate_id));
-        let k_g = read_matrix_from_multi_batch::<M>(params, dir, &gate_aux_id, 2)
-            .unwrap_or_else(|| panic!("k_g for gate {} not found", gate_id));
-        let a_out = read_matrix_from_multi_batch::<M>(params, dir, &gate_aux_id, 3)
-            .unwrap_or_else(|| panic!("a_out for gate {} not found", gate_id));
         let k_lut =
             read_matrix_from_multi_batch::<M>(params, dir, &format!("ggh15_lut_{}", lut_id), k)
                 .unwrap_or_else(|| panic!("k_lut (index {}) for lut {} not found", k, lut_id));
+        let a_out = read_matrix_from_multi_batch::<M>(params, dir, &gate_aux_id, 4)
+            .unwrap_or_else(|| panic!("a_out for gate {} not found", gate_id));
 
         let d_to_ggh = self.c_b0.clone() * k_to_ggh;
         let one_vector = &one.vector;
-        let b_g_matrix_1 = b_g_matrix.slice_rows(0, d);
-        let b_g_matrix_2 = b_g_matrix.slice_rows(d, 2 * d);
-        let p_g = d_to_ggh -
-            &(one_vector.mul_decompose(&b_g_matrix_1) +
-                input.vector.mul_decompose(&b_g_matrix_2));
-        let p_g_l = p_g * k_g;
-        let c_out = p_g_l * k_lut;
+        let term_const =
+            one_vector.mul_decompose(&b_matrix_lut_1) + one_vector.mul_decompose(&c_matrix_1);
+        let term_input = input.vector.mul_decompose(&c_matrix_2);
+        let p_g = d_to_ggh - &(term_const + term_input);
+        let c_out = p_g * k_lut;
         let output_pubkey = BggPublicKey { matrix: a_out, reveal_plaintext: true };
         BggEncoding::new(c_out, output_pubkey, Some(y))
     }

@@ -6,7 +6,7 @@ use mxx::{
     element::PolyElem,
     lookup::{
         PublicLut,
-        lwe_eval::{LWEBGGEncodingPltEvaluator, LWEBGGPubKeyPltEvaluator},
+        ggh15_eval::{GGH15BGGEncodingPltEvaluator, GGH15BGGPubKeyPltEvaluator},
     },
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     poly::{
@@ -17,7 +17,7 @@ use mxx::{
         DistType, PolyTrapdoorSampler, PolyUniformSampler, hash::DCRTPolyHashSampler,
         trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
     },
-    simulator::{SimulatorContext, error_norm::NormPltLWEEvaluator},
+    simulator::{SimulatorContext, error_norm::NormPltGGH15Evaluator},
     storage::write::{init_storage_system, wait_for_all_writes},
     utils::bigdecimal_bits_ceil,
 };
@@ -122,7 +122,8 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
             D_SECRET,
             log_base_q,
         ));
-        let plt_evaluator = NormPltLWEEvaluator::new(ctx.clone(), &error_sigma);
+        let plt_evaluator =
+            NormPltGGH15Evaluator::new(ctx.clone(), &error_sigma, &error_sigma, None);
         let e_init_norm = &error_sigma * BigDecimal::from(6u64);
         let input_bound = BigDecimal::from((P - 1) as u64);
 
@@ -139,29 +140,24 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
             .map(|e| e.matrix_norm.poly_norm.norm)
             .max_by(|a, b| a.partial_cmp(b).expect("comparable BigDecimal"))
             .expect("non-empty output");
-
-        // Post-processing projection by G^{-1}(unit_vector) is a 1-hot selection path here,
-        // so we conservatively reuse max_error without extra inflation.
-        let projected_max_error = max_error.clone();
         let q_over_2p_bd = BigDecimal::from_biguint(q_over_2p.clone(), 0);
         info!(
-            "crt_depth={} q_over_p_bits={} q_over_2p_bits={} max_error_bits={} projected_max_error_bits={}",
+            "crt_depth={} q_over_p_bits={} q_over_2p_bits={} max_error_bits={}",
             crt_depth,
             q_over_p.bits(),
             q_over_2p.bits(),
-            bigdecimal_bits_ceil(&max_error),
-            bigdecimal_bits_ceil(&projected_max_error)
+            bigdecimal_bits_ceil(&max_error)
         );
-        if projected_max_error < q_over_2p_bd {
+        if max_error < q_over_2p_bd {
             return (crt_depth, params, circuit, q_over_p);
         }
     }
 
-    panic!("crt_depth satisfying error < q/p not found up to MAX_CRT_DEPTH");
+    panic!("crt_depth satisfying error < q/(2p) not found up to MAX_CRT_DEPTH");
 }
 
 #[tokio::test]
-async fn test_lwe_modp_chain_rounding() {
+async fn test_ggh15_modp_chain_rounding() {
     let _ = tracing_subscriber::fmt::try_init();
 
     let (_crt_depth, params, circuit, q_over_p) = find_crt_depth_for_modp_chain();
@@ -171,6 +167,7 @@ async fn test_lwe_modp_chain_rounding() {
         params.ring_dimension(),
         params.base_bits()
     );
+
     let mut rng = rand::rng();
     let a: u64 = rng.random_range(0..P);
     let b: u64 = rng.random_range(0..P);
@@ -183,19 +180,19 @@ async fn test_lwe_modp_chain_rounding() {
         DCRTPoly::from_usize_to_constant(&params, c as usize),
     ];
 
-    let d_secret = D_SECRET;
     let key: [u8; 32] = [
         0x5f, 0x92, 0x10, 0x6a, 0xa0, 0xd4, 0x55, 0xf2, 0x64, 0x96, 0x74, 0x8f, 0xc6, 0xdb, 0xed,
         0x20, 0x1e, 0x0c, 0xd6, 0x6a, 0xe4, 0xa4, 0x3a, 0x9a, 0x41, 0xb5, 0xf8, 0x30, 0xe7, 0x3a,
         0x08, 0xd9,
     ];
+
     let bgg_pubkey_sampler =
-        BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d_secret);
+        BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, D_SECRET);
     let tag: u64 = rand::random();
     let tag_bytes = tag.to_le_bytes();
 
     let uniform_sampler = DCRTPolyUniformSampler::new();
-    let s = uniform_sampler.sample_uniform(&params, 1, d_secret - 1, DistType::BitDist).get_row(0);
+    let s = uniform_sampler.sample_uniform(&params, 1, D_SECRET - 1, DistType::BitDist).get_row(0);
     let mut secrets = s;
     secrets.push(DCRTPoly::const_minus_one(&params));
     let s_vec = DCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
@@ -211,25 +208,34 @@ async fn test_lwe_modp_chain_rounding() {
 
     let trapdoor_sigma = 4.578;
     let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, trapdoor_sigma);
-    let (b0_trapdoor, b0_matrix) = trapdoor_sampler.trapdoor(&params, d_secret);
+    let (b0_trapdoor, b0_matrix) = trapdoor_sampler.trapdoor(&params, D_SECRET);
     let b0_matrix = Arc::new(b0_matrix);
     let b0_trapdoor = Arc::new(b0_trapdoor);
 
-    let dir = Path::new("test_data/lwe_modp_chain_rounding");
-    if !dir.exists() {
-        fs::create_dir_all(dir).unwrap();
+    let dir = Path::new("test_data/ggh15_modp_chain_rounding");
+    if dir.exists() {
+        fs::remove_dir_all(dir).unwrap();
     }
+    fs::create_dir_all(dir).unwrap();
     init_storage_system(dir.to_path_buf());
 
     info!("plt pubkey evaluator setup start");
-    let plt_pubkey_evaluator =
-        LWEBGGPubKeyPltEvaluator::<
-            DCRTPolyMatrix,
-            DCRTPolyHashSampler<Keccak256>,
-            DCRTPolyTrapdoorSampler,
-        >::new(
-            key, trapdoor_sampler.clone(), b0_matrix.clone(), b0_trapdoor, dir.to_path_buf()
-        );
+    let insert_1_to_s = false;
+    let plt_pubkey_evaluator = GGH15BGGPubKeyPltEvaluator::<
+        DCRTPolyMatrix,
+        DCRTPolyUniformSampler,
+        DCRTPolyHashSampler<Keccak256>,
+        DCRTPolyTrapdoorSampler,
+    >::new(
+        key,
+        trapdoor_sigma,
+        ERROR_SIGMA,
+        &params,
+        b0_matrix.clone(),
+        b0_trapdoor,
+        dir.to_path_buf(),
+        insert_1_to_s,
+    );
     info!("plt pubkey evaluator setup done");
 
     info!("circuit eval pubkey start");
@@ -241,12 +247,12 @@ async fn test_lwe_modp_chain_rounding() {
 
     wait_for_all_writes(dir.to_path_buf()).await.unwrap();
 
-    let c_b = s_vec.clone() * b0_matrix.as_ref();
+    let c_b0 = s_vec.clone() * b0_matrix.as_ref();
     info!("plt encoding evaluator setup start");
-    let plt_encoding_evaluator = LWEBGGEncodingPltEvaluator::<
+    let plt_encoding_evaluator = GGH15BGGEncodingPltEvaluator::<
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
-    >::new(key, dir.to_path_buf(), c_b);
+    >::new(key, &params, dir.to_path_buf(), D_SECRET, c_b0);
     info!("plt encoding evaluator setup done");
 
     info!("circuit eval encoding start");
@@ -256,8 +262,7 @@ async fn test_lwe_modp_chain_rounding() {
     assert_eq!(result_encoding.len(), 1);
 
     let encoding = &result_encoding[0];
-    let s_times_pk = s_vec.clone() * &encoding.pubkey.matrix;
-    let diff = encoding.vector.clone() - s_times_pk;
+    assert_eq!(encoding.pubkey, result_pubkey[0]);
 
     let expected = BigUint::from(expected_mod_p);
     let expected_plaintext =
@@ -274,7 +279,9 @@ async fn test_lwe_modp_chain_rounding() {
         "decoded value from encoding plaintext must match mod p result"
     );
 
-    let unit_vector = DCRTPolyMatrix::unit_column_vector(&params, d_secret, d_secret - 1);
+    let s_times_pk = s_vec.clone() * &encoding.pubkey.matrix;
+    let diff = encoding.vector.clone() - s_times_pk;
+    let unit_vector = DCRTPolyMatrix::unit_column_vector(&params, D_SECRET, D_SECRET - 1);
     let projected = diff.mul_decompose(&unit_vector);
     assert_eq!(projected.row_size(), 1);
     assert_eq!(projected.col_size(), 1);

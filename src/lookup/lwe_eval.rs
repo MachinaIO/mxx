@@ -274,7 +274,13 @@ where
                     let target = a_lt.clone() - &(gadget.clone() * y_k);
                     (
                         k,
-                        trap_sampler.preimage_extend(params, trapdoor, pub_matrix, &ext_matrix, &target),
+                        trap_sampler.preimage_extend(
+                            params,
+                            trapdoor,
+                            pub_matrix,
+                            &ext_matrix,
+                            &target,
+                        ),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -290,7 +296,13 @@ where
                 let target = a_lt.clone() - &(gadget.clone() * y_k);
                 (
                     k,
-                    trap_sampler.preimage_extend(params, trapdoor, pub_matrix, &ext_matrix, &target),
+                    trap_sampler.preimage_extend(
+                        params,
+                        trapdoor,
+                        pub_matrix,
+                        &ext_matrix,
+                        &target,
+                    ),
                 )
             })
             .collect::<Vec<_>>();

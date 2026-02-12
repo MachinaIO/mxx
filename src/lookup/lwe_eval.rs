@@ -11,9 +11,21 @@ use crate::{
     },
     utils::timed_read,
 };
-use rayon::{iter::ParallelBridge, prelude::*};
-use std::{marker::PhantomData, path::PathBuf, sync::Arc};
+use dashmap::DashMap;
+use rayon::prelude::*;
+use std::{collections::HashMap, marker::PhantomData, path::PathBuf, sync::Arc};
 use tracing::{debug, info};
+
+#[derive(Debug)]
+struct GateState<M>
+where
+    M: PolyMatrix,
+{
+    lut_id: usize,
+    input_pubkey_bytes: Vec<u8>,
+    output_pubkey_bytes: Vec<u8>,
+    _m: PhantomData<M>,
+}
 
 #[derive(Debug)]
 pub struct LWEBGGPubKeyPltEvaluator<M, SH, ST>
@@ -27,6 +39,8 @@ where
     pub pub_matrix: Arc<M>,
     pub trapdoor: Arc<ST::Trapdoor>,
     pub dir_path: PathBuf,
+    lut_state: DashMap<usize, PublicLut<<BggPublicKey<M> as Evaluable>::P>>,
+    gate_state: DashMap<GateId, GateState<M>>,
     _sh: PhantomData<SH>,
     _st: PhantomData<ST>,
 }
@@ -45,30 +59,30 @@ where
         _: &BggPublicKey<M>,
         input: &BggPublicKey<M>,
         gate_id: GateId,
-        _: usize,
+        lut_id: usize,
     ) -> BggPublicKey<M> {
         let row_size = input.matrix.row_size();
         let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, gate_id);
-        let buffer = preimage_all::<M, ST, _>(
-            plt,
-            params,
-            &self.trap_sampler,
-            &self.pub_matrix,
-            &self.trapdoor,
-            &input.matrix,
-            &a_lt,
-            &gate_id,
+        self.lut_state.entry(lut_id).or_insert_with(|| plt.clone());
+        self.gate_state.insert(
+            gate_id,
+            GateState {
+                lut_id,
+                input_pubkey_bytes: input.matrix.to_compact_bytes(),
+                output_pubkey_bytes: a_lt.to_compact_bytes(),
+                _m: PhantomData,
+            },
         );
-        add_lookup_buffer(buffer);
         BggPublicKey { matrix: a_lt, reveal_plaintext: true }
     }
 }
 
 impl<M, SH, ST> LWEBGGPubKeyPltEvaluator<M, SH, ST>
 where
-    M: PolyMatrix,
+    M: PolyMatrix + Send + 'static,
     SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     ST: PolyTrapdoorSampler<M = M> + Send + Sync,
+    M::P: 'static,
 {
     pub fn new(
         hash_key: [u8; 32],
@@ -83,9 +97,62 @@ where
             pub_matrix,
             trapdoor,
             dir_path,
+            lut_state: DashMap::new(),
+            gate_state: DashMap::new(),
             _sh: PhantomData,
             _st: PhantomData,
         }
+    }
+
+    pub fn sample_aux_matrices(&self, params: &<M::P as Poly>::Params) {
+        info!("Sampling LWE LUT auxiliary matrices");
+
+        let lut_ids: Vec<usize> = self.lut_state.iter().map(|entry| *entry.key()).collect();
+        let mut lut_entries: HashMap<usize, PublicLut<<BggPublicKey<M> as Evaluable>::P>> =
+            HashMap::with_capacity(lut_ids.len());
+        for lut_id in lut_ids {
+            if let Some((_, plt)) = self.lut_state.remove(&lut_id) {
+                lut_entries.insert(lut_id, plt);
+            }
+        }
+
+        let gate_ids: Vec<GateId> = self.gate_state.iter().map(|entry| *entry.key()).collect();
+        let total_gates = gate_ids.len();
+        let mut gate_entries = Vec::with_capacity(gate_ids.len());
+        for gate_id in gate_ids {
+            if let Some((_, state)) = self.gate_state.remove(&gate_id) {
+                gate_entries.push((gate_id, state));
+            }
+        }
+
+        if gate_entries.is_empty() {
+            info!("No LWE gate auxiliary matrices to sample");
+            return;
+        }
+
+        for (gate_id, gate_state) in gate_entries {
+            let plt = lut_entries.get(&gate_state.lut_id).unwrap_or_else(|| {
+                panic!(
+                    "LUT state for lut_id {} not found while sampling gate {}",
+                    gate_state.lut_id, gate_id
+                )
+            });
+            let input_pubkey = M::from_compact_bytes(params, &gate_state.input_pubkey_bytes);
+            let output_pubkey = M::from_compact_bytes(params, &gate_state.output_pubkey_bytes);
+            let buffer = preimage_all::<M, ST, _>(
+                plt,
+                params,
+                &self.trap_sampler,
+                &self.pub_matrix,
+                &self.trapdoor,
+                &input_pubkey,
+                &output_pubkey,
+                &gate_id,
+            );
+            add_lookup_buffer(buffer);
+        }
+
+        info!("Sampled {} LWE gate auxiliary matrices", total_gates);
     }
 }
 
@@ -187,16 +254,48 @@ where
 {
     let row_size = pub_matrix.row_size();
     let gadget = M::gadget_matrix(params, row_size);
-    info!("start collecting preimages {}", id);
-    let preimages = plt
-        .entries(params)
-        .par_bridge()
-        .map(|(x_k, (k, y_k))| {
-            let ext_matrix = a_z.clone() - &(gadget.clone() * x_k);
-            let target = a_lt.clone() - &(gadget.clone() * y_k);
-            (k, trap_sampler.preimage_extend(params, trapdoor, pub_matrix, &ext_matrix, &target))
-        })
-        .collect::<Vec<_>>();
+    let chunk_size = crate::env::lut_preimage_chunk_size().max(1);
+    info!(
+        "start collecting preimages {} (entries={}, parallel_batch={})",
+        id,
+        plt.len(),
+        chunk_size
+    );
+    let mut preimages = Vec::with_capacity(plt.len());
+    let mut batch = Vec::with_capacity(chunk_size);
+    for (x_k, (k, y_k)) in plt.entries(params) {
+        batch.push((x_k, k, y_k));
+        if batch.len() >= chunk_size {
+            let chunk = std::mem::take(&mut batch);
+            let mut partial = chunk
+                .into_par_iter()
+                .map(|(x_k, k, y_k)| {
+                    let ext_matrix = a_z.clone() - &(gadget.clone() * x_k);
+                    let target = a_lt.clone() - &(gadget.clone() * y_k);
+                    (
+                        k,
+                        trap_sampler.preimage_extend(params, trapdoor, pub_matrix, &ext_matrix, &target),
+                    )
+                })
+                .collect::<Vec<_>>();
+            preimages.append(&mut partial);
+            batch = Vec::with_capacity(chunk_size);
+        }
+    }
+    if !batch.is_empty() {
+        let mut partial = batch
+            .into_par_iter()
+            .map(|(x_k, k, y_k)| {
+                let ext_matrix = a_z.clone() - &(gadget.clone() * x_k);
+                let target = a_lt.clone() - &(gadget.clone() * y_k);
+                (
+                    k,
+                    trap_sampler.preimage_extend(params, trapdoor, pub_matrix, &ext_matrix, &target),
+                )
+            })
+            .collect::<Vec<_>>();
+        preimages.append(&mut partial);
+    }
     info!("finish collecting preimages {}", id);
     get_lookup_buffer(preimages, &format!("L_{id}"))
 }
@@ -298,6 +397,7 @@ mod test {
             std::slice::from_ref(&enc1.pubkey),
             Some(&plt_pubkey_evaluator),
         );
+        plt_pubkey_evaluator.sample_aux_matrices(&params);
         wait_for_all_writes(dir.to_path_buf()).await.unwrap();
         assert_eq!(result_pubkey.len(), 1);
         let result_pubkey = &result_pubkey[0];

@@ -112,6 +112,7 @@ async fn test_arithmetic_circuit_operations_lwe() {
     let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(&pk_evaluator));
     info!("end pubkey evaluation");
     assert_eq!(pubkey_out.len(), 1);
+    pk_evaluator.sample_aux_matrices(&params);
     info!("wait for all writes");
     wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
     info!("finish writing");

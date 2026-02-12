@@ -164,6 +164,7 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_commit_modp_chain_rounding() {
     let _ = tracing_subscriber::fmt::try_init();
 

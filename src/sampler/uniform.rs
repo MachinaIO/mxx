@@ -1,8 +1,8 @@
 use crate::{
-    matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+    matrix::{dcrt_poly::DCRTPolyMatrix, PolyMatrix},
     openfhe_guard::ensure_openfhe_warmup,
     parallel_iter,
-    poly::{Poly, PolyParams, dcrt::poly::DCRTPoly},
+    poly::{dcrt::poly::DCRTPoly, Poly, PolyParams},
     sampler::{DistType, PolyUniformSampler},
 };
 use openfhe::ffi;
@@ -132,9 +132,9 @@ mod tests {
         for coeff in coeffs.iter() {
             let value = coeff.value.clone();
             assert!(
-                value == BigUint::ZERO ||
-                    value == BigUint::from(1u32) ||
-                    value == params.modulus().as_ref() - BigUint::from(1u32),
+                value == BigUint::ZERO
+                    || value == BigUint::from(1u32)
+                    || value == params.modulus().as_ref() - BigUint::from(1u32),
                 "Coefficient value {:?} is not in {{-1, 0, 1}}",
                 value
             );

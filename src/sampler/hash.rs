@@ -1,8 +1,8 @@
 use crate::{
-    element::{PolyElem, finite_ring::FinRingElem},
-    matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+    element::{finite_ring::FinRingElem, PolyElem},
+    matrix::{dcrt_poly::DCRTPolyMatrix, PolyMatrix},
     parallel_iter,
-    poly::{Poly, PolyParams, dcrt::poly::DCRTPoly},
+    poly::{dcrt::poly::DCRTPoly, Poly, PolyParams},
     sampler::{DistType, PolyHashSampler},
 };
 use bitvec::prelude::*;

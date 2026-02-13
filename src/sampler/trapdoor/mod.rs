@@ -1,3 +1,5 @@
+#[cfg(feature = "gpu")]
+pub use crate::sampler::gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler};
 use crate::{
     matrix::{
         PolyMatrix,

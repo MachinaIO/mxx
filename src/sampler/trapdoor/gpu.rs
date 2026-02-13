@@ -1,16 +1,9 @@
-use super::DCRTTrapdoor;
 use crate::{
-    matrix::{
-        PolyMatrix,
-        gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuMatrixSampleDist},
-    },
-    poly::{
-        Poly, PolyParams,
-        dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams},
-    },
-    sampler::{DistType, PolyTrapdoorSampler},
+    matrix::{gpu_dcrt_poly::GpuDCRTPolyMatrix, PolyMatrix},
+    poly::{dcrt::gpu::GpuDCRTPolyParams, Poly, PolyParams},
+    sampler::{gpu::GpuDCRTPolyUniformSampler, DistType, PolyTrapdoorSampler, PolyUniformSampler},
 };
-use rand::{Rng, rng};
+use rand::{rng, Rng};
 use std::time::Instant;
 
 const SIGMA: f64 = 4.578;
@@ -28,10 +21,11 @@ pub struct GpuDCRTTrapdoor {
 
 impl GpuDCRTTrapdoor {
     pub fn new(params: &GpuDCRTPolyParams, size: usize, sigma: f64) -> Self {
+        let uniform_sampler = GpuDCRTPolyUniformSampler::new();
         let log_base_q = params.modulus_digits();
         let dist = DistType::GaussDist { sigma };
-        let r = sample_gpu_matrix_native(params, size, size * log_base_q, dist);
-        let e = sample_gpu_matrix_native(params, size, size * log_base_q, dist);
+        let r = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
+        let e = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
         let a_mat = &r * &r.transpose(); // d x d
         let b_mat = &r * &e.transpose(); // d x d
         let d_mat = &e * &e.transpose(); // d x d
@@ -40,31 +34,57 @@ impl GpuDCRTTrapdoor {
     }
 
     pub fn to_compact_bytes(&self) -> Vec<u8> {
-        self.to_cpu_trapdoor().to_compact_bytes()
+        let mats = [&self.r, &self.e, &self.a_mat, &self.b_mat, &self.d_mat, &self.re];
+        let mut parts = Vec::with_capacity(mats.len());
+        let mut total_len = 0usize;
+        for mat in mats {
+            let bytes = mat.to_compact_bytes();
+            total_len += 8 + bytes.len();
+            parts.push(bytes);
+        }
+        let mut out = Vec::with_capacity(total_len);
+        for bytes in parts {
+            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            out.extend_from_slice(&bytes);
+        }
+        out
     }
 
     pub fn from_compact_bytes(params: &GpuDCRTPolyParams, bytes: &[u8]) -> Option<Self> {
-        let cpu_params = cpu_params_from_gpu(params);
-        let cpu = DCRTTrapdoor::from_compact_bytes(&cpu_params, bytes)?;
-        Some(Self {
-            r: GpuDCRTPolyMatrix::from_cpu_matrix(params, &cpu.r),
-            e: GpuDCRTPolyMatrix::from_cpu_matrix(params, &cpu.e),
-            a_mat: GpuDCRTPolyMatrix::from_cpu_matrix(params, &cpu.a_mat),
-            b_mat: GpuDCRTPolyMatrix::from_cpu_matrix(params, &cpu.b_mat),
-            d_mat: GpuDCRTPolyMatrix::from_cpu_matrix(params, &cpu.d_mat),
-            re: GpuDCRTPolyMatrix::from_cpu_matrix(params, &cpu.re),
-        })
-    }
-
-    pub(crate) fn to_cpu_trapdoor(&self) -> DCRTTrapdoor {
-        DCRTTrapdoor {
-            r: self.r.to_cpu_matrix(),
-            e: self.e.to_cpu_matrix(),
-            a_mat: self.a_mat.to_cpu_matrix(),
-            b_mat: self.b_mat.to_cpu_matrix(),
-            d_mat: self.d_mat.to_cpu_matrix(),
-            re: self.re.to_cpu_matrix(),
+        let mut offset = 0usize;
+        let next = |buf: &[u8], offset: &mut usize| -> Option<Vec<u8>> {
+            if *offset + 8 > buf.len() {
+                return None;
+            }
+            let mut len_bytes = [0u8; 8];
+            len_bytes.copy_from_slice(&buf[*offset..*offset + 8]);
+            let len = u64::from_le_bytes(len_bytes) as usize;
+            *offset += 8;
+            if *offset + len > buf.len() {
+                return None;
+            }
+            let out = buf[*offset..*offset + len].to_vec();
+            *offset += len;
+            Some(out)
+        };
+        let r_bytes = next(bytes, &mut offset)?;
+        let e_bytes = next(bytes, &mut offset)?;
+        let a_bytes = next(bytes, &mut offset)?;
+        let b_bytes = next(bytes, &mut offset)?;
+        let d_bytes = next(bytes, &mut offset)?;
+        let re_bytes = next(bytes, &mut offset)?;
+        if offset != bytes.len() {
+            return None;
         }
+
+        Some(Self {
+            r: GpuDCRTPolyMatrix::from_compact_bytes(params, &r_bytes),
+            e: GpuDCRTPolyMatrix::from_compact_bytes(params, &e_bytes),
+            a_mat: GpuDCRTPolyMatrix::from_compact_bytes(params, &a_bytes),
+            b_mat: GpuDCRTPolyMatrix::from_compact_bytes(params, &b_bytes),
+            d_mat: GpuDCRTPolyMatrix::from_compact_bytes(params, &d_bytes),
+            re: GpuDCRTPolyMatrix::from_compact_bytes(params, &re_bytes),
+        })
     }
 }
 
@@ -90,8 +110,9 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
         size: usize,
     ) -> (Self::Trapdoor, Self::M) {
+        let uniform_sampler = GpuDCRTPolyUniformSampler::new();
         let trapdoor = GpuDCRTTrapdoor::new(params, size, self.sigma);
-        let a_bar = sample_gpu_matrix_native(params, size, size, DistType::FinRingDist);
+        let a_bar = uniform_sampler.sample_uniform(params, size, size, DistType::FinRingDist);
         let g = GpuDCRTPolyMatrix::gadget_matrix(params, size);
         let a0 = a_bar.concat_columns(&[&GpuDCRTPolyMatrix::identity(params, size, None)]);
         let a1 = &g - &(&a_bar * &trapdoor.r + &trapdoor.e);
@@ -130,11 +151,11 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         let param_start = Instant::now();
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
-        let s = SPECTRAL_CONSTANT *
-            (self.base as f64 + 1.0) *
-            SIGMA *
-            SIGMA *
-            (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+        let s = SPECTRAL_CONSTANT
+            * (self.base as f64 + 1.0)
+            * SIGMA
+            * SIGMA
+            * (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
         let dgg_large_std = (s * s - self.c * self.c).sqrt();
         tracing::debug!(
             elapsed_ms = param_start.elapsed().as_secs_f64() * 1_000.0,
@@ -224,27 +245,19 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         let target_ncol = target.col_size();
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
-        let s = SPECTRAL_CONSTANT *
-            (self.base as f64 + 1.0) *
-            SIGMA *
-            SIGMA *
-            (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+        let s = SPECTRAL_CONSTANT
+            * (self.base as f64 + 1.0)
+            * SIGMA
+            * SIGMA
+            * (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
 
         let dist = DistType::GaussDist { sigma: s };
-        let preimage_right = sample_gpu_matrix_native(params, ext_ncol, target_ncol, dist);
+        let uniform_sampler = GpuDCRTPolyUniformSampler::new();
+        let preimage_right = uniform_sampler.sample_uniform(params, ext_ncol, target_ncol, dist);
         let t = target - &(ext_matrix * &preimage_right);
         let preimage_left = self.preimage(params, trapdoor, public_matrix, &t);
         preimage_left.concat_rows(&[&preimage_right])
     }
-}
-
-fn cpu_params_from_gpu(params: &GpuDCRTPolyParams) -> DCRTPolyParams {
-    DCRTPolyParams::new(
-        params.ring_dimension(),
-        params.crt_depth(),
-        params.crt_bits(),
-        params.base_bits(),
-    )
 }
 
 fn sample_pert_square_mat_gpu_native(
@@ -256,6 +269,7 @@ fn sample_pert_square_mat_gpu_native(
     sigma_large: f64,
     total_ncol: usize,
 ) -> GpuDCRTPolyMatrix {
+    let uniform_sampler = GpuDCRTPolyUniformSampler::new();
     let d = trapdoor.r.row_size();
     let dk = trapdoor.r.col_size();
     let num_blocks = total_ncol.div_ceil(d);
@@ -263,7 +277,7 @@ fn sample_pert_square_mat_gpu_native(
     let padding_ncol = padded_ncol - total_ncol;
 
     // p2 is sampled directly on GPU as in the Karney branch of OpenFHE.
-    let p2 = sample_gpu_matrix_native(
+    let p2 = uniform_sampler.sample_uniform(
         params,
         dk,
         padded_ncol,
@@ -293,63 +307,17 @@ fn sample_pert_square_mat_gpu_native(
     p_hat
 }
 
-fn sample_gpu_matrix_native(
-    params: &GpuDCRTPolyParams,
-    nrow: usize,
-    ncol: usize,
-    dist: DistType,
-) -> GpuDCRTPolyMatrix {
-    if nrow == 0 || ncol == 0 {
-        return GpuDCRTPolyMatrix::zero(params, nrow, ncol);
-    }
-    let mut prng = rng();
-    let seed: u64 = prng.random();
-    match dist {
-        DistType::FinRingDist => GpuDCRTPolyMatrix::sample_distribution(
-            params,
-            nrow,
-            ncol,
-            GpuMatrixSampleDist::Uniform,
-            0.0,
-            seed,
-        ),
-        DistType::GaussDist { sigma } => GpuDCRTPolyMatrix::sample_distribution(
-            params,
-            nrow,
-            ncol,
-            GpuMatrixSampleDist::Gauss,
-            sigma,
-            seed,
-        ),
-        DistType::BitDist => GpuDCRTPolyMatrix::sample_distribution(
-            params,
-            nrow,
-            ncol,
-            GpuMatrixSampleDist::Bit,
-            0.0,
-            seed,
-        ),
-        DistType::TernaryDist => GpuDCRTPolyMatrix::sample_distribution(
-            params,
-            nrow,
-            ncol,
-            GpuMatrixSampleDist::Ternary,
-            0.0,
-            seed,
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
+        __TestState,
         matrix::PolyMatrix,
         poly::{
-            PolyParams,
             dcrt::{gpu::gpu_device_sync, params::DCRTPolyParams},
+            PolyParams,
         },
+        __PAIR,
     };
     use sequential_test::sequential;
 
@@ -421,7 +389,8 @@ mod tests {
         let params = gpu_params_from_cpu(&cpu_params);
         let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
         let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
-        let target = sample_gpu_matrix_native(&params, size, size, DistType::FinRingDist);
+        let uniform_sampler = GpuDCRTPolyUniformSampler::new();
+        let target = uniform_sampler.sample_uniform(&params, size, size, DistType::FinRingDist);
 
         let preimage = trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &target);
         let product = &public_matrix * &preimage;
@@ -437,7 +406,8 @@ mod tests {
         let params = gpu_params_from_cpu(&cpu_params);
         let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
         let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
-        let target = sample_gpu_matrix_native(&params, size, size, DistType::FinRingDist);
+        let uniform_sampler = GpuDCRTPolyUniformSampler::new();
+        let target = uniform_sampler.sample_uniform(&params, size, size, DistType::FinRingDist);
 
         // Deterministic gadget preimage baseline:
         // z_plain = [R*z; E*z; z], where z = decompose(target).

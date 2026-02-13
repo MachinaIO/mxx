@@ -177,6 +177,19 @@ where
         if secs >= 1.0 { format!("{secs:.3}s") } else { format!("{:.1}ms", secs * 1000.0) }
     }
 
+    fn derive_w_matrix(&self, params: &<M::P as Poly>::Params, lut_id: usize) -> M {
+        let d = self.b0_matrix.row_size();
+        let m_g = d * params.modulus_digits();
+        HS::new().sample_hash(
+            params,
+            self.hash_key,
+            format!("ggh15_lut_w_matrix_{}", lut_id),
+            d,
+            2 * m_g + 2 * m_g * params.modulus_digits(),
+            DistType::FinRingDist,
+        )
+    }
+
     pub fn sample_aux_matrices(&self, params: &<M::P as Poly>::Params) {
         info!("Sampling LUT and gate auxiliary matrices");
         let start = Instant::now();
@@ -202,21 +215,11 @@ where
         let m_g = d * params.modulus_digits();
         let trap_sampler = TS::new(params, self.trapdoor_sigma);
         let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, 2 * d);
-        let hash_sampler = HS::new();
-        let mut w_matrix_map: HashMap<usize, M> = HashMap::with_capacity(lut_entries.len());
         let mut processed_lut_rows = 0usize;
 
         for (lut_id, plt) in lut_entries {
             let lut_start = Instant::now();
-            let w_matrix = hash_sampler.sample_hash(
-                params,
-                self.hash_key,
-                format!("ggh15_lut_w_matrix_{}", lut_id),
-                d,
-                2 * m_g + 2 * m_g * params.modulus_digits(),
-                DistType::FinRingDist,
-            );
-            w_matrix_map.insert(lut_id, w_matrix.clone());
+            let w_matrix = self.derive_w_matrix(params, lut_id);
 
             let mut part_idx = 0usize;
             let mut batch: Vec<(usize, M::P)> = Vec::with_capacity(chunk_size);
@@ -314,9 +317,7 @@ where
                 let take = gates.len().min(chunk_size);
                 let current: Vec<(GateId, GateState<M>)> = gates.drain(..take).collect();
                 total_gates += current.len();
-                let results: Vec<(GateId, M, M)> = current
-                    .into_par_iter()
-                    .map(|(gate_id, state)| {
+                current.into_par_iter().for_each(|(gate_id, state)| {
                         let uniform_sampler = US::new();
                         let trap_sampler = TS::new(params, trapdoor_sigma);
                         let hash_sampler = HS::new();
@@ -343,42 +344,94 @@ where
                         };
                         let preimage_gate1 =
                             trap_sampler.preimage(params, &b0_trapdoor, &b0_matrix, &gate_target1);
+                        drop(gate_target1);
+                        drop(s_g_concat);
+                        drop(s_g);
                         debug!("Sampled gate preimage 1: gate_id={}, lut_id={}", gate_id, lut_id);
-                        let gate_target2 = {
-                            let input_matrix =
-                                M::from_compact_bytes(params, &state.input_pubkey_bytes);
-                            let out_matrix =
-                                M::from_compact_bytes(params, &state.output_pubkey_bytes);
-                            let u_g_matrix = hash_sampler.sample_hash(
-                                params,
-                                self.hash_key,
-                                format!("ggh15_lut_u_g_matrix_{}", gate_id),
-                                d,
-                                m_g,
-                                DistType::FinRingDist,
-                            );
-                            let u_g_times_gadget =
-                                u_g_matrix.clone() * &M::gadget_matrix(params, m_g);
-                            let target_low = &w_matrix_map[&lut_id];
-                            let target_high = out_matrix.concat_columns(&[
-                                &(-M::gadget_matrix(params, d)),
-                                &(-input_matrix * &u_g_times_gadget.decompose()),
-                                &u_g_times_gadget,
-                            ]);
-                            target_high.concat_rows(&[&target_low])
-                        };
-                        debug!("Constructed gate target 2: gate_id={}, lut_id={}", gate_id, lut_id);
-                        let preimage_gate2 =
-                            trap_sampler.preimage(params, &b1_trapdoor, &b1_matrix, &gate_target2);
-                        (gate_id, preimage_gate1, preimage_gate2)
-                    })
-                    .collect();
+                        let preimage_gate1_id = format!("ggh15_preimage_gate1_{}", gate_id);
+                        add_lookup_buffer(get_lookup_buffer(
+                            vec![(0, preimage_gate1)],
+                            &preimage_gate1_id,
+                        ));
 
-                for (gate_id, preimage_gate1, preimage_gate2) in results {
-                    let preimage_gate_entries = vec![(0, preimage_gate1), (1, preimage_gate2)];
-                    let preimage_gate_id = format!("ggh15_preimage_gate_{}", gate_id);
-                    add_lookup_buffer(get_lookup_buffer(preimage_gate_entries, &preimage_gate_id));
-                }
+                        let input_matrix = M::from_compact_bytes(params, &state.input_pubkey_bytes);
+                        let out_matrix = M::from_compact_bytes(params, &state.output_pubkey_bytes);
+                        let u_g_matrix = hash_sampler.sample_hash(
+                            params,
+                            self.hash_key,
+                            format!("ggh15_lut_u_g_matrix_{}", gate_id),
+                            d,
+                            m_g,
+                            DistType::FinRingDist,
+                        );
+                        let u_g_times_gadget = u_g_matrix.clone() * &M::gadget_matrix(params, m_g);
+                        drop(u_g_matrix);
+                        let u_g_times_gadget_decompose = u_g_times_gadget.decompose();
+
+                        let w_matrix = self.derive_w_matrix(params, lut_id);
+                        let k = params.modulus_digits();
+                        let block0_end = m_g;
+                        let block1_end = block0_end + m_g;
+                        let block2_end = block1_end + (m_g * k);
+                        let block3_end = block2_end + (m_g * k);
+                        debug_assert_eq!(
+                            w_matrix.col_size(),
+                            block3_end,
+                            "w_matrix columns must match [I | Gy | G^-1(v_idx) | G^-1(v_idx*idx)] layout"
+                        );
+                        let w_block_identity = w_matrix.slice_columns(0, block0_end);
+                        let w_block_gy = w_matrix.slice_columns(block0_end, block1_end);
+                        let w_block_v = w_matrix.slice_columns(block1_end, block2_end);
+                        let w_block_vx = w_matrix.slice_columns(block2_end, block3_end);
+                        drop(w_matrix);
+
+                        let target_gate2_identity = out_matrix.concat_rows(&[&w_block_identity]);
+                        drop(out_matrix);
+                        drop(w_block_identity);
+                        let preimage_gate2_identity =
+                            trap_sampler.preimage(params, &b1_trapdoor, &b1_matrix, &target_gate2_identity);
+                        drop(target_gate2_identity);
+                        add_lookup_buffer(get_lookup_buffer(
+                            vec![(0, preimage_gate2_identity)],
+                            &format!("ggh15_preimage_gate2_identity_{}", gate_id),
+                        ));
+
+                        let target_high_gy = -M::gadget_matrix(params, d);
+                        let target_gate2_gy = target_high_gy.concat_rows(&[&w_block_gy]);
+                        drop(target_high_gy);
+                        drop(w_block_gy);
+                        let preimage_gate2_gy =
+                            trap_sampler.preimage(params, &b1_trapdoor, &b1_matrix, &target_gate2_gy);
+                        drop(target_gate2_gy);
+                        add_lookup_buffer(get_lookup_buffer(
+                            vec![(0, preimage_gate2_gy)],
+                            &format!("ggh15_preimage_gate2_gy_{}", gate_id),
+                        ));
+
+                        let target_high_v = -(input_matrix * &u_g_times_gadget_decompose);
+                        drop(u_g_times_gadget_decompose);
+                        let target_gate2_v = target_high_v.concat_rows(&[&w_block_v]);
+                        drop(target_high_v);
+                        drop(w_block_v);
+                        let preimage_gate2_v =
+                            trap_sampler.preimage(params, &b1_trapdoor, &b1_matrix, &target_gate2_v);
+                        drop(target_gate2_v);
+                        add_lookup_buffer(get_lookup_buffer(
+                            vec![(0, preimage_gate2_v)],
+                            &format!("ggh15_preimage_gate2_v_{}", gate_id),
+                        ));
+
+                        let target_gate2_vx = u_g_times_gadget.concat_rows(&[&w_block_vx]);
+                        drop(u_g_times_gadget);
+                        drop(w_block_vx);
+                        let preimage_gate2_vx =
+                            trap_sampler.preimage(params, &b1_trapdoor, &b1_matrix, &target_gate2_vx);
+                        drop(target_gate2_vx);
+                        add_lookup_buffer(get_lookup_buffer(
+                            vec![(0, preimage_gate2_vx)],
+                            &format!("ggh15_preimage_gate2_vx_{}", gate_id),
+                        ));
+                    });
                 let pct = if total_gate_count == 0 {
                     100.0
                 } else {
@@ -500,17 +553,38 @@ where
         let preimage_gate1 = read_matrix_from_multi_batch::<M>(
             params,
             dir,
-            &format!("ggh15_preimage_gate_{}", gate_id),
+            &format!("ggh15_preimage_gate1_{}", gate_id),
             0,
         )
         .unwrap_or_else(|| panic!("preimage_gate1 for gate {} not found", gate_id));
-        let preimage_gate2 = read_matrix_from_multi_batch::<M>(
+        let preimage_gate2_identity = read_matrix_from_multi_batch::<M>(
             params,
             dir,
-            &format!("ggh15_preimage_gate_{}", gate_id),
-            1,
+            &format!("ggh15_preimage_gate2_identity_{}", gate_id),
+            0,
         )
-        .unwrap_or_else(|| panic!("preimage_gate2 for gate {} not found", gate_id));
+        .unwrap_or_else(|| panic!("preimage_gate2_identity for gate {} not found", gate_id));
+        let preimage_gate2_gy = read_matrix_from_multi_batch::<M>(
+            params,
+            dir,
+            &format!("ggh15_preimage_gate2_gy_{}", gate_id),
+            0,
+        )
+        .unwrap_or_else(|| panic!("preimage_gate2_gy for gate {} not found", gate_id));
+        let preimage_gate2_v = read_matrix_from_multi_batch::<M>(
+            params,
+            dir,
+            &format!("ggh15_preimage_gate2_v_{}", gate_id),
+            0,
+        )
+        .unwrap_or_else(|| panic!("preimage_gate2_v for gate {} not found", gate_id));
+        let preimage_gate2_vx = read_matrix_from_multi_batch::<M>(
+            params,
+            dir,
+            &format!("ggh15_preimage_gate2_vx_{}", gate_id),
+            0,
+        )
+        .unwrap_or_else(|| panic!("preimage_gate2_vx for gate {} not found", gate_id));
         let preimage_lut = read_matrix_from_multi_batch::<M>(
             params,
             dir,
@@ -537,33 +611,36 @@ where
             m_g,
             DistType::FinRingDist,
         );
-        let k = params.modulus_digits();
-        let block0_end = m_g;
-        let block1_end = block0_end + m_g;
-        let block2_end = block1_end + (m_g * k);
-        let block3_end = block2_end + (m_g * k);
+        let mk = m_g * params.modulus_digits();
         debug_assert_eq!(
-            preimage_gate2.col_size(),
-            block3_end,
-            "preimage_gate2 columns must match [I | G^-1(G*y) | G^-1(v_idx) | G^-1(v_idx*x)] layout"
+            preimage_gate2_identity.col_size(),
+            m_g,
+            "preimage_gate2_identity must have m_g columns"
         );
-        let pre2_block_identity = preimage_gate2.slice_columns(0, block0_end);
-        let pre2_block_gy = preimage_gate2.slice_columns(block0_end, block1_end);
-        let pre2_block_v = preimage_gate2.slice_columns(block1_end, block2_end);
-        let pre2_block_vx = preimage_gate2.slice_columns(block2_end, block3_end);
+        debug_assert_eq!(
+            preimage_gate2_gy.col_size(),
+            m_g,
+            "preimage_gate2_gy must have m_g columns"
+        );
+        debug_assert_eq!(
+            preimage_gate2_v.col_size(),
+            mk,
+            "preimage_gate2_v must have m_g*k columns"
+        );
+        debug_assert_eq!(
+            preimage_gate2_vx.col_size(),
+            mk,
+            "preimage_gate2_vx must have m_g*k columns"
+        );
 
         let gy = M::gadget_matrix(params, d) * y.clone();
         let v_idx_scaled = v_idx.clone() * x;
         let sg_times_b1 = self.c_b0.clone() * preimage_gate1;
-        // Compute sg_times_b1 * preimage_gate2 * t_idx without materializing t_idx.
-        let mut sg_times_pre2_t_idx = sg_times_b1.clone() * pre2_block_identity;
-        sg_times_pre2_t_idx =
-            sg_times_pre2_t_idx + (sg_times_b1.clone() * pre2_block_gy).mul_decompose(&gy);
-        sg_times_pre2_t_idx =
-            sg_times_pre2_t_idx + (sg_times_b1.clone() * pre2_block_v).mul_decompose(&v_idx);
-        sg_times_pre2_t_idx =
-            sg_times_pre2_t_idx + (sg_times_b1.clone() * pre2_block_vx).mul_decompose(&v_idx_scaled);
-        let c_const = sg_times_pre2_t_idx - sg_times_b1 * preimage_lut;
+        let c_pre2_identity = sg_times_b1.clone() * preimage_gate2_identity;
+        let c_pre2_gy = (sg_times_b1.clone() * preimage_gate2_gy).mul_decompose(&gy);
+        let c_pre2_v = (sg_times_b1.clone() * preimage_gate2_v).mul_decompose(&v_idx);
+        let c_pre2_vx = (sg_times_b1.clone() * preimage_gate2_vx).mul_decompose(&v_idx_scaled);
+        let c_const = c_pre2_identity + c_pre2_gy + c_pre2_v + c_pre2_vx - sg_times_b1 * preimage_lut;
         let c_x_randomized = input.vector.clone() *
             (u_g * M::gadget_matrix(params, m_g)).decompose() *
             v_idx.decompose();

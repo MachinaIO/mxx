@@ -14,7 +14,7 @@ pub fn lut_preimage_chunk_size() -> usize {
     std::env::var("LUT_PREIMAGE_CHUNK_SIZE")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(50)
+        .unwrap_or(20)
 }
 
 /// `BLOCK_SIZE`: generic processing block size used in utilities (default: 100).

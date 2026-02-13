@@ -108,7 +108,6 @@ async fn test_arithmetic_circuit_operations_ggh15() {
         seed,
         trapdoor_sigma,
         error_sigma,
-        &params,
         b0_matrix.clone(),
         b0_trapdoor.clone(),
         tmp_dir.path().to_path_buf(),
@@ -137,7 +136,7 @@ async fn test_arithmetic_circuit_operations_ggh15() {
     let enc_evaluator = GGH15BGGEncodingPltEvaluator::<
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
-    >::new(seed, &params, tmp_dir.path().to_path_buf(), d, c_b0);
+    >::new(seed, tmp_dir.path().to_path_buf(), c_b0);
     info!("start encoding evaluation");
     let start = std::time::Instant::now();
     let encoding_out = circuit.eval(&params, &encodings[0], &encodings[1..], Some(&enc_evaluator));

@@ -159,7 +159,6 @@ impl PltEvaluator<ErrorNorm> for NormPltLWEEvaluator {
 #[derive(Debug, Clone)]
 pub struct NormPltGGH15Evaluator {
     pub const_term: PolyMatrixNorm,
-    pub e_one_multiplier: PolyMatrixNorm,
     pub e_input_multiplier: PolyMatrixNorm,
 }
 
@@ -172,10 +171,6 @@ impl NormPltGGH15Evaluator {
     ) -> Self {
         let preimage_norm = compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base);
         let e_b_init = PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_b, e_b_sigma * 6, None);
-
-        let k_to_ggh =
-            PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_b, preimage_norm.clone(), None);
-        let k_lut = PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, preimage_norm.clone(), None);
         let s_vec = PolyMatrixNorm::new(
             ctx.clone(),
             1,
@@ -183,18 +178,60 @@ impl NormPltGGH15Evaluator {
             secret_sigma.unwrap_or(BigDecimal::one()),
             None,
         );
-        let s_times_errs = s_vec *
-            PolyMatrixNorm::new(ctx.clone(), ctx.secret_size, ctx.m_b, e_mat_sigma * 6, None) *
-            &k_lut;
-        let const_term = e_b_init * k_to_ggh * &k_lut + &s_times_errs + &s_times_errs;
-        let const_term_bits = bigdecimal_bits_ceil(&const_term.poly_norm.norm);
-        info!("{}", format!("GGH15 PLT const term norm bits {}", const_term_bits));
-        let decomposed = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_b);
-        let e_one_multiplier = &decomposed * &k_lut;
-        let e_one_multiplier_bits = bigdecimal_bits_ceil(&e_one_multiplier.poly_norm.norm);
-        info!("{}", format!("GGH15 PLT e_one multiplier norm bits {}", e_one_multiplier_bits));
-        let e_input_multiplier = decomposed * &k_lut;
-        Self { const_term, e_one_multiplier, e_input_multiplier }
+        let e_times_preimage_gate_1 = e_b_init.clone() *
+            PolyMatrixNorm::new(ctx.clone(), ctx.m_b, 2 * ctx.m_b, preimage_norm.clone(), None) +
+            s_vec.clone() *
+                PolyMatrixNorm::new(
+                    ctx.clone(),
+                    ctx.secret_size,
+                    2 * ctx.m_b,
+                    e_mat_sigma * 6,
+                    None,
+                );
+
+        let t_idx = PolyMatrixNorm::new(
+            ctx.clone(),
+            2 * ctx.m_g + 2 * ctx.m_g * ctx.log_base_q,
+            ctx.m_g,
+            BigDecimal::one(),
+            None,
+        );
+        let const_term = e_times_preimage_gate_1.clone() *
+            PolyMatrixNorm::new(
+                ctx.clone(),
+                2 * ctx.m_b,
+                t_idx.nrow,
+                preimage_norm.clone(),
+                None,
+            ) *
+            t_idx +
+            e_times_preimage_gate_1 *
+                PolyMatrixNorm::new(
+                    ctx.clone(),
+                    2 * ctx.m_b,
+                    ctx.m_g,
+                    preimage_norm.clone(),
+                    None,
+                );
+        info!(
+            "{}",
+            format!(
+                "GGH15 PLT const term norm bits {}",
+                bigdecimal_bits_ceil(&const_term.poly_norm.norm)
+            )
+        );
+
+        let e_input_multiplier = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g) *
+            PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g);
+        info!(
+            "{}",
+            format!(
+                "GGH15 PLT e_input multiplier norm bits {}",
+                bigdecimal_bits_ceil(&e_input_multiplier.poly_norm.norm)
+            )
+        );
+
+        Self { const_term, e_input_multiplier }
     }
 }
 
@@ -203,7 +240,7 @@ impl PltEvaluator<ErrorNorm> for NormPltGGH15Evaluator {
         &self,
         _: &(),
         plt: &PublicLut<DCRTPoly>,
-        one: &ErrorNorm,
+        _: &ErrorNorm,
         input: &ErrorNorm,
         _: GateId,
         _: usize,
@@ -211,9 +248,7 @@ impl PltEvaluator<ErrorNorm> for NormPltGGH15Evaluator {
         let plaintext_bd =
             BigDecimal::from(num_bigint::BigInt::from(plt.max_output_row().1.value().clone()));
         let plaintext_norm = PolyNorm::new(input.clone_ctx(), plaintext_bd);
-        let matrix_norm = &self.const_term +
-            &one.matrix_norm * &self.e_one_multiplier +
-            &input.matrix_norm * &self.e_input_multiplier;
+        let matrix_norm = &self.const_term + &input.matrix_norm * &self.e_input_multiplier;
         ErrorNorm { matrix_norm, plaintext_norm }
     }
 }

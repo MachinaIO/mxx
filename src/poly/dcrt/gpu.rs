@@ -95,6 +95,12 @@ unsafe extern "C" {
         out_bytes_per_coeff: *mut u16,
         out_payload_len: *mut usize,
     ) -> c_int;
+    fn gpu_poly_load_compact_bytes(
+        poly: *mut GpuPolyOpaque,
+        payload: *const u8,
+        payload_len: usize,
+        max_coeff_bits: u16,
+    ) -> c_int;
     fn gpu_poly_store_coeffs_words(
         poly: *mut GpuPolyOpaque,
         coeff_words_out: *mut u64,
@@ -483,50 +489,6 @@ fn packed_coeff_bytes_len(ring_dimension: usize, max_coeff_bits: usize) -> usize
     ring_dimension.saturating_mul(max_coeff_bits).div_ceil(8)
 }
 
-#[inline(always)]
-fn set_packed_bit(bytes: &mut [u8], bit_index: usize) {
-    bytes[bit_index / 8] |= 1u8 << (bit_index % 8);
-}
-
-#[inline(always)]
-fn get_packed_bit(bytes: &[u8], bit_index: usize) -> bool {
-    (bytes[bit_index / 8] & (1u8 << (bit_index % 8))) != 0
-}
-
-fn unpack_unsigned_coeffs(
-    payload: &[u8],
-    ring_dimension: usize,
-    max_coeff_bits: usize,
-) -> Vec<BigUint> {
-    if ring_dimension == 0 {
-        return Vec::new();
-    }
-    if max_coeff_bits == 0 {
-        return vec![BigUint::ZERO; ring_dimension];
-    }
-    let expected_payload_len = packed_coeff_bytes_len(ring_dimension, max_coeff_bits);
-    assert_eq!(
-        payload.len(),
-        expected_payload_len,
-        "invalid packed coeff payload length: got {}, expected {}",
-        payload.len(),
-        expected_payload_len
-    );
-    let coeff_bytes_len = max_coeff_bits.div_ceil(8);
-    (0..ring_dimension)
-        .map(|i| {
-            let base_bit = i * max_coeff_bits;
-            let mut coeff_bytes = vec![0u8; coeff_bytes_len];
-            for b in 0..max_coeff_bits {
-                if get_packed_bit(payload, base_bit + b) {
-                    set_packed_bit(&mut coeff_bytes, b);
-                }
-            }
-            BigUint::from_bytes_le(&coeff_bytes)
-        })
-        .collect()
-}
-
 #[derive(Clone)]
 pub struct GpuDCRTPolyParams {
     ring_dimension: u32,
@@ -901,6 +863,21 @@ impl GpuDCRTPoly {
         Ok((max_coeff_bits, bytes_per_coeff, payload))
     }
 
+    fn try_load_compact_bytes_payload(
+        &mut self,
+        payload: &[u8],
+        max_coeff_bits: u16,
+    ) -> Result<(), String> {
+        let status = unsafe {
+            gpu_poly_load_compact_bytes(self.raw, payload.as_ptr(), payload.len(), max_coeff_bits)
+        };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        self.is_ntt = false;
+        Ok(())
+    }
+
     fn try_store_coeff_words(&mut self, format: c_int) -> Result<(usize, Vec<u64>), String> {
         let words_per_coeff = coeff_words_per_coeff_upper(self.params.moduli(), self.level);
         let n = self.params.ring_dimension() as usize;
@@ -1230,18 +1207,13 @@ impl Poly for GpuDCRTPoly {
         );
 
         let payload = &bytes[GPU_COMPACT_HEADER_LEN..];
-        let coeff_values = unpack_unsigned_coeffs(payload, ring_dimension, max_coeff_bits);
-        let modulus = params.modulus();
-        let modulus_value = modulus.as_ref().clone();
-        let coeffs = coeff_values
-            .into_iter()
-            .enumerate()
-            .map(|(i, value)| {
-                assert!(value < modulus_value, "decoded coefficient out of range at index {}", i);
-                FinRingElem::new(value, modulus.clone())
-            })
-            .collect::<Vec<_>>();
-        Self::from_coeffs(params, &coeffs)
+        let max_coeff_bits_u16 = u16::try_from(max_coeff_bits)
+            .unwrap_or_else(|_| panic!("max_coeff_bits out of u16 range: {max_coeff_bits}"));
+        let level = params.crt_depth.saturating_sub(1);
+        let mut poly = Self::new_empty(Arc::new(params.clone()), level, false);
+        poly.try_load_compact_bytes_payload(payload, max_coeff_bits_u16)
+            .unwrap_or_else(|err| panic!("gpu_poly_load_compact_bytes failed: {err}"));
+        poly
     }
 
     fn coeffs(&self) -> Vec<Self::Elem> {

@@ -415,6 +415,39 @@ namespace
         payload_out[byte_idx] = out;
     }
 
+    __global__ void unpack_packed_coeffs_mod_kernel(
+        const uint8_t *payload,
+        size_t n,
+        uint32_t bit_width,
+        uint64_t modulus,
+        uint64_t *residue_out)
+    {
+        const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (idx >= n)
+        {
+            return;
+        }
+        if (bit_width == 0)
+        {
+            residue_out[idx] = 0;
+            return;
+        }
+
+        const size_t base_bit = idx * static_cast<size_t>(bit_width);
+        uint64_t residue = 0;
+        for (int b = static_cast<int>(bit_width) - 1; b >= 0; --b)
+        {
+            const size_t bit_idx = base_bit + static_cast<size_t>(b);
+            const uint8_t byte_val = payload[bit_idx / 8];
+            const uint8_t bit = static_cast<uint8_t>((byte_val >> (bit_idx % 8)) & 0x1u);
+            const unsigned __int128 term =
+                static_cast<unsigned __int128>(residue) * static_cast<unsigned __int128>(2u) +
+                static_cast<unsigned __int128>(bit);
+            residue = static_cast<uint64_t>(term % static_cast<unsigned __int128>(modulus));
+        }
+        residue_out[idx] = residue;
+    }
+
     int compare_u64_arrays_on_device(
         const uint64_t *lhs,
         const uint64_t *rhs,
@@ -779,6 +812,215 @@ extern "C"
         catch (...)
         {
             return set_error("unknown exception in gpu_poly_load_rns");
+        }
+    }
+
+    int gpu_poly_load_compact_bytes(
+        GpuPoly *poly,
+        const uint8_t *payload,
+        size_t payload_len,
+        uint16_t max_coeff_bits)
+    {
+        try
+        {
+            if (!poly || !poly->ctx)
+            {
+                return set_error("invalid gpu_poly_load_compact_bytes arguments");
+            }
+
+            const int level = poly->level;
+            const int limb_count = level + 1;
+            const size_t n = static_cast<size_t>(poly->ctx->N);
+            if (limb_count <= 0)
+            {
+                return set_error("invalid level in gpu_poly_load_compact_bytes");
+            }
+            if (limb_count > static_cast<int>(poly->ctx->moduli.size()))
+            {
+                return set_error("unexpected modulus count in gpu_poly_load_compact_bytes");
+            }
+
+            if (max_coeff_bits == 0)
+            {
+                if (payload_len != 0)
+                {
+                    return set_error("payload_len must be zero when max_coeff_bits is zero");
+                }
+            }
+            else
+            {
+                if (!payload)
+                {
+                    return set_error("null payload in gpu_poly_load_compact_bytes");
+                }
+            }
+
+            if (max_coeff_bits > 0 &&
+                n > std::numeric_limits<size_t>::max() / static_cast<size_t>(max_coeff_bits))
+            {
+                return set_error("payload length overflow in gpu_poly_load_compact_bytes");
+            }
+            const size_t expected_payload_len =
+                (n * static_cast<size_t>(max_coeff_bits) + static_cast<size_t>(7)) / static_cast<size_t>(8);
+            if (payload_len != expected_payload_len)
+            {
+                return set_error("payload length mismatch in gpu_poly_load_compact_bytes");
+            }
+
+            auto *ctx = poly->ctx->ctx;
+            if (ctx->limbGPUid.size() < static_cast<size_t>(limb_count))
+            {
+                return set_error("unexpected limb mapping size in gpu_poly_load_compact_bytes");
+            }
+
+            struct DevicePayloadBuffer
+            {
+                int device;
+                uint8_t *ptr;
+            };
+            std::vector<DevicePayloadBuffer> payload_buffers;
+            std::vector<int> touched_devices;
+            auto release = [&]() {
+                for (auto &entry : payload_buffers)
+                {
+                    if (entry.ptr)
+                    {
+                        cudaSetDevice(entry.device);
+                        cudaFree(entry.ptr);
+                        entry.ptr = nullptr;
+                    }
+                }
+            };
+            auto find_payload_buffer = [&](int device) -> uint8_t * {
+                for (const auto &entry : payload_buffers)
+                {
+                    if (entry.device == device)
+                    {
+                        return entry.ptr;
+                    }
+                }
+                return nullptr;
+            };
+            auto mark_device = [&](int device) {
+                for (int d : touched_devices)
+                {
+                    if (d == device)
+                    {
+                        return;
+                    }
+                }
+                touched_devices.push_back(device);
+            };
+
+            const int threads = 256;
+            const int blocks = static_cast<int>(
+                (n + static_cast<size_t>(threads) - 1) / static_cast<size_t>(threads));
+
+            for (int limb = 0; limb < limb_count; ++limb)
+            {
+                const dim3 limb_id = ctx->limbGPUid[static_cast<size_t>(limb)];
+                if (limb_id.x >= poly->poly->GPU.size())
+                {
+                    release();
+                    return set_error("unexpected limb GPU partition in gpu_poly_load_compact_bytes");
+                }
+                auto &partition = poly->poly->GPU[limb_id.x];
+                if (limb_id.y >= partition.limb.size())
+                {
+                    release();
+                    return set_error("unexpected limb index in gpu_poly_load_compact_bytes");
+                }
+                auto &limb_impl = partition.limb[limb_id.y];
+                if (limb_impl.index() != FIDESlib::U64)
+                {
+                    release();
+                    return set_error("unsupported limb type in gpu_poly_load_compact_bytes");
+                }
+                auto &limb_u64 = std::get<FIDESlib::U64>(limb_impl);
+
+                cudaError_t err = cudaSetDevice(partition.device);
+                if (err != cudaSuccess)
+                {
+                    release();
+                    return set_error(cudaGetErrorString(err));
+                }
+                mark_device(partition.device);
+
+                if (max_coeff_bits == 0)
+                {
+                    err = cudaMemsetAsync(
+                        limb_u64.v.data,
+                        0,
+                        static_cast<size_t>(poly->ctx->N) * sizeof(uint64_t),
+                        limb_u64.stream.ptr);
+                    if (err != cudaSuccess)
+                    {
+                        release();
+                        return set_error(cudaGetErrorString(err));
+                    }
+                    continue;
+                }
+
+                uint8_t *d_payload = find_payload_buffer(partition.device);
+                if (!d_payload)
+                {
+                    err = cudaMalloc(reinterpret_cast<void **>(&d_payload), payload_len);
+                    if (err != cudaSuccess)
+                    {
+                        release();
+                        return set_error(cudaGetErrorString(err));
+                    }
+                    err = cudaMemcpy(d_payload, payload, payload_len, cudaMemcpyHostToDevice);
+                    if (err != cudaSuccess)
+                    {
+                        cudaFree(d_payload);
+                        release();
+                        return set_error(cudaGetErrorString(err));
+                    }
+                    payload_buffers.push_back(DevicePayloadBuffer{partition.device, d_payload});
+                }
+
+                unpack_packed_coeffs_mod_kernel<<<blocks, threads, 0, limb_u64.stream.ptr>>>(
+                    d_payload,
+                    n,
+                    static_cast<uint32_t>(max_coeff_bits),
+                    poly->ctx->moduli[static_cast<size_t>(limb)],
+                    limb_u64.v.data);
+                err = cudaGetLastError();
+                if (err != cudaSuccess)
+                {
+                    release();
+                    return set_error(cudaGetErrorString(err));
+                }
+            }
+
+            for (int device : touched_devices)
+            {
+                cudaError_t err = cudaSetDevice(device);
+                if (err != cudaSuccess)
+                {
+                    release();
+                    return set_error(cudaGetErrorString(err));
+                }
+                err = cudaDeviceSynchronize();
+                if (err != cudaSuccess)
+                {
+                    release();
+                    return set_error(cudaGetErrorString(err));
+                }
+            }
+
+            release();
+            poly->format = PolyFormat::Coeff;
+            return 0;
+        }
+        catch (const std::exception &e)
+        {
+            return set_error(e);
+        }
+        catch (...)
+        {
+            return set_error("unknown exception in gpu_poly_load_compact_bytes");
         }
     }
 

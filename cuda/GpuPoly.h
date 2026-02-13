@@ -81,6 +81,11 @@ int gpu_poly_store_compact_bytes(
     uint16_t* out_max_coeff_bits,
     uint16_t* out_bytes_per_coeff,
     size_t* out_payload_len);
+int gpu_poly_load_compact_bytes(
+    GpuPoly* poly,
+    const uint8_t* payload,
+    size_t payload_len,
+    uint16_t max_coeff_bits);
 int gpu_poly_store_coeffs_words(
     GpuPoly* poly,
     uint64_t* coeff_words_out,

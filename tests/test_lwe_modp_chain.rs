@@ -3,11 +3,10 @@ use keccak_asm::Keccak256;
 use mxx::{
     bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
     circuit::PolyCircuit,
-    commit::wee25::{Wee25Commit, Wee25PublicParams},
     element::PolyElem,
     lookup::{
         PublicLut,
-        commit_eval::{CommitBGGEncodingPltEvaluator, CommitBGGPubKeyPltEvaluator},
+        lwe_eval::{LWEBGGEncodingPltEvaluator, LWEBGGPubKeyPltEvaluator},
     },
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     poly::{
@@ -18,7 +17,7 @@ use mxx::{
         DistType, PolyTrapdoorSampler, PolyUniformSampler, hash::DCRTPolyHashSampler,
         trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
     },
-    simulator::{SimulatorContext, error_norm::NormPltCommitEvaluator},
+    simulator::{SimulatorContext, error_norm::NormPltLWEEvaluator},
     storage::write::{init_storage_system, wait_for_all_writes},
     utils::bigdecimal_bits_ceil,
 };
@@ -28,10 +27,9 @@ use std::{fs, path::Path, sync::Arc};
 use tracing::info;
 
 const CRT_BITS: usize = 51;
-const RING_DIM: u32 = 1 << 8;
+const RING_DIM: u32 = 1 << 4;
 const ERROR_SIGMA: f64 = 4.0;
 const BASE_BITS: u32 = 17;
-const TREE_BASE: usize = 2;
 const MAX_CRT_DEPTH: usize = 12;
 const P: u64 = 7;
 const D_SECRET: usize = 2;
@@ -124,8 +122,7 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
             D_SECRET,
             log_base_q,
         ));
-        let plt_evaluator =
-            NormPltCommitEvaluator::new(ctx.clone(), &error_sigma, TREE_BASE, &circuit);
+        let plt_evaluator = NormPltLWEEvaluator::new(ctx.clone(), &error_sigma);
         let e_init_norm = &error_sigma * BigDecimal::from(6u64);
         let input_bound = BigDecimal::from((P - 1) as u64);
 
@@ -160,15 +157,20 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
         }
     }
 
-    panic!("crt_depth satisfying error < q/(2p) not found up to MAX_CRT_DEPTH");
+    panic!("crt_depth satisfying error < q/p not found up to MAX_CRT_DEPTH");
 }
 
 #[tokio::test]
-async fn test_commit_modp_chain_rounding() {
+async fn test_lwe_modp_chain_rounding() {
     let _ = tracing_subscriber::fmt::try_init();
 
     let (_crt_depth, params, circuit, q_over_p) = find_crt_depth_for_modp_chain();
-
+    info!(
+        "selected crt_depth={} ring_dim={} base_bits={}",
+        params.crt_depth(),
+        params.ring_dimension(),
+        params.base_bits()
+    );
     let mut rng = rand::rng();
     let a: u64 = rng.random_range(0..P);
     let b: u64 = rng.random_range(0..P);
@@ -210,38 +212,23 @@ async fn test_commit_modp_chain_rounding() {
     let trapdoor_sigma = 4.578;
     let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, trapdoor_sigma);
     let (b0_trapdoor, b0_matrix) = trapdoor_sampler.trapdoor(&params, d_secret);
-    let c_b0 = s_vec.clone() * &b0_matrix;
+    let b0_matrix = Arc::new(b0_matrix);
+    let b0_trapdoor = Arc::new(b0_trapdoor);
 
-    let dir = Path::new("test_data/commit_modp_chain_rounding");
+    let dir = Path::new("test_data/lwe_modp_chain_rounding");
     if !dir.exists() {
         fs::create_dir_all(dir).unwrap();
     }
     init_storage_system(dir.to_path_buf());
 
-    info!("wee25 public params sampling start");
-    let wee25_commit = Wee25Commit::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::new(
-        &params,
-        d_secret,
-        TREE_BASE,
-        trapdoor_sigma,
-    );
-    wee25_commit
-        .sample_public_params::<DCRTPolyUniformSampler, DCRTPolyTrapdoorSampler>(&params, key, dir);
-    wait_for_all_writes(dir.to_path_buf()).await.unwrap();
-    let wee25_public_params =
-        Wee25PublicParams::<DCRTPolyMatrix>::read_from_storage(&params, dir, &wee25_commit, key)
-            .expect("wee25 public params not found");
-    info!("wee25 public params sampling done");
-
     info!("plt pubkey evaluator setup start");
     let plt_pubkey_evaluator =
-        CommitBGGPubKeyPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup(
-            &params,
-            d_secret,
-            trapdoor_sigma,
-            TREE_BASE,
-            key,
-            wee25_public_params,
+        LWEBGGPubKeyPltEvaluator::<
+            DCRTPolyMatrix,
+            DCRTPolyHashSampler<Keccak256>,
+            DCRTPolyTrapdoorSampler,
+        >::new(
+            key, trapdoor_sampler.clone(), b0_matrix.clone(), b0_trapdoor, dir.to_path_buf()
         );
     info!("plt pubkey evaluator setup done");
 
@@ -250,32 +237,16 @@ async fn test_commit_modp_chain_rounding() {
         circuit.eval(&params, &enc_one.pubkey, &input_pubkeys, Some(&plt_pubkey_evaluator));
     info!("circuit eval pubkey done");
     assert_eq!(result_pubkey.len(), 1);
+    plt_pubkey_evaluator.sample_aux_matrices(&params);
 
-    info!("commit_all_lut_matrices start");
-    plt_pubkey_evaluator.commit_all_lut_matrices::<DCRTPolyTrapdoorSampler>(
-        &params,
-        &b0_matrix,
-        &b0_trapdoor,
-    );
-    info!("commit_all_lut_matrices done");
     wait_for_all_writes(dir.to_path_buf()).await.unwrap();
 
-    let c_b = s_vec.clone() * plt_pubkey_evaluator.wee25_public_params.b.clone();
+    let c_b = s_vec.clone() * b0_matrix.as_ref();
     info!("plt encoding evaluator setup start");
-    let plt_encoding_evaluator =
-        CommitBGGEncodingPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::setup(
-            &params,
-            trapdoor_sigma,
-            TREE_BASE,
-            key,
-            &circuit,
-            &enc_one.pubkey,
-            &input_pubkeys,
-            &c_b0,
-            &c_b,
-            &dir.to_path_buf(),
-            plt_pubkey_evaluator.wee25_public_params.clone(),
-        );
+    let plt_encoding_evaluator = LWEBGGEncodingPltEvaluator::<
+        DCRTPolyMatrix,
+        DCRTPolyHashSampler<Keccak256>,
+    >::new(key, dir.to_path_buf(), c_b);
     info!("plt encoding evaluator setup done");
 
     info!("circuit eval encoding start");

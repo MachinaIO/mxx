@@ -20,12 +20,10 @@ use mxx::{
     utils::gen_biguint_for_modulus,
 };
 use num_bigint::BigUint;
-use std::sync::Arc;
-use tempfile::tempdir;
+use std::{fs, path::Path, sync::Arc};
 use tracing::info;
 
 #[tokio::test]
-#[ignore]
 async fn test_arithmetic_circuit_operations_lwe() {
     // Mixed operations in a single circuit: (a + b) * c - a.
     const P_MODULI_BITS: usize = 6;
@@ -84,7 +82,11 @@ async fn test_arithmetic_circuit_operations_lwe() {
     assert_eq!(eval_results[0], expected_poly, "mixed operations should be correct");
 
     // 2) BGG+ public key evaluation.
-    let tmp_dir = tempdir().unwrap();
+    let dir = Path::new("test_data/test_arithmetic_circuit_operations_lwe");
+    if dir.exists() {
+        fs::remove_dir_all(dir).unwrap();
+    }
+    fs::create_dir_all(dir).unwrap();
     let seed: [u8; 32] = [0u8; 32];
     let d = 1usize;
     let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, 4.578);
@@ -92,7 +94,7 @@ async fn test_arithmetic_circuit_operations_lwe() {
     let trapdoor = Arc::new(trapdoor);
     let pub_matrix = Arc::new(pub_matrix);
 
-    init_storage_system(tmp_dir.path().to_path_buf());
+    init_storage_system(dir.to_path_buf());
     let reveal_plaintexts = vec![true; circuit.num_input()];
     let pk_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(seed, d);
     let pubkeys = pk_sampler.sample(&params, b"BGG_PUBKEY", &reveal_plaintexts);
@@ -106,14 +108,15 @@ async fn test_arithmetic_circuit_operations_lwe() {
         trapdoor_sampler.clone(),
         pub_matrix.clone(),
         trapdoor.clone(),
-        tmp_dir.path().to_path_buf(),
+        dir.to_path_buf(),
     );
     info!("starr pubkey evaluation");
     let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(&pk_evaluator));
     info!("end pubkey evaluation");
     assert_eq!(pubkey_out.len(), 1);
+    pk_evaluator.sample_aux_matrices(&params);
     info!("wait for all writes");
-    wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
+    wait_for_all_writes(dir.to_path_buf()).await.unwrap();
     info!("finish writing");
 
     // 3) BGG+ encoding evaluation.
@@ -129,7 +132,7 @@ async fn test_arithmetic_circuit_operations_lwe() {
     let enc_evaluator =
         LWEBGGEncodingPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::new(
             seed,
-            tmp_dir.path().to_path_buf(),
+            dir.to_path_buf(),
             p,
         );
     info!("start encoding evaluation");

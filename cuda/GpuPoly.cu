@@ -877,39 +877,49 @@ extern "C"
             {
                 int device;
                 uint8_t *ptr;
+                cudaEvent_t copy_ready;
+            };
+            struct DeviceEvent
+            {
+                int device;
+                cudaEvent_t event;
             };
             std::vector<DevicePayloadBuffer> payload_buffers;
-            std::vector<int> touched_devices;
+            std::vector<DeviceEvent> completion_events;
             auto release = [&]() {
-                for (auto &entry : payload_buffers)
+                for (const auto &entry : completion_events)
                 {
-                    if (entry.ptr)
+                    if (entry.event)
                     {
                         cudaSetDevice(entry.device);
+                        cudaEventDestroy(entry.event);
+                    }
+                }
+                completion_events.clear();
+                for (auto &entry : payload_buffers)
+                {
+                    cudaSetDevice(entry.device);
+                    if (entry.copy_ready)
+                    {
+                        cudaEventDestroy(entry.copy_ready);
+                        entry.copy_ready = nullptr;
+                    }
+                    if (entry.ptr)
+                    {
                         cudaFree(entry.ptr);
                         entry.ptr = nullptr;
                     }
                 }
             };
-            auto find_payload_buffer = [&](int device) -> uint8_t * {
-                for (const auto &entry : payload_buffers)
+            auto find_payload_buffer = [&](int device) -> DevicePayloadBuffer * {
+                for (auto &entry : payload_buffers)
                 {
                     if (entry.device == device)
                     {
-                        return entry.ptr;
+                        return &entry;
                     }
                 }
                 return nullptr;
-            };
-            auto mark_device = [&](int device) {
-                for (int d : touched_devices)
-                {
-                    if (d == device)
-                    {
-                        return;
-                    }
-                }
-                touched_devices.push_back(device);
             };
 
             const int threads = 256;
@@ -944,7 +954,6 @@ extern "C"
                     release();
                     return set_error(cudaGetErrorString(err));
                 }
-                mark_device(partition.device);
 
                 if (max_coeff_bits == 0)
                 {
@@ -958,30 +967,75 @@ extern "C"
                         release();
                         return set_error(cudaGetErrorString(err));
                     }
+                    cudaEvent_t done = nullptr;
+                    err = cudaEventCreateWithFlags(&done, cudaEventDisableTiming);
+                    if (err != cudaSuccess)
+                    {
+                        release();
+                        return set_error(cudaGetErrorString(err));
+                    }
+                    err = cudaEventRecord(done, limb_u64.stream.ptr);
+                    if (err != cudaSuccess)
+                    {
+                        cudaEventDestroy(done);
+                        release();
+                        return set_error(cudaGetErrorString(err));
+                    }
+                    completion_events.push_back(DeviceEvent{partition.device, done});
                     continue;
                 }
 
-                uint8_t *d_payload = find_payload_buffer(partition.device);
-                if (!d_payload)
+                DevicePayloadBuffer *payload_entry = find_payload_buffer(partition.device);
+                if (!payload_entry)
                 {
+                    DevicePayloadBuffer entry{partition.device, nullptr, nullptr};
+                    uint8_t *d_payload = nullptr;
                     err = cudaMalloc(reinterpret_cast<void **>(&d_payload), payload_len);
                     if (err != cudaSuccess)
                     {
                         release();
                         return set_error(cudaGetErrorString(err));
                     }
-                    err = cudaMemcpy(d_payload, payload, payload_len, cudaMemcpyHostToDevice);
+                    err = cudaMemcpyAsync(
+                        d_payload,
+                        payload,
+                        payload_len,
+                        cudaMemcpyHostToDevice,
+                        limb_u64.stream.ptr);
                     if (err != cudaSuccess)
                     {
                         cudaFree(d_payload);
                         release();
                         return set_error(cudaGetErrorString(err));
                     }
-                    payload_buffers.push_back(DevicePayloadBuffer{partition.device, d_payload});
+                    entry.ptr = d_payload;
+                    err = cudaEventCreateWithFlags(&entry.copy_ready, cudaEventDisableTiming);
+                    if (err != cudaSuccess)
+                    {
+                        cudaFree(d_payload);
+                        release();
+                        return set_error(cudaGetErrorString(err));
+                    }
+                    err = cudaEventRecord(entry.copy_ready, limb_u64.stream.ptr);
+                    if (err != cudaSuccess)
+                    {
+                        cudaEventDestroy(entry.copy_ready);
+                        cudaFree(d_payload);
+                        release();
+                        return set_error(cudaGetErrorString(err));
+                    }
+                    payload_buffers.push_back(entry);
+                    payload_entry = &payload_buffers.back();
+                }
+                err = cudaStreamWaitEvent(limb_u64.stream.ptr, payload_entry->copy_ready, 0);
+                if (err != cudaSuccess)
+                {
+                    release();
+                    return set_error(cudaGetErrorString(err));
                 }
 
                 unpack_packed_coeffs_mod_kernel<<<blocks, threads, 0, limb_u64.stream.ptr>>>(
-                    d_payload,
+                    payload_entry->ptr,
                     n,
                     static_cast<uint32_t>(max_coeff_bits),
                     poly->ctx->moduli[static_cast<size_t>(limb)],
@@ -992,17 +1046,32 @@ extern "C"
                     release();
                     return set_error(cudaGetErrorString(err));
                 }
-            }
-
-            for (int device : touched_devices)
-            {
-                cudaError_t err = cudaSetDevice(device);
+                cudaEvent_t done = nullptr;
+                err = cudaEventCreateWithFlags(&done, cudaEventDisableTiming);
                 if (err != cudaSuccess)
                 {
                     release();
                     return set_error(cudaGetErrorString(err));
                 }
-                err = cudaDeviceSynchronize();
+                err = cudaEventRecord(done, limb_u64.stream.ptr);
+                if (err != cudaSuccess)
+                {
+                    cudaEventDestroy(done);
+                    release();
+                    return set_error(cudaGetErrorString(err));
+                }
+                completion_events.push_back(DeviceEvent{partition.device, done});
+            }
+
+            for (const auto &entry : completion_events)
+            {
+                cudaError_t err = cudaSetDevice(entry.device);
+                if (err != cudaSuccess)
+                {
+                    release();
+                    return set_error(cudaGetErrorString(err));
+                }
+                err = cudaEventSynchronize(entry.event);
                 if (err != cudaSuccess)
                 {
                     release();
@@ -1415,7 +1484,6 @@ extern "C"
             {
                 return set_error("gpu_poly_store_coeffs_words expects coeff format");
             }
-            poly->poly->sync();
 
             const int level = poly->level;
             const int limb_count = level + 1;
@@ -1468,6 +1536,7 @@ extern "C"
             }
 
             std::vector<const uint64_t *> limb_ptrs(static_cast<size_t>(limb_count));
+            std::vector<cudaStream_t> limb_streams(static_cast<size_t>(limb_count));
             int common_device = -1;
             for (int limb = 0; limb < limb_count; ++limb)
             {
@@ -1495,8 +1564,9 @@ extern "C"
                     return set_error(
                         "gpu_poly_store_coeffs_words requires all limbs on a single GPU");
                 }
-                limb_ptrs[static_cast<size_t>(limb)] =
-                    std::get<FIDESlib::U64>(limb_impl).v.data;
+                auto &limb_u64 = std::get<FIDESlib::U64>(limb_impl);
+                limb_ptrs[static_cast<size_t>(limb)] = limb_u64.v.data;
+                limb_streams[static_cast<size_t>(limb)] = limb_u64.stream.ptr;
             }
 
             cudaError_t err = cudaSetDevice(common_device);
@@ -1520,7 +1590,22 @@ extern "C"
             uint64_t *d_garner_inv = nullptr;
             uint64_t *d_coeff_words = nullptr;
             int *d_overflow = nullptr;
+            cudaStream_t work_stream = nullptr;
+            std::vector<cudaEvent_t> ready_events;
             auto release = [&]() {
+                for (cudaEvent_t ev : ready_events)
+                {
+                    if (ev)
+                    {
+                        cudaEventDestroy(ev);
+                    }
+                }
+                ready_events.clear();
+                if (work_stream)
+                {
+                    cudaStreamDestroy(work_stream);
+                    work_stream = nullptr;
+                }
                 if (d_overflow)
                 {
                     cudaFree(d_overflow);
@@ -1548,6 +1633,39 @@ extern "C"
                 }
             };
 
+            err = cudaStreamCreateWithFlags(&work_stream, cudaStreamNonBlocking);
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+            ready_events.reserve(static_cast<size_t>(limb_count));
+            for (int limb = 0; limb < limb_count; ++limb)
+            {
+                cudaEvent_t ready = nullptr;
+                err = cudaEventCreateWithFlags(&ready, cudaEventDisableTiming);
+                if (err != cudaSuccess)
+                {
+                    release();
+                    return set_error(cudaGetErrorString(err));
+                }
+                err = cudaEventRecord(ready, limb_streams[static_cast<size_t>(limb)]);
+                if (err != cudaSuccess)
+                {
+                    cudaEventDestroy(ready);
+                    release();
+                    return set_error(cudaGetErrorString(err));
+                }
+                err = cudaStreamWaitEvent(work_stream, ready, 0);
+                if (err != cudaSuccess)
+                {
+                    cudaEventDestroy(ready);
+                    release();
+                    return set_error(cudaGetErrorString(err));
+                }
+                ready_events.push_back(ready);
+            }
+
             err = cudaMalloc(
                 reinterpret_cast<void **>(&d_limb_ptrs),
                 static_cast<size_t>(limb_count) * sizeof(uint64_t *));
@@ -1556,11 +1674,12 @@ extern "C"
                 release();
                 return set_error(cudaGetErrorString(err));
             }
-            err = cudaMemcpy(
+            err = cudaMemcpyAsync(
                 d_limb_ptrs,
                 limb_ptrs.data(),
                 static_cast<size_t>(limb_count) * sizeof(uint64_t *),
-                cudaMemcpyHostToDevice);
+                cudaMemcpyHostToDevice,
+                work_stream);
             if (err != cudaSuccess)
             {
                 release();
@@ -1573,11 +1692,12 @@ extern "C"
                 release();
                 return set_error(cudaGetErrorString(err));
             }
-            err = cudaMemcpy(
+            err = cudaMemcpyAsync(
                 d_moduli,
                 moduli_subset.data(),
                 moduli_subset.size() * sizeof(uint64_t),
-                cudaMemcpyHostToDevice);
+                cudaMemcpyHostToDevice,
+                work_stream);
             if (err != cudaSuccess)
             {
                 release();
@@ -1592,11 +1712,12 @@ extern "C"
                 release();
                 return set_error(cudaGetErrorString(err));
             }
-            err = cudaMemcpy(
+            err = cudaMemcpyAsync(
                 d_garner_inv,
                 inverse_table.data(),
                 inverse_table.size() * sizeof(uint64_t),
-                cudaMemcpyHostToDevice);
+                cudaMemcpyHostToDevice,
+                work_stream);
             if (err != cudaSuccess)
             {
                 release();
@@ -1618,7 +1739,7 @@ extern "C"
                 release();
                 return set_error(cudaGetErrorString(err));
             }
-            err = cudaMemset(d_overflow, 0, sizeof(int));
+            err = cudaMemsetAsync(d_overflow, 0, sizeof(int), work_stream);
             if (err != cudaSuccess)
             {
                 release();
@@ -1630,7 +1751,7 @@ extern "C"
                 const int threads = 256;
                 const int blocks = static_cast<int>((n + static_cast<size_t>(threads) - 1) /
                                                     static_cast<size_t>(threads));
-                reconstruct_rns_to_words_kernel<<<blocks, threads>>>(
+                reconstruct_rns_to_words_kernel<<<blocks, threads, 0, work_stream>>>(
                     d_limb_ptrs,
                     d_moduli,
                     d_garner_inv,
@@ -1649,7 +1770,12 @@ extern "C"
             }
 
             int h_overflow = 0;
-            err = cudaMemcpy(&h_overflow, d_overflow, sizeof(int), cudaMemcpyDeviceToHost);
+            err = cudaMemcpyAsync(
+                &h_overflow,
+                d_overflow,
+                sizeof(int),
+                cudaMemcpyDeviceToHost,
+                work_stream);
             if (err != cudaSuccess)
             {
                 release();
@@ -1657,18 +1783,19 @@ extern "C"
             }
             if (expected_len > 0)
             {
-                err = cudaMemcpy(
+                err = cudaMemcpyAsync(
                     coeff_words_out,
                     d_coeff_words,
                     expected_len * sizeof(uint64_t),
-                    cudaMemcpyDeviceToHost);
+                    cudaMemcpyDeviceToHost,
+                    work_stream);
                 if (err != cudaSuccess)
                 {
                     release();
                     return set_error(cudaGetErrorString(err));
                 }
             }
-            err = cudaDeviceSynchronize();
+            err = cudaStreamSynchronize(work_stream);
             if (err != cudaSuccess)
             {
                 release();
@@ -1715,7 +1842,6 @@ extern "C"
             {
                 return set_error("gpu_poly_store_compact_bytes expects coeff format");
             }
-            poly->poly->sync();
 
             const int level = poly->level;
             const int limb_count = level + 1;
@@ -1757,6 +1883,7 @@ extern "C"
             }
 
             std::vector<const uint64_t *> limb_ptrs(static_cast<size_t>(limb_count));
+            std::vector<cudaStream_t> limb_streams(static_cast<size_t>(limb_count));
             int common_device = -1;
             for (int limb = 0; limb < limb_count; ++limb)
             {
@@ -1784,8 +1911,9 @@ extern "C"
                     return set_error(
                         "gpu_poly_store_compact_bytes requires all limbs on a single GPU");
                 }
-                limb_ptrs[static_cast<size_t>(limb)] =
-                    std::get<FIDESlib::U64>(limb_impl).v.data;
+                auto &limb_u64 = std::get<FIDESlib::U64>(limb_impl);
+                limb_ptrs[static_cast<size_t>(limb)] = limb_u64.v.data;
+                limb_streams[static_cast<size_t>(limb)] = limb_u64.stream.ptr;
             }
 
             cudaError_t err = cudaSetDevice(common_device);
@@ -1817,7 +1945,22 @@ extern "C"
             int *d_overflow = nullptr;
             unsigned int *d_max_bits = nullptr;
             uint8_t *d_payload = nullptr;
+            cudaStream_t work_stream = nullptr;
+            std::vector<cudaEvent_t> ready_events;
             auto release = [&]() {
+                for (cudaEvent_t ev : ready_events)
+                {
+                    if (ev)
+                    {
+                        cudaEventDestroy(ev);
+                    }
+                }
+                ready_events.clear();
+                if (work_stream)
+                {
+                    cudaStreamDestroy(work_stream);
+                    work_stream = nullptr;
+                }
                 if (d_payload)
                 {
                     cudaFree(d_payload);
@@ -1855,6 +1998,39 @@ extern "C"
                 }
             };
 
+            err = cudaStreamCreateWithFlags(&work_stream, cudaStreamNonBlocking);
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+            ready_events.reserve(static_cast<size_t>(limb_count));
+            for (int limb = 0; limb < limb_count; ++limb)
+            {
+                cudaEvent_t ready = nullptr;
+                err = cudaEventCreateWithFlags(&ready, cudaEventDisableTiming);
+                if (err != cudaSuccess)
+                {
+                    release();
+                    return set_error(cudaGetErrorString(err));
+                }
+                err = cudaEventRecord(ready, limb_streams[static_cast<size_t>(limb)]);
+                if (err != cudaSuccess)
+                {
+                    cudaEventDestroy(ready);
+                    release();
+                    return set_error(cudaGetErrorString(err));
+                }
+                err = cudaStreamWaitEvent(work_stream, ready, 0);
+                if (err != cudaSuccess)
+                {
+                    cudaEventDestroy(ready);
+                    release();
+                    return set_error(cudaGetErrorString(err));
+                }
+                ready_events.push_back(ready);
+            }
+
             err = cudaMalloc(
                 reinterpret_cast<void **>(&d_limb_ptrs),
                 static_cast<size_t>(limb_count) * sizeof(uint64_t *));
@@ -1863,11 +2039,12 @@ extern "C"
                 release();
                 return set_error(cudaGetErrorString(err));
             }
-            err = cudaMemcpy(
+            err = cudaMemcpyAsync(
                 d_limb_ptrs,
                 limb_ptrs.data(),
                 static_cast<size_t>(limb_count) * sizeof(uint64_t *),
-                cudaMemcpyHostToDevice);
+                cudaMemcpyHostToDevice,
+                work_stream);
             if (err != cudaSuccess)
             {
                 release();
@@ -1880,11 +2057,12 @@ extern "C"
                 release();
                 return set_error(cudaGetErrorString(err));
             }
-            err = cudaMemcpy(
+            err = cudaMemcpyAsync(
                 d_moduli,
                 moduli_subset.data(),
                 moduli_subset.size() * sizeof(uint64_t),
-                cudaMemcpyHostToDevice);
+                cudaMemcpyHostToDevice,
+                work_stream);
             if (err != cudaSuccess)
             {
                 release();
@@ -1899,11 +2077,12 @@ extern "C"
                 release();
                 return set_error(cudaGetErrorString(err));
             }
-            err = cudaMemcpy(
+            err = cudaMemcpyAsync(
                 d_garner_inv,
                 inverse_table.data(),
                 inverse_table.size() * sizeof(uint64_t),
-                cudaMemcpyHostToDevice);
+                cudaMemcpyHostToDevice,
+                work_stream);
             if (err != cudaSuccess)
             {
                 release();
@@ -1924,7 +2103,7 @@ extern "C"
                 release();
                 return set_error(cudaGetErrorString(err));
             }
-            err = cudaMemset(d_overflow, 0, sizeof(int));
+            err = cudaMemsetAsync(d_overflow, 0, sizeof(int), work_stream);
             if (err != cudaSuccess)
             {
                 release();
@@ -1934,7 +2113,7 @@ extern "C"
             const int threads = 256;
             const int blocks = static_cast<int>((n + static_cast<size_t>(threads) - 1) /
                                                 static_cast<size_t>(threads));
-            reconstruct_rns_to_words_kernel<<<blocks, threads>>>(
+            reconstruct_rns_to_words_kernel<<<blocks, threads, 0, work_stream>>>(
                 d_limb_ptrs,
                 d_moduli,
                 d_garner_inv,
@@ -1952,7 +2131,18 @@ extern "C"
             }
 
             int h_overflow = 0;
-            err = cudaMemcpy(&h_overflow, d_overflow, sizeof(int), cudaMemcpyDeviceToHost);
+            err = cudaMemcpyAsync(
+                &h_overflow,
+                d_overflow,
+                sizeof(int),
+                cudaMemcpyDeviceToHost,
+                work_stream);
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+            err = cudaStreamSynchronize(work_stream);
             if (err != cudaSuccess)
             {
                 release();
@@ -1970,14 +2160,14 @@ extern "C"
                 release();
                 return set_error(cudaGetErrorString(err));
             }
-            err = cudaMemset(d_max_bits, 0, sizeof(unsigned int));
+            err = cudaMemsetAsync(d_max_bits, 0, sizeof(unsigned int), work_stream);
             if (err != cudaSuccess)
             {
                 release();
                 return set_error(cudaGetErrorString(err));
             }
 
-            compute_max_bits_from_words_kernel<<<blocks, threads>>>(
+            compute_max_bits_from_words_kernel<<<blocks, threads, 0, work_stream>>>(
                 d_coeff_words,
                 n,
                 static_cast<int>(words_per_coeff),
@@ -1990,7 +2180,18 @@ extern "C"
             }
 
             unsigned int h_max_bits = 0;
-            err = cudaMemcpy(&h_max_bits, d_max_bits, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+            err = cudaMemcpyAsync(
+                &h_max_bits,
+                d_max_bits,
+                sizeof(unsigned int),
+                cudaMemcpyDeviceToHost,
+                work_stream);
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+            err = cudaStreamSynchronize(work_stream);
             if (err != cudaSuccess)
             {
                 release();
@@ -2034,7 +2235,7 @@ extern "C"
                 }
 
                 const int payload_blocks = static_cast<int>((payload_len + threads - 1) / threads);
-                pack_coeff_words_bits_kernel<<<payload_blocks, threads>>>(
+                pack_coeff_words_bits_kernel<<<payload_blocks, threads, 0, work_stream>>>(
                     d_coeff_words,
                     n,
                     static_cast<int>(words_per_coeff),
@@ -2048,7 +2249,12 @@ extern "C"
                     return set_error(cudaGetErrorString(err));
                 }
 
-                err = cudaMemcpy(payload_out, d_payload, payload_len, cudaMemcpyDeviceToHost);
+                err = cudaMemcpyAsync(
+                    payload_out,
+                    d_payload,
+                    payload_len,
+                    cudaMemcpyDeviceToHost,
+                    work_stream);
                 if (err != cudaSuccess)
                 {
                     release();
@@ -2056,7 +2262,7 @@ extern "C"
                 }
             }
 
-            err = cudaDeviceSynchronize();
+            err = cudaStreamSynchronize(work_stream);
             if (err != cudaSuccess)
             {
                 release();

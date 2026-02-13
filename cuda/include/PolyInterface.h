@@ -5,13 +5,13 @@
 
 #include <cuda_runtime.h>
 
-#include "GpuPoly.h"
+#include "Poly.h"
 
-// FIDESlib headers (expected under third_party/FIDESlib/include).
-#include "../third_party/FIDESlib/include/CKKS/Context.cuh"
-#include "../third_party/FIDESlib/include/CKKS/Parameters.cuh"
-#include "../third_party/FIDESlib/include/LimbUtils.cuh"
-#include "../third_party/FIDESlib/include/CKKS/RNSPoly.cuh"
+// FIDESlib headers (resolved via include path).
+#include "CKKS/Context.cuh"
+#include "CKKS/Parameters.cuh"
+#include "LimbUtils.cuh"
+#include "CKKS/RNSPoly.cuh"
 
 namespace CKKS = FIDESlib::CKKS;
 

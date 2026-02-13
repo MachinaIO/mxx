@@ -81,7 +81,7 @@ jobs:
           RUSTFLAGS: -A unused
 
       - name: Run test
-        run: RUST_TEST_NOCAPTURE=1 cargo test -r -- --test-threads=1
+        run: RUST_TEST_NOCAPTURE=1 cargo test -r --lib -- --test-threads=1
   
   ci-success:
     name: ci success

@@ -22,7 +22,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tracing::info;
+use tracing::debug;
 
 /// ideal thread chunk size for parallel
 pub fn chunk_size_for(original: usize) -> usize {
@@ -134,7 +134,7 @@ pub fn timed_read<T, F: FnOnce() -> T>(label: &str, f: F, total: &mut Duration) 
     let res = f();
     let elapsed = start.elapsed();
     *total += elapsed;
-    info!("{}", format!("{label} loaded in {elapsed:?}"));
+    debug!("{}", format!("{label} loaded in {elapsed:?}"));
     res
 }
 
@@ -148,7 +148,7 @@ where
     let res = f().await;
     let elapsed = start.elapsed();
     *total += elapsed;
-    info!("{}", format!("{label} loaded in {elapsed:?}"));
+    debug!("{}", format!("{label} loaded in {elapsed:?}"));
     res
 }
 

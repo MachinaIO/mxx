@@ -128,15 +128,7 @@ pub struct NormPltLWEEvaluator {
 
 impl NormPltLWEEvaluator {
     pub fn new(ctx: Arc<SimulatorContext>, e_b_sigma: &BigDecimal) -> Self {
-        let c_0 = BigDecimal::from_f64(1.8).unwrap();
-        let c_1 = BigDecimal::from_f64(4.7).unwrap();
-        let sigma = BigDecimal::from_f64(4.578).unwrap();
-        let two_sqrt = BigDecimal::from(2).sqrt().unwrap();
-        let m_g_sqrt = BigDecimal::from(ctx.m_g as u64).sqrt().expect("sqrt(m_g) failed");
-        let term = ctx.ring_dim_sqrt.clone() * m_g_sqrt +
-            two_sqrt * ctx.ring_dim_sqrt.clone() +
-            c_1.clone();
-        let norm: BigDecimal = c_0 * 6 * sigma.clone() * ((ctx.base.clone() + 1) * sigma) * term;
+        let norm = compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base);
         let norm_bits = bigdecimal_bits_ceil(&norm);
         info!("{}", format!("preimage norm bits {}", norm_bits));
         let e_b_init = PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_b, e_b_sigma * 6, None);

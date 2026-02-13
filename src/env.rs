@@ -14,7 +14,7 @@ pub fn lut_preimage_chunk_size() -> usize {
     std::env::var("LUT_PREIMAGE_CHUNK_SIZE")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(80)
+        .unwrap_or(50)
 }
 
 /// `BLOCK_SIZE`: generic processing block size used in utilities (default: 100).
@@ -27,10 +27,10 @@ pub fn lut_bytes_limit() -> Option<usize> {
     std::env::var("LUT_BYTES_LIMIT").ok().and_then(|s| s.parse::<usize>().ok())
 }
 
-const DEFAULT_WEE25_TOPJ_BATCH: usize = 50;
-const DEFAULT_WEE25_COMMIT_CACHE_PERSIST_BATCH: usize = 100;
+const DEFAULT_WEE25_TOPJ_BATCH: usize = 200;
+const DEFAULT_WEE25_COMMIT_CACHE_PERSIST_BATCH: usize = 300;
 
-/// `WEE25_TOPJ_PARALLEL_BATCH`: block batch size for top_j generation (default: 5).
+/// `WEE25_TOPJ_PARALLEL_BATCH`: block batch size for top_j generation (default: 200).
 pub fn wee25_topj_parallel_batch() -> usize {
     std::env::var("WEE25_TOPJ_PARALLEL_BATCH")
         .ok()
@@ -40,7 +40,7 @@ pub fn wee25_topj_parallel_batch() -> usize {
 }
 
 /// `WEE25_COMMIT_CACHE_PERSIST_BATCH`: number of commit-cache nodes buffered before persisting
-/// (default: 1).
+/// (default: 1000).
 pub fn wee25_commit_cache_persist_batch() -> usize {
     std::env::var("WEE25_COMMIT_CACHE_PERSIST_BATCH")
         .ok()

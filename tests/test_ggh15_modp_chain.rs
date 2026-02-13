@@ -213,10 +213,9 @@ async fn test_ggh15_modp_chain_rounding() {
     let b0_trapdoor = Arc::new(b0_trapdoor);
 
     let dir = Path::new("test_data/ggh15_modp_chain_rounding");
-    if dir.exists() {
-        fs::remove_dir_all(dir).unwrap();
+    if !dir.exists() {
+        fs::create_dir_all(dir).unwrap();
     }
-    fs::create_dir_all(dir).unwrap();
     init_storage_system(dir.to_path_buf());
 
     info!("plt pubkey evaluator setup start");

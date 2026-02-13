@@ -1,15 +1,15 @@
-use super::{utils::split_int64_mat_alt_to_elems, DCRTTrapdoor};
+use super::{DCRTTrapdoor, utils::split_int64_mat_alt_to_elems};
 use crate::{
-    matrix::{dcrt_poly::DCRTPolyMatrix, PolyMatrix},
+    matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     openfhe_guard::ensure_openfhe_warmup,
     parallel_iter,
     poly::{
-        dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         Poly, PolyParams,
+        dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
     sampler::{
-        trapdoor::KARNEY_THRESHOLD, uniform::DCRTPolyUniformSampler, DistType, PolyTrapdoorSampler,
-        PolyUniformSampler,
+        DistType, PolyTrapdoorSampler, PolyUniformSampler, trapdoor::KARNEY_THRESHOLD,
+        uniform::DCRTPolyUniformSampler,
     },
 };
 use openfhe::ffi::DCRTGaussSampGqArbBase;
@@ -57,7 +57,9 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         debug!("{}", "gadget matrix generated");
         let a0 = a_bar.concat_columns(&[&DCRTPolyMatrix::identity(params, size, None)]);
         debug!("{}", "a0 generated");
-        let a1 = g - (a_bar * &trapdoor.r + &trapdoor.e);
+        let trapdoor_r = trapdoor.r_cpu();
+        let trapdoor_e = trapdoor.e_cpu();
+        let a1 = g - (a_bar * &trapdoor_r + &trapdoor_e);
         debug!("{}", "a1 generated");
         let a = a0.concat_columns(&[&a1]);
         debug!("{}", "public matrix generated");
@@ -93,11 +95,11 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
 
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
-        let s = SPECTRAL_CONSTANT
-            * (self.base as f64 + 1.0)
-            * SIGMA
-            * SIGMA
-            * (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+        let s = SPECTRAL_CONSTANT *
+            (self.base as f64 + 1.0) *
+            SIGMA *
+            SIGMA *
+            (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
         let dgg_large_std = (s * s - self.c * self.c).sqrt();
         let peikert = dgg_large_std < KARNEY_THRESHOLD;
         let (dgg_large_mean, dgg_large_table) = if dgg_large_std > KARNEY_THRESHOLD {
@@ -170,9 +172,11 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         z_hat_mat.replace_entries_with_expand(0..d, 0..target_cols, k, 1, f);
         debug!("{}", "z_hat_mat generated");
         drop(perturbed_syndrome);
-        let r_z_hat = &trapdoor.r * &z_hat_mat;
+        let trapdoor_r = trapdoor.r_cpu();
+        let r_z_hat = &trapdoor_r * &z_hat_mat;
         debug!("{}", "r_z_hat generated");
-        let e_z_hat = &trapdoor.e * &z_hat_mat;
+        let trapdoor_e = trapdoor.e_cpu();
+        let e_z_hat = &trapdoor_e * &z_hat_mat;
         debug!("{}", "e_z_hat generated");
         let z_hat_former = (p_hat.slice_rows(0, d) + r_z_hat)
             .concat_rows(&[&(p_hat.slice_rows(d, 2 * d) + e_z_hat)]);
@@ -198,11 +202,11 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         let target_ncol = target.col_size();
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
-        let s = SPECTRAL_CONSTANT
-            * (self.base as f64 + 1.0)
-            * SIGMA
-            * SIGMA
-            * (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+        let s = SPECTRAL_CONSTANT *
+            (self.base as f64 + 1.0) *
+            SIGMA *
+            SIGMA *
+            (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
         let dist = DistType::GaussDist { sigma: s };
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let preimage_right = uniform_sampler.sample_uniform(params, ext_ncol, target_ncol, dist);
@@ -271,10 +275,9 @@ pub(crate) fn gauss_samp_gq_arb_base(
 mod test {
     use super::*;
     use crate::{
-        __TestState,
+        __PAIR, __TestState,
         poly::PolyParams,
-        sampler::{uniform::DCRTPolyUniformSampler, PolyUniformSampler},
-        __PAIR,
+        sampler::{PolyUniformSampler, uniform::DCRTPolyUniformSampler},
     };
 
     const SIGMA: f64 = 4.578;
@@ -339,7 +342,9 @@ mod test {
         let muled = {
             let k = params.modulus_digits();
             let identity = DCRTPolyMatrix::identity(&params, size * k, None);
-            let trapdoor_matrix = trapdoor.r.concat_rows(&[&trapdoor.e, &identity]);
+            let trapdoor_r = trapdoor.r_cpu();
+            let trapdoor_e = trapdoor.e_cpu();
+            let trapdoor_matrix = trapdoor_r.concat_rows(&[&trapdoor_e, &identity]);
             public_matrix * trapdoor_matrix
         };
         let gadget_matrix = DCRTPolyMatrix::gadget_matrix(&params, size);

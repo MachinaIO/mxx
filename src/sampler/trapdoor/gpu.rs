@@ -1,9 +1,9 @@
 use crate::{
-    matrix::{gpu_dcrt_poly::GpuDCRTPolyMatrix, PolyMatrix},
-    poly::{dcrt::gpu::GpuDCRTPolyParams, Poly, PolyParams},
-    sampler::{gpu::GpuDCRTPolyUniformSampler, DistType, PolyTrapdoorSampler, PolyUniformSampler},
+    matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
+    poly::{Poly, PolyParams, dcrt::gpu::GpuDCRTPolyParams},
+    sampler::{DistType, PolyTrapdoorSampler, PolyUniformSampler, gpu::GpuDCRTPolyUniformSampler},
 };
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 use std::time::Instant;
 
 const SIGMA: f64 = 4.578;
@@ -151,11 +151,11 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         let param_start = Instant::now();
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
-        let s = SPECTRAL_CONSTANT
-            * (self.base as f64 + 1.0)
-            * SIGMA
-            * SIGMA
-            * (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+        let s = SPECTRAL_CONSTANT *
+            (self.base as f64 + 1.0) *
+            SIGMA *
+            SIGMA *
+            (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
         let dgg_large_std = (s * s - self.c * self.c).sqrt();
         tracing::debug!(
             elapsed_ms = param_start.elapsed().as_secs_f64() * 1_000.0,
@@ -245,11 +245,11 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         let target_ncol = target.col_size();
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
-        let s = SPECTRAL_CONSTANT
-            * (self.base as f64 + 1.0)
-            * SIGMA
-            * SIGMA
-            * (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+        let s = SPECTRAL_CONSTANT *
+            (self.base as f64 + 1.0) *
+            SIGMA *
+            SIGMA *
+            (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
 
         let dist = DistType::GaussDist { sigma: s };
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();
@@ -311,13 +311,12 @@ fn sample_pert_square_mat_gpu_native(
 mod tests {
     use super::*;
     use crate::{
-        __TestState,
+        __PAIR, __TestState,
         matrix::PolyMatrix,
         poly::{
-            dcrt::{gpu::gpu_device_sync, params::DCRTPolyParams},
             PolyParams,
+            dcrt::{gpu::gpu_device_sync, params::DCRTPolyParams},
         },
-        __PAIR,
     };
     use sequential_test::sequential;
 

@@ -1,4 +1,8 @@
 #[cfg(feature = "gpu")]
+use crate::matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix;
+#[cfg(feature = "gpu")]
+use crate::poly::dcrt::gpu::GpuDCRTPolyParams;
+#[cfg(feature = "gpu")]
 pub use crate::sampler::gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler};
 use crate::{
     matrix::{
@@ -32,35 +36,118 @@ pub mod utils;
 pub(crate) const KARNEY_THRESHOLD: f64 = 300.0;
 static SAMPLE_P1_FOR_PERT_MAT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DCRTTrapdoor {
-    pub r: DCRTPolyMatrix,
-    pub e: DCRTPolyMatrix,
-    pub a_mat: DCRTPolyMatrix,
-    pub b_mat: DCRTPolyMatrix,
-    pub d_mat: DCRTPolyMatrix,
-    pub re: DCRTPolyMatrix,
+#[cfg(feature = "gpu")]
+type TrapdoorMatrix = GpuDCRTPolyMatrix;
+#[cfg(not(feature = "gpu"))]
+type TrapdoorMatrix = DCRTPolyMatrix;
+
+#[cfg(feature = "gpu")]
+fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {
+    let (moduli, _, _) = params.to_crt();
+    GpuDCRTPolyParams::new(params.ring_dimension(), moduli, params.base_bits())
 }
+
+#[cfg(feature = "gpu")]
+fn trapdoor_matrix_from_cpu(params: &DCRTPolyParams, matrix: &DCRTPolyMatrix) -> TrapdoorMatrix {
+    let gpu_params = gpu_params_from_cpu(params);
+    GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, matrix)
+}
+
+#[cfg(not(feature = "gpu"))]
+fn trapdoor_matrix_from_cpu(_params: &DCRTPolyParams, matrix: &DCRTPolyMatrix) -> TrapdoorMatrix {
+    matrix.clone()
+}
+
+#[cfg(feature = "gpu")]
+fn trapdoor_matrix_to_cpu(matrix: &TrapdoorMatrix) -> DCRTPolyMatrix {
+    matrix.to_cpu_matrix()
+}
+
+#[cfg(not(feature = "gpu"))]
+fn trapdoor_matrix_to_cpu(matrix: &TrapdoorMatrix) -> DCRTPolyMatrix {
+    matrix.clone()
+}
+
+#[derive(Debug, Clone)]
+pub struct DCRTTrapdoor {
+    pub r: TrapdoorMatrix,
+    pub e: TrapdoorMatrix,
+    pub a_mat: TrapdoorMatrix,
+    pub b_mat: TrapdoorMatrix,
+    pub d_mat: TrapdoorMatrix,
+    pub re: TrapdoorMatrix,
+}
+
+impl PartialEq for DCRTTrapdoor {
+    fn eq(&self, other: &Self) -> bool {
+        self.r_cpu() == other.r_cpu() &&
+            self.e_cpu() == other.e_cpu() &&
+            self.a_mat_cpu() == other.a_mat_cpu() &&
+            self.b_mat_cpu() == other.b_mat_cpu() &&
+            self.d_mat_cpu() == other.d_mat_cpu() &&
+            self.re_cpu() == other.re_cpu()
+    }
+}
+
+impl Eq for DCRTTrapdoor {}
 
 impl DCRTTrapdoor {
     pub fn new(params: &DCRTPolyParams, size: usize, sigma: f64) -> Self {
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let log_base_q = params.modulus_digits();
         let dist = DistType::GaussDist { sigma };
-        let r = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
-        let e = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
-        let a_mat = &r * &r.transpose(); // d x d
-        let b_mat = &r * &e.transpose(); // d x d
-        let d_mat = &e * &e.transpose(); // d x d
-        let re = r.concat_rows(&[&e]);
-        Self { r, e, a_mat, b_mat, d_mat, re }
+        let r_cpu = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
+        let e_cpu = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
+        let a_mat_cpu = &r_cpu * &r_cpu.transpose(); // d x d
+        let b_mat_cpu = &r_cpu * &e_cpu.transpose(); // d x d
+        let d_mat_cpu = &e_cpu * &e_cpu.transpose(); // d x d
+        let re_cpu = r_cpu.concat_rows(&[&e_cpu]);
+        Self {
+            r: trapdoor_matrix_from_cpu(params, &r_cpu),
+            e: trapdoor_matrix_from_cpu(params, &e_cpu),
+            a_mat: trapdoor_matrix_from_cpu(params, &a_mat_cpu),
+            b_mat: trapdoor_matrix_from_cpu(params, &b_mat_cpu),
+            d_mat: trapdoor_matrix_from_cpu(params, &d_mat_cpu),
+            re: trapdoor_matrix_from_cpu(params, &re_cpu),
+        }
+    }
+
+    pub(crate) fn r_cpu(&self) -> DCRTPolyMatrix {
+        trapdoor_matrix_to_cpu(&self.r)
+    }
+
+    pub(crate) fn e_cpu(&self) -> DCRTPolyMatrix {
+        trapdoor_matrix_to_cpu(&self.e)
+    }
+
+    pub(crate) fn a_mat_cpu(&self) -> DCRTPolyMatrix {
+        trapdoor_matrix_to_cpu(&self.a_mat)
+    }
+
+    pub(crate) fn b_mat_cpu(&self) -> DCRTPolyMatrix {
+        trapdoor_matrix_to_cpu(&self.b_mat)
+    }
+
+    pub(crate) fn d_mat_cpu(&self) -> DCRTPolyMatrix {
+        trapdoor_matrix_to_cpu(&self.d_mat)
+    }
+
+    pub(crate) fn re_cpu(&self) -> DCRTPolyMatrix {
+        trapdoor_matrix_to_cpu(&self.re)
     }
 
     pub fn to_compact_bytes(&self) -> Vec<u8> {
-        let mats = [&self.r, &self.e, &self.a_mat, &self.b_mat, &self.d_mat, &self.re];
+        let mats = [
+            self.r_cpu(),
+            self.e_cpu(),
+            self.a_mat_cpu(),
+            self.b_mat_cpu(),
+            self.d_mat_cpu(),
+            self.re_cpu(),
+        ];
         let mut parts = Vec::with_capacity(mats.len());
         let mut total_len = 0usize;
-        for mat in mats {
+        for mat in mats.iter() {
             let bytes = mat.to_compact_bytes();
             total_len += 8 + bytes.len();
             parts.push(bytes);
@@ -99,13 +186,19 @@ impl DCRTTrapdoor {
         if offset != bytes.len() {
             return None;
         }
+        let r = DCRTPolyMatrix::from_compact_bytes(params, &r_bytes);
+        let e = DCRTPolyMatrix::from_compact_bytes(params, &e_bytes);
+        let a_mat = DCRTPolyMatrix::from_compact_bytes(params, &a_bytes);
+        let b_mat = DCRTPolyMatrix::from_compact_bytes(params, &b_bytes);
+        let d_mat = DCRTPolyMatrix::from_compact_bytes(params, &d_bytes);
+        let re = DCRTPolyMatrix::from_compact_bytes(params, &re_bytes);
         Some(Self {
-            r: DCRTPolyMatrix::from_compact_bytes(params, &r_bytes),
-            e: DCRTPolyMatrix::from_compact_bytes(params, &e_bytes),
-            a_mat: DCRTPolyMatrix::from_compact_bytes(params, &a_bytes),
-            b_mat: DCRTPolyMatrix::from_compact_bytes(params, &b_bytes),
-            d_mat: DCRTPolyMatrix::from_compact_bytes(params, &d_bytes),
-            re: DCRTPolyMatrix::from_compact_bytes(params, &re_bytes),
+            r: trapdoor_matrix_from_cpu(params, &r),
+            e: trapdoor_matrix_from_cpu(params, &e),
+            a_mat: trapdoor_matrix_from_cpu(params, &a_mat),
+            b_mat: trapdoor_matrix_from_cpu(params, &b_mat),
+            d_mat: trapdoor_matrix_from_cpu(params, &d_mat),
+            re: trapdoor_matrix_from_cpu(params, &re),
         })
     }
 
@@ -118,7 +211,7 @@ impl DCRTTrapdoor {
         peikert: bool,
         total_ncol: usize,
     ) -> DCRTPolyMatrix {
-        let r = &self.r;
+        let r = self.r_cpu();
         let params = &r.params;
         ensure_openfhe_warmup(params);
         let n = params.ring_dimension() as usize;
@@ -168,13 +261,13 @@ impl DCRTTrapdoor {
         // debug_mem("p2_vecs generated");
         // let p2 = p2_vecs[0].concat_columns(&p2_vecs[1..].iter().collect::<Vec<_>>());
         debug!("{}", "p2 generated");
-        let a_mat = self.a_mat.clone();
-        let b_mat = self.b_mat.clone();
-        let d_mat = self.d_mat.clone();
+        let a_mat = self.a_mat_cpu();
+        let b_mat = self.b_mat_cpu();
+        let d_mat = self.d_mat_cpu();
         debug!("{}", "a_mat, b_mat, d_mat loaded");
-        let re = &self.re;
+        let re = self.re_cpu();
         debug!("{}", "re loaded");
-        let tp2 = re * &p2;
+        let tp2 = &re * &p2;
         debug!("{}", "tp2 generated");
         let p1 = sample_p1_for_pert_mat(a_mat, b_mat, d_mat, tp2, params, c, s, dgg, padded_ncol);
         debug!("{}", "p1 generated");

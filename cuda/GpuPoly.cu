@@ -6,6 +6,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <cuda_runtime.h>
@@ -171,6 +172,148 @@ namespace
         return static_cast<uint32_t>(64 - __builtin_clzll(v));
     }
 
+    constexpr int kMaxRnsLimbs = 64;
+    constexpr int kMaxCoeffWords = 64;
+
+    bool mod_inverse_u64(uint64_t a, uint64_t modulus, uint64_t &out_inv)
+    {
+        if (modulus == 0)
+        {
+            return false;
+        }
+        __int128 t = 0;
+        __int128 new_t = 1;
+        __int128 r = static_cast<__int128>(modulus);
+        __int128 new_r = static_cast<__int128>(a % modulus);
+        while (new_r != 0)
+        {
+            const __int128 q = r / new_r;
+
+            const __int128 tmp_t = t - q * new_t;
+            t = new_t;
+            new_t = tmp_t;
+
+            const __int128 tmp_r = r - q * new_r;
+            r = new_r;
+            new_r = tmp_r;
+        }
+        if (r != 1)
+        {
+            return false;
+        }
+        if (t < 0)
+        {
+            t += static_cast<__int128>(modulus);
+        }
+        out_inv = static_cast<uint64_t>(t);
+        return true;
+    }
+
+    std::vector<uint64_t> compute_garner_inverse_table(const std::vector<uint64_t> &moduli, int limb_count)
+    {
+        const size_t count = static_cast<size_t>(limb_count);
+        std::vector<uint64_t> inverse_table(count * count, 0);
+        for (int i = 1; i < limb_count; ++i)
+        {
+            const uint64_t qi = moduli[static_cast<size_t>(i)];
+            for (int j = 0; j < i; ++j)
+            {
+                const uint64_t qj = moduli[static_cast<size_t>(j)];
+                uint64_t inv = 0;
+                if (!mod_inverse_u64(qj % qi, qi, inv))
+                {
+                    throw std::runtime_error("CRT moduli must be pairwise coprime");
+                }
+                inverse_table[static_cast<size_t>(j) * count + static_cast<size_t>(i)] = inv;
+            }
+        }
+        return inverse_table;
+    }
+
+    __device__ __forceinline__ uint64_t mul_mod_u64_device(uint64_t a, uint64_t b, uint64_t modulus)
+    {
+        const unsigned __int128 prod =
+            static_cast<unsigned __int128>(a) * static_cast<unsigned __int128>(b);
+        return static_cast<uint64_t>(prod % static_cast<unsigned __int128>(modulus));
+    }
+
+    __global__ void reconstruct_rns_to_words_kernel(
+        const uint64_t *const *limb_ptrs,
+        const uint64_t *moduli,
+        const uint64_t *garner_inverses,
+        int inverse_stride,
+        int limb_count,
+        size_t n,
+        int words_per_coeff,
+        uint64_t *coeff_words_out,
+        int *overflow_out)
+    {
+        const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (idx >= n)
+        {
+            return;
+        }
+
+        uint64_t mixed_digits[kMaxRnsLimbs];
+        uint64_t coeff_words[kMaxCoeffWords];
+
+        for (int i = 0; i < limb_count; ++i)
+        {
+            mixed_digits[i] = limb_ptrs[i][idx] % moduli[i];
+        }
+
+        const size_t inverse_stride_sz = static_cast<size_t>(inverse_stride);
+        for (int i = 1; i < limb_count; ++i)
+        {
+            const uint64_t qi = moduli[i];
+            uint64_t t = mixed_digits[i];
+            for (int j = 0; j < i; ++j)
+            {
+                const uint64_t xj_mod_qi = mixed_digits[j] % qi;
+                const uint64_t diff = t >= xj_mod_qi
+                                          ? (t - xj_mod_qi)
+                                          : static_cast<uint64_t>(
+                                                static_cast<unsigned __int128>(t) +
+                                                static_cast<unsigned __int128>(qi) -
+                                                static_cast<unsigned __int128>(xj_mod_qi));
+                const uint64_t inv = garner_inverses[static_cast<size_t>(j) * inverse_stride_sz +
+                                                    static_cast<size_t>(i)];
+                t = mul_mod_u64_device(diff, inv, qi);
+            }
+            mixed_digits[i] = t;
+        }
+
+        for (int w = 0; w < words_per_coeff; ++w)
+        {
+            coeff_words[w] = 0;
+        }
+
+        for (int i = limb_count - 1; i >= 0; --i)
+        {
+            const uint64_t qi = moduli[i];
+            uint64_t carry = mixed_digits[i];
+            for (int w = 0; w < words_per_coeff; ++w)
+            {
+                const unsigned __int128 term =
+                    static_cast<unsigned __int128>(coeff_words[w]) *
+                        static_cast<unsigned __int128>(qi) +
+                    static_cast<unsigned __int128>(carry);
+                coeff_words[w] = static_cast<uint64_t>(term);
+                carry = static_cast<uint64_t>(term >> 64);
+            }
+            if (carry != 0)
+            {
+                atomicExch(overflow_out, 1);
+            }
+        }
+
+        uint64_t *dst = coeff_words_out + idx * static_cast<size_t>(words_per_coeff);
+        for (int w = 0; w < words_per_coeff; ++w)
+        {
+            dst[w] = coeff_words[w];
+        }
+    }
+
     __global__ void decompose_base_kernel(
         const uint64_t *src,
         uint64_t *dst,
@@ -203,6 +346,73 @@ namespace
         {
             atomicExch(out_equal, 0);
         }
+    }
+
+    __device__ __forceinline__ uint32_t bit_width_u64_device(uint64_t value)
+    {
+        return value == 0 ? 0u : static_cast<uint32_t>(64 - __clzll(value));
+    }
+
+    __global__ void compute_max_bits_from_words_kernel(
+        const uint64_t *coeff_words,
+        size_t n,
+        int words_per_coeff,
+        unsigned int *max_bits_out)
+    {
+        const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (idx >= n)
+        {
+            return;
+        }
+
+        const uint64_t *coeff = coeff_words + idx * static_cast<size_t>(words_per_coeff);
+        uint32_t bit_width = 0;
+        for (int w = words_per_coeff - 1; w >= 0; --w)
+        {
+            const uint64_t word = coeff[w];
+            if (word != 0)
+            {
+                bit_width = static_cast<uint32_t>(w) * 64u + bit_width_u64_device(word);
+                break;
+            }
+        }
+        atomicMax(max_bits_out, bit_width);
+    }
+
+    __global__ void pack_coeff_words_bits_kernel(
+        const uint64_t *coeff_words,
+        size_t n,
+        int words_per_coeff,
+        uint32_t bit_width,
+        uint8_t *payload_out,
+        size_t payload_len)
+    {
+        const size_t byte_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (byte_idx >= payload_len)
+        {
+            return;
+        }
+
+        const size_t total_bits = n * static_cast<size_t>(bit_width);
+        const size_t base_bit = byte_idx * 8;
+        uint8_t out = 0;
+        for (size_t k = 0; k < 8; ++k)
+        {
+            const size_t bit_idx = base_bit + k;
+            if (bit_idx >= total_bits)
+            {
+                break;
+            }
+            const size_t coeff_idx = bit_idx / static_cast<size_t>(bit_width);
+            const size_t coeff_bit = bit_idx % static_cast<size_t>(bit_width);
+            const size_t word_idx = coeff_bit / 64;
+            const uint32_t bit_in_word = static_cast<uint32_t>(coeff_bit % 64);
+            const uint64_t word =
+                coeff_words[coeff_idx * static_cast<size_t>(words_per_coeff) + word_idx];
+            const uint8_t bit = static_cast<uint8_t>((word >> bit_in_word) & uint64_t{1});
+            out |= static_cast<uint8_t>(bit << k);
+        }
+        payload_out[byte_idx] = out;
     }
 
     int compare_u64_arrays_on_device(
@@ -336,8 +546,18 @@ extern "C"
             }
             params.Sprimes.clear();
 
+            std::vector<uint64_t> moduli_vec(moduli, moduli + moduli_len);
+            std::vector<uint64_t> inverse_table =
+                compute_garner_inverse_table(moduli_vec, static_cast<int>(moduli_len));
+
             auto *ctx = new CKKS::Context(params, gpu_list, 0);
-            auto *gpu_ctx = new GpuContext{ctx, std::vector<uint64_t>(moduli, moduli + moduli_len), 1 << logN, gpu_list, batch};
+            auto *gpu_ctx = new GpuContext{
+                ctx,
+                std::move(moduli_vec),
+                1 << logN,
+                gpu_list,
+                batch,
+                std::move(inverse_table)};
             *out_ctx = gpu_ctx;
             return 0;
         }
@@ -918,6 +1138,702 @@ extern "C"
         catch (...)
         {
             return set_error("unknown exception in gpu_poly_store_rns_batch");
+        }
+    }
+
+    int gpu_poly_store_coeffs_words(
+        GpuPoly *poly,
+        uint64_t *coeff_words_out,
+        size_t coeff_words_len,
+        size_t words_per_coeff,
+        int format)
+    {
+        try
+        {
+            if (!poly || !poly->ctx || !coeff_words_out)
+            {
+                return set_error("invalid gpu_poly_store_coeffs_words arguments");
+            }
+            if (words_per_coeff == 0)
+            {
+                return set_error("words_per_coeff must be non-zero in gpu_poly_store_coeffs_words");
+            }
+            PolyFormat target_format;
+            if (!parse_format(format, target_format))
+            {
+                return set_error("invalid format in gpu_poly_store_coeffs_words");
+            }
+
+            const int batch = default_batch(poly->ctx);
+            if (target_format == PolyFormat::Eval)
+            {
+                ensure_coeff(poly, batch);
+            }
+            if (poly->format != PolyFormat::Coeff)
+            {
+                return set_error("gpu_poly_store_coeffs_words expects coeff format");
+            }
+            poly->poly->sync();
+
+            const int level = poly->level;
+            const int limb_count = level + 1;
+            if (limb_count <= 0)
+            {
+                return 0;
+            }
+            if (limb_count > static_cast<int>(poly->ctx->moduli.size()))
+            {
+                return set_error("unexpected modulus count in gpu_poly_store_coeffs_words");
+            }
+            if (limb_count > kMaxRnsLimbs)
+            {
+                return set_error("limb_count exceeds kernel limit in gpu_poly_store_coeffs_words");
+            }
+            if (words_per_coeff > static_cast<size_t>(kMaxCoeffWords))
+            {
+                return set_error("words_per_coeff exceeds kernel limit in gpu_poly_store_coeffs_words");
+            }
+
+            size_t total_bits_upper = 0;
+            for (int limb = 0; limb < limb_count; ++limb)
+            {
+                total_bits_upper +=
+                    static_cast<size_t>(bit_width_u64(poly->ctx->moduli[static_cast<size_t>(limb)]));
+            }
+            const size_t required_words =
+                std::max<size_t>(1, (total_bits_upper + static_cast<size_t>(63)) /
+                                        static_cast<size_t>(64));
+            if (words_per_coeff < required_words)
+            {
+                return set_error("words_per_coeff too small in gpu_poly_store_coeffs_words");
+            }
+
+            const size_t n = static_cast<size_t>(poly->ctx->N);
+            if (n > 0 && words_per_coeff > std::numeric_limits<size_t>::max() / n)
+            {
+                return set_error("output length overflow in gpu_poly_store_coeffs_words");
+            }
+            const size_t expected_len = n * words_per_coeff;
+            if (coeff_words_len < expected_len)
+            {
+                return set_error("coeff_words_len too small in gpu_poly_store_coeffs_words");
+            }
+
+            auto *ctx = poly->ctx->ctx;
+            if (ctx->limbGPUid.size() < static_cast<size_t>(limb_count))
+            {
+                return set_error("unexpected limb mapping size in gpu_poly_store_coeffs_words");
+            }
+
+            std::vector<const uint64_t *> limb_ptrs(static_cast<size_t>(limb_count));
+            int common_device = -1;
+            for (int limb = 0; limb < limb_count; ++limb)
+            {
+                const dim3 limb_id = ctx->limbGPUid[static_cast<size_t>(limb)];
+                if (limb_id.x >= poly->poly->GPU.size())
+                {
+                    return set_error("unexpected limb GPU partition in gpu_poly_store_coeffs_words");
+                }
+                auto &partition = poly->poly->GPU[limb_id.x];
+                if (limb_id.y >= partition.limb.size())
+                {
+                    return set_error("unexpected limb index in gpu_poly_store_coeffs_words");
+                }
+                auto &limb_impl = partition.limb[limb_id.y];
+                if (limb_impl.index() != FIDESlib::U64)
+                {
+                    return set_error("unsupported limb type in gpu_poly_store_coeffs_words");
+                }
+                if (common_device < 0)
+                {
+                    common_device = partition.device;
+                }
+                else if (common_device != partition.device)
+                {
+                    return set_error(
+                        "gpu_poly_store_coeffs_words requires all limbs on a single GPU");
+                }
+                limb_ptrs[static_cast<size_t>(limb)] =
+                    std::get<FIDESlib::U64>(limb_impl).v.data;
+            }
+
+            cudaError_t err = cudaSetDevice(common_device);
+            if (err != cudaSuccess)
+            {
+                return set_error(cudaGetErrorString(err));
+            }
+
+            std::vector<uint64_t> moduli_subset(
+                poly->ctx->moduli.begin(),
+                poly->ctx->moduli.begin() + static_cast<size_t>(limb_count));
+            const size_t inverse_stride = poly->ctx->moduli.size();
+            const std::vector<uint64_t> &inverse_table = poly->ctx->garner_inverse_table;
+            if (inverse_table.size() != inverse_stride * inverse_stride)
+            {
+                return set_error("invalid cached inverse table in gpu_poly_store_coeffs_words");
+            }
+
+            const uint64_t **d_limb_ptrs = nullptr;
+            uint64_t *d_moduli = nullptr;
+            uint64_t *d_garner_inv = nullptr;
+            uint64_t *d_coeff_words = nullptr;
+            int *d_overflow = nullptr;
+            auto release = [&]() {
+                if (d_overflow)
+                {
+                    cudaFree(d_overflow);
+                    d_overflow = nullptr;
+                }
+                if (d_coeff_words)
+                {
+                    cudaFree(d_coeff_words);
+                    d_coeff_words = nullptr;
+                }
+                if (d_garner_inv)
+                {
+                    cudaFree(d_garner_inv);
+                    d_garner_inv = nullptr;
+                }
+                if (d_moduli)
+                {
+                    cudaFree(d_moduli);
+                    d_moduli = nullptr;
+                }
+                if (d_limb_ptrs)
+                {
+                    cudaFree(d_limb_ptrs);
+                    d_limb_ptrs = nullptr;
+                }
+            };
+
+            err = cudaMalloc(
+                reinterpret_cast<void **>(&d_limb_ptrs),
+                static_cast<size_t>(limb_count) * sizeof(uint64_t *));
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+            err = cudaMemcpy(
+                d_limb_ptrs,
+                limb_ptrs.data(),
+                static_cast<size_t>(limb_count) * sizeof(uint64_t *),
+                cudaMemcpyHostToDevice);
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+
+            err = cudaMalloc(reinterpret_cast<void **>(&d_moduli), moduli_subset.size() * sizeof(uint64_t));
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+            err = cudaMemcpy(
+                d_moduli,
+                moduli_subset.data(),
+                moduli_subset.size() * sizeof(uint64_t),
+                cudaMemcpyHostToDevice);
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+
+            err = cudaMalloc(
+                reinterpret_cast<void **>(&d_garner_inv),
+                inverse_table.size() * sizeof(uint64_t));
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+            err = cudaMemcpy(
+                d_garner_inv,
+                inverse_table.data(),
+                inverse_table.size() * sizeof(uint64_t),
+                cudaMemcpyHostToDevice);
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+
+            if (expected_len > 0)
+            {
+                err = cudaMalloc(reinterpret_cast<void **>(&d_coeff_words), expected_len * sizeof(uint64_t));
+                if (err != cudaSuccess)
+                {
+                    release();
+                    return set_error(cudaGetErrorString(err));
+                }
+            }
+            err = cudaMalloc(reinterpret_cast<void **>(&d_overflow), sizeof(int));
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+            err = cudaMemset(d_overflow, 0, sizeof(int));
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+
+            if (n > 0)
+            {
+                const int threads = 256;
+                const int blocks = static_cast<int>((n + static_cast<size_t>(threads) - 1) /
+                                                    static_cast<size_t>(threads));
+                reconstruct_rns_to_words_kernel<<<blocks, threads>>>(
+                    d_limb_ptrs,
+                    d_moduli,
+                    d_garner_inv,
+                    static_cast<int>(inverse_stride),
+                    limb_count,
+                    n,
+                    static_cast<int>(words_per_coeff),
+                    d_coeff_words,
+                    d_overflow);
+                err = cudaGetLastError();
+                if (err != cudaSuccess)
+                {
+                    release();
+                    return set_error(cudaGetErrorString(err));
+                }
+            }
+
+            int h_overflow = 0;
+            err = cudaMemcpy(&h_overflow, d_overflow, sizeof(int), cudaMemcpyDeviceToHost);
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+            if (expected_len > 0)
+            {
+                err = cudaMemcpy(
+                    coeff_words_out,
+                    d_coeff_words,
+                    expected_len * sizeof(uint64_t),
+                    cudaMemcpyDeviceToHost);
+                if (err != cudaSuccess)
+                {
+                    release();
+                    return set_error(cudaGetErrorString(err));
+                }
+            }
+            err = cudaDeviceSynchronize();
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+            if (h_overflow != 0)
+            {
+                release();
+                return set_error("overflow in gpu_poly_store_coeffs_words");
+            }
+
+            release();
+            return 0;
+        }
+        catch (const std::exception &e)
+        {
+            return set_error(e);
+        }
+        catch (...)
+        {
+            return set_error("unknown exception in gpu_poly_store_coeffs_words");
+        }
+    }
+
+    int gpu_poly_store_compact_bytes(
+        GpuPoly *poly,
+        uint8_t *payload_out,
+        size_t payload_capacity,
+        uint16_t *out_max_coeff_bits,
+        uint16_t *out_bytes_per_coeff,
+        size_t *out_payload_len)
+    {
+        try
+        {
+            if (!poly || !poly->ctx || !payload_out || !out_max_coeff_bits ||
+                !out_bytes_per_coeff || !out_payload_len)
+            {
+                return set_error("invalid gpu_poly_store_compact_bytes arguments");
+            }
+
+            const int batch = default_batch(poly->ctx);
+            ensure_coeff(poly, batch);
+            if (poly->format != PolyFormat::Coeff)
+            {
+                return set_error("gpu_poly_store_compact_bytes expects coeff format");
+            }
+            poly->poly->sync();
+
+            const int level = poly->level;
+            const int limb_count = level + 1;
+            const size_t n = static_cast<size_t>(poly->ctx->N);
+            if (limb_count <= 0 || n == 0)
+            {
+                *out_max_coeff_bits = 0;
+                *out_bytes_per_coeff = 0;
+                *out_payload_len = 0;
+                return 0;
+            }
+            if (limb_count > static_cast<int>(poly->ctx->moduli.size()))
+            {
+                return set_error("unexpected modulus count in gpu_poly_store_compact_bytes");
+            }
+            if (limb_count > kMaxRnsLimbs)
+            {
+                return set_error("limb_count exceeds kernel limit in gpu_poly_store_compact_bytes");
+            }
+
+            size_t total_bits_upper = 0;
+            for (int limb = 0; limb < limb_count; ++limb)
+            {
+                total_bits_upper +=
+                    static_cast<size_t>(bit_width_u64(poly->ctx->moduli[static_cast<size_t>(limb)]));
+            }
+            const size_t words_per_coeff =
+                std::max<size_t>(1, (total_bits_upper + static_cast<size_t>(63)) /
+                                        static_cast<size_t>(64));
+            if (words_per_coeff > static_cast<size_t>(kMaxCoeffWords))
+            {
+                return set_error("words_per_coeff exceeds kernel limit in gpu_poly_store_compact_bytes");
+            }
+
+            auto *ctx = poly->ctx->ctx;
+            if (ctx->limbGPUid.size() < static_cast<size_t>(limb_count))
+            {
+                return set_error("unexpected limb mapping size in gpu_poly_store_compact_bytes");
+            }
+
+            std::vector<const uint64_t *> limb_ptrs(static_cast<size_t>(limb_count));
+            int common_device = -1;
+            for (int limb = 0; limb < limb_count; ++limb)
+            {
+                const dim3 limb_id = ctx->limbGPUid[static_cast<size_t>(limb)];
+                if (limb_id.x >= poly->poly->GPU.size())
+                {
+                    return set_error("unexpected limb GPU partition in gpu_poly_store_compact_bytes");
+                }
+                auto &partition = poly->poly->GPU[limb_id.x];
+                if (limb_id.y >= partition.limb.size())
+                {
+                    return set_error("unexpected limb index in gpu_poly_store_compact_bytes");
+                }
+                auto &limb_impl = partition.limb[limb_id.y];
+                if (limb_impl.index() != FIDESlib::U64)
+                {
+                    return set_error("unsupported limb type in gpu_poly_store_compact_bytes");
+                }
+                if (common_device < 0)
+                {
+                    common_device = partition.device;
+                }
+                else if (common_device != partition.device)
+                {
+                    return set_error(
+                        "gpu_poly_store_compact_bytes requires all limbs on a single GPU");
+                }
+                limb_ptrs[static_cast<size_t>(limb)] =
+                    std::get<FIDESlib::U64>(limb_impl).v.data;
+            }
+
+            cudaError_t err = cudaSetDevice(common_device);
+            if (err != cudaSuccess)
+            {
+                return set_error(cudaGetErrorString(err));
+            }
+
+            if (words_per_coeff > std::numeric_limits<size_t>::max() / n)
+            {
+                return set_error("coeff word length overflow in gpu_poly_store_compact_bytes");
+            }
+            const size_t coeff_word_len = n * words_per_coeff;
+
+            std::vector<uint64_t> moduli_subset(
+                poly->ctx->moduli.begin(),
+                poly->ctx->moduli.begin() + static_cast<size_t>(limb_count));
+            const size_t inverse_stride = poly->ctx->moduli.size();
+            const std::vector<uint64_t> &inverse_table = poly->ctx->garner_inverse_table;
+            if (inverse_table.size() != inverse_stride * inverse_stride)
+            {
+                return set_error("invalid cached inverse table in gpu_poly_store_compact_bytes");
+            }
+
+            const uint64_t **d_limb_ptrs = nullptr;
+            uint64_t *d_moduli = nullptr;
+            uint64_t *d_garner_inv = nullptr;
+            uint64_t *d_coeff_words = nullptr;
+            int *d_overflow = nullptr;
+            unsigned int *d_max_bits = nullptr;
+            uint8_t *d_payload = nullptr;
+            auto release = [&]() {
+                if (d_payload)
+                {
+                    cudaFree(d_payload);
+                    d_payload = nullptr;
+                }
+                if (d_max_bits)
+                {
+                    cudaFree(d_max_bits);
+                    d_max_bits = nullptr;
+                }
+                if (d_overflow)
+                {
+                    cudaFree(d_overflow);
+                    d_overflow = nullptr;
+                }
+                if (d_coeff_words)
+                {
+                    cudaFree(d_coeff_words);
+                    d_coeff_words = nullptr;
+                }
+                if (d_garner_inv)
+                {
+                    cudaFree(d_garner_inv);
+                    d_garner_inv = nullptr;
+                }
+                if (d_moduli)
+                {
+                    cudaFree(d_moduli);
+                    d_moduli = nullptr;
+                }
+                if (d_limb_ptrs)
+                {
+                    cudaFree(d_limb_ptrs);
+                    d_limb_ptrs = nullptr;
+                }
+            };
+
+            err = cudaMalloc(
+                reinterpret_cast<void **>(&d_limb_ptrs),
+                static_cast<size_t>(limb_count) * sizeof(uint64_t *));
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+            err = cudaMemcpy(
+                d_limb_ptrs,
+                limb_ptrs.data(),
+                static_cast<size_t>(limb_count) * sizeof(uint64_t *),
+                cudaMemcpyHostToDevice);
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+
+            err = cudaMalloc(reinterpret_cast<void **>(&d_moduli), moduli_subset.size() * sizeof(uint64_t));
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+            err = cudaMemcpy(
+                d_moduli,
+                moduli_subset.data(),
+                moduli_subset.size() * sizeof(uint64_t),
+                cudaMemcpyHostToDevice);
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+
+            err = cudaMalloc(
+                reinterpret_cast<void **>(&d_garner_inv),
+                inverse_table.size() * sizeof(uint64_t));
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+            err = cudaMemcpy(
+                d_garner_inv,
+                inverse_table.data(),
+                inverse_table.size() * sizeof(uint64_t),
+                cudaMemcpyHostToDevice);
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+
+            err = cudaMalloc(
+                reinterpret_cast<void **>(&d_coeff_words),
+                coeff_word_len * sizeof(uint64_t));
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+            err = cudaMalloc(reinterpret_cast<void **>(&d_overflow), sizeof(int));
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+            err = cudaMemset(d_overflow, 0, sizeof(int));
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+
+            const int threads = 256;
+            const int blocks = static_cast<int>((n + static_cast<size_t>(threads) - 1) /
+                                                static_cast<size_t>(threads));
+            reconstruct_rns_to_words_kernel<<<blocks, threads>>>(
+                d_limb_ptrs,
+                d_moduli,
+                d_garner_inv,
+                static_cast<int>(inverse_stride),
+                limb_count,
+                n,
+                static_cast<int>(words_per_coeff),
+                d_coeff_words,
+                d_overflow);
+            err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+
+            int h_overflow = 0;
+            err = cudaMemcpy(&h_overflow, d_overflow, sizeof(int), cudaMemcpyDeviceToHost);
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+            if (h_overflow != 0)
+            {
+                release();
+                return set_error("overflow in gpu_poly_store_compact_bytes");
+            }
+
+            err = cudaMalloc(reinterpret_cast<void **>(&d_max_bits), sizeof(unsigned int));
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+            err = cudaMemset(d_max_bits, 0, sizeof(unsigned int));
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+
+            compute_max_bits_from_words_kernel<<<blocks, threads>>>(
+                d_coeff_words,
+                n,
+                static_cast<int>(words_per_coeff),
+                d_max_bits);
+            err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+
+            unsigned int h_max_bits = 0;
+            err = cudaMemcpy(&h_max_bits, d_max_bits, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+            if (h_max_bits > static_cast<unsigned int>(std::numeric_limits<uint16_t>::max()))
+            {
+                release();
+                return set_error("max coeff bits exceed u16 range in gpu_poly_store_compact_bytes");
+            }
+            const unsigned int h_bytes_per_coeff =
+                (h_max_bits + static_cast<unsigned int>(7)) / static_cast<unsigned int>(8);
+            if (h_bytes_per_coeff >
+                static_cast<unsigned int>(std::numeric_limits<uint16_t>::max()))
+            {
+                release();
+                return set_error("bytes_per_coeff exceed u16 range in gpu_poly_store_compact_bytes");
+            }
+
+            if (h_max_bits > 0 &&
+                n > std::numeric_limits<size_t>::max() / static_cast<size_t>(h_max_bits))
+            {
+                release();
+                return set_error("payload length overflow in gpu_poly_store_compact_bytes");
+            }
+            const size_t payload_len =
+                (n * static_cast<size_t>(h_max_bits) + static_cast<size_t>(7)) / static_cast<size_t>(8);
+            if (payload_len > payload_capacity)
+            {
+                release();
+                return set_error("payload_capacity too small in gpu_poly_store_compact_bytes");
+            }
+
+            if (payload_len > 0)
+            {
+                err = cudaMalloc(reinterpret_cast<void **>(&d_payload), payload_len);
+                if (err != cudaSuccess)
+                {
+                    release();
+                    return set_error(cudaGetErrorString(err));
+                }
+
+                const int payload_blocks = static_cast<int>((payload_len + threads - 1) / threads);
+                pack_coeff_words_bits_kernel<<<payload_blocks, threads>>>(
+                    d_coeff_words,
+                    n,
+                    static_cast<int>(words_per_coeff),
+                    h_max_bits,
+                    d_payload,
+                    payload_len);
+                err = cudaGetLastError();
+                if (err != cudaSuccess)
+                {
+                    release();
+                    return set_error(cudaGetErrorString(err));
+                }
+
+                err = cudaMemcpy(payload_out, d_payload, payload_len, cudaMemcpyDeviceToHost);
+                if (err != cudaSuccess)
+                {
+                    release();
+                    return set_error(cudaGetErrorString(err));
+                }
+            }
+
+            err = cudaDeviceSynchronize();
+            if (err != cudaSuccess)
+            {
+                release();
+                return set_error(cudaGetErrorString(err));
+            }
+
+            *out_max_coeff_bits = static_cast<uint16_t>(h_max_bits);
+            *out_bytes_per_coeff = static_cast<uint16_t>(h_bytes_per_coeff);
+            *out_payload_len = payload_len;
+            release();
+            return 0;
+        }
+        catch (const std::exception &e)
+        {
+            return set_error(e);
+        }
+        catch (...)
+        {
+            return set_error("unknown exception in gpu_poly_store_compact_bytes");
         }
     }
 

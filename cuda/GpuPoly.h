@@ -74,6 +74,19 @@ int gpu_poly_store_rns_batch(
     size_t bytes_per_poly,
     int format,
     GpuEventSet** out_events);
+int gpu_poly_store_compact_bytes(
+    GpuPoly* poly,
+    uint8_t* payload_out,
+    size_t payload_capacity,
+    uint16_t* out_max_coeff_bits,
+    uint16_t* out_bytes_per_coeff,
+    size_t* out_payload_len);
+int gpu_poly_store_coeffs_words(
+    GpuPoly* poly,
+    uint64_t* coeff_words_out,
+    size_t coeff_words_len,
+    size_t words_per_coeff,
+    int format);
 int gpu_event_set_wait(GpuEventSet* events);
 void gpu_event_set_destroy(GpuEventSet* events);
 

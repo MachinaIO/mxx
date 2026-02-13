@@ -28,6 +28,7 @@ struct GpuContext
     int N;
     std::vector<int> gpu_ids;
     uint32_t batch;
+    std::vector<uint64_t> garner_inverse_table;
 };
 
 struct GpuPoly

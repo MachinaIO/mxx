@@ -1,5 +1,5 @@
 use crate::{
-    element::{finite_ring::FinRingElem, PolyElem},
+    element::{PolyElem, finite_ring::FinRingElem},
     impl_binop_with_refs,
     poly::{Poly, PolyParams},
     utils::mod_inverse,
@@ -424,19 +424,8 @@ fn bits_in_u64(value: u64) -> usize {
 
 #[inline(always)]
 fn coeff_words_per_coeff_upper(moduli: &[u64], level: usize) -> usize {
-    assert!(
-        level < moduli.len(),
-        "invalid level {} for modulus count {}",
-        level,
-        moduli.len()
-    );
-    moduli
-        .iter()
-        .take(level + 1)
-        .map(|m| bits_in_u64(*m))
-        .sum::<usize>()
-        .div_ceil(64)
-        .max(1)
+    assert!(level < moduli.len(), "invalid level {} for modulus count {}", level, moduli.len());
+    moduli.iter().take(level + 1).map(|m| bits_in_u64(*m)).sum::<usize>().div_ceil(64).max(1)
 }
 
 #[inline(always)]
@@ -452,11 +441,7 @@ fn biguint_from_u64_words_le(words: &[u64]) -> BigUint {
     while digits.last().copied() == Some(0) {
         digits.pop();
     }
-    if digits.is_empty() {
-        BigUint::ZERO
-    } else {
-        BigUint::new(digits)
-    }
+    if digits.is_empty() { BigUint::ZERO } else { BigUint::new(digits) }
 }
 
 fn log2_u32(value: u32) -> u32 {
@@ -572,12 +557,12 @@ impl Debug for GpuDCRTPolyParams {
 
 impl PartialEq for GpuDCRTPolyParams {
     fn eq(&self, other: &Self) -> bool {
-        self.ring_dimension == other.ring_dimension
-            && self.moduli == other.moduli
-            && self.base_bits == other.base_bits
-            && self.gpu_ids == other.gpu_ids
-            && self.dnum == other.dnum
-            && self.batch == other.batch
+        self.ring_dimension == other.ring_dimension &&
+            self.moduli == other.moduli &&
+            self.base_bits == other.base_bits &&
+            self.gpu_ids == other.gpu_ids &&
+            self.dnum == other.dnum &&
+            self.batch == other.batch
     }
 }
 
@@ -1502,10 +1487,9 @@ impl MulAssign<&GpuDCRTPoly> for GpuDCRTPoly {
 mod tests {
     use super::*;
     use crate::{
-        __TestState,
+        __PAIR, __TestState,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
-        sampler::{uniform::DCRTPolyUniformSampler, DistType, PolyUniformSampler},
-        __PAIR,
+        sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
     };
     use rand::prelude::*;
 

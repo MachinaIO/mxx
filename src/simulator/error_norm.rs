@@ -170,6 +170,7 @@ impl NormPltGGH15Evaluator {
         secret_sigma: Option<BigDecimal>,
     ) -> Self {
         let preimage_norm = compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base);
+        info!("{}", format!("preimage norm bits {}", bigdecimal_bits_ceil(&preimage_norm)));
         let e_b_init = PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_b, e_b_sigma * 6, None);
         let s_vec = PolyMatrixNorm::new(
             ctx.clone(),

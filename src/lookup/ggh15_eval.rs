@@ -640,7 +640,8 @@ where
         let c_pre2_gy = (sg_times_b1.clone() * preimage_gate2_gy).mul_decompose(&gy);
         let c_pre2_v = (sg_times_b1.clone() * preimage_gate2_v).mul_decompose(&v_idx);
         let c_pre2_vx = (sg_times_b1.clone() * preimage_gate2_vx).mul_decompose(&v_idx_scaled);
-        let c_const = c_pre2_identity + c_pre2_gy + c_pre2_v + c_pre2_vx - sg_times_b1 * preimage_lut;
+        let c_const =
+            c_pre2_identity + c_pre2_gy + c_pre2_v + c_pre2_vx - sg_times_b1 * preimage_lut;
         let c_x_randomized = input.vector.clone() *
             (u_g * M::gadget_matrix(params, m_g)).decompose() *
             v_idx.decompose();

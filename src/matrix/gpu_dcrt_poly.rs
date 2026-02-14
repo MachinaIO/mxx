@@ -181,6 +181,40 @@ impl GpuDCRTPolyMatrix {
         check_status(status, "gpu_matrix_copy_block");
     }
 
+    pub fn add_in_place(&mut self, rhs: &Self) {
+        debug_assert_eq!(self.params, rhs.params, "add_in_place requires same params");
+        debug_assert!(
+            self.nrow == rhs.nrow && self.ncol == rhs.ncol,
+            "add_in_place requires same dimensions: self({}, {}) != rhs({}, {})",
+            self.nrow,
+            self.ncol,
+            rhs.nrow,
+            rhs.ncol
+        );
+        if self.nrow == 0 || self.ncol == 0 {
+            return;
+        }
+        let status = unsafe { gpu_matrix_add(self.raw, self.raw, rhs.raw) };
+        check_status(status, "gpu_matrix_add");
+    }
+
+    pub fn sub_in_place(&mut self, rhs: &Self) {
+        debug_assert_eq!(self.params, rhs.params, "sub_in_place requires same params");
+        debug_assert!(
+            self.nrow == rhs.nrow && self.ncol == rhs.ncol,
+            "sub_in_place requires same dimensions: self({}, {}) != rhs({}, {})",
+            self.nrow,
+            self.ncol,
+            rhs.nrow,
+            rhs.ncol
+        );
+        if self.nrow == 0 || self.ncol == 0 {
+            return;
+        }
+        let status = unsafe { gpu_matrix_sub(self.raw, self.raw, rhs.raw) };
+        check_status(status, "gpu_matrix_sub");
+    }
+
     pub(crate) fn sample_distribution(
         params: &GpuDCRTPolyParams,
         nrow: usize,
@@ -391,7 +425,7 @@ impl GpuDCRTPolyMatrix {
         out
     }
 
-    pub fn concat_rows_owned(self, others: Vec<Self>) -> Self {
+    fn concat_rows_consume_with_refs(self, others: &[&Self]) -> Self {
         #[cfg(debug_assertions)]
         for (idx, other) in others.iter().enumerate() {
             if self.ncol != other.ncol {
@@ -419,7 +453,7 @@ impl GpuDCRTPolyMatrix {
         out
     }
 
-    pub fn concat_columns_owned(self, others: Vec<Self>) -> Self {
+    fn concat_columns_consume_with_refs(self, others: &[&Self]) -> Self {
         #[cfg(debug_assertions)]
         for (idx, other) in others.iter().enumerate() {
             if self.nrow != other.nrow {
@@ -435,7 +469,6 @@ impl GpuDCRTPolyMatrix {
                 );
             }
         }
-
         let nrow = self.nrow;
         let ncol = self.ncol + others.iter().map(|x| x.ncol).sum::<usize>();
         let mut out = Self::new_empty(&self.params, nrow, ncol);
@@ -446,6 +479,46 @@ impl GpuDCRTPolyMatrix {
             col_offset += other.ncol;
         }
         out
+    }
+
+    fn concat_diag_consume_with_refs(self, others: &[&Self]) -> Self {
+        #[cfg(debug_assertions)]
+        for (idx, other) in others.iter().enumerate() {
+            if self.params != other.params {
+                panic!(
+                    "Concat error: mismatched params at index {} (lhs={:?}, rhs={:?})",
+                    idx, self.params, other.params
+                );
+            }
+        }
+
+        let nrow = self.nrow + others.iter().map(|x| x.nrow).sum::<usize>();
+        let ncol = self.ncol + others.iter().map(|x| x.ncol).sum::<usize>();
+        let mut out = Self::new_zero(&self.params, nrow, ncol);
+        out.copy_block_from(&self, 0, 0, 0, 0, self.nrow, self.ncol);
+        let mut row_offset = self.nrow;
+        let mut col_offset = self.ncol;
+        for other in others.iter() {
+            out.copy_block_from(other, row_offset, col_offset, 0, 0, other.nrow, other.ncol);
+            row_offset += other.nrow;
+            col_offset += other.ncol;
+        }
+        out
+    }
+
+    pub fn concat_rows_owned(self, others: Vec<Self>) -> Self {
+        let refs = others.iter().collect::<Vec<_>>();
+        self.concat_rows_consume_with_refs(&refs)
+    }
+
+    pub fn concat_columns_owned(self, others: Vec<Self>) -> Self {
+        let refs = others.iter().collect::<Vec<_>>();
+        self.concat_columns_consume_with_refs(&refs)
+    }
+
+    pub fn concat_diag_owned(self, others: Vec<Self>) -> Self {
+        let refs = others.iter().collect::<Vec<_>>();
+        self.concat_diag_consume_with_refs(&refs)
     }
 }
 
@@ -618,60 +691,15 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
     }
 
     fn concat_columns(&self, others: &[&Self]) -> Self {
-        #[cfg(debug_assertions)]
-        for (idx, other) in others.iter().enumerate() {
-            if self.nrow != other.nrow {
-                panic!(
-                    "Concat error: while the shape of the first matrix is ({}, {}), that of the {}-th matrix is ({},{})",
-                    self.nrow, self.ncol, idx, other.nrow, other.ncol
-                );
-            }
-        }
-        let ncol = self.ncol + others.iter().map(|x| x.ncol).sum::<usize>();
-        let mut out = Self::new_empty(&self.params, self.nrow, ncol);
-        out.copy_block_from(self, 0, 0, 0, 0, self.nrow, self.ncol);
-        let mut col_offset = self.ncol;
-        for other in others {
-            out.copy_block_from(other, 0, col_offset, 0, 0, other.nrow, other.ncol);
-            col_offset += other.ncol;
-        }
-        out
+        self.clone().concat_columns_consume_with_refs(others)
     }
 
     fn concat_rows(&self, others: &[&Self]) -> Self {
-        #[cfg(debug_assertions)]
-        for (idx, other) in others.iter().enumerate() {
-            if self.ncol != other.ncol {
-                panic!(
-                    "Concat error: while the shape of the first matrix is ({}, {}), that of the {}-th matrix is ({},{})",
-                    self.nrow, self.ncol, idx, other.nrow, other.ncol
-                );
-            }
-        }
-        let nrow = self.nrow + others.iter().map(|x| x.nrow).sum::<usize>();
-        let mut out = Self::new_empty(&self.params, nrow, self.ncol);
-        out.copy_block_from(self, 0, 0, 0, 0, self.nrow, self.ncol);
-        let mut row_offset = self.nrow;
-        for other in others {
-            out.copy_block_from(other, row_offset, 0, 0, 0, other.nrow, other.ncol);
-            row_offset += other.nrow;
-        }
-        out
+        self.clone().concat_rows_consume_with_refs(others)
     }
 
     fn concat_diag(&self, others: &[&Self]) -> Self {
-        let nrow = self.nrow + others.iter().map(|x| x.nrow).sum::<usize>();
-        let ncol = self.ncol + others.iter().map(|x| x.ncol).sum::<usize>();
-        let mut out = Self::new_zero(&self.params, nrow, ncol);
-        out.copy_block_from(self, 0, 0, 0, 0, self.nrow, self.ncol);
-        let mut row_offset = self.nrow;
-        let mut col_offset = self.ncol;
-        for other in others {
-            out.copy_block_from(other, row_offset, col_offset, 0, 0, other.nrow, other.ncol);
-            row_offset += other.nrow;
-            col_offset += other.ncol;
-        }
-        out
+        self.clone().concat_diag_consume_with_refs(others)
     }
 
     fn tensor(&self, other: &Self) -> Self {
@@ -907,16 +935,18 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
 impl Add for GpuDCRTPolyMatrix {
     type Output = GpuDCRTPolyMatrix;
 
-    fn add(self, rhs: Self) -> Self::Output {
-        &self + &rhs
+    fn add(mut self, rhs: Self) -> Self::Output {
+        self.add_in_place(&rhs);
+        self
     }
 }
 
 impl Add<&GpuDCRTPolyMatrix> for GpuDCRTPolyMatrix {
     type Output = GpuDCRTPolyMatrix;
 
-    fn add(self, rhs: &GpuDCRTPolyMatrix) -> Self::Output {
-        &self + rhs
+    fn add(mut self, rhs: &GpuDCRTPolyMatrix) -> Self::Output {
+        self.add_in_place(rhs);
+        self
     }
 }
 
@@ -924,20 +954,8 @@ impl Add<&GpuDCRTPolyMatrix> for &GpuDCRTPolyMatrix {
     type Output = GpuDCRTPolyMatrix;
 
     fn add(self, rhs: &GpuDCRTPolyMatrix) -> Self::Output {
-        debug_assert!(
-            self.nrow == rhs.nrow && self.ncol == rhs.ncol,
-            "Addition requires matrices of same dimensions: self({}, {}) != rhs({}, {})",
-            self.nrow,
-            self.ncol,
-            rhs.nrow,
-            rhs.ncol
-        );
-        let out = GpuDCRTPolyMatrix::new_empty(&self.params, self.nrow, self.ncol);
-        if self.nrow == 0 || self.ncol == 0 {
-            return out;
-        }
-        let status = unsafe { gpu_matrix_add(out.raw, self.raw, rhs.raw) };
-        check_status(status, "gpu_matrix_add");
+        let mut out = self.clone();
+        out.add_in_place(rhs);
         out
     }
 }
@@ -945,16 +963,18 @@ impl Add<&GpuDCRTPolyMatrix> for &GpuDCRTPolyMatrix {
 impl Sub for GpuDCRTPolyMatrix {
     type Output = GpuDCRTPolyMatrix;
 
-    fn sub(self, rhs: Self) -> Self::Output {
-        &self - &rhs
+    fn sub(mut self, rhs: Self) -> Self::Output {
+        self.sub_in_place(&rhs);
+        self
     }
 }
 
 impl Sub<&GpuDCRTPolyMatrix> for GpuDCRTPolyMatrix {
     type Output = GpuDCRTPolyMatrix;
 
-    fn sub(self, rhs: &GpuDCRTPolyMatrix) -> Self::Output {
-        &self - rhs
+    fn sub(mut self, rhs: &GpuDCRTPolyMatrix) -> Self::Output {
+        self.sub_in_place(rhs);
+        self
     }
 }
 
@@ -962,20 +982,8 @@ impl Sub<&GpuDCRTPolyMatrix> for &GpuDCRTPolyMatrix {
     type Output = GpuDCRTPolyMatrix;
 
     fn sub(self, rhs: &GpuDCRTPolyMatrix) -> Self::Output {
-        debug_assert!(
-            self.nrow == rhs.nrow && self.ncol == rhs.ncol,
-            "Subtraction requires matrices of same dimensions: self({}, {}) != rhs({}, {})",
-            self.nrow,
-            self.ncol,
-            rhs.nrow,
-            rhs.ncol
-        );
-        let out = GpuDCRTPolyMatrix::new_empty(&self.params, self.nrow, self.ncol);
-        if self.nrow == 0 || self.ncol == 0 {
-            return out;
-        }
-        let status = unsafe { gpu_matrix_sub(out.raw, self.raw, rhs.raw) };
-        check_status(status, "gpu_matrix_sub");
+        let mut out = self.clone();
+        out.sub_in_place(rhs);
         out
     }
 }

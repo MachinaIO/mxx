@@ -1503,6 +1503,7 @@ extern "C" void gpu_matrix_destroy(GpuMatrix *mat)
     {
         return;
     }
+
     for (auto *poly : mat->polys)
     {
         gpu_poly_destroy(poly);
@@ -1996,7 +1997,8 @@ extern "C" int gpu_matrix_fill_gadget(
         std::vector<uint32_t> limb_indices;
     };
     std::vector<FillBatch> batches;
-    auto get_batch = [&](int device) -> FillBatch & {
+    auto get_batch = [&](int device) -> FillBatch &
+    {
         for (auto &b : batches)
         {
             if (b.device == device)
@@ -2401,7 +2403,8 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
         std::vector<uint64_t> out_moduli;
     };
     std::vector<DecomposeBatch> batches;
-    auto get_batch = [&](int device) -> DecomposeBatch & {
+    auto get_batch = [&](int device) -> DecomposeBatch &
+    {
         for (auto &b : batches)
         {
             if (b.device == device)
@@ -2652,1402 +2655,1404 @@ using gpu_chacha::DeviceChaChaRng;
 using gpu_chacha::rng_init;
 using gpu_chacha::rng_next_u64;
 
-    __device__ __forceinline__ double uniform_open01(DeviceChaChaRng &rng)
+__device__ __forceinline__ double uniform_open01(DeviceChaChaRng &rng)
+{
+    constexpr double kScale = 1.0 / 9007199254740992.0; // 2^53
+    double u = static_cast<double>(rng_next_u64(rng) >> 11U) * kScale;
+    if (u <= 0.0)
     {
-        constexpr double kScale = 1.0 / 9007199254740992.0; // 2^53
-        double u = static_cast<double>(rng_next_u64(rng) >> 11U) * kScale;
-        if (u <= 0.0)
-        {
-            u = kScale;
-        }
-        else if (u >= 1.0)
-        {
-            u = 1.0 - kScale;
-        }
-        return u;
+        u = kScale;
     }
-
-    __device__ __forceinline__ double sample_standard_normal(DeviceChaChaRng &rng)
+    else if (u >= 1.0)
     {
-        double u1 = uniform_open01(rng);
-        double u2 = uniform_open01(rng);
-        double r = sqrt(-2.0 * log(u1));
-        double theta = kTwoPi * u2;
-        return r * cos(theta);
+        u = 1.0 - kScale;
     }
+    return u;
+}
 
-    __device__ __forceinline__ bool karney_algorithm_h(DeviceChaChaRng &rng)
+__device__ __forceinline__ double sample_standard_normal(DeviceChaChaRng &rng)
+{
+    double u1 = uniform_open01(rng);
+    double u2 = uniform_open01(rng);
+    double r = sqrt(-2.0 * log(u1));
+    double theta = kTwoPi * u2;
+    return r * cos(theta);
+}
+
+__device__ __forceinline__ bool karney_algorithm_h(DeviceChaChaRng &rng)
+{
+    double h_a = uniform_open01(rng);
+    if (!(h_a < 0.5))
     {
-        double h_a = uniform_open01(rng);
-        if (!(h_a < 0.5))
+        return true;
+    }
+    for (;;)
+    {
+        double h_b = uniform_open01(rng);
+        if (!(h_b < h_a))
+        {
+            return false;
+        }
+        h_a = uniform_open01(rng);
+        if (!(h_a < h_b))
         {
             return true;
         }
-        for (;;)
+    }
+}
+
+__device__ __forceinline__ int32_t karney_algorithm_g(DeviceChaChaRng &rng)
+{
+    int32_t n = 0;
+    while (karney_algorithm_h(rng))
+    {
+        ++n;
+        if (n > 1024)
         {
-            double h_b = uniform_open01(rng);
-            if (!(h_b < h_a))
-            {
-                return false;
-            }
-            h_a = uniform_open01(rng);
-            if (!(h_a < h_b))
-            {
-                return true;
-            }
+            break;
         }
     }
+    return n;
+}
 
-    __device__ __forceinline__ int32_t karney_algorithm_g(DeviceChaChaRng &rng)
+__device__ __forceinline__ bool karney_algorithm_p(DeviceChaChaRng &rng, int32_t n)
+{
+    while (n-- && karney_algorithm_h(rng))
     {
-        int32_t n = 0;
-        while (karney_algorithm_h(rng))
-        {
-            ++n;
-            if (n > 1024)
-            {
-                break;
-            }
-        }
-        return n;
     }
+    return n < 0;
+}
 
-    __device__ __forceinline__ bool karney_algorithm_p(DeviceChaChaRng &rng, int32_t n)
+__device__ __forceinline__ bool karney_algorithm_b(DeviceChaChaRng &rng, int32_t k, double x)
+{
+    double y = x;
+    int32_t n = 0;
+    double m = static_cast<double>(2 * k + 2);
+    for (;; ++n)
     {
-        while (n-- && karney_algorithm_h(rng))
+        double z = uniform_open01(rng);
+        if (!(z < y))
         {
+            break;
         }
-        return n < 0;
-    }
-
-    __device__ __forceinline__ bool karney_algorithm_b(DeviceChaChaRng &rng, int32_t k, double x)
-    {
-        double y = x;
-        int32_t n = 0;
-        double m = static_cast<double>(2 * k + 2);
-        for (;; ++n)
+        double r = uniform_open01(rng);
+        if (!(r < (2.0 * static_cast<double>(k) + x) / m))
         {
-            double z = uniform_open01(rng);
-            if (!(z < y))
-            {
-                break;
-            }
-            double r = uniform_open01(rng);
-            if (!(r < (2.0 * static_cast<double>(k) + x) / m))
-            {
-                break;
-            }
-            y = z;
-            if (n > 4096)
-            {
-                break;
-            }
+            break;
         }
-        return (n % 2) == 0;
-    }
-
-    __device__ __forceinline__ int64_t sample_integer_karney(DeviceChaChaRng &rng, double mean, double stddev)
-    {
-        if (!(stddev > 0.0) || !isfinite(mean) || !isfinite(stddev))
+        y = z;
+        if (n > 4096)
         {
-            return static_cast<int64_t>(llround(mean));
-        }
-
-        int64_t ceil_std = static_cast<int64_t>(ceil(stddev));
-        if (ceil_std <= 0)
-        {
-            return static_cast<int64_t>(llround(mean));
-        }
-
-        for (int iter = 0; iter < 1 << 16; ++iter)
-        {
-            int32_t k = karney_algorithm_g(rng);
-            if (!karney_algorithm_p(rng, k * (k - 1)))
-            {
-                continue;
-            }
-
-            int64_t s = (rng_next_u64(rng) & 1ULL) ? 1 : -1;
-            double di0 = stddev * static_cast<double>(k) + static_cast<double>(s) * mean;
-            int64_t i0 = static_cast<int64_t>(ceil(di0));
-            double x0 = (static_cast<double>(i0) - di0) / stddev;
-            int64_t j = static_cast<int64_t>(rng_next_u64(rng) % static_cast<uint64_t>(ceil_std));
-            double x = x0 + static_cast<double>(j) / stddev;
-
-            if (!(x < 1.0) || (x == 0.0 && s < 0 && k == 0))
-            {
-                continue;
-            }
-
-            int32_t h = k + 1;
-            while (h-- > 0 && karney_algorithm_b(rng, k, x))
-            {
-            }
-            if (h >= 0)
-            {
-                continue;
-            }
-
-            return s * (i0 + j);
-        }
-
-        // Fallback in case the rejection loop takes too long.
-        return static_cast<int64_t>(llround(mean + stddev * sample_standard_normal(rng)));
-    }
-
-    __device__ __forceinline__ void get_base_digits_u64(
-        uint64_t value,
-        uint64_t base,
-        uint32_t digits,
-        int64_t *out_digits)
-    {
-        for (uint32_t i = 0; i < digits; ++i)
-        {
-            out_digits[i] = static_cast<int64_t>(value % base);
-            value /= base;
+            break;
         }
     }
+    return (n % 2) == 0;
+}
 
-    __device__ __forceinline__ uint64_t signed_mod_i64(int64_t value, uint64_t modulus)
+__device__ __forceinline__ int64_t sample_integer_karney(DeviceChaChaRng &rng, double mean, double stddev)
+{
+    if (!(stddev > 0.0) || !isfinite(mean) || !isfinite(stddev))
     {
-        if (modulus == 0)
-        {
-            return 0;
-        }
-        if (value >= 0)
-        {
-            return static_cast<uint64_t>(value) % modulus;
-        }
-        uint64_t magnitude = static_cast<uint64_t>(-(value + 1)) + 1;
-        uint64_t rem = magnitude % modulus;
-        return rem == 0 ? 0 : (modulus - rem);
+        return static_cast<int64_t>(llround(mean));
     }
 
-    __device__ __forceinline__ uint64_t sample_uniform_mod(DeviceChaChaRng &rng, uint64_t modulus)
+    int64_t ceil_std = static_cast<int64_t>(ceil(stddev));
+    if (ceil_std <= 0)
     {
-        if (modulus == 0)
-        {
-            return 0;
-        }
-        constexpr uint64_t kU64Max = ~uint64_t{0};
-        const uint64_t threshold = kU64Max - (kU64Max % modulus);
-        for (;;)
-        {
-            uint64_t x = rng_next_u64(rng);
-            if (x < threshold)
-            {
-                return x % modulus;
-            }
-        }
+        return static_cast<int64_t>(llround(mean));
     }
 
-    __device__ __forceinline__ int64_t centered_residue_i64(uint64_t value, uint64_t modulus)
+    for (int iter = 0; iter < 1 << 16; ++iter)
     {
-        if (modulus == 0)
+        int32_t k = karney_algorithm_g(rng);
+        if (!karney_algorithm_p(rng, k * (k - 1)))
         {
-            return 0;
+            continue;
         }
-        uint64_t reduced = value % modulus;
-        uint64_t half = modulus >> 1;
-        if (reduced <= half)
+
+        int64_t s = (rng_next_u64(rng) & 1ULL) ? 1 : -1;
+        double di0 = stddev * static_cast<double>(k) + static_cast<double>(s) * mean;
+        int64_t i0 = static_cast<int64_t>(ceil(di0));
+        double x0 = (static_cast<double>(i0) - di0) / stddev;
+        int64_t j = static_cast<int64_t>(rng_next_u64(rng) % static_cast<uint64_t>(ceil_std));
+        double x = x0 + static_cast<double>(j) / stddev;
+
+        if (!(x < 1.0) || (x == 0.0 && s < 0 && k == 0))
         {
-            return static_cast<int64_t>(reduced);
+            continue;
         }
-        uint64_t neg = modulus - reduced;
-        return -static_cast<int64_t>(neg);
+
+        int32_t h = k + 1;
+        while (h-- > 0 && karney_algorithm_b(rng, k, x))
+        {
+        }
+        if (h >= 0)
+        {
+            continue;
+        }
+
+        return s * (i0 + j);
     }
 
-    __global__ void matrix_sample_distribution_multi_limb_kernel(
-        uint64_t **dst,
-        size_t poly_count,
-        size_t limb_count,
-        size_t n,
-        const uint64_t *moduli,
-        const uint32_t *limb_indices,
-        int dist_type,
-        double sigma,
-        uint64_t seed)
+    // Fallback in case the rejection loop takes too long.
+    return static_cast<int64_t>(llround(mean + stddev * sample_standard_normal(rng)));
+}
+
+__device__ __forceinline__ void get_base_digits_u64(
+    uint64_t value,
+    uint64_t base,
+    uint32_t digits,
+    int64_t *out_digits)
+{
+    for (uint32_t i = 0; i < digits; ++i)
     {
-        size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        size_t total = limb_count * poly_count * n;
-        if (idx >= total)
-        {
-            return;
-        }
+        out_digits[i] = static_cast<int64_t>(value % base);
+        value /= base;
+    }
+}
 
-        const size_t per_limb = poly_count * n;
-        const size_t limb_slot = idx / per_limb;
-        const size_t rem = idx - limb_slot * per_limb;
-        const size_t poly_idx = rem / n;
-        const size_t coeff_idx = rem - poly_idx * n;
-        const size_t ptr_idx = limb_slot * poly_count + poly_idx;
+__device__ __forceinline__ uint64_t signed_mod_i64(int64_t value, uint64_t modulus)
+{
+    if (modulus == 0)
+    {
+        return 0;
+    }
+    if (value >= 0)
+    {
+        return static_cast<uint64_t>(value) % modulus;
+    }
+    uint64_t magnitude = static_cast<uint64_t>(-(value + 1)) + 1;
+    uint64_t rem = magnitude % modulus;
+    return rem == 0 ? 0 : (modulus - rem);
+}
 
-        const uint64_t modulus = moduli[limb_slot];
-        const uint32_t limb_idx = limb_indices[limb_slot];
+__device__ __forceinline__ uint64_t sample_uniform_mod(DeviceChaChaRng &rng, uint64_t modulus)
+{
+    if (modulus == 0)
+    {
+        return 0;
+    }
+    constexpr uint64_t kU64Max = ~uint64_t{0};
+    const uint64_t threshold = kU64Max - (kU64Max % modulus);
+    for (;;)
+    {
+        uint64_t x = rng_next_u64(rng);
+        if (x < threshold)
+        {
+            return x % modulus;
+        }
+    }
+}
 
-        uint64_t sample = 0;
-        if (dist_type == GPU_MATRIX_DIST_UNIFORM)
-        {
-            DeviceChaChaRng rng;
-            rng_init(
-                rng,
-                seed,
-                static_cast<uint64_t>(poly_idx + 1),
-                static_cast<uint64_t>(coeff_idx + 1),
-                static_cast<uint64_t>(limb_idx + 1),
-                0x6f70656e66686531ULL);
-            sample = sample_uniform_mod(rng, modulus);
-        }
-        else if (dist_type == GPU_MATRIX_DIST_GAUSS)
-        {
-            DeviceChaChaRng rng;
-            rng_init(
-                rng,
-                seed,
-                static_cast<uint64_t>(poly_idx + 1),
-                static_cast<uint64_t>(coeff_idx + 1),
-                0,
-                0x6f70656e66686532ULL);
-            int64_t z = sample_integer_karney(rng, 0.0, sigma);
-            sample = signed_mod_i64(z, modulus);
-        }
-        else if (dist_type == GPU_MATRIX_DIST_BIT)
-        {
-            DeviceChaChaRng rng;
-            rng_init(
-                rng,
-                seed,
-                static_cast<uint64_t>(poly_idx + 1),
-                static_cast<uint64_t>(coeff_idx + 1),
-                0,
-                0x6f70656e66686533ULL);
-            sample = (rng_next_u64(rng) & 1ULL) % modulus;
-        }
-        else if (dist_type == GPU_MATRIX_DIST_TERNARY)
-        {
-            DeviceChaChaRng rng;
-            rng_init(
-                rng,
-                seed,
-                static_cast<uint64_t>(poly_idx + 1),
-                static_cast<uint64_t>(coeff_idx + 1),
-                0,
-                0x6f70656e66686534ULL);
-            uint64_t pick = rng_next_u64(rng) % 3ULL;
-            int64_t z = pick == 0 ? 0 : (pick == 1 ? 1 : -1);
-            sample = signed_mod_i64(z, modulus);
-        }
+__device__ __forceinline__ int64_t centered_residue_i64(uint64_t value, uint64_t modulus)
+{
+    if (modulus == 0)
+    {
+        return 0;
+    }
+    uint64_t reduced = value % modulus;
+    uint64_t half = modulus >> 1;
+    if (reduced <= half)
+    {
+        return static_cast<int64_t>(reduced);
+    }
+    uint64_t neg = modulus - reduced;
+    return -static_cast<int64_t>(neg);
+}
 
-        dst[ptr_idx][coeff_idx] = sample;
+__global__ void matrix_sample_distribution_multi_limb_kernel(
+    uint64_t **dst,
+    size_t poly_count,
+    size_t limb_count,
+    size_t n,
+    const uint64_t *moduli,
+    const uint32_t *limb_indices,
+    int dist_type,
+    double sigma,
+    uint64_t seed)
+{
+    size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    size_t total = limb_count * poly_count * n;
+    if (idx >= total)
+    {
+        return;
     }
 
-    __device__ __forceinline__ uint64_t pow_mod_u64(uint64_t base, uint32_t exp, uint64_t modulus)
+    const size_t per_limb = poly_count * n;
+    const size_t limb_slot = idx / per_limb;
+    const size_t rem = idx - limb_slot * per_limb;
+    const size_t poly_idx = rem / n;
+    const size_t coeff_idx = rem - poly_idx * n;
+    const size_t ptr_idx = limb_slot * poly_count + poly_idx;
+
+    const uint64_t modulus = moduli[limb_slot];
+    const uint32_t limb_idx = limb_indices[limb_slot];
+
+    uint64_t sample = 0;
+    if (dist_type == GPU_MATRIX_DIST_UNIFORM)
     {
-        if (modulus == 0)
-        {
-            return 0;
-        }
-        uint64_t result = 1ULL % modulus;
-        uint64_t cur = base % modulus;
-        uint32_t e = exp;
-        while (e > 0)
-        {
-            if (e & 1U)
-            {
-                result = static_cast<uint64_t>((static_cast<unsigned __int128>(result) * cur) % modulus);
-            }
-            e >>= 1U;
-            if (e > 0)
-            {
-                cur = static_cast<uint64_t>((static_cast<unsigned __int128>(cur) * cur) % modulus);
-            }
-        }
-        return result;
-    }
-
-    __global__ void matrix_fill_gadget_multi_limb_kernel(
-        uint64_t **dst,
-        size_t poly_count,
-        size_t limb_count,
-        size_t n,
-        const uint64_t *moduli,
-        const uint32_t *limb_indices,
-        size_t rows,
-        size_t cols,
-        size_t log_base_q,
-        uint32_t digits_per_tower,
-        uint32_t base_bits)
-    {
-        size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        size_t total = limb_count * poly_count * n;
-        if (idx >= total)
-        {
-            return;
-        }
-
-        const size_t per_limb = poly_count * n;
-        const size_t limb_slot = idx / per_limb;
-        const size_t rem = idx - limb_slot * per_limb;
-        const size_t poly_idx = rem / n;
-        const size_t coeff_idx = rem - poly_idx * n;
-        const size_t ptr_idx = limb_slot * poly_count + poly_idx;
-
-        const uint64_t modulus = moduli[limb_slot];
-        const uint32_t limb_idx = limb_indices[limb_slot];
-
-        uint64_t value = 0;
-        if (coeff_idx == 0 && rows > 0 && cols > 0 && log_base_q > 0)
-        {
-            size_t row = poly_idx / cols;
-            size_t col = poly_idx - row * cols;
-            size_t block_start = row * log_base_q;
-            if (col >= block_start && col < block_start + log_base_q)
-            {
-                size_t local = col - block_start;
-                uint32_t tower = static_cast<uint32_t>(local / static_cast<size_t>(digits_per_tower));
-                uint32_t digit = static_cast<uint32_t>(local % static_cast<size_t>(digits_per_tower));
-                if (tower == limb_idx)
-                {
-                    uint64_t base = uint64_t{1} << base_bits;
-                    value = pow_mod_u64(base, digit, modulus);
-                }
-            }
-        }
-        dst[ptr_idx][coeff_idx] = value;
-    }
-
-    __global__ void matrix_sample_p1_full_kernel(
-        const uint64_t **a_entries,
-        const uint64_t **b_entries,
-        const uint64_t **d_entries,
-        const uint64_t **tp2_entries,
-        uint64_t **out_entries,
-        size_t d,
-        size_t cols,
-        size_t n,
-        size_t sample_start,
-        size_t sample_count,
-        double *cov_workspace,
-        double *mean_workspace,
-        double *col_workspace,
-        int64_t *sampled_workspace,
-        uint64_t modulus,
-        double sigma,
-        double s,
-        double dgg_stddev,
-        uint32_t limb_idx,
-        uint64_t seed)
-    {
-        const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        if (idx >= sample_count)
-        {
-            return;
-        }
-
-        const size_t m = d * 2;
-        if (m == 0)
-        {
-            return;
-        }
-
-        const size_t sample_idx = sample_start + idx;
-        const size_t col_idx = sample_idx / n;
-        const size_t coeff_idx = sample_idx - col_idx * n;
-        const size_t cov_stride = m * m;
-        const size_t vec_stride = m;
-        double *cov = cov_workspace + idx * cov_stride;
-        double *mean = mean_workspace + idx * vec_stride;
-        double *col_buf = col_workspace + idx * vec_stride;
-        int64_t *sampled = sampled_workspace + idx * vec_stride;
-
         DeviceChaChaRng rng;
         rng_init(
             rng,
             seed,
-            static_cast<uint64_t>(col_idx + 1),
-            static_cast<uint64_t>(coeff_idx + 1),
-            static_cast<uint64_t>(limb_idx + 1),
-            0x7065727475726231ULL);
-
-        const double sigma2 = sigma * sigma;
-        const double s2 = s * s;
-        const double denom = s2 - sigma2;
-        if (!(denom > 0.0))
-        {
-            return;
-        }
-        const double c_scale = -sigma2 / denom;
-        const double fallback_var = dgg_stddev * dgg_stddev;
-        const double eps = 1e-9;
-
-        for (size_t i = 0; i < d; ++i)
-        {
-            for (size_t j = 0; j < d; ++j)
-            {
-                const size_t ij = matrix_index(i, j, d);
-                const size_t ji = matrix_index(j, i, d);
-                const double a_ij = static_cast<double>(centered_residue_i64(a_entries[ij][coeff_idx], modulus));
-                const double d_ij = static_cast<double>(centered_residue_i64(d_entries[ij][coeff_idx], modulus));
-                const double b_ij = static_cast<double>(centered_residue_i64(b_entries[ij][coeff_idx], modulus));
-                const double b_ji = static_cast<double>(centered_residue_i64(b_entries[ji][coeff_idx], modulus));
-
-                const double af = -sigma2 * a_ij + (i == j ? s2 : 0.0);
-                const double df = -sigma2 * d_ij + (i == j ? s2 : 0.0);
-                const double bf = -sigma2 * b_ij;
-                const double bt = -sigma2 * b_ji;
-
-                cov[matrix_index(i, j, m)] = af;
-                cov[matrix_index(i + d, j + d, m)] = df;
-                cov[matrix_index(i, j + d, m)] = bf;
-                cov[matrix_index(i + d, j, m)] = bt;
-            }
-        }
-
-        for (size_t row = 0; row < m; ++row)
-        {
-            const size_t tp_idx = matrix_index(row, col_idx, cols);
-            const double c_centered = static_cast<double>(centered_residue_i64(tp2_entries[tp_idx][coeff_idx], modulus));
-            mean[row] = c_scale * c_centered;
-        }
-
-        for (int t = static_cast<int>(m) - 1; t >= 0; --t)
-        {
-            const size_t tt = static_cast<size_t>(t);
-            double var = cov[matrix_index(tt, tt, m)];
-            if (!(var > eps))
-            {
-                var = fallback_var;
-            }
-            const double mu = mean[tt];
-            const int64_t z = sample_integer_karney(rng, mu, sqrt(var));
-            sampled[tt] = z;
-
-            if (t == 0)
-            {
-                break;
-            }
-
-            const double delta = static_cast<double>(z) - mu;
-            for (int i = 0; i < t; ++i)
-            {
-                col_buf[static_cast<size_t>(i)] =
-                    cov[matrix_index(static_cast<size_t>(i), tt, m)];
-            }
-
-            for (int i = 0; i < t; ++i)
-            {
-                mean[static_cast<size_t>(i)] +=
-                    (col_buf[static_cast<size_t>(i)] / var) * delta;
-            }
-
-            for (int i = 0; i < t; ++i)
-            {
-                for (int j = 0; j <= i; ++j)
-                {
-                    double updated = cov[matrix_index(static_cast<size_t>(i), static_cast<size_t>(j), m)] -
-                                     (col_buf[static_cast<size_t>(i)] * col_buf[static_cast<size_t>(j)] / var);
-                    cov[matrix_index(static_cast<size_t>(i), static_cast<size_t>(j), m)] = updated;
-                    cov[matrix_index(static_cast<size_t>(j), static_cast<size_t>(i), m)] = updated;
-                }
-            }
-        }
-
-        for (size_t row = 0; row < m; ++row)
-        {
-            const size_t out_idx = matrix_index(row, col_idx, cols);
-            out_entries[out_idx][coeff_idx] = signed_mod_i64(sampled[row], modulus);
-        }
-    }
-
-    __global__ void matrix_gauss_samp_gq_arb_base_multi_kernel(
-        const uint64_t **src,
-        uint64_t **dst,
-        size_t poly_count,
-        size_t n,
-        size_t job_count,
-        const uint64_t *tower_moduli,
-        uint32_t base_bits,
-        uint32_t digits_per_tower,
-        const uint32_t *digit_indices,
-        double c,
-        const uint32_t *tower_indices,
-        uint64_t seed,
-        const uint64_t *out_moduli)
-    {
-        size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        size_t total = job_count * poly_count * n;
-        if (idx >= total)
-        {
-            return;
-        }
-        if (digits_per_tower == 0 || digits_per_tower > kGaussMaxDigits || base_bits == 0 || base_bits >= 63)
-        {
-            return;
-        }
-
-        const size_t per_job = poly_count * n;
-        const size_t job_idx = idx / per_job;
-        const size_t rem = idx - job_idx * per_job;
-        const size_t poly_idx = rem / n;
-        const size_t coeff_idx = rem - poly_idx * n;
-        const size_t ptr_idx = job_idx * poly_count + poly_idx;
-
-        const uint64_t tower_modulus = tower_moduli[job_idx];
-        const uint64_t out_modulus = out_moduli[job_idx];
-        const uint32_t digit_idx = digit_indices[job_idx];
-        const uint32_t tower_idx = tower_indices[job_idx];
-
-        uint64_t value = src[ptr_idx][coeff_idx];
-        if (tower_modulus != 0)
-        {
-            value %= tower_modulus;
-        }
-
-        uint64_t base = uint64_t{1} << base_bits;
-        double base_f = static_cast<double>(base);
-        double sigma = c / (base_f + 1.0);
-
-        int64_t m_digits[kGaussMaxDigits];
-        int64_t v_digits[kGaussMaxDigits];
-        double l[kGaussMaxDigits];
-        double h[kGaussMaxDigits];
-        double c_vec[kGaussMaxDigits];
-        double p[kGaussMaxDigits];
-        double a[kGaussMaxDigits];
-        double zf[kGaussMaxDigits];
-        int64_t z[kGaussMaxDigits];
-
-        get_base_digits_u64(tower_modulus, base, digits_per_tower, m_digits);
-        get_base_digits_u64(value, base, digits_per_tower, v_digits);
-
-        const double kf = static_cast<double>(digits_per_tower);
-        l[0] = sqrt(base_f * (1.0 + 1.0 / kf) + 1.0);
-        for (uint32_t i = 1; i < digits_per_tower; ++i)
-        {
-            l[i] = sqrt(base_f * (1.0 + 1.0 / (kf - static_cast<double>(i))));
-        }
-
-        h[0] = 0.0;
-        for (uint32_t i = 1; i < digits_per_tower; ++i)
-        {
-            h[i] = sqrt(base_f * (1.0 - 1.0 / (kf - static_cast<double>(i - 1))));
-        }
-
-        c_vec[0] = static_cast<double>(m_digits[0]) / base_f;
-        for (uint32_t i = 1; i < digits_per_tower; ++i)
-        {
-            c_vec[i] = (c_vec[i - 1] + static_cast<double>(m_digits[i])) / base_f;
-        }
-
-        DeviceChaChaRng rng;
-        rng_init(
-            rng,
-            seed,
-            static_cast<uint64_t>(tower_idx + 1),
             static_cast<uint64_t>(poly_idx + 1),
             static_cast<uint64_t>(coeff_idx + 1),
-            0x6761646765746731ULL);
-
-        for (uint32_t i = 0; i < digits_per_tower; ++i)
-        {
-            zf[i] = sigma * sample_standard_normal(rng);
-        }
-        for (uint32_t i = 0; i + 1 < digits_per_tower; ++i)
-        {
-            p[i] = l[i] * zf[i] + h[i + 1] * zf[i + 1];
-        }
-        p[digits_per_tower - 1] = h[digits_per_tower - 1] * zf[digits_per_tower - 1];
-
-        a[0] = (static_cast<double>(v_digits[0]) - p[0]) / base_f;
-        for (uint32_t t = 1; t < digits_per_tower; ++t)
-        {
-            a[t] = (a[t - 1] + static_cast<double>(v_digits[t]) - p[t]) / base_f;
-        }
-
-        const uint32_t last = digits_per_tower - 1;
-        z[last] = sample_integer_karney(rng, -a[last] / c_vec[last], sigma / c_vec[last]);
-        for (uint32_t i = 0; i < digits_per_tower; ++i)
-        {
-            a[i] += static_cast<double>(z[last]) * c_vec[i];
-        }
-        for (uint32_t i = 0; i < last; ++i)
-        {
-            z[i] = sample_integer_karney(rng, -a[i], sigma);
-        }
-
-        int64_t out_digit = 0;
-        if (digits_per_tower == 1)
-        {
-            out_digit = static_cast<int64_t>(base) * z[0] + m_digits[0] * z[0] + v_digits[0];
-        }
-        else if (digit_idx == 0)
-        {
-            out_digit = static_cast<int64_t>(base) * z[0] + m_digits[0] * z[last] + v_digits[0];
-        }
-        else if (digit_idx < last)
-        {
-            out_digit = static_cast<int64_t>(base) * z[digit_idx] - z[digit_idx - 1] +
-                        m_digits[digit_idx] * z[last] + v_digits[digit_idx];
-        }
-        else
-        {
-            out_digit = m_digits[last] * z[last] - z[last - 1] + v_digits[last];
-        }
-
-        dst[ptr_idx][coeff_idx] = signed_mod_i64(out_digit, out_modulus);
+            static_cast<uint64_t>(limb_idx + 1),
+            0x6f70656e66686531ULL);
+        sample = sample_uniform_mod(rng, modulus);
+    }
+    else if (dist_type == GPU_MATRIX_DIST_GAUSS)
+    {
+        DeviceChaChaRng rng;
+        rng_init(
+            rng,
+            seed,
+            static_cast<uint64_t>(poly_idx + 1),
+            static_cast<uint64_t>(coeff_idx + 1),
+            0,
+            0x6f70656e66686532ULL);
+        int64_t z = sample_integer_karney(rng, 0.0, sigma);
+        sample = signed_mod_i64(z, modulus);
+    }
+    else if (dist_type == GPU_MATRIX_DIST_BIT)
+    {
+        DeviceChaChaRng rng;
+        rng_init(
+            rng,
+            seed,
+            static_cast<uint64_t>(poly_idx + 1),
+            static_cast<uint64_t>(coeff_idx + 1),
+            0,
+            0x6f70656e66686533ULL);
+        sample = (rng_next_u64(rng) & 1ULL) % modulus;
+    }
+    else if (dist_type == GPU_MATRIX_DIST_TERNARY)
+    {
+        DeviceChaChaRng rng;
+        rng_init(
+            rng,
+            seed,
+            static_cast<uint64_t>(poly_idx + 1),
+            static_cast<uint64_t>(coeff_idx + 1),
+            0,
+            0x6f70656e66686534ULL);
+        uint64_t pick = rng_next_u64(rng) % 3ULL;
+        int64_t z = pick == 0 ? 0 : (pick == 1 ? 1 : -1);
+        sample = signed_mod_i64(z, modulus);
     }
 
-    int launch_gauss_samp_gq_arb_base_multi_kernel(
-        const std::vector<const uint64_t *> &src_ptrs,
-        const std::vector<uint64_t *> &dst_ptrs,
-        size_t poly_count,
-        size_t n,
-        const std::vector<uint64_t> &tower_moduli,
-        uint32_t base_bits,
-        uint32_t digits_per_tower,
-        const std::vector<uint32_t> &digit_indices,
-        double c,
-        const std::vector<uint32_t> &tower_indices,
-        uint64_t seed,
-        const std::vector<uint64_t> &out_moduli,
-        int device,
-        cudaStream_t stream)
+    dst[ptr_idx][coeff_idx] = sample;
+}
+
+__device__ __forceinline__ uint64_t pow_mod_u64(uint64_t base, uint32_t exp, uint64_t modulus)
+{
+    if (modulus == 0)
     {
-        const size_t job_count = tower_moduli.size();
-        if (job_count == 0 || poly_count == 0 || n == 0)
-        {
-            return 0;
-        }
-        if (digit_indices.size() != job_count || tower_indices.size() != job_count ||
-            out_moduli.size() != job_count)
-        {
-            return set_error("unexpected job parameter counts in matrix_gauss_samp_gq_arb_base_multi_kernel");
-        }
-        const size_t ptr_count = job_count * poly_count;
-        if (src_ptrs.size() != ptr_count || dst_ptrs.size() != ptr_count)
-        {
-            return set_error("unexpected pointer counts in matrix_gauss_samp_gq_arb_base_multi_kernel");
-        }
-
-        cudaError_t err = cudaSetDevice(device);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-
-        const uint64_t **d_src = nullptr;
-        uint64_t **d_dst = nullptr;
-        uint64_t *d_tower_moduli = nullptr;
-        uint32_t *d_digit_indices = nullptr;
-        uint32_t *d_tower_indices = nullptr;
-        uint64_t *d_out_moduli = nullptr;
-
-        const size_t ptr_bytes = ptr_count * sizeof(uint64_t *);
-        const size_t u64_bytes = job_count * sizeof(uint64_t);
-        const size_t u32_bytes = job_count * sizeof(uint32_t);
-
-        err = cudaMallocAsync(&d_src, ptr_bytes, stream);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        err = cudaMallocAsync(&d_dst, ptr_bytes, stream);
-        if (err != cudaSuccess)
-        {
-            cudaFreeAsync(d_src, stream);
-            return set_error(err);
-        }
-        err = cudaMallocAsync(&d_tower_moduli, u64_bytes, stream);
-        if (err != cudaSuccess)
-        {
-            cudaFreeAsync(d_src, stream);
-            cudaFreeAsync(d_dst, stream);
-            return set_error(err);
-        }
-        err = cudaMallocAsync(&d_digit_indices, u32_bytes, stream);
-        if (err != cudaSuccess)
-        {
-            cudaFreeAsync(d_src, stream);
-            cudaFreeAsync(d_dst, stream);
-            cudaFreeAsync(d_tower_moduli, stream);
-            return set_error(err);
-        }
-        err = cudaMallocAsync(&d_tower_indices, u32_bytes, stream);
-        if (err != cudaSuccess)
-        {
-            cudaFreeAsync(d_src, stream);
-            cudaFreeAsync(d_dst, stream);
-            cudaFreeAsync(d_tower_moduli, stream);
-            cudaFreeAsync(d_digit_indices, stream);
-            return set_error(err);
-        }
-        err = cudaMallocAsync(&d_out_moduli, u64_bytes, stream);
-        if (err != cudaSuccess)
-        {
-            cudaFreeAsync(d_src, stream);
-            cudaFreeAsync(d_dst, stream);
-            cudaFreeAsync(d_tower_moduli, stream);
-            cudaFreeAsync(d_digit_indices, stream);
-            cudaFreeAsync(d_tower_indices, stream);
-            return set_error(err);
-        }
-
-        err = cudaMemcpyAsync(d_src, src_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cudaFreeAsync(d_src, stream);
-            cudaFreeAsync(d_dst, stream);
-            cudaFreeAsync(d_tower_moduli, stream);
-            cudaFreeAsync(d_digit_indices, stream);
-            cudaFreeAsync(d_tower_indices, stream);
-            cudaFreeAsync(d_out_moduli, stream);
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cudaFreeAsync(d_src, stream);
-            cudaFreeAsync(d_dst, stream);
-            cudaFreeAsync(d_tower_moduli, stream);
-            cudaFreeAsync(d_digit_indices, stream);
-            cudaFreeAsync(d_tower_indices, stream);
-            cudaFreeAsync(d_out_moduli, stream);
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_tower_moduli, tower_moduli.data(), u64_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cudaFreeAsync(d_src, stream);
-            cudaFreeAsync(d_dst, stream);
-            cudaFreeAsync(d_tower_moduli, stream);
-            cudaFreeAsync(d_digit_indices, stream);
-            cudaFreeAsync(d_tower_indices, stream);
-            cudaFreeAsync(d_out_moduli, stream);
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_digit_indices, digit_indices.data(), u32_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cudaFreeAsync(d_src, stream);
-            cudaFreeAsync(d_dst, stream);
-            cudaFreeAsync(d_tower_moduli, stream);
-            cudaFreeAsync(d_digit_indices, stream);
-            cudaFreeAsync(d_tower_indices, stream);
-            cudaFreeAsync(d_out_moduli, stream);
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_tower_indices, tower_indices.data(), u32_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cudaFreeAsync(d_src, stream);
-            cudaFreeAsync(d_dst, stream);
-            cudaFreeAsync(d_tower_moduli, stream);
-            cudaFreeAsync(d_digit_indices, stream);
-            cudaFreeAsync(d_tower_indices, stream);
-            cudaFreeAsync(d_out_moduli, stream);
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_out_moduli, out_moduli.data(), u64_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cudaFreeAsync(d_src, stream);
-            cudaFreeAsync(d_dst, stream);
-            cudaFreeAsync(d_tower_moduli, stream);
-            cudaFreeAsync(d_digit_indices, stream);
-            cudaFreeAsync(d_tower_indices, stream);
-            cudaFreeAsync(d_out_moduli, stream);
-            return set_error(err);
-        }
-
-        const int threads = 256;
-        const size_t total = ptr_count * n;
-        const int blocks = static_cast<int>((total + threads - 1) / threads);
-        matrix_gauss_samp_gq_arb_base_multi_kernel<<<blocks, threads, 0, stream>>>(
-            d_src,
-            d_dst,
-            poly_count,
-            n,
-            job_count,
-            d_tower_moduli,
-            base_bits,
-            digits_per_tower,
-            d_digit_indices,
-            c,
-            d_tower_indices,
-            seed,
-            d_out_moduli);
-        err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            cudaFreeAsync(d_src, stream);
-            cudaFreeAsync(d_dst, stream);
-            cudaFreeAsync(d_tower_moduli, stream);
-            cudaFreeAsync(d_digit_indices, stream);
-            cudaFreeAsync(d_tower_indices, stream);
-            cudaFreeAsync(d_out_moduli, stream);
-            return set_error(err);
-        }
-
-        err = cudaStreamSynchronize(stream);
-        if (err != cudaSuccess)
-        {
-            cudaFreeAsync(d_src, stream);
-            cudaFreeAsync(d_dst, stream);
-            cudaFreeAsync(d_tower_moduli, stream);
-            cudaFreeAsync(d_digit_indices, stream);
-            cudaFreeAsync(d_tower_indices, stream);
-            cudaFreeAsync(d_out_moduli, stream);
-            return set_error(err);
-        }
-
-        err = cudaFreeAsync(d_src, stream);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        err = cudaFreeAsync(d_dst, stream);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        err = cudaFreeAsync(d_tower_moduli, stream);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        err = cudaFreeAsync(d_digit_indices, stream);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        err = cudaFreeAsync(d_tower_indices, stream);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        err = cudaFreeAsync(d_out_moduli, stream);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
         return 0;
     }
-
-    int launch_sample_distribution_multi_limb_kernel(
-        const std::vector<uint64_t *> &dst_ptrs,
-        size_t poly_count,
-        size_t n,
-        const std::vector<uint64_t> &moduli,
-        const std::vector<uint32_t> &limb_indices,
-        int dist_type,
-        double sigma,
-        uint64_t seed,
-        cudaStream_t stream)
+    uint64_t result = 1ULL % modulus;
+    uint64_t cur = base % modulus;
+    uint32_t e = exp;
+    while (e > 0)
     {
-        const size_t limb_count = moduli.size();
-        if (limb_count == 0 || poly_count == 0 || n == 0)
+        if (e & 1U)
         {
-            return 0;
+            result = static_cast<uint64_t>((static_cast<unsigned __int128>(result) * cur) % modulus);
         }
-        if (limb_indices.size() != limb_count)
+        e >>= 1U;
+        if (e > 0)
         {
-            return set_error("unexpected limb parameter counts in matrix_sample_distribution_multi_limb_kernel");
+            cur = static_cast<uint64_t>((static_cast<unsigned __int128>(cur) * cur) % modulus);
         }
-        const size_t ptr_count = limb_count * poly_count;
-        if (dst_ptrs.size() != ptr_count)
+    }
+    return result;
+}
+
+__global__ void matrix_fill_gadget_multi_limb_kernel(
+    uint64_t **dst,
+    size_t poly_count,
+    size_t limb_count,
+    size_t n,
+    const uint64_t *moduli,
+    const uint32_t *limb_indices,
+    size_t rows,
+    size_t cols,
+    size_t log_base_q,
+    uint32_t digits_per_tower,
+    uint32_t base_bits)
+{
+    size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    size_t total = limb_count * poly_count * n;
+    if (idx >= total)
+    {
+        return;
+    }
+
+    const size_t per_limb = poly_count * n;
+    const size_t limb_slot = idx / per_limb;
+    const size_t rem = idx - limb_slot * per_limb;
+    const size_t poly_idx = rem / n;
+    const size_t coeff_idx = rem - poly_idx * n;
+    const size_t ptr_idx = limb_slot * poly_count + poly_idx;
+
+    const uint64_t modulus = moduli[limb_slot];
+    const uint32_t limb_idx = limb_indices[limb_slot];
+
+    uint64_t value = 0;
+    if (coeff_idx == 0 && rows > 0 && cols > 0 && log_base_q > 0)
+    {
+        size_t row = poly_idx / cols;
+        size_t col = poly_idx - row * cols;
+        size_t block_start = row * log_base_q;
+        if (col >= block_start && col < block_start + log_base_q)
         {
-            return set_error("unexpected pointer counts in matrix_sample_distribution_multi_limb_kernel");
+            size_t local = col - block_start;
+            uint32_t tower = static_cast<uint32_t>(local / static_cast<size_t>(digits_per_tower));
+            uint32_t digit = static_cast<uint32_t>(local % static_cast<size_t>(digits_per_tower));
+            if (tower == limb_idx)
+            {
+                uint64_t base = uint64_t{1} << base_bits;
+                value = pow_mod_u64(base, digit, modulus);
+            }
+        }
+    }
+    dst[ptr_idx][coeff_idx] = value;
+}
+
+__global__ void matrix_sample_p1_full_kernel(
+    const uint64_t **a_entries,
+    const uint64_t **b_entries,
+    const uint64_t **d_entries,
+    const uint64_t **tp2_entries,
+    uint64_t **out_entries,
+    size_t d,
+    size_t cols,
+    size_t n,
+    size_t sample_start,
+    size_t sample_count,
+    double *cov_workspace,
+    double *mean_workspace,
+    double *col_workspace,
+    int64_t *sampled_workspace,
+    uint64_t modulus,
+    double sigma,
+    double s,
+    double dgg_stddev,
+    uint32_t limb_idx,
+    uint64_t seed)
+{
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= sample_count)
+    {
+        return;
+    }
+
+    const size_t m = d * 2;
+    if (m == 0)
+    {
+        return;
+    }
+
+    const size_t sample_idx = sample_start + idx;
+    const size_t col_idx = sample_idx / n;
+    const size_t coeff_idx = sample_idx - col_idx * n;
+    const size_t cov_stride = m * m;
+    const size_t vec_stride = m;
+    double *cov = cov_workspace + idx * cov_stride;
+    double *mean = mean_workspace + idx * vec_stride;
+    double *col_buf = col_workspace + idx * vec_stride;
+    int64_t *sampled = sampled_workspace + idx * vec_stride;
+
+    DeviceChaChaRng rng;
+    rng_init(
+        rng,
+        seed,
+        static_cast<uint64_t>(col_idx + 1),
+        static_cast<uint64_t>(coeff_idx + 1),
+        static_cast<uint64_t>(limb_idx + 1),
+        0x7065727475726231ULL);
+
+    const double sigma2 = sigma * sigma;
+    const double s2 = s * s;
+    const double denom = s2 - sigma2;
+    if (!(denom > 0.0))
+    {
+        return;
+    }
+    const double c_scale = -sigma2 / denom;
+    const double fallback_var = dgg_stddev * dgg_stddev;
+    const double eps = 1e-9;
+
+    for (size_t i = 0; i < d; ++i)
+    {
+        for (size_t j = 0; j < d; ++j)
+        {
+            const size_t ij = matrix_index(i, j, d);
+            const size_t ji = matrix_index(j, i, d);
+            const double a_ij = static_cast<double>(centered_residue_i64(a_entries[ij][coeff_idx], modulus));
+            const double d_ij = static_cast<double>(centered_residue_i64(d_entries[ij][coeff_idx], modulus));
+            const double b_ij = static_cast<double>(centered_residue_i64(b_entries[ij][coeff_idx], modulus));
+            const double b_ji = static_cast<double>(centered_residue_i64(b_entries[ji][coeff_idx], modulus));
+
+            const double af = -sigma2 * a_ij + (i == j ? s2 : 0.0);
+            const double df = -sigma2 * d_ij + (i == j ? s2 : 0.0);
+            const double bf = -sigma2 * b_ij;
+            const double bt = -sigma2 * b_ji;
+
+            cov[matrix_index(i, j, m)] = af;
+            cov[matrix_index(i + d, j + d, m)] = df;
+            cov[matrix_index(i, j + d, m)] = bf;
+            cov[matrix_index(i + d, j, m)] = bt;
+        }
+    }
+
+    for (size_t row = 0; row < m; ++row)
+    {
+        const size_t tp_idx = matrix_index(row, col_idx, cols);
+        const double c_centered = static_cast<double>(centered_residue_i64(tp2_entries[tp_idx][coeff_idx], modulus));
+        mean[row] = c_scale * c_centered;
+    }
+
+    for (int t = static_cast<int>(m) - 1; t >= 0; --t)
+    {
+        const size_t tt = static_cast<size_t>(t);
+        double var = cov[matrix_index(tt, tt, m)];
+        if (!(var > eps))
+        {
+            var = fallback_var;
+        }
+        const double mu = mean[tt];
+        const int64_t z = sample_integer_karney(rng, mu, sqrt(var));
+        sampled[tt] = z;
+
+        if (t == 0)
+        {
+            break;
         }
 
-        uint64_t **d_dst = nullptr;
-        uint64_t *d_moduli = nullptr;
-        uint32_t *d_limb_indices = nullptr;
-        const size_t ptr_bytes = ptr_count * sizeof(uint64_t *);
-        const size_t u64_bytes = limb_count * sizeof(uint64_t);
-        const size_t u32_bytes = limb_count * sizeof(uint32_t);
-
-        cudaError_t err = cudaMalloc(&d_dst, ptr_bytes);
-        if (err != cudaSuccess)
+        const double delta = static_cast<double>(z) - mu;
+        for (int i = 0; i < t; ++i)
         {
-            return set_error(err);
-        }
-        err = cudaMalloc(&d_moduli, u64_bytes);
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_dst);
-            return set_error(err);
-        }
-        err = cudaMalloc(&d_limb_indices, u32_bytes);
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_dst);
-            cudaFree(d_moduli);
-            return set_error(err);
+            col_buf[static_cast<size_t>(i)] =
+                cov[matrix_index(static_cast<size_t>(i), tt, m)];
         }
 
-        err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
+        for (int i = 0; i < t; ++i)
         {
-            cudaFree(d_dst);
-            cudaFree(d_moduli);
-            cudaFree(d_limb_indices);
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_moduli, moduli.data(), u64_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_dst);
-            cudaFree(d_moduli);
-            cudaFree(d_limb_indices);
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_limb_indices, limb_indices.data(), u32_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_dst);
-            cudaFree(d_moduli);
-            cudaFree(d_limb_indices);
-            return set_error(err);
+            mean[static_cast<size_t>(i)] +=
+                (col_buf[static_cast<size_t>(i)] / var) * delta;
         }
 
-        const int threads = 256;
-        const size_t total = ptr_count * n;
-        const int blocks = static_cast<int>((total + threads - 1) / threads);
-        matrix_sample_distribution_multi_limb_kernel<<<blocks, threads, 0, stream>>>(
-            d_dst,
-            poly_count,
-            limb_count,
+        for (int i = 0; i < t; ++i)
+        {
+            for (int j = 0; j <= i; ++j)
+            {
+                double updated = cov[matrix_index(static_cast<size_t>(i), static_cast<size_t>(j), m)] -
+                                 (col_buf[static_cast<size_t>(i)] * col_buf[static_cast<size_t>(j)] / var);
+                cov[matrix_index(static_cast<size_t>(i), static_cast<size_t>(j), m)] = updated;
+                cov[matrix_index(static_cast<size_t>(j), static_cast<size_t>(i), m)] = updated;
+            }
+        }
+    }
+
+    for (size_t row = 0; row < m; ++row)
+    {
+        const size_t out_idx = matrix_index(row, col_idx, cols);
+        out_entries[out_idx][coeff_idx] = signed_mod_i64(sampled[row], modulus);
+    }
+}
+
+__global__ void matrix_gauss_samp_gq_arb_base_multi_kernel(
+    const uint64_t **src,
+    uint64_t **dst,
+    size_t poly_count,
+    size_t n,
+    size_t job_count,
+    const uint64_t *tower_moduli,
+    uint32_t base_bits,
+    uint32_t digits_per_tower,
+    const uint32_t *digit_indices,
+    double c,
+    const uint32_t *tower_indices,
+    uint64_t seed,
+    const uint64_t *out_moduli)
+{
+    size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    size_t total = job_count * poly_count * n;
+    if (idx >= total)
+    {
+        return;
+    }
+    if (digits_per_tower == 0 || digits_per_tower > kGaussMaxDigits || base_bits == 0 || base_bits >= 63)
+    {
+        return;
+    }
+
+    const size_t per_job = poly_count * n;
+    const size_t job_idx = idx / per_job;
+    const size_t rem = idx - job_idx * per_job;
+    const size_t poly_idx = rem / n;
+    const size_t coeff_idx = rem - poly_idx * n;
+    const size_t ptr_idx = job_idx * poly_count + poly_idx;
+
+    const uint64_t tower_modulus = tower_moduli[job_idx];
+    const uint64_t out_modulus = out_moduli[job_idx];
+    const uint32_t digit_idx = digit_indices[job_idx];
+    const uint32_t tower_idx = tower_indices[job_idx];
+
+    uint64_t value = src[ptr_idx][coeff_idx];
+    if (tower_modulus != 0)
+    {
+        value %= tower_modulus;
+    }
+
+    uint64_t base = uint64_t{1} << base_bits;
+    double base_f = static_cast<double>(base);
+    double sigma = c / (base_f + 1.0);
+
+    int64_t m_digits[kGaussMaxDigits];
+    int64_t v_digits[kGaussMaxDigits];
+    double l[kGaussMaxDigits];
+    double h[kGaussMaxDigits];
+    double c_vec[kGaussMaxDigits];
+    double p[kGaussMaxDigits];
+    double a[kGaussMaxDigits];
+    double zf[kGaussMaxDigits];
+    int64_t z[kGaussMaxDigits];
+
+    get_base_digits_u64(tower_modulus, base, digits_per_tower, m_digits);
+    get_base_digits_u64(value, base, digits_per_tower, v_digits);
+
+    const double kf = static_cast<double>(digits_per_tower);
+    l[0] = sqrt(base_f * (1.0 + 1.0 / kf) + 1.0);
+    for (uint32_t i = 1; i < digits_per_tower; ++i)
+    {
+        l[i] = sqrt(base_f * (1.0 + 1.0 / (kf - static_cast<double>(i))));
+    }
+
+    h[0] = 0.0;
+    for (uint32_t i = 1; i < digits_per_tower; ++i)
+    {
+        h[i] = sqrt(base_f * (1.0 - 1.0 / (kf - static_cast<double>(i - 1))));
+    }
+
+    c_vec[0] = static_cast<double>(m_digits[0]) / base_f;
+    for (uint32_t i = 1; i < digits_per_tower; ++i)
+    {
+        c_vec[i] = (c_vec[i - 1] + static_cast<double>(m_digits[i])) / base_f;
+    }
+
+    DeviceChaChaRng rng;
+    rng_init(
+        rng,
+        seed,
+        static_cast<uint64_t>(tower_idx + 1),
+        static_cast<uint64_t>(poly_idx + 1),
+        static_cast<uint64_t>(coeff_idx + 1),
+        0x6761646765746731ULL);
+
+    for (uint32_t i = 0; i < digits_per_tower; ++i)
+    {
+        zf[i] = sigma * sample_standard_normal(rng);
+    }
+    for (uint32_t i = 0; i + 1 < digits_per_tower; ++i)
+    {
+        p[i] = l[i] * zf[i] + h[i + 1] * zf[i + 1];
+    }
+    p[digits_per_tower - 1] = h[digits_per_tower - 1] * zf[digits_per_tower - 1];
+
+    a[0] = (static_cast<double>(v_digits[0]) - p[0]) / base_f;
+    for (uint32_t t = 1; t < digits_per_tower; ++t)
+    {
+        a[t] = (a[t - 1] + static_cast<double>(v_digits[t]) - p[t]) / base_f;
+    }
+
+    const uint32_t last = digits_per_tower - 1;
+    z[last] = sample_integer_karney(rng, -a[last] / c_vec[last], sigma / c_vec[last]);
+    for (uint32_t i = 0; i < digits_per_tower; ++i)
+    {
+        a[i] += static_cast<double>(z[last]) * c_vec[i];
+    }
+    for (uint32_t i = 0; i < last; ++i)
+    {
+        z[i] = sample_integer_karney(rng, -a[i], sigma);
+    }
+
+    int64_t out_digit = 0;
+    if (digits_per_tower == 1)
+    {
+        out_digit = static_cast<int64_t>(base) * z[0] + m_digits[0] * z[0] + v_digits[0];
+    }
+    else if (digit_idx == 0)
+    {
+        out_digit = static_cast<int64_t>(base) * z[0] + m_digits[0] * z[last] + v_digits[0];
+    }
+    else if (digit_idx < last)
+    {
+        out_digit = static_cast<int64_t>(base) * z[digit_idx] - z[digit_idx - 1] +
+                    m_digits[digit_idx] * z[last] + v_digits[digit_idx];
+    }
+    else
+    {
+        out_digit = m_digits[last] * z[last] - z[last - 1] + v_digits[last];
+    }
+
+    dst[ptr_idx][coeff_idx] = signed_mod_i64(out_digit, out_modulus);
+}
+
+int launch_gauss_samp_gq_arb_base_multi_kernel(
+    const std::vector<const uint64_t *> &src_ptrs,
+    const std::vector<uint64_t *> &dst_ptrs,
+    size_t poly_count,
+    size_t n,
+    const std::vector<uint64_t> &tower_moduli,
+    uint32_t base_bits,
+    uint32_t digits_per_tower,
+    const std::vector<uint32_t> &digit_indices,
+    double c,
+    const std::vector<uint32_t> &tower_indices,
+    uint64_t seed,
+    const std::vector<uint64_t> &out_moduli,
+    int device,
+    cudaStream_t stream)
+{
+    const size_t job_count = tower_moduli.size();
+    if (job_count == 0 || poly_count == 0 || n == 0)
+    {
+        return 0;
+    }
+    if (digit_indices.size() != job_count || tower_indices.size() != job_count ||
+        out_moduli.size() != job_count)
+    {
+        return set_error("unexpected job parameter counts in matrix_gauss_samp_gq_arb_base_multi_kernel");
+    }
+    const size_t ptr_count = job_count * poly_count;
+    if (src_ptrs.size() != ptr_count || dst_ptrs.size() != ptr_count)
+    {
+        return set_error("unexpected pointer counts in matrix_gauss_samp_gq_arb_base_multi_kernel");
+    }
+
+    cudaError_t err = cudaSetDevice(device);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+
+    const uint64_t **d_src = nullptr;
+    uint64_t **d_dst = nullptr;
+    uint64_t *d_tower_moduli = nullptr;
+    uint32_t *d_digit_indices = nullptr;
+    uint32_t *d_tower_indices = nullptr;
+    uint64_t *d_out_moduli = nullptr;
+
+    const size_t ptr_bytes = ptr_count * sizeof(uint64_t *);
+    const size_t u64_bytes = job_count * sizeof(uint64_t);
+    const size_t u32_bytes = job_count * sizeof(uint32_t);
+
+    err = cudaMallocAsync(&d_src, ptr_bytes, stream);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+    err = cudaMallocAsync(&d_dst, ptr_bytes, stream);
+    if (err != cudaSuccess)
+    {
+        cudaFreeAsync(d_src, stream);
+        return set_error(err);
+    }
+    err = cudaMallocAsync(&d_tower_moduli, u64_bytes, stream);
+    if (err != cudaSuccess)
+    {
+        cudaFreeAsync(d_src, stream);
+        cudaFreeAsync(d_dst, stream);
+        return set_error(err);
+    }
+    err = cudaMallocAsync(&d_digit_indices, u32_bytes, stream);
+    if (err != cudaSuccess)
+    {
+        cudaFreeAsync(d_src, stream);
+        cudaFreeAsync(d_dst, stream);
+        cudaFreeAsync(d_tower_moduli, stream);
+        return set_error(err);
+    }
+    err = cudaMallocAsync(&d_tower_indices, u32_bytes, stream);
+    if (err != cudaSuccess)
+    {
+        cudaFreeAsync(d_src, stream);
+        cudaFreeAsync(d_dst, stream);
+        cudaFreeAsync(d_tower_moduli, stream);
+        cudaFreeAsync(d_digit_indices, stream);
+        return set_error(err);
+    }
+    err = cudaMallocAsync(&d_out_moduli, u64_bytes, stream);
+    if (err != cudaSuccess)
+    {
+        cudaFreeAsync(d_src, stream);
+        cudaFreeAsync(d_dst, stream);
+        cudaFreeAsync(d_tower_moduli, stream);
+        cudaFreeAsync(d_digit_indices, stream);
+        cudaFreeAsync(d_tower_indices, stream);
+        return set_error(err);
+    }
+
+    err = cudaMemcpyAsync(d_src, src_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess)
+    {
+        cudaFreeAsync(d_src, stream);
+        cudaFreeAsync(d_dst, stream);
+        cudaFreeAsync(d_tower_moduli, stream);
+        cudaFreeAsync(d_digit_indices, stream);
+        cudaFreeAsync(d_tower_indices, stream);
+        cudaFreeAsync(d_out_moduli, stream);
+        return set_error(err);
+    }
+    err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess)
+    {
+        cudaFreeAsync(d_src, stream);
+        cudaFreeAsync(d_dst, stream);
+        cudaFreeAsync(d_tower_moduli, stream);
+        cudaFreeAsync(d_digit_indices, stream);
+        cudaFreeAsync(d_tower_indices, stream);
+        cudaFreeAsync(d_out_moduli, stream);
+        return set_error(err);
+    }
+    err = cudaMemcpyAsync(d_tower_moduli, tower_moduli.data(), u64_bytes, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess)
+    {
+        cudaFreeAsync(d_src, stream);
+        cudaFreeAsync(d_dst, stream);
+        cudaFreeAsync(d_tower_moduli, stream);
+        cudaFreeAsync(d_digit_indices, stream);
+        cudaFreeAsync(d_tower_indices, stream);
+        cudaFreeAsync(d_out_moduli, stream);
+        return set_error(err);
+    }
+    err = cudaMemcpyAsync(d_digit_indices, digit_indices.data(), u32_bytes, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess)
+    {
+        cudaFreeAsync(d_src, stream);
+        cudaFreeAsync(d_dst, stream);
+        cudaFreeAsync(d_tower_moduli, stream);
+        cudaFreeAsync(d_digit_indices, stream);
+        cudaFreeAsync(d_tower_indices, stream);
+        cudaFreeAsync(d_out_moduli, stream);
+        return set_error(err);
+    }
+    err = cudaMemcpyAsync(d_tower_indices, tower_indices.data(), u32_bytes, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess)
+    {
+        cudaFreeAsync(d_src, stream);
+        cudaFreeAsync(d_dst, stream);
+        cudaFreeAsync(d_tower_moduli, stream);
+        cudaFreeAsync(d_digit_indices, stream);
+        cudaFreeAsync(d_tower_indices, stream);
+        cudaFreeAsync(d_out_moduli, stream);
+        return set_error(err);
+    }
+    err = cudaMemcpyAsync(d_out_moduli, out_moduli.data(), u64_bytes, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess)
+    {
+        cudaFreeAsync(d_src, stream);
+        cudaFreeAsync(d_dst, stream);
+        cudaFreeAsync(d_tower_moduli, stream);
+        cudaFreeAsync(d_digit_indices, stream);
+        cudaFreeAsync(d_tower_indices, stream);
+        cudaFreeAsync(d_out_moduli, stream);
+        return set_error(err);
+    }
+
+    const int threads = 256;
+    const size_t total = ptr_count * n;
+    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    matrix_gauss_samp_gq_arb_base_multi_kernel<<<blocks, threads, 0, stream>>>(
+        d_src,
+        d_dst,
+        poly_count,
+        n,
+        job_count,
+        d_tower_moduli,
+        base_bits,
+        digits_per_tower,
+        d_digit_indices,
+        c,
+        d_tower_indices,
+        seed,
+        d_out_moduli);
+    err = cudaGetLastError();
+    if (err != cudaSuccess)
+    {
+        cudaFreeAsync(d_src, stream);
+        cudaFreeAsync(d_dst, stream);
+        cudaFreeAsync(d_tower_moduli, stream);
+        cudaFreeAsync(d_digit_indices, stream);
+        cudaFreeAsync(d_tower_indices, stream);
+        cudaFreeAsync(d_out_moduli, stream);
+        return set_error(err);
+    }
+
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess)
+    {
+        cudaFreeAsync(d_src, stream);
+        cudaFreeAsync(d_dst, stream);
+        cudaFreeAsync(d_tower_moduli, stream);
+        cudaFreeAsync(d_digit_indices, stream);
+        cudaFreeAsync(d_tower_indices, stream);
+        cudaFreeAsync(d_out_moduli, stream);
+        return set_error(err);
+    }
+
+    err = cudaFreeAsync(d_src, stream);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+    err = cudaFreeAsync(d_dst, stream);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+    err = cudaFreeAsync(d_tower_moduli, stream);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+    err = cudaFreeAsync(d_digit_indices, stream);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+    err = cudaFreeAsync(d_tower_indices, stream);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+    err = cudaFreeAsync(d_out_moduli, stream);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+    return 0;
+}
+
+int launch_sample_distribution_multi_limb_kernel(
+    const std::vector<uint64_t *> &dst_ptrs,
+    size_t poly_count,
+    size_t n,
+    const std::vector<uint64_t> &moduli,
+    const std::vector<uint32_t> &limb_indices,
+    int dist_type,
+    double sigma,
+    uint64_t seed,
+    cudaStream_t stream)
+{
+    const size_t limb_count = moduli.size();
+    if (limb_count == 0 || poly_count == 0 || n == 0)
+    {
+        return 0;
+    }
+    if (limb_indices.size() != limb_count)
+    {
+        return set_error("unexpected limb parameter counts in matrix_sample_distribution_multi_limb_kernel");
+    }
+    const size_t ptr_count = limb_count * poly_count;
+    if (dst_ptrs.size() != ptr_count)
+    {
+        return set_error("unexpected pointer counts in matrix_sample_distribution_multi_limb_kernel");
+    }
+
+    uint64_t **d_dst = nullptr;
+    uint64_t *d_moduli = nullptr;
+    uint32_t *d_limb_indices = nullptr;
+    const size_t ptr_bytes = ptr_count * sizeof(uint64_t *);
+    const size_t u64_bytes = limb_count * sizeof(uint64_t);
+    const size_t u32_bytes = limb_count * sizeof(uint32_t);
+
+    cudaError_t err = cudaMalloc(&d_dst, ptr_bytes);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+    err = cudaMalloc(&d_moduli, u64_bytes);
+    if (err != cudaSuccess)
+    {
+        cudaFree(d_dst);
+        return set_error(err);
+    }
+    err = cudaMalloc(&d_limb_indices, u32_bytes);
+    if (err != cudaSuccess)
+    {
+        cudaFree(d_dst);
+        cudaFree(d_moduli);
+        return set_error(err);
+    }
+
+    err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess)
+    {
+        cudaFree(d_dst);
+        cudaFree(d_moduli);
+        cudaFree(d_limb_indices);
+        return set_error(err);
+    }
+    err = cudaMemcpyAsync(d_moduli, moduli.data(), u64_bytes, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess)
+    {
+        cudaFree(d_dst);
+        cudaFree(d_moduli);
+        cudaFree(d_limb_indices);
+        return set_error(err);
+    }
+    err = cudaMemcpyAsync(d_limb_indices, limb_indices.data(), u32_bytes, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess)
+    {
+        cudaFree(d_dst);
+        cudaFree(d_moduli);
+        cudaFree(d_limb_indices);
+        return set_error(err);
+    }
+
+    const int threads = 256;
+    const size_t total = ptr_count * n;
+    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    matrix_sample_distribution_multi_limb_kernel<<<blocks, threads, 0, stream>>>(
+        d_dst,
+        poly_count,
+        limb_count,
+        n,
+        d_moduli,
+        d_limb_indices,
+        dist_type,
+        sigma,
+        seed);
+    err = cudaGetLastError();
+    if (err != cudaSuccess)
+    {
+        cudaFree(d_dst);
+        cudaFree(d_moduli);
+        cudaFree(d_limb_indices);
+        return set_error(err);
+    }
+
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess)
+    {
+        cudaFree(d_dst);
+        cudaFree(d_moduli);
+        cudaFree(d_limb_indices);
+        return set_error(err);
+    }
+
+    cudaFree(d_dst);
+    cudaFree(d_moduli);
+    cudaFree(d_limb_indices);
+    return 0;
+}
+
+int launch_fill_gadget_multi_limb_kernel(
+    const std::vector<uint64_t *> &dst_ptrs,
+    size_t poly_count,
+    size_t n,
+    const std::vector<uint64_t> &moduli,
+    const std::vector<uint32_t> &limb_indices,
+    size_t rows,
+    size_t cols,
+    size_t log_base_q,
+    uint32_t digits_per_tower,
+    uint32_t base_bits,
+    cudaStream_t stream)
+{
+    const size_t limb_count = moduli.size();
+    if (limb_count == 0 || poly_count == 0 || n == 0)
+    {
+        return 0;
+    }
+    if (limb_indices.size() != limb_count)
+    {
+        return set_error("unexpected limb parameter counts in matrix_fill_gadget_multi_limb_kernel");
+    }
+    const size_t ptr_count = limb_count * poly_count;
+    if (dst_ptrs.size() != ptr_count)
+    {
+        return set_error("unexpected pointer counts in matrix_fill_gadget_multi_limb_kernel");
+    }
+
+    uint64_t **d_dst = nullptr;
+    uint64_t *d_moduli = nullptr;
+    uint32_t *d_limb_indices = nullptr;
+    const size_t ptr_bytes = ptr_count * sizeof(uint64_t *);
+    const size_t u64_bytes = limb_count * sizeof(uint64_t);
+    const size_t u32_bytes = limb_count * sizeof(uint32_t);
+
+    cudaError_t err = cudaMalloc(&d_dst, ptr_bytes);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+    err = cudaMalloc(&d_moduli, u64_bytes);
+    if (err != cudaSuccess)
+    {
+        cudaFree(d_dst);
+        return set_error(err);
+    }
+    err = cudaMalloc(&d_limb_indices, u32_bytes);
+    if (err != cudaSuccess)
+    {
+        cudaFree(d_dst);
+        cudaFree(d_moduli);
+        return set_error(err);
+    }
+
+    err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess)
+    {
+        cudaFree(d_dst);
+        cudaFree(d_moduli);
+        cudaFree(d_limb_indices);
+        return set_error(err);
+    }
+    err = cudaMemcpyAsync(d_moduli, moduli.data(), u64_bytes, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess)
+    {
+        cudaFree(d_dst);
+        cudaFree(d_moduli);
+        cudaFree(d_limb_indices);
+        return set_error(err);
+    }
+    err = cudaMemcpyAsync(d_limb_indices, limb_indices.data(), u32_bytes, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess)
+    {
+        cudaFree(d_dst);
+        cudaFree(d_moduli);
+        cudaFree(d_limb_indices);
+        return set_error(err);
+    }
+
+    const int threads = 256;
+    const size_t total = ptr_count * n;
+    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    matrix_fill_gadget_multi_limb_kernel<<<blocks, threads, 0, stream>>>(
+        d_dst,
+        poly_count,
+        limb_count,
+        n,
+        d_moduli,
+        d_limb_indices,
+        rows,
+        cols,
+        log_base_q,
+        digits_per_tower,
+        base_bits);
+    err = cudaGetLastError();
+    if (err != cudaSuccess)
+    {
+        cudaFree(d_dst);
+        cudaFree(d_moduli);
+        cudaFree(d_limb_indices);
+        return set_error(err);
+    }
+
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess)
+    {
+        cudaFree(d_dst);
+        cudaFree(d_moduli);
+        cudaFree(d_limb_indices);
+        return set_error(err);
+    }
+
+    cudaFree(d_dst);
+    cudaFree(d_moduli);
+    cudaFree(d_limb_indices);
+    return 0;
+}
+
+int launch_sample_p1_full_kernel(
+    const std::vector<const uint64_t *> &a_entries,
+    const std::vector<const uint64_t *> &b_entries,
+    const std::vector<const uint64_t *> &d_entries,
+    const std::vector<const uint64_t *> &tp2_entries,
+    const std::vector<uint64_t *> &out_entries,
+    size_t d,
+    size_t cols,
+    size_t n,
+    uint64_t modulus,
+    double sigma,
+    double s,
+    double dgg_stddev,
+    uint32_t limb_idx,
+    uint64_t seed,
+    cudaStream_t stream,
+    int device_id)
+{
+    if (d == 0 || cols == 0 || n == 0)
+    {
+        return 0;
+    }
+    const size_t mat_entries = d * d;
+    const size_t vec_entries = 2 * d * cols;
+    if (a_entries.size() != mat_entries || b_entries.size() != mat_entries ||
+        d_entries.size() != mat_entries || tp2_entries.size() != vec_entries ||
+        out_entries.size() != vec_entries)
+    {
+        return set_error("unexpected pointer counts in matrix_sample_p1_full_kernel");
+    }
+
+    if (device_id < 0)
+    {
+        return set_error("invalid device in matrix_sample_p1_full_kernel");
+    }
+    cudaError_t err = cudaSetDevice(device_id);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+
+    const size_t m = 2 * d;
+    if (m == 0)
+    {
+        return set_error("invalid dimension in matrix_sample_p1_full_kernel");
+    }
+    if (m > std::numeric_limits<size_t>::max() / m)
+    {
+        return set_error("workspace overflow in matrix_sample_p1_full_kernel");
+    }
+    const size_t cov_elems_per_sample = m * m;
+    if (cov_elems_per_sample > std::numeric_limits<size_t>::max() / sizeof(double))
+    {
+        return set_error("workspace overflow in matrix_sample_p1_full_kernel");
+    }
+    const size_t cov_bytes_per_sample = cov_elems_per_sample * sizeof(double);
+    if (m > std::numeric_limits<size_t>::max() / sizeof(double))
+    {
+        return set_error("workspace overflow in matrix_sample_p1_full_kernel");
+    }
+    const size_t vec_bytes_per_sample = m * sizeof(double);
+    if (m > std::numeric_limits<size_t>::max() / sizeof(int64_t))
+    {
+        return set_error("workspace overflow in matrix_sample_p1_full_kernel");
+    }
+    const size_t sampled_bytes_per_sample = m * sizeof(int64_t);
+    if (cov_bytes_per_sample > std::numeric_limits<size_t>::max() - vec_bytes_per_sample)
+    {
+        return set_error("workspace overflow in matrix_sample_p1_full_kernel");
+    }
+    size_t bytes_per_sample_total = cov_bytes_per_sample + vec_bytes_per_sample;
+    if (bytes_per_sample_total > std::numeric_limits<size_t>::max() - vec_bytes_per_sample)
+    {
+        return set_error("workspace overflow in matrix_sample_p1_full_kernel");
+    }
+    bytes_per_sample_total += vec_bytes_per_sample;
+    if (bytes_per_sample_total > std::numeric_limits<size_t>::max() - sampled_bytes_per_sample)
+    {
+        return set_error("workspace overflow in matrix_sample_p1_full_kernel");
+    }
+    bytes_per_sample_total += sampled_bytes_per_sample;
+
+    const size_t total_samples = cols * n;
+    size_t chunk_samples = total_samples;
+
+    const uint64_t **d_a_entries = nullptr;
+    const uint64_t **d_b_entries = nullptr;
+    const uint64_t **d_d_entries = nullptr;
+    const uint64_t **d_tp2_entries = nullptr;
+    uint64_t **d_out_entries = nullptr;
+    const size_t mat_bytes = mat_entries * sizeof(uint64_t *);
+    const size_t vec_bytes = vec_entries * sizeof(uint64_t *);
+
+    auto free_all = [&]()
+    {
+        if (d_a_entries)
+            cudaFree(d_a_entries);
+        if (d_b_entries)
+            cudaFree(d_b_entries);
+        if (d_d_entries)
+            cudaFree(d_d_entries);
+        if (d_tp2_entries)
+            cudaFree(d_tp2_entries);
+        if (d_out_entries)
+            cudaFree(d_out_entries);
+    };
+
+    err = cudaMalloc(&d_a_entries, mat_bytes);
+    if (err != cudaSuccess)
+    {
+        free_all();
+        return set_error(err);
+    }
+    err = cudaMalloc(&d_b_entries, mat_bytes);
+    if (err != cudaSuccess)
+    {
+        free_all();
+        return set_error(err);
+    }
+    err = cudaMalloc(&d_d_entries, mat_bytes);
+    if (err != cudaSuccess)
+    {
+        free_all();
+        return set_error(err);
+    }
+    err = cudaMalloc(&d_tp2_entries, vec_bytes);
+    if (err != cudaSuccess)
+    {
+        free_all();
+        return set_error(err);
+    }
+    err = cudaMalloc(&d_out_entries, vec_bytes);
+    if (err != cudaSuccess)
+    {
+        free_all();
+        return set_error(err);
+    }
+
+    err = cudaMemcpyAsync(d_a_entries, a_entries.data(), mat_bytes, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess)
+    {
+        free_all();
+        return set_error(err);
+    }
+    err = cudaMemcpyAsync(d_b_entries, b_entries.data(), mat_bytes, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess)
+    {
+        free_all();
+        return set_error(err);
+    }
+    err = cudaMemcpyAsync(d_d_entries, d_entries.data(), mat_bytes, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess)
+    {
+        free_all();
+        return set_error(err);
+    }
+    err = cudaMemcpyAsync(d_tp2_entries, tp2_entries.data(), vec_bytes, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess)
+    {
+        free_all();
+        return set_error(err);
+    }
+    err = cudaMemcpyAsync(d_out_entries, out_entries.data(), vec_bytes, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess)
+    {
+        free_all();
+        return set_error(err);
+    }
+
+    double *cov_workspace = nullptr;
+    double *mean_workspace = nullptr;
+    double *col_workspace = nullptr;
+    int64_t *sampled_workspace = nullptr;
+    auto free_workspace = [&]()
+    {
+        if (cov_workspace)
+            cudaFree(cov_workspace);
+        if (mean_workspace)
+            cudaFree(mean_workspace);
+        if (col_workspace)
+            cudaFree(col_workspace);
+        if (sampled_workspace)
+            cudaFree(sampled_workspace);
+        cov_workspace = nullptr;
+        mean_workspace = nullptr;
+        col_workspace = nullptr;
+        sampled_workspace = nullptr;
+    };
+
+    auto alloc_workspace = [&](size_t samples) -> bool
+    {
+        if (samples == 0)
+        {
+            return false;
+        }
+        if (samples > std::numeric_limits<size_t>::max() / cov_bytes_per_sample ||
+            samples > std::numeric_limits<size_t>::max() / vec_bytes_per_sample ||
+            samples > std::numeric_limits<size_t>::max() / sampled_bytes_per_sample)
+        {
+            return false;
+        }
+        cudaError_t local_err = cudaMalloc(&cov_workspace, samples * cov_bytes_per_sample);
+        if (local_err != cudaSuccess)
+        {
+            free_workspace();
+            return false;
+        }
+        local_err = cudaMalloc(&mean_workspace, samples * vec_bytes_per_sample);
+        if (local_err != cudaSuccess)
+        {
+            free_workspace();
+            return false;
+        }
+        local_err = cudaMalloc(&col_workspace, samples * vec_bytes_per_sample);
+        if (local_err != cudaSuccess)
+        {
+            free_workspace();
+            return false;
+        }
+        local_err = cudaMalloc(&sampled_workspace, samples * sampled_bytes_per_sample);
+        if (local_err != cudaSuccess)
+        {
+            free_workspace();
+            return false;
+        }
+        return true;
+    };
+
+    while (!alloc_workspace(chunk_samples))
+    {
+        if (chunk_samples <= 1)
+        {
+            free_all();
+            return set_error("failed to allocate workspace in matrix_sample_p1_full_kernel");
+        }
+        chunk_samples = (chunk_samples + 1) / 2;
+    }
+
+    const int threads = 256;
+    for (size_t sample_start = 0; sample_start < total_samples; sample_start += chunk_samples)
+    {
+        size_t sample_count = std::min(chunk_samples, total_samples - sample_start);
+        const int blocks = static_cast<int>((sample_count + threads - 1) / threads);
+        matrix_sample_p1_full_kernel<<<blocks, threads, 0, stream>>>(
+            d_a_entries,
+            d_b_entries,
+            d_d_entries,
+            d_tp2_entries,
+            d_out_entries,
+            d,
+            cols,
             n,
-            d_moduli,
-            d_limb_indices,
-            dist_type,
+            sample_start,
+            sample_count,
+            cov_workspace,
+            mean_workspace,
+            col_workspace,
+            sampled_workspace,
+            modulus,
             sigma,
+            s,
+            dgg_stddev,
+            limb_idx,
             seed);
         err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_dst);
-            cudaFree(d_moduli);
-            cudaFree(d_limb_indices);
-            return set_error(err);
-        }
-
-        err = cudaStreamSynchronize(stream);
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_dst);
-            cudaFree(d_moduli);
-            cudaFree(d_limb_indices);
-            return set_error(err);
-        }
-
-        cudaFree(d_dst);
-        cudaFree(d_moduli);
-        cudaFree(d_limb_indices);
-        return 0;
-    }
-
-    int launch_fill_gadget_multi_limb_kernel(
-        const std::vector<uint64_t *> &dst_ptrs,
-        size_t poly_count,
-        size_t n,
-        const std::vector<uint64_t> &moduli,
-        const std::vector<uint32_t> &limb_indices,
-        size_t rows,
-        size_t cols,
-        size_t log_base_q,
-        uint32_t digits_per_tower,
-        uint32_t base_bits,
-        cudaStream_t stream)
-    {
-        const size_t limb_count = moduli.size();
-        if (limb_count == 0 || poly_count == 0 || n == 0)
-        {
-            return 0;
-        }
-        if (limb_indices.size() != limb_count)
-        {
-            return set_error("unexpected limb parameter counts in matrix_fill_gadget_multi_limb_kernel");
-        }
-        const size_t ptr_count = limb_count * poly_count;
-        if (dst_ptrs.size() != ptr_count)
-        {
-            return set_error("unexpected pointer counts in matrix_fill_gadget_multi_limb_kernel");
-        }
-
-        uint64_t **d_dst = nullptr;
-        uint64_t *d_moduli = nullptr;
-        uint32_t *d_limb_indices = nullptr;
-        const size_t ptr_bytes = ptr_count * sizeof(uint64_t *);
-        const size_t u64_bytes = limb_count * sizeof(uint64_t);
-        const size_t u32_bytes = limb_count * sizeof(uint32_t);
-
-        cudaError_t err = cudaMalloc(&d_dst, ptr_bytes);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        err = cudaMalloc(&d_moduli, u64_bytes);
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_dst);
-            return set_error(err);
-        }
-        err = cudaMalloc(&d_limb_indices, u32_bytes);
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_dst);
-            cudaFree(d_moduli);
-            return set_error(err);
-        }
-
-        err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_dst);
-            cudaFree(d_moduli);
-            cudaFree(d_limb_indices);
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_moduli, moduli.data(), u64_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_dst);
-            cudaFree(d_moduli);
-            cudaFree(d_limb_indices);
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_limb_indices, limb_indices.data(), u32_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_dst);
-            cudaFree(d_moduli);
-            cudaFree(d_limb_indices);
-            return set_error(err);
-        }
-
-        const int threads = 256;
-        const size_t total = ptr_count * n;
-        const int blocks = static_cast<int>((total + threads - 1) / threads);
-        matrix_fill_gadget_multi_limb_kernel<<<blocks, threads, 0, stream>>>(
-            d_dst,
-            poly_count,
-            limb_count,
-            n,
-            d_moduli,
-            d_limb_indices,
-            rows,
-            cols,
-            log_base_q,
-            digits_per_tower,
-            base_bits);
-        err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_dst);
-            cudaFree(d_moduli);
-            cudaFree(d_limb_indices);
-            return set_error(err);
-        }
-
-        err = cudaStreamSynchronize(stream);
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_dst);
-            cudaFree(d_moduli);
-            cudaFree(d_limb_indices);
-            return set_error(err);
-        }
-
-        cudaFree(d_dst);
-        cudaFree(d_moduli);
-        cudaFree(d_limb_indices);
-        return 0;
-    }
-
-    int launch_sample_p1_full_kernel(
-        const std::vector<const uint64_t *> &a_entries,
-        const std::vector<const uint64_t *> &b_entries,
-        const std::vector<const uint64_t *> &d_entries,
-        const std::vector<const uint64_t *> &tp2_entries,
-        const std::vector<uint64_t *> &out_entries,
-        size_t d,
-        size_t cols,
-        size_t n,
-        uint64_t modulus,
-        double sigma,
-        double s,
-        double dgg_stddev,
-        uint32_t limb_idx,
-        uint64_t seed,
-        cudaStream_t stream,
-        int device_id)
-    {
-        if (d == 0 || cols == 0 || n == 0)
-        {
-            return 0;
-        }
-        const size_t mat_entries = d * d;
-        const size_t vec_entries = 2 * d * cols;
-        if (a_entries.size() != mat_entries || b_entries.size() != mat_entries ||
-            d_entries.size() != mat_entries || tp2_entries.size() != vec_entries ||
-            out_entries.size() != vec_entries)
-        {
-            return set_error("unexpected pointer counts in matrix_sample_p1_full_kernel");
-        }
-
-        if (device_id < 0)
-        {
-            return set_error("invalid device in matrix_sample_p1_full_kernel");
-        }
-        cudaError_t err = cudaSetDevice(device_id);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-
-        const size_t m = 2 * d;
-        if (m == 0)
-        {
-            return set_error("invalid dimension in matrix_sample_p1_full_kernel");
-        }
-        if (m > std::numeric_limits<size_t>::max() / m)
-        {
-            return set_error("workspace overflow in matrix_sample_p1_full_kernel");
-        }
-        const size_t cov_elems_per_sample = m * m;
-        if (cov_elems_per_sample > std::numeric_limits<size_t>::max() / sizeof(double))
-        {
-            return set_error("workspace overflow in matrix_sample_p1_full_kernel");
-        }
-        const size_t cov_bytes_per_sample = cov_elems_per_sample * sizeof(double);
-        if (m > std::numeric_limits<size_t>::max() / sizeof(double))
-        {
-            return set_error("workspace overflow in matrix_sample_p1_full_kernel");
-        }
-        const size_t vec_bytes_per_sample = m * sizeof(double);
-        if (m > std::numeric_limits<size_t>::max() / sizeof(int64_t))
-        {
-            return set_error("workspace overflow in matrix_sample_p1_full_kernel");
-        }
-        const size_t sampled_bytes_per_sample = m * sizeof(int64_t);
-        if (cov_bytes_per_sample > std::numeric_limits<size_t>::max() - vec_bytes_per_sample)
-        {
-            return set_error("workspace overflow in matrix_sample_p1_full_kernel");
-        }
-        size_t bytes_per_sample_total = cov_bytes_per_sample + vec_bytes_per_sample;
-        if (bytes_per_sample_total > std::numeric_limits<size_t>::max() - vec_bytes_per_sample)
-        {
-            return set_error("workspace overflow in matrix_sample_p1_full_kernel");
-        }
-        bytes_per_sample_total += vec_bytes_per_sample;
-        if (bytes_per_sample_total > std::numeric_limits<size_t>::max() - sampled_bytes_per_sample)
-        {
-            return set_error("workspace overflow in matrix_sample_p1_full_kernel");
-        }
-        bytes_per_sample_total += sampled_bytes_per_sample;
-
-        const size_t total_samples = cols * n;
-        size_t chunk_samples = total_samples;
-
-        const uint64_t **d_a_entries = nullptr;
-        const uint64_t **d_b_entries = nullptr;
-        const uint64_t **d_d_entries = nullptr;
-        const uint64_t **d_tp2_entries = nullptr;
-        uint64_t **d_out_entries = nullptr;
-        const size_t mat_bytes = mat_entries * sizeof(uint64_t *);
-        const size_t vec_bytes = vec_entries * sizeof(uint64_t *);
-
-        auto free_all = [&]() {
-            if (d_a_entries)
-                cudaFree(d_a_entries);
-            if (d_b_entries)
-                cudaFree(d_b_entries);
-            if (d_d_entries)
-                cudaFree(d_d_entries);
-            if (d_tp2_entries)
-                cudaFree(d_tp2_entries);
-            if (d_out_entries)
-                cudaFree(d_out_entries);
-        };
-
-        err = cudaMalloc(&d_a_entries, mat_bytes);
-        if (err != cudaSuccess)
-        {
-            free_all();
-            return set_error(err);
-        }
-        err = cudaMalloc(&d_b_entries, mat_bytes);
-        if (err != cudaSuccess)
-        {
-            free_all();
-            return set_error(err);
-        }
-        err = cudaMalloc(&d_d_entries, mat_bytes);
-        if (err != cudaSuccess)
-        {
-            free_all();
-            return set_error(err);
-        }
-        err = cudaMalloc(&d_tp2_entries, vec_bytes);
-        if (err != cudaSuccess)
-        {
-            free_all();
-            return set_error(err);
-        }
-        err = cudaMalloc(&d_out_entries, vec_bytes);
-        if (err != cudaSuccess)
-        {
-            free_all();
-            return set_error(err);
-        }
-
-        err = cudaMemcpyAsync(d_a_entries, a_entries.data(), mat_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            free_all();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_b_entries, b_entries.data(), mat_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            free_all();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_d_entries, d_entries.data(), mat_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            free_all();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_tp2_entries, tp2_entries.data(), vec_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            free_all();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_out_entries, out_entries.data(), vec_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            free_all();
-            return set_error(err);
-        }
-
-        double *cov_workspace = nullptr;
-        double *mean_workspace = nullptr;
-        double *col_workspace = nullptr;
-        int64_t *sampled_workspace = nullptr;
-        auto free_workspace = [&]() {
-            if (cov_workspace)
-                cudaFree(cov_workspace);
-            if (mean_workspace)
-                cudaFree(mean_workspace);
-            if (col_workspace)
-                cudaFree(col_workspace);
-            if (sampled_workspace)
-                cudaFree(sampled_workspace);
-            cov_workspace = nullptr;
-            mean_workspace = nullptr;
-            col_workspace = nullptr;
-            sampled_workspace = nullptr;
-        };
-
-        auto alloc_workspace = [&](size_t samples) -> bool {
-            if (samples == 0)
-            {
-                return false;
-            }
-            if (samples > std::numeric_limits<size_t>::max() / cov_bytes_per_sample ||
-                samples > std::numeric_limits<size_t>::max() / vec_bytes_per_sample ||
-                samples > std::numeric_limits<size_t>::max() / sampled_bytes_per_sample)
-            {
-                return false;
-            }
-            cudaError_t local_err = cudaMalloc(&cov_workspace, samples * cov_bytes_per_sample);
-            if (local_err != cudaSuccess)
-            {
-                free_workspace();
-                return false;
-            }
-            local_err = cudaMalloc(&mean_workspace, samples * vec_bytes_per_sample);
-            if (local_err != cudaSuccess)
-            {
-                free_workspace();
-                return false;
-            }
-            local_err = cudaMalloc(&col_workspace, samples * vec_bytes_per_sample);
-            if (local_err != cudaSuccess)
-            {
-                free_workspace();
-                return false;
-            }
-            local_err = cudaMalloc(&sampled_workspace, samples * sampled_bytes_per_sample);
-            if (local_err != cudaSuccess)
-            {
-                free_workspace();
-                return false;
-            }
-            return true;
-        };
-
-        while (!alloc_workspace(chunk_samples))
-        {
-            if (chunk_samples <= 1)
-            {
-                free_all();
-                return set_error("failed to allocate workspace in matrix_sample_p1_full_kernel");
-            }
-            chunk_samples = (chunk_samples + 1) / 2;
-        }
-
-        const int threads = 256;
-        for (size_t sample_start = 0; sample_start < total_samples; sample_start += chunk_samples)
-        {
-            size_t sample_count = std::min(chunk_samples, total_samples - sample_start);
-            const int blocks = static_cast<int>((sample_count + threads - 1) / threads);
-            matrix_sample_p1_full_kernel<<<blocks, threads, 0, stream>>>(
-                d_a_entries,
-                d_b_entries,
-                d_d_entries,
-                d_tp2_entries,
-                d_out_entries,
-                d,
-                cols,
-                n,
-                sample_start,
-                sample_count,
-                cov_workspace,
-                mean_workspace,
-                col_workspace,
-                sampled_workspace,
-                modulus,
-                sigma,
-                s,
-                dgg_stddev,
-                limb_idx,
-                seed);
-            err = cudaGetLastError();
-            if (err != cudaSuccess)
-            {
-                free_workspace();
-                free_all();
-                return set_error(err);
-            }
-        }
-
-        err = cudaStreamSynchronize(stream);
         if (err != cudaSuccess)
         {
             free_workspace();
             free_all();
             return set_error(err);
         }
-
-        free_workspace();
-        free_all();
-        return 0;
     }
 
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess)
+    {
+        free_workspace();
+        free_all();
+        return set_error(err);
+    }
+
+    free_workspace();
+    free_all();
+    return 0;
+}
 
 extern "C" int gpu_matrix_sample_distribution(
     GpuMatrix *out,
@@ -4100,7 +4105,8 @@ extern "C" int gpu_matrix_sample_distribution(
         std::vector<uint32_t> limb_indices;
     };
     std::vector<DistBatch> batches;
-    auto get_batch = [&](int device) -> DistBatch & {
+    auto get_batch = [&](int device) -> DistBatch &
+    {
         for (auto &b : batches)
         {
             if (b.device == device)
@@ -4519,7 +4525,8 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         std::vector<uint64_t> out_moduli;
     };
     std::vector<GaussBatch> batches;
-    auto get_batch = [&](int device) -> GaussBatch & {
+    auto get_batch = [&](int device) -> GaussBatch &
+    {
         for (auto &b : batches)
         {
             if (b.device == device)

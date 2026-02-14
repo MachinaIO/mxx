@@ -195,6 +195,7 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         let z_seed: u64 = rng.random();
         let gauss_start = Instant::now();
         let z_hat_mat = perturbed_syndrome.gauss_samp_gq_arb_base(self.c, self.sigma, z_seed);
+        drop(perturbed_syndrome);
         tracing::debug!(
             elapsed_ms = gauss_start.elapsed().as_secs_f64() * 1_000.0,
             "gpu preimage: sampled z_hat_mat with gauss_samp_gq_arb_base"
@@ -215,12 +216,14 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
 
         let assemble_start = Instant::now();
         let correction_start = Instant::now();
-        let correction = r_z_hat.concat_rows(&[&e_z_hat, &z_hat_mat]);
+        let correction = r_z_hat.concat_rows_owned(vec![e_z_hat, z_hat_mat]);
         tracing::debug!(
             elapsed_ms = correction_start.elapsed().as_secs_f64() * 1_000.0,
             "gpu preimage: assembled correction matrix"
         );
-        let out = &p_hat + &correction;
+        let mut out = p_hat;
+        out.add_in_place(&correction);
+        drop(correction);
         tracing::debug!(
             elapsed_ms = assemble_start.elapsed().as_secs_f64() * 1_000.0,
             "gpu preimage: assembled output matrix"
@@ -299,8 +302,9 @@ fn sample_pert_square_mat_gpu_native(
         dgg_stddev,
         p1_seed,
     );
+    drop(tp2);
 
-    let mut p_hat = p1.concat_rows(&[&p2]);
+    let mut p_hat = p1.concat_rows_owned(vec![p2]);
     if padding_ncol > 0 {
         p_hat = p_hat.slice_columns(0, total_ncol);
     }

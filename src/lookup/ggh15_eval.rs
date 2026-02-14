@@ -550,35 +550,33 @@ where
         info!("Sampling auxiliary matrices with d = {}", d);
         let m_g = d * params.modulus_digits();
         let mut persist_b0_checkpoint: Option<(M, Vec<u8>)> = None;
-        let (b0_trapdoor, b0_matrix, b0_loaded_from_checkpoint) = if let Some((
-            b0_trapdoor,
-            b0_matrix,
-        )) =
-            self.load_b0_checkpoint(params, &checkpoint_prefix)
-        {
-            info!("Resumed B0 checkpoint with prefix={checkpoint_prefix}");
-            (b0_trapdoor, b0_matrix, true)
-        } else {
-            let trap_sampler = TS::new(params, self.trapdoor_sigma);
-            let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, d);
-            persist_b0_checkpoint = Some((b0_matrix.clone(), TS::trapdoor_to_bytes(&b0_trapdoor)));
-            (b0_trapdoor, b0_matrix, false)
-        };
+        let (b0_trapdoor, b0_matrix, b0_loaded_from_checkpoint) =
+            if let Some((b0_trapdoor, b0_matrix)) =
+                self.load_b0_checkpoint(params, &checkpoint_prefix)
+            {
+                info!("Resumed B0 checkpoint with prefix={checkpoint_prefix}");
+                (b0_trapdoor, b0_matrix, true)
+            } else {
+                let trap_sampler = TS::new(params, self.trapdoor_sigma);
+                let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, d);
+                persist_b0_checkpoint =
+                    Some((b0_matrix.clone(), TS::trapdoor_to_bytes(&b0_trapdoor)));
+                (b0_trapdoor, b0_matrix, false)
+            };
         let mut persist_b1_checkpoint: Option<(M, Vec<u8>)> = None;
-        let (b1_trapdoor, b1_matrix, b1_loaded_from_checkpoint) = if let Some((
-            b1_trapdoor,
-            b1_matrix,
-        )) =
-            self.load_b1_checkpoint(params, &checkpoint_prefix)
-        {
-            info!("Resumed B1 checkpoint with prefix={checkpoint_prefix}");
-            (b1_trapdoor, b1_matrix, true)
-        } else {
-            let trap_sampler = TS::new(params, self.trapdoor_sigma);
-            let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, 2 * d);
-            persist_b1_checkpoint = Some((b1_matrix.clone(), TS::trapdoor_to_bytes(&b1_trapdoor)));
-            (b1_trapdoor, b1_matrix, false)
-        };
+        let (b1_trapdoor, b1_matrix, b1_loaded_from_checkpoint) =
+            if let Some((b1_trapdoor, b1_matrix)) =
+                self.load_b1_checkpoint(params, &checkpoint_prefix)
+            {
+                info!("Resumed B1 checkpoint with prefix={checkpoint_prefix}");
+                (b1_trapdoor, b1_matrix, true)
+            } else {
+                let trap_sampler = TS::new(params, self.trapdoor_sigma);
+                let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, 2 * d);
+                persist_b1_checkpoint =
+                    Some((b1_matrix.clone(), TS::trapdoor_to_bytes(&b1_trapdoor)));
+                (b1_trapdoor, b1_matrix, false)
+            };
 
         let checkpoint_index_for_resume = if has_resume_candidates &&
             (!b0_loaded_from_checkpoint || !b1_loaded_from_checkpoint)
@@ -586,8 +584,7 @@ where
             warn!(
                 "Auxiliary outputs exist but B0/B1 checkpoint is missing (prefix={checkpoint_prefix}, b0_loaded={}, b1_loaded={}); \
 resuming is disabled and auxiliary matrices will be resampled from scratch",
-                b0_loaded_from_checkpoint,
-                b1_loaded_from_checkpoint
+                b0_loaded_from_checkpoint, b1_loaded_from_checkpoint
             );
             None
         } else {

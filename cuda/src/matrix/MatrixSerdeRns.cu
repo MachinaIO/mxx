@@ -46,31 +46,29 @@ extern "C" int gpu_matrix_store_rns_batch(
         return 0;
     }
 
-    std::vector<GpuPoly *> clones;
-    clones.reserve(count);
-
-    auto cleanup_clones = [&clones]() {
-        for (auto *poly : clones)
-        {
-            gpu_poly_destroy(poly);
-        }
-        clones.clear();
-    };
-
-    for (size_t i = 0; i < count; ++i)
+    const int matrix_format =
+        mat->format == PolyFormat::Eval ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
+    GpuMatrix *clones = nullptr;
+    int status = gpu_matrix_create(
+        mat->ctx,
+        mat->level,
+        mat->rows,
+        mat->cols,
+        matrix_format,
+        &clones);
+    if (status != 0)
     {
-        GpuPoly *clone = nullptr;
-        int status = gpu_poly_clone(mat->polys[i], &clone);
-        if (status != 0)
-        {
-            cleanup_clones();
-            return status;
-        }
-        clones.push_back(clone);
+        return status;
+    }
+    status = gpu_matrix_copy(clones, mat);
+    if (status != 0)
+    {
+        gpu_matrix_destroy(clones);
+        return status;
     }
 
-    int status = gpu_poly_store_rns_batch(
-        clones.data(),
+    status = gpu_poly_store_rns_batch(
+        clones->polys.data(),
         count,
         bytes_out,
         bytes_per_poly,
@@ -83,7 +81,7 @@ extern "C" int gpu_matrix_store_rns_batch(
             gpu_event_set_destroy(*out_events);
             *out_events = nullptr;
         }
-        cleanup_clones();
+        gpu_matrix_destroy(clones);
         return status;
     }
 
@@ -94,11 +92,11 @@ extern "C" int gpu_matrix_store_rns_batch(
         *out_events = nullptr;
         if (status != 0)
         {
-            cleanup_clones();
+            gpu_matrix_destroy(clones);
             return status;
         }
     }
 
-    cleanup_clones();
+    gpu_matrix_destroy(clones);
     return 0;
 }

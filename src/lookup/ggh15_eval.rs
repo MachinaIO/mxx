@@ -17,7 +17,6 @@ use std::{
     fs::read_to_string,
     marker::PhantomData,
     path::PathBuf,
-    sync::Arc,
     time::{Duration, Instant},
 };
 use tracing::{debug, info, warn};
@@ -111,10 +110,9 @@ where
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
 {
     pub hash_key: [u8; 32],
+    pub d: usize,
     pub trapdoor_sigma: f64,
     pub error_sigma: f64,
-    pub b0_matrix: Arc<M>,
-    pub b0_trapdoor: Arc<TS::Trapdoor>,
     pub dir_path: PathBuf,
     pub insert_1_to_s: bool,
     lut_state: DashMap<usize, PublicLut<<BggPublicKey<M> as Evaluable>::P>>,
@@ -134,22 +132,19 @@ where
 {
     pub fn new(
         hash_key: [u8; 32],
+        d: usize,
         trapdoor_sigma: f64,
         error_sigma: f64,
-        b0_matrix: Arc<M>,
-        b0_trapdoor: Arc<TS::Trapdoor>,
         dir_path: PathBuf,
         insert_1_to_s: bool,
     ) -> Self {
-        let d = b0_matrix.row_size();
         debug_assert!(!insert_1_to_s || d > 1, "cannot insert 1 into s when d = 1");
 
         Self {
             hash_key,
+            d,
             trapdoor_sigma,
             error_sigma,
-            b0_matrix,
-            b0_trapdoor,
             dir_path,
             insert_1_to_s,
             lut_state: DashMap::new(),
@@ -176,7 +171,7 @@ where
             part_idx,
             batch.len()
         );
-        let d = self.b0_matrix.row_size();
+        let d = self.d;
         let m = d * params.modulus_digits();
         let k = params.modulus_digits();
         let trap_sampler = TS::new(params, self.trapdoor_sigma);
@@ -239,7 +234,7 @@ where
     }
 
     fn derive_w_matrix(&self, params: &<M::P as Poly>::Params, lut_id: usize) -> M {
-        let d = self.b0_matrix.row_size();
+        let d = self.d;
         let m_g = d * params.modulus_digits();
         HS::new().sample_hash(
             params,
@@ -255,7 +250,7 @@ where
         let (_, crt_bits, crt_depth) = params.to_crt();
         format!(
             "ggh15_aux_d{}_crtbits{}_crtdepth{}_ring{}_base{}_sigma{:.6}_err{:.6}_ins{}_key{}",
-            self.b0_matrix.row_size(),
+            self.d,
             crt_bits,
             crt_depth,
             params.ring_dimension(),
@@ -376,20 +371,27 @@ where
             Self::checkpoint_has_index(checkpoint_index, &gate2_vx_prefix, 0)
     }
 
-    fn has_any_aux_outputs(checkpoint_index: Option<&GlobalTableIndex>) -> bool {
+    fn has_resume_candidates(
+        checkpoint_index: Option<&GlobalTableIndex>,
+        lut_ids: &[usize],
+        gate_ids: &[GateId],
+    ) -> bool {
         let Some(checkpoint_index) = checkpoint_index else {
             return false;
         };
-        checkpoint_index.entries.keys().any(|key| {
-            key.starts_with("ggh15_lut_aux_") ||
-                key.starts_with("ggh15_lut_preimage_") ||
-                key.starts_with("ggh15_lut_v_idx_") ||
-                key.starts_with("ggh15_preimage_gate1_") ||
-                key.starts_with("ggh15_preimage_gate2_identity_") ||
-                key.starts_with("ggh15_preimage_gate2_gy_") ||
-                key.starts_with("ggh15_preimage_gate2_v_") ||
-                key.starts_with("ggh15_preimage_gate2_vx_")
-        })
+        for lut_id in lut_ids {
+            let lut_aux_prefix = format!("ggh15_lut_aux_{}", lut_id);
+            let info = Self::collect_checkpoint_entry_info(Some(checkpoint_index), &lut_aux_prefix);
+            if !info.indices.is_empty() {
+                return true;
+            }
+        }
+        for gate_id in gate_ids {
+            if Self::gate_checkpoint_complete(Some(checkpoint_index), *gate_id) {
+                return true;
+            }
+        }
+        false
     }
 
     fn load_b1_checkpoint(
@@ -447,17 +449,79 @@ where
         Some((b1_trapdoor, b1_matrix))
     }
 
+    fn load_b0_checkpoint(
+        &self,
+        params: &<M::P as Poly>::Params,
+        checkpoint_prefix: &str,
+    ) -> Option<(TS::Trapdoor, M)> {
+        let dir = self.dir_path.as_path();
+        let b0_id_prefix = format!("{checkpoint_prefix}_b0");
+        let b0_trapdoor_id_prefix = format!("{checkpoint_prefix}_b0_trapdoor");
+        info!(
+            "Trying B0 checkpoint load from {} (matrix_id_prefix={}, trapdoor_id_prefix={})",
+            dir.display(),
+            b0_id_prefix,
+            b0_trapdoor_id_prefix
+        );
+        let b0_bytes = if let Some(bytes) = read_bytes_from_multi_batch(dir, &b0_id_prefix, 0) {
+            bytes
+        } else {
+            info!(
+                "B0 checkpoint matrix not found (dir={}, id_prefix={}, index=0)",
+                dir.display(),
+                b0_id_prefix
+            );
+            return None;
+        };
+        let trapdoor_bytes =
+            if let Some(bytes) = read_bytes_from_multi_batch(dir, &b0_trapdoor_id_prefix, 0) {
+                bytes
+            } else {
+                info!(
+                    "B0 checkpoint trapdoor not found (dir={}, id_prefix={}, index=0)",
+                    dir.display(),
+                    b0_trapdoor_id_prefix
+                );
+                return None;
+            };
+        let b0_trapdoor = if let Some(td) = TS::trapdoor_from_bytes(params, &trapdoor_bytes) {
+            td
+        } else {
+            warn!(
+                "Failed to decode B0 trapdoor bytes (dir={}, id_prefix={}, index=0)",
+                dir.display(),
+                b0_trapdoor_id_prefix
+            );
+            return None;
+        };
+        let b0_matrix = M::from_compact_bytes(params, &b0_bytes);
+        info!(
+            "Loaded B0 checkpoint (dir={}, matrix_id_prefix={}, trapdoor_id_prefix={})",
+            dir.display(),
+            b0_id_prefix,
+            b0_trapdoor_id_prefix
+        );
+        Some((b0_trapdoor, b0_matrix))
+    }
+
+    pub fn load_b0_matrix_checkpoint(&self, params: &<M::P as Poly>::Params) -> Option<M> {
+        let checkpoint_prefix = self.aux_checkpoint_prefix(params);
+        let b0_id_prefix = format!("{checkpoint_prefix}_b0");
+        let dir = self.dir_path.as_path();
+        let bytes = read_bytes_from_multi_batch(dir, &b0_id_prefix, 0)?;
+        Some(M::from_compact_bytes(params, &bytes))
+    }
+
     pub fn sample_aux_matrices(&self, params: &<M::P as Poly>::Params) {
         info!("Sampling LUT and gate auxiliary matrices");
         let start = Instant::now();
         let chunk_size = crate::env::lut_preimage_chunk_size();
         let checkpoint_prefix = self.aux_checkpoint_prefix(params);
         let checkpoint_index = self.load_checkpoint_index();
-        let has_aux_outputs = Self::has_any_aux_outputs(checkpoint_index.as_ref());
 
         let lut_ids: Vec<usize> = self.lut_state.iter().map(|entry| *entry.key()).collect();
         let mut lut_entries = Vec::with_capacity(lut_ids.len());
-        for lut_id in lut_ids {
+        for &lut_id in &lut_ids {
             if let Some((_, plt)) = self.lut_state.remove(&lut_id) {
                 lut_entries.push((lut_id, plt));
             }
@@ -472,36 +536,58 @@ where
         );
         let gate_ids: Vec<GateId> = self.gate_state.iter().map(|entry| *entry.key()).collect();
         let mut gate_entries = Vec::with_capacity(gate_ids.len());
-        for gate_id in gate_ids {
+        for &gate_id in &gate_ids {
             if let Some((_, state)) = self.gate_state.remove(&gate_id) {
                 gate_entries.push((gate_id, state));
             }
         }
+        let has_resume_candidates =
+            Self::has_resume_candidates(checkpoint_index.as_ref(), &lut_ids, &gate_ids);
         let total_gate_count = gate_entries.len();
         debug!("Gate sampling start: total_gates={}, chunk_size={}", total_gate_count, chunk_size);
 
-        let d = self.b0_matrix.row_size();
+        let d = self.d;
         info!("Sampling auxiliary matrices with d = {}", d);
         let m_g = d * params.modulus_digits();
+        let mut persist_b0_checkpoint: Option<(M, Vec<u8>)> = None;
+        let (b0_trapdoor, b0_matrix, b0_loaded_from_checkpoint) = if let Some((
+            b0_trapdoor,
+            b0_matrix,
+        )) =
+            self.load_b0_checkpoint(params, &checkpoint_prefix)
+        {
+            info!("Resumed B0 checkpoint with prefix={checkpoint_prefix}");
+            (b0_trapdoor, b0_matrix, true)
+        } else {
+            let trap_sampler = TS::new(params, self.trapdoor_sigma);
+            let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, d);
+            persist_b0_checkpoint = Some((b0_matrix.clone(), TS::trapdoor_to_bytes(&b0_trapdoor)));
+            (b0_trapdoor, b0_matrix, false)
+        };
         let mut persist_b1_checkpoint: Option<(M, Vec<u8>)> = None;
-        let (b1_trapdoor, b1_matrix, b1_loaded_from_checkpoint) =
-            if let Some((b1_trapdoor, b1_matrix)) =
-                self.load_b1_checkpoint(params, &checkpoint_prefix)
-            {
-                info!("Resumed B1 checkpoint with prefix={checkpoint_prefix}");
-                (b1_trapdoor, b1_matrix, true)
-            } else {
-                let trap_sampler = TS::new(params, self.trapdoor_sigma);
-                let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, 2 * d);
-                persist_b1_checkpoint =
-                    Some((b1_matrix.clone(), TS::trapdoor_to_bytes(&b1_trapdoor)));
-                (b1_trapdoor, b1_matrix, false)
-            };
+        let (b1_trapdoor, b1_matrix, b1_loaded_from_checkpoint) = if let Some((
+            b1_trapdoor,
+            b1_matrix,
+        )) =
+            self.load_b1_checkpoint(params, &checkpoint_prefix)
+        {
+            info!("Resumed B1 checkpoint with prefix={checkpoint_prefix}");
+            (b1_trapdoor, b1_matrix, true)
+        } else {
+            let trap_sampler = TS::new(params, self.trapdoor_sigma);
+            let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, 2 * d);
+            persist_b1_checkpoint = Some((b1_matrix.clone(), TS::trapdoor_to_bytes(&b1_trapdoor)));
+            (b1_trapdoor, b1_matrix, false)
+        };
 
-        let checkpoint_index_for_resume = if has_aux_outputs && !b1_loaded_from_checkpoint {
+        let checkpoint_index_for_resume = if has_resume_candidates &&
+            (!b0_loaded_from_checkpoint || !b1_loaded_from_checkpoint)
+        {
             warn!(
-                "Auxiliary outputs exist but B1 checkpoint is missing (prefix={checkpoint_prefix}); \
-resuming is disabled and auxiliary matrices will be resampled from scratch"
+                "Auxiliary outputs exist but B0/B1 checkpoint is missing (prefix={checkpoint_prefix}, b0_loaded={}, b1_loaded={}); \
+resuming is disabled and auxiliary matrices will be resampled from scratch",
+                b0_loaded_from_checkpoint,
+                b1_loaded_from_checkpoint
             );
             None
         } else {
@@ -514,7 +600,34 @@ resuming is disabled and auxiliary matrices will be resampled from scratch"
             checkpoint_prefix
         );
 
-        // Checkpoint verification phase. No add_lookup_buffer should run before this phase ends.
+        if let Some((b0_matrix_for_save, b0_trapdoor_bytes)) = persist_b0_checkpoint {
+            let b0_id_prefix = format!("{checkpoint_prefix}_b0");
+            let b0_trapdoor_id_prefix = format!("{checkpoint_prefix}_b0_trapdoor");
+            info!(
+                "Persisting newly generated B0 checkpoint (matrix_id_prefix={}, trapdoor_id_prefix={})",
+                b0_id_prefix, b0_trapdoor_id_prefix
+            );
+            add_lookup_buffer(get_lookup_buffer(vec![(0, b0_matrix_for_save)], &b0_id_prefix));
+            add_lookup_buffer(get_lookup_buffer_bytes(
+                vec![(0, b0_trapdoor_bytes)],
+                &b0_trapdoor_id_prefix,
+            ));
+        }
+        if let Some((b1_matrix_for_save, b1_trapdoor_bytes)) = persist_b1_checkpoint {
+            let b1_id_prefix = format!("{checkpoint_prefix}_b1");
+            let b1_trapdoor_id_prefix = format!("{checkpoint_prefix}_b1_trapdoor");
+            info!(
+                "Persisting newly generated B1 checkpoint (matrix_id_prefix={}, trapdoor_id_prefix={})",
+                b1_id_prefix, b1_trapdoor_id_prefix
+            );
+            add_lookup_buffer(get_lookup_buffer(vec![(0, b1_matrix_for_save)], &b1_id_prefix));
+            add_lookup_buffer(get_lookup_buffer_bytes(
+                vec![(0, b1_trapdoor_bytes)],
+                &b1_trapdoor_id_prefix,
+            ));
+        }
+
+        // Checkpoint verification phase.
         let mut processed_lut_rows = 0usize;
         let mut resumed_lut_rows = 0usize;
         let mut lut_plans = Vec::with_capacity(lut_entries.len());
@@ -552,24 +665,10 @@ resuming is disabled and auxiliary matrices will be resampled from scratch"
             }
         }
         info!(
-            "Checkpoint verification completed before writes (pending_lut_rows={}, pending_gates={})",
+            "Checkpoint verification completed (pending_lut_rows={}, pending_gates={})",
             total_lut_rows.saturating_sub(resumed_lut_rows),
             total_gate_count.saturating_sub(resumed_gates)
         );
-
-        if let Some((b1_matrix_for_save, b1_trapdoor_bytes)) = persist_b1_checkpoint {
-            let b1_id_prefix = format!("{checkpoint_prefix}_b1");
-            let b1_trapdoor_id_prefix = format!("{checkpoint_prefix}_b1_trapdoor");
-            info!(
-                "Persisting newly generated B1 checkpoint (matrix_id_prefix={}, trapdoor_id_prefix={})",
-                b1_id_prefix, b1_trapdoor_id_prefix
-            );
-            add_lookup_buffer(get_lookup_buffer(vec![(0, b1_matrix_for_save)], &b1_id_prefix));
-            add_lookup_buffer(get_lookup_buffer_bytes(
-                vec![(0, b1_trapdoor_bytes)],
-                &b1_trapdoor_id_prefix,
-            ));
-        }
 
         for (lut_id, plt, completed_rows, mut part_idx, resumed_rows_for_lut) in lut_plans {
             let lut_start = Instant::now();
@@ -653,8 +752,6 @@ resuming is disabled and auxiliary matrices will be resampled from scratch"
             return;
         }
 
-        let b0_trapdoor = self.b0_trapdoor.clone();
-        let b0_matrix = self.b0_matrix.clone();
         let error_sigma = self.error_sigma;
         let trapdoor_sigma = self.trapdoor_sigma;
 
@@ -1034,7 +1131,7 @@ mod test {
         storage::write::{init_storage_system, storage_test_lock, wait_for_all_writes},
     };
     use keccak_asm::Keccak256;
-    use std::{fs, path::Path, sync::Arc};
+    use std::{fs, path::Path};
 
     fn setup_lsb_constant_binary_plt(t_n: usize, params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {
         PublicLut::<DCRTPoly>::new_from_usize_range(
@@ -1086,10 +1183,7 @@ mod test {
         let enc_one = encodings[0].clone();
         let enc1 = encodings[1].clone();
 
-        let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
-        let (b0_trapdoor, b0) = trapdoor_sampler.trapdoor(&params, d);
         let s_vec = DCRTPolyMatrix::from_poly_vec_row(&params, secrets);
-        let c_b0 = s_vec.clone() * &b0;
 
         // Storage directory
         let dir_path = "test_data/test_ggh15_plt_eval_single_input";
@@ -1104,20 +1198,13 @@ mod test {
 
         let error_sigma = 0.0;
         let insert_1_to_s = false;
-        let plt_pubkey_evaluator = GGH15BGGPubKeyPltEvaluator::<
-            DCRTPolyMatrix,
-            DCRTPolyUniformSampler,
-            DCRTPolyHashSampler<Keccak256>,
-            DCRTPolyTrapdoorSampler,
-        >::new(
-            key,
-            SIGMA,
-            error_sigma,
-            Arc::new(b0),
-            Arc::new(b0_trapdoor),
-            dir_path.into(),
-            insert_1_to_s,
-        );
+        let plt_pubkey_evaluator =
+            GGH15BGGPubKeyPltEvaluator::<
+                DCRTPolyMatrix,
+                DCRTPolyUniformSampler,
+                DCRTPolyHashSampler<Keccak256>,
+                DCRTPolyTrapdoorSampler,
+            >::new(key, d, SIGMA, error_sigma, dir_path.into(), insert_1_to_s);
 
         let result_pubkey = circuit.eval(
             &params,
@@ -1129,6 +1216,10 @@ mod test {
         wait_for_all_writes(dir.to_path_buf()).await.unwrap();
         assert_eq!(result_pubkey.len(), 1);
         let result_pubkey = &result_pubkey[0];
+        let b0_matrix = plt_pubkey_evaluator
+            .load_b0_matrix_checkpoint(&params)
+            .expect("b0 matrix checkpoint should exist after sample_aux_matrices");
+        let c_b0 = s_vec.clone() * &b0_matrix;
 
         let plt_encoding_evaluator = GGH15BGGEncodingPltEvaluator::<
             DCRTPolyMatrix,
@@ -1201,10 +1292,7 @@ mod test {
         let input_pubkeys = pubkeys[1..].to_vec();
         let input_encodings = encodings[1..].to_vec();
 
-        let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
-        let (b0_trapdoor, b0) = trapdoor_sampler.trapdoor(&params, d);
         let s_vec = DCRTPolyMatrix::from_poly_vec_row(&params, secrets);
-        let c_b0 = s_vec.clone() * &b0;
 
         // Storage directory
         let dir_path = "test_data/test_ggh15_plt_eval_multi_inputs";
@@ -1219,26 +1307,23 @@ mod test {
 
         let error_sigma = 0.0;
         let insert_1_to_s = false;
-        let plt_pubkey_evaluator = GGH15BGGPubKeyPltEvaluator::<
-            DCRTPolyMatrix,
-            DCRTPolyUniformSampler,
-            DCRTPolyHashSampler<Keccak256>,
-            DCRTPolyTrapdoorSampler,
-        >::new(
-            key,
-            SIGMA,
-            error_sigma,
-            Arc::new(b0),
-            Arc::new(b0_trapdoor),
-            dir_path.into(),
-            insert_1_to_s,
-        );
+        let plt_pubkey_evaluator =
+            GGH15BGGPubKeyPltEvaluator::<
+                DCRTPolyMatrix,
+                DCRTPolyUniformSampler,
+                DCRTPolyHashSampler<Keccak256>,
+                DCRTPolyTrapdoorSampler,
+            >::new(key, d, SIGMA, error_sigma, dir_path.into(), insert_1_to_s);
 
         let result_pubkey =
             circuit.eval(&params, &enc_one.pubkey, &input_pubkeys, Some(&plt_pubkey_evaluator));
         plt_pubkey_evaluator.sample_aux_matrices(&params);
         wait_for_all_writes(dir.to_path_buf()).await.unwrap();
         assert_eq!(result_pubkey.len(), input_size);
+        let b0_matrix = plt_pubkey_evaluator
+            .load_b0_matrix_checkpoint(&params)
+            .expect("b0 matrix checkpoint should exist after sample_aux_matrices");
+        let c_b0 = s_vec.clone() * &b0_matrix;
 
         let plt_encoding_evaluator = GGH15BGGEncodingPltEvaluator::<
             DCRTPolyMatrix,

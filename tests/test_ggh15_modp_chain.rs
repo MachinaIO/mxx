@@ -14,8 +14,8 @@ use mxx::{
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
     sampler::{
-        DistType, PolyTrapdoorSampler, PolyUniformSampler, hash::DCRTPolyHashSampler,
-        trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
+        DistType, PolyUniformSampler, hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
+        uniform::DCRTPolyUniformSampler,
     },
     simulator::{SimulatorContext, error_norm::NormPltGGH15Evaluator},
     storage::write::{init_storage_system, wait_for_all_writes},
@@ -207,11 +207,6 @@ async fn test_ggh15_modp_chain_rounding() {
     let input_encodings = encodings[1..].to_vec();
 
     let trapdoor_sigma = 4.578;
-    let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, trapdoor_sigma);
-    let (b0_trapdoor, b0_matrix) = trapdoor_sampler.trapdoor(&params, D_SECRET);
-    let b0_matrix = Arc::new(b0_matrix);
-    let b0_trapdoor = Arc::new(b0_trapdoor);
-
     let dir = Path::new("test_data/ggh15_modp_chain_rounding");
     if !dir.exists() {
         fs::create_dir_all(dir).unwrap();
@@ -220,20 +215,13 @@ async fn test_ggh15_modp_chain_rounding() {
 
     info!("plt pubkey evaluator setup start");
     let insert_1_to_s = false;
-    let plt_pubkey_evaluator = GGH15BGGPubKeyPltEvaluator::<
-        DCRTPolyMatrix,
-        DCRTPolyUniformSampler,
-        DCRTPolyHashSampler<Keccak256>,
-        DCRTPolyTrapdoorSampler,
-    >::new(
-        key,
-        trapdoor_sigma,
-        ERROR_SIGMA,
-        b0_matrix.clone(),
-        b0_trapdoor,
-        dir.to_path_buf(),
-        insert_1_to_s,
-    );
+    let plt_pubkey_evaluator =
+        GGH15BGGPubKeyPltEvaluator::<
+            DCRTPolyMatrix,
+            DCRTPolyUniformSampler,
+            DCRTPolyHashSampler<Keccak256>,
+            DCRTPolyTrapdoorSampler,
+        >::new(key, D_SECRET, trapdoor_sigma, ERROR_SIGMA, dir.to_path_buf(), insert_1_to_s);
     info!("plt pubkey evaluator setup done");
 
     info!("circuit eval pubkey start");
@@ -245,7 +233,10 @@ async fn test_ggh15_modp_chain_rounding() {
 
     wait_for_all_writes(dir.to_path_buf()).await.unwrap();
 
-    let c_b0 = s_vec.clone() * b0_matrix.as_ref();
+    let b0_matrix = plt_pubkey_evaluator
+        .load_b0_matrix_checkpoint(&params)
+        .expect("b0 matrix checkpoint should exist after sample_aux_matrices");
+    let c_b0 = s_vec.clone() * &b0_matrix;
     info!("plt encoding evaluator setup start");
     let plt_encoding_evaluator = GGH15BGGEncodingPltEvaluator::<
         DCRTPolyMatrix,

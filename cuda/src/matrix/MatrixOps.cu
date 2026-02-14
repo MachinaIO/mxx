@@ -2183,10 +2183,57 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
         tmp_inputs.reserve(count);
         for (size_t i = 0; i < count; ++i)
         {
-            GpuPoly *clone = nullptr;
-            int status = gpu_poly_clone(src->polys[i], &clone);
+            int status = sync_poly_partition_streams(
+                src->polys[i],
+                "failed to synchronize source partition stream before clone in gpu_matrix_decompose_base");
             if (status != 0)
             {
+                for (auto *p : tmp_inputs)
+                {
+                    gpu_poly_destroy(p);
+                }
+                return status;
+            }
+            status = sync_poly_limb_streams(
+                src->polys[i],
+                "failed to synchronize source limb stream before clone in gpu_matrix_decompose_base");
+            if (status != 0)
+            {
+                for (auto *p : tmp_inputs)
+                {
+                    gpu_poly_destroy(p);
+                }
+                return status;
+            }
+
+            GpuPoly *clone = nullptr;
+            status = gpu_poly_clone(src->polys[i], &clone);
+            if (status != 0)
+            {
+                for (auto *p : tmp_inputs)
+                {
+                    gpu_poly_destroy(p);
+                }
+                return status;
+            }
+            status = sync_poly_partition_streams(
+                clone,
+                "failed to synchronize clone partition stream before gpu_poly_intt in gpu_matrix_decompose_base");
+            if (status != 0)
+            {
+                gpu_poly_destroy(clone);
+                for (auto *p : tmp_inputs)
+                {
+                    gpu_poly_destroy(p);
+                }
+                return status;
+            }
+            status = sync_poly_limb_streams(
+                clone,
+                "failed to synchronize clone limb stream before gpu_poly_intt in gpu_matrix_decompose_base");
+            if (status != 0)
+            {
+                gpu_poly_destroy(clone);
                 for (auto *p : tmp_inputs)
                 {
                     gpu_poly_destroy(p);
@@ -2216,30 +2263,6 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
     }
 
     // Ensure all pending source-side INTT work is finished before one-shot kernels.
-    for (int device : src->ctx->gpu_ids)
-    {
-        cudaError_t err = cudaSetDevice(device);
-        if (err != cudaSuccess)
-        {
-            for (auto *p : tmp_inputs)
-            {
-                gpu_poly_destroy(p);
-            }
-            return set_error(err);
-        }
-        err = cudaDeviceSynchronize();
-        if (err != cudaSuccess)
-        {
-            for (auto *p : tmp_inputs)
-            {
-                gpu_poly_destroy(p);
-            }
-            return set_error(err);
-        }
-    }
-
-    // Ensure all pending INTT work has completed before reading source limbs
-    // from different streams in the sampling kernels.
     for (int device : src->ctx->gpu_ids)
     {
         cudaError_t err = cudaSetDevice(device);

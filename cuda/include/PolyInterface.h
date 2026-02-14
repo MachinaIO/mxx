@@ -59,6 +59,12 @@ struct GpuMatrix
     int level;
     PolyFormat format;
     std::vector<GpuPoly *> polys;
+    struct SharedLimbBuffer
+    {
+        int device;
+        uint64_t *ptr;
+    };
+    std::vector<SharedLimbBuffer> shared_limb_buffers;
 };
 
 extern "C" int gpu_set_last_error(const char *msg);

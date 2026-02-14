@@ -1456,6 +1456,69 @@ extern "C" int gpu_block_mul_timed(
     return gpu_block_matmul(out, lhs, rhs, rows, inner, cols, out_kernel_ms);
 }
 
+namespace
+{
+    bool checked_mul_size(size_t a, size_t b, size_t *out)
+    {
+        if (!out)
+        {
+            return false;
+        }
+        if (a != 0 && b > static_cast<size_t>(-1) / a)
+        {
+            return false;
+        }
+        *out = a * b;
+        return true;
+    }
+
+    size_t limb_count_for_level(const std::vector<FIDESlib::LimbRecord> &meta, int level)
+    {
+        size_t count = 0;
+        for (const auto &record : meta)
+        {
+            if (record.id > level)
+            {
+                break;
+            }
+            ++count;
+        }
+        return count;
+    }
+
+    void free_matrix_shared_limb_buffers(GpuMatrix *mat)
+    {
+        if (!mat)
+        {
+            return;
+        }
+        for (const auto &entry : mat->shared_limb_buffers)
+        {
+            if (!entry.ptr)
+            {
+                continue;
+            }
+            cudaSetDevice(entry.device);
+            cudaFree(entry.ptr);
+        }
+        mat->shared_limb_buffers.clear();
+    }
+
+    void destroy_matrix_contents(GpuMatrix *mat)
+    {
+        if (!mat)
+        {
+            return;
+        }
+        for (auto *poly : mat->polys)
+        {
+            gpu_poly_destroy(poly);
+        }
+        mat->polys.clear();
+        free_matrix_shared_limb_buffers(mat);
+    }
+}
+
 extern "C" int gpu_matrix_create(
     GpuContext *ctx,
     int level,
@@ -1468,29 +1531,198 @@ extern "C" int gpu_matrix_create(
     {
         return set_error("invalid gpu_matrix_create arguments");
     }
+    *out = nullptr;
     PolyFormat fmt;
     if (!parse_format(format, fmt))
     {
         return set_error("invalid format in gpu_matrix_create");
     }
-
-    auto *mat = new GpuMatrix{ctx, rows, cols, level, fmt, {}};
-    const size_t count = rows * cols;
-    mat->polys.reserve(count);
-    for (size_t i = 0; i < count; ++i)
+    if (level < -1 || level > ctx->ctx->L)
     {
-        GpuPoly *poly = nullptr;
-        int status = gpu_poly_create(ctx, level, &poly);
-        if (status != 0)
+        return set_error("invalid level in gpu_matrix_create");
+    }
+
+    size_t count = 0;
+    if (!checked_mul_size(rows, cols, &count))
+    {
+        return set_error("matrix size overflow in gpu_matrix_create");
+    }
+
+    auto *mat = new GpuMatrix{ctx, rows, cols, level, fmt, {}, {}};
+    mat->polys.reserve(count);
+    const size_t partition_count = ctx->ctx->meta.size();
+    if (partition_count != ctx->ctx->GPUid.size())
+    {
+        destroy_matrix_contents(mat);
+        delete mat;
+        return set_error("unexpected context partition mapping in gpu_matrix_create");
+    }
+
+    std::vector<size_t> limb_counts(partition_count, 0);
+    std::vector<size_t> words_per_poly(partition_count, 0);
+    std::vector<size_t> words_total(partition_count, 0);
+    std::vector<uint64_t *> device_bases(partition_count, nullptr);
+    std::vector<FIDESlib::Stream *> alloc_streams(partition_count, nullptr);
+    const size_t n = static_cast<size_t>(ctx->N);
+
+    for (size_t partition_idx = 0; partition_idx < partition_count; ++partition_idx)
+    {
+        auto &meta = ctx->ctx->meta[partition_idx];
+        const size_t limbs = limb_count_for_level(meta, level);
+        limb_counts[partition_idx] = limbs;
+        if (limbs == 0 || count == 0)
         {
-            for (auto *p : mat->polys)
-            {
-                gpu_poly_destroy(p);
-            }
-            delete mat;
-            return status;
+            continue;
         }
-        poly->format = fmt;
+
+        size_t limb_words = 0;
+        size_t poly_words = 0;
+        size_t total_words = 0;
+        size_t total_bytes = 0;
+        if (!checked_mul_size(n, limbs, &limb_words) ||
+            !checked_mul_size(limb_words, static_cast<size_t>(2), &poly_words) ||
+            !checked_mul_size(poly_words, count, &total_words) ||
+            !checked_mul_size(total_words, sizeof(uint64_t), &total_bytes))
+        {
+            destroy_matrix_contents(mat);
+            delete mat;
+            return set_error("matrix limb allocation overflow in gpu_matrix_create");
+        }
+
+        cudaError_t err = cudaSetDevice(ctx->ctx->GPUid[partition_idx]);
+        if (err != cudaSuccess)
+        {
+            destroy_matrix_contents(mat);
+            delete mat;
+            return set_error(err);
+        }
+
+        FIDESlib::Stream *alloc_stream = nullptr;
+        for (size_t limb_idx = 0; limb_idx < meta.size(); ++limb_idx)
+        {
+            if (meta[limb_idx].id > level)
+            {
+                break;
+            }
+            alloc_stream = &meta[limb_idx].stream;
+            break;
+        }
+        if (!alloc_stream || !alloc_stream->ptr)
+        {
+            destroy_matrix_contents(mat);
+            delete mat;
+            return set_error("missing allocation stream in gpu_matrix_create");
+        }
+
+        uint64_t *base = nullptr;
+        err = cudaMallocAsync(&base, total_bytes, alloc_stream->ptr);
+        if (err != cudaSuccess)
+        {
+            destroy_matrix_contents(mat);
+            delete mat;
+            return set_error(err);
+        }
+
+        for (size_t limb_idx = 0; limb_idx < meta.size(); ++limb_idx)
+        {
+            if (meta[limb_idx].id > level)
+            {
+                break;
+            }
+            FIDESlib::Stream *limb_stream = &meta[limb_idx].stream;
+            if (limb_stream != alloc_stream)
+            {
+                limb_stream->wait(*alloc_stream);
+            }
+        }
+
+        device_bases[partition_idx] = base;
+        alloc_streams[partition_idx] = alloc_stream;
+        words_per_poly[partition_idx] = poly_words;
+        words_total[partition_idx] = total_words;
+        mat->shared_limb_buffers.push_back(GpuMatrix::SharedLimbBuffer{
+            ctx->ctx->GPUid[partition_idx],
+            base});
+    }
+
+    std::vector<size_t> words_used(partition_count, 0);
+    for (size_t poly_idx = 0; poly_idx < count; ++poly_idx)
+    {
+        auto *poly_impl = new CKKS::RNSPoly(*ctx->ctx, -1, false);
+        poly_impl->setLevel(level);
+        auto *poly = new GpuPoly{poly_impl, ctx, level, fmt};
+
+        for (size_t partition_idx = 0; partition_idx < partition_count; ++partition_idx)
+        {
+            const size_t limbs = limb_counts[partition_idx];
+            if (limbs == 0)
+            {
+                continue;
+            }
+            if (partition_idx >= poly_impl->GPU.size())
+            {
+                gpu_poly_destroy(poly);
+                destroy_matrix_contents(mat);
+                delete mat;
+                return set_error("unexpected poly partition size in gpu_matrix_create");
+            }
+
+            auto &partition = poly_impl->GPU[partition_idx];
+            if (partition.device != ctx->ctx->GPUid[partition_idx])
+            {
+                gpu_poly_destroy(poly);
+                destroy_matrix_contents(mat);
+                delete mat;
+                return set_error("unexpected partition device in gpu_matrix_create");
+            }
+
+            uint64_t *base = device_bases[partition_idx];
+            if (!base)
+            {
+                gpu_poly_destroy(poly);
+                destroy_matrix_contents(mat);
+                delete mat;
+                return set_error("missing shared limb buffer in gpu_matrix_create");
+            }
+
+            const size_t poly_words = words_per_poly[partition_idx];
+            const size_t limb_words = poly_words / 2;
+            const size_t offset_words = words_used[partition_idx];
+            if (offset_words > words_total[partition_idx] ||
+                poly_words > words_total[partition_idx] - offset_words)
+            {
+                gpu_poly_destroy(poly);
+                destroy_matrix_contents(mat);
+                delete mat;
+                return set_error("shared limb buffer overflow in gpu_matrix_create");
+            }
+
+            cudaError_t err = cudaSetDevice(partition.device);
+            if (err != cudaSuccess)
+            {
+                gpu_poly_destroy(poly);
+                destroy_matrix_contents(mat);
+                delete mat;
+                return set_error(err);
+            }
+            if (alloc_streams[partition_idx])
+            {
+                partition.s.wait(*alloc_streams[partition_idx]);
+            }
+
+            partition.generate(
+                partition.meta,
+                partition.limb,
+                partition.limbptr,
+                static_cast<int>(limbs) - 1,
+                &partition.auxptr,
+                base,
+                offset_words,
+                base,
+                offset_words + limb_words);
+            words_used[partition_idx] = offset_words + poly_words;
+        }
+
         mat->polys.push_back(poly);
     }
     *out = mat;
@@ -1504,10 +1736,7 @@ extern "C" void gpu_matrix_destroy(GpuMatrix *mat)
         return;
     }
 
-    for (auto *poly : mat->polys)
-    {
-        gpu_poly_destroy(poly);
-    }
+    destroy_matrix_contents(mat);
     delete mat;
 }
 

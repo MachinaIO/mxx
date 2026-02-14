@@ -102,6 +102,7 @@ namespace
 
     void ensure_eval(GpuPoly *poly, int batch)
     {
+        std::lock_guard<std::mutex> guard(poly->ctx->transform_mutex);
         if (poly->format == PolyFormat::Coeff)
         {
             poly->poly->NTT(batch);
@@ -112,6 +113,7 @@ namespace
 
     void ensure_coeff(GpuPoly *poly, int batch)
     {
+        std::lock_guard<std::mutex> guard(poly->ctx->transform_mutex);
         if (poly->format == PolyFormat::Eval)
         {
             poly->poly->INTT(batch);

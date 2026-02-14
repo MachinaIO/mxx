@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <mutex>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -29,6 +30,7 @@ struct GpuContext
     std::vector<int> gpu_ids;
     uint32_t batch;
     std::vector<uint64_t> garner_inverse_table;
+    std::mutex transform_mutex;
 };
 
 struct GpuPoly

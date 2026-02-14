@@ -58,30 +58,40 @@ namespace
     }
 
     template <typename T>
-    __global__ void matrix_decompose_kernel(
+    __global__ void matrix_decompose_multi_kernel(
         const T **src,
         T **dst,
         size_t poly_count,
         size_t n,
-        uint32_t shift,
-        T mask,
-        T out_modulus)
+        size_t job_count,
+        const uint32_t *shifts,
+        const T *masks,
+        const T *out_moduli)
     {
         size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        size_t total = poly_count * n;
+        size_t total = job_count * poly_count * n;
         if (idx >= total)
         {
             return;
         }
-        size_t poly_idx = idx / n;
-        size_t coeff_idx = idx - poly_idx * n;
-        T residue = src[poly_idx][coeff_idx];
+
+        const size_t per_job = poly_count * n;
+        const size_t job_idx = idx / per_job;
+        const size_t rem = idx - job_idx * per_job;
+        const size_t poly_idx = rem / n;
+        const size_t coeff_idx = rem - poly_idx * n;
+
+        const size_t ptr_idx = job_idx * poly_count + poly_idx;
+        T residue = src[ptr_idx][coeff_idx];
+        const uint32_t shift = shifts[job_idx];
+        const T mask = masks[job_idx];
         T digit = shift >= static_cast<uint32_t>(sizeof(T) * 8) ? 0 : ((residue >> shift) & mask);
+        const T out_modulus = out_moduli[job_idx];
         if (out_modulus != 0 && digit >= out_modulus)
         {
             digit %= out_modulus;
         }
-        dst[poly_idx][coeff_idx] = digit;
+        dst[ptr_idx][coeff_idx] = digit;
     }
 
     template <typename T>
@@ -111,6 +121,24 @@ namespace
         {
             out[poly_idx][coeff_idx] = mul_mod_u32(a, b, modulus);
         }
+    }
+
+    template <typename T>
+    __global__ void block_copy_kernel(
+        const T **src,
+        T **dst,
+        size_t poly_count,
+        size_t n)
+    {
+        size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        size_t total = poly_count * n;
+        if (idx >= total)
+        {
+            return;
+        }
+        size_t poly_idx = idx / n;
+        size_t coeff_idx = idx - poly_idx * n;
+        dst[poly_idx][coeff_idx] = src[poly_idx][coeff_idx];
     }
 
     template <typename T>
@@ -492,13 +520,175 @@ namespace
     }
 
     template <typename T>
-    int launch_decompose_kernel(
+    int launch_decompose_multi_kernel(
+        const std::vector<const T *> &src_ptrs,
+        const std::vector<T *> &dst_ptrs,
+        size_t poly_count,
+        size_t n,
+        const std::vector<uint32_t> &shifts,
+        const std::vector<T> &masks,
+        const std::vector<T> &out_moduli,
+        cudaStream_t stream)
+    {
+        const size_t job_count = shifts.size();
+        if (job_count == 0 || poly_count == 0 || n == 0)
+        {
+            return 0;
+        }
+        if (masks.size() != job_count || out_moduli.size() != job_count)
+        {
+            return set_error("unexpected job parameter counts in matrix_decompose_multi_kernel");
+        }
+        const size_t ptr_count = job_count * poly_count;
+        if (src_ptrs.size() != ptr_count || dst_ptrs.size() != ptr_count)
+        {
+            return set_error("unexpected pointer counts in matrix_decompose_multi_kernel");
+        }
+
+        const T **d_src = nullptr;
+        T **d_dst = nullptr;
+        uint32_t *d_shifts = nullptr;
+        T *d_masks = nullptr;
+        T *d_out_moduli = nullptr;
+
+        const size_t ptr_bytes = ptr_count * sizeof(T *);
+        const size_t shift_bytes = job_count * sizeof(uint32_t);
+        const size_t scalar_bytes = job_count * sizeof(T);
+
+        cudaError_t err = cudaMalloc(&d_src, ptr_bytes);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        err = cudaMalloc(&d_dst, ptr_bytes);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_src);
+            return set_error(err);
+        }
+        err = cudaMalloc(&d_shifts, shift_bytes);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_src);
+            cudaFree(d_dst);
+            return set_error(err);
+        }
+        err = cudaMalloc(&d_masks, scalar_bytes);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_src);
+            cudaFree(d_dst);
+            cudaFree(d_shifts);
+            return set_error(err);
+        }
+        err = cudaMalloc(&d_out_moduli, scalar_bytes);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_src);
+            cudaFree(d_dst);
+            cudaFree(d_shifts);
+            cudaFree(d_masks);
+            return set_error(err);
+        }
+
+        err = cudaMemcpyAsync(d_src, src_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_src);
+            cudaFree(d_dst);
+            cudaFree(d_shifts);
+            cudaFree(d_masks);
+            cudaFree(d_out_moduli);
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_src);
+            cudaFree(d_dst);
+            cudaFree(d_shifts);
+            cudaFree(d_masks);
+            cudaFree(d_out_moduli);
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(d_shifts, shifts.data(), shift_bytes, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_src);
+            cudaFree(d_dst);
+            cudaFree(d_shifts);
+            cudaFree(d_masks);
+            cudaFree(d_out_moduli);
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(d_masks, masks.data(), scalar_bytes, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_src);
+            cudaFree(d_dst);
+            cudaFree(d_shifts);
+            cudaFree(d_masks);
+            cudaFree(d_out_moduli);
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(d_out_moduli, out_moduli.data(), scalar_bytes, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_src);
+            cudaFree(d_dst);
+            cudaFree(d_shifts);
+            cudaFree(d_masks);
+            cudaFree(d_out_moduli);
+            return set_error(err);
+        }
+
+        const int threads = 256;
+        const size_t total = ptr_count * n;
+        const int blocks = static_cast<int>((total + threads - 1) / threads);
+        matrix_decompose_multi_kernel<<<blocks, threads, 0, stream>>>(
+            d_src,
+            d_dst,
+            poly_count,
+            n,
+            job_count,
+            d_shifts,
+            d_masks,
+            d_out_moduli);
+        err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_src);
+            cudaFree(d_dst);
+            cudaFree(d_shifts);
+            cudaFree(d_masks);
+            cudaFree(d_out_moduli);
+            return set_error(err);
+        }
+
+        err = cudaStreamSynchronize(stream);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_src);
+            cudaFree(d_dst);
+            cudaFree(d_shifts);
+            cudaFree(d_masks);
+            cudaFree(d_out_moduli);
+            return set_error(err);
+        }
+
+        cudaFree(d_src);
+        cudaFree(d_dst);
+        cudaFree(d_shifts);
+        cudaFree(d_masks);
+        cudaFree(d_out_moduli);
+        return 0;
+    }
+
+    template <typename T>
+    int launch_copy_kernel(
         const std::vector<const T *> &src_ptrs,
         const std::vector<T *> &dst_ptrs,
         size_t n,
-        uint32_t shift,
-        T mask,
-        T out_modulus,
         cudaStream_t stream)
     {
         const size_t count = src_ptrs.size();
@@ -508,7 +698,7 @@ namespace
         }
         if (dst_ptrs.size() != count)
         {
-            return set_error("unexpected pointer counts in matrix_decompose_kernel");
+            return set_error("unexpected pointer counts in block_copy_kernel");
         }
 
         const T **d_src = nullptr;
@@ -546,14 +736,7 @@ namespace
         const size_t total = count * n;
         const int blocks = static_cast<int>((total + threads - 1) / threads);
 
-        matrix_decompose_kernel<<<blocks, threads, 0, stream>>>(
-            d_src,
-            d_dst,
-            count,
-            n,
-            shift,
-            mask,
-            out_modulus);
+        block_copy_kernel<<<blocks, threads, 0, stream>>>(d_src, d_dst, count, n);
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -572,6 +755,194 @@ namespace
 
         cudaFree(d_src);
         cudaFree(d_dst);
+        return 0;
+    }
+
+    bool has_stream_ref(const std::vector<FIDESlib::Stream *> &streams, FIDESlib::Stream *candidate)
+    {
+        for (auto *stream : streams)
+        {
+            if (stream == candidate)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    template <typename T>
+    int launch_copy_for_limb(
+        GpuMatrix *out,
+        const GpuMatrix *src,
+        const std::vector<size_t> &src_indices,
+        const std::vector<size_t> &dst_indices,
+        const dim3 &limb_id,
+        size_t n)
+    {
+        const size_t count = src_indices.size();
+        if (count == 0)
+        {
+            return 0;
+        }
+        if (dst_indices.size() != count)
+        {
+            return set_error("mismatched index counts in launch_copy_for_limb");
+        }
+
+        std::vector<const T *> src_ptrs;
+        std::vector<T *> dst_ptrs;
+        std::vector<FIDESlib::Stream *> src_streams;
+        std::vector<FIDESlib::Stream *> dst_streams;
+        src_ptrs.reserve(count);
+        dst_ptrs.reserve(count);
+        src_streams.reserve(count);
+        dst_streams.reserve(count);
+
+        FIDESlib::Stream *exec_stream_ref = nullptr;
+        cudaStream_t exec_stream = nullptr;
+        int device = -1;
+
+        for (size_t i = 0; i < count; ++i)
+        {
+            const GpuPoly *src_poly = src->polys[src_indices[i]];
+            GpuPoly *dst_poly = out->polys[dst_indices[i]];
+            if (!src_poly || !dst_poly)
+            {
+                return set_error("null polynomial in launch_copy_for_limb");
+            }
+            if (limb_id.x >= src_poly->poly->GPU.size() || limb_id.x >= dst_poly->poly->GPU.size())
+            {
+                return set_error("unexpected limb GPU partition in launch_copy_for_limb");
+            }
+
+            const auto &src_partition = src_poly->poly->GPU[limb_id.x];
+            auto &dst_partition = dst_poly->poly->GPU[limb_id.x];
+            if (src_partition.device != dst_partition.device)
+            {
+                return set_error("source/destination device mismatch in launch_copy_for_limb");
+            }
+            if (limb_id.y >= src_partition.limb.size() || limb_id.y >= dst_partition.limb.size())
+            {
+                return set_error("unexpected limb index in launch_copy_for_limb");
+            }
+
+            const auto &src_limb = src_partition.limb[limb_id.y];
+            auto &dst_limb = dst_partition.limb[limb_id.y];
+            if constexpr (std::is_same_v<T, uint64_t>)
+            {
+                if (src_limb.index() != FIDESlib::U64 || dst_limb.index() != FIDESlib::U64)
+                {
+                    return set_error("mixed limb types in launch_copy_for_limb");
+                }
+                const auto &src_u64 = std::get<FIDESlib::U64>(src_limb);
+                auto &dst_u64 = std::get<FIDESlib::U64>(dst_limb);
+                src_ptrs.push_back(src_u64.v.data);
+                dst_ptrs.push_back(dst_u64.v.data);
+
+                auto *src_stream_ref = &src_u64.stream;
+                auto *dst_stream_ref = &dst_u64.stream;
+                if (!has_stream_ref(src_streams, src_stream_ref))
+                {
+                    src_streams.push_back(src_stream_ref);
+                }
+                if (!has_stream_ref(dst_streams, dst_stream_ref))
+                {
+                    dst_streams.push_back(dst_stream_ref);
+                }
+
+                if (!exec_stream_ref)
+                {
+                    exec_stream_ref = dst_stream_ref;
+                    exec_stream = dst_u64.stream.ptr;
+                    device = dst_partition.device;
+                }
+                else if (device != dst_partition.device)
+                {
+                    return set_error("inconsistent copy device in launch_copy_for_limb");
+                }
+            }
+            else
+            {
+                if (src_limb.index() != FIDESlib::U32 || dst_limb.index() != FIDESlib::U32)
+                {
+                    return set_error("mixed limb types in launch_copy_for_limb");
+                }
+                const auto &src_u32 = std::get<FIDESlib::U32>(src_limb);
+                auto &dst_u32 = std::get<FIDESlib::U32>(dst_limb);
+                src_ptrs.push_back(src_u32.v.data);
+                dst_ptrs.push_back(dst_u32.v.data);
+
+                auto *src_stream_ref = &src_u32.stream;
+                auto *dst_stream_ref = &dst_u32.stream;
+                if (!has_stream_ref(src_streams, src_stream_ref))
+                {
+                    src_streams.push_back(src_stream_ref);
+                }
+                if (!has_stream_ref(dst_streams, dst_stream_ref))
+                {
+                    dst_streams.push_back(dst_stream_ref);
+                }
+
+                if (!exec_stream_ref)
+                {
+                    exec_stream_ref = dst_stream_ref;
+                    exec_stream = dst_u32.stream.ptr;
+                    device = dst_partition.device;
+                }
+                else if (device != dst_partition.device)
+                {
+                    return set_error("inconsistent copy device in launch_copy_for_limb");
+                }
+            }
+        }
+
+        if (!exec_stream_ref || !exec_stream)
+        {
+            return set_error("null execution stream in launch_copy_for_limb");
+        }
+
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+
+        for (auto *src_stream_ref : src_streams)
+        {
+            if (src_stream_ref != exec_stream_ref)
+            {
+                exec_stream_ref->wait(*src_stream_ref);
+            }
+        }
+        for (auto *dst_stream_ref : dst_streams)
+        {
+            if (dst_stream_ref != exec_stream_ref)
+            {
+                exec_stream_ref->wait(*dst_stream_ref);
+            }
+        }
+
+        int status = launch_copy_kernel(src_ptrs, dst_ptrs, n, exec_stream);
+        if (status != 0)
+        {
+            return status;
+        }
+
+        for (auto *dst_stream_ref : dst_streams)
+        {
+            if (dst_stream_ref != exec_stream_ref)
+            {
+                dst_stream_ref->wait(*exec_stream_ref);
+            }
+        }
+        for (auto *src_stream_ref : src_streams)
+        {
+            if (src_stream_ref != exec_stream_ref)
+            {
+                src_stream_ref->wait(*exec_stream_ref);
+            }
+        }
+
         return 0;
     }
 
@@ -1008,40 +1379,16 @@ namespace
     }
 } // namespace
 
-int launch_gauss_samp_gq_arb_base_kernel(
-    const std::vector<const uint64_t *> &src_ptrs,
+int launch_fill_gadget_multi_limb_kernel(
     const std::vector<uint64_t *> &dst_ptrs,
+    size_t poly_count,
     size_t n,
-    uint64_t tower_modulus,
-    uint32_t base_bits,
-    uint32_t digits_per_tower,
-    uint32_t digit_idx,
-    double c,
-    uint32_t tower_idx,
-    uint64_t seed,
-    uint64_t out_modulus,
-    int device,
-    cudaStream_t stream);
-
-int launch_sample_distribution_kernel(
-    const std::vector<uint64_t *> &dst_ptrs,
-    size_t n,
-    uint64_t modulus,
-    int dist_type,
-    double sigma,
-    uint32_t limb_idx,
-    uint64_t seed,
-    cudaStream_t stream);
-
-int launch_fill_gadget_kernel(
-    const std::vector<uint64_t *> &dst_ptrs,
-    size_t n,
-    uint64_t modulus,
+    const std::vector<uint64_t> &moduli,
+    const std::vector<uint32_t> &limb_indices,
     size_t rows,
     size_t cols,
     size_t log_base_q,
     uint32_t digits_per_tower,
-    uint32_t limb_idx,
     uint32_t base_bits,
     cudaStream_t stream);
 
@@ -1478,19 +1825,106 @@ extern "C" int gpu_matrix_copy_block(
         return set_error("context mismatch in gpu_matrix_copy_block");
     }
 
+    const size_t count = rows * cols;
+    if (count == 0)
+    {
+        out->format = src->format;
+        return 0;
+    }
+
+    std::vector<size_t> src_indices;
+    std::vector<size_t> dst_indices;
+    src_indices.reserve(count);
+    dst_indices.reserve(count);
     for (size_t i = 0; i < rows; ++i)
     {
         for (size_t j = 0; j < cols; ++j)
         {
-            const size_t src_idx = matrix_index(src_row + i, src_col + j, src->cols);
-            const size_t dst_idx = matrix_index(dst_row + i, dst_col + j, out->cols);
-            int status = gpu_poly_copy(out->polys[dst_idx], src->polys[src_idx]);
-            if (status != 0)
-            {
-                return status;
-            }
+            src_indices.push_back(matrix_index(src_row + i, src_col + j, src->cols));
+            dst_indices.push_back(matrix_index(dst_row + i, dst_col + j, out->cols));
         }
     }
+
+    const int level = src->level;
+    if (level < 0)
+    {
+        return set_error("invalid level in gpu_matrix_copy_block");
+    }
+    const int N = src->ctx->N;
+    if (N <= 0)
+    {
+        out->format = src->format;
+        return 0;
+    }
+
+    auto &limb_map = src->ctx->ctx->limbGPUid;
+    if (limb_map.size() < static_cast<size_t>(level + 1))
+    {
+        return set_error("unexpected limb mapping size in gpu_matrix_copy_block");
+    }
+
+    for (int limb = 0; limb <= level; ++limb)
+    {
+        const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
+        const GpuPoly *src_poly0 = src->polys[src_indices[0]];
+        if (!src_poly0)
+        {
+            return set_error("null source polynomial in gpu_matrix_copy_block");
+        }
+        if (limb_id.x >= src_poly0->poly->GPU.size())
+        {
+            return set_error("unexpected limb GPU partition in gpu_matrix_copy_block");
+        }
+        const auto &src_partition0 = src_poly0->poly->GPU[limb_id.x];
+        if (limb_id.y >= src_partition0.limb.size())
+        {
+            return set_error("unexpected limb index in gpu_matrix_copy_block");
+        }
+
+        const auto &limb_impl = src_partition0.limb[limb_id.y];
+        int status = 0;
+        if (limb_impl.index() == FIDESlib::U64)
+        {
+            status = launch_copy_for_limb<uint64_t>(
+                out,
+                src,
+                src_indices,
+                dst_indices,
+                limb_id,
+                static_cast<size_t>(N));
+        }
+        else if (limb_impl.index() == FIDESlib::U32)
+        {
+            status = launch_copy_for_limb<uint32_t>(
+                out,
+                src,
+                src_indices,
+                dst_indices,
+                limb_id,
+                static_cast<size_t>(N));
+        }
+        else
+        {
+            return set_error("unsupported limb type in gpu_matrix_copy_block");
+        }
+        if (status != 0)
+        {
+            return status;
+        }
+    }
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        const size_t src_idx = src_indices[i];
+        const size_t dst_idx = dst_indices[i];
+        if (!out->polys[dst_idx] || !src->polys[src_idx])
+        {
+            return set_error("null polynomial after copy in gpu_matrix_copy_block");
+        }
+        out->polys[dst_idx]->level = src->polys[src_idx]->level;
+        out->polys[dst_idx]->format = src->polys[src_idx]->format;
+    }
+
     out->format = src->format;
     return 0;
 }
@@ -1553,12 +1987,34 @@ extern "C" int gpu_matrix_fill_gadget(
         return set_error("output size mismatch in gpu_matrix_fill_gadget");
     }
 
+    struct FillBatch
+    {
+        int device;
+        cudaStream_t stream;
+        std::vector<uint64_t *> dst_ptrs;
+        std::vector<uint64_t> moduli;
+        std::vector<uint32_t> limb_indices;
+    };
+    std::vector<FillBatch> batches;
+    auto get_batch = [&](int device) -> FillBatch & {
+        for (auto &b : batches)
+        {
+            if (b.device == device)
+            {
+                return b;
+            }
+        }
+        batches.push_back(FillBatch{device, nullptr, {}, {}, {}});
+        return batches.back();
+    };
+
     for (int limb = 0; limb <= level; ++limb)
     {
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        std::vector<uint64_t *> dst_ptrs;
-        dst_ptrs.reserve(count);
-        cudaStream_t out_stream = nullptr;
+        std::vector<uint64_t *> limb_ptrs;
+        limb_ptrs.reserve(count);
+        int limb_device = -1;
+        cudaStream_t limb_stream = nullptr;
 
         for (size_t idx = 0; idx < count; ++idx)
         {
@@ -1582,24 +2038,55 @@ extern "C" int gpu_matrix_fill_gadget(
                 return set_error("unsupported limb type in gpu_matrix_fill_gadget");
             }
             auto &limb_u64 = std::get<FIDESlib::U64>(limb_impl);
-            if (!out_stream)
+            if (limb_device == -1)
             {
-                out_stream = limb_u64.stream.ptr;
+                limb_device = partition.device;
+                limb_stream = limb_u64.stream.ptr;
             }
-            dst_ptrs.push_back(limb_u64.v.data);
+            else if (limb_device != partition.device)
+            {
+                return set_error("inconsistent limb device in gpu_matrix_fill_gadget");
+            }
+            limb_ptrs.push_back(limb_u64.v.data);
         }
 
-        int status = launch_fill_gadget_kernel(
-            dst_ptrs,
+        if (limb_device < 0)
+        {
+            return set_error("invalid limb device in gpu_matrix_fill_gadget");
+        }
+        auto &batch = get_batch(limb_device);
+        if (!batch.stream)
+        {
+            batch.stream = limb_stream;
+        }
+        batch.moduli.push_back(out->ctx->moduli[static_cast<size_t>(limb)]);
+        batch.limb_indices.push_back(static_cast<uint32_t>(limb));
+        batch.dst_ptrs.insert(batch.dst_ptrs.end(), limb_ptrs.begin(), limb_ptrs.end());
+    }
+
+    for (auto &batch : batches)
+    {
+        if (!batch.stream)
+        {
+            return set_error("null stream in gpu_matrix_fill_gadget");
+        }
+        cudaError_t err = cudaSetDevice(batch.device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        int status = launch_fill_gadget_multi_limb_kernel(
+            batch.dst_ptrs,
+            count,
             static_cast<size_t>(out->ctx->N),
-            out->ctx->moduli[static_cast<size_t>(limb)],
+            batch.moduli,
+            batch.limb_indices,
             rows,
             cols,
             log_base_q,
             digits_per_tower,
-            static_cast<uint32_t>(limb),
             base_bits,
-            out_stream);
+            batch.stream);
         if (status != 0)
         {
             return status;
@@ -1726,6 +2213,29 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
         }
     }
 
+    // Ensure all pending source-side INTT work is finished before one-shot kernels.
+    for (int device : src->ctx->gpu_ids)
+    {
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess)
+        {
+            for (auto *p : tmp_inputs)
+            {
+                gpu_poly_destroy(p);
+            }
+            return set_error(err);
+        }
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess)
+        {
+            for (auto *p : tmp_inputs)
+            {
+                gpu_poly_destroy(p);
+            }
+            return set_error(err);
+        }
+    }
+
     // Ensure all pending INTT work has completed before reading source limbs
     // from different streams in the sampling kernels.
     for (int device : src->ctx->gpu_ids)
@@ -1759,6 +2269,9 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
         }
         return set_error("unexpected limb mapping size in gpu_matrix_decompose_base");
     }
+
+    std::vector<std::pair<int, cudaStream_t>> out_zero_streams;
+    out_zero_streams.reserve(out->polys.size() * crt_depth);
 
     for (size_t idx = 0; idx < out->polys.size(); ++idx)
     {
@@ -1825,9 +2338,47 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
                 }
                 return set_error(err);
             }
+
+            bool seen_stream = false;
+            for (const auto &entry : out_zero_streams)
+            {
+                if (entry.first == partition.device && entry.second == limb_u64.stream.ptr)
+                {
+                    seen_stream = true;
+                    break;
+                }
+            }
+            if (!seen_stream)
+            {
+                out_zero_streams.emplace_back(partition.device, limb_u64.stream.ptr);
+            }
         }
         poly->format = PolyFormat::Coeff;
         poly->level = level;
+    }
+
+    // Output limbs are zeroed asynchronously on per-limb streams.
+    // Synchronize those streams once before decomposition kernels start.
+    for (const auto &entry : out_zero_streams)
+    {
+        cudaError_t err = cudaSetDevice(entry.first);
+        if (err != cudaSuccess)
+        {
+            for (auto *p : tmp_inputs)
+            {
+                gpu_poly_destroy(p);
+            }
+            return set_error(err);
+        }
+        err = cudaStreamSynchronize(entry.second);
+        if (err != cudaSuccess)
+        {
+            for (auto *p : tmp_inputs)
+            {
+                gpu_poly_destroy(p);
+            }
+            return set_error(err);
+        }
     }
 
     if (src->ctx->moduli.size() < crt_depth)
@@ -1838,6 +2389,29 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
         }
         return set_error("unexpected modulus count in gpu_matrix_decompose_base");
     }
+
+    struct DecomposeBatch
+    {
+        int device;
+        cudaStream_t stream;
+        std::vector<const uint64_t *> src_ptrs;
+        std::vector<uint64_t *> dst_ptrs;
+        std::vector<uint32_t> shifts;
+        std::vector<uint64_t> masks;
+        std::vector<uint64_t> out_moduli;
+    };
+    std::vector<DecomposeBatch> batches;
+    auto get_batch = [&](int device) -> DecomposeBatch & {
+        for (auto &b : batches)
+        {
+            if (b.device == device)
+            {
+                return b;
+            }
+        }
+        batches.push_back(DecomposeBatch{device, nullptr, {}, {}, {}, {}, {}});
+        return batches.back();
+    };
 
     for (int src_limb = 0; src_limb <= level; ++src_limb)
     {
@@ -1870,15 +2444,6 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
         }
 
         const uint32_t src_bits = bit_width_u64(src->ctx->moduli[static_cast<size_t>(src_limb)]);
-        cudaError_t err = cudaSetDevice(src_partition0.device);
-        if (err != cudaSuccess)
-        {
-            for (auto *p : tmp_inputs)
-            {
-                gpu_poly_destroy(p);
-            }
-            return set_error(err);
-        }
 
         for (uint32_t digit_idx = 0; digit_idx < digits_per_tower; ++digit_idx)
         {
@@ -1927,6 +2492,7 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
                 std::vector<uint64_t *> dst_ptrs;
                 dst_ptrs.reserve(count);
                 cudaStream_t out_stream = nullptr;
+                int out_device = -1;
 
                 for (size_t idx = 0; idx < count; ++idx)
                 {
@@ -1965,27 +2531,77 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
                     if (!out_stream)
                     {
                         out_stream = out_limb_u64.stream.ptr;
+                        out_device = out_partition.device;
+                    }
+                    else if (out_device != out_partition.device)
+                    {
+                        for (auto *p : tmp_inputs)
+                        {
+                            gpu_poly_destroy(p);
+                        }
+                        return set_error("inconsistent output limb device in gpu_matrix_decompose_base");
                     }
                     dst_ptrs.push_back(out_limb_u64.v.data);
                 }
 
-                int status = launch_decompose_kernel<uint64_t>(
-                    src_ptrs,
-                    dst_ptrs,
-                    static_cast<size_t>(src->ctx->N),
-                    shift,
-                    mask,
-                    src->ctx->moduli[static_cast<size_t>(out_limb)],
-                    out_stream);
-                if (status != 0)
+                if (out_device < 0 || !out_stream)
                 {
                     for (auto *p : tmp_inputs)
                     {
                         gpu_poly_destroy(p);
                     }
-                    return status;
+                    return set_error("invalid output stream/device in gpu_matrix_decompose_base");
                 }
+
+                auto &batch_ref = get_batch(out_device);
+                if (!batch_ref.stream)
+                {
+                    batch_ref.stream = out_stream;
+                }
+                batch_ref.shifts.push_back(shift);
+                batch_ref.masks.push_back(mask);
+                batch_ref.out_moduli.push_back(src->ctx->moduli[static_cast<size_t>(out_limb)]);
+                batch_ref.src_ptrs.insert(batch_ref.src_ptrs.end(), src_ptrs.begin(), src_ptrs.end());
+                batch_ref.dst_ptrs.insert(batch_ref.dst_ptrs.end(), dst_ptrs.begin(), dst_ptrs.end());
             }
+        }
+    }
+
+    for (auto &batch_ref : batches)
+    {
+        if (!batch_ref.stream)
+        {
+            for (auto *p : tmp_inputs)
+            {
+                gpu_poly_destroy(p);
+            }
+            return set_error("null stream in gpu_matrix_decompose_base");
+        }
+        cudaError_t err = cudaSetDevice(batch_ref.device);
+        if (err != cudaSuccess)
+        {
+            for (auto *p : tmp_inputs)
+            {
+                gpu_poly_destroy(p);
+            }
+            return set_error(err);
+        }
+        int status = launch_decompose_multi_kernel<uint64_t>(
+            batch_ref.src_ptrs,
+            batch_ref.dst_ptrs,
+            count,
+            static_cast<size_t>(src->ctx->N),
+            batch_ref.shifts,
+            batch_ref.masks,
+            batch_ref.out_moduli,
+            batch_ref.stream);
+        if (status != 0)
+        {
+            for (auto *p : tmp_inputs)
+            {
+                gpu_poly_destroy(p);
+            }
+            return status;
         }
     }
 
@@ -2241,24 +2857,33 @@ using gpu_chacha::rng_next_u64;
         return -static_cast<int64_t>(neg);
     }
 
-    __global__ void matrix_sample_distribution_kernel(
+    __global__ void matrix_sample_distribution_multi_limb_kernel(
         uint64_t **dst,
         size_t poly_count,
+        size_t limb_count,
         size_t n,
-        uint64_t modulus,
+        const uint64_t *moduli,
+        const uint32_t *limb_indices,
         int dist_type,
         double sigma,
-        uint32_t limb_idx,
         uint64_t seed)
     {
         size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        size_t total = poly_count * n;
+        size_t total = limb_count * poly_count * n;
         if (idx >= total)
         {
             return;
         }
-        size_t poly_idx = idx / n;
-        size_t coeff_idx = idx - poly_idx * n;
+
+        const size_t per_limb = poly_count * n;
+        const size_t limb_slot = idx / per_limb;
+        const size_t rem = idx - limb_slot * per_limb;
+        const size_t poly_idx = rem / n;
+        const size_t coeff_idx = rem - poly_idx * n;
+        const size_t ptr_idx = limb_slot * poly_count + poly_idx;
+
+        const uint64_t modulus = moduli[limb_slot];
+        const uint32_t limb_idx = limb_indices[limb_slot];
 
         uint64_t sample = 0;
         if (dist_type == GPU_MATRIX_DIST_UNIFORM)
@@ -2313,7 +2938,7 @@ using gpu_chacha::rng_next_u64;
             sample = signed_mod_i64(z, modulus);
         }
 
-        dst[poly_idx][coeff_idx] = sample;
+        dst[ptr_idx][coeff_idx] = sample;
     }
 
     __device__ __forceinline__ uint64_t pow_mod_u64(uint64_t base, uint32_t exp, uint64_t modulus)
@@ -2340,26 +2965,35 @@ using gpu_chacha::rng_next_u64;
         return result;
     }
 
-    __global__ void matrix_fill_gadget_kernel(
+    __global__ void matrix_fill_gadget_multi_limb_kernel(
         uint64_t **dst,
         size_t poly_count,
+        size_t limb_count,
         size_t n,
-        uint64_t modulus,
+        const uint64_t *moduli,
+        const uint32_t *limb_indices,
         size_t rows,
         size_t cols,
         size_t log_base_q,
         uint32_t digits_per_tower,
-        uint32_t limb_idx,
         uint32_t base_bits)
     {
         size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        size_t total = poly_count * n;
+        size_t total = limb_count * poly_count * n;
         if (idx >= total)
         {
             return;
         }
-        size_t poly_idx = idx / n;
-        size_t coeff_idx = idx - poly_idx * n;
+
+        const size_t per_limb = poly_count * n;
+        const size_t limb_slot = idx / per_limb;
+        const size_t rem = idx - limb_slot * per_limb;
+        const size_t poly_idx = rem / n;
+        const size_t coeff_idx = rem - poly_idx * n;
+        const size_t ptr_idx = limb_slot * poly_count + poly_idx;
+
+        const uint64_t modulus = moduli[limb_slot];
+        const uint32_t limb_idx = limb_indices[limb_slot];
 
         uint64_t value = 0;
         if (coeff_idx == 0 && rows > 0 && cols > 0 && log_base_q > 0)
@@ -2379,7 +3013,7 @@ using gpu_chacha::rng_next_u64;
                 }
             }
         }
-        dst[poly_idx][coeff_idx] = value;
+        dst[ptr_idx][coeff_idx] = value;
     }
 
     __global__ void matrix_sample_p1_full_kernel(
@@ -2525,35 +3159,45 @@ using gpu_chacha::rng_next_u64;
         }
     }
 
-    __global__ void matrix_gauss_samp_gq_arb_base_kernel(
+    __global__ void matrix_gauss_samp_gq_arb_base_multi_kernel(
         const uint64_t **src,
         uint64_t **dst,
         size_t poly_count,
         size_t n,
-        uint64_t tower_modulus,
+        size_t job_count,
+        const uint64_t *tower_moduli,
         uint32_t base_bits,
         uint32_t digits_per_tower,
-        uint32_t digit_idx,
+        const uint32_t *digit_indices,
         double c,
-        uint32_t tower_idx,
+        const uint32_t *tower_indices,
         uint64_t seed,
-        uint64_t out_modulus)
+        const uint64_t *out_moduli)
     {
         size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        size_t total = poly_count * n;
+        size_t total = job_count * poly_count * n;
         if (idx >= total)
         {
             return;
         }
-
         if (digits_per_tower == 0 || digits_per_tower > kGaussMaxDigits || base_bits == 0 || base_bits >= 63)
         {
             return;
         }
 
-        size_t poly_idx = idx / n;
-        size_t coeff_idx = idx - poly_idx * n;
-        uint64_t value = src[poly_idx][coeff_idx];
+        const size_t per_job = poly_count * n;
+        const size_t job_idx = idx / per_job;
+        const size_t rem = idx - job_idx * per_job;
+        const size_t poly_idx = rem / n;
+        const size_t coeff_idx = rem - poly_idx * n;
+        const size_t ptr_idx = job_idx * poly_count + poly_idx;
+
+        const uint64_t tower_modulus = tower_moduli[job_idx];
+        const uint64_t out_modulus = out_moduli[job_idx];
+        const uint32_t digit_idx = digit_indices[job_idx];
+        const uint32_t tower_idx = tower_indices[job_idx];
+
+        uint64_t value = src[ptr_idx][coeff_idx];
         if (tower_modulus != 0)
         {
             value %= tower_modulus;
@@ -2650,32 +3294,39 @@ using gpu_chacha::rng_next_u64;
             out_digit = m_digits[last] * z[last] - z[last - 1] + v_digits[last];
         }
 
-        dst[poly_idx][coeff_idx] = signed_mod_i64(out_digit, out_modulus);
+        dst[ptr_idx][coeff_idx] = signed_mod_i64(out_digit, out_modulus);
     }
 
-    int launch_gauss_samp_gq_arb_base_kernel(
+    int launch_gauss_samp_gq_arb_base_multi_kernel(
         const std::vector<const uint64_t *> &src_ptrs,
         const std::vector<uint64_t *> &dst_ptrs,
+        size_t poly_count,
         size_t n,
-        uint64_t tower_modulus,
+        const std::vector<uint64_t> &tower_moduli,
         uint32_t base_bits,
         uint32_t digits_per_tower,
-        uint32_t digit_idx,
+        const std::vector<uint32_t> &digit_indices,
         double c,
-        uint32_t tower_idx,
+        const std::vector<uint32_t> &tower_indices,
         uint64_t seed,
-        uint64_t out_modulus,
+        const std::vector<uint64_t> &out_moduli,
         int device,
         cudaStream_t stream)
     {
-        const size_t count = src_ptrs.size();
-        if (count == 0 || n == 0)
+        const size_t job_count = tower_moduli.size();
+        if (job_count == 0 || poly_count == 0 || n == 0)
         {
             return 0;
         }
-        if (dst_ptrs.size() != count)
+        if (digit_indices.size() != job_count || tower_indices.size() != job_count ||
+            out_moduli.size() != job_count)
         {
-            return set_error("unexpected pointer counts in matrix_gauss_samp_gq_arb_base_kernel");
+            return set_error("unexpected job parameter counts in matrix_gauss_samp_gq_arb_base_multi_kernel");
+        }
+        const size_t ptr_count = job_count * poly_count;
+        if (src_ptrs.size() != ptr_count || dst_ptrs.size() != ptr_count)
+        {
+            return set_error("unexpected pointer counts in matrix_gauss_samp_gq_arb_base_multi_kernel");
         }
 
         cudaError_t err = cudaSetDevice(device);
@@ -2686,57 +3337,166 @@ using gpu_chacha::rng_next_u64;
 
         const uint64_t **d_src = nullptr;
         uint64_t **d_dst = nullptr;
-        const size_t bytes = count * sizeof(uint64_t *);
+        uint64_t *d_tower_moduli = nullptr;
+        uint32_t *d_digit_indices = nullptr;
+        uint32_t *d_tower_indices = nullptr;
+        uint64_t *d_out_moduli = nullptr;
 
-        err = cudaMallocAsync(&d_src, bytes, stream);
+        const size_t ptr_bytes = ptr_count * sizeof(uint64_t *);
+        const size_t u64_bytes = job_count * sizeof(uint64_t);
+        const size_t u32_bytes = job_count * sizeof(uint32_t);
+
+        err = cudaMallocAsync(&d_src, ptr_bytes, stream);
         if (err != cudaSuccess)
         {
             return set_error(err);
         }
-        err = cudaMallocAsync(&d_dst, bytes, stream);
+        err = cudaMallocAsync(&d_dst, ptr_bytes, stream);
         if (err != cudaSuccess)
         {
             cudaFreeAsync(d_src, stream);
             return set_error(err);
         }
-
-        err = cudaMemcpyAsync(d_src, src_ptrs.data(), bytes, cudaMemcpyHostToDevice, stream);
+        err = cudaMallocAsync(&d_tower_moduli, u64_bytes, stream);
         if (err != cudaSuccess)
         {
             cudaFreeAsync(d_src, stream);
             cudaFreeAsync(d_dst, stream);
             return set_error(err);
         }
-        err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), bytes, cudaMemcpyHostToDevice, stream);
+        err = cudaMallocAsync(&d_digit_indices, u32_bytes, stream);
         if (err != cudaSuccess)
         {
             cudaFreeAsync(d_src, stream);
             cudaFreeAsync(d_dst, stream);
+            cudaFreeAsync(d_tower_moduli, stream);
+            return set_error(err);
+        }
+        err = cudaMallocAsync(&d_tower_indices, u32_bytes, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFreeAsync(d_src, stream);
+            cudaFreeAsync(d_dst, stream);
+            cudaFreeAsync(d_tower_moduli, stream);
+            cudaFreeAsync(d_digit_indices, stream);
+            return set_error(err);
+        }
+        err = cudaMallocAsync(&d_out_moduli, u64_bytes, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFreeAsync(d_src, stream);
+            cudaFreeAsync(d_dst, stream);
+            cudaFreeAsync(d_tower_moduli, stream);
+            cudaFreeAsync(d_digit_indices, stream);
+            cudaFreeAsync(d_tower_indices, stream);
+            return set_error(err);
+        }
+
+        err = cudaMemcpyAsync(d_src, src_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFreeAsync(d_src, stream);
+            cudaFreeAsync(d_dst, stream);
+            cudaFreeAsync(d_tower_moduli, stream);
+            cudaFreeAsync(d_digit_indices, stream);
+            cudaFreeAsync(d_tower_indices, stream);
+            cudaFreeAsync(d_out_moduli, stream);
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFreeAsync(d_src, stream);
+            cudaFreeAsync(d_dst, stream);
+            cudaFreeAsync(d_tower_moduli, stream);
+            cudaFreeAsync(d_digit_indices, stream);
+            cudaFreeAsync(d_tower_indices, stream);
+            cudaFreeAsync(d_out_moduli, stream);
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(d_tower_moduli, tower_moduli.data(), u64_bytes, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFreeAsync(d_src, stream);
+            cudaFreeAsync(d_dst, stream);
+            cudaFreeAsync(d_tower_moduli, stream);
+            cudaFreeAsync(d_digit_indices, stream);
+            cudaFreeAsync(d_tower_indices, stream);
+            cudaFreeAsync(d_out_moduli, stream);
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(d_digit_indices, digit_indices.data(), u32_bytes, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFreeAsync(d_src, stream);
+            cudaFreeAsync(d_dst, stream);
+            cudaFreeAsync(d_tower_moduli, stream);
+            cudaFreeAsync(d_digit_indices, stream);
+            cudaFreeAsync(d_tower_indices, stream);
+            cudaFreeAsync(d_out_moduli, stream);
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(d_tower_indices, tower_indices.data(), u32_bytes, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFreeAsync(d_src, stream);
+            cudaFreeAsync(d_dst, stream);
+            cudaFreeAsync(d_tower_moduli, stream);
+            cudaFreeAsync(d_digit_indices, stream);
+            cudaFreeAsync(d_tower_indices, stream);
+            cudaFreeAsync(d_out_moduli, stream);
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(d_out_moduli, out_moduli.data(), u64_bytes, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFreeAsync(d_src, stream);
+            cudaFreeAsync(d_dst, stream);
+            cudaFreeAsync(d_tower_moduli, stream);
+            cudaFreeAsync(d_digit_indices, stream);
+            cudaFreeAsync(d_tower_indices, stream);
+            cudaFreeAsync(d_out_moduli, stream);
             return set_error(err);
         }
 
         const int threads = 256;
-        const size_t total = count * n;
+        const size_t total = ptr_count * n;
         const int blocks = static_cast<int>((total + threads - 1) / threads);
-
-        matrix_gauss_samp_gq_arb_base_kernel<<<blocks, threads, 0, stream>>>(
+        matrix_gauss_samp_gq_arb_base_multi_kernel<<<blocks, threads, 0, stream>>>(
             d_src,
             d_dst,
-            count,
+            poly_count,
             n,
-            tower_modulus,
+            job_count,
+            d_tower_moduli,
             base_bits,
             digits_per_tower,
-            digit_idx,
+            d_digit_indices,
             c,
-            tower_idx,
+            d_tower_indices,
             seed,
-            out_modulus);
+            d_out_moduli);
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             cudaFreeAsync(d_src, stream);
             cudaFreeAsync(d_dst, stream);
+            cudaFreeAsync(d_tower_moduli, stream);
+            cudaFreeAsync(d_digit_indices, stream);
+            cudaFreeAsync(d_tower_indices, stream);
+            cudaFreeAsync(d_out_moduli, stream);
+            return set_error(err);
+        }
+
+        err = cudaStreamSynchronize(stream);
+        if (err != cudaSuccess)
+        {
+            cudaFreeAsync(d_src, stream);
+            cudaFreeAsync(d_dst, stream);
+            cudaFreeAsync(d_tower_moduli, stream);
+            cudaFreeAsync(d_digit_indices, stream);
+            cudaFreeAsync(d_tower_indices, stream);
+            cudaFreeAsync(d_out_moduli, stream);
             return set_error(err);
         }
 
@@ -2750,56 +3510,125 @@ using gpu_chacha::rng_next_u64;
         {
             return set_error(err);
         }
-        return 0;
-    }
-
-    int launch_sample_distribution_kernel(
-        const std::vector<uint64_t *> &dst_ptrs,
-        size_t n,
-        uint64_t modulus,
-        int dist_type,
-        double sigma,
-        uint32_t limb_idx,
-        uint64_t seed,
-        cudaStream_t stream)
-    {
-        const size_t count = dst_ptrs.size();
-        if (count == 0 || n == 0)
-        {
-            return 0;
-        }
-
-        uint64_t **d_dst = nullptr;
-        const size_t bytes = count * sizeof(uint64_t *);
-        cudaError_t err = cudaMalloc(&d_dst, bytes);
+        err = cudaFreeAsync(d_tower_moduli, stream);
         if (err != cudaSuccess)
         {
             return set_error(err);
         }
+        err = cudaFreeAsync(d_digit_indices, stream);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        err = cudaFreeAsync(d_tower_indices, stream);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        err = cudaFreeAsync(d_out_moduli, stream);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        return 0;
+    }
 
-        err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), bytes, cudaMemcpyHostToDevice, stream);
+    int launch_sample_distribution_multi_limb_kernel(
+        const std::vector<uint64_t *> &dst_ptrs,
+        size_t poly_count,
+        size_t n,
+        const std::vector<uint64_t> &moduli,
+        const std::vector<uint32_t> &limb_indices,
+        int dist_type,
+        double sigma,
+        uint64_t seed,
+        cudaStream_t stream)
+    {
+        const size_t limb_count = moduli.size();
+        if (limb_count == 0 || poly_count == 0 || n == 0)
+        {
+            return 0;
+        }
+        if (limb_indices.size() != limb_count)
+        {
+            return set_error("unexpected limb parameter counts in matrix_sample_distribution_multi_limb_kernel");
+        }
+        const size_t ptr_count = limb_count * poly_count;
+        if (dst_ptrs.size() != ptr_count)
+        {
+            return set_error("unexpected pointer counts in matrix_sample_distribution_multi_limb_kernel");
+        }
+
+        uint64_t **d_dst = nullptr;
+        uint64_t *d_moduli = nullptr;
+        uint32_t *d_limb_indices = nullptr;
+        const size_t ptr_bytes = ptr_count * sizeof(uint64_t *);
+        const size_t u64_bytes = limb_count * sizeof(uint64_t);
+        const size_t u32_bytes = limb_count * sizeof(uint32_t);
+
+        cudaError_t err = cudaMalloc(&d_dst, ptr_bytes);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        err = cudaMalloc(&d_moduli, u64_bytes);
         if (err != cudaSuccess)
         {
             cudaFree(d_dst);
             return set_error(err);
         }
+        err = cudaMalloc(&d_limb_indices, u32_bytes);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_dst);
+            cudaFree(d_moduli);
+            return set_error(err);
+        }
+
+        err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_dst);
+            cudaFree(d_moduli);
+            cudaFree(d_limb_indices);
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(d_moduli, moduli.data(), u64_bytes, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_dst);
+            cudaFree(d_moduli);
+            cudaFree(d_limb_indices);
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(d_limb_indices, limb_indices.data(), u32_bytes, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_dst);
+            cudaFree(d_moduli);
+            cudaFree(d_limb_indices);
+            return set_error(err);
+        }
 
         const int threads = 256;
-        const size_t total = count * n;
+        const size_t total = ptr_count * n;
         const int blocks = static_cast<int>((total + threads - 1) / threads);
-        matrix_sample_distribution_kernel<<<blocks, threads, 0, stream>>>(
+        matrix_sample_distribution_multi_limb_kernel<<<blocks, threads, 0, stream>>>(
             d_dst,
-            count,
+            poly_count,
+            limb_count,
             n,
-            modulus,
+            d_moduli,
+            d_limb_indices,
             dist_type,
             sigma,
-            limb_idx,
             seed);
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             cudaFree(d_dst);
+            cudaFree(d_moduli);
+            cudaFree(d_limb_indices);
             return set_error(err);
         }
 
@@ -2807,64 +3636,117 @@ using gpu_chacha::rng_next_u64;
         if (err != cudaSuccess)
         {
             cudaFree(d_dst);
+            cudaFree(d_moduli);
+            cudaFree(d_limb_indices);
             return set_error(err);
         }
 
         cudaFree(d_dst);
+        cudaFree(d_moduli);
+        cudaFree(d_limb_indices);
         return 0;
     }
 
-    int launch_fill_gadget_kernel(
+    int launch_fill_gadget_multi_limb_kernel(
         const std::vector<uint64_t *> &dst_ptrs,
+        size_t poly_count,
         size_t n,
-        uint64_t modulus,
+        const std::vector<uint64_t> &moduli,
+        const std::vector<uint32_t> &limb_indices,
         size_t rows,
         size_t cols,
         size_t log_base_q,
         uint32_t digits_per_tower,
-        uint32_t limb_idx,
         uint32_t base_bits,
         cudaStream_t stream)
     {
-        const size_t count = dst_ptrs.size();
-        if (count == 0 || n == 0)
+        const size_t limb_count = moduli.size();
+        if (limb_count == 0 || poly_count == 0 || n == 0)
         {
             return 0;
         }
+        if (limb_indices.size() != limb_count)
+        {
+            return set_error("unexpected limb parameter counts in matrix_fill_gadget_multi_limb_kernel");
+        }
+        const size_t ptr_count = limb_count * poly_count;
+        if (dst_ptrs.size() != ptr_count)
+        {
+            return set_error("unexpected pointer counts in matrix_fill_gadget_multi_limb_kernel");
+        }
 
         uint64_t **d_dst = nullptr;
-        const size_t bytes = count * sizeof(uint64_t *);
-        cudaError_t err = cudaMalloc(&d_dst, bytes);
+        uint64_t *d_moduli = nullptr;
+        uint32_t *d_limb_indices = nullptr;
+        const size_t ptr_bytes = ptr_count * sizeof(uint64_t *);
+        const size_t u64_bytes = limb_count * sizeof(uint64_t);
+        const size_t u32_bytes = limb_count * sizeof(uint32_t);
+
+        cudaError_t err = cudaMalloc(&d_dst, ptr_bytes);
         if (err != cudaSuccess)
         {
             return set_error(err);
         }
-
-        err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), bytes, cudaMemcpyHostToDevice, stream);
+        err = cudaMalloc(&d_moduli, u64_bytes);
         if (err != cudaSuccess)
         {
             cudaFree(d_dst);
             return set_error(err);
         }
+        err = cudaMalloc(&d_limb_indices, u32_bytes);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_dst);
+            cudaFree(d_moduli);
+            return set_error(err);
+        }
+
+        err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_dst);
+            cudaFree(d_moduli);
+            cudaFree(d_limb_indices);
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(d_moduli, moduli.data(), u64_bytes, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_dst);
+            cudaFree(d_moduli);
+            cudaFree(d_limb_indices);
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(d_limb_indices, limb_indices.data(), u32_bytes, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_dst);
+            cudaFree(d_moduli);
+            cudaFree(d_limb_indices);
+            return set_error(err);
+        }
 
         const int threads = 256;
-        const size_t total = count * n;
+        const size_t total = ptr_count * n;
         const int blocks = static_cast<int>((total + threads - 1) / threads);
-        matrix_fill_gadget_kernel<<<blocks, threads, 0, stream>>>(
+        matrix_fill_gadget_multi_limb_kernel<<<blocks, threads, 0, stream>>>(
             d_dst,
-            count,
+            poly_count,
+            limb_count,
             n,
-            modulus,
+            d_moduli,
+            d_limb_indices,
             rows,
             cols,
             log_base_q,
             digits_per_tower,
-            limb_idx,
             base_bits);
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             cudaFree(d_dst);
+            cudaFree(d_moduli);
+            cudaFree(d_limb_indices);
             return set_error(err);
         }
 
@@ -2872,10 +3754,14 @@ using gpu_chacha::rng_next_u64;
         if (err != cudaSuccess)
         {
             cudaFree(d_dst);
+            cudaFree(d_moduli);
+            cudaFree(d_limb_indices);
             return set_error(err);
         }
 
         cudaFree(d_dst);
+        cudaFree(d_moduli);
+        cudaFree(d_limb_indices);
         return 0;
     }
 
@@ -2962,13 +3848,7 @@ using gpu_chacha::rng_next_u64;
         bytes_per_sample_total += sampled_bytes_per_sample;
 
         const size_t total_samples = cols * n;
-        constexpr size_t kWorkspaceBudgetBytes = 128ULL * 1024ULL * 1024ULL;
-        size_t chunk_samples = kWorkspaceBudgetBytes / bytes_per_sample_total;
-        if (chunk_samples == 0)
-        {
-            chunk_samples = 1;
-        }
-        chunk_samples = std::min(chunk_samples, total_samples);
+        size_t chunk_samples = total_samples;
 
         const uint64_t **d_a_entries = nullptr;
         const uint64_t **d_b_entries = nullptr;
@@ -3211,12 +4091,34 @@ extern "C" int gpu_matrix_sample_distribution(
         return set_error("unexpected limb mapping size in gpu_matrix_sample_distribution");
     }
 
+    struct DistBatch
+    {
+        int device;
+        cudaStream_t stream;
+        std::vector<uint64_t *> dst_ptrs;
+        std::vector<uint64_t> moduli;
+        std::vector<uint32_t> limb_indices;
+    };
+    std::vector<DistBatch> batches;
+    auto get_batch = [&](int device) -> DistBatch & {
+        for (auto &b : batches)
+        {
+            if (b.device == device)
+            {
+                return b;
+            }
+        }
+        batches.push_back(DistBatch{device, nullptr, {}, {}, {}});
+        return batches.back();
+    };
+
     for (int limb = 0; limb <= level; ++limb)
     {
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        std::vector<uint64_t *> dst_ptrs;
-        dst_ptrs.reserve(count);
-        cudaStream_t out_stream = nullptr;
+        std::vector<uint64_t *> limb_ptrs;
+        limb_ptrs.reserve(count);
+        int limb_device = -1;
+        cudaStream_t limb_stream = nullptr;
 
         for (size_t idx = 0; idx < count; ++idx)
         {
@@ -3240,22 +4142,53 @@ extern "C" int gpu_matrix_sample_distribution(
                 return set_error("unsupported limb type in gpu_matrix_sample_distribution");
             }
             auto &limb_u64 = std::get<FIDESlib::U64>(limb_impl);
-            if (!out_stream)
+            if (limb_device == -1)
             {
-                out_stream = limb_u64.stream.ptr;
+                limb_device = partition.device;
+                limb_stream = limb_u64.stream.ptr;
             }
-            dst_ptrs.push_back(limb_u64.v.data);
+            else if (limb_device != partition.device)
+            {
+                return set_error("inconsistent limb device in gpu_matrix_sample_distribution");
+            }
+            limb_ptrs.push_back(limb_u64.v.data);
         }
 
-        int status = launch_sample_distribution_kernel(
-            dst_ptrs,
+        if (limb_device < 0)
+        {
+            return set_error("invalid limb device in gpu_matrix_sample_distribution");
+        }
+        auto &batch = get_batch(limb_device);
+        if (!batch.stream)
+        {
+            batch.stream = limb_stream;
+        }
+        batch.moduli.push_back(out->ctx->moduli[static_cast<size_t>(limb)]);
+        batch.limb_indices.push_back(static_cast<uint32_t>(limb));
+        batch.dst_ptrs.insert(batch.dst_ptrs.end(), limb_ptrs.begin(), limb_ptrs.end());
+    }
+
+    for (auto &batch : batches)
+    {
+        if (!batch.stream)
+        {
+            return set_error("null stream in gpu_matrix_sample_distribution");
+        }
+        cudaError_t err = cudaSetDevice(batch.device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        int status = launch_sample_distribution_multi_limb_kernel(
+            batch.dst_ptrs,
+            count,
             static_cast<size_t>(out->ctx->N),
-            out->ctx->moduli[static_cast<size_t>(limb)],
+            batch.moduli,
+            batch.limb_indices,
             dist_type,
             sigma,
-            static_cast<uint32_t>(limb),
             seed,
-            out_stream);
+            batch.stream);
         if (status != 0)
         {
             return status;
@@ -3424,6 +4357,28 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         }
     }
 
+    for (int device : src->ctx->gpu_ids)
+    {
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess)
+        {
+            for (auto *p : tmp_inputs)
+            {
+                gpu_poly_destroy(p);
+            }
+            return set_error(err);
+        }
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess)
+        {
+            for (auto *p : tmp_inputs)
+            {
+                gpu_poly_destroy(p);
+            }
+            return set_error(err);
+        }
+    }
+
     auto &limb_map = src->ctx->ctx->limbGPUid;
     if (limb_map.size() < crt_depth)
     {
@@ -3433,6 +4388,9 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         }
         return set_error("unexpected limb mapping size in gpu_matrix_gauss_samp_gq_arb_base");
     }
+
+    std::vector<std::pair<int, cudaStream_t>> out_zero_streams;
+    out_zero_streams.reserve(out->polys.size() * crt_depth);
 
     for (size_t idx = 0; idx < out->polys.size(); ++idx)
     {
@@ -3499,9 +4457,45 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                 }
                 return set_error(err);
             }
+
+            bool seen_stream = false;
+            for (const auto &entry : out_zero_streams)
+            {
+                if (entry.first == partition.device && entry.second == limb_u64.stream.ptr)
+                {
+                    seen_stream = true;
+                    break;
+                }
+            }
+            if (!seen_stream)
+            {
+                out_zero_streams.emplace_back(partition.device, limb_u64.stream.ptr);
+            }
         }
         poly->format = PolyFormat::Coeff;
         poly->level = level;
+    }
+
+    for (const auto &entry : out_zero_streams)
+    {
+        cudaError_t err = cudaSetDevice(entry.first);
+        if (err != cudaSuccess)
+        {
+            for (auto *p : tmp_inputs)
+            {
+                gpu_poly_destroy(p);
+            }
+            return set_error(err);
+        }
+        err = cudaStreamSynchronize(entry.second);
+        if (err != cudaSuccess)
+        {
+            for (auto *p : tmp_inputs)
+            {
+                gpu_poly_destroy(p);
+            }
+            return set_error(err);
+        }
     }
 
     if (src->ctx->moduli.size() < crt_depth)
@@ -3512,6 +4506,30 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         }
         return set_error("unexpected modulus count in gpu_matrix_gauss_samp_gq_arb_base");
     }
+
+    struct GaussBatch
+    {
+        int device;
+        cudaStream_t stream;
+        std::vector<const uint64_t *> src_ptrs;
+        std::vector<uint64_t *> dst_ptrs;
+        std::vector<uint64_t> tower_moduli;
+        std::vector<uint32_t> digit_indices;
+        std::vector<uint32_t> tower_indices;
+        std::vector<uint64_t> out_moduli;
+    };
+    std::vector<GaussBatch> batches;
+    auto get_batch = [&](int device) -> GaussBatch & {
+        for (auto &b : batches)
+        {
+            if (b.device == device)
+            {
+                return b;
+            }
+        }
+        batches.push_back(GaussBatch{device, nullptr, {}, {}, {}, {}, {}, {}});
+        return batches.back();
+    };
 
     for (int src_limb = 0; src_limb <= level; ++src_limb)
     {
@@ -3550,8 +4568,6 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                 static_cast<size_t>(digit_idx);
             std::vector<const uint64_t *> src_ptrs;
             src_ptrs.reserve(count);
-            std::vector<cudaStream_t> src_streams;
-            src_streams.reserve(count);
             for (size_t idx = 0; idx < count; ++idx)
             {
                 const auto &in_partition = inputs[idx]->poly->GPU[src_limb_id.x];
@@ -3573,34 +4589,6 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                     return set_error("unsupported input source limb type in gpu_matrix_gauss_samp_gq_arb_base");
                 }
                 const auto &in_limb_u64 = std::get<FIDESlib::U64>(in_limb_impl);
-                cudaStream_t src_stream = in_limb_u64.stream.ptr;
-                bool seen_src_stream = false;
-                for (cudaStream_t s : src_streams)
-                {
-                    if (s == src_stream)
-                    {
-                        seen_src_stream = true;
-                        break;
-                    }
-                }
-                if (!seen_src_stream)
-                {
-                    src_streams.push_back(src_stream);
-                }
-                cudaStream_t src_partition_stream = in_partition.s.ptr;
-                seen_src_stream = false;
-                for (cudaStream_t s : src_streams)
-                {
-                    if (s == src_partition_stream)
-                    {
-                        seen_src_stream = true;
-                        break;
-                    }
-                }
-                if (!seen_src_stream)
-                {
-                    src_streams.push_back(src_partition_stream);
-                }
                 src_ptrs.push_back(in_limb_u64.v.data);
             }
 
@@ -3611,8 +4599,6 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                 dst_ptrs.reserve(count);
                 cudaStream_t out_stream = nullptr;
                 int out_device = -1;
-                std::vector<cudaStream_t> dst_streams;
-                dst_streams.reserve(count);
 
                 for (size_t idx = 0; idx < count; ++idx)
                 {
@@ -3661,197 +4647,65 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                         }
                         return set_error("inconsistent output limb device in gpu_matrix_gauss_samp_gq_arb_base");
                     }
-                    cudaStream_t dst_stream = out_limb_u64.stream.ptr;
-                    bool seen_stream = false;
-                    for (cudaStream_t s : dst_streams)
-                    {
-                        if (s == dst_stream)
-                        {
-                            seen_stream = true;
-                            break;
-                        }
-                    }
-                    if (!seen_stream)
-                    {
-                        dst_streams.push_back(dst_stream);
-                    }
-                    cudaStream_t dst_partition_stream = out_partition.s.ptr;
-                    seen_stream = false;
-                    for (cudaStream_t s : dst_streams)
-                    {
-                        if (s == dst_partition_stream)
-                        {
-                            seen_stream = true;
-                            break;
-                        }
-                    }
-                    if (!seen_stream)
-                    {
-                        dst_streams.push_back(dst_partition_stream);
-                    }
                     dst_ptrs.push_back(out_limb_u64.v.data);
                 }
 
-                for (cudaStream_t dst_stream : dst_streams)
+                if (out_device < 0 || !out_stream)
                 {
-                    if (dst_stream == out_stream)
+                    for (auto *p : tmp_inputs)
                     {
-                        continue;
+                        gpu_poly_destroy(p);
                     }
-                    cudaEvent_t ready = nullptr;
-                    cudaError_t err = cudaEventCreateWithFlags(&ready, cudaEventDisableTiming);
-                    if (err != cudaSuccess)
-                    {
-                        for (auto *p : tmp_inputs)
-                        {
-                            gpu_poly_destroy(p);
-                        }
-                        return set_error(err);
-                    }
-                    err = cudaEventRecord(ready, dst_stream);
-                    if (err != cudaSuccess)
-                    {
-                        cudaEventDestroy(ready);
-                        for (auto *p : tmp_inputs)
-                        {
-                            gpu_poly_destroy(p);
-                        }
-                        return set_error(err);
-                    }
-                    err = cudaStreamWaitEvent(out_stream, ready, 0);
-                    cudaError_t destroy_err = cudaEventDestroy(ready);
-                    if (err != cudaSuccess)
-                    {
-                        for (auto *p : tmp_inputs)
-                        {
-                            gpu_poly_destroy(p);
-                        }
-                        return set_error(err);
-                    }
-                    if (destroy_err != cudaSuccess)
-                    {
-                        for (auto *p : tmp_inputs)
-                        {
-                            gpu_poly_destroy(p);
-                        }
-                        return set_error(destroy_err);
-                    }
-                }
-                for (cudaStream_t src_stream : src_streams)
-                {
-                    if (src_stream == out_stream)
-                    {
-                        continue;
-                    }
-                    cudaEvent_t ready = nullptr;
-                    cudaError_t err = cudaEventCreateWithFlags(&ready, cudaEventDisableTiming);
-                    if (err != cudaSuccess)
-                    {
-                        for (auto *p : tmp_inputs)
-                        {
-                            gpu_poly_destroy(p);
-                        }
-                        return set_error(err);
-                    }
-                    err = cudaEventRecord(ready, src_stream);
-                    if (err != cudaSuccess)
-                    {
-                        cudaEventDestroy(ready);
-                        for (auto *p : tmp_inputs)
-                        {
-                            gpu_poly_destroy(p);
-                        }
-                        return set_error(err);
-                    }
-                    err = cudaStreamWaitEvent(out_stream, ready, 0);
-                    cudaError_t destroy_err = cudaEventDestroy(ready);
-                    if (err != cudaSuccess)
-                    {
-                        for (auto *p : tmp_inputs)
-                        {
-                            gpu_poly_destroy(p);
-                        }
-                        return set_error(err);
-                    }
-                    if (destroy_err != cudaSuccess)
-                    {
-                        for (auto *p : tmp_inputs)
-                        {
-                            gpu_poly_destroy(p);
-                        }
-                        return set_error(destroy_err);
-                    }
+                    return set_error("invalid output stream/device in gpu_matrix_gauss_samp_gq_arb_base");
                 }
 
-                int status = launch_gauss_samp_gq_arb_base_kernel(
-                    src_ptrs,
-                    dst_ptrs,
-                    static_cast<size_t>(src->ctx->N),
-                    src->ctx->moduli[static_cast<size_t>(src_limb)],
-                    base_bits,
-                    digits_per_tower,
-                    digit_idx,
-                    c,
-                    static_cast<uint32_t>(src_limb),
-                    seed,
-                    src->ctx->moduli[static_cast<size_t>(out_limb)],
-                    out_device,
-                    out_stream);
-                if (status != 0)
+                auto &batch_ref = get_batch(out_device);
+                if (!batch_ref.stream)
                 {
-                    for (auto *p : tmp_inputs)
-                    {
-                        gpu_poly_destroy(p);
-                    }
-                    return status;
+                    batch_ref.stream = out_stream;
                 }
-                cudaEvent_t done = nullptr;
-                cudaError_t err = cudaEventCreateWithFlags(&done, cudaEventDisableTiming);
-                if (err != cudaSuccess)
-                {
-                    for (auto *p : tmp_inputs)
-                    {
-                        gpu_poly_destroy(p);
-                    }
-                    return set_error(err);
-                }
-                err = cudaEventRecord(done, out_stream);
-                if (err != cudaSuccess)
-                {
-                    cudaEventDestroy(done);
-                    for (auto *p : tmp_inputs)
-                    {
-                        gpu_poly_destroy(p);
-                    }
-                    return set_error(err);
-                }
-                for (cudaStream_t dst_stream : dst_streams)
-                {
-                    if (dst_stream == out_stream)
-                    {
-                        continue;
-                    }
-                    err = cudaStreamWaitEvent(dst_stream, done, 0);
-                    if (err != cudaSuccess)
-                    {
-                        cudaEventDestroy(done);
-                        for (auto *p : tmp_inputs)
-                        {
-                            gpu_poly_destroy(p);
-                        }
-                        return set_error(err);
-                    }
-                }
-                cudaError_t destroy_err = cudaEventDestroy(done);
-                if (destroy_err != cudaSuccess)
-                {
-                    for (auto *p : tmp_inputs)
-                    {
-                        gpu_poly_destroy(p);
-                    }
-                    return set_error(destroy_err);
-                }
+                batch_ref.tower_moduli.push_back(src->ctx->moduli[static_cast<size_t>(src_limb)]);
+                batch_ref.digit_indices.push_back(digit_idx);
+                batch_ref.tower_indices.push_back(static_cast<uint32_t>(src_limb));
+                batch_ref.out_moduli.push_back(src->ctx->moduli[static_cast<size_t>(out_limb)]);
+                batch_ref.src_ptrs.insert(batch_ref.src_ptrs.end(), src_ptrs.begin(), src_ptrs.end());
+                batch_ref.dst_ptrs.insert(batch_ref.dst_ptrs.end(), dst_ptrs.begin(), dst_ptrs.end());
             }
+        }
+    }
+
+    for (auto &batch_ref : batches)
+    {
+        if (!batch_ref.stream)
+        {
+            for (auto *p : tmp_inputs)
+            {
+                gpu_poly_destroy(p);
+            }
+            return set_error("null stream in gpu_matrix_gauss_samp_gq_arb_base");
+        }
+        int status = launch_gauss_samp_gq_arb_base_multi_kernel(
+            batch_ref.src_ptrs,
+            batch_ref.dst_ptrs,
+            count,
+            static_cast<size_t>(src->ctx->N),
+            batch_ref.tower_moduli,
+            base_bits,
+            digits_per_tower,
+            batch_ref.digit_indices,
+            c,
+            batch_ref.tower_indices,
+            seed,
+            batch_ref.out_moduli,
+            batch_ref.device,
+            batch_ref.stream);
+        if (status != 0)
+        {
+            for (auto *p : tmp_inputs)
+            {
+                gpu_poly_destroy(p);
+            }
+            return status;
         }
     }
 

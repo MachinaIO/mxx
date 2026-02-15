@@ -327,12 +327,16 @@ mod tests {
     use super::*;
     use crate::{
         __PAIR, __TestState,
+        element::PolyElem,
         matrix::PolyMatrix,
         poly::{
             PolyParams,
             dcrt::{gpu::gpu_device_sync, params::DCRTPolyParams},
         },
+        simulator::error_norm::compute_preimage_norm,
     };
+    use bigdecimal::{BigDecimal, FromPrimitive};
+    use num_bigint::{BigInt, BigUint};
     use sequential_test::sequential;
 
     const SIGMA: f64 = 4.578;
@@ -436,5 +440,116 @@ mod tests {
             sampled, z_plain_full,
             "preimage sampler should not collapse to the plain deterministic gadget preimage"
         );
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_preimage_coefficients_below_compute_preimage_norm() {
+        gpu_device_sync();
+        let size = 2usize;
+        let cpu_params = DCRTPolyParams::new(1 << 8, 4, 51, 17);
+        let params = gpu_params_from_cpu(&cpu_params);
+        let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+        let uniform_sampler = GpuDCRTPolyUniformSampler::new();
+
+        let ring_dim_sqrt = BigDecimal::from_u32(params.ring_dimension())
+            .expect("ring dimension should convert to BigDecimal")
+            .sqrt()
+            .expect("ring dimension sqrt should exist");
+        let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
+        let m_g = (size * params.modulus_digits()) as u64;
+        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base);
+        let modulus = params.modulus();
+
+        for sample_idx in 0..4usize {
+            let target = uniform_sampler.sample_uniform(&params, size, size, DistType::FinRingDist);
+            let preimage = trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &target);
+            assert_eq!(&public_matrix * &preimage, target);
+
+            for i in 0..preimage.row_size() {
+                for j in 0..preimage.col_size() {
+                    let poly = preimage.entry(i, j);
+                    for (k, coeff) in poly.coeffs().into_iter().enumerate() {
+                        let value = coeff.value().clone();
+                        let neg = modulus.as_ref() - &value;
+                        let centered_abs = if value < neg { value } else { neg };
+                        let centered_bd = BigDecimal::from(BigInt::from(centered_abs.clone()));
+                        assert!(
+                            centered_bd < preimage_norm_bound,
+                            "preimage coeff exceeds compute_preimage_norm bound at sample={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={}",
+                            sample_idx,
+                            i,
+                            j,
+                            k,
+                            centered_abs,
+                            preimage_norm_bound
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_p_hat_coefficients_below_compute_preimage_norm() {
+        gpu_device_sync();
+        let size = 2usize;
+        let cpu_params = DCRTPolyParams::new(1 << 8, 4, 51, 17);
+        let params = gpu_params_from_cpu(&cpu_params);
+        let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let (trapdoor, _public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+
+        let ring_dim_sqrt = BigDecimal::from_u32(params.ring_dimension())
+            .expect("ring dimension should convert to BigDecimal")
+            .sqrt()
+            .expect("ring dimension sqrt should exist");
+        let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
+        let m_g = (size * params.modulus_digits()) as u64;
+        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base);
+        let modulus = params.modulus();
+        let n = params.ring_dimension() as usize;
+        let k = params.modulus_digits();
+        let s = SPECTRAL_CONSTANT *
+            ((1u32 << params.base_bits()) as f64 + 1.0) *
+            SIGMA *
+            SIGMA *
+            (((size * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+        let dgg_large_std =
+            (s * s - (((1u32 << params.base_bits()) as f64 + 1.0) * SIGMA).powi(2)).sqrt();
+
+        for sample_idx in 0..4usize {
+            let p_hat = sample_pert_square_mat_gpu_native(
+                &params,
+                &trapdoor,
+                s,
+                ((1u32 << params.base_bits()) as f64 + 1.0) * SIGMA,
+                SIGMA,
+                dgg_large_std,
+                size,
+            );
+            for i in 0..p_hat.row_size() {
+                for j in 0..p_hat.col_size() {
+                    let poly = p_hat.entry(i, j);
+                    for (coeff_idx, coeff) in poly.coeffs().into_iter().enumerate() {
+                        let value = coeff.value().clone();
+                        let neg = modulus.as_ref() - &value;
+                        let centered_abs = if value < neg { value } else { neg };
+                        let centered_bd = BigDecimal::from(BigInt::from(centered_abs.clone()));
+                        assert!(
+                            centered_bd < preimage_norm_bound,
+                            "p_hat coeff exceeds compute_preimage_norm bound at sample={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={}",
+                            sample_idx,
+                            i,
+                            j,
+                            coeff_idx,
+                            centered_abs,
+                            preimage_norm_bound
+                        );
+                    }
+                }
+            }
+        }
     }
 }

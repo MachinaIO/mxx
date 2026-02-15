@@ -1392,12 +1392,11 @@ int launch_fill_gadget_multi_limb_kernel(
     uint32_t base_bits,
     cudaStream_t stream);
 
-int launch_sample_p1_full_kernel(
+int launch_sample_p1_integer_kernel(
     const std::vector<const uint64_t *> &a_entries,
     const std::vector<const uint64_t *> &b_entries,
     const std::vector<const uint64_t *> &d_entries,
     const std::vector<const uint64_t *> &tp2_entries,
-    const std::vector<uint64_t *> &out_entries,
     size_t d,
     size_t cols,
     size_t n,
@@ -1405,8 +1404,16 @@ int launch_sample_p1_full_kernel(
     double sigma,
     double s,
     double dgg_stddev,
-    uint32_t limb_idx,
     uint64_t seed,
+    cudaStream_t stream,
+    int device_id,
+    std::vector<int64_t> &sampled_out_host);
+
+int launch_scatter_p1_integer_to_limb_kernel(
+    const std::vector<int64_t> &sampled_in_host,
+    const std::vector<uint64_t *> &out_entries,
+    size_t n,
+    uint64_t modulus,
     cudaStream_t stream,
     int device_id);
 
@@ -3302,12 +3309,11 @@ __global__ void matrix_fill_gadget_multi_limb_kernel(
     dst[ptr_idx][coeff_idx] = value;
 }
 
-__global__ void matrix_sample_p1_full_kernel(
+__global__ void matrix_sample_p1_integer_kernel(
     const uint64_t **a_entries,
     const uint64_t **b_entries,
     const uint64_t **d_entries,
     const uint64_t **tp2_entries,
-    uint64_t **out_entries,
     size_t d,
     size_t cols,
     size_t n,
@@ -3317,11 +3323,11 @@ __global__ void matrix_sample_p1_full_kernel(
     double *mean_workspace,
     double *col_workspace,
     int64_t *sampled_workspace,
+    int64_t *sampled_out,
     uint64_t modulus,
     double sigma,
     double s,
     double dgg_stddev,
-    uint32_t limb_idx,
     uint64_t seed)
 {
     const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -3352,7 +3358,7 @@ __global__ void matrix_sample_p1_full_kernel(
         seed,
         static_cast<uint64_t>(col_idx + 1),
         static_cast<uint64_t>(coeff_idx + 1),
-        static_cast<uint64_t>(limb_idx + 1),
+        0,
         0x7065727475726231ULL);
 
     const double sigma2 = sigma * sigma;
@@ -3440,9 +3446,28 @@ __global__ void matrix_sample_p1_full_kernel(
 
     for (size_t row = 0; row < m; ++row)
     {
-        const size_t out_idx = matrix_index(row, col_idx, cols);
-        out_entries[out_idx][coeff_idx] = signed_mod_i64(sampled[row], modulus);
+        const size_t out_idx = matrix_index(row, col_idx, cols) * n + coeff_idx;
+        sampled_out[out_idx] = sampled[row];
     }
+}
+
+__global__ void matrix_scatter_p1_integer_to_limb_kernel(
+    const int64_t *sampled_in,
+    uint64_t **out_entries,
+    size_t entry_count,
+    size_t n,
+    uint64_t modulus)
+{
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = entry_count * n;
+    if (idx >= total)
+    {
+        return;
+    }
+
+    const size_t entry_idx = idx / n;
+    const size_t coeff_idx = idx - entry_idx * n;
+    out_entries[entry_idx][coeff_idx] = signed_mod_i64(sampled_in[idx], modulus);
 }
 
 __global__ void matrix_gauss_samp_gq_arb_base_multi_kernel(
@@ -4051,12 +4076,11 @@ int launch_fill_gadget_multi_limb_kernel(
     return 0;
 }
 
-int launch_sample_p1_full_kernel(
+int launch_sample_p1_integer_kernel(
     const std::vector<const uint64_t *> &a_entries,
     const std::vector<const uint64_t *> &b_entries,
     const std::vector<const uint64_t *> &d_entries,
     const std::vector<const uint64_t *> &tp2_entries,
-    const std::vector<uint64_t *> &out_entries,
     size_t d,
     size_t cols,
     size_t n,
@@ -4064,27 +4088,27 @@ int launch_sample_p1_full_kernel(
     double sigma,
     double s,
     double dgg_stddev,
-    uint32_t limb_idx,
     uint64_t seed,
     cudaStream_t stream,
-    int device_id)
+    int device_id,
+    std::vector<int64_t> &sampled_out_host)
 {
     if (d == 0 || cols == 0 || n == 0)
     {
+        sampled_out_host.clear();
         return 0;
     }
     const size_t mat_entries = d * d;
     const size_t vec_entries = 2 * d * cols;
     if (a_entries.size() != mat_entries || b_entries.size() != mat_entries ||
-        d_entries.size() != mat_entries || tp2_entries.size() != vec_entries ||
-        out_entries.size() != vec_entries)
+        d_entries.size() != mat_entries || tp2_entries.size() != vec_entries)
     {
-        return set_error("unexpected pointer counts in matrix_sample_p1_full_kernel");
+        return set_error("unexpected pointer counts in matrix_sample_p1_integer_kernel");
     }
 
     if (device_id < 0)
     {
-        return set_error("invalid device in matrix_sample_p1_full_kernel");
+        return set_error("invalid device in matrix_sample_p1_integer_kernel");
     }
     cudaError_t err = cudaSetDevice(device_id);
     if (err != cudaSuccess)
@@ -4095,52 +4119,54 @@ int launch_sample_p1_full_kernel(
     const size_t m = 2 * d;
     if (m == 0)
     {
-        return set_error("invalid dimension in matrix_sample_p1_full_kernel");
+        return set_error("invalid dimension in matrix_sample_p1_integer_kernel");
     }
     if (m > std::numeric_limits<size_t>::max() / m)
     {
-        return set_error("workspace overflow in matrix_sample_p1_full_kernel");
+        return set_error("workspace overflow in matrix_sample_p1_integer_kernel");
     }
     const size_t cov_elems_per_sample = m * m;
     if (cov_elems_per_sample > std::numeric_limits<size_t>::max() / sizeof(double))
     {
-        return set_error("workspace overflow in matrix_sample_p1_full_kernel");
+        return set_error("workspace overflow in matrix_sample_p1_integer_kernel");
     }
     const size_t cov_bytes_per_sample = cov_elems_per_sample * sizeof(double);
     if (m > std::numeric_limits<size_t>::max() / sizeof(double))
     {
-        return set_error("workspace overflow in matrix_sample_p1_full_kernel");
+        return set_error("workspace overflow in matrix_sample_p1_integer_kernel");
     }
     const size_t vec_bytes_per_sample = m * sizeof(double);
     if (m > std::numeric_limits<size_t>::max() / sizeof(int64_t))
     {
-        return set_error("workspace overflow in matrix_sample_p1_full_kernel");
+        return set_error("workspace overflow in matrix_sample_p1_integer_kernel");
     }
     const size_t sampled_bytes_per_sample = m * sizeof(int64_t);
     if (cov_bytes_per_sample > std::numeric_limits<size_t>::max() - vec_bytes_per_sample)
     {
-        return set_error("workspace overflow in matrix_sample_p1_full_kernel");
+        return set_error("workspace overflow in matrix_sample_p1_integer_kernel");
     }
     size_t bytes_per_sample_total = cov_bytes_per_sample + vec_bytes_per_sample;
     if (bytes_per_sample_total > std::numeric_limits<size_t>::max() - vec_bytes_per_sample)
     {
-        return set_error("workspace overflow in matrix_sample_p1_full_kernel");
+        return set_error("workspace overflow in matrix_sample_p1_integer_kernel");
     }
     bytes_per_sample_total += vec_bytes_per_sample;
     if (bytes_per_sample_total > std::numeric_limits<size_t>::max() - sampled_bytes_per_sample)
     {
-        return set_error("workspace overflow in matrix_sample_p1_full_kernel");
+        return set_error("workspace overflow in matrix_sample_p1_integer_kernel");
     }
     bytes_per_sample_total += sampled_bytes_per_sample;
 
     const size_t total_samples = cols * n;
     size_t chunk_samples = total_samples;
+    const size_t total_values = vec_entries * n;
+    sampled_out_host.assign(total_values, 0);
 
     const uint64_t **d_a_entries = nullptr;
     const uint64_t **d_b_entries = nullptr;
     const uint64_t **d_d_entries = nullptr;
     const uint64_t **d_tp2_entries = nullptr;
-    uint64_t **d_out_entries = nullptr;
+    int64_t *d_sampled_out = nullptr;
     const size_t mat_bytes = mat_entries * sizeof(uint64_t *);
     const size_t vec_bytes = vec_entries * sizeof(uint64_t *);
 
@@ -4154,8 +4180,8 @@ int launch_sample_p1_full_kernel(
             cudaFree(d_d_entries);
         if (d_tp2_entries)
             cudaFree(d_tp2_entries);
-        if (d_out_entries)
-            cudaFree(d_out_entries);
+        if (d_sampled_out)
+            cudaFree(d_sampled_out);
     };
 
     err = cudaMalloc(&d_a_entries, mat_bytes);
@@ -4182,7 +4208,7 @@ int launch_sample_p1_full_kernel(
         free_all();
         return set_error(err);
     }
-    err = cudaMalloc(&d_out_entries, vec_bytes);
+    err = cudaMalloc(&d_sampled_out, total_values * sizeof(int64_t));
     if (err != cudaSuccess)
     {
         free_all();
@@ -4213,13 +4239,6 @@ int launch_sample_p1_full_kernel(
         free_all();
         return set_error(err);
     }
-    err = cudaMemcpyAsync(d_out_entries, out_entries.data(), vec_bytes, cudaMemcpyHostToDevice, stream);
-    if (err != cudaSuccess)
-    {
-        free_all();
-        return set_error(err);
-    }
-
     double *cov_workspace = nullptr;
     double *mean_workspace = nullptr;
     double *col_workspace = nullptr;
@@ -4284,7 +4303,7 @@ int launch_sample_p1_full_kernel(
         if (chunk_samples <= 1)
         {
             free_all();
-            return set_error("failed to allocate workspace in matrix_sample_p1_full_kernel");
+            return set_error("failed to allocate workspace in matrix_sample_p1_integer_kernel");
         }
         chunk_samples = (chunk_samples + 1) / 2;
     }
@@ -4294,12 +4313,11 @@ int launch_sample_p1_full_kernel(
     {
         size_t sample_count = std::min(chunk_samples, total_samples - sample_start);
         const int blocks = static_cast<int>((sample_count + threads - 1) / threads);
-        matrix_sample_p1_full_kernel<<<blocks, threads, 0, stream>>>(
+        matrix_sample_p1_integer_kernel<<<blocks, threads, 0, stream>>>(
             d_a_entries,
             d_b_entries,
             d_d_entries,
             d_tp2_entries,
-            d_out_entries,
             d,
             cols,
             n,
@@ -4309,11 +4327,11 @@ int launch_sample_p1_full_kernel(
             mean_workspace,
             col_workspace,
             sampled_workspace,
+            d_sampled_out,
             modulus,
             sigma,
             s,
             dgg_stddev,
-            limb_idx,
             seed);
         err = cudaGetLastError();
         if (err != cudaSuccess)
@@ -4331,8 +4349,124 @@ int launch_sample_p1_full_kernel(
         free_all();
         return set_error(err);
     }
+    err = cudaMemcpyAsync(
+        sampled_out_host.data(),
+        d_sampled_out,
+        total_values * sizeof(int64_t),
+        cudaMemcpyDeviceToHost,
+        stream);
+    if (err != cudaSuccess)
+    {
+        free_workspace();
+        free_all();
+        return set_error(err);
+    }
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess)
+    {
+        free_workspace();
+        free_all();
+        return set_error(err);
+    }
 
     free_workspace();
+    free_all();
+    return 0;
+}
+
+int launch_scatter_p1_integer_to_limb_kernel(
+    const std::vector<int64_t> &sampled_in_host,
+    const std::vector<uint64_t *> &out_entries,
+    size_t n,
+    uint64_t modulus,
+    cudaStream_t stream,
+    int device_id)
+{
+    if (out_entries.empty() || n == 0)
+    {
+        return 0;
+    }
+    if (device_id < 0)
+    {
+        return set_error("invalid device in matrix_scatter_p1_integer_to_limb_kernel");
+    }
+    const size_t total = out_entries.size() * n;
+    if (sampled_in_host.size() != total)
+    {
+        return set_error("sampled input size mismatch in matrix_scatter_p1_integer_to_limb_kernel");
+    }
+
+    cudaError_t err = cudaSetDevice(device_id);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+
+    uint64_t **d_out_entries = nullptr;
+    int64_t *d_sampled_in = nullptr;
+    const size_t out_ptr_bytes = out_entries.size() * sizeof(uint64_t *);
+    const size_t sampled_bytes = total * sizeof(int64_t);
+
+    auto free_all = [&]()
+    {
+        if (d_out_entries)
+            cudaFree(d_out_entries);
+        if (d_sampled_in)
+            cudaFree(d_sampled_in);
+    };
+
+    err = cudaMalloc(&d_out_entries, out_ptr_bytes);
+    if (err != cudaSuccess)
+    {
+        free_all();
+        return set_error(err);
+    }
+    err = cudaMalloc(&d_sampled_in, sampled_bytes);
+    if (err != cudaSuccess)
+    {
+        free_all();
+        return set_error(err);
+    }
+
+    err = cudaMemcpyAsync(d_out_entries, out_entries.data(), out_ptr_bytes, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess)
+    {
+        free_all();
+        return set_error(err);
+    }
+    err = cudaMemcpyAsync(
+        d_sampled_in,
+        sampled_in_host.data(),
+        sampled_bytes,
+        cudaMemcpyHostToDevice,
+        stream);
+    if (err != cudaSuccess)
+    {
+        free_all();
+        return set_error(err);
+    }
+
+    const int threads = 256;
+    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    matrix_scatter_p1_integer_to_limb_kernel<<<blocks, threads, 0, stream>>>(
+        d_sampled_in,
+        d_out_entries,
+        out_entries.size(),
+        n,
+        modulus);
+    err = cudaGetLastError();
+    if (err != cudaSuccess)
+    {
+        free_all();
+        return set_error(err);
+    }
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess)
+    {
+        free_all();
+        return set_error(err);
+    }
+
     free_all();
     return 0;
 }
@@ -5144,78 +5278,151 @@ extern "C" int gpu_matrix_sample_p1_full(
     }
     out->format = PolyFormat::Coeff;
 
+    const dim3 ref_limb_id = limb_map[0];
+    std::vector<const uint64_t *> ref_a_entry_ptrs;
+    std::vector<const uint64_t *> ref_b_entry_ptrs;
+    std::vector<const uint64_t *> ref_d_entry_ptrs;
+    std::vector<const uint64_t *> ref_tp2_entry_ptrs;
+    ref_a_entry_ptrs.reserve(d_rows * d_rows);
+    ref_b_entry_ptrs.reserve(d_rows * d_rows);
+    ref_d_entry_ptrs.reserve(d_rows * d_rows);
+    ref_tp2_entry_ptrs.reserve(2 * d_rows * cols);
+
+    cudaStream_t ref_stream = nullptr;
+    int ref_device = -1;
+    for (size_t i = 0; i < d_rows; ++i)
+    {
+        for (size_t j = 0; j < d_rows; ++j)
+        {
+            const size_t idx = matrix_index(i, j, d_rows);
+            if (ref_limb_id.x >= a_inputs[idx]->poly->GPU.size() ||
+                ref_limb_id.x >= b_inputs[idx]->poly->GPU.size() ||
+                ref_limb_id.x >= d_inputs[idx]->poly->GPU.size())
+            {
+                cleanup();
+                return set_error("unexpected A/B/D limb GPU partition in gpu_matrix_sample_p1_full");
+            }
+            const auto &a_part = a_inputs[idx]->poly->GPU[ref_limb_id.x];
+            const auto &b_part = b_inputs[idx]->poly->GPU[ref_limb_id.x];
+            const auto &d_part = d_inputs[idx]->poly->GPU[ref_limb_id.x];
+            if (ref_limb_id.y >= a_part.limb.size() ||
+                ref_limb_id.y >= b_part.limb.size() ||
+                ref_limb_id.y >= d_part.limb.size())
+            {
+                cleanup();
+                return set_error("unexpected A/B/D limb index in gpu_matrix_sample_p1_full");
+            }
+            const auto &a_impl = a_part.limb[ref_limb_id.y];
+            const auto &b_impl = b_part.limb[ref_limb_id.y];
+            const auto &d_impl = d_part.limb[ref_limb_id.y];
+            if (a_impl.index() != FIDESlib::U64 ||
+                b_impl.index() != FIDESlib::U64 ||
+                d_impl.index() != FIDESlib::U64)
+            {
+                cleanup();
+                return set_error("unsupported A/B/D limb type in gpu_matrix_sample_p1_full");
+            }
+            ref_a_entry_ptrs.push_back(std::get<FIDESlib::U64>(a_impl).v.data);
+            ref_b_entry_ptrs.push_back(std::get<FIDESlib::U64>(b_impl).v.data);
+            ref_d_entry_ptrs.push_back(std::get<FIDESlib::U64>(d_impl).v.data);
+        }
+    }
+    for (size_t row = 0; row < 2 * d_rows; ++row)
+    {
+        for (size_t col = 0; col < cols; ++col)
+        {
+            const size_t idx = matrix_index(row, col, cols);
+            if (ref_limb_id.x >= tp2_inputs[idx]->poly->GPU.size() ||
+                ref_limb_id.x >= out->polys[idx]->poly->GPU.size())
+            {
+                cleanup();
+                return set_error("unexpected tp2/output limb GPU partition in gpu_matrix_sample_p1_full");
+            }
+            const auto &tp2_part = tp2_inputs[idx]->poly->GPU[ref_limb_id.x];
+            auto &out_part = out->polys[idx]->poly->GPU[ref_limb_id.x];
+            if (tp2_part.device != out_part.device)
+            {
+                cleanup();
+                return set_error("input/output limb device mismatch in gpu_matrix_sample_p1_full");
+            }
+            if (ref_device < 0)
+            {
+                ref_device = out_part.device;
+            }
+            else if (ref_device != out_part.device)
+            {
+                cleanup();
+                return set_error("mixed reference output devices in gpu_matrix_sample_p1_full");
+            }
+            if (ref_limb_id.y >= tp2_part.limb.size() || ref_limb_id.y >= out_part.limb.size())
+            {
+                cleanup();
+                return set_error("unexpected tp2/output limb index in gpu_matrix_sample_p1_full");
+            }
+            const auto &tp2_impl = tp2_part.limb[ref_limb_id.y];
+            auto &out_impl = out_part.limb[ref_limb_id.y];
+            if (tp2_impl.index() != FIDESlib::U64 || out_impl.index() != FIDESlib::U64)
+            {
+                cleanup();
+                return set_error("unsupported tp2/output limb type in gpu_matrix_sample_p1_full");
+            }
+            const auto &tp2_u64 = std::get<FIDESlib::U64>(tp2_impl);
+            auto &out_u64 = std::get<FIDESlib::U64>(out_impl);
+            if (!ref_stream)
+            {
+                ref_stream = out_u64.stream.ptr;
+            }
+            ref_tp2_entry_ptrs.push_back(tp2_u64.v.data);
+        }
+    }
+    if (!ref_stream || ref_device < 0)
+    {
+        cleanup();
+        return set_error("invalid reference stream/device in gpu_matrix_sample_p1_full");
+    }
+
+    std::vector<int64_t> sampled_out_host;
+    status = launch_sample_p1_integer_kernel(
+        ref_a_entry_ptrs,
+        ref_b_entry_ptrs,
+        ref_d_entry_ptrs,
+        ref_tp2_entry_ptrs,
+        d_rows,
+        cols,
+        static_cast<size_t>(a_mat->ctx->N),
+        a_mat->ctx->moduli[0],
+        sigma,
+        s,
+        dgg_stddev,
+        seed,
+        ref_stream,
+        ref_device,
+        sampled_out_host);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+
     for (int limb = 0; limb <= level; ++limb)
     {
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-
-        std::vector<const uint64_t *> a_entry_ptrs;
-        std::vector<const uint64_t *> b_entry_ptrs;
-        std::vector<const uint64_t *> d_entry_ptrs;
-        std::vector<const uint64_t *> tp2_entry_ptrs;
         std::vector<uint64_t *> out_entry_ptrs;
-        a_entry_ptrs.reserve(d_rows * d_rows);
-        b_entry_ptrs.reserve(d_rows * d_rows);
-        d_entry_ptrs.reserve(d_rows * d_rows);
-        tp2_entry_ptrs.reserve(2 * d_rows * cols);
         out_entry_ptrs.reserve(2 * d_rows * cols);
 
         cudaStream_t out_stream = nullptr;
         int out_device = -1;
-        for (size_t i = 0; i < d_rows; ++i)
-        {
-            for (size_t j = 0; j < d_rows; ++j)
-            {
-                const size_t idx = matrix_index(i, j, d_rows);
-                if (limb_id.x >= a_inputs[idx]->poly->GPU.size() ||
-                    limb_id.x >= b_inputs[idx]->poly->GPU.size() ||
-                    limb_id.x >= d_inputs[idx]->poly->GPU.size())
-                {
-                    cleanup();
-                    return set_error("unexpected A/B/D limb GPU partition in gpu_matrix_sample_p1_full");
-                }
-                const auto &a_part = a_inputs[idx]->poly->GPU[limb_id.x];
-                const auto &b_part = b_inputs[idx]->poly->GPU[limb_id.x];
-                const auto &d_part = d_inputs[idx]->poly->GPU[limb_id.x];
-                if (limb_id.y >= a_part.limb.size() ||
-                    limb_id.y >= b_part.limb.size() ||
-                    limb_id.y >= d_part.limb.size())
-                {
-                    cleanup();
-                    return set_error("unexpected A/B/D limb index in gpu_matrix_sample_p1_full");
-                }
-                const auto &a_impl = a_part.limb[limb_id.y];
-                const auto &b_impl = b_part.limb[limb_id.y];
-                const auto &d_impl = d_part.limb[limb_id.y];
-                if (a_impl.index() != FIDESlib::U64 ||
-                    b_impl.index() != FIDESlib::U64 ||
-                    d_impl.index() != FIDESlib::U64)
-                {
-                    cleanup();
-                    return set_error("unsupported A/B/D limb type in gpu_matrix_sample_p1_full");
-                }
-                a_entry_ptrs.push_back(std::get<FIDESlib::U64>(a_impl).v.data);
-                b_entry_ptrs.push_back(std::get<FIDESlib::U64>(b_impl).v.data);
-                d_entry_ptrs.push_back(std::get<FIDESlib::U64>(d_impl).v.data);
-            }
-        }
         for (size_t row = 0; row < 2 * d_rows; ++row)
         {
             for (size_t col = 0; col < cols; ++col)
             {
                 const size_t idx = matrix_index(row, col, cols);
-                if (limb_id.x >= tp2_inputs[idx]->poly->GPU.size() ||
-                    limb_id.x >= out->polys[idx]->poly->GPU.size())
+                if (limb_id.x >= out->polys[idx]->poly->GPU.size())
                 {
                     cleanup();
-                    return set_error("unexpected tp2/output limb GPU partition in gpu_matrix_sample_p1_full");
+                    return set_error("unexpected output limb GPU partition in gpu_matrix_sample_p1_full");
                 }
-                const auto &tp2_part = tp2_inputs[idx]->poly->GPU[limb_id.x];
                 auto &out_part = out->polys[idx]->poly->GPU[limb_id.x];
-                if (tp2_part.device != out_part.device)
-                {
-                    cleanup();
-                    return set_error("input/output limb device mismatch in gpu_matrix_sample_p1_full");
-                }
                 if (out_device < 0)
                 {
                     out_device = out_part.device;
@@ -5225,44 +5432,36 @@ extern "C" int gpu_matrix_sample_p1_full(
                     cleanup();
                     return set_error("mixed output devices in gpu_matrix_sample_p1_full");
                 }
-                if (limb_id.y >= tp2_part.limb.size() || limb_id.y >= out_part.limb.size())
+                if (limb_id.y >= out_part.limb.size())
                 {
                     cleanup();
-                    return set_error("unexpected tp2/output limb index in gpu_matrix_sample_p1_full");
+                    return set_error("unexpected output limb index in gpu_matrix_sample_p1_full");
                 }
-                const auto &tp2_impl = tp2_part.limb[limb_id.y];
                 auto &out_impl = out_part.limb[limb_id.y];
-                if (tp2_impl.index() != FIDESlib::U64 || out_impl.index() != FIDESlib::U64)
+                if (out_impl.index() != FIDESlib::U64)
                 {
                     cleanup();
-                    return set_error("unsupported tp2/output limb type in gpu_matrix_sample_p1_full");
+                    return set_error("unsupported output limb type in gpu_matrix_sample_p1_full");
                 }
-                const auto &tp2_u64 = std::get<FIDESlib::U64>(tp2_impl);
                 auto &out_u64 = std::get<FIDESlib::U64>(out_impl);
                 if (!out_stream)
                 {
                     out_stream = out_u64.stream.ptr;
                 }
-                tp2_entry_ptrs.push_back(tp2_u64.v.data);
                 out_entry_ptrs.push_back(out_u64.v.data);
             }
         }
+        if (!out_stream || out_device < 0)
+        {
+            cleanup();
+            return set_error("invalid output stream/device in gpu_matrix_sample_p1_full");
+        }
 
-        status = launch_sample_p1_full_kernel(
-            a_entry_ptrs,
-            b_entry_ptrs,
-            d_entry_ptrs,
-            tp2_entry_ptrs,
+        status = launch_scatter_p1_integer_to_limb_kernel(
+            sampled_out_host,
             out_entry_ptrs,
-            d_rows,
-            cols,
             static_cast<size_t>(a_mat->ctx->N),
             a_mat->ctx->moduli[static_cast<size_t>(limb)],
-            sigma,
-            s,
-            dgg_stddev,
-            static_cast<uint32_t>(limb),
-            seed,
             out_stream,
             out_device);
         if (status != 0)

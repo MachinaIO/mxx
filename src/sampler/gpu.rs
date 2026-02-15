@@ -149,13 +149,15 @@ mod tests {
     use super::*;
     use crate::{
         __PAIR, __TestState,
+        element::PolyElem,
         matrix::PolyMatrix,
         poly::{
-            PolyParams,
+            Poly, PolyParams,
             dcrt::{gpu::gpu_device_sync, params::DCRTPolyParams},
         },
     };
     use keccak_asm::Keccak256;
+    use num_bigint::BigUint;
     use sequential_test::sequential;
 
     fn gpu_test_params() -> DCRTPolyParams {
@@ -191,5 +193,44 @@ mod tests {
         let sampled1 = sampler.sample_hash(&params, key, tag, 4, 5, DistType::FinRingDist);
         let sampled2 = sampler.sample_hash(&params, key, tag, 4, 5, DistType::FinRingDist);
         assert_eq!(sampled1, sampled2);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_sample_gpu_matrix_with_seed_gauss_coeff_lt_6sigma() {
+        gpu_device_sync();
+        let cpu_params = gpu_test_params();
+        let params = gpu_params_from_cpu(&cpu_params);
+        let sigma = 4.578;
+        let sampled = sample_gpu_matrix_with_seed(
+            &params,
+            4,
+            5,
+            DistType::GaussDist { sigma },
+            0x1234_5678_9abc_def0,
+        );
+
+        let bound = sigma * 6.0;
+        let strict_upper = BigUint::from(bound.ceil() as u64);
+        let q = params.modulus();
+
+        for i in 0..sampled.row_size() {
+            for j in 0..sampled.col_size() {
+                let poly = sampled.entry(i, j);
+                for (k, coeff) in poly.coeffs().into_iter().enumerate() {
+                    let value = coeff.value().clone();
+                    let neg = q.as_ref() - &value;
+                    let centered_abs = if value < neg { value } else { neg };
+                    assert!(
+                        centered_abs < strict_upper,
+                        "gauss coeff bound violated at ({i},{j}) coeff={k}: centered_abs={} >= {} (sigma={}, 6sigma={})",
+                        centered_abs,
+                        strict_upper,
+                        sigma,
+                        bound
+                    );
+                }
+            }
+        }
     }
 }

@@ -27,7 +27,7 @@ use std::{fs, path::Path, sync::Arc};
 use tracing::info;
 
 const CRT_BITS: usize = 51;
-const RING_DIM: u32 = 1 << 14;
+const RING_DIM: u32 = 1 << 8;
 const ERROR_SIGMA: f64 = 4.0;
 const BASE_BITS: u32 = 17;
 const MAX_CRT_DEPTH: usize = 12;
@@ -188,8 +188,7 @@ async fn test_ggh15_modp_chain_rounding() {
 
     let bgg_pubkey_sampler =
         BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, D_SECRET);
-    let tag: u64 = rand::random();
-    let tag_bytes = tag.to_le_bytes();
+    let tag_bytes: &[u8] = b"bgg_pubkey";
 
     let uniform_sampler = DCRTPolyUniformSampler::new();
     let s = uniform_sampler.sample_uniform(&params, 1, D_SECRET - 1, DistType::BitDist).get_row(0);
@@ -198,7 +197,7 @@ async fn test_ggh15_modp_chain_rounding() {
     let s_vec = DCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
 
     let reveal_plaintexts = vec![true; circuit.num_input()];
-    let pubkeys = bgg_pubkey_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
+    let pubkeys = bgg_pubkey_sampler.sample(&params, tag_bytes, &reveal_plaintexts);
     let bgg_encoding_sampler =
         BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
     let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &plaintexts);

@@ -258,8 +258,7 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
 
     let bgg_pubkey_sampler =
         BGGPublicKeySampler::<_, GpuDCRTPolyHashSampler<Keccak256>>::new(key, D_SECRET);
-    let tag: u64 = rand::random();
-    let tag_bytes = tag.to_le_bytes();
+    let tag_bytes: &[u8] = b"bgg_pubkey";
 
     let uniform_sampler = GpuDCRTPolyUniformSampler::new();
     let s = uniform_sampler.sample_uniform(&params, 1, D_SECRET - 1, DistType::BitDist).get_row(0);
@@ -268,7 +267,7 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
     let s_vec = GpuDCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
 
     let reveal_plaintexts = vec![true; circuit.num_input()];
-    let pubkeys = bgg_pubkey_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
+    let pubkeys = bgg_pubkey_sampler.sample(&params, tag_bytes, &reveal_plaintexts);
     let bgg_encoding_sampler =
         BGGEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
     let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &plaintexts);

@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{matrix::PolyMatrix, poly::Poly, storage::write::GlobalTableIndex};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// Read a specific matrix from split batch files by its ID prefix and index.
 /// Uses indexed format for O(1) access to lookup tables.
@@ -103,7 +103,7 @@ where
     let mut matrix_data = vec![0u8; entry.bytes_per_matrix];
     file.read_exact(&mut matrix_data).ok()?;
     let matrix = M::from_compact_bytes(params, &matrix_data);
-    info!(
+    debug!(
         "{}",
         format!(
             "Loaded matrix {} from batch file {} (table: {}) in {:?}",

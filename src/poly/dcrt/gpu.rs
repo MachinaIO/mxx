@@ -2,10 +2,10 @@ use crate::{
     element::{PolyElem, finite_ring::FinRingElem},
     impl_binop_with_refs,
     poly::{Poly, PolyParams},
-    utils::{chunk_size_for, mod_inverse},
+    utils::mod_inverse,
 };
 use num_bigint::BigUint;
-use num_traits::{One, ToPrimitive, Zero};
+use num_traits::{One, ToPrimitive};
 use rayon::prelude::*;
 #[cfg(test)]
 use sequential_test::sequential;
@@ -79,13 +79,6 @@ unsafe extern "C" {
         rns_len: usize,
         format: c_int,
     ) -> c_int;
-    fn gpu_poly_store_rns(
-        poly: *mut GpuPolyOpaque,
-        rns_flat_out: *mut u64,
-        rns_len: usize,
-        format: c_int,
-        out_events: *mut *mut GpuEventSetOpaque,
-    ) -> c_int;
     fn gpu_poly_store_rns_batch(
         polys: *const *mut GpuPolyOpaque,
         poly_count: usize,
@@ -93,6 +86,27 @@ unsafe extern "C" {
         bytes_per_poly: usize,
         format: c_int,
         out_events: *mut *mut GpuEventSetOpaque,
+    ) -> c_int;
+    fn gpu_poly_store_compact_bytes(
+        poly: *mut GpuPolyOpaque,
+        payload_out: *mut u8,
+        payload_capacity: usize,
+        out_max_coeff_bits: *mut u16,
+        out_bytes_per_coeff: *mut u16,
+        out_payload_len: *mut usize,
+    ) -> c_int;
+    fn gpu_poly_load_compact_bytes(
+        poly: *mut GpuPolyOpaque,
+        payload: *const u8,
+        payload_len: usize,
+        max_coeff_bits: u16,
+    ) -> c_int;
+    fn gpu_poly_store_coeffs_words(
+        poly: *mut GpuPolyOpaque,
+        coeff_words_out: *mut u64,
+        coeff_words_len: usize,
+        words_per_coeff: usize,
+        format: c_int,
     ) -> c_int;
     pub(crate) fn gpu_event_set_wait(events: *mut GpuEventSetOpaque) -> c_int;
     pub(crate) fn gpu_event_set_destroy(events: *mut GpuEventSetOpaque);
@@ -111,6 +125,11 @@ unsafe extern "C" {
         out: *mut GpuPolyOpaque,
         a: *const GpuPolyOpaque,
         b: *const GpuPolyOpaque,
+    ) -> c_int;
+    fn gpu_poly_equal(
+        lhs: *const GpuPolyOpaque,
+        rhs: *const GpuPolyOpaque,
+        out_equal: *mut c_int,
     ) -> c_int;
     fn gpu_poly_decompose_base(
         src: *const GpuPolyOpaque,
@@ -169,6 +188,11 @@ unsafe extern "C" {
         lhs: *const GpuMatrixOpaque,
         rhs: *const GpuMatrixOpaque,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_equal(
+        lhs: *const GpuMatrixOpaque,
+        rhs: *const GpuMatrixOpaque,
+        out_equal: *mut c_int,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_mul_timed(
         out: *mut GpuMatrixOpaque,
         lhs: *const GpuMatrixOpaque,
@@ -190,10 +214,36 @@ unsafe extern "C" {
         rows: usize,
         cols: usize,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_fill_gadget(out: *mut GpuMatrixOpaque, base_bits: u32) -> c_int;
     pub(crate) fn gpu_matrix_decompose_base(
         src: *const GpuMatrixOpaque,
         base_bits: u32,
         out: *mut GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_gauss_samp_gq_arb_base(
+        src: *const GpuMatrixOpaque,
+        base_bits: u32,
+        c: f64,
+        dgg_stddev: f64,
+        seed: u64,
+        out: *mut GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_sample_p1_full(
+        a_mat: *const GpuMatrixOpaque,
+        b_mat: *const GpuMatrixOpaque,
+        d_mat: *const GpuMatrixOpaque,
+        tp2: *const GpuMatrixOpaque,
+        sigma: f64,
+        s: f64,
+        dgg_stddev: f64,
+        seed: u64,
+        out: *mut GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_sample_distribution(
+        out: *mut GpuMatrixOpaque,
+        dist_type: c_int,
+        sigma: f64,
+        seed: u64,
     ) -> c_int;
 
     fn gpu_poly_ntt(poly: *mut GpuPolyOpaque, batch: c_int) -> c_int;
@@ -210,6 +260,16 @@ unsafe extern "C" {
 
 pub(crate) const GPU_POLY_FORMAT_COEFF: c_int = 0;
 pub(crate) const GPU_POLY_FORMAT_EVAL: c_int = 1;
+pub(crate) const GPU_MATRIX_DIST_UNIFORM: c_int = 0;
+pub(crate) const GPU_MATRIX_DIST_GAUSS: c_int = 1;
+pub(crate) const GPU_MATRIX_DIST_BIT: c_int = 2;
+pub(crate) const GPU_MATRIX_DIST_TERNARY: c_int = 3;
+
+const GPU_COMPACT_MAGIC: [u8; 4] = *b"GCB4";
+const GPU_COMPACT_VERSION: u8 = 4;
+const GPU_COMPACT_FORMAT_COEFF: u8 = 0;
+const GPU_COMPACT_FORMAT_EVAL: u8 = 1;
+const GPU_COMPACT_HEADER_LEN: usize = 10;
 
 pub(crate) fn last_error_string() -> String {
     unsafe {
@@ -368,9 +428,65 @@ fn bits_in_u64(value: u64) -> usize {
     (u64::BITS - value.leading_zeros()) as usize
 }
 
+#[inline(always)]
+fn coeff_words_per_coeff_upper(moduli: &[u64], level: usize) -> usize {
+    assert!(level < moduli.len(), "invalid level {} for modulus count {}", level, moduli.len());
+    moduli.iter().take(level + 1).map(|m| bits_in_u64(*m)).sum::<usize>().div_ceil(64).max(1)
+}
+
+#[inline(always)]
+fn biguint_from_u64_words_le(words: &[u64]) -> BigUint {
+    if words.is_empty() {
+        return BigUint::ZERO;
+    }
+    let mut digits = Vec::with_capacity(words.len() * 2);
+    for &word in words {
+        digits.push((word & 0xFFFF_FFFF) as u32);
+        digits.push((word >> 32) as u32);
+    }
+    while digits.last().copied() == Some(0) {
+        digits.pop();
+    }
+    if digits.is_empty() { BigUint::ZERO } else { BigUint::new(digits) }
+}
+
 fn log2_u32(value: u32) -> u32 {
     assert!(value.is_power_of_two(), "ring_dimension must be a power of 2");
     value.trailing_zeros()
+}
+
+fn parse_gpu_compact_header(bytes: &[u8]) -> (usize, usize, c_int) {
+    assert!(
+        bytes.len() >= GPU_COMPACT_HEADER_LEN,
+        "compact bytes too short for GPU header (got {}, need at least {})",
+        bytes.len(),
+        GPU_COMPACT_HEADER_LEN
+    );
+    assert!(
+        bytes[0..4] == GPU_COMPACT_MAGIC,
+        "invalid GPU compact magic: expected {:?}, got {:?}",
+        GPU_COMPACT_MAGIC,
+        &bytes[0..4]
+    );
+    let version = bytes[4];
+    assert_eq!(
+        version, GPU_COMPACT_VERSION,
+        "unsupported GPU compact version: got {}, expected {}",
+        version, GPU_COMPACT_VERSION
+    );
+    let format = match bytes[5] {
+        GPU_COMPACT_FORMAT_COEFF => GPU_POLY_FORMAT_COEFF,
+        GPU_COMPACT_FORMAT_EVAL => GPU_POLY_FORMAT_EVAL,
+        other => panic!("unsupported GPU compact format: {other}"),
+    };
+    let max_coeff_bits = u16::from_le_bytes([bytes[6], bytes[7]]) as usize;
+    let bytes_per_coeff = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+    (max_coeff_bits, bytes_per_coeff, format)
+}
+
+#[inline(always)]
+fn packed_coeff_bytes_len(ring_dimension: usize, max_coeff_bits: usize) -> usize {
+    ring_dimension.saturating_mul(max_coeff_bits).div_ceil(8)
 }
 
 #[derive(Clone)]
@@ -686,22 +802,6 @@ impl GpuDCRTPoly {
         Self::from_flat(Arc::new(params.clone()), level, flat, false)
     }
 
-    fn store_rns_flat(&self) -> Vec<u64> {
-        let n = self.params.ring_dimension as usize;
-        let len = (self.level + 1) * n;
-        let mut flat = vec![0u64; len];
-        let mut events: *mut GpuEventSetOpaque = ptr::null_mut();
-        let format = if self.is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
-        let status = unsafe {
-            gpu_poly_store_rns(self.raw, flat.as_mut_ptr(), flat.len(), format, &mut events)
-        };
-        check_status(status, "gpu_poly_store_rns");
-        let wait_status = unsafe { gpu_event_set_wait(events) };
-        unsafe { gpu_event_set_destroy(events) };
-        check_status(wait_status, "gpu_event_set_wait");
-        flat
-    }
-
     pub(crate) fn store_rns_bytes(&mut self, bytes_out: &mut [u8], format: c_int) {
         if bytes_out.is_empty() {
             return;
@@ -723,6 +823,82 @@ impl GpuDCRTPoly {
         unsafe { gpu_event_set_destroy(events) };
         check_status(wait_status, "gpu_event_set_wait");
         self.is_ntt = format == GPU_POLY_FORMAT_EVAL;
+    }
+
+    fn try_store_compact_bytes_payload(&mut self) -> Result<(u16, u16, Vec<u8>), String> {
+        let ring_dimension = self.params.ring_dimension() as usize;
+        let max_coeff_bits_upper = self
+            .params
+            .moduli()
+            .iter()
+            .take(self.level + 1)
+            .map(|m| bits_in_u64(*m))
+            .sum::<usize>();
+        let total_bits = ring_dimension
+            .checked_mul(max_coeff_bits_upper)
+            .ok_or_else(|| "compact payload bit length overflow".to_string())?;
+        let payload_capacity = total_bits.div_ceil(8);
+        let mut payload = vec![0u8; payload_capacity];
+        let mut max_coeff_bits: u16 = 0;
+        let mut bytes_per_coeff: u16 = 0;
+        let mut payload_len: usize = 0;
+        let status = unsafe {
+            gpu_poly_store_compact_bytes(
+                self.raw,
+                payload.as_mut_ptr(),
+                payload_capacity,
+                &mut max_coeff_bits,
+                &mut bytes_per_coeff,
+                &mut payload_len,
+            )
+        };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        if usize::from(bytes_per_coeff) != usize::from(max_coeff_bits).div_ceil(8) {
+            return Err("GPU compact metadata mismatch".to_string());
+        }
+        payload.truncate(payload_len);
+        self.is_ntt = false;
+        Ok((max_coeff_bits, bytes_per_coeff, payload))
+    }
+
+    fn try_load_compact_bytes_payload(
+        &mut self,
+        payload: &[u8],
+        max_coeff_bits: u16,
+    ) -> Result<(), String> {
+        let status = unsafe {
+            gpu_poly_load_compact_bytes(self.raw, payload.as_ptr(), payload.len(), max_coeff_bits)
+        };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        self.is_ntt = false;
+        Ok(())
+    }
+
+    fn try_store_coeff_words(&mut self, format: c_int) -> Result<(usize, Vec<u64>), String> {
+        let words_per_coeff = coeff_words_per_coeff_upper(self.params.moduli(), self.level);
+        let n = self.params.ring_dimension() as usize;
+        let total_words = n
+            .checked_mul(words_per_coeff)
+            .ok_or_else(|| "coefficient word length overflow".to_string())?;
+        let mut coeff_words = vec![0u64; total_words];
+        let status = unsafe {
+            gpu_poly_store_coeffs_words(
+                self.raw,
+                coeff_words.as_mut_ptr(),
+                coeff_words.len(),
+                words_per_coeff,
+                format,
+            )
+        };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        self.is_ntt = format == GPU_POLY_FORMAT_EVAL;
+        Ok((words_per_coeff, coeff_words))
     }
 
     pub(crate) fn store_rns_bytes_batch(
@@ -784,48 +960,6 @@ impl GpuDCRTPoly {
         assert_eq!(self.level, other.level, "GPU polynomials must have the same level");
         assert_eq!(self.params.as_ref(), other.params.as_ref(), "GPU params must match");
     }
-
-    // pub(crate) fn load_from_compact_bytes(&mut self, bytes: &[u8]) {
-    //     let ring_dimension = self.params.ring_dimension() as usize;
-    //     if ring_dimension == 0 {
-    //         return;
-    //     }
-    //     let max_byte_size = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as
-    // usize;     let bit_vector_byte_size = ring_dimension.div_ceil(8);
-    //     let bit_vector = &bytes[4..4 + bit_vector_byte_size];
-    //     let coeffs_base_offset = 4 + bit_vector_byte_size;
-    //     let modulus = self.params.modulus();
-    //     let coeffs: Vec<FinRingElem> = reconstruct_coeffs_chunked(
-    //         bytes,
-    //         ring_dimension,
-    //         max_byte_size,
-    //         bit_vector,
-    //         coeffs_base_offset,
-    //         &modulus,
-    //         chunk_size_for(ring_dimension),
-    //     );
-
-    //     let level = self.level;
-    //     let moduli = self.params.moduli();
-    //     let modulus_bigints =
-    //         moduli[..=level].iter().map(|m| BigUint::from(*m)).collect::<Vec<_>>();
-    //     let residues_by_limb = modulus_bigints
-    //         .iter()
-    //         .map(|modulus| {
-    //             coeffs
-    //                 .par_iter()
-    //                 .map(|coeff| (coeff.value() % modulus).to_u64().unwrap_or(0))
-    //                 .collect::<Vec<_>>()
-    //         })
-    //         .collect::<Vec<_>>();
-    //     let flat = residues_by_limb.into_iter().flatten().collect::<Vec<_>>();
-
-    //     let status = unsafe {
-    //         gpu_poly_load_rns(self.raw, flat.as_ptr(), flat.len(), GPU_POLY_FORMAT_COEFF)
-    //     };
-    //     check_status(status, "gpu_poly_load_rns");
-    //     self.is_ntt = false;
-    // }
 
     // pub(crate) fn add_into(out: &mut GpuDCRTPoly, a: &GpuDCRTPoly, b: &GpuDCRTPoly) {
     //     a.assert_compatible(b);
@@ -959,10 +1093,24 @@ impl Drop for GpuDCRTPoly {
 
 impl PartialEq for GpuDCRTPoly {
     fn eq(&self, other: &Self) -> bool {
-        if self.params.as_ref() != other.params.as_ref() {
+        if self.params.as_ref() != other.params.as_ref() || self.level != other.level {
             return false;
         }
-        self.coeffs() == other.coeffs()
+        if self.raw == other.raw {
+            return true;
+        }
+        let mut out_equal: c_int = 0;
+        if self.is_ntt == other.is_ntt {
+            let status =
+                unsafe { gpu_poly_equal(self.raw, other.raw, &mut out_equal as *mut c_int) };
+            check_status(status, "gpu_poly_equal");
+            return out_equal != 0;
+        }
+        let lhs = self.ensure_coeff_domain();
+        let rhs = other.ensure_coeff_domain();
+        let status = unsafe { gpu_poly_equal(lhs.raw, rhs.raw, &mut out_equal as *mut c_int) };
+        check_status(status, "gpu_poly_equal");
+        out_equal != 0
     }
 }
 
@@ -1037,46 +1185,56 @@ impl Poly for GpuDCRTPoly {
     }
 
     fn from_compact_bytes(params: &Self::Params, bytes: &[u8]) -> Self {
-        let ring_dimension = params.ring_dimension as usize;
-        let modulus = params.modulus();
-
-        let max_byte_size = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-        let bit_vector_byte_size = ring_dimension.div_ceil(8);
-        let bit_vector = &bytes[4..4 + bit_vector_byte_size];
-        let coeffs_base_offset = 4 + bit_vector_byte_size;
-
-        let coeffs: Vec<FinRingElem> = reconstruct_coeffs_chunked(
-            bytes,
-            ring_dimension,
-            max_byte_size,
-            bit_vector,
-            coeffs_base_offset,
-            &modulus,
-            chunk_size_for(ring_dimension),
+        let (max_coeff_bits, bytes_per_coeff, format) = parse_gpu_compact_header(bytes);
+        assert_eq!(
+            format, GPU_POLY_FORMAT_COEFF,
+            "compact bytes only support coeff format for now"
+        );
+        assert_eq!(
+            bytes_per_coeff,
+            max_coeff_bits.div_ceil(8),
+            "compact bytes metadata mismatch: bytes_per_coeff must be ceil(max_coeff_bits/8)"
+        );
+        let ring_dimension = params.ring_dimension() as usize;
+        let payload_len = packed_coeff_bytes_len(ring_dimension, max_coeff_bits);
+        let expected_total = GPU_COMPACT_HEADER_LEN + payload_len;
+        assert_eq!(
+            bytes.len(),
+            expected_total,
+            "compact bytes total size mismatch: got {}, expected {}",
+            bytes.len(),
+            expected_total
         );
 
-        Self::from_coeffs(params, &coeffs)
+        let payload = &bytes[GPU_COMPACT_HEADER_LEN..];
+        let max_coeff_bits_u16 = u16::try_from(max_coeff_bits)
+            .unwrap_or_else(|_| panic!("max_coeff_bits out of u16 range: {max_coeff_bits}"));
+        let level = params.crt_depth.saturating_sub(1);
+        let mut poly = Self::new_empty(Arc::new(params.clone()), level, false);
+        poly.try_load_compact_bytes_payload(payload, max_coeff_bits_u16)
+            .unwrap_or_else(|err| panic!("gpu_poly_load_compact_bytes failed: {err}"));
+        poly
     }
 
     fn coeffs(&self) -> Vec<Self::Elem> {
-        let poly = self.ensure_coeff_domain();
+        let mut poly = self.ensure_coeff_domain();
         let n = poly.params.ring_dimension as usize;
         let level = poly.level;
-        // let flat_time = Instant::now();
-        let flat = poly.store_rns_flat();
         let modulus = poly.params.modulus();
-        let reconstruct_coeffs = poly.params.reconstruct_coeffs_for_level(level);
         let modulus_level = Arc::new(poly.params.modulus_for_level(level));
+        let (words_per_coeff, coeff_words) = poly
+            .try_store_coeff_words(GPU_POLY_FORMAT_COEFF)
+            .unwrap_or_else(|err| panic!("gpu_poly_store_coeffs_words failed: {err}"));
 
         let mut coeffs = Vec::with_capacity(n);
         for i in 0..n {
-            let mut acc = BigUint::zero();
-            for limb in 0..=level {
-                let residue = flat[limb * n + i];
-                acc += &reconstruct_coeffs[limb] * BigUint::from(residue);
-            }
-            acc %= &*modulus_level;
-            coeffs.push(FinRingElem::new(acc, modulus.clone()));
+            let start = i * words_per_coeff;
+            let value = biguint_from_u64_words_le(&coeff_words[start..start + words_per_coeff]);
+            assert!(
+                &value < modulus_level.as_ref(),
+                "GPU reconstructed coefficient out of range at index {i}"
+            );
+            coeffs.push(FinRingElem::new(value, modulus.clone()));
         }
         coeffs
     }
@@ -1191,12 +1349,18 @@ impl Poly for GpuDCRTPoly {
     }
 
     fn to_compact_bytes(&self) -> Vec<u8> {
-        let coeffs = self.coeffs();
-        let ring_dimension = coeffs.len();
-        let processed_coeffs: Vec<(bool, Vec<u8>)> =
-            process_coeffs_chunked(&coeffs, chunk_size_for(ring_dimension));
-
-        build_compact_bytes(processed_coeffs, ring_dimension)
+        let mut poly = self.ensure_coeff_domain();
+        let (max_coeff_bits, bytes_per_coeff, payload) = poly
+            .try_store_compact_bytes_payload()
+            .unwrap_or_else(|err| panic!("gpu_poly_store_compact_bytes failed: {err}"));
+        let mut bytes = vec![0u8; GPU_COMPACT_HEADER_LEN + payload.len()];
+        bytes[0..4].copy_from_slice(&GPU_COMPACT_MAGIC);
+        bytes[4] = GPU_COMPACT_VERSION;
+        bytes[5] = GPU_COMPACT_FORMAT_COEFF;
+        bytes[6..8].copy_from_slice(&max_coeff_bits.to_le_bytes());
+        bytes[8..10].copy_from_slice(&bytes_per_coeff.to_le_bytes());
+        bytes[GPU_COMPACT_HEADER_LEN..].copy_from_slice(&payload);
+        bytes
     }
 
     fn to_const_int(&self) -> usize {
@@ -1289,39 +1453,6 @@ impl MulAssign<&GpuDCRTPoly> for GpuDCRTPoly {
     fn mul_assign(&mut self, rhs: &Self) {
         *self = &*self * rhs;
     }
-}
-
-// ==== Compact bytes helpers ====
-
-fn build_compact_bytes(processed_coeffs: Vec<(bool, Vec<u8>)>, ring_dimension: usize) -> Vec<u8> {
-    let bit_vector_byte_size = ring_dimension.div_ceil(8);
-    let mut bit_vector = vec![0u8; bit_vector_byte_size];
-    let mut max_byte_size = 1;
-
-    for (i, (is_negative, value_bytes)) in processed_coeffs.iter().enumerate() {
-        if *is_negative {
-            let byte_idx = i / 8;
-            let bit_idx = i % 8;
-            bit_vector[byte_idx] |= 1 << bit_idx;
-        }
-        max_byte_size = std::cmp::max(max_byte_size, value_bytes.len());
-    }
-
-    let total_byte_size = 4 + bit_vector_byte_size + (ring_dimension * max_byte_size);
-    let mut result = vec![0u8; total_byte_size];
-
-    result[0..4].copy_from_slice(&(max_byte_size as u32).to_le_bytes());
-    result[4..4 + bit_vector_byte_size].copy_from_slice(&bit_vector);
-
-    let coeffs_base_offset = 4 + bit_vector_byte_size;
-    for (i, (_, value_bytes)) in processed_coeffs.iter().enumerate() {
-        if !value_bytes.is_empty() {
-            let start_pos = coeffs_base_offset + (i * max_byte_size);
-            result[start_pos..start_pos + value_bytes.len()].copy_from_slice(value_bytes);
-        }
-    }
-
-    result
 }
 
 #[cfg(test)]
@@ -1455,6 +1586,20 @@ mod tests {
 
     #[test]
     #[sequential]
+    fn test_gpu_dcrtpoly_partial_eq_across_domains() {
+        gpu_device_sync();
+        let params = gpu_test_params();
+        let gpu_params = gpu_params_from_cpu(&params);
+        let sampler = DCRTPolyUniformSampler::new();
+        let cpu_poly = sampler.sample_poly(&params, &DistType::FinRingDist);
+        let coeff_poly = gpu_poly_from_cpu(&cpu_poly, &gpu_params);
+        let mut eval_poly = coeff_poly.clone();
+        eval_poly.ntt_in_place();
+        assert_eq!(coeff_poly, eval_poly, "PartialEq should match across coeff/eval domains");
+    }
+
+    #[test]
+    #[sequential]
     fn test_gpu_dcrtpoly_decompose() {
         gpu_device_sync();
         let params = gpu_test_params();
@@ -1476,35 +1621,22 @@ mod tests {
         let cpu_poly = sampler.sample_poly(&params, &DistType::BitDist);
         let poly = gpu_poly_from_cpu(&cpu_poly, &gpu_params);
         let bytes = poly.to_compact_bytes();
+        assert_eq!(&bytes[0..4], &GPU_COMPACT_MAGIC);
+        assert_eq!(bytes[4], GPU_COMPACT_VERSION);
+        assert_eq!(bytes[5], GPU_COMPACT_FORMAT_COEFF);
+
+        let (max_coeff_bits, bytes_per_coeff, format) = parse_gpu_compact_header(&bytes);
+        assert_eq!(format, GPU_POLY_FORMAT_COEFF);
+        assert!(max_coeff_bits <= 1, "BitDist should need at most 1 coefficient bit");
+        assert_eq!(bytes_per_coeff, max_coeff_bits.div_ceil(8));
 
         let ring_dimension = gpu_params.ring_dimension() as usize;
-
-        let max_byte_size = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-        assert_eq!(max_byte_size, 1, "Max byte size size should be 1 for BitDist");
-
-        let bit_vector_byte_size = ring_dimension.div_ceil(8);
-
-        let expected_total_size = 4 + bit_vector_byte_size + (ring_dimension * max_byte_size);
-        assert_eq!(bytes.len(), expected_total_size, "Incorrect total byte size");
-
-        let bit_vector = &bytes[4..4 + bit_vector_byte_size];
-        assert_eq!(bit_vector.len(), bit_vector_byte_size, "Bit vector size is incorrect");
-
-        let coeffs_section = &bytes[4 + bit_vector_byte_size..];
+        let expected_payload_len = packed_coeff_bytes_len(ring_dimension, max_coeff_bits);
         assert_eq!(
-            coeffs_section.len(),
-            ring_dimension * max_byte_size,
-            "Coefficient section size is incorrect"
+            bytes.len(),
+            GPU_COMPACT_HEADER_LEN + expected_payload_len,
+            "compact bytes total length mismatch"
         );
-
-        for (i, &coeff_byte) in coeffs_section.iter().enumerate() {
-            assert!(
-                coeff_byte == 0 || coeff_byte == 1,
-                "Coefficient at position {} should be 0 or 1, got {}",
-                i,
-                coeff_byte
-            );
-        }
     }
 
     #[test]
@@ -1517,30 +1649,24 @@ mod tests {
         let cpu_poly = sampler.sample_poly(&params, &DistType::FinRingDist);
         let poly = gpu_poly_from_cpu(&cpu_poly, &gpu_params);
         let bytes = poly.to_compact_bytes();
-        let modulus = gpu_params.modulus();
-        let modulus_byte_size = modulus.to_bytes_le().len();
+        assert_eq!(&bytes[0..4], &GPU_COMPACT_MAGIC);
+        assert_eq!(bytes[4], GPU_COMPACT_VERSION);
+        assert_eq!(bytes[5], GPU_COMPACT_FORMAT_COEFF);
+
+        let (max_coeff_bits, bytes_per_coeff, format) = parse_gpu_compact_header(&bytes);
+        assert_eq!(format, GPU_POLY_FORMAT_COEFF);
+        assert!(
+            max_coeff_bits <= gpu_params.modulus_bits(),
+            "coefficient bit width should not exceed modulus bits"
+        );
+        assert_eq!(bytes_per_coeff, max_coeff_bits.div_ceil(8));
 
         let ring_dimension = gpu_params.ring_dimension() as usize;
-
-        let max_byte_size = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-        assert!(
-            max_byte_size <= modulus_byte_size,
-            "Max byte size should be less than or equal to modulus byte size"
-        );
-
-        let bit_vector_byte_size = ring_dimension.div_ceil(8);
-
-        let expected_total_size = 4 + bit_vector_byte_size + (ring_dimension * max_byte_size);
-        assert_eq!(bytes.len(), expected_total_size, "Incorrect total byte size");
-
-        let bit_vector = &bytes[4..4 + bit_vector_byte_size];
-        assert_eq!(bit_vector.len(), bit_vector_byte_size, "Bit vector size is incorrect");
-
-        let coeffs_section = &bytes[4 + bit_vector_byte_size..];
+        let expected_payload_len = packed_coeff_bytes_len(ring_dimension, max_coeff_bits);
         assert_eq!(
-            coeffs_section.len(),
-            ring_dimension * max_byte_size,
-            "Coefficient section size is incorrect"
+            bytes.len(),
+            GPU_COMPACT_HEADER_LEN + expected_payload_len,
+            "compact bytes total length mismatch"
         );
     }
 
@@ -1578,108 +1704,5 @@ mod tests {
             original_poly, reconstructed_poly,
             "Reconstructed polynomial does not match original (GaussDist)"
         );
-    }
-}
-
-fn reconstruct_coeffs_chunked(
-    bytes: &[u8],
-    ring_dimension: usize,
-    max_byte_size: usize,
-    bit_vector: &[u8],
-    coeffs_base_offset: usize,
-    modulus: &Arc<BigUint>,
-    chunk_size: usize,
-) -> Vec<FinRingElem> {
-    (0..ring_dimension)
-        .into_par_iter()
-        .chunks(chunk_size)
-        .flat_map(|chunk| {
-            chunk
-                .into_iter()
-                .map(|i| {
-                    reconstruct_single_coeff(
-                        i,
-                        bytes,
-                        max_byte_size,
-                        bit_vector,
-                        coeffs_base_offset,
-                        modulus,
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
-#[inline(always)]
-fn reconstruct_single_coeff(
-    i: usize,
-    bytes: &[u8],
-    max_byte_size: usize,
-    bit_vector: &[u8],
-    coeffs_base_offset: usize,
-    modulus: &Arc<BigUint>,
-) -> FinRingElem {
-    let start = coeffs_base_offset + (i * max_byte_size);
-
-    let mut value_len = max_byte_size;
-    let value_bytes = &bytes[start..start + max_byte_size];
-    while value_len > 0 && value_bytes[value_len - 1] == 0 {
-        value_len -= 1;
-    }
-
-    let value = if value_len == 0 {
-        BigUint::ZERO
-    } else {
-        BigUint::from_bytes_le(&value_bytes[..value_len])
-    };
-
-    let byte_idx = i / 8;
-    let bit_idx = i % 8;
-    let is_negative = (bit_vector[byte_idx] & (1 << bit_idx)) != 0;
-
-    let final_value =
-        if is_negative && !value.is_zero() { modulus.as_ref() - &value } else { value };
-
-    FinRingElem::new(final_value, modulus.clone())
-}
-
-fn process_coeffs_chunked(coeffs: &[FinRingElem], chunk_size: usize) -> Vec<(bool, Vec<u8>)> {
-    if coeffs.is_empty() {
-        return Vec::new();
-    }
-
-    let modulus_arc = coeffs[0].modulus().clone();
-    let modulus_ref = modulus_arc.as_ref();
-    let q_half = modulus_ref >> 1;
-
-    coeffs
-        .par_chunks(chunk_size)
-        .flat_map(|chunk| {
-            chunk
-                .iter()
-                .map(|coeff| process_single_coeff_with(coeff, modulus_ref, &q_half))
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
-#[inline(always)]
-fn process_single_coeff_with(
-    coeff: &FinRingElem,
-    modulus: &BigUint,
-    q_half: &BigUint,
-) -> (bool, Vec<u8>) {
-    let coeff_val = coeff.value();
-
-    if coeff_val > q_half {
-        let centered_value = modulus - coeff_val;
-        let value_bytes =
-            if centered_value.is_zero() { Vec::new() } else { centered_value.to_bytes_le() };
-        (true, value_bytes)
-    } else if coeff_val.is_zero() {
-        (false, Vec::new())
-    } else {
-        (false, coeff_val.to_bytes_le())
     }
 }

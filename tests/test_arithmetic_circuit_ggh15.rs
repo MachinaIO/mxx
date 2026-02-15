@@ -13,8 +13,8 @@ use mxx::{
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
     sampler::{
-        DistType, PolyTrapdoorSampler, PolyUniformSampler, hash::DCRTPolyHashSampler,
-        trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
+        DistType, PolyUniformSampler, hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
+        uniform::DCRTPolyUniformSampler,
     },
     storage::write::{init_storage_system, wait_for_all_writes},
     utils::gen_biguint_for_modulus,
@@ -88,31 +88,21 @@ async fn test_arithmetic_circuit_operations_ggh15() {
     let d = 1usize;
     let trapdoor_sigma = 4.578;
     let error_sigma = 0.0;
-    let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, trapdoor_sigma);
-    let (b0_trapdoor, b0_matrix) = trapdoor_sampler.trapdoor(&params, d);
-    let b0_trapdoor = Arc::new(b0_trapdoor);
-    let b0_matrix = Arc::new(b0_matrix);
-
     init_storage_system(tmp_dir.path().to_path_buf());
     let reveal_plaintexts = vec![true; circuit.num_input()];
     let pk_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(seed, d);
     let pubkeys = pk_sampler.sample(&params, b"BGG_PUBKEY", &reveal_plaintexts);
 
     let insert_1_to_s = false;
-    let pk_evaluator = GGH15BGGPubKeyPltEvaluator::<
-        DCRTPolyMatrix,
-        DCRTPolyUniformSampler,
-        DCRTPolyHashSampler<Keccak256>,
-        DCRTPolyTrapdoorSampler,
-    >::new(
-        seed,
-        trapdoor_sigma,
-        error_sigma,
-        b0_matrix.clone(),
-        b0_trapdoor.clone(),
-        tmp_dir.path().to_path_buf(),
-        insert_1_to_s,
-    );
+    let pk_evaluator =
+        GGH15BGGPubKeyPltEvaluator::<
+            DCRTPolyMatrix,
+            DCRTPolyUniformSampler,
+            DCRTPolyHashSampler<Keccak256>,
+            DCRTPolyTrapdoorSampler,
+        >::new(
+            seed, d, trapdoor_sigma, error_sigma, tmp_dir.path().to_path_buf(), insert_1_to_s
+        );
     info!("start pubkey evaluation");
     let start = std::time::Instant::now();
     let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(&pk_evaluator));
@@ -122,12 +112,16 @@ async fn test_arithmetic_circuit_operations_ggh15() {
     pk_evaluator.sample_aux_matrices(&params);
     wait_for_all_writes(tmp_dir.path().to_path_buf()).await.unwrap();
     info!("finish writing");
+    let b0_matrix = pk_evaluator
+        .load_b0_matrix_checkpoint(&params)
+        .expect("b0 matrix checkpoint should exist after sample_aux_matrices");
 
     // 3) BGG+ encoding evaluation.
     let uniform_sampler = DCRTPolyUniformSampler::new();
     let secrets = uniform_sampler.sample_uniform(&params, 1, d, DistType::BitDist).get_row(0);
     let s = DCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
-    let c_b0 = s.clone() * b0_matrix.as_ref();
+    let c_b0 = s.clone() * &b0_matrix;
+    let checkpoint_prefix = pk_evaluator.checkpoint_prefix(&params);
 
     let bgg_encoding_sampler =
         BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
@@ -136,7 +130,7 @@ async fn test_arithmetic_circuit_operations_ggh15() {
     let enc_evaluator = GGH15BGGEncodingPltEvaluator::<
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
-    >::new(seed, tmp_dir.path().to_path_buf(), c_b0);
+    >::new(seed, tmp_dir.path().to_path_buf(), checkpoint_prefix, c_b0);
     info!("start encoding evaluation");
     let start = std::time::Instant::now();
     let encoding_out = circuit.eval(&params, &encodings[0], &encodings[1..], Some(&enc_evaluator));

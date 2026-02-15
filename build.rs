@@ -17,11 +17,18 @@ fn main() {
 
     if env::var("CARGO_FEATURE_GPU").is_ok() {
         println!("cargo::rerun-if-changed=gpu-setup.sh");
-        println!("cargo::rerun-if-changed=cuda/GpuPoly.cu");
-        println!("cargo::rerun-if-changed=cuda/GpuPoly.h");
-        println!("cargo::rerun-if-changed=cuda/GpuMatrix.cu");
-        println!("cargo::rerun-if-changed=cuda/GpuMatrix.h");
-        println!("cargo::rerun-if-changed=cuda/GpuPolyInternal.h");
+        println!("cargo::rerun-if-changed=cuda/src/poly/Poly.cu");
+        println!("cargo::rerun-if-changed=cuda/src/poly/PolyUtils.cu");
+        println!("cargo::rerun-if-changed=cuda/src/poly/PolySerdeRns.cu");
+        println!("cargo::rerun-if-changed=cuda/src/poly/PolyOps.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/Matrix.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixUtils.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixOps.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSerdeRns.cu");
+        println!("cargo::rerun-if-changed=cuda/include/Poly.h");
+        println!("cargo::rerun-if-changed=cuda/include/Matrix.h");
+        println!("cargo::rerun-if-changed=cuda/include/PolyInterface.h");
+        println!("cargo::rerun-if-changed=cuda/include/ChaCha.cuh");
 
         let manifest_dir =
             PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
@@ -96,8 +103,9 @@ fn main() {
         let mut build = cc::Build::new();
         build
             .cuda(true)
-            .file("cuda/GpuPoly.cu")
-            .file("cuda/GpuMatrix.cu")
+            .file("cuda/src/poly/Poly.cu")
+            .file("cuda/src/matrix/Matrix.cu")
+            .include("cuda/include")
             .include(&fides_include)
             .include(&openfhe_include)
             .include(&openfhe_core_include)

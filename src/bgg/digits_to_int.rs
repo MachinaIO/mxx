@@ -98,7 +98,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bggpublickey_digits_to_int() {
+    fn test_bgg_publickey_digits_to_int() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
 
@@ -139,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bggencoding_digits_to_int_static() {
+    fn test_bgg_encoding_digits_to_int_static() {
         // Create parameters for testing
         let params = DCRTPolyParams::default();
 

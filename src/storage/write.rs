@@ -3,7 +3,7 @@ use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterato
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions, write as write_file},
+    fs::{File, OpenOptions, read_dir, write as write_file},
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, mpsc},
@@ -203,8 +203,9 @@ impl WriterState {
     fn reset(&mut self, dir_path: PathBuf, bytes_limit: Option<usize>) {
         self.dir_path = dir_path;
         self.bytes_limit = bytes_limit;
-        self.current_file_index = 0;
-        self.current_file_size = 0;
+        let (file_index, file_size) = Self::recover_tail_position(&self.dir_path);
+        self.current_file_index = file_index;
+        self.current_file_size = file_size;
         self.file = None;
         self.last_error = None;
     }
@@ -219,7 +220,7 @@ impl WriterState {
         if self.file.is_none() {
             let filename = format!("lookup_tables_batch_{}.bin", self.current_file_index);
             let path = self.dir_path.join(&filename);
-            let file = OpenOptions::new().create(true).write(true).truncate(true).open(&path)?;
+            let file = OpenOptions::new().create(true).append(true).open(&path)?;
             self.file = Some(file);
         }
         Ok(())
@@ -227,6 +228,34 @@ impl WriterState {
 
     fn record_error(&mut self, err: io::Error) {
         self.last_error = Some(err);
+    }
+
+    fn parse_batch_file_index(name: &str) -> Option<usize> {
+        let rest = name.strip_prefix("lookup_tables_batch_")?;
+        let num = rest.strip_suffix(".bin")?;
+        num.parse::<usize>().ok()
+    }
+
+    fn recover_tail_position(dir_path: &Path) -> (usize, usize) {
+        let mut best: Option<(usize, usize)> = None;
+        let Ok(entries) = read_dir(dir_path) else {
+            return (0, 0);
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(index) = Self::parse_batch_file_index(name) else {
+                continue;
+            };
+            let size = entry.metadata().map(|m| m.len() as usize).unwrap_or(0);
+            match best {
+                Some((best_index, _)) if index <= best_index => {}
+                _ => best = Some((index, size)),
+            }
+        }
+        best.unwrap_or((0, 0))
     }
 }
 

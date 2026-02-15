@@ -13,11 +13,18 @@ use crate::{
 use openfhe::ffi::GenerateIntegerKarney;
 use rand::{Rng, distr::Uniform, rng};
 use rayon::prelude::*;
-use std::ops::Range;
+use std::{
+    ops::Range,
+    sync::{Mutex, OnceLock},
+};
+
+static KARNEY_SAMPLER_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(crate) fn gen_int_karney(mean: f64, stddev: f64) -> i64 {
-    let out = GenerateIntegerKarney(mean, stddev);
-    out
+    // OpenFHE's Karney sampler can touch shared global state in some builds.
+    // Serialize calls to avoid rare races while preserving the exact sampler primitive.
+    let _guard = KARNEY_SAMPLER_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    GenerateIntegerKarney(mean, stddev)
 }
 
 fn find_in_vec(vec: &[f64], search: f64) -> u32 {

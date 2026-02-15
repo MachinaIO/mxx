@@ -2,7 +2,7 @@
 
 #include <stddef.h>
 
-#include "GpuPoly.h"
+#include "Poly.h"
 
 #ifdef __cplusplus
 extern "C" {

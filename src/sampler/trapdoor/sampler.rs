@@ -14,11 +14,16 @@ use crate::{
 };
 use openfhe::ffi::DCRTGaussSampGqArbBase;
 use rayon::iter::ParallelIterator;
-use std::{ops::Range, time::Instant};
+use std::{
+    ops::Range,
+    sync::{Mutex, OnceLock},
+    time::Instant,
+};
 use tracing::debug;
 
 const SIGMA: f64 = 4.578;
 const SPECTRAL_CONSTANT: f64 = 1.8;
+static GAUSS_SAMP_GQ_ARB_BASE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct DCRTPolyTrapdoorSampler {
@@ -52,7 +57,9 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         debug!("{}", "gadget matrix generated");
         let a0 = a_bar.concat_columns(&[&DCRTPolyMatrix::identity(params, size, None)]);
         debug!("{}", "a0 generated");
-        let a1 = g - (a_bar * &trapdoor.r + &trapdoor.e);
+        let trapdoor_r = trapdoor.r_cpu();
+        let trapdoor_e = trapdoor.e_cpu();
+        let a1 = g - (a_bar * &trapdoor_r + &trapdoor_e);
         debug!("{}", "a1 generated");
         let a = a0.concat_columns(&[&a1]);
         debug!("{}", "public matrix generated");
@@ -165,9 +172,11 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         z_hat_mat.replace_entries_with_expand(0..d, 0..target_cols, k, 1, f);
         debug!("{}", "z_hat_mat generated");
         drop(perturbed_syndrome);
-        let r_z_hat = &trapdoor.r * &z_hat_mat;
+        let trapdoor_r = trapdoor.r_cpu();
+        let r_z_hat = &trapdoor_r * &z_hat_mat;
         debug!("{}", "r_z_hat generated");
-        let e_z_hat = &trapdoor.e * &z_hat_mat;
+        let trapdoor_e = trapdoor.e_cpu();
+        let e_z_hat = &trapdoor_e * &z_hat_mat;
         debug!("{}", "e_z_hat generated");
         let z_hat_former = (p_hat.slice_rows(0, d) + r_z_hat)
             .concat_rows(&[&(p_hat.slice_rows(d, 2 * d) + e_z_hat)]);
@@ -237,17 +246,22 @@ pub(crate) fn gauss_samp_gq_arb_base(
     let depth = params.crt_depth();
     let k_res_bits = params.crt_bits();
     let k_res_digits = params.modulus_digits() / depth;
-    let result = DCRTGaussSampGqArbBase(
-        syndrome.get_poly(),
-        c,
-        n,
-        depth,
-        k_res_bits,
-        k_res_digits,
-        base as i64,
-        sigma,
-        tower_idx,
-    );
+    // OpenFHE's GaussSampGqArbBase can race across threads depending on backend state.
+    // Keep this FFI call serialized for stability.
+    let result = {
+        let _guard = GAUSS_SAMP_GQ_ARB_BASE_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        DCRTGaussSampGqArbBase(
+            syndrome.get_poly(),
+            c,
+            n,
+            depth,
+            k_res_bits,
+            k_res_digits,
+            base as i64,
+            sigma,
+            tower_idx,
+        )
+    };
     debug_assert_eq!(result.len(), n as usize * k_res_digits);
     // let mut matrix = I64Matrix::new_empty(&I64MatrixParams, k_res, n as usize);
     parallel_iter!(0..k_res_digits)
@@ -328,7 +342,9 @@ mod test {
         let muled = {
             let k = params.modulus_digits();
             let identity = DCRTPolyMatrix::identity(&params, size * k, None);
-            let trapdoor_matrix = trapdoor.r.concat_rows(&[&trapdoor.e, &identity]);
+            let trapdoor_r = trapdoor.r_cpu();
+            let trapdoor_e = trapdoor.e_cpu();
+            let trapdoor_matrix = trapdoor_r.concat_rows(&[&trapdoor_e, &identity]);
             public_matrix * trapdoor_matrix
         };
         let gadget_matrix = DCRTPolyMatrix::gadget_matrix(&params, size);

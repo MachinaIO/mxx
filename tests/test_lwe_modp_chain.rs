@@ -27,7 +27,7 @@ use std::{fs, path::Path, sync::Arc};
 use tracing::info;
 
 const CRT_BITS: usize = 51;
-const RING_DIM: u32 = 1 << 4;
+const RING_DIM: u32 = 1 << 14;
 const ERROR_SIGMA: f64 = 4.0;
 const BASE_BITS: u32 = 17;
 const MAX_CRT_DEPTH: usize = 12;

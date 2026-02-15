@@ -814,23 +814,25 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
     fn mul_decompose(&self, other: &Self) -> Self {
         let log_base_q = self.params.modulus_digits();
         debug_assert_eq!(self.ncol, other.nrow * log_base_q);
+        debug_assert_eq!(self.params, other.params, "mul_decompose requires same params");
         let ncol = other.ncol;
-        debug_assert!(ncol > 0, "mul_decompose expects at least one column");
-        let outputs = parallel_iter!(0..ncol)
-            .map(|j| self * &other.get_column_matrix_decompose(j))
-            .collect::<Vec<_>>();
-        let mut refs = Vec::with_capacity(outputs.len().saturating_sub(1));
-        for i in 1..outputs.len() {
-            refs.push(&outputs[i]);
+        if self.nrow == 0 || ncol == 0 {
+            return Self::new_empty(&self.params, self.nrow, ncol);
         }
-        outputs[0].concat_columns(&refs)
+
+        // Keep peak memory low by processing one decomposed column at a time.
+        let mut out = Self::new_empty(&self.params, self.nrow, ncol);
+        for j in 0..ncol {
+            let col_decomposed = other.get_column_matrix_decompose(j);
+            let product = self * &col_decomposed;
+            out.copy_block_from(&product, 0, j, 0, 0, self.nrow, 1);
+        }
+        out
     }
 
     fn get_column_matrix_decompose(&self, j: usize) -> Self {
-        let col = self.get_column(j);
-        let column_matrix =
-            Self::from_poly_vec(&self.params, col.into_iter().map(|poly| vec![poly]).collect());
-        column_matrix.decompose()
+        debug_assert!(j < self.ncol, "column index out of bounds in get_column_matrix_decompose");
+        self.slice(0, self.nrow, j, j + 1).decompose()
     }
 
     fn vectorize_columns(&self) -> Self {

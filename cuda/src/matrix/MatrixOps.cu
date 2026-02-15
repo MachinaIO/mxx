@@ -1486,7 +1486,7 @@ namespace
         return count;
     }
 
-    void free_matrix_shared_limb_buffers(GpuMatrix *mat)
+    void free_matrix_shared_buffers(GpuMatrix *mat)
     {
         if (!mat)
         {
@@ -1502,6 +1502,35 @@ namespace
             cudaFree(entry.ptr);
         }
         mat->shared_limb_buffers.clear();
+        for (const auto &entry : mat->shared_aux_buffers)
+        {
+            if (!entry.ptr)
+            {
+                continue;
+            }
+            cudaSetDevice(entry.device);
+            cudaFree(entry.ptr);
+        }
+        mat->shared_aux_buffers.clear();
+    }
+
+    void detach_matrix_shared_aux_buffers(GpuMatrix *mat)
+    {
+        if (!mat || mat->shared_aux_buffers.empty())
+        {
+            return;
+        }
+        for (auto *poly : mat->polys)
+        {
+            if (!poly || !poly->poly)
+            {
+                continue;
+            }
+            for (auto &partition : poly->poly->GPU)
+            {
+                partition.bufferAUXptrs = nullptr;
+            }
+        }
     }
 
     void destroy_matrix_contents(GpuMatrix *mat)
@@ -1510,12 +1539,13 @@ namespace
         {
             return;
         }
+        detach_matrix_shared_aux_buffers(mat);
         for (auto *poly : mat->polys)
         {
             gpu_poly_destroy(poly);
         }
         mat->polys.clear();
-        free_matrix_shared_limb_buffers(mat);
+        free_matrix_shared_buffers(mat);
     }
 }
 
@@ -1548,7 +1578,7 @@ extern "C" int gpu_matrix_create(
         return set_error("matrix size overflow in gpu_matrix_create");
     }
 
-    auto *mat = new GpuMatrix{ctx, rows, cols, level, fmt, {}, {}};
+    auto *mat = new GpuMatrix{ctx, rows, cols, level, fmt, {}, {}, {}};
     mat->polys.reserve(count);
     const size_t partition_count = ctx->ctx->meta.size();
     if (partition_count != ctx->ctx->GPUid.size())
@@ -1562,6 +1592,9 @@ extern "C" int gpu_matrix_create(
     std::vector<size_t> words_per_poly(partition_count, 0);
     std::vector<size_t> words_total(partition_count, 0);
     std::vector<uint64_t *> device_bases(partition_count, nullptr);
+    std::vector<void **> aux_device_bases(partition_count, nullptr);
+    std::vector<size_t> aux_slots_per_poly(partition_count, 0);
+    std::vector<size_t> aux_slots_total(partition_count, 0);
     std::vector<FIDESlib::Stream *> alloc_streams(partition_count, nullptr);
     const size_t n = static_cast<size_t>(ctx->N);
 
@@ -1623,6 +1656,28 @@ extern "C" int gpu_matrix_create(
             return set_error(err);
         }
 
+        size_t aux_slots = 0;
+        size_t aux_total_slots = 0;
+        size_t aux_total_bytes = 0;
+        const size_t decomp_count = ctx->ctx->decompMeta[partition_idx].size();
+        if (!checked_mul_size(static_cast<size_t>(FIDESlib::MAXP), static_cast<size_t>(4 + 4 * decomp_count), &aux_slots) ||
+            !checked_mul_size(aux_slots, count, &aux_total_slots) ||
+            !checked_mul_size(aux_total_slots, sizeof(void *), &aux_total_bytes))
+        {
+            destroy_matrix_contents(mat);
+            delete mat;
+            return set_error("matrix aux allocation overflow in gpu_matrix_create");
+        }
+
+        void **aux_base = nullptr;
+        err = cudaMallocAsync(&aux_base, aux_total_bytes, alloc_stream->ptr);
+        if (err != cudaSuccess)
+        {
+            destroy_matrix_contents(mat);
+            delete mat;
+            return set_error(err);
+        }
+
         for (size_t limb_idx = 0; limb_idx < meta.size(); ++limb_idx)
         {
             if (meta[limb_idx].id > level)
@@ -1637,15 +1692,22 @@ extern "C" int gpu_matrix_create(
         }
 
         device_bases[partition_idx] = base;
+        aux_device_bases[partition_idx] = aux_base;
+        aux_slots_per_poly[partition_idx] = aux_slots;
+        aux_slots_total[partition_idx] = aux_total_slots;
         alloc_streams[partition_idx] = alloc_stream;
         words_per_poly[partition_idx] = poly_words;
         words_total[partition_idx] = total_words;
         mat->shared_limb_buffers.push_back(GpuMatrix::SharedLimbBuffer{
             ctx->ctx->GPUid[partition_idx],
             base});
+        mat->shared_aux_buffers.push_back(GpuMatrix::SharedAuxBuffer{
+            ctx->ctx->GPUid[partition_idx],
+            aux_base});
     }
 
     std::vector<size_t> words_used(partition_count, 0);
+    std::vector<size_t> aux_slots_used(partition_count, 0);
     for (size_t poly_idx = 0; poly_idx < count; ++poly_idx)
     {
         auto *poly_impl = new CKKS::RNSPoly(*ctx->ctx, -1, false);
@@ -1654,11 +1716,6 @@ extern "C" int gpu_matrix_create(
 
         for (size_t partition_idx = 0; partition_idx < partition_count; ++partition_idx)
         {
-            const size_t limbs = limb_counts[partition_idx];
-            if (limbs == 0)
-            {
-                continue;
-            }
             if (partition_idx >= poly_impl->GPU.size())
             {
                 gpu_poly_destroy(poly);
@@ -1674,6 +1731,84 @@ extern "C" int gpu_matrix_create(
                 destroy_matrix_contents(mat);
                 delete mat;
                 return set_error("unexpected partition device in gpu_matrix_create");
+            }
+
+            cudaError_t err = cudaSetDevice(partition.device);
+            if (err != cudaSuccess)
+            {
+                gpu_poly_destroy(poly);
+                destroy_matrix_contents(mat);
+                delete mat;
+                return set_error(err);
+            }
+            if (alloc_streams[partition_idx])
+            {
+                partition.s.wait(*alloc_streams[partition_idx]);
+            }
+
+            void **aux_base = aux_device_bases[partition_idx];
+            if (!aux_base)
+            {
+                gpu_poly_destroy(poly);
+                destroy_matrix_contents(mat);
+                delete mat;
+                return set_error("missing shared aux buffer in gpu_matrix_create");
+            }
+            const size_t aux_poly_slots = aux_slots_per_poly[partition_idx];
+            const size_t aux_offset_slots = aux_slots_used[partition_idx];
+            if (aux_offset_slots > aux_slots_total[partition_idx] ||
+                aux_poly_slots > aux_slots_total[partition_idx] - aux_offset_slots)
+            {
+                gpu_poly_destroy(poly);
+                destroy_matrix_contents(mat);
+                delete mat;
+                return set_error("shared aux buffer overflow in gpu_matrix_create");
+            }
+            if (partition.bufferAUXptrs)
+            {
+                err = cudaFree(partition.bufferAUXptrs);
+                if (err != cudaSuccess)
+                {
+                    gpu_poly_destroy(poly);
+                    destroy_matrix_contents(mat);
+                    delete mat;
+                    return set_error(err);
+                }
+            }
+            void **poly_aux_base = aux_base + aux_offset_slots;
+            partition.bufferAUXptrs = poly_aux_base;
+            const size_t aux_stride = static_cast<size_t>(FIDESlib::MAXP);
+            const size_t decomp_ptr_count = partition.DECOMPlimbptr.size();
+            if (partition.DECOMPauxptr.size() != decomp_ptr_count ||
+                partition.DIGITlimbptr.size() != decomp_ptr_count ||
+                partition.DIGITauxptr.size() != decomp_ptr_count)
+            {
+                gpu_poly_destroy(poly);
+                destroy_matrix_contents(mat);
+                delete mat;
+                return set_error("unexpected aux pointer layout in gpu_matrix_create");
+            }
+            partition.limbptr.data = poly_aux_base;
+            partition.auxptr.data = poly_aux_base + aux_stride;
+            partition.SPECIALlimbptr.data = poly_aux_base + 2 * aux_stride;
+            partition.SPECIALauxptr.data = poly_aux_base + 3 * aux_stride;
+            for (size_t decomp_idx = 0; decomp_idx < decomp_ptr_count; ++decomp_idx)
+            {
+                partition.DECOMPlimbptr[decomp_idx].data =
+                    poly_aux_base + (4 + decomp_idx) * aux_stride;
+                partition.DECOMPauxptr[decomp_idx].data =
+                    poly_aux_base + (4 + decomp_ptr_count + decomp_idx) * aux_stride;
+                partition.DIGITlimbptr[decomp_idx].data =
+                    poly_aux_base + (4 + 2 * decomp_ptr_count + decomp_idx) * aux_stride;
+                partition.DIGITauxptr[decomp_idx].data =
+                    poly_aux_base + (4 + 3 * decomp_ptr_count + decomp_idx) * aux_stride;
+            }
+            aux_slots_used[partition_idx] = aux_offset_slots + aux_poly_slots;
+
+            const size_t limbs = limb_counts[partition_idx];
+            if (limbs == 0)
+            {
+                continue;
             }
 
             uint64_t *base = device_bases[partition_idx];
@@ -1695,19 +1830,6 @@ extern "C" int gpu_matrix_create(
                 destroy_matrix_contents(mat);
                 delete mat;
                 return set_error("shared limb buffer overflow in gpu_matrix_create");
-            }
-
-            cudaError_t err = cudaSetDevice(partition.device);
-            if (err != cudaSuccess)
-            {
-                gpu_poly_destroy(poly);
-                destroy_matrix_contents(mat);
-                delete mat;
-                return set_error(err);
-            }
-            if (alloc_streams[partition_idx])
-            {
-                partition.s.wait(*alloc_streams[partition_idx]);
             }
 
             partition.generate(

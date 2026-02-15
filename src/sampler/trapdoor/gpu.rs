@@ -189,8 +189,6 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             "gpu preimage: computed perturbed_syndrome"
         );
 
-        // OpenFHE-equivalent GaussSampGqArbBase path on GPU:
-        // this keeps the perturbation + gadget preimage step randomized.
         let mut rng = rng();
         let z_seed: u64 = rng.random();
         let gauss_start = Instant::now();
@@ -278,6 +276,14 @@ fn sample_pert_square_mat_gpu_native(
     let num_blocks = total_ncol.div_ceil(d);
     let padded_ncol = num_blocks * d;
     let padding_ncol = padded_ncol - total_ncol;
+    tracing::debug!(
+        d = d,
+        dk = dk,
+        total_ncol = total_ncol,
+        padded_ncol = padded_ncol,
+        padding_ncol = padding_ncol,
+        "gpu preimage sample_pert: start"
+    );
 
     // p2 is sampled directly on GPU as in the Karney branch of OpenFHE.
     let p2 = uniform_sampler.sample_uniform(
@@ -286,7 +292,9 @@ fn sample_pert_square_mat_gpu_native(
         padded_ncol,
         DistType::GaussDist { sigma: sigma_large },
     );
+    tracing::debug!("gpu preimage sample_pert: sampled p2");
     let tp2 = &trapdoor.re * &p2;
+    tracing::debug!("gpu preimage sample_pert: computed tp2");
 
     // Keep perturbation generation on device: this sampler uses the full
     // 2d x 2d covariance induced by (A, B, D) and Tp2.
@@ -302,11 +310,14 @@ fn sample_pert_square_mat_gpu_native(
         dgg_stddev,
         p1_seed,
     );
+    tracing::debug!("gpu preimage sample_pert: sampled p1");
     drop(tp2);
 
     let mut p_hat = p1.concat_rows_owned(vec![p2]);
+    tracing::debug!("gpu preimage sample_pert: concatenated p1/p2");
     if padding_ncol > 0 {
         p_hat = p_hat.slice_columns(0, total_ncol);
+        tracing::debug!("gpu preimage sample_pert: sliced padding columns");
     }
     p_hat
 }

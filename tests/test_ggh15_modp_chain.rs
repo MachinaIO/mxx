@@ -27,7 +27,7 @@ use std::{fs, path::Path, sync::Arc};
 use tracing::info;
 
 const CRT_BITS: usize = 51;
-const RING_DIM: u32 = 1 << 4;
+const RING_DIM: u32 = 1 << 14;
 const ERROR_SIGMA: f64 = 4.0;
 const BASE_BITS: u32 = 17;
 const MAX_CRT_DEPTH: usize = 12;
@@ -237,11 +237,12 @@ async fn test_ggh15_modp_chain_rounding() {
         .load_b0_matrix_checkpoint(&params)
         .expect("b0 matrix checkpoint should exist after sample_aux_matrices");
     let c_b0 = s_vec.clone() * &b0_matrix;
+    let checkpoint_prefix = plt_pubkey_evaluator.checkpoint_prefix(&params);
     info!("plt encoding evaluator setup start");
     let plt_encoding_evaluator = GGH15BGGEncodingPltEvaluator::<
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
-    >::new(key, dir.to_path_buf(), c_b0);
+    >::new(key, dir.to_path_buf(), checkpoint_prefix, c_b0);
     info!("plt encoding evaluator setup done");
 
     info!("circuit eval encoding start");

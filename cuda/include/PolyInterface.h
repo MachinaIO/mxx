@@ -64,7 +64,13 @@ struct GpuMatrix
         int device;
         uint64_t *ptr;
     };
+    struct SharedAuxBuffer
+    {
+        int device;
+        void **ptr;
+    };
     std::vector<SharedLimbBuffer> shared_limb_buffers;
+    std::vector<SharedAuxBuffer> shared_aux_buffers;
 };
 
 extern "C" int gpu_set_last_error(const char *msg);

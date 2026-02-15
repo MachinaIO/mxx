@@ -121,6 +121,7 @@ async fn test_arithmetic_circuit_operations_ggh15() {
     let secrets = uniform_sampler.sample_uniform(&params, 1, d, DistType::BitDist).get_row(0);
     let s = DCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
     let c_b0 = s.clone() * &b0_matrix;
+    let checkpoint_prefix = pk_evaluator.checkpoint_prefix(&params);
 
     let bgg_encoding_sampler =
         BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
@@ -129,7 +130,7 @@ async fn test_arithmetic_circuit_operations_ggh15() {
     let enc_evaluator = GGH15BGGEncodingPltEvaluator::<
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
-    >::new(seed, tmp_dir.path().to_path_buf(), c_b0);
+    >::new(seed, tmp_dir.path().to_path_buf(), checkpoint_prefix, c_b0);
     info!("start encoding evaluation");
     let start = std::time::Instant::now();
     let encoding_out = circuit.eval(&params, &encodings[0], &encodings[1..], Some(&enc_evaluator));

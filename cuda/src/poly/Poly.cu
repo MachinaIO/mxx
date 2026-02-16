@@ -1,4 +1,4 @@
-#include "PolyInterface.h"
+#include "Poly.h"
 
 #include <algorithm>
 #include <cstring>
@@ -11,6 +11,6 @@
 #include <vector>
 #include <cuda_runtime.h>
 
-#include "PolyUtils.cu"
+#include "../Runtime.cu"
 #include "PolySerdeRns.cu"
 #include "PolyOps.cu"

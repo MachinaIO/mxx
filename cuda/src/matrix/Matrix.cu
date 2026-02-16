@@ -1,21 +1,14 @@
-#include "matrix/Matrix.h"
+#include "Matrix.h"
 #include "ChaCha.cuh"
-#include "matrix/Matrix.cuh"
+#include "PolyInterface.h"
 
 #include <algorithm>
 #include <cmath>
 #include <exception>
 #include <limits>
-#include <string>
 #include <type_traits>
 #include <vector>
 
-#include "../ChaCha.cu"
-#include "../Runtime.cu"
 #include "MatrixUtils.cu"
-#include "MatrixData.cu"
-#include "MatrixArith.cu"
-#include "MatrixDecompose.cu"
-#include "MatrixSampling.cu"
-#include "MatrixTrapdoor.cu"
-#include "MatrixSerde.cu"
+#include "MatrixOps.cu"
+#include "MatrixSerdeRns.cu"

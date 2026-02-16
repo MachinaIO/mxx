@@ -17,56 +17,53 @@ fn main() {
 
     if env::var("CARGO_FEATURE_GPU").is_ok() {
         println!("cargo::rerun-if-changed=gpu-setup.sh");
-        println!("cargo::rerun-if-changed=cuda/src/ChaCha.cu");
+        println!("cargo::rerun-if-changed=cuda/src/poly/Poly.cu");
+        println!("cargo::rerun-if-changed=cuda/src/poly/PolyUtils.cu");
+        println!("cargo::rerun-if-changed=cuda/src/poly/PolySerdeRns.cu");
+        println!("cargo::rerun-if-changed=cuda/src/poly/PolyOps.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/Matrix.cu");
-        println!("cargo::rerun-if-changed=cuda/src/Runtime.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixUtils.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixData.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixArith.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixDecompose.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSampling.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixTrapdoor.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSerde.cu");
-        println!("cargo::rerun-if-changed=cuda/include/Runtime.cuh");
-        println!("cargo::rerun-if-changed=cuda/include/matrix/Matrix.h");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixOps.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSerdeRns.cu");
+        println!("cargo::rerun-if-changed=cuda/include/Poly.h");
+        println!("cargo::rerun-if-changed=cuda/include/Matrix.h");
+        println!("cargo::rerun-if-changed=cuda/include/PolyInterface.h");
         println!("cargo::rerun-if-changed=cuda/include/ChaCha.cuh");
 
         let manifest_dir =
             PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
-        let skip_setup = env::var("FIDESLIB_SKIP_SETUP").ok().as_deref() == Some("1");
-        if skip_setup {
-            println!("cargo::warning=Skipping gpu-setup.sh (FIDESLIB_SKIP_SETUP=1)");
-        } else {
-            let mut setup_cmd = Command::new("bash");
-            setup_cmd
-                .current_dir(&manifest_dir)
-                .env("FIDESLIB_SKIP_INSTALL", "1")
-                .arg("gpu-setup.sh");
-            if let Ok(skip_submodule_update) = env::var("FIDESLIB_SKIP_SUBMODULE_UPDATE") {
-                setup_cmd.env("FIDESLIB_SKIP_SUBMODULE_UPDATE", skip_submodule_update);
-            }
-            if let Ok(cuda_arch) = env::var("CUDA_ARCH") {
-                setup_cmd.env("CUDA_ARCH", cuda_arch);
-            }
-
-            let status = setup_cmd.status().expect("failed to run gpu-setup.sh");
-            if !status.success() {
-                panic!("gpu-setup.sh failed with status {status}");
-            }
+        let status = Command::new("bash")
+            .current_dir(&manifest_dir)
+            .env("FIDESLIB_SKIP_INSTALL", "1")
+            .arg("gpu-setup.sh")
+            .status()
+            .expect("failed to run gpu-setup.sh");
+        if !status.success() {
+            panic!("gpu-setup.sh failed with status {status}");
         }
 
-        let fides_include = manifest_dir.join("third_party/FIDESlib/include");
-        let fides_static_lib = manifest_dir.join("third_party/FIDESlib/build/fideslib.a");
+        let fides_root =
+            env::var("FIDESLIB_ROOT").unwrap_or_else(|_| "third_party/FIDESlib".to_string());
+        let fides_include =
+            env::var("FIDESLIB_INCLUDE_DIR").unwrap_or_else(|_| format!("{fides_root}/include"));
+        let fides_build_lib_dir = format!("{fides_root}/build");
+        let fides_build_lib = PathBuf::from(&fides_build_lib_dir).join("fideslib.a");
+        let fides_lib_dir = env::var("FIDESLIB_LIB_DIR").unwrap_or_else(|_| {
+            if fides_build_lib.exists() {
+                fides_build_lib_dir
+            } else {
+                "/usr/local/lib".to_string()
+            }
+        });
         let openfhe_include = env::var("OPENFHE_INCLUDE_DIR")
             .unwrap_or_else(|_| "/usr/local/include/openfhe".to_string());
         let openfhe_core_include = format!("{openfhe_include}/core");
         let openfhe_pke_include = format!("{openfhe_include}/pke");
         let openfhe_binfhe_include = format!("{openfhe_include}/binfhe");
 
-        if !fides_include.exists() {
+        if !PathBuf::from(&fides_include).exists() {
             println!(
-                "cargo::warning=FIDESlib include dir not found at {}",
-                fides_include.display()
+                "cargo::warning=FIDESlib include dir not found at {fides_include} (set FIDESLIB_INCLUDE_DIR)"
             );
         }
         if !PathBuf::from(&openfhe_include).exists() {
@@ -106,6 +103,7 @@ fn main() {
         let mut build = cc::Build::new();
         build
             .cuda(true)
+            .file("cuda/src/poly/Poly.cu")
             .file("cuda/src/matrix/Matrix.cu")
             .include("cuda/include")
             .include(&fides_include)
@@ -120,13 +118,19 @@ fn main() {
             .flag(&format!("-arch=sm_{cuda_arch}"));
         build.compile("gpupoly");
 
-        if !fides_static_lib.exists() {
-            panic!(
-                "FIDESlib static library not found at {}. run gpu-setup.sh before building with --features gpu",
-                fides_static_lib.display()
+        println!("cargo::rustc-link-search=native={fides_lib_dir}");
+        let fideslib_prefixed = PathBuf::from(&fides_lib_dir).join("libfideslib.a");
+        let fideslib_unprefixed = PathBuf::from(&fides_lib_dir).join("fideslib.a");
+        if fideslib_prefixed.exists() {
+            println!("cargo::rustc-link-lib=static=fideslib");
+        } else if fideslib_unprefixed.exists() {
+            println!("cargo::rustc-link-arg={}", fideslib_unprefixed.display());
+        } else {
+            println!(
+                "cargo::warning=FIDESlib library not found in {fides_lib_dir} (expected libfideslib.a or fideslib.a)"
             );
+            println!("cargo::rustc-link-lib=fideslib");
         }
-        println!("cargo::rustc-link-arg={}", fides_static_lib.display());
 
         println!("cargo::rustc-link-search=native={cuda_lib_dir}");
         println!("cargo::rustc-link-lib=cudart");

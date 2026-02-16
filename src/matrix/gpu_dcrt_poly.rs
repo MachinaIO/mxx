@@ -10,11 +10,11 @@ use crate::{
                 GPU_MATRIX_DIST_UNIFORM, GPU_POLY_FORMAT_EVAL, GpuDCRTPoly, GpuDCRTPolyParams,
                 GpuEventSetOpaque, GpuMatrixOpaque, check_status, gpu_event_set_destroy,
                 gpu_event_set_wait, gpu_matrix_add, gpu_matrix_copy, gpu_matrix_copy_block,
-                gpu_matrix_copy_entry, gpu_matrix_create, gpu_matrix_decompose_base,
-                gpu_matrix_destroy, gpu_matrix_entry_clone, gpu_matrix_equal,
+                gpu_matrix_create, gpu_matrix_decompose_base, gpu_matrix_destroy, gpu_matrix_equal,
                 gpu_matrix_fill_gadget, gpu_matrix_gauss_samp_gq_arb_base,
                 gpu_matrix_load_rns_batch, gpu_matrix_mul, gpu_matrix_mul_scalar,
-                gpu_matrix_mul_timed, gpu_matrix_sample_distribution, gpu_matrix_sample_p1_full,
+                gpu_matrix_mul_timed,
+                gpu_matrix_sample_distribution, gpu_matrix_sample_p1_full,
                 gpu_matrix_store_rns_batch, gpu_matrix_sub,
             },
             params::DCRTPolyParams,
@@ -607,12 +607,23 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
     }
 
     fn entry(&self, i: usize, j: usize) -> Self::P {
-        let mut poly_ptr: *mut _ = ptr::null_mut();
-        let status = unsafe { gpu_matrix_entry_clone(self.raw, i, j, &mut poly_ptr) };
-        check_status(status, "gpu_matrix_entry_clone");
         let params = Arc::new(self.params.clone());
         let level = params.crt_depth().saturating_sub(1);
-        unsafe { GpuDCRTPoly::from_raw(params, poly_ptr, level, true) }
+        let mut poly_mat: *mut GpuMatrixOpaque = ptr::null_mut();
+        let status = unsafe {
+            gpu_matrix_create(
+                self.params.ctx_raw(),
+                level as i32,
+                1,
+                1,
+                GPU_POLY_FORMAT_EVAL,
+                &mut poly_mat as *mut *mut GpuMatrixOpaque,
+            )
+        };
+        check_status(status, "gpu_matrix_create");
+        let status = unsafe { gpu_matrix_copy_block(poly_mat, self.raw, 0, 0, i, j, 1, 1) };
+        check_status(status, "gpu_matrix_copy_block");
+        unsafe { GpuDCRTPoly::from_raw_matrix(params, poly_mat, level, true) }
     }
 
     fn set_entry(&mut self, i: usize, j: usize, elem: Self::P) {
@@ -620,8 +631,9 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         if !elem.is_ntt() {
             elem.ntt_in_place();
         }
-        let status = unsafe { gpu_matrix_copy_entry(self.raw, i, j, elem.raw_ptr()) };
-        check_status(status, "gpu_matrix_copy_entry");
+        let status =
+            unsafe { gpu_matrix_copy_block(self.raw, elem.raw_ptr(), i, j, 0, 0, 1, 1) };
+        check_status(status, "gpu_matrix_copy_block");
     }
 
     fn get_row(&self, i: usize) -> Vec<Self::P> {
@@ -1005,7 +1017,8 @@ impl GpuDCRTPolyMatrix {
             scalar_eval = tmp;
             &scalar_eval
         };
-        let status = unsafe { gpu_matrix_mul_scalar(out.raw, self.raw, scalar_ref.raw_ptr()) };
+        let status =
+            unsafe { gpu_matrix_mul_scalar(out.raw, self.raw, scalar_ref.raw_ptr() as *const _) };
         check_status(status, "gpu_matrix_mul_scalar");
         out
     }

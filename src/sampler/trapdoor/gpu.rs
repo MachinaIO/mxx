@@ -447,7 +447,7 @@ mod tests {
     fn test_gpu_preimage_coefficients_below_compute_preimage_norm() {
         gpu_device_sync();
         let size = 2usize;
-        let cpu_params = DCRTPolyParams::new(1 << 12, 4, 51, 17);
+        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
         let params = gpu_params_from_cpu(&cpu_params);
         let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
         let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
@@ -496,7 +496,7 @@ mod tests {
     fn test_gpu_p_hat_coefficients_below_compute_preimage_norm() {
         gpu_device_sync();
         let size = 2usize;
-        let cpu_params = DCRTPolyParams::new(1 << 12, 4, 51, 17);
+        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
         let params = gpu_params_from_cpu(&cpu_params);
         let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
         let (trapdoor, _public_matrix) = trapdoor_sampler.trapdoor(&params, size);

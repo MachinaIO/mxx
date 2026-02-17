@@ -15,7 +15,8 @@ use crate::{
                 gpu_matrix_gauss_samp_gq_arb_base, gpu_matrix_intt_all, gpu_matrix_load_rns_batch,
                 gpu_matrix_mul, gpu_matrix_mul_scalar, gpu_matrix_mul_timed, gpu_matrix_ntt_all,
                 gpu_matrix_sample_distribution, gpu_matrix_sample_p1_full,
-                gpu_matrix_store_rns_batch, gpu_matrix_sub,
+                gpu_matrix_store_compact_bytes, gpu_matrix_store_rns_batch,
+                gpu_matrix_load_compact_bytes, gpu_matrix_sub,
             },
             params::DCRTPolyParams,
             poly::DCRTPoly,
@@ -631,58 +632,100 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
     type P = GpuDCRTPoly;
 
     fn to_compact_bytes(&self) -> Vec<u8> {
-        let bytes_per_poly = rns_bytes_len(&self.params);
-        let total = self.nrow.saturating_mul(self.ncol);
-        let mut bytes = vec![0u8; total.saturating_mul(bytes_per_poly)];
         let format = if self.is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
-        self.store_rns_bytes(&mut bytes, bytes_per_poly, format);
 
-        let entries = (0..self.nrow)
-            .map(|row| {
-                (0..self.ncol)
-                    .map(|col| {
-                        let idx = row * self.ncol + col;
-                        let start = idx * bytes_per_poly;
-                        let end = start + bytes_per_poly;
-                        bytes.get(start..end).unwrap_or_default().to_vec()
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let compact_payload = (format as u8, entries);
+        let level = self.level;
+        let coeff_count = self
+            .nrow
+            .saturating_mul(self.ncol)
+            .saturating_mul(self.params.ring_dimension() as usize);
+        let coeff_bits_upper = self
+            .params
+            .moduli()
+            .iter()
+            .take(level + 1)
+            .map(|m| (u64::BITS - m.leading_zeros()) as usize)
+            .sum::<usize>();
+        let payload_capacity = coeff_count.saturating_mul(coeff_bits_upper).div_ceil(8);
+        let mut payload = vec![0u8; payload_capacity];
+        let mut max_coeff_bits: u16 = 0;
+        let mut bytes_per_coeff: u16 = 0;
+        let mut payload_len: usize = 0;
+
+        let tmp = self.clone();
+        let status = unsafe {
+            gpu_matrix_store_compact_bytes(
+                tmp.raw,
+                payload.as_mut_ptr(),
+                payload.len(),
+                &mut max_coeff_bits as *mut u16,
+                &mut bytes_per_coeff as *mut u16,
+                &mut payload_len as *mut usize,
+            )
+        };
+        check_status(status, "gpu_matrix_store_compact_bytes");
+        payload.truncate(payload_len);
+
+        let compact_payload = (
+            1u8,
+            format as u8,
+            level as u32,
+            self.nrow,
+            self.ncol,
+            max_coeff_bits,
+            bytes_per_coeff,
+            payload,
+        );
         bincode::encode_to_vec(compact_payload, bincode::config::standard())
             .expect("Failed to serialize matrix to compact bytes")
     }
 
     fn from_compact_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self {
-        let (format_tag, entries_bytes): (u8, Vec<Vec<Vec<u8>>>) =
+        let (version, format_tag, level_u32, nrow, ncol, max_coeff_bits, bytes_per_coeff, payload): (
+            u8,
+            u8,
+            u32,
+            usize,
+            usize,
+            u16,
+            u16,
+            Vec<u8>,
+        ) =
             bincode::decode_from_slice(bytes, bincode::config::standard())
                 .expect("Failed to deserialize matrix from compact bytes")
                 .0;
+        assert_eq!(version, 1, "Unsupported compact matrix version: {version}");
         let format = match format_tag {
             x if x == GPU_POLY_FORMAT_COEFF as u8 => GPU_POLY_FORMAT_COEFF,
             x if x == GPU_POLY_FORMAT_EVAL as u8 => GPU_POLY_FORMAT_EVAL,
             _ => panic!("Invalid compact matrix format tag: {format_tag}"),
         };
-        let nrow = entries_bytes.len();
-        let ncol = if nrow > 0 { entries_bytes[0].len() } else { 0 };
-        let bytes_per_poly = rns_bytes_len(params);
-        let total = nrow.saturating_mul(ncol);
-        let mut flat = vec![0u8; total.saturating_mul(bytes_per_poly)];
-        for row in 0..nrow {
-            for col in 0..ncol {
-                let idx = row * ncol + col;
-                let start = idx * bytes_per_poly;
-                if let Some(src) = entries_bytes.get(row).and_then(|r| r.get(col)) {
-                    if bytes_per_poly > 0 {
-                        let len = bytes_per_poly.min(src.len());
-                        flat[start..start + len].copy_from_slice(&src[..len]);
-                    }
-                }
-            }
+        let level = level_u32 as usize;
+        assert!(level < params.crt_depth(), "invalid compact matrix level: {level}");
+        let expected_bytes_per_coeff =
+            ((max_coeff_bits as usize).div_ceil(8)) as u16;
+        assert_eq!(
+            bytes_per_coeff, expected_bytes_per_coeff,
+            "compact bytes_per_coeff mismatch: got {bytes_per_coeff}, expected {expected_bytes_per_coeff}"
+        );
+
+        let mut out = Self::new_empty_with_state(params, nrow, ncol, level, false);
+        let status = unsafe {
+            gpu_matrix_load_compact_bytes(
+                out.raw,
+                payload.as_ptr(),
+                payload.len(),
+                max_coeff_bits,
+            )
+        };
+        check_status(status, "gpu_matrix_load_compact_bytes");
+        out.is_ntt = false;
+        if format == GPU_POLY_FORMAT_EVAL {
+            let status =
+                unsafe { gpu_matrix_ntt_all(out.raw, out.params.batch() as i32) };
+            check_status(status, "gpu_matrix_ntt_all");
+            out.is_ntt = true;
         }
-        let mut out = Self::new_empty(params, nrow, ncol);
-        out.load_rns_bytes(&flat, bytes_per_poly, format);
         out
     }
 

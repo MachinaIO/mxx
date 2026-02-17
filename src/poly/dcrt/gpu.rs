@@ -83,6 +83,20 @@ unsafe extern "C" {
         format: c_int,
         out_events: *mut *mut GpuEventSetOpaque,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_store_compact_bytes(
+        mat: *mut GpuMatrixOpaque,
+        payload_out: *mut u8,
+        payload_capacity: usize,
+        out_max_coeff_bits: *mut u16,
+        out_bytes_per_coeff: *mut u16,
+        out_payload_len: *mut usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_load_compact_bytes(
+        mat: *mut GpuMatrixOpaque,
+        payload: *const u8,
+        payload_len: usize,
+        max_coeff_bits: u16,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_add(
         out: *mut GpuMatrixOpaque,
         lhs: *const GpuMatrixOpaque,

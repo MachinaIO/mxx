@@ -758,18 +758,6 @@ namespace
         return 0;
     }
 
-    bool has_stream_ref(const std::vector<FIDESlib::Stream *> &streams, FIDESlib::Stream *candidate)
-    {
-        for (auto *stream : streams)
-        {
-            if (stream == candidate)
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-
     template <typename T>
     int launch_copy_for_limb(
         GpuMatrix *out,
@@ -788,30 +776,44 @@ namespace
         {
             return set_error("mismatched index counts in launch_copy_for_limb");
         }
+        std::vector<GpuPoly *> src_polys;
+        std::vector<GpuPoly *> dst_polys;
+        auto cleanup_views = [&]()
+        {
+            release_poly_views(src_polys);
+            release_poly_views(dst_polys);
+        };
 
+        int status = materialize_matrix_poly_views(src, src_polys);
+        if (status != 0)
+        {
+            cleanup_views();
+            return status;
+        }
+        status = materialize_matrix_poly_views(out, dst_polys);
+        if (status != 0)
+        {
+            cleanup_views();
+            return status;
+        }
         std::vector<const T *> src_ptrs;
         std::vector<T *> dst_ptrs;
-        std::vector<FIDESlib::Stream *> src_streams;
-        std::vector<FIDESlib::Stream *> dst_streams;
         src_ptrs.reserve(count);
         dst_ptrs.reserve(count);
-        src_streams.reserve(count);
-        dst_streams.reserve(count);
-
-        FIDESlib::Stream *exec_stream_ref = nullptr;
-        cudaStream_t exec_stream = nullptr;
         int device = -1;
-
+        cudaStream_t exec_stream = nullptr;
         for (size_t i = 0; i < count; ++i)
         {
-            const GpuPoly *src_poly = src->polys[src_indices[i]].get();
-            GpuPoly *dst_poly = out->polys[dst_indices[i]].get();
+            const GpuPoly *src_poly = src_polys[src_indices[i]];
+            GpuPoly *dst_poly = dst_polys[dst_indices[i]];
             if (!src_poly || !dst_poly)
             {
+                cleanup_views();
                 return set_error("null polynomial in launch_copy_for_limb");
             }
             if (limb_id.x >= src_poly->poly->GPU.size() || limb_id.x >= dst_poly->poly->GPU.size())
             {
+                cleanup_views();
                 return set_error("unexpected limb GPU partition in launch_copy_for_limb");
             }
 
@@ -819,11 +821,22 @@ namespace
             auto &dst_partition = dst_poly->poly->GPU[limb_id.x];
             if (src_partition.device != dst_partition.device)
             {
+                cleanup_views();
                 return set_error("source/destination device mismatch in launch_copy_for_limb");
             }
             if (limb_id.y >= src_partition.limb.size() || limb_id.y >= dst_partition.limb.size())
             {
+                cleanup_views();
                 return set_error("unexpected limb index in launch_copy_for_limb");
+            }
+            if (device < 0)
+            {
+                device = dst_partition.device;
+            }
+            else if (device != dst_partition.device)
+            {
+                cleanup_views();
+                return set_error("inconsistent device in launch_copy_for_limb");
             }
 
             const auto &src_limb = src_partition.limb[limb_id.y];
@@ -832,115 +845,54 @@ namespace
             {
                 if (src_limb.index() != FIDESlib::U64 || dst_limb.index() != FIDESlib::U64)
                 {
+                    cleanup_views();
                     return set_error("mixed limb types in launch_copy_for_limb");
                 }
                 const auto &src_u64 = std::get<FIDESlib::U64>(src_limb);
                 auto &dst_u64 = std::get<FIDESlib::U64>(dst_limb);
                 src_ptrs.push_back(src_u64.v.data);
                 dst_ptrs.push_back(dst_u64.v.data);
-
-                auto *src_stream_ref = &src_u64.stream;
-                auto *dst_stream_ref = &dst_u64.stream;
-                if (!has_stream_ref(src_streams, src_stream_ref))
+                if (!exec_stream)
                 {
-                    src_streams.push_back(src_stream_ref);
-                }
-                if (!has_stream_ref(dst_streams, dst_stream_ref))
-                {
-                    dst_streams.push_back(dst_stream_ref);
-                }
-
-                if (!exec_stream_ref)
-                {
-                    exec_stream_ref = dst_stream_ref;
                     exec_stream = dst_u64.stream.ptr;
-                    device = dst_partition.device;
-                }
-                else if (device != dst_partition.device)
-                {
-                    return set_error("inconsistent copy device in launch_copy_for_limb");
                 }
             }
             else
             {
                 if (src_limb.index() != FIDESlib::U32 || dst_limb.index() != FIDESlib::U32)
                 {
+                    cleanup_views();
                     return set_error("mixed limb types in launch_copy_for_limb");
                 }
                 const auto &src_u32 = std::get<FIDESlib::U32>(src_limb);
                 auto &dst_u32 = std::get<FIDESlib::U32>(dst_limb);
                 src_ptrs.push_back(src_u32.v.data);
                 dst_ptrs.push_back(dst_u32.v.data);
-
-                auto *src_stream_ref = &src_u32.stream;
-                auto *dst_stream_ref = &dst_u32.stream;
-                if (!has_stream_ref(src_streams, src_stream_ref))
+                if (!exec_stream)
                 {
-                    src_streams.push_back(src_stream_ref);
-                }
-                if (!has_stream_ref(dst_streams, dst_stream_ref))
-                {
-                    dst_streams.push_back(dst_stream_ref);
-                }
-
-                if (!exec_stream_ref)
-                {
-                    exec_stream_ref = dst_stream_ref;
                     exec_stream = dst_u32.stream.ptr;
-                    device = dst_partition.device;
-                }
-                else if (device != dst_partition.device)
-                {
-                    return set_error("inconsistent copy device in launch_copy_for_limb");
                 }
             }
         }
 
-        if (!exec_stream_ref || !exec_stream)
+        if (!exec_stream || device < 0)
         {
+            cleanup_views();
             return set_error("null execution stream in launch_copy_for_limb");
         }
 
         cudaError_t err = cudaSetDevice(device);
         if (err != cudaSuccess)
         {
+            cleanup_views();
             return set_error(err);
         }
 
-        for (auto *src_stream_ref : src_streams)
-        {
-            if (src_stream_ref != exec_stream_ref)
-            {
-                exec_stream_ref->wait(*src_stream_ref);
-            }
-        }
-        for (auto *dst_stream_ref : dst_streams)
-        {
-            if (dst_stream_ref != exec_stream_ref)
-            {
-                exec_stream_ref->wait(*dst_stream_ref);
-            }
-        }
-
-        int status = launch_copy_kernel(src_ptrs, dst_ptrs, n, exec_stream);
+        status = launch_copy_kernel(src_ptrs, dst_ptrs, n, exec_stream);
+        cleanup_views();
         if (status != 0)
         {
             return status;
-        }
-
-        for (auto *dst_stream_ref : dst_streams)
-        {
-            if (dst_stream_ref != exec_stream_ref)
-            {
-                dst_stream_ref->wait(*exec_stream_ref);
-            }
-        }
-        for (auto *src_stream_ref : src_streams)
-        {
-            if (src_stream_ref != exec_stream_ref)
-            {
-                src_stream_ref->wait(*exec_stream_ref);
-            }
         }
 
         return 0;
@@ -1483,14 +1435,41 @@ extern "C" int gpu_matrix_add(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
         return set_error("context mismatch in gpu_matrix_add");
     }
     const size_t count = lhs->rows * lhs->cols;
-    auto out_polys = collect_poly_ptrs(out);
-    auto lhs_polys = collect_poly_const_ptrs(lhs);
-    auto rhs_polys = collect_poly_const_ptrs(rhs);
-    int status = gpu_block_add(
+    std::vector<GpuPoly *> out_polys;
+    std::vector<GpuPoly *> lhs_polys_raw;
+    std::vector<GpuPoly *> rhs_polys_raw;
+    auto cleanup = [&]()
+    {
+        release_poly_views(out_polys);
+        release_poly_views(lhs_polys_raw);
+        release_poly_views(rhs_polys_raw);
+    };
+    int status = materialize_matrix_poly_views(out, out_polys);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = materialize_matrix_poly_views(lhs, lhs_polys_raw);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = materialize_matrix_poly_views(rhs, rhs_polys_raw);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    auto lhs_polys = collect_poly_const_ptrs(lhs_polys_raw);
+    auto rhs_polys = collect_poly_const_ptrs(rhs_polys_raw);
+    status = gpu_block_add(
         out_polys.data(),
         lhs_polys.data(),
         rhs_polys.data(),
         count);
+    cleanup();
     if (status != 0)
     {
         return status;
@@ -1519,14 +1498,41 @@ extern "C" int gpu_matrix_sub(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
         return set_error("context mismatch in gpu_matrix_sub");
     }
     const size_t count = lhs->rows * lhs->cols;
-    auto out_polys = collect_poly_ptrs(out);
-    auto lhs_polys = collect_poly_const_ptrs(lhs);
-    auto rhs_polys = collect_poly_const_ptrs(rhs);
-    int status = gpu_block_sub(
+    std::vector<GpuPoly *> out_polys;
+    std::vector<GpuPoly *> lhs_polys_raw;
+    std::vector<GpuPoly *> rhs_polys_raw;
+    auto cleanup = [&]()
+    {
+        release_poly_views(out_polys);
+        release_poly_views(lhs_polys_raw);
+        release_poly_views(rhs_polys_raw);
+    };
+    int status = materialize_matrix_poly_views(out, out_polys);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = materialize_matrix_poly_views(lhs, lhs_polys_raw);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = materialize_matrix_poly_views(rhs, rhs_polys_raw);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    auto lhs_polys = collect_poly_const_ptrs(lhs_polys_raw);
+    auto rhs_polys = collect_poly_const_ptrs(rhs_polys_raw);
+    status = gpu_block_sub(
         out_polys.data(),
         lhs_polys.data(),
         rhs_polys.data(),
         count);
+    cleanup();
     if (status != 0)
     {
         return status;
@@ -1554,16 +1560,43 @@ extern "C" int gpu_matrix_mul(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     {
         return set_error("context mismatch in gpu_matrix_mul");
     }
-    auto out_polys = collect_poly_ptrs(out);
-    auto lhs_polys = collect_poly_const_ptrs(lhs);
-    auto rhs_polys = collect_poly_const_ptrs(rhs);
-    int status = gpu_block_mul(
+    std::vector<GpuPoly *> out_polys;
+    std::vector<GpuPoly *> lhs_polys_raw;
+    std::vector<GpuPoly *> rhs_polys_raw;
+    auto cleanup = [&]()
+    {
+        release_poly_views(out_polys);
+        release_poly_views(lhs_polys_raw);
+        release_poly_views(rhs_polys_raw);
+    };
+    int status = materialize_matrix_poly_views(out, out_polys);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = materialize_matrix_poly_views(lhs, lhs_polys_raw);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = materialize_matrix_poly_views(rhs, rhs_polys_raw);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    auto lhs_polys = collect_poly_const_ptrs(lhs_polys_raw);
+    auto rhs_polys = collect_poly_const_ptrs(rhs_polys_raw);
+    status = gpu_block_mul(
         out_polys.data(),
         lhs_polys.data(),
         rhs_polys.data(),
         lhs->rows,
         lhs->cols,
         rhs->cols);
+    cleanup();
     if (status != 0)
     {
         return status;
@@ -1595,20 +1628,42 @@ extern "C" int gpu_matrix_equal(const GpuMatrix *lhs, const GpuMatrix *rhs, int 
     }
 
     const size_t count = lhs->rows * lhs->cols;
+    std::vector<GpuPoly *> lhs_polys;
+    std::vector<GpuPoly *> rhs_polys;
+    auto cleanup = [&]()
+    {
+        release_poly_views(lhs_polys);
+        release_poly_views(rhs_polys);
+    };
+    int status = materialize_matrix_poly_views(lhs, lhs_polys);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = materialize_matrix_poly_views(rhs, rhs_polys);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
     for (size_t i = 0; i < count; ++i)
     {
         int poly_equal = 0;
-        int status = gpu_poly_equal(lhs->polys[i].get(), rhs->polys[i].get(), &poly_equal);
+        status = gpu_poly_equal(lhs_polys[i], rhs_polys[i], &poly_equal);
         if (status != 0)
         {
+            cleanup();
             return status;
         }
         if (poly_equal == 0)
         {
+            cleanup();
             return 0;
         }
     }
 
+    cleanup();
     *out_equal = 1;
     return 0;
 }
@@ -1640,10 +1695,36 @@ extern "C" int gpu_matrix_mul_timed(
     {
         return set_error("context mismatch in gpu_matrix_mul_timed");
     }
-    auto out_polys = collect_poly_ptrs(out);
-    auto lhs_polys = collect_poly_const_ptrs(lhs);
-    auto rhs_polys = collect_poly_const_ptrs(rhs);
-    int status = gpu_block_mul_timed(
+    std::vector<GpuPoly *> out_polys;
+    std::vector<GpuPoly *> lhs_polys_raw;
+    std::vector<GpuPoly *> rhs_polys_raw;
+    auto cleanup = [&]()
+    {
+        release_poly_views(out_polys);
+        release_poly_views(lhs_polys_raw);
+        release_poly_views(rhs_polys_raw);
+    };
+    int status = materialize_matrix_poly_views(out, out_polys);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = materialize_matrix_poly_views(lhs, lhs_polys_raw);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = materialize_matrix_poly_views(rhs, rhs_polys_raw);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    auto lhs_polys = collect_poly_const_ptrs(lhs_polys_raw);
+    auto rhs_polys = collect_poly_const_ptrs(rhs_polys_raw);
+    status = gpu_block_mul_timed(
         out_polys.data(),
         lhs_polys.data(),
         rhs_polys.data(),
@@ -1651,6 +1732,7 @@ extern "C" int gpu_matrix_mul_timed(
         lhs->cols,
         rhs->cols,
         out_kernel_ms);
+    cleanup();
     if (status != 0)
     {
         return status;
@@ -1682,14 +1764,33 @@ extern "C" int gpu_matrix_mul_scalar(
     }
 
     const size_t count = lhs->rows * lhs->cols;
-    auto out_polys = collect_poly_ptrs(out);
-    auto lhs_polys = collect_poly_const_ptrs(lhs);
+    std::vector<GpuPoly *> out_polys;
+    std::vector<GpuPoly *> lhs_polys_raw;
+    auto cleanup = [&]()
+    {
+        release_poly_views(out_polys);
+        release_poly_views(lhs_polys_raw);
+    };
+    int status = materialize_matrix_poly_views(out, out_polys);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = materialize_matrix_poly_views(lhs, lhs_polys_raw);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    auto lhs_polys = collect_poly_const_ptrs(lhs_polys_raw);
     std::vector<const GpuPoly *> rhs(count, scalar);
-    int status = gpu_block_entrywise_mul(
+    status = gpu_block_entrywise_mul(
         out_polys.data(),
         lhs_polys.data(),
         rhs.data(),
         count);
+    cleanup();
     if (status != 0)
     {
         return status;

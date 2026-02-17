@@ -56,38 +56,12 @@ namespace
         mat->shared_aux_buffers.clear();
     }
 
-    void detach_matrix_shared_aux_buffers(GpuMatrix *mat)
-    {
-        if (!mat || mat->shared_aux_buffers.empty())
-        {
-            return;
-        }
-        for (const auto &poly_holder : mat->polys)
-        {
-            GpuPoly *poly = poly_holder.get();
-            if (!poly || !poly->poly)
-            {
-                continue;
-            }
-            for (auto &partition : poly->poly->GPU)
-            {
-                partition.bufferAUXptrs = nullptr;
-            }
-        }
-    }
-
     void destroy_matrix_contents(GpuMatrix *mat)
     {
         if (!mat)
         {
             return;
         }
-        detach_matrix_shared_aux_buffers(mat);
-        for (auto &poly_holder : mat->polys)
-        {
-            gpu_poly_destroy(poly_holder.release());
-        }
-        mat->polys.clear();
         free_matrix_shared_buffers(mat);
     }
 }
@@ -121,8 +95,7 @@ extern "C" int gpu_matrix_create(
         return set_error("matrix size overflow in gpu_matrix_create");
     }
 
-    auto *mat = new GpuMatrix{ctx, rows, cols, level, fmt, {}, {}, {}};
-    mat->polys.reserve(count);
+    auto *mat = new GpuMatrix{ctx, rows, cols, level, fmt, {}, {}};
     const size_t partition_count = ctx->ctx->meta.size();
     if (partition_count != ctx->ctx->GPUid.size())
     {
@@ -130,22 +103,15 @@ extern "C" int gpu_matrix_create(
         delete mat;
         return set_error("unexpected context partition mapping in gpu_matrix_create");
     }
+    mat->shared_limb_buffers.resize(partition_count);
+    mat->shared_aux_buffers.resize(partition_count);
 
-    std::vector<size_t> limb_counts(partition_count, 0);
-    std::vector<size_t> words_per_poly(partition_count, 0);
-    std::vector<size_t> words_total(partition_count, 0);
-    std::vector<uint64_t *> device_bases(partition_count, nullptr);
-    std::vector<void **> aux_device_bases(partition_count, nullptr);
-    std::vector<size_t> aux_slots_per_poly(partition_count, 0);
-    std::vector<size_t> aux_slots_total(partition_count, 0);
-    std::vector<FIDESlib::Stream *> alloc_streams(partition_count, nullptr);
     const size_t n = static_cast<size_t>(ctx->N);
 
     for (size_t partition_idx = 0; partition_idx < partition_count; ++partition_idx)
     {
         auto &meta = ctx->ctx->meta[partition_idx];
         const size_t limbs = limb_count_for_level(meta, level);
-        limb_counts[partition_idx] = limbs;
         if (limbs == 0 || count == 0)
         {
             continue;
@@ -234,162 +200,20 @@ extern "C" int gpu_matrix_create(
             }
         }
 
-        device_bases[partition_idx] = base;
-        aux_device_bases[partition_idx] = aux_base;
-        aux_slots_per_poly[partition_idx] = aux_slots;
-        aux_slots_total[partition_idx] = aux_total_slots;
-        alloc_streams[partition_idx] = alloc_stream;
-        words_per_poly[partition_idx] = poly_words;
-        words_total[partition_idx] = total_words;
-        mat->shared_limb_buffers.push_back(GpuMatrix::SharedLimbBuffer{
+        mat->shared_limb_buffers[partition_idx] = GpuMatrix::SharedLimbBuffer{
             ctx->ctx->GPUid[partition_idx],
-            base});
-        mat->shared_aux_buffers.push_back(GpuMatrix::SharedAuxBuffer{
+            base,
+            limbs,
+            poly_words,
+            total_words,
+            n};
+        mat->shared_aux_buffers[partition_idx] = GpuMatrix::SharedAuxBuffer{
             ctx->ctx->GPUid[partition_idx],
-            aux_base});
+            aux_base,
+            aux_slots,
+            aux_total_slots};
     }
 
-    std::vector<size_t> words_used(partition_count, 0);
-    std::vector<size_t> aux_slots_used(partition_count, 0);
-    for (size_t poly_idx = 0; poly_idx < count; ++poly_idx)
-    {
-        auto *poly_impl = new CKKS::RNSPoly(*ctx->ctx, -1, false);
-        poly_impl->setLevel(level);
-        auto *poly = new GpuPoly{poly_impl, ctx, level, fmt};
-
-        for (size_t partition_idx = 0; partition_idx < partition_count; ++partition_idx)
-        {
-            if (partition_idx >= poly_impl->GPU.size())
-            {
-                gpu_poly_destroy(poly);
-                destroy_matrix_contents(mat);
-                delete mat;
-                return set_error("unexpected poly partition size in gpu_matrix_create");
-            }
-
-            auto &partition = poly_impl->GPU[partition_idx];
-            if (partition.device != ctx->ctx->GPUid[partition_idx])
-            {
-                gpu_poly_destroy(poly);
-                destroy_matrix_contents(mat);
-                delete mat;
-                return set_error("unexpected partition device in gpu_matrix_create");
-            }
-
-            cudaError_t err = cudaSetDevice(partition.device);
-            if (err != cudaSuccess)
-            {
-                gpu_poly_destroy(poly);
-                destroy_matrix_contents(mat);
-                delete mat;
-                return set_error(err);
-            }
-            if (alloc_streams[partition_idx])
-            {
-                partition.s.wait(*alloc_streams[partition_idx]);
-            }
-
-            void **aux_base = aux_device_bases[partition_idx];
-            if (!aux_base)
-            {
-                gpu_poly_destroy(poly);
-                destroy_matrix_contents(mat);
-                delete mat;
-                return set_error("missing shared aux buffer in gpu_matrix_create");
-            }
-            const size_t aux_poly_slots = aux_slots_per_poly[partition_idx];
-            const size_t aux_offset_slots = aux_slots_used[partition_idx];
-            if (aux_offset_slots > aux_slots_total[partition_idx] ||
-                aux_poly_slots > aux_slots_total[partition_idx] - aux_offset_slots)
-            {
-                gpu_poly_destroy(poly);
-                destroy_matrix_contents(mat);
-                delete mat;
-                return set_error("shared aux buffer overflow in gpu_matrix_create");
-            }
-            if (partition.bufferAUXptrs)
-            {
-                err = cudaFree(partition.bufferAUXptrs);
-                if (err != cudaSuccess)
-                {
-                    gpu_poly_destroy(poly);
-                    destroy_matrix_contents(mat);
-                    delete mat;
-                    return set_error(err);
-                }
-            }
-            void **poly_aux_base = aux_base + aux_offset_slots;
-            partition.bufferAUXptrs = poly_aux_base;
-            const size_t aux_stride = static_cast<size_t>(FIDESlib::MAXP);
-            const size_t decomp_ptr_count = partition.DECOMPlimbptr.size();
-            if (partition.DECOMPauxptr.size() != decomp_ptr_count ||
-                partition.DIGITlimbptr.size() != decomp_ptr_count ||
-                partition.DIGITauxptr.size() != decomp_ptr_count)
-            {
-                gpu_poly_destroy(poly);
-                destroy_matrix_contents(mat);
-                delete mat;
-                return set_error("unexpected aux pointer layout in gpu_matrix_create");
-            }
-            partition.limbptr.data = poly_aux_base;
-            partition.auxptr.data = poly_aux_base + aux_stride;
-            partition.SPECIALlimbptr.data = poly_aux_base + 2 * aux_stride;
-            partition.SPECIALauxptr.data = poly_aux_base + 3 * aux_stride;
-            for (size_t decomp_idx = 0; decomp_idx < decomp_ptr_count; ++decomp_idx)
-            {
-                partition.DECOMPlimbptr[decomp_idx].data =
-                    poly_aux_base + (4 + decomp_idx) * aux_stride;
-                partition.DECOMPauxptr[decomp_idx].data =
-                    poly_aux_base + (4 + decomp_ptr_count + decomp_idx) * aux_stride;
-                partition.DIGITlimbptr[decomp_idx].data =
-                    poly_aux_base + (4 + 2 * decomp_ptr_count + decomp_idx) * aux_stride;
-                partition.DIGITauxptr[decomp_idx].data =
-                    poly_aux_base + (4 + 3 * decomp_ptr_count + decomp_idx) * aux_stride;
-            }
-            aux_slots_used[partition_idx] = aux_offset_slots + aux_poly_slots;
-
-            const size_t limbs = limb_counts[partition_idx];
-            if (limbs == 0)
-            {
-                continue;
-            }
-
-            uint64_t *base = device_bases[partition_idx];
-            if (!base)
-            {
-                gpu_poly_destroy(poly);
-                destroy_matrix_contents(mat);
-                delete mat;
-                return set_error("missing shared limb buffer in gpu_matrix_create");
-            }
-
-            const size_t poly_words = words_per_poly[partition_idx];
-            const size_t limb_words = poly_words / 2;
-            const size_t offset_words = words_used[partition_idx];
-            if (offset_words > words_total[partition_idx] ||
-                poly_words > words_total[partition_idx] - offset_words)
-            {
-                gpu_poly_destroy(poly);
-                destroy_matrix_contents(mat);
-                delete mat;
-                return set_error("shared limb buffer overflow in gpu_matrix_create");
-            }
-
-            partition.generate(
-                partition.meta,
-                partition.limb,
-                partition.limbptr,
-                static_cast<int>(limbs) - 1,
-                &partition.auxptr,
-                base,
-                offset_words,
-                base,
-                offset_words + limb_words);
-            words_used[partition_idx] = offset_words + poly_words;
-        }
-
-        mat->polys.emplace_back(poly);
-    }
     *out = mat;
     return 0;
 }
@@ -419,17 +243,7 @@ extern "C" int gpu_matrix_copy(GpuMatrix *dst, const GpuMatrix *src)
     {
         return set_error("context mismatch in gpu_matrix_copy");
     }
-    const size_t count = src->rows * src->cols;
-    for (size_t i = 0; i < count; ++i)
-    {
-        int status = gpu_poly_copy(dst->polys[i].get(), src->polys[i].get());
-        if (status != 0)
-        {
-            return status;
-        }
-    }
-    dst->format = src->format;
-    return 0;
+    return gpu_matrix_copy_block(dst, src, 0, 0, 0, 0, src->rows, src->cols);
 }
 
 extern "C" int gpu_matrix_entry_clone(
@@ -449,7 +263,16 @@ extern "C" int gpu_matrix_entry_clone(
         return set_error("index out of bounds in gpu_matrix_entry_clone");
     }
     const size_t idx = matrix_index(row, col, mat->cols);
-    return gpu_poly_clone_async(mat->polys[idx].get(), out_poly, out_events);
+    GpuPoly *view = nullptr;
+    int status = materialize_matrix_poly_view(mat, idx, &view);
+    if (status != 0)
+    {
+        return status;
+    }
+    status = gpu_poly_clone_async(view, out_poly, out_events);
+    std::vector<GpuPoly *> tmp_views{view};
+    release_poly_views(tmp_views);
+    return status;
 }
 
 extern "C" int gpu_matrix_copy_entry(
@@ -471,7 +294,21 @@ extern "C" int gpu_matrix_copy_entry(
         return set_error("context mismatch in gpu_matrix_copy_entry");
     }
     const size_t idx = matrix_index(row, col, mat->cols);
-    return gpu_poly_copy(mat->polys[idx].get(), src);
+    GpuPoly *view = nullptr;
+    int status = materialize_matrix_poly_view(mat, idx, &view);
+    if (status != 0)
+    {
+        return status;
+    }
+    status = gpu_poly_copy(view, src);
+    std::vector<GpuPoly *> tmp_views{view};
+    release_poly_views(tmp_views);
+    if (status != 0)
+    {
+        return status;
+    }
+    mat->format = src->format;
+    return 0;
 }
 
 extern "C" int gpu_matrix_copy_block(
@@ -542,63 +379,17 @@ extern "C" int gpu_matrix_copy_block(
     for (int limb = 0; limb <= level; ++limb)
     {
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        const GpuPoly *src_poly0 = src->polys[src_indices[0]].get();
-        if (!src_poly0)
-        {
-            return set_error("null source polynomial in gpu_matrix_copy_block");
-        }
-        if (limb_id.x >= src_poly0->poly->GPU.size())
-        {
-            return set_error("unexpected limb GPU partition in gpu_matrix_copy_block");
-        }
-        const auto &src_partition0 = src_poly0->poly->GPU[limb_id.x];
-        if (limb_id.y >= src_partition0.limb.size())
-        {
-            return set_error("unexpected limb index in gpu_matrix_copy_block");
-        }
-
-        const auto &limb_impl = src_partition0.limb[limb_id.y];
-        int status = 0;
-        if (limb_impl.index() == FIDESlib::U64)
-        {
-            status = launch_copy_for_limb<uint64_t>(
-                out,
-                src,
-                src_indices,
-                dst_indices,
-                limb_id,
-                static_cast<size_t>(N));
-        }
-        else if (limb_impl.index() == FIDESlib::U32)
-        {
-            status = launch_copy_for_limb<uint32_t>(
-                out,
-                src,
-                src_indices,
-                dst_indices,
-                limb_id,
-                static_cast<size_t>(N));
-        }
-        else
-        {
-            return set_error("unsupported limb type in gpu_matrix_copy_block");
-        }
+        int status = launch_copy_for_limb<uint64_t>(
+            out,
+            src,
+            src_indices,
+            dst_indices,
+            limb_id,
+            static_cast<size_t>(N));
         if (status != 0)
         {
             return status;
         }
-    }
-
-    for (size_t i = 0; i < count; ++i)
-    {
-        const size_t src_idx = src_indices[i];
-        const size_t dst_idx = dst_indices[i];
-        if (!out->polys[dst_idx] || !src->polys[src_idx])
-        {
-            return set_error("null polynomial after copy in gpu_matrix_copy_block");
-        }
-        out->polys[dst_idx]->level = src->polys[src_idx]->level;
-        out->polys[dst_idx]->format = src->polys[src_idx]->format;
     }
 
     out->format = src->format;

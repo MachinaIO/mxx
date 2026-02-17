@@ -249,6 +249,16 @@ extern "C" int gpu_matrix_fill_gadget(
     {
         return set_error("output size mismatch in gpu_matrix_fill_gadget");
     }
+    std::vector<GpuPoly *> out_polys;
+    int status = materialize_matrix_poly_views(out, out_polys);
+    if (status != 0)
+    {
+        return status;
+    }
+    auto cleanup_out_polys = [&]()
+    {
+        release_poly_views(out_polys);
+    };
 
     struct FillBatch
     {
@@ -279,44 +289,52 @@ extern "C" int gpu_matrix_fill_gadget(
         limb_ptrs.reserve(count);
         int limb_device = -1;
         cudaStream_t limb_stream = nullptr;
+        int status = matrix_limb_device(out, limb_id, &limb_device);
+        if (status != 0)
+        {
+            cleanup_out_polys();
+            return status;
+        }
+        status = matrix_limb_stream(out, limb_id, &limb_stream);
+        if (status != 0)
+        {
+            cleanup_out_polys();
+            return status;
+        }
 
         for (size_t idx = 0; idx < count; ++idx)
         {
-            GpuPoly *poly = out->polys[idx].get();
+            GpuPoly *poly = out_polys[idx];
             if (!poly || poly->ctx != out->ctx || poly->level != level)
             {
+                cleanup_out_polys();
                 return set_error("invalid output poly in gpu_matrix_fill_gadget");
             }
             if (limb_id.x >= poly->poly->GPU.size())
             {
+                cleanup_out_polys();
                 return set_error("unexpected limb GPU partition in gpu_matrix_fill_gadget");
             }
             auto &partition = poly->poly->GPU[limb_id.x];
             if (limb_id.y >= partition.limb.size())
             {
+                cleanup_out_polys();
                 return set_error("unexpected limb index in gpu_matrix_fill_gadget");
             }
             auto &limb_impl = partition.limb[limb_id.y];
             if (limb_impl.index() != FIDESlib::U64)
             {
+                cleanup_out_polys();
                 return set_error("unsupported limb type in gpu_matrix_fill_gadget");
             }
             auto &limb_u64 = std::get<FIDESlib::U64>(limb_impl);
-            if (limb_device == -1)
-            {
-                limb_device = partition.device;
-                limb_stream = limb_u64.stream.ptr;
-            }
-            else if (limb_device != partition.device)
-            {
-                return set_error("inconsistent limb device in gpu_matrix_fill_gadget");
-            }
             limb_ptrs.push_back(limb_u64.v.data);
         }
 
-        if (limb_device < 0)
+        if (limb_device < 0 || !limb_stream)
         {
-            return set_error("invalid limb device in gpu_matrix_fill_gadget");
+            cleanup_out_polys();
+            return set_error("invalid limb metadata in gpu_matrix_fill_gadget");
         }
         auto &batch = get_batch(limb_device);
         if (!batch.stream)
@@ -332,11 +350,13 @@ extern "C" int gpu_matrix_fill_gadget(
     {
         if (!batch.stream)
         {
+            cleanup_out_polys();
             return set_error("null stream in gpu_matrix_fill_gadget");
         }
         cudaError_t err = cudaSetDevice(batch.device);
         if (err != cudaSuccess)
         {
+            cleanup_out_polys();
             return set_error(err);
         }
         int status = launch_fill_gadget_multi_limb_kernel(
@@ -353,18 +373,19 @@ extern "C" int gpu_matrix_fill_gadget(
             batch.stream);
         if (status != 0)
         {
+            cleanup_out_polys();
             return status;
         }
     }
 
     const int batch = default_batch(out->ctx);
-    for (auto &poly_holder : out->polys)
+    for (auto *poly : out_polys)
     {
-        GpuPoly *poly = poly_holder.get();
         poly->format = PolyFormat::Coeff;
-        int status = gpu_poly_ntt(poly, batch);
+        status = gpu_poly_ntt(poly, batch);
         if (status != 0)
         {
+            cleanup_out_polys();
             return status;
         }
         status = sync_poly_partition_streams(
@@ -372,6 +393,7 @@ extern "C" int gpu_matrix_fill_gadget(
             "failed to synchronize output partition stream after gpu_poly_ntt in gpu_matrix_fill_gadget");
         if (status != 0)
         {
+            cleanup_out_polys();
             return status;
         }
         status = sync_poly_limb_streams(
@@ -379,10 +401,12 @@ extern "C" int gpu_matrix_fill_gadget(
             "failed to synchronize output limb stream after gpu_poly_ntt in gpu_matrix_fill_gadget");
         if (status != 0)
         {
+            cleanup_out_polys();
             return status;
         }
         poly->format = PolyFormat::Eval;
     }
+    cleanup_out_polys();
     out->format = PolyFormat::Eval;
     return 0;
 }
@@ -438,23 +462,41 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
     }
 
     GpuMatrix *tmp_inputs_matrix = nullptr;
+    std::vector<GpuPoly *> src_polys;
+    std::vector<GpuPoly *> out_polys;
+    std::vector<GpuPoly *> tmp_input_polys;
     std::vector<const GpuPoly *> inputs;
     inputs.reserve(count);
     auto cleanup_tmp_inputs = [&]()
     {
+        release_poly_views(src_polys);
+        release_poly_views(out_polys);
+        release_poly_views(tmp_input_polys);
         if (tmp_inputs_matrix)
         {
             gpu_matrix_destroy(tmp_inputs_matrix);
             tmp_inputs_matrix = nullptr;
         }
     };
+    int status = materialize_matrix_poly_views(src, src_polys);
+    if (status != 0)
+    {
+        cleanup_tmp_inputs();
+        return status;
+    }
+    status = materialize_matrix_poly_views(out, out_polys);
+    if (status != 0)
+    {
+        cleanup_tmp_inputs();
+        return status;
+    }
     const int batch = default_batch(src->ctx);
     if (src->format == PolyFormat::Eval)
     {
         for (size_t i = 0; i < count; ++i)
         {
             int status = sync_poly_partition_streams(
-                src->polys[i].get(),
+                src_polys[i],
                 "failed to synchronize source partition stream before clone in gpu_matrix_decompose_base");
             if (status != 0)
             {
@@ -462,7 +504,7 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
                 return status;
             }
             status = sync_poly_limb_streams(
-                src->polys[i].get(),
+                src_polys[i],
                 "failed to synchronize source limb stream before clone in gpu_matrix_decompose_base");
             if (status != 0)
             {
@@ -486,9 +528,14 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
             return status;
         }
 
-        for (auto &clone_holder : tmp_inputs_matrix->polys)
+        status = materialize_matrix_poly_views(tmp_inputs_matrix, tmp_input_polys);
+        if (status != 0)
         {
-            GpuPoly *clone = clone_holder.get();
+            cleanup_tmp_inputs();
+            return status;
+        }
+        for (auto *clone : tmp_input_polys)
+        {
             status = sync_poly_partition_streams(
                 clone,
                 "failed to synchronize clone partition stream before gpu_poly_intt in gpu_matrix_decompose_base");
@@ -518,24 +565,28 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
     {
         for (size_t i = 0; i < count; ++i)
         {
-            inputs.push_back(src->polys[i].get());
+            inputs.push_back(src_polys[i]);
         }
     }
 
     // Ensure all pending source-side INTT work is finished before one-shot kernels.
-    for (int device : src->ctx->gpu_ids)
+    for (const auto *input_poly : inputs)
     {
-        cudaError_t err = cudaSetDevice(device);
-        if (err != cudaSuccess)
+        status = sync_poly_partition_streams(
+            input_poly,
+            "failed to synchronize input partition stream after gpu_poly_intt in gpu_matrix_decompose_base");
+        if (status != 0)
         {
             cleanup_tmp_inputs();
-            return set_error(err);
+            return status;
         }
-        err = cudaDeviceSynchronize();
-        if (err != cudaSuccess)
+        status = sync_poly_limb_streams(
+            input_poly,
+            "failed to synchronize input limb stream after gpu_poly_intt in gpu_matrix_decompose_base");
+        if (status != 0)
         {
             cleanup_tmp_inputs();
-            return set_error(err);
+            return status;
         }
     }
 
@@ -547,11 +598,11 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
     }
 
     std::vector<std::pair<int, cudaStream_t>> out_zero_streams;
-    out_zero_streams.reserve(out->polys.size() * crt_depth);
+    out_zero_streams.reserve(out_polys.size() * crt_depth);
 
-    for (size_t idx = 0; idx < out->polys.size(); ++idx)
+    for (size_t idx = 0; idx < out_polys.size(); ++idx)
     {
-        GpuPoly *poly = out->polys[idx].get();
+        GpuPoly *poly = out_polys[idx];
         if (!poly || poly->ctx != src->ctx || poly->level != level)
         {
             cleanup_tmp_inputs();
@@ -736,7 +787,7 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
                     const size_t col = idx % cols;
                     const size_t out_row = row * log_base_q + digit_offset;
                     const size_t out_idx = matrix_index(out_row, col, out->cols);
-                    auto &out_partition = out->polys[out_idx]->poly->GPU[out_limb_id.x];
+                    auto &out_partition = out_polys[out_idx]->poly->GPU[out_limb_id.x];
                     if (out_partition.device != in_partition.device)
                     {
                         cleanup_tmp_inputs();
@@ -816,9 +867,8 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
         }
     }
 
-    for (auto &poly_holder : out->polys)
+    for (auto *poly : out_polys)
     {
-        GpuPoly *poly = poly_holder.get();
         int status = gpu_poly_ntt(poly, batch);
         if (status != 0)
         {

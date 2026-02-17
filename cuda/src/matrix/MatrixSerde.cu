@@ -11,13 +11,19 @@ extern "C" int gpu_matrix_load_rns_batch(
     }
     *out_events = nullptr;
     const size_t count = mat->rows * mat->cols;
-    auto mat_polys = collect_poly_ptrs(mat);
-    int status = gpu_poly_load_rns_batch(
+    std::vector<GpuPoly *> mat_polys;
+    int status = materialize_matrix_poly_views(mat, mat_polys);
+    if (status != 0)
+    {
+        return status;
+    }
+    status = gpu_poly_load_rns_batch(
         mat_polys.data(),
         count,
         bytes,
         bytes_per_poly,
         format);
+    release_poly_views(mat_polys);
     if (status != 0)
     {
         return status;
@@ -42,51 +48,41 @@ extern "C" int gpu_matrix_load_rns_batch(
     std::vector<StreamRef> streams;
     streams.reserve(mat->ctx ? mat->ctx->gpu_ids.size() : 1);
 
-    for (size_t idx = 0; idx < count; ++idx)
+    auto &limb_map = mat->ctx->ctx->limbGPUid;
+    if (limb_map.size() < static_cast<size_t>(mat->level + 1))
     {
-        GpuPoly *poly = mat->polys[idx].get();
-        if (!poly || !poly->poly)
+        gpu_event_set_destroy(event_set);
+        return set_error("unexpected limb mapping size in gpu_matrix_load_rns_batch");
+    }
+    for (int limb = 0; limb <= mat->level; ++limb)
+    {
+        const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
+        int device = -1;
+        cudaStream_t stream = nullptr;
+        status = matrix_limb_device(mat, limb_id, &device);
+        if (status != 0)
         {
             gpu_event_set_destroy(event_set);
-            return set_error("null poly in gpu_matrix_load_rns_batch");
+            return status;
         }
-        for (auto &partition : poly->poly->GPU)
+        status = matrix_limb_stream(mat, limb_id, &stream);
+        if (status != 0)
         {
-            for (auto &limb_impl : partition.limb)
+            gpu_event_set_destroy(event_set);
+            return status;
+        }
+        bool seen = false;
+        for (const auto &entry : streams)
+        {
+            if (entry.device == device && entry.stream == stream)
             {
-                cudaStream_t stream = nullptr;
-                if (limb_impl.index() == FIDESlib::U64)
-                {
-                    stream = std::get<FIDESlib::U64>(limb_impl).stream.ptr;
-                }
-                else if (limb_impl.index() == FIDESlib::U32)
-                {
-                    stream = std::get<FIDESlib::U32>(limb_impl).stream.ptr;
-                }
-                else
-                {
-                    gpu_event_set_destroy(event_set);
-                    return set_error("unsupported limb type in gpu_matrix_load_rns_batch");
-                }
-                if (!stream)
-                {
-                    gpu_event_set_destroy(event_set);
-                    return set_error("null stream in gpu_matrix_load_rns_batch");
-                }
-                bool seen = false;
-                for (const auto &entry : streams)
-                {
-                    if (entry.device == partition.device && entry.stream == stream)
-                    {
-                        seen = true;
-                        break;
-                    }
-                }
-                if (!seen)
-                {
-                    streams.push_back(StreamRef{partition.device, stream});
-                }
+                seen = true;
+                break;
             }
+        }
+        if (!seen)
+        {
+            streams.push_back(StreamRef{device, stream});
         }
     }
 
@@ -160,7 +156,13 @@ extern "C" int gpu_matrix_store_rns_batch(
         return status;
     }
 
-    auto clone_polys = collect_poly_ptrs(clones);
+    std::vector<GpuPoly *> clone_polys;
+    status = materialize_matrix_poly_views(clones, clone_polys);
+    if (status != 0)
+    {
+        gpu_matrix_destroy(clones);
+        return status;
+    }
     status = gpu_poly_store_rns_batch(
         clone_polys.data(),
         count,
@@ -168,6 +170,7 @@ extern "C" int gpu_matrix_store_rns_batch(
         bytes_per_poly,
         format,
         out_events);
+    release_poly_views(clone_polys);
     if (status != 0)
     {
         if (*out_events)

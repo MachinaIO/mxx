@@ -1,6 +1,5 @@
 #pragma once
 
-#include <memory>
 #include <vector>
 
 #include "Poly.h"
@@ -13,16 +12,21 @@ struct GpuMatrix
     size_t cols;
     int level;
     PolyFormat format;
-    std::vector<std::unique_ptr<GpuPoly>> polys;
     struct SharedLimbBuffer
     {
         int device;
         uint64_t *ptr;
+        size_t limb_count;
+        size_t words_per_poly;
+        size_t words_total;
+        size_t n;
     };
     struct SharedAuxBuffer
     {
         int device;
         void **ptr;
+        size_t slots_per_poly;
+        size_t slots_total;
     };
     std::vector<SharedLimbBuffer> shared_limb_buffers;
     std::vector<SharedAuxBuffer> shared_aux_buffers;

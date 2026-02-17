@@ -991,23 +991,41 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
     }
 
     GpuMatrix *tmp_inputs_matrix = nullptr;
+    std::vector<GpuPoly *> src_polys;
+    std::vector<GpuPoly *> out_polys;
+    std::vector<GpuPoly *> tmp_input_polys;
     std::vector<const GpuPoly *> inputs;
     inputs.reserve(count);
     auto cleanup_tmp_inputs = [&]()
     {
+        release_poly_views(src_polys);
+        release_poly_views(out_polys);
+        release_poly_views(tmp_input_polys);
         if (tmp_inputs_matrix)
         {
             gpu_matrix_destroy(tmp_inputs_matrix);
             tmp_inputs_matrix = nullptr;
         }
     };
+    int status = materialize_matrix_poly_views(src, src_polys);
+    if (status != 0)
+    {
+        cleanup_tmp_inputs();
+        return status;
+    }
+    status = materialize_matrix_poly_views(out, out_polys);
+    if (status != 0)
+    {
+        cleanup_tmp_inputs();
+        return status;
+    }
     const int batch = default_batch(src->ctx);
     if (src->format == PolyFormat::Eval)
     {
         for (size_t i = 0; i < count; ++i)
         {
             int sync_status = sync_poly_partition_streams(
-                src->polys[i].get(),
+                src_polys[i],
                 "failed to synchronize source partition stream in gpu_matrix_gauss_samp_gq_arb_base");
             if (sync_status != 0)
             {
@@ -1015,7 +1033,7 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                 return sync_status;
             }
             sync_status = sync_poly_limb_streams(
-                src->polys[i].get(),
+                src_polys[i],
                 "failed to synchronize source limb stream in gpu_matrix_gauss_samp_gq_arb_base");
             if (sync_status != 0)
             {
@@ -1039,9 +1057,14 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
             return status;
         }
 
-        for (auto &clone_holder : tmp_inputs_matrix->polys)
+        status = materialize_matrix_poly_views(tmp_inputs_matrix, tmp_input_polys);
+        if (status != 0)
         {
-            GpuPoly *clone = clone_holder.get();
+            cleanup_tmp_inputs();
+            return status;
+        }
+        for (auto *clone : tmp_input_polys)
+        {
             int sync_status = sync_poly_partition_streams(
                 clone,
                 "failed to synchronize clone partition stream in gpu_matrix_gauss_samp_gq_arb_base");
@@ -1071,23 +1094,27 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
     {
         for (size_t i = 0; i < count; ++i)
         {
-            inputs.push_back(src->polys[i].get());
+            inputs.push_back(src_polys[i]);
         }
     }
 
-    for (int device : src->ctx->gpu_ids)
+    for (const auto *input_poly : inputs)
     {
-        cudaError_t err = cudaSetDevice(device);
-        if (err != cudaSuccess)
+        int sync_status = sync_poly_partition_streams(
+            input_poly,
+            "failed to synchronize input partition stream after gpu_poly_intt in gpu_matrix_gauss_samp_gq_arb_base");
+        if (sync_status != 0)
         {
             cleanup_tmp_inputs();
-            return set_error(err);
+            return sync_status;
         }
-        err = cudaDeviceSynchronize();
-        if (err != cudaSuccess)
+        sync_status = sync_poly_limb_streams(
+            input_poly,
+            "failed to synchronize input limb stream after gpu_poly_intt in gpu_matrix_gauss_samp_gq_arb_base");
+        if (sync_status != 0)
         {
             cleanup_tmp_inputs();
-            return set_error(err);
+            return sync_status;
         }
     }
 
@@ -1099,11 +1126,11 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
     }
 
     std::vector<std::pair<int, cudaStream_t>> out_zero_streams;
-    out_zero_streams.reserve(out->polys.size() * crt_depth);
+    out_zero_streams.reserve(out_polys.size() * crt_depth);
 
-    for (size_t idx = 0; idx < out->polys.size(); ++idx)
+    for (size_t idx = 0; idx < out_polys.size(); ++idx)
     {
-        GpuPoly *poly = out->polys[idx].get();
+        GpuPoly *poly = out_polys[idx];
         if (!poly || poly->ctx != src->ctx || poly->level != level)
         {
             cleanup_tmp_inputs();
@@ -1275,7 +1302,7 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                     const size_t col = idx % cols;
                     const size_t out_row = row * log_base_q + digit_offset;
                     const size_t out_idx = matrix_index(out_row, col, out->cols);
-                    auto &out_partition = out->polys[out_idx]->poly->GPU[out_limb_id.x];
+                    auto &out_partition = out_polys[out_idx]->poly->GPU[out_limb_id.x];
                     if (out_partition.device != in_partition.device)
                     {
                         cleanup_tmp_inputs();
@@ -1356,9 +1383,8 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         }
     }
 
-    for (auto &poly_holder : out->polys)
+    for (auto *poly : out_polys)
     {
-        GpuPoly *poly = poly_holder.get();
         int status = gpu_poly_ntt(poly, batch);
         if (status != 0)
         {
@@ -1443,6 +1469,11 @@ extern "C" int gpu_matrix_sample_p1_full(
     GpuMatrix *tmp_b = nullptr;
     GpuMatrix *tmp_d = nullptr;
     GpuMatrix *tmp_tp2 = nullptr;
+    std::vector<GpuPoly *> a_views;
+    std::vector<GpuPoly *> b_views;
+    std::vector<GpuPoly *> d_views;
+    std::vector<GpuPoly *> tp2_views;
+    std::vector<GpuPoly *> out_views;
     std::vector<const GpuPoly *> a_inputs;
     std::vector<const GpuPoly *> b_inputs;
     std::vector<const GpuPoly *> d_inputs;
@@ -1450,6 +1481,11 @@ extern "C" int gpu_matrix_sample_p1_full(
 
     auto cleanup = [&]()
     {
+        release_poly_views(a_views);
+        release_poly_views(b_views);
+        release_poly_views(d_views);
+        release_poly_views(tp2_views);
+        release_poly_views(out_views);
         if (tmp_a)
         {
             gpu_matrix_destroy(tmp_a);
@@ -1472,11 +1508,16 @@ extern "C" int gpu_matrix_sample_p1_full(
         }
     };
 
-    auto collect_coeff_inputs = [&](const GpuMatrix *src, GpuMatrix **owned, std::vector<const GpuPoly *> &inputs) -> int
+    auto collect_coeff_inputs = [&](
+                                    const GpuMatrix *src,
+                                    GpuMatrix **owned,
+                                    std::vector<GpuPoly *> &views,
+                                    std::vector<const GpuPoly *> &inputs) -> int
     {
         const size_t count = src->rows * src->cols;
         inputs.clear();
         inputs.reserve(count);
+        views.clear();
         const int batch = default_batch(src->ctx);
         *owned = nullptr;
         if (src->format == PolyFormat::Eval)
@@ -1501,12 +1542,19 @@ extern "C" int gpu_matrix_sample_p1_full(
                 *owned = nullptr;
                 return status;
             }
-            for (auto &clone_holder : (*owned)->polys)
+            status = materialize_matrix_poly_views(*owned, views);
+            if (status != 0)
             {
-                GpuPoly *clone = clone_holder.get();
+                gpu_matrix_destroy(*owned);
+                *owned = nullptr;
+                return status;
+            }
+            for (auto *clone : views)
+            {
                 status = gpu_poly_intt(clone, batch);
                 if (status != 0)
                 {
+                    release_poly_views(views);
                     gpu_matrix_destroy(*owned);
                     *owned = nullptr;
                     return status;
@@ -1516,33 +1564,44 @@ extern "C" int gpu_matrix_sample_p1_full(
         }
         else
         {
+            int status = materialize_matrix_poly_views(src, views);
+            if (status != 0)
+            {
+                return status;
+            }
             for (size_t i = 0; i < count; ++i)
             {
-                inputs.push_back(src->polys[i].get());
+                inputs.push_back(views[i]);
             }
         }
         return 0;
     };
 
-    int status = collect_coeff_inputs(a_mat, &tmp_a, a_inputs);
+    int status = materialize_matrix_poly_views(out, out_views);
     if (status != 0)
     {
         cleanup();
         return status;
     }
-    status = collect_coeff_inputs(b_mat, &tmp_b, b_inputs);
+    status = collect_coeff_inputs(a_mat, &tmp_a, a_views, a_inputs);
     if (status != 0)
     {
         cleanup();
         return status;
     }
-    status = collect_coeff_inputs(d_mat, &tmp_d, d_inputs);
+    status = collect_coeff_inputs(b_mat, &tmp_b, b_views, b_inputs);
     if (status != 0)
     {
         cleanup();
         return status;
     }
-    status = collect_coeff_inputs(tp2, &tmp_tp2, tp2_inputs);
+    status = collect_coeff_inputs(d_mat, &tmp_d, d_views, d_inputs);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = collect_coeff_inputs(tp2, &tmp_tp2, tp2_views, tp2_inputs);
     if (status != 0)
     {
         cleanup();
@@ -1550,25 +1609,59 @@ extern "C" int gpu_matrix_sample_p1_full(
     }
 
     // Ensure all pending INTT work has completed before cross-stream reads.
-    for (int device : a_mat->ctx->gpu_ids)
+    auto sync_inputs = [&](const std::vector<const GpuPoly *> &in_polys, const char *name) -> int
     {
-        cudaError_t err = cudaSetDevice(device);
-        if (err != cudaSuccess)
+        for (const auto *poly : in_polys)
         {
-            cleanup();
-            return set_error(err);
+            int sync_status = sync_poly_partition_streams(poly, name);
+            if (sync_status != 0)
+            {
+                return sync_status;
+            }
+            sync_status = sync_poly_limb_streams(poly, name);
+            if (sync_status != 0)
+            {
+                return sync_status;
+            }
         }
-        err = cudaDeviceSynchronize();
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
+        return 0;
+    };
+    status = sync_inputs(
+        a_inputs,
+        "failed to synchronize A partition/limb streams after gpu_poly_intt in gpu_matrix_sample_p1_full");
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = sync_inputs(
+        b_inputs,
+        "failed to synchronize B partition/limb streams after gpu_poly_intt in gpu_matrix_sample_p1_full");
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = sync_inputs(
+        d_inputs,
+        "failed to synchronize D partition/limb streams after gpu_poly_intt in gpu_matrix_sample_p1_full");
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = sync_inputs(
+        tp2_inputs,
+        "failed to synchronize tp2 partition/limb streams after gpu_poly_intt in gpu_matrix_sample_p1_full");
+    if (status != 0)
+    {
+        cleanup();
+        return status;
     }
 
-    for (size_t idx = 0; idx < out->polys.size(); ++idx)
+    for (size_t idx = 0; idx < out_views.size(); ++idx)
     {
-        GpuPoly *poly = out->polys[idx].get();
+        GpuPoly *poly = out_views[idx];
         if (!poly || poly->ctx != a_mat->ctx || poly->level != level)
         {
             cleanup();
@@ -1634,13 +1727,13 @@ extern "C" int gpu_matrix_sample_p1_full(
         {
             const size_t idx = matrix_index(row, col, cols);
             if (ref_limb_id.x >= tp2_inputs[idx]->poly->GPU.size() ||
-                ref_limb_id.x >= out->polys[idx]->poly->GPU.size())
+                ref_limb_id.x >= out_views[idx]->poly->GPU.size())
             {
                 cleanup();
                 return set_error("unexpected tp2/output limb GPU partition in gpu_matrix_sample_p1_full");
             }
             const auto &tp2_part = tp2_inputs[idx]->poly->GPU[ref_limb_id.x];
-            auto &out_part = out->polys[idx]->poly->GPU[ref_limb_id.x];
+            auto &out_part = out_views[idx]->poly->GPU[ref_limb_id.x];
             if (tp2_part.device != out_part.device)
             {
                 cleanup();
@@ -1718,12 +1811,12 @@ extern "C" int gpu_matrix_sample_p1_full(
             for (size_t col = 0; col < cols; ++col)
             {
                 const size_t idx = matrix_index(row, col, cols);
-                if (limb_id.x >= out->polys[idx]->poly->GPU.size())
+                if (limb_id.x >= out_views[idx]->poly->GPU.size())
                 {
                     cleanup();
                     return set_error("unexpected output limb GPU partition in gpu_matrix_sample_p1_full");
                 }
-                auto &out_part = out->polys[idx]->poly->GPU[limb_id.x];
+                auto &out_part = out_views[idx]->poly->GPU[limb_id.x];
                 if (out_device < 0)
                 {
                     out_device = out_part.device;
@@ -1773,9 +1866,8 @@ extern "C" int gpu_matrix_sample_p1_full(
     }
 
     const int batch = default_batch(out->ctx);
-    for (auto &poly_holder : out->polys)
+    for (auto *poly : out_views)
     {
-        GpuPoly *poly = poly_holder.get();
         status = gpu_poly_ntt(poly, batch);
         if (status != 0)
         {

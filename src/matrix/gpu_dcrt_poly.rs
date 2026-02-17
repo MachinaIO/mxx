@@ -12,11 +12,11 @@ use crate::{
                 gpu_event_set_destroy, gpu_event_set_wait, gpu_matrix_add, gpu_matrix_copy,
                 gpu_matrix_copy_block, gpu_matrix_create, gpu_matrix_decompose_base,
                 gpu_matrix_destroy, gpu_matrix_equal, gpu_matrix_fill_gadget,
-                gpu_matrix_gauss_samp_gq_arb_base, gpu_matrix_intt_all, gpu_matrix_load_rns_batch,
-                gpu_matrix_mul, gpu_matrix_mul_scalar, gpu_matrix_mul_timed, gpu_matrix_ntt_all,
+                gpu_matrix_gauss_samp_gq_arb_base, gpu_matrix_intt_all,
+                gpu_matrix_load_compact_bytes, gpu_matrix_load_rns_batch, gpu_matrix_mul,
+                gpu_matrix_mul_scalar, gpu_matrix_mul_timed, gpu_matrix_ntt_all,
                 gpu_matrix_sample_distribution, gpu_matrix_sample_p1_full,
-                gpu_matrix_store_compact_bytes, gpu_matrix_store_rns_batch,
-                gpu_matrix_load_compact_bytes, gpu_matrix_sub,
+                gpu_matrix_store_compact_bytes, gpu_matrix_store_rns_batch, gpu_matrix_sub,
             },
             params::DCRTPolyParams,
             poly::DCRTPoly,
@@ -702,8 +702,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         };
         let level = level_u32 as usize;
         assert!(level < params.crt_depth(), "invalid compact matrix level: {level}");
-        let expected_bytes_per_coeff =
-            ((max_coeff_bits as usize).div_ceil(8)) as u16;
+        let expected_bytes_per_coeff = ((max_coeff_bits as usize).div_ceil(8)) as u16;
         assert_eq!(
             bytes_per_coeff, expected_bytes_per_coeff,
             "compact bytes_per_coeff mismatch: got {bytes_per_coeff}, expected {expected_bytes_per_coeff}"
@@ -711,18 +710,12 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
 
         let mut out = Self::new_empty_with_state(params, nrow, ncol, level, false);
         let status = unsafe {
-            gpu_matrix_load_compact_bytes(
-                out.raw,
-                payload.as_ptr(),
-                payload.len(),
-                max_coeff_bits,
-            )
+            gpu_matrix_load_compact_bytes(out.raw, payload.as_ptr(), payload.len(), max_coeff_bits)
         };
         check_status(status, "gpu_matrix_load_compact_bytes");
         out.is_ntt = false;
         if format == GPU_POLY_FORMAT_EVAL {
-            let status =
-                unsafe { gpu_matrix_ntt_all(out.raw, out.params.batch() as i32) };
+            let status = unsafe { gpu_matrix_ntt_all(out.raw, out.params.batch() as i32) };
             check_status(status, "gpu_matrix_ntt_all");
             out.is_ntt = true;
         }

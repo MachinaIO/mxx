@@ -31,6 +31,36 @@
         }
     }
 
+    std::vector<GpuPoly *> collect_poly_ptrs(GpuMatrix *mat)
+    {
+        std::vector<GpuPoly *> ptrs;
+        if (!mat)
+        {
+            return ptrs;
+        }
+        ptrs.reserve(mat->polys.size());
+        for (auto &poly : mat->polys)
+        {
+            ptrs.push_back(poly.get());
+        }
+        return ptrs;
+    }
+
+    std::vector<const GpuPoly *> collect_poly_const_ptrs(const GpuMatrix *mat)
+    {
+        std::vector<const GpuPoly *> ptrs;
+        if (!mat)
+        {
+            return ptrs;
+        }
+        ptrs.reserve(mat->polys.size());
+        for (const auto &poly : mat->polys)
+        {
+            ptrs.push_back(poly.get());
+        }
+        return ptrs;
+    }
+
     int sync_poly_limb_streams(const GpuPoly *poly, const char *context)
     {
         if (!poly || !poly->ctx || !poly->poly)

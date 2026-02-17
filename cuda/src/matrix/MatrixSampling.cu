@@ -480,7 +480,7 @@ extern "C" int gpu_matrix_sample_distribution(
 
         for (size_t idx = 0; idx < count; ++idx)
         {
-            GpuPoly *poly = out->polys[idx];
+            GpuPoly *poly = out->polys[idx].get();
             if (!poly || poly->ctx != out->ctx || poly->level != level)
             {
                 return set_error("invalid output poly in gpu_matrix_sample_distribution");
@@ -554,8 +554,9 @@ extern "C" int gpu_matrix_sample_distribution(
     }
 
     const int batch = default_batch(out->ctx);
-    for (auto *poly : out->polys)
+    for (auto &poly_holder : out->polys)
     {
+        GpuPoly *poly = poly_holder.get();
         poly->format = PolyFormat::Coeff;
         int status = gpu_poly_ntt(poly, batch);
         if (status != 0)

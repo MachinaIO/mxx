@@ -282,7 +282,7 @@ extern "C" int gpu_matrix_fill_gadget(
 
         for (size_t idx = 0; idx < count; ++idx)
         {
-            GpuPoly *poly = out->polys[idx];
+            GpuPoly *poly = out->polys[idx].get();
             if (!poly || poly->ctx != out->ctx || poly->level != level)
             {
                 return set_error("invalid output poly in gpu_matrix_fill_gadget");
@@ -358,8 +358,9 @@ extern "C" int gpu_matrix_fill_gadget(
     }
 
     const int batch = default_batch(out->ctx);
-    for (auto *poly : out->polys)
+    for (auto &poly_holder : out->polys)
     {
+        GpuPoly *poly = poly_holder.get();
         poly->format = PolyFormat::Coeff;
         int status = gpu_poly_ntt(poly, batch);
         if (status != 0)
@@ -453,7 +454,7 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
         for (size_t i = 0; i < count; ++i)
         {
             int status = sync_poly_partition_streams(
-                src->polys[i],
+                src->polys[i].get(),
                 "failed to synchronize source partition stream before clone in gpu_matrix_decompose_base");
             if (status != 0)
             {
@@ -461,7 +462,7 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
                 return status;
             }
             status = sync_poly_limb_streams(
-                src->polys[i],
+                src->polys[i].get(),
                 "failed to synchronize source limb stream before clone in gpu_matrix_decompose_base");
             if (status != 0)
             {
@@ -485,8 +486,9 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
             return status;
         }
 
-        for (auto *clone : tmp_inputs_matrix->polys)
+        for (auto &clone_holder : tmp_inputs_matrix->polys)
         {
+            GpuPoly *clone = clone_holder.get();
             status = sync_poly_partition_streams(
                 clone,
                 "failed to synchronize clone partition stream before gpu_poly_intt in gpu_matrix_decompose_base");
@@ -516,7 +518,7 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
     {
         for (size_t i = 0; i < count; ++i)
         {
-            inputs.push_back(src->polys[i]);
+            inputs.push_back(src->polys[i].get());
         }
     }
 
@@ -549,7 +551,7 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
 
     for (size_t idx = 0; idx < out->polys.size(); ++idx)
     {
-        GpuPoly *poly = out->polys[idx];
+        GpuPoly *poly = out->polys[idx].get();
         if (!poly || poly->ctx != src->ctx || poly->level != level)
         {
             cleanup_tmp_inputs();
@@ -814,8 +816,9 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
         }
     }
 
-    for (auto *poly : out->polys)
+    for (auto &poly_holder : out->polys)
     {
+        GpuPoly *poly = poly_holder.get();
         int status = gpu_poly_ntt(poly, batch);
         if (status != 0)
         {

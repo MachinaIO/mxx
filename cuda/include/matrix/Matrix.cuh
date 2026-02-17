@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <vector>
 
 #include "Poly.h"
@@ -12,7 +13,7 @@ struct GpuMatrix
     size_t cols;
     int level;
     PolyFormat format;
-    std::vector<GpuPoly *> polys;
+    std::vector<std::unique_ptr<GpuPoly>> polys;
     struct SharedLimbBuffer
     {
         int device;

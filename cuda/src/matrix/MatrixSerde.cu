@@ -11,8 +11,9 @@ extern "C" int gpu_matrix_load_rns_batch(
     }
     *out_events = nullptr;
     const size_t count = mat->rows * mat->cols;
+    auto mat_polys = collect_poly_ptrs(mat);
     int status = gpu_poly_load_rns_batch(
-        mat->polys.data(),
+        mat_polys.data(),
         count,
         bytes,
         bytes_per_poly,
@@ -43,7 +44,7 @@ extern "C" int gpu_matrix_load_rns_batch(
 
     for (size_t idx = 0; idx < count; ++idx)
     {
-        GpuPoly *poly = mat->polys[idx];
+        GpuPoly *poly = mat->polys[idx].get();
         if (!poly || !poly->poly)
         {
             gpu_event_set_destroy(event_set);
@@ -159,8 +160,9 @@ extern "C" int gpu_matrix_store_rns_batch(
         return status;
     }
 
+    auto clone_polys = collect_poly_ptrs(clones);
     status = gpu_poly_store_rns_batch(
-        clones->polys.data(),
+        clone_polys.data(),
         count,
         bytes_out,
         bytes_per_poly,

@@ -62,8 +62,9 @@ namespace
         {
             return;
         }
-        for (auto *poly : mat->polys)
+        for (const auto &poly_holder : mat->polys)
         {
+            GpuPoly *poly = poly_holder.get();
             if (!poly || !poly->poly)
             {
                 continue;
@@ -82,9 +83,9 @@ namespace
             return;
         }
         detach_matrix_shared_aux_buffers(mat);
-        for (auto *poly : mat->polys)
+        for (auto &poly_holder : mat->polys)
         {
-            gpu_poly_destroy(poly);
+            gpu_poly_destroy(poly_holder.release());
         }
         mat->polys.clear();
         free_matrix_shared_buffers(mat);
@@ -387,7 +388,7 @@ extern "C" int gpu_matrix_create(
             words_used[partition_idx] = offset_words + poly_words;
         }
 
-        mat->polys.push_back(poly);
+        mat->polys.emplace_back(poly);
     }
     *out = mat;
     return 0;
@@ -421,7 +422,7 @@ extern "C" int gpu_matrix_copy(GpuMatrix *dst, const GpuMatrix *src)
     const size_t count = src->rows * src->cols;
     for (size_t i = 0; i < count; ++i)
     {
-        int status = gpu_poly_copy(dst->polys[i], src->polys[i]);
+        int status = gpu_poly_copy(dst->polys[i].get(), src->polys[i].get());
         if (status != 0)
         {
             return status;
@@ -448,7 +449,7 @@ extern "C" int gpu_matrix_entry_clone(
         return set_error("index out of bounds in gpu_matrix_entry_clone");
     }
     const size_t idx = matrix_index(row, col, mat->cols);
-    return gpu_poly_clone_async(mat->polys[idx], out_poly, out_events);
+    return gpu_poly_clone_async(mat->polys[idx].get(), out_poly, out_events);
 }
 
 extern "C" int gpu_matrix_copy_entry(
@@ -470,7 +471,7 @@ extern "C" int gpu_matrix_copy_entry(
         return set_error("context mismatch in gpu_matrix_copy_entry");
     }
     const size_t idx = matrix_index(row, col, mat->cols);
-    return gpu_poly_copy(mat->polys[idx], src);
+    return gpu_poly_copy(mat->polys[idx].get(), src);
 }
 
 extern "C" int gpu_matrix_copy_block(
@@ -541,7 +542,7 @@ extern "C" int gpu_matrix_copy_block(
     for (int limb = 0; limb <= level; ++limb)
     {
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        const GpuPoly *src_poly0 = src->polys[src_indices[0]];
+        const GpuPoly *src_poly0 = src->polys[src_indices[0]].get();
         if (!src_poly0)
         {
             return set_error("null source polynomial in gpu_matrix_copy_block");

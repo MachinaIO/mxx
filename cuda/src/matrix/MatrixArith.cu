@@ -804,8 +804,8 @@ namespace
 
         for (size_t i = 0; i < count; ++i)
         {
-            const GpuPoly *src_poly = src->polys[src_indices[i]];
-            GpuPoly *dst_poly = out->polys[dst_indices[i]];
+            const GpuPoly *src_poly = src->polys[src_indices[i]].get();
+            GpuPoly *dst_poly = out->polys[dst_indices[i]].get();
             if (!src_poly || !dst_poly)
             {
                 return set_error("null polynomial in launch_copy_for_limb");
@@ -1483,10 +1483,13 @@ extern "C" int gpu_matrix_add(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
         return set_error("context mismatch in gpu_matrix_add");
     }
     const size_t count = lhs->rows * lhs->cols;
+    auto out_polys = collect_poly_ptrs(out);
+    auto lhs_polys = collect_poly_const_ptrs(lhs);
+    auto rhs_polys = collect_poly_const_ptrs(rhs);
     int status = gpu_block_add(
-        out->polys.data(),
-        const_cast<const GpuPoly *const *>(lhs->polys.data()),
-        const_cast<const GpuPoly *const *>(rhs->polys.data()),
+        out_polys.data(),
+        lhs_polys.data(),
+        rhs_polys.data(),
         count);
     if (status != 0)
     {
@@ -1516,10 +1519,13 @@ extern "C" int gpu_matrix_sub(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
         return set_error("context mismatch in gpu_matrix_sub");
     }
     const size_t count = lhs->rows * lhs->cols;
+    auto out_polys = collect_poly_ptrs(out);
+    auto lhs_polys = collect_poly_const_ptrs(lhs);
+    auto rhs_polys = collect_poly_const_ptrs(rhs);
     int status = gpu_block_sub(
-        out->polys.data(),
-        const_cast<const GpuPoly *const *>(lhs->polys.data()),
-        const_cast<const GpuPoly *const *>(rhs->polys.data()),
+        out_polys.data(),
+        lhs_polys.data(),
+        rhs_polys.data(),
         count);
     if (status != 0)
     {
@@ -1548,10 +1554,13 @@ extern "C" int gpu_matrix_mul(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     {
         return set_error("context mismatch in gpu_matrix_mul");
     }
+    auto out_polys = collect_poly_ptrs(out);
+    auto lhs_polys = collect_poly_const_ptrs(lhs);
+    auto rhs_polys = collect_poly_const_ptrs(rhs);
     int status = gpu_block_mul(
-        out->polys.data(),
-        const_cast<const GpuPoly *const *>(lhs->polys.data()),
-        const_cast<const GpuPoly *const *>(rhs->polys.data()),
+        out_polys.data(),
+        lhs_polys.data(),
+        rhs_polys.data(),
         lhs->rows,
         lhs->cols,
         rhs->cols);
@@ -1589,7 +1598,7 @@ extern "C" int gpu_matrix_equal(const GpuMatrix *lhs, const GpuMatrix *rhs, int 
     for (size_t i = 0; i < count; ++i)
     {
         int poly_equal = 0;
-        int status = gpu_poly_equal(lhs->polys[i], rhs->polys[i], &poly_equal);
+        int status = gpu_poly_equal(lhs->polys[i].get(), rhs->polys[i].get(), &poly_equal);
         if (status != 0)
         {
             return status;
@@ -1631,10 +1640,13 @@ extern "C" int gpu_matrix_mul_timed(
     {
         return set_error("context mismatch in gpu_matrix_mul_timed");
     }
+    auto out_polys = collect_poly_ptrs(out);
+    auto lhs_polys = collect_poly_const_ptrs(lhs);
+    auto rhs_polys = collect_poly_const_ptrs(rhs);
     int status = gpu_block_mul_timed(
-        out->polys.data(),
-        const_cast<const GpuPoly *const *>(lhs->polys.data()),
-        const_cast<const GpuPoly *const *>(rhs->polys.data()),
+        out_polys.data(),
+        lhs_polys.data(),
+        rhs_polys.data(),
         lhs->rows,
         lhs->cols,
         rhs->cols,
@@ -1670,10 +1682,12 @@ extern "C" int gpu_matrix_mul_scalar(
     }
 
     const size_t count = lhs->rows * lhs->cols;
+    auto out_polys = collect_poly_ptrs(out);
+    auto lhs_polys = collect_poly_const_ptrs(lhs);
     std::vector<const GpuPoly *> rhs(count, scalar);
     int status = gpu_block_entrywise_mul(
-        out->polys.data(),
-        const_cast<const GpuPoly *const *>(lhs->polys.data()),
+        out_polys.data(),
+        lhs_polys.data(),
         rhs.data(),
         count);
     if (status != 0)

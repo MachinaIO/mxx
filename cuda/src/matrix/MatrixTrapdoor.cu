@@ -1007,7 +1007,7 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         for (size_t i = 0; i < count; ++i)
         {
             int sync_status = sync_poly_partition_streams(
-                src->polys[i],
+                src->polys[i].get(),
                 "failed to synchronize source partition stream in gpu_matrix_gauss_samp_gq_arb_base");
             if (sync_status != 0)
             {
@@ -1015,7 +1015,7 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                 return sync_status;
             }
             sync_status = sync_poly_limb_streams(
-                src->polys[i],
+                src->polys[i].get(),
                 "failed to synchronize source limb stream in gpu_matrix_gauss_samp_gq_arb_base");
             if (sync_status != 0)
             {
@@ -1039,8 +1039,9 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
             return status;
         }
 
-        for (auto *clone : tmp_inputs_matrix->polys)
+        for (auto &clone_holder : tmp_inputs_matrix->polys)
         {
+            GpuPoly *clone = clone_holder.get();
             int sync_status = sync_poly_partition_streams(
                 clone,
                 "failed to synchronize clone partition stream in gpu_matrix_gauss_samp_gq_arb_base");
@@ -1070,7 +1071,7 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
     {
         for (size_t i = 0; i < count; ++i)
         {
-            inputs.push_back(src->polys[i]);
+            inputs.push_back(src->polys[i].get());
         }
     }
 
@@ -1102,7 +1103,7 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
 
     for (size_t idx = 0; idx < out->polys.size(); ++idx)
     {
-        GpuPoly *poly = out->polys[idx];
+        GpuPoly *poly = out->polys[idx].get();
         if (!poly || poly->ctx != src->ctx || poly->level != level)
         {
             cleanup_tmp_inputs();
@@ -1355,8 +1356,9 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         }
     }
 
-    for (auto *poly : out->polys)
+    for (auto &poly_holder : out->polys)
     {
+        GpuPoly *poly = poly_holder.get();
         int status = gpu_poly_ntt(poly, batch);
         if (status != 0)
         {
@@ -1499,8 +1501,9 @@ extern "C" int gpu_matrix_sample_p1_full(
                 *owned = nullptr;
                 return status;
             }
-            for (auto *clone : (*owned)->polys)
+            for (auto &clone_holder : (*owned)->polys)
             {
+                GpuPoly *clone = clone_holder.get();
                 status = gpu_poly_intt(clone, batch);
                 if (status != 0)
                 {
@@ -1515,7 +1518,7 @@ extern "C" int gpu_matrix_sample_p1_full(
         {
             for (size_t i = 0; i < count; ++i)
             {
-                inputs.push_back(src->polys[i]);
+                inputs.push_back(src->polys[i].get());
             }
         }
         return 0;
@@ -1565,7 +1568,7 @@ extern "C" int gpu_matrix_sample_p1_full(
 
     for (size_t idx = 0; idx < out->polys.size(); ++idx)
     {
-        GpuPoly *poly = out->polys[idx];
+        GpuPoly *poly = out->polys[idx].get();
         if (!poly || poly->ctx != a_mat->ctx || poly->level != level)
         {
             cleanup();
@@ -1770,8 +1773,9 @@ extern "C" int gpu_matrix_sample_p1_full(
     }
 
     const int batch = default_batch(out->ctx);
-    for (auto *poly : out->polys)
+    for (auto &poly_holder : out->polys)
     {
+        GpuPoly *poly = poly_holder.get();
         status = gpu_poly_ntt(poly, batch);
         if (status != 0)
         {

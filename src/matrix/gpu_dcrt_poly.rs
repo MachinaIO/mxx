@@ -158,7 +158,7 @@ impl GpuDCRTPolyMatrix {
         }
         let total = nrow.saturating_mul(ncol);
         let bytes = vec![0u8; total.saturating_mul(bytes_per_poly)];
-        out.load_rns_bytes(&bytes, bytes_per_poly);
+        out.load_rns_bytes(&bytes, bytes_per_poly, GPU_POLY_FORMAT_EVAL);
         out
     }
 
@@ -282,7 +282,7 @@ impl GpuDCRTPolyMatrix {
         out
     }
 
-    fn store_rns_bytes(&self, bytes_out: &mut [u8], bytes_per_poly: usize) {
+    fn store_rns_bytes(&self, bytes_out: &mut [u8], bytes_per_poly: usize, format: i32) {
         if bytes_out.is_empty() || bytes_per_poly == 0 {
             return;
         }
@@ -292,7 +292,7 @@ impl GpuDCRTPolyMatrix {
                 self.raw,
                 bytes_out.as_mut_ptr(),
                 bytes_per_poly,
-                GPU_POLY_FORMAT_EVAL,
+                format,
                 &mut events as *mut *mut GpuEventSetOpaque,
             )
         };
@@ -304,7 +304,7 @@ impl GpuDCRTPolyMatrix {
         }
     }
 
-    fn load_rns_bytes(&mut self, bytes: &[u8], bytes_per_poly: usize) {
+    fn load_rns_bytes(&mut self, bytes: &[u8], bytes_per_poly: usize, format: i32) {
         if bytes.is_empty() || bytes_per_poly == 0 {
             return;
         }
@@ -313,7 +313,7 @@ impl GpuDCRTPolyMatrix {
                 self.raw,
                 bytes.as_ptr(),
                 bytes_per_poly,
-                GPU_POLY_FORMAT_EVAL,
+                format,
             )
         };
         check_status(status, "gpu_matrix_load_rns_batch");
@@ -339,7 +339,7 @@ impl GpuDCRTPolyMatrix {
         }
         let total = self.nrow.saturating_mul(self.ncol);
         let mut bytes = vec![0u8; total.saturating_mul(bytes_per_poly)];
-        self.store_rns_bytes(&mut bytes, bytes_per_poly);
+        self.store_rns_bytes(&mut bytes, bytes_per_poly, GPU_POLY_FORMAT_EVAL);
         let level = cpu_params.crt_depth().saturating_sub(1);
         let n = cpu_params.ring_dimension() as usize;
         let expected_len = (level + 1).saturating_mul(n);
@@ -421,7 +421,7 @@ impl GpuDCRTPolyMatrix {
         });
 
         let mut out = Self::new_empty(params, nrow, ncol);
-        out.load_rns_bytes(&bytes, bytes_per_poly);
+        out.load_rns_bytes(&bytes, bytes_per_poly, GPU_POLY_FORMAT_EVAL);
         out
     }
 
@@ -529,7 +529,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         let bytes_per_poly = rns_bytes_len(&self.params);
         let total = self.nrow.saturating_mul(self.ncol);
         let mut bytes = vec![0u8; total.saturating_mul(bytes_per_poly)];
-        self.store_rns_bytes(&mut bytes, bytes_per_poly);
+        self.store_rns_bytes(&mut bytes, bytes_per_poly, GPU_POLY_FORMAT_EVAL);
 
         let entries = (0..self.nrow)
             .map(|row| {
@@ -570,7 +570,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             }
         }
         let mut out = Self::new_empty(params, nrow, ncol);
-        out.load_rns_bytes(&flat, bytes_per_poly);
+        out.load_rns_bytes(&flat, bytes_per_poly, GPU_POLY_FORMAT_EVAL);
         out
     }
 
@@ -602,7 +602,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             GPU_POLY_FORMAT_EVAL,
         );
         let mut out = Self::new_empty(params, nrow, ncol);
-        out.load_rns_bytes(&bytes, bytes_per_poly);
+        out.load_rns_bytes(&bytes, bytes_per_poly, GPU_POLY_FORMAT_EVAL);
         out
     }
 
@@ -676,7 +676,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
                 bytes[start..end].copy_from_slice(&scalar_bytes);
             }
         }
-        out.load_rns_bytes(&bytes, bytes_per_poly);
+        out.load_rns_bytes(&bytes, bytes_per_poly, GPU_POLY_FORMAT_EVAL);
         out
     }
 
@@ -890,7 +890,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
                     }
                 }
                 let mut block = Self::new_empty(params, rows_len, cols_len);
-                block.load_rns_bytes(&flat, bytes_per_poly);
+                block.load_rns_bytes(&flat, bytes_per_poly, GPU_POLY_FORMAT_EVAL);
                 matrix.copy_block_from(&block, rows.start, cols.start, 0, 0, rows_len, cols_len);
             }
         }

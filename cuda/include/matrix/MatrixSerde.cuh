@@ -1,6 +1,6 @@
 #pragma once
 
-#include "Poly.h"
+#include "matrix/Matrix.cuh"
 
 #ifdef __cplusplus
 extern "C"

@@ -986,7 +986,7 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
     }
     if (count == 0)
     {
-        out->format = PolyFormat::Eval;
+        out->format = GPU_POLY_FORMAT_EVAL;
         return 0;
     }
 
@@ -1011,10 +1011,10 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
     }
 
     const int batch = default_batch(src->ctx);
-    if (src->format == PolyFormat::Eval)
+    if (src->format == GPU_POLY_FORMAT_EVAL)
     {
         const int matrix_format =
-            src->format == PolyFormat::Eval ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
+            src->format == GPU_POLY_FORMAT_EVAL ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
         status = gpu_matrix_create(src->ctx, level, rows, cols, matrix_format, &tmp_inputs_matrix);
         if (status != 0)
         {
@@ -1276,14 +1276,14 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         }
     }
 
-    out->format = PolyFormat::Coeff;
+    out->format = GPU_POLY_FORMAT_COEFF;
     status = gpu_matrix_ntt_all(out, batch);
     if (status != 0)
     {
         cleanup_tmp_inputs();
         return status;
     }
-    out->format = PolyFormat::Eval;
+    out->format = GPU_POLY_FORMAT_EVAL;
 
     cleanup_tmp_inputs();
     return 0;
@@ -1335,7 +1335,7 @@ extern "C" int gpu_matrix_sample_p1_full(
     }
     if (cols == 0 || d_rows == 0)
     {
-        out->format = PolyFormat::Eval;
+        out->format = GPU_POLY_FORMAT_EVAL;
         return 0;
     }
 
@@ -1397,10 +1397,10 @@ extern "C" int gpu_matrix_sample_p1_full(
     {
         *owned = nullptr;
         *coeff_input = src;
-        if (src->format == PolyFormat::Eval)
+        if (src->format == GPU_POLY_FORMAT_EVAL)
         {
             const int matrix_format =
-                src->format == PolyFormat::Eval ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
+                src->format == GPU_POLY_FORMAT_EVAL ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
             int status = gpu_matrix_create(
                 src->ctx,
                 src->level,
@@ -1472,7 +1472,7 @@ extern "C" int gpu_matrix_sample_p1_full(
         return status;
     }
 
-    out->format = PolyFormat::Coeff;
+    out->format = GPU_POLY_FORMAT_COEFF;
 
     const dim3 ref_limb_id = limb_map[0];
     int ref_device = -1;
@@ -1628,7 +1628,7 @@ extern "C" int gpu_matrix_sample_p1_full(
         cleanup();
         return status;
     }
-    out->format = PolyFormat::Eval;
+    out->format = GPU_POLY_FORMAT_EVAL;
 
     cleanup();
     return 0;

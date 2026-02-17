@@ -17,12 +17,8 @@ fn main() {
 
     if env::var("CARGO_FEATURE_GPU").is_ok() {
         println!("cargo::rerun-if-changed=gpu-setup.sh");
-        println!("cargo::rerun-if-changed=cuda/src/poly/Poly.cu");
         println!("cargo::rerun-if-changed=cuda/src/Runtime.cu");
         println!("cargo::rerun-if-changed=cuda/src/ChaCha.cu");
-        println!("cargo::rerun-if-changed=cuda/src/poly/PolyUtils.cu");
-        println!("cargo::rerun-if-changed=cuda/src/poly/PolySerdeRns.cu");
-        println!("cargo::rerun-if-changed=cuda/src/poly/PolyOps.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/Matrix.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixUtils.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixNTT.cu");
@@ -33,13 +29,13 @@ fn main() {
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixTrapdoor.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSerde.cu");
         println!("cargo::rerun-if-changed=cuda/include/Runtime.cuh");
-        println!("cargo::rerun-if-changed=cuda/include/Poly.h");
         println!("cargo::rerun-if-changed=cuda/include/ChaCha.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/Matrix.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixUtils.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixData.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixArith.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixDecompose.cuh");
+        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixNTT.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixSampling.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixTrapdoor.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixSerde.cuh");
@@ -118,7 +114,6 @@ fn main() {
         build
             .cuda(true)
             .file("cuda/src/Runtime.cu")
-            .file("cuda/src/poly/Poly.cu")
             .file("cuda/src/matrix/Matrix.cu")
             .include("cuda/include")
             .include(&fides_include)

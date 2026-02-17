@@ -80,7 +80,7 @@ extern "C" int gpu_matrix_create(
         return set_error("invalid gpu_matrix_create arguments");
     }
     *out = nullptr;
-    PolyFormat fmt;
+    GpuPolyFormat fmt;
     if (!parse_format(format, fmt))
     {
         return set_error("invalid format in gpu_matrix_create");

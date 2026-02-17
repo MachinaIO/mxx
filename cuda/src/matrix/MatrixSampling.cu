@@ -428,7 +428,7 @@ extern "C" int gpu_matrix_sample_distribution(
     const size_t count = out->rows * out->cols;
     if (count == 0)
     {
-        out->format = PolyFormat::Eval;
+        out->format = GPU_POLY_FORMAT_EVAL;
         return 0;
     }
 
@@ -539,12 +539,12 @@ extern "C" int gpu_matrix_sample_distribution(
         }
     }
 
-    out->format = PolyFormat::Coeff;
+    out->format = GPU_POLY_FORMAT_COEFF;
     status = gpu_matrix_ntt_all(out, default_batch(out->ctx));
     if (status != 0)
     {
         return status;
     }
-    out->format = PolyFormat::Eval;
+    out->format = GPU_POLY_FORMAT_EVAL;
     return 0;
 }

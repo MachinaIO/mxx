@@ -31,12 +31,6 @@ pub(crate) struct GpuContextOpaque {
 
 #[allow(non_camel_case_types)]
 #[repr(C)]
-pub(crate) struct GpuPolyOpaque {
-    _private: [u8; 0],
-}
-
-#[allow(non_camel_case_types)]
-#[repr(C)]
 pub(crate) struct GpuMatrixOpaque {
     _private: [u8; 0],
 }
@@ -62,82 +56,8 @@ unsafe extern "C" {
     fn gpu_context_destroy(ctx: *mut GpuContextOpaque);
     fn gpu_context_get_N(ctx: *const GpuContextOpaque, out_n: *mut c_int) -> c_int;
 
-    fn gpu_poly_create(
-        ctx: *mut GpuContextOpaque,
-        level: c_int,
-        out_poly: *mut *mut GpuPolyOpaque,
-    ) -> c_int;
-    pub(crate) fn gpu_poly_destroy(poly: *mut GpuPolyOpaque);
-    fn gpu_poly_clone_async(
-        src: *const GpuPolyOpaque,
-        out_poly: *mut *mut GpuPolyOpaque,
-        out_events: *mut *mut GpuEventSetOpaque,
-    ) -> c_int;
-
-    fn gpu_poly_load_rns(
-        poly: *mut GpuPolyOpaque,
-        rns_flat: *const u64,
-        rns_len: usize,
-        format: c_int,
-    ) -> c_int;
-    fn gpu_poly_store_rns_batch(
-        polys: *const *mut GpuPolyOpaque,
-        poly_count: usize,
-        bytes_out: *mut u8,
-        bytes_per_poly: usize,
-        format: c_int,
-        out_events: *mut *mut GpuEventSetOpaque,
-    ) -> c_int;
-    fn gpu_poly_store_compact_bytes(
-        poly: *mut GpuPolyOpaque,
-        payload_out: *mut u8,
-        payload_capacity: usize,
-        out_max_coeff_bits: *mut u16,
-        out_bytes_per_coeff: *mut u16,
-        out_payload_len: *mut usize,
-    ) -> c_int;
-    fn gpu_poly_load_compact_bytes(
-        poly: *mut GpuPolyOpaque,
-        payload: *const u8,
-        payload_len: usize,
-        max_coeff_bits: u16,
-    ) -> c_int;
-    fn gpu_poly_store_coeffs_words(
-        poly: *mut GpuPolyOpaque,
-        coeff_words_out: *mut u64,
-        coeff_words_len: usize,
-        words_per_coeff: usize,
-        format: c_int,
-    ) -> c_int;
     pub(crate) fn gpu_event_set_wait(events: *mut GpuEventSetOpaque) -> c_int;
     pub(crate) fn gpu_event_set_destroy(events: *mut GpuEventSetOpaque);
-
-    fn gpu_poly_add(
-        out: *mut GpuPolyOpaque,
-        a: *const GpuPolyOpaque,
-        b: *const GpuPolyOpaque,
-    ) -> c_int;
-    fn gpu_poly_sub(
-        out: *mut GpuPolyOpaque,
-        a: *const GpuPolyOpaque,
-        b: *const GpuPolyOpaque,
-    ) -> c_int;
-    fn gpu_poly_mul(
-        out: *mut GpuPolyOpaque,
-        a: *const GpuPolyOpaque,
-        b: *const GpuPolyOpaque,
-    ) -> c_int;
-    fn gpu_poly_equal(
-        lhs: *const GpuPolyOpaque,
-        rhs: *const GpuPolyOpaque,
-        out_equal: *mut c_int,
-    ) -> c_int;
-    fn gpu_poly_decompose_base(
-        src: *const GpuPolyOpaque,
-        base_bits: u32,
-        out_polys: *const *mut GpuPolyOpaque,
-        out_count: usize,
-    ) -> c_int;
 
     pub(crate) fn gpu_matrix_create(
         ctx: *mut GpuContextOpaque,
@@ -237,9 +157,6 @@ unsafe extern "C" {
     ) -> c_int;
     pub(crate) fn gpu_matrix_ntt_all(mat: *mut GpuMatrixOpaque, batch: c_int) -> c_int;
     pub(crate) fn gpu_matrix_intt_all(mat: *mut GpuMatrixOpaque, batch: c_int) -> c_int;
-
-    pub(crate) fn gpu_poly_ntt(poly: *mut GpuPolyOpaque, batch: c_int) -> c_int;
-    pub(crate) fn gpu_poly_intt(poly: *mut GpuPolyOpaque, batch: c_int) -> c_int;
     fn gpu_device_synchronize() -> c_int;
     fn gpu_device_count(out_count: *mut c_int) -> c_int;
     // fn gpu_device_mem_info(device: c_int, out_free: *mut usize, out_total: *mut usize) -> c_int;
@@ -256,12 +173,6 @@ pub(crate) const GPU_MATRIX_DIST_UNIFORM: c_int = 0;
 pub(crate) const GPU_MATRIX_DIST_GAUSS: c_int = 1;
 pub(crate) const GPU_MATRIX_DIST_BIT: c_int = 2;
 pub(crate) const GPU_MATRIX_DIST_TERNARY: c_int = 3;
-
-const GPU_COMPACT_MAGIC: [u8; 4] = *b"GCB4";
-const GPU_COMPACT_VERSION: u8 = 4;
-const GPU_COMPACT_FORMAT_COEFF: u8 = 0;
-const GPU_COMPACT_FORMAT_EVAL: u8 = 1;
-const GPU_COMPACT_HEADER_LEN: usize = 10;
 
 pub(crate) fn last_error_string() -> String {
     unsafe {
@@ -421,64 +332,9 @@ fn bits_in_u64(value: u64) -> usize {
 }
 
 #[inline(always)]
-fn coeff_words_per_coeff_upper(moduli: &[u64], level: usize) -> usize {
-    assert!(level < moduli.len(), "invalid level {} for modulus count {}", level, moduli.len());
-    moduli.iter().take(level + 1).map(|m| bits_in_u64(*m)).sum::<usize>().div_ceil(64).max(1)
-}
-
-#[inline(always)]
-fn biguint_from_u64_words_le(words: &[u64]) -> BigUint {
-    if words.is_empty() {
-        return BigUint::ZERO;
-    }
-    let mut digits = Vec::with_capacity(words.len() * 2);
-    for &word in words {
-        digits.push((word & 0xFFFF_FFFF) as u32);
-        digits.push((word >> 32) as u32);
-    }
-    while digits.last().copied() == Some(0) {
-        digits.pop();
-    }
-    if digits.is_empty() { BigUint::ZERO } else { BigUint::new(digits) }
-}
-
 fn log2_u32(value: u32) -> u32 {
     assert!(value.is_power_of_two(), "ring_dimension must be a power of 2");
     value.trailing_zeros()
-}
-
-fn parse_gpu_compact_header(bytes: &[u8]) -> (usize, usize, c_int) {
-    assert!(
-        bytes.len() >= GPU_COMPACT_HEADER_LEN,
-        "compact bytes too short for GPU header (got {}, need at least {})",
-        bytes.len(),
-        GPU_COMPACT_HEADER_LEN
-    );
-    assert!(
-        bytes[0..4] == GPU_COMPACT_MAGIC,
-        "invalid GPU compact magic: expected {:?}, got {:?}",
-        GPU_COMPACT_MAGIC,
-        &bytes[0..4]
-    );
-    let version = bytes[4];
-    assert_eq!(
-        version, GPU_COMPACT_VERSION,
-        "unsupported GPU compact version: got {}, expected {}",
-        version, GPU_COMPACT_VERSION
-    );
-    let format = match bytes[5] {
-        GPU_COMPACT_FORMAT_COEFF => GPU_POLY_FORMAT_COEFF,
-        GPU_COMPACT_FORMAT_EVAL => GPU_POLY_FORMAT_EVAL,
-        other => panic!("unsupported GPU compact format: {other}"),
-    };
-    let max_coeff_bits = u16::from_le_bytes([bytes[6], bytes[7]]) as usize;
-    let bytes_per_coeff = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
-    (max_coeff_bits, bytes_per_coeff, format)
-}
-
-#[inline(always)]
-fn packed_coeff_bytes_len(ring_dimension: usize, max_coeff_bits: usize) -> usize {
-    ring_dimension.saturating_mul(max_coeff_bits).div_ceil(8)
 }
 
 #[derive(Clone)]
@@ -720,11 +576,6 @@ unsafe impl Send for GpuDCRTPoly {}
 unsafe impl Sync for GpuDCRTPoly {}
 
 impl GpuDCRTPoly {
-    pub(crate) fn new_empty(params: Arc<GpuDCRTPolyParams>, level: usize, is_ntt: bool) -> Self {
-        let inner = GpuDCRTPolyMatrix::new_empty_with_state(params.as_ref(), 1, 1, level, is_ntt);
-        Self { inner }
-    }
-
     pub(crate) fn from_inner(inner: GpuDCRTPolyMatrix) -> Self {
         inner.assert_singleton();
         Self { inner }
@@ -828,77 +679,6 @@ impl GpuDCRTPoly {
         assert_eq!(self.level(), other.level(), "GPU polynomials must have the same level");
         assert_eq!(self.params_ref(), other.params_ref(), "GPU params must match");
     }
-
-    // pub(crate) fn add_into(out: &mut GpuDCRTPoly, a: &GpuDCRTPoly, b: &GpuDCRTPoly) {
-    //     a.assert_compatible(b);
-    //     assert_eq!(out.level, a.level, "GPU polynomials must have the same level");
-    //     assert_eq!(out.params.as_ref(), a.params.as_ref(), "GPU params must match");
-    //     let status = unsafe { gpu_poly_add(out.raw, a.raw, b.raw) };
-    //     check_status(status, "gpu_poly_add");
-    //     out.is_ntt = a.is_ntt;
-    // }
-
-    // pub(crate) fn block_entrywise_mul_into(
-    //     out: &mut [GpuDCRTPoly],
-    //     a: &[GpuDCRTPoly],
-    //     b: &[GpuDCRTPoly],
-    // ) {
-    //     Self::block_op_into(out, a, b, gpu_block_entrywise_mul, "gpu_block_entrywise_mul");
-    // }
-
-    // pub(crate) fn block_mul_into_refs(
-    //     out: &mut [GpuDCRTPoly],
-    //     a: &[&GpuDCRTPoly],
-    //     b: &[&GpuDCRTPoly],
-    // ) {
-    //     assert_eq!(out.len(), a.len(), "GPU block op requires equal lengths");
-    //     assert_eq!(out.len(), b.len(), "GPU block op requires equal lengths");
-    //     if out.is_empty() {
-    //         return;
-    //     }
-
-    //     debug_assert!(
-    //         a.iter().zip(b.iter()).all(|(lhs, rhs)| {
-    //             lhs.level == rhs.level &&
-    //                 lhs.params.as_ref() == rhs.params.as_ref() &&
-    //                 lhs.is_ntt == rhs.is_ntt
-    //         }),
-    //         "GPU block op requires compatible inputs"
-    //     );
-
-    //     let out_ptrs = out.iter_mut().map(|poly| poly.raw).collect::<Vec<_>>();
-    //     let lhs_ptrs = a.iter().map(|poly| poly.raw as *const GpuPolyOpaque).collect::<Vec<_>>();
-    //     let rhs_ptrs = b.iter().map(|poly| poly.raw as *const GpuPolyOpaque).collect::<Vec<_>>();
-
-    //     let status = unsafe {
-    //         gpu_block_entrywise_mul(
-    //             out_ptrs.as_ptr(),
-    //             lhs_ptrs.as_ptr(),
-    //             rhs_ptrs.as_ptr(),
-    //             out.len(),
-    //         )
-    //     };
-    //     check_status(status, "gpu_block_entrywise_mul");
-
-    //     let is_ntt = a[0].is_ntt;
-    //     let level = a[0].level;
-    //     for poly in out.iter_mut() {
-    //         poly.is_ntt = is_ntt;
-    //         poly.level = level;
-    //     }
-    // }
-
-    // pub(crate) fn add_in_place(&mut self, rhs: &GpuDCRTPoly) {
-    //     self.assert_compatible(rhs);
-    //     let status = unsafe { gpu_poly_add(self.raw, self.raw, rhs.raw) };
-    //     check_status(status, "gpu_poly_add");
-    // }
-
-    // pub(crate) fn sub_in_place(&mut self, rhs: &GpuDCRTPoly) {
-    //     self.assert_compatible(rhs);
-    //     let status = unsafe { gpu_poly_sub(self.raw, self.raw, rhs.raw) };
-    //     check_status(status, "gpu_poly_sub");
-    // }
 
     fn constant_with_value(params: &Arc<GpuDCRTPolyParams>, value: &BigUint) -> Self {
         let n = params.ring_dimension as usize;

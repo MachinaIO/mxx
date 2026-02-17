@@ -1,6 +1,6 @@
 #pragma once
 
-#include "Poly.h"
+#include "matrix/Matrix.cuh"
 
 int launch_sample_distribution_multi_limb_kernel(
     const std::vector<uint64_t *> &dst_ptrs,

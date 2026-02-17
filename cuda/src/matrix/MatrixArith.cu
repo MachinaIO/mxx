@@ -1482,7 +1482,7 @@ extern "C" int gpu_matrix_add(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     const size_t count = lhs->rows * lhs->cols;
     if (count == 0)
     {
-        out->format = PolyFormat::Eval;
+        out->format = GPU_POLY_FORMAT_EVAL;
         return 0;
     }
 
@@ -1495,7 +1495,7 @@ extern "C" int gpu_matrix_add(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     const int N = lhs->ctx->N;
     if (N <= 0)
     {
-        out->format = PolyFormat::Eval;
+        out->format = GPU_POLY_FORMAT_EVAL;
         return 0;
     }
 
@@ -1523,7 +1523,7 @@ extern "C" int gpu_matrix_add(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
         }
     }
 
-    out->format = PolyFormat::Eval;
+    out->format = GPU_POLY_FORMAT_EVAL;
     return 0;
 }
 
@@ -1622,7 +1622,7 @@ extern "C" int gpu_matrix_mul(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     {
         return set_error("null context in gpu_matrix_mul");
     }
-    if (lhs->format != PolyFormat::Eval || rhs->format != PolyFormat::Eval)
+    if (lhs->format != GPU_POLY_FORMAT_EVAL || rhs->format != GPU_POLY_FORMAT_EVAL)
     {
         return set_error("gpu_matrix_mul requires Eval format");
     }
@@ -1635,7 +1635,7 @@ extern "C" int gpu_matrix_mul(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     const int N = lhs->ctx->N;
     if (N <= 0)
     {
-        out->format = PolyFormat::Eval;
+        out->format = GPU_POLY_FORMAT_EVAL;
         return 0;
     }
 
@@ -1665,7 +1665,7 @@ extern "C" int gpu_matrix_mul(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
         }
     }
 
-    out->format = PolyFormat::Eval;
+    out->format = GPU_POLY_FORMAT_EVAL;
     return 0;
 }
 
@@ -1773,7 +1773,7 @@ extern "C" int gpu_matrix_mul_timed(
     {
         return set_error("null context in gpu_matrix_mul_timed");
     }
-    if (lhs->format != PolyFormat::Eval || rhs->format != PolyFormat::Eval)
+    if (lhs->format != GPU_POLY_FORMAT_EVAL || rhs->format != GPU_POLY_FORMAT_EVAL)
     {
         return set_error("gpu_matrix_mul_timed requires Eval format");
     }
@@ -1786,7 +1786,7 @@ extern "C" int gpu_matrix_mul_timed(
     const int N = lhs->ctx->N;
     if (N <= 0)
     {
-        out->format = PolyFormat::Eval;
+        out->format = GPU_POLY_FORMAT_EVAL;
         return 0;
     }
 
@@ -1816,7 +1816,7 @@ extern "C" int gpu_matrix_mul_timed(
         }
     }
 
-    out->format = PolyFormat::Eval;
+    out->format = GPU_POLY_FORMAT_EVAL;
     return 0;
 }
 
@@ -1849,7 +1849,7 @@ extern "C" int gpu_matrix_mul_scalar(
     {
         return set_error("null context in gpu_matrix_mul_scalar");
     }
-    if (lhs->format != PolyFormat::Eval || scalar->format != PolyFormat::Eval)
+    if (lhs->format != GPU_POLY_FORMAT_EVAL || scalar->format != GPU_POLY_FORMAT_EVAL)
     {
         return set_error("gpu_matrix_mul_scalar requires Eval format");
     }

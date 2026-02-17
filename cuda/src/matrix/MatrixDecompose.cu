@@ -210,7 +210,7 @@ extern "C" int gpu_matrix_fill_gadget(
     const size_t count = rows * cols;
     if (count == 0)
     {
-        out->format = PolyFormat::Eval;
+        out->format = GPU_POLY_FORMAT_EVAL;
         return 0;
     }
 
@@ -344,13 +344,13 @@ extern "C" int gpu_matrix_fill_gadget(
         }
     }
 
-    out->format = PolyFormat::Coeff;
+    out->format = GPU_POLY_FORMAT_COEFF;
     status = gpu_matrix_ntt_all(out, default_batch(out->ctx));
     if (status != 0)
     {
         return status;
     }
-    out->format = PolyFormat::Eval;
+    out->format = GPU_POLY_FORMAT_EVAL;
     return 0;
 }
 
@@ -400,7 +400,7 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
     }
     if (count == 0)
     {
-        out->format = PolyFormat::Eval;
+        out->format = GPU_POLY_FORMAT_EVAL;
         return 0;
     }
 
@@ -425,10 +425,10 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
     }
 
     const int batch = default_batch(src->ctx);
-    if (src->format == PolyFormat::Eval)
+    if (src->format == GPU_POLY_FORMAT_EVAL)
     {
         const int matrix_format =
-            src->format == PolyFormat::Eval ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
+            src->format == GPU_POLY_FORMAT_EVAL ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
         status = gpu_matrix_create(src->ctx, level, rows, cols, matrix_format, &tmp_inputs_matrix);
         if (status != 0)
         {
@@ -699,14 +699,14 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
         }
     }
 
-    out->format = PolyFormat::Coeff;
+    out->format = GPU_POLY_FORMAT_COEFF;
     status = gpu_matrix_ntt_all(out, batch);
     if (status != 0)
     {
         cleanup_tmp_inputs();
         return status;
     }
-    out->format = PolyFormat::Eval;
+    out->format = GPU_POLY_FORMAT_EVAL;
 
     cleanup_tmp_inputs();
     return 0;

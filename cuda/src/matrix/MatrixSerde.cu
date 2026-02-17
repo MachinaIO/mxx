@@ -112,7 +112,7 @@ extern "C" int gpu_matrix_load_rns_batch(
         return set_error("invalid context in gpu_matrix_load_rns_batch");
     }
 
-    PolyFormat target_format;
+    GpuPolyFormat target_format;
     if (!parse_format(format, target_format))
     {
         return set_error("invalid format in gpu_matrix_load_rns_batch");
@@ -241,7 +241,7 @@ extern "C" int gpu_matrix_store_rns_batch(
         return set_error("invalid context in gpu_matrix_store_rns_batch");
     }
 
-    PolyFormat target_format;
+    GpuPolyFormat target_format;
     if (!parse_format(format, target_format))
     {
         return set_error("invalid format in gpu_matrix_store_rns_batch");

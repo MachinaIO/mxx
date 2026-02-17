@@ -1,6 +1,6 @@
 #pragma once
 
-#include "Poly.h"
+#include "matrix/Matrix.cuh"
 
 int launch_gauss_samp_gq_arb_base_multi_kernel(
     const std::vector<const uint64_t *> &src_ptrs,

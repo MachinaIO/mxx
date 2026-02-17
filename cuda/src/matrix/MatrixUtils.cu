@@ -16,15 +16,15 @@ int default_batch(const GpuContext *ctx)
     return static_cast<int>(ctx && ctx->batch != 0 ? ctx->batch : 1);
 }
 
-bool parse_format(int format, PolyFormat &out)
+bool parse_format(int format, GpuPolyFormat &out)
 {
     switch (format)
     {
     case GPU_POLY_FORMAT_COEFF:
-        out = PolyFormat::Coeff;
+        out = GPU_POLY_FORMAT_COEFF;
         return true;
     case GPU_POLY_FORMAT_EVAL:
-        out = PolyFormat::Eval;
+        out = GPU_POLY_FORMAT_EVAL;
         return true;
     default:
         return false;

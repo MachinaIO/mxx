@@ -159,6 +159,59 @@ bool matrix_aux_slice_for_limb(const GpuMatrix *mat, const dim3 &limb_id, size_t
     return true;
 }
 
+size_t matrix_align_up_size(size_t value, size_t alignment)
+{
+    if (alignment == 0)
+    {
+        return value;
+    }
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+int matrix_acquire_aux_workspace(
+    const GpuMatrix *aux_owner,
+    const dim3 *aux_limb_id,
+    size_t bytes,
+    void **out_ptr,
+    bool *out_shared)
+{
+    if (!out_ptr || !out_shared)
+    {
+        return set_error("invalid matrix_acquire_aux_workspace arguments");
+    }
+    *out_ptr = nullptr;
+    *out_shared = false;
+    if (bytes == 0)
+    {
+        return 0;
+    }
+    if (aux_owner && aux_limb_id && matrix_aux_slice_for_limb(aux_owner, *aux_limb_id, bytes, out_ptr))
+    {
+        *out_shared = true;
+        return 0;
+    }
+    cudaError_t err = cudaMalloc(out_ptr, bytes);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+    return 0;
+}
+
+int matrix_release_aux_workspace(void *ptr, bool from_shared)
+{
+    if (!ptr || from_shared)
+    {
+        return 0;
+    }
+    cudaError_t err = cudaFree(ptr);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+    return 0;
+}
+
 
 int sync_matrix_limb_streams(const GpuMatrix *mat, const char *context)
 {

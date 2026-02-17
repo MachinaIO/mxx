@@ -631,6 +631,32 @@ impl GpuDCRTPolyMatrix {
 impl PolyMatrix for GpuDCRTPolyMatrix {
     type P = GpuDCRTPoly;
 
+    fn add_in_place(&mut self, rhs: &Self) {
+        GpuDCRTPolyMatrix::add_in_place(self, rhs);
+    }
+
+    fn copy_block_from(
+        &mut self,
+        src: &Self,
+        dst_row: usize,
+        dst_col: usize,
+        src_row: usize,
+        src_col: usize,
+        rows: usize,
+        cols: usize,
+    ) {
+        GpuDCRTPolyMatrix::copy_block_from(
+            self,
+            src,
+            dst_row,
+            dst_col,
+            src_row,
+            src_col,
+            rows,
+            cols,
+        );
+    }
+
     fn to_compact_bytes(&self) -> Vec<u8> {
         let format = if self.is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
 

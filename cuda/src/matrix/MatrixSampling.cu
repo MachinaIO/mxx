@@ -300,7 +300,9 @@ int launch_sample_distribution_multi_limb_kernel(
     int dist_type,
     double sigma,
     uint64_t seed,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const GpuMatrix *aux_owner,
+    const dim3 *aux_limb_id)
 {
     const size_t limb_count = moduli.size();
     if (limb_count == 0 || poly_count == 0 || n == 0)
@@ -317,54 +319,49 @@ int launch_sample_distribution_multi_limb_kernel(
         return set_error("unexpected pointer counts in matrix_sample_distribution_multi_limb_kernel");
     }
 
-    uint64_t **d_dst = nullptr;
-    uint64_t *d_moduli = nullptr;
-    uint32_t *d_limb_indices = nullptr;
     const size_t ptr_bytes = ptr_count * sizeof(uint64_t *);
     const size_t u64_bytes = limb_count * sizeof(uint64_t);
     const size_t u32_bytes = limb_count * sizeof(uint32_t);
+    const size_t moduli_offset = matrix_align_up_size(ptr_bytes, alignof(uint64_t));
+    const size_t limb_indices_offset =
+        matrix_align_up_size(moduli_offset + u64_bytes, alignof(uint32_t));
+    const size_t workspace_bytes = limb_indices_offset + u32_bytes;
 
-    cudaError_t err = cudaMalloc(&d_dst, ptr_bytes);
-    if (err != cudaSuccess)
+    void *workspace = nullptr;
+    bool from_shared = false;
+    int status = matrix_acquire_aux_workspace(
+        aux_owner,
+        aux_limb_id,
+        workspace_bytes,
+        &workspace,
+        &from_shared);
+    if (status != 0)
     {
-        return set_error(err);
+        return status;
     }
-    err = cudaMalloc(&d_moduli, u64_bytes);
-    if (err != cudaSuccess)
-    {
-        cudaFree(d_dst);
-        return set_error(err);
-    }
-    err = cudaMalloc(&d_limb_indices, u32_bytes);
-    if (err != cudaSuccess)
-    {
-        cudaFree(d_dst);
-        cudaFree(d_moduli);
-        return set_error(err);
-    }
+    auto cleanup_workspace = [&]() -> int { return matrix_release_aux_workspace(workspace, from_shared); };
 
-    err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
+    auto *workspace_base = reinterpret_cast<uint8_t *>(workspace);
+    uint64_t **d_dst = reinterpret_cast<uint64_t **>(workspace_base);
+    uint64_t *d_moduli = reinterpret_cast<uint64_t *>(workspace_base + moduli_offset);
+    uint32_t *d_limb_indices = reinterpret_cast<uint32_t *>(workspace_base + limb_indices_offset);
+
+    cudaError_t err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
     if (err != cudaSuccess)
     {
-        cudaFree(d_dst);
-        cudaFree(d_moduli);
-        cudaFree(d_limb_indices);
+        cleanup_workspace();
         return set_error(err);
     }
     err = cudaMemcpyAsync(d_moduli, moduli.data(), u64_bytes, cudaMemcpyHostToDevice, stream);
     if (err != cudaSuccess)
     {
-        cudaFree(d_dst);
-        cudaFree(d_moduli);
-        cudaFree(d_limb_indices);
+        cleanup_workspace();
         return set_error(err);
     }
     err = cudaMemcpyAsync(d_limb_indices, limb_indices.data(), u32_bytes, cudaMemcpyHostToDevice, stream);
     if (err != cudaSuccess)
     {
-        cudaFree(d_dst);
-        cudaFree(d_moduli);
-        cudaFree(d_limb_indices);
+        cleanup_workspace();
         return set_error(err);
     }
 
@@ -384,24 +381,22 @@ int launch_sample_distribution_multi_limb_kernel(
     err = cudaGetLastError();
     if (err != cudaSuccess)
     {
-        cudaFree(d_dst);
-        cudaFree(d_moduli);
-        cudaFree(d_limb_indices);
+        cleanup_workspace();
         return set_error(err);
     }
 
     err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess)
     {
-        cudaFree(d_dst);
-        cudaFree(d_moduli);
-        cudaFree(d_limb_indices);
+        cleanup_workspace();
         return set_error(err);
     }
 
-    cudaFree(d_dst);
-    cudaFree(d_moduli);
-    cudaFree(d_limb_indices);
+    status = cleanup_workspace();
+    if (status != 0)
+    {
+        return status;
+    }
     return 0;
 }
 
@@ -455,6 +450,8 @@ extern "C" int gpu_matrix_sample_distribution(
         std::vector<uint64_t *> dst_ptrs;
         std::vector<uint64_t> moduli;
         std::vector<uint32_t> limb_indices;
+        dim3 aux_limb_id;
+        bool has_aux_limb_id;
     };
     std::vector<DistBatch> batches;
     auto get_batch = [&](int device) -> DistBatch &
@@ -466,7 +463,7 @@ extern "C" int gpu_matrix_sample_distribution(
                 return b;
             }
         }
-        batches.push_back(DistBatch{device, nullptr, {}, {}, {}});
+        batches.push_back(DistBatch{device, nullptr, {}, {}, {}, dim3{0, 0, 0}, false});
         return batches.back();
     };
 
@@ -507,6 +504,11 @@ extern "C" int gpu_matrix_sample_distribution(
         {
             batch.stream = limb_stream;
         }
+        if (!batch.has_aux_limb_id)
+        {
+            batch.aux_limb_id = limb_id;
+            batch.has_aux_limb_id = true;
+        }
         batch.moduli.push_back(out->ctx->moduli[static_cast<size_t>(limb)]);
         batch.limb_indices.push_back(static_cast<uint32_t>(limb));
         batch.dst_ptrs.insert(batch.dst_ptrs.end(), limb_ptrs.begin(), limb_ptrs.end());
@@ -532,7 +534,9 @@ extern "C" int gpu_matrix_sample_distribution(
             dist_type,
             sigma,
             seed,
-            batch.stream);
+            batch.stream,
+            out,
+            batch.has_aux_limb_id ? &batch.aux_limb_id : nullptr);
         if (status != 0)
         {
             return status;

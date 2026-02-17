@@ -213,15 +213,34 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         );
 
         let assemble_start = Instant::now();
-        let correction_start = Instant::now();
-        let correction = r_z_hat.concat_rows_owned(vec![e_z_hat, z_hat_mat]);
-        tracing::debug!(
-            elapsed_ms = correction_start.elapsed().as_secs_f64() * 1_000.0,
-            "gpu preimage: assembled correction matrix"
-        );
         let mut out = p_hat;
-        out.add_in_place(&correction);
-        drop(correction);
+        let total_ncol = out.col_size();
+        let out_nrow = out.row_size();
+        let mut add_block_to_out =
+            |dst_row: usize, block: &GpuDCRTPolyMatrix, step: &'static str| {
+                let block_start = Instant::now();
+                let rows = block.row_size();
+                let mut out_block = out.slice(dst_row, dst_row + rows, 0, total_ncol);
+                out_block.add_in_place(block);
+                out.copy_block_from(&out_block, dst_row, 0, 0, 0, rows, total_ncol);
+                tracing::debug!(
+                    elapsed_ms = block_start.elapsed().as_secs_f64() * 1_000.0,
+                    row_start = dst_row,
+                    rows = rows,
+                    step = step,
+                    "gpu preimage: merged correction block"
+                );
+            };
+        add_block_to_out(0, &r_z_hat, "r_z_hat");
+        let e_row_start = r_z_hat.row_size();
+        add_block_to_out(e_row_start, &e_z_hat, "e_z_hat");
+        let z_row_start = e_row_start + e_z_hat.row_size();
+        debug_assert_eq!(
+            z_row_start + z_hat_mat.row_size(),
+            out_nrow,
+            "preimage correction row blocks must cover output rows"
+        );
+        add_block_to_out(z_row_start, &z_hat_mat, "z_hat_mat");
         tracing::debug!(
             elapsed_ms = assemble_start.elapsed().as_secs_f64() * 1_000.0,
             "gpu preimage: assembled output matrix"
@@ -313,11 +332,20 @@ fn sample_pert_square_mat_gpu_native(
     tracing::debug!("gpu preimage sample_pert: sampled p1");
     drop(tp2);
 
-    let mut p_hat = p1.concat_rows_owned(vec![p2]);
-    tracing::debug!("gpu preimage sample_pert: concatenated p1/p2");
+    let mut p_hat = GpuDCRTPolyMatrix::new_empty_with_state(
+        params,
+        p1.row_size() + p2.row_size(),
+        total_ncol,
+        p1.level(),
+        p1.is_ntt(),
+    );
+    debug_assert!(p1.col_size() >= total_ncol, "p1 must include target columns");
+    debug_assert!(p2.col_size() >= total_ncol, "p2 must include target columns");
+    p_hat.copy_block_from(&p1, 0, 0, 0, 0, p1.row_size(), total_ncol);
+    p_hat.copy_block_from(&p2, p1.row_size(), 0, 0, 0, p2.row_size(), total_ncol);
+    tracing::debug!("gpu preimage sample_pert: assembled p_hat without concat+slice");
     if padding_ncol > 0 {
-        p_hat = p_hat.slice_columns(0, total_ncol);
-        tracing::debug!("gpu preimage sample_pert: sliced padding columns");
+        tracing::debug!("gpu preimage sample_pert: skipped padded columns during assembly");
     }
     p_hat
 }

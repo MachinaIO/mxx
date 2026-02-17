@@ -319,22 +319,26 @@ where
                 "Constructed w_block_identity for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
                 lut_id, part_idx, idx
             );
-            w_t_idx = w_t_idx + w_block_gy.mul_decompose(&gy);
+            let w_gy = w_block_gy.mul_decompose(&gy);
+            w_t_idx.add_in_place(&w_gy);
             debug!(
                 "Constructed w_block_gy contribution for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
                 lut_id, part_idx, idx
             );
-            w_t_idx = w_t_idx + w_block_v.mul_decompose(&v_idx);
+            let w_v = w_block_v.mul_decompose(&v_idx);
+            w_t_idx.add_in_place(&w_v);
             debug!(
                 "Constructed w_block_v contribution for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
                 lut_id, part_idx, idx
             );
-            w_t_idx = w_t_idx + w_block_v_idx.mul_decompose(&v_idx_scaled);
+            let w_v_idx = w_block_v_idx.mul_decompose(&v_idx_scaled);
+            w_t_idx.add_in_place(&w_v_idx);
             debug!(
                 "Constructed w_block_v_idx contribution for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
                 lut_id, part_idx, idx
             );
-            let target = M::zero(params, d, m).concat_rows(&[&w_t_idx]);
+            let mut target = M::zero(params, d + w_t_idx.row_size(), m);
+            target.copy_block_from(&w_t_idx, d, 0, 0, 0, w_t_idx.row_size(), m);
             debug!(
                 "Constructed target for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
                 lut_id, part_idx, idx

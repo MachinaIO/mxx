@@ -7,9 +7,21 @@ namespace
         Mul,
     };
 
-    constexpr int kMatmulTileM = 16;
-    constexpr int kMatmulTileN = 16;
-    constexpr int kMatmulTileK = 8;
+#ifndef GPU_MATMUL_TILE_M
+#define GPU_MATMUL_TILE_M 8
+#endif
+#ifndef GPU_MATMUL_TILE_N
+#define GPU_MATMUL_TILE_N 32
+#endif
+#ifndef GPU_MATMUL_TILE_K
+#define GPU_MATMUL_TILE_K 16
+#endif
+
+    constexpr int kMatmulTileM = GPU_MATMUL_TILE_M;
+    constexpr int kMatmulTileN = GPU_MATMUL_TILE_N;
+    constexpr int kMatmulTileK = GPU_MATMUL_TILE_K;
+    static_assert(kMatmulTileM > 0 && kMatmulTileN > 0 && kMatmulTileK > 0, "invalid matmul tile size");
+    static_assert(kMatmulTileM * kMatmulTileN <= 1024, "matmul tile thread count exceeds CUDA limit");
     template <typename T>
     __global__ void block_add_kernel(
         const T **lhs,
@@ -1434,7 +1446,9 @@ int launch_fill_gadget_multi_limb_kernel(
     size_t log_base_q,
     uint32_t digits_per_tower,
     uint32_t base_bits,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const GpuMatrix *aux_owner,
+    const dim3 *aux_limb_id);
 
 int launch_sample_p1_integer_kernel(
     const std::vector<const uint64_t *> &a_entries,
@@ -1451,7 +1465,9 @@ int launch_sample_p1_integer_kernel(
     uint64_t seed,
     cudaStream_t stream,
     int device_id,
-    int64_t **sampled_out_device);
+    int64_t **sampled_out_device,
+    const GpuMatrix *aux_owner,
+    const dim3 *aux_limb_id);
 
 int launch_scatter_p1_integer_to_limb_kernel_device(
     const int64_t *sampled_in_device,
@@ -1459,7 +1475,9 @@ int launch_scatter_p1_integer_to_limb_kernel_device(
     size_t n,
     uint64_t modulus,
     cudaStream_t stream,
-    int device_id);
+    int device_id,
+    const GpuMatrix *aux_owner,
+    const dim3 *aux_limb_id);
 
 extern "C" int gpu_matrix_add(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs)
 {

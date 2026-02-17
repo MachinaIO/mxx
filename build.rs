@@ -25,6 +25,7 @@ fn main() {
         println!("cargo::rerun-if-changed=cuda/src/poly/PolyOps.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/Matrix.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixUtils.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixNTT.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixData.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixArith.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixDecompose.cu");
@@ -116,6 +117,7 @@ fn main() {
         let mut build = cc::Build::new();
         build
             .cuda(true)
+            .file("cuda/src/Runtime.cu")
             .file("cuda/src/poly/Poly.cu")
             .file("cuda/src/matrix/Matrix.cu")
             .include("cuda/include")

@@ -16,17 +16,6 @@ extern "C"
         GpuMatrix **out);
     void gpu_matrix_destroy(GpuMatrix *mat);
     int gpu_matrix_copy(GpuMatrix *dst, const GpuMatrix *src);
-    int gpu_matrix_entry_clone(
-        const GpuMatrix *mat,
-        size_t row,
-        size_t col,
-        GpuPoly **out_poly,
-        GpuEventSet **out_events);
-    int gpu_matrix_copy_entry(
-        GpuMatrix *mat,
-        size_t row,
-        size_t col,
-        const GpuPoly *src);
     int gpu_matrix_copy_block(
         GpuMatrix *out,
         const GpuMatrix *src,

@@ -36,6 +36,20 @@ namespace
         streams.push_back(SerdeStreamRef{device, stream});
     }
 
+    void serde_destroy_event_set(GpuEventSet *events)
+    {
+        if (!events)
+        {
+            return;
+        }
+        for (const auto &entry : events->entries)
+        {
+            cudaSetDevice(entry.device);
+            cudaEventDestroy(entry.event);
+        }
+        delete events;
+    }
+
     int serde_build_event_set_from_streams(const std::vector<SerdeStreamRef> &streams, GpuEventSet **out_events)
     {
         if (!out_events)
@@ -55,7 +69,7 @@ namespace
             cudaError_t err = cudaSetDevice(entry.device);
             if (err != cudaSuccess)
             {
-                gpu_event_set_destroy(event_set);
+                serde_destroy_event_set(event_set);
                 return set_error(err);
             }
 
@@ -63,14 +77,14 @@ namespace
             err = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
             if (err != cudaSuccess)
             {
-                gpu_event_set_destroy(event_set);
+                serde_destroy_event_set(event_set);
                 return set_error(err);
             }
             err = cudaEventRecord(ev, entry.stream);
             if (err != cudaSuccess)
             {
                 cudaEventDestroy(ev);
-                gpu_event_set_destroy(event_set);
+                serde_destroy_event_set(event_set);
                 return set_error(err);
             }
             event_set->entries.push_back(GpuEventSet::Entry{ev, entry.device});
@@ -155,50 +169,55 @@ extern "C" int gpu_matrix_load_rns_batch(
 
     std::vector<SerdeStreamRef> streams;
     streams.reserve(limb_count);
-    for (size_t poly_idx = 0; poly_idx < count; ++poly_idx)
+    const size_t coeff_bytes = static_cast<size_t>(N) * sizeof(uint64_t);
+    for (size_t limb = 0; limb < limb_count; ++limb)
     {
-        const uint8_t *poly_bytes = bytes + poly_idx * bytes_per_poly;
-        for (size_t limb = 0; limb < limb_count; ++limb)
+        const dim3 limb_id = limb_map[limb];
+        uint64_t *dst = matrix_limb_ptr_by_id(mat, 0, limb_id);
+        if (!dst)
         {
-            const dim3 limb_id = limb_map[limb];
-            uint64_t *dst = matrix_limb_ptr_by_id(mat, poly_idx, limb_id);
-            if (!dst)
-            {
-                return set_error("null matrix limb pointer in gpu_matrix_load_rns_batch");
-            }
-
-            int device = -1;
-            cudaStream_t stream = nullptr;
-            int status = matrix_limb_device(mat, limb_id, &device);
-            if (status != 0)
-            {
-                return status;
-            }
-            status = matrix_limb_stream(mat, limb_id, &stream);
-            if (status != 0)
-            {
-                return status;
-            }
-
-            cudaError_t err = cudaSetDevice(device);
-            if (err != cudaSuccess)
-            {
-                return set_error(err);
-            }
-
-            const uint8_t *src = poly_bytes + limb * static_cast<size_t>(N) * sizeof(uint64_t);
-            err = cudaMemcpyAsync(
-                dst,
-                src,
-                static_cast<size_t>(N) * sizeof(uint64_t),
-                cudaMemcpyHostToDevice,
-                stream);
-            if (err != cudaSuccess)
-            {
-                return set_error(err);
-            }
-            serde_append_unique_stream(streams, device, stream);
+            return set_error("null matrix limb base pointer in gpu_matrix_load_rns_batch");
         }
+
+        int device = -1;
+        cudaStream_t stream = nullptr;
+        int status = matrix_limb_device(mat, limb_id, &device);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_limb_stream(mat, limb_id, &stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        if (limb_id.x >= mat->shared_limb_buffers.size())
+        {
+            return set_error("invalid partition index in gpu_matrix_load_rns_batch");
+        }
+        const auto &buffer = mat->shared_limb_buffers[limb_id.x];
+        const size_t dst_pitch = buffer.words_per_poly * sizeof(uint64_t);
+        const uint8_t *src = bytes + limb * coeff_bytes;
+
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        err = cudaMemcpy2DAsync(
+            dst,
+            dst_pitch,
+            src,
+            bytes_per_poly,
+            coeff_bytes,
+            count,
+            cudaMemcpyHostToDevice,
+            stream);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        serde_append_unique_stream(streams, device, stream);
     }
 
     mat->format = target_format;
@@ -281,50 +300,55 @@ extern "C" int gpu_matrix_store_rns_batch(
 
     std::vector<SerdeStreamRef> streams;
     streams.reserve(limb_count);
-    for (size_t poly_idx = 0; poly_idx < count; ++poly_idx)
+    const size_t coeff_bytes = static_cast<size_t>(N) * sizeof(uint64_t);
+    for (size_t limb = 0; limb < limb_count; ++limb)
     {
-        uint8_t *poly_bytes = bytes_out + poly_idx * bytes_per_poly;
-        for (size_t limb = 0; limb < limb_count; ++limb)
+        const dim3 limb_id = limb_map[limb];
+        const uint64_t *src = matrix_limb_ptr_by_id(mat, 0, limb_id);
+        if (!src)
         {
-            const dim3 limb_id = limb_map[limb];
-            const uint64_t *src = matrix_limb_ptr_by_id(mat, poly_idx, limb_id);
-            if (!src)
-            {
-                return set_error("null matrix limb pointer in gpu_matrix_store_rns_batch");
-            }
-
-            int device = -1;
-            cudaStream_t stream = nullptr;
-            int status = matrix_limb_device(mat, limb_id, &device);
-            if (status != 0)
-            {
-                return status;
-            }
-            status = matrix_limb_stream(mat, limb_id, &stream);
-            if (status != 0)
-            {
-                return status;
-            }
-
-            cudaError_t err = cudaSetDevice(device);
-            if (err != cudaSuccess)
-            {
-                return set_error(err);
-            }
-
-            uint8_t *dst = poly_bytes + limb * static_cast<size_t>(N) * sizeof(uint64_t);
-            err = cudaMemcpyAsync(
-                dst,
-                src,
-                static_cast<size_t>(N) * sizeof(uint64_t),
-                cudaMemcpyDeviceToHost,
-                stream);
-            if (err != cudaSuccess)
-            {
-                return set_error(err);
-            }
-            serde_append_unique_stream(streams, device, stream);
+            return set_error("null matrix limb base pointer in gpu_matrix_store_rns_batch");
         }
+
+        int device = -1;
+        cudaStream_t stream = nullptr;
+        int status = matrix_limb_device(mat, limb_id, &device);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_limb_stream(mat, limb_id, &stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        if (limb_id.x >= mat->shared_limb_buffers.size())
+        {
+            return set_error("invalid partition index in gpu_matrix_store_rns_batch");
+        }
+        const auto &buffer = mat->shared_limb_buffers[limb_id.x];
+        const size_t src_pitch = buffer.words_per_poly * sizeof(uint64_t);
+        uint8_t *dst = bytes_out + limb * coeff_bytes;
+
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        err = cudaMemcpy2DAsync(
+            dst,
+            bytes_per_poly,
+            src,
+            src_pitch,
+            coeff_bytes,
+            count,
+            cudaMemcpyDeviceToHost,
+            stream);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        serde_append_unique_stream(streams, device, stream);
     }
 
     return serde_build_event_set_from_streams(streams, out_events);

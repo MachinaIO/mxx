@@ -447,17 +447,7 @@ extern "C" int gpu_matrix_sample_distribution(
     {
         return set_error("unexpected limb mapping size in gpu_matrix_sample_distribution");
     }
-    std::vector<GpuPoly *> out_polys;
-    int status = materialize_matrix_poly_views(out, out_polys);
-    if (status != 0)
-    {
-        return status;
-    }
-    auto cleanup_out_polys = [&]()
-    {
-        release_poly_views(out_polys);
-    };
-
+    int status = 0;
     struct DistBatch
     {
         int device;
@@ -490,48 +480,26 @@ extern "C" int gpu_matrix_sample_distribution(
         status = matrix_limb_device(out, limb_id, &limb_device);
         if (status != 0)
         {
-            cleanup_out_polys();
             return status;
         }
         status = matrix_limb_stream(out, limb_id, &limb_stream);
         if (status != 0)
         {
-            cleanup_out_polys();
             return status;
         }
 
         for (size_t idx = 0; idx < count; ++idx)
         {
-            GpuPoly *poly = out_polys[idx];
-            if (!poly || poly->ctx != out->ctx || poly->level != level)
+            uint64_t *dst = matrix_limb_ptr_by_id(out, idx, limb_id);
+            if (!dst)
             {
-                cleanup_out_polys();
-                return set_error("invalid output poly in gpu_matrix_sample_distribution");
+                return set_error("null output limb pointer in gpu_matrix_sample_distribution");
             }
-            if (limb_id.x >= poly->poly->GPU.size())
-            {
-                cleanup_out_polys();
-                return set_error("unexpected limb GPU partition in gpu_matrix_sample_distribution");
-            }
-            auto &partition = poly->poly->GPU[limb_id.x];
-            if (limb_id.y >= partition.limb.size())
-            {
-                cleanup_out_polys();
-                return set_error("unexpected limb index in gpu_matrix_sample_distribution");
-            }
-            auto &limb_impl = partition.limb[limb_id.y];
-            if (limb_impl.index() != FIDESlib::U64)
-            {
-                cleanup_out_polys();
-                return set_error("unsupported limb type in gpu_matrix_sample_distribution");
-            }
-            auto &limb_u64 = std::get<FIDESlib::U64>(limb_impl);
-            limb_ptrs.push_back(limb_u64.v.data);
+            limb_ptrs.push_back(dst);
         }
 
         if (limb_device < 0 || !limb_stream)
         {
-            cleanup_out_polys();
             return set_error("invalid limb metadata in gpu_matrix_sample_distribution");
         }
         auto &batch = get_batch(limb_device);
@@ -548,13 +516,11 @@ extern "C" int gpu_matrix_sample_distribution(
     {
         if (!batch.stream)
         {
-            cleanup_out_polys();
             return set_error("null stream in gpu_matrix_sample_distribution");
         }
         cudaError_t err = cudaSetDevice(batch.device);
         if (err != cudaSuccess)
         {
-            cleanup_out_polys();
             return set_error(err);
         }
         status = launch_sample_distribution_multi_limb_kernel(
@@ -569,24 +535,16 @@ extern "C" int gpu_matrix_sample_distribution(
             batch.stream);
         if (status != 0)
         {
-            cleanup_out_polys();
             return status;
         }
     }
 
-    const int batch = default_batch(out->ctx);
-    for (auto *poly : out_polys)
+    out->format = PolyFormat::Coeff;
+    status = gpu_matrix_ntt_all(out, default_batch(out->ctx));
+    if (status != 0)
     {
-        poly->format = PolyFormat::Coeff;
-        status = gpu_poly_ntt(poly, batch);
-        if (status != 0)
-        {
-            cleanup_out_polys();
-            return status;
-        }
-        poly->format = PolyFormat::Eval;
+        return status;
     }
-    cleanup_out_polys();
     out->format = PolyFormat::Eval;
     return 0;
 }

@@ -11,6 +11,7 @@
 #include <vector>
 #include <cuda_runtime.h>
 
-#include "../Runtime.cu"
+#include "Runtime.cuh"
+#include "PolyUtils.cu"
 #include "PolySerdeRns.cu"
 #include "PolyOps.cu"

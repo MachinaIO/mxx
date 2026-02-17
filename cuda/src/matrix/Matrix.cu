@@ -10,6 +10,7 @@
 
 #include "../ChaCha.cu"
 #include "MatrixUtils.cu"
+#include "MatrixNTT.cu"
 #include "MatrixArith.cu"
 #include "MatrixData.cu"
 #include "MatrixDecompose.cu"

@@ -355,7 +355,7 @@ namespace
         }
         if (out_ptrs.size() != out_count || lhs_ptrs.size() != lhs_count || rhs_ptrs.size() != rhs_count)
         {
-            return set_error("unexpected pointer counts in gpu_block_mul");
+            return set_error("unexpected pointer counts in launch_block_matmul_kernel");
         }
 
         T **d_out = nullptr;
@@ -841,198 +841,6 @@ namespace
     }
 
     template <typename T>
-    int launch_for_limb(
-        GpuPoly *const *out,
-        const GpuPoly *const *lhs,
-        const GpuPoly *const *rhs,
-        size_t count,
-        size_t n,
-        int limb,
-        const dim3 &limb_id,
-        BlockOp op)
-    {
-        std::vector<T *> out_ptrs;
-        std::vector<const T *> lhs_ptrs;
-        std::vector<const T *> rhs_ptrs;
-        out_ptrs.reserve(count);
-        lhs_ptrs.reserve(count);
-        rhs_ptrs.reserve(count);
-
-        cudaStream_t stream = nullptr;
-        for (size_t i = 0; i < count; ++i)
-        {
-            auto &lhs_partition = lhs[i]->poly->GPU[limb_id.x];
-            auto &rhs_partition = rhs[i]->poly->GPU[limb_id.x];
-            auto &out_partition = out[i]->poly->GPU[limb_id.x];
-            if (limb_id.y >= lhs_partition.limb.size() || limb_id.y >= rhs_partition.limb.size() ||
-                limb_id.y >= out_partition.limb.size())
-            {
-                return set_error("unexpected limb index in gpu_block_op");
-            }
-            auto &lhs_limb = lhs_partition.limb[limb_id.y];
-            auto &rhs_limb = rhs_partition.limb[limb_id.y];
-            auto &out_limb = out_partition.limb[limb_id.y];
-            if (lhs_limb.index() != rhs_limb.index() || lhs_limb.index() != out_limb.index())
-            {
-                return set_error("mixed limb types in gpu_block_op");
-            }
-
-            if constexpr (std::is_same_v<T, uint64_t>)
-            {
-                auto &lhs_u = std::get<FIDESlib::U64>(lhs_limb);
-                auto &rhs_u = std::get<FIDESlib::U64>(rhs_limb);
-                auto &out_u = std::get<FIDESlib::U64>(out_limb);
-                if (!stream)
-                {
-                    stream = lhs_u.stream.ptr;
-                }
-                lhs_ptrs.push_back(lhs_u.v.data);
-                rhs_ptrs.push_back(rhs_u.v.data);
-                out_ptrs.push_back(out_u.v.data);
-            }
-            else
-            {
-                auto &lhs_u = std::get<FIDESlib::U32>(lhs_limb);
-                auto &rhs_u = std::get<FIDESlib::U32>(rhs_limb);
-                auto &out_u = std::get<FIDESlib::U32>(out_limb);
-                if (!stream)
-                {
-                    stream = lhs_u.stream.ptr;
-                }
-                lhs_ptrs.push_back(lhs_u.v.data);
-                rhs_ptrs.push_back(rhs_u.v.data);
-                out_ptrs.push_back(out_u.v.data);
-            }
-        }
-
-        const uint64_t modulus64 = lhs[0]->ctx->moduli[static_cast<size_t>(limb)];
-        const T modulus = static_cast<T>(modulus64);
-        return launch_block_kernel(out_ptrs, lhs_ptrs, rhs_ptrs, n, modulus, op, stream);
-    }
-
-    template <typename T>
-    int launch_for_limb_matmul(
-        GpuPoly *const *out,
-        const GpuPoly *const *lhs,
-        const GpuPoly *const *rhs,
-        size_t rows,
-        size_t inner,
-        size_t cols,
-        size_t n,
-        int limb,
-        const dim3 &limb_id,
-        double *out_kernel_ms)
-    {
-        const size_t out_count = rows * cols;
-        const size_t lhs_count = rows * inner;
-        const size_t rhs_count = inner * cols;
-
-        std::vector<T *> out_ptrs;
-        std::vector<const T *> lhs_ptrs;
-        std::vector<const T *> rhs_ptrs;
-        out_ptrs.reserve(out_count);
-        lhs_ptrs.reserve(lhs_count);
-        rhs_ptrs.reserve(rhs_count);
-
-        cudaStream_t stream = nullptr;
-        int limb_index = -1;
-
-        for (size_t i = 0; i < lhs_count; ++i)
-        {
-            auto &lhs_partition = lhs[i]->poly->GPU[limb_id.x];
-            if (limb_id.y >= lhs_partition.limb.size())
-            {
-                return set_error("unexpected limb index in gpu_block_mul");
-            }
-            auto &lhs_limb = lhs_partition.limb[limb_id.y];
-            if constexpr (std::is_same_v<T, uint64_t>)
-            {
-                if (lhs_limb.index() != FIDESlib::U64)
-                {
-                    return set_error("mixed limb types in gpu_block_mul");
-                }
-                auto &lhs_u = std::get<FIDESlib::U64>(lhs_limb);
-                if (!stream)
-                {
-                    stream = lhs_u.stream.ptr;
-                }
-                lhs_ptrs.push_back(lhs_u.v.data);
-            }
-            else
-            {
-                if (lhs_limb.index() != FIDESlib::U32)
-                {
-                    return set_error("mixed limb types in gpu_block_mul");
-                }
-                auto &lhs_u = std::get<FIDESlib::U32>(lhs_limb);
-                if (!stream)
-                {
-                    stream = lhs_u.stream.ptr;
-                }
-                lhs_ptrs.push_back(lhs_u.v.data);
-            }
-            if (limb_index == -1)
-            {
-                limb_index = lhs_limb.index();
-            }
-        }
-
-        for (size_t i = 0; i < rhs_count; ++i)
-        {
-            auto &rhs_partition = rhs[i]->poly->GPU[limb_id.x];
-            if (limb_id.y >= rhs_partition.limb.size())
-            {
-                return set_error("unexpected limb index in gpu_block_mul");
-            }
-            auto &rhs_limb = rhs_partition.limb[limb_id.y];
-            if (rhs_limb.index() != limb_index)
-            {
-                return set_error("mixed limb types in gpu_block_mul");
-            }
-
-            if constexpr (std::is_same_v<T, uint64_t>)
-            {
-                auto &rhs_u = std::get<FIDESlib::U64>(rhs_limb);
-                rhs_ptrs.push_back(rhs_u.v.data);
-            }
-            else
-            {
-                auto &rhs_u = std::get<FIDESlib::U32>(rhs_limb);
-                rhs_ptrs.push_back(rhs_u.v.data);
-            }
-        }
-
-        for (size_t i = 0; i < out_count; ++i)
-        {
-            auto &out_partition = out[i]->poly->GPU[limb_id.x];
-            if (limb_id.y >= out_partition.limb.size())
-            {
-                return set_error("unexpected limb index in gpu_block_mul");
-            }
-            auto &out_limb = out_partition.limb[limb_id.y];
-            if (out_limb.index() != limb_index)
-            {
-                return set_error("mixed limb types in gpu_block_mul");
-            }
-
-            if constexpr (std::is_same_v<T, uint64_t>)
-            {
-                auto &out_u = std::get<FIDESlib::U64>(out_limb);
-                out_ptrs.push_back(out_u.v.data);
-            }
-            else
-            {
-                auto &out_u = std::get<FIDESlib::U32>(out_limb);
-                out_ptrs.push_back(out_u.v.data);
-            }
-        }
-
-        const uint64_t modulus64 = lhs[0]->ctx->moduli[static_cast<size_t>(limb)];
-        const T modulus = static_cast<T>(modulus64);
-        return launch_block_matmul_kernel(out_ptrs, lhs_ptrs, rhs_ptrs, rows, inner, cols, n, modulus, stream, out_kernel_ms);
-    }
-
-    template <typename T>
     __global__ void block_equal_kernel(
         const T **lhs,
         const T **rhs,
@@ -1198,38 +1006,40 @@ namespace
     }
 
     int get_scalar_limb_u64(
-        const GpuPoly *scalar,
+        const GpuMatrix *scalar,
         const dim3 &limb_id,
         const uint64_t **out_ptr,
         int *out_device,
         cudaStream_t *out_stream)
     {
-        if (!scalar || !scalar->poly || !out_ptr || !out_device || !out_stream)
+        if (!scalar || !out_ptr || !out_device || !out_stream)
         {
             return set_error("invalid scalar arguments in get_scalar_limb_u64");
         }
-        if (limb_id.x >= scalar->poly->GPU.size())
+        if (scalar->rows != 1 || scalar->cols != 1)
         {
-            return set_error("unexpected scalar partition index in get_scalar_limb_u64");
+            return set_error("scalar matrix must be 1x1 in get_scalar_limb_u64");
         }
-        const auto &partition = scalar->poly->GPU[limb_id.x];
-        if (limb_id.y >= partition.limb.size())
+        const uint64_t *ptr = matrix_limb_ptr_by_id(scalar, 0, limb_id);
+        if (!ptr)
         {
-            return set_error("unexpected scalar limb index in get_scalar_limb_u64");
+            return set_error("null scalar limb pointer in get_scalar_limb_u64");
         }
-        const auto &limb_impl = partition.limb[limb_id.y];
-        if (limb_impl.index() != FIDESlib::U64)
+        int device = -1;
+        int status = matrix_limb_device(scalar, limb_id, &device);
+        if (status != 0)
         {
-            return set_error("unsupported scalar limb type in get_scalar_limb_u64");
+            return status;
         }
-        const auto &limb_u64 = std::get<FIDESlib::U64>(limb_impl);
-        if (!limb_u64.v.data || !limb_u64.stream.ptr)
+        cudaStream_t stream = nullptr;
+        status = matrix_limb_stream(scalar, limb_id, &stream);
+        if (status != 0)
         {
-            return set_error("null scalar limb buffer in get_scalar_limb_u64");
+            return status;
         }
-        *out_ptr = limb_u64.v.data;
-        *out_device = partition.device;
-        *out_stream = limb_u64.stream.ptr;
+        *out_ptr = ptr;
+        *out_device = device;
+        *out_stream = stream;
         return 0;
     }
 
@@ -1447,7 +1257,7 @@ namespace
     int launch_matrix_scalar_mul_for_limb(
         GpuMatrix *out,
         const GpuMatrix *lhs,
-        const GpuPoly *scalar,
+        const GpuMatrix *scalar,
         size_t count,
         size_t n,
         int limb,
@@ -1605,245 +1415,6 @@ namespace
         return launch_block_equal_kernel(lhs_ptrs, rhs_ptrs, n, stream, is_equal);
     }
 
-    int gpu_block_op(GpuPoly *const *out, const GpuPoly *const *lhs, const GpuPoly *const *rhs, size_t count, BlockOp op)
-    {
-        if (!out || !lhs || !rhs)
-        {
-            return set_error("invalid gpu_block_op arguments");
-        }
-        if (count == 0)
-        {
-            return 0;
-        }
-
-        const GpuPoly *lhs0 = lhs[0];
-        if (!lhs0 || !lhs0->ctx)
-        {
-            return set_error("null context in gpu_block_op");
-        }
-        const GpuContext *ctx = lhs0->ctx;
-        const int level = lhs0->level;
-        const PolyFormat format = lhs0->format;
-        if (op == BlockOp::Mul && format != PolyFormat::Eval)
-        {
-            return set_error("gpu_block_entrywise_mul requires Eval format");
-        }
-
-        // for (size_t i = 0; i < count; ++i)
-        // {
-        //     if (!out[i] || !lhs[i] || !rhs[i])
-        //     {
-        //         return set_error("null polynomial in gpu_block_op");
-        //     }
-        //     if (lhs[i]->ctx != ctx || rhs[i]->ctx != ctx || out[i]->ctx != ctx)
-        //     {
-        //         return set_error("mismatched contexts in gpu_block_op");
-        //     }
-        //     if (lhs[i]->level != level || rhs[i]->level != level || out[i]->level != level)
-        //     {
-        //         return set_error("mismatched levels in gpu_block_op");
-        //     }
-        //     if (lhs[i]->format != format || rhs[i]->format != format)
-        //     {
-        //         return set_error("mismatched formats in gpu_block_op");
-        //     }
-        // }
-
-        if (level < 0)
-        {
-            return set_error("invalid level in gpu_block_op");
-        }
-
-        const int N = ctx->N;
-        if (N <= 0)
-        {
-            return 0;
-        }
-
-        auto &limb_map = ctx->ctx->limbGPUid;
-        if (limb_map.size() < static_cast<size_t>(level + 1))
-        {
-            return set_error("unexpected limb mapping size in gpu_block_op");
-        }
-
-        for (int limb = 0; limb <= level; ++limb)
-        {
-            const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-            if (limb_id.x >= lhs0->poly->GPU.size())
-            {
-                return set_error("unexpected limb GPU partition in gpu_block_op");
-            }
-            const auto &partition = lhs0->poly->GPU[limb_id.x];
-            if (limb_id.y >= partition.limb.size())
-            {
-                return set_error("unexpected limb index in gpu_block_op");
-            }
-
-            cudaError_t err = cudaSetDevice(partition.device);
-            if (err != cudaSuccess)
-            {
-                return set_error(err);
-            }
-
-            const auto &limb_impl = partition.limb[limb_id.y];
-            if (limb_impl.index() == FIDESlib::U64)
-            {
-                int status = launch_for_limb<uint64_t>(out, lhs, rhs, count, static_cast<size_t>(N), limb, limb_id, op);
-                if (status != 0)
-                {
-                    return status;
-                }
-            }
-            else if (limb_impl.index() == FIDESlib::U32)
-            {
-                int status = launch_for_limb<uint32_t>(out, lhs, rhs, count, static_cast<size_t>(N), limb, limb_id, op);
-                if (status != 0)
-                {
-                    return status;
-                }
-            }
-            else
-            {
-                return set_error("unsupported limb type in gpu_block_op");
-            }
-        }
-
-        for (size_t i = 0; i < count; ++i)
-        {
-            out[i]->level = level;
-            out[i]->format = format;
-        }
-        return 0;
-    }
-
-    int gpu_block_matmul(
-        GpuPoly *const *out,
-        const GpuPoly *const *lhs,
-        const GpuPoly *const *rhs,
-        size_t rows,
-        size_t inner,
-        size_t cols,
-        double *out_kernel_ms = nullptr)
-    {
-        if (!out || !lhs || !rhs)
-        {
-            return set_error("invalid gpu_block_mul arguments");
-        }
-        if (out_kernel_ms)
-        {
-            *out_kernel_ms = 0.0;
-        }
-        const size_t out_count = rows * cols;
-        if (rows == 0 || inner == 0 || cols == 0)
-        {
-            return 0;
-        }
-        if (out_count == 0)
-        {
-            return 0;
-        }
-
-        const GpuPoly *lhs0 = lhs[0];
-        if (!lhs0 || !lhs0->ctx)
-        {
-            return set_error("null context in gpu_block_mul");
-        }
-        const GpuContext *ctx = lhs0->ctx;
-        const int level = lhs0->level;
-        const PolyFormat format = lhs0->format;
-        if (format != PolyFormat::Eval)
-        {
-            return set_error("gpu_block_mul requires Eval format");
-        }
-
-        if (level < 0)
-        {
-            return set_error("invalid level in gpu_block_mul");
-        }
-
-        const int N = ctx->N;
-        if (N <= 0)
-        {
-            return 0;
-        }
-
-        auto &limb_map = ctx->ctx->limbGPUid;
-        if (limb_map.size() < static_cast<size_t>(level + 1))
-        {
-            return set_error("unexpected limb mapping size in gpu_block_mul");
-        }
-
-        for (int limb = 0; limb <= level; ++limb)
-        {
-            const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-            if (limb_id.x >= lhs0->poly->GPU.size())
-            {
-                return set_error("unexpected limb GPU partition in gpu_block_mul");
-            }
-            const auto &partition = lhs0->poly->GPU[limb_id.x];
-            if (limb_id.y >= partition.limb.size())
-            {
-                return set_error("unexpected limb index in gpu_block_mul");
-            }
-
-            cudaError_t err = cudaSetDevice(partition.device);
-            if (err != cudaSuccess)
-            {
-                return set_error(err);
-            }
-
-            const auto &limb_impl = partition.limb[limb_id.y];
-            if (limb_impl.index() == FIDESlib::U64)
-            {
-                int status =
-                    launch_for_limb_matmul<uint64_t>(
-                        out,
-                        lhs,
-                        rhs,
-                        rows,
-                        inner,
-                        cols,
-                        static_cast<size_t>(N),
-                        limb,
-                        limb_id,
-                        out_kernel_ms);
-                if (status != 0)
-                {
-                    return status;
-                }
-            }
-            else if (limb_impl.index() == FIDESlib::U32)
-            {
-                int status =
-                    launch_for_limb_matmul<uint32_t>(
-                        out,
-                        lhs,
-                        rhs,
-                        rows,
-                        inner,
-                        cols,
-                        static_cast<size_t>(N),
-                        limb,
-                        limb_id,
-                        out_kernel_ms);
-                if (status != 0)
-                {
-                    return status;
-                }
-            }
-            else
-            {
-                return set_error("unsupported limb type in gpu_block_mul");
-            }
-        }
-
-        for (size_t i = 0; i < out_count; ++i)
-        {
-            out[i]->level = level;
-            out[i]->format = format;
-        }
-        return 0;
-    }
 } // namespace
 
 int launch_fill_gadget_multi_limb_kernel(
@@ -1883,52 +1454,6 @@ int launch_scatter_p1_integer_to_limb_kernel(
     uint64_t modulus,
     cudaStream_t stream,
     int device_id);
-
-extern "C" int gpu_block_add(GpuPoly *const *out, const GpuPoly *const *lhs, const GpuPoly *const *rhs, size_t count)
-{
-    return gpu_block_op(out, lhs, rhs, count, BlockOp::Add);
-}
-
-extern "C" int gpu_block_sub(GpuPoly *const *out, const GpuPoly *const *lhs, const GpuPoly *const *rhs, size_t count)
-{
-    return gpu_block_op(out, lhs, rhs, count, BlockOp::Sub);
-}
-
-extern "C" int gpu_block_entrywise_mul(
-    GpuPoly *const *out,
-    const GpuPoly *const *lhs,
-    const GpuPoly *const *rhs,
-    size_t count)
-{
-    return gpu_block_op(out, lhs, rhs, count, BlockOp::Mul);
-}
-
-extern "C" int gpu_block_mul(
-    GpuPoly *const *out,
-    const GpuPoly *const *lhs,
-    const GpuPoly *const *rhs,
-    size_t rows,
-    size_t inner,
-    size_t cols)
-{
-    return gpu_block_matmul(out, lhs, rhs, rows, inner, cols);
-}
-
-extern "C" int gpu_block_mul_timed(
-    GpuPoly *const *out,
-    const GpuPoly *const *lhs,
-    const GpuPoly *const *rhs,
-    size_t rows,
-    size_t inner,
-    size_t cols,
-    double *out_kernel_ms)
-{
-    if (!out_kernel_ms)
-    {
-        return set_error("null out_kernel_ms in gpu_block_mul_timed");
-    }
-    return gpu_block_matmul(out, lhs, rhs, rows, inner, cols, out_kernel_ms);
-}
 
 extern "C" int gpu_matrix_add(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs)
 {
@@ -2298,7 +1823,7 @@ extern "C" int gpu_matrix_mul_timed(
 extern "C" int gpu_matrix_mul_scalar(
     GpuMatrix *out,
     const GpuMatrix *lhs,
-    const GpuPoly *scalar)
+    const GpuMatrix *scalar)
 {
     if (!out || !lhs || !scalar)
     {
@@ -2311,6 +1836,10 @@ extern "C" int gpu_matrix_mul_scalar(
     if (lhs->ctx != out->ctx || lhs->level != out->level)
     {
         return set_error("context mismatch in gpu_matrix_mul_scalar");
+    }
+    if (scalar->rows != 1 || scalar->cols != 1)
+    {
+        return set_error("gpu_matrix_mul_scalar requires 1x1 scalar matrix");
     }
     if (scalar->ctx != lhs->ctx || scalar->level != lhs->level)
     {

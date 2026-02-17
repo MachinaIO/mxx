@@ -149,19 +149,6 @@ unsafe extern "C" {
     ) -> c_int;
     pub(crate) fn gpu_matrix_destroy(mat: *mut GpuMatrixOpaque);
     pub(crate) fn gpu_matrix_copy(dst: *mut GpuMatrixOpaque, src: *const GpuMatrixOpaque) -> c_int;
-    pub(crate) fn gpu_matrix_entry_clone(
-        mat: *const GpuMatrixOpaque,
-        row: usize,
-        col: usize,
-        out_poly: *mut *mut GpuPolyOpaque,
-        out_events: *mut *mut GpuEventSetOpaque,
-    ) -> c_int;
-    pub(crate) fn gpu_matrix_copy_entry(
-        mat: *mut GpuMatrixOpaque,
-        row: usize,
-        col: usize,
-        src: *const GpuPolyOpaque,
-    ) -> c_int;
     pub(crate) fn gpu_matrix_load_rns_batch(
         mat: *mut GpuMatrixOpaque,
         bytes: *const u8,
@@ -205,7 +192,7 @@ unsafe extern "C" {
     pub(crate) fn gpu_matrix_mul_scalar(
         out: *mut GpuMatrixOpaque,
         lhs: *const GpuMatrixOpaque,
-        scalar: *const GpuPolyOpaque,
+        scalar: *const GpuMatrixOpaque,
     ) -> c_int;
     pub(crate) fn gpu_matrix_copy_block(
         out: *mut GpuMatrixOpaque,
@@ -248,6 +235,8 @@ unsafe extern "C" {
         sigma: f64,
         seed: u64,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_ntt_all(mat: *mut GpuMatrixOpaque, batch: c_int) -> c_int;
+    pub(crate) fn gpu_matrix_intt_all(mat: *mut GpuMatrixOpaque, batch: c_int) -> c_int;
 
     pub(crate) fn gpu_poly_ntt(poly: *mut GpuPolyOpaque, batch: c_int) -> c_int;
     pub(crate) fn gpu_poly_intt(poly: *mut GpuPolyOpaque, batch: c_int) -> c_int;

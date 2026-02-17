@@ -97,13 +97,6 @@ int gpu_poly_add(GpuPoly* out, const GpuPoly* a, const GpuPoly* b);
 int gpu_poly_sub(GpuPoly* out, const GpuPoly* a, const GpuPoly* b);
 int gpu_poly_mul(GpuPoly* out, const GpuPoly* a, const GpuPoly* b);
 int gpu_poly_equal(const GpuPoly* lhs, const GpuPoly* rhs, int* out_equal);
-int gpu_block_add(GpuPoly* const* out, const GpuPoly* const* lhs, const GpuPoly* const* rhs, size_t count);
-int gpu_block_sub(GpuPoly* const* out, const GpuPoly* const* lhs, const GpuPoly* const* rhs, size_t count);
-int gpu_block_entrywise_mul(
-    GpuPoly* const* out,
-    const GpuPoly* const* lhs,
-    const GpuPoly* const* rhs,
-    size_t count);
 int gpu_poly_decompose_base(
     const GpuPoly* src,
     uint32_t base_bits,
@@ -113,13 +106,6 @@ int gpu_poly_decompose_base(
 int gpu_matrix_create(GpuContext* ctx, int level, size_t rows, size_t cols, int format, GpuMatrix** out);
 void gpu_matrix_destroy(GpuMatrix* mat);
 int gpu_matrix_copy(GpuMatrix* dst, const GpuMatrix* src);
-int gpu_matrix_entry_clone(
-    const GpuMatrix* mat,
-    size_t row,
-    size_t col,
-    GpuPoly** out_poly,
-    GpuEventSet** out_events);
-int gpu_matrix_copy_entry(GpuMatrix* mat, size_t row, size_t col, const GpuPoly* src);
 int gpu_matrix_load_rns_batch(
     GpuMatrix* mat,
     const uint8_t* bytes,
@@ -137,7 +123,7 @@ int gpu_matrix_sub(GpuMatrix* out, const GpuMatrix* lhs, const GpuMatrix* rhs);
 int gpu_matrix_mul(GpuMatrix* out, const GpuMatrix* lhs, const GpuMatrix* rhs);
 int gpu_matrix_equal(const GpuMatrix* lhs, const GpuMatrix* rhs, int* out_equal);
 int gpu_matrix_mul_timed(GpuMatrix* out, const GpuMatrix* lhs, const GpuMatrix* rhs, double* out_kernel_ms);
-int gpu_matrix_mul_scalar(GpuMatrix* out, const GpuMatrix* lhs, const GpuPoly* scalar);
+int gpu_matrix_mul_scalar(GpuMatrix* out, const GpuMatrix* lhs, const GpuMatrix* scalar);
 int gpu_matrix_copy_block(
     GpuMatrix* out,
     const GpuMatrix* src,
@@ -173,6 +159,8 @@ int gpu_matrix_sample_distribution(
     int dist_type,
     double sigma,
     uint64_t seed);
+int gpu_matrix_ntt_all(GpuMatrix* mat, int batch);
+int gpu_matrix_intt_all(GpuMatrix* mat, int batch);
 
 int gpu_poly_ntt(GpuPoly* poly, int batch);
 int gpu_poly_intt(GpuPoly* poly, int batch);

@@ -4,25 +4,24 @@ use crate::{
     parallel_iter,
     poly::{
         Poly, PolyParams,
-        dcrt::{
-            gpu::{
-                GPU_MATRIX_DIST_BIT, GPU_MATRIX_DIST_GAUSS, GPU_MATRIX_DIST_TERNARY,
-                GPU_MATRIX_DIST_UNIFORM, GPU_POLY_FORMAT_COEFF, GPU_POLY_FORMAT_EVAL,
-                GpuDCRTPoly, GpuDCRTPolyParams,
-                GpuEventSetOpaque, GpuMatrixOpaque, check_status, gpu_event_set_destroy,
-                gpu_event_set_wait, gpu_matrix_add, gpu_matrix_copy, gpu_matrix_copy_block,
-                gpu_matrix_copy_entry, gpu_matrix_create, gpu_matrix_decompose_base,
-                gpu_matrix_destroy, gpu_matrix_entry_clone, gpu_matrix_equal,
-                gpu_matrix_fill_gadget, gpu_matrix_gauss_samp_gq_arb_base,
-                gpu_matrix_load_rns_batch, gpu_matrix_mul, gpu_matrix_mul_scalar,
-                gpu_matrix_mul_timed, gpu_matrix_sample_distribution, gpu_matrix_sample_p1_full,
-                gpu_matrix_store_rns_batch, gpu_matrix_sub, gpu_poly_destroy, gpu_poly_intt,
-                gpu_poly_ntt,
+            dcrt::{
+                gpu::{
+                    GPU_MATRIX_DIST_BIT, GPU_MATRIX_DIST_GAUSS, GPU_MATRIX_DIST_TERNARY,
+                    GPU_MATRIX_DIST_UNIFORM, GPU_POLY_FORMAT_COEFF, GPU_POLY_FORMAT_EVAL,
+                    GpuDCRTPoly, GpuDCRTPolyParams, GpuEventSetOpaque, GpuMatrixOpaque,
+                    check_status, gpu_event_set_destroy, gpu_event_set_wait, gpu_matrix_add,
+                    gpu_matrix_copy, gpu_matrix_copy_block, gpu_matrix_create,
+                    gpu_matrix_decompose_base, gpu_matrix_destroy, gpu_matrix_equal,
+                    gpu_matrix_fill_gadget, gpu_matrix_gauss_samp_gq_arb_base,
+                    gpu_matrix_intt_all, gpu_matrix_load_rns_batch, gpu_matrix_mul,
+                    gpu_matrix_mul_scalar, gpu_matrix_mul_timed, gpu_matrix_ntt_all,
+                    gpu_matrix_sample_distribution, gpu_matrix_sample_p1_full,
+                    gpu_matrix_store_rns_batch, gpu_matrix_sub,
+                },
+                params::DCRTPolyParams,
+                poly::DCRTPoly,
             },
-            params::DCRTPolyParams,
-            poly::DCRTPoly,
         },
-    },
     utils::block_size,
 };
 use num_bigint::BigUint;
@@ -199,37 +198,8 @@ impl GpuDCRTPolyMatrix {
         if self.is_ntt {
             return;
         }
-        let mut poly_ptr: *mut _ = ptr::null_mut();
-        let mut events: *mut GpuEventSetOpaque = ptr::null_mut();
-        let status = unsafe { gpu_matrix_entry_clone(self.raw, 0, 0, &mut poly_ptr, &mut events) };
-        check_status(status, "gpu_matrix_entry_clone");
-        if !events.is_null() {
-            let wait_status = unsafe { gpu_event_set_wait(events) };
-            unsafe { gpu_event_set_destroy(events) };
-            check_status(wait_status, "gpu_event_set_wait");
-        }
-        let status = unsafe { gpu_poly_ntt(poly_ptr, batch) };
-        check_status(status, "gpu_poly_ntt");
-
-        let mut new_raw: *mut GpuMatrixOpaque = ptr::null_mut();
-        let status = unsafe {
-            gpu_matrix_create(
-                self.params.ctx_raw(),
-                self.level as i32,
-                1,
-                1,
-                GPU_POLY_FORMAT_EVAL,
-                &mut new_raw as *mut *mut GpuMatrixOpaque,
-            )
-        };
-        check_status(status, "gpu_matrix_create");
-        let status = unsafe { gpu_matrix_copy_entry(new_raw, 0, 0, poly_ptr) };
-        check_status(status, "gpu_matrix_copy_entry");
-        unsafe {
-            gpu_matrix_destroy(self.raw);
-            gpu_poly_destroy(poly_ptr);
-        }
-        self.raw = new_raw;
+        let status = unsafe { gpu_matrix_ntt_all(self.raw, batch) };
+        check_status(status, "gpu_matrix_ntt_all");
         self.is_ntt = true;
     }
 
@@ -238,37 +208,8 @@ impl GpuDCRTPolyMatrix {
         if !self.is_ntt {
             return;
         }
-        let mut poly_ptr: *mut _ = ptr::null_mut();
-        let mut events: *mut GpuEventSetOpaque = ptr::null_mut();
-        let status = unsafe { gpu_matrix_entry_clone(self.raw, 0, 0, &mut poly_ptr, &mut events) };
-        check_status(status, "gpu_matrix_entry_clone");
-        if !events.is_null() {
-            let wait_status = unsafe { gpu_event_set_wait(events) };
-            unsafe { gpu_event_set_destroy(events) };
-            check_status(wait_status, "gpu_event_set_wait");
-        }
-        let status = unsafe { gpu_poly_intt(poly_ptr, batch) };
-        check_status(status, "gpu_poly_intt");
-
-        let mut new_raw: *mut GpuMatrixOpaque = ptr::null_mut();
-        let status = unsafe {
-            gpu_matrix_create(
-                self.params.ctx_raw(),
-                self.level as i32,
-                1,
-                1,
-                GPU_POLY_FORMAT_COEFF,
-                &mut new_raw as *mut *mut GpuMatrixOpaque,
-            )
-        };
-        check_status(status, "gpu_matrix_create");
-        let status = unsafe { gpu_matrix_copy_entry(new_raw, 0, 0, poly_ptr) };
-        check_status(status, "gpu_matrix_copy_entry");
-        unsafe {
-            gpu_matrix_destroy(self.raw);
-            gpu_poly_destroy(poly_ptr);
-        }
-        self.raw = new_raw;
+        let status = unsafe { gpu_matrix_intt_all(self.raw, batch) };
+        check_status(status, "gpu_matrix_intt_all");
         self.is_ntt = false;
     }
 
@@ -1204,27 +1145,7 @@ impl GpuDCRTPolyMatrix {
         }
         let scalar_mat = scalar_eval.inner();
         scalar_mat.assert_singleton();
-
-        let mut scalar_poly: *mut _ = ptr::null_mut();
-        let mut events: *mut GpuEventSetOpaque = ptr::null_mut();
-        let status = unsafe {
-            gpu_matrix_entry_clone(
-                scalar_mat.raw,
-                0,
-                0,
-                &mut scalar_poly as *mut _,
-                &mut events as *mut *mut GpuEventSetOpaque,
-            )
-        };
-        check_status(status, "gpu_matrix_entry_clone");
-        if !events.is_null() {
-            let wait_status = unsafe { gpu_event_set_wait(events) };
-            unsafe { gpu_event_set_destroy(events) };
-            check_status(wait_status, "gpu_event_set_wait");
-        }
-
-        let status = unsafe { gpu_matrix_mul_scalar(out.raw, self.raw, scalar_poly) };
-        unsafe { gpu_poly_destroy(scalar_poly) };
+        let status = unsafe { gpu_matrix_mul_scalar(out.raw, self.raw, scalar_mat.raw) };
         check_status(status, "gpu_matrix_mul_scalar");
         out
     }

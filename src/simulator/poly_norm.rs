@@ -1,6 +1,6 @@
 use crate::{impl_binop_with_refs, simulator::SimulatorContext};
 use bigdecimal::BigDecimal;
-use num_traits::One;
+use num_traits::{FromPrimitive, One};
 use std::{
     ops::{Add, AddAssign, Mul, MulAssign},
     sync::Arc,
@@ -22,7 +22,7 @@ impl PolyNorm {
     }
 
     pub fn sample_gauss(ctx: Arc<SimulatorContext>, sigma: BigDecimal) -> Self {
-        let norm = sigma * 6;
+        let norm = sigma * BigDecimal::from_f32(6.5).unwrap();
         PolyNorm { ctx, norm }
     }
 }

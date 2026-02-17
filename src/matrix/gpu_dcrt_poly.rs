@@ -4,24 +4,23 @@ use crate::{
     parallel_iter,
     poly::{
         Poly, PolyParams,
-            dcrt::{
-                gpu::{
-                    GPU_MATRIX_DIST_BIT, GPU_MATRIX_DIST_GAUSS, GPU_MATRIX_DIST_TERNARY,
-                    GPU_MATRIX_DIST_UNIFORM, GPU_POLY_FORMAT_COEFF, GPU_POLY_FORMAT_EVAL,
-                    GpuDCRTPoly, GpuDCRTPolyParams, GpuEventSetOpaque, GpuMatrixOpaque,
-                    check_status, gpu_event_set_destroy, gpu_event_set_wait, gpu_matrix_add,
-                    gpu_matrix_copy, gpu_matrix_copy_block, gpu_matrix_create,
-                    gpu_matrix_decompose_base, gpu_matrix_destroy, gpu_matrix_equal,
-                    gpu_matrix_fill_gadget, gpu_matrix_gauss_samp_gq_arb_base,
-                    gpu_matrix_intt_all, gpu_matrix_load_rns_batch, gpu_matrix_mul,
-                    gpu_matrix_mul_scalar, gpu_matrix_mul_timed, gpu_matrix_ntt_all,
-                    gpu_matrix_sample_distribution, gpu_matrix_sample_p1_full,
-                    gpu_matrix_store_rns_batch, gpu_matrix_sub,
-                },
-                params::DCRTPolyParams,
-                poly::DCRTPoly,
+        dcrt::{
+            gpu::{
+                GPU_MATRIX_DIST_BIT, GPU_MATRIX_DIST_GAUSS, GPU_MATRIX_DIST_TERNARY,
+                GPU_MATRIX_DIST_UNIFORM, GPU_POLY_FORMAT_COEFF, GPU_POLY_FORMAT_EVAL, GpuDCRTPoly,
+                GpuDCRTPolyParams, GpuEventSetOpaque, GpuMatrixOpaque, check_status,
+                gpu_event_set_destroy, gpu_event_set_wait, gpu_matrix_add, gpu_matrix_copy,
+                gpu_matrix_copy_block, gpu_matrix_create, gpu_matrix_decompose_base,
+                gpu_matrix_destroy, gpu_matrix_equal, gpu_matrix_fill_gadget,
+                gpu_matrix_gauss_samp_gq_arb_base, gpu_matrix_intt_all, gpu_matrix_load_rns_batch,
+                gpu_matrix_mul, gpu_matrix_mul_scalar, gpu_matrix_mul_timed, gpu_matrix_ntt_all,
+                gpu_matrix_sample_distribution, gpu_matrix_sample_p1_full,
+                gpu_matrix_store_rns_batch, gpu_matrix_sub,
             },
+            params::DCRTPolyParams,
+            poly::DCRTPoly,
         },
+    },
     utils::block_size,
 };
 use num_bigint::BigUint;
@@ -90,13 +89,8 @@ impl Clone for GpuDCRTPolyMatrix {
                 self.is_ntt,
             );
         }
-        let out = Self::new_empty_with_state(
-            &self.params,
-            self.nrow,
-            self.ncol,
-            self.level,
-            self.is_ntt,
-        );
+        let out =
+            Self::new_empty_with_state(&self.params, self.nrow, self.ncol, self.level, self.is_ntt);
         let status = unsafe { gpu_matrix_copy(out.raw, self.raw) };
         check_status(status, "gpu_matrix_copy");
         out
@@ -536,18 +530,13 @@ impl GpuDCRTPolyMatrix {
             if self.level != other.level || self.is_ntt != other.is_ntt {
                 panic!(
                     "Concat error: mismatched state at index {} (lhs level/is_ntt = {}/{}, rhs = {}/{})",
-                    idx,
-                    self.level,
-                    self.is_ntt,
-                    other.level,
-                    other.is_ntt
+                    idx, self.level, self.is_ntt, other.level, other.is_ntt
                 );
             }
         }
         let nrow = self.nrow + others.iter().map(|x| x.nrow).sum::<usize>();
         let ncol = self.ncol;
-        let mut out =
-            Self::new_zero_with_state(&self.params, nrow, ncol, self.level, self.is_ntt);
+        let mut out = Self::new_zero_with_state(&self.params, nrow, ncol, self.level, self.is_ntt);
         out.copy_block_from(&self, 0, 0, 0, 0, self.nrow, self.ncol);
         let mut row_offset = self.nrow;
         for other in others.iter() {
@@ -575,11 +564,7 @@ impl GpuDCRTPolyMatrix {
             if self.level != other.level || self.is_ntt != other.is_ntt {
                 panic!(
                     "Concat error: mismatched state at index {} (lhs level/is_ntt = {}/{}, rhs = {}/{})",
-                    idx,
-                    self.level,
-                    self.is_ntt,
-                    other.level,
-                    other.is_ntt
+                    idx, self.level, self.is_ntt, other.level, other.is_ntt
                 );
             }
         }
@@ -607,19 +592,14 @@ impl GpuDCRTPolyMatrix {
             if self.level != other.level || self.is_ntt != other.is_ntt {
                 panic!(
                     "Concat error: mismatched state at index {} (lhs level/is_ntt = {}/{}, rhs = {}/{})",
-                    idx,
-                    self.level,
-                    self.is_ntt,
-                    other.level,
-                    other.is_ntt
+                    idx, self.level, self.is_ntt, other.level, other.is_ntt
                 );
             }
         }
 
         let nrow = self.nrow + others.iter().map(|x| x.nrow).sum::<usize>();
         let ncol = self.ncol + others.iter().map(|x| x.ncol).sum::<usize>();
-        let mut out =
-            Self::new_zero_with_state(&self.params, nrow, ncol, self.level, self.is_ntt);
+        let mut out = Self::new_zero_with_state(&self.params, nrow, ncol, self.level, self.is_ntt);
         out.copy_block_from(&self, 0, 0, 0, 0, self.nrow, self.ncol);
         let mut row_offset = self.nrow;
         let mut col_offset = self.ncol;
@@ -654,11 +634,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         let bytes_per_poly = rns_bytes_len(&self.params);
         let total = self.nrow.saturating_mul(self.ncol);
         let mut bytes = vec![0u8; total.saturating_mul(bytes_per_poly)];
-        let format = if self.is_ntt {
-            GPU_POLY_FORMAT_EVAL
-        } else {
-            GPU_POLY_FORMAT_COEFF
-        };
+        let format = if self.is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
         self.store_rns_bytes(&mut bytes, bytes_per_poly, format);
 
         let entries = (0..self.nrow)
@@ -809,13 +785,8 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
     }
 
     fn transpose(&self) -> Self {
-        let mut out = Self::new_empty_with_state(
-            &self.params,
-            self.ncol,
-            self.nrow,
-            self.level,
-            self.is_ntt,
-        );
+        let mut out =
+            Self::new_empty_with_state(&self.params, self.ncol, self.nrow, self.level, self.is_ntt);
         for i in 0..self.nrow {
             for j in 0..self.ncol {
                 out.copy_block_from(self, j, i, i, j, 1, 1);

@@ -715,47 +715,6 @@ pub struct GpuDCRTPoly {
     is_ntt: bool,
 }
 
-struct GpuMatrixHandle {
-    raw: *mut GpuMatrixOpaque,
-}
-
-impl GpuMatrixHandle {
-    fn create(
-        params: &GpuDCRTPolyParams,
-        level: usize,
-        rows: usize,
-        cols: usize,
-        format: c_int,
-    ) -> Self {
-        let mut raw: *mut GpuMatrixOpaque = ptr::null_mut();
-        let status = unsafe {
-            gpu_matrix_create(
-                params.ctx_raw(),
-                level as c_int,
-                rows,
-                cols,
-                format,
-                &mut raw as *mut *mut GpuMatrixOpaque,
-            )
-        };
-        check_status(status, "gpu_matrix_create");
-        Self { raw }
-    }
-
-    fn raw(&self) -> *mut GpuMatrixOpaque {
-        self.raw
-    }
-}
-
-impl Drop for GpuMatrixHandle {
-    fn drop(&mut self) {
-        if !self.raw.is_null() {
-            unsafe { gpu_matrix_destroy(self.raw) };
-            self.raw = ptr::null_mut();
-        }
-    }
-}
-
 impl Debug for GpuDCRTPoly {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GpuDCRTPoly")
@@ -804,19 +763,11 @@ impl GpuDCRTPoly {
         flat: Vec<u64>,
         is_ntt: bool,
     ) -> Self {
+        let poly = Self::new_empty(params, level, is_ntt);
         let format = if is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
-        let mat = GpuMatrixHandle::create(params.as_ref(), level, 1, 1, format);
-        let bytes_per_poly = flat.len().saturating_mul(mem::size_of::<u64>());
-        let status = unsafe {
-            gpu_matrix_load_rns_batch(
-                mat.raw(),
-                flat.as_ptr() as *const u8,
-                bytes_per_poly,
-                format,
-            )
-        };
-        check_status(status, "gpu_matrix_load_rns_batch");
-        Self::from_singleton_matrix(params, level, is_ntt, mat.raw())
+        let status = unsafe { gpu_poly_load_rns(poly.raw, flat.as_ptr(), flat.len(), format) };
+        check_status(status, "gpu_poly_load_rns");
+        poly
     }
 
     fn from_u64_vecs(params: &GpuDCRTPolyParams, coeffs: &[Vec<u64>]) -> Self {
@@ -855,23 +806,22 @@ impl GpuDCRTPoly {
         if bytes_out.is_empty() {
             return;
         }
-        let mat = self.to_singleton_matrix(self.is_ntt);
+        let ptrs = [self.raw];
         let mut events: *mut GpuEventSetOpaque = ptr::null_mut();
         let status = unsafe {
-            gpu_matrix_store_rns_batch(
-                mat.raw(),
+            gpu_poly_store_rns_batch(
+                ptrs.as_ptr(),
+                1,
                 bytes_out.as_mut_ptr(),
                 bytes_out.len(),
                 format,
                 &mut events,
             )
         };
-        check_status(status, "gpu_matrix_store_rns_batch");
-        if !events.is_null() {
-            let wait_status = unsafe { gpu_event_set_wait(events) };
-            unsafe { gpu_event_set_destroy(events) };
-            check_status(wait_status, "gpu_event_set_wait");
-        }
+        check_status(status, "gpu_poly_store_rns_batch");
+        let wait_status = unsafe { gpu_event_set_wait(events) };
+        unsafe { gpu_event_set_destroy(events) };
+        check_status(wait_status, "gpu_event_set_wait");
         self.is_ntt = format == GPU_POLY_FORMAT_EVAL;
     }
 
@@ -957,16 +907,28 @@ impl GpuDCRTPoly {
         bytes_per_poly: usize,
         format: c_int,
     ) {
-        if polys.is_empty() || bytes_out.is_empty() || bytes_per_poly == 0 {
+        if polys.is_empty() || bytes_out.is_empty() {
             return;
         }
-        for (idx, poly) in polys.iter_mut().enumerate() {
-            let start = idx.saturating_mul(bytes_per_poly);
-            let end = start.saturating_add(bytes_per_poly);
-            if end > bytes_out.len() {
-                break;
-            }
-            poly.store_rns_bytes(&mut bytes_out[start..end], format);
+        let ptrs = polys.iter_mut().map(|poly| poly.raw).collect::<Vec<_>>();
+        let mut events: *mut GpuEventSetOpaque = ptr::null_mut();
+        let status = unsafe {
+            gpu_poly_store_rns_batch(
+                ptrs.as_ptr(),
+                polys.len(),
+                bytes_out.as_mut_ptr(),
+                bytes_per_poly,
+                format,
+                &mut events,
+            )
+        };
+        check_status(status, "gpu_poly_store_rns_batch");
+        let wait_status = unsafe { gpu_event_set_wait(events) };
+        unsafe { gpu_event_set_destroy(events) };
+        check_status(wait_status, "gpu_event_set_wait");
+        let is_ntt = format == GPU_POLY_FORMAT_EVAL;
+        for poly in polys.iter_mut() {
+            poly.is_ntt = is_ntt;
         }
     }
 
@@ -985,15 +947,6 @@ impl GpuDCRTPoly {
         self.is_ntt
     }
 
-    fn ensure_eval_domain(&self) -> Self {
-        if self.is_ntt {
-            return self.clone();
-        }
-        let mut tmp = self.clone();
-        tmp.ntt_in_place();
-        tmp
-    }
-
     pub(crate) fn ntt_in_place(&mut self) {
         if self.is_ntt {
             return;
@@ -1006,40 +959,6 @@ impl GpuDCRTPoly {
     fn assert_compatible(&self, other: &Self) {
         assert_eq!(self.level, other.level, "GPU polynomials must have the same level");
         assert_eq!(self.params.as_ref(), other.params.as_ref(), "GPU params must match");
-    }
-
-    fn to_singleton_matrix(&self, matrix_is_ntt: bool) -> GpuMatrixHandle {
-        let format = if matrix_is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
-        let mat = GpuMatrixHandle::create(self.params.as_ref(), self.level, 1, 1, format);
-        debug_assert_eq!(
-            self.is_ntt, matrix_is_ntt,
-            "to_singleton_matrix requires caller-side domain alignment"
-        );
-        let status = unsafe { gpu_matrix_copy_entry(mat.raw(), 0, 0, self.raw_ptr()) };
-        check_status(status, "gpu_matrix_copy_entry");
-        mat
-    }
-
-    fn from_singleton_matrix(
-        params: Arc<GpuDCRTPolyParams>,
-        level: usize,
-        is_ntt: bool,
-        mat: *const GpuMatrixOpaque,
-    ) -> Self {
-        let mut poly_ptr: *mut GpuPolyOpaque = ptr::null_mut();
-        let status = unsafe { gpu_matrix_entry_clone(mat, 0, 0, &mut poly_ptr) };
-        check_status(status, "gpu_matrix_entry_clone");
-        unsafe { Self::from_raw(params, poly_ptr, level, is_ntt) }
-    }
-
-    fn equal_via_singleton_matrix(lhs: &Self, rhs: &Self, compare_ntt: bool) -> bool {
-        let lhs_mat = lhs.to_singleton_matrix(compare_ntt);
-        let rhs_mat = rhs.to_singleton_matrix(compare_ntt);
-        let mut out_equal: c_int = 0;
-        let status =
-            unsafe { gpu_matrix_equal(lhs_mat.raw(), rhs_mat.raw(), &mut out_equal as *mut c_int) };
-        check_status(status, "gpu_matrix_equal");
-        out_equal != 0
     }
 
     // pub(crate) fn add_into(out: &mut GpuDCRTPoly, a: &GpuDCRTPoly, b: &GpuDCRTPoly) {
@@ -1180,12 +1099,18 @@ impl PartialEq for GpuDCRTPoly {
         if self.raw == other.raw {
             return true;
         }
+        let mut out_equal: c_int = 0;
         if self.is_ntt == other.is_ntt {
-            return Self::equal_via_singleton_matrix(self, other, self.is_ntt);
+            let status =
+                unsafe { gpu_poly_equal(self.raw, other.raw, &mut out_equal as *mut c_int) };
+            check_status(status, "gpu_poly_equal");
+            return out_equal != 0;
         }
         let lhs = self.ensure_coeff_domain();
         let rhs = other.ensure_coeff_domain();
-        Self::equal_via_singleton_matrix(&lhs, &rhs, false)
+        let status = unsafe { gpu_poly_equal(lhs.raw, rhs.raw, &mut out_equal as *mut c_int) };
+        check_status(status, "gpu_poly_equal");
+        out_equal != 0
     }
 }
 
@@ -1381,23 +1306,17 @@ impl Poly for GpuDCRTPoly {
         if num_digits == 0 {
             return Vec::new();
         }
-        let src_eval = self.ensure_eval_domain();
-        let src_mat = src_eval.to_singleton_matrix(true);
-        let out_mat = GpuMatrixHandle::create(self.params.as_ref(), self.level, num_digits, 1, 1);
-        let status =
-            unsafe { gpu_matrix_decompose_base(src_mat.raw(), params.base_bits(), out_mat.raw()) };
-        check_status(status, "gpu_matrix_decompose_base");
-        (0..num_digits)
-            .map(|idx| {
-                let mut poly_ptr: *mut GpuPolyOpaque = ptr::null_mut();
-                let status =
-                    unsafe { gpu_matrix_entry_clone(out_mat.raw(), idx, 0, &mut poly_ptr) };
-                check_status(status, "gpu_matrix_entry_clone");
-                let out =
-                    unsafe { GpuDCRTPoly::from_raw(self.params.clone(), poly_ptr, self.level, true) };
-                out.ensure_coeff_domain()
-            })
-            .collect::<Vec<_>>()
+
+        let mut out = (0..num_digits)
+            .map(|_| GpuDCRTPoly::new_empty(self.params.clone(), self.level, false))
+            .collect::<Vec<_>>();
+        let out_ptrs = out.iter_mut().map(|poly| poly.raw).collect::<Vec<_>>();
+
+        let status = unsafe {
+            gpu_poly_decompose_base(self.raw, params.base_bits(), out_ptrs.as_ptr(), out_ptrs.len())
+        };
+        check_status(status, "gpu_poly_decompose_base");
+        out
     }
 
     fn extract_bits_with_threshold(&self, params: &Self::Params) -> Vec<bool> {
@@ -1460,45 +1379,27 @@ impl Poly for GpuDCRTPoly {
 
 impl_binop_with_refs!(GpuDCRTPoly => Add::add(self, rhs: &GpuDCRTPoly) -> GpuDCRTPoly {
     self.assert_compatible(rhs);
-    let lhs_eval = self.ensure_eval_domain();
-    let rhs_eval = rhs.ensure_eval_domain();
-    let lhs_mat = lhs_eval.to_singleton_matrix(true);
-    let rhs_mat = rhs_eval.to_singleton_matrix(true);
-    let out_mat =
-        GpuMatrixHandle::create(self.params.as_ref(), self.level, 1, 1, GPU_POLY_FORMAT_EVAL);
-    let status = unsafe { gpu_matrix_add(out_mat.raw(), lhs_mat.raw(), rhs_mat.raw()) };
-    check_status(status, "gpu_matrix_add");
-    let out_eval =
-        GpuDCRTPoly::from_singleton_matrix(self.params.clone(), self.level, true, out_mat.raw());
-    if self.is_ntt { out_eval } else { out_eval.ensure_coeff_domain() }
+    let out = GpuDCRTPoly::new_empty(self.params.clone(), self.level, self.is_ntt);
+    let status = unsafe { gpu_poly_add(out.raw, self.raw, rhs.raw) };
+    check_status(status, "gpu_poly_add");
+    out
 });
 
 impl_binop_with_refs!(GpuDCRTPoly => Sub::sub(self, rhs: &GpuDCRTPoly) -> GpuDCRTPoly {
     self.assert_compatible(rhs);
-    let lhs_eval = self.ensure_eval_domain();
-    let rhs_eval = rhs.ensure_eval_domain();
-    let lhs_mat = lhs_eval.to_singleton_matrix(true);
-    let rhs_mat = rhs_eval.to_singleton_matrix(true);
-    let out_mat =
-        GpuMatrixHandle::create(self.params.as_ref(), self.level, 1, 1, GPU_POLY_FORMAT_EVAL);
-    let status = unsafe { gpu_matrix_sub(out_mat.raw(), lhs_mat.raw(), rhs_mat.raw()) };
-    check_status(status, "gpu_matrix_sub");
-    let out_eval =
-        GpuDCRTPoly::from_singleton_matrix(self.params.clone(), self.level, true, out_mat.raw());
-    if self.is_ntt { out_eval } else { out_eval.ensure_coeff_domain() }
+    let out = GpuDCRTPoly::new_empty(self.params.clone(), self.level, self.is_ntt);
+    let status = unsafe { gpu_poly_sub(out.raw, self.raw, rhs.raw) };
+    check_status(status, "gpu_poly_sub");
+    out
 });
 
 impl_binop_with_refs!(GpuDCRTPoly => Mul::mul(self, rhs: &GpuDCRTPoly) -> GpuDCRTPoly {
     self.assert_compatible(rhs);
-    let lhs_eval = self.ensure_eval_domain();
-    let rhs_eval = rhs.ensure_eval_domain();
-    let lhs_mat = lhs_eval.to_singleton_matrix(true);
-    let rhs_mat = rhs_eval.to_singleton_matrix(true);
-    let out_mat =
-        GpuMatrixHandle::create(self.params.as_ref(), self.level, 1, 1, GPU_POLY_FORMAT_EVAL);
-    let status = unsafe { gpu_matrix_mul(out_mat.raw(), lhs_mat.raw(), rhs_mat.raw()) };
-    check_status(status, "gpu_matrix_mul");
-    GpuDCRTPoly::from_singleton_matrix(self.params.clone(), self.level, true, out_mat.raw())
+    let mut out = GpuDCRTPoly::new_empty(self.params.clone(), self.level, false);
+    let status = unsafe { gpu_poly_mul(out.raw, self.raw, rhs.raw) };
+    check_status(status, "gpu_poly_mul");
+    out.is_ntt = true;
+    out
 });
 
 impl Neg for GpuDCRTPoly {

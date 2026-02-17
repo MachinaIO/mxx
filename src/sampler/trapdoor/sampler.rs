@@ -697,7 +697,8 @@ mod test {
         let dgg_large_params = (dgg_large_mean, dgg_large_std, dgg_large_table.as_deref());
 
         for sample_idx in 0..4usize {
-            let p_hat = trapdoor.sample_pert_square_mat(s, c, SIGMA, dgg_large_params, peikert, size);
+            let p_hat =
+                trapdoor.sample_pert_square_mat(s, c, SIGMA, dgg_large_params, peikert, size);
             for i in 0..p_hat.row_size() {
                 for j in 0..p_hat.col_size() {
                     let poly = p_hat.entry(i, j);

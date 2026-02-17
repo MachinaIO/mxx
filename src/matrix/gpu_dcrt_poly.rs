@@ -646,14 +646,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         cols: usize,
     ) {
         GpuDCRTPolyMatrix::copy_block_from(
-            self,
-            src,
-            dst_row,
-            dst_col,
-            src_row,
-            src_col,
-            rows,
-            cols,
+            self, src, dst_row, dst_col, src_row, src_col, rows, cols,
         );
     }
 

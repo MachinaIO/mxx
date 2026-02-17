@@ -33,10 +33,10 @@ int launch_sample_p1_integer_kernel(
     uint64_t seed,
     cudaStream_t stream,
     int device_id,
-    std::vector<int64_t> &sampled_out_host);
+    int64_t **sampled_out_device);
 
-int launch_scatter_p1_integer_to_limb_kernel(
-    const std::vector<int64_t> &sampled_in_host,
+int launch_scatter_p1_integer_to_limb_kernel_device(
+    const int64_t *sampled_in_device,
     const std::vector<uint64_t *> &out_entries,
     size_t n,
     uint64_t modulus,

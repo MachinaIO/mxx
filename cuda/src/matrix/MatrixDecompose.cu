@@ -555,6 +555,8 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
     {
         int device;
         cudaStream_t stream;
+        bool has_aux_limb;
+        dim3 aux_limb_id;
         std::vector<const uint64_t *> src_ptrs;
         std::vector<uint64_t *> dst_ptrs;
         std::vector<uint32_t> shifts;
@@ -571,7 +573,7 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
                 return b;
             }
         }
-        batches.push_back(DecomposeBatch{device, nullptr, {}, {}, {}, {}, {}});
+        batches.push_back(DecomposeBatch{device, nullptr, false, dim3{}, {}, {}, {}, {}, {}});
         return batches.back();
     };
 
@@ -661,6 +663,11 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
                 {
                     batch_ref.stream = out_stream;
                 }
+                if (!batch_ref.has_aux_limb)
+                {
+                    batch_ref.aux_limb_id = out_limb_id;
+                    batch_ref.has_aux_limb = true;
+                }
                 batch_ref.shifts.push_back(shift);
                 batch_ref.masks.push_back(mask);
                 batch_ref.out_moduli.push_back(src->ctx->moduli[static_cast<size_t>(out_limb)]);
@@ -691,7 +698,9 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
             batch_ref.shifts,
             batch_ref.masks,
             batch_ref.out_moduli,
-            batch_ref.stream);
+            batch_ref.stream,
+            out,
+            batch_ref.has_aux_limb ? &batch_ref.aux_limb_id : nullptr);
         if (status != 0)
         {
             cleanup_tmp_inputs();

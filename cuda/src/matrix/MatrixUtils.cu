@@ -108,6 +108,57 @@ const uint64_t *matrix_limb_ptr_by_id(const GpuMatrix *mat, size_t poly_idx, con
     return matrix_limb_ptr_by_id(const_cast<GpuMatrix *>(mat), poly_idx, limb_id);
 }
 
+bool matrix_aux_slice_for_limb(const GpuMatrix *mat, const dim3 &limb_id, size_t bytes, void **out_ptr)
+{
+    if (!out_ptr)
+    {
+        return false;
+    }
+    *out_ptr = nullptr;
+    if (!mat || limb_id.x >= mat->shared_aux_buffers.size() ||
+        limb_id.x >= mat->shared_limb_buffers.size())
+    {
+        return false;
+    }
+
+    const auto &aux_buffer = mat->shared_aux_buffers[limb_id.x];
+    const auto &limb_buffer = mat->shared_limb_buffers[limb_id.x];
+    if (!aux_buffer.ptr || limb_buffer.limb_count == 0 || limb_id.y >= limb_buffer.limb_count)
+    {
+        return false;
+    }
+
+    size_t total_bytes = 0;
+    if (aux_buffer.slots_total > static_cast<size_t>(-1) / sizeof(void *))
+    {
+        return false;
+    }
+    total_bytes = aux_buffer.slots_total * sizeof(void *);
+    if (total_bytes == 0)
+    {
+        return false;
+    }
+
+    const size_t limbs = limb_buffer.limb_count;
+    const size_t alignment = alignof(void *);
+    size_t bytes_per_limb = total_bytes / limbs;
+    bytes_per_limb -= bytes_per_limb % alignment;
+    if (bytes_per_limb == 0 || bytes > bytes_per_limb)
+    {
+        return false;
+    }
+
+    const size_t limb_offset = static_cast<size_t>(limb_id.y) * bytes_per_limb;
+    if (limb_offset > total_bytes || total_bytes - limb_offset < bytes)
+    {
+        return false;
+    }
+
+    auto *base = reinterpret_cast<uint8_t *>(aux_buffer.ptr);
+    *out_ptr = static_cast<void *>(base + limb_offset);
+    return true;
+}
+
 
 int sync_matrix_limb_streams(const GpuMatrix *mat, const char *context)
 {

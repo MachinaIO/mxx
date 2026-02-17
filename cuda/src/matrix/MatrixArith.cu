@@ -227,6 +227,59 @@ namespace
         }
     }
 
+    size_t align_up_size(size_t value, size_t alignment)
+    {
+        if (alignment == 0)
+        {
+            return value;
+        }
+        return (value + alignment - 1) & ~(alignment - 1);
+    }
+
+    int acquire_matrix_aux_workspace(
+        const GpuMatrix *aux_owner,
+        const dim3 *aux_limb_id,
+        size_t bytes,
+        void **out_ptr,
+        bool *out_shared)
+    {
+        if (!out_ptr || !out_shared)
+        {
+            return set_error("invalid acquire_matrix_aux_workspace arguments");
+        }
+        *out_ptr = nullptr;
+        *out_shared = false;
+        if (bytes == 0)
+        {
+            return 0;
+        }
+        if (aux_owner && aux_limb_id && matrix_aux_slice_for_limb(aux_owner, *aux_limb_id, bytes, out_ptr))
+        {
+            *out_shared = true;
+            return 0;
+        }
+        cudaError_t err = cudaMalloc(out_ptr, bytes);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        return 0;
+    }
+
+    int release_matrix_aux_workspace(void *ptr, bool from_shared)
+    {
+        if (!ptr || from_shared)
+        {
+            return 0;
+        }
+        cudaError_t err = cudaFree(ptr);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        return 0;
+    }
+
     template <typename T>
     int launch_block_kernel(
         const std::vector<T *> &out_ptrs,
@@ -235,7 +288,9 @@ namespace
         size_t n,
         T modulus,
         BlockOp op,
-        cudaStream_t stream)
+        cudaStream_t stream,
+        const GpuMatrix *aux_owner,
+        const dim3 *aux_limb_id)
     {
         const size_t count = out_ptrs.size();
         if (count == 0 || n == 0)
@@ -243,52 +298,47 @@ namespace
             return 0;
         }
 
-        T **d_out = nullptr;
-        const T **d_lhs = nullptr;
-        const T **d_rhs = nullptr;
-        const size_t bytes = count * sizeof(T *);
+        const size_t ptr_bytes = count * sizeof(T *);
+        const size_t lhs_offset = align_up_size(ptr_bytes, alignof(T *));
+        const size_t rhs_offset = align_up_size(lhs_offset + ptr_bytes, alignof(T *));
+        const size_t workspace_bytes = rhs_offset + ptr_bytes;
 
-        cudaError_t err = cudaMalloc(&d_out, bytes);
-        if (err != cudaSuccess)
+        void *workspace = nullptr;
+        bool from_shared = false;
+        int status = acquire_matrix_aux_workspace(
+            aux_owner,
+            aux_limb_id,
+            workspace_bytes,
+            &workspace,
+            &from_shared);
+        if (status != 0)
         {
-            return set_error(err);
-        }
-        err = cudaMalloc(&d_lhs, bytes);
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_out);
-            return set_error(err);
-        }
-        err = cudaMalloc(&d_rhs, bytes);
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_out);
-            cudaFree(d_lhs);
-            return set_error(err);
+            return status;
         }
 
-        err = cudaMemcpyAsync(d_out, out_ptrs.data(), bytes, cudaMemcpyHostToDevice, stream);
+        auto *workspace_base = reinterpret_cast<uint8_t *>(workspace);
+        T **d_out = reinterpret_cast<T **>(workspace_base);
+        const T **d_lhs = reinterpret_cast<const T **>(workspace_base + lhs_offset);
+        const T **d_rhs = reinterpret_cast<const T **>(workspace_base + rhs_offset);
+
+        auto cleanup_workspace = [&]() -> int { return release_matrix_aux_workspace(workspace, from_shared); };
+
+        cudaError_t err = cudaMemcpyAsync(d_out, out_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_out);
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
+            cleanup_workspace();
             return set_error(err);
         }
-        err = cudaMemcpyAsync(d_lhs, lhs_ptrs.data(), bytes, cudaMemcpyHostToDevice, stream);
+        err = cudaMemcpyAsync(d_lhs, lhs_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_out);
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
+            cleanup_workspace();
             return set_error(err);
         }
-        err = cudaMemcpyAsync(d_rhs, rhs_ptrs.data(), bytes, cudaMemcpyHostToDevice, stream);
+        err = cudaMemcpyAsync(d_rhs, rhs_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_out);
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
+            cleanup_workspace();
             return set_error(err);
         }
 
@@ -312,24 +362,22 @@ namespace
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            cudaFree(d_out);
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
+            cleanup_workspace();
             return set_error(err);
         }
 
         err = cudaStreamSynchronize(stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_out);
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
+            cleanup_workspace();
             return set_error(err);
         }
 
-        cudaFree(d_out);
-        cudaFree(d_lhs);
-        cudaFree(d_rhs);
+        status = cleanup_workspace();
+        if (status != 0)
+        {
+            return status;
+        }
         return 0;
     }
 
@@ -344,7 +392,9 @@ namespace
         size_t n,
         T modulus,
         cudaStream_t stream,
-        double *out_kernel_ms)
+        double *out_kernel_ms,
+        const GpuMatrix *aux_owner,
+        const dim3 *aux_limb_id)
     {
         const size_t out_count = rows * cols;
         const size_t lhs_count = rows * inner;
@@ -358,54 +408,48 @@ namespace
             return set_error("unexpected pointer counts in launch_block_matmul_kernel");
         }
 
-        T **d_out = nullptr;
-        const T **d_lhs = nullptr;
-        const T **d_rhs = nullptr;
         const size_t out_bytes = out_count * sizeof(T *);
         const size_t lhs_bytes = lhs_count * sizeof(T *);
         const size_t rhs_bytes = rhs_count * sizeof(T *);
+        const size_t lhs_offset = align_up_size(out_bytes, alignof(T *));
+        const size_t rhs_offset = align_up_size(lhs_offset + lhs_bytes, alignof(T *));
+        const size_t workspace_bytes = rhs_offset + rhs_bytes;
 
-        cudaError_t err = cudaMalloc(&d_out, out_bytes);
-        if (err != cudaSuccess)
+        void *workspace = nullptr;
+        bool from_shared = false;
+        int status = acquire_matrix_aux_workspace(
+            aux_owner,
+            aux_limb_id,
+            workspace_bytes,
+            &workspace,
+            &from_shared);
+        if (status != 0)
         {
-            return set_error(err);
-        }
-        err = cudaMalloc(&d_lhs, lhs_bytes);
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_out);
-            return set_error(err);
-        }
-        err = cudaMalloc(&d_rhs, rhs_bytes);
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_out);
-            cudaFree(d_lhs);
-            return set_error(err);
+            return status;
         }
 
-        err = cudaMemcpyAsync(d_out, out_ptrs.data(), out_bytes, cudaMemcpyHostToDevice, stream);
+        auto *workspace_base = reinterpret_cast<uint8_t *>(workspace);
+        T **d_out = reinterpret_cast<T **>(workspace_base);
+        const T **d_lhs = reinterpret_cast<const T **>(workspace_base + lhs_offset);
+        const T **d_rhs = reinterpret_cast<const T **>(workspace_base + rhs_offset);
+        auto cleanup_workspace = [&]() -> int { return release_matrix_aux_workspace(workspace, from_shared); };
+
+        cudaError_t err = cudaMemcpyAsync(d_out, out_ptrs.data(), out_bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_out);
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
+            cleanup_workspace();
             return set_error(err);
         }
         err = cudaMemcpyAsync(d_lhs, lhs_ptrs.data(), lhs_bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_out);
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
+            cleanup_workspace();
             return set_error(err);
         }
         err = cudaMemcpyAsync(d_rhs, rhs_ptrs.data(), rhs_bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_out);
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
+            cleanup_workspace();
             return set_error(err);
         }
 
@@ -422,18 +466,14 @@ namespace
             err = cudaEventCreate(&start);
             if (err != cudaSuccess)
             {
-                cudaFree(d_out);
-                cudaFree(d_lhs);
-                cudaFree(d_rhs);
+                cleanup_workspace();
                 return set_error(err);
             }
             err = cudaEventCreate(&stop);
             if (err != cudaSuccess)
             {
                 cudaEventDestroy(start);
-                cudaFree(d_out);
-                cudaFree(d_lhs);
-                cudaFree(d_rhs);
+                cleanup_workspace();
                 return set_error(err);
             }
             err = cudaEventRecord(start, stream);
@@ -441,9 +481,7 @@ namespace
             {
                 cudaEventDestroy(start);
                 cudaEventDestroy(stop);
-                cudaFree(d_out);
-                cudaFree(d_lhs);
-                cudaFree(d_rhs);
+                cleanup_workspace();
                 return set_error(err);
             }
         }
@@ -458,9 +496,7 @@ namespace
                 cudaEventDestroy(start);
                 cudaEventDestroy(stop);
             }
-            cudaFree(d_out);
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
+            cleanup_workspace();
             return set_error(err);
         }
 
@@ -471,9 +507,7 @@ namespace
             {
                 cudaEventDestroy(start);
                 cudaEventDestroy(stop);
-                cudaFree(d_out);
-                cudaFree(d_lhs);
-                cudaFree(d_rhs);
+                cleanup_workspace();
                 return set_error(err);
             }
             err = cudaEventSynchronize(stop);
@@ -481,9 +515,7 @@ namespace
             {
                 cudaEventDestroy(start);
                 cudaEventDestroy(stop);
-                cudaFree(d_out);
-                cudaFree(d_lhs);
-                cudaFree(d_rhs);
+                cleanup_workspace();
                 return set_error(err);
             }
             float kernel_ms = 0.0f;
@@ -492,9 +524,7 @@ namespace
             {
                 cudaEventDestroy(start);
                 cudaEventDestroy(stop);
-                cudaFree(d_out);
-                cudaFree(d_lhs);
-                cudaFree(d_rhs);
+                cleanup_workspace();
                 return set_error(err);
             }
             *out_kernel_ms += static_cast<double>(kernel_ms);
@@ -506,16 +536,16 @@ namespace
             err = cudaStreamSynchronize(stream);
             if (err != cudaSuccess)
             {
-                cudaFree(d_out);
-                cudaFree(d_lhs);
-                cudaFree(d_rhs);
+                cleanup_workspace();
                 return set_error(err);
             }
         }
 
-        cudaFree(d_out);
-        cudaFree(d_lhs);
-        cudaFree(d_rhs);
+        status = cleanup_workspace();
+        if (status != 0)
+        {
+            return status;
+        }
         return 0;
     }
 
@@ -528,7 +558,9 @@ namespace
         const std::vector<uint32_t> &shifts,
         const std::vector<T> &masks,
         const std::vector<T> &out_moduli,
-        cudaStream_t stream)
+        cudaStream_t stream,
+        const GpuMatrix *aux_owner,
+        const dim3 *aux_limb_id)
     {
         const size_t job_count = shifts.size();
         if (job_count == 0 || poly_count == 0 || n == 0)
@@ -545,100 +577,64 @@ namespace
             return set_error("unexpected pointer counts in matrix_decompose_multi_kernel");
         }
 
-        const T **d_src = nullptr;
-        T **d_dst = nullptr;
-        uint32_t *d_shifts = nullptr;
-        T *d_masks = nullptr;
-        T *d_out_moduli = nullptr;
-
         const size_t ptr_bytes = ptr_count * sizeof(T *);
         const size_t shift_bytes = job_count * sizeof(uint32_t);
         const size_t scalar_bytes = job_count * sizeof(T);
+        const size_t dst_offset = align_up_size(ptr_bytes, alignof(T *));
+        const size_t shifts_offset = align_up_size(dst_offset + ptr_bytes, alignof(uint32_t));
+        const size_t masks_offset = align_up_size(shifts_offset + shift_bytes, alignof(T));
+        const size_t out_moduli_offset = align_up_size(masks_offset + scalar_bytes, alignof(T));
+        const size_t workspace_bytes = out_moduli_offset + scalar_bytes;
 
-        cudaError_t err = cudaMalloc(&d_src, ptr_bytes);
-        if (err != cudaSuccess)
+        void *workspace = nullptr;
+        bool from_shared = false;
+        int status = acquire_matrix_aux_workspace(
+            aux_owner,
+            aux_limb_id,
+            workspace_bytes,
+            &workspace,
+            &from_shared);
+        if (status != 0)
         {
-            return set_error(err);
-        }
-        err = cudaMalloc(&d_dst, ptr_bytes);
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_src);
-            return set_error(err);
-        }
-        err = cudaMalloc(&d_shifts, shift_bytes);
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_src);
-            cudaFree(d_dst);
-            return set_error(err);
-        }
-        err = cudaMalloc(&d_masks, scalar_bytes);
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_src);
-            cudaFree(d_dst);
-            cudaFree(d_shifts);
-            return set_error(err);
-        }
-        err = cudaMalloc(&d_out_moduli, scalar_bytes);
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_src);
-            cudaFree(d_dst);
-            cudaFree(d_shifts);
-            cudaFree(d_masks);
-            return set_error(err);
+            return status;
         }
 
-        err = cudaMemcpyAsync(d_src, src_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
+        auto *workspace_base = reinterpret_cast<uint8_t *>(workspace);
+        const T **d_src = reinterpret_cast<const T **>(workspace_base);
+        T **d_dst = reinterpret_cast<T **>(workspace_base + dst_offset);
+        uint32_t *d_shifts = reinterpret_cast<uint32_t *>(workspace_base + shifts_offset);
+        T *d_masks = reinterpret_cast<T *>(workspace_base + masks_offset);
+        T *d_out_moduli = reinterpret_cast<T *>(workspace_base + out_moduli_offset);
+        auto cleanup_workspace = [&]() -> int { return release_matrix_aux_workspace(workspace, from_shared); };
+
+        cudaError_t err = cudaMemcpyAsync(d_src, src_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_src);
-            cudaFree(d_dst);
-            cudaFree(d_shifts);
-            cudaFree(d_masks);
-            cudaFree(d_out_moduli);
+            cleanup_workspace();
             return set_error(err);
         }
         err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_src);
-            cudaFree(d_dst);
-            cudaFree(d_shifts);
-            cudaFree(d_masks);
-            cudaFree(d_out_moduli);
+            cleanup_workspace();
             return set_error(err);
         }
         err = cudaMemcpyAsync(d_shifts, shifts.data(), shift_bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_src);
-            cudaFree(d_dst);
-            cudaFree(d_shifts);
-            cudaFree(d_masks);
-            cudaFree(d_out_moduli);
+            cleanup_workspace();
             return set_error(err);
         }
         err = cudaMemcpyAsync(d_masks, masks.data(), scalar_bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_src);
-            cudaFree(d_dst);
-            cudaFree(d_shifts);
-            cudaFree(d_masks);
-            cudaFree(d_out_moduli);
+            cleanup_workspace();
             return set_error(err);
         }
         err = cudaMemcpyAsync(d_out_moduli, out_moduli.data(), scalar_bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_src);
-            cudaFree(d_dst);
-            cudaFree(d_shifts);
-            cudaFree(d_masks);
-            cudaFree(d_out_moduli);
+            cleanup_workspace();
             return set_error(err);
         }
 
@@ -657,30 +653,22 @@ namespace
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            cudaFree(d_src);
-            cudaFree(d_dst);
-            cudaFree(d_shifts);
-            cudaFree(d_masks);
-            cudaFree(d_out_moduli);
+            cleanup_workspace();
             return set_error(err);
         }
 
         err = cudaStreamSynchronize(stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_src);
-            cudaFree(d_dst);
-            cudaFree(d_shifts);
-            cudaFree(d_masks);
-            cudaFree(d_out_moduli);
+            cleanup_workspace();
             return set_error(err);
         }
 
-        cudaFree(d_src);
-        cudaFree(d_dst);
-        cudaFree(d_shifts);
-        cudaFree(d_masks);
-        cudaFree(d_out_moduli);
+        status = cleanup_workspace();
+        if (status != 0)
+        {
+            return status;
+        }
         return 0;
     }
 
@@ -689,7 +677,9 @@ namespace
         const std::vector<const T *> &src_ptrs,
         const std::vector<T *> &dst_ptrs,
         size_t n,
-        cudaStream_t stream)
+        cudaStream_t stream,
+        const GpuMatrix *aux_owner,
+        const dim3 *aux_limb_id)
     {
         const size_t count = src_ptrs.size();
         if (count == 0 || n == 0)
@@ -701,34 +691,38 @@ namespace
             return set_error("unexpected pointer counts in block_copy_kernel");
         }
 
-        const T **d_src = nullptr;
-        T **d_dst = nullptr;
         const size_t bytes = count * sizeof(T *);
+        const size_t dst_offset = align_up_size(bytes, alignof(T *));
+        const size_t workspace_bytes = dst_offset + bytes;
 
-        cudaError_t err = cudaMalloc(&d_src, bytes);
-        if (err != cudaSuccess)
+        void *workspace = nullptr;
+        bool from_shared = false;
+        int status = acquire_matrix_aux_workspace(
+            aux_owner,
+            aux_limb_id,
+            workspace_bytes,
+            &workspace,
+            &from_shared);
+        if (status != 0)
         {
-            return set_error(err);
-        }
-        err = cudaMalloc(&d_dst, bytes);
-        if (err != cudaSuccess)
-        {
-            cudaFree(d_src);
-            return set_error(err);
+            return status;
         }
 
-        err = cudaMemcpyAsync(d_src, src_ptrs.data(), bytes, cudaMemcpyHostToDevice, stream);
+        auto *workspace_base = reinterpret_cast<uint8_t *>(workspace);
+        const T **d_src = reinterpret_cast<const T **>(workspace_base);
+        T **d_dst = reinterpret_cast<T **>(workspace_base + dst_offset);
+        auto cleanup_workspace = [&]() -> int { return release_matrix_aux_workspace(workspace, from_shared); };
+
+        cudaError_t err = cudaMemcpyAsync(d_src, src_ptrs.data(), bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_src);
-            cudaFree(d_dst);
+            cleanup_workspace();
             return set_error(err);
         }
         err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_src);
-            cudaFree(d_dst);
+            cleanup_workspace();
             return set_error(err);
         }
 
@@ -740,21 +734,22 @@ namespace
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            cudaFree(d_src);
-            cudaFree(d_dst);
+            cleanup_workspace();
             return set_error(err);
         }
 
         err = cudaStreamSynchronize(stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_src);
-            cudaFree(d_dst);
+            cleanup_workspace();
             return set_error(err);
         }
 
-        cudaFree(d_src);
-        cudaFree(d_dst);
+        status = cleanup_workspace();
+        if (status != 0)
+        {
+            return status;
+        }
         return 0;
     }
 
@@ -831,7 +826,7 @@ namespace
             dst_ptrs.push_back(reinterpret_cast<T *>(dst_ptr));
         }
 
-        status = launch_copy_kernel(src_ptrs, dst_ptrs, n, exec_stream);
+        status = launch_copy_kernel(src_ptrs, dst_ptrs, n, exec_stream, out, &limb_id);
         if (status != 0)
         {
             return status;
@@ -1124,7 +1119,7 @@ namespace
         }
         const uint64_t modulus64 = lhs->ctx->moduli[static_cast<size_t>(limb)];
         const T modulus = static_cast<T>(modulus64);
-        return launch_block_kernel(out_ptrs, lhs_ptrs, rhs_ptrs, n, modulus, op, stream);
+        return launch_block_kernel(out_ptrs, lhs_ptrs, rhs_ptrs, n, modulus, op, stream, out, &limb_id);
     }
 
     template <typename T>
@@ -1250,7 +1245,9 @@ namespace
             n,
             modulus,
             stream,
-            out_kernel_ms);
+            out_kernel_ms,
+            out,
+            &limb_id);
     }
 
     template <typename T>
@@ -1345,7 +1342,16 @@ namespace
         }
         const uint64_t modulus64 = lhs->ctx->moduli[static_cast<size_t>(limb)];
         const T modulus = static_cast<T>(modulus64);
-        return launch_block_kernel(out_ptrs, lhs_ptrs, rhs_ptrs, n, modulus, BlockOp::Mul, stream);
+        return launch_block_kernel(
+            out_ptrs,
+            lhs_ptrs,
+            rhs_ptrs,
+            n,
+            modulus,
+            BlockOp::Mul,
+            stream,
+            out,
+            &limb_id);
     }
 
     template <typename T>
@@ -1445,10 +1451,10 @@ int launch_sample_p1_integer_kernel(
     uint64_t seed,
     cudaStream_t stream,
     int device_id,
-    std::vector<int64_t> &sampled_out_host);
+    int64_t **sampled_out_device);
 
-int launch_scatter_p1_integer_to_limb_kernel(
-    const std::vector<int64_t> &sampled_in_host,
+int launch_scatter_p1_integer_to_limb_kernel_device(
+    const int64_t *sampled_in_device,
     const std::vector<uint64_t *> &out_entries,
     size_t n,
     uint64_t modulus,

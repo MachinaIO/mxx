@@ -1,4 +1,140 @@
-__global__ void matrix_sample_p1_integer_kernel(
+constexpr size_t kSampleP1LocalMaxM = 8;
+
+__global__ void matrix_sample_p1_integer_kernel_small(
+    const uint64_t **a_entries,
+    const uint64_t **b_entries,
+    const uint64_t **d_entries,
+    const uint64_t **tp2_entries,
+    size_t d,
+    size_t cols,
+    size_t n,
+    int64_t *sampled_out,
+    uint64_t modulus,
+    double sigma,
+    double s,
+    double dgg_stddev,
+    uint64_t seed)
+{
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total_samples = cols * n;
+    if (idx >= total_samples)
+    {
+        return;
+    }
+
+    const size_t m = d * 2;
+    if (m == 0 || m > kSampleP1LocalMaxM)
+    {
+        return;
+    }
+
+    const size_t col_idx = idx / n;
+    const size_t coeff_idx = idx - col_idx * n;
+    double cov[kSampleP1LocalMaxM * kSampleP1LocalMaxM];
+    double mean[kSampleP1LocalMaxM];
+    double col_buf[kSampleP1LocalMaxM];
+    int64_t sampled[kSampleP1LocalMaxM];
+
+    DeviceChaChaRng rng;
+    rng_init(
+        rng,
+        seed,
+        static_cast<uint64_t>(col_idx + 1),
+        static_cast<uint64_t>(coeff_idx + 1),
+        0,
+        0x7065727475726231ULL);
+
+    const double sigma2 = sigma * sigma;
+    const double s2 = s * s;
+    const double denom = s2 - sigma2;
+    if (!(denom > 0.0))
+    {
+        return;
+    }
+    const double c_scale = -sigma2 / denom;
+    const double fallback_var = dgg_stddev * dgg_stddev;
+    const double eps = 1e-9;
+
+    for (size_t i = 0; i < d; ++i)
+    {
+        for (size_t j = 0; j < d; ++j)
+        {
+            const size_t ij = matrix_index(i, j, d);
+            const size_t ji = matrix_index(j, i, d);
+            const double a_ij = static_cast<double>(centered_residue_i64(a_entries[ij][coeff_idx], modulus));
+            const double d_ij = static_cast<double>(centered_residue_i64(d_entries[ij][coeff_idx], modulus));
+            const double b_ij = static_cast<double>(centered_residue_i64(b_entries[ij][coeff_idx], modulus));
+            const double b_ji = static_cast<double>(centered_residue_i64(b_entries[ji][coeff_idx], modulus));
+
+            const double af = -sigma2 * a_ij + (i == j ? s2 : 0.0);
+            const double df = -sigma2 * d_ij + (i == j ? s2 : 0.0);
+            const double bf = -sigma2 * b_ij;
+            const double bt = -sigma2 * b_ji;
+
+            cov[matrix_index(i, j, m)] = af;
+            cov[matrix_index(i + d, j + d, m)] = df;
+            cov[matrix_index(i, j + d, m)] = bf;
+            cov[matrix_index(i + d, j, m)] = bt;
+        }
+    }
+
+    for (size_t row = 0; row < m; ++row)
+    {
+        const size_t tp_idx = matrix_index(row, col_idx, cols);
+        const double c_centered = static_cast<double>(centered_residue_i64(tp2_entries[tp_idx][coeff_idx], modulus));
+        mean[row] = c_scale * c_centered;
+    }
+
+    for (int t = static_cast<int>(m) - 1; t >= 0; --t)
+    {
+        const size_t tt = static_cast<size_t>(t);
+        double var = cov[matrix_index(tt, tt, m)];
+        if (!(var > eps))
+        {
+            var = fallback_var;
+        }
+        const double mu = mean[tt];
+        const int64_t z = sample_integer_karney(rng, mu, sqrt(var));
+        sampled[tt] = z;
+
+        if (t == 0)
+        {
+            break;
+        }
+
+        const double delta = static_cast<double>(z) - mu;
+        for (int i = 0; i < t; ++i)
+        {
+            col_buf[static_cast<size_t>(i)] =
+                cov[matrix_index(static_cast<size_t>(i), tt, m)];
+        }
+
+        for (int i = 0; i < t; ++i)
+        {
+            mean[static_cast<size_t>(i)] +=
+                (col_buf[static_cast<size_t>(i)] / var) * delta;
+        }
+
+        for (int i = 0; i < t; ++i)
+        {
+            for (int j = 0; j <= i; ++j)
+            {
+                double updated = cov[matrix_index(static_cast<size_t>(i), static_cast<size_t>(j), m)] -
+                                 (col_buf[static_cast<size_t>(i)] * col_buf[static_cast<size_t>(j)] / var);
+                cov[matrix_index(static_cast<size_t>(i), static_cast<size_t>(j), m)] = updated;
+                cov[matrix_index(static_cast<size_t>(j), static_cast<size_t>(i), m)] = updated;
+            }
+        }
+    }
+
+    for (size_t row = 0; row < m; ++row)
+    {
+        const size_t out_idx = matrix_index(row, col_idx, cols) * n + coeff_idx;
+        sampled_out[out_idx] = sampled[row];
+    }
+}
+
+__global__ void matrix_sample_p1_integer_kernel_large(
     const uint64_t **a_entries,
     const uint64_t **b_entries,
     const uint64_t **d_entries,
@@ -549,11 +685,15 @@ int launch_sample_p1_integer_kernel(
     uint64_t seed,
     cudaStream_t stream,
     int device_id,
-    std::vector<int64_t> &sampled_out_host)
+    int64_t **sampled_out_device)
 {
+    if (!sampled_out_device)
+    {
+        return set_error("null output pointer in matrix_sample_p1_integer_kernel");
+    }
+    *sampled_out_device = nullptr;
     if (d == 0 || cols == 0 || n == 0)
     {
-        sampled_out_host.clear();
         return 0;
     }
     const size_t mat_entries = d * d;
@@ -574,51 +714,17 @@ int launch_sample_p1_integer_kernel(
         return set_error(err);
     }
 
-    const size_t m = 2 * d;
-    if (m == 0)
+    const size_t m = d * 2;
+    if (m == 0 || m > std::numeric_limits<size_t>::max() / m)
     {
         return set_error("invalid dimension in matrix_sample_p1_integer_kernel");
     }
-    if (m > std::numeric_limits<size_t>::max() / m)
-    {
-        return set_error("workspace overflow in matrix_sample_p1_integer_kernel");
-    }
-    const size_t cov_elems_per_sample = m * m;
-    if (cov_elems_per_sample > std::numeric_limits<size_t>::max() / sizeof(double))
-    {
-        return set_error("workspace overflow in matrix_sample_p1_integer_kernel");
-    }
-    const size_t cov_bytes_per_sample = cov_elems_per_sample * sizeof(double);
-    if (m > std::numeric_limits<size_t>::max() / sizeof(double))
-    {
-        return set_error("workspace overflow in matrix_sample_p1_integer_kernel");
-    }
-    const size_t vec_bytes_per_sample = m * sizeof(double);
-    if (m > std::numeric_limits<size_t>::max() / sizeof(int64_t))
-    {
-        return set_error("workspace overflow in matrix_sample_p1_integer_kernel");
-    }
-    const size_t sampled_bytes_per_sample = m * sizeof(int64_t);
-    if (cov_bytes_per_sample > std::numeric_limits<size_t>::max() - vec_bytes_per_sample)
-    {
-        return set_error("workspace overflow in matrix_sample_p1_integer_kernel");
-    }
-    size_t bytes_per_sample_total = cov_bytes_per_sample + vec_bytes_per_sample;
-    if (bytes_per_sample_total > std::numeric_limits<size_t>::max() - vec_bytes_per_sample)
-    {
-        return set_error("workspace overflow in matrix_sample_p1_integer_kernel");
-    }
-    bytes_per_sample_total += vec_bytes_per_sample;
-    if (bytes_per_sample_total > std::numeric_limits<size_t>::max() - sampled_bytes_per_sample)
-    {
-        return set_error("workspace overflow in matrix_sample_p1_integer_kernel");
-    }
-    bytes_per_sample_total += sampled_bytes_per_sample;
-
     const size_t total_samples = cols * n;
-    size_t chunk_samples = total_samples;
     const size_t total_values = vec_entries * n;
-    sampled_out_host.assign(total_values, 0);
+    if (total_samples == 0 || total_values == 0)
+    {
+        return 0;
+    }
 
     const uint64_t **d_a_entries = nullptr;
     const uint64_t **d_b_entries = nullptr;
@@ -697,81 +803,12 @@ int launch_sample_p1_integer_kernel(
         free_all();
         return set_error(err);
     }
-    double *cov_workspace = nullptr;
-    double *mean_workspace = nullptr;
-    double *col_workspace = nullptr;
-    int64_t *sampled_workspace = nullptr;
-    auto free_workspace = [&]()
-    {
-        if (cov_workspace)
-            cudaFree(cov_workspace);
-        if (mean_workspace)
-            cudaFree(mean_workspace);
-        if (col_workspace)
-            cudaFree(col_workspace);
-        if (sampled_workspace)
-            cudaFree(sampled_workspace);
-        cov_workspace = nullptr;
-        mean_workspace = nullptr;
-        col_workspace = nullptr;
-        sampled_workspace = nullptr;
-    };
-
-    auto alloc_workspace = [&](size_t samples) -> bool
-    {
-        if (samples == 0)
-        {
-            return false;
-        }
-        if (samples > std::numeric_limits<size_t>::max() / cov_bytes_per_sample ||
-            samples > std::numeric_limits<size_t>::max() / vec_bytes_per_sample ||
-            samples > std::numeric_limits<size_t>::max() / sampled_bytes_per_sample)
-        {
-            return false;
-        }
-        cudaError_t local_err = cudaMalloc(&cov_workspace, samples * cov_bytes_per_sample);
-        if (local_err != cudaSuccess)
-        {
-            free_workspace();
-            return false;
-        }
-        local_err = cudaMalloc(&mean_workspace, samples * vec_bytes_per_sample);
-        if (local_err != cudaSuccess)
-        {
-            free_workspace();
-            return false;
-        }
-        local_err = cudaMalloc(&col_workspace, samples * vec_bytes_per_sample);
-        if (local_err != cudaSuccess)
-        {
-            free_workspace();
-            return false;
-        }
-        local_err = cudaMalloc(&sampled_workspace, samples * sampled_bytes_per_sample);
-        if (local_err != cudaSuccess)
-        {
-            free_workspace();
-            return false;
-        }
-        return true;
-    };
-
-    while (!alloc_workspace(chunk_samples))
-    {
-        if (chunk_samples <= 1)
-        {
-            free_all();
-            return set_error("failed to allocate workspace in matrix_sample_p1_integer_kernel");
-        }
-        chunk_samples = (chunk_samples + 1) / 2;
-    }
 
     const int threads = 256;
-    for (size_t sample_start = 0; sample_start < total_samples; sample_start += chunk_samples)
+    if (m <= kSampleP1LocalMaxM)
     {
-        size_t sample_count = std::min(chunk_samples, total_samples - sample_start);
-        const int blocks = static_cast<int>((sample_count + threads - 1) / threads);
-        matrix_sample_p1_integer_kernel<<<blocks, threads, 0, stream>>>(
+        const int blocks = static_cast<int>((total_samples + threads - 1) / threads);
+        matrix_sample_p1_integer_kernel_small<<<blocks, threads, 0, stream>>>(
             d_a_entries,
             d_b_entries,
             d_d_entries,
@@ -779,12 +816,6 @@ int launch_sample_p1_integer_kernel(
             d,
             cols,
             n,
-            sample_start,
-            sample_count,
-            cov_workspace,
-            mean_workspace,
-            col_workspace,
-            sampled_workspace,
             d_sampled_out,
             modulus,
             sigma,
@@ -794,46 +825,171 @@ int launch_sample_p1_integer_kernel(
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            free_workspace();
             free_all();
             return set_error(err);
         }
     }
+    else
+    {
+        const size_t cov_elems_per_sample = m * m;
+        if (cov_elems_per_sample > std::numeric_limits<size_t>::max() / sizeof(double))
+        {
+            free_all();
+            return set_error("workspace overflow in matrix_sample_p1_integer_kernel");
+        }
+        const size_t cov_bytes_per_sample = cov_elems_per_sample * sizeof(double);
+        if (m > std::numeric_limits<size_t>::max() / sizeof(double))
+        {
+            free_all();
+            return set_error("workspace overflow in matrix_sample_p1_integer_kernel");
+        }
+        const size_t vec_bytes_per_sample = m * sizeof(double);
+        if (m > std::numeric_limits<size_t>::max() / sizeof(int64_t))
+        {
+            free_all();
+            return set_error("workspace overflow in matrix_sample_p1_integer_kernel");
+        }
+        const size_t sampled_bytes_per_sample = m * sizeof(int64_t);
+        if (cov_bytes_per_sample > std::numeric_limits<size_t>::max() - vec_bytes_per_sample)
+        {
+            free_all();
+            return set_error("workspace overflow in matrix_sample_p1_integer_kernel");
+        }
+        size_t bytes_per_sample_total = cov_bytes_per_sample + vec_bytes_per_sample;
+        if (bytes_per_sample_total > std::numeric_limits<size_t>::max() - vec_bytes_per_sample)
+        {
+            free_all();
+            return set_error("workspace overflow in matrix_sample_p1_integer_kernel");
+        }
+        bytes_per_sample_total += vec_bytes_per_sample;
+        if (bytes_per_sample_total > std::numeric_limits<size_t>::max() - sampled_bytes_per_sample)
+        {
+            free_all();
+            return set_error("workspace overflow in matrix_sample_p1_integer_kernel");
+        }
+        bytes_per_sample_total += sampled_bytes_per_sample;
+
+        double *cov_workspace = nullptr;
+        double *mean_workspace = nullptr;
+        double *col_workspace = nullptr;
+        int64_t *sampled_workspace = nullptr;
+        auto free_workspace = [&]()
+        {
+            if (cov_workspace)
+                cudaFree(cov_workspace);
+            if (mean_workspace)
+                cudaFree(mean_workspace);
+            if (col_workspace)
+                cudaFree(col_workspace);
+            if (sampled_workspace)
+                cudaFree(sampled_workspace);
+            cov_workspace = nullptr;
+            mean_workspace = nullptr;
+            col_workspace = nullptr;
+            sampled_workspace = nullptr;
+        };
+
+        size_t chunk_samples = total_samples;
+        auto alloc_workspace = [&](size_t samples) -> bool
+        {
+            if (samples == 0)
+            {
+                return false;
+            }
+            if (samples > std::numeric_limits<size_t>::max() / cov_bytes_per_sample ||
+                samples > std::numeric_limits<size_t>::max() / vec_bytes_per_sample ||
+                samples > std::numeric_limits<size_t>::max() / sampled_bytes_per_sample)
+            {
+                return false;
+            }
+            cudaError_t local_err = cudaMalloc(&cov_workspace, samples * cov_bytes_per_sample);
+            if (local_err != cudaSuccess)
+            {
+                free_workspace();
+                return false;
+            }
+            local_err = cudaMalloc(&mean_workspace, samples * vec_bytes_per_sample);
+            if (local_err != cudaSuccess)
+            {
+                free_workspace();
+                return false;
+            }
+            local_err = cudaMalloc(&col_workspace, samples * vec_bytes_per_sample);
+            if (local_err != cudaSuccess)
+            {
+                free_workspace();
+                return false;
+            }
+            local_err = cudaMalloc(&sampled_workspace, samples * sampled_bytes_per_sample);
+            if (local_err != cudaSuccess)
+            {
+                free_workspace();
+                return false;
+            }
+            return true;
+        };
+
+        while (!alloc_workspace(chunk_samples))
+        {
+            if (chunk_samples <= 1)
+            {
+                free_workspace();
+                free_all();
+                return set_error("failed to allocate workspace in matrix_sample_p1_integer_kernel");
+            }
+            chunk_samples = (chunk_samples + 1) / 2;
+        }
+
+        for (size_t sample_start = 0; sample_start < total_samples; sample_start += chunk_samples)
+        {
+            size_t sample_count = std::min(chunk_samples, total_samples - sample_start);
+            const int blocks = static_cast<int>((sample_count + threads - 1) / threads);
+            matrix_sample_p1_integer_kernel_large<<<blocks, threads, 0, stream>>>(
+                d_a_entries,
+                d_b_entries,
+                d_d_entries,
+                d_tp2_entries,
+                d,
+                cols,
+                n,
+                sample_start,
+                sample_count,
+                cov_workspace,
+                mean_workspace,
+                col_workspace,
+                sampled_workspace,
+                d_sampled_out,
+                modulus,
+                sigma,
+                s,
+                dgg_stddev,
+                seed);
+            err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                free_workspace();
+                free_all();
+                return set_error(err);
+            }
+        }
+        free_workspace();
+    }
 
     err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess)
     {
-        free_workspace();
-        free_all();
-        return set_error(err);
-    }
-    err = cudaMemcpyAsync(
-        sampled_out_host.data(),
-        d_sampled_out,
-        total_values * sizeof(int64_t),
-        cudaMemcpyDeviceToHost,
-        stream);
-    if (err != cudaSuccess)
-    {
-        free_workspace();
-        free_all();
-        return set_error(err);
-    }
-    err = cudaStreamSynchronize(stream);
-    if (err != cudaSuccess)
-    {
-        free_workspace();
         free_all();
         return set_error(err);
     }
 
-    free_workspace();
+    *sampled_out_device = d_sampled_out;
+    d_sampled_out = nullptr;
     free_all();
     return 0;
 }
 
-int launch_scatter_p1_integer_to_limb_kernel(
-    const std::vector<int64_t> &sampled_in_host,
+int launch_scatter_p1_integer_to_limb_kernel_device(
+    const int64_t *sampled_in_device,
     const std::vector<uint64_t *> &out_entries,
     size_t n,
     uint64_t modulus,
@@ -844,15 +1000,15 @@ int launch_scatter_p1_integer_to_limb_kernel(
     {
         return 0;
     }
+    if (!sampled_in_device)
+    {
+        return set_error("null sampled device buffer in matrix_scatter_p1_integer_to_limb_kernel");
+    }
     if (device_id < 0)
     {
         return set_error("invalid device in matrix_scatter_p1_integer_to_limb_kernel");
     }
     const size_t total = out_entries.size() * n;
-    if (sampled_in_host.size() != total)
-    {
-        return set_error("sampled input size mismatch in matrix_scatter_p1_integer_to_limb_kernel");
-    }
 
     cudaError_t err = cudaSetDevice(device_id);
     if (err != cudaSuccess)
@@ -861,53 +1017,32 @@ int launch_scatter_p1_integer_to_limb_kernel(
     }
 
     uint64_t **d_out_entries = nullptr;
-    int64_t *d_sampled_in = nullptr;
     const size_t out_ptr_bytes = out_entries.size() * sizeof(uint64_t *);
-    const size_t sampled_bytes = total * sizeof(int64_t);
 
-    auto free_all = [&]()
+    auto free_out_entries = [&]()
     {
         if (d_out_entries)
             cudaFree(d_out_entries);
-        if (d_sampled_in)
-            cudaFree(d_sampled_in);
     };
 
     err = cudaMalloc(&d_out_entries, out_ptr_bytes);
     if (err != cudaSuccess)
     {
-        free_all();
-        return set_error(err);
-    }
-    err = cudaMalloc(&d_sampled_in, sampled_bytes);
-    if (err != cudaSuccess)
-    {
-        free_all();
+        free_out_entries();
         return set_error(err);
     }
 
     err = cudaMemcpyAsync(d_out_entries, out_entries.data(), out_ptr_bytes, cudaMemcpyHostToDevice, stream);
     if (err != cudaSuccess)
     {
-        free_all();
-        return set_error(err);
-    }
-    err = cudaMemcpyAsync(
-        d_sampled_in,
-        sampled_in_host.data(),
-        sampled_bytes,
-        cudaMemcpyHostToDevice,
-        stream);
-    if (err != cudaSuccess)
-    {
-        free_all();
+        free_out_entries();
         return set_error(err);
     }
 
     const int threads = 256;
     const int blocks = static_cast<int>((total + threads - 1) / threads);
     matrix_scatter_p1_integer_to_limb_kernel<<<blocks, threads, 0, stream>>>(
-        d_sampled_in,
+        sampled_in_device,
         d_out_entries,
         out_entries.size(),
         n,
@@ -915,17 +1050,17 @@ int launch_scatter_p1_integer_to_limb_kernel(
     err = cudaGetLastError();
     if (err != cudaSuccess)
     {
-        free_all();
+        free_out_entries();
         return set_error(err);
     }
     err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess)
     {
-        free_all();
+        free_out_entries();
         return set_error(err);
     }
 
-    free_all();
+    free_out_entries();
     return 0;
 }
 
@@ -1363,9 +1498,26 @@ extern "C" int gpu_matrix_sample_p1_full(
     const GpuMatrix *b_input = b_mat;
     const GpuMatrix *d_input = d_mat;
     const GpuMatrix *tp2_input = tp2;
+    struct DeviceSampleBuffer
+    {
+        int device;
+        int64_t *ptr;
+    };
+    std::vector<DeviceSampleBuffer> sampled_device_buffers;
 
     auto cleanup = [&]()
     {
+        for (auto &entry : sampled_device_buffers)
+        {
+            if (!entry.ptr || entry.device < 0)
+            {
+                continue;
+            }
+            cudaSetDevice(entry.device);
+            cudaFree(entry.ptr);
+            entry.ptr = nullptr;
+        }
+        sampled_device_buffers.clear();
         if (tmp_a)
         {
             gpu_matrix_destroy(tmp_a);
@@ -1550,7 +1702,7 @@ extern "C" int gpu_matrix_sample_p1_full(
         return set_error("invalid reference stream/device in gpu_matrix_sample_p1_full");
     }
 
-    std::vector<int64_t> sampled_out_host;
+    int64_t *sampled_ref_device = nullptr;
     status = launch_sample_p1_integer_kernel(
         ref_a_entry_ptrs,
         ref_b_entry_ptrs,
@@ -1566,12 +1718,96 @@ extern "C" int gpu_matrix_sample_p1_full(
         seed,
         ref_stream,
         ref_device,
-        sampled_out_host);
+        &sampled_ref_device);
     if (status != 0)
     {
         cleanup();
         return status;
     }
+    if (sampled_ref_device)
+    {
+        sampled_device_buffers.push_back(DeviceSampleBuffer{ref_device, sampled_ref_device});
+    }
+
+    size_t sampled_entry_count = 0;
+    size_t sampled_value_count = 0;
+    size_t sampled_bytes = 0;
+    if (d_rows != 0 && cols > std::numeric_limits<size_t>::max() / (2 * d_rows))
+    {
+        cleanup();
+        return set_error("sample count overflow in gpu_matrix_sample_p1_full");
+    }
+    sampled_entry_count = 2 * d_rows * cols;
+    if (static_cast<size_t>(a_mat->ctx->N) != 0 &&
+        sampled_entry_count > std::numeric_limits<size_t>::max() / static_cast<size_t>(a_mat->ctx->N))
+    {
+        cleanup();
+        return set_error("sample count overflow in gpu_matrix_sample_p1_full");
+    }
+    sampled_value_count = sampled_entry_count * static_cast<size_t>(a_mat->ctx->N);
+    if (sampled_value_count > std::numeric_limits<size_t>::max() / sizeof(int64_t))
+    {
+        cleanup();
+        return set_error("sample byte overflow in gpu_matrix_sample_p1_full");
+    }
+    sampled_bytes = sampled_value_count * sizeof(int64_t);
+
+    auto ensure_sample_buffer_on_device = [&](int device, cudaStream_t stream, int64_t **out_ptr) -> int
+    {
+        if (!out_ptr)
+        {
+            return set_error("invalid output in ensure_sample_buffer_on_device");
+        }
+        *out_ptr = nullptr;
+        for (const auto &entry : sampled_device_buffers)
+        {
+            if (entry.device == device && entry.ptr)
+            {
+                *out_ptr = entry.ptr;
+                return 0;
+            }
+        }
+        if (!sampled_ref_device)
+        {
+            return set_error("missing reference sample buffer in gpu_matrix_sample_p1_full");
+        }
+        if (sampled_bytes == 0)
+        {
+            return 0;
+        }
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        int64_t *device_copy = nullptr;
+        err = cudaMalloc(&device_copy, sampled_bytes);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        err = cudaMemcpyPeerAsync(
+            device_copy,
+            device,
+            sampled_ref_device,
+            ref_device,
+            sampled_bytes,
+            stream);
+        if (err != cudaSuccess)
+        {
+            cudaFree(device_copy);
+            return set_error(err);
+        }
+        err = cudaStreamSynchronize(stream);
+        if (err != cudaSuccess)
+        {
+            cudaFree(device_copy);
+            return set_error(err);
+        }
+        sampled_device_buffers.push_back(DeviceSampleBuffer{device, device_copy});
+        *out_ptr = device_copy;
+        return 0;
+    };
 
     for (int limb = 0; limb <= level; ++limb)
     {
@@ -1608,8 +1844,16 @@ extern "C" int gpu_matrix_sample_p1_full(
             }
         }
 
-        status = launch_scatter_p1_integer_to_limb_kernel(
-            sampled_out_host,
+        int64_t *sampled_for_device = nullptr;
+        status = ensure_sample_buffer_on_device(out_device, out_stream, &sampled_for_device);
+        if (status != 0)
+        {
+            cleanup();
+            return status;
+        }
+
+        status = launch_scatter_p1_integer_to_limb_kernel_device(
+            sampled_for_device,
             out_entry_ptrs,
             static_cast<size_t>(a_mat->ctx->N),
             a_mat->ctx->moduli[static_cast<size_t>(limb)],

@@ -1,3 +1,86 @@
+namespace
+{
+    struct SerdeStreamRef
+    {
+        int device;
+        cudaStream_t stream;
+    };
+
+    bool serde_checked_mul_size(size_t a, size_t b, size_t *out)
+    {
+        if (!out)
+        {
+            return false;
+        }
+        if (a != 0 && b > static_cast<size_t>(-1) / a)
+        {
+            return false;
+        }
+        *out = a * b;
+        return true;
+    }
+
+    void serde_append_unique_stream(std::vector<SerdeStreamRef> &streams, int device, cudaStream_t stream)
+    {
+        if (!stream)
+        {
+            return;
+        }
+        for (const auto &entry : streams)
+        {
+            if (entry.device == device && entry.stream == stream)
+            {
+                return;
+            }
+        }
+        streams.push_back(SerdeStreamRef{device, stream});
+    }
+
+    int serde_build_event_set_from_streams(const std::vector<SerdeStreamRef> &streams, GpuEventSet **out_events)
+    {
+        if (!out_events)
+        {
+            return set_error("invalid out_events in serde_build_event_set_from_streams");
+        }
+        *out_events = nullptr;
+        if (streams.empty())
+        {
+            return 0;
+        }
+
+        auto *event_set = new GpuEventSet();
+        event_set->entries.reserve(streams.size());
+        for (const auto &entry : streams)
+        {
+            cudaError_t err = cudaSetDevice(entry.device);
+            if (err != cudaSuccess)
+            {
+                gpu_event_set_destroy(event_set);
+                return set_error(err);
+            }
+
+            cudaEvent_t ev = nullptr;
+            err = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+            if (err != cudaSuccess)
+            {
+                gpu_event_set_destroy(event_set);
+                return set_error(err);
+            }
+            err = cudaEventRecord(ev, entry.stream);
+            if (err != cudaSuccess)
+            {
+                cudaEventDestroy(ev);
+                gpu_event_set_destroy(event_set);
+                return set_error(err);
+            }
+            event_set->entries.push_back(GpuEventSet::Entry{ev, entry.device});
+        }
+
+        *out_events = event_set;
+        return 0;
+    }
+}
+
 extern "C" int gpu_matrix_load_rns_batch(
     GpuMatrix *mat,
     const uint8_t *bytes,
@@ -10,111 +93,116 @@ extern "C" int gpu_matrix_load_rns_batch(
         return set_error("invalid gpu_matrix_load_rns_batch arguments");
     }
     *out_events = nullptr;
-    const size_t count = mat->rows * mat->cols;
-    std::vector<GpuPoly *> mat_polys;
-    int status = materialize_matrix_poly_views(mat, mat_polys);
-    if (status != 0)
+    if (!mat->ctx || !mat->ctx->ctx)
     {
-        return status;
+        return set_error("invalid context in gpu_matrix_load_rns_batch");
     }
-    status = gpu_poly_load_rns_batch(
-        mat_polys.data(),
-        count,
-        bytes,
-        bytes_per_poly,
-        format);
-    release_poly_views(mat_polys);
-    if (status != 0)
-    {
-        return status;
-    }
-    PolyFormat fmt;
-    if (!parse_format(format, fmt))
+
+    PolyFormat target_format;
+    if (!parse_format(format, target_format))
     {
         return set_error("invalid format in gpu_matrix_load_rns_batch");
     }
-    mat->format = fmt;
+
+    size_t count = 0;
+    if (!serde_checked_mul_size(mat->rows, mat->cols, &count))
+    {
+        return set_error("matrix size overflow in gpu_matrix_load_rns_batch");
+    }
+    if (count > 0 && !bytes)
+    {
+        return set_error("null bytes in gpu_matrix_load_rns_batch");
+    }
+
+    if (mat->level < 0)
+    {
+        mat->format = target_format;
+        return count == 0 ? 0 : set_error("invalid level in gpu_matrix_load_rns_batch");
+    }
+    const int N = mat->ctx->N;
+    if (N <= 0)
+    {
+        return set_error("invalid ring dimension in gpu_matrix_load_rns_batch");
+    }
+
+    const size_t limb_count = static_cast<size_t>(mat->level + 1);
+    size_t expected_words = 0;
+    size_t expected_bytes = 0;
+    if (!serde_checked_mul_size(limb_count, static_cast<size_t>(N), &expected_words) ||
+        !serde_checked_mul_size(expected_words, sizeof(uint64_t), &expected_bytes))
+    {
+        return set_error("size overflow in gpu_matrix_load_rns_batch");
+    }
+    if (bytes_per_poly == 0 || bytes_per_poly % sizeof(uint64_t) != 0)
+    {
+        return set_error("bytes_per_poly must be a non-zero multiple of 8");
+    }
+    if (bytes_per_poly < expected_bytes)
+    {
+        return set_error("bytes_per_poly too small in gpu_matrix_load_rns_batch");
+    }
     if (count == 0)
     {
+        mat->format = target_format;
         return 0;
     }
 
-    auto *event_set = new GpuEventSet();
-    struct StreamRef
-    {
-        int device;
-        cudaStream_t stream;
-    };
-    std::vector<StreamRef> streams;
-    streams.reserve(mat->ctx ? mat->ctx->gpu_ids.size() : 1);
-
     auto &limb_map = mat->ctx->ctx->limbGPUid;
-    if (limb_map.size() < static_cast<size_t>(mat->level + 1))
+    if (limb_map.size() < limb_count)
     {
-        gpu_event_set_destroy(event_set);
         return set_error("unexpected limb mapping size in gpu_matrix_load_rns_batch");
     }
-    for (int limb = 0; limb <= mat->level; ++limb)
+
+    std::vector<SerdeStreamRef> streams;
+    streams.reserve(limb_count);
+    for (size_t poly_idx = 0; poly_idx < count; ++poly_idx)
     {
-        const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        int device = -1;
-        cudaStream_t stream = nullptr;
-        status = matrix_limb_device(mat, limb_id, &device);
-        if (status != 0)
+        const uint8_t *poly_bytes = bytes + poly_idx * bytes_per_poly;
+        for (size_t limb = 0; limb < limb_count; ++limb)
         {
-            gpu_event_set_destroy(event_set);
-            return status;
-        }
-        status = matrix_limb_stream(mat, limb_id, &stream);
-        if (status != 0)
-        {
-            gpu_event_set_destroy(event_set);
-            return status;
-        }
-        bool seen = false;
-        for (const auto &entry : streams)
-        {
-            if (entry.device == device && entry.stream == stream)
+            const dim3 limb_id = limb_map[limb];
+            uint64_t *dst = matrix_limb_ptr_by_id(mat, poly_idx, limb_id);
+            if (!dst)
             {
-                seen = true;
-                break;
+                return set_error("null matrix limb pointer in gpu_matrix_load_rns_batch");
             }
-        }
-        if (!seen)
-        {
-            streams.push_back(StreamRef{device, stream});
+
+            int device = -1;
+            cudaStream_t stream = nullptr;
+            int status = matrix_limb_device(mat, limb_id, &device);
+            if (status != 0)
+            {
+                return status;
+            }
+            status = matrix_limb_stream(mat, limb_id, &stream);
+            if (status != 0)
+            {
+                return status;
+            }
+
+            cudaError_t err = cudaSetDevice(device);
+            if (err != cudaSuccess)
+            {
+                return set_error(err);
+            }
+
+            const uint8_t *src = poly_bytes + limb * static_cast<size_t>(N) * sizeof(uint64_t);
+            err = cudaMemcpyAsync(
+                dst,
+                src,
+                static_cast<size_t>(N) * sizeof(uint64_t),
+                cudaMemcpyHostToDevice,
+                stream);
+            if (err != cudaSuccess)
+            {
+                return set_error(err);
+            }
+            serde_append_unique_stream(streams, device, stream);
         }
     }
 
-    event_set->entries.reserve(streams.size());
-    for (const auto &entry : streams)
-    {
-        cudaError_t err = cudaSetDevice(entry.device);
-        if (err != cudaSuccess)
-        {
-            gpu_event_set_destroy(event_set);
-            return set_error(cudaGetErrorString(err));
-        }
-
-        cudaEvent_t ev = nullptr;
-        err = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
-        if (err != cudaSuccess)
-        {
-            gpu_event_set_destroy(event_set);
-            return set_error(cudaGetErrorString(err));
-        }
-        err = cudaEventRecord(ev, entry.stream);
-        if (err != cudaSuccess)
-        {
-            cudaEventDestroy(ev);
-            gpu_event_set_destroy(event_set);
-            return set_error(cudaGetErrorString(err));
-        }
-        event_set->entries.push_back(GpuEventSet::Entry{ev, entry.device});
-    }
-
-    *out_events = event_set;
-    return 0;
+    mat->format = target_format;
+    return serde_build_event_set_from_streams(streams, out_events);
 }
 
 extern "C" int gpu_matrix_store_rns_batch(
@@ -129,71 +217,115 @@ extern "C" int gpu_matrix_store_rns_batch(
         return set_error("invalid gpu_matrix_store_rns_batch arguments");
     }
     *out_events = nullptr;
-    const size_t count = mat->rows * mat->cols;
+    if (!mat->ctx || !mat->ctx->ctx)
+    {
+        return set_error("invalid context in gpu_matrix_store_rns_batch");
+    }
+
+    PolyFormat target_format;
+    if (!parse_format(format, target_format))
+    {
+        return set_error("invalid format in gpu_matrix_store_rns_batch");
+    }
+    if (target_format != mat->format)
+    {
+        return set_error("format conversion is not supported in gpu_matrix_store_rns_batch");
+    }
+
+    size_t count = 0;
+    if (!serde_checked_mul_size(mat->rows, mat->cols, &count))
+    {
+        return set_error("matrix size overflow in gpu_matrix_store_rns_batch");
+    }
+    if (count > 0 && !bytes_out)
+    {
+        return set_error("null bytes_out in gpu_matrix_store_rns_batch");
+    }
     if (count == 0)
     {
         return 0;
     }
 
-    const int matrix_format =
-        mat->format == PolyFormat::Eval ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
-    GpuMatrix *clones = nullptr;
-    int status = gpu_matrix_create(
-        mat->ctx,
-        mat->level,
-        mat->rows,
-        mat->cols,
-        matrix_format,
-        &clones);
-    if (status != 0)
+    if (mat->level < 0)
     {
-        return status;
+        return set_error("invalid level in gpu_matrix_store_rns_batch");
     }
-    status = gpu_matrix_copy(clones, mat);
-    if (status != 0)
+    const int N = mat->ctx->N;
+    if (N <= 0)
     {
-        gpu_matrix_destroy(clones);
-        return status;
+        return set_error("invalid ring dimension in gpu_matrix_store_rns_batch");
     }
 
-    std::vector<GpuPoly *> clone_polys;
-    status = materialize_matrix_poly_views(clones, clone_polys);
-    if (status != 0)
+    const size_t limb_count = static_cast<size_t>(mat->level + 1);
+    size_t expected_words = 0;
+    size_t expected_bytes = 0;
+    if (!serde_checked_mul_size(limb_count, static_cast<size_t>(N), &expected_words) ||
+        !serde_checked_mul_size(expected_words, sizeof(uint64_t), &expected_bytes))
     {
-        gpu_matrix_destroy(clones);
-        return status;
+        return set_error("size overflow in gpu_matrix_store_rns_batch");
     }
-    status = gpu_poly_store_rns_batch(
-        clone_polys.data(),
-        count,
-        bytes_out,
-        bytes_per_poly,
-        format,
-        out_events);
-    release_poly_views(clone_polys);
-    if (status != 0)
+    if (bytes_per_poly == 0 || bytes_per_poly % sizeof(uint64_t) != 0)
     {
-        if (*out_events)
+        return set_error("bytes_per_poly must be a non-zero multiple of 8");
+    }
+    if (bytes_per_poly < expected_bytes)
+    {
+        return set_error("bytes_per_poly too small in gpu_matrix_store_rns_batch");
+    }
+
+    auto &limb_map = mat->ctx->ctx->limbGPUid;
+    if (limb_map.size() < limb_count)
+    {
+        return set_error("unexpected limb mapping size in gpu_matrix_store_rns_batch");
+    }
+
+    std::vector<SerdeStreamRef> streams;
+    streams.reserve(limb_count);
+    for (size_t poly_idx = 0; poly_idx < count; ++poly_idx)
+    {
+        uint8_t *poly_bytes = bytes_out + poly_idx * bytes_per_poly;
+        for (size_t limb = 0; limb < limb_count; ++limb)
         {
-            gpu_event_set_destroy(*out_events);
-            *out_events = nullptr;
+            const dim3 limb_id = limb_map[limb];
+            const uint64_t *src = matrix_limb_ptr_by_id(mat, poly_idx, limb_id);
+            if (!src)
+            {
+                return set_error("null matrix limb pointer in gpu_matrix_store_rns_batch");
+            }
+
+            int device = -1;
+            cudaStream_t stream = nullptr;
+            int status = matrix_limb_device(mat, limb_id, &device);
+            if (status != 0)
+            {
+                return status;
+            }
+            status = matrix_limb_stream(mat, limb_id, &stream);
+            if (status != 0)
+            {
+                return status;
+            }
+
+            cudaError_t err = cudaSetDevice(device);
+            if (err != cudaSuccess)
+            {
+                return set_error(err);
+            }
+
+            uint8_t *dst = poly_bytes + limb * static_cast<size_t>(N) * sizeof(uint64_t);
+            err = cudaMemcpyAsync(
+                dst,
+                src,
+                static_cast<size_t>(N) * sizeof(uint64_t),
+                cudaMemcpyDeviceToHost,
+                stream);
+            if (err != cudaSuccess)
+            {
+                return set_error(err);
+            }
+            serde_append_unique_stream(streams, device, stream);
         }
-        gpu_matrix_destroy(clones);
-        return status;
     }
 
-    if (*out_events)
-    {
-        status = gpu_event_set_wait(*out_events);
-        gpu_event_set_destroy(*out_events);
-        *out_events = nullptr;
-        if (status != 0)
-        {
-            gpu_matrix_destroy(clones);
-            return status;
-        }
-    }
-
-    gpu_matrix_destroy(clones);
-    return 0;
+    return serde_build_event_set_from_streams(streams, out_events);
 }

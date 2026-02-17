@@ -1,5 +1,11 @@
 namespace
 {
+    struct StreamRef
+    {
+        int device;
+        cudaStream_t stream;
+    };
+
     bool checked_mul_size(size_t a, size_t b, size_t *out)
     {
         if (!out)
@@ -63,6 +69,178 @@ namespace
             return;
         }
         free_matrix_shared_buffers(mat);
+    }
+
+    void append_unique_stream(std::vector<StreamRef> &streams, int device, cudaStream_t stream)
+    {
+        if (!stream)
+        {
+            return;
+        }
+        for (const auto &entry : streams)
+        {
+            if (entry.device == device && entry.stream == stream)
+            {
+                return;
+            }
+        }
+        streams.push_back(StreamRef{device, stream});
+    }
+
+    int wait_stream_on_stream(int device, cudaStream_t consumer, cudaStream_t producer)
+    {
+        if (!consumer || !producer || consumer == producer)
+        {
+            return 0;
+        }
+
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+
+        cudaEvent_t ev = nullptr;
+        err = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        err = cudaEventRecord(ev, producer);
+        if (err != cudaSuccess)
+        {
+            cudaEventDestroy(ev);
+            return set_error(err);
+        }
+        err = cudaStreamWaitEvent(consumer, ev, 0);
+        if (err != cudaSuccess)
+        {
+            cudaEventDestroy(ev);
+            return set_error(err);
+        }
+        err = cudaEventDestroy(ev);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        return 0;
+    }
+
+    int build_event_set_from_streams(const std::vector<StreamRef> &streams, GpuEventSet **out_events)
+    {
+        if (!out_events)
+        {
+            return set_error("invalid out_events in build_event_set_from_streams");
+        }
+        *out_events = nullptr;
+        if (streams.empty())
+        {
+            return 0;
+        }
+
+        auto *event_set = new GpuEventSet();
+        event_set->entries.reserve(streams.size());
+
+        for (const auto &entry : streams)
+        {
+            cudaError_t err = cudaSetDevice(entry.device);
+            if (err != cudaSuccess)
+            {
+                gpu_event_set_destroy(event_set);
+                return set_error(err);
+            }
+
+            cudaEvent_t ev = nullptr;
+            err = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+            if (err != cudaSuccess)
+            {
+                gpu_event_set_destroy(event_set);
+                return set_error(err);
+            }
+            err = cudaEventRecord(ev, entry.stream);
+            if (err != cudaSuccess)
+            {
+                cudaEventDestroy(ev);
+                gpu_event_set_destroy(event_set);
+                return set_error(err);
+            }
+            event_set->entries.push_back(GpuEventSet::Entry{ev, entry.device});
+        }
+
+        *out_events = event_set;
+        return 0;
+    }
+
+    int get_poly_limb_u64_const(
+        const GpuPoly *poly,
+        const dim3 &limb_id,
+        const uint64_t **out_ptr,
+        cudaStream_t *out_stream,
+        int *out_device)
+    {
+        if (!poly || !poly->poly || !out_ptr || !out_stream || !out_device)
+        {
+            return set_error("invalid get_poly_limb_u64_const arguments");
+        }
+        if (limb_id.x >= poly->poly->GPU.size())
+        {
+            return set_error("invalid partition index in get_poly_limb_u64_const");
+        }
+        const auto &partition = poly->poly->GPU[limb_id.x];
+        if (limb_id.y >= partition.limb.size())
+        {
+            return set_error("invalid limb index in get_poly_limb_u64_const");
+        }
+        const auto &limb_impl = partition.limb[limb_id.y];
+        if (limb_impl.index() != FIDESlib::U64)
+        {
+            return set_error("unsupported limb type in get_poly_limb_u64_const");
+        }
+        const auto &u64 = std::get<FIDESlib::U64>(limb_impl);
+        if (!u64.v.data || !u64.stream.ptr)
+        {
+            return set_error("null limb storage in get_poly_limb_u64_const");
+        }
+        *out_ptr = u64.v.data;
+        *out_stream = u64.stream.ptr;
+        *out_device = partition.device;
+        return 0;
+    }
+
+    int get_poly_limb_u64_mut(
+        GpuPoly *poly,
+        const dim3 &limb_id,
+        uint64_t **out_ptr,
+        cudaStream_t *out_stream,
+        int *out_device)
+    {
+        if (!poly || !poly->poly || !out_ptr || !out_stream || !out_device)
+        {
+            return set_error("invalid get_poly_limb_u64_mut arguments");
+        }
+        if (limb_id.x >= poly->poly->GPU.size())
+        {
+            return set_error("invalid partition index in get_poly_limb_u64_mut");
+        }
+        auto &partition = poly->poly->GPU[limb_id.x];
+        if (limb_id.y >= partition.limb.size())
+        {
+            return set_error("invalid limb index in get_poly_limb_u64_mut");
+        }
+        auto &limb_impl = partition.limb[limb_id.y];
+        if (limb_impl.index() != FIDESlib::U64)
+        {
+            return set_error("unsupported limb type in get_poly_limb_u64_mut");
+        }
+        auto &u64 = std::get<FIDESlib::U64>(limb_impl);
+        if (!u64.v.data || !u64.stream.ptr)
+        {
+            return set_error("null limb storage in get_poly_limb_u64_mut");
+        }
+        *out_ptr = u64.v.data;
+        *out_stream = u64.stream.ptr;
+        *out_device = partition.device;
+        return 0;
     }
 }
 
@@ -262,16 +440,119 @@ extern "C" int gpu_matrix_entry_clone(
     {
         return set_error("index out of bounds in gpu_matrix_entry_clone");
     }
+    if (!mat->ctx || !mat->ctx->ctx)
+    {
+        return set_error("invalid context in gpu_matrix_entry_clone");
+    }
+    *out_poly = nullptr;
     const size_t idx = matrix_index(row, col, mat->cols);
-    GpuPoly *view = nullptr;
-    int status = materialize_matrix_poly_view(mat, idx, &view);
+    int status = gpu_poly_create(mat->ctx, mat->level, out_poly);
     if (status != 0)
     {
         return status;
     }
-    status = gpu_poly_clone_async(view, out_poly, out_events);
-    std::vector<GpuPoly *> tmp_views{view};
-    release_poly_views(tmp_views);
+    (*out_poly)->format = mat->format;
+
+    const int N = mat->ctx->N;
+    if (N <= 0 || mat->level < 0)
+    {
+        return 0;
+    }
+
+    auto &limb_map = mat->ctx->ctx->limbGPUid;
+    if (limb_map.size() < static_cast<size_t>(mat->level + 1))
+    {
+        gpu_poly_destroy(*out_poly);
+        *out_poly = nullptr;
+        return set_error("unexpected limb mapping size in gpu_matrix_entry_clone");
+    }
+
+    std::vector<StreamRef> streams;
+    streams.reserve(static_cast<size_t>(mat->level + 1));
+    for (int limb = 0; limb <= mat->level; ++limb)
+    {
+        const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
+
+        const uint64_t *src_ptr = matrix_limb_ptr_by_id(mat, idx, limb_id);
+        if (!src_ptr)
+        {
+            gpu_poly_destroy(*out_poly);
+            *out_poly = nullptr;
+            return set_error("null matrix limb pointer in gpu_matrix_entry_clone");
+        }
+
+        int src_device = -1;
+        cudaStream_t src_stream = nullptr;
+        status = matrix_limb_device(mat, limb_id, &src_device);
+        if (status != 0)
+        {
+            gpu_poly_destroy(*out_poly);
+            *out_poly = nullptr;
+            return status;
+        }
+        status = matrix_limb_stream(mat, limb_id, &src_stream);
+        if (status != 0)
+        {
+            gpu_poly_destroy(*out_poly);
+            *out_poly = nullptr;
+            return status;
+        }
+
+        uint64_t *dst_ptr = nullptr;
+        int dst_device = -1;
+        cudaStream_t dst_stream = nullptr;
+        status = get_poly_limb_u64_mut(*out_poly, limb_id, &dst_ptr, &dst_stream, &dst_device);
+        if (status != 0)
+        {
+            gpu_poly_destroy(*out_poly);
+            *out_poly = nullptr;
+            return status;
+        }
+        if (src_device != dst_device)
+        {
+            gpu_poly_destroy(*out_poly);
+            *out_poly = nullptr;
+            return set_error("device mismatch in gpu_matrix_entry_clone");
+        }
+
+        cudaError_t err = cudaSetDevice(dst_device);
+        if (err != cudaSuccess)
+        {
+            gpu_poly_destroy(*out_poly);
+            *out_poly = nullptr;
+            return set_error(err);
+        }
+
+        status = wait_stream_on_stream(dst_device, dst_stream, src_stream);
+        if (status != 0)
+        {
+            gpu_poly_destroy(*out_poly);
+            *out_poly = nullptr;
+            return status;
+        }
+
+        err = cudaMemcpyAsync(
+            dst_ptr,
+            src_ptr,
+            static_cast<size_t>(N) * sizeof(uint64_t),
+            cudaMemcpyDeviceToDevice,
+            dst_stream);
+        if (err != cudaSuccess)
+        {
+            gpu_poly_destroy(*out_poly);
+            *out_poly = nullptr;
+            return set_error(err);
+        }
+        append_unique_stream(streams, dst_device, dst_stream);
+    }
+
+    status = build_event_set_from_streams(streams, out_events);
+    if (status != 0)
+    {
+        gpu_poly_destroy(*out_poly);
+        *out_poly = nullptr;
+        return status;
+    }
     return status;
 }
 
@@ -293,20 +574,102 @@ extern "C" int gpu_matrix_copy_entry(
     {
         return set_error("context mismatch in gpu_matrix_copy_entry");
     }
+    if (!mat->ctx || !mat->ctx->ctx)
+    {
+        return set_error("invalid context in gpu_matrix_copy_entry");
+    }
     const size_t idx = matrix_index(row, col, mat->cols);
-    GpuPoly *view = nullptr;
-    int status = materialize_matrix_poly_view(mat, idx, &view);
-    if (status != 0)
+
+    const int N = mat->ctx->N;
+    if (N <= 0 || mat->level < 0)
     {
-        return status;
+        mat->format = src->format;
+        return 0;
     }
-    status = gpu_poly_copy(view, src);
-    std::vector<GpuPoly *> tmp_views{view};
-    release_poly_views(tmp_views);
-    if (status != 0)
+
+    auto &limb_map = mat->ctx->ctx->limbGPUid;
+    if (limb_map.size() < static_cast<size_t>(mat->level + 1))
     {
-        return status;
+        return set_error("unexpected limb mapping size in gpu_matrix_copy_entry");
     }
+
+    std::vector<StreamRef> streams;
+    streams.reserve(static_cast<size_t>(mat->level + 1));
+    for (int limb = 0; limb <= mat->level; ++limb)
+    {
+        const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
+
+        const uint64_t *src_ptr = nullptr;
+        int src_device = -1;
+        cudaStream_t src_stream = nullptr;
+        int status = get_poly_limb_u64_const(src, limb_id, &src_ptr, &src_stream, &src_device);
+        if (status != 0)
+        {
+            return status;
+        }
+
+        uint64_t *dst_ptr = matrix_limb_ptr_by_id(mat, idx, limb_id);
+        if (!dst_ptr)
+        {
+            return set_error("null matrix limb pointer in gpu_matrix_copy_entry");
+        }
+
+        int dst_device = -1;
+        cudaStream_t dst_stream = nullptr;
+        status = matrix_limb_device(mat, limb_id, &dst_device);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_limb_stream(mat, limb_id, &dst_stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        if (src_device != dst_device)
+        {
+            return set_error("device mismatch in gpu_matrix_copy_entry");
+        }
+
+        cudaError_t err = cudaSetDevice(dst_device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+
+        status = wait_stream_on_stream(dst_device, dst_stream, src_stream);
+        if (status != 0)
+        {
+            return status;
+        }
+
+        err = cudaMemcpyAsync(
+            dst_ptr,
+            src_ptr,
+            static_cast<size_t>(N) * sizeof(uint64_t),
+            cudaMemcpyDeviceToDevice,
+            dst_stream);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        append_unique_stream(streams, dst_device, dst_stream);
+    }
+
+    for (const auto &entry : streams)
+    {
+        cudaError_t err = cudaSetDevice(entry.device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        err = cudaStreamSynchronize(entry.stream);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+    }
+
     mat->format = src->format;
     return 0;
 }

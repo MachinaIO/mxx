@@ -713,7 +713,12 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         let bytes_per_poly = rns_bytes_len(&self.params);
         let total = self.nrow.saturating_mul(self.ncol);
         let mut bytes = vec![0u8; total.saturating_mul(bytes_per_poly)];
-        self.store_rns_bytes(&mut bytes, bytes_per_poly, GPU_POLY_FORMAT_EVAL);
+        let format = if self.is_ntt {
+            GPU_POLY_FORMAT_EVAL
+        } else {
+            GPU_POLY_FORMAT_COEFF
+        };
+        self.store_rns_bytes(&mut bytes, bytes_per_poly, format);
 
         let entries = (0..self.nrow)
             .map(|row| {
@@ -727,15 +732,21 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        bincode::encode_to_vec(&entries, bincode::config::standard())
+        let compact_payload = (format as u8, entries);
+        bincode::encode_to_vec(compact_payload, bincode::config::standard())
             .expect("Failed to serialize matrix to compact bytes")
     }
 
     fn from_compact_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self {
-        let entries_bytes: Vec<Vec<Vec<u8>>> =
+        let (format_tag, entries_bytes): (u8, Vec<Vec<Vec<u8>>>) =
             bincode::decode_from_slice(bytes, bincode::config::standard())
                 .expect("Failed to deserialize matrix from compact bytes")
                 .0;
+        let format = match format_tag {
+            x if x == GPU_POLY_FORMAT_COEFF as u8 => GPU_POLY_FORMAT_COEFF,
+            x if x == GPU_POLY_FORMAT_EVAL as u8 => GPU_POLY_FORMAT_EVAL,
+            _ => panic!("Invalid compact matrix format tag: {format_tag}"),
+        };
         let nrow = entries_bytes.len();
         let ncol = if nrow > 0 { entries_bytes[0].len() } else { 0 };
         let bytes_per_poly = rns_bytes_len(params);
@@ -754,7 +765,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             }
         }
         let mut out = Self::new_empty(params, nrow, ncol);
-        out.load_rns_bytes(&flat, bytes_per_poly, GPU_POLY_FORMAT_EVAL);
+        out.load_rns_bytes(&flat, bytes_per_poly, format);
         out
     }
 

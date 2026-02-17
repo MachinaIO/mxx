@@ -767,6 +767,10 @@ namespace
         const dim3 &limb_id,
         size_t n)
     {
+        if constexpr (!std::is_same_v<T, uint64_t>)
+        {
+            return set_error("unsupported limb type in launch_copy_for_limb");
+        }
         const size_t count = src_indices.size();
         if (count == 0)
         {
@@ -776,120 +780,58 @@ namespace
         {
             return set_error("mismatched index counts in launch_copy_for_limb");
         }
-        std::vector<GpuPoly *> src_polys;
-        std::vector<GpuPoly *> dst_polys;
-        auto cleanup_views = [&]()
-        {
-            release_poly_views(src_polys);
-            release_poly_views(dst_polys);
-        };
 
-        int status = materialize_matrix_poly_views(src, src_polys);
+        int src_device = -1;
+        int status = matrix_limb_device(src, limb_id, &src_device);
         if (status != 0)
         {
-            cleanup_views();
             return status;
         }
-        status = materialize_matrix_poly_views(out, dst_polys);
+        int dst_device = -1;
+        status = matrix_limb_device(out, limb_id, &dst_device);
         if (status != 0)
         {
-            cleanup_views();
             return status;
         }
+        if (src_device != dst_device)
+        {
+            return set_error("source/destination device mismatch in launch_copy_for_limb");
+        }
+
+        cudaStream_t exec_stream = nullptr;
+        status = matrix_limb_stream(out, limb_id, &exec_stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        if (!exec_stream)
+        {
+            return set_error("null execution stream in launch_copy_for_limb");
+        }
+
+        cudaError_t err = cudaSetDevice(dst_device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+
         std::vector<const T *> src_ptrs;
         std::vector<T *> dst_ptrs;
         src_ptrs.reserve(count);
         dst_ptrs.reserve(count);
-        int device = -1;
-        cudaStream_t exec_stream = nullptr;
         for (size_t i = 0; i < count; ++i)
         {
-            const GpuPoly *src_poly = src_polys[src_indices[i]];
-            GpuPoly *dst_poly = dst_polys[dst_indices[i]];
-            if (!src_poly || !dst_poly)
+            const uint64_t *src_ptr = matrix_limb_ptr_by_id(src, src_indices[i], limb_id);
+            uint64_t *dst_ptr = matrix_limb_ptr_by_id(out, dst_indices[i], limb_id);
+            if (!src_ptr || !dst_ptr)
             {
-                cleanup_views();
-                return set_error("null polynomial in launch_copy_for_limb");
+                return set_error("null limb pointer in launch_copy_for_limb");
             }
-            if (limb_id.x >= src_poly->poly->GPU.size() || limb_id.x >= dst_poly->poly->GPU.size())
-            {
-                cleanup_views();
-                return set_error("unexpected limb GPU partition in launch_copy_for_limb");
-            }
-
-            const auto &src_partition = src_poly->poly->GPU[limb_id.x];
-            auto &dst_partition = dst_poly->poly->GPU[limb_id.x];
-            if (src_partition.device != dst_partition.device)
-            {
-                cleanup_views();
-                return set_error("source/destination device mismatch in launch_copy_for_limb");
-            }
-            if (limb_id.y >= src_partition.limb.size() || limb_id.y >= dst_partition.limb.size())
-            {
-                cleanup_views();
-                return set_error("unexpected limb index in launch_copy_for_limb");
-            }
-            if (device < 0)
-            {
-                device = dst_partition.device;
-            }
-            else if (device != dst_partition.device)
-            {
-                cleanup_views();
-                return set_error("inconsistent device in launch_copy_for_limb");
-            }
-
-            const auto &src_limb = src_partition.limb[limb_id.y];
-            auto &dst_limb = dst_partition.limb[limb_id.y];
-            if constexpr (std::is_same_v<T, uint64_t>)
-            {
-                if (src_limb.index() != FIDESlib::U64 || dst_limb.index() != FIDESlib::U64)
-                {
-                    cleanup_views();
-                    return set_error("mixed limb types in launch_copy_for_limb");
-                }
-                const auto &src_u64 = std::get<FIDESlib::U64>(src_limb);
-                auto &dst_u64 = std::get<FIDESlib::U64>(dst_limb);
-                src_ptrs.push_back(src_u64.v.data);
-                dst_ptrs.push_back(dst_u64.v.data);
-                if (!exec_stream)
-                {
-                    exec_stream = dst_u64.stream.ptr;
-                }
-            }
-            else
-            {
-                if (src_limb.index() != FIDESlib::U32 || dst_limb.index() != FIDESlib::U32)
-                {
-                    cleanup_views();
-                    return set_error("mixed limb types in launch_copy_for_limb");
-                }
-                const auto &src_u32 = std::get<FIDESlib::U32>(src_limb);
-                auto &dst_u32 = std::get<FIDESlib::U32>(dst_limb);
-                src_ptrs.push_back(src_u32.v.data);
-                dst_ptrs.push_back(dst_u32.v.data);
-                if (!exec_stream)
-                {
-                    exec_stream = dst_u32.stream.ptr;
-                }
-            }
-        }
-
-        if (!exec_stream || device < 0)
-        {
-            cleanup_views();
-            return set_error("null execution stream in launch_copy_for_limb");
-        }
-
-        cudaError_t err = cudaSetDevice(device);
-        if (err != cudaSuccess)
-        {
-            cleanup_views();
-            return set_error(err);
+            src_ptrs.push_back(reinterpret_cast<const T *>(src_ptr));
+            dst_ptrs.push_back(reinterpret_cast<T *>(dst_ptr));
         }
 
         status = launch_copy_kernel(src_ptrs, dst_ptrs, n, exec_stream);
-        cleanup_views();
         if (status != 0)
         {
             return status;
@@ -1088,6 +1030,579 @@ namespace
         const uint64_t modulus64 = lhs[0]->ctx->moduli[static_cast<size_t>(limb)];
         const T modulus = static_cast<T>(modulus64);
         return launch_block_matmul_kernel(out_ptrs, lhs_ptrs, rhs_ptrs, rows, inner, cols, n, modulus, stream, out_kernel_ms);
+    }
+
+    template <typename T>
+    __global__ void block_equal_kernel(
+        const T **lhs,
+        const T **rhs,
+        size_t poly_count,
+        size_t n,
+        int *out_equal)
+    {
+        const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        const size_t total = poly_count * n;
+        if (idx >= total)
+        {
+            return;
+        }
+        const size_t poly_idx = idx / n;
+        const size_t coeff_idx = idx - poly_idx * n;
+        if (lhs[poly_idx][coeff_idx] != rhs[poly_idx][coeff_idx])
+        {
+            atomicExch(out_equal, 0);
+        }
+    }
+
+    template <typename T>
+    int launch_block_equal_kernel(
+        const std::vector<const T *> &lhs_ptrs,
+        const std::vector<const T *> &rhs_ptrs,
+        size_t n,
+        cudaStream_t stream,
+        bool &is_equal)
+    {
+        const size_t count = lhs_ptrs.size();
+        if (count == 0 || n == 0)
+        {
+            is_equal = true;
+            return 0;
+        }
+        if (rhs_ptrs.size() != count)
+        {
+            return set_error("unexpected pointer counts in block_equal_kernel");
+        }
+
+        const T **d_lhs = nullptr;
+        const T **d_rhs = nullptr;
+        int *d_equal = nullptr;
+        const size_t ptr_bytes = count * sizeof(T *);
+        cudaError_t err = cudaMalloc(&d_lhs, ptr_bytes);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        err = cudaMalloc(&d_rhs, ptr_bytes);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_lhs);
+            return set_error(err);
+        }
+        err = cudaMalloc(&d_equal, sizeof(int));
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_lhs);
+            cudaFree(d_rhs);
+            return set_error(err);
+        }
+
+        err = cudaMemcpyAsync(d_lhs, lhs_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_lhs);
+            cudaFree(d_rhs);
+            cudaFree(d_equal);
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(d_rhs, rhs_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_lhs);
+            cudaFree(d_rhs);
+            cudaFree(d_equal);
+            return set_error(err);
+        }
+
+        int h_equal = 1;
+        err = cudaMemcpyAsync(d_equal, &h_equal, sizeof(int), cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_lhs);
+            cudaFree(d_rhs);
+            cudaFree(d_equal);
+            return set_error(err);
+        }
+
+        const int threads = 256;
+        const size_t total = count * n;
+        const int blocks = static_cast<int>((total + threads - 1) / threads);
+        block_equal_kernel<<<blocks, threads, 0, stream>>>(d_lhs, d_rhs, count, n, d_equal);
+        err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_lhs);
+            cudaFree(d_rhs);
+            cudaFree(d_equal);
+            return set_error(err);
+        }
+
+        err = cudaMemcpyAsync(&h_equal, d_equal, sizeof(int), cudaMemcpyDeviceToHost, stream);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_lhs);
+            cudaFree(d_rhs);
+            cudaFree(d_equal);
+            return set_error(err);
+        }
+        err = cudaStreamSynchronize(stream);
+        if (err != cudaSuccess)
+        {
+            cudaFree(d_lhs);
+            cudaFree(d_rhs);
+            cudaFree(d_equal);
+            return set_error(err);
+        }
+
+        cudaFree(d_lhs);
+        cudaFree(d_rhs);
+        cudaFree(d_equal);
+        is_equal = (h_equal != 0);
+        return 0;
+    }
+
+    int arith_wait_stream_on_stream(int device, cudaStream_t consumer, cudaStream_t producer)
+    {
+        if (!consumer || !producer || consumer == producer)
+        {
+            return 0;
+        }
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        cudaEvent_t ev = nullptr;
+        err = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        err = cudaEventRecord(ev, producer);
+        if (err != cudaSuccess)
+        {
+            cudaEventDestroy(ev);
+            return set_error(err);
+        }
+        err = cudaStreamWaitEvent(consumer, ev, 0);
+        if (err != cudaSuccess)
+        {
+            cudaEventDestroy(ev);
+            return set_error(err);
+        }
+        err = cudaEventDestroy(ev);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        return 0;
+    }
+
+    int get_scalar_limb_u64(
+        const GpuPoly *scalar,
+        const dim3 &limb_id,
+        const uint64_t **out_ptr,
+        int *out_device,
+        cudaStream_t *out_stream)
+    {
+        if (!scalar || !scalar->poly || !out_ptr || !out_device || !out_stream)
+        {
+            return set_error("invalid scalar arguments in get_scalar_limb_u64");
+        }
+        if (limb_id.x >= scalar->poly->GPU.size())
+        {
+            return set_error("unexpected scalar partition index in get_scalar_limb_u64");
+        }
+        const auto &partition = scalar->poly->GPU[limb_id.x];
+        if (limb_id.y >= partition.limb.size())
+        {
+            return set_error("unexpected scalar limb index in get_scalar_limb_u64");
+        }
+        const auto &limb_impl = partition.limb[limb_id.y];
+        if (limb_impl.index() != FIDESlib::U64)
+        {
+            return set_error("unsupported scalar limb type in get_scalar_limb_u64");
+        }
+        const auto &limb_u64 = std::get<FIDESlib::U64>(limb_impl);
+        if (!limb_u64.v.data || !limb_u64.stream.ptr)
+        {
+            return set_error("null scalar limb buffer in get_scalar_limb_u64");
+        }
+        *out_ptr = limb_u64.v.data;
+        *out_device = partition.device;
+        *out_stream = limb_u64.stream.ptr;
+        return 0;
+    }
+
+    template <typename T>
+    int launch_matrix_elementwise_for_limb(
+        GpuMatrix *out,
+        const GpuMatrix *lhs,
+        const GpuMatrix *rhs,
+        size_t count,
+        size_t n,
+        int limb,
+        const dim3 &limb_id,
+        BlockOp op)
+    {
+        if constexpr (!std::is_same_v<T, uint64_t>)
+        {
+            return set_error("unsupported matrix limb type in launch_matrix_elementwise_for_limb");
+        }
+        if (count == 0 || n == 0)
+        {
+            return 0;
+        }
+
+        int lhs_device = -1;
+        int rhs_device = -1;
+        int out_device = -1;
+        int status = matrix_limb_device(lhs, limb_id, &lhs_device);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_limb_device(rhs, limb_id, &rhs_device);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_limb_device(out, limb_id, &out_device);
+        if (status != 0)
+        {
+            return status;
+        }
+        if (lhs_device != rhs_device || lhs_device != out_device)
+        {
+            return set_error("device mismatch in launch_matrix_elementwise_for_limb");
+        }
+
+        cudaStream_t stream = nullptr;
+        status = matrix_limb_stream(out, limb_id, &stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        cudaError_t err = cudaSetDevice(out_device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+
+        std::vector<T *> out_ptrs;
+        std::vector<const T *> lhs_ptrs;
+        std::vector<const T *> rhs_ptrs;
+        out_ptrs.reserve(count);
+        lhs_ptrs.reserve(count);
+        rhs_ptrs.reserve(count);
+        for (size_t idx = 0; idx < count; ++idx)
+        {
+            const uint64_t *lhs_ptr = matrix_limb_ptr_by_id(lhs, idx, limb_id);
+            const uint64_t *rhs_ptr = matrix_limb_ptr_by_id(rhs, idx, limb_id);
+            uint64_t *out_ptr = matrix_limb_ptr_by_id(out, idx, limb_id);
+            if (!lhs_ptr || !rhs_ptr || !out_ptr)
+            {
+                return set_error("null matrix limb pointer in launch_matrix_elementwise_for_limb");
+            }
+            lhs_ptrs.push_back(reinterpret_cast<const T *>(lhs_ptr));
+            rhs_ptrs.push_back(reinterpret_cast<const T *>(rhs_ptr));
+            out_ptrs.push_back(reinterpret_cast<T *>(out_ptr));
+        }
+
+        if (static_cast<size_t>(limb) >= lhs->ctx->moduli.size())
+        {
+            return set_error("unexpected modulus index in launch_matrix_elementwise_for_limb");
+        }
+        const uint64_t modulus64 = lhs->ctx->moduli[static_cast<size_t>(limb)];
+        const T modulus = static_cast<T>(modulus64);
+        return launch_block_kernel(out_ptrs, lhs_ptrs, rhs_ptrs, n, modulus, op, stream);
+    }
+
+    template <typename T>
+    int launch_matrix_matmul_for_limb(
+        GpuMatrix *out,
+        const GpuMatrix *lhs,
+        const GpuMatrix *rhs,
+        size_t rows,
+        size_t inner,
+        size_t cols,
+        size_t n,
+        int limb,
+        const dim3 &limb_id,
+        double *out_kernel_ms)
+    {
+        if constexpr (!std::is_same_v<T, uint64_t>)
+        {
+            return set_error("unsupported matrix limb type in launch_matrix_matmul_for_limb");
+        }
+        const size_t out_count = rows * cols;
+        const size_t lhs_count = rows * inner;
+        const size_t rhs_count = inner * cols;
+        if (out_count == 0 || n == 0)
+        {
+            return 0;
+        }
+
+        int lhs_device = -1;
+        int rhs_device = -1;
+        int out_device = -1;
+        int status = matrix_limb_device(lhs, limb_id, &lhs_device);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_limb_device(rhs, limb_id, &rhs_device);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_limb_device(out, limb_id, &out_device);
+        if (status != 0)
+        {
+            return status;
+        }
+        if (lhs_device != rhs_device || lhs_device != out_device)
+        {
+            return set_error("device mismatch in launch_matrix_matmul_for_limb");
+        }
+
+        cudaStream_t stream = nullptr;
+        status = matrix_limb_stream(out, limb_id, &stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        cudaError_t err = cudaSetDevice(out_device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+
+        std::vector<T *> out_ptrs;
+        std::vector<const T *> lhs_ptrs;
+        std::vector<const T *> rhs_ptrs;
+        out_ptrs.reserve(out_count);
+        lhs_ptrs.reserve(lhs_count);
+        rhs_ptrs.reserve(rhs_count);
+
+        for (size_t r = 0; r < rows; ++r)
+        {
+            for (size_t k = 0; k < inner; ++k)
+            {
+                const size_t idx = matrix_index(r, k, lhs->cols);
+                const uint64_t *lhs_ptr = matrix_limb_ptr_by_id(lhs, idx, limb_id);
+                if (!lhs_ptr)
+                {
+                    return set_error("null lhs pointer in launch_matrix_matmul_for_limb");
+                }
+                lhs_ptrs.push_back(reinterpret_cast<const T *>(lhs_ptr));
+            }
+        }
+        for (size_t k = 0; k < inner; ++k)
+        {
+            for (size_t c = 0; c < cols; ++c)
+            {
+                const size_t idx = matrix_index(k, c, rhs->cols);
+                const uint64_t *rhs_ptr = matrix_limb_ptr_by_id(rhs, idx, limb_id);
+                if (!rhs_ptr)
+                {
+                    return set_error("null rhs pointer in launch_matrix_matmul_for_limb");
+                }
+                rhs_ptrs.push_back(reinterpret_cast<const T *>(rhs_ptr));
+            }
+        }
+        for (size_t r = 0; r < rows; ++r)
+        {
+            for (size_t c = 0; c < cols; ++c)
+            {
+                const size_t idx = matrix_index(r, c, out->cols);
+                uint64_t *out_ptr = matrix_limb_ptr_by_id(out, idx, limb_id);
+                if (!out_ptr)
+                {
+                    return set_error("null out pointer in launch_matrix_matmul_for_limb");
+                }
+                out_ptrs.push_back(reinterpret_cast<T *>(out_ptr));
+            }
+        }
+
+        if (static_cast<size_t>(limb) >= lhs->ctx->moduli.size())
+        {
+            return set_error("unexpected modulus index in launch_matrix_matmul_for_limb");
+        }
+        const uint64_t modulus64 = lhs->ctx->moduli[static_cast<size_t>(limb)];
+        const T modulus = static_cast<T>(modulus64);
+        return launch_block_matmul_kernel(
+            out_ptrs,
+            lhs_ptrs,
+            rhs_ptrs,
+            rows,
+            inner,
+            cols,
+            n,
+            modulus,
+            stream,
+            out_kernel_ms);
+    }
+
+    template <typename T>
+    int launch_matrix_scalar_mul_for_limb(
+        GpuMatrix *out,
+        const GpuMatrix *lhs,
+        const GpuPoly *scalar,
+        size_t count,
+        size_t n,
+        int limb,
+        const dim3 &limb_id)
+    {
+        if constexpr (!std::is_same_v<T, uint64_t>)
+        {
+            return set_error("unsupported matrix limb type in launch_matrix_scalar_mul_for_limb");
+        }
+        if (count == 0 || n == 0)
+        {
+            return 0;
+        }
+
+        int lhs_device = -1;
+        int out_device = -1;
+        int status = matrix_limb_device(lhs, limb_id, &lhs_device);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_limb_device(out, limb_id, &out_device);
+        if (status != 0)
+        {
+            return status;
+        }
+        if (lhs_device != out_device)
+        {
+            return set_error("device mismatch in launch_matrix_scalar_mul_for_limb");
+        }
+
+        const uint64_t *scalar_ptr = nullptr;
+        int scalar_device = -1;
+        cudaStream_t scalar_stream = nullptr;
+        status = get_scalar_limb_u64(scalar, limb_id, &scalar_ptr, &scalar_device, &scalar_stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        if (scalar_device != out_device)
+        {
+            return set_error("scalar device mismatch in launch_matrix_scalar_mul_for_limb");
+        }
+
+        cudaStream_t stream = nullptr;
+        status = matrix_limb_stream(out, limb_id, &stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        cudaError_t err = cudaSetDevice(out_device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        status = arith_wait_stream_on_stream(out_device, stream, scalar_stream);
+        if (status != 0)
+        {
+            return status;
+        }
+
+        std::vector<T *> out_ptrs;
+        std::vector<const T *> lhs_ptrs;
+        std::vector<const T *> rhs_ptrs;
+        out_ptrs.reserve(count);
+        lhs_ptrs.reserve(count);
+        rhs_ptrs.reserve(count);
+        const T *scalar_ptr_t = reinterpret_cast<const T *>(scalar_ptr);
+        for (size_t idx = 0; idx < count; ++idx)
+        {
+            const uint64_t *lhs_ptr = matrix_limb_ptr_by_id(lhs, idx, limb_id);
+            uint64_t *out_ptr = matrix_limb_ptr_by_id(out, idx, limb_id);
+            if (!lhs_ptr || !out_ptr)
+            {
+                return set_error("null matrix limb pointer in launch_matrix_scalar_mul_for_limb");
+            }
+            lhs_ptrs.push_back(reinterpret_cast<const T *>(lhs_ptr));
+            rhs_ptrs.push_back(scalar_ptr_t);
+            out_ptrs.push_back(reinterpret_cast<T *>(out_ptr));
+        }
+
+        if (static_cast<size_t>(limb) >= lhs->ctx->moduli.size())
+        {
+            return set_error("unexpected modulus index in launch_matrix_scalar_mul_for_limb");
+        }
+        const uint64_t modulus64 = lhs->ctx->moduli[static_cast<size_t>(limb)];
+        const T modulus = static_cast<T>(modulus64);
+        return launch_block_kernel(out_ptrs, lhs_ptrs, rhs_ptrs, n, modulus, BlockOp::Mul, stream);
+    }
+
+    template <typename T>
+    int launch_matrix_equal_for_limb(
+        const GpuMatrix *lhs,
+        const GpuMatrix *rhs,
+        size_t count,
+        size_t n,
+        const dim3 &limb_id,
+        bool &is_equal)
+    {
+        if constexpr (!std::is_same_v<T, uint64_t>)
+        {
+            return set_error("unsupported matrix limb type in launch_matrix_equal_for_limb");
+        }
+        if (count == 0 || n == 0)
+        {
+            is_equal = true;
+            return 0;
+        }
+
+        int lhs_device = -1;
+        int rhs_device = -1;
+        int status = matrix_limb_device(lhs, limb_id, &lhs_device);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_limb_device(rhs, limb_id, &rhs_device);
+        if (status != 0)
+        {
+            return status;
+        }
+        if (lhs_device != rhs_device)
+        {
+            return set_error("device mismatch in launch_matrix_equal_for_limb");
+        }
+
+        cudaStream_t stream = nullptr;
+        status = matrix_limb_stream(lhs, limb_id, &stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        cudaError_t err = cudaSetDevice(lhs_device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+
+        std::vector<const T *> lhs_ptrs;
+        std::vector<const T *> rhs_ptrs;
+        lhs_ptrs.reserve(count);
+        rhs_ptrs.reserve(count);
+        for (size_t idx = 0; idx < count; ++idx)
+        {
+            const uint64_t *lhs_ptr = matrix_limb_ptr_by_id(lhs, idx, limb_id);
+            const uint64_t *rhs_ptr = matrix_limb_ptr_by_id(rhs, idx, limb_id);
+            if (!lhs_ptr || !rhs_ptr)
+            {
+                return set_error("null matrix limb pointer in launch_matrix_equal_for_limb");
+            }
+            lhs_ptrs.push_back(reinterpret_cast<const T *>(lhs_ptr));
+            rhs_ptrs.push_back(reinterpret_cast<const T *>(rhs_ptr));
+        }
+
+        return launch_block_equal_kernel(lhs_ptrs, rhs_ptrs, n, stream, is_equal);
     }
 
     int gpu_block_op(GpuPoly *const *out, const GpuPoly *const *lhs, const GpuPoly *const *rhs, size_t count, BlockOp op)
@@ -1434,46 +1949,55 @@ extern "C" int gpu_matrix_add(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     {
         return set_error("context mismatch in gpu_matrix_add");
     }
+    if (!lhs->ctx || !lhs->ctx->ctx)
+    {
+        return set_error("null context in gpu_matrix_add");
+    }
+
     const size_t count = lhs->rows * lhs->cols;
-    std::vector<GpuPoly *> out_polys;
-    std::vector<GpuPoly *> lhs_polys_raw;
-    std::vector<GpuPoly *> rhs_polys_raw;
-    auto cleanup = [&]()
+    if (count == 0)
     {
-        release_poly_views(out_polys);
-        release_poly_views(lhs_polys_raw);
-        release_poly_views(rhs_polys_raw);
-    };
-    int status = materialize_matrix_poly_views(out, out_polys);
-    if (status != 0)
-    {
-        cleanup();
-        return status;
+        out->format = PolyFormat::Eval;
+        return 0;
     }
-    status = materialize_matrix_poly_views(lhs, lhs_polys_raw);
-    if (status != 0)
+
+    const int level = lhs->level;
+    if (level < 0)
     {
-        cleanup();
-        return status;
+        return set_error("invalid level in gpu_matrix_add");
     }
-    status = materialize_matrix_poly_views(rhs, rhs_polys_raw);
-    if (status != 0)
+
+    const int N = lhs->ctx->N;
+    if (N <= 0)
     {
-        cleanup();
-        return status;
+        out->format = PolyFormat::Eval;
+        return 0;
     }
-    auto lhs_polys = collect_poly_const_ptrs(lhs_polys_raw);
-    auto rhs_polys = collect_poly_const_ptrs(rhs_polys_raw);
-    status = gpu_block_add(
-        out_polys.data(),
-        lhs_polys.data(),
-        rhs_polys.data(),
-        count);
-    cleanup();
-    if (status != 0)
+
+    auto &limb_map = lhs->ctx->ctx->limbGPUid;
+    if (limb_map.size() < static_cast<size_t>(level + 1))
     {
-        return status;
+        return set_error("unexpected limb mapping size in gpu_matrix_add");
     }
+
+    for (int limb = 0; limb <= level; ++limb)
+    {
+        const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
+        int status = launch_matrix_elementwise_for_limb<uint64_t>(
+            out,
+            lhs,
+            rhs,
+            count,
+            static_cast<size_t>(N),
+            limb,
+            limb_id,
+            BlockOp::Add);
+        if (status != 0)
+        {
+            return status;
+        }
+    }
+
     out->format = PolyFormat::Eval;
     return 0;
 }
@@ -1497,46 +2021,55 @@ extern "C" int gpu_matrix_sub(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     {
         return set_error("context mismatch in gpu_matrix_sub");
     }
+    if (!lhs->ctx || !lhs->ctx->ctx)
+    {
+        return set_error("null context in gpu_matrix_sub");
+    }
+
     const size_t count = lhs->rows * lhs->cols;
-    std::vector<GpuPoly *> out_polys;
-    std::vector<GpuPoly *> lhs_polys_raw;
-    std::vector<GpuPoly *> rhs_polys_raw;
-    auto cleanup = [&]()
+    if (count == 0)
     {
-        release_poly_views(out_polys);
-        release_poly_views(lhs_polys_raw);
-        release_poly_views(rhs_polys_raw);
-    };
-    int status = materialize_matrix_poly_views(out, out_polys);
-    if (status != 0)
-    {
-        cleanup();
-        return status;
+        out->format = lhs->format;
+        return 0;
     }
-    status = materialize_matrix_poly_views(lhs, lhs_polys_raw);
-    if (status != 0)
+
+    const int level = lhs->level;
+    if (level < 0)
     {
-        cleanup();
-        return status;
+        return set_error("invalid level in gpu_matrix_sub");
     }
-    status = materialize_matrix_poly_views(rhs, rhs_polys_raw);
-    if (status != 0)
+
+    const int N = lhs->ctx->N;
+    if (N <= 0)
     {
-        cleanup();
-        return status;
+        out->format = lhs->format;
+        return 0;
     }
-    auto lhs_polys = collect_poly_const_ptrs(lhs_polys_raw);
-    auto rhs_polys = collect_poly_const_ptrs(rhs_polys_raw);
-    status = gpu_block_sub(
-        out_polys.data(),
-        lhs_polys.data(),
-        rhs_polys.data(),
-        count);
-    cleanup();
-    if (status != 0)
+
+    auto &limb_map = lhs->ctx->ctx->limbGPUid;
+    if (limb_map.size() < static_cast<size_t>(level + 1))
     {
-        return status;
+        return set_error("unexpected limb mapping size in gpu_matrix_sub");
     }
+
+    for (int limb = 0; limb <= level; ++limb)
+    {
+        const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
+        int status = launch_matrix_elementwise_for_limb<uint64_t>(
+            out,
+            lhs,
+            rhs,
+            count,
+            static_cast<size_t>(N),
+            limb,
+            limb_id,
+            BlockOp::Sub);
+        if (status != 0)
+        {
+            return status;
+        }
+    }
+
     out->format = lhs->format;
     return 0;
 }
@@ -1560,47 +2093,53 @@ extern "C" int gpu_matrix_mul(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     {
         return set_error("context mismatch in gpu_matrix_mul");
     }
-    std::vector<GpuPoly *> out_polys;
-    std::vector<GpuPoly *> lhs_polys_raw;
-    std::vector<GpuPoly *> rhs_polys_raw;
-    auto cleanup = [&]()
+    if (!lhs->ctx || !lhs->ctx->ctx)
     {
-        release_poly_views(out_polys);
-        release_poly_views(lhs_polys_raw);
-        release_poly_views(rhs_polys_raw);
-    };
-    int status = materialize_matrix_poly_views(out, out_polys);
-    if (status != 0)
-    {
-        cleanup();
-        return status;
+        return set_error("null context in gpu_matrix_mul");
     }
-    status = materialize_matrix_poly_views(lhs, lhs_polys_raw);
-    if (status != 0)
+    if (lhs->format != PolyFormat::Eval || rhs->format != PolyFormat::Eval)
     {
-        cleanup();
-        return status;
+        return set_error("gpu_matrix_mul requires Eval format");
     }
-    status = materialize_matrix_poly_views(rhs, rhs_polys_raw);
-    if (status != 0)
+
+    const int level = lhs->level;
+    if (level < 0)
     {
-        cleanup();
-        return status;
+        return set_error("invalid level in gpu_matrix_mul");
     }
-    auto lhs_polys = collect_poly_const_ptrs(lhs_polys_raw);
-    auto rhs_polys = collect_poly_const_ptrs(rhs_polys_raw);
-    status = gpu_block_mul(
-        out_polys.data(),
-        lhs_polys.data(),
-        rhs_polys.data(),
-        lhs->rows,
-        lhs->cols,
-        rhs->cols);
-    cleanup();
-    if (status != 0)
+    const int N = lhs->ctx->N;
+    if (N <= 0)
     {
-        return status;
+        out->format = PolyFormat::Eval;
+        return 0;
     }
+
+    auto &limb_map = lhs->ctx->ctx->limbGPUid;
+    if (limb_map.size() < static_cast<size_t>(level + 1))
+    {
+        return set_error("unexpected limb mapping size in gpu_matrix_mul");
+    }
+
+    for (int limb = 0; limb <= level; ++limb)
+    {
+        const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
+        int status = launch_matrix_matmul_for_limb<uint64_t>(
+            out,
+            lhs,
+            rhs,
+            lhs->rows,
+            lhs->cols,
+            rhs->cols,
+            static_cast<size_t>(N),
+            limb,
+            limb_id,
+            nullptr);
+        if (status != 0)
+        {
+            return status;
+        }
+    }
+
     out->format = PolyFormat::Eval;
     return 0;
 }
@@ -1626,44 +2165,53 @@ extern "C" int gpu_matrix_equal(const GpuMatrix *lhs, const GpuMatrix *rhs, int 
     {
         return 0;
     }
-
+    if (!lhs->ctx || !lhs->ctx->ctx)
+    {
+        return set_error("null context in gpu_matrix_equal");
+    }
+    if (lhs->format != rhs->format)
+    {
+        return 0;
+    }
     const size_t count = lhs->rows * lhs->cols;
-    std::vector<GpuPoly *> lhs_polys;
-    std::vector<GpuPoly *> rhs_polys;
-    auto cleanup = [&]()
+    const int level = lhs->level;
+    if (level < 0)
     {
-        release_poly_views(lhs_polys);
-        release_poly_views(rhs_polys);
-    };
-    int status = materialize_matrix_poly_views(lhs, lhs_polys);
-    if (status != 0)
-    {
-        cleanup();
-        return status;
+        return set_error("invalid level in gpu_matrix_equal");
     }
-    status = materialize_matrix_poly_views(rhs, rhs_polys);
-    if (status != 0)
+    const int N = lhs->ctx->N;
+    if (N <= 0 || count == 0)
     {
-        cleanup();
-        return status;
+        *out_equal = 1;
+        return 0;
     }
-    for (size_t i = 0; i < count; ++i)
+    auto &limb_map = lhs->ctx->ctx->limbGPUid;
+    if (limb_map.size() < static_cast<size_t>(level + 1))
     {
-        int poly_equal = 0;
-        status = gpu_poly_equal(lhs_polys[i], rhs_polys[i], &poly_equal);
+        return set_error("unexpected limb mapping size in gpu_matrix_equal");
+    }
+
+    for (int limb = 0; limb <= level; ++limb)
+    {
+        bool limb_equal = false;
+        const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
+        int status = launch_matrix_equal_for_limb<uint64_t>(
+            lhs,
+            rhs,
+            count,
+            static_cast<size_t>(N),
+            limb_id,
+            limb_equal);
         if (status != 0)
         {
-            cleanup();
             return status;
         }
-        if (poly_equal == 0)
+        if (!limb_equal)
         {
-            cleanup();
             return 0;
         }
     }
 
-    cleanup();
     *out_equal = 1;
     return 0;
 }
@@ -1678,6 +2226,7 @@ extern "C" int gpu_matrix_mul_timed(
     {
         return set_error("null out_kernel_ms in gpu_matrix_mul_timed");
     }
+    *out_kernel_ms = 0.0;
     if (!out || !lhs || !rhs)
     {
         return set_error("invalid gpu_matrix_mul_timed arguments");
@@ -1695,48 +2244,53 @@ extern "C" int gpu_matrix_mul_timed(
     {
         return set_error("context mismatch in gpu_matrix_mul_timed");
     }
-    std::vector<GpuPoly *> out_polys;
-    std::vector<GpuPoly *> lhs_polys_raw;
-    std::vector<GpuPoly *> rhs_polys_raw;
-    auto cleanup = [&]()
+    if (!lhs->ctx || !lhs->ctx->ctx)
     {
-        release_poly_views(out_polys);
-        release_poly_views(lhs_polys_raw);
-        release_poly_views(rhs_polys_raw);
-    };
-    int status = materialize_matrix_poly_views(out, out_polys);
-    if (status != 0)
-    {
-        cleanup();
-        return status;
+        return set_error("null context in gpu_matrix_mul_timed");
     }
-    status = materialize_matrix_poly_views(lhs, lhs_polys_raw);
-    if (status != 0)
+    if (lhs->format != PolyFormat::Eval || rhs->format != PolyFormat::Eval)
     {
-        cleanup();
-        return status;
+        return set_error("gpu_matrix_mul_timed requires Eval format");
     }
-    status = materialize_matrix_poly_views(rhs, rhs_polys_raw);
-    if (status != 0)
+
+    const int level = lhs->level;
+    if (level < 0)
     {
-        cleanup();
-        return status;
+        return set_error("invalid level in gpu_matrix_mul_timed");
     }
-    auto lhs_polys = collect_poly_const_ptrs(lhs_polys_raw);
-    auto rhs_polys = collect_poly_const_ptrs(rhs_polys_raw);
-    status = gpu_block_mul_timed(
-        out_polys.data(),
-        lhs_polys.data(),
-        rhs_polys.data(),
-        lhs->rows,
-        lhs->cols,
-        rhs->cols,
-        out_kernel_ms);
-    cleanup();
-    if (status != 0)
+    const int N = lhs->ctx->N;
+    if (N <= 0)
     {
-        return status;
+        out->format = PolyFormat::Eval;
+        return 0;
     }
+
+    auto &limb_map = lhs->ctx->ctx->limbGPUid;
+    if (limb_map.size() < static_cast<size_t>(level + 1))
+    {
+        return set_error("unexpected limb mapping size in gpu_matrix_mul_timed");
+    }
+
+    for (int limb = 0; limb <= level; ++limb)
+    {
+        const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
+        int status = launch_matrix_matmul_for_limb<uint64_t>(
+            out,
+            lhs,
+            rhs,
+            lhs->rows,
+            lhs->cols,
+            rhs->cols,
+            static_cast<size_t>(N),
+            limb,
+            limb_id,
+            out_kernel_ms);
+        if (status != 0)
+        {
+            return status;
+        }
+    }
+
     out->format = PolyFormat::Eval;
     return 0;
 }
@@ -1762,39 +2316,56 @@ extern "C" int gpu_matrix_mul_scalar(
     {
         return set_error("scalar context mismatch in gpu_matrix_mul_scalar");
     }
+    if (!lhs->ctx || !lhs->ctx->ctx)
+    {
+        return set_error("null context in gpu_matrix_mul_scalar");
+    }
+    if (lhs->format != PolyFormat::Eval || scalar->format != PolyFormat::Eval)
+    {
+        return set_error("gpu_matrix_mul_scalar requires Eval format");
+    }
 
     const size_t count = lhs->rows * lhs->cols;
-    std::vector<GpuPoly *> out_polys;
-    std::vector<GpuPoly *> lhs_polys_raw;
-    auto cleanup = [&]()
+    if (count == 0)
     {
-        release_poly_views(out_polys);
-        release_poly_views(lhs_polys_raw);
-    };
-    int status = materialize_matrix_poly_views(out, out_polys);
-    if (status != 0)
-    {
-        cleanup();
-        return status;
+        out->format = lhs->format;
+        return 0;
     }
-    status = materialize_matrix_poly_views(lhs, lhs_polys_raw);
-    if (status != 0)
+    const int level = lhs->level;
+    if (level < 0)
     {
-        cleanup();
-        return status;
+        return set_error("invalid level in gpu_matrix_mul_scalar");
     }
-    auto lhs_polys = collect_poly_const_ptrs(lhs_polys_raw);
-    std::vector<const GpuPoly *> rhs(count, scalar);
-    status = gpu_block_entrywise_mul(
-        out_polys.data(),
-        lhs_polys.data(),
-        rhs.data(),
-        count);
-    cleanup();
-    if (status != 0)
+    const int N = lhs->ctx->N;
+    if (N <= 0)
     {
-        return status;
+        out->format = lhs->format;
+        return 0;
     }
+
+    auto &limb_map = lhs->ctx->ctx->limbGPUid;
+    if (limb_map.size() < static_cast<size_t>(level + 1))
+    {
+        return set_error("unexpected limb mapping size in gpu_matrix_mul_scalar");
+    }
+
+    for (int limb = 0; limb <= level; ++limb)
+    {
+        const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
+        int status = launch_matrix_scalar_mul_for_limb<uint64_t>(
+            out,
+            lhs,
+            scalar,
+            count,
+            static_cast<size_t>(N),
+            limb,
+            limb_id);
+        if (status != 0)
+        {
+            return status;
+        }
+    }
+
     out->format = lhs->format;
     return 0;
 }

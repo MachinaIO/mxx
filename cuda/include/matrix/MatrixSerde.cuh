@@ -11,7 +11,8 @@ extern "C"
         GpuMatrix *mat,
         const uint8_t *bytes,
         size_t bytes_per_poly,
-        int format);
+        int format,
+        GpuEventSet **out_events);
 
     int gpu_matrix_store_rns_batch(
         const GpuMatrix *mat,

@@ -220,9 +220,11 @@ extern "C"
 
             if (out != a)
             {
-                out->poly->copy(*a->poly);
-                out->level = a->level;
-                out->format = a->format;
+                int copy_status = gpu_poly_copy(out, a);
+                if (copy_status != 0)
+                {
+                    return copy_status;
+                }
             }
             ensure_eval(out, batch);
             out->poly->multElement(*b_poly);

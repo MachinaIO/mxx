@@ -20,7 +20,8 @@ extern "C"
         const GpuMatrix *mat,
         size_t row,
         size_t col,
-        GpuPoly **out_poly);
+        GpuPoly **out_poly,
+        GpuEventSet **out_events);
     int gpu_matrix_copy_entry(
         GpuMatrix *mat,
         size_t row,

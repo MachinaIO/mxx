@@ -113,9 +113,19 @@ int gpu_poly_decompose_base(
 int gpu_matrix_create(GpuContext* ctx, int level, size_t rows, size_t cols, int format, GpuMatrix** out);
 void gpu_matrix_destroy(GpuMatrix* mat);
 int gpu_matrix_copy(GpuMatrix* dst, const GpuMatrix* src);
-int gpu_matrix_entry_clone(const GpuMatrix* mat, size_t row, size_t col, GpuPoly** out_poly);
+int gpu_matrix_entry_clone(
+    const GpuMatrix* mat,
+    size_t row,
+    size_t col,
+    GpuPoly** out_poly,
+    GpuEventSet** out_events);
 int gpu_matrix_copy_entry(GpuMatrix* mat, size_t row, size_t col, const GpuPoly* src);
-int gpu_matrix_load_rns_batch(GpuMatrix* mat, const uint8_t* bytes, size_t bytes_per_poly, int format);
+int gpu_matrix_load_rns_batch(
+    GpuMatrix* mat,
+    const uint8_t* bytes,
+    size_t bytes_per_poly,
+    int format,
+    GpuEventSet** out_events);
 int gpu_matrix_store_rns_batch(
     const GpuMatrix* mat,
     uint8_t* bytes_out,

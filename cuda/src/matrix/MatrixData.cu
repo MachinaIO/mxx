@@ -435,18 +435,20 @@ extern "C" int gpu_matrix_entry_clone(
     const GpuMatrix *mat,
     size_t row,
     size_t col,
-    GpuPoly **out_poly)
+    GpuPoly **out_poly,
+    GpuEventSet **out_events)
 {
-    if (!mat || !out_poly)
+    if (!mat || !out_poly || !out_events)
     {
         return set_error("invalid gpu_matrix_entry_clone arguments");
     }
+    *out_events = nullptr;
     if (row >= mat->rows || col >= mat->cols)
     {
         return set_error("index out of bounds in gpu_matrix_entry_clone");
     }
     const size_t idx = matrix_index(row, col, mat->cols);
-    return gpu_poly_clone(mat->polys[idx], out_poly);
+    return gpu_poly_clone_async(mat->polys[idx], out_poly, out_events);
 }
 
 extern "C" int gpu_matrix_copy_entry(

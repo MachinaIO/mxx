@@ -442,6 +442,9 @@ extern "C"
                 return set_error("invalid gpu_poly_copy arguments");
             }
             dst->poly->copy(*src->poly);
+            // copy() writes via partition stream; propagate completion to limb streams
+            // so the next limb-stream consumer observes copied data.
+            propagate_partition_stream_to_limbs(dst->poly);
             dst->level = src->level;
             dst->format = src->format;
             return 0;

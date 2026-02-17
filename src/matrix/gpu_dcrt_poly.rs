@@ -130,7 +130,7 @@ impl PartialEq for GpuDCRTPolyMatrix {
 impl Eq for GpuDCRTPolyMatrix {}
 
 impl GpuDCRTPolyMatrix {
-    fn new_empty(params: &GpuDCRTPolyParams, nrow: usize, ncol: usize) -> Self {
+    pub(crate) fn new_empty(params: &GpuDCRTPolyParams, nrow: usize, ncol: usize) -> Self {
         let level = params.crt_depth().saturating_sub(1) as i32;
         let mut raw: *mut GpuMatrixOpaque = ptr::null_mut();
         let status = unsafe {
@@ -282,7 +282,7 @@ impl GpuDCRTPolyMatrix {
         out
     }
 
-    fn store_rns_bytes(&self, bytes_out: &mut [u8], bytes_per_poly: usize, format: i32) {
+    pub(crate) fn store_rns_bytes(&self, bytes_out: &mut [u8], bytes_per_poly: usize, format: i32) {
         if bytes_out.is_empty() || bytes_per_poly == 0 {
             return;
         }
@@ -304,19 +304,26 @@ impl GpuDCRTPolyMatrix {
         }
     }
 
-    fn load_rns_bytes(&mut self, bytes: &[u8], bytes_per_poly: usize, format: i32) {
+    pub(crate) fn load_rns_bytes(&mut self, bytes: &[u8], bytes_per_poly: usize, format: i32) {
         if bytes.is_empty() || bytes_per_poly == 0 {
             return;
         }
+        let mut events: *mut GpuEventSetOpaque = ptr::null_mut();
         let status = unsafe {
             gpu_matrix_load_rns_batch(
                 self.raw,
                 bytes.as_ptr(),
                 bytes_per_poly,
                 format,
+                &mut events as *mut *mut GpuEventSetOpaque,
             )
         };
         check_status(status, "gpu_matrix_load_rns_batch");
+        if !events.is_null() {
+            let wait_status = unsafe { gpu_event_set_wait(events) };
+            unsafe { gpu_event_set_destroy(events) };
+            check_status(wait_status, "gpu_event_set_wait");
+        }
     }
 
     fn cpu_params(&self) -> DCRTPolyParams {
@@ -608,8 +615,14 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
 
     fn entry(&self, i: usize, j: usize) -> Self::P {
         let mut poly_ptr: *mut _ = ptr::null_mut();
-        let status = unsafe { gpu_matrix_entry_clone(self.raw, i, j, &mut poly_ptr) };
+        let mut events: *mut GpuEventSetOpaque = ptr::null_mut();
+        let status = unsafe { gpu_matrix_entry_clone(self.raw, i, j, &mut poly_ptr, &mut events) };
         check_status(status, "gpu_matrix_entry_clone");
+        if !events.is_null() {
+            let wait_status = unsafe { gpu_event_set_wait(events) };
+            unsafe { gpu_event_set_destroy(events) };
+            check_status(wait_status, "gpu_event_set_wait");
+        }
         let params = Arc::new(self.params.clone());
         let level = params.crt_depth().saturating_sub(1);
         unsafe { GpuDCRTPoly::from_raw(params, poly_ptr, level, true) }

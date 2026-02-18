@@ -7,7 +7,7 @@ use crate::{
 use num_bigint::BigUint;
 use num_traits::{One, ToPrimitive};
 use std::{marker::PhantomData, sync::Arc};
-use tracing::debug;
+use tracing::{debug, info};
 
 #[derive(Debug, Clone)]
 pub struct NestedRnsPolyContext {
@@ -218,7 +218,7 @@ impl NestedRnsPolyContext {
                 },
                 Some(max_mod_p_row),
             );
-            debug!("Constructed lut_mod_p for p_{} = {} with size {}", p_i_idx, p_i, lut_mod_p_len);
+            info!("Constructed lut_mod_p for p_{} = {} with size {}", p_i_idx, p_i, lut_mod_p_len);
             lut_mod_p.push(lut_mod_p_lut);
 
             let p_moduli_big = BigUint::from(p_i);
@@ -259,7 +259,7 @@ impl NestedRnsPolyContext {
                 },
                 Some(max_x_to_y_row),
             );
-            debug!(
+            info!(
                 "Constructed lut_x_to_y for p_{} = {} with size {}",
                 p_i_idx, p_i, lut_x_to_y_len
             );
@@ -283,7 +283,7 @@ impl NestedRnsPolyContext {
                 },
                 Some(max_x_to_real_row),
             );
-            debug!(
+            info!(
                 "Constructed lut_x_to_real for p_{} = {} with size {}",
                 p_i_idx, p_i, lut_x_to_real_len
             );
@@ -322,7 +322,7 @@ impl NestedRnsPolyContext {
             },
             Some(max_real_to_v_row),
         );
-        debug!("Constructed lut_real_to_v with size {}", lut_real_to_v_len);
+        info!("Constructed lut_real_to_v with size {}", lut_real_to_v_len);
         let lut_real_to_v = lut_real_to_v_lut;
 
         let lut_mod_p_ids = lut_mod_p

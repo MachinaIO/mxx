@@ -38,6 +38,13 @@ struct GpuMatrix
     size_t cols;
     int level;
     GpuPolyFormat format;
+    struct LimbExecState
+    {
+        int device;
+        cudaStream_t stream;
+        cudaEvent_t write_done;
+        bool write_done_valid;
+    };
     struct SharedLimbBuffer
     {
         int device;
@@ -56,6 +63,7 @@ struct GpuMatrix
     };
     std::vector<SharedLimbBuffer> shared_limb_buffers;
     std::vector<SharedAuxBuffer> shared_aux_buffers;
+    std::vector<std::vector<LimbExecState>> exec_limb_states;
 };
 #endif
 

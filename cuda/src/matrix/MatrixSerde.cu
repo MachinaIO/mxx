@@ -316,7 +316,7 @@ namespace
         size_t *out_limb_count,
         size_t *out_poly_count)
     {
-        if (!mat || !mat->ctx || !mat->ctx->ctx || !out_level || !out_n ||
+        if (!mat || !mat->ctx || !out_level || !out_n ||
             !out_limb_count || !out_poly_count)
         {
             return false;
@@ -376,7 +376,7 @@ extern "C" int gpu_matrix_load_rns_batch(
         return set_error("invalid gpu_matrix_load_rns_batch arguments");
     }
     *out_events = nullptr;
-    if (!mat->ctx || !mat->ctx->ctx)
+    if (!mat->ctx)
     {
         return set_error("invalid context in gpu_matrix_load_rns_batch");
     }
@@ -430,7 +430,7 @@ extern "C" int gpu_matrix_load_rns_batch(
         return 0;
     }
 
-    auto &limb_map = mat->ctx->ctx->limbGPUid;
+    auto &limb_map = mat->ctx->limb_gpu_ids;
     if (limb_map.size() < limb_count)
     {
         return set_error("unexpected limb mapping size in gpu_matrix_load_rns_batch");
@@ -486,6 +486,11 @@ extern "C" int gpu_matrix_load_rns_batch(
         {
             return set_error(err);
         }
+        status = matrix_record_limb_write(mat, limb_id, stream);
+        if (status != 0)
+        {
+            return status;
+        }
         serde_append_unique_stream(streams, device, stream);
     }
 
@@ -505,7 +510,7 @@ extern "C" int gpu_matrix_store_rns_batch(
         return set_error("invalid gpu_matrix_store_rns_batch arguments");
     }
     *out_events = nullptr;
-    if (!mat->ctx || !mat->ctx->ctx)
+    if (!mat->ctx)
     {
         return set_error("invalid context in gpu_matrix_store_rns_batch");
     }
@@ -561,7 +566,7 @@ extern "C" int gpu_matrix_store_rns_batch(
         return set_error("bytes_per_poly too small in gpu_matrix_store_rns_batch");
     }
 
-    auto &limb_map = mat->ctx->ctx->limbGPUid;
+    auto &limb_map = mat->ctx->limb_gpu_ids;
     if (limb_map.size() < limb_count)
     {
         return set_error("unexpected limb mapping size in gpu_matrix_store_rns_batch");
@@ -603,6 +608,11 @@ extern "C" int gpu_matrix_store_rns_batch(
         if (err != cudaSuccess)
         {
             return set_error(err);
+        }
+        status = matrix_wait_limb_stream(mat, limb_id, device, stream);
+        if (status != 0)
+        {
+            return status;
         }
         err = cudaMemcpy2DAsync(
             dst,
@@ -693,7 +703,7 @@ extern "C" int gpu_poly_store_compact_bytes(
         return set_error("words_per_coeff exceeds kernel limit in gpu_poly_store_compact_bytes");
     }
 
-    auto &limb_map = poly->ctx->ctx->limbGPUid;
+    auto &limb_map = poly->ctx->limb_gpu_ids;
     if (limb_map.size() < limb_count)
     {
         return set_error("unexpected limb mapping size in gpu_poly_store_compact_bytes");
@@ -701,7 +711,6 @@ extern "C" int gpu_poly_store_compact_bytes(
 
     std::vector<const uint64_t *> limb_ptrs(limb_count);
     std::vector<size_t> limb_strides(limb_count);
-    std::vector<cudaStream_t> limb_streams(limb_count);
     int common_device = -1;
     for (size_t limb = 0; limb < limb_count; ++limb)
     {
@@ -712,13 +721,7 @@ extern "C" int gpu_poly_store_compact_bytes(
             return set_error("null matrix limb pointer in gpu_poly_store_compact_bytes");
         }
         int device = -1;
-        cudaStream_t stream = nullptr;
         int status = matrix_limb_device(poly, limb_id, &device);
-        if (status != 0)
-        {
-            return status;
-        }
-        status = matrix_limb_stream(poly, limb_id, &stream);
         if (status != 0)
         {
             return status;
@@ -738,7 +741,6 @@ extern "C" int gpu_poly_store_compact_bytes(
         }
         limb_ptrs[limb] = limb_ptr;
         limb_strides[limb] = buffer.words_per_poly;
-        limb_streams[limb] = stream;
     }
 
     const size_t inverse_stride = poly->ctx->moduli.size();
@@ -770,16 +772,7 @@ extern "C" int gpu_poly_store_compact_bytes(
     unsigned int *d_max_bits = nullptr;
     uint8_t *d_payload = nullptr;
     cudaStream_t work_stream = nullptr;
-    std::vector<cudaEvent_t> ready_events;
     auto release = [&]() {
-        for (cudaEvent_t ev : ready_events)
-        {
-            if (ev)
-            {
-                cudaEventDestroy(ev);
-            }
-        }
-        ready_events.clear();
         if (work_stream)
         {
             cudaStreamDestroy(work_stream);
@@ -833,31 +826,18 @@ extern "C" int gpu_poly_store_compact_bytes(
         release();
         return set_error(err);
     }
-    ready_events.reserve(limb_count);
     for (size_t limb = 0; limb < limb_count; ++limb)
     {
-        cudaEvent_t ready = nullptr;
-        err = cudaEventCreateWithFlags(&ready, cudaEventDisableTiming);
-        if (err != cudaSuccess)
+        const int wait_status = matrix_wait_limb_stream(
+            poly,
+            limb_map[limb],
+            common_device,
+            work_stream);
+        if (wait_status != 0)
         {
             release();
-            return set_error(err);
+            return wait_status;
         }
-        err = cudaEventRecord(ready, limb_streams[limb]);
-        if (err != cudaSuccess)
-        {
-            cudaEventDestroy(ready);
-            release();
-            return set_error(err);
-        }
-        err = cudaStreamWaitEvent(work_stream, ready, 0);
-        if (err != cudaSuccess)
-        {
-            cudaEventDestroy(ready);
-            release();
-            return set_error(err);
-        }
-        ready_events.push_back(ready);
     }
 
     err = cudaMalloc(reinterpret_cast<void **>(&d_limb_ptrs), limb_count * sizeof(uint64_t *));
@@ -1127,7 +1107,7 @@ extern "C" int gpu_poly_load_compact_bytes(
     size_t payload_len,
     uint16_t max_coeff_bits)
 {
-    if (!poly || !poly->ctx || !poly->ctx->ctx)
+    if (!poly || !poly->ctx)
     {
         return set_error("invalid gpu_poly_load_compact_bytes arguments");
     }
@@ -1185,7 +1165,7 @@ extern "C" int gpu_poly_load_compact_bytes(
         return set_error("payload length mismatch in gpu_poly_load_compact_bytes");
     }
 
-    auto &limb_map = poly->ctx->ctx->limbGPUid;
+    auto &limb_map = poly->ctx->limb_gpu_ids;
     if (limb_map.size() < limb_count)
     {
         return set_error("unexpected limb mapping size in gpu_poly_load_compact_bytes");
@@ -1193,7 +1173,6 @@ extern "C" int gpu_poly_load_compact_bytes(
 
     std::vector<uint64_t *> limb_ptrs(limb_count);
     std::vector<size_t> limb_strides(limb_count);
-    std::vector<cudaStream_t> limb_streams(limb_count);
     int common_device = -1;
     for (size_t limb = 0; limb < limb_count; ++limb)
     {
@@ -1204,13 +1183,7 @@ extern "C" int gpu_poly_load_compact_bytes(
             return set_error("null matrix limb pointer in gpu_poly_load_compact_bytes");
         }
         int device = -1;
-        cudaStream_t stream = nullptr;
         int status = matrix_limb_device(poly, limb_id, &device);
-        if (status != 0)
-        {
-            return status;
-        }
-        status = matrix_limb_stream(poly, limb_id, &stream);
         if (status != 0)
         {
             return status;
@@ -1230,7 +1203,6 @@ extern "C" int gpu_poly_load_compact_bytes(
         }
         limb_ptrs[limb] = limb_ptr;
         limb_strides[limb] = buffer.words_per_poly;
-        limb_streams[limb] = stream;
     }
 
     cudaError_t err = cudaSetDevice(common_device);
@@ -1244,16 +1216,7 @@ extern "C" int gpu_poly_load_compact_bytes(
     size_t *d_limb_strides = nullptr;
     uint64_t *d_moduli = nullptr;
     cudaStream_t work_stream = nullptr;
-    std::vector<cudaEvent_t> ready_events;
     auto release = [&]() {
-        for (cudaEvent_t ev : ready_events)
-        {
-            if (ev)
-            {
-                cudaEventDestroy(ev);
-            }
-        }
-        ready_events.clear();
         if (work_stream)
         {
             cudaStreamDestroy(work_stream);
@@ -1287,31 +1250,18 @@ extern "C" int gpu_poly_load_compact_bytes(
         release();
         return set_error(err);
     }
-    ready_events.reserve(limb_count);
     for (size_t limb = 0; limb < limb_count; ++limb)
     {
-        cudaEvent_t ready = nullptr;
-        err = cudaEventCreateWithFlags(&ready, cudaEventDisableTiming);
-        if (err != cudaSuccess)
+        const int wait_status = matrix_wait_limb_stream(
+            poly,
+            limb_map[limb],
+            common_device,
+            work_stream);
+        if (wait_status != 0)
         {
             release();
-            return set_error(err);
+            return wait_status;
         }
-        err = cudaEventRecord(ready, limb_streams[limb]);
-        if (err != cudaSuccess)
-        {
-            cudaEventDestroy(ready);
-            release();
-            return set_error(err);
-        }
-        err = cudaStreamWaitEvent(work_stream, ready, 0);
-        if (err != cudaSuccess)
-        {
-            cudaEventDestroy(ready);
-            release();
-            return set_error(err);
-        }
-        ready_events.push_back(ready);
     }
 
     if (payload_len > 0)
@@ -1414,6 +1364,16 @@ extern "C" int gpu_poly_load_compact_bytes(
     {
         release();
         return set_error(err);
+    }
+
+    for (size_t limb = 0; limb < limb_count; ++limb)
+    {
+        const int status = matrix_record_limb_write(poly, limb_map[limb], nullptr);
+        if (status != 0)
+        {
+            release();
+            return status;
+        }
     }
 
     release();

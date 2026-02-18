@@ -334,12 +334,15 @@ int launch_sample_distribution_multi_limb_kernel(
         aux_limb_id,
         workspace_bytes,
         &workspace,
-        &from_shared);
+        &from_shared,
+        stream);
     if (status != 0)
     {
         return status;
     }
-    auto cleanup_workspace = [&]() -> int { return matrix_release_aux_workspace(workspace, from_shared); };
+    auto cleanup_workspace = [&]() -> int {
+        return matrix_release_aux_workspace(workspace, from_shared, stream);
+    };
 
     auto *workspace_base = reinterpret_cast<uint8_t *>(workspace);
     uint64_t **d_dst = reinterpret_cast<uint64_t **>(workspace_base);
@@ -379,13 +382,6 @@ int launch_sample_distribution_multi_limb_kernel(
         sigma,
         seed);
     err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        cleanup_workspace();
-        return set_error(err);
-    }
-
-    err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess)
     {
         cleanup_workspace();
@@ -437,7 +433,7 @@ extern "C" int gpu_matrix_sample_distribution(
         return set_error("unexpected modulus count in gpu_matrix_sample_distribution");
     }
 
-    auto &limb_map = out->ctx->ctx->limbGPUid;
+    auto &limb_map = out->ctx->limb_gpu_ids;
     if (limb_map.size() < static_cast<size_t>(level + 1))
     {
         return set_error("unexpected limb mapping size in gpu_matrix_sample_distribution");
@@ -450,20 +446,21 @@ extern "C" int gpu_matrix_sample_distribution(
         std::vector<uint64_t *> dst_ptrs;
         std::vector<uint64_t> moduli;
         std::vector<uint32_t> limb_indices;
+        std::vector<dim3> dst_limb_ids;
         dim3 aux_limb_id;
         bool has_aux_limb_id;
     };
     std::vector<DistBatch> batches;
-    auto get_batch = [&](int device) -> DistBatch &
+    auto get_batch = [&](int device, cudaStream_t stream) -> DistBatch &
     {
         for (auto &b : batches)
         {
-            if (b.device == device)
+            if (b.device == device && b.stream == stream)
             {
                 return b;
             }
         }
-        batches.push_back(DistBatch{device, nullptr, {}, {}, {}, dim3{0, 0, 0}, false});
+        batches.push_back(DistBatch{device, stream, {}, {}, {}, {}, dim3{0, 0, 0}, false});
         return batches.back();
     };
 
@@ -499,11 +496,7 @@ extern "C" int gpu_matrix_sample_distribution(
         {
             return set_error("invalid limb metadata in gpu_matrix_sample_distribution");
         }
-        auto &batch = get_batch(limb_device);
-        if (!batch.stream)
-        {
-            batch.stream = limb_stream;
-        }
+        auto &batch = get_batch(limb_device, limb_stream);
         if (!batch.has_aux_limb_id)
         {
             batch.aux_limb_id = limb_id;
@@ -511,6 +504,7 @@ extern "C" int gpu_matrix_sample_distribution(
         }
         batch.moduli.push_back(out->ctx->moduli[static_cast<size_t>(limb)]);
         batch.limb_indices.push_back(static_cast<uint32_t>(limb));
+        batch.dst_limb_ids.push_back(limb_id);
         batch.dst_ptrs.insert(batch.dst_ptrs.end(), limb_ptrs.begin(), limb_ptrs.end());
     }
 
@@ -540,6 +534,14 @@ extern "C" int gpu_matrix_sample_distribution(
         if (status != 0)
         {
             return status;
+        }
+        for (const dim3 &limb_id : batch.dst_limb_ids)
+        {
+            status = matrix_record_limb_write(out, limb_id, batch.stream);
+            if (status != 0)
+            {
+                return status;
+            }
         }
     }
 

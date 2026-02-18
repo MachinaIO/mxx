@@ -118,12 +118,15 @@ int launch_fill_gadget_multi_limb_kernel(
         aux_limb_id,
         workspace_bytes,
         &workspace,
-        &from_shared);
+        &from_shared,
+        stream);
     if (status != 0)
     {
         return status;
     }
-    auto cleanup_workspace = [&]() -> int { return matrix_release_aux_workspace(workspace, from_shared); };
+    auto cleanup_workspace = [&]() -> int {
+        return matrix_release_aux_workspace(workspace, from_shared, stream);
+    };
 
     auto *workspace_base = reinterpret_cast<uint8_t *>(workspace);
     uint64_t **d_dst = reinterpret_cast<uint64_t **>(workspace_base);
@@ -171,13 +174,6 @@ int launch_fill_gadget_multi_limb_kernel(
         return set_error(err);
     }
 
-    err = cudaStreamSynchronize(stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_workspace();
-        return set_error(err);
-    }
-
     status = cleanup_workspace();
     if (status != 0)
     {
@@ -219,7 +215,7 @@ extern "C" int gpu_matrix_fill_gadget(
     {
         return set_error("unexpected modulus count in gpu_matrix_fill_gadget");
     }
-    auto &limb_map = out->ctx->ctx->limbGPUid;
+    auto &limb_map = out->ctx->limb_gpu_ids;
     if (limb_map.size() < crt_depth)
     {
         return set_error("unexpected limb mapping size in gpu_matrix_fill_gadget");
@@ -253,20 +249,21 @@ extern "C" int gpu_matrix_fill_gadget(
         std::vector<uint64_t *> dst_ptrs;
         std::vector<uint64_t> moduli;
         std::vector<uint32_t> limb_indices;
+        std::vector<dim3> dst_limb_ids;
         dim3 aux_limb_id;
         bool has_aux_limb_id;
     };
     std::vector<FillBatch> batches;
-    auto get_batch = [&](int device) -> FillBatch &
+    auto get_batch = [&](int device, cudaStream_t stream) -> FillBatch &
     {
         for (auto &b : batches)
         {
-            if (b.device == device)
+            if (b.device == device && b.stream == stream)
             {
                 return b;
             }
         }
-        batches.push_back(FillBatch{device, nullptr, {}, {}, {}, dim3{0, 0, 0}, false});
+        batches.push_back(FillBatch{device, stream, {}, {}, {}, {}, dim3{0, 0, 0}, false});
         return batches.back();
     };
 
@@ -302,11 +299,7 @@ extern "C" int gpu_matrix_fill_gadget(
         {
             return set_error("invalid limb metadata in gpu_matrix_fill_gadget");
         }
-        auto &batch = get_batch(limb_device);
-        if (!batch.stream)
-        {
-            batch.stream = limb_stream;
-        }
+        auto &batch = get_batch(limb_device, limb_stream);
         if (!batch.has_aux_limb_id)
         {
             batch.aux_limb_id = limb_id;
@@ -314,6 +307,7 @@ extern "C" int gpu_matrix_fill_gadget(
         }
         batch.moduli.push_back(out->ctx->moduli[static_cast<size_t>(limb)]);
         batch.limb_indices.push_back(static_cast<uint32_t>(limb));
+        batch.dst_limb_ids.push_back(limb_id);
         batch.dst_ptrs.insert(batch.dst_ptrs.end(), limb_ptrs.begin(), limb_ptrs.end());
     }
 
@@ -345,6 +339,14 @@ extern "C" int gpu_matrix_fill_gadget(
         if (status != 0)
         {
             return status;
+        }
+        for (const dim3 &limb_id : batch.dst_limb_ids)
+        {
+            status = matrix_record_limb_write(out, limb_id, batch.stream);
+            if (status != 0)
+            {
+                return status;
+            }
         }
     }
 
@@ -424,15 +426,7 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
         }
     };
 
-    int status = sync_matrix_limb_streams(
-        src,
-        "failed to synchronize source limb stream before clone in gpu_matrix_decompose_base");
-    if (status != 0)
-    {
-        cleanup_tmp_inputs();
-        return status;
-    }
-
+    int status = 0;
     const int batch = default_batch(src->ctx);
     if (src->format == GPU_POLY_FORMAT_EVAL)
     {
@@ -459,16 +453,7 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
         inputs_matrix = tmp_inputs_matrix;
     }
 
-    status = sync_matrix_limb_streams(
-        inputs_matrix,
-        "failed to synchronize input limb stream before decompose kernel in gpu_matrix_decompose_base");
-    if (status != 0)
-    {
-        cleanup_tmp_inputs();
-        return status;
-    }
-
-    auto &limb_map = src->ctx->ctx->limbGPUid;
+    auto &limb_map = src->ctx->limb_gpu_ids;
     if (limb_map.size() < crt_depth)
     {
         cleanup_tmp_inputs();
@@ -476,19 +461,6 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
     }
 
     const size_t out_count = out->rows * out->cols;
-    std::vector<std::pair<int, cudaStream_t>> out_zero_streams;
-    out_zero_streams.reserve(crt_depth);
-    auto add_out_stream = [&](int device, cudaStream_t stream) {
-        for (const auto &entry : out_zero_streams)
-        {
-            if (entry.first == device && entry.second == stream)
-            {
-                return;
-            }
-        }
-        out_zero_streams.emplace_back(device, stream);
-    };
-
     for (int limb = 0; limb <= level; ++limb)
     {
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
@@ -535,23 +507,6 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
                 return set_error(err);
             }
         }
-        add_out_stream(out_device, out_stream);
-    }
-
-    for (const auto &entry : out_zero_streams)
-    {
-        cudaError_t err = cudaSetDevice(entry.first);
-        if (err != cudaSuccess)
-        {
-            cleanup_tmp_inputs();
-            return set_error(err);
-        }
-        err = cudaStreamSynchronize(entry.second);
-        if (err != cudaSuccess)
-        {
-            cleanup_tmp_inputs();
-            return set_error(err);
-        }
     }
 
     if (src->ctx->moduli.size() < crt_depth)
@@ -566,6 +521,8 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
         cudaStream_t stream;
         bool has_aux_limb;
         dim3 aux_limb_id;
+        std::vector<dim3> src_limb_ids;
+        std::vector<dim3> dst_limb_ids;
         std::vector<const uint64_t *> src_ptrs;
         std::vector<uint64_t *> dst_ptrs;
         std::vector<uint32_t> shifts;
@@ -573,17 +530,28 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
         std::vector<uint64_t> out_moduli;
     };
     std::vector<DecomposeBatch> batches;
-    auto get_batch = [&](int device) -> DecomposeBatch &
+    auto get_batch = [&](int device, cudaStream_t stream) -> DecomposeBatch &
     {
         for (auto &b : batches)
         {
-            if (b.device == device)
+            if (b.device == device && b.stream == stream)
             {
                 return b;
             }
         }
-        batches.push_back(DecomposeBatch{device, nullptr, false, dim3{}, {}, {}, {}, {}, {}});
+        batches.push_back(
+            DecomposeBatch{device, stream, false, dim3{}, {}, {}, {}, {}, {}, {}, {}});
         return batches.back();
+    };
+    auto append_unique_limb = [](std::vector<dim3> &limb_ids, const dim3 &limb_id) {
+        for (const dim3 &entry : limb_ids)
+        {
+            if (entry.x == limb_id.x && entry.y == limb_id.y)
+            {
+                return;
+            }
+        }
+        limb_ids.push_back(limb_id);
     };
 
     for (int src_limb = 0; src_limb <= level; ++src_limb)
@@ -667,16 +635,14 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
                     dst_ptrs.push_back(dst_ptr);
                 }
 
-                auto &batch_ref = get_batch(out_device);
-                if (!batch_ref.stream)
-                {
-                    batch_ref.stream = out_stream;
-                }
+                auto &batch_ref = get_batch(out_device, out_stream);
                 if (!batch_ref.has_aux_limb)
                 {
                     batch_ref.aux_limb_id = out_limb_id;
                     batch_ref.has_aux_limb = true;
                 }
+                append_unique_limb(batch_ref.src_limb_ids, src_limb_id);
+                append_unique_limb(batch_ref.dst_limb_ids, out_limb_id);
                 batch_ref.shifts.push_back(shift);
                 batch_ref.masks.push_back(mask);
                 batch_ref.out_moduli.push_back(src->ctx->moduli[static_cast<size_t>(out_limb)]);
@@ -699,6 +665,15 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
             cleanup_tmp_inputs();
             return set_error(err);
         }
+        for (const dim3 &src_limb_id : batch_ref.src_limb_ids)
+        {
+            status = matrix_wait_limb_stream(inputs_matrix, src_limb_id, batch_ref.device, batch_ref.stream);
+            if (status != 0)
+            {
+                cleanup_tmp_inputs();
+                return status;
+            }
+        }
         status = launch_decompose_multi_kernel<uint64_t>(
             batch_ref.src_ptrs,
             batch_ref.dst_ptrs,
@@ -714,6 +689,15 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
         {
             cleanup_tmp_inputs();
             return status;
+        }
+        for (const dim3 &dst_limb_id : batch_ref.dst_limb_ids)
+        {
+            status = matrix_record_limb_write(out, dst_limb_id, batch_ref.stream);
+            if (status != 0)
+            {
+                cleanup_tmp_inputs();
+                return status;
+            }
         }
     }
 

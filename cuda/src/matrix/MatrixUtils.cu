@@ -40,6 +40,42 @@ size_t matrix_poly_count(const GpuMatrix *mat)
     return mat->rows * mat->cols;
 }
 
+namespace
+{
+    const GpuMatrix::LimbExecState *matrix_limb_state_const(
+        const GpuMatrix *mat,
+        const dim3 &limb_id,
+        const char *context)
+    {
+        if (!mat || !mat->ctx)
+        {
+            set_error("invalid matrix context");
+            return nullptr;
+        }
+        if (limb_id.x >= mat->exec_limb_states.size())
+        {
+            set_error(context);
+            return nullptr;
+        }
+        const auto &states = mat->exec_limb_states[limb_id.x];
+        if (limb_id.y >= states.size())
+        {
+            set_error(context);
+            return nullptr;
+        }
+        return &states[limb_id.y];
+    }
+
+    GpuMatrix::LimbExecState *matrix_limb_state(
+        GpuMatrix *mat,
+        const dim3 &limb_id,
+        const char *context)
+    {
+        return const_cast<GpuMatrix::LimbExecState *>(
+            matrix_limb_state_const(mat, limb_id, context));
+    }
+}
+
 
 int matrix_limb_device(const GpuMatrix *mat, const dim3 &limb_id, int *out_device)
 {
@@ -47,16 +83,13 @@ int matrix_limb_device(const GpuMatrix *mat, const dim3 &limb_id, int *out_devic
     {
         return set_error("invalid matrix_limb_device arguments");
     }
-    if (limb_id.x >= mat->shared_limb_buffers.size())
+    const auto *state =
+        matrix_limb_state_const(mat, limb_id, "invalid limb index in matrix_limb_device");
+    if (!state)
     {
-        return set_error("invalid partition index in matrix_limb_device");
+        return 1;
     }
-    const auto &buffer = mat->shared_limb_buffers[limb_id.x];
-    if (!buffer.ptr || limb_id.y >= buffer.limb_count)
-    {
-        return set_error("invalid limb index in matrix_limb_device");
-    }
-    *out_device = buffer.device;
+    *out_device = state->device;
     return 0;
 }
 
@@ -66,16 +99,13 @@ int matrix_limb_stream(const GpuMatrix *mat, const dim3 &limb_id, cudaStream_t *
     {
         return set_error("invalid matrix_limb_stream arguments");
     }
-    if (limb_id.x >= mat->ctx->ctx->meta.size())
+    const auto *state =
+        matrix_limb_state_const(mat, limb_id, "invalid limb index in matrix_limb_stream");
+    if (!state)
     {
-        return set_error("invalid partition index in matrix_limb_stream");
+        return 1;
     }
-    const auto &meta = mat->ctx->ctx->meta[limb_id.x];
-    if (limb_id.y >= meta.size())
-    {
-        return set_error("invalid limb index in matrix_limb_stream");
-    }
-    *out_stream = meta[limb_id.y].stream.ptr;
+    *out_stream = state->stream;
     return *out_stream ? 0 : set_error("null stream in matrix_limb_stream");
 }
 
@@ -106,6 +136,98 @@ uint64_t *matrix_limb_ptr_by_id(GpuMatrix *mat, size_t poly_idx, const dim3 &lim
 const uint64_t *matrix_limb_ptr_by_id(const GpuMatrix *mat, size_t poly_idx, const dim3 &limb_id)
 {
     return matrix_limb_ptr_by_id(const_cast<GpuMatrix *>(mat), poly_idx, limb_id);
+}
+
+int matrix_wait_limb_stream(
+    const GpuMatrix *src,
+    const dim3 &limb_id,
+    int consumer_device,
+    cudaStream_t consumer_stream)
+{
+    if (!src || !src->ctx || !consumer_stream || consumer_device < 0)
+    {
+        return set_error("invalid matrix_wait_limb_stream arguments");
+    }
+    const auto *state =
+        matrix_limb_state_const(src, limb_id, "invalid limb index in matrix_wait_limb_stream");
+    if (!state)
+    {
+        return 1;
+    }
+    if (!state->write_done || !state->write_done_valid)
+    {
+        return 0;
+    }
+    if (state->device != consumer_device)
+    {
+        return set_error("device mismatch in matrix_wait_limb_stream");
+    }
+    cudaError_t err = cudaSetDevice(consumer_device);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+    err = cudaStreamWaitEvent(consumer_stream, state->write_done, 0);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+    return 0;
+}
+
+int matrix_wait_limb(const GpuMatrix *dst, const GpuMatrix *src, const dim3 &limb_id)
+{
+    if (!dst || !src)
+    {
+        return set_error("invalid matrix_wait_limb arguments");
+    }
+    int dst_device = -1;
+    int status = matrix_limb_device(dst, limb_id, &dst_device);
+    if (status != 0)
+    {
+        return status;
+    }
+    cudaStream_t dst_stream = nullptr;
+    status = matrix_limb_stream(dst, limb_id, &dst_stream);
+    if (status != 0)
+    {
+        return status;
+    }
+    return matrix_wait_limb_stream(src, limb_id, dst_device, dst_stream);
+}
+
+int matrix_record_limb_write(GpuMatrix *dst, const dim3 &limb_id, cudaStream_t stream)
+{
+    if (!dst || !dst->ctx)
+    {
+        return set_error("invalid matrix_record_limb_write arguments");
+    }
+    auto *state =
+        matrix_limb_state(dst, limb_id, "invalid limb index in matrix_record_limb_write");
+    if (!state)
+    {
+        return 1;
+    }
+    if (!stream)
+    {
+        stream = state->stream;
+    }
+    if (!stream || !state->write_done)
+    {
+        return set_error("invalid stream or event in matrix_record_limb_write");
+    }
+    cudaError_t err = cudaSetDevice(state->device);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+    err = cudaEventRecord(state->write_done, stream);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+    state->write_done_valid = true;
+    return 0;
 }
 
 bool matrix_aux_slice_for_limb(const GpuMatrix *mat, const dim3 &limb_id, size_t bytes, void **out_ptr)
@@ -173,7 +295,8 @@ int matrix_acquire_aux_workspace(
     const dim3 *aux_limb_id,
     size_t bytes,
     void **out_ptr,
-    bool *out_shared)
+    bool *out_shared,
+    cudaStream_t stream)
 {
     if (!out_ptr || !out_shared)
     {
@@ -190,7 +313,11 @@ int matrix_acquire_aux_workspace(
         *out_shared = true;
         return 0;
     }
-    cudaError_t err = cudaMalloc(out_ptr, bytes);
+    if (!stream)
+    {
+        return set_error("null stream in matrix_acquire_aux_workspace");
+    }
+    cudaError_t err = cudaMallocAsync(out_ptr, bytes, stream);
     if (err != cudaSuccess)
     {
         return set_error(err);
@@ -198,13 +325,17 @@ int matrix_acquire_aux_workspace(
     return 0;
 }
 
-int matrix_release_aux_workspace(void *ptr, bool from_shared)
+int matrix_release_aux_workspace(void *ptr, bool from_shared, cudaStream_t stream)
 {
     if (!ptr || from_shared)
     {
         return 0;
     }
-    cudaError_t err = cudaFree(ptr);
+    if (!stream)
+    {
+        return set_error("null stream in matrix_release_aux_workspace");
+    }
+    cudaError_t err = cudaFreeAsync(ptr, stream);
     if (err != cudaSuccess)
     {
         return set_error(err);
@@ -215,18 +346,9 @@ int matrix_release_aux_workspace(void *ptr, bool from_shared)
 
 int sync_matrix_limb_streams(const GpuMatrix *mat, const char *context)
 {
-    if (!mat || !mat->ctx || !mat->ctx->ctx || !context)
+    if (!mat || !context)
     {
         return set_error("invalid sync_matrix_limb_streams arguments");
-    }
-    if (mat->level < 0)
-    {
-        return set_error(context);
-    }
-    auto &limb_map = mat->ctx->ctx->limbGPUid;
-    if (limb_map.size() < static_cast<size_t>(mat->level + 1))
-    {
-        return set_error(context);
     }
 
     struct StreamRef
@@ -235,7 +357,12 @@ int sync_matrix_limb_streams(const GpuMatrix *mat, const char *context)
         cudaStream_t stream;
     };
     std::vector<StreamRef> streams;
-    streams.reserve(static_cast<size_t>(mat->level + 1));
+    size_t reserve_count = 0;
+    for (const auto &partition_states : mat->exec_limb_states)
+    {
+        reserve_count += partition_states.size();
+    }
+    streams.reserve(reserve_count);
     auto add_stream = [&](int device, cudaStream_t stream) {
         if (!stream)
         {
@@ -251,22 +378,18 @@ int sync_matrix_limb_streams(const GpuMatrix *mat, const char *context)
         streams.push_back(StreamRef{device, stream});
     };
 
-    for (int limb = 0; limb <= mat->level; ++limb)
+    for (size_t partition_idx = 0; partition_idx < mat->exec_limb_states.size(); ++partition_idx)
     {
-        const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        int device = -1;
-        int status = matrix_limb_device(mat, limb_id, &device);
-        if (status != 0)
+        if (partition_idx >= mat->shared_limb_buffers.size())
         {
             return set_error(context);
         }
-        cudaStream_t stream = nullptr;
-        status = matrix_limb_stream(mat, limb_id, &stream);
-        if (status != 0)
+        const int device = mat->shared_limb_buffers[partition_idx].device;
+        const auto &states = mat->exec_limb_states[partition_idx];
+        for (const auto &state : states)
         {
-            return set_error(context);
+            add_stream(device, state.stream);
         }
-        add_stream(device, stream);
     }
 
     for (const auto &entry : streams)

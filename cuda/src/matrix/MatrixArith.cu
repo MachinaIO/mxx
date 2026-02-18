@@ -253,7 +253,8 @@ namespace
         const dim3 *aux_limb_id,
         size_t bytes,
         void **out_ptr,
-        bool *out_shared)
+        bool *out_shared,
+        cudaStream_t stream)
     {
         if (!out_ptr || !out_shared)
         {
@@ -270,7 +271,11 @@ namespace
             *out_shared = true;
             return 0;
         }
-        cudaError_t err = cudaMalloc(out_ptr, bytes);
+        if (!stream)
+        {
+            return set_error("null stream in acquire_matrix_aux_workspace");
+        }
+        cudaError_t err = cudaMallocAsync(out_ptr, bytes, stream);
         if (err != cudaSuccess)
         {
             return set_error(err);
@@ -278,13 +283,17 @@ namespace
         return 0;
     }
 
-    int release_matrix_aux_workspace(void *ptr, bool from_shared)
+    int release_matrix_aux_workspace(void *ptr, bool from_shared, cudaStream_t stream)
     {
         if (!ptr || from_shared)
         {
             return 0;
         }
-        cudaError_t err = cudaFree(ptr);
+        if (!stream)
+        {
+            return set_error("null stream in release_matrix_aux_workspace");
+        }
+        cudaError_t err = cudaFreeAsync(ptr, stream);
         if (err != cudaSuccess)
         {
             return set_error(err);
@@ -322,7 +331,8 @@ namespace
             aux_limb_id,
             workspace_bytes,
             &workspace,
-            &from_shared);
+            &from_shared,
+            stream);
         if (status != 0)
         {
             return status;
@@ -333,7 +343,9 @@ namespace
         const T **d_lhs = reinterpret_cast<const T **>(workspace_base + lhs_offset);
         const T **d_rhs = reinterpret_cast<const T **>(workspace_base + rhs_offset);
 
-        auto cleanup_workspace = [&]() -> int { return release_matrix_aux_workspace(workspace, from_shared); };
+        auto cleanup_workspace = [&]() -> int {
+            return release_matrix_aux_workspace(workspace, from_shared, stream);
+        };
 
         cudaError_t err = cudaMemcpyAsync(d_out, out_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
@@ -377,14 +389,12 @@ namespace
             cleanup_workspace();
             return set_error(err);
         }
-
         err = cudaStreamSynchronize(stream);
         if (err != cudaSuccess)
         {
             cleanup_workspace();
             return set_error(err);
         }
-
         status = cleanup_workspace();
         if (status != 0)
         {
@@ -434,7 +444,8 @@ namespace
             aux_limb_id,
             workspace_bytes,
             &workspace,
-            &from_shared);
+            &from_shared,
+            stream);
         if (status != 0)
         {
             return status;
@@ -444,7 +455,9 @@ namespace
         T **d_out = reinterpret_cast<T **>(workspace_base);
         const T **d_lhs = reinterpret_cast<const T **>(workspace_base + lhs_offset);
         const T **d_rhs = reinterpret_cast<const T **>(workspace_base + rhs_offset);
-        auto cleanup_workspace = [&]() -> int { return release_matrix_aux_workspace(workspace, from_shared); };
+        auto cleanup_workspace = [&]() -> int {
+            return release_matrix_aux_workspace(workspace, from_shared, stream);
+        };
 
         cudaError_t err = cudaMemcpyAsync(d_out, out_ptrs.data(), out_bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
@@ -545,6 +558,7 @@ namespace
         }
         else
         {
+            // Non-timed path remains asynchronous; dependencies are tracked by stream/event.
             err = cudaStreamSynchronize(stream);
             if (err != cudaSuccess)
             {
@@ -605,7 +619,8 @@ namespace
             aux_limb_id,
             workspace_bytes,
             &workspace,
-            &from_shared);
+            &from_shared,
+            stream);
         if (status != 0)
         {
             return status;
@@ -617,7 +632,9 @@ namespace
         uint32_t *d_shifts = reinterpret_cast<uint32_t *>(workspace_base + shifts_offset);
         T *d_masks = reinterpret_cast<T *>(workspace_base + masks_offset);
         T *d_out_moduli = reinterpret_cast<T *>(workspace_base + out_moduli_offset);
-        auto cleanup_workspace = [&]() -> int { return release_matrix_aux_workspace(workspace, from_shared); };
+        auto cleanup_workspace = [&]() -> int {
+            return release_matrix_aux_workspace(workspace, from_shared, stream);
+        };
 
         cudaError_t err = cudaMemcpyAsync(d_src, src_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
@@ -668,14 +685,12 @@ namespace
             cleanup_workspace();
             return set_error(err);
         }
-
         err = cudaStreamSynchronize(stream);
         if (err != cudaSuccess)
         {
             cleanup_workspace();
             return set_error(err);
         }
-
         status = cleanup_workspace();
         if (status != 0)
         {
@@ -714,7 +729,8 @@ namespace
             aux_limb_id,
             workspace_bytes,
             &workspace,
-            &from_shared);
+            &from_shared,
+            stream);
         if (status != 0)
         {
             return status;
@@ -723,7 +739,9 @@ namespace
         auto *workspace_base = reinterpret_cast<uint8_t *>(workspace);
         const T **d_src = reinterpret_cast<const T **>(workspace_base);
         T **d_dst = reinterpret_cast<T **>(workspace_base + dst_offset);
-        auto cleanup_workspace = [&]() -> int { return release_matrix_aux_workspace(workspace, from_shared); };
+        auto cleanup_workspace = [&]() -> int {
+            return release_matrix_aux_workspace(workspace, from_shared, stream);
+        };
 
         cudaError_t err = cudaMemcpyAsync(d_src, src_ptrs.data(), bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
@@ -749,14 +767,12 @@ namespace
             cleanup_workspace();
             return set_error(err);
         }
-
         err = cudaStreamSynchronize(stream);
         if (err != cudaSuccess)
         {
             cleanup_workspace();
             return set_error(err);
         }
-
         status = cleanup_workspace();
         if (status != 0)
         {
@@ -821,6 +837,11 @@ namespace
         {
             return set_error(err);
         }
+        status = matrix_wait_limb_stream(src, limb_id, dst_device, exec_stream);
+        if (status != 0)
+        {
+            return status;
+        }
 
         std::vector<const T *> src_ptrs;
         std::vector<T *> dst_ptrs;
@@ -844,7 +865,7 @@ namespace
             return status;
         }
 
-        return 0;
+        return matrix_record_limb_write(out, limb_id, exec_stream);
     }
 
     template <typename T>
@@ -975,51 +996,13 @@ namespace
         return 0;
     }
 
-    int arith_wait_stream_on_stream(int device, cudaStream_t consumer, cudaStream_t producer)
-    {
-        if (!consumer || !producer || consumer == producer)
-        {
-            return 0;
-        }
-        cudaError_t err = cudaSetDevice(device);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        cudaEvent_t ev = nullptr;
-        err = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        err = cudaEventRecord(ev, producer);
-        if (err != cudaSuccess)
-        {
-            cudaEventDestroy(ev);
-            return set_error(err);
-        }
-        err = cudaStreamWaitEvent(consumer, ev, 0);
-        if (err != cudaSuccess)
-        {
-            cudaEventDestroy(ev);
-            return set_error(err);
-        }
-        err = cudaEventDestroy(ev);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        return 0;
-    }
-
     int get_scalar_limb_u64(
         const GpuMatrix *scalar,
         const dim3 &limb_id,
         const uint64_t **out_ptr,
-        int *out_device,
-        cudaStream_t *out_stream)
+        int *out_device)
     {
-        if (!scalar || !out_ptr || !out_device || !out_stream)
+        if (!scalar || !out_ptr || !out_device)
         {
             return set_error("invalid scalar arguments in get_scalar_limb_u64");
         }
@@ -1038,15 +1021,8 @@ namespace
         {
             return status;
         }
-        cudaStream_t stream = nullptr;
-        status = matrix_limb_stream(scalar, limb_id, &stream);
-        if (status != 0)
-        {
-            return status;
-        }
         *out_ptr = ptr;
         *out_device = device;
-        *out_stream = stream;
         return 0;
     }
 
@@ -1104,6 +1080,16 @@ namespace
         {
             return set_error(err);
         }
+        status = matrix_wait_limb_stream(lhs, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_wait_limb_stream(rhs, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
 
         std::vector<T *> out_ptrs;
         std::vector<const T *> lhs_ptrs;
@@ -1131,7 +1117,12 @@ namespace
         }
         const uint64_t modulus64 = lhs->ctx->moduli[static_cast<size_t>(limb)];
         const T modulus = static_cast<T>(modulus64);
-        return launch_block_kernel(out_ptrs, lhs_ptrs, rhs_ptrs, n, modulus, op, stream, out, &limb_id);
+        status = launch_block_kernel(out_ptrs, lhs_ptrs, rhs_ptrs, n, modulus, op, stream, out, &limb_id);
+        if (status != 0)
+        {
+            return status;
+        }
+        return matrix_record_limb_write(out, limb_id, stream);
     }
 
     template <typename T>
@@ -1193,6 +1184,16 @@ namespace
         {
             return set_error(err);
         }
+        status = matrix_wait_limb_stream(lhs, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_wait_limb_stream(rhs, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
 
         std::vector<T *> out_ptrs;
         std::vector<const T *> lhs_ptrs;
@@ -1247,7 +1248,7 @@ namespace
         }
         const uint64_t modulus64 = lhs->ctx->moduli[static_cast<size_t>(limb)];
         const T modulus = static_cast<T>(modulus64);
-        return launch_block_matmul_kernel(
+        status = launch_block_matmul_kernel(
             out_ptrs,
             lhs_ptrs,
             rhs_ptrs,
@@ -1260,6 +1261,11 @@ namespace
             out_kernel_ms,
             out,
             &limb_id);
+        if (status != 0)
+        {
+            return status;
+        }
+        return matrix_record_limb_write(out, limb_id, stream);
     }
 
     template <typename T>
@@ -1300,8 +1306,7 @@ namespace
 
         const uint64_t *scalar_ptr = nullptr;
         int scalar_device = -1;
-        cudaStream_t scalar_stream = nullptr;
-        status = get_scalar_limb_u64(scalar, limb_id, &scalar_ptr, &scalar_device, &scalar_stream);
+        status = get_scalar_limb_u64(scalar, limb_id, &scalar_ptr, &scalar_device);
         if (status != 0)
         {
             return status;
@@ -1322,7 +1327,12 @@ namespace
         {
             return set_error(err);
         }
-        status = arith_wait_stream_on_stream(out_device, stream, scalar_stream);
+        status = matrix_wait_limb_stream(lhs, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_wait_limb_stream(scalar, limb_id, out_device, stream);
         if (status != 0)
         {
             return status;
@@ -1354,7 +1364,7 @@ namespace
         }
         const uint64_t modulus64 = lhs->ctx->moduli[static_cast<size_t>(limb)];
         const T modulus = static_cast<T>(modulus64);
-        return launch_block_kernel(
+        status = launch_block_kernel(
             out_ptrs,
             lhs_ptrs,
             rhs_ptrs,
@@ -1364,6 +1374,11 @@ namespace
             stream,
             out,
             &limb_id);
+        if (status != 0)
+        {
+            return status;
+        }
+        return matrix_record_limb_write(out, limb_id, stream);
     }
 
     template <typename T>
@@ -1412,6 +1427,11 @@ namespace
         if (err != cudaSuccess)
         {
             return set_error(err);
+        }
+        status = matrix_wait_limb_stream(rhs, limb_id, lhs_device, stream);
+        if (status != 0)
+        {
+            return status;
         }
 
         std::vector<const T *> lhs_ptrs;
@@ -1498,7 +1518,7 @@ extern "C" int gpu_matrix_add(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     {
         return set_error("context mismatch in gpu_matrix_add");
     }
-    if (!lhs->ctx || !lhs->ctx->ctx)
+    if (!lhs->ctx)
     {
         return set_error("null context in gpu_matrix_add");
     }
@@ -1522,17 +1542,17 @@ extern "C" int gpu_matrix_add(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
         out->format = GPU_POLY_FORMAT_EVAL;
         return 0;
     }
-
-    auto &limb_map = lhs->ctx->ctx->limbGPUid;
+    auto &limb_map = lhs->ctx->limb_gpu_ids;
     if (limb_map.size() < static_cast<size_t>(level + 1))
     {
         return set_error("unexpected limb mapping size in gpu_matrix_add");
     }
 
+    int status = 0;
     for (int limb = 0; limb <= level; ++limb)
     {
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        int status = launch_matrix_elementwise_for_limb<uint64_t>(
+        status = launch_matrix_elementwise_for_limb<uint64_t>(
             out,
             lhs,
             rhs,
@@ -1570,7 +1590,7 @@ extern "C" int gpu_matrix_sub(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     {
         return set_error("context mismatch in gpu_matrix_sub");
     }
-    if (!lhs->ctx || !lhs->ctx->ctx)
+    if (!lhs->ctx)
     {
         return set_error("null context in gpu_matrix_sub");
     }
@@ -1594,17 +1614,17 @@ extern "C" int gpu_matrix_sub(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
         out->format = lhs->format;
         return 0;
     }
-
-    auto &limb_map = lhs->ctx->ctx->limbGPUid;
+    auto &limb_map = lhs->ctx->limb_gpu_ids;
     if (limb_map.size() < static_cast<size_t>(level + 1))
     {
         return set_error("unexpected limb mapping size in gpu_matrix_sub");
     }
 
+    int status = 0;
     for (int limb = 0; limb <= level; ++limb)
     {
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        int status = launch_matrix_elementwise_for_limb<uint64_t>(
+        status = launch_matrix_elementwise_for_limb<uint64_t>(
             out,
             lhs,
             rhs,
@@ -1642,7 +1662,7 @@ extern "C" int gpu_matrix_mul(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     {
         return set_error("context mismatch in gpu_matrix_mul");
     }
-    if (!lhs->ctx || !lhs->ctx->ctx)
+    if (!lhs->ctx)
     {
         return set_error("null context in gpu_matrix_mul");
     }
@@ -1662,17 +1682,17 @@ extern "C" int gpu_matrix_mul(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
         out->format = GPU_POLY_FORMAT_EVAL;
         return 0;
     }
-
-    auto &limb_map = lhs->ctx->ctx->limbGPUid;
+    auto &limb_map = lhs->ctx->limb_gpu_ids;
     if (limb_map.size() < static_cast<size_t>(level + 1))
     {
         return set_error("unexpected limb mapping size in gpu_matrix_mul");
     }
 
+    int status = 0;
     for (int limb = 0; limb <= level; ++limb)
     {
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        int status = launch_matrix_matmul_for_limb<uint64_t>(
+        status = launch_matrix_matmul_for_limb<uint64_t>(
             out,
             lhs,
             rhs,
@@ -1714,7 +1734,7 @@ extern "C" int gpu_matrix_equal(const GpuMatrix *lhs, const GpuMatrix *rhs, int 
     {
         return 0;
     }
-    if (!lhs->ctx || !lhs->ctx->ctx)
+    if (!lhs->ctx)
     {
         return set_error("null context in gpu_matrix_equal");
     }
@@ -1734,17 +1754,18 @@ extern "C" int gpu_matrix_equal(const GpuMatrix *lhs, const GpuMatrix *rhs, int 
         *out_equal = 1;
         return 0;
     }
-    auto &limb_map = lhs->ctx->ctx->limbGPUid;
+    auto &limb_map = lhs->ctx->limb_gpu_ids;
     if (limb_map.size() < static_cast<size_t>(level + 1))
     {
         return set_error("unexpected limb mapping size in gpu_matrix_equal");
     }
 
+    int status = 0;
     for (int limb = 0; limb <= level; ++limb)
     {
         bool limb_equal = false;
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        int status = launch_matrix_equal_for_limb<uint64_t>(
+        status = launch_matrix_equal_for_limb<uint64_t>(
             lhs,
             rhs,
             count,
@@ -1793,7 +1814,7 @@ extern "C" int gpu_matrix_mul_timed(
     {
         return set_error("context mismatch in gpu_matrix_mul_timed");
     }
-    if (!lhs->ctx || !lhs->ctx->ctx)
+    if (!lhs->ctx)
     {
         return set_error("null context in gpu_matrix_mul_timed");
     }
@@ -1813,17 +1834,17 @@ extern "C" int gpu_matrix_mul_timed(
         out->format = GPU_POLY_FORMAT_EVAL;
         return 0;
     }
-
-    auto &limb_map = lhs->ctx->ctx->limbGPUid;
+    auto &limb_map = lhs->ctx->limb_gpu_ids;
     if (limb_map.size() < static_cast<size_t>(level + 1))
     {
         return set_error("unexpected limb mapping size in gpu_matrix_mul_timed");
     }
 
+    int status = 0;
     for (int limb = 0; limb <= level; ++limb)
     {
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        int status = launch_matrix_matmul_for_limb<uint64_t>(
+        status = launch_matrix_matmul_for_limb<uint64_t>(
             out,
             lhs,
             rhs,
@@ -1869,7 +1890,7 @@ extern "C" int gpu_matrix_mul_scalar(
     {
         return set_error("scalar context mismatch in gpu_matrix_mul_scalar");
     }
-    if (!lhs->ctx || !lhs->ctx->ctx)
+    if (!lhs->ctx)
     {
         return set_error("null context in gpu_matrix_mul_scalar");
     }
@@ -1895,17 +1916,17 @@ extern "C" int gpu_matrix_mul_scalar(
         out->format = lhs->format;
         return 0;
     }
-
-    auto &limb_map = lhs->ctx->ctx->limbGPUid;
+    auto &limb_map = lhs->ctx->limb_gpu_ids;
     if (limb_map.size() < static_cast<size_t>(level + 1))
     {
         return set_error("unexpected limb mapping size in gpu_matrix_mul_scalar");
     }
 
+    int status = 0;
     for (int limb = 0; limb <= level; ++limb)
     {
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        int status = launch_matrix_scalar_mul_for_limb<uint64_t>(
+        status = launch_matrix_scalar_mul_for_limb<uint64_t>(
             out,
             lhs,
             scalar,

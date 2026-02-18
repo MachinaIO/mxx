@@ -1,6 +1,7 @@
 #include "Runtime.cuh"
 
 #include <exception>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -155,13 +156,41 @@ extern "C"
                 compute_garner_inverse_table(moduli_vec, static_cast<int>(moduli_len));
 
             auto *ctx = new CKKS::Context(params, gpu_list, 0);
-            auto *gpu_ctx = new GpuContext{
-                ctx,
-                std::move(moduli_vec),
-                1 << logN,
-                gpu_list,
-                batch,
-                std::move(inverse_table)};
+            const size_t limb_count = ctx->limbGPUid.size();
+            std::vector<dim3> limb_gpu_ids = ctx->limbGPUid;
+            std::vector<int> limb_prime_ids(limb_count, -1);
+            std::vector<FIDESlib::TYPE> limb_types(limb_count, FIDESlib::U64);
+            for (size_t limb = 0; limb < limb_count; ++limb)
+            {
+                const dim3 limb_id = limb_gpu_ids[limb];
+                if (limb_id.x >= ctx->meta.size() || limb_id.y >= ctx->meta[limb_id.x].size())
+                {
+                    throw std::runtime_error("invalid limb metadata while building gpu context");
+                }
+                const auto &record = ctx->meta[limb_id.x][limb_id.y];
+                limb_prime_ids[limb] = record.id;
+                limb_types[limb] = record.type;
+            }
+
+            std::vector<size_t> decomp_counts_by_partition;
+            decomp_counts_by_partition.reserve(ctx->decompMeta.size());
+            for (const auto &partition_meta : ctx->decompMeta)
+            {
+                decomp_counts_by_partition.push_back(partition_meta.size());
+            }
+
+            auto *gpu_ctx = new GpuContext();
+            gpu_ctx->ctx = ctx;
+            gpu_ctx->moduli = std::move(moduli_vec);
+            gpu_ctx->N = 1 << logN;
+            gpu_ctx->level = static_cast<int>(L);
+            gpu_ctx->gpu_ids = ctx->GPUid;
+            gpu_ctx->batch = batch;
+            gpu_ctx->garner_inverse_table = std::move(inverse_table);
+            gpu_ctx->limb_gpu_ids = std::move(limb_gpu_ids);
+            gpu_ctx->limb_prime_ids = std::move(limb_prime_ids);
+            gpu_ctx->limb_types = std::move(limb_types);
+            gpu_ctx->decomp_counts_by_partition = std::move(decomp_counts_by_partition);
             *out_ctx = gpu_ctx;
             return 0;
         }

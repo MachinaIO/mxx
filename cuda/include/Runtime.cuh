@@ -62,9 +62,14 @@ struct GpuContext
     CKKS::Context *ctx;
     std::vector<uint64_t> moduli;
     int N;
+    int level;
     std::vector<int> gpu_ids;
     uint32_t batch;
     std::vector<uint64_t> garner_inverse_table;
+    std::vector<dim3> limb_gpu_ids;
+    std::vector<int> limb_prime_ids;
+    std::vector<FIDESlib::TYPE> limb_types;
+    std::vector<size_t> decomp_counts_by_partition;
     std::mutex transform_mutex;
 };
 

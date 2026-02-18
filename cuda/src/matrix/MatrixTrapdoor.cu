@@ -494,12 +494,15 @@ int launch_gauss_samp_gq_arb_base_multi_kernel(
         aux_limb_id,
         workspace_bytes,
         &workspace,
-        &from_shared);
+        &from_shared,
+        stream);
     if (status != 0)
     {
         return status;
     }
-    auto cleanup_workspace = [&]() -> int { return matrix_release_aux_workspace(workspace, from_shared); };
+    auto cleanup_workspace = [&]() -> int {
+        return matrix_release_aux_workspace(workspace, from_shared, stream);
+    };
 
     auto *workspace_base = reinterpret_cast<uint8_t *>(workspace);
     const uint64_t **d_src = reinterpret_cast<const uint64_t **>(workspace_base);
@@ -564,13 +567,6 @@ int launch_gauss_samp_gq_arb_base_multi_kernel(
         seed,
         d_out_moduli);
     err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        cleanup_workspace();
-        return set_error(err);
-    }
-
-    err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess)
     {
         cleanup_workspace();
@@ -658,7 +654,8 @@ int launch_sample_p1_integer_kernel(
         aux_limb_id,
         metadata_bytes,
         &metadata_workspace,
-        &metadata_from_shared);
+        &metadata_from_shared,
+        stream);
     if (status != 0)
     {
         return status;
@@ -678,7 +675,7 @@ int launch_sample_p1_integer_kernel(
             cudaFree(d_sampled_out);
         if (metadata_workspace)
         {
-            matrix_release_aux_workspace(metadata_workspace, metadata_from_shared);
+            matrix_release_aux_workspace(metadata_workspace, metadata_from_shared, stream);
             metadata_workspace = nullptr;
         }
     };
@@ -937,12 +934,15 @@ int launch_scatter_p1_integer_to_limb_kernel_device(
         aux_limb_id,
         out_ptr_bytes,
         &workspace,
-        &from_shared);
+        &from_shared,
+        stream);
     if (status != 0)
     {
         return status;
     }
-    auto cleanup_workspace = [&]() -> int { return matrix_release_aux_workspace(workspace, from_shared); };
+    auto cleanup_workspace = [&]() -> int {
+        return matrix_release_aux_workspace(workspace, from_shared, stream);
+    };
     uint64_t **d_out_entries = reinterpret_cast<uint64_t **>(workspace);
 
     err = cudaMemcpyAsync(d_out_entries, out_entries.data(), out_ptr_bytes, cudaMemcpyHostToDevice, stream);
@@ -966,13 +966,6 @@ int launch_scatter_p1_integer_to_limb_kernel_device(
         cleanup_workspace();
         return set_error(err);
     }
-    err = cudaStreamSynchronize(stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_workspace();
-        return set_error(err);
-    }
-
     status = cleanup_workspace();
     if (status != 0)
     {
@@ -1058,15 +1051,7 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         }
     };
 
-    int status = sync_matrix_limb_streams(
-        src,
-        "failed to synchronize source limb stream before clone in gpu_matrix_gauss_samp_gq_arb_base");
-    if (status != 0)
-    {
-        cleanup_tmp_inputs();
-        return status;
-    }
-
+    int status = 0;
     const int batch = default_batch(src->ctx);
     if (src->format == GPU_POLY_FORMAT_EVAL)
     {
@@ -1093,16 +1078,7 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         inputs_matrix = tmp_inputs_matrix;
     }
 
-    status = sync_matrix_limb_streams(
-        inputs_matrix,
-        "failed to synchronize input limb stream before gauss kernel in gpu_matrix_gauss_samp_gq_arb_base");
-    if (status != 0)
-    {
-        cleanup_tmp_inputs();
-        return status;
-    }
-
-    auto &limb_map = src->ctx->ctx->limbGPUid;
+    auto &limb_map = src->ctx->limb_gpu_ids;
     if (limb_map.size() < crt_depth)
     {
         cleanup_tmp_inputs();
@@ -1110,19 +1086,6 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
     }
 
     const size_t out_count = out->rows * out->cols;
-    std::vector<std::pair<int, cudaStream_t>> out_zero_streams;
-    out_zero_streams.reserve(crt_depth);
-    auto add_out_stream = [&](int device, cudaStream_t stream) {
-        for (const auto &entry : out_zero_streams)
-        {
-            if (entry.first == device && entry.second == stream)
-            {
-                return;
-            }
-        }
-        out_zero_streams.emplace_back(device, stream);
-    };
-
     for (int limb = 0; limb <= level; ++limb)
     {
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
@@ -1169,23 +1132,6 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                 return set_error(err);
             }
         }
-        add_out_stream(out_device, out_stream);
-    }
-
-    for (const auto &entry : out_zero_streams)
-    {
-        cudaError_t err = cudaSetDevice(entry.first);
-        if (err != cudaSuccess)
-        {
-            cleanup_tmp_inputs();
-            return set_error(err);
-        }
-        err = cudaStreamSynchronize(entry.second);
-        if (err != cudaSuccess)
-        {
-            cleanup_tmp_inputs();
-            return set_error(err);
-        }
     }
 
     if (src->ctx->moduli.size() < crt_depth)
@@ -1198,6 +1144,8 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
     {
         int device;
         cudaStream_t stream;
+        std::vector<dim3> src_limb_ids;
+        std::vector<dim3> dst_limb_ids;
         std::vector<const uint64_t *> src_ptrs;
         std::vector<uint64_t *> dst_ptrs;
         std::vector<uint64_t> tower_moduli;
@@ -1208,17 +1156,28 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         bool has_aux_limb_id;
     };
     std::vector<GaussBatch> batches;
-    auto get_batch = [&](int device) -> GaussBatch &
+    auto get_batch = [&](int device, cudaStream_t stream) -> GaussBatch &
     {
         for (auto &b : batches)
         {
-            if (b.device == device)
+            if (b.device == device && b.stream == stream)
             {
                 return b;
             }
         }
-        batches.push_back(GaussBatch{device, nullptr, {}, {}, {}, {}, {}, {}, dim3{0, 0, 0}, false});
+        batches.push_back(
+            GaussBatch{device, stream, {}, {}, {}, {}, {}, {}, {}, {}, dim3{0, 0, 0}, false});
         return batches.back();
+    };
+    auto append_unique_limb = [](std::vector<dim3> &limb_ids, const dim3 &limb_id) {
+        for (const dim3 &entry : limb_ids)
+        {
+            if (entry.x == limb_id.x && entry.y == limb_id.y)
+            {
+                return;
+            }
+        }
+        limb_ids.push_back(limb_id);
     };
 
     for (int src_limb = 0; src_limb <= level; ++src_limb)
@@ -1291,16 +1250,14 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                     dst_ptrs.push_back(dst_ptr);
                 }
 
-                auto &batch_ref = get_batch(out_device);
-                if (!batch_ref.stream)
-                {
-                    batch_ref.stream = out_stream;
-                }
+                auto &batch_ref = get_batch(out_device, out_stream);
                 if (!batch_ref.has_aux_limb_id)
                 {
                     batch_ref.aux_limb_id = out_limb_id;
                     batch_ref.has_aux_limb_id = true;
                 }
+                append_unique_limb(batch_ref.src_limb_ids, src_limb_id);
+                append_unique_limb(batch_ref.dst_limb_ids, out_limb_id);
                 batch_ref.tower_moduli.push_back(src->ctx->moduli[static_cast<size_t>(src_limb)]);
                 batch_ref.digit_indices.push_back(digit_idx);
                 batch_ref.tower_indices.push_back(static_cast<uint32_t>(src_limb));
@@ -1317,6 +1274,15 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         {
             cleanup_tmp_inputs();
             return set_error("null stream in gpu_matrix_gauss_samp_gq_arb_base");
+        }
+        for (const dim3 &src_limb_id : batch_ref.src_limb_ids)
+        {
+            status = matrix_wait_limb_stream(inputs_matrix, src_limb_id, batch_ref.device, batch_ref.stream);
+            if (status != 0)
+            {
+                cleanup_tmp_inputs();
+                return status;
+            }
         }
         status = launch_gauss_samp_gq_arb_base_multi_kernel(
             batch_ref.src_ptrs,
@@ -1339,6 +1305,15 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         {
             cleanup_tmp_inputs();
             return status;
+        }
+        for (const dim3 &dst_limb_id : batch_ref.dst_limb_ids)
+        {
+            status = matrix_record_limb_write(out, dst_limb_id, batch_ref.stream);
+            if (status != 0)
+            {
+                cleanup_tmp_inputs();
+                return status;
+            }
         }
     }
 
@@ -1418,7 +1393,7 @@ extern "C" int gpu_matrix_sample_p1_full(
     {
         return set_error("unexpected modulus count in gpu_matrix_sample_p1_full");
     }
-    auto &limb_map = a_mat->ctx->ctx->limbGPUid;
+    auto &limb_map = a_mat->ctx->limb_gpu_ids;
     if (limb_map.size() < crt_depth)
     {
         return set_error("unexpected limb mapping size in gpu_matrix_sample_p1_full");
@@ -1478,8 +1453,7 @@ extern "C" int gpu_matrix_sample_p1_full(
     auto collect_coeff_input_matrix = [&](
                                           const GpuMatrix *src,
                                           GpuMatrix **owned,
-                                          const GpuMatrix **coeff_input,
-                                          const char *sync_context) -> int
+                                          const GpuMatrix **coeff_input) -> int
     {
         *owned = nullptr;
         *coeff_input = src;
@@ -1514,14 +1488,13 @@ extern "C" int gpu_matrix_sample_p1_full(
             }
             *coeff_input = *owned;
         }
-        return sync_matrix_limb_streams(*coeff_input, sync_context);
+        return 0;
     };
 
     int status = collect_coeff_input_matrix(
         a_mat,
         &tmp_a,
-        &a_input,
-        "failed to synchronize A limb streams in gpu_matrix_sample_p1_full");
+        &a_input);
     if (status != 0)
     {
         cleanup();
@@ -1530,8 +1503,7 @@ extern "C" int gpu_matrix_sample_p1_full(
     status = collect_coeff_input_matrix(
         b_mat,
         &tmp_b,
-        &b_input,
-        "failed to synchronize B limb streams in gpu_matrix_sample_p1_full");
+        &b_input);
     if (status != 0)
     {
         cleanup();
@@ -1540,8 +1512,7 @@ extern "C" int gpu_matrix_sample_p1_full(
     status = collect_coeff_input_matrix(
         d_mat,
         &tmp_d,
-        &d_input,
-        "failed to synchronize D limb streams in gpu_matrix_sample_p1_full");
+        &d_input);
     if (status != 0)
     {
         cleanup();
@@ -1550,8 +1521,7 @@ extern "C" int gpu_matrix_sample_p1_full(
     status = collect_coeff_input_matrix(
         tp2,
         &tmp_tp2,
-        &tp2_input,
-        "failed to synchronize tp2 limb streams in gpu_matrix_sample_p1_full");
+        &tp2_input);
     if (status != 0)
     {
         cleanup();
@@ -1634,6 +1604,30 @@ extern "C" int gpu_matrix_sample_p1_full(
     {
         cleanup();
         return set_error("invalid reference stream/device in gpu_matrix_sample_p1_full");
+    }
+    status = matrix_wait_limb_stream(a_input, ref_limb_id, ref_device, ref_stream);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = matrix_wait_limb_stream(b_input, ref_limb_id, ref_device, ref_stream);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = matrix_wait_limb_stream(d_input, ref_limb_id, ref_device, ref_stream);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = matrix_wait_limb_stream(tp2_input, ref_limb_id, ref_device, ref_stream);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
     }
 
     int64_t *sampled_ref_device = nullptr;
@@ -1797,6 +1791,12 @@ extern "C" int gpu_matrix_sample_p1_full(
             out_device,
             out,
             &limb_id);
+        if (status != 0)
+        {
+            cleanup();
+            return status;
+        }
+        status = matrix_record_limb_write(out, limb_id, out_stream);
         if (status != 0)
         {
             cleanup();

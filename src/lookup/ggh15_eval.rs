@@ -11,7 +11,7 @@ use crate::{
     },
 };
 use dashmap::DashMap;
-use rayon::prelude::*;
+use rayon::{ThreadPoolBuilder, prelude::*};
 use std::{
     collections::{HashMap, HashSet},
     fs::read_to_string,
@@ -298,61 +298,78 @@ where
         let w_block_gy = w_matrix.slice_columns(block0_end, block1_end);
         let w_block_v = w_matrix.slice_columns(block1_end, block2_end);
         let w_block_v_idx = w_matrix.slice_columns(block2_end, block3_end);
-        batch.par_iter().for_each(|(idx, y_poly)| {
-            let v_idx = uniform_sampler.sample_uniform(
-                params,
-                m,
-                m,
-                DistType::GaussDist { sigma: self.trapdoor_sigma },
-            );
-            debug!(
-                "Sampled v_idx for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
-                lut_id, part_idx, idx
-            );
-            let idx_poly = M::P::from_usize_to_constant(params, *idx);
-            let gy = gadget_matrix.clone() * y_poly;
-            let v_idx_scaled = v_idx.clone() * idx_poly;
-            // Compute w_matrix * t_idx without materializing t_idx:
-            // t_idx = [I; G^-1(G*y); G^-1(v_idx); G^-1(v_idx*idx)].
-            let mut w_t_idx = w_block_identity.clone();
-            debug!(
-                "Constructed w_block_identity for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
-                lut_id, part_idx, idx
-            );
-            let w_gy = w_block_gy.mul_decompose(&gy);
-            w_t_idx.add_in_place(&w_gy);
-            debug!(
-                "Constructed w_block_gy contribution for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
-                lut_id, part_idx, idx
-            );
-            let w_v = w_block_v.mul_decompose(&v_idx);
-            w_t_idx.add_in_place(&w_v);
-            debug!(
-                "Constructed w_block_v contribution for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
-                lut_id, part_idx, idx
-            );
-            let w_v_idx = w_block_v_idx.mul_decompose(&v_idx_scaled);
-            w_t_idx.add_in_place(&w_v_idx);
-            debug!(
-                "Constructed w_block_v_idx contribution for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
-                lut_id, part_idx, idx
-            );
-            let mut target = M::zero(params, d + w_t_idx.row_size(), m);
-            target.copy_block_from(&w_t_idx, d, 0, 0, 0, w_t_idx.row_size(), m);
-            debug!(
-                "Constructed target for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
-                lut_id, part_idx, idx
-            );
-            let k_l_preimage = trap_sampler.preimage(params, b1_trapdoor, b1_matrix, &target);
-            debug!(
-                "Sampled LUT preimage: lut_id={}, part_idx={}, row_idx={}",
-                lut_id, part_idx, idx
-            );
-            let lut_aux_id = format!("{lut_aux_id_prefix}_part{part_idx}_idx{idx}");
-            add_lookup_buffer(get_lookup_buffer(
-                vec![(0usize, v_idx), (1usize, k_l_preimage)],
-                &lut_aux_id,
-            ));
+        let configured_parallelism = crate::env::lut_preimage_chunk_size().max(1);
+        let batch_parallelism = configured_parallelism.min(batch.len()).max(1);
+        let available_parallelism = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(batch_parallelism);
+        assert!(
+            available_parallelism >= batch_parallelism,
+            "sample_lut_preimages requires {batch_parallelism} CPU threads (LUT_PREIMAGE_CHUNK_SIZE={} and batch_size={}) but only {available_parallelism} are available",
+            configured_parallelism,
+            batch.len()
+        );
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(batch_parallelism)
+            .build()
+            .expect("failed to build rayon pool for sample_lut_preimages");
+        pool.install(|| {
+            batch.par_iter().for_each(|(idx, y_poly)| {
+                let v_idx = uniform_sampler.sample_uniform(
+                    params,
+                    m,
+                    m,
+                    DistType::GaussDist { sigma: self.trapdoor_sigma },
+                );
+                debug!(
+                    "Sampled v_idx for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
+                    lut_id, part_idx, idx
+                );
+                let idx_poly = M::P::from_usize_to_constant(params, *idx);
+                let gy = gadget_matrix.clone() * y_poly;
+                let v_idx_scaled = v_idx.clone() * idx_poly;
+                // Compute w_matrix * t_idx without materializing t_idx:
+                // t_idx = [I; G^-1(G*y); G^-1(v_idx); G^-1(v_idx*idx)].
+                let mut w_t_idx = w_block_identity.clone();
+                debug!(
+                    "Constructed w_block_identity for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
+                    lut_id, part_idx, idx
+                );
+                let w_gy = w_block_gy.mul_decompose(&gy);
+                w_t_idx.add_in_place(&w_gy);
+                debug!(
+                    "Constructed w_block_gy contribution for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
+                    lut_id, part_idx, idx
+                );
+                let w_v = w_block_v.mul_decompose(&v_idx);
+                w_t_idx.add_in_place(&w_v);
+                debug!(
+                    "Constructed w_block_v contribution for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
+                    lut_id, part_idx, idx
+                );
+                let w_v_idx = w_block_v_idx.mul_decompose(&v_idx_scaled);
+                w_t_idx.add_in_place(&w_v_idx);
+                debug!(
+                    "Constructed w_block_v_idx contribution for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
+                    lut_id, part_idx, idx
+                );
+                let mut target = M::zero(params, d + w_t_idx.row_size(), m);
+                target.copy_block_from(&w_t_idx, d, 0, 0, 0, w_t_idx.row_size(), m);
+                debug!(
+                    "Constructed target for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
+                    lut_id, part_idx, idx
+                );
+                let k_l_preimage = trap_sampler.preimage(params, b1_trapdoor, b1_matrix, &target);
+                debug!(
+                    "Sampled LUT preimage: lut_id={}, part_idx={}, row_idx={}",
+                    lut_id, part_idx, idx
+                );
+                let lut_aux_id = format!("{lut_aux_id_prefix}_part{part_idx}_idx{idx}");
+                add_lookup_buffer(get_lookup_buffer(
+                    vec![(0usize, v_idx), (1usize, k_l_preimage)],
+                    &lut_aux_id,
+                ));
+            });
         });
     }
 
@@ -953,6 +970,23 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
         let trapdoor_sigma = self.trapdoor_sigma;
         let gate_parallelism = crate::env::ggh15_gate_parallelism();
         info!("GGH15 gate preimage parallelism={}", gate_parallelism);
+        let available_parallelism = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(gate_parallelism);
+        assert!(
+            available_parallelism >= gate_parallelism,
+            "gate preimage requires {gate_parallelism} CPU threads (GGH15_GATE_PARALLELISM={gate_parallelism}) but only {available_parallelism} are available"
+        );
+        let gate_pool = if gate_parallelism > 1 {
+            Some(
+                ThreadPoolBuilder::new()
+                    .num_threads(gate_parallelism)
+                    .build()
+                    .expect("failed to build rayon pool for gate preimages"),
+            )
+        } else {
+            None
+        };
 
         for (lut_id, mut gates) in gates_by_lut {
             let lut_gate_start = Instant::now();
@@ -1151,18 +1185,13 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                         drop(u_g_matrix);
                     };
 
-                    if gate_parallelism <= 1 {
+                    if let Some(pool) = gate_pool.as_ref() {
+                        pool.install(|| {
+                            pending.into_par_iter().for_each(&process_gate);
+                        });
+                    } else {
                         for item in pending {
                             process_gate(item);
-                        }
-                    } else {
-                        let mut iter = pending.into_iter();
-                        loop {
-                            let chunk = iter.by_ref().take(gate_parallelism).collect::<Vec<_>>();
-                            if chunk.is_empty() {
-                                break;
-                            }
-                            chunk.into_par_iter().for_each(&process_gate);
                         }
                     }
                 }

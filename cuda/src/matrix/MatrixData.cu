@@ -107,15 +107,7 @@ namespace
                     if (err == cudaSuccess && free_done)
                     {
                         cudaEventRecord(free_done, free_stream);
-                        cudaEventSynchronize(free_done);
                         cudaEventDestroy(free_done);
-                    }
-                    else
-                    {
-                        if (free_done)
-                        {
-                            cudaEventDestroy(free_done);
-                        }
                     }
                 }
                 if (!dependency_ok && !async_free_queued)
@@ -138,7 +130,10 @@ namespace
                         cudaEventDestroy(drained);
                     }
                 }
-                cudaStreamDestroy(free_stream);
+                if (free_stream)
+                {
+                    cudaStreamDestroy(free_stream);
+                }
             }
             else
             {
@@ -436,7 +431,6 @@ extern "C" void gpu_matrix_destroy(GpuMatrix *mat)
     {
         return;
     }
-
     destroy_matrix_contents(mat);
     delete mat;
 }

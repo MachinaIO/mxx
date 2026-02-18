@@ -11,7 +11,7 @@ use crate::{
     },
 };
 use dashmap::DashMap;
-use rayon::{ThreadPoolBuilder, prelude::*};
+use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
     fs::read_to_string,
@@ -35,6 +35,41 @@ where
 struct CheckpointEntryInfo {
     indices: HashSet<usize>,
     max_part_idx: Option<usize>,
+}
+
+struct CompactBytesJob<M>
+where
+    M: PolyMatrix,
+{
+    id_prefix: String,
+    matrices: Vec<(usize, M)>,
+}
+
+impl<M> CompactBytesJob<M>
+where
+    M: PolyMatrix,
+{
+    fn new(id_prefix: String, matrices: Vec<(usize, M)>) -> Self {
+        Self { id_prefix, matrices }
+    }
+
+    fn wait_then_store(self) {
+        let mut payloads = Vec::with_capacity(self.matrices.len());
+        let mut max_len = 0usize;
+        for (idx, matrix) in self.matrices {
+            let bytes = matrix.to_compact_bytes();
+            max_len = max_len.max(bytes.len());
+            payloads.push((idx, bytes));
+        }
+        // Match get_lookup_buffer behavior for variable compact payload lengths.
+        let padded_len = max_len.saturating_add(16);
+        for (_, bytes) in payloads.iter_mut() {
+            if bytes.len() < padded_len {
+                bytes.resize(padded_len, 0);
+            }
+        }
+        add_lookup_buffer(get_lookup_buffer_bytes(payloads, &self.id_prefix));
+    }
 }
 
 fn decode_lut_aux_pair<M: PolyMatrix>(
@@ -298,22 +333,9 @@ where
         let w_block_gy = w_matrix.slice_columns(block0_end, block1_end);
         let w_block_v = w_matrix.slice_columns(block1_end, block2_end);
         let w_block_v_idx = w_matrix.slice_columns(block2_end, block3_end);
-        let configured_parallelism = crate::env::lut_preimage_chunk_size().max(1);
-        let batch_parallelism = configured_parallelism.min(batch.len()).max(1);
-        let available_parallelism =
-            std::thread::available_parallelism().map(usize::from).unwrap_or(batch_parallelism);
-        assert!(
-            available_parallelism >= batch_parallelism,
-            "sample_lut_preimages requires {batch_parallelism} CPU threads (LUT_PREIMAGE_CHUNK_SIZE={} and batch_size={}) but only {available_parallelism} are available",
-            configured_parallelism,
-            batch.len()
-        );
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(batch_parallelism)
-            .build()
-            .expect("failed to build rayon pool for sample_lut_preimages");
-        pool.install(|| {
-            batch.par_iter().for_each(|(idx, y_poly)| {
+        let jobs = batch
+            .par_iter()
+            .map(|(idx, y_poly)| {
                 let v_idx = uniform_sampler.sample_uniform(
                     params,
                     m,
@@ -364,12 +386,12 @@ where
                     lut_id, part_idx, idx
                 );
                 let lut_aux_id = format!("{lut_aux_id_prefix}_part{part_idx}_idx{idx}");
-                add_lookup_buffer(get_lookup_buffer(
-                    vec![(0usize, v_idx), (1usize, k_l_preimage)],
-                    &lut_aux_id,
-                ));
-            });
-        });
+                CompactBytesJob::new(lut_aux_id, vec![(0usize, v_idx), (1usize, k_l_preimage)])
+            })
+            .collect::<Vec<_>>();
+        debug!("Finished sampling LUT preimages for part_idx={}", part_idx);
+        jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+        debug!("Finished storing LUT preimages for part_idx={}", part_idx);
     }
 
     fn format_duration(duration: Duration) -> String {
@@ -967,24 +989,10 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
 
         let error_sigma = self.error_sigma;
         let trapdoor_sigma = self.trapdoor_sigma;
-        let gate_parallelism = crate::env::ggh15_gate_parallelism();
-        info!("GGH15 gate preimage parallelism={}", gate_parallelism);
-        let available_parallelism =
-            std::thread::available_parallelism().map(usize::from).unwrap_or(gate_parallelism);
-        assert!(
-            available_parallelism >= gate_parallelism,
-            "gate preimage requires {gate_parallelism} CPU threads (GGH15_GATE_PARALLELISM={gate_parallelism}) but only {available_parallelism} are available"
+        info!(
+            "GGH15 gate preimage parallelism uses Rayon global pool (GGH15_GATE_PARALLELISM={})",
+            crate::env::ggh15_gate_parallelism()
         );
-        let gate_pool = if gate_parallelism > 1 {
-            Some(
-                ThreadPoolBuilder::new()
-                    .num_threads(gate_parallelism)
-                    .build()
-                    .expect("failed to build rayon pool for gate preimages"),
-            )
-        } else {
-            None
-        };
 
         for (lut_id, mut gates) in gates_by_lut {
             let lut_gate_start = Instant::now();
@@ -996,6 +1004,7 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                 if !pending.is_empty() {
                     total_gates = total_gates.saturating_add(pending.len());
                     let process_gate = |(gate_id, state): (GateId, GateState<M>)| {
+                        let mut persist_jobs = Vec::new();
                         let uniform_sampler = US::new();
                         let trap_sampler = TS::new(params, trapdoor_sigma);
                         let hash_sampler = HS::new();
@@ -1027,9 +1036,9 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                         drop(s_g);
                         debug!("Sampled gate preimage 1: gate_id={}, lut_id={}", gate_id, lut_id);
                         let preimage_gate1_id = self.preimage_gate1_id_prefix(params, gate_id);
-                        add_lookup_buffer(get_lookup_buffer(
+                        persist_jobs.push(CompactBytesJob::new(
+                            preimage_gate1_id,
                             vec![(0, preimage_gate1)],
-                            &preimage_gate1_id,
                         ));
 
                         let input_matrix = M::from_compact_bytes(params, &state.input_pubkey_bytes);
@@ -1076,9 +1085,9 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                             &target_gate2_identity,
                         );
                         drop(target_gate2_identity);
-                        add_lookup_buffer(get_lookup_buffer(
+                        persist_jobs.push(CompactBytesJob::new(
+                            self.preimage_gate2_identity_id_prefix(params, gate_id),
                             vec![(0, preimage_gate2_identity)],
-                            &self.preimage_gate2_identity_id_prefix(params, gate_id),
                         ));
 
                         let target_high_gy = -M::gadget_matrix(params, d);
@@ -1092,9 +1101,9 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                             &target_gate2_gy,
                         );
                         drop(target_gate2_gy);
-                        add_lookup_buffer(get_lookup_buffer(
+                        persist_jobs.push(CompactBytesJob::new(
+                            self.preimage_gate2_gy_id_prefix(params, gate_id),
                             vec![(0, preimage_gate2_gy)],
-                            &self.preimage_gate2_gy_id_prefix(params, gate_id),
                         ));
 
                         let gadget_digits = M::gadget_matrix(params, 1).get_row(0);
@@ -1144,9 +1153,9 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                             );
                             let gate2_v_chunk_prefix =
                                 format!("{}_part{}", gate2_v_prefix, chunk_idx);
-                            add_lookup_buffer(get_lookup_buffer(
+                            persist_jobs.push(CompactBytesJob::new(
+                                gate2_v_chunk_prefix,
                                 vec![(chunk_idx, preimage_chunk)],
-                                &gate2_v_chunk_prefix,
                             ));
                         }
                         drop(w_block_v);
@@ -1174,24 +1183,19 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                             );
                             let gate2_vx_chunk_prefix =
                                 format!("{}_part{}", gate2_vx_prefix, chunk_idx);
-                            add_lookup_buffer(get_lookup_buffer(
+                            persist_jobs.push(CompactBytesJob::new(
+                                gate2_vx_chunk_prefix,
                                 vec![(chunk_idx, preimage_chunk)],
-                                &gate2_vx_chunk_prefix,
                             ));
                         }
                         drop(w_block_vx);
                         drop(u_g_matrix);
+                        persist_jobs
                     };
 
-                    if let Some(pool) = gate_pool.as_ref() {
-                        pool.install(|| {
-                            pending.into_par_iter().for_each(&process_gate);
-                        });
-                    } else {
-                        for item in pending {
-                            process_gate(item);
-                        }
-                    }
+                    let persist_jobs =
+                        pending.into_par_iter().flat_map_iter(process_gate).collect::<Vec<_>>();
+                    persist_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
                 }
                 let pct = if total_gate_count == 0 {
                     100.0

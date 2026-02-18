@@ -117,12 +117,6 @@ unsafe extern "C" {
         rhs: *const GpuMatrixOpaque,
         out_equal: *mut c_int,
     ) -> c_int;
-    pub(crate) fn gpu_matrix_mul_timed(
-        out: *mut GpuMatrixOpaque,
-        lhs: *const GpuMatrixOpaque,
-        rhs: *const GpuMatrixOpaque,
-        out_kernel_ms: *mut f64,
-    ) -> c_int;
     pub(crate) fn gpu_matrix_mul_scalar(
         out: *mut GpuMatrixOpaque,
         lhs: *const GpuMatrixOpaque,

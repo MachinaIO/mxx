@@ -422,7 +422,6 @@ namespace
         size_t out_stride,
         T modulus,
         cudaStream_t stream,
-        double *out_kernel_ms,
         const GpuMatrix *,
         const dim3 *)
     {
@@ -441,31 +440,6 @@ namespace
             static_cast<unsigned int>((rows + kMatmulTileM - 1) / kMatmulTileM),
             static_cast<unsigned int>(n));
 
-        cudaError_t err;
-        cudaEvent_t start = nullptr;
-        cudaEvent_t stop = nullptr;
-        if (out_kernel_ms)
-        {
-            err = cudaEventCreate(&start);
-            if (err != cudaSuccess)
-            {
-                return set_error(err);
-            }
-            err = cudaEventCreate(&stop);
-            if (err != cudaSuccess)
-            {
-                cudaEventDestroy(start);
-                return set_error(err);
-            }
-            err = cudaEventRecord(start, stream);
-            if (err != cudaSuccess)
-            {
-                cudaEventDestroy(start);
-                cudaEventDestroy(stop);
-                return set_error(err);
-            }
-        }
-
         block_matmul_kernel<<<blocks, threads, 0, stream>>>(
             lhs_base,
             rhs_base,
@@ -479,48 +453,10 @@ namespace
             out_stride,
             modulus);
 
-        err = cudaGetLastError();
+        const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            if (start)
-            {
-                cudaEventDestroy(start);
-                cudaEventDestroy(stop);
-            }
             return set_error(err);
-        }
-
-        if (out_kernel_ms)
-        {
-            err = cudaEventRecord(stop, stream);
-            if (err != cudaSuccess)
-            {
-                cudaEventDestroy(start);
-                cudaEventDestroy(stop);
-                return set_error(err);
-            }
-            err = cudaEventSynchronize(stop);
-            if (err != cudaSuccess)
-            {
-                cudaEventDestroy(start);
-                cudaEventDestroy(stop);
-                return set_error(err);
-            }
-            float kernel_ms = 0.0f;
-            err = cudaEventElapsedTime(&kernel_ms, start, stop);
-            if (err != cudaSuccess)
-            {
-                cudaEventDestroy(start);
-                cudaEventDestroy(stop);
-                return set_error(err);
-            }
-            *out_kernel_ms += static_cast<double>(kernel_ms);
-            cudaEventDestroy(start);
-            cudaEventDestroy(stop);
-        }
-        else
-        {
-            // Non-timed path remains asynchronous; dependencies are tracked by stream/event.
         }
         return 0;
     }
@@ -1030,8 +966,7 @@ namespace
         size_t cols,
         size_t n,
         int limb,
-        const dim3 &limb_id,
-        double *out_kernel_ms)
+        const dim3 &limb_id)
     {
         if constexpr (!std::is_same_v<T, uint64_t>)
         {
@@ -1123,7 +1058,6 @@ namespace
             out_stride,
             modulus,
             stream,
-            out_kernel_ms,
             out,
             &limb_id);
         if (status != 0)
@@ -1570,8 +1504,7 @@ extern "C" int gpu_matrix_mul(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
             rhs->cols,
             static_cast<size_t>(N),
             limb,
-            limb_id,
-            nullptr);
+            limb_id);
         if (status != 0)
         {
             return status;
@@ -1652,85 +1585,6 @@ extern "C" int gpu_matrix_equal(const GpuMatrix *lhs, const GpuMatrix *rhs, int 
     }
 
     *out_equal = 1;
-    return 0;
-}
-
-extern "C" int gpu_matrix_mul_timed(
-    GpuMatrix *out,
-    const GpuMatrix *lhs,
-    const GpuMatrix *rhs,
-    double *out_kernel_ms)
-{
-    if (!out_kernel_ms)
-    {
-        return set_error("null out_kernel_ms in gpu_matrix_mul_timed");
-    }
-    *out_kernel_ms = 0.0;
-    if (!out || !lhs || !rhs)
-    {
-        return set_error("invalid gpu_matrix_mul_timed arguments");
-    }
-    if (lhs->cols != rhs->rows)
-    {
-        return set_error("size mismatch in gpu_matrix_mul_timed");
-    }
-    if (out->rows != lhs->rows || out->cols != rhs->cols)
-    {
-        return set_error("output size mismatch in gpu_matrix_mul_timed");
-    }
-    if (lhs->ctx != rhs->ctx || lhs->ctx != out->ctx || lhs->level != rhs->level ||
-        lhs->level != out->level)
-    {
-        return set_error("context mismatch in gpu_matrix_mul_timed");
-    }
-    if (!lhs->ctx)
-    {
-        return set_error("null context in gpu_matrix_mul_timed");
-    }
-    if (lhs->format != GPU_POLY_FORMAT_EVAL || rhs->format != GPU_POLY_FORMAT_EVAL)
-    {
-        return set_error("gpu_matrix_mul_timed requires Eval format");
-    }
-
-    const int level = lhs->level;
-    if (level < 0)
-    {
-        return set_error("invalid level in gpu_matrix_mul_timed");
-    }
-    const int N = lhs->ctx->N;
-    if (N <= 0)
-    {
-        out->format = GPU_POLY_FORMAT_EVAL;
-        return 0;
-    }
-    auto &limb_map = lhs->ctx->limb_gpu_ids;
-    if (limb_map.size() < static_cast<size_t>(level + 1))
-    {
-        return set_error("unexpected limb mapping size in gpu_matrix_mul_timed");
-    }
-
-    int status = 0;
-    for (int limb = 0; limb <= level; ++limb)
-    {
-        const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        status = launch_matrix_matmul_for_limb<uint64_t>(
-            out,
-            lhs,
-            rhs,
-            lhs->rows,
-            lhs->cols,
-            rhs->cols,
-            static_cast<size_t>(N),
-            limb,
-            limb_id,
-            out_kernel_ms);
-        if (status != 0)
-        {
-            return status;
-        }
-    }
-
-    out->format = GPU_POLY_FORMAT_EVAL;
     return 0;
 }
 

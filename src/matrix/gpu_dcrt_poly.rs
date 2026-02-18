@@ -14,7 +14,7 @@ use crate::{
                 gpu_matrix_destroy, gpu_matrix_equal, gpu_matrix_fill_gadget,
                 gpu_matrix_gauss_samp_gq_arb_base, gpu_matrix_intt_all,
                 gpu_matrix_load_compact_bytes, gpu_matrix_load_rns_batch, gpu_matrix_mul,
-                gpu_matrix_mul_scalar, gpu_matrix_mul_timed, gpu_matrix_ntt_all,
+                gpu_matrix_mul_scalar, gpu_matrix_ntt_all,
                 gpu_matrix_sample_distribution, gpu_matrix_sample_p1_full,
                 gpu_matrix_store_compact_bytes, gpu_matrix_store_rns_batch, gpu_matrix_sub,
             },
@@ -1176,11 +1176,7 @@ impl GpuDCRTPolyMatrix {
         out
     }
 
-    fn mul_internal(
-        &self,
-        rhs: &GpuDCRTPolyMatrix,
-        kernel_ms: Option<&mut f64>,
-    ) -> GpuDCRTPolyMatrix {
+    fn mul_internal(&self, rhs: &GpuDCRTPolyMatrix) -> GpuDCRTPolyMatrix {
         debug_assert!(
             self.ncol == rhs.nrow,
             "Multiplication condition failed: self.ncol ({}) must equal rhs.nrow ({})",
@@ -1200,21 +1196,9 @@ impl GpuDCRTPolyMatrix {
         if self.nrow == 0 || rhs.ncol == 0 || self.ncol == 0 {
             return out;
         }
-        if let Some(acc) = kernel_ms {
-            let status =
-                unsafe { gpu_matrix_mul_timed(out.raw, self.raw, rhs.raw, acc as *mut f64) };
-            check_status(status, "gpu_matrix_mul_timed");
-        } else {
-            let status = unsafe { gpu_matrix_mul(out.raw, self.raw, rhs.raw) };
-            check_status(status, "gpu_matrix_mul");
-        }
+        let status = unsafe { gpu_matrix_mul(out.raw, self.raw, rhs.raw) };
+        check_status(status, "gpu_matrix_mul");
         out
-    }
-
-    pub fn mul_with_kernel_time(&self, rhs: &GpuDCRTPolyMatrix) -> (GpuDCRTPolyMatrix, f64) {
-        let mut kernel_ms = 0.0f64;
-        let out = self.mul_internal(rhs, Some(&mut kernel_ms));
-        (out, kernel_ms)
     }
 }
 
@@ -1246,7 +1230,7 @@ impl Mul<&GpuDCRTPolyMatrix> for &GpuDCRTPolyMatrix {
     type Output = GpuDCRTPolyMatrix;
 
     fn mul(self, rhs: &GpuDCRTPolyMatrix) -> Self::Output {
-        self.mul_internal(rhs, None)
+        self.mul_internal(rhs)
     }
 }
 

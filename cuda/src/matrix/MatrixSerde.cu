@@ -939,6 +939,18 @@ extern "C" int gpu_poly_store_compact_bytes(
         release();
         return set_error(err);
     }
+    err = cudaMalloc(reinterpret_cast<void **>(&d_max_bits), sizeof(unsigned int));
+    if (err != cudaSuccess)
+    {
+        release();
+        return set_error(err);
+    }
+    err = cudaMemsetAsync(d_max_bits, 0, sizeof(unsigned int), work_stream);
+    if (err != cudaSuccess)
+    {
+        release();
+        return set_error(err);
+    }
 
     const int threads = 256;
     const int blocks =
@@ -963,11 +975,35 @@ extern "C" int gpu_poly_store_compact_bytes(
         return set_error(err);
     }
 
+    serde_compute_max_bits_from_words_kernel<<<blocks, threads, 0, work_stream>>>(
+        d_coeff_words,
+        coeff_count,
+        static_cast<int>(words_per_coeff),
+        d_max_bits);
+    err = cudaGetLastError();
+    if (err != cudaSuccess)
+    {
+        release();
+        return set_error(err);
+    }
+
     int h_overflow = 0;
+    unsigned int h_max_bits = 0;
     err = cudaMemcpyAsync(
         &h_overflow,
         d_overflow,
         sizeof(int),
+        cudaMemcpyDeviceToHost,
+        work_stream);
+    if (err != cudaSuccess)
+    {
+        release();
+        return set_error(err);
+    }
+    err = cudaMemcpyAsync(
+        &h_max_bits,
+        d_max_bits,
+        sizeof(unsigned int),
         cudaMemcpyDeviceToHost,
         work_stream);
     if (err != cudaSuccess)
@@ -985,50 +1021,6 @@ extern "C" int gpu_poly_store_compact_bytes(
     {
         release();
         return set_error("overflow in gpu_poly_store_compact_bytes");
-    }
-
-    err = cudaMalloc(reinterpret_cast<void **>(&d_max_bits), sizeof(unsigned int));
-    if (err != cudaSuccess)
-    {
-        release();
-        return set_error(err);
-    }
-    err = cudaMemsetAsync(d_max_bits, 0, sizeof(unsigned int), work_stream);
-    if (err != cudaSuccess)
-    {
-        release();
-        return set_error(err);
-    }
-
-    serde_compute_max_bits_from_words_kernel<<<blocks, threads, 0, work_stream>>>(
-        d_coeff_words,
-        coeff_count,
-        static_cast<int>(words_per_coeff),
-        d_max_bits);
-    err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        release();
-        return set_error(err);
-    }
-
-    unsigned int h_max_bits = 0;
-    err = cudaMemcpyAsync(
-        &h_max_bits,
-        d_max_bits,
-        sizeof(unsigned int),
-        cudaMemcpyDeviceToHost,
-        work_stream);
-    if (err != cudaSuccess)
-    {
-        release();
-        return set_error(err);
-    }
-    err = cudaStreamSynchronize(work_stream);
-    if (err != cudaSuccess)
-    {
-        release();
-        return set_error(err);
     }
     if (h_max_bits > static_cast<unsigned int>(std::numeric_limits<uint16_t>::max()))
     {
@@ -1364,16 +1356,9 @@ extern "C" int gpu_poly_load_compact_bytes(
         release();
         return set_error(err);
     }
-    err = cudaStreamSynchronize(work_stream);
-    if (err != cudaSuccess)
-    {
-        release();
-        return set_error(err);
-    }
-
     for (size_t limb = 0; limb < limb_count; ++limb)
     {
-        const int status = matrix_record_limb_write(poly, limb_map[limb], nullptr);
+        const int status = matrix_record_limb_write(poly, limb_map[limb], work_stream);
         if (status != 0)
         {
             release();

@@ -39,8 +39,14 @@ async fn test_arithmetic_circuit_operations_ggh15() {
     let modulus = params.modulus();
 
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
-    let ctx =
-        Arc::new(NestedRnsPolyContext::setup(&mut circuit, &params, P_MODULI_BITS, SCALE, false));
+    let ctx = Arc::new(NestedRnsPolyContext::setup(
+        &mut circuit,
+        &params,
+        P_MODULI_BITS,
+        SCALE,
+        false,
+        None,
+    ));
 
     let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
     let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
@@ -57,9 +63,9 @@ async fn test_arithmetic_circuit_operations_ggh15() {
     let a_value: BigUint = gen_biguint_for_modulus(&mut rng, modulus.as_ref());
     let b_value: BigUint = gen_biguint_for_modulus(&mut rng, modulus.as_ref());
     let c_value: BigUint = gen_biguint_for_modulus(&mut rng, modulus.as_ref());
-    let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value);
-    let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value);
-    let c_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &c_value);
+    let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, None);
+    let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, None);
+    let c_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &c_value, None);
     let plaintext_inputs = [a_inputs.clone(), b_inputs.clone(), c_inputs.clone()].concat();
 
     let plt_evaluator = PolyPltEvaluator::new();

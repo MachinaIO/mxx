@@ -175,25 +175,60 @@ int matrix_wait_limb_stream(
     return 0;
 }
 
-int matrix_wait_limb(const GpuMatrix *dst, const GpuMatrix *src, const dim3 &limb_id)
+int matrix_track_limb_consumer(
+    const GpuMatrix *src,
+    const dim3 &limb_id,
+    int consumer_device,
+    cudaStream_t consumer_stream)
 {
-    if (!dst || !src)
+    if (!src || !src->ctx || !consumer_stream || consumer_device < 0)
     {
-        return set_error("invalid matrix_wait_limb arguments");
+        return set_error("invalid matrix_track_limb_consumer arguments");
     }
-    int dst_device = -1;
-    int status = matrix_limb_device(dst, limb_id, &dst_device);
-    if (status != 0)
+    auto *state = matrix_limb_state(
+        const_cast<GpuMatrix *>(src),
+        limb_id,
+        "invalid limb index in matrix_track_limb_consumer");
+    if (!state)
     {
-        return status;
+        return 1;
     }
-    cudaStream_t dst_stream = nullptr;
-    status = matrix_limb_stream(dst, limb_id, &dst_stream);
-    if (status != 0)
+    if (state->device != consumer_device)
     {
-        return status;
+        return set_error("device mismatch in matrix_track_limb_consumer");
     }
-    return matrix_wait_limb_stream(src, limb_id, dst_device, dst_stream);
+    if (!state->stream)
+    {
+        return set_error("null producer stream in matrix_track_limb_consumer");
+    }
+    cudaError_t err = cudaSetDevice(consumer_device);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+    cudaEvent_t consumer_done = nullptr;
+    err = cudaEventCreateWithFlags(&consumer_done, cudaEventDisableTiming);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+    err = cudaEventRecord(consumer_done, consumer_stream);
+    if (err != cudaSuccess)
+    {
+        cudaEventDestroy(consumer_done);
+        return set_error(err);
+    }
+    err = cudaStreamWaitEvent(state->stream, consumer_done, 0);
+    cudaError_t destroy_err = cudaEventDestroy(consumer_done);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+    if (destroy_err != cudaSuccess)
+    {
+        return set_error(destroy_err);
+    }
+    return 0;
 }
 
 int matrix_record_limb_write(GpuMatrix *dst, const dim3 &limb_id, cudaStream_t stream)
@@ -343,70 +378,6 @@ int matrix_release_aux_workspace(void *ptr, bool from_shared, cudaStream_t strea
     return 0;
 }
 
-
-int sync_matrix_limb_streams(const GpuMatrix *mat, const char *context)
-{
-    if (!mat || !context)
-    {
-        return set_error("invalid sync_matrix_limb_streams arguments");
-    }
-
-    struct StreamRef
-    {
-        int device;
-        cudaStream_t stream;
-    };
-    std::vector<StreamRef> streams;
-    size_t reserve_count = 0;
-    for (const auto &partition_states : mat->exec_limb_states)
-    {
-        reserve_count += partition_states.size();
-    }
-    streams.reserve(reserve_count);
-    auto add_stream = [&](int device, cudaStream_t stream) {
-        if (!stream)
-        {
-            return;
-        }
-        for (const auto &entry : streams)
-        {
-            if (entry.device == device && entry.stream == stream)
-            {
-                return;
-            }
-        }
-        streams.push_back(StreamRef{device, stream});
-    };
-
-    for (size_t partition_idx = 0; partition_idx < mat->exec_limb_states.size(); ++partition_idx)
-    {
-        if (partition_idx >= mat->shared_limb_buffers.size())
-        {
-            return set_error(context);
-        }
-        const int device = mat->shared_limb_buffers[partition_idx].device;
-        const auto &states = mat->exec_limb_states[partition_idx];
-        for (const auto &state : states)
-        {
-            add_stream(device, state.stream);
-        }
-    }
-
-    for (const auto &entry : streams)
-    {
-        cudaError_t err = cudaSetDevice(entry.device);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        err = cudaStreamSynchronize(entry.stream);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-    }
-    return 0;
-}
 
 uint32_t bit_width_u64(uint64_t v)
 {

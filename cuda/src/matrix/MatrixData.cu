@@ -20,25 +20,147 @@ namespace
         {
             return;
         }
-        for (const auto &entry : mat->shared_limb_buffers)
+        const size_t partition_count =
+            std::max(mat->shared_limb_buffers.size(), mat->shared_aux_buffers.size());
+        for (size_t partition_idx = 0; partition_idx < partition_count; ++partition_idx)
         {
-            if (!entry.ptr)
+            uint64_t *limb_ptr = nullptr;
+            int limb_device = -1;
+            if (partition_idx < mat->shared_limb_buffers.size())
+            {
+                limb_ptr = mat->shared_limb_buffers[partition_idx].ptr;
+                limb_device = mat->shared_limb_buffers[partition_idx].device;
+            }
+            void **aux_ptr = nullptr;
+            int aux_device = -1;
+            if (partition_idx < mat->shared_aux_buffers.size())
+            {
+                aux_ptr = mat->shared_aux_buffers[partition_idx].ptr;
+                aux_device = mat->shared_aux_buffers[partition_idx].device;
+            }
+            int device = limb_device >= 0 ? limb_device : aux_device;
+            if (device < 0 || (!limb_ptr && !aux_ptr))
             {
                 continue;
             }
-            cudaSetDevice(entry.device);
-            cudaFree(entry.ptr);
+            cudaSetDevice(device);
+
+            cudaStream_t free_stream = nullptr;
+            cudaError_t err = cudaStreamCreateWithFlags(&free_stream, cudaStreamNonBlocking);
+            if (err == cudaSuccess && free_stream)
+            {
+                bool dependency_ok = true;
+                bool async_free_queued = false;
+                std::vector<cudaEvent_t> drained_events;
+                if (partition_idx < mat->exec_limb_states.size())
+                {
+                    auto &states = mat->exec_limb_states[partition_idx];
+                    drained_events.reserve(states.size());
+                    for (auto &state : states)
+                    {
+                        if (!state.stream)
+                        {
+                            continue;
+                        }
+                        cudaEvent_t drained = nullptr;
+                        err = cudaEventCreateWithFlags(&drained, cudaEventDisableTiming);
+                        if (err != cudaSuccess || !drained)
+                        {
+                            if (drained)
+                            {
+                                cudaEventDestroy(drained);
+                            }
+                            dependency_ok = false;
+                            break;
+                        }
+                        err = cudaEventRecord(drained, state.stream);
+                        if (err != cudaSuccess)
+                        {
+                            cudaEventDestroy(drained);
+                            dependency_ok = false;
+                            break;
+                        }
+                        err = cudaStreamWaitEvent(free_stream, drained, 0);
+                        if (err != cudaSuccess)
+                        {
+                            cudaEventDestroy(drained);
+                            dependency_ok = false;
+                            break;
+                        }
+                        drained_events.push_back(drained);
+                    }
+                }
+                if (dependency_ok)
+                {
+                    if (limb_ptr)
+                    {
+                        cudaFreeAsync(limb_ptr, free_stream);
+                    }
+                    if (aux_ptr)
+                    {
+                        cudaFreeAsync(aux_ptr, free_stream);
+                    }
+                    async_free_queued = true;
+
+                    cudaEvent_t free_done = nullptr;
+                    err = cudaEventCreateWithFlags(&free_done, cudaEventDisableTiming);
+                    if (err == cudaSuccess && free_done)
+                    {
+                        cudaEventRecord(free_done, free_stream);
+                        cudaEventSynchronize(free_done);
+                        cudaEventDestroy(free_done);
+                    }
+                    else
+                    {
+                        if (free_done)
+                        {
+                            cudaEventDestroy(free_done);
+                        }
+                    }
+                }
+                if (!dependency_ok && !async_free_queued)
+                {
+                    if (limb_ptr)
+                    {
+                        cudaFree(limb_ptr);
+                        limb_ptr = nullptr;
+                    }
+                    if (aux_ptr)
+                    {
+                        cudaFree(aux_ptr);
+                        aux_ptr = nullptr;
+                    }
+                }
+                for (cudaEvent_t drained : drained_events)
+                {
+                    if (drained)
+                    {
+                        cudaEventDestroy(drained);
+                    }
+                }
+                cudaStreamDestroy(free_stream);
+            }
+            else
+            {
+                if (limb_ptr)
+                {
+                    cudaFree(limb_ptr);
+                }
+                if (aux_ptr)
+                {
+                    cudaFree(aux_ptr);
+                }
+            }
+            if (partition_idx < mat->shared_limb_buffers.size())
+            {
+                mat->shared_limb_buffers[partition_idx].ptr = nullptr;
+            }
+            if (partition_idx < mat->shared_aux_buffers.size())
+            {
+                mat->shared_aux_buffers[partition_idx].ptr = nullptr;
+            }
         }
         mat->shared_limb_buffers.clear();
-        for (const auto &entry : mat->shared_aux_buffers)
-        {
-            if (!entry.ptr)
-            {
-                continue;
-            }
-            cudaSetDevice(entry.device);
-            cudaFree(entry.ptr);
-        }
         mat->shared_aux_buffers.clear();
     }
 
@@ -79,8 +201,8 @@ namespace
         {
             return;
         }
-        free_matrix_exec_states(mat);
         free_matrix_shared_buffers(mat);
+        free_matrix_exec_states(mat);
     }
 
 }
@@ -363,24 +485,10 @@ extern "C" int gpu_matrix_copy_block(
         return set_error("context mismatch in gpu_matrix_copy_block");
     }
 
-    const size_t count = rows * cols;
-    if (count == 0)
+    if (rows == 0 || cols == 0)
     {
         out->format = src->format;
         return 0;
-    }
-
-    std::vector<size_t> src_indices;
-    std::vector<size_t> dst_indices;
-    src_indices.reserve(count);
-    dst_indices.reserve(count);
-    for (size_t i = 0; i < rows; ++i)
-    {
-        for (size_t j = 0; j < cols; ++j)
-        {
-            src_indices.push_back(matrix_index(src_row + i, src_col + j, src->cols));
-            dst_indices.push_back(matrix_index(dst_row + i, dst_col + j, out->cols));
-        }
     }
 
     const int level = src->level;
@@ -407,9 +515,15 @@ extern "C" int gpu_matrix_copy_block(
         status = launch_copy_for_limb<uint64_t>(
             out,
             src,
-            src_indices,
-            dst_indices,
             limb_id,
+            src_row,
+            src_col,
+            dst_row,
+            dst_col,
+            rows,
+            cols,
+            src->cols,
+            out->cols,
             static_cast<size_t>(N));
         if (status != 0)
         {

@@ -16,9 +16,12 @@ int matrix_wait_limb_stream(
     const dim3 &limb_id,
     int consumer_device,
     cudaStream_t consumer_stream);
-int matrix_wait_limb(const GpuMatrix *dst, const GpuMatrix *src, const dim3 &limb_id);
+int matrix_track_limb_consumer(
+    const GpuMatrix *src,
+    const dim3 &limb_id,
+    int consumer_device,
+    cudaStream_t consumer_stream);
 int matrix_record_limb_write(GpuMatrix *dst, const dim3 &limb_id, cudaStream_t stream);
-int sync_matrix_limb_streams(const GpuMatrix *mat, const char *context);
 bool matrix_aux_slice_for_limb(const GpuMatrix *mat, const dim3 &limb_id, size_t bytes, void **out_ptr);
 size_t matrix_align_up_size(size_t value, size_t alignment);
 int matrix_acquire_aux_workspace(

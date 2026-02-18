@@ -208,32 +208,24 @@ __device__ __forceinline__ int64_t centered_residue_i64(uint64_t value, uint64_t
 }
 
 __global__ void matrix_sample_distribution_multi_limb_kernel(
-    uint64_t **dst,
+    uint64_t *dst_base,
     size_t poly_count,
-    size_t limb_count,
     size_t n,
-    const uint64_t *moduli,
-    const uint32_t *limb_indices,
+    size_t dst_stride,
+    uint64_t modulus,
+    uint32_t limb_idx,
     int dist_type,
     double sigma,
     uint64_t seed)
 {
     size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    size_t total = limb_count * poly_count * n;
+    size_t total = poly_count * n;
     if (idx >= total)
     {
         return;
     }
-
-    const size_t per_limb = poly_count * n;
-    const size_t limb_slot = idx / per_limb;
-    const size_t rem = idx - limb_slot * per_limb;
-    const size_t poly_idx = rem / n;
-    const size_t coeff_idx = rem - poly_idx * n;
-    const size_t ptr_idx = limb_slot * poly_count + poly_idx;
-
-    const uint64_t modulus = moduli[limb_slot];
-    const uint32_t limb_idx = limb_indices[limb_slot];
+    const size_t poly_idx = idx / n;
+    const size_t coeff_idx = idx - poly_idx * n;
 
     uint64_t sample = 0;
     if (dist_type == GPU_MATRIX_DIST_UNIFORM)
@@ -288,110 +280,49 @@ __global__ void matrix_sample_distribution_multi_limb_kernel(
         sample = signed_mod_i64(z, modulus);
     }
 
-    dst[ptr_idx][coeff_idx] = sample;
+    dst_base[poly_idx * dst_stride + coeff_idx] = sample;
 }
 
 int launch_sample_distribution_multi_limb_kernel(
-    const std::vector<uint64_t *> &dst_ptrs,
+    uint64_t *dst_base,
     size_t poly_count,
     size_t n,
-    const std::vector<uint64_t> &moduli,
-    const std::vector<uint32_t> &limb_indices,
+    size_t dst_stride,
+    uint64_t modulus,
+    uint32_t limb_idx,
     int dist_type,
     double sigma,
     uint64_t seed,
     cudaStream_t stream,
-    const GpuMatrix *aux_owner,
-    const dim3 *aux_limb_id)
+    const GpuMatrix *,
+    const dim3 *)
 {
-    const size_t limb_count = moduli.size();
-    if (limb_count == 0 || poly_count == 0 || n == 0)
+    if (!dst_base)
+    {
+        return set_error("null output base pointer in matrix_sample_distribution_multi_limb_kernel");
+    }
+    if (poly_count == 0 || n == 0)
     {
         return 0;
     }
-    if (limb_indices.size() != limb_count)
-    {
-        return set_error("unexpected limb parameter counts in matrix_sample_distribution_multi_limb_kernel");
-    }
-    const size_t ptr_count = limb_count * poly_count;
-    if (dst_ptrs.size() != ptr_count)
-    {
-        return set_error("unexpected pointer counts in matrix_sample_distribution_multi_limb_kernel");
-    }
-
-    const size_t ptr_bytes = ptr_count * sizeof(uint64_t *);
-    const size_t u64_bytes = limb_count * sizeof(uint64_t);
-    const size_t u32_bytes = limb_count * sizeof(uint32_t);
-    const size_t moduli_offset = matrix_align_up_size(ptr_bytes, alignof(uint64_t));
-    const size_t limb_indices_offset =
-        matrix_align_up_size(moduli_offset + u64_bytes, alignof(uint32_t));
-    const size_t workspace_bytes = limb_indices_offset + u32_bytes;
-
-    void *workspace = nullptr;
-    bool from_shared = false;
-    int status = matrix_acquire_aux_workspace(
-        aux_owner,
-        aux_limb_id,
-        workspace_bytes,
-        &workspace,
-        &from_shared,
-        stream);
-    if (status != 0)
-    {
-        return status;
-    }
-    auto cleanup_workspace = [&]() -> int {
-        return matrix_release_aux_workspace(workspace, from_shared, stream);
-    };
-
-    auto *workspace_base = reinterpret_cast<uint8_t *>(workspace);
-    uint64_t **d_dst = reinterpret_cast<uint64_t **>(workspace_base);
-    uint64_t *d_moduli = reinterpret_cast<uint64_t *>(workspace_base + moduli_offset);
-    uint32_t *d_limb_indices = reinterpret_cast<uint32_t *>(workspace_base + limb_indices_offset);
-
-    cudaError_t err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_workspace();
-        return set_error(err);
-    }
-    err = cudaMemcpyAsync(d_moduli, moduli.data(), u64_bytes, cudaMemcpyHostToDevice, stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_workspace();
-        return set_error(err);
-    }
-    err = cudaMemcpyAsync(d_limb_indices, limb_indices.data(), u32_bytes, cudaMemcpyHostToDevice, stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_workspace();
-        return set_error(err);
-    }
 
     const int threads = 256;
-    const size_t total = ptr_count * n;
+    const size_t total = poly_count * n;
     const int blocks = static_cast<int>((total + threads - 1) / threads);
     matrix_sample_distribution_multi_limb_kernel<<<blocks, threads, 0, stream>>>(
-        d_dst,
+        dst_base,
         poly_count,
-        limb_count,
         n,
-        d_moduli,
-        d_limb_indices,
+        dst_stride,
+        modulus,
+        limb_idx,
         dist_type,
         sigma,
         seed);
-    err = cudaGetLastError();
+    cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
     {
-        cleanup_workspace();
         return set_error(err);
-    }
-
-    status = cleanup_workspace();
-    if (status != 0)
-    {
-        return status;
     }
     return 0;
 }
@@ -439,36 +370,9 @@ extern "C" int gpu_matrix_sample_distribution(
         return set_error("unexpected limb mapping size in gpu_matrix_sample_distribution");
     }
     int status = 0;
-    struct DistBatch
-    {
-        int device;
-        cudaStream_t stream;
-        std::vector<uint64_t *> dst_ptrs;
-        std::vector<uint64_t> moduli;
-        std::vector<uint32_t> limb_indices;
-        std::vector<dim3> dst_limb_ids;
-        dim3 aux_limb_id;
-        bool has_aux_limb_id;
-    };
-    std::vector<DistBatch> batches;
-    auto get_batch = [&](int device, cudaStream_t stream) -> DistBatch &
-    {
-        for (auto &b : batches)
-        {
-            if (b.device == device && b.stream == stream)
-            {
-                return b;
-            }
-        }
-        batches.push_back(DistBatch{device, stream, {}, {}, {}, {}, dim3{0, 0, 0}, false});
-        return batches.back();
-    };
-
     for (int limb = 0; limb <= level; ++limb)
     {
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        std::vector<uint64_t *> limb_ptrs;
-        limb_ptrs.reserve(count);
         int limb_device = -1;
         cudaStream_t limb_stream = nullptr;
         status = matrix_limb_device(out, limb_id, &limb_device);
@@ -481,67 +385,46 @@ extern "C" int gpu_matrix_sample_distribution(
         {
             return status;
         }
-
-        for (size_t idx = 0; idx < count; ++idx)
-        {
-            uint64_t *dst = matrix_limb_ptr_by_id(out, idx, limb_id);
-            if (!dst)
-            {
-                return set_error("null output limb pointer in gpu_matrix_sample_distribution");
-            }
-            limb_ptrs.push_back(dst);
-        }
-
         if (limb_device < 0 || !limb_stream)
         {
             return set_error("invalid limb metadata in gpu_matrix_sample_distribution");
         }
-        auto &batch = get_batch(limb_device, limb_stream);
-        if (!batch.has_aux_limb_id)
+        uint64_t *dst_base = matrix_limb_ptr_by_id(out, 0, limb_id);
+        if (!dst_base)
         {
-            batch.aux_limb_id = limb_id;
-            batch.has_aux_limb_id = true;
+            return set_error("null output limb base pointer in gpu_matrix_sample_distribution");
         }
-        batch.moduli.push_back(out->ctx->moduli[static_cast<size_t>(limb)]);
-        batch.limb_indices.push_back(static_cast<uint32_t>(limb));
-        batch.dst_limb_ids.push_back(limb_id);
-        batch.dst_ptrs.insert(batch.dst_ptrs.end(), limb_ptrs.begin(), limb_ptrs.end());
-    }
-
-    for (auto &batch : batches)
-    {
-        if (!batch.stream)
+        if (limb_id.x >= out->shared_limb_buffers.size())
         {
-            return set_error("null stream in gpu_matrix_sample_distribution");
+            return set_error("invalid output partition index in gpu_matrix_sample_distribution");
         }
-        cudaError_t err = cudaSetDevice(batch.device);
+        const size_t dst_stride = out->shared_limb_buffers[limb_id.x].words_per_poly;
+        cudaError_t err = cudaSetDevice(limb_device);
         if (err != cudaSuccess)
         {
             return set_error(err);
         }
         status = launch_sample_distribution_multi_limb_kernel(
-            batch.dst_ptrs,
+            dst_base,
             count,
             static_cast<size_t>(out->ctx->N),
-            batch.moduli,
-            batch.limb_indices,
+            dst_stride,
+            out->ctx->moduli[static_cast<size_t>(limb)],
+            static_cast<uint32_t>(limb),
             dist_type,
             sigma,
             seed,
-            batch.stream,
+            limb_stream,
             out,
-            batch.has_aux_limb_id ? &batch.aux_limb_id : nullptr);
+            &limb_id);
         if (status != 0)
         {
             return status;
         }
-        for (const dim3 &limb_id : batch.dst_limb_ids)
+        status = matrix_record_limb_write(out, limb_id, limb_stream);
+        if (status != 0)
         {
-            status = matrix_record_limb_write(out, limb_id, batch.stream);
-            if (status != 0)
-            {
-                return status;
-            }
+            return status;
         }
     }
 

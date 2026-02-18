@@ -627,6 +627,11 @@ extern "C" int gpu_matrix_store_rns_batch(
         {
             return set_error(err);
         }
+        status = matrix_track_limb_consumer(mat, limb_id, device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
         serde_append_unique_stream(streams, device, stream);
     }
 

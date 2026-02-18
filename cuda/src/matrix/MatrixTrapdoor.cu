@@ -296,22 +296,27 @@ __global__ void matrix_scatter_p1_integer_to_limb_kernel(
 }
 
 __global__ void matrix_gauss_samp_gq_arb_base_multi_kernel(
-    const uint64_t **src,
-    uint64_t **dst,
+    const uint64_t *src_base,
+    uint64_t *dst_base,
     size_t poly_count,
     size_t n,
-    size_t job_count,
-    const uint64_t *tower_moduli,
+    size_t src_stride,
+    size_t dst_stride,
+    size_t src_cols,
+    size_t out_cols,
+    size_t log_base_q,
+    size_t digit_offset,
+    uint64_t tower_modulus,
     uint32_t base_bits,
     uint32_t digits_per_tower,
-    const uint32_t *digit_indices,
+    uint32_t digit_idx,
     double c,
-    const uint32_t *tower_indices,
+    uint32_t tower_idx,
     uint64_t seed,
-    const uint64_t *out_moduli)
+    uint64_t out_modulus)
 {
     size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    size_t total = job_count * poly_count * n;
+    size_t total = poly_count * n;
     if (idx >= total)
     {
         return;
@@ -321,19 +326,10 @@ __global__ void matrix_gauss_samp_gq_arb_base_multi_kernel(
         return;
     }
 
-    const size_t per_job = poly_count * n;
-    const size_t job_idx = idx / per_job;
-    const size_t rem = idx - job_idx * per_job;
-    const size_t poly_idx = rem / n;
-    const size_t coeff_idx = rem - poly_idx * n;
-    const size_t ptr_idx = job_idx * poly_count + poly_idx;
+    const size_t poly_idx = idx / n;
+    const size_t coeff_idx = idx - poly_idx * n;
 
-    const uint64_t tower_modulus = tower_moduli[job_idx];
-    const uint64_t out_modulus = out_moduli[job_idx];
-    const uint32_t digit_idx = digit_indices[job_idx];
-    const uint32_t tower_idx = tower_indices[job_idx];
-
-    uint64_t value = src[ptr_idx][coeff_idx];
+    uint64_t value = src_base[poly_idx * src_stride + coeff_idx];
     if (tower_modulus != 0)
     {
         value %= tower_modulus;
@@ -430,41 +426,48 @@ __global__ void matrix_gauss_samp_gq_arb_base_multi_kernel(
         out_digit = m_digits[last] * z[last] - z[last - 1] + v_digits[last];
     }
 
-    dst[ptr_idx][coeff_idx] = signed_mod_i64(out_digit, out_modulus);
+    const size_t row = src_cols == 0 ? 0 : (poly_idx / src_cols);
+    const size_t col = src_cols == 0 ? 0 : (poly_idx - row * src_cols);
+    const size_t out_row = row * log_base_q + digit_offset;
+    const size_t out_poly_idx = out_row * out_cols + col;
+    dst_base[out_poly_idx * dst_stride + coeff_idx] = signed_mod_i64(out_digit, out_modulus);
 }
 
 int launch_gauss_samp_gq_arb_base_multi_kernel(
-    const std::vector<const uint64_t *> &src_ptrs,
-    const std::vector<uint64_t *> &dst_ptrs,
+    const uint64_t *src_base,
+    uint64_t *dst_base,
     size_t poly_count,
     size_t n,
-    const std::vector<uint64_t> &tower_moduli,
+    size_t src_stride,
+    size_t dst_stride,
+    size_t src_cols,
+    size_t out_cols,
+    size_t log_base_q,
+    size_t digit_offset,
+    uint64_t tower_modulus,
     uint32_t base_bits,
     uint32_t digits_per_tower,
-    const std::vector<uint32_t> &digit_indices,
+    uint32_t digit_idx,
     double c,
-    const std::vector<uint32_t> &tower_indices,
+    uint32_t tower_idx,
     uint64_t seed,
-    const std::vector<uint64_t> &out_moduli,
+    uint64_t out_modulus,
     int device,
     cudaStream_t stream,
-    const GpuMatrix *aux_owner,
-    const dim3 *aux_limb_id)
+    const GpuMatrix *,
+    const dim3 *)
 {
-    const size_t job_count = tower_moduli.size();
-    if (job_count == 0 || poly_count == 0 || n == 0)
+    if (!src_base || !dst_base)
+    {
+        return set_error("null base pointer in matrix_gauss_samp_gq_arb_base_multi_kernel");
+    }
+    if (poly_count == 0 || n == 0)
     {
         return 0;
     }
-    if (digit_indices.size() != job_count || tower_indices.size() != job_count ||
-        out_moduli.size() != job_count)
+    if (src_cols == 0 || out_cols == 0 || log_base_q == 0)
     {
-        return set_error("unexpected job parameter counts in matrix_gauss_samp_gq_arb_base_multi_kernel");
-    }
-    const size_t ptr_count = job_count * poly_count;
-    if (src_ptrs.size() != ptr_count || dst_ptrs.size() != ptr_count)
-    {
-        return set_error("unexpected pointer counts in matrix_gauss_samp_gq_arb_base_multi_kernel");
+        return set_error("invalid matrix shape in matrix_gauss_samp_gq_arb_base_multi_kernel");
     }
 
     cudaError_t err = cudaSetDevice(device);
@@ -473,110 +476,32 @@ int launch_gauss_samp_gq_arb_base_multi_kernel(
         return set_error(err);
     }
 
-    const size_t ptr_bytes = ptr_count * sizeof(uint64_t *);
-    const size_t u64_bytes = job_count * sizeof(uint64_t);
-    const size_t u32_bytes = job_count * sizeof(uint32_t);
-    const size_t dst_offset = matrix_align_up_size(ptr_bytes, alignof(uint64_t *));
-    const size_t tower_moduli_offset =
-        matrix_align_up_size(dst_offset + ptr_bytes, alignof(uint64_t));
-    const size_t digit_indices_offset =
-        matrix_align_up_size(tower_moduli_offset + u64_bytes, alignof(uint32_t));
-    const size_t tower_indices_offset =
-        matrix_align_up_size(digit_indices_offset + u32_bytes, alignof(uint32_t));
-    const size_t out_moduli_offset =
-        matrix_align_up_size(tower_indices_offset + u32_bytes, alignof(uint64_t));
-    const size_t workspace_bytes = out_moduli_offset + u64_bytes;
-
-    void *workspace = nullptr;
-    bool from_shared = false;
-    int status = matrix_acquire_aux_workspace(
-        aux_owner,
-        aux_limb_id,
-        workspace_bytes,
-        &workspace,
-        &from_shared,
-        stream);
-    if (status != 0)
-    {
-        return status;
-    }
-    auto cleanup_workspace = [&]() -> int {
-        return matrix_release_aux_workspace(workspace, from_shared, stream);
-    };
-
-    auto *workspace_base = reinterpret_cast<uint8_t *>(workspace);
-    const uint64_t **d_src = reinterpret_cast<const uint64_t **>(workspace_base);
-    uint64_t **d_dst = reinterpret_cast<uint64_t **>(workspace_base + dst_offset);
-    uint64_t *d_tower_moduli = reinterpret_cast<uint64_t *>(workspace_base + tower_moduli_offset);
-    uint32_t *d_digit_indices = reinterpret_cast<uint32_t *>(workspace_base + digit_indices_offset);
-    uint32_t *d_tower_indices = reinterpret_cast<uint32_t *>(workspace_base + tower_indices_offset);
-    uint64_t *d_out_moduli = reinterpret_cast<uint64_t *>(workspace_base + out_moduli_offset);
-
-    err = cudaMemcpyAsync(d_src, src_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_workspace();
-        return set_error(err);
-    }
-    err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_workspace();
-        return set_error(err);
-    }
-    err = cudaMemcpyAsync(d_tower_moduli, tower_moduli.data(), u64_bytes, cudaMemcpyHostToDevice, stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_workspace();
-        return set_error(err);
-    }
-    err = cudaMemcpyAsync(d_digit_indices, digit_indices.data(), u32_bytes, cudaMemcpyHostToDevice, stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_workspace();
-        return set_error(err);
-    }
-    err = cudaMemcpyAsync(d_tower_indices, tower_indices.data(), u32_bytes, cudaMemcpyHostToDevice, stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_workspace();
-        return set_error(err);
-    }
-    err = cudaMemcpyAsync(d_out_moduli, out_moduli.data(), u64_bytes, cudaMemcpyHostToDevice, stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_workspace();
-        return set_error(err);
-    }
-
     const int threads = 256;
-    const size_t total = ptr_count * n;
+    const size_t total = poly_count * n;
     const int blocks = static_cast<int>((total + threads - 1) / threads);
     matrix_gauss_samp_gq_arb_base_multi_kernel<<<blocks, threads, 0, stream>>>(
-        d_src,
-        d_dst,
+        src_base,
+        dst_base,
         poly_count,
         n,
-        job_count,
-        d_tower_moduli,
+        src_stride,
+        dst_stride,
+        src_cols,
+        out_cols,
+        log_base_q,
+        digit_offset,
+        tower_modulus,
         base_bits,
         digits_per_tower,
-        d_digit_indices,
+        digit_idx,
         c,
-        d_tower_indices,
+        tower_idx,
         seed,
-        d_out_moduli);
+        out_modulus);
     err = cudaGetLastError();
     if (err != cudaSuccess)
     {
-        cleanup_workspace();
         return set_error(err);
-    }
-
-    status = cleanup_workspace();
-    if (status != 0)
-    {
-        return status;
     }
     return 0;
 }
@@ -598,6 +523,7 @@ int launch_sample_p1_integer_kernel(
     cudaStream_t stream,
     int device_id,
     int64_t **sampled_out_device,
+    cudaEvent_t sampled_ready_event,
     const GpuMatrix *aux_owner,
     const dim3 *aux_limb_id)
 {
@@ -883,11 +809,14 @@ int launch_sample_p1_integer_kernel(
         free_workspace();
     }
 
-    err = cudaStreamSynchronize(stream);
-    if (err != cudaSuccess)
+    if (sampled_ready_event)
     {
-        free_all();
-        return set_error(err);
+        err = cudaEventRecord(sampled_ready_event, stream);
+        if (err != cudaSuccess)
+        {
+            free_all();
+            return set_error(err);
+        }
     }
 
     *sampled_out_device = d_sampled_out;
@@ -1140,46 +1069,6 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         return set_error("unexpected modulus count in gpu_matrix_gauss_samp_gq_arb_base");
     }
 
-    struct GaussBatch
-    {
-        int device;
-        cudaStream_t stream;
-        std::vector<dim3> src_limb_ids;
-        std::vector<dim3> dst_limb_ids;
-        std::vector<const uint64_t *> src_ptrs;
-        std::vector<uint64_t *> dst_ptrs;
-        std::vector<uint64_t> tower_moduli;
-        std::vector<uint32_t> digit_indices;
-        std::vector<uint32_t> tower_indices;
-        std::vector<uint64_t> out_moduli;
-        dim3 aux_limb_id;
-        bool has_aux_limb_id;
-    };
-    std::vector<GaussBatch> batches;
-    auto get_batch = [&](int device, cudaStream_t stream) -> GaussBatch &
-    {
-        for (auto &b : batches)
-        {
-            if (b.device == device && b.stream == stream)
-            {
-                return b;
-            }
-        }
-        batches.push_back(
-            GaussBatch{device, stream, {}, {}, {}, {}, {}, {}, {}, {}, dim3{0, 0, 0}, false});
-        return batches.back();
-    };
-    auto append_unique_limb = [](std::vector<dim3> &limb_ids, const dim3 &limb_id) {
-        for (const dim3 &entry : limb_ids)
-        {
-            if (entry.x == limb_id.x && entry.y == limb_id.y)
-            {
-                return;
-            }
-        }
-        limb_ids.push_back(limb_id);
-    };
-
     for (int src_limb = 0; src_limb <= level; ++src_limb)
     {
         const dim3 src_limb_id = limb_map[static_cast<size_t>(src_limb)];
@@ -1190,19 +1079,18 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
             cleanup_tmp_inputs();
             return status;
         }
-
-        std::vector<const uint64_t *> src_ptrs;
-        src_ptrs.reserve(count);
-        for (size_t idx = 0; idx < count; ++idx)
+        const uint64_t *src_base = matrix_limb_ptr_by_id(inputs_matrix, 0, src_limb_id);
+        if (!src_base)
         {
-            const uint64_t *src_ptr = matrix_limb_ptr_by_id(inputs_matrix, idx, src_limb_id);
-            if (!src_ptr)
-            {
-                cleanup_tmp_inputs();
-                return set_error("null source limb pointer in gpu_matrix_gauss_samp_gq_arb_base");
-            }
-            src_ptrs.push_back(src_ptr);
+            cleanup_tmp_inputs();
+            return set_error("null source limb base pointer in gpu_matrix_gauss_samp_gq_arb_base");
         }
+        if (src_limb_id.x >= inputs_matrix->shared_limb_buffers.size())
+        {
+            cleanup_tmp_inputs();
+            return set_error("invalid source partition index in gpu_matrix_gauss_samp_gq_arb_base");
+        }
+        const size_t src_stride = inputs_matrix->shared_limb_buffers[src_limb_id.x].words_per_poly;
 
         for (uint32_t digit_idx = 0; digit_idx < digits_per_tower; ++digit_idx)
         {
@@ -1232,87 +1120,70 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                     cleanup_tmp_inputs();
                     return status;
                 }
-
-                std::vector<uint64_t *> dst_ptrs;
-                dst_ptrs.reserve(count);
-                for (size_t idx = 0; idx < count; ++idx)
+                status = matrix_wait_limb_stream(inputs_matrix, src_limb_id, out_device, out_stream);
+                if (status != 0)
                 {
-                    const size_t row = idx / cols;
-                    const size_t col = idx % cols;
-                    const size_t out_row = row * log_base_q + digit_offset;
-                    const size_t out_idx = matrix_index(out_row, col, out->cols);
-                    uint64_t *dst_ptr = matrix_limb_ptr_by_id(out, out_idx, out_limb_id);
-                    if (!dst_ptr)
-                    {
-                        cleanup_tmp_inputs();
-                        return set_error("null output limb pointer in gpu_matrix_gauss_samp_gq_arb_base");
-                    }
-                    dst_ptrs.push_back(dst_ptr);
+                    cleanup_tmp_inputs();
+                    return status;
                 }
 
-                auto &batch_ref = get_batch(out_device, out_stream);
-                if (!batch_ref.has_aux_limb_id)
+                uint64_t *dst_base = matrix_limb_ptr_by_id(out, 0, out_limb_id);
+                if (!dst_base)
                 {
-                    batch_ref.aux_limb_id = out_limb_id;
-                    batch_ref.has_aux_limb_id = true;
+                    cleanup_tmp_inputs();
+                    return set_error("null output limb base pointer in gpu_matrix_gauss_samp_gq_arb_base");
                 }
-                append_unique_limb(batch_ref.src_limb_ids, src_limb_id);
-                append_unique_limb(batch_ref.dst_limb_ids, out_limb_id);
-                batch_ref.tower_moduli.push_back(src->ctx->moduli[static_cast<size_t>(src_limb)]);
-                batch_ref.digit_indices.push_back(digit_idx);
-                batch_ref.tower_indices.push_back(static_cast<uint32_t>(src_limb));
-                batch_ref.out_moduli.push_back(src->ctx->moduli[static_cast<size_t>(out_limb)]);
-                batch_ref.src_ptrs.insert(batch_ref.src_ptrs.end(), src_ptrs.begin(), src_ptrs.end());
-                batch_ref.dst_ptrs.insert(batch_ref.dst_ptrs.end(), dst_ptrs.begin(), dst_ptrs.end());
-            }
-        }
-    }
+                if (out_limb_id.x >= out->shared_limb_buffers.size())
+                {
+                    cleanup_tmp_inputs();
+                    return set_error("invalid output partition index in gpu_matrix_gauss_samp_gq_arb_base");
+                }
+                const size_t dst_stride = out->shared_limb_buffers[out_limb_id.x].words_per_poly;
 
-    for (auto &batch_ref : batches)
-    {
-        if (!batch_ref.stream)
-        {
-            cleanup_tmp_inputs();
-            return set_error("null stream in gpu_matrix_gauss_samp_gq_arb_base");
-        }
-        for (const dim3 &src_limb_id : batch_ref.src_limb_ids)
-        {
-            status = matrix_wait_limb_stream(inputs_matrix, src_limb_id, batch_ref.device, batch_ref.stream);
-            if (status != 0)
-            {
-                cleanup_tmp_inputs();
-                return status;
-            }
-        }
-        status = launch_gauss_samp_gq_arb_base_multi_kernel(
-            batch_ref.src_ptrs,
-            batch_ref.dst_ptrs,
-            count,
-            static_cast<size_t>(src->ctx->N),
-            batch_ref.tower_moduli,
-            base_bits,
-            digits_per_tower,
-            batch_ref.digit_indices,
-            c,
-            batch_ref.tower_indices,
-            seed,
-            batch_ref.out_moduli,
-            batch_ref.device,
-            batch_ref.stream,
-            out,
-            batch_ref.has_aux_limb_id ? &batch_ref.aux_limb_id : nullptr);
-        if (status != 0)
-        {
-            cleanup_tmp_inputs();
-            return status;
-        }
-        for (const dim3 &dst_limb_id : batch_ref.dst_limb_ids)
-        {
-            status = matrix_record_limb_write(out, dst_limb_id, batch_ref.stream);
-            if (status != 0)
-            {
-                cleanup_tmp_inputs();
-                return status;
+                status = launch_gauss_samp_gq_arb_base_multi_kernel(
+                    src_base,
+                    dst_base,
+                    count,
+                    static_cast<size_t>(src->ctx->N),
+                    src_stride,
+                    dst_stride,
+                    cols,
+                    out->cols,
+                    log_base_q,
+                    digit_offset,
+                    src->ctx->moduli[static_cast<size_t>(src_limb)],
+                    base_bits,
+                    digits_per_tower,
+                    digit_idx,
+                    c,
+                    static_cast<uint32_t>(src_limb),
+                    seed,
+                    src->ctx->moduli[static_cast<size_t>(out_limb)],
+                    out_device,
+                    out_stream,
+                    out,
+                    &out_limb_id);
+                if (status != 0)
+                {
+                    cleanup_tmp_inputs();
+                    return status;
+                }
+                status = matrix_track_limb_consumer(
+                    inputs_matrix,
+                    src_limb_id,
+                    out_device,
+                    out_stream);
+                if (status != 0)
+                {
+                    cleanup_tmp_inputs();
+                    return status;
+                }
+                status = matrix_record_limb_write(out, out_limb_id, out_stream);
+                if (status != 0)
+                {
+                    cleanup_tmp_inputs();
+                    return status;
+                }
             }
         }
     }
@@ -1413,9 +1284,20 @@ extern "C" int gpu_matrix_sample_p1_full(
         int64_t *ptr;
     };
     std::vector<DeviceSampleBuffer> sampled_device_buffers;
+    cudaEvent_t sampled_ready_event = nullptr;
+    int sampled_ready_device = -1;
 
     auto cleanup = [&]()
     {
+        if (sampled_ready_event)
+        {
+            if (sampled_ready_device >= 0)
+            {
+                cudaSetDevice(sampled_ready_device);
+            }
+            cudaEventDestroy(sampled_ready_event);
+            sampled_ready_event = nullptr;
+        }
         for (auto &entry : sampled_device_buffers)
         {
             if (!entry.ptr || entry.device < 0)
@@ -1629,6 +1511,19 @@ extern "C" int gpu_matrix_sample_p1_full(
         cleanup();
         return status;
     }
+    cudaError_t err = cudaSetDevice(ref_device);
+    if (err != cudaSuccess)
+    {
+        cleanup();
+        return set_error(err);
+    }
+    err = cudaEventCreateWithFlags(&sampled_ready_event, cudaEventDisableTiming);
+    if (err != cudaSuccess)
+    {
+        cleanup();
+        return set_error(err);
+    }
+    sampled_ready_device = ref_device;
 
     int64_t *sampled_ref_device = nullptr;
     status = launch_sample_p1_integer_kernel(
@@ -1647,8 +1542,33 @@ extern "C" int gpu_matrix_sample_p1_full(
         ref_stream,
         ref_device,
         &sampled_ref_device,
+        sampled_ready_event,
         out,
         &ref_limb_id);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = matrix_track_limb_consumer(a_input, ref_limb_id, ref_device, ref_stream);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = matrix_track_limb_consumer(b_input, ref_limb_id, ref_device, ref_stream);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = matrix_track_limb_consumer(d_input, ref_limb_id, ref_device, ref_stream);
+    if (status != 0)
+    {
+        cleanup();
+        return status;
+    }
+    status = matrix_track_limb_consumer(tp2_input, ref_limb_id, ref_device, ref_stream);
     if (status != 0)
     {
         cleanup();
@@ -1693,6 +1613,19 @@ extern "C" int gpu_matrix_sample_p1_full(
         {
             if (entry.device == device && entry.ptr)
             {
+                if (sampled_ready_event && device == ref_device)
+                {
+                    cudaError_t wait_err = cudaSetDevice(device);
+                    if (wait_err != cudaSuccess)
+                    {
+                        return set_error(wait_err);
+                    }
+                    wait_err = cudaStreamWaitEvent(stream, sampled_ready_event, 0);
+                    if (wait_err != cudaSuccess)
+                    {
+                        return set_error(wait_err);
+                    }
+                }
                 *out_ptr = entry.ptr;
                 return 0;
             }
@@ -1728,21 +1661,19 @@ extern "C" int gpu_matrix_sample_p1_full(
             cudaFree(device_copy);
             return set_error(err);
         }
-        err = cudaStreamSynchronize(stream);
-        if (err != cudaSuccess)
-        {
-            cudaFree(device_copy);
-            return set_error(err);
-        }
         sampled_device_buffers.push_back(DeviceSampleBuffer{device, device_copy});
         *out_ptr = device_copy;
         return 0;
     };
 
+    std::vector<std::vector<uint64_t *>> out_entry_ptrs_by_limb(
+        static_cast<size_t>(level + 1));
+
     for (int limb = 0; limb <= level; ++limb)
     {
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        std::vector<uint64_t *> out_entry_ptrs;
+        auto &out_entry_ptrs = out_entry_ptrs_by_limb[static_cast<size_t>(limb)];
+        out_entry_ptrs.clear();
         out_entry_ptrs.reserve(2 * d_rows * cols);
 
         int out_device = -1;

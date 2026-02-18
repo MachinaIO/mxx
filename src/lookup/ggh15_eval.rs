@@ -300,9 +300,8 @@ where
         let w_block_v_idx = w_matrix.slice_columns(block2_end, block3_end);
         let configured_parallelism = crate::env::lut_preimage_chunk_size().max(1);
         let batch_parallelism = configured_parallelism.min(batch.len()).max(1);
-        let available_parallelism = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(batch_parallelism);
+        let available_parallelism =
+            std::thread::available_parallelism().map(usize::from).unwrap_or(batch_parallelism);
         assert!(
             available_parallelism >= batch_parallelism,
             "sample_lut_preimages requires {batch_parallelism} CPU threads (LUT_PREIMAGE_CHUNK_SIZE={} and batch_size={}) but only {available_parallelism} are available",
@@ -970,9 +969,8 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
         let trapdoor_sigma = self.trapdoor_sigma;
         let gate_parallelism = crate::env::ggh15_gate_parallelism();
         info!("GGH15 gate preimage parallelism={}", gate_parallelism);
-        let available_parallelism = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(gate_parallelism);
+        let available_parallelism =
+            std::thread::available_parallelism().map(usize::from).unwrap_or(gate_parallelism);
         assert!(
             available_parallelism >= gate_parallelism,
             "gate preimage requires {gate_parallelism} CPU threads (GGH15_GATE_PARALLELISM={gate_parallelism}) but only {available_parallelism} are available"

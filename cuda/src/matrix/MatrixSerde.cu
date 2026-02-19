@@ -922,66 +922,37 @@ extern "C" int gpu_poly_store_compact_bytes(
     unsigned int *d_max_abs_bits = nullptr;
     uint8_t *d_payload = nullptr;
     cudaStream_t work_stream = nullptr;
+    auto free_ptr = [&](auto *&ptr) {
+        if (!ptr)
+        {
+            return;
+        }
+        if (work_stream)
+        {
+            cudaFreeAsync(ptr, work_stream);
+        }
+        else
+        {
+            cudaFree(ptr);
+        }
+        ptr = nullptr;
+    };
     auto release = [&]() {
+        free_ptr(d_payload);
+        free_ptr(d_max_abs_bits);
+        free_ptr(d_sign_bits);
+        free_ptr(d_overflow);
+        free_ptr(d_coeff_words);
+        free_ptr(d_garner_inv);
+        free_ptr(d_moduli);
+        free_ptr(d_half_modulus_words);
+        free_ptr(d_modulus_words);
+        free_ptr(d_limb_strides);
+        free_ptr(d_limb_ptrs);
         if (work_stream)
         {
             cudaStreamDestroy(work_stream);
             work_stream = nullptr;
-        }
-        if (d_payload)
-        {
-            cudaFree(d_payload);
-            d_payload = nullptr;
-        }
-        if (d_max_abs_bits)
-        {
-            cudaFree(d_max_abs_bits);
-            d_max_abs_bits = nullptr;
-        }
-        if (d_sign_bits)
-        {
-            cudaFree(d_sign_bits);
-            d_sign_bits = nullptr;
-        }
-        if (d_overflow)
-        {
-            cudaFree(d_overflow);
-            d_overflow = nullptr;
-        }
-        if (d_coeff_words)
-        {
-            cudaFree(d_coeff_words);
-            d_coeff_words = nullptr;
-        }
-        if (d_garner_inv)
-        {
-            cudaFree(d_garner_inv);
-            d_garner_inv = nullptr;
-        }
-        if (d_moduli)
-        {
-            cudaFree(d_moduli);
-            d_moduli = nullptr;
-        }
-        if (d_half_modulus_words)
-        {
-            cudaFree(d_half_modulus_words);
-            d_half_modulus_words = nullptr;
-        }
-        if (d_modulus_words)
-        {
-            cudaFree(d_modulus_words);
-            d_modulus_words = nullptr;
-        }
-        if (d_limb_strides)
-        {
-            cudaFree(d_limb_strides);
-            d_limb_strides = nullptr;
-        }
-        if (d_limb_ptrs)
-        {
-            cudaFree(d_limb_ptrs);
-            d_limb_ptrs = nullptr;
         }
     };
 
@@ -991,9 +962,10 @@ extern "C" int gpu_poly_store_compact_bytes(
         release();
         return set_error(err);
     }
-    err = cudaMalloc(
+    err = cudaMallocAsync(
         reinterpret_cast<void **>(&d_modulus_words),
-        words_per_coeff * sizeof(uint64_t));
+        words_per_coeff * sizeof(uint64_t),
+        work_stream);
     if (err != cudaSuccess)
     {
         release();
@@ -1010,9 +982,10 @@ extern "C" int gpu_poly_store_compact_bytes(
         release();
         return set_error(err);
     }
-    err = cudaMalloc(
+    err = cudaMallocAsync(
         reinterpret_cast<void **>(&d_half_modulus_words),
-        words_per_coeff * sizeof(uint64_t));
+        words_per_coeff * sizeof(uint64_t),
+        work_stream);
     if (err != cudaSuccess)
     {
         release();
@@ -1043,7 +1016,10 @@ extern "C" int gpu_poly_store_compact_bytes(
         }
     }
 
-    err = cudaMalloc(reinterpret_cast<void **>(&d_limb_ptrs), limb_count * sizeof(uint64_t *));
+    err = cudaMallocAsync(
+        reinterpret_cast<void **>(&d_limb_ptrs),
+        limb_count * sizeof(uint64_t *),
+        work_stream);
     if (err != cudaSuccess)
     {
         release();
@@ -1061,7 +1037,10 @@ extern "C" int gpu_poly_store_compact_bytes(
         return set_error(err);
     }
 
-    err = cudaMalloc(reinterpret_cast<void **>(&d_limb_strides), limb_count * sizeof(size_t));
+    err = cudaMallocAsync(
+        reinterpret_cast<void **>(&d_limb_strides),
+        limb_count * sizeof(size_t),
+        work_stream);
     if (err != cudaSuccess)
     {
         release();
@@ -1079,7 +1058,10 @@ extern "C" int gpu_poly_store_compact_bytes(
         return set_error(err);
     }
 
-    err = cudaMalloc(reinterpret_cast<void **>(&d_moduli), moduli_subset.size() * sizeof(uint64_t));
+    err = cudaMallocAsync(
+        reinterpret_cast<void **>(&d_moduli),
+        moduli_subset.size() * sizeof(uint64_t),
+        work_stream);
     if (err != cudaSuccess)
     {
         release();
@@ -1097,9 +1079,10 @@ extern "C" int gpu_poly_store_compact_bytes(
         return set_error(err);
     }
 
-    err = cudaMalloc(
+    err = cudaMallocAsync(
         reinterpret_cast<void **>(&d_garner_inv),
-        inverse_table.size() * sizeof(uint64_t));
+        inverse_table.size() * sizeof(uint64_t),
+        work_stream);
     if (err != cudaSuccess)
     {
         release();
@@ -1117,15 +1100,16 @@ extern "C" int gpu_poly_store_compact_bytes(
         return set_error(err);
     }
 
-    err = cudaMalloc(
+    err = cudaMallocAsync(
         reinterpret_cast<void **>(&d_coeff_words),
-        coeff_word_len * sizeof(uint64_t));
+        coeff_word_len * sizeof(uint64_t),
+        work_stream);
     if (err != cudaSuccess)
     {
         release();
         return set_error(err);
     }
-    err = cudaMalloc(reinterpret_cast<void **>(&d_overflow), sizeof(int));
+    err = cudaMallocAsync(reinterpret_cast<void **>(&d_overflow), sizeof(int), work_stream);
     if (err != cudaSuccess)
     {
         release();
@@ -1137,13 +1121,19 @@ extern "C" int gpu_poly_store_compact_bytes(
         release();
         return set_error(err);
     }
-    err = cudaMalloc(reinterpret_cast<void **>(&d_sign_bits), coeff_count * sizeof(uint8_t));
+    err = cudaMallocAsync(
+        reinterpret_cast<void **>(&d_sign_bits),
+        coeff_count * sizeof(uint8_t),
+        work_stream);
     if (err != cudaSuccess)
     {
         release();
         return set_error(err);
     }
-    err = cudaMalloc(reinterpret_cast<void **>(&d_max_abs_bits), sizeof(unsigned int));
+    err = cudaMallocAsync(
+        reinterpret_cast<void **>(&d_max_abs_bits),
+        sizeof(unsigned int),
+        work_stream);
     if (err != cudaSuccess)
     {
         release();
@@ -1263,7 +1253,8 @@ extern "C" int gpu_poly_store_compact_bytes(
 
     if (payload_len > 0)
     {
-        err = cudaMalloc(reinterpret_cast<void **>(&d_payload), payload_len);
+        err =
+            cudaMallocAsync(reinterpret_cast<void **>(&d_payload), payload_len, work_stream);
         if (err != cudaSuccess)
         {
             release();
@@ -1428,31 +1419,30 @@ extern "C" int gpu_poly_load_compact_bytes(
     size_t *d_limb_strides = nullptr;
     uint64_t *d_moduli = nullptr;
     cudaStream_t work_stream = nullptr;
+    auto free_ptr = [&](auto *&ptr) {
+        if (!ptr)
+        {
+            return;
+        }
+        if (work_stream)
+        {
+            cudaFreeAsync(ptr, work_stream);
+        }
+        else
+        {
+            cudaFree(ptr);
+        }
+        ptr = nullptr;
+    };
     auto release = [&]() {
+        free_ptr(d_moduli);
+        free_ptr(d_limb_strides);
+        free_ptr(d_limb_ptrs);
+        free_ptr(d_payload);
         if (work_stream)
         {
             cudaStreamDestroy(work_stream);
             work_stream = nullptr;
-        }
-        if (d_moduli)
-        {
-            cudaFree(d_moduli);
-            d_moduli = nullptr;
-        }
-        if (d_limb_strides)
-        {
-            cudaFree(d_limb_strides);
-            d_limb_strides = nullptr;
-        }
-        if (d_limb_ptrs)
-        {
-            cudaFree(d_limb_ptrs);
-            d_limb_ptrs = nullptr;
-        }
-        if (d_payload)
-        {
-            cudaFree(d_payload);
-            d_payload = nullptr;
         }
     };
 
@@ -1478,7 +1468,10 @@ extern "C" int gpu_poly_load_compact_bytes(
 
     if (payload_len > 0)
     {
-        err = cudaMalloc(reinterpret_cast<void **>(&d_payload), payload_len);
+        err = cudaMallocAsync(
+            reinterpret_cast<void **>(&d_payload),
+            payload_len,
+            work_stream);
         if (err != cudaSuccess)
         {
             release();
@@ -1497,7 +1490,10 @@ extern "C" int gpu_poly_load_compact_bytes(
         }
     }
 
-    err = cudaMalloc(reinterpret_cast<void **>(&d_limb_ptrs), limb_count * sizeof(uint64_t *));
+    err = cudaMallocAsync(
+        reinterpret_cast<void **>(&d_limb_ptrs),
+        limb_count * sizeof(uint64_t *),
+        work_stream);
     if (err != cudaSuccess)
     {
         release();
@@ -1515,7 +1511,10 @@ extern "C" int gpu_poly_load_compact_bytes(
         return set_error(err);
     }
 
-    err = cudaMalloc(reinterpret_cast<void **>(&d_limb_strides), limb_count * sizeof(size_t));
+    err = cudaMallocAsync(
+        reinterpret_cast<void **>(&d_limb_strides),
+        limb_count * sizeof(size_t),
+        work_stream);
     if (err != cudaSuccess)
     {
         release();
@@ -1534,7 +1533,10 @@ extern "C" int gpu_poly_load_compact_bytes(
     }
 
     std::vector<uint64_t> moduli_subset(poly->ctx->moduli.begin(), poly->ctx->moduli.begin() + limb_count);
-    err = cudaMalloc(reinterpret_cast<void **>(&d_moduli), moduli_subset.size() * sizeof(uint64_t));
+    err = cudaMallocAsync(
+        reinterpret_cast<void **>(&d_moduli),
+        moduli_subset.size() * sizeof(uint64_t),
+        work_stream);
     if (err != cudaSuccess)
     {
         release();

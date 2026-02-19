@@ -724,40 +724,53 @@ namespace
         const T **d_lhs = nullptr;
         const T **d_rhs = nullptr;
         int *d_equal = nullptr;
+        auto release = [&]() {
+            if (d_equal)
+            {
+                cudaFreeAsync(d_equal, stream);
+                d_equal = nullptr;
+            }
+            if (d_rhs)
+            {
+                cudaFreeAsync(const_cast<T **>(d_rhs), stream);
+                d_rhs = nullptr;
+            }
+            if (d_lhs)
+            {
+                cudaFreeAsync(const_cast<T **>(d_lhs), stream);
+                d_lhs = nullptr;
+            }
+        };
         const size_t ptr_bytes = count * sizeof(T *);
-        cudaError_t err = cudaMalloc(&d_lhs, ptr_bytes);
+        cudaError_t err =
+            cudaMallocAsync(reinterpret_cast<void **>(&d_lhs), ptr_bytes, stream);
         if (err != cudaSuccess)
         {
             return set_error(err);
         }
-        err = cudaMalloc(&d_rhs, ptr_bytes);
+        err = cudaMallocAsync(reinterpret_cast<void **>(&d_rhs), ptr_bytes, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_lhs);
+            release();
             return set_error(err);
         }
-        err = cudaMalloc(&d_equal, sizeof(int));
+        err = cudaMallocAsync(reinterpret_cast<void **>(&d_equal), sizeof(int), stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
+            release();
             return set_error(err);
         }
 
         err = cudaMemcpyAsync(d_lhs, lhs_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
-            cudaFree(d_equal);
+            release();
             return set_error(err);
         }
         err = cudaMemcpyAsync(d_rhs, rhs_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
-            cudaFree(d_equal);
+            release();
             return set_error(err);
         }
 
@@ -765,9 +778,7 @@ namespace
         err = cudaMemcpyAsync(d_equal, &h_equal, sizeof(int), cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
-            cudaFree(d_equal);
+            release();
             return set_error(err);
         }
 
@@ -778,32 +789,24 @@ namespace
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
-            cudaFree(d_equal);
+            release();
             return set_error(err);
         }
 
         err = cudaMemcpyAsync(&h_equal, d_equal, sizeof(int), cudaMemcpyDeviceToHost, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
-            cudaFree(d_equal);
+            release();
             return set_error(err);
         }
         err = cudaStreamSynchronize(stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
-            cudaFree(d_equal);
+            release();
             return set_error(err);
         }
 
-        cudaFree(d_lhs);
-        cudaFree(d_rhs);
-        cudaFree(d_equal);
+        release();
         is_equal = (h_equal != 0);
         return 0;
     }

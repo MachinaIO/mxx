@@ -581,6 +581,10 @@ int launch_sample_p1_integer_kernel(
     {
         return set_error("invalid device in matrix_sample_p1_integer_kernel");
     }
+    if (!stream)
+    {
+        return set_error("null stream in matrix_sample_p1_integer_kernel");
+    }
     cudaError_t err = cudaSetDevice(device_id);
     if (err != cudaSuccess)
     {
@@ -604,10 +608,13 @@ int launch_sample_p1_integer_kernel(
     auto free_all = [&]()
     {
         if (d_sampled_out)
-            cudaFree(d_sampled_out);
+        {
+            cudaFreeAsync(d_sampled_out, stream);
+            d_sampled_out = nullptr;
+        }
     };
 
-    err = cudaMalloc(&d_sampled_out, total_values * sizeof(int64_t));
+    err = cudaMallocAsync(reinterpret_cast<void **>(&d_sampled_out), total_values * sizeof(int64_t), stream);
     if (err != cudaSuccess)
     {
         free_all();
@@ -683,20 +690,18 @@ int launch_sample_p1_integer_kernel(
         }
         bytes_per_sample_total += sampled_bytes_per_sample;
 
+        void *workspace = nullptr;
         double *cov_workspace = nullptr;
         double *mean_workspace = nullptr;
         double *col_workspace = nullptr;
         int64_t *sampled_workspace = nullptr;
         auto free_workspace = [&]()
         {
-            if (cov_workspace)
-                cudaFree(cov_workspace);
-            if (mean_workspace)
-                cudaFree(mean_workspace);
-            if (col_workspace)
-                cudaFree(col_workspace);
-            if (sampled_workspace)
-                cudaFree(sampled_workspace);
+            if (workspace)
+            {
+                cudaFreeAsync(workspace, stream);
+                workspace = nullptr;
+            }
             cov_workspace = nullptr;
             mean_workspace = nullptr;
             col_workspace = nullptr;
@@ -716,30 +721,26 @@ int launch_sample_p1_integer_kernel(
             {
                 return false;
             }
-            cudaError_t local_err = cudaMalloc(&cov_workspace, samples * cov_bytes_per_sample);
+            if (samples > std::numeric_limits<size_t>::max() / bytes_per_sample_total)
+            {
+                return false;
+            }
+            const size_t workspace_bytes = samples * bytes_per_sample_total;
+            cudaError_t local_err = cudaMallocAsync(&workspace, workspace_bytes, stream);
             if (local_err != cudaSuccess)
             {
                 free_workspace();
                 return false;
             }
-            local_err = cudaMalloc(&mean_workspace, samples * vec_bytes_per_sample);
-            if (local_err != cudaSuccess)
-            {
-                free_workspace();
-                return false;
-            }
-            local_err = cudaMalloc(&col_workspace, samples * vec_bytes_per_sample);
-            if (local_err != cudaSuccess)
-            {
-                free_workspace();
-                return false;
-            }
-            local_err = cudaMalloc(&sampled_workspace, samples * sampled_bytes_per_sample);
-            if (local_err != cudaSuccess)
-            {
-                free_workspace();
-                return false;
-            }
+            auto *workspace_base = reinterpret_cast<uint8_t *>(workspace);
+            const size_t cov_bytes = samples * cov_bytes_per_sample;
+            const size_t mean_bytes = samples * vec_bytes_per_sample;
+            const size_t col_bytes = samples * vec_bytes_per_sample;
+            cov_workspace = reinterpret_cast<double *>(workspace_base);
+            mean_workspace = reinterpret_cast<double *>(workspace_base + cov_bytes);
+            col_workspace = reinterpret_cast<double *>(workspace_base + cov_bytes + mean_bytes);
+            sampled_workspace = reinterpret_cast<int64_t *>(
+                workspace_base + cov_bytes + mean_bytes + col_bytes);
             return true;
         };
 
@@ -1243,6 +1244,8 @@ extern "C" int gpu_matrix_sample_p1_full(
     {
         int device;
         int64_t *ptr;
+        cudaStream_t owner_stream;
+        cudaEvent_t ready_event;
     };
     std::vector<DeviceSampleBuffer> sampled_device_buffers;
     cudaEvent_t sampled_ready_event = nullptr;
@@ -1261,13 +1264,34 @@ extern "C" int gpu_matrix_sample_p1_full(
         }
         for (auto &entry : sampled_device_buffers)
         {
-            if (!entry.ptr || entry.device < 0)
+            if (entry.device < 0)
             {
+                entry.ptr = nullptr;
+                if (entry.ready_event)
+                {
+                    cudaEventDestroy(entry.ready_event);
+                    entry.ready_event = nullptr;
+                }
                 continue;
             }
             cudaSetDevice(entry.device);
-            cudaFree(entry.ptr);
-            entry.ptr = nullptr;
+            if (entry.ptr)
+            {
+                if (entry.owner_stream)
+                {
+                    cudaFreeAsync(entry.ptr, entry.owner_stream);
+                }
+                else
+                {
+                    cudaFree(entry.ptr);
+                }
+                entry.ptr = nullptr;
+            }
+            if (entry.ready_event)
+            {
+                cudaEventDestroy(entry.ready_event);
+                entry.ready_event = nullptr;
+            }
         }
         sampled_device_buffers.clear();
         if (tmp_a)
@@ -1517,7 +1541,10 @@ extern "C" int gpu_matrix_sample_p1_full(
     }
     if (sampled_ref_device)
     {
-        sampled_device_buffers.push_back(DeviceSampleBuffer{ref_device, sampled_ref_device});
+        sampled_device_buffers.push_back(
+            DeviceSampleBuffer{ref_device, sampled_ref_device, ref_stream, sampled_ready_event});
+        sampled_ready_event = nullptr;
+        sampled_ready_device = -1;
     }
 
     size_t sampled_entry_count = 0;
@@ -1549,23 +1576,68 @@ extern "C" int gpu_matrix_sample_p1_full(
         {
             return set_error("invalid output in ensure_sample_buffer_on_device");
         }
+        if (device < 0 || !stream)
+        {
+            return set_error("invalid device/stream in ensure_sample_buffer_on_device");
+        }
         *out_ptr = nullptr;
-        for (const auto &entry : sampled_device_buffers)
+        auto link_consumer_to_owner =
+            [&](DeviceSampleBuffer &entry, cudaStream_t consumer_stream) -> int
+        {
+            if (!entry.owner_stream)
+            {
+                return 0;
+            }
+            cudaError_t link_err = cudaSetDevice(entry.device);
+            if (link_err != cudaSuccess)
+            {
+                return set_error(link_err);
+            }
+            cudaEvent_t consumer_done = nullptr;
+            link_err = cudaEventCreateWithFlags(&consumer_done, cudaEventDisableTiming);
+            if (link_err != cudaSuccess)
+            {
+                return set_error(link_err);
+            }
+            link_err = cudaEventRecord(consumer_done, consumer_stream);
+            if (link_err != cudaSuccess)
+            {
+                cudaEventDestroy(consumer_done);
+                return set_error(link_err);
+            }
+            link_err = cudaStreamWaitEvent(entry.owner_stream, consumer_done, 0);
+            cudaError_t destroy_err = cudaEventDestroy(consumer_done);
+            if (link_err != cudaSuccess)
+            {
+                return set_error(link_err);
+            }
+            if (destroy_err != cudaSuccess)
+            {
+                return set_error(destroy_err);
+            }
+            return 0;
+        };
+        for (auto &entry : sampled_device_buffers)
         {
             if (entry.device == device && entry.ptr)
             {
-                if (sampled_ready_event && device == ref_device)
+                cudaError_t wait_err = cudaSetDevice(device);
+                if (wait_err != cudaSuccess)
                 {
-                    cudaError_t wait_err = cudaSetDevice(device);
+                    return set_error(wait_err);
+                }
+                if (entry.ready_event)
+                {
+                    wait_err = cudaStreamWaitEvent(stream, entry.ready_event, 0);
                     if (wait_err != cudaSuccess)
                     {
                         return set_error(wait_err);
                     }
-                    wait_err = cudaStreamWaitEvent(stream, sampled_ready_event, 0);
-                    if (wait_err != cudaSuccess)
-                    {
-                        return set_error(wait_err);
-                    }
+                }
+                int link_status = link_consumer_to_owner(entry, stream);
+                if (link_status != 0)
+                {
+                    return link_status;
                 }
                 *out_ptr = entry.ptr;
                 return 0;
@@ -1585,7 +1657,7 @@ extern "C" int gpu_matrix_sample_p1_full(
             return set_error(err);
         }
         int64_t *device_copy = nullptr;
-        err = cudaMalloc(&device_copy, sampled_bytes);
+        err = cudaMallocAsync(reinterpret_cast<void **>(&device_copy), sampled_bytes, stream);
         if (err != cudaSuccess)
         {
             return set_error(err);
@@ -1599,10 +1671,24 @@ extern "C" int gpu_matrix_sample_p1_full(
             stream);
         if (err != cudaSuccess)
         {
-            cudaFree(device_copy);
+            cudaFreeAsync(device_copy, stream);
             return set_error(err);
         }
-        sampled_device_buffers.push_back(DeviceSampleBuffer{device, device_copy});
+        cudaEvent_t copy_ready = nullptr;
+        err = cudaEventCreateWithFlags(&copy_ready, cudaEventDisableTiming);
+        if (err != cudaSuccess)
+        {
+            cudaFreeAsync(device_copy, stream);
+            return set_error(err);
+        }
+        err = cudaEventRecord(copy_ready, stream);
+        if (err != cudaSuccess)
+        {
+            cudaEventDestroy(copy_ready);
+            cudaFreeAsync(device_copy, stream);
+            return set_error(err);
+        }
+        sampled_device_buffers.push_back(DeviceSampleBuffer{device, device_copy, stream, copy_ready});
         *out_ptr = device_copy;
         return 0;
     };

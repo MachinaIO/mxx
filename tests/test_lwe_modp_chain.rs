@@ -194,7 +194,8 @@ async fn test_lwe_modp_chain_rounding() {
     let tag_bytes: &[u8] = b"bgg_pubkey";
 
     let uniform_sampler = DCRTPolyUniformSampler::new();
-    let s = uniform_sampler.sample_uniform(&params, 1, d_secret - 1, DistType::BitDist).get_row(0);
+    let s =
+        uniform_sampler.sample_uniform(&params, 1, d_secret - 1, DistType::TernaryDist).get_row(0);
     let mut secrets = s;
     secrets.push(DCRTPoly::const_minus_one(&params));
     let s_vec = DCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());

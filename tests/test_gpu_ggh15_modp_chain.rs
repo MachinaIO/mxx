@@ -261,7 +261,8 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
     let tag_bytes: &[u8] = b"bgg_pubkey";
 
     let uniform_sampler = GpuDCRTPolyUniformSampler::new();
-    let s = uniform_sampler.sample_uniform(&params, 1, D_SECRET - 1, DistType::BitDist).get_row(0);
+    let s =
+        uniform_sampler.sample_uniform(&params, 1, D_SECRET - 1, DistType::TernaryDist).get_row(0);
     let mut secrets = s;
     secrets.push(GpuDCRTPoly::const_minus_one(&params));
     let s_vec = GpuDCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());

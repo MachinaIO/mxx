@@ -905,12 +905,32 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
     }
 
     fn decompose(&self) -> Self {
+        let total_start = Instant::now();
+        let to_ms = |d: Duration| d.as_secs_f64() * 1000.0;
         let log_base_q = self.params.modulus_digits();
         let nrow = self.nrow.saturating_mul(log_base_q);
+        let alloc_start = Instant::now();
         let out = Self::new_empty(&self.params, nrow, self.ncol);
+        let alloc_elapsed = alloc_start.elapsed();
+        let kernel_start = Instant::now();
         let status =
             unsafe { gpu_matrix_decompose_base(self.raw, self.params.base_bits(), out.raw) };
+        let kernel_elapsed = kernel_start.elapsed();
         check_status(status, "gpu_matrix_decompose_base");
+        let total_elapsed = total_start.elapsed();
+        let accounted = alloc_elapsed + kernel_elapsed;
+        let other_elapsed = total_elapsed.saturating_sub(accounted);
+        debug!(
+            "GpuDCRTPolyMatrix::decompose timing: in_shape=({}, {}), out_shape=({}, {}), alloc_ms={:.3}, decompose_call_ms={:.3}, total_ms={:.3}, other_ms={:.3}",
+            self.nrow,
+            self.ncol,
+            out.nrow,
+            out.ncol,
+            to_ms(alloc_elapsed),
+            to_ms(kernel_elapsed),
+            to_ms(total_elapsed),
+            to_ms(other_elapsed)
+        );
         out
     }
 
@@ -1051,7 +1071,36 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
 
     fn get_column_matrix_decompose(&self, j: usize) -> Self {
         debug_assert!(j < self.ncol, "column index out of bounds in get_column_matrix_decompose");
-        self.slice(0, self.nrow, j, j + 1).decompose()
+        let total_start = Instant::now();
+        let to_ms = |d: Duration| d.as_secs_f64() * 1000.0;
+
+        let slice_start = Instant::now();
+        let col = self.slice(0, self.nrow, j, j + 1);
+        let slice_elapsed = slice_start.elapsed();
+
+        let decompose_start = Instant::now();
+        let out = col.decompose();
+        let decompose_elapsed = decompose_start.elapsed();
+
+        let total_elapsed = total_start.elapsed();
+        let accounted = slice_elapsed + decompose_elapsed;
+        let other_elapsed = total_elapsed.saturating_sub(accounted);
+        debug!(
+            "GpuDCRTPolyMatrix::get_column_matrix_decompose timing: col={}/{}, in_shape=({}, {}), slice_out_shape=({}, {}), decompose_out_shape=({}, {}), slice_ms={:.3}, decompose_ms={:.3}, total_ms={:.3}, other_ms={:.3}",
+            j + 1,
+            self.ncol,
+            self.nrow,
+            self.ncol,
+            col.nrow,
+            col.ncol,
+            out.nrow,
+            out.ncol,
+            to_ms(slice_elapsed),
+            to_ms(decompose_elapsed),
+            to_ms(total_elapsed),
+            to_ms(other_elapsed)
+        );
+        out
     }
 
     fn vectorize_columns(&self) -> Self {

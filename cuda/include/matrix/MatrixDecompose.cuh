@@ -13,9 +13,7 @@ int launch_fill_gadget_multi_limb_kernel(
     size_t log_base_q,
     uint32_t digits_per_tower,
     uint32_t base_bits,
-    cudaStream_t stream,
-    const GpuMatrix *aux_owner,
-    const dim3 *aux_limb_id);
+    cudaStream_t stream);
 
 #ifdef __cplusplus
 extern "C"
@@ -25,11 +23,7 @@ extern "C"
     int gpu_matrix_fill_gadget(
         GpuMatrix *out,
         uint32_t base_bits);
-    int gpu_matrix_fill_small_gadget(
-        GpuMatrix *out,
-        uint32_t base_bits);
     int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bits, GpuMatrix *out);
-    int gpu_matrix_decompose_base_small(const GpuMatrix *src, uint32_t base_bits, GpuMatrix *out);
 
 #ifdef __cplusplus
 }

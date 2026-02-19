@@ -24,11 +24,14 @@ namespace
     static_assert(kMatmulTileM * kMatmulTileN <= 1024, "matmul tile thread count exceeds CUDA limit");
     template <typename T>
     __global__ void block_add_kernel(
-        const T **lhs,
-        const T **rhs,
-        T **out,
+        const T *lhs_base,
+        const T *rhs_base,
+        T *out_base,
         size_t poly_count,
         size_t n,
+        size_t lhs_stride,
+        size_t rhs_stride,
+        size_t out_stride,
         T modulus)
     {
         size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -39,20 +42,23 @@ namespace
         }
         size_t poly_idx = idx / n;
         size_t coeff_idx = idx - poly_idx * n;
-        T a = lhs[poly_idx][coeff_idx];
-        T b = rhs[poly_idx][coeff_idx];
+        T a = lhs_base[poly_idx * lhs_stride + coeff_idx];
+        T b = rhs_base[poly_idx * rhs_stride + coeff_idx];
         T sum = a + b;
         sum = sum >= modulus ? (sum - modulus) : sum;
-        out[poly_idx][coeff_idx] = sum;
+        out_base[poly_idx * out_stride + coeff_idx] = sum;
     }
 
     template <typename T>
     __global__ void block_sub_kernel(
-        const T **lhs,
-        const T **rhs,
-        T **out,
+        const T *lhs_base,
+        const T *rhs_base,
+        T *out_base,
         size_t poly_count,
         size_t n,
+        size_t lhs_stride,
+        size_t rhs_stride,
+        size_t out_stride,
         T modulus)
     {
         size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -63,57 +69,61 @@ namespace
         }
         size_t poly_idx = idx / n;
         size_t coeff_idx = idx - poly_idx * n;
-        T a = lhs[poly_idx][coeff_idx];
-        T b = rhs[poly_idx][coeff_idx];
+        T a = lhs_base[poly_idx * lhs_stride + coeff_idx];
+        T b = rhs_base[poly_idx * rhs_stride + coeff_idx];
         T diff = a >= b ? (a - b) : (modulus - (b - a));
-        out[poly_idx][coeff_idx] = diff;
+        out_base[poly_idx * out_stride + coeff_idx] = diff;
     }
 
     template <typename T>
     __global__ void matrix_decompose_multi_kernel(
-        const T **src,
-        T **dst,
+        const T *src_base,
+        T *dst_base,
         size_t poly_count,
         size_t n,
-        size_t job_count,
-        const uint32_t *shifts,
-        const T *masks,
-        const T *out_moduli)
+        size_t src_stride,
+        size_t dst_stride,
+        size_t src_cols,
+        size_t out_cols,
+        size_t log_base_q,
+        size_t digit_offset,
+        uint32_t shift,
+        T mask,
+        T out_modulus)
     {
         size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        size_t total = job_count * poly_count * n;
+        size_t total = poly_count * n;
         if (idx >= total)
         {
             return;
         }
-
-        const size_t per_job = poly_count * n;
-        const size_t job_idx = idx / per_job;
-        const size_t rem = idx - job_idx * per_job;
-        const size_t poly_idx = rem / n;
-        const size_t coeff_idx = rem - poly_idx * n;
-
-        const size_t ptr_idx = job_idx * poly_count + poly_idx;
-        T residue = src[ptr_idx][coeff_idx];
-        const uint32_t shift = shifts[job_idx];
-        const T mask = masks[job_idx];
+        const size_t poly_idx = idx / n;
+        const size_t coeff_idx = idx - poly_idx * n;
+        T residue = src_base[poly_idx * src_stride + coeff_idx];
         T digit = shift >= static_cast<uint32_t>(sizeof(T) * 8) ? 0 : ((residue >> shift) & mask);
-        const T out_modulus = out_moduli[job_idx];
         if (out_modulus != 0 && digit >= out_modulus)
         {
             digit %= out_modulus;
         }
-        dst[ptr_idx][coeff_idx] = digit;
+        const size_t row = src_cols == 0 ? 0 : (poly_idx / src_cols);
+        const size_t col = src_cols == 0 ? 0 : (poly_idx - row * src_cols);
+        const size_t out_row = row * log_base_q + digit_offset;
+        const size_t out_poly_idx = out_row * out_cols + col;
+        dst_base[out_poly_idx * dst_stride + coeff_idx] = digit;
     }
 
     template <typename T>
     __global__ void block_mul_kernel(
-        const T **lhs,
-        const T **rhs,
-        T **out,
+        const T *lhs_base,
+        const T *rhs_base,
+        T *out_base,
         size_t poly_count,
         size_t n,
-        T modulus)
+        size_t lhs_stride,
+        size_t rhs_stride,
+        size_t out_stride,
+        T modulus,
+        int rhs_is_scalar)
     {
         size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
         size_t total = poly_count * n;
@@ -123,45 +133,64 @@ namespace
         }
         size_t poly_idx = idx / n;
         size_t coeff_idx = idx - poly_idx * n;
-        T a = lhs[poly_idx][coeff_idx];
-        T b = rhs[poly_idx][coeff_idx];
+        size_t rhs_poly_idx = rhs_is_scalar ? 0 : poly_idx;
+        T a = lhs_base[poly_idx * lhs_stride + coeff_idx];
+        T b = rhs_base[rhs_poly_idx * rhs_stride + coeff_idx];
         if constexpr (std::is_same_v<T, uint64_t>)
         {
-            out[poly_idx][coeff_idx] = mul_mod_u64(a, b, modulus);
+            out_base[poly_idx * out_stride + coeff_idx] = mul_mod_u64(a, b, modulus);
         }
         else
         {
-            out[poly_idx][coeff_idx] = mul_mod_u32(a, b, modulus);
+            out_base[poly_idx * out_stride + coeff_idx] = mul_mod_u32(a, b, modulus);
         }
     }
 
     template <typename T>
-    __global__ void block_copy_kernel(
-        const T **src,
-        T **dst,
-        size_t poly_count,
-        size_t n)
+    __global__ void block_copy_rect_kernel(
+        const T *src_base,
+        T *dst_base,
+        size_t copy_rows,
+        size_t copy_cols,
+        size_t n,
+        size_t src_stride,
+        size_t dst_stride,
+        size_t src_cols,
+        size_t dst_cols,
+        size_t src_row,
+        size_t src_col,
+        size_t dst_row,
+        size_t dst_col)
     {
-        size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        size_t total = poly_count * n;
+        const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        const size_t total_poly = copy_rows * copy_cols;
+        const size_t total = total_poly * n;
         if (idx >= total)
         {
             return;
         }
-        size_t poly_idx = idx / n;
-        size_t coeff_idx = idx - poly_idx * n;
-        dst[poly_idx][coeff_idx] = src[poly_idx][coeff_idx];
+        const size_t poly_offset = idx / n;
+        const size_t coeff_idx = idx - poly_offset * n;
+        const size_t local_row = poly_offset / copy_cols;
+        const size_t local_col = poly_offset - local_row * copy_cols;
+        const size_t src_poly_idx = (src_row + local_row) * src_cols + (src_col + local_col);
+        const size_t dst_poly_idx = (dst_row + local_row) * dst_cols + (dst_col + local_col);
+        dst_base[dst_poly_idx * dst_stride + coeff_idx] =
+            src_base[src_poly_idx * src_stride + coeff_idx];
     }
 
     template <typename T>
     __global__ void block_matmul_kernel(
-        const T **lhs,
-        const T **rhs,
-        T **out,
+        const T *lhs_base,
+        const T *rhs_base,
+        T *out_base,
         size_t rows,
         size_t inner,
         size_t cols,
         size_t n,
+        size_t lhs_stride,
+        size_t rhs_stride,
+        size_t out_stride,
         T modulus)
     {
         __shared__ T lhs_tile[kMatmulTileM][kMatmulTileK];
@@ -192,8 +221,8 @@ namespace
                 T val = 0;
                 if (lhs_row < rows && lhs_k < inner)
                 {
-                    const T *lhs_poly = lhs[lhs_row * inner + lhs_k];
-                    val = lhs_poly[coeff_idx];
+                    const size_t lhs_poly_idx = lhs_row * inner + lhs_k;
+                    val = lhs_base[lhs_poly_idx * lhs_stride + coeff_idx];
                 }
                 lhs_tile[r][k] = val;
             }
@@ -206,8 +235,8 @@ namespace
                 T val = 0;
                 if (rhs_k < inner && rhs_col < cols)
                 {
-                    const T *rhs_poly = rhs[rhs_k * cols + rhs_col];
-                    val = rhs_poly[coeff_idx];
+                    const size_t rhs_poly_idx = rhs_k * cols + rhs_col;
+                    val = rhs_base[rhs_poly_idx * rhs_stride + coeff_idx];
                 }
                 rhs_tile[k][c] = val;
             }
@@ -235,7 +264,8 @@ namespace
 
         if (row < rows && col < cols)
         {
-            out[row * cols + col][coeff_idx] = acc;
+            const size_t out_poly_idx = row * cols + col;
+            out_base[out_poly_idx * out_stride + coeff_idx] = acc;
         }
     }
 
@@ -253,7 +283,8 @@ namespace
         const dim3 *aux_limb_id,
         size_t bytes,
         void **out_ptr,
-        bool *out_shared)
+        bool *out_shared,
+        cudaStream_t stream)
     {
         if (!out_ptr || !out_shared)
         {
@@ -270,7 +301,11 @@ namespace
             *out_shared = true;
             return 0;
         }
-        cudaError_t err = cudaMalloc(out_ptr, bytes);
+        if (!stream)
+        {
+            return set_error("null stream in acquire_matrix_aux_workspace");
+        }
+        cudaError_t err = cudaMallocAsync(out_ptr, bytes, stream);
         if (err != cudaSuccess)
         {
             return set_error(err);
@@ -278,13 +313,17 @@ namespace
         return 0;
     }
 
-    int release_matrix_aux_workspace(void *ptr, bool from_shared)
+    int release_matrix_aux_workspace(void *ptr, bool from_shared, cudaStream_t stream)
     {
         if (!ptr || from_shared)
         {
             return 0;
         }
-        cudaError_t err = cudaFree(ptr);
+        if (!stream)
+        {
+            return set_error("null stream in release_matrix_aux_workspace");
+        }
+        cudaError_t err = cudaFreeAsync(ptr, stream);
         if (err != cudaSuccess)
         {
             return set_error(err);
@@ -294,175 +333,105 @@ namespace
 
     template <typename T>
     int launch_block_kernel(
-        const std::vector<T *> &out_ptrs,
-        const std::vector<const T *> &lhs_ptrs,
-        const std::vector<const T *> &rhs_ptrs,
+        const T *lhs_base,
+        const T *rhs_base,
+        T *out_base,
+        size_t poly_count,
         size_t n,
+        size_t lhs_stride,
+        size_t rhs_stride,
+        size_t out_stride,
         T modulus,
         BlockOp op,
         cudaStream_t stream,
-        const GpuMatrix *aux_owner,
-        const dim3 *aux_limb_id)
+        int rhs_is_scalar)
     {
-        const size_t count = out_ptrs.size();
-        if (count == 0 || n == 0)
+        if (!lhs_base || !rhs_base || !out_base)
+        {
+            return set_error("null base pointer in launch_block_kernel");
+        }
+        if (poly_count == 0 || n == 0)
         {
             return 0;
         }
 
-        const size_t ptr_bytes = count * sizeof(T *);
-        const size_t lhs_offset = align_up_size(ptr_bytes, alignof(T *));
-        const size_t rhs_offset = align_up_size(lhs_offset + ptr_bytes, alignof(T *));
-        const size_t workspace_bytes = rhs_offset + ptr_bytes;
-
-        void *workspace = nullptr;
-        bool from_shared = false;
-        int status = acquire_matrix_aux_workspace(
-            aux_owner,
-            aux_limb_id,
-            workspace_bytes,
-            &workspace,
-            &from_shared);
-        if (status != 0)
-        {
-            return status;
-        }
-
-        auto *workspace_base = reinterpret_cast<uint8_t *>(workspace);
-        T **d_out = reinterpret_cast<T **>(workspace_base);
-        const T **d_lhs = reinterpret_cast<const T **>(workspace_base + lhs_offset);
-        const T **d_rhs = reinterpret_cast<const T **>(workspace_base + rhs_offset);
-
-        auto cleanup_workspace = [&]() -> int { return release_matrix_aux_workspace(workspace, from_shared); };
-
-        cudaError_t err = cudaMemcpyAsync(d_out, out_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cleanup_workspace();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_lhs, lhs_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cleanup_workspace();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_rhs, rhs_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cleanup_workspace();
-            return set_error(err);
-        }
-
         const int threads = 256;
-        const size_t total = count * n;
+        const size_t total = poly_count * n;
         const int blocks = static_cast<int>((total + threads - 1) / threads);
 
         switch (op)
         {
         case BlockOp::Add:
-            block_add_kernel<<<blocks, threads, 0, stream>>>(d_lhs, d_rhs, d_out, count, n, modulus);
+            block_add_kernel<<<blocks, threads, 0, stream>>>(
+                lhs_base,
+                rhs_base,
+                out_base,
+                poly_count,
+                n,
+                lhs_stride,
+                rhs_stride,
+                out_stride,
+                modulus);
             break;
         case BlockOp::Sub:
-            block_sub_kernel<<<blocks, threads, 0, stream>>>(d_lhs, d_rhs, d_out, count, n, modulus);
+            block_sub_kernel<<<blocks, threads, 0, stream>>>(
+                lhs_base,
+                rhs_base,
+                out_base,
+                poly_count,
+                n,
+                lhs_stride,
+                rhs_stride,
+                out_stride,
+                modulus);
             break;
         case BlockOp::Mul:
-            block_mul_kernel<<<blocks, threads, 0, stream>>>(d_lhs, d_rhs, d_out, count, n, modulus);
+            block_mul_kernel<<<blocks, threads, 0, stream>>>(
+                lhs_base,
+                rhs_base,
+                out_base,
+                poly_count,
+                n,
+                lhs_stride,
+                rhs_stride,
+                out_stride,
+                modulus,
+                rhs_is_scalar);
             break;
         }
 
-        err = cudaGetLastError();
+        const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            cleanup_workspace();
             return set_error(err);
-        }
-
-        err = cudaStreamSynchronize(stream);
-        if (err != cudaSuccess)
-        {
-            cleanup_workspace();
-            return set_error(err);
-        }
-
-        status = cleanup_workspace();
-        if (status != 0)
-        {
-            return status;
         }
         return 0;
     }
 
     template <typename T>
     int launch_block_matmul_kernel(
-        const std::vector<T *> &out_ptrs,
-        const std::vector<const T *> &lhs_ptrs,
-        const std::vector<const T *> &rhs_ptrs,
+        const T *lhs_base,
+        const T *rhs_base,
+        T *out_base,
         size_t rows,
         size_t inner,
         size_t cols,
         size_t n,
+        size_t lhs_stride,
+        size_t rhs_stride,
+        size_t out_stride,
         T modulus,
         cudaStream_t stream,
-        double *out_kernel_ms,
-        const GpuMatrix *aux_owner,
-        const dim3 *aux_limb_id)
+        const GpuMatrix *,
+        const dim3 *)
     {
-        const size_t out_count = rows * cols;
-        const size_t lhs_count = rows * inner;
-        const size_t rhs_count = inner * cols;
-        if (out_count == 0 || n == 0)
+        if (!lhs_base || !rhs_base || !out_base)
+        {
+            return set_error("null base pointer in launch_block_matmul_kernel");
+        }
+        if (rows == 0 || inner == 0 || cols == 0 || n == 0)
         {
             return 0;
-        }
-        if (out_ptrs.size() != out_count || lhs_ptrs.size() != lhs_count || rhs_ptrs.size() != rhs_count)
-        {
-            return set_error("unexpected pointer counts in launch_block_matmul_kernel");
-        }
-
-        const size_t out_bytes = out_count * sizeof(T *);
-        const size_t lhs_bytes = lhs_count * sizeof(T *);
-        const size_t rhs_bytes = rhs_count * sizeof(T *);
-        const size_t lhs_offset = align_up_size(out_bytes, alignof(T *));
-        const size_t rhs_offset = align_up_size(lhs_offset + lhs_bytes, alignof(T *));
-        const size_t workspace_bytes = rhs_offset + rhs_bytes;
-
-        void *workspace = nullptr;
-        bool from_shared = false;
-        int status = acquire_matrix_aux_workspace(
-            aux_owner,
-            aux_limb_id,
-            workspace_bytes,
-            &workspace,
-            &from_shared);
-        if (status != 0)
-        {
-            return status;
-        }
-
-        auto *workspace_base = reinterpret_cast<uint8_t *>(workspace);
-        T **d_out = reinterpret_cast<T **>(workspace_base);
-        const T **d_lhs = reinterpret_cast<const T **>(workspace_base + lhs_offset);
-        const T **d_rhs = reinterpret_cast<const T **>(workspace_base + rhs_offset);
-        auto cleanup_workspace = [&]() -> int { return release_matrix_aux_workspace(workspace, from_shared); };
-
-        cudaError_t err = cudaMemcpyAsync(d_out, out_ptrs.data(), out_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cleanup_workspace();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_lhs, lhs_ptrs.data(), lhs_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cleanup_workspace();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_rhs, rhs_ptrs.data(), rhs_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cleanup_workspace();
-            return set_error(err);
         }
 
         const dim3 threads(kMatmulTileN, kMatmulTileM);
@@ -471,296 +440,136 @@ namespace
             static_cast<unsigned int>((rows + kMatmulTileM - 1) / kMatmulTileM),
             static_cast<unsigned int>(n));
 
-        cudaEvent_t start = nullptr;
-        cudaEvent_t stop = nullptr;
-        if (out_kernel_ms)
-        {
-            err = cudaEventCreate(&start);
-            if (err != cudaSuccess)
-            {
-                cleanup_workspace();
-                return set_error(err);
-            }
-            err = cudaEventCreate(&stop);
-            if (err != cudaSuccess)
-            {
-                cudaEventDestroy(start);
-                cleanup_workspace();
-                return set_error(err);
-            }
-            err = cudaEventRecord(start, stream);
-            if (err != cudaSuccess)
-            {
-                cudaEventDestroy(start);
-                cudaEventDestroy(stop);
-                cleanup_workspace();
-                return set_error(err);
-            }
-        }
+        block_matmul_kernel<<<blocks, threads, 0, stream>>>(
+            lhs_base,
+            rhs_base,
+            out_base,
+            rows,
+            inner,
+            cols,
+            n,
+            lhs_stride,
+            rhs_stride,
+            out_stride,
+            modulus);
 
-        block_matmul_kernel<<<blocks, threads, 0, stream>>>(d_lhs, d_rhs, d_out, rows, inner, cols, n, modulus);
-
-        err = cudaGetLastError();
+        const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            if (start)
-            {
-                cudaEventDestroy(start);
-                cudaEventDestroy(stop);
-            }
-            cleanup_workspace();
             return set_error(err);
-        }
-
-        if (out_kernel_ms)
-        {
-            err = cudaEventRecord(stop, stream);
-            if (err != cudaSuccess)
-            {
-                cudaEventDestroy(start);
-                cudaEventDestroy(stop);
-                cleanup_workspace();
-                return set_error(err);
-            }
-            err = cudaEventSynchronize(stop);
-            if (err != cudaSuccess)
-            {
-                cudaEventDestroy(start);
-                cudaEventDestroy(stop);
-                cleanup_workspace();
-                return set_error(err);
-            }
-            float kernel_ms = 0.0f;
-            err = cudaEventElapsedTime(&kernel_ms, start, stop);
-            if (err != cudaSuccess)
-            {
-                cudaEventDestroy(start);
-                cudaEventDestroy(stop);
-                cleanup_workspace();
-                return set_error(err);
-            }
-            *out_kernel_ms += static_cast<double>(kernel_ms);
-            cudaEventDestroy(start);
-            cudaEventDestroy(stop);
-        }
-        else
-        {
-            err = cudaStreamSynchronize(stream);
-            if (err != cudaSuccess)
-            {
-                cleanup_workspace();
-                return set_error(err);
-            }
-        }
-
-        status = cleanup_workspace();
-        if (status != 0)
-        {
-            return status;
         }
         return 0;
     }
 
     template <typename T>
     int launch_decompose_multi_kernel(
-        const std::vector<const T *> &src_ptrs,
-        const std::vector<T *> &dst_ptrs,
+        const T *src_base,
+        T *dst_base,
         size_t poly_count,
         size_t n,
-        const std::vector<uint32_t> &shifts,
-        const std::vector<T> &masks,
-        const std::vector<T> &out_moduli,
+        size_t src_stride,
+        size_t dst_stride,
+        size_t src_cols,
+        size_t out_cols,
+        size_t log_base_q,
+        size_t digit_offset,
+        uint32_t shift,
+        T mask,
+        T out_modulus,
         cudaStream_t stream,
-        const GpuMatrix *aux_owner,
-        const dim3 *aux_limb_id)
+        const GpuMatrix *,
+        const dim3 *)
     {
-        const size_t job_count = shifts.size();
-        if (job_count == 0 || poly_count == 0 || n == 0)
+        if (!src_base || !dst_base)
+        {
+            return set_error("null base pointer in launch_decompose_multi_kernel");
+        }
+        if (poly_count == 0 || n == 0)
         {
             return 0;
         }
-        if (masks.size() != job_count || out_moduli.size() != job_count)
+        if (src_cols == 0 || out_cols == 0 || log_base_q == 0)
         {
-            return set_error("unexpected job parameter counts in matrix_decompose_multi_kernel");
-        }
-        const size_t ptr_count = job_count * poly_count;
-        if (src_ptrs.size() != ptr_count || dst_ptrs.size() != ptr_count)
-        {
-            return set_error("unexpected pointer counts in matrix_decompose_multi_kernel");
-        }
-
-        const size_t ptr_bytes = ptr_count * sizeof(T *);
-        const size_t shift_bytes = job_count * sizeof(uint32_t);
-        const size_t scalar_bytes = job_count * sizeof(T);
-        const size_t dst_offset = align_up_size(ptr_bytes, alignof(T *));
-        const size_t shifts_offset = align_up_size(dst_offset + ptr_bytes, alignof(uint32_t));
-        const size_t masks_offset = align_up_size(shifts_offset + shift_bytes, alignof(T));
-        const size_t out_moduli_offset = align_up_size(masks_offset + scalar_bytes, alignof(T));
-        const size_t workspace_bytes = out_moduli_offset + scalar_bytes;
-
-        void *workspace = nullptr;
-        bool from_shared = false;
-        int status = acquire_matrix_aux_workspace(
-            aux_owner,
-            aux_limb_id,
-            workspace_bytes,
-            &workspace,
-            &from_shared);
-        if (status != 0)
-        {
-            return status;
-        }
-
-        auto *workspace_base = reinterpret_cast<uint8_t *>(workspace);
-        const T **d_src = reinterpret_cast<const T **>(workspace_base);
-        T **d_dst = reinterpret_cast<T **>(workspace_base + dst_offset);
-        uint32_t *d_shifts = reinterpret_cast<uint32_t *>(workspace_base + shifts_offset);
-        T *d_masks = reinterpret_cast<T *>(workspace_base + masks_offset);
-        T *d_out_moduli = reinterpret_cast<T *>(workspace_base + out_moduli_offset);
-        auto cleanup_workspace = [&]() -> int { return release_matrix_aux_workspace(workspace, from_shared); };
-
-        cudaError_t err = cudaMemcpyAsync(d_src, src_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cleanup_workspace();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cleanup_workspace();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_shifts, shifts.data(), shift_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cleanup_workspace();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_masks, masks.data(), scalar_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cleanup_workspace();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_out_moduli, out_moduli.data(), scalar_bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cleanup_workspace();
-            return set_error(err);
+            return set_error("invalid matrix shape in launch_decompose_multi_kernel");
         }
 
         const int threads = 256;
-        const size_t total = ptr_count * n;
+        const size_t total = poly_count * n;
         const int blocks = static_cast<int>((total + threads - 1) / threads);
+        cudaError_t err;
         matrix_decompose_multi_kernel<<<blocks, threads, 0, stream>>>(
-            d_src,
-            d_dst,
+            src_base,
+            dst_base,
             poly_count,
             n,
-            job_count,
-            d_shifts,
-            d_masks,
-            d_out_moduli);
+            src_stride,
+            dst_stride,
+            src_cols,
+            out_cols,
+            log_base_q,
+            digit_offset,
+            shift,
+            mask,
+            out_modulus);
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            cleanup_workspace();
             return set_error(err);
-        }
-
-        err = cudaStreamSynchronize(stream);
-        if (err != cudaSuccess)
-        {
-            cleanup_workspace();
-            return set_error(err);
-        }
-
-        status = cleanup_workspace();
-        if (status != 0)
-        {
-            return status;
         }
         return 0;
     }
 
     template <typename T>
     int launch_copy_kernel(
-        const std::vector<const T *> &src_ptrs,
-        const std::vector<T *> &dst_ptrs,
+        const T *src_base,
+        T *dst_base,
         size_t n,
-        cudaStream_t stream,
-        const GpuMatrix *aux_owner,
-        const dim3 *aux_limb_id)
+        size_t src_stride,
+        size_t dst_stride,
+        size_t src_cols,
+        size_t dst_cols,
+        size_t src_row,
+        size_t src_col,
+        size_t dst_row,
+        size_t dst_col,
+        size_t copy_rows,
+        size_t copy_cols,
+        cudaStream_t stream)
     {
-        const size_t count = src_ptrs.size();
-        if (count == 0 || n == 0)
+        if (!src_base || !dst_base)
+        {
+            return set_error("null base pointer in block_copy_rect_kernel");
+        }
+        if (copy_rows == 0 || copy_cols == 0 || n == 0)
         {
             return 0;
         }
-        if (dst_ptrs.size() != count)
+        if (src_cols == 0 || dst_cols == 0)
         {
-            return set_error("unexpected pointer counts in block_copy_kernel");
-        }
-
-        const size_t bytes = count * sizeof(T *);
-        const size_t dst_offset = align_up_size(bytes, alignof(T *));
-        const size_t workspace_bytes = dst_offset + bytes;
-
-        void *workspace = nullptr;
-        bool from_shared = false;
-        int status = acquire_matrix_aux_workspace(
-            aux_owner,
-            aux_limb_id,
-            workspace_bytes,
-            &workspace,
-            &from_shared);
-        if (status != 0)
-        {
-            return status;
-        }
-
-        auto *workspace_base = reinterpret_cast<uint8_t *>(workspace);
-        const T **d_src = reinterpret_cast<const T **>(workspace_base);
-        T **d_dst = reinterpret_cast<T **>(workspace_base + dst_offset);
-        auto cleanup_workspace = [&]() -> int { return release_matrix_aux_workspace(workspace, from_shared); };
-
-        cudaError_t err = cudaMemcpyAsync(d_src, src_ptrs.data(), bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cleanup_workspace();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(d_dst, dst_ptrs.data(), bytes, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess)
-        {
-            cleanup_workspace();
-            return set_error(err);
+            return set_error("invalid matrix shape in block_copy_rect_kernel");
         }
 
         const int threads = 256;
-        const size_t total = count * n;
+        const size_t total = copy_rows * copy_cols * n;
         const int blocks = static_cast<int>((total + threads - 1) / threads);
-
-        block_copy_kernel<<<blocks, threads, 0, stream>>>(d_src, d_dst, count, n);
-        err = cudaGetLastError();
+        block_copy_rect_kernel<<<blocks, threads, 0, stream>>>(
+            src_base,
+            dst_base,
+            copy_rows,
+            copy_cols,
+            n,
+            src_stride,
+            dst_stride,
+            src_cols,
+            dst_cols,
+            src_row,
+            src_col,
+            dst_row,
+            dst_col);
+        cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            cleanup_workspace();
             return set_error(err);
-        }
-
-        err = cudaStreamSynchronize(stream);
-        if (err != cudaSuccess)
-        {
-            cleanup_workspace();
-            return set_error(err);
-        }
-
-        status = cleanup_workspace();
-        if (status != 0)
-        {
-            return status;
         }
         return 0;
     }
@@ -769,23 +578,24 @@ namespace
     int launch_copy_for_limb(
         GpuMatrix *out,
         const GpuMatrix *src,
-        const std::vector<size_t> &src_indices,
-        const std::vector<size_t> &dst_indices,
         const dim3 &limb_id,
+        size_t src_row,
+        size_t src_col,
+        size_t dst_row,
+        size_t dst_col,
+        size_t copy_rows,
+        size_t copy_cols,
+        size_t src_cols,
+        size_t dst_cols,
         size_t n)
     {
         if constexpr (!std::is_same_v<T, uint64_t>)
         {
             return set_error("unsupported limb type in launch_copy_for_limb");
         }
-        const size_t count = src_indices.size();
-        if (count == 0)
+        if (copy_rows == 0 || copy_cols == 0)
         {
             return 0;
-        }
-        if (dst_indices.size() != count)
-        {
-            return set_error("mismatched index counts in launch_copy_for_limb");
         }
 
         int src_device = -1;
@@ -821,30 +631,53 @@ namespace
         {
             return set_error(err);
         }
-
-        std::vector<const T *> src_ptrs;
-        std::vector<T *> dst_ptrs;
-        src_ptrs.reserve(count);
-        dst_ptrs.reserve(count);
-        for (size_t i = 0; i < count; ++i)
-        {
-            const uint64_t *src_ptr = matrix_limb_ptr_by_id(src, src_indices[i], limb_id);
-            uint64_t *dst_ptr = matrix_limb_ptr_by_id(out, dst_indices[i], limb_id);
-            if (!src_ptr || !dst_ptr)
-            {
-                return set_error("null limb pointer in launch_copy_for_limb");
-            }
-            src_ptrs.push_back(reinterpret_cast<const T *>(src_ptr));
-            dst_ptrs.push_back(reinterpret_cast<T *>(dst_ptr));
-        }
-
-        status = launch_copy_kernel(src_ptrs, dst_ptrs, n, exec_stream, out, &limb_id);
+        status = matrix_wait_limb_stream(src, limb_id, dst_device, exec_stream);
         if (status != 0)
         {
             return status;
         }
 
-        return 0;
+        const T *src_base = reinterpret_cast<const T *>(matrix_limb_ptr_by_id(src, 0, limb_id));
+        T *dst_base = reinterpret_cast<T *>(matrix_limb_ptr_by_id(out, 0, limb_id));
+        if (!src_base || !dst_base)
+        {
+            return set_error("null limb base pointer in launch_copy_for_limb");
+        }
+
+        if (limb_id.x >= src->shared_limb_buffers.size() ||
+            limb_id.x >= out->shared_limb_buffers.size())
+        {
+            return set_error("invalid partition index in launch_copy_for_limb");
+        }
+        const size_t src_stride = src->shared_limb_buffers[limb_id.x].words_per_poly;
+        const size_t dst_stride = out->shared_limb_buffers[limb_id.x].words_per_poly;
+
+        status = launch_copy_kernel(
+            src_base,
+            dst_base,
+            n,
+            src_stride,
+            dst_stride,
+            src_cols,
+            dst_cols,
+            src_row,
+            src_col,
+            dst_row,
+            dst_col,
+            copy_rows,
+            copy_cols,
+            exec_stream);
+        if (status != 0)
+        {
+            return status;
+        }
+
+        status = matrix_track_limb_consumer(src, limb_id, dst_device, exec_stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        return matrix_record_limb_write(out, limb_id, exec_stream);
     }
 
     template <typename T>
@@ -891,40 +724,53 @@ namespace
         const T **d_lhs = nullptr;
         const T **d_rhs = nullptr;
         int *d_equal = nullptr;
+        auto release = [&]() {
+            if (d_equal)
+            {
+                cudaFreeAsync(d_equal, stream);
+                d_equal = nullptr;
+            }
+            if (d_rhs)
+            {
+                cudaFreeAsync(const_cast<T **>(d_rhs), stream);
+                d_rhs = nullptr;
+            }
+            if (d_lhs)
+            {
+                cudaFreeAsync(const_cast<T **>(d_lhs), stream);
+                d_lhs = nullptr;
+            }
+        };
         const size_t ptr_bytes = count * sizeof(T *);
-        cudaError_t err = cudaMalloc(&d_lhs, ptr_bytes);
+        cudaError_t err =
+            cudaMallocAsync(reinterpret_cast<void **>(&d_lhs), ptr_bytes, stream);
         if (err != cudaSuccess)
         {
             return set_error(err);
         }
-        err = cudaMalloc(&d_rhs, ptr_bytes);
+        err = cudaMallocAsync(reinterpret_cast<void **>(&d_rhs), ptr_bytes, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_lhs);
+            release();
             return set_error(err);
         }
-        err = cudaMalloc(&d_equal, sizeof(int));
+        err = cudaMallocAsync(reinterpret_cast<void **>(&d_equal), sizeof(int), stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
+            release();
             return set_error(err);
         }
 
         err = cudaMemcpyAsync(d_lhs, lhs_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
-            cudaFree(d_equal);
+            release();
             return set_error(err);
         }
         err = cudaMemcpyAsync(d_rhs, rhs_ptrs.data(), ptr_bytes, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
-            cudaFree(d_equal);
+            release();
             return set_error(err);
         }
 
@@ -932,9 +778,7 @@ namespace
         err = cudaMemcpyAsync(d_equal, &h_equal, sizeof(int), cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
-            cudaFree(d_equal);
+            release();
             return set_error(err);
         }
 
@@ -945,70 +789,25 @@ namespace
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
-            cudaFree(d_equal);
+            release();
             return set_error(err);
         }
 
         err = cudaMemcpyAsync(&h_equal, d_equal, sizeof(int), cudaMemcpyDeviceToHost, stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
-            cudaFree(d_equal);
+            release();
             return set_error(err);
         }
         err = cudaStreamSynchronize(stream);
         if (err != cudaSuccess)
         {
-            cudaFree(d_lhs);
-            cudaFree(d_rhs);
-            cudaFree(d_equal);
+            release();
             return set_error(err);
         }
 
-        cudaFree(d_lhs);
-        cudaFree(d_rhs);
-        cudaFree(d_equal);
+        release();
         is_equal = (h_equal != 0);
-        return 0;
-    }
-
-    int arith_wait_stream_on_stream(int device, cudaStream_t consumer, cudaStream_t producer)
-    {
-        if (!consumer || !producer || consumer == producer)
-        {
-            return 0;
-        }
-        cudaError_t err = cudaSetDevice(device);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        cudaEvent_t ev = nullptr;
-        err = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        err = cudaEventRecord(ev, producer);
-        if (err != cudaSuccess)
-        {
-            cudaEventDestroy(ev);
-            return set_error(err);
-        }
-        err = cudaStreamWaitEvent(consumer, ev, 0);
-        if (err != cudaSuccess)
-        {
-            cudaEventDestroy(ev);
-            return set_error(err);
-        }
-        err = cudaEventDestroy(ev);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
         return 0;
     }
 
@@ -1016,10 +815,9 @@ namespace
         const GpuMatrix *scalar,
         const dim3 &limb_id,
         const uint64_t **out_ptr,
-        int *out_device,
-        cudaStream_t *out_stream)
+        int *out_device)
     {
-        if (!scalar || !out_ptr || !out_device || !out_stream)
+        if (!scalar || !out_ptr || !out_device)
         {
             return set_error("invalid scalar arguments in get_scalar_limb_u64");
         }
@@ -1038,15 +836,8 @@ namespace
         {
             return status;
         }
-        cudaStream_t stream = nullptr;
-        status = matrix_limb_stream(scalar, limb_id, &stream);
-        if (status != 0)
-        {
-            return status;
-        }
         *out_ptr = ptr;
         *out_device = device;
-        *out_stream = stream;
         return 0;
     }
 
@@ -1104,26 +895,33 @@ namespace
         {
             return set_error(err);
         }
-
-        std::vector<T *> out_ptrs;
-        std::vector<const T *> lhs_ptrs;
-        std::vector<const T *> rhs_ptrs;
-        out_ptrs.reserve(count);
-        lhs_ptrs.reserve(count);
-        rhs_ptrs.reserve(count);
-        for (size_t idx = 0; idx < count; ++idx)
+        status = matrix_wait_limb_stream(lhs, limb_id, out_device, stream);
+        if (status != 0)
         {
-            const uint64_t *lhs_ptr = matrix_limb_ptr_by_id(lhs, idx, limb_id);
-            const uint64_t *rhs_ptr = matrix_limb_ptr_by_id(rhs, idx, limb_id);
-            uint64_t *out_ptr = matrix_limb_ptr_by_id(out, idx, limb_id);
-            if (!lhs_ptr || !rhs_ptr || !out_ptr)
-            {
-                return set_error("null matrix limb pointer in launch_matrix_elementwise_for_limb");
-            }
-            lhs_ptrs.push_back(reinterpret_cast<const T *>(lhs_ptr));
-            rhs_ptrs.push_back(reinterpret_cast<const T *>(rhs_ptr));
-            out_ptrs.push_back(reinterpret_cast<T *>(out_ptr));
+            return status;
         }
+        status = matrix_wait_limb_stream(rhs, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+
+        const uint64_t *lhs_base_u64 = matrix_limb_ptr_by_id(lhs, 0, limb_id);
+        const uint64_t *rhs_base_u64 = matrix_limb_ptr_by_id(rhs, 0, limb_id);
+        uint64_t *out_base_u64 = matrix_limb_ptr_by_id(out, 0, limb_id);
+        if (!lhs_base_u64 || !rhs_base_u64 || !out_base_u64)
+        {
+            return set_error("null matrix limb base pointer in launch_matrix_elementwise_for_limb");
+        }
+        if (limb_id.x >= lhs->shared_limb_buffers.size() ||
+            limb_id.x >= rhs->shared_limb_buffers.size() ||
+            limb_id.x >= out->shared_limb_buffers.size())
+        {
+            return set_error("invalid partition index in launch_matrix_elementwise_for_limb");
+        }
+        const size_t lhs_stride = lhs->shared_limb_buffers[limb_id.x].words_per_poly;
+        const size_t rhs_stride = rhs->shared_limb_buffers[limb_id.x].words_per_poly;
+        const size_t out_stride = out->shared_limb_buffers[limb_id.x].words_per_poly;
 
         if (static_cast<size_t>(limb) >= lhs->ctx->moduli.size())
         {
@@ -1131,7 +929,34 @@ namespace
         }
         const uint64_t modulus64 = lhs->ctx->moduli[static_cast<size_t>(limb)];
         const T modulus = static_cast<T>(modulus64);
-        return launch_block_kernel(out_ptrs, lhs_ptrs, rhs_ptrs, n, modulus, op, stream, out, &limb_id);
+        status = launch_block_kernel(
+            reinterpret_cast<const T *>(lhs_base_u64),
+            reinterpret_cast<const T *>(rhs_base_u64),
+            reinterpret_cast<T *>(out_base_u64),
+            count,
+            n,
+            lhs_stride,
+            rhs_stride,
+            out_stride,
+            modulus,
+            op,
+            stream,
+            0);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_track_limb_consumer(lhs, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_track_limb_consumer(rhs, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        return matrix_record_limb_write(out, limb_id, stream);
     }
 
     template <typename T>
@@ -1144,17 +969,13 @@ namespace
         size_t cols,
         size_t n,
         int limb,
-        const dim3 &limb_id,
-        double *out_kernel_ms)
+        const dim3 &limb_id)
     {
         if constexpr (!std::is_same_v<T, uint64_t>)
         {
             return set_error("unsupported matrix limb type in launch_matrix_matmul_for_limb");
         }
-        const size_t out_count = rows * cols;
-        const size_t lhs_count = rows * inner;
-        const size_t rhs_count = inner * cols;
-        if (out_count == 0 || n == 0)
+        if (rows == 0 || inner == 0 || cols == 0 || n == 0)
         {
             return 0;
         }
@@ -1193,53 +1014,33 @@ namespace
         {
             return set_error(err);
         }
+        status = matrix_wait_limb_stream(lhs, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_wait_limb_stream(rhs, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
 
-        std::vector<T *> out_ptrs;
-        std::vector<const T *> lhs_ptrs;
-        std::vector<const T *> rhs_ptrs;
-        out_ptrs.reserve(out_count);
-        lhs_ptrs.reserve(lhs_count);
-        rhs_ptrs.reserve(rhs_count);
-
-        for (size_t r = 0; r < rows; ++r)
+        const uint64_t *lhs_base_u64 = matrix_limb_ptr_by_id(lhs, 0, limb_id);
+        const uint64_t *rhs_base_u64 = matrix_limb_ptr_by_id(rhs, 0, limb_id);
+        uint64_t *out_base_u64 = matrix_limb_ptr_by_id(out, 0, limb_id);
+        if (!lhs_base_u64 || !rhs_base_u64 || !out_base_u64)
         {
-            for (size_t k = 0; k < inner; ++k)
-            {
-                const size_t idx = matrix_index(r, k, lhs->cols);
-                const uint64_t *lhs_ptr = matrix_limb_ptr_by_id(lhs, idx, limb_id);
-                if (!lhs_ptr)
-                {
-                    return set_error("null lhs pointer in launch_matrix_matmul_for_limb");
-                }
-                lhs_ptrs.push_back(reinterpret_cast<const T *>(lhs_ptr));
-            }
+            return set_error("null matrix limb base pointer in launch_matrix_matmul_for_limb");
         }
-        for (size_t k = 0; k < inner; ++k)
+        if (limb_id.x >= lhs->shared_limb_buffers.size() ||
+            limb_id.x >= rhs->shared_limb_buffers.size() ||
+            limb_id.x >= out->shared_limb_buffers.size())
         {
-            for (size_t c = 0; c < cols; ++c)
-            {
-                const size_t idx = matrix_index(k, c, rhs->cols);
-                const uint64_t *rhs_ptr = matrix_limb_ptr_by_id(rhs, idx, limb_id);
-                if (!rhs_ptr)
-                {
-                    return set_error("null rhs pointer in launch_matrix_matmul_for_limb");
-                }
-                rhs_ptrs.push_back(reinterpret_cast<const T *>(rhs_ptr));
-            }
+            return set_error("invalid partition index in launch_matrix_matmul_for_limb");
         }
-        for (size_t r = 0; r < rows; ++r)
-        {
-            for (size_t c = 0; c < cols; ++c)
-            {
-                const size_t idx = matrix_index(r, c, out->cols);
-                uint64_t *out_ptr = matrix_limb_ptr_by_id(out, idx, limb_id);
-                if (!out_ptr)
-                {
-                    return set_error("null out pointer in launch_matrix_matmul_for_limb");
-                }
-                out_ptrs.push_back(reinterpret_cast<T *>(out_ptr));
-            }
-        }
+        const size_t lhs_stride = lhs->shared_limb_buffers[limb_id.x].words_per_poly;
+        const size_t rhs_stride = rhs->shared_limb_buffers[limb_id.x].words_per_poly;
+        const size_t out_stride = out->shared_limb_buffers[limb_id.x].words_per_poly;
 
         if (static_cast<size_t>(limb) >= lhs->ctx->moduli.size())
         {
@@ -1247,19 +1048,36 @@ namespace
         }
         const uint64_t modulus64 = lhs->ctx->moduli[static_cast<size_t>(limb)];
         const T modulus = static_cast<T>(modulus64);
-        return launch_block_matmul_kernel(
-            out_ptrs,
-            lhs_ptrs,
-            rhs_ptrs,
+        status = launch_block_matmul_kernel(
+            reinterpret_cast<const T *>(lhs_base_u64),
+            reinterpret_cast<const T *>(rhs_base_u64),
+            reinterpret_cast<T *>(out_base_u64),
             rows,
             inner,
             cols,
             n,
+            lhs_stride,
+            rhs_stride,
+            out_stride,
             modulus,
             stream,
-            out_kernel_ms,
             out,
             &limb_id);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_track_limb_consumer(lhs, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_track_limb_consumer(rhs, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        return matrix_record_limb_write(out, limb_id, stream);
     }
 
     template <typename T>
@@ -1300,8 +1118,7 @@ namespace
 
         const uint64_t *scalar_ptr = nullptr;
         int scalar_device = -1;
-        cudaStream_t scalar_stream = nullptr;
-        status = get_scalar_limb_u64(scalar, limb_id, &scalar_ptr, &scalar_device, &scalar_stream);
+        status = get_scalar_limb_u64(scalar, limb_id, &scalar_ptr, &scalar_device);
         if (status != 0)
         {
             return status;
@@ -1322,31 +1139,31 @@ namespace
         {
             return set_error(err);
         }
-        status = arith_wait_stream_on_stream(out_device, stream, scalar_stream);
+        status = matrix_wait_limb_stream(lhs, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_wait_limb_stream(scalar, limb_id, out_device, stream);
         if (status != 0)
         {
             return status;
         }
 
-        std::vector<T *> out_ptrs;
-        std::vector<const T *> lhs_ptrs;
-        std::vector<const T *> rhs_ptrs;
-        out_ptrs.reserve(count);
-        lhs_ptrs.reserve(count);
-        rhs_ptrs.reserve(count);
-        const T *scalar_ptr_t = reinterpret_cast<const T *>(scalar_ptr);
-        for (size_t idx = 0; idx < count; ++idx)
+        const uint64_t *lhs_base_u64 = matrix_limb_ptr_by_id(lhs, 0, limb_id);
+        uint64_t *out_base_u64 = matrix_limb_ptr_by_id(out, 0, limb_id);
+        if (!lhs_base_u64 || !out_base_u64)
         {
-            const uint64_t *lhs_ptr = matrix_limb_ptr_by_id(lhs, idx, limb_id);
-            uint64_t *out_ptr = matrix_limb_ptr_by_id(out, idx, limb_id);
-            if (!lhs_ptr || !out_ptr)
-            {
-                return set_error("null matrix limb pointer in launch_matrix_scalar_mul_for_limb");
-            }
-            lhs_ptrs.push_back(reinterpret_cast<const T *>(lhs_ptr));
-            rhs_ptrs.push_back(scalar_ptr_t);
-            out_ptrs.push_back(reinterpret_cast<T *>(out_ptr));
+            return set_error("null matrix limb base pointer in launch_matrix_scalar_mul_for_limb");
         }
+        if (limb_id.x >= lhs->shared_limb_buffers.size() || limb_id.x >= out->shared_limb_buffers.size() ||
+            limb_id.x >= scalar->shared_limb_buffers.size())
+        {
+            return set_error("invalid partition index in launch_matrix_scalar_mul_for_limb");
+        }
+        const size_t lhs_stride = lhs->shared_limb_buffers[limb_id.x].words_per_poly;
+        const size_t out_stride = out->shared_limb_buffers[limb_id.x].words_per_poly;
+        const size_t scalar_stride = scalar->shared_limb_buffers[limb_id.x].words_per_poly;
 
         if (static_cast<size_t>(limb) >= lhs->ctx->moduli.size())
         {
@@ -1354,16 +1171,34 @@ namespace
         }
         const uint64_t modulus64 = lhs->ctx->moduli[static_cast<size_t>(limb)];
         const T modulus = static_cast<T>(modulus64);
-        return launch_block_kernel(
-            out_ptrs,
-            lhs_ptrs,
-            rhs_ptrs,
+        status = launch_block_kernel(
+            reinterpret_cast<const T *>(lhs_base_u64),
+            reinterpret_cast<const T *>(scalar_ptr),
+            reinterpret_cast<T *>(out_base_u64),
+            count,
             n,
+            lhs_stride,
+            scalar_stride,
+            out_stride,
             modulus,
             BlockOp::Mul,
             stream,
-            out,
-            &limb_id);
+            1);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_track_limb_consumer(lhs, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_track_limb_consumer(scalar, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        return matrix_record_limb_write(out, limb_id, stream);
     }
 
     template <typename T>
@@ -1413,6 +1248,11 @@ namespace
         {
             return set_error(err);
         }
+        status = matrix_wait_limb_stream(rhs, limb_id, lhs_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
 
         std::vector<const T *> lhs_ptrs;
         std::vector<const T *> rhs_ptrs;
@@ -1435,21 +1275,6 @@ namespace
 
 } // namespace
 
-int launch_fill_gadget_multi_limb_kernel(
-    const std::vector<uint64_t *> &dst_ptrs,
-    size_t poly_count,
-    size_t n,
-    const std::vector<uint64_t> &moduli,
-    const std::vector<uint32_t> &limb_indices,
-    size_t rows,
-    size_t cols,
-    size_t log_base_q,
-    uint32_t digits_per_tower,
-    uint32_t base_bits,
-    cudaStream_t stream,
-    const GpuMatrix *aux_owner,
-    const dim3 *aux_limb_id);
-
 int launch_sample_p1_integer_kernel(
     const std::vector<const uint64_t *> &a_entries,
     const std::vector<const uint64_t *> &b_entries,
@@ -1466,6 +1291,7 @@ int launch_sample_p1_integer_kernel(
     cudaStream_t stream,
     int device_id,
     int64_t **sampled_out_device,
+    cudaEvent_t sampled_ready_event,
     const GpuMatrix *aux_owner,
     const dim3 *aux_limb_id);
 
@@ -1498,7 +1324,7 @@ extern "C" int gpu_matrix_add(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     {
         return set_error("context mismatch in gpu_matrix_add");
     }
-    if (!lhs->ctx || !lhs->ctx->ctx)
+    if (!lhs->ctx)
     {
         return set_error("null context in gpu_matrix_add");
     }
@@ -1522,17 +1348,17 @@ extern "C" int gpu_matrix_add(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
         out->format = GPU_POLY_FORMAT_EVAL;
         return 0;
     }
-
-    auto &limb_map = lhs->ctx->ctx->limbGPUid;
+    auto &limb_map = lhs->ctx->limb_gpu_ids;
     if (limb_map.size() < static_cast<size_t>(level + 1))
     {
         return set_error("unexpected limb mapping size in gpu_matrix_add");
     }
 
+    int status = 0;
     for (int limb = 0; limb <= level; ++limb)
     {
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        int status = launch_matrix_elementwise_for_limb<uint64_t>(
+        status = launch_matrix_elementwise_for_limb<uint64_t>(
             out,
             lhs,
             rhs,
@@ -1570,7 +1396,7 @@ extern "C" int gpu_matrix_sub(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     {
         return set_error("context mismatch in gpu_matrix_sub");
     }
-    if (!lhs->ctx || !lhs->ctx->ctx)
+    if (!lhs->ctx)
     {
         return set_error("null context in gpu_matrix_sub");
     }
@@ -1594,17 +1420,17 @@ extern "C" int gpu_matrix_sub(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
         out->format = lhs->format;
         return 0;
     }
-
-    auto &limb_map = lhs->ctx->ctx->limbGPUid;
+    auto &limb_map = lhs->ctx->limb_gpu_ids;
     if (limb_map.size() < static_cast<size_t>(level + 1))
     {
         return set_error("unexpected limb mapping size in gpu_matrix_sub");
     }
 
+    int status = 0;
     for (int limb = 0; limb <= level; ++limb)
     {
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        int status = launch_matrix_elementwise_for_limb<uint64_t>(
+        status = launch_matrix_elementwise_for_limb<uint64_t>(
             out,
             lhs,
             rhs,
@@ -1642,7 +1468,7 @@ extern "C" int gpu_matrix_mul(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     {
         return set_error("context mismatch in gpu_matrix_mul");
     }
-    if (!lhs->ctx || !lhs->ctx->ctx)
+    if (!lhs->ctx)
     {
         return set_error("null context in gpu_matrix_mul");
     }
@@ -1662,17 +1488,17 @@ extern "C" int gpu_matrix_mul(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
         out->format = GPU_POLY_FORMAT_EVAL;
         return 0;
     }
-
-    auto &limb_map = lhs->ctx->ctx->limbGPUid;
+    auto &limb_map = lhs->ctx->limb_gpu_ids;
     if (limb_map.size() < static_cast<size_t>(level + 1))
     {
         return set_error("unexpected limb mapping size in gpu_matrix_mul");
     }
 
+    int status = 0;
     for (int limb = 0; limb <= level; ++limb)
     {
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        int status = launch_matrix_matmul_for_limb<uint64_t>(
+        status = launch_matrix_matmul_for_limb<uint64_t>(
             out,
             lhs,
             rhs,
@@ -1681,8 +1507,7 @@ extern "C" int gpu_matrix_mul(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
             rhs->cols,
             static_cast<size_t>(N),
             limb,
-            limb_id,
-            nullptr);
+            limb_id);
         if (status != 0)
         {
             return status;
@@ -1714,7 +1539,7 @@ extern "C" int gpu_matrix_equal(const GpuMatrix *lhs, const GpuMatrix *rhs, int 
     {
         return 0;
     }
-    if (!lhs->ctx || !lhs->ctx->ctx)
+    if (!lhs->ctx)
     {
         return set_error("null context in gpu_matrix_equal");
     }
@@ -1734,17 +1559,18 @@ extern "C" int gpu_matrix_equal(const GpuMatrix *lhs, const GpuMatrix *rhs, int 
         *out_equal = 1;
         return 0;
     }
-    auto &limb_map = lhs->ctx->ctx->limbGPUid;
+    auto &limb_map = lhs->ctx->limb_gpu_ids;
     if (limb_map.size() < static_cast<size_t>(level + 1))
     {
         return set_error("unexpected limb mapping size in gpu_matrix_equal");
     }
 
+    int status = 0;
     for (int limb = 0; limb <= level; ++limb)
     {
         bool limb_equal = false;
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        int status = launch_matrix_equal_for_limb<uint64_t>(
+        status = launch_matrix_equal_for_limb<uint64_t>(
             lhs,
             rhs,
             count,
@@ -1762,85 +1588,6 @@ extern "C" int gpu_matrix_equal(const GpuMatrix *lhs, const GpuMatrix *rhs, int 
     }
 
     *out_equal = 1;
-    return 0;
-}
-
-extern "C" int gpu_matrix_mul_timed(
-    GpuMatrix *out,
-    const GpuMatrix *lhs,
-    const GpuMatrix *rhs,
-    double *out_kernel_ms)
-{
-    if (!out_kernel_ms)
-    {
-        return set_error("null out_kernel_ms in gpu_matrix_mul_timed");
-    }
-    *out_kernel_ms = 0.0;
-    if (!out || !lhs || !rhs)
-    {
-        return set_error("invalid gpu_matrix_mul_timed arguments");
-    }
-    if (lhs->cols != rhs->rows)
-    {
-        return set_error("size mismatch in gpu_matrix_mul_timed");
-    }
-    if (out->rows != lhs->rows || out->cols != rhs->cols)
-    {
-        return set_error("output size mismatch in gpu_matrix_mul_timed");
-    }
-    if (lhs->ctx != rhs->ctx || lhs->ctx != out->ctx || lhs->level != rhs->level ||
-        lhs->level != out->level)
-    {
-        return set_error("context mismatch in gpu_matrix_mul_timed");
-    }
-    if (!lhs->ctx || !lhs->ctx->ctx)
-    {
-        return set_error("null context in gpu_matrix_mul_timed");
-    }
-    if (lhs->format != GPU_POLY_FORMAT_EVAL || rhs->format != GPU_POLY_FORMAT_EVAL)
-    {
-        return set_error("gpu_matrix_mul_timed requires Eval format");
-    }
-
-    const int level = lhs->level;
-    if (level < 0)
-    {
-        return set_error("invalid level in gpu_matrix_mul_timed");
-    }
-    const int N = lhs->ctx->N;
-    if (N <= 0)
-    {
-        out->format = GPU_POLY_FORMAT_EVAL;
-        return 0;
-    }
-
-    auto &limb_map = lhs->ctx->ctx->limbGPUid;
-    if (limb_map.size() < static_cast<size_t>(level + 1))
-    {
-        return set_error("unexpected limb mapping size in gpu_matrix_mul_timed");
-    }
-
-    for (int limb = 0; limb <= level; ++limb)
-    {
-        const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        int status = launch_matrix_matmul_for_limb<uint64_t>(
-            out,
-            lhs,
-            rhs,
-            lhs->rows,
-            lhs->cols,
-            rhs->cols,
-            static_cast<size_t>(N),
-            limb,
-            limb_id,
-            out_kernel_ms);
-        if (status != 0)
-        {
-            return status;
-        }
-    }
-
-    out->format = GPU_POLY_FORMAT_EVAL;
     return 0;
 }
 
@@ -1869,7 +1616,7 @@ extern "C" int gpu_matrix_mul_scalar(
     {
         return set_error("scalar context mismatch in gpu_matrix_mul_scalar");
     }
-    if (!lhs->ctx || !lhs->ctx->ctx)
+    if (!lhs->ctx)
     {
         return set_error("null context in gpu_matrix_mul_scalar");
     }
@@ -1895,17 +1642,17 @@ extern "C" int gpu_matrix_mul_scalar(
         out->format = lhs->format;
         return 0;
     }
-
-    auto &limb_map = lhs->ctx->ctx->limbGPUid;
+    auto &limb_map = lhs->ctx->limb_gpu_ids;
     if (limb_map.size() < static_cast<size_t>(level + 1))
     {
         return set_error("unexpected limb mapping size in gpu_matrix_mul_scalar");
     }
 
+    int status = 0;
     for (int limb = 0; limb <= level; ++limb)
     {
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        int status = launch_matrix_scalar_mul_for_limb<uint64_t>(
+        status = launch_matrix_scalar_mul_for_limb<uint64_t>(
             out,
             lhs,
             scalar,

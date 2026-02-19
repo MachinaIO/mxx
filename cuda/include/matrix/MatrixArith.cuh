@@ -11,7 +11,6 @@ extern "C"
     int gpu_matrix_sub(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs);
     int gpu_matrix_mul(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs);
     int gpu_matrix_equal(const GpuMatrix *lhs, const GpuMatrix *rhs, int *out_equal);
-    int gpu_matrix_mul_timed(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs, double *out_kernel_ms);
     int gpu_matrix_mul_scalar(
         GpuMatrix *out,
         const GpuMatrix *lhs,

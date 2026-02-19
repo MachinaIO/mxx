@@ -353,7 +353,7 @@ namespace
     template <bool Forward>
     int run_matrix_transform_u64(GpuMatrix *mat)
     {
-        if (!mat || !mat->ctx || !mat->ctx->ctx)
+        if (!mat || !mat->ctx)
         {
             return set_error("invalid matrix in run_matrix_transform_u64");
         }
@@ -367,16 +367,29 @@ namespace
         }
 
         const uint32_t n = static_cast<uint32_t>(mat->ctx->N);
-        const uint32_t log_n = static_cast<uint32_t>(mat->ctx->ctx->logN);
-        if (!is_power_of_two_u32(n) || (1U << log_n) != n || log_n == 0)
+        uint32_t log_n = 0;
+        uint32_t tmp_n = n;
+        while ((tmp_n & 1U) == 0U && tmp_n > 1U)
+        {
+            ++log_n;
+            tmp_n >>= 1U;
+        }
+        if (!is_power_of_two_u32(n) || tmp_n != 1U || log_n == 0)
         {
             return set_error("invalid ring size/logN in run_matrix_transform_u64");
         }
 
-        auto &limb_map = mat->ctx->ctx->limbGPUid;
+        auto &limb_map = mat->ctx->limb_gpu_ids;
+        auto &limb_types = mat->ctx->limb_types;
+        auto &limb_prime_ids = mat->ctx->limb_prime_ids;
         if (limb_map.size() < static_cast<size_t>(mat->level + 1))
         {
             return set_error("unexpected limb mapping size in run_matrix_transform_u64");
+        }
+        if (limb_types.size() < static_cast<size_t>(mat->level + 1) ||
+            limb_prime_ids.size() < static_cast<size_t>(mat->level + 1))
+        {
+            return set_error("unexpected limb metadata size in run_matrix_transform_u64");
         }
 
         const size_t poly_count = matrix_poly_count(mat);
@@ -411,18 +424,17 @@ namespace
             {
                 return status;
             }
-
-            if (limb_id.x >= mat->ctx->ctx->meta.size() ||
-                limb_id.y >= mat->ctx->ctx->meta[limb_id.x].size())
+            status = matrix_wait_limb_stream(mat, limb_id, device, stream);
+            if (status != 0)
             {
-                return set_error("invalid limb metadata in run_matrix_transform_u64");
+                return status;
             }
-            const auto &record = mat->ctx->ctx->meta[limb_id.x][limb_id.y];
-            if (record.type != FIDESlib::U64)
+
+            if (limb_types[static_cast<size_t>(limb)] != FIDESlib::U64)
             {
                 return set_error("unsupported limb type in run_matrix_transform_u64");
             }
-            const int primeid = record.id;
+            const int primeid = limb_prime_ids[static_cast<size_t>(limb)];
             if (primeid < 0 || primeid >= FIDESlib::MAXP || limb_id.x >= FIDESlib::MAXD)
             {
                 return set_error("invalid prime/device index in run_matrix_transform_u64");
@@ -465,6 +477,11 @@ namespace
             {
                 return status;
             }
+            status = matrix_record_limb_write(mat, limb_id, stream);
+            if (status != 0)
+            {
+                return status;
+            }
         }
 
         mat->format = Forward ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
@@ -475,7 +492,7 @@ namespace
 int gpu_matrix_ntt_all(GpuMatrix *mat, int batch)
 {
     (void)batch;
-    if (!mat || !mat->ctx || !mat->ctx->ctx)
+    if (!mat || !mat->ctx)
     {
         return set_error("invalid gpu_matrix_ntt_all arguments");
     }
@@ -489,7 +506,7 @@ int gpu_matrix_ntt_all(GpuMatrix *mat, int batch)
 int gpu_matrix_intt_all(GpuMatrix *mat, int batch)
 {
     (void)batch;
-    if (!mat || !mat->ctx || !mat->ctx->ctx)
+    if (!mat || !mat->ctx)
     {
         return set_error("invalid gpu_matrix_intt_all arguments");
     }

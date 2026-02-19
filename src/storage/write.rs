@@ -679,6 +679,7 @@ pub fn get_lookup_buffer_bytes(
     payloads: Vec<(usize, Vec<u8>)>,
     id_prefix: &str,
 ) -> BatchLookupBuffer {
+    let start = Instant::now();
     debug_assert!(!payloads.is_empty(), "payloads must be non-empty");
     let bytes_per_matrix = payloads[0].1.len();
     debug_assert!(
@@ -702,6 +703,14 @@ pub fn get_lookup_buffer_bytes(
         let offset = header_size + i * bytes_per_matrix;
         encoded[offset..offset + bytes_per_matrix].copy_from_slice(&bytes);
     }
+    let elapsed = start.elapsed();
+    debug!(
+        "{}",
+        format!(
+            "Serialized {} matrices for {} ({} bytes, {} bytes per matrix) in {elapsed:?}",
+            num_matrices, id_prefix, total_size, bytes_per_matrix
+        )
+    );
     BatchLookupBuffer {
         data: encoded,
         num_matrices,

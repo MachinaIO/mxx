@@ -1,10 +1,14 @@
 constexpr size_t kSampleP1LocalMaxM = 8;
 
 __global__ void matrix_sample_p1_integer_kernel_small(
-    const uint64_t **a_entries,
-    const uint64_t **b_entries,
-    const uint64_t **d_entries,
-    const uint64_t **tp2_entries,
+    const uint64_t *a_base,
+    const uint64_t *b_base,
+    const uint64_t *d_base,
+    const uint64_t *tp2_base,
+    size_t a_stride,
+    size_t b_stride,
+    size_t d_stride,
+    size_t tp2_stride,
     size_t d,
     size_t cols,
     size_t n,
@@ -61,10 +65,18 @@ __global__ void matrix_sample_p1_integer_kernel_small(
         {
             const size_t ij = matrix_index(i, j, d);
             const size_t ji = matrix_index(j, i, d);
-            const double a_ij = static_cast<double>(centered_residue_i64(a_entries[ij][coeff_idx], modulus));
-            const double d_ij = static_cast<double>(centered_residue_i64(d_entries[ij][coeff_idx], modulus));
-            const double b_ij = static_cast<double>(centered_residue_i64(b_entries[ij][coeff_idx], modulus));
-            const double b_ji = static_cast<double>(centered_residue_i64(b_entries[ji][coeff_idx], modulus));
+            const double a_ij = static_cast<double>(centered_residue_i64(
+                a_base[ij * a_stride + coeff_idx],
+                modulus));
+            const double d_ij = static_cast<double>(centered_residue_i64(
+                d_base[ij * d_stride + coeff_idx],
+                modulus));
+            const double b_ij = static_cast<double>(centered_residue_i64(
+                b_base[ij * b_stride + coeff_idx],
+                modulus));
+            const double b_ji = static_cast<double>(centered_residue_i64(
+                b_base[ji * b_stride + coeff_idx],
+                modulus));
 
             const double af = -sigma2 * a_ij + (i == j ? s2 : 0.0);
             const double df = -sigma2 * d_ij + (i == j ? s2 : 0.0);
@@ -81,7 +93,9 @@ __global__ void matrix_sample_p1_integer_kernel_small(
     for (size_t row = 0; row < m; ++row)
     {
         const size_t tp_idx = matrix_index(row, col_idx, cols);
-        const double c_centered = static_cast<double>(centered_residue_i64(tp2_entries[tp_idx][coeff_idx], modulus));
+        const double c_centered = static_cast<double>(centered_residue_i64(
+            tp2_base[tp_idx * tp2_stride + coeff_idx],
+            modulus));
         mean[row] = c_scale * c_centered;
     }
 
@@ -135,10 +149,14 @@ __global__ void matrix_sample_p1_integer_kernel_small(
 }
 
 __global__ void matrix_sample_p1_integer_kernel_large(
-    const uint64_t **a_entries,
-    const uint64_t **b_entries,
-    const uint64_t **d_entries,
-    const uint64_t **tp2_entries,
+    const uint64_t *a_base,
+    const uint64_t *b_base,
+    const uint64_t *d_base,
+    const uint64_t *tp2_base,
+    size_t a_stride,
+    size_t b_stride,
+    size_t d_stride,
+    size_t tp2_stride,
     size_t d,
     size_t cols,
     size_t n,
@@ -203,10 +221,18 @@ __global__ void matrix_sample_p1_integer_kernel_large(
         {
             const size_t ij = matrix_index(i, j, d);
             const size_t ji = matrix_index(j, i, d);
-            const double a_ij = static_cast<double>(centered_residue_i64(a_entries[ij][coeff_idx], modulus));
-            const double d_ij = static_cast<double>(centered_residue_i64(d_entries[ij][coeff_idx], modulus));
-            const double b_ij = static_cast<double>(centered_residue_i64(b_entries[ij][coeff_idx], modulus));
-            const double b_ji = static_cast<double>(centered_residue_i64(b_entries[ji][coeff_idx], modulus));
+            const double a_ij = static_cast<double>(centered_residue_i64(
+                a_base[ij * a_stride + coeff_idx],
+                modulus));
+            const double d_ij = static_cast<double>(centered_residue_i64(
+                d_base[ij * d_stride + coeff_idx],
+                modulus));
+            const double b_ij = static_cast<double>(centered_residue_i64(
+                b_base[ij * b_stride + coeff_idx],
+                modulus));
+            const double b_ji = static_cast<double>(centered_residue_i64(
+                b_base[ji * b_stride + coeff_idx],
+                modulus));
 
             const double af = -sigma2 * a_ij + (i == j ? s2 : 0.0);
             const double df = -sigma2 * d_ij + (i == j ? s2 : 0.0);
@@ -223,7 +249,9 @@ __global__ void matrix_sample_p1_integer_kernel_large(
     for (size_t row = 0; row < m; ++row)
     {
         const size_t tp_idx = matrix_index(row, col_idx, cols);
-        const double c_centered = static_cast<double>(centered_residue_i64(tp2_entries[tp_idx][coeff_idx], modulus));
+        const double c_centered = static_cast<double>(centered_residue_i64(
+            tp2_base[tp_idx * tp2_stride + coeff_idx],
+            modulus));
         mean[row] = c_scale * c_centered;
     }
 
@@ -278,7 +306,8 @@ __global__ void matrix_sample_p1_integer_kernel_large(
 
 __global__ void matrix_scatter_p1_integer_to_limb_kernel(
     const int64_t *sampled_in,
-    uint64_t **out_entries,
+    uint64_t *out_base,
+    size_t out_stride,
     size_t entry_count,
     size_t n,
     uint64_t modulus)
@@ -292,7 +321,7 @@ __global__ void matrix_scatter_p1_integer_to_limb_kernel(
 
     const size_t entry_idx = idx / n;
     const size_t coeff_idx = idx - entry_idx * n;
-    out_entries[entry_idx][coeff_idx] = signed_mod_i64(sampled_in[idx], modulus);
+    out_base[entry_idx * out_stride + coeff_idx] = signed_mod_i64(sampled_in[idx], modulus);
 }
 
 __global__ void matrix_gauss_samp_gq_arb_base_multi_kernel(
@@ -508,10 +537,14 @@ int launch_gauss_samp_gq_arb_base_multi_kernel(
 
 
 int launch_sample_p1_integer_kernel(
-    const std::vector<const uint64_t *> &a_entries,
-    const std::vector<const uint64_t *> &b_entries,
-    const std::vector<const uint64_t *> &d_entries,
-    const std::vector<const uint64_t *> &tp2_entries,
+    const uint64_t *a_base,
+    const uint64_t *b_base,
+    const uint64_t *d_base,
+    const uint64_t *tp2_base,
+    size_t a_stride,
+    size_t b_stride,
+    size_t d_stride,
+    size_t tp2_stride,
     size_t d,
     size_t cols,
     size_t n,
@@ -523,26 +556,26 @@ int launch_sample_p1_integer_kernel(
     cudaStream_t stream,
     int device_id,
     int64_t **sampled_out_device,
-    cudaEvent_t sampled_ready_event,
-    const GpuMatrix *aux_owner,
-    const dim3 *aux_limb_id)
+    cudaEvent_t sampled_ready_event)
 {
     if (!sampled_out_device)
     {
         return set_error("null output pointer in matrix_sample_p1_integer_kernel");
     }
     *sampled_out_device = nullptr;
+    if (!a_base || !b_base || !d_base || !tp2_base)
+    {
+        return set_error("null base pointer in matrix_sample_p1_integer_kernel");
+    }
+    if (a_stride < n || b_stride < n || d_stride < n || tp2_stride < n)
+    {
+        return set_error("invalid stride in matrix_sample_p1_integer_kernel");
+    }
     if (d == 0 || cols == 0 || n == 0)
     {
         return 0;
     }
-    const size_t mat_entries = d * d;
     const size_t vec_entries = 2 * d * cols;
-    if (a_entries.size() != mat_entries || b_entries.size() != mat_entries ||
-        d_entries.size() != mat_entries || tp2_entries.size() != vec_entries)
-    {
-        return set_error("unexpected pointer counts in matrix_sample_p1_integer_kernel");
-    }
 
     if (device_id < 0)
     {
@@ -566,72 +599,15 @@ int launch_sample_p1_integer_kernel(
         return 0;
     }
 
-    const size_t mat_bytes = mat_entries * sizeof(uint64_t *);
-    const size_t vec_bytes = vec_entries * sizeof(uint64_t *);
-    const size_t b_offset = matrix_align_up_size(mat_bytes, alignof(uint64_t *));
-    const size_t d_offset = matrix_align_up_size(b_offset + mat_bytes, alignof(uint64_t *));
-    const size_t tp2_offset = matrix_align_up_size(d_offset + mat_bytes, alignof(uint64_t *));
-    const size_t metadata_bytes = tp2_offset + vec_bytes;
-
-    void *metadata_workspace = nullptr;
-    bool metadata_from_shared = false;
-    int status = matrix_acquire_aux_workspace(
-        aux_owner,
-        aux_limb_id,
-        metadata_bytes,
-        &metadata_workspace,
-        &metadata_from_shared,
-        stream);
-    if (status != 0)
-    {
-        return status;
-    }
-
-    auto *metadata_base = reinterpret_cast<uint8_t *>(metadata_workspace);
-    const uint64_t **d_a_entries = reinterpret_cast<const uint64_t **>(metadata_base);
-    const uint64_t **d_b_entries = reinterpret_cast<const uint64_t **>(metadata_base + b_offset);
-    const uint64_t **d_d_entries = reinterpret_cast<const uint64_t **>(metadata_base + d_offset);
-    const uint64_t **d_tp2_entries =
-        reinterpret_cast<const uint64_t **>(metadata_base + tp2_offset);
     int64_t *d_sampled_out = nullptr;
 
     auto free_all = [&]()
     {
         if (d_sampled_out)
             cudaFree(d_sampled_out);
-        if (metadata_workspace)
-        {
-            matrix_release_aux_workspace(metadata_workspace, metadata_from_shared, stream);
-            metadata_workspace = nullptr;
-        }
     };
 
     err = cudaMalloc(&d_sampled_out, total_values * sizeof(int64_t));
-    if (err != cudaSuccess)
-    {
-        free_all();
-        return set_error(err);
-    }
-
-    err = cudaMemcpyAsync(d_a_entries, a_entries.data(), mat_bytes, cudaMemcpyHostToDevice, stream);
-    if (err != cudaSuccess)
-    {
-        free_all();
-        return set_error(err);
-    }
-    err = cudaMemcpyAsync(d_b_entries, b_entries.data(), mat_bytes, cudaMemcpyHostToDevice, stream);
-    if (err != cudaSuccess)
-    {
-        free_all();
-        return set_error(err);
-    }
-    err = cudaMemcpyAsync(d_d_entries, d_entries.data(), mat_bytes, cudaMemcpyHostToDevice, stream);
-    if (err != cudaSuccess)
-    {
-        free_all();
-        return set_error(err);
-    }
-    err = cudaMemcpyAsync(d_tp2_entries, tp2_entries.data(), vec_bytes, cudaMemcpyHostToDevice, stream);
     if (err != cudaSuccess)
     {
         free_all();
@@ -643,10 +619,14 @@ int launch_sample_p1_integer_kernel(
     {
         const int blocks = static_cast<int>((total_samples + threads - 1) / threads);
         matrix_sample_p1_integer_kernel_small<<<blocks, threads, 0, stream>>>(
-            d_a_entries,
-            d_b_entries,
-            d_d_entries,
-            d_tp2_entries,
+            a_base,
+            b_base,
+            d_base,
+            tp2_base,
+            a_stride,
+            b_stride,
+            d_stride,
+            tp2_stride,
             d,
             cols,
             n,
@@ -779,10 +759,14 @@ int launch_sample_p1_integer_kernel(
             size_t sample_count = std::min(chunk_samples, total_samples - sample_start);
             const int blocks = static_cast<int>((sample_count + threads - 1) / threads);
             matrix_sample_p1_integer_kernel_large<<<blocks, threads, 0, stream>>>(
-                d_a_entries,
-                d_b_entries,
-                d_d_entries,
-                d_tp2_entries,
+                a_base,
+                b_base,
+                d_base,
+                tp2_base,
+                a_stride,
+                b_stride,
+                d_stride,
+                tp2_stride,
                 d,
                 cols,
                 n,
@@ -827,15 +811,15 @@ int launch_sample_p1_integer_kernel(
 
 int launch_scatter_p1_integer_to_limb_kernel_device(
     const int64_t *sampled_in_device,
-    const std::vector<uint64_t *> &out_entries,
+    uint64_t *out_base,
+    size_t out_stride,
+    size_t entry_count,
     size_t n,
     uint64_t modulus,
     cudaStream_t stream,
-    int device_id,
-    const GpuMatrix *aux_owner,
-    const dim3 *aux_limb_id)
+    int device_id)
 {
-    if (out_entries.empty() || n == 0)
+    if (entry_count == 0 || n == 0)
     {
         return 0;
     }
@@ -843,11 +827,19 @@ int launch_scatter_p1_integer_to_limb_kernel_device(
     {
         return set_error("null sampled device buffer in matrix_scatter_p1_integer_to_limb_kernel");
     }
+    if (!out_base)
+    {
+        return set_error("null output base pointer in matrix_scatter_p1_integer_to_limb_kernel");
+    }
+    if (out_stride < n)
+    {
+        return set_error("invalid output stride in matrix_scatter_p1_integer_to_limb_kernel");
+    }
     if (device_id < 0)
     {
         return set_error("invalid device in matrix_scatter_p1_integer_to_limb_kernel");
     }
-    const size_t total = out_entries.size() * n;
+    const size_t total = entry_count * n;
 
     cudaError_t err = cudaSetDevice(device_id);
     if (err != cudaSuccess)
@@ -855,50 +847,19 @@ int launch_scatter_p1_integer_to_limb_kernel_device(
         return set_error(err);
     }
 
-    const size_t out_ptr_bytes = out_entries.size() * sizeof(uint64_t *);
-    void *workspace = nullptr;
-    bool from_shared = false;
-    int status = matrix_acquire_aux_workspace(
-        aux_owner,
-        aux_limb_id,
-        out_ptr_bytes,
-        &workspace,
-        &from_shared,
-        stream);
-    if (status != 0)
-    {
-        return status;
-    }
-    auto cleanup_workspace = [&]() -> int {
-        return matrix_release_aux_workspace(workspace, from_shared, stream);
-    };
-    uint64_t **d_out_entries = reinterpret_cast<uint64_t **>(workspace);
-
-    err = cudaMemcpyAsync(d_out_entries, out_entries.data(), out_ptr_bytes, cudaMemcpyHostToDevice, stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_workspace();
-        return set_error(err);
-    }
-
     const int threads = 256;
     const int blocks = static_cast<int>((total + threads - 1) / threads);
     matrix_scatter_p1_integer_to_limb_kernel<<<blocks, threads, 0, stream>>>(
         sampled_in_device,
-        d_out_entries,
-        out_entries.size(),
+        out_base,
+        out_stride,
+        entry_count,
         n,
         modulus);
     err = cudaGetLastError();
     if (err != cudaSuccess)
     {
-        cleanup_workspace();
         return set_error(err);
-    }
-    status = cleanup_workspace();
-    if (status != 0)
-    {
-        return status;
     }
     return 0;
 }
@@ -1439,49 +1400,27 @@ extern "C" int gpu_matrix_sample_p1_full(
         cleanup();
         return set_error("input/output limb device mismatch in gpu_matrix_sample_p1_full");
     }
-
-    std::vector<const uint64_t *> ref_a_entry_ptrs;
-    std::vector<const uint64_t *> ref_b_entry_ptrs;
-    std::vector<const uint64_t *> ref_d_entry_ptrs;
-    std::vector<const uint64_t *> ref_tp2_entry_ptrs;
-    ref_a_entry_ptrs.reserve(d_rows * d_rows);
-    ref_b_entry_ptrs.reserve(d_rows * d_rows);
-    ref_d_entry_ptrs.reserve(d_rows * d_rows);
-    ref_tp2_entry_ptrs.reserve(2 * d_rows * cols);
-
-    for (size_t i = 0; i < d_rows; ++i)
+    const uint64_t *ref_a_base = matrix_limb_ptr_by_id(a_input, 0, ref_limb_id);
+    const uint64_t *ref_b_base = matrix_limb_ptr_by_id(b_input, 0, ref_limb_id);
+    const uint64_t *ref_d_base = matrix_limb_ptr_by_id(d_input, 0, ref_limb_id);
+    const uint64_t *ref_tp2_base = matrix_limb_ptr_by_id(tp2_input, 0, ref_limb_id);
+    if (!ref_a_base || !ref_b_base || !ref_d_base || !ref_tp2_base)
     {
-        for (size_t j = 0; j < d_rows; ++j)
-        {
-            const size_t idx = matrix_index(i, j, d_rows);
-            const uint64_t *a_ptr = matrix_limb_ptr_by_id(a_input, idx, ref_limb_id);
-            const uint64_t *b_ptr = matrix_limb_ptr_by_id(b_input, idx, ref_limb_id);
-            const uint64_t *d_ptr = matrix_limb_ptr_by_id(d_input, idx, ref_limb_id);
-            if (!a_ptr || !b_ptr || !d_ptr)
-            {
-                cleanup();
-                return set_error("null A/B/D limb pointer in gpu_matrix_sample_p1_full");
-            }
-            ref_a_entry_ptrs.push_back(a_ptr);
-            ref_b_entry_ptrs.push_back(b_ptr);
-            ref_d_entry_ptrs.push_back(d_ptr);
-        }
+        cleanup();
+        return set_error("null reference limb base pointer in gpu_matrix_sample_p1_full");
     }
-    for (size_t row = 0; row < 2 * d_rows; ++row)
+    if (ref_limb_id.x >= a_input->shared_limb_buffers.size() ||
+        ref_limb_id.x >= b_input->shared_limb_buffers.size() ||
+        ref_limb_id.x >= d_input->shared_limb_buffers.size() ||
+        ref_limb_id.x >= tp2_input->shared_limb_buffers.size())
     {
-        for (size_t col = 0; col < cols; ++col)
-        {
-            const size_t idx = matrix_index(row, col, cols);
-            const uint64_t *tp2_ptr = matrix_limb_ptr_by_id(tp2_input, idx, ref_limb_id);
-            uint64_t *out_ptr = matrix_limb_ptr_by_id(out, idx, ref_limb_id);
-            if (!tp2_ptr || !out_ptr)
-            {
-                cleanup();
-                return set_error("null tp2/output limb pointer in gpu_matrix_sample_p1_full");
-            }
-            ref_tp2_entry_ptrs.push_back(tp2_ptr);
-        }
+        cleanup();
+        return set_error("invalid reference partition index in gpu_matrix_sample_p1_full");
     }
+    const size_t ref_a_stride = a_input->shared_limb_buffers[ref_limb_id.x].words_per_poly;
+    const size_t ref_b_stride = b_input->shared_limb_buffers[ref_limb_id.x].words_per_poly;
+    const size_t ref_d_stride = d_input->shared_limb_buffers[ref_limb_id.x].words_per_poly;
+    const size_t ref_tp2_stride = tp2_input->shared_limb_buffers[ref_limb_id.x].words_per_poly;
     if (!ref_stream || ref_device < 0)
     {
         cleanup();
@@ -1527,10 +1466,14 @@ extern "C" int gpu_matrix_sample_p1_full(
 
     int64_t *sampled_ref_device = nullptr;
     status = launch_sample_p1_integer_kernel(
-        ref_a_entry_ptrs,
-        ref_b_entry_ptrs,
-        ref_d_entry_ptrs,
-        ref_tp2_entry_ptrs,
+        ref_a_base,
+        ref_b_base,
+        ref_d_base,
+        ref_tp2_base,
+        ref_a_stride,
+        ref_b_stride,
+        ref_d_stride,
+        ref_tp2_stride,
         d_rows,
         cols,
         static_cast<size_t>(a_mat->ctx->N),
@@ -1542,9 +1485,7 @@ extern "C" int gpu_matrix_sample_p1_full(
         ref_stream,
         ref_device,
         &sampled_ref_device,
-        sampled_ready_event,
-        out,
-        &ref_limb_id);
+        sampled_ready_event);
     if (status != 0)
     {
         cleanup();
@@ -1666,16 +1607,9 @@ extern "C" int gpu_matrix_sample_p1_full(
         return 0;
     };
 
-    std::vector<std::vector<uint64_t *>> out_entry_ptrs_by_limb(
-        static_cast<size_t>(level + 1));
-
     for (int limb = 0; limb <= level; ++limb)
     {
         const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        auto &out_entry_ptrs = out_entry_ptrs_by_limb[static_cast<size_t>(limb)];
-        out_entry_ptrs.clear();
-        out_entry_ptrs.reserve(2 * d_rows * cols);
-
         int out_device = -1;
         status = matrix_limb_device(out, limb_id, &out_device);
         if (status != 0)
@@ -1690,20 +1624,18 @@ extern "C" int gpu_matrix_sample_p1_full(
             cleanup();
             return status;
         }
-        for (size_t row = 0; row < 2 * d_rows; ++row)
+        uint64_t *out_base = matrix_limb_ptr_by_id(out, 0, limb_id);
+        if (!out_base)
         {
-            for (size_t col = 0; col < cols; ++col)
-            {
-                const size_t idx = matrix_index(row, col, cols);
-                uint64_t *out_ptr = matrix_limb_ptr_by_id(out, idx, limb_id);
-                if (!out_ptr)
-                {
-                    cleanup();
-                    return set_error("null output limb pointer in gpu_matrix_sample_p1_full");
-                }
-                out_entry_ptrs.push_back(out_ptr);
-            }
+            cleanup();
+            return set_error("null output limb base pointer in gpu_matrix_sample_p1_full");
         }
+        if (limb_id.x >= out->shared_limb_buffers.size())
+        {
+            cleanup();
+            return set_error("invalid output partition index in gpu_matrix_sample_p1_full");
+        }
+        const size_t out_stride = out->shared_limb_buffers[limb_id.x].words_per_poly;
 
         int64_t *sampled_for_device = nullptr;
         status = ensure_sample_buffer_on_device(out_device, out_stream, &sampled_for_device);
@@ -1715,13 +1647,13 @@ extern "C" int gpu_matrix_sample_p1_full(
 
         status = launch_scatter_p1_integer_to_limb_kernel_device(
             sampled_for_device,
-            out_entry_ptrs,
+            out_base,
+            out_stride,
+            sampled_entry_count,
             static_cast<size_t>(a_mat->ctx->N),
             a_mat->ctx->moduli[static_cast<size_t>(limb)],
             out_stream,
-            out_device,
-            out,
-            &limb_id);
+            out_device);
         if (status != 0)
         {
             cleanup();

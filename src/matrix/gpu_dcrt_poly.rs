@@ -1572,12 +1572,8 @@ mod tests {
         let gpu_params = gpu_params_from_cpu(&params);
         let size = 3;
         let k = gpu_params.crt_bits().div_ceil(gpu_params.base_bits() as usize);
-        let min_modulus = gpu_params
-            .moduli()
-            .iter()
-            .copied()
-            .min()
-            .expect("CRT basis must be non-empty");
+        let min_modulus =
+            gpu_params.moduli().iter().copied().min().expect("CRT basis must be non-empty");
         let upper = usize::try_from(min_modulus).unwrap_or(usize::MAX);
         let random_int = rng().random_range(0..upper);
 

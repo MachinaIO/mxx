@@ -620,10 +620,7 @@ mod tests {
         let size = 3;
         let k = params.crt_bits().div_ceil(params.base_bits() as usize);
         let (crt_moduli, _, _) = <DCRTPolyParams as crate::poly::PolyParams>::to_crt(&params);
-        let min_modulus = crt_moduli
-            .into_iter()
-            .min()
-            .expect("CRT basis must be non-empty");
+        let min_modulus = crt_moduli.into_iter().min().expect("CRT basis must be non-empty");
         let upper = usize::try_from(min_modulus).unwrap_or(usize::MAX);
         let random_int = rng().random_range(0..upper);
 

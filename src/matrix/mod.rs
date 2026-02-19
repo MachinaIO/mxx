@@ -158,7 +158,14 @@ pub trait PolyMatrix:
     /// A matrix of dimension n×(n·log_b(q)), in which each block row is a scaled identity
     /// under the ring modulus.
     fn gadget_matrix(params: &<Self::P as Poly>::Params, size: usize) -> Self;
+    /// Constructs a compact gadget matrix G_small = I_n ⊗ (1, b, ..., b^{k-1}),
+    /// where k = ceil(crt_bits / base_bits) and b = 2^{base_bits}.
+    fn small_gadget_matrix(params: &<Self::P as Poly>::Params, size: usize) -> Self;
     fn decompose(&self) -> Self;
+    /// Returns a compact decomposition matrix D such that
+    /// small_gadget_matrix(size) * D == self
+    /// under the assumption that coefficients are bounded by crt_bits.
+    fn small_decompose(&self) -> Self;
     fn modulus_switch(
         &self,
         new_modulus: &<<Self::P as Poly>::Params as PolyParams>::Modulus,

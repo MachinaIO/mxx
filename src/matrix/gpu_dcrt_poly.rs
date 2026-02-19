@@ -11,7 +11,8 @@ use crate::{
                 GpuDCRTPolyParams, GpuEventSetOpaque, GpuMatrixOpaque, check_status,
                 gpu_event_set_destroy, gpu_event_set_wait, gpu_matrix_add, gpu_matrix_copy,
                 gpu_matrix_copy_block, gpu_matrix_create, gpu_matrix_decompose_base,
-                gpu_matrix_destroy, gpu_matrix_equal, gpu_matrix_fill_gadget,
+                gpu_matrix_decompose_base_small, gpu_matrix_destroy, gpu_matrix_equal,
+                gpu_matrix_fill_gadget, gpu_matrix_fill_small_gadget,
                 gpu_matrix_gauss_samp_gq_arb_base, gpu_matrix_intt_all,
                 gpu_matrix_load_compact_bytes, gpu_matrix_load_rns_batch, gpu_matrix_mul,
                 gpu_matrix_mul_scalar, gpu_matrix_mul_timed, gpu_matrix_ntt_all,
@@ -902,6 +903,17 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         out
     }
 
+    fn small_gadget_matrix(params: &<Self::P as Poly>::Params, size: usize) -> Self {
+        if size == 0 {
+            return Self::new_zero(params, 0, 0);
+        }
+        let k = params.crt_bits().div_ceil(params.base_bits() as usize);
+        let out = Self::new_empty(params, size, size * k);
+        let status = unsafe { gpu_matrix_fill_small_gadget(out.raw, params.base_bits()) };
+        check_status(status, "gpu_matrix_fill_small_gadget");
+        out
+    }
+
     fn decompose(&self) -> Self {
         let log_base_q = self.params.modulus_digits();
         let nrow = self.nrow.saturating_mul(log_base_q);
@@ -909,6 +921,16 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         let status =
             unsafe { gpu_matrix_decompose_base(self.raw, self.params.base_bits(), out.raw) };
         check_status(status, "gpu_matrix_decompose_base");
+        out
+    }
+
+    fn small_decompose(&self) -> Self {
+        let k = self.params.crt_bits().div_ceil(self.params.base_bits() as usize);
+        let nrow = self.nrow.saturating_mul(k);
+        let out = Self::new_empty(&self.params, nrow, self.ncol);
+        let status =
+            unsafe { gpu_matrix_decompose_base_small(self.raw, self.params.base_bits(), out.raw) };
+        check_status(status, "gpu_matrix_decompose_base_small");
         out
     }
 
@@ -1451,6 +1473,34 @@ mod tests {
         assert_eq!(expected_matrix.size().0, 2);
         assert_eq!(expected_matrix.size().1, 8);
         assert_eq!(matrix, expected_matrix);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_small_decompose_identity_relation() {
+        gpu_device_sync();
+        let params = gpu_test_params();
+        let gpu_params = gpu_params_from_cpu(&params);
+        let size = 3;
+        let k = gpu_params.crt_bits().div_ceil(gpu_params.base_bits() as usize);
+        let upper = if gpu_params.crt_bits() >= usize::BITS as usize {
+            usize::MAX
+        } else {
+            1usize << gpu_params.crt_bits()
+        };
+        let random_int = rng().random_range(0..upper);
+
+        let identity = GpuDCRTPolyMatrix::identity(
+            &gpu_params,
+            size,
+            Some(GpuDCRTPoly::from_usize_to_constant(&gpu_params, random_int)),
+        );
+        let decomposed = identity.small_decompose();
+        assert_eq!(decomposed.size().0, size * k);
+        assert_eq!(decomposed.size().1, size);
+
+        let reconstructed = GpuDCRTPolyMatrix::small_gadget_matrix(&gpu_params, size) * decomposed;
+        assert_eq!(reconstructed, identity);
     }
 
     #[test]

@@ -187,9 +187,10 @@ int launch_fill_gadget_multi_limb_kernel(
 }
 
 
-extern "C" int gpu_matrix_fill_gadget(
+static int gpu_matrix_fill_gadget_impl(
     GpuMatrix *out,
-    uint32_t base_bits)
+    uint32_t base_bits,
+    bool small)
 {
     if (!out)
     {
@@ -239,7 +240,9 @@ extern "C" int gpu_matrix_fill_gadget(
     {
         return set_error("invalid digits_per_tower in gpu_matrix_fill_gadget");
     }
-    const size_t log_base_q = static_cast<size_t>(digits_per_tower) * crt_depth;
+    const size_t log_base_q =
+        small ? static_cast<size_t>(digits_per_tower)
+              : static_cast<size_t>(digits_per_tower) * crt_depth;
     if (cols != rows * log_base_q)
     {
         return set_error("output size mismatch in gpu_matrix_fill_gadget");
@@ -313,7 +316,8 @@ extern "C" int gpu_matrix_fill_gadget(
             batch.has_aux_limb_id = true;
         }
         batch.moduli.push_back(out->ctx->moduli[static_cast<size_t>(limb)]);
-        batch.limb_indices.push_back(static_cast<uint32_t>(limb));
+        // small gadget reuses a single digit block for all CRT limbs.
+        batch.limb_indices.push_back(small ? 0u : static_cast<uint32_t>(limb));
         batch.dst_ptrs.insert(batch.dst_ptrs.end(), limb_ptrs.begin(), limb_ptrs.end());
     }
 
@@ -358,7 +362,25 @@ extern "C" int gpu_matrix_fill_gadget(
     return 0;
 }
 
-extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bits, GpuMatrix *out)
+extern "C" int gpu_matrix_fill_gadget(
+    GpuMatrix *out,
+    uint32_t base_bits)
+{
+    return gpu_matrix_fill_gadget_impl(out, base_bits, false);
+}
+
+extern "C" int gpu_matrix_fill_small_gadget(
+    GpuMatrix *out,
+    uint32_t base_bits)
+{
+    return gpu_matrix_fill_gadget_impl(out, base_bits, true);
+}
+
+static int gpu_matrix_decompose_base_impl(
+    const GpuMatrix *src,
+    uint32_t base_bits,
+    GpuMatrix *out,
+    bool small)
 {
     if (!src || !out)
     {
@@ -402,8 +424,10 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
     {
         return set_error("invalid digits_per_tower in gpu_matrix_decompose_base");
     }
-    const size_t log_base_q = static_cast<size_t>(digits_per_tower) * crt_depth;
-    if (out->rows != rows * log_base_q || out->cols != cols)
+    const size_t out_log_base_q =
+        small ? static_cast<size_t>(digits_per_tower)
+              : static_cast<size_t>(digits_per_tower) * crt_depth;
+    if (out->rows != rows * out_log_base_q || out->cols != cols)
     {
         return set_error("output size mismatch in gpu_matrix_decompose_base");
     }
@@ -586,7 +610,9 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
         return batches.back();
     };
 
-    for (int src_limb = 0; src_limb <= level; ++src_limb)
+    const int src_limb_begin = 0;
+    const int src_limb_end = small ? 1 : (level + 1);
+    for (int src_limb = src_limb_begin; src_limb < src_limb_end; ++src_limb)
     {
         const dim3 src_limb_id = limb_map[static_cast<size_t>(src_limb)];
         int src_device = -1;
@@ -624,8 +650,9 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
             }
 
             const size_t digit_offset =
-                static_cast<size_t>(src_limb) * static_cast<size_t>(digits_per_tower) +
-                static_cast<size_t>(digit_idx);
+                small ? static_cast<size_t>(digit_idx)
+                      : static_cast<size_t>(src_limb) * static_cast<size_t>(digits_per_tower) +
+                            static_cast<size_t>(digit_idx);
 
             for (int out_limb = 0; out_limb <= level; ++out_limb)
             {
@@ -656,7 +683,7 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
                 {
                     const size_t row = idx / cols;
                     const size_t col = idx % cols;
-                    const size_t out_row = row * log_base_q + digit_offset;
+                    const size_t out_row = row * out_log_base_q + digit_offset;
                     const size_t out_idx = matrix_index(out_row, col, out->cols);
                     uint64_t *dst_ptr = matrix_limb_ptr_by_id(out, out_idx, out_limb_id);
                     if (!dst_ptr)
@@ -731,4 +758,14 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
 
     cleanup_tmp_inputs();
     return 0;
+}
+
+extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bits, GpuMatrix *out)
+{
+    return gpu_matrix_decompose_base_impl(src, base_bits, out, false);
+}
+
+extern "C" int gpu_matrix_decompose_base_small(const GpuMatrix *src, uint32_t base_bits, GpuMatrix *out)
+{
+    return gpu_matrix_decompose_base_impl(src, base_bits, out, true);
 }

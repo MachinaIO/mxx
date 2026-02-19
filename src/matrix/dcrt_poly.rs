@@ -619,11 +619,12 @@ mod tests {
         let params = DCRTPolyParams::default();
         let size = 3;
         let k = params.crt_bits().div_ceil(params.base_bits() as usize);
-        let upper = if params.crt_bits() >= usize::BITS as usize {
-            usize::MAX
-        } else {
-            1usize << params.crt_bits()
-        };
+        let (crt_moduli, _, _) = <DCRTPolyParams as crate::poly::PolyParams>::to_crt(&params);
+        let min_modulus = crt_moduli
+            .into_iter()
+            .min()
+            .expect("CRT basis must be non-empty");
+        let upper = usize::try_from(min_modulus).unwrap_or(usize::MAX);
         let random_int = rng().random_range(0..upper);
 
         let identity = DCRTPolyMatrix::identity(

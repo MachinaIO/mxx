@@ -164,7 +164,8 @@ pub trait PolyMatrix:
     fn decompose(&self) -> Self;
     /// Returns a compact decomposition matrix D such that
     /// small_gadget_matrix(size) * D == self
-    /// under the assumption that coefficients are bounded by crt_bits.
+    /// under the assumption that coefficients are bounded by min(moduli)
+    /// (i.e., the matrix norm is strictly less than the smallest CRT modulus).
     fn small_decompose(&self) -> Self;
     fn modulus_switch(
         &self,

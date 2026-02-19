@@ -1,49 +1,5 @@
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
-
 namespace
 {
-    bool gpu_malloc_timing_enabled()
-    {
-        static int enabled = []() {
-            const char *env = std::getenv("MXX_GPU_MALLOC_TIMING");
-            return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
-        }();
-        return enabled != 0;
-    }
-
-    void log_cuda_malloc_async_timing(
-        const char *site,
-        int level,
-        size_t rows,
-        size_t cols,
-        size_t partition_idx,
-        size_t bytes,
-        const std::chrono::steady_clock::time_point &start_time,
-        cudaError_t status)
-    {
-        if (!gpu_malloc_timing_enabled())
-        {
-            return;
-        }
-        const auto end_time = std::chrono::steady_clock::now();
-        const auto elapsed_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-        const long long elapsed_ms = static_cast<long long>(elapsed_us / 1000);
-        std::fprintf(
-            stderr,
-            "[mxx][cudaMallocAsync][debug] site=%s level=%d rows=%zu cols=%zu partition=%zu bytes=%zu elapsed_ms=%lld status=%d\n",
-            site ? site : "unknown",
-            level,
-            rows,
-            cols,
-            partition_idx,
-            bytes,
-            elapsed_ms,
-            static_cast<int>(status));
-    }
-
     bool checked_mul_size(size_t a, size_t b, size_t *out)
     {
         if (!out)
@@ -370,17 +326,7 @@ extern "C" int gpu_matrix_create(
         }
 
         uint64_t *base = nullptr;
-        const auto limb_malloc_start = std::chrono::steady_clock::now();
         err = cudaMallocAsync(&base, total_bytes, alloc_stream);
-        log_cuda_malloc_async_timing(
-            "gpu_matrix_create.limb_buffer",
-            level,
-            rows,
-            cols,
-            partition_idx,
-            total_bytes,
-            limb_malloc_start,
-            err);
         if (err != cudaSuccess)
         {
             destroy_matrix_contents(mat);
@@ -408,17 +354,7 @@ extern "C" int gpu_matrix_create(
         }
 
         void **aux_base = nullptr;
-        const auto aux_malloc_start = std::chrono::steady_clock::now();
         err = cudaMallocAsync(&aux_base, aux_total_bytes, alloc_stream);
-        log_cuda_malloc_async_timing(
-            "gpu_matrix_create.aux_buffer",
-            level,
-            rows,
-            cols,
-            partition_idx,
-            aux_total_bytes,
-            aux_malloc_start,
-            err);
         if (err != cudaSuccess)
         {
             destroy_matrix_contents(mat);

@@ -375,7 +375,8 @@ pub fn compute_preimage_norm(
     let two_sqrt = BigDecimal::from(2).sqrt().unwrap();
     let m_g_sqrt = BigDecimal::from(m_g).sqrt().expect("sqrt(m_g) failed");
     let term = ring_dim_sqrt.clone() * m_g_sqrt + two_sqrt * ring_dim_sqrt + c_1;
-    let preimage_norm = c_0 * 6 * sigma.clone() * ((base + 1) * sigma) * term;
+    let preimage_norm =
+        c_0 * BigDecimal::from_f32(6.5).unwrap() * sigma.clone() * ((base + 1) * sigma) * term;
     // let preimage_norm_bits = bigdecimal_bits_ceil(&preimage_norm);
     // info!("{}", format!("preimage norm bits {}", preimage_norm_bits));
     preimage_norm

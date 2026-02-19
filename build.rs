@@ -17,18 +17,28 @@ fn main() {
 
     if env::var("CARGO_FEATURE_GPU").is_ok() {
         println!("cargo::rerun-if-changed=gpu-setup.sh");
-        println!("cargo::rerun-if-changed=cuda/src/poly/Poly.cu");
-        println!("cargo::rerun-if-changed=cuda/src/poly/PolyUtils.cu");
-        println!("cargo::rerun-if-changed=cuda/src/poly/PolySerdeRns.cu");
-        println!("cargo::rerun-if-changed=cuda/src/poly/PolyOps.cu");
+        println!("cargo::rerun-if-changed=cuda/src/Runtime.cu");
+        println!("cargo::rerun-if-changed=cuda/src/ChaCha.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/Matrix.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixUtils.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixOps.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSerdeRns.cu");
-        println!("cargo::rerun-if-changed=cuda/include/Poly.h");
-        println!("cargo::rerun-if-changed=cuda/include/Matrix.h");
-        println!("cargo::rerun-if-changed=cuda/include/PolyInterface.h");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixNTT.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixData.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixArith.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixDecompose.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSampling.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixTrapdoor.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSerde.cu");
+        println!("cargo::rerun-if-changed=cuda/include/Runtime.cuh");
         println!("cargo::rerun-if-changed=cuda/include/ChaCha.cuh");
+        println!("cargo::rerun-if-changed=cuda/include/matrix/Matrix.cuh");
+        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixUtils.cuh");
+        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixData.cuh");
+        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixArith.cuh");
+        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixDecompose.cuh");
+        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixNTT.cuh");
+        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixSampling.cuh");
+        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixTrapdoor.cuh");
+        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixSerde.cuh");
 
         let manifest_dir =
             PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
@@ -103,7 +113,7 @@ fn main() {
         let mut build = cc::Build::new();
         build
             .cuda(true)
-            .file("cuda/src/poly/Poly.cu")
+            .file("cuda/src/Runtime.cu")
             .file("cuda/src/matrix/Matrix.cu")
             .include("cuda/include")
             .include(&fides_include)

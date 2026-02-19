@@ -14,7 +14,7 @@ pub fn lut_preimage_chunk_size() -> usize {
     std::env::var("LUT_PREIMAGE_CHUNK_SIZE")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(20)
+        .unwrap_or(30)
 }
 
 /// `GGH15_GATE_PARALLELISM`: max number of gate preimages to process in parallel (default: 1).
@@ -23,7 +23,7 @@ pub fn ggh15_gate_parallelism() -> usize {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(1)
+        .unwrap_or(30)
 }
 
 /// `BLOCK_SIZE`: generic processing block size used in utilities (default: 100).

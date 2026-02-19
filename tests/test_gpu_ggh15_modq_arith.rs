@@ -303,12 +303,13 @@ async fn test_gpu_ggh15_modq_arith() {
     let (circuit, _ctx) = build_modq_arith_circuit_gpu(&params, q_level);
     info!("found crt_depth={}", crt_depth);
     info!(
-        "selected crt_depth={} ring_dim={} crt_bits={} base_bits={} q_level={:?}",
+        "selected crt_depth={} ring_dim={} crt_bits={} base_bits={} q_level={:?} q_modulo={:?}",
         crt_depth,
         params.ring_dimension(),
         CRT_BITS,
         BASE_BITS,
-        q_level
+        q_level,
+        all_q_moduli
     );
     info!(
         "circuit non_free_depth={} gate_counts={:?}",

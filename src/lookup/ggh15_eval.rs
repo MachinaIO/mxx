@@ -313,8 +313,9 @@ where
                     lut_id, part_idx, idx
                 );
                 let gy = gadget_matrix.clone() * y_poly;
-                let w_gy = w_block_gy.mul_decompose(&gy);
+                let gy_decomposed = gy.decompose();
                 drop(gy);
+                let w_gy = w_block_gy.clone() * gy_decomposed;
                 w_t_idx.add_in_place(&w_gy);
                 debug!(
                     "Constructed w_block_gy contribution for LUT preimage: lut_id={}, part_idx={}, row_idx={}",

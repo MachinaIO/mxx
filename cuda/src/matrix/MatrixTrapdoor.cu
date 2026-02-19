@@ -1054,53 +1054,53 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         }
         const size_t src_stride = inputs_matrix->shared_limb_buffers[src_limb_id.x].words_per_poly;
 
-        for (uint32_t digit_idx = 0; digit_idx < digits_per_tower; ++digit_idx)
+        for (int out_limb = 0; out_limb <= level; ++out_limb)
         {
-            const size_t digit_offset =
-                static_cast<size_t>(src_limb) * static_cast<size_t>(digits_per_tower) +
-                static_cast<size_t>(digit_idx);
-
-            for (int out_limb = 0; out_limb <= level; ++out_limb)
+            const dim3 out_limb_id = limb_map[static_cast<size_t>(out_limb)];
+            int out_device = -1;
+            status = matrix_limb_device(out, out_limb_id, &out_device);
+            if (status != 0)
             {
-                const dim3 out_limb_id = limb_map[static_cast<size_t>(out_limb)];
-                int out_device = -1;
-                status = matrix_limb_device(out, out_limb_id, &out_device);
-                if (status != 0)
-                {
-                    cleanup_tmp_inputs();
-                    return status;
-                }
-                if (out_device != src_device)
-                {
-                    cleanup_tmp_inputs();
-                    return set_error("input/output limb device mismatch in gpu_matrix_gauss_samp_gq_arb_base");
-                }
-                cudaStream_t out_stream = nullptr;
-                status = matrix_limb_stream(out, out_limb_id, &out_stream);
-                if (status != 0)
-                {
-                    cleanup_tmp_inputs();
-                    return status;
-                }
-                status = matrix_wait_limb_stream(inputs_matrix, src_limb_id, out_device, out_stream);
-                if (status != 0)
-                {
-                    cleanup_tmp_inputs();
-                    return status;
-                }
+                cleanup_tmp_inputs();
+                return status;
+            }
+            if (out_device != src_device)
+            {
+                cleanup_tmp_inputs();
+                return set_error("input/output limb device mismatch in gpu_matrix_gauss_samp_gq_arb_base");
+            }
+            cudaStream_t out_stream = nullptr;
+            status = matrix_limb_stream(out, out_limb_id, &out_stream);
+            if (status != 0)
+            {
+                cleanup_tmp_inputs();
+                return status;
+            }
+            status = matrix_wait_limb_stream(inputs_matrix, src_limb_id, out_device, out_stream);
+            if (status != 0)
+            {
+                cleanup_tmp_inputs();
+                return status;
+            }
 
-                uint64_t *dst_base = matrix_limb_ptr_by_id(out, 0, out_limb_id);
-                if (!dst_base)
-                {
-                    cleanup_tmp_inputs();
-                    return set_error("null output limb base pointer in gpu_matrix_gauss_samp_gq_arb_base");
-                }
-                if (out_limb_id.x >= out->shared_limb_buffers.size())
-                {
-                    cleanup_tmp_inputs();
-                    return set_error("invalid output partition index in gpu_matrix_gauss_samp_gq_arb_base");
-                }
-                const size_t dst_stride = out->shared_limb_buffers[out_limb_id.x].words_per_poly;
+            uint64_t *dst_base = matrix_limb_ptr_by_id(out, 0, out_limb_id);
+            if (!dst_base)
+            {
+                cleanup_tmp_inputs();
+                return set_error("null output limb base pointer in gpu_matrix_gauss_samp_gq_arb_base");
+            }
+            if (out_limb_id.x >= out->shared_limb_buffers.size())
+            {
+                cleanup_tmp_inputs();
+                return set_error("invalid output partition index in gpu_matrix_gauss_samp_gq_arb_base");
+            }
+            const size_t dst_stride = out->shared_limb_buffers[out_limb_id.x].words_per_poly;
+
+            for (uint32_t digit_idx = 0; digit_idx < digits_per_tower; ++digit_idx)
+            {
+                const size_t digit_offset =
+                    static_cast<size_t>(src_limb) * static_cast<size_t>(digits_per_tower) +
+                    static_cast<size_t>(digit_idx);
 
                 status = launch_gauss_samp_gq_arb_base_multi_kernel(
                     src_base,
@@ -1130,22 +1130,22 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                     cleanup_tmp_inputs();
                     return status;
                 }
-                status = matrix_track_limb_consumer(
-                    inputs_matrix,
-                    src_limb_id,
-                    out_device,
-                    out_stream);
-                if (status != 0)
-                {
-                    cleanup_tmp_inputs();
-                    return status;
-                }
                 status = matrix_record_limb_write(out, out_limb_id, out_stream);
                 if (status != 0)
                 {
                     cleanup_tmp_inputs();
                     return status;
                 }
+            }
+            status = matrix_track_limb_consumer(
+                inputs_matrix,
+                src_limb_id,
+                out_device,
+                out_stream);
+            if (status != 0)
+            {
+                cleanup_tmp_inputs();
+                return status;
             }
         }
     }

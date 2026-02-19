@@ -167,6 +167,7 @@ impl NormPltGGH15Evaluator {
         ctx: Arc<SimulatorContext>,
         e_b_sigma: &BigDecimal,
         e_mat_sigma: &BigDecimal,
+        trapdoor_sigma: &BigDecimal,
         secret_sigma: Option<BigDecimal>,
     ) -> Self {
         let preimage_norm = compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base);
@@ -189,14 +190,24 @@ impl NormPltGGH15Evaluator {
                     e_mat_sigma * 6,
                     None,
                 );
-
+        let v_idx =
+            PolyMatrixNorm::sample_gauss(ctx.clone(), ctx.m_g, ctx.m_g, trapdoor_sigma.clone());
+        let small_decomposed = PolyMatrixNorm::new(
+            ctx.clone(),
+            ctx.m_g * ctx.log_base_q_small,
+            ctx.m_g,
+            ctx.base.clone() - BigDecimal::from(1u64),
+            Some((ctx.m_g - 1) * ctx.log_base_q_small),
+        );
+        let small_times_v = small_decomposed * &v_idx;
         let t_idx = PolyMatrixNorm::new(
             ctx.clone(),
-            2 * ctx.m_g + 2 * ctx.m_g * ctx.log_base_q,
+            3 * ctx.m_g + ctx.m_g * ctx.log_base_q_small,
             ctx.m_g,
-            BigDecimal::one(),
+            small_times_v.poly_norm.norm,
             None,
         );
+
         let const_term = e_times_preimage_gate_1.clone() *
             PolyMatrixNorm::new(
                 ctx.clone(),
@@ -222,8 +233,7 @@ impl NormPltGGH15Evaluator {
             )
         );
 
-        let e_input_multiplier = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g) *
-            PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g);
+        let e_input_multiplier = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g) * &v_idx;
         info!(
             "{}",
             format!(
@@ -403,11 +413,13 @@ mod tests {
             BigDecimal::from(32u64),   // base
             2,
             28, // log_base_q
+            3,  // log_base_q_small
         ))
     }
 
     const E_B_SIGMA: f64 = 4.0;
     const E_INIT_NORM: u32 = 1 << 14;
+    const TRAPDOOR_SIGMA: f64 = 4.578;
 
     #[test]
     fn test_wire_norm_addition() {
@@ -552,6 +564,7 @@ mod tests {
             ctx.clone(),
             &BigDecimal::from_f64(E_B_SIGMA).unwrap(),
             &BigDecimal::from_f64(E_B_SIGMA).unwrap(),
+            &BigDecimal::from_f64(TRAPDOOR_SIGMA).unwrap(),
             None,
         );
         let out = circuit.simulate_max_error_norm(

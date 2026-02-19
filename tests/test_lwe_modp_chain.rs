@@ -103,7 +103,7 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
 
     for crt_depth in 1..=MAX_CRT_DEPTH {
         let params = DCRTPolyParams::new(RING_DIM, crt_depth, CRT_BITS, BASE_BITS);
-        let (q_moduli, _q_bits, _q_depth) = params.to_crt();
+        let (q_moduli, _, crt_depth) = params.to_crt();
         let q_moduli_min = *q_moduli.iter().min().expect("q_moduli must not be empty");
         assert!(
             (P as u128) * (P as u128) < q_moduli_min as u128,
@@ -116,11 +116,13 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
         let circuit = build_modp_chain_circuit(&params, P, &q_over_p);
 
         let log_base_q = params.modulus_digits();
+        let log_base_q_small = log_base_q / crt_depth;
         let ctx = Arc::new(SimulatorContext::new(
             ring_dim_sqrt.clone(),
             base.clone(),
             D_SECRET,
             log_base_q,
+            log_base_q_small,
         ));
         let plt_evaluator = NormPltLWEEvaluator::new(ctx.clone(), &error_sigma);
         let e_init_norm = &error_sigma * BigDecimal::from(6u64);

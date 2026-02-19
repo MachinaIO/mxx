@@ -192,58 +192,6 @@ fn read_lut_aux_preimage_from_checkpoint<M: PolyMatrix>(
     read_lut_aux_matrix_from_checkpoint::<M>(params, dir, lut_aux_id_prefix, idx, entry_key, 1)
 }
 
-fn add_term_to_accumulator<M: PolyMatrix>(acc: &mut Option<M>, term: M) {
-    let next = match acc.take() {
-        Some(prev) => prev + term,
-        None => term,
-    };
-    *acc = Some(next);
-}
-
-fn accumulate_chunked_preimage_with_decomposed_rhs<M, F>(
-    params: &<M::P as Poly>::Params,
-    dir: &std::path::Path,
-    id_prefix: &str,
-    chunk_count: usize,
-    lhs: &M,
-    rhs: &M,
-    chunk_width: usize,
-    acc: &mut Option<M>,
-    mut rhs_chunk_transform: F,
-) where
-    M: PolyMatrix,
-    F: FnMut(M) -> M,
-{
-    debug_assert_ne!(chunk_count, 0, "chunk_count must be positive");
-    debug_assert_eq!(
-        rhs.row_size() % chunk_count,
-        0,
-        "rhs.row_size() must be divisible by chunk_count"
-    );
-    let rhs_rows_per_chunk = rhs.row_size() / chunk_count;
-    debug_assert_eq!(
-        rhs_rows_per_chunk * params.modulus_digits(),
-        chunk_width,
-        "chunk_width must equal rhs_rows_per_chunk * params.modulus_digits()"
-    );
-    let part_prefix = format!("{id_prefix}_part");
-    for chunk_idx in 0..chunk_count {
-        let preimage_chunk = read_matrix_from_multi_batch::<M>(
-            params,
-            dir,
-            &format!("{part_prefix}{chunk_idx}"),
-            chunk_idx,
-        )
-        .expect(format!("Failed to read matrix from multi batch: {}", chunk_idx).as_str());
-        let lhs_chunk = lhs.clone() * preimage_chunk;
-        let row_start = chunk_idx * rhs_rows_per_chunk;
-        let row_end = row_start + rhs_rows_per_chunk;
-        let rhs_chunk = rhs_chunk_transform(rhs.slice_rows(row_start, row_end)).decompose();
-        let term = lhs_chunk * rhs_chunk;
-        add_term_to_accumulator(acc, term);
-    }
-}
-
 pub struct GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
 where
     M: PolyMatrix + Send + Sync + 'static,
@@ -319,10 +267,11 @@ where
         );
         let d = self.d;
         let m = d * params.modulus_digits();
-        let k = params.modulus_digits();
         let trap_sampler = TS::new(params, self.trapdoor_sigma);
         let uniform_sampler = US::new();
         let gadget_matrix = M::gadget_matrix(params, d);
+        let (_, _, crt_depth) = params.to_crt();
+        let k_small = params.modulus_digits() / crt_depth;
         debug_assert_eq!(
             w_block_identity.col_size(),
             m,
@@ -335,12 +284,12 @@ where
         );
         debug_assert_eq!(
             w_block_v.col_size(),
-            m * k,
+            m,
             "w_block_v columns must equal d * modulus_digits^2"
         );
         debug_assert_eq!(
             w_block_vx.col_size(),
-            m * k,
+            m * k_small,
             "w_block_vx columns must equal d * modulus_digits^2"
         );
         let jobs = batch
@@ -356,29 +305,30 @@ where
                     "Sampled v_idx for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
                     lut_id, part_idx, idx
                 );
-                let idx_poly = M::P::from_usize_to_constant(params, *idx);
-                let gy = gadget_matrix.clone() * y_poly;
-                let v_idx_scaled = v_idx.clone() * idx_poly;
                 // Compute w_matrix * t_idx without materializing t_idx:
-                // t_idx = [I; G^-1(G*y); G^-1(v_idx); G^-1(v_idx*idx)].
+                // t_idx = [I_d; G^-1(G*y); v_idx; G_small^-1(idx * I_m) * v_idx].
                 let mut w_t_idx = w_block_identity.clone();
                 debug!(
                     "Constructed w_block_identity for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
                     lut_id, part_idx, idx
                 );
+                let gy = gadget_matrix.clone() * y_poly;
                 let w_gy = w_block_gy.mul_decompose(&gy);
+                drop(gy);
                 w_t_idx.add_in_place(&w_gy);
                 debug!(
                     "Constructed w_block_gy contribution for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
                     lut_id, part_idx, idx
                 );
-                let w_v = w_block_v.mul_decompose(&v_idx);
+                let w_v = w_block_v.clone() * &v_idx;
                 w_t_idx.add_in_place(&w_v);
                 debug!(
                     "Constructed w_block_v contribution for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
                     lut_id, part_idx, idx
                 );
-                let w_v_idx = w_block_vx.mul_decompose(&v_idx_scaled);
+                let idx_poly = M::P::from_usize_to_constant(params, *idx);
+                let idx_small_decomposed = M::identity(params, m, Some(idx_poly)).small_decompose();
+                let w_v_idx = w_block_vx.clone() * idx_small_decomposed * &v_idx;
                 w_t_idx.add_in_place(&w_v_idx);
                 debug!(
                     "Constructed w_block_v_idx contribution for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
@@ -440,12 +390,14 @@ where
 
     fn derive_w_block_v(&self, params: &<M::P as Poly>::Params, lut_id: usize) -> M {
         let m_g = self.d * params.modulus_digits();
-        self.derive_w_block_with_tag(params, lut_id, "block_v", m_g * params.modulus_digits())
+        self.derive_w_block_with_tag(params, lut_id, "block_v", m_g)
     }
 
     fn derive_w_block_vx(&self, params: &<M::P as Poly>::Params, lut_id: usize) -> M {
         let m_g = self.d * params.modulus_digits();
-        self.derive_w_block_with_tag(params, lut_id, "block_vx", m_g * params.modulus_digits())
+        let (_, _, crt_depth) = params.to_crt();
+        let k_small = params.modulus_digits() / crt_depth;
+        self.derive_w_block_with_tag(params, lut_id, "block_vx", m_g * k_small)
     }
 
     fn aux_checkpoint_prefix(&self, params: &<M::P as Poly>::Params) -> String {
@@ -1162,20 +1114,11 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                     let (stage3_jobs, stage4_inputs): (Vec<_>, Vec<_>) = stage3.into_iter().unzip();
                     stage3_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
 
-                    let k = params.modulus_digits();
-                    let gate2_chunk_cols = m_g;
-                    let gadget_digits = M::gadget_matrix(params, 1).get_row(0);
-                    debug_assert_eq!(
-                        gadget_digits.len(),
-                        k,
-                        "gadget digit count must match modulus_digits"
-                    );
-
                     let w_block_v = self.derive_w_block_v(params, lut_id);
-                    debug_assert_eq!(w_block_v.col_size(), gate2_chunk_cols * k);
-                    let stage4_context = stage4_inputs
+                    let stage4 = stage4_inputs
                         .into_par_iter()
                         .map(|(gate_id, state)| {
+                            let trap_sampler = TS::new(params, trapdoor_sigma);
                             let hash_sampler = HS::new();
                             let input_matrix =
                                 M::from_compact_bytes(params, &state.input_pubkey_bytes);
@@ -1194,117 +1137,60 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                                 u_g_matrix.row_size(),
                                 u_g_matrix.col_size()
                             );
-                            (gate_id, input_matrix, u_g_matrix)
+                            let taget_high_v = - input_matrix * u_g_matrix.decompose();
+                            let target_gate2_v = taget_high_v.concat_rows(&[&w_block_v]);
+                            drop(taget_high_v);
+                            let preimage_gate2_v = trap_sampler.preimage(
+                                params,
+                                &b1_trapdoor,
+                                &b1_matrix,
+                                &target_gate2_v,
+                            );
+                            drop(target_gate2_v);
+                            debug!(
+                                "Sampled gate preimage 2 (v part): gate_id={}, lut_id={}",
+                                gate_id, lut_id
+                            );
+                            let job = CompactBytesJob::new(
+                                self.preimage_gate2_v_id_prefix(params, gate_id),
+                                vec![(0, preimage_gate2_v)],
+                            );
+                            (job, (gate_id, u_g_matrix))
                         })
                         .collect::<Vec<_>>();
-                    for chunk_idx in 0..k {
-                        let col_start = chunk_idx * gate2_chunk_cols;
-                        let col_end = col_start + gate2_chunk_cols;
-                        let w_block_v_chunk = w_block_v.slice_columns(col_start, col_end);
-                        let stage4_jobs = stage4_context
-                            .par_iter()
-                            .map(|(gate_id, input_matrix, u_g_matrix)| {
-                                let trap_sampler = TS::new(params, trapdoor_sigma);
-                                let mut gadget_chunk = M::zero(params, m_g, m_g);
-                                for local_col in 0..m_g {
-                                    let global_col = chunk_idx * m_g + local_col;
-                                    let gadget_row = global_col / k;
-                                    let gadget_digit_idx = global_col % k;
-                                    debug_assert!(gadget_row < m_g);
-                                    gadget_chunk.set_entry(
-                                        gadget_row,
-                                        local_col,
-                                        gadget_digits[gadget_digit_idx].clone(),
-                                    );
-                                }
-                                let u_g_times_gadget_chunk = u_g_matrix.clone() * &gadget_chunk;
-                                let u_g_times_gadget_chunk_decompose =
-                                    u_g_times_gadget_chunk.decompose();
-                                let target_high_v_chunk =
-                                    -(input_matrix.clone() * &u_g_times_gadget_chunk_decompose);
-                                let target_chunk =
-                                    target_high_v_chunk.concat_rows(&[&w_block_v_chunk]);
-                                let preimage_chunk = trap_sampler.preimage(
-                                    params,
-                                    &b1_trapdoor,
-                                    &b1_matrix,
-                                    &target_chunk,
-                                );
-                                debug!(
-                                    "Sampled gate preimage 2 (v part, chunk {}): gate_id={}, lut_id={}",
-                                    chunk_idx, gate_id, lut_id
-                                );
-                                let gate2_v_chunk_prefix = format!(
-                                    "{}_part{}",
-                                    self.preimage_gate2_v_id_prefix(params, *gate_id),
-                                    chunk_idx
-                                );
-                                CompactBytesJob::new(
-                                    gate2_v_chunk_prefix,
-                                    vec![(chunk_idx, preimage_chunk)],
-                                )
-                            })
-                            .collect::<Vec<_>>();
-                        drop(w_block_v_chunk);
-                        stage4_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
-                    }
+                    let (stage4_jobs, stage5_inputs): (Vec<_>, Vec<_>) = stage4.into_iter().unzip();
+                    stage4_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
                     drop(w_block_v);
 
-                    let stage5_context = stage4_context
-                        .into_iter()
-                        .map(|(gate_id, _input_matrix, u_g_matrix)| (gate_id, u_g_matrix))
-                        .collect::<Vec<_>>();
                     let w_block_vx = self.derive_w_block_vx(params, lut_id);
-                    debug_assert_eq!(w_block_vx.col_size(), gate2_chunk_cols * k);
-                    for chunk_idx in 0..k {
-                        let col_start = chunk_idx * gate2_chunk_cols;
-                        let col_end = col_start + gate2_chunk_cols;
-                        let w_block_vx_chunk = w_block_vx.slice_columns(col_start, col_end);
-                        let stage5_jobs = stage5_context
-                            .par_iter()
-                            .map(|(gate_id, u_g_matrix)| {
-                                let trap_sampler = TS::new(params, trapdoor_sigma);
-                                let mut gadget_chunk = M::zero(params, m_g, m_g);
-                                for local_col in 0..m_g {
-                                    let global_col = chunk_idx * m_g + local_col;
-                                    let gadget_row = global_col / k;
-                                    let gadget_digit_idx = global_col % k;
-                                    debug_assert!(gadget_row < m_g);
-                                    gadget_chunk.set_entry(
-                                        gadget_row,
-                                        local_col,
-                                        gadget_digits[gadget_digit_idx].clone(),
-                                    );
-                                }
-                                let u_g_times_gadget_chunk = u_g_matrix.clone() * &gadget_chunk;
-                                let target_chunk =
-                                    u_g_times_gadget_chunk.concat_rows(&[&w_block_vx_chunk]);
-                                let preimage_chunk = trap_sampler.preimage(
-                                    params,
-                                    &b1_trapdoor,
-                                    &b1_matrix,
-                                    &target_chunk,
-                                );
-                                debug!(
-                                    "Sampled gate preimage 2 (vx part, chunk {}): gate_id={}, lut_id={}",
-                                    chunk_idx, gate_id, lut_id
-                                );
-                                let gate2_vx_chunk_prefix = format!(
-                                    "{}_part{}",
-                                    self.preimage_gate2_vx_id_prefix(params, *gate_id),
-                                    chunk_idx
-                                );
-                                CompactBytesJob::new(
-                                    gate2_vx_chunk_prefix,
-                                    vec![(chunk_idx, preimage_chunk)],
-                                )
-                            })
-                            .collect::<Vec<_>>();
-                        drop(w_block_vx_chunk);
-                        stage5_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
-                    }
+                    let small_gadget_matrix = M::small_gadget_matrix(params, m_g);
+                    let stage5 = stage5_inputs
+                        .into_par_iter()
+                        .map(|(gate_id, u_g_matrix)| {
+                            let trap_sampler = TS::new(params, trapdoor_sigma);
+                            let target_high_vx = u_g_matrix * &small_gadget_matrix;
+                            let target_gate2_vx = target_high_vx.concat_rows(&[&w_block_vx]);
+                            drop(target_high_vx);
+                            let preimage_gate2_vx = trap_sampler.preimage(
+                                params,
+                                &b1_trapdoor,
+                                &b1_matrix,
+                                &target_gate2_vx,
+                            );
+                            drop(target_gate2_vx);
+                            debug!(
+                                "Sampled gate preimage 2 (vx part): gate_id={}, lut_id={}",
+                                gate_id, lut_id
+                            );
+                            let job = CompactBytesJob::new(
+                                self.preimage_gate2_vx_id_prefix(params, gate_id),
+                                vec![(0, preimage_gate2_vx)],
+                            );
+                            job
+                        })
+                        .collect::<Vec<_>>();
+                    stage5.into_par_iter().for_each(CompactBytesJob::wait_then_store);
                     drop(w_block_vx);
-                    drop(gadget_digits);
                 }
                 let pct = if total_gate_count == 0 {
                     100.0
@@ -1428,7 +1314,6 @@ where
 
         let dir = std::path::Path::new(&self.dir_path);
         let checkpoint_prefix = &self.checkpoint_prefix;
-        let gate_chunk_count = params.modulus_digits();
         let lut_aux_prefix = format!("{checkpoint_prefix}_lut_aux_{}", lut_id);
         let lut_aux_entry_key = find_lut_aux_row_key_with_full_pair(dir, &lut_aux_prefix, k);
 
@@ -1444,7 +1329,9 @@ where
         let hash_sampler = HS::new();
         let d = input.pubkey.matrix.row_size();
         let m_g = d * params.modulus_digits();
-        let mut c_const: Option<M> = None;
+        let (_, _, crt_depth) = params.to_crt();
+        let k_small = params.modulus_digits() / crt_depth;
+        // let mut c_const: Option<M> = None;
 
         let preimage_gate2_identity = read_matrix_from_multi_batch::<M>(
             params,
@@ -1458,7 +1345,7 @@ where
             m_g,
             "preimage_gate2_identity must have m_g columns"
         );
-        add_term_to_accumulator(&mut c_const, sg_times_b1.clone() * preimage_gate2_identity);
+        let mut c_const = sg_times_b1.clone() * preimage_gate2_identity;
 
         let preimage_gate2_gy = read_matrix_from_multi_batch::<M>(
             params,
@@ -1473,20 +1360,8 @@ where
             "preimage_gate2_gy must have m_g columns"
         );
         let gy = M::gadget_matrix(params, d) * y.clone();
-        add_term_to_accumulator(
-            &mut c_const,
-            (sg_times_b1.clone() * preimage_gate2_gy).mul_decompose(&gy),
-        );
-
-        let preimage_lut = read_lut_aux_preimage_from_checkpoint::<M>(
-            params,
-            dir,
-            &lut_aux_prefix,
-            k,
-            lut_aux_entry_key.as_deref(),
-        )
-        .unwrap_or_else(|| panic!("preimage_lut (index {}) for lut {} not found", k, lut_id));
-        add_term_to_accumulator(&mut c_const, -(sg_times_b1.clone() * preimage_lut));
+        let gy_decomposed = gy.decompose();
+        c_const = c_const + sg_times_b1.clone() * preimage_gate2_gy * gy_decomposed;
 
         let v_idx = read_lut_aux_v_idx_from_checkpoint::<M>(
             params,
@@ -1496,28 +1371,44 @@ where
             lut_aux_entry_key.as_deref(),
         )
         .unwrap_or_else(|| panic!("v_idx (index {}) for lut {} not found", k, lut_id));
-        accumulate_chunked_preimage_with_decomposed_rhs::<M, _>(
+        let preimage_gate2_v = read_matrix_from_multi_batch::<M>(
             params,
             dir,
             &format!("{checkpoint_prefix}_preimage_gate2_v_{}", gate_id),
-            gate_chunk_count,
-            &sg_times_b1,
-            &v_idx,
+            0,
+        )
+        .unwrap_or_else(|| panic!("preimage_gate2_v for gate {} not found", gate_id));
+        debug_assert_eq!(
+            preimage_gate2_v.col_size(),
             m_g,
-            &mut c_const,
-            |rhs_chunk| rhs_chunk,
+            "preimage_gate2_v must have m_g columns"
         );
-        accumulate_chunked_preimage_with_decomposed_rhs::<M, _>(
+        c_const = c_const + sg_times_b1.clone() * preimage_gate2_v * &v_idx;
+
+        let preimage_gate2_vx = read_matrix_from_multi_batch::<M>(
             params,
             dir,
             &format!("{checkpoint_prefix}_preimage_gate2_vx_{}", gate_id),
-            gate_chunk_count,
-            &sg_times_b1,
-            &v_idx,
-            m_g,
-            &mut c_const,
-            |rhs_chunk| rhs_chunk * x,
+            0,
+        )
+        .unwrap_or_else(|| panic!("preimage_gate2_vx for gate {} not found", gate_id));
+        debug_assert_eq!(
+            preimage_gate2_vx.col_size(),
+            m_g * k_small,
+            "preimage_gate2_vx must have m_g * k_small columns"
         );
+        let x_small_decomposed = M::identity(params, m_g, Some(x.clone())).small_decompose();
+        c_const = c_const + sg_times_b1.clone() * preimage_gate2_vx * x_small_decomposed * &v_idx;
+
+        let preimage_lut = read_lut_aux_preimage_from_checkpoint::<M>(
+            params,
+            dir,
+            &lut_aux_prefix,
+            k,
+            lut_aux_entry_key.as_deref(),
+        )
+        .unwrap_or_else(|| panic!("preimage_lut (index {}) for lut {} not found", k, lut_id));
+        c_const = c_const - sg_times_b1.clone() * preimage_lut;
         drop(sg_times_b1);
 
         let u_g = hash_sampler.sample_hash(
@@ -1535,48 +1426,11 @@ where
             u_g.row_size(),
             u_g.col_size()
         );
-        let gadget_digits = M::gadget_matrix(params, 1).get_row(0);
-        debug_assert_eq!(
-            gadget_digits.len(),
-            gate_chunk_count,
-            "gadget digit count must match modulus_digits"
-        );
-        let build_u_g_times_gadget_chunk = |chunk_idx: usize| {
-            let mut gadget_chunk = M::zero(params, m_g, m_g);
-            for local_col in 0..m_g {
-                let global_col = chunk_idx * m_g + local_col;
-                let gadget_row = global_col / gate_chunk_count;
-                let gadget_digit_idx = global_col % gate_chunk_count;
-                debug_assert!(gadget_row < m_g);
-                gadget_chunk.set_entry(
-                    gadget_row,
-                    local_col,
-                    gadget_digits[gadget_digit_idx].clone(),
-                );
-            }
-            u_g.clone() * &gadget_chunk
-        };
-        debug_assert_eq!(
-            v_idx.row_size() % gate_chunk_count,
-            0,
-            "v_idx row size must be divisible by modulus_digits"
-        );
-        let rhs_rows_per_chunk = v_idx.row_size() / gate_chunk_count;
-        let mut c_x_randomized: Option<M> = None;
-        for chunk_idx in 0..gate_chunk_count {
-            let u_g_times_gadget_chunk = build_u_g_times_gadget_chunk(chunk_idx);
-            let lhs_chunk = input.vector.mul_decompose(&u_g_times_gadget_chunk);
-            let row_start = chunk_idx * rhs_rows_per_chunk;
-            let row_end = row_start + rhs_rows_per_chunk;
-            let rhs_chunk = v_idx.slice_rows(row_start, row_end).decompose();
-            add_term_to_accumulator(&mut c_x_randomized, lhs_chunk * rhs_chunk);
-        }
-        let c_x_randomized = c_x_randomized
-            .unwrap_or_else(|| panic!("c_x_randomized accumulation failed for gate {}", gate_id));
+
+        let c_x_randomized = input.vector.clone() * u_g.decompose() * v_idx;
         debug!("Computed c_x_randomized for gate encoding: gate_id={}, lut_id={}", gate_id, lut_id);
-        let c_out = c_const
-            .unwrap_or_else(|| panic!("c_const term accumulation failed for gate {}", gate_id)) +
-            c_x_randomized;
+        drop(u_g);
+        let c_out = c_const + c_x_randomized;
         debug!("Computed c_out for gate encoding: gate_id={}, lut_id={}", gate_id, lut_id);
         let out_pubkey = BggPublicKey {
             matrix: hash_sampler.sample_hash(

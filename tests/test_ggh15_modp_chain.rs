@@ -23,11 +23,11 @@ use mxx::{
 };
 use num_bigint::BigUint;
 use rand::Rng;
-use std::{fs, path::Path, sync::Arc};
+use std::{fs, path::Path, sync::Arc, time::Instant};
 use tracing::info;
 
 const CRT_BITS: usize = 51;
-const RING_DIM: u32 = 1 << 8;
+const RING_DIM: u32 = 1 << 14;
 const ERROR_SIGMA: f64 = 4.0;
 const BASE_BITS: u32 = 17;
 const MAX_CRT_DEPTH: usize = 12;
@@ -100,10 +100,11 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
     let ring_dim_sqrt = BigDecimal::from_u32(RING_DIM).unwrap().sqrt().unwrap();
     let base = BigDecimal::from_biguint(BigUint::from(1u32) << BASE_BITS, 0);
     let error_sigma = BigDecimal::from_f64(ERROR_SIGMA).expect("valid error sigma");
+    let trapdoor_sigma = BigDecimal::from_f64(4.578).expect("valid trapdoor sigma");
 
     for crt_depth in 1..=MAX_CRT_DEPTH {
         let params = DCRTPolyParams::new(RING_DIM, crt_depth, CRT_BITS, BASE_BITS);
-        let (q_moduli, _q_bits, _q_depth) = params.to_crt();
+        let (q_moduli, _, crt_depth) = params.to_crt();
         let q_moduli_min = *q_moduli.iter().min().expect("q_moduli must not be empty");
         assert!(
             (P as u128) * (P as u128) < q_moduli_min as u128,
@@ -116,14 +117,21 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
         let circuit = build_modp_chain_circuit(&params, P, &q_over_p);
 
         let log_base_q = params.modulus_digits();
+        let log_base_q_small = log_base_q / crt_depth;
         let ctx = Arc::new(SimulatorContext::new(
             ring_dim_sqrt.clone(),
             base.clone(),
             D_SECRET,
             log_base_q,
+            log_base_q_small,
         ));
-        let plt_evaluator =
-            NormPltGGH15Evaluator::new(ctx.clone(), &error_sigma, &error_sigma, None);
+        let plt_evaluator = NormPltGGH15Evaluator::new(
+            ctx.clone(),
+            &error_sigma,
+            &error_sigma,
+            &trapdoor_sigma,
+            None,
+        );
         let e_init_norm = &error_sigma * BigDecimal::from(6u64);
         let input_bound = BigDecimal::from((P - 1) as u64);
 
@@ -229,9 +237,19 @@ async fn test_ggh15_modp_chain_rounding() {
         circuit.eval(&params, &enc_one.pubkey, &input_pubkeys, Some(&plt_pubkey_evaluator));
     info!("circuit eval pubkey done");
     assert_eq!(result_pubkey.len(), 1);
+    let sample_aux_start = Instant::now();
     plt_pubkey_evaluator.sample_aux_matrices(&params);
+    info!(
+        "plt_pubkey_evaluator.sample_aux_matrices elapsed_ms={:.3}",
+        sample_aux_start.elapsed().as_secs_f64() * 1000.0
+    );
 
+    let wait_writes_start = Instant::now();
     wait_for_all_writes(dir.to_path_buf()).await.unwrap();
+    info!(
+        "wait_for_all_writes elapsed_ms={:.3}",
+        wait_writes_start.elapsed().as_secs_f64() * 1000.0
+    );
 
     let b0_matrix = plt_pubkey_evaluator
         .load_b0_matrix_checkpoint(&params)

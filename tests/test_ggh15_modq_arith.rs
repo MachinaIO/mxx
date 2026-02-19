@@ -27,8 +27,8 @@ use std::{fs, path::Path, sync::Arc};
 use tracing::info;
 
 const RING_DIM: u32 = 1 << 8;
-const CRT_BITS: usize = 51;
-const P_MODULI_BITS: usize = 7;
+const CRT_BITS: usize = 24;
+const P_MODULI_BITS: usize = 6;
 const SCALE: u64 = 1 << 7;
 const BASE_BITS: u32 = 8;
 const MAX_CRT_DEPTH: usize = 32;
@@ -114,23 +114,31 @@ fn find_crt_depth_for_modq_arith() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
     let base = BigDecimal::from_biguint(BigUint::from(1u32) << BASE_BITS, 0);
     let error_sigma = BigDecimal::from_f64(ERROR_SIGMA).expect("valid error sigma");
     let input_bound = BigDecimal::from((1u64 << P_MODULI_BITS) - 1);
+    let trapdoor_sigma = BigDecimal::from_f64(4.578).expect("valid trapdoor sigma");
     let e_init_norm = &error_sigma * BigDecimal::from(6u64);
 
     for crt_depth in 1..=MAX_CRT_DEPTH {
         let params = DCRTPolyParams::new(RING_DIM, crt_depth, CRT_BITS, BASE_BITS);
-        let (q_moduli, _, _) = params.to_crt();
+        let (q_moduli, _, crt_depth) = params.to_crt();
         let q = params.modulus();
         let (circuit, _ctx) = build_modq_arith_circuit(&params);
 
         let log_base_q = params.modulus_digits();
+        let log_base_q_small = log_base_q / crt_depth;
         let ctx = Arc::new(SimulatorContext::new(
             ring_dim_sqrt.clone(),
             base.clone(),
             D_SECRET,
             log_base_q,
+            log_base_q_small,
         ));
-        let plt_evaluator =
-            NormPltGGH15Evaluator::new(ctx.clone(), &error_sigma, &error_sigma, None);
+        let plt_evaluator = NormPltGGH15Evaluator::new(
+            ctx.clone(),
+            &error_sigma,
+            &error_sigma,
+            &trapdoor_sigma,
+            None,
+        );
 
         let out_errors = circuit.simulate_max_error_norm(
             ctx,

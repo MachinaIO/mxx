@@ -990,9 +990,10 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
 
         let error_sigma = self.error_sigma;
         let trapdoor_sigma = self.trapdoor_sigma;
+        let chunk_size = crate::env::ggh15_gate_parallelism();
         info!(
             "GGH15 gate preimage parallelism uses Rayon global pool (GGH15_GATE_PARALLELISM={})",
-            crate::env::ggh15_gate_parallelism()
+            chunk_size
         );
 
         for (lut_id, mut gates) in gates_by_lut {

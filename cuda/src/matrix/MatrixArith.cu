@@ -724,8 +724,7 @@ namespace
         const T **d_lhs = nullptr;
         const T **d_rhs = nullptr;
         int *d_equal = nullptr;
-        auto release = [&]()
-        {
+        auto release = [&]() {
             if (d_equal)
             {
                 cudaFreeAsync(d_equal, stream);

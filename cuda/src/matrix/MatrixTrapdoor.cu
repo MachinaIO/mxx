@@ -535,6 +535,7 @@ int launch_gauss_samp_gq_arb_base_multi_kernel(
     return 0;
 }
 
+
 int launch_sample_p1_integer_kernel(
     const uint64_t *a_base,
     const uint64_t *b_base,
@@ -863,6 +864,7 @@ int launch_scatter_p1_integer_to_limb_kernel_device(
     }
     return 0;
 }
+
 
 extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
     const GpuMatrix *src,

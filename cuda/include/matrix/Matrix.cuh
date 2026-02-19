@@ -7,25 +7,24 @@
 #include "Runtime.cuh"
 
 #ifdef __cplusplus
-extern "C"
-{
+extern "C" {
 #endif
 
-    typedef struct GpuMatrix GpuMatrix;
+typedef struct GpuMatrix GpuMatrix;
 
-    typedef enum GpuPolyFormat
-    {
-        GPU_POLY_FORMAT_COEFF = 0,
-        GPU_POLY_FORMAT_EVAL = 1,
-    } GpuPolyFormat;
+typedef enum GpuPolyFormat
+{
+    GPU_POLY_FORMAT_COEFF = 0,
+    GPU_POLY_FORMAT_EVAL = 1,
+} GpuPolyFormat;
 
-    typedef enum GpuMatrixSampleDist
-    {
-        GPU_MATRIX_DIST_UNIFORM = 0,
-        GPU_MATRIX_DIST_GAUSS = 1,
-        GPU_MATRIX_DIST_BIT = 2,
-        GPU_MATRIX_DIST_TERNARY = 3,
-    } GpuMatrixSampleDist;
+typedef enum GpuMatrixSampleDist
+{
+    GPU_MATRIX_DIST_UNIFORM = 0,
+    GPU_MATRIX_DIST_GAUSS = 1,
+    GPU_MATRIX_DIST_BIT = 2,
+    GPU_MATRIX_DIST_TERNARY = 3,
+} GpuMatrixSampleDist;
 
 #ifdef __cplusplus
 }

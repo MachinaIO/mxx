@@ -327,6 +327,7 @@ int launch_sample_distribution_multi_limb_kernel(
     return 0;
 }
 
+
 extern "C" int gpu_matrix_sample_distribution(
     GpuMatrix *out,
     int dist_type,

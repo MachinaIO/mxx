@@ -76,6 +76,7 @@ namespace
     }
 }
 
+
 int matrix_limb_device(const GpuMatrix *mat, const dim3 &limb_id, int *out_device)
 {
     if (!mat || !mat->ctx || !out_device)
@@ -303,18 +304,16 @@ bool matrix_aux_slice_for_limb(const GpuMatrix *mat, const dim3 &limb_id, size_t
     {
         return false;
     }
-    return static_cast<uint32_t>(sum);
-}
 
-const size_t limb_offset = static_cast<size_t>(limb_id.y) * bytes_per_limb;
-if (limb_offset > total_bytes || total_bytes - limb_offset < bytes)
-{
-    return false;
-}
+    const size_t limb_offset = static_cast<size_t>(limb_id.y) * bytes_per_limb;
+    if (limb_offset > total_bytes || total_bytes - limb_offset < bytes)
+    {
+        return false;
+    }
 
-auto *base = reinterpret_cast<uint8_t *>(aux_buffer.ptr);
-*out_ptr = static_cast<void *>(base + limb_offset);
-return true;
+    auto *base = reinterpret_cast<uint8_t *>(aux_buffer.ptr);
+    *out_ptr = static_cast<void *>(base + limb_offset);
+    return true;
 }
 
 size_t matrix_align_up_size(size_t value, size_t alignment)
@@ -378,6 +377,7 @@ int matrix_release_aux_workspace(void *ptr, bool from_shared, cudaStream_t strea
     }
     return 0;
 }
+
 
 uint32_t bit_width_u64(uint64_t v)
 {

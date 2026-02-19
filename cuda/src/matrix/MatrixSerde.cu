@@ -922,8 +922,7 @@ extern "C" int gpu_poly_store_compact_bytes(
     unsigned int *d_max_abs_bits = nullptr;
     uint8_t *d_payload = nullptr;
     cudaStream_t work_stream = nullptr;
-    auto free_ptr = [&](auto *&ptr)
-    {
+    auto free_ptr = [&](auto *&ptr) {
         if (!ptr)
         {
             return;
@@ -938,8 +937,7 @@ extern "C" int gpu_poly_store_compact_bytes(
         }
         ptr = nullptr;
     };
-    auto release = [&]()
-    {
+    auto release = [&]() {
         free_ptr(d_payload);
         free_ptr(d_max_abs_bits);
         free_ptr(d_sign_bits);
@@ -1421,8 +1419,7 @@ extern "C" int gpu_poly_load_compact_bytes(
     size_t *d_limb_strides = nullptr;
     uint64_t *d_moduli = nullptr;
     cudaStream_t work_stream = nullptr;
-    auto free_ptr = [&](auto *&ptr)
-    {
+    auto free_ptr = [&](auto *&ptr) {
         if (!ptr)
         {
             return;
@@ -1437,8 +1434,7 @@ extern "C" int gpu_poly_load_compact_bytes(
         }
         ptr = nullptr;
     };
-    auto release = [&]()
-    {
+    auto release = [&]() {
         free_ptr(d_moduli);
         free_ptr(d_limb_strides);
         free_ptr(d_limb_ptrs);

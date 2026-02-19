@@ -113,6 +113,7 @@ int launch_fill_gadget_multi_limb_kernel(
     return 0;
 }
 
+
 extern "C" int gpu_matrix_fill_gadget(
     GpuMatrix *out,
     uint32_t base_bits)

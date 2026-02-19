@@ -276,9 +276,13 @@ mod test {
     use super::*;
     use crate::{
         __PAIR, __TestState,
+        element::PolyElem,
         poly::PolyParams,
         sampler::{PolyUniformSampler, uniform::DCRTPolyUniformSampler},
+        simulator::error_norm::compute_preimage_norm,
     };
+    use bigdecimal::{BigDecimal, FromPrimitive};
+    use num_bigint::{BigInt, BigUint};
 
     const SIGMA: f64 = 4.578;
 
@@ -594,6 +598,129 @@ mod test {
         let product = public_matrix * &preimage;
 
         assert_eq!(product, target, "Product of public matrix and preimage should equal target");
+    }
+
+    #[test]
+    #[sequential_test::sequential]
+    fn test_preimage_coefficients_below_compute_preimage_norm() {
+        let size = 2usize;
+        let params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
+        let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+        let uniform_sampler = DCRTPolyUniformSampler::new();
+
+        let ring_dim_sqrt = BigDecimal::from_u32(params.ring_dimension())
+            .expect("ring dimension should convert to BigDecimal")
+            .sqrt()
+            .expect("ring dimension sqrt should exist");
+        let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
+        let m_g = (size * params.modulus_digits()) as u64;
+        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base);
+        let modulus = params.modulus();
+
+        for sample_idx in 0..4usize {
+            let target = uniform_sampler.sample_uniform(&params, size, size, DistType::FinRingDist);
+            let preimage = trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &target);
+            assert_eq!(&public_matrix * &preimage, target);
+
+            for i in 0..preimage.row_size() {
+                for j in 0..preimage.col_size() {
+                    let poly = preimage.entry(i, j);
+                    for (coeff_idx, coeff) in poly.coeffs().into_iter().enumerate() {
+                        let value = coeff.value().clone();
+                        let neg = modulus.as_ref() - &value;
+                        let centered_abs = if value < neg { value } else { neg };
+                        let centered_bd = BigDecimal::from(BigInt::from(centered_abs.clone()));
+                        assert!(
+                            centered_bd < preimage_norm_bound,
+                            "preimage coeff exceeds compute_preimage_norm bound at sample={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={}",
+                            sample_idx,
+                            i,
+                            j,
+                            coeff_idx,
+                            centered_abs,
+                            preimage_norm_bound
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[sequential_test::sequential]
+    fn test_p_hat_coefficients_below_compute_preimage_norm() {
+        let size = 2usize;
+        let params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
+        let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let (trapdoor, _public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+
+        let ring_dim_sqrt = BigDecimal::from_u32(params.ring_dimension())
+            .expect("ring dimension should convert to BigDecimal")
+            .sqrt()
+            .expect("ring dimension sqrt should exist");
+        let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
+        let m_g = (size * params.modulus_digits()) as u64;
+        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base);
+        let modulus = params.modulus();
+        let n = params.ring_dimension() as usize;
+        let k = params.modulus_digits();
+        let base = 1u32 << params.base_bits();
+        let c = (base as f64 + 1.0) * SIGMA;
+        let s = SPECTRAL_CONSTANT *
+            (base as f64 + 1.0) *
+            SIGMA *
+            SIGMA *
+            (((size * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+        let dgg_large_std = (s * s - c * c).sqrt();
+        let peikert = dgg_large_std < KARNEY_THRESHOLD;
+        let (dgg_large_mean, dgg_large_table) = if dgg_large_std > KARNEY_THRESHOLD {
+            (None, None)
+        } else {
+            let acc: f64 = 5e-32;
+            let m = (-2.0 * acc.ln()).sqrt();
+            let fin = (dgg_large_std * m).ceil() as usize;
+
+            let mut m_vals = Vec::with_capacity(fin);
+            let variance = 2.0 * dgg_large_std * dgg_large_std;
+            let mut cusum = 0.0f64;
+            for i in 1..=fin {
+                cusum += (-(i as f64 * i as f64) / variance).exp();
+                m_vals.push(cusum);
+            }
+            let m_a = 1.0 / (2.0 * cusum + 1.0);
+            for val in &mut m_vals {
+                *val *= m_a;
+            }
+            (Some(m_a), Some(m_vals))
+        };
+        let dgg_large_params = (dgg_large_mean, dgg_large_std, dgg_large_table.as_deref());
+
+        for sample_idx in 0..4usize {
+            let p_hat =
+                trapdoor.sample_pert_square_mat(s, c, SIGMA, dgg_large_params, peikert, size);
+            for i in 0..p_hat.row_size() {
+                for j in 0..p_hat.col_size() {
+                    let poly = p_hat.entry(i, j);
+                    for (coeff_idx, coeff) in poly.coeffs().into_iter().enumerate() {
+                        let value = coeff.value().clone();
+                        let neg = modulus.as_ref() - &value;
+                        let centered_abs = if value < neg { value } else { neg };
+                        let centered_bd = BigDecimal::from(BigInt::from(centered_abs.clone()));
+                        assert!(
+                            centered_bd < preimage_norm_bound,
+                            "p_hat coeff exceeds compute_preimage_norm bound at sample={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={}",
+                            sample_idx,
+                            i,
+                            j,
+                            coeff_idx,
+                            centered_abs,
+                            preimage_norm_bound
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

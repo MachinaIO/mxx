@@ -62,6 +62,28 @@ pub trait PolyMatrix:
 {
     type P: Poly;
 
+    fn add_in_place(&mut self, rhs: &Self) {
+        *self = self.clone() + rhs;
+    }
+
+    fn copy_block_from(
+        &mut self,
+        src: &Self,
+        dst_row: usize,
+        dst_col: usize,
+        src_row: usize,
+        src_col: usize,
+        rows: usize,
+        cols: usize,
+    ) {
+        for r in 0..rows {
+            for c in 0..cols {
+                let elem = src.entry(src_row + r, src_col + c);
+                self.set_entry(dst_row + r, dst_col + c, elem);
+            }
+        }
+    }
+
     fn to_compact_bytes(&self) -> Vec<u8>;
     fn from_compact_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self;
     fn from_poly_vec(params: &<Self::P as Poly>::Params, vec: Vec<Vec<Self::P>>) -> Self;

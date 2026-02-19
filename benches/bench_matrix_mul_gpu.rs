@@ -29,11 +29,11 @@ fn bench_gpu_matrix_mul() {
     let right = GpuDCRTPolyMatrix::from_cpu_matrix(&params, &right_cpu);
 
     let start = Instant::now();
-    let (result, kernel_ms) = left.mul_with_kernel_time(&right);
+    let result = &left * &right;
     let elapsed = start.elapsed();
     black_box(result);
 
-    info!("GPU GpuDCRTPolyMatrix mul: total={:?}, kernel={:.3} ms", elapsed, kernel_ms);
+    info!("GPU GpuDCRTPolyMatrix mul: total={:?}", elapsed);
 }
 
 #[cfg(not(feature = "gpu"))]

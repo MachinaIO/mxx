@@ -47,47 +47,43 @@ namespace
 
             cudaStream_t free_stream = nullptr;
             cudaError_t err = cudaStreamCreateWithFlags(&free_stream, cudaStreamNonBlocking);
+
             if (err == cudaSuccess && free_stream)
             {
                 bool dependency_ok = true;
                 bool async_free_queued = false;
-                std::vector<cudaEvent_t> drained_events;
                 if (partition_idx < mat->exec_limb_states.size())
                 {
                     auto &states = mat->exec_limb_states[partition_idx];
-                    drained_events.reserve(states.size());
                     for (auto &state : states)
                     {
                         if (!state.stream)
                         {
                             continue;
                         }
-                        cudaEvent_t drained = nullptr;
-                        err = cudaEventCreateWithFlags(&drained, cudaEventDisableTiming);
-                        if (err != cudaSuccess || !drained)
+                        if (state.device != device)
                         {
-                            if (drained)
-                            {
-                                cudaEventDestroy(drained);
-                            }
                             dependency_ok = false;
                             break;
                         }
-                        err = cudaEventRecord(drained, state.stream);
+                        if (!state.write_done)
+                        {
+                            dependency_ok = false;
+                            break;
+                        }
+                        err = cudaEventRecord(state.write_done, state.stream);
                         if (err != cudaSuccess)
                         {
-                            cudaEventDestroy(drained);
                             dependency_ok = false;
                             break;
                         }
-                        err = cudaStreamWaitEvent(free_stream, drained, 0);
+                        state.write_done_valid = true;
+                        err = cudaStreamWaitEvent(free_stream, state.write_done, 0);
                         if (err != cudaSuccess)
                         {
-                            cudaEventDestroy(drained);
                             dependency_ok = false;
                             break;
                         }
-                        drained_events.push_back(drained);
                     }
                 }
                 if (dependency_ok)
@@ -101,14 +97,6 @@ namespace
                         cudaFreeAsync(aux_ptr, free_stream);
                     }
                     async_free_queued = true;
-
-                    cudaEvent_t free_done = nullptr;
-                    err = cudaEventCreateWithFlags(&free_done, cudaEventDisableTiming);
-                    if (err == cudaSuccess && free_done)
-                    {
-                        cudaEventRecord(free_done, free_stream);
-                        cudaEventDestroy(free_done);
-                    }
                 }
                 if (!dependency_ok && !async_free_queued)
                 {
@@ -121,13 +109,6 @@ namespace
                     {
                         cudaFree(aux_ptr);
                         aux_ptr = nullptr;
-                    }
-                }
-                for (cudaEvent_t drained : drained_events)
-                {
-                    if (drained)
-                    {
-                        cudaEventDestroy(drained);
                     }
                 }
                 if (free_stream)
@@ -168,12 +149,21 @@ namespace
         for (size_t partition_idx = 0; partition_idx < mat->exec_limb_states.size(); ++partition_idx)
         {
             auto &states = mat->exec_limb_states[partition_idx];
-            for (auto &state : states)
+            int device = -1;
+            for (const auto &state : states)
             {
                 if (state.device >= 0)
                 {
-                    cudaSetDevice(state.device);
+                    device = state.device;
+                    break;
                 }
+            }
+            if (device >= 0)
+            {
+                cudaSetDevice(device);
+            }
+            for (auto &state : states)
+            {
                 if (state.write_done)
                 {
                     cudaEventDestroy(state.write_done);

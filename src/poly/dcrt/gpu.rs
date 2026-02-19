@@ -133,10 +133,7 @@ unsafe extern "C" {
         cols: usize,
     ) -> c_int;
     pub(crate) fn gpu_matrix_fill_gadget(out: *mut GpuMatrixOpaque, base_bits: u32) -> c_int;
-    pub(crate) fn gpu_matrix_fill_small_gadget(
-        out: *mut GpuMatrixOpaque,
-        base_bits: u32,
-    ) -> c_int;
+    pub(crate) fn gpu_matrix_fill_small_gadget(out: *mut GpuMatrixOpaque, base_bits: u32) -> c_int;
     pub(crate) fn gpu_matrix_decompose_base(
         src: *const GpuMatrixOpaque,
         base_bits: u32,

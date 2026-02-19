@@ -7,24 +7,25 @@
 #include "Runtime.cuh"
 
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 
-typedef struct GpuMatrix GpuMatrix;
+    typedef struct GpuMatrix GpuMatrix;
 
-typedef enum GpuPolyFormat
-{
-    GPU_POLY_FORMAT_COEFF = 0,
-    GPU_POLY_FORMAT_EVAL = 1,
-} GpuPolyFormat;
+    typedef enum GpuPolyFormat
+    {
+        GPU_POLY_FORMAT_COEFF = 0,
+        GPU_POLY_FORMAT_EVAL = 1,
+    } GpuPolyFormat;
 
-typedef enum GpuMatrixSampleDist
-{
-    GPU_MATRIX_DIST_UNIFORM = 0,
-    GPU_MATRIX_DIST_GAUSS = 1,
-    GPU_MATRIX_DIST_BIT = 2,
-    GPU_MATRIX_DIST_TERNARY = 3,
-} GpuMatrixSampleDist;
+    typedef enum GpuMatrixSampleDist
+    {
+        GPU_MATRIX_DIST_UNIFORM = 0,
+        GPU_MATRIX_DIST_GAUSS = 1,
+        GPU_MATRIX_DIST_BIT = 2,
+        GPU_MATRIX_DIST_TERNARY = 3,
+    } GpuMatrixSampleDist;
 
 #ifdef __cplusplus
 }
@@ -38,6 +39,13 @@ struct GpuMatrix
     size_t cols;
     int level;
     GpuPolyFormat format;
+    struct LimbExecState
+    {
+        int device;
+        cudaStream_t stream;
+        cudaEvent_t write_done;
+        bool write_done_valid;
+    };
     struct SharedLimbBuffer
     {
         int device;
@@ -56,6 +64,7 @@ struct GpuMatrix
     };
     std::vector<SharedLimbBuffer> shared_limb_buffers;
     std::vector<SharedAuxBuffer> shared_aux_buffers;
+    std::vector<std::vector<LimbExecState>> exec_limb_states;
 };
 #endif
 

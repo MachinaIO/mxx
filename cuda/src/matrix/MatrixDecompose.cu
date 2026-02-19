@@ -1,3 +1,87 @@
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
+namespace
+{
+    bool gpu_decompose_timing_enabled()
+    {
+        static int enabled = []() {
+            const char *env = std::getenv("MXX_GPU_DECOMPOSE_TIMING");
+            return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+        }();
+        return enabled != 0;
+    }
+
+    long long elapsed_ms_since(const std::chrono::steady_clock::time_point &start_time)
+    {
+        const auto end_time = std::chrono::steady_clock::now();
+        const auto elapsed_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+        return static_cast<long long>(elapsed_us / 1000);
+    }
+
+    void log_decompose_stage_timing(
+        const char *stage,
+        int level,
+        size_t in_rows,
+        size_t in_cols,
+        size_t out_rows,
+        size_t out_cols,
+        long long elapsed_ms,
+        int status)
+    {
+        if (!gpu_decompose_timing_enabled())
+        {
+            return;
+        }
+        std::fprintf(
+            stderr,
+            "[mxx][gpu_matrix_decompose_base][debug] stage=%s level=%d in_shape=(%zu,%zu) out_shape=(%zu,%zu) elapsed_ms=%lld status=%d\n",
+            stage ? stage : "unknown",
+            level,
+            in_rows,
+            in_cols,
+            out_rows,
+            out_cols,
+            elapsed_ms,
+            status);
+    }
+
+    void log_decompose_loop_timing(
+        const char *stage,
+        int level,
+        size_t in_rows,
+        size_t in_cols,
+        size_t out_rows,
+        size_t out_cols,
+        int src_limb,
+        int out_limb,
+        int digit_idx,
+        long long elapsed_ms,
+        int status)
+    {
+        if (!gpu_decompose_timing_enabled())
+        {
+            return;
+        }
+        std::fprintf(
+            stderr,
+            "[mxx][gpu_matrix_decompose_base][debug] stage=%s level=%d in_shape=(%zu,%zu) out_shape=(%zu,%zu) src_limb=%d out_limb=%d digit_idx=%d elapsed_ms=%lld status=%d\n",
+            stage ? stage : "unknown",
+            level,
+            in_rows,
+            in_cols,
+            out_rows,
+            out_cols,
+            src_limb,
+            out_limb,
+            digit_idx,
+            elapsed_ms,
+            status);
+    }
+}
+
 __device__ __forceinline__ uint64_t pow_mod_u64(uint64_t base, uint32_t exp, uint64_t modulus)
 {
     if (modulus == 0)
@@ -265,6 +349,8 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
 
     const size_t rows = src->rows;
     const size_t cols = src->cols;
+    const size_t out_rows = out->rows;
+    const size_t out_cols = out->cols;
     const size_t count = rows * cols;
     const int level = src->level;
     if (level < 0)
@@ -304,7 +390,17 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
     {
         if (tmp_inputs_matrix)
         {
+            const auto destroy_start = std::chrono::steady_clock::now();
             gpu_matrix_destroy(tmp_inputs_matrix);
+            log_decompose_stage_timing(
+                "gpu_matrix_destroy_tmp_inputs",
+                level,
+                rows,
+                cols,
+                out_rows,
+                out_cols,
+                elapsed_ms_since(destroy_start),
+                0);
             tmp_inputs_matrix = nullptr;
         }
     };
@@ -315,19 +411,49 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
     {
         const int matrix_format =
             src->format == GPU_POLY_FORMAT_EVAL ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
+        auto stage_start = std::chrono::steady_clock::now();
         status = gpu_matrix_create(src->ctx, level, rows, cols, matrix_format, &tmp_inputs_matrix);
+        log_decompose_stage_timing(
+            "gpu_matrix_create_tmp_inputs",
+            level,
+            rows,
+            cols,
+            out_rows,
+            out_cols,
+            elapsed_ms_since(stage_start),
+            status);
         if (status != 0)
         {
             cleanup_tmp_inputs();
             return status;
         }
+        stage_start = std::chrono::steady_clock::now();
         status = gpu_matrix_copy(tmp_inputs_matrix, src);
+        log_decompose_stage_timing(
+            "gpu_matrix_copy_tmp_inputs",
+            level,
+            rows,
+            cols,
+            out_rows,
+            out_cols,
+            elapsed_ms_since(stage_start),
+            status);
         if (status != 0)
         {
             cleanup_tmp_inputs();
             return status;
         }
+        stage_start = std::chrono::steady_clock::now();
         status = gpu_matrix_intt_all(tmp_inputs_matrix, batch);
+        log_decompose_stage_timing(
+            "gpu_matrix_intt_all_tmp_inputs",
+            level,
+            rows,
+            cols,
+            out_rows,
+            out_cols,
+            elapsed_ms_since(stage_start),
+            status);
         if (status != 0)
         {
             cleanup_tmp_inputs();
@@ -383,7 +509,20 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
         const size_t coeff_bytes = static_cast<size_t>(src->ctx->N) * sizeof(uint64_t);
         if (out_count > 0)
         {
+            const auto stage_start = std::chrono::steady_clock::now();
             err = cudaMemset2DAsync(dst, dst_pitch, 0, coeff_bytes, out_count, out_stream);
+            log_decompose_loop_timing(
+                "cudaMemset2DAsync_out_limb",
+                level,
+                rows,
+                cols,
+                out_rows,
+                out_cols,
+                -1,
+                limb,
+                -1,
+                elapsed_ms_since(stage_start),
+                static_cast<int>(err));
             if (err != cudaSuccess)
             {
                 cleanup_tmp_inputs();
@@ -445,7 +584,20 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
                 cleanup_tmp_inputs();
                 return status;
             }
+            const auto wait_start = std::chrono::steady_clock::now();
             status = matrix_wait_limb_stream(inputs_matrix, src_limb_id, out_device, out_stream);
+            log_decompose_loop_timing(
+                "matrix_wait_limb_stream",
+                level,
+                rows,
+                cols,
+                out_rows,
+                out_cols,
+                src_limb,
+                out_limb,
+                -1,
+                elapsed_ms_since(wait_start),
+                status);
             if (status != 0)
             {
                 cleanup_tmp_inputs();
@@ -480,6 +632,7 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
                     static_cast<size_t>(src_limb) * static_cast<size_t>(digits_per_tower) +
                     static_cast<size_t>(digit_idx);
 
+                const auto launch_start = std::chrono::steady_clock::now();
                 status = launch_decompose_multi_kernel<uint64_t>(
                     src_base,
                     dst_base,
@@ -497,23 +650,61 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
                     out_stream,
                     out,
                     &out_limb_id);
+                log_decompose_loop_timing(
+                    "launch_decompose_multi_kernel",
+                    level,
+                    rows,
+                    cols,
+                    out_rows,
+                    out_cols,
+                    src_limb,
+                    out_limb,
+                    static_cast<int>(digit_idx),
+                    elapsed_ms_since(launch_start),
+                    status);
                 if (status != 0)
                 {
                     cleanup_tmp_inputs();
                     return status;
                 }
+                const auto record_start = std::chrono::steady_clock::now();
                 status = matrix_record_limb_write(out, out_limb_id, out_stream);
+                log_decompose_loop_timing(
+                    "matrix_record_limb_write",
+                    level,
+                    rows,
+                    cols,
+                    out_rows,
+                    out_cols,
+                    src_limb,
+                    out_limb,
+                    static_cast<int>(digit_idx),
+                    elapsed_ms_since(record_start),
+                    status);
                 if (status != 0)
                 {
                     cleanup_tmp_inputs();
                     return status;
                 }
             }
+            const auto track_start = std::chrono::steady_clock::now();
             status = matrix_track_limb_consumer(
                 inputs_matrix,
                 src_limb_id,
                 out_device,
                 out_stream);
+            log_decompose_loop_timing(
+                "matrix_track_limb_consumer",
+                level,
+                rows,
+                cols,
+                out_rows,
+                out_cols,
+                src_limb,
+                out_limb,
+                -1,
+                elapsed_ms_since(track_start),
+                status);
             if (status != 0)
             {
                 cleanup_tmp_inputs();
@@ -525,7 +716,17 @@ extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bit
     out->format = GPU_POLY_FORMAT_COEFF;
     if (requested_out_format == GPU_POLY_FORMAT_EVAL)
     {
+        const auto ntt_start = std::chrono::steady_clock::now();
         status = gpu_matrix_ntt_all(out, batch);
+        log_decompose_stage_timing(
+            "gpu_matrix_ntt_all_out",
+            level,
+            rows,
+            cols,
+            out_rows,
+            out_cols,
+            elapsed_ms_since(ntt_start),
+            status);
         if (status != 0)
         {
             cleanup_tmp_inputs();

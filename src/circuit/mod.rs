@@ -507,7 +507,17 @@ impl<P: Poly> PolyCircuit<P> {
         PE: PltEvaluator<E>,
     {
         let (call_id_base, gate_id_base) = self.eval_gate_id_bases();
-        self.eval_scoped(params, one, inputs, plt_evaluator, 0, call_id_base, gate_id_base)
+        let shared_inputs: Vec<Arc<E>> = inputs.iter().cloned().map(Arc::new).collect();
+        let outputs = self.eval_scoped(
+            params,
+            one,
+            &shared_inputs,
+            plt_evaluator,
+            0,
+            call_id_base,
+            gate_id_base,
+        );
+        outputs.into_iter().map(|value| value.as_ref().clone()).collect()
     }
 
     fn eval_gate_id_bases(&self) -> (usize, usize) {
@@ -536,12 +546,12 @@ impl<P: Poly> PolyCircuit<P> {
         &self,
         params: &E::Params,
         one: &E,
-        inputs: &[E],
+        inputs: &[Arc<E>],
         plt_evaluator: Option<&PE>,
         call_prefix: usize,
         call_id_base: usize,
         gate_id_base: usize,
-    ) -> Vec<E>
+    ) -> Vec<Arc<E>>
     where
         E: Evaluable<P = P>,
         PE: PltEvaluator<E>,
@@ -591,7 +601,7 @@ impl<P: Poly> PolyCircuit<P> {
             "number of provided inputs must match circuit inputs"
         );
         for (id, input) in input_gate_ids.into_iter().zip(inputs.iter()) {
-            wires.insert(id, Arc::new(input.clone()));
+            wires.insert(id, Arc::clone(input));
             if let Some(prefix) = self.print_value.get(&id) {
                 info!("{}", format!("[{prefix}] Gate ID {id}, {:?}", input));
             }
@@ -608,7 +618,7 @@ impl<P: Poly> PolyCircuit<P> {
             }
             let gate = self.gates.get(&gate_id).expect("gate not found").clone();
             debug!("Get gate");
-            let result = match &gate.gate_type {
+            let result: Arc<E> = match &gate.gate_type {
                 PolyGateType::Input => {
                     panic!("Input gate {gate:?} should already be preloaded");
                 }
@@ -620,7 +630,7 @@ impl<P: Poly> PolyCircuit<P> {
                         wires.get(&gate.input_gates[1]).expect("wire missing for Add").clone();
                     let result = (*left).clone() + &*right;
                     debug!("Add gate end");
-                    result
+                    Arc::new(result)
                 }
                 PolyGateType::Sub => {
                     debug!("Sub gate start");
@@ -630,7 +640,7 @@ impl<P: Poly> PolyCircuit<P> {
                         wires.get(&gate.input_gates[1]).expect("wire missing for Sub").clone();
                     let result = (*left).clone() - &*right;
                     debug!("Sub gate end");
-                    result
+                    Arc::new(result)
                 }
                 PolyGateType::Mul => {
                     debug!("Mul gate start");
@@ -640,7 +650,7 @@ impl<P: Poly> PolyCircuit<P> {
                         wires.get(&gate.input_gates[1]).expect("wire missing for Mul").clone();
                     let result = (*left).clone() * &*right;
                     debug!("Mul gate end");
-                    result
+                    Arc::new(result)
                 }
                 PolyGateType::SmallScalarMul { scalar } => {
                     let input = wires
@@ -649,7 +659,7 @@ impl<P: Poly> PolyCircuit<P> {
                         .clone();
                     let result = input.small_scalar_mul(params, scalar);
                     debug!("Large scalar mul gate end");
-                    result
+                    Arc::new(result)
                 }
                 PolyGateType::LargeScalarMul { scalar } => {
                     let input = wires
@@ -658,7 +668,7 @@ impl<P: Poly> PolyCircuit<P> {
                         .clone();
                     let result = input.large_scalar_mul(params, scalar);
                     debug!("Large scalar mul gate end");
-                    result
+                    Arc::new(result)
                 }
                 PolyGateType::Rotate { shift } => {
                     debug!("Rotate gate start");
@@ -666,7 +676,7 @@ impl<P: Poly> PolyCircuit<P> {
                         wires.get(&gate.input_gates[0]).expect("wire missing for Rotate").clone();
                     let result = input.rotate(params, *shift);
                     debug!("Rotate gate end");
-                    result
+                    Arc::new(result)
                 }
                 PolyGateType::PubLut { lut_id } => {
                     debug!("Public Lookup gate start");
@@ -691,7 +701,7 @@ impl<P: Poly> PolyCircuit<P> {
                             *lut_id,
                         );
                     debug!("Public Lookup gate end");
-                    result
+                    Arc::new(result)
                 }
                 PolyGateType::SubCircuitOutput { call_id, output_idx, .. } => {
                     debug!("Sub-circuit call start");
@@ -712,9 +722,7 @@ impl<P: Poly> PolyCircuit<P> {
                     let sub_inputs = call
                         .inputs
                         .iter()
-                        .map(|id| {
-                            wires.get(id).expect("wire missing for sub-circuit").as_ref().clone()
-                        })
+                        .map(|id| wires.get(id).expect("wire missing for sub-circuit").clone())
                         .collect::<Vec<_>>();
                     let sub_outputs = sub_circuit.eval_scoped(
                         params,
@@ -728,20 +736,19 @@ impl<P: Poly> PolyCircuit<P> {
                     if sub_outputs.len() != call.output_gate_ids.len() {
                         panic!("sub-circuit output size mismatch");
                     }
-                    let output_arcs: Vec<Arc<E>> = sub_outputs.into_iter().map(Arc::new).collect();
                     for (gate_id, value) in
-                        call.output_gate_ids.iter().copied().zip(output_arcs.iter().cloned())
+                        call.output_gate_ids.iter().copied().zip(sub_outputs.iter().cloned())
                     {
                         wires.insert(gate_id, value);
                     }
                     debug!("Sub-circuit call end");
-                    output_arcs[*output_idx].as_ref().clone()
+                    sub_outputs[*output_idx].clone()
                 }
             };
             if let Some(prefix) = self.print_value.get(&gate_id) {
                 info!("{}", format!("[{prefix}] Gate ID {gate_id}, {:?}", result));
             }
-            wires.insert(gate_id, Arc::new(result));
+            wires.insert(gate_id, result);
             debug!("{}", format!("Gate id {gate_id} finished"));
         };
 
@@ -840,7 +847,7 @@ impl<P: Poly> PolyCircuit<P> {
                 .collect()
         };
         debug!("Outputs are collected");
-        outputs.into_iter().map(|value| (*value).clone()).collect()
+        outputs
     }
 
     pub fn register_public_lookup(&mut self, public_lookup: PublicLut<P>) -> usize {

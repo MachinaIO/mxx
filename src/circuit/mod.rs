@@ -507,9 +507,18 @@ impl<P: Poly> PolyCircuit<P> {
         PE: PltEvaluator<E>,
     {
         let (call_id_base, gate_id_base) = self.eval_gate_id_bases();
-        let outputs =
-            self.eval_scoped(params, one, inputs, plt_evaluator, 0, call_id_base, gate_id_base);
-        outputs.into_iter().map(|value| value.as_ref().clone()).collect()
+        let input_compacts =
+            inputs.iter().map(|input| Arc::new(input.to_compact())).collect::<Vec<_>>();
+        let outputs = self.eval_scoped(
+            params,
+            one,
+            &input_compacts,
+            plt_evaluator,
+            0,
+            call_id_base,
+            gate_id_base,
+        );
+        outputs.into_iter().map(|value| E::from_compact(params, value.as_ref())).collect()
     }
 
     fn eval_gate_id_bases(&self) -> (usize, usize) {
@@ -538,12 +547,12 @@ impl<P: Poly> PolyCircuit<P> {
         &self,
         params: &E::Params,
         one: &Arc<E>,
-        inputs: &[Arc<E>],
+        inputs: &[Arc<E::Compact>],
         plt_evaluator: Option<&PE>,
         call_prefix: usize,
         call_id_base: usize,
         gate_id_base: usize,
-    ) -> Vec<Arc<E>>
+    ) -> Vec<Arc<E::Compact>>
     where
         E: Evaluable<P = P>,
         PE: PltEvaluator<E>,
@@ -554,7 +563,7 @@ impl<P: Poly> PolyCircuit<P> {
             assert_ne!(self.num_output(), 0);
         }
 
-        let wires: DashMap<GateId, Arc<E>> = DashMap::new();
+        let wires: DashMap<GateId, Arc<E::Compact>> = DashMap::new();
         let levels = self.compute_levels();
         debug!("{}", format!("Levels: {levels:?}"));
         debug!("Levels are computed");
@@ -585,7 +594,7 @@ impl<P: Poly> PolyCircuit<P> {
             .collect();
         debug!("Initialized remaining-use counters for {} wires", remaining_use_count.len());
 
-        wires.insert(GateId(0), Arc::clone(one));
+        wires.insert(GateId(0), Arc::new(one.to_compact()));
         debug!("Constant one gate is set");
         // Collect all input gate IDs excluding the reserved constant-one gate (0)
         let mut input_gate_ids: Vec<GateId> = self
@@ -606,7 +615,8 @@ impl<P: Poly> PolyCircuit<P> {
         for (id, input) in input_gate_ids.into_iter().zip(inputs.iter()) {
             wires.insert(id, Arc::clone(input));
             if let Some(prefix) = self.print_value.get(&id) {
-                info!("{}", format!("[{prefix}] Gate ID {id}, {:?}", input));
+                let decoded_input = E::from_compact(params, input.as_ref());
+                info!("{}", format!("[{prefix}] Gate ID {id}, {:?}", decoded_input));
             }
         }
         debug!("Input wires are set");
@@ -637,7 +647,7 @@ impl<P: Poly> PolyCircuit<P> {
                 return;
             }
             debug!("Get gate");
-            let result: Arc<E> = match &gate.gate_type {
+            let result: Arc<E::Compact> = match &gate.gate_type {
                 PolyGateType::Input => {
                     panic!("Input gate {gate:?} should already be preloaded");
                 }
@@ -647,9 +657,11 @@ impl<P: Poly> PolyCircuit<P> {
                         wires.get(&gate.input_gates[0]).expect("wire missing for Add").clone();
                     let right =
                         wires.get(&gate.input_gates[1]).expect("wire missing for Add").clone();
-                    let result = (*left).clone() + &*right;
+                    let left = E::from_compact(params, left.as_ref());
+                    let right = E::from_compact(params, right.as_ref());
+                    let result = left + &right;
                     debug!("Add gate end");
-                    Arc::new(result)
+                    Arc::new(result.to_compact())
                 }
                 PolyGateType::Sub => {
                     debug!("Sub gate start");
@@ -657,9 +669,11 @@ impl<P: Poly> PolyCircuit<P> {
                         wires.get(&gate.input_gates[0]).expect("wire missing for Sub").clone();
                     let right =
                         wires.get(&gate.input_gates[1]).expect("wire missing for Sub").clone();
-                    let result = (*left).clone() - &*right;
+                    let left = E::from_compact(params, left.as_ref());
+                    let right = E::from_compact(params, right.as_ref());
+                    let result = left - &right;
                     debug!("Sub gate end");
-                    Arc::new(result)
+                    Arc::new(result.to_compact())
                 }
                 PolyGateType::Mul => {
                     debug!("Mul gate start");
@@ -667,35 +681,40 @@ impl<P: Poly> PolyCircuit<P> {
                         wires.get(&gate.input_gates[0]).expect("wire missing for Mul").clone();
                     let right =
                         wires.get(&gate.input_gates[1]).expect("wire missing for Mul").clone();
-                    let result = (*left).clone() * &*right;
+                    let left = E::from_compact(params, left.as_ref());
+                    let right = E::from_compact(params, right.as_ref());
+                    let result = left * &right;
                     debug!("Mul gate end");
-                    Arc::new(result)
+                    Arc::new(result.to_compact())
                 }
                 PolyGateType::SmallScalarMul { scalar } => {
                     let input = wires
                         .get(&gate.input_gates[0])
                         .expect("wire missing for LargeScalarMul")
                         .clone();
+                    let input = E::from_compact(params, input.as_ref());
                     let result = input.small_scalar_mul(params, scalar);
                     debug!("Large scalar mul gate end");
-                    Arc::new(result)
+                    Arc::new(result.to_compact())
                 }
                 PolyGateType::LargeScalarMul { scalar } => {
                     let input = wires
                         .get(&gate.input_gates[0])
                         .expect("wire missing for LargeScalarMul")
                         .clone();
+                    let input = E::from_compact(params, input.as_ref());
                     let result = input.large_scalar_mul(params, scalar);
                     debug!("Large scalar mul gate end");
-                    Arc::new(result)
+                    Arc::new(result.to_compact())
                 }
                 PolyGateType::Rotate { shift } => {
                     debug!("Rotate gate start");
                     let input =
                         wires.get(&gate.input_gates[0]).expect("wire missing for Rotate").clone();
+                    let input = E::from_compact(params, input.as_ref());
                     let result = input.rotate(params, *shift);
                     debug!("Rotate gate end");
-                    Arc::new(result)
+                    Arc::new(result.to_compact())
                 }
                 PolyGateType::PubLut { lut_id } => {
                     debug!("Public Lookup gate start");
@@ -703,6 +722,7 @@ impl<P: Poly> PolyCircuit<P> {
                         .get(&gate.input_gates[0])
                         .expect("wire missing for Public Lookup")
                         .clone();
+                    let input = E::from_compact(params, input.as_ref());
                     let scoped_gate_id = call_prefix
                         .checked_mul(gate_id_base)
                         .and_then(|base| base.checked_add(gate_id.0))
@@ -715,12 +735,12 @@ impl<P: Poly> PolyCircuit<P> {
                             params,
                             lookup_guard.as_ref(),
                             one,
-                            &*input,
+                            &input,
                             scoped_gate_id,
                             *lut_id,
                         );
                     debug!("Public Lookup gate end");
-                    Arc::new(result)
+                    Arc::new(result.to_compact())
                 }
                 PolyGateType::SubCircuitOutput { call_id, output_idx, .. } => {
                     debug!("Sub-circuit call start");
@@ -765,7 +785,8 @@ impl<P: Poly> PolyCircuit<P> {
                 }
             };
             if let Some(prefix) = self.print_value.get(&gate_id) {
-                info!("{}", format!("[{prefix}] Gate ID {gate_id}, {:?}", result));
+                let decoded_result = E::from_compact(params, result.as_ref());
+                info!("{}", format!("[{prefix}] Gate ID {gate_id}, {:?}", decoded_result));
             }
             wires.insert(gate_id, result);
             release_consumed_inputs(&gate);
@@ -816,11 +837,11 @@ impl<P: Poly> PolyCircuit<P> {
             }
         }
 
-        let outputs: Vec<Arc<E>> = if use_parallel {
+        let outputs: Vec<Arc<E::Compact>> = if use_parallel {
             if let Some(chunk_size) = parallel_gates {
-                let mut out: Vec<Arc<E>> = Vec::with_capacity(self.output_ids.len());
+                let mut out: Vec<Arc<E::Compact>> = Vec::with_capacity(self.output_ids.len());
                 for chunk in self.output_ids.chunks(chunk_size) {
-                    let mut chunk_out: Vec<Arc<E>> = chunk
+                    let mut chunk_out: Vec<Arc<E::Compact>> = chunk
                         .par_iter()
                         .map(|&id| wires.get(&id).expect("output missing").clone())
                         .collect();

@@ -7,6 +7,15 @@ use num_bigint::BigUint;
 impl<P: Poly> Evaluable for P {
     type Params = P::Params;
     type P = P;
+    type Compact = Vec<u8>;
+
+    fn to_compact(&self) -> Self::Compact {
+        self.to_compact_bytes()
+    }
+
+    fn from_compact(params: &Self::Params, compact: &Self::Compact) -> Self {
+        Self::from_compact_bytes(params, compact)
+    }
 
     fn rotate(&self, params: &Self::Params, shift: i32) -> Self {
         let mut coeffs = self.coeffs();

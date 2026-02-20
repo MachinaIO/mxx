@@ -96,6 +96,15 @@ impl_binop_with_refs!(ErrorNorm => Mul::mul(self, rhs: &ErrorNorm) -> ErrorNorm 
 impl Evaluable for ErrorNorm {
     type Params = ();
     type P = DCRTPoly;
+    type Compact = ErrorNorm;
+
+    fn to_compact(&self) -> Self::Compact {
+        self.clone()
+    }
+
+    fn from_compact(_: &Self::Params, compact: &Self::Compact) -> Self {
+        compact.clone()
+    }
 
     fn rotate(&self, _: &Self::Params, _: i32) -> Self {
         self.clone()

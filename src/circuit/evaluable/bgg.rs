@@ -4,10 +4,57 @@ use crate::{
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
 };
+use std::marker::PhantomData;
+
+#[derive(Debug, Clone)]
+pub struct BggPublicKeyCompact<M: PolyMatrix> {
+    pub matrix_bytes: Vec<u8>,
+    pub reveal_plaintext: bool,
+    _m: PhantomData<M>,
+}
+
+impl<M: PolyMatrix> BggPublicKeyCompact<M> {
+    fn new(matrix_bytes: Vec<u8>, reveal_plaintext: bool) -> Self {
+        Self { matrix_bytes, reveal_plaintext, _m: PhantomData }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BggEncodingCompact<M: PolyMatrix> {
+    pub vector_bytes: Vec<u8>,
+    pub pubkey: BggPublicKeyCompact<M>,
+    pub plaintext_bytes: Option<Vec<u8>>,
+}
 
 impl<M: PolyMatrix> Evaluable for BggEncoding<M> {
     type Params = <M::P as Poly>::Params;
     type P = M::P;
+    type Compact = BggEncodingCompact<M>;
+
+    fn to_compact(&self) -> Self::Compact {
+        BggEncodingCompact {
+            vector_bytes: self.vector.to_compact_bytes(),
+            pubkey: BggPublicKeyCompact::new(
+                self.pubkey.matrix.to_compact_bytes(),
+                self.pubkey.reveal_plaintext,
+            ),
+            plaintext_bytes: self.plaintext.as_ref().map(|p| p.to_compact_bytes()),
+        }
+    }
+
+    fn from_compact(params: &Self::Params, compact: &Self::Compact) -> Self {
+        BggEncoding {
+            vector: M::from_compact_bytes(params, &compact.vector_bytes),
+            pubkey: BggPublicKey {
+                matrix: M::from_compact_bytes(params, &compact.pubkey.matrix_bytes),
+                reveal_plaintext: compact.pubkey.reveal_plaintext,
+            },
+            plaintext: compact
+                .plaintext_bytes
+                .as_ref()
+                .map(|bytes| M::P::from_compact_bytes(params, bytes)),
+        }
+    }
 
     fn rotate(&self, params: &Self::Params, shift: i32) -> Self {
         let pubkey = self.pubkey.rotate(params, shift);
@@ -46,6 +93,18 @@ impl<M: PolyMatrix> Evaluable for BggEncoding<M> {
 impl<M: PolyMatrix> Evaluable for BggPublicKey<M> {
     type Params = <M::P as Poly>::Params;
     type P = M::P;
+    type Compact = BggPublicKeyCompact<M>;
+
+    fn to_compact(&self) -> Self::Compact {
+        BggPublicKeyCompact::new(self.matrix.to_compact_bytes(), self.reveal_plaintext)
+    }
+
+    fn from_compact(params: &Self::Params, compact: &Self::Compact) -> Self {
+        BggPublicKey {
+            matrix: M::from_compact_bytes(params, &compact.matrix_bytes),
+            reveal_plaintext: compact.reveal_plaintext,
+        }
+    }
 
     fn rotate(&self, params: &Self::Params, shift: i32) -> Self {
         let shift = if shift >= 0 {

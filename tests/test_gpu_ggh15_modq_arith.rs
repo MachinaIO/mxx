@@ -428,19 +428,24 @@ async fn test_gpu_ggh15_modq_arith() {
     let encodings = encoding_sampler.sample(&params, &pubkeys, &plaintext_inputs);
     let enc_one = encodings[0].clone();
     info!("encoding sampling elapsed_ms={:.3}", enc_setup_start.elapsed().as_secs_f64() * 1000.0);
+    drop(pubkeys);
 
     let encoding_eval_start = Instant::now();
     let encoding_out = circuit.eval(&params, &enc_one, &encodings[1..], Some(&enc_evaluator));
     info!("encoding eval elapsed_ms={:.3}", encoding_eval_start.elapsed().as_secs_f64() * 1000.0);
     assert_eq!(encoding_out.len(), active_q_moduli.len());
+    drop(encodings);
+    drop(enc_one);
 
     let unit_column = GpuDCRTPolyMatrix::unit_column_vector(&params, d_secret, d_secret - 1);
     let mut decoded_residues = Vec::with_capacity(active_q_moduli.len());
-    for (idx, &q_i) in active_q_moduli.iter().enumerate() {
-        assert_eq!(encoding_out[idx].pubkey, pubkey_out[idx]);
+    for ((encoding, pubkey), &q_i) in
+        encoding_out.into_iter().zip(pubkey_out.into_iter()).zip(active_q_moduli.iter())
+    {
+        assert_eq!(encoding.pubkey, pubkey);
 
-        let s_times_pk = s_vec.clone() * &pubkey_out[idx].matrix;
-        let diff = encoding_out[idx].vector.clone() - s_times_pk;
+        let s_times_pk = s_vec.clone() * &pubkey.matrix;
+        let diff = encoding.vector.clone() - s_times_pk;
         let projected = diff.mul_decompose(&unit_column);
         assert_eq!(projected.row_size(), 1);
         assert_eq!(projected.col_size(), 1);

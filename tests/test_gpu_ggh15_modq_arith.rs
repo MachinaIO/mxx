@@ -328,19 +328,19 @@ async fn test_gpu_ggh15_modq_arith() {
     let b_value: BigUint = gen_biguint_for_modulus(&mut rng, &q);
     let expected = (&a_value * &b_value) % &q;
 
-    let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, q_level);
-    let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, q_level);
+    let a_inputs: Vec<GpuDCRTPoly> =
+        encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, q_level);
+    let b_inputs: Vec<GpuDCRTPoly> =
+        encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, q_level);
     let plaintext_inputs = [a_inputs.clone(), b_inputs.clone()].concat();
 
     let dry_circuit = build_modq_arith_value_circuit_gpu(&params, q_level);
     let dry_plt_evaluator = PolyPltEvaluator::new();
     let dry_eval_start = Instant::now();
-    let dry_out = dry_circuit.eval(
-        &params,
-        &GpuDCRTPoly::const_one(&params),
-        &plaintext_inputs,
-        Some(&dry_plt_evaluator),
-    );
+    let dry_one = Arc::new(GpuDCRTPoly::const_one(&params));
+    let dry_inputs: Vec<Arc<GpuDCRTPoly>> =
+        plaintext_inputs.iter().cloned().map(Arc::new).collect();
+    let dry_out = dry_circuit.eval(&params, &dry_one, &dry_inputs, Some(&dry_plt_evaluator));
     info!("dry eval elapsed_ms={:.3}", dry_eval_start.elapsed().as_secs_f64() * 1000.0);
     assert_eq!(dry_out.len(), 1, "dry-run should output one value polynomial");
     let dry_const_term = dry_out[0]
@@ -376,7 +376,11 @@ async fn test_gpu_ggh15_modq_arith() {
         BGGPublicKeySampler::<_, GpuDCRTPolyHashSampler<Keccak256>>::new(seed, d_secret);
     let reveal_plaintexts = vec![true; circuit.num_input()];
     info!("sampling public keys");
-    let pubkeys = pk_sampler.sample(&params, b"BGG_PUBKEY", &reveal_plaintexts);
+    let pubkeys: Vec<_> = pk_sampler
+        .sample(&params, b"BGG_PUBKEY", &reveal_plaintexts)
+        .into_iter()
+        .map(Arc::new)
+        .collect();
     info!("sampled {} public keys", pubkeys.len());
 
     let pk_evaluator_setup_start = Instant::now();
@@ -425,17 +429,19 @@ async fn test_gpu_ggh15_modq_arith() {
     let enc_setup_start = Instant::now();
     let encoding_sampler =
         BGGEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
-    let encodings = encoding_sampler.sample(&params, &pubkeys, &plaintext_inputs);
-    let enc_one = encodings[0].clone();
+    let encodings: Vec<_> = encoding_sampler
+        .sample(&params, &pubkeys, &plaintext_inputs)
+        .into_iter()
+        .map(Arc::new)
+        .collect();
     info!("encoding sampling elapsed_ms={:.3}", enc_setup_start.elapsed().as_secs_f64() * 1000.0);
     drop(pubkeys);
 
     let encoding_eval_start = Instant::now();
-    let encoding_out = circuit.eval(&params, &enc_one, &encodings[1..], Some(&enc_evaluator));
+    let encoding_out = circuit.eval(&params, &encodings[0], &encodings[1..], Some(&enc_evaluator));
     info!("encoding eval elapsed_ms={:.3}", encoding_eval_start.elapsed().as_secs_f64() * 1000.0);
     assert_eq!(encoding_out.len(), active_q_moduli.len());
     drop(encodings);
-    drop(enc_one);
 
     let unit_column = GpuDCRTPolyMatrix::unit_column_vector(&params, d_secret, d_secret - 1);
     let mut decoded_residues = Vec::with_capacity(active_q_moduli.len());

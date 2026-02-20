@@ -34,7 +34,7 @@ use std::{fs, path::Path, sync::Arc, time::Instant};
 use tracing::info;
 
 const CRT_BITS: usize = 51;
-const RING_DIM: u32 = 1 << 11;
+const RING_DIM: u32 = 1 << 8;
 const ERROR_SIGMA: f64 = 4.0;
 const BASE_BITS: u32 = 17;
 const MAX_CRT_DEPTH: usize = 12;
@@ -283,6 +283,9 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
     let enc_one = encodings[0].clone();
     let input_pubkeys = pubkeys[1..].to_vec();
     let input_encodings = encodings[1..].to_vec();
+    let input_pubkeys_shared: Vec<Arc<_>> = input_pubkeys.iter().cloned().map(Arc::new).collect();
+    let input_encodings_shared: Vec<Arc<_>> =
+        input_encodings.iter().cloned().map(Arc::new).collect();
 
     let trapdoor_sigma = 4.578;
     let dir = Path::new("test_data/gpu_ggh15_modp_chain_rounding");
@@ -303,8 +306,9 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
     info!("plt pubkey evaluator setup done");
 
     info!("circuit eval pubkey start");
+    let enc_one_pubkey = Arc::new(enc_one.pubkey.clone());
     let result_pubkey =
-        circuit.eval(&params, &enc_one.pubkey, &input_pubkeys, Some(&plt_pubkey_evaluator));
+        circuit.eval(&params, &enc_one_pubkey, &input_pubkeys_shared, Some(&plt_pubkey_evaluator));
     info!("circuit eval pubkey done");
     assert_eq!(result_pubkey.len(), 1);
     let sample_aux_start = Instant::now();
@@ -334,8 +338,13 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
     info!("plt encoding evaluator setup done");
 
     info!("circuit eval encoding start");
-    let result_encoding =
-        circuit.eval(&params, &enc_one, &input_encodings, Some(&plt_encoding_evaluator));
+    let enc_one_shared = Arc::new(enc_one.clone());
+    let result_encoding = circuit.eval(
+        &params,
+        &enc_one_shared,
+        &input_encodings_shared,
+        Some(&plt_encoding_evaluator),
+    );
     info!("circuit eval encoding done");
     assert_eq!(result_encoding.len(), 1);
 

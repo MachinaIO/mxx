@@ -327,8 +327,8 @@ where
                     lut_id, part_idx, idx
                 );
                 let idx_poly = M::P::from_usize_to_constant(params, *idx);
-                let idx_small_decomposed = M::identity(params, m, Some(idx_poly)).small_decompose();
-                let w_v_idx = w_block_vx.clone() * idx_small_decomposed * &v_idx;
+                let idx_identity = M::identity(params, m, Some(idx_poly.clone()));
+                let w_v_idx = w_block_vx.mul_decompose_small(&idx_identity) * &v_idx;
                 w_t_idx.add_in_place(&w_v_idx);
                 debug!(
                     "Constructed w_block_v_idx contribution for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
@@ -1404,8 +1404,10 @@ where
             m_g * k_small,
             "preimage_gate2_vx must have m_g * k_small columns"
         );
-        let x_small_decomposed = M::identity(params, m_g, Some(x.clone())).small_decompose();
-        c_const = c_const + sg_times_b1.clone() * preimage_gate2_vx * x_small_decomposed * &v_idx;
+        let x_identity = M::identity(params, m_g, Some(x.clone()));
+        c_const = c_const +
+            (sg_times_b1.clone() * preimage_gate2_vx).mul_decompose_small(&x_identity) * &v_idx;
+        drop(x_identity);
 
         let preimage_lut = read_lut_aux_preimage_from_checkpoint::<M>(
             params,

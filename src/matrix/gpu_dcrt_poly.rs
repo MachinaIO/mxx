@@ -1071,6 +1071,79 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         out
     }
 
+    fn mul_decompose_small(&self, other: &Self) -> Self {
+        let total_start = Instant::now();
+        let to_ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let k = self.params.crt_bits().div_ceil(self.params.base_bits() as usize);
+        debug_assert_eq!(self.ncol, other.nrow * k);
+        debug_assert_eq!(self.params, other.params, "mul_decompose_small requires same params");
+        let ncol = other.ncol;
+        if self.nrow == 0 || ncol == 0 {
+            debug!(
+                "GpuDCRTPolyMatrix::mul_decompose_small timing (early return): nrow={}, ncol={}, other_nrow={}, other_ncol={}, total_ms={:.3}",
+                self.nrow,
+                self.ncol,
+                other.nrow,
+                other.ncol,
+                to_ms(total_start.elapsed())
+            );
+            return Self::new_empty(&self.params, self.nrow, ncol);
+        }
+
+        // Keep peak memory low by processing one compact-decomposed column at a time.
+        let mut out = Self::new_empty(&self.params, self.nrow, ncol);
+        let mut decompose_total = Duration::ZERO;
+        let mut mul_total = Duration::ZERO;
+        let mut copy_total = Duration::ZERO;
+        for j in 0..ncol {
+            let col_start = Instant::now();
+
+            let decompose_start = Instant::now();
+            let col_small_decomposed = other.slice(0, other.nrow, j, j + 1).small_decompose();
+            let decompose_elapsed = decompose_start.elapsed();
+
+            let mul_start = Instant::now();
+            let product = self * &col_small_decomposed;
+            let mul_elapsed = mul_start.elapsed();
+
+            let copy_start = Instant::now();
+            out.copy_block_from(&product, 0, j, 0, 0, self.nrow, 1);
+            let copy_elapsed = copy_start.elapsed();
+
+            let col_elapsed = col_start.elapsed();
+            decompose_total += decompose_elapsed;
+            mul_total += mul_elapsed;
+            copy_total += copy_elapsed;
+
+            debug!(
+                "GpuDCRTPolyMatrix::mul_decompose_small timing: col={}/{}, decompose_ms={:.3}, mul_ms={:.3}, copy_ms={:.3}, col_total_ms={:.3}",
+                j + 1,
+                ncol,
+                to_ms(decompose_elapsed),
+                to_ms(mul_elapsed),
+                to_ms(copy_elapsed),
+                to_ms(col_elapsed)
+            );
+        }
+
+        let total_elapsed = total_start.elapsed();
+        let accounted = decompose_total + mul_total + copy_total;
+        let other_total = total_elapsed.saturating_sub(accounted);
+        debug!(
+            "GpuDCRTPolyMatrix::mul_decompose_small timing summary: nrow={}, ncol={}, other_nrow={}, other_ncol={}, total_ms={:.3}, decompose_total_ms={:.3}, mul_total_ms={:.3}, copy_total_ms={:.3}, other_total_ms={:.3}",
+            self.nrow,
+            self.ncol,
+            other.nrow,
+            other.ncol,
+            to_ms(total_elapsed),
+            to_ms(decompose_total),
+            to_ms(mul_total),
+            to_ms(copy_total),
+            to_ms(other_total)
+        );
+        out
+    }
+
     fn get_column_matrix_decompose(&self, j: usize) -> Self {
         debug_assert!(j < self.ncol, "column index out of bounds in get_column_matrix_decompose");
         let col = self.slice(0, self.nrow, j, j + 1);
@@ -1540,6 +1613,53 @@ mod tests {
 
         let reconstructed = GpuDCRTPolyMatrix::small_gadget_matrix(&gpu_params, size) * decomposed;
         assert_eq!(reconstructed, identity);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_mul_decompose_small_relation() {
+        gpu_device_sync();
+        let params = gpu_test_params();
+        let gpu_params = gpu_params_from_cpu(&params);
+        let n = 2usize;
+        let r = 2usize;
+
+        let a = GpuDCRTPolyMatrix::from_poly_vec(
+            &gpu_params,
+            vec![
+                vec![
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 1),
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 2),
+                ],
+                vec![
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 3),
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 4),
+                ],
+            ],
+        );
+        assert_eq!(a.size(), (r, n));
+
+        let b = GpuDCRTPolyMatrix::from_poly_vec(
+            &gpu_params,
+            vec![
+                vec![
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 5),
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 6),
+                ],
+                vec![
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 7),
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 8),
+                ],
+            ],
+        );
+        assert_eq!(b.size(), (n, 2));
+
+        let g_small = GpuDCRTPolyMatrix::small_gadget_matrix(&gpu_params, n);
+        let left = a.clone() * &g_small;
+        let expected = a * &b;
+        let actual = left.mul_decompose_small(&b);
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

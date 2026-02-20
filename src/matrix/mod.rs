@@ -179,6 +179,9 @@ pub trait PolyMatrix:
     /// Performs the operation S * G^-1(other),
     /// where G^-1(other) is digit decomposition of other matrix
     fn mul_decompose(&self, other: &Self) -> Self;
+    /// Performs the operation S * G_small^-1(other),
+    /// where G_small^-1(other) is compact digit decomposition of other matrix
+    fn mul_decompose_small(&self, other: &Self) -> Self;
     /// j is column and return decomposed matrix of target column
     fn get_column_matrix_decompose(&self, j: usize) -> Self;
     /// Stack columns into a single column vector (column-wise vectorization).

@@ -7,7 +7,7 @@ pub use gate::{PolyGate, PolyGateKind, PolyGateType};
 
 use dashmap::DashMap;
 use num_bigint::BigUint;
-use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Debug,
@@ -559,23 +559,31 @@ impl<P: Poly> PolyCircuit<P> {
         debug!("{}", format!("Levels: {levels:?}"));
         debug!("Levels are computed");
         let output_set: HashSet<GateId> = self.output_ids.iter().copied().collect();
-        let last_use_level: DashMap<GateId, usize> = DashMap::new();
-        levels.par_iter().enumerate().for_each(|(level_idx, level)| {
-            for gate_id in level {
-                let gate = self.gates.get(gate_id).expect("gate not found");
-                for input_id in &gate.input_gates {
-                    last_use_level
-                        .entry(*input_id)
-                        .and_modify(|val| {
-                            if *val < level_idx {
-                                *val = level_idx;
-                            }
-                        })
-                        .or_insert(level_idx);
+        // Count remaining input uses per wire so we can release each input wire
+        // immediately after its final consumer gate has been evaluated.
+        let use_count_by_gate: HashMap<GateId, usize> = levels
+            .par_iter()
+            .map(|level| {
+                let mut local_count = HashMap::<GateId, usize>::new();
+                for gate_id in level {
+                    let gate = self.gates.get(gate_id).expect("gate not found");
+                    for input_id in &gate.input_gates {
+                        *local_count.entry(*input_id).or_insert(0) += 1;
+                    }
                 }
-            }
-        });
-        debug!("modified last_use_level");
+                local_count
+            })
+            .reduce(HashMap::new, |mut acc, local| {
+                for (gate_id, count) in local {
+                    *acc.entry(gate_id).or_insert(0) += count;
+                }
+                acc
+            });
+        let remaining_use_count: HashMap<GateId, AtomicUsize> = use_count_by_gate
+            .into_iter()
+            .map(|(gate_id, count)| (gate_id, AtomicUsize::new(count)))
+            .collect();
+        debug!("Initialized remaining-use counters for {} wires", remaining_use_count.len());
 
         wires.insert(GateId(0), Arc::clone(one));
         debug!("Constant one gate is set");
@@ -605,13 +613,29 @@ impl<P: Poly> PolyCircuit<P> {
 
         let parallel_gates = crate::env::circuit_parallel_gates();
         let use_parallel = parallel_gates.map(|n| n != 1).unwrap_or(true);
+        let release_consumed_inputs = |gate: &PolyGate| {
+            for input_id in &gate.input_gates {
+                if output_set.contains(input_id) {
+                    continue;
+                }
+                let Some(counter) = remaining_use_count.get(input_id) else {
+                    continue;
+                };
+                let prev = counter.fetch_sub(1, Ordering::AcqRel);
+                debug_assert!(prev > 0, "remaining use counter underflow for gate {}", input_id);
+                if prev == 1 {
+                    wires.remove(input_id);
+                }
+            }
+        };
         let eval_gate = |gate_id: GateId| {
             debug!("{}", format!("Gate id {gate_id} started"));
+            let gate = self.gates.get(&gate_id).expect("gate not found").clone();
             if wires.contains_key(&gate_id) {
                 debug!("{}", format!("Gate id {gate_id} already evaluated"));
+                release_consumed_inputs(&gate);
                 return;
             }
-            let gate = self.gates.get(&gate_id).expect("gate not found").clone();
             debug!("Get gate");
             let result: Arc<E> = match &gate.gate_type {
                 PolyGateType::Input => {
@@ -744,6 +768,7 @@ impl<P: Poly> PolyCircuit<P> {
                 info!("{}", format!("[{prefix}] Gate ID {gate_id}, {:?}", result));
             }
             wires.insert(gate_id, result);
+            release_consumed_inputs(&gate);
             debug!("{}", format!("Gate id {gate_id} finished"));
         };
 
@@ -788,33 +813,6 @@ impl<P: Poly> PolyCircuit<P> {
             } else {
                 regular_gates.iter().copied().for_each(|gate_id| eval_gate(gate_id));
                 debug!("Evaluated gate in single thread");
-            }
-            let to_remove: HashSet<GateId> = level
-                .par_iter()
-                .map(|gate_id| {
-                    let gate = self.gates.get(gate_id).expect("gate not found");
-                    let mut local: HashSet<GateId> = HashSet::new();
-                    for input_id in &gate.input_gates {
-                        if output_set.contains(input_id) {
-                            continue;
-                        }
-                        if last_use_level
-                            .get(input_id)
-                            .map(|val| *val == level_idx)
-                            .unwrap_or(false)
-                        {
-                            local.insert(*input_id);
-                        }
-                    }
-                    local
-                })
-                .reduce(HashSet::new, |mut acc, local| {
-                    acc.extend(local);
-                    acc
-                });
-            debug!("Level {}: removed {} wires", level_idx, to_remove.len());
-            for gate_id in to_remove {
-                wires.remove(&gate_id);
             }
         }
 

@@ -27,7 +27,6 @@ where
 {
     lut_id: usize,
     input_pubkey_bytes: Vec<u8>,
-    output_pubkey_bytes: Vec<u8>,
     _m: PhantomData<M>,
 }
 
@@ -1060,8 +1059,15 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                         .into_par_iter()
                         .map(|(gate_id, state)| {
                             let trap_sampler = TS::new(params, trapdoor_sigma);
-                            let out_matrix =
-                                M::from_compact_bytes(params, &state.output_pubkey_bytes);
+                            let hash_sampler = HS::new();
+                            let out_matrix = hash_sampler.sample_hash(
+                                params,
+                                self.hash_key,
+                                format!("ggh15_gate_a_out_{}", gate_id),
+                                d,
+                                m_g,
+                                DistType::FinRingDist,
+                            );
                             let target_gate2_identity =
                                 out_matrix.concat_rows(&[&w_block_identity]);
                             let preimage_gate2_identity = trap_sampler.preimage(
@@ -1259,7 +1265,6 @@ where
             GateState {
                 lut_id,
                 input_pubkey_bytes: input.matrix.to_compact_bytes(),
-                output_pubkey_bytes: output_pubkey.matrix.to_compact_bytes(),
                 _m: PhantomData,
             },
         );

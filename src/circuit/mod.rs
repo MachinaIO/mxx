@@ -586,6 +586,7 @@ impl<P: Poly> PolyCircuit<P> {
         debug!("modified last_use_level");
 
         wires.insert(GateId(0), Arc::new(one.clone()));
+        debug!("Constant one gate is set");
         // Collect all input gate IDs excluding the reserved constant-one gate (0)
         let mut input_gate_ids: Vec<GateId> = self
             .gates

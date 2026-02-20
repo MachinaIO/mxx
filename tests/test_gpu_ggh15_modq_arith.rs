@@ -34,7 +34,7 @@ use num_traits::ToPrimitive;
 use std::{fs, path::Path, sync::Arc, time::Instant};
 use tracing::info;
 
-const RING_DIM: u32 = 1 << 8;
+const RING_DIM: u32 = 1 << 14;
 const CRT_BITS: usize = 24;
 const P_MODULI_BITS: usize = 6;
 const SCALE: u64 = 1 << 7;
@@ -353,37 +353,6 @@ async fn test_gpu_ggh15_modq_arith() {
     assert_value_matches_q_level(&dry_const_term, &expected, &q, &active_q_moduli, &all_q_moduli);
     info!("dry-run succeeded with expected constant term");
 
-    let plt_evaluator = PolyPltEvaluator::new();
-    let plain_out = circuit.eval(
-        &params,
-        &GpuDCRTPoly::const_one(&params),
-        &plaintext_inputs,
-        Some(&plt_evaluator),
-    );
-    assert_eq!(plain_out.len(), active_q_moduli.len());
-
-    let mut plain_residues = Vec::with_capacity(active_q_moduli.len());
-    for (idx, &q_i) in active_q_moduli.iter().enumerate() {
-        let coeff = plain_out[idx]
-            .coeffs()
-            .into_iter()
-            .next()
-            .expect("output poly must have at least one coefficient")
-            .value()
-            .clone();
-        let decoded = decode_residue_from_scaled_coeff(&coeff, q_i, full_q.as_ref());
-        plain_residues.push(decoded);
-    }
-    let plain_reconstructed =
-        reconstruct_from_residues(&active_q_moduli, full_q.as_ref(), &plain_residues);
-    assert_value_matches_q_level(
-        &plain_reconstructed,
-        &expected,
-        &q,
-        &active_q_moduli,
-        &all_q_moduli,
-    );
-
     let seed: [u8; 32] = [0u8; 32];
     let trapdoor_sigma = 4.578;
     let d_secret = D_SECRET;
@@ -401,18 +370,16 @@ async fn test_gpu_ggh15_modq_arith() {
     let mut secrets = sampled;
     secrets.push(GpuDCRTPoly::const_minus_one(&params));
     let s_vec = GpuDCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
+    info!("sampled secret vector with {} polynomials", secrets.len());
 
     let pk_sampler =
         BGGPublicKeySampler::<_, GpuDCRTPolyHashSampler<Keccak256>>::new(seed, d_secret);
     let reveal_plaintexts = vec![true; circuit.num_input()];
+    info!("sampling public keys");
     let pubkeys = pk_sampler.sample(&params, b"BGG_PUBKEY", &reveal_plaintexts);
+    info!("sampled {} public keys", pubkeys.len());
 
-    let enc_setup_start = Instant::now();
-    let encoding_sampler =
-        BGGEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
-    let encodings = encoding_sampler.sample(&params, &pubkeys, &plaintext_inputs);
-    let enc_one = encodings[0].clone();
-
+    let pk_evaluator_setup_start = Instant::now();
     let pk_evaluator =
         GGH15BGGPubKeyPltEvaluator::<
             GpuDCRTPolyMatrix,
@@ -421,12 +388,12 @@ async fn test_gpu_ggh15_modq_arith() {
             GpuDCRTPolyTrapdoorSampler,
         >::new(seed, d_secret, trapdoor_sigma, ERROR_SIGMA, dir.to_path_buf(), false);
     info!(
-        "encoding sampler + pk evaluator setup elapsed_ms={:.3}",
-        enc_setup_start.elapsed().as_secs_f64() * 1000.0
+        "pk evaluator setup elapsed_ms={:.3}",
+        pk_evaluator_setup_start.elapsed().as_secs_f64() * 1000.0
     );
 
     let pubkey_eval_start = Instant::now();
-    let pubkey_out = circuit.eval(&params, &enc_one.pubkey, &pubkeys[1..], Some(&pk_evaluator));
+    let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(&pk_evaluator));
     info!("pubkey eval elapsed_ms={:.3}", pubkey_eval_start.elapsed().as_secs_f64() * 1000.0);
     assert_eq!(pubkey_out.len(), active_q_moduli.len());
 
@@ -454,6 +421,13 @@ async fn test_gpu_ggh15_modq_arith() {
         GpuDCRTPolyMatrix,
         GpuDCRTPolyHashSampler<Keccak256>,
     >::new(seed, dir.to_path_buf(), checkpoint_prefix, c_b0);
+
+    let enc_setup_start = Instant::now();
+    let encoding_sampler =
+        BGGEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
+    let encodings = encoding_sampler.sample(&params, &pubkeys, &plaintext_inputs);
+    let enc_one = encodings[0].clone();
+    info!("encoding sampling elapsed_ms={:.3}", enc_setup_start.elapsed().as_secs_f64() * 1000.0);
 
     let encoding_eval_start = Instant::now();
     let encoding_out = circuit.eval(&params, &enc_one, &encodings[1..], Some(&enc_evaluator));

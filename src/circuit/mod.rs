@@ -583,6 +583,7 @@ impl<P: Poly> PolyCircuit<P> {
                 }
             }
         });
+        debug!("modified last_use_level");
 
         wires.insert(GateId(0), Arc::new(one.clone()));
         // Collect all input gate IDs excluding the reserved constant-one gate (0)
@@ -595,6 +596,7 @@ impl<P: Poly> PolyCircuit<P> {
             })
             .collect();
         input_gate_ids.sort_by_key(|gid| gid.0);
+        debug!("input_gate_ids size {}", input_gate_ids.len());
         assert_eq!(
             input_gate_ids.len(),
             inputs.len(),

@@ -312,9 +312,8 @@ where
                     lut_id, part_idx, idx
                 );
                 let gy = gadget_matrix.clone() * y_poly;
-                let gy_decomposed = gy.decompose();
+                let w_gy = w_block_gy.mul_decompose(&gy);
                 drop(gy);
-                let w_gy = w_block_gy.clone() * gy_decomposed;
                 w_t_idx.add_in_place(&w_gy);
                 debug!(
                     "Constructed w_block_gy contribution for LUT preimage: lut_id={}, part_idx={}, row_idx={}",
@@ -1145,7 +1144,7 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                                 u_g_matrix.row_size(),
                                 u_g_matrix.col_size()
                             );
-                            let taget_high_v = - input_matrix * u_g_matrix.decompose();
+                            let taget_high_v = - input_matrix.mul_decompose(&u_g_matrix);
                             let target_gate2_v = taget_high_v.concat_rows(&[&w_block_v]);
                             drop(taget_high_v);
                             let preimage_gate2_v = trap_sampler.preimage(
@@ -1367,8 +1366,8 @@ where
             "preimage_gate2_gy must have m_g columns"
         );
         let gy = M::gadget_matrix(params, d) * y.clone();
-        let gy_decomposed = gy.decompose();
-        c_const = c_const + sg_times_b1.clone() * preimage_gate2_gy * gy_decomposed;
+        c_const = c_const + (sg_times_b1.clone() * preimage_gate2_gy).mul_decompose(&gy);
+        drop(gy);
 
         let v_idx = read_lut_aux_v_idx_from_checkpoint::<M>(
             params,
@@ -1436,7 +1435,7 @@ where
             u_g.col_size()
         );
 
-        let c_x_randomized = input.vector.clone() * u_g.decompose() * v_idx;
+        let c_x_randomized = input.vector.clone().mul_decompose(&u_g) * v_idx;
         debug!("Computed c_x_randomized for gate encoding: gate_id={}, lut_id={}", gate_id, lut_id);
         drop(u_g);
         let c_out = c_const + c_x_randomized;

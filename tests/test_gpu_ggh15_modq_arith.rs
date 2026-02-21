@@ -34,11 +34,11 @@ use num_traits::ToPrimitive;
 use std::{fs, path::Path, sync::Arc, time::Instant};
 use tracing::info;
 
-const RING_DIM: u32 = 1 << 8;
-const CRT_BITS: usize = 32;
-const P_MODULI_BITS: usize = 7;
+const RING_DIM: u32 = 1 << 14;
+const CRT_BITS: usize = 24;
+const P_MODULI_BITS: usize = 6;
 const SCALE: u64 = 1 << 7;
-const BASE_BITS: u32 = 16;
+const BASE_BITS: u32 = 12;
 const MAX_CRT_DEPTH: usize = 32;
 const ERROR_SIGMA: f64 = 4.0;
 const D_SECRET: usize = 2;

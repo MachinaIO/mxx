@@ -221,7 +221,8 @@ where
                 );
                 let idx_poly = M::P::from_usize_to_constant(params, *idx);
                 let idx_identity = M::identity(params, m, Some(idx_poly.clone()));
-                let w_v_idx = w_block_vx.mul_decompose_small(&idx_identity) * &v_idx;
+                let w_v_idx = w_block_vx.mul_decompose_small(&idx_identity) * v_idx;
+                drop(idx_identity);
                 w_t_idx.add_in_place(&w_v_idx);
                 debug!(
                     "Constructed w_block_v_idx contribution for LUT preimage: lut_id={}, row_idx={}",
@@ -229,6 +230,7 @@ where
                 );
                 let mut target = M::zero(params, d + w_t_idx.row_size(), m);
                 target.copy_block_from(&w_t_idx, d, 0, 0, 0, w_t_idx.row_size(), m);
+                drop(w_t_idx);
                 debug!(
                     "Constructed target for LUT preimage: lut_id={}, row_idx={}",
                     lut_id, idx
@@ -695,13 +697,20 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
 
         for (lut_id, plt) in lut_entries {
             let lut_aux_prefix = self.lut_aux_id_prefix(params, lut_id);
-            let mut completed_rows: HashSet<usize> = HashSet::new();
-            for (_, (idx, _)) in plt.entries(params) {
-                let lut_aux_row_id = format!("{lut_aux_prefix}_idx{idx}");
-                if Self::checkpoint_has_index(checkpoint_index_for_resume, &lut_aux_row_id, 0) {
-                    completed_rows.insert(idx);
-                }
-            }
+            let completed_rows: HashSet<usize> = plt
+                .entries(params)
+                .map(|(_, (idx, _))| idx)
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .filter_map(|idx| {
+                    let lut_aux_row_id = format!("{lut_aux_prefix}_idx{idx}");
+                    if Self::checkpoint_has_index(checkpoint_index_for_resume, &lut_aux_row_id, 0) {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
             let resumed_rows_for_lut = completed_rows.len();
             resumed_lut_rows = resumed_lut_rows.saturating_add(resumed_rows_for_lut);
             processed_lut_rows = processed_lut_rows.saturating_add(resumed_rows_for_lut);
@@ -714,22 +723,34 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
             lut_plans.push((lut_id, plt, completed_rows, resumed_rows_for_lut));
         }
 
-        let mut gates_by_lut: HashMap<usize, Vec<(GateId, GateState<M>)>> = HashMap::new();
-        let mut resumed_gates = 0usize;
-        let mut total_gates = 0usize;
-        for (gate_id, state) in gate_entries {
-            if Self::gate_checkpoint_complete(
-                checkpoint_index_for_resume,
-                &checkpoint_prefix,
-                gate_id,
-                gate_chunk_count,
-            ) {
-                resumed_gates = resumed_gates.saturating_add(1);
-                total_gates = total_gates.saturating_add(1);
-            } else {
-                gates_by_lut.entry(state.lut_id).or_default().push((gate_id, state));
-            }
-        }
+        let (resumed_gates, gates_by_lut) = gate_entries
+            .into_par_iter()
+            .fold(
+                || (0usize, HashMap::<usize, Vec<(GateId, GateState<M>)>>::new()),
+                |(mut resumed, mut grouped), (gate_id, state)| {
+                    if Self::gate_checkpoint_complete(
+                        checkpoint_index_for_resume,
+                        &checkpoint_prefix,
+                        gate_id,
+                        gate_chunk_count,
+                    ) {
+                        resumed = resumed.saturating_add(1);
+                    } else {
+                        grouped.entry(state.lut_id).or_default().push((gate_id, state));
+                    }
+                    (resumed, grouped)
+                },
+            )
+            .reduce(
+                || (0usize, HashMap::<usize, Vec<(GateId, GateState<M>)>>::new()),
+                |(left_resumed, mut left_grouped), (right_resumed, right_grouped)| {
+                    for (lut_id, mut gates) in right_grouped {
+                        left_grouped.entry(lut_id).or_default().append(&mut gates);
+                    }
+                    (left_resumed.saturating_add(right_resumed), left_grouped)
+                },
+            );
+        let mut total_gates = resumed_gates;
         info!(
             "Checkpoint verification completed (pending_lut_rows={}, pending_gates={})",
             total_lut_rows.saturating_sub(resumed_lut_rows),

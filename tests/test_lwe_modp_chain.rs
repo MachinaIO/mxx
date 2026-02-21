@@ -103,7 +103,7 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
 
     for crt_depth in 1..=MAX_CRT_DEPTH {
         let params = DCRTPolyParams::new(RING_DIM, crt_depth, CRT_BITS, BASE_BITS);
-        let (q_moduli, _q_bits, _q_depth) = params.to_crt();
+        let (q_moduli, _, crt_depth) = params.to_crt();
         let q_moduli_min = *q_moduli.iter().min().expect("q_moduli must not be empty");
         assert!(
             (P as u128) * (P as u128) < q_moduli_min as u128,
@@ -116,11 +116,13 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
         let circuit = build_modp_chain_circuit(&params, P, &q_over_p);
 
         let log_base_q = params.modulus_digits();
+        let log_base_q_small = log_base_q / crt_depth;
         let ctx = Arc::new(SimulatorContext::new(
             ring_dim_sqrt.clone(),
             base.clone(),
             D_SECRET,
             log_base_q,
+            log_base_q_small,
         ));
         let plt_evaluator = NormPltLWEEvaluator::new(ctx.clone(), &error_sigma);
         let e_init_norm = &error_sigma * BigDecimal::from(6u64);
@@ -208,6 +210,9 @@ async fn test_lwe_modp_chain_rounding() {
     let enc_one = encodings[0].clone();
     let input_pubkeys = pubkeys[1..].to_vec();
     let input_encodings = encodings[1..].to_vec();
+    let input_pubkeys_shared: Vec<Arc<_>> = input_pubkeys.iter().cloned().map(Arc::new).collect();
+    let input_encodings_shared: Vec<Arc<_>> =
+        input_encodings.iter().cloned().map(Arc::new).collect();
 
     let trapdoor_sigma = 4.578;
     let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, trapdoor_sigma);
@@ -233,8 +238,9 @@ async fn test_lwe_modp_chain_rounding() {
     info!("plt pubkey evaluator setup done");
 
     info!("circuit eval pubkey start");
+    let enc_one_pubkey = Arc::new(enc_one.pubkey.clone());
     let result_pubkey =
-        circuit.eval(&params, &enc_one.pubkey, &input_pubkeys, Some(&plt_pubkey_evaluator));
+        circuit.eval(&params, &enc_one_pubkey, &input_pubkeys_shared, Some(&plt_pubkey_evaluator));
     info!("circuit eval pubkey done");
     assert_eq!(result_pubkey.len(), 1);
     plt_pubkey_evaluator.sample_aux_matrices(&params);
@@ -250,8 +256,13 @@ async fn test_lwe_modp_chain_rounding() {
     info!("plt encoding evaluator setup done");
 
     info!("circuit eval encoding start");
-    let result_encoding =
-        circuit.eval(&params, &enc_one, &input_encodings, Some(&plt_encoding_evaluator));
+    let enc_one_shared = Arc::new(enc_one.clone());
+    let result_encoding = circuit.eval(
+        &params,
+        &enc_one_shared,
+        &input_encodings_shared,
+        Some(&plt_encoding_evaluator),
+    );
     info!("circuit eval encoding done");
     assert_eq!(result_encoding.len(), 1);
 

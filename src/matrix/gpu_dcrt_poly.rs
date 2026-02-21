@@ -11,7 +11,8 @@ use crate::{
                 GpuDCRTPolyParams, GpuEventSetOpaque, GpuMatrixOpaque, check_status,
                 gpu_event_set_destroy, gpu_event_set_wait, gpu_matrix_add, gpu_matrix_copy,
                 gpu_matrix_copy_block, gpu_matrix_create, gpu_matrix_decompose_base,
-                gpu_matrix_destroy, gpu_matrix_equal, gpu_matrix_fill_gadget,
+                gpu_matrix_decompose_base_small, gpu_matrix_destroy, gpu_matrix_equal,
+                gpu_matrix_fill_gadget, gpu_matrix_fill_small_gadget,
                 gpu_matrix_gauss_samp_gq_arb_base, gpu_matrix_intt_all,
                 gpu_matrix_load_compact_bytes, gpu_matrix_load_rns_batch, gpu_matrix_mul,
                 gpu_matrix_mul_scalar, gpu_matrix_ntt_all, gpu_matrix_sample_distribution,
@@ -904,33 +905,34 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         out
     }
 
+    fn small_gadget_matrix(params: &<Self::P as Poly>::Params, size: usize) -> Self {
+        if size == 0 {
+            return Self::new_zero(params, 0, 0);
+        }
+        let k = params.crt_bits().div_ceil(params.base_bits() as usize);
+        let out = Self::new_empty(params, size, size * k);
+        let status = unsafe { gpu_matrix_fill_small_gadget(out.raw, params.base_bits()) };
+        check_status(status, "gpu_matrix_fill_small_gadget");
+        out
+    }
+
     fn decompose(&self) -> Self {
-        let total_start = Instant::now();
-        let to_ms = |d: Duration| d.as_secs_f64() * 1000.0;
         let log_base_q = self.params.modulus_digits();
         let nrow = self.nrow.saturating_mul(log_base_q);
-        let alloc_start = Instant::now();
         let out = Self::new_empty(&self.params, nrow, self.ncol);
-        let alloc_elapsed = alloc_start.elapsed();
-        let kernel_start = Instant::now();
         let status =
             unsafe { gpu_matrix_decompose_base(self.raw, self.params.base_bits(), out.raw) };
-        let kernel_elapsed = kernel_start.elapsed();
         check_status(status, "gpu_matrix_decompose_base");
-        let total_elapsed = total_start.elapsed();
-        let accounted = alloc_elapsed + kernel_elapsed;
-        let other_elapsed = total_elapsed.saturating_sub(accounted);
-        debug!(
-            "GpuDCRTPolyMatrix::decompose timing: in_shape=({}, {}), out_shape=({}, {}), alloc_ms={:.3}, decompose_call_ms={:.3}, total_ms={:.3}, other_ms={:.3}",
-            self.nrow,
-            self.ncol,
-            out.nrow,
-            out.ncol,
-            to_ms(alloc_elapsed),
-            to_ms(kernel_elapsed),
-            to_ms(total_elapsed),
-            to_ms(other_elapsed)
-        );
+        out
+    }
+
+    fn small_decompose(&self) -> Self {
+        let k = self.params.crt_bits().div_ceil(self.params.base_bits() as usize);
+        let nrow = self.nrow.saturating_mul(k);
+        let out = Self::new_empty(&self.params, nrow, self.ncol);
+        let status =
+            unsafe { gpu_matrix_decompose_base_small(self.raw, self.params.base_bits(), out.raw) };
+        check_status(status, "gpu_matrix_decompose_base_small");
         out
     }
 
@@ -1069,38 +1071,83 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         out
     }
 
-    fn get_column_matrix_decompose(&self, j: usize) -> Self {
-        debug_assert!(j < self.ncol, "column index out of bounds in get_column_matrix_decompose");
+    fn mul_decompose_small(&self, other: &Self) -> Self {
         let total_start = Instant::now();
         let to_ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let k = self.params.crt_bits().div_ceil(self.params.base_bits() as usize);
+        debug_assert_eq!(self.ncol, other.nrow * k);
+        debug_assert_eq!(self.params, other.params, "mul_decompose_small requires same params");
+        let ncol = other.ncol;
+        if self.nrow == 0 || ncol == 0 {
+            debug!(
+                "GpuDCRTPolyMatrix::mul_decompose_small timing (early return): nrow={}, ncol={}, other_nrow={}, other_ncol={}, total_ms={:.3}",
+                self.nrow,
+                self.ncol,
+                other.nrow,
+                other.ncol,
+                to_ms(total_start.elapsed())
+            );
+            return Self::new_empty(&self.params, self.nrow, ncol);
+        }
 
-        let slice_start = Instant::now();
-        let col = self.slice(0, self.nrow, j, j + 1);
-        let slice_elapsed = slice_start.elapsed();
+        // Keep peak memory low by processing one compact-decomposed column at a time.
+        let mut out = Self::new_empty(&self.params, self.nrow, ncol);
+        let mut decompose_total = Duration::ZERO;
+        let mut mul_total = Duration::ZERO;
+        let mut copy_total = Duration::ZERO;
+        for j in 0..ncol {
+            let col_start = Instant::now();
 
-        let decompose_start = Instant::now();
-        let out = col.decompose();
-        let decompose_elapsed = decompose_start.elapsed();
+            let decompose_start = Instant::now();
+            let col_small_decomposed = other.slice(0, other.nrow, j, j + 1).small_decompose();
+            let decompose_elapsed = decompose_start.elapsed();
+
+            let mul_start = Instant::now();
+            let product = self * &col_small_decomposed;
+            let mul_elapsed = mul_start.elapsed();
+
+            let copy_start = Instant::now();
+            out.copy_block_from(&product, 0, j, 0, 0, self.nrow, 1);
+            let copy_elapsed = copy_start.elapsed();
+
+            let col_elapsed = col_start.elapsed();
+            decompose_total += decompose_elapsed;
+            mul_total += mul_elapsed;
+            copy_total += copy_elapsed;
+
+            debug!(
+                "GpuDCRTPolyMatrix::mul_decompose_small timing: col={}/{}, decompose_ms={:.3}, mul_ms={:.3}, copy_ms={:.3}, col_total_ms={:.3}",
+                j + 1,
+                ncol,
+                to_ms(decompose_elapsed),
+                to_ms(mul_elapsed),
+                to_ms(copy_elapsed),
+                to_ms(col_elapsed)
+            );
+        }
 
         let total_elapsed = total_start.elapsed();
-        let accounted = slice_elapsed + decompose_elapsed;
-        let other_elapsed = total_elapsed.saturating_sub(accounted);
+        let accounted = decompose_total + mul_total + copy_total;
+        let other_total = total_elapsed.saturating_sub(accounted);
         debug!(
-            "GpuDCRTPolyMatrix::get_column_matrix_decompose timing: col={}/{}, in_shape=({}, {}), slice_out_shape=({}, {}), decompose_out_shape=({}, {}), slice_ms={:.3}, decompose_ms={:.3}, total_ms={:.3}, other_ms={:.3}",
-            j + 1,
-            self.ncol,
+            "GpuDCRTPolyMatrix::mul_decompose_small timing summary: nrow={}, ncol={}, other_nrow={}, other_ncol={}, total_ms={:.3}, decompose_total_ms={:.3}, mul_total_ms={:.3}, copy_total_ms={:.3}, other_total_ms={:.3}",
             self.nrow,
             self.ncol,
-            col.nrow,
-            col.ncol,
-            out.nrow,
-            out.ncol,
-            to_ms(slice_elapsed),
-            to_ms(decompose_elapsed),
+            other.nrow,
+            other.ncol,
             to_ms(total_elapsed),
-            to_ms(other_elapsed)
+            to_ms(decompose_total),
+            to_ms(mul_total),
+            to_ms(copy_total),
+            to_ms(other_total)
         );
         out
+    }
+
+    fn get_column_matrix_decompose(&self, j: usize) -> Self {
+        debug_assert!(j < self.ncol, "column index out of bounds in get_column_matrix_decompose");
+        let col = self.slice(0, self.nrow, j, j + 1);
+        col.decompose()
     }
 
     fn vectorize_columns(&self) -> Self {
@@ -1540,6 +1587,79 @@ mod tests {
         assert_eq!(expected_matrix.size().0, 2);
         assert_eq!(expected_matrix.size().1, 8);
         assert_eq!(matrix, expected_matrix);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_small_decompose_identity_relation() {
+        gpu_device_sync();
+        let params = gpu_test_params();
+        let gpu_params = gpu_params_from_cpu(&params);
+        let size = 3;
+        let k = gpu_params.crt_bits().div_ceil(gpu_params.base_bits() as usize);
+        let min_modulus =
+            gpu_params.moduli().iter().copied().min().expect("CRT basis must be non-empty");
+        let upper = usize::try_from(min_modulus).unwrap_or(usize::MAX);
+        let random_int = rng().random_range(0..upper);
+
+        let identity = GpuDCRTPolyMatrix::identity(
+            &gpu_params,
+            size,
+            Some(GpuDCRTPoly::from_usize_to_constant(&gpu_params, random_int)),
+        );
+        let decomposed = identity.small_decompose();
+        assert_eq!(decomposed.size().0, size * k);
+        assert_eq!(decomposed.size().1, size);
+
+        let reconstructed = GpuDCRTPolyMatrix::small_gadget_matrix(&gpu_params, size) * decomposed;
+        assert_eq!(reconstructed, identity);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_mul_decompose_small_relation() {
+        gpu_device_sync();
+        let params = gpu_test_params();
+        let gpu_params = gpu_params_from_cpu(&params);
+        let n = 2usize;
+        let r = 2usize;
+
+        let a = GpuDCRTPolyMatrix::from_poly_vec(
+            &gpu_params,
+            vec![
+                vec![
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 1),
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 2),
+                ],
+                vec![
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 3),
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 4),
+                ],
+            ],
+        );
+        assert_eq!(a.size(), (r, n));
+
+        let b = GpuDCRTPolyMatrix::from_poly_vec(
+            &gpu_params,
+            vec![
+                vec![
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 5),
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 6),
+                ],
+                vec![
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 7),
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 8),
+                ],
+            ],
+        );
+        assert_eq!(b.size(), (n, 2));
+
+        let g_small = GpuDCRTPolyMatrix::small_gadget_matrix(&gpu_params, n);
+        let left = a.clone() * &g_small;
+        let expected = a * &b;
+        let actual = left.mul_decompose_small(&b);
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

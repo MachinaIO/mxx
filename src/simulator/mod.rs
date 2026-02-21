@@ -14,6 +14,7 @@ pub struct SimulatorContext {
     pub log_base_q: usize,
     pub m_g: usize,
     pub m_b: usize,
+    pub log_base_q_small: usize,
 }
 
 impl SimulatorContext {
@@ -23,10 +24,11 @@ impl SimulatorContext {
         base: BigDecimal,
         secret_size: usize,
         log_base_q: usize,
+        log_base_q_small: usize,
     ) -> Self {
         let m_g = secret_size * log_base_q;
         let m_b = secret_size * (log_base_q + 2);
 
-        Self { ring_dim_sqrt, base, secret_size, log_base_q, m_g, m_b }
+        Self { ring_dim_sqrt, base, secret_size, log_base_q, log_base_q_small, m_g, m_b }
     }
 }

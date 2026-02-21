@@ -30,7 +30,7 @@ use mxx::{
 };
 use num_bigint::BigUint;
 use rand::Rng;
-use std::{fs, path::Path, sync::Arc};
+use std::{fs, path::Path, sync::Arc, time::Instant};
 use tracing::info;
 
 const CRT_BITS: usize = 51;
@@ -116,7 +116,7 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, BigUint) {
 
     for crt_depth in 1..=MAX_CRT_DEPTH {
         let params = DCRTPolyParams::new(RING_DIM, crt_depth, CRT_BITS, BASE_BITS);
-        let (q_moduli, _q_bits, _q_depth) = params.to_crt();
+        let (q_moduli, _, crt_depth) = params.to_crt();
         let q_moduli_min = *q_moduli.iter().min().expect("q_moduli must not be empty");
         assert!(
             (P as u128) * (P as u128) < q_moduli_min as u128,
@@ -129,11 +129,13 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, BigUint) {
         let circuit = build_modp_chain_circuit_cpu(&params, P, &q_over_p);
 
         let log_base_q = params.modulus_digits();
+        let log_base_q_small = log_base_q / crt_depth;
         let ctx = Arc::new(SimulatorContext::new(
             ring_dim_sqrt.clone(),
             base.clone(),
             D_SECRET,
             log_base_q,
+            log_base_q_small,
         ));
         let plt_evaluator =
             NormPltGGH15Evaluator::new(ctx.clone(), &error_sigma, &error_sigma, None);
@@ -275,6 +277,9 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
     let enc_one = encodings[0].clone();
     let input_pubkeys = pubkeys[1..].to_vec();
     let input_encodings = encodings[1..].to_vec();
+    let input_pubkeys_shared: Vec<Arc<_>> = input_pubkeys.iter().cloned().map(Arc::new).collect();
+    let input_encodings_shared: Vec<Arc<_>> =
+        input_encodings.iter().cloned().map(Arc::new).collect();
 
     let trapdoor_sigma = 4.578;
     let dir = Path::new("test_data/gpu_ggh15_modp_chain_rounding");
@@ -295,13 +300,24 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
     info!("plt pubkey evaluator setup done");
 
     info!("circuit eval pubkey start");
+    let enc_one_pubkey = Arc::new(enc_one.pubkey.clone());
     let result_pubkey =
-        circuit.eval(&params, &enc_one.pubkey, &input_pubkeys, Some(&plt_pubkey_evaluator));
+        circuit.eval(&params, &enc_one_pubkey, &input_pubkeys_shared, Some(&plt_pubkey_evaluator));
     info!("circuit eval pubkey done");
     assert_eq!(result_pubkey.len(), 1);
+    let sample_aux_start = Instant::now();
     plt_pubkey_evaluator.sample_aux_matrices(&params);
+    info!(
+        "plt_pubkey_evaluator.sample_aux_matrices elapsed_ms={:.3}",
+        sample_aux_start.elapsed().as_secs_f64() * 1000.0
+    );
 
+    let wait_writes_start = Instant::now();
     wait_for_all_writes(dir.to_path_buf()).await.expect("storage writes should complete");
+    info!(
+        "wait_for_all_writes elapsed_ms={:.3}",
+        wait_writes_start.elapsed().as_secs_f64() * 1000.0
+    );
 
     let b0_matrix = plt_pubkey_evaluator
         .load_b0_matrix_checkpoint(&params)
@@ -316,8 +332,13 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
     info!("plt encoding evaluator setup done");
 
     info!("circuit eval encoding start");
-    let result_encoding =
-        circuit.eval(&params, &enc_one, &input_encodings, Some(&plt_encoding_evaluator));
+    let enc_one_shared = Arc::new(enc_one.clone());
+    let result_encoding = circuit.eval(
+        &params,
+        &enc_one_shared,
+        &input_encodings_shared,
+        Some(&plt_encoding_evaluator),
+    );
     info!("circuit eval encoding done");
     assert_eq!(result_encoding.len(), 1);
 

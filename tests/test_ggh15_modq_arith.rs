@@ -27,10 +27,10 @@ use std::{fs, path::Path, sync::Arc};
 use tracing::info;
 
 const RING_DIM: u32 = 1 << 8;
-const CRT_BITS: usize = 51;
-const P_MODULI_BITS: usize = 7;
+const CRT_BITS: usize = 24;
+const P_MODULI_BITS: usize = 6;
 const SCALE: u64 = 1 << 7;
-const BASE_BITS: u32 = 8;
+const BASE_BITS: u32 = 12;
 const MAX_CRT_DEPTH: usize = 32;
 const ERROR_SIGMA: f64 = 4.0;
 const D_SECRET: usize = 2;
@@ -118,16 +118,18 @@ fn find_crt_depth_for_modq_arith() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
 
     for crt_depth in 1..=MAX_CRT_DEPTH {
         let params = DCRTPolyParams::new(RING_DIM, crt_depth, CRT_BITS, BASE_BITS);
-        let (q_moduli, _, _) = params.to_crt();
+        let (q_moduli, _, crt_depth) = params.to_crt();
         let q = params.modulus();
         let (circuit, _ctx) = build_modq_arith_circuit(&params);
 
         let log_base_q = params.modulus_digits();
+        let log_base_q_small = log_base_q / crt_depth;
         let ctx = Arc::new(SimulatorContext::new(
             ring_dim_sqrt.clone(),
             base.clone(),
             D_SECRET,
             log_base_q,
+            log_base_q_small,
         ));
         let plt_evaluator =
             NormPltGGH15Evaluator::new(ctx.clone(), &error_sigma, &error_sigma, None);
@@ -197,18 +199,17 @@ async fn test_ggh15_modq_arith() {
     let b_value: BigUint = gen_biguint_for_modulus(&mut rng, q.as_ref());
     let expected = (&a_value * &b_value) % q.as_ref();
 
-    let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, None);
-    let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, None);
+    let a_inputs: Vec<DCRTPoly> = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, None);
+    let b_inputs: Vec<DCRTPoly> = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, None);
     let plaintext_inputs = [a_inputs.clone(), b_inputs.clone()].concat();
+    let plaintext_inputs_shared: Vec<Arc<DCRTPoly>> =
+        plaintext_inputs.iter().cloned().map(Arc::new).collect();
 
     let dry_circuit = build_modq_arith_value_circuit(&params);
     let dry_plt_evaluator = PolyPltEvaluator::new();
-    let dry_out = dry_circuit.eval(
-        &params,
-        &DCRTPoly::const_one(&params),
-        &plaintext_inputs,
-        Some(&dry_plt_evaluator),
-    );
+    let dry_one = Arc::new(DCRTPoly::const_one(&params));
+    let dry_out =
+        dry_circuit.eval(&params, &dry_one, &plaintext_inputs_shared, Some(&dry_plt_evaluator));
     assert_eq!(dry_out.len(), 1, "plain PolyCircuit dry-run should output one value polynomial");
     let dry_const_term = dry_out[0]
         .coeffs()
@@ -224,12 +225,9 @@ async fn test_ggh15_modq_arith() {
     info!("plain PolyCircuit dry-run succeeded with expected constant term");
 
     let plt_evaluator = PolyPltEvaluator::new();
-    let plain_out = circuit.eval(
-        &params,
-        &DCRTPoly::const_one(&params),
-        &plaintext_inputs,
-        Some(&plt_evaluator),
-    );
+    let plain_one = Arc::new(DCRTPoly::const_one(&params));
+    let plain_out =
+        circuit.eval(&params, &plain_one, &plaintext_inputs_shared, Some(&plt_evaluator));
     assert_eq!(plain_out.len(), q_moduli.len());
 
     let mut plain_residues = Vec::with_capacity(q_moduli.len());
@@ -282,7 +280,9 @@ async fn test_ggh15_modq_arith() {
         >::new(seed, d_secret, trapdoor_sigma, ERROR_SIGMA, dir.to_path_buf(), false);
 
     let pubkey_eval_start = std::time::Instant::now();
-    let pubkey_out = circuit.eval(&params, &enc_one.pubkey, &pubkeys[1..], Some(&pk_evaluator));
+    let pubkey_one = Arc::new(enc_one.pubkey.clone());
+    let input_pubkeys: Vec<Arc<_>> = pubkeys[1..].iter().cloned().map(Arc::new).collect();
+    let pubkey_out = circuit.eval(&params, &pubkey_one, &input_pubkeys, Some(&pk_evaluator));
     info!("pubkey eval elapsed {:?}", pubkey_eval_start.elapsed());
     assert_eq!(pubkey_out.len(), q_moduli.len());
 
@@ -306,7 +306,9 @@ async fn test_ggh15_modq_arith() {
     >::new(seed, dir.to_path_buf(), checkpoint_prefix, c_b0);
 
     let encoding_eval_start = std::time::Instant::now();
-    let encoding_out = circuit.eval(&params, &enc_one, &encodings[1..], Some(&enc_evaluator));
+    let encoding_one = Arc::new(enc_one.clone());
+    let input_encodings: Vec<Arc<_>> = encodings[1..].iter().cloned().map(Arc::new).collect();
+    let encoding_out = circuit.eval(&params, &encoding_one, &input_encodings, Some(&enc_evaluator));
     info!("encoding eval elapsed {:?}", encoding_eval_start.elapsed());
     assert_eq!(encoding_out.len(), q_moduli.len());
 

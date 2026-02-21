@@ -34,7 +34,7 @@ const SCALE: u64 = 1 << 7;
 const BASE_BITS: u32 = 12;
 const MAX_CRT_DEPTH: usize = 32;
 const ERROR_SIGMA: f64 = 4.0;
-const D_SECRET: usize = 2;
+const D_SECRET: usize = 1;
 const TREE_BASE: usize = 4;
 
 fn round_div_biguint(value: &BigUint, divisor: &BigUint) -> BigUint {
@@ -42,25 +42,65 @@ fn round_div_biguint(value: &BigUint, divisor: &BigUint) -> BigUint {
     (value + &half) / divisor
 }
 
-fn decode_residue_from_scaled_coeff(coeff: &BigUint, q_i: u64, q: &BigUint) -> BigUint {
-    let scaled = coeff * BigUint::from(q_i);
-    let rounded = round_div_biguint(&scaled, q);
-    rounded % BigUint::from(q_i)
+fn q_level_from_env() -> Option<usize> {
+    std::env::var("COMMIT_MODQ_ARITH_Q_LEVEL").ok().map(|raw| {
+        let level =
+            raw.parse::<usize>().expect("COMMIT_MODQ_ARITH_Q_LEVEL must be a positive integer");
+        assert!(level > 0, "COMMIT_MODQ_ARITH_Q_LEVEL must be greater than or equal to 1");
+        level
+    })
 }
 
-fn reconstruct_from_residues(params: &DCRTPolyParams, residues: &[BigUint]) -> BigUint {
-    let reconst_coeffs = params.reconst_coeffs();
-    assert_eq!(residues.len(), reconst_coeffs.len());
-    let q = params.modulus();
-    let mut value = BigUint::from(0u64);
-    for (residue, coeff) in residues.iter().zip(reconst_coeffs.iter()) {
-        value += residue * coeff;
+fn active_q_moduli_and_modulus<T: PolyParams>(
+    params: &T,
+    q_level: Option<usize>,
+) -> (Vec<u64>, BigUint, usize) {
+    let (q_moduli, _, max_q_level) = params.to_crt();
+    let active_q_level = q_level.unwrap_or(max_q_level);
+    assert!(
+        active_q_level <= max_q_level,
+        "q_level exceeds CRT depth: q_level={}, crt_depth={}",
+        active_q_level,
+        max_q_level
+    );
+    let active_q_moduli = q_moduli.into_iter().take(active_q_level).collect::<Vec<_>>();
+    let active_q =
+        active_q_moduli.iter().fold(BigUint::from(1u64), |acc, &q_i| acc * BigUint::from(q_i));
+    (active_q_moduli, active_q, active_q_level)
+}
+
+fn assert_value_matches_q_level(
+    value: &BigUint,
+    expected_mod_active_q: &BigUint,
+    active_q: &BigUint,
+    active_q_moduli: &[u64],
+    all_q_moduli: &[u64],
+) {
+    if active_q_moduli.len() == all_q_moduli.len() {
+        assert_eq!(
+            value, expected_mod_active_q,
+            "value must match expected modulo full q when q_level covers all CRT levels"
+        );
+        return;
     }
-    value % q.as_ref()
+
+    assert_eq!(
+        value % active_q,
+        expected_mod_active_q.clone(),
+        "value modulo active q must match expected modulo active q"
+    );
+    for &q_i in all_q_moduli.iter().skip(active_q_moduli.len()) {
+        assert_eq!(
+            value % BigUint::from(q_i),
+            BigUint::from(0u64),
+            "inactive CRT residues must be zero when q_level is limited"
+        );
+    }
 }
 
 fn build_modq_arith_circuit(
     params: &DCRTPolyParams,
+    q_level: Option<usize>,
 ) -> (PolyCircuit<DCRTPoly>, Arc<NestedRnsPolyContext>) {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
     let ctx = Arc::new(NestedRnsPolyContext::setup(
@@ -69,7 +109,7 @@ fn build_modq_arith_circuit(
         P_MODULI_BITS,
         SCALE,
         false,
-        None,
+        q_level,
     ));
 
     let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
@@ -77,23 +117,14 @@ fn build_modq_arith_circuit(
 
     let prod = poly_a.mul_full_reduce(&poly_b, None, &mut circuit);
     let out = prod.reconstruct(None, &mut circuit);
-
-    let (q_moduli, _, _) = params.to_crt();
-    let q = params.modulus();
-    let mut unit_vector = vec![BigUint::from(0u64); params.ring_dimension() as usize];
-    unit_vector[0] = BigUint::from(1u64);
-
-    let mut outputs = Vec::with_capacity(q_moduli.len());
-    for &q_i in q_moduli.iter() {
-        let q_over_qi = q.as_ref() / BigUint::from(q_i);
-        let scalar = unit_vector.iter().map(|u| u * &q_over_qi).collect::<Vec<_>>();
-        outputs.push(circuit.large_scalar_mul(out, &scalar));
-    }
-    circuit.output(outputs);
+    circuit.output(vec![out]);
     (circuit, ctx)
 }
 
-fn build_modq_arith_value_circuit(params: &DCRTPolyParams) -> PolyCircuit<DCRTPoly> {
+fn build_modq_arith_value_circuit(
+    params: &DCRTPolyParams,
+    q_level: Option<usize>,
+) -> PolyCircuit<DCRTPoly> {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
     let ctx = Arc::new(NestedRnsPolyContext::setup(
         &mut circuit,
@@ -101,7 +132,7 @@ fn build_modq_arith_value_circuit(params: &DCRTPolyParams) -> PolyCircuit<DCRTPo
         P_MODULI_BITS,
         SCALE,
         false,
-        None,
+        q_level,
     ));
 
     let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
@@ -112,7 +143,9 @@ fn build_modq_arith_value_circuit(params: &DCRTPolyParams) -> PolyCircuit<DCRTPo
     circuit
 }
 
-fn find_crt_depth_for_modq_arith() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPoly>) {
+fn find_crt_depth_for_modq_arith(
+    q_level: Option<usize>,
+) -> (usize, DCRTPolyParams, PolyCircuit<DCRTPoly>) {
     let ring_dim_sqrt = BigDecimal::from_u32(RING_DIM).unwrap().sqrt().unwrap();
     let base = BigDecimal::from_biguint(BigUint::from(1u32) << BASE_BITS, 0);
     let error_sigma = BigDecimal::from_f64(ERROR_SIGMA).expect("valid error sigma");
@@ -121,9 +154,10 @@ fn find_crt_depth_for_modq_arith() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
 
     for crt_depth in 1..=MAX_CRT_DEPTH {
         let params = DCRTPolyParams::new(RING_DIM, crt_depth, CRT_BITS, BASE_BITS);
-        let (q_moduli, _, crt_depth) = params.to_crt();
-        let q = params.modulus();
-        let (circuit, _ctx) = build_modq_arith_circuit(&params);
+        let (active_q_moduli, _, crt_depth) = active_q_moduli_and_modulus(&params, q_level);
+        let full_q = params.modulus();
+        let q_max = *active_q_moduli.iter().max().expect("active_q_moduli must not be empty");
+        let (circuit, _ctx) = build_modq_arith_circuit(&params, q_level);
 
         let log_base_q = params.modulus_digits();
         let log_base_q_small = log_base_q / crt_depth;
@@ -145,18 +179,12 @@ fn find_crt_depth_for_modq_arith() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
             Some(&plt_evaluator),
         );
 
-        assert_eq!(out_errors.len(), q_moduli.len());
+        assert_eq!(out_errors.len(), 1);
 
-        let mut all_ok = true;
-        let mut max_error_bits = 0u64;
-        for (idx, &q_i) in q_moduli.iter().enumerate() {
-            let threshold = q.as_ref() / BigUint::from(2u64 * q_i);
-            let error = &out_errors[idx].matrix_norm.poly_norm.norm;
-            max_error_bits = max_error_bits.max(bigdecimal_bits_ceil(error));
-            if *error >= BigDecimal::from_biguint(threshold, 0) {
-                all_ok = false;
-            }
-        }
+        let threshold = full_q.as_ref() / BigUint::from(2u64 * q_max);
+        let error = &out_errors[0].matrix_norm.poly_norm.norm;
+        let max_error_bits = bigdecimal_bits_ceil(error);
+        let all_ok = *error < BigDecimal::from_biguint(threshold, 0);
 
         info!(
             "crt_depth={} q_bits={} max_error_bits={}",
@@ -180,13 +208,19 @@ fn find_crt_depth_for_modq_arith() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
 async fn test_commit_modq_arith() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let (crt_depth, params, circuit) = find_crt_depth_for_modq_arith();
+    let q_level = q_level_from_env();
+    let (crt_depth, params, circuit) = find_crt_depth_for_modq_arith(q_level);
+    let (all_q_moduli, _, _) = params.to_crt();
+    let (active_q_moduli, active_q, active_q_level) = active_q_moduli_and_modulus(&params, q_level);
+    let full_q = params.modulus();
     info!(
-        "selected crt_depth={} ring_dim={} crt_bits={} base_bits={}",
+        "selected crt_depth={} ring_dim={} crt_bits={} base_bits={} q_level={:?} q_moduli={:?}",
         crt_depth,
         params.ring_dimension(),
         CRT_BITS,
-        BASE_BITS
+        BASE_BITS,
+        q_level,
+        all_q_moduli
     );
     info!(
         "circuit non_free_depth={} gate_counts={:?}",
@@ -194,22 +228,27 @@ async fn test_commit_modq_arith() {
         circuit.count_gates_by_type_vec()
     );
 
-    let q = params.modulus();
-    let (q_moduli, _, _) = params.to_crt();
+    info!(
+        "active_q_level={} active_q_bits={} active_q_moduli_len={}",
+        active_q_level,
+        active_q.bits(),
+        active_q_moduli.len()
+    );
+    let q_max = *active_q_moduli.iter().max().expect("active_q_moduli must not be empty");
 
     let mut rng = rand::rng();
-    let a_value: BigUint = gen_biguint_for_modulus(&mut rng, q.as_ref());
-    let b_value: BigUint = gen_biguint_for_modulus(&mut rng, q.as_ref());
+    let a_value: BigUint = gen_biguint_for_modulus(&mut rng, &active_q);
+    let b_value: BigUint = gen_biguint_for_modulus(&mut rng, &active_q);
 
-    let expected = (&a_value * &b_value) % q.as_ref();
+    let expected = (&a_value * &b_value) % &active_q;
 
-    let a_inputs: Vec<DCRTPoly> = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, None);
-    let b_inputs: Vec<DCRTPoly> = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, None);
+    let a_inputs: Vec<DCRTPoly> = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, q_level);
+    let b_inputs: Vec<DCRTPoly> = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, q_level);
     let plaintext_inputs = [a_inputs.clone(), b_inputs.clone()].concat();
     let plaintext_inputs_shared: Vec<Arc<DCRTPoly>> =
         plaintext_inputs.iter().cloned().map(Arc::new).collect();
 
-    let dry_circuit = build_modq_arith_value_circuit(&params);
+    let dry_circuit = build_modq_arith_value_circuit(&params, q_level);
     let dry_plt_evaluator = PolyPltEvaluator::new();
     let dry_one = Arc::new(DCRTPoly::const_one(&params));
     let dry_out =
@@ -222,9 +261,12 @@ async fn test_commit_modq_arith() {
         .expect("dry-run output polynomial must have at least one coefficient")
         .value()
         .clone();
-    assert_eq!(
-        dry_const_term, expected,
-        "dry-run output polynomial constant term must match expected mod q output"
+    assert_value_matches_q_level(
+        &dry_const_term,
+        &expected,
+        &active_q,
+        &active_q_moduli,
+        &all_q_moduli,
     );
     info!("plain PolyCircuit dry-run succeeded with expected constant term");
 
@@ -232,39 +274,37 @@ async fn test_commit_modq_arith() {
     let plain_one = Arc::new(DCRTPoly::const_one(&params));
     let plain_out =
         circuit.eval(&params, &plain_one, &plaintext_inputs_shared, Some(&plt_evaluator));
-    assert_eq!(plain_out.len(), q_moduli.len());
-
-    let mut plain_residues = Vec::with_capacity(q_moduli.len());
-    for (idx, &q_i) in q_moduli.iter().enumerate() {
-        let coeff = plain_out[idx]
-            .coeffs()
-            .into_iter()
-            .next()
-            .expect("output poly must have at least one coefficient")
-            .value()
-            .clone();
-        let decoded = decode_residue_from_scaled_coeff(&coeff, q_i, q.as_ref());
-        plain_residues.push(decoded);
-    }
-    let plain_reconstructed = reconstruct_from_residues(&params, &plain_residues);
-    assert_eq!(plain_reconstructed, expected);
+    assert_eq!(plain_out.len(), 1);
+    let plain_const = plain_out[0]
+        .coeffs()
+        .into_iter()
+        .next()
+        .expect("output poly must have at least one coefficient")
+        .value()
+        .clone();
+    assert_value_matches_q_level(
+        &plain_const,
+        &expected,
+        &active_q,
+        &active_q_moduli,
+        &all_q_moduli,
+    );
 
     let seed: [u8; 32] = [0u8; 32];
     let trapdoor_sigma = 4.578;
     let d_secret = D_SECRET;
 
-    let storage_dir = Path::new("test_data/test_commit_modq_arith");
+    let dir_name = format!("test_data/test_commit_modq_arith_qlevel_{}", active_q_level);
+    let storage_dir = Path::new(&dir_name);
     if !storage_dir.exists() {
         fs::create_dir_all(storage_dir).unwrap();
     }
     init_storage_system(storage_dir.to_path_buf());
 
     let uniform_sampler = DCRTPolyUniformSampler::new();
-    let sampled =
-        uniform_sampler.sample_uniform(&params, 1, d_secret - 1, DistType::TernaryDist).get_row(0);
-    let mut secrets = sampled;
-    secrets.push(DCRTPoly::const_minus_one(&params));
-    let s_vec = DCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
+    let secrets =
+        uniform_sampler.sample_uniform(&params, 1, d_secret, DistType::TernaryDist).get_row(0);
+    let s_vec = DCRTPolyMatrix::from_poly_vec_row(&params, secrets.clone());
 
     let pk_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(seed, d_secret);
     let reveal_plaintexts = vec![true; circuit.num_input()];
@@ -314,7 +354,7 @@ async fn test_commit_modq_arith() {
     let pubkey_one = Arc::new(enc_one.pubkey.clone());
     let input_pubkeys: Vec<Arc<_>> = pubkeys[1..].iter().cloned().map(Arc::new).collect();
     let pubkey_out = circuit.eval(&params, &pubkey_one, &input_pubkeys, Some(&pk_evaluator));
-    assert_eq!(pubkey_out.len(), q_moduli.len());
+    assert_eq!(pubkey_out.len(), 1);
 
     pk_evaluator.commit_all_lut_matrices::<DCRTPolyTrapdoorSampler>(
         &params,
@@ -344,34 +384,28 @@ async fn test_commit_modq_arith() {
     let encoding_one = Arc::new(enc_one.clone());
     let input_encodings: Vec<Arc<_>> = encodings[1..].iter().cloned().map(Arc::new).collect();
     let encoding_out = circuit.eval(&params, &encoding_one, &input_encodings, Some(&enc_evaluator));
-    assert_eq!(encoding_out.len(), q_moduli.len());
+    assert_eq!(encoding_out.len(), 1);
 
-    let unit_column = DCRTPolyMatrix::unit_column_vector(&params, d_secret, d_secret - 1);
-    let mut decoded_residues = Vec::with_capacity(q_moduli.len());
-    for (idx, &q_i) in q_moduli.iter().enumerate() {
-        assert_eq!(encoding_out[idx].pubkey, pubkey_out[idx]);
+    assert_eq!(encoding_out[0].pubkey, pubkey_out[0]);
+    let expected_poly = DCRTPoly::from_biguint_to_constant(&params, expected.clone());
+    let expected_times_gadget =
+        s_vec.clone() * (DCRTPolyMatrix::gadget_matrix(&params, d_secret) * expected_poly.clone());
+    let s_times_pk = s_vec.clone() * &pubkey_out[0].matrix;
+    let diff = encoding_out[0].vector.clone() - s_times_pk + expected_times_gadget;
+    let coeff = diff
+        .entry(0, 0)
+        .coeffs()
+        .into_iter()
+        .next()
+        .expect("diff poly must have at least one coefficient")
+        .value()
+        .clone();
 
-        let s_times_pk = s_vec.clone() * &pubkey_out[idx].matrix;
-        let diff = encoding_out[idx].vector.clone() - s_times_pk;
-        let projected = diff.mul_decompose(&unit_column);
-        assert_eq!(projected.row_size(), 1);
-        assert_eq!(projected.col_size(), 1);
-
-        let coeff = projected
-            .entry(0, 0)
-            .coeffs()
-            .into_iter()
-            .next()
-            .expect("projected poly must have at least one coefficient")
-            .value()
-            .clone();
-
-        let decoded = decode_residue_from_scaled_coeff(&coeff, q_i, q.as_ref());
-        let expected_residue = &expected % BigUint::from(q_i);
-        assert_eq!(decoded, expected_residue);
-        decoded_residues.push(decoded);
-    }
-
-    let reconstructed = reconstruct_from_residues(&params, &decoded_residues);
-    assert_eq!(reconstructed, expected);
+    let random_int: u64 = rand::random::<u64>() % q_max;
+    let q_over_qmax = full_q.as_ref() / BigUint::from(q_max);
+    let randomized_coeff = coeff + q_over_qmax.clone() * BigUint::from(random_int);
+    let rounded = round_div_biguint(&randomized_coeff, &q_over_qmax);
+    let decoded_random: u64 =
+        (&rounded % BigUint::from(q_max)).try_into().expect("decoded random coefficient must fit u64");
+    assert_eq!(decoded_random, random_int);
 }

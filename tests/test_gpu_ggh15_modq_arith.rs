@@ -27,10 +27,9 @@ use mxx::{
     },
     simulator::{SimulatorContext, error_norm::NormPltGGH15Evaluator},
     storage::write::{init_storage_system, wait_for_all_writes},
-    utils::{bigdecimal_bits_ceil, gen_biguint_for_modulus, mod_inverse},
+    utils::{bigdecimal_bits_ceil, gen_biguint_for_modulus},
 };
 use num_bigint::BigUint;
-use num_traits::ToPrimitive;
 use std::{fs, path::Path, sync::Arc, time::Instant};
 use tracing::info;
 
@@ -41,32 +40,11 @@ const SCALE: u64 = 1 << 7;
 const BASE_BITS: u32 = 12;
 const MAX_CRT_DEPTH: usize = 32;
 const ERROR_SIGMA: f64 = 4.0;
-const D_SECRET: usize = 2;
+const D_SECRET: usize = 1;
 
 fn round_div_biguint(value: &BigUint, divisor: &BigUint) -> BigUint {
     let half = divisor >> 1;
     (value + &half) / divisor
-}
-
-fn decode_residue_from_scaled_coeff(coeff: &BigUint, q_i: u64, q: &BigUint) -> BigUint {
-    let scaled = coeff * BigUint::from(q_i);
-    let rounded = round_div_biguint(&scaled, q);
-    rounded % BigUint::from(q_i)
-}
-
-fn reconstruct_from_residues(q_moduli: &[u64], q: &BigUint, residues: &[BigUint]) -> BigUint {
-    assert_eq!(residues.len(), q_moduli.len());
-    let mut value = BigUint::from(0u64);
-    for (residue, &q_i) in residues.iter().zip(q_moduli.iter()) {
-        let q_i_big = BigUint::from(q_i);
-        let q_over_qi = q / &q_i_big;
-        let q_over_qi_mod_qi =
-            (&q_over_qi % &q_i_big).to_u64().expect("CRT residue must fit in u64");
-        let inv = mod_inverse(q_over_qi_mod_qi, q_i).expect("CRT moduli must be pairwise coprime");
-        let coeff = (&q_over_qi * BigUint::from(inv)) % q;
-        value += residue * coeff;
-    }
-    value % q
 }
 
 fn assert_value_matches_q_level(
@@ -143,19 +121,7 @@ fn build_modq_arith_circuit_cpu(
     let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
     let prod = poly_a.mul_full_reduce(&poly_b, None, &mut circuit);
     let out = prod.reconstruct(None, &mut circuit);
-
-    let (active_q_moduli, _, _) = active_q_moduli_and_modulus(params, q_level);
-    let q = params.modulus();
-    let mut unit_vector = vec![BigUint::from(0u64); params.ring_dimension() as usize];
-    unit_vector[0] = BigUint::from(1u64);
-
-    let mut outputs = Vec::with_capacity(active_q_moduli.len());
-    for &q_i in active_q_moduli.iter() {
-        let q_over_qi = q.as_ref() / BigUint::from(q_i);
-        let scalar = unit_vector.iter().map(|u| u * &q_over_qi).collect::<Vec<_>>();
-        outputs.push(circuit.large_scalar_mul(out, &scalar));
-    }
-    circuit.output(outputs);
+    circuit.output(vec![out]);
     (circuit, ctx)
 }
 
@@ -177,19 +143,7 @@ fn build_modq_arith_circuit_gpu(
     let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
     let prod = poly_a.mul_full_reduce(&poly_b, None, &mut circuit);
     let out = prod.reconstruct(None, &mut circuit);
-
-    let (active_q_moduli, _, _) = active_q_moduli_and_modulus(params, q_level);
-    let q = params.modulus();
-    let mut unit_vector = vec![BigUint::from(0u64); params.ring_dimension() as usize];
-    unit_vector[0] = BigUint::from(1u64);
-
-    let mut outputs = Vec::with_capacity(active_q_moduli.len());
-    for &q_i in active_q_moduli.iter() {
-        let q_over_qi = q.as_ref() / BigUint::from(q_i);
-        let scalar = unit_vector.iter().map(|u| u * &q_over_qi).collect::<Vec<_>>();
-        outputs.push(circuit.large_scalar_mul(out, &scalar));
-    }
-    circuit.output(outputs);
+    circuit.output(vec![out]);
     (circuit, ctx)
 }
 
@@ -225,7 +179,8 @@ fn find_crt_depth_for_modq_arith(q_level: Option<usize>) -> (usize, DCRTPolyPara
     for crt_depth in 1..=MAX_CRT_DEPTH {
         let params = DCRTPolyParams::new(RING_DIM, crt_depth, CRT_BITS, BASE_BITS);
         let (active_q_moduli, _, _) = active_q_moduli_and_modulus(&params, q_level);
-        let q = params.modulus();
+        let full_q = params.modulus();
+        let q_max = *active_q_moduli.iter().max().expect("active_q_moduli must not be empty");
         let (_, _, crt_depth) = params.to_crt();
         let (circuit, _ctx) = build_modq_arith_circuit_cpu(&params, q_level);
 
@@ -249,18 +204,12 @@ fn find_crt_depth_for_modq_arith(q_level: Option<usize>) -> (usize, DCRTPolyPara
             Some(&plt_evaluator),
         );
 
-        assert_eq!(out_errors.len(), active_q_moduli.len());
+        assert_eq!(out_errors.len(), 1);
 
-        let mut all_ok = true;
-        let mut max_error_bits = 0u64;
-        for (idx, &q_i) in active_q_moduli.iter().enumerate() {
-            let threshold = q.as_ref() / BigUint::from(2u64 * q_i);
-            let error = &out_errors[idx].matrix_norm.poly_norm.norm;
-            max_error_bits = max_error_bits.max(bigdecimal_bits_ceil(error));
-            if *error >= BigDecimal::from_biguint(threshold, 0) {
-                all_ok = false;
-            }
-        }
+        let threshold = full_q.as_ref() / BigUint::from(2u64 * q_max);
+        let error = &out_errors[0].matrix_norm.poly_norm.norm;
+        let max_error_bits = bigdecimal_bits_ceil(error);
+        let all_ok = *error < BigDecimal::from_biguint(threshold, 0);
 
         info!(
             "crt_depth={} q_bits={} max_error_bits={}",
@@ -290,10 +239,11 @@ async fn test_gpu_ggh15_modq_arith() {
     let params =
         GpuDCRTPolyParams::new(cpu_params.ring_dimension(), moduli, cpu_params.base_bits());
     assert_eq!(params.modulus(), cpu_params.modulus());
+    let full_q = params.modulus();
 
     let (all_q_moduli, _, _) = params.to_crt();
-    let full_q = params.modulus();
-    let (active_q_moduli, q, active_q_level) = active_q_moduli_and_modulus(&params, q_level);
+    let (active_q_moduli, active_q, active_q_level) = active_q_moduli_and_modulus(&params, q_level);
+    let q_max = *active_q_moduli.iter().max().expect("active_q_moduli must not be empty");
     let (circuit, _ctx) = build_modq_arith_circuit_gpu(&params, q_level);
     info!("found crt_depth={}", crt_depth);
     info!(
@@ -313,14 +263,14 @@ async fn test_gpu_ggh15_modq_arith() {
     info!(
         "active_q_level={} active_q_bits={} active_q_moduli_len={}",
         active_q_level,
-        q.bits(),
+        active_q.bits(),
         active_q_moduli.len()
     );
 
     let mut rng = rand::rng();
-    let a_value: BigUint = gen_biguint_for_modulus(&mut rng, &q);
-    let b_value: BigUint = gen_biguint_for_modulus(&mut rng, &q);
-    let expected = (&a_value * &b_value) % &q;
+    let a_value: BigUint = gen_biguint_for_modulus(&mut rng, &active_q);
+    let b_value: BigUint = gen_biguint_for_modulus(&mut rng, &active_q);
+    let expected = (&a_value * &b_value) % &active_q;
 
     let a_inputs: Vec<GpuDCRTPoly> =
         encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, q_level);
@@ -344,7 +294,13 @@ async fn test_gpu_ggh15_modq_arith() {
         .expect("dry-run output polynomial must have at least one coefficient")
         .value()
         .clone();
-    assert_value_matches_q_level(&dry_const_term, &expected, &q, &active_q_moduli, &all_q_moduli);
+    assert_value_matches_q_level(
+        &dry_const_term,
+        &expected,
+        &active_q,
+        &active_q_moduli,
+        &all_q_moduli,
+    );
     info!("dry-run succeeded with expected constant term");
 
     let seed: [u8; 32] = [0u8; 32];
@@ -359,11 +315,9 @@ async fn test_gpu_ggh15_modq_arith() {
     init_storage_system(dir.to_path_buf());
 
     let uniform_sampler = GpuDCRTPolyUniformSampler::new();
-    let sampled =
-        uniform_sampler.sample_uniform(&params, 1, d_secret - 1, DistType::TernaryDist).get_row(0);
-    let mut secrets = sampled;
-    secrets.push(GpuDCRTPoly::const_minus_one(&params));
-    let s_vec = GpuDCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
+    let secrets =
+        uniform_sampler.sample_uniform(&params, 1, d_secret, DistType::TernaryDist).get_row(0);
+    let s_vec = GpuDCRTPolyMatrix::from_poly_vec_row(&params, secrets.clone());
     info!("sampled secret vector with {} polynomials", secrets.len());
 
     let pk_sampler =
@@ -393,7 +347,7 @@ async fn test_gpu_ggh15_modq_arith() {
     let pubkey_eval_start = Instant::now();
     let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(&pk_evaluator));
     info!("pubkey eval elapsed_ms={:.3}", pubkey_eval_start.elapsed().as_secs_f64() * 1000.0);
-    assert_eq!(pubkey_out.len(), active_q_moduli.len());
+    assert_eq!(pubkey_out.len(), 1);
 
     let sample_aux_start = Instant::now();
     pk_evaluator.sample_aux_matrices(&params);
@@ -434,40 +388,31 @@ async fn test_gpu_ggh15_modq_arith() {
     let encoding_eval_start = Instant::now();
     let encoding_out = circuit.eval(&params, &encodings[0], &encodings[1..], Some(&enc_evaluator));
     info!("encoding eval elapsed_ms={:.3}", encoding_eval_start.elapsed().as_secs_f64() * 1000.0);
-    assert_eq!(encoding_out.len(), active_q_moduli.len());
+    assert_eq!(encoding_out.len(), 1);
     drop(encodings);
 
-    let unit_column = GpuDCRTPolyMatrix::unit_column_vector(&params, d_secret, d_secret - 1);
-    let mut decoded_residues = Vec::with_capacity(active_q_moduli.len());
-    for ((encoding, pubkey), &q_i) in
-        encoding_out.into_iter().zip(pubkey_out.into_iter()).zip(active_q_moduli.iter())
-    {
-        assert_eq!(encoding.pubkey, pubkey);
+    assert_eq!(encoding_out[0].pubkey, pubkey_out[0]);
+    let expected_poly = GpuDCRTPoly::from_biguint_to_constant(&params, expected.clone());
+    let expected_times_gadget = s_vec.clone() *
+        (GpuDCRTPolyMatrix::gadget_matrix(&params, d_secret) * expected_poly.clone());
+    let s_times_pk = s_vec.clone() * &pubkey_out[0].matrix;
+    let diff = encoding_out[0].vector.clone() - s_times_pk + expected_times_gadget;
+    let coeff = diff
+        .entry(0, 0)
+        .coeffs()
+        .into_iter()
+        .next()
+        .expect("diff poly must have at least one coefficient")
+        .value()
+        .clone();
 
-        let s_times_pk = s_vec.clone() * &pubkey.matrix;
-        let diff = encoding.vector.clone() - s_times_pk;
-        let projected = diff.mul_decompose(&unit_column);
-        assert_eq!(projected.row_size(), 1);
-        assert_eq!(projected.col_size(), 1);
-
-        let coeff = projected
-            .entry(0, 0)
-            .coeffs()
-            .into_iter()
-            .next()
-            .expect("projected poly must have at least one coefficient")
-            .value()
-            .clone();
-
-        let decoded = decode_residue_from_scaled_coeff(&coeff, q_i, full_q.as_ref());
-        let expected_residue = &expected % BigUint::from(q_i);
-        assert_eq!(decoded, expected_residue);
-        decoded_residues.push(decoded);
-    }
-
-    let reconstructed =
-        reconstruct_from_residues(&active_q_moduli, full_q.as_ref(), &decoded_residues);
-    assert_value_matches_q_level(&reconstructed, &expected, &q, &active_q_moduli, &all_q_moduli);
+    let random_int: u64 = rand::random::<u64>() % q_max;
+    let q_over_qmax = full_q.as_ref() / BigUint::from(q_max);
+    let randomized_coeff = coeff + q_over_qmax.clone() * BigUint::from(random_int);
+    let rounded = round_div_biguint(&randomized_coeff, &q_over_qmax);
+    let decoded_random: u64 =
+        (&rounded % BigUint::from(q_max)).try_into().expect("decoded random coefficient must fit u64");
+    assert_eq!(decoded_random, random_int);
 
     gpu_device_sync();
 }

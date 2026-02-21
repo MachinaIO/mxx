@@ -113,7 +113,6 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, BigUint) {
         .expect("ring dim sqrt should exist");
     let base = BigDecimal::from_biguint(BigUint::from(1u32) << BASE_BITS, 0);
     let error_sigma = BigDecimal::from_f64(ERROR_SIGMA).expect("valid error sigma");
-    let trapdoor_sigma = BigDecimal::from_f64(4.578).expect("valid trapdoor sigma");
 
     for crt_depth in 1..=MAX_CRT_DEPTH {
         let params = DCRTPolyParams::new(RING_DIM, crt_depth, CRT_BITS, BASE_BITS);
@@ -138,13 +137,8 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, BigUint) {
             log_base_q,
             log_base_q_small,
         ));
-        let plt_evaluator = NormPltGGH15Evaluator::new(
-            ctx.clone(),
-            &error_sigma,
-            &error_sigma,
-            &trapdoor_sigma,
-            None,
-        );
+        let plt_evaluator =
+            NormPltGGH15Evaluator::new(ctx.clone(), &error_sigma, &error_sigma, None);
         let e_init_norm = &error_sigma * BigDecimal::from(6u64);
         let input_bound = BigDecimal::from((P - 1) as u64);
 

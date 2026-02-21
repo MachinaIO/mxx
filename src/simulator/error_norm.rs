@@ -178,7 +178,6 @@ impl NormPltGGH15Evaluator {
         ctx: Arc<SimulatorContext>,
         e_b_sigma: &BigDecimal,
         e_mat_sigma: &BigDecimal,
-        trapdoor_sigma: &BigDecimal,
         secret_sigma: Option<BigDecimal>,
     ) -> Self {
         let preimage_norm = compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base);
@@ -201,8 +200,7 @@ impl NormPltGGH15Evaluator {
                     e_mat_sigma * 6,
                     None,
                 );
-        let v_idx =
-            PolyMatrixNorm::sample_gauss(ctx.clone(), ctx.m_g, ctx.m_g, trapdoor_sigma.clone());
+        let v_idx = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g);
         let small_decomposed = PolyMatrixNorm::new(
             ctx.clone(),
             ctx.m_g * ctx.log_base_q_small,
@@ -430,7 +428,6 @@ mod tests {
 
     const E_B_SIGMA: f64 = 4.0;
     const E_INIT_NORM: u32 = 1 << 14;
-    const TRAPDOOR_SIGMA: f64 = 4.578;
 
     #[test]
     fn test_wire_norm_addition() {
@@ -575,7 +572,6 @@ mod tests {
             ctx.clone(),
             &BigDecimal::from_f64(E_B_SIGMA).unwrap(),
             &BigDecimal::from_f64(E_B_SIGMA).unwrap(),
-            &BigDecimal::from_f64(TRAPDOOR_SIGMA).unwrap(),
             None,
         );
         let out = circuit.simulate_max_error_norm(

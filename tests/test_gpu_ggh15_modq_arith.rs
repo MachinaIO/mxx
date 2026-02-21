@@ -34,11 +34,11 @@ use num_traits::ToPrimitive;
 use std::{fs, path::Path, sync::Arc, time::Instant};
 use tracing::info;
 
-const RING_DIM: u32 = 1 << 14;
-const CRT_BITS: usize = 24;
-const P_MODULI_BITS: usize = 6;
+const RING_DIM: u32 = 1 << 8;
+const CRT_BITS: usize = 32;
+const P_MODULI_BITS: usize = 7;
 const SCALE: u64 = 1 << 7;
-const BASE_BITS: u32 = 12;
+const BASE_BITS: u32 = 16;
 const MAX_CRT_DEPTH: usize = 32;
 const ERROR_SIGMA: f64 = 4.0;
 const D_SECRET: usize = 2;
@@ -220,7 +220,6 @@ fn find_crt_depth_for_modq_arith(q_level: Option<usize>) -> (usize, DCRTPolyPara
     let base = BigDecimal::from_biguint(BigUint::from(1u32) << BASE_BITS, 0);
     let error_sigma = BigDecimal::from_f64(ERROR_SIGMA).expect("valid error sigma");
     let input_bound = BigDecimal::from((1u64 << P_MODULI_BITS) - 1);
-    let trapdoor_sigma = BigDecimal::from_f64(4.578).expect("valid trapdoor sigma");
     let e_init_norm = &error_sigma * BigDecimal::from(6u64);
 
     for crt_depth in 1..=MAX_CRT_DEPTH {
@@ -239,13 +238,8 @@ fn find_crt_depth_for_modq_arith(q_level: Option<usize>) -> (usize, DCRTPolyPara
             log_base_q,
             log_base_q_small,
         ));
-        let plt_evaluator = NormPltGGH15Evaluator::new(
-            ctx.clone(),
-            &error_sigma,
-            &error_sigma,
-            &trapdoor_sigma,
-            None,
-        );
+        let plt_evaluator =
+            NormPltGGH15Evaluator::new(ctx.clone(), &error_sigma, &error_sigma, None);
 
         let out_errors = circuit.simulate_max_error_norm(
             ctx,

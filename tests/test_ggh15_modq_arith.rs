@@ -114,7 +114,6 @@ fn find_crt_depth_for_modq_arith() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
     let base = BigDecimal::from_biguint(BigUint::from(1u32) << BASE_BITS, 0);
     let error_sigma = BigDecimal::from_f64(ERROR_SIGMA).expect("valid error sigma");
     let input_bound = BigDecimal::from((1u64 << P_MODULI_BITS) - 1);
-    let trapdoor_sigma = BigDecimal::from_f64(4.578).expect("valid trapdoor sigma");
     let e_init_norm = &error_sigma * BigDecimal::from(6u64);
 
     for crt_depth in 1..=MAX_CRT_DEPTH {
@@ -132,13 +131,8 @@ fn find_crt_depth_for_modq_arith() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
             log_base_q,
             log_base_q_small,
         ));
-        let plt_evaluator = NormPltGGH15Evaluator::new(
-            ctx.clone(),
-            &error_sigma,
-            &error_sigma,
-            &trapdoor_sigma,
-            None,
-        );
+        let plt_evaluator =
+            NormPltGGH15Evaluator::new(ctx.clone(), &error_sigma, &error_sigma, None);
 
         let out_errors = circuit.simulate_max_error_norm(
             ctx,

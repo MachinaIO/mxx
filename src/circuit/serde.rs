@@ -303,18 +303,12 @@ mod tests {
         let params = DCRTPolyParams::default();
         let a = DCRTPoly::const_one(&params);
         let b = DCRTPoly::const_one(&params);
-        let out1 = circuit.eval(
-            &params,
-            &DCRTPoly::const_one(&params),
-            &[a.clone(), b.clone()],
-            None::<&PolyPltEvaluator>,
-        );
-        let out2 = roundtrip.eval(
-            &params,
-            &DCRTPoly::const_one(&params),
-            &[a, b],
-            None::<&PolyPltEvaluator>,
-        );
+        let one = Arc::new(DCRTPoly::const_one(&params));
+        let out1_inputs = vec![Arc::new(a.clone()), Arc::new(b.clone())];
+        let out1 = circuit.eval(&params, &one, &out1_inputs, None::<&PolyPltEvaluator>);
+        let one = Arc::new(DCRTPoly::const_one(&params));
+        let out2_inputs = vec![Arc::new(a), Arc::new(b)];
+        let out2 = roundtrip.eval(&params, &one, &out2_inputs, None::<&PolyPltEvaluator>);
         assert_eq!(out1, out2);
     }
 }

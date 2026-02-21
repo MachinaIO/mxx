@@ -119,6 +119,18 @@ impl PolyMatrix for DCRTPolyMatrix {
         gadget_vector.concat_diag(&vec![&gadget_vector; size - 1])
     }
 
+    fn small_gadget_matrix(params: &<Self::P as Poly>::Params, size: usize) -> Self {
+        if size == 0 {
+            return Self::zero(params, 0, 0);
+        }
+        let k = params.crt_bits().div_ceil(params.base_bits() as usize);
+        let gadget_vector = Self::from_poly_vec_row(
+            params,
+            (0..k).map(|i| DCRTPoly::from_power_of_base_to_constant(params, i)).collect::<Vec<_>>(),
+        );
+        Self::identity(params, size, None).tensor(&gadget_vector)
+    }
+
     fn decompose(&self) -> Self {
         let base_bits = self.params.base_bits();
         let log_base_q =
@@ -149,6 +161,40 @@ impl PolyMatrix for DCRTPolyMatrix {
         };
         new_matrix.replace_entries_with_expand(0..self.nrow, 0..self.ncol, log_base_q, 1, f);
         new_matrix
+    }
+
+    fn small_decompose(&self) -> Self {
+        let base_bits = self.params.base_bits();
+        let k = self.params.crt_bits().div_ceil(self.params.base_bits() as usize);
+        let mut out = Self::new_empty(&self.params, self.nrow * k, self.ncol);
+        let f = |row_offsets: Range<usize>, col_offsets: Range<usize>| -> Vec<Vec<DCRTPoly>> {
+            let nrow = row_offsets.len();
+            let ncol = col_offsets.len();
+            let entries = self.block_entries(row_offsets, col_offsets);
+            let decomposed_entries: Vec<Vec<Vec<DCRTPoly>>> = parallel_iter!(0..nrow)
+                .map(|i| {
+                    parallel_iter!(0..ncol)
+                        .map(|j| {
+                            self.dcrt_decompose_poly(&entries[i][j], base_bits)
+                                .into_iter()
+                                .take(k)
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            parallel_iter!(0..(nrow * k))
+                .map(|idx| {
+                    let i = idx / k;
+                    let digit = idx % k;
+                    parallel_iter!(0..ncol)
+                        .map(|j| decomposed_entries[i][j][digit].clone())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        out.replace_entries_with_expand(0..self.nrow, 0..self.ncol, k, 1, f);
+        out
     }
 
     fn modulus_switch(
@@ -205,6 +251,24 @@ impl PolyMatrix for DCRTPolyMatrix {
         let ncol = other.ncol;
         debug_assert!(ncol > 0, "mul_decompose expects at least one column");
         let output = (0..ncol).map(|j| self * &other.get_column_matrix_decompose(j)).collect_vec();
+        output[0].concat_columns(&output[1..].iter().collect::<Vec<_>>())
+    }
+
+    fn mul_decompose_small(&self, other: &Self) -> Self {
+        let k = self.params.crt_bits().div_ceil(self.params.base_bits() as usize);
+        debug_assert_eq!(self.ncol, other.nrow * k);
+        let ncol = other.ncol;
+        debug_assert!(ncol > 0, "mul_decompose_small expects at least one column");
+        let output = (0..ncol)
+            .map(|j| {
+                let col = Self::from_poly_vec(
+                    &self.params,
+                    other.get_column(j).into_iter().map(|poly| vec![poly]).collect(),
+                )
+                .small_decompose();
+                self * &col
+            })
+            .collect_vec();
         output[0].concat_columns(&output[1..].iter().collect::<Vec<_>>())
     }
 
@@ -419,6 +483,7 @@ mod tests {
 
     use super::*;
     use num_bigint::BigUint;
+    use rand::{Rng, rng};
     use std::sync::Arc;
 
     #[test]
@@ -565,6 +630,77 @@ mod tests {
         assert_eq!(expected_matrix.size().0, 2);
         assert_eq!(expected_matrix.size().1, 8);
         assert_eq!(matrix, expected_matrix);
+    }
+
+    #[test]
+    fn test_matrix_small_decompose_identity_relation() {
+        let params = DCRTPolyParams::default();
+        let size = 3;
+        let k = params.crt_bits().div_ceil(params.base_bits() as usize);
+        let (crt_moduli, _, _) = <DCRTPolyParams as crate::poly::PolyParams>::to_crt(&params);
+        let min_modulus = crt_moduli.into_iter().min().expect("CRT basis must be non-empty");
+        let upper = usize::try_from(min_modulus).unwrap_or(usize::MAX);
+        let random_int = rng().random_range(0..upper);
+
+        let identity = DCRTPolyMatrix::identity(
+            &params,
+            size,
+            Some(DCRTPoly::from_usize_to_constant(&params, random_int)),
+        );
+        let decomposed = identity.small_decompose();
+        assert_eq!(decomposed.size().0, size * k);
+        assert_eq!(decomposed.size().1, size);
+
+        let reconstructed = DCRTPolyMatrix::small_gadget_matrix(&params, size) * decomposed;
+        assert_eq!(reconstructed, identity);
+    }
+
+    #[test]
+    fn test_matrix_mul_decompose_small_relation() {
+        let params = DCRTPolyParams::new(4, 2, 17, 3);
+        let n = 2usize;
+        let r = 3usize;
+
+        let a = DCRTPolyMatrix::from_poly_vec(
+            &params,
+            vec![
+                vec![
+                    DCRTPoly::from_usize_to_constant(&params, 1),
+                    DCRTPoly::from_usize_to_constant(&params, 2),
+                ],
+                vec![
+                    DCRTPoly::from_usize_to_constant(&params, 3),
+                    DCRTPoly::from_usize_to_constant(&params, 4),
+                ],
+                vec![
+                    DCRTPoly::from_usize_to_constant(&params, 5),
+                    DCRTPoly::from_usize_to_constant(&params, 6),
+                ],
+            ],
+        );
+        assert_eq!(a.size(), (r, n));
+
+        let b = DCRTPolyMatrix::from_poly_vec(
+            &params,
+            vec![
+                vec![
+                    DCRTPoly::from_usize_to_constant(&params, 7),
+                    DCRTPoly::from_usize_to_constant(&params, 8),
+                ],
+                vec![
+                    DCRTPoly::from_usize_to_constant(&params, 9),
+                    DCRTPoly::from_usize_to_constant(&params, 10),
+                ],
+            ],
+        );
+        assert_eq!(b.size(), (n, 2));
+
+        let g_small = DCRTPolyMatrix::small_gadget_matrix(&params, n);
+        let left = a.clone() * &g_small;
+        let expected = a * &b;
+        let actual = left.mul_decompose_small(&b);
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

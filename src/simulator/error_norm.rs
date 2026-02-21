@@ -37,7 +37,9 @@ impl PolyCircuit<DCRTPoly> {
             PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, e_init_norm.clone(), None),
         );
         info!("e_init_norm bits {}", bigdecimal_bits_ceil(e_init_norm));
-        self.eval(&(), &one_error, &vec![input_error; input_size], plt_evaluator)
+        let one_error = Arc::new(one_error);
+        let input_errors = vec![Arc::new(input_error); input_size];
+        self.eval(&(), &one_error, &input_errors, plt_evaluator)
     }
 }
 
@@ -94,6 +96,15 @@ impl_binop_with_refs!(ErrorNorm => Mul::mul(self, rhs: &ErrorNorm) -> ErrorNorm 
 impl Evaluable for ErrorNorm {
     type Params = ();
     type P = DCRTPoly;
+    type Compact = ErrorNorm;
+
+    fn to_compact(&self) -> Self::Compact {
+        self.clone()
+    }
+
+    fn from_compact(_: &Self::Params, compact: &Self::Compact) -> Self {
+        compact.clone()
+    }
 
     fn rotate(&self, _: &Self::Params, _: i32) -> Self {
         self.clone()
@@ -189,14 +200,23 @@ impl NormPltGGH15Evaluator {
                     e_mat_sigma * 6,
                     None,
                 );
-
+        let v_idx = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g);
+        let small_decomposed = PolyMatrixNorm::new(
+            ctx.clone(),
+            ctx.m_g * ctx.log_base_q_small,
+            ctx.m_g,
+            ctx.base.clone() - BigDecimal::from(1u64),
+            Some((ctx.m_g - 1) * ctx.log_base_q_small),
+        );
+        let small_times_v = small_decomposed * &v_idx;
         let t_idx = PolyMatrixNorm::new(
             ctx.clone(),
-            2 * ctx.m_g + 2 * ctx.m_g * ctx.log_base_q,
+            3 * ctx.m_g + ctx.m_g * ctx.log_base_q_small,
             ctx.m_g,
-            BigDecimal::one(),
+            small_times_v.poly_norm.norm,
             None,
         );
+
         let const_term = e_times_preimage_gate_1.clone() *
             PolyMatrixNorm::new(
                 ctx.clone(),
@@ -222,8 +242,7 @@ impl NormPltGGH15Evaluator {
             )
         );
 
-        let e_input_multiplier = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g) *
-            PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g);
+        let e_input_multiplier = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g) * &v_idx;
         info!(
             "{}",
             format!(
@@ -403,6 +422,7 @@ mod tests {
             BigDecimal::from(32u64),   // base
             2,
             28, // log_base_q
+            3,  // log_base_q_small
         ))
     }
 

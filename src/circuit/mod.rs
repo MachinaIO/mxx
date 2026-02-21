@@ -7,7 +7,7 @@ pub use gate::{PolyGate, PolyGateKind, PolyGateType};
 
 use dashmap::DashMap;
 use num_bigint::BigUint;
-use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Debug,
@@ -498,8 +498,8 @@ impl<P: Poly> PolyCircuit<P> {
     pub fn eval<E, PE>(
         &self,
         params: &E::Params,
-        one: &E,
-        inputs: &[E],
+        one: &Arc<E>,
+        inputs: &[Arc<E>],
         plt_evaluator: Option<&PE>,
     ) -> Vec<E>
     where
@@ -507,7 +507,18 @@ impl<P: Poly> PolyCircuit<P> {
         PE: PltEvaluator<E>,
     {
         let (call_id_base, gate_id_base) = self.eval_gate_id_bases();
-        self.eval_scoped(params, one, inputs, plt_evaluator, 0, call_id_base, gate_id_base)
+        let input_compacts =
+            inputs.iter().map(|input| Arc::new(input.to_compact())).collect::<Vec<_>>();
+        let outputs = self.eval_scoped(
+            params,
+            one,
+            &input_compacts,
+            plt_evaluator,
+            0,
+            call_id_base,
+            gate_id_base,
+        );
+        outputs.into_iter().map(|value| E::from_compact(params, value.as_ref())).collect()
     }
 
     fn eval_gate_id_bases(&self) -> (usize, usize) {
@@ -535,13 +546,13 @@ impl<P: Poly> PolyCircuit<P> {
     fn eval_scoped<E, PE>(
         &self,
         params: &E::Params,
-        one: &E,
-        inputs: &[E],
+        one: &Arc<E>,
+        inputs: &[Arc<E::Compact>],
         plt_evaluator: Option<&PE>,
         call_prefix: usize,
         call_id_base: usize,
         gate_id_base: usize,
-    ) -> Vec<E>
+    ) -> Vec<Arc<E::Compact>>
     where
         E: Evaluable<P = P>,
         PE: PltEvaluator<E>,
@@ -552,29 +563,39 @@ impl<P: Poly> PolyCircuit<P> {
             assert_ne!(self.num_output(), 0);
         }
 
-        let wires: DashMap<GateId, Arc<E>> = DashMap::new();
+        let wires: DashMap<GateId, Arc<E::Compact>> = DashMap::new();
         let levels = self.compute_levels();
         debug!("{}", format!("Levels: {levels:?}"));
         debug!("Levels are computed");
         let output_set: HashSet<GateId> = self.output_ids.iter().copied().collect();
-        let last_use_level: DashMap<GateId, usize> = DashMap::new();
-        levels.par_iter().enumerate().for_each(|(level_idx, level)| {
-            for gate_id in level {
-                let gate = self.gates.get(gate_id).expect("gate not found");
-                for input_id in &gate.input_gates {
-                    last_use_level
-                        .entry(*input_id)
-                        .and_modify(|val| {
-                            if *val < level_idx {
-                                *val = level_idx;
-                            }
-                        })
-                        .or_insert(level_idx);
+        // Count remaining input uses per wire so we can release each input wire
+        // immediately after its final consumer gate has been evaluated.
+        let use_count_by_gate: HashMap<GateId, usize> = levels
+            .par_iter()
+            .map(|level| {
+                let mut local_count = HashMap::<GateId, usize>::new();
+                for gate_id in level {
+                    let gate = self.gates.get(gate_id).expect("gate not found");
+                    for input_id in &gate.input_gates {
+                        *local_count.entry(*input_id).or_insert(0) += 1;
+                    }
                 }
-            }
-        });
+                local_count
+            })
+            .reduce(HashMap::new, |mut acc, local| {
+                for (gate_id, count) in local {
+                    *acc.entry(gate_id).or_insert(0) += count;
+                }
+                acc
+            });
+        let remaining_use_count: HashMap<GateId, AtomicUsize> = use_count_by_gate
+            .into_iter()
+            .map(|(gate_id, count)| (gate_id, AtomicUsize::new(count)))
+            .collect();
+        debug!("Initialized remaining-use counters for {} wires", remaining_use_count.len());
 
-        wires.insert(GateId(0), Arc::new(one.clone()));
+        wires.insert(GateId(0), Arc::new(one.to_compact()));
+        debug!("Constant one gate is set");
         // Collect all input gate IDs excluding the reserved constant-one gate (0)
         let mut input_gate_ids: Vec<GateId> = self
             .gates
@@ -585,30 +606,48 @@ impl<P: Poly> PolyCircuit<P> {
             })
             .collect();
         input_gate_ids.sort_by_key(|gid| gid.0);
+        debug!("input_gate_ids size {}", input_gate_ids.len());
         assert_eq!(
             input_gate_ids.len(),
             inputs.len(),
             "number of provided inputs must match circuit inputs"
         );
         for (id, input) in input_gate_ids.into_iter().zip(inputs.iter()) {
-            wires.insert(id, Arc::new(input.clone()));
+            wires.insert(id, Arc::clone(input));
             if let Some(prefix) = self.print_value.get(&id) {
-                info!("{}", format!("[{prefix}] Gate ID {id}, {:?}", input));
+                let decoded_input = E::from_compact(params, input.as_ref());
+                info!("{}", format!("[{prefix}] Gate ID {id}, {:?}", decoded_input));
             }
         }
         debug!("Input wires are set");
 
         let parallel_gates = crate::env::circuit_parallel_gates();
         let use_parallel = parallel_gates.map(|n| n != 1).unwrap_or(true);
+        let release_consumed_inputs = |gate: &PolyGate| {
+            for input_id in &gate.input_gates {
+                if output_set.contains(input_id) {
+                    continue;
+                }
+                let Some(counter) = remaining_use_count.get(input_id) else {
+                    continue;
+                };
+                let prev = counter.fetch_sub(1, Ordering::AcqRel);
+                debug_assert!(prev > 0, "remaining use counter underflow for gate {}", input_id);
+                if prev == 1 {
+                    wires.remove(input_id);
+                }
+            }
+        };
         let eval_gate = |gate_id: GateId| {
             debug!("{}", format!("Gate id {gate_id} started"));
+            let gate = self.gates.get(&gate_id).expect("gate not found").clone();
             if wires.contains_key(&gate_id) {
                 debug!("{}", format!("Gate id {gate_id} already evaluated"));
+                release_consumed_inputs(&gate);
                 return;
             }
-            let gate = self.gates.get(&gate_id).expect("gate not found").clone();
             debug!("Get gate");
-            let result = match &gate.gate_type {
+            let result: Arc<E::Compact> = match &gate.gate_type {
                 PolyGateType::Input => {
                     panic!("Input gate {gate:?} should already be preloaded");
                 }
@@ -618,9 +657,11 @@ impl<P: Poly> PolyCircuit<P> {
                         wires.get(&gate.input_gates[0]).expect("wire missing for Add").clone();
                     let right =
                         wires.get(&gate.input_gates[1]).expect("wire missing for Add").clone();
-                    let result = (*left).clone() + &*right;
+                    let left = E::from_compact(params, left.as_ref());
+                    let right = E::from_compact(params, right.as_ref());
+                    let result = left + &right;
                     debug!("Add gate end");
-                    result
+                    Arc::new(result.to_compact())
                 }
                 PolyGateType::Sub => {
                     debug!("Sub gate start");
@@ -628,9 +669,11 @@ impl<P: Poly> PolyCircuit<P> {
                         wires.get(&gate.input_gates[0]).expect("wire missing for Sub").clone();
                     let right =
                         wires.get(&gate.input_gates[1]).expect("wire missing for Sub").clone();
-                    let result = (*left).clone() - &*right;
+                    let left = E::from_compact(params, left.as_ref());
+                    let right = E::from_compact(params, right.as_ref());
+                    let result = left - &right;
                     debug!("Sub gate end");
-                    result
+                    Arc::new(result.to_compact())
                 }
                 PolyGateType::Mul => {
                     debug!("Mul gate start");
@@ -638,35 +681,40 @@ impl<P: Poly> PolyCircuit<P> {
                         wires.get(&gate.input_gates[0]).expect("wire missing for Mul").clone();
                     let right =
                         wires.get(&gate.input_gates[1]).expect("wire missing for Mul").clone();
-                    let result = (*left).clone() * &*right;
+                    let left = E::from_compact(params, left.as_ref());
+                    let right = E::from_compact(params, right.as_ref());
+                    let result = left * &right;
                     debug!("Mul gate end");
-                    result
+                    Arc::new(result.to_compact())
                 }
                 PolyGateType::SmallScalarMul { scalar } => {
                     let input = wires
                         .get(&gate.input_gates[0])
                         .expect("wire missing for LargeScalarMul")
                         .clone();
+                    let input = E::from_compact(params, input.as_ref());
                     let result = input.small_scalar_mul(params, scalar);
                     debug!("Large scalar mul gate end");
-                    result
+                    Arc::new(result.to_compact())
                 }
                 PolyGateType::LargeScalarMul { scalar } => {
                     let input = wires
                         .get(&gate.input_gates[0])
                         .expect("wire missing for LargeScalarMul")
                         .clone();
+                    let input = E::from_compact(params, input.as_ref());
                     let result = input.large_scalar_mul(params, scalar);
                     debug!("Large scalar mul gate end");
-                    result
+                    Arc::new(result.to_compact())
                 }
                 PolyGateType::Rotate { shift } => {
                     debug!("Rotate gate start");
                     let input =
                         wires.get(&gate.input_gates[0]).expect("wire missing for Rotate").clone();
+                    let input = E::from_compact(params, input.as_ref());
                     let result = input.rotate(params, *shift);
                     debug!("Rotate gate end");
-                    result
+                    Arc::new(result.to_compact())
                 }
                 PolyGateType::PubLut { lut_id } => {
                     debug!("Public Lookup gate start");
@@ -674,6 +722,7 @@ impl<P: Poly> PolyCircuit<P> {
                         .get(&gate.input_gates[0])
                         .expect("wire missing for Public Lookup")
                         .clone();
+                    let input = E::from_compact(params, input.as_ref());
                     let scoped_gate_id = call_prefix
                         .checked_mul(gate_id_base)
                         .and_then(|base| base.checked_add(gate_id.0))
@@ -686,12 +735,12 @@ impl<P: Poly> PolyCircuit<P> {
                             params,
                             lookup_guard.as_ref(),
                             one,
-                            &*input,
+                            &input,
                             scoped_gate_id,
                             *lut_id,
                         );
                     debug!("Public Lookup gate end");
-                    result
+                    Arc::new(result.to_compact())
                 }
                 PolyGateType::SubCircuitOutput { call_id, output_idx, .. } => {
                     debug!("Sub-circuit call start");
@@ -712,9 +761,7 @@ impl<P: Poly> PolyCircuit<P> {
                     let sub_inputs = call
                         .inputs
                         .iter()
-                        .map(|id| {
-                            wires.get(id).expect("wire missing for sub-circuit").as_ref().clone()
-                        })
+                        .map(|id| wires.get(id).expect("wire missing for sub-circuit").clone())
                         .collect::<Vec<_>>();
                     let sub_outputs = sub_circuit.eval_scoped(
                         params,
@@ -728,20 +775,21 @@ impl<P: Poly> PolyCircuit<P> {
                     if sub_outputs.len() != call.output_gate_ids.len() {
                         panic!("sub-circuit output size mismatch");
                     }
-                    let output_arcs: Vec<Arc<E>> = sub_outputs.into_iter().map(Arc::new).collect();
                     for (gate_id, value) in
-                        call.output_gate_ids.iter().copied().zip(output_arcs.iter().cloned())
+                        call.output_gate_ids.iter().copied().zip(sub_outputs.iter().cloned())
                     {
                         wires.insert(gate_id, value);
                     }
                     debug!("Sub-circuit call end");
-                    output_arcs[*output_idx].as_ref().clone()
+                    sub_outputs[*output_idx].clone()
                 }
             };
             if let Some(prefix) = self.print_value.get(&gate_id) {
-                info!("{}", format!("[{prefix}] Gate ID {gate_id}, {:?}", result));
+                let decoded_result = E::from_compact(params, result.as_ref());
+                info!("{}", format!("[{prefix}] Gate ID {gate_id}, {:?}", decoded_result));
             }
-            wires.insert(gate_id, Arc::new(result));
+            wires.insert(gate_id, result);
+            release_consumed_inputs(&gate);
             debug!("{}", format!("Gate id {gate_id} finished"));
         };
 
@@ -787,40 +835,13 @@ impl<P: Poly> PolyCircuit<P> {
                 regular_gates.iter().copied().for_each(|gate_id| eval_gate(gate_id));
                 debug!("Evaluated gate in single thread");
             }
-            let to_remove: HashSet<GateId> = level
-                .par_iter()
-                .map(|gate_id| {
-                    let gate = self.gates.get(gate_id).expect("gate not found");
-                    let mut local: HashSet<GateId> = HashSet::new();
-                    for input_id in &gate.input_gates {
-                        if output_set.contains(input_id) {
-                            continue;
-                        }
-                        if last_use_level
-                            .get(input_id)
-                            .map(|val| *val == level_idx)
-                            .unwrap_or(false)
-                        {
-                            local.insert(*input_id);
-                        }
-                    }
-                    local
-                })
-                .reduce(HashSet::new, |mut acc, local| {
-                    acc.extend(local);
-                    acc
-                });
-            debug!("Level {}: removed {} wires", level_idx, to_remove.len());
-            for gate_id in to_remove {
-                wires.remove(&gate_id);
-            }
         }
 
-        let outputs: Vec<Arc<E>> = if use_parallel {
+        let outputs: Vec<Arc<E::Compact>> = if use_parallel {
             if let Some(chunk_size) = parallel_gates {
-                let mut out: Vec<Arc<E>> = Vec::with_capacity(self.output_ids.len());
+                let mut out: Vec<Arc<E::Compact>> = Vec::with_capacity(self.output_ids.len());
                 for chunk in self.output_ids.chunks(chunk_size) {
-                    let mut chunk_out: Vec<Arc<E>> = chunk
+                    let mut chunk_out: Vec<Arc<E::Compact>> = chunk
                         .par_iter()
                         .map(|&id| wires.get(&id).expect("output missing").clone())
                         .collect();
@@ -840,7 +861,7 @@ impl<P: Poly> PolyCircuit<P> {
                 .collect()
         };
         debug!("Outputs are collected");
-        outputs.into_iter().map(|value| (*value).clone()).collect()
+        outputs
     }
 
     pub fn register_public_lookup(&mut self, public_lookup: PublicLut<P>) -> usize {
@@ -906,7 +927,7 @@ mod tests {
     use super::*;
     use crate::{
         element::PolyElem,
-        lookup::poly::PolyPltEvaluator,
+        lookup::{PltEvaluator, poly::PolyPltEvaluator},
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
             Poly, PolyParams,
@@ -917,6 +938,21 @@ mod tests {
         utils::{create_bit_random_poly, create_random_poly},
     };
     use num_bigint::BigUint;
+    use std::sync::Arc;
+
+    fn eval_with_const_one<PE>(
+        circuit: &PolyCircuit<DCRTPoly>,
+        params: &DCRTPolyParams,
+        inputs: &[DCRTPoly],
+        plt_evaluator: Option<&PE>,
+    ) -> Vec<DCRTPoly>
+    where
+        PE: PltEvaluator<DCRTPoly>,
+    {
+        let one = Arc::new(DCRTPoly::const_one(params));
+        let eval_inputs = inputs.iter().cloned().map(Arc::new).collect::<Vec<_>>();
+        circuit.eval(params, &one, &eval_inputs, plt_evaluator)
+    }
 
     #[test]
     fn test_eval_add() {
@@ -934,9 +970,9 @@ mod tests {
         circuit.output(vec![add_gate]);
 
         // Evaluate the circuit
-        let result = circuit.eval(
+        let result = eval_with_const_one(
+            &circuit,
             &params,
-            &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
             None::<&PolyPltEvaluator>,
         );
@@ -965,9 +1001,9 @@ mod tests {
         circuit.output(vec![sub_gate]);
 
         // Evaluate the circuit
-        let result = circuit.eval(
+        let result = eval_with_const_one(
+            &circuit,
             &params,
-            &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
             None::<&PolyPltEvaluator>,
         );
@@ -996,9 +1032,9 @@ mod tests {
         circuit.output(vec![mul_gate]);
 
         // Evaluate the circuit
-        let result = circuit.eval(
+        let result = eval_with_const_one(
+            &circuit,
             &params,
-            &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
             None::<&PolyPltEvaluator>,
         );
@@ -1031,12 +1067,8 @@ mod tests {
 
         // Evaluate the circuit with any input (it won't be used)
         let dummy_input = create_random_poly(&params);
-        let result = circuit.eval(
-            &params,
-            &DCRTPoly::const_one(&params),
-            &[dummy_input],
-            None::<&PolyPltEvaluator>,
-        );
+        let result =
+            eval_with_const_one(&circuit, &params, &[dummy_input], None::<&PolyPltEvaluator>);
 
         // Verify the result
         assert_eq!(result.len(), 1);
@@ -1095,9 +1127,9 @@ mod tests {
         circuit.output(vec![sub_gate]);
 
         // Evaluate the circuit
-        let result = circuit.eval(
+        let result = eval_with_const_one(
+            &circuit,
             &params,
-            &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone(), poly3.clone()],
             None::<&PolyPltEvaluator>,
         );
@@ -1135,9 +1167,9 @@ mod tests {
         circuit.output(vec![add_gate, sub_gate, mul_gate]);
 
         // Evaluate the circuit
-        let result = circuit.eval(
+        let result = eval_with_const_one(
+            &circuit,
             &params,
-            &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
             None::<&PolyPltEvaluator>,
         );
@@ -1186,9 +1218,9 @@ mod tests {
         circuit.output(vec![add_gate]);
 
         // Evaluate the circuit: inputs are assigned in ascending input GateId order
-        let result = circuit.eval(
+        let result = eval_with_const_one(
+            &circuit,
             &params,
-            &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
             None::<&PolyPltEvaluator>,
         );
@@ -1236,9 +1268,9 @@ mod tests {
         circuit.output(vec![f]);
 
         // Evaluate the circuit
-        let result = circuit.eval(
+        let result = eval_with_const_one(
+            &circuit,
             &params,
-            &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone(), poly3.clone(), poly4.clone()],
             None::<&PolyPltEvaluator>,
         );
@@ -1262,9 +1294,9 @@ mod tests {
         circuit.output(vec![and_result]);
         let poly1 = create_bit_random_poly(&params);
         let poly2 = create_bit_random_poly(&params);
-        let result = circuit.eval(
+        let result = eval_with_const_one(
+            &circuit,
             &params,
-            &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
             None::<&PolyPltEvaluator>,
         );
@@ -1281,9 +1313,9 @@ mod tests {
         let not_result = circuit.not_gate(inputs[0]);
         circuit.output(vec![not_result]);
         let poly1 = create_bit_random_poly(&params);
-        let result = circuit.eval(
+        let result = eval_with_const_one(
+            &circuit,
             &params,
-            &DCRTPoly::const_one(&params),
             std::slice::from_ref(&poly1),
             None::<&PolyPltEvaluator>,
         );
@@ -1301,9 +1333,9 @@ mod tests {
         circuit.output(vec![or_result]);
         let poly1 = create_bit_random_poly(&params);
         let poly2 = create_bit_random_poly(&params);
-        let result = circuit.eval(
+        let result = eval_with_const_one(
+            &circuit,
             &params,
-            &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
             None::<&PolyPltEvaluator>,
         );
@@ -1321,9 +1353,9 @@ mod tests {
         circuit.output(vec![nand_result]);
         let poly1 = create_bit_random_poly(&params);
         let poly2 = create_bit_random_poly(&params);
-        let result = circuit.eval(
+        let result = eval_with_const_one(
+            &circuit,
             &params,
-            &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
             None::<&PolyPltEvaluator>,
         );
@@ -1341,9 +1373,9 @@ mod tests {
         circuit.output(vec![nor_result]);
         let poly1 = create_bit_random_poly(&params);
         let poly2 = create_bit_random_poly(&params);
-        let result = circuit.eval(
+        let result = eval_with_const_one(
+            &circuit,
             &params,
-            &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
             None::<&PolyPltEvaluator>,
         );
@@ -1362,9 +1394,9 @@ mod tests {
         circuit.output(vec![nor_result]);
         let poly1 = create_bit_random_poly(&params);
         let poly2 = create_bit_random_poly(&params);
-        let result = circuit.eval(
+        let result = eval_with_const_one(
+            &circuit,
             &params,
-            &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
             None::<&PolyPltEvaluator>,
         );
@@ -1383,9 +1415,9 @@ mod tests {
         circuit.output(vec![xnor_result]);
         let poly1 = create_bit_random_poly(&params);
         let poly2 = create_bit_random_poly(&params);
-        let result = circuit.eval(
+        let result = eval_with_const_one(
+            &circuit,
             &params,
-            &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
             None::<&PolyPltEvaluator>,
         );
@@ -1440,8 +1472,7 @@ mod tests {
 
         // concatenate decomposed_c0 and decomposed_c1 and x
         let input = [a_bits, b_bits, vec![x.clone()]].concat();
-        let result =
-            circuit.eval(&params, &DCRTPoly::const_one(&params), &input, None::<&PolyPltEvaluator>);
+        let result = eval_with_const_one(&circuit, &params, &input, None::<&PolyPltEvaluator>);
 
         assert_eq!(result.len(), log_q * 2);
 
@@ -1505,9 +1536,9 @@ mod tests {
         main_circuit.output(vec![final_gate]);
 
         // Evaluate the main circuit
-        let result = main_circuit.eval(
+        let result = eval_with_const_one(
+            &main_circuit,
             &params,
-            &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone()],
             None::<&PolyPltEvaluator>,
         );
@@ -1568,9 +1599,9 @@ mod tests {
         main_circuit.output(vec![scalar_mul_gate]);
 
         // Evaluate the main circuit
-        let result = main_circuit.eval(
+        let result = eval_with_const_one(
+            &main_circuit,
             &params,
-            &DCRTPoly::const_one(&params),
             &[poly1.clone(), poly2.clone(), poly3.clone()],
             None::<&PolyPltEvaluator>,
         );
@@ -1598,12 +1629,8 @@ mod tests {
 
         // Evaluate the circuit with any input (it won't be used)
         let dummy_input = create_random_poly(&params);
-        let result = circuit.eval(
-            &params,
-            &DCRTPoly::const_one(&params),
-            &[dummy_input],
-            None::<&PolyPltEvaluator>,
-        );
+        let result =
+            eval_with_const_one(&circuit, &params, &[dummy_input], None::<&PolyPltEvaluator>);
 
         // Expected result: 0
         let expected = DCRTPoly::const_zero(&params);
@@ -1627,12 +1654,8 @@ mod tests {
 
         // Evaluate the circuit with any input (it won't be used)
         let dummy_input = create_random_poly(&params);
-        let result = circuit.eval(
-            &params,
-            &DCRTPoly::const_one(&params),
-            &[dummy_input],
-            None::<&PolyPltEvaluator>,
-        );
+        let result =
+            eval_with_const_one(&circuit, &params, &[dummy_input], None::<&PolyPltEvaluator>);
 
         // Expected result: 1
         let expected = DCRTPoly::const_one(&params);
@@ -1656,12 +1679,8 @@ mod tests {
 
         // Evaluate the circuit with any input (it won't be used)
         let dummy_input = create_random_poly(&params);
-        let result = circuit.eval(
-            &params,
-            &DCRTPoly::const_one(&params),
-            &[dummy_input],
-            None::<&PolyPltEvaluator>,
-        );
+        let result =
+            eval_with_const_one(&circuit, &params, &[dummy_input], None::<&PolyPltEvaluator>);
 
         // Expected result: -1
         // We can compute -1 as 0 - 1

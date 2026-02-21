@@ -6,7 +6,7 @@ use crate::{
     sampler::{DistType, PolyHashSampler, PolyUniformSampler},
 };
 use rayon::prelude::*;
-use std::marker::PhantomData;
+use std::{borrow::Borrow, marker::PhantomData};
 use tracing::debug;
 
 /// A sampler of a public key A in the BGG+ RLWE encoding scheme
@@ -104,12 +104,15 @@ where
     }
 
     /// This extend the given plaintexts +1 and insert constant 1 polynomial plaintext
-    pub fn sample(
+    pub fn sample<K>(
         &self,
         params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
-        public_keys: &[BggPublicKey<S::M>],
+        public_keys: &[K],
         plaintexts: &[<S::M as PolyMatrix>::P],
-    ) -> Vec<BggEncoding<S::M>> {
+    ) -> Vec<BggEncoding<S::M>>
+    where
+        K: Borrow<BggPublicKey<S::M>> + Sync,
+    {
         let secret_vec = &self.secret_vec;
         let log_base_q = params.modulus_digits();
         // first slot is allocated to the constant 1 polynomial plaintext
@@ -126,9 +129,9 @@ where
                 error_sampler.sample_uniform(params, 1, columns, DistType::GaussDist { sigma })
             }
         };
-        let all_public_key_matrix: S::M = public_keys[0]
-            .matrix
-            .concat_columns(&public_keys[1..].par_iter().map(|pk| &pk.matrix).collect::<Vec<_>>());
+        let all_public_key_matrix: S::M = public_keys[0].borrow().matrix.concat_columns(
+            &public_keys[1..].par_iter().map(|pk| &pk.borrow().matrix).collect::<Vec<_>>(),
+        );
         let first_term = secret_vec.clone() * all_public_key_matrix;
 
         let gadget = S::M::gadget_matrix(params, secret_vec_size);
@@ -142,14 +145,11 @@ where
             .map(|(idx, plaintext)| {
                 let vector = all_vector.slice_columns(m * idx, m * (idx + 1));
                 debug!("before constructing BggEncoding");
+                let pubkey = public_keys[idx].borrow();
                 BggEncoding {
                     vector,
-                    pubkey: public_keys[idx].clone(),
-                    plaintext: if public_keys[idx].reveal_plaintext {
-                        Some(plaintext.clone())
-                    } else {
-                        None
-                    },
+                    pubkey: pubkey.clone(),
+                    plaintext: if pubkey.reveal_plaintext { Some(plaintext.clone()) } else { None },
                 }
             })
             .collect()

@@ -23,6 +23,10 @@ pub trait Evaluable:
 {
     type Params: Debug + Clone + Send + Sync;
     type P: Poly;
+    type Compact: Debug + Clone + Send + Sync;
+
+    fn to_compact(&self) -> Self::Compact;
+    fn from_compact(params: &Self::Params, compact: &Self::Compact) -> Self;
 
     fn rotate(&self, params: &Self::Params, shift: i32) -> Self;
     fn small_scalar_mul(&self, params: &Self::Params, scalar: &[u32]) -> Self;

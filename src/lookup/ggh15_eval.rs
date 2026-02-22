@@ -784,6 +784,7 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                     continue;
                 }
                 batch.push((idx, y_poly));
+
                 if batch.len() >= chunk_size {
                     let lut_preimage_batch_start = Instant::now();
                     self.sample_lut_preimages(

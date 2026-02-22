@@ -657,38 +657,17 @@ static int gpu_matrix_decompose_base_impl(
         }
         if (out_limb_bases_device)
         {
-            if (dispatch_stream)
-            {
-                cudaFreeAsync(out_limb_bases_device, dispatch_stream);
-            }
-            else
-            {
-                cudaFree(out_limb_bases_device);
-            }
+            cudaFreeAsync(out_limb_bases_device, dispatch_stream);
             out_limb_bases_device = nullptr;
         }
         if (out_limb_strides_device)
         {
-            if (dispatch_stream)
-            {
-                cudaFreeAsync(out_limb_strides_device, dispatch_stream);
-            }
-            else
-            {
-                cudaFree(out_limb_strides_device);
-            }
+            cudaFreeAsync(out_limb_strides_device, dispatch_stream);
             out_limb_strides_device = nullptr;
         }
         if (out_limb_moduli_device)
         {
-            if (dispatch_stream)
-            {
-                cudaFreeAsync(out_limb_moduli_device, dispatch_stream);
-            }
-            else
-            {
-                cudaFree(out_limb_moduli_device);
-            }
+            cudaFreeAsync(out_limb_moduli_device, dispatch_stream);
             out_limb_moduli_device = nullptr;
         }
         cleanup_tmp_inputs();

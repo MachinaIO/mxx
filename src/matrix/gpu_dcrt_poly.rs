@@ -225,6 +225,41 @@ impl GpuDCRTPolyMatrix {
         self
     }
 
+    fn decompose_from_raw(
+        &self,
+        src_raw: *const GpuMatrixOpaque,
+        out_nrow: usize,
+        small: bool,
+    ) -> Self {
+        let out = Self::new_empty(&self.params, out_nrow, self.ncol);
+        let status = unsafe {
+            if small {
+                gpu_matrix_decompose_base_small(src_raw, self.params.base_bits(), out.raw)
+            } else {
+                gpu_matrix_decompose_base(src_raw, self.params.base_bits(), out.raw)
+            }
+        };
+        check_status(
+            status,
+            if small { "gpu_matrix_decompose_base_small" } else { "gpu_matrix_decompose_base" },
+        );
+        out
+    }
+
+    pub(crate) fn decompose_owned(mut self) -> Self {
+        self.intt_all_in_place();
+        let log_base_q = self.params.modulus_digits();
+        let out_nrow = self.nrow.saturating_mul(log_base_q);
+        self.decompose_from_raw(self.raw, out_nrow, false)
+    }
+
+    pub(crate) fn small_decompose_owned(mut self) -> Self {
+        self.intt_all_in_place();
+        let k = self.params.crt_bits().div_ceil(self.params.base_bits() as usize);
+        let out_nrow = self.nrow.saturating_mul(k);
+        self.decompose_from_raw(self.raw, out_nrow, true)
+    }
+
     fn new_zero_with_state(
         params: &GpuDCRTPolyParams,
         nrow: usize,
@@ -938,22 +973,22 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
 
     fn decompose(&self) -> Self {
         let log_base_q = self.params.modulus_digits();
-        let nrow = self.nrow.saturating_mul(log_base_q);
-        let out = Self::new_empty(&self.params, nrow, self.ncol);
-        let status =
-            unsafe { gpu_matrix_decompose_base(self.raw, self.params.base_bits(), out.raw) };
-        check_status(status, "gpu_matrix_decompose_base");
-        out
+        let out_nrow = self.nrow.saturating_mul(log_base_q);
+        self.decompose_from_raw(self.raw, out_nrow, false)
+    }
+
+    fn decompose_owned(self) -> Self {
+        GpuDCRTPolyMatrix::decompose_owned(self)
     }
 
     fn small_decompose(&self) -> Self {
         let k = self.params.crt_bits().div_ceil(self.params.base_bits() as usize);
-        let nrow = self.nrow.saturating_mul(k);
-        let out = Self::new_empty(&self.params, nrow, self.ncol);
-        let status =
-            unsafe { gpu_matrix_decompose_base_small(self.raw, self.params.base_bits(), out.raw) };
-        check_status(status, "gpu_matrix_decompose_base_small");
-        out
+        let out_nrow = self.nrow.saturating_mul(k);
+        self.decompose_from_raw(self.raw, out_nrow, true)
+    }
+
+    fn small_decompose_owned(self) -> Self {
+        GpuDCRTPolyMatrix::small_decompose_owned(self)
     }
 
     fn modulus_switch(
@@ -1119,7 +1154,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             let col_start = Instant::now();
 
             let decompose_start = Instant::now();
-            let col_small_decomposed = other.slice(0, other.nrow, j, j + 1).small_decompose();
+            let col_small_decomposed = other.slice(0, other.nrow, j, j + 1).small_decompose_owned();
             let decompose_elapsed = decompose_start.elapsed();
 
             let mul_start = Instant::now();
@@ -1166,8 +1201,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
 
     fn get_column_matrix_decompose(&self, j: usize) -> Self {
         debug_assert!(j < self.ncol, "column index out of bounds in get_column_matrix_decompose");
-        let col = self.slice(0, self.nrow, j, j + 1);
-        col.decompose()
+        self.slice(0, self.nrow, j, j + 1).decompose_owned()
     }
 
     fn vectorize_columns(&self) -> Self {

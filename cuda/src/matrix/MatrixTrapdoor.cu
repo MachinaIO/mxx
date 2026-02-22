@@ -1216,50 +1216,22 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         }
         if (sampled_digits_device)
         {
-            if (dispatch_stream)
-            {
-                cudaFreeAsync(sampled_digits_device, dispatch_stream);
-            }
-            else
-            {
-                cudaFree(sampled_digits_device);
-            }
+            cudaFreeAsync(sampled_digits_device, dispatch_stream);
             sampled_digits_device = nullptr;
         }
         if (out_limb_bases_device)
         {
-            if (dispatch_stream)
-            {
-                cudaFreeAsync(out_limb_bases_device, dispatch_stream);
-            }
-            else
-            {
-                cudaFree(out_limb_bases_device);
-            }
+            cudaFreeAsync(out_limb_bases_device, dispatch_stream);
             out_limb_bases_device = nullptr;
         }
         if (out_limb_strides_device)
         {
-            if (dispatch_stream)
-            {
-                cudaFreeAsync(out_limb_strides_device, dispatch_stream);
-            }
-            else
-            {
-                cudaFree(out_limb_strides_device);
-            }
+            cudaFreeAsync(out_limb_strides_device, dispatch_stream);
             out_limb_strides_device = nullptr;
         }
         if (out_limb_moduli_device)
         {
-            if (dispatch_stream)
-            {
-                cudaFreeAsync(out_limb_moduli_device, dispatch_stream);
-            }
-            else
-            {
-                cudaFree(out_limb_moduli_device);
-            }
+            cudaFreeAsync(out_limb_moduli_device, dispatch_stream);
             out_limb_moduli_device = nullptr;
         }
         cleanup_tmp_inputs();
@@ -1562,14 +1534,7 @@ extern "C" int gpu_matrix_sample_p1_full(
             cudaSetDevice(entry.device);
             if (entry.ptr)
             {
-                if (entry.owner_stream)
-                {
-                    cudaFreeAsync(entry.ptr, entry.owner_stream);
-                }
-                else
-                {
-                    cudaFree(entry.ptr);
-                }
+                cudaFreeAsync(entry.ptr, entry.owner_stream);
                 entry.ptr = nullptr;
             }
             if (entry.ready_event)

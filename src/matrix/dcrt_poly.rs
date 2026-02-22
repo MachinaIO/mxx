@@ -265,7 +265,7 @@ impl PolyMatrix for DCRTPolyMatrix {
                     &self.params,
                     other.get_column(j).into_iter().map(|poly| vec![poly]).collect(),
                 )
-                .small_decompose();
+                .small_decompose_owned();
                 self * &col
             })
             .collect_vec();
@@ -277,7 +277,7 @@ impl PolyMatrix for DCRTPolyMatrix {
             &self.params,
             self.get_column(j).into_iter().map(|poly| vec![poly]).collect(),
         )
-        .decompose()
+        .decompose_owned()
     }
 
     fn vectorize_columns(&self) -> Self {

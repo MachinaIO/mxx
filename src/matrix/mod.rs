@@ -162,11 +162,17 @@ pub trait PolyMatrix:
     /// where k = ceil(crt_bits / base_bits) and b = 2^{base_bits}.
     fn small_gadget_matrix(params: &<Self::P as Poly>::Params, size: usize) -> Self;
     fn decompose(&self) -> Self;
+    fn decompose_owned(self) -> Self {
+        self.decompose()
+    }
     /// Returns a compact decomposition matrix D such that
     /// small_gadget_matrix(size) * D == self
     /// under the assumption that coefficients are bounded by min(moduli)
     /// (i.e., the matrix norm is strictly less than the smallest CRT modulus).
     fn small_decompose(&self) -> Self;
+    fn small_decompose_owned(self) -> Self {
+        self.small_decompose()
+    }
     fn modulus_switch(
         &self,
         new_modulus: &<<Self::P as Poly>::Params as PolyParams>::Modulus,

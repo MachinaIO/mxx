@@ -334,11 +334,10 @@ __global__ void matrix_gauss_samp_gq_arb_base_multi_kernel(
     size_t src_cols,
     size_t out_cols,
     size_t log_base_q,
-    size_t digit_offset,
+    size_t src_digit_offset,
     uint64_t tower_modulus,
     uint32_t base_bits,
     uint32_t digits_per_tower,
-    uint32_t digit_idx,
     double c,
     uint32_t tower_idx,
     uint64_t seed,
@@ -436,30 +435,33 @@ __global__ void matrix_gauss_samp_gq_arb_base_multi_kernel(
         z[i] = sample_integer_karney(rng, -a[i], sigma);
     }
 
-    int64_t out_digit = 0;
-    if (digits_per_tower == 1)
-    {
-        out_digit = static_cast<int64_t>(base) * z[0] + m_digits[0] * z[0] + v_digits[0];
-    }
-    else if (digit_idx == 0)
-    {
-        out_digit = static_cast<int64_t>(base) * z[0] + m_digits[0] * z[last] + v_digits[0];
-    }
-    else if (digit_idx < last)
-    {
-        out_digit = static_cast<int64_t>(base) * z[digit_idx] - z[digit_idx - 1] +
-                    m_digits[digit_idx] * z[last] + v_digits[digit_idx];
-    }
-    else
-    {
-        out_digit = m_digits[last] * z[last] - z[last - 1] + v_digits[last];
-    }
-
     const size_t row = src_cols == 0 ? 0 : (poly_idx / src_cols);
     const size_t col = src_cols == 0 ? 0 : (poly_idx - row * src_cols);
-    const size_t out_row = row * log_base_q + digit_offset;
-    const size_t out_poly_idx = out_row * out_cols + col;
-    dst_base[out_poly_idx * dst_stride + coeff_idx] = signed_mod_i64(out_digit, out_modulus);
+    for (uint32_t digit_idx = 0; digit_idx < digits_per_tower; ++digit_idx)
+    {
+        int64_t out_digit = 0;
+        if (digits_per_tower == 1)
+        {
+            out_digit = static_cast<int64_t>(base) * z[0] + m_digits[0] * z[0] + v_digits[0];
+        }
+        else if (digit_idx == 0)
+        {
+            out_digit = static_cast<int64_t>(base) * z[0] + m_digits[0] * z[last] + v_digits[0];
+        }
+        else if (digit_idx < last)
+        {
+            out_digit = static_cast<int64_t>(base) * z[digit_idx] - z[digit_idx - 1] +
+                        m_digits[digit_idx] * z[last] + v_digits[digit_idx];
+        }
+        else
+        {
+            out_digit = m_digits[last] * z[last] - z[last - 1] + v_digits[last];
+        }
+
+        const size_t out_row = row * log_base_q + src_digit_offset + static_cast<size_t>(digit_idx);
+        const size_t out_poly_idx = out_row * out_cols + col;
+        dst_base[out_poly_idx * dst_stride + coeff_idx] = signed_mod_i64(out_digit, out_modulus);
+    }
 }
 
 int launch_gauss_samp_gq_arb_base_multi_kernel(
@@ -472,11 +474,10 @@ int launch_gauss_samp_gq_arb_base_multi_kernel(
     size_t src_cols,
     size_t out_cols,
     size_t log_base_q,
-    size_t digit_offset,
+    size_t src_digit_offset,
     uint64_t tower_modulus,
     uint32_t base_bits,
     uint32_t digits_per_tower,
-    uint32_t digit_idx,
     double c,
     uint32_t tower_idx,
     uint64_t seed,
@@ -518,11 +519,10 @@ int launch_gauss_samp_gq_arb_base_multi_kernel(
         src_cols,
         out_cols,
         log_base_q,
-        digit_offset,
+        src_digit_offset,
         tower_modulus,
         base_bits,
         digits_per_tower,
-        digit_idx,
         c,
         tower_idx,
         seed,
@@ -1095,47 +1095,40 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
                 return set_error("invalid output partition index in gpu_matrix_gauss_samp_gq_arb_base");
             }
             const size_t dst_stride = out->shared_limb_buffers[out_limb_id.x].words_per_poly;
-
-            for (uint32_t digit_idx = 0; digit_idx < digits_per_tower; ++digit_idx)
+            const size_t src_digit_offset =
+                static_cast<size_t>(src_limb) * static_cast<size_t>(digits_per_tower);
+            status = launch_gauss_samp_gq_arb_base_multi_kernel(
+                src_base,
+                dst_base,
+                count,
+                static_cast<size_t>(src->ctx->N),
+                src_stride,
+                dst_stride,
+                cols,
+                out->cols,
+                log_base_q,
+                src_digit_offset,
+                src->ctx->moduli[static_cast<size_t>(src_limb)],
+                base_bits,
+                digits_per_tower,
+                c,
+                static_cast<uint32_t>(src_limb),
+                seed,
+                src->ctx->moduli[static_cast<size_t>(out_limb)],
+                out_device,
+                out_stream,
+                out,
+                &out_limb_id);
+            if (status != 0)
             {
-                const size_t digit_offset =
-                    static_cast<size_t>(src_limb) * static_cast<size_t>(digits_per_tower) +
-                    static_cast<size_t>(digit_idx);
-
-                status = launch_gauss_samp_gq_arb_base_multi_kernel(
-                    src_base,
-                    dst_base,
-                    count,
-                    static_cast<size_t>(src->ctx->N),
-                    src_stride,
-                    dst_stride,
-                    cols,
-                    out->cols,
-                    log_base_q,
-                    digit_offset,
-                    src->ctx->moduli[static_cast<size_t>(src_limb)],
-                    base_bits,
-                    digits_per_tower,
-                    digit_idx,
-                    c,
-                    static_cast<uint32_t>(src_limb),
-                    seed,
-                    src->ctx->moduli[static_cast<size_t>(out_limb)],
-                    out_device,
-                    out_stream,
-                    out,
-                    &out_limb_id);
-                if (status != 0)
-                {
-                    cleanup_tmp_inputs();
-                    return status;
-                }
-                status = matrix_record_limb_write(out, out_limb_id, out_stream);
-                if (status != 0)
-                {
-                    cleanup_tmp_inputs();
-                    return status;
-                }
+                cleanup_tmp_inputs();
+                return status;
+            }
+            status = matrix_record_limb_write(out, out_limb_id, out_stream);
+            if (status != 0)
+            {
+                cleanup_tmp_inputs();
+                return status;
             }
             status = matrix_track_limb_consumer(
                 inputs_matrix,

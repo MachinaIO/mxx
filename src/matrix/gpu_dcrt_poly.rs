@@ -211,6 +211,20 @@ impl GpuDCRTPolyMatrix {
         self.is_ntt = false;
     }
 
+    pub(crate) fn intt_all_in_place(&mut self) {
+        if self.nrow == 0 || self.ncol == 0 || !self.is_ntt {
+            return;
+        }
+        let status = unsafe { gpu_matrix_intt_all(self.raw, self.params.batch() as i32) };
+        check_status(status, "gpu_matrix_intt_all");
+        self.is_ntt = false;
+    }
+
+    pub(crate) fn into_coeff_domain(mut self) -> Self {
+        self.intt_all_in_place();
+        self
+    }
+
     fn new_zero_with_state(
         params: &GpuDCRTPolyParams,
         nrow: usize,
@@ -337,7 +351,7 @@ impl GpuDCRTPolyMatrix {
         a_mat: &Self,
         b_mat: &Self,
         d_mat: &Self,
-        tp2: &Self,
+        mut tp2: Self,
         sigma: f64,
         s: f64,
         dgg_stddev: f64,
@@ -356,6 +370,9 @@ impl GpuDCRTPolyMatrix {
         if tp2.nrow == 0 || tp2.ncol == 0 {
             return out;
         }
+        // tp2 is consumed by this API, so convert in-place and avoid C++-side
+        // tmp_tp2 create/copy/INTT path.
+        tp2.intt_all_in_place();
         let status = unsafe {
             gpu_matrix_sample_p1_full(
                 a_mat.raw, b_mat.raw, d_mat.raw, tp2.raw, sigma, s, dgg_stddev, seed, out.raw,

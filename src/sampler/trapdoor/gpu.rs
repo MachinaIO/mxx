@@ -9,6 +9,10 @@ use std::time::Instant;
 const SIGMA: f64 = 4.578;
 const SPECTRAL_CONSTANT: f64 = 1.8;
 
+fn coeff_cached_matrix(src: &GpuDCRTPolyMatrix) -> GpuDCRTPolyMatrix {
+    src.clone().into_coeff_domain()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuDCRTTrapdoor {
     pub r: GpuDCRTPolyMatrix,
@@ -17,6 +21,9 @@ pub struct GpuDCRTTrapdoor {
     pub b_mat: GpuDCRTPolyMatrix,
     pub d_mat: GpuDCRTPolyMatrix,
     pub re: GpuDCRTPolyMatrix,
+    a_mat_coeff: GpuDCRTPolyMatrix,
+    b_mat_coeff: GpuDCRTPolyMatrix,
+    d_mat_coeff: GpuDCRTPolyMatrix,
 }
 
 impl GpuDCRTTrapdoor {
@@ -30,7 +37,10 @@ impl GpuDCRTTrapdoor {
         let b_mat = &r * &e.transpose(); // d x d
         let d_mat = &e * &e.transpose(); // d x d
         let re = r.concat_rows(&[&e]);
-        Self { r, e, a_mat, b_mat, d_mat, re }
+        let a_mat_coeff = coeff_cached_matrix(&a_mat);
+        let b_mat_coeff = coeff_cached_matrix(&b_mat);
+        let d_mat_coeff = coeff_cached_matrix(&d_mat);
+        Self { r, e, a_mat, b_mat, d_mat, re, a_mat_coeff, b_mat_coeff, d_mat_coeff }
     }
 
     pub fn to_compact_bytes(&self) -> Vec<u8> {
@@ -77,14 +87,16 @@ impl GpuDCRTTrapdoor {
             return None;
         }
 
-        Some(Self {
-            r: GpuDCRTPolyMatrix::from_compact_bytes(params, &r_bytes),
-            e: GpuDCRTPolyMatrix::from_compact_bytes(params, &e_bytes),
-            a_mat: GpuDCRTPolyMatrix::from_compact_bytes(params, &a_bytes),
-            b_mat: GpuDCRTPolyMatrix::from_compact_bytes(params, &b_bytes),
-            d_mat: GpuDCRTPolyMatrix::from_compact_bytes(params, &d_bytes),
-            re: GpuDCRTPolyMatrix::from_compact_bytes(params, &re_bytes),
-        })
+        let r = GpuDCRTPolyMatrix::from_compact_bytes(params, &r_bytes);
+        let e = GpuDCRTPolyMatrix::from_compact_bytes(params, &e_bytes);
+        let a_mat = GpuDCRTPolyMatrix::from_compact_bytes(params, &a_bytes);
+        let b_mat = GpuDCRTPolyMatrix::from_compact_bytes(params, &b_bytes);
+        let d_mat = GpuDCRTPolyMatrix::from_compact_bytes(params, &d_bytes);
+        let re = GpuDCRTPolyMatrix::from_compact_bytes(params, &re_bytes);
+        let a_mat_coeff = coeff_cached_matrix(&a_mat);
+        let b_mat_coeff = coeff_cached_matrix(&b_mat);
+        let d_mat_coeff = coeff_cached_matrix(&d_mat);
+        Some(Self { r, e, a_mat, b_mat, d_mat, re, a_mat_coeff, b_mat_coeff, d_mat_coeff })
     }
 }
 
@@ -320,17 +332,16 @@ fn sample_pert_square_mat_gpu_native(
     let mut prng = rng();
     let p1_seed: u64 = prng.random();
     let p1 = GpuDCRTPolyMatrix::sample_p1_full(
-        &trapdoor.a_mat,
-        &trapdoor.b_mat,
-        &trapdoor.d_mat,
-        &tp2,
+        &trapdoor.a_mat_coeff,
+        &trapdoor.b_mat_coeff,
+        &trapdoor.d_mat_coeff,
+        tp2,
         c,
         s,
         dgg_stddev,
         p1_seed,
     );
     tracing::debug!("gpu preimage sample_pert: sampled p1");
-    drop(tp2);
 
     let mut p_hat = GpuDCRTPolyMatrix::new_empty_with_state(
         params,

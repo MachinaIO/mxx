@@ -130,10 +130,37 @@ pub trait PolyMatrix:
     fn transpose(&self) -> Self;
     /// (m * n1), (m * n2) -> (m * (n1 + n2))
     fn concat_columns(&self, others: &[&Self]) -> Self;
+    /// Owned variant of `concat_columns` that can consume the first/other inputs.
+    /// Implementations may override this to avoid unnecessary deep clone of `self`.
+    fn concat_columns_owned(self, others: Vec<Self>) -> Self {
+        if others.is_empty() {
+            return self;
+        }
+        let refs = others.iter().collect::<Vec<_>>();
+        self.concat_columns(&refs)
+    }
     /// (m1 * n), (m2 * n) -> ((m1 + m2) * n)
     fn concat_rows(&self, others: &[&Self]) -> Self;
+    /// Owned variant of `concat_rows` that can consume the first/other inputs.
+    /// Implementations may override this to avoid unnecessary deep clone of `self`.
+    fn concat_rows_owned(self, others: Vec<Self>) -> Self {
+        if others.is_empty() {
+            return self;
+        }
+        let refs = others.iter().collect::<Vec<_>>();
+        self.concat_rows(&refs)
+    }
     /// (m1 * n1), (m2 * n2) -> ((m1 + m2) * (n1 + n2))
     fn concat_diag(&self, others: &[&Self]) -> Self;
+    /// Owned variant of `concat_diag` that can consume the first/other inputs.
+    /// Implementations may override this to avoid unnecessary deep clone of `self`.
+    fn concat_diag_owned(self, others: Vec<Self>) -> Self {
+        if others.is_empty() {
+            return self;
+        }
+        let refs = others.iter().collect::<Vec<_>>();
+        self.concat_diag(&refs)
+    }
     fn tensor(&self, other: &Self) -> Self;
     fn unit_column_vector(params: &<Self::P as Poly>::Params, size: usize, index: usize) -> Self {
         let mut vec = vec![Self::P::const_zero(params); size];

@@ -912,12 +912,24 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         self.clone().concat_columns_consume_with_refs(others)
     }
 
+    fn concat_columns_owned(self, others: Vec<Self>) -> Self {
+        GpuDCRTPolyMatrix::concat_columns_owned(self, others)
+    }
+
     fn concat_rows(&self, others: &[&Self]) -> Self {
         self.clone().concat_rows_consume_with_refs(others)
     }
 
+    fn concat_rows_owned(self, others: Vec<Self>) -> Self {
+        GpuDCRTPolyMatrix::concat_rows_owned(self, others)
+    }
+
     fn concat_diag(&self, others: &[&Self]) -> Self {
         self.clone().concat_diag_consume_with_refs(others)
+    }
+
+    fn concat_diag_owned(self, others: Vec<Self>) -> Self {
+        GpuDCRTPolyMatrix::concat_diag_owned(self, others)
     }
 
     fn tensor(&self, other: &Self) -> Self {

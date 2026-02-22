@@ -414,10 +414,10 @@ where
         Self::checkpoint_has_index(checkpoint_index, &gate1_prefix, 0) &&
             Self::checkpoint_has_index(checkpoint_index, &gate2_identity_prefix, 0) &&
             Self::checkpoint_has_index(checkpoint_index, &gate2_gy_prefix, 0) &&
-            (0..gate_chunk_count).all(|chunk_idx| {
+            (0..gate_chunk_count).into_par_iter().all(|chunk_idx| {
                 Self::checkpoint_has_index(checkpoint_index, &gate2_v_prefix, chunk_idx)
             }) &&
-            (0..gate_chunk_count).all(|chunk_idx| {
+            (0..gate_chunk_count).into_par_iter().all(|chunk_idx| {
                 Self::checkpoint_has_index(checkpoint_index, &gate2_vx_prefix, chunk_idx)
             })
     }
@@ -432,26 +432,24 @@ where
         let Some(checkpoint_index) = checkpoint_index else {
             return false;
         };
-        for lut_id in lut_ids {
+        let has_lut_resume = lut_ids.par_iter().any(|lut_id| {
             let lut_aux_prefix = format!("{checkpoint_prefix}_lut_aux_{}", lut_id);
             let lut_aux_row_prefix = format!("{lut_aux_prefix}_idx");
-            if checkpoint_index.entries.iter().any(|(key, entry)| {
+            checkpoint_index.entries.iter().any(|(key, entry)| {
                 key.starts_with(&lut_aux_row_prefix) && entry.indices.contains(&0)
-            }) {
-                return true;
-            }
+            })
+        });
+        if has_lut_resume {
+            return true;
         }
-        for gate_id in gate_ids {
-            if Self::gate_checkpoint_complete(
+        gate_ids.par_iter().any(|gate_id| {
+            Self::gate_checkpoint_complete(
                 Some(checkpoint_index),
                 checkpoint_prefix,
                 *gate_id,
                 gate_chunk_count,
-            ) {
-                return true;
-            }
-        }
-        false
+            )
+        })
     }
 
     fn load_b1_checkpoint(
@@ -692,36 +690,52 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
 
         // Checkpoint verification phase.
         let mut processed_lut_rows = 0usize;
-        let mut resumed_lut_rows = 0usize;
-        let mut lut_plans = Vec::with_capacity(lut_entries.len());
-
-        for (lut_id, plt) in lut_entries {
-            let lut_aux_prefix = self.lut_aux_id_prefix(params, lut_id);
-            let completed_rows: HashSet<usize> = plt
-                .entries(params)
-                .map(|(_, (idx, _))| idx)
-                .collect::<Vec<_>>()
-                .into_par_iter()
-                .filter_map(|idx| {
-                    let lut_aux_row_id = format!("{lut_aux_prefix}_idx{idx}");
-                    if Self::checkpoint_has_index(checkpoint_index_for_resume, &lut_aux_row_id, 0) {
-                        Some(idx)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let resumed_rows_for_lut = completed_rows.len();
-            resumed_lut_rows = resumed_lut_rows.saturating_add(resumed_rows_for_lut);
-            processed_lut_rows = processed_lut_rows.saturating_add(resumed_rows_for_lut);
-            if resumed_rows_for_lut > 0 {
+        let lut_plans_with_prefix = lut_entries
+            .into_par_iter()
+            .map(|(lut_id, plt)| {
+                let lut_aux_prefix = self.lut_aux_id_prefix(params, lut_id);
+                let completed_rows: HashSet<usize> = plt
+                    .entries(params)
+                    .map(|(_, (idx, _))| idx)
+                    .collect::<Vec<_>>()
+                    .into_par_iter()
+                    .filter_map(|idx| {
+                        let lut_aux_row_id = format!("{lut_aux_prefix}_idx{idx}");
+                        if Self::checkpoint_has_index(
+                            checkpoint_index_for_resume,
+                            &lut_aux_row_id,
+                            0,
+                        ) {
+                            Some(idx)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let resumed_rows_for_lut = completed_rows.len();
+                (lut_id, plt, completed_rows, resumed_rows_for_lut, lut_aux_prefix)
+            })
+            .collect::<Vec<_>>();
+        lut_plans_with_prefix
+            .par_iter()
+            .filter(|(_, _, _, resumed_rows_for_lut, _)| *resumed_rows_for_lut > 0)
+            .for_each(|(lut_id, _, _, resumed_rows_for_lut, lut_aux_prefix)| {
                 info!(
                     "LUT checkpoint resumed: lut_id={}, rows={}, aux_prefix={}",
                     lut_id, resumed_rows_for_lut, lut_aux_prefix
                 );
-            }
-            lut_plans.push((lut_id, plt, completed_rows, resumed_rows_for_lut));
-        }
+            });
+        let resumed_lut_rows = lut_plans_with_prefix
+            .par_iter()
+            .map(|(_, _, _, resumed_rows_for_lut, _)| *resumed_rows_for_lut)
+            .sum::<usize>();
+        processed_lut_rows = processed_lut_rows.saturating_add(resumed_lut_rows);
+        let lut_plans = lut_plans_with_prefix
+            .into_iter()
+            .map(|(lut_id, plt, completed_rows, resumed_rows_for_lut, _)| {
+                (lut_id, plt, completed_rows, resumed_rows_for_lut)
+            })
+            .collect::<Vec<_>>();
 
         let (resumed_gates, gates_by_lut) = gate_entries
             .into_par_iter()
@@ -744,9 +758,9 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
             .reduce(
                 || (0usize, HashMap::<usize, Vec<(GateId, GateState<M>)>>::new()),
                 |(left_resumed, mut left_grouped), (right_resumed, right_grouped)| {
-                    for (lut_id, mut gates) in right_grouped {
+                    right_grouped.into_iter().for_each(|(lut_id, mut gates)| {
                         left_grouped.entry(lut_id).or_default().append(&mut gates);
-                    }
+                    });
                     (left_resumed.saturating_add(right_resumed), left_grouped)
                 },
             );
@@ -771,6 +785,7 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                 }
                 batch.push((idx, y_poly));
                 if batch.len() >= chunk_size {
+                    let lut_preimage_batch_start = Instant::now();
                     self.sample_lut_preimages(
                         params,
                         lut_id,
@@ -783,7 +798,13 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                         &w_block_vx,
                         &batch,
                     );
-                    debug!("Sampled LUT preimages: lut_id={}, batch_size={}", lut_id, batch.len());
+                    let lut_preimage_batch_elapsed = lut_preimage_batch_start.elapsed();
+                    debug!(
+                        "Sampled LUT preimages: lut_id={}, batch_size={}, elapsed={}",
+                        lut_id,
+                        batch.len(),
+                        Self::format_duration(lut_preimage_batch_elapsed)
+                    );
                     processed_lut_rows = processed_lut_rows.saturating_add(batch.len());
                     let pct = if total_lut_rows == 0 {
                         100.0

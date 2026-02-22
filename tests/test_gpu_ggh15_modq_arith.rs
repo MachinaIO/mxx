@@ -410,8 +410,9 @@ async fn test_gpu_ggh15_modq_arith() {
     let q_over_qmax = full_q.as_ref() / BigUint::from(q_max);
     let randomized_coeff = coeff + q_over_qmax.clone() * BigUint::from(random_int);
     let rounded = round_div_biguint(&randomized_coeff, &q_over_qmax);
-    let decoded_random: u64 =
-        (&rounded % BigUint::from(q_max)).try_into().expect("decoded random coefficient must fit u64");
+    let decoded_random: u64 = (&rounded % BigUint::from(q_max))
+        .try_into()
+        .expect("decoded random coefficient must fit u64");
     assert_eq!(decoded_random, random_int);
 
     gpu_device_sync();

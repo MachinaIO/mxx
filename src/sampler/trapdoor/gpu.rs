@@ -205,7 +205,6 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         let z_seed: u64 = rng.random();
         let gauss_start = Instant::now();
         let z_hat_mat = perturbed_syndrome.gauss_samp_gq_arb_base(self.c, self.sigma, z_seed);
-        drop(perturbed_syndrome);
         tracing::debug!(
             elapsed_ms = gauss_start.elapsed().as_secs_f64() * 1_000.0,
             "gpu preimage: sampled z_hat_mat with gauss_samp_gq_arb_base"

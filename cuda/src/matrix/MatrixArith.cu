@@ -76,43 +76,6 @@ namespace
     }
 
     template <typename T>
-    __global__ void matrix_decompose_multi_kernel(
-        const T *src_base,
-        T *dst_base,
-        size_t poly_count,
-        size_t n,
-        size_t src_stride,
-        size_t dst_stride,
-        size_t src_cols,
-        size_t out_cols,
-        size_t log_base_q,
-        size_t digit_offset,
-        uint32_t shift,
-        T mask,
-        T out_modulus)
-    {
-        size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        size_t total = poly_count * n;
-        if (idx >= total)
-        {
-            return;
-        }
-        const size_t poly_idx = idx / n;
-        const size_t coeff_idx = idx - poly_idx * n;
-        T residue = src_base[poly_idx * src_stride + coeff_idx];
-        T digit = shift >= static_cast<uint32_t>(sizeof(T) * 8) ? 0 : ((residue >> shift) & mask);
-        if (out_modulus != 0 && digit >= out_modulus)
-        {
-            digit %= out_modulus;
-        }
-        const size_t row = src_cols == 0 ? 0 : (poly_idx / src_cols);
-        const size_t col = src_cols == 0 ? 0 : (poly_idx - row * src_cols);
-        const size_t out_row = row * log_base_q + digit_offset;
-        const size_t out_poly_idx = out_row * out_cols + col;
-        dst_base[out_poly_idx * dst_stride + coeff_idx] = digit;
-    }
-
-    template <typename T>
     __global__ void block_mul_kernel(
         const T *lhs_base,
         const T *rhs_base,
@@ -454,64 +417,6 @@ namespace
             modulus);
 
         const cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        return 0;
-    }
-
-    template <typename T>
-    int launch_decompose_multi_kernel(
-        const T *src_base,
-        T *dst_base,
-        size_t poly_count,
-        size_t n,
-        size_t src_stride,
-        size_t dst_stride,
-        size_t src_cols,
-        size_t out_cols,
-        size_t log_base_q,
-        size_t digit_offset,
-        uint32_t shift,
-        T mask,
-        T out_modulus,
-        cudaStream_t stream,
-        const GpuMatrix *,
-        const dim3 *)
-    {
-        if (!src_base || !dst_base)
-        {
-            return set_error("null base pointer in launch_decompose_multi_kernel");
-        }
-        if (poly_count == 0 || n == 0)
-        {
-            return 0;
-        }
-        if (src_cols == 0 || out_cols == 0 || log_base_q == 0)
-        {
-            return set_error("invalid matrix shape in launch_decompose_multi_kernel");
-        }
-
-        const int threads = 256;
-        const size_t total = poly_count * n;
-        const int blocks = static_cast<int>((total + threads - 1) / threads);
-        cudaError_t err;
-        matrix_decompose_multi_kernel<<<blocks, threads, 0, stream>>>(
-            src_base,
-            dst_base,
-            poly_count,
-            n,
-            src_stride,
-            dst_stride,
-            src_cols,
-            out_cols,
-            log_base_q,
-            digit_offset,
-            shift,
-            mask,
-            out_modulus);
-        err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             return set_error(err);

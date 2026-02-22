@@ -329,10 +329,13 @@ impl GpuDCRTPolyMatrix {
         out
     }
 
-    pub fn gauss_samp_gq_arb_base(&self, c: f64, dgg_stddev: f64, seed: u64) -> Self {
+    pub fn gauss_samp_gq_arb_base(mut self, c: f64, dgg_stddev: f64, seed: u64) -> Self {
         let log_base_q = self.params.modulus_digits();
         let out_nrow = self.nrow.saturating_mul(log_base_q);
         let out = Self::new_empty(&self.params, out_nrow, self.ncol);
+        // This API consumes the source matrix, so convert it in-place to COEFF
+        // and avoid CUDA-side tmp create/copy/INTT.
+        self.intt_all_in_place();
         let status = unsafe {
             gpu_matrix_gauss_samp_gq_arb_base(
                 self.raw,
@@ -1700,7 +1703,7 @@ mod tests {
         let gadget = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, matrix.row_size());
         for offset in 0..16u64 {
             let sampled =
-                matrix.gauss_samp_gq_arb_base(c, 4.578, 0x1234_5678_9abc_def0u64 + offset);
+                matrix.clone().gauss_samp_gq_arb_base(c, 4.578, 0x1234_5678_9abc_def0u64 + offset);
             let reconstructed = &gadget * &sampled;
             assert_eq!(reconstructed, matrix);
         }
@@ -1717,7 +1720,7 @@ mod tests {
         let varied_gadget = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, 1);
         for offset in 0..16u64 {
             let sampled =
-                varied_matrix.gauss_samp_gq_arb_base(c, 4.578, 0x00de_adbe_efu64 + offset);
+                varied_matrix.clone().gauss_samp_gq_arb_base(c, 4.578, 0x00de_adbe_efu64 + offset);
             let reconstructed = &varied_gadget * &sampled;
             assert_eq!(reconstructed, varied_matrix);
         }
@@ -1741,8 +1744,11 @@ mod tests {
         );
         let wide_gadget = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, wide_matrix.row_size());
         for offset in 0..16u64 {
-            let sampled =
-                wide_matrix.gauss_samp_gq_arb_base(c, 4.578, 0x55aa_aa55_1357_2468u64 + offset);
+            let sampled = wide_matrix.clone().gauss_samp_gq_arb_base(
+                c,
+                4.578,
+                0x55aa_aa55_1357_2468u64 + offset,
+            );
             let reconstructed = &wide_gadget * &sampled;
             assert_eq!(reconstructed, wide_matrix);
         }
@@ -1763,8 +1769,11 @@ mod tests {
         let random_matrix = GpuDCRTPolyMatrix::from_poly_vec(&gpu_params, random_matrix_vec);
         let random_gadget = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, random_matrix.row_size());
         for offset in 0..8u64 {
-            let sampled =
-                random_matrix.gauss_samp_gq_arb_base(c, 4.578, 0x0f0f_f0f0_2468_1357u64 + offset);
+            let sampled = random_matrix.clone().gauss_samp_gq_arb_base(
+                c,
+                4.578,
+                0x0f0f_f0f0_2468_1357u64 + offset,
+            );
             let reconstructed = &random_gadget * &sampled;
             if reconstructed != random_matrix {
                 let sampled_cpu = sampled.to_cpu_matrix();

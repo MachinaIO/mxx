@@ -222,9 +222,8 @@ where
                     lut_id, idx
                 );
                 let idx_poly = M::P::from_usize_to_constant(params, *idx);
-                let idx_identity = M::identity(params, m, Some(idx_poly.clone()));
-                let w_v_idx = w_block_vx.mul_decompose_small(&idx_identity) * v_idx;
-                drop(idx_identity);
+                let idx_identity_decomposed = M::identity(params, m, Some(idx_poly)).small_decompose();
+                let w_v_idx = w_block_vx.clone() * idx_identity_decomposed * v_idx;
                 w_t_idx.add_in_place(&w_v_idx);
                 debug!(
                     "Constructed w_block_v_idx contribution for LUT preimage: lut_id={}, row_idx={}",
@@ -1540,10 +1539,9 @@ where
             m_g * k_small,
             "preimage_gate2_vx must have m_g * k_small columns"
         );
-        let x_identity = M::identity(params, m_g, Some(x.clone()));
-        c_const = c_const +
-            (sg_times_b1.clone() * preimage_gate2_vx).mul_decompose_small(&x_identity) * &v_idx;
-        drop(x_identity);
+        let x_identity_decomposed = M::identity(params, m_g, Some(x.clone())).small_decompose();
+        c_const =
+            c_const + sg_times_b1.clone() * preimage_gate2_vx * x_identity_decomposed * &v_idx;
 
         let preimage_lut = read_matrix_from_multi_batch::<M>(params, dir, &lut_aux_row_id, 0)
             .unwrap_or_else(|| panic!("preimage_lut (index {}) for lut {} not found", k, lut_id));

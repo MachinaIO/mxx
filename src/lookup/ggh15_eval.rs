@@ -185,66 +185,145 @@ where
             m * k_small,
             "w_block_vx columns must equal d * modulus_digits^2"
         );
-        let jobs = batch
-            .par_iter()
-            .map(|(idx, y_poly)| {
-                let v_idx = derive_lut_v_idx_from_hash::<M, HS>(
-                    params,
-                    self.hash_key,
-                    lut_id,
-                    *idx,
-                    d,
-                );
-                debug!(
-                    "Derived v_idx for LUT preimage from hash: lut_id={}, row_idx={}",
-                    lut_id, idx
-                );
-                // Compute w_matrix * t_idx without materializing t_idx:
-                // t_idx = [I_d; G^-1(G*y); v_idx; G_small^-1(idx * I_m) * v_idx].
-                let mut w_t_idx = w_block_identity.clone();
-                debug!(
-                    "Constructed w_block_identity for LUT preimage: lut_id={}, row_idx={}",
-                    lut_id, idx
-                );
-                let gy = gadget_matrix.clone() * y_poly;
-                let gy_decomposed = gy.decompose();
-                drop(gy);
-                let w_gy = w_block_gy.clone() * gy_decomposed;
-                w_t_idx.add_in_place(&w_gy);
-                debug!(
-                    "Constructed w_block_gy contribution for LUT preimage: lut_id={}, row_idx={}",
-                    lut_id, idx
-                );
-                let w_v = w_block_v.clone() * &v_idx;
-                w_t_idx.add_in_place(&w_v);
-                debug!(
-                    "Constructed w_block_v contribution for LUT preimage: lut_id={}, row_idx={}",
-                    lut_id, idx
-                );
-                let idx_poly = M::P::from_usize_to_constant(params, *idx);
-                let idx_identity_decomposed = M::identity(params, m, Some(idx_poly)).small_decompose();
-                let w_v_idx = w_block_vx.clone() * idx_identity_decomposed * v_idx;
-                w_t_idx.add_in_place(&w_v_idx);
-                debug!(
-                    "Constructed w_block_v_idx contribution for LUT preimage: lut_id={}, row_idx={}",
-                    lut_id, idx
-                );
-                let mut target = M::zero(params, d + w_t_idx.row_size(), m);
-                target.copy_block_from(&w_t_idx, d, 0, 0, 0, w_t_idx.row_size(), m);
-                drop(w_t_idx);
-                debug!(
-                    "Constructed target for LUT preimage: lut_id={}, row_idx={}",
-                    lut_id, idx
-                );
-                let k_l_preimage = trap_sampler.preimage(params, b1_trapdoor, b1_matrix, &target);
-                debug!(
-                    "Sampled LUT preimage: lut_id={}, row_idx={}",
-                    lut_id, idx
-                );
-                let lut_aux_id = format!("{lut_aux_id_prefix}_idx{idx}");
-                CompactBytesJob::new(lut_aux_id, vec![(0usize, k_l_preimage)])
-            })
-            .collect::<Vec<_>>();
+        let jobs = if batch.is_empty() {
+            Vec::new()
+        } else {
+            let batch_size = batch.len();
+            let batched_cols =
+                m.checked_mul(batch_size).expect("batched target column count overflow");
+            let entry_indices = batch.iter().map(|(idx, _)| *idx).collect::<Vec<_>>();
+
+            // Compute W * T batchwise with shared left operands in stages:
+            // [I_d | ...] + W_gy * Gy_cat + W_v * V_cat + W_vx * VX_rhs_cat.
+            let mut w_t_idx_batched = if batch_size == 1 {
+                w_block_identity.clone()
+            } else {
+                let identity_refs =
+                    std::iter::repeat(w_block_identity).take(batch_size).collect::<Vec<_>>();
+                identity_refs[0].concat_columns(&identity_refs[1..])
+            };
+
+            let gy_terms = batch
+                .par_iter()
+                .map(|(idx, y_poly)| {
+                    let gy = gadget_matrix.clone() * y_poly;
+                    let gy_decomposed = gy.decompose();
+                    drop(gy);
+                    debug!(
+                        "Computed gy_decomposed for LUT preimage: lut_id={}, row_idx={}",
+                        lut_id, idx
+                    );
+                    gy_decomposed
+                })
+                .collect::<Vec<_>>();
+            let gy_refs = gy_terms.iter().collect::<Vec<_>>();
+            let gy_cat = if gy_refs.len() == 1 {
+                gy_refs[0].clone()
+            } else {
+                gy_refs[0].concat_columns(&gy_refs[1..])
+            };
+            drop(gy_refs);
+            drop(gy_terms);
+            let w_gy_batched = w_block_gy.clone() * gy_cat;
+            w_t_idx_batched.add_in_place(&w_gy_batched);
+            drop(w_gy_batched);
+
+            let v_idx_terms = batch
+                .par_iter()
+                .map(|(idx, _)| {
+                    let v_idx =
+                        derive_lut_v_idx_from_hash::<M, HS>(params, self.hash_key, lut_id, *idx, d);
+                    debug!(
+                        "Derived v_idx for LUT preimage from hash: lut_id={}, row_idx={}",
+                        lut_id, idx
+                    );
+                    (*idx, v_idx)
+                })
+                .collect::<Vec<_>>();
+            let v_refs = v_idx_terms.iter().map(|(_, v_idx)| v_idx).collect::<Vec<_>>();
+            let v_cat = if v_refs.len() == 1 {
+                v_refs[0].clone()
+            } else {
+                v_refs[0].concat_columns(&v_refs[1..])
+            };
+            drop(v_refs);
+            let w_v_batched = w_block_v.clone() * v_cat;
+            w_t_idx_batched.add_in_place(&w_v_batched);
+            drop(w_v_batched);
+
+            let vx_rhs_terms = v_idx_terms
+                .par_iter()
+                .map(|(idx, v_idx)| {
+                    let idx_poly = M::P::from_usize_to_constant(params, *idx);
+                    let idx_identity_decomposed =
+                        M::identity(params, m, Some(idx_poly)).small_decompose();
+                    let vx_rhs = idx_identity_decomposed * v_idx;
+                    debug!("Computed vx_rhs for LUT preimage: lut_id={}, row_idx={}", lut_id, idx);
+                    vx_rhs
+                })
+                .collect::<Vec<_>>();
+            let vx_rhs_refs = vx_rhs_terms.iter().map(|vx_rhs| vx_rhs).collect::<Vec<_>>();
+            let vx_rhs_cat = if vx_rhs_refs.len() == 1 {
+                vx_rhs_refs[0].clone()
+            } else {
+                vx_rhs_refs[0].concat_columns(&vx_rhs_refs[1..])
+            };
+            drop(vx_rhs_refs);
+            drop(vx_rhs_terms);
+            drop(v_idx_terms);
+            let w_vx_batched = w_block_vx.clone() * vx_rhs_cat;
+            w_t_idx_batched.add_in_place(&w_vx_batched);
+            drop(w_vx_batched);
+            debug!(
+                "Constructed batched W*T for LUT preimages: lut_id={}, batch_size={}, cols={}",
+                lut_id,
+                batch_size,
+                w_t_idx_batched.col_size()
+            );
+
+            let mut batched_target = M::zero(params, d + w_t_idx_batched.row_size(), batched_cols);
+            batched_target.copy_block_from(
+                &w_t_idx_batched,
+                d,
+                0,
+                0,
+                0,
+                w_t_idx_batched.row_size(),
+                batched_cols,
+            );
+            drop(w_t_idx_batched);
+            debug!(
+                "Constructed batched target for LUT preimages: lut_id={}, batch_size={}, target_cols={}",
+                lut_id,
+                batch_size,
+                batched_target.col_size()
+            );
+
+            let batched_preimage =
+                trap_sampler.preimage(params, b1_trapdoor, b1_matrix, &batched_target);
+            debug!(
+                "Sampled batched LUT preimage: lut_id={}, batch_size={}",
+                lut_id,
+                entry_indices.len()
+            );
+            let preimage_nrow = batched_preimage.row_size();
+            entry_indices
+                .into_iter()
+                .enumerate()
+                .map(|(entry_pos, idx)| {
+                    let col_start =
+                        entry_pos.checked_mul(m).expect("preimage slice column offset overflow");
+                    let col_end = col_start + m;
+                    let k_l_preimage = batched_preimage.slice(0, preimage_nrow, col_start, col_end);
+                    debug!(
+                        "Extracted LUT preimage slice from batched preimage: lut_id={}, row_idx={}",
+                        lut_id, idx
+                    );
+                    let lut_aux_id = format!("{lut_aux_id_prefix}_idx{idx}");
+                    CompactBytesJob::new(lut_aux_id, vec![(0usize, k_l_preimage)])
+                })
+                .collect::<Vec<_>>()
+        };
         drop(gadget_matrix);
         let sample_lut_preimages_elapsed = sample_lut_preimages_start.elapsed();
         debug!(

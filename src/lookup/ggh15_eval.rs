@@ -156,8 +156,9 @@ where
         w_block_v: &M,
         w_block_vx: &M,
         batch: &[(usize, M::P)],
-    ) {
-        debug!("Sampling LUT preimages: lut_id={}, batch_size={}", lut_id, batch.len());
+    ) -> Vec<CompactBytesJob<M>> {
+        let sample_lut_preimages_start = Instant::now();
+        debug!("Sampling LUT preimages started: lut_id={}, batch_size={}", lut_id, batch.len());
         let d = self.d;
         let m = d * params.modulus_digits();
         let trap_sampler = TS::new(params, self.trapdoor_sigma);
@@ -246,9 +247,14 @@ where
             })
             .collect::<Vec<_>>();
         drop(gadget_matrix);
-        debug!("Finished sampling LUT preimages");
-        jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
-        debug!("Finished storing LUT preimages");
+        let sample_lut_preimages_elapsed = sample_lut_preimages_start.elapsed();
+        debug!(
+            "Finished sampling LUT preimages: lut_id={}, batch_size={}, elapsed={}",
+            lut_id,
+            batch.len(),
+            Self::format_duration(sample_lut_preimages_elapsed)
+        );
+        jobs
     }
 
     fn format_duration(duration: Duration) -> String {
@@ -963,6 +969,7 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
             let w_block_v = self.derive_w_block_v(params, lut_id);
             let w_block_vx = self.derive_w_block_vx(params, lut_id);
             let mut batch: Vec<(usize, M::P)> = Vec::with_capacity(chunk_size);
+            let mut pending_store_jobs: Option<Vec<CompactBytesJob<M>>> = None;
             for (_, (idx, y_poly)) in plt.entries(params) {
                 if completed_rows.contains(&idx) {
                     continue;
@@ -970,27 +977,58 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                 batch.push((idx, y_poly));
 
                 if batch.len() >= chunk_size {
+                    let current_batch = std::mem::take(&mut batch);
                     let lut_preimage_batch_start = Instant::now();
-                    self.sample_lut_preimages(
-                        params,
-                        lut_id,
-                        &lut_aux_id_prefix,
-                        &b1_trapdoor,
-                        &b1_matrix,
-                        &w_block_identity,
-                        &w_block_gy,
-                        &w_block_v,
-                        &w_block_vx,
-                        &batch,
-                    );
+                    let sampled_jobs = if let Some(previous_jobs) = pending_store_jobs.take() {
+                        let (_, jobs) = rayon::join(
+                            || {
+                                let wait_start = Instant::now();
+                                previous_jobs
+                                    .into_par_iter()
+                                    .for_each(CompactBytesJob::wait_then_store);
+                                debug!(
+                                    "Previous batch store completed in {}",
+                                    Self::format_duration(wait_start.elapsed())
+                                );
+                            },
+                            || {
+                                self.sample_lut_preimages(
+                                    params,
+                                    lut_id,
+                                    &lut_aux_id_prefix,
+                                    &b1_trapdoor,
+                                    &b1_matrix,
+                                    &w_block_identity,
+                                    &w_block_gy,
+                                    &w_block_v,
+                                    &w_block_vx,
+                                    &current_batch,
+                                )
+                            },
+                        );
+                        jobs
+                    } else {
+                        self.sample_lut_preimages(
+                            params,
+                            lut_id,
+                            &lut_aux_id_prefix,
+                            &b1_trapdoor,
+                            &b1_matrix,
+                            &w_block_identity,
+                            &w_block_gy,
+                            &w_block_v,
+                            &w_block_vx,
+                            &current_batch,
+                        )
+                    };
                     let lut_preimage_batch_elapsed = lut_preimage_batch_start.elapsed();
                     debug!(
                         "Sampled LUT preimages: lut_id={}, batch_size={}, elapsed={}",
                         lut_id,
-                        batch.len(),
+                        current_batch.len(),
                         Self::format_duration(lut_preimage_batch_elapsed)
                     );
-                    processed_lut_rows = processed_lut_rows.saturating_add(batch.len());
+                    processed_lut_rows = processed_lut_rows.saturating_add(current_batch.len());
                     let pct = if total_lut_rows == 0 {
                         100.0
                     } else {
@@ -1002,23 +1040,58 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                         total_lut_rows,
                         Self::format_duration(start.elapsed())
                     );
-                    batch.clear();
+                    pending_store_jobs = Some(sampled_jobs);
                 }
             }
             if !batch.is_empty() {
-                self.sample_lut_preimages(
-                    params,
+                let current_batch = std::mem::take(&mut batch);
+                let lut_preimage_batch_start = Instant::now();
+                let sampled_jobs = if let Some(previous_jobs) = pending_store_jobs.take() {
+                    let (_, jobs) = rayon::join(
+                        || {
+                            previous_jobs
+                                .into_par_iter()
+                                .for_each(CompactBytesJob::wait_then_store);
+                        },
+                        || {
+                            self.sample_lut_preimages(
+                                params,
+                                lut_id,
+                                &lut_aux_id_prefix,
+                                &b1_trapdoor,
+                                &b1_matrix,
+                                &w_block_identity,
+                                &w_block_gy,
+                                &w_block_v,
+                                &w_block_vx,
+                                &current_batch,
+                            )
+                        },
+                    );
+                    jobs
+                } else {
+                    self.sample_lut_preimages(
+                        params,
+                        lut_id,
+                        &lut_aux_id_prefix,
+                        &b1_trapdoor,
+                        &b1_matrix,
+                        &w_block_identity,
+                        &w_block_gy,
+                        &w_block_v,
+                        &w_block_vx,
+                        &current_batch,
+                    )
+                };
+                let lut_preimage_batch_elapsed = lut_preimage_batch_start.elapsed();
+                debug!(
+                    "Sampled LUT preimages: lut_id={}, batch_size={}, elapsed={}",
                     lut_id,
-                    &lut_aux_id_prefix,
-                    &b1_trapdoor,
-                    &b1_matrix,
-                    &w_block_identity,
-                    &w_block_gy,
-                    &w_block_v,
-                    &w_block_vx,
-                    &batch,
+                    current_batch.len(),
+                    Self::format_duration(lut_preimage_batch_elapsed)
                 );
-                processed_lut_rows = processed_lut_rows.saturating_add(batch.len());
+                pending_store_jobs = Some(sampled_jobs);
+                processed_lut_rows = processed_lut_rows.saturating_add(current_batch.len());
                 let pct = if total_lut_rows == 0 {
                     100.0
                 } else {
@@ -1030,6 +1103,9 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                     total_lut_rows,
                     Self::format_duration(start.elapsed())
                 );
+            }
+            if let Some(previous_jobs) = pending_store_jobs.take() {
+                previous_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
             }
             drop(w_block_vx);
             drop(w_block_v);

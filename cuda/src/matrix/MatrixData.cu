@@ -492,27 +492,22 @@ extern "C" int gpu_matrix_copy_block(
         return set_error("unexpected limb mapping size in gpu_matrix_copy_block");
     }
 
-    int status = 0;
-    for (int limb = 0; limb <= level; ++limb)
+    int status = launch_copy_for_all_limbs<uint64_t>(
+        out,
+        src,
+        src_row,
+        src_col,
+        dst_row,
+        dst_col,
+        rows,
+        cols,
+        src->cols,
+        out->cols,
+        static_cast<size_t>(N),
+        level);
+    if (status != 0)
     {
-        const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        status = launch_copy_for_limb<uint64_t>(
-            out,
-            src,
-            limb_id,
-            src_row,
-            src_col,
-            dst_row,
-            dst_col,
-            rows,
-            cols,
-            src->cols,
-            out->cols,
-            static_cast<size_t>(N));
-        if (status != 0)
-        {
-            return status;
-        }
+        return status;
     }
 
     out->format = src->format;

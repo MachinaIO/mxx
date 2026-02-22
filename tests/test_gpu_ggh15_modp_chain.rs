@@ -34,26 +34,25 @@ use std::{fs, path::Path, sync::Arc, time::Instant};
 use tracing::info;
 
 const CRT_BITS: usize = 51;
-const RING_DIM: u32 = 1 << 8;
+const RING_DIM: u32 = 1 << 14;
 const ERROR_SIGMA: f64 = 4.0;
 const BASE_BITS: u32 = 17;
 const MAX_CRT_DEPTH: usize = 12;
 const P: u64 = 7;
-const D_SECRET: usize = 2;
+const D_SECRET: usize = 1;
 
 fn round_div_biguint(value: &BigUint, divisor: &BigUint) -> BigUint {
     let half = divisor >> 1;
     (value + &half) / divisor
 }
 
-fn decode_mod_p_from_scaled_plaintext(plaintext: &GpuDCRTPoly, q_over_p: &BigUint, p: u64) -> u64 {
+fn decode_mod_p_from_plaintext(plaintext: &GpuDCRTPoly, p: u64) -> u64 {
     let coeff = plaintext
         .coeffs()
         .into_iter()
         .next()
         .expect("plaintext polynomial must have at least one coefficient");
-    let rounded = round_div_biguint(coeff.value(), q_over_p);
-    (&rounded % BigUint::from(p)).try_into().expect("decoded value must fit u64")
+    (coeff.value() % BigUint::from(p)).try_into().expect("decoded value must fit u64")
 }
 
 fn max_output_row_from_biguint_cpu(
@@ -84,11 +83,7 @@ fn build_mod_p_lut_cpu(params: &DCRTPolyParams, p: u64) -> PublicLut<DCRTPoly> {
     )
 }
 
-fn build_modp_chain_circuit_cpu(
-    params: &DCRTPolyParams,
-    p: u64,
-    q_over_p: &BigUint,
-) -> PolyCircuit<DCRTPoly> {
+fn build_modp_chain_circuit_cpu(params: &DCRTPolyParams, p: u64) -> PolyCircuit<DCRTPoly> {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
     let inputs = circuit.input(3);
 
@@ -99,10 +94,7 @@ fn build_modp_chain_circuit_cpu(
 
     let t2 = circuit.mul_gate(t1_mod, inputs[2]);
     let t2_mod = circuit.public_lookup_gate(t2, lut_id);
-
-    let scalar = DCRTPoly::from_biguint_to_constant(params, q_over_p.clone());
-    let scaled = circuit.poly_scalar_mul(t2_mod, &scalar);
-    circuit.output(vec![scaled]);
+    circuit.output(vec![t2_mod]);
     circuit
 }
 
@@ -126,7 +118,7 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, BigUint) {
         let q = params.modulus();
         let q_over_p = q.as_ref() / BigUint::from(P);
         let q_over_2p = q.as_ref() / BigUint::from(2 * P);
-        let circuit = build_modp_chain_circuit_cpu(&params, P, &q_over_p);
+        let circuit = build_modp_chain_circuit_cpu(&params, P);
 
         let log_base_q = params.modulus_digits();
         let log_base_q_small = log_base_q / crt_depth;
@@ -199,11 +191,7 @@ fn build_mod_p_lut_gpu(params: &GpuDCRTPolyParams, p: u64) -> PublicLut<GpuDCRTP
     )
 }
 
-fn build_modp_chain_circuit_gpu(
-    params: &GpuDCRTPolyParams,
-    p: u64,
-    q_over_p: &BigUint,
-) -> PolyCircuit<GpuDCRTPoly> {
+fn build_modp_chain_circuit_gpu(params: &GpuDCRTPolyParams, p: u64) -> PolyCircuit<GpuDCRTPoly> {
     let mut circuit = PolyCircuit::<GpuDCRTPoly>::new();
     let inputs = circuit.input(3);
 
@@ -214,10 +202,7 @@ fn build_modp_chain_circuit_gpu(
 
     let t2 = circuit.mul_gate(t1_mod, inputs[2]);
     let t2_mod = circuit.public_lookup_gate(t2, lut_id);
-
-    let scalar = GpuDCRTPoly::from_biguint_to_constant(params, q_over_p.clone());
-    let scaled = circuit.poly_scalar_mul(t2_mod, &scalar);
-    circuit.output(vec![scaled]);
+    circuit.output(vec![t2_mod]);
     circuit
 }
 
@@ -232,7 +217,7 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
         GpuDCRTPolyParams::new(cpu_params.ring_dimension(), moduli, cpu_params.base_bits());
     assert_eq!(params.modulus(), cpu_params.modulus());
 
-    let circuit = build_modp_chain_circuit_gpu(&params, P, &q_over_p);
+    let circuit = build_modp_chain_circuit_gpu(&params, P);
     info!(
         "selected crt_depth={} ring_dim={} base_bits={}",
         params.crt_depth(),
@@ -263,11 +248,9 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
     let tag_bytes: &[u8] = b"bgg_pubkey";
 
     let uniform_sampler = GpuDCRTPolyUniformSampler::new();
-    let s =
-        uniform_sampler.sample_uniform(&params, 1, D_SECRET - 1, DistType::TernaryDist).get_row(0);
-    let mut secrets = s;
-    secrets.push(GpuDCRTPoly::const_minus_one(&params));
-    let s_vec = GpuDCRTPolyMatrix::from_poly_vec_row(&params, secrets.to_vec());
+    let secrets =
+        uniform_sampler.sample_uniform(&params, 1, D_SECRET, DistType::TernaryDist).get_row(0);
+    let s_vec = GpuDCRTPolyMatrix::from_poly_vec_row(&params, secrets.clone());
 
     let reveal_plaintexts = vec![true; circuit.num_input()];
     let pubkeys = bgg_pubkey_sampler.sample(&params, tag_bytes, &reveal_plaintexts);
@@ -346,40 +329,38 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
     assert_eq!(encoding.pubkey, result_pubkey[0]);
 
     let expected = BigUint::from(expected_mod_p);
-    let expected_plaintext =
-        GpuDCRTPoly::from_biguint_to_constant(&params, expected * q_over_p.clone());
+    let expected_plaintext = GpuDCRTPoly::from_biguint_to_constant(&params, expected.clone());
     let plaintext =
         encoding.plaintext.as_ref().expect("encoding plaintext should be available for this test");
     assert_eq!(
         plaintext, &expected_plaintext,
-        "symbolic plaintext must match expected scaled mod-p value"
+        "symbolic plaintext must match expected mod-p value"
     );
 
-    let decoded_from_plaintext = decode_mod_p_from_scaled_plaintext(plaintext, &q_over_p, P);
+    let decoded_from_plaintext = decode_mod_p_from_plaintext(plaintext, P);
     assert_eq!(
         decoded_from_plaintext, expected_mod_p,
         "decoded value from encoding plaintext must match mod p result"
     );
 
+    let random_int: u64 = rng.random_range(0..P);
     let s_times_pk = s_vec.clone() * &encoding.pubkey.matrix;
-    let diff = encoding.vector.clone() - s_times_pk;
-    let unit_vector = GpuDCRTPolyMatrix::unit_column_vector(&params, D_SECRET, D_SECRET - 1);
-    let projected = diff.mul_decompose(&unit_vector);
-    assert_eq!(projected.row_size(), 1);
-    assert_eq!(projected.col_size(), 1);
-
-    let projected_poly = projected.entry(0, 0);
-    let coeff = projected_poly
+    let expected_times_gadget = s_vec.clone() *
+        (GpuDCRTPolyMatrix::gadget_matrix(&params, D_SECRET) * expected_plaintext.clone());
+    let diff = encoding.vector.clone() - s_times_pk + expected_times_gadget;
+    let coeff = diff
+        .entry(0, 0)
         .coeffs()
         .into_iter()
         .next()
-        .expect("projected poly must have at least one coefficient");
-    let rounded = round_div_biguint(coeff.value(), &q_over_p);
-    let decoded: u64 =
-        (&rounded % BigUint::from(P)).try_into().expect("decoded coefficient must fit u64");
+        .expect("diff poly must have at least one coefficient");
+    let randomized_coeff = coeff.value().clone() + q_over_p.clone() * BigUint::from(random_int);
+    let rounded = round_div_biguint(&randomized_coeff, &q_over_p);
+    let decoded_random: u64 =
+        (&rounded % BigUint::from(P)).try_into().expect("decoded random coefficient must fit u64");
     assert_eq!(
-        decoded, expected_mod_p,
-        "decoded value from projected encoding.vector must match mod p result"
+        decoded_random, random_int,
+        "rounded projected coefficient must recover injected random mod p"
     );
 
     gpu_device_sync();

@@ -156,8 +156,9 @@ where
         w_block_v: &M,
         w_block_vx: &M,
         batch: &[(usize, M::P)],
-    ) {
-        debug!("Sampling LUT preimages: lut_id={}, batch_size={}", lut_id, batch.len());
+    ) -> Vec<CompactBytesJob<M>> {
+        let sample_lut_preimages_start = Instant::now();
+        debug!("Sampling LUT preimages started: lut_id={}, batch_size={}", lut_id, batch.len());
         let d = self.d;
         let m = d * params.modulus_digits();
         let trap_sampler = TS::new(params, self.trapdoor_sigma);
@@ -184,68 +185,152 @@ where
             m * k_small,
             "w_block_vx columns must equal d * modulus_digits^2"
         );
-        let jobs = batch
-            .par_iter()
-            .map(|(idx, y_poly)| {
-                let v_idx = derive_lut_v_idx_from_hash::<M, HS>(
-                    params,
-                    self.hash_key,
-                    lut_id,
-                    *idx,
-                    d,
-                );
-                debug!(
-                    "Derived v_idx for LUT preimage from hash: lut_id={}, row_idx={}",
-                    lut_id, idx
-                );
-                // Compute w_matrix * t_idx without materializing t_idx:
-                // t_idx = [I_d; G^-1(G*y); v_idx; G_small^-1(idx * I_m) * v_idx].
-                let mut w_t_idx = w_block_identity.clone();
-                debug!(
-                    "Constructed w_block_identity for LUT preimage: lut_id={}, row_idx={}",
-                    lut_id, idx
-                );
-                let gy = gadget_matrix.clone() * y_poly;
-                let w_gy = w_block_gy.mul_decompose(&gy);
-                drop(gy);
-                w_t_idx.add_in_place(&w_gy);
-                debug!(
-                    "Constructed w_block_gy contribution for LUT preimage: lut_id={}, row_idx={}",
-                    lut_id, idx
-                );
-                let w_v = w_block_v.clone() * &v_idx;
-                w_t_idx.add_in_place(&w_v);
-                debug!(
-                    "Constructed w_block_v contribution for LUT preimage: lut_id={}, row_idx={}",
-                    lut_id, idx
-                );
-                let idx_poly = M::P::from_usize_to_constant(params, *idx);
-                let idx_identity = M::identity(params, m, Some(idx_poly.clone()));
-                let w_v_idx = w_block_vx.mul_decompose_small(&idx_identity) * &v_idx;
-                w_t_idx.add_in_place(&w_v_idx);
-                debug!(
-                    "Constructed w_block_v_idx contribution for LUT preimage: lut_id={}, row_idx={}",
-                    lut_id, idx
-                );
-                let mut target = M::zero(params, d + w_t_idx.row_size(), m);
-                target.copy_block_from(&w_t_idx, d, 0, 0, 0, w_t_idx.row_size(), m);
-                debug!(
-                    "Constructed target for LUT preimage: lut_id={}, row_idx={}",
-                    lut_id, idx
-                );
-                let k_l_preimage = trap_sampler.preimage(params, b1_trapdoor, b1_matrix, &target);
-                debug!(
-                    "Sampled LUT preimage: lut_id={}, row_idx={}",
-                    lut_id, idx
-                );
-                let lut_aux_id = format!("{lut_aux_id_prefix}_idx{idx}");
-                CompactBytesJob::new(lut_aux_id, vec![(0usize, k_l_preimage)])
-            })
-            .collect::<Vec<_>>();
+        let jobs = if batch.is_empty() {
+            Vec::new()
+        } else {
+            let batch_size = batch.len();
+            let batched_cols =
+                m.checked_mul(batch_size).expect("batched target column count overflow");
+            let entry_indices = batch.iter().map(|(idx, _)| *idx).collect::<Vec<_>>();
+
+            // Compute W * T batchwise with shared left operands in stages:
+            // [I_d | ...] + W_gy * Gy_cat + W_v * V_cat + W_vx * VX_rhs_cat.
+            let mut w_t_idx_batched = if batch_size == 1 {
+                w_block_identity.clone()
+            } else {
+                let identity_refs =
+                    std::iter::repeat(w_block_identity).take(batch_size).collect::<Vec<_>>();
+                identity_refs[0].concat_columns(&identity_refs[1..])
+            };
+
+            let gy_terms = batch
+                .par_iter()
+                .map(|(idx, y_poly)| {
+                    let gy = gadget_matrix.clone() * y_poly;
+                    let gy_decomposed = gy.decompose();
+                    drop(gy);
+                    debug!(
+                        "Computed gy_decomposed for LUT preimage: lut_id={}, row_idx={}",
+                        lut_id, idx
+                    );
+                    gy_decomposed
+                })
+                .collect::<Vec<_>>();
+            let gy_cat = if gy_terms.len() == 1 {
+                gy_terms.into_iter().next().expect("gy_terms must contain one matrix")
+            } else {
+                let mut gy_iter = gy_terms.into_iter();
+                let gy_first = gy_iter.next().expect("gy_terms must be non-empty");
+                gy_first.concat_columns_owned(gy_iter.collect())
+            };
+            let w_gy_batched = w_block_gy.clone() * gy_cat;
+            w_t_idx_batched.add_in_place(&w_gy_batched);
+            drop(w_gy_batched);
+
+            let v_idx_terms = batch
+                .par_iter()
+                .map(|(idx, _)| {
+                    let v_idx =
+                        derive_lut_v_idx_from_hash::<M, HS>(params, self.hash_key, lut_id, *idx, d);
+                    debug!(
+                        "Derived v_idx for LUT preimage from hash: lut_id={}, row_idx={}",
+                        lut_id, idx
+                    );
+                    (*idx, v_idx)
+                })
+                .collect::<Vec<_>>();
+            let v_refs = v_idx_terms.iter().map(|(_, v_idx)| v_idx).collect::<Vec<_>>();
+            let v_cat = if v_refs.len() == 1 {
+                v_refs[0].clone()
+            } else {
+                v_refs[0].concat_columns(&v_refs[1..])
+            };
+            drop(v_refs);
+            let w_v_batched = w_block_v.clone() * v_cat;
+            w_t_idx_batched.add_in_place(&w_v_batched);
+            drop(w_v_batched);
+
+            let vx_rhs_terms = v_idx_terms
+                .par_iter()
+                .map(|(idx, v_idx)| {
+                    let idx_poly = M::P::from_usize_to_constant(params, *idx);
+                    let idx_identity_decomposed =
+                        M::identity(params, m, Some(idx_poly)).small_decompose();
+                    let vx_rhs = idx_identity_decomposed * v_idx;
+                    debug!("Computed vx_rhs for LUT preimage: lut_id={}, row_idx={}", lut_id, idx);
+                    vx_rhs
+                })
+                .collect::<Vec<_>>();
+            let vx_rhs_cat = if vx_rhs_terms.len() == 1 {
+                vx_rhs_terms.into_iter().next().expect("vx_rhs_terms must contain one matrix")
+            } else {
+                let mut rhs_iter = vx_rhs_terms.into_iter();
+                let rhs_first = rhs_iter.next().expect("vx_rhs_terms must be non-empty");
+                rhs_first.concat_columns_owned(rhs_iter.collect())
+            };
+            drop(v_idx_terms);
+            let w_vx_batched = w_block_vx.clone() * vx_rhs_cat;
+            w_t_idx_batched.add_in_place(&w_vx_batched);
+            drop(w_vx_batched);
+            debug!(
+                "Constructed batched W*T for LUT preimages: lut_id={}, batch_size={}, cols={}",
+                lut_id,
+                batch_size,
+                w_t_idx_batched.col_size()
+            );
+
+            let mut batched_target = M::zero(params, d + w_t_idx_batched.row_size(), batched_cols);
+            batched_target.copy_block_from(
+                &w_t_idx_batched,
+                d,
+                0,
+                0,
+                0,
+                w_t_idx_batched.row_size(),
+                batched_cols,
+            );
+            drop(w_t_idx_batched);
+            debug!(
+                "Constructed batched target for LUT preimages: lut_id={}, batch_size={}, target_cols={}",
+                lut_id,
+                batch_size,
+                batched_target.col_size()
+            );
+
+            let batched_preimage =
+                trap_sampler.preimage(params, b1_trapdoor, b1_matrix, &batched_target);
+            debug!(
+                "Sampled batched LUT preimage: lut_id={}, batch_size={}",
+                lut_id,
+                entry_indices.len()
+            );
+            let preimage_nrow = batched_preimage.row_size();
+            entry_indices
+                .into_iter()
+                .enumerate()
+                .map(|(entry_pos, idx)| {
+                    let col_start =
+                        entry_pos.checked_mul(m).expect("preimage slice column offset overflow");
+                    let col_end = col_start + m;
+                    let k_l_preimage = batched_preimage.slice(0, preimage_nrow, col_start, col_end);
+                    debug!(
+                        "Extracted LUT preimage slice from batched preimage: lut_id={}, row_idx={}",
+                        lut_id, idx
+                    );
+                    let lut_aux_id = format!("{lut_aux_id_prefix}_idx{idx}");
+                    CompactBytesJob::new(lut_aux_id, vec![(0usize, k_l_preimage)])
+                })
+                .collect::<Vec<_>>()
+        };
         drop(gadget_matrix);
-        debug!("Finished sampling LUT preimages");
-        jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
-        debug!("Finished storing LUT preimages");
+        let sample_lut_preimages_elapsed = sample_lut_preimages_start.elapsed();
+        debug!(
+            "Finished sampling LUT preimages: lut_id={}, batch_size={}, elapsed={}",
+            lut_id,
+            batch.len(),
+            Self::format_duration(sample_lut_preimages_elapsed)
+        );
+        jobs
     }
 
     fn format_duration(duration: Duration) -> String {
@@ -379,6 +464,7 @@ where
 
     fn checkpoint_has_index(
         checkpoint_index: Option<&GlobalTableIndex>,
+        part_index_cache: Option<&HashMap<String, HashSet<usize>>>,
         id_prefix: &str,
         target_k: usize,
     ) -> bool {
@@ -387,18 +473,80 @@ where
         {
             return true;
         }
+        part_index_cache
+            .and_then(|cache| cache.get(id_prefix))
+            .is_some_and(|indices| indices.contains(&target_k))
+    }
+
+    fn strip_part_suffix(key: &str) -> &str {
+        if let Some((base, part)) = key.rsplit_once("_part") &&
+            !part.is_empty() &&
+            part.bytes().all(|c| c.is_ascii_digit())
+        {
+            base
+        } else {
+            key
+        }
+    }
+
+    fn build_part_index_cache(
+        checkpoint_index: Option<&GlobalTableIndex>,
+    ) -> Option<HashMap<String, HashSet<usize>>> {
+        let checkpoint_index = checkpoint_index?;
+        let mut cache: HashMap<String, HashSet<usize>> = HashMap::new();
+        for (key, entry) in &checkpoint_index.entries {
+            if let Some((base, part)) = key.rsplit_once("_part") &&
+                !part.is_empty() &&
+                part.bytes().all(|c| c.is_ascii_digit())
+            {
+                cache.entry(base.to_string()).or_default().extend(entry.indices.iter().copied());
+            }
+        }
+        Some(cache)
+    }
+
+    fn collect_lut_completed_rows(
+        checkpoint_index: Option<&GlobalTableIndex>,
+        checkpoint_prefix: &str,
+        lut_ids: &[usize],
+    ) -> HashMap<usize, HashSet<usize>> {
         let Some(checkpoint_index) = checkpoint_index else {
-            return false;
+            return HashMap::new();
         };
-        let part_prefix = format!("{id_prefix}_part");
-        checkpoint_index
-            .entries
-            .iter()
-            .any(|(key, entry)| key.starts_with(&part_prefix) && entry.indices.contains(&target_k))
+        if lut_ids.is_empty() {
+            return HashMap::new();
+        }
+        let target_lut_ids: HashSet<usize> = lut_ids.iter().copied().collect();
+        let lut_aux_prefix = format!("{checkpoint_prefix}_lut_aux_");
+        let mut completed_rows: HashMap<usize, HashSet<usize>> = HashMap::new();
+        for (raw_key, entry) in &checkpoint_index.entries {
+            if !entry.indices.contains(&0) {
+                continue;
+            }
+            let key = Self::strip_part_suffix(raw_key);
+            let Some(rest) = key.strip_prefix(&lut_aux_prefix) else {
+                continue;
+            };
+            let Some((lut_id_str, row_idx_str)) = rest.split_once("_idx") else {
+                continue;
+            };
+            let Ok(lut_id) = lut_id_str.parse::<usize>() else {
+                continue;
+            };
+            if !target_lut_ids.contains(&lut_id) {
+                continue;
+            }
+            let Ok(row_idx) = row_idx_str.parse::<usize>() else {
+                continue;
+            };
+            completed_rows.entry(lut_id).or_default().insert(row_idx);
+        }
+        completed_rows
     }
 
     fn gate_checkpoint_complete(
         checkpoint_index: Option<&GlobalTableIndex>,
+        part_index_cache: Option<&HashMap<String, HashSet<usize>>>,
         checkpoint_prefix: &str,
         gate_id: GateId,
         gate_chunk_count: usize,
@@ -409,14 +557,29 @@ where
         let gate2_gy_prefix = format!("{checkpoint_prefix}_preimage_gate2_gy_{}", gate_id);
         let gate2_v_prefix = format!("{checkpoint_prefix}_preimage_gate2_v_{}", gate_id);
         let gate2_vx_prefix = format!("{checkpoint_prefix}_preimage_gate2_vx_{}", gate_id);
-        Self::checkpoint_has_index(checkpoint_index, &gate1_prefix, 0) &&
-            Self::checkpoint_has_index(checkpoint_index, &gate2_identity_prefix, 0) &&
-            Self::checkpoint_has_index(checkpoint_index, &gate2_gy_prefix, 0) &&
-            (0..gate_chunk_count).all(|chunk_idx| {
-                Self::checkpoint_has_index(checkpoint_index, &gate2_v_prefix, chunk_idx)
+        Self::checkpoint_has_index(checkpoint_index, part_index_cache, &gate1_prefix, 0) &&
+            Self::checkpoint_has_index(
+                checkpoint_index,
+                part_index_cache,
+                &gate2_identity_prefix,
+                0,
+            ) &&
+            Self::checkpoint_has_index(checkpoint_index, part_index_cache, &gate2_gy_prefix, 0) &&
+            (0..gate_chunk_count).into_par_iter().all(|chunk_idx| {
+                Self::checkpoint_has_index(
+                    checkpoint_index,
+                    part_index_cache,
+                    &gate2_v_prefix,
+                    chunk_idx,
+                )
             }) &&
-            (0..gate_chunk_count).all(|chunk_idx| {
-                Self::checkpoint_has_index(checkpoint_index, &gate2_vx_prefix, chunk_idx)
+            (0..gate_chunk_count).into_par_iter().all(|chunk_idx| {
+                Self::checkpoint_has_index(
+                    checkpoint_index,
+                    part_index_cache,
+                    &gate2_vx_prefix,
+                    chunk_idx,
+                )
             })
     }
 
@@ -430,25 +593,130 @@ where
         let Some(checkpoint_index) = checkpoint_index else {
             return false;
         };
-        for lut_id in lut_ids {
-            let lut_aux_prefix = format!("{checkpoint_prefix}_lut_aux_{}", lut_id);
-            let lut_aux_row_prefix = format!("{lut_aux_prefix}_idx");
-            if checkpoint_index.entries.iter().any(|(key, entry)| {
-                key.starts_with(&lut_aux_row_prefix) && entry.indices.contains(&0)
-            }) {
-                return true;
+
+        #[derive(Default)]
+        struct GateResumeState {
+            gate1: bool,
+            gate2_identity: bool,
+            gate2_gy: bool,
+            gate2_v_chunks: HashSet<usize>,
+            gate2_vx_chunks: HashSet<usize>,
+        }
+
+        impl GateResumeState {
+            fn is_complete(&self, gate_chunk_count: usize) -> bool {
+                self.gate1 &&
+                    self.gate2_identity &&
+                    self.gate2_gy &&
+                    self.gate2_v_chunks.len() == gate_chunk_count &&
+                    self.gate2_vx_chunks.len() == gate_chunk_count
             }
         }
-        for gate_id in gate_ids {
-            if Self::gate_checkpoint_complete(
-                Some(checkpoint_index),
-                checkpoint_prefix,
-                *gate_id,
-                gate_chunk_count,
-            ) {
+
+        let target_lut_ids: HashSet<usize> = lut_ids.iter().copied().collect();
+        let target_gate_ids: HashSet<GateId> = gate_ids.iter().copied().collect();
+        let lut_aux_prefix = format!("{checkpoint_prefix}_lut_aux_");
+        let gate1_prefix = format!("{checkpoint_prefix}_preimage_gate1_");
+        let gate2_identity_prefix = format!("{checkpoint_prefix}_preimage_gate2_identity_");
+        let gate2_gy_prefix = format!("{checkpoint_prefix}_preimage_gate2_gy_");
+        let gate2_v_prefix = format!("{checkpoint_prefix}_preimage_gate2_v_");
+        let gate2_vx_prefix = format!("{checkpoint_prefix}_preimage_gate2_vx_");
+
+        let mut gate_states: HashMap<GateId, GateResumeState> = HashMap::new();
+        for (raw_key, entry) in &checkpoint_index.entries {
+            let key = Self::strip_part_suffix(raw_key);
+
+            if let Some(rest) = key.strip_prefix(&lut_aux_prefix) &&
+                let Some((lut_id_str, _)) = rest.split_once("_idx") &&
+                let Ok(lut_id) = lut_id_str.parse::<usize>() &&
+                target_lut_ids.contains(&lut_id) &&
+                entry.indices.contains(&0)
+            {
                 return true;
             }
+
+            if let Some(gate_id_str) = key.strip_prefix(&gate1_prefix) &&
+                let Ok(gate_id_raw) = gate_id_str.parse::<usize>() &&
+                target_gate_ids.contains(&GateId(gate_id_raw)) &&
+                entry.indices.contains(&0)
+            {
+                let gate_id = GateId(gate_id_raw);
+                let state = gate_states.entry(gate_id).or_default();
+                state.gate1 = true;
+                if state.is_complete(gate_chunk_count) {
+                    return true;
+                }
+                continue;
+            }
+
+            if let Some(gate_id_str) = key.strip_prefix(&gate2_identity_prefix) &&
+                let Ok(gate_id_raw) = gate_id_str.parse::<usize>() &&
+                target_gate_ids.contains(&GateId(gate_id_raw)) &&
+                entry.indices.contains(&0)
+            {
+                let gate_id = GateId(gate_id_raw);
+                let state = gate_states.entry(gate_id).or_default();
+                state.gate2_identity = true;
+                if state.is_complete(gate_chunk_count) {
+                    return true;
+                }
+                continue;
+            }
+
+            if let Some(gate_id_str) = key.strip_prefix(&gate2_gy_prefix) &&
+                let Ok(gate_id_raw) = gate_id_str.parse::<usize>() &&
+                target_gate_ids.contains(&GateId(gate_id_raw)) &&
+                entry.indices.contains(&0)
+            {
+                let gate_id = GateId(gate_id_raw);
+                let state = gate_states.entry(gate_id).or_default();
+                state.gate2_gy = true;
+                if state.is_complete(gate_chunk_count) {
+                    return true;
+                }
+                continue;
+            }
+
+            if let Some(gate_id_str) = key.strip_prefix(&gate2_v_prefix) &&
+                let Ok(gate_id_raw) = gate_id_str.parse::<usize>() &&
+                target_gate_ids.contains(&GateId(gate_id_raw))
+            {
+                let gate_id = GateId(gate_id_raw);
+                let state = gate_states.entry(gate_id).or_default();
+                entry
+                    .indices
+                    .iter()
+                    .copied()
+                    .filter(|chunk_idx| *chunk_idx < gate_chunk_count)
+                    .for_each(|chunk_idx| {
+                        state.gate2_v_chunks.insert(chunk_idx);
+                    });
+                if state.is_complete(gate_chunk_count) {
+                    return true;
+                }
+                continue;
+            }
+
+            if let Some(gate_id_str) = key.strip_prefix(&gate2_vx_prefix) &&
+                let Ok(gate_id_raw) = gate_id_str.parse::<usize>() &&
+                target_gate_ids.contains(&GateId(gate_id_raw))
+            {
+                let gate_id = GateId(gate_id_raw);
+                let state = gate_states.entry(gate_id).or_default();
+                entry
+                    .indices
+                    .iter()
+                    .copied()
+                    .filter(|chunk_idx| *chunk_idx < gate_chunk_count)
+                    .for_each(|chunk_idx| {
+                        state.gate2_vx_chunks.insert(chunk_idx);
+                    });
+                if state.is_complete(gate_chunk_count) {
+                    return true;
+                }
+            }
         }
+
         false
     }
 
@@ -660,6 +928,7 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
             self.dir_path.display(),
             checkpoint_prefix
         );
+        let checkpoint_part_index_cache = Self::build_part_index_cache(checkpoint_index_for_resume);
 
         if let Some((b0_matrix_for_save, b0_trapdoor_bytes)) = persist_b0_checkpoint {
             let b0_id_prefix = format!("{checkpoint_prefix}_b0");
@@ -690,46 +959,78 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
 
         // Checkpoint verification phase.
         let mut processed_lut_rows = 0usize;
-        let mut resumed_lut_rows = 0usize;
-        let mut lut_plans = Vec::with_capacity(lut_entries.len());
-
-        for (lut_id, plt) in lut_entries {
-            let lut_aux_prefix = self.lut_aux_id_prefix(params, lut_id);
-            let mut completed_rows: HashSet<usize> = HashSet::new();
-            for (_, (idx, _)) in plt.entries(params) {
-                let lut_aux_row_id = format!("{lut_aux_prefix}_idx{idx}");
-                if Self::checkpoint_has_index(checkpoint_index_for_resume, &lut_aux_row_id, 0) {
-                    completed_rows.insert(idx);
-                }
-            }
-            let resumed_rows_for_lut = completed_rows.len();
-            resumed_lut_rows = resumed_lut_rows.saturating_add(resumed_rows_for_lut);
-            processed_lut_rows = processed_lut_rows.saturating_add(resumed_rows_for_lut);
-            if resumed_rows_for_lut > 0 {
+        let completed_lut_rows_by_id = Self::collect_lut_completed_rows(
+            checkpoint_index_for_resume,
+            &checkpoint_prefix,
+            &lut_ids,
+        );
+        let lut_plans_with_prefix = lut_entries
+            .into_par_iter()
+            .map(|(lut_id, plt)| {
+                let lut_aux_prefix = self.lut_aux_id_prefix(params, lut_id);
+                let completed_rows: HashSet<usize> =
+                    if let Some(index_rows) = completed_lut_rows_by_id.get(&lut_id) {
+                        plt.entries(params)
+                            .map(|(_, (idx, _))| idx)
+                            .filter(|idx| index_rows.contains(idx))
+                            .collect()
+                    } else {
+                        HashSet::new()
+                    };
+                let resumed_rows_for_lut = completed_rows.len();
+                (lut_id, plt, completed_rows, resumed_rows_for_lut, lut_aux_prefix)
+            })
+            .collect::<Vec<_>>();
+        lut_plans_with_prefix
+            .par_iter()
+            .filter(|(_, _, _, resumed_rows_for_lut, _)| *resumed_rows_for_lut > 0)
+            .for_each(|(lut_id, _, _, resumed_rows_for_lut, lut_aux_prefix)| {
                 info!(
                     "LUT checkpoint resumed: lut_id={}, rows={}, aux_prefix={}",
                     lut_id, resumed_rows_for_lut, lut_aux_prefix
                 );
-            }
-            lut_plans.push((lut_id, plt, completed_rows, resumed_rows_for_lut));
-        }
+            });
+        let resumed_lut_rows = lut_plans_with_prefix
+            .par_iter()
+            .map(|(_, _, _, resumed_rows_for_lut, _)| *resumed_rows_for_lut)
+            .sum::<usize>();
+        processed_lut_rows = processed_lut_rows.saturating_add(resumed_lut_rows);
+        let lut_plans = lut_plans_with_prefix
+            .into_iter()
+            .map(|(lut_id, plt, completed_rows, resumed_rows_for_lut, _)| {
+                (lut_id, plt, completed_rows, resumed_rows_for_lut)
+            })
+            .collect::<Vec<_>>();
 
-        let mut gates_by_lut: HashMap<usize, Vec<(GateId, GateState<M>)>> = HashMap::new();
-        let mut resumed_gates = 0usize;
-        let mut total_gates = 0usize;
-        for (gate_id, state) in gate_entries {
-            if Self::gate_checkpoint_complete(
-                checkpoint_index_for_resume,
-                &checkpoint_prefix,
-                gate_id,
-                gate_chunk_count,
-            ) {
-                resumed_gates = resumed_gates.saturating_add(1);
-                total_gates = total_gates.saturating_add(1);
-            } else {
-                gates_by_lut.entry(state.lut_id).or_default().push((gate_id, state));
-            }
-        }
+        let (resumed_gates, gates_by_lut) = gate_entries
+            .into_par_iter()
+            .fold(
+                || (0usize, HashMap::<usize, Vec<(GateId, GateState<M>)>>::new()),
+                |(mut resumed, mut grouped), (gate_id, state)| {
+                    if Self::gate_checkpoint_complete(
+                        checkpoint_index_for_resume,
+                        checkpoint_part_index_cache.as_ref(),
+                        &checkpoint_prefix,
+                        gate_id,
+                        gate_chunk_count,
+                    ) {
+                        resumed = resumed.saturating_add(1);
+                    } else {
+                        grouped.entry(state.lut_id).or_default().push((gate_id, state));
+                    }
+                    (resumed, grouped)
+                },
+            )
+            .reduce(
+                || (0usize, HashMap::<usize, Vec<(GateId, GateState<M>)>>::new()),
+                |(left_resumed, mut left_grouped), (right_resumed, right_grouped)| {
+                    right_grouped.into_iter().for_each(|(lut_id, mut gates)| {
+                        left_grouped.entry(lut_id).or_default().append(&mut gates);
+                    });
+                    (left_resumed.saturating_add(right_resumed), left_grouped)
+                },
+            );
+        let mut total_gates = resumed_gates;
         info!(
             "Checkpoint verification completed (pending_lut_rows={}, pending_gates={})",
             total_lut_rows.saturating_sub(resumed_lut_rows),
@@ -744,26 +1045,66 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
             let w_block_v = self.derive_w_block_v(params, lut_id);
             let w_block_vx = self.derive_w_block_vx(params, lut_id);
             let mut batch: Vec<(usize, M::P)> = Vec::with_capacity(chunk_size);
+            let mut pending_store_jobs: Option<Vec<CompactBytesJob<M>>> = None;
             for (_, (idx, y_poly)) in plt.entries(params) {
                 if completed_rows.contains(&idx) {
                     continue;
                 }
                 batch.push((idx, y_poly));
+
                 if batch.len() >= chunk_size {
-                    self.sample_lut_preimages(
-                        params,
+                    let current_batch = std::mem::take(&mut batch);
+                    let lut_preimage_batch_start = Instant::now();
+                    let sampled_jobs = if let Some(previous_jobs) = pending_store_jobs.take() {
+                        let (_, jobs) = rayon::join(
+                            || {
+                                let wait_start = Instant::now();
+                                previous_jobs
+                                    .into_par_iter()
+                                    .for_each(CompactBytesJob::wait_then_store);
+                                debug!(
+                                    "Previous batch store completed in {}",
+                                    Self::format_duration(wait_start.elapsed())
+                                );
+                            },
+                            || {
+                                self.sample_lut_preimages(
+                                    params,
+                                    lut_id,
+                                    &lut_aux_id_prefix,
+                                    &b1_trapdoor,
+                                    &b1_matrix,
+                                    &w_block_identity,
+                                    &w_block_gy,
+                                    &w_block_v,
+                                    &w_block_vx,
+                                    &current_batch,
+                                )
+                            },
+                        );
+                        jobs
+                    } else {
+                        self.sample_lut_preimages(
+                            params,
+                            lut_id,
+                            &lut_aux_id_prefix,
+                            &b1_trapdoor,
+                            &b1_matrix,
+                            &w_block_identity,
+                            &w_block_gy,
+                            &w_block_v,
+                            &w_block_vx,
+                            &current_batch,
+                        )
+                    };
+                    let lut_preimage_batch_elapsed = lut_preimage_batch_start.elapsed();
+                    debug!(
+                        "Sampled LUT preimages: lut_id={}, batch_size={}, elapsed={}",
                         lut_id,
-                        &lut_aux_id_prefix,
-                        &b1_trapdoor,
-                        &b1_matrix,
-                        &w_block_identity,
-                        &w_block_gy,
-                        &w_block_v,
-                        &w_block_vx,
-                        &batch,
+                        current_batch.len(),
+                        Self::format_duration(lut_preimage_batch_elapsed)
                     );
-                    debug!("Sampled LUT preimages: lut_id={}, batch_size={}", lut_id, batch.len());
-                    processed_lut_rows = processed_lut_rows.saturating_add(batch.len());
+                    processed_lut_rows = processed_lut_rows.saturating_add(current_batch.len());
                     let pct = if total_lut_rows == 0 {
                         100.0
                     } else {
@@ -775,23 +1116,58 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                         total_lut_rows,
                         Self::format_duration(start.elapsed())
                     );
-                    batch.clear();
+                    pending_store_jobs = Some(sampled_jobs);
                 }
             }
             if !batch.is_empty() {
-                self.sample_lut_preimages(
-                    params,
+                let current_batch = std::mem::take(&mut batch);
+                let lut_preimage_batch_start = Instant::now();
+                let sampled_jobs = if let Some(previous_jobs) = pending_store_jobs.take() {
+                    let (_, jobs) = rayon::join(
+                        || {
+                            previous_jobs
+                                .into_par_iter()
+                                .for_each(CompactBytesJob::wait_then_store);
+                        },
+                        || {
+                            self.sample_lut_preimages(
+                                params,
+                                lut_id,
+                                &lut_aux_id_prefix,
+                                &b1_trapdoor,
+                                &b1_matrix,
+                                &w_block_identity,
+                                &w_block_gy,
+                                &w_block_v,
+                                &w_block_vx,
+                                &current_batch,
+                            )
+                        },
+                    );
+                    jobs
+                } else {
+                    self.sample_lut_preimages(
+                        params,
+                        lut_id,
+                        &lut_aux_id_prefix,
+                        &b1_trapdoor,
+                        &b1_matrix,
+                        &w_block_identity,
+                        &w_block_gy,
+                        &w_block_v,
+                        &w_block_vx,
+                        &current_batch,
+                    )
+                };
+                let lut_preimage_batch_elapsed = lut_preimage_batch_start.elapsed();
+                debug!(
+                    "Sampled LUT preimages: lut_id={}, batch_size={}, elapsed={}",
                     lut_id,
-                    &lut_aux_id_prefix,
-                    &b1_trapdoor,
-                    &b1_matrix,
-                    &w_block_identity,
-                    &w_block_gy,
-                    &w_block_v,
-                    &w_block_vx,
-                    &batch,
+                    current_batch.len(),
+                    Self::format_duration(lut_preimage_batch_elapsed)
                 );
-                processed_lut_rows = processed_lut_rows.saturating_add(batch.len());
+                pending_store_jobs = Some(sampled_jobs);
+                processed_lut_rows = processed_lut_rows.saturating_add(current_batch.len());
                 let pct = if total_lut_rows == 0 {
                     100.0
                 } else {
@@ -803,6 +1179,9 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                     total_lut_rows,
                     Self::format_duration(start.elapsed())
                 );
+            }
+            if let Some(previous_jobs) = pending_store_jobs.take() {
+                previous_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
             }
             drop(w_block_vx);
             drop(w_block_v);
@@ -843,11 +1222,11 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
 
                 if !pending.is_empty() {
                     total_gates = total_gates.saturating_add(pending.len());
-                    let stage1 = pending
+
+                    let stage1_entries = pending
                         .into_par_iter()
                         .map(|(gate_id, state)| {
                             let uniform_sampler = US::new();
-                            let trap_sampler = TS::new(params, trapdoor_sigma);
                             let s_g = if self.insert_1_to_s {
                                 let s_g_bar = uniform_sampler.sample_uniform(
                                     params,
@@ -855,11 +1234,12 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                                     d - 1,
                                     DistType::TernaryDist,
                                 );
-                                s_g_bar.concat_diag(&[&M::identity(params, 1, None)])
+                                s_g_bar.concat_diag_owned(vec![M::identity(params, 1, None)])
                             } else {
                                 uniform_sampler.sample_uniform(params, d, d, DistType::TernaryDist)
                             };
-                            let s_g_concat = M::identity(params, d, None).concat_columns(&[&s_g]);
+                            let s_g_concat =
+                                M::identity(params, d, None).concat_columns_owned(vec![s_g]);
                             let gate_target1 = {
                                 let error = uniform_sampler.sample_uniform(
                                     params,
@@ -869,34 +1249,71 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                                 );
                                 s_g_concat.clone() * &b1_matrix + error
                             };
-                            let preimage_gate1 = trap_sampler.preimage(
-                                params,
-                                &b0_trapdoor,
-                                &b0_matrix,
-                                &gate_target1,
-                            );
-                            drop(gate_target1);
                             drop(s_g_concat);
-                            drop(s_g);
+                            (gate_id, state, gate_target1)
+                        })
+                        .collect::<Vec<_>>();
+                    let stage1_target_cols = stage1_entries[0].2.col_size();
+                    debug_assert!(
+                        stage1_entries
+                            .iter()
+                            .all(|(_, _, target)| target.col_size() == stage1_target_cols),
+                        "stage1 target columns must be identical across gates"
+                    );
+                    let mut stage1_gate_ids = Vec::with_capacity(stage1_entries.len());
+                    let mut stage2_inputs = Vec::with_capacity(stage1_entries.len());
+                    let mut stage1_targets = Vec::with_capacity(stage1_entries.len());
+                    for (gate_id, state, target) in stage1_entries {
+                        stage1_gate_ids.push(gate_id);
+                        stage2_inputs.push((gate_id, state));
+                        stage1_targets.push(target);
+                    }
+                    let stage1_batched_target = if stage1_targets.len() == 1 {
+                        stage1_targets.pop().expect("stage1_targets must contain one matrix")
+                    } else {
+                        let mut target_iter = stage1_targets.into_iter();
+                        let target_first =
+                            target_iter.next().expect("stage1_targets must be non-empty");
+                        target_first.concat_columns_owned(target_iter.collect())
+                    };
+                    let trap_sampler = TS::new(params, trapdoor_sigma);
+                    let stage1_batched_preimage = trap_sampler.preimage(
+                        params,
+                        &b0_trapdoor,
+                        &b0_matrix,
+                        &stage1_batched_target,
+                    );
+                    let stage1_preimage_nrow = stage1_batched_preimage.row_size();
+                    let stage1_jobs = stage1_gate_ids
+                        .into_iter()
+                        .enumerate()
+                        .map(|(gate_pos, gate_id)| {
+                            let col_start = gate_pos
+                                .checked_mul(stage1_target_cols)
+                                .expect("stage1 preimage slice column offset overflow");
+                            let col_end = col_start + stage1_target_cols;
+                            let preimage_gate1 = stage1_batched_preimage.slice(
+                                0,
+                                stage1_preimage_nrow,
+                                col_start,
+                                col_end,
+                            );
                             debug!(
                                 "Sampled gate preimage 1: gate_id={}, lut_id={}",
                                 gate_id, lut_id
                             );
-                            let job = CompactBytesJob::new(
+                            CompactBytesJob::new(
                                 self.preimage_gate1_id_prefix(params, gate_id),
                                 vec![(0, preimage_gate1)],
-                            );
-                            (job, (gate_id, state))
+                            )
                         })
                         .collect::<Vec<_>>();
-                    let (stage1_jobs, stage2_inputs): (Vec<_>, Vec<_>) = stage1.into_iter().unzip();
                     stage1_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
 
                     let w_block_identity = self.derive_w_block_identity(params, lut_id);
-                    let stage2 = stage2_inputs
+                    let stage2_entries = stage2_inputs
                         .into_par_iter()
                         .map(|(gate_id, state)| {
-                            let trap_sampler = TS::new(params, trapdoor_sigma);
                             let hash_sampler = HS::new();
                             let out_matrix = hash_sampler.sample_hash(
                                 params,
@@ -908,63 +1325,121 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                             );
                             let target_gate2_identity =
                                 out_matrix.concat_rows(&[&w_block_identity]);
-                            let preimage_gate2_identity = trap_sampler.preimage(
-                                params,
-                                &b1_trapdoor,
-                                &b1_matrix,
-                                &target_gate2_identity,
+                            (gate_id, state, target_gate2_identity)
+                        })
+                        .collect::<Vec<_>>();
+                    let stage2_target_cols = stage2_entries[0].2.col_size();
+                    debug_assert!(
+                        stage2_entries
+                            .iter()
+                            .all(|(_, _, target)| target.col_size() == stage2_target_cols),
+                        "stage2 target columns must be identical across gates"
+                    );
+                    let mut stage2_gate_ids = Vec::with_capacity(stage2_entries.len());
+                    let mut stage3_inputs = Vec::with_capacity(stage2_entries.len());
+                    let mut stage2_targets = Vec::with_capacity(stage2_entries.len());
+                    for (gate_id, state, target) in stage2_entries {
+                        stage2_gate_ids.push(gate_id);
+                        stage3_inputs.push((gate_id, state));
+                        stage2_targets.push(target);
+                    }
+                    let stage2_batched_target = if stage2_targets.len() == 1 {
+                        stage2_targets.pop().expect("stage2_targets must contain one matrix")
+                    } else {
+                        let mut target_iter = stage2_targets.into_iter();
+                        let target_first =
+                            target_iter.next().expect("stage2_targets must be non-empty");
+                        target_first.concat_columns_owned(target_iter.collect())
+                    };
+                    let trap_sampler = TS::new(params, trapdoor_sigma);
+                    let stage2_batched_preimage = trap_sampler.preimage(
+                        params,
+                        &b1_trapdoor,
+                        &b1_matrix,
+                        &stage2_batched_target,
+                    );
+                    let stage2_preimage_nrow = stage2_batched_preimage.row_size();
+                    let stage2_jobs = stage2_gate_ids
+                        .into_iter()
+                        .enumerate()
+                        .map(|(gate_pos, gate_id)| {
+                            let col_start = gate_pos
+                                .checked_mul(stage2_target_cols)
+                                .expect("stage2 preimage slice column offset overflow");
+                            let col_end = col_start + stage2_target_cols;
+                            let preimage_gate2_identity = stage2_batched_preimage.slice(
+                                0,
+                                stage2_preimage_nrow,
+                                col_start,
+                                col_end,
                             );
-                            drop(target_gate2_identity);
                             debug!(
                                 "Sampled gate preimage 2 (identity part): gate_id={}, lut_id={}",
                                 gate_id, lut_id
                             );
-                            let job = CompactBytesJob::new(
+                            CompactBytesJob::new(
                                 self.preimage_gate2_identity_id_prefix(params, gate_id),
                                 vec![(0, preimage_gate2_identity)],
-                            );
-                            (job, (gate_id, state))
+                            )
                         })
                         .collect::<Vec<_>>();
                     drop(w_block_identity);
-                    let (stage2_jobs, stage3_inputs): (Vec<_>, Vec<_>) = stage2.into_iter().unzip();
                     stage2_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
 
                     let w_block_gy = self.derive_w_block_gy(params, lut_id);
-                    let stage3 = stage3_inputs
-                        .into_par_iter()
-                        .map(|(gate_id, state)| {
-                            let trap_sampler = TS::new(params, trapdoor_sigma);
-                            let target_high_gy = -M::gadget_matrix(params, d);
-                            let target_gate2_gy = target_high_gy.concat_rows(&[&w_block_gy]);
-                            drop(target_high_gy);
-                            let preimage_gate2_gy = trap_sampler.preimage(
-                                params,
-                                &b1_trapdoor,
-                                &b1_matrix,
-                                &target_gate2_gy,
+                    let stage3_gate_ids =
+                        stage3_inputs.iter().map(|(gate_id, _)| *gate_id).collect::<Vec<_>>();
+                    let target_high_gy = -M::gadget_matrix(params, d);
+                    let target_gate2_gy = target_high_gy.concat_rows(&[&w_block_gy]);
+                    drop(target_high_gy);
+                    let stage3_target_cols = target_gate2_gy.col_size();
+                    let stage3_batched_target = if stage3_gate_ids.len() == 1 {
+                        target_gate2_gy.clone()
+                    } else {
+                        let stage3_target_refs = std::iter::repeat(&target_gate2_gy)
+                            .take(stage3_gate_ids.len())
+                            .collect::<Vec<_>>();
+                        stage3_target_refs[0].concat_columns(&stage3_target_refs[1..])
+                    };
+                    let trap_sampler = TS::new(params, trapdoor_sigma);
+                    let stage3_batched_preimage = trap_sampler.preimage(
+                        params,
+                        &b1_trapdoor,
+                        &b1_matrix,
+                        &stage3_batched_target,
+                    );
+                    let stage3_preimage_nrow = stage3_batched_preimage.row_size();
+                    let stage3_jobs = stage3_gate_ids
+                        .into_iter()
+                        .enumerate()
+                        .map(|(gate_pos, gate_id)| {
+                            let col_start = gate_pos
+                                .checked_mul(stage3_target_cols)
+                                .expect("stage3 preimage slice column offset overflow");
+                            let col_end = col_start + stage3_target_cols;
+                            let preimage_gate2_gy = stage3_batched_preimage.slice(
+                                0,
+                                stage3_preimage_nrow,
+                                col_start,
+                                col_end,
                             );
-                            drop(target_gate2_gy);
                             debug!(
                                 "Sampled gate preimage 2 (gy part): gate_id={}, lut_id={}",
                                 gate_id, lut_id
                             );
-                            let job = CompactBytesJob::new(
+                            CompactBytesJob::new(
                                 self.preimage_gate2_gy_id_prefix(params, gate_id),
                                 vec![(0, preimage_gate2_gy)],
-                            );
-                            (job, (gate_id, state))
+                            )
                         })
                         .collect::<Vec<_>>();
                     drop(w_block_gy);
-                    let (stage3_jobs, stage4_inputs): (Vec<_>, Vec<_>) = stage3.into_iter().unzip();
                     stage3_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
 
                     let w_block_v = self.derive_w_block_v(params, lut_id);
-                    let stage4 = stage4_inputs
+                    let stage4_entries = stage3_inputs
                         .into_par_iter()
                         .map(|(gate_id, state)| {
-                            let trap_sampler = TS::new(params, trapdoor_sigma);
                             let hash_sampler = HS::new();
                             let input_matrix =
                                 M::from_compact_bytes(params, &state.input_pubkey_bytes);
@@ -983,59 +1458,135 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                                 u_g_matrix.row_size(),
                                 u_g_matrix.col_size()
                             );
-                            let taget_high_v = - input_matrix.mul_decompose(&u_g_matrix);
-                            let target_gate2_v = taget_high_v.concat_rows(&[&w_block_v]);
-                            drop(taget_high_v);
-                            let preimage_gate2_v = trap_sampler.preimage(
-                                params,
-                                &b1_trapdoor,
-                                &b1_matrix,
-                                &target_gate2_v,
+                            let u_g_decomposed = u_g_matrix.decompose();
+                            let target_high_v = -(input_matrix * u_g_decomposed);
+                            let target_gate2_v = target_high_v.concat_rows(&[&w_block_v]);
+                            (gate_id, u_g_matrix, target_gate2_v)
+                        })
+                        .collect::<Vec<_>>();
+                    let stage4_target_cols = stage4_entries[0].2.col_size();
+                    debug_assert!(
+                        stage4_entries
+                            .iter()
+                            .all(|(_, _, target)| target.col_size() == stage4_target_cols),
+                        "stage4 target columns must be identical across gates"
+                    );
+                    let mut stage4_gate_ids = Vec::with_capacity(stage4_entries.len());
+                    let mut stage5_inputs = Vec::with_capacity(stage4_entries.len());
+                    let mut stage4_targets = Vec::with_capacity(stage4_entries.len());
+                    for (gate_id, u_g_matrix, target) in stage4_entries {
+                        stage4_gate_ids.push(gate_id);
+                        stage5_inputs.push((gate_id, u_g_matrix));
+                        stage4_targets.push(target);
+                    }
+                    let stage4_batched_target = if stage4_targets.len() == 1 {
+                        stage4_targets.pop().expect("stage4_targets must contain one matrix")
+                    } else {
+                        let mut target_iter = stage4_targets.into_iter();
+                        let target_first =
+                            target_iter.next().expect("stage4_targets must be non-empty");
+                        target_first.concat_columns_owned(target_iter.collect())
+                    };
+                    let trap_sampler = TS::new(params, trapdoor_sigma);
+                    let stage4_batched_preimage = trap_sampler.preimage(
+                        params,
+                        &b1_trapdoor,
+                        &b1_matrix,
+                        &stage4_batched_target,
+                    );
+                    let stage4_preimage_nrow = stage4_batched_preimage.row_size();
+                    let stage4_jobs = stage4_gate_ids
+                        .into_iter()
+                        .enumerate()
+                        .map(|(gate_pos, gate_id)| {
+                            let col_start = gate_pos
+                                .checked_mul(stage4_target_cols)
+                                .expect("stage4 preimage slice column offset overflow");
+                            let col_end = col_start + stage4_target_cols;
+                            let preimage_gate2_v = stage4_batched_preimage.slice(
+                                0,
+                                stage4_preimage_nrow,
+                                col_start,
+                                col_end,
                             );
-                            drop(target_gate2_v);
                             debug!(
                                 "Sampled gate preimage 2 (v part): gate_id={}, lut_id={}",
                                 gate_id, lut_id
                             );
-                            let job = CompactBytesJob::new(
+                            CompactBytesJob::new(
                                 self.preimage_gate2_v_id_prefix(params, gate_id),
                                 vec![(0, preimage_gate2_v)],
-                            );
-                            (job, (gate_id, u_g_matrix))
+                            )
                         })
                         .collect::<Vec<_>>();
-                    let (stage4_jobs, stage5_inputs): (Vec<_>, Vec<_>) = stage4.into_iter().unzip();
                     stage4_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
                     drop(w_block_v);
 
                     let w_block_vx = self.derive_w_block_vx(params, lut_id);
                     let small_gadget_matrix = M::small_gadget_matrix(params, m_g);
-                    let stage5 = stage5_inputs
+                    let stage5_entries = stage5_inputs
                         .into_par_iter()
                         .map(|(gate_id, u_g_matrix)| {
-                            let trap_sampler = TS::new(params, trapdoor_sigma);
                             let target_high_vx = u_g_matrix * &small_gadget_matrix;
                             let target_gate2_vx = target_high_vx.concat_rows(&[&w_block_vx]);
                             drop(target_high_vx);
-                            let preimage_gate2_vx = trap_sampler.preimage(
-                                params,
-                                &b1_trapdoor,
-                                &b1_matrix,
-                                &target_gate2_vx,
+                            (gate_id, target_gate2_vx)
+                        })
+                        .collect::<Vec<_>>();
+                    let stage5_target_cols = stage5_entries[0].1.col_size();
+                    debug_assert!(
+                        stage5_entries
+                            .iter()
+                            .all(|(_, target)| target.col_size() == stage5_target_cols),
+                        "stage5 target columns must be identical across gates"
+                    );
+                    let mut stage5_gate_ids = Vec::with_capacity(stage5_entries.len());
+                    let mut stage5_targets = Vec::with_capacity(stage5_entries.len());
+                    for (gate_id, target) in stage5_entries {
+                        stage5_gate_ids.push(gate_id);
+                        stage5_targets.push(target);
+                    }
+                    let stage5_batched_target = if stage5_targets.len() == 1 {
+                        stage5_targets.pop().expect("stage5_targets must contain one matrix")
+                    } else {
+                        let mut target_iter = stage5_targets.into_iter();
+                        let target_first =
+                            target_iter.next().expect("stage5_targets must be non-empty");
+                        target_first.concat_columns_owned(target_iter.collect())
+                    };
+                    let trap_sampler = TS::new(params, trapdoor_sigma);
+                    let stage5_batched_preimage = trap_sampler.preimage(
+                        params,
+                        &b1_trapdoor,
+                        &b1_matrix,
+                        &stage5_batched_target,
+                    );
+                    let stage5_preimage_nrow = stage5_batched_preimage.row_size();
+                    let stage5_jobs = stage5_gate_ids
+                        .into_iter()
+                        .enumerate()
+                        .map(|(gate_pos, gate_id)| {
+                            let col_start = gate_pos
+                                .checked_mul(stage5_target_cols)
+                                .expect("stage5 preimage slice column offset overflow");
+                            let col_end = col_start + stage5_target_cols;
+                            let preimage_gate2_vx = stage5_batched_preimage.slice(
+                                0,
+                                stage5_preimage_nrow,
+                                col_start,
+                                col_end,
                             );
-                            drop(target_gate2_vx);
                             debug!(
                                 "Sampled gate preimage 2 (vx part): gate_id={}, lut_id={}",
                                 gate_id, lut_id
                             );
-                            let job = CompactBytesJob::new(
+                            CompactBytesJob::new(
                                 self.preimage_gate2_vx_id_prefix(params, gate_id),
                                 vec![(0, preimage_gate2_vx)],
-                            );
-                            job
+                            )
                         })
                         .collect::<Vec<_>>();
-                    stage5.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+                    stage5_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
                     drop(w_block_vx);
                 }
                 let pct = if total_gate_count == 0 {
@@ -1205,8 +1756,9 @@ where
             "preimage_gate2_gy must have m_g columns"
         );
         let gy = M::gadget_matrix(params, d) * y.clone();
-        c_const = c_const + (sg_times_b1.clone() * preimage_gate2_gy).mul_decompose(&gy);
+        let gy_decomposed = gy.decompose();
         drop(gy);
+        c_const = c_const + sg_times_b1.clone() * preimage_gate2_gy * gy_decomposed;
 
         let v_idx = derive_lut_v_idx_from_hash::<M, HS>(params, self.hash_key, lut_id, k, d);
         let preimage_gate2_v = read_matrix_from_multi_batch::<M>(
@@ -1235,10 +1787,9 @@ where
             m_g * k_small,
             "preimage_gate2_vx must have m_g * k_small columns"
         );
-        let x_identity = M::identity(params, m_g, Some(x.clone()));
-        c_const = c_const +
-            (sg_times_b1.clone() * preimage_gate2_vx).mul_decompose_small(&x_identity) * &v_idx;
-        drop(x_identity);
+        let x_identity_decomposed = M::identity(params, m_g, Some(x.clone())).small_decompose();
+        c_const =
+            c_const + sg_times_b1.clone() * preimage_gate2_vx * x_identity_decomposed * &v_idx;
 
         let preimage_lut = read_matrix_from_multi_batch::<M>(params, dir, &lut_aux_row_id, 0)
             .unwrap_or_else(|| panic!("preimage_lut (index {}) for lut {} not found", k, lut_id));
@@ -1261,9 +1812,10 @@ where
             u_g.col_size()
         );
 
-        let c_x_randomized = input.vector.clone().mul_decompose(&u_g) * v_idx;
-        debug!("Computed c_x_randomized for gate encoding: gate_id={}, lut_id={}", gate_id, lut_id);
+        let u_g_decomposed = u_g.decompose();
         drop(u_g);
+        let c_x_randomized = input.vector.clone() * u_g_decomposed * v_idx;
+        debug!("Computed c_x_randomized for gate encoding: gate_id={}, lut_id={}", gate_id, lut_id);
         let c_out = c_const + c_x_randomized;
         debug!("Computed c_out for gate encoding: gate_id={}, lut_id={}", gate_id, lut_id);
         let out_pubkey = BggPublicKey {

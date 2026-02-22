@@ -2,6 +2,7 @@ namespace
 {
     constexpr uint32_t kTransformThreads = 256;
     constexpr size_t kMaxGridY = 65535;
+    constexpr size_t kMaxGridZ = 65535;
 
     __device__ __forceinline__ uint64_t sub_mod_u64(uint64_t a, uint64_t b, uint64_t mod)
     {
@@ -52,46 +53,70 @@ namespace
         return result;
     }
 
-    __global__ void ntt_twist_kernel(
-        uint64_t *base,
-        size_t stride,
+    __global__ void ntt_twist_all_limbs_kernel(
+        uint64_t *const *limb_bases,
+        const size_t *limb_strides,
+        const uint64_t *limb_twiddle_bases,
+        const uint64_t *limb_moduli,
+        size_t limb_count,
         uint32_t n,
-        uint64_t twiddle_base,
-        uint64_t modulus)
+        size_t poly_offset)
     {
         const uint32_t coeff_idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (coeff_idx >= n)
         {
             return;
         }
-        const size_t poly_idx = static_cast<size_t>(blockIdx.y);
-        uint64_t *poly = base + poly_idx * stride;
+        const size_t limb_idx = static_cast<size_t>(blockIdx.z);
+        if (limb_idx >= limb_count)
+        {
+            return;
+        }
+        const size_t poly_idx = poly_offset + static_cast<size_t>(blockIdx.y);
+        uint64_t *const base = limb_bases[limb_idx];
+        const size_t stride = limb_strides[limb_idx];
+        const uint64_t twiddle_base = limb_twiddle_bases[limb_idx];
+        const uint64_t modulus = limb_moduli[limb_idx];
+        uint64_t *const poly = base + poly_idx * stride;
         const uint64_t tw = pow_mod_u64_device(twiddle_base, coeff_idx, modulus);
         poly[coeff_idx] = mul_mod_u64(poly[coeff_idx], tw, modulus);
     }
 
-    __global__ void ntt_scale_kernel(
-        uint64_t *base,
-        size_t stride,
+    __global__ void ntt_scale_all_limbs_kernel(
+        uint64_t *const *limb_bases,
+        const size_t *limb_strides,
+        const uint64_t *limb_factors,
+        const uint64_t *limb_moduli,
+        size_t limb_count,
         uint32_t n,
-        uint64_t factor,
-        uint64_t modulus)
+        size_t poly_offset)
     {
         const uint32_t coeff_idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (coeff_idx >= n)
         {
             return;
         }
-        const size_t poly_idx = static_cast<size_t>(blockIdx.y);
-        uint64_t *poly = base + poly_idx * stride;
+        const size_t limb_idx = static_cast<size_t>(blockIdx.z);
+        if (limb_idx >= limb_count)
+        {
+            return;
+        }
+        const size_t poly_idx = poly_offset + static_cast<size_t>(blockIdx.y);
+        uint64_t *const base = limb_bases[limb_idx];
+        const size_t stride = limb_strides[limb_idx];
+        const uint64_t factor = limb_factors[limb_idx];
+        const uint64_t modulus = limb_moduli[limb_idx];
+        uint64_t *const poly = base + poly_idx * stride;
         poly[coeff_idx] = mul_mod_u64(poly[coeff_idx], factor, modulus);
     }
 
-    __global__ void ntt_bit_reverse_kernel(
-        uint64_t *base,
-        size_t stride,
+    __global__ void ntt_bit_reverse_all_limbs_kernel(
+        uint64_t *const *limb_bases,
+        const size_t *limb_strides,
+        size_t limb_count,
         uint32_t n,
-        uint32_t log_n)
+        uint32_t log_n,
+        size_t poly_offset)
     {
         const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= n)
@@ -103,20 +128,29 @@ namespace
         {
             return;
         }
-        const size_t poly_idx = static_cast<size_t>(blockIdx.y);
-        uint64_t *poly = base + poly_idx * stride;
+        const size_t limb_idx = static_cast<size_t>(blockIdx.z);
+        if (limb_idx >= limb_count)
+        {
+            return;
+        }
+        const size_t poly_idx = poly_offset + static_cast<size_t>(blockIdx.y);
+        uint64_t *const base = limb_bases[limb_idx];
+        const size_t stride = limb_strides[limb_idx];
+        uint64_t *const poly = base + poly_idx * stride;
         const uint64_t tmp = poly[idx];
         poly[idx] = poly[rev];
         poly[rev] = tmp;
     }
 
-    __global__ void ntt_stage_kernel(
-        uint64_t *base,
-        size_t stride,
+    __global__ void ntt_stage_all_limbs_kernel(
+        uint64_t *const *limb_bases,
+        const size_t *limb_strides,
+        const uint64_t *limb_wlens,
+        const uint64_t *limb_moduli,
+        size_t limb_count,
         uint32_t n,
         uint32_t len,
-        uint64_t wlen,
-        uint64_t modulus)
+        size_t poly_offset)
     {
         const uint32_t bfly_idx = blockIdx.x * blockDim.x + threadIdx.x;
         const uint32_t butterflies = n >> 1;
@@ -124,15 +158,21 @@ namespace
         {
             return;
         }
-
+        const size_t limb_idx = static_cast<size_t>(blockIdx.z);
+        if (limb_idx >= limb_count)
+        {
+            return;
+        }
         const uint32_t half = len >> 1;
         const uint32_t group = bfly_idx / half;
         const uint32_t j = bfly_idx - group * half;
         const uint32_t i = group * len + j;
-
-        const size_t poly_idx = static_cast<size_t>(blockIdx.y);
-        uint64_t *poly = base + poly_idx * stride;
-
+        const size_t poly_idx = poly_offset + static_cast<size_t>(blockIdx.y);
+        uint64_t *const base = limb_bases[limb_idx];
+        const size_t stride = limb_strides[limb_idx];
+        const uint64_t wlen = limb_wlens[limb_idx];
+        const uint64_t modulus = limb_moduli[limb_idx];
+        uint64_t *const poly = base + poly_idx * stride;
         const uint64_t w = pow_mod_u64_device(wlen, j, modulus);
         const uint64_t u = poly[i];
         const uint64_t v = mul_mod_u64(poly[i + half], w, modulus);
@@ -145,31 +185,44 @@ namespace
         return v != 0 && (v & (v - 1)) == 0;
     }
 
-    int launch_twist_for_all_polys(
-        uint64_t *base,
-        size_t stride,
+    int launch_twist_for_all_limbs(
+        uint64_t *const *limb_bases,
+        const size_t *limb_strides,
+        const uint64_t *limb_twiddle_bases,
+        const uint64_t *limb_moduli,
+        size_t limb_count,
         uint32_t n,
         size_t poly_count,
-        uint64_t twiddle_base,
-        uint64_t modulus,
         cudaStream_t stream)
     {
-        if (!base)
+        if (!limb_bases || !limb_strides || !limb_twiddle_bases || !limb_moduli)
         {
-            return set_error("null pointer in launch_twist_for_all_polys");
+            return set_error("null metadata in launch_twist_for_all_limbs");
+        }
+        if (limb_count == 0 || poly_count == 0)
+        {
+            return 0;
+        }
+        if (limb_count > kMaxGridZ)
+        {
+            return set_error("too many limbs in launch_twist_for_all_limbs");
         }
         const uint32_t blocks_x = (n + kTransformThreads - 1) / kTransformThreads;
         for (size_t offset = 0; offset < poly_count; offset += kMaxGridY)
         {
             const size_t chunk = std::min(kMaxGridY, poly_count - offset);
-            uint64_t *chunk_base = base + offset * stride;
-            const dim3 grid{blocks_x, static_cast<uint32_t>(chunk)};
-            ntt_twist_kernel<<<grid, kTransformThreads, 0, stream>>>(
-                chunk_base,
-                stride,
+            const dim3 grid{
+                blocks_x,
+                static_cast<uint32_t>(chunk),
+                static_cast<uint32_t>(limb_count)};
+            ntt_twist_all_limbs_kernel<<<grid, kTransformThreads, 0, stream>>>(
+                limb_bases,
+                limb_strides,
+                limb_twiddle_bases,
+                limb_moduli,
+                limb_count,
                 n,
-                twiddle_base,
-                modulus);
+                offset);
             cudaError_t err = cudaGetLastError();
             if (err != cudaSuccess)
             {
@@ -179,26 +232,44 @@ namespace
         return 0;
     }
 
-    int launch_scale_for_all_polys(
-        uint64_t *base,
-        size_t stride,
+    int launch_scale_for_all_limbs(
+        uint64_t *const *limb_bases,
+        const size_t *limb_strides,
+        const uint64_t *limb_factors,
+        const uint64_t *limb_moduli,
+        size_t limb_count,
         uint32_t n,
         size_t poly_count,
-        uint64_t factor,
-        uint64_t modulus,
         cudaStream_t stream)
     {
-        if (!base)
+        if (!limb_bases || !limb_strides || !limb_factors || !limb_moduli)
         {
-            return set_error("null pointer in launch_scale_for_all_polys");
+            return set_error("null metadata in launch_scale_for_all_limbs");
+        }
+        if (limb_count == 0 || poly_count == 0)
+        {
+            return 0;
+        }
+        if (limb_count > kMaxGridZ)
+        {
+            return set_error("too many limbs in launch_scale_for_all_limbs");
         }
         const uint32_t blocks_x = (n + kTransformThreads - 1) / kTransformThreads;
         for (size_t offset = 0; offset < poly_count; offset += kMaxGridY)
         {
             const size_t chunk = std::min(kMaxGridY, poly_count - offset);
-            uint64_t *chunk_base = base + offset * stride;
-            const dim3 grid{blocks_x, static_cast<uint32_t>(chunk)};
-            ntt_scale_kernel<<<grid, kTransformThreads, 0, stream>>>(chunk_base, stride, n, factor, modulus);
+            const dim3 grid{
+                blocks_x,
+                static_cast<uint32_t>(chunk),
+                static_cast<uint32_t>(limb_count)};
+            ntt_scale_all_limbs_kernel<<<grid, kTransformThreads, 0, stream>>>(
+                limb_bases,
+                limb_strides,
+                limb_factors,
+                limb_moduli,
+                limb_count,
+                n,
+                offset);
             cudaError_t err = cudaGetLastError();
             if (err != cudaSuccess)
             {
@@ -208,25 +279,42 @@ namespace
         return 0;
     }
 
-    int launch_bit_reverse_for_all_polys(
-        uint64_t *base,
-        size_t stride,
+    int launch_bit_reverse_for_all_limbs(
+        uint64_t *const *limb_bases,
+        const size_t *limb_strides,
+        size_t limb_count,
         uint32_t n,
         uint32_t log_n,
         size_t poly_count,
         cudaStream_t stream)
     {
-        if (!base)
+        if (!limb_bases || !limb_strides)
         {
-            return set_error("null pointer in launch_bit_reverse_for_all_polys");
+            return set_error("null metadata in launch_bit_reverse_for_all_limbs");
+        }
+        if (limb_count == 0 || poly_count == 0)
+        {
+            return 0;
+        }
+        if (limb_count > kMaxGridZ)
+        {
+            return set_error("too many limbs in launch_bit_reverse_for_all_limbs");
         }
         const uint32_t blocks_x = (n + kTransformThreads - 1) / kTransformThreads;
         for (size_t offset = 0; offset < poly_count; offset += kMaxGridY)
         {
             const size_t chunk = std::min(kMaxGridY, poly_count - offset);
-            uint64_t *chunk_base = base + offset * stride;
-            const dim3 grid{blocks_x, static_cast<uint32_t>(chunk)};
-            ntt_bit_reverse_kernel<<<grid, kTransformThreads, 0, stream>>>(chunk_base, stride, n, log_n);
+            const dim3 grid{
+                blocks_x,
+                static_cast<uint32_t>(chunk),
+                static_cast<uint32_t>(limb_count)};
+            ntt_bit_reverse_all_limbs_kernel<<<grid, kTransformThreads, 0, stream>>>(
+                limb_bases,
+                limb_strides,
+                limb_count,
+                n,
+                log_n,
+                offset);
             cudaError_t err = cudaGetLastError();
             if (err != cudaSuccess)
             {
@@ -236,117 +324,53 @@ namespace
         return 0;
     }
 
-    int launch_stage_for_all_polys(
-        uint64_t *base,
-        size_t stride,
+    int launch_stage_for_all_limbs(
+        uint64_t *const *limb_bases,
+        const size_t *limb_strides,
+        const uint64_t *limb_wlens,
+        const uint64_t *limb_moduli,
+        size_t limb_count,
         uint32_t n,
-        size_t poly_count,
         uint32_t len,
-        uint64_t wlen,
-        uint64_t modulus,
+        size_t poly_count,
         cudaStream_t stream)
     {
-        if (!base)
+        if (!limb_bases || !limb_strides || !limb_wlens || !limb_moduli)
         {
-            return set_error("null pointer in launch_stage_for_all_polys");
+            return set_error("null metadata in launch_stage_for_all_limbs");
+        }
+        if (limb_count == 0 || poly_count == 0)
+        {
+            return 0;
+        }
+        if (limb_count > kMaxGridZ)
+        {
+            return set_error("too many limbs in launch_stage_for_all_limbs");
         }
         const uint32_t butterflies = n >> 1;
         const uint32_t blocks_x = (butterflies + kTransformThreads - 1) / kTransformThreads;
         for (size_t offset = 0; offset < poly_count; offset += kMaxGridY)
         {
             const size_t chunk = std::min(kMaxGridY, poly_count - offset);
-            uint64_t *chunk_base = base + offset * stride;
-            const dim3 grid{blocks_x, static_cast<uint32_t>(chunk)};
-            ntt_stage_kernel<<<grid, kTransformThreads, 0, stream>>>(
-                chunk_base,
-                stride,
+            const dim3 grid{
+                blocks_x,
+                static_cast<uint32_t>(chunk),
+                static_cast<uint32_t>(limb_count)};
+            ntt_stage_all_limbs_kernel<<<grid, kTransformThreads, 0, stream>>>(
+                limb_bases,
+                limb_strides,
+                limb_wlens,
+                limb_moduli,
+                limb_count,
                 n,
                 len,
-                wlen,
-                modulus);
+                offset);
             cudaError_t err = cudaGetLastError();
             if (err != cudaSuccess)
             {
                 return set_error(err);
             }
         }
-        return 0;
-    }
-
-    int run_limb_ntt_transform(
-        uint64_t *base,
-        size_t stride,
-        uint32_t n,
-        uint32_t log_n,
-        size_t poly_count,
-        uint64_t modulus,
-        uint64_t n_inv,
-        uint64_t root,
-        uint64_t inv_root,
-        cudaStream_t stream,
-        bool forward)
-    {
-        if (!base)
-        {
-            return set_error("null pointer in run_limb_ntt_transform");
-        }
-
-        const uint64_t omega = mul_mod_u64_host(root, root, modulus);
-        const uint64_t inv_omega = mul_mod_u64_host(inv_root, inv_root, modulus);
-
-        int status = 0;
-        if (forward)
-        {
-            status = launch_twist_for_all_polys(base, stride, n, poly_count, root, modulus, stream);
-            if (status != 0)
-            {
-                return status;
-            }
-            status = launch_bit_reverse_for_all_polys(base, stride, n, log_n, poly_count, stream);
-            if (status != 0)
-            {
-                return status;
-            }
-            for (uint32_t len = 2; len <= n; len <<= 1)
-            {
-                const uint32_t exp = n / len;
-                const uint64_t wlen = pow_mod_u64_host(omega, exp, modulus);
-                status = launch_stage_for_all_polys(base, stride, n, poly_count, len, wlen, modulus, stream);
-                if (status != 0)
-                {
-                    return status;
-                }
-            }
-        }
-        else
-        {
-            status = launch_bit_reverse_for_all_polys(base, stride, n, log_n, poly_count, stream);
-            if (status != 0)
-            {
-                return status;
-            }
-            for (uint32_t len = 2; len <= n; len <<= 1)
-            {
-                const uint32_t exp = n / len;
-                const uint64_t wlen = pow_mod_u64_host(inv_omega, exp, modulus);
-                status = launch_stage_for_all_polys(base, stride, n, poly_count, len, wlen, modulus, stream);
-                if (status != 0)
-                {
-                    return status;
-                }
-            }
-            status = launch_scale_for_all_polys(base, stride, n, poly_count, n_inv, modulus, stream);
-            if (status != 0)
-            {
-                return status;
-            }
-            status = launch_twist_for_all_polys(base, stride, n, poly_count, inv_root, modulus, stream);
-            if (status != 0)
-            {
-                return status;
-            }
-        }
-
         return 0;
     }
 
@@ -382,14 +406,18 @@ namespace
         auto &limb_map = mat->ctx->limb_gpu_ids;
         auto &limb_types = mat->ctx->limb_types;
         auto &limb_prime_ids = mat->ctx->limb_prime_ids;
-        if (limb_map.size() < static_cast<size_t>(mat->level + 1))
+        const size_t limb_count = static_cast<size_t>(mat->level + 1);
+        if (limb_map.size() < limb_count)
         {
             return set_error("unexpected limb mapping size in run_matrix_transform_u64");
         }
-        if (limb_types.size() < static_cast<size_t>(mat->level + 1) ||
-            limb_prime_ids.size() < static_cast<size_t>(mat->level + 1))
+        if (limb_types.size() < limb_count || limb_prime_ids.size() < limb_count)
         {
             return set_error("unexpected limb metadata size in run_matrix_transform_u64");
+        }
+        if (limb_count > kMaxGridZ)
+        {
+            return set_error("too many limbs in run_matrix_transform_u64");
         }
 
         const size_t poly_count = matrix_poly_count(mat);
@@ -399,42 +427,60 @@ namespace
             return 0;
         }
 
-        if (poly_count > std::numeric_limits<uint32_t>::max())
-        {
-            return set_error("poly_count too large in run_matrix_transform_u64");
-        }
+        std::vector<dim3> active_limb_ids(limb_count);
+        std::vector<uint64_t *> limb_bases(limb_count, nullptr);
+        std::vector<size_t> limb_strides(limb_count, 0);
+        std::vector<uint64_t> limb_moduli(limb_count, 0);
+        std::vector<uint64_t> limb_n_inv(limb_count, 0);
+        std::vector<uint64_t> limb_root(limb_count, 0);
+        std::vector<uint64_t> limb_inv_root(limb_count, 0);
+        std::vector<uint64_t> limb_omega(limb_count, 0);
+        std::vector<uint64_t> limb_inv_omega(limb_count, 0);
+        std::vector<uint64_t> limb_wlens(limb_count, 0);
+
+        int dispatch_device = -1;
+        cudaStream_t dispatch_stream = nullptr;
+        int status = 0;
 
         for (int limb = 0; limb <= mat->level; ++limb)
         {
-            const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
+            const size_t limb_idx = static_cast<size_t>(limb);
+            const dim3 limb_id = limb_map[limb_idx];
+            active_limb_ids[limb_idx] = limb_id;
             if (limb_id.x >= mat->shared_limb_buffers.size())
             {
                 return set_error("invalid shared limb partition in run_matrix_transform_u64");
             }
 
-            int device = -1;
-            int status = matrix_limb_device(mat, limb_id, &device);
+            int limb_device = -1;
+            status = matrix_limb_device(mat, limb_id, &limb_device);
             if (status != 0)
             {
                 return status;
             }
-            cudaStream_t stream = nullptr;
-            status = matrix_limb_stream(mat, limb_id, &stream);
-            if (status != 0)
+            if (limb == 0)
             {
-                return status;
+                dispatch_device = limb_device;
+                status = matrix_limb_stream(mat, limb_id, &dispatch_stream);
+                if (status != 0)
+                {
+                    return status;
+                }
+                if (!dispatch_stream)
+                {
+                    return set_error("null dispatch stream in run_matrix_transform_u64");
+                }
             }
-            status = matrix_wait_limb_stream(mat, limb_id, device, stream);
-            if (status != 0)
+            else if (limb_device != dispatch_device)
             {
-                return status;
+                return set_error("single-device mode requires all limbs on one device in run_matrix_transform_u64");
             }
 
-            if (limb_types[static_cast<size_t>(limb)] != FIDESlib::U64)
+            if (limb_types[limb_idx] != FIDESlib::U64)
             {
                 return set_error("unsupported limb type in run_matrix_transform_u64");
             }
-            const int primeid = limb_prime_ids[static_cast<size_t>(limb)];
+            const int primeid = limb_prime_ids[limb_idx];
             if (primeid < 0 || primeid >= FIDESlib::MAXP || limb_id.x >= FIDESlib::MAXD)
             {
                 return set_error("invalid prime/device index in run_matrix_transform_u64");
@@ -448,43 +494,355 @@ namespace
             {
                 return set_error("invalid modulus/root constants in run_matrix_transform_u64");
             }
+            limb_moduli[limb_idx] = modulus;
+            limb_n_inv[limb_idx] = n_inv;
+            limb_root[limb_idx] = root;
+            limb_inv_root[limb_idx] = inv_root;
+            limb_omega[limb_idx] = mul_mod_u64_host(root, root, modulus);
+            limb_inv_omega[limb_idx] = mul_mod_u64_host(inv_root, inv_root, modulus);
 
             const auto &buffer = mat->shared_limb_buffers[limb_id.x];
             if (buffer.words_per_poly < static_cast<size_t>(n))
             {
                 return set_error("invalid words_per_poly in run_matrix_transform_u64");
             }
+            limb_strides[limb_idx] = buffer.words_per_poly;
 
             uint64_t *base = matrix_limb_ptr_by_id(mat, 0, limb_id);
             if (!base)
             {
                 return set_error("null matrix limb pointer in run_matrix_transform_u64");
             }
+            limb_bases[limb_idx] = base;
+        }
 
-            status = run_limb_ntt_transform(
-                base,
-                buffer.words_per_poly,
-                n,
-                log_n,
-                poly_count,
-                modulus,
-                n_inv,
-                root,
-                inv_root,
-                stream,
-                Forward);
-            if (status != 0)
-            {
-                return status;
-            }
-            status = matrix_record_limb_write(mat, limb_id, stream);
+        for (const dim3 &limb_id : active_limb_ids)
+        {
+            status = matrix_wait_limb_stream(mat, limb_id, dispatch_device, dispatch_stream);
             if (status != 0)
             {
                 return status;
             }
         }
 
+        const size_t ptr_bytes = limb_count * sizeof(uint64_t *);
+        const size_t stride_bytes = limb_count * sizeof(size_t);
+        const size_t scalar_bytes = limb_count * sizeof(uint64_t);
+        uint64_t **limb_bases_device = nullptr;
+        size_t *limb_strides_device = nullptr;
+        uint64_t *limb_moduli_device = nullptr;
+        uint64_t *limb_twists_device = nullptr;
+        uint64_t *limb_scales_device = nullptr;
+        uint64_t *limb_wlens_device = nullptr;
+        auto cleanup = [&]()
+        {
+            if (dispatch_device >= 0)
+            {
+                cudaSetDevice(dispatch_device);
+            }
+            if (limb_bases_device)
+            {
+                cudaFreeAsync(limb_bases_device, dispatch_stream);
+                limb_bases_device = nullptr;
+            }
+            if (limb_strides_device)
+            {
+                cudaFreeAsync(limb_strides_device, dispatch_stream);
+                limb_strides_device = nullptr;
+            }
+            if (limb_moduli_device)
+            {
+                cudaFreeAsync(limb_moduli_device, dispatch_stream);
+                limb_moduli_device = nullptr;
+            }
+            if (limb_twists_device)
+            {
+                cudaFreeAsync(limb_twists_device, dispatch_stream);
+                limb_twists_device = nullptr;
+            }
+            if (limb_scales_device)
+            {
+                cudaFreeAsync(limb_scales_device, dispatch_stream);
+                limb_scales_device = nullptr;
+            }
+            if (limb_wlens_device)
+            {
+                cudaFreeAsync(limb_wlens_device, dispatch_stream);
+                limb_wlens_device = nullptr;
+            }
+        };
+
+        cudaError_t err = cudaSetDevice(dispatch_device);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMallocAsync(reinterpret_cast<void **>(&limb_bases_device), ptr_bytes, dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMallocAsync(reinterpret_cast<void **>(&limb_strides_device), stride_bytes, dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMallocAsync(reinterpret_cast<void **>(&limb_moduli_device), scalar_bytes, dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMallocAsync(reinterpret_cast<void **>(&limb_twists_device), scalar_bytes, dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMallocAsync(reinterpret_cast<void **>(&limb_scales_device), scalar_bytes, dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMallocAsync(reinterpret_cast<void **>(&limb_wlens_device), scalar_bytes, dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+
+        err = cudaMemcpyAsync(
+            limb_bases_device,
+            limb_bases.data(),
+            ptr_bytes,
+            cudaMemcpyHostToDevice,
+            dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(
+            limb_strides_device,
+            limb_strides.data(),
+            stride_bytes,
+            cudaMemcpyHostToDevice,
+            dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(
+            limb_moduli_device,
+            limb_moduli.data(),
+            scalar_bytes,
+            cudaMemcpyHostToDevice,
+            dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        if constexpr (Forward)
+        {
+            err = cudaMemcpyAsync(
+                limb_twists_device,
+                limb_root.data(),
+                scalar_bytes,
+                cudaMemcpyHostToDevice,
+                dispatch_stream);
+            if (err != cudaSuccess)
+            {
+                cleanup();
+                return set_error(err);
+            }
+        }
+        else
+        {
+            err = cudaMemcpyAsync(
+                limb_twists_device,
+                limb_inv_root.data(),
+                scalar_bytes,
+                cudaMemcpyHostToDevice,
+                dispatch_stream);
+            if (err != cudaSuccess)
+            {
+                cleanup();
+                return set_error(err);
+            }
+            err = cudaMemcpyAsync(
+                limb_scales_device,
+                limb_n_inv.data(),
+                scalar_bytes,
+                cudaMemcpyHostToDevice,
+                dispatch_stream);
+            if (err != cudaSuccess)
+            {
+                cleanup();
+                return set_error(err);
+            }
+        }
+
+        if constexpr (Forward)
+        {
+            status = launch_twist_for_all_limbs(
+                limb_bases_device,
+                limb_strides_device,
+                limb_twists_device,
+                limb_moduli_device,
+                limb_count,
+                n,
+                poly_count,
+                dispatch_stream);
+            if (status != 0)
+            {
+                cleanup();
+                return status;
+            }
+            status = launch_bit_reverse_for_all_limbs(
+                limb_bases_device,
+                limb_strides_device,
+                limb_count,
+                n,
+                log_n,
+                poly_count,
+                dispatch_stream);
+            if (status != 0)
+            {
+                cleanup();
+                return status;
+            }
+            for (uint32_t len = 2; len <= n; len <<= 1)
+            {
+                const uint32_t exp = n / len;
+                for (size_t idx = 0; idx < limb_count; ++idx)
+                {
+                    limb_wlens[idx] = pow_mod_u64_host(limb_omega[idx], exp, limb_moduli[idx]);
+                }
+                err = cudaMemcpyAsync(
+                    limb_wlens_device,
+                    limb_wlens.data(),
+                    scalar_bytes,
+                    cudaMemcpyHostToDevice,
+                    dispatch_stream);
+                if (err != cudaSuccess)
+                {
+                    cleanup();
+                    return set_error(err);
+                }
+                status = launch_stage_for_all_limbs(
+                    limb_bases_device,
+                    limb_strides_device,
+                    limb_wlens_device,
+                    limb_moduli_device,
+                    limb_count,
+                    n,
+                    len,
+                    poly_count,
+                    dispatch_stream);
+                if (status != 0)
+                {
+                    cleanup();
+                    return status;
+                }
+            }
+        }
+        else
+        {
+            status = launch_bit_reverse_for_all_limbs(
+                limb_bases_device,
+                limb_strides_device,
+                limb_count,
+                n,
+                log_n,
+                poly_count,
+                dispatch_stream);
+            if (status != 0)
+            {
+                cleanup();
+                return status;
+            }
+            for (uint32_t len = 2; len <= n; len <<= 1)
+            {
+                const uint32_t exp = n / len;
+                for (size_t idx = 0; idx < limb_count; ++idx)
+                {
+                    limb_wlens[idx] = pow_mod_u64_host(limb_inv_omega[idx], exp, limb_moduli[idx]);
+                }
+                err = cudaMemcpyAsync(
+                    limb_wlens_device,
+                    limb_wlens.data(),
+                    scalar_bytes,
+                    cudaMemcpyHostToDevice,
+                    dispatch_stream);
+                if (err != cudaSuccess)
+                {
+                    cleanup();
+                    return set_error(err);
+                }
+                status = launch_stage_for_all_limbs(
+                    limb_bases_device,
+                    limb_strides_device,
+                    limb_wlens_device,
+                    limb_moduli_device,
+                    limb_count,
+                    n,
+                    len,
+                    poly_count,
+                    dispatch_stream);
+                if (status != 0)
+                {
+                    cleanup();
+                    return status;
+                }
+            }
+            status = launch_scale_for_all_limbs(
+                limb_bases_device,
+                limb_strides_device,
+                limb_scales_device,
+                limb_moduli_device,
+                limb_count,
+                n,
+                poly_count,
+                dispatch_stream);
+            if (status != 0)
+            {
+                cleanup();
+                return status;
+            }
+            status = launch_twist_for_all_limbs(
+                limb_bases_device,
+                limb_strides_device,
+                limb_twists_device,
+                limb_moduli_device,
+                limb_count,
+                n,
+                poly_count,
+                dispatch_stream);
+            if (status != 0)
+            {
+                cleanup();
+                return status;
+            }
+        }
+
+        for (const dim3 &limb_id : active_limb_ids)
+        {
+            status = matrix_record_limb_write(mat, limb_id, dispatch_stream);
+            if (status != 0)
+            {
+                cleanup();
+                return status;
+            }
+        }
+
         mat->format = Forward ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
+        cleanup();
         return 0;
     }
 }

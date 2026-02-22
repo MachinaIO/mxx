@@ -130,10 +130,37 @@ pub trait PolyMatrix:
     fn transpose(&self) -> Self;
     /// (m * n1), (m * n2) -> (m * (n1 + n2))
     fn concat_columns(&self, others: &[&Self]) -> Self;
+    /// Owned variant of `concat_columns` that can consume the first/other inputs.
+    /// Implementations may override this to avoid unnecessary deep clone of `self`.
+    fn concat_columns_owned(self, others: Vec<Self>) -> Self {
+        if others.is_empty() {
+            return self;
+        }
+        let refs = others.iter().collect::<Vec<_>>();
+        self.concat_columns(&refs)
+    }
     /// (m1 * n), (m2 * n) -> ((m1 + m2) * n)
     fn concat_rows(&self, others: &[&Self]) -> Self;
+    /// Owned variant of `concat_rows` that can consume the first/other inputs.
+    /// Implementations may override this to avoid unnecessary deep clone of `self`.
+    fn concat_rows_owned(self, others: Vec<Self>) -> Self {
+        if others.is_empty() {
+            return self;
+        }
+        let refs = others.iter().collect::<Vec<_>>();
+        self.concat_rows(&refs)
+    }
     /// (m1 * n1), (m2 * n2) -> ((m1 + m2) * (n1 + n2))
     fn concat_diag(&self, others: &[&Self]) -> Self;
+    /// Owned variant of `concat_diag` that can consume the first/other inputs.
+    /// Implementations may override this to avoid unnecessary deep clone of `self`.
+    fn concat_diag_owned(self, others: Vec<Self>) -> Self {
+        if others.is_empty() {
+            return self;
+        }
+        let refs = others.iter().collect::<Vec<_>>();
+        self.concat_diag(&refs)
+    }
     fn tensor(&self, other: &Self) -> Self;
     fn unit_column_vector(params: &<Self::P as Poly>::Params, size: usize, index: usize) -> Self {
         let mut vec = vec![Self::P::const_zero(params); size];
@@ -162,11 +189,17 @@ pub trait PolyMatrix:
     /// where k = ceil(crt_bits / base_bits) and b = 2^{base_bits}.
     fn small_gadget_matrix(params: &<Self::P as Poly>::Params, size: usize) -> Self;
     fn decompose(&self) -> Self;
+    fn decompose_owned(self) -> Self {
+        self.decompose()
+    }
     /// Returns a compact decomposition matrix D such that
     /// small_gadget_matrix(size) * D == self
     /// under the assumption that coefficients are bounded by min(moduli)
     /// (i.e., the matrix norm is strictly less than the smallest CRT modulus).
     fn small_decompose(&self) -> Self;
+    fn small_decompose_owned(self) -> Self {
+        self.small_decompose()
+    }
     fn modulus_switch(
         &self,
         new_modulus: &<<Self::P as Poly>::Params as PolyParams>::Modulus,

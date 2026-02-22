@@ -145,7 +145,7 @@ unsafe extern "C" {
         out: *mut GpuMatrixOpaque,
     ) -> c_int;
     pub(crate) fn gpu_matrix_gauss_samp_gq_arb_base(
-        src: *const GpuMatrixOpaque,
+        src: *mut GpuMatrixOpaque,
         base_bits: u32,
         c: f64,
         dgg_stddev: f64,

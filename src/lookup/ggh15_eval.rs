@@ -206,8 +206,9 @@ where
                     lut_id, idx
                 );
                 let gy = gadget_matrix.clone() * y_poly;
-                let w_gy = w_block_gy.mul_decompose(&gy);
+                let gy_decomposed = gy.decompose();
                 drop(gy);
+                let w_gy = w_block_gy.clone() * gy_decomposed;
                 w_t_idx.add_in_place(&w_gy);
                 debug!(
                     "Constructed w_block_gy contribution for LUT preimage: lut_id={}, row_idx={}",
@@ -381,6 +382,7 @@ where
 
     fn checkpoint_has_index(
         checkpoint_index: Option<&GlobalTableIndex>,
+        part_index_cache: Option<&HashMap<String, HashSet<usize>>>,
         id_prefix: &str,
         target_k: usize,
     ) -> bool {
@@ -389,18 +391,80 @@ where
         {
             return true;
         }
+        part_index_cache
+            .and_then(|cache| cache.get(id_prefix))
+            .is_some_and(|indices| indices.contains(&target_k))
+    }
+
+    fn strip_part_suffix(key: &str) -> &str {
+        if let Some((base, part)) = key.rsplit_once("_part") &&
+            !part.is_empty() &&
+            part.bytes().all(|c| c.is_ascii_digit())
+        {
+            base
+        } else {
+            key
+        }
+    }
+
+    fn build_part_index_cache(
+        checkpoint_index: Option<&GlobalTableIndex>,
+    ) -> Option<HashMap<String, HashSet<usize>>> {
+        let checkpoint_index = checkpoint_index?;
+        let mut cache: HashMap<String, HashSet<usize>> = HashMap::new();
+        for (key, entry) in &checkpoint_index.entries {
+            if let Some((base, part)) = key.rsplit_once("_part") &&
+                !part.is_empty() &&
+                part.bytes().all(|c| c.is_ascii_digit())
+            {
+                cache.entry(base.to_string()).or_default().extend(entry.indices.iter().copied());
+            }
+        }
+        Some(cache)
+    }
+
+    fn collect_lut_completed_rows(
+        checkpoint_index: Option<&GlobalTableIndex>,
+        checkpoint_prefix: &str,
+        lut_ids: &[usize],
+    ) -> HashMap<usize, HashSet<usize>> {
         let Some(checkpoint_index) = checkpoint_index else {
-            return false;
+            return HashMap::new();
         };
-        let part_prefix = format!("{id_prefix}_part");
-        checkpoint_index
-            .entries
-            .iter()
-            .any(|(key, entry)| key.starts_with(&part_prefix) && entry.indices.contains(&target_k))
+        if lut_ids.is_empty() {
+            return HashMap::new();
+        }
+        let target_lut_ids: HashSet<usize> = lut_ids.iter().copied().collect();
+        let lut_aux_prefix = format!("{checkpoint_prefix}_lut_aux_");
+        let mut completed_rows: HashMap<usize, HashSet<usize>> = HashMap::new();
+        for (raw_key, entry) in &checkpoint_index.entries {
+            if !entry.indices.contains(&0) {
+                continue;
+            }
+            let key = Self::strip_part_suffix(raw_key);
+            let Some(rest) = key.strip_prefix(&lut_aux_prefix) else {
+                continue;
+            };
+            let Some((lut_id_str, row_idx_str)) = rest.split_once("_idx") else {
+                continue;
+            };
+            let Ok(lut_id) = lut_id_str.parse::<usize>() else {
+                continue;
+            };
+            if !target_lut_ids.contains(&lut_id) {
+                continue;
+            }
+            let Ok(row_idx) = row_idx_str.parse::<usize>() else {
+                continue;
+            };
+            completed_rows.entry(lut_id).or_default().insert(row_idx);
+        }
+        completed_rows
     }
 
     fn gate_checkpoint_complete(
         checkpoint_index: Option<&GlobalTableIndex>,
+        part_index_cache: Option<&HashMap<String, HashSet<usize>>>,
         checkpoint_prefix: &str,
         gate_id: GateId,
         gate_chunk_count: usize,
@@ -411,14 +475,29 @@ where
         let gate2_gy_prefix = format!("{checkpoint_prefix}_preimage_gate2_gy_{}", gate_id);
         let gate2_v_prefix = format!("{checkpoint_prefix}_preimage_gate2_v_{}", gate_id);
         let gate2_vx_prefix = format!("{checkpoint_prefix}_preimage_gate2_vx_{}", gate_id);
-        Self::checkpoint_has_index(checkpoint_index, &gate1_prefix, 0) &&
-            Self::checkpoint_has_index(checkpoint_index, &gate2_identity_prefix, 0) &&
-            Self::checkpoint_has_index(checkpoint_index, &gate2_gy_prefix, 0) &&
+        Self::checkpoint_has_index(checkpoint_index, part_index_cache, &gate1_prefix, 0) &&
+            Self::checkpoint_has_index(
+                checkpoint_index,
+                part_index_cache,
+                &gate2_identity_prefix,
+                0,
+            ) &&
+            Self::checkpoint_has_index(checkpoint_index, part_index_cache, &gate2_gy_prefix, 0) &&
             (0..gate_chunk_count).into_par_iter().all(|chunk_idx| {
-                Self::checkpoint_has_index(checkpoint_index, &gate2_v_prefix, chunk_idx)
+                Self::checkpoint_has_index(
+                    checkpoint_index,
+                    part_index_cache,
+                    &gate2_v_prefix,
+                    chunk_idx,
+                )
             }) &&
             (0..gate_chunk_count).into_par_iter().all(|chunk_idx| {
-                Self::checkpoint_has_index(checkpoint_index, &gate2_vx_prefix, chunk_idx)
+                Self::checkpoint_has_index(
+                    checkpoint_index,
+                    part_index_cache,
+                    &gate2_vx_prefix,
+                    chunk_idx,
+                )
             })
     }
 
@@ -432,24 +511,131 @@ where
         let Some(checkpoint_index) = checkpoint_index else {
             return false;
         };
-        let has_lut_resume = lut_ids.par_iter().any(|lut_id| {
-            let lut_aux_prefix = format!("{checkpoint_prefix}_lut_aux_{}", lut_id);
-            let lut_aux_row_prefix = format!("{lut_aux_prefix}_idx");
-            checkpoint_index.entries.iter().any(|(key, entry)| {
-                key.starts_with(&lut_aux_row_prefix) && entry.indices.contains(&0)
-            })
-        });
-        if has_lut_resume {
-            return true;
+
+        #[derive(Default)]
+        struct GateResumeState {
+            gate1: bool,
+            gate2_identity: bool,
+            gate2_gy: bool,
+            gate2_v_chunks: HashSet<usize>,
+            gate2_vx_chunks: HashSet<usize>,
         }
-        gate_ids.par_iter().any(|gate_id| {
-            Self::gate_checkpoint_complete(
-                Some(checkpoint_index),
-                checkpoint_prefix,
-                *gate_id,
-                gate_chunk_count,
-            )
-        })
+
+        impl GateResumeState {
+            fn is_complete(&self, gate_chunk_count: usize) -> bool {
+                self.gate1 &&
+                    self.gate2_identity &&
+                    self.gate2_gy &&
+                    self.gate2_v_chunks.len() == gate_chunk_count &&
+                    self.gate2_vx_chunks.len() == gate_chunk_count
+            }
+        }
+
+        let target_lut_ids: HashSet<usize> = lut_ids.iter().copied().collect();
+        let target_gate_ids: HashSet<GateId> = gate_ids.iter().copied().collect();
+        let lut_aux_prefix = format!("{checkpoint_prefix}_lut_aux_");
+        let gate1_prefix = format!("{checkpoint_prefix}_preimage_gate1_");
+        let gate2_identity_prefix = format!("{checkpoint_prefix}_preimage_gate2_identity_");
+        let gate2_gy_prefix = format!("{checkpoint_prefix}_preimage_gate2_gy_");
+        let gate2_v_prefix = format!("{checkpoint_prefix}_preimage_gate2_v_");
+        let gate2_vx_prefix = format!("{checkpoint_prefix}_preimage_gate2_vx_");
+
+        let mut gate_states: HashMap<GateId, GateResumeState> = HashMap::new();
+        for (raw_key, entry) in &checkpoint_index.entries {
+            let key = Self::strip_part_suffix(raw_key);
+
+            if let Some(rest) = key.strip_prefix(&lut_aux_prefix) &&
+                let Some((lut_id_str, _)) = rest.split_once("_idx") &&
+                let Ok(lut_id) = lut_id_str.parse::<usize>() &&
+                target_lut_ids.contains(&lut_id) &&
+                entry.indices.contains(&0)
+            {
+                return true;
+            }
+
+            if let Some(gate_id_str) = key.strip_prefix(&gate1_prefix) &&
+                let Ok(gate_id_raw) = gate_id_str.parse::<usize>() &&
+                target_gate_ids.contains(&GateId(gate_id_raw)) &&
+                entry.indices.contains(&0)
+            {
+                let gate_id = GateId(gate_id_raw);
+                let state = gate_states.entry(gate_id).or_default();
+                state.gate1 = true;
+                if state.is_complete(gate_chunk_count) {
+                    return true;
+                }
+                continue;
+            }
+
+            if let Some(gate_id_str) = key.strip_prefix(&gate2_identity_prefix) &&
+                let Ok(gate_id_raw) = gate_id_str.parse::<usize>() &&
+                target_gate_ids.contains(&GateId(gate_id_raw)) &&
+                entry.indices.contains(&0)
+            {
+                let gate_id = GateId(gate_id_raw);
+                let state = gate_states.entry(gate_id).or_default();
+                state.gate2_identity = true;
+                if state.is_complete(gate_chunk_count) {
+                    return true;
+                }
+                continue;
+            }
+
+            if let Some(gate_id_str) = key.strip_prefix(&gate2_gy_prefix) &&
+                let Ok(gate_id_raw) = gate_id_str.parse::<usize>() &&
+                target_gate_ids.contains(&GateId(gate_id_raw)) &&
+                entry.indices.contains(&0)
+            {
+                let gate_id = GateId(gate_id_raw);
+                let state = gate_states.entry(gate_id).or_default();
+                state.gate2_gy = true;
+                if state.is_complete(gate_chunk_count) {
+                    return true;
+                }
+                continue;
+            }
+
+            if let Some(gate_id_str) = key.strip_prefix(&gate2_v_prefix) &&
+                let Ok(gate_id_raw) = gate_id_str.parse::<usize>() &&
+                target_gate_ids.contains(&GateId(gate_id_raw))
+            {
+                let gate_id = GateId(gate_id_raw);
+                let state = gate_states.entry(gate_id).or_default();
+                entry
+                    .indices
+                    .iter()
+                    .copied()
+                    .filter(|chunk_idx| *chunk_idx < gate_chunk_count)
+                    .for_each(|chunk_idx| {
+                        state.gate2_v_chunks.insert(chunk_idx);
+                    });
+                if state.is_complete(gate_chunk_count) {
+                    return true;
+                }
+                continue;
+            }
+
+            if let Some(gate_id_str) = key.strip_prefix(&gate2_vx_prefix) &&
+                let Ok(gate_id_raw) = gate_id_str.parse::<usize>() &&
+                target_gate_ids.contains(&GateId(gate_id_raw))
+            {
+                let gate_id = GateId(gate_id_raw);
+                let state = gate_states.entry(gate_id).or_default();
+                entry
+                    .indices
+                    .iter()
+                    .copied()
+                    .filter(|chunk_idx| *chunk_idx < gate_chunk_count)
+                    .for_each(|chunk_idx| {
+                        state.gate2_vx_chunks.insert(chunk_idx);
+                    });
+                if state.is_complete(gate_chunk_count) {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     fn load_b1_checkpoint(
@@ -660,6 +846,7 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
             self.dir_path.display(),
             checkpoint_prefix
         );
+        let checkpoint_part_index_cache = Self::build_part_index_cache(checkpoint_index_for_resume);
 
         if let Some((b0_matrix_for_save, b0_trapdoor_bytes)) = persist_b0_checkpoint {
             let b0_id_prefix = format!("{checkpoint_prefix}_b0");
@@ -690,28 +877,24 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
 
         // Checkpoint verification phase.
         let mut processed_lut_rows = 0usize;
+        let completed_lut_rows_by_id = Self::collect_lut_completed_rows(
+            checkpoint_index_for_resume,
+            &checkpoint_prefix,
+            &lut_ids,
+        );
         let lut_plans_with_prefix = lut_entries
             .into_par_iter()
             .map(|(lut_id, plt)| {
                 let lut_aux_prefix = self.lut_aux_id_prefix(params, lut_id);
-                let completed_rows: HashSet<usize> = plt
-                    .entries(params)
-                    .map(|(_, (idx, _))| idx)
-                    .collect::<Vec<_>>()
-                    .into_par_iter()
-                    .filter_map(|idx| {
-                        let lut_aux_row_id = format!("{lut_aux_prefix}_idx{idx}");
-                        if Self::checkpoint_has_index(
-                            checkpoint_index_for_resume,
-                            &lut_aux_row_id,
-                            0,
-                        ) {
-                            Some(idx)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
+                let completed_rows: HashSet<usize> =
+                    if let Some(index_rows) = completed_lut_rows_by_id.get(&lut_id) {
+                        plt.entries(params)
+                            .map(|(_, (idx, _))| idx)
+                            .filter(|idx| index_rows.contains(idx))
+                            .collect()
+                    } else {
+                        HashSet::new()
+                    };
                 let resumed_rows_for_lut = completed_rows.len();
                 (lut_id, plt, completed_rows, resumed_rows_for_lut, lut_aux_prefix)
             })
@@ -744,6 +927,7 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                 |(mut resumed, mut grouped), (gate_id, state)| {
                     if Self::gate_checkpoint_complete(
                         checkpoint_index_for_resume,
+                        checkpoint_part_index_cache.as_ref(),
                         &checkpoint_prefix,
                         gate_id,
                         gate_chunk_count,
@@ -1026,7 +1210,8 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                                 u_g_matrix.row_size(),
                                 u_g_matrix.col_size()
                             );
-                            let taget_high_v = - input_matrix.mul_decompose(&u_g_matrix);
+                            let u_g_decomposed = u_g_matrix.decompose();
+                            let taget_high_v = - input_matrix * u_g_decomposed;
                             let target_gate2_v = taget_high_v.concat_rows(&[&w_block_v]);
                             drop(taget_high_v);
                             let preimage_gate2_v = trap_sampler.preimage(
@@ -1248,8 +1433,9 @@ where
             "preimage_gate2_gy must have m_g columns"
         );
         let gy = M::gadget_matrix(params, d) * y.clone();
-        c_const = c_const + (sg_times_b1.clone() * preimage_gate2_gy).mul_decompose(&gy);
+        let gy_decomposed = gy.decompose();
         drop(gy);
+        c_const = c_const + sg_times_b1.clone() * preimage_gate2_gy * gy_decomposed;
 
         let v_idx = derive_lut_v_idx_from_hash::<M, HS>(params, self.hash_key, lut_id, k, d);
         let preimage_gate2_v = read_matrix_from_multi_batch::<M>(
@@ -1304,9 +1490,10 @@ where
             u_g.col_size()
         );
 
-        let c_x_randomized = input.vector.clone().mul_decompose(&u_g) * v_idx;
-        debug!("Computed c_x_randomized for gate encoding: gate_id={}, lut_id={}", gate_id, lut_id);
+        let u_g_decomposed = u_g.decompose();
         drop(u_g);
+        let c_x_randomized = input.vector.clone() * u_g_decomposed * v_idx;
+        debug!("Computed c_x_randomized for gate encoding: gate_id={}, lut_id={}", gate_id, lut_id);
         let c_out = c_const + c_x_randomized;
         debug!("Computed c_out for gate encoding: gate_id={}, lut_id={}", gate_id, lut_id);
         let out_pubkey = BggPublicKey {

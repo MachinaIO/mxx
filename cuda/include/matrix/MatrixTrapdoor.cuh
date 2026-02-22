@@ -49,7 +49,7 @@ extern "C"
 #endif
 
     int gpu_matrix_gauss_samp_gq_arb_base(
-        const GpuMatrix *src,
+        GpuMatrix *src,
         uint32_t base_bits,
         double c,
         double dgg_stddev,

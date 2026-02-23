@@ -898,14 +898,14 @@ where
                 let u_g_decomposed = u_g_matrix.decompose();
                 let target_high_v = -(input_matrix * u_g_decomposed);
                 let target_gate2_v = target_high_v.concat_rows(&[&shared.w_block_v]);
-                (entry_pos, gate_id, u_g_matrix, target_gate2_v)
+                (entry_pos, gate_id, target_gate2_v)
             })
             .collect::<Vec<_>>();
         let mut stage5_inputs = Vec::with_capacity(stage4_entries.len());
         let mut stage4_requests = Vec::with_capacity(stage4_entries.len());
-        for (entry_pos, gate_id, u_g_matrix, target) in stage4_entries {
+        for (entry_pos, gate_id, target) in stage4_entries {
             let shared = &shared[entry_pos];
-            stage5_inputs.push((entry_pos, gate_id, u_g_matrix));
+            stage5_inputs.push((entry_pos, gate_id));
             stage4_requests.push(GpuPreimageRequest {
                 entry_idx: entry_pos,
                 params: shared.params,
@@ -921,7 +921,7 @@ where
             .collect::<HashMap<usize, M>>();
         let stage4_jobs = stage5_inputs
             .iter()
-            .map(|(entry_pos, gate_id, _)| {
+            .map(|(entry_pos, gate_id)| {
                 let preimage_gate2_v = stage4_preimages.remove(entry_pos).unwrap_or_else(|| {
                     panic!("missing gate stage4 preimage for entry_pos={entry_pos}")
                 });
@@ -936,10 +936,19 @@ where
 
         let stage5_requests = stage5_inputs
             .iter()
-            .map(|(entry_pos, _, u_g_matrix)| {
+            .map(|(entry_pos, gate_id)| {
                 let shared = &shared[*entry_pos];
+                let hash_sampler = HS::new();
+                let u_g_matrix = hash_sampler.sample_hash(
+                    shared.params,
+                    self.hash_key,
+                    format!("ggh15_lut_u_g_matrix_{}", gate_id),
+                    d,
+                    m_g,
+                    DistType::FinRingDist,
+                );
                 let small_gadget_matrix = M::small_gadget_matrix(shared.params, m_g);
-                let target_high_vx = u_g_matrix.clone() * &small_gadget_matrix;
+                let target_high_vx = u_g_matrix * &small_gadget_matrix;
                 let target_gate2_vx = target_high_vx.concat_rows(&[&shared.w_block_vx]);
                 GpuPreimageRequest {
                     entry_idx: *entry_pos,
@@ -956,7 +965,7 @@ where
             .collect::<HashMap<usize, M>>();
         let stage5_jobs = stage5_inputs
             .iter()
-            .map(|(entry_pos, gate_id, _)| {
+            .map(|(entry_pos, gate_id)| {
                 let preimage_gate2_vx = stage5_preimages.remove(entry_pos).unwrap_or_else(|| {
                     panic!("missing gate stage5 preimage for entry_pos={entry_pos}")
                 });
@@ -1179,20 +1188,20 @@ where
                 let u_g_decomposed = u_g_matrix.decompose();
                 let target_high_v = -(input_matrix * u_g_decomposed);
                 let target_gate2_v = target_high_v.concat_rows(&[w_block_v]);
-                (gate_id, u_g_matrix, target_gate2_v)
+                (gate_id, target_gate2_v)
             })
             .collect::<Vec<_>>();
-        let stage4_target_cols = stage4_entries[0].2.col_size();
+        let stage4_target_cols = stage4_entries[0].1.col_size();
         debug_assert!(
-            stage4_entries.iter().all(|(_, _, target)| target.col_size() == stage4_target_cols),
+            stage4_entries.iter().all(|(_, target)| target.col_size() == stage4_target_cols),
             "stage4 target columns must be identical across gates"
         );
         let mut stage4_gate_ids = Vec::with_capacity(stage4_entries.len());
         let mut stage5_inputs = Vec::with_capacity(stage4_entries.len());
         let mut stage4_targets = Vec::with_capacity(stage4_entries.len());
-        for (gate_id, u_g_matrix, target) in stage4_entries {
+        for (gate_id, target) in stage4_entries {
             stage4_gate_ids.push(gate_id);
-            stage5_inputs.push((gate_id, u_g_matrix));
+            stage5_inputs.push(gate_id);
             stage4_targets.push(target);
         }
         let stage4_batched_target = if stage4_targets.len() == 1 {
@@ -1228,7 +1237,16 @@ where
         let small_gadget_matrix = M::small_gadget_matrix(params, m_g);
         let stage5_entries = stage5_inputs
             .into_par_iter()
-            .map(|(gate_id, u_g_matrix)| {
+            .map(|gate_id| {
+                let hash_sampler = HS::new();
+                let u_g_matrix = hash_sampler.sample_hash(
+                    params,
+                    self.hash_key,
+                    format!("ggh15_lut_u_g_matrix_{}", gate_id),
+                    d,
+                    m_g,
+                    DistType::FinRingDist,
+                );
                 let target_high_vx = u_g_matrix * &small_gadget_matrix;
                 let target_gate2_vx = target_high_vx.concat_rows(&[w_block_vx]);
                 drop(target_high_vx);

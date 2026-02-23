@@ -92,6 +92,43 @@ pub trait PolyTrapdoorSampler {
         target: &Self::M,
     ) -> Self::M;
 
+    #[cfg(feature = "gpu")]
+    fn gpu_device_ids(&self, _params: &<<Self::M as PolyMatrix>::P as Poly>::Params) -> Vec<i32> {
+        vec![0]
+    }
+
+    #[cfg(feature = "gpu")]
+    fn gpu_params_for_device(
+        &self,
+        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
+        _device_id: i32,
+    ) -> <<Self::M as PolyMatrix>::P as Poly>::Params {
+        params.clone()
+    }
+
+    #[cfg(feature = "gpu")]
+    fn preimage_batched_sharded<'a>(
+        &self,
+        requests: Vec<crate::sampler::trapdoor::GpuPreimageRequest<'a, Self::M, Self::Trapdoor>>,
+    ) -> Vec<(usize, Self::M)>
+    where
+        Self::Trapdoor: Send + Sync + 'a,
+        Self::M: 'a,
+    {
+        requests
+            .into_iter()
+            .map(|request| {
+                let out = self.preimage(
+                    request.params,
+                    request.trapdoor,
+                    request.public_matrix,
+                    &request.target,
+                );
+                (request.entry_idx, out)
+            })
+            .collect()
+    }
+
     // Given a trapdoor of B, an extension matrix C, a target matrix U, return a preimage D s.t.
     // [B,C]D = U.
     fn preimage_extend(

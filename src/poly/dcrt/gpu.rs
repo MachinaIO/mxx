@@ -252,6 +252,11 @@ fn available_gpu_ids() -> Vec<i32> {
     (0..count).map(|idx| idx as i32).collect()
 }
 
+#[cfg(feature = "gpu")]
+pub fn detected_gpu_device_count() -> usize {
+    available_gpu_ids().len()
+}
+
 fn pinned_alloc<T>(len: usize) -> NonNull<T> {
     if len == 0 {
         return NonNull::dangling();
@@ -467,6 +472,10 @@ impl GpuDCRTPolyParams {
 
     pub fn moduli(&self) -> &[u64] {
         &self.moduli
+    }
+
+    pub fn gpu_ids(&self) -> &[i32] {
+        &self.gpu_ids
     }
 
     pub fn batch(&self) -> u32 {

@@ -1,3 +1,8 @@
+#[cfg(feature = "gpu")]
+fn default_gpu_parallelism() -> usize {
+    crate::poly::dcrt::gpu::detected_gpu_device_count().max(1)
+}
+
 /// Environment variable helpers for runtime configuration.
 
 /// `MXX_CIRCUIT_PARALLEL_GATES`: max number of gates processed in parallel per level.
@@ -9,21 +14,38 @@ pub fn circuit_parallel_gates() -> Option<usize> {
         .filter(|n| *n > 0)
 }
 
-/// `LUT_PREIMAGE_CHUNK_SIZE`: number of LUT/gate preimages per batch (default: 80).
+/// `LUT_PREIMAGE_CHUNK_SIZE`: number of LUT/gate preimages per batch.
+/// Default: GPU feature enabled => detected GPU device count, otherwise 30.
 pub fn lut_preimage_chunk_size() -> usize {
-    std::env::var("LUT_PREIMAGE_CHUNK_SIZE")
+    let parsed = std::env::var("LUT_PREIMAGE_CHUNK_SIZE")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(30)
+        .filter(|n| *n > 0);
+    #[cfg(feature = "gpu")]
+    {
+        parsed.unwrap_or_else(default_gpu_parallelism)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        parsed.unwrap_or(30)
+    }
 }
 
-/// `GGH15_GATE_PARALLELISM`: max number of gate preimages to process in parallel (default: 1).
+/// `GGH15_GATE_PARALLELISM`: max number of gate preimages to process in parallel.
+/// Default: GPU feature enabled => detected GPU device count, otherwise 30.
 pub fn ggh15_gate_parallelism() -> usize {
-    std::env::var("GGH15_GATE_PARALLELISM")
+    let parsed = std::env::var("GGH15_GATE_PARALLELISM")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(30)
+        .filter(|n| *n > 0);
+    #[cfg(feature = "gpu")]
+    {
+        parsed.unwrap_or_else(default_gpu_parallelism)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        parsed.unwrap_or(30)
+    }
 }
 
 /// `BLOCK_SIZE`: generic processing block size used in utilities (default: 100).

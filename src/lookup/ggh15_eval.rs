@@ -1,3 +1,5 @@
+#[cfg(feature = "gpu")]
+use crate::sampler::trapdoor::GpuPreimageRequest;
 use crate::{
     bgg::{encoding::BggEncoding, public_key::BggPublicKey},
     circuit::{evaluable::Evaluable, gate::GateId},
@@ -63,6 +65,71 @@ where
         }
         add_lookup_buffer(get_lookup_buffer_bytes(payloads, &self.id_prefix));
     }
+}
+
+#[cfg(feature = "gpu")]
+struct GpuLutBaseDeviceShared<M, T>
+where
+    M: PolyMatrix,
+    T: Send + Sync,
+{
+    device_id: i32,
+    params: <<M as PolyMatrix>::P as Poly>::Params,
+    trapdoor: T,
+    b1_matrix: M,
+}
+
+#[cfg(feature = "gpu")]
+struct GpuLutDeviceShared<'a, M, T>
+where
+    M: PolyMatrix,
+    T: Send + Sync,
+{
+    device_id: i32,
+    params: &'a <<M as PolyMatrix>::P as Poly>::Params,
+    trapdoor: &'a T,
+    b1_matrix: &'a M,
+    w_block_identity: M,
+    w_block_gy: M,
+    w_block_v: M,
+    w_block_vx: M,
+    gadget_matrix: M,
+}
+
+#[cfg(feature = "gpu")]
+struct GpuGateBaseDeviceShared<M, T>
+where
+    M: PolyMatrix,
+    T: Send + Sync,
+{
+    device_id: i32,
+    params: <<M as PolyMatrix>::P as Poly>::Params,
+    b0_trapdoor: T,
+    b0_matrix: M,
+    b1_trapdoor: T,
+    b1_matrix: M,
+    gadget_matrix: M,
+    small_gadget_matrix: M,
+}
+
+#[cfg(feature = "gpu")]
+struct GpuGateDeviceShared<'a, M, T>
+where
+    M: PolyMatrix,
+    T: Send + Sync,
+{
+    device_id: i32,
+    params: &'a <<M as PolyMatrix>::P as Poly>::Params,
+    b0_trapdoor: &'a T,
+    b0_matrix: &'a M,
+    b1_trapdoor: &'a T,
+    b1_matrix: &'a M,
+    w_block_identity: M,
+    w_block_gy: M,
+    w_block_v: M,
+    w_block_vx: M,
+    gadget_matrix: &'a M,
+    small_gadget_matrix: &'a M,
 }
 
 fn derive_lut_v_idx_from_hash<M, HS>(
@@ -144,6 +211,335 @@ where
         }
     }
 
+    #[cfg(feature = "gpu")]
+    fn prepare_gpu_lut_base_device_shared(
+        &self,
+        params: &<BggPublicKey<M> as Evaluable>::Params,
+        b1_trapdoor: &TS::Trapdoor,
+        b1_matrix: &M,
+    ) -> Vec<GpuLutBaseDeviceShared<M, TS::Trapdoor>> {
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let device_ids = trap_sampler.gpu_device_ids(params);
+        assert!(
+            !device_ids.is_empty(),
+            "at least one GPU device is required for gpu sample_lut_preimages"
+        );
+
+        let b1_trapdoor_bytes = TS::trapdoor_to_bytes(b1_trapdoor);
+        let b1_matrix_bytes = b1_matrix.to_compact_bytes();
+
+        device_ids
+            .into_iter()
+            .map(|device_id| {
+                let local_params = trap_sampler.gpu_params_for_device(params, device_id);
+                let local_trapdoor = TS::trapdoor_from_bytes(&local_params, &b1_trapdoor_bytes)
+                    .expect("failed to deserialize trapdoor for preloaded LUT device resources");
+                let local_b1_matrix = M::from_compact_bytes(&local_params, &b1_matrix_bytes);
+                GpuLutBaseDeviceShared {
+                    device_id,
+                    params: local_params,
+                    trapdoor: local_trapdoor,
+                    b1_matrix: local_b1_matrix,
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "gpu")]
+    fn prepare_gpu_lut_device_shared<'a>(
+        &self,
+        lut_id: usize,
+        base_shared: &'a [GpuLutBaseDeviceShared<M, TS::Trapdoor>],
+    ) -> Vec<GpuLutDeviceShared<'a, M, TS::Trapdoor>> {
+        base_shared
+            .iter()
+            .map(|base| {
+                let w_block_identity = self.derive_w_block_identity(&base.params, lut_id);
+                let w_block_gy = self.derive_w_block_gy(&base.params, lut_id);
+                let w_block_v = self.derive_w_block_v(&base.params, lut_id);
+                let w_block_vx = self.derive_w_block_vx(&base.params, lut_id);
+                let gadget_matrix = M::gadget_matrix(&base.params, self.d);
+                GpuLutDeviceShared {
+                    device_id: base.device_id,
+                    params: &base.params,
+                    trapdoor: &base.trapdoor,
+                    b1_matrix: &base.b1_matrix,
+                    w_block_identity,
+                    w_block_gy,
+                    w_block_v,
+                    w_block_vx,
+                    gadget_matrix,
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "gpu")]
+    fn prepare_gpu_gate_base_device_shared(
+        &self,
+        params: &<BggPublicKey<M> as Evaluable>::Params,
+        b0_trapdoor: &TS::Trapdoor,
+        b0_matrix: &M,
+        b1_trapdoor: &TS::Trapdoor,
+        b1_matrix: &M,
+    ) -> Vec<GpuGateBaseDeviceShared<M, TS::Trapdoor>> {
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let device_ids = trap_sampler.gpu_device_ids(params);
+        assert!(
+            !device_ids.is_empty(),
+            "at least one GPU device is required for gpu gate preimage sampling"
+        );
+
+        let b0_trapdoor_bytes = TS::trapdoor_to_bytes(b0_trapdoor);
+        let b0_matrix_bytes = b0_matrix.to_compact_bytes();
+        let b1_trapdoor_bytes = TS::trapdoor_to_bytes(b1_trapdoor);
+        let b1_matrix_bytes = b1_matrix.to_compact_bytes();
+        let gadget_matrix_bytes = M::gadget_matrix(params, self.d).to_compact_bytes();
+        let m_g = self.d * params.modulus_digits();
+        let small_gadget_matrix_bytes = M::small_gadget_matrix(params, m_g).to_compact_bytes();
+
+        device_ids
+            .into_iter()
+            .map(|device_id| {
+                let local_params = trap_sampler.gpu_params_for_device(params, device_id);
+                let local_b0_trapdoor = TS::trapdoor_from_bytes(&local_params, &b0_trapdoor_bytes)
+                    .expect(
+                        "failed to deserialize b0 trapdoor for preloaded gate device resources",
+                    );
+                let local_b1_trapdoor = TS::trapdoor_from_bytes(&local_params, &b1_trapdoor_bytes)
+                    .expect(
+                        "failed to deserialize b1 trapdoor for preloaded gate device resources",
+                    );
+                let local_b0_matrix = M::from_compact_bytes(&local_params, &b0_matrix_bytes);
+                let local_b1_matrix = M::from_compact_bytes(&local_params, &b1_matrix_bytes);
+                let local_gadget_matrix =
+                    M::from_compact_bytes(&local_params, &gadget_matrix_bytes);
+                let local_small_gadget_matrix =
+                    M::from_compact_bytes(&local_params, &small_gadget_matrix_bytes);
+                GpuGateBaseDeviceShared {
+                    device_id,
+                    params: local_params,
+                    b0_trapdoor: local_b0_trapdoor,
+                    b0_matrix: local_b0_matrix,
+                    b1_trapdoor: local_b1_trapdoor,
+                    b1_matrix: local_b1_matrix,
+                    gadget_matrix: local_gadget_matrix,
+                    small_gadget_matrix: local_small_gadget_matrix,
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "gpu")]
+    fn copy_matrix_to_gpu_gate_devices(
+        &self,
+        matrix: &M,
+        base_shared: &[GpuGateBaseDeviceShared<M, TS::Trapdoor>],
+    ) -> Vec<M> {
+        let bytes = matrix.to_compact_bytes();
+        base_shared
+            .iter()
+            .map(|device_shared| M::from_compact_bytes(&device_shared.params, &bytes))
+            .collect()
+    }
+
+    #[cfg(feature = "gpu")]
+    fn prepare_gpu_gate_device_shared<'a>(
+        &self,
+        base_shared: &'a [GpuGateBaseDeviceShared<M, TS::Trapdoor>],
+        w_block_identity_by_device: Vec<M>,
+        w_block_gy_by_device: Vec<M>,
+        w_block_v_by_device: Vec<M>,
+        w_block_vx_by_device: Vec<M>,
+    ) -> Vec<GpuGateDeviceShared<'a, M, TS::Trapdoor>> {
+        let len = base_shared.len();
+        assert_eq!(
+            len,
+            w_block_identity_by_device.len(),
+            "w_block_identity device replicas must match gate base shared length"
+        );
+        assert_eq!(
+            len,
+            w_block_gy_by_device.len(),
+            "w_block_gy device replicas must match gate base shared length"
+        );
+        assert_eq!(
+            len,
+            w_block_v_by_device.len(),
+            "w_block_v device replicas must match gate base shared length"
+        );
+        assert_eq!(
+            len,
+            w_block_vx_by_device.len(),
+            "w_block_vx device replicas must match gate base shared length"
+        );
+
+        let mut w_identity_it = w_block_identity_by_device.into_iter();
+        let mut w_gy_it = w_block_gy_by_device.into_iter();
+        let mut w_v_it = w_block_v_by_device.into_iter();
+        let mut w_vx_it = w_block_vx_by_device.into_iter();
+
+        (0..len)
+            .map(|idx| {
+                let base = &base_shared[idx];
+                GpuGateDeviceShared {
+                    device_id: base.device_id,
+                    params: &base.params,
+                    b0_trapdoor: &base.b0_trapdoor,
+                    b0_matrix: &base.b0_matrix,
+                    b1_trapdoor: &base.b1_trapdoor,
+                    b1_matrix: &base.b1_matrix,
+                    w_block_identity: w_identity_it
+                        .next()
+                        .expect("missing w_block_identity replica for gate device"),
+                    w_block_gy: w_gy_it.next().expect("missing w_block_gy replica for gate device"),
+                    w_block_v: w_v_it.next().expect("missing w_block_v replica for gate device"),
+                    w_block_vx: w_vx_it.next().expect("missing w_block_vx replica for gate device"),
+                    gadget_matrix: &base.gadget_matrix,
+                    small_gadget_matrix: &base.small_gadget_matrix,
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "gpu")]
+    fn sample_lut_preimages(
+        &self,
+        params: &<BggPublicKey<M> as Evaluable>::Params,
+        lut_id: usize,
+        lut_aux_id_prefix: &str,
+        shared: &[GpuLutDeviceShared<'_, M, TS::Trapdoor>],
+        batch: &[(usize, Vec<M::P>)],
+    ) -> Vec<CompactBytesJob<M>> {
+        let sample_lut_preimages_start = Instant::now();
+        debug!("Sampling LUT preimages started: lut_id={}, batch_size={}", lut_id, batch.len());
+        let d = self.d;
+        let m = d * params.modulus_digits();
+        let (_, _, crt_depth) = params.to_crt();
+        let k_small = params.modulus_digits() / crt_depth;
+        debug_assert!(!shared.is_empty(), "gpu shared resources must not be empty");
+        debug_assert_eq!(
+            shared[0].w_block_identity.col_size(),
+            m,
+            "w_block_identity columns must equal d * modulus_digits"
+        );
+        debug_assert_eq!(
+            shared[0].w_block_gy.col_size(),
+            m,
+            "w_block_gy columns must equal d * modulus_digits"
+        );
+        debug_assert_eq!(
+            shared[0].w_block_v.col_size(),
+            m,
+            "w_block_v columns must equal d * modulus_digits^2"
+        );
+        debug_assert_eq!(
+            shared[0].w_block_vx.col_size(),
+            m * k_small,
+            "w_block_vx columns must equal d * modulus_digits^2"
+        );
+
+        let jobs = {
+            if batch.is_empty() {
+                Vec::new()
+            } else {
+                let trap_sampler = TS::new(params, self.trapdoor_sigma);
+                assert!(
+                    batch.len() <= shared.len(),
+                    "LUT_PREIMAGE_CHUNK_SIZE must be <= available GPU devices: batch_size={}, devices={}",
+                    batch.len(),
+                    shared.len()
+                );
+
+                let requests = batch
+                    .par_iter()
+                    .enumerate()
+                    .map(|(entry_pos, (idx, y_by_device))| {
+                        let shared_dev = &shared[entry_pos];
+                        debug_assert_eq!(
+                            y_by_device.len(),
+                            shared.len(),
+                            "entries_multi_gpus must provide y for every device"
+                        );
+                        let local_y_poly = y_by_device
+                            .get(entry_pos)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "missing y_poly for device position {} (available={})",
+                                    entry_pos,
+                                    y_by_device.len()
+                                )
+                            })
+                            .clone();
+
+                        let gy = shared_dev.gadget_matrix.clone() * &local_y_poly;
+                        let gy_decomposed = gy.decompose();
+                        let mut w_t_idx = shared_dev.w_block_gy.clone() * gy_decomposed;
+
+                        let v_idx = derive_lut_v_idx_from_hash::<M, HS>(
+                            shared_dev.params,
+                            self.hash_key,
+                            lut_id,
+                            *idx,
+                            d,
+                        );
+                        let w_v = shared_dev.w_block_v.clone() * &v_idx;
+                        w_t_idx.add_in_place(&w_v);
+
+                        let idx_poly = M::P::from_usize_to_constant(shared_dev.params, *idx);
+                        let idx_identity_decomposed =
+                            M::identity(shared_dev.params, m, Some(idx_poly)).small_decompose();
+                        let vx_rhs = idx_identity_decomposed * &v_idx;
+                        let w_vx = shared_dev.w_block_vx.clone() * vx_rhs;
+                        w_t_idx.add_in_place(&w_vx);
+                        w_t_idx.add_in_place(&shared_dev.w_block_identity);
+
+                        let mut target = M::zero(shared_dev.params, d + w_t_idx.row_size(), m);
+                        target.copy_block_from(&w_t_idx, d, 0, 0, 0, w_t_idx.row_size(), m);
+
+                        debug!(
+                            "Constructed device-local target for LUT preimage: lut_id={}, row_idx={}, device_id={}",
+                            lut_id,
+                            idx,
+                            shared_dev.device_id
+                        );
+
+                        GpuPreimageRequest {
+                            entry_idx: *idx,
+                            params: shared_dev.params,
+                            trapdoor: shared_dev.trapdoor,
+                            public_matrix: shared_dev.b1_matrix,
+                            target,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                let preimages = trap_sampler.preimage_batched_sharded(requests);
+                let mut preimage_by_idx = preimages.into_iter().collect::<HashMap<usize, M>>();
+                batch
+                    .iter()
+                    .map(|(idx, _)| {
+                        let lut_aux_id = format!("{lut_aux_id_prefix}_idx{idx}");
+                        let preimage = preimage_by_idx
+                            .remove(idx)
+                            .unwrap_or_else(|| panic!("missing preimage for LUT row idx={idx}"));
+                        CompactBytesJob::new(lut_aux_id, vec![(0usize, preimage)])
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let sample_lut_preimages_elapsed = sample_lut_preimages_start.elapsed();
+        debug!(
+            "Finished sampling LUT preimages: lut_id={}, batch_size={}, elapsed={}",
+            lut_id,
+            batch.len(),
+            Self::format_duration(sample_lut_preimages_elapsed)
+        );
+        jobs
+    }
+
+    #[cfg(not(feature = "gpu"))]
     fn sample_lut_preimages(
         &self,
         params: &<BggPublicKey<M> as Evaluable>::Params,
@@ -185,6 +581,7 @@ where
             m * k_small,
             "w_block_vx columns must equal d * modulus_digits^2"
         );
+
         let jobs = if batch.is_empty() {
             Vec::new()
         } else {
@@ -193,8 +590,6 @@ where
                 m.checked_mul(batch_size).expect("batched target column count overflow");
             let entry_indices = batch.iter().map(|(idx, _)| *idx).collect::<Vec<_>>();
 
-            // Compute W * T batchwise with shared left operands in stages:
-            // [I_d | ...] + W_gy * Gy_cat + W_v * V_cat + W_vx * VX_rhs_cat.
             let mut w_t_idx_batched = if batch_size == 1 {
                 w_block_identity.clone()
             } else {
@@ -272,12 +667,6 @@ where
             let w_vx_batched = w_block_vx.clone() * vx_rhs_cat;
             w_t_idx_batched.add_in_place(&w_vx_batched);
             drop(w_vx_batched);
-            debug!(
-                "Constructed batched W*T for LUT preimages: lut_id={}, batch_size={}, cols={}",
-                lut_id,
-                batch_size,
-                w_t_idx_batched.col_size()
-            );
 
             let mut batched_target = M::zero(params, d + w_t_idx_batched.row_size(), batched_cols);
             batched_target.copy_block_from(
@@ -290,20 +679,9 @@ where
                 batched_cols,
             );
             drop(w_t_idx_batched);
-            debug!(
-                "Constructed batched target for LUT preimages: lut_id={}, batch_size={}, target_cols={}",
-                lut_id,
-                batch_size,
-                batched_target.col_size()
-            );
 
             let batched_preimage =
                 trap_sampler.preimage(params, b1_trapdoor, b1_matrix, &batched_target);
-            debug!(
-                "Sampled batched LUT preimage: lut_id={}, batch_size={}",
-                lut_id,
-                entry_indices.len()
-            );
             let preimage_nrow = batched_preimage.row_size();
             entry_indices
                 .into_iter()
@@ -313,10 +691,6 @@ where
                         entry_pos.checked_mul(m).expect("preimage slice column offset overflow");
                     let col_end = col_start + m;
                     let k_l_preimage = batched_preimage.slice(0, preimage_nrow, col_start, col_end);
-                    debug!(
-                        "Extracted LUT preimage slice from batched preimage: lut_id={}, row_idx={}",
-                        lut_id, idx
-                    );
                     let lut_aux_id = format!("{lut_aux_id_prefix}_idx{idx}");
                     CompactBytesJob::new(lut_aux_id, vec![(0usize, k_l_preimage)])
                 })
@@ -331,6 +705,591 @@ where
             Self::format_duration(sample_lut_preimages_elapsed)
         );
         jobs
+    }
+
+    #[cfg(feature = "gpu")]
+    fn sample_gate_preimages_batch(
+        &self,
+        params: &<BggPublicKey<M> as Evaluable>::Params,
+        lut_id: usize,
+        pending: Vec<(GateId, GateState<M>)>,
+        shared: &[GpuGateDeviceShared<'_, M, TS::Trapdoor>],
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        assert!(
+            pending.len() <= shared.len(),
+            "GGH15_GATE_PARALLELISM must be <= available GPU devices for gate preimage sampling: pending={}, devices={}",
+            pending.len(),
+            shared.len()
+        );
+
+        let d = self.d;
+        let m_g = d * params.modulus_digits();
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+
+        let stage1_entries = pending
+            .into_par_iter()
+            .enumerate()
+            .map(|(entry_pos, (gate_id, state))| {
+                let shared = &shared[entry_pos];
+                let uniform_sampler = US::new();
+                let s_g = if self.insert_1_to_s {
+                    let s_g_bar = uniform_sampler.sample_uniform(
+                        shared.params,
+                        d - 1,
+                        d - 1,
+                        DistType::TernaryDist,
+                    );
+                    s_g_bar.concat_diag_owned(vec![M::identity(shared.params, 1, None)])
+                } else {
+                    uniform_sampler.sample_uniform(shared.params, d, d, DistType::TernaryDist)
+                };
+                let s_g_concat = M::identity(shared.params, d, None).concat_columns_owned(vec![s_g]);
+                let gate_target1 = {
+                    let error = uniform_sampler.sample_uniform(
+                        shared.params,
+                        d,
+                        shared.b1_matrix.col_size(),
+                        DistType::GaussDist { sigma: self.error_sigma },
+                    );
+                    s_g_concat.clone() * shared.b1_matrix + error
+                };
+                debug!(
+                    "Constructed stage1 target for gate preimage: gate_id={}, lut_id={}, device_id={}",
+                    gate_id,
+                    lut_id,
+                    shared.device_id
+                );
+                (entry_pos, gate_id, state, gate_target1)
+            })
+            .collect::<Vec<_>>();
+        let mut stage2_inputs = Vec::with_capacity(stage1_entries.len());
+        let mut stage1_requests = Vec::with_capacity(stage1_entries.len());
+        for (entry_pos, gate_id, state, target) in stage1_entries {
+            let shared = &shared[entry_pos];
+            stage2_inputs.push((entry_pos, gate_id, state));
+            stage1_requests.push(GpuPreimageRequest {
+                entry_idx: entry_pos,
+                params: shared.params,
+                trapdoor: shared.b0_trapdoor,
+                public_matrix: shared.b0_matrix,
+                target,
+            });
+        }
+        let mut stage1_preimages = trap_sampler
+            .preimage_batched_sharded(stage1_requests)
+            .into_iter()
+            .collect::<HashMap<usize, M>>();
+        let stage1_jobs = stage2_inputs
+            .iter()
+            .map(|(entry_pos, gate_id, _)| {
+                let preimage_gate1 = stage1_preimages.remove(entry_pos).unwrap_or_else(|| {
+                    panic!("missing gate stage1 preimage for entry_pos={entry_pos}")
+                });
+                debug!("Sampled gate preimage 1: gate_id={}, lut_id={}", gate_id, lut_id);
+                CompactBytesJob::new(
+                    self.preimage_gate1_id_prefix(params, *gate_id),
+                    vec![(0, preimage_gate1)],
+                )
+            })
+            .collect::<Vec<_>>();
+        stage1_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+
+        let stage2_entries = stage2_inputs
+            .into_par_iter()
+            .map(|(entry_pos, gate_id, state)| {
+                let shared = &shared[entry_pos];
+                let hash_sampler = HS::new();
+                let out_matrix = hash_sampler.sample_hash(
+                    shared.params,
+                    self.hash_key,
+                    format!("ggh15_gate_a_out_{}", gate_id),
+                    d,
+                    m_g,
+                    DistType::FinRingDist,
+                );
+                let target_gate2_identity = out_matrix.concat_rows(&[&shared.w_block_identity]);
+                debug!(
+                    "Constructed stage2 identity target for gate preimage: gate_id={}, lut_id={}, device_id={}",
+                    gate_id,
+                    lut_id,
+                    shared.device_id
+                );
+                (entry_pos, gate_id, state, target_gate2_identity)
+            })
+            .collect::<Vec<_>>();
+        let mut stage3_inputs = Vec::with_capacity(stage2_entries.len());
+        let mut stage2_requests = Vec::with_capacity(stage2_entries.len());
+        for (entry_pos, gate_id, state, target) in stage2_entries {
+            let shared = &shared[entry_pos];
+            stage3_inputs.push((entry_pos, gate_id, state));
+            stage2_requests.push(GpuPreimageRequest {
+                entry_idx: entry_pos,
+                params: shared.params,
+                trapdoor: shared.b1_trapdoor,
+                public_matrix: shared.b1_matrix,
+                target,
+            });
+        }
+        let mut stage2_preimages = trap_sampler
+            .preimage_batched_sharded(stage2_requests)
+            .into_iter()
+            .collect::<HashMap<usize, M>>();
+        let stage2_jobs = stage3_inputs
+            .iter()
+            .map(|(entry_pos, gate_id, _)| {
+                let preimage_gate2_identity =
+                    stage2_preimages.remove(entry_pos).unwrap_or_else(|| {
+                        panic!("missing gate stage2 preimage for entry_pos={entry_pos}")
+                    });
+                debug!(
+                    "Sampled gate preimage 2 (identity part): gate_id={}, lut_id={}",
+                    gate_id, lut_id
+                );
+                CompactBytesJob::new(
+                    self.preimage_gate2_identity_id_prefix(params, *gate_id),
+                    vec![(0, preimage_gate2_identity)],
+                )
+            })
+            .collect::<Vec<_>>();
+        stage2_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+
+        let stage3_requests = stage3_inputs
+            .iter()
+            .map(|(entry_pos, _, _)| {
+                let shared = &shared[*entry_pos];
+                let target_high_gy = -shared.gadget_matrix.clone();
+                let target_gate2_gy = target_high_gy.concat_rows(&[&shared.w_block_gy]);
+                GpuPreimageRequest {
+                    entry_idx: *entry_pos,
+                    params: shared.params,
+                    trapdoor: shared.b1_trapdoor,
+                    public_matrix: shared.b1_matrix,
+                    target: target_gate2_gy,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut stage3_preimages = trap_sampler
+            .preimage_batched_sharded(stage3_requests)
+            .into_iter()
+            .collect::<HashMap<usize, M>>();
+        let stage3_jobs = stage3_inputs
+            .iter()
+            .map(|(entry_pos, gate_id, _)| {
+                let preimage_gate2_gy = stage3_preimages.remove(entry_pos).unwrap_or_else(|| {
+                    panic!("missing gate stage3 preimage for entry_pos={entry_pos}")
+                });
+                debug!("Sampled gate preimage 2 (gy part): gate_id={}, lut_id={}", gate_id, lut_id);
+                CompactBytesJob::new(
+                    self.preimage_gate2_gy_id_prefix(params, *gate_id),
+                    vec![(0, preimage_gate2_gy)],
+                )
+            })
+            .collect::<Vec<_>>();
+        stage3_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+
+        let stage4_entries = stage3_inputs
+            .into_par_iter()
+            .map(|(entry_pos, gate_id, state)| {
+                let shared = &shared[entry_pos];
+                let hash_sampler = HS::new();
+                let input_matrix = M::from_compact_bytes(shared.params, &state.input_pubkey_bytes);
+                let u_g_matrix = hash_sampler.sample_hash(
+                    shared.params,
+                    self.hash_key,
+                    format!("ggh15_lut_u_g_matrix_{}", gate_id),
+                    d,
+                    m_g,
+                    DistType::FinRingDist,
+                );
+                debug!(
+                    "Derived u_g_matrix for gate: gate_id={}, lut_id={}, rows={}, cols={}, device_id={}",
+                    gate_id,
+                    lut_id,
+                    u_g_matrix.row_size(),
+                    u_g_matrix.col_size(),
+                    shared.device_id
+                );
+                let u_g_decomposed = u_g_matrix.decompose();
+                let target_high_v = -(input_matrix * u_g_decomposed);
+                let target_gate2_v = target_high_v.concat_rows(&[&shared.w_block_v]);
+                (entry_pos, gate_id, u_g_matrix, target_gate2_v)
+            })
+            .collect::<Vec<_>>();
+        let mut stage5_inputs = Vec::with_capacity(stage4_entries.len());
+        let mut stage4_requests = Vec::with_capacity(stage4_entries.len());
+        for (entry_pos, gate_id, u_g_matrix, target) in stage4_entries {
+            let shared = &shared[entry_pos];
+            stage5_inputs.push((entry_pos, gate_id, u_g_matrix));
+            stage4_requests.push(GpuPreimageRequest {
+                entry_idx: entry_pos,
+                params: shared.params,
+                trapdoor: shared.b1_trapdoor,
+                public_matrix: shared.b1_matrix,
+                target,
+            });
+        }
+        let mut stage4_preimages = trap_sampler
+            .preimage_batched_sharded(stage4_requests)
+            .into_iter()
+            .collect::<HashMap<usize, M>>();
+        let stage4_jobs = stage5_inputs
+            .iter()
+            .map(|(entry_pos, gate_id, _)| {
+                let preimage_gate2_v = stage4_preimages.remove(entry_pos).unwrap_or_else(|| {
+                    panic!("missing gate stage4 preimage for entry_pos={entry_pos}")
+                });
+                debug!("Sampled gate preimage 2 (v part): gate_id={}, lut_id={}", gate_id, lut_id);
+                CompactBytesJob::new(
+                    self.preimage_gate2_v_id_prefix(params, *gate_id),
+                    vec![(0, preimage_gate2_v)],
+                )
+            })
+            .collect::<Vec<_>>();
+        stage4_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+
+        let stage5_requests = stage5_inputs
+            .iter()
+            .map(|(entry_pos, _, u_g_matrix)| {
+                let shared = &shared[*entry_pos];
+                let target_high_vx = u_g_matrix.clone() * shared.small_gadget_matrix;
+                let target_gate2_vx = target_high_vx.concat_rows(&[&shared.w_block_vx]);
+                GpuPreimageRequest {
+                    entry_idx: *entry_pos,
+                    params: shared.params,
+                    trapdoor: shared.b1_trapdoor,
+                    public_matrix: shared.b1_matrix,
+                    target: target_gate2_vx,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut stage5_preimages = trap_sampler
+            .preimage_batched_sharded(stage5_requests)
+            .into_iter()
+            .collect::<HashMap<usize, M>>();
+        let stage5_jobs = stage5_inputs
+            .iter()
+            .map(|(entry_pos, gate_id, _)| {
+                let preimage_gate2_vx = stage5_preimages.remove(entry_pos).unwrap_or_else(|| {
+                    panic!("missing gate stage5 preimage for entry_pos={entry_pos}")
+                });
+                debug!("Sampled gate preimage 2 (vx part): gate_id={}, lut_id={}", gate_id, lut_id);
+                CompactBytesJob::new(
+                    self.preimage_gate2_vx_id_prefix(params, *gate_id),
+                    vec![(0, preimage_gate2_vx)],
+                )
+            })
+            .collect::<Vec<_>>();
+        stage5_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn sample_gate_preimages_batch(
+        &self,
+        params: &<BggPublicKey<M> as Evaluable>::Params,
+        lut_id: usize,
+        pending: Vec<(GateId, GateState<M>)>,
+        b0_trapdoor: &TS::Trapdoor,
+        b0_matrix: &M,
+        b1_trapdoor: &TS::Trapdoor,
+        b1_matrix: &M,
+        w_block_identity: &M,
+        w_block_gy: &M,
+        w_block_v: &M,
+        w_block_vx: &M,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        let d = self.d;
+        let m_g = d * params.modulus_digits();
+
+        let stage1_entries = pending
+            .into_par_iter()
+            .map(|(gate_id, state)| {
+                let uniform_sampler = US::new();
+                let s_g = if self.insert_1_to_s {
+                    let s_g_bar =
+                        uniform_sampler.sample_uniform(params, d - 1, d - 1, DistType::TernaryDist);
+                    s_g_bar.concat_diag_owned(vec![M::identity(params, 1, None)])
+                } else {
+                    uniform_sampler.sample_uniform(params, d, d, DistType::TernaryDist)
+                };
+                let s_g_concat = M::identity(params, d, None).concat_columns_owned(vec![s_g]);
+                let gate_target1 = {
+                    let error = uniform_sampler.sample_uniform(
+                        params,
+                        d,
+                        b1_matrix.col_size(),
+                        DistType::GaussDist { sigma: self.error_sigma },
+                    );
+                    s_g_concat.clone() * b1_matrix + error
+                };
+                drop(s_g_concat);
+                (gate_id, state, gate_target1)
+            })
+            .collect::<Vec<_>>();
+        let stage1_target_cols = stage1_entries[0].2.col_size();
+        debug_assert!(
+            stage1_entries.iter().all(|(_, _, target)| target.col_size() == stage1_target_cols),
+            "stage1 target columns must be identical across gates"
+        );
+        let mut stage1_gate_ids = Vec::with_capacity(stage1_entries.len());
+        let mut stage2_inputs = Vec::with_capacity(stage1_entries.len());
+        let mut stage1_targets = Vec::with_capacity(stage1_entries.len());
+        for (gate_id, state, target) in stage1_entries {
+            stage1_gate_ids.push(gate_id);
+            stage2_inputs.push((gate_id, state));
+            stage1_targets.push(target);
+        }
+        let stage1_batched_target = if stage1_targets.len() == 1 {
+            stage1_targets.pop().expect("stage1_targets must contain one matrix")
+        } else {
+            let mut target_iter = stage1_targets.into_iter();
+            let target_first = target_iter.next().expect("stage1_targets must be non-empty");
+            target_first.concat_columns_owned(target_iter.collect())
+        };
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let stage1_batched_preimage =
+            trap_sampler.preimage(params, b0_trapdoor, b0_matrix, &stage1_batched_target);
+        let stage1_preimage_nrow = stage1_batched_preimage.row_size();
+        let stage1_jobs = stage1_gate_ids
+            .into_iter()
+            .enumerate()
+            .map(|(gate_pos, gate_id)| {
+                let col_start = gate_pos
+                    .checked_mul(stage1_target_cols)
+                    .expect("stage1 preimage slice column offset overflow");
+                let col_end = col_start + stage1_target_cols;
+                let preimage_gate1 =
+                    stage1_batched_preimage.slice(0, stage1_preimage_nrow, col_start, col_end);
+                debug!("Sampled gate preimage 1: gate_id={}, lut_id={}", gate_id, lut_id);
+                CompactBytesJob::new(
+                    self.preimage_gate1_id_prefix(params, gate_id),
+                    vec![(0, preimage_gate1)],
+                )
+            })
+            .collect::<Vec<_>>();
+        stage1_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+
+        let stage2_entries = stage2_inputs
+            .into_par_iter()
+            .map(|(gate_id, state)| {
+                let hash_sampler = HS::new();
+                let out_matrix = hash_sampler.sample_hash(
+                    params,
+                    self.hash_key,
+                    format!("ggh15_gate_a_out_{}", gate_id),
+                    d,
+                    m_g,
+                    DistType::FinRingDist,
+                );
+                let target_gate2_identity = out_matrix.concat_rows(&[w_block_identity]);
+                (gate_id, state, target_gate2_identity)
+            })
+            .collect::<Vec<_>>();
+        let stage2_target_cols = stage2_entries[0].2.col_size();
+        debug_assert!(
+            stage2_entries.iter().all(|(_, _, target)| target.col_size() == stage2_target_cols),
+            "stage2 target columns must be identical across gates"
+        );
+        let mut stage2_gate_ids = Vec::with_capacity(stage2_entries.len());
+        let mut stage3_inputs = Vec::with_capacity(stage2_entries.len());
+        let mut stage2_targets = Vec::with_capacity(stage2_entries.len());
+        for (gate_id, state, target) in stage2_entries {
+            stage2_gate_ids.push(gate_id);
+            stage3_inputs.push((gate_id, state));
+            stage2_targets.push(target);
+        }
+        let stage2_batched_target = if stage2_targets.len() == 1 {
+            stage2_targets.pop().expect("stage2_targets must contain one matrix")
+        } else {
+            let mut target_iter = stage2_targets.into_iter();
+            let target_first = target_iter.next().expect("stage2_targets must be non-empty");
+            target_first.concat_columns_owned(target_iter.collect())
+        };
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let stage2_batched_preimage =
+            trap_sampler.preimage(params, b1_trapdoor, b1_matrix, &stage2_batched_target);
+        let stage2_preimage_nrow = stage2_batched_preimage.row_size();
+        let stage2_jobs = stage2_gate_ids
+            .into_iter()
+            .enumerate()
+            .map(|(gate_pos, gate_id)| {
+                let col_start = gate_pos
+                    .checked_mul(stage2_target_cols)
+                    .expect("stage2 preimage slice column offset overflow");
+                let col_end = col_start + stage2_target_cols;
+                let preimage_gate2_identity =
+                    stage2_batched_preimage.slice(0, stage2_preimage_nrow, col_start, col_end);
+                debug!(
+                    "Sampled gate preimage 2 (identity part): gate_id={}, lut_id={}",
+                    gate_id, lut_id
+                );
+                CompactBytesJob::new(
+                    self.preimage_gate2_identity_id_prefix(params, gate_id),
+                    vec![(0, preimage_gate2_identity)],
+                )
+            })
+            .collect::<Vec<_>>();
+        stage2_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+
+        let stage3_gate_ids = stage3_inputs.iter().map(|(gate_id, _)| *gate_id).collect::<Vec<_>>();
+        let target_high_gy = -M::gadget_matrix(params, d);
+        let target_gate2_gy = target_high_gy.concat_rows(&[w_block_gy]);
+        drop(target_high_gy);
+        let stage3_target_cols = target_gate2_gy.col_size();
+        let stage3_batched_target = if stage3_gate_ids.len() == 1 {
+            target_gate2_gy.clone()
+        } else {
+            let stage3_target_refs =
+                std::iter::repeat(&target_gate2_gy).take(stage3_gate_ids.len()).collect::<Vec<_>>();
+            stage3_target_refs[0].concat_columns(&stage3_target_refs[1..])
+        };
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let stage3_batched_preimage =
+            trap_sampler.preimage(params, b1_trapdoor, b1_matrix, &stage3_batched_target);
+        let stage3_preimage_nrow = stage3_batched_preimage.row_size();
+        let stage3_jobs = stage3_gate_ids
+            .into_iter()
+            .enumerate()
+            .map(|(gate_pos, gate_id)| {
+                let col_start = gate_pos
+                    .checked_mul(stage3_target_cols)
+                    .expect("stage3 preimage slice column offset overflow");
+                let col_end = col_start + stage3_target_cols;
+                let preimage_gate2_gy =
+                    stage3_batched_preimage.slice(0, stage3_preimage_nrow, col_start, col_end);
+                debug!("Sampled gate preimage 2 (gy part): gate_id={}, lut_id={}", gate_id, lut_id);
+                CompactBytesJob::new(
+                    self.preimage_gate2_gy_id_prefix(params, gate_id),
+                    vec![(0, preimage_gate2_gy)],
+                )
+            })
+            .collect::<Vec<_>>();
+        stage3_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+
+        let stage4_entries = stage3_inputs
+            .into_par_iter()
+            .map(|(gate_id, state)| {
+                let hash_sampler = HS::new();
+                let input_matrix = M::from_compact_bytes(params, &state.input_pubkey_bytes);
+                let u_g_matrix = hash_sampler.sample_hash(
+                    params,
+                    self.hash_key,
+                    format!("ggh15_lut_u_g_matrix_{}", gate_id),
+                    d,
+                    m_g,
+                    DistType::FinRingDist,
+                );
+                debug!(
+                    "Derived u_g_matrix for gate: gate_id={}, lut_id={}, rows={}, cols={}",
+                    gate_id,
+                    lut_id,
+                    u_g_matrix.row_size(),
+                    u_g_matrix.col_size()
+                );
+                let u_g_decomposed = u_g_matrix.decompose();
+                let target_high_v = -(input_matrix * u_g_decomposed);
+                let target_gate2_v = target_high_v.concat_rows(&[w_block_v]);
+                (gate_id, u_g_matrix, target_gate2_v)
+            })
+            .collect::<Vec<_>>();
+        let stage4_target_cols = stage4_entries[0].2.col_size();
+        debug_assert!(
+            stage4_entries.iter().all(|(_, _, target)| target.col_size() == stage4_target_cols),
+            "stage4 target columns must be identical across gates"
+        );
+        let mut stage4_gate_ids = Vec::with_capacity(stage4_entries.len());
+        let mut stage5_inputs = Vec::with_capacity(stage4_entries.len());
+        let mut stage4_targets = Vec::with_capacity(stage4_entries.len());
+        for (gate_id, u_g_matrix, target) in stage4_entries {
+            stage4_gate_ids.push(gate_id);
+            stage5_inputs.push((gate_id, u_g_matrix));
+            stage4_targets.push(target);
+        }
+        let stage4_batched_target = if stage4_targets.len() == 1 {
+            stage4_targets.pop().expect("stage4_targets must contain one matrix")
+        } else {
+            let mut target_iter = stage4_targets.into_iter();
+            let target_first = target_iter.next().expect("stage4_targets must be non-empty");
+            target_first.concat_columns_owned(target_iter.collect())
+        };
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let stage4_batched_preimage =
+            trap_sampler.preimage(params, b1_trapdoor, b1_matrix, &stage4_batched_target);
+        let stage4_preimage_nrow = stage4_batched_preimage.row_size();
+        let stage4_jobs = stage4_gate_ids
+            .into_iter()
+            .enumerate()
+            .map(|(gate_pos, gate_id)| {
+                let col_start = gate_pos
+                    .checked_mul(stage4_target_cols)
+                    .expect("stage4 preimage slice column offset overflow");
+                let col_end = col_start + stage4_target_cols;
+                let preimage_gate2_v =
+                    stage4_batched_preimage.slice(0, stage4_preimage_nrow, col_start, col_end);
+                debug!("Sampled gate preimage 2 (v part): gate_id={}, lut_id={}", gate_id, lut_id);
+                CompactBytesJob::new(
+                    self.preimage_gate2_v_id_prefix(params, gate_id),
+                    vec![(0, preimage_gate2_v)],
+                )
+            })
+            .collect::<Vec<_>>();
+        stage4_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+
+        let small_gadget_matrix = M::small_gadget_matrix(params, m_g);
+        let stage5_entries = stage5_inputs
+            .into_par_iter()
+            .map(|(gate_id, u_g_matrix)| {
+                let target_high_vx = u_g_matrix * &small_gadget_matrix;
+                let target_gate2_vx = target_high_vx.concat_rows(&[w_block_vx]);
+                drop(target_high_vx);
+                (gate_id, target_gate2_vx)
+            })
+            .collect::<Vec<_>>();
+        let stage5_target_cols = stage5_entries[0].1.col_size();
+        debug_assert!(
+            stage5_entries.iter().all(|(_, target)| target.col_size() == stage5_target_cols),
+            "stage5 target columns must be identical across gates"
+        );
+        let mut stage5_gate_ids = Vec::with_capacity(stage5_entries.len());
+        let mut stage5_targets = Vec::with_capacity(stage5_entries.len());
+        for (gate_id, target) in stage5_entries {
+            stage5_gate_ids.push(gate_id);
+            stage5_targets.push(target);
+        }
+        let stage5_batched_target = if stage5_targets.len() == 1 {
+            stage5_targets.pop().expect("stage5_targets must contain one matrix")
+        } else {
+            let mut target_iter = stage5_targets.into_iter();
+            let target_first = target_iter.next().expect("stage5_targets must be non-empty");
+            target_first.concat_columns_owned(target_iter.collect())
+        };
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let stage5_batched_preimage =
+            trap_sampler.preimage(params, b1_trapdoor, b1_matrix, &stage5_batched_target);
+        let stage5_preimage_nrow = stage5_batched_preimage.row_size();
+        let stage5_jobs = stage5_gate_ids
+            .into_iter()
+            .enumerate()
+            .map(|(gate_pos, gate_id)| {
+                let col_start = gate_pos
+                    .checked_mul(stage5_target_cols)
+                    .expect("stage5 preimage slice column offset overflow");
+                let col_end = col_start + stage5_target_cols;
+                let preimage_gate2_vx =
+                    stage5_batched_preimage.slice(0, stage5_preimage_nrow, col_start, col_end);
+                debug!("Sampled gate preimage 2 (vx part): gate_id={}, lut_id={}", gate_id, lut_id);
+                CompactBytesJob::new(
+                    self.preimage_gate2_vx_id_prefix(params, gate_id),
+                    vec![(0, preimage_gate2_vx)],
+                )
+            })
+            .collect::<Vec<_>>();
+        stage5_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
     }
 
     fn format_duration(duration: Duration) -> String {
@@ -880,7 +1839,6 @@ where
 
         let d = self.d;
         info!("Sampling auxiliary matrices with d = {}", d);
-        let m_g = d * params.modulus_digits();
         let mut persist_b0_checkpoint: Option<(M, Vec<u8>)> = None;
         let (b0_trapdoor, b0_matrix, b0_loaded_from_checkpoint) =
             if let Some((b0_trapdoor, b0_matrix)) =
@@ -1036,6 +1994,9 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
             total_lut_rows.saturating_sub(resumed_lut_rows),
             total_gate_count.saturating_sub(resumed_gates)
         );
+        #[cfg(feature = "gpu")]
+        let gpu_lut_base_shared =
+            self.prepare_gpu_lut_base_device_shared(params, &b1_trapdoor, &b1_matrix);
 
         for (lut_id, plt, completed_rows, resumed_rows_for_lut) in lut_plans {
             let lut_start = Instant::now();
@@ -1044,58 +2005,91 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
             let w_block_gy = self.derive_w_block_gy(params, lut_id);
             let w_block_v = self.derive_w_block_v(params, lut_id);
             let w_block_vx = self.derive_w_block_vx(params, lut_id);
-            let mut batch: Vec<(usize, M::P)> = Vec::with_capacity(chunk_size);
-            let mut pending_store_jobs: Option<Vec<CompactBytesJob<M>>> = None;
-            for (_, (idx, y_poly)) in plt.entries(params) {
-                if completed_rows.contains(&idx) {
-                    continue;
-                }
-                batch.push((idx, y_poly));
+            #[cfg(feature = "gpu")]
+            let gpu_lut_shared = self.prepare_gpu_lut_device_shared(lut_id, &gpu_lut_base_shared);
 
-                if batch.len() >= chunk_size {
+            #[cfg(feature = "gpu")]
+            {
+                let gpu_lut_params_by_device = gpu_lut_shared
+                    .iter()
+                    .map(|device_shared| device_shared.params)
+                    .collect::<Vec<_>>();
+                let sample_lut_batch = |current_batch: &[(usize, Vec<M::P>)]| {
+                    self.sample_lut_preimages(
+                        params,
+                        lut_id,
+                        &lut_aux_id_prefix,
+                        &gpu_lut_shared,
+                        current_batch,
+                    )
+                };
+
+                let mut batch: Vec<(usize, Vec<M::P>)> = Vec::with_capacity(chunk_size);
+                let mut pending_store_jobs: Option<Vec<CompactBytesJob<M>>> = None;
+                for (_, (idx, y_by_device)) in plt.entries_multi_gpus(&gpu_lut_params_by_device) {
+                    if completed_rows.contains(&idx) {
+                        continue;
+                    }
+                    batch.push((idx, y_by_device));
+
+                    if batch.len() >= chunk_size {
+                        let current_batch = std::mem::take(&mut batch);
+                        let lut_preimage_batch_start = Instant::now();
+                        let sampled_jobs = if let Some(previous_jobs) = pending_store_jobs.take() {
+                            let (_, jobs) = rayon::join(
+                                || {
+                                    let wait_start = Instant::now();
+                                    previous_jobs
+                                        .into_par_iter()
+                                        .for_each(CompactBytesJob::wait_then_store);
+                                    debug!(
+                                        "Previous batch store completed in {}",
+                                        Self::format_duration(wait_start.elapsed())
+                                    );
+                                },
+                                || sample_lut_batch(&current_batch),
+                            );
+                            jobs
+                        } else {
+                            sample_lut_batch(&current_batch)
+                        };
+                        let lut_preimage_batch_elapsed = lut_preimage_batch_start.elapsed();
+                        debug!(
+                            "Sampled LUT preimages: lut_id={}, batch_size={}, elapsed={}",
+                            lut_id,
+                            current_batch.len(),
+                            Self::format_duration(lut_preimage_batch_elapsed)
+                        );
+                        processed_lut_rows = processed_lut_rows.saturating_add(current_batch.len());
+                        let pct = if total_lut_rows == 0 {
+                            100.0
+                        } else {
+                            (processed_lut_rows as f64) * 100.0 / (total_lut_rows as f64)
+                        };
+                        debug!(
+                            "LUT rows processed: {}/{} ({pct:.1}%), elapsed={}",
+                            processed_lut_rows,
+                            total_lut_rows,
+                            Self::format_duration(start.elapsed())
+                        );
+                        pending_store_jobs = Some(sampled_jobs);
+                    }
+                }
+                if !batch.is_empty() {
                     let current_batch = std::mem::take(&mut batch);
                     let lut_preimage_batch_start = Instant::now();
                     let sampled_jobs = if let Some(previous_jobs) = pending_store_jobs.take() {
                         let (_, jobs) = rayon::join(
                             || {
-                                let wait_start = Instant::now();
                                 previous_jobs
                                     .into_par_iter()
                                     .for_each(CompactBytesJob::wait_then_store);
-                                debug!(
-                                    "Previous batch store completed in {}",
-                                    Self::format_duration(wait_start.elapsed())
-                                );
                             },
-                            || {
-                                self.sample_lut_preimages(
-                                    params,
-                                    lut_id,
-                                    &lut_aux_id_prefix,
-                                    &b1_trapdoor,
-                                    &b1_matrix,
-                                    &w_block_identity,
-                                    &w_block_gy,
-                                    &w_block_v,
-                                    &w_block_vx,
-                                    &current_batch,
-                                )
-                            },
+                            || sample_lut_batch(&current_batch),
                         );
                         jobs
                     } else {
-                        self.sample_lut_preimages(
-                            params,
-                            lut_id,
-                            &lut_aux_id_prefix,
-                            &b1_trapdoor,
-                            &b1_matrix,
-                            &w_block_identity,
-                            &w_block_gy,
-                            &w_block_v,
-                            &w_block_vx,
-                            &current_batch,
-                        )
+                        sample_lut_batch(&current_batch)
                     };
                     let lut_preimage_batch_elapsed = lut_preimage_batch_start.elapsed();
                     debug!(
@@ -1104,6 +2098,7 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                         current_batch.len(),
                         Self::format_duration(lut_preimage_batch_elapsed)
                     );
+                    pending_store_jobs = Some(sampled_jobs);
                     processed_lut_rows = processed_lut_rows.saturating_add(current_batch.len());
                     let pct = if total_lut_rows == 0 {
                         100.0
@@ -1116,36 +2111,15 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                         total_lut_rows,
                         Self::format_duration(start.elapsed())
                     );
-                    pending_store_jobs = Some(sampled_jobs);
+                }
+                if let Some(previous_jobs) = pending_store_jobs.take() {
+                    previous_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
                 }
             }
-            if !batch.is_empty() {
-                let current_batch = std::mem::take(&mut batch);
-                let lut_preimage_batch_start = Instant::now();
-                let sampled_jobs = if let Some(previous_jobs) = pending_store_jobs.take() {
-                    let (_, jobs) = rayon::join(
-                        || {
-                            previous_jobs
-                                .into_par_iter()
-                                .for_each(CompactBytesJob::wait_then_store);
-                        },
-                        || {
-                            self.sample_lut_preimages(
-                                params,
-                                lut_id,
-                                &lut_aux_id_prefix,
-                                &b1_trapdoor,
-                                &b1_matrix,
-                                &w_block_identity,
-                                &w_block_gy,
-                                &w_block_v,
-                                &w_block_vx,
-                                &current_batch,
-                            )
-                        },
-                    );
-                    jobs
-                } else {
+
+            #[cfg(not(feature = "gpu"))]
+            {
+                let sample_lut_batch = |current_batch: &[(usize, M::P)]| {
                     self.sample_lut_preimages(
                         params,
                         lut_id,
@@ -1156,32 +2130,101 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                         &w_block_gy,
                         &w_block_v,
                         &w_block_vx,
-                        &current_batch,
+                        current_batch,
                     )
                 };
-                let lut_preimage_batch_elapsed = lut_preimage_batch_start.elapsed();
-                debug!(
-                    "Sampled LUT preimages: lut_id={}, batch_size={}, elapsed={}",
-                    lut_id,
-                    current_batch.len(),
-                    Self::format_duration(lut_preimage_batch_elapsed)
-                );
-                pending_store_jobs = Some(sampled_jobs);
-                processed_lut_rows = processed_lut_rows.saturating_add(current_batch.len());
-                let pct = if total_lut_rows == 0 {
-                    100.0
-                } else {
-                    (processed_lut_rows as f64) * 100.0 / (total_lut_rows as f64)
-                };
-                debug!(
-                    "LUT rows processed: {}/{} ({pct:.1}%), elapsed={}",
-                    processed_lut_rows,
-                    total_lut_rows,
-                    Self::format_duration(start.elapsed())
-                );
-            }
-            if let Some(previous_jobs) = pending_store_jobs.take() {
-                previous_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+
+                let mut batch: Vec<(usize, M::P)> = Vec::with_capacity(chunk_size);
+                let mut pending_store_jobs: Option<Vec<CompactBytesJob<M>>> = None;
+                for (_, (idx, y_poly)) in plt.entries(params) {
+                    if completed_rows.contains(&idx) {
+                        continue;
+                    }
+                    batch.push((idx, y_poly));
+
+                    if batch.len() >= chunk_size {
+                        let current_batch = std::mem::take(&mut batch);
+                        let lut_preimage_batch_start = Instant::now();
+                        let sampled_jobs = if let Some(previous_jobs) = pending_store_jobs.take() {
+                            let (_, jobs) = rayon::join(
+                                || {
+                                    let wait_start = Instant::now();
+                                    previous_jobs
+                                        .into_par_iter()
+                                        .for_each(CompactBytesJob::wait_then_store);
+                                    debug!(
+                                        "Previous batch store completed in {}",
+                                        Self::format_duration(wait_start.elapsed())
+                                    );
+                                },
+                                || sample_lut_batch(&current_batch),
+                            );
+                            jobs
+                        } else {
+                            sample_lut_batch(&current_batch)
+                        };
+                        let lut_preimage_batch_elapsed = lut_preimage_batch_start.elapsed();
+                        debug!(
+                            "Sampled LUT preimages: lut_id={}, batch_size={}, elapsed={}",
+                            lut_id,
+                            current_batch.len(),
+                            Self::format_duration(lut_preimage_batch_elapsed)
+                        );
+                        processed_lut_rows = processed_lut_rows.saturating_add(current_batch.len());
+                        let pct = if total_lut_rows == 0 {
+                            100.0
+                        } else {
+                            (processed_lut_rows as f64) * 100.0 / (total_lut_rows as f64)
+                        };
+                        debug!(
+                            "LUT rows processed: {}/{} ({pct:.1}%), elapsed={}",
+                            processed_lut_rows,
+                            total_lut_rows,
+                            Self::format_duration(start.elapsed())
+                        );
+                        pending_store_jobs = Some(sampled_jobs);
+                    }
+                }
+                if !batch.is_empty() {
+                    let current_batch = std::mem::take(&mut batch);
+                    let lut_preimage_batch_start = Instant::now();
+                    let sampled_jobs = if let Some(previous_jobs) = pending_store_jobs.take() {
+                        let (_, jobs) = rayon::join(
+                            || {
+                                previous_jobs
+                                    .into_par_iter()
+                                    .for_each(CompactBytesJob::wait_then_store);
+                            },
+                            || sample_lut_batch(&current_batch),
+                        );
+                        jobs
+                    } else {
+                        sample_lut_batch(&current_batch)
+                    };
+                    let lut_preimage_batch_elapsed = lut_preimage_batch_start.elapsed();
+                    debug!(
+                        "Sampled LUT preimages: lut_id={}, batch_size={}, elapsed={}",
+                        lut_id,
+                        current_batch.len(),
+                        Self::format_duration(lut_preimage_batch_elapsed)
+                    );
+                    pending_store_jobs = Some(sampled_jobs);
+                    processed_lut_rows = processed_lut_rows.saturating_add(current_batch.len());
+                    let pct = if total_lut_rows == 0 {
+                        100.0
+                    } else {
+                        (processed_lut_rows as f64) * 100.0 / (total_lut_rows as f64)
+                    };
+                    debug!(
+                        "LUT rows processed: {}/{} ({pct:.1}%), elapsed={}",
+                        processed_lut_rows,
+                        total_lut_rows,
+                        Self::format_duration(start.elapsed())
+                    );
+                }
+                if let Some(previous_jobs) = pending_store_jobs.take() {
+                    previous_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+                }
             }
             drop(w_block_vx);
             drop(w_block_v);
@@ -1205,389 +2248,88 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
             return;
         }
 
-        let error_sigma = self.error_sigma;
-        let trapdoor_sigma = self.trapdoor_sigma;
         let chunk_size = crate::env::ggh15_gate_parallelism();
         info!(
             "GGH15 gate preimage parallelism uses Rayon global pool (GGH15_GATE_PARALLELISM={})",
             chunk_size
         );
+        #[cfg(feature = "gpu")]
+        let gpu_gate_base_shared = self.prepare_gpu_gate_base_device_shared(
+            params,
+            &b0_trapdoor,
+            &b0_matrix,
+            &b1_trapdoor,
+            &b1_matrix,
+        );
 
         for (lut_id, mut gates) in gates_by_lut {
             let lut_gate_start = Instant::now();
+            let w_block_identity = self.derive_w_block_identity(params, lut_id);
+            let w_block_gy = self.derive_w_block_gy(params, lut_id);
+            let w_block_v = self.derive_w_block_v(params, lut_id);
+            let w_block_vx = self.derive_w_block_vx(params, lut_id);
+            #[cfg(feature = "gpu")]
+            let w_block_identity_by_device =
+                self.copy_matrix_to_gpu_gate_devices(&w_block_identity, &gpu_gate_base_shared);
+            #[cfg(feature = "gpu")]
+            let w_block_gy_by_device =
+                self.copy_matrix_to_gpu_gate_devices(&w_block_gy, &gpu_gate_base_shared);
+            #[cfg(feature = "gpu")]
+            let w_block_v_by_device =
+                self.copy_matrix_to_gpu_gate_devices(&w_block_v, &gpu_gate_base_shared);
+            #[cfg(feature = "gpu")]
+            let w_block_vx_by_device =
+                self.copy_matrix_to_gpu_gate_devices(&w_block_vx, &gpu_gate_base_shared);
+            #[cfg(feature = "gpu")]
+            let gpu_gate_shared = self.prepare_gpu_gate_device_shared(
+                &gpu_gate_base_shared,
+                w_block_identity_by_device,
+                w_block_gy_by_device,
+                w_block_v_by_device,
+                w_block_vx_by_device,
+            );
+
+            #[cfg(feature = "gpu")]
+            let sample_gate_batch = |pending: Vec<(GateId, GateState<M>)>| {
+                self.sample_gate_preimages_batch(params, lut_id, pending, &gpu_gate_shared)
+            };
+            #[cfg(not(feature = "gpu"))]
+            let sample_gate_batch = |pending: Vec<(GateId, GateState<M>)>| {
+                self.sample_gate_preimages_batch(
+                    params,
+                    lut_id,
+                    pending,
+                    &b0_trapdoor,
+                    &b0_matrix,
+                    &b1_trapdoor,
+                    &b1_matrix,
+                    &w_block_identity,
+                    &w_block_gy,
+                    &w_block_v,
+                    &w_block_vx,
+                )
+            };
 
             while !gates.is_empty() {
                 let take = gates.len().min(chunk_size);
                 let pending: Vec<(GateId, GateState<M>)> = gates.drain(..take).collect();
 
                 if !pending.is_empty() {
-                    total_gates = total_gates.saturating_add(pending.len());
-
-                    let stage1_entries = pending
-                        .into_par_iter()
-                        .map(|(gate_id, state)| {
-                            let uniform_sampler = US::new();
-                            let s_g = if self.insert_1_to_s {
-                                let s_g_bar = uniform_sampler.sample_uniform(
-                                    params,
-                                    d - 1,
-                                    d - 1,
-                                    DistType::TernaryDist,
-                                );
-                                s_g_bar.concat_diag_owned(vec![M::identity(params, 1, None)])
-                            } else {
-                                uniform_sampler.sample_uniform(params, d, d, DistType::TernaryDist)
-                            };
-                            let s_g_concat =
-                                M::identity(params, d, None).concat_columns_owned(vec![s_g]);
-                            let gate_target1 = {
-                                let error = uniform_sampler.sample_uniform(
-                                    params,
-                                    d,
-                                    b1_matrix.col_size(),
-                                    DistType::GaussDist { sigma: error_sigma },
-                                );
-                                s_g_concat.clone() * &b1_matrix + error
-                            };
-                            drop(s_g_concat);
-                            (gate_id, state, gate_target1)
-                        })
-                        .collect::<Vec<_>>();
-                    let stage1_target_cols = stage1_entries[0].2.col_size();
-                    debug_assert!(
-                        stage1_entries
-                            .iter()
-                            .all(|(_, _, target)| target.col_size() == stage1_target_cols),
-                        "stage1 target columns must be identical across gates"
+                    let pending_len = pending.len();
+                    total_gates = total_gates.saturating_add(pending_len);
+                    let gate_preimage_batch_start = Instant::now();
+                    debug!(
+                        "Sampling gate preimages batch started: lut_id={}, batch_size={}",
+                        lut_id, pending_len
                     );
-                    let mut stage1_gate_ids = Vec::with_capacity(stage1_entries.len());
-                    let mut stage2_inputs = Vec::with_capacity(stage1_entries.len());
-                    let mut stage1_targets = Vec::with_capacity(stage1_entries.len());
-                    for (gate_id, state, target) in stage1_entries {
-                        stage1_gate_ids.push(gate_id);
-                        stage2_inputs.push((gate_id, state));
-                        stage1_targets.push(target);
-                    }
-                    let stage1_batched_target = if stage1_targets.len() == 1 {
-                        stage1_targets.pop().expect("stage1_targets must contain one matrix")
-                    } else {
-                        let mut target_iter = stage1_targets.into_iter();
-                        let target_first =
-                            target_iter.next().expect("stage1_targets must be non-empty");
-                        target_first.concat_columns_owned(target_iter.collect())
-                    };
-                    let trap_sampler = TS::new(params, trapdoor_sigma);
-                    let stage1_batched_preimage = trap_sampler.preimage(
-                        params,
-                        &b0_trapdoor,
-                        &b0_matrix,
-                        &stage1_batched_target,
+                    sample_gate_batch(pending);
+                    let gate_preimage_batch_elapsed = gate_preimage_batch_start.elapsed();
+                    debug!(
+                        "Finished sampling gate preimages batch: lut_id={}, batch_size={}, elapsed={}",
+                        lut_id,
+                        pending_len,
+                        Self::format_duration(gate_preimage_batch_elapsed)
                     );
-                    let stage1_preimage_nrow = stage1_batched_preimage.row_size();
-                    let stage1_jobs = stage1_gate_ids
-                        .into_iter()
-                        .enumerate()
-                        .map(|(gate_pos, gate_id)| {
-                            let col_start = gate_pos
-                                .checked_mul(stage1_target_cols)
-                                .expect("stage1 preimage slice column offset overflow");
-                            let col_end = col_start + stage1_target_cols;
-                            let preimage_gate1 = stage1_batched_preimage.slice(
-                                0,
-                                stage1_preimage_nrow,
-                                col_start,
-                                col_end,
-                            );
-                            debug!(
-                                "Sampled gate preimage 1: gate_id={}, lut_id={}",
-                                gate_id, lut_id
-                            );
-                            CompactBytesJob::new(
-                                self.preimage_gate1_id_prefix(params, gate_id),
-                                vec![(0, preimage_gate1)],
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    stage1_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
-
-                    let w_block_identity = self.derive_w_block_identity(params, lut_id);
-                    let stage2_entries = stage2_inputs
-                        .into_par_iter()
-                        .map(|(gate_id, state)| {
-                            let hash_sampler = HS::new();
-                            let out_matrix = hash_sampler.sample_hash(
-                                params,
-                                self.hash_key,
-                                format!("ggh15_gate_a_out_{}", gate_id),
-                                d,
-                                m_g,
-                                DistType::FinRingDist,
-                            );
-                            let target_gate2_identity =
-                                out_matrix.concat_rows(&[&w_block_identity]);
-                            (gate_id, state, target_gate2_identity)
-                        })
-                        .collect::<Vec<_>>();
-                    let stage2_target_cols = stage2_entries[0].2.col_size();
-                    debug_assert!(
-                        stage2_entries
-                            .iter()
-                            .all(|(_, _, target)| target.col_size() == stage2_target_cols),
-                        "stage2 target columns must be identical across gates"
-                    );
-                    let mut stage2_gate_ids = Vec::with_capacity(stage2_entries.len());
-                    let mut stage3_inputs = Vec::with_capacity(stage2_entries.len());
-                    let mut stage2_targets = Vec::with_capacity(stage2_entries.len());
-                    for (gate_id, state, target) in stage2_entries {
-                        stage2_gate_ids.push(gate_id);
-                        stage3_inputs.push((gate_id, state));
-                        stage2_targets.push(target);
-                    }
-                    let stage2_batched_target = if stage2_targets.len() == 1 {
-                        stage2_targets.pop().expect("stage2_targets must contain one matrix")
-                    } else {
-                        let mut target_iter = stage2_targets.into_iter();
-                        let target_first =
-                            target_iter.next().expect("stage2_targets must be non-empty");
-                        target_first.concat_columns_owned(target_iter.collect())
-                    };
-                    let trap_sampler = TS::new(params, trapdoor_sigma);
-                    let stage2_batched_preimage = trap_sampler.preimage(
-                        params,
-                        &b1_trapdoor,
-                        &b1_matrix,
-                        &stage2_batched_target,
-                    );
-                    let stage2_preimage_nrow = stage2_batched_preimage.row_size();
-                    let stage2_jobs = stage2_gate_ids
-                        .into_iter()
-                        .enumerate()
-                        .map(|(gate_pos, gate_id)| {
-                            let col_start = gate_pos
-                                .checked_mul(stage2_target_cols)
-                                .expect("stage2 preimage slice column offset overflow");
-                            let col_end = col_start + stage2_target_cols;
-                            let preimage_gate2_identity = stage2_batched_preimage.slice(
-                                0,
-                                stage2_preimage_nrow,
-                                col_start,
-                                col_end,
-                            );
-                            debug!(
-                                "Sampled gate preimage 2 (identity part): gate_id={}, lut_id={}",
-                                gate_id, lut_id
-                            );
-                            CompactBytesJob::new(
-                                self.preimage_gate2_identity_id_prefix(params, gate_id),
-                                vec![(0, preimage_gate2_identity)],
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    drop(w_block_identity);
-                    stage2_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
-
-                    let w_block_gy = self.derive_w_block_gy(params, lut_id);
-                    let stage3_gate_ids =
-                        stage3_inputs.iter().map(|(gate_id, _)| *gate_id).collect::<Vec<_>>();
-                    let target_high_gy = -M::gadget_matrix(params, d);
-                    let target_gate2_gy = target_high_gy.concat_rows(&[&w_block_gy]);
-                    drop(target_high_gy);
-                    let stage3_target_cols = target_gate2_gy.col_size();
-                    let stage3_batched_target = if stage3_gate_ids.len() == 1 {
-                        target_gate2_gy.clone()
-                    } else {
-                        let stage3_target_refs = std::iter::repeat(&target_gate2_gy)
-                            .take(stage3_gate_ids.len())
-                            .collect::<Vec<_>>();
-                        stage3_target_refs[0].concat_columns(&stage3_target_refs[1..])
-                    };
-                    let trap_sampler = TS::new(params, trapdoor_sigma);
-                    let stage3_batched_preimage = trap_sampler.preimage(
-                        params,
-                        &b1_trapdoor,
-                        &b1_matrix,
-                        &stage3_batched_target,
-                    );
-                    let stage3_preimage_nrow = stage3_batched_preimage.row_size();
-                    let stage3_jobs = stage3_gate_ids
-                        .into_iter()
-                        .enumerate()
-                        .map(|(gate_pos, gate_id)| {
-                            let col_start = gate_pos
-                                .checked_mul(stage3_target_cols)
-                                .expect("stage3 preimage slice column offset overflow");
-                            let col_end = col_start + stage3_target_cols;
-                            let preimage_gate2_gy = stage3_batched_preimage.slice(
-                                0,
-                                stage3_preimage_nrow,
-                                col_start,
-                                col_end,
-                            );
-                            debug!(
-                                "Sampled gate preimage 2 (gy part): gate_id={}, lut_id={}",
-                                gate_id, lut_id
-                            );
-                            CompactBytesJob::new(
-                                self.preimage_gate2_gy_id_prefix(params, gate_id),
-                                vec![(0, preimage_gate2_gy)],
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    drop(w_block_gy);
-                    stage3_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
-
-                    let w_block_v = self.derive_w_block_v(params, lut_id);
-                    let stage4_entries = stage3_inputs
-                        .into_par_iter()
-                        .map(|(gate_id, state)| {
-                            let hash_sampler = HS::new();
-                            let input_matrix =
-                                M::from_compact_bytes(params, &state.input_pubkey_bytes);
-                            let u_g_matrix = hash_sampler.sample_hash(
-                                params,
-                                self.hash_key,
-                                format!("ggh15_lut_u_g_matrix_{}", gate_id),
-                                d,
-                                m_g,
-                                DistType::FinRingDist,
-                            );
-                            debug!(
-                                "Derived u_g_matrix for gate: gate_id={}, lut_id={}, rows={}, cols={}",
-                                gate_id,
-                                lut_id,
-                                u_g_matrix.row_size(),
-                                u_g_matrix.col_size()
-                            );
-                            let u_g_decomposed = u_g_matrix.decompose();
-                            let target_high_v = -(input_matrix * u_g_decomposed);
-                            let target_gate2_v = target_high_v.concat_rows(&[&w_block_v]);
-                            (gate_id, u_g_matrix, target_gate2_v)
-                        })
-                        .collect::<Vec<_>>();
-                    let stage4_target_cols = stage4_entries[0].2.col_size();
-                    debug_assert!(
-                        stage4_entries
-                            .iter()
-                            .all(|(_, _, target)| target.col_size() == stage4_target_cols),
-                        "stage4 target columns must be identical across gates"
-                    );
-                    let mut stage4_gate_ids = Vec::with_capacity(stage4_entries.len());
-                    let mut stage5_inputs = Vec::with_capacity(stage4_entries.len());
-                    let mut stage4_targets = Vec::with_capacity(stage4_entries.len());
-                    for (gate_id, u_g_matrix, target) in stage4_entries {
-                        stage4_gate_ids.push(gate_id);
-                        stage5_inputs.push((gate_id, u_g_matrix));
-                        stage4_targets.push(target);
-                    }
-                    let stage4_batched_target = if stage4_targets.len() == 1 {
-                        stage4_targets.pop().expect("stage4_targets must contain one matrix")
-                    } else {
-                        let mut target_iter = stage4_targets.into_iter();
-                        let target_first =
-                            target_iter.next().expect("stage4_targets must be non-empty");
-                        target_first.concat_columns_owned(target_iter.collect())
-                    };
-                    let trap_sampler = TS::new(params, trapdoor_sigma);
-                    let stage4_batched_preimage = trap_sampler.preimage(
-                        params,
-                        &b1_trapdoor,
-                        &b1_matrix,
-                        &stage4_batched_target,
-                    );
-                    let stage4_preimage_nrow = stage4_batched_preimage.row_size();
-                    let stage4_jobs = stage4_gate_ids
-                        .into_iter()
-                        .enumerate()
-                        .map(|(gate_pos, gate_id)| {
-                            let col_start = gate_pos
-                                .checked_mul(stage4_target_cols)
-                                .expect("stage4 preimage slice column offset overflow");
-                            let col_end = col_start + stage4_target_cols;
-                            let preimage_gate2_v = stage4_batched_preimage.slice(
-                                0,
-                                stage4_preimage_nrow,
-                                col_start,
-                                col_end,
-                            );
-                            debug!(
-                                "Sampled gate preimage 2 (v part): gate_id={}, lut_id={}",
-                                gate_id, lut_id
-                            );
-                            CompactBytesJob::new(
-                                self.preimage_gate2_v_id_prefix(params, gate_id),
-                                vec![(0, preimage_gate2_v)],
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    stage4_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
-                    drop(w_block_v);
-
-                    let w_block_vx = self.derive_w_block_vx(params, lut_id);
-                    let small_gadget_matrix = M::small_gadget_matrix(params, m_g);
-                    let stage5_entries = stage5_inputs
-                        .into_par_iter()
-                        .map(|(gate_id, u_g_matrix)| {
-                            let target_high_vx = u_g_matrix * &small_gadget_matrix;
-                            let target_gate2_vx = target_high_vx.concat_rows(&[&w_block_vx]);
-                            drop(target_high_vx);
-                            (gate_id, target_gate2_vx)
-                        })
-                        .collect::<Vec<_>>();
-                    let stage5_target_cols = stage5_entries[0].1.col_size();
-                    debug_assert!(
-                        stage5_entries
-                            .iter()
-                            .all(|(_, target)| target.col_size() == stage5_target_cols),
-                        "stage5 target columns must be identical across gates"
-                    );
-                    let mut stage5_gate_ids = Vec::with_capacity(stage5_entries.len());
-                    let mut stage5_targets = Vec::with_capacity(stage5_entries.len());
-                    for (gate_id, target) in stage5_entries {
-                        stage5_gate_ids.push(gate_id);
-                        stage5_targets.push(target);
-                    }
-                    let stage5_batched_target = if stage5_targets.len() == 1 {
-                        stage5_targets.pop().expect("stage5_targets must contain one matrix")
-                    } else {
-                        let mut target_iter = stage5_targets.into_iter();
-                        let target_first =
-                            target_iter.next().expect("stage5_targets must be non-empty");
-                        target_first.concat_columns_owned(target_iter.collect())
-                    };
-                    let trap_sampler = TS::new(params, trapdoor_sigma);
-                    let stage5_batched_preimage = trap_sampler.preimage(
-                        params,
-                        &b1_trapdoor,
-                        &b1_matrix,
-                        &stage5_batched_target,
-                    );
-                    let stage5_preimage_nrow = stage5_batched_preimage.row_size();
-                    let stage5_jobs = stage5_gate_ids
-                        .into_iter()
-                        .enumerate()
-                        .map(|(gate_pos, gate_id)| {
-                            let col_start = gate_pos
-                                .checked_mul(stage5_target_cols)
-                                .expect("stage5 preimage slice column offset overflow");
-                            let col_end = col_start + stage5_target_cols;
-                            let preimage_gate2_vx = stage5_batched_preimage.slice(
-                                0,
-                                stage5_preimage_nrow,
-                                col_start,
-                                col_end,
-                            );
-                            debug!(
-                                "Sampled gate preimage 2 (vx part): gate_id={}, lut_id={}",
-                                gate_id, lut_id
-                            );
-                            CompactBytesJob::new(
-                                self.preimage_gate2_vx_id_prefix(params, gate_id),
-                                vec![(0, preimage_gate2_vx)],
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    stage5_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
-                    drop(w_block_vx);
                 }
                 let pct = if total_gate_count == 0 {
                     100.0
@@ -1601,6 +2343,10 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                     Self::format_duration(start.elapsed())
                 );
             }
+            drop(w_block_vx);
+            drop(w_block_v);
+            drop(w_block_gy);
+            drop(w_block_identity);
             debug!(
                 "Gate group for LUT {} complete in {}",
                 lut_id,

@@ -91,6 +91,43 @@ impl<P: Poly> PublicLut<P> {
         }))
     }
 
+    #[cfg(feature = "gpu")]
+    pub fn entries_multi_gpus<'a>(
+        &'a self,
+        params_by_device: &'a [&'a P::Params],
+    ) -> Box<dyn Iterator<Item = (Vec<P>, (usize, Vec<P>))> + Send + 'a> {
+        assert!(
+            !params_by_device.is_empty(),
+            "entries_multi_gpus requires at least one device parameter set"
+        );
+        Box::new((0..self.len).map(move |input_idx| {
+            let mut x_by_device = Vec::with_capacity(params_by_device.len());
+            let mut y_by_device = Vec::with_capacity(params_by_device.len());
+            let mut row_idx: Option<usize> = None;
+            for &device_params in params_by_device {
+                let x = P::from_usize_to_constant(device_params, input_idx);
+                let (k, y) = (self.f)(device_params, &x).unwrap_or_else(|| {
+                    panic!(
+                        "LUT entry {} missing from 0..len range on one of GPU device params",
+                        input_idx
+                    )
+                });
+                if let Some(expected_k) = row_idx {
+                    assert_eq!(
+                        expected_k, k,
+                        "entries_multi_gpus expects consistent output-row idx across devices for input {}",
+                        input_idx
+                    );
+                } else {
+                    row_idx = Some(k);
+                }
+                x_by_device.push(x);
+                y_by_device.push(y);
+            }
+            (x_by_device, (row_idx.expect("row idx must exist"), y_by_device))
+        }))
+    }
+
     pub fn max_output_row(&self) -> &(usize, <P as Poly>::Elem) {
         &self.max_output_row
     }

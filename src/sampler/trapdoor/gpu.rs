@@ -4,6 +4,7 @@ use crate::{
     sampler::{DistType, PolyTrapdoorSampler, PolyUniformSampler, gpu::GpuDCRTPolyUniformSampler},
 };
 use rand::{Rng, rng};
+use rayon::prelude::*;
 use std::time::Instant;
 
 const SIGMA: f64 = 4.578;
@@ -105,6 +106,19 @@ pub struct GpuDCRTPolyTrapdoorSampler {
     sigma: f64,
     base: u32,
     c: f64,
+}
+
+#[derive(Debug)]
+pub struct GpuPreimageRequest<'a, M, T>
+where
+    M: PolyMatrix,
+    T: Send + Sync,
+{
+    pub entry_idx: usize,
+    pub params: &'a <<M as PolyMatrix>::P as Poly>::Params,
+    pub trapdoor: &'a T,
+    pub public_matrix: &'a M,
+    pub target: M,
 }
 
 impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
@@ -261,6 +275,53 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             "gpu preimage: finished"
         );
         out
+    }
+
+    fn gpu_device_ids(&self, params: &<<Self::M as PolyMatrix>::P as Poly>::Params) -> Vec<i32> {
+        params.gpu_ids().to_vec()
+    }
+
+    fn gpu_params_for_device(
+        &self,
+        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
+        device_id: i32,
+    ) -> <<Self::M as PolyMatrix>::P as Poly>::Params {
+        GpuDCRTPolyParams::new_with_gpu(
+            params.ring_dimension(),
+            params.moduli().to_vec(),
+            params.base_bits(),
+            vec![device_id],
+            Some(1),
+            params.batch(),
+        )
+    }
+
+    fn preimage_batched_sharded<'a>(
+        &self,
+        requests: Vec<GpuPreimageRequest<'a, Self::M, Self::Trapdoor>>,
+    ) -> Vec<(usize, Self::M)>
+    where
+        Self::Trapdoor: Send + Sync + 'a,
+        Self::M: 'a,
+    {
+        tracing::debug!(
+            request_count = requests.len(),
+            "gpu preimage: start multi-target sharded dispatch"
+        );
+        let results = requests
+            .into_par_iter()
+            .map(|request| {
+                let out = self.preimage(
+                    &request.params,
+                    &request.trapdoor,
+                    &request.public_matrix,
+                    &request.target,
+                );
+                (request.entry_idx, out)
+            })
+            .collect::<Vec<_>>();
+        tracing::debug!("gpu preimage: finished multi-target sharded dispatch");
+        results
     }
 
     fn preimage_extend(

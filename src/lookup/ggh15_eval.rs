@@ -18,7 +18,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::read_to_string,
     marker::PhantomData,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 use tracing::{debug, info, warn};
@@ -152,6 +152,54 @@ where
     debug_assert_eq!(v_idx.row_size(), m_g, "derived v_idx rows must equal d * modulus_digits");
     debug_assert_eq!(v_idx.col_size(), m_g, "derived v_idx cols must equal d * modulus_digits");
     v_idx
+}
+
+fn small_gadget_chunk_count<M>(params: &<M::P as Poly>::Params) -> usize
+where
+    M: PolyMatrix,
+{
+    let (_, _, crt_depth) = params.to_crt();
+    params.modulus_digits() / crt_depth
+}
+
+fn read_matrix_from_chunks<M>(
+    params: &<M::P as Poly>::Params,
+    dir: &Path,
+    id_prefix: &str,
+    expected_chunk_cols: usize,
+    chunk_count: usize,
+    label: &str,
+) -> M
+where
+    M: PolyMatrix,
+{
+    assert!(chunk_count > 0, "{label} chunk_count must be > 0 (id_prefix={id_prefix})");
+    let first = read_matrix_from_multi_batch::<M>(params, dir, id_prefix, 0)
+        .unwrap_or_else(|| panic!("{label} (index 0) not found: id_prefix={id_prefix}"));
+    assert_eq!(
+        first.col_size(),
+        expected_chunk_cols,
+        "{label} chunk 0 must have {expected_chunk_cols} columns (id_prefix={id_prefix})"
+    );
+    if chunk_count == 1 {
+        return first;
+    }
+
+    let mut chunks = Vec::with_capacity(chunk_count - 1);
+    for chunk_idx in 1..chunk_count {
+        let chunk = read_matrix_from_multi_batch::<M>(params, dir, id_prefix, chunk_idx)
+            .unwrap_or_else(|| {
+                panic!("{label} chunk {chunk_idx} not found: id_prefix={id_prefix}")
+            });
+        assert_eq!(
+            chunk.col_size(),
+            expected_chunk_cols,
+            "{label} chunk {} must have {expected_chunk_cols} columns (id_prefix={id_prefix})",
+            chunk_idx
+        );
+        chunks.push(chunk);
+    }
+    first.concat_columns_owned(chunks)
 }
 
 pub struct GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
@@ -710,7 +758,12 @@ where
 
         let d = self.d;
         let m_g = d * params.modulus_digits();
+        let k_small = small_gadget_chunk_count::<M>(params);
         let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        debug_assert!(
+            shared.iter().all(|entry| entry.w_block_vx.col_size() == m_g * k_small),
+            "w_block_vx columns must equal m_g * k_small"
+        );
 
         let stage1_entries = pending
             .into_par_iter()
@@ -934,49 +987,72 @@ where
             .collect::<Vec<_>>();
         stage4_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
 
-        let stage5_requests = stage5_inputs
-            .iter()
-            .map(|(entry_pos, gate_id)| {
-                let shared = &shared[*entry_pos];
-                let hash_sampler = HS::new();
-                let u_g_matrix = hash_sampler.sample_hash(
-                    shared.params,
-                    self.hash_key,
-                    format!("ggh15_lut_u_g_matrix_{}", gate_id),
-                    d,
-                    m_g,
-                    DistType::FinRingDist,
-                );
-                let small_gadget_matrix = M::small_gadget_matrix(shared.params, m_g);
-                let target_high_vx = u_g_matrix * &small_gadget_matrix;
-                let target_gate2_vx = target_high_vx.concat_rows(&[&shared.w_block_vx]);
-                GpuPreimageRequest {
-                    entry_idx: *entry_pos,
-                    params: shared.params,
-                    trapdoor: shared.b1_trapdoor,
-                    public_matrix: shared.b1_matrix,
-                    target: target_gate2_vx,
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut stage5_preimages = trap_sampler
-            .preimage_batched_sharded(stage5_requests)
-            .into_iter()
-            .collect::<HashMap<usize, M>>();
-        let stage5_jobs = stage5_inputs
-            .iter()
-            .map(|(entry_pos, gate_id)| {
-                let preimage_gate2_vx = stage5_preimages.remove(entry_pos).unwrap_or_else(|| {
-                    panic!("missing gate stage5 preimage for entry_pos={entry_pos}")
-                });
-                debug!("Sampled gate preimage 2 (vx part): gate_id={}, lut_id={}", gate_id, lut_id);
-                CompactBytesJob::new(
-                    self.preimage_gate2_vx_id_prefix(params, *gate_id),
-                    vec![(0, preimage_gate2_vx)],
-                )
-            })
-            .collect::<Vec<_>>();
-        stage5_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+        for chunk_idx in 0..k_small {
+            let chunk_col_start =
+                chunk_idx.checked_mul(m_g).expect("stage5 chunk start column overflow");
+            let chunk_col_end = chunk_col_start + m_g;
+            let stage5_requests = stage5_inputs
+                .iter()
+                .map(|(entry_pos, gate_id)| {
+                    let shared = &shared[*entry_pos];
+                    let hash_sampler = HS::new();
+                    let u_g_matrix = hash_sampler.sample_hash(
+                        shared.params,
+                        self.hash_key,
+                        format!("ggh15_lut_u_g_matrix_{}", gate_id),
+                        d,
+                        m_g,
+                        DistType::FinRingDist,
+                    );
+                    let target_high_vx_chunk = self.build_stage5_target_high_vx_chunk(
+                        shared.params,
+                        &u_g_matrix,
+                        chunk_idx,
+                        m_g,
+                    );
+                    let w_block_vx_chunk = shared.w_block_vx.slice(
+                        0,
+                        shared.w_block_vx.row_size(),
+                        chunk_col_start,
+                        chunk_col_end,
+                    );
+                    let target_gate2_vx_chunk =
+                        target_high_vx_chunk.concat_rows(&[&w_block_vx_chunk]);
+                    GpuPreimageRequest {
+                        entry_idx: *entry_pos,
+                        params: shared.params,
+                        trapdoor: shared.b1_trapdoor,
+                        public_matrix: shared.b1_matrix,
+                        target: target_gate2_vx_chunk,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut stage5_preimages = trap_sampler
+                .preimage_batched_sharded(stage5_requests)
+                .into_iter()
+                .collect::<HashMap<usize, M>>();
+            let stage5_jobs = stage5_inputs
+                .iter()
+                .map(|(entry_pos, gate_id)| {
+                    let preimage_gate2_vx_chunk = stage5_preimages
+                        .remove(entry_pos)
+                        .unwrap_or_else(|| {
+                            panic!("missing gate stage5 preimage for entry_pos={entry_pos}, chunk_idx={chunk_idx}")
+                        });
+                    debug!(
+                        "Sampled gate preimage 2 (vx part): gate_id={}, lut_id={}, chunk_idx={}",
+                        gate_id,
+                        lut_id,
+                        chunk_idx
+                    );
+                    CompactBytesJob::new(
+                        self.preimage_gate2_vx_id_prefix(params, *gate_id),
+                        vec![(chunk_idx, preimage_gate2_vx_chunk)],
+                    )
+                })
+                .collect::<Vec<_>>();
+            stage5_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+        }
     }
 
     #[cfg(not(feature = "gpu"))]
@@ -999,6 +1075,7 @@ where
         }
         let d = self.d;
         let m_g = d * params.modulus_digits();
+        let k_small = small_gadget_chunk_count::<M>(params);
 
         let stage1_entries = pending
             .into_par_iter()
@@ -1286,9 +1363,28 @@ where
                 let preimage_gate2_vx =
                     stage5_batched_preimage.slice(0, stage5_preimage_nrow, col_start, col_end);
                 debug!("Sampled gate preimage 2 (vx part): gate_id={}, lut_id={}", gate_id, lut_id);
+                debug_assert_eq!(
+                    preimage_gate2_vx.col_size(),
+                    m_g * k_small,
+                    "stage5 preimage columns must equal m_g * k_small"
+                );
+                let chunked_preimages = (0..k_small)
+                    .map(|chunk_idx| {
+                        let chunk_col_start =
+                            chunk_idx.checked_mul(m_g).expect("stage5 chunk start column overflow");
+                        let chunk_col_end = chunk_col_start + m_g;
+                        let chunk = preimage_gate2_vx.slice(
+                            0,
+                            preimage_gate2_vx.row_size(),
+                            chunk_col_start,
+                            chunk_col_end,
+                        );
+                        (chunk_idx, chunk)
+                    })
+                    .collect::<Vec<_>>();
                 CompactBytesJob::new(
                     self.preimage_gate2_vx_id_prefix(params, gate_id),
-                    vec![(0, preimage_gate2_vx)],
+                    chunked_preimages,
                 )
             })
             .collect::<Vec<_>>();
@@ -1335,9 +1431,38 @@ where
 
     fn derive_w_block_vx(&self, params: &<M::P as Poly>::Params, lut_id: usize) -> M {
         let m_g = self.d * params.modulus_digits();
-        let (_, _, crt_depth) = params.to_crt();
-        let k_small = params.modulus_digits() / crt_depth;
+        let k_small = small_gadget_chunk_count::<M>(params);
         self.derive_w_block_with_tag(params, lut_id, "block_vx", m_g * k_small)
+    }
+
+    #[cfg(feature = "gpu")]
+    fn build_stage5_target_high_vx_chunk(
+        &self,
+        params: &<M::P as Poly>::Params,
+        u_g_matrix: &M,
+        chunk_idx: usize,
+        m_g: usize,
+    ) -> M {
+        let d = self.d;
+        let k_small = small_gadget_chunk_count::<M>(params);
+        debug_assert!(chunk_idx < k_small, "chunk_idx must be < k_small");
+
+        let chunk_start = chunk_idx.checked_mul(m_g).expect("stage5 chunk column offset overflow");
+        let mut target_high_vx_chunk = M::zero(params, d, m_g);
+        let scalar_by_digit = (0..k_small)
+            .map(|digit| M::P::from_power_of_base_to_constant(params, digit))
+            .collect::<Vec<_>>();
+
+        for local_col in 0..m_g {
+            let global_col = chunk_start + local_col;
+            let src_col = global_col / k_small;
+            let digit = global_col % k_small;
+            let src_column = u_g_matrix.slice(0, d, src_col, src_col + 1);
+            let scaled_column = src_column * &scalar_by_digit[digit];
+            target_high_vx_chunk.copy_block_from(&scaled_column, 0, local_col, 0, 0, d, 1);
+        }
+
+        target_high_vx_chunk
     }
 
     fn aux_checkpoint_prefix(&self, params: &<M::P as Poly>::Params) -> String {
@@ -1511,7 +1636,8 @@ where
         part_index_cache: Option<&HashMap<String, HashSet<usize>>>,
         checkpoint_prefix: &str,
         gate_id: GateId,
-        gate_chunk_count: usize,
+        gate_v_chunk_count: usize,
+        gate_vx_chunk_count: usize,
     ) -> bool {
         let gate1_prefix = format!("{checkpoint_prefix}_preimage_gate1_{}", gate_id);
         let gate2_identity_prefix =
@@ -1527,7 +1653,7 @@ where
                 0,
             ) &&
             Self::checkpoint_has_index(checkpoint_index, part_index_cache, &gate2_gy_prefix, 0) &&
-            (0..gate_chunk_count).into_par_iter().all(|chunk_idx| {
+            (0..gate_v_chunk_count).into_par_iter().all(|chunk_idx| {
                 Self::checkpoint_has_index(
                     checkpoint_index,
                     part_index_cache,
@@ -1535,7 +1661,7 @@ where
                     chunk_idx,
                 )
             }) &&
-            (0..gate_chunk_count).into_par_iter().all(|chunk_idx| {
+            (0..gate_vx_chunk_count).into_par_iter().all(|chunk_idx| {
                 Self::checkpoint_has_index(
                     checkpoint_index,
                     part_index_cache,
@@ -1550,7 +1676,8 @@ where
         checkpoint_prefix: &str,
         lut_ids: &[usize],
         gate_ids: &[GateId],
-        gate_chunk_count: usize,
+        gate_v_chunk_count: usize,
+        gate_vx_chunk_count: usize,
     ) -> bool {
         let Some(checkpoint_index) = checkpoint_index else {
             return false;
@@ -1566,12 +1693,12 @@ where
         }
 
         impl GateResumeState {
-            fn is_complete(&self, gate_chunk_count: usize) -> bool {
+            fn is_complete(&self, gate_v_chunk_count: usize, gate_vx_chunk_count: usize) -> bool {
                 self.gate1 &&
                     self.gate2_identity &&
                     self.gate2_gy &&
-                    self.gate2_v_chunks.len() == gate_chunk_count &&
-                    self.gate2_vx_chunks.len() == gate_chunk_count
+                    self.gate2_v_chunks.len() == gate_v_chunk_count &&
+                    self.gate2_vx_chunks.len() == gate_vx_chunk_count
             }
         }
 
@@ -1605,7 +1732,7 @@ where
                 let gate_id = GateId(gate_id_raw);
                 let state = gate_states.entry(gate_id).or_default();
                 state.gate1 = true;
-                if state.is_complete(gate_chunk_count) {
+                if state.is_complete(gate_v_chunk_count, gate_vx_chunk_count) {
                     return true;
                 }
                 continue;
@@ -1619,7 +1746,7 @@ where
                 let gate_id = GateId(gate_id_raw);
                 let state = gate_states.entry(gate_id).or_default();
                 state.gate2_identity = true;
-                if state.is_complete(gate_chunk_count) {
+                if state.is_complete(gate_v_chunk_count, gate_vx_chunk_count) {
                     return true;
                 }
                 continue;
@@ -1633,7 +1760,7 @@ where
                 let gate_id = GateId(gate_id_raw);
                 let state = gate_states.entry(gate_id).or_default();
                 state.gate2_gy = true;
-                if state.is_complete(gate_chunk_count) {
+                if state.is_complete(gate_v_chunk_count, gate_vx_chunk_count) {
                     return true;
                 }
                 continue;
@@ -1649,11 +1776,11 @@ where
                     .indices
                     .iter()
                     .copied()
-                    .filter(|chunk_idx| *chunk_idx < gate_chunk_count)
+                    .filter(|chunk_idx| *chunk_idx < gate_v_chunk_count)
                     .for_each(|chunk_idx| {
                         state.gate2_v_chunks.insert(chunk_idx);
                     });
-                if state.is_complete(gate_chunk_count) {
+                if state.is_complete(gate_v_chunk_count, gate_vx_chunk_count) {
                     return true;
                 }
                 continue;
@@ -1669,11 +1796,11 @@ where
                     .indices
                     .iter()
                     .copied()
-                    .filter(|chunk_idx| *chunk_idx < gate_chunk_count)
+                    .filter(|chunk_idx| *chunk_idx < gate_vx_chunk_count)
                     .for_each(|chunk_idx| {
                         state.gate2_vx_chunks.insert(chunk_idx);
                     });
-                if state.is_complete(gate_chunk_count) {
+                if state.is_complete(gate_v_chunk_count, gate_vx_chunk_count) {
                     return true;
                 }
             }
@@ -1829,13 +1956,15 @@ where
                 gate_entries.push((gate_id, state));
             }
         }
-        let gate_chunk_count = params.modulus_digits();
+        let gate_v_chunk_count = 1usize;
+        let gate_vx_chunk_count = small_gadget_chunk_count::<M>(params);
         let has_resume_candidates = Self::has_resume_candidates(
             checkpoint_index.as_ref(),
             &checkpoint_prefix,
             &lut_ids,
             &gate_ids,
-            gate_chunk_count,
+            gate_v_chunk_count,
+            gate_vx_chunk_count,
         );
         let total_gate_count = gate_entries.len();
         debug!("Gate sampling start: total_gates={}, chunk_size={}", total_gate_count, chunk_size);
@@ -1973,7 +2102,8 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                         checkpoint_part_index_cache.as_ref(),
                         &checkpoint_prefix,
                         gate_id,
-                        gate_chunk_count,
+                        gate_v_chunk_count,
+                        gate_vx_chunk_count,
                     ) {
                         resumed = resumed.saturating_add(1);
                     } else {
@@ -2478,8 +2608,7 @@ where
         let hash_sampler = HS::new();
         let d = input.pubkey.matrix.row_size();
         let m_g = d * params.modulus_digits();
-        let (_, _, crt_depth) = params.to_crt();
-        let k_small = params.modulus_digits() / crt_depth;
+        let k_small = small_gadget_chunk_count::<M>(params);
         // let mut c_const: Option<M> = None;
 
         let preimage_gate2_identity = read_matrix_from_multi_batch::<M>(
@@ -2514,13 +2643,14 @@ where
         c_const = c_const + sg_times_b1.clone() * preimage_gate2_gy * gy_decomposed;
 
         let v_idx = derive_lut_v_idx_from_hash::<M, HS>(params, self.hash_key, lut_id, k, d);
-        let preimage_gate2_v = read_matrix_from_multi_batch::<M>(
+        let preimage_gate2_v = read_matrix_from_chunks::<M>(
             params,
             dir,
             &format!("{checkpoint_prefix}_preimage_gate2_v_{}", gate_id),
-            0,
-        )
-        .unwrap_or_else(|| panic!("preimage_gate2_v for gate {} not found", gate_id));
+            m_g,
+            1,
+            "preimage_gate2_v",
+        );
         debug_assert_eq!(
             preimage_gate2_v.col_size(),
             m_g,
@@ -2528,13 +2658,14 @@ where
         );
         c_const = c_const + sg_times_b1.clone() * preimage_gate2_v * &v_idx;
 
-        let preimage_gate2_vx = read_matrix_from_multi_batch::<M>(
+        let preimage_gate2_vx = read_matrix_from_chunks::<M>(
             params,
             dir,
             &format!("{checkpoint_prefix}_preimage_gate2_vx_{}", gate_id),
-            0,
-        )
-        .unwrap_or_else(|| panic!("preimage_gate2_vx for gate {} not found", gate_id));
+            m_g,
+            k_small,
+            "preimage_gate2_vx",
+        );
         debug_assert_eq!(
             preimage_gate2_vx.col_size(),
             m_g * k_small,

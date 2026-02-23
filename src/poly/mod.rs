@@ -33,6 +33,14 @@ pub trait PolyParams: Clone + Debug + PartialEq + Eq + Send + Sync {
     /// Given the parameter, return the crt decomposed moduli as array along with the bit size and
     /// depth of these moduli.
     fn to_crt(&self) -> (Vec<u64>, usize, usize);
+    #[cfg(feature = "gpu")]
+    fn device_ids(&self) -> Vec<i32> {
+        vec![0]
+    }
+    #[cfg(feature = "gpu")]
+    fn params_for_device(&self, _device_id: i32) -> Self {
+        self.clone()
+    }
     /// Return CRT reconstruction coefficients for each CRT modulus.
     fn reconst_coeffs(&self) -> Vec<BigUint> {
         let (moduli, _, _) = self.to_crt();

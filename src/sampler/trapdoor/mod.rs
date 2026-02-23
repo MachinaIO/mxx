@@ -17,7 +17,7 @@ use crate::{
     sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
 };
 #[cfg(feature = "gpu")]
-pub use gpu::{GpuDCRTPolyTrapdoorSampler, GpuDCRTTrapdoor};
+pub use gpu::{GpuDCRTPolyTrapdoorSampler, GpuDCRTTrapdoor, GpuPreimageRequest};
 use openfhe::ffi::{FormatMatrixCoefficient, SampleP1ForPertMat};
 use rayon::iter::ParallelIterator;
 pub use sampler::DCRTPolyTrapdoorSampler;

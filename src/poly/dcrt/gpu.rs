@@ -252,6 +252,16 @@ fn available_gpu_ids() -> Vec<i32> {
     (0..count).map(|idx| idx as i32).collect()
 }
 
+#[cfg(feature = "gpu")]
+pub fn detected_gpu_device_count() -> usize {
+    available_gpu_ids().len()
+}
+
+#[cfg(feature = "gpu")]
+pub fn detected_gpu_device_ids() -> Vec<i32> {
+    available_gpu_ids()
+}
+
 fn pinned_alloc<T>(len: usize) -> NonNull<T> {
     if len == 0 {
         return NonNull::dangling();
@@ -418,6 +428,22 @@ impl PolyParams for GpuDCRTPolyParams {
     fn to_crt(&self) -> (Vec<u64>, usize, usize) {
         (self.moduli.clone(), self.crt_bits, self.crt_depth)
     }
+
+    fn device_ids(&self) -> Vec<i32> {
+        let detected = detected_gpu_device_ids();
+        if detected.is_empty() { self.gpu_ids.clone() } else { detected }
+    }
+
+    fn params_for_device(&self, device_id: i32) -> Self {
+        GpuDCRTPolyParams::new_with_gpu(
+            self.ring_dimension,
+            self.moduli.clone(),
+            self.base_bits,
+            vec![device_id],
+            Some(1),
+            self.batch,
+        )
+    }
 }
 
 impl GpuDCRTPolyParams {
@@ -467,6 +493,10 @@ impl GpuDCRTPolyParams {
 
     pub fn moduli(&self) -> &[u64] {
         &self.moduli
+    }
+
+    pub fn gpu_ids(&self) -> &[i32] {
+        &self.gpu_ids
     }
 
     pub fn batch(&self) -> u32 {

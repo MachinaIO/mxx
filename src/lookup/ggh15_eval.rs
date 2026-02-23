@@ -914,6 +914,7 @@ where
                 target,
             });
         }
+
         let mut stage4_preimages = trap_sampler
             .preimage_batched_sharded(stage4_requests)
             .into_iter()

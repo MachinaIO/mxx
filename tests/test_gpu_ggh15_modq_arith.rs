@@ -344,6 +344,28 @@ async fn test_gpu_ggh15_modq_arith() {
         .collect();
     info!("sampled {} public keys", pubkeys.len());
 
+    let enc_setup_start = Instant::now();
+    let encoding_sampler =
+        BGGEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
+    let encodings = encoding_sampler.sample(&params, &pubkeys, &plaintext_inputs);
+    info!("encoding sampling elapsed_ms={:.3}", enc_setup_start.elapsed().as_secs_f64() * 1000.0);
+    let encodings_compact_start = Instant::now();
+    let encodings_compact: Vec<_> = encodings
+        .into_iter()
+        .map(|encoding| {
+            (
+                encoding.vector.into_compact_bytes(),
+                encoding.pubkey.matrix.into_compact_bytes(),
+                encoding.pubkey.reveal_plaintext,
+                encoding.plaintext,
+            )
+        })
+        .collect();
+    info!(
+        "encoding compact serialization elapsed_ms={:.3}",
+        encodings_compact_start.elapsed().as_secs_f64() * 1000.0
+    );
+
     let pk_evaluator_setup_start = Instant::now();
     let pk_evaluator =
         GGH15BGGPubKeyPltEvaluator::<
@@ -361,6 +383,7 @@ async fn test_gpu_ggh15_modq_arith() {
     let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(&pk_evaluator));
     info!("pubkey eval elapsed_ms={:.3}", pubkey_eval_start.elapsed().as_secs_f64() * 1000.0);
     assert_eq!(pubkey_out.len(), 1);
+    drop(pubkeys);
 
     let sample_aux_start = Instant::now();
     pk_evaluator.sample_aux_matrices(&params);
@@ -381,22 +404,31 @@ async fn test_gpu_ggh15_modq_arith() {
         .expect("b0 matrix checkpoint should exist after sample_aux_matrices");
     let c_b0 = s_vec.clone() * &b0_matrix;
     let checkpoint_prefix = pk_evaluator.checkpoint_prefix(&params);
+    drop(pk_evaluator);
 
     let enc_evaluator = GGH15BGGEncodingPltEvaluator::<
         GpuDCRTPolyMatrix,
         GpuDCRTPolyHashSampler<Keccak256>,
     >::new(seed, dir.to_path_buf(), checkpoint_prefix, c_b0);
 
-    let enc_setup_start = Instant::now();
-    let encoding_sampler =
-        BGGEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
-    let encodings: Vec<_> = encoding_sampler
-        .sample(&params, &pubkeys, &plaintext_inputs)
+    let encodings_restore_start = Instant::now();
+    let encodings: Vec<_> = encodings_compact
         .into_iter()
-        .map(Arc::new)
+        .map(|(vector_bytes, pubkey_bytes, reveal_plaintext, plaintext)| {
+            Arc::new(mxx::bgg::encoding::BggEncoding::new(
+                GpuDCRTPolyMatrix::from_compact_bytes(&params, &vector_bytes),
+                mxx::bgg::public_key::BggPublicKey::new(
+                    GpuDCRTPolyMatrix::from_compact_bytes(&params, &pubkey_bytes),
+                    reveal_plaintext,
+                ),
+                plaintext,
+            ))
+        })
         .collect();
-    info!("encoding sampling elapsed_ms={:.3}", enc_setup_start.elapsed().as_secs_f64() * 1000.0);
-    drop(pubkeys);
+    info!(
+        "encoding restore elapsed_ms={:.3}",
+        encodings_restore_start.elapsed().as_secs_f64() * 1000.0
+    );
 
     let encoding_eval_start = Instant::now();
     let encoding_out = circuit.eval(&params, &encodings[0], &encodings[1..], Some(&enc_evaluator));

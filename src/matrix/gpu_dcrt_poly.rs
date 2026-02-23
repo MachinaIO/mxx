@@ -708,7 +708,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         );
     }
 
-    fn to_compact_bytes(&self) -> Vec<u8> {
+    fn into_compact_bytes(self) -> Vec<u8> {
         let format = if self.is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
 
         let level = self.level;
@@ -729,10 +729,9 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         let mut bytes_per_coeff: u16 = 0;
         let mut payload_len: usize = 0;
 
-        let tmp = self.clone();
         let status = unsafe {
             gpu_matrix_store_compact_bytes(
-                tmp.raw,
+                self.raw,
                 payload.as_mut_ptr(),
                 payload.len(),
                 &mut max_coeff_bits as *mut u16,

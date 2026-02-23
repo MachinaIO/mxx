@@ -52,7 +52,7 @@ where
         let mut payloads = Vec::with_capacity(self.matrices.len());
         let mut max_len = 0usize;
         for (idx, matrix) in self.matrices {
-            let bytes = matrix.to_compact_bytes();
+            let bytes = matrix.into_compact_bytes();
             max_len = max_len.max(bytes.len());
             payloads.push((idx, bytes));
         }
@@ -108,8 +108,6 @@ where
     b0_matrix: M,
     b1_trapdoor: T,
     b1_matrix: M,
-    gadget_matrix: M,
-    small_gadget_matrix: M,
 }
 
 #[cfg(feature = "gpu")]
@@ -128,8 +126,6 @@ where
     w_block_gy: M,
     w_block_v: M,
     w_block_vx: M,
-    gadget_matrix: &'a M,
-    small_gadget_matrix: &'a M,
 }
 
 fn derive_lut_v_idx_from_hash<M, HS>(
@@ -292,9 +288,6 @@ where
         let b0_matrix_bytes = b0_matrix.to_compact_bytes();
         let b1_trapdoor_bytes = TS::trapdoor_to_bytes(b1_trapdoor);
         let b1_matrix_bytes = b1_matrix.to_compact_bytes();
-        let gadget_matrix_bytes = M::gadget_matrix(params, self.d).to_compact_bytes();
-        let m_g = self.d * params.modulus_digits();
-        let small_gadget_matrix_bytes = M::small_gadget_matrix(params, m_g).to_compact_bytes();
 
         device_ids
             .into_iter()
@@ -310,10 +303,6 @@ where
                     );
                 let local_b0_matrix = M::from_compact_bytes(&local_params, &b0_matrix_bytes);
                 let local_b1_matrix = M::from_compact_bytes(&local_params, &b1_matrix_bytes);
-                let local_gadget_matrix =
-                    M::from_compact_bytes(&local_params, &gadget_matrix_bytes);
-                let local_small_gadget_matrix =
-                    M::from_compact_bytes(&local_params, &small_gadget_matrix_bytes);
                 GpuGateBaseDeviceShared {
                     device_id,
                     params: local_params,
@@ -321,8 +310,6 @@ where
                     b0_matrix: local_b0_matrix,
                     b1_trapdoor: local_b1_trapdoor,
                     b1_matrix: local_b1_matrix,
-                    gadget_matrix: local_gadget_matrix,
-                    small_gadget_matrix: local_small_gadget_matrix,
                 }
             })
             .collect()
@@ -393,8 +380,6 @@ where
                     w_block_gy: w_gy_it.next().expect("missing w_block_gy replica for gate device"),
                     w_block_v: w_v_it.next().expect("missing w_block_v replica for gate device"),
                     w_block_vx: w_vx_it.next().expect("missing w_block_vx replica for gate device"),
-                    gadget_matrix: &base.gadget_matrix,
-                    small_gadget_matrix: &base.small_gadget_matrix,
                 }
             })
             .collect()
@@ -858,7 +843,7 @@ where
             .iter()
             .map(|(entry_pos, _, _)| {
                 let shared = &shared[*entry_pos];
-                let target_high_gy = -shared.gadget_matrix.clone();
+                let target_high_gy = -M::gadget_matrix(shared.params, d);
                 let target_gate2_gy = target_high_gy.concat_rows(&[&shared.w_block_gy]);
                 GpuPreimageRequest {
                     entry_idx: *entry_pos,
@@ -952,7 +937,8 @@ where
             .iter()
             .map(|(entry_pos, _, u_g_matrix)| {
                 let shared = &shared[*entry_pos];
-                let target_high_vx = u_g_matrix.clone() * shared.small_gadget_matrix;
+                let small_gadget_matrix = M::small_gadget_matrix(shared.params, m_g);
+                let target_high_vx = u_g_matrix.clone() * &small_gadget_matrix;
                 let target_gate2_vx = target_high_vx.concat_rows(&[&shared.w_block_vx]);
                 GpuPreimageRequest {
                     entry_idx: *entry_pos,
@@ -2224,6 +2210,8 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                     previous_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
                 }
             }
+            #[cfg(feature = "gpu")]
+            drop(gpu_lut_shared);
             drop(w_block_vx);
             drop(w_block_v);
             drop(w_block_gy);
@@ -2235,6 +2223,8 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                 resumed_rows_for_lut
             );
         }
+        #[cfg(feature = "gpu")]
+        drop(gpu_lut_base_shared);
 
         if total_gate_count == 0 {
             info!("No gate auxiliary matrices to sample");

@@ -213,8 +213,21 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
 
     let (_crt_depth, cpu_params, q_over_p) = find_crt_depth_for_modp_chain();
     let (moduli, _, _) = cpu_params.to_crt();
-    let params =
-        GpuDCRTPolyParams::new(cpu_params.ring_dimension(), moduli, cpu_params.base_bits());
+    let detected_gpu_params =
+        GpuDCRTPolyParams::new(cpu_params.ring_dimension(), moduli.clone(), cpu_params.base_bits());
+    let single_gpu_id = *detected_gpu_params
+        .gpu_ids()
+        .first()
+        .expect("at least one GPU device is required for test_gpu_ggh15_modp_chain_rounding");
+    let params = GpuDCRTPolyParams::new_with_gpu(
+        cpu_params.ring_dimension(),
+        moduli,
+        cpu_params.base_bits(),
+        vec![single_gpu_id],
+        Some(1),
+        detected_gpu_params.batch(),
+    );
+    info!("forcing single GPU for this test: gpu_id={}", single_gpu_id);
     assert_eq!(params.modulus(), cpu_params.modulus());
 
     let circuit = build_modp_chain_circuit_gpu(&params, P);

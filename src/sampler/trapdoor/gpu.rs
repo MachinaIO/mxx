@@ -277,25 +277,6 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         out
     }
 
-    fn gpu_device_ids(&self, params: &<<Self::M as PolyMatrix>::P as Poly>::Params) -> Vec<i32> {
-        params.gpu_ids().to_vec()
-    }
-
-    fn gpu_params_for_device(
-        &self,
-        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
-        device_id: i32,
-    ) -> <<Self::M as PolyMatrix>::P as Poly>::Params {
-        GpuDCRTPolyParams::new_with_gpu(
-            params.ring_dimension(),
-            params.moduli().to_vec(),
-            params.base_bits(),
-            vec![device_id],
-            Some(1),
-            params.batch(),
-        )
-    }
-
     fn preimage_batched_sharded<'a>(
         &self,
         requests: Vec<GpuPreimageRequest<'a, Self::M, Self::Trapdoor>>,

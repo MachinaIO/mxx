@@ -218,8 +218,7 @@ where
         b1_trapdoor: &TS::Trapdoor,
         b1_matrix: &M,
     ) -> Vec<GpuLutBaseDeviceShared<M, TS::Trapdoor>> {
-        let trap_sampler = TS::new(params, self.trapdoor_sigma);
-        let device_ids = trap_sampler.gpu_device_ids(params);
+        let device_ids = params.device_ids();
         assert!(
             !device_ids.is_empty(),
             "at least one GPU device is required for gpu sample_lut_preimages"
@@ -231,7 +230,7 @@ where
         device_ids
             .into_iter()
             .map(|device_id| {
-                let local_params = trap_sampler.gpu_params_for_device(params, device_id);
+                let local_params = params.params_for_device(device_id);
                 let local_trapdoor = TS::trapdoor_from_bytes(&local_params, &b1_trapdoor_bytes)
                     .expect("failed to deserialize trapdoor for preloaded LUT device resources");
                 let local_b1_matrix = M::from_compact_bytes(&local_params, &b1_matrix_bytes);
@@ -283,8 +282,7 @@ where
         b1_trapdoor: &TS::Trapdoor,
         b1_matrix: &M,
     ) -> Vec<GpuGateBaseDeviceShared<M, TS::Trapdoor>> {
-        let trap_sampler = TS::new(params, self.trapdoor_sigma);
-        let device_ids = trap_sampler.gpu_device_ids(params);
+        let device_ids = params.device_ids();
         assert!(
             !device_ids.is_empty(),
             "at least one GPU device is required for gpu gate preimage sampling"
@@ -301,7 +299,7 @@ where
         device_ids
             .into_iter()
             .map(|device_id| {
-                let local_params = trap_sampler.gpu_params_for_device(params, device_id);
+                let local_params = params.params_for_device(device_id);
                 let local_b0_trapdoor = TS::trapdoor_from_bytes(&local_params, &b0_trapdoor_bytes)
                     .expect(
                         "failed to deserialize b0 trapdoor for preloaded gate device resources",

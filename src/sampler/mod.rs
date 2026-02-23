@@ -93,20 +93,6 @@ pub trait PolyTrapdoorSampler {
     ) -> Self::M;
 
     #[cfg(feature = "gpu")]
-    fn gpu_device_ids(&self, _params: &<<Self::M as PolyMatrix>::P as Poly>::Params) -> Vec<i32> {
-        vec![0]
-    }
-
-    #[cfg(feature = "gpu")]
-    fn gpu_params_for_device(
-        &self,
-        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
-        _device_id: i32,
-    ) -> <<Self::M as PolyMatrix>::P as Poly>::Params {
-        params.clone()
-    }
-
-    #[cfg(feature = "gpu")]
     fn preimage_batched_sharded<'a>(
         &self,
         requests: Vec<crate::sampler::trapdoor::GpuPreimageRequest<'a, Self::M, Self::Trapdoor>>,

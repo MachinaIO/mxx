@@ -215,7 +215,6 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
     let (moduli, _, _) = cpu_params.to_crt();
     let detected_gpu_params =
         GpuDCRTPolyParams::new(cpu_params.ring_dimension(), moduli.clone(), cpu_params.base_bits());
-    let aux_params = detected_gpu_params.clone();
     let single_gpu_id = *detected_gpu_params
         .gpu_ids()
         .first()
@@ -229,7 +228,6 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
         detected_gpu_params.batch(),
     );
     info!("forcing single GPU for this test: gpu_id={}", single_gpu_id);
-    info!("sample_aux_matrices will use all detected GPUs: gpu_ids={:?}", aux_params.gpu_ids());
     assert_eq!(params.modulus(), cpu_params.modulus());
 
     let circuit = build_modp_chain_circuit_gpu(&params, P);
@@ -304,7 +302,7 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
     info!("circuit eval pubkey done");
     assert_eq!(result_pubkey.len(), 1);
     let sample_aux_start = Instant::now();
-    plt_pubkey_evaluator.sample_aux_matrices(&aux_params);
+    plt_pubkey_evaluator.sample_aux_matrices(&params);
     info!(
         "plt_pubkey_evaluator.sample_aux_matrices elapsed_ms={:.3}",
         sample_aux_start.elapsed().as_secs_f64() * 1000.0

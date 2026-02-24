@@ -56,6 +56,16 @@ impl<M: PolyMatrix> Evaluable for BggEncoding<M> {
         }
     }
 
+    #[cfg(feature = "gpu")]
+    fn eval_device_ids(params: &Self::Params) -> Vec<i32> {
+        params.device_ids()
+    }
+
+    #[cfg(feature = "gpu")]
+    fn params_for_eval_device(params: &Self::Params, device_id: i32) -> Self::Params {
+        params.params_for_device(device_id)
+    }
+
     fn rotate(&self, params: &Self::Params, shift: i32) -> Self {
         let pubkey = self.pubkey.rotate(params, shift);
         let shift = if shift >= 0 {
@@ -104,6 +114,16 @@ impl<M: PolyMatrix> Evaluable for BggPublicKey<M> {
             matrix: M::from_compact_bytes(params, &compact.matrix_bytes),
             reveal_plaintext: compact.reveal_plaintext,
         }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn eval_device_ids(params: &Self::Params) -> Vec<i32> {
+        params.device_ids()
+    }
+
+    #[cfg(feature = "gpu")]
+    fn params_for_eval_device(params: &Self::Params, device_id: i32) -> Self::Params {
+        params.params_for_device(device_id)
     }
 
     fn rotate(&self, params: &Self::Params, shift: i32) -> Self {

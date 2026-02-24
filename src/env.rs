@@ -6,12 +6,29 @@ fn default_gpu_parallelism() -> usize {
 /// Environment variable helpers for runtime configuration.
 
 /// `MXX_CIRCUIT_PARALLEL_GATES`: max number of gates processed in parallel per level.
-/// If unset or invalid, the evaluator uses full parallelism.
+/// GPU feature enabled: default is detected GPU device count and must be <= detected GPU count.
+/// Non-GPU: if unset/invalid, evaluator uses full parallelism.
 pub fn circuit_parallel_gates() -> Option<usize> {
-    std::env::var("MXX_CIRCUIT_PARALLEL_GATES")
+    let parsed = std::env::var("MXX_CIRCUIT_PARALLEL_GATES")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| *n > 0)
+        .filter(|n| *n > 0);
+    #[cfg(feature = "gpu")]
+    {
+        let device_count = default_gpu_parallelism();
+        let value = parsed.unwrap_or(device_count);
+        assert!(
+            value <= device_count,
+            "MXX_CIRCUIT_PARALLEL_GATES must be <= available GPU devices: requested={}, devices={}",
+            value,
+            device_count
+        );
+        Some(value)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        parsed
+    }
 }
 
 /// `LUT_PREIMAGE_CHUNK_SIZE`: number of LUT/gate preimages per batch.

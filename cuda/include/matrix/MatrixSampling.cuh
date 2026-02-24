@@ -23,6 +23,18 @@ extern "C"
         int dist_type,
         double sigma,
         uint64_t seed);
+    int gpu_matrix_sample_distribution_decompose_base(
+        GpuMatrix *out,
+        int dist_type,
+        double sigma,
+        uint64_t seed,
+        uint32_t base_bits);
+    int gpu_matrix_sample_distribution_decompose_base_small(
+        GpuMatrix *out,
+        int dist_type,
+        double sigma,
+        uint64_t seed,
+        uint32_t base_bits);
 
 #ifdef __cplusplus
 }

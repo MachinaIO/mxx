@@ -140,7 +140,7 @@ where
     HS: PolyHashSampler<[u8; 32], M = M>,
 {
     let m_g = d * params.modulus_digits();
-    let sampled = HS::new().sample_hash(
+    let v_idx = HS::new().sample_hash_decomposed(
         params,
         hash_key,
         format!("ggh15_lut_v_idx_{}_{}", lut_id, idx),
@@ -148,7 +148,6 @@ where
         m_g,
         DistType::FinRingDist,
     );
-    let v_idx = sampled.decompose();
     debug_assert_eq!(v_idx.row_size(), m_g, "derived v_idx rows must equal d * modulus_digits");
     debug_assert_eq!(v_idx.col_size(), m_g, "derived v_idx cols must equal d * modulus_digits");
     v_idx
@@ -932,7 +931,7 @@ where
                 let shared = &shared[entry_pos];
                 let hash_sampler = HS::new();
                 let input_matrix = M::from_compact_bytes(shared.params, &state.input_pubkey_bytes);
-                let u_g_matrix = hash_sampler.sample_hash(
+                let u_g_decomposed = hash_sampler.sample_hash_decomposed(
                     shared.params,
                     self.hash_key,
                     format!("ggh15_lut_u_g_matrix_{}", gate_id),
@@ -941,14 +940,13 @@ where
                     DistType::FinRingDist,
                 );
                 debug!(
-                    "Derived u_g_matrix for gate: gate_id={}, lut_id={}, rows={}, cols={}, device_id={}",
+                    "Derived decomposed u_g_matrix for gate: gate_id={}, lut_id={}, rows={}, cols={}, device_id={}",
                     gate_id,
                     lut_id,
-                    u_g_matrix.row_size(),
-                    u_g_matrix.col_size(),
+                    u_g_decomposed.row_size(),
+                    u_g_decomposed.col_size(),
                     shared.device_id
                 );
-                let u_g_decomposed = u_g_matrix.decompose();
                 let target_high_v = -(input_matrix * u_g_decomposed);
                 let target_gate2_v = target_high_v.concat_rows(&[&shared.w_block_v]);
                 (entry_pos, gate_id, target_gate2_v)
@@ -1247,7 +1245,7 @@ where
             .map(|(gate_id, state)| {
                 let hash_sampler = HS::new();
                 let input_matrix = M::from_compact_bytes(params, &state.input_pubkey_bytes);
-                let u_g_matrix = hash_sampler.sample_hash(
+                let u_g_decomposed = hash_sampler.sample_hash_decomposed(
                     params,
                     self.hash_key,
                     format!("ggh15_lut_u_g_matrix_{}", gate_id),
@@ -1256,13 +1254,12 @@ where
                     DistType::FinRingDist,
                 );
                 debug!(
-                    "Derived u_g_matrix for gate: gate_id={}, lut_id={}, rows={}, cols={}",
+                    "Derived decomposed u_g_matrix for gate: gate_id={}, lut_id={}, rows={}, cols={}",
                     gate_id,
                     lut_id,
-                    u_g_matrix.row_size(),
-                    u_g_matrix.col_size()
+                    u_g_decomposed.row_size(),
+                    u_g_decomposed.col_size()
                 );
-                let u_g_decomposed = u_g_matrix.decompose();
                 let target_high_v = -(input_matrix * u_g_decomposed);
                 let target_gate2_v = target_high_v.concat_rows(&[w_block_v]);
                 (gate_id, target_gate2_v)
@@ -2599,20 +2596,10 @@ where
         let lut_aux_prefix = format!("{checkpoint_prefix}_lut_aux_{}", lut_id);
         let lut_aux_row_id = format!("{lut_aux_prefix}_idx{k}");
 
-        let preimage_gate1 = read_matrix_from_multi_batch::<M>(
-            params,
-            dir,
-            &format!("{checkpoint_prefix}_preimage_gate1_{}", gate_id),
-            0,
-        )
-        .unwrap_or_else(|| panic!("preimage_gate1 for gate {} not found", gate_id));
-        let sg_times_b1 = self.c_b0.clone() * preimage_gate1;
-
         let hash_sampler = HS::new();
         let d = input.pubkey.matrix.row_size();
         let m_g = d * params.modulus_digits();
         let k_small = small_gadget_chunk_count::<M>(params);
-        // let mut c_const: Option<M> = None;
 
         let preimage_gate2_identity = read_matrix_from_multi_batch::<M>(
             params,
@@ -2626,7 +2613,7 @@ where
             m_g,
             "preimage_gate2_identity must have m_g columns"
         );
-        let mut c_const = sg_times_b1.clone() * preimage_gate2_identity;
+        let mut c_const_rhs = preimage_gate2_identity;
 
         let preimage_gate2_gy = read_matrix_from_multi_batch::<M>(
             params,
@@ -2643,7 +2630,8 @@ where
         let gy = M::gadget_matrix(params, d) * y.clone();
         let gy_decomposed = gy.decompose();
         drop(gy);
-        c_const = c_const + sg_times_b1.clone() * preimage_gate2_gy * gy_decomposed;
+        let gy_term = preimage_gate2_gy * gy_decomposed;
+        c_const_rhs.add_in_place(&gy_term);
 
         let v_idx = derive_lut_v_idx_from_hash::<M, HS>(params, self.hash_key, lut_id, k, d);
         let preimage_gate2_v = read_matrix_from_chunks::<M>(
@@ -2659,7 +2647,8 @@ where
             m_g,
             "preimage_gate2_v must have m_g columns"
         );
-        c_const = c_const + sg_times_b1.clone() * preimage_gate2_v * &v_idx;
+        let v_term = preimage_gate2_v * &v_idx;
+        c_const_rhs.add_in_place(&v_term);
 
         let x_identity_decomposed = M::identity(params, m_g, Some(x.clone())).small_decompose();
         debug_assert_eq!(
@@ -2703,14 +2692,24 @@ where
         }
         let vx_product_acc =
             vx_product_acc.expect("gate2_vx chunk accumulation must have at least one chunk");
-        c_const = c_const + sg_times_b1.clone() * vx_product_acc * &v_idx;
+        let vx_term = vx_product_acc * &v_idx;
+        c_const_rhs.add_in_place(&vx_term);
 
         let preimage_lut = read_matrix_from_multi_batch::<M>(params, dir, &lut_aux_row_id, 0)
             .unwrap_or_else(|| panic!("preimage_lut (index {}) for lut {} not found", k, lut_id));
-        c_const = c_const - sg_times_b1.clone() * preimage_lut;
-        drop(sg_times_b1);
+        c_const_rhs = c_const_rhs - preimage_lut;
 
-        let u_g = hash_sampler.sample_hash(
+        let preimage_gate1 = read_matrix_from_multi_batch::<M>(
+            params,
+            dir,
+            &format!("{checkpoint_prefix}_preimage_gate1_{}", gate_id),
+            0,
+        )
+        .unwrap_or_else(|| panic!("preimage_gate1 for gate {} not found", gate_id));
+        let sg_times_b1 = self.c_b0.clone() * preimage_gate1;
+        let c_const = sg_times_b1 * c_const_rhs;
+
+        let u_g_decomposed = hash_sampler.sample_hash_decomposed(
             params,
             self.hash_key,
             format!("ggh15_lut_u_g_matrix_{}", gate_id),
@@ -2719,15 +2718,12 @@ where
             DistType::FinRingDist,
         );
         debug!(
-            "Derived u_g_matrix for gate encoding: gate_id={}, lut_id={}, rows={}, cols={}",
+            "Derived decomposed u_g_matrix for gate encoding: gate_id={}, lut_id={}, rows={}, cols={}",
             gate_id,
             lut_id,
-            u_g.row_size(),
-            u_g.col_size()
+            u_g_decomposed.row_size(),
+            u_g_decomposed.col_size()
         );
-
-        let u_g_decomposed = u_g.decompose();
-        drop(u_g);
         let c_x_randomized = input.vector.clone() * u_g_decomposed * v_idx;
         debug!("Computed c_x_randomized for gate encoding: gate_id={}, lut_id={}", gate_id, lut_id);
         let c_out = c_const + c_x_randomized;

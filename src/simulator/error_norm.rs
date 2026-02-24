@@ -37,9 +37,8 @@ impl PolyCircuit<DCRTPoly> {
             PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, e_init_norm.clone(), None),
         );
         info!("e_init_norm bits {}", bigdecimal_bits_ceil(e_init_norm));
-        let one_error = Arc::new(one_error);
-        let input_errors = vec![Arc::new(input_error); input_size];
-        self.eval(&(), &one_error, &input_errors, plt_evaluator)
+        let input_errors = vec![input_error; input_size];
+        self.eval(&(), one_error, input_errors, plt_evaluator)
     }
 }
 

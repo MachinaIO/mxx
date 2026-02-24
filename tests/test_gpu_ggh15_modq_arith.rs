@@ -294,10 +294,9 @@ async fn test_gpu_ggh15_modq_arith() {
     let dry_circuit = build_modq_arith_value_circuit_gpu(&params, q_level);
     let dry_plt_evaluator = PolyPltEvaluator::new();
     let dry_eval_start = Instant::now();
-    let dry_one = Arc::new(GpuDCRTPoly::const_one(&params));
-    let dry_inputs: Vec<Arc<GpuDCRTPoly>> =
-        plaintext_inputs.iter().cloned().map(Arc::new).collect();
-    let dry_out = dry_circuit.eval(&params, &dry_one, &dry_inputs, Some(&dry_plt_evaluator));
+    let dry_one = GpuDCRTPoly::const_one(&params);
+    let dry_inputs = plaintext_inputs.clone();
+    let dry_out = dry_circuit.eval(&params, dry_one, dry_inputs, Some(&dry_plt_evaluator));
     info!("dry eval elapsed_ms={:.3}", dry_eval_start.elapsed().as_secs_f64() * 1000.0);
     assert_eq!(dry_out.len(), 1, "dry-run should output one value polynomial");
     let dry_const_term = dry_out[0]
@@ -337,11 +336,7 @@ async fn test_gpu_ggh15_modq_arith() {
         BGGPublicKeySampler::<_, GpuDCRTPolyHashSampler<Keccak256>>::new(seed, d_secret);
     let reveal_plaintexts = vec![true; circuit.num_input()];
     info!("sampling public keys");
-    let pubkeys: Vec<_> = pk_sampler
-        .sample(&params, b"BGG_PUBKEY", &reveal_plaintexts)
-        .into_iter()
-        .map(Arc::new)
-        .collect();
+    let mut pubkeys = pk_sampler.sample(&params, b"BGG_PUBKEY", &reveal_plaintexts);
     info!("sampled {} public keys", pubkeys.len());
 
     let enc_setup_start = Instant::now();
@@ -379,11 +374,12 @@ async fn test_gpu_ggh15_modq_arith() {
         pk_evaluator_setup_start.elapsed().as_secs_f64() * 1000.0
     );
 
+    let input_pubkeys = pubkeys.split_off(1);
+    let one_pubkey = pubkeys.pop().expect("pubkeys must contain one entry for const one");
     let pubkey_eval_start = Instant::now();
-    let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(&pk_evaluator));
+    let pubkey_out = circuit.eval(&params, one_pubkey, input_pubkeys, Some(&pk_evaluator));
     info!("pubkey eval elapsed_ms={:.3}", pubkey_eval_start.elapsed().as_secs_f64() * 1000.0);
     assert_eq!(pubkey_out.len(), 1);
-    drop(pubkeys);
 
     let sample_aux_start = Instant::now();
     pk_evaluator.sample_aux_matrices(&params);
@@ -412,17 +408,17 @@ async fn test_gpu_ggh15_modq_arith() {
     >::new(seed, dir.to_path_buf(), checkpoint_prefix, c_b0);
 
     let encodings_restore_start = Instant::now();
-    let encodings: Vec<_> = encodings_compact
+    let mut encodings: Vec<_> = encodings_compact
         .into_iter()
         .map(|(vector_bytes, pubkey_bytes, reveal_plaintext, plaintext)| {
-            Arc::new(mxx::bgg::encoding::BggEncoding::new(
+            mxx::bgg::encoding::BggEncoding::new(
                 GpuDCRTPolyMatrix::from_compact_bytes(&params, &vector_bytes),
                 mxx::bgg::public_key::BggPublicKey::new(
                     GpuDCRTPolyMatrix::from_compact_bytes(&params, &pubkey_bytes),
                     reveal_plaintext,
                 ),
                 plaintext,
-            ))
+            )
         })
         .collect();
     info!(
@@ -430,11 +426,12 @@ async fn test_gpu_ggh15_modq_arith() {
         encodings_restore_start.elapsed().as_secs_f64() * 1000.0
     );
 
+    let input_encodings = encodings.split_off(1);
+    let one_encoding = encodings.pop().expect("encodings must contain one entry for const one");
     let encoding_eval_start = Instant::now();
-    let encoding_out = circuit.eval(&params, &encodings[0], &encodings[1..], Some(&enc_evaluator));
+    let encoding_out = circuit.eval(&params, one_encoding, input_encodings, Some(&enc_evaluator));
     info!("encoding eval elapsed_ms={:.3}", encoding_eval_start.elapsed().as_secs_f64() * 1000.0);
     assert_eq!(encoding_out.len(), 1);
-    drop(encodings);
 
     assert_eq!(encoding_out[0].pubkey, pubkey_out[0]);
     let expected_poly = GpuDCRTPoly::from_biguint_to_constant(&params, expected.clone());

@@ -2759,7 +2759,7 @@ mod test {
         storage::write::{init_storage_system, storage_test_lock, wait_for_all_writes},
     };
     use keccak_asm::Keccak256;
-    use std::{fs, path::Path, sync::Arc};
+    use std::{fs, path::Path};
 
     fn setup_lsb_constant_binary_plt(t_n: usize, params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {
         PublicLut::<DCRTPoly>::new_from_usize_range(
@@ -2834,10 +2834,10 @@ mod test {
                 DCRTPolyTrapdoorSampler,
             >::new(key, d, SIGMA, error_sigma, dir_path.into(), insert_1_to_s);
 
-        let one_pubkey = Arc::new(enc_one.pubkey.clone());
-        let input_pubkeys = vec![Arc::new(enc1.pubkey.clone())];
+        let one_pubkey = enc_one.pubkey.clone();
+        let input_pubkeys = vec![enc1.pubkey.clone()];
         let result_pubkey =
-            circuit.eval(&params, &one_pubkey, &input_pubkeys, Some(&plt_pubkey_evaluator));
+            circuit.eval(&params, one_pubkey, input_pubkeys, Some(&plt_pubkey_evaluator));
         plt_pubkey_evaluator.sample_aux_matrices(&params);
         wait_for_all_writes(dir.to_path_buf()).await.unwrap();
         assert_eq!(result_pubkey.len(), 1);
@@ -2853,10 +2853,10 @@ mod test {
             DCRTPolyHashSampler<Keccak256>,
         >::new(key, dir_path.into(), checkpoint_prefix, c_b0);
 
-        let one_encoding = Arc::new(enc_one.clone());
-        let input_encodings = vec![Arc::new(enc1.clone())];
+        let one_encoding = enc_one.clone();
+        let input_encodings = vec![enc1.clone()];
         let result_encoding =
-            circuit.eval(&params, &one_encoding, &input_encodings, Some(&plt_encoding_evaluator));
+            circuit.eval(&params, one_encoding, input_encodings, Some(&plt_encoding_evaluator));
         assert_eq!(result_encoding.len(), 1);
         let result_encoding = &result_encoding[0];
         assert_eq!(result_encoding.pubkey, result_pubkey.clone());
@@ -2940,10 +2940,9 @@ mod test {
                 DCRTPolyTrapdoorSampler,
             >::new(key, d, SIGMA, error_sigma, dir_path.into(), insert_1_to_s);
 
-        let one_pubkey = Arc::new(enc_one.pubkey.clone());
-        let input_pubkeys_arc = input_pubkeys.iter().cloned().map(Arc::new).collect::<Vec<_>>();
+        let one_pubkey = enc_one.pubkey.clone();
         let result_pubkey =
-            circuit.eval(&params, &one_pubkey, &input_pubkeys_arc, Some(&plt_pubkey_evaluator));
+            circuit.eval(&params, one_pubkey, input_pubkeys.clone(), Some(&plt_pubkey_evaluator));
         plt_pubkey_evaluator.sample_aux_matrices(&params);
         wait_for_all_writes(dir.to_path_buf()).await.unwrap();
         assert_eq!(result_pubkey.len(), input_size);
@@ -2958,12 +2957,11 @@ mod test {
             DCRTPolyHashSampler<Keccak256>,
         >::new(key, dir_path.into(), checkpoint_prefix, c_b0);
 
-        let one_encoding = Arc::new(enc_one.clone());
-        let input_encodings_arc = input_encodings.iter().cloned().map(Arc::new).collect::<Vec<_>>();
+        let one_encoding = enc_one.clone();
         let result_encoding = circuit.eval(
             &params,
-            &one_encoding,
-            &input_encodings_arc,
+            one_encoding,
+            input_encodings.clone(),
             Some(&plt_encoding_evaluator),
         );
         assert_eq!(result_encoding.len(), input_size);

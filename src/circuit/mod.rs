@@ -498,8 +498,8 @@ impl<P: Poly> PolyCircuit<P> {
     pub fn eval<E, PE>(
         &self,
         params: &E::Params,
-        one: &Arc<E>,
-        inputs: &[Arc<E>],
+        one: E,
+        inputs: Vec<E>,
         plt_evaluator: Option<&PE>,
     ) -> Vec<E>
     where
@@ -507,13 +507,14 @@ impl<P: Poly> PolyCircuit<P> {
         PE: PltEvaluator<E>,
     {
         let (call_id_base, gate_id_base) = self.eval_gate_id_bases();
-        let input_compacts = inputs
-            .iter()
-            .map(|input| Arc::new(input.as_ref().clone().to_compact()))
-            .collect::<Vec<_>>();
+        let one_compact = Arc::new(one.to_compact());
+        let one = Arc::new(E::from_compact(params, one_compact.as_ref()));
+        let input_compacts =
+            inputs.into_iter().map(|input| Arc::new(input.to_compact())).collect::<Vec<_>>();
         let outputs = self.eval_scoped(
             params,
-            one,
+            &one,
+            one_compact,
             &input_compacts,
             plt_evaluator,
             0,
@@ -549,6 +550,7 @@ impl<P: Poly> PolyCircuit<P> {
         &self,
         params: &E::Params,
         one: &Arc<E>,
+        one_compact: Arc<E::Compact>,
         inputs: &[Arc<E::Compact>],
         plt_evaluator: Option<&PE>,
         call_prefix: usize,
@@ -596,7 +598,7 @@ impl<P: Poly> PolyCircuit<P> {
             .collect();
         debug!("Initialized remaining-use counters for {} wires", remaining_use_count.len());
 
-        wires.insert(GateId(0), Arc::new(one.as_ref().clone().to_compact()));
+        wires.insert(GateId(0), one_compact.clone());
         debug!("Constant one gate is set");
         // Collect all input gate IDs excluding the reserved constant-one gate (0)
         let mut input_gate_ids: Vec<GateId> = self
@@ -768,6 +770,7 @@ impl<P: Poly> PolyCircuit<P> {
                     let sub_outputs = sub_circuit.eval_scoped(
                         params,
                         one,
+                        one_compact.clone(),
                         &sub_inputs,
                         plt_evaluator,
                         child_prefix,
@@ -940,7 +943,6 @@ mod tests {
         utils::{create_bit_random_poly, create_random_poly},
     };
     use num_bigint::BigUint;
-    use std::sync::Arc;
 
     fn eval_with_const_one<PE>(
         circuit: &PolyCircuit<DCRTPoly>,
@@ -951,9 +953,9 @@ mod tests {
     where
         PE: PltEvaluator<DCRTPoly>,
     {
-        let one = Arc::new(DCRTPoly::const_one(params));
-        let eval_inputs = inputs.iter().cloned().map(Arc::new).collect::<Vec<_>>();
-        circuit.eval(params, &one, &eval_inputs, plt_evaluator)
+        let one = DCRTPoly::const_one(params);
+        let eval_inputs = inputs.to_vec();
+        circuit.eval(params, one, eval_inputs, plt_evaluator)
     }
 
     #[test]

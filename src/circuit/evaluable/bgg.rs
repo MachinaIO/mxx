@@ -140,7 +140,6 @@ mod tests {
         sampler::hash::DCRTPolyHashSampler, utils::random_bgg_encodings,
     };
     use keccak_asm::Keccak256;
-    use std::sync::Arc;
 
     #[test]
     fn test_encoding_add() {
@@ -160,12 +159,11 @@ mod tests {
         circuit.output(vec![add_gate]);
 
         // Evaluate the circuit
-        let enc_one = Arc::new(enc_one);
-        let eval_inputs = vec![Arc::new(enc1.clone()), Arc::new(enc2.clone())];
+        let eval_inputs = vec![enc1.clone(), enc2.clone()];
         let result = circuit.eval(
             &params,
-            &enc_one,
-            &eval_inputs,
+            enc_one,
+            eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
@@ -197,12 +195,11 @@ mod tests {
         circuit.output(vec![sub_gate]);
 
         // Evaluate the circuit
-        let enc_one = Arc::new(enc_one);
-        let eval_inputs = vec![Arc::new(enc1.clone()), Arc::new(enc2.clone())];
+        let eval_inputs = vec![enc1.clone(), enc2.clone()];
         let result = circuit.eval(
             &params,
-            &enc_one,
-            &eval_inputs,
+            enc_one,
+            eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
@@ -234,12 +231,11 @@ mod tests {
         circuit.output(vec![mul_gate]);
 
         // Evaluate the circuit
-        let enc_one = Arc::new(enc_one);
-        let eval_inputs = vec![Arc::new(enc1.clone()), Arc::new(enc2.clone())];
+        let eval_inputs = vec![enc1.clone(), enc2.clone()];
         let result = circuit.eval(
             &params,
-            &enc_one,
-            &eval_inputs,
+            enc_one,
+            eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
@@ -281,13 +277,11 @@ mod tests {
         circuit.output(vec![sub_gate]);
 
         // Evaluate the circuit
-        let enc_one = Arc::new(enc_one);
-        let eval_inputs =
-            vec![Arc::new(enc1.clone()), Arc::new(enc2.clone()), Arc::new(enc3.clone())];
+        let eval_inputs = vec![enc1.clone(), enc2.clone(), enc3.clone()];
         let result = circuit.eval(
             &params,
-            &enc_one,
-            &eval_inputs,
+            enc_one,
+            eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
@@ -342,17 +336,11 @@ mod tests {
         circuit.output(vec![f]);
 
         // Evaluate the circuit
-        let enc_one = Arc::new(enc_one);
-        let eval_inputs = vec![
-            Arc::new(enc1.clone()),
-            Arc::new(enc2.clone()),
-            Arc::new(enc3.clone()),
-            Arc::new(enc4.clone()),
-        ];
+        let eval_inputs = vec![enc1.clone(), enc2.clone(), enc3.clone(), enc4.clone()];
         let result = circuit.eval(
             &params,
-            &enc_one,
-            &eval_inputs,
+            enc_one,
+            eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
@@ -401,12 +389,11 @@ mod tests {
         circuit.output(vec![add_gate]);
 
         // Evaluate the circuit
-        let enc_one = Arc::new(enc_one);
-        let eval_inputs = vec![Arc::new(enc1.clone()), Arc::new(enc2.clone())];
+        let eval_inputs = vec![enc1.clone(), enc2.clone()];
         let result = circuit.eval(
             &params,
-            &enc_one,
-            &eval_inputs,
+            enc_one,
+            eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
@@ -464,12 +451,11 @@ mod tests {
         main_circuit.output(vec![final_gate]);
 
         // Evaluate the main circuit
-        let enc_one = Arc::new(enc_one);
-        let eval_inputs = vec![Arc::new(enc1.clone()), Arc::new(enc2.clone())];
+        let eval_inputs = vec![enc1.clone(), enc2.clone()];
         let result = main_circuit.eval(
             &params,
-            &enc_one,
-            &eval_inputs,
+            enc_one,
+            eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
@@ -534,13 +520,11 @@ mod tests {
         main_circuit.output(vec![scalar_mul_gate]);
 
         // Evaluate the main circuit
-        let enc_one = Arc::new(enc_one);
-        let eval_inputs =
-            vec![Arc::new(enc1.clone()), Arc::new(enc2.clone()), Arc::new(enc3.clone())];
+        let eval_inputs = vec![enc1.clone(), enc2.clone(), enc3.clone()];
         let result = main_circuit.eval(
             &params,
-            &enc_one,
-            &eval_inputs,
+            enc_one,
+            eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 

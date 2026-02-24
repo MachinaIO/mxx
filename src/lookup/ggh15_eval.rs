@@ -202,6 +202,49 @@ where
     first.concat_columns_owned(chunks)
 }
 
+fn read_matrix_from_chunk_suffixed_prefixes<M>(
+    params: &<M::P as Poly>::Params,
+    dir: &Path,
+    base_id_prefix: &str,
+    expected_chunk_cols: usize,
+    chunk_count: usize,
+    label: &str,
+) -> M
+where
+    M: PolyMatrix,
+{
+    assert!(chunk_count > 0, "{label} chunk_count must be > 0 (base_id_prefix={base_id_prefix})");
+    let first_id_prefix = format!("{base_id_prefix}_chunk0");
+    let first =
+        read_matrix_from_multi_batch::<M>(params, dir, &first_id_prefix, 0).unwrap_or_else(|| {
+            panic!("{label} chunk 0 not found: id_prefix={first_id_prefix}, index=0")
+        });
+    assert_eq!(
+        first.col_size(),
+        expected_chunk_cols,
+        "{label} chunk 0 must have {expected_chunk_cols} columns (id_prefix={first_id_prefix})"
+    );
+    if chunk_count == 1 {
+        return first;
+    }
+
+    let mut chunks = Vec::with_capacity(chunk_count - 1);
+    for chunk_idx in 1..chunk_count {
+        let chunk_id_prefix = format!("{base_id_prefix}_chunk{chunk_idx}");
+        let chunk = read_matrix_from_multi_batch::<M>(params, dir, &chunk_id_prefix, 0)
+            .unwrap_or_else(|| {
+                panic!("{label} chunk {chunk_idx} not found: id_prefix={chunk_id_prefix}, index=0")
+            });
+        assert_eq!(
+            chunk.col_size(),
+            expected_chunk_cols,
+            "{label} chunk {chunk_idx} must have {expected_chunk_cols} columns (id_prefix={chunk_id_prefix})"
+        );
+        chunks.push(chunk);
+    }
+    first.concat_columns_owned(chunks)
+}
+
 pub struct GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
 where
     M: PolyMatrix + Send + Sync + 'static,
@@ -1046,8 +1089,8 @@ where
                         chunk_idx
                     );
                     CompactBytesJob::new(
-                        self.preimage_gate2_vx_id_prefix(params, *gate_id),
-                        vec![(chunk_idx, preimage_gate2_vx_chunk)],
+                        self.preimage_gate2_vx_chunk_id_prefix(params, *gate_id, chunk_idx),
+                        vec![(0, preimage_gate2_vx_chunk)],
                     )
                 })
                 .collect::<Vec<_>>();
@@ -1355,7 +1398,7 @@ where
         let stage5_jobs = stage5_gate_ids
             .into_iter()
             .enumerate()
-            .map(|(gate_pos, gate_id)| {
+            .flat_map(|(gate_pos, gate_id)| {
                 let col_start = gate_pos
                     .checked_mul(stage5_target_cols)
                     .expect("stage5 preimage slice column offset overflow");
@@ -1368,7 +1411,7 @@ where
                     m_g * k_small,
                     "stage5 preimage columns must equal m_g * k_small"
                 );
-                let chunked_preimages = (0..k_small)
+                (0..k_small)
                     .map(|chunk_idx| {
                         let chunk_col_start =
                             chunk_idx.checked_mul(m_g).expect("stage5 chunk start column overflow");
@@ -1379,13 +1422,12 @@ where
                             chunk_col_start,
                             chunk_col_end,
                         );
-                        (chunk_idx, chunk)
+                        CompactBytesJob::new(
+                            self.preimage_gate2_vx_chunk_id_prefix(params, gate_id, chunk_idx),
+                            vec![(0, chunk)],
+                        )
                     })
-                    .collect::<Vec<_>>();
-                CompactBytesJob::new(
-                    self.preimage_gate2_vx_id_prefix(params, gate_id),
-                    chunked_preimages,
-                )
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         stage5_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
@@ -1513,12 +1555,18 @@ where
         format!("{}_preimage_gate2_v_{}", self.aux_checkpoint_prefix(params), gate_id)
     }
 
-    fn preimage_gate2_vx_id_prefix(
+    fn preimage_gate2_vx_chunk_id_prefix(
         &self,
         params: &<M::P as Poly>::Params,
         gate_id: GateId,
+        chunk_idx: usize,
     ) -> String {
-        format!("{}_preimage_gate2_vx_{}", self.aux_checkpoint_prefix(params), gate_id)
+        format!(
+            "{}_preimage_gate2_vx_{}_chunk{}",
+            self.aux_checkpoint_prefix(params),
+            gate_id,
+            chunk_idx
+        )
     }
 
     pub fn checkpoint_prefix(&self, params: &<M::P as Poly>::Params) -> String {
@@ -1644,7 +1692,6 @@ where
             format!("{checkpoint_prefix}_preimage_gate2_identity_{}", gate_id);
         let gate2_gy_prefix = format!("{checkpoint_prefix}_preimage_gate2_gy_{}", gate_id);
         let gate2_v_prefix = format!("{checkpoint_prefix}_preimage_gate2_v_{}", gate_id);
-        let gate2_vx_prefix = format!("{checkpoint_prefix}_preimage_gate2_vx_{}", gate_id);
         Self::checkpoint_has_index(checkpoint_index, part_index_cache, &gate1_prefix, 0) &&
             Self::checkpoint_has_index(
                 checkpoint_index,
@@ -1662,11 +1709,13 @@ where
                 )
             }) &&
             (0..gate_vx_chunk_count).into_par_iter().all(|chunk_idx| {
+                let gate2_vx_chunk_prefix =
+                    format!("{checkpoint_prefix}_preimage_gate2_vx_{}_chunk{}", gate_id, chunk_idx);
                 Self::checkpoint_has_index(
                     checkpoint_index,
                     part_index_cache,
-                    &gate2_vx_prefix,
-                    chunk_idx,
+                    &gate2_vx_chunk_prefix,
+                    0,
                 )
             })
     }
@@ -1786,20 +1835,17 @@ where
                 continue;
             }
 
-            if let Some(gate_id_str) = key.strip_prefix(&gate2_vx_prefix) &&
+            if let Some(rest) = key.strip_prefix(&gate2_vx_prefix) &&
+                let Some((gate_id_str, chunk_idx_str)) = rest.split_once("_chunk") &&
                 let Ok(gate_id_raw) = gate_id_str.parse::<usize>() &&
-                target_gate_ids.contains(&GateId(gate_id_raw))
+                target_gate_ids.contains(&GateId(gate_id_raw)) &&
+                entry.indices.contains(&0) &&
+                let Ok(chunk_idx) = chunk_idx_str.parse::<usize>() &&
+                chunk_idx < gate_vx_chunk_count
             {
                 let gate_id = GateId(gate_id_raw);
                 let state = gate_states.entry(gate_id).or_default();
-                entry
-                    .indices
-                    .iter()
-                    .copied()
-                    .filter(|chunk_idx| *chunk_idx < gate_vx_chunk_count)
-                    .for_each(|chunk_idx| {
-                        state.gate2_vx_chunks.insert(chunk_idx);
-                    });
+                state.gate2_vx_chunks.insert(chunk_idx);
                 if state.is_complete(gate_v_chunk_count, gate_vx_chunk_count) {
                     return true;
                 }
@@ -2658,7 +2704,7 @@ where
         );
         c_const = c_const + sg_times_b1.clone() * preimage_gate2_v * &v_idx;
 
-        let preimage_gate2_vx = read_matrix_from_chunks::<M>(
+        let preimage_gate2_vx = read_matrix_from_chunk_suffixed_prefixes::<M>(
             params,
             dir,
             &format!("{checkpoint_prefix}_preimage_gate2_vx_{}", gate_id),

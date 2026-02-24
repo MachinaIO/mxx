@@ -202,49 +202,6 @@ where
     first.concat_columns_owned(chunks)
 }
 
-fn read_matrix_from_chunk_suffixed_prefixes<M>(
-    params: &<M::P as Poly>::Params,
-    dir: &Path,
-    base_id_prefix: &str,
-    expected_chunk_cols: usize,
-    chunk_count: usize,
-    label: &str,
-) -> M
-where
-    M: PolyMatrix,
-{
-    assert!(chunk_count > 0, "{label} chunk_count must be > 0 (base_id_prefix={base_id_prefix})");
-    let first_id_prefix = format!("{base_id_prefix}_chunk0");
-    let first =
-        read_matrix_from_multi_batch::<M>(params, dir, &first_id_prefix, 0).unwrap_or_else(|| {
-            panic!("{label} chunk 0 not found: id_prefix={first_id_prefix}, index=0")
-        });
-    assert_eq!(
-        first.col_size(),
-        expected_chunk_cols,
-        "{label} chunk 0 must have {expected_chunk_cols} columns (id_prefix={first_id_prefix})"
-    );
-    if chunk_count == 1 {
-        return first;
-    }
-
-    let mut chunks = Vec::with_capacity(chunk_count - 1);
-    for chunk_idx in 1..chunk_count {
-        let chunk_id_prefix = format!("{base_id_prefix}_chunk{chunk_idx}");
-        let chunk = read_matrix_from_multi_batch::<M>(params, dir, &chunk_id_prefix, 0)
-            .unwrap_or_else(|| {
-                panic!("{label} chunk {chunk_idx} not found: id_prefix={chunk_id_prefix}, index=0")
-            });
-        assert_eq!(
-            chunk.col_size(),
-            expected_chunk_cols,
-            "{label} chunk {chunk_idx} must have {expected_chunk_cols} columns (id_prefix={chunk_id_prefix})"
-        );
-        chunks.push(chunk);
-    }
-    first.concat_columns_owned(chunks)
-}
-
 pub struct GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
 where
     M: PolyMatrix + Send + Sync + 'static,
@@ -2704,22 +2661,49 @@ where
         );
         c_const = c_const + sg_times_b1.clone() * preimage_gate2_v * &v_idx;
 
-        let preimage_gate2_vx = read_matrix_from_chunk_suffixed_prefixes::<M>(
-            params,
-            dir,
-            &format!("{checkpoint_prefix}_preimage_gate2_vx_{}", gate_id),
-            m_g,
-            k_small,
-            "preimage_gate2_vx",
+        let x_identity_decomposed = M::identity(params, m_g, Some(x.clone())).small_decompose();
+        debug_assert_eq!(
+            x_identity_decomposed.row_size(),
+            m_g * k_small,
+            "x_identity_decomposed rows must have m_g * k_small rows"
         );
         debug_assert_eq!(
-            preimage_gate2_vx.col_size(),
-            m_g * k_small,
-            "preimage_gate2_vx must have m_g * k_small columns"
+            x_identity_decomposed.col_size(),
+            m_g,
+            "x_identity_decomposed must have m_g columns"
         );
-        let x_identity_decomposed = M::identity(params, m_g, Some(x.clone())).small_decompose();
-        c_const =
-            c_const + sg_times_b1.clone() * preimage_gate2_vx * x_identity_decomposed * &v_idx;
+        let mut vx_product_acc: Option<M> = None;
+        for chunk_idx in 0..k_small {
+            let preimage_gate2_vx_chunk = read_matrix_from_multi_batch::<M>(
+                params,
+                dir,
+                &format!("{checkpoint_prefix}_preimage_gate2_vx_{}_chunk{}", gate_id, chunk_idx),
+                0,
+            )
+            .unwrap_or_else(|| {
+                panic!("preimage_gate2_vx chunk {} for gate {} not found", chunk_idx, gate_id)
+            });
+            debug_assert_eq!(
+                preimage_gate2_vx_chunk.col_size(),
+                m_g,
+                "preimage_gate2_vx chunk must have m_g columns"
+            );
+            let row_start = chunk_idx
+                .checked_mul(m_g)
+                .expect("x_identity_decomposed chunk row offset overflow");
+            let row_end = row_start + m_g;
+            let x_identity_decomposed_chunk =
+                x_identity_decomposed.slice(row_start, row_end, 0, m_g);
+            let vx_chunk_product = preimage_gate2_vx_chunk * &x_identity_decomposed_chunk;
+            if let Some(acc) = vx_product_acc.as_mut() {
+                acc.add_in_place(&vx_chunk_product);
+            } else {
+                vx_product_acc = Some(vx_chunk_product);
+            }
+        }
+        let vx_product_acc =
+            vx_product_acc.expect("gate2_vx chunk accumulation must have at least one chunk");
+        c_const = c_const + sg_times_b1.clone() * vx_product_acc * &v_idx;
 
         let preimage_lut = read_matrix_from_multi_batch::<M>(params, dir, &lut_aux_row_id, 0)
             .unwrap_or_else(|| panic!("preimage_lut (index {}) for lut {} not found", k, lut_id));

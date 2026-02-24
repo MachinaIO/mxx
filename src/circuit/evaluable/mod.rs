@@ -25,7 +25,7 @@ pub trait Evaluable:
     type P: Poly;
     type Compact: Debug + Clone + Send + Sync;
 
-    fn to_compact(&self) -> Self::Compact;
+    fn to_compact(self) -> Self::Compact;
     fn from_compact(params: &Self::Params, compact: &Self::Compact) -> Self;
 
     fn rotate(&self, params: &Self::Params, shift: i32) -> Self;

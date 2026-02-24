@@ -9,7 +9,7 @@ impl<P: Poly> Evaluable for P {
     type P = P;
     type Compact = Vec<u8>;
 
-    fn to_compact(&self) -> Self::Compact {
+    fn to_compact(self) -> Self::Compact {
         self.to_compact_bytes()
     }
 

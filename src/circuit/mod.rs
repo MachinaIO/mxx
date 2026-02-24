@@ -507,8 +507,10 @@ impl<P: Poly> PolyCircuit<P> {
         PE: PltEvaluator<E>,
     {
         let (call_id_base, gate_id_base) = self.eval_gate_id_bases();
-        let input_compacts =
-            inputs.iter().map(|input| Arc::new(input.to_compact())).collect::<Vec<_>>();
+        let input_compacts = inputs
+            .iter()
+            .map(|input| Arc::new(input.as_ref().clone().to_compact()))
+            .collect::<Vec<_>>();
         let outputs = self.eval_scoped(
             params,
             one,
@@ -594,7 +596,7 @@ impl<P: Poly> PolyCircuit<P> {
             .collect();
         debug!("Initialized remaining-use counters for {} wires", remaining_use_count.len());
 
-        wires.insert(GateId(0), Arc::new(one.to_compact()));
+        wires.insert(GateId(0), Arc::new(one.as_ref().clone().to_compact()));
         debug!("Constant one gate is set");
         // Collect all input gate IDs excluding the reserved constant-one gate (0)
         let mut input_gate_ids: Vec<GateId> = self

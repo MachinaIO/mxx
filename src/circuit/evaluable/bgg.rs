@@ -31,14 +31,14 @@ impl<M: PolyMatrix> Evaluable for BggEncoding<M> {
     type P = M::P;
     type Compact = BggEncodingCompact<M>;
 
-    fn to_compact(&self) -> Self::Compact {
+    fn to_compact(self) -> Self::Compact {
         BggEncodingCompact {
-            vector_bytes: self.vector.to_compact_bytes(),
+            vector_bytes: self.vector.into_compact_bytes(),
             pubkey: BggPublicKeyCompact::new(
-                self.pubkey.matrix.to_compact_bytes(),
+                self.pubkey.matrix.into_compact_bytes(),
                 self.pubkey.reveal_plaintext,
             ),
-            plaintext_bytes: self.plaintext.as_ref().map(|p| p.to_compact_bytes()),
+            plaintext_bytes: self.plaintext.map(|p| p.to_compact_bytes()),
         }
     }
 
@@ -95,8 +95,8 @@ impl<M: PolyMatrix> Evaluable for BggPublicKey<M> {
     type P = M::P;
     type Compact = BggPublicKeyCompact<M>;
 
-    fn to_compact(&self) -> Self::Compact {
-        BggPublicKeyCompact::new(self.matrix.to_compact_bytes(), self.reveal_plaintext)
+    fn to_compact(self) -> Self::Compact {
+        BggPublicKeyCompact::new(self.matrix.into_compact_bytes(), self.reveal_plaintext)
     }
 
     fn from_compact(params: &Self::Params, compact: &Self::Compact) -> Self {

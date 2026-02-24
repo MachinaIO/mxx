@@ -98,8 +98,8 @@ impl Evaluable for ErrorNorm {
     type P = DCRTPoly;
     type Compact = ErrorNorm;
 
-    fn to_compact(&self) -> Self::Compact {
-        self.clone()
+    fn to_compact(self) -> Self::Compact {
+        self
     }
 
     fn from_compact(_: &Self::Params, compact: &Self::Compact) -> Self {

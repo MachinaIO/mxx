@@ -2654,10 +2654,7 @@ where
         {
             return Arc::clone(cached);
         }
-        panic!(
-            "c_b0 for params not found in preloaded cache (device_ids={:?})",
-            params.device_ids()
-        );
+        panic!("c_b0 for params not found in preloaded cache");
     }
 }
 
@@ -2677,6 +2674,11 @@ where
         gate_id: GateId,
         lut_id: usize,
     ) -> BggEncoding<M> {
+        let public_lookup_started = Instant::now();
+        debug!(
+            "GGH15BGGEncodingPltEvaluator::public_lookup start: gate_id={}, lut_id={}",
+            gate_id, lut_id
+        );
         let x = input
             .plaintext
             .as_ref()
@@ -2822,7 +2824,14 @@ where
             ),
             reveal_plaintext: true,
         };
-        BggEncoding::new(c_out, out_pubkey, Some(y))
+        let out = BggEncoding::new(c_out, out_pubkey, Some(y));
+        debug!(
+            "GGH15BGGEncodingPltEvaluator::public_lookup end: gate_id={}, lut_id={}, elapsed_ms={:.3}",
+            gate_id,
+            lut_id,
+            public_lookup_started.elapsed().as_secs_f64() * 1000.0
+        );
+        out
     }
 }
 

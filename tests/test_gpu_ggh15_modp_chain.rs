@@ -321,7 +321,9 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
     let plt_encoding_evaluator = GGH15BGGEncodingPltEvaluator::<
         GpuDCRTPolyMatrix,
         GpuDCRTPolyHashSampler<Keccak256>,
-    >::new(key, dir.to_path_buf(), checkpoint_prefix, c_b0);
+    >::new(
+        key, dir.to_path_buf(), checkpoint_prefix, &params, c_b0
+    );
     info!("plt encoding evaluator setup done");
 
     info!("circuit eval encoding start");

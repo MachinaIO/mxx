@@ -18,7 +18,9 @@ use std::{
     collections::{HashMap, HashSet},
     fs::read_to_string,
     marker::PhantomData,
+    ops::Mul,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tracing::{debug, info, warn};
@@ -2603,7 +2605,7 @@ where
     pub hash_key: [u8; 32],
     pub dir_path: PathBuf,
     pub checkpoint_prefix: String,
-    pub c_b0: M,
+    c_b0_by_params: Vec<(<<M as PolyMatrix>::P as Poly>::Params, Arc<M>)>,
     _hs: PhantomData<HS>,
 }
 
@@ -2612,8 +2614,50 @@ where
     M: PolyMatrix,
     HS: PolyHashSampler<[u8; 32], M = M>,
 {
-    pub fn new(hash_key: [u8; 32], dir_path: PathBuf, checkpoint_prefix: String, c_b0: M) -> Self {
-        Self { hash_key, dir_path, checkpoint_prefix, c_b0, _hs: PhantomData }
+    pub fn new(
+        hash_key: [u8; 32],
+        dir_path: PathBuf,
+        checkpoint_prefix: String,
+        params: &<M::P as Poly>::Params,
+        c_b0: M,
+    ) -> Self {
+        let c_b0_compact_bytes = c_b0.into_compact_bytes();
+        let mut c_b0_by_params: Vec<(<<M as PolyMatrix>::P as Poly>::Params, Arc<M>)> = Vec::new();
+
+        #[cfg(feature = "gpu")]
+        {
+            let mut device_ids = params.device_ids();
+            if device_ids.is_empty() {
+                device_ids.push(0);
+            }
+            for device_id in device_ids {
+                let local_params = params.params_for_device(device_id);
+                let local_c_b0 =
+                    Arc::new(M::from_compact_bytes(&local_params, &c_b0_compact_bytes));
+                c_b0_by_params.push((local_params, local_c_b0));
+            }
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            c_b0_by_params.push((
+                params.clone(),
+                Arc::new(M::from_compact_bytes(params, &c_b0_compact_bytes)),
+            ));
+        }
+
+        Self { hash_key, dir_path, checkpoint_prefix, c_b0_by_params, _hs: PhantomData }
+    }
+
+    fn c_b0_for_params(&self, params: &<M::P as Poly>::Params) -> Arc<M> {
+        if let Some((_, cached)) =
+            self.c_b0_by_params.iter().find(|(cached_params, _)| cached_params == params)
+        {
+            return Arc::clone(cached);
+        }
+        panic!(
+            "c_b0 for params not found in preloaded cache (device_ids={:?})",
+            params.device_ids()
+        );
     }
 }
 
@@ -2622,6 +2666,7 @@ where
     M: PolyMatrix + Send + Sync,
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     M::P: 'static,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
 {
     fn public_lookup(
         &self,
@@ -2743,7 +2788,8 @@ where
             0,
         )
         .unwrap_or_else(|| panic!("preimage_gate1 for gate {} not found", gate_id));
-        let sg_times_b1 = self.c_b0.clone() * preimage_gate1;
+        let c_b0 = self.c_b0_for_params(params);
+        let sg_times_b1 = c_b0.as_ref() * &preimage_gate1;
         let c_const = sg_times_b1 * c_const_rhs;
 
         let u_g_decomposed = hash_sampler.sample_hash_decomposed(
@@ -2914,7 +2960,9 @@ mod test {
         let plt_encoding_evaluator = GGH15BGGEncodingPltEvaluator::<
             DCRTPolyMatrix,
             DCRTPolyHashSampler<Keccak256>,
-        >::new(key, dir_path.into(), checkpoint_prefix, c_b0);
+        >::new(
+            key, dir_path.into(), checkpoint_prefix, &params, c_b0
+        );
 
         let one_encoding = enc_one.clone();
         let input_encodings = vec![enc1.clone()];
@@ -3018,7 +3066,9 @@ mod test {
         let plt_encoding_evaluator = GGH15BGGEncodingPltEvaluator::<
             DCRTPolyMatrix,
             DCRTPolyHashSampler<Keccak256>,
-        >::new(key, dir_path.into(), checkpoint_prefix, c_b0);
+        >::new(
+            key, dir_path.into(), checkpoint_prefix, &params, c_b0
+        );
 
         let one_encoding = enc_one.clone();
         let result_encoding = circuit.eval(

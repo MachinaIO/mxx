@@ -346,7 +346,7 @@ async fn test_ggh15_modq_arith() {
     let enc_evaluator = GGH15BGGEncodingPltEvaluator::<
         DCRTPolyMatrix,
         DCRTPolyHashSampler<Keccak256>,
-    >::new(seed, dir.to_path_buf(), checkpoint_prefix, c_b0);
+    >::new(seed, dir.to_path_buf(), checkpoint_prefix, &params, c_b0);
 
     let encoding_eval_start = std::time::Instant::now();
     let encoding_out = circuit.eval(&params, enc_one, input_encodings, Some(&enc_evaluator));

@@ -413,7 +413,7 @@ async fn test_gpu_ggh15_modq_arith() {
     let enc_evaluator = GGH15BGGEncodingPltEvaluator::<
         GpuDCRTPolyMatrix,
         GpuDCRTPolyHashSampler<Keccak256>,
-    >::new(seed, dir.to_path_buf(), checkpoint_prefix, c_b0);
+    >::new(seed, dir.to_path_buf(), checkpoint_prefix, &params, c_b0);
 
     let encodings_restore_start = Instant::now();
     let mut encodings: Vec<_> = encodings_compact

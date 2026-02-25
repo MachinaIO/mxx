@@ -2134,6 +2134,38 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
         for (lut_id, plt, completed_rows, resumed_rows_for_lut) in lut_plans {
             let lut_start = Instant::now();
             let lut_aux_id_prefix = self.lut_aux_id_prefix(params, lut_id);
+            let pending_input_indices: Vec<usize> = if completed_rows.is_empty() {
+                (0..plt.len()).collect()
+            } else {
+                let pending_scan_start = Instant::now();
+                let pending = (0..plt.len())
+                    .into_par_iter()
+                    .filter_map(|input_idx| {
+                        let x = M::P::from_usize_to_constant(params, input_idx);
+                        let (row_idx, _) = plt.get(params, &x).unwrap_or_else(|| {
+                            panic!("LUT entry {} missing from 0..len range", input_idx)
+                        });
+                        (!completed_rows.contains(&row_idx)).then_some(input_idx)
+                    })
+                    .collect::<Vec<_>>();
+                debug!(
+                    "Computed pending LUT entries: lut_id={}, pending_entries={}, resumed_rows={}, elapsed={}",
+                    lut_id,
+                    pending.len(),
+                    resumed_rows_for_lut,
+                    Self::format_duration(pending_scan_start.elapsed())
+                );
+                pending
+            };
+            if pending_input_indices.is_empty() {
+                debug!(
+                    "LUT {} complete in {} (resumed_rows={})",
+                    lut_id,
+                    Self::format_duration(lut_start.elapsed()),
+                    resumed_rows_for_lut
+                );
+                continue;
+            }
             let w_block_identity = self.derive_w_block_identity(params, lut_id);
             let w_block_gy = self.derive_w_block_gy(params, lut_id);
             let w_block_v = self.derive_w_block_v(params, lut_id);
@@ -2159,10 +2191,26 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
 
                 let mut batch: Vec<(usize, Vec<M::P>)> = Vec::with_capacity(chunk_size);
                 let mut pending_store_jobs: Option<Vec<CompactBytesJob<M>>> = None;
-                for (_, (idx, y_by_device)) in plt.entries_multi_gpus(&gpu_lut_params_by_device) {
-                    if completed_rows.contains(&idx) {
-                        continue;
+                for input_idx in pending_input_indices.iter().copied() {
+                    let mut y_by_device = Vec::with_capacity(gpu_lut_params_by_device.len());
+                    let mut row_idx: Option<usize> = None;
+                    for &device_params in &gpu_lut_params_by_device {
+                        let x = M::P::from_usize_to_constant(device_params, input_idx);
+                        let (idx, y_poly) = plt.get(device_params, &x).unwrap_or_else(|| {
+                            panic!("LUT entry {} missing from 0..len range", input_idx)
+                        });
+                        if let Some(expected_idx) = row_idx {
+                            debug_assert_eq!(
+                                expected_idx, idx,
+                                "pending LUT entry row index must be consistent across devices for input {}",
+                                input_idx
+                            );
+                        } else {
+                            row_idx = Some(idx);
+                        }
+                        y_by_device.push(y_poly);
                     }
+                    let idx = row_idx.expect("pending LUT row index must exist");
                     batch.push((idx, y_by_device));
 
                     if batch.len() >= chunk_size {
@@ -2269,10 +2317,11 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
 
                 let mut batch: Vec<(usize, M::P)> = Vec::with_capacity(chunk_size);
                 let mut pending_store_jobs: Option<Vec<CompactBytesJob<M>>> = None;
-                for (_, (idx, y_poly)) in plt.entries(params) {
-                    if completed_rows.contains(&idx) {
-                        continue;
-                    }
+                for input_idx in pending_input_indices.iter().copied() {
+                    let x = M::P::from_usize_to_constant(params, input_idx);
+                    let (idx, y_poly) = plt.get(params, &x).unwrap_or_else(|| {
+                        panic!("LUT entry {} missing from 0..len range", input_idx)
+                    });
                     batch.push((idx, y_poly));
 
                     if batch.len() >= chunk_size {
@@ -2632,6 +2681,7 @@ where
         drop(gy);
         let gy_term = preimage_gate2_gy * gy_decomposed;
         c_const_rhs.add_in_place(&gy_term);
+        drop(gy_term);
 
         let v_idx = derive_lut_v_idx_from_hash::<M, HS>(params, self.hash_key, lut_id, k, d);
         let preimage_gate2_v = read_matrix_from_chunks::<M>(
@@ -2649,6 +2699,7 @@ where
         );
         let v_term = preimage_gate2_v * &v_idx;
         c_const_rhs.add_in_place(&v_term);
+        drop(v_term);
 
         let x_identity_decomposed = M::identity(params, m_g, Some(x.clone())).small_decompose();
         debug_assert_eq!(
@@ -2690,10 +2741,12 @@ where
                 vx_product_acc = Some(vx_chunk_product);
             }
         }
+        drop(x_identity_decomposed);
         let vx_product_acc =
             vx_product_acc.expect("gate2_vx chunk accumulation must have at least one chunk");
         let vx_term = vx_product_acc * &v_idx;
         c_const_rhs.add_in_place(&vx_term);
+        drop(vx_term);
 
         let preimage_lut = read_matrix_from_multi_batch::<M>(params, dir, &lut_aux_row_id, 0)
             .unwrap_or_else(|| panic!("preimage_lut (index {}) for lut {} not found", k, lut_id));

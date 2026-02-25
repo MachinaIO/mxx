@@ -314,6 +314,9 @@ async fn test_gpu_ggh15_modq_arith() {
         &all_q_moduli,
     );
     info!("dry-run succeeded with expected constant term");
+    drop(dry_out);
+    drop(dry_circuit);
+    drop(dry_plt_evaluator);
 
     let seed: [u8; 32] = [0u8; 32];
     let trapdoor_sigma = 4.578;
@@ -342,7 +345,11 @@ async fn test_gpu_ggh15_modq_arith() {
     let enc_setup_start = Instant::now();
     let encoding_sampler =
         BGGEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
+    drop(secrets);
     let encodings = encoding_sampler.sample(&params, &pubkeys, &plaintext_inputs);
+    drop(plaintext_inputs);
+    drop(a_inputs);
+    drop(b_inputs);
     info!("encoding sampling elapsed_ms={:.3}", enc_setup_start.elapsed().as_secs_f64() * 1000.0);
     let encodings_compact_start = Instant::now();
     let encodings_compact: Vec<_> = encodings
@@ -399,6 +406,7 @@ async fn test_gpu_ggh15_modq_arith() {
         .load_b0_matrix_checkpoint(&params)
         .expect("b0 matrix checkpoint should exist after sample_aux_matrices");
     let c_b0 = s_vec.clone() * &b0_matrix;
+    drop(b0_matrix);
     let checkpoint_prefix = pk_evaluator.checkpoint_prefix(&params);
     drop(pk_evaluator);
 

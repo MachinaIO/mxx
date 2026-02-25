@@ -11,6 +11,7 @@ use rayon::prelude::*;
 #[cfg(test)]
 use sequential_test::sequential;
 use std::{
+    collections::HashMap,
     ffi::CStr,
     fmt::Debug,
     hash::Hash,
@@ -19,7 +20,7 @@ use std::{
     os::raw::{c_char, c_int},
     ptr::{self, NonNull},
     slice,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 use tracing::info;
 
@@ -375,6 +376,22 @@ fn log2_u32(value: u32) -> u32 {
     value.trailing_zeros()
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct DeviceContextCacheKey {
+    ring_dimension: u32,
+    moduli: Vec<u64>,
+    base_bits: u32,
+    device_id: i32,
+    batch: u32,
+}
+
+fn single_device_context_cache() -> &'static Mutex<HashMap<DeviceContextCacheKey, Weak<GpuContext>>>
+{
+    static CACHE: OnceLock<Mutex<HashMap<DeviceContextCacheKey, Weak<GpuContext>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 #[derive(Clone)]
 pub struct GpuDCRTPolyParams {
     ring_dimension: u32,
@@ -449,18 +466,53 @@ impl PolyParams for GpuDCRTPolyParams {
     }
 
     fn params_for_device(&self, device_id: i32) -> Self {
-        GpuDCRTPolyParams::new_with_gpu(
-            self.ring_dimension,
-            self.moduli.clone(),
-            self.base_bits,
-            vec![device_id],
-            Some(1),
-            self.batch,
-        )
+        let ctx = self.single_device_context(device_id);
+        Self {
+            ring_dimension: self.ring_dimension,
+            moduli: self.moduli.clone(),
+            crt_bits: self.crt_bits,
+            crt_depth: self.crt_depth,
+            modulus: self.modulus.clone(),
+            base_bits: self.base_bits,
+            gpu_ids: vec![device_id],
+            dnum: 1,
+            batch: self.batch,
+            ctx,
+        }
     }
 }
 
 impl GpuDCRTPolyParams {
+    fn single_device_context(&self, device_id: i32) -> Arc<GpuContext> {
+        let key = DeviceContextCacheKey {
+            ring_dimension: self.ring_dimension,
+            moduli: self.moduli.clone(),
+            base_bits: self.base_bits,
+            device_id,
+            batch: self.batch,
+        };
+
+        if let Some(existing) = {
+            let cache = single_device_context_cache();
+            let guard = cache.lock().expect("single_device_context_cache mutex poisoned");
+            guard.get(&key).and_then(Weak::upgrade)
+        } {
+            return existing;
+        }
+
+        let log_n = log2_u32(self.ring_dimension);
+        let created =
+            Arc::new(GpuContext::create(log_n, &self.moduli, &[device_id], 1, self.batch));
+
+        let cache = single_device_context_cache();
+        let mut guard = cache.lock().expect("single_device_context_cache mutex poisoned");
+        if let Some(existing) = guard.get(&key).and_then(Weak::upgrade) {
+            return existing;
+        }
+        guard.insert(key, Arc::downgrade(&created));
+        created
+    }
+
     pub fn new(ring_dimension: u32, moduli: Vec<u64>, base_bits: u32) -> Self {
         let gpu_ids = available_gpu_ids();
         Self::new_with_gpu(ring_dimension, moduli, base_bits, gpu_ids, None, 1)

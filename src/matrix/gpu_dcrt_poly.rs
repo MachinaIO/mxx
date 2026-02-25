@@ -12,11 +12,11 @@ use crate::{
                 gpu_event_set_destroy, gpu_event_set_wait, gpu_matrix_add, gpu_matrix_copy,
                 gpu_matrix_copy_block, gpu_matrix_create, gpu_matrix_decompose_base,
                 gpu_matrix_decompose_base_small, gpu_matrix_destroy, gpu_matrix_equal,
-                gpu_matrix_fill_gadget, gpu_matrix_fill_small_gadget,
-                gpu_matrix_gauss_samp_gq_arb_base, gpu_matrix_intt_all,
-                gpu_matrix_load_compact_bytes, gpu_matrix_load_rns_batch, gpu_matrix_mul,
-                gpu_matrix_mul_scalar, gpu_matrix_ntt_all, gpu_matrix_sample_distribution,
-                gpu_matrix_sample_distribution_decompose_base,
+                gpu_matrix_fill_gadget, gpu_matrix_fill_small_decomposed_identity_chunk,
+                gpu_matrix_fill_small_gadget, gpu_matrix_gauss_samp_gq_arb_base,
+                gpu_matrix_intt_all, gpu_matrix_load_compact_bytes, gpu_matrix_load_rns_batch,
+                gpu_matrix_mul, gpu_matrix_mul_scalar, gpu_matrix_ntt_all,
+                gpu_matrix_sample_distribution, gpu_matrix_sample_distribution_decompose_base,
                 gpu_matrix_sample_distribution_decompose_base_small, gpu_matrix_sample_p1_full,
                 gpu_matrix_store_compact_bytes, gpu_matrix_store_rns_batch, gpu_matrix_sub,
             },
@@ -1072,6 +1072,62 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
 
     fn small_decompose_owned(self) -> Self {
         GpuDCRTPolyMatrix::small_decompose_owned(self)
+    }
+
+    fn small_decomposed_identity_chunk(
+        params: &<Self::P as Poly>::Params,
+        size: usize,
+        chunk_idx: usize,
+        chunk_count: usize,
+        scalar_by_digit: &[Self::P],
+    ) -> Self {
+        assert!(chunk_count > 0, "small_decomposed_identity_chunk chunk_count must be > 0");
+        assert_eq!(
+            scalar_by_digit.len(),
+            chunk_count,
+            "small_decomposed_identity_chunk requires scalar_by_digit.len() == chunk_count"
+        );
+        if size == 0 {
+            return Self::new_zero(params, 0, 0);
+        }
+
+        let scalar_row = Self::from_poly_vec_row(params, scalar_by_digit.to_vec());
+        debug_assert_eq!(
+            scalar_row.size(),
+            (1, chunk_count),
+            "scalar_by_digit row must be 1 x chunk_count"
+        );
+        let out =
+            Self::new_empty_with_state(params, size, size, scalar_row.level, scalar_row.is_ntt);
+        let status = unsafe {
+            gpu_matrix_fill_small_decomposed_identity_chunk(out.raw, scalar_row.raw, chunk_idx)
+        };
+        check_status(status, "gpu_matrix_fill_small_decomposed_identity_chunk");
+        out
+    }
+
+    fn small_decomposed_identity_chunk_from_scalar(
+        params: &<Self::P as Poly>::Params,
+        size: usize,
+        scalar: &Self::P,
+        chunk_idx: usize,
+        chunk_count: usize,
+    ) -> Self {
+        let scalar_decomposed = Self::identity(params, 1, Some(scalar.clone())).small_decompose();
+        assert_eq!(
+            scalar_decomposed.size(),
+            (chunk_count, 1),
+            "scalar small decomposition shape mismatch in small_decomposed_identity_chunk_from_scalar"
+        );
+        let scalar_by_digit =
+            (0..chunk_count).map(|digit| scalar_decomposed.entry(digit, 0)).collect::<Vec<_>>();
+        Self::small_decomposed_identity_chunk(
+            params,
+            size,
+            chunk_idx,
+            chunk_count,
+            &scalar_by_digit,
+        )
     }
 
     fn modulus_switch(

@@ -439,6 +439,379 @@ extern "C" int gpu_matrix_fill_small_gadget(
     return gpu_matrix_fill_gadget_impl(out, base_bits, true);
 }
 
+__global__ void matrix_fill_small_decomposed_identity_chunk_all_limbs_kernel(
+    const uint64_t *const *src_bases,
+    uint64_t *const *dst_bases,
+    const size_t *src_strides,
+    const size_t *dst_strides,
+    size_t limb_count,
+    size_t n,
+    size_t size,
+    size_t chunk_idx,
+    size_t chunk_count)
+{
+    const size_t limb_idx = static_cast<size_t>(blockIdx.z);
+    if (limb_idx >= limb_count)
+    {
+        return;
+    }
+    const uint64_t *src_base = src_bases ? src_bases[limb_idx] : nullptr;
+    uint64_t *dst_base = dst_bases ? dst_bases[limb_idx] : nullptr;
+    const size_t src_stride = src_strides ? src_strides[limb_idx] : 0;
+    const size_t dst_stride = dst_strides ? dst_strides[limb_idx] : 0;
+    if (!src_base || !dst_base || src_stride < n || dst_stride < n)
+    {
+        return;
+    }
+
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = size * n;
+    if (idx >= total)
+    {
+        return;
+    }
+    const size_t local_row = idx / n;
+    const size_t coeff_idx = idx - local_row * n;
+    const size_t global_row = chunk_idx * size + local_row;
+    const size_t src_row = global_row / chunk_count;
+    const size_t digit = global_row - src_row * chunk_count;
+    if (src_row >= size || digit >= chunk_count)
+    {
+        return;
+    }
+
+    const size_t src_poly_idx = digit;
+    const size_t dst_poly_idx = local_row * size + src_row;
+    dst_base[dst_poly_idx * dst_stride + coeff_idx] =
+        src_base[src_poly_idx * src_stride + coeff_idx];
+}
+
+extern "C" int gpu_matrix_fill_small_decomposed_identity_chunk(
+    GpuMatrix *out,
+    const GpuMatrix *scalar_by_digit,
+    size_t chunk_idx)
+{
+    if (!out || !scalar_by_digit)
+    {
+        return set_error("invalid gpu_matrix_fill_small_decomposed_identity_chunk arguments");
+    }
+    if (out->ctx != scalar_by_digit->ctx || out->level != scalar_by_digit->level)
+    {
+        return set_error("context mismatch in gpu_matrix_fill_small_decomposed_identity_chunk");
+    }
+    if (out->rows != out->cols)
+    {
+        return set_error("output must be square in gpu_matrix_fill_small_decomposed_identity_chunk");
+    }
+    if (scalar_by_digit->rows != 1 || scalar_by_digit->cols == 0)
+    {
+        return set_error("scalar_by_digit must be 1 x chunk_count in gpu_matrix_fill_small_decomposed_identity_chunk");
+    }
+    if (out->format != scalar_by_digit->format)
+    {
+        return set_error("format mismatch in gpu_matrix_fill_small_decomposed_identity_chunk");
+    }
+    const size_t size = out->rows;
+    const size_t chunk_count = scalar_by_digit->cols;
+    if (chunk_idx >= chunk_count)
+    {
+        return set_error("chunk_idx out of range in gpu_matrix_fill_small_decomposed_identity_chunk");
+    }
+    if (size == 0)
+    {
+        return 0;
+    }
+
+    const int level = out->level;
+    if (level < 0)
+    {
+        return set_error("invalid level in gpu_matrix_fill_small_decomposed_identity_chunk");
+    }
+    const size_t limb_count = static_cast<size_t>(level + 1);
+    auto &limb_map = out->ctx->limb_gpu_ids;
+    if (limb_map.size() < limb_count)
+    {
+        return set_error("unexpected limb mapping size in gpu_matrix_fill_small_decomposed_identity_chunk");
+    }
+
+    int dispatch_device = -1;
+    cudaStream_t dispatch_stream = nullptr;
+    std::vector<dim3> active_limb_ids(limb_count);
+    std::vector<uint64_t *> out_limb_bases(limb_count, nullptr);
+    std::vector<const uint64_t *> src_limb_bases(limb_count, nullptr);
+    std::vector<size_t> out_limb_strides(limb_count, 0);
+    std::vector<size_t> src_limb_strides(limb_count, 0);
+
+    int status = 0;
+    for (int limb = 0; limb <= level; ++limb)
+    {
+        const size_t idx = static_cast<size_t>(limb);
+        const dim3 limb_id = limb_map[idx];
+        active_limb_ids[idx] = limb_id;
+
+        int out_device = -1;
+        status = matrix_limb_device(out, limb_id, &out_device);
+        if (status != 0)
+        {
+            return status;
+        }
+        cudaStream_t out_stream = nullptr;
+        status = matrix_limb_stream(out, limb_id, &out_stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        if (out_device < 0 || !out_stream)
+        {
+            return set_error("invalid output limb metadata in gpu_matrix_fill_small_decomposed_identity_chunk");
+        }
+        if (limb == 0)
+        {
+            dispatch_device = out_device;
+            dispatch_stream = out_stream;
+        }
+        else if (out_device != dispatch_device)
+        {
+            return set_error(
+                "single-device mode requires all limbs on one device in gpu_matrix_fill_small_decomposed_identity_chunk");
+        }
+
+        int src_device = -1;
+        status = matrix_limb_device(scalar_by_digit, limb_id, &src_device);
+        if (status != 0)
+        {
+            return status;
+        }
+        if (src_device != dispatch_device)
+        {
+            return set_error(
+                "single-device mode requires scalar limbs on dispatch device in gpu_matrix_fill_small_decomposed_identity_chunk");
+        }
+
+        uint64_t *dst = matrix_limb_ptr_by_id(out, 0, limb_id);
+        if (!dst)
+        {
+            return set_error("null output limb pointer in gpu_matrix_fill_small_decomposed_identity_chunk");
+        }
+        const uint64_t *src = matrix_limb_ptr_by_id(scalar_by_digit, 0, limb_id);
+        if (!src)
+        {
+            return set_error("null source limb pointer in gpu_matrix_fill_small_decomposed_identity_chunk");
+        }
+        if (limb_id.x >= out->shared_limb_buffers.size() ||
+            limb_id.x >= scalar_by_digit->shared_limb_buffers.size())
+        {
+            return set_error("invalid partition index in gpu_matrix_fill_small_decomposed_identity_chunk");
+        }
+        out_limb_bases[idx] = dst;
+        src_limb_bases[idx] = src;
+        out_limb_strides[idx] = out->shared_limb_buffers[limb_id.x].words_per_poly;
+        src_limb_strides[idx] = scalar_by_digit->shared_limb_buffers[limb_id.x].words_per_poly;
+    }
+
+    if (dispatch_device < 0 || !dispatch_stream)
+    {
+        return set_error("invalid dispatch metadata in gpu_matrix_fill_small_decomposed_identity_chunk");
+    }
+    cudaError_t err = cudaSetDevice(dispatch_device);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+
+    if (limb_count > kDecomposeMaxGridZ)
+    {
+        return set_error("too many limbs in gpu_matrix_fill_small_decomposed_identity_chunk");
+    }
+
+    const size_t out_count = size * size;
+    const size_t coeff_bytes = static_cast<size_t>(out->ctx->N) * sizeof(uint64_t);
+    for (int limb = 0; limb <= level; ++limb)
+    {
+        const size_t idx = static_cast<size_t>(limb);
+        const dim3 limb_id = active_limb_ids[idx];
+        status = matrix_wait_limb_stream(out, limb_id, dispatch_device, dispatch_stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_wait_limb_stream(scalar_by_digit, limb_id, dispatch_device, dispatch_stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        const size_t dst_pitch = out_limb_strides[idx] * sizeof(uint64_t);
+        err = cudaMemset2DAsync(
+            out_limb_bases[idx],
+            dst_pitch,
+            0,
+            coeff_bytes,
+            out_count,
+            dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+    }
+
+    if (limb_count > std::numeric_limits<size_t>::max() / sizeof(uint64_t *) ||
+        limb_count > std::numeric_limits<size_t>::max() / sizeof(size_t))
+    {
+        return set_error("limb metadata size overflow in gpu_matrix_fill_small_decomposed_identity_chunk");
+    }
+    const size_t limb_ptr_bytes = limb_count * sizeof(uint64_t *);
+    const size_t limb_stride_bytes = limb_count * sizeof(size_t);
+    uint64_t **src_limb_bases_device = nullptr;
+    uint64_t **out_limb_bases_device = nullptr;
+    size_t *src_limb_strides_device = nullptr;
+    size_t *out_limb_strides_device = nullptr;
+    auto cleanup_dispatch_allocs = [&]()
+    {
+        if (dispatch_device >= 0)
+        {
+            cudaSetDevice(dispatch_device);
+        }
+        if (src_limb_bases_device)
+        {
+            cudaFreeAsync(src_limb_bases_device, dispatch_stream);
+            src_limb_bases_device = nullptr;
+        }
+        if (out_limb_bases_device)
+        {
+            cudaFreeAsync(out_limb_bases_device, dispatch_stream);
+            out_limb_bases_device = nullptr;
+        }
+        if (src_limb_strides_device)
+        {
+            cudaFreeAsync(src_limb_strides_device, dispatch_stream);
+            src_limb_strides_device = nullptr;
+        }
+        if (out_limb_strides_device)
+        {
+            cudaFreeAsync(out_limb_strides_device, dispatch_stream);
+            out_limb_strides_device = nullptr;
+        }
+    };
+
+    err = cudaMallocAsync(reinterpret_cast<void **>(&src_limb_bases_device), limb_ptr_bytes, dispatch_stream);
+    if (err != cudaSuccess)
+    {
+        cleanup_dispatch_allocs();
+        return set_error(err);
+    }
+    err = cudaMallocAsync(reinterpret_cast<void **>(&out_limb_bases_device), limb_ptr_bytes, dispatch_stream);
+    if (err != cudaSuccess)
+    {
+        cleanup_dispatch_allocs();
+        return set_error(err);
+    }
+    err = cudaMallocAsync(reinterpret_cast<void **>(&src_limb_strides_device), limb_stride_bytes, dispatch_stream);
+    if (err != cudaSuccess)
+    {
+        cleanup_dispatch_allocs();
+        return set_error(err);
+    }
+    err = cudaMallocAsync(reinterpret_cast<void **>(&out_limb_strides_device), limb_stride_bytes, dispatch_stream);
+    if (err != cudaSuccess)
+    {
+        cleanup_dispatch_allocs();
+        return set_error(err);
+    }
+
+    err = cudaMemcpyAsync(
+        src_limb_bases_device,
+        src_limb_bases.data(),
+        limb_ptr_bytes,
+        cudaMemcpyHostToDevice,
+        dispatch_stream);
+    if (err != cudaSuccess)
+    {
+        cleanup_dispatch_allocs();
+        return set_error(err);
+    }
+    err = cudaMemcpyAsync(
+        out_limb_bases_device,
+        out_limb_bases.data(),
+        limb_ptr_bytes,
+        cudaMemcpyHostToDevice,
+        dispatch_stream);
+    if (err != cudaSuccess)
+    {
+        cleanup_dispatch_allocs();
+        return set_error(err);
+    }
+    err = cudaMemcpyAsync(
+        src_limb_strides_device,
+        src_limb_strides.data(),
+        limb_stride_bytes,
+        cudaMemcpyHostToDevice,
+        dispatch_stream);
+    if (err != cudaSuccess)
+    {
+        cleanup_dispatch_allocs();
+        return set_error(err);
+    }
+    err = cudaMemcpyAsync(
+        out_limb_strides_device,
+        out_limb_strides.data(),
+        limb_stride_bytes,
+        cudaMemcpyHostToDevice,
+        dispatch_stream);
+    if (err != cudaSuccess)
+    {
+        cleanup_dispatch_allocs();
+        return set_error(err);
+    }
+
+    const int threads = 256;
+    const size_t total = size * static_cast<size_t>(out->ctx->N);
+    const int blocks = static_cast<int>((total + static_cast<size_t>(threads) - 1) / threads);
+    const dim3 grid{
+        static_cast<unsigned int>(blocks),
+        1u,
+        static_cast<unsigned int>(limb_count)};
+    matrix_fill_small_decomposed_identity_chunk_all_limbs_kernel<<<grid, threads, 0, dispatch_stream>>>(
+        src_limb_bases_device,
+        out_limb_bases_device,
+        src_limb_strides_device,
+        out_limb_strides_device,
+        limb_count,
+        static_cast<size_t>(out->ctx->N),
+        size,
+        chunk_idx,
+        chunk_count);
+    err = cudaGetLastError();
+    if (err != cudaSuccess)
+    {
+        cleanup_dispatch_allocs();
+        return set_error(err);
+    }
+
+    for (int limb = 0; limb <= level; ++limb)
+    {
+        const size_t idx = static_cast<size_t>(limb);
+        status = matrix_track_limb_consumer(
+            scalar_by_digit,
+            active_limb_ids[idx],
+            dispatch_device,
+            dispatch_stream);
+        if (status != 0)
+        {
+            cleanup_dispatch_allocs();
+            return status;
+        }
+        status = matrix_record_limb_write(out, active_limb_ids[idx], dispatch_stream);
+        if (status != 0)
+        {
+            cleanup_dispatch_allocs();
+            return status;
+        }
+    }
+    cleanup_dispatch_allocs();
+    out->format = scalar_by_digit->format;
+    return 0;
+}
+
 static int gpu_matrix_decompose_base_impl(
     const GpuMatrix *src,
     uint32_t base_bits,

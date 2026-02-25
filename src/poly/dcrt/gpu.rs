@@ -135,6 +135,11 @@ unsafe extern "C" {
     ) -> c_int;
     pub(crate) fn gpu_matrix_fill_gadget(out: *mut GpuMatrixOpaque, base_bits: u32) -> c_int;
     pub(crate) fn gpu_matrix_fill_small_gadget(out: *mut GpuMatrixOpaque, base_bits: u32) -> c_int;
+    pub(crate) fn gpu_matrix_fill_small_decomposed_identity_chunk(
+        out: *mut GpuMatrixOpaque,
+        scalar_by_digit: *const GpuMatrixOpaque,
+        chunk_idx: usize,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_decompose_base(
         src: *const GpuMatrixOpaque,
         base_bits: u32,

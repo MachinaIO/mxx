@@ -2701,17 +2701,6 @@ where
         c_const_rhs.add_in_place(&v_term);
         drop(v_term);
 
-        let x_identity_decomposed = M::identity(params, m_g, Some(x.clone())).small_decompose();
-        debug_assert_eq!(
-            x_identity_decomposed.row_size(),
-            m_g * k_small,
-            "x_identity_decomposed rows must have m_g * k_small rows"
-        );
-        debug_assert_eq!(
-            x_identity_decomposed.col_size(),
-            m_g,
-            "x_identity_decomposed must have m_g columns"
-        );
         let mut vx_product_acc: Option<M> = None;
         for chunk_idx in 0..k_small {
             let preimage_gate2_vx_chunk = read_matrix_from_multi_batch::<M>(
@@ -2728,12 +2717,8 @@ where
                 m_g,
                 "preimage_gate2_vx chunk must have m_g columns"
             );
-            let row_start = chunk_idx
-                .checked_mul(m_g)
-                .expect("x_identity_decomposed chunk row offset overflow");
-            let row_end = row_start + m_g;
             let x_identity_decomposed_chunk =
-                x_identity_decomposed.slice(row_start, row_end, 0, m_g);
+                M::small_decomposed_identity_chunk_from_scalar(params, m_g, x, chunk_idx, k_small);
             let vx_chunk_product = preimage_gate2_vx_chunk * &x_identity_decomposed_chunk;
             if let Some(acc) = vx_product_acc.as_mut() {
                 acc.add_in_place(&vx_chunk_product);
@@ -2741,7 +2726,6 @@ where
                 vx_product_acc = Some(vx_chunk_product);
             }
         }
-        drop(x_identity_decomposed);
         let vx_product_acc =
             vx_product_acc.expect("gate2_vx chunk accumulation must have at least one chunk");
         let vx_term = vx_product_acc * &v_idx;
@@ -2824,6 +2808,32 @@ mod test {
     }
 
     const SIGMA: f64 = 4.578;
+
+    #[test]
+    fn test_small_decomposed_identity_chunk_equivalence() {
+        let params = DCRTPolyParams::default();
+        let d = 2usize;
+        let m_g = d * params.modulus_digits();
+        let k_small = super::small_gadget_chunk_count::<DCRTPolyMatrix>(&params);
+        let x = DCRTPoly::from_usize_to_constant(&params, 13);
+
+        let full = DCRTPolyMatrix::identity(&params, m_g, Some(x.clone())).small_decompose();
+        let x_digit_decomposed = DCRTPolyMatrix::identity(&params, 1, Some(x)).small_decompose();
+        let x_digit_by_chunk =
+            (0..k_small).map(|digit| x_digit_decomposed.entry(digit, 0)).collect::<Vec<_>>();
+
+        for chunk_idx in 0..k_small {
+            let expected = full.slice(chunk_idx * m_g, (chunk_idx + 1) * m_g, 0, m_g);
+            let actual = DCRTPolyMatrix::small_decomposed_identity_chunk(
+                &params,
+                m_g,
+                chunk_idx,
+                k_small,
+                &x_digit_by_chunk,
+            );
+            assert_eq!(actual, expected, "chunk mismatch at chunk_idx={chunk_idx}");
+        }
+    }
 
     #[tokio::test]
     #[sequential_test::sequential]

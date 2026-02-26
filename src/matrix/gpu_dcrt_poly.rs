@@ -1729,19 +1729,17 @@ mod tests {
         let source_coeff = source_eval.clone().into_coeff_domain();
 
         for source in [source_eval, source_coeff] {
-            let source_cpu = source.to_cpu_matrix();
             let bytes_from_src = source.to_compact_bytes();
 
             let decoded_on_dst = GpuDCRTPolyMatrix::from_compact_bytes(&dst_params, &bytes_from_src);
+            let bytes_from_dst = decoded_on_dst.to_compact_bytes();
             assert_eq!(
-                decoded_on_dst.to_cpu_matrix(),
-                source_cpu,
-                "cross-device decode mismatch (src_device={}, dst_device={})",
+                bytes_from_dst,
+                bytes_from_src,
+                "cross-device decode/encode bytes mismatch (src_device={}, dst_device={})",
                 src_device,
                 dst_device
             );
-
-            let bytes_from_dst = decoded_on_dst.to_compact_bytes();
             let decoded_back_on_src =
                 GpuDCRTPolyMatrix::from_compact_bytes(&src_params, &bytes_from_dst);
             assert_eq!(

@@ -18,11 +18,6 @@ impl<P: Poly> Evaluable for P {
     }
 
     #[cfg(feature = "gpu")]
-    fn eval_device_ids(params: &Self::Params) -> Vec<i32> {
-        params.device_ids()
-    }
-
-    #[cfg(feature = "gpu")]
     fn params_for_eval_device(params: &Self::Params, device_id: i32) -> Self::Params {
         params.params_for_device(device_id)
     }

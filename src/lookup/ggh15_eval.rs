@@ -265,7 +265,7 @@ where
         b1_trapdoor: &TS::Trapdoor,
         b1_matrix: &M,
     ) -> Vec<GpuLutBaseDeviceShared<M, TS::Trapdoor>> {
-        let device_ids = params.device_ids();
+        let device_ids = detected_gpu_device_ids();
         assert!(
             !device_ids.is_empty(),
             "at least one GPU device is required for gpu sample_lut_preimages"

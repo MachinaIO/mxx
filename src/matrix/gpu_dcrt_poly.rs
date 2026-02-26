@@ -1731,23 +1731,20 @@ mod tests {
         for source in [source_eval, source_coeff] {
             let bytes_from_src = source.to_compact_bytes();
 
-            let decoded_on_dst = GpuDCRTPolyMatrix::from_compact_bytes(&dst_params, &bytes_from_src);
+            let decoded_on_dst =
+                GpuDCRTPolyMatrix::from_compact_bytes(&dst_params, &bytes_from_src);
             let bytes_from_dst = decoded_on_dst.to_compact_bytes();
             assert_eq!(
-                bytes_from_dst,
-                bytes_from_src,
+                bytes_from_dst, bytes_from_src,
                 "cross-device decode/encode bytes mismatch (src_device={}, dst_device={})",
-                src_device,
-                dst_device
+                src_device, dst_device
             );
             let decoded_back_on_src =
                 GpuDCRTPolyMatrix::from_compact_bytes(&src_params, &bytes_from_dst);
             assert_eq!(
-                decoded_back_on_src,
-                source,
+                decoded_back_on_src, source,
                 "cross-device roundtrip mismatch (src_device={}, dst_device={})",
-                src_device,
-                dst_device
+                src_device, dst_device
             );
             assert_eq!(
                 decoded_back_on_src.to_compact_bytes(),

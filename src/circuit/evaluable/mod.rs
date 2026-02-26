@@ -29,11 +29,6 @@ pub trait Evaluable:
     fn from_compact(params: &Self::Params, compact: &Self::Compact) -> Self;
 
     #[cfg(feature = "gpu")]
-    fn eval_device_ids(_params: &Self::Params) -> Vec<i32> {
-        vec![0]
-    }
-
-    #[cfg(feature = "gpu")]
     fn params_for_eval_device(params: &Self::Params, _device_id: i32) -> Self::Params {
         params.clone()
     }

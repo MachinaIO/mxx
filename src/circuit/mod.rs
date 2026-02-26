@@ -19,6 +19,8 @@ use std::{
     },
 };
 
+#[cfg(feature = "gpu")]
+use crate::poly::dcrt::gpu::detected_gpu_device_ids;
 use crate::{
     circuit::gate::GateId,
     lookup::{PltEvaluator, PublicLut},
@@ -664,7 +666,7 @@ impl<P: Poly> PolyCircuit<P> {
         let use_parallel = parallel_gates.map(|n| n != 1).unwrap_or(true);
         #[cfg(feature = "gpu")]
         let shard_params_and_one: Vec<(E::Params, Arc<E>)> = {
-            let mut device_ids = E::eval_device_ids(params);
+            let mut device_ids = detected_gpu_device_ids();
             if device_ids.is_empty() {
                 device_ids.push(0);
             }

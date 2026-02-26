@@ -344,7 +344,7 @@ extern "C" int gpu_matrix_create(
             return set_error("unexpected decomp metadata size in gpu_matrix_create");
         }
         const size_t decomp_count = ctx->decomp_counts_by_partition[partition_idx];
-        if (!checked_mul_size(static_cast<size_t>(FIDESlib::MAXP), static_cast<size_t>(4 + 4 * decomp_count), &aux_slots) ||
+        if (!checked_mul_size(ctx->max_aux_limbs, static_cast<size_t>(4 + 4 * decomp_count), &aux_slots) ||
             !checked_mul_size(aux_slots, count, &aux_total_slots) ||
             !checked_mul_size(aux_total_slots, sizeof(void *), &aux_total_bytes))
         {

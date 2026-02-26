@@ -406,6 +406,10 @@ namespace
         auto &limb_map = mat->ctx->limb_gpu_ids;
         auto &limb_types = mat->ctx->limb_types;
         auto &limb_prime_ids = mat->ctx->limb_prime_ids;
+        auto &moduli = mat->ctx->moduli;
+        auto &ntt_n_inv_by_prime = mat->ctx->ntt_n_inv_by_prime;
+        auto &ntt_root_by_prime = mat->ctx->ntt_root_by_prime;
+        auto &ntt_inv_root_by_prime = mat->ctx->ntt_inv_root_by_prime;
         const size_t limb_count = static_cast<size_t>(mat->level + 1);
         if (limb_map.size() < limb_count)
         {
@@ -414,6 +418,12 @@ namespace
         if (limb_types.size() < limb_count || limb_prime_ids.size() < limb_count)
         {
             return set_error("unexpected limb metadata size in run_matrix_transform_u64");
+        }
+        if (ntt_n_inv_by_prime.size() != moduli.size() ||
+            ntt_root_by_prime.size() != moduli.size() ||
+            ntt_inv_root_by_prime.size() != moduli.size())
+        {
+            return set_error("unexpected NTT constants size in run_matrix_transform_u64");
         }
         if (limb_count > kMaxGridZ)
         {
@@ -476,20 +486,22 @@ namespace
                 return set_error("single-device mode requires all limbs on one device in run_matrix_transform_u64");
             }
 
-            if (limb_types[limb_idx] != FIDESlib::U64)
+            if (limb_types[limb_idx] != GPU_LIMB_U64)
             {
                 return set_error("unsupported limb type in run_matrix_transform_u64");
             }
             const int primeid = limb_prime_ids[limb_idx];
-            if (primeid < 0 || primeid >= FIDESlib::MAXP || limb_id.x >= FIDESlib::MAXD)
+            if (primeid < 0 ||
+                static_cast<size_t>(primeid) >= moduli.size() ||
+                limb_id.x >= mat->ctx->gpu_ids.size())
             {
                 return set_error("invalid prime/device index in run_matrix_transform_u64");
             }
 
-            const uint64_t modulus = FIDESlib::host_constants.primes[primeid];
-            const uint64_t n_inv = FIDESlib::host_constants.N_inv[primeid];
-            const uint64_t root = FIDESlib::host_global.root[primeid];
-            const uint64_t inv_root = FIDESlib::host_global.inv_root[primeid];
+            const uint64_t modulus = moduli[static_cast<size_t>(primeid)];
+            const uint64_t n_inv = ntt_n_inv_by_prime[static_cast<size_t>(primeid)];
+            const uint64_t root = ntt_root_by_prime[static_cast<size_t>(primeid)];
+            const uint64_t inv_root = ntt_inv_root_by_prime[static_cast<size_t>(primeid)];
             if (modulus == 0 || n_inv == 0 || root == 0 || inv_root == 0)
             {
                 return set_error("invalid modulus/root constants in run_matrix_transform_u64");

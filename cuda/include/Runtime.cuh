@@ -8,14 +8,6 @@
 #ifdef __cplusplus
 #include <mutex>
 #include <vector>
-
-// FIDESlib headers (resolved via include path).
-#include "CKKS/Context.cuh"
-#include "CKKS/Parameters.cuh"
-#include "LimbUtils.cuh"
-#include "CKKS/RNSPoly.cuh"
-
-namespace CKKS = FIDESlib::CKKS;
 #endif
 
 #ifdef __cplusplus
@@ -57,18 +49,31 @@ void gpu_pinned_free(void *ptr);
 #endif
 
 #ifdef __cplusplus
+constexpr size_t GPU_RUNTIME_MAX_LIMBS = 64;
+constexpr size_t GPU_RUNTIME_MAX_DIGITS = 8;
+
+enum GpuLimbType : uint8_t
+{
+    GPU_LIMB_U32 = 0,
+    GPU_LIMB_U64 = 1,
+};
+
 struct GpuContext
 {
-    CKKS::Context *ctx;
     std::vector<uint64_t> moduli;
+    std::vector<uint64_t> ntt_n_inv_by_prime;
+    std::vector<uint64_t> ntt_root_by_prime;
+    std::vector<uint64_t> ntt_inv_root_by_prime;
     int N;
     int level;
     std::vector<int> gpu_ids;
     uint32_t batch;
+    uint32_t dnum;
+    size_t max_aux_limbs;
     std::vector<uint64_t> garner_inverse_table;
     std::vector<dim3> limb_gpu_ids;
     std::vector<int> limb_prime_ids;
-    std::vector<FIDESlib::TYPE> limb_types;
+    std::vector<GpuLimbType> limb_types;
     std::vector<size_t> decomp_counts_by_partition;
     std::mutex transform_mutex;
 };

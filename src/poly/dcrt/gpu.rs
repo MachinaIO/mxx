@@ -520,7 +520,10 @@ impl GpuDCRTPolyParams {
 
     pub fn new(ring_dimension: u32, moduli: Vec<u64>, base_bits: u32) -> Self {
         let gpu_ids = available_gpu_ids();
-        Self::new_with_gpu(ring_dimension, moduli, base_bits, gpu_ids, None, 1)
+        // Default params stay single-device so low-level matrix/poly ops keep the
+        // invariant that all limbs of a matrix live on one device.
+        let default_gpu_ids = gpu_ids.into_iter().take(1).collect::<Vec<_>>();
+        Self::new_with_gpu(ring_dimension, moduli, base_bits, default_gpu_ids, None, 1)
     }
 
     pub fn new_with_gpu(

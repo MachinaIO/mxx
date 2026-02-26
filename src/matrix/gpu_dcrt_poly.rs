@@ -1810,6 +1810,91 @@ mod tests {
 
     #[test]
     #[sequential]
+    fn test_gpu_matrix_small_decomposed_identity_chunk_digit_bound() {
+        gpu_device_sync();
+        let params = DCRTPolyParams::new(128, 2, 16, 4);
+        let gpu_params = gpu_params_from_cpu(&params);
+        let size = 4usize;
+        let chunk_count = gpu_params.crt_bits().div_ceil(gpu_params.base_bits() as usize);
+        let digit_upper = BigUint::from(1u64 << gpu_params.base_bits());
+
+        let min_modulus =
+            gpu_params.moduli().iter().copied().min().expect("CRT basis must be non-empty");
+        let scalar =
+            GpuDCRTPoly::from_biguint_to_constant(&gpu_params, BigUint::from(min_modulus - 1));
+
+        for chunk_idx in 0..chunk_count {
+            let chunk = GpuDCRTPolyMatrix::small_decomposed_identity_chunk_from_scalar(
+                &gpu_params,
+                size,
+                &scalar,
+                chunk_idx,
+                chunk_count,
+            );
+            assert_eq!(chunk.size(), (size, size));
+            for row in 0..size {
+                for col in 0..size {
+                    for coeff in chunk.entry(row, col).coeffs() {
+                        assert!(
+                            coeff.value() < &digit_upper,
+                            "digit bound violated: row={}, col={}, chunk_idx={}, value={}, upper={}",
+                            row,
+                            col,
+                            chunk_idx,
+                            coeff.value(),
+                            digit_upper
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_small_decomposed_identity_chunk_from_scalar_relation() {
+        gpu_device_sync();
+        let params = DCRTPolyParams::new(128, 2, 16, 4);
+        let gpu_params = gpu_params_from_cpu(&params);
+        let size = 4usize;
+        let chunk_count = gpu_params.crt_bits().div_ceil(gpu_params.base_bits() as usize);
+
+        let min_modulus =
+            gpu_params.moduli().iter().copied().min().expect("CRT basis must be non-empty");
+        let scalar =
+            GpuDCRTPoly::from_biguint_to_constant(&gpu_params, BigUint::from(min_modulus - 1));
+
+        let mut chunks = Vec::with_capacity(chunk_count);
+        for chunk_idx in 0..chunk_count {
+            let chunk = GpuDCRTPolyMatrix::small_decomposed_identity_chunk_from_scalar(
+                &gpu_params,
+                size,
+                &scalar,
+                chunk_idx,
+                chunk_count,
+            );
+            assert_eq!(chunk.size(), (size, size));
+            chunks.push(chunk);
+        }
+
+        let mut chunk_iter = chunks.into_iter();
+        let first_chunk = chunk_iter
+            .next()
+            .expect("small_decomposed_identity_chunk_from_scalar must produce at least one chunk");
+        let decomposed_from_chunks = first_chunk.concat_rows_owned(chunk_iter.collect());
+        assert_eq!(decomposed_from_chunks.size(), (size * chunk_count, size));
+
+        let expected_identity = GpuDCRTPolyMatrix::identity(&gpu_params, size, Some(scalar));
+        let expected_decomposed = expected_identity.clone().small_decompose();
+        assert_eq!(decomposed_from_chunks, expected_decomposed);
+
+        let reconstructed =
+            GpuDCRTPolyMatrix::small_gadget_matrix(&gpu_params, size) * decomposed_from_chunks;
+        assert_eq!(reconstructed, expected_identity);
+    }
+
+    #[test]
+    #[sequential]
     fn test_gpu_matrix_mul_decompose_small_relation() {
         gpu_device_sync();
         let params = gpu_test_params();

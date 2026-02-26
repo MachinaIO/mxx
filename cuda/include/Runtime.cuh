@@ -58,12 +58,30 @@ enum GpuLimbType : uint8_t
     GPU_LIMB_U64 = 1,
 };
 
+struct GpuNttDeviceConstants
+{
+    int device;
+    size_t limb_count;
+    uint32_t stage_count;
+    uint64_t *limb_wlen_forward; // stage-major layout: [stage][limb]
+    uint64_t *limb_wlen_inverse; // stage-major layout: [stage][limb]
+};
+
+#if defined(__CUDACC__)
+extern __constant__ uint64_t gpu_ntt_const_moduli[GPU_RUNTIME_MAX_LIMBS];
+extern __constant__ uint64_t gpu_ntt_const_root[GPU_RUNTIME_MAX_LIMBS];
+extern __constant__ uint64_t gpu_ntt_const_inv_root[GPU_RUNTIME_MAX_LIMBS];
+extern __constant__ uint64_t gpu_ntt_const_n_inv[GPU_RUNTIME_MAX_LIMBS];
+extern __constant__ uint32_t gpu_ntt_const_limb_count;
+#endif
+
 struct GpuContext
 {
     std::vector<uint64_t> moduli;
     std::vector<uint64_t> ntt_n_inv_by_prime;
     std::vector<uint64_t> ntt_root_by_prime;
     std::vector<uint64_t> ntt_inv_root_by_prime;
+    std::vector<GpuNttDeviceConstants> ntt_device_constants;
     int N;
     int level;
     std::vector<int> gpu_ids;

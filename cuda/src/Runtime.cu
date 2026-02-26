@@ -1,6 +1,8 @@
 #include "Runtime.cuh"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <stdexcept>
@@ -292,6 +294,204 @@ namespace
             inv_root_by_prime[i] = inv_root;
         }
     }
+
+    uint64_t parse_u64_or_default(const char *value, uint64_t default_value)
+    {
+        if (!value || value[0] == '\0')
+        {
+            return default_value;
+        }
+        errno = 0;
+        char *end = nullptr;
+        const unsigned long long parsed = std::strtoull(value, &end, 10);
+        if (errno != 0 || !end || *end != '\0')
+        {
+            return default_value;
+        }
+        return static_cast<uint64_t>(parsed);
+    }
+
+    uint64_t mempool_release_threshold_bytes()
+    {
+        const uint64_t default_threshold = std::numeric_limits<uint64_t>::max();
+        const char *env = std::getenv("MXX_CUDA_MEMPOOL_RELEASE_THRESHOLD_BYTES");
+        return parse_u64_or_default(env, default_threshold);
+    }
+
+    void configure_default_mempool_release_threshold(const std::vector<int> &gpu_list)
+    {
+        uint64_t threshold = mempool_release_threshold_bytes();
+        for (int device : gpu_list)
+        {
+            cudaMemPool_t pool = nullptr;
+            cudaError_t err = cudaDeviceGetDefaultMemPool(&pool, device);
+            if (err != cudaSuccess)
+            {
+                throw std::runtime_error(cudaGetErrorString(err));
+            }
+            err = cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold);
+            if (err != cudaSuccess)
+            {
+                throw std::runtime_error(cudaGetErrorString(err));
+            }
+        }
+    }
+
+    GpuNttDeviceConstants make_empty_ntt_device_constants(int device, size_t limb_count, uint32_t stage_count)
+    {
+        GpuNttDeviceConstants out{};
+        out.device = device;
+        out.limb_count = limb_count;
+        out.stage_count = stage_count;
+        out.limb_wlen_forward = nullptr;
+        out.limb_wlen_inverse = nullptr;
+        return out;
+    }
+
+    void free_ntt_device_constants_entry(GpuNttDeviceConstants &entry)
+    {
+        if (entry.device < 0)
+        {
+            return;
+        }
+        if (cudaSetDevice(entry.device) != cudaSuccess)
+        {
+            return;
+        }
+        if (entry.limb_wlen_forward)
+        {
+            cudaFree(entry.limb_wlen_forward);
+            entry.limb_wlen_forward = nullptr;
+        }
+        if (entry.limb_wlen_inverse)
+        {
+            cudaFree(entry.limb_wlen_inverse);
+            entry.limb_wlen_inverse = nullptr;
+        }
+    }
+
+    void free_ntt_device_constants(std::vector<GpuNttDeviceConstants> &entries)
+    {
+        for (auto &entry : entries)
+        {
+            free_ntt_device_constants_entry(entry);
+        }
+        entries.clear();
+    }
+
+    void upload_ntt_small_constants_to_symbol(
+        int device,
+        const std::vector<uint64_t> &limb_moduli,
+        const std::vector<uint64_t> &limb_root,
+        const std::vector<uint64_t> &limb_inv_root,
+        const std::vector<uint64_t> &limb_n_inv)
+    {
+        const size_t limb_count = limb_moduli.size();
+        if (limb_count == 0 || limb_count > GPU_RUNTIME_MAX_LIMBS)
+        {
+            throw std::runtime_error("invalid limb count in upload_ntt_small_constants_to_symbol");
+        }
+        if (limb_root.size() != limb_count ||
+            limb_inv_root.size() != limb_count ||
+            limb_n_inv.size() != limb_count)
+        {
+            throw std::runtime_error("inconsistent limb constants in upload_ntt_small_constants_to_symbol");
+        }
+
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess)
+        {
+            throw std::runtime_error(cudaGetErrorString(err));
+        }
+        const size_t limb_bytes = limb_count * sizeof(uint64_t);
+        err = cudaMemcpyToSymbol(gpu_ntt_const_moduli, limb_moduli.data(), limb_bytes, 0, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess)
+        {
+            throw std::runtime_error(cudaGetErrorString(err));
+        }
+        err = cudaMemcpyToSymbol(gpu_ntt_const_root, limb_root.data(), limb_bytes, 0, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess)
+        {
+            throw std::runtime_error(cudaGetErrorString(err));
+        }
+        err =
+            cudaMemcpyToSymbol(gpu_ntt_const_inv_root, limb_inv_root.data(), limb_bytes, 0, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess)
+        {
+            throw std::runtime_error(cudaGetErrorString(err));
+        }
+        err = cudaMemcpyToSymbol(gpu_ntt_const_n_inv, limb_n_inv.data(), limb_bytes, 0, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess)
+        {
+            throw std::runtime_error(cudaGetErrorString(err));
+        }
+        const uint32_t limb_count_u32 = static_cast<uint32_t>(limb_count);
+        err = cudaMemcpyToSymbol(
+            gpu_ntt_const_limb_count,
+            &limb_count_u32,
+            sizeof(limb_count_u32),
+            0,
+            cudaMemcpyHostToDevice);
+        if (err != cudaSuccess)
+        {
+            throw std::runtime_error(cudaGetErrorString(err));
+        }
+    }
+
+    void upload_ntt_wlen_to_device(
+        int device,
+        const std::vector<uint64_t> &limb_wlen_forward,
+        const std::vector<uint64_t> &limb_wlen_inverse,
+        uint32_t stage_count,
+        GpuNttDeviceConstants *out_entry)
+    {
+        if (!out_entry)
+        {
+            throw std::runtime_error("null output entry in upload_ntt_wlen_to_device");
+        }
+        const size_t limb_count = out_entry->limb_count;
+        if (limb_count == 0 || stage_count == 0)
+        {
+            throw std::runtime_error("invalid NTT constants shape in upload_ntt_wlen_to_device");
+        }
+        const size_t wlen_count = limb_count * static_cast<size_t>(stage_count);
+        if (limb_wlen_forward.size() != wlen_count || limb_wlen_inverse.size() != wlen_count)
+        {
+            throw std::runtime_error("inconsistent wlen constants in upload_ntt_wlen_to_device");
+        }
+
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess)
+        {
+            throw std::runtime_error(cudaGetErrorString(err));
+        }
+
+        const size_t wlen_bytes = wlen_count * sizeof(uint64_t);
+        auto alloc_and_copy = [&](uint64_t **dst, const uint64_t *src)
+        {
+            cudaError_t local_err = cudaMalloc(reinterpret_cast<void **>(dst), wlen_bytes);
+            if (local_err != cudaSuccess)
+            {
+                throw std::runtime_error(cudaGetErrorString(local_err));
+            }
+            local_err = cudaMemcpy(*dst, src, wlen_bytes, cudaMemcpyHostToDevice);
+            if (local_err != cudaSuccess)
+            {
+                throw std::runtime_error(cudaGetErrorString(local_err));
+            }
+        };
+
+        try
+        {
+            alloc_and_copy(&out_entry->limb_wlen_forward, limb_wlen_forward.data());
+            alloc_and_copy(&out_entry->limb_wlen_inverse, limb_wlen_inverse.data());
+        }
+        catch (...)
+        {
+            free_ntt_device_constants_entry(*out_entry);
+            throw;
+        }
+    }
 }
 
 extern "C" int gpu_set_last_error(const char *msg)
@@ -312,6 +512,7 @@ extern "C"
         uint32_t batch,
         GpuContext **out_ctx)
     {
+        GpuContext *gpu_ctx = nullptr;
         try
         {
             if (!out_ctx || !moduli || moduli_len == 0)
@@ -343,6 +544,7 @@ extern "C"
             }
 
             validate_gpu_list(gpu_list);
+            configure_default_mempool_release_threshold(gpu_list);
             const uint32_t resolved_dnum =
                 dnum == 0 ? static_cast<uint32_t>(gpu_list.size()) : dnum;
             if (resolved_dnum == 0 || resolved_dnum > GPU_RUNTIME_MAX_DIGITS)
@@ -375,7 +577,44 @@ extern "C"
             std::vector<size_t> decomp_counts_by_partition =
                 compute_decomp_counts_by_partition(gpu_list.size(), resolved_dnum);
 
-            auto *gpu_ctx = new GpuContext();
+            const uint32_t stage_count = logN;
+            std::vector<uint64_t> limb_moduli(limb_count, 0);
+            std::vector<uint64_t> limb_root(limb_count, 0);
+            std::vector<uint64_t> limb_inv_root(limb_count, 0);
+            std::vector<uint64_t> limb_n_inv(limb_count, 0);
+            const size_t wlen_count = limb_count * static_cast<size_t>(stage_count);
+            std::vector<uint64_t> limb_wlen_forward(wlen_count, 0);
+            std::vector<uint64_t> limb_wlen_inverse(wlen_count, 0);
+            for (size_t limb_idx = 0; limb_idx < limb_count; ++limb_idx)
+            {
+                const int primeid = limb_prime_ids[limb_idx];
+                if (primeid < 0 || static_cast<size_t>(primeid) >= moduli_vec.size())
+                {
+                    throw std::runtime_error("invalid prime id in context creation");
+                }
+                const size_t prime_idx = static_cast<size_t>(primeid);
+                const uint64_t modulus = moduli_vec[prime_idx];
+                const uint64_t root = root_by_prime[prime_idx];
+                const uint64_t inv_root = inv_root_by_prime[prime_idx];
+                const uint64_t n_inv = n_inv_by_prime[prime_idx];
+                limb_moduli[limb_idx] = modulus;
+                limb_root[limb_idx] = root;
+                limb_inv_root[limb_idx] = inv_root;
+                limb_n_inv[limb_idx] = n_inv;
+
+                const uint64_t omega = mul_mod_u64_host(root, root, modulus);
+                const uint64_t inv_omega = mul_mod_u64_host(inv_root, inv_root, modulus);
+                for (uint32_t stage_idx = 0; stage_idx < stage_count; ++stage_idx)
+                {
+                    const uint32_t len = static_cast<uint32_t>(1U << (stage_idx + 1U));
+                    const uint32_t exp = static_cast<uint32_t>(n_u64 / len);
+                    const size_t offset = static_cast<size_t>(stage_idx) * limb_count + limb_idx;
+                    limb_wlen_forward[offset] = pow_mod_u64_host(omega, exp, modulus);
+                    limb_wlen_inverse[offset] = pow_mod_u64_host(inv_omega, exp, modulus);
+                }
+            }
+
+            gpu_ctx = new GpuContext();
             gpu_ctx->moduli = std::move(moduli_vec);
             gpu_ctx->ntt_n_inv_by_prime = std::move(n_inv_by_prime);
             gpu_ctx->ntt_root_by_prime = std::move(root_by_prime);
@@ -391,15 +630,39 @@ extern "C"
             gpu_ctx->limb_prime_ids = std::move(limb_prime_ids);
             gpu_ctx->limb_types = std::move(limb_types);
             gpu_ctx->decomp_counts_by_partition = std::move(decomp_counts_by_partition);
+            gpu_ctx->ntt_device_constants.reserve(gpu_ctx->gpu_ids.size());
+            for (int device : gpu_ctx->gpu_ids)
+            {
+                GpuNttDeviceConstants device_constants =
+                    make_empty_ntt_device_constants(device, limb_count, stage_count);
+                upload_ntt_small_constants_to_symbol(
+                    device,
+                    limb_moduli,
+                    limb_root,
+                    limb_inv_root,
+                    limb_n_inv);
+                upload_ntt_wlen_to_device(device, limb_wlen_forward, limb_wlen_inverse, stage_count, &device_constants);
+                gpu_ctx->ntt_device_constants.push_back(device_constants);
+            }
             *out_ctx = gpu_ctx;
             return 0;
         }
         catch (const std::exception &e)
         {
+            if (gpu_ctx)
+            {
+                free_ntt_device_constants(gpu_ctx->ntt_device_constants);
+                delete gpu_ctx;
+            }
             return set_error(e);
         }
         catch (...)
         {
+            if (gpu_ctx)
+            {
+                free_ntt_device_constants(gpu_ctx->ntt_device_constants);
+                delete gpu_ctx;
+            }
             return set_error("unknown exception in gpu_context_create");
         }
     }
@@ -410,6 +673,7 @@ extern "C"
         {
             return;
         }
+        free_ntt_device_constants(ctx->ntt_device_constants);
         delete ctx;
     }
 

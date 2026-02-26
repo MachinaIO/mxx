@@ -1664,7 +1664,7 @@ mod tests {
     use crate::{
         __PAIR, __TestState,
         element::{PolyElem, finite_ring::FinRingElem},
-        poly::dcrt::gpu::gpu_device_sync,
+        poly::dcrt::gpu::{detected_gpu_device_ids, gpu_device_sync},
     };
     use num_bigint::BigUint;
     use rand::{Rng, rng};
@@ -1678,6 +1678,87 @@ mod tests {
         let _ = tracing_subscriber::fmt::try_init();
         let (moduli, _crt_bits, _crt_depth) = params.to_crt();
         GpuDCRTPolyParams::new(params.ring_dimension(), moduli, params.base_bits())
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_compact_cross_device_roundtrip_invariant() {
+        gpu_device_sync();
+        let device_ids = detected_gpu_device_ids();
+        if device_ids.len() < 2 {
+            return;
+        }
+
+        let params = gpu_test_params();
+        let (moduli, _, _) = params.to_crt();
+        let src_device = device_ids[0];
+        let dst_device = device_ids[1];
+        let src_params = GpuDCRTPolyParams::new_with_gpu(
+            params.ring_dimension(),
+            moduli.clone(),
+            params.base_bits(),
+            vec![src_device],
+            Some(1),
+            1,
+        );
+        let dst_params = GpuDCRTPolyParams::new_with_gpu(
+            params.ring_dimension(),
+            moduli,
+            params.base_bits(),
+            vec![dst_device],
+            Some(1),
+            1,
+        );
+
+        let near_modulus = src_params.modulus().as_ref() - BigUint::from(7u32);
+        let source_eval = GpuDCRTPolyMatrix::from_poly_vec(
+            &src_params,
+            vec![
+                vec![
+                    GpuDCRTPoly::from_usize_to_constant(&src_params, 0),
+                    GpuDCRTPoly::from_usize_to_constant(&src_params, 1),
+                    GpuDCRTPoly::from_usize_to_constant(&src_params, 37),
+                ],
+                vec![
+                    GpuDCRTPoly::from_usize_to_constant(&src_params, 5),
+                    GpuDCRTPoly::from_biguint_to_constant(&src_params, near_modulus.clone()),
+                    GpuDCRTPoly::from_usize_to_constant(&src_params, 9),
+                ],
+            ],
+        );
+        let source_coeff = source_eval.clone().into_coeff_domain();
+
+        for source in [source_eval, source_coeff] {
+            let source_cpu = source.to_cpu_matrix();
+            let bytes_from_src = source.to_compact_bytes();
+
+            let decoded_on_dst = GpuDCRTPolyMatrix::from_compact_bytes(&dst_params, &bytes_from_src);
+            assert_eq!(
+                decoded_on_dst.to_cpu_matrix(),
+                source_cpu,
+                "cross-device decode mismatch (src_device={}, dst_device={})",
+                src_device,
+                dst_device
+            );
+
+            let bytes_from_dst = decoded_on_dst.to_compact_bytes();
+            let decoded_back_on_src =
+                GpuDCRTPolyMatrix::from_compact_bytes(&src_params, &bytes_from_dst);
+            assert_eq!(
+                decoded_back_on_src,
+                source,
+                "cross-device roundtrip mismatch (src_device={}, dst_device={})",
+                src_device,
+                dst_device
+            );
+            assert_eq!(
+                decoded_back_on_src.to_compact_bytes(),
+                bytes_from_src,
+                "compact bytes are not stable across cross-device roundtrip (src_device={}, dst_device={})",
+                src_device,
+                dst_device
+            );
+        }
     }
 
     #[test]

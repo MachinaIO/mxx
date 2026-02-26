@@ -1,6 +1,4 @@
 #[cfg(feature = "gpu")]
-use crate::poly::dcrt::gpu::detected_gpu_device_ids;
-#[cfg(feature = "gpu")]
 use crate::sampler::trapdoor::GpuPreimageRequest;
 use crate::{
     bgg::{encoding::BggEncoding, public_key::BggPublicKey},
@@ -265,7 +263,7 @@ where
         b1_trapdoor: &TS::Trapdoor,
         b1_matrix: &M,
     ) -> Vec<GpuLutBaseDeviceShared<M, TS::Trapdoor>> {
-        let device_ids = detected_gpu_device_ids();
+        let device_ids = params.device_ids();
         assert!(
             !device_ids.is_empty(),
             "at least one GPU device is required for gpu sample_lut_preimages"
@@ -443,7 +441,7 @@ where
         lut_id: usize,
         lut_aux_id_prefix: &str,
         shared: &[GpuLutDeviceShared<'_, M, TS::Trapdoor>],
-        batch: &[(usize, Vec<M::P>)],
+        batch: &[(usize, i32, M::P)],
     ) -> Vec<CompactBytesJob<M>> {
         let sample_lut_preimages_start = Instant::now();
         debug!("Sampling LUT preimages started: lut_id={}, batch_size={}", lut_id, batch.len());
@@ -484,29 +482,25 @@ where
                     batch.len(),
                     shared.len()
                 );
+                let shared_by_device = shared
+                    .iter()
+                    .map(|entry| (entry.device_id, entry))
+                    .collect::<HashMap<i32, &GpuLutDeviceShared<'_, M, TS::Trapdoor>>>();
+                debug_assert_eq!(
+                    shared_by_device.len(),
+                    shared.len(),
+                    "gpu shared resources must have unique device ids"
+                );
 
                 let requests = batch
                     .par_iter()
-                    .enumerate()
-                    .map(|(entry_pos, (idx, y_by_device))| {
-                        let shared_dev = &shared[entry_pos];
-                        debug_assert_eq!(
-                            y_by_device.len(),
-                            shared.len(),
-                            "entries_multi_gpus must provide y for every device"
-                        );
-                        let local_y_poly = y_by_device
-                            .get(entry_pos)
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "missing y_poly for device position {} (available={})",
-                                    entry_pos,
-                                    y_by_device.len()
-                                )
-                            })
-                            .clone();
+                    .map(|(idx, device_id, local_y_poly)| {
+                        let shared_dev = shared_by_device
+                            .get(device_id)
+                            .copied()
+                            .unwrap_or_else(|| panic!("missing gpu shared entry for device {}", device_id));
 
-                        let gy = shared_dev.gadget_matrix.clone() * &local_y_poly;
+                        let gy = shared_dev.gadget_matrix.clone() * local_y_poly;
                         let gy_decomposed = gy.decompose();
                         let mut w_t_idx = shared_dev.w_block_gy.clone() * gy_decomposed;
 
@@ -552,7 +546,7 @@ where
                 let mut preimage_by_idx = preimages.into_iter().collect::<HashMap<usize, M>>();
                 batch
                     .iter()
-                    .map(|(idx, _)| {
+                    .map(|(idx, _, _)| {
                         let lut_aux_id = format!("{lut_aux_id_prefix}_idx{idx}");
                         let preimage = preimage_by_idx
                             .remove(idx)
@@ -2179,11 +2173,13 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
 
             #[cfg(feature = "gpu")]
             {
-                let gpu_lut_params_by_device = gpu_lut_shared
-                    .iter()
-                    .map(|device_shared| device_shared.params)
-                    .collect::<Vec<_>>();
-                let sample_lut_batch = |current_batch: &[(usize, Vec<M::P>)]| {
+                assert!(
+                    chunk_size <= gpu_lut_shared.len(),
+                    "LUT_PREIMAGE_CHUNK_SIZE must be <= available GPU devices: chunk_size={}, devices={}",
+                    chunk_size,
+                    gpu_lut_shared.len()
+                );
+                let sample_lut_batch = |current_batch: &[(usize, i32, M::P)]| {
                     self.sample_lut_preimages(
                         params,
                         lut_id,
@@ -2193,29 +2189,16 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                     )
                 };
 
-                let mut batch: Vec<(usize, Vec<M::P>)> = Vec::with_capacity(chunk_size);
+                let mut batch: Vec<(usize, i32, M::P)> = Vec::with_capacity(chunk_size);
                 let mut pending_store_jobs: Option<Vec<CompactBytesJob<M>>> = None;
                 for input_idx in pending_input_indices.iter().copied() {
-                    let mut y_by_device = Vec::with_capacity(gpu_lut_params_by_device.len());
-                    let mut row_idx: Option<usize> = None;
-                    for &device_params in &gpu_lut_params_by_device {
-                        let x = M::P::from_usize_to_constant(device_params, input_idx);
-                        let (idx, y_poly) = plt.get(device_params, &x).unwrap_or_else(|| {
-                            panic!("LUT entry {} missing from 0..len range", input_idx)
-                        });
-                        if let Some(expected_idx) = row_idx {
-                            debug_assert_eq!(
-                                expected_idx, idx,
-                                "pending LUT entry row index must be consistent across devices for input {}",
-                                input_idx
-                            );
-                        } else {
-                            row_idx = Some(idx);
-                        }
-                        y_by_device.push(y_poly);
-                    }
-                    let idx = row_idx.expect("pending LUT row index must exist");
-                    batch.push((idx, y_by_device));
+                    let device_slot = batch.len();
+                    let device_shared = &gpu_lut_shared[device_slot];
+                    let x = M::P::from_usize_to_constant(device_shared.params, input_idx);
+                    let (idx, y_poly) = plt.get(device_shared.params, &x).unwrap_or_else(|| {
+                        panic!("LUT entry {} missing from 0..len range", input_idx)
+                    });
+                    batch.push((idx, device_shared.device_id, y_poly));
 
                     if batch.len() >= chunk_size {
                         let current_batch = std::mem::take(&mut batch);

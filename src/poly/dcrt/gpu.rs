@@ -466,8 +466,7 @@ impl PolyParams for GpuDCRTPolyParams {
     }
 
     fn device_ids(&self) -> Vec<i32> {
-        let detected = detected_gpu_device_ids();
-        if detected.is_empty() { self.gpu_ids.clone() } else { detected }
+        self.gpu_ids.clone()
     }
 
     fn params_for_device(&self, device_id: i32) -> Self {

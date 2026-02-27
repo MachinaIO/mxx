@@ -71,18 +71,14 @@ namespace
                             dependency_ok = false;
                             break;
                         }
-                        err = cudaEventRecord(state.write_done, state.stream);
-                        if (err != cudaSuccess)
+                        if (state.write_done_valid)
                         {
-                            dependency_ok = false;
-                            break;
-                        }
-                        state.write_done_valid = true;
-                        err = cudaStreamWaitEvent(free_stream, state.write_done, 0);
-                        if (err != cudaSuccess)
-                        {
-                            dependency_ok = false;
-                            break;
+                            err = cudaStreamWaitEvent(free_stream, state.write_done, 0);
+                            if (err != cudaSuccess)
+                            {
+                                dependency_ok = false;
+                                break;
+                            }
                         }
                     }
                 }

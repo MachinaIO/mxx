@@ -2613,10 +2613,9 @@ where
 
         #[cfg(feature = "gpu")]
         {
-            let mut device_ids = params.device_ids();
-            if device_ids.is_empty() {
-                device_ids.push(0);
-            }
+            // Keep preload device set aligned with eval dispatch: eval path uses detected GPUs,
+            // while params may still carry a narrower set (e.g. single-GPU default).
+            let device_ids = detected_gpu_device_ids();
             for device_id in device_ids {
                 let local_params = params.params_for_device(device_id);
                 let local_c_b0 =

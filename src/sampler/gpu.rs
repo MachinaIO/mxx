@@ -78,7 +78,7 @@ where
         dist: DistType,
     ) -> Self::M {
         let seed = hash_seed_for_matrix::<H>(key, tag.as_ref());
-        sample_gpu_matrix_with_seed_decomposed(params, nrow, ncol, dist, seed)
+        sample_gpu_matrix_with_seed(params, nrow, ncol, dist, seed).decompose()
     }
 
     fn sample_hash_small_decomposed<B: AsRef<[u8]>>(
@@ -91,7 +91,7 @@ where
         dist: DistType,
     ) -> Self::M {
         let seed = hash_seed_for_matrix::<H>(key, tag.as_ref());
-        sample_gpu_matrix_with_seed_small_decomposed(params, nrow, ncol, dist, seed)
+        sample_gpu_matrix_with_seed(params, nrow, ncol, dist, seed).small_decompose()
     }
 }
 
@@ -160,112 +160,6 @@ fn sample_gpu_matrix_with_seed(
             seed,
         ),
         DistType::TernaryDist => GpuDCRTPolyMatrix::sample_distribution(
-            params,
-            nrow,
-            ncol,
-            GpuMatrixSampleDist::Ternary,
-            0.0,
-            seed,
-        ),
-    }
-}
-
-fn sample_gpu_matrix_with_seed_decomposed(
-    params: &GpuDCRTPolyParams,
-    nrow: usize,
-    ncol: usize,
-    dist: DistType,
-    seed: u64,
-) -> GpuDCRTPolyMatrix {
-    if nrow == 0 || ncol == 0 {
-        return GpuDCRTPolyMatrix::sample_distribution_decomposed(
-            params,
-            nrow,
-            ncol,
-            GpuMatrixSampleDist::Uniform,
-            0.0,
-            seed,
-        );
-    }
-    match dist {
-        DistType::FinRingDist => GpuDCRTPolyMatrix::sample_distribution_decomposed(
-            params,
-            nrow,
-            ncol,
-            GpuMatrixSampleDist::Uniform,
-            0.0,
-            seed,
-        ),
-        DistType::GaussDist { sigma } => GpuDCRTPolyMatrix::sample_distribution_decomposed(
-            params,
-            nrow,
-            ncol,
-            GpuMatrixSampleDist::Gauss,
-            sigma,
-            seed,
-        ),
-        DistType::BitDist => GpuDCRTPolyMatrix::sample_distribution_decomposed(
-            params,
-            nrow,
-            ncol,
-            GpuMatrixSampleDist::Bit,
-            0.0,
-            seed,
-        ),
-        DistType::TernaryDist => GpuDCRTPolyMatrix::sample_distribution_decomposed(
-            params,
-            nrow,
-            ncol,
-            GpuMatrixSampleDist::Ternary,
-            0.0,
-            seed,
-        ),
-    }
-}
-
-fn sample_gpu_matrix_with_seed_small_decomposed(
-    params: &GpuDCRTPolyParams,
-    nrow: usize,
-    ncol: usize,
-    dist: DistType,
-    seed: u64,
-) -> GpuDCRTPolyMatrix {
-    if nrow == 0 || ncol == 0 {
-        return GpuDCRTPolyMatrix::sample_distribution_small_decomposed(
-            params,
-            nrow,
-            ncol,
-            GpuMatrixSampleDist::Uniform,
-            0.0,
-            seed,
-        );
-    }
-    match dist {
-        DistType::FinRingDist => GpuDCRTPolyMatrix::sample_distribution_small_decomposed(
-            params,
-            nrow,
-            ncol,
-            GpuMatrixSampleDist::Uniform,
-            0.0,
-            seed,
-        ),
-        DistType::GaussDist { sigma } => GpuDCRTPolyMatrix::sample_distribution_small_decomposed(
-            params,
-            nrow,
-            ncol,
-            GpuMatrixSampleDist::Gauss,
-            sigma,
-            seed,
-        ),
-        DistType::BitDist => GpuDCRTPolyMatrix::sample_distribution_small_decomposed(
-            params,
-            nrow,
-            ncol,
-            GpuMatrixSampleDist::Bit,
-            0.0,
-            seed,
-        ),
-        DistType::TernaryDist => GpuDCRTPolyMatrix::sample_distribution_small_decomposed(
             params,
             nrow,
             ncol,

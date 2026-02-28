@@ -175,20 +175,6 @@ unsafe extern "C" {
         sigma: f64,
         seed: u64,
     ) -> c_int;
-    pub(crate) fn gpu_matrix_sample_distribution_decompose_base(
-        out: *mut GpuMatrixOpaque,
-        dist_type: c_int,
-        sigma: f64,
-        seed: u64,
-        base_bits: u32,
-    ) -> c_int;
-    pub(crate) fn gpu_matrix_sample_distribution_decompose_base_small(
-        out: *mut GpuMatrixOpaque,
-        dist_type: c_int,
-        sigma: f64,
-        seed: u64,
-        base_bits: u32,
-    ) -> c_int;
     pub(crate) fn gpu_matrix_ntt_all(mat: *mut GpuMatrixOpaque, batch: c_int) -> c_int;
     pub(crate) fn gpu_matrix_intt_all(mat: *mut GpuMatrixOpaque, batch: c_int) -> c_int;
     fn gpu_device_synchronize() -> c_int;

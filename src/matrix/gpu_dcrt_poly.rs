@@ -16,8 +16,7 @@ use crate::{
                 gpu_matrix_fill_small_gadget, gpu_matrix_gauss_samp_gq_arb_base,
                 gpu_matrix_intt_all, gpu_matrix_load_compact_bytes, gpu_matrix_load_rns_batch,
                 gpu_matrix_mul, gpu_matrix_mul_scalar, gpu_matrix_ntt_all,
-                gpu_matrix_sample_distribution, gpu_matrix_sample_distribution_decompose_base,
-                gpu_matrix_sample_distribution_decompose_base_small, gpu_matrix_sample_p1_full,
+                gpu_matrix_sample_distribution, gpu_matrix_sample_p1_full,
                 gpu_matrix_store_compact_bytes, gpu_matrix_store_rns_batch, gpu_matrix_sub,
             },
             params::DCRTPolyParams,
@@ -362,77 +361,6 @@ impl GpuDCRTPolyMatrix {
         }
         let status = unsafe { gpu_matrix_sample_distribution(out.raw, dist.as_ffi(), sigma, seed) };
         check_status(status, "gpu_matrix_sample_distribution");
-        out
-    }
-
-    pub(crate) fn sample_distribution_decomposed(
-        params: &GpuDCRTPolyParams,
-        nrow: usize,
-        ncol: usize,
-        dist: GpuMatrixSampleDist,
-        sigma: f64,
-        seed: u64,
-    ) -> Self {
-        Self::sample_distribution_decomposed_impl(params, nrow, ncol, dist, sigma, seed, false)
-    }
-
-    pub(crate) fn sample_distribution_small_decomposed(
-        params: &GpuDCRTPolyParams,
-        nrow: usize,
-        ncol: usize,
-        dist: GpuMatrixSampleDist,
-        sigma: f64,
-        seed: u64,
-    ) -> Self {
-        Self::sample_distribution_decomposed_impl(params, nrow, ncol, dist, sigma, seed, true)
-    }
-
-    fn sample_distribution_decomposed_impl(
-        params: &GpuDCRTPolyParams,
-        nrow: usize,
-        ncol: usize,
-        dist: GpuMatrixSampleDist,
-        sigma: f64,
-        seed: u64,
-        small: bool,
-    ) -> Self {
-        let digits = if small {
-            params.crt_bits().div_ceil(params.base_bits() as usize)
-        } else {
-            params.modulus_digits()
-        };
-        let out_nrow = nrow.saturating_mul(digits);
-        let out = Self::new_empty(params, out_nrow, ncol);
-        if nrow == 0 || ncol == 0 {
-            return out;
-        }
-        let status = unsafe {
-            if small {
-                gpu_matrix_sample_distribution_decompose_base_small(
-                    out.raw,
-                    dist.as_ffi(),
-                    sigma,
-                    seed,
-                    params.base_bits(),
-                )
-            } else {
-                gpu_matrix_sample_distribution_decompose_base(
-                    out.raw,
-                    dist.as_ffi(),
-                    sigma,
-                    seed,
-                    params.base_bits(),
-                )
-            }
-        };
-        check_status(
-            status,
-            if small {
-                "gpu_matrix_sample_distribution_decompose_base_small"
-            } else {
-                "gpu_matrix_sample_distribution_decompose_base"
-            },
-        );
         out
     }
 

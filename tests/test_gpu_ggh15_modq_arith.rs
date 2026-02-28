@@ -509,7 +509,14 @@ async fn test_gpu_ggh15_modq_arith() {
     let b0_matrix = pk_evaluator
         .load_b0_matrix_checkpoint(&params)
         .expect("b0 matrix checkpoint should exist after sample_aux_matrices");
-    let c_b0 = s_vec.clone() * &b0_matrix;
+    let c_b0_base = s_vec.clone() * &b0_matrix;
+    let c_b0_error = uniform_sampler.sample_uniform(
+        &params,
+        1,
+        c_b0_base.col_size(),
+        DistType::GaussDist { sigma: cfg.error_sigma },
+    );
+    let c_b0 = c_b0_base + c_b0_error;
     drop(b0_matrix);
     let checkpoint_prefix = pk_evaluator.checkpoint_prefix(&params);
     drop(pk_evaluator);

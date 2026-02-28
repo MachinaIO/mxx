@@ -34,7 +34,7 @@ use std::{fs, path::Path, sync::Arc, time::Instant};
 use tracing::info;
 
 const CRT_BITS: usize = 51;
-const RING_DIM: u32 = 1 << 14;
+const RING_DIM: u32 = 1 << 8;
 const ERROR_SIGMA: f64 = 4.0;
 const BASE_BITS: u32 = 17;
 const MAX_CRT_DEPTH: usize = 12;
@@ -315,7 +315,14 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
     let b0_matrix = plt_pubkey_evaluator
         .load_b0_matrix_checkpoint(&params)
         .expect("b0 matrix checkpoint should exist after sample_aux_matrices");
-    let c_b0 = s_vec.clone() * &b0_matrix;
+    let c_b0_base = s_vec.clone() * &b0_matrix;
+    let c_b0_error = uniform_sampler.sample_uniform(
+        &params,
+        1,
+        c_b0_base.col_size(),
+        DistType::GaussDist { sigma: ERROR_SIGMA },
+    );
+    let c_b0 = c_b0_base + c_b0_error;
     let checkpoint_prefix = plt_pubkey_evaluator.checkpoint_prefix(&params);
     info!("plt encoding evaluator setup start");
     let plt_encoding_evaluator = GGH15BGGEncodingPltEvaluator::<

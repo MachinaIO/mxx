@@ -411,7 +411,10 @@ mod tests {
         matrix::PolyMatrix,
         poly::{
             PolyParams,
-            dcrt::{gpu::gpu_device_sync, params::DCRTPolyParams},
+            dcrt::{
+                gpu::{detected_gpu_device_ids, gpu_device_sync},
+                params::DCRTPolyParams,
+            },
         },
         simulator::error_norm::compute_preimage_norm,
     };
@@ -621,6 +624,105 @@ mod tests {
                             centered_bd < preimage_norm_bound,
                             "p_hat coeff exceeds compute_preimage_norm bound at sample={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={}",
                             sample_idx,
+                            i,
+                            j,
+                            coeff_idx,
+                            centered_abs,
+                            preimage_norm_bound
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_preimage_compact_cross_device_restore_relation_and_norm() {
+        gpu_device_sync();
+        let device_ids = detected_gpu_device_ids();
+        if device_ids.len() < 2 {
+            return;
+        }
+
+        let size = 2usize;
+        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
+        let base_params = gpu_params_from_cpu(&cpu_params);
+        let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&base_params, SIGMA);
+        let uniform_sampler = GpuDCRTPolyUniformSampler::new();
+
+        let ring_dim_sqrt = BigDecimal::from_u32(base_params.ring_dimension())
+            .expect("ring dimension should convert to BigDecimal")
+            .sqrt()
+            .expect("ring dimension sqrt should exist");
+        let base = BigDecimal::from_biguint(BigUint::from(1u32) << base_params.base_bits(), 0);
+        let m_g = (size * base_params.modulus_digits()) as u64;
+        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base);
+        let modulus = base_params.modulus();
+
+        struct DeviceCase {
+            src_device: i32,
+            dst_device: i32,
+            public_matrix_bytes: Vec<u8>,
+            target_bytes: Vec<u8>,
+            preimage_bytes: Vec<u8>,
+        }
+
+        let mut cases = Vec::with_capacity(device_ids.len());
+        for (idx, src_device) in device_ids.iter().copied().enumerate() {
+            let dst_device = device_ids[(idx + 1) % device_ids.len()];
+            assert_ne!(src_device, dst_device, "src and dst devices must differ");
+
+            let src_params = base_params.params_for_device(src_device);
+            let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&src_params, size);
+            let target =
+                uniform_sampler.sample_uniform(&src_params, size, size, DistType::FinRingDist);
+            let preimage =
+                trapdoor_sampler.preimage(&src_params, &trapdoor, &public_matrix, &target);
+            assert_eq!(
+                &public_matrix * &preimage,
+                target,
+                "source-device preimage relation failed on device {}",
+                src_device
+            );
+
+            cases.push(DeviceCase {
+                src_device,
+                dst_device,
+                public_matrix_bytes: public_matrix.to_compact_bytes(),
+                target_bytes: target.to_compact_bytes(),
+                preimage_bytes: preimage.to_compact_bytes(),
+            });
+        }
+
+        for case in cases {
+            let dst_params = base_params.params_for_device(case.dst_device);
+            let public_matrix =
+                GpuDCRTPolyMatrix::from_compact_bytes(&dst_params, &case.public_matrix_bytes);
+            let target = GpuDCRTPolyMatrix::from_compact_bytes(&dst_params, &case.target_bytes);
+            let preimage = GpuDCRTPolyMatrix::from_compact_bytes(&dst_params, &case.preimage_bytes);
+
+            assert_eq!(
+                &public_matrix * &preimage,
+                target,
+                "cross-device restored preimage relation failed (src_device={}, dst_device={})",
+                case.src_device,
+                case.dst_device
+            );
+
+            for i in 0..preimage.row_size() {
+                for j in 0..preimage.col_size() {
+                    let poly = preimage.entry(i, j);
+                    for (coeff_idx, coeff) in poly.coeffs().into_iter().enumerate() {
+                        let value = coeff.value().clone();
+                        let neg = modulus.as_ref() - &value;
+                        let centered_abs = if value < neg { value } else { neg };
+                        let centered_bd = BigDecimal::from(BigInt::from(centered_abs.clone()));
+                        assert!(
+                            centered_bd < preimage_norm_bound,
+                            "restored preimage coeff exceeds compute_preimage_norm bound (src_device={}, dst_device={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={})",
+                            case.src_device,
+                            case.dst_device,
                             i,
                             j,
                             coeff_idx,

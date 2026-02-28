@@ -57,36 +57,30 @@ struct ModqArithConfig {
 
 fn env_or_parse_u32(key: &str, default: u32) -> u32 {
     match env::var(key) {
-        Ok(raw) => raw
-            .parse::<u32>()
-            .unwrap_or_else(|e| panic!("{key} must be a valid u32: {e}")),
+        Ok(raw) => raw.parse::<u32>().unwrap_or_else(|e| panic!("{key} must be a valid u32: {e}")),
         Err(_) => default,
     }
 }
 
 fn env_or_parse_u64(key: &str, default: u64) -> u64 {
     match env::var(key) {
-        Ok(raw) => raw
-            .parse::<u64>()
-            .unwrap_or_else(|e| panic!("{key} must be a valid u64: {e}")),
+        Ok(raw) => raw.parse::<u64>().unwrap_or_else(|e| panic!("{key} must be a valid u64: {e}")),
         Err(_) => default,
     }
 }
 
 fn env_or_parse_usize(key: &str, default: usize) -> usize {
     match env::var(key) {
-        Ok(raw) => raw
-            .parse::<usize>()
-            .unwrap_or_else(|e| panic!("{key} must be a valid usize: {e}")),
+        Ok(raw) => {
+            raw.parse::<usize>().unwrap_or_else(|e| panic!("{key} must be a valid usize: {e}"))
+        }
         Err(_) => default,
     }
 }
 
 fn env_or_parse_f64(key: &str, default: f64) -> f64 {
     match env::var(key) {
-        Ok(raw) => raw
-            .parse::<f64>()
-            .unwrap_or_else(|e| panic!("{key} must be a valid f64: {e}")),
+        Ok(raw) => raw.parse::<f64>().unwrap_or_else(|e| panic!("{key} must be a valid f64: {e}")),
         Err(_) => default,
     }
 }
@@ -132,10 +126,7 @@ impl ModqArithConfig {
 
     fn dir_name(&self, active_q_level: usize) -> String {
         self.dir_name_override.clone().unwrap_or_else(|| {
-            format!(
-                "test_data/test_gpu_ggh15_modq_arith_qlevel_{}",
-                active_q_level
-            )
+            format!("test_data/test_gpu_ggh15_modq_arith_qlevel_{}", active_q_level)
         })
     }
 }
@@ -403,7 +394,8 @@ async fn test_gpu_ggh15_modq_arith() {
         encode_nested_rns_poly(cfg.p_moduli_bits, &params, &b_value, q_level);
     let plaintext_inputs = [a_inputs.clone(), b_inputs.clone()].concat();
 
-    let dry_circuit = build_modq_arith_value_circuit_gpu(&params, q_level, cfg.p_moduli_bits, cfg.scale);
+    let dry_circuit =
+        build_modq_arith_value_circuit_gpu(&params, q_level, cfg.p_moduli_bits, cfg.scale);
     let dry_plt_evaluator = PolyPltEvaluator::new();
     let dry_eval_start = Instant::now();
     let dry_one = GpuDCRTPoly::const_one(&params);
@@ -486,15 +478,8 @@ async fn test_gpu_ggh15_modq_arith() {
             GpuDCRTPolyMatrix,
             GpuDCRTPolyUniformSampler,
             GpuDCRTPolyHashSampler<Keccak256>,
-        GpuDCRTPolyTrapdoorSampler,
-        >::new(
-            seed,
-            d_secret,
-            trapdoor_sigma,
-            cfg.error_sigma,
-            dir.to_path_buf(),
-            false,
-        );
+            GpuDCRTPolyTrapdoorSampler,
+        >::new(seed, d_secret, trapdoor_sigma, cfg.error_sigma, dir.to_path_buf(), false);
     info!(
         "pk evaluator setup elapsed_ms={:.3}",
         pk_evaluator_setup_start.elapsed().as_secs_f64() * 1000.0

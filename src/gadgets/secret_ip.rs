@@ -44,7 +44,6 @@ mod tests {
         },
     };
     use keccak_asm::Keccak256;
-    use std::sync::Arc;
 
     #[test]
     fn test_secret_ip_with_rlwe_vectors() {
@@ -70,10 +69,8 @@ mod tests {
         circuit.output(vec![out]);
 
         let poly_inputs = vec![a.clone(), b.clone(), neg_t.clone(), DCRTPoly::const_one(&params)];
-        let one_poly = Arc::new(DCRTPoly::const_one(&params));
-        let poly_input_arcs = poly_inputs.iter().cloned().map(Arc::new).collect::<Vec<_>>();
-        let poly_out =
-            circuit.eval(&params, &one_poly, &poly_input_arcs, None::<&PolyPltEvaluator>);
+        let one_poly = DCRTPoly::const_one(&params);
+        let poly_out = circuit.eval(&params, one_poly, poly_inputs, None::<&PolyPltEvaluator>);
         assert_eq!(poly_out.len(), 1);
         let expected_poly = b.clone() + (a.clone() * &neg_t);
         assert_eq!(poly_out[0], expected_poly);
@@ -83,12 +80,12 @@ mod tests {
         let reveal_plaintexts = vec![true, true, false, false];
         let pk_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(seed, d);
         let pubkeys = pk_sampler.sample(&params, b"SECRET_IP_TEST", &reveal_plaintexts);
-        let one_pubkey = Arc::new(pubkeys[0].clone());
-        let input_pubkeys = pubkeys[1..].iter().cloned().map(Arc::new).collect::<Vec<_>>();
+        let one_pubkey = pubkeys[0].clone();
+        let input_pubkeys = pubkeys[1..].to_vec();
         let pk_out = circuit.eval(
             &params,
-            &one_pubkey,
-            &input_pubkeys,
+            one_pubkey,
+            input_pubkeys,
             None::<
                 &LWEBGGPubKeyPltEvaluator<
                     DCRTPolyMatrix,
@@ -107,12 +104,12 @@ mod tests {
             BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
         let plaintexts = vec![a.clone(), b.clone(), neg_t.clone(), DCRTPoly::const_one(&params)];
         let encodings = encoding_sampler.sample(&params, &pubkeys, &plaintexts);
-        let one_encoding = Arc::new(encodings[0].clone());
-        let input_encodings = encodings[1..].iter().cloned().map(Arc::new).collect::<Vec<_>>();
+        let one_encoding = encodings[0].clone();
+        let input_encodings = encodings[1..].to_vec();
         let enc_out = circuit.eval(
             &params,
-            &one_encoding,
-            &input_encodings,
+            one_encoding,
+            input_encodings,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
         assert_eq!(enc_out.len(), 1);

@@ -42,6 +42,76 @@ size_t matrix_poly_count(const GpuMatrix *mat)
 
 namespace
 {
+    struct ThreadLocalConsumerEventState
+    {
+        int device = -1;
+        cudaEvent_t event = nullptr;
+
+        ~ThreadLocalConsumerEventState()
+        {
+            if (!event || device < 0)
+            {
+                return;
+            }
+            cudaError_t err = cudaSetDevice(device);
+            if (err == cudaSuccess)
+            {
+                cudaEventDestroy(event);
+            }
+            event = nullptr;
+            device = -1;
+        }
+    };
+
+    thread_local ThreadLocalConsumerEventState g_thread_local_consumer_event;
+
+    int matrix_get_thread_local_consumer_event(int device, cudaEvent_t *out_event)
+    {
+        if (device < 0 || !out_event)
+        {
+            return set_error("invalid matrix_get_thread_local_consumer_event arguments");
+        }
+
+        auto &tls = g_thread_local_consumer_event;
+        if (tls.event && tls.device == device)
+        {
+            *out_event = tls.event;
+            return 0;
+        }
+
+        if (tls.event)
+        {
+            cudaError_t err = cudaSetDevice(tls.device);
+            if (err != cudaSuccess)
+            {
+                return set_error(err);
+            }
+            err = cudaEventDestroy(tls.event);
+            if (err != cudaSuccess)
+            {
+                return set_error(err);
+            }
+            tls.event = nullptr;
+            tls.device = -1;
+        }
+
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        err = cudaEventCreateWithFlags(&tls.event, cudaEventDisableTiming);
+        if (err != cudaSuccess)
+        {
+            tls.event = nullptr;
+            tls.device = -1;
+            return set_error(err);
+        }
+        tls.device = device;
+        *out_event = tls.event;
+        return 0;
+    }
+
     const GpuMatrix::LimbExecState *matrix_limb_state_const(
         const GpuMatrix *mat,
         const dim3 &limb_id,
@@ -206,27 +276,48 @@ int matrix_track_limb_consumer(
     {
         return set_error(err);
     }
-    cudaEvent_t consumer_done = nullptr;
-    err = cudaEventCreateWithFlags(&consumer_done, cudaEventDisableTiming);
-    if (err != cudaSuccess)
+
+    // Fast path: consumer already runs on the producer stream.
+    if (state->stream == consumer_stream)
     {
-        return set_error(err);
+        if (state->write_done)
+        {
+            err = cudaEventRecord(state->write_done, consumer_stream);
+            if (err != cudaSuccess)
+            {
+                return set_error(err);
+            }
+            state->write_done_valid = true;
+        }
+        return 0;
+    }
+
+    cudaEvent_t consumer_done = nullptr;
+    int status = matrix_get_thread_local_consumer_event(consumer_device, &consumer_done);
+    if (status != 0)
+    {
+        return status;
     }
     err = cudaEventRecord(consumer_done, consumer_stream);
     if (err != cudaSuccess)
     {
-        cudaEventDestroy(consumer_done);
         return set_error(err);
     }
     err = cudaStreamWaitEvent(state->stream, consumer_done, 0);
-    cudaError_t destroy_err = cudaEventDestroy(consumer_done);
     if (err != cudaSuccess)
     {
         return set_error(err);
     }
-    if (destroy_err != cudaSuccess)
+
+    // Fold consumer completion into write_done so later waits/free use one event.
+    if (state->write_done)
     {
-        return set_error(destroy_err);
+        err = cudaEventRecord(state->write_done, state->stream);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        state->write_done_valid = true;
     }
     return 0;
 }

@@ -25,8 +25,13 @@ pub trait Evaluable:
     type P: Poly;
     type Compact: Debug + Clone + Send + Sync;
 
-    fn to_compact(&self) -> Self::Compact;
+    fn to_compact(self) -> Self::Compact;
     fn from_compact(params: &Self::Params, compact: &Self::Compact) -> Self;
+
+    #[cfg(feature = "gpu")]
+    fn params_for_eval_device(params: &Self::Params, _device_id: i32) -> Self::Params {
+        params.clone()
+    }
 
     fn rotate(&self, params: &Self::Params, shift: i32) -> Self;
     fn small_scalar_mul(&self, params: &Self::Params, scalar: &[u32]) -> Self;

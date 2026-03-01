@@ -30,17 +30,106 @@ use mxx::{
     utils::{bigdecimal_bits_ceil, gen_biguint_for_modulus},
 };
 use num_bigint::BigUint;
-use std::{fs, path::Path, sync::Arc, time::Instant};
+use std::{env, fs, path::Path, sync::Arc, time::Instant};
 use tracing::info;
 
-const RING_DIM: u32 = 1 << 14;
-const CRT_BITS: usize = 24;
-const P_MODULI_BITS: usize = 6;
-const SCALE: u64 = 1 << 7;
-const BASE_BITS: u32 = 12;
-const MAX_CRT_DEPTH: usize = 32;
-const ERROR_SIGMA: f64 = 4.0;
-const D_SECRET: usize = 1;
+const DEFAULT_RING_DIM: u32 = 1 << 14;
+const DEFAULT_CRT_BITS: usize = 24;
+const DEFAULT_P_MODULI_BITS: usize = 6;
+const DEFAULT_SCALE: u64 = 1 << 7;
+const DEFAULT_BASE_BITS: u32 = 12;
+const DEFAULT_MAX_CRT_DEPTH: usize = 32;
+const DEFAULT_ERROR_SIGMA: f64 = 4.0;
+const DEFAULT_D_SECRET: usize = 1;
+
+#[derive(Debug, Clone)]
+struct ModqArithConfig {
+    ring_dim: u32,
+    crt_bits: usize,
+    p_moduli_bits: usize,
+    scale: u64,
+    base_bits: u32,
+    max_crt_depth: usize,
+    error_sigma: f64,
+    d_secret: usize,
+    dir_name_override: Option<String>,
+}
+
+fn env_or_parse_u32(key: &str, default: u32) -> u32 {
+    match env::var(key) {
+        Ok(raw) => raw.parse::<u32>().unwrap_or_else(|e| panic!("{key} must be a valid u32: {e}")),
+        Err(_) => default,
+    }
+}
+
+fn env_or_parse_u64(key: &str, default: u64) -> u64 {
+    match env::var(key) {
+        Ok(raw) => raw.parse::<u64>().unwrap_or_else(|e| panic!("{key} must be a valid u64: {e}")),
+        Err(_) => default,
+    }
+}
+
+fn env_or_parse_usize(key: &str, default: usize) -> usize {
+    match env::var(key) {
+        Ok(raw) => {
+            raw.parse::<usize>().unwrap_or_else(|e| panic!("{key} must be a valid usize: {e}"))
+        }
+        Err(_) => default,
+    }
+}
+
+fn env_or_parse_f64(key: &str, default: f64) -> f64 {
+    match env::var(key) {
+        Ok(raw) => raw.parse::<f64>().unwrap_or_else(|e| panic!("{key} must be a valid f64: {e}")),
+        Err(_) => default,
+    }
+}
+
+impl ModqArithConfig {
+    fn from_env() -> Self {
+        let ring_dim = env_or_parse_u32("GGH15_MODQ_ARITH_RING_DIM", DEFAULT_RING_DIM);
+        let crt_bits = env_or_parse_usize("GGH15_MODQ_ARITH_CRT_BITS", DEFAULT_CRT_BITS);
+        let p_moduli_bits =
+            env_or_parse_usize("GGH15_MODQ_ARITH_P_MODULI_BITS", DEFAULT_P_MODULI_BITS);
+        let scale = env_or_parse_u64("GGH15_MODQ_ARITH_SCALE", DEFAULT_SCALE);
+        let base_bits = env_or_parse_u32("GGH15_MODQ_ARITH_BASE_BITS", DEFAULT_BASE_BITS);
+        let max_crt_depth =
+            env_or_parse_usize("GGH15_MODQ_ARITH_MAX_CRT_DEPTH", DEFAULT_MAX_CRT_DEPTH);
+        let error_sigma = env_or_parse_f64("GGH15_MODQ_ARITH_ERROR_SIGMA", DEFAULT_ERROR_SIGMA);
+        let d_secret = env_or_parse_usize("GGH15_MODQ_ARITH_D_SECRET", DEFAULT_D_SECRET);
+        let dir_name_override = env::var("GGH15_MODQ_ARITH_DIR_NAME")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        assert!(ring_dim > 0, "GGH15_MODQ_ARITH_RING_DIM must be > 0");
+        assert!(crt_bits > 0, "GGH15_MODQ_ARITH_CRT_BITS must be > 0");
+        assert!(p_moduli_bits > 0, "GGH15_MODQ_ARITH_P_MODULI_BITS must be > 0");
+        assert!(scale > 0, "GGH15_MODQ_ARITH_SCALE must be > 0");
+        assert!(base_bits > 0, "GGH15_MODQ_ARITH_BASE_BITS must be > 0");
+        assert!(max_crt_depth > 0, "GGH15_MODQ_ARITH_MAX_CRT_DEPTH must be > 0");
+        assert!(error_sigma > 0.0, "GGH15_MODQ_ARITH_ERROR_SIGMA must be > 0");
+        assert!(d_secret > 0, "GGH15_MODQ_ARITH_D_SECRET must be > 0");
+
+        Self {
+            ring_dim,
+            crt_bits,
+            p_moduli_bits,
+            scale,
+            base_bits,
+            max_crt_depth,
+            error_sigma,
+            d_secret,
+            dir_name_override,
+        }
+    }
+
+    fn dir_name(&self, active_q_level: usize) -> String {
+        self.dir_name_override.clone().unwrap_or_else(|| {
+            format!("test_data/test_gpu_ggh15_modq_arith_qlevel_{}", active_q_level)
+        })
+    }
+}
 
 fn round_div_biguint(value: &BigUint, divisor: &BigUint) -> BigUint {
     let half = divisor >> 1;
@@ -106,13 +195,15 @@ fn active_q_moduli_and_modulus<T: PolyParams>(
 fn build_modq_arith_circuit_cpu(
     params: &DCRTPolyParams,
     q_level: Option<usize>,
+    p_moduli_bits: usize,
+    scale: u64,
 ) -> (PolyCircuit<DCRTPoly>, Arc<NestedRnsPolyContext>) {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
     let ctx = Arc::new(NestedRnsPolyContext::setup(
         &mut circuit,
         params,
-        P_MODULI_BITS,
-        SCALE,
+        p_moduli_bits,
+        scale,
         false,
         q_level,
     ));
@@ -128,13 +219,15 @@ fn build_modq_arith_circuit_cpu(
 fn build_modq_arith_circuit_gpu(
     params: &GpuDCRTPolyParams,
     q_level: Option<usize>,
+    p_moduli_bits: usize,
+    scale: u64,
 ) -> (PolyCircuit<GpuDCRTPoly>, Arc<NestedRnsPolyContext>) {
     let mut circuit = PolyCircuit::<GpuDCRTPoly>::new();
     let ctx = Arc::new(NestedRnsPolyContext::setup(
         &mut circuit,
         params,
-        P_MODULI_BITS,
-        SCALE,
+        p_moduli_bits,
+        scale,
         false,
         q_level,
     ));
@@ -150,13 +243,15 @@ fn build_modq_arith_circuit_gpu(
 fn build_modq_arith_value_circuit_gpu(
     params: &GpuDCRTPolyParams,
     q_level: Option<usize>,
+    p_moduli_bits: usize,
+    scale: u64,
 ) -> PolyCircuit<GpuDCRTPoly> {
     let mut circuit = PolyCircuit::<GpuDCRTPoly>::new();
     let ctx = Arc::new(NestedRnsPolyContext::setup(
         &mut circuit,
         params,
-        P_MODULI_BITS,
-        SCALE,
+        p_moduli_bits,
+        scale,
         false,
         q_level,
     ));
@@ -169,27 +264,31 @@ fn build_modq_arith_value_circuit_gpu(
     circuit
 }
 
-fn find_crt_depth_for_modq_arith(q_level: Option<usize>) -> (usize, DCRTPolyParams) {
-    let ring_dim_sqrt = BigDecimal::from_u32(RING_DIM).unwrap().sqrt().unwrap();
-    let base = BigDecimal::from_biguint(BigUint::from(1u32) << BASE_BITS, 0);
-    let error_sigma = BigDecimal::from_f64(ERROR_SIGMA).expect("valid error sigma");
-    let input_bound = BigDecimal::from((1u64 << P_MODULI_BITS) - 1);
+fn find_crt_depth_for_modq_arith(
+    cfg: &ModqArithConfig,
+    q_level: Option<usize>,
+) -> (usize, DCRTPolyParams) {
+    let ring_dim_sqrt = BigDecimal::from_u32(cfg.ring_dim).unwrap().sqrt().unwrap();
+    let base = BigDecimal::from_biguint(BigUint::from(1u32) << cfg.base_bits, 0);
+    let error_sigma = BigDecimal::from_f64(cfg.error_sigma).expect("valid error sigma");
+    let input_bound = BigDecimal::from((1u64 << cfg.p_moduli_bits) - 1);
     let e_init_norm = &error_sigma * BigDecimal::from(6u64);
 
-    for crt_depth in 1..=MAX_CRT_DEPTH {
-        let params = DCRTPolyParams::new(RING_DIM, crt_depth, CRT_BITS, BASE_BITS);
+    for crt_depth in 1..=cfg.max_crt_depth {
+        let params = DCRTPolyParams::new(cfg.ring_dim, crt_depth, cfg.crt_bits, cfg.base_bits);
         let (active_q_moduli, _, _) = active_q_moduli_and_modulus(&params, q_level);
         let full_q = params.modulus();
         let q_max = *active_q_moduli.iter().max().expect("active_q_moduli must not be empty");
         let (_, _, crt_depth) = params.to_crt();
-        let (circuit, _ctx) = build_modq_arith_circuit_cpu(&params, q_level);
+        let (circuit, _ctx) =
+            build_modq_arith_circuit_cpu(&params, q_level, cfg.p_moduli_bits, cfg.scale);
 
         let log_base_q = params.modulus_digits();
         let log_base_q_small = log_base_q / crt_depth;
         let ctx = Arc::new(SimulatorContext::new(
             ring_dim_sqrt.clone(),
             base.clone(),
-            D_SECRET,
+            cfg.d_secret,
             log_base_q,
             log_base_q_small,
         ));
@@ -224,7 +323,8 @@ fn find_crt_depth_for_modq_arith(q_level: Option<usize>) -> (usize, DCRTPolyPara
     }
 
     panic!(
-        "crt_depth satisfying error < q/(2*q_i) for all CRT moduli not found up to MAX_CRT_DEPTH"
+        "crt_depth satisfying error < q/(2*q_i) for all CRT moduli not found up to MAX_CRT_DEPTH ({})",
+        cfg.max_crt_depth
     );
 }
 
@@ -232,9 +332,11 @@ fn find_crt_depth_for_modq_arith(q_level: Option<usize>) -> (usize, DCRTPolyPara
 async fn test_gpu_ggh15_modq_arith() {
     let _ = tracing_subscriber::fmt::try_init();
     gpu_device_sync();
+    let cfg = ModqArithConfig::from_env();
+    info!("modq arith test config: {:?}", cfg);
 
     let q_level = q_level_from_env();
-    let (crt_depth, cpu_params) = find_crt_depth_for_modq_arith(q_level);
+    let (crt_depth, cpu_params) = find_crt_depth_for_modq_arith(&cfg, q_level);
     let (moduli, _, _) = cpu_params.to_crt();
     let detected_gpu_params =
         GpuDCRTPolyParams::new(cpu_params.ring_dimension(), moduli.clone(), cpu_params.base_bits());
@@ -257,14 +359,15 @@ async fn test_gpu_ggh15_modq_arith() {
     let (all_q_moduli, _, _) = params.to_crt();
     let (active_q_moduli, active_q, active_q_level) = active_q_moduli_and_modulus(&params, q_level);
     let q_max = *active_q_moduli.iter().max().expect("active_q_moduli must not be empty");
-    let (circuit, _ctx) = build_modq_arith_circuit_gpu(&params, q_level);
+    let (circuit, _ctx) =
+        build_modq_arith_circuit_gpu(&params, q_level, cfg.p_moduli_bits, cfg.scale);
     info!("found crt_depth={}", crt_depth);
     info!(
         "selected crt_depth={} ring_dim={} crt_bits={} base_bits={} q_level={:?} q_modulo={:?}",
         crt_depth,
         params.ring_dimension(),
-        CRT_BITS,
-        BASE_BITS,
+        cfg.crt_bits,
+        cfg.base_bits,
         q_level,
         all_q_moduli
     );
@@ -286,18 +389,18 @@ async fn test_gpu_ggh15_modq_arith() {
     let expected = (&a_value * &b_value) % &active_q;
 
     let a_inputs: Vec<GpuDCRTPoly> =
-        encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, q_level);
+        encode_nested_rns_poly(cfg.p_moduli_bits, &params, &a_value, q_level);
     let b_inputs: Vec<GpuDCRTPoly> =
-        encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, q_level);
+        encode_nested_rns_poly(cfg.p_moduli_bits, &params, &b_value, q_level);
     let plaintext_inputs = [a_inputs.clone(), b_inputs.clone()].concat();
 
-    let dry_circuit = build_modq_arith_value_circuit_gpu(&params, q_level);
+    let dry_circuit =
+        build_modq_arith_value_circuit_gpu(&params, q_level, cfg.p_moduli_bits, cfg.scale);
     let dry_plt_evaluator = PolyPltEvaluator::new();
     let dry_eval_start = Instant::now();
-    let dry_one = Arc::new(GpuDCRTPoly::const_one(&params));
-    let dry_inputs: Vec<Arc<GpuDCRTPoly>> =
-        plaintext_inputs.iter().cloned().map(Arc::new).collect();
-    let dry_out = dry_circuit.eval(&params, &dry_one, &dry_inputs, Some(&dry_plt_evaluator));
+    let dry_one = GpuDCRTPoly::const_one(&params);
+    let dry_inputs = plaintext_inputs.clone();
+    let dry_out = dry_circuit.eval(&params, dry_one, dry_inputs, Some(&dry_plt_evaluator));
     info!("dry eval elapsed_ms={:.3}", dry_eval_start.elapsed().as_secs_f64() * 1000.0);
     assert_eq!(dry_out.len(), 1, "dry-run should output one value polynomial");
     let dry_const_term = dry_out[0]
@@ -315,12 +418,15 @@ async fn test_gpu_ggh15_modq_arith() {
         &all_q_moduli,
     );
     info!("dry-run succeeded with expected constant term");
+    drop(dry_out);
+    drop(dry_circuit);
+    drop(dry_plt_evaluator);
 
     let seed: [u8; 32] = [0u8; 32];
     let trapdoor_sigma = 4.578;
-    let d_secret = D_SECRET;
+    let d_secret = cfg.d_secret;
 
-    let dir_name = format!("test_data/test_gpu_ggh15_modq_arith_qlevel_{}", active_q_level);
+    let dir_name = cfg.dir_name(active_q_level);
     let dir = Path::new(&dir_name);
     if !dir.exists() {
         fs::create_dir_all(dir).expect("failed to create test directory");
@@ -337,12 +443,34 @@ async fn test_gpu_ggh15_modq_arith() {
         BGGPublicKeySampler::<_, GpuDCRTPolyHashSampler<Keccak256>>::new(seed, d_secret);
     let reveal_plaintexts = vec![true; circuit.num_input()];
     info!("sampling public keys");
-    let pubkeys: Vec<_> = pk_sampler
-        .sample(&params, b"BGG_PUBKEY", &reveal_plaintexts)
-        .into_iter()
-        .map(Arc::new)
-        .collect();
+    let mut pubkeys = pk_sampler.sample(&params, b"BGG_PUBKEY", &reveal_plaintexts);
     info!("sampled {} public keys", pubkeys.len());
+
+    let enc_setup_start = Instant::now();
+    let encoding_sampler =
+        BGGEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
+    drop(secrets);
+    let encodings = encoding_sampler.sample(&params, &pubkeys, &plaintext_inputs);
+    drop(plaintext_inputs);
+    drop(a_inputs);
+    drop(b_inputs);
+    info!("encoding sampling elapsed_ms={:.3}", enc_setup_start.elapsed().as_secs_f64() * 1000.0);
+    let encodings_compact_start = Instant::now();
+    let encodings_compact: Vec<_> = encodings
+        .into_iter()
+        .map(|encoding| {
+            (
+                encoding.vector.into_compact_bytes(),
+                encoding.pubkey.matrix.into_compact_bytes(),
+                encoding.pubkey.reveal_plaintext,
+                encoding.plaintext,
+            )
+        })
+        .collect();
+    info!(
+        "encoding compact serialization elapsed_ms={:.3}",
+        encodings_compact_start.elapsed().as_secs_f64() * 1000.0
+    );
 
     let pk_evaluator_setup_start = Instant::now();
     let pk_evaluator =
@@ -351,14 +479,16 @@ async fn test_gpu_ggh15_modq_arith() {
             GpuDCRTPolyUniformSampler,
             GpuDCRTPolyHashSampler<Keccak256>,
             GpuDCRTPolyTrapdoorSampler,
-        >::new(seed, d_secret, trapdoor_sigma, ERROR_SIGMA, dir.to_path_buf(), false);
+        >::new(seed, d_secret, trapdoor_sigma, cfg.error_sigma, dir.to_path_buf(), false);
     info!(
         "pk evaluator setup elapsed_ms={:.3}",
         pk_evaluator_setup_start.elapsed().as_secs_f64() * 1000.0
     );
 
+    let input_pubkeys = pubkeys.split_off(1);
+    let one_pubkey = pubkeys.pop().expect("pubkeys must contain one entry for const one");
     let pubkey_eval_start = Instant::now();
-    let pubkey_out = circuit.eval(&params, &pubkeys[0], &pubkeys[1..], Some(&pk_evaluator));
+    let pubkey_out = circuit.eval(&params, one_pubkey, input_pubkeys, Some(&pk_evaluator));
     info!("pubkey eval elapsed_ms={:.3}", pubkey_eval_start.elapsed().as_secs_f64() * 1000.0);
     assert_eq!(pubkey_out.len(), 1);
 
@@ -379,35 +509,53 @@ async fn test_gpu_ggh15_modq_arith() {
     let b0_matrix = pk_evaluator
         .load_b0_matrix_checkpoint(&params)
         .expect("b0 matrix checkpoint should exist after sample_aux_matrices");
-    let c_b0 = s_vec.clone() * &b0_matrix;
+    let c_b0_base = s_vec.clone() * &b0_matrix;
+    let c_b0_error = uniform_sampler.sample_uniform(
+        &params,
+        1,
+        c_b0_base.col_size(),
+        DistType::GaussDist { sigma: cfg.error_sigma },
+    );
+    let c_b0 = c_b0_base + c_b0_error;
+    drop(b0_matrix);
     let checkpoint_prefix = pk_evaluator.checkpoint_prefix(&params);
+    drop(pk_evaluator);
 
     let enc_evaluator = GGH15BGGEncodingPltEvaluator::<
         GpuDCRTPolyMatrix,
         GpuDCRTPolyHashSampler<Keccak256>,
-    >::new(seed, dir.to_path_buf(), checkpoint_prefix, c_b0);
+    >::new(seed, dir.to_path_buf(), checkpoint_prefix, &params, c_b0);
 
-    let enc_setup_start = Instant::now();
-    let encoding_sampler =
-        BGGEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
-    let encodings: Vec<_> = encoding_sampler
-        .sample(&params, &pubkeys, &plaintext_inputs)
+    let encodings_restore_start = Instant::now();
+    let mut encodings: Vec<_> = encodings_compact
         .into_iter()
-        .map(Arc::new)
+        .map(|(vector_bytes, pubkey_bytes, reveal_plaintext, plaintext)| {
+            mxx::bgg::encoding::BggEncoding::new(
+                GpuDCRTPolyMatrix::from_compact_bytes(&params, &vector_bytes),
+                mxx::bgg::public_key::BggPublicKey::new(
+                    GpuDCRTPolyMatrix::from_compact_bytes(&params, &pubkey_bytes),
+                    reveal_plaintext,
+                ),
+                plaintext,
+            )
+        })
         .collect();
-    info!("encoding sampling elapsed_ms={:.3}", enc_setup_start.elapsed().as_secs_f64() * 1000.0);
-    drop(pubkeys);
+    info!(
+        "encoding restore elapsed_ms={:.3}",
+        encodings_restore_start.elapsed().as_secs_f64() * 1000.0
+    );
 
+    let input_encodings = encodings.split_off(1);
+    let one_encoding = encodings.pop().expect("encodings must contain one entry for const one");
     let encoding_eval_start = Instant::now();
-    let encoding_out = circuit.eval(&params, &encodings[0], &encodings[1..], Some(&enc_evaluator));
+    let encoding_out = circuit.eval(&params, one_encoding, input_encodings, Some(&enc_evaluator));
     info!("encoding eval elapsed_ms={:.3}", encoding_eval_start.elapsed().as_secs_f64() * 1000.0);
     assert_eq!(encoding_out.len(), 1);
-    drop(encodings);
 
     assert_eq!(encoding_out[0].pubkey, pubkey_out[0]);
     let expected_poly = GpuDCRTPoly::from_biguint_to_constant(&params, expected.clone());
     let expected_times_gadget = s_vec.clone() *
-        (GpuDCRTPolyMatrix::gadget_matrix(&params, d_secret) * expected_poly.clone());
+        (GpuDCRTPolyMatrix::gadget_matrix(&params, cfg.d_secret) * expected_poly.clone());
     let s_times_pk = s_vec.clone() * &pubkey_out[0].matrix;
     let diff = encoding_out[0].vector.clone() - s_times_pk + expected_times_gadget;
     let coeff = diff

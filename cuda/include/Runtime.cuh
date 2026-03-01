@@ -8,14 +8,6 @@
 #ifdef __cplusplus
 #include <mutex>
 #include <vector>
-
-// FIDESlib headers (resolved via include path).
-#include "CKKS/Context.cuh"
-#include "CKKS/Parameters.cuh"
-#include "LimbUtils.cuh"
-#include "CKKS/RNSPoly.cuh"
-
-namespace CKKS = FIDESlib::CKKS;
 #endif
 
 #ifdef __cplusplus
@@ -57,18 +49,49 @@ void gpu_pinned_free(void *ptr);
 #endif
 
 #ifdef __cplusplus
+constexpr size_t GPU_RUNTIME_MAX_LIMBS = 64;
+constexpr size_t GPU_RUNTIME_MAX_DIGITS = 8;
+
+enum GpuLimbType : uint8_t
+{
+    GPU_LIMB_U32 = 0,
+    GPU_LIMB_U64 = 1,
+};
+
+struct GpuNttDeviceConstants
+{
+    int device;
+    size_t limb_count;
+    uint32_t stage_count;
+    uint64_t *limb_wlen_forward; // stage-major layout: [stage][limb]
+    uint64_t *limb_wlen_inverse; // stage-major layout: [stage][limb]
+};
+
+#if defined(__CUDACC__)
+extern __constant__ uint64_t gpu_ntt_const_moduli[GPU_RUNTIME_MAX_LIMBS];
+extern __constant__ uint64_t gpu_ntt_const_root[GPU_RUNTIME_MAX_LIMBS];
+extern __constant__ uint64_t gpu_ntt_const_inv_root[GPU_RUNTIME_MAX_LIMBS];
+extern __constant__ uint64_t gpu_ntt_const_n_inv[GPU_RUNTIME_MAX_LIMBS];
+extern __constant__ uint32_t gpu_ntt_const_limb_count;
+#endif
+
 struct GpuContext
 {
-    CKKS::Context *ctx;
     std::vector<uint64_t> moduli;
+    std::vector<uint64_t> ntt_n_inv_by_prime;
+    std::vector<uint64_t> ntt_root_by_prime;
+    std::vector<uint64_t> ntt_inv_root_by_prime;
+    std::vector<GpuNttDeviceConstants> ntt_device_constants;
     int N;
     int level;
     std::vector<int> gpu_ids;
     uint32_t batch;
+    uint32_t dnum;
+    size_t max_aux_limbs;
     std::vector<uint64_t> garner_inverse_table;
     std::vector<dim3> limb_gpu_ids;
     std::vector<int> limb_prime_ids;
-    std::vector<FIDESlib::TYPE> limb_types;
+    std::vector<GpuLimbType> limb_types;
     std::vector<size_t> decomp_counts_by_partition;
     std::mutex transform_mutex;
 };

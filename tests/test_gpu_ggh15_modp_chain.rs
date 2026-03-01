@@ -34,7 +34,7 @@ use std::{fs, path::Path, sync::Arc, time::Instant};
 use tracing::info;
 
 const CRT_BITS: usize = 51;
-const RING_DIM: u32 = 1 << 14;
+const RING_DIM: u32 = 1 << 8;
 const ERROR_SIGMA: f64 = 4.0;
 const BASE_BITS: u32 = 17;
 const MAX_CRT_DEPTH: usize = 12;
@@ -266,16 +266,14 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
     let s_vec = GpuDCRTPolyMatrix::from_poly_vec_row(&params, secrets.clone());
 
     let reveal_plaintexts = vec![true; circuit.num_input()];
-    let pubkeys = bgg_pubkey_sampler.sample(&params, tag_bytes, &reveal_plaintexts);
+    let mut pubkeys = bgg_pubkey_sampler.sample(&params, tag_bytes, &reveal_plaintexts);
     let bgg_encoding_sampler =
         BGGEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
-    let encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &plaintexts);
-    let enc_one = encodings[0].clone();
-    let input_pubkeys = pubkeys[1..].to_vec();
-    let input_encodings = encodings[1..].to_vec();
-    let input_pubkeys_shared: Vec<Arc<_>> = input_pubkeys.iter().cloned().map(Arc::new).collect();
-    let input_encodings_shared: Vec<Arc<_>> =
-        input_encodings.iter().cloned().map(Arc::new).collect();
+    let mut encodings = bgg_encoding_sampler.sample(&params, &pubkeys, &plaintexts);
+    let input_pubkeys = pubkeys.split_off(1);
+    let one_pubkey = pubkeys.pop().expect("pubkeys must contain one entry for const one");
+    let input_encodings = encodings.split_off(1);
+    let enc_one = encodings.pop().expect("encodings must contain one entry for const one");
 
     let trapdoor_sigma = 4.578;
     let dir = Path::new("test_data/gpu_ggh15_modp_chain_rounding");
@@ -296,9 +294,8 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
     info!("plt pubkey evaluator setup done");
 
     info!("circuit eval pubkey start");
-    let enc_one_pubkey = Arc::new(enc_one.pubkey.clone());
     let result_pubkey =
-        circuit.eval(&params, &enc_one_pubkey, &input_pubkeys_shared, Some(&plt_pubkey_evaluator));
+        circuit.eval(&params, one_pubkey, input_pubkeys, Some(&plt_pubkey_evaluator));
     info!("circuit eval pubkey done");
     assert_eq!(result_pubkey.len(), 1);
     let sample_aux_start = Instant::now();
@@ -318,23 +315,27 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
     let b0_matrix = plt_pubkey_evaluator
         .load_b0_matrix_checkpoint(&params)
         .expect("b0 matrix checkpoint should exist after sample_aux_matrices");
-    let c_b0 = s_vec.clone() * &b0_matrix;
+    let c_b0_base = s_vec.clone() * &b0_matrix;
+    let c_b0_error = uniform_sampler.sample_uniform(
+        &params,
+        1,
+        c_b0_base.col_size(),
+        DistType::GaussDist { sigma: ERROR_SIGMA },
+    );
+    let c_b0 = c_b0_base + c_b0_error;
     let checkpoint_prefix = plt_pubkey_evaluator.checkpoint_prefix(&params);
     info!("plt encoding evaluator setup start");
     let plt_encoding_evaluator = GGH15BGGEncodingPltEvaluator::<
         GpuDCRTPolyMatrix,
         GpuDCRTPolyHashSampler<Keccak256>,
-    >::new(key, dir.to_path_buf(), checkpoint_prefix, c_b0);
+    >::new(
+        key, dir.to_path_buf(), checkpoint_prefix, &params, c_b0
+    );
     info!("plt encoding evaluator setup done");
 
     info!("circuit eval encoding start");
-    let enc_one_shared = Arc::new(enc_one.clone());
-    let result_encoding = circuit.eval(
-        &params,
-        &enc_one_shared,
-        &input_encodings_shared,
-        Some(&plt_encoding_evaluator),
-    );
+    let result_encoding =
+        circuit.eval(&params, enc_one, input_encodings, Some(&plt_encoding_evaluator));
     info!("circuit eval encoding done");
     assert_eq!(result_encoding.len(), 1);
 

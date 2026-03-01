@@ -29,6 +29,10 @@ extern "C"
     int gpu_matrix_fill_small_gadget(
         GpuMatrix *out,
         uint32_t base_bits);
+    int gpu_matrix_fill_small_decomposed_identity_chunk(
+        GpuMatrix *out,
+        const GpuMatrix *scalar_by_digit,
+        size_t chunk_idx);
     int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bits, GpuMatrix *out);
     int gpu_matrix_decompose_base_small(const GpuMatrix *src, uint32_t base_bits, GpuMatrix *out);
 

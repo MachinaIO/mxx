@@ -1,5 +1,78 @@
 constexpr size_t kSampleP1LocalMaxM = 8;
 
+namespace
+{
+    struct ThreadLocalOwnerLinkEventState
+    {
+        int device = -1;
+        cudaEvent_t event = nullptr;
+
+        ~ThreadLocalOwnerLinkEventState()
+        {
+            if (!event || device < 0)
+            {
+                return;
+            }
+            cudaError_t err = cudaSetDevice(device);
+            if (err == cudaSuccess)
+            {
+                cudaEventDestroy(event);
+            }
+            event = nullptr;
+            device = -1;
+        }
+    };
+
+    thread_local ThreadLocalOwnerLinkEventState g_thread_local_owner_link_event;
+
+    int matrix_get_thread_local_owner_link_event(int device, cudaEvent_t *out_event)
+    {
+        if (device < 0 || !out_event)
+        {
+            return set_error("invalid matrix_get_thread_local_owner_link_event arguments");
+        }
+
+        auto &tls = g_thread_local_owner_link_event;
+        if (tls.event && tls.device == device)
+        {
+            *out_event = tls.event;
+            return 0;
+        }
+
+        if (tls.event)
+        {
+            cudaError_t err = cudaSetDevice(tls.device);
+            if (err != cudaSuccess)
+            {
+                return set_error(err);
+            }
+            err = cudaEventDestroy(tls.event);
+            if (err != cudaSuccess)
+            {
+                return set_error(err);
+            }
+            tls.event = nullptr;
+            tls.device = -1;
+        }
+
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        err = cudaEventCreateWithFlags(&tls.event, cudaEventDisableTiming);
+        if (err != cudaSuccess)
+        {
+            tls.event = nullptr;
+            tls.device = -1;
+            return set_error(err);
+        }
+        tls.device = device;
+        *out_event = tls.event;
+        return 0;
+    }
+}
+
 __global__ void matrix_sample_p1_integer_kernel_small(
     const uint64_t *a_base,
     const uint64_t *b_base,
@@ -1838,32 +1911,29 @@ extern "C" int gpu_matrix_sample_p1_full(
             {
                 return 0;
             }
-            cudaError_t link_err = cudaSetDevice(entry.device);
-            if (link_err != cudaSuccess)
+            if (!consumer_stream)
             {
-                return set_error(link_err);
+                return set_error("invalid consumer stream in gpu_matrix_sample_p1_full");
+            }
+            if (consumer_stream == entry.owner_stream)
+            {
+                return 0;
             }
             cudaEvent_t consumer_done = nullptr;
-            link_err = cudaEventCreateWithFlags(&consumer_done, cudaEventDisableTiming);
-            if (link_err != cudaSuccess)
+            int event_status = matrix_get_thread_local_owner_link_event(entry.device, &consumer_done);
+            if (event_status != 0)
             {
-                return set_error(link_err);
+                return event_status;
             }
-            link_err = cudaEventRecord(consumer_done, consumer_stream);
+            cudaError_t link_err = cudaEventRecord(consumer_done, consumer_stream);
             if (link_err != cudaSuccess)
             {
-                cudaEventDestroy(consumer_done);
                 return set_error(link_err);
             }
             link_err = cudaStreamWaitEvent(entry.owner_stream, consumer_done, 0);
-            cudaError_t destroy_err = cudaEventDestroy(consumer_done);
             if (link_err != cudaSuccess)
             {
                 return set_error(link_err);
-            }
-            if (destroy_err != cudaSuccess)
-            {
-                return set_error(destroy_err);
             }
             return 0;
         };

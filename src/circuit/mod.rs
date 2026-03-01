@@ -7,6 +7,8 @@ pub use gate::{PolyGate, PolyGateKind, PolyGateType};
 
 use dashmap::DashMap;
 use num_bigint::BigUint;
+#[cfg(feature = "gpu")]
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -17,12 +19,47 @@ use std::{
     },
 };
 
+#[cfg(feature = "gpu")]
+use crate::poly::dcrt::gpu::detected_gpu_device_ids;
 use crate::{
     circuit::gate::GateId,
     lookup::{PltEvaluator, PublicLut},
     poly::Poly,
 };
 use tracing::{debug, info};
+
+#[cfg(feature = "gpu")]
+#[derive(Debug)]
+enum LoadedGateInputs<E: Evaluable> {
+    SkipExisting,
+    Unary(E),
+    Binary(E, E),
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Debug)]
+struct LoadedGateCtx<E: Evaluable> {
+    gate_id: GateId,
+    gate: PolyGate,
+    shard_idx: usize,
+    inputs: LoadedGateInputs<E>,
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Debug)]
+enum ComputedGateValue<E: Evaluable> {
+    SkipExisting,
+    Value(E),
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Debug)]
+struct ComputedGateCtx<E: Evaluable> {
+    gate_id: GateId,
+    gate: PolyGate,
+    shard_idx: usize,
+    value: ComputedGateValue<E>,
+}
 
 #[derive(Debug)]
 struct LookupRegistry<P: Poly> {
@@ -498,8 +535,8 @@ impl<P: Poly> PolyCircuit<P> {
     pub fn eval<E, PE>(
         &self,
         params: &E::Params,
-        one: &Arc<E>,
-        inputs: &[Arc<E>],
+        one: E,
+        inputs: Vec<E>,
         plt_evaluator: Option<&PE>,
     ) -> Vec<E>
     where
@@ -507,11 +544,14 @@ impl<P: Poly> PolyCircuit<P> {
         PE: PltEvaluator<E>,
     {
         let (call_id_base, gate_id_base) = self.eval_gate_id_bases();
+        let one_compact = Arc::new(one.to_compact());
+        let one = Arc::new(E::from_compact(params, one_compact.as_ref()));
         let input_compacts =
-            inputs.iter().map(|input| Arc::new(input.to_compact())).collect::<Vec<_>>();
+            inputs.into_iter().map(|input| Arc::new(input.to_compact())).collect::<Vec<_>>();
         let outputs = self.eval_scoped(
             params,
-            one,
+            &one,
+            one_compact,
             &input_compacts,
             plt_evaluator,
             0,
@@ -547,6 +587,7 @@ impl<P: Poly> PolyCircuit<P> {
         &self,
         params: &E::Params,
         one: &Arc<E>,
+        one_compact: Arc<E::Compact>,
         inputs: &[Arc<E::Compact>],
         plt_evaluator: Option<&PE>,
         call_prefix: usize,
@@ -594,7 +635,7 @@ impl<P: Poly> PolyCircuit<P> {
             .collect();
         debug!("Initialized remaining-use counters for {} wires", remaining_use_count.len());
 
-        wires.insert(GateId(0), Arc::new(one.to_compact()));
+        wires.insert(GateId(0), one_compact.clone());
         debug!("Constant one gate is set");
         // Collect all input gate IDs excluding the reserved constant-one gate (0)
         let mut input_gate_ids: Vec<GateId> = self
@@ -623,6 +664,21 @@ impl<P: Poly> PolyCircuit<P> {
 
         let parallel_gates = crate::env::circuit_parallel_gates();
         let use_parallel = parallel_gates.map(|n| n != 1).unwrap_or(true);
+        #[cfg(feature = "gpu")]
+        let shard_params_and_one: Vec<(E::Params, Arc<E>)> = {
+            let mut device_ids = detected_gpu_device_ids();
+            if device_ids.is_empty() {
+                device_ids.push(0);
+            }
+            device_ids
+                .into_iter()
+                .map(|device_id| {
+                    let local_params = E::params_for_eval_device(params, device_id);
+                    let local_one = Arc::new(E::from_compact(&local_params, one_compact.as_ref()));
+                    (local_params, local_one)
+                })
+                .collect()
+        };
         let release_consumed_inputs = |gate: &PolyGate| {
             for input_id in &gate.input_gates {
                 if output_set.contains(input_id) {
@@ -638,7 +694,7 @@ impl<P: Poly> PolyCircuit<P> {
                 }
             }
         };
-        let eval_gate = |gate_id: GateId| {
+        let eval_gate = |gate_id: GateId, eval_params: &E::Params, eval_one: &Arc<E>| {
             debug!("{}", format!("Gate id {gate_id} started"));
             let gate = self.gates.get(&gate_id).expect("gate not found").clone();
             if wires.contains_key(&gate_id) {
@@ -657,8 +713,8 @@ impl<P: Poly> PolyCircuit<P> {
                         wires.get(&gate.input_gates[0]).expect("wire missing for Add").clone();
                     let right =
                         wires.get(&gate.input_gates[1]).expect("wire missing for Add").clone();
-                    let left = E::from_compact(params, left.as_ref());
-                    let right = E::from_compact(params, right.as_ref());
+                    let left = E::from_compact(eval_params, left.as_ref());
+                    let right = E::from_compact(eval_params, right.as_ref());
                     let result = left + &right;
                     debug!("Add gate end");
                     Arc::new(result.to_compact())
@@ -669,8 +725,8 @@ impl<P: Poly> PolyCircuit<P> {
                         wires.get(&gate.input_gates[0]).expect("wire missing for Sub").clone();
                     let right =
                         wires.get(&gate.input_gates[1]).expect("wire missing for Sub").clone();
-                    let left = E::from_compact(params, left.as_ref());
-                    let right = E::from_compact(params, right.as_ref());
+                    let left = E::from_compact(eval_params, left.as_ref());
+                    let right = E::from_compact(eval_params, right.as_ref());
                     let result = left - &right;
                     debug!("Sub gate end");
                     Arc::new(result.to_compact())
@@ -681,8 +737,8 @@ impl<P: Poly> PolyCircuit<P> {
                         wires.get(&gate.input_gates[0]).expect("wire missing for Mul").clone();
                     let right =
                         wires.get(&gate.input_gates[1]).expect("wire missing for Mul").clone();
-                    let left = E::from_compact(params, left.as_ref());
-                    let right = E::from_compact(params, right.as_ref());
+                    let left = E::from_compact(eval_params, left.as_ref());
+                    let right = E::from_compact(eval_params, right.as_ref());
                     let result = left * &right;
                     debug!("Mul gate end");
                     Arc::new(result.to_compact())
@@ -692,8 +748,8 @@ impl<P: Poly> PolyCircuit<P> {
                         .get(&gate.input_gates[0])
                         .expect("wire missing for LargeScalarMul")
                         .clone();
-                    let input = E::from_compact(params, input.as_ref());
-                    let result = input.small_scalar_mul(params, scalar);
+                    let input = E::from_compact(eval_params, input.as_ref());
+                    let result = input.small_scalar_mul(eval_params, scalar);
                     debug!("Large scalar mul gate end");
                     Arc::new(result.to_compact())
                 }
@@ -702,8 +758,8 @@ impl<P: Poly> PolyCircuit<P> {
                         .get(&gate.input_gates[0])
                         .expect("wire missing for LargeScalarMul")
                         .clone();
-                    let input = E::from_compact(params, input.as_ref());
-                    let result = input.large_scalar_mul(params, scalar);
+                    let input = E::from_compact(eval_params, input.as_ref());
+                    let result = input.large_scalar_mul(eval_params, scalar);
                     debug!("Large scalar mul gate end");
                     Arc::new(result.to_compact())
                 }
@@ -711,8 +767,8 @@ impl<P: Poly> PolyCircuit<P> {
                     debug!("Rotate gate start");
                     let input =
                         wires.get(&gate.input_gates[0]).expect("wire missing for Rotate").clone();
-                    let input = E::from_compact(params, input.as_ref());
-                    let result = input.rotate(params, *shift);
+                    let input = E::from_compact(eval_params, input.as_ref());
+                    let result = input.rotate(eval_params, *shift);
                     debug!("Rotate gate end");
                     Arc::new(result.to_compact())
                 }
@@ -722,7 +778,7 @@ impl<P: Poly> PolyCircuit<P> {
                         .get(&gate.input_gates[0])
                         .expect("wire missing for Public Lookup")
                         .clone();
-                    let input = E::from_compact(params, input.as_ref());
+                    let input = E::from_compact(eval_params, input.as_ref());
                     let scoped_gate_id = call_prefix
                         .checked_mul(gate_id_base)
                         .and_then(|base| base.checked_add(gate_id.0))
@@ -732,9 +788,9 @@ impl<P: Poly> PolyCircuit<P> {
                         self.lookup_registry.lookups.get(lut_id).expect("lookup table missing");
                     let result =
                         plt_evaluator.expect("public lookup evaluator missing").public_lookup(
-                            params,
+                            eval_params,
                             lookup_guard.as_ref(),
-                            one,
+                            eval_one,
                             &input,
                             scoped_gate_id,
                             *lut_id,
@@ -764,8 +820,9 @@ impl<P: Poly> PolyCircuit<P> {
                         .map(|id| wires.get(id).expect("wire missing for sub-circuit").clone())
                         .collect::<Vec<_>>();
                     let sub_outputs = sub_circuit.eval_scoped(
-                        params,
-                        one,
+                        eval_params,
+                        eval_one,
+                        one_compact.clone(),
                         &sub_inputs,
                         plt_evaluator,
                         child_prefix,
@@ -785,14 +842,151 @@ impl<P: Poly> PolyCircuit<P> {
                 }
             };
             if let Some(prefix) = self.print_value.get(&gate_id) {
-                let decoded_result = E::from_compact(params, result.as_ref());
+                let decoded_result = E::from_compact(eval_params, result.as_ref());
                 info!("{}", format!("[{prefix}] Gate ID {gate_id}, {:?}", decoded_result));
             }
             wires.insert(gate_id, result);
             release_consumed_inputs(&gate);
             debug!("{}", format!("Gate id {gate_id} finished"));
         };
-
+        #[cfg(feature = "gpu")]
+        let load_chunk = |chunk: &[GateId]| -> Vec<LoadedGateCtx<E>> {
+            chunk
+                .par_iter()
+                .enumerate()
+                .map(|(slot, gate_id)| {
+                    let shard_idx = slot % shard_params_and_one.len();
+                    let (eval_params, _) = &shard_params_and_one[shard_idx];
+                    let gate_id = *gate_id;
+                    let gate = self.gates.get(&gate_id).expect("gate not found").clone();
+                    if wires.contains_key(&gate_id) {
+                        return LoadedGateCtx {
+                            gate_id,
+                            gate,
+                            shard_idx,
+                            inputs: LoadedGateInputs::SkipExisting,
+                        };
+                    }
+                    let inputs = match &gate.gate_type {
+                        PolyGateType::Input => LoadedGateInputs::SkipExisting,
+                        PolyGateType::Add | PolyGateType::Sub | PolyGateType::Mul => {
+                            let left = wires
+                                .get(&gate.input_gates[0])
+                                .expect("wire missing for binary gate")
+                                .clone();
+                            let right = wires
+                                .get(&gate.input_gates[1])
+                                .expect("wire missing for binary gate")
+                                .clone();
+                            let left = E::from_compact(eval_params, left.as_ref());
+                            let right = E::from_compact(eval_params, right.as_ref());
+                            LoadedGateInputs::Binary(left, right)
+                        }
+                        PolyGateType::SmallScalarMul { .. } |
+                        PolyGateType::LargeScalarMul { .. } |
+                        PolyGateType::Rotate { .. } |
+                        PolyGateType::PubLut { .. } => {
+                            let input = wires
+                                .get(&gate.input_gates[0])
+                                .expect("wire missing for unary gate")
+                                .clone();
+                            let input = E::from_compact(eval_params, input.as_ref());
+                            LoadedGateInputs::Unary(input)
+                        }
+                        PolyGateType::SubCircuitOutput { .. } => {
+                            panic!("SubCircuitOutput gate should not be in regular chunk path");
+                        }
+                    };
+                    LoadedGateCtx { gate_id, gate, shard_idx, inputs }
+                })
+                .collect()
+        };
+        #[cfg(feature = "gpu")]
+        let compute_chunk = |loaded_chunk: Vec<LoadedGateCtx<E>>| -> Vec<ComputedGateCtx<E>> {
+            loaded_chunk
+                .into_par_iter()
+                .map(|loaded| {
+                    let LoadedGateCtx { gate_id, gate, shard_idx, inputs } = loaded;
+                    let (eval_params, eval_one) = &shard_params_and_one[shard_idx];
+                    let value = match (inputs, &gate.gate_type) {
+                        (LoadedGateInputs::SkipExisting, _) => ComputedGateValue::SkipExisting,
+                        (LoadedGateInputs::Binary(left, right), PolyGateType::Add) => {
+                            ComputedGateValue::Value(left + &right)
+                        }
+                        (LoadedGateInputs::Binary(left, right), PolyGateType::Sub) => {
+                            ComputedGateValue::Value(left - &right)
+                        }
+                        (LoadedGateInputs::Binary(left, right), PolyGateType::Mul) => {
+                            ComputedGateValue::Value(left * &right)
+                        }
+                        (
+                            LoadedGateInputs::Unary(input),
+                            PolyGateType::SmallScalarMul { scalar },
+                        ) => ComputedGateValue::Value(input.small_scalar_mul(eval_params, scalar)),
+                        (
+                            LoadedGateInputs::Unary(input),
+                            PolyGateType::LargeScalarMul { scalar },
+                        ) => ComputedGateValue::Value(input.large_scalar_mul(eval_params, scalar)),
+                        (LoadedGateInputs::Unary(input), PolyGateType::Rotate { shift }) => {
+                            ComputedGateValue::Value(input.rotate(eval_params, *shift))
+                        }
+                        (LoadedGateInputs::Unary(input), PolyGateType::PubLut { lut_id }) => {
+                            let scoped_gate_id = call_prefix
+                                .checked_mul(gate_id_base)
+                                .and_then(|base| base.checked_add(gate_id.0))
+                                .map(GateId)
+                                .expect("scoped gate id overflow");
+                            let lookup_guard = self
+                                .lookup_registry
+                                .lookups
+                                .get(lut_id)
+                                .expect("lookup table missing");
+                            let result = plt_evaluator
+                                .expect("public lookup evaluator missing")
+                                .public_lookup(
+                                    eval_params,
+                                    lookup_guard.as_ref(),
+                                    eval_one,
+                                    &input,
+                                    scoped_gate_id,
+                                    *lut_id,
+                                );
+                            ComputedGateValue::Value(result)
+                        }
+                        _ => {
+                            panic!("loaded gate inputs do not match gate type for gate {}", gate_id)
+                        }
+                    };
+                    ComputedGateCtx { gate_id, gate, shard_idx, value }
+                })
+                .collect()
+        };
+        #[cfg(feature = "gpu")]
+        let store_chunk = |computed_chunk: Vec<ComputedGateCtx<E>>| {
+            computed_chunk.into_par_iter().for_each(|computed| {
+                let ComputedGateCtx { gate_id, gate, shard_idx, value } = computed;
+                match value {
+                    ComputedGateValue::SkipExisting => {
+                        release_consumed_inputs(&gate);
+                        debug!("{}", format!("Gate id {gate_id} finished"));
+                    }
+                    ComputedGateValue::Value(result) => {
+                        let (eval_params, _) = &shard_params_and_one[shard_idx];
+                        let compact = Arc::new(result.to_compact());
+                        if let Some(prefix) = self.print_value.get(&gate_id) {
+                            let decoded_result = E::from_compact(eval_params, compact.as_ref());
+                            info!(
+                                "{}",
+                                format!("[{prefix}] Gate ID {gate_id}, {:?}", decoded_result)
+                            );
+                        }
+                        wires.insert(gate_id, compact);
+                        release_consumed_inputs(&gate);
+                        debug!("{}", format!("Gate id {gate_id} finished"));
+                    }
+                }
+            });
+        };
         for (level_idx, level) in levels.iter().enumerate() {
             let lookup_gate_count = level
                 .iter()
@@ -819,20 +1013,75 @@ impl<P: Poly> PolyCircuit<P> {
                 }
             }
             if !subcircuit_gates.is_empty() {
-                subcircuit_gates.iter().copied().for_each(|gate_id| eval_gate(gate_id));
+                #[cfg(feature = "gpu")]
+                {
+                    let (eval_params, eval_one) = shard_params_and_one
+                        .first()
+                        .expect("at least one eval shard context required");
+                    subcircuit_gates
+                        .iter()
+                        .copied()
+                        .for_each(|gate_id| eval_gate(gate_id, eval_params, eval_one));
+                }
+                #[cfg(not(feature = "gpu"))]
+                {
+                    subcircuit_gates
+                        .iter()
+                        .copied()
+                        .for_each(|gate_id| eval_gate(gate_id, params, one));
+                }
                 debug!("Evaluated sub-circuit gates in single thread");
             }
-            if use_parallel {
-                if let Some(chunk_size) = parallel_gates {
-                    regular_gates.chunks(chunk_size).for_each(|chunk| {
-                        chunk.par_iter().copied().for_each(|gate_id| eval_gate(gate_id));
-                    });
-                } else {
-                    regular_gates.par_iter().copied().for_each(|gate_id| eval_gate(gate_id));
+            if let Some(chunk_size) = parallel_gates {
+                #[cfg(feature = "gpu")]
+                {
+                    let regular_chunks: Vec<&[GateId]> = regular_gates.chunks(chunk_size).collect();
+                    if !regular_chunks.is_empty() {
+                        let mut loaded_curr = Some(load_chunk(regular_chunks[0]));
+                        let mut computed_prev: Option<Vec<ComputedGateCtx<E>>> = None;
+                        for chunk_idx in 0..regular_chunks.len() {
+                            let to_store = computed_prev.take();
+                            let to_compute =
+                                loaded_curr.take().expect("loaded chunk missing in pipeline");
+                            let next_chunk = regular_chunks.get(chunk_idx + 1).copied();
+                            let ((), (computed_curr, loaded_next)) = rayon::join(
+                                || {
+                                    if let Some(computed_chunk) = to_store {
+                                        store_chunk(computed_chunk);
+                                    }
+                                },
+                                || {
+                                    rayon::join(
+                                        || compute_chunk(to_compute),
+                                        || next_chunk.map(load_chunk),
+                                    )
+                                },
+                            );
+                            computed_prev = Some(computed_curr);
+                            loaded_curr = loaded_next;
+                        }
+                        if let Some(last_chunk) = computed_prev.take() {
+                            store_chunk(last_chunk);
+                        }
+                    }
                 }
+                #[cfg(not(feature = "gpu"))]
+                {
+                    regular_gates.chunks(chunk_size).for_each(|chunk| {
+                        chunk
+                            .par_iter()
+                            .copied()
+                            .for_each(|gate_id| eval_gate(gate_id, params, one));
+                    });
+                }
+            } else if use_parallel {
+                regular_gates
+                    .par_iter()
+                    .copied()
+                    .for_each(|gate_id| eval_gate(gate_id, params, one));
                 debug!("Evaluated gate in parallel");
             } else {
-                regular_gates.iter().copied().for_each(|gate_id| eval_gate(gate_id));
+                regular_gates.iter().copied().for_each(|gate_id| eval_gate(gate_id, params, one));
                 debug!("Evaluated gate in single thread");
             }
         }
@@ -938,7 +1187,6 @@ mod tests {
         utils::{create_bit_random_poly, create_random_poly},
     };
     use num_bigint::BigUint;
-    use std::sync::Arc;
 
     fn eval_with_const_one<PE>(
         circuit: &PolyCircuit<DCRTPoly>,
@@ -949,9 +1197,9 @@ mod tests {
     where
         PE: PltEvaluator<DCRTPoly>,
     {
-        let one = Arc::new(DCRTPoly::const_one(params));
-        let eval_inputs = inputs.iter().cloned().map(Arc::new).collect::<Vec<_>>();
-        circuit.eval(params, &one, &eval_inputs, plt_evaluator)
+        let one = DCRTPoly::const_one(params);
+        let eval_inputs = inputs.to_vec();
+        circuit.eval(params, one, eval_inputs, plt_evaluator)
     }
 
     #[test]

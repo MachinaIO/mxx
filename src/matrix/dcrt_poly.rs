@@ -348,7 +348,7 @@ impl PolyMatrix for DCRTPolyMatrix {
         }
     }
 
-    fn to_compact_bytes(&self) -> Vec<u8> {
+    fn into_compact_bytes(self) -> Vec<u8> {
         let entries = self.block_entries(0..self.nrow, 0..self.ncol);
         let entries_bytes: Vec<Vec<Vec<u8>>> = entries
             .par_iter()

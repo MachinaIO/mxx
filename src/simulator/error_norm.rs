@@ -231,7 +231,8 @@ impl NormPltGGH15Evaluator {
             ctx.base.clone() - BigDecimal::from(1u64),
             Some((ctx.m_g - 1) * ctx.log_base_q_small),
         );
-        // Corresponds to `(small_decomposed_identity_chunk_from_scalar * v_idx)` in `public_lookup`.
+        // Corresponds to `(small_decomposed_identity_chunk_from_scalar * v_idx)` in
+        // `public_lookup`.
         let small_times_v = small_decomposed_identity_chunks * &v_idx;
 
         // Corresponds to `preimage_gate2_identity` (B0 preimage for identity/out term).

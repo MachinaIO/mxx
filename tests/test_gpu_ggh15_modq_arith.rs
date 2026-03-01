@@ -41,6 +41,7 @@ const DEFAULT_BASE_BITS: u32 = 12;
 const DEFAULT_MAX_CRT_DEPTH: usize = 32;
 const DEFAULT_ERROR_SIGMA: f64 = 4.0;
 const DEFAULT_D_SECRET: usize = 1;
+const DEFAULT_HEIGHT: usize = 1;
 
 #[derive(Debug, Clone)]
 struct ModqArithConfig {
@@ -52,6 +53,7 @@ struct ModqArithConfig {
     max_crt_depth: usize,
     error_sigma: f64,
     d_secret: usize,
+    height: usize,
     dir_name_override: Option<String>,
 }
 
@@ -97,6 +99,7 @@ impl ModqArithConfig {
             env_or_parse_usize("GGH15_MODQ_ARITH_MAX_CRT_DEPTH", DEFAULT_MAX_CRT_DEPTH);
         let error_sigma = env_or_parse_f64("GGH15_MODQ_ARITH_ERROR_SIGMA", DEFAULT_ERROR_SIGMA);
         let d_secret = env_or_parse_usize("GGH15_MODQ_ARITH_D_SECRET", DEFAULT_D_SECRET);
+        let height = env_or_parse_usize("GGH15_MODQ_ARITH_HEIGHT", DEFAULT_HEIGHT);
         let dir_name_override = env::var("GGH15_MODQ_ARITH_DIR_NAME")
             .ok()
             .map(|v| v.trim().to_string())
@@ -120,6 +123,7 @@ impl ModqArithConfig {
             max_crt_depth,
             error_sigma,
             d_secret,
+            height,
             dir_name_override,
         }
     }
@@ -197,6 +201,7 @@ fn build_modq_arith_circuit_cpu(
     q_level: Option<usize>,
     p_moduli_bits: usize,
     scale: u64,
+    height: usize,
 ) -> (PolyCircuit<DCRTPoly>, Arc<NestedRnsPolyContext>) {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
     let ctx = Arc::new(NestedRnsPolyContext::setup(
@@ -208,11 +213,7 @@ fn build_modq_arith_circuit_cpu(
         q_level,
     ));
 
-    let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-    let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-    let prod = poly_a.mul_full_reduce(&poly_b, None, &mut circuit);
-    let out = prod.reconstruct(None, &mut circuit);
-    circuit.output(vec![out]);
+    NestedRnsPoly::benchmark_multiplication_tree(ctx.clone(), &mut circuit, height, q_level);
     (circuit, ctx)
 }
 
@@ -221,6 +222,7 @@ fn build_modq_arith_circuit_gpu(
     q_level: Option<usize>,
     p_moduli_bits: usize,
     scale: u64,
+    height: usize,
 ) -> (PolyCircuit<GpuDCRTPoly>, Arc<NestedRnsPolyContext>) {
     let mut circuit = PolyCircuit::<GpuDCRTPoly>::new();
     let ctx = Arc::new(NestedRnsPolyContext::setup(
@@ -232,11 +234,7 @@ fn build_modq_arith_circuit_gpu(
         q_level,
     ));
 
-    let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-    let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-    let prod = poly_a.mul_full_reduce(&poly_b, None, &mut circuit);
-    let out = prod.reconstruct(None, &mut circuit);
-    circuit.output(vec![out]);
+    NestedRnsPoly::benchmark_multiplication_tree(ctx.clone(), &mut circuit, height, q_level);
     (circuit, ctx)
 }
 
@@ -245,6 +243,7 @@ fn build_modq_arith_value_circuit_gpu(
     q_level: Option<usize>,
     p_moduli_bits: usize,
     scale: u64,
+    height: usize,
 ) -> PolyCircuit<GpuDCRTPoly> {
     let mut circuit = PolyCircuit::<GpuDCRTPoly>::new();
     let ctx = Arc::new(NestedRnsPolyContext::setup(
@@ -256,11 +255,7 @@ fn build_modq_arith_value_circuit_gpu(
         q_level,
     ));
 
-    let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-    let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-    let prod = poly_a.mul_full_reduce(&poly_b, None, &mut circuit);
-    let out = prod.reconstruct(None, &mut circuit);
-    circuit.output(vec![out]);
+    NestedRnsPoly::benchmark_multiplication_tree(ctx, &mut circuit, height, q_level);
     circuit
 }
 
@@ -280,8 +275,13 @@ fn find_crt_depth_for_modq_arith(
         let full_q = params.modulus();
         let q_max = *active_q_moduli.iter().max().expect("active_q_moduli must not be empty");
         let (_, _, crt_depth) = params.to_crt();
-        let (circuit, _ctx) =
-            build_modq_arith_circuit_cpu(&params, q_level, cfg.p_moduli_bits, cfg.scale);
+        let (circuit, _ctx) = build_modq_arith_circuit_cpu(
+            &params,
+            q_level,
+            cfg.p_moduli_bits,
+            cfg.scale,
+            cfg.height,
+        );
 
         let log_base_q = params.modulus_digits();
         let log_base_q_small = log_base_q / crt_depth;
@@ -336,6 +336,8 @@ async fn test_gpu_ggh15_modq_arith() {
     info!("modq arith test config: {:?}", cfg);
 
     let q_level = q_level_from_env();
+    let num_inputs =
+        1usize.checked_shl(cfg.height as u32).expect("GGH15_MODQ_ARITH_HEIGHT is too large");
     let (crt_depth, cpu_params) = find_crt_depth_for_modq_arith(&cfg, q_level);
     let (moduli, _, _) = cpu_params.to_crt();
     let detected_gpu_params =
@@ -360,7 +362,7 @@ async fn test_gpu_ggh15_modq_arith() {
     let (active_q_moduli, active_q, active_q_level) = active_q_moduli_and_modulus(&params, q_level);
     let q_max = *active_q_moduli.iter().max().expect("active_q_moduli must not be empty");
     let (circuit, _ctx) =
-        build_modq_arith_circuit_gpu(&params, q_level, cfg.p_moduli_bits, cfg.scale);
+        build_modq_arith_circuit_gpu(&params, q_level, cfg.p_moduli_bits, cfg.scale, cfg.height);
     info!("found crt_depth={}", crt_depth);
     info!(
         "selected crt_depth={} ring_dim={} crt_bits={} base_bits={} q_level={:?} q_modulo={:?}",
@@ -382,20 +384,25 @@ async fn test_gpu_ggh15_modq_arith() {
         active_q.bits(),
         active_q_moduli.len()
     );
+    info!("multiplication tree config: height={} num_inputs={}", cfg.height, num_inputs);
 
     let mut rng = rand::rng();
-    let a_value: BigUint = gen_biguint_for_modulus(&mut rng, &active_q);
-    let b_value: BigUint = gen_biguint_for_modulus(&mut rng, &active_q);
-    let expected = (&a_value * &b_value) % &active_q;
+    let input_values: Vec<BigUint> =
+        (0..num_inputs).map(|_| gen_biguint_for_modulus(&mut rng, &active_q)).collect();
+    let expected =
+        input_values.iter().fold(BigUint::from(1u64), |acc, value| (acc * value) % &active_q);
+    let plaintext_inputs: Vec<GpuDCRTPoly> = input_values
+        .iter()
+        .flat_map(|value| encode_nested_rns_poly(cfg.p_moduli_bits, &params, value, q_level))
+        .collect();
 
-    let a_inputs: Vec<GpuDCRTPoly> =
-        encode_nested_rns_poly(cfg.p_moduli_bits, &params, &a_value, q_level);
-    let b_inputs: Vec<GpuDCRTPoly> =
-        encode_nested_rns_poly(cfg.p_moduli_bits, &params, &b_value, q_level);
-    let plaintext_inputs = [a_inputs.clone(), b_inputs.clone()].concat();
-
-    let dry_circuit =
-        build_modq_arith_value_circuit_gpu(&params, q_level, cfg.p_moduli_bits, cfg.scale);
+    let dry_circuit = build_modq_arith_value_circuit_gpu(
+        &params,
+        q_level,
+        cfg.p_moduli_bits,
+        cfg.scale,
+        cfg.height,
+    );
     let dry_plt_evaluator = PolyPltEvaluator::new();
     let dry_eval_start = Instant::now();
     let dry_one = GpuDCRTPoly::const_one(&params);
@@ -452,8 +459,6 @@ async fn test_gpu_ggh15_modq_arith() {
     drop(secrets);
     let encodings = encoding_sampler.sample(&params, &pubkeys, &plaintext_inputs);
     drop(plaintext_inputs);
-    drop(a_inputs);
-    drop(b_inputs);
     info!("encoding sampling elapsed_ms={:.3}", enc_setup_start.elapsed().as_secs_f64() * 1000.0);
     let encodings_compact_start = Instant::now();
     let encodings_compact: Vec<_> = encodings

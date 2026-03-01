@@ -27,11 +27,11 @@ use std::{fs, path::Path, sync::Arc};
 use tracing::info;
 
 const RING_DIM: u32 = 1 << 6;
-const CRT_BITS: usize = 24;
-const P_MODULI_BITS: usize = 6;
+const DEFAULT_CRT_BITS: usize = 24;
+const P_MODULI_BITS: usize = 7;
 const SCALE: u64 = 1 << 7;
-const BASE_BITS: u32 = 12;
-const MAX_CRT_DEPTH: usize = 32;
+const DEFAULT_BASE_BITS: u32 = 12;
+const MAX_CRT_DEPTH: usize = 64;
 const ERROR_SIGMA: f64 = 4.0;
 const D_SECRET: usize = 1;
 
@@ -47,6 +47,33 @@ fn q_level_from_env() -> Option<usize> {
         assert!(level > 0, "GGH15_MODQ_ARITH_Q_LEVEL must be greater than or equal to 1");
         level
     })
+}
+
+fn height_from_env() -> usize {
+    std::env::var("GGH15_MODQ_ARITH_HEIGHT")
+        .ok()
+        .map(|raw| {
+            raw.parse::<usize>().expect("GGH15_MODQ_ARITH_HEIGHT must be a non-negative integer")
+        })
+        .unwrap_or(1)
+}
+
+fn crt_bits_from_env() -> usize {
+    std::env::var("GGH15_MODQ_ARITH_CRT_BITS")
+        .ok()
+        .map(|raw| {
+            raw.parse::<usize>().expect("GGH15_MODQ_ARITH_CRT_BITS must be a positive integer")
+        })
+        .unwrap_or(DEFAULT_CRT_BITS)
+}
+
+fn base_bits_from_env() -> u32 {
+    std::env::var("GGH15_MODQ_ARITH_BASE_BITS")
+        .ok()
+        .map(|raw| {
+            raw.parse::<u32>().expect("GGH15_MODQ_ARITH_BASE_BITS must be a positive integer")
+        })
+        .unwrap_or(DEFAULT_BASE_BITS)
 }
 
 fn active_q_moduli_and_modulus<T: PolyParams>(
@@ -100,6 +127,7 @@ fn build_modq_arith_circuit(
     params: &DCRTPolyParams,
     q_level: Option<usize>,
 ) -> (PolyCircuit<DCRTPoly>, Arc<NestedRnsPolyContext>) {
+    let height = height_from_env();
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
     let ctx = Arc::new(NestedRnsPolyContext::setup(
         &mut circuit,
@@ -109,12 +137,7 @@ fn build_modq_arith_circuit(
         false,
         q_level,
     ));
-
-    let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-    let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-    let prod = poly_a.mul_full_reduce(&poly_b, None, &mut circuit);
-    let out = prod.reconstruct(None, &mut circuit);
-    circuit.output(vec![out]);
+    NestedRnsPoly::benchmark_multiplication_tree(ctx.clone(), &mut circuit, height, q_level);
     (circuit, ctx)
 }
 
@@ -122,6 +145,7 @@ fn build_modq_arith_value_circuit(
     params: &DCRTPolyParams,
     q_level: Option<usize>,
 ) -> PolyCircuit<DCRTPoly> {
+    let height = height_from_env();
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
     let ctx = Arc::new(NestedRnsPolyContext::setup(
         &mut circuit,
@@ -131,27 +155,24 @@ fn build_modq_arith_value_circuit(
         false,
         q_level,
     ));
-
-    let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-    let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-    let prod = poly_a.mul_full_reduce(&poly_b, None, &mut circuit);
-    let out = prod.reconstruct(None, &mut circuit);
-    circuit.output(vec![out]);
+    NestedRnsPoly::benchmark_multiplication_tree(ctx, &mut circuit, height, q_level);
     circuit
 }
 
 fn find_crt_depth_for_modq_arith(
     q_level: Option<usize>,
+    crt_bits: usize,
+    base_bits: u32,
 ) -> (usize, DCRTPolyParams, PolyCircuit<DCRTPoly>) {
     let ring_dim_sqrt = BigDecimal::from_u32(RING_DIM).unwrap().sqrt().unwrap();
-    let base = BigDecimal::from_biguint(BigUint::from(1u32) << BASE_BITS, 0);
+    let base = BigDecimal::from_biguint(BigUint::from(1u32) << base_bits, 0);
     let error_sigma = BigDecimal::from_f64(ERROR_SIGMA).expect("valid error sigma");
     let input_bound = BigDecimal::from((1u64 << P_MODULI_BITS) - 1);
     let e_init_norm = &error_sigma * BigDecimal::from(6u64);
 
     for crt_depth in 1..=MAX_CRT_DEPTH {
-        let params = DCRTPolyParams::new(RING_DIM, crt_depth, CRT_BITS, BASE_BITS);
-        let (active_q_moduli, _, crt_depth) = active_q_moduli_and_modulus(&params, q_level);
+        let params = DCRTPolyParams::new(RING_DIM, crt_depth, crt_bits, base_bits);
+        let (active_q_moduli, _, _) = active_q_moduli_and_modulus(&params, q_level);
         let full_q = params.modulus();
         let q_max = *active_q_moduli.iter().max().expect("active_q_moduli must not be empty");
         let (circuit, _ctx) = build_modq_arith_circuit(&params, q_level);
@@ -204,8 +225,13 @@ fn find_crt_depth_for_modq_arith(
 async fn test_ggh15_modq_arith() {
     let _ = tracing_subscriber::fmt::try_init();
 
+    let height = height_from_env();
+    let crt_bits = crt_bits_from_env();
+    let base_bits = base_bits_from_env();
+    let num_inputs =
+        1usize.checked_shl(height as u32).expect("GGH15_MODQ_ARITH_HEIGHT is too large");
     let q_level = q_level_from_env();
-    let (crt_depth, params, circuit) = find_crt_depth_for_modq_arith(q_level);
+    let (crt_depth, params, circuit) = find_crt_depth_for_modq_arith(q_level, crt_bits, base_bits);
     info!("found crt_depth={}", crt_depth);
     let (all_q_moduli, _, _) = params.to_crt();
     let (active_q_moduli, active_q, active_q_level) = active_q_moduli_and_modulus(&params, q_level);
@@ -214,8 +240,8 @@ async fn test_ggh15_modq_arith() {
         "selected crt_depth={} ring_dim={} crt_bits={} base_bits={} q_level={:?} q_moduli={:?}",
         crt_depth,
         params.ring_dimension(),
-        CRT_BITS,
-        BASE_BITS,
+        crt_bits,
+        base_bits,
         q_level,
         all_q_moduli
     );
@@ -230,17 +256,20 @@ async fn test_ggh15_modq_arith() {
         active_q.bits(),
         active_q_moduli.len()
     );
+    info!("multiplication tree config: height={} num_inputs={}", height, num_inputs);
 
     let q_max = *active_q_moduli.iter().max().expect("active_q_moduli must not be empty");
 
     let mut rng = rand::rng();
-    let a_value: BigUint = gen_biguint_for_modulus(&mut rng, &active_q);
-    let b_value: BigUint = gen_biguint_for_modulus(&mut rng, &active_q);
-    let expected = (&a_value * &b_value) % &active_q;
+    let input_values =
+        (0..num_inputs).map(|_| gen_biguint_for_modulus(&mut rng, &active_q)).collect::<Vec<_>>();
+    let expected =
+        input_values.iter().fold(BigUint::from(1u64), |acc, value| (acc * value) % &active_q);
 
-    let a_inputs: Vec<DCRTPoly> = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, q_level);
-    let b_inputs: Vec<DCRTPoly> = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, q_level);
-    let plaintext_inputs = [a_inputs.clone(), b_inputs.clone()].concat();
+    let plaintext_inputs = input_values
+        .iter()
+        .flat_map(|value| encode_nested_rns_poly(P_MODULI_BITS, &params, value, q_level))
+        .collect::<Vec<_>>();
     let plaintext_inputs_shared = plaintext_inputs.clone();
 
     let dry_circuit = build_modq_arith_value_circuit(&params, q_level);

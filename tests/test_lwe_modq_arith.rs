@@ -239,14 +239,17 @@ async fn test_lwe_modq_arith() {
     let a_inputs: Vec<DCRTPoly> = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, q_level);
     let b_inputs: Vec<DCRTPoly> = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, q_level);
     let plaintext_inputs = [a_inputs.clone(), b_inputs.clone()].concat();
-    let plaintext_inputs_shared: Vec<Arc<DCRTPoly>> =
-        plaintext_inputs.iter().cloned().map(Arc::new).collect();
+    let plaintext_inputs_shared = plaintext_inputs.clone();
 
     let dry_circuit = build_modq_arith_value_circuit(&params, q_level);
     let dry_plt_evaluator = PolyPltEvaluator::new();
-    let dry_one = Arc::new(DCRTPoly::const_one(&params));
-    let dry_out =
-        dry_circuit.eval(&params, &dry_one, &plaintext_inputs_shared, Some(&dry_plt_evaluator));
+    let dry_one = DCRTPoly::const_one(&params);
+    let dry_out = dry_circuit.eval(
+        &params,
+        dry_one,
+        plaintext_inputs_shared.clone(),
+        Some(&dry_plt_evaluator),
+    );
     assert_eq!(dry_out.len(), 1, "plain PolyCircuit dry-run should output one value polynomial");
     let dry_const_term = dry_out[0]
         .coeffs()
@@ -265,9 +268,8 @@ async fn test_lwe_modq_arith() {
     info!("plain PolyCircuit dry-run succeeded with expected constant term");
 
     let plt_evaluator = PolyPltEvaluator::new();
-    let plain_one = Arc::new(DCRTPoly::const_one(&params));
-    let plain_out =
-        circuit.eval(&params, &plain_one, &plaintext_inputs_shared, Some(&plt_evaluator));
+    let plain_one = DCRTPoly::const_one(&params);
+    let plain_out = circuit.eval(&params, plain_one, plaintext_inputs_shared, Some(&plt_evaluator));
     assert_eq!(plain_out.len(), 1);
     let plain_const = plain_out[0]
         .coeffs()
@@ -302,12 +304,15 @@ async fn test_lwe_modq_arith() {
 
     let pk_sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(seed, d_secret);
     let reveal_plaintexts = vec![true; circuit.num_input()];
-    let pubkeys = pk_sampler.sample(&params, b"BGG_PUBKEY", &reveal_plaintexts);
+    let mut pubkeys = pk_sampler.sample(&params, b"BGG_PUBKEY", &reveal_plaintexts);
 
     let encoding_sampler =
         BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
-    let encodings = encoding_sampler.sample(&params, &pubkeys, &plaintext_inputs);
-    let enc_one = encodings[0].clone();
+    let mut encodings = encoding_sampler.sample(&params, &pubkeys, &plaintext_inputs);
+    let input_pubkeys = pubkeys.split_off(1);
+    let pubkey_one = pubkeys.pop().expect("pubkeys must contain one entry for const one");
+    let input_encodings = encodings.split_off(1);
+    let enc_one = encodings.pop().expect("encodings must contain one entry for const one");
 
     let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, trapdoor_sigma);
     let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(&params, d_secret);
@@ -323,9 +328,7 @@ async fn test_lwe_modq_arith() {
             seed, trapdoor_sampler.clone(), pub_matrix.clone(), trapdoor, dir.to_path_buf()
         );
 
-    let pubkey_one = Arc::new(enc_one.pubkey.clone());
-    let input_pubkeys: Vec<Arc<_>> = pubkeys[1..].iter().cloned().map(Arc::new).collect();
-    let pubkey_out = circuit.eval(&params, &pubkey_one, &input_pubkeys, Some(&pk_evaluator));
+    let pubkey_out = circuit.eval(&params, pubkey_one, input_pubkeys, Some(&pk_evaluator));
     assert_eq!(pubkey_out.len(), 1);
 
     pk_evaluator.sample_aux_matrices(&params);
@@ -339,9 +342,7 @@ async fn test_lwe_modq_arith() {
             p,
         );
 
-    let encoding_one = Arc::new(enc_one.clone());
-    let input_encodings: Vec<Arc<_>> = encodings[1..].iter().cloned().map(Arc::new).collect();
-    let encoding_out = circuit.eval(&params, &encoding_one, &input_encodings, Some(&enc_evaluator));
+    let encoding_out = circuit.eval(&params, enc_one, input_encodings, Some(&enc_evaluator));
     assert_eq!(encoding_out.len(), 1);
 
     assert_eq!(encoding_out[0].pubkey, pubkey_out[0]);

@@ -84,7 +84,10 @@ pub trait PolyMatrix:
         }
     }
 
-    fn to_compact_bytes(&self) -> Vec<u8>;
+    fn into_compact_bytes(self) -> Vec<u8>;
+    fn to_compact_bytes(&self) -> Vec<u8> {
+        self.clone().into_compact_bytes()
+    }
     fn from_compact_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self;
     fn from_poly_vec(params: &<Self::P as Poly>::Params, vec: Vec<Vec<Self::P>>) -> Self;
     /// Creates a row vector (1 x n matrix) from a vector of n DCRTPoly elements.
@@ -199,6 +202,65 @@ pub trait PolyMatrix:
     fn small_decompose(&self) -> Self;
     fn small_decompose_owned(self) -> Self {
         self.small_decompose()
+    }
+    /// Builds one row-chunk of `identity(size, scalar).small_decompose()` without materializing
+    /// the full `(size * chunk_count) x size` matrix.
+    fn small_decomposed_identity_chunk(
+        params: &<Self::P as Poly>::Params,
+        size: usize,
+        chunk_idx: usize,
+        chunk_count: usize,
+        scalar_by_digit: &[Self::P],
+    ) -> Self {
+        assert!(chunk_count > 0, "small_decomposed_identity_chunk chunk_count must be > 0");
+        assert_eq!(
+            scalar_by_digit.len(),
+            chunk_count,
+            "small_decomposed_identity_chunk requires scalar_by_digit.len() == chunk_count"
+        );
+        let row_start = chunk_idx
+            .checked_mul(size)
+            .expect("small_decomposed_identity_chunk row offset overflow");
+        let mut out = Self::zero(params, size, size);
+        for local_row in 0..size {
+            let global_row = row_start + local_row;
+            let src_row = global_row / chunk_count;
+            let digit = global_row % chunk_count;
+            assert!(
+                src_row < size,
+                "small_decomposed_identity_chunk source row out of bounds: src_row={}, size={}",
+                src_row,
+                size
+            );
+            out.set_entry(local_row, src_row, scalar_by_digit[digit].clone());
+        }
+        out
+    }
+    /// Builds one row-chunk of `identity(size, scalar).small_decompose()`.
+    /// Default implementation preserves exact semantics by materializing the full decomposition
+    /// and slicing out the requested chunk.
+    fn small_decomposed_identity_chunk_from_scalar(
+        params: &<Self::P as Poly>::Params,
+        size: usize,
+        scalar: &Self::P,
+        chunk_idx: usize,
+        chunk_count: usize,
+    ) -> Self {
+        assert!(
+            chunk_count > 0,
+            "small_decomposed_identity_chunk_from_scalar chunk_count must be > 0"
+        );
+        assert!(
+            chunk_idx < chunk_count,
+            "small_decomposed_identity_chunk_from_scalar chunk_idx out of range: chunk_idx={}, chunk_count={}",
+            chunk_idx,
+            chunk_count
+        );
+        let full = Self::identity(params, size, Some(scalar.clone())).small_decompose();
+        let row_start = chunk_idx
+            .checked_mul(size)
+            .expect("small_decomposed_identity_chunk_from_scalar row offset overflow");
+        full.slice(row_start, row_start + size, 0, size)
     }
     fn modulus_switch(
         &self,

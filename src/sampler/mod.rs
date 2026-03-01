@@ -43,6 +43,30 @@ pub trait PolyHashSampler<K: AsRef<[u8]>> {
         ncol: usize,
         dist: DistType,
     ) -> Self::M;
+
+    fn sample_hash_decomposed<B: AsRef<[u8]>>(
+        &self,
+        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
+        key: [u8; 32],
+        tag: B,
+        nrow: usize,
+        ncol: usize,
+        dist: DistType,
+    ) -> Self::M {
+        self.sample_hash(params, key, tag, nrow, ncol, dist).decompose_owned()
+    }
+
+    fn sample_hash_small_decomposed<B: AsRef<[u8]>>(
+        &self,
+        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
+        key: [u8; 32],
+        tag: B,
+        nrow: usize,
+        ncol: usize,
+        dist: DistType,
+    ) -> Self::M {
+        self.sample_hash(params, key, tag, nrow, ncol, dist).small_decompose_owned()
+    }
 }
 
 pub trait PolyUniformSampler {

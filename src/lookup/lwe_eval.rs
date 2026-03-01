@@ -403,10 +403,10 @@ mod test {
                 Arc::new(b_trapdoor),
                 dir_path.into(),
             );
-        let one_pubkey = Arc::new(enc_one.pubkey.clone());
-        let input_pubkeys = vec![Arc::new(enc1.pubkey.clone())];
+        let one_pubkey = enc_one.pubkey.clone();
+        let input_pubkeys = vec![enc1.pubkey.clone()];
         let result_pubkey =
-            circuit.eval(&params, &one_pubkey, &input_pubkeys, Some(&plt_pubkey_evaluator));
+            circuit.eval(&params, one_pubkey, input_pubkeys, Some(&plt_pubkey_evaluator));
         plt_pubkey_evaluator.sample_aux_matrices(&params);
         wait_for_all_writes(dir.to_path_buf()).await.unwrap();
         assert_eq!(result_pubkey.len(), 1);
@@ -419,10 +419,10 @@ mod test {
         >::new(key, dir_path.into(), c_b);
 
         // Evaluate the circuit
-        let one_encoding = Arc::new(enc_one.clone());
-        let input_encodings = vec![Arc::new(enc1.clone())];
+        let one_encoding = enc_one.clone();
+        let input_encodings = vec![enc1.clone()];
         let result_encoding =
-            circuit.eval(&params, &one_encoding, &input_encodings, Some(&plt_encoding_evaluator));
+            circuit.eval(&params, one_encoding, input_encodings, Some(&plt_encoding_evaluator));
         assert_eq!(result_encoding.len(), 1);
         let result_encoding = &result_encoding[0];
         assert_eq!(result_encoding.pubkey, result_pubkey.clone());

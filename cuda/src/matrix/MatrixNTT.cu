@@ -1,3 +1,9 @@
+__constant__ uint64_t gpu_ntt_const_moduli[GPU_RUNTIME_MAX_LIMBS];
+__constant__ uint64_t gpu_ntt_const_root[GPU_RUNTIME_MAX_LIMBS];
+__constant__ uint64_t gpu_ntt_const_inv_root[GPU_RUNTIME_MAX_LIMBS];
+__constant__ uint64_t gpu_ntt_const_n_inv[GPU_RUNTIME_MAX_LIMBS];
+__constant__ uint32_t gpu_ntt_const_limb_count;
+
 namespace
 {
     constexpr uint32_t kTransformThreads = 256;
@@ -30,37 +36,13 @@ namespace
         return result;
     }
 
-    uint64_t mul_mod_u64_host(uint64_t a, uint64_t b, uint64_t mod)
-    {
-        const unsigned __int128 prod = static_cast<unsigned __int128>(a) * static_cast<unsigned __int128>(b);
-        return static_cast<uint64_t>(prod % mod);
-    }
-
-    uint64_t pow_mod_u64_host(uint64_t base, uint32_t exp, uint64_t mod)
-    {
-        uint64_t result = 1 % mod;
-        uint64_t cur = base % mod;
-        uint32_t e = exp;
-        while (e != 0)
-        {
-            if ((e & 1U) != 0)
-            {
-                result = mul_mod_u64_host(result, cur, mod);
-            }
-            cur = mul_mod_u64_host(cur, cur, mod);
-            e >>= 1;
-        }
-        return result;
-    }
-
     __global__ void ntt_twist_all_limbs_kernel(
         uint64_t *const *limb_bases,
         const size_t *limb_strides,
-        const uint64_t *limb_twiddle_bases,
-        const uint64_t *limb_moduli,
         size_t limb_count,
         uint32_t n,
-        size_t poly_offset)
+        size_t poly_offset,
+        bool inverse)
     {
         const uint32_t coeff_idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (coeff_idx >= n)
@@ -75,8 +57,12 @@ namespace
         const size_t poly_idx = poly_offset + static_cast<size_t>(blockIdx.y);
         uint64_t *const base = limb_bases[limb_idx];
         const size_t stride = limb_strides[limb_idx];
-        const uint64_t twiddle_base = limb_twiddle_bases[limb_idx];
-        const uint64_t modulus = limb_moduli[limb_idx];
+        if (limb_idx >= static_cast<size_t>(gpu_ntt_const_limb_count))
+        {
+            return;
+        }
+        const uint64_t twiddle_base = inverse ? gpu_ntt_const_inv_root[limb_idx] : gpu_ntt_const_root[limb_idx];
+        const uint64_t modulus = gpu_ntt_const_moduli[limb_idx];
         uint64_t *const poly = base + poly_idx * stride;
         const uint64_t tw = pow_mod_u64_device(twiddle_base, coeff_idx, modulus);
         poly[coeff_idx] = mul_mod_u64(poly[coeff_idx], tw, modulus);
@@ -85,8 +71,6 @@ namespace
     __global__ void ntt_scale_all_limbs_kernel(
         uint64_t *const *limb_bases,
         const size_t *limb_strides,
-        const uint64_t *limb_factors,
-        const uint64_t *limb_moduli,
         size_t limb_count,
         uint32_t n,
         size_t poly_offset)
@@ -104,8 +88,12 @@ namespace
         const size_t poly_idx = poly_offset + static_cast<size_t>(blockIdx.y);
         uint64_t *const base = limb_bases[limb_idx];
         const size_t stride = limb_strides[limb_idx];
-        const uint64_t factor = limb_factors[limb_idx];
-        const uint64_t modulus = limb_moduli[limb_idx];
+        if (limb_idx >= static_cast<size_t>(gpu_ntt_const_limb_count))
+        {
+            return;
+        }
+        const uint64_t factor = gpu_ntt_const_n_inv[limb_idx];
+        const uint64_t modulus = gpu_ntt_const_moduli[limb_idx];
         uint64_t *const poly = base + poly_idx * stride;
         poly[coeff_idx] = mul_mod_u64(poly[coeff_idx], factor, modulus);
     }
@@ -146,7 +134,6 @@ namespace
         uint64_t *const *limb_bases,
         const size_t *limb_strides,
         const uint64_t *limb_wlens,
-        const uint64_t *limb_moduli,
         size_t limb_count,
         uint32_t n,
         uint32_t len,
@@ -170,8 +157,12 @@ namespace
         const size_t poly_idx = poly_offset + static_cast<size_t>(blockIdx.y);
         uint64_t *const base = limb_bases[limb_idx];
         const size_t stride = limb_strides[limb_idx];
+        if (limb_idx >= static_cast<size_t>(gpu_ntt_const_limb_count))
+        {
+            return;
+        }
         const uint64_t wlen = limb_wlens[limb_idx];
-        const uint64_t modulus = limb_moduli[limb_idx];
+        const uint64_t modulus = gpu_ntt_const_moduli[limb_idx];
         uint64_t *const poly = base + poly_idx * stride;
         const uint64_t w = pow_mod_u64_device(wlen, j, modulus);
         const uint64_t u = poly[i];
@@ -188,14 +179,13 @@ namespace
     int launch_twist_for_all_limbs(
         uint64_t *const *limb_bases,
         const size_t *limb_strides,
-        const uint64_t *limb_twiddle_bases,
-        const uint64_t *limb_moduli,
         size_t limb_count,
         uint32_t n,
         size_t poly_count,
-        cudaStream_t stream)
+        cudaStream_t stream,
+        bool inverse)
     {
-        if (!limb_bases || !limb_strides || !limb_twiddle_bases || !limb_moduli)
+        if (!limb_bases || !limb_strides)
         {
             return set_error("null metadata in launch_twist_for_all_limbs");
         }
@@ -218,11 +208,10 @@ namespace
             ntt_twist_all_limbs_kernel<<<grid, kTransformThreads, 0, stream>>>(
                 limb_bases,
                 limb_strides,
-                limb_twiddle_bases,
-                limb_moduli,
                 limb_count,
                 n,
-                offset);
+                offset,
+                inverse);
             cudaError_t err = cudaGetLastError();
             if (err != cudaSuccess)
             {
@@ -235,14 +224,12 @@ namespace
     int launch_scale_for_all_limbs(
         uint64_t *const *limb_bases,
         const size_t *limb_strides,
-        const uint64_t *limb_factors,
-        const uint64_t *limb_moduli,
         size_t limb_count,
         uint32_t n,
         size_t poly_count,
         cudaStream_t stream)
     {
-        if (!limb_bases || !limb_strides || !limb_factors || !limb_moduli)
+        if (!limb_bases || !limb_strides)
         {
             return set_error("null metadata in launch_scale_for_all_limbs");
         }
@@ -265,8 +252,6 @@ namespace
             ntt_scale_all_limbs_kernel<<<grid, kTransformThreads, 0, stream>>>(
                 limb_bases,
                 limb_strides,
-                limb_factors,
-                limb_moduli,
                 limb_count,
                 n,
                 offset);
@@ -328,14 +313,13 @@ namespace
         uint64_t *const *limb_bases,
         const size_t *limb_strides,
         const uint64_t *limb_wlens,
-        const uint64_t *limb_moduli,
         size_t limb_count,
         uint32_t n,
         uint32_t len,
         size_t poly_count,
         cudaStream_t stream)
     {
-        if (!limb_bases || !limb_strides || !limb_wlens || !limb_moduli)
+        if (!limb_bases || !limb_strides || !limb_wlens)
         {
             return set_error("null metadata in launch_stage_for_all_limbs");
         }
@@ -360,7 +344,6 @@ namespace
                 limb_bases,
                 limb_strides,
                 limb_wlens,
-                limb_moduli,
                 limb_count,
                 n,
                 len,
@@ -406,6 +389,7 @@ namespace
         auto &limb_map = mat->ctx->limb_gpu_ids;
         auto &limb_types = mat->ctx->limb_types;
         auto &limb_prime_ids = mat->ctx->limb_prime_ids;
+        auto &moduli = mat->ctx->moduli;
         const size_t limb_count = static_cast<size_t>(mat->level + 1);
         if (limb_map.size() < limb_count)
         {
@@ -430,15 +414,9 @@ namespace
         std::vector<dim3> active_limb_ids(limb_count);
         std::vector<uint64_t *> limb_bases(limb_count, nullptr);
         std::vector<size_t> limb_strides(limb_count, 0);
-        std::vector<uint64_t> limb_moduli(limb_count, 0);
-        std::vector<uint64_t> limb_n_inv(limb_count, 0);
-        std::vector<uint64_t> limb_root(limb_count, 0);
-        std::vector<uint64_t> limb_inv_root(limb_count, 0);
-        std::vector<uint64_t> limb_omega(limb_count, 0);
-        std::vector<uint64_t> limb_inv_omega(limb_count, 0);
-        std::vector<uint64_t> limb_wlens(limb_count, 0);
 
         int dispatch_device = -1;
+        size_t dispatch_slot = std::numeric_limits<size_t>::max();
         cudaStream_t dispatch_stream = nullptr;
         int status = 0;
 
@@ -461,6 +439,7 @@ namespace
             if (limb == 0)
             {
                 dispatch_device = limb_device;
+                dispatch_slot = static_cast<size_t>(limb_id.x);
                 status = matrix_limb_stream(mat, limb_id, &dispatch_stream);
                 if (status != 0)
                 {
@@ -476,30 +455,17 @@ namespace
                 return set_error("single-device mode requires all limbs on one device in run_matrix_transform_u64");
             }
 
-            if (limb_types[limb_idx] != FIDESlib::U64)
+            if (limb_types[limb_idx] != GPU_LIMB_U64)
             {
                 return set_error("unsupported limb type in run_matrix_transform_u64");
             }
             const int primeid = limb_prime_ids[limb_idx];
-            if (primeid < 0 || primeid >= FIDESlib::MAXP || limb_id.x >= FIDESlib::MAXD)
+            if (primeid < 0 ||
+                static_cast<size_t>(primeid) >= moduli.size() ||
+                limb_id.x >= mat->ctx->gpu_ids.size())
             {
                 return set_error("invalid prime/device index in run_matrix_transform_u64");
             }
-
-            const uint64_t modulus = FIDESlib::host_constants.primes[primeid];
-            const uint64_t n_inv = FIDESlib::host_constants.N_inv[primeid];
-            const uint64_t root = FIDESlib::host_global.root[primeid];
-            const uint64_t inv_root = FIDESlib::host_global.inv_root[primeid];
-            if (modulus == 0 || n_inv == 0 || root == 0 || inv_root == 0)
-            {
-                return set_error("invalid modulus/root constants in run_matrix_transform_u64");
-            }
-            limb_moduli[limb_idx] = modulus;
-            limb_n_inv[limb_idx] = n_inv;
-            limb_root[limb_idx] = root;
-            limb_inv_root[limb_idx] = inv_root;
-            limb_omega[limb_idx] = mul_mod_u64_host(root, root, modulus);
-            limb_inv_omega[limb_idx] = mul_mod_u64_host(inv_root, inv_root, modulus);
 
             const auto &buffer = mat->shared_limb_buffers[limb_id.x];
             if (buffer.words_per_poly < static_cast<size_t>(n))
@@ -516,6 +482,29 @@ namespace
             limb_bases[limb_idx] = base;
         }
 
+        if (dispatch_slot >= mat->ctx->ntt_device_constants.size())
+        {
+            return set_error("missing per-device NTT constants in run_matrix_transform_u64");
+        }
+        const GpuNttDeviceConstants &device_constants = mat->ctx->ntt_device_constants[dispatch_slot];
+        if (device_constants.device != dispatch_device)
+        {
+            return set_error("NTT constants device mismatch in run_matrix_transform_u64");
+        }
+        if (device_constants.limb_count < limb_count)
+        {
+            return set_error("insufficient NTT limb constants in run_matrix_transform_u64");
+        }
+        if (device_constants.stage_count != log_n)
+        {
+            return set_error("NTT stage constants mismatch in run_matrix_transform_u64");
+        }
+        if (!device_constants.limb_wlen_forward ||
+            !device_constants.limb_wlen_inverse)
+        {
+            return set_error("null per-device NTT constants in run_matrix_transform_u64");
+        }
+
         for (const dim3 &limb_id : active_limb_ids)
         {
             status = matrix_wait_limb_stream(mat, limb_id, dispatch_device, dispatch_stream);
@@ -527,13 +516,10 @@ namespace
 
         const size_t ptr_bytes = limb_count * sizeof(uint64_t *);
         const size_t stride_bytes = limb_count * sizeof(size_t);
-        const size_t scalar_bytes = limb_count * sizeof(uint64_t);
         uint64_t **limb_bases_device = nullptr;
         size_t *limb_strides_device = nullptr;
-        uint64_t *limb_moduli_device = nullptr;
-        uint64_t *limb_twists_device = nullptr;
-        uint64_t *limb_scales_device = nullptr;
-        uint64_t *limb_wlens_device = nullptr;
+        const uint64_t *limb_wlens_base =
+            Forward ? device_constants.limb_wlen_forward : device_constants.limb_wlen_inverse;
         auto cleanup = [&]()
         {
             if (dispatch_device >= 0)
@@ -550,26 +536,6 @@ namespace
                 cudaFreeAsync(limb_strides_device, dispatch_stream);
                 limb_strides_device = nullptr;
             }
-            if (limb_moduli_device)
-            {
-                cudaFreeAsync(limb_moduli_device, dispatch_stream);
-                limb_moduli_device = nullptr;
-            }
-            if (limb_twists_device)
-            {
-                cudaFreeAsync(limb_twists_device, dispatch_stream);
-                limb_twists_device = nullptr;
-            }
-            if (limb_scales_device)
-            {
-                cudaFreeAsync(limb_scales_device, dispatch_stream);
-                limb_scales_device = nullptr;
-            }
-            if (limb_wlens_device)
-            {
-                cudaFreeAsync(limb_wlens_device, dispatch_stream);
-                limb_wlens_device = nullptr;
-            }
         };
 
         cudaError_t err = cudaSetDevice(dispatch_device);
@@ -585,30 +551,6 @@ namespace
             return set_error(err);
         }
         err = cudaMallocAsync(reinterpret_cast<void **>(&limb_strides_device), stride_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&limb_moduli_device), scalar_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&limb_twists_device), scalar_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&limb_scales_device), scalar_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&limb_wlens_device), scalar_bytes, dispatch_stream);
         if (err != cudaSuccess)
         {
             cleanup();
@@ -637,68 +579,17 @@ namespace
             cleanup();
             return set_error(err);
         }
-        err = cudaMemcpyAsync(
-            limb_moduli_device,
-            limb_moduli.data(),
-            scalar_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        if constexpr (Forward)
-        {
-            err = cudaMemcpyAsync(
-                limb_twists_device,
-                limb_root.data(),
-                scalar_bytes,
-                cudaMemcpyHostToDevice,
-                dispatch_stream);
-            if (err != cudaSuccess)
-            {
-                cleanup();
-                return set_error(err);
-            }
-        }
-        else
-        {
-            err = cudaMemcpyAsync(
-                limb_twists_device,
-                limb_inv_root.data(),
-                scalar_bytes,
-                cudaMemcpyHostToDevice,
-                dispatch_stream);
-            if (err != cudaSuccess)
-            {
-                cleanup();
-                return set_error(err);
-            }
-            err = cudaMemcpyAsync(
-                limb_scales_device,
-                limb_n_inv.data(),
-                scalar_bytes,
-                cudaMemcpyHostToDevice,
-                dispatch_stream);
-            if (err != cudaSuccess)
-            {
-                cleanup();
-                return set_error(err);
-            }
-        }
 
         if constexpr (Forward)
         {
             status = launch_twist_for_all_limbs(
                 limb_bases_device,
                 limb_strides_device,
-                limb_twists_device,
-                limb_moduli_device,
                 limb_count,
                 n,
                 poly_count,
-                dispatch_stream);
+                dispatch_stream,
+                false);
             if (status != 0)
             {
                 cleanup();
@@ -717,29 +608,14 @@ namespace
                 cleanup();
                 return status;
             }
-            for (uint32_t len = 2; len <= n; len <<= 1)
+            for (uint32_t stage_idx = 0, len = 2; len <= n; len <<= 1, ++stage_idx)
             {
-                const uint32_t exp = n / len;
-                for (size_t idx = 0; idx < limb_count; ++idx)
-                {
-                    limb_wlens[idx] = pow_mod_u64_host(limb_omega[idx], exp, limb_moduli[idx]);
-                }
-                err = cudaMemcpyAsync(
-                    limb_wlens_device,
-                    limb_wlens.data(),
-                    scalar_bytes,
-                    cudaMemcpyHostToDevice,
-                    dispatch_stream);
-                if (err != cudaSuccess)
-                {
-                    cleanup();
-                    return set_error(err);
-                }
+                const uint64_t *limb_wlens_device =
+                    limb_wlens_base + static_cast<size_t>(stage_idx) * device_constants.limb_count;
                 status = launch_stage_for_all_limbs(
                     limb_bases_device,
                     limb_strides_device,
                     limb_wlens_device,
-                    limb_moduli_device,
                     limb_count,
                     n,
                     len,
@@ -767,29 +643,14 @@ namespace
                 cleanup();
                 return status;
             }
-            for (uint32_t len = 2; len <= n; len <<= 1)
+            for (uint32_t stage_idx = 0, len = 2; len <= n; len <<= 1, ++stage_idx)
             {
-                const uint32_t exp = n / len;
-                for (size_t idx = 0; idx < limb_count; ++idx)
-                {
-                    limb_wlens[idx] = pow_mod_u64_host(limb_inv_omega[idx], exp, limb_moduli[idx]);
-                }
-                err = cudaMemcpyAsync(
-                    limb_wlens_device,
-                    limb_wlens.data(),
-                    scalar_bytes,
-                    cudaMemcpyHostToDevice,
-                    dispatch_stream);
-                if (err != cudaSuccess)
-                {
-                    cleanup();
-                    return set_error(err);
-                }
+                const uint64_t *limb_wlens_device =
+                    limb_wlens_base + static_cast<size_t>(stage_idx) * device_constants.limb_count;
                 status = launch_stage_for_all_limbs(
                     limb_bases_device,
                     limb_strides_device,
                     limb_wlens_device,
-                    limb_moduli_device,
                     limb_count,
                     n,
                     len,
@@ -804,8 +665,6 @@ namespace
             status = launch_scale_for_all_limbs(
                 limb_bases_device,
                 limb_strides_device,
-                limb_scales_device,
-                limb_moduli_device,
                 limb_count,
                 n,
                 poly_count,
@@ -818,12 +677,11 @@ namespace
             status = launch_twist_for_all_limbs(
                 limb_bases_device,
                 limb_strides_device,
-                limb_twists_device,
-                limb_moduli_device,
                 limb_count,
                 n,
                 poly_count,
-                dispatch_stream);
+                dispatch_stream,
+                true);
             if (status != 0)
             {
                 cleanup();

@@ -585,6 +585,33 @@ mod tests {
     }
 
     #[test]
+    fn test_small_decomposed_identity_chunk_equivalence() {
+        let params = DCRTPolyParams::default();
+        let d = 2usize;
+        let m_g = d * params.modulus_digits();
+        let (_, _, crt_depth) = params.to_crt();
+        let k_small = params.modulus_digits() / crt_depth;
+        let x = DCRTPoly::from_usize_to_constant(&params, 13);
+
+        let full = DCRTPolyMatrix::identity(&params, m_g, Some(x.clone())).small_decompose();
+        let x_digit_decomposed = DCRTPolyMatrix::identity(&params, 1, Some(x)).small_decompose();
+        let x_digit_by_chunk =
+            (0..k_small).map(|digit| x_digit_decomposed.entry(digit, 0)).collect::<Vec<_>>();
+
+        for chunk_idx in 0..k_small {
+            let expected = full.slice(chunk_idx * m_g, (chunk_idx + 1) * m_g, 0, m_g);
+            let actual = DCRTPolyMatrix::small_decomposed_identity_chunk(
+                &params,
+                m_g,
+                chunk_idx,
+                k_small,
+                &x_digit_by_chunk,
+            );
+            assert_eq!(actual, expected, "chunk mismatch at chunk_idx={chunk_idx}");
+        }
+    }
+
+    #[test]
     fn test_matrix_decompose_with_unaligned_base() {
         let params = DCRTPolyParams::new(4, 1, 52, 17);
         let digits_length = params.modulus_digits();

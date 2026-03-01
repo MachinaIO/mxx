@@ -145,6 +145,14 @@ impl NormPltLWEEvaluator {
         let e_b_times_preimage =
             &e_b_init * &PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, norm.clone(), None);
         let preimage_lower = PolyMatrixNorm::new(ctx.clone(), ctx.m_g, ctx.m_g, norm.clone(), None);
+        info!(
+            "LWE PLT const term norm bits {}",
+            bigdecimal_bits_ceil(&e_b_times_preimage.poly_norm.norm)
+        );
+        info!(
+            "LWE PLT e_input multiplier norm bits {}",
+            bigdecimal_bits_ceil(&preimage_lower.poly_norm.norm)
+        );
         Self { e_b_times_preimage, preimage_lower }
     }
 }
@@ -179,6 +187,12 @@ impl NormPltGGH15Evaluator {
         e_mat_sigma: &BigDecimal,
         secret_sigma: Option<BigDecimal>,
     ) -> Self {
+        let dump_const_term_breakdown = std::env::var("MXX_SIM_GGH15_CONST_TERM_BREAKDOWN")
+            .ok()
+            .map(|raw| matches!(raw.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
+        let matrix_norm_bits = |m: &PolyMatrixNorm| bigdecimal_bits_ceil(&m.poly_norm.norm);
+
         let preimage_norm = compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base);
         info!("{}", format!("preimage norm bits {}", bigdecimal_bits_ceil(&preimage_norm)));
         let e_b_init = PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_b, e_b_sigma * 6, None);
@@ -189,50 +203,118 @@ impl NormPltGGH15Evaluator {
             secret_sigma.unwrap_or(BigDecimal::one()),
             None,
         );
-        let e_times_preimage_gate_1 = e_b_init.clone() *
-            PolyMatrixNorm::new(ctx.clone(), ctx.m_b, 2 * ctx.m_b, preimage_norm.clone(), None) +
-            s_vec.clone() *
-                PolyMatrixNorm::new(
-                    ctx.clone(),
-                    ctx.secret_size,
-                    2 * ctx.m_b,
-                    e_mat_sigma * 6,
-                    None,
-                );
+        // Corresponds to `preimage_gate1` sampled in `sample_gate_preimages_batch` stage1
+        // from target `S_g * B1 + error` (B1 now has size d, so this is m_b x m_b).
+        let preimage_gate1_from_b0 =
+            PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_b, preimage_norm.clone(), None);
+        // Corresponds to stage1 Gaussian `error` in target `S_g * B1 + error`.
+        let stage1_target_error =
+            PolyMatrixNorm::new(ctx.clone(), ctx.secret_size, ctx.m_b, e_mat_sigma * 6, None);
+        let gate1_from_eb = e_b_init.clone() * &preimage_gate1_from_b0;
+        let gate1_from_s = s_vec.clone() * &stage1_target_error;
+        // Corresponds to the error part of `c_b0 * preimage_gate1`.
+        let gate1_error_total = &gate1_from_eb + &gate1_from_s;
+        let gate1_total_bits = matrix_norm_bits(&gate1_error_total);
+        let gate1_from_eb_bits = matrix_norm_bits(&gate1_from_eb);
+        let gate1_from_s_bits = matrix_norm_bits(&gate1_from_s);
+
+        // Corresponds to `gy.decompose()` in `public_lookup`.
+        let gy_decomposed = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g);
+        // Corresponds to `v_idx` in `public_lookup`.
         let v_idx = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g);
-        let small_decomposed = PolyMatrixNorm::new(
+        // Corresponds to the vertically stacked
+        // `small_decomposed_identity_chunk_from_scalar(...)` blocks used in vx accumulation.
+        let small_decomposed_identity_chunks = PolyMatrixNorm::new(
             ctx.clone(),
             ctx.m_g * ctx.log_base_q_small,
             ctx.m_g,
             ctx.base.clone() - BigDecimal::from(1u64),
             Some((ctx.m_g - 1) * ctx.log_base_q_small),
         );
-        let small_times_v = small_decomposed * &v_idx;
-        let t_idx = PolyMatrixNorm::new(
+        // Corresponds to `(small_decomposed_identity_chunk_from_scalar * v_idx)` in
+        // `public_lookup`.
+        let small_times_v = small_decomposed_identity_chunks * &v_idx;
+
+        // Corresponds to `preimage_gate2_identity` (B0 preimage for identity/out term).
+        let preimage_gate2_identity_from_b0 =
+            PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, preimage_norm.clone(), None);
+        // Corresponds to `preimage_gate2_gy` (B0 preimage for gy term).
+        let preimage_gate2_gy_from_b0 =
+            PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, preimage_norm.clone(), None);
+        // Corresponds to `preimage_gate2_v` (B0 preimage for v_idx term).
+        let preimage_gate2_v_from_b0 =
+            PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, preimage_norm.clone(), None);
+        // Corresponds to concatenated `preimage_gate2_vx_chunk` blocks.
+        let preimage_gate2_vx_from_b0 = PolyMatrixNorm::new(
             ctx.clone(),
-            3 * ctx.m_g + ctx.m_g * ctx.log_base_q_small,
-            ctx.m_g,
-            small_times_v.poly_norm.norm,
+            ctx.m_b,
+            ctx.m_g * ctx.log_base_q_small,
+            preimage_norm.clone(),
+            None,
+        );
+        // Corresponds to Gaussian `error` added in stage2 target
+        // `S_g * w_block_identity + out_matrix + error`.
+        let stage2_identity_target_error =
+            PolyMatrixNorm::new(ctx.clone(), ctx.secret_size, ctx.m_g, e_mat_sigma * 6, None);
+        // Corresponds to Gaussian `error` added in stage3 target
+        // `S_g * w_block_gy - gadget + error`.
+        let stage3_gy_target_error =
+            PolyMatrixNorm::new(ctx.clone(), ctx.secret_size, ctx.m_g, e_mat_sigma * 6, None);
+        // Corresponds to Gaussian `error` added in stage4 target
+        // `S_g * w_block_v - (input_matrix * u_g_decomposed) + error`.
+        let stage4_v_target_error =
+            PolyMatrixNorm::new(ctx.clone(), ctx.secret_size, ctx.m_g, e_mat_sigma * 6, None);
+        // Corresponds to Gaussian `error` added in stage5 target
+        // `S_g * w_block_vx + (u_g_matrix * gadget_small) + error`.
+        let stage5_vx_target_error = PolyMatrixNorm::new(
+            ctx.clone(),
+            ctx.secret_size,
+            ctx.m_g * ctx.log_base_q_small,
+            e_mat_sigma * 6,
             None,
         );
 
-        let const_term = e_times_preimage_gate_1.clone() *
-            PolyMatrixNorm::new(
-                ctx.clone(),
-                2 * ctx.m_b,
-                t_idx.nrow,
-                preimage_norm.clone(),
-                None,
-            ) *
-            t_idx +
-            e_times_preimage_gate_1 *
-                PolyMatrixNorm::new(
-                    ctx.clone(),
-                    2 * ctx.m_b,
-                    ctx.m_g,
-                    preimage_norm.clone(),
-                    None,
-                );
+        let gate2_identity_from_eb = e_b_init.clone() * &preimage_gate2_identity_from_b0;
+        let gate2_identity_from_s = s_vec.clone() * &stage2_identity_target_error;
+        let gate2_identity_total = &gate2_identity_from_eb + &gate2_identity_from_s;
+
+        let gate2_gy_from_eb = e_b_init.clone() * &preimage_gate2_gy_from_b0;
+        let gate2_gy_from_s = s_vec.clone() * &stage3_gy_target_error;
+        let gate2_gy_total = &gate2_gy_from_eb + &gate2_gy_from_s;
+
+        let gate2_v_from_eb = e_b_init.clone() * &preimage_gate2_v_from_b0;
+        let gate2_v_from_s = s_vec.clone() * &stage4_v_target_error;
+        let gate2_v_total = &gate2_v_from_eb + &gate2_v_from_s;
+
+        let gate2_vx_from_eb = e_b_init.clone() * &preimage_gate2_vx_from_b0;
+        let gate2_vx_from_s = s_vec.clone() * &stage5_vx_target_error;
+        let gate2_vx_total = &gate2_vx_from_eb + &gate2_vx_from_s;
+
+        // Corresponds to
+        // `c_b0 * (preimage_gate2_gy * gy_decomposed + preimage_gate2_v * v_idx + vx_product_acc *
+        // v_idx)`.
+        let const_term_gate2_gy_total = gate2_gy_total.clone() * gy_decomposed.clone();
+        let const_term_gate2_v_total = gate2_v_total.clone() * v_idx.clone();
+        let const_term_gate2_vx_total = gate2_vx_total.clone() * small_times_v.clone();
+        let mut const_term_gate2_t_total = const_term_gate2_gy_total.clone();
+        const_term_gate2_t_total += const_term_gate2_v_total.clone();
+        const_term_gate2_t_total += const_term_gate2_vx_total.clone();
+        // Corresponds to `c_b0 * preimage_gate2_identity`.
+        let const_term_gate2_identity_total = gate2_identity_total.clone();
+
+        // Corresponds to the stored `preimage_lut` loaded in `public_lookup`.
+        // In `ggh15_eval.rs`, `sample_lut_preimages` already samples this matrix from a target
+        // that includes identity + gy + v + vx components, and `public_lookup` subtracts
+        // `preimage_gate1 * preimage_lut` without additional multipliers.
+        let preimage_lut_total =
+            PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, preimage_norm.clone(), None);
+        // Corresponds to subtraction term
+        // `c_b0 * (preimage_gate1 * preimage_lut)` in `public_lookup`.
+        let const_term_lut_subtraction_total = gate1_error_total.clone() * preimage_lut_total;
+
+        let mut const_term = const_term_gate2_identity_total.clone();
+        const_term += const_term_gate2_t_total.clone();
+        const_term += const_term_lut_subtraction_total.clone();
         info!(
             "{}",
             format!(
@@ -241,6 +323,35 @@ impl NormPltGGH15Evaluator {
             )
         );
 
+        if dump_const_term_breakdown {
+            info!(
+                "GGH15 const term breakdown bits: gate1_total={} gate1_from_eb={} gate1_from_s={} gate2_identity_total={} gate2_identity_from_eb={} gate2_identity_from_s={} gate2_gy_total={} gate2_gy_from_eb={} gate2_gy_from_s={} gate2_v_total={} gate2_v_from_eb={} gate2_v_from_s={} gate2_vx_total={} gate2_vx_from_eb={} gate2_vx_from_s={} term_gate2_identity={} term_gate2_gy={} term_gate2_v={} term_gate2_vx={} term_gate2_t={} term_lut_subtraction={} const_total={}",
+                gate1_total_bits,
+                gate1_from_eb_bits,
+                gate1_from_s_bits,
+                matrix_norm_bits(&gate2_identity_total),
+                matrix_norm_bits(&gate2_identity_from_eb),
+                matrix_norm_bits(&gate2_identity_from_s),
+                matrix_norm_bits(&gate2_gy_total),
+                matrix_norm_bits(&gate2_gy_from_eb),
+                matrix_norm_bits(&gate2_gy_from_s),
+                matrix_norm_bits(&gate2_v_total),
+                matrix_norm_bits(&gate2_v_from_eb),
+                matrix_norm_bits(&gate2_v_from_s),
+                matrix_norm_bits(&gate2_vx_total),
+                matrix_norm_bits(&gate2_vx_from_eb),
+                matrix_norm_bits(&gate2_vx_from_s),
+                matrix_norm_bits(&const_term_gate2_identity_total),
+                matrix_norm_bits(&const_term_gate2_gy_total),
+                matrix_norm_bits(&const_term_gate2_v_total),
+                matrix_norm_bits(&const_term_gate2_vx_total),
+                matrix_norm_bits(&const_term_gate2_t_total),
+                matrix_norm_bits(&const_term_lut_subtraction_total),
+                matrix_norm_bits(&const_term)
+            );
+        }
+
+        // Corresponds to `input.vector * u_g_decomposed * v_idx` in `public_lookup`.
         let e_input_multiplier = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g) * &v_idx;
         info!(
             "{}",

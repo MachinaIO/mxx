@@ -97,10 +97,10 @@ Agents must strictly follow this lifecycle to create, execute, and complete an E
 3. Map the plan actions (the checklist in the `Progress` section) to the events introduced in `docs/verification/index.md`, enumerate which validations must run after each action, and add those validations into the plan actions. For example, if task B follows task A and validation A exists for task A's event, then update the action order as task A, validation A, task B.
 4. Execute the actions updated in step 3 in order. Record progress in the plan document created in step 2.
 5. If an unexpected event occurs while executing an action (for example, an unexpected error), add it to the `Surprises & Discoveries` section. Then update the actions and return to step 3.
-6. After completing all actions, review `docs/verification` again and run the validation corresponding to the post-ExecPlan event.
-7. Add the results of step 6 to the plan document created in step 2, then move that plan document to `docs/plans/completed`. If technical debt remains, add a corresponding document under `docs/plans/tech-debt`.
+6. After completing all actions, finalize the plan document state first: update progress/outcome sections, then move that plan document from `docs/plans/active/` to `docs/plans/completed/`. If technical debt remains, add a corresponding document under `docs/plans/tech-debt`.
+7. Review `docs/verification` again and run the validation corresponding to the post-ExecPlan event. Record the final validation results in the completed plan document, including failed commands, failure locations, and likely causes when validation fails. Then perform the final commit and push so the completed plan (and its final validation evidence) is persisted in git. If final validation fails, you must still append the failure results to the completed plan document and include that update in the final commit/push.
 
-Important: once a human or an AI agent starts a new ExecPlan lifecycle, the AI agent must not request any human response until step 7 is complete. Treat humans as a very slow external device, and assume reliance on humans will significantly delay completion.
+Important: once a human or an AI agent starts a new ExecPlan lifecycle, the AI agent must not request any human response until step 7 is complete, including the final commit/push that persists the completed plan state. Treat humans as a very slow external device, and assume reliance on humans will significantly delay completion.
 
 # Prototyping milestones and parallel implementations
 

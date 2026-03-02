@@ -10,13 +10,24 @@ Use this document after all actions in an ExecPlan are complete.
 
 ## Required actions
 
-1. Open the completed ExecPlan document and find the linked PR tracking document path.
+1. Commit the finalized ExecPlan state and push the current branch before PR-readiness checks.
+
+    Use an English commit message that clearly states the closure of the ExecPlan lifecycle.
+
+    Recommended commands:
+
+        git status --short
+        git add -A
+        git commit -m "docs: finalize execplan completion and post-validation results"
+        git push origin $(git branch --show-current)
+
+2. Open the completed ExecPlan document and find the linked PR tracking document path.
 
     Example check:
 
         rg -n "docs/prs/active/|docs/prs/completed/" docs/plans -S
 
-2. Open the referenced PR tracking document and review its metadata.
+3. Open the referenced PR tracking document and review its metadata.
 
     Confirm at least:
 
@@ -25,7 +36,7 @@ Use this document after all actions in an ExecPlan are complete.
     - commit context
     - stated PR scope/content
 
-3. Determine whether the PR scope has been achieved and is ready for review.
+4. Determine whether the PR scope has been achieved and is ready for review.
 
     Base this decision on:
 
@@ -33,7 +44,7 @@ Use this document after all actions in an ExecPlan are complete.
     - consistency between implemented changes and PR scope in the PR tracking document
     - known limitations explicitly documented in the plan
 
-4. If the PR is ready for review, transition PR and document state.
+5. If the PR is ready for review, transition PR and document state.
 
     1. Set GitHub PR to ready for review.
 
@@ -47,12 +58,13 @@ Use this document after all actions in an ExecPlan are complete.
 
         mv docs/prs/active/<pr_tracking_file>.md docs/prs/completed/<pr_tracking_file>.md
 
-5. If the PR is not ready for review, keep the PR and PR tracking document in active state.
+6. If the PR is not ready for review, keep the PR and PR tracking document in active state.
 
     Record the remaining blockers in the ExecPlan and PR tracking document so the readiness decision is auditable.
 
 ## Success criteria
 
+- Final ExecPlan-state changes are committed and pushed on the current branch before PR-readiness checks.
 - The PR tracking document linked by the ExecPlan is reviewed before readiness decision.
 - Ready/not-ready decision is explicitly recorded.
 - If ready: GitHub PR is transitioned to ready for review and PR tracking document is moved to `docs/prs/completed/`.
@@ -60,6 +72,7 @@ Use this document after all actions in an ExecPlan are complete.
 
 ## Failure triage
 
+- If commit or push fails, record the exact error, resolve the git issue (for example, conflicts or remote rejection), and retry before continuing.
 - If PR linkage is missing in the ExecPlan, add the missing PR tracking document path and re-run this event.
 - If PR state transition cannot be executed automatically, perform it in web UI and record that fallback.
 - If move command fails because path mismatch exists, locate the correct PR tracking file and update the ExecPlan reference for consistency.
@@ -67,6 +80,7 @@ Use this document after all actions in an ExecPlan are complete.
 ## Evidence to record
 
 - ExecPlan path used for this event.
+- Commit hash and push result for the final ExecPlan-state commit.
 - PR tracking document path used for this event.
 - Ready/not-ready decision rationale.
 - If ready: evidence that PR was set to ready for review and file move command/result.

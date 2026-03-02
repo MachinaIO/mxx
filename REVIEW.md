@@ -38,6 +38,7 @@ A user may identify a PR by URL, title, a file under `docs/prs/`, or a deictic r
 2. Ask the user for clarification only when confidence in PR identification is very low (approximately 10% confidence), and avoid unnecessary confirmation requests.
 3. Execute all mandatory review checks in this document.
 4. Publish the review result as a GitHub PR comment in English.
+5. After posting the first review comment, poll the PR status every 5 minutes and check whether new commits were added after that comment. If new commits are detected, return to step 3 and repeat the review cycle. Continue this loop until the PR is merged.
 
 If all checks pass, the PR comment must explicitly state that result and include benchmark results when benchmarks were part of the review.
 

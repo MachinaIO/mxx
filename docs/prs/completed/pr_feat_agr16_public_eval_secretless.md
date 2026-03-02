@@ -17,4 +17,6 @@
 - Follow-up scope: remove secret-key dependency from `Agr16Encoding` homomorphic operations as requested by reviewer/user while preserving test coverage.
 
 ## Status
-- `OPEN` and `ready for review` before follow-up commit.
+- `OPEN` and `ready for review` after follow-up commit.
+- Follow-up commit: `1e1c380`.
+- Follow-up response comment: `https://github.com/MachinaIO/mxx/pull/60#issuecomment-3985851598`.

@@ -7,7 +7,7 @@ This plan follows `PLANS.md`.
 ExecPlan start context:
 - Branch at start: `feat/agr16_encoding`
 - Commit at start: `d0cf02c3f64793badf5f6af23a0d2e5e668b0550`
-- PR tracking document: `docs/prs/active/pr_feat_agr16_public_eval_secretless.md`
+- PR tracking document: `docs/prs/completed/pr_feat_agr16_public_eval_secretless.md`
 
 Repository-document context used for this plan: `PLANS.md`, `DESIGN.md`, `docs/design/index.md`, `ARCHITECTURE.md`, `docs/architecture/index.md`, `docs/architecture/scope/index.md`, `docs/architecture/scope/agr16.md`, `VERIFICATION.md`, `docs/verification/index.md`, `docs/verification/main_execplan_pre_creation.md`, `docs/verification/cpu_behavior_changes.md`, and `docs/verification/main_execplan_post_completion.md`.
 
@@ -26,7 +26,9 @@ After this change, `Agr16Encoding` add/sub/mul operations will no longer depend 
   - `cargo +nightly fmt --all`
   - `cargo test -r --lib agr16`
   - `cargo test -r --lib`
-- [ ] Commit/push follow-up changes, move plan/tracking docs to completed, and finalize post-completion lifecycle commit.
+- [x] (2026-03-02 17:27Z) Pushed follow-up commit `1e1c380` and posted PR update comment `https://github.com/MachinaIO/mxx/pull/60#issuecomment-3985851598`.
+- [x] (2026-03-02 17:28Z) Moved this plan and PR tracking file to completed directories.
+- [x] (2026-03-02 17:30Z) Finalized post-completion lifecycle with commit/push of completed-plan state.
 
 Main-ExecPlan validation mapping (PLANS.md lifecycle step 3):
 - Action `remove secret dependency from Agr16Encoding operations` -> run `cargo test -r --lib agr16`.
@@ -51,7 +53,7 @@ Main-ExecPlan validation mapping (PLANS.md lifecycle step 3):
 
 ## Outcomes & Retrospective
 
-Implementation and verification are complete. Remaining work is lifecycle/document persistence and push.
+Implementation, verification, and lifecycle/document persistence are complete.
 
 ## Design/Architecture/Verification Document Summary
 
@@ -121,3 +123,4 @@ Executed verification results:
 No public API signatures were added. `Agr16Encoding::new` signature changed by removing secret parameter, and all call sites were updated accordingly.
 
 Revision note (2026-03-02, Codex): Initial plan created for public-evaluation secretless follow-up.
+Revision note (2026-03-02, Codex): Finalized completed-plan state after document move and lifecycle persistence commit.

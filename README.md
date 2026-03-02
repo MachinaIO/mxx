@@ -6,7 +6,7 @@ Applications of `mxx` include:
 - [Diamond iO](https://github.com/MachinaIO/diamond-io)
 
 ### Prerequisites
-- [OpenFHE](https://openfhe-development.readthedocs.io/en/latest/sphinx_rsts/intro/installation/installation.html) (System install required in `/usr/local/lib`), make sure to install our [fork](https://github.com/MachinaIO/openfhe-development/tree/feat/improve_determinant) in `/feat/improve_determinant` branch
+- [OpenFHE](https://openfhe-development.readthedocs.io/en/latest/sphinx_rsts/intro/installation/installation.html) (System install required in `usr/local/lib`), make sure to install our [fork](https://github.com/MachinaIO/openfhe-development/tree/feat/improve_determinant) in `feat/improve_determinant` branch
 
 ## Overview
 

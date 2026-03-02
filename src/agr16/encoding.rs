@@ -9,7 +9,6 @@ pub struct Agr16Encoding<M: PolyMatrix> {
     pub c_times_s: M,
     pub s_square_encoding: M,
     pub plaintext: Option<<M as PolyMatrix>::P>,
-    pub(crate) secret: <M as PolyMatrix>::P,
 }
 
 impl<M: PolyMatrix> Agr16Encoding<M> {
@@ -19,9 +18,8 @@ impl<M: PolyMatrix> Agr16Encoding<M> {
         c_times_s: M,
         s_square_encoding: M,
         plaintext: Option<<M as PolyMatrix>::P>,
-        secret: <M as PolyMatrix>::P,
     ) -> Self {
-        Self { vector, pubkey, c_times_s, s_square_encoding, plaintext, secret }
+        Self { vector, pubkey, c_times_s, s_square_encoding, plaintext }
     }
 
     pub fn concat_vector(&self, others: &[Self]) -> M {
@@ -30,21 +28,9 @@ impl<M: PolyMatrix> Agr16Encoding<M> {
 
     fn assert_compatible(&self, other: &Self) {
         assert_eq!(
-            self.secret, other.secret,
-            "AGR16 encodings must use the same secret to support multiplication"
-        );
-        assert_eq!(
             self.s_square_encoding, other.s_square_encoding,
             "AGR16 encodings must share the same E(s^2) advice encoding"
         );
-    }
-
-    fn recompute_c_times_s(
-        vector: &M,
-        pubkey: &Agr16PublicKey<M>,
-        secret: &<M as PolyMatrix>::P,
-    ) -> M {
-        (vector.clone() * secret) + (pubkey.c_times_s_pubkey.clone() * secret)
     }
 }
 
@@ -65,15 +51,8 @@ impl<M: PolyMatrix> Add<&Self> for Agr16Encoding<M> {
             (Some(a), Some(b)) => Some(a + b),
             _ => None,
         };
-        let c_times_s = Self::recompute_c_times_s(&vector, &pubkey, &self.secret);
-        Self {
-            vector,
-            pubkey,
-            c_times_s,
-            s_square_encoding: self.s_square_encoding,
-            plaintext,
-            secret: self.secret,
-        }
+        let c_times_s = self.c_times_s + &other.c_times_s;
+        Self { vector, pubkey, c_times_s, s_square_encoding: self.s_square_encoding, plaintext }
     }
 }
 
@@ -94,15 +73,8 @@ impl<M: PolyMatrix> Sub<&Self> for Agr16Encoding<M> {
             (Some(a), Some(b)) => Some(a - b),
             _ => None,
         };
-        let c_times_s = Self::recompute_c_times_s(&vector, &pubkey, &self.secret);
-        Self {
-            vector,
-            pubkey,
-            c_times_s,
-            s_square_encoding: self.s_square_encoding,
-            plaintext,
-            secret: self.secret,
-        }
+        let c_times_s = self.c_times_s - &other.c_times_s;
+        Self { vector, pubkey, c_times_s, s_square_encoding: self.s_square_encoding, plaintext }
     }
 }
 
@@ -134,15 +106,9 @@ impl<M: PolyMatrix> Mul<&Self> for Agr16Encoding<M> {
             (Some(a), Some(b)) => Some(a * b),
             _ => None,
         };
-        let c_times_s = Self::recompute_c_times_s(&vector, &pubkey, &self.secret);
+        // Publicly computable auxiliary update for subsequent multiplications.
+        let c_times_s = (self.c_times_s * &other.vector) + (self.vector * &other.c_times_s);
 
-        Self {
-            vector,
-            pubkey,
-            c_times_s,
-            s_square_encoding: self.s_square_encoding,
-            plaintext,
-            secret: self.secret,
-        }
+        Self { vector, pubkey, c_times_s, s_square_encoding: self.s_square_encoding, plaintext }
     }
 }

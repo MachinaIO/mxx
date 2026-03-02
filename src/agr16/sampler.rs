@@ -157,7 +157,6 @@ where
                     c_times_s,
                     s_square_encoding,
                     if pubkey.reveal_plaintext { Some(plaintext) } else { None },
-                    self.secret.clone(),
                 )
             })
             .collect()

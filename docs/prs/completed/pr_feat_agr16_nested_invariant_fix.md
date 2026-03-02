@@ -21,3 +21,6 @@
 
 ## Status
 - `OPEN` and `ready for review` at follow-up start.
+- Follow-up fix commit pushed: `5f02777`.
+- Review-response comment: `https://github.com/MachinaIO/mxx/pull/60#issuecomment-3986125051`.
+- PR readiness check: `gh pr ready 60` reported PR is already ready for review.

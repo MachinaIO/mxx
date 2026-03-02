@@ -7,7 +7,7 @@ This plan follows `PLANS.md`.
 ExecPlan start context:
 - Branch at start: `feat/agr16_encoding`
 - Commit at start: `8e2fe588cfe5c7b8ec9bd0a8737e2c7d99913b8d`
-- PR tracking document: `docs/prs/active/pr_feat_agr16_nested_invariant_fix.md`
+- PR tracking document: `docs/prs/completed/pr_feat_agr16_nested_invariant_fix.md`
 
 Repository-document context used for this plan: `PLANS.md`, `DESIGN.md`, `docs/design/index.md`, `ARCHITECTURE.md`, `docs/architecture/index.md`, `docs/architecture/scope/index.md`, `docs/architecture/scope/agr16.md`, `VERIFICATION.md`, `docs/verification/index.md`, `docs/verification/main_execplan_pre_creation.md`, `docs/verification/cpu_behavior_changes.md`, and `docs/verification/main_execplan_post_completion.md`.
 
@@ -29,7 +29,8 @@ After this change, AGR16 nested multiplication will keep a consistent publicly-c
   - `cargo test -r --lib`
   - `cargo test -r --lib agr16 --no-default-features --features disk` (5 consecutive runs)
 - [x] (2026-03-02 18:25Z) Repeated `cargo test -r --lib agr16` to probe prior flake report; observed one intermittent `SIGSEGV` in a 5-run loop, with surrounding retries passing.
-- [ ] Post PR response comment, finalize docs lifecycle (move active plan/PR tracking docs to completed), run post-completion event, and persist with final commit/push.
+- [x] (2026-03-02 18:28Z) Posted PR response comment (`https://github.com/MachinaIO/mxx/pull/60#issuecomment-3986125051`), confirmed PR remains ready-for-review, and moved plan/PR tracking docs to completed directories.
+- [x] (2026-03-02 18:29Z) Persisted completed-plan state with final lifecycle commit/push.
 
 Main-ExecPlan validation mapping (PLANS.md lifecycle step 3):
 - Action `implement invariant-preserving public formulas` -> run `cargo test -r --lib agr16`.
@@ -64,7 +65,7 @@ Main-ExecPlan validation mapping (PLANS.md lifecycle step 3):
 
 ## Outcomes & Retrospective
 
-Implemented and verified. Remaining work is lifecycle closure (PR comment, docs move to completed, final commit/push).
+Implemented and verified. PR #60 follow-up is complete, with one residual note: intermittent `SIGSEGV` in repeated `cargo test -r --lib agr16` runs remains reproducible (also observed before this fix path).
 
 ## Design/Architecture/Verification Document Summary
 

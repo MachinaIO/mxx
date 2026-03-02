@@ -1,23 +1,34 @@
 # Repository Guidelines
+## Meta Rules
+The following documents define *meta-rules* for how agents should create, update, and reference documents. Agents must carefully read and understand them.
 
-## Project Structure & Module Organization
-Core code lives in `src/` as a Rust library (`lib.rs`) with domain modules such as `matrix/`, `poly/`, `sampler/`, `lookup/`, `circuit/`, and `commit/`. Integration tests are in `tests/` and follow scenario-oriented files like `test_lwe_modq_arith.rs` and `test_gpu_ggh15_modq_arith.rs`. Benchmarks are in `benches/` (custom harness binaries). CUDA sources and headers are in `cuda/src` and `cuda/include`, compiled via `build.rs` when the `gpu` feature is enabled. Use `test_data/` for generated artifacts and `docs/` for design/performance notes.
+### Plans (PLANS.md)
+Read PLANS.md before starting any new task. You must write an ExecPlan following this document from design through implementation.
 
-## Build, Test, and Development Commands
-- `cargo build`: Build CPU path.
-- `cargo build --features gpu`: Build with CUDA support (`nvcc` required).
-- `cargo +nightly fmt --all --check`: CI formatting gate.
-- `cargo test -r --lib`: Run all unit tests.
-- `cargo test -r --lib --features gpu`: Run all unit tests with the `gpu` feature.
-- `cargo test -r gpu --lib --features gpu`: Run all gpu-specific unit tests with the `gpu` feature.
-- `cargo test --test test_gpu_ggh15_modq_arith --features gpu -- --nocapture`: Run a GPU integration test.
-- `cargo bench --bench bench_preimage_gpu --features gpu`: Run GPU benchmark binary.
+### Design (DESIGN.md)
+Read DESIGN.md when your change requires a non-obvious decision that should be reusable beyond each PR, e.g.:
+- you are choosing between multiple approaches with meaningful trade-offs,
+- you introduce a new interface/contract, invariant, or API behavior,
+- you add a pattern that future work should follow consistently.
+If the decision is long-lived, create/update the relevant design artifact (per DESIGN.md) and link it from your ExecPlan.
 
-## Coding Style & Naming Conventions
-Use Rust 2024 idioms and format with `rustfmt.toml` (nightly rustfmt options are used). Follow 4-space indentation and keep code rustfmt-clean before opening a PR. Naming: `snake_case` for modules/files/functions, `CamelCase` for types/traits, and `SCREAMING_SNAKE_CASE` for constants. Keep feature-gated code explicit (`#[cfg(feature = "gpu")]`) and colocated with CPU equivalents where practical.
+### Architecture (ARCHITECTURE.md)
+Read ARCHITECTURE.md before making changes that could affect code structure, e.g.:
+- moving/adding modules or domains, changing package layout, or layering,
+- adding/changing feature flags, shared infrastructure, or cross-domain dependencies,
+- introducing new external dependencies,
+- touching boundaries (e.g., FFI/CUDA, IO/storage, build integration) that rely on invariants.
 
-## Testing Guidelines (Definition of Done)
-Prefer targeted test runs first (`cargo test --test <name>`), then run all unit tests. GPU tests require GPUs and CUDA runtime. After you finish modifying cuda or gpu-specific rust codes, run all gpu-specific unit tests 300 times (outside a sandbox) by compiling the modfied codes once and then running the binary sequentially.
+### Verification (VERIFICATION.md)
+Read VERIFICATION.md before implementation to determine the required verification level and the canonical commands/checks, especially when:
+- adding new features, changing behavior, or touching performance/correctness-critical code,
+- modifying tests/CI, introducing new test categories, or changing required checks.
+Your ExecPlan must reference VERIFICATION.md and list the exact commands you ran; update VERIFICATION.md only when the *meta* verification policy itself changes.
 
-## Commit & Pull Request Guidelines
-Recent history favors short, imperative, lowercase subjects (for example: `fix device id bugs`, `cache ntt constants`). Keep commits scoped to one logical change. PRs should include: purpose, key implementation notes, commands run (`fmt`, `clippy`, tests), and environment details (CPU/GPU, CUDA arch). Attach benchmark deltas for performance-sensitive changes.
+### Review (REVIEW.md)
+Read REVIEW.md when you are asked to review a PR or to act as a reviewer.
+In reviewer mode, follow REVIEW.md as the governing policy for independent review posture, required checks, and GitHub PR comment reporting.
+
+## Global Requirements
+- All documentation in this repository, along with git commit messages and PRs, must be written in English.
+- When documenting file paths, use only paths relative to the repository top directory. Do not write absolute paths in documentation.

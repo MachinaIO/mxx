@@ -116,11 +116,13 @@ Before moving an ExecPlan from `docs/plans/active/` to `docs/plans/completed/`, 
 
 Agents must strictly follow this lifecycle to create, execute, and complete an ExecPlan.
 
-1. Before creating or updating the target plan file, choose the lifecycle target (`main ExecPlan` or `sub ExecPlan`) and run the corresponding pre-creation verification document under `docs/verification`:
-   * `main ExecPlan`: `docs/verification/main_execplan_pre_creation.md`
-   * `sub ExecPlan`: `docs/verification/sub_execplan_pre_execution.md`
-   At this point, do not create, edit, or delete files.
-2. Add a new plan document for the target ExecPlan under `docs/plans/active` in accordance with `PLANS.md`. If the target is a main ExecPlan and decomposition is needed, create one sub-plan markdown document per sub ExecPlan under `docs/plans/active`, and ensure each sub plan links the parent main ExecPlan path and names the main-plan scope it covers.
+1. Choose the lifecycle target (`main ExecPlan` or `sub ExecPlan`) and run the corresponding pre-event verification document under `docs/verification`:
+   * `main ExecPlan`: before creating or updating the main plan file, run `docs/verification/main_execplan_pre_creation.md`.
+   * `sub ExecPlan`: before executing the sub plan, run `docs/verification/sub_execplan_pre_execution.md` (this event is not for sub-plan creation).
+   While running this event, follow the file-edit restrictions defined by the selected verification document.
+2. Create or select the target plan document under `docs/plans/active`:
+   * `main ExecPlan`: add a new main-plan document in accordance with `PLANS.md`. If decomposition is needed, create one sub-plan markdown document per sub ExecPlan under `docs/plans/active`, and ensure each sub plan links the parent main ExecPlan path and names the main-plan scope it covers.
+   * `sub ExecPlan`: use the already-created sub-plan document defined by the parent main ExecPlan scope. If it does not exist yet, return to the parent main ExecPlan scope and create/link that sub-plan document before starting sub-plan execution.
 3. This step is required for main ExecPlans only. Map the main plan actions (the checklist in `Progress`) to the events introduced in `docs/verification/index.md`, enumerate which validations must run after each action, and add those validations into the main-plan actions. For validations related to sub ExecPlans, either (a) insert each validation adjacent to the corresponding sub-plan action, or (b) aggregate them into one validation step in the main ExecPlan after one or more sub ExecPlans finish.
 4. Execute the actions updated in step 3 in order and record progress in the target plan. Sub ExecPlans execute their own actions independently under their assigned scope.
 5. If an unexpected event occurs while executing an action (for example, an unexpected error), add it to the `Surprises & Discoveries` section. Then update the actions and return to step 3. "Update the actions" includes creating new sub ExecPlans when needed.

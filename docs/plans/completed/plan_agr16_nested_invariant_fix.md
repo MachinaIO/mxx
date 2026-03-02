@@ -71,11 +71,11 @@ Implemented and verified. PR #60 follow-up is complete, with one residual note: 
 
 Design documents:
 - Referenced: `DESIGN.md`, `docs/design/index.md`.
-- Planned updates: none unless a long-lived invariant contract change needs explicit design capture.
+- Modified/Created: none.
 
 Architecture documents:
 - Referenced: `ARCHITECTURE.md`, `docs/architecture/index.md`, `docs/architecture/scope/index.md`, `docs/architecture/scope/agr16.md`.
-- Planned updates: none expected (no module-boundary changes; this is intra-scope behavior correction).
+- Modified/Created: none (no module-boundary changes; this is intra-scope behavior correction).
 
 Verification documents:
 - Referenced: `VERIFICATION.md`, `docs/verification/index.md`, `docs/verification/main_execplan_pre_creation.md`, `docs/verification/cpu_behavior_changes.md`, `docs/verification/main_execplan_post_completion.md`.
@@ -133,8 +133,8 @@ Expected touched files:
 - `src/agr16/sampler.rs`
 - `src/circuit/evaluable/agr16.rs`
 - `src/agr16/mod.rs`
-- `docs/prs/active/pr_feat_agr16_nested_invariant_fix.md`
-- `docs/plans/active/plan_agr16_nested_invariant_fix.md`
+- `docs/prs/completed/pr_feat_agr16_nested_invariant_fix.md`
+- `docs/plans/completed/plan_agr16_nested_invariant_fix.md`
 
 ## Interfaces and Dependencies
 

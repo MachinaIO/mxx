@@ -72,7 +72,7 @@ mod tests {
         let tag_bytes = tag.to_le_bytes();
 
         let pubkey_sampler =
-            AGR16PublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, 1);
+            AGR16PublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, 2);
         let reveal_plaintexts = vec![true; input_size];
         let pubkeys = pubkey_sampler.sample(params, &tag_bytes, &reveal_plaintexts);
 
@@ -90,13 +90,52 @@ mod tests {
         DCRTPolyMatrix::from_poly_vec_row(params, vec![value])
     }
 
+    fn assert_primary_auxiliary_invariants(
+        encoding: &Agr16Encoding<DCRTPolyMatrix>,
+        secret: &DCRTPoly,
+    ) {
+        let expected_c_times_s = (encoding.pubkey.c_times_s_pubkey.clone() * secret) +
+            (encoding.vector.clone() * secret);
+        assert_eq!(encoding.c_times_s, expected_c_times_s, "AGR16 c_times_s invariant must hold");
+    }
+
+    fn assert_full_auxiliary_invariants(
+        params: &DCRTPolyParams,
+        encoding: &Agr16Encoding<DCRTPolyMatrix>,
+        secret: &DCRTPoly,
+    ) {
+        let secret_matrix = scalar_matrix(params, secret.clone());
+        assert_primary_auxiliary_invariants(encoding, secret);
+        let expected_c_times_s_times_s = (encoding.pubkey.c_times_s_times_s_pubkey.clone() *
+            secret) +
+            (encoding.c_times_s.clone() * secret);
+        assert_eq!(
+            encoding.c_times_s_times_s, expected_c_times_s_times_s,
+            "AGR16 c_times_s_times_s invariant must hold"
+        );
+
+        let expected_s_square =
+            (encoding.pubkey.s_square_pubkey.clone() * secret) + (secret_matrix.clone() * secret);
+        assert_eq!(
+            encoding.s_square_encoding, expected_s_square,
+            "AGR16 E(s^2) advice invariant must hold"
+        );
+
+        let expected_s_square_times_s = (encoding.pubkey.s_square_times_s_pubkey.clone() * secret) +
+            (encoding.s_square_encoding.clone() * secret);
+        assert_eq!(
+            encoding.s_square_times_s_encoding, expected_s_square_times_s,
+            "AGR16 E(E(s^2) * s) advice invariant must hold"
+        );
+    }
+
     #[test]
     fn test_agr16_sampling_satisfies_equation_5_1_without_error() {
         let params = DCRTPolyParams::default();
         let input_size = 3;
         let (pubkeys, encodings, plaintexts, secret) = sample_fixture(input_size, &params);
 
-        let secret_matrix = scalar_matrix(&params, secret);
+        let secret_matrix = scalar_matrix(&params, secret.clone());
 
         // Slot 0 is the constant-1 encoding.
         let all_plaintexts = [&[DCRTPoly::const_one(&params)], plaintexts.as_slice()].concat();
@@ -107,6 +146,7 @@ mod tests {
                 encodings[idx].vector, expected,
                 "AGR16 base encoding must satisfy Equation 5.1 with zero injected error"
             );
+            assert_full_auxiliary_invariants(&params, &encodings[idx], &secret);
         }
     }
 
@@ -142,19 +182,20 @@ mod tests {
             plaintexts[2].clone() +
             plaintexts[0].clone();
 
-        assert_eq!(enc_out.pubkey.matrix, pk_out.matrix);
+        assert_eq!(enc_out.pubkey, *pk_out);
 
-        let expected_ct = (scalar_matrix(&params, secret) * pk_out.matrix.clone()) +
+        let expected_ct = (scalar_matrix(&params, secret.clone()) * pk_out.matrix.clone()) +
             scalar_matrix(&params, expected_plain.clone());
         assert_eq!(
             enc_out.vector, expected_ct,
             "Evaluated AGR16 ciphertext must satisfy Equation 5.1 when error=0"
         );
+        assert_primary_auxiliary_invariants(enc_out, &secret);
         assert_eq!(enc_out.plaintext, Some(expected_plain));
     }
 
     #[test]
-    fn test_agr16_nested_multiplication_public_eval_without_secret_dependency() {
+    fn test_agr16_nested_multiplication_preserves_equation_5_1_without_error() {
         let params = DCRTPolyParams::default();
         let (pubkeys, encodings, plaintexts, secret) = sample_fixture(3, &params);
 
@@ -185,12 +226,14 @@ mod tests {
             plaintexts[2].clone()) *
             plaintexts[1].clone();
 
-        assert_eq!(enc_out.pubkey.matrix, pk_out.matrix);
+        assert_eq!(enc_out.pubkey, *pk_out);
 
-        // For higher-depth multiplication, this module keeps evaluation public by propagating
-        // only publicly available auxiliary encodings (without using the secret key).
-        // We still require plaintext correctness and key/ciphertext structure alignment.
-        let _ = secret;
+        let expected_ct = (scalar_matrix(&params, secret.clone()) * pk_out.matrix.clone()) +
+            scalar_matrix(&params, expected_plain.clone());
+        assert_eq!(
+            enc_out.vector, expected_ct,
+            "Nested AGR16 multiplication output must satisfy Equation 5.1 when error=0"
+        );
         assert_eq!(enc_out.plaintext, Some(expected_plain));
     }
 

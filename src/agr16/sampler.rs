@@ -63,10 +63,26 @@ where
             input_size,
             DistType::FinRingDist,
         );
+        let c_times_s_times_s_labels = sampler.sample_hash(
+            params,
+            self.hash_key,
+            tagged_bytes(tag, b"ctss_pk", self.d),
+            1,
+            input_size,
+            DistType::FinRingDist,
+        );
         let s_square_pubkey = sampler.sample_hash(
             params,
             self.hash_key,
             tagged_bytes(tag, b"s2_pk", self.d),
+            1,
+            1,
+            DistType::FinRingDist,
+        );
+        let s_square_times_s_pubkey = sampler.sample_hash(
+            params,
+            self.hash_key,
+            tagged_bytes(tag, b"s2s_pk", self.d),
             1,
             1,
             DistType::FinRingDist,
@@ -78,7 +94,9 @@ where
                 Agr16PublicKey::new(
                     labels.slice_columns(idx, idx + 1),
                     c_times_s_labels.slice_columns(idx, idx + 1),
+                    c_times_s_times_s_labels.slice_columns(idx, idx + 1),
                     s_square_pubkey.clone(),
+                    s_square_times_s_pubkey.clone(),
                     reveal_plaintext,
                 )
             })
@@ -148,14 +166,21 @@ where
                 let vector = (secret_matrix.clone() * &pubkey.matrix) + message + error;
                 let c_times_s = (pubkey.c_times_s_pubkey.clone() * &self.secret) +
                     (vector.clone() * &self.secret);
+                let c_times_s_times_s = (pubkey.c_times_s_times_s_pubkey.clone() * &self.secret) +
+                    (c_times_s.clone() * &self.secret);
                 let s_square_encoding = (pubkey.s_square_pubkey.clone() * &self.secret) +
                     (secret_matrix.clone() * &self.secret);
+                let s_square_times_s_encoding = (pubkey.s_square_times_s_pubkey.clone() *
+                    &self.secret) +
+                    (s_square_encoding.clone() * &self.secret);
 
                 Agr16Encoding::new(
                     vector,
                     pubkey.clone(),
                     c_times_s,
+                    c_times_s_times_s,
                     s_square_encoding,
+                    s_square_times_s_encoding,
                     if pubkey.reveal_plaintext { Some(plaintext) } else { None },
                 )
             })

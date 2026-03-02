@@ -7,7 +7,9 @@ pub struct Agr16Encoding<M: PolyMatrix> {
     pub vector: M,
     pub pubkey: Agr16PublicKey<M>,
     pub c_times_s: M,
+    pub c_times_s_times_s: M,
     pub s_square_encoding: M,
+    pub s_square_times_s_encoding: M,
     pub plaintext: Option<<M as PolyMatrix>::P>,
 }
 
@@ -16,10 +18,20 @@ impl<M: PolyMatrix> Agr16Encoding<M> {
         vector: M,
         pubkey: Agr16PublicKey<M>,
         c_times_s: M,
+        c_times_s_times_s: M,
         s_square_encoding: M,
+        s_square_times_s_encoding: M,
         plaintext: Option<<M as PolyMatrix>::P>,
     ) -> Self {
-        Self { vector, pubkey, c_times_s, s_square_encoding, plaintext }
+        Self {
+            vector,
+            pubkey,
+            c_times_s,
+            c_times_s_times_s,
+            s_square_encoding,
+            s_square_times_s_encoding,
+            plaintext,
+        }
     }
 
     pub fn concat_vector(&self, others: &[Self]) -> M {
@@ -30,6 +42,10 @@ impl<M: PolyMatrix> Agr16Encoding<M> {
         assert_eq!(
             self.s_square_encoding, other.s_square_encoding,
             "AGR16 encodings must share the same E(s^2) advice encoding"
+        );
+        assert_eq!(
+            self.s_square_times_s_encoding, other.s_square_times_s_encoding,
+            "AGR16 encodings must share the same E(E(s^2) * s) advice encoding"
         );
     }
 }
@@ -52,7 +68,16 @@ impl<M: PolyMatrix> Add<&Self> for Agr16Encoding<M> {
             _ => None,
         };
         let c_times_s = self.c_times_s + &other.c_times_s;
-        Self { vector, pubkey, c_times_s, s_square_encoding: self.s_square_encoding, plaintext }
+        let c_times_s_times_s = self.c_times_s_times_s + &other.c_times_s_times_s;
+        Self {
+            vector,
+            pubkey,
+            c_times_s,
+            c_times_s_times_s,
+            s_square_encoding: self.s_square_encoding,
+            s_square_times_s_encoding: self.s_square_times_s_encoding,
+            plaintext,
+        }
     }
 }
 
@@ -74,7 +99,16 @@ impl<M: PolyMatrix> Sub<&Self> for Agr16Encoding<M> {
             _ => None,
         };
         let c_times_s = self.c_times_s - &other.c_times_s;
-        Self { vector, pubkey, c_times_s, s_square_encoding: self.s_square_encoding, plaintext }
+        let c_times_s_times_s = self.c_times_s_times_s - &other.c_times_s_times_s;
+        Self {
+            vector,
+            pubkey,
+            c_times_s,
+            c_times_s_times_s,
+            s_square_encoding: self.s_square_encoding,
+            s_square_times_s_encoding: self.s_square_times_s_encoding,
+            plaintext,
+        }
     }
 }
 
@@ -95,10 +129,12 @@ impl<M: PolyMatrix> Mul<&Self> for Agr16Encoding<M> {
 
         // Section 5 Eq. (5.24)-style ciphertext multiplication.
         let first_term = self.vector.clone() * &other.vector;
-        let uu = self.pubkey.matrix.clone() * &other.pubkey.matrix;
-        let second_term = uu * &self.s_square_encoding;
-        let third_term = other.pubkey.matrix.clone() * &self.c_times_s;
-        let fourth_term = self.pubkey.matrix.clone() * &other.c_times_s;
+        let left_matrix = self.pubkey.matrix.clone();
+        let right_matrix = other.pubkey.matrix.clone();
+        let uu = left_matrix.clone() * &right_matrix;
+        let second_term = uu.clone() * &self.s_square_encoding;
+        let third_term = right_matrix.clone() * &self.c_times_s;
+        let fourth_term = left_matrix.clone() * &other.c_times_s;
         let vector = first_term + second_term - third_term - fourth_term;
 
         let pubkey = self.pubkey * &other.pubkey;
@@ -106,9 +142,24 @@ impl<M: PolyMatrix> Mul<&Self> for Agr16Encoding<M> {
             (Some(a), Some(b)) => Some(a * b),
             _ => None,
         };
-        // Publicly computable auxiliary update for subsequent multiplications.
-        let c_times_s = (self.c_times_s * &other.vector) + (self.vector * &other.c_times_s);
+        // Publicly computable update matched to the key-side auxiliary transition.
+        let c_times_s = (self.vector.clone() * &other.c_times_s) -
+            (self.c_times_s.clone() * &other.pubkey.c_times_s_pubkey) +
+            (uu * &self.s_square_times_s_encoding) -
+            (right_matrix * &self.c_times_s_times_s) -
+            (left_matrix * &other.c_times_s_times_s);
+        // Best-effort propagation for the second auxiliary chain level.
+        let c_times_s_times_s =
+            (self.c_times_s_times_s * &other.vector) + (self.vector * &other.c_times_s_times_s);
 
-        Self { vector, pubkey, c_times_s, s_square_encoding: self.s_square_encoding, plaintext }
+        Self {
+            vector,
+            pubkey,
+            c_times_s,
+            c_times_s_times_s,
+            s_square_encoding: self.s_square_encoding,
+            s_square_times_s_encoding: self.s_square_times_s_encoding,
+            plaintext,
+        }
     }
 }

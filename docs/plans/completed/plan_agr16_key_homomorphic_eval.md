@@ -7,7 +7,7 @@ This plan follows `PLANS.md`.
 ExecPlan start context:
 - Branch at start: `feat/agr16_encoding`
 - Commit at start: `cdeb008389b69ebda0d867856dbee20601bf7779`
-- PR tracking document: `docs/prs/active/pr_feat_agr16_encoding.md`
+- PR tracking document: `docs/prs/completed/pr_feat_agr16_encoding.md`
 
 Repository-document context used for this plan: `PLANS.md`, `DESIGN.md`, `docs/design/index.md`, `ARCHITECTURE.md`, `docs/architecture/index.md`, `docs/architecture/scope/index.md`, `docs/architecture/scope/bgg.md`, `docs/architecture/scope/root_modules.md`, `VERIFICATION.md`, `docs/verification/index.md`, `docs/verification/main_execplan_pre_creation.md`, `docs/verification/cpu_behavior_changes.md`, and `docs/verification/main_execplan_post_completion.md`.
 
@@ -29,7 +29,10 @@ After this change, the repository will include a new `src/agr16` module that imp
   - `cargo +nightly fmt --all`
   - scope-targeted tests for `agr16`/`circuit::evaluable::agr16`
   - `cargo test -r --lib` (feature completion and foundational module addition)
-- [ ] Create draft PR once branch has implementation commits, then finalize plan sections, move plan to `docs/plans/completed/`, run `docs/verification/main_execplan_post_completion.md` (set PR ready if scope complete, move PR tracking doc to `docs/prs/completed/`), and perform final commit/push.
+- [x] (2026-03-02 16:12Z) Created draft PR `https://github.com/MachinaIO/mxx/pull/60` and updated PR tracking metadata (`docs/prs/active/pr_feat_agr16_encoding.md`).
+- [x] (2026-03-02 16:12Z) Moved this plan to `docs/plans/completed/` after implementation and verification were finalized.
+- [x] (2026-03-02 16:12Z) Executed post-ExecPlan verification from `docs/verification/main_execplan_post_completion.md`: PR scope reviewed as complete, PR `#60` set to ready for review, and PR tracking file moved to `docs/prs/completed/pr_feat_agr16_encoding.md`.
+- [x] (2026-03-02 16:13Z) Persisted post-completion state in git with final commit/push.
 
 Main-ExecPlan validation mapping (PLANS.md lifecycle step 3):
 - Action `Implement new src/agr16 module` -> event `cpu_behavior_changes.md`: run fmt + scoped unit tests after implementation.
@@ -70,7 +73,7 @@ Main-ExecPlan validation mapping (PLANS.md lifecycle step 3):
 
 Implemented the AGR16 module end-to-end (`src/agr16/*` + `Evaluable` wiring + circuit tests). The new tests demonstrate Section 5.1 behavior in zero-error mode for sampled encodings and for circuit-evaluated outputs, including nested multiplication.
 
-Remaining lifecycle work is operational: create/update draft PR after committing branch diff, close post-completion verification event, and persist final state (commit/push + move plan/PR tracking docs).
+Post-completion lifecycle actions are complete. PR `#60` is open and ready for review with tracking moved to completed state.
 
 ## Design/Architecture/Verification Document Summary
 
@@ -152,6 +155,9 @@ Commands executed during implementation/verification:
     cargo test -r --lib circuit::evaluable::agr16
     cargo test -r --lib
     cargo +nightly fmt --all
+    gh pr create --draft --title "feat: add AGR16 key-homomorphic evaluation module" --body-file /tmp/pr_body_agr16.md
+    gh pr ready
+    mv docs/prs/active/pr_feat_agr16_encoding.md docs/prs/completed/pr_feat_agr16_encoding.md
 
 ## Validation and Acceptance
 
@@ -179,8 +185,8 @@ Planned artifact files:
 
 Current evidence snapshot:
 - Branch: `feat/agr16_encoding`
-- Pre-creation PR state: no branch PR yet
-- PR tracking file: `docs/prs/active/pr_feat_agr16_encoding.md`
+- PR: `https://github.com/MachinaIO/mxx/pull/60` (`OPEN`, `ready for review`)
+- PR tracking file: `docs/prs/completed/pr_feat_agr16_encoding.md`
 - Verification snapshot:
   - `cargo test -r --lib agr16`: pass (`3 passed`)
   - `cargo test -r --lib circuit::evaluable::agr16`: pass (`0 tests`, compile/selection check)
@@ -205,3 +211,4 @@ Dependencies reused:
 
 Revision note (2026-03-02, Codex): Initial plan created with pre-creation evidence, validation mapping, and implementation milestones.
 Revision note (2026-03-02, Codex): Updated progress with implemented AGR16 code/docs, recorded verification outcomes, and captured compile-time discoveries/decisions.
+Revision note (2026-03-02, Codex): Recorded post-ExecPlan readiness transition (`gh pr ready`), moved PR tracking file to completed, and updated plan state after move to `docs/plans/completed/`.

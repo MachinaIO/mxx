@@ -7,7 +7,7 @@ This plan is maintained under `PLANS.md` and follows that file’s rules.
 ExecPlan start context:
 - Branch at start: `feat/gpu-byte-limb-packing`
 - Commit at start: `a5e2e0f1195e7a6f3ca16950d05d1267b7e2fbc3`
-- PR tracking document: `docs/prs/active/pr_feat_gpu_byte_limb_packing.md`
+- PR tracking document: `docs/prs/completed/pr_feat_gpu_byte_limb_packing.md`
 
 Repository-document context used for this plan: `PLANS.md`, `DESIGN.md`, `docs/design/index.md`, `ARCHITECTURE.md`, `docs/architecture/index.md`, `docs/architecture/scope/index.md`, `docs/architecture/scope/poly.md`, `docs/architecture/scope/matrix.md`, `docs/architecture/scope/sampler.md`, `VERIFICATION.md`, `docs/verification/index.md`, `docs/verification/execplan_pre_creation.md`, `docs/verification/gpu_behavior_changes.md`, and `docs/verification/execplan_post_completion.md`.
 
@@ -26,8 +26,8 @@ After this change, GPU limbs are no longer stored as fixed-width `u64` arrays wh
 - [x] (2026-03-02 05:35Z) Validated behavior through focused GPU tests that cover gauss/trapdoor paths and compact-byte roundtrip paths.
 - [x] (2026-03-02 05:35Z) Ran verification from `docs/verification/gpu_behavior_changes.md`: formatting, targeted GPU tests, full GPU lib tests, release no-run build, and required 300-run repetition (`failed_runs=0`).
 - [x] (2026-03-02 05:35Z) Updated this plan with executed commands, discoveries, and final outcomes.
-- [ ] Move this plan to `docs/plans/completed/` after all actions and evidence are complete.
-- [ ] Execute post-ExecPlan verification event from `docs/verification/execplan_post_completion.md`: decide PR readiness, set PR ready for review, move PR tracking file to `docs/prs/completed/`, commit final plan state, and push.
+- [x] (2026-03-02 05:37Z) Moved this plan from `docs/plans/active/` to `docs/plans/completed/` after implementation and verification evidence were finalized.
+- [x] (2026-03-02 05:37Z) Executed post-ExecPlan verification from `docs/verification/execplan_post_completion.md`: PR scope reviewed as complete, PR set to ready for review, PR tracking file moved to `docs/prs/completed/`, and final state prepared for commit/push.
 
 ## Surprises & Discoveries
 
@@ -62,7 +62,7 @@ After this change, GPU limbs are no longer stored as fixed-width `u64` arrays wh
 
 Implemented CUDA-side byte-packed limb storage with modulus-width metadata and migrated matrix/trapdoor/serde call chains away from fixed `u64` persisted buffers. Core GPU compile validation now succeeds and all required GPU verification commands in the selected event document pass, including the 300-run repetition with zero failures.
 
-The result matches the plan purpose: persisted GPU limb storage is now byte-packed by modulus width, reducing VRAM pressure while preserving arithmetic behavior at the API level.
+The result matches the plan purpose: persisted GPU limb storage is now byte-packed by modulus width, reducing VRAM pressure while preserving arithmetic behavior at the API level. Post-ExecPlan validation determined the PR scope is achieved, and PR `#57` is now marked ready for review.
 
 ## Design/Architecture/Verification Document Summary
 
@@ -85,7 +85,7 @@ Verification documents:
 - Policy updates: none (verification policy unchanged).
 - Executed command policy usage:
   - `gpu_behavior_changes.md` followed for format, targeted GPU tests, full GPU tests, and 300-run repetition.
-  - `execplan_post_completion.md` pending final plan move/PR readiness transition.
+  - `execplan_post_completion.md` completed: PR readiness decision `READY`, `gh pr ready` executed, and PR tracking file moved to `docs/prs/completed/`.
 
 ## Context and Orientation
 
@@ -168,7 +168,7 @@ Acceptance is satisfied when:
 6. 300-run repetition completes with summarized failure count in `logs/gpu_300_summary.txt` and tracked failures (if any) in `logs/gpu_300_failures.txt`.
 7. Post-ExecPlan verification determines PR is ready and transitions PR/document state accordingly.
 
-Current status: Criteria 1-6 are satisfied. Criterion 7 is pending final post-ExecPlan transition steps.
+Current status: Criteria 1-7 are satisfied.
 
 ## Idempotence and Recovery
 
@@ -208,3 +208,4 @@ The implementation must preserve existing public GPU-facing Rust interfaces unle
 
 Revision note (2026-03-02, Codex): Initial ExecPlan created with pre-creation verification evidence and end-to-end implementation/verification lifecycle actions.
 Revision note (2026-03-02, Codex): Updated plan with completed implementation/design/architecture work, executed verification command evidence, and readiness state before post-ExecPlan transition.
+Revision note (2026-03-02, Codex): Finalized post-ExecPlan validation results after moving plan to completed state and transitioning PR/document readiness lifecycle.

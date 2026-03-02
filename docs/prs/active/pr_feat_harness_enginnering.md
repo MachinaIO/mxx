@@ -1,20 +1,21 @@
 # PR Tracking: feat/harness_enginnering
 
 ## PR Link
-- Unknown at this time (GitHub CLI unavailable locally; verify in GitHub UI).
+- https://github.com/MachinaIO/mxx/pull/56
 
 ## PR Creation Date
-- Unknown at this time (to be updated when PR is confirmed/created).
+- 2026-03-02T03:24:58Z
 
 ## Branch
 - `feat/harness_enginnering`
 
-## Commit at Tracking-Doc Creation
-- `2c202a2`
+## Commit at PR Creation
+- `a529d2e79dd2d756212acdbcb36c9a15ea246851`
 
 ## PR Content Summary
-- Documentation governance and execution-harness policy updates, including plans/architecture/verification rule alignment and verification event expansions.
+- Title: `init documents for ai agents`
+- Draft PR from `feat/harness_enginnering` into `main`
+- Scope: documentation governance and execution-harness policy updates, including plans/architecture/verification rule alignment and verification event expansions.
 
 ## Status
-- Branch/PR reuse for ongoing documentation policy work.
-- PR metadata requires manual confirmation/update in GitHub UI.
+- `OPEN` and draft (`ready for review` not yet requested).

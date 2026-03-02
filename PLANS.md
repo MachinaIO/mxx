@@ -6,7 +6,7 @@ This document describes the requirements for an execution plan ("ExecPlan"), a d
 
 When authoring an executable specification (ExecPlan), follow PLANS.md _to the letter_. If it is not in your context, refresh your memory by reading the entire PLANS.md file. Be thorough in reading (and re-reading) source material to produce an accurate specification. When creating a spec, start from the skeleton and flesh it out as you do your research.
 
-When implementing an executable specification (ExecPlan), do not prompt the user for "next steps"; simply proceed to the next milestone. Keep all sections up to date, add or split entries in the list at every stopping point to affirmatively state the progress made and next steps. Resolve ambiguities autonomously, and commit frequently. Do not request human confirmation until the ExecPlan Lifecycle defined below is complete.
+When implementing an executable specification (ExecPlan), do not prompt the user for "next steps"; simply proceed to the next milestone. Keep all sections up to date, add or split entries in the list at every stopping point to affirmatively state the progress made and next steps. Resolve ambiguities autonomously, and commit frequently. Do not request human confirmation until the ExecPlan Lifecycle defined below is complete. If you are executing a sub ExecPlan, report outcomes back to its parent main ExecPlan instead of asking the user for instructions.
 
 When discussing an executable specification (ExecPlan), record decisions in a log in the spec for posterity; it should be unambiguously clear why any change to the specification was made. ExecPlans are living documents, and it should always be possible to restart from _only_ the ExecPlan and no other work.
 
@@ -74,6 +74,28 @@ When creating a new plan markdown file, place it by status:
 
 Any markdown file in `docs/plans/tech-debt/` must include links to the related plan markdown files (for example, active or completed plans that introduced, mitigated, or depend on that debt). The links must be explicit repository-relative markdown links so a reader can navigate directly.
 
+## Main and Sub ExecPlans
+
+An ExecPlan that owns the end-to-end objective is called a `main ExecPlan`. A plan created by decomposing part of that objective is called a `sub ExecPlan`.
+
+When a created ExecPlan is large, agents are encouraged to decompose it into multiple sub ExecPlans. A large plan means the scope is too broad to execute reliably as one context, especially when progress tracking, validation mapping, or implementation detail would become difficult to maintain in one document.
+
+Each sub ExecPlan must have its own markdown plan document under `docs/plans/active/`. Every such sub-plan document must include:
+
+* a repository-relative link to its parent main ExecPlan file,
+* an explicit statement of which part of the main ExecPlan it corresponds to (for example, which action, milestone, or scoped output),
+* enough bounded scope that one sub agent can reasonably complete it within one context window.
+
+The `Progress` section in the main ExecPlan must do more than list sub plans. It must explicitly describe execution topology:
+
+* which sub ExecPlans are parallelizable,
+* which sub ExecPlans must be processed sequentially and in what order,
+* when multiple sub-agent types are available, which sub-agent type is assigned to each sub ExecPlan.
+
+Here, “parallelizable” means the sub ExecPlans can be executed by separate sub agents with isolated context windows and no required communication between those sub agents until the individual sub plans are completed.
+
+Each sub ExecPlan independently follows the ExecPlan lifecycle. After finishing, the sub agent must autonomously report results back to the parent main ExecPlan scope and terminate without requesting a human response.
+
 ## How ExecPlans must use design, architecture, and verification documents
 
 Each ExecPlan must explicitly describe how it handled design, architecture, and verification guidance from `AGENTS.md`.
@@ -92,15 +114,20 @@ Before moving an ExecPlan from `docs/plans/active/` to `docs/plans/completed/`, 
 
 Agents must strictly follow this lifecycle to create, execute, and complete an ExecPlan.
 
-1. Follow the validation document under `docs/verification` that corresponds to the pre-ExecPlan event. At this point, do not create, edit, or delete any files.
-2. Add a new plan document for the ExecPlan under `docs/plans/active`. Create the new plan there in accordance with `PLANS.md`.
-3. Map the plan actions (the checklist in the `Progress` section) to the events introduced in `docs/verification/index.md`, enumerate which validations must run after each action, and add those validations into the plan actions. For example, if task B follows task A and validation A exists for task A's event, then update the action order as task A, validation A, task B.
-4. Execute the actions updated in step 3 in order. Record progress in the plan document created in step 2.
-5. If an unexpected event occurs while executing an action (for example, an unexpected error), add it to the `Surprises & Discoveries` section. Then update the actions and return to step 3.
-6. After completing all actions, finalize the plan document state first: update progress/outcome sections, then move that plan document from `docs/plans/active/` to `docs/plans/completed/`. If technical debt remains, add a corresponding document under `docs/plans/tech-debt`.
-7. Review `docs/verification` again and run the validation corresponding to the post-ExecPlan event. Record the final validation results in the completed plan document, including failed commands, failure locations, and likely causes when validation fails. Then perform the final commit and push so the completed plan (and its final validation evidence) is persisted in git. If final validation fails, you must still append the failure results to the completed plan document and include that update in the final commit/push.
+1. Before creating or updating the target plan file, choose the lifecycle target (`main ExecPlan` or `sub ExecPlan`) and run the corresponding pre-creation verification document under `docs/verification`:
+   * `main ExecPlan`: `docs/verification/main_execplan_pre_creation.md`
+   * `sub ExecPlan`: `docs/verification/sub_execplan_pre_creation.md`
+   At this point, do not create, edit, or delete files.
+2. Add a new plan document for the target ExecPlan under `docs/plans/active` in accordance with `PLANS.md`. If the target is a main ExecPlan and decomposition is needed, create one sub-plan markdown document per sub ExecPlan under `docs/plans/active`, and ensure each sub plan links the parent main ExecPlan path and names the main-plan scope it covers.
+3. This step is required for main ExecPlans only. Map the main plan actions (the checklist in `Progress`) to the events introduced in `docs/verification/index.md`, enumerate which validations must run after each action, and add those validations into the main-plan actions. For validations related to sub ExecPlans, either (a) insert each validation adjacent to the corresponding sub-plan action, or (b) aggregate them into one validation step in the main ExecPlan after one or more sub ExecPlans finish.
+4. Execute the actions updated in step 3 in order and record progress in the target plan. Sub ExecPlans execute their own actions independently under their assigned scope.
+5. If an unexpected event occurs while executing an action (for example, an unexpected error), add it to the `Surprises & Discoveries` section. Then update the actions and return to step 3. "Update the actions" includes creating new sub ExecPlans when needed.
+6. After completing all actions for the target plan, finalize that plan document state first: update progress/outcome sections, then move that plan document from `docs/plans/active/` to `docs/plans/completed/`. If technical debt remains, add a corresponding document under `docs/plans/tech-debt`.
+7. Run post-completion verification using the document that matches the target plan type:
+   * `main ExecPlan`: run `docs/verification/main_execplan_post_completion.md`, record final validation results in the completed main plan document (including failed commands, failure locations, and likely causes when validation fails), then perform the final commit and push so completed-plan state and final evidence are persisted in git. If final validation fails, still append failure results and include them in the final commit/push.
+   * `sub ExecPlan`: run `docs/verification/sub_execplan_post_completion.md`, then return to the corresponding main ExecPlan scope and update the main plan `Progress` (and related sections when needed) with the sub-plan outcome. After this report, the sub agent must terminate without requesting user response.
 
-Important: once a human or an AI agent starts a new ExecPlan lifecycle, the AI agent must not request any human response until step 7 is complete, including the final commit/push that persists the completed plan state. Treat humans as a very slow external device, and assume reliance on humans will significantly delay completion.
+Important: once a human or an AI agent starts a new ExecPlan lifecycle, the AI agent must not request any human response until step 7 is complete for the current plan target. For main ExecPlans, completion includes the final commit/push that persists completed-plan state. For sub ExecPlans, completion includes reporting back into the corresponding main ExecPlan scope. Treat humans as a very slow external device, and assume reliance on humans will significantly delay completion.
 
 # Prototyping milestones and parallel implementations
 
@@ -129,6 +156,8 @@ Prefer additive code changes followed by subtractions that keep tests passing. P
     - [ ] Example partially completed step (completed: X; remaining: Y).
 
     Use timestamps to measure rates of progress.
+
+    If the plan is a main ExecPlan that uses sub ExecPlans, each `Progress` action must also state whether the sub plans are parallel or sequential, the required order for sequential work, and the assigned sub-agent type when multiple sub-agent types exist.
 
     ## Surprises & Discoveries
 

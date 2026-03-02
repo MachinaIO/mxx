@@ -1,16 +1,18 @@
-# Event: After ExecPlan Completion
+# Event: After Main ExecPlan Completion
 
-Use this document after all actions in an ExecPlan are complete.
+Use this document after all actions in a `main ExecPlan` are complete.
+
+If you are closing a `sub ExecPlan`, use `docs/verification/sub_execplan_post_completion.md` instead.
 
 ## Preconditions
 
 - Working directory: repository root (`.`).
-- The target ExecPlan document is already updated to completed state.
-- The ExecPlan document includes a repository-relative path to the corresponding PR tracking document.
+- The target main ExecPlan document is already updated to completed state.
+- The main ExecPlan document includes a repository-relative path to the corresponding PR tracking document.
 
 ## Required actions
 
-1. Open the completed ExecPlan document and find the linked PR tracking document path.
+1. Open the completed main ExecPlan document and find the linked PR tracking document path.
 
     Example check:
 
@@ -29,7 +31,7 @@ Use this document after all actions in an ExecPlan are complete.
 
     Base this decision on:
 
-    - ExecPlan completion status (`Progress`, `Outcomes & Retrospective`, validation results)
+    - main ExecPlan completion status (`Progress`, `Outcomes & Retrospective`, validation results)
     - consistency between implemented changes and PR scope in the PR tracking document
     - known limitations explicitly documented in the plan
 
@@ -64,24 +66,24 @@ Use this document after all actions in an ExecPlan are complete.
 
 ## Success criteria
 
-- The PR tracking document linked by the ExecPlan is reviewed before readiness decision.
+- The PR tracking document linked by the main ExecPlan is reviewed before readiness decision.
 - Ready/not-ready decision is explicitly recorded.
 - If ready: GitHub PR is transitioned to ready for review and PR tracking document is moved to `docs/prs/completed/`.
 - If not ready: PR remains non-ready and PR tracking document remains under `docs/prs/active/` with blockers recorded.
-- Final ExecPlan-state changes (including post-ExecPlan validation evidence) are committed and pushed as the last step.
+- Final main-ExecPlan state changes (including post-ExecPlan validation evidence) are committed and pushed as the last step.
 
 ## Failure triage
 
-- If PR linkage is missing in the ExecPlan, add the missing PR tracking document path and re-run this event.
+- If PR linkage is missing in the main ExecPlan, add the missing PR tracking document path and re-run this event.
 - If PR state transition cannot be executed automatically, perform it in web UI and record that fallback.
-- If move command fails because path mismatch exists, locate the correct PR tracking file and update the ExecPlan reference for consistency.
+- If move command fails because path mismatch exists, locate the correct PR tracking file and update the main ExecPlan reference for consistency.
 - If commit or push fails at the final persistence step, record the exact error, resolve the git issue (for example, conflicts or remote rejection), and retry.
 
 ## Evidence to record
 
-- ExecPlan path used for this event.
+- Main ExecPlan path used for this event.
 - PR tracking document path used for this event.
 - Ready/not-ready decision rationale.
 - If ready: evidence that PR was set to ready for review and file move command/result.
 - If not ready: blocker list and next required actions.
-- Commit hash and push result for the final ExecPlan-state commit that persists post-ExecPlan validation evidence.
+- Commit hash and push result for the final commit that persists main-ExecPlan post-validation evidence.

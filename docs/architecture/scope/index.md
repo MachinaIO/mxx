@@ -16,6 +16,7 @@ Dependency statements in this scope index use implementation direction:
 `src` directory scopes (one per top-level directory):
 
 - [root_modules.md](./root_modules.md)
+- [agr16.md](./agr16.md)
 - [bgg.md](./bgg.md)
 - [circuit.md](./circuit.md)
 - [commit.md](./commit.md)
@@ -45,10 +46,11 @@ Protocol and workflow scopes:
 
 - `root_modules` is a cross-cutting support scope used by multiple directories.
 - `bgg` depends on `matrix`, `poly`, and `sampler`.
+- `agr16` depends on `matrix`, `poly`, and `sampler`.
 - `storage` depends on `matrix` and `poly`.
 - `commit` depends on `matrix`, `poly`, `sampler`, and `storage`.
 - `lookup` depends on `bgg`, `circuit`, `matrix`, `poly`, `sampler`, and `storage`.
-- `circuit` depends on `poly` and `lookup`.
+- `circuit` depends on `poly`, `lookup`, and `agr16`.
 - `gadgets` depends on `circuit`, `lookup`, and `poly`.
 - `simulator` depends on `circuit`, `lookup`, and `poly`.
 

@@ -12,6 +12,7 @@ Defines circuit structures, gate semantics, evaluable abstractions, serializatio
 - `src/circuit/evaluable/mod.rs`
 - `src/circuit/evaluable/poly.rs`
 - `src/circuit/evaluable/bgg.rs`
+- `src/circuit/evaluable/agr16.rs`
 
 ## Interface vs implementation
 
@@ -19,12 +20,14 @@ Defines circuit structures, gate semantics, evaluable abstractions, serializatio
 - Concrete evaluable variants:
   - polynomial evaluable path
   - BGG evaluable path
+  - AGR16 evaluable path
 - Core orchestrator: `PolyCircuit`
 
 ## Depends on scopes
 
 - `poly`
 - `lookup`
+- `agr16`
 
 ## Used by scopes
 

@@ -14,8 +14,13 @@
 
 ## PR Content Summary
 - Title: `init documents for ai agents`
-- Draft PR from `feat/harness_enginnering` into `main`
+- PR from `feat/harness_enginnering` into `main`
 - Scope: documentation governance and execution-harness policy updates, including plans/architecture/verification rule alignment and verification event expansions.
 
 ## Status
-- `OPEN` and draft (`ready for review` not yet requested).
+- `MERGED` on `2026-03-02T04:45:54Z`.
+- Final state details (`gh pr view 56 --json ...`):
+  - `state`: `MERGED`
+  - `isDraft`: `false`
+  - `mergedAt`: `2026-03-02T04:45:54Z`
+  - `closedAt`: `2026-03-02T04:45:54Z`

@@ -1,12 +1,14 @@
-# Event: Before ExecPlan Creation
+# Event: Before Main ExecPlan Creation
 
-Use this document before creating a new ExecPlan file.
+Use this document before creating a new `main ExecPlan` file.
+
+If you are executing a `sub ExecPlan`, use `docs/verification/sub_execplan_pre_execution.md` instead.
 
 ## Preconditions
 
 - Working directory: repository root (`.`).
 - Do not change implementation files during this event. Branch/PR tracking metadata files required by this event are allowed.
-- This event runs before adding a new plan file under `docs/plans/active/`.
+- This event runs before adding a new main-plan file under `docs/plans/active/`.
 
 ## Required actions
 
@@ -28,13 +30,13 @@ Use this document before creating a new ExecPlan file.
 
     If GitHub CLI is not available, record that PR metadata could not be queried locally and proceed using branch history plus local change context.
 
-4. Decide whether the upcoming plan is aligned with the current branch and in-progress pull request scope.
+4. Decide whether the upcoming main-plan scope is aligned with the current branch and in-progress pull request scope.
 
     Treat the plan as not aligned when it introduces a separately reviewable objective (for example, a new feature, a separate bugfix track, or unrelated documentation policy work).
 
 5. Apply branch-switch rules.
 
-    - If the current branch is `main`, you must move to a new branch before creating the ExecPlan.
+    - If the current branch is `main`, you must move to a new branch before creating the main ExecPlan.
     - If the plan is not aligned with the current branch/PR, first confirm current changes are committed, then move to a new branch.
 
     Commands:
@@ -91,11 +93,11 @@ Use this document before creating a new ExecPlan file.
     - Locate or create the corresponding PR tracking file under `docs/prs/active/`.
     - Ensure the file contains current PR metadata and is up to date.
 
-9. Require PR document linkage in upcoming ExecPlan files.
+9. Require PR document linkage in upcoming main ExecPlan files.
 
-    For every ExecPlan created after this event (new branch/PR or reused branch/PR), add the repository-relative path to the corresponding PR tracking markdown file in the plan document.
+    For every main ExecPlan created after this event (new branch/PR or reused branch/PR), add the repository-relative path to the corresponding PR tracking markdown file in the plan document.
 
-    Also record, in that ExecPlan plan document, the branch name and git commit hash at the moment the ExecPlan starts.
+    Also record, in that main ExecPlan document, the branch name and git commit hash at the moment the ExecPlan starts.
 
     Example path format:
 
@@ -106,17 +108,17 @@ Use this document before creating a new ExecPlan file.
 - Branch/PR alignment decision is recorded.
 - If current branch is `main`, a new branch is checked out.
 - If plan scope is not aligned, current work is confirmed committed before switching and a new branch is checked out.
-- Final branch and status are recorded before ExecPlan creation.
+- Final branch and status are recorded before main ExecPlan creation.
 - If a new branch is created, a draft PR is created and a PR tracking file is added under `docs/prs/active/` with required metadata.
 - If an existing branch/PR is reused, the corresponding PR tracking file is linked and updated as needed.
-- The upcoming ExecPlan includes the relative path to the corresponding PR tracking file.
-- The upcoming ExecPlan records its start-time branch name and git commit hash.
+- The upcoming main ExecPlan includes the relative path to the corresponding PR tracking file.
+- The upcoming main ExecPlan records its start-time branch name and git commit hash.
 
 ## Failure triage
 
 - If branch switch fails because of uncommitted changes, commit or safely stash current work, then retry the switch.
 - If PR context cannot be queried (for example, `gh` unavailable), record that limitation and make the alignment decision from local evidence.
-- If draft PR creation cannot be completed automatically, create it manually in GitHub UI and record the result in the PR tracking file before creating the ExecPlan.
+- If draft PR creation cannot be completed automatically, create it manually in GitHub UI and record the result in the PR tracking file before creating the main ExecPlan.
 
 ## Evidence to record
 

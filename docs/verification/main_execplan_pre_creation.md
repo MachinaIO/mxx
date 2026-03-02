@@ -2,7 +2,7 @@
 
 Use this document before creating a new `main ExecPlan` file.
 
-If you are creating a `sub ExecPlan`, use `docs/verification/sub_execplan_pre_creation.md` instead.
+If you are executing a `sub ExecPlan`, use `docs/verification/sub_execplan_pre_execution.md` instead.
 
 ## Preconditions
 

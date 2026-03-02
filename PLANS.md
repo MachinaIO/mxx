@@ -116,7 +116,7 @@ Agents must strictly follow this lifecycle to create, execute, and complete an E
 
 1. Before creating or updating the target plan file, choose the lifecycle target (`main ExecPlan` or `sub ExecPlan`) and run the corresponding pre-creation verification document under `docs/verification`:
    * `main ExecPlan`: `docs/verification/main_execplan_pre_creation.md`
-   * `sub ExecPlan`: `docs/verification/sub_execplan_pre_creation.md`
+   * `sub ExecPlan`: `docs/verification/sub_execplan_pre_execution.md`
    At this point, do not create, edit, or delete files.
 2. Add a new plan document for the target ExecPlan under `docs/plans/active` in accordance with `PLANS.md`. If the target is a main ExecPlan and decomposition is needed, create one sub-plan markdown document per sub ExecPlan under `docs/plans/active`, and ensure each sub plan links the parent main ExecPlan path and names the main-plan scope it covers.
 3. This step is required for main ExecPlans only. Map the main plan actions (the checklist in `Progress`) to the events introduced in `docs/verification/index.md`, enumerate which validations must run after each action, and add those validations into the main-plan actions. For validations related to sub ExecPlans, either (a) insert each validation adjacent to the corresponding sub-plan action, or (b) aggregate them into one validation step in the main ExecPlan after one or more sub ExecPlans finish.

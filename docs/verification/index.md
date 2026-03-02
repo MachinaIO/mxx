@@ -16,7 +16,7 @@ If more than one event applies, execute all applicable event documents.
 ## Event map
 
 - Before creating a new main ExecPlan: read [main_execplan_pre_creation.md](./main_execplan_pre_creation.md).
-- Before creating a new sub ExecPlan: read [sub_execplan_pre_creation.md](./sub_execplan_pre_creation.md).
+- Before executing a sub ExecPlan: read [sub_execplan_pre_execution.md](./sub_execplan_pre_execution.md).
 - After completing a main ExecPlan: read [main_execplan_post_completion.md](./main_execplan_post_completion.md).
 - After completing a sub ExecPlan: read [sub_execplan_post_completion.md](./sub_execplan_post_completion.md).
 - Docs-only changes: read [docs_only_changes.md](./docs_only_changes.md).

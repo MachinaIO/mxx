@@ -26,6 +26,13 @@ CUDA files included in this scope (used via Rust GPU matrix implementation and F
 - `cuda/src/matrix/MatrixUtils.cu`
 - `cuda/include/matrix/*.cuh`
 
+## CUDA Boundary Contract
+
+- GPU limb buffers are byte-packed (`uint8_t`) and no longer fixed `u64` arrays.
+- Each limb uses modulus-specific coefficient width (`ceil(bit_width(modulus)/8)` bytes per coefficient).
+- Kernel call paths must pass limb metadata (`stride_bytes`, `coeff_bytes`) and use packed load/store helpers.
+- `cuda/src/matrix/MatrixSerde.cu` is responsible for bridging host RNS batch `u64` byte layout and packed GPU limb layout.
+
 ## Interface vs implementation
 
 - Interfaces:

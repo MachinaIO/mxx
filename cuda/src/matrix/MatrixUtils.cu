@@ -179,7 +179,7 @@ int matrix_limb_stream(const GpuMatrix *mat, const dim3 &limb_id, cudaStream_t *
     return *out_stream ? 0 : set_error("null stream in matrix_limb_stream");
 }
 
-uint64_t *matrix_limb_ptr_by_id(GpuMatrix *mat, size_t poly_idx, const dim3 &limb_id)
+uint8_t *matrix_limb_ptr_by_id(GpuMatrix *mat, size_t poly_idx, const dim3 &limb_id)
 {
     if (!mat || limb_id.x >= mat->shared_limb_buffers.size())
     {
@@ -195,17 +195,70 @@ uint64_t *matrix_limb_ptr_by_id(GpuMatrix *mat, size_t poly_idx, const dim3 &lim
     {
         return nullptr;
     }
-    const size_t offset_words = poly_idx * buffer.words_per_poly + limb_id.y * buffer.n;
-    if (offset_words >= buffer.words_total)
+    if (limb_id.y >= buffer.limb_offsets_bytes.size() || limb_id.y >= buffer.limb_coeff_bytes.size())
     {
         return nullptr;
     }
-    return buffer.ptr + offset_words;
+    const size_t coeff_bytes = static_cast<size_t>(buffer.limb_coeff_bytes[limb_id.y]);
+    if (coeff_bytes == 0)
+    {
+        return nullptr;
+    }
+    size_t coeff_region_bytes = 0;
+    if (buffer.n != 0 && coeff_bytes > static_cast<size_t>(-1) / buffer.n)
+    {
+        return nullptr;
+    }
+    coeff_region_bytes = buffer.n * coeff_bytes;
+    const size_t base_offset = buffer.limb_offsets_bytes[limb_id.y];
+    size_t poly_offset = 0;
+    if (poly_idx != 0 && buffer.bytes_per_poly > static_cast<size_t>(-1) / poly_idx)
+    {
+        return nullptr;
+    }
+    poly_offset = poly_idx * buffer.bytes_per_poly;
+    if (base_offset > static_cast<size_t>(-1) - poly_offset)
+    {
+        return nullptr;
+    }
+    const size_t offset_bytes = poly_offset + base_offset;
+    if (offset_bytes > buffer.bytes_total || buffer.bytes_total - offset_bytes < coeff_region_bytes)
+    {
+        return nullptr;
+    }
+    return buffer.ptr + offset_bytes;
 }
 
-const uint64_t *matrix_limb_ptr_by_id(const GpuMatrix *mat, size_t poly_idx, const dim3 &limb_id)
+const uint8_t *matrix_limb_ptr_by_id(const GpuMatrix *mat, size_t poly_idx, const dim3 &limb_id)
 {
     return matrix_limb_ptr_by_id(const_cast<GpuMatrix *>(mat), poly_idx, limb_id);
+}
+
+bool matrix_limb_metadata_by_id(
+    const GpuMatrix *mat,
+    const dim3 &limb_id,
+    size_t *out_stride_bytes,
+    uint8_t *out_coeff_bytes)
+{
+    if (!mat || !out_stride_bytes || !out_coeff_bytes || limb_id.x >= mat->shared_limb_buffers.size())
+    {
+        return false;
+    }
+    const auto &buffer = mat->shared_limb_buffers[limb_id.x];
+    if (limb_id.y >= buffer.limb_count ||
+        limb_id.y >= buffer.limb_coeff_bytes.size() ||
+        limb_id.y >= buffer.limb_offsets_bytes.size())
+    {
+        return false;
+    }
+    const uint8_t coeff_bytes = buffer.limb_coeff_bytes[limb_id.y];
+    if (coeff_bytes == 0)
+    {
+        return false;
+    }
+    *out_stride_bytes = buffer.bytes_per_poly;
+    *out_coeff_bytes = coeff_bytes;
+    return true;
 }
 
 int matrix_wait_limb_stream(

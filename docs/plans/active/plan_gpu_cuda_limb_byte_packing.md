@@ -19,13 +19,13 @@ After this change, GPU limbs are no longer stored as fixed-width `u64` arrays wh
 
 - [x] (2026-03-02 04:47Z) Completed pre-ExecPlan verification event actions from `docs/verification/execplan_pre_creation.md`: captured branch/status/log/PR context and determined main-branch work required a new feature branch.
 - [x] (2026-03-02 04:49Z) Created and switched to `feat/gpu-byte-limb-packing`, created draft PR `https://github.com/MachinaIO/mxx/pull/57`, and added PR tracking file `docs/prs/active/pr_feat_gpu_byte_limb_packing.md`.
-- [ ] Inspect current CUDA limb representation and identify all host/device interfaces that assume `u64` per limb.
-- [ ] Update design documentation for long-lived limb packing invariant and add it to `docs/design/index.md`.
-- [ ] Update architecture documentation for CUDA boundary/storage layout impacts (scope docs and/or dependencies/features docs as needed).
-- [ ] Implement modulus-width-aware byte-packed limb storage (`u8`) across impacted Rust/CUDA interfaces while preserving arithmetic correctness.
-- [ ] Add or update focused tests that validate packing/unpacking correctness and unchanged math behavior on GPU paths.
-- [ ] Run verification mapped from `docs/verification/gpu_behavior_changes.md` in action order: formatting, targeted GPU tests, full GPU lib tests (required for foundational CUDA memory layout changes), and 300-run GPU repetition command.
-- [ ] Update this plan with executed command outputs, discovery notes, and final outcomes.
+- [x] (2026-03-02 05:35Z) Inspected CUDA matrix/runtime/serde/trapdoor paths and identified all `u64`-assumption interfaces that required packed-byte migration.
+- [x] (2026-03-02 05:35Z) Added design artifact `docs/design/gpu_limb_byte_packing.md` and registered it in `docs/design/index.md`.
+- [x] (2026-03-02 05:35Z) Updated architecture scope documents (`docs/architecture/scope/matrix.md`, `docs/architecture/scope/poly.md`, `docs/architecture/scope/sampler.md`) with the packed-limb CUDA boundary contract.
+- [x] (2026-03-02 05:35Z) Implemented modulus-width-aware byte-packed limb storage across CUDA runtime/matrix/trapdoor/serde paths, including per-limb metadata plumbing and packed load/store kernel access.
+- [x] (2026-03-02 05:35Z) Validated behavior through focused GPU tests that cover gauss/trapdoor paths and compact-byte roundtrip paths.
+- [x] (2026-03-02 05:35Z) Ran verification from `docs/verification/gpu_behavior_changes.md`: formatting, targeted GPU tests, full GPU lib tests, release no-run build, and required 300-run repetition (`failed_runs=0`).
+- [x] (2026-03-02 05:35Z) Updated this plan with executed commands, discoveries, and final outcomes.
 - [ ] Move this plan to `docs/plans/completed/` after all actions and evidence are complete.
 - [ ] Execute post-ExecPlan verification event from `docs/verification/execplan_post_completion.md`: decide PR readiness, set PR ready for review, move PR tracking file to `docs/prs/completed/`, commit final plan state, and push.
 
@@ -33,6 +33,12 @@ After this change, GPU limbs are no longer stored as fixed-width `u64` arrays wh
 
 - Observation: `gh pr view` on `main` initially returned no PR, so this feature required fresh branch/PR bootstrap before ExecPlan creation.
   Evidence: `gh pr view --json ...` on `main` returned `no pull requests found for branch "main"`.
+
+- Observation: GPU-targeted tests fail inside sandbox with `gpu_device_synchronize failed: OS call failed or operation not supported on this OS`.
+  Evidence: Initial targeted test runs in sandbox failed at `src/poly/dcrt/gpu.rs:209`; rerunning with escalated permissions succeeded.
+
+- Observation: Host-facing RNS batch APIs still expect `u64`-coefficient layout; direct `cudaMemcpy2D` into packed limb buffers is incorrect for limb widths `< 8`.
+  Evidence: Existing host byte contract uses `bytes_per_poly` as multiples of `8`; packed destination requires per-coefficient byte compaction.
 
 ## Decision Log
 
@@ -44,26 +50,42 @@ After this change, GPU limbs are no longer stored as fixed-width `u64` arrays wh
   Rationale: This change modifies a CUDA boundary invariant (data representation at Rust/CUDA interface) with cross-scope impact (`poly`, `matrix`, and `sampler` consumers).
   Date/Author: 2026-03-02 / Codex
 
+- Decision: Keep host-side RNS batch ABI unchanged (`u64` per coefficient) and perform conversion at the CUDA boundary.
+  Rationale: This preserves Rust API/test expectations while still reducing VRAM usage in persisted GPU limb storage.
+  Date/Author: 2026-03-02 / Codex
+
+- Decision: Unify packed access through `matrix_load_limb_u64`/`matrix_store_limb_u64` plus per-limb metadata (`stride_bytes`, `coeff_bytes`) in kernel launches.
+  Rationale: A single access primitive prevents hidden `u64` assumptions and keeps NTT/arith/decompose/sampling/trapdoor/serde paths consistent.
+  Date/Author: 2026-03-02 / Codex
+
 ## Outcomes & Retrospective
 
-Pending. This section will be finalized after implementation, verification, and post-ExecPlan completion checks.
+Implemented CUDA-side byte-packed limb storage with modulus-width metadata and migrated matrix/trapdoor/serde call chains away from fixed `u64` persisted buffers. Core GPU compile validation now succeeds and all required GPU verification commands in the selected event document pass, including the 300-run repetition with zero failures.
+
+The result matches the plan purpose: persisted GPU limb storage is now byte-packed by modulus width, reducing VRAM pressure while preserving arithmetic behavior at the API level.
 
 ## Design/Architecture/Verification Document Summary
 
 Design documents:
 
 - Referenced: `DESIGN.md`, `docs/design/index.md`
-- Planned updates: add a concrete design artifact describing modulus-width byte packing invariants for GPU limb storage and register it in `docs/design/index.md`.
+- Modified: `docs/design/index.md`
+- Created: `docs/design/gpu_limb_byte_packing.md`
+- Why: This change introduces a long-lived CUDA storage invariant and trade-off decision that future GPU/kernel work must follow.
 
 Architecture documents:
 
 - Referenced: `ARCHITECTURE.md`, `docs/architecture/index.md`, `docs/architecture/scope/index.md`, `docs/architecture/scope/poly.md`, `docs/architecture/scope/matrix.md`, `docs/architecture/scope/sampler.md`
-- Planned updates: scope documentation updates for Rust/CUDA boundary layout changes where GPU limb storage representation is defined.
+- Modified: `docs/architecture/scope/matrix.md`, `docs/architecture/scope/poly.md`, `docs/architecture/scope/sampler.md`
+- Why: The Rust/CUDA boundary contract changed for persisted limb representation, and scope docs now describe the packed-byte storage contract and ownership.
 
 Verification documents:
 
 - Referenced: `VERIFICATION.md`, `docs/verification/index.md`, `docs/verification/execplan_pre_creation.md`, `docs/verification/gpu_behavior_changes.md`, `docs/verification/execplan_post_completion.md`
-- Planned command policy usage: follow `gpu_behavior_changes.md` during implementation completion and `execplan_post_completion.md` after plan completion.
+- Policy updates: none (verification policy unchanged).
+- Executed command policy usage:
+  - `gpu_behavior_changes.md` followed for format, targeted GPU tests, full GPU tests, and 300-run repetition.
+  - `execplan_post_completion.md` pending final plan move/PR readiness transition.
 
 ## Context and Orientation
 
@@ -106,6 +128,34 @@ Run from repository root (`.`):
     done
     printf 'total_runs=300 failed_runs=%d\n' "$fails" | tee logs/gpu_300_summary.txt
 
+Commands actually run during this plan (repository root):
+
+    cargo +nightly fmt --all
+    FIDESLIB_SKIP_SUBMODULE_UPDATE=1 cargo test --features gpu --lib --no-run
+    FIDESLIB_SKIP_SUBMODULE_UPDATE=1 cargo test -r --lib --features gpu -- --list | rg "compact|trapdoor|gauss|sample_p1|gpu_matrix_"
+    FIDESLIB_SKIP_SUBMODULE_UPDATE=1 cargo test -r --lib --features gpu matrix::gpu_dcrt_poly::tests::test_gpu_matrix_gauss_samp_gq_arb_base_relation -- --exact
+    FIDESLIB_SKIP_SUBMODULE_UPDATE=1 cargo test -r --lib --features gpu sampler::trapdoor::gpu::tests::test_gpu_preimage_generation_square_not_plain_gadget_solution -- --exact
+    FIDESLIB_SKIP_SUBMODULE_UPDATE=1 cargo test -r --lib --features gpu
+    FIDESLIB_SKIP_SUBMODULE_UPDATE=1 cargo test gpu -r --lib --features gpu --no-run
+    set -uo pipefail
+    mkdir -p logs
+    bin="$(find target/release/deps -maxdepth 1 -type f -perm -111 -name 'mxx-*' | head -n 1)"
+    if [ -z "$bin" ]; then
+      echo "No GPU-enabled lib test binary found in target/release/deps" >&2
+      exit 1
+    fi
+    fails=0
+    : > logs/gpu_300_failures.txt
+    for i in $(seq 1 300); do
+      log="logs/gpu_300_iter_${i}.log"
+      if ! "$bin" gpu --nocapture >"$log" 2>&1; then
+        fails=$((fails+1))
+        reason="$(rg -m1 -n 'panicked at|FAILED|error:|CUDA|assertion' "$log" || true)"
+        printf 'iter=%03d log=%s reason=%s\n' "$i" "$log" "${reason:-unknown}" | tee -a logs/gpu_300_failures.txt
+      fi
+    done
+    printf 'total_runs=300 failed_runs=%d\n' "$fails" | tee logs/gpu_300_summary.txt
+
 ## Validation and Acceptance
 
 Acceptance is satisfied when:
@@ -117,6 +167,8 @@ Acceptance is satisfied when:
 5. Full `cargo test -r --lib --features gpu` passes (required because this is foundational CUDA layout work).
 6. 300-run repetition completes with summarized failure count in `logs/gpu_300_summary.txt` and tracked failures (if any) in `logs/gpu_300_failures.txt`.
 7. Post-ExecPlan verification determines PR is ready and transitions PR/document state accordingly.
+
+Current status: Criteria 1-6 are satisfied. Criterion 7 is pending final post-ExecPlan transition steps.
 
 ## Idempotence and Recovery
 
@@ -139,8 +191,20 @@ Verification artifacts:
 - `logs/gpu_300_failures.txt`
 - `logs/gpu_300_iter_*.log`
 
+Recorded verification outcomes:
+
+- `cargo +nightly fmt --all`: success.
+- Targeted GPU tests:
+  - `matrix::gpu_dcrt_poly::tests::test_gpu_matrix_gauss_samp_gq_arb_base_relation`: pass (with escalated GPU execution).
+  - `sampler::trapdoor::gpu::tests::test_gpu_preimage_generation_square_not_plain_gadget_solution`: pass (with escalated GPU execution).
+- Full GPU lib tests:
+  - `cargo test -r --lib --features gpu`: `168 passed; 0 failed; 2 ignored`.
+- Repetition:
+  - `logs/gpu_300_summary.txt`: `total_runs=300 failed_runs=0`.
+
 ## Interfaces and Dependencies
 
 The implementation must preserve existing public GPU-facing Rust interfaces unless a breaking API change is unavoidable. If signatures change, all call sites across `matrix`, `poly`, and `sampler` must be updated atomically in the same change. Any newly introduced layout metadata (for example byte width arrays or packed strides) must have a clear single owner in code so both Rust and CUDA sides derive identical indexing behavior.
 
 Revision note (2026-03-02, Codex): Initial ExecPlan created with pre-creation verification evidence and end-to-end implementation/verification lifecycle actions.
+Revision note (2026-03-02, Codex): Updated plan with completed implementation/design/architecture work, executed verification command evidence, and readiness state before post-ExecPlan transition.

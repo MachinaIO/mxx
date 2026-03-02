@@ -37,8 +37,9 @@ namespace
     }
 
     __global__ void ntt_twist_all_limbs_kernel(
-        uint64_t *const *limb_bases,
-        const size_t *limb_strides,
+        uint8_t *const *limb_bases,
+        const size_t *limb_stride_bytes,
+        const uint8_t *limb_coeff_bytes,
         size_t limb_count,
         uint32_t n,
         size_t poly_offset,
@@ -55,22 +56,30 @@ namespace
             return;
         }
         const size_t poly_idx = poly_offset + static_cast<size_t>(blockIdx.y);
-        uint64_t *const base = limb_bases[limb_idx];
-        const size_t stride = limb_strides[limb_idx];
+        uint8_t *const base = limb_bases[limb_idx];
+        const size_t stride_bytes = limb_stride_bytes[limb_idx];
+        const uint8_t coeff_bytes = limb_coeff_bytes[limb_idx];
         if (limb_idx >= static_cast<size_t>(gpu_ntt_const_limb_count))
         {
             return;
         }
         const uint64_t twiddle_base = inverse ? gpu_ntt_const_inv_root[limb_idx] : gpu_ntt_const_root[limb_idx];
         const uint64_t modulus = gpu_ntt_const_moduli[limb_idx];
-        uint64_t *const poly = base + poly_idx * stride;
         const uint64_t tw = pow_mod_u64_device(twiddle_base, coeff_idx, modulus);
-        poly[coeff_idx] = mul_mod_u64(poly[coeff_idx], tw, modulus);
+        const uint64_t src = matrix_load_limb_u64(base, poly_idx, coeff_idx, stride_bytes, coeff_bytes);
+        matrix_store_limb_u64(
+            base,
+            poly_idx,
+            coeff_idx,
+            stride_bytes,
+            coeff_bytes,
+            mul_mod_u64(src, tw, modulus));
     }
 
     __global__ void ntt_scale_all_limbs_kernel(
-        uint64_t *const *limb_bases,
-        const size_t *limb_strides,
+        uint8_t *const *limb_bases,
+        const size_t *limb_stride_bytes,
+        const uint8_t *limb_coeff_bytes,
         size_t limb_count,
         uint32_t n,
         size_t poly_offset)
@@ -86,21 +95,29 @@ namespace
             return;
         }
         const size_t poly_idx = poly_offset + static_cast<size_t>(blockIdx.y);
-        uint64_t *const base = limb_bases[limb_idx];
-        const size_t stride = limb_strides[limb_idx];
+        uint8_t *const base = limb_bases[limb_idx];
+        const size_t stride_bytes = limb_stride_bytes[limb_idx];
+        const uint8_t coeff_bytes = limb_coeff_bytes[limb_idx];
         if (limb_idx >= static_cast<size_t>(gpu_ntt_const_limb_count))
         {
             return;
         }
         const uint64_t factor = gpu_ntt_const_n_inv[limb_idx];
         const uint64_t modulus = gpu_ntt_const_moduli[limb_idx];
-        uint64_t *const poly = base + poly_idx * stride;
-        poly[coeff_idx] = mul_mod_u64(poly[coeff_idx], factor, modulus);
+        const uint64_t src = matrix_load_limb_u64(base, poly_idx, coeff_idx, stride_bytes, coeff_bytes);
+        matrix_store_limb_u64(
+            base,
+            poly_idx,
+            coeff_idx,
+            stride_bytes,
+            coeff_bytes,
+            mul_mod_u64(src, factor, modulus));
     }
 
     __global__ void ntt_bit_reverse_all_limbs_kernel(
-        uint64_t *const *limb_bases,
-        const size_t *limb_strides,
+        uint8_t *const *limb_bases,
+        const size_t *limb_stride_bytes,
+        const uint8_t *limb_coeff_bytes,
         size_t limb_count,
         uint32_t n,
         uint32_t log_n,
@@ -122,17 +139,20 @@ namespace
             return;
         }
         const size_t poly_idx = poly_offset + static_cast<size_t>(blockIdx.y);
-        uint64_t *const base = limb_bases[limb_idx];
-        const size_t stride = limb_strides[limb_idx];
-        uint64_t *const poly = base + poly_idx * stride;
-        const uint64_t tmp = poly[idx];
-        poly[idx] = poly[rev];
-        poly[rev] = tmp;
+        uint8_t *const base = limb_bases[limb_idx];
+        const size_t stride_bytes = limb_stride_bytes[limb_idx];
+        const uint8_t coeff_bytes = limb_coeff_bytes[limb_idx];
+        const uint64_t tmp = matrix_load_limb_u64(base, poly_idx, idx, stride_bytes, coeff_bytes);
+        const uint64_t rev_val =
+            matrix_load_limb_u64(base, poly_idx, rev, stride_bytes, coeff_bytes);
+        matrix_store_limb_u64(base, poly_idx, idx, stride_bytes, coeff_bytes, rev_val);
+        matrix_store_limb_u64(base, poly_idx, rev, stride_bytes, coeff_bytes, tmp);
     }
 
     __global__ void ntt_stage_all_limbs_kernel(
-        uint64_t *const *limb_bases,
-        const size_t *limb_strides,
+        uint8_t *const *limb_bases,
+        const size_t *limb_stride_bytes,
+        const uint8_t *limb_coeff_bytes,
         const uint64_t *limb_wlens,
         size_t limb_count,
         uint32_t n,
@@ -155,20 +175,34 @@ namespace
         const uint32_t j = bfly_idx - group * half;
         const uint32_t i = group * len + j;
         const size_t poly_idx = poly_offset + static_cast<size_t>(blockIdx.y);
-        uint64_t *const base = limb_bases[limb_idx];
-        const size_t stride = limb_strides[limb_idx];
+        uint8_t *const base = limb_bases[limb_idx];
+        const size_t stride_bytes = limb_stride_bytes[limb_idx];
+        const uint8_t coeff_bytes = limb_coeff_bytes[limb_idx];
         if (limb_idx >= static_cast<size_t>(gpu_ntt_const_limb_count))
         {
             return;
         }
         const uint64_t wlen = limb_wlens[limb_idx];
         const uint64_t modulus = gpu_ntt_const_moduli[limb_idx];
-        uint64_t *const poly = base + poly_idx * stride;
         const uint64_t w = pow_mod_u64_device(wlen, j, modulus);
-        const uint64_t u = poly[i];
-        const uint64_t v = mul_mod_u64(poly[i + half], w, modulus);
-        poly[i] = add_mod_u64(u, v, modulus);
-        poly[i + half] = sub_mod_u64(u, v, modulus);
+        const uint64_t u = matrix_load_limb_u64(base, poly_idx, i, stride_bytes, coeff_bytes);
+        const uint64_t upper =
+            matrix_load_limb_u64(base, poly_idx, i + half, stride_bytes, coeff_bytes);
+        const uint64_t v = mul_mod_u64(upper, w, modulus);
+        matrix_store_limb_u64(
+            base,
+            poly_idx,
+            i,
+            stride_bytes,
+            coeff_bytes,
+            add_mod_u64(u, v, modulus));
+        matrix_store_limb_u64(
+            base,
+            poly_idx,
+            i + half,
+            stride_bytes,
+            coeff_bytes,
+            sub_mod_u64(u, v, modulus));
     }
 
     bool is_power_of_two_u32(uint32_t v)
@@ -177,15 +211,16 @@ namespace
     }
 
     int launch_twist_for_all_limbs(
-        uint64_t *const *limb_bases,
-        const size_t *limb_strides,
+        uint8_t *const *limb_bases,
+        const size_t *limb_stride_bytes,
+        const uint8_t *limb_coeff_bytes,
         size_t limb_count,
         uint32_t n,
         size_t poly_count,
         cudaStream_t stream,
         bool inverse)
     {
-        if (!limb_bases || !limb_strides)
+        if (!limb_bases || !limb_stride_bytes || !limb_coeff_bytes)
         {
             return set_error("null metadata in launch_twist_for_all_limbs");
         }
@@ -207,7 +242,8 @@ namespace
                 static_cast<uint32_t>(limb_count)};
             ntt_twist_all_limbs_kernel<<<grid, kTransformThreads, 0, stream>>>(
                 limb_bases,
-                limb_strides,
+                limb_stride_bytes,
+                limb_coeff_bytes,
                 limb_count,
                 n,
                 offset,
@@ -222,14 +258,15 @@ namespace
     }
 
     int launch_scale_for_all_limbs(
-        uint64_t *const *limb_bases,
-        const size_t *limb_strides,
+        uint8_t *const *limb_bases,
+        const size_t *limb_stride_bytes,
+        const uint8_t *limb_coeff_bytes,
         size_t limb_count,
         uint32_t n,
         size_t poly_count,
         cudaStream_t stream)
     {
-        if (!limb_bases || !limb_strides)
+        if (!limb_bases || !limb_stride_bytes || !limb_coeff_bytes)
         {
             return set_error("null metadata in launch_scale_for_all_limbs");
         }
@@ -251,7 +288,8 @@ namespace
                 static_cast<uint32_t>(limb_count)};
             ntt_scale_all_limbs_kernel<<<grid, kTransformThreads, 0, stream>>>(
                 limb_bases,
-                limb_strides,
+                limb_stride_bytes,
+                limb_coeff_bytes,
                 limb_count,
                 n,
                 offset);
@@ -265,15 +303,16 @@ namespace
     }
 
     int launch_bit_reverse_for_all_limbs(
-        uint64_t *const *limb_bases,
-        const size_t *limb_strides,
+        uint8_t *const *limb_bases,
+        const size_t *limb_stride_bytes,
+        const uint8_t *limb_coeff_bytes,
         size_t limb_count,
         uint32_t n,
         uint32_t log_n,
         size_t poly_count,
         cudaStream_t stream)
     {
-        if (!limb_bases || !limb_strides)
+        if (!limb_bases || !limb_stride_bytes || !limb_coeff_bytes)
         {
             return set_error("null metadata in launch_bit_reverse_for_all_limbs");
         }
@@ -295,7 +334,8 @@ namespace
                 static_cast<uint32_t>(limb_count)};
             ntt_bit_reverse_all_limbs_kernel<<<grid, kTransformThreads, 0, stream>>>(
                 limb_bases,
-                limb_strides,
+                limb_stride_bytes,
+                limb_coeff_bytes,
                 limb_count,
                 n,
                 log_n,
@@ -310,8 +350,9 @@ namespace
     }
 
     int launch_stage_for_all_limbs(
-        uint64_t *const *limb_bases,
-        const size_t *limb_strides,
+        uint8_t *const *limb_bases,
+        const size_t *limb_stride_bytes,
+        const uint8_t *limb_coeff_bytes,
         const uint64_t *limb_wlens,
         size_t limb_count,
         uint32_t n,
@@ -319,7 +360,7 @@ namespace
         size_t poly_count,
         cudaStream_t stream)
     {
-        if (!limb_bases || !limb_strides || !limb_wlens)
+        if (!limb_bases || !limb_stride_bytes || !limb_coeff_bytes || !limb_wlens)
         {
             return set_error("null metadata in launch_stage_for_all_limbs");
         }
@@ -342,7 +383,8 @@ namespace
                 static_cast<uint32_t>(limb_count)};
             ntt_stage_all_limbs_kernel<<<grid, kTransformThreads, 0, stream>>>(
                 limb_bases,
-                limb_strides,
+                limb_stride_bytes,
+                limb_coeff_bytes,
                 limb_wlens,
                 limb_count,
                 n,
@@ -387,7 +429,6 @@ namespace
         }
 
         auto &limb_map = mat->ctx->limb_gpu_ids;
-        auto &limb_types = mat->ctx->limb_types;
         auto &limb_prime_ids = mat->ctx->limb_prime_ids;
         auto &moduli = mat->ctx->moduli;
         const size_t limb_count = static_cast<size_t>(mat->level + 1);
@@ -395,7 +436,7 @@ namespace
         {
             return set_error("unexpected limb mapping size in run_matrix_transform_u64");
         }
-        if (limb_types.size() < limb_count || limb_prime_ids.size() < limb_count)
+        if (limb_prime_ids.size() < limb_count)
         {
             return set_error("unexpected limb metadata size in run_matrix_transform_u64");
         }
@@ -412,8 +453,9 @@ namespace
         }
 
         std::vector<dim3> active_limb_ids(limb_count);
-        std::vector<uint64_t *> limb_bases(limb_count, nullptr);
-        std::vector<size_t> limb_strides(limb_count, 0);
+        std::vector<uint8_t *> limb_bases(limb_count, nullptr);
+        std::vector<size_t> limb_stride_bytes(limb_count, 0);
+        std::vector<uint8_t> limb_coeff_bytes(limb_count, 0);
 
         int dispatch_device = -1;
         size_t dispatch_slot = std::numeric_limits<size_t>::max();
@@ -455,10 +497,6 @@ namespace
                 return set_error("single-device mode requires all limbs on one device in run_matrix_transform_u64");
             }
 
-            if (limb_types[limb_idx] != GPU_LIMB_U64)
-            {
-                return set_error("unsupported limb type in run_matrix_transform_u64");
-            }
             const int primeid = limb_prime_ids[limb_idx];
             if (primeid < 0 ||
                 static_cast<size_t>(primeid) >= moduli.size() ||
@@ -467,14 +505,24 @@ namespace
                 return set_error("invalid prime/device index in run_matrix_transform_u64");
             }
 
-            const auto &buffer = mat->shared_limb_buffers[limb_id.x];
-            if (buffer.words_per_poly < static_cast<size_t>(n))
+            size_t stride_bytes = 0;
+            uint8_t coeff_bytes = 0;
+            if (!matrix_limb_metadata_by_id(mat, limb_id, &stride_bytes, &coeff_bytes))
             {
-                return set_error("invalid words_per_poly in run_matrix_transform_u64");
+                return set_error("invalid limb metadata in run_matrix_transform_u64");
             }
-            limb_strides[limb_idx] = buffer.words_per_poly;
+            if (coeff_bytes == 0)
+            {
+                return set_error("invalid coeff byte-width in run_matrix_transform_u64");
+            }
+            if (stride_bytes < static_cast<size_t>(n) * static_cast<size_t>(coeff_bytes))
+            {
+                return set_error("invalid bytes_per_poly in run_matrix_transform_u64");
+            }
+            limb_stride_bytes[limb_idx] = stride_bytes;
+            limb_coeff_bytes[limb_idx] = coeff_bytes;
 
-            uint64_t *base = matrix_limb_ptr_by_id(mat, 0, limb_id);
+            uint8_t *base = matrix_limb_ptr_by_id(mat, 0, limb_id);
             if (!base)
             {
                 return set_error("null matrix limb pointer in run_matrix_transform_u64");
@@ -514,10 +562,12 @@ namespace
             }
         }
 
-        const size_t ptr_bytes = limb_count * sizeof(uint64_t *);
+        const size_t ptr_bytes = limb_count * sizeof(uint8_t *);
         const size_t stride_bytes = limb_count * sizeof(size_t);
-        uint64_t **limb_bases_device = nullptr;
-        size_t *limb_strides_device = nullptr;
+        const size_t coeff_bytes_bytes = limb_count * sizeof(uint8_t);
+        uint8_t **limb_bases_device = nullptr;
+        size_t *limb_stride_bytes_device = nullptr;
+        uint8_t *limb_coeff_bytes_device = nullptr;
         const uint64_t *limb_wlens_base =
             Forward ? device_constants.limb_wlen_forward : device_constants.limb_wlen_inverse;
         auto cleanup = [&]()
@@ -531,10 +581,15 @@ namespace
                 cudaFreeAsync(limb_bases_device, dispatch_stream);
                 limb_bases_device = nullptr;
             }
-            if (limb_strides_device)
+            if (limb_stride_bytes_device)
             {
-                cudaFreeAsync(limb_strides_device, dispatch_stream);
-                limb_strides_device = nullptr;
+                cudaFreeAsync(limb_stride_bytes_device, dispatch_stream);
+                limb_stride_bytes_device = nullptr;
+            }
+            if (limb_coeff_bytes_device)
+            {
+                cudaFreeAsync(limb_coeff_bytes_device, dispatch_stream);
+                limb_coeff_bytes_device = nullptr;
             }
         };
 
@@ -550,7 +605,13 @@ namespace
             cleanup();
             return set_error(err);
         }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&limb_strides_device), stride_bytes, dispatch_stream);
+        err = cudaMallocAsync(reinterpret_cast<void **>(&limb_stride_bytes_device), stride_bytes, dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMallocAsync(reinterpret_cast<void **>(&limb_coeff_bytes_device), coeff_bytes_bytes, dispatch_stream);
         if (err != cudaSuccess)
         {
             cleanup();
@@ -569,9 +630,20 @@ namespace
             return set_error(err);
         }
         err = cudaMemcpyAsync(
-            limb_strides_device,
-            limb_strides.data(),
+            limb_stride_bytes_device,
+            limb_stride_bytes.data(),
             stride_bytes,
+            cudaMemcpyHostToDevice,
+            dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(
+            limb_coeff_bytes_device,
+            limb_coeff_bytes.data(),
+            coeff_bytes_bytes,
             cudaMemcpyHostToDevice,
             dispatch_stream);
         if (err != cudaSuccess)
@@ -584,7 +656,8 @@ namespace
         {
             status = launch_twist_for_all_limbs(
                 limb_bases_device,
-                limb_strides_device,
+                limb_stride_bytes_device,
+                limb_coeff_bytes_device,
                 limb_count,
                 n,
                 poly_count,
@@ -597,7 +670,8 @@ namespace
             }
             status = launch_bit_reverse_for_all_limbs(
                 limb_bases_device,
-                limb_strides_device,
+                limb_stride_bytes_device,
+                limb_coeff_bytes_device,
                 limb_count,
                 n,
                 log_n,
@@ -614,7 +688,8 @@ namespace
                     limb_wlens_base + static_cast<size_t>(stage_idx) * device_constants.limb_count;
                 status = launch_stage_for_all_limbs(
                     limb_bases_device,
-                    limb_strides_device,
+                    limb_stride_bytes_device,
+                    limb_coeff_bytes_device,
                     limb_wlens_device,
                     limb_count,
                     n,
@@ -632,7 +707,8 @@ namespace
         {
             status = launch_bit_reverse_for_all_limbs(
                 limb_bases_device,
-                limb_strides_device,
+                limb_stride_bytes_device,
+                limb_coeff_bytes_device,
                 limb_count,
                 n,
                 log_n,
@@ -649,7 +725,8 @@ namespace
                     limb_wlens_base + static_cast<size_t>(stage_idx) * device_constants.limb_count;
                 status = launch_stage_for_all_limbs(
                     limb_bases_device,
-                    limb_strides_device,
+                    limb_stride_bytes_device,
+                    limb_coeff_bytes_device,
                     limb_wlens_device,
                     limb_count,
                     n,
@@ -664,7 +741,8 @@ namespace
             }
             status = launch_scale_for_all_limbs(
                 limb_bases_device,
-                limb_strides_device,
+                limb_stride_bytes_device,
+                limb_coeff_bytes_device,
                 limb_count,
                 n,
                 poly_count,
@@ -676,7 +754,8 @@ namespace
             }
             status = launch_twist_for_all_limbs(
                 limb_bases_device,
-                limb_strides_device,
+                limb_stride_bytes_device,
+                limb_coeff_bytes_device,
                 limb_count,
                 n,
                 poly_count,

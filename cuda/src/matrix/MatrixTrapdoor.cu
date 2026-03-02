@@ -74,14 +74,18 @@ namespace
 }
 
 __global__ void matrix_sample_p1_integer_kernel_small(
-    const uint64_t *a_base,
-    const uint64_t *b_base,
-    const uint64_t *d_base,
-    const uint64_t *tp2_base,
-    size_t a_stride,
-    size_t b_stride,
-    size_t d_stride,
-    size_t tp2_stride,
+    const uint8_t *a_base,
+    const uint8_t *b_base,
+    const uint8_t *d_base,
+    const uint8_t *tp2_base,
+    size_t a_stride_bytes,
+    size_t b_stride_bytes,
+    size_t d_stride_bytes,
+    size_t tp2_stride_bytes,
+    uint8_t a_coeff_bytes,
+    uint8_t b_coeff_bytes,
+    uint8_t d_coeff_bytes,
+    uint8_t tp2_coeff_bytes,
     size_t d,
     size_t cols,
     size_t n,
@@ -139,16 +143,16 @@ __global__ void matrix_sample_p1_integer_kernel_small(
             const size_t ij = matrix_index(i, j, d);
             const size_t ji = matrix_index(j, i, d);
             const double a_ij = static_cast<double>(centered_residue_i64(
-                a_base[ij * a_stride + coeff_idx],
+                matrix_load_limb_u64(a_base, ij, coeff_idx, a_stride_bytes, a_coeff_bytes),
                 modulus));
             const double d_ij = static_cast<double>(centered_residue_i64(
-                d_base[ij * d_stride + coeff_idx],
+                matrix_load_limb_u64(d_base, ij, coeff_idx, d_stride_bytes, d_coeff_bytes),
                 modulus));
             const double b_ij = static_cast<double>(centered_residue_i64(
-                b_base[ij * b_stride + coeff_idx],
+                matrix_load_limb_u64(b_base, ij, coeff_idx, b_stride_bytes, b_coeff_bytes),
                 modulus));
             const double b_ji = static_cast<double>(centered_residue_i64(
-                b_base[ji * b_stride + coeff_idx],
+                matrix_load_limb_u64(b_base, ji, coeff_idx, b_stride_bytes, b_coeff_bytes),
                 modulus));
 
             const double af = -sigma2 * a_ij + (i == j ? s2 : 0.0);
@@ -167,7 +171,7 @@ __global__ void matrix_sample_p1_integer_kernel_small(
     {
         const size_t tp_idx = matrix_index(row, col_idx, cols);
         const double c_centered = static_cast<double>(centered_residue_i64(
-            tp2_base[tp_idx * tp2_stride + coeff_idx],
+            matrix_load_limb_u64(tp2_base, tp_idx, coeff_idx, tp2_stride_bytes, tp2_coeff_bytes),
             modulus));
         mean[row] = c_scale * c_centered;
     }
@@ -222,14 +226,18 @@ __global__ void matrix_sample_p1_integer_kernel_small(
 }
 
 __global__ void matrix_sample_p1_integer_kernel_large(
-    const uint64_t *a_base,
-    const uint64_t *b_base,
-    const uint64_t *d_base,
-    const uint64_t *tp2_base,
-    size_t a_stride,
-    size_t b_stride,
-    size_t d_stride,
-    size_t tp2_stride,
+    const uint8_t *a_base,
+    const uint8_t *b_base,
+    const uint8_t *d_base,
+    const uint8_t *tp2_base,
+    size_t a_stride_bytes,
+    size_t b_stride_bytes,
+    size_t d_stride_bytes,
+    size_t tp2_stride_bytes,
+    uint8_t a_coeff_bytes,
+    uint8_t b_coeff_bytes,
+    uint8_t d_coeff_bytes,
+    uint8_t tp2_coeff_bytes,
     size_t d,
     size_t cols,
     size_t n,
@@ -295,16 +303,16 @@ __global__ void matrix_sample_p1_integer_kernel_large(
             const size_t ij = matrix_index(i, j, d);
             const size_t ji = matrix_index(j, i, d);
             const double a_ij = static_cast<double>(centered_residue_i64(
-                a_base[ij * a_stride + coeff_idx],
+                matrix_load_limb_u64(a_base, ij, coeff_idx, a_stride_bytes, a_coeff_bytes),
                 modulus));
             const double d_ij = static_cast<double>(centered_residue_i64(
-                d_base[ij * d_stride + coeff_idx],
+                matrix_load_limb_u64(d_base, ij, coeff_idx, d_stride_bytes, d_coeff_bytes),
                 modulus));
             const double b_ij = static_cast<double>(centered_residue_i64(
-                b_base[ij * b_stride + coeff_idx],
+                matrix_load_limb_u64(b_base, ij, coeff_idx, b_stride_bytes, b_coeff_bytes),
                 modulus));
             const double b_ji = static_cast<double>(centered_residue_i64(
-                b_base[ji * b_stride + coeff_idx],
+                matrix_load_limb_u64(b_base, ji, coeff_idx, b_stride_bytes, b_coeff_bytes),
                 modulus));
 
             const double af = -sigma2 * a_ij + (i == j ? s2 : 0.0);
@@ -323,7 +331,7 @@ __global__ void matrix_sample_p1_integer_kernel_large(
     {
         const size_t tp_idx = matrix_index(row, col_idx, cols);
         const double c_centered = static_cast<double>(centered_residue_i64(
-            tp2_base[tp_idx * tp2_stride + coeff_idx],
+            matrix_load_limb_u64(tp2_base, tp_idx, coeff_idx, tp2_stride_bytes, tp2_coeff_bytes),
             modulus));
         mean[row] = c_scale * c_centered;
     }
@@ -379,8 +387,9 @@ __global__ void matrix_sample_p1_integer_kernel_large(
 
 __global__ void matrix_scatter_p1_integer_to_limb_kernel(
     const int64_t *sampled_in,
-    uint64_t *out_base,
-    size_t out_stride,
+    uint8_t *out_base,
+    size_t out_stride_bytes,
+    uint8_t out_coeff_bytes,
     size_t entry_count,
     size_t n,
     uint64_t modulus)
@@ -394,15 +403,22 @@ __global__ void matrix_scatter_p1_integer_to_limb_kernel(
 
     const size_t entry_idx = idx / n;
     const size_t coeff_idx = idx - entry_idx * n;
-    out_base[entry_idx * out_stride + coeff_idx] = signed_mod_i64(sampled_in[idx], modulus);
+    matrix_store_limb_u64(
+        out_base,
+        entry_idx,
+        coeff_idx,
+        out_stride_bytes,
+        out_coeff_bytes,
+        signed_mod_i64(sampled_in[idx], modulus));
 }
 
 __global__ void matrix_gauss_samp_gq_arb_base_sample_kernel(
-    const uint64_t *src_base,
+    const uint8_t *src_base,
     int64_t *sampled_digits,
     size_t poly_count,
     size_t n,
-    size_t src_stride,
+    size_t src_stride_bytes,
+    uint8_t src_coeff_bytes,
     uint64_t tower_modulus,
     uint32_t base_bits,
     uint32_t digits_per_tower,
@@ -424,7 +440,8 @@ __global__ void matrix_gauss_samp_gq_arb_base_sample_kernel(
     const size_t poly_idx = idx / n;
     const size_t coeff_idx = idx - poly_idx * n;
 
-    uint64_t value = src_base[poly_idx * src_stride + coeff_idx];
+    uint64_t value =
+        matrix_load_limb_u64(src_base, poly_idx, coeff_idx, src_stride_bytes, src_coeff_bytes);
     if (tower_modulus != 0)
     {
         value %= tower_modulus;
@@ -531,8 +548,9 @@ __global__ void matrix_gauss_samp_gq_arb_base_sample_kernel(
 
 __global__ void matrix_gauss_samp_gq_arb_base_scatter_kernel(
     const int64_t *sampled_digits,
-    uint64_t *const *dst_bases,
-    const size_t *dst_strides,
+    uint8_t *const *dst_bases,
+    const size_t *dst_stride_bytes,
+    const uint8_t *dst_coeff_bytes,
     const uint64_t *out_moduli,
     size_t out_limb_count,
     size_t poly_count,
@@ -554,7 +572,7 @@ __global__ void matrix_gauss_samp_gq_arb_base_scatter_kernel(
     {
         return;
     }
-    if (!sampled_digits || !dst_bases || !dst_strides || !out_moduli || src_cols == 0 || out_cols == 0 || log_base_q == 0)
+    if (!sampled_digits || !dst_bases || !dst_stride_bytes || !dst_coeff_bytes || !out_moduli || src_cols == 0 || out_cols == 0 || log_base_q == 0)
     {
         return;
     }
@@ -563,10 +581,11 @@ __global__ void matrix_gauss_samp_gq_arb_base_scatter_kernel(
         return;
     }
 
-    uint64_t *dst_base = dst_bases[out_limb];
-    const size_t dst_stride = dst_strides[out_limb];
+    uint8_t *dst_base = dst_bases[out_limb];
+    const size_t dst_stride = dst_stride_bytes[out_limb];
+    const uint8_t dst_bytes = dst_coeff_bytes[out_limb];
     const uint64_t out_modulus = out_moduli[out_limb];
-    if (!dst_base || dst_stride < n)
+    if (!dst_base || dst_bytes == 0 || dst_stride < n * static_cast<size_t>(dst_bytes))
     {
         return;
     }
@@ -582,16 +601,23 @@ __global__ void matrix_gauss_samp_gq_arb_base_scatter_kernel(
         const int64_t out_digit = sampled_digits[sample_idx];
         const size_t out_row = row * log_base_q + src_digit_offset + static_cast<size_t>(digit_idx);
         const size_t out_poly_idx = out_row * out_cols + col;
-        dst_base[out_poly_idx * dst_stride + coeff_idx] = signed_mod_i64(out_digit, out_modulus);
+        matrix_store_limb_u64(
+            dst_base,
+            out_poly_idx,
+            coeff_idx,
+            dst_stride,
+            dst_bytes,
+            signed_mod_i64(out_digit, out_modulus));
     }
 }
 
 int launch_gauss_samp_gq_arb_base_sample_kernel(
-    const uint64_t *src_base,
+    const uint8_t *src_base,
     int64_t *sampled_digits,
     size_t poly_count,
     size_t n,
-    size_t src_stride,
+    size_t src_stride_bytes,
+    uint8_t src_coeff_bytes,
     uint64_t tower_modulus,
     uint32_t base_bits,
     uint32_t digits_per_tower,
@@ -609,7 +635,7 @@ int launch_gauss_samp_gq_arb_base_sample_kernel(
     {
         return 0;
     }
-    if (src_stride < n)
+    if (src_coeff_bytes == 0 || src_stride_bytes < n * static_cast<size_t>(src_coeff_bytes))
     {
         return set_error("invalid stride in matrix_gauss_samp_gq_arb_base_sample_kernel");
     }
@@ -632,7 +658,8 @@ int launch_gauss_samp_gq_arb_base_sample_kernel(
         sampled_digits,
         poly_count,
         n,
-        src_stride,
+        src_stride_bytes,
+        src_coeff_bytes,
         tower_modulus,
         base_bits,
         digits_per_tower,
@@ -649,8 +676,9 @@ int launch_gauss_samp_gq_arb_base_sample_kernel(
 
 int launch_gauss_samp_gq_arb_base_scatter_kernel(
     const int64_t *sampled_digits,
-    uint64_t *const *dst_bases,
-    const size_t *dst_strides,
+    uint8_t *const *dst_bases,
+    const size_t *dst_stride_bytes,
+    const uint8_t *dst_coeff_bytes,
     const uint64_t *out_moduli,
     size_t out_limb_count,
     size_t poly_count,
@@ -663,7 +691,7 @@ int launch_gauss_samp_gq_arb_base_scatter_kernel(
     int device,
     cudaStream_t stream)
 {
-    if (!sampled_digits || !dst_bases || !dst_strides || !out_moduli)
+    if (!sampled_digits || !dst_bases || !dst_stride_bytes || !dst_coeff_bytes || !out_moduli)
     {
         return set_error("null pointer in matrix_gauss_samp_gq_arb_base_scatter_kernel");
     }
@@ -697,7 +725,8 @@ int launch_gauss_samp_gq_arb_base_scatter_kernel(
     matrix_gauss_samp_gq_arb_base_scatter_kernel<<<grid, threads, 0, stream>>>(
         sampled_digits,
         dst_bases,
-        dst_strides,
+        dst_stride_bytes,
+        dst_coeff_bytes,
         out_moduli,
         out_limb_count,
         poly_count,
@@ -717,14 +746,18 @@ int launch_gauss_samp_gq_arb_base_scatter_kernel(
 
 
 int launch_sample_p1_integer_kernel(
-    const uint64_t *a_base,
-    const uint64_t *b_base,
-    const uint64_t *d_base,
-    const uint64_t *tp2_base,
-    size_t a_stride,
-    size_t b_stride,
-    size_t d_stride,
-    size_t tp2_stride,
+    const uint8_t *a_base,
+    const uint8_t *b_base,
+    const uint8_t *d_base,
+    const uint8_t *tp2_base,
+    size_t a_stride_bytes,
+    size_t b_stride_bytes,
+    size_t d_stride_bytes,
+    size_t tp2_stride_bytes,
+    uint8_t a_coeff_bytes,
+    uint8_t b_coeff_bytes,
+    uint8_t d_coeff_bytes,
+    uint8_t tp2_coeff_bytes,
     size_t d,
     size_t cols,
     size_t n,
@@ -747,7 +780,11 @@ int launch_sample_p1_integer_kernel(
     {
         return set_error("null base pointer in matrix_sample_p1_integer_kernel");
     }
-    if (a_stride < n || b_stride < n || d_stride < n || tp2_stride < n)
+    if (a_coeff_bytes == 0 || b_coeff_bytes == 0 || d_coeff_bytes == 0 || tp2_coeff_bytes == 0 ||
+        a_stride_bytes < n * static_cast<size_t>(a_coeff_bytes) ||
+        b_stride_bytes < n * static_cast<size_t>(b_coeff_bytes) ||
+        d_stride_bytes < n * static_cast<size_t>(d_coeff_bytes) ||
+        tp2_stride_bytes < n * static_cast<size_t>(tp2_coeff_bytes))
     {
         return set_error("invalid stride in matrix_sample_p1_integer_kernel");
     }
@@ -810,10 +847,14 @@ int launch_sample_p1_integer_kernel(
             b_base,
             d_base,
             tp2_base,
-            a_stride,
-            b_stride,
-            d_stride,
-            tp2_stride,
+            a_stride_bytes,
+            b_stride_bytes,
+            d_stride_bytes,
+            tp2_stride_bytes,
+            a_coeff_bytes,
+            b_coeff_bytes,
+            d_coeff_bytes,
+            tp2_coeff_bytes,
             d,
             cols,
             n,
@@ -944,10 +985,14 @@ int launch_sample_p1_integer_kernel(
                 b_base,
                 d_base,
                 tp2_base,
-                a_stride,
-                b_stride,
-                d_stride,
-                tp2_stride,
+                a_stride_bytes,
+                b_stride_bytes,
+                d_stride_bytes,
+                tp2_stride_bytes,
+                a_coeff_bytes,
+                b_coeff_bytes,
+                d_coeff_bytes,
+                tp2_coeff_bytes,
                 d,
                 cols,
                 n,
@@ -992,8 +1037,9 @@ int launch_sample_p1_integer_kernel(
 
 int launch_scatter_p1_integer_to_limb_kernel_device(
     const int64_t *sampled_in_device,
-    uint64_t *out_base,
-    size_t out_stride,
+    uint8_t *out_base,
+    size_t out_stride_bytes,
+    uint8_t out_coeff_bytes,
     size_t entry_count,
     size_t n,
     uint64_t modulus,
@@ -1012,7 +1058,7 @@ int launch_scatter_p1_integer_to_limb_kernel_device(
     {
         return set_error("null output base pointer in matrix_scatter_p1_integer_to_limb_kernel");
     }
-    if (out_stride < n)
+    if (out_coeff_bytes == 0 || out_stride_bytes < n * static_cast<size_t>(out_coeff_bytes))
     {
         return set_error("invalid output stride in matrix_scatter_p1_integer_to_limb_kernel");
     }
@@ -1033,7 +1079,8 @@ int launch_scatter_p1_integer_to_limb_kernel_device(
     matrix_scatter_p1_integer_to_limb_kernel<<<blocks, threads, 0, stream>>>(
         sampled_in_device,
         out_base,
-        out_stride,
+        out_stride_bytes,
+        out_coeff_bytes,
         entry_count,
         n,
         modulus);
@@ -1139,11 +1186,13 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
     }
 
     std::vector<dim3> active_limb_ids(crt_depth);
-    std::vector<uint64_t *> out_limb_bases(crt_depth, nullptr);
+    std::vector<uint8_t *> out_limb_bases(crt_depth, nullptr);
     std::vector<size_t> out_limb_strides(crt_depth, 0);
+    std::vector<uint8_t> out_limb_coeff_bytes(crt_depth, 0);
     std::vector<uint64_t> out_limb_moduli(crt_depth, 0);
-    std::vector<const uint64_t *> src_limb_bases(crt_depth, nullptr);
+    std::vector<const uint8_t *> src_limb_bases(crt_depth, nullptr);
     std::vector<size_t> src_limb_strides(crt_depth, 0);
+    std::vector<uint8_t> src_limb_coeff_bytes(crt_depth, 0);
 
     int dispatch_device = -1;
     for (int limb = 0; limb <= level; ++limb)
@@ -1169,25 +1218,27 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
             cleanup_tmp_inputs();
             return set_error("single-GPU path requires all out limbs on one device");
         }
-        uint64_t *dst_base = matrix_limb_ptr_by_id(out, 0, limb_id);
+        uint8_t *dst_base = matrix_limb_ptr_by_id(out, 0, limb_id);
         if (!dst_base)
         {
             cleanup_tmp_inputs();
             return set_error("null output limb base pointer in gpu_matrix_gauss_samp_gq_arb_base");
         }
-        if (limb_id.x >= out->shared_limb_buffers.size())
+        size_t dst_stride = 0;
+        uint8_t dst_coeff_bytes = 0;
+        if (!matrix_limb_metadata_by_id(out, limb_id, &dst_stride, &dst_coeff_bytes))
         {
             cleanup_tmp_inputs();
-            return set_error("invalid output partition index in gpu_matrix_gauss_samp_gq_arb_base");
+            return set_error("invalid output limb metadata in gpu_matrix_gauss_samp_gq_arb_base");
         }
-        const size_t dst_stride = out->shared_limb_buffers[limb_id.x].words_per_poly;
-        if (dst_stride < static_cast<size_t>(src->ctx->N))
+        if (dst_stride < static_cast<size_t>(src->ctx->N) * static_cast<size_t>(dst_coeff_bytes))
         {
             cleanup_tmp_inputs();
             return set_error("invalid output stride in gpu_matrix_gauss_samp_gq_arb_base");
         }
         out_limb_bases[limb_idx] = dst_base;
         out_limb_strides[limb_idx] = dst_stride;
+        out_limb_coeff_bytes[limb_idx] = dst_coeff_bytes;
     }
     if (dispatch_device < 0)
     {
@@ -1224,25 +1275,27 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
             cleanup_tmp_inputs();
             return set_error("single-GPU path requires all src limbs on one device");
         }
-        const uint64_t *src_base = matrix_limb_ptr_by_id(inputs_matrix, 0, src_limb_id);
+        const uint8_t *src_base = matrix_limb_ptr_by_id(inputs_matrix, 0, src_limb_id);
         if (!src_base)
         {
             cleanup_tmp_inputs();
             return set_error("null source limb base pointer in gpu_matrix_gauss_samp_gq_arb_base");
         }
-        if (src_limb_id.x >= inputs_matrix->shared_limb_buffers.size())
+        size_t src_stride = 0;
+        uint8_t src_coeff_bytes = 0;
+        if (!matrix_limb_metadata_by_id(inputs_matrix, src_limb_id, &src_stride, &src_coeff_bytes))
         {
             cleanup_tmp_inputs();
-            return set_error("invalid source partition index in gpu_matrix_gauss_samp_gq_arb_base");
+            return set_error("invalid source limb metadata in gpu_matrix_gauss_samp_gq_arb_base");
         }
-        const size_t src_stride = inputs_matrix->shared_limb_buffers[src_limb_id.x].words_per_poly;
-        if (src_stride < static_cast<size_t>(src->ctx->N))
+        if (src_stride < static_cast<size_t>(src->ctx->N) * static_cast<size_t>(src_coeff_bytes))
         {
             cleanup_tmp_inputs();
             return set_error("invalid source stride in gpu_matrix_gauss_samp_gq_arb_base");
         }
         src_limb_bases[src_idx] = src_base;
         src_limb_strides[src_idx] = src_stride;
+        src_limb_coeff_bytes[src_idx] = src_coeff_bytes;
     }
 
     size_t sampled_values = count;
@@ -1266,20 +1319,23 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         return set_error("sample byte overflow in gpu_matrix_gauss_samp_gq_arb_base");
     }
     const size_t sampled_bytes = sampled_values * sizeof(int64_t);
-    if (crt_depth > std::numeric_limits<size_t>::max() / sizeof(uint64_t *) ||
+    if (crt_depth > std::numeric_limits<size_t>::max() / sizeof(uint8_t *) ||
         crt_depth > std::numeric_limits<size_t>::max() / sizeof(size_t) ||
-        crt_depth > std::numeric_limits<size_t>::max() / sizeof(uint64_t))
+        crt_depth > std::numeric_limits<size_t>::max() / sizeof(uint64_t) ||
+        crt_depth > std::numeric_limits<size_t>::max() / sizeof(uint8_t))
     {
         cleanup_tmp_inputs();
         return set_error("limb metadata size overflow in gpu_matrix_gauss_samp_gq_arb_base");
     }
-    const size_t out_ptr_bytes = crt_depth * sizeof(uint64_t *);
+    const size_t out_ptr_bytes = crt_depth * sizeof(uint8_t *);
     const size_t out_stride_bytes = crt_depth * sizeof(size_t);
+    const size_t out_coeff_bytes = crt_depth * sizeof(uint8_t);
     const size_t out_moduli_bytes = crt_depth * sizeof(uint64_t);
 
     int64_t *sampled_digits_device = nullptr;
-    uint64_t **out_limb_bases_device = nullptr;
+    uint8_t **out_limb_bases_device = nullptr;
     size_t *out_limb_strides_device = nullptr;
+    uint8_t *out_limb_coeff_bytes_device = nullptr;
     uint64_t *out_limb_moduli_device = nullptr;
     auto cleanup = [&]()
     {
@@ -1302,6 +1358,11 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
             cudaFreeAsync(out_limb_strides_device, dispatch_stream);
             out_limb_strides_device = nullptr;
         }
+        if (out_limb_coeff_bytes_device)
+        {
+            cudaFreeAsync(out_limb_coeff_bytes_device, dispatch_stream);
+            out_limb_coeff_bytes_device = nullptr;
+        }
         if (out_limb_moduli_device)
         {
             cudaFreeAsync(out_limb_moduli_device, dispatch_stream);
@@ -1318,7 +1379,6 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
     }
 
     const size_t out_count = out->rows * out->cols;
-    const size_t coeff_bytes = static_cast<size_t>(src->ctx->N) * sizeof(uint64_t);
     for (int limb = 0; limb <= level; ++limb)
     {
         const dim3 out_limb_id = active_limb_ids[static_cast<size_t>(limb)];
@@ -1330,12 +1390,15 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         }
         if (out_count > 0)
         {
-            const size_t dst_pitch = out_limb_strides[static_cast<size_t>(limb)] * sizeof(uint64_t);
+            const size_t dst_pitch = out_limb_strides[static_cast<size_t>(limb)];
+            const size_t zero_width =
+                static_cast<size_t>(src->ctx->N) *
+                static_cast<size_t>(out_limb_coeff_bytes[static_cast<size_t>(limb)]);
             err = cudaMemset2DAsync(
                 out_limb_bases[static_cast<size_t>(limb)],
                 dst_pitch,
                 0,
-                coeff_bytes,
+                zero_width,
                 out_count,
                 dispatch_stream);
             if (err != cudaSuccess)
@@ -1364,6 +1427,15 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         cleanup();
         return set_error(err);
     }
+    err = cudaMallocAsync(
+        reinterpret_cast<void **>(&out_limb_coeff_bytes_device),
+        out_coeff_bytes,
+        dispatch_stream);
+    if (err != cudaSuccess)
+    {
+        cleanup();
+        return set_error(err);
+    }
     err = cudaMallocAsync(reinterpret_cast<void **>(&out_limb_moduli_device), out_moduli_bytes, dispatch_stream);
     if (err != cudaSuccess)
     {
@@ -1386,6 +1458,17 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         out_limb_strides_device,
         out_limb_strides.data(),
         out_stride_bytes,
+        cudaMemcpyHostToDevice,
+        dispatch_stream);
+    if (err != cudaSuccess)
+    {
+        cleanup();
+        return set_error(err);
+    }
+    err = cudaMemcpyAsync(
+        out_limb_coeff_bytes_device,
+        out_limb_coeff_bytes.data(),
+        out_coeff_bytes,
         cudaMemcpyHostToDevice,
         dispatch_stream);
     if (err != cudaSuccess)
@@ -1422,6 +1505,7 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
             count,
             static_cast<size_t>(src->ctx->N),
             src_limb_strides[src_idx],
+            src_limb_coeff_bytes[src_idx],
             src->ctx->moduli[src_idx],
             base_bits,
             digits_per_tower,
@@ -1442,6 +1526,7 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
             sampled_digits_device,
             out_limb_bases_device,
             out_limb_strides_device,
+            out_limb_coeff_bytes_device,
             out_limb_moduli_device,
             crt_depth,
             count,
@@ -1747,27 +1832,40 @@ extern "C" int gpu_matrix_sample_p1_full(
         cleanup();
         return set_error("input/output limb device mismatch in gpu_matrix_sample_p1_full");
     }
-    const uint64_t *ref_a_base = matrix_limb_ptr_by_id(a_input, 0, ref_limb_id);
-    const uint64_t *ref_b_base = matrix_limb_ptr_by_id(b_input, 0, ref_limb_id);
-    const uint64_t *ref_d_base = matrix_limb_ptr_by_id(d_input, 0, ref_limb_id);
-    const uint64_t *ref_tp2_base = matrix_limb_ptr_by_id(tp2_input, 0, ref_limb_id);
+    const uint8_t *ref_a_base = matrix_limb_ptr_by_id(a_input, 0, ref_limb_id);
+    const uint8_t *ref_b_base = matrix_limb_ptr_by_id(b_input, 0, ref_limb_id);
+    const uint8_t *ref_d_base = matrix_limb_ptr_by_id(d_input, 0, ref_limb_id);
+    const uint8_t *ref_tp2_base = matrix_limb_ptr_by_id(tp2_input, 0, ref_limb_id);
     if (!ref_a_base || !ref_b_base || !ref_d_base || !ref_tp2_base)
     {
         cleanup();
         return set_error("null reference limb base pointer in gpu_matrix_sample_p1_full");
     }
-    if (ref_limb_id.x >= a_input->shared_limb_buffers.size() ||
-        ref_limb_id.x >= b_input->shared_limb_buffers.size() ||
-        ref_limb_id.x >= d_input->shared_limb_buffers.size() ||
-        ref_limb_id.x >= tp2_input->shared_limb_buffers.size())
+    size_t ref_a_stride = 0;
+    size_t ref_b_stride = 0;
+    size_t ref_d_stride = 0;
+    size_t ref_tp2_stride = 0;
+    uint8_t ref_a_coeff_bytes = 0;
+    uint8_t ref_b_coeff_bytes = 0;
+    uint8_t ref_d_coeff_bytes = 0;
+    uint8_t ref_tp2_coeff_bytes = 0;
+    if (!matrix_limb_metadata_by_id(a_input, ref_limb_id, &ref_a_stride, &ref_a_coeff_bytes) ||
+        !matrix_limb_metadata_by_id(b_input, ref_limb_id, &ref_b_stride, &ref_b_coeff_bytes) ||
+        !matrix_limb_metadata_by_id(d_input, ref_limb_id, &ref_d_stride, &ref_d_coeff_bytes) ||
+        !matrix_limb_metadata_by_id(tp2_input, ref_limb_id, &ref_tp2_stride, &ref_tp2_coeff_bytes))
     {
         cleanup();
-        return set_error("invalid reference partition index in gpu_matrix_sample_p1_full");
+        return set_error("invalid reference limb metadata in gpu_matrix_sample_p1_full");
     }
-    const size_t ref_a_stride = a_input->shared_limb_buffers[ref_limb_id.x].words_per_poly;
-    const size_t ref_b_stride = b_input->shared_limb_buffers[ref_limb_id.x].words_per_poly;
-    const size_t ref_d_stride = d_input->shared_limb_buffers[ref_limb_id.x].words_per_poly;
-    const size_t ref_tp2_stride = tp2_input->shared_limb_buffers[ref_limb_id.x].words_per_poly;
+    const size_t n = static_cast<size_t>(a_mat->ctx->N);
+    if (ref_a_stride < n * static_cast<size_t>(ref_a_coeff_bytes) ||
+        ref_b_stride < n * static_cast<size_t>(ref_b_coeff_bytes) ||
+        ref_d_stride < n * static_cast<size_t>(ref_d_coeff_bytes) ||
+        ref_tp2_stride < n * static_cast<size_t>(ref_tp2_coeff_bytes))
+    {
+        cleanup();
+        return set_error("invalid reference limb stride in gpu_matrix_sample_p1_full");
+    }
     if (!ref_stream || ref_device < 0)
     {
         cleanup();
@@ -1821,9 +1919,13 @@ extern "C" int gpu_matrix_sample_p1_full(
         ref_b_stride,
         ref_d_stride,
         ref_tp2_stride,
+        ref_a_coeff_bytes,
+        ref_b_coeff_bytes,
+        ref_d_coeff_bytes,
+        ref_tp2_coeff_bytes,
         d_rows,
         cols,
-        static_cast<size_t>(a_mat->ctx->N),
+        n,
         a_mat->ctx->moduli[0],
         sigma,
         s,
@@ -2030,18 +2132,19 @@ extern "C" int gpu_matrix_sample_p1_full(
             cleanup();
             return status;
         }
-        uint64_t *out_base = matrix_limb_ptr_by_id(out, 0, limb_id);
+        uint8_t *out_base = matrix_limb_ptr_by_id(out, 0, limb_id);
         if (!out_base)
         {
             cleanup();
             return set_error("null output limb base pointer in gpu_matrix_sample_p1_full");
         }
-        if (limb_id.x >= out->shared_limb_buffers.size())
+        size_t out_stride = 0;
+        uint8_t out_coeff_bytes = 0;
+        if (!matrix_limb_metadata_by_id(out, limb_id, &out_stride, &out_coeff_bytes))
         {
             cleanup();
-            return set_error("invalid output partition index in gpu_matrix_sample_p1_full");
+            return set_error("invalid output limb metadata in gpu_matrix_sample_p1_full");
         }
-        const size_t out_stride = out->shared_limb_buffers[limb_id.x].words_per_poly;
 
         int64_t *sampled_for_device = nullptr;
         status = ensure_sample_buffer_on_device(out_device, out_stream, &sampled_for_device);
@@ -2055,6 +2158,7 @@ extern "C" int gpu_matrix_sample_p1_full(
             sampled_for_device,
             out_base,
             out_stride,
+            out_coeff_bytes,
             sampled_entry_count,
             static_cast<size_t>(a_mat->ctx->N),
             a_mat->ctx->moduli[static_cast<size_t>(limb)],

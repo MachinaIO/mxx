@@ -1,11 +1,11 @@
 # PR Tracking: docs/sub-execplan-main-sub-lifecycle
 
-- PR link: Pending (draft PR creation blocked until branch is pushed; `gh pr create --draft --fill` returned "you must first push the current branch to a remote, or use the --head flag")
-- PR creation date: Pending
+- PR link: https://github.com/MachinaIO/mxx/pull/58
+- PR creation date: 2026-03-02T14:12:02Z
 - Branch name: `docs/sub-execplan-main-sub-lifecycle`
-- Commit hash at PR creation time: Pending
+- Commit hash at PR creation time: `13c41aa387494b79fc4e223268ab8d211ae1bbc5`
 - Scope summary: Update ExecPlan policy documentation to introduce main/sub ExecPlan structure, rename pre/post completion verification event documents so they are explicit for main ExecPlans, and align lifecycle guidance and verification index references with the new model.
+- PR state: `OPEN` (draft).
 - Readiness decision (2026-03-02): Not ready for review.
 - Blockers:
-  - No PR exists yet for `docs/sub-execplan-main-sub-lifecycle` (`gh pr status` shows no associated PR).
-  - Draft PR creation remains blocked until the branch is pushed.
+  - PR remains draft and has not been transitioned with `gh pr ready`.

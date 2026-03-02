@@ -192,6 +192,7 @@ Current evidence snapshot:
   - `cargo test -r --lib circuit::evaluable::agr16`: pass (`0 tests`, compile/selection check)
   - `cargo test -r --lib`: pass (`138 passed; 0 failed; 2 ignored`)
   - `cargo +nightly fmt --all`: pass
+  - Post-completion persistence commit: `3edc66a` (`docs: finalize agr16 execplan completion lifecycle`), pushed to `origin/feat/agr16_encoding`.
 
 ## Interfaces and Dependencies
 

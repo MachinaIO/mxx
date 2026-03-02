@@ -195,4 +195,12 @@ mod tests {
         );
         assert_eq!(enc_out.plaintext, Some(expected_plain));
     }
+
+    #[test]
+    #[should_panic(expected = "AGR16EncodingSampler::new requires at least one secret polynomial")]
+    fn test_agr16_sampler_rejects_empty_secret_input() {
+        let params = DCRTPolyParams::default();
+        let empty_secrets: Vec<DCRTPoly> = Vec::new();
+        let _ = AGR16EncodingSampler::<DCRTPolyUniformSampler>::new(&params, &empty_secrets, None);
+    }
 }

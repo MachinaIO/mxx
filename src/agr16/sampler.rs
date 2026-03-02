@@ -99,15 +99,19 @@ where
     S: PolyUniformSampler + Sync,
 {
     pub fn new(
-        params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
+        _params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
         secrets: &[<S::M as PolyMatrix>::P],
         gauss_sigma: Option<f64>,
     ) -> Self {
+        assert!(
+            !secrets.is_empty(),
+            "AGR16EncodingSampler::new requires at least one secret polynomial"
+        );
         let secret = secrets
             .iter()
             .cloned()
             .reduce(|acc, next| acc + next)
-            .unwrap_or_else(|| <S::M as PolyMatrix>::P::const_zero(params));
+            .expect("AGR16EncodingSampler::new checked non-empty secrets");
         Self { secret, gauss_sigma, _s: PhantomData }
     }
 

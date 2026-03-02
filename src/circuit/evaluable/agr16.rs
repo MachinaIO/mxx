@@ -4,7 +4,39 @@ use crate::{
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
 };
-use std::marker::PhantomData;
+use dashmap::DashMap;
+use std::{
+    marker::PhantomData,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+static AGR16_SECRET_HANDLE_COUNTER: AtomicU64 = AtomicU64::new(1);
+static AGR16_SECRET_CACHE: OnceLock<DashMap<u64, Vec<u8>>> = OnceLock::new();
+
+fn agr16_secret_cache() -> &'static DashMap<u64, Vec<u8>> {
+    AGR16_SECRET_CACHE.get_or_init(DashMap::new)
+}
+
+fn put_agr16_secret(secret_bytes: Vec<u8>) -> u64 {
+    let handle = AGR16_SECRET_HANDLE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    agr16_secret_cache().insert(handle, secret_bytes);
+    handle
+}
+
+fn get_agr16_secret(handle: u64) -> Vec<u8> {
+    agr16_secret_cache()
+        .get(&handle)
+        .map(|entry| entry.value().clone())
+        .unwrap_or_else(|| {
+            panic!(
+                "AGR16 secret handle {} not found in process-local cache; compact data cannot be rehydrated in this process",
+                handle
+            )
+        })
+}
 
 #[derive(Debug, Clone)]
 pub struct Agr16PublicKeyCompact<M: PolyMatrix> {
@@ -22,7 +54,7 @@ pub struct Agr16EncodingCompact<M: PolyMatrix> {
     pub s_square_encoding_bytes: Vec<u8>,
     pub pubkey: Agr16PublicKeyCompact<M>,
     pub plaintext_bytes: Option<Vec<u8>>,
-    pub secret_bytes: Vec<u8>,
+    pub secret_handle: u64,
     pub _m: PhantomData<M>,
 }
 
@@ -99,18 +131,20 @@ impl<M: PolyMatrix> Evaluable for Agr16Encoding<M> {
     type Compact = Agr16EncodingCompact<M>;
 
     fn to_compact(self) -> Self::Compact {
+        let secret_handle = put_agr16_secret(self.secret.to_compact_bytes());
         Agr16EncodingCompact::<M> {
             vector_bytes: self.vector.into_compact_bytes(),
             c_times_s_bytes: self.c_times_s.into_compact_bytes(),
             s_square_encoding_bytes: self.s_square_encoding.into_compact_bytes(),
             pubkey: self.pubkey.to_compact(),
             plaintext_bytes: self.plaintext.map(|p| p.to_compact_bytes()),
-            secret_bytes: self.secret.to_compact_bytes(),
+            secret_handle,
             _m: PhantomData,
         }
     }
 
     fn from_compact(params: &Self::Params, compact: &Self::Compact) -> Self {
+        let secret_bytes = get_agr16_secret(compact.secret_handle);
         Agr16Encoding {
             vector: M::from_compact_bytes(params, &compact.vector_bytes),
             c_times_s: M::from_compact_bytes(params, &compact.c_times_s_bytes),
@@ -120,7 +154,7 @@ impl<M: PolyMatrix> Evaluable for Agr16Encoding<M> {
                 .plaintext_bytes
                 .as_ref()
                 .map(|bytes| M::P::from_compact_bytes(params, bytes)),
-            secret: M::P::from_compact_bytes(params, &compact.secret_bytes),
+            secret: M::P::from_compact_bytes(params, &secret_bytes),
         }
     }
 

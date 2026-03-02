@@ -24,7 +24,7 @@ namespace
             std::max(mat->shared_limb_buffers.size(), mat->shared_aux_buffers.size());
         for (size_t partition_idx = 0; partition_idx < partition_count; ++partition_idx)
         {
-            uint64_t *limb_ptr = nullptr;
+            uint8_t *limb_ptr = nullptr;
             int limb_device = -1;
             if (partition_idx < mat->shared_limb_buffers.size())
             {
@@ -234,6 +234,9 @@ extern "C" int gpu_matrix_create(
     for (size_t partition_idx = 0; partition_idx < partition_count; ++partition_idx)
     {
         size_t limbs = 0;
+        std::vector<uint8_t> local_limb_bytes;
+        std::vector<size_t> local_limb_offsets;
+        size_t coeff_bytes_per_poly = 0;
         if (level >= 0)
         {
             const size_t active_limbs = static_cast<size_t>(level + 1);
@@ -243,6 +246,12 @@ extern "C" int gpu_matrix_create(
                 delete mat;
                 return set_error("unexpected limb mapping size in gpu_matrix_create");
             }
+            if (ctx->limb_coeff_bytes.size() < active_limbs)
+            {
+                destroy_matrix_contents(mat);
+                delete mat;
+                return set_error("unexpected limb byte-width metadata in gpu_matrix_create");
+            }
             for (size_t limb = 0; limb < active_limbs; ++limb)
             {
                 const dim3 limb_id = ctx->limb_gpu_ids[limb];
@@ -250,6 +259,48 @@ extern "C" int gpu_matrix_create(
                 {
                     limbs = std::max(limbs, static_cast<size_t>(limb_id.y) + 1);
                 }
+            }
+            local_limb_bytes.assign(limbs, 0);
+            local_limb_offsets.assign(limbs, 0);
+            for (size_t limb = 0; limb < active_limbs; ++limb)
+            {
+                const dim3 limb_id = ctx->limb_gpu_ids[limb];
+                if (limb_id.x != partition_idx)
+                {
+                    continue;
+                }
+                if (limb_id.y >= local_limb_bytes.size())
+                {
+                    destroy_matrix_contents(mat);
+                    delete mat;
+                    return set_error("invalid local limb index in gpu_matrix_create");
+                }
+                local_limb_bytes[limb_id.y] = ctx->limb_coeff_bytes[limb];
+            }
+            for (size_t limb_idx = 0; limb_idx < limbs; ++limb_idx)
+            {
+                const uint8_t coeff_bytes = local_limb_bytes[limb_idx];
+                if (coeff_bytes == 0)
+                {
+                    destroy_matrix_contents(mat);
+                    delete mat;
+                    return set_error("missing local limb byte-width in gpu_matrix_create");
+                }
+                size_t limb_region_bytes = 0;
+                if (!checked_mul_size(n, static_cast<size_t>(coeff_bytes), &limb_region_bytes))
+                {
+                    destroy_matrix_contents(mat);
+                    delete mat;
+                    return set_error("matrix limb region overflow in gpu_matrix_create");
+                }
+                local_limb_offsets[limb_idx] = coeff_bytes_per_poly;
+                if (coeff_bytes_per_poly > static_cast<size_t>(-1) - limb_region_bytes)
+                {
+                    destroy_matrix_contents(mat);
+                    delete mat;
+                    return set_error("matrix limb offset overflow in gpu_matrix_create");
+                }
+                coeff_bytes_per_poly += limb_region_bytes;
             }
         }
         if (limbs == 0 || count == 0)
@@ -259,14 +310,10 @@ extern "C" int gpu_matrix_create(
 
         mat->exec_limb_states[partition_idx].resize(limbs);
 
-        size_t limb_words = 0;
-        size_t poly_words = 0;
-        size_t total_words = 0;
+        size_t bytes_per_poly = 0;
         size_t total_bytes = 0;
-        if (!checked_mul_size(n, limbs, &limb_words) ||
-            !checked_mul_size(limb_words, static_cast<size_t>(2), &poly_words) ||
-            !checked_mul_size(poly_words, count, &total_words) ||
-            !checked_mul_size(total_words, sizeof(uint64_t), &total_bytes))
+        if (!checked_mul_size(coeff_bytes_per_poly, static_cast<size_t>(2), &bytes_per_poly) ||
+            !checked_mul_size(bytes_per_poly, count, &total_bytes))
         {
             destroy_matrix_contents(mat);
             delete mat;
@@ -321,8 +368,8 @@ extern "C" int gpu_matrix_create(
             return set_error("missing allocation stream in gpu_matrix_create");
         }
 
-        uint64_t *base = nullptr;
-        err = cudaMallocAsync(&base, total_bytes, alloc_stream);
+        uint8_t *base = nullptr;
+        err = cudaMallocAsync(reinterpret_cast<void **>(&base), total_bytes, alloc_stream);
         if (err != cudaSuccess)
         {
             destroy_matrix_contents(mat);
@@ -397,9 +444,11 @@ extern "C" int gpu_matrix_create(
             ctx->gpu_ids[partition_idx],
             base,
             limbs,
-            poly_words,
-            total_words,
-            n};
+            bytes_per_poly,
+            total_bytes,
+            n,
+            std::move(local_limb_bytes),
+            std::move(local_limb_offsets)};
         mat->shared_aux_buffers[partition_idx] = GpuMatrix::SharedAuxBuffer{
             ctx->gpu_ids[partition_idx],
             aux_base,

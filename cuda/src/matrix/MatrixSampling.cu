@@ -208,10 +208,11 @@ __device__ __forceinline__ int64_t centered_residue_i64(uint64_t value, uint64_t
 }
 
 __global__ void matrix_sample_distribution_multi_limb_kernel(
-    uint64_t *dst_base,
+    uint8_t *dst_base,
     size_t poly_count,
     size_t n,
-    size_t dst_stride,
+    size_t dst_stride_bytes,
+    uint8_t dst_coeff_bytes,
     uint64_t modulus,
     uint32_t limb_idx,
     int dist_type,
@@ -280,14 +281,21 @@ __global__ void matrix_sample_distribution_multi_limb_kernel(
         sample = signed_mod_i64(z, modulus);
     }
 
-    dst_base[poly_idx * dst_stride + coeff_idx] = sample;
+    matrix_store_limb_u64(
+        dst_base,
+        poly_idx,
+        coeff_idx,
+        dst_stride_bytes,
+        dst_coeff_bytes,
+        sample);
 }
 
 int launch_sample_distribution_multi_limb_kernel(
-    uint64_t *dst_base,
+    uint8_t *dst_base,
     size_t poly_count,
     size_t n,
-    size_t dst_stride,
+    size_t dst_stride_bytes,
+    uint8_t dst_coeff_bytes,
     uint64_t modulus,
     uint32_t limb_idx,
     int dist_type,
@@ -313,7 +321,8 @@ int launch_sample_distribution_multi_limb_kernel(
         dst_base,
         poly_count,
         n,
-        dst_stride,
+        dst_stride_bytes,
+        dst_coeff_bytes,
         modulus,
         limb_idx,
         dist_type,
@@ -389,16 +398,17 @@ extern "C" int gpu_matrix_sample_distribution(
         {
             return set_error("invalid limb metadata in gpu_matrix_sample_distribution");
         }
-        uint64_t *dst_base = matrix_limb_ptr_by_id(out, 0, limb_id);
+        uint8_t *dst_base = matrix_limb_ptr_by_id(out, 0, limb_id);
         if (!dst_base)
         {
             return set_error("null output limb base pointer in gpu_matrix_sample_distribution");
         }
-        if (limb_id.x >= out->shared_limb_buffers.size())
+        size_t dst_stride_bytes = 0;
+        uint8_t dst_coeff_bytes = 0;
+        if (!matrix_limb_metadata_by_id(out, limb_id, &dst_stride_bytes, &dst_coeff_bytes))
         {
-            return set_error("invalid output partition index in gpu_matrix_sample_distribution");
+            return set_error("invalid output limb metadata in gpu_matrix_sample_distribution");
         }
-        const size_t dst_stride = out->shared_limb_buffers[limb_id.x].words_per_poly;
         cudaError_t err = cudaSetDevice(limb_device);
         if (err != cudaSuccess)
         {
@@ -408,7 +418,8 @@ extern "C" int gpu_matrix_sample_distribution(
             dst_base,
             count,
             static_cast<size_t>(out->ctx->N),
-            dst_stride,
+            dst_stride_bytes,
+            dst_coeff_bytes,
             out->ctx->moduli[static_cast<size_t>(limb)],
             static_cast<uint32_t>(limb),
             dist_type,

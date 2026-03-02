@@ -236,14 +236,35 @@ namespace
         return counts;
     }
 
+    uint8_t modulus_coeff_bytes(uint64_t modulus)
+    {
+        if (modulus == 0)
+        {
+            throw std::runtime_error("zero modulus in limb metadata");
+        }
+        const uint32_t bit_width = static_cast<uint32_t>(64U - __builtin_clzll(modulus));
+        const uint32_t coeff_bytes = (bit_width + 7U) / 8U;
+        if (coeff_bytes == 0 || coeff_bytes > 8U)
+        {
+            throw std::runtime_error("invalid modulus byte-width in limb metadata");
+        }
+        return static_cast<uint8_t>(coeff_bytes);
+    }
+
     void build_limb_metadata(
+        const std::vector<uint64_t> &moduli,
         size_t limb_count,
         size_t gpu_count,
         uint32_t dnum,
         std::vector<dim3> &limb_gpu_ids,
         std::vector<int> &limb_prime_ids,
-        std::vector<GpuLimbType> &limb_types)
+        std::vector<GpuLimbType> &limb_types,
+        std::vector<uint8_t> &limb_coeff_bytes)
     {
+        if (moduli.size() < limb_count)
+        {
+            throw std::runtime_error("modulus metadata size mismatch in build_limb_metadata");
+        }
         std::vector<uint32_t> next_local_index(gpu_count, 0);
         for (size_t limb = 0; limb < limb_count; ++limb)
         {
@@ -252,7 +273,9 @@ namespace
             const uint32_t local_index = next_local_index[partition]++;
             limb_gpu_ids[limb] = dim3(partition, local_index, 0);
             limb_prime_ids[limb] = static_cast<int>(limb);
-            limb_types[limb] = GPU_LIMB_U64;
+            const uint8_t coeff_bytes = modulus_coeff_bytes(moduli[limb]);
+            limb_coeff_bytes[limb] = coeff_bytes;
+            limb_types[limb] = coeff_bytes <= 4 ? GPU_LIMB_U32 : GPU_LIMB_U64;
         }
     }
 
@@ -566,13 +589,16 @@ extern "C"
             std::vector<dim3> limb_gpu_ids(limb_count, dim3{0, 0, 0});
             std::vector<int> limb_prime_ids(limb_count, -1);
             std::vector<GpuLimbType> limb_types(limb_count, GPU_LIMB_U64);
+            std::vector<uint8_t> limb_coeff_bytes(limb_count, 0);
             build_limb_metadata(
+                moduli_vec,
                 limb_count,
                 gpu_list.size(),
                 resolved_dnum,
                 limb_gpu_ids,
                 limb_prime_ids,
-                limb_types);
+                limb_types,
+                limb_coeff_bytes);
 
             std::vector<size_t> decomp_counts_by_partition =
                 compute_decomp_counts_by_partition(gpu_list.size(), resolved_dnum);
@@ -629,6 +655,7 @@ extern "C"
             gpu_ctx->limb_gpu_ids = std::move(limb_gpu_ids);
             gpu_ctx->limb_prime_ids = std::move(limb_prime_ids);
             gpu_ctx->limb_types = std::move(limb_types);
+            gpu_ctx->limb_coeff_bytes = std::move(limb_coeff_bytes);
             gpu_ctx->decomp_counts_by_partition = std::move(decomp_counts_by_partition);
             gpu_ctx->ntt_device_constants.reserve(gpu_ctx->gpu_ids.size());
             for (int device : gpu_ctx->gpu_ids)

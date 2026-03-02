@@ -22,6 +22,12 @@ Current registered design documents:
     1. Target behavior/properties with assumptions and limits.
     2. Core technical idea and trade-off rationale for VRAM reduction.
 
+- [agr16_recursive_auxiliary_chain.md](./agr16_recursive_auxiliary_chain.md)
+  - Purpose: Defines recursive auxiliary-chain invariants and depth sizing rules for AGR16 public evaluation.
+  - Roles:
+    1. Target behavior/properties with assumptions and limits.
+    2. Core technical idea and trade-off rationale for depth extension.
+
 When adding a design document, place it under `docs/design/` and add it to this index with:
 
 - a short purpose summary,

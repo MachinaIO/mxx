@@ -22,6 +22,8 @@ mod tests {
     };
     use keccak_asm::Keccak256;
 
+    const AUXILIARY_DEPTH: usize = 8;
+
     struct NoopAgr16PkPlt;
 
     impl PltEvaluator<Agr16PublicKey<DCRTPolyMatrix>> for NoopAgr16PkPlt {
@@ -72,7 +74,7 @@ mod tests {
         let tag_bytes = tag.to_le_bytes();
 
         let pubkey_sampler =
-            AGR16PublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, 2);
+            AGR16PublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, AUXILIARY_DEPTH);
         let reveal_plaintexts = vec![true; input_size];
         let pubkeys = pubkey_sampler.sample(params, &tag_bytes, &reveal_plaintexts);
 
@@ -94,9 +96,17 @@ mod tests {
         encoding: &Agr16Encoding<DCRTPolyMatrix>,
         secret: &DCRTPoly,
     ) {
-        let expected_c_times_s = (encoding.pubkey.c_times_s_pubkey.clone() * secret) +
+        assert!(
+            !encoding.pubkey.c_times_s_pubkeys.is_empty() &&
+                !encoding.c_times_s_encodings.is_empty(),
+            "AGR16 encoding must keep at least one recursive c_times_s level"
+        );
+        let expected_c_times_s = (encoding.pubkey.c_times_s_pubkeys[0].clone() * secret) +
             (encoding.vector.clone() * secret);
-        assert_eq!(encoding.c_times_s, expected_c_times_s, "AGR16 c_times_s invariant must hold");
+        assert_eq!(
+            encoding.c_times_s_encodings[0], expected_c_times_s,
+            "AGR16 c_times_s invariant must hold"
+        );
     }
 
     fn assert_full_auxiliary_invariants(
@@ -105,28 +115,54 @@ mod tests {
         secret: &DCRTPoly,
     ) {
         let secret_matrix = scalar_matrix(params, secret.clone());
-        assert_primary_auxiliary_invariants(encoding, secret);
-        let expected_c_times_s_times_s = (encoding.pubkey.c_times_s_times_s_pubkey.clone() *
-            secret) +
-            (encoding.c_times_s.clone() * secret);
         assert_eq!(
-            encoding.c_times_s_times_s, expected_c_times_s_times_s,
-            "AGR16 c_times_s_times_s invariant must hold"
+            encoding.pubkey.c_times_s_pubkeys.len(),
+            encoding.c_times_s_encodings.len(),
+            "AGR16 c_times_s invariant depth mismatch between key and encoding"
+        );
+        assert_eq!(
+            encoding.pubkey.s_power_pubkeys.len(),
+            encoding.s_power_encodings.len(),
+            "AGR16 s-power advice depth mismatch between key and encoding"
         );
 
-        let expected_s_square =
-            (encoding.pubkey.s_square_pubkey.clone() * secret) + (secret_matrix.clone() * secret);
-        assert_eq!(
-            encoding.s_square_encoding, expected_s_square,
-            "AGR16 E(s^2) advice invariant must hold"
-        );
+        let mut current_c_level = encoding.vector.clone();
+        for level in 0..encoding.c_times_s_encodings.len() {
+            let expected = (encoding.pubkey.c_times_s_pubkeys[level].clone() * secret) +
+                (current_c_level.clone() * secret);
+            assert_eq!(
+                encoding.c_times_s_encodings[level], expected,
+                "AGR16 c_times_s recursive invariant must hold at level {level}"
+            );
+            current_c_level = encoding.c_times_s_encodings[level].clone();
+        }
 
-        let expected_s_square_times_s = (encoding.pubkey.s_square_times_s_pubkey.clone() * secret) +
-            (encoding.s_square_encoding.clone() * secret);
-        assert_eq!(
-            encoding.s_square_times_s_encoding, expected_s_square_times_s,
-            "AGR16 E(E(s^2) * s) advice invariant must hold"
-        );
+        let mut current_s_level = secret_matrix;
+        for level in 0..encoding.s_power_encodings.len() {
+            let expected = (encoding.pubkey.s_power_pubkeys[level].clone() * secret) +
+                (current_s_level.clone() * secret);
+            assert_eq!(
+                encoding.s_power_encodings[level], expected,
+                "AGR16 s-power recursive invariant must hold at level {level}"
+            );
+            current_s_level = encoding.s_power_encodings[level].clone();
+        }
+    }
+
+    fn assert_eval_output_matches_equation_5_1(
+        params: &DCRTPolyParams,
+        secret: &DCRTPoly,
+        pk_out: &Agr16PublicKey<DCRTPolyMatrix>,
+        enc_out: &Agr16Encoding<DCRTPolyMatrix>,
+        expected_plain: DCRTPoly,
+        context: &str,
+    ) {
+        assert_eq!(enc_out.pubkey, *pk_out);
+        let expected_ct = (scalar_matrix(params, secret.clone()) * pk_out.matrix.clone()) +
+            scalar_matrix(params, expected_plain.clone());
+        assert_eq!(enc_out.vector, expected_ct, "{context}");
+        assert_primary_auxiliary_invariants(enc_out, secret);
+        assert_eq!(enc_out.plaintext, Some(expected_plain));
     }
 
     #[test]
@@ -181,17 +217,14 @@ mod tests {
         let expected_plain = (plaintexts[0].clone() + plaintexts[1].clone()) *
             plaintexts[2].clone() +
             plaintexts[0].clone();
-
-        assert_eq!(enc_out.pubkey, *pk_out);
-
-        let expected_ct = (scalar_matrix(&params, secret.clone()) * pk_out.matrix.clone()) +
-            scalar_matrix(&params, expected_plain.clone());
-        assert_eq!(
-            enc_out.vector, expected_ct,
-            "Evaluated AGR16 ciphertext must satisfy Equation 5.1 when error=0"
+        assert_eval_output_matches_equation_5_1(
+            &params,
+            &secret,
+            pk_out,
+            enc_out,
+            expected_plain,
+            "Evaluated AGR16 ciphertext must satisfy Equation 5.1 when error=0",
         );
-        assert_primary_auxiliary_invariants(enc_out, &secret);
-        assert_eq!(enc_out.plaintext, Some(expected_plain));
     }
 
     #[test]
@@ -225,16 +258,121 @@ mod tests {
         let expected_plain = ((plaintexts[0].clone() * plaintexts[1].clone()) +
             plaintexts[2].clone()) *
             plaintexts[1].clone();
-
-        assert_eq!(enc_out.pubkey, *pk_out);
-
-        let expected_ct = (scalar_matrix(&params, secret.clone()) * pk_out.matrix.clone()) +
-            scalar_matrix(&params, expected_plain.clone());
-        assert_eq!(
-            enc_out.vector, expected_ct,
-            "Nested AGR16 multiplication output must satisfy Equation 5.1 when error=0"
+        assert_eval_output_matches_equation_5_1(
+            &params,
+            &secret,
+            pk_out,
+            enc_out,
+            expected_plain,
+            "Nested AGR16 multiplication output must satisfy Equation 5.1 when error=0",
         );
-        assert_eq!(enc_out.plaintext, Some(expected_plain));
+    }
+
+    #[test]
+    fn test_agr16_depth3_multiplication_preserves_equation_5_1_without_error() {
+        let params = DCRTPolyParams::default();
+        let (pubkeys, encodings, plaintexts, secret) = sample_fixture(4, &params);
+
+        // f(x1,x2,x3,x4) = (((x1 * x2) * x3) * x4)
+        let mut circuit = PolyCircuit::new();
+        let inputs = circuit.input(4);
+        let mul1 = circuit.mul_gate(inputs[0], inputs[1]);
+        let mul2 = circuit.mul_gate(mul1, inputs[2]);
+        let out = circuit.mul_gate(mul2, inputs[3]);
+        circuit.output(vec![out]);
+
+        let pk_outputs = circuit.eval(
+            &params,
+            pubkeys[0].clone(),
+            vec![pubkeys[1].clone(), pubkeys[2].clone(), pubkeys[3].clone(), pubkeys[4].clone()],
+            None::<&NoopAgr16PkPlt>,
+        );
+        let enc_outputs = circuit.eval(
+            &params,
+            encodings[0].clone(),
+            vec![
+                encodings[1].clone(),
+                encodings[2].clone(),
+                encodings[3].clone(),
+                encodings[4].clone(),
+            ],
+            None::<&NoopAgr16EncPlt>,
+        );
+
+        let expected_plain = ((plaintexts[0].clone() * plaintexts[1].clone()) *
+            plaintexts[2].clone()) *
+            plaintexts[3].clone();
+        assert_eval_output_matches_equation_5_1(
+            &params,
+            &secret,
+            &pk_outputs[0],
+            &enc_outputs[0],
+            expected_plain,
+            "Depth-3 AGR16 multiplication output must satisfy Equation 5.1 when error=0",
+        );
+    }
+
+    #[test]
+    fn test_agr16_depth4_composed_circuit_preserves_equation_5_1_without_error() {
+        let params = DCRTPolyParams::default();
+        let (pubkeys, encodings, plaintexts, secret) = sample_fixture(8, &params);
+
+        // f(x1..x8) = ((((x1 * x2) + x3) * (x4 * x5)) * (x6 + x7)) * x8
+        let mut circuit = PolyCircuit::new();
+        let inputs = circuit.input(8);
+        let mul12 = circuit.mul_gate(inputs[0], inputs[1]);
+        let add123 = circuit.add_gate(mul12, inputs[2]);
+        let mul45 = circuit.mul_gate(inputs[3], inputs[4]);
+        let mul_left = circuit.mul_gate(add123, mul45);
+        let add67 = circuit.add_gate(inputs[5], inputs[6]);
+        let mul_deep = circuit.mul_gate(mul_left, add67);
+        let out = circuit.mul_gate(mul_deep, inputs[7]);
+        circuit.output(vec![out]);
+
+        let pk_outputs = circuit.eval(
+            &params,
+            pubkeys[0].clone(),
+            vec![
+                pubkeys[1].clone(),
+                pubkeys[2].clone(),
+                pubkeys[3].clone(),
+                pubkeys[4].clone(),
+                pubkeys[5].clone(),
+                pubkeys[6].clone(),
+                pubkeys[7].clone(),
+                pubkeys[8].clone(),
+            ],
+            None::<&NoopAgr16PkPlt>,
+        );
+        let enc_outputs = circuit.eval(
+            &params,
+            encodings[0].clone(),
+            vec![
+                encodings[1].clone(),
+                encodings[2].clone(),
+                encodings[3].clone(),
+                encodings[4].clone(),
+                encodings[5].clone(),
+                encodings[6].clone(),
+                encodings[7].clone(),
+                encodings[8].clone(),
+            ],
+            None::<&NoopAgr16EncPlt>,
+        );
+
+        let expected_plain = ((((plaintexts[0].clone() * plaintexts[1].clone()) +
+            plaintexts[2].clone()) *
+            (plaintexts[3].clone() * plaintexts[4].clone())) *
+            (plaintexts[5].clone() + plaintexts[6].clone())) *
+            plaintexts[7].clone();
+        assert_eval_output_matches_equation_5_1(
+            &params,
+            &secret,
+            &pk_outputs[0],
+            &enc_outputs[0],
+            expected_plain,
+            "Depth-4 AGR16 composed output must satisfy Equation 5.1 when error=0",
+        );
     }
 
     #[test]

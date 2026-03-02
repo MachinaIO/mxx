@@ -17,6 +17,14 @@ fn tagged_bytes(tag: &[u8], purpose: &[u8], d: usize) -> Vec<u8> {
     out
 }
 
+fn tagged_level_bytes(tag: &[u8], purpose: &[u8], d: usize, level: usize) -> Vec<u8> {
+    let mut purpose_with_level = Vec::with_capacity(purpose.len() + 1 + 20);
+    purpose_with_level.extend_from_slice(purpose);
+    purpose_with_level.extend_from_slice(b"_");
+    purpose_with_level.extend_from_slice(level.to_string().as_bytes());
+    tagged_bytes(tag, &purpose_with_level, d)
+}
+
 fn scalar_matrix<M: PolyMatrix>(params: &<M::P as Poly>::Params, scalar: M::P) -> M {
     M::from_poly_vec_row(params, vec![scalar])
 }
@@ -35,6 +43,7 @@ where
     S: PolyHashSampler<K>,
 {
     pub fn new(hash_key: [u8; 32], d: usize) -> Self {
+        assert!(d > 0, "AGR16PublicKeySampler::new requires positive recursive auxiliary depth");
         Self { hash_key, d, _k: PhantomData, _s: PhantomData }
     }
 
@@ -55,48 +64,41 @@ where
             input_size,
             DistType::FinRingDist,
         );
-        let c_times_s_labels = sampler.sample_hash(
-            params,
-            self.hash_key,
-            tagged_bytes(tag, b"cts_pk", self.d),
-            1,
-            input_size,
-            DistType::FinRingDist,
-        );
-        let c_times_s_times_s_labels = sampler.sample_hash(
-            params,
-            self.hash_key,
-            tagged_bytes(tag, b"ctss_pk", self.d),
-            1,
-            input_size,
-            DistType::FinRingDist,
-        );
-        let s_square_pubkey = sampler.sample_hash(
-            params,
-            self.hash_key,
-            tagged_bytes(tag, b"s2_pk", self.d),
-            1,
-            1,
-            DistType::FinRingDist,
-        );
-        let s_square_times_s_pubkey = sampler.sample_hash(
-            params,
-            self.hash_key,
-            tagged_bytes(tag, b"s2s_pk", self.d),
-            1,
-            1,
-            DistType::FinRingDist,
-        );
+        let c_times_s_labels = (0..self.d)
+            .map(|level| {
+                sampler.sample_hash(
+                    params,
+                    self.hash_key,
+                    tagged_level_bytes(tag, b"cts_pk", self.d, level),
+                    1,
+                    input_size,
+                    DistType::FinRingDist,
+                )
+            })
+            .collect::<Vec<_>>();
+        let s_power_pubkeys = (0..self.d)
+            .map(|level| {
+                sampler.sample_hash(
+                    params,
+                    self.hash_key,
+                    tagged_level_bytes(tag, b"s_power_pk", self.d, level),
+                    1,
+                    1,
+                    DistType::FinRingDist,
+                )
+            })
+            .collect::<Vec<_>>();
 
         parallel_iter!(0..input_size)
             .map(|idx| {
                 let reveal_plaintext = if idx == 0 { true } else { reveal_plaintexts[idx - 1] };
                 Agr16PublicKey::new(
                     labels.slice_columns(idx, idx + 1),
-                    c_times_s_labels.slice_columns(idx, idx + 1),
-                    c_times_s_times_s_labels.slice_columns(idx, idx + 1),
-                    s_square_pubkey.clone(),
-                    s_square_times_s_pubkey.clone(),
+                    c_times_s_labels
+                        .iter()
+                        .map(|label| label.slice_columns(idx, idx + 1))
+                        .collect(),
+                    s_power_pubkeys.clone(),
                     reveal_plaintext,
                 )
             })
@@ -151,6 +153,11 @@ where
         parallel_iter!(0..packed_input_size)
             .map(|idx| {
                 let pubkey: Agr16PublicKey<S::M> = public_keys[idx].borrow().clone();
+                assert_eq!(
+                    pubkey.c_times_s_pubkeys.len(),
+                    pubkey.s_power_pubkeys.len(),
+                    "AGR16 public key must provide matching recursive auxiliary depths"
+                );
                 let plaintext: <S::M as PolyMatrix>::P = plaintexts[idx].clone();
                 let message = scalar_matrix::<S::M>(params, plaintext.clone());
 
@@ -164,23 +171,38 @@ where
 
                 // Section 5.1 relation in this module's convention: c = s * PK + m + err.
                 let vector = (secret_matrix.clone() * &pubkey.matrix) + message + error;
-                let c_times_s = (pubkey.c_times_s_pubkey.clone() * &self.secret) +
-                    (vector.clone() * &self.secret);
-                let c_times_s_times_s = (pubkey.c_times_s_times_s_pubkey.clone() * &self.secret) +
-                    (c_times_s.clone() * &self.secret);
-                let s_square_encoding = (pubkey.s_square_pubkey.clone() * &self.secret) +
-                    (secret_matrix.clone() * &self.secret);
-                let s_square_times_s_encoding = (pubkey.s_square_times_s_pubkey.clone() *
-                    &self.secret) +
-                    (s_square_encoding.clone() * &self.secret);
+                let c_times_s_encodings = {
+                    let mut current = vector.clone();
+                    pubkey
+                        .c_times_s_pubkeys
+                        .iter()
+                        .map(|level_pubkey| {
+                            let next = (level_pubkey.clone() * &self.secret) +
+                                (current.clone() * &self.secret);
+                            current = next.clone();
+                            next
+                        })
+                        .collect()
+                };
+                let s_power_encodings = {
+                    let mut current = secret_matrix.clone();
+                    pubkey
+                        .s_power_pubkeys
+                        .iter()
+                        .map(|level_pubkey| {
+                            let next = (level_pubkey.clone() * &self.secret) +
+                                (current.clone() * &self.secret);
+                            current = next.clone();
+                            next
+                        })
+                        .collect()
+                };
 
                 Agr16Encoding::new(
                     vector,
                     pubkey.clone(),
-                    c_times_s,
-                    c_times_s_times_s,
-                    s_square_encoding,
-                    s_square_times_s_encoding,
+                    c_times_s_encodings,
+                    s_power_encodings,
                     if pubkey.reveal_plaintext { Some(plaintext) } else { None },
                 )
             })

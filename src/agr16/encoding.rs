@@ -6,10 +6,8 @@ use std::ops::{Add, Mul, Sub};
 pub struct Agr16Encoding<M: PolyMatrix> {
     pub vector: M,
     pub pubkey: Agr16PublicKey<M>,
-    pub c_times_s: M,
-    pub c_times_s_times_s: M,
-    pub s_square_encoding: M,
-    pub s_square_times_s_encoding: M,
+    pub c_times_s_encodings: Vec<M>,
+    pub s_power_encodings: Vec<M>,
     pub plaintext: Option<<M as PolyMatrix>::P>,
 }
 
@@ -17,21 +15,11 @@ impl<M: PolyMatrix> Agr16Encoding<M> {
     pub fn new(
         vector: M,
         pubkey: Agr16PublicKey<M>,
-        c_times_s: M,
-        c_times_s_times_s: M,
-        s_square_encoding: M,
-        s_square_times_s_encoding: M,
+        c_times_s_encodings: Vec<M>,
+        s_power_encodings: Vec<M>,
         plaintext: Option<<M as PolyMatrix>::P>,
     ) -> Self {
-        Self {
-            vector,
-            pubkey,
-            c_times_s,
-            c_times_s_times_s,
-            s_square_encoding,
-            s_square_times_s_encoding,
-            plaintext,
-        }
+        Self { vector, pubkey, c_times_s_encodings, s_power_encodings, plaintext }
     }
 
     pub fn concat_vector(&self, others: &[Self]) -> M {
@@ -40,13 +28,16 @@ impl<M: PolyMatrix> Agr16Encoding<M> {
 
     fn assert_compatible(&self, other: &Self) {
         assert_eq!(
-            self.s_square_encoding, other.s_square_encoding,
-            "AGR16 encodings must share the same E(s^2) advice encoding"
+            self.s_power_encodings, other.s_power_encodings,
+            "AGR16 encodings must share the same recursive s-power advice encodings"
         );
-        assert_eq!(
-            self.s_square_times_s_encoding, other.s_square_times_s_encoding,
-            "AGR16 encodings must share the same E(E(s^2) * s) advice encoding"
-        );
+    }
+
+    fn convolution_term(lhs: &[M], rhs: &[M], level: usize) -> M {
+        (0..=level)
+            .map(|idx| lhs[idx].clone() * &rhs[level - idx])
+            .reduce(|acc, value| acc + &value)
+            .expect("AGR16 convolution requires at least one term")
     }
 }
 
@@ -67,15 +58,15 @@ impl<M: PolyMatrix> Add<&Self> for Agr16Encoding<M> {
             (Some(a), Some(b)) => Some(a + b),
             _ => None,
         };
-        let c_times_s = self.c_times_s + &other.c_times_s;
-        let c_times_s_times_s = self.c_times_s_times_s + &other.c_times_s_times_s;
+        let c_times_s_encodings =
+            (0..self.c_times_s_encodings.len().min(other.c_times_s_encodings.len()))
+                .map(|idx| self.c_times_s_encodings[idx].clone() + &other.c_times_s_encodings[idx])
+                .collect();
         Self {
             vector,
             pubkey,
-            c_times_s,
-            c_times_s_times_s,
-            s_square_encoding: self.s_square_encoding,
-            s_square_times_s_encoding: self.s_square_times_s_encoding,
+            c_times_s_encodings,
+            s_power_encodings: self.s_power_encodings,
             plaintext,
         }
     }
@@ -98,15 +89,15 @@ impl<M: PolyMatrix> Sub<&Self> for Agr16Encoding<M> {
             (Some(a), Some(b)) => Some(a - b),
             _ => None,
         };
-        let c_times_s = self.c_times_s - &other.c_times_s;
-        let c_times_s_times_s = self.c_times_s_times_s - &other.c_times_s_times_s;
+        let c_times_s_encodings =
+            (0..self.c_times_s_encodings.len().min(other.c_times_s_encodings.len()))
+                .map(|idx| self.c_times_s_encodings[idx].clone() - &other.c_times_s_encodings[idx])
+                .collect();
         Self {
             vector,
             pubkey,
-            c_times_s,
-            c_times_s_times_s,
-            s_square_encoding: self.s_square_encoding,
-            s_square_times_s_encoding: self.s_square_times_s_encoding,
+            c_times_s_encodings,
+            s_power_encodings: self.s_power_encodings,
             plaintext,
         }
     }
@@ -126,15 +117,33 @@ impl<M: PolyMatrix> Mul<&Self> for Agr16Encoding<M> {
         if self.plaintext.is_none() {
             panic!("Unknown plaintext for the left-hand AGR16 multiplication input");
         }
+        assert!(
+            !self.c_times_s_encodings.is_empty() && !other.c_times_s_encodings.is_empty(),
+            "AGR16 multiplication requires at least one c_times_s encoding level"
+        );
+        assert!(
+            !self.s_power_encodings.is_empty(),
+            "AGR16 multiplication requires at least one s-power advice encoding"
+        );
+        assert_eq!(
+            self.c_times_s_encodings.len(),
+            self.pubkey.c_times_s_pubkeys.len(),
+            "Left AGR16 encoding/public-key auxiliary depth mismatch"
+        );
+        assert_eq!(
+            other.c_times_s_encodings.len(),
+            other.pubkey.c_times_s_pubkeys.len(),
+            "Right AGR16 encoding/public-key auxiliary depth mismatch"
+        );
 
         // Section 5 Eq. (5.24)-style ciphertext multiplication.
         let first_term = self.vector.clone() * &other.vector;
         let left_matrix = self.pubkey.matrix.clone();
         let right_matrix = other.pubkey.matrix.clone();
         let uu = left_matrix.clone() * &right_matrix;
-        let second_term = uu.clone() * &self.s_square_encoding;
-        let third_term = right_matrix.clone() * &self.c_times_s;
-        let fourth_term = left_matrix.clone() * &other.c_times_s;
+        let second_term = uu.clone() * &self.s_power_encodings[0];
+        let third_term = right_matrix.clone() * &self.c_times_s_encodings[0];
+        let fourth_term = left_matrix.clone() * &other.c_times_s_encodings[0];
         let vector = first_term + second_term - third_term - fourth_term;
 
         let pubkey = self.pubkey * &other.pubkey;
@@ -142,23 +151,32 @@ impl<M: PolyMatrix> Mul<&Self> for Agr16Encoding<M> {
             (Some(a), Some(b)) => Some(a * b),
             _ => None,
         };
-        // Publicly computable update matched to the key-side auxiliary transition.
-        let c_times_s = (self.vector.clone() * &other.c_times_s) -
-            (self.c_times_s.clone() * &other.pubkey.c_times_s_pubkey) +
-            (uu * &self.s_square_times_s_encoding) -
-            (right_matrix * &self.c_times_s_times_s) -
-            (left_matrix * &other.c_times_s_times_s);
-        // Best-effort propagation for the second auxiliary chain level.
-        let c_times_s_times_s =
-            (self.c_times_s_times_s * &other.vector) + (self.vector * &other.c_times_s_times_s);
+        let recursive_levels = pubkey.c_times_s_pubkeys.len();
+        assert!(
+            self.c_times_s_encodings.len() > recursive_levels &&
+                other.c_times_s_encodings.len() > recursive_levels &&
+                self.s_power_encodings.len() > recursive_levels,
+            "AGR16 multiplication is missing recursive auxiliary advice levels"
+        );
+        let c_times_s_encodings = (0..recursive_levels)
+            .map(|level| {
+                let convolution = Self::convolution_term(
+                    &self.c_times_s_encodings,
+                    &other.pubkey.c_times_s_pubkeys,
+                    level,
+                );
+                (self.vector.clone() * &other.c_times_s_encodings[level]) - convolution +
+                    (uu.clone() * &self.s_power_encodings[level + 1]) -
+                    (right_matrix.clone() * &self.c_times_s_encodings[level + 1]) -
+                    (left_matrix.clone() * &other.c_times_s_encodings[level + 1])
+            })
+            .collect();
 
         Self {
             vector,
             pubkey,
-            c_times_s,
-            c_times_s_times_s,
-            s_square_encoding: self.s_square_encoding,
-            s_square_times_s_encoding: self.s_square_times_s_encoding,
+            c_times_s_encodings,
+            s_power_encodings: self.s_power_encodings,
             plaintext,
         }
     }

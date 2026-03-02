@@ -17,5 +17,5 @@
 - Current follow-up scope: address reviewer findings on secret leakage in compact encoding and empty-secret sampler misconfiguration.
 
 ## Status
-- `OPEN` and `ready for review` before follow-up fixes.
-- This tracking file is for active review-fix lifecycle work.
+- `OPEN` and `ready for review` after follow-up fixes.
+- Review-response comment posted: `https://github.com/MachinaIO/mxx/pull/60#issuecomment-3985646564`.

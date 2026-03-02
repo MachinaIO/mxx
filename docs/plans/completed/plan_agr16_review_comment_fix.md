@@ -7,7 +7,7 @@ This plan follows `PLANS.md`.
 ExecPlan start context:
 - Branch at start: `feat/agr16_encoding`
 - Commit at start: `c8654aa728ef63cc2862f93432ce4bf3c1986749`
-- PR tracking document: `docs/prs/active/pr_feat_agr16_encoding_review_fix.md`
+- PR tracking document: `docs/prs/completed/pr_feat_agr16_encoding_review_fix.md`
 
 Repository-document context used for this plan: `PLANS.md`, `DESIGN.md`, `docs/design/index.md`, `ARCHITECTURE.md`, `docs/architecture/index.md`, `docs/architecture/scope/index.md`, `docs/architecture/scope/agr16.md`, `VERIFICATION.md`, `docs/verification/index.md`, `docs/verification/main_execplan_pre_creation.md`, `docs/verification/cpu_behavior_changes.md`, and `docs/verification/main_execplan_post_completion.md`.
 
@@ -26,8 +26,9 @@ After this change, PR #60 will no longer expose AGR16 secret material through co
   - `cargo +nightly fmt --all`
   - `cargo test -r --lib agr16`
   - `cargo test -r --lib`
-- [ ] Push follow-up commits and post review-response comment on PR #60.
-- [ ] Complete post-completion lifecycle (`docs/verification/main_execplan_post_completion.md`): readiness decision, PR tracking move to completed, final commit/push for plan lifecycle state.
+- [x] (2026-03-02 17:03Z) Pushed follow-up commit `6170f55` and posted review-response comment `https://github.com/MachinaIO/mxx/pull/60#issuecomment-3985646564`.
+- [x] (2026-03-02 17:04Z) Verified post-completion readiness state: PR #60 is `OPEN` and `isDraft=false` (already ready for review).
+- [x] (2026-03-02 17:04Z) Completed post-completion lifecycle persistence: moved review-fix PR tracking/plan documents to completed directories and prepared final lifecycle commit/push.
 
 Main-ExecPlan validation mapping (PLANS.md lifecycle step 3):
 - Action `compact serialization fix` -> run `cargo test -r --lib agr16`.
@@ -63,7 +64,7 @@ The two reviewer findings are addressed in code and covered by tests:
 - compact output no longer contains raw secret bytes;
 - sampler now rejects empty secret input with an explicit panic and test.
 
-Remaining lifecycle work is operational: commit/push, post PR response, and close ExecPlan lifecycle documents.
+All planned review-fix actions are complete, including PR response and lifecycle-document closure.
 
 ## Design/Architecture/Verification Document Summary
 
@@ -138,6 +139,10 @@ Commands executed:
     cargo +nightly fmt --all
     cargo test -r --lib agr16
     cargo test -r --lib
+    gh pr comment 60 --body-file /tmp/pr60_review_response.md
+
+PR readiness/status snapshot:
+- `gh pr view 60 --json number,state,isDraft,url,...` -> `OPEN`, `isDraft=false`, `url=https://github.com/MachinaIO/mxx/pull/60`
 
 Verification outcomes:
 - `cargo test -r --lib agr16`: pass (`4 passed`)
@@ -153,3 +158,5 @@ Internal dependency additions may include standard synchronization primitives fo
 
 Revision note (2026-03-02, Codex): Initial plan created for PR #60 reviewer follow-up on compact-secret leakage and empty-secret sampler validation.
 Revision note (2026-03-02, Codex): Updated with implemented code fixes, verification evidence, and final-lifecycle remaining steps.
+Revision note (2026-03-02, Codex): Recorded pushed fix commit and PR response comment, then prepared post-completion document persistence steps.
+Revision note (2026-03-02, Codex): Finalized completed-plan state after moving tracking docs and confirming PR remains ready for review.

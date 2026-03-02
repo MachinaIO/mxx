@@ -26,10 +26,7 @@ For the target PR, verify all of the following:
 
 ## Verification source rule
 
-Use repository verification runbooks to decide concrete commands and checks:
-
-- if `docs/validation/` exists and is maintained, follow it;
-- otherwise, follow `docs/verification/` in this repository.
+Use repository verification runbooks under `docs/verification/` to decide concrete commands and checks.
 
 Do not trust documentation claims blindly. Validate by reading code and running appropriate checks.
 

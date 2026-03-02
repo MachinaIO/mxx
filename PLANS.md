@@ -92,7 +92,9 @@ The `Progress` section in the main ExecPlan must do more than list sub plans. It
 * which sub ExecPlans must be processed sequentially and in what order,
 * when multiple sub-agent types are available, which sub-agent type is assigned to each sub ExecPlan.
 
-Here, “parallelizable” means the sub ExecPlans can be executed by separate sub agents with isolated context windows and no required communication between those sub agents until the individual sub plans are completed.
+Here, “parallelizable” means the sub ExecPlans can be executed by separate sub agents with isolated context windows and no required communication between those sub agents until the individual sub plans are completed. Parallelizable sub ExecPlans must not require simultaneous edits to the same file.
+
+If conflicts still occur while multiple sub ExecPlans are executed in parallel, the main ExecPlan is responsible for resolving those conflicts.
 
 Each sub ExecPlan independently follows the ExecPlan lifecycle. After finishing, the sub agent must autonomously report results back to the parent main ExecPlan scope and terminate without requesting a human response.
 

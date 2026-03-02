@@ -92,6 +92,7 @@ struct GpuContext
     std::vector<dim3> limb_gpu_ids;
     std::vector<int> limb_prime_ids;
     std::vector<GpuLimbType> limb_types;
+    std::vector<uint8_t> limb_coeff_bytes;
     std::vector<size_t> decomp_counts_by_partition;
     std::mutex transform_mutex;
 };

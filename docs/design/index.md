@@ -16,7 +16,11 @@ Design documents in this repository are organized by function. Each document sho
 
 Current registered design documents:
 
-- No concrete design artifacts are registered yet beyond this index.
+- [gpu_limb_byte_packing.md](./gpu_limb_byte_packing.md)
+  - Purpose: Defines the long-lived CUDA limb storage invariant that packs each modulus into its minimum byte width.
+  - Roles:
+    1. Target behavior/properties with assumptions and limits.
+    2. Core technical idea and trade-off rationale for VRAM reduction.
 
 When adding a design document, place it under `docs/design/` and add it to this index with:
 

@@ -20,6 +20,12 @@ CUDA files included in this scope (called through Rust GPU bindings):
 - `cuda/include/Runtime.cuh`
 - `cuda/include/ChaCha.cuh`
 
+## CUDA Boundary Contract
+
+- Runtime context metadata (`GpuContext`) computes and stores per-limb coefficient byte width from each modulus.
+- This metadata is consumed by matrix/poly CUDA paths so persisted GPU data uses packed-byte limb storage.
+- Host-facing RNS batch APIs remain `u64`-coefficient oriented; conversion at the CUDA boundary preserves Rust-side interface stability.
+
 ## Interface vs implementation
 
 - Interfaces: `crate::poly::PolyParams`, `crate::poly::Poly`

@@ -48,11 +48,13 @@ struct GpuMatrix
     struct SharedLimbBuffer
     {
         int device;
-        uint64_t *ptr;
+        uint8_t *ptr;
         size_t limb_count;
-        size_t words_per_poly;
-        size_t words_total;
+        size_t bytes_per_poly;
+        size_t bytes_total;
         size_t n;
+        std::vector<uint8_t> limb_coeff_bytes;
+        std::vector<size_t> limb_offsets_bytes;
     };
     struct SharedAuxBuffer
     {

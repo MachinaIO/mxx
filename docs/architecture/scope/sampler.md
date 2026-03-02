@@ -25,6 +25,11 @@ Provides sampling interfaces and implementations for hash-based, uniform, and tr
   - DCRT CPU samplers
   - GPU-enabled samplers and trapdoor paths (feature-gated)
 
+## CUDA Boundary Contract
+
+- GPU trapdoor/sampling kernels operate on packed-byte limb storage via matrix metadata (`stride_bytes`, `coeff_bytes`).
+- Sampler-side CUDA launch paths must not assume fixed 8-byte coefficients for persisted limb buffers.
+
 ## Depends on scopes
 
 - `matrix`

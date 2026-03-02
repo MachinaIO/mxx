@@ -19,10 +19,18 @@ int launch_gauss_samp_gq_arb_base_multi_kernel(
     cudaStream_t stream);
 
 int launch_sample_p1_integer_kernel(
-    const std::vector<const uint64_t *> &a_entries,
-    const std::vector<const uint64_t *> &b_entries,
-    const std::vector<const uint64_t *> &d_entries,
-    const std::vector<const uint64_t *> &tp2_entries,
+    const uint8_t *a_base,
+    const uint8_t *b_base,
+    const uint8_t *d_base,
+    const uint8_t *tp2_base,
+    size_t a_stride_bytes,
+    size_t b_stride_bytes,
+    size_t d_stride_bytes,
+    size_t tp2_stride_bytes,
+    uint8_t a_coeff_bytes,
+    uint8_t b_coeff_bytes,
+    uint8_t d_coeff_bytes,
+    uint8_t tp2_coeff_bytes,
     size_t d,
     size_t cols,
     size_t n,
@@ -33,11 +41,15 @@ int launch_sample_p1_integer_kernel(
     uint64_t seed,
     cudaStream_t stream,
     int device_id,
-    int64_t **sampled_out_device);
+    int64_t **sampled_out_device,
+    cudaEvent_t sampled_ready_event);
 
 int launch_scatter_p1_integer_to_limb_kernel_device(
     const int64_t *sampled_in_device,
-    const std::vector<uint64_t *> &out_entries,
+    uint8_t *out_base,
+    size_t out_stride_bytes,
+    uint8_t out_coeff_bytes,
+    size_t entry_count,
     size_t n,
     uint64_t modulus,
     cudaStream_t stream,

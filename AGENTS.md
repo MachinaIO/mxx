@@ -25,6 +25,10 @@ Read VERIFICATION.md before implementation to determine the required verificatio
 - modifying tests/CI, introducing new test categories, or changing required checks.
 Your ExecPlan must reference VERIFICATION.md and list the exact commands you ran; update VERIFICATION.md only when the *meta* verification policy itself changes.
 
+### Review (REVIEW.md)
+Read REVIEW.md when you are asked to review a PR or to act as a reviewer.
+In reviewer mode, follow REVIEW.md as the governing policy for independent review posture, required checks, and GitHub PR comment reporting.
+
 ## Global Requirements
 - All documentation in this repository, along with git commit messages and PRs, must be written in English.
 - When documenting file paths, use only paths relative to the repository top directory. Do not write absolute paths in documentation.

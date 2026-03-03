@@ -61,9 +61,10 @@ mod tests {
         }
     }
 
-    fn sample_fixture_with_aux_depth(
+    fn sample_fixture_with_aux_depth_and_reveal_flags(
         input_size: usize,
         auxiliary_depth: usize,
+        reveal_plaintexts: Vec<bool>,
         params: &DCRTPolyParams,
     ) -> (
         Vec<Agr16PublicKey<DCRTPolyMatrix>>,
@@ -71,13 +72,17 @@ mod tests {
         Vec<DCRTPoly>,
         DCRTPoly,
     ) {
+        assert_eq!(
+            reveal_plaintexts.len(),
+            input_size,
+            "reveal_plaintexts length must match AGR16 input_size"
+        );
         let key: [u8; 32] = rand::random();
         let tag: u64 = rand::random();
         let tag_bytes = tag.to_le_bytes();
 
         let pubkey_sampler =
             AGR16PublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, auxiliary_depth);
-        let reveal_plaintexts = vec![true; input_size];
         let pubkeys = pubkey_sampler.sample(params, &tag_bytes, &reveal_plaintexts);
 
         let secret = create_ternary_random_poly(params);
@@ -88,6 +93,24 @@ mod tests {
         let encodings = encoding_sampler.sample(params, &pubkeys, &plaintexts);
 
         (pubkeys, encodings, plaintexts, encoding_sampler.secret)
+    }
+
+    fn sample_fixture_with_aux_depth(
+        input_size: usize,
+        auxiliary_depth: usize,
+        params: &DCRTPolyParams,
+    ) -> (
+        Vec<Agr16PublicKey<DCRTPolyMatrix>>,
+        Vec<Agr16Encoding<DCRTPolyMatrix>>,
+        Vec<DCRTPoly>,
+        DCRTPoly,
+    ) {
+        sample_fixture_with_aux_depth_and_reveal_flags(
+            input_size,
+            auxiliary_depth,
+            vec![true; input_size],
+            params,
+        )
     }
 
     fn sample_fixture(
@@ -532,6 +555,63 @@ mod tests {
             &enc_outputs[0],
             expected_plain,
             "Env-probe complete binary-tree AGR16 multiplication output must satisfy Equation 5.1 when error=0",
+        );
+    }
+
+    #[test]
+    fn test_agr16_mul_eval_works_without_revealed_plaintexts() {
+        let params = DCRTPolyParams::default();
+        let input_size = 3;
+        let (pubkeys, encodings, plaintexts, secret) =
+            sample_fixture_with_aux_depth_and_reveal_flags(
+                input_size,
+                AUXILIARY_DEPTH,
+                vec![false; input_size],
+                &params,
+            );
+
+        assert!(
+            pubkeys.iter().skip(1).all(|pk| !pk.reveal_plaintext),
+            "AGR16 fixture must hide user-input plaintexts in this test"
+        );
+        assert!(
+            encodings.iter().skip(1).all(|ct| ct.plaintext.is_none()),
+            "Sampled AGR16 encodings must hide user-input plaintexts in this test"
+        );
+
+        // f(x1,x2,x3) = (x1 * x2) * x3
+        let mut circuit = PolyCircuit::new();
+        let inputs = circuit.input(input_size);
+        let mul12 = circuit.mul_gate(inputs[0], inputs[1]);
+        let out = circuit.mul_gate(mul12, inputs[2]);
+        circuit.output(vec![out]);
+
+        let pk_outputs = circuit.eval(
+            &params,
+            pubkeys[0].clone(),
+            vec![pubkeys[1].clone(), pubkeys[2].clone(), pubkeys[3].clone()],
+            None::<&NoopAgr16PkPlt>,
+        );
+        let enc_outputs = circuit.eval(
+            &params,
+            encodings[0].clone(),
+            vec![encodings[1].clone(), encodings[2].clone(), encodings[3].clone()],
+            None::<&NoopAgr16EncPlt>,
+        );
+
+        let expected_plain =
+            (plaintexts[0].clone() * plaintexts[1].clone()) * plaintexts[2].clone();
+        let expected_ct = (scalar_matrix(&params, secret.clone()) * pk_outputs[0].matrix.clone()) +
+            scalar_matrix(&params, expected_plain);
+        assert_eq!(enc_outputs[0].pubkey, pk_outputs[0]);
+        assert_eq!(
+            enc_outputs[0].vector, expected_ct,
+            "AGR16 hidden-plaintext multiplication output must satisfy Equation 5.1 when error=0"
+        );
+        assert_primary_auxiliary_invariants(&enc_outputs[0], &secret);
+        assert_eq!(
+            enc_outputs[0].plaintext, None,
+            "AGR16 public evaluation should not require or reveal plaintext for hidden inputs"
         );
     }
 

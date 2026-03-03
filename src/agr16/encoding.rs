@@ -114,9 +114,6 @@ impl<M: PolyMatrix> Mul<&Self> for Agr16Encoding<M> {
     type Output = Self;
     fn mul(self, other: &Self) -> Self {
         self.assert_compatible(other);
-        if self.plaintext.is_none() {
-            panic!("Unknown plaintext for the left-hand AGR16 multiplication input");
-        }
         assert!(
             !self.c_times_s_encodings.is_empty() && !other.c_times_s_encodings.is_empty(),
             "AGR16 multiplication requires at least one c_times_s encoding level"

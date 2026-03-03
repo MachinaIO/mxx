@@ -562,10 +562,6 @@ request_mode() {
       return 0
     fi
 
-    if ! is_daemon_running; then
-      die "reviewer daemon stopped while waiting for request response"
-    fi
-
     if [[ "$WAIT_TIMEOUT_SEC" != "0" ]]; then
       now="$(date +%s)"
       if (( now - started_at >= WAIT_TIMEOUT_SEC )); then

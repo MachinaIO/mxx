@@ -406,6 +406,70 @@ mod tests {
     }
 
     #[test]
+    fn test_agr16_complete_binary_tree_depth3_preserves_equation_5_1_without_error() {
+        let params = DCRTPolyParams::default();
+        let leaf_count = 8;
+        let (pubkeys, encodings, plaintexts, secret) = sample_fixture(leaf_count, &params);
+
+        // Complete binary tree multiplication of depth 3:
+        // f(x1..x8) = ((x1*x2)*(x3*x4)) * ((x5*x6)*(x7*x8))
+        let mut circuit = PolyCircuit::new();
+        let inputs = circuit.input(leaf_count);
+
+        let level1 = [
+            circuit.mul_gate(inputs[0], inputs[1]),
+            circuit.mul_gate(inputs[2], inputs[3]),
+            circuit.mul_gate(inputs[4], inputs[5]),
+            circuit.mul_gate(inputs[6], inputs[7]),
+        ];
+        let level2 =
+            [circuit.mul_gate(level1[0], level1[1]), circuit.mul_gate(level1[2], level1[3])];
+        let out = circuit.mul_gate(level2[0], level2[1]);
+        circuit.output(vec![out]);
+
+        let pk_outputs = circuit.eval(
+            &params,
+            pubkeys[0].clone(),
+            vec![
+                pubkeys[1].clone(),
+                pubkeys[2].clone(),
+                pubkeys[3].clone(),
+                pubkeys[4].clone(),
+                pubkeys[5].clone(),
+                pubkeys[6].clone(),
+                pubkeys[7].clone(),
+                pubkeys[8].clone(),
+            ],
+            None::<&NoopAgr16PkPlt>,
+        );
+        let enc_outputs = circuit.eval(
+            &params,
+            encodings[0].clone(),
+            vec![
+                encodings[1].clone(),
+                encodings[2].clone(),
+                encodings[3].clone(),
+                encodings[4].clone(),
+                encodings[5].clone(),
+                encodings[6].clone(),
+                encodings[7].clone(),
+                encodings[8].clone(),
+            ],
+            None::<&NoopAgr16EncPlt>,
+        );
+
+        let expected_plain = plaintexts.iter().cloned().reduce(|acc, next| acc * next).unwrap();
+        assert_eval_output_matches_equation_5_1(
+            &params,
+            &secret,
+            &pk_outputs[0],
+            &enc_outputs[0],
+            expected_plain,
+            "Depth-3 complete binary-tree AGR16 multiplication output must satisfy Equation 5.1 when error=0",
+        );
+    }
+
+    #[test]
     fn test_agr16_pubkey_read_from_files_supports_recursive_depth() {
         let params = DCRTPolyParams::default();
         let dir = create_temp_test_dir("agr16_recursive_read");

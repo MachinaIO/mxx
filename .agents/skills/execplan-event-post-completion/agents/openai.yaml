@@ -1,0 +1,7 @@
+interface:
+  display_name: "Event Post Completion"
+  short_description: "Run execplan.post_completion checks"
+  default_prompt: "Execute post-completion verification for an ExecPlan."
+
+policy:
+  allow_implicit_invocation: true

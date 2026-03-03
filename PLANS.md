@@ -196,6 +196,8 @@ Agents must strictly follow this lifecycle to create, execute, and complete an E
 1. Before creating a new ExecPlan document, run pre-creation verification:
    * `scripts/execplan_gate.sh --event execplan.pre_creation`
    * If you are reusing an existing plan document, run with `--plan <plan_md>` so the attempt is recorded directly in that plan ledger.
+   * After pre-creation verification, create or identify the target PR for this lifecycle, pass that PR URL to a reviewer agent, and start the builder/reviewer loop controller for the same PR context.
+   * If no PR exists yet, the builder must create one at the first push opportunity; the loop controller must discover that PR URL and hand it to the reviewer agent before reviewer evaluation begins.
 2. Create or select one target ExecPlan document under `docs/plans/active/`.
    * For a newly created plan document, run `scripts/execplan_gate.sh --plan <plan_md> --event execplan.pre_creation` immediately so the plan ledger contains explicit pre-creation pass evidence required by later gate checks.
 3. Before action execution, map each `Progress` action to metadata and verification events from the event-index map:
@@ -216,10 +218,12 @@ Agents must strictly follow this lifecycle to create, execute, and complete an E
    * `scripts/execplan_gate.sh --plan <completed_plan_md> --event execplan.post_completion`.
    * Post-completion operational behavior is defined only in `.agents/skills/execplan-event-post-completion/SKILL.md` and its script.
    * If post-completion verification fails, do not complete the lifecycle: move the plan document back to `docs/plans/active/`, restore PR-tracking docs to `docs/prs/active/` when applicable, then return to action revision/re-execution (following the skill-defined rollback behavior).
-10. If notification is needed and step 9 passed, post a single final PR comment:
-   * `scripts/execplan_notify.sh --plan <completed_plan_md> --event execplan.post_completion --status pass`.
+10. After step 9 passes, keep the builder agent waiting for reviewer-agent output on the target PR, then branch by reviewer status:
+   * If reviewer status is `APPROVED`, optionally post one final notification PR comment (`scripts/execplan_notify.sh --plan <completed_plan_md> --event execplan.post_completion --status pass`), report ExecPlan completion to the user, and finish.
+   * If reviewer status is `CHANGES_REQUIRED` (or equivalent non-approval findings), move the plan back to `docs/plans/active/` when needed, append remediation actions to `Progress`, and restart from step 3.
+   * Do not request user response during this loop unless the configured autonomous failure threshold is exceeded.
 
-Important: once a human or an AI agent starts a new ExecPlan lifecycle, the AI agent must not request any human response until step 9 is complete and all required verification events are `pass` (and complete step 10 first when notification is needed). If an agent requests human response before lifecycle completion requirements are complete, that agent is immediately dismissed and removed. Treat humans as a very slow external device, and assume reliance on humans will significantly delay completion.
+Important: once a human or an AI agent starts a new ExecPlan lifecycle, the AI agent must not request any human response until either (a) reviewer status becomes `APPROVED` after step 9 and lifecycle completion is reportable, or (b) the configured autonomous failure threshold is exceeded. If an agent requests human response before those conditions, that agent is immediately dismissed and removed. Treat humans as a very slow external device, and assume reliance on humans will significantly delay completion.
 
 # Prototyping milestones and parallel implementations
 

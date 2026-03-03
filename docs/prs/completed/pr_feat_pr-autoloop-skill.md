@@ -8,7 +8,3 @@
 - PR state: OPEN (draft=true)
 - PR head/base: feat/pr-autoloop-skill -> main
 - last metadata refresh: 2026-03-03 20:31Z
-
-## Readiness Blockers
-
-- remaining blockers not provided

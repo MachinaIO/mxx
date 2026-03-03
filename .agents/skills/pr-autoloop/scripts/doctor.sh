@@ -4,24 +4,39 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  doctor.sh --pr-url <url> [--offline-ok]
+  doctor.sh [--pr-url <url> | --head-branch <branch>] [--offline-ok]
   doctor.sh --help
 
 Checks:
   - required CLIs (`git`, `gh`, `codex`, `jq`)
   - `gh auth status`
   - `codex login status`
-  - `gh pr view` for the target PR URL
+  - `gh pr view` for the target PR URL when provided
+  - branch visibility and PR discovery API access when starting without an existing PR URL
 USAGE
 }
 
 PR_URL=""
+HEAD_BRANCH=""
 OFFLINE_OK=0
+
+resolve_current_branch() {
+  local branch
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if [[ -z "$branch" || "$branch" == "HEAD" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$branch"
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --pr-url)
       PR_URL="${2:-}"
+      shift 2
+      ;;
+    --head-branch)
+      HEAD_BRANCH="${2:-}"
       shift 2
       ;;
     --offline-ok)
@@ -40,8 +55,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$PR_URL" ]]; then
-  echo "--pr-url is required" >&2
+if [[ -z "$PR_URL" && -z "$HEAD_BRANCH" ]]; then
+  HEAD_BRANCH="$(resolve_current_branch || true)"
+fi
+
+if [[ -z "$PR_URL" && -z "$HEAD_BRANCH" ]]; then
+  echo "either --pr-url or --head-branch is required (or run from a named branch)" >&2
   usage >&2
   exit 2
 fi
@@ -66,6 +85,8 @@ run_check() {
   local label="$1"
   local cmd="$2"
   local out_file
+  local rc
+  local summary
   out_file="$(mktemp)"
 
   set +e
@@ -96,7 +117,19 @@ run_check() {
 
 run_check "GitHub authentication" "gh auth status"
 run_check "Codex authentication" "codex login status"
-run_check "PR metadata access" "gh pr view '$PR_URL' --json number,title,headRefName,baseRefName,url,state,isDraft"
+
+if [[ -n "$PR_URL" ]]; then
+  run_check "PR metadata access" "gh pr view '$PR_URL' --json number,title,headRefName,baseRefName,url,state,isDraft"
+else
+  if git show-ref --verify --quiet "refs/heads/$HEAD_BRANCH" || git ls-remote --exit-code --heads origin "$HEAD_BRANCH" >/dev/null 2>&1; then
+    echo "[OK] head branch is visible: $HEAD_BRANCH"
+  else
+    echo "[FAIL] head branch is not visible locally or on origin: $HEAD_BRANCH" >&2
+    hard_fail=1
+  fi
+
+  run_check "PR discovery access by head branch" "gh pr list --head '$HEAD_BRANCH' --json number,url,headRefName,state,isDraft --limit 20"
+fi
 
 if [[ "$hard_fail" -ne 0 ]]; then
   echo "doctor result: FAIL" >&2

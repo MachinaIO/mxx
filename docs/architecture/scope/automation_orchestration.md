@@ -23,7 +23,8 @@ Interface contract:
 
 - `run_loop.sh` CLI arguments:
   - `--goal-file`
-  - `--pr-url`
+  - `--pr-url` (existing PR mode) or `--head-branch` (bootstrap mode)
+  - `--base-branch` (optional, bootstrap mode guidance)
   - `--max-builder-failures`
   - `--max-iterations`
 - Reviewer comment contract fields:
@@ -33,8 +34,9 @@ Interface contract:
 
 Implementation details:
 
-- Lock and state files under `.agents/skills/pr-autoloop/runtime/`.
+- Lock and state files under `.agents/skills/pr-autoloop/runtime/` (PR lock when known, branch lock during bootstrap).
 - Builder/reviewer isolated git worktrees for branch-safe iteration.
+- Automatic PR URL discovery after builder execution in bootstrap mode; discovered URL is passed to reviewer context.
 - Event-level validation via `action.pr_autoloop` skill script.
 
 ## Depends on scopes

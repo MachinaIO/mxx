@@ -7,9 +7,11 @@ Runtime state is persisted at:
 ## Required fields
 
 - `run_id` (string): unique loop execution id.
-- `pr_url` (string): target PR URL.
-- `pr_number` (string): PR number extracted from URL/API.
+- `pr_url` (string): target PR URL. Empty until PR is discovered in bootstrap mode.
+- `pr_number` (string): PR number extracted from URL/API. Empty until PR is discovered in bootstrap mode.
 - `pr_branch` (string): PR head branch.
+- `base_branch` (string): base branch used for PR creation guidance.
+- `lock_key` (string): lock identity (`pr-<number>` or `branch-<sanitized_branch>`).
 - `iteration` (number): current iteration (1-based).
 - `max_iterations` (number): configured loop bound.
 - `max_builder_failures` (number): configured consecutive builder failure bound.
@@ -21,6 +23,7 @@ Runtime state is persisted at:
 
 ## Runtime layout
 
-- `runtime/locks/pr-<number>.lock`: per-PR lock file.
+- `runtime/locks/pr-<number>.lock`: per-PR lock file (when PR is known at start).
+- `runtime/locks/branch-<sanitized_branch>.lock`: bootstrap lock before PR is known.
 - `runtime/runs/<run_id>/logs/`: builder/reviewer command logs.
 - `runtime/runs/<run_id>/feedback/`: reviewer feedback snapshots for subsequent builder iterations.

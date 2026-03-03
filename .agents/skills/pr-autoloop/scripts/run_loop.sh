@@ -4,19 +4,21 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  run_loop.sh --goal-file <path> --pr-url <url> [options]
+  run_loop.sh --goal-file <path> [--pr-url <url> | --head-branch <branch>] [options]
   run_loop.sh --self-test
 
 Required arguments:
   --goal-file <path>              Goal/spec input for the builder agent.
-  --pr-url <url>                  Target pull request URL.
+  --pr-url <url>                  Target pull request URL (or use --head-branch bootstrap mode).
 
 Options:
+  --head-branch <name>            Head branch used when PR URL is not provided.
+  --base-branch <name>            Base branch used when builder must create a PR (default: origin/HEAD or main).
   --max-builder-failures <n>      Consecutive builder failure threshold (default: 3).
   --max-iterations <n>            Maximum loop iterations (default: 20).
   --runtime-dir <path>            Runtime directory (default: .agents/skills/pr-autoloop/runtime).
-  --builder-worktree <path>       Builder worktree path (default: <runtime>/worktrees/builder-pr-<pr_number>).
-  --reviewer-worktree <path>      Reviewer worktree path (default: <runtime>/worktrees/reviewer-pr-<pr_number>).
+  --builder-worktree <path>       Builder worktree path (default: <runtime>/worktrees/builder-<lock_key>).
+  --reviewer-worktree <path>      Reviewer worktree path (default: <runtime>/worktrees/reviewer-<lock_key>).
   --cleanup-lock                  Remove an existing lock file before acquiring lock.
   --model <name>                  Optional model value passed to codex exec.
   --self-test                     Run parser/contract self-tests only.
@@ -52,6 +54,80 @@ extract_pr_number() {
     return 0
   fi
   return 1
+}
+
+sanitize_for_key() {
+  local value="$1"
+  echo "$value" | sed -E 's/[^A-Za-z0-9._-]+/_/g'
+}
+
+resolve_current_branch() {
+  local branch
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if [[ -z "$branch" || "$branch" == "HEAD" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$branch"
+}
+
+default_base_branch() {
+  local remote_head
+  remote_head="$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null || true)"
+  if [[ "$remote_head" == refs/remotes/origin/* ]]; then
+    printf '%s\n' "${remote_head#refs/remotes/origin/}"
+    return 0
+  fi
+  printf '%s\n' "main"
+}
+
+local_branch_exists() {
+  local branch="$1"
+  git show-ref --verify --quiet "refs/heads/$branch"
+}
+
+remote_branch_exists() {
+  local branch="$1"
+  if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+    return 0
+  fi
+  git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1
+}
+
+discover_pr_url_by_head_branch() {
+  local branch="$1"
+  local list_json
+  list_json="$(gh pr list --state open --head "$branch" --json url,headRefName 2>/dev/null || true)"
+  [[ -n "$list_json" ]] || return 1
+
+  jq -r \
+    --arg branch "$branch" \
+    '[.[] | select(.headRefName == $branch)][0].url // empty' <<< "$list_json"
+}
+
+load_pr_context_from_url() {
+  local input_url="$1"
+  local pr_json
+  local resolved_url
+  local resolved_number
+  local resolved_branch
+  local resolved_base
+
+  pr_json="$(gh pr view "$input_url" --json url,number,headRefName,baseRefName 2>/dev/null || true)"
+  [[ -n "$pr_json" ]] || return 1
+
+  resolved_url="$(jq -r '.url // empty' <<< "$pr_json")"
+  resolved_number="$(jq -r '.number // empty' <<< "$pr_json")"
+  resolved_branch="$(jq -r '.headRefName // empty' <<< "$pr_json")"
+  resolved_base="$(jq -r '.baseRefName // empty' <<< "$pr_json")"
+
+  [[ -n "$resolved_url" && -n "$resolved_number" && -n "$resolved_branch" ]] || return 1
+
+  PR_URL="$resolved_url"
+  PR_NUMBER="$resolved_number"
+  PR_BRANCH="$resolved_branch"
+  if [[ -n "$resolved_base" ]]; then
+    BASE_BRANCH="$resolved_base"
+  fi
 }
 
 extract_tag_value() {
@@ -103,6 +179,10 @@ AUTO_REVIEW_STATUS: MAYBE"
 
 GOAL_FILE=""
 PR_URL=""
+HEAD_BRANCH=""
+BASE_BRANCH=""
+PR_NUMBER=""
+PR_BRANCH=""
 MAX_BUILDER_FAILURES=3
 MAX_ITERATIONS=20
 RUNTIME_DIR=".agents/skills/pr-autoloop/runtime"
@@ -111,6 +191,7 @@ REVIEWER_WORKTREE=""
 CLEANUP_LOCK=0
 SELF_TEST=0
 MODEL=""
+LOCK_KEY=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -120,6 +201,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --pr-url)
       PR_URL="${2:-}"
+      shift 2
+      ;;
+    --head-branch)
+      HEAD_BRANCH="${2:-}"
+      shift 2
+      ;;
+    --base-branch)
+      BASE_BRANCH="${2:-}"
       shift 2
       ;;
     --max-builder-failures)
@@ -170,7 +259,6 @@ if [[ "$SELF_TEST" -eq 1 ]]; then
 fi
 
 [[ -n "$GOAL_FILE" ]] || die "--goal-file is required"
-[[ -n "$PR_URL" ]] || die "--pr-url is required"
 [[ -f "$GOAL_FILE" ]] || die "goal file not found: $GOAL_FILE"
 is_positive_int "$MAX_BUILDER_FAILURES" || die "--max-builder-failures must be a positive integer"
 is_positive_int "$MAX_ITERATIONS" || die "--max-iterations must be a positive integer"
@@ -179,20 +267,51 @@ for cmd in git gh codex jq; do
   require_cmd "$cmd"
 done
 
-PR_NUMBER="$(extract_pr_number "$PR_URL" || true)"
-if [[ -z "$PR_NUMBER" ]]; then
-  PR_NUMBER="$(gh pr view "$PR_URL" --json number --jq '.number' 2>/dev/null || true)"
+if [[ -z "$PR_URL" && -z "$HEAD_BRANCH" ]]; then
+  HEAD_BRANCH="$(resolve_current_branch || true)"
 fi
-[[ -n "$PR_NUMBER" ]] || die "failed to determine PR number from URL or gh"
 
-PR_BRANCH="$(gh pr view "$PR_URL" --json headRefName --jq '.headRefName' 2>/dev/null || true)"
-[[ -n "$PR_BRANCH" ]] || die "failed to fetch PR head branch via gh"
+if [[ -z "$PR_URL" && -z "$HEAD_BRANCH" ]]; then
+  die "either --pr-url or --head-branch is required (or run from a named branch)"
+fi
+
+if [[ -n "$PR_URL" ]]; then
+  load_pr_context_from_url "$PR_URL" || die "failed to resolve PR metadata from --pr-url"
+  if [[ -n "$HEAD_BRANCH" && "$HEAD_BRANCH" != "$PR_BRANCH" ]]; then
+    die "--head-branch ($HEAD_BRANCH) does not match PR head branch ($PR_BRANCH)"
+  fi
+else
+  PR_BRANCH="$HEAD_BRANCH"
+fi
+
+[[ -n "$PR_BRANCH" ]] || die "failed to resolve head branch"
+if ! local_branch_exists "$PR_BRANCH" && ! remote_branch_exists "$PR_BRANCH"; then
+  die "head branch not found locally or on origin: $PR_BRANCH"
+fi
+
+if [[ -z "$PR_URL" ]]; then
+  CANDIDATE_PR_URL="$(discover_pr_url_by_head_branch "$PR_BRANCH" || true)"
+  if [[ -n "$CANDIDATE_PR_URL" ]]; then
+    load_pr_context_from_url "$CANDIDATE_PR_URL" || die "failed to resolve discovered PR metadata"
+    log "found existing PR for branch $PR_BRANCH: $PR_URL"
+  fi
+fi
+
+if [[ -z "$BASE_BRANCH" ]]; then
+  BASE_BRANCH="$(default_base_branch)"
+fi
+
+if [[ -n "$PR_NUMBER" ]]; then
+  LOCK_KEY="pr-$PR_NUMBER"
+else
+  LOCK_KEY="branch-$(sanitize_for_key "$PR_BRANCH")"
+fi
 
 if [[ -z "$BUILDER_WORKTREE" ]]; then
-  BUILDER_WORKTREE="$RUNTIME_DIR/worktrees/builder-pr-$PR_NUMBER"
+  BUILDER_WORKTREE="$RUNTIME_DIR/worktrees/builder-$LOCK_KEY"
 fi
 if [[ -z "$REVIEWER_WORKTREE" ]]; then
-  REVIEWER_WORKTREE="$RUNTIME_DIR/worktrees/reviewer-pr-$PR_NUMBER"
+  REVIEWER_WORKTREE="$RUNTIME_DIR/worktrees/reviewer-$LOCK_KEY"
 fi
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -201,7 +320,7 @@ LOG_DIR="$RUN_DIR/logs"
 FEEDBACK_DIR="$RUN_DIR/feedback"
 STATE_FILE="$RUN_DIR/state.json"
 LOCK_DIR="$RUNTIME_DIR/locks"
-LOCK_FILE="$LOCK_DIR/pr-$PR_NUMBER.lock"
+LOCK_FILE="$LOCK_DIR/$LOCK_KEY.lock"
 
 mkdir -p "$LOG_DIR" "$FEEDBACK_DIR" "$LOCK_DIR"
 
@@ -222,7 +341,7 @@ if ( set -o noclobber; echo "$$" > "$LOCK_FILE" ) 2>/dev/null; then
   LOCK_HELD=1
 else
   holder="$(cat "$LOCK_FILE" 2>/dev/null || echo unknown)"
-  die "lock already exists for PR #$PR_NUMBER at $LOCK_FILE (holder=$holder)"
+  die "lock already exists for $LOCK_KEY at $LOCK_FILE (holder=$holder)"
 fi
 
 write_state() {
@@ -237,6 +356,8 @@ write_state() {
     --arg pr_url "$PR_URL" \
     --arg pr_number "$PR_NUMBER" \
     --arg pr_branch "$PR_BRANCH" \
+    --arg base_branch "$BASE_BRANCH" \
+    --arg lock_key "$LOCK_KEY" \
     --argjson iteration "$iteration" \
     --argjson max_iterations "$MAX_ITERATIONS" \
     --argjson max_builder_failures "$MAX_BUILDER_FAILURES" \
@@ -250,6 +371,8 @@ write_state() {
       pr_url: $pr_url,
       pr_number: $pr_number,
       pr_branch: $pr_branch,
+      base_branch: $base_branch,
+      lock_key: $lock_key,
       iteration: $iteration,
       max_iterations: $max_iterations,
       max_builder_failures: $max_builder_failures,
@@ -261,24 +384,41 @@ write_state() {
     }' > "$STATE_FILE"
 }
 
+resolve_worktree_seed_ref() {
+  if remote_branch_exists "$PR_BRANCH"; then
+    printf '%s\n' "origin/$PR_BRANCH"
+    return 0
+  fi
+  if local_branch_exists "$PR_BRANCH"; then
+    printf '%s\n' "$PR_BRANCH"
+    return 0
+  fi
+  return 1
+}
+
 sync_worktree() {
   local role="$1"
   local worktree_path="$2"
-  local local_branch="pr-autoloop-${role}-${PR_NUMBER}"
+  local local_branch="pr-autoloop-${role}-${LOCK_KEY}"
+  local seed_ref
 
-  git fetch origin "$PR_BRANCH" >/dev/null 2>&1 || die "git fetch failed for branch $PR_BRANCH"
+  git fetch origin "$PR_BRANCH" >/dev/null 2>&1 || true
+  seed_ref="$(resolve_worktree_seed_ref || true)"
+  [[ -n "$seed_ref" ]] || die "unable to resolve seed ref for branch $PR_BRANCH"
 
   if [[ -e "$worktree_path/.git" || -f "$worktree_path/.git" ]]; then
-    git -C "$worktree_path" fetch origin "$PR_BRANCH" >/dev/null 2>&1 || die "failed to fetch in $role worktree"
+    git -C "$worktree_path" fetch origin "$PR_BRANCH" >/dev/null 2>&1 || true
 
     if ! git -C "$worktree_path" diff --quiet -- || ! git -C "$worktree_path" diff --cached --quiet --; then
       die "$role worktree has uncommitted changes: $worktree_path"
     fi
 
     if ! git -C "$worktree_path" checkout "$local_branch" >/dev/null 2>&1; then
-      git -C "$worktree_path" checkout -B "$local_branch" "origin/$PR_BRANCH" >/dev/null 2>&1 || die "failed to create local branch $local_branch"
+      git -C "$worktree_path" checkout -B "$local_branch" "$seed_ref" >/dev/null 2>&1 || die "failed to create local branch $local_branch"
     fi
-    git -C "$worktree_path" merge --ff-only "origin/$PR_BRANCH" >/dev/null 2>&1 || die "failed to fast-forward $role worktree"
+    if remote_branch_exists "$PR_BRANCH"; then
+      git -C "$worktree_path" merge --ff-only "origin/$PR_BRANCH" >/dev/null 2>&1 || die "failed to fast-forward $role worktree"
+    fi
     return 0
   fi
 
@@ -289,9 +429,14 @@ sync_worktree() {
 
   if git show-ref --verify --quiet "refs/heads/$local_branch"; then
     git worktree add "$worktree_path" "$local_branch" >/dev/null 2>&1 || die "failed to add existing branch worktree for $role"
-    git -C "$worktree_path" merge --ff-only "origin/$PR_BRANCH" >/dev/null 2>&1 || die "failed to fast-forward existing $role branch"
+    if remote_branch_exists "$PR_BRANCH"; then
+      git -C "$worktree_path" merge --ff-only "origin/$PR_BRANCH" >/dev/null 2>&1 || die "failed to fast-forward existing $role branch"
+    fi
   else
-    git worktree add -b "$local_branch" "$worktree_path" "origin/$PR_BRANCH" >/dev/null 2>&1 || die "failed to add new branch worktree for $role"
+    git worktree add -b "$local_branch" "$worktree_path" "$seed_ref" >/dev/null 2>&1 || die "failed to add new branch worktree for $role"
+    if remote_branch_exists "$PR_BRANCH"; then
+      git -C "$worktree_path" merge --ff-only "origin/$PR_BRANCH" >/dev/null 2>&1 || die "failed to fast-forward new $role branch"
+    fi
   fi
 }
 
@@ -324,7 +469,32 @@ AUTO_RESULT: PUSHED"
 }
 
 get_latest_head_commit() {
-  gh pr view "$PR_URL" --json headRefOid --jq '.headRefOid' 2>/dev/null || true
+  if [[ -n "$PR_URL" ]]; then
+    gh pr view "$PR_URL" --json headRefOid --jq '.headRefOid // empty' 2>/dev/null || true
+    return 0
+  fi
+
+  git ls-remote --heads origin "$PR_BRANCH" 2>/dev/null | awk 'NR==1 {print $1}'
+}
+
+ensure_pr_context_for_review() {
+  local discovered_url
+
+  if [[ -n "$PR_URL" ]]; then
+    return 0
+  fi
+
+  discovered_url="$(discover_pr_url_by_head_branch "$PR_BRANCH" || true)"
+  if [[ -z "$discovered_url" ]]; then
+    return 1
+  fi
+
+  load_pr_context_from_url "$discovered_url" || return 1
+  if [[ -z "$BASE_BRANCH" ]]; then
+    BASE_BRANCH="$(default_base_branch)"
+  fi
+  log "detected PR created by builder: $PR_URL"
+  return 0
 }
 
 fetch_reviewer_comment_body() {
@@ -356,7 +526,9 @@ for ((ITER=1; ITER<=MAX_ITERATIONS; ITER++)); do
   sync_worktree "builder" "$BUILDER_WORKTREE"
 
   PRE_HEAD="$(get_latest_head_commit)"
-  [[ -n "$PRE_HEAD" ]] || die "failed to fetch PR head commit before builder run"
+  if [[ -n "$PR_URL" && -z "$PRE_HEAD" ]]; then
+    die "failed to fetch PR head commit before builder run"
+  fi
 
   BUILDER_PROMPT="$RUN_DIR/builder_prompt_iter_${ITER}.md"
   BUILDER_LOG="$LOG_DIR/builder_iter_${ITER}.log"
@@ -371,8 +543,15 @@ for ((ITER=1; ITER<=MAX_ITERATIONS; ITER++)); do
     echo "- Commit and push to the current PR branch before exiting."
     echo
     echo "Context:"
-    echo "- PR URL: $PR_URL"
     echo "- PR head branch: $PR_BRANCH"
+    if [[ -n "$PR_URL" ]]; then
+      echo "- PR URL: $PR_URL"
+    else
+      echo "- PR URL: (none yet)"
+      echo "- Base branch for new PR: $BASE_BRANCH"
+      echo "- A PR for this branch does not exist yet. After pushing commits, create a PR from $PR_BRANCH to $BASE_BRANCH using gh CLI."
+      echo "- If a PR already exists by the time you check, reuse it and do not create duplicates."
+    fi
     echo "- Run ID: $RUN_ID"
     echo "- Iteration: $ITER"
     echo
@@ -399,7 +578,17 @@ for ((ITER=1; ITER<=MAX_ITERATIONS; ITER++)); do
   fi
 
   POST_HEAD="$(get_latest_head_commit)"
-  [[ -n "$POST_HEAD" ]] || die "failed to fetch PR head commit after builder run"
+  if [[ -z "$POST_HEAD" ]]; then
+    CONSECUTIVE_BUILDER_FAILURES=$((CONSECUTIVE_BUILDER_FAILURES + 1))
+    write_state "$ITER" "$CONSECUTIVE_BUILDER_FAILURES" "$LAST_BUILDER_COMMIT" "$LAST_REVIEW_STATUS" "FAILED"
+    log "builder run finished but no remote head was found for branch $PR_BRANCH (consecutive=$CONSECUTIVE_BUILDER_FAILURES)"
+
+    if [[ "$CONSECUTIVE_BUILDER_FAILURES" -ge "$MAX_BUILDER_FAILURES" ]]; then
+      write_state "$ITER" "$CONSECUTIVE_BUILDER_FAILURES" "$LAST_BUILDER_COMMIT" "$LAST_REVIEW_STATUS" "FAILED_LIMIT"
+      die "builder did not produce a reachable remote branch head $CONSECUTIVE_BUILDER_FAILURES times consecutively"
+    fi
+    continue
+  fi
 
   if [[ "$POST_HEAD" == "$PRE_HEAD" ]]; then
     CONSECUTIVE_BUILDER_FAILURES=$((CONSECUTIVE_BUILDER_FAILURES + 1))
@@ -415,6 +604,19 @@ for ((ITER=1; ITER<=MAX_ITERATIONS; ITER++)); do
 
   LAST_BUILDER_COMMIT="$POST_HEAD"
   CONSECUTIVE_BUILDER_FAILURES=0
+
+  if ! ensure_pr_context_for_review; then
+    CONSECUTIVE_BUILDER_FAILURES=$((CONSECUTIVE_BUILDER_FAILURES + 1))
+    write_state "$ITER" "$CONSECUTIVE_BUILDER_FAILURES" "$LAST_BUILDER_COMMIT" "$LAST_REVIEW_STATUS" "FAILED"
+    log "builder pushed commit but PR could not be discovered for branch $PR_BRANCH (consecutive=$CONSECUTIVE_BUILDER_FAILURES)"
+
+    if [[ "$CONSECUTIVE_BUILDER_FAILURES" -ge "$MAX_BUILDER_FAILURES" ]]; then
+      write_state "$ITER" "$CONSECUTIVE_BUILDER_FAILURES" "$LAST_BUILDER_COMMIT" "$LAST_REVIEW_STATUS" "FAILED_LIMIT"
+      die "builder failed to produce/discover a PR $CONSECUTIVE_BUILDER_FAILURES times consecutively"
+    fi
+    continue
+  fi
+
   post_builder_comment "$ITER" "$LAST_BUILDER_COMMIT"
 
   sync_worktree "reviewer" "$REVIEWER_WORKTREE"

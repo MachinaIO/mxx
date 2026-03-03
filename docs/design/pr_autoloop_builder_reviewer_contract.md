@@ -42,6 +42,11 @@ Reviewer comments additionally require:
 - `AUTO_REVIEW_STATUS: APPROVED|CHANGES_REQUIRED`
 - `AUTO_TARGET_COMMIT: <sha>`
 
+### Startup modes
+
+- Existing PR mode: operator provides `--pr-url`; loop binds to that PR immediately.
+- Bootstrap mode: operator provides `--head-branch` (and optional `--base-branch`) without `--pr-url`; builder creates or reuses a PR, then loop auto-discovers the PR URL and passes it to reviewer.
+
 ### Stop conditions
 
 - `APPROVED`: successful termination.
@@ -52,6 +57,7 @@ Reviewer comments additionally require:
 ### Safety and isolation
 
 - One lock per PR prevents concurrent loops for the same PR.
+- Before PR discovery in bootstrap mode, loop uses one lock per head branch and keeps the lock for the run lifetime.
 - Runtime state is persisted in skill-local files for auditability and restart analysis.
 
 ## Trade-offs

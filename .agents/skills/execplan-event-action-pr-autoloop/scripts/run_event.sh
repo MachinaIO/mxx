@@ -49,8 +49,8 @@ commands+=("bash -n .agents/skills/pr-autoloop/scripts/doctor.sh")
 commands+=("bash -n .agents/skills/pr-autoloop/scripts/run_loop.sh")
 commands+=(".agents/skills/pr-autoloop/scripts/run_loop.sh --self-test")
 commands+=("rg -n AUTO_AGENT: BUILDER|AUTO_AGENT: REVIEWER|AUTO_REVIEW_STATUS|AUTO_TARGET_COMMIT .agents/skills/pr-autoloop/references/comment_contract.md")
-commands+=("rg -n -- --goal-file|--pr-url|--max-builder-failures|--max-iterations .agents/skills/pr-autoloop/scripts/run_loop.sh")
-commands+=("rg -n run_id|pr_url|consecutive_builder_failures|last_reviewer_status .agents/skills/pr-autoloop/references/state_schema.md")
+commands+=("rg -n -- --goal-file|--pr-url|--head-branch|--base-branch|--max-builder-failures|--max-iterations .agents/skills/pr-autoloop/scripts/run_loop.sh")
+commands+=("rg -n run_id|pr_url|base_branch|lock_key|consecutive_builder_failures|last_reviewer_status .agents/skills/pr-autoloop/references/state_schema.md")
 
 if ! bash -n .agents/skills/pr-autoloop/scripts/doctor.sh; then
   echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
@@ -110,6 +110,18 @@ if ! rg -q -- "--pr-url" .agents/skills/pr-autoloop/scripts/run_loop.sh; then
   echo "STATUS=fail"
   exit 1
 fi
+if ! rg -q -- "--head-branch" .agents/skills/pr-autoloop/scripts/run_loop.sh; then
+  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+  echo "FAILURE_SUMMARY=run_loop argument contract missing --head-branch"
+  echo "STATUS=fail"
+  exit 1
+fi
+if ! rg -q -- "--base-branch" .agents/skills/pr-autoloop/scripts/run_loop.sh; then
+  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+  echo "FAILURE_SUMMARY=run_loop argument contract missing --base-branch"
+  echo "STATUS=fail"
+  exit 1
+fi
 if ! rg -q -- "--max-builder-failures" .agents/skills/pr-autoloop/scripts/run_loop.sh; then
   echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
   echo "FAILURE_SUMMARY=run_loop argument contract missing --max-builder-failures"
@@ -132,6 +144,18 @@ fi
 if ! rg -q "consecutive_builder_failures" .agents/skills/pr-autoloop/references/state_schema.md; then
   echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
   echo "FAILURE_SUMMARY=state schema missing consecutive_builder_failures field"
+  echo "STATUS=fail"
+  exit 1
+fi
+if ! rg -q "base_branch" .agents/skills/pr-autoloop/references/state_schema.md; then
+  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+  echo "FAILURE_SUMMARY=state schema missing base_branch field"
+  echo "STATUS=fail"
+  exit 1
+fi
+if ! rg -q "lock_key" .agents/skills/pr-autoloop/references/state_schema.md; then
+  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+  echo "FAILURE_SUMMARY=state schema missing lock_key field"
   echo "STATUS=fail"
   exit 1
 fi

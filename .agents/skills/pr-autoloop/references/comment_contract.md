@@ -21,6 +21,11 @@ When posted, include:
 - `AUTO_TARGET_COMMIT: <head_sha_after_push>`
 - `AUTO_RESULT: PUSHED|NO_CHANGE|FAILED`
 
+Bootstrap note:
+
+- When loop starts without `--pr-url`, builder must create/reuse a PR for the configured head branch.
+- `run_loop.sh` discovers that PR URL and uses it for reviewer execution and comment parsing.
+
 ## Reviewer comment contract (required)
 
 Reviewer comments are mandatory and must include all fields below:

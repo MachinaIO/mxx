@@ -22,3 +22,4 @@
 - `OPEN` and `ready for review` at follow-up start.
 - Reviewer follow-up response comment posted: `https://github.com/MachinaIO/mxx/pull/60#issuecomment-3987779322`.
 - PR readiness check: `gh pr ready 60` reports PR is already ready for review.
+- Follow-up implementation committed and pushed: `253dd55` on `feat/agr16_encoding`.

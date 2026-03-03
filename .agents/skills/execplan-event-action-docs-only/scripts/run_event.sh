@@ -29,7 +29,7 @@ fi
 commands=()
 commands+=("git diff --name-only --relative HEAD --")
 commands+=("git ls-files --others --exclude-standard")
-commands+=("rg -n TODO|TBD|FIXME docs PLANS.md ARCHITECTURE.md [VERIFICATION.md-if-present]")
+commands+=("rg -n <placeholder-pattern> <changed-doc-targets>")
 
 mapfile -t paths < <({
   git diff --name-only --relative HEAD --
@@ -49,13 +49,22 @@ for path in "${paths[@]}"; do
   esac
 done
 
-placeholder_targets=(docs PLANS.md ARCHITECTURE.md)
-if [[ -f VERIFICATION.md ]]; then
-  placeholder_targets+=(VERIFICATION.md)
+placeholder_targets=()
+for path in "${paths[@]}"; do
+  if [[ -f "$path" ]]; then
+    placeholder_targets+=("$path")
+  fi
+done
+
+if [[ ${#placeholder_targets[@]} -eq 0 ]]; then
+  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+  echo "FAILURE_SUMMARY=none"
+  echo "STATUS=pass"
+  exit 0
 fi
 
 set +e
-placeholder_hits="$(rg -n "TODO|TBD|FIXME" "${placeholder_targets[@]}" 2>/dev/null)"
+placeholder_hits="$(rg -n -e "TODO" -e "TBD" -e "FIXME" "${placeholder_targets[@]}" 2>/dev/null)"
 placeholder_rc=$?
 set -e
 

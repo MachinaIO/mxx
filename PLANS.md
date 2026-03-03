@@ -195,6 +195,7 @@ Agents must strictly follow this lifecycle to create, execute, and complete an E
 
 1. Before creating a new ExecPlan document, run pre-creation verification:
    * `scripts/execplan_gate.sh --event execplan.pre_creation`
+   * Execute this lifecycle gate command out-of-sandbox.
    * If you are reusing an existing plan document, run with `--plan <plan_md>` so the attempt is recorded directly in that plan ledger.
 2. Create or select one target ExecPlan document under `docs/plans/active/`.
    * For a newly created plan document, run `scripts/execplan_gate.sh --plan <plan_md> --event execplan.pre_creation` immediately so the plan ledger contains explicit pre-creation pass evidence required by later gate checks.
@@ -214,6 +215,7 @@ Agents must strictly follow this lifecycle to create, execute, and complete an E
    * add technical-debt follow-up plans when needed.
 9. Run post-completion verification:
    * `scripts/execplan_gate.sh --plan <completed_plan_md> --event execplan.post_completion`.
+   * Execute this lifecycle gate command out-of-sandbox.
    * Post-completion operational behavior is defined only in `.agents/skills/execplan-event-post-completion/SKILL.md` and its script.
    * If post-completion verification fails, do not complete the lifecycle: move the plan document back to `docs/plans/active/`, restore PR-tracking docs to `docs/prs/active/` when applicable, then return to action revision/re-execution (following the skill-defined rollback behavior).
 10. If configured, post one final notification PR comment after all validations pass:

@@ -24,7 +24,9 @@ Dynamic controls:
 
 Execution policy:
 
-- This event runs `gh` operations; execute out-of-sandbox according to `.agents/skills/execplan-sandbox-escalation/SKILL.md`.
+- This event must be executed out-of-sandbox.
+- Run through gate as: `scripts/execplan_gate.sh --event execplan.pre_creation` (or `--plan <plan_md> --event execplan.pre_creation`) with out-of-sandbox execution.
+- Do not run this event inside sandbox because reviewer-daemon startup and `gh` access are required.
 
 ## Script
 

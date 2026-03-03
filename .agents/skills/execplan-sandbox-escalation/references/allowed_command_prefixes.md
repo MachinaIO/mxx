@@ -22,6 +22,8 @@ Policy note: `gh` prefixed commands are expected to run out-of-sandbox by defaul
 - `gh pr edit`
 - `mv docs/prs/active/`
 - `mkdir -p docs/prs/active`
+- `scripts/execplan_gate.sh --event execplan.pre_creation`
+- `scripts/execplan_gate.sh --plan`
 
 ## Entry requirements for new prefixes
 

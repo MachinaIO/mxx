@@ -28,7 +28,9 @@ Dynamic controls:
 
 Execution policy:
 
-- This event runs `gh` operations (including reviewer-comment fetch by URL); execute out-of-sandbox according to `.agents/skills/execplan-sandbox-escalation/SKILL.md`.
+- This event must be executed out-of-sandbox.
+- Run through gate as: `scripts/execplan_gate.sh --plan <completed_plan_md> --event execplan.post_completion` with out-of-sandbox execution.
+- Do not run this event inside sandbox because reviewer-daemon request/response flow and `gh` access are required.
 
 ## Script
 

@@ -212,40 +212,6 @@ if [[ -z "$pr_url" || "$pr_url" == "(not available locally)" ]]; then
   fail_validation "PR tracking metadata missing resolvable PR link for reviewer request"
 fi
 
-target_commit="$(git rev-parse HEAD)"
-review_request_id="post-completion-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-commands+=("$reviewer_daemon_script --request --pr-url $pr_url --commit $target_commit --run-id execplan-post-completion --iteration 0 --request-id $review_request_id")
-
-if ! review_response_json="$("$reviewer_daemon_script" \
-  --request \
-  --pr-url "$pr_url" \
-  --commit "$target_commit" \
-  --run-id "execplan-post-completion" \
-  --iteration "0" \
-  --request-id "$review_request_id")"; then
-  fail_validation "failed while waiting for reviewer daemon response for commit $target_commit"
-fi
-
-review_comment_url="$(jq -r '.comment_url // empty' <<< "$review_response_json" 2>/dev/null || true)"
-if [[ -z "$review_comment_url" ]]; then
-  review_error="$(jq -r '.error // empty' <<< "$review_response_json" 2>/dev/null || true)"
-  if [[ -n "$review_error" ]]; then
-    fail_validation "reviewer daemon response missing comment URL: $review_error"
-  fi
-  fail_validation "reviewer daemon response missing comment URL"
-fi
-
-commands+=("gh pr view $pr_url --json comments")
-review_comment_body="$(fetch_comment_body_by_url "$pr_url" "$review_comment_url" || true)"
-if [[ -z "$review_comment_body" ]]; then
-  fail_validation "failed to fetch reviewer comment body from URL: $review_comment_url"
-fi
-
-if ! rg -q '(^|[[:space:]])APPROVE($|[[:space:]])' <<< "$review_comment_body"; then
-  compact_review="$(printf '%s' "$review_comment_body" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g' | cut -c1-400)"
-  fail_validation "reviewer did not approve latest commit; comment_url=$review_comment_url; comment_excerpt=${compact_review:-empty}"
-fi
-
 pr_ready="${EXECPLAN_PR_READY:-auto}"
 case "$pr_ready" in
   ready|not_ready|auto)
@@ -398,7 +364,25 @@ done
 
 if [[ ${#changed_paths[@]} -gt 0 ]]; then
   commands+=("git add changed plan files")
-  git add -- "${changed_paths[@]}"
+  stage_failures=()
+  for path in "${changed_paths[@]}"; do
+    if git ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
+      if ! git add -u -- "$path" >/dev/null 2>&1; then
+        stage_failures+=("$path")
+      fi
+      continue
+    fi
+
+    if [[ -e "$path" ]]; then
+      if ! git add -- "$path" >/dev/null 2>&1; then
+        stage_failures+=("$path")
+      fi
+    fi
+  done
+
+  if [[ ${#stage_failures[@]} -gt 0 ]]; then
+    fail_after_git_add "failed to stage target files: $(IFS=','; echo "${stage_failures[*]}")"
+  fi
 else
   commands+=("no changed files to stage")
 fi
@@ -429,6 +413,40 @@ branch="$(git branch --show-current)"
 commands+=("git push origin $branch")
 if ! git push origin "$branch" >/dev/null 2>&1; then
   fail_after_git_add "failed to push final post-completion state to origin/$branch"
+fi
+
+target_commit="$(git rev-parse HEAD)"
+review_request_id="post-completion-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+commands+=("$reviewer_daemon_script --request --pr-url $pr_url --commit $target_commit --run-id execplan-post-completion --iteration 0 --request-id $review_request_id")
+
+if ! review_response_json="$("$reviewer_daemon_script" \
+  --request \
+  --pr-url "$pr_url" \
+  --commit "$target_commit" \
+  --run-id "execplan-post-completion" \
+  --iteration "0" \
+  --request-id "$review_request_id")"; then
+  fail_after_git_add "failed while waiting for reviewer daemon response for pushed commit $target_commit"
+fi
+
+review_comment_url="$(jq -r '.comment_url // empty' <<< "$review_response_json" 2>/dev/null || true)"
+if [[ -z "$review_comment_url" ]]; then
+  review_error="$(jq -r '.error // empty' <<< "$review_response_json" 2>/dev/null || true)"
+  if [[ -n "$review_error" ]]; then
+    fail_after_git_add "reviewer daemon response missing comment URL for pushed commit $target_commit: $review_error"
+  fi
+  fail_after_git_add "reviewer daemon response missing comment URL for pushed commit $target_commit"
+fi
+
+commands+=("gh pr view $pr_url --json comments")
+review_comment_body="$(fetch_comment_body_by_url "$pr_url" "$review_comment_url" || true)"
+if [[ -z "$review_comment_body" ]]; then
+  fail_after_git_add "failed to fetch reviewer comment body from URL: $review_comment_url"
+fi
+
+if ! rg -q '(^|[[:space:]])APPROVE($|[[:space:]])' <<< "$review_comment_body"; then
+  compact_review="$(printf '%s' "$review_comment_body" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g' | cut -c1-400)"
+  fail_after_git_add "reviewer did not approve pushed commit $target_commit; comment_url=$review_comment_url; comment_excerpt=${compact_review:-empty}"
 fi
 
 if [[ "$pr_ready" == "ready" ]]; then

@@ -1,19 +1,19 @@
-# Design: Builder/Reviewer Autonomous PR Loop Contract
+# Design: Builder-Started Reviewer Daemon Contract
 
 ## Purpose
 
-Define a long-lived contract for autonomous PR iteration where a builder agent and reviewer agent run in a deterministic loop using machine-readable comment tags.
+Define a long-lived contract for autonomous PR iteration where the builder starts and communicates with a long-running reviewer daemon using machine-readable comment tags.
 
 ## Problem Statement
 
-Manual coordination between implementation and review steps causes inconsistent stop conditions and ambiguous ownership when both roles use a shared GitHub identity.
+Manual coordination between implementation and review steps causes inconsistent handoff timing and ambiguous ownership when both roles use a shared GitHub identity.
 
 ## Design Goals
 
-1. Deterministic loop control with explicit stop/continue states.
+1. Deterministic builder-to-reviewer handoff with explicit machine-readable request/response state.
 2. Explicit role attribution in PR comments even under shared GitHub account usage.
-3. Contract-first parsing: reviewer status must be machine readable.
-4. Bounded failure behavior to prevent runaway execution.
+3. Contract-first parsing: reviewer output status and target commit must be machine readable.
+4. Deterministic lifecycle gating for `execplan.pre_creation` and `execplan.post_completion`.
 
 ## Non-Goals
 
@@ -28,38 +28,40 @@ Manual coordination between implementation and review steps causes inconsistent 
 - `builder agent`: implements feedback, commits, and pushes.
 - `reviewer agent`: performs independent review and posts one contract-compliant PR comment per iteration.
 
-### Comment tags
+### Reviewer comment tags
 
-All autonomous-loop comments include:
-
-- `[AUTO_LOOP]`
-- `AUTO_RUN_ID: <id>`
-- `AUTO_ITERATION: <n>`
-- `AUTO_AGENT: BUILDER|REVIEWER`
-
-Reviewer comments additionally require:
+Reviewer comments require:
 
 - `AUTO_REVIEW_STATUS: APPROVED|CHANGES_REQUIRED`
 - `AUTO_TARGET_COMMIT: <sha>`
-- `AUTO_REQUEST_ID: <request_id>` when driven by daemon request/response flow
+- `AUTO_REQUEST_ID: <request_id>`
+- `AUTO_RUN_ID: <run_id>`
+- `AUTO_ITERATION: <n>`
+- `AUTO_AGENT: REVIEWER`
 - `APPROVE` token when and only when status is approved
 
-Reviewer timing rule in autonomous-loop mode:
+Reviewer timing rule:
 
 - Reviewer posts a contract-compliant comment for each iteration without waiting for CI completion.
 - If CI is still running, reviewer still emits `APPROVED` or `CHANGES_REQUIRED` based on current evidence.
 
-### Startup modes
+### Daemon request/response flow
 
-- Existing PR mode: operator provides `--pr-url`; loop binds to that PR immediately.
-- Bootstrap mode: operator provides `--head-branch` (and optional `--base-branch`) without `--pr-url`; builder creates or reuses a PR, then loop auto-discovers the PR URL and passes it to reviewer.
+1. Builder (or lifecycle event) starts reviewer daemon with `reviewer_daemon.sh --start`.
+2. Builder sends one message for each review cycle with `reviewer_daemon.sh --request --commit <sha>`.
+3. Reviewer daemon posts exactly one contract-compliant PR comment and writes response JSON containing `comment_url` and parsed status fields.
+4. Caller consumes response JSON as deterministic control input.
 
-### Stop conditions
+Startup modes:
 
-- `APPROVED`: successful termination.
-- `CHANGES_REQUIRED`: continue with next builder iteration.
-- Missing/invalid reviewer contract tags: fail-stop (`FAILED_CONTRACT`).
-- Builder consecutive failure count reaches configured threshold: fail-stop (`FAILED_LIMIT`).
+- Existing PR mode: operator provides `--pr-url`; daemon binds to that PR immediately.
+- Branch-first mode: operator provides `--head-branch`; daemon discovers PR URL by head branch when needed.
+
+### Stop behavior
+
+- `APPROVED` with `APPROVE` token: lifecycle post-completion verification can pass; daemon exits.
+- `CHANGES_REQUIRED`: daemon remains active and waits for next request.
+- Missing/invalid reviewer contract tags, commit mismatch, or missing comment URL: hard failure.
 
 ### Lifecycle event integration
 
@@ -69,11 +71,10 @@ Reviewer timing rule in autonomous-loop mode:
 
 ### Safety and isolation
 
-- One lock per PR prevents concurrent loops for the same PR.
-- Before PR discovery in bootstrap mode, loop uses one lock per head branch and keeps the lock for the run lifetime.
-- Runtime state is persisted in skill-local files for auditability and restart analysis.
+- Runtime state is persisted in skill-local daemon files for auditability and restart analysis.
+- Contract parsing is strict: prose-only reviewer outputs are invalid.
 
 ## Trade-offs
 
-- Strict contract parsing increases failures for malformed comments but avoids ambiguous behavior.
-- Shared account operation remains possible, but correctness depends on role-tag discipline.
+- Strict contract parsing increases failures for malformed comments but prevents ambiguous lifecycle decisions.
+- Daemon process management adds operational complexity, but gives deterministic synchronization and reply semantics between builder and reviewer.

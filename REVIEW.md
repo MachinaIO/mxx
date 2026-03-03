@@ -18,7 +18,7 @@ At the start of PR review work, reset reviewer posture:
 For the target PR, verify all of the following:
 
 1. GitHub CI status is passing.
-   - Exception for autonomous-loop mode: if CI checks are still `pending`/`in_progress`, do not wait; post the reviewer comment immediately using the current evidence.
+   - Exception for autonomous flow mode: if CI checks are still `pending`/`in_progress`, do not wait; post the reviewer comment immediately using the current evidence.
 2. If tests were added or changed, confirm the test changes are aligned with the PR scope and are not superficial pass-only tests; perform static code analysis of test logic to verify substantive validation behavior.
 3. Run impacted unit tests that may be affected by the PR but are not covered by CI for this change. Select and execute tests yourself. Do not run integration tests unless explicitly instructed/approved by the user.
 4. Check for duplicated logic, unnecessary processing, dead private code paths, and obsolete fallback logic that was retained only for backward compatibility with old code/data without current necessity.
@@ -46,7 +46,7 @@ If all checks pass, the PR comment must explicitly state that result and include
 
 ## Autonomous loop comment contract
 
-When review work is executed as part of the repository autonomous loop (builder/reviewer mode), the reviewer comment must include all of the following machine-readable tags:
+When review work is executed as part of the repository autonomous flow (builder/reviewer daemon mode), the reviewer comment must include all of the following machine-readable tags:
 
 - `AUTO_AGENT: REVIEWER`
 - `AUTO_RUN_ID: <run_id>`
@@ -55,8 +55,8 @@ When review work is executed as part of the repository autonomous loop (builder/
 - `AUTO_REVIEW_STATUS: APPROVED|CHANGES_REQUIRED`
 - `AUTO_TARGET_COMMIT: <sha>`
 
-In autonomous-loop mode, `AUTO_REVIEW_STATUS: APPROVED` is the loop success stop condition and the reviewer comment must include `APPROVE`. `CHANGES_REQUIRED` means the next builder iteration must run and must not include `APPROVE`. Missing required tags is a contract violation and must be treated as a failed review-cycle output.
-In autonomous-loop mode, reviewer must not block comment posting on CI completion; if CI is still running, reviewer still posts a contract-compliant comment for the current iteration.
+In autonomous flow mode, `AUTO_REVIEW_STATUS: APPROVED` is the success stop condition and the reviewer comment must include `APPROVE`. `CHANGES_REQUIRED` means the builder must continue with another implementation cycle and must not include `APPROVE`. Missing required tags is a contract violation and must be treated as a failed review-cycle output.
+In autonomous flow mode, reviewer must not block comment posting on CI completion; if CI is still running, reviewer still posts a contract-compliant comment for the current request.
 
 ## Reviewer-mode restrictions
 

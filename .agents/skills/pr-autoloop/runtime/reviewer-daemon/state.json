@@ -1,8 +1,8 @@
 {
   "pr_url": "https://github.com/MachinaIO/mxx/pull/63",
   "head_branch": "feat/pr-autoloop-skill",
-  "status": "APPROVED",
-  "pid": "2838842",
-  "workdir": "/tmp/mxx-reviewer-daemon-1772575319",
-  "updated_at": "2026-03-03T22:04:06Z"
+  "status": "WAITING",
+  "pid": "2862335",
+  "workdir": "/home/sora/codes/mxx",
+  "updated_at": "2026-03-03T22:38:58Z"
 }

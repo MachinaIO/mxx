@@ -23,4 +23,4 @@
 - `OPEN` and `ready for review` at follow-up start.
 - Reviewer follow-up response comment posted: `https://github.com/MachinaIO/mxx/pull/60#issuecomment-3988490802`.
 - PR readiness check: `gh pr ready 60` reports PR is already ready for review.
-- GPU benchmark implementation and verification updates are prepared for final persistence commit on `feat/agr16_encoding`.
+- GPU benchmark implementation and verification updates were persisted in commit `9ddfc40` and pushed to `feat/agr16_encoding`.

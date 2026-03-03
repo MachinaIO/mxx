@@ -207,6 +207,30 @@ if [[ "$has_plan_file" -eq 1 ]] && ! rg -q "execplan_start_commit:" "$PLAN"; the
 EOF
 fi
 
+if [[ "$has_plan_file" -eq 1 ]] && ! rg -q "<!-- execplan-start-untracked:start -->" "$PLAN"; then
+  commands+=("capture execplan start untracked snapshot")
+  {
+    echo
+    echo "## ExecPlan Start Snapshot"
+    echo
+    echo "<!-- execplan-start-untracked:start -->"
+
+    snapshot_count=0
+    while IFS= read -r path; do
+      [[ -z "$path" ]] && continue
+      hash="$(git hash-object -- "$path" 2>/dev/null || echo "(missing)")"
+      printf -- "- start_untracked_file: %s\t%s\n" "$hash" "$path"
+      snapshot_count=$((snapshot_count + 1))
+    done < <(git ls-files --others --exclude-standard | sort)
+
+    if [[ "$snapshot_count" -eq 0 ]]; then
+      echo "- start_untracked_file: (none)	(none)"
+    fi
+
+    echo "<!-- execplan-start-untracked:end -->"
+  } >> "$PLAN"
+fi
+
 commands+=("write/update $tracking_path")
 if [[ "$has_plan_file" -eq 1 ]]; then
   commands+=("update plan linkage metadata")

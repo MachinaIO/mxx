@@ -193,13 +193,18 @@ Agents must strictly follow this lifecycle to create, execute, and complete an E
 5. After each action, run `scripts/execplan_gate.sh` for each mapped event in `verify_events`. The gate must block lifecycle progress when verification fails or remains unexecuted.
 6. Record every gate attempt in the plan's `Verification Ledger` section.
 7. On failure, run auto-fix and retry loops through the gate until pass, within policy bound (`3 tries`). If the bound is exceeded, record `escalated` and stop progress.
-8. After all actions and action-level verification events pass, run post-completion verification:
-   * `scripts/execplan_gate.sh --plan <plan_md> --event execplan.post_completion`.
-9. Finalize plan state: update progress/outcomes/ledger sections, push commits, move the plan to `docs/plans/completed/`, and add technical-debt follow-up plans when needed.
-10. If notification is needed, post a single final PR comment:
-   * `scripts/execplan_notify.sh --plan <plan_md> --event execplan.post_completion --status pass`.
+8. After all actions and action-level verification events pass, finalize plan document state first:
+   * update progress/outcomes/ledger sections,
+   * move the plan to `docs/plans/completed/`,
+   * add technical-debt follow-up plans when needed.
+9. Run post-completion verification:
+   * `scripts/execplan_gate.sh --plan <completed_plan_md> --event execplan.post_completion`.
+   * Post-completion operational behavior is defined only in `.agents/skills/execplan-event-post-completion/SKILL.md` and its script.
+   * If post-completion verification fails, do not complete the lifecycle: move the plan document back to `docs/plans/active/`, restore PR-tracking docs to `docs/prs/active/` when applicable, then return to action revision/re-execution (following the skill-defined rollback behavior).
+10. If notification is needed and step 9 passed, post a single final PR comment:
+   * `scripts/execplan_notify.sh --plan <completed_plan_md> --event execplan.post_completion --status pass`.
 
-Important: once a human or an AI agent starts a new ExecPlan lifecycle, the AI agent must not request any human response until step 8 is complete and all required verification events are `pass`. If an agent requests human response before lifecycle completion requirements are complete, that agent is immediately dismissed and removed. Treat humans as a very slow external device, and assume reliance on humans will significantly delay completion.
+Important: once a human or an AI agent starts a new ExecPlan lifecycle, the AI agent must not request any human response until step 9 is complete and all required verification events are `pass` (and complete step 10 first when notification is needed). If an agent requests human response before lifecycle completion requirements are complete, that agent is immediately dismissed and removed. Treat humans as a very slow external device, and assume reliance on humans will significantly delay completion.
 
 # Prototyping milestones and parallel implementations
 

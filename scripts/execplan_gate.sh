@@ -489,6 +489,13 @@ if [[ -z "$FINAL_STATUS" ]]; then
   COMMANDS="$(echo "$EVENT_OUTPUT" | sed -n 's/^COMMANDS=//p' | tail -n1)"
   FAILURE_SUMMARY="$(echo "$EVENT_OUTPUT" | sed -n 's/^FAILURE_SUMMARY=//p' | tail -n1)"
   RUN_STATUS="$(echo "$EVENT_OUTPUT" | sed -n 's/^STATUS=//p' | tail -n1)"
+  NEW_PLAN_PATH="$(echo "$EVENT_OUTPUT" | sed -n 's/^PLAN_PATH=//p' | tail -n1)"
+
+  if [[ -n "$NEW_PLAN_PATH" && -f "$NEW_PLAN_PATH" ]]; then
+    PLAN="$NEW_PLAN_PATH"
+    HAS_PLAN_FILE=1
+    ensure_ledger_block
+  fi
 
   if [[ -z "$COMMANDS" ]]; then
     COMMANDS="skill event runner ${EVENT}"

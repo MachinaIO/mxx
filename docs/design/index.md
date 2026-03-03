@@ -26,6 +26,11 @@ Current registered design documents:
   - Roles:
     1. Target behavior/properties with assumptions and limits.
     2. Core technical idea and trade-off rationale for enforcement vs. advisory docs.
+- [pr_autoloop_builder_reviewer_contract.md](./pr_autoloop_builder_reviewer_contract.md)
+  - Purpose: Defines the long-lived autonomous PR iteration contract for builder/reviewer roles, machine-readable comment tags, and deterministic stop conditions.
+  - Roles:
+    1. Target behavior/properties with assumptions and limits.
+    2. Core technical idea and trade-off rationale for strict contract parsing under shared-account operation.
 
 When adding a design document, place it under `docs/design/` and add it to this index with:
 

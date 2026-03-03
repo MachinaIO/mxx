@@ -43,6 +43,18 @@ A user may identify a PR by URL, title, a file under `docs/prs/`, or a deictic r
 
 If all checks pass, the PR comment must explicitly state that result and include benchmark results when benchmarks were part of the review.
 
+## Autonomous loop comment contract
+
+When review work is executed as part of the repository autonomous loop (builder/reviewer mode), the reviewer comment must include all of the following machine-readable tags:
+
+- `AUTO_AGENT: REVIEWER`
+- `AUTO_RUN_ID: <run_id>`
+- `AUTO_ITERATION: <iteration_number>`
+- `AUTO_REVIEW_STATUS: APPROVED|CHANGES_REQUIRED`
+- `AUTO_TARGET_COMMIT: <sha>`
+
+In autonomous-loop mode, `AUTO_REVIEW_STATUS: APPROVED` is the loop success stop condition. `CHANGES_REQUIRED` means the next builder iteration must run. Missing required tags is a contract violation and must be treated as a failed review-cycle output.
+
 ## Reviewer-mode restrictions
 
 - Local file creation/edit/delete is allowed for analysis support.

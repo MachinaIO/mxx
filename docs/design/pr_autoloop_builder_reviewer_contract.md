@@ -1,0 +1,60 @@
+# Design: Builder/Reviewer Autonomous PR Loop Contract
+
+## Purpose
+
+Define a long-lived contract for autonomous PR iteration where a builder agent and reviewer agent run in a deterministic loop using machine-readable comment tags.
+
+## Problem Statement
+
+Manual coordination between implementation and review steps causes inconsistent stop conditions and ambiguous ownership when both roles use a shared GitHub identity.
+
+## Design Goals
+
+1. Deterministic loop control with explicit stop/continue states.
+2. Explicit role attribution in PR comments even under shared GitHub account usage.
+3. Contract-first parsing: reviewer status must be machine readable.
+4. Bounded failure behavior to prevent runaway execution.
+
+## Non-Goals
+
+- Replacing repository review policy in `REVIEW.md`.
+- Replacing CI status checks.
+- Defining host-level process supervision (`systemd`) as a mandatory requirement.
+
+## Core Contract
+
+### Roles
+
+- `builder agent`: implements feedback, commits, and pushes.
+- `reviewer agent`: performs independent review and posts one contract-compliant PR comment per iteration.
+
+### Comment tags
+
+All autonomous-loop comments include:
+
+- `[AUTO_LOOP]`
+- `AUTO_RUN_ID: <id>`
+- `AUTO_ITERATION: <n>`
+- `AUTO_AGENT: BUILDER|REVIEWER`
+
+Reviewer comments additionally require:
+
+- `AUTO_REVIEW_STATUS: APPROVED|CHANGES_REQUIRED`
+- `AUTO_TARGET_COMMIT: <sha>`
+
+### Stop conditions
+
+- `APPROVED`: successful termination.
+- `CHANGES_REQUIRED`: continue with next builder iteration.
+- Missing/invalid reviewer contract tags: fail-stop (`FAILED_CONTRACT`).
+- Builder consecutive failure count reaches configured threshold: fail-stop (`FAILED_LIMIT`).
+
+### Safety and isolation
+
+- One lock per PR prevents concurrent loops for the same PR.
+- Runtime state is persisted in skill-local files for auditability and restart analysis.
+
+## Trade-offs
+
+- Strict contract parsing increases failures for malformed comments but avoids ambiguous behavior.
+- Shared account operation remains possible, but correctness depends on role-tag discipline.

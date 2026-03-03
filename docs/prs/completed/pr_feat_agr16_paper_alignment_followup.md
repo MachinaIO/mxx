@@ -23,3 +23,4 @@
 - `OPEN` and `ready for review` at follow-up start.
 - Scope is limited to AGR16 paper-alignment corrections and tests.
 - Readiness reconfirmed with `gh pr ready 60` (already ready), and tracking docs moved to completed paths.
+- Implementation persisted in commit `2b62c82` and pushed to `feat/agr16_encoding`.

@@ -19,11 +19,11 @@ Read ARCHITECTURE.md before making changes that could affect code structure, e.g
 - introducing new external dependencies,
 - touching boundaries (e.g., FFI/CUDA, IO/storage, build integration) that rely on invariants.
 
-### Verification (VERIFICATION.md)
-Read VERIFICATION.md before implementation to determine the required verification level and the canonical commands/checks, especially when:
+### Verification (PLANS.md + repository-local event skills)
+Read `PLANS.md` verification sections before implementation to determine verification policy and enforcement requirements, especially when:
 - adding new features, changing behavior, or touching performance/correctness-critical code,
 - modifying tests/CI, introducing new test categories, or changing required checks.
-Your ExecPlan must reference VERIFICATION.md and list the exact commands you ran; update VERIFICATION.md only when the *meta* verification policy itself changes.
+ExecPlan verification execution must use repository-local event skills under `.agents/skills/execplan-event-*/` plus index mapping under `.agents/skills/execplan-event-index/`, and gate/notify scripts under `scripts/`.
 
 ### Review (REVIEW.md)
 Read REVIEW.md when you are asked to review a PR or to act as a reviewer.

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Event CPU Behavior"
+  short_description: "Run action.cpu_behavior checks"
+  default_prompt: "Execute CPU behavior verification for an ExecPlan action."
+
+policy:
+  allow_implicit_invocation: true

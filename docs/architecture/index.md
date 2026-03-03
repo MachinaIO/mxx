@@ -27,6 +27,7 @@ The current architecture scope documents are mapped to these implementation root
 - CUDA/C++ boundary code: `cuda/`
 - Build integration: `build.rs`
 - Test and benchmark entrypoints: `tests/`, `benches/`
+- ExecPlan verification automation: `.agents/skills/`, `scripts/`
 
 ## Maintenance rule
 

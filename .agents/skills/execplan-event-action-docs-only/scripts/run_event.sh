@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PLAN=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --plan)
+      PLAN="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      echo "Usage: run_event.sh --plan <plan_md>"
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "$PLAN" || ! -f "$PLAN" ]]; then
+  echo "COMMANDS=none"
+  echo "FAILURE_SUMMARY=plan file not found"
+  echo "STATUS=fail"
+  exit 1
+fi
+
+commands=()
+commands+=("git diff --name-only --relative HEAD --")
+commands+=("git ls-files --others --exclude-standard")
+commands+=("rg -n TODO|TBD|FIXME docs PLANS.md ARCHITECTURE.md [VERIFICATION.md-if-present]")
+
+mapfile -t paths < <({
+  git diff --name-only --relative HEAD --
+  git ls-files --others --exclude-standard
+} | sed '/^$/d' | sort -u)
+
+for path in "${paths[@]}"; do
+  case "$path" in
+    docs/*|*.md|AGENTS.md|ARCHITECTURE.md|DESIGN.md|PLANS.md|REVIEW.md)
+      ;;
+    *)
+      echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+      echo "FAILURE_SUMMARY=non-doc path found for docs-only event: $path"
+      echo "STATUS=fail"
+      exit 1
+      ;;
+  esac
+done
+
+placeholder_targets=(docs PLANS.md ARCHITECTURE.md)
+if [[ -f VERIFICATION.md ]]; then
+  placeholder_targets+=(VERIFICATION.md)
+fi
+
+set +e
+placeholder_hits="$(rg -n "TODO|TBD|FIXME" "${placeholder_targets[@]}" 2>/dev/null)"
+placeholder_rc=$?
+set -e
+
+if [[ $placeholder_rc -eq 0 ]]; then
+  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+  echo "FAILURE_SUMMARY=stale policy/documentation placeholders found: $(echo "$placeholder_hits" | head -n 1)"
+  echo "STATUS=fail"
+  exit 1
+fi
+
+echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+echo "FAILURE_SUMMARY=none"
+echo "STATUS=pass"

@@ -117,6 +117,8 @@ Operational verification source of truth:
 * `.agents/skills/execplan-event-index/SKILL.md`
 * `.agents/skills/execplan-event-index/references/event_skill_map.tsv`
 * each mapped event skill under `.agents/skills/execplan-event-*/`
+* `.agents/skills/execplan-sandbox-escalation/SKILL.md`
+* `.agents/skills/execplan-sandbox-escalation/references/allowed_command_prefixes.md`
 * `scripts/execplan_gate.sh`
 * `scripts/execplan_notify.sh`
 
@@ -162,6 +164,16 @@ If notification is needed, post only once after all actions are complete, `execp
 
 Notification target is GitHub PR comment.
 
+### Sandbox escalation policy
+
+When executing ExecPlan actions or verification events, apply this out-of-sandbox command policy:
+
+* `.agents/skills/execplan-sandbox-escalation/SKILL.md` is mandatory for all out-of-sandbox command execution,
+* invoke that skill and read `.agents/skills/execplan-sandbox-escalation/references/allowed_command_prefixes.md` before requesting or running any out-of-sandbox command,
+* prefer implementing the needed function with already allowed prefixes,
+* if existing prefixes cannot safely realize the function, request human operator approval for a new out-of-sandbox command and add a safely generalized prefix entry to `.agents/skills/execplan-sandbox-escalation/references/allowed_command_prefixes.md`.
+* if this mandatory skill step is not completed, do not execute out-of-sandbox commands and treat the state as a policy violation that blocks lifecycle progress until corrected.
+
 ### Evidence policy
 
 Short-lived verification logs must not be stored in separate temporary tracking files.
@@ -190,6 +202,7 @@ Agents must strictly follow this lifecycle to create, execute, and complete an E
    * required metadata: `action_id`, `mode`, `depends_on`, `file_locks`, `verify_events`, `worker_type`,
    * `verify_events` values must be event IDs registered in `.agents/skills/execplan-event-index/references/event_skill_map.tsv`.
 4. Execute actions in dependency order. Delegate only `mode=parallel` actions to sub agents, and keep all status updates in the same ExecPlan.
+   * Any out-of-sandbox command execution during action work or verification must follow the `Sandbox escalation policy` in this document and the mandatory skill `.agents/skills/execplan-sandbox-escalation/SKILL.md`.
 5. After each action, run `scripts/execplan_gate.sh` for each mapped event in `verify_events`. The gate must block lifecycle progress when verification fails or remains unexecuted.
 6. Record every gate attempt in the plan's `Verification Ledger` section.
 7. On failure, run auto-fix and retry loops through the gate until pass, within policy bound (`3 tries`). If the bound is exceeded, record `escalated` and stop progress.

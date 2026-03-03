@@ -23,7 +23,7 @@ Read ARCHITECTURE.md before making changes that could affect code structure, e.g
 Read `PLANS.md` verification sections before implementation to determine verification policy and enforcement requirements, especially when:
 - adding new features, changing behavior, or touching performance/correctness-critical code,
 - modifying tests/CI, introducing new test categories, or changing required checks.
-ExecPlan verification execution must use repository-local event skills under `.agents/skills/execplan-event-*/` plus index mapping under `.agents/skills/execplan-event-index/`, and gate/notify scripts under `scripts/`. Your ExecPlan must list exact commands in `Verification Ledger` and follow the integrated policy in `PLANS.md`.
+ExecPlan verification execution must use repository-local event skills under `.agents/skills/execplan-event-*/` plus index mapping under `.agents/skills/execplan-event-index/`, and gate/notify scripts under `scripts/`.
 
 ### Review (REVIEW.md)
 Read REVIEW.md when you are asked to review a PR or to act as a reviewer.

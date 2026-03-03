@@ -21,7 +21,7 @@ After this change, the `pr-autoloop` skill surface and validation contracts are 
 - [x] (2026-03-03 22:23Z) action_id=a1; mode=serial; depends_on=a0; file_locks=.agents/skills/pr-autoloop/SKILL.md,.agents/skills/pr-autoloop/agents/openai.yaml,.agents/skills/pr-autoloop/references/comment_contract.md,.agents/skills/pr-autoloop/references/state_schema.md,.agents/skills/pr-autoloop/scripts/run_loop.sh,.agents/skills/pr-autoloop/scripts/reviewer_daemon.sh,.agents/skills/execplan-event-action-pr-autoloop/scripts/run_event.sh; verify_events=action.pr_autoloop,action.tooling; worker_type=default; removed `run_loop.sh`, converted contracts/verification to daemon-only semantics, and removed tracked runtime artifacts.
 - [x] (2026-03-03 22:23Z) action_id=a2; mode=serial; depends_on=a1; file_locks=docs/design/pr_autoloop_builder_reviewer_contract.md,docs/architecture/scope/automation_orchestration.md,REVIEW.md,docs/plans/active/plan_pr_autoloop_daemon_alignment_cleanup.md; verify_events=action.tooling; worker_type=default; updated design/architecture/review policy text to daemon-first reviewer request/response terminology.
 - [x] (2026-03-03 22:23Z) action_id=a3; mode=serial; depends_on=a2; file_locks=docs/plans/active/plan_pr_autoloop_daemon_alignment_cleanup.md; verify_events=action.pr_autoloop,action.tooling; worker_type=default; re-ran action-level gates on the full modified set and reached passing state for both events.
-- [ ] action_id=a4; mode=serial; depends_on=a3; file_locks=docs/plans/active/plan_pr_autoloop_daemon_alignment_cleanup.md,docs/plans/completed/plan_pr_autoloop_daemon_alignment_cleanup.md,docs/prs/active/pr_feat_pr-autoloop-skill.md,docs/prs/completed/pr_feat_pr-autoloop-skill.md,.agents/skills/execplan-event-post-completion/SKILL.md,.agents/skills/execplan-event-post-completion/scripts/run_event.sh,.agents/skills/execplan-event-action-pr-autoloop/scripts/run_event.sh,.agents/skills/pr-autoloop/runtime/.gitignore; verify_events=action.tooling; worker_type=default; partially completed: fixed post-completion review ordering to push-first and added idempotent blocker section handling plus runtime de-tracking checks; remaining: obtain `execplan.post_completion` pass and mark action complete.
+- [x] (2026-03-03 22:46Z) action_id=a4; mode=serial; depends_on=a3; file_locks=docs/plans/active/plan_pr_autoloop_daemon_alignment_cleanup.md,docs/plans/completed/plan_pr_autoloop_daemon_alignment_cleanup.md,docs/prs/active/pr_feat_pr-autoloop-skill.md,docs/prs/completed/pr_feat_pr-autoloop-skill.md,.agents/skills/execplan-event-post-completion/SKILL.md,.agents/skills/execplan-event-post-completion/scripts/run_event.sh,.agents/skills/execplan-event-action-pr-autoloop/scripts/run_event.sh,.agents/skills/pr-autoloop/runtime/.gitignore; verify_events=action.tooling; worker_type=default; completed remediation for reviewer findings (active/completed consistency, blocker idempotence, runtime artifact de-tracking) and prepared final post-completion verification.
 
 ## Verification Ledger
 
@@ -76,7 +76,7 @@ Completed so far:
 
 Remaining:
 
-- Complete action `a4`.
+- None (waiting for lifecycle post-completion event execution result).
 
 ## Context and Orientation
 
@@ -137,6 +137,7 @@ If post-completion fails, the event script must roll plan/PR tracking docs back 
 - 2026-03-03 22:23Z: Converted verification targets to daemon-only contracts, removed `action.docs_only` from this plan because non-doc skill/script cleanup is intentionally in scope, and updated reviewer timing wording to satisfy strict gate validation.
 - 2026-03-03 22:36Z: Added post-completion remediation because reviewer request happened before final push. Updated event script/skill to push first, then request reviewer for pushed commit; resumed from active plan `a4` after escalation.
 - 2026-03-03 22:43Z: Applied reviewer-requested remediation: returned plan to active state, deduplicated blocker sections, removed tracked runtime daemon outputs, and added runtime de-tracking validation.
+- 2026-03-03 22:46Z: Marked `a4` complete after remediation implementation and set plan to ready for final lifecycle `execplan.post_completion` execution.
 
 
 ## Post-Completion Blockers

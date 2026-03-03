@@ -61,8 +61,9 @@ mod tests {
         }
     }
 
-    fn sample_fixture(
+    fn sample_fixture_with_aux_depth(
         input_size: usize,
+        auxiliary_depth: usize,
         params: &DCRTPolyParams,
     ) -> (
         Vec<Agr16PublicKey<DCRTPolyMatrix>>,
@@ -75,7 +76,7 @@ mod tests {
         let tag_bytes = tag.to_le_bytes();
 
         let pubkey_sampler =
-            AGR16PublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, AUXILIARY_DEPTH);
+            AGR16PublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, auxiliary_depth);
         let reveal_plaintexts = vec![true; input_size];
         let pubkeys = pubkey_sampler.sample(params, &tag_bytes, &reveal_plaintexts);
 
@@ -87,6 +88,18 @@ mod tests {
         let encodings = encoding_sampler.sample(params, &pubkeys, &plaintexts);
 
         (pubkeys, encodings, plaintexts, encoding_sampler.secret)
+    }
+
+    fn sample_fixture(
+        input_size: usize,
+        params: &DCRTPolyParams,
+    ) -> (
+        Vec<Agr16PublicKey<DCRTPolyMatrix>>,
+        Vec<Agr16Encoding<DCRTPolyMatrix>>,
+        Vec<DCRTPoly>,
+        DCRTPoly,
+    ) {
+        sample_fixture_with_aux_depth(input_size, AUXILIARY_DEPTH, params)
     }
 
     fn scalar_matrix(params: &DCRTPolyParams, value: DCRTPoly) -> DCRTPolyMatrix {
@@ -466,6 +479,59 @@ mod tests {
             &enc_outputs[0],
             expected_plain,
             "Depth-3 complete binary-tree AGR16 multiplication output must satisfy Equation 5.1 when error=0",
+        );
+    }
+
+    #[test]
+    fn test_agr16_complete_binary_tree_depth_env_probe() {
+        let params = DCRTPolyParams::default();
+        let depth = std::env::var("MXX_AGR16_TREE_DEPTH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(3);
+        let auxiliary_depth = std::env::var("MXX_AGR16_AUX_DEPTH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(depth + 1);
+        assert!(depth > 0, "MXX_AGR16_TREE_DEPTH must be positive");
+        assert!(
+            auxiliary_depth >= depth + 1,
+            "MXX_AGR16_AUX_DEPTH must satisfy auxiliary_depth >= depth + 1"
+        );
+        let leaf_count = 1usize << depth;
+        let (pubkeys, encodings, plaintexts, secret) =
+            sample_fixture_with_aux_depth(leaf_count, auxiliary_depth, &params);
+
+        let mut circuit = PolyCircuit::new();
+        let inputs = circuit.input(leaf_count);
+        let mut level = inputs.clone();
+        while level.len() > 1 {
+            level = level.chunks_exact(2).map(|pair| circuit.mul_gate(pair[0], pair[1])).collect();
+        }
+        let out = level[0];
+        circuit.output(vec![out]);
+
+        let pk_outputs = circuit.eval(
+            &params,
+            pubkeys[0].clone(),
+            pubkeys.iter().skip(1).cloned().collect(),
+            None::<&NoopAgr16PkPlt>,
+        );
+        let enc_outputs = circuit.eval(
+            &params,
+            encodings[0].clone(),
+            encodings.iter().skip(1).cloned().collect(),
+            None::<&NoopAgr16EncPlt>,
+        );
+
+        let expected_plain = plaintexts.iter().cloned().reduce(|acc, next| acc * next).unwrap();
+        assert_eval_output_matches_equation_5_1(
+            &params,
+            &secret,
+            &pk_outputs[0],
+            &enc_outputs[0],
+            expected_plain,
+            "Env-probe complete binary-tree AGR16 multiplication output must satisfy Equation 5.1 when error=0",
         );
     }
 

@@ -22,13 +22,15 @@ After this change, AGR16 tests will include a complete binary-tree multiplicatio
 - [x] (2026-03-03 00:59Z) Created active PR tracking file `docs/prs/active/pr_feat_agr16_binary_tree_test_coverage.md`.
 - [x] (2026-03-03 01:00Z) Created this ExecPlan.
 - [x] (2026-03-03 01:03Z) Added complete binary-tree multiplication depth-3 test with Eq. 5.1 output consistency check in `src/agr16/mod.rs` (`test_agr16_complete_binary_tree_depth3_preserves_equation_5_1_without_error`).
-- [x] (2026-03-03 01:05Z) Ran verification commands:
+- [x] (2026-03-03 01:22Z) Added benchmark `benches/bench_agr16_complete_binary_tree_depth_env_probe.rs` mirroring `test_agr16_complete_binary_tree_depth_env_probe` with requested params (`ring_dim=2^14`, `crt_bits=52`, `crt_depth=9`, `base_bits=crt_bits/2`) and registered it in `Cargo.toml`.
+- [x] (2026-03-03 01:25Z) Ran verification commands:
   - `cargo +nightly fmt --all`
   - `cargo test -r --lib agr16`
   - `cargo test -r --lib`
+  - `cargo bench --bench bench_agr16_complete_binary_tree_depth_env_probe --no-run`
 - [x] (2026-03-03 01:08Z) Posted reviewer follow-up response comment: `https://github.com/MachinaIO/mxx/pull/60#issuecomment-3987936514`.
 - [x] (2026-03-03 01:08Z) Ran post-completion readiness action `gh pr ready 60` (already ready) and moved plan/PR tracking docs to completed.
-- [x] (2026-03-03 01:10Z) Persisted final post-completion state with commit `f76f31f` and push `feat/agr16_encoding -> origin/feat/agr16_encoding`.
+- [ ] Persist final post-completion state via commit and push.
 
 Main-ExecPlan validation mapping (PLANS.md lifecycle step 3):
 - Action `add binary-tree multiplication topology test` -> run `cargo test -r --lib agr16`.
@@ -48,7 +50,7 @@ Main-ExecPlan validation mapping (PLANS.md lifecycle step 3):
 
 ## Outcomes & Retrospective
 
-Completed. AGR16 now includes complete binary-tree multiplication coverage at depth 3 with Eq. 5.1 output consistency assertion, and lifecycle evidence is persisted in commit `f76f31f`.
+Implementation and validation are complete. Remaining work is final persistence commit/push for this benchmark-extension follow-up.
 
 ## Design/Architecture/Verification Document Summary
 
@@ -107,6 +109,8 @@ The change is test-focused. If the new circuit topology assertion fails, isolate
 
 Expected touched files:
 - `src/agr16/mod.rs`
+- `benches/bench_agr16_complete_binary_tree_depth_env_probe.rs`
+- `Cargo.toml`
 - `docs/prs/completed/pr_feat_agr16_binary_tree_test_coverage.md`
 - `docs/plans/completed/plan_agr16_binary_tree_depth_test_coverage.md`
 
@@ -114,6 +118,4 @@ Expected touched files:
 
 No public interface changes expected.
 
-Revision note (2026-03-03 01:05Z): Updated plan with completed binary-tree test implementation and verification outcomes; left only lifecycle closure steps pending.
-Revision note (2026-03-03 01:08Z): Updated completed-path linkage and recorded PR response/readiness actions; left final commit/push as remaining lifecycle step.
-Revision note (2026-03-03 01:10Z): Recorded final commit/push evidence and marked lifecycle fully completed.
+Revision note (2026-03-03 01:25Z): Reopened this completed plan as a continuation follow-up to add the requested benchmark mirror, updated verification evidence, and marked final persistence as pending again.

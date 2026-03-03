@@ -51,10 +51,11 @@ When review work is executed as part of the repository autonomous loop (builder/
 - `AUTO_AGENT: REVIEWER`
 - `AUTO_RUN_ID: <run_id>`
 - `AUTO_ITERATION: <iteration_number>`
+- `AUTO_REQUEST_ID: <request_id>` (daemon request/response mode)
 - `AUTO_REVIEW_STATUS: APPROVED|CHANGES_REQUIRED`
 - `AUTO_TARGET_COMMIT: <sha>`
 
-In autonomous-loop mode, `AUTO_REVIEW_STATUS: APPROVED` is the loop success stop condition. `CHANGES_REQUIRED` means the next builder iteration must run. Missing required tags is a contract violation and must be treated as a failed review-cycle output.
+In autonomous-loop mode, `AUTO_REVIEW_STATUS: APPROVED` is the loop success stop condition and the reviewer comment must include `APPROVE`. `CHANGES_REQUIRED` means the next builder iteration must run and must not include `APPROVE`. Missing required tags is a contract violation and must be treated as a failed review-cycle output.
 In autonomous-loop mode, reviewer must not block comment posting on CI completion; if CI is still running, reviewer still posts a contract-compliant comment for the current iteration.
 
 ## Reviewer-mode restrictions

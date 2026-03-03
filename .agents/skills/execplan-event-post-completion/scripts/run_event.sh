@@ -141,6 +141,23 @@ has_unresolved_latest_nonpass_event() {
   '
 }
 
+extract_pr_link_from_tracking_doc() {
+  local tracking_doc="$1"
+  sed -n -E 's/^- PR link:[[:space:]]+(.+)$/\1/p' "$tracking_doc" | head -n1 | sed -E 's/[[:space:]]+$//'
+}
+
+fetch_comment_body_by_url() {
+  local pr_url="$1"
+  local comment_url="$2"
+  local comments_json
+  comments_json="$(gh pr view "$pr_url" --json comments 2>/dev/null || true)"
+  [[ -n "$comments_json" ]] || return 1
+
+  jq -r \
+    --arg comment_url "$comment_url" \
+    '[.comments[] | select(.url == $comment_url)][-1].body // empty' <<< "$comments_json"
+}
+
 if ! rg -q "event_id=execplan.pre_creation;.*status=pass" "$PLAN"; then
   fail_validation "missing pass entry for execplan.pre_creation"
 fi
@@ -183,6 +200,50 @@ for field in "PR link" "branch" "commit" "summary/content"; do
 done
 if [[ ${#missing_fields[@]} -gt 0 ]]; then
   fail_validation "PR tracking metadata incomplete; missing fields: $(IFS=','; echo "${missing_fields[*]}")"
+fi
+
+reviewer_daemon_script=".agents/skills/pr-autoloop/scripts/reviewer_daemon.sh"
+if [[ ! -x "$reviewer_daemon_script" ]]; then
+  fail_validation "reviewer daemon script missing or not executable: $reviewer_daemon_script"
+fi
+
+pr_url="$(extract_pr_link_from_tracking_doc "$pr_doc_path")"
+if [[ -z "$pr_url" || "$pr_url" == "(not available locally)" ]]; then
+  fail_validation "PR tracking metadata missing resolvable PR link for reviewer request"
+fi
+
+target_commit="$(git rev-parse HEAD)"
+review_request_id="post-completion-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+commands+=("$reviewer_daemon_script --request --pr-url $pr_url --commit $target_commit --run-id execplan-post-completion --iteration 0 --request-id $review_request_id")
+
+if ! review_response_json="$("$reviewer_daemon_script" \
+  --request \
+  --pr-url "$pr_url" \
+  --commit "$target_commit" \
+  --run-id "execplan-post-completion" \
+  --iteration "0" \
+  --request-id "$review_request_id")"; then
+  fail_validation "failed while waiting for reviewer daemon response for commit $target_commit"
+fi
+
+review_comment_url="$(jq -r '.comment_url // empty' <<< "$review_response_json" 2>/dev/null || true)"
+if [[ -z "$review_comment_url" ]]; then
+  review_error="$(jq -r '.error // empty' <<< "$review_response_json" 2>/dev/null || true)"
+  if [[ -n "$review_error" ]]; then
+    fail_validation "reviewer daemon response missing comment URL: $review_error"
+  fi
+  fail_validation "reviewer daemon response missing comment URL"
+fi
+
+commands+=("gh pr view $pr_url --json comments")
+review_comment_body="$(fetch_comment_body_by_url "$pr_url" "$review_comment_url" || true)"
+if [[ -z "$review_comment_body" ]]; then
+  fail_validation "failed to fetch reviewer comment body from URL: $review_comment_url"
+fi
+
+if ! rg -q '(^|[[:space:]])APPROVE($|[[:space:]])' <<< "$review_comment_body"; then
+  compact_review="$(printf '%s' "$review_comment_body" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g' | cut -c1-400)"
+  fail_validation "reviewer did not approve latest commit; comment_url=$review_comment_url; comment_excerpt=${compact_review:-empty}"
 fi
 
 pr_ready="${EXECPLAN_PR_READY:-auto}"

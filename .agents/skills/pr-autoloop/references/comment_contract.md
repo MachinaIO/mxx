@@ -11,6 +11,10 @@ Every autonomous-loop comment must include:
 - `AUTO_ITERATION: <n>`
 - `AUTO_AGENT: BUILDER` or `AUTO_AGENT: REVIEWER`
 
+When the reviewer daemon request/response path is used, reviewer comments must also include:
+
+- `AUTO_REQUEST_ID: <request_id>`
+
 ## Builder comment contract
 
 Builder comments are optional but recommended for traceability.
@@ -33,6 +37,7 @@ Reviewer comments are mandatory and must include all fields below:
 - `AUTO_AGENT: REVIEWER`
 - `AUTO_REVIEW_STATUS: APPROVED|CHANGES_REQUIRED`
 - `AUTO_TARGET_COMMIT: <sha>`
+- `AUTO_REQUEST_ID: <request_id>` (daemon mode)
 
 Reviewer timing:
 
@@ -42,5 +47,10 @@ Reviewer timing:
 
 - `APPROVED`: loop exits successfully.
 - `CHANGES_REQUIRED`: loop continues and passes reviewer feedback to next builder iteration.
+
+Approval token:
+
+- When status is `APPROVED`, include `APPROVE` in the comment body.
+- When status is `CHANGES_REQUIRED`, do not include `APPROVE`.
 
 Any missing or invalid reviewer field is treated as a hard failure.

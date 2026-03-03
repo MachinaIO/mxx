@@ -41,6 +41,8 @@ Reviewer comments additionally require:
 
 - `AUTO_REVIEW_STATUS: APPROVED|CHANGES_REQUIRED`
 - `AUTO_TARGET_COMMIT: <sha>`
+- `AUTO_REQUEST_ID: <request_id>` when driven by daemon request/response flow
+- `APPROVE` token when and only when status is approved
 
 Reviewer timing rule in autonomous-loop mode:
 
@@ -58,6 +60,12 @@ Reviewer timing rule in autonomous-loop mode:
 - `CHANGES_REQUIRED`: continue with next builder iteration.
 - Missing/invalid reviewer contract tags: fail-stop (`FAILED_CONTRACT`).
 - Builder consecutive failure count reaches configured threshold: fail-stop (`FAILED_LIMIT`).
+
+### Lifecycle event integration
+
+- `execplan.pre_creation`: ensure reviewer daemon process is running (start in background when absent).
+- `execplan.post_completion`: send latest commit metadata to reviewer daemon, wait for response, fetch returned review-comment URL, and pass only when `APPROVE` token is present.
+- Reviewer daemon exits after emitting an approved (`APPROVE`) review comment; otherwise it stays active awaiting new commit messages.
 
 ### Safety and isolation
 

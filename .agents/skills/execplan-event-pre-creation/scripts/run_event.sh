@@ -172,6 +172,29 @@ if [[ "$gh_available" -eq 1 ]]; then
   pr_base="$(gh pr view --json baseRefName --jq '.baseRefName' 2>/dev/null || echo "(unknown)")"
 fi
 
+reviewer_daemon_script=".agents/skills/pr-autoloop/scripts/reviewer_daemon.sh"
+if [[ ! -x "$reviewer_daemon_script" ]]; then
+  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+  echo "FAILURE_SUMMARY=reviewer daemon script missing or not executable: $reviewer_daemon_script"
+  echo "STATUS=fail"
+  exit 1
+fi
+
+reviewer_start_cmd=("$reviewer_daemon_script" --start --runtime-dir ".agents/skills/pr-autoloop/runtime" --head-branch "$branch_after")
+if [[ -n "$pr_url" && "$pr_url" != "(not available locally)" ]]; then
+  reviewer_start_cmd+=(--pr-url "$pr_url")
+  commands+=("$reviewer_daemon_script --start --runtime-dir .agents/skills/pr-autoloop/runtime --head-branch $branch_after --pr-url $pr_url")
+else
+  commands+=("$reviewer_daemon_script --start --runtime-dir .agents/skills/pr-autoloop/runtime --head-branch $branch_after")
+fi
+
+if ! "${reviewer_start_cmd[@]}" >/dev/null 2>&1; then
+  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+  echo "FAILURE_SUMMARY=failed to start or attach reviewer daemon process"
+  echo "STATUS=fail"
+  exit 1
+fi
+
 cat > "$tracking_path" <<EOF
 # PR Tracking: ${branch_after}
 

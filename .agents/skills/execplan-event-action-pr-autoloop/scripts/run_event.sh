@@ -32,6 +32,7 @@ required_paths=(
   ".agents/skills/pr-autoloop/references/comment_contract.md"
   ".agents/skills/pr-autoloop/references/state_schema.md"
   ".agents/skills/pr-autoloop/scripts/doctor.sh"
+  ".agents/skills/pr-autoloop/scripts/reviewer_daemon.sh"
   ".agents/skills/pr-autoloop/scripts/run_loop.sh"
 )
 
@@ -46,15 +47,23 @@ done
 
 commands=()
 commands+=("bash -n .agents/skills/pr-autoloop/scripts/doctor.sh")
+commands+=("bash -n .agents/skills/pr-autoloop/scripts/reviewer_daemon.sh")
 commands+=("bash -n .agents/skills/pr-autoloop/scripts/run_loop.sh")
 commands+=(".agents/skills/pr-autoloop/scripts/run_loop.sh --self-test")
-commands+=("rg -n AUTO_AGENT: BUILDER|AUTO_AGENT: REVIEWER|AUTO_REVIEW_STATUS|AUTO_TARGET_COMMIT .agents/skills/pr-autoloop/references/comment_contract.md")
+commands+=("rg -n AUTO_AGENT: BUILDER|AUTO_AGENT: REVIEWER|AUTO_REQUEST_ID|AUTO_REVIEW_STATUS|AUTO_TARGET_COMMIT|APPROVE .agents/skills/pr-autoloop/references/comment_contract.md")
 commands+=("rg -n -- --goal-file|--pr-url|--head-branch|--base-branch|--max-builder-failures|--max-iterations .agents/skills/pr-autoloop/scripts/run_loop.sh")
-commands+=("rg -n run_id|pr_url|base_branch|lock_key|consecutive_builder_failures|last_reviewer_status .agents/skills/pr-autoloop/references/state_schema.md")
+commands+=("rg -n run_id|pr_url|base_branch|lock_key|consecutive_builder_failures|last_reviewer_status|reviewer-daemon|responses .agents/skills/pr-autoloop/references/state_schema.md")
 
 if ! bash -n .agents/skills/pr-autoloop/scripts/doctor.sh; then
   echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
   echo "FAILURE_SUMMARY=doctor.sh syntax check failed"
+  echo "STATUS=fail"
+  exit 1
+fi
+
+if ! bash -n .agents/skills/pr-autoloop/scripts/reviewer_daemon.sh; then
+  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+  echo "FAILURE_SUMMARY=reviewer_daemon.sh syntax check failed"
   echo "STATUS=fail"
   exit 1
 fi
@@ -85,6 +94,12 @@ if ! rg -q "AUTO_AGENT: REVIEWER" .agents/skills/pr-autoloop/references/comment_
   echo "STATUS=fail"
   exit 1
 fi
+if ! rg -q "AUTO_REQUEST_ID" .agents/skills/pr-autoloop/references/comment_contract.md; then
+  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+  echo "FAILURE_SUMMARY=comment contract missing AUTO_REQUEST_ID"
+  echo "STATUS=fail"
+  exit 1
+fi
 if ! rg -q "AUTO_REVIEW_STATUS" .agents/skills/pr-autoloop/references/comment_contract.md; then
   echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
   echo "FAILURE_SUMMARY=comment contract missing AUTO_REVIEW_STATUS"
@@ -94,6 +109,12 @@ fi
 if ! rg -q "AUTO_TARGET_COMMIT" .agents/skills/pr-autoloop/references/comment_contract.md; then
   echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
   echo "FAILURE_SUMMARY=comment contract missing AUTO_TARGET_COMMIT"
+  echo "STATUS=fail"
+  exit 1
+fi
+if ! rg -q "APPROVE" .agents/skills/pr-autoloop/references/comment_contract.md; then
+  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+  echo "FAILURE_SUMMARY=comment contract missing APPROVE token rule"
   echo "STATUS=fail"
   exit 1
 fi
@@ -156,6 +177,12 @@ fi
 if ! rg -q "lock_key" .agents/skills/pr-autoloop/references/state_schema.md; then
   echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
   echo "FAILURE_SUMMARY=state schema missing lock_key field"
+  echo "STATUS=fail"
+  exit 1
+fi
+if ! rg -q "reviewer-daemon" .agents/skills/pr-autoloop/references/state_schema.md; then
+  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+  echo "FAILURE_SUMMARY=state schema missing reviewer-daemon runtime layout"
   echo "STATUS=fail"
   exit 1
 fi

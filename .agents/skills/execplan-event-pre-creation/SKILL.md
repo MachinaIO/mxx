@@ -11,6 +11,7 @@ Executes the "before main ExecPlan creation" workflow:
 - query PR context when `gh` is available,
 - enforce branch-switch rules (`main` or scope-misaligned work must switch),
 - create/update PR tracking metadata under `docs/prs/active/`,
+- ensure reviewer daemon process is running (start in background when absent),
 - ensure the ExecPlan contains PR tracking path and start branch/commit linkage,
 - capture a start snapshot of tracked/untracked working-tree deltas (hash + path) in the plan when `--plan` is provided.
 
@@ -20,6 +21,10 @@ Dynamic controls:
 - `EXECPLAN_NEW_BRANCH=<type/scope>` when branch switch is required
 - `EXECPLAN_PR_TRACKING_PATH=docs/prs/active/<file>.md`
 - `EXECPLAN_MANUAL_PR_URL=<url>` when `gh` is unavailable and a new branch requires manual draft PR creation
+
+Execution policy:
+
+- This event runs `gh` operations; execute out-of-sandbox according to `.agents/skills/execplan-sandbox-escalation/SKILL.md`.
 
 ## Script
 

@@ -28,7 +28,8 @@ After this change, contributors can run one repository-local skill workflow that
 - [x] (2026-03-03 20:59Z) action_id=a4e; mode=serial; depends_on=a4d; file_locks=PLANS.md,docs/plans/active/plan_builder_reviewer_pr_autoloop_skill.md; verify_events=action.docs_only; worker_type=default; updated `ExecPlan Lifecycle` to require PR-bound reviewer startup, reviewer-gated completion, and automatic return-to-step-3 remediation loop.
 - [x] (2026-03-03 21:08Z) action_id=a4f; mode=serial; depends_on=a4e; file_locks=docs/plans/active/plan_builder_reviewer_pr_autoloop_skill.md; verify_events=action.docs_only; worker_type=default; reviewer remediation loop for stuck CI pending state: pushed a CI-retrigger commit and restarted readiness evaluation.
 - [x] (2026-03-03 21:12Z) action_id=a4g; mode=serial; depends_on=a4f; file_locks=.agents/skills/pr-autoloop/SKILL.md,.agents/skills/pr-autoloop/scripts/run_loop.sh,.agents/skills/pr-autoloop/references/comment_contract.md,.agents/skills/execplan-sandbox-escalation/SKILL.md,.agents/skills/execplan-sandbox-escalation/references/allowed_command_prefixes.md,REVIEW.md,docs/design/pr_autoloop_builder_reviewer_contract.md,docs/architecture/scope/automation_orchestration.md,docs/plans/active/plan_builder_reviewer_pr_autoloop_skill.md; verify_events=action.pr_autoloop,action.tooling; worker_type=default; enforced out-of-sandbox `gh` execution in skills and required reviewer to post loop comments without waiting for running CI.
-- [ ] action_id=a5; mode=serial; depends_on=a4g; file_locks=docs/plans/active/plan_builder_reviewer_pr_autoloop_skill.md,docs/plans/completed/plan_builder_reviewer_pr_autoloop_skill.md,docs/prs/active/pr_feat_pr-autoloop-skill.md,docs/prs/completed/pr_feat_pr-autoloop-skill.md; verify_events=execplan.post_completion; worker_type=default; finalize plan state and run post-completion gate.
+- [x] (2026-03-03 21:42Z) action_id=a4h; mode=serial; depends_on=a4g; file_locks=PLANS.md,.agents/skills/execplan-event-pre-creation/SKILL.md,.agents/skills/execplan-event-pre-creation/scripts/run_event.sh,.agents/skills/execplan-event-post-completion/SKILL.md,.agents/skills/execplan-event-post-completion/scripts/run_event.sh,.agents/skills/pr-autoloop/SKILL.md,.agents/skills/pr-autoloop/scripts/reviewer_daemon.sh,.agents/skills/pr-autoloop/references/comment_contract.md,.agents/skills/pr-autoloop/references/state_schema.md,.agents/skills/execplan-event-action-pr-autoloop/scripts/run_event.sh,REVIEW.md,docs/design/pr_autoloop_builder_reviewer_contract.md,docs/architecture/scope/automation_orchestration.md,docs/plans/active/plan_builder_reviewer_pr_autoloop_skill.md; verify_events=action.pr_autoloop,action.tooling; worker_type=default; removed lifecycle-level reviewer-loop clauses and implemented reviewer-daemon handshake via pre/post lifecycle event scripts with `APPROVE` token gating.
+- [ ] action_id=a5; mode=serial; depends_on=a4h; file_locks=docs/plans/active/plan_builder_reviewer_pr_autoloop_skill.md,docs/plans/completed/plan_builder_reviewer_pr_autoloop_skill.md,docs/prs/active/pr_feat_pr-autoloop-skill.md,docs/prs/completed/pr_feat_pr-autoloop-skill.md; verify_events=execplan.post_completion; worker_type=default; finalize plan state and run post-completion gate.
 
 ## Verification Ledger
 
@@ -54,6 +55,12 @@ After this change, contributors can run one repository-local skill workflow that
 - attempt_record: event_id=action.pr_autoloop; attempt=3; status=pass; started_at=2026-03-03 21:09Z; finished_at=2026-03-03 21:09Z; commands=bash -n .agents/skills/pr-autoloop/scripts/doctor.sh bash -n .agents/skills/pr-autoloop/scripts/run_loop.sh .agents/skills/pr-autoloop/scripts/run_loop.sh --self-test rg -n AUTO_AGENT: BUILDER|AUTO_AGENT: REVIEWER|AUTO_REVIEW_STATUS|AUTO_TARGET_COMMIT .agents/skills/pr-autoloop/references/comment_contract.md rg -n -- --goal-file|--pr-url|--head-branch|--base-branch|--max-builder-failures|--max-iterations .agents/skills/pr-autoloop/scripts/run_loop.sh rg -n run_id|pr_url|base_branch|lock_key|consecutive_builder_failures|last_reviewer_status .agents/skills/pr-autoloop/references/state_schema.md; failure_summary=none; notify_reference=not_requested;
 - attempt_record: event_id=action.tooling; attempt=3; status=pass; started_at=2026-03-03 21:12Z; finished_at=2026-03-03 21:12Z; commands=bash -n scripts/*.sh .agents/skills/execplan-event-*/scripts/*.sh; failure_summary=none; notify_reference=not_requested;
 - attempt_record: event_id=action.pr_autoloop; attempt=3; status=pass; started_at=2026-03-03 21:12Z; finished_at=2026-03-03 21:12Z; commands=bash -n .agents/skills/pr-autoloop/scripts/doctor.sh bash -n .agents/skills/pr-autoloop/scripts/run_loop.sh .agents/skills/pr-autoloop/scripts/run_loop.sh --self-test rg -n AUTO_AGENT: BUILDER|AUTO_AGENT: REVIEWER|AUTO_REVIEW_STATUS|AUTO_TARGET_COMMIT .agents/skills/pr-autoloop/references/comment_contract.md rg -n -- --goal-file|--pr-url|--head-branch|--base-branch|--max-builder-failures|--max-iterations .agents/skills/pr-autoloop/scripts/run_loop.sh rg -n run_id|pr_url|base_branch|lock_key|consecutive_builder_failures|last_reviewer_status .agents/skills/pr-autoloop/references/state_schema.md; failure_summary=none; notify_reference=not_requested;
+- attempt_record: event_id=action.tooling; attempt=3; status=pass; started_at=2026-03-03 21:42Z; finished_at=2026-03-03 21:42Z; commands=bash -n scripts/*.sh .agents/skills/execplan-event-*/scripts/*.sh; failure_summary=none; notify_reference=not_requested;
+- attempt_record: event_id=action.pr_autoloop; attempt=3; status=pass; started_at=2026-03-03 21:42Z; finished_at=2026-03-03 21:42Z; commands=bash -n .agents/skills/pr-autoloop/scripts/doctor.sh bash -n .agents/skills/pr-autoloop/scripts/reviewer_daemon.sh bash -n .agents/skills/pr-autoloop/scripts/run_loop.sh .agents/skills/pr-autoloop/scripts/run_loop.sh --self-test rg -n AUTO_AGENT: BUILDER|AUTO_AGENT: REVIEWER|AUTO_REQUEST_ID|AUTO_REVIEW_STATUS|AUTO_TARGET_COMMIT|APPROVE .agents/skills/pr-autoloop/references/comment_contract.md rg -n -- --goal-file|--pr-url|--head-branch|--base-branch|--max-builder-failures|--max-iterations .agents/skills/pr-autoloop/scripts/run_loop.sh rg -n run_id|pr_url|base_branch|lock_key|consecutive_builder_failures|last_reviewer_status|reviewer-daemon|responses .agents/skills/pr-autoloop/references/state_schema.md; failure_summary=none; notify_reference=not_requested;
+- attempt_record: event_id=action.tooling; attempt=3; status=pass; started_at=2026-03-03 21:43Z; finished_at=2026-03-03 21:43Z; commands=bash -n scripts/*.sh .agents/skills/execplan-event-*/scripts/*.sh; failure_summary=none; notify_reference=not_requested;
+- attempt_record: event_id=action.pr_autoloop; attempt=3; status=pass; started_at=2026-03-03 21:43Z; finished_at=2026-03-03 21:43Z; commands=bash -n .agents/skills/pr-autoloop/scripts/doctor.sh bash -n .agents/skills/pr-autoloop/scripts/reviewer_daemon.sh bash -n .agents/skills/pr-autoloop/scripts/run_loop.sh .agents/skills/pr-autoloop/scripts/run_loop.sh --self-test rg -n AUTO_AGENT: BUILDER|AUTO_AGENT: REVIEWER|AUTO_REQUEST_ID|AUTO_REVIEW_STATUS|AUTO_TARGET_COMMIT|APPROVE .agents/skills/pr-autoloop/references/comment_contract.md rg -n -- --goal-file|--pr-url|--head-branch|--base-branch|--max-builder-failures|--max-iterations .agents/skills/pr-autoloop/scripts/run_loop.sh rg -n run_id|pr_url|base_branch|lock_key|consecutive_builder_failures|last_reviewer_status|reviewer-daemon|responses .agents/skills/pr-autoloop/references/state_schema.md; failure_summary=none; notify_reference=not_requested;
+- attempt_record: event_id=action.tooling; attempt=3; status=pass; started_at=2026-03-03 21:45Z; finished_at=2026-03-03 21:45Z; commands=bash -n scripts/*.sh .agents/skills/execplan-event-*/scripts/*.sh; failure_summary=none; notify_reference=not_requested;
+- attempt_record: event_id=action.pr_autoloop; attempt=3; status=pass; started_at=2026-03-03 21:45Z; finished_at=2026-03-03 21:45Z; commands=bash -n .agents/skills/pr-autoloop/scripts/doctor.sh bash -n .agents/skills/pr-autoloop/scripts/reviewer_daemon.sh bash -n .agents/skills/pr-autoloop/scripts/run_loop.sh .agents/skills/pr-autoloop/scripts/run_loop.sh --self-test rg -n AUTO_AGENT: BUILDER|AUTO_AGENT: REVIEWER|AUTO_REQUEST_ID|AUTO_REVIEW_STATUS|AUTO_TARGET_COMMIT|APPROVE .agents/skills/pr-autoloop/references/comment_contract.md rg -n -- --goal-file|--pr-url|--head-branch|--base-branch|--max-builder-failures|--max-iterations .agents/skills/pr-autoloop/scripts/run_loop.sh rg -n run_id|pr_url|base_branch|lock_key|consecutive_builder_failures|last_reviewer_status|reviewer-daemon|responses .agents/skills/pr-autoloop/references/state_schema.md; failure_summary=none; notify_reference=not_requested;
 <!-- verification-ledger:end -->
 
 ## Surprises & Discoveries
@@ -110,6 +117,10 @@ After this change, contributors can run one repository-local skill workflow that
   Rationale: Network/API stability under sandbox was intermittent, and reviewer iteration contracts must progress even when CI is still running.
   Date/Author: 2026-03-03 / Codex
 
+- Decision: Revert reviewer-loop control out of `PLANS.md` lifecycle and enforce reviewer synchronization inside lifecycle event scripts using a reviewer daemon request/response contract.
+  Rationale: Direct builder/reviewer synchronization in lifecycle text was not robust; event-script automation provides deterministic startup, waiting, and approval-token checks without requiring concurrent in-process loops.
+  Date/Author: 2026-03-03 / Codex
+
 ## Outcomes & Retrospective
 
 Completed so far:
@@ -123,6 +134,7 @@ Completed so far:
 - Updated skill instructions so loop start requests execute `doctor.sh` then `run_loop.sh` directly.
 - Updated `PLANS.md` lifecycle steps so PR-scoped reviewer startup is explicit and reviewer status now controls completion vs. remediation-loop restart.
 - Updated skill/policy contracts so `gh` operations are explicitly out-of-sandbox and reviewer comments are posted without waiting for CI completion in autonomous-loop mode.
+- Added reviewer daemon process control and IPC: pre-creation now ensures daemon startup, post-completion sends commit metadata and blocks until reviewer response/comment URL is returned, and gate pass now requires `APPROVE` token in fetched comment body.
 
 Remaining:
 
@@ -150,6 +162,7 @@ Run from repository root (`.`):
 
     # Local checks
     bash -n .agents/skills/pr-autoloop/scripts/doctor.sh
+    bash -n .agents/skills/pr-autoloop/scripts/reviewer_daemon.sh
     bash -n .agents/skills/pr-autoloop/scripts/run_loop.sh
     .agents/skills/pr-autoloop/scripts/run_loop.sh --self-test
 
@@ -162,12 +175,14 @@ Run from repository root (`.`):
 
 Acceptance requires all of the following:
 
-1. `.agents/skills/pr-autoloop/` contains the requested files (`SKILL.md`, `agents/openai.yaml`, `scripts/run_loop.sh`, `scripts/doctor.sh`, `references/comment_contract.md`, `references/state_schema.md`).
+1. `.agents/skills/pr-autoloop/` contains the requested files (`SKILL.md`, `agents/openai.yaml`, `scripts/run_loop.sh`, `scripts/doctor.sh`, `scripts/reviewer_daemon.sh`, `references/comment_contract.md`, `references/state_schema.md`).
 2. Role tags are standardized: `AUTO_AGENT: BUILDER` and `AUTO_AGENT: REVIEWER`.
 3. Reviewer contract enforces:
    - `AUTO_REVIEW_STATUS: APPROVED|CHANGES_REQUIRED`
    - `AUTO_TARGET_COMMIT: <sha>`
    - `AUTO_AGENT: REVIEWER`
+   - `AUTO_REQUEST_ID: <request_id>` (daemon mode)
+   - `APPROVE` token when approved
 4. `run_loop.sh` supports `--goal-file`, dual startup mode (`--pr-url` or `--head-branch` with optional `--base-branch`), `--max-builder-failures`, and `--max-iterations`.
 5. Loop logic explicitly handles approval stop, changes-required repeat, malformed reviewer comment fail-stop, builder failure threshold stop, and lock conflict stop.
 6. Design and architecture docs include this long-lived orchestration model and are indexed.
@@ -184,6 +199,7 @@ Primary artifacts expected from this plan:
 - `.agents/skills/pr-autoloop/SKILL.md`
 - `.agents/skills/pr-autoloop/agents/openai.yaml`
 - `.agents/skills/pr-autoloop/scripts/doctor.sh`
+- `.agents/skills/pr-autoloop/scripts/reviewer_daemon.sh`
 - `.agents/skills/pr-autoloop/scripts/run_loop.sh`
 - `.agents/skills/pr-autoloop/references/comment_contract.md`
 - `.agents/skills/pr-autoloop/references/state_schema.md`
@@ -232,3 +248,4 @@ Revision note (2026-03-03, Codex): Added PR #63 metadata sync and lifecycle poli
 Revision note (2026-03-03, Codex): Added bootstrap startup mode (`--head-branch`) and automated PR URL hand-off to reviewer, then re-ran `action.pr_autoloop` and `action.tooling` gates.
 Revision note (2026-03-03, Codex): Updated `PLANS.md` lifecycle to enforce PR-scoped reviewer gating and restart-from-step-3 remediation; recorded docs-only gate rerun with explicit attempt override.
 Revision note (2026-03-03, Codex): Added out-of-sandbox `gh` execution guidance and non-blocking reviewer-comment timing for running CI in autonomous-loop mode.
+Revision note (2026-03-03, Codex): Reworked reviewer synchronization to daemon IPC in pre/post lifecycle event scripts and restored `PLANS.md` lifecycle to event-script-owned reviewer behavior.

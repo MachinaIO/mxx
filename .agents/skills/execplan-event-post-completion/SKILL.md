@@ -9,6 +9,8 @@ Executes the "after main ExecPlan completion" workflow:
 
 - validate ledger completion prerequisites,
 - resolve linked PR tracking document from the plan and verify metadata,
+- send latest commit metadata to reviewer daemon and wait for reviewer response,
+- fetch reviewer comment by returned URL and require `APPROVE` token,
 - determine ready/not-ready state,
 - if ready, move tracking doc to `docs/prs/completed/`,
 - if not ready, keep active state and record blockers,
@@ -23,6 +25,10 @@ Dynamic controls:
 - `EXECPLAN_BLOCKERS="<text>"` when not ready
 - `EXECPLAN_PR_READY_CONFIRMED=1` after manual web-UI readiness fallback when automation is unavailable
 - `EXECPLAN_FINAL_COMMIT_MESSAGE="<message>"`
+
+Execution policy:
+
+- This event runs `gh` operations (including reviewer-comment fetch by URL); execute out-of-sandbox according to `.agents/skills/execplan-sandbox-escalation/SKILL.md`.
 
 ## Script
 

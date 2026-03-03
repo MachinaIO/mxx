@@ -27,3 +27,7 @@ Runtime state is persisted at:
 - `runtime/locks/branch-<sanitized_branch>.lock`: bootstrap lock before PR is known.
 - `runtime/runs/<run_id>/logs/`: builder/reviewer command logs.
 - `runtime/runs/<run_id>/feedback/`: reviewer feedback snapshots for subsequent builder iterations.
+- `runtime/reviewer-daemon/reviewer.pid`: reviewer daemon pid file.
+- `runtime/reviewer-daemon/state.json`: reviewer daemon runtime state (target PR/branch, status).
+- `runtime/reviewer-daemon/inbox/<request_id>.json`: builder-to-reviewer request envelopes.
+- `runtime/reviewer-daemon/responses/<request_id>.json`: reviewer response envelopes (comment URL/status/token).

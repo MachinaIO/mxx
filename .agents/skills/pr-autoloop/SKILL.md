@@ -23,6 +23,7 @@ Provide:
 4. Run `scripts/run_loop.sh` to execute the builder/reviewer cycle.
 5. In autonomous-loop reviewer mode, if CI checks are still running, reviewer must post a contract-compliant comment immediately without waiting for CI completion.
 6. Review runtime artifacts under `runtime/runs/<run_id>/` for logs and state transitions.
+7. For lifecycle-driven reviews, use `scripts/reviewer_daemon.sh` request/response flow; reviewer daemon must remain running until it emits an `APPROVE` token comment.
 
 ### Start command patterns
 
@@ -50,3 +51,4 @@ Read these files before changing contracts or parser logic:
 - Keep role tags explicit (`AUTO_AGENT: BUILDER` and `AUTO_AGENT: REVIEWER`).
 - Treat missing reviewer contract tags as hard failures; do not infer status from prose.
 - Enforce lock ownership per PR to prevent concurrent autonomous loops.
+- When reviewer approval is reached, include `APPROVE` in the reviewer comment so lifecycle gate logic can terminate deterministically.

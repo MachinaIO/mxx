@@ -185,6 +185,7 @@ Agents must strictly follow this lifecycle to create, execute, and complete an E
    * `scripts/execplan_gate.sh --event execplan.pre_creation`
    * If you are reusing an existing plan document, run with `--plan <plan_md>` so the attempt is recorded directly in that plan ledger.
 2. Create or select one target ExecPlan document under `docs/plans/active/`.
+   * For a newly created plan document, run `scripts/execplan_gate.sh --plan <plan_md> --event execplan.pre_creation` immediately so the plan ledger contains explicit pre-creation pass evidence required by later gate checks.
 3. Before action execution, map each `Progress` action to metadata and verification events from the event-index map:
    * required metadata: `action_id`, `mode`, `depends_on`, `file_locks`, `verify_events`, `worker_type`,
    * `verify_events` values must be event IDs registered in `.agents/skills/execplan-event-index/references/event_skill_map.tsv`.

@@ -69,13 +69,6 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EVENT_MAP="$REPO_ROOT/.agents/skills/execplan-event-index/references/event_skill_map.tsv"
-GIT_DIR="$(git rev-parse --git-dir 2>/dev/null || true)"
-STATE_DIR=""
-PRE_CREATION_MARKER=""
-if [[ -n "$GIT_DIR" ]]; then
-  STATE_DIR="$GIT_DIR/execplan_gate_state"
-  PRE_CREATION_MARKER="$STATE_DIR/pre_creation_pass.marker"
-fi
 
 if [[ ! -f "$EVENT_MAP" ]]; then
   echo "Event map not found: $EVENT_MAP" >&2
@@ -175,38 +168,6 @@ has_non_lifecycle_pass() {
   '
 }
 
-has_pre_creation_pass_anywhere() {
-  if has_pass "$PRE_EVENT_ID"; then
-    return 0
-  fi
-  if [[ -n "$PRE_CREATION_MARKER" && -f "$PRE_CREATION_MARKER" ]]; then
-    return 0
-  fi
-  return 1
-}
-
-import_pre_creation_marker_to_ledger() {
-  if [[ "$HAS_PLAN_FILE" -ne 1 ]]; then
-    return 0
-  fi
-  if has_pass "$PRE_EVENT_ID"; then
-    return 0
-  fi
-  if [[ -z "$PRE_CREATION_MARKER" || ! -f "$PRE_CREATION_MARKER" ]]; then
-    return 0
-  fi
-
-  local marker_time started finished entry
-  marker_time="$(cat "$PRE_CREATION_MARKER" 2>/dev/null || true)"
-  if [[ -z "$marker_time" ]]; then
-    marker_time="$(date -u +"%Y-%m-%d %H:%MZ")"
-  fi
-  started="$marker_time"
-  finished="$marker_time"
-  entry="- attempt_record: event_id=${PRE_EVENT_ID}; attempt=1; status=pass; started_at=${started}; finished_at=${finished}; commands=imported pre-creation marker; failure_summary=none; notify_reference=not_requested;"
-  append_ledger_entry "$entry"
-}
-
 find_unresolved_nonpass_event() {
   local current_event="$1"
   ledger_lines | awk -v current="$current_event" '
@@ -304,32 +265,110 @@ find_parallel_file_lock_conflict() {
   if [[ "$HAS_PLAN_FILE" -ne 1 ]]; then
     return 1
   fi
-  local line action_id locks lock
-  declare -A owner_by_lock=()
-
-  while IFS= read -r line; do
-    action_id="$(echo "$line" | sed -nE 's/.*action_id=([^;]+);.*/\1/p')"
-    locks="$(echo "$line" | sed -nE 's/.*file_locks=([^;]+);.*/\1/p')"
-
-    if [[ -z "$action_id" || -z "$locks" ]]; then
-      continue
-    fi
-
-    IFS=',' read -r -a lock_items <<<"$locks"
-    for lock in "${lock_items[@]}"; do
-      lock="$(echo "$lock" | xargs)"
-      if [[ -z "$lock" || "$lock" == "none" || "$lock" == "-" ]]; then
-        continue
-      fi
-
-      if [[ -n "${owner_by_lock[$lock]:-}" && "${owner_by_lock[$lock]}" != "$action_id" ]]; then
-        echo "file_locks conflict: '$lock' shared by parallel actions '${owner_by_lock[$lock]}' and '$action_id'"
+  local conflict
+  conflict="$(
+    awk '
+      function trim(s) {
+        gsub(/^[[:space:]]+/, "", s)
+        gsub(/[[:space:]]+$/, "", s)
+        return s
+      }
+      function extract_field(line, key,    n, parts, i, value) {
+        n=split(line, parts, ";")
+        for (i=1; i<=n; i++) {
+          if (parts[i] ~ (key "=")) {
+            sub("^.*" key "=", "", parts[i])
+            value=trim(parts[i])
+            return value
+          }
+        }
+        return ""
+      }
+      function has_shared_lock(a, b,    n1, n2, i, j, lock1, lock2) {
+        n1=split(locks[a], arr1, ",")
+        n2=split(locks[b], arr2, ",")
+        for (i=1; i<=n1; i++) {
+          lock1=trim(arr1[i])
+          if (lock1 == "" || lock1 == "none" || lock1 == "-") {
+            continue
+          }
+          for (j=1; j<=n2; j++) {
+            lock2=trim(arr2[j])
+            if (lock2 == "" || lock2 == "none" || lock2 == "-") {
+              continue
+            }
+            if (lock1 == lock2) {
+              conflict_lock=lock1
+              return 1
+            }
+          }
+        }
         return 0
-      fi
-      owner_by_lock["$lock"]="$action_id"
-    done
-  done < <(rg "action_id=.*;.*mode=parallel;.*file_locks=.*;" "$PLAN" || true)
+      }
+      function depends_rec(start, target,    n, dep_list, i, dep) {
+        if (start == "" || seen[start]) {
+          return 0
+        }
+        seen[start]=1
+        n=split(depends[start], dep_list, ",")
+        for (i=1; i<=n; i++) {
+          dep=trim(dep_list[i])
+          if (dep == "" || dep == "none" || dep == "-") {
+            continue
+          }
+          if (dep == target) {
+            return 1
+          }
+          if (depends_rec(dep, target)) {
+            return 1
+          }
+        }
+        return 0
+      }
+      function depends_on(start, target) {
+        delete seen
+        return depends_rec(start, target)
+      }
+      /action_id=/ {
+        action_id=extract_field($0, "action_id")
+        mode[action_id]=extract_field($0, "mode")
+        depends[action_id]=extract_field($0, "depends_on")
+        locks[action_id]=extract_field($0, "file_locks")
+        if (!(action_id in action_seen)) {
+          action_seen[action_id]=1
+          action_order[++action_count]=action_id
+        }
+      }
+      END {
+        for (i=1; i<=action_count; i++) {
+          a=action_order[i]
+          if (mode[a] != "parallel") {
+            continue
+          }
+          for (j=i+1; j<=action_count; j++) {
+            b=action_order[j]
+            if (mode[b] != "parallel") {
+              continue
+            }
+            if (!has_shared_lock(a, b)) {
+              continue
+            }
+            if (depends_on(a, b) || depends_on(b, a)) {
+              continue
+            }
+            printf "file_locks conflict: '\''%s'\'' shared by unordered parallel actions '\''%s'\'' and '\''%s'\''", conflict_lock, a, b
+            exit 0
+          }
+        }
+        exit 1
+      }
+    ' "$PLAN"
+  )" || true
 
+  if [[ -n "$conflict" ]]; then
+    echo "$conflict"
+    return 0
+  fi
   return 1
 }
 
@@ -370,7 +409,6 @@ fi
 EVENT_SCRIPT="$(resolve_event_script "$EVENT")"
 
 ensure_ledger_block
-import_pre_creation_marker_to_ledger
 
 existing_attempts="$(count_attempts "$EVENT")"
 if [[ -n "$ATTEMPT_OVERRIDE" ]]; then
@@ -399,7 +437,7 @@ if [[ -z "$FINAL_STATUS" && "$EVENT" != "$PRE_EVENT_ID" ]]; then
 fi
 
 if [[ -z "$FINAL_STATUS" && "$EVENT" != "$PRE_EVENT_ID" ]]; then
-  if ! has_pre_creation_pass_anywhere; then
+  if ! has_pass "$PRE_EVENT_ID"; then
     FINAL_STATUS="fail"
     COMMANDS="gate prerequisite: require ${PRE_EVENT_ID} pass"
     FAILURE_SUMMARY="missing pass evidence for ${PRE_EVENT_ID}"
@@ -477,11 +515,6 @@ fi
 
 if [[ -z "$FAILURE_SUMMARY" ]]; then
   FAILURE_SUMMARY="none"
-fi
-
-if [[ "$FINAL_STATUS" == "pass" && "$EVENT" == "$PRE_EVENT_ID" && -n "$STATE_DIR" ]]; then
-  mkdir -p "$STATE_DIR"
-  date -u +"%Y-%m-%d %H:%MZ" > "$PRE_CREATION_MARKER"
 fi
 
 FINISHED_AT="$(date -u +"%Y-%m-%d %H:%MZ")"

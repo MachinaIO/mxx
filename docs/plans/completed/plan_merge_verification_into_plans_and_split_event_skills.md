@@ -34,7 +34,7 @@ After this change, verification policy is integrated in `PLANS.md` (no separate 
 - Decision: Remove fixed event dispatch from gate and move dispatch to event-index mapping (`event_skill_map.tsv`).
   Rationale: user requested future event add/remove flexibility.
   Date/Author: 2026-03-03 / Codex
-- Decision: Keep lifecycle edges (`execplan.pre_execution`, `execplan.post_completion`) mandatory in index map.
+- Decision: Keep lifecycle edges (`execplan.pre_creation`, `execplan.post_completion`) mandatory in index map.
   Rationale: user explicitly allowed assuming those two are mandatory.
   Date/Author: 2026-03-03 / Codex
 - Decision: Integrate verification policy into `PLANS.md` and remove standalone policy authority in `VERIFICATION.md`.
@@ -98,7 +98,7 @@ Run from repository root (`.`):
     bash -n scripts/execplan_notify.sh scripts/execplan_gate.sh .agents/skills/execplan-event-*/scripts/run_event.sh
 
     # gate functional checks with fake gh
-    PATH="<tmp_dir>/mxx_fakebin:$PATH" scripts/execplan_gate.sh --plan <tmp_dir>/mxx_modular_gate_tooling.md --event execplan.pre_execution
+    PATH="<tmp_dir>/mxx_fakebin:$PATH" scripts/execplan_gate.sh --plan <tmp_dir>/mxx_modular_gate_tooling.md --event execplan.pre_creation
     PATH="<tmp_dir>/mxx_fakebin:$PATH" scripts/execplan_gate.sh --plan <tmp_dir>/mxx_modular_gate_tooling.md --event action.tooling
     PATH="<tmp_dir>/mxx_fakebin:$PATH" scripts/execplan_gate.sh --plan <tmp_dir>/mxx_modular_gate_tooling.md --event execplan.post_completion
 
@@ -118,7 +118,7 @@ Acceptance criteria and outcomes:
 ## Verification Ledger
 
 <!-- verification-ledger:start -->
-- attempt_record: event_id=execplan.pre_execution; attempt=1; status=pass; started_at=2026-03-03 16:19Z; finished_at=2026-03-03 16:19Z; commands=policy and modular skill split implementation prechecks; failure_summary=none; notify_reference=not_run;
+- attempt_record: event_id=execplan.pre_creation; attempt=1; status=pass; started_at=2026-03-03 16:19Z; finished_at=2026-03-03 16:19Z; commands=policy and modular skill split implementation prechecks; failure_summary=none; notify_reference=not_run;
 - attempt_record: event_id=action.tooling; attempt=1; status=pass; started_at=2026-03-03 16:19Z; finished_at=2026-03-03 16:19Z; commands=bash -n scripts/execplan_notify.sh scripts/execplan_gate.sh .agents/skills/execplan-event-*/scripts/run_event.sh; failure_summary=none; notify_reference=not_run;
 - attempt_record: event_id=execplan.post_completion; attempt=1; status=pass; started_at=2026-03-03 16:19Z; finished_at=2026-03-03 16:19Z; commands=gate functional scenarios with fake gh harness for pre/tooling/post and conflict/escalation paths; failure_summary=none; notify_reference=not_run;
 <!-- verification-ledger:end -->

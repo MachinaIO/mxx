@@ -4,13 +4,14 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  execplan_notify.sh --plan <plan_md> --event <event_id> --status <pass|fail|escalated>
+  execplan_notify.sh --plan <plan_md> --event execplan.post_completion --status pass
 USAGE
 }
 
 PLAN=""
 EVENT=""
 STATUS=""
+POST_EVENT_ID="execplan.post_completion"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -53,8 +54,13 @@ if ! command -v gh >/dev/null 2>&1; then
   exit 1
 fi
 
-if [[ "$STATUS" != "pass" && "$STATUS" != "fail" && "$STATUS" != "escalated" ]]; then
-  echo "Unsupported status: $STATUS" >&2
+if [[ "$EVENT" != "$POST_EVENT_ID" ]]; then
+  echo "Unsupported event for notify: $EVENT (only $POST_EVENT_ID is allowed)" >&2
+  exit 2
+fi
+
+if [[ "$STATUS" != "pass" ]]; then
+  echo "Unsupported status for notify: $STATUS (only pass is allowed)" >&2
   exit 2
 fi
 
@@ -80,6 +86,10 @@ fi
 LEDGER_LINE="$(rg "event_id=${EVENT};" "$PLAN" | tail -n1 || true)"
 if [[ -z "$LEDGER_LINE" ]]; then
   LEDGER_LINE="(no ledger entry yet for this event)"
+fi
+if [[ "$LEDGER_LINE" != *"status=pass"* ]]; then
+  echo "Latest ledger entry for $EVENT is not pass; refusing to notify" >&2
+  exit 1
 fi
 
 TIMESTAMP="$(date -u +"%Y-%m-%d %H:%MZ")"

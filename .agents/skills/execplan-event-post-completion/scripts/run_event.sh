@@ -153,29 +153,8 @@ else
 fi
 
 commands+=("git status --short")
-commands+=("git add -A")
-commands+=("git commit -m <finalize-message> [if there are staged changes]")
-commands+=("git push origin <current-branch>")
-
+commands+=("no auto-commit/no auto-push in post-completion verification")
 git status --short >/dev/null
-git add -A
-if ! git diff --cached --quiet; then
-  final_message="${EXECPLAN_FINAL_COMMIT_MESSAGE:-docs: finalize execplan completion and post-validation results}"
-  if ! git commit -m "$final_message" >/dev/null 2>&1; then
-    echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-    echo "FAILURE_SUMMARY=failed to create final post-completion commit"
-    echo "STATUS=fail"
-    exit 1
-  fi
-fi
-
-branch="$(git branch --show-current)"
-if ! git push origin "$branch" >/dev/null 2>&1; then
-  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=failed to push final post-completion state to origin/$branch"
-  echo "STATUS=fail"
-  exit 1
-fi
 
 echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
 echo "FAILURE_SUMMARY=none"

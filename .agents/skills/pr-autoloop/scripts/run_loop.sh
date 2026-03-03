@@ -630,6 +630,7 @@ for ((ITER=1; ITER<=MAX_ITERATIONS; ITER++)); do
     echo "Review requirements:"
     echo "- Follow REVIEW.md strictly for reviewer checks."
     echo "- Review the current PR head commit and post one PR comment in English."
+    echo "- If CI checks are still running, do not wait; post the review comment for this iteration immediately."
     echo "- Include mandatory machine tags exactly once:"
     echo "  AUTO_AGENT: REVIEWER"
     echo "  AUTO_RUN_ID: $RUN_ID"

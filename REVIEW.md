@@ -18,6 +18,7 @@ At the start of PR review work, reset reviewer posture:
 For the target PR, verify all of the following:
 
 1. GitHub CI status is passing.
+   - Exception for autonomous-loop mode: if CI checks are still `pending`/`in_progress`, do not wait; post the reviewer comment immediately using the current evidence.
 2. If tests were added or changed, confirm the test changes are aligned with the PR scope and are not superficial pass-only tests; perform static code analysis of test logic to verify substantive validation behavior.
 3. Run impacted unit tests that may be affected by the PR but are not covered by CI for this change. Select and execute tests yourself. Do not run integration tests unless explicitly instructed/approved by the user.
 4. Check for duplicated logic, unnecessary processing, dead private code paths, and obsolete fallback logic that was retained only for backward compatibility with old code/data without current necessity.
@@ -54,6 +55,7 @@ When review work is executed as part of the repository autonomous loop (builder/
 - `AUTO_TARGET_COMMIT: <sha>`
 
 In autonomous-loop mode, `AUTO_REVIEW_STATUS: APPROVED` is the loop success stop condition. `CHANGES_REQUIRED` means the next builder iteration must run. Missing required tags is a contract violation and must be treated as a failed review-cycle output.
+In autonomous-loop mode, reviewer must not block comment posting on CI completion; if CI is still running, reviewer still posts a contract-compliant comment for the current iteration.
 
 ## Reviewer-mode restrictions
 

@@ -18,9 +18,11 @@ Provide:
 ## Workflow
 
 1. When the user asks to start the loop, execute commands directly (do not only print instructions).
-2. Run `scripts/doctor.sh` to validate local prerequisites and auth state.
-3. Run `scripts/run_loop.sh` to execute the builder/reviewer cycle.
-4. Review runtime artifacts under `runtime/runs/<run_id>/` for logs and state transitions.
+2. Because this workflow relies on `gh` commands, run start commands outside sandbox, following `.agents/skills/execplan-sandbox-escalation/SKILL.md`.
+3. Run `scripts/doctor.sh` to validate local prerequisites and auth state.
+4. Run `scripts/run_loop.sh` to execute the builder/reviewer cycle.
+5. In autonomous-loop reviewer mode, if CI checks are still running, reviewer must post a contract-compliant comment immediately without waiting for CI completion.
+6. Review runtime artifacts under `runtime/runs/<run_id>/` for logs and state transitions.
 
 ### Start command patterns
 

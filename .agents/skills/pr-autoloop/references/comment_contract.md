@@ -34,6 +34,10 @@ Reviewer comments are mandatory and must include all fields below:
 - `AUTO_REVIEW_STATUS: APPROVED|CHANGES_REQUIRED`
 - `AUTO_TARGET_COMMIT: <sha>`
 
+Reviewer timing:
+
+- In autonomous-loop mode, reviewer posts this contract comment even when CI checks are still running.
+
 `AUTO_REVIEW_STATUS` values are strict:
 
 - `APPROVED`: loop exits successfully.

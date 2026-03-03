@@ -42,6 +42,11 @@ Reviewer comments additionally require:
 - `AUTO_REVIEW_STATUS: APPROVED|CHANGES_REQUIRED`
 - `AUTO_TARGET_COMMIT: <sha>`
 
+Reviewer timing rule in autonomous-loop mode:
+
+- Reviewer posts a contract-compliant comment for each iteration without waiting for CI completion.
+- If CI is still running, reviewer still emits `APPROVED` or `CHANGES_REQUIRED` based on current evidence.
+
 ### Startup modes
 
 - Existing PR mode: operator provides `--pr-url`; loop binds to that PR immediately.

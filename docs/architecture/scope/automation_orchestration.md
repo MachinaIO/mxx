@@ -37,6 +37,8 @@ Implementation details:
 - Lock and state files under `.agents/skills/pr-autoloop/runtime/` (PR lock when known, branch lock during bootstrap).
 - Builder/reviewer isolated git worktrees for branch-safe iteration.
 - Automatic PR URL discovery after builder execution in bootstrap mode; discovered URL is passed to reviewer context.
+- `gh` API operations are executed via out-of-sandbox command paths following `.agents/skills/execplan-sandbox-escalation/`.
+- Reviewer iteration comments are non-blocking with respect to CI runtime; reviewer does not wait for CI completion to post contract output.
 - Event-level validation via `action.pr_autoloop` skill script.
 
 ## Depends on scopes

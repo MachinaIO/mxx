@@ -344,7 +344,7 @@ mod test {
     use keccak_asm::Keccak256;
     use std::{fs, path::Path};
 
-    fn setup_lsb_constant_binary_plt(t_n: usize, params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {
+    fn setup_lsb_bit_lut(t_n: usize, params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {
         PublicLut::<DCRTPoly>::new(
             params,
             t_n as u64,
@@ -352,13 +352,10 @@ mod test {
                 if k >= t_n as u64 {
                     return None;
                 }
-                let k_usize = usize::try_from(k).expect("LUT index must fit in usize");
-                let y_lsb = DCRTPoly::from_usize_to_lsb(params, k_usize);
-                let y_elem = y_lsb
-                    .coeffs()
-                    .into_iter()
-                    .next()
-                    .expect("constant-term coefficient must exist");
+                let y_elem = <<DCRTPoly as Poly>::Elem as crate::element::PolyElem>::constant(
+                    &params.modulus(),
+                    k % 2,
+                );
                 Some((k, y_elem))
             },
             None,
@@ -373,7 +370,7 @@ mod test {
         let _storage_lock = storage_test_lock().await;
         let _ = tracing_subscriber::fmt::try_init();
         let params = DCRTPolyParams::default();
-        let plt = setup_lsb_constant_binary_plt(16, &params);
+        let plt = setup_lsb_bit_lut(16, &params);
         // Create a simple circuit with the lookup table
         let mut circuit = PolyCircuit::new();
         let inputs = circuit.input(1);

@@ -24,6 +24,7 @@ After this change, all lookup evaluators consistently consume `PublicLut` entrie
 - [x] (2026-03-03 10:50Z) Ran CPU behavior verification commands from `docs/verification/cpu_behavior_changes.md`: formatting and lookup-focused unit tests passed (sequential, after code edits).
 - [x] (2026-03-03 11:08Z) Completed final validation depth by running full library tests (`cargo test -r --lib`) after scoped lookup tests (sequential, completion-level verification).
 - [x] (2026-03-03 10:53Z) Updated this ExecPlan with final outcomes, command results, and retrospective (sequential, after verification).
+- [x] (2026-03-03 15:16Z) Updated unit-test helper LUT constructors to emit `k % 2` directly (without building `y_lsb`) and renamed helper function names to match behavior; reran formatting and lookup-scoped unit tests.
 
 ## Surprises & Discoveries
 
@@ -45,6 +46,10 @@ After this change, all lookup evaluators consistently consume `PublicLut` entrie
 
 - Decision: Do not restore `new_from_usize_range`; update all call sites to `PublicLut::new` directly.
   Rationale: User explicitly requested no compatibility layer and a minimal code path.
+  Date/Author: 2026-03-03 / Codex
+
+- Decision: Rename unit-test LUT helper names from `setup_lsb_constant_binary_plt` to `setup_lsb_bit_lut` (and GPU variant) and make LUT output explicitly `k % 2`.
+  Rationale: This matches the implemented behavior directly and removes unnecessary construction of intermediate LSB polynomials in test setup paths.
   Date/Author: 2026-03-03 / Codex
 
 ## Outcomes & Retrospective
@@ -102,6 +107,8 @@ Commands run during implementation/verification:
     cargo +nightly fmt --all
     cargo test -r --lib -- lookup
     cargo test -r --lib
+    cargo +nightly fmt --all
+    cargo test -r --lib -- lookup
 
 ## Validation and Acceptance
 
@@ -144,3 +151,5 @@ Files that must match this contract after implementation:
 Revision note (2026-03-03): Initial plan creation with pre-creation verification evidence and implementation scope mapping for `PublicLut` u64-input migration.
 
 Revision note (2026-03-03): Updated implementation status to complete, recorded the user-directed no-compatibility decision (`new_from_usize_range` not restored), and added final verification command outcomes.
+
+Revision note (2026-03-03): Updated lookup unit-test helper LUT constructors to direct `k % 2` output and renamed helper functions accordingly; added rerun validation commands.

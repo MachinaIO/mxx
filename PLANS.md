@@ -158,7 +158,7 @@ Do not notify on every event.
 
 If notification is needed, post only once after all actions are complete, `execplan.post_completion` is `pass`, and commits are pushed:
 
-* `scripts/execplan_notify.sh --plan <plan_md> --event <event_id> --status <pass|fail|escalated>`
+* `scripts/execplan_notify.sh --plan <completed_plan_md> --event execplan.post_completion --status pass`
 
 Notification target is GitHub PR comment.
 

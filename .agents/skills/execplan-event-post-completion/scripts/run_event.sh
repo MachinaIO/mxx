@@ -102,6 +102,45 @@ fail_after_git_add() {
   emit_fail "$summary"
 }
 
+has_unresolved_latest_nonpass_event() {
+  sed -n '/<!-- verification-ledger:start -->/,/<!-- verification-ledger:end -->/p' "$PLAN" | awk '
+    /event_id=/ && /status=/ {
+      event=""
+      status=""
+      n=split($0, parts, ";")
+      for (i=1; i<=n; i++) {
+        if (parts[i] ~ /event_id=/) {
+          tmp=parts[i]
+          gsub(/^.*event_id=/, "", tmp)
+          gsub(/^ +| +$/, "", tmp)
+          event=tmp
+        }
+        if (parts[i] ~ /status=/) {
+          tmp=parts[i]
+          gsub(/^.*status=/, "", tmp)
+          gsub(/^ +| +$/, "", tmp)
+          status=tmp
+        }
+      }
+      if (event != "") {
+        latest[event]=status
+      }
+    }
+    END {
+      for (e in latest) {
+        if (e == "execplan.post_completion") {
+          continue
+        }
+        if (latest[e] == "fail" || latest[e] == "escalated") {
+          print e ":" latest[e]
+          exit 0
+        }
+      }
+      exit 1
+    }
+  '
+}
+
 if ! rg -q "event_id=execplan.pre_creation;.*status=pass" "$PLAN"; then
   fail_validation "missing pass entry for execplan.pre_creation"
 fi
@@ -156,7 +195,10 @@ case "$pr_ready" in
 esac
 
 if [[ "$pr_ready" == "auto" ]]; then
-  if rg -q "^- \[ \]" "$PLAN" || rg -q "status=(fail|escalated)" "$PLAN"; then
+  if rg -q "^- \[ \]" "$PLAN" || unresolved_latest="$(has_unresolved_latest_nonpass_event)"; then
+    if [[ -n "${unresolved_latest:-}" ]]; then
+      commands+=("auto-ready blocked by unresolved latest non-pass event: $unresolved_latest")
+    fi
     pr_ready="not_ready"
   else
     pr_ready="ready"
@@ -195,6 +237,24 @@ git status --short >/dev/null
 if ! rg -q "<!-- execplan-start-untracked:start -->" "$PLAN"; then
   fail_validation "missing execplan start untracked snapshot in plan; run pre-creation with --plan and retry"
 fi
+if ! rg -q "<!-- execplan-start-tracked:start -->" "$PLAN"; then
+  fail_validation "missing execplan start tracked snapshot in plan; run pre-creation with --plan and retry"
+fi
+
+declare -A baseline_tracked_hash=()
+while IFS= read -r line; do
+  payload="${line#- start_tracked_change: }"
+  hash="${payload%%$'\t'*}"
+  path="${payload#*$'\t'}"
+  hash="$(echo "$hash" | xargs)"
+  path="$(echo "$path" | sed -E 's/^ +| +$//g')"
+  if [[ -n "$path" && "$path" != "(none)" ]]; then
+    baseline_tracked_hash["$path"]="$hash"
+  fi
+done < <(
+  sed -n '/<!-- execplan-start-tracked:start -->/,/<!-- execplan-start-tracked:end -->/p' "$PLAN" \
+    | rg "^- start_tracked_change:"
+)
 
 declare -A baseline_untracked_hash=()
 while IFS= read -r line; do
@@ -223,7 +283,20 @@ declare -A seen_paths=()
 changed_paths=()
 for path in "${tracked_changes[@]}"; do
   [[ -z "$path" ]] && continue
-  if [[ -z "${seen_paths[$path]:-}" ]]; then
+  include_path=0
+  if [[ -n "${baseline_tracked_hash[$path]:-}" ]]; then
+    current_hash="(deleted)"
+    if [[ -e "$path" ]]; then
+      current_hash="$(git hash-object -- "$path" 2>/dev/null || echo "(missing)")"
+    fi
+    if [[ "$current_hash" != "${baseline_tracked_hash[$path]}" ]]; then
+      include_path=1
+    fi
+  else
+    include_path=1
+  fi
+
+  if [[ "$include_path" -eq 1 ]] && [[ -z "${seen_paths[$path]:-}" ]]; then
     seen_paths["$path"]=1
     changed_paths+=("$path")
   fi
@@ -273,8 +346,8 @@ if [[ ${#skipped_untracked[@]} -gt 0 ]]; then
   commands+=("skip unrelated untracked files")
 fi
 
-if ! git diff --quiet --; then
-  fail_after_git_add "unstaged changes remain after git add; do not edit files after staging"
+if [[ ${#changed_paths[@]} -gt 0 ]] && ! git diff --quiet -- "${changed_paths[@]}"; then
+  fail_after_git_add "unstaged changes remain in staged target files after git add; do not edit files after staging"
 fi
 
 if ! git diff --cached --quiet; then
@@ -287,8 +360,8 @@ else
   commands+=("no staged changes to commit")
 fi
 
-if ! git diff --quiet --; then
-  fail_after_git_add "files changed after git add/commit; stop and restage before push"
+if [[ ${#changed_paths[@]} -gt 0 ]] && ! git diff --quiet -- "${changed_paths[@]}"; then
+  fail_after_git_add "staged target files changed after git add/commit; stop and restage before push"
 fi
 
 branch="$(git branch --show-current)"

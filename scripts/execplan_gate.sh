@@ -50,16 +50,15 @@ if [[ -z "$EVENT" ]]; then
   exit 2
 fi
 
-if [[ "$EVENT" != "$PRE_EVENT_ID" ]]; then
-  if [[ -z "$PLAN" ]]; then
-    echo "--plan is required for event: $EVENT" >&2
-    usage >&2
-    exit 2
-  fi
-  if [[ ! -f "$PLAN" ]]; then
-    echo "Plan file not found: $PLAN" >&2
-    exit 1
-  fi
+if [[ "$EVENT" != "$PRE_EVENT_ID" && -z "$PLAN" ]]; then
+  echo "--plan is required for event: $EVENT" >&2
+  usage >&2
+  exit 2
+fi
+
+if [[ -n "$PLAN" && ! -f "$PLAN" ]]; then
+  echo "Plan file not found: $PLAN" >&2
+  exit 1
 fi
 
 HAS_PLAN_FILE=0

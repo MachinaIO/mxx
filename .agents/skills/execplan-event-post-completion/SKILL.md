@@ -13,7 +13,7 @@ Executes the "after main ExecPlan completion" workflow:
 - if ready, move tracking doc to `docs/prs/completed/`,
 - if not ready, keep active state and record blockers,
 - stage/commit/push only files changed by the plan in this lifecycle,
-- apply untracked-file rule: keep pre-existing unchanged untracked files unstaged, but stage new files created during this plan (including the target plan document) and pre-existing untracked files modified during this plan,
+- apply tracked/untracked baseline rule: keep pre-existing unchanged tracked/untracked edits unstaged, but stage files newly changed during this plan (including a new target plan document) and pre-existing files modified during this plan,
 - run `gh pr ready` when the PR is complete,
 - if validation fails before staging, roll back plan/pr tracking docs to active paths and return to action revision flow.
 

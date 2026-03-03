@@ -83,11 +83,23 @@ if [[ -z "$PR_NUMBER" ]]; then
   exit 1
 fi
 
-LEDGER_LINE="$(rg "event_id=${EVENT};" "$PLAN" | tail -n1 || true)"
-if [[ -z "$LEDGER_LINE" ]]; then
-  LEDGER_LINE="(no ledger entry yet for this event)"
+if ! rg -q "<!-- verification-ledger:start -->" "$PLAN"; then
+  echo "Verification Ledger block not found in plan: $PLAN" >&2
+  exit 1
 fi
-if [[ "$LEDGER_LINE" != *"status=pass"* ]]; then
+
+LEDGER_LINE="$(
+  sed -n '/<!-- verification-ledger:start -->/,/<!-- verification-ledger:end -->/p' "$PLAN" \
+    | rg "event_id=${EVENT};" \
+    | tail -n1 || true
+)"
+if [[ -z "$LEDGER_LINE" ]]; then
+  echo "No ledger entry found for event $EVENT in Verification Ledger" >&2
+  exit 1
+fi
+
+LEDGER_STATUS="$(echo "$LEDGER_LINE" | sed -nE 's/.*status=([^;]+);.*/\1/p' | xargs)"
+if [[ "$LEDGER_STATUS" != "pass" ]]; then
   echo "Latest ledger entry for $EVENT is not pass; refusing to notify" >&2
   exit 1
 fi
@@ -95,18 +107,8 @@ fi
 TIMESTAMP="$(date -u +"%Y-%m-%d %H:%MZ")"
 REF="gh-pr-comment:pr-${PR_NUMBER}:event-${EVENT}:$TIMESTAMP"
 
-BODY=$(cat <<MSG
-ExecPlan verification update
-
-- Plan: \
-`$PLAN`
-- Event: `$EVENT`
-- Status: `$STATUS`
-- Timestamp (UTC): `$TIMESTAMP`
-- Ledger: \
-`$LEDGER_LINE`
-MSG
-)
+BODY="$(printf "ExecPlan verification update\n\n- Plan: %s\n- Event: %s\n- Status: %s\n- Timestamp (UTC): %s\n- Ledger: %s\n" \
+  "$PLAN" "$EVENT" "$STATUS" "$TIMESTAMP" "$LEDGER_LINE")"
 
 gh pr comment "$PR_NUMBER" --body "$BODY" >/dev/null
 

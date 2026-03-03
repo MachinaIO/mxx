@@ -207,11 +207,36 @@ if [[ "$has_plan_file" -eq 1 ]] && ! rg -q "execplan_start_commit:" "$PLAN"; the
 EOF
 fi
 
-if [[ "$has_plan_file" -eq 1 ]] && ! rg -q "<!-- execplan-start-untracked:start -->" "$PLAN"; then
-  commands+=("capture execplan start untracked snapshot")
+if [[ "$has_plan_file" -eq 1 ]] && ! rg -q "<!-- execplan-start-tracked:start -->" "$PLAN"; then
+  commands+=("capture execplan start tracked snapshot")
   {
     echo
     echo "## ExecPlan Start Snapshot"
+    echo
+    echo "<!-- execplan-start-tracked:start -->"
+
+    snapshot_count=0
+    while IFS= read -r path; do
+      [[ -z "$path" ]] && continue
+      hash="(deleted)"
+      if [[ -e "$path" ]]; then
+        hash="$(git hash-object -- "$path" 2>/dev/null || echo "(missing)")"
+      fi
+      printf -- "- start_tracked_change: %s\t%s\n" "$hash" "$path"
+      snapshot_count=$((snapshot_count + 1))
+    done < <(git diff --name-only HEAD -- | sort)
+
+    if [[ "$snapshot_count" -eq 0 ]]; then
+      echo "- start_tracked_change: (none)	(none)"
+    fi
+
+    echo "<!-- execplan-start-tracked:end -->"
+  } >> "$PLAN"
+fi
+
+if [[ "$has_plan_file" -eq 1 ]] && ! rg -q "<!-- execplan-start-untracked:start -->" "$PLAN"; then
+  commands+=("capture execplan start untracked snapshot")
+  {
     echo
     echo "<!-- execplan-start-untracked:start -->"
 

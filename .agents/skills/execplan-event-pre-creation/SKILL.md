@@ -12,7 +12,7 @@ Executes the "before main ExecPlan creation" workflow:
 - enforce branch-switch rules (`main` or scope-misaligned work must switch),
 - create/update PR tracking metadata under `docs/prs/active/`,
 - ensure the ExecPlan contains PR tracking path and start branch/commit linkage,
-- capture a start snapshot of untracked files (hash + path) in the plan when `--plan` is provided.
+- capture a start snapshot of tracked/untracked working-tree deltas (hash + path) in the plan when `--plan` is provided.
 
 Dynamic controls:
 

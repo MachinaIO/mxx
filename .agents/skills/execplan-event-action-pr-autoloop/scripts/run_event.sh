@@ -64,6 +64,7 @@ commands+=("rg -n AUTO_AGENT: REVIEWER|AUTO_REQUEST_ID|AUTO_RUN_ID|AUTO_ITERATIO
 commands+=("rg -n -- --start|--request|--status|--stop|--commit|--pr-url|--head-branch|--request-id|--run-id|--iteration|--runtime-dir|--wait-timeout-sec .agents/skills/pr-autoloop/scripts/reviewer_daemon.sh")
 commands+=("rg -n reviewer.pid|state.json|inbox/<request_id>.json|responses/<request_id>.json|WAITING|RUNNING|APPROVED .agents/skills/pr-autoloop/references/state_schema.md")
 commands+=("rg -n CI|do not wait .agents/skills/pr-autoloop/references/comment_contract.md")
+commands+=("git ls-files .agents/skills/pr-autoloop/runtime")
 
 if ! bash -n .agents/skills/pr-autoloop/scripts/doctor.sh; then
   echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
@@ -242,6 +243,17 @@ if ! rg -q "APPROVED" .agents/skills/pr-autoloop/references/state_schema.md; the
   echo "FAILURE_SUMMARY=state schema missing APPROVED state"
   echo "STATUS=fail"
   exit 1
+fi
+
+tracked_runtime_paths="$(git ls-files .agents/skills/pr-autoloop/runtime | sed '/^$/d' || true)"
+if [[ -n "$tracked_runtime_paths" ]]; then
+  non_whitelist_runtime="$(printf '%s\n' "$tracked_runtime_paths" | grep -v '^.agents/skills/pr-autoloop/runtime/.gitignore$' || true)"
+  if [[ -n "$non_whitelist_runtime" ]]; then
+    echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+    echo "FAILURE_SUMMARY=runtime directory contains tracked mutable artifacts: $(printf '%s' "$non_whitelist_runtime" | tr '\n' ',' | sed 's/,$//')"
+    echo "STATUS=fail"
+    exit 1
+  fi
 fi
 
 echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"

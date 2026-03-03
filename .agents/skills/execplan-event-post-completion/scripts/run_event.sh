@@ -158,6 +158,47 @@ fetch_comment_body_by_url() {
     '[.comments[] | select(.url == $comment_url)][-1].body // empty' <<< "$comments_json"
 }
 
+remove_markdown_section() {
+  local file="$1"
+  local heading="$2"
+  local tmp
+  tmp="$(mktemp)"
+
+  awk -v heading="$heading" '
+    BEGIN { in_section=0 }
+    {
+      if ($0 == "## " heading) {
+        in_section=1
+        next
+      }
+      if (in_section) {
+        if ($0 ~ /^## /) {
+          in_section=0
+          print $0
+        }
+        next
+      }
+      print $0
+    }
+  ' "$file" > "$tmp"
+
+  mv "$tmp" "$file"
+}
+
+upsert_single_bullet_section() {
+  local file="$1"
+  local heading="$2"
+  local bullet_text="$3"
+
+  remove_markdown_section "$file" "$heading"
+  {
+    echo
+    echo "## $heading"
+    echo
+    echo "- $bullet_text"
+  } >> "$file"
+}
+
 if ! rg -q "event_id=execplan.pre_creation;.*status=pass" "$PLAN"; then
   fail_validation "missing pass entry for execplan.pre_creation"
 fi
@@ -233,6 +274,10 @@ if [[ "$pr_ready" == "auto" ]]; then
 fi
 
 if [[ "$pr_ready" == "ready" ]]; then
+  commands+=("clear stale blockers sections")
+  remove_markdown_section "$PLAN" "Post-Completion Blockers"
+  remove_markdown_section "$pr_doc_path" "Readiness Blockers"
+
   if [[ "$pr_doc_path" == docs/prs/active/* ]]; then
     mkdir -p docs/prs/completed
     target="docs/prs/completed/$(basename "$pr_doc_path")"
@@ -244,18 +289,9 @@ if [[ "$pr_ready" == "ready" ]]; then
   fi
 else
   blockers="${EXECPLAN_BLOCKERS:-remaining blockers not provided}"
-  {
-    echo
-    echo "## Post-Completion Blockers"
-    echo
-    echo "- ${blockers}"
-  } >> "$PLAN"
-  {
-    echo
-    echo "## Readiness Blockers"
-    echo
-    echo "- ${blockers}"
-  } >> "$pr_doc_path"
+  commands+=("upsert blockers sections")
+  upsert_single_bullet_section "$PLAN" "Post-Completion Blockers" "$blockers"
+  upsert_single_bullet_section "$pr_doc_path" "Readiness Blockers" "$blockers"
 fi
 
 commands+=("git status --short")

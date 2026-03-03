@@ -8,17 +8,6 @@
 - PR state: OPEN
 - PR head/base: feat/pr-autoloop-skill -> main
 
-## Readiness Blockers
-
-- remaining blockers not provided
-
-## Readiness Blockers
-
-- remaining blockers not provided
-
-## Readiness Blockers
-
-- remaining blockers not provided
 
 ## Readiness Blockers
 

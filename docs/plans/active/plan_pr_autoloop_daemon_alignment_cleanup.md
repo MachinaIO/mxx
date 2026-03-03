@@ -21,7 +21,7 @@ After this change, the `pr-autoloop` skill surface and validation contracts are 
 - [x] (2026-03-03 22:23Z) action_id=a1; mode=serial; depends_on=a0; file_locks=.agents/skills/pr-autoloop/SKILL.md,.agents/skills/pr-autoloop/agents/openai.yaml,.agents/skills/pr-autoloop/references/comment_contract.md,.agents/skills/pr-autoloop/references/state_schema.md,.agents/skills/pr-autoloop/scripts/run_loop.sh,.agents/skills/pr-autoloop/scripts/reviewer_daemon.sh,.agents/skills/execplan-event-action-pr-autoloop/scripts/run_event.sh; verify_events=action.pr_autoloop,action.tooling; worker_type=default; removed `run_loop.sh`, converted contracts/verification to daemon-only semantics, and removed tracked runtime artifacts.
 - [x] (2026-03-03 22:23Z) action_id=a2; mode=serial; depends_on=a1; file_locks=docs/design/pr_autoloop_builder_reviewer_contract.md,docs/architecture/scope/automation_orchestration.md,REVIEW.md,docs/plans/active/plan_pr_autoloop_daemon_alignment_cleanup.md; verify_events=action.tooling; worker_type=default; updated design/architecture/review policy text to daemon-first reviewer request/response terminology.
 - [x] (2026-03-03 22:23Z) action_id=a3; mode=serial; depends_on=a2; file_locks=docs/plans/active/plan_pr_autoloop_daemon_alignment_cleanup.md; verify_events=action.pr_autoloop,action.tooling; worker_type=default; re-ran action-level gates on the full modified set and reached passing state for both events.
-- [ ] action_id=a4; mode=serial; depends_on=a3; file_locks=docs/plans/active/plan_pr_autoloop_daemon_alignment_cleanup.md,docs/plans/completed/plan_pr_autoloop_daemon_alignment_cleanup.md,docs/prs/active/pr_feat_pr-autoloop-skill.md,docs/prs/completed/pr_feat_pr-autoloop-skill.md,.agents/skills/execplan-event-post-completion/SKILL.md,.agents/skills/execplan-event-post-completion/scripts/run_event.sh; verify_events=action.tooling; worker_type=default; partially completed: diagnosed post-completion ordering bug and updated event implementation/skill text so reviewer request is sent only after final add/commit/push; remaining: re-run `execplan.post_completion` to pass and close lifecycle.
+- [ ] action_id=a4; mode=serial; depends_on=a3; file_locks=docs/plans/active/plan_pr_autoloop_daemon_alignment_cleanup.md,docs/plans/completed/plan_pr_autoloop_daemon_alignment_cleanup.md,docs/prs/active/pr_feat_pr-autoloop-skill.md,docs/prs/completed/pr_feat_pr-autoloop-skill.md,.agents/skills/execplan-event-post-completion/SKILL.md,.agents/skills/execplan-event-post-completion/scripts/run_event.sh,.agents/skills/execplan-event-action-pr-autoloop/scripts/run_event.sh,.agents/skills/pr-autoloop/runtime/.gitignore; verify_events=action.tooling; worker_type=default; partially completed: fixed post-completion review ordering to push-first and added idempotent blocker section handling plus runtime de-tracking checks; remaining: obtain `execplan.post_completion` pass and mark action complete.
 
 ## Verification Ledger
 
@@ -37,6 +37,8 @@ After this change, the `pr-autoloop` skill surface and validation contracts are 
 - attempt_record: event_id=execplan.post_completion; attempt=2; status=fail; started_at=2026-03-03 22:25Z; finished_at=2026-03-03 22:30Z; commands=skill event runner execplan.post_completion; failure_summary=event runner failed; notify_reference=not_requested;
 - attempt_record: event_id=execplan.post_completion; attempt=3; status=escalated; started_at=2026-03-03 22:32Z; finished_at=2026-03-03 22:35Z; commands=skill event runner execplan.post_completion; failure_summary=event runner failed , retry bound exceeded (attempt=3); notify_reference=not_requested;
 - attempt_record: event_id=execplan.post_completion; attempt=3; status=escalated; started_at=2026-03-03 22:38Z; finished_at=2026-03-03 22:38Z; commands=rg -n docs/prs/active/|docs/prs/completed/ <plan> open docs/prs/active/pr_feat_pr-autoloop-skill.md git status --short git add changed plan files; failure_summary=failed to stage target files: .agents/skills/pr-autoloop/runtime/reviewer-daemon/logs/daemon.log,.agents/skills/pr-autoloop/runtime/reviewer-daemon/state.json , retry bound exceeded (attempt=3); notify_reference=not_requested;
+- attempt_record: event_id=execplan.post_completion; attempt=3; status=escalated; started_at=2026-03-03 22:38Z; finished_at=2026-03-03 22:42Z; commands=rg -n docs/prs/active/|docs/prs/completed/ <plan> open docs/prs/active/pr_feat_pr-autoloop-skill.md git status --short git add changed plan files git commit -m <finalize-message> git push origin feat/pr-autoloop-skill .agents/skills/pr-autoloop/scripts/reviewer_daemon.sh --request --pr-url https://github.com/MachinaIO/mxx/pull/63 --commit 7f66b5f26e61e8a455620b6db7397033cc4ed10c --run-id execplan-post-completion --iteration 0 --request-id post-completion-20260303T223900Z-2862415 gh pr view https://github.com/MachinaIO/mxx/pull/63 --json comments; failure_summary=reviewer did not approve pushed commit 7f66b5f26e61e8a455620b6db7397033cc4ed10c, comment_url=https://github.com/MachinaIO/mxx/pull/63#issuecomment-3994012167, comment_excerpt=Review findings (changes required): 1. High: Completed-plan state is internally inconsistent and blocks lifecycle closure. - `docs/plans/completed/plan_pr_autoloop_daemon_alignment_cleanup.md:24` keeps action `a4` unchecked. - `docs/plans/completed/plan_pr_autoloop_daemon_alignment_cleanup.md:36-39` records only `fail/escalated` for `execplan.post_completion` with no pass attempt. - The file is st , retry bound exceeded (attempt=3); notify_reference=not_requested;
+- attempt_record: event_id=execplan.post_completion; attempt=3; status=escalated; started_at=2026-03-03 22:45Z; finished_at=2026-03-03 22:45Z; commands=rg -n docs/prs/active/|docs/prs/completed/ <plan> open docs/prs/active/pr_feat_pr-autoloop-skill.md upsert blockers sections git status --short git add changed plan files; failure_summary=failed to stage target files: .agents/skills/pr-autoloop/runtime/reviewer-daemon/logs/daemon.log,.agents/skills/pr-autoloop/runtime/reviewer-daemon/state.json , retry bound exceeded (attempt=3); notify_reference=not_requested;
 <!-- verification-ledger:end -->
 
 ## Surprises & Discoveries
@@ -47,6 +49,8 @@ After this change, the `pr-autoloop` skill surface and validation contracts are 
   Evidence: gate failure summary: `comment contract missing non-blocking CI timing rule`.
 - Observation: `execplan.post_completion` reviewed commit `5b56dc8...` (pre-finalization commit) because review request happened before add/commit/push in event ordering.
   Evidence: reviewer daemon request command in failed ledger entry referenced `--commit 5b56dc89d2a340d9e86131d0a6c6fd0bdbdbb6c7` before final staging/push.
+- Observation: Reviewer returned `CHANGES_REQUIRED` for commit `7f66b5f...` because the plan stayed under `docs/plans/completed/` while unfinished and blocker sections were duplicated.
+  Evidence: PR comment `https://github.com/MachinaIO/mxx/pull/63#issuecomment-3994012167`.
 
 ## Decision Log
 
@@ -58,6 +62,9 @@ After this change, the `pr-autoloop` skill surface and validation contracts are 
   Date/Author: 2026-03-04 / Codex
 - Decision: Reorder `execplan.post_completion` event flow to add/commit/push first, then request reviewer daemon on the pushed HEAD commit.
   Rationale: Prevent stale commit review and satisfy deterministic contract that reviewer evaluates the exact pushed result of lifecycle finalization.
+  Date/Author: 2026-03-04 / Codex
+- Decision: Enforce runtime artifact de-tracking and idempotent blocker-section updates in lifecycle scripts.
+  Rationale: Prevent repeated post-completion churn and avoid mutable runtime logs/state being versioned.
   Date/Author: 2026-03-04 / Codex
 
 ## Outcomes & Retrospective
@@ -129,14 +136,8 @@ If post-completion fails, the event script must roll plan/PR tracking docs back 
 
 - 2026-03-03 22:23Z: Converted verification targets to daemon-only contracts, removed `action.docs_only` from this plan because non-doc skill/script cleanup is intentionally in scope, and updated reviewer timing wording to satisfy strict gate validation.
 - 2026-03-03 22:36Z: Added post-completion remediation because reviewer request happened before final push. Updated event script/skill to push first, then request reviewer for pushed commit; resumed from active plan `a4` after escalation.
+- 2026-03-03 22:43Z: Applied reviewer-requested remediation: returned plan to active state, deduplicated blocker sections, removed tracked runtime daemon outputs, and added runtime de-tracking validation.
 
-## Post-Completion Blockers
-
-- remaining blockers not provided
-
-## Post-Completion Blockers
-
-- remaining blockers not provided
 
 ## Post-Completion Blockers
 

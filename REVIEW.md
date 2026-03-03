@@ -23,10 +23,11 @@ For the target PR, verify all of the following:
 4. Check for duplicated logic, unnecessary processing, dead private code paths, and obsolete fallback logic that was retained only for backward compatibility with old code/data without current necessity.
 5. If PR changes can materially affect benchmark outcomes, run relevant benchmarks and record the result delta against the target branch implementation (the PR base branch).
 6. Check for any other unnatural, inconsistent, or suspicious changes.
+7. Confirm the target ExecPlan includes a `Verification Ledger` with complete gate-attempt history for required lifecycle and action events.
 
 ## Verification source rule
 
-Use repository verification runbooks under `docs/verification/` to decide concrete commands and checks.
+Use repository-local event verification skills under `.agents/skills/execplan-event-*/`, with event resolution from `.agents/skills/execplan-event-index/references/event_skill_map.tsv`, and gate/notify scripts under `scripts/` to decide concrete commands and checks.
 
 Do not trust documentation claims blindly. Validate by reading code and running appropriate checks.
 

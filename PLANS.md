@@ -6,7 +6,7 @@ This document describes the requirements for an execution plan ("ExecPlan"), a d
 
 When authoring an executable specification (ExecPlan), follow PLANS.md _to the letter_. If it is not in your context, refresh your memory by reading the entire PLANS.md file. Be thorough in reading (and re-reading) source material to produce an accurate specification. When creating a spec, start from the skeleton and flesh it out as you do your research.
 
-When implementing an executable specification (ExecPlan), do not prompt the user for "next steps"; simply proceed to the next milestone. Keep all sections up to date, add or split entries in the list at every stopping point to affirmatively state the progress made and next steps. Resolve ambiguities autonomously, and commit frequently. Do not request human confirmation until the ExecPlan Lifecycle defined below is complete. If you are executing a sub ExecPlan, report outcomes back to its parent main ExecPlan instead of asking the user for instructions.
+When implementing an executable specification (ExecPlan), do not prompt the user for "next steps"; simply proceed to the next milestone. Keep all sections up to date, add or split entries in the list at every stopping point to affirmatively state the progress made and next steps. Resolve ambiguities autonomously, and commit frequently. Do not request human confirmation until the ExecPlan Lifecycle defined below is complete. If you delegate parallelizable actions to sub agents, merge and document their outcomes in the same ExecPlan rather than creating separate plan lifecycles.
 
 When discussing an executable specification (ExecPlan), record decisions in a log in the spec for posterity; it should be unambiguously clear why any change to the specification was made. ExecPlans are living documents, and it should always be possible to restart from _only_ the ExecPlan and no other work.
 
@@ -74,64 +74,131 @@ When creating a new plan markdown file, place it by status:
 
 Any markdown file in `docs/plans/tech-debt/` must include links to the related plan markdown files (for example, active or completed plans that introduced, mitigated, or depend on that debt). The links must be explicit repository-relative markdown links so a reader can navigate directly.
 
-## Main and Sub ExecPlans
+## Action-Level Parallel Execution
 
-An ExecPlan that owns the end-to-end objective is called a `main ExecPlan`. A plan created by decomposing part of that objective is called a `sub ExecPlan`.
+This repository uses one lifecycle target: a single `ExecPlan` document for one end-to-end objective.
 
-When a created ExecPlan is large, agents are encouraged to decompose it into multiple sub ExecPlans. A large plan means the scope is too broad to execute reliably as one context, especially when progress tracking, validation mapping, or implementation detail would become difficult to maintain in one document.
+If work is large, decompose it into action-level units inside that one plan and delegate only parallelizable actions to sub agents. Do not create separate sub-plan lifecycle documents for that decomposition.
 
-Each sub ExecPlan must have its own markdown plan document under `docs/plans/active/`. Every such sub-plan document must include:
+The `Progress` section must document execution topology for delegated actions:
 
-* a repository-relative link to its parent main ExecPlan file,
-* an explicit statement of which part of the main ExecPlan it corresponds to (for example, which action, milestone, or scoped output),
-* enough bounded scope that one sub agent can reasonably complete it within one context window.
+* which actions are parallelizable and which are sequential,
+* dependency order for sequential actions (`depends_on`),
+* file-level ownership for conflict prevention (`file_locks`),
+* sub-agent assignment (`worker_type`) when more than one sub-agent type is available.
 
-The `Progress` section in the main ExecPlan must do more than list sub plans. It must explicitly describe execution topology:
+An action is parallelizable only when both conditions hold:
 
-* which sub ExecPlans are parallelizable,
-* which sub ExecPlans must be processed sequentially and in what order,
-* when multiple sub-agent types are available, which sub-agent type is assigned to each sub ExecPlan.
+* all `depends_on` actions are already completed, and
+* `file_locks` for concurrently running actions are disjoint.
 
-Here, “parallelizable” means the sub ExecPlans can be executed by separate sub agents with isolated context windows and no required communication between those sub agents until the individual sub plans are completed. Parallelizable sub ExecPlans must not require simultaneous edits to the same file.
+If conflicts still occur during delegated parallel execution, the parent ExecPlan owner is responsible for conflict resolution and for recording the final merged outcome in the same plan.
 
-If conflicts still occur while multiple sub ExecPlans are executed in parallel, the main ExecPlan is responsible for resolving those conflicts.
+## How ExecPlans must use design, architecture, and integrated verification policy
 
-Each sub ExecPlan independently follows the ExecPlan lifecycle. After finishing, the sub agent must autonomously report results back to the parent main ExecPlan scope and terminate without requesting a human response.
+Each ExecPlan must explicitly describe how it handled design and architecture guidance from `AGENTS.md`, and how it applied the integrated verification policy defined in this document.
 
-## How ExecPlans must use design, architecture, and verification documents
-
-Each ExecPlan must explicitly describe how it handled design, architecture, and verification guidance from `AGENTS.md`.
-
-At the beginning of the ExecPlan, include a short repository-document context paragraph that names the exact files consulted for design, architecture, and verification policy. Use repository-relative paths. If a required policy file does not exist yet, state that clearly in the ExecPlan and record the fallback document or assumption used.
+At the beginning of the ExecPlan, include a short repository-document context paragraph that names the exact files consulted for design and architecture guidance and names the repository-local event skills/scripts used for verification execution. Use repository-relative paths.
 
 For design decisions, follow this rule: if the change introduces a long-lived or reusable decision (for example, a new interface, invariant, API behavior, or a major trade-off), the ExecPlan must either update the design document or create one, and must link that artifact in the plan.
 
 For architecture changes, follow this rule: if the change affects structure (module boundaries, layering, feature flags, shared infrastructure, cross-domain dependencies, or boundaries such as FFI/CUDA/IO/build integration), the ExecPlan must describe the architecture impact and must update the architecture document and related enforcement rules in the same change.
 
-For verification, follow this rule: every ExecPlan must name the verification policy document and list exact verification commands to run and commands actually run. Update the verification document only when verification *policy* changes; do not update it for routine per-change command results.
+For verification, follow this rule: every ExecPlan must identify the event-index skill, list exact verification commands planned, and record commands actually run in `Verification Ledger`. Update this document only when long-lived verification policy changes. Update repository-local skill files when event execution procedures or event mappings change.
 
-Before moving an ExecPlan from `docs/plans/active/` to `docs/plans/completed/`, the plan must include an explicit note of what design, architecture, and verification documents were referenced, created, modified, or left unchanged, and why.
+Before moving an ExecPlan from `docs/plans/active/` to `docs/plans/completed/`, the plan must include an explicit note of what design documents, architecture documents, and verification skills/scripts were referenced, created, modified, or left unchanged, and why.
+
+## Integrated Verification Policy
+
+Verification policy is defined in this section. Event execution procedures are defined by repository-local skills and scripts.
+
+Operational verification source of truth:
+
+* `.agents/skills/execplan-event-index/SKILL.md`
+* `.agents/skills/execplan-event-index/references/event_skill_map.tsv`
+* each mapped event skill under `.agents/skills/execplan-event-*/`
+* `scripts/execplan_gate.sh`
+* `scripts/execplan_notify.sh`
+
+### Event model
+
+Event membership is data-driven by `.agents/skills/execplan-event-index/references/event_skill_map.tsv`.
+
+The following lifecycle events are mandatory and must always exist in that map:
+
+* `execplan.pre_creation`
+* `execplan.post_completion`
+
+Action events are intentionally flexible and may be added or removed over time without changing this policy text, as long as they are registered in the event map.
+
+### Enforcement model
+
+Verification is enforced by gate execution:
+
+* `scripts/execplan_gate.sh --event <event_id> [--plan <plan_md>] [--attempt <n>]`
+
+The gate must reject lifecycle progress when required events are unexecuted, failed, or escalated.
+
+At minimum, gate enforcement must include:
+
+* block advancing to a different event while any previously attempted event remains in latest `fail` or `escalated` state,
+* block `execplan.post_completion` unless every event listed in `Progress` `verify_events` has at least one `pass` entry in `Verification Ledger`.
+
+### Retry and escalation bounds
+
+For each event:
+
+* max attempts: 3
+
+If the attempt bound is exceeded, the gate must mark the event as `escalated`, stop lifecycle progress, and require blocker reporting.
+
+### Notification policy
+
+Do not notify on every event.
+
+If notification is needed, post only once after all actions are complete, `execplan.post_completion` is `pass`, and commits are pushed:
+
+* `scripts/execplan_notify.sh --plan <plan_md> --event <event_id> --status <pass|fail|escalated>`
+
+Notification target is GitHub PR comment.
+
+### Evidence policy
+
+Short-lived verification logs must not be stored in separate temporary tracking files.
+
+Each ExecPlan must include `## Verification Ledger` entries for every event attempt with:
+
+* `event_id`
+* `attempt`
+* `status` (`pass`, `fail`, `escalated`)
+* `commands`
+* `failure_summary`
+* `notify_reference`
+* `started_at`
+* `finished_at`
 
 ## ExecPlan Lifecycle
 
 Agents must strictly follow this lifecycle to create, execute, and complete an ExecPlan.
 
-1. Choose the lifecycle target (`main ExecPlan` or `sub ExecPlan`) and run the corresponding pre-event verification document under `docs/verification`:
-   * `main ExecPlan`: before creating or updating the main plan file, run `docs/verification/main_execplan_pre_creation.md`.
-   * `sub ExecPlan`: before executing the sub plan, run `docs/verification/sub_execplan_pre_execution.md` (this event is not for sub-plan creation).
-   While running this event, follow the file-edit restrictions defined by the selected verification document.
-2. Create or select the target plan document under `docs/plans/active`:
-   * `main ExecPlan`: add a new main-plan document in accordance with `PLANS.md`. If decomposition is needed, create one sub-plan markdown document per sub ExecPlan under `docs/plans/active`, and ensure each sub plan links the parent main ExecPlan path and names the main-plan scope it covers.
-   * `sub ExecPlan`: use the already-created sub-plan document defined by the parent main ExecPlan scope. If it does not exist yet, return to the parent main ExecPlan scope and create/link that sub-plan document before starting sub-plan execution.
-3. This step is required for main ExecPlans only. Map the main plan actions (the checklist in `Progress`) to the events introduced in `docs/verification/index.md`, enumerate which validations must run after each action, and add those validations into the main-plan actions. For validations related to sub ExecPlans, either (a) insert each validation adjacent to the corresponding sub-plan action, or (b) aggregate them into one validation step in the main ExecPlan after one or more sub ExecPlans finish.
-4. Execute the actions updated in step 3 in order and record progress in the target plan. Sub ExecPlans execute their own actions independently under their assigned scope.
-5. If an unexpected event occurs while executing an action (for example, an unexpected error), add it to the `Surprises & Discoveries` section. Then update the actions and return to step 3. "Update the actions" includes creating new sub ExecPlans when needed.
-6. After completing all actions for the target plan, finalize that plan document state first: update progress/outcome sections, then move that plan document from `docs/plans/active/` to `docs/plans/completed/`. If technical debt remains, add a corresponding document under `docs/plans/tech-debt`.
-7. Run post-completion verification using the document that matches the target plan type:
-   * `main ExecPlan`: run `docs/verification/main_execplan_post_completion.md`, record final validation results in the completed main plan document (including failed commands, failure locations, and likely causes when validation fails), then perform the final commit and push so completed-plan state and final evidence are persisted in git. If final validation fails, still append failure results and include them in the final commit/push.
-   * `sub ExecPlan`: run `docs/verification/sub_execplan_post_completion.md`, then return to the corresponding main ExecPlan scope and update the main plan `Progress` (and related sections when needed) with the sub-plan outcome. After this report, the sub agent must terminate without requesting user response.
+1. Before creating a new ExecPlan document, run pre-creation verification:
+   * `scripts/execplan_gate.sh --event execplan.pre_creation`
+   * If you are reusing an existing plan document, run with `--plan <plan_md>` so the attempt is recorded directly in that plan ledger.
+2. Create or select one target ExecPlan document under `docs/plans/active/`.
+3. Before action execution, map each `Progress` action to metadata and verification events from the event-index map:
+   * required metadata: `action_id`, `mode`, `depends_on`, `file_locks`, `verify_events`, `worker_type`,
+   * `verify_events` values must be event IDs registered in `.agents/skills/execplan-event-index/references/event_skill_map.tsv`.
+4. Execute actions in dependency order. Delegate only `mode=parallel` actions to sub agents, and keep all status updates in the same ExecPlan.
+5. After each action, run `scripts/execplan_gate.sh` for each mapped event in `verify_events`. The gate must block lifecycle progress when verification fails or remains unexecuted.
+6. Record every gate attempt in the plan's `Verification Ledger` section.
+7. On failure, run auto-fix and retry loops through the gate until pass, within policy bound (`3 tries`). If the bound is exceeded, record `escalated` and stop progress.
+8. After all actions and action-level verification events pass, run post-completion verification:
+   * `scripts/execplan_gate.sh --plan <plan_md> --event execplan.post_completion`.
+9. Finalize plan state: update progress/outcomes/ledger sections, push commits, move the plan to `docs/plans/completed/`, and add technical-debt follow-up plans when needed.
+10. If notification is needed, post a single final PR comment:
+   * `scripts/execplan_notify.sh --plan <plan_md> --event execplan.post_completion --status pass`.
 
-Important: once a human or an AI agent starts a new ExecPlan lifecycle, the AI agent must not request any human response until step 7 is complete for the current plan target. For main ExecPlans, completion includes the final commit/push that persists completed-plan state. For sub ExecPlans, completion includes reporting back into the corresponding main ExecPlan scope. If an agent requests human response before all step-7 verification requirements are complete, that agent is immediately dismissed and removed. Treat humans as a very slow external device, and assume reliance on humans will significantly delay completion.
+Important: once a human or an AI agent starts a new ExecPlan lifecycle, the AI agent must not request any human response until step 8 is complete and all required verification events are `pass`. If an agent requests human response before lifecycle completion requirements are complete, that agent is immediately dismissed and removed. Treat humans as a very slow external device, and assume reliance on humans will significantly delay completion.
 
 # Prototyping milestones and parallel implementations
 
@@ -158,10 +225,24 @@ Prefer additive code changes followed by subtractions that keep tests passing. P
     - [x] (2025-10-01 13:00Z) Example completed step.
     - [ ] Example incomplete step.
     - [ ] Example partially completed step (completed: X; remaining: Y).
+    - [ ] action_id=a3; mode=parallel; depends_on=a1,a2; file_locks=src/lookup/mod.rs; verify_events=action.cpu_behavior; worker_type=worker; implement lookup cache rewrite.
 
     Use timestamps to measure rates of progress.
 
-    If the plan is a main ExecPlan that uses sub ExecPlans, each `Progress` action must also state whether the sub plans are parallel or sequential, the required order for sequential work, and the assigned sub-agent type when multiple sub-agent types exist.
+    Each `Progress` action must define execution metadata: `action_id`, `mode` (`serial` or `parallel`), `depends_on`, `file_locks`, `verify_events`, and `worker_type` when multiple sub-agent types exist.
+
+    ## Verification Ledger
+
+    Record every verification event attempt in this section using one entry per attempt with:
+
+    - `event_id`
+    - `attempt`
+    - `status` (`pass`, `fail`, `escalated`)
+    - `commands`
+    - `failure_summary`
+    - `notify_reference`
+    - `started_at`
+    - `finished_at`
 
     ## Surprises & Discoveries
 

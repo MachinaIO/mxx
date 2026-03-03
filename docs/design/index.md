@@ -21,6 +21,11 @@ Current registered design documents:
   - Roles:
     1. Target behavior/properties with assumptions and limits.
     2. Core technical idea and trade-off rationale for VRAM reduction.
+- [execplan_verification_enforcement.md](./execplan_verification_enforcement.md)
+  - Purpose: Defines long-lived verification enforcement design using repository-local skills, gate execution, and in-plan ledger evidence.
+  - Roles:
+    1. Target behavior/properties with assumptions and limits.
+    2. Core technical idea and trade-off rationale for enforcement vs. advisory docs.
 
 When adding a design document, place it under `docs/design/` and add it to this index with:
 

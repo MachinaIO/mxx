@@ -59,25 +59,33 @@ fn max_output_row_from_biguint_cpu(
     params: &DCRTPolyParams,
     idx: usize,
     value: BigUint,
-) -> (usize, <DCRTPoly as Poly>::Elem) {
+) -> (u64, <DCRTPoly as Poly>::Elem) {
     let poly = DCRTPoly::from_biguint_to_constant(params, value);
     let coeff = poly
         .coeffs()
         .into_iter()
         .max()
         .expect("max_output_row_from_biguint_cpu requires coefficients");
-    (idx, coeff)
+    (u64::try_from(idx).expect("row index must fit in u64"), coeff)
 }
 
 fn build_mod_p_lut_cpu(params: &DCRTPolyParams, p: u64) -> PublicLut<DCRTPoly> {
     let lut_len = (p * p) as usize;
     let max_row = max_output_row_from_biguint_cpu(params, (p - 1) as usize, BigUint::from(p - 1));
-    PublicLut::<DCRTPoly>::new_from_usize_range(
+    PublicLut::<DCRTPoly>::new(
         params,
-        lut_len,
+        lut_len as u64,
         move |params, t| {
-            let output = BigUint::from((t as u64) % p);
-            (t, DCRTPoly::from_biguint_to_constant(params, output))
+            if t >= lut_len as u64 {
+                return None;
+            }
+            let output = BigUint::from(t % p);
+            let y_elem = DCRTPoly::from_biguint_to_constant(params, output)
+                .coeffs()
+                .into_iter()
+                .next()
+                .expect("constant-term coefficient must exist");
+            Some((t, y_elem))
         },
         Some(max_row),
     )
@@ -167,25 +175,33 @@ fn max_output_row_from_biguint_gpu(
     params: &GpuDCRTPolyParams,
     idx: usize,
     value: BigUint,
-) -> (usize, <GpuDCRTPoly as Poly>::Elem) {
+) -> (u64, <GpuDCRTPoly as Poly>::Elem) {
     let poly = GpuDCRTPoly::from_biguint_to_constant(params, value);
     let coeff = poly
         .coeffs()
         .into_iter()
         .max()
         .expect("max_output_row_from_biguint_gpu requires coefficients");
-    (idx, coeff)
+    (u64::try_from(idx).expect("row index must fit in u64"), coeff)
 }
 
 fn build_mod_p_lut_gpu(params: &GpuDCRTPolyParams, p: u64) -> PublicLut<GpuDCRTPoly> {
     let lut_len = (p * p) as usize;
     let max_row = max_output_row_from_biguint_gpu(params, (p - 1) as usize, BigUint::from(p - 1));
-    PublicLut::<GpuDCRTPoly>::new_from_usize_range(
+    PublicLut::<GpuDCRTPoly>::new(
         params,
-        lut_len,
+        lut_len as u64,
         move |params, t| {
-            let output = BigUint::from((t as u64) % p);
-            (t, GpuDCRTPoly::from_biguint_to_constant(params, output))
+            if t >= lut_len as u64 {
+                return None;
+            }
+            let output = BigUint::from(t % p);
+            let y_elem = GpuDCRTPoly::from_biguint_to_constant(params, output)
+                .coeffs()
+                .into_iter()
+                .next()
+                .expect("constant-term coefficient must exist");
+            Some((t, y_elem))
         },
         Some(max_row),
     )

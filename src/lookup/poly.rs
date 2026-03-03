@@ -1,8 +1,10 @@
 use crate::{
     circuit::gate::GateId,
+    element::PolyElem,
     lookup::{PltEvaluator, PublicLut},
     poly::Poly,
 };
+use num_traits::ToPrimitive;
 
 #[derive(Debug, Clone)]
 pub struct PolyPltEvaluator {}
@@ -17,15 +19,28 @@ impl<P: Poly + 'static> PltEvaluator<P> for PolyPltEvaluator {
         gate_id: GateId,
         lut_id: usize,
     ) -> P {
-        let output = match plt.get(params, input) {
-            Some(outputs) => outputs.1,
-            None => panic!(
-                "output of the lookup evaluation not found; gate_id: {:?}, lut_id: {:?}, input: {:?}",
-                gate_id, lut_id, input
-            ),
-        };
-
-        output
+        let output_coeffs = input
+            .coeffs()
+            .into_iter()
+            .enumerate()
+            .map(|(coeff_idx, coeff)| {
+                let x_i = coeff.value().to_u64().unwrap_or_else(|| {
+                    panic!(
+                        "lookup input coefficient must fit in u64; gate_id: {:?}, lut_id: {:?}, coeff_idx: {:?}, coeff: {:?}",
+                        gate_id, lut_id, coeff_idx, coeff
+                    )
+                });
+                plt.get(params, x_i)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "output of the lookup evaluation not found; gate_id: {:?}, lut_id: {:?}, coeff_idx: {:?}, input_coeff_u64: {:?}",
+                            gate_id, lut_id, coeff_idx, x_i
+                        )
+                    })
+                    .1
+            })
+            .collect::<Vec<_>>();
+        P::from_coeffs(params, &output_coeffs)
     }
 }
 

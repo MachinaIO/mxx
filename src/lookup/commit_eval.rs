@@ -340,10 +340,14 @@ where
             .plaintext
             .as_ref()
             .expect("the BGG encoding should reveal plaintext for public lookup");
-        let (k, y) = plt.get(params, x).unwrap_or_else(|| {
-            panic!("{:?} not found in LUT for gate {}", x.to_const_int(), gate_id)
-        });
-        let lut_vector_idx = lut_gate_index(&self.lut_gate_start_ids, gate_id, k);
+        let x_u64 = u64::try_from(x.to_const_int())
+            .expect("BGG encoding plaintext constant term must fit in u64 for public lookup");
+        let (k, y) = plt
+            .get(params, x_u64)
+            .unwrap_or_else(|| panic!("{:?} not found in LUT for gate {}", x_u64, gate_id));
+        let k_usize = usize::try_from(k).expect("LUT row index must fit in usize");
+        let y_poly = M::P::from_elem_to_constant(params, &y);
+        let lut_vector_idx = lut_gate_index(&self.lut_gate_start_ids, gate_id, k_usize);
         let (msg_stream, padded_len, _, _) = build_msg_stream_for_lut_eval::<M, HS>(
             params,
             &self.wee25_commit,
@@ -369,13 +373,13 @@ where
         let secret_size = input.pubkey.matrix.row_size();
         let m_b = self.wee25_commit.m_b;
         let r_g_i =
-            derive_r_g_i_matrix::<M, HS>(params, secret_size, m_b, self.hash_key, gate_id, k);
+            derive_r_g_i_matrix::<M, HS>(params, secret_size, m_b, self.hash_key, gate_id, k_usize);
         let canceler = derive_canceler_matrix::<M>(
             params,
             &self.b_1,
             &verifier,
             &r_g_i,
-            k,
+            k_usize,
             self.reconst_coeffs.as_slice(),
         );
         let c_lut = self.c_commit.clone() * verifier + self.c_b.clone() * opening;
@@ -390,7 +394,7 @@ where
         BggEncoding {
             pubkey: BggPublicKey { matrix: a_out, reveal_plaintext: true },
             vector: c_out,
-            plaintext: Some(y),
+            plaintext: Some(y_poly),
         }
     }
 }
@@ -459,11 +463,14 @@ where
                 let lut_id = *lut_id;
                 let lut_input_index = global_idx - start_idx;
                 let lut = luts.get(&lut_id).unwrap();
-                let input = M::P::from_usize_to_constant(params, lut_input_index);
-                let (idx, y_poly) = lut
-                    .get(params, &input)
+                let lut_input_u64 =
+                    u64::try_from(lut_input_index).expect("LUT input index must fit in u64");
+                let (idx, y_elem) = lut
+                    .get(params, lut_input_u64)
                     .unwrap_or_else(|| panic!("LUT entry {} missing", lut_input_index));
-                let verifier_idx = start_idx + idx;
+                let idx_usize = usize::try_from(idx).expect("LUT row index must fit in usize");
+                let y_poly = M::P::from_elem_to_constant(params, &y_elem);
+                let verifier_idx = start_idx + idx_usize;
                 let verifier_slice = if verifier_idx >= range_start && verifier_idx < range_end {
                     let local_idx = verifier_idx - range_start;
                     verifier_range.slice_columns(m_b * local_idx, m_b * (local_idx + 1))
@@ -476,14 +483,20 @@ where
                     )
                 };
                 let a_out = derive_a_out_matrix::<M, HS>(params, secret_size, hash_key, gate_id);
-                let r_g_i =
-                    derive_r_g_i_matrix::<M, HS>(params, secret_size, m_b, hash_key, gate_id, idx);
+                let r_g_i = derive_r_g_i_matrix::<M, HS>(
+                    params,
+                    secret_size,
+                    m_b,
+                    hash_key,
+                    gate_id,
+                    idx_usize,
+                );
                 let canceler = derive_canceler_matrix::<M>(
                     params,
                     &b_1,
                     &verifier_slice,
                     &r_g_i,
-                    idx,
+                    idx_usize,
                     reconst_coeffs.as_slice(),
                 );
                 let padded = (a_out.clone() - gadget.clone() * y_poly).concat_columns(&[&M::zero(
@@ -635,10 +648,22 @@ mod tests {
     use tracing::info;
 
     fn setup_lsb_constant_binary_plt(t_n: usize, params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {
-        PublicLut::<DCRTPoly>::new_from_usize_range(
+        PublicLut::<DCRTPoly>::new(
             params,
-            t_n,
-            |params, k| (k, DCRTPoly::from_usize_to_lsb(params, k)),
+            t_n as u64,
+            move |params, k| {
+                if k >= t_n as u64 {
+                    return None;
+                }
+                let k_usize = usize::try_from(k).expect("LUT index must fit in usize");
+                let y_lsb = DCRTPoly::from_usize_to_lsb(params, k_usize);
+                let y_elem = y_lsb
+                    .coeffs()
+                    .into_iter()
+                    .next()
+                    .expect("constant-term coefficient must exist");
+                Some((k, y_elem))
+            },
             None,
         )
     }
@@ -770,7 +795,10 @@ mod tests {
         let result_encoding = &result_encoding[0];
         assert_eq!(result_encoding.pubkey, result_pubkey.clone());
 
-        let expected_plaintext = plt.get(&params, &plaintexts[0]).unwrap().1;
+        let expected_input = u64::try_from(plaintexts[0].to_const_int())
+            .expect("test plaintext constant term must fit in u64");
+        let expected_plaintext_elem = plt.get(&params, expected_input).unwrap().1;
+        let expected_plaintext = DCRTPoly::from_elem_to_constant(&params, &expected_plaintext_elem);
         assert_eq!(result_encoding.plaintext.clone().unwrap(), expected_plaintext.clone());
 
         let expected_vector = s_vec.clone() *
@@ -913,7 +941,11 @@ mod tests {
         assert_eq!(result_encoding.len(), input_size);
 
         for (idx, encoding) in result_encoding.iter().enumerate() {
-            let expected_plaintext = plt.get(&params, &plaintexts[idx]).unwrap().1;
+            let expected_input = u64::try_from(plaintexts[idx].to_const_int())
+                .expect("test plaintext constant term must fit in u64");
+            let expected_plaintext_elem = plt.get(&params, expected_input).unwrap().1;
+            let expected_plaintext =
+                DCRTPoly::from_elem_to_constant(&params, &expected_plaintext_elem);
             assert_eq!(encoding.plaintext.clone().unwrap(), expected_plaintext.clone());
 
             let expected_vector = s_vec.clone() *

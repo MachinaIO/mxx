@@ -620,12 +620,26 @@ mod tests {
     fn test_wire_norm_lwe_plt_bounds() {
         // Build a tiny LUT on DCRTPoly where the maximum output coeff is known (e.g., 7)
         let params = DCRTPolyParams::default();
-        let plt = PublicLut::<DCRTPoly>::new_from_usize_range(
+        let plt = PublicLut::<DCRTPoly>::new(
             &params,
             2,
             |params, idx| match idx {
-                0 => (0usize, DCRTPoly::from_usize_to_constant(params, 5)),
-                1 => (1usize, DCRTPoly::from_usize_to_constant(params, 7)),
+                0 => Some((
+                    0,
+                    DCRTPoly::from_usize_to_constant(params, 5)
+                        .coeffs()
+                        .into_iter()
+                        .next()
+                        .expect("constant-term coefficient must exist"),
+                )),
+                1 => Some((
+                    1,
+                    DCRTPoly::from_usize_to_constant(params, 7)
+                        .coeffs()
+                        .into_iter()
+                        .next()
+                        .expect("constant-term coefficient must exist"),
+                )),
                 _ => unreachable!("index out of range for test LUT"),
             },
             None,
@@ -658,12 +672,26 @@ mod tests {
     fn test_wire_norm_ggh15_plt_bounds() {
         // Build a tiny LUT on DCRTPoly where the maximum output coeff is known (e.g., 7)
         let params = DCRTPolyParams::default();
-        let plt = PublicLut::<DCRTPoly>::new_from_usize_range(
+        let plt = PublicLut::<DCRTPoly>::new(
             &params,
             2,
             |params, idx| match idx {
-                0 => (0usize, DCRTPoly::from_usize_to_constant(params, 5)),
-                1 => (1usize, DCRTPoly::from_usize_to_constant(params, 7)),
+                0 => Some((
+                    0,
+                    DCRTPoly::from_usize_to_constant(params, 5)
+                        .coeffs()
+                        .into_iter()
+                        .next()
+                        .expect("constant-term coefficient must exist"),
+                )),
+                1 => Some((
+                    1,
+                    DCRTPoly::from_usize_to_constant(params, 7)
+                        .coeffs()
+                        .into_iter()
+                        .next()
+                        .expect("constant-term coefficient must exist"),
+                )),
                 _ => unreachable!("index out of range for test LUT"),
             },
             None,
@@ -700,12 +728,26 @@ mod tests {
     fn test_wire_norm_commit_plt_bounds() {
         // Build a tiny LUT on DCRTPoly where the maximum output coeff is known (e.g., 7)
         let params = DCRTPolyParams::default();
-        let plt = PublicLut::<DCRTPoly>::new_from_usize_range(
+        let plt = PublicLut::<DCRTPoly>::new(
             &params,
             2,
             |params, idx| match idx {
-                0 => (0usize, DCRTPoly::from_usize_to_constant(params, 5)),
-                1 => (1usize, DCRTPoly::from_usize_to_constant(params, 7)),
+                0 => Some((
+                    0,
+                    DCRTPoly::from_usize_to_constant(params, 5)
+                        .coeffs()
+                        .into_iter()
+                        .next()
+                        .expect("constant-term coefficient must exist"),
+                )),
+                1 => Some((
+                    1,
+                    DCRTPoly::from_usize_to_constant(params, 7)
+                        .coeffs()
+                        .into_iter()
+                        .next()
+                        .expect("constant-term coefficient must exist"),
+                )),
                 _ => unreachable!("index out of range for test LUT"),
             },
             None,

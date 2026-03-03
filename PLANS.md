@@ -6,7 +6,7 @@ This document describes the requirements for an execution plan ("ExecPlan"), a d
 
 When authoring an executable specification (ExecPlan), follow PLANS.md _to the letter_. If it is not in your context, refresh your memory by reading the entire PLANS.md file. Be thorough in reading (and re-reading) source material to produce an accurate specification. When creating a spec, start from the skeleton and flesh it out as you do your research.
 
-When implementing an executable specification (ExecPlan), do not prompt the user for "next steps"; simply proceed to the next milestone. Keep all sections up to date, add or split entries in the list at every stopping point to affirmatively state the progress made and next steps. Resolve ambiguities autonomously, and commit frequently. Do not request human confirmation until the ExecPlan Lifecycle defined below is complete. If you delegate parallelizable actions to sub agents, merge and document their outcomes in the same ExecPlan rather than creating separate plan lifecycles.
+When implementing an executable specification (ExecPlan), do not prompt the user for "next steps"; simply proceed to the next milestone. Keep all sections up to date, add or split entries in the list at every stopping point to affirmatively state the progress made and next steps. When a `Progress` action finishes, mark that action complete immediately before beginning the next action. Resolve ambiguities autonomously, and commit frequently. Do not request human confirmation until the ExecPlan Lifecycle defined below is complete. If you delegate parallelizable actions to sub agents, merge and document their outcomes in the same ExecPlan rather than creating separate plan lifecycles.
 
 When discussing an executable specification (ExecPlan), record decisions in a log in the spec for posterity; it should be unambiguously clear why any change to the specification was made. ExecPlans are living documents, and it should always be possible to restart from _only_ the ExecPlan and no other work.
 
@@ -202,10 +202,12 @@ Agents must strictly follow this lifecycle to create, execute, and complete an E
    * required metadata: `action_id`, `mode`, `depends_on`, `file_locks`, `verify_events`, `worker_type`,
    * `verify_events` values must be event IDs registered in `.agents/skills/execplan-event-index/references/event_skill_map.tsv`.
 4. Execute actions in dependency order. Delegate only `mode=parallel` actions to sub agents, and keep all status updates in the same ExecPlan.
+   * As soon as one action is completed, update that action's checkbox in `Progress` to `[x]` before starting the next action.
    * Any out-of-sandbox command execution during action work or verification must follow the `Sandbox escalation policy` in this document and the mandatory skill `.agents/skills/execplan-sandbox-escalation/SKILL.md`.
 5. After each action, run `scripts/execplan_gate.sh` for each mapped event in `verify_events`. The gate must block lifecycle progress when verification fails or remains unexecuted.
 6. Record every gate attempt in the plan's `Verification Ledger` section.
 7. On failure, run auto-fix and retry loops through the gate until pass, within policy bound (`3 tries`). If the bound is exceeded, record `escalated` and stop progress.
+   * If escalation or human operator intervention occurs, keep the same ExecPlan in `docs/plans/active/`, confirm unfinished `Progress` actions remain unchecked, and resume from the first unfinished action after intervention. Do not start a new ExecPlan for the same objective while the previous one is still active.
 8. After all actions and action-level verification events pass, finalize plan document state first:
    * update progress/outcomes/ledger sections,
    * move the plan to `docs/plans/completed/`,
@@ -247,6 +249,8 @@ Prefer additive code changes followed by subtractions that keep tests passing. P
     - [ ] action_id=a3; mode=parallel; depends_on=a1,a2; file_locks=src/lookup/mod.rs; verify_events=action.cpu_behavior; worker_type=worker; implement lookup cache rewrite.
 
     Use timestamps to measure rates of progress.
+
+    During execution, mark each action as `[x]` immediately when that action finishes, before starting the next action.
 
     Each `Progress` action must define execution metadata: `action_id`, `mode` (`serial` or `parallel`), `depends_on`, `file_locks`, `verify_events`, and `worker_type` when multiple sub-agent types exist.
 

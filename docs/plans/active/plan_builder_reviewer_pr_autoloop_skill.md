@@ -22,7 +22,8 @@ After this change, contributors can run one repository-local skill workflow that
 - [x] (2026-03-03 20:23Z) action_id=a2; mode=serial; depends_on=a1; file_locks=.agents/skills/execplan-event-action-pr-autoloop/SKILL.md,.agents/skills/execplan-event-action-pr-autoloop/agents/openai.yaml,.agents/skills/execplan-event-action-pr-autoloop/scripts/run_event.sh,.agents/skills/execplan-event-index/references/event_skill_map.tsv; verify_events=action.tooling; worker_type=default; added and registered `action.pr_autoloop` verification event skill.
 - [x] (2026-03-03 20:24Z) action_id=a3; mode=serial; depends_on=a2; file_locks=docs/design/pr_autoloop_builder_reviewer_contract.md,docs/design/index.md,docs/architecture/scope/automation_orchestration.md,docs/architecture/scope/index.md,docs/architecture/dependencies/native_and_toolchain.md,REVIEW.md; verify_events=action.docs_only; worker_type=default; updated long-lived design/architecture/review policy docs for builder/reviewer loop contracts.
 - [x] (2026-03-03 20:24Z) action_id=a4; mode=serial; depends_on=a3; file_locks=docs/plans/active/plan_builder_reviewer_pr_autoloop_skill.md; verify_events=action.pr_autoloop,action.tooling,action.docs_only; worker_type=default; executed script syntax/self tests and gated verification events, including docs-only retry until pass.
-- [ ] action_id=a5; mode=serial; depends_on=a4; file_locks=docs/plans/active/plan_builder_reviewer_pr_autoloop_skill.md,docs/plans/completed/plan_builder_reviewer_pr_autoloop_skill.md,docs/prs/active/pr_feat_pr-autoloop-skill.md,docs/prs/completed/pr_feat_pr-autoloop-skill.md; verify_events=execplan.post_completion; worker_type=default; finalize plan state and run post-completion gate.
+- [x] (2026-03-03 20:31Z) action_id=a4b; mode=serial; depends_on=a4; file_locks=docs/prs/active/pr_feat_pr-autoloop-skill.md,PLANS.md,docs/plans/active/plan_builder_reviewer_pr_autoloop_skill.md; verify_events=action.docs_only; worker_type=default; updated PR tracking metadata for created PR #63 and updated `PLANS.md` lifecycle rules for intervention-resume behavior and immediate progress checkbox updates.
+- [ ] action_id=a5; mode=serial; depends_on=a4b; file_locks=docs/plans/active/plan_builder_reviewer_pr_autoloop_skill.md,docs/plans/completed/plan_builder_reviewer_pr_autoloop_skill.md,docs/prs/active/pr_feat_pr-autoloop-skill.md,docs/prs/completed/pr_feat_pr-autoloop-skill.md; verify_events=execplan.post_completion; worker_type=default; finalize plan state and run post-completion gate.
 
 ## Verification Ledger
 
@@ -37,6 +38,7 @@ After this change, contributors can run one repository-local skill workflow that
 - attempt_record: event_id=action.pr_autoloop; attempt=2; status=pass; started_at=2026-03-03 20:24Z; finished_at=2026-03-03 20:24Z; commands=bash -n .agents/skills/pr-autoloop/scripts/doctor.sh bash -n .agents/skills/pr-autoloop/scripts/run_loop.sh .agents/skills/pr-autoloop/scripts/run_loop.sh --self-test rg -n AUTO_AGENT: BUILDER|AUTO_AGENT: REVIEWER|AUTO_REVIEW_STATUS|AUTO_TARGET_COMMIT .agents/skills/pr-autoloop/references/comment_contract.md rg -n -- --goal-file|--pr-url|--max-builder-failures|--max-iterations .agents/skills/pr-autoloop/scripts/run_loop.sh rg -n run_id|pr_url|consecutive_builder_failures|last_reviewer_status .agents/skills/pr-autoloop/references/state_schema.md; failure_summary=none; notify_reference=not_requested;
 - attempt_record: event_id=action.docs_only; attempt=4; status=escalated; started_at=2026-03-03 20:25Z; finished_at=2026-03-03 20:25Z; commands=gate retry bound pre-check; failure_summary=retry bound exceeded before execution (attempt=4); notify_reference=not_requested;
 - attempt_record: event_id=action.docs_only; attempt=3; status=pass; started_at=2026-03-03 20:25Z; finished_at=2026-03-03 20:25Z; commands=git diff --name-only --relative HEAD -- git ls-files --others --exclude-standard rg -n <placeholder-pattern> <changed-doc-targets>; failure_summary=none; notify_reference=not_requested;
+- attempt_record: event_id=action.docs_only; attempt=3; status=pass; started_at=2026-03-03 20:32Z; finished_at=2026-03-03 20:32Z; commands=git diff --name-only --relative HEAD -- git ls-files --others --exclude-standard rg -n <placeholder-pattern> <changed-doc-targets>; failure_summary=none; notify_reference=not_requested;
 <!-- verification-ledger:end -->
 
 ## Surprises & Discoveries
@@ -49,6 +51,9 @@ After this change, contributors can run one repository-local skill workflow that
 
 - Observation: An unnecessary extra docs-only gate invocation exceeded retry bound and produced an `escalated` entry even though a prior pass already existed.
   Evidence: `action.docs_only` attempt 4 recorded `status=escalated`; a corrective rerun with `--attempt 3` restored latest status to `pass`.
+
+- Observation: GitHub API connectivity recovered temporarily after an earlier outage, allowing `git push` and PR creation.
+  Evidence: `git push origin feat/pr-autoloop-skill` succeeded and `gh pr create --draft --fill` returned `https://github.com/MachinaIO/mxx/pull/63`.
 
 ## Decision Log
 
@@ -68,6 +73,10 @@ After this change, contributors can run one repository-local skill workflow that
   Rationale: Preserves audit history of the operator error while re-establishing a latest-pass status required by gate prerequisites.
   Date/Author: 2026-03-03 / Codex
 
+- Decision: Update `PLANS.md` lifecycle text to require immediate progress checkbox updates and explicit resume-from-active-plan behavior after operator intervention.
+  Rationale: Prevents state drift during long-running lifecycles and makes post-intervention recovery deterministic.
+  Date/Author: 2026-03-03 / Codex
+
 ## Outcomes & Retrospective
 
 Completed so far:
@@ -76,6 +85,7 @@ Completed so far:
 - Added and registered `action.pr_autoloop` verification event.
 - Updated long-lived design and architecture artifacts plus reviewer contract policy.
 - Ran gate-verified checks with final `pass` for `action.tooling`, `action.pr_autoloop`, and `action.docs_only`.
+- Updated PR tracking metadata to the real PR (`#63`) and applied requested lifecycle-policy improvements in `PLANS.md`.
 
 Remaining:
 
@@ -181,3 +191,4 @@ No Rust/CUDA interfaces change.
 Revision note (2026-03-03, Codex): Rewrote the plan to align with integrated event-skill verification lifecycle in current `PLANS.md`, including action metadata and `Verification Ledger` requirements.
 Revision note (2026-03-03, Codex): Updated progress, discoveries, and outcomes after implementing skill/event/docs changes and resolving docs-only verification false positives.
 Revision note (2026-03-03, Codex): Recorded docs-only retry-bound escalation incident and corrective gate rerun to keep latest status auditable and pass-aligned.
+Revision note (2026-03-03, Codex): Added PR #63 metadata sync and lifecycle policy follow-up in `PLANS.md` per operator request.

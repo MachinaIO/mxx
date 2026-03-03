@@ -28,9 +28,10 @@ After this change, AGR16 tests will include a complete binary-tree multiplicatio
   - `cargo test -r --lib agr16`
   - `cargo test -r --lib`
   - `cargo bench --bench bench_agr16_complete_binary_tree_depth_env_probe --no-run`
-- [x] (2026-03-03 01:08Z) Posted reviewer follow-up response comment: `https://github.com/MachinaIO/mxx/pull/60#issuecomment-3987936514`.
+- [x] (2026-03-03 01:08Z) Posted reviewer follow-up response comment for the binary-tree test request: `https://github.com/MachinaIO/mxx/pull/60#issuecomment-3987936514`.
+- [x] (2026-03-03 01:30Z) Posted reviewer follow-up response comment for the benchmark request: `https://github.com/MachinaIO/mxx/pull/60#issuecomment-3988450391`.
 - [x] (2026-03-03 01:08Z) Ran post-completion readiness action `gh pr ready 60` (already ready) and moved plan/PR tracking docs to completed.
-- [ ] Persist final post-completion state via commit and push.
+- [x] (2026-03-03 01:29Z) Persisted final post-completion state with commit `dadb643` and push `feat/agr16_encoding -> origin/feat/agr16_encoding`.
 
 Main-ExecPlan validation mapping (PLANS.md lifecycle step 3):
 - Action `add binary-tree multiplication topology test` -> run `cargo test -r --lib agr16`.
@@ -50,7 +51,7 @@ Main-ExecPlan validation mapping (PLANS.md lifecycle step 3):
 
 ## Outcomes & Retrospective
 
-Implementation and validation are complete. Remaining work is final persistence commit/push for this benchmark-extension follow-up.
+Completed. AGR16 now has both the env-probe complete binary-tree test and the corresponding benchmark target with requested parameter set, and lifecycle evidence is persisted in commit `dadb643`.
 
 ## Design/Architecture/Verification Document Summary
 
@@ -119,3 +120,4 @@ Expected touched files:
 No public interface changes expected.
 
 Revision note (2026-03-03 01:25Z): Reopened this completed plan as a continuation follow-up to add the requested benchmark mirror, updated verification evidence, and marked final persistence as pending again.
+Revision note (2026-03-03 01:30Z): Recorded benchmark-request PR response link and final commit/push evidence, then marked lifecycle fully completed.

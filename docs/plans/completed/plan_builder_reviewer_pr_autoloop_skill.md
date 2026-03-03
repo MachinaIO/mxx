@@ -30,7 +30,7 @@ After this change, contributors can run one repository-local skill workflow that
 - [x] (2026-03-03 21:12Z) action_id=a4g; mode=serial; depends_on=a4f; file_locks=.agents/skills/pr-autoloop/SKILL.md,.agents/skills/pr-autoloop/scripts/run_loop.sh,.agents/skills/pr-autoloop/references/comment_contract.md,.agents/skills/execplan-sandbox-escalation/SKILL.md,.agents/skills/execplan-sandbox-escalation/references/allowed_command_prefixes.md,REVIEW.md,docs/design/pr_autoloop_builder_reviewer_contract.md,docs/architecture/scope/automation_orchestration.md,docs/plans/active/plan_builder_reviewer_pr_autoloop_skill.md; verify_events=action.pr_autoloop,action.tooling; worker_type=default; enforced out-of-sandbox `gh` execution in skills and required reviewer to post loop comments without waiting for running CI.
 - [x] (2026-03-03 21:42Z) action_id=a4h; mode=serial; depends_on=a4g; file_locks=PLANS.md,.agents/skills/execplan-event-pre-creation/SKILL.md,.agents/skills/execplan-event-pre-creation/scripts/run_event.sh,.agents/skills/execplan-event-post-completion/SKILL.md,.agents/skills/execplan-event-post-completion/scripts/run_event.sh,.agents/skills/pr-autoloop/SKILL.md,.agents/skills/pr-autoloop/scripts/reviewer_daemon.sh,.agents/skills/pr-autoloop/references/comment_contract.md,.agents/skills/pr-autoloop/references/state_schema.md,.agents/skills/execplan-event-action-pr-autoloop/scripts/run_event.sh,REVIEW.md,docs/design/pr_autoloop_builder_reviewer_contract.md,docs/architecture/scope/automation_orchestration.md,docs/plans/active/plan_builder_reviewer_pr_autoloop_skill.md; verify_events=action.pr_autoloop,action.tooling; worker_type=default; removed lifecycle-level reviewer-loop clauses and implemented reviewer-daemon handshake via pre/post lifecycle event scripts with `APPROVE` token gating.
 - [x] (2026-03-04 01:13Z) action_id=a4i; mode=serial; depends_on=a4h; file_locks=PLANS.md,.agents/skills/execplan-sandbox-escalation/SKILL.md,.agents/skills/execplan-sandbox-escalation/references/allowed_command_prefixes.md,.agents/skills/execplan-event-pre-creation/SKILL.md,.agents/skills/execplan-event-post-completion/SKILL.md,docs/plans/active/plan_builder_reviewer_pr_autoloop_skill.md; verify_events=action.tooling; worker_type=default; made lifecycle gate execution (`execplan.pre_creation`/`execplan.post_completion`) explicitly out-of-sandbox mandatory and added allowlist prefixes for automatic approval workflows.
-- [ ] action_id=a5; mode=serial; depends_on=a4i; file_locks=docs/plans/active/plan_builder_reviewer_pr_autoloop_skill.md,docs/plans/completed/plan_builder_reviewer_pr_autoloop_skill.md,docs/prs/active/pr_feat_pr-autoloop-skill.md,docs/prs/completed/pr_feat_pr-autoloop-skill.md; verify_events=execplan.post_completion; worker_type=default; finalize plan state and run post-completion gate.
+- [ ] action_id=a5; mode=serial; depends_on=a4i; file_locks=docs/plans/active/plan_builder_reviewer_pr_autoloop_skill.md,docs/plans/completed/plan_builder_reviewer_pr_autoloop_skill.md,docs/prs/active/pr_feat_pr-autoloop-skill.md,docs/prs/completed/pr_feat_pr-autoloop-skill.md; verify_events=action.tooling; worker_type=default; finalize plan state and run post-completion gate.
 
 ## Verification Ledger
 
@@ -65,6 +65,9 @@ After this change, contributors can run one repository-local skill workflow that
 - attempt_record: event_id=action.tooling; attempt=3; status=pass; started_at=2026-03-03 21:45Z; finished_at=2026-03-03 21:45Z; commands=bash -n scripts/*.sh .agents/skills/execplan-event-*/scripts/*.sh; failure_summary=none; notify_reference=not_requested;
 - attempt_record: event_id=action.pr_autoloop; attempt=3; status=pass; started_at=2026-03-03 21:45Z; finished_at=2026-03-03 21:45Z; commands=bash -n .agents/skills/pr-autoloop/scripts/doctor.sh bash -n .agents/skills/pr-autoloop/scripts/reviewer_daemon.sh bash -n .agents/skills/pr-autoloop/scripts/run_loop.sh .agents/skills/pr-autoloop/scripts/run_loop.sh --self-test rg -n AUTO_AGENT: BUILDER|AUTO_AGENT: REVIEWER|AUTO_REQUEST_ID|AUTO_REVIEW_STATUS|AUTO_TARGET_COMMIT|APPROVE .agents/skills/pr-autoloop/references/comment_contract.md rg -n -- --goal-file|--pr-url|--head-branch|--base-branch|--max-builder-failures|--max-iterations .agents/skills/pr-autoloop/scripts/run_loop.sh rg -n run_id|pr_url|base_branch|lock_key|consecutive_builder_failures|last_reviewer_status|reviewer-daemon|responses .agents/skills/pr-autoloop/references/state_schema.md; failure_summary=none; notify_reference=not_requested;
 - attempt_record: event_id=action.tooling; attempt=3; status=pass; started_at=2026-03-03 21:50Z; finished_at=2026-03-03 21:50Z; commands=bash -n scripts/*.sh .agents/skills/execplan-event-*/scripts/*.sh; failure_summary=none; notify_reference=not_requested;
+- attempt_record: event_id=execplan.post_completion; attempt=1; status=fail; started_at=2026-03-03 21:58Z; finished_at=2026-03-03 21:58Z; commands=gate prerequisite: required verify_events pass coverage scan; failure_summary=missing pass entries for required verify_events: execplan.post_completion; notify_reference=not_requested;
+- attempt_record: event_id=execplan.post_completion; attempt=2; status=fail; started_at=2026-03-03 21:59Z; finished_at=2026-03-03 21:59Z; commands=gate prerequisite: required verify_events pass coverage scan; failure_summary=missing pass entries for required verify_events: execplan.post_completion` on final action creates a circular prerequisite because the gate requires all action verify-events to have a prior `pass` before executing `execplan.post_completion`.; notify_reference=not_requested;
+- attempt_record: event_id=execplan.post_completion; attempt=2; status=fail; started_at=2026-03-03 22:00Z; finished_at=2026-03-03 22:01Z; commands=rg -n docs/prs/active/|docs/prs/completed/ <plan> open docs/prs/active/pr_feat_pr-autoloop-skill.md .agents/skills/pr-autoloop/scripts/reviewer_daemon.sh --request --pr-url https://github.com/MachinaIO/mxx/pull/63 --commit b34bac6478ed03d5914376f3d363d06897f5387e --run-id execplan-post-completion --iteration 0 --request-id post-completion-20260303T220030Z-2837389 rollback plan docs/plans/completed/plan_builder_reviewer_pr_autoloop_skill.md -> docs/plans/active/plan_builder_reviewer_pr_autoloop_skill.md; failure_summary=reviewer daemon response missing comment URL: reviewer comment not found for AUTO_REQUEST_ID; notify_reference=not_requested;
 <!-- verification-ledger:end -->
 
 ## Surprises & Discoveries
@@ -86,6 +89,9 @@ After this change, contributors can run one repository-local skill workflow that
 
 - Observation: Autonomous reviewer flow can stall on long-running or queued CI unless comment timing explicitly allows non-blocking output.
   Evidence: PR #63 `run` check remained pending for extended polling while reviewer-loop progression required a comment decision.
+
+- Observation: Setting the final action verify event to `execplan.post_completion` creates a circular prerequisite because the gate requires all action verify-events to have a prior `pass` before executing `execplan.post_completion`.
+  Evidence: gate attempt recorded `failure_summary=missing pass entries for required verify_events: execplan.post_completion`.
 
 ## Decision Log
 
@@ -127,6 +133,10 @@ After this change, contributors can run one repository-local skill workflow that
 
 - Decision: Treat lifecycle gate commands for `execplan.pre_creation` and `execplan.post_completion` as mandatory out-of-sandbox operations and pre-approve narrow gate-command prefixes.
   Rationale: These events transitively require reviewer-daemon and GitHub API access; forcing out-of-sandbox avoids deadlock/pending states caused by sandbox network/auth limits.
+  Date/Author: 2026-03-04 / Codex
+
+- Decision: Keep action-level `verify_events` for `a5` on non-lifecycle events only (`action.tooling`) and run `execplan.post_completion` exclusively as the lifecycle gate step.
+  Rationale: Prevents circular gate prerequisites while preserving lifecycle ordering required by `PLANS.md`.
   Date/Author: 2026-03-04 / Codex
 
 ## Outcomes & Retrospective
@@ -261,3 +271,8 @@ Revision note (2026-03-03, Codex): Added out-of-sandbox `gh` execution guidance 
 Revision note (2026-03-03, Codex): Reworked reviewer synchronization to daemon IPC in pre/post lifecycle event scripts and restored `PLANS.md` lifecycle to event-script-owned reviewer behavior.
 Revision note (2026-03-03, Codex): Adjusted reviewer daemon request mode to wait indefinitely for response by default, aligned with post-completion wait contract.
 Revision note (2026-03-04, Codex): Made pre/post lifecycle gate execution explicitly out-of-sandbox and updated sandbox allowlist guidance with gate-command prefixes.
+Revision note (2026-03-04, Codex): Fixed final action verification metadata to avoid circular prerequisite with `execplan.post_completion` gate.
+
+## Post-Completion Blockers
+
+- remaining blockers not provided

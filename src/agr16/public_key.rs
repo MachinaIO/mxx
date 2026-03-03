@@ -1,6 +1,9 @@
-use crate::{matrix::PolyMatrix, poly::Poly};
+use crate::{matrix::PolyMatrix, poly::Poly, utils::block_size};
 use rayon::prelude::*;
-use std::ops::{Add, Mul, Sub};
+use std::{
+    ops::{Add, Mul, Sub},
+    path::{Path, PathBuf},
+};
 
 /// AGR16 public-key label for one encoding wire.
 ///
@@ -38,17 +41,23 @@ impl<M: PolyMatrix> Agr16PublicKey<M> {
         ncol: usize,
         dir_path: P,
         id: &str,
+        recursive_depth: usize,
         reveal_plaintext: bool,
     ) -> Self {
+        assert!(recursive_depth > 0, "AGR16 read_from_files requires recursive_depth > 0");
         let matrix = M::read_from_files(params, nrow, ncol, &dir_path, &format!("{id}_matrix"));
-        let c_times_s_pubkeys = vec![
-            M::read_from_files(params, nrow, ncol, &dir_path, &format!("{id}_cts_pk")),
-            M::read_from_files(params, nrow, ncol, &dir_path, &format!("{id}_ctss_pk")),
-        ];
-        let s_power_pubkeys = vec![
-            M::read_from_files(params, nrow, ncol, &dir_path, &format!("{id}_s2_pk")),
-            M::read_from_files(params, nrow, ncol, &dir_path, &format!("{id}_s2s_pk")),
-        ];
+        let c_times_s_pubkeys = (0..recursive_depth)
+            .map(|level| {
+                let level_id = Self::resolve_c_times_s_level_id(&dir_path, id, level, nrow, ncol);
+                M::read_from_files(params, nrow, ncol, &dir_path, &level_id)
+            })
+            .collect();
+        let s_power_pubkeys = (0..recursive_depth)
+            .map(|level| {
+                let level_id = Self::resolve_s_power_level_id(&dir_path, id, level, nrow, ncol);
+                M::read_from_files(params, nrow, ncol, &dir_path, &level_id)
+            })
+            .collect();
         Self { matrix, c_times_s_pubkeys, s_power_pubkeys, reveal_plaintext }
     }
 
@@ -64,6 +73,86 @@ impl<M: PolyMatrix> Agr16PublicKey<M> {
             .map(|idx| lhs[idx].clone() * &rhs[level - idx])
             .reduce(|acc, value| acc + &value)
             .expect("AGR16 convolution requires at least one term")
+    }
+
+    fn block_file_path<P: AsRef<Path>>(
+        dir_path: P,
+        id: &str,
+        block_size: usize,
+        nrow: usize,
+        ncol: usize,
+    ) -> PathBuf {
+        let row_end = nrow.min(block_size.max(1));
+        let col_end = ncol.min(block_size.max(1));
+        let mut path = dir_path.as_ref().to_path_buf();
+        path.push(format!("{}_{}_{}.{}_{}.{}.matrix", id, block_size, 0, row_end, 0, col_end));
+        path
+    }
+
+    fn matrix_id_exists<P: AsRef<Path>>(dir_path: P, id: &str, nrow: usize, ncol: usize) -> bool {
+        let default_bsize = block_size();
+        if Self::block_file_path(&dir_path, id, default_bsize, nrow, ncol).exists() {
+            return true;
+        }
+        let compact_bsize = default_bsize.min(nrow.max(1)).min(ncol.max(1));
+        if compact_bsize != default_bsize {
+            return Self::block_file_path(dir_path, id, compact_bsize, nrow, ncol).exists();
+        }
+        false
+    }
+
+    fn resolve_c_times_s_level_id<P: AsRef<Path>>(
+        dir_path: P,
+        id: &str,
+        level: usize,
+        nrow: usize,
+        ncol: usize,
+    ) -> String {
+        let recursive_id = format!("{id}_cts_pk_{level}");
+        if Self::matrix_id_exists(&dir_path, &recursive_id, nrow, ncol) {
+            return recursive_id;
+        }
+        let legacy_id = match level {
+            0 => Some(format!("{id}_cts_pk")),
+            1 => Some(format!("{id}_ctss_pk")),
+            _ => None,
+        };
+        if let Some(legacy_id) = legacy_id {
+            if Self::matrix_id_exists(&dir_path, &legacy_id, nrow, ncol) {
+                return legacy_id;
+            }
+        }
+        panic!(
+            "AGR16 missing c_times_s public-key file for level {} (expected ids: {} or legacy)",
+            level, recursive_id
+        );
+    }
+
+    fn resolve_s_power_level_id<P: AsRef<Path>>(
+        dir_path: P,
+        id: &str,
+        level: usize,
+        nrow: usize,
+        ncol: usize,
+    ) -> String {
+        let recursive_id = format!("{id}_s_power_pk_{level}");
+        if Self::matrix_id_exists(&dir_path, &recursive_id, nrow, ncol) {
+            return recursive_id;
+        }
+        let legacy_id = match level {
+            0 => Some(format!("{id}_s2_pk")),
+            1 => Some(format!("{id}_s2s_pk")),
+            _ => None,
+        };
+        if let Some(legacy_id) = legacy_id {
+            if Self::matrix_id_exists(&dir_path, &legacy_id, nrow, ncol) {
+                return legacy_id;
+            }
+        }
+        panic!(
+            "AGR16 missing s-power public-key file for level {} (expected ids: {} or legacy)",
+            level, recursive_id
+        );
     }
 }
 

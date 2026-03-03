@@ -18,9 +18,10 @@ mod tests {
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
         sampler::{hash::DCRTPolyHashSampler, uniform::DCRTPolyUniformSampler},
-        utils::{create_random_poly, create_ternary_random_poly},
+        utils::{block_size, create_random_poly, create_ternary_random_poly},
     };
     use keccak_asm::Keccak256;
+    use std::path::{Path, PathBuf};
 
     const AUXILIARY_DEPTH: usize = 8;
 
@@ -90,6 +91,35 @@ mod tests {
 
     fn scalar_matrix(params: &DCRTPolyParams, value: DCRTPoly) -> DCRTPolyMatrix {
         DCRTPolyMatrix::from_poly_vec_row(params, vec![value])
+    }
+
+    fn create_temp_test_dir(name: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("mxx_{name}_{}_{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).expect("Failed to create temporary test directory");
+        dir
+    }
+
+    fn write_matrix_file(dir_path: &Path, id: &str, matrix: &DCRTPolyMatrix) {
+        let (nrow, ncol) = matrix.size();
+        let default_bsize = block_size();
+        let compact_bsize = default_bsize.min(nrow.max(1)).min(ncol.max(1));
+        let entries = matrix.block_entries(0..nrow, 0..ncol);
+        let entries_bytes: Vec<Vec<Vec<u8>>> = entries
+            .iter()
+            .map(|row| row.iter().map(|poly| poly.to_compact_bytes()).collect())
+            .collect();
+        let bytes = bincode::encode_to_vec(&entries_bytes, bincode::config::standard())
+            .expect("Failed to encode matrix bytes");
+        let mut path = dir_path.to_path_buf();
+        path.push(format!("{}_{}_{}.{}_{}.{}.matrix", id, default_bsize, 0, nrow, 0, ncol));
+        std::fs::write(&path, &bytes).expect("Failed to write matrix file");
+        if compact_bsize != default_bsize {
+            let mut compact_path = dir_path.to_path_buf();
+            compact_path
+                .push(format!("{}_{}_{}.{}_{}.{}.matrix", id, compact_bsize, 0, nrow, 0, ncol));
+            std::fs::write(compact_path, bytes).expect("Failed to write compact matrix file");
+        }
     }
 
     fn assert_primary_auxiliary_invariants(
@@ -373,6 +403,73 @@ mod tests {
             expected_plain,
             "Depth-4 AGR16 composed output must satisfy Equation 5.1 when error=0",
         );
+    }
+
+    #[test]
+    fn test_agr16_pubkey_read_from_files_supports_recursive_depth() {
+        let params = DCRTPolyParams::default();
+        let dir = create_temp_test_dir("agr16_recursive_read");
+        let id = "pk_recursive";
+        let nrow = 1;
+        let ncol = 1;
+        let recursive_depth = 4;
+
+        let matrix = scalar_matrix(&params, create_random_poly(&params));
+        write_matrix_file(&dir, &format!("{id}_matrix"), &matrix);
+
+        let c_times_s_pubkeys: Vec<DCRTPolyMatrix> = (0..recursive_depth)
+            .map(|level| {
+                let level_matrix = scalar_matrix(&params, create_random_poly(&params));
+                write_matrix_file(&dir, &format!("{id}_cts_pk_{level}"), &level_matrix);
+                level_matrix
+            })
+            .collect();
+        let s_power_pubkeys: Vec<DCRTPolyMatrix> = (0..recursive_depth)
+            .map(|level| {
+                let level_matrix = scalar_matrix(&params, create_random_poly(&params));
+                write_matrix_file(&dir, &format!("{id}_s_power_pk_{level}"), &level_matrix);
+                level_matrix
+            })
+            .collect();
+
+        let loaded = Agr16PublicKey::<DCRTPolyMatrix>::read_from_files(
+            &params, nrow, ncol, &dir, id, 4, true,
+        );
+        let expected = Agr16PublicKey::new(matrix, c_times_s_pubkeys, s_power_pubkeys, true);
+        assert_eq!(loaded, expected);
+
+        std::fs::remove_dir_all(&dir).expect("Failed to cleanup temporary test directory");
+    }
+
+    #[test]
+    fn test_agr16_pubkey_read_from_files_supports_legacy_two_level_names() {
+        let params = DCRTPolyParams::default();
+        let dir = create_temp_test_dir("agr16_legacy_read");
+        let id = "pk_legacy";
+        let nrow = 1;
+        let ncol = 1;
+
+        let matrix = scalar_matrix(&params, create_random_poly(&params));
+        write_matrix_file(&dir, &format!("{id}_matrix"), &matrix);
+
+        let cts_pk = scalar_matrix(&params, create_random_poly(&params));
+        let ctss_pk = scalar_matrix(&params, create_random_poly(&params));
+        write_matrix_file(&dir, &format!("{id}_cts_pk"), &cts_pk);
+        write_matrix_file(&dir, &format!("{id}_ctss_pk"), &ctss_pk);
+
+        let s2_pk = scalar_matrix(&params, create_random_poly(&params));
+        let s2s_pk = scalar_matrix(&params, create_random_poly(&params));
+        write_matrix_file(&dir, &format!("{id}_s2_pk"), &s2_pk);
+        write_matrix_file(&dir, &format!("{id}_s2s_pk"), &s2s_pk);
+
+        let loaded = Agr16PublicKey::<DCRTPolyMatrix>::read_from_files(
+            &params, nrow, ncol, &dir, id, 2, false,
+        );
+        let expected =
+            Agr16PublicKey::new(matrix, vec![cts_pk, ctss_pk], vec![s2_pk, s2s_pk], false);
+        assert_eq!(loaded, expected);
+
+        std::fs::remove_dir_all(&dir).expect("Failed to cleanup temporary test directory");
     }
 
     #[test]

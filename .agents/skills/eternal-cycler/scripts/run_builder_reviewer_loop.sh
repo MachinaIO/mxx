@@ -286,13 +286,15 @@ post_builder_failure_comment_after_push() {
   local stage="$1"
   local plan_doc_filename="$2"
   local failure_reason="$3"
+  local pr_title="${4:-}"
+  local pr_body="${5:-}"
   local normalized_target_pr_url comment_body
 
   auto_stage_commit_and_push "loop: checkpoint builder failure report"
   push_target_branch
 
   if [[ -z "$PR_URL" ]]; then
-    PR_URL="$(resolve_or_create_pr_for_branch "$TARGET_BRANCH")"
+    PR_URL="$(resolve_or_create_pr_for_branch "$TARGET_BRANCH" "$pr_title" "$pr_body")"
     [[ -n "$PR_URL" ]] || die "failed to resolve/create PR for branch: $TARGET_BRANCH"
   fi
 
@@ -310,17 +312,19 @@ failure_reason: ${failure_reason}"
 handle_builder_payload_result() {
   local stage="$1"
   local payload_json="$2"
-  local result plan_doc_filename failure_reason
+  local result plan_doc_filename failure_reason pr_title pr_body
 
   result="$(jq -r '.result' <<< "$payload_json")"
   plan_doc_filename="$(jq -r '.plan_doc_filename' <<< "$payload_json")"
   failure_reason="$(jq -r '.failure_reason' <<< "$payload_json")"
+  pr_title="$(jq -r '.pr_title' <<< "$payload_json")"
+  pr_body="$(jq -r '.pr_body' <<< "$payload_json")"
 
   if [[ "$result" == "success" ]]; then
     return 0
   fi
 
-  post_builder_failure_comment_after_push "$stage" "$plan_doc_filename" "$failure_reason"
+  post_builder_failure_comment_after_push "$stage" "$plan_doc_filename" "$failure_reason" "$pr_title" "$pr_body"
   die "builder reported failed_after_3_retries at stage=${stage}; reason=${failure_reason}; plan_doc_filename=${plan_doc_filename}"
 }
 
@@ -480,9 +484,16 @@ EOF
 
 resolve_or_create_pr_for_branch() {
   local branch="$1"
-  local pr_title="$2"
-  local pr_body="$3"
+  local pr_title="${2:-}"
+  local pr_body="${3:-}"
   local open_json open_url create_out
+
+  if [[ -z "${pr_title//[[:space:]]/}" ]]; then
+    pr_title="chore: create PR for ${branch}"
+  fi
+  if [[ -z "${pr_body//[[:space:]]/}" ]]; then
+    pr_body="Automated branch-first PR creation while reporting a builder failure."
+  fi
 
   open_json="$(gh pr list --state open --head "$branch" --json url,updatedAt --limit 20 2>/dev/null || true)"
   open_url="$(jq -r '[.[]] | sort_by(.updatedAt) | reverse | .[0].url // empty' <<< "$open_json")"

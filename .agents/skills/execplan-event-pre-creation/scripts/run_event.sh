@@ -126,36 +126,6 @@ tracking_path="${EXECPLAN_PR_TRACKING_PATH:-docs/prs/active/pr_${branch_after//\
 commands+=("mkdir -p $(dirname "$tracking_path")")
 mkdir -p "$(dirname "$tracking_path")"
 
-if [[ "$new_branch_created" -eq 1 && "$gh_available" -eq 1 ]]; then
-  commands+=("gh pr create --draft --fill")
-  set +e
-  gh pr create --draft --fill >/dev/null 2>&1
-  create_rc=$?
-  set -e
-  if [[ "$create_rc" -ne 0 ]]; then
-    # If PR already exists, continue; otherwise fail because this event requires PR setup for a new branch.
-    set +e
-    gh pr view --json number,url >/dev/null 2>&1
-    view_rc=$?
-    set -e
-    if [[ "$view_rc" -ne 0 ]]; then
-      echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-      echo "FAILURE_SUMMARY=failed to create draft PR for new branch and no existing PR was found"
-      echo "STATUS=fail"
-      exit 1
-    fi
-  fi
-fi
-
-if [[ "$new_branch_created" -eq 1 && "$gh_available" -eq 0 ]]; then
-  if [[ -z "${EXECPLAN_MANUAL_PR_URL:-}" ]]; then
-    echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-    echo "FAILURE_SUMMARY=gh unavailable for new branch; create draft PR manually and provide EXECPLAN_MANUAL_PR_URL"
-    echo "STATUS=fail"
-    exit 1
-  fi
-fi
-
 creation_date="$(date -u +"%Y-%m-%d %H:%MZ")"
 creation_commit="$(git rev-parse HEAD)"
 pr_url="${EXECPLAN_MANUAL_PR_URL:-"(not available locally)"}"

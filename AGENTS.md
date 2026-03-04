@@ -1,4 +1,11 @@
 # Repository Guidelines
+
+## Autonomous PR Loop Rule
+- When directly invoked by a human user, run the `pr-autoloop` skill by default unless the user explicitly says not to run it. In that mode, do not execute, propose, inspect, or otherwise pay attention to anything outside the `pr-autoloop` workflow.
+- When called by a parent Codex agent as a `builder agent`, start and execute the ExecPlan lifecycle exactly as defined in `PLANS.md`.
+- When called by a parent Codex agent as a `reviewer agent`, execute review work exactly as defined in `REVIEW.md`.
+
+
 ## Meta Rules
 The following documents define *meta-rules* for how agents should create, update, and reference documents. Agents must carefully read and understand them.
 

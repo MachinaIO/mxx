@@ -28,11 +28,10 @@ Interface contract:
   - if resume is selected, caller switches to the selected doc's branch before invoking the loop and uses `PR link` for `--pr-url` when present,
   - if selected doc lacks `PR link`, caller still runs on the switched branch without `--pr-url`,
   - if new PR flow is selected (or no active doc exists), caller creates/switches to a task-derived new branch before invoking the loop.
-- Reviewer comment contract fields:
-  - `AUTO_AGENT: REVIEWER`
-  - `AUTO_REVIEW_STATUS: APPROVED|CHANGES_REQUIRED`
-  - `AUTO_TARGET_COMMIT: <sha>`
-  - `APPROVE` token only for approved output
+- Reviewer autonomous-loop output fields:
+  - `pr_url` (string)
+  - `comment_body` (string)
+  - `approve_merge` (boolean)
 
 Implementation details:
 
@@ -41,8 +40,9 @@ Implementation details:
 - PR routing supports two modes:
   - explicit `--pr-url` (head branch must match current local branch),
   - branch-first on current local branch (reuse existing open PR or create new PR).
-- Comment retrieval uses `gh api graphql` over both issue comments and review bodies.
-- Approval requires `APPROVE` token plus `AUTO_TARGET_COMMIT` equality with current loop target commit.
+- Reviewer output is generated with `codex exec --output-schema` and captured with `--output-last-message`.
+- Reviewer output is parsed as JSON, schema-validated (`pr_url`, `comment_body`, `approve_merge`), then posted by loop script with `gh pr comment`.
+- Approval requires `approve_merge: true` in validated reviewer JSON output.
 - On approval, the loop script updates/moves PR tracking docs (`docs/prs/active` -> `docs/prs/completed`) and records completed tracking metadata including `review state: OPEN`.
 - The loop script performs mechanical git finalization for builder output: stage tracked edits, stage non-baseline untracked files, commit when needed, then push to origin.
 - Lifecycle events no longer run reviewer orchestration.

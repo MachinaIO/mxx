@@ -1,11 +1,11 @@
 ---
 name: pr-autoloop
-description: Run the fixed builder/reviewer loop and handle resume-vs-new PR selection before invoking the non-interactive loop script.
+description: When directly invoked by a human user, run this skill by default unless the user explicitly says not to.
 ---
 
 # Skill: pr-autoloop
 
-Use this skill when the user asks to start or continue the autonomous builder/reviewer loop.
+When directly invoked by a human user, run this skill by default unless the user explicitly says not to run it.
 
 ## Runtime scripts
 

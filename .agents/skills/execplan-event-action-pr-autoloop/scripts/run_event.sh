@@ -72,11 +72,10 @@ commands=()
 commands+=("bash -n $DOCTOR")
 commands+=("bash -n $LOOP")
 commands+=("rg -n -- --task|--task-file|--pr-url|--max-iterations|--max-builder-cleanup-retries|--max-reviewer-failures|--model-builder|--model-reviewer $LOOP")
-commands+=("rg -n AUTO_AGENT: REVIEWER|AUTO_REVIEW_STATUS|AUTO_TARGET_COMMIT|APPROVE $LOOP")
-commands+=("rg -n fromdateiso8601|%ct $LOOP")
-commands+=("rg -n gh\\ api\\ graphql $LOOP")
-commands+=("rg -F -n comments(first:100 $LOOP")
-commands+=("rg -F -n reviews(first:100 $LOOP")
+commands+=("rg -n pr_url|comment_body|approve_merge $LOOP")
+commands+=("rg -n write_reviewer_output_schema|parse_reviewer_payload_json|run_codex_prompt_capture|post_pr_comment $LOOP")
+commands+=("rg -n -- --output-schema|--output-last-message $LOOP")
+commands+=("rg -n gh\\ pr\\ comment $LOOP")
 commands+=("rg -n resolve_current_branch|headRefName|must match current local branch $LOOP")
 commands+=("rg -n pr_state|pr_merged_at|state,mergedAt|OPEN and unmerged $LOOP")
 commands+=("rg -n gh\\ auth\\ status|codex\\ login\\ status $DOCTOR")
@@ -134,14 +133,21 @@ if ! rg -Fq "if ! printf '%s\\n' \"\$prompt_text\" | \"\${cmd[@]}\"; then" "$LOO
   exit 1
 fi
 
-for marker in "fromdateiso8601" "%ct" "AUTO_AGENT: REVIEWER" "AUTO_REVIEW_STATUS" "AUTO_TARGET_COMMIT" "APPROVE" "gh api graphql" "comments(first:100" "reviews(first:100"; do
-  if ! rg -Fq "$marker" "$LOOP"; then
+for marker in "pr_url" "comment_body" "approve_merge" "write_reviewer_output_schema" "parse_reviewer_payload_json" "run_codex_prompt_capture" "--output-schema" "--output-last-message" "post_pr_comment" "gh pr comment"; do
+  if ! rg -Fq -- "$marker" "$LOOP"; then
     echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
     echo "FAILURE_SUMMARY=loop script missing required marker: $marker"
     echo "STATUS=fail"
     exit 1
   fi
 done
+
+if rg -q "AUTO_REVIEW_STATUS|AUTO_TARGET_COMMIT|APPROVE|gh api graphql|comments\\(first:100|reviews\\(first:100|fromdateiso8601" "$LOOP"; then
+  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+  echo "FAILURE_SUMMARY=loop script still contains legacy reviewer comment scraping or tag/token contract markers"
+  echo "STATUS=fail"
+  exit 1
+fi
 
 for marker in "resolve_current_branch" "headRefName" "must match current local branch"; do
   if ! rg -Fq "$marker" "$LOOP"; then

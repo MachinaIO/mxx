@@ -27,7 +27,7 @@ Current registered design documents:
     1. Target behavior/properties with assumptions and limits.
     2. Core technical idea and trade-off rationale for enforcement vs. advisory docs.
 - [pr_autoloop_builder_reviewer_contract.md](./pr_autoloop_builder_reviewer_contract.md)
-  - Purpose: Defines the long-lived autonomous PR iteration contract for builder/reviewer roles, machine-readable comment tags, and deterministic stop conditions.
+  - Purpose: Defines the long-lived autonomous PR iteration contract for builder/reviewer roles, reviewer JSON structured output, and deterministic stop conditions.
   - Roles:
     1. Target behavior/properties with assumptions and limits.
     2. Core technical idea and trade-off rationale for strict contract parsing under shared-account operation.

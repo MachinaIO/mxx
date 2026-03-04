@@ -52,30 +52,30 @@ resolve_current_branch() {
   printf '%s\n' "$branch"
 }
 
-contains_approve_token() {
-  local body="$1"
-  grep -Eq '(^|[[:space:]])APPROVE($|[[:space:]])' <<< "$body"
+normalize_pr_url() {
+  local pr_url="$1"
+  printf '%s\n' "$pr_url" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s:/+$::'
 }
 
-extract_tag_value() {
-  local body="$1"
-  local key="$2"
-  local line prefix value
-
-  while IFS= read -r line; do
-    prefix="${key}:"
-    if [[ "$line" == "$prefix"* ]]; then
-      value="${line#"$prefix"}"
-      value="$(echo "$value" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
-      if [[ -n "$value" ]]; then
-        printf '%s\n' "$value"
-        return 0
-      fi
-    fi
-  done <<< "$body"
-
-  return 1
+parse_reviewer_payload_json() {
+  local raw="$1"
+  jq -e -c '
+    if type != "object" then
+      error("reviewer output must be a JSON object")
+    else
+      .
+    end
+    | if (.pr_url | type) != "string" then error("pr_url must be string") else . end
+    | if (.comment_body | type) != "string" then error("comment_body must be string") else . end
+    | .pr_url |= (sub("^[[:space:]]+"; "") | sub("[[:space:]]+$"; ""))
+    | if (.pr_url | length) == 0 then error("pr_url must be non-empty") else . end
+    | if (.comment_body | length) == 0 then error("comment_body must be non-empty") else . end
+    | if (.approve_merge | type) != "boolean" then error("approve_merge must be boolean") else . end
+    | {pr_url, comment_body, approve_merge}
+  ' <<< "$raw" 2>/dev/null
 }
+
+LAST_CODEX_OUTPUT=""
 
 has_tracked_dirty() {
   if ! git diff --quiet --; then
@@ -97,17 +97,6 @@ head_is_pushed() {
   [[ -n "$remote_head" && "$remote_head" == "$local_head" ]]
 }
 
-parse_pr_coordinates() {
-  local pr_url="$1"
-  if [[ "$pr_url" =~ ^https://github\.com/([^/]+)/([^/]+)/pull/([0-9]+)$ ]]; then
-    PR_OWNER="${BASH_REMATCH[1]}"
-    PR_REPO="${BASH_REMATCH[2]}"
-    PR_NUMBER="${BASH_REMATCH[3]}"
-    return 0
-  fi
-  return 1
-}
-
 run_codex_prompt() {
   local role="$1"
   local model="$2"
@@ -124,6 +113,97 @@ run_codex_prompt() {
     return 1
   fi
 
+  return 0
+}
+
+write_reviewer_output_schema() {
+  local schema_file
+  schema_file="$(mktemp)"
+  cat > "$schema_file" <<'EOF'
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["pr_url", "comment_body", "approve_merge"],
+  "properties": {
+    "pr_url": {
+      "type": "string",
+      "minLength": 1
+    },
+    "comment_body": {
+      "type": "string",
+      "minLength": 1
+    },
+    "approve_merge": {
+      "type": "boolean"
+    }
+  }
+}
+EOF
+  printf '%s\n' "$schema_file"
+}
+
+run_codex_prompt_capture() {
+  local role="$1"
+  local model="$2"
+  local prompt_text="$3"
+  local schema_file="${4:-}"
+  local output rc last_message_file
+
+  local cmd=(codex exec --dangerously-bypass-approvals-and-sandbox --cd "$WORKDIR")
+  if [[ -n "$model" ]]; then
+    cmd+=(--model "$model")
+  fi
+  if [[ -n "$schema_file" ]]; then
+    last_message_file="$(mktemp)"
+    cmd+=(--output-schema "$schema_file" --output-last-message "$last_message_file")
+  fi
+  cmd+=(-)
+
+  set +e
+  output="$(printf '%s\n' "$prompt_text" | "${cmd[@]}" 2>&1)"
+  rc=$?
+  set -e
+
+  if [[ -n "$schema_file" ]]; then
+    LAST_CODEX_OUTPUT="$(cat "$last_message_file" 2>/dev/null || true)"
+    rm -f "$last_message_file"
+  else
+    LAST_CODEX_OUTPUT="$output"
+  fi
+
+  if [[ -n "$output" ]]; then
+    printf '%s\n' "$output"
+  fi
+
+  if [[ "$rc" -ne 0 ]]; then
+    log "$role codex execution failed"
+    return 1
+  fi
+
+  if [[ -n "$schema_file" && -z "$(printf '%s' "$LAST_CODEX_OUTPUT" | tr -d '[:space:]')" ]]; then
+    log "$role codex execution produced empty structured output"
+    return 1
+  fi
+
+  return 0
+}
+
+post_pr_comment() {
+  local pr_url="$1"
+  local comment_body="$2"
+  local output rc
+
+  set +e
+  output="$(gh pr comment "$pr_url" --body "$comment_body" 2>&1)"
+  rc=$?
+  set -e
+
+  if [[ "$rc" -ne 0 ]]; then
+    log "failed to post PR comment for $pr_url: $output"
+    return 1
+  fi
+
+  printf '%s\n' "$output"
   return 0
 }
 
@@ -307,68 +387,6 @@ resolve_or_create_pr_for_branch() {
   fi
 
   printf '%s\n' "$open_url"
-}
-
-fetch_self_comments_since() {
-  local pr_url="$1"
-  local self_login="$2"
-  local since_epoch="$3"
-
-  local issue_query review_query
-  local issue_cursor review_cursor
-  local issue_has_next review_has_next
-  local response
-  local tmp
-
-  parse_pr_coordinates "$pr_url" || die "invalid PR URL format: $pr_url"
-
-  issue_query='query($owner:String!, $name:String!, $number:Int!, $cursor:String) { repository(owner:$owner, name:$name) { pullRequest(number:$number) { comments(first:100, after:$cursor) { nodes { url body createdAt author { login } } pageInfo { hasNextPage endCursor } } } } }'
-  review_query='query($owner:String!, $name:String!, $number:Int!, $cursor:String) { repository(owner:$owner, name:$name) { pullRequest(number:$number) { reviews(first:100, after:$cursor) { nodes { url body submittedAt author { login } } pageInfo { hasNextPage endCursor } } } } }'
-
-  tmp="$(mktemp)"
-
-  issue_cursor=""
-  while true; do
-    response="$(gh api graphql -f query="$issue_query" -F owner="$PR_OWNER" -F name="$PR_REPO" -F number="$PR_NUMBER" -F cursor="$issue_cursor" 2>/dev/null || true)"
-    [[ -n "$response" ]] || { rm -f "$tmp"; return 1; }
-
-    jq -c --arg login "$self_login" --argjson since "$since_epoch" '
-      .data.repository.pullRequest.comments.nodes[]
-      | select(.author.login == $login)
-      | select((.createdAt | fromdateiso8601) > $since)
-      | {url:.url, body:(.body // ""), time:.createdAt, kind:"issue_comment"}
-    ' <<< "$response" >> "$tmp"
-
-    issue_has_next="$(jq -r '.data.repository.pullRequest.comments.pageInfo.hasNextPage // false' <<< "$response")"
-    issue_cursor="$(jq -r '.data.repository.pullRequest.comments.pageInfo.endCursor // ""' <<< "$response")"
-    [[ "$issue_has_next" == "true" ]] || break
-  done
-
-  review_cursor=""
-  while true; do
-    response="$(gh api graphql -f query="$review_query" -F owner="$PR_OWNER" -F name="$PR_REPO" -F number="$PR_NUMBER" -F cursor="$review_cursor" 2>/dev/null || true)"
-    [[ -n "$response" ]] || { rm -f "$tmp"; return 1; }
-
-    jq -c --arg login "$self_login" --argjson since "$since_epoch" '
-      .data.repository.pullRequest.reviews.nodes[]
-      | select(.author.login == $login)
-      | select(.submittedAt != null)
-      | select((.submittedAt | fromdateiso8601) > $since)
-      | {url:.url, body:(.body // ""), time:.submittedAt, kind:"review"}
-    ' <<< "$response" >> "$tmp"
-
-    review_has_next="$(jq -r '.data.repository.pullRequest.reviews.pageInfo.hasNextPage // false' <<< "$response")"
-    review_cursor="$(jq -r '.data.repository.pullRequest.reviews.pageInfo.endCursor // ""' <<< "$response")"
-    [[ "$review_has_next" == "true" ]] || break
-  done
-
-  if [[ -s "$tmp" ]]; then
-    jq -s 'sort_by(.time)' "$tmp"
-  else
-    printf '[]\n'
-  fi
-
-  rm -f "$tmp"
 }
 
 run_builder_cleanup_until_stable() {
@@ -567,9 +585,6 @@ done < <(git ls-files --others --exclude-standard)
 START_COMMIT="$(git rev-parse HEAD)"
 LATEST_COMMIT="$START_COMMIT"
 
-SELF_LOGIN="$(gh api user --jq '.login' 2>/dev/null || true)"
-[[ -n "$SELF_LOGIN" ]] || die "failed to resolve authenticated GitHub login"
-
 RUN_ID="loop-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
 log "loop started (branch=$TARGET_BRANCH, start_commit=$START_COMMIT, run_id=$RUN_ID)"
@@ -624,85 +639,92 @@ Review target:
 
 Policy requirements:
 - Follow REVIEW.md strictly.
-- Post your review result as PR comment(s).
-- In autonomous mode, include contract tags:
-  AUTO_AGENT: REVIEWER
-  AUTO_REVIEW_STATUS: APPROVED or CHANGES_REQUIRED
-  AUTO_TARGET_COMMIT: ${LATEST_COMMIT}
-- If and only if approved, include a standalone token line: APPROVE
-- If CI is running, do not wait for completion; post based on current evidence.
-- If the latest plan in this PR appears unresolved after three failures, explicitly include a remediation request in the review comment."
+- Do not post any GitHub comment directly in autonomous loop mode.
+- Return exactly one JSON object and nothing else:
+  {\"pr_url\":\"<target-pr-url>\",\"comment_body\":\"<comment body in English>\",\"approve_merge\":true|false}
+- Set \"pr_url\" to the same PR URL shown above.
+- If CI is running, do not wait for completion; decide from current evidence.
+- If the latest plan in this PR appears unresolved after three failures, include explicit remediation request text in \"comment_body\".
+- Use approve_merge=true only when merge should be approved now."
 
-  if ! run_codex_prompt "reviewer" "$MODEL_REVIEWER" "$reviewer_prompt"; then
+  reviewer_schema_file="$(write_reviewer_output_schema)"
+  if ! run_codex_prompt_capture "reviewer" "$MODEL_REVIEWER" "$reviewer_prompt" "$reviewer_schema_file"; then
+    rm -f "$reviewer_schema_file"
     REVIEWER_FAILURES=$((REVIEWER_FAILURES + 1))
     if [[ "$REVIEWER_FAILURES" -ge "$MAX_REVIEWER_FAILURES" ]]; then
       die "reviewer execution failed $REVIEWER_FAILURES times consecutively"
     fi
     continue
   fi
+  rm -f "$reviewer_schema_file"
 
-  commit_epoch="$(git show -s --format=%ct "$LATEST_COMMIT")"
-  comments_json="$(fetch_self_comments_since "$PR_URL" "$SELF_LOGIN" "$commit_epoch" || true)"
-  if [[ -z "$comments_json" ]]; then
+  reviewer_payload_json="$(parse_reviewer_payload_json "$LAST_CODEX_OUTPUT" || true)"
+  if [[ -z "$reviewer_payload_json" ]]; then
     REVIEWER_FAILURES=$((REVIEWER_FAILURES + 1))
     if [[ "$REVIEWER_FAILURES" -ge "$MAX_REVIEWER_FAILURES" ]]; then
-      die "failed to fetch reviewer comments $REVIEWER_FAILURES times consecutively"
+      die "reviewer output was not valid JSON payload for $REVIEWER_FAILURES consecutive attempts"
+    fi
+    log "reviewer output was not valid JSON payload; retrying review iteration"
+    continue
+  fi
+
+  reviewer_pr_url="$(jq -r '.pr_url' <<< "$reviewer_payload_json")"
+  reviewer_comment_body="$(jq -r '.comment_body' <<< "$reviewer_payload_json")"
+  reviewer_approve_merge="$(jq -r '.approve_merge' <<< "$reviewer_payload_json")"
+
+  normalized_reviewer_pr_url="$(normalize_pr_url "$reviewer_pr_url")"
+  normalized_target_pr_url="$(normalize_pr_url "$PR_URL")"
+
+  if [[ "$normalized_reviewer_pr_url" != "$normalized_target_pr_url" ]]; then
+    REVIEWER_FAILURES=$((REVIEWER_FAILURES + 1))
+    if [[ "$REVIEWER_FAILURES" -ge "$MAX_REVIEWER_FAILURES" ]]; then
+      die "reviewer payload PR URL mismatch for $REVIEWER_FAILURES consecutive attempts"
+    fi
+    log "reviewer payload PR URL mismatch (expected=$normalized_target_pr_url got=$normalized_reviewer_pr_url)"
+    continue
+  fi
+
+  post_output="$(post_pr_comment "$normalized_target_pr_url" "$reviewer_comment_body" || true)"
+  if [[ -z "$post_output" ]]; then
+    REVIEWER_FAILURES=$((REVIEWER_FAILURES + 1))
+    if [[ "$REVIEWER_FAILURES" -ge "$MAX_REVIEWER_FAILURES" ]]; then
+      die "failed to post reviewer comment for $REVIEWER_FAILURES consecutive attempts"
     fi
     continue
   fi
 
-  comment_count="$(jq -r 'length' <<< "$comments_json")"
-  if [[ "$comment_count" -eq 0 ]]; then
-    REVIEWER_FAILURES=$((REVIEWER_FAILURES + 1))
-    if [[ "$REVIEWER_FAILURES" -ge "$MAX_REVIEWER_FAILURES" ]]; then
-      die "no new self-authored review comments found after commit $LATEST_COMMIT for $REVIEWER_FAILURES consecutive attempts"
-    fi
-    continue
-  fi
-
+  comment_url="$(printf '%s\n' "$post_output" | rg -o 'https://github\\.com/[^[:space:]]+' | head -n1 || true)"
   REVIEWER_FAILURES=0
 
-  APPROVED=0
-  COMMENT_URLS=()
-  for ((i=0; i<comment_count; i++)); do
-    url="$(jq -r ".[$i].url // empty" <<< "$comments_json")"
-    body="$(jq -r ".[$i].body // \"\"" <<< "$comments_json")"
-
-    if [[ -n "$url" ]]; then
-      COMMENT_URLS+=("$url")
-    fi
-
-    target_commit="$(extract_tag_value "$body" "AUTO_TARGET_COMMIT" || true)"
-    if contains_approve_token "$body" && [[ "$target_commit" == "$LATEST_COMMIT" ]]; then
-      APPROVED=1
-    fi
-  done
-
-  if [[ "$APPROVED" -eq 1 ]]; then
+  if [[ "$reviewer_approve_merge" == "true" ]]; then
     finalize_pr_tracking_doc "$PR_URL" "$TARGET_BRANCH" "$LATEST_COMMIT"
-    log "approval detected for commit $LATEST_COMMIT; loop finished"
+    log "reviewer approve_merge=true for commit $LATEST_COMMIT; loop finished"
     exit 0
   fi
 
-  if [[ ${#COMMENT_URLS[@]} -eq 0 ]]; then
-    REVIEWER_FAILURES=$((REVIEWER_FAILURES + 1))
-    if [[ "$REVIEWER_FAILURES" -ge "$MAX_REVIEWER_FAILURES" ]]; then
-      die "reviewer comments had no URLs for $REVIEWER_FAILURES consecutive attempts"
-    fi
-    continue
-  fi
-
-  comment_links_block="$(printf '%s\n' "${COMMENT_URLS[@]}")"
-  builder_followup_prompt="You are called by a parent agent as a builder agent.
+  if [[ -n "$comment_url" ]]; then
+    builder_followup_prompt="You are called by a parent agent as a builder agent.
 You are the BUILDER agent in an autonomous loop.
 
-Address all review comments referenced by these links:
-${comment_links_block}
+Address the reviewer feedback in this PR comment:
+${comment_url}
 
 Requirements:
 - Implement required fixes on branch ${TARGET_BRANCH}.
 - Leave your code edits in the worktree/index; the loop script will stage, commit, and push automatically.
 - Keep unrelated baseline untracked files untouched."
+  else
+    builder_followup_prompt="You are called by a parent agent as a builder agent.
+You are the BUILDER agent in an autonomous loop.
+
+Address the reviewer feedback text below:
+${reviewer_comment_body}
+
+Requirements:
+- Implement required fixes on branch ${TARGET_BRANCH}.
+- Leave your code edits in the worktree/index; the loop script will stage, commit, and push automatically.
+- Keep unrelated baseline untracked files untouched."
+  fi
 
   if ! run_codex_prompt "builder_followup" "$MODEL_BUILDER" "$builder_followup_prompt"; then
     die "builder follow-up execution failed at iteration $ITERATION"
@@ -718,9 +740,9 @@ Requirements:
     LATEST_COMMIT="$cleanup_commit"
     log "new commit detected after builder follow-up: $LATEST_COMMIT"
   else
-    log "no new commit after builder follow-up; re-checking review comments"
+    log "no new commit after builder follow-up; running next reviewer cycle"
   fi
 
 done
 
-die "max iterations reached without APPROVE for commit $LATEST_COMMIT"
+die "max iterations reached without reviewer approve_merge=true for commit $LATEST_COMMIT"

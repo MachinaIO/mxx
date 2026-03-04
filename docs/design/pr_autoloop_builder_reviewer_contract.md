@@ -12,7 +12,7 @@ Embedding reviewer startup, waiting, and PR creation inside lifecycle verificati
 
 1. Deterministic orchestration from a single fixed loop script.
 2. Explicit PR selection behavior for both `--pr-url` and branch-first execution.
-3. Strict machine-readable approval criteria bound to the current target commit.
+3. Strict machine-readable review decision criteria from reviewer structured output.
 4. Bounded retries to avoid infinite loops.
 5. Lifecycle events (`execplan.pre_creation` / `execplan.post_completion`) remain validation-focused and do not run reviewer automation.
 6. PR tracking completion transition happens only inside loop approval handling, not in lifecycle verification events.
@@ -28,7 +28,7 @@ Embedding reviewer startup, waiting, and PR creation inside lifecycle verificati
 ### Roles
 
 - `builder agent`: implements task and feedback, then commits and pushes.
-- `reviewer agent`: reviews target commit/newer commits and posts contract-compliant PR comment output.
+- `reviewer agent`: reviews target commit/newer commits and returns one contract-compliant JSON payload.
 
 ### Entrypoint and inputs
 
@@ -73,47 +73,38 @@ After each builder run, the script enforces stabilization before proceeding:
 
 The script performs mechanical finalization by staging tracked changes, staging new untracked files outside the baseline set, committing when needed, and pushing to origin. Builder cleanup prompts are bounded by `--max-builder-cleanup-retries` and focus only on remaining code fixes, not git finalization.
 
-### Reviewer comment contract
+### Reviewer structured output contract
 
-Reviewer comments require:
+Reviewer output in autonomous loop mode requires exactly one JSON object with:
 
-- `AUTO_AGENT: REVIEWER`
-- `AUTO_REVIEW_STATUS: APPROVED|CHANGES_REQUIRED`
-- `AUTO_TARGET_COMMIT: <sha>`
-- `APPROVE` token only when approved
+- `pr_url` (string): target PR URL.
+- `comment_body` (string): review comment text the loop script will post.
+- `approve_merge` (boolean): merge approval decision.
 
 Reviewer timing rule:
 
-- reviewer must post without waiting for CI completion.
+- reviewer must return JSON without waiting for CI completion.
 
-### Comment collection and approval decision
+The reviewer agent must not post GitHub comments directly in autonomous loop mode. The loop script is the only component that posts the review comment using `gh pr comment`.
 
-For each review cycle, the script fetches self-authored PR output after the target commit timestamp from:
+### JSON validation and approval decision
 
-- issue comments,
-- review bodies,
+For each review cycle, the loop script invokes reviewer with `codex exec --output-schema <schema.json> --output-last-message <file>` so Codex is constrained to the structured response contract.
 
-via `gh api graphql`.
+The loop script then validates the returned JSON and checks field types/required values (`pr_url` and `comment_body` non-empty strings, `approve_merge` boolean).
 
-Time filtering rule:
-
-- compare timestamps as epoch seconds (`fromdateiso8601` in jq), not raw ISO string lexical comparison, so timezone-offset differences cannot hide valid newer comments.
-
-Approval is valid only when both are true in at least one collected comment:
-
-1. `APPROVE` token is present,
-2. `AUTO_TARGET_COMMIT` equals current target commit.
+Approval is valid only when `approve_merge` is `true` in the validated JSON payload.
 
 ### Stop behavior
 
 - No-op stop: if first builder phase produces no new commit after cleanup.
-- Success stop: approval condition above is met and the script finalizes PR tracking by writing completed metadata (`review state: OPEN`) and moving the tracking file to `docs/prs/completed/`.
+- Success stop: `approve_merge` is `true` and the script finalizes PR tracking by writing completed metadata (`review state: OPEN`) and moving the tracking file to `docs/prs/completed/`.
 - Failure stop: retry bounds reached (`max-iterations` or reviewer/builder cleanup failure bounds).
 
 ### Output forwarding contract
 
 - `codex exec` output is not persisted to per-iteration log files.
-- Builder/reviewer subprocess output is forwarded directly to caller stdout/stderr.
+- Builder/reviewer subprocess output is forwarded to caller stdout/stderr.
 
 ### Lifecycle event integration
 
@@ -125,4 +116,4 @@ Approval is valid only when both are true in at least one collected comment:
 
 - Loop execution begins only from tracked-clean working tree.
 - Baseline untracked files are excluded from cleanup targets.
-- Approval parsing is strict and commit-bound to prevent stale comment acceptance.
+- Reviewer output parsing is strict and schema-validated before any PR comment post or approval decision.

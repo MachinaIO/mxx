@@ -4,7 +4,7 @@
 This repository provides implementations for lattice-cryptography operations (polynomail and matrix operations, preimage samplings, BGG+ encodings, and more), written in Rust and CUDA.
 
 ## Autonomous PR Loop Rule
-- When directly invoked by a human user, you must apply the `eternal-cycler` skill first by default unless the user explicitly says not to use it.
+- **Hard pledge:** When directly invoked by a human user, you must invoke the `eternal-cycler` skill as the very first action, and you must not proceed to any other work before doing so, unless the user explicitly and unambiguously requests not to use it.
 - In that default mode, follow `.agents/skills/eternal-cycler/SKILL.md` as the primary workflow contract for task execution.
 - If the user explicitly opts out of `eternal-cycler`, continue with the requested task without applying that skill.
 

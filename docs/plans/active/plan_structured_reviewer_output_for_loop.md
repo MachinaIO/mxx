@@ -2,11 +2,11 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` will be updated as work proceeds. This document follows `PLANS.md` requirements.
 
-Repository-document context used for this plan: `AGENTS.md`, `PLANS.md`, `DESIGN.md`, `ARCHITECTURE.md`, `docs/design/index.md`, `docs/design/pr_autoloop_builder_reviewer_contract.md`, `docs/architecture/index.md`, `docs/architecture/scope/index.md`, `docs/architecture/scope/automation_orchestration.md`, `REVIEW.md`, `.agents/skills/pr-autoloop/SKILL.md`, `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh`, `.agents/skills/execplan-event-index/SKILL.md`, `.agents/skills/execplan-event-index/references/event_skill_map.tsv`, `.agents/skills/execplan-event-action-pr-autoloop/SKILL.md`, `.agents/skills/execplan-event-action-pr-autoloop/scripts/run_event.sh`, `.agents/skills/execplan-event-action-tooling/SKILL.md`, `.agents/skills/execplan-event-action-tooling/scripts/run_event.sh`, `.agents/skills/execplan-event-pre-creation/SKILL.md`, `.agents/skills/execplan-event-post-completion/SKILL.md`, `scripts/execplan_gate.sh`, and `scripts/execplan_notify.sh`.
+Repository-document context used for this plan: `AGENTS.md`, `PLANS.md`, `DESIGN.md`, `ARCHITECTURE.md`, `docs/design/index.md`, `docs/design/pr_autoloop_builder_reviewer_contract.md`, `docs/architecture/index.md`, `docs/architecture/scope/index.md`, `docs/architecture/scope/automation_orchestration.md`, `REVIEW.md`, `.agents/skills/pr-autoloop/SKILL.md`, `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh`, `.agents/skills/execplan-event-index/SKILL.md`, `.agents/skills/execplan-event-index/references/event_skill_map.tsv`, `.agents/skills/execplan-event-action-tooling/SKILL.md`, `.agents/skills/execplan-event-action-tooling/scripts/run_event.sh`, `.agents/skills/execplan-event-pre-creation/SKILL.md`, `.agents/skills/execplan-event-post-completion/SKILL.md`, `scripts/execplan_gate.sh`, and `scripts/execplan_notify.sh`.
 
 ## Purpose / Big Picture
 
-After this change, reviewer execution in `run_builder_reviewer_loop.sh` will return one machine-readable JSON object instead of directly posting PR comments. The loop script will post the comment itself via `gh pr comment`, and merge/loop-stop decisions will rely only on a boolean JSON field, not brittle text matching. This removes comment scraping/tag parsing complexity and makes approval behavior explicit and deterministic. In addition, standalone reviewer mode will no longer post PR comments and will return review result plus acceptability boolean directly to the user.
+After this change, reviewer execution in `run_builder_reviewer_loop.sh` will return one machine-readable JSON object instead of directly posting PR comments. The loop script will post the comment itself via `gh pr comment`, and merge/loop-stop decisions will rely only on a boolean JSON field, not brittle text matching. This removes comment scraping/tag parsing complexity and makes approval behavior explicit and deterministic.
 
 ## Progress
 
@@ -17,6 +17,7 @@ After this change, reviewer execution in `run_builder_reviewer_loop.sh` will ret
 - [x] (2026-03-04 04:07Z) action_id=a4; mode=serial; depends_on=a3; file_locks=REVIEW.md,docs/plans/active/plan_structured_reviewer_output_for_loop.md; verify_events=none; worker_type=default; removed standalone/autonomous branching from `REVIEW.md` and documented single autonomous-loop-only reviewer policy.
 - [x] (2026-03-04 04:08Z) action_id=a5; mode=serial; depends_on=a4; file_locks=.agents/skills/pr-autoloop/SKILL.md,docs/plans/active/plan_structured_reviewer_output_for_loop.md; verify_events=none; worker_type=default; aligned `pr-autoloop` skill description with `AGENTS.md` default-run rule for human-invoked turns.
 - [x] (2026-03-04 04:10Z) action_id=a6; mode=serial; depends_on=a5; file_locks=.agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh,.agents/skills/execplan-event-action-pr-autoloop/scripts/run_event.sh,docs/design/pr_autoloop_builder_reviewer_contract.md,docs/architecture/scope/automation_orchestration.md,docs/plans/active/plan_structured_reviewer_output_for_loop.md; verify_events=action.pr_autoloop,action.tooling; worker_type=default; added builder structured output contract (`plan_doc_filename`,`result`,`failure_reason`) plus failure-report PR comment path after git push.
+- [x] (2026-03-04 04:29Z) action_id=a7; mode=serial; depends_on=a6; file_locks=.agents/skills/execplan-event-index/references/event_skill_map.tsv,.agents/skills/execplan-event-action-pr-autoloop/,docs/architecture/scope/automation_orchestration.md,docs/plans/active/plan_structured_reviewer_output_for_loop.md; verify_events=none; worker_type=default; removed `action.pr_autoloop` event mapping and deleted its event-skill files so `pr-autoloop` remains the only autonomous loop runtime path.
 
 ## Verification Ledger
 
@@ -79,20 +80,21 @@ Completed objectives:
 - Reviewer JSON is now constrained directly by `codex exec --output-schema` and captured via `--output-last-message`.
 - Builder JSON is now constrained directly by `codex exec --output-schema` and captured via `--output-last-message`.
 - Legacy comment scraping and tag/token approval parsing logic was removed.
-- `REVIEW.md` now defines autonomous JSON contract and standalone no-PR-post contract (`review_result` + `accept_merge`).
+- `REVIEW.md` now defines autonomous reviewer JSON contract (`pr_url`, `comment_body`, `approve_merge`).
 - `REVIEW.md` now defines only autonomous-loop reviewer behavior (single-mode contract).
 - Design and architecture documents were synchronized with the new reviewer JSON contract.
 - `action.pr_autoloop` and `action.tooling` gate events passed after remediation (including a false-negative marker check fix for `--output-schema`).
+- `action.pr_autoloop` verification was removed from `.agents/skills/execplan-event-index/references/event_skill_map.tsv`, and `.agents/skills/execplan-event-action-pr-autoloop/` was deleted.
 
 Remaining lifecycle steps outside this implementation turn: run final completion flow (`execplan.post_completion`) when plan/document movement is requested.
 
 ## Context and Orientation
 
-The autonomous loop entrypoint is `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh`. Today it asks reviewer agent output to post PR comments directly and then re-fetches comments via GitHub GraphQL to infer approval based on tags and `APPROVE` token matching. Reviewer policy is defined in `REVIEW.md`, with long-lived contract and architecture descriptions in `docs/design/pr_autoloop_builder_reviewer_contract.md` and `docs/architecture/scope/automation_orchestration.md`. Validation for this scope is enforced by `.agents/skills/execplan-event-action-pr-autoloop/scripts/run_event.sh`, which currently checks for old tag-based markers. All these files must be aligned to the new JSON-output contract.
+The autonomous loop entrypoint is `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh`, and it already uses structured JSON output for both builder and reviewer roles. This follow-up change removes the dedicated `action.pr_autoloop` verification event so that loop execution relies on the `pr-autoloop` runtime contract directly, with syntax/tooling verification remaining under `action.tooling`.
 
 ## Plan of Work
 
-Implement JSON-driven reviewer handoff in the loop script: capture reviewer output from `codex exec`, parse and validate one JSON object using `jq`, post the PR comment through `gh pr comment`, and use `approve_merge` boolean as the only stop condition for loop completion. Remove obsolete functions and paths used only for comment scraping and tag/token parsing. Update reviewer policy and design/architecture documents to define the new contract and state that reviewer agent returns structured data while loop script performs GitHub write action. Update `action.pr_autoloop` verification script marker checks so gate validation enforces the new contract rather than old tag/token markers.
+Remove `action.pr_autoloop` from the event registry and delete the corresponding event-skill files. Keep the runtime `pr-autoloop` flow intact, and update architecture/plan documentation to reflect that validation now relies on generic tooling checks plus direct loop runtime behavior.
 
 ## Concrete Steps
 
@@ -104,18 +106,19 @@ From repository root:
 
 Then edit:
 
-    .agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh
-    REVIEW.md
-    docs/design/pr_autoloop_builder_reviewer_contract.md
-    docs/architecture/scope/automation_orchestration.md
+    .agents/skills/execplan-event-index/references/event_skill_map.tsv
+    .agents/skills/execplan-event-action-pr-autoloop/SKILL.md
     .agents/skills/execplan-event-action-pr-autoloop/scripts/run_event.sh
+    .agents/skills/execplan-event-action-pr-autoloop/agents/openai.yaml
+    docs/architecture/scope/automation_orchestration.md
+    docs/plans/active/plan_structured_reviewer_output_for_loop.md
 
 Run validation:
 
     bash -n .agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh
-    bash -n .agents/skills/execplan-event-action-pr-autoloop/scripts/run_event.sh
-    scripts/execplan_gate.sh --plan docs/plans/active/plan_structured_reviewer_output_for_loop.md --event action.pr_autoloop
-    scripts/execplan_gate.sh --plan docs/plans/active/plan_structured_reviewer_output_for_loop.md --event action.tooling
+    bash -n scripts/execplan_gate.sh
+    bash -n .agents/skills/execplan-event-action-tooling/scripts/run_event.sh
+    .agents/skills/execplan-event-action-tooling/scripts/run_event.sh --plan docs/plans/active/plan_structured_reviewer_output_for_loop.md
 
 ## Validation and Acceptance
 
@@ -125,13 +128,14 @@ Acceptance criteria:
 2. Reviewer prompt explicitly requests JSON output containing PR URL, comment body, and approval boolean.
 3. Loop script posts the reviewer comment body via `gh pr comment <url> --body <text>`.
 4. Loop stop condition is controlled by parsed `approve_merge` boolean only.
-5. Standalone reviewer mode in `REVIEW.md` explicitly forbids PR posting and requires returning `review_result` and `accept_merge` directly to user.
-6. `REVIEW.md`, design doc, architecture scope doc, and action verification script all describe/check the same autonomous JSON contract.
-7. `action.pr_autoloop` and `action.tooling` gate events pass and are recorded in this plan ledger.
+5. `REVIEW.md` remains autonomous-loop-only and keeps reviewer JSON contract (`pr_url`, `comment_body`, `approve_merge`).
+6. `.agents/skills/execplan-event-index/references/event_skill_map.tsv` no longer contains `action.pr_autoloop`.
+7. `.agents/skills/execplan-event-action-pr-autoloop/` is removed from the repository.
+8. Tooling verification scripts remain syntactically valid and `action.tooling` event script runs successfully with this plan path.
 
 ## Idempotence and Recovery
 
-Script/doc edits are additive and repeatable. If gate checks fail, inspect failure summary in ledger, patch target files, and rerun the same gate command with the same `--plan` path until pass or escalation bound is reached. No destructive git operations are required.
+Script/doc edits are additive and repeatable. If syntax/tooling checks fail, patch target files and rerun the same commands with the same `--plan` path. No destructive git operations are required.
 
 ## Artifacts and Notes
 
@@ -147,20 +151,15 @@ The reviewer structured-output interface for autonomous loop mode after this cha
 
 Dependencies remain `git`, `gh`, `codex`, and `jq` in `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh`.
 
-Standalone reviewer-mode response interface after this change:
-
-- `review_result` (string): review findings/result returned directly to user.
-- `accept_merge` (boolean): whether merge can be accepted now.
-
 ## Plan Revision Notes
 
 - 2026-03-04 03:57Z: Initial plan created to implement reviewer JSON structured-output contract and loop-side comment posting/approval decision simplification.
 - 2026-03-04 04:02Z: Updated action-pr-autoloop verification marker checks after first gate failure caused by over-strict quoted-field marker.
-- 2026-03-04 04:03Z: Incorporated standalone reviewer-mode no-PR-post requirement and documented direct user return contract (`review_result` + `accept_merge`).
 - 2026-03-04 04:07Z: Updated reviewer invocation to use `codex exec --output-schema`/`--output-last-message` and fixed gate marker matching for `--output-schema`.
 - 2026-03-04 04:07Z: Unified `REVIEW.md` to autonomous-loop-only policy and removed standalone/autonomous branching language.
 - 2026-03-04 04:08Z: Updated `.agents/skills/pr-autoloop/SKILL.md` description text to match `AGENTS.md` default human-invocation behavior.
 - 2026-03-04 04:10Z: Added builder structured output schema and post-push builder failure comment reporting path.
+- 2026-03-04 04:29Z: Removed `action.pr_autoloop` event registration and deleted `.agents/skills/execplan-event-action-pr-autoloop/`, leaving `pr-autoloop` as the runtime loop path.
 - execplan_start_branch: feat/pr-autoloop-skill
 - execplan_start_commit: d1e6822eaaf84ce85f69d003b52847375f3200d5
 

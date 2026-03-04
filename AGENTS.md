@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Autonomous PR Loop Rule
-- When directly invoked by a human user, run the `pr-autoloop` skill by default unless the user explicitly says not to run it. Follow the `pr-autoloop` skill resume/new-PR workflow before running loop commands directly.
+- When directly invoked by a human user, run the `pr-autoloop` skill by default unless the user explicitly says not to run it. In that mode, do not execute, propose, inspect, or otherwise pay attention to anything outside the `pr-autoloop` workflow.
 - When called by a parent Codex agent as a `builder agent`, start and execute the ExecPlan lifecycle exactly as defined in `PLANS.md`.
 - When called by a parent Codex agent as a `reviewer agent`, execute review work exactly as defined in `REVIEW.md`.
 
@@ -39,4 +39,3 @@ In reviewer mode, follow REVIEW.md as the governing policy for independent revie
 ## Global Requirements
 - All documentation in this repository, along with git commit messages and PRs, must be written in English.
 - When documenting file paths, use only paths relative to the repository top directory. Do not write absolute paths in documentation.
-

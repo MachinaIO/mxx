@@ -9,8 +9,6 @@ Documents repository-local autonomous PR orchestration implemented as fixed scri
 - `.agents/skills/pr-autoloop/SKILL.md`
 - `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_doctor.sh`
 - `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh`
-- `.agents/skills/execplan-event-action-pr-autoloop/SKILL.md`
-- `.agents/skills/execplan-event-action-pr-autoloop/scripts/run_event.sh`
 - `.agents/skills/execplan-event-index/references/event_skill_map.tsv` (event registration)
 
 ## Interface vs implementation
@@ -52,6 +50,7 @@ Implementation details:
 - On approval, the loop script updates/moves PR tracking docs (`docs/prs/active` -> `docs/prs/completed`) and records completed tracking metadata including `review state: OPEN`.
 - The loop script performs mechanical git finalization for builder output: stage tracked edits, stage non-baseline untracked files, commit when needed, then push to origin.
 - Lifecycle events no longer run reviewer orchestration.
+- No dedicated `action.pr_autoloop` event exists. Loop behavior validation is covered by regular tooling/script checks and direct `pr-autoloop` runtime operation.
 - `execplan.post_completion` does not mark PR ready, does not move PR tracking docs, and does not run git add/commit/push; it is lifecycle validation-only.
 - `gh` operations are executed via out-of-sandbox command paths following `.agents/skills/execplan-sandbox-escalation/`.
 

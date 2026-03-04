@@ -94,6 +94,7 @@ All paths are relative to this SKILL.md file's location (the eternal-cycler inst
 
 20. Treat `run_builder_reviewer_loop.sh` as non-interactive.
 21. Each builder and reviewer agent invocation enforces a minimum runtime of 1 hour (3600 seconds). The loop script enforces this automatically by sleeping for the remaining time after the agent exits. Do not pass `--min-agent-duration 0` or any value below 3600 unless the user explicitly requests it.
+22. **Do not stop the loop without explicit user instruction.** Stopping or abandoning the builder/reviewer loop before the user explicitly requests it is prohibited, regardless of elapsed time, iteration count, or perceived task completion. If the loop script exits on its own (e.g. max iterations reached, unrecoverable error), report the outcome to the user and ask whether to continue rather than silently halting.
 
 ## Suggested invocation template
 

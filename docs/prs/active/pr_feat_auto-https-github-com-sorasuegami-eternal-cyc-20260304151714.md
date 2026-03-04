@@ -1,9 +1,9 @@
 # PR Tracking: feat/auto-https-github-com-sorasuegami-eternal-cyc-20260304151714
 
 - PR link: https://github.com/MachinaIO/mxx/pull/64
-- PR creation date: 2026-03-04T15:29:39Z
+- PR creation date: 2026-03-04 18:06Z
 - branch name: feat/auto-https-github-com-sorasuegami-eternal-cyc-20260304151714
-- commit hash at PR creation time: 948882af7d397834516d2be7e8b1ab5d0d512fe5
-- summary/content of the PR: chore: install eternal-cycler and complete PR #63 tracking
+- commit hash at PR creation time: 01016769f79db3343d69eb859eb79924ca655bee
+- summary/content of the PR: chore: adopt eternal-cycler and retire mxx agent loop
 - PR state: OPEN
 - PR head/base: feat/auto-https-github-com-sorasuegami-eternal-cyc-20260304151714 -> main

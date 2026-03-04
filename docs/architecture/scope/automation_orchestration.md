@@ -35,10 +35,16 @@ Interface contract:
   - `pr_url` (string)
   - `comment_body` (string)
   - `approve_merge` (boolean)
-- Builder autonomous-loop output fields:
+- Builder autonomous-loop output fields (`.agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh`):
   - `plan_doc_filename` (string)
   - `result` (`success` | `failed_after_3_retries`)
   - `failure_reason` (string; empty on success)
+- Builder autonomous-loop output fields (`.agents/skills/eternal-cycler/scripts/run_builder_reviewer_loop.sh`):
+  - `plan_doc_filename` (string)
+  - `result` (`success` | `failed_after_3_retries`)
+  - `failure_reason` (string; empty on success)
+  - `pr_title` (string; required when loop must create a PR)
+  - `pr_body` (string; markdown body used when loop must create a PR)
 
 Implementation details:
 
@@ -49,7 +55,9 @@ Implementation details:
   - explicit `--pr-url` (head branch must match current local branch),
   - branch-first on current local branch (reuse existing open PR or create new PR).
 - Builder output is generated with `codex exec --output-schema` and captured with `--output-last-message`.
-- Builder output is parsed as JSON, schema-validated (`plan_doc_filename`, `result`, `failure_reason`), and when builder reports `failed_after_3_retries` the loop script pushes branch state and posts a builder-identity PR comment with failure reason.
+- Local wrapper builder output is schema-validated as (`plan_doc_filename`, `result`, `failure_reason`).
+- Upstream eternal-cycler builder output is schema-validated as (`plan_doc_filename`, `result`, `failure_reason`, `pr_title`, `pr_body`), and when branch-first PR creation is needed it uses builder-provided `pr_title` and `pr_body`.
+- When builder reports `failed_after_3_retries`, the loop script pushes branch state and posts a builder-identity PR comment with failure reason.
 - Reviewer output is generated with `codex exec --output-schema` and captured with `--output-last-message`.
 - Reviewer output is parsed as JSON, schema-validated (`pr_url`, `comment_body`, `approve_merge`), then posted by loop script with `gh pr comment`.
 - Approval requires `approve_merge: true` in validated reviewer JSON output.

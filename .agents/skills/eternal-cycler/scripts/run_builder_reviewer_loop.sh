@@ -86,9 +86,13 @@ parse_builder_payload_json() {
     | if (.plan_doc_filename | type) != "string" then error("plan_doc_filename must be string") else . end
     | if (.result | type) != "string" then error("result must be string") else . end
     | if (.failure_reason | type) != "string" then error("failure_reason must be string") else . end
+    | if (.pr_title | type) != "string" then error("pr_title must be string") else . end
+    | if (.pr_body | type) != "string" then error("pr_body must be string") else . end
     | .plan_doc_filename |= (sub("^[[:space:]]+"; "") | sub("[[:space:]]+$"; ""))
     | .failure_reason |= (sub("^[[:space:]]+"; "") | sub("[[:space:]]+$"; ""))
+    | .pr_title |= (sub("^[[:space:]]+"; "") | sub("[[:space:]]+$"; ""))
     | if (.plan_doc_filename | length) == 0 then error("plan_doc_filename must be non-empty") else . end
+    | if (.pr_title | length) == 0 then error("pr_title must be non-empty") else . end
     | if (.result != "success" and .result != "failed_after_3_retries") then
         error("result must be success or failed_after_3_retries")
       else
@@ -101,7 +105,7 @@ parse_builder_payload_json() {
       else
         .
       end
-    | {plan_doc_filename, result, failure_reason}
+    | {plan_doc_filename, result, failure_reason, pr_title, pr_body}
   ' <<< "$raw" 2>/dev/null
 }
 
@@ -190,7 +194,7 @@ write_builder_output_schema() {
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["plan_doc_filename", "result", "failure_reason"],
+  "required": ["plan_doc_filename", "result", "failure_reason", "pr_title", "pr_body"],
   "properties": {
     "plan_doc_filename": {
       "type": "string",
@@ -201,6 +205,13 @@ write_builder_output_schema() {
       "enum": ["success", "failed_after_3_retries"]
     },
     "failure_reason": {
+      "type": "string"
+    },
+    "pr_title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "pr_body": {
       "type": "string"
     }
   }
@@ -214,7 +225,7 @@ run_codex_prompt_capture() {
   local model="$2"
   local prompt_text="$3"
   local schema_file="${4:-}"
-  local output rc last_message_file
+  local rc last_message_file
 
   local cmd=(codex exec --dangerously-bypass-approvals-and-sandbox --cd "$WORKDIR")
   if [[ -n "$model" ]]; then
@@ -226,20 +237,17 @@ run_codex_prompt_capture() {
   fi
   cmd+=(-)
 
+  # Stream codex output directly to the terminal so the operator can follow
+  # builder/reviewer progress in real time.  The structured JSON payload is
+  # captured separately via --output-last-message into $last_message_file.
   set +e
-  output="$(printf '%s\n' "$prompt_text" | "${cmd[@]}" 2>&1)"
+  printf '%s\n' "$prompt_text" | "${cmd[@]}"
   rc=$?
   set -e
 
   if [[ -n "$schema_file" ]]; then
     LAST_CODEX_OUTPUT="$(cat "$last_message_file" 2>/dev/null || true)"
     rm -f "$last_message_file"
-  else
-    LAST_CODEX_OUTPUT="$output"
-  fi
-
-  if [[ -n "$output" ]]; then
-    printf '%s\n' "$output"
   fi
 
   if [[ "$rc" -ne 0 ]]; then
@@ -472,6 +480,8 @@ EOF
 
 resolve_or_create_pr_for_branch() {
   local branch="$1"
+  local pr_title="$2"
+  local pr_body="$3"
   local open_json open_url create_out
 
   open_json="$(gh pr list --state open --head "$branch" --json url,updatedAt --limit 20 2>/dev/null || true)"
@@ -482,7 +492,7 @@ resolve_or_create_pr_for_branch() {
   fi
 
   set +e
-  create_out="$(gh pr create --fill --head "$branch" 2>&1)"
+  create_out="$(gh pr create --title "$pr_title" --body "$pr_body" --head "$branch" 2>&1)"
   local rc=$?
   set -e
   if [[ "$rc" -ne 0 ]]; then
@@ -731,9 +741,11 @@ Requirements:
 - Keep unrelated baseline untracked files untouched.
 - Try up to 3 implementation attempts before declaring failure.
 - Return exactly one JSON object and nothing else:
-  {\"plan_doc_filename\":\"<relative-plan-path>\",\"result\":\"success|failed_after_3_retries\",\"failure_reason\":\"<empty-if-success>\"}
-- Use `result=success` only when implementation is complete for this request.
-- Use `result=failed_after_3_retries` only after 3 attempts fail and include concrete failure reason in `failure_reason`."
+  {\"plan_doc_filename\":\"<relative-plan-path>\",\"result\":\"success|failed_after_3_retries\",\"failure_reason\":\"<empty-if-success>\",\"pr_title\":\"<concise PR title>\",\"pr_body\":\"<PR description in markdown>\"}
+- Use result=success only when implementation is complete for this request.
+- Use result=failed_after_3_retries only after 3 attempts fail and include concrete failure reason in failure_reason.
+- pr_title must be a concise, action-oriented title describing the change (e.g. \"feat: add input validation to login form\").
+- pr_body must be a markdown description of what was changed and why, suitable for a pull request body."
 
 builder_schema_file="$(write_builder_output_schema)"
 if ! run_codex_prompt_capture "builder_initial" "$MODEL_BUILDER" "$initial_builder_prompt" "$builder_schema_file"; then
@@ -761,7 +773,9 @@ fi
 LATEST_COMMIT="$cleanup_commit"
 
 if [[ -z "$PR_URL" ]]; then
-  PR_URL="$(resolve_or_create_pr_for_branch "$TARGET_BRANCH")"
+  _pr_title="$(jq -r '.pr_title' <<< "$builder_payload_json")"
+  _pr_body="$(jq -r '.pr_body' <<< "$builder_payload_json")"
+  PR_URL="$(resolve_or_create_pr_for_branch "$TARGET_BRANCH" "$_pr_title" "$_pr_body")"
   [[ -n "$PR_URL" ]] || die "failed to resolve/create PR for branch: $TARGET_BRANCH"
 fi
 
@@ -860,9 +874,11 @@ Requirements:
 - Keep unrelated baseline untracked files untouched.
 - Try up to 3 implementation attempts before declaring failure.
 - Return exactly one JSON object and nothing else:
-  {\"plan_doc_filename\":\"<relative-plan-path>\",\"result\":\"success|failed_after_3_retries\",\"failure_reason\":\"<empty-if-success>\"}
-- Use `result=success` only when implementation is complete for this request.
-- Use `result=failed_after_3_retries` only after 3 attempts fail and include concrete failure reason in `failure_reason`."
+  {\"plan_doc_filename\":\"<relative-plan-path>\",\"result\":\"success|failed_after_3_retries\",\"failure_reason\":\"<empty-if-success>\",\"pr_title\":\"<concise PR title>\",\"pr_body\":\"<PR description in markdown>\"}
+- Use result=success only when implementation is complete for this request.
+- Use result=failed_after_3_retries only after 3 attempts fail and include concrete failure reason in failure_reason.
+- pr_title must be a concise, action-oriented title describing the change (e.g. \"feat: add input validation to login form\").
+- pr_body must be a markdown description of what was changed and why, suitable for a pull request body."
   else
     builder_followup_prompt="You are the BUILDER agent in an autonomous loop.
 
@@ -878,9 +894,11 @@ Requirements:
 - Keep unrelated baseline untracked files untouched.
 - Try up to 3 implementation attempts before declaring failure.
 - Return exactly one JSON object and nothing else:
-  {\"plan_doc_filename\":\"<relative-plan-path>\",\"result\":\"success|failed_after_3_retries\",\"failure_reason\":\"<empty-if-success>\"}
-- Use `result=success` only when implementation is complete for this request.
-- Use `result=failed_after_3_retries` only after 3 attempts fail and include concrete failure reason in `failure_reason`."
+  {\"plan_doc_filename\":\"<relative-plan-path>\",\"result\":\"success|failed_after_3_retries\",\"failure_reason\":\"<empty-if-success>\",\"pr_title\":\"<concise PR title>\",\"pr_body\":\"<PR description in markdown>\"}
+- Use result=success only when implementation is complete for this request.
+- Use result=failed_after_3_retries only after 3 attempts fail and include concrete failure reason in failure_reason.
+- pr_title must be a concise, action-oriented title describing the change (e.g. \"feat: add input validation to login form\").
+- pr_body must be a markdown description of what was changed and why, suitable for a pull request body."
   fi
 
   builder_schema_file="$(write_builder_output_schema)"

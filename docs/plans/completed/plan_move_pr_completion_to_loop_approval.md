@@ -31,6 +31,7 @@ After this change, `execplan.post_completion` verification will stop handling PR
 - attempt_record: event_id=action.tooling; attempt=1; status=pass; started_at=2026-03-04 00:45Z; finished_at=2026-03-04 00:45Z; commands=bash -n scripts/*.sh .agents/skills/execplan-event-*/scripts/*.sh; failure_summary=none; notify_reference=not_requested;
 - attempt_record: event_id=action.pr_autoloop; attempt=1; status=pass; started_at=2026-03-04 00:45Z; finished_at=2026-03-04 00:45Z; commands=bash -n scripts/run_builder_reviewer_doctor.sh bash -n scripts/run_builder_reviewer_loop.sh rg -n -- --task|--task-file|--pr-url|--max-iterations|--max-builder-cleanup-retries|--max-reviewer-failures|--model-builder|--model-reviewer scripts/run_builder_reviewer_loop.sh rg -n AUTO_AGENT: REVIEWER|AUTO_REVIEW_STATUS|AUTO_TARGET_COMMIT|APPROVE scripts/run_builder_reviewer_loop.sh rg -n gh\ api\ graphql scripts/run_builder_reviewer_loop.sh rg -F -n comments(first:100 scripts/run_builder_reviewer_loop.sh rg -F -n reviews(first:100 scripts/run_builder_reviewer_loop.sh rg -n mergedAt|state|OPEN|headRefName scripts/run_builder_reviewer_loop.sh scripts/run_builder_reviewer_doctor.sh rg -n gh\ auth\ status|codex\ login\ status scripts/run_builder_reviewer_doctor.sh; failure_summary=none; notify_reference=not_requested;
 - attempt_record: event_id=execplan.post_completion; attempt=1; status=fail; started_at=2026-03-04 00:46Z; finished_at=2026-03-04 00:46Z; commands=rg -n docs/prs/active/|docs/prs/completed/ <plan> open docs/prs/active/pr_feat_pr-autoloop-skill.md rollback plan docs/plans/completed/plan_move_pr_completion_to_loop_approval.md -> docs/plans/active/plan_move_pr_completion_to_loop_approval.md; failure_summary=plan still contains incomplete Progress actions; notify_reference=not_requested;
+- attempt_record: event_id=execplan.post_completion; attempt=2; status=pass; started_at=2026-03-04 00:46Z; finished_at=2026-03-04 00:46Z; commands=rg -n docs/prs/active/|docs/prs/completed/ <plan> open docs/prs/active/pr_feat_pr-autoloop-skill.md git status --short git add changed plan files skip unrelated untracked files git commit -m <finalize-message> git push origin feat/pr-autoloop-skill; failure_summary=none; notify_reference=not_requested;
 <!-- verification-ledger:end -->
 
 ## Surprises & Discoveries
@@ -62,7 +63,7 @@ Completed:
 
 Remaining:
 
-- Re-run lifecycle `execplan.post_completion` gate after the first failure caused by an incomplete `Progress` action marker.
+- None.
 
 ## Context and Orientation
 
@@ -109,6 +110,7 @@ The loop transition will be implemented idempotently: if completed PR doc alread
 - 2026-03-04 00:53Z: Updated design and architecture docs to reflect new ownership boundary.
 - 2026-03-04 00:54Z: Action verification gates (`action.tooling`, `action.pr_autoloop`) passed.
 - 2026-03-04 00:58Z: First `execplan.post_completion` attempt failed because `a5` was still unchecked; marked `a5` complete before retry.
+- 2026-03-04 01:00Z: `execplan.post_completion` attempt 2 passed after re-moving the plan to `docs/plans/completed/`.
 - execplan_start_branch: feat/pr-autoloop-skill
 - execplan_start_commit: 0d81c656b9dd059c187d2a2231a84e0b8aaebbd0
 

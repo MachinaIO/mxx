@@ -7,3 +7,7 @@
 - summary/content of the PR: chore: adopt eternal-cycler and retire mxx agent loop
 - PR state: OPEN
 - PR head/base: feat/auto-https-github-com-sorasuegami-eternal-cyc-20260304151714 -> main
+- review state: OPEN
+- tracking state: COMPLETED
+- completion commit: 0163a14801b590935e462f919cd0239da0f4ef29
+- completed at: 2026-03-04 18:32Z

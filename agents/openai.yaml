@@ -1,7 +1,7 @@
 interface:
-  display_name: "PR Auto Loop"
+  display_name: "eternal-cycler"
   short_description: "Start/continue fixed builder-reviewer loop"
-  default_prompt: "Run the pr-autoloop skill workflow and invoke the non-interactive loop script with explicit task input."
+  default_prompt: "Run the eternal-cycler skill workflow and invoke the non-interactive loop script with explicit task input."
 
 policy:
   allow_implicit_invocation: true

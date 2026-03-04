@@ -19,6 +19,7 @@ After this change, reviewer execution in `run_builder_reviewer_loop.sh` will ret
 - [x] (2026-03-04 04:10Z) action_id=a6; mode=serial; depends_on=a5; file_locks=.agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh,docs/design/pr_autoloop_builder_reviewer_contract.md,docs/architecture/scope/automation_orchestration.md,docs/plans/active/plan_structured_reviewer_output_for_loop.md; verify_events=action.tooling; worker_type=default; added builder structured output contract (`plan_doc_filename`,`result`,`failure_reason`) plus failure-report PR comment path after git push.
 - [x] (2026-03-04 04:29Z) action_id=a7; mode=serial; depends_on=a6; file_locks=.agents/skills/execplan-event-index/references/event_skill_map.tsv,.agents/skills/execplan-event-action-pr-autoloop/,docs/architecture/scope/automation_orchestration.md,docs/plans/active/plan_structured_reviewer_output_for_loop.md; verify_events=none; worker_type=default; removed `action.pr_autoloop` event mapping and deleted its event-skill files so `pr-autoloop` remains the only autonomous loop runtime path.
 - [x] (2026-03-04 04:58Z) action_id=a8; mode=serial; depends_on=a7; file_locks=.agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh,docs/plans/active/plan_structured_reviewer_output_for_loop.md; verify_events=none; worker_type=default; reconciled plan ledger/progress consistency after `action.pr_autoloop` retirement and hardened reviewer comment/push-state error handling in loop script.
+- [x] (2026-03-04 05:04Z) action_id=a9; mode=serial; depends_on=a8; file_locks=docs/plans/completed/plan_structured_reviewer_output_for_loop.md; verify_events=none; worker_type=default; moved plan to completed path, pushed implementation commits, and recorded `execplan.post_completion` pass.
 
 ## Verification Ledger
 
@@ -36,6 +37,8 @@ After this change, reviewer execution in `run_builder_reviewer_loop.sh` will ret
 - attempt_record: event_id=action.pr_autoloop; attempt=1; status=pass; started_at=2026-03-04 04:06Z; finished_at=2026-03-04 04:06Z; commands=bash -n .agents/skills/pr-autoloop/scripts/run_builder_reviewer_doctor.sh bash -n .agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh rg -n -- --task|--task-file|--pr-url|--max-iterations|--max-builder-cleanup-retries|--max-reviewer-failures|--model-builder|--model-reviewer .agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh rg -n pr_url|comment_body|approve_merge .agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh rg -n write_reviewer_output_schema|parse_reviewer_payload_json|run_codex_prompt_capture|post_pr_comment .agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh rg -n -- --output-schema|--output-last-message .agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh rg -n gh\ pr\ comment .agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh rg -n resolve_current_branch|headRefName|must match current local branch .agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh rg -n pr_state|pr_merged_at|state,mergedAt|OPEN and unmerged .agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh rg -n gh\ auth\ status|codex\ login\ status .agents/skills/pr-autoloop/scripts/run_builder_reviewer_doctor.sh rg -n prompt_for_task_text|prompt_for_resume_target_if_needed|is_interactive_session|log_path|LOG_DIR .agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh rg -F -n if ! printf '%s
 ' "$prompt_text" | "${cmd[@]}", then .agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh; failure_summary=none; notify_reference=not_requested;
 - attempt_record: event_id=action.tooling; attempt=1; status=pass; started_at=2026-03-04 04:06Z; finished_at=2026-03-04 04:06Z; commands=bash -n scripts/*.sh .agents/skills/execplan-event-*/scripts/*.sh; failure_summary=none; notify_reference=not_requested;
+- attempt_record: event_id=execplan.post_completion; attempt=1; status=pass; started_at=2026-03-04 05:04Z; finished_at=2026-03-04 05:04Z; commands=rg -n docs/prs/active/|docs/prs/completed/ <plan> open docs/prs/active/pr_feat_pr-autoloop-skill.md git status --short; failure_summary=none; notify_reference=not_requested;
+- attempt_record: event_id=execplan.post_completion; attempt=2; status=pass; started_at=2026-03-04 05:04Z; finished_at=2026-03-04 05:04Z; commands=rg -n docs/prs/active/|docs/prs/completed/ <plan> open docs/prs/active/pr_feat_pr-autoloop-skill.md git status --short; failure_summary=none; notify_reference=not_requested;
 <!-- verification-ledger:end -->
 
 ## Surprises & Discoveries
@@ -84,8 +87,9 @@ Completed objectives:
 - `action.pr_autoloop` and `action.tooling` gate events passed after remediation (including a false-negative marker check fix for `--output-schema`).
 - `action.pr_autoloop` verification was removed from `.agents/skills/execplan-event-index/references/event_skill_map.tsv`, and `.agents/skills/execplan-event-action-pr-autoloop/` was deleted.
 - ExecPlan `Progress`/`Verification Ledger` was normalized so the latest recorded statuses are no longer left in unresolved fail/escalated state after event retirement.
+- `execplan.post_completion` passed after plan finalization in `docs/plans/completed/`.
 
-Remaining lifecycle steps outside this implementation turn: run final completion flow (`execplan.post_completion`) when plan/document movement is requested.
+Lifecycle completion is finished for this plan (`execplan.post_completion`: pass).
 
 ## Context and Orientation
 
@@ -160,6 +164,7 @@ Dependencies remain `git`, `gh`, `codex`, and `jq` in `.agents/skills/pr-autoloo
 - 2026-03-04 04:10Z: Added builder structured output schema and post-push builder failure comment reporting path.
 - 2026-03-04 04:29Z: Removed `action.pr_autoloop` event registration and deleted `.agents/skills/execplan-event-action-pr-autoloop/`, leaving `pr-autoloop` as the runtime loop path.
 - 2026-03-04 04:58Z: Reconciled stale `Verification Ledger`/`verify_events` entries after event retirement and fixed loop resilience bugs (`head_is_pushed` remote failure handling, reviewer comment success check by exit code).
+- 2026-03-04 05:04Z: Moved this plan to `docs/plans/completed/`, pushed the changes, and recorded `execplan.post_completion` pass.
 - execplan_start_branch: feat/pr-autoloop-skill
 - execplan_start_commit: d1e6822eaaf84ce85f69d003b52847375f3200d5
 

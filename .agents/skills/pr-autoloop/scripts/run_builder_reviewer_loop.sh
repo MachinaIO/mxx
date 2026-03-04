@@ -722,8 +722,9 @@ cleanup_kind="${cleanup_result%%|*}"
 cleanup_commit="${cleanup_result#*|}"
 
 if [[ "$cleanup_kind" == "unchanged" ]]; then
-  log "no new commit detected after initial builder run; exiting without review loop"
-  exit 0
+  log "no new commit detected after initial builder run; continuing to initial reviewer cycle"
+else
+  log "new commit detected after initial builder run: $cleanup_commit"
 fi
 
 LATEST_COMMIT="$cleanup_commit"

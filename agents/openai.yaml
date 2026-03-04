@@ -1,6 +1,6 @@
 interface:
-  display_name: "Eternal Cycler: Automating the Builder-Reviewer Agent Interaction Cycle"
-  short_description: "Start/continue fixed builder-reviewer loop"
+  display_name: "Eternal Cycler"
+  short_description: "Automate the builder-reviewer agent interaction cycle"
   default_prompt: "Run the eternal-cycler skill workflow and invoke the non-interactive loop script with explicit task input."
 
 policy:

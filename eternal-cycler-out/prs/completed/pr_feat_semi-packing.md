@@ -7,3 +7,7 @@
 - summary/content of the PR: feat: support semi-packed BGG+ encodings and lookup table evaluation
 - PR state: OPEN
 - PR head/base: feat/semi-packing -> main
+- review state: OPEN
+- tracking state: COMPLETED
+- completion commit: e87994a65f20ed2bb05fac04db3c634f50c9dd80
+- completed at: 2026-03-04 22:39Z

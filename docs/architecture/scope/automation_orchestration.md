@@ -2,13 +2,10 @@
 
 ## Purpose
 
-Documents repository-local autonomous PR orchestration implemented by a static upstream skill install under `.agents/skills/eternal-cycler/` and repository-facing wrappers under `.agents/skills/pr-autoloop/scripts/`.
+Documents repository-local autonomous PR orchestration implemented by a static upstream skill install under `.agents/skills/eternal-cycler/`.
 
 ## Implementation mapping
 
-- `.agents/skills/pr-autoloop/SKILL.md`
-- `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_doctor.sh`
-- `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh`
 - `.agents/skills/eternal-cycler/SKILL.md`
 - `.agents/skills/eternal-cycler/setup.sh`
 - `.agents/skills/eternal-cycler/scripts/run_builder_reviewer_doctor.sh`
@@ -26,7 +23,7 @@ Interface contract:
   - if task input is omitted, fail immediately with usage error
   - bounded controls (`--max-iterations`, `--max-builder-cleanup-retries`, `--max-reviewer-failures`)
   - optional model selectors (`--model-builder`, `--model-reviewer`)
-- `pr-autoloop` skill caller behavior:
+- `eternal-cycler` skill caller behavior:
   - when `--pr-url` is omitted and any docs exist in `docs/prs/active`, caller asks user whether to resume one of them,
   - if resume is selected, caller switches to the selected doc's branch before invoking the loop and uses `PR link` for `--pr-url` when present,
   - if selected doc lacks `PR link`, caller still runs on the switched branch without `--pr-url`,
@@ -35,10 +32,6 @@ Interface contract:
   - `pr_url` (string)
   - `comment_body` (string)
   - `approve_merge` (boolean)
-- Builder autonomous-loop output fields (`.agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh`):
-  - `plan_doc_filename` (string)
-  - `result` (`success` | `failed_after_3_retries`)
-  - `failure_reason` (string; empty on success)
 - Builder autonomous-loop output fields (`.agents/skills/eternal-cycler/scripts/run_builder_reviewer_loop.sh`):
   - `plan_doc_filename` (string)
   - `result` (`success` | `failed_after_3_retries`)
@@ -64,7 +57,7 @@ Implementation details:
 - On approval, the loop script updates/moves PR tracking docs (`docs/prs/active` -> `docs/prs/completed`) and records completed tracking metadata including `review state: OPEN`.
 - The loop script performs mechanical git finalization for builder output: stage tracked edits, stage non-baseline untracked files, commit when needed, then push to origin.
 - Lifecycle events no longer run reviewer orchestration.
-- No dedicated `action.pr_autoloop` event exists. Loop behavior validation is covered by regular tooling/script checks and direct `pr-autoloop` runtime operation.
+- No dedicated `action.pr_autoloop` event exists. Loop behavior validation is covered by regular tooling/script checks and direct `eternal-cycler` runtime operation.
 - `execplan.post_completion` does not mark PR ready, does not move PR tracking docs, and does not run git add/commit/push; it is lifecycle validation-only.
 - `gh` operations are executed via out-of-sandbox command paths following `.agents/skills/execplan-sandbox-escalation/`.
 

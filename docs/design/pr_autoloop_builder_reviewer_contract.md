@@ -34,7 +34,7 @@ Embedding reviewer startup, waiting, and PR creation inside lifecycle verificati
 
 Fixed entrypoint:
 
-- `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh`
+- `.agents/skills/eternal-cycler/scripts/run_builder_reviewer_loop.sh`
 
 Required input:
 
@@ -57,7 +57,7 @@ Bounded controls:
 - If `--pr-url` is provided, the script validates the PR with `gh pr view --json headRefName,url` and asserts `headRefName == TARGET_BRANCH`.
 - If the PR head branch differs from the current local branch, the script exits with input error.
 - If `--pr-url` is not provided, the current branch is used. Existing open PR for the branch is reused; otherwise a new PR is created.
-- Resume-vs-new selection is not handled inside the loop script. The `pr-autoloop` skill caller handles this selection before invocation:
+- Resume-vs-new selection is not handled inside the loop script. The `eternal-cycler` skill caller handles this selection before invocation:
   - when `--pr-url` is omitted and `docs/prs/active/*.md` has entries, caller asks whether to resume one of those PRs,
   - if resume is selected, caller switches to the selected doc's branch before running the loop, then passes `PR link` as `--pr-url` when present,
   - if selected doc lacks `PR link`, caller still runs on that switched branch without `--pr-url`,

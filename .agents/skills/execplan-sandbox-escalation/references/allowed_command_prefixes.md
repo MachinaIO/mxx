@@ -25,13 +25,13 @@ Policy note: `gh` prefixed commands are expected to run out-of-sandbox by defaul
 - `mkdir -p docs/prs/active`
 - `scripts/execplan_gate.sh --event execplan.pre_creation`
 - `scripts/execplan_gate.sh --plan`
-- `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_doctor.sh`
-- `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh`
+- `.agents/skills/eternal-cycler/scripts/run_builder_reviewer_doctor.sh`
+- `.agents/skills/eternal-cycler/scripts/run_builder_reviewer_loop.sh`
 
 ## Deprecated prefixes (cleanup candidates)
 
-- `scripts/run_builder_reviewer_doctor.sh` (obsolete after pr-autoloop skill path consolidation)
-- `scripts/run_builder_reviewer_loop.sh` (obsolete after pr-autoloop skill path consolidation)
+- `scripts/run_builder_reviewer_doctor.sh` (obsolete after eternal-cycler skill path consolidation)
+- `scripts/run_builder_reviewer_loop.sh` (obsolete after eternal-cycler skill path consolidation)
 
 ## Entry requirements for new prefixes
 

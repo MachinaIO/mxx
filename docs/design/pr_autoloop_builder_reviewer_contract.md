@@ -15,6 +15,7 @@ Embedding reviewer startup, waiting, and PR creation inside lifecycle verificati
 3. Strict machine-readable approval criteria bound to the current target commit.
 4. Bounded retries to avoid infinite loops.
 5. Lifecycle events (`execplan.pre_creation` / `execplan.post_completion`) remain validation-focused and do not run reviewer automation.
+6. PR tracking completion transition happens only inside loop approval handling, not in lifecycle verification events.
 
 ## Non-Goals
 
@@ -97,14 +98,14 @@ Approval is valid only when both are true in at least one collected comment:
 ### Stop behavior
 
 - No-op stop: if first builder phase produces no new commit after cleanup.
-- Success stop: approval condition above is met.
+- Success stop: approval condition above is met and the script finalizes PR tracking by writing completed metadata (`review state: OPEN`) and moving the tracking file to `docs/prs/completed/`.
 - Failure stop: retry bounds reached (`max-iterations` or reviewer/builder cleanup failure bounds).
 
 ### Lifecycle event integration
 
 - `execplan.pre_creation`: captures plan/PR tracking initialization only.
 - `execplan.post_completion`: performs lifecycle completion checks and final persistence only.
-- Neither lifecycle event starts reviewer automation or performs reviewer wait/approval gating.
+- Neither lifecycle event starts reviewer automation, performs reviewer wait/approval gating, nor transitions PR tracking documents to completed/ready state.
 
 ## Safety and isolation
 

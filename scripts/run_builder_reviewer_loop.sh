@@ -156,6 +156,125 @@ get_new_untracked_paths() {
   done < <(git ls-files --others --exclude-standard)
 }
 
+upsert_bullet_line() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+  local prefix tmp
+
+  prefix="- ${key}:"
+  tmp="$(mktemp)"
+
+  awk -v prefix="$prefix" -v key="$key" -v value="$value" '
+    BEGIN { found = 0 }
+    {
+      if (index($0, prefix) == 1) {
+        print "- " key ": " value
+        found = 1
+        next
+      }
+      print
+    }
+    END {
+      if (!found) {
+        print "- " key ": " value
+      }
+    }
+  ' "$file" > "$tmp"
+
+  mv "$tmp" "$file"
+}
+
+find_pr_tracking_doc() {
+  local pr_url="$1"
+  local dir found_path
+
+  for dir in docs/prs/active docs/prs/completed; do
+    [[ -d "$dir" ]] || continue
+    found_path="$(rg -l -F -- "- PR link: $pr_url" "$dir" 2>/dev/null | head -n1 || true)"
+    if [[ -n "$found_path" ]]; then
+      printf '%s\n' "$found_path"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+finalize_pr_tracking_doc() {
+  local pr_url="$1"
+  local target_branch="$2"
+  local approved_commit="$3"
+  local source_path default_active_path default_completed_path completed_path moved_from
+  local now_utc
+
+  default_active_path="docs/prs/active/pr_${target_branch//\//_}.md"
+  default_completed_path="docs/prs/completed/pr_${target_branch//\//_}.md"
+
+  source_path="$(find_pr_tracking_doc "$pr_url" || true)"
+  if [[ -z "$source_path" ]]; then
+    if [[ -f "$default_active_path" ]]; then
+      source_path="$default_active_path"
+    elif [[ -f "$default_completed_path" ]]; then
+      source_path="$default_completed_path"
+    else
+      source_path="$default_completed_path"
+      mkdir -p "$(dirname "$source_path")"
+      now_utc="$(date -u +"%Y-%m-%d %H:%MZ")"
+      cat > "$source_path" <<EOF
+# PR Tracking: ${target_branch}
+
+- PR link: ${pr_url}
+- PR creation date: ${now_utc}
+- branch name: ${target_branch}
+- commit hash at PR creation time: ${approved_commit}
+- summary/content of the PR: (set by run_builder_reviewer_loop.sh)
+- PR state: OPEN
+- PR head/base: ${target_branch} -> (unknown)
+EOF
+    fi
+  fi
+
+  if [[ "$source_path" == docs/prs/completed/* ]]; then
+    completed_path="$source_path"
+  elif [[ "$source_path" == docs/prs/active/* ]]; then
+    completed_path="docs/prs/completed/$(basename "$source_path")"
+  else
+    completed_path="$default_completed_path"
+  fi
+
+  mkdir -p "$(dirname "$completed_path")"
+
+  moved_from=""
+  if [[ "$source_path" != "$completed_path" ]]; then
+    mv "$source_path" "$completed_path"
+    moved_from="$source_path"
+  fi
+
+  now_utc="$(date -u +"%Y-%m-%d %H:%MZ")"
+  upsert_bullet_line "$completed_path" "PR link" "$pr_url"
+  upsert_bullet_line "$completed_path" "branch name" "$target_branch"
+  upsert_bullet_line "$completed_path" "PR state" "OPEN"
+  upsert_bullet_line "$completed_path" "review state" "OPEN"
+  upsert_bullet_line "$completed_path" "tracking state" "COMPLETED"
+  upsert_bullet_line "$completed_path" "completion commit" "$approved_commit"
+  upsert_bullet_line "$completed_path" "completed at" "$now_utc"
+
+  if [[ -n "$moved_from" ]]; then
+    git add -A -- "$moved_from" "$completed_path" >/dev/null 2>&1 || die "failed to stage PR tracking move/update"
+  else
+    git add -A -- "$completed_path" >/dev/null 2>&1 || die "failed to stage PR tracking update"
+  fi
+
+  if ! git diff --cached --quiet; then
+    git commit -m "docs(pr): complete tracking on reviewer approval" >/dev/null 2>&1 || die "failed to commit PR tracking completion update"
+    git push origin "$target_branch" >/dev/null 2>&1 || die "failed to push PR tracking completion update to origin/$target_branch"
+    log "PR tracking document finalized and pushed: $completed_path"
+  else
+    log "PR tracking document already finalized: $completed_path"
+  fi
+}
+
 resolve_or_create_pr_for_branch() {
   local branch="$1"
   local open_json open_url create_out
@@ -554,6 +673,7 @@ Policy requirements:
   done
 
   if [[ "$APPROVED" -eq 1 ]]; then
+    finalize_pr_tracking_doc "$PR_URL" "$TARGET_BRANCH" "$LATEST_COMMIT"
     log "approval detected for commit $LATEST_COMMIT; loop finished"
     exit 0
   fi

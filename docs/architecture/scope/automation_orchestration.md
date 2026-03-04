@@ -35,7 +35,9 @@ Implementation details:
   - branch-first (reuse existing open PR or create new PR).
 - Comment retrieval uses `gh api graphql` over both issue comments and review bodies.
 - Approval requires `APPROVE` token plus `AUTO_TARGET_COMMIT` equality with current loop target commit.
+- On approval, the loop script updates/moves PR tracking docs (`docs/prs/active` -> `docs/prs/completed`) and records completed tracking metadata including `review state: OPEN`.
 - Lifecycle events no longer run reviewer orchestration.
+- `execplan.post_completion` does not mark PR ready and does not move PR tracking docs; it is lifecycle validation/persistence only.
 - `gh` operations are executed via out-of-sandbox command paths following `.agents/skills/execplan-sandbox-escalation/`.
 
 ## Depends on scopes

@@ -35,8 +35,6 @@ commands=()
 commands+=("rg -n docs/prs/active/|docs/prs/completed/ <plan>")
 
 pr_doc_path=""
-moved_pr_doc_from=""
-moved_pr_doc_to=""
 rollback_plan_path=""
 
 emit_fail() {
@@ -74,21 +72,6 @@ rollback_to_active() {
     fi
   fi
 
-  if [[ -n "$moved_pr_doc_from" && -n "$moved_pr_doc_to" && -f "$moved_pr_doc_to" ]]; then
-    mkdir -p "$(dirname "$moved_pr_doc_from")"
-    commands+=("rollback pr doc $moved_pr_doc_to -> $moved_pr_doc_from")
-    mv "$moved_pr_doc_to" "$moved_pr_doc_from"
-    pr_doc_path="$moved_pr_doc_from"
-    return
-  fi
-
-  if [[ -n "$pr_doc_path" && "$pr_doc_path" == docs/prs/completed/* && -f "$pr_doc_path" ]]; then
-    target_path="docs/prs/active/$(basename "$pr_doc_path")"
-    mkdir -p "$(dirname "$target_path")"
-    commands+=("rollback pr doc $pr_doc_path -> $target_path")
-    mv "$pr_doc_path" "$target_path"
-    pr_doc_path="$target_path"
-  fi
 }
 
 fail_validation() {
@@ -146,47 +129,6 @@ extract_pr_link_from_tracking_doc() {
   sed -n -E 's/^- PR link:[[:space:]]+(.+)$/\1/p' "$tracking_doc" | head -n1 | sed -E 's/[[:space:]]+$//'
 }
 
-remove_markdown_section() {
-  local file="$1"
-  local heading="$2"
-  local tmp
-  tmp="$(mktemp)"
-
-  awk -v heading="$heading" '
-    BEGIN { in_section=0 }
-    {
-      if ($0 == "## " heading) {
-        in_section=1
-        next
-      }
-      if (in_section) {
-        if ($0 ~ /^## /) {
-          in_section=0
-          print $0
-        }
-        next
-      }
-      print $0
-    }
-  ' "$file" > "$tmp"
-
-  mv "$tmp" "$file"
-}
-
-upsert_single_bullet_section() {
-  local file="$1"
-  local heading="$2"
-  local bullet_text="$3"
-
-  remove_markdown_section "$file" "$heading"
-  {
-    echo
-    echo "## $heading"
-    echo
-    echo "- $bullet_text"
-  } >> "$file"
-}
-
 if ! rg -q "event_id=execplan.pre_creation;.*status=pass" "$PLAN"; then
   fail_validation "missing pass entry for execplan.pre_creation"
 fi
@@ -236,45 +178,12 @@ if [[ -z "$pr_url" || "$pr_url" == "(not available locally)" ]]; then
   fail_validation "PR tracking metadata missing resolvable PR link"
 fi
 
-pr_ready="${EXECPLAN_PR_READY:-auto}"
-case "$pr_ready" in
-  ready|not_ready|auto)
-    ;;
-  *)
-    fail_validation "invalid EXECPLAN_PR_READY value: $pr_ready (expected ready|not_ready|auto)"
-    ;;
-esac
-
-if [[ "$pr_ready" == "auto" ]]; then
-  if rg -q "^- \[ \]" "$PLAN" || unresolved_latest="$(has_unresolved_latest_nonpass_event)"; then
-    if [[ -n "${unresolved_latest:-}" ]]; then
-      commands+=("auto-ready blocked by unresolved latest non-pass event: $unresolved_latest")
-    fi
-    pr_ready="not_ready"
-  else
-    pr_ready="ready"
-  fi
+if rg -q "^- \[ \]" "$PLAN"; then
+  fail_validation "plan still contains incomplete Progress actions"
 fi
 
-if [[ "$pr_ready" == "ready" ]]; then
-  commands+=("clear stale blockers sections")
-  remove_markdown_section "$PLAN" "Post-Completion Blockers"
-  remove_markdown_section "$pr_doc_path" "Readiness Blockers"
-
-  if [[ "$pr_doc_path" == docs/prs/active/* ]]; then
-    mkdir -p docs/prs/completed
-    target="docs/prs/completed/$(basename "$pr_doc_path")"
-    commands+=("mv $pr_doc_path $target")
-    mv "$pr_doc_path" "$target"
-    moved_pr_doc_from="$pr_doc_path"
-    moved_pr_doc_to="$target"
-    pr_doc_path="$target"
-  fi
-else
-  blockers="${EXECPLAN_BLOCKERS:-remaining blockers not provided}"
-  commands+=("upsert blockers sections")
-  upsert_single_bullet_section "$PLAN" "Post-Completion Blockers" "$blockers"
-  upsert_single_bullet_section "$pr_doc_path" "Readiness Blockers" "$blockers"
+if unresolved_latest="$(has_unresolved_latest_nonpass_event)"; then
+  fail_validation "latest verification event is unresolved: $unresolved_latest"
 fi
 
 commands+=("git status --short")
@@ -432,32 +341,6 @@ branch="$(git branch --show-current)"
 commands+=("git push origin $branch")
 if ! git push origin "$branch" >/dev/null 2>&1; then
   fail_after_git_add "failed to push final post-completion state to origin/$branch"
-fi
-
-if [[ "$pr_ready" == "ready" ]]; then
-  ready_confirmed="${EXECPLAN_PR_READY_CONFIRMED:-0}"
-  if command -v gh >/dev/null 2>&1; then
-    commands+=("gh pr view $pr_url --json isDraft")
-    is_draft="$(gh pr view "$pr_url" --json isDraft --jq '.isDraft' 2>/dev/null || echo "unknown")"
-    if [[ "$is_draft" == "true" ]]; then
-      commands+=("gh pr ready $pr_url")
-      if ! gh pr ready "$pr_url" >/dev/null 2>&1; then
-        if [[ "$ready_confirmed" != "1" ]]; then
-          fail_after_git_add "failed to transition PR to ready-for-review via gh (set EXECPLAN_PR_READY_CONFIRMED=1 only after manual UI fallback)"
-        fi
-      fi
-    elif [[ "$is_draft" == "false" ]]; then
-      commands+=("pr already ready")
-    else
-      if [[ "$ready_confirmed" != "1" ]]; then
-        fail_after_git_add "failed to detect PR draft state via gh (set EXECPLAN_PR_READY_CONFIRMED=1 only after manual UI confirmation)"
-      fi
-    fi
-  else
-    if [[ "$ready_confirmed" != "1" ]]; then
-      fail_after_git_add "gh CLI unavailable; set PR ready in web UI and re-run with EXECPLAN_PR_READY_CONFIRMED=1"
-    fi
-  fi
 fi
 
 echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"

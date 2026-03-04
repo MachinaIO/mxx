@@ -17,7 +17,6 @@ Options:
   --max-reviewer-failures <n>        Max consecutive reviewer-phase failures (default: 3).
   --model-builder <model>            Optional model for builder codex runs.
   --model-reviewer <model>           Optional model for reviewer codex runs.
-  --min-agent-duration <secs>        Minimum seconds per builder/reviewer invocation (default: 3600).
   --help                             Show this help.
 USAGE
 }
@@ -241,9 +240,6 @@ run_codex_prompt_capture() {
   # Stream codex output directly to the terminal so the operator can follow
   # builder/reviewer progress in real time.  The structured JSON payload is
   # captured separately via --output-last-message into $last_message_file.
-  local agent_start_ts
-  agent_start_ts="$(date +%s)"
-
   set +e
   printf '%s\n' "$prompt_text" | "${cmd[@]}"
   rc=$?
@@ -252,16 +248,6 @@ run_codex_prompt_capture() {
   if [[ -n "$schema_file" ]]; then
     LAST_CODEX_OUTPUT="$(cat "$last_message_file" 2>/dev/null || true)"
     rm -f "$last_message_file"
-  fi
-
-  # Enforce minimum agent duration so the operator can follow progress and
-  # agents cannot short-circuit the loop by returning immediately.
-  local agent_elapsed agent_remaining
-  agent_elapsed=$(( $(date +%s) - agent_start_ts ))
-  agent_remaining=$(( MIN_AGENT_DURATION_SECS - agent_elapsed ))
-  if [[ "$agent_remaining" -gt 0 ]]; then
-    log "$role finished in ${agent_elapsed}s; enforcing minimum duration — sleeping ${agent_remaining}s"
-    sleep "$agent_remaining"
   fi
 
   if [[ "$rc" -ne 0 ]]; then
@@ -605,7 +591,6 @@ MAX_BUILDER_CLEANUP_RETRIES=5
 MAX_REVIEWER_FAILURES=3
 MODEL_BUILDER=""
 MODEL_REVIEWER=""
-MIN_AGENT_DURATION_SECS=3600
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -641,10 +626,6 @@ while [[ $# -gt 0 ]]; do
       MODEL_REVIEWER="${2:-}"
       shift 2
       ;;
-    --min-agent-duration)
-      MIN_AGENT_DURATION_SECS="${2:-}"
-      shift 2
-      ;;
     -h|--help)
       usage
       exit 0
@@ -670,7 +651,7 @@ if [[ -z "$TASK_TEXT" ]]; then
   exit 2
 fi
 
-for n in "$MAX_ITERATIONS" "$MAX_BUILDER_CLEANUP_RETRIES" "$MAX_REVIEWER_FAILURES" "$MIN_AGENT_DURATION_SECS"; do
+for n in "$MAX_ITERATIONS" "$MAX_BUILDER_CLEANUP_RETRIES" "$MAX_REVIEWER_FAILURES"; do
   is_positive_int "$n" || die "numeric options must be positive integers"
 done
 

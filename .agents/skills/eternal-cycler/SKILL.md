@@ -93,9 +93,8 @@ All paths are relative to this SKILL.md file's location (the eternal-cycler inst
 ### Always
 
 20. Treat `run_builder_reviewer_loop.sh` as non-interactive.
-21. Each builder and reviewer agent invocation enforces a minimum runtime of 1 hour (3600 seconds). The loop script enforces this automatically by sleeping for the remaining time after the agent exits. Do not pass `--min-agent-duration 0` or any value below 3600 unless the user explicitly requests it.
-22. **Stream agent output to the operator in real time.** While a builder or reviewer agent is running, relay its output to the human operator continuously as it is produced — do not buffer and dump at completion. The operator must be able to observe progress without waiting for the agent to finish.
-23. **Do not stop the loop without explicit user instruction.** Stopping or abandoning the builder/reviewer loop before the user explicitly requests it is prohibited, regardless of elapsed time, iteration count, or perceived task completion. If the loop script exits on its own (e.g. max iterations reached, unrecoverable error), report the outcome to the user and ask whether to continue rather than silently halting.
+21. **Stream agent output to the operator in real time.** While a builder or reviewer agent is running, relay its output to the human operator continuously as it is produced — do not buffer and dump at completion. The operator must be able to observe progress without waiting for the agent to finish.
+22. **Do not stop the loop without explicit user instruction.** Stopping or abandoning the builder/reviewer loop before the user explicitly requests it is prohibited, regardless of elapsed time, iteration count, or perceived task completion. If the loop script exits on its own (e.g. max iterations reached, unrecoverable error), report the outcome to the user and ask whether to continue rather than silently halting.
 
 ## Suggested invocation template
 

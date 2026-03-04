@@ -1,11 +1,11 @@
 ---
-name: pr-autoloop
-description: When directly invoked by a human user, run this skill by default unless the user explicitly says not to.
+name: eternal-cycler
+description: A skill for automating the loop of interactions between the implementation builder agent and the implementation reviewer agent.
 ---
 
-# Skill: pr-autoloop
+# Skill: eternal-cycler
 
-When directly invoked by a human user, run this skill by default unless the user explicitly says not to run it.
+A skill for automating the loop of interactions between the implementation builder agent and the implementation reviewer agent.
 
 ## Runtime scripts
 

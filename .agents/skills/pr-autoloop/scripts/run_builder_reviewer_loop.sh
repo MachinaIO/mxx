@@ -121,9 +121,20 @@ has_tracked_dirty() {
 }
 
 head_is_pushed() {
-  local local_head remote_head
+  local local_head remote_head remote_output rc
   local_head="$(git rev-parse HEAD)"
-  remote_head="$(git ls-remote --heads origin "$TARGET_BRANCH" | awk '{print $1}' | head -n1)"
+
+  set +e
+  remote_output="$(git ls-remote --heads origin "$TARGET_BRANCH" 2>/dev/null)"
+  rc=$?
+  set -e
+
+  if [[ "$rc" -ne 0 ]]; then
+    log "failed to query origin/$TARGET_BRANCH via git ls-remote; treating branch as not pushed yet"
+    return 1
+  fi
+
+  remote_head="$(awk '{print $1}' <<< "$remote_output" | head -n1)"
   [[ -n "$remote_head" && "$remote_head" == "$local_head" ]]
 }
 
@@ -795,8 +806,7 @@ Policy requirements:
     continue
   fi
 
-  post_output="$(post_pr_comment "$normalized_target_pr_url" "$reviewer_comment_body" || true)"
-  if [[ -z "$post_output" ]]; then
+  if ! post_output="$(post_pr_comment "$normalized_target_pr_url" "$reviewer_comment_body")"; then
     REVIEWER_FAILURES=$((REVIEWER_FAILURES + 1))
     if [[ "$REVIEWER_FAILURES" -ge "$MAX_REVIEWER_FAILURES" ]]; then
       die "failed to post reviewer comment for $REVIEWER_FAILURES consecutive attempts"

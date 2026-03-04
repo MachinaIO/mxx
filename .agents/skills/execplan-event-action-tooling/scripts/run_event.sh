@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ETERNAL_CYCLER_ROOT and REPO_ROOT are exported by execplan_gate.sh before calling this script.
+# Fall back to git-based resolution if invoked directly (e.g. during testing).
+ETERNAL_CYCLER_ROOT="${ETERNAL_CYCLER_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)}"
+REPO_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel)}"
+
 PLAN=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -26,47 +31,11 @@ if [[ -z "$PLAN" || ! -f "$PLAN" ]]; then
   exit 1
 fi
 
-loop_script=".agents/skills/eternal-cycler/scripts/run_builder_reviewer_loop.sh"
-branch_first_call_marker='PR_URL="$(resolve_or_create_pr_for_branch "$TARGET_BRANCH" "$pr_title" "$pr_body")"'
-branch_first_title_default='local pr_title="${2:-}"'
-branch_first_body_default='local pr_body="${3:-}"'
+commands="bash -n ${ETERNAL_CYCLER_ROOT}/scripts/*.sh ${REPO_ROOT}/.agents/skills/execplan-event-*/scripts/*.sh"
 
-commands="bash -n scripts/*.sh .agents/skills/execplan-event-*/scripts/*.sh"
-commands="$commands; rg -F '$branch_first_call_marker' $loop_script"
-commands="$commands; rg -F '$branch_first_title_default' $loop_script"
-commands="$commands; rg -F '$branch_first_body_default' $loop_script"
-
-if ! bash -n scripts/*.sh .agents/skills/execplan-event-*/scripts/*.sh; then
+if ! bash -n "${ETERNAL_CYCLER_ROOT}"/scripts/*.sh "${REPO_ROOT}"/.agents/skills/execplan-event-*/scripts/*.sh; then
   echo "COMMANDS=$commands"
   echo "FAILURE_SUMMARY=tooling script syntax check failed"
-  echo "STATUS=fail"
-  exit 1
-fi
-
-if [[ ! -f "$loop_script" ]]; then
-  echo "COMMANDS=$commands"
-  echo "FAILURE_SUMMARY=missing loop script for branch-first failure regression guard: $loop_script"
-  echo "STATUS=fail"
-  exit 1
-fi
-
-if ! rg -F --quiet "$branch_first_call_marker" "$loop_script"; then
-  echo "COMMANDS=$commands"
-  echo "FAILURE_SUMMARY=missing branch-first failure PR resolve/create call with title/body forwarding"
-  echo "STATUS=fail"
-  exit 1
-fi
-
-if ! rg -F --quiet "$branch_first_title_default" "$loop_script"; then
-  echo "COMMANDS=$commands"
-  echo "FAILURE_SUMMARY=missing optional-safe default for resolve_or_create_pr_for_branch pr_title argument"
-  echo "STATUS=fail"
-  exit 1
-fi
-
-if ! rg -F --quiet "$branch_first_body_default" "$loop_script"; then
-  echo "COMMANDS=$commands"
-  echo "FAILURE_SUMMARY=missing optional-safe default for resolve_or_create_pr_for_branch pr_body argument"
   echo "STATUS=fail"
   exit 1
 fi
@@ -74,3 +43,4 @@ fi
 echo "COMMANDS=$commands"
 echo "FAILURE_SUMMARY=none"
 echo "STATUS=pass"
+

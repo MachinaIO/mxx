@@ -32,4 +32,3 @@ When adding a design document, place it under `docs/design/` and add it to this 
 
 - [DESIGN.md](../../DESIGN.md)
 - [ARCHITECTURE.md](../../ARCHITECTURE.md)
-- [PLANS.md](../../PLANS.md)

@@ -37,6 +37,17 @@ Architecture implication: `gpu` is not only a Rust-level feature; it is a native
 
 CI currently runs formatting, clippy (including `--features disk` path), and release lib tests without `gpu`.
 
+## Autonomous orchestration tooling boundary
+
+Repository-local autonomous PR orchestration under `.agents/skills/eternal-cycler/scripts/run_builder_reviewer_loop.sh` and `.agents/skills/eternal-cycler/scripts/run_builder_reviewer_doctor.sh` depends on CLI toolchain components in addition to Rust/CUDA toolchains:
+
+- `git` (branch synchronization and worktree isolation),
+- `gh` (PR metadata queries and PR comment posting),
+- `codex` (non-interactive builder/reviewer agent execution),
+- `jq` (JSON field extraction from `gh` output).
+
+Architecture implication: autonomous-loop operation is an execution-time tooling boundary. Missing or broken CLI dependencies should be treated as runtime blockers for that scope even when Rust build/test paths are healthy.
+
 ## Update triggers
 
 Update this document whenever:

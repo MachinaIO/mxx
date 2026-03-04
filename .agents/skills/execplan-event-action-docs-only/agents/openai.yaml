@@ -1,0 +1,7 @@
+interface:
+  display_name: "Event Docs Only"
+  short_description: "Run action.docs_only checks"
+  default_prompt: "Execute docs-only verification for an ExecPlan action."
+
+policy:
+  allow_implicit_invocation: true

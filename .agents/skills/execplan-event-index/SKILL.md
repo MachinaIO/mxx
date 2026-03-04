@@ -28,11 +28,13 @@ Format (tab-separated):
 The registry must always include:
 
 - `execplan.pre_creation`
+- `execplan.post_creation`
+- `execplan.resume`
 - `execplan.post_completion`
 
 ## Evolution rule
 
-Action events may be added/removed by editing `references/event_skill_map.tsv` and creating/removing corresponding event skill directories under `.agents/skills/`.
+Action events may be added/removed by editing `references/event_skill_map.tsv` (at `.agents/skills/execplan-event-index/references/event_skill_map.tsv` in the consuming repo) and creating/removing corresponding event skill directories under `.agents/skills/`.
 
 ## Out-of-sandbox command rule
 

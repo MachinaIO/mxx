@@ -73,6 +73,18 @@ After each builder run, the script enforces stabilization before proceeding:
 
 The script performs mechanical finalization by staging tracked changes, staging new untracked files outside the baseline set, committing when needed, and pushing to origin. Builder cleanup prompts are bounded by `--max-builder-cleanup-retries` and focus only on remaining code fixes, not git finalization.
 
+### Builder structured output contract
+
+Builder output in autonomous loop mode requires exactly one JSON object with:
+
+- `plan_doc_filename` (string): repository-relative path of the created/updated plan document.
+- `result` (string enum): `success` or `failed_after_3_retries`.
+- `failure_reason` (string): empty string when `result=success`; non-empty explanation when `result=failed_after_3_retries`.
+
+The loop script invokes builder with `codex exec --output-schema <schema.json> --output-last-message <file>` so Codex is constrained to this structured response contract.
+
+If builder returns `failed_after_3_retries`, the loop script performs `git push` first and then posts a PR comment containing the failure reason with explicit builder identity (`AUTO_AGENT: BUILDER`).
+
 ### Reviewer structured output contract
 
 Reviewer output in autonomous loop mode requires exactly one JSON object with:

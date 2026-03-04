@@ -72,7 +72,9 @@ commands=()
 commands+=("bash -n $DOCTOR")
 commands+=("bash -n $LOOP")
 commands+=("rg -n -- --task|--task-file|--pr-url|--max-iterations|--max-builder-cleanup-retries|--max-reviewer-failures|--model-builder|--model-reviewer $LOOP")
+commands+=("rg -n plan_doc_filename|failed_after_3_retries|failure_reason $LOOP")
 commands+=("rg -n pr_url|comment_body|approve_merge $LOOP")
+commands+=("rg -n write_builder_output_schema|parse_builder_payload_json|handle_builder_payload_result|post_builder_failure_comment_after_push $LOOP")
 commands+=("rg -n write_reviewer_output_schema|parse_reviewer_payload_json|run_codex_prompt_capture|post_pr_comment $LOOP")
 commands+=("rg -n -- --output-schema|--output-last-message $LOOP")
 commands+=("rg -n gh\\ pr\\ comment $LOOP")
@@ -133,7 +135,7 @@ if ! rg -Fq "if ! printf '%s\\n' \"\$prompt_text\" | \"\${cmd[@]}\"; then" "$LOO
   exit 1
 fi
 
-for marker in "pr_url" "comment_body" "approve_merge" "write_reviewer_output_schema" "parse_reviewer_payload_json" "run_codex_prompt_capture" "--output-schema" "--output-last-message" "post_pr_comment" "gh pr comment"; do
+for marker in "plan_doc_filename" "failed_after_3_retries" "failure_reason" "write_builder_output_schema" "parse_builder_payload_json" "handle_builder_payload_result" "post_builder_failure_comment_after_push" "pr_url" "comment_body" "approve_merge" "write_reviewer_output_schema" "parse_reviewer_payload_json" "run_codex_prompt_capture" "--output-schema" "--output-last-message" "post_pr_comment" "gh pr comment"; do
   if ! rg -Fq -- "$marker" "$LOOP"; then
     echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
     echo "FAILURE_SUMMARY=loop script missing required marker: $marker"

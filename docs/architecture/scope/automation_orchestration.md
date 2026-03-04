@@ -32,6 +32,10 @@ Interface contract:
   - `pr_url` (string)
   - `comment_body` (string)
   - `approve_merge` (boolean)
+- Builder autonomous-loop output fields:
+  - `plan_doc_filename` (string)
+  - `result` (`success` | `failed_after_3_retries`)
+  - `failure_reason` (string; empty on success)
 
 Implementation details:
 
@@ -40,6 +44,8 @@ Implementation details:
 - PR routing supports two modes:
   - explicit `--pr-url` (head branch must match current local branch),
   - branch-first on current local branch (reuse existing open PR or create new PR).
+- Builder output is generated with `codex exec --output-schema` and captured with `--output-last-message`.
+- Builder output is parsed as JSON, schema-validated (`plan_doc_filename`, `result`, `failure_reason`), and when builder reports `failed_after_3_retries` the loop script pushes branch state and posts a builder-identity PR comment with failure reason.
 - Reviewer output is generated with `codex exec --output-schema` and captured with `--output-last-message`.
 - Reviewer output is parsed as JSON, schema-validated (`pr_url`, `comment_body`, `approve_merge`), then posted by loop script with `gh pr comment`.
 - Approval requires `approve_merge: true` in validated reviewer JSON output.

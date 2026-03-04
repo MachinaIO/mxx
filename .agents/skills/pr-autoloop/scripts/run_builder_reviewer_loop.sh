@@ -75,6 +75,36 @@ parse_reviewer_payload_json() {
   ' <<< "$raw" 2>/dev/null
 }
 
+parse_builder_payload_json() {
+  local raw="$1"
+  jq -e -c '
+    if type != "object" then
+      error("builder output must be a JSON object")
+    else
+      .
+    end
+    | if (.plan_doc_filename | type) != "string" then error("plan_doc_filename must be string") else . end
+    | if (.result | type) != "string" then error("result must be string") else . end
+    | if (.failure_reason | type) != "string" then error("failure_reason must be string") else . end
+    | .plan_doc_filename |= (sub("^[[:space:]]+"; "") | sub("[[:space:]]+$"; ""))
+    | .failure_reason |= (sub("^[[:space:]]+"; "") | sub("[[:space:]]+$"; ""))
+    | if (.plan_doc_filename | length) == 0 then error("plan_doc_filename must be non-empty") else . end
+    | if (.result != "success" and .result != "failed_after_3_retries") then
+        error("result must be success or failed_after_3_retries")
+      else
+        .
+      end
+    | if (.result == "success" and (.failure_reason | length) != 0) then
+        error("failure_reason must be empty string when result=success")
+      elif (.result == "failed_after_3_retries" and (.failure_reason | length) == 0) then
+        error("failure_reason must be non-empty when result=failed_after_3_retries")
+      else
+        .
+      end
+    | {plan_doc_filename, result, failure_reason}
+  ' <<< "$raw" 2>/dev/null
+}
+
 LAST_CODEX_OUTPUT=""
 
 has_tracked_dirty() {
@@ -135,6 +165,32 @@ write_reviewer_output_schema() {
     },
     "approve_merge": {
       "type": "boolean"
+    }
+  }
+}
+EOF
+  printf '%s\n' "$schema_file"
+}
+
+write_builder_output_schema() {
+  local schema_file
+  schema_file="$(mktemp)"
+  cat > "$schema_file" <<'EOF'
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["plan_doc_filename", "result", "failure_reason"],
+  "properties": {
+    "plan_doc_filename": {
+      "type": "string",
+      "minLength": 1
+    },
+    "result": {
+      "type": "string",
+      "enum": ["success", "failed_after_3_retries"]
+    },
+    "failure_reason": {
+      "type": "string"
     }
   }
 }
@@ -205,6 +261,48 @@ post_pr_comment() {
 
   printf '%s\n' "$output"
   return 0
+}
+
+post_builder_failure_comment_after_push() {
+  local stage="$1"
+  local plan_doc_filename="$2"
+  local failure_reason="$3"
+  local normalized_target_pr_url comment_body
+
+  auto_stage_commit_and_push "loop: checkpoint builder failure report"
+  push_target_branch
+
+  if [[ -z "$PR_URL" ]]; then
+    PR_URL="$(resolve_or_create_pr_for_branch "$TARGET_BRANCH")"
+    [[ -n "$PR_URL" ]] || die "failed to resolve/create PR for branch: $TARGET_BRANCH"
+  fi
+
+  normalized_target_pr_url="$(normalize_pr_url "$PR_URL")"
+  comment_body="AUTO_AGENT: BUILDER
+Builder agent failure report.
+stage: ${stage}
+plan_doc_filename: ${plan_doc_filename}
+result: failed_after_3_retries
+failure_reason: ${failure_reason}"
+
+  post_pr_comment "$normalized_target_pr_url" "$comment_body" >/dev/null || die "failed to post builder failure comment to $normalized_target_pr_url"
+}
+
+handle_builder_payload_result() {
+  local stage="$1"
+  local payload_json="$2"
+  local result plan_doc_filename failure_reason
+
+  result="$(jq -r '.result' <<< "$payload_json")"
+  plan_doc_filename="$(jq -r '.plan_doc_filename' <<< "$payload_json")"
+  failure_reason="$(jq -r '.failure_reason' <<< "$payload_json")"
+
+  if [[ "$result" == "success" ]]; then
+    return 0
+  fi
+
+  post_builder_failure_comment_after_push "$stage" "$plan_doc_filename" "$failure_reason"
+  die "builder reported failed_after_3_retries at stage=${stage}; reason=${failure_reason}; plan_doc_filename=${plan_doc_filename}"
 }
 
 get_new_untracked_paths() {
@@ -599,11 +697,23 @@ Requirements:
 - Follow repository policies in AGENTS.md and PLANS.md.
 - Work only on branch: ${TARGET_BRANCH}
 - Leave your code edits in the worktree/index; the loop script will stage, commit, and push automatically.
-- Keep unrelated baseline untracked files untouched."
+- Keep unrelated baseline untracked files untouched.
+- Try up to 3 implementation attempts before declaring failure.
+- Return exactly one JSON object and nothing else:
+  {\"plan_doc_filename\":\"<relative-plan-path>\",\"result\":\"success|failed_after_3_retries\",\"failure_reason\":\"<empty-if-success>\"}
+- Use `result=success` only when implementation is complete for this request.
+- Use `result=failed_after_3_retries` only after 3 attempts fail and include concrete failure reason in `failure_reason`."
 
-if ! run_codex_prompt "builder_initial" "$MODEL_BUILDER" "$initial_builder_prompt"; then
+builder_schema_file="$(write_builder_output_schema)"
+if ! run_codex_prompt_capture "builder_initial" "$MODEL_BUILDER" "$initial_builder_prompt" "$builder_schema_file"; then
+  rm -f "$builder_schema_file"
   die "initial builder execution failed"
 fi
+rm -f "$builder_schema_file"
+
+builder_payload_json="$(parse_builder_payload_json "$LAST_CODEX_OUTPUT" || true)"
+[[ -n "$builder_payload_json" ]] || die "initial builder output was not valid JSON payload"
+handle_builder_payload_result "initial" "$builder_payload_json"
 
 cleanup_result="$(run_builder_cleanup_until_stable "$START_COMMIT" || true)"
 [[ -n "$cleanup_result" ]] || die "builder cleanup failed after initial task"
@@ -712,7 +822,12 @@ ${comment_url}
 Requirements:
 - Implement required fixes on branch ${TARGET_BRANCH}.
 - Leave your code edits in the worktree/index; the loop script will stage, commit, and push automatically.
-- Keep unrelated baseline untracked files untouched."
+- Keep unrelated baseline untracked files untouched.
+- Try up to 3 implementation attempts before declaring failure.
+- Return exactly one JSON object and nothing else:
+  {\"plan_doc_filename\":\"<relative-plan-path>\",\"result\":\"success|failed_after_3_retries\",\"failure_reason\":\"<empty-if-success>\"}
+- Use `result=success` only when implementation is complete for this request.
+- Use `result=failed_after_3_retries` only after 3 attempts fail and include concrete failure reason in `failure_reason`."
   else
     builder_followup_prompt="You are called by a parent agent as a builder agent.
 You are the BUILDER agent in an autonomous loop.
@@ -723,12 +838,24 @@ ${reviewer_comment_body}
 Requirements:
 - Implement required fixes on branch ${TARGET_BRANCH}.
 - Leave your code edits in the worktree/index; the loop script will stage, commit, and push automatically.
-- Keep unrelated baseline untracked files untouched."
+- Keep unrelated baseline untracked files untouched.
+- Try up to 3 implementation attempts before declaring failure.
+- Return exactly one JSON object and nothing else:
+  {\"plan_doc_filename\":\"<relative-plan-path>\",\"result\":\"success|failed_after_3_retries\",\"failure_reason\":\"<empty-if-success>\"}
+- Use `result=success` only when implementation is complete for this request.
+- Use `result=failed_after_3_retries` only after 3 attempts fail and include concrete failure reason in `failure_reason`."
   fi
 
-  if ! run_codex_prompt "builder_followup" "$MODEL_BUILDER" "$builder_followup_prompt"; then
+  builder_schema_file="$(write_builder_output_schema)"
+  if ! run_codex_prompt_capture "builder_followup" "$MODEL_BUILDER" "$builder_followup_prompt" "$builder_schema_file"; then
+    rm -f "$builder_schema_file"
     die "builder follow-up execution failed at iteration $ITERATION"
   fi
+  rm -f "$builder_schema_file"
+
+  builder_payload_json="$(parse_builder_payload_json "$LAST_CODEX_OUTPUT" || true)"
+  [[ -n "$builder_payload_json" ]] || die "builder follow-up output was not valid JSON payload at iteration $ITERATION"
+  handle_builder_payload_result "followup_iter_${ITERATION}" "$builder_payload_json"
 
   cleanup_result="$(run_builder_cleanup_until_stable "$LATEST_COMMIT" || true)"
   [[ -n "$cleanup_result" ]] || die "builder cleanup failed at iteration $ITERATION"

@@ -452,7 +452,7 @@ resolve_or_create_pr_for_branch() {
 fetch_self_comments_since() {
   local pr_url="$1"
   local self_login="$2"
-  local since_iso="$3"
+  local since_epoch="$3"
 
   local issue_query review_query
   local issue_cursor review_cursor
@@ -472,10 +472,10 @@ fetch_self_comments_since() {
     response="$(gh api graphql -f query="$issue_query" -F owner="$PR_OWNER" -F name="$PR_REPO" -F number="$PR_NUMBER" -F cursor="$issue_cursor" 2>/dev/null || true)"
     [[ -n "$response" ]] || { rm -f "$tmp"; return 1; }
 
-    jq -c --arg login "$self_login" --arg since "$since_iso" '
+    jq -c --arg login "$self_login" --argjson since "$since_epoch" '
       .data.repository.pullRequest.comments.nodes[]
       | select(.author.login == $login)
-      | select(.createdAt > $since)
+      | select((.createdAt | fromdateiso8601) > $since)
       | {url:.url, body:(.body // ""), time:.createdAt, kind:"issue_comment"}
     ' <<< "$response" >> "$tmp"
 
@@ -489,11 +489,11 @@ fetch_self_comments_since() {
     response="$(gh api graphql -f query="$review_query" -F owner="$PR_OWNER" -F name="$PR_REPO" -F number="$PR_NUMBER" -F cursor="$review_cursor" 2>/dev/null || true)"
     [[ -n "$response" ]] || { rm -f "$tmp"; return 1; }
 
-    jq -c --arg login "$self_login" --arg since "$since_iso" '
+    jq -c --arg login "$self_login" --argjson since "$since_epoch" '
       .data.repository.pullRequest.reviews.nodes[]
       | select(.author.login == $login)
       | select(.submittedAt != null)
-      | select(.submittedAt > $since)
+      | select((.submittedAt | fromdateiso8601) > $since)
       | {url:.url, body:(.body // ""), time:.submittedAt, kind:"review"}
     ' <<< "$response" >> "$tmp"
 
@@ -797,8 +797,8 @@ Policy requirements:
     continue
   fi
 
-  commit_time="$(git show -s --format=%cI "$LATEST_COMMIT")"
-  comments_json="$(fetch_self_comments_since "$PR_URL" "$SELF_LOGIN" "$commit_time" || true)"
+  commit_epoch="$(git show -s --format=%ct "$LATEST_COMMIT")"
+  comments_json="$(fetch_self_comments_since "$PR_URL" "$SELF_LOGIN" "$commit_epoch" || true)"
   if [[ -z "$comments_json" ]]; then
     REVIEWER_FAILURES=$((REVIEWER_FAILURES + 1))
     if [[ "$REVIEWER_FAILURES" -ge "$MAX_REVIEWER_FAILURES" ]]; then

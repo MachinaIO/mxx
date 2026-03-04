@@ -93,6 +93,10 @@ For each review cycle, the script fetches self-authored PR output after the targ
 
 via `gh api graphql`.
 
+Time filtering rule:
+
+- compare timestamps as epoch seconds (`fromdateiso8601` in jq), not raw ISO string lexical comparison, so timezone-offset differences cannot hide valid newer comments.
+
 Approval is valid only when both are true in at least one collected comment:
 
 1. `APPROVE` token is present,

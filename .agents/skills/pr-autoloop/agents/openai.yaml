@@ -1,7 +1,0 @@
-interface:
-  display_name: "PR Reviewer Daemon"
-  short_description: "Run builder/reviewer PR automation through reviewer daemon messaging"
-  default_prompt: "Start or use the reviewer daemon workflow with strict machine-readable review comment contracts."
-
-policy:
-  allow_implicit_invocation: true

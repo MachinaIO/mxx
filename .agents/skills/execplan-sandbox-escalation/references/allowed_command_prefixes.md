@@ -20,10 +20,17 @@ Policy note: `gh` prefixed commands are expected to run out-of-sandbox by defaul
 - `gh pr ready`
 - `gh pr status`
 - `gh pr edit`
+- `gh api graphql`
 - `mv docs/prs/active/`
 - `mkdir -p docs/prs/active`
 - `scripts/execplan_gate.sh --event execplan.pre_creation`
 - `scripts/execplan_gate.sh --plan`
+- `scripts/run_builder_reviewer_doctor.sh`
+- `scripts/run_builder_reviewer_loop.sh`
+
+## Deprecated prefixes (cleanup candidates)
+
+- `.agents/skills/pr-autoloop/scripts/reviewer_daemon.sh --start` (obsolete after fixed-script migration)
 
 ## Entry requirements for new prefixes
 

@@ -25,6 +25,7 @@ For the target PR, verify all of the following:
 5. If PR changes can materially affect benchmark outcomes, run relevant benchmarks and record the result delta against the target branch implementation (the PR base branch).
 6. Check for any other unnatural, inconsistent, or suspicious changes.
 7. Confirm the target ExecPlan includes a `Verification Ledger` with complete gate-attempt history for required lifecycle and action events.
+8. Inspect the latest plan document changed by the PR. If that plan indicates unresolved three-attempt failure/escalation state (for example, force-closed failed plan without corresponding remediation), the reviewer comment must explicitly demand remediation actions.
 
 ## Verification source rule
 
@@ -46,12 +47,9 @@ If all checks pass, the PR comment must explicitly state that result and include
 
 ## Autonomous loop comment contract
 
-When review work is executed as part of the repository autonomous flow (builder/reviewer daemon mode), the reviewer comment must include all of the following machine-readable tags:
+When review work is executed as part of the repository autonomous flow (fixed builder/reviewer script mode), the reviewer comment must include all of the following machine-readable tags:
 
 - `AUTO_AGENT: REVIEWER`
-- `AUTO_RUN_ID: <run_id>`
-- `AUTO_ITERATION: <iteration_number>`
-- `AUTO_REQUEST_ID: <request_id>` (daemon request/response mode)
 - `AUTO_REVIEW_STATUS: APPROVED|CHANGES_REQUIRED`
 - `AUTO_TARGET_COMMIT: <sha>`
 

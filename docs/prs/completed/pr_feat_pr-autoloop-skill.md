@@ -1,10 +1,9 @@
 # PR Tracking: feat/pr-autoloop-skill
 
 - PR link: https://github.com/MachinaIO/mxx/pull/63
-- PR creation date: 2026-03-03T20:27:59Z
+- PR creation date: 2026-03-04 00:06Z
 - branch name: feat/pr-autoloop-skill
-- commit hash at PR creation time: e9aae72975467ba1a56ab7df2083d1446511f1f8
+- commit hash at PR creation time: a8e6cf5bd48cc2a40ccd907c912b1554f1c2b23e
 - summary/content of the PR: feat/pr autoloop skill
-- PR state: OPEN (draft=true)
+- PR state: OPEN
 - PR head/base: feat/pr-autoloop-skill -> main
-- last metadata refresh: 2026-03-03 20:31Z

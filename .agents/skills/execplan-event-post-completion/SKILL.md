@@ -13,8 +13,6 @@ Executes the "after main ExecPlan completion" workflow:
 - if ready, move tracking doc to `docs/prs/completed/`,
 - if not ready, keep active state and record blockers,
 - stage/commit/push only files changed by the plan in this lifecycle,
-- send pushed commit metadata to reviewer daemon and wait for reviewer response,
-- fetch reviewer comment by returned URL and require `APPROVE` token for the pushed commit,
 - apply tracked/untracked baseline rule: keep pre-existing unchanged tracked/untracked edits unstaged, but stage files newly changed during this plan (including a new target plan document) and pre-existing files modified during this plan,
 - run `gh pr ready` when the PR is complete,
 - if validation fails before staging, roll back plan/pr tracking docs to active paths and return to action revision flow.
@@ -30,7 +28,7 @@ Execution policy:
 
 - This event must be executed out-of-sandbox.
 - Run through gate as: `scripts/execplan_gate.sh --plan <completed_plan_md> --event execplan.post_completion` with out-of-sandbox execution.
-- Do not run this event inside sandbox because reviewer-daemon request/response flow and `gh` access are required.
+- Do not run this event inside sandbox because stable `gh` access is required.
 
 ## Script
 

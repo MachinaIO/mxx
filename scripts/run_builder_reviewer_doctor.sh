@@ -4,15 +4,15 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  doctor.sh [--pr-url <url> | --head-branch <branch>] [--offline-ok]
-  doctor.sh --help
+  run_builder_reviewer_doctor.sh [--pr-url <url> | --head-branch <branch>] [--offline-ok]
+  run_builder_reviewer_doctor.sh --help
 
 Checks:
   - required CLIs (`git`, `gh`, `codex`, `jq`)
   - `gh auth status`
   - `codex login status`
-  - `gh pr view` for the target PR URL when provided
-  - branch visibility and PR discovery API access when starting without an existing PR URL
+  - PR metadata access (`gh pr view`) when `--pr-url` is provided
+  - PR discovery access by head branch when `--head-branch` is provided
 USAGE
 }
 
@@ -55,6 +55,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -n "$PR_URL" && -n "$HEAD_BRANCH" ]]; then
+  echo "--pr-url and --head-branch are mutually exclusive" >&2
+  exit 2
+fi
+
 if [[ -z "$PR_URL" && -z "$HEAD_BRANCH" ]]; then
   HEAD_BRANCH="$(resolve_current_branch || true)"
 fi
@@ -87,6 +92,7 @@ run_check() {
   local out_file
   local rc
   local summary
+
   out_file="$(mktemp)"
 
   set +e
@@ -119,7 +125,7 @@ run_check "GitHub authentication" "gh auth status"
 run_check "Codex authentication" "codex login status"
 
 if [[ -n "$PR_URL" ]]; then
-  run_check "PR metadata access" "gh pr view '$PR_URL' --json number,title,headRefName,baseRefName,url,state,isDraft"
+  run_check "PR metadata access" "gh pr view '$PR_URL' --json number,url,state,mergedAt,headRefName,baseRefName,isDraft"
 else
   if git show-ref --verify --quiet "refs/heads/$HEAD_BRANCH" || git ls-remote --exit-code --heads origin "$HEAD_BRANCH" >/dev/null 2>&1; then
     echo "[OK] head branch is visible: $HEAD_BRANCH"
@@ -128,7 +134,7 @@ else
     hard_fail=1
   fi
 
-  run_check "PR discovery access by head branch" "gh pr list --head '$HEAD_BRANCH' --json number,url,headRefName,state,isDraft --limit 20"
+  run_check "PR discovery access by head branch" "gh pr list --head '$HEAD_BRANCH' --state all --json number,url,headRefName,state,isDraft,mergedAt --limit 20"
 fi
 
 if [[ "$hard_fail" -ne 0 ]]; then

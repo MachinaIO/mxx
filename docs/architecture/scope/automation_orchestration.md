@@ -2,18 +2,13 @@
 
 ## Purpose
 
-Documents repository-local autonomous orchestration for pull request iteration implemented as a skill with bundled scripts.
+Documents repository-local autonomous PR orchestration implemented as fixed scripts under `scripts/`.
 
 ## Implementation mapping
 
-- `.agents/skills/pr-autoloop/SKILL.md`
-- `.agents/skills/pr-autoloop/agents/openai.yaml`
-- `.agents/skills/pr-autoloop/references/comment_contract.md`
-- `.agents/skills/pr-autoloop/references/state_schema.md`
-- `.agents/skills/pr-autoloop/scripts/doctor.sh`
-- `.agents/skills/pr-autoloop/scripts/reviewer_daemon.sh`
+- `scripts/run_builder_reviewer_doctor.sh`
+- `scripts/run_builder_reviewer_loop.sh`
 - `.agents/skills/execplan-event-action-pr-autoloop/SKILL.md`
-- `.agents/skills/execplan-event-action-pr-autoloop/agents/openai.yaml`
 - `.agents/skills/execplan-event-action-pr-autoloop/scripts/run_event.sh`
 - `.agents/skills/execplan-event-index/references/event_skill_map.tsv` (event registration)
 
@@ -21,29 +16,27 @@ Documents repository-local autonomous orchestration for pull request iteration i
 
 Interface contract:
 
-- `reviewer_daemon.sh` CLI modes and required arguments:
-  - `--start [--pr-url <url>] [--head-branch <branch>]`
-  - `--request --commit <sha> [--pr-url <url>] [--head-branch <branch>] [--request-id <id>] [--run-id <id>] [--iteration <n>]`
-  - `--status`
-  - `--stop`
+- `run_builder_reviewer_loop.sh` required/optional arguments:
+  - `--task <text>` or `--task-file <path>`
+  - optional `--pr-url <url>`
+  - bounded controls (`--max-iterations`, `--max-builder-cleanup-retries`, `--max-reviewer-failures`)
+  - optional model selectors (`--model-builder`, `--model-reviewer`)
 - Reviewer comment contract fields:
   - `AUTO_AGENT: REVIEWER`
-  - `AUTO_REQUEST_ID: <request_id>`
-  - `AUTO_RUN_ID: <run_id>`
-  - `AUTO_ITERATION: <n>`
   - `AUTO_REVIEW_STATUS: APPROVED|CHANGES_REQUIRED`
   - `AUTO_TARGET_COMMIT: <sha>`
-  - `APPROVE` token when approved
+  - `APPROVE` token only for approved output
 
 Implementation details:
 
-- Reviewer daemon inbox/response/runtime state under `.agents/skills/pr-autoloop/runtime/reviewer-daemon/`.
-- Builder sends commit-scoped review requests and blocks until daemon response payload is written.
-- Daemon can discover PR URL from head branch when request omits explicit PR URL.
-- ExecPlan lifecycle events use daemon messaging: pre-creation starts reviewer daemon if absent, post-completion sends commit metadata and blocks until reviewer response comment URL is returned.
-- `gh` API operations are executed via out-of-sandbox command paths following `.agents/skills/execplan-sandbox-escalation/`.
-- Reviewer iteration comments are non-blocking with respect to CI runtime; reviewer does not wait for CI completion to post contract output.
-- Event-level validation via `action.pr_autoloop` skill script, including rejection of removed legacy loop files.
+- Fixed-script loop orchestrates builder/reviewer codex execution and owns retry bounds.
+- PR routing supports two modes:
+  - explicit `--pr-url` (OPEN and unmerged only),
+  - branch-first (reuse existing open PR or create new PR).
+- Comment retrieval uses `gh api graphql` over both issue comments and review bodies.
+- Approval requires `APPROVE` token plus `AUTO_TARGET_COMMIT` equality with current loop target commit.
+- Lifecycle events no longer run reviewer orchestration.
+- `gh` operations are executed via out-of-sandbox command paths following `.agents/skills/execplan-sandbox-escalation/`.
 
 ## Depends on scopes
 
@@ -52,7 +45,7 @@ Implementation details:
 
 ## External/tool boundaries
 
-- `codex` CLI for non-interactive agent execution.
+- `codex` CLI for non-interactive builder/reviewer agent execution.
 - `gh` CLI for PR metadata and comment operations.
 - `git` for branch sync and worktree isolation.
 - `jq` for parsing JSON responses.

@@ -31,8 +31,11 @@ if [[ "$PLAN" == /* ]]; then
   plan_is_abs=1
 fi
 
+# REPO_ROOT: root of the consuming git repository.
+REPO_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel)}"
+
 commands=()
-commands+=("rg -n docs/prs/active/|docs/prs/completed/ <plan>")
+commands+=("rg -n eternal-cycler-out/prs/active/|eternal-cycler-out/prs/completed/ <plan>")
 
 pr_doc_path=""
 rollback_plan_path=""
@@ -51,7 +54,7 @@ emit_fail() {
 to_plan_style_path() {
   local rel="$1"
   if [[ "$plan_is_abs" -eq 1 ]]; then
-    printf "%s/%s" "$PWD" "$rel"
+    printf "%s/%s" "$REPO_ROOT" "$rel"
   else
     printf "%s" "$rel"
   fi
@@ -60,8 +63,8 @@ to_plan_style_path() {
 rollback_to_active() {
   local target_rel target_path
 
-  if [[ "$PLAN" == docs/plans/completed/* || "$PLAN" == */docs/plans/completed/* ]]; then
-    target_rel="docs/plans/active/$(basename "$PLAN")"
+  if [[ "$PLAN" == eternal-cycler-out/plans/completed/* || "$PLAN" == */eternal-cycler-out/plans/completed/* ]]; then
+    target_rel="eternal-cycler-out/plans/active/$(basename "$PLAN")"
     target_path="$(to_plan_style_path "$target_rel")"
     if [[ "$PLAN" != "$target_path" && -f "$PLAN" ]]; then
       mkdir -p "$(dirname "$target_path")"
@@ -106,7 +109,8 @@ has_unresolved_latest_nonpass_event() {
     }
     END {
       for (e in latest) {
-        if (e == "execplan.post_completion") {
+        if (e == "execplan.pre_creation" || e == "execplan.post_creation" || \
+            e == "execplan.resume" || e == "execplan.post_completion") {
           continue
         }
         if (latest[e] == "fail" || latest[e] == "escalated") {
@@ -124,8 +128,9 @@ extract_pr_link_from_tracking_doc() {
   sed -n -E 's/^- PR link:[[:space:]]+(.+)$/\1/p' "$tracking_doc" | head -n1 | sed -E 's/[[:space:]]+$//'
 }
 
-if ! rg -q "event_id=execplan.pre_creation;.*status=pass" "$PLAN"; then
-  fail_validation "missing pass entry for execplan.pre_creation"
+if ! rg -q "event_id=execplan.post_creation;.*status=pass" "$PLAN" && \
+   ! rg -q "event_id=execplan.resume;.*status=pass" "$PLAN"; then
+  fail_validation "missing pass entry for execplan.post_creation or execplan.resume"
 fi
 
 if ! awk '
@@ -139,7 +144,8 @@ if ! awk '
         event=parts[i]
       }
     }
-    if (event != "" && event != "execplan.pre_creation" && event != "execplan.post_completion") {
+    if (event != "" && event != "execplan.pre_creation" && event != "execplan.post_creation" \
+        && event != "execplan.resume" && event != "execplan.post_completion") {
       found=1
     }
   }
@@ -148,13 +154,16 @@ if ! awk '
   fail_validation "missing pass entry for non-lifecycle event"
 fi
 
-pr_doc_path="$(rg -o "docs/prs/(active|completed)/[^ )\t]+\\.md" "$PLAN" | head -n1 || true)"
+pr_doc_path="$(rg -o "eternal-cycler-out/prs/(active|completed)/[^ )\t]+\\.md" "$PLAN" | head -n1 || true)"
 if [[ -z "$pr_doc_path" ]]; then
   fail_validation "missing PR tracking document linkage in plan"
 fi
 
-if [[ ! -f "$pr_doc_path" && "$pr_doc_path" == docs/prs/active/* ]]; then
-  fallback_path="docs/prs/completed/$(basename "$pr_doc_path")"
+# Resolve to absolute path for file tests (plan may record repo-relative paths).
+[[ "$pr_doc_path" == /* ]] || pr_doc_path="${REPO_ROOT}/${pr_doc_path}"
+
+if [[ ! -f "$pr_doc_path" && "$pr_doc_path" == */eternal-cycler-out/prs/active/* ]]; then
+  fallback_path="${REPO_ROOT}/eternal-cycler-out/prs/completed/$(basename "$pr_doc_path")"
   if [[ -f "$fallback_path" ]]; then
     commands+=("fallback pr doc $pr_doc_path -> $fallback_path")
     pr_doc_path="$fallback_path"
@@ -194,10 +203,10 @@ commands+=("git status --short")
 git status --short >/dev/null
 
 if ! rg -q "<!-- execplan-start-untracked:start -->" "$PLAN"; then
-  fail_validation "missing execplan start untracked snapshot in plan; run pre-creation with --plan and retry"
+  fail_validation "missing execplan start untracked snapshot in plan; run execplan.post_creation and retry"
 fi
 if ! rg -q "<!-- execplan-start-tracked:start -->" "$PLAN"; then
-  fail_validation "missing execplan start tracked snapshot in plan; run pre-creation with --plan and retry"
+  fail_validation "missing execplan start tracked snapshot in plan; run execplan.post_creation and retry"
 fi
 
 echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"

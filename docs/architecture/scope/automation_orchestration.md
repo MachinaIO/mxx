@@ -18,7 +18,9 @@ Interface contract:
 
 - `run_builder_reviewer_loop.sh` required/optional arguments:
   - `--task <text>` or `--task-file <path>`
+  - if both are omitted in interactive mode, prompt task text on stdin
   - optional `--pr-url <url>`
+  - if `--pr-url` is omitted in interactive mode and `docs/prs/active/*.md` exists, prompt resume/new selection
   - bounded controls (`--max-iterations`, `--max-builder-cleanup-retries`, `--max-reviewer-failures`)
   - optional model selectors (`--model-builder`, `--model-reviewer`)
 - Reviewer comment contract fields:
@@ -36,8 +38,9 @@ Implementation details:
 - Comment retrieval uses `gh api graphql` over both issue comments and review bodies.
 - Approval requires `APPROVE` token plus `AUTO_TARGET_COMMIT` equality with current loop target commit.
 - On approval, the loop script updates/moves PR tracking docs (`docs/prs/active` -> `docs/prs/completed`) and records completed tracking metadata including `review state: OPEN`.
+- The loop script performs mechanical git finalization for builder output: stage tracked edits, stage non-baseline untracked files, commit when needed, then push to origin.
 - Lifecycle events no longer run reviewer orchestration.
-- `execplan.post_completion` does not mark PR ready and does not move PR tracking docs; it is lifecycle validation/persistence only.
+- `execplan.post_completion` does not mark PR ready, does not move PR tracking docs, and does not run git add/commit/push; it is lifecycle validation-only.
 - `gh` operations are executed via out-of-sandbox command paths following `.agents/skills/execplan-sandbox-escalation/`.
 
 ## Depends on scopes

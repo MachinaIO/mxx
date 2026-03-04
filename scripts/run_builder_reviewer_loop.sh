@@ -4,10 +4,13 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  run_builder_reviewer_loop.sh (--task <text> | --task-file <path>) [options]
+  run_builder_reviewer_loop.sh [--task <text> | --task-file <path>] [options]
 
 Options:
+  --task <text>                      Builder initial task text. If omitted in interactive mode, prompt on stdin.
+  --task-file <path>                 Builder initial task file path. If omitted in interactive mode, prompt on stdin.
   --pr-url <url>                     Reuse an existing OPEN (unmerged) PR and its head branch.
+                                    If omitted and docs/prs/active has entries, interactive mode prompts resume/new choice.
   --max-iterations <n>               Max review iterations (default: 20).
   --max-builder-cleanup-retries <n>  Max builder cleanup retries per cycle (default: 5).
   --max-reviewer-failures <n>        Max consecutive reviewer-phase failures (default: 3).
@@ -33,6 +36,15 @@ require_cmd() {
 
 is_positive_int() {
   [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -gt 0 ]]
+}
+
+is_interactive_session() {
+  [[ -t 0 && -t 1 ]]
+}
+
+trim_spaces() {
+  local value="$1"
+  echo "$value" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
 }
 
 resolve_repo_root() {
@@ -154,6 +166,140 @@ get_new_untracked_paths() {
       printf '%s\n' "$path"
     fi
   done < <(git ls-files --others --exclude-standard)
+}
+
+extract_tracking_field() {
+  local tracking_doc="$1"
+  local field="$2"
+  local raw=""
+
+  raw="$(sed -n -E "s/^- ${field}:[[:space:]]+(.+)$/\\1/p" "$tracking_doc" | head -n1 || true)"
+  trim_spaces "$raw"
+}
+
+extract_tracking_title_branch() {
+  local tracking_doc="$1"
+  local raw=""
+
+  raw="$(sed -n -E 's/^# PR Tracking:[[:space:]]+(.+)$/\1/p' "$tracking_doc" | head -n1 || true)"
+  trim_spaces "$raw"
+}
+
+prompt_for_task_text() {
+  local line
+  local lines=()
+
+  is_interactive_session || die "either --task or --task-file is required in non-interactive mode"
+
+  echo "No --task/--task-file provided." >&2
+  echo "Enter builder task text. Finish with a single line: EOF" >&2
+  while IFS= read -r line; do
+    if [[ "$line" == "EOF" ]]; then
+      break
+    fi
+    lines+=("$line")
+  done
+
+  if [[ ${#lines[@]} -eq 0 ]]; then
+    die "task content is empty"
+  fi
+
+  TASK_TEXT="$(printf '%s\n' "${lines[@]}")"
+  TASK_TEXT="${TASK_TEXT%$'\n'}"
+}
+
+prompt_for_resume_target_if_needed() {
+  local docs=()
+  local idx choice choice_num
+  local selected_doc branch_name pr_link display_branch display_pr
+
+  CHOSEN_BRANCH=""
+  CHOSEN_PR_URL=""
+
+  [[ -z "$PR_URL" ]] || return 0
+  is_interactive_session || return 0
+
+  if [[ -d docs/prs/active ]]; then
+    while IFS= read -r path; do
+      [[ -n "$path" ]] && docs+=("$path")
+    done < <(find docs/prs/active -maxdepth 1 -type f -name '*.md' | sort)
+  fi
+
+  [[ ${#docs[@]} -gt 0 ]] || return 0
+
+  echo "Active PR tracking documents were found and --pr-url was not provided." >&2
+  echo "Select target:" >&2
+  echo "  [0] Create or reuse PR from current branch" >&2
+
+  for idx in "${!docs[@]}"; do
+    branch_name="$(extract_tracking_field "${docs[$idx]}" "branch name")"
+    if [[ -z "$branch_name" ]]; then
+      branch_name="$(extract_tracking_title_branch "${docs[$idx]}")"
+    fi
+    pr_link="$(extract_tracking_field "${docs[$idx]}" "PR link")"
+
+    display_branch="${branch_name:-unknown}"
+    display_pr="${pr_link:-none}"
+    echo "  [$((idx + 1))] Resume ${docs[$idx]} (branch=${display_branch}, pr=${display_pr})" >&2
+  done
+
+  while true; do
+    read -r -p "Choose [0-${#docs[@]}] (default 0): " choice
+    choice="$(trim_spaces "$choice")"
+    if [[ -z "$choice" ]]; then
+      choice_num=0
+      break
+    fi
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 0 && choice <= ${#docs[@]} )); then
+      choice_num="$choice"
+      break
+    fi
+    echo "Invalid selection: $choice" >&2
+  done
+
+  if (( choice_num == 0 )); then
+    return 0
+  fi
+
+  selected_doc="${docs[$((choice_num - 1))]}"
+  CHOSEN_BRANCH="$(extract_tracking_field "$selected_doc" "branch name")"
+  if [[ -z "$CHOSEN_BRANCH" ]]; then
+    CHOSEN_BRANCH="$(extract_tracking_title_branch "$selected_doc")"
+  fi
+
+  CHOSEN_PR_URL="$(extract_tracking_field "$selected_doc" "PR link")"
+  if [[ "$CHOSEN_PR_URL" == "(not available locally)" ]]; then
+    CHOSEN_PR_URL=""
+  fi
+
+  if [[ -z "$CHOSEN_BRANCH" && -z "$CHOSEN_PR_URL" ]]; then
+    die "selected PR tracking document lacks both branch and PR link: $selected_doc"
+  fi
+}
+
+push_target_branch() {
+  git push origin "$TARGET_BRANCH" >/dev/null 2>&1 || die "failed to push branch to origin/$TARGET_BRANCH"
+}
+
+auto_stage_commit_and_push() {
+  local commit_message="$1"
+
+  git add -u -- . >/dev/null 2>&1 || die "failed to stage tracked changes"
+
+  mapfile -t NEW_UNTRACKED < <(get_new_untracked_paths)
+  if [[ ${#NEW_UNTRACKED[@]} -gt 0 ]]; then
+    for path in "${NEW_UNTRACKED[@]}"; do
+      git add -- "$path" >/dev/null 2>&1 || die "failed to stage new untracked path: $path"
+    done
+  fi
+
+  if ! git diff --cached --quiet; then
+    git commit -m "$commit_message" >/dev/null 2>&1 || die "failed to create loop commit: $commit_message"
+  fi
+
+  if ! head_is_pushed; then
+    push_target_branch
+  fi
 }
 
 upsert_bullet_line() {
@@ -373,6 +519,8 @@ run_builder_cleanup_until_stable() {
   local untracked_msg
 
   while true; do
+    auto_stage_commit_and_push "loop: checkpoint builder output"
+
     current_commit="$(git rev-parse HEAD)"
 
     tracked_dirty=0
@@ -423,9 +571,8 @@ ${untracked_msg}
 
 Do the following now:
 1) Resolve remaining tracked changes or newly-created untracked files produced by your previous work.
-2) Commit required changes.
-3) Push the current branch (${TARGET_BRANCH}) to origin.
-4) Do not modify unrelated baseline untracked files that existed before this loop started.
+2) Do not modify unrelated baseline untracked files that existed before this loop started.
+3) Do not run git commit or git push. The loop script performs commit/push automatically.
 
 After finishing, exit."
 
@@ -493,14 +640,16 @@ done
 if [[ -n "$TASK_TEXT" && -n "$TASK_FILE" ]]; then
   die "--task and --task-file are mutually exclusive"
 fi
-if [[ -z "$TASK_TEXT" && -z "$TASK_FILE" ]]; then
-  die "either --task or --task-file is required"
-fi
 
 if [[ -n "$TASK_FILE" ]]; then
   [[ -f "$TASK_FILE" ]] || die "task file not found: $TASK_FILE"
   TASK_TEXT="$(cat "$TASK_FILE")"
 fi
+
+if [[ -z "$TASK_TEXT" && -z "$TASK_FILE" ]]; then
+  prompt_for_task_text
+fi
+
 [[ -n "$TASK_TEXT" ]] || die "task content is empty"
 
 for n in "$MAX_ITERATIONS" "$MAX_BUILDER_CLEANUP_RETRIES" "$MAX_REVIEWER_FAILURES"; do
@@ -522,6 +671,14 @@ if has_tracked_dirty; then
 fi
 
 TARGET_BRANCH=""
+CHOSEN_BRANCH=""
+CHOSEN_PR_URL=""
+prompt_for_resume_target_if_needed
+
+if [[ -n "$CHOSEN_PR_URL" && -z "$PR_URL" ]]; then
+  PR_URL="$CHOSEN_PR_URL"
+fi
+
 if [[ -n "$PR_URL" ]]; then
   scripts/run_builder_reviewer_doctor.sh --pr-url "$PR_URL" >/dev/null
 
@@ -540,7 +697,12 @@ if [[ -n "$PR_URL" ]]; then
 
   ensure_branch_checked_out "$TARGET_BRANCH"
 else
-  TARGET_BRANCH="$(resolve_current_branch || true)"
+  if [[ -n "$CHOSEN_BRANCH" ]]; then
+    TARGET_BRANCH="$CHOSEN_BRANCH"
+    ensure_branch_checked_out "$TARGET_BRANCH"
+  else
+    TARGET_BRANCH="$(resolve_current_branch || true)"
+  fi
   [[ -n "$TARGET_BRANCH" ]] || die "unable to resolve current branch"
   scripts/run_builder_reviewer_doctor.sh --head-branch "$TARGET_BRANCH" >/dev/null
 fi
@@ -578,7 +740,7 @@ ${TASK_TEXT}
 Requirements:
 - Follow repository policies in AGENTS.md and PLANS.md.
 - Work only on branch: ${TARGET_BRANCH}
-- When done, ensure all required changes are committed and pushed to origin/${TARGET_BRANCH}.
+- Leave your code edits in the worktree/index; the loop script will stage, commit, and push automatically.
 - Keep unrelated baseline untracked files untouched."
 
 if ! run_codex_prompt "builder_initial" "$MODEL_BUILDER" "$initial_builder_prompt" "$LOG_DIR/builder_initial.log"; then
@@ -694,8 +856,7 @@ ${comment_links_block}
 
 Requirements:
 - Implement required fixes on branch ${TARGET_BRANCH}.
-- Commit all required changes.
-- Push branch ${TARGET_BRANCH} to origin.
+- Leave your code edits in the worktree/index; the loop script will stage, commit, and push automatically.
 - Keep unrelated baseline untracked files untouched."
 
   if ! run_codex_prompt "builder_followup" "$MODEL_BUILDER" "$builder_followup_prompt" "$LOG_DIR/builder_followup_iter_${ITERATION}.log"; then

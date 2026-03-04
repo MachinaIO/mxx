@@ -65,6 +65,7 @@ commands+=("bash -n scripts/run_builder_reviewer_doctor.sh")
 commands+=("bash -n scripts/run_builder_reviewer_loop.sh")
 commands+=("rg -n -- --task|--task-file|--pr-url|--max-iterations|--max-builder-cleanup-retries|--max-reviewer-failures|--model-builder|--model-reviewer scripts/run_builder_reviewer_loop.sh")
 commands+=("rg -n AUTO_AGENT: REVIEWER|AUTO_REVIEW_STATUS|AUTO_TARGET_COMMIT|APPROVE scripts/run_builder_reviewer_loop.sh")
+commands+=("rg -n prompt_for_task_text|prompt_for_resume_target_if_needed|auto_stage_commit_and_push scripts/run_builder_reviewer_loop.sh")
 commands+=("rg -n gh\\ api\\ graphql scripts/run_builder_reviewer_loop.sh")
 commands+=("rg -F -n comments(first:100 scripts/run_builder_reviewer_loop.sh")
 commands+=("rg -F -n reviews(first:100 scripts/run_builder_reviewer_loop.sh")
@@ -130,6 +131,24 @@ fi
 if ! rg -q -- "--model-reviewer" scripts/run_builder_reviewer_loop.sh; then
   echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
   echo "FAILURE_SUMMARY=fixed loop argument contract missing --model-reviewer"
+  echo "STATUS=fail"
+  exit 1
+fi
+if ! rg -q "prompt_for_task_text" scripts/run_builder_reviewer_loop.sh; then
+  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+  echo "FAILURE_SUMMARY=loop script missing interactive task prompt handler"
+  echo "STATUS=fail"
+  exit 1
+fi
+if ! rg -q "prompt_for_resume_target_if_needed" scripts/run_builder_reviewer_loop.sh; then
+  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+  echo "FAILURE_SUMMARY=loop script missing interactive active-PR resume selection handler"
+  echo "STATUS=fail"
+  exit 1
+fi
+if ! rg -q "auto_stage_commit_and_push" scripts/run_builder_reviewer_loop.sh; then
+  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+  echo "FAILURE_SUMMARY=loop script missing automatic stage/commit/push function"
   echo "STATUS=fail"
   exit 1
 fi

@@ -160,7 +160,7 @@ After escalation, the current plan must be force-closed as failed in `docs/plans
 
 Do not notify on every event.
 
-If notification is needed, post only once after all actions are complete, `execplan.post_completion` is `pass`, and commits are pushed:
+If notification is needed, post only once after all actions are complete, `execplan.post_completion` is `pass`, and required commits are already pushed by action/loop workflows:
 
 * `scripts/execplan_notify.sh --plan <completed_plan_md> --event execplan.post_completion --status pass`
 
@@ -216,11 +216,13 @@ Agents must strictly follow this lifecycle to create, execute, and complete an E
 8. After all actions and action-level verification events pass, finalize plan document state first:
    * update progress/outcomes/ledger sections,
    * move the plan to `docs/plans/completed/`,
+   * ensure required implementation commits are already pushed before entering post-completion verification,
    * add technical-debt follow-up plans when needed.
 9. Run post-completion verification:
    * `scripts/execplan_gate.sh --plan <completed_plan_md> --event execplan.post_completion`.
    * Execute this lifecycle gate command out-of-sandbox.
    * `execplan.post_completion` is lifecycle-only and must not be listed in any `Progress` action `verify_events`.
+   * `execplan.post_completion` is validation-only and must not run `git add`, `git commit`, or `git push`.
    * Post-completion operational behavior is defined only in `.agents/skills/execplan-event-post-completion/SKILL.md` and its script.
    * If post-completion verification fails and attempts remain, follow the skill-defined rollback/remediation behavior, then rerun post-completion.
    * If post-completion reaches three consecutive failures, apply step 7 escalation handling (force-close failed plan, then restart with a new operator-seeded ExecPlan).

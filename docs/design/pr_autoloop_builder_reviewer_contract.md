@@ -39,6 +39,7 @@ Fixed entrypoint:
 Required input:
 
 - `--task <text>` or `--task-file <path>`
+- if both are omitted in an interactive terminal, the script prompts for task text from stdin
 
 Optional input:
 
@@ -57,6 +58,7 @@ Bounded controls:
 - On valid input, execution switches to the PR head branch.
 - On merged/closed input, the script exits with input error.
 - If `--pr-url` is not provided, the current branch is used. Existing open PR for the branch is reused; otherwise a new PR is created.
+- In interactive mode with no `--pr-url`, if `docs/prs/active/*.md` exists, the script prompts whether to resume one of those tracked PRs or proceed with current-branch create/reuse behavior.
 
 ### Builder cleanup rule
 
@@ -66,7 +68,7 @@ After each builder run, the script enforces stabilization before proceeding:
 - untracked files not present in baseline must be resolved,
 - branch head must be pushed to `origin/<branch>`.
 
-Cleanup is delegated back to builder and bounded by `--max-builder-cleanup-retries`.
+The script performs mechanical finalization by staging tracked changes, staging new untracked files outside the baseline set, committing when needed, and pushing to origin. Builder cleanup prompts are bounded by `--max-builder-cleanup-retries` and focus only on remaining code fixes, not git finalization.
 
 ### Reviewer comment contract
 
@@ -104,7 +106,7 @@ Approval is valid only when both are true in at least one collected comment:
 ### Lifecycle event integration
 
 - `execplan.pre_creation`: captures plan/PR tracking initialization only.
-- `execplan.post_completion`: performs lifecycle completion checks and final persistence only.
+- `execplan.post_completion`: performs lifecycle completion checks only (validation-only, no git mutation).
 - Neither lifecycle event starts reviewer automation, performs reviewer wait/approval gating, nor transitions PR tracking documents to completed/ready state.
 
 ## Safety and isolation

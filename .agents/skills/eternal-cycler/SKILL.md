@@ -74,9 +74,9 @@ All paths are relative to this SKILL.md file's location (the eternal-cycler inst
 16. New PR flow rule (user chose new PR flow, or no active PR doc exists):
     - Create and switch to a new branch before invoking the loop.
     - Branch naming must be task-derived and deterministic:
-      - `task_seed`: first non-empty line from task text or task file.
-      - `task_slug`: lowercase, replace non `[a-z0-9]` with `-`, collapse repeated `-`, trim leading/trailing `-`, default `task`.
-      - `branch_name`: `feat/auto-${task_slug:0:40}-$(date -u +%Y%m%dT%H%M%S)`.
+      - `task_seed`: first non-empty line of the **user's original task text** (before any preamble is prepended). Remove all tokens that contain `/` or `\` (file/path components) from this line before further processing.
+      - `task_slug`: lowercase the cleaned seed, replace non `[a-z0-9]` with `-`, collapse repeated `-`, trim leading/trailing `-`, default `task`.
+      - `branch_name`: `feat/auto-${task_slug:0:40}-$(date -u +%Y%m%d)`.
       - If name already exists locally or on origin, append `-1`, `-2`, ... until unique.
     - Run `git switch -c <branch_name>`.
 17. Compose the task for the builder agent:

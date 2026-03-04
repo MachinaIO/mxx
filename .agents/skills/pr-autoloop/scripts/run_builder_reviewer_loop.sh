@@ -418,7 +418,8 @@ run_builder_cleanup_until_stable() {
       untracked_msg="(none)"
     fi
 
-    cleanup_prompt="You are the BUILDER agent in an autonomous loop.
+    cleanup_prompt="You are called by a parent agent as a builder agent.
+You are the BUILDER agent in an autonomous loop.
 
 Cleanup request:
 - Base commit before your previous attempt: ${base_commit}
@@ -573,7 +574,8 @@ RUN_ID="loop-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
 log "loop started (branch=$TARGET_BRANCH, start_commit=$START_COMMIT, run_id=$RUN_ID)"
 
-initial_builder_prompt="You are the BUILDER agent in an autonomous loop.
+initial_builder_prompt="You are called by a parent agent as a builder agent.
+You are the BUILDER agent in an autonomous loop.
 
 Task:
 ${TASK_TEXT}
@@ -613,7 +615,8 @@ REVIEWER_FAILURES=0
 for ((ITERATION=1; ITERATION<=MAX_ITERATIONS; ITERATION++)); do
   log "review iteration $ITERATION started for commit $LATEST_COMMIT"
 
-  reviewer_prompt="You are the REVIEWER agent in an autonomous loop.
+  reviewer_prompt="You are called by a parent agent as a reviewer agent.
+You are the REVIEWER agent in an autonomous loop.
 
 Review target:
 - PR URL: ${PR_URL}
@@ -690,7 +693,8 @@ Policy requirements:
   fi
 
   comment_links_block="$(printf '%s\n' "${COMMENT_URLS[@]}")"
-  builder_followup_prompt="You are the BUILDER agent in an autonomous loop.
+  builder_followup_prompt="You are called by a parent agent as a builder agent.
+You are the BUILDER agent in an autonomous loop.
 
 Address all review comments referenced by these links:
 ${comment_links_block}

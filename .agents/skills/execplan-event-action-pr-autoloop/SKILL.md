@@ -5,7 +5,7 @@ description: Event skill for action.pr_autoloop verification. Use for fixed-scri
 
 # Event Skill: action.pr_autoloop
 
-Runs deterministic validation for fixed loop scripts under `scripts/` and ensures daemon-era pr-autoloop skill files are removed.
+Runs deterministic validation for fixed loop scripts under `.agents/skills/pr-autoloop/scripts/` and enforces the non-interactive, direct-output loop contract.
 
 ## Script
 

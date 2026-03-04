@@ -32,3 +32,6 @@ In reviewer mode, follow REVIEW.md as the governing policy for independent revie
 ## Global Requirements
 - All documentation in this repository, along with git commit messages and PRs, must be written in English.
 - When documenting file paths, use only paths relative to the repository top directory. Do not write absolute paths in documentation.
+
+## Autonomous PR Loop Rule
+- When the requested work requires starting or continuing the builder/reviewer autonomous loop, invoke the `pr-autoloop` skill first and follow its resume/new-PR selection workflow before running any loop command directly.

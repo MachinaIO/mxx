@@ -7,10 +7,11 @@ Usage:
   run_builder_reviewer_loop.sh [--task <text> | --task-file <path>] [options]
 
 Options:
-  --task <text>                      Builder initial task text. If omitted in interactive mode, prompt on stdin.
-  --task-file <path>                 Builder initial task file path. If omitted in interactive mode, prompt on stdin.
-  --pr-url <url>                     Reuse an existing OPEN (unmerged) PR and its head branch.
-                                    If omitted and docs/prs/active has entries, interactive mode prompts resume/new choice.
+  --task <text>                      Builder initial task text.
+  --task-file <path>                 Builder initial task file path.
+  --pr-url <url>                     Optional target PR URL.
+                                    If provided, its head branch must match the current local branch.
+                                    If omitted, the current branch is used.
   --max-iterations <n>               Max review iterations (default: 20).
   --max-builder-cleanup-retries <n>  Max builder cleanup retries per cycle (default: 5).
   --max-reviewer-failures <n>        Max consecutive reviewer-phase failures (default: 3).
@@ -36,15 +37,6 @@ require_cmd() {
 
 is_positive_int() {
   [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -gt 0 ]]
-}
-
-is_interactive_session() {
-  [[ -t 0 && -t 1 ]]
-}
-
-trim_spaces() {
-  local value="$1"
-  echo "$value" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
 }
 
 resolve_repo_root() {
@@ -105,28 +97,6 @@ head_is_pushed() {
   [[ -n "$remote_head" && "$remote_head" == "$local_head" ]]
 }
 
-ensure_branch_checked_out() {
-  local target_branch="$1"
-  local current_branch
-
-  current_branch="$(resolve_current_branch || true)"
-  if [[ "$current_branch" == "$target_branch" ]]; then
-    return 0
-  fi
-
-  if git show-ref --verify --quiet "refs/heads/$target_branch"; then
-    git switch "$target_branch" >/dev/null 2>&1 || die "failed to switch to branch: $target_branch"
-    return 0
-  fi
-
-  if git ls-remote --exit-code --heads origin "$target_branch" >/dev/null 2>&1; then
-    git switch -c "$target_branch" --track "origin/$target_branch" >/dev/null 2>&1 || die "failed to create tracking branch from origin/$target_branch"
-    return 0
-  fi
-
-  die "cannot find branch locally or on origin: $target_branch"
-}
-
 parse_pr_coordinates() {
   local pr_url="$1"
   if [[ "$pr_url" =~ ^https://github\.com/([^/]+)/([^/]+)/pull/([0-9]+)$ ]]; then
@@ -142,7 +112,6 @@ run_codex_prompt() {
   local role="$1"
   local model="$2"
   local prompt_text="$3"
-  local log_path="$4"
 
   local cmd=(codex exec --dangerously-bypass-approvals-and-sandbox --cd "$WORKDIR")
   if [[ -n "$model" ]]; then
@@ -150,8 +119,8 @@ run_codex_prompt() {
   fi
   cmd+=(-)
 
-  if ! printf '%s\n' "$prompt_text" | "${cmd[@]}" >"$log_path" 2>&1; then
-    log "$role codex execution failed (log: $log_path)"
+  if ! printf '%s\n' "$prompt_text" | "${cmd[@]}"; then
+    log "$role codex execution failed"
     return 1
   fi
 
@@ -166,115 +135,6 @@ get_new_untracked_paths() {
       printf '%s\n' "$path"
     fi
   done < <(git ls-files --others --exclude-standard)
-}
-
-extract_tracking_field() {
-  local tracking_doc="$1"
-  local field="$2"
-  local raw=""
-
-  raw="$(sed -n -E "s/^- ${field}:[[:space:]]+(.+)$/\\1/p" "$tracking_doc" | head -n1 || true)"
-  trim_spaces "$raw"
-}
-
-extract_tracking_title_branch() {
-  local tracking_doc="$1"
-  local raw=""
-
-  raw="$(sed -n -E 's/^# PR Tracking:[[:space:]]+(.+)$/\1/p' "$tracking_doc" | head -n1 || true)"
-  trim_spaces "$raw"
-}
-
-prompt_for_task_text() {
-  local line
-  local lines=()
-
-  is_interactive_session || die "either --task or --task-file is required in non-interactive mode"
-
-  echo "No --task/--task-file provided." >&2
-  echo "Enter builder task text. Finish with a single line: EOF" >&2
-  while IFS= read -r line; do
-    if [[ "$line" == "EOF" ]]; then
-      break
-    fi
-    lines+=("$line")
-  done
-
-  if [[ ${#lines[@]} -eq 0 ]]; then
-    die "task content is empty"
-  fi
-
-  TASK_TEXT="$(printf '%s\n' "${lines[@]}")"
-  TASK_TEXT="${TASK_TEXT%$'\n'}"
-}
-
-prompt_for_resume_target_if_needed() {
-  local docs=()
-  local idx choice choice_num
-  local selected_doc branch_name pr_link display_branch display_pr
-
-  CHOSEN_BRANCH=""
-  CHOSEN_PR_URL=""
-
-  [[ -z "$PR_URL" ]] || return 0
-  is_interactive_session || return 0
-
-  if [[ -d docs/prs/active ]]; then
-    while IFS= read -r path; do
-      [[ -n "$path" ]] && docs+=("$path")
-    done < <(find docs/prs/active -maxdepth 1 -type f -name '*.md' | sort)
-  fi
-
-  [[ ${#docs[@]} -gt 0 ]] || return 0
-
-  echo "Active PR tracking documents were found and --pr-url was not provided." >&2
-  echo "Select target:" >&2
-  echo "  [0] Create or reuse PR from current branch" >&2
-
-  for idx in "${!docs[@]}"; do
-    branch_name="$(extract_tracking_field "${docs[$idx]}" "branch name")"
-    if [[ -z "$branch_name" ]]; then
-      branch_name="$(extract_tracking_title_branch "${docs[$idx]}")"
-    fi
-    pr_link="$(extract_tracking_field "${docs[$idx]}" "PR link")"
-
-    display_branch="${branch_name:-unknown}"
-    display_pr="${pr_link:-none}"
-    echo "  [$((idx + 1))] Resume ${docs[$idx]} (branch=${display_branch}, pr=${display_pr})" >&2
-  done
-
-  while true; do
-    read -r -p "Choose [0-${#docs[@]}] (default 0): " choice
-    choice="$(trim_spaces "$choice")"
-    if [[ -z "$choice" ]]; then
-      choice_num=0
-      break
-    fi
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 0 && choice <= ${#docs[@]} )); then
-      choice_num="$choice"
-      break
-    fi
-    echo "Invalid selection: $choice" >&2
-  done
-
-  if (( choice_num == 0 )); then
-    return 0
-  fi
-
-  selected_doc="${docs[$((choice_num - 1))]}"
-  CHOSEN_BRANCH="$(extract_tracking_field "$selected_doc" "branch name")"
-  if [[ -z "$CHOSEN_BRANCH" ]]; then
-    CHOSEN_BRANCH="$(extract_tracking_title_branch "$selected_doc")"
-  fi
-
-  CHOSEN_PR_URL="$(extract_tracking_field "$selected_doc" "PR link")"
-  if [[ "$CHOSEN_PR_URL" == "(not available locally)" ]]; then
-    CHOSEN_PR_URL=""
-  fi
-
-  if [[ -z "$CHOSEN_BRANCH" && -z "$CHOSEN_PR_URL" ]]; then
-    die "selected PR tracking document lacks both branch and PR link: $selected_doc"
-  fi
 }
 
 push_target_branch() {
@@ -515,7 +375,7 @@ run_builder_cleanup_until_stable() {
   local base_commit="$1"
   local attempt=0
   local current_commit tracked_dirty pushed
-  local cleanup_prompt cleanup_log
+  local cleanup_prompt
   local untracked_msg
 
   while true; do
@@ -576,8 +436,7 @@ Do the following now:
 
 After finishing, exit."
 
-    cleanup_log="$LOG_DIR/builder_cleanup_attempt_${attempt}.log"
-    if ! run_codex_prompt "builder_cleanup" "$MODEL_BUILDER" "$cleanup_prompt" "$cleanup_log"; then
+    if ! run_codex_prompt "builder_cleanup" "$MODEL_BUILDER" "$cleanup_prompt"; then
       log "builder cleanup attempt ${attempt} failed"
       return 1
     fi
@@ -646,6 +505,12 @@ if [[ -n "$TASK_FILE" ]]; then
   TASK_TEXT="$(cat "$TASK_FILE")"
 fi
 
+if [[ -z "$TASK_TEXT" ]]; then
+  echo "either --task or --task-file is required" >&2
+  usage >&2
+  exit 2
+fi
+
 for n in "$MAX_ITERATIONS" "$MAX_BUILDER_CLEANUP_RETRIES" "$MAX_REVIEWER_FAILURES"; do
   is_positive_int "$n" || die "numeric options must be positive integers"
 done
@@ -656,6 +521,7 @@ done
 
 WORKDIR="$(resolve_repo_root)"
 cd "$WORKDIR"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ -n "$(git ls-files -u)" ]]; then
   die "unmerged paths detected; resolve conflicts first"
@@ -665,46 +531,23 @@ if has_tracked_dirty; then
 fi
 
 TARGET_BRANCH=""
-CHOSEN_BRANCH=""
-CHOSEN_PR_URL=""
-prompt_for_resume_target_if_needed
-
-if [[ -n "$CHOSEN_PR_URL" && -z "$PR_URL" ]]; then
-  PR_URL="$CHOSEN_PR_URL"
-fi
-
-if [[ -z "$TASK_TEXT" && -z "$TASK_FILE" ]]; then
-  prompt_for_task_text
-fi
-
-[[ -n "$TASK_TEXT" ]] || die "task content is empty"
+TARGET_BRANCH="$(resolve_current_branch || true)"
+[[ -n "$TARGET_BRANCH" ]] || die "unable to resolve current branch"
+"$SCRIPT_DIR/run_builder_reviewer_doctor.sh" --head-branch "$TARGET_BRANCH" >/dev/null
 
 if [[ -n "$PR_URL" ]]; then
-  scripts/run_builder_reviewer_doctor.sh --pr-url "$PR_URL" >/dev/null
+  "$SCRIPT_DIR/run_builder_reviewer_doctor.sh" --pr-url "$PR_URL" >/dev/null
 
-  pr_info_json="$(gh pr view "$PR_URL" --json url,state,mergedAt,headRefName,number 2>/dev/null || true)"
+  pr_info_json="$(gh pr view "$PR_URL" --json url,headRefName,number 2>/dev/null || true)"
   [[ -n "$pr_info_json" ]] || die "failed to read PR metadata: $PR_URL"
 
-  pr_state="$(jq -r '.state // ""' <<< "$pr_info_json")"
-  pr_merged_at="$(jq -r '.mergedAt // empty' <<< "$pr_info_json")"
-  TARGET_BRANCH="$(jq -r '.headRefName // ""' <<< "$pr_info_json")"
+  pr_head_branch="$(jq -r '.headRefName // ""' <<< "$pr_info_json")"
   PR_URL="$(jq -r '.url // ""' <<< "$pr_info_json")"
 
-  [[ -n "$TARGET_BRANCH" ]] || die "failed to resolve PR head branch from: $PR_URL"
-  if [[ "$pr_state" != "OPEN" || -n "$pr_merged_at" ]]; then
-    die "--pr-url must reference an OPEN and unmerged PR (state=$pr_state, mergedAt=${pr_merged_at:-null})"
+  [[ -n "$pr_head_branch" ]] || die "failed to resolve PR head branch from: $PR_URL"
+  if [[ "$pr_head_branch" != "$TARGET_BRANCH" ]]; then
+    die "--pr-url head branch ($pr_head_branch) must match current local branch ($TARGET_BRANCH)"
   fi
-
-  ensure_branch_checked_out "$TARGET_BRANCH"
-else
-  if [[ -n "$CHOSEN_BRANCH" ]]; then
-    TARGET_BRANCH="$CHOSEN_BRANCH"
-    ensure_branch_checked_out "$TARGET_BRANCH"
-  else
-    TARGET_BRANCH="$(resolve_current_branch || true)"
-  fi
-  [[ -n "$TARGET_BRANCH" ]] || die "unable to resolve current branch"
-  scripts/run_builder_reviewer_doctor.sh --head-branch "$TARGET_BRANCH" >/dev/null
 fi
 
 if [[ -n "$(git ls-files -u)" ]]; then
@@ -727,8 +570,6 @@ SELF_LOGIN="$(gh api user --jq '.login' 2>/dev/null || true)"
 [[ -n "$SELF_LOGIN" ]] || die "failed to resolve authenticated GitHub login"
 
 RUN_ID="loop-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-LOG_DIR="/tmp/builder_reviewer_loop_${RUN_ID}"
-mkdir -p "$LOG_DIR"
 
 log "loop started (branch=$TARGET_BRANCH, start_commit=$START_COMMIT, run_id=$RUN_ID)"
 
@@ -743,7 +584,7 @@ Requirements:
 - Leave your code edits in the worktree/index; the loop script will stage, commit, and push automatically.
 - Keep unrelated baseline untracked files untouched."
 
-if ! run_codex_prompt "builder_initial" "$MODEL_BUILDER" "$initial_builder_prompt" "$LOG_DIR/builder_initial.log"; then
+if ! run_codex_prompt "builder_initial" "$MODEL_BUILDER" "$initial_builder_prompt"; then
   die "initial builder execution failed"
 fi
 
@@ -789,7 +630,7 @@ Policy requirements:
 - If CI is running, do not wait for completion; post based on current evidence.
 - If the latest plan in this PR appears unresolved after three failures, explicitly include a remediation request in the review comment."
 
-  if ! run_codex_prompt "reviewer" "$MODEL_REVIEWER" "$reviewer_prompt" "$LOG_DIR/reviewer_iter_${ITERATION}.log"; then
+  if ! run_codex_prompt "reviewer" "$MODEL_REVIEWER" "$reviewer_prompt"; then
     REVIEWER_FAILURES=$((REVIEWER_FAILURES + 1))
     if [[ "$REVIEWER_FAILURES" -ge "$MAX_REVIEWER_FAILURES" ]]; then
       die "reviewer execution failed $REVIEWER_FAILURES times consecutively"
@@ -859,7 +700,7 @@ Requirements:
 - Leave your code edits in the worktree/index; the loop script will stage, commit, and push automatically.
 - Keep unrelated baseline untracked files untouched."
 
-  if ! run_codex_prompt "builder_followup" "$MODEL_BUILDER" "$builder_followup_prompt" "$LOG_DIR/builder_followup_iter_${ITERATION}.log"; then
+  if ! run_codex_prompt "builder_followup" "$MODEL_BUILDER" "$builder_followup_prompt"; then
     die "builder follow-up execution failed at iteration $ITERATION"
   fi
 

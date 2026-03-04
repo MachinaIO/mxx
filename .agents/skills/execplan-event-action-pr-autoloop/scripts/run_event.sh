@@ -27,8 +27,9 @@ if [[ -z "$PLAN" || ! -f "$PLAN" ]]; then
 fi
 
 required_paths=(
-  "scripts/run_builder_reviewer_doctor.sh"
-  "scripts/run_builder_reviewer_loop.sh"
+  ".agents/skills/pr-autoloop/SKILL.md"
+  ".agents/skills/pr-autoloop/scripts/run_builder_reviewer_doctor.sh"
+  ".agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh"
 )
 
 for path in "${required_paths[@]}"; do
@@ -38,6 +39,9 @@ for path in "${required_paths[@]}"; do
     echo "STATUS=fail"
     exit 1
   fi
+done
+
+for path in ".agents/skills/pr-autoloop/scripts/run_builder_reviewer_doctor.sh" ".agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh"; do
   if [[ ! -x "$path" ]]; then
     echo "COMMANDS=validate required fixed-loop file executability"
     echo "FAILURE_SUMMARY=required script is not executable: $path"
@@ -47,194 +51,128 @@ for path in "${required_paths[@]}"; do
 done
 
 legacy_paths=(
-  ".agents/skills/pr-autoloop"
+  "scripts/run_builder_reviewer_doctor.sh"
+  "scripts/run_builder_reviewer_loop.sh"
   ".agents/skills/pr-autoloop/scripts/reviewer_daemon.sh"
 )
 
 for path in "${legacy_paths[@]}"; do
   if [[ -e "$path" ]]; then
-    echo "COMMANDS=validate daemon-era removal"
-    echo "FAILURE_SUMMARY=legacy daemon-era path must be removed: $path"
+    echo "COMMANDS=validate legacy path removal"
+    echo "FAILURE_SUMMARY=legacy path must be removed: $path"
     echo "STATUS=fail"
     exit 1
   fi
 done
 
-commands=()
-commands+=("bash -n scripts/run_builder_reviewer_doctor.sh")
-commands+=("bash -n scripts/run_builder_reviewer_loop.sh")
-commands+=("rg -n -- --task|--task-file|--pr-url|--max-iterations|--max-builder-cleanup-retries|--max-reviewer-failures|--model-builder|--model-reviewer scripts/run_builder_reviewer_loop.sh")
-commands+=("rg -n AUTO_AGENT: REVIEWER|AUTO_REVIEW_STATUS|AUTO_TARGET_COMMIT|APPROVE scripts/run_builder_reviewer_loop.sh")
-commands+=("rg -n prompt_for_task_text|prompt_for_resume_target_if_needed|auto_stage_commit_and_push scripts/run_builder_reviewer_loop.sh")
-commands+=("rg -n fromdateiso8601|%ct scripts/run_builder_reviewer_loop.sh")
-commands+=("rg -n gh\\ api\\ graphql scripts/run_builder_reviewer_loop.sh")
-commands+=("rg -F -n comments(first:100 scripts/run_builder_reviewer_loop.sh")
-commands+=("rg -F -n reviews(first:100 scripts/run_builder_reviewer_loop.sh")
-commands+=("rg -n mergedAt|state|OPEN|headRefName scripts/run_builder_reviewer_loop.sh scripts/run_builder_reviewer_doctor.sh")
-commands+=("rg -n gh\\ auth\\ status|codex\\ login\\ status scripts/run_builder_reviewer_doctor.sh")
+LOOP=".agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh"
+DOCTOR=".agents/skills/pr-autoloop/scripts/run_builder_reviewer_doctor.sh"
 
-if ! bash -n scripts/run_builder_reviewer_doctor.sh; then
+commands=()
+commands+=("bash -n $DOCTOR")
+commands+=("bash -n $LOOP")
+commands+=("rg -n -- --task|--task-file|--pr-url|--max-iterations|--max-builder-cleanup-retries|--max-reviewer-failures|--model-builder|--model-reviewer $LOOP")
+commands+=("rg -n AUTO_AGENT: REVIEWER|AUTO_REVIEW_STATUS|AUTO_TARGET_COMMIT|APPROVE $LOOP")
+commands+=("rg -n fromdateiso8601|%ct $LOOP")
+commands+=("rg -n gh\\ api\\ graphql $LOOP")
+commands+=("rg -F -n comments(first:100 $LOOP")
+commands+=("rg -F -n reviews(first:100 $LOOP")
+commands+=("rg -n resolve_current_branch|headRefName|must match current local branch $LOOP")
+commands+=("rg -n pr_state|pr_merged_at|state,mergedAt|OPEN and unmerged $LOOP")
+commands+=("rg -n gh\\ auth\\ status|codex\\ login\\ status $DOCTOR")
+commands+=("rg -n prompt_for_task_text|prompt_for_resume_target_if_needed|is_interactive_session|log_path|LOG_DIR $LOOP")
+commands+=("rg -F -n if ! printf '%s\\n' \"\$prompt_text\" | \"\${cmd[@]}\"; then $LOOP")
+
+if ! bash -n "$DOCTOR"; then
   echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
   echo "FAILURE_SUMMARY=run_builder_reviewer_doctor.sh syntax check failed"
   echo "STATUS=fail"
   exit 1
 fi
 
-if ! bash -n scripts/run_builder_reviewer_loop.sh; then
+if ! bash -n "$LOOP"; then
   echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
   echo "FAILURE_SUMMARY=run_builder_reviewer_loop.sh syntax check failed"
   echo "STATUS=fail"
   exit 1
 fi
 
-if ! rg -q -- "--task" scripts/run_builder_reviewer_loop.sh; then
-  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=fixed loop argument contract missing --task"
-  echo "STATUS=fail"
-  exit 1
-fi
-if ! rg -q -- "--task-file" scripts/run_builder_reviewer_loop.sh; then
-  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=fixed loop argument contract missing --task-file"
-  echo "STATUS=fail"
-  exit 1
-fi
-if ! rg -q -- "--pr-url" scripts/run_builder_reviewer_loop.sh; then
-  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=fixed loop argument contract missing --pr-url"
-  echo "STATUS=fail"
-  exit 1
-fi
-if ! rg -q -- "--max-iterations" scripts/run_builder_reviewer_loop.sh; then
-  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=fixed loop argument contract missing --max-iterations"
-  echo "STATUS=fail"
-  exit 1
-fi
-if ! rg -q -- "--max-builder-cleanup-retries" scripts/run_builder_reviewer_loop.sh; then
-  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=fixed loop argument contract missing --max-builder-cleanup-retries"
-  echo "STATUS=fail"
-  exit 1
-fi
-if ! rg -q -- "--max-reviewer-failures" scripts/run_builder_reviewer_loop.sh; then
-  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=fixed loop argument contract missing --max-reviewer-failures"
-  echo "STATUS=fail"
-  exit 1
-fi
-if ! rg -q -- "--model-builder" scripts/run_builder_reviewer_loop.sh; then
-  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=fixed loop argument contract missing --model-builder"
-  echo "STATUS=fail"
-  exit 1
-fi
-if ! rg -q -- "--model-reviewer" scripts/run_builder_reviewer_loop.sh; then
-  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=fixed loop argument contract missing --model-reviewer"
-  echo "STATUS=fail"
-  exit 1
-fi
-if ! rg -q "prompt_for_task_text" scripts/run_builder_reviewer_loop.sh; then
-  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=loop script missing interactive task prompt handler"
-  echo "STATUS=fail"
-  exit 1
-fi
-if ! rg -q "prompt_for_resume_target_if_needed" scripts/run_builder_reviewer_loop.sh; then
-  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=loop script missing interactive active-PR resume selection handler"
-  echo "STATUS=fail"
-  exit 1
-fi
-if ! rg -q "auto_stage_commit_and_push" scripts/run_builder_reviewer_loop.sh; then
+for flag in --task --task-file --pr-url --max-iterations --max-builder-cleanup-retries --max-reviewer-failures --model-builder --model-reviewer; do
+  if ! rg -q -- "$flag" "$LOOP"; then
+    echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+    echo "FAILURE_SUMMARY=fixed loop argument contract missing $flag"
+    echo "STATUS=fail"
+    exit 1
+  fi
+done
+
+if ! rg -q "auto_stage_commit_and_push" "$LOOP"; then
   echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
   echo "FAILURE_SUMMARY=loop script missing automatic stage/commit/push function"
   echo "STATUS=fail"
   exit 1
 fi
-if ! rg -q "fromdateiso8601" scripts/run_builder_reviewer_loop.sh; then
+
+if rg -q "prompt_for_task_text|prompt_for_resume_target_if_needed|is_interactive_session" "$LOOP"; then
   echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=loop script missing epoch-normalized reviewer comment timestamp filter"
-  echo "STATUS=fail"
-  exit 1
-fi
-if ! rg -q "%ct" scripts/run_builder_reviewer_loop.sh; then
-  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=loop script missing commit epoch timestamp source for comment filter"
+  echo "FAILURE_SUMMARY=loop script still contains interactive prompt handlers"
   echo "STATUS=fail"
   exit 1
 fi
 
-if ! rg -q "AUTO_AGENT: REVIEWER" scripts/run_builder_reviewer_loop.sh; then
+if rg -q "log_path|LOG_DIR|builder_initial\\.log|reviewer_iter_|builder_cleanup_attempt_|builder_followup_iter_" "$LOOP"; then
   echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=reviewer prompt contract missing AUTO_AGENT: REVIEWER"
-  echo "STATUS=fail"
-  exit 1
-fi
-if ! rg -q "AUTO_REVIEW_STATUS" scripts/run_builder_reviewer_loop.sh; then
-  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=reviewer prompt contract missing AUTO_REVIEW_STATUS"
-  echo "STATUS=fail"
-  exit 1
-fi
-if ! rg -q "AUTO_TARGET_COMMIT" scripts/run_builder_reviewer_loop.sh; then
-  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=reviewer prompt contract missing AUTO_TARGET_COMMIT"
-  echo "STATUS=fail"
-  exit 1
-fi
-if ! rg -q "APPROVE" scripts/run_builder_reviewer_loop.sh; then
-  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=reviewer prompt contract missing APPROVE token handling"
+  echo "FAILURE_SUMMARY=loop script still contains codex log-file persistence markers"
   echo "STATUS=fail"
   exit 1
 fi
 
-if ! rg -q "gh api graphql" scripts/run_builder_reviewer_loop.sh; then
+if ! rg -Fq "if ! printf '%s\\n' \"\$prompt_text\" | \"\${cmd[@]}\"; then" "$LOOP"; then
   echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=loop script missing GraphQL comment/review retrieval"
-  echo "STATUS=fail"
-  exit 1
-fi
-if ! rg -Fq "comments(first:100" scripts/run_builder_reviewer_loop.sh; then
-  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=loop script missing issue comment collection query"
-  echo "STATUS=fail"
-  exit 1
-fi
-if ! rg -Fq "reviews(first:100" scripts/run_builder_reviewer_loop.sh; then
-  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=loop script missing review collection query"
+  echo "FAILURE_SUMMARY=loop script missing direct codex stdout/stderr forwarding marker"
   echo "STATUS=fail"
   exit 1
 fi
 
-if ! rg -q "mergedAt" scripts/run_builder_reviewer_loop.sh; then
+for marker in "fromdateiso8601" "%ct" "AUTO_AGENT: REVIEWER" "AUTO_REVIEW_STATUS" "AUTO_TARGET_COMMIT" "APPROVE" "gh api graphql" "comments(first:100" "reviews(first:100"; do
+  if ! rg -Fq "$marker" "$LOOP"; then
+    echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+    echo "FAILURE_SUMMARY=loop script missing required marker: $marker"
+    echo "STATUS=fail"
+    exit 1
+  fi
+done
+
+for marker in "resolve_current_branch" "headRefName" "must match current local branch"; do
+  if ! rg -Fq "$marker" "$LOOP"; then
+    echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+    echo "FAILURE_SUMMARY=loop script missing branch-match assertion marker: $marker"
+    echo "STATUS=fail"
+    exit 1
+  fi
+done
+
+if rg -q "ensure_branch_checked_out" "$LOOP"; then
   echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=loop script missing merged PR input guard"
+  echo "FAILURE_SUMMARY=loop script must not switch branches automatically"
   echo "STATUS=fail"
   exit 1
 fi
-if ! rg -q "state" scripts/run_builder_reviewer_loop.sh; then
+
+if rg -q "pr_state|pr_merged_at|state,mergedAt|OPEN and unmerged" "$LOOP"; then
   echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=loop script missing PR state input guard"
+  echo "FAILURE_SUMMARY=loop script must not gate PR URL by OPEN/merged state; only branch match is allowed"
   echo "STATUS=fail"
   exit 1
 fi
-if ! rg -q "OPEN" scripts/run_builder_reviewer_loop.sh; then
-  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
-  echo "FAILURE_SUMMARY=loop script missing OPEN-only PR guard"
-  echo "STATUS=fail"
-  exit 1
-fi
-if ! rg -q "gh auth status" scripts/run_builder_reviewer_doctor.sh; then
+
+if ! rg -q "gh auth status" "$DOCTOR"; then
   echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
   echo "FAILURE_SUMMARY=doctor script missing gh auth status check"
   echo "STATUS=fail"
   exit 1
 fi
-if ! rg -q "codex login status" scripts/run_builder_reviewer_doctor.sh; then
+if ! rg -q "codex login status" "$DOCTOR"; then
   echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
   echo "FAILURE_SUMMARY=doctor script missing codex login status check"
   echo "STATUS=fail"

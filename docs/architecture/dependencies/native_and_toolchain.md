@@ -39,7 +39,7 @@ CI currently runs formatting, clippy (including `--features disk` path), and rel
 
 ## Autonomous orchestration tooling boundary
 
-Repository-local autonomous PR orchestration under `scripts/run_builder_reviewer_loop.sh` and `scripts/run_builder_reviewer_doctor.sh` depends on CLI toolchain components in addition to Rust/CUDA toolchains:
+Repository-local autonomous PR orchestration under `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh` and `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_doctor.sh` depends on CLI toolchain components in addition to Rust/CUDA toolchains:
 
 - `git` (branch synchronization and worktree isolation),
 - `gh` (PR metadata queries and PR comment posting),

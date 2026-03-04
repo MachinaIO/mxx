@@ -2,12 +2,13 @@
 
 ## Purpose
 
-Documents repository-local autonomous PR orchestration implemented as fixed scripts under `scripts/`.
+Documents repository-local autonomous PR orchestration implemented as fixed scripts under `.agents/skills/pr-autoloop/scripts/`.
 
 ## Implementation mapping
 
-- `scripts/run_builder_reviewer_doctor.sh`
-- `scripts/run_builder_reviewer_loop.sh`
+- `.agents/skills/pr-autoloop/SKILL.md`
+- `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_doctor.sh`
+- `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh`
 - `.agents/skills/execplan-event-action-pr-autoloop/SKILL.md`
 - `.agents/skills/execplan-event-action-pr-autoloop/scripts/run_event.sh`
 - `.agents/skills/execplan-event-index/references/event_skill_map.tsv` (event registration)
@@ -19,10 +20,14 @@ Interface contract:
 - `run_builder_reviewer_loop.sh` required/optional arguments:
   - `--task <text>` or `--task-file <path>`
   - optional `--pr-url <url>`
-  - if `--pr-url` is omitted in interactive mode and `docs/prs/active/*.md` exists, prompt resume/new selection first
-  - if both task inputs are omitted in interactive mode, prompt task text on stdin after resume/new selection
+  - if task input is omitted, fail immediately with usage error
   - bounded controls (`--max-iterations`, `--max-builder-cleanup-retries`, `--max-reviewer-failures`)
   - optional model selectors (`--model-builder`, `--model-reviewer`)
+- `pr-autoloop` skill caller behavior:
+  - when `--pr-url` is omitted and any docs exist in `docs/prs/active`, caller asks user whether to resume one of them,
+  - if resume is selected, caller switches to the selected doc's branch before invoking the loop and uses `PR link` for `--pr-url` when present,
+  - if selected doc lacks `PR link`, caller still runs on the switched branch without `--pr-url`,
+  - if new PR flow is selected (or no active doc exists), caller creates/switches to a task-derived new branch before invoking the loop.
 - Reviewer comment contract fields:
   - `AUTO_AGENT: REVIEWER`
   - `AUTO_REVIEW_STATUS: APPROVED|CHANGES_REQUIRED`
@@ -32,9 +37,10 @@ Interface contract:
 Implementation details:
 
 - Fixed-script loop orchestrates builder/reviewer codex execution and owns retry bounds.
+- Loop output is streamed directly to stdout/stderr; no per-iteration codex log files are persisted.
 - PR routing supports two modes:
-  - explicit `--pr-url` (OPEN and unmerged only),
-  - branch-first (reuse existing open PR or create new PR).
+  - explicit `--pr-url` (head branch must match current local branch),
+  - branch-first on current local branch (reuse existing open PR or create new PR).
 - Comment retrieval uses `gh api graphql` over both issue comments and review bodies.
 - Approval requires `APPROVE` token plus `AUTO_TARGET_COMMIT` equality with current loop target commit.
 - On approval, the loop script updates/moves PR tracking docs (`docs/prs/active` -> `docs/prs/completed`) and records completed tracking metadata including `review state: OPEN`.

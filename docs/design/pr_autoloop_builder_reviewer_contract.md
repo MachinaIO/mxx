@@ -34,13 +34,12 @@ Embedding reviewer startup, waiting, and PR creation inside lifecycle verificati
 
 Fixed entrypoint:
 
-- `scripts/run_builder_reviewer_loop.sh`
+- `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh`
 
 Required input:
 
 - `--task <text>` or `--task-file <path>`
-- if `--pr-url` is omitted in interactive mode and `docs/prs/active/*.md` exists, the script first prompts whether to resume one of those tracked PRs or proceed with current-branch create/reuse behavior
-- if both task inputs are omitted in an interactive terminal, the script then prompts for task text from stdin
+- if both task inputs are omitted, the script exits with usage error (`exit 2`)
 
 Optional input:
 
@@ -54,12 +53,15 @@ Bounded controls:
 
 ### PR targeting behavior
 
-- If `--pr-url` is provided, the script validates the PR with `gh pr view --json state,mergedAt,headRefName,url`.
-- Input is valid only when state is `OPEN` and `mergedAt` is null.
-- On valid input, execution switches to the PR head branch.
-- On merged/closed input, the script exits with input error.
+- The loop script always uses the current local branch as `TARGET_BRANCH`.
+- If `--pr-url` is provided, the script validates the PR with `gh pr view --json headRefName,url` and asserts `headRefName == TARGET_BRANCH`.
+- If the PR head branch differs from the current local branch, the script exits with input error.
 - If `--pr-url` is not provided, the current branch is used. Existing open PR for the branch is reused; otherwise a new PR is created.
-- In interactive mode with no `--pr-url`, if `docs/prs/active/*.md` exists, the script prompts whether to resume one of those tracked PRs or proceed with current-branch create/reuse behavior before any fallback task-text prompt.
+- Resume-vs-new selection is not handled inside the loop script. The `pr-autoloop` skill caller handles this selection before invocation:
+  - when `--pr-url` is omitted and `docs/prs/active/*.md` has entries, caller asks whether to resume one of those PRs,
+  - if resume is selected, caller switches to the selected doc's branch before running the loop, then passes `PR link` as `--pr-url` when present,
+  - if selected doc lacks `PR link`, caller still runs on that switched branch without `--pr-url`,
+  - if new PR flow is selected (or no active doc exists), caller creates/switches to a task-derived new branch before loop invocation.
 
 ### Builder cleanup rule
 
@@ -107,6 +109,11 @@ Approval is valid only when both are true in at least one collected comment:
 - No-op stop: if first builder phase produces no new commit after cleanup.
 - Success stop: approval condition above is met and the script finalizes PR tracking by writing completed metadata (`review state: OPEN`) and moving the tracking file to `docs/prs/completed/`.
 - Failure stop: retry bounds reached (`max-iterations` or reviewer/builder cleanup failure bounds).
+
+### Output forwarding contract
+
+- `codex exec` output is not persisted to per-iteration log files.
+- Builder/reviewer subprocess output is forwarded directly to caller stdout/stderr.
 
 ### Lifecycle event integration
 

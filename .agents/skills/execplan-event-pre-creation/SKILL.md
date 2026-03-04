@@ -19,7 +19,13 @@ Dynamic controls:
 - `EXECPLAN_SCOPE_ALIGNMENT=aligned|not_aligned|auto`
 - `EXECPLAN_NEW_BRANCH=<type/scope>` when branch switch is required
 - `EXECPLAN_PR_TRACKING_PATH=docs/prs/active/<file>.md`
-- `EXECPLAN_MANUAL_PR_URL=<url>` when `gh` is unavailable and a new branch requires manual draft PR creation
+- `EXECPLAN_MANUAL_PR_URL=<url>` when PR metadata must be injected explicitly
+
+Execution policy:
+
+- This event must be executed out-of-sandbox.
+- Run through gate as: `scripts/execplan_gate.sh --event execplan.pre_creation` (or `--plan <plan_md> --event execplan.pre_creation`) with out-of-sandbox execution.
+- Do not run this event inside sandbox because stable `gh` access is required.
 
 ## Script
 

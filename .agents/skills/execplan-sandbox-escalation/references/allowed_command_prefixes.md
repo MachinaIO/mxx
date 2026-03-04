@@ -6,6 +6,8 @@ Before requesting a new out-of-sandbox command approval, verify whether one of t
 
 ## Pre-approved prefixes
 
+Policy note: `gh` prefixed commands are expected to run out-of-sandbox by default for stable GitHub API access.
+
 - `git status --short`
 - `git branch --show-current`
 - `git add -A`
@@ -18,8 +20,18 @@ Before requesting a new out-of-sandbox command approval, verify whether one of t
 - `gh pr ready`
 - `gh pr status`
 - `gh pr edit`
+- `gh api graphql`
 - `mv docs/prs/active/`
 - `mkdir -p docs/prs/active`
+- `scripts/execplan_gate.sh --event execplan.pre_creation`
+- `scripts/execplan_gate.sh --plan`
+- `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_doctor.sh`
+- `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh`
+
+## Deprecated prefixes (cleanup candidates)
+
+- `scripts/run_builder_reviewer_doctor.sh` (obsolete after pr-autoloop skill path consolidation)
+- `scripts/run_builder_reviewer_loop.sh` (obsolete after pr-autoloop skill path consolidation)
 
 ## Entry requirements for new prefixes
 

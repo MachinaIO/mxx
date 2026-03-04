@@ -32,6 +32,7 @@ Additional independent scopes:
 
 - [tests.md](./tests.md)
 - [benches.md](./benches.md)
+- [automation_orchestration.md](./automation_orchestration.md)
 
 ## Current scope dependency statements
 
@@ -56,6 +57,7 @@ Operational scopes:
 
 - `tests` depends on protocol/foundation scopes and validates end-to-end behavior.
 - `benches` depends on performance-critical runtime scopes (`matrix`, `poly`, `sampler`).
+- `automation_orchestration` depends on repository toolchain boundaries (`git`, `gh`, `codex`, `jq`) and event-skill infrastructure.
 
 Known mutual dependency:
 

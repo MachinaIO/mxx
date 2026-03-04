@@ -2,13 +2,18 @@
 
 ## Purpose
 
-Documents repository-local autonomous PR orchestration implemented as fixed scripts under `.agents/skills/pr-autoloop/scripts/`.
+Documents repository-local autonomous PR orchestration implemented by a static upstream skill install under `.agents/skills/eternal-cycler/` and repository-facing wrappers under `.agents/skills/pr-autoloop/scripts/`.
 
 ## Implementation mapping
 
 - `.agents/skills/pr-autoloop/SKILL.md`
 - `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_doctor.sh`
 - `.agents/skills/pr-autoloop/scripts/run_builder_reviewer_loop.sh`
+- `.agents/skills/eternal-cycler/SKILL.md`
+- `.agents/skills/eternal-cycler/setup.sh`
+- `.agents/skills/eternal-cycler/scripts/run_builder_reviewer_doctor.sh`
+- `.agents/skills/eternal-cycler/scripts/run_builder_reviewer_loop.sh`
+- `eternal-cycler-out/` (runtime output root for plans/PR tracking artifacts)
 - `.agents/skills/execplan-event-index/references/event_skill_map.tsv` (event registration)
 
 ## Interface vs implementation
@@ -39,6 +44,7 @@ Implementation details:
 
 - Fixed-script loop orchestrates builder/reviewer codex execution and owns retry bounds.
 - Loop output is streamed directly to stdout/stderr; no per-iteration codex log files are persisted.
+- `.agents/skills/eternal-cycler/` is installed from upstream as static skill content; runtime plan/PR artifacts are written under `eternal-cycler-out/`.
 - PR routing supports two modes:
   - explicit `--pr-url` (head branch must match current local branch),
   - branch-first on current local branch (reuse existing open PR or create new PR).

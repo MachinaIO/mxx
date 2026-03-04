@@ -106,8 +106,6 @@ parse_builder_payload_json() {
 }
 
 LAST_CODEX_OUTPUT=""
-builder_payload_json=""
-reviewer_payload_json=""
 
 has_tracked_dirty() {
   if ! git diff --quiet --; then
@@ -386,7 +384,7 @@ find_pr_tracking_doc() {
   local pr_url="$1"
   local dir found_path
 
-  for dir in docs/prs/active docs/prs/completed; do
+  for dir in eternal-cycler-out/prs/active eternal-cycler-out/prs/completed; do
     [[ -d "$dir" ]] || continue
     found_path="$(rg -l -F -- "- PR link: $pr_url" "$dir" 2>/dev/null | head -n1 || true)"
     if [[ -n "$found_path" ]]; then
@@ -405,8 +403,8 @@ finalize_pr_tracking_doc() {
   local source_path default_active_path default_completed_path completed_path moved_from
   local now_utc
 
-  default_active_path="docs/prs/active/pr_${target_branch//\//_}.md"
-  default_completed_path="docs/prs/completed/pr_${target_branch//\//_}.md"
+  default_active_path="eternal-cycler-out/prs/active/pr_${target_branch//\//_}.md"
+  default_completed_path="eternal-cycler-out/prs/completed/pr_${target_branch//\//_}.md"
 
   source_path="$(find_pr_tracking_doc "$pr_url" || true)"
   if [[ -z "$source_path" ]]; then
@@ -432,10 +430,10 @@ EOF
     fi
   fi
 
-  if [[ "$source_path" == docs/prs/completed/* ]]; then
+  if [[ "$source_path" == eternal-cycler-out/prs/completed/* ]]; then
     completed_path="$source_path"
-  elif [[ "$source_path" == docs/prs/active/* ]]; then
-    completed_path="docs/prs/completed/$(basename "$source_path")"
+  elif [[ "$source_path" == eternal-cycler-out/prs/active/* ]]; then
+    completed_path="eternal-cycler-out/prs/completed/$(basename "$source_path")"
   else
     completed_path="$default_completed_path"
   fi
@@ -652,6 +650,23 @@ done
 WORKDIR="$(resolve_repo_root)"
 cd "$WORKDIR"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# SUBMODULE_ROOT: root of the eternal-cycler installation.
+# Script lives at <submodule>/scripts/, so go up 1 level.
+SUBMODULE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Path to eternal-cycler relative to the git repo root, for use in agent prompts.
+SUBMODULE_REL="$(realpath --relative-to="$WORKDIR" "$SUBMODULE_ROOT")"
+
+# Explicit path context injected into every agent prompt.
+PATH_CONTEXT="Path context (all paths are from the repository root):
+- Policy docs:           ${SUBMODULE_REL}/PLANS.md, ${SUBMODULE_REL}/REVIEW.md
+- ExecPlan gate:         ${SUBMODULE_REL}/scripts/execplan_gate.sh
+- ExecPlan notify:       ${SUBMODULE_REL}/scripts/execplan_notify.sh
+- Verification skills:   .agents/skills/execplan-event-*/  (copied from ${SUBMODULE_REL}/assets/default-verification/ by setup.sh)
+- Event index map:       .agents/skills/execplan-event-index/references/event_skill_map.tsv
+- Sandbox policy:        .agents/skills/execplan-sandbox-escalation/SKILL.md
+- Plans dir:             eternal-cycler-out/plans/
+- PR tracking dir:       eternal-cycler-out/prs/
+Paths to policy docs, gate, and notify scripts are relative to ${SUBMODULE_REL}/. Paths to verification skills, plans, and PR tracking are relative to the repository root."
 
 if [[ -n "$(git ls-files -u)" ]]; then
   die "unmerged paths detected; resolve conflicts first"
@@ -700,22 +715,25 @@ RUN_ID="loop-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
 log "loop started (branch=$TARGET_BRANCH, start_commit=$START_COMMIT, run_id=$RUN_ID)"
 
-initial_builder_prompt="You are called by a parent agent as a builder agent.
-You are the BUILDER agent in an autonomous loop.
+initial_builder_prompt="You are the BUILDER agent in an autonomous loop.
+
+${PATH_CONTEXT}
+
+Start by reading ${SUBMODULE_REL}/PLANS.md in full.
+Follow the ExecPlan lifecycle defined in that document to complete the task below.
 
 Task:
 ${TASK_TEXT}
 
 Requirements:
-- Follow repository policies in AGENTS.md and PLANS.md.
 - Work only on branch: ${TARGET_BRANCH}
 - Leave your code edits in the worktree/index; the loop script will stage, commit, and push automatically.
 - Keep unrelated baseline untracked files untouched.
 - Try up to 3 implementation attempts before declaring failure.
 - Return exactly one JSON object and nothing else:
   {\"plan_doc_filename\":\"<relative-plan-path>\",\"result\":\"success|failed_after_3_retries\",\"failure_reason\":\"<empty-if-success>\"}
-- Use result=success only when implementation is complete for this request.
-- Use result=failed_after_3_retries only after 3 attempts fail and include concrete failure reason in failure_reason."
+- Use `result=success` only when implementation is complete for this request.
+- Use `result=failed_after_3_retries` only after 3 attempts fail and include concrete failure reason in `failure_reason`."
 
 builder_schema_file="$(write_builder_output_schema)"
 if ! run_codex_prompt_capture "builder_initial" "$MODEL_BUILDER" "$initial_builder_prompt" "$builder_schema_file"; then
@@ -754,15 +772,17 @@ REVIEWER_FAILURES=0
 for ((ITERATION=1; ITERATION<=MAX_ITERATIONS; ITERATION++)); do
   log "review iteration $ITERATION started for commit $LATEST_COMMIT"
 
-  reviewer_prompt="You are called by a parent agent as a reviewer agent.
-You are the REVIEWER agent in an autonomous loop.
+  reviewer_prompt="You are the REVIEWER agent in an autonomous loop.
+
+${PATH_CONTEXT}
+
+Start by reading ${SUBMODULE_REL}/REVIEW.md in full.
+Follow the review policy defined in that document.
 
 Review target:
 - PR URL: ${PR_URL}
 - Target commit and newer commits on head branch: ${LATEST_COMMIT}
 
-Policy requirements:
-- Follow REVIEW.md strictly.
 - Do not post any GitHub comment directly in autonomous loop mode.
 - Return exactly one JSON object and nothing else:
   {\"pr_url\":\"<target-pr-url>\",\"comment_body\":\"<comment body in English>\",\"approve_merge\":true|false}
@@ -826,37 +846,41 @@ Policy requirements:
   fi
 
   if [[ -n "$comment_url" ]]; then
-    builder_followup_prompt="You are called by a parent agent as a builder agent.
-You are the BUILDER agent in an autonomous loop.
+    builder_followup_prompt="You are the BUILDER agent in an autonomous loop.
+
+${PATH_CONTEXT}
 
 Address the reviewer feedback in this PR comment:
 ${comment_url}
 
 Requirements:
 - Implement required fixes on branch ${TARGET_BRANCH}.
+- Follow the ExecPlan lifecycle in ${SUBMODULE_REL}/PLANS.md.
 - Leave your code edits in the worktree/index; the loop script will stage, commit, and push automatically.
 - Keep unrelated baseline untracked files untouched.
 - Try up to 3 implementation attempts before declaring failure.
 - Return exactly one JSON object and nothing else:
   {\"plan_doc_filename\":\"<relative-plan-path>\",\"result\":\"success|failed_after_3_retries\",\"failure_reason\":\"<empty-if-success>\"}
-- Use result=success only when implementation is complete for this request.
-- Use result=failed_after_3_retries only after 3 attempts fail and include concrete failure reason in failure_reason."
+- Use `result=success` only when implementation is complete for this request.
+- Use `result=failed_after_3_retries` only after 3 attempts fail and include concrete failure reason in `failure_reason`."
   else
-    builder_followup_prompt="You are called by a parent agent as a builder agent.
-You are the BUILDER agent in an autonomous loop.
+    builder_followup_prompt="You are the BUILDER agent in an autonomous loop.
+
+${PATH_CONTEXT}
 
 Address the reviewer feedback text below:
 ${reviewer_comment_body}
 
 Requirements:
 - Implement required fixes on branch ${TARGET_BRANCH}.
+- Follow the ExecPlan lifecycle in ${SUBMODULE_REL}/PLANS.md.
 - Leave your code edits in the worktree/index; the loop script will stage, commit, and push automatically.
 - Keep unrelated baseline untracked files untouched.
 - Try up to 3 implementation attempts before declaring failure.
 - Return exactly one JSON object and nothing else:
   {\"plan_doc_filename\":\"<relative-plan-path>\",\"result\":\"success|failed_after_3_retries\",\"failure_reason\":\"<empty-if-success>\"}
-- Use result=success only when implementation is complete for this request.
-- Use result=failed_after_3_retries only after 3 attempts fail and include concrete failure reason in failure_reason."
+- Use `result=success` only when implementation is complete for this request.
+- Use `result=failed_after_3_retries` only after 3 attempts fail and include concrete failure reason in `failure_reason`."
   fi
 
   builder_schema_file="$(write_builder_output_schema)"

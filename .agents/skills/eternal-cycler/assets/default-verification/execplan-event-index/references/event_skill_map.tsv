@@ -1,0 +1,5 @@
+# event_id	skill_dir	script_relpath
+execplan.pre_creation	execplan-event-pre-creation	scripts/run_event.sh
+action.docs_only	execplan-event-action-docs-only	scripts/run_event.sh
+action.tooling	execplan-event-action-tooling	scripts/run_event.sh
+execplan.post_completion	execplan-event-post-completion	scripts/run_event.sh

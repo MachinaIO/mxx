@@ -44,7 +44,7 @@ for bin in git gh codex jq rg; do
   if command -v "$bin" >/dev/null 2>&1; then
     log "OK  $bin found"
   else
-    warn "$bin not found (required for pr-autoloop)"
+    warn "$bin not found (required for eternal-cycler)"
   fi
 done
 echo

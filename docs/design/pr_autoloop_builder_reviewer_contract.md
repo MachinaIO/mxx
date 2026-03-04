@@ -39,7 +39,8 @@ Fixed entrypoint:
 Required input:
 
 - `--task <text>` or `--task-file <path>`
-- if both are omitted in an interactive terminal, the script prompts for task text from stdin
+- if `--pr-url` is omitted in interactive mode and `docs/prs/active/*.md` exists, the script first prompts whether to resume one of those tracked PRs or proceed with current-branch create/reuse behavior
+- if both task inputs are omitted in an interactive terminal, the script then prompts for task text from stdin
 
 Optional input:
 
@@ -58,7 +59,7 @@ Bounded controls:
 - On valid input, execution switches to the PR head branch.
 - On merged/closed input, the script exits with input error.
 - If `--pr-url` is not provided, the current branch is used. Existing open PR for the branch is reused; otherwise a new PR is created.
-- In interactive mode with no `--pr-url`, if `docs/prs/active/*.md` exists, the script prompts whether to resume one of those tracked PRs or proceed with current-branch create/reuse behavior.
+- In interactive mode with no `--pr-url`, if `docs/prs/active/*.md` exists, the script prompts whether to resume one of those tracked PRs or proceed with current-branch create/reuse behavior before any fallback task-text prompt.
 
 ### Builder cleanup rule
 

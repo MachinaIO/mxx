@@ -18,9 +18,9 @@ Interface contract:
 
 - `run_builder_reviewer_loop.sh` required/optional arguments:
   - `--task <text>` or `--task-file <path>`
-  - if both are omitted in interactive mode, prompt task text on stdin
   - optional `--pr-url <url>`
-  - if `--pr-url` is omitted in interactive mode and `docs/prs/active/*.md` exists, prompt resume/new selection
+  - if `--pr-url` is omitted in interactive mode and `docs/prs/active/*.md` exists, prompt resume/new selection first
+  - if both task inputs are omitted in interactive mode, prompt task text on stdin after resume/new selection
   - bounded controls (`--max-iterations`, `--max-builder-cleanup-retries`, `--max-reviewer-failures`)
   - optional model selectors (`--model-builder`, `--model-reviewer`)
 - Reviewer comment contract fields:

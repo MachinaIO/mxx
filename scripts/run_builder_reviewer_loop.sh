@@ -646,12 +646,6 @@ if [[ -n "$TASK_FILE" ]]; then
   TASK_TEXT="$(cat "$TASK_FILE")"
 fi
 
-if [[ -z "$TASK_TEXT" && -z "$TASK_FILE" ]]; then
-  prompt_for_task_text
-fi
-
-[[ -n "$TASK_TEXT" ]] || die "task content is empty"
-
 for n in "$MAX_ITERATIONS" "$MAX_BUILDER_CLEANUP_RETRIES" "$MAX_REVIEWER_FAILURES"; do
   is_positive_int "$n" || die "numeric options must be positive integers"
 done
@@ -678,6 +672,12 @@ prompt_for_resume_target_if_needed
 if [[ -n "$CHOSEN_PR_URL" && -z "$PR_URL" ]]; then
   PR_URL="$CHOSEN_PR_URL"
 fi
+
+if [[ -z "$TASK_TEXT" && -z "$TASK_FILE" ]]; then
+  prompt_for_task_text
+fi
+
+[[ -n "$TASK_TEXT" ]] || die "task content is empty"
 
 if [[ -n "$PR_URL" ]]; then
   scripts/run_builder_reviewer_doctor.sh --pr-url "$PR_URL" >/dev/null

@@ -32,6 +32,10 @@ Read ARCHITECTURE.md when you need to understand how repository components are s
 - introducing new external dependencies,
 - touching boundaries (e.g., FFI/CUDA, IO/storage, build integration) that rely on invariants.
 
+### GPU (GPU.md)
+Read GPU.md when reading, writing, or reviewing GPU implementations (especially, but not limited to, CUDA files).
+
+
 ## Global Requirements
 - All documentation in this repository, along with git commit messages and PRs, must be written in English.
 - When documenting file paths, use only paths relative to the repository top directory. Do not write absolute paths in documentation.

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Event Post Creation"
+  short_description: "Run execplan.post_creation checks"
+  default_prompt: "Execute post-creation verification for an ExecPlan."
+
+policy:
+  allow_implicit_invocation: true

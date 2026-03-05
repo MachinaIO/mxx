@@ -1,0 +1,7 @@
+interface:
+  display_name: "Event Resume"
+  short_description: "Run execplan.resume checks"
+  default_prompt: "Execute resume verification for an ExecPlan."
+
+policy:
+  allow_implicit_invocation: true

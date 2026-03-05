@@ -51,19 +51,16 @@ echo
 
 # Copy default verification skills to the consuming repo's .agents/skills/ directory.
 # The gate script reads event skill scripts from .agents/skills/, not from assets/default-verification/.
-# Skills already present in .agents/skills/ are not overwritten, so consuming-repo customizations are preserved.
+# Existing skill directories are overwritten so that updates from eternal-cycler are always applied.
 SKILLS_DIR="$REPO_ROOT/.agents/skills"
 DEFAULT_VERIFICATION_DIR="$SCRIPT_DIR/assets/default-verification"
 mkdir -p "$SKILLS_DIR"
 log "Copying default verification skills to ${REPO_ROOT}/.agents/skills/"
 for skill_dir in "$DEFAULT_VERIFICATION_DIR"/*/; do
   skill_name="$(basename "$skill_dir")"
-  if [[ -d "$SKILLS_DIR/$skill_name" ]]; then
-    log "SKIP $skill_name (already present in .agents/skills/; not overwritten)"
-  else
-    cp -r "$skill_dir" "$SKILLS_DIR/$skill_name"
-    log "OK   copied $skill_name -> .agents/skills/$skill_name"
-  fi
+  rm -rf "${SKILLS_DIR:?}/$skill_name"
+  cp -r "$skill_dir" "$SKILLS_DIR/$skill_name"
+  log "OK   copied $skill_name -> .agents/skills/$skill_name"
 done
 echo
 

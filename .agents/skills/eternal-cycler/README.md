@@ -149,7 +149,7 @@ Re-run setup after updating to pick up any new default verification skills:
 bash .agents/skills/eternal-cycler/setup.sh
 ```
 
-Skills already present in `.agents/skills/` are not overwritten, so your customizations are preserved.
+Existing skill directories in `.agents/skills/` are overwritten so that updates from eternal-cycler are always applied.
 
 ## Adding custom verification events
 

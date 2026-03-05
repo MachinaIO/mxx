@@ -16,6 +16,11 @@ Design documents in this repository are organized by function. Each document sho
 
 Current registered design documents:
 
+- [ggh15_arbitrary_polynomial_lookup.md](./ggh15_arbitrary_polynomial_lookup.md)
+  - Purpose: Defines how GGH15 public lookup evaluation can support finite-domain non-constant polynomial inputs that remain within the current compact-decomposition contract, without adding per-coefficient preimage families.
+  - Roles:
+    1. Target behavior/properties with assumptions and limits.
+    2. Core technical idea and trade-off rationale for the GGH15 lookup extension.
 - [gpu_limb_byte_packing.md](./gpu_limb_byte_packing.md)
   - Purpose: Defines the long-lived CUDA limb storage invariant that packs each modulus into its minimum byte width.
   - Roles:

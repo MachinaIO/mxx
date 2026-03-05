@@ -128,6 +128,27 @@ extract_pr_link_from_tracking_doc() {
   sed -n -E 's/^- PR link:[[:space:]]+(.+)$/\1/p' "$tracking_doc" | head -n1 | sed -E 's/[[:space:]]+$//'
 }
 
+extract_tracking_field() {
+  local tracking_doc="$1"
+  local key="$2"
+  sed -n -E "s/^- ${key}:[[:space:]]+(.+)$/\\1/p" "$tracking_doc" | head -n1 | sed -E 's/[[:space:]]+$//'
+}
+
+resolve_open_pr_for_branch() {
+  local branch_name="$1"
+  local pr_list_json
+
+  [[ -n "$branch_name" ]] || return 1
+  command -v gh >/dev/null 2>&1 || return 1
+
+  commands+=("gh pr list --state open --head ${branch_name} --json url,updatedAt --limit 20")
+  pr_list_json="$(gh pr list --state open --head "$branch_name" --json url,updatedAt --limit 20 2>/dev/null || true)"
+  if [[ -z "$pr_list_json" ]]; then
+    return 1
+  fi
+  jq -r '[.[]] | sort_by(.updatedAt) | reverse | .[0].url // empty' <<< "$pr_list_json"
+}
+
 if ! rg -q "event_id=execplan.post_creation;.*status=pass" "$PLAN" && \
    ! rg -q "event_id=execplan.resume;.*status=pass" "$PLAN"; then
   fail_validation "missing pass entry for execplan.post_creation or execplan.resume"
@@ -187,8 +208,25 @@ if [[ ${#missing_fields[@]} -gt 0 ]]; then
 fi
 
 pr_url="$(extract_pr_link_from_tracking_doc "$pr_doc_path")"
-if [[ -z "$pr_url" || "$pr_url" == "(not available locally)" ]]; then
-  fail_validation "PR tracking metadata missing resolvable PR link"
+branch_name="$(extract_tracking_field "$pr_doc_path" "branch name")"
+open_pr_url="$(resolve_open_pr_for_branch "$branch_name" || true)"
+
+if [[ -n "$open_pr_url" ]]; then
+  if [[ -z "$pr_url" || "$pr_url" == "(not available locally)" ]]; then
+    fail_validation "PR tracking metadata missing live PR link for branch '$branch_name'; current open PR is $open_pr_url"
+  fi
+  if [[ "$pr_url" != "$open_pr_url" ]]; then
+    fail_validation "PR tracking metadata is stale for branch '$branch_name'; recorded $pr_url but current open PR is $open_pr_url"
+  fi
+fi
+
+if [[ -n "$pr_url" && "$pr_url" != "(not available locally)" ]]; then
+  if command -v gh >/dev/null 2>&1; then
+    commands+=("gh pr view ${pr_url} --json url,state")
+    if ! gh pr view "$pr_url" --json url,state >/dev/null 2>&1; then
+      fail_validation "PR tracking metadata points to an unreadable PR link: $pr_url"
+    fi
+  fi
 fi
 
 if rg -q "^- \[ \]" "$PLAN"; then

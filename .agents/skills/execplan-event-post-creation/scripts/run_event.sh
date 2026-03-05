@@ -44,14 +44,50 @@ commands+=("git status --short")
 branch="$(git branch --show-current)"
 git status --short >/dev/null
 
+resolve_pr_metadata() {
+  local branch_name="$1"
+  local pr_list_json selected_json
+
+  pr_url="${EXECPLAN_MANUAL_PR_URL:-"(not available locally)"}"
+  pr_title="(not available locally)"
+  pr_state="unknown"
+  pr_head="$branch_name"
+  pr_base="(unknown)"
+
+  if [[ "$gh_available" -ne 1 ]]; then
+    return 0
+  fi
+
+  if [[ -n "${EXECPLAN_MANUAL_PR_URL:-}" && "${EXECPLAN_MANUAL_PR_URL}" != "(not available locally)" ]]; then
+    commands+=("gh pr view ${EXECPLAN_MANUAL_PR_URL} --json url,title,state,headRefName,baseRefName")
+    selected_json="$(gh pr view "${EXECPLAN_MANUAL_PR_URL}" --json url,title,state,headRefName,baseRefName 2>/dev/null || true)"
+  else
+    commands+=("gh pr list --state open --head ${branch_name} --json url,title,state,headRefName,baseRefName,updatedAt --limit 20")
+    pr_list_json="$(gh pr list --state open --head "$branch_name" --json url,title,state,headRefName,baseRefName,updatedAt --limit 20 2>/dev/null || true)"
+    if [[ -n "$pr_list_json" ]]; then
+      selected_json="$(jq -c '[.[]] | sort_by(.updatedAt) | reverse | .[0] // empty' <<< "$pr_list_json")"
+    else
+      selected_json=""
+    fi
+  fi
+
+  if [[ -z "$selected_json" || "$selected_json" == "null" ]]; then
+    return 0
+  fi
+
+  pr_url="$(jq -r '.url // "(not available locally)"' <<< "$selected_json")"
+  pr_title="$(jq -r '.title // "(not available locally)"' <<< "$selected_json")"
+  pr_state="$(jq -r '.state // "unknown"' <<< "$selected_json")"
+  pr_head="$(jq -r --arg branch "$branch_name" '.headRefName // $branch' <<< "$selected_json")"
+  pr_base="$(jq -r '.baseRefName // "(unknown)"' <<< "$selected_json")"
+}
+
 gh_available=0
 if command -v gh >/dev/null 2>&1; then
   gh_available=1
   commands+=("gh pr status")
-  commands+=("gh pr view --json number,title,body,state,headRefName,baseRefName,url")
   set +e
   gh pr status >/dev/null 2>&1
-  gh pr view --json number,title,body,state,headRefName,baseRefName,url >/dev/null 2>&1
   set -e
 fi
 
@@ -63,19 +99,7 @@ mkdir -p "$(dirname "$tracking_path")"
 
 creation_date="$(date -u +"%Y-%m-%d %H:%MZ")"
 creation_commit="$(git rev-parse HEAD)"
-pr_url="${EXECPLAN_MANUAL_PR_URL:-"(not available locally)"}"
-pr_title="(not available locally)"
-pr_state="unknown"
-pr_head="$branch"
-pr_base="(unknown)"
-
-if [[ "$gh_available" -eq 1 ]]; then
-  pr_url="$(gh pr view --json url --jq '.url' 2>/dev/null || echo "(not available locally)")"
-  pr_title="$(gh pr view --json title --jq '.title' 2>/dev/null || echo "(not available locally)")"
-  pr_state="$(gh pr view --json state --jq '.state' 2>/dev/null || echo "unknown")"
-  pr_head="$(gh pr view --json headRefName --jq '.headRefName' 2>/dev/null || echo "$branch")"
-  pr_base="$(gh pr view --json baseRefName --jq '.baseRefName' 2>/dev/null || echo "(unknown)")"
-fi
+resolve_pr_metadata "$branch"
 
 commands+=("write $tracking_path")
 cat > "$tracking_path" <<EOF
@@ -90,26 +114,26 @@ cat > "$tracking_path" <<EOF
 - PR head/base: ${pr_head} -> ${pr_base}
 EOF
 
-if ! rg -q "$tracking_path_rel" "$PLAN"; then
+if ! rg -q "^-[[:space:]]+pr_tracking_doc:" "$PLAN"; then
   commands+=("append PR Tracking Linkage to plan")
   cat >> "$PLAN" <<EOF
 
 ## PR Tracking Linkage
 
 - pr_tracking_doc: ${tracking_path_rel}
-- execplan_start_branch: ${branch}
-- execplan_start_commit: ${creation_commit}
 EOF
 fi
 
 if ! rg -q "execplan_start_branch:" "$PLAN"; then
   cat >> "$PLAN" <<EOF
+
 - execplan_start_branch: ${branch}
 EOF
 fi
 
 if ! rg -q "execplan_start_commit:" "$PLAN"; then
   cat >> "$PLAN" <<EOF
+
 - execplan_start_commit: ${creation_commit}
 EOF
 fi

@@ -10,7 +10,7 @@ In this document, "arbitrary-polynomial" means "arbitrary within a finite repres
 
 The present GGH15 lookup path mixes two different notions of "row input":
 
-1. `GGH15BGGEncodingPltEvaluator::public_lookup` first computes the scalar selector key `rho(x) = x.to_const_int()` and calls `PublicLut::get(params, rho(x))`.
+1. `GGH15BGGEncodingPltEvaluator::public_lookup` calls `PublicLut::get(params, x)`, and the default range constructor `PublicLut::new_from_usize_range` internally derives the selector key `rho(x) = x.to_const_int()`.
 2. `GGH15BGGPubKeyPltEvaluator::sample_lut_preimages` hard-codes the row representative as the constant polynomial `idx * 1` through `M::P::from_usize_to_constant(params, idx)`.
 
 That is harmless only when the admitted runtime polynomial for selector key `k` really is the constant polynomial `k * 1`. As soon as the lookup domain assigns key `k` to a different representative `x_k`, the gate-side cancellation no longer matches the LUT-side preimage.
@@ -32,8 +32,8 @@ and use `x_k` in the LUT auxiliary preimage equation:
 where:
 
 - `x_k` is the exact lookup-domain representative for row `k`,
-- `rho_k` is the scalar selector key consumed by the existing `PublicLut::get` API,
-- `y_k` is the row output embedded in the same constant-polynomial form used today,
+- `rho_k` is the scalar selector key used to identify row `k` inside the finite representative set,
+- `y_k` is the full polynomial row output already returned by `PublicLut::get` today, with constant-polynomial outputs remaining a compatibility subset,
 - `V_k` is the hashed matrix already derived from `(lut_id, k)`,
 - `D_sm(x_k)` is the compact small decomposition of `x_k * I_m`,
 - `G` is the existing gadget matrix,
@@ -102,7 +102,7 @@ The required invariant is:
 
 `lift(rho(x)) = x` for every admissible runtime plaintext `x` in the lookup domain.
 
-This means the implementation is not trying to support every polynomial in `R_q`; it supports a finite set of canonical representatives, each tagged by a scalar key. The current runtime call `x.to_const_int()` is one concrete choice for `rho`. The later implementation may keep that API shape, but only for domains where `to_const_int()` is a left inverse of the chosen representative map.
+This means the implementation is not trying to support every polynomial in `R_q`; it supports a finite set of canonical representatives, each tagged by a scalar key. The current default constructor path uses `x.to_const_int()` as one concrete choice for `rho`. The later implementation may keep that API shape only for domains where `to_const_int()` is a left inverse of the chosen representative map and the selector keys fit in `usize`; wider domains need a different selector extractor and, likely, a widened row-key API.
 
 ## Admissible Representative Domain
 
@@ -161,21 +161,21 @@ The later implementation should extend `PublicLut<P>` so that row representative
 
 A concrete shape is:
 
-- `PublicLutRow<P> { selector_key: u64, input_repr: P, row_idx: u64, output: P::Elem }`
+- `PublicLutRow<P> { selector_key: usize, input_repr: P, row_idx: usize, output: P }`
 - `PublicLut<P>` stores `rows: Vec<PublicLutRow<P>>`
-- `PublicLut::get` remains the runtime selector over `u64`
+- `PublicLut::get` keeps returning the existing `(row_idx, output_poly)` pair for a runtime polynomial input, or gains a thin helper layered on that same data
 - add a setup-time iterator or lookup helper that exposes `selector_key`, `input_repr`, `row_idx`, and `output` to `GGH15BGGPubKeyPltEvaluator`
 - use that same stored row table as the resume/checkpoint source of truth for `row_idx`
 
-This preserves the current selector shape in `GGH15BGGEncodingPltEvaluator::public_lookup`, but it gives `GGH15BGGPubKeyPltEvaluator` the missing representative polynomial `x_k` during auxiliary-matrix sampling.
+This preserves the current polynomial-output behavior in `GGH15BGGEncodingPltEvaluator::public_lookup`, but it gives `GGH15BGGPubKeyPltEvaluator` the missing representative polynomial `x_k` during auxiliary-matrix sampling.
 
-For legacy constant-input call sites, a compatibility constructor can fill `selector_key = idx`, `input_repr = idx * 1`, and `row_idx = idx`. For arbitrary-polynomial domains, a new constructor should accept explicit row descriptors and document the required invariant `input_repr.to_const_int() == selector_key` whenever the runtime path still uses `to_const_int()`.
+For legacy constant-input call sites, a compatibility constructor can fill `selector_key = idx`, `input_repr = idx * 1`, and `row_idx = idx`. For arbitrary-polynomial domains, a new constructor should accept explicit row descriptors and document the required invariant `input_repr.to_const_int() == selector_key` only for domains whose selector keys fit in `usize`; wider domains need a different selector representation.
 
 ## Concrete Implementation Path
 
 The later code change should follow this sequence.
 
-1. Extend `src/lookup/mod.rs` so `PublicLut<P>` can enumerate explicit row descriptors `(selector_key, x_k, row_idx, y_k)`.
+1. Extend `src/lookup/mod.rs` so `PublicLut<P>` can enumerate explicit row descriptors `(selector_key, x_k, row_idx, y_k)` with `y_k` still represented as `P`.
 2. Keep a constant-domain compatibility constructor that derives those descriptors from `idx`.
 3. In `GGH15BGGPubKeyPltEvaluator::sample_lut_preimages`, replace the current `(idx, y_poly)` batch input with row objects carrying `(selector_key, x_k, row_idx, y_k)`.
 4. Replace `from_usize_to_constant(params, idx)` in the LUT preimage equation with the stored representative `x_k`.
@@ -205,7 +205,7 @@ The later implementation should be accepted only if all of the following hold.
 
 ## Example Domain
 
-For a binary-decoded domain, a valid row family is:
+For a binary-decoded domain whose admitted bit width fits in `usize::BITS`, a valid row family is:
 
 - `rho(x) = x.to_const_int()`
 - `x_k = P::from_usize_to_lsb(params, k)`
@@ -213,4 +213,4 @@ For a binary-decoded domain, a valid row family is:
 - `selector_key = k`
 - `y_k = f(x_k)`
 
-Then `rho(x_k) = k`, so `lift(rho(x_k)) = x_k` holds on the admitted domain. The runtime selector may still recover `k` from `x_k.to_const_int()`, but the LUT preimage must use the full polynomial `x_k`, not the constant polynomial `k * 1`. That single change is what makes the GGH15 cancellation work for arbitrary polynomial representatives without adding coefficient-wise preimages.
+Then `rho(x_k) = k`, so `lift(rho(x_k)) = x_k` holds on the admitted domain as long as both `to_const_int()` and `from_usize_to_lsb()` can represent every selector bit without truncation. If `params.ring_dimension()` or the semantic selector width exceeds `usize::BITS`, the current helpers silently stop being injective and this example no longer applies; a later implementation would need a different selector encoding API instead of claiming a general guarantee from the current `usize`-based helpers. Within the bounded domain above, the LUT preimage must still use the full polynomial `x_k`, not the constant polynomial `k * 1`. That single change is what makes the GGH15 cancellation work for arbitrary polynomial representatives without adding coefficient-wise preimages.

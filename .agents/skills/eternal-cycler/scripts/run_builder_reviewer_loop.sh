@@ -402,6 +402,13 @@ upsert_bullet_line() {
   mv "$tmp" "$file"
 }
 
+extract_bullet_line_value() {
+  local file="$1"
+  local key="$2"
+  [[ -f "$file" ]] || return 1
+  sed -n -E "s/^- ${key}:[[:space:]]+(.+)$/\\1/p" "$file" | head -n1 | sed -E 's/[[:space:]]+$//'
+}
+
 find_pr_tracking_doc() {
   local pr_url="$1"
   local dir found_path
@@ -416,6 +423,49 @@ find_pr_tracking_doc() {
   done
 
   return 1
+}
+
+sync_active_pr_tracking_doc() {
+  local pr_url="$1"
+  local target_branch="$2"
+  local reference_commit="$3"
+  local tracking_path now_utc pr_info_json pr_title pr_state pr_head pr_base
+  local existing_pr_url creation_date creation_commit
+
+  tracking_path="eternal-cycler-out/prs/active/pr_${target_branch//\//_}.md"
+  mkdir -p "$(dirname "$tracking_path")"
+
+  pr_info_json="$(gh pr view "$pr_url" --json url,title,state,headRefName,baseRefName 2>/dev/null || true)"
+  [[ -n "$pr_info_json" ]] || die "failed to read PR metadata for tracking doc sync: $pr_url"
+
+  pr_title="$(jq -r '.title // "(not available locally)"' <<< "$pr_info_json")"
+  pr_state="$(jq -r '.state // "unknown"' <<< "$pr_info_json")"
+  pr_head="$(jq -r --arg branch "$target_branch" '.headRefName // $branch' <<< "$pr_info_json")"
+  pr_base="$(jq -r '.baseRefName // "(unknown)"' <<< "$pr_info_json")"
+
+  existing_pr_url="$(extract_bullet_line_value "$tracking_path" "PR link" || true)"
+  creation_date="$(extract_bullet_line_value "$tracking_path" "PR creation date" || true)"
+  creation_commit="$(extract_bullet_line_value "$tracking_path" "commit hash at PR creation time" || true)"
+  now_utc="$(date -u +"%Y-%m-%d %H:%MZ")"
+
+  if [[ -z "$creation_date" || "$creation_date" == "(see original)" || "$creation_date" == "(not available locally)" || "$existing_pr_url" != "$pr_url" ]]; then
+    creation_date="$now_utc"
+  fi
+  if [[ -z "$creation_commit" || "$creation_commit" == "(see original)" || "$creation_commit" == "(not available locally)" || "$existing_pr_url" != "$pr_url" ]]; then
+    creation_commit="$reference_commit"
+  fi
+
+  cat > "$tracking_path" <<EOF
+# PR Tracking: ${target_branch}
+
+- PR link: ${pr_url}
+- PR creation date: ${creation_date}
+- branch name: ${target_branch}
+- commit hash at PR creation time: ${creation_commit}
+- summary/content of the PR: ${pr_title}
+- PR state: ${pr_state}
+- PR head/base: ${pr_head} -> ${pr_base}
+EOF
 }
 
 finalize_pr_tracking_doc() {
@@ -798,6 +848,8 @@ if [[ -z "$PR_URL" ]]; then
   PR_URL="$(resolve_or_create_pr_for_branch "$TARGET_BRANCH" "$_pr_title" "$_pr_body")"
   [[ -n "$PR_URL" ]] || die "failed to resolve/create PR for branch: $TARGET_BRANCH"
 fi
+
+sync_active_pr_tracking_doc "$PR_URL" "$TARGET_BRANCH" "$LATEST_COMMIT"
 
 log "target PR: $PR_URL"
 

@@ -3,7 +3,8 @@ set -euo pipefail
 
 # execplan.pre_creation — lightweight environment check run before the plan file exists.
 # --plan is not accepted; branch management is the caller's responsibility.
-# Records git state and returns pass. Follow with execplan.post_creation after writing the plan.
+# Validates branch/worktree state before plan creation. Follow with execplan.post_creation after
+# writing the plan.
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -21,9 +22,20 @@ done
 commands=()
 commands+=("git branch --show-current")
 commands+=("git status --short")
+commands+=("git diff --quiet --")
+commands+=("git diff --cached --quiet --")
+commands+=("git ls-files -u")
 commands+=("git log --oneline --decorate --max-count=20")
 
-git branch --show-current >/dev/null
+fail() {
+  local summary="$1"
+  echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
+  echo "FAILURE_SUMMARY=$summary"
+  echo "STATUS=fail"
+  exit 1
+}
+
+current_branch="$(git branch --show-current)"
 git status --short >/dev/null
 git log --oneline --decorate --max-count=20 >/dev/null
 
@@ -32,6 +44,22 @@ if command -v gh >/dev/null 2>&1; then
   set +e
   gh pr status >/dev/null 2>&1
   set -e
+fi
+
+if [[ -z "$current_branch" ]]; then
+  fail "detached HEAD is not allowed; switch to a feature branch before creating a plan"
+fi
+
+if [[ "$current_branch" == "main" || "$current_branch" == "master" ]]; then
+  fail "current branch '$current_branch' is not allowed for ExecPlan creation; switch to a feature branch first"
+fi
+
+if [[ -n "$(git ls-files -u)" ]]; then
+  fail "unmerged paths detected; resolve conflicts before creating a plan"
+fi
+
+if ! git diff --quiet -- || ! git diff --cached --quiet --; then
+  fail "tracked working tree is dirty; commit or stash tracked changes before creating a plan"
 fi
 
 echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"

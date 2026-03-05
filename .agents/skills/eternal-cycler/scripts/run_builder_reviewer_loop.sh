@@ -856,6 +856,9 @@ Review target:
 
   if [[ "$reviewer_approve_merge" == "true" ]]; then
     finalize_pr_tracking_doc "$PR_URL" "$TARGET_BRANCH" "$LATEST_COMMIT"
+    if [[ -n "$PR_URL" ]]; then
+      gh pr ready "$PR_URL" 2>/dev/null || true
+    fi
     log "reviewer approve_merge=true for commit $LATEST_COMMIT; loop finished"
     exit 0
   fi

@@ -2118,7 +2118,9 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                 let completed_rows: HashSet<usize> =
                     if let Some(index_rows) = completed_lut_rows_by_id.get(&lut_id) {
                         plt.entries(params)
-                            .map(|(_, (idx, _))| idx)
+                            .map(|(_, (idx, _))| {
+                                usize::try_from(idx).expect("LUT row index must fit in usize")
+                            })
                             .filter(|idx| index_rows.contains(idx))
                             .collect()
                     } else {
@@ -2198,11 +2200,14 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                 let pending = (0..plt.len())
                     .into_par_iter()
                     .filter_map(|input_idx| {
-                        let x = M::P::from_usize_to_constant(params, input_idx);
-                        let (row_idx, _) = plt.get(params, &x).unwrap_or_else(|| {
+                        let input_u64 =
+                            u64::try_from(input_idx).expect("LUT input index must fit in u64");
+                        let (row_idx, _) = plt.get(params, input_u64).unwrap_or_else(|| {
                             panic!("LUT entry {} missing from 0..len range", input_idx)
                         });
-                        (!completed_rows.contains(&row_idx)).then_some(input_idx)
+                        let row_idx_usize =
+                            usize::try_from(row_idx).expect("LUT row index must fit in usize");
+                        (!completed_rows.contains(&row_idx_usize)).then_some(input_idx)
                     })
                     .collect::<Vec<_>>();
                 debug!(
@@ -2253,11 +2258,15 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                 for input_idx in pending_input_indices.iter().copied() {
                     let device_slot = batch.len();
                     let device_shared = &gpu_lut_shared[device_slot];
-                    let x = M::P::from_usize_to_constant(device_shared.params, input_idx);
-                    let (idx, y_poly) = plt.get(device_shared.params, &x).unwrap_or_else(|| {
-                        panic!("LUT entry {} missing from 0..len range", input_idx)
-                    });
-                    batch.push((idx, device_shared.device_id, y_poly));
+                    let input_u64 =
+                        u64::try_from(input_idx).expect("LUT input index must fit in u64");
+                    let (idx, y_elem) =
+                        plt.get(device_shared.params, input_u64).unwrap_or_else(|| {
+                            panic!("LUT entry {} missing from 0..len range", input_idx)
+                        });
+                    let idx_usize = usize::try_from(idx).expect("LUT row index must fit in usize");
+                    let y_poly = M::P::from_elem_to_constant(device_shared.params, &y_elem);
+                    batch.push((idx_usize, device_shared.device_id, y_poly));
 
                     if batch.len() >= chunk_size {
                         let current_batch = std::mem::take(&mut batch);
@@ -2364,11 +2373,14 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                 let mut batch: Vec<(usize, M::P)> = Vec::with_capacity(chunk_size);
                 let mut pending_store_jobs: Option<Vec<CompactBytesJob<M>>> = None;
                 for input_idx in pending_input_indices.iter().copied() {
-                    let x = M::P::from_usize_to_constant(params, input_idx);
-                    let (idx, y_poly) = plt.get(params, &x).unwrap_or_else(|| {
+                    let input_u64 =
+                        u64::try_from(input_idx).expect("LUT input index must fit in u64");
+                    let (idx, y_elem) = plt.get(params, input_u64).unwrap_or_else(|| {
                         panic!("LUT entry {} missing from 0..len range", input_idx)
                     });
-                    batch.push((idx, y_poly));
+                    let idx_usize = usize::try_from(idx).expect("LUT row index must fit in usize");
+                    let y_poly = M::P::from_elem_to_constant(params, &y_elem);
+                    batch.push((idx_usize, y_poly));
 
                     if batch.len() >= chunk_size {
                         let current_batch = std::mem::take(&mut batch);
@@ -2720,9 +2732,13 @@ where
             .plaintext
             .as_ref()
             .expect("the BGG encoding should reveal plaintext for public lookup");
-        let (k, y) = plt.get(params, x).unwrap_or_else(|| {
-            panic!("{:?} not found in LUT for gate {}", x.to_const_int(), gate_id)
-        });
+        let x_u64 = u64::try_from(x.to_const_int())
+            .expect("BGG encoding plaintext constant term must fit in u64 for public lookup");
+        let (k, y) = plt
+            .get(params, x_u64)
+            .unwrap_or_else(|| panic!("{:?} not found in LUT for gate {}", x_u64, gate_id));
+        let k_usize = usize::try_from(k).expect("LUT row index must fit in usize");
+        let y_poly = M::P::from_elem_to_constant(params, &y);
 
         let dir = std::path::Path::new(&self.dir_path);
         let checkpoint_prefix = &self.checkpoint_prefix;
@@ -2760,14 +2776,14 @@ where
             m_g,
             "preimage_gate2_gy must have m_g columns"
         );
-        let gy = M::gadget_matrix(params, d) * y.clone();
+        let gy = M::gadget_matrix(params, d) * y_poly.clone();
         let gy_decomposed = gy.decompose();
         drop(gy);
         let gy_term = preimage_gate2_gy * gy_decomposed;
         c_const_rhs.add_in_place(&gy_term);
         drop(gy_term);
 
-        let v_idx = derive_lut_v_idx_from_hash::<M, HS>(params, self.hash_key, lut_id, k, d);
+        let v_idx = derive_lut_v_idx_from_hash::<M, HS>(params, self.hash_key, lut_id, k_usize, d);
         let preimage_gate2_v = read_matrix_from_chunks::<M>(
             params,
             dir,
@@ -2861,7 +2877,7 @@ where
             ),
             reveal_plaintext: true,
         };
-        let out = BggEncoding::new(c_out, out_pubkey, Some(y));
+        let out = BggEncoding::new(c_out, out_pubkey, Some(y_poly));
         debug!(
             "GGH15BGGEncodingPltEvaluator::public_lookup end: gate_id={}, lut_id={}, elapsed_ms={:.3}",
             gate_id,
@@ -2899,24 +2915,39 @@ mod test {
     use keccak_asm::Keccak256;
     use std::{fs, path::Path};
 
-    fn setup_lsb_constant_binary_plt(t_n: usize, params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {
-        PublicLut::<DCRTPoly>::new_from_usize_range(
+    fn setup_lsb_bit_lut(t_n: usize, params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {
+        PublicLut::<DCRTPoly>::new(
             params,
-            t_n,
-            |params, k| (k, DCRTPoly::from_usize_to_lsb(params, k)),
+            t_n as u64,
+            move |params, k| {
+                if k >= t_n as u64 {
+                    return None;
+                }
+                let y_elem = <<DCRTPoly as Poly>::Elem as crate::element::PolyElem>::constant(
+                    &params.modulus(),
+                    k % 2,
+                );
+                Some((k, y_elem))
+            },
             None,
         )
     }
 
     #[cfg(feature = "gpu")]
-    fn setup_lsb_constant_binary_plt_gpu(
-        t_n: usize,
-        params: &GpuDCRTPolyParams,
-    ) -> PublicLut<GpuDCRTPoly> {
-        PublicLut::<GpuDCRTPoly>::new_from_usize_range(
+    fn setup_lsb_bit_lut_gpu(t_n: usize, params: &GpuDCRTPolyParams) -> PublicLut<GpuDCRTPoly> {
+        PublicLut::<GpuDCRTPoly>::new(
             params,
-            t_n,
-            |params, k| (k, GpuDCRTPoly::from_usize_to_lsb(params, k)),
+            t_n as u64,
+            move |params, k| {
+                if k >= t_n as u64 {
+                    return None;
+                }
+                let y_elem = <<GpuDCRTPoly as Poly>::Elem as crate::element::PolyElem>::constant(
+                    &params.modulus(),
+                    k % 2,
+                );
+                Some((k, y_elem))
+            },
             None,
         )
     }
@@ -2930,7 +2961,7 @@ mod test {
         let _ = tracing_subscriber::fmt::try_init();
 
         let params = DCRTPolyParams::default();
-        let plt = setup_lsb_constant_binary_plt(16, &params);
+        let plt = setup_lsb_bit_lut(16, &params);
 
         // Create a simple circuit with the lookup table
         let mut circuit = PolyCircuit::new();
@@ -3014,7 +3045,10 @@ mod test {
         let result_encoding = &result_encoding[0];
         assert_eq!(result_encoding.pubkey, result_pubkey.clone());
 
-        let expected_plaintext = plt.get(&params, &plaintexts[0]).unwrap().1;
+        let expected_input = u64::try_from(plaintexts[0].to_const_int())
+            .expect("test plaintext constant term must fit in u64");
+        let expected_plaintext_elem = plt.get(&params, expected_input).unwrap().1;
+        let expected_plaintext = DCRTPoly::from_elem_to_constant(&params, &expected_plaintext_elem);
         assert_eq!(result_encoding.plaintext.clone().unwrap(), expected_plaintext.clone());
 
         let expected_vector = s_vec.clone() *
@@ -3030,7 +3064,7 @@ mod test {
         let _ = tracing_subscriber::fmt::try_init();
 
         let params = DCRTPolyParams::default();
-        let plt = setup_lsb_constant_binary_plt(16, &params);
+        let plt = setup_lsb_bit_lut(16, &params);
 
         // Create a simple circuit with the lookup table
         let mut circuit = PolyCircuit::new();
@@ -3125,7 +3159,11 @@ mod test {
             let result_encoding_i = &result_encoding[i];
             assert_eq!(result_encoding_i.pubkey, result_pubkey[i].clone());
 
-            let expected_plaintext = plt.get(&params, &plaintexts[i]).unwrap().1;
+            let expected_input = u64::try_from(plaintexts[i].to_const_int())
+                .expect("test plaintext constant term must fit in u64");
+            let expected_plaintext_elem = plt.get(&params, expected_input).unwrap().1;
+            let expected_plaintext =
+                DCRTPoly::from_elem_to_constant(&params, &expected_plaintext_elem);
             assert_eq!(result_encoding_i.plaintext.clone().unwrap(), expected_plaintext.clone());
 
             let expected_vector = s_vec.clone() *
@@ -3163,7 +3201,7 @@ mod test {
             detected_gpu_params.batch(),
         );
 
-        let plt = setup_lsb_constant_binary_plt_gpu(16, &params);
+        let plt = setup_lsb_bit_lut_gpu(16, &params);
 
         // Create a simple circuit with the lookup table
         let mut circuit = PolyCircuit::new();
@@ -3258,7 +3296,11 @@ mod test {
             let result_encoding_i = &result_encoding[i];
             assert_eq!(result_encoding_i.pubkey, result_pubkey[i].clone());
 
-            let expected_plaintext = plt.get(&params, &plaintexts[i]).unwrap().1;
+            let expected_input = u64::try_from(plaintexts[i].to_const_int())
+                .expect("test plaintext constant term must fit in u64");
+            let expected_plaintext_elem = plt.get(&params, expected_input).unwrap().1;
+            let expected_plaintext =
+                GpuDCRTPoly::from_elem_to_constant(&params, &expected_plaintext_elem);
             assert_eq!(result_encoding_i.plaintext.clone().unwrap(), expected_plaintext.clone());
 
             let expected_vector = s_vec.clone() *

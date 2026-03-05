@@ -184,10 +184,14 @@ where
         _: usize,
     ) -> BggEncoding<M> {
         let z = input.plaintext.as_ref().expect("the BGG encoding should revealed plaintext");
+        let z_u64 = u64::try_from(z.to_const_int())
+            .expect("BGG encoding plaintext constant term must fit in u64 for public lookup");
         debug!("public lookup length is {}", plt.len());
         let (k, y_k) = plt
-            .get(params, z)
-            .unwrap_or_else(|| panic!("{:?} is not exist in public lookup f", z.to_const_int()));
+            .get(params, z_u64)
+            .unwrap_or_else(|| panic!("{:?} is not exist in public lookup f", z_u64));
+        let k_usize = usize::try_from(k).expect("LUT row index must fit in usize");
+        let y_k_poly = M::P::from_elem_to_constant(params, &y_k);
         debug!("Performing public lookup, k={k}");
         let row_size = input.pubkey.matrix.row_size();
         let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, gate_id);
@@ -199,7 +203,7 @@ where
                     params,
                     &self.dir_path,
                     &format!("L_{gate_id}"),
-                    k,
+                    k_usize,
                 )
                 .unwrap_or_else(|| panic!("Matrix with index {} not found in batch", k))
             },
@@ -207,7 +211,7 @@ where
         );
         let concat = self.c_b.clone().concat_columns(&[&input.vector]);
         let vector = concat * l_k;
-        BggEncoding::new(vector, pubkey, Some(y_k))
+        BggEncoding::new(vector, pubkey, Some(y_k_poly))
     }
 }
 
@@ -270,10 +274,14 @@ where
             let mut partial = chunk
                 .into_par_iter()
                 .map(|(x_k, k, y_k)| {
-                    let ext_matrix = a_z.clone() - &(gadget.clone() * x_k);
-                    let target = a_lt.clone() - &(gadget.clone() * y_k);
+                    let x_k_usize = usize::try_from(x_k).expect("LUT input must fit in usize");
+                    let k_usize = usize::try_from(k).expect("LUT row index must fit in usize");
+                    let x_poly = P::from_usize_to_constant(params, x_k_usize);
+                    let y_poly = P::from_elem_to_constant(params, &y_k);
+                    let ext_matrix = a_z.clone() - &(gadget.clone() * x_poly);
+                    let target = a_lt.clone() - &(gadget.clone() * y_poly);
                     (
-                        k,
+                        k_usize,
                         trap_sampler.preimage_extend(
                             params,
                             trapdoor,
@@ -292,10 +300,14 @@ where
         let mut partial = batch
             .into_par_iter()
             .map(|(x_k, k, y_k)| {
-                let ext_matrix = a_z.clone() - &(gadget.clone() * x_k);
-                let target = a_lt.clone() - &(gadget.clone() * y_k);
+                let x_k_usize = usize::try_from(x_k).expect("LUT input must fit in usize");
+                let k_usize = usize::try_from(k).expect("LUT row index must fit in usize");
+                let x_poly = P::from_usize_to_constant(params, x_k_usize);
+                let y_poly = P::from_elem_to_constant(params, &y_k);
+                let ext_matrix = a_z.clone() - &(gadget.clone() * x_poly);
+                let target = a_lt.clone() - &(gadget.clone() * y_poly);
                 (
-                    k,
+                    k_usize,
                     trap_sampler.preimage_extend(
                         params,
                         trapdoor,
@@ -332,11 +344,20 @@ mod test {
     use keccak_asm::Keccak256;
     use std::{fs, path::Path};
 
-    fn setup_lsb_constant_binary_plt(t_n: usize, params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {
-        PublicLut::<DCRTPoly>::new_from_usize_range(
+    fn setup_lsb_bit_lut(t_n: usize, params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {
+        PublicLut::<DCRTPoly>::new(
             params,
-            t_n,
-            |params, k| (k, DCRTPoly::from_usize_to_lsb(params, k)),
+            t_n as u64,
+            move |params, k| {
+                if k >= t_n as u64 {
+                    return None;
+                }
+                let y_elem = <<DCRTPoly as Poly>::Elem as crate::element::PolyElem>::constant(
+                    &params.modulus(),
+                    k % 2,
+                );
+                Some((k, y_elem))
+            },
             None,
         )
     }
@@ -349,7 +370,7 @@ mod test {
         let _storage_lock = storage_test_lock().await;
         let _ = tracing_subscriber::fmt::try_init();
         let params = DCRTPolyParams::default();
-        let plt = setup_lsb_constant_binary_plt(16, &params);
+        let plt = setup_lsb_bit_lut(16, &params);
         // Create a simple circuit with the lookup table
         let mut circuit = PolyCircuit::new();
         let inputs = circuit.input(1);
@@ -426,7 +447,10 @@ mod test {
         assert_eq!(result_encoding.len(), 1);
         let result_encoding = &result_encoding[0];
         assert_eq!(result_encoding.pubkey, result_pubkey.clone());
-        let expected_plaintext = plt.get(&params, &plaintexts[0]).unwrap().1;
+        let expected_input = u64::try_from(plaintexts[0].to_const_int())
+            .expect("test plaintext constant term must fit in u64");
+        let expected_plaintext_elem = plt.get(&params, expected_input).unwrap().1;
+        let expected_plaintext = DCRTPoly::from_elem_to_constant(&params, &expected_plaintext_elem);
         assert_eq!(result_encoding.plaintext.clone().unwrap(), expected_plaintext.clone());
         let expected_vector = s_vec.clone() *
             (result_encoding.pubkey.matrix.clone() -

@@ -9,5 +9,5 @@
 - PR head/base: feat/semi-packing -> main
 - review state: OPEN
 - tracking state: COMPLETED
-- completion commit: e87994a65f20ed2bb05fac04db3c634f50c9dd80
-- completed at: 2026-03-04 22:39Z
+- completion commit: 76c044d60a51511500df3028deed8eadfd480c35
+- completed at: 2026-03-05 00:08Z

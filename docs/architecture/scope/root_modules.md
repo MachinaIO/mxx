@@ -28,6 +28,7 @@ This scope is cross-cutting and references multiple scopes through helper utilit
 - `matrix`
 - `sampler`
 - `bgg`
+- `agr16`
 
 ## Used by scopes
 

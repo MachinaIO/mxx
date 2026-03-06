@@ -73,3 +73,11 @@ harness = false
 [[bench]]
 name = "bench_preimage_gpu"
 harness = false
+
+[[bench]]
+name = "bench_agr16_complete_binary_tree_depth_env_probe"
+harness = false
+
+[[bench]]
+name = "bench_agr16_complete_binary_tree_depth_env_probe_gpu"
+harness = false

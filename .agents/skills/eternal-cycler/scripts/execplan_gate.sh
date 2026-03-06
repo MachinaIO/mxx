@@ -155,7 +155,15 @@ resolve_event_script() {
 }
 
 sanitize() {
-  echo "$1" | tr '\n' ' ' | sed -E 's/[;]+/,/g; s/[[:space:]]+/ /g; s/^ //; s/ $//'
+  local text="$1"
+  local repo_root_prefix="${REPO_ROOT%/}/"
+
+  text="${text//${repo_root_prefix}/}"
+  if [[ "$text" == "${REPO_ROOT%/}" ]]; then
+    text="."
+  fi
+
+  echo "$text" | tr '\n' ' ' | sed -E 's/[;]+/,/g; s/[[:space:]]+/ /g; s/^ //; s/ $//'
 }
 
 ensure_ledger_block() {

@@ -37,6 +37,17 @@ fi
 
 REPO_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel)}"
 
+repo_rel_path() {
+  local path="$1"
+  if [[ "$path" == "${REPO_ROOT%/}/"* ]]; then
+    printf '%s' "${path#${REPO_ROOT%/}/}"
+  elif [[ "$path" == "${REPO_ROOT%/}" ]]; then
+    printf '.'
+  else
+    printf '%s' "$path"
+  fi
+}
+
 commands=()
 commands+=("git branch --show-current")
 commands+=("git status --short")
@@ -94,14 +105,14 @@ fi
 tracking_path="${EXECPLAN_PR_TRACKING_PATH:-${REPO_ROOT}/eternal-cycler-out/prs/active/pr_${branch//\//_}.md}"
 # Repo-relative version for writing into the plan document (policy: no absolute paths in docs).
 tracking_path_rel="${tracking_path#"${REPO_ROOT}/"}"
-commands+=("mkdir -p $(dirname "$tracking_path")")
+commands+=("mkdir -p $(repo_rel_path "$(dirname "$tracking_path")")")
 mkdir -p "$(dirname "$tracking_path")"
 
 creation_date="$(date -u +"%Y-%m-%d %H:%MZ")"
 creation_commit="$(git rev-parse HEAD)"
 resolve_pr_metadata "$branch"
 
-commands+=("write $tracking_path")
+commands+=("write $(repo_rel_path "$tracking_path")")
 cat > "$tracking_path" <<EOF
 # PR Tracking: ${branch}
 

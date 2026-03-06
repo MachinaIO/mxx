@@ -34,6 +34,17 @@ fi
 # REPO_ROOT: root of the consuming git repository.
 REPO_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel)}"
 
+repo_rel_path() {
+  local path="$1"
+  if [[ "$path" == "${REPO_ROOT%/}/"* ]]; then
+    printf '%s' "${path#${REPO_ROOT%/}/}"
+  elif [[ "$path" == "${REPO_ROOT%/}" ]]; then
+    printf '.'
+  else
+    printf '%s' "$path"
+  fi
+}
+
 commands=()
 commands+=("rg -n eternal-cycler-out/prs/active/|eternal-cycler-out/prs/completed/ <plan>")
 
@@ -68,7 +79,7 @@ rollback_to_active() {
     target_path="$(to_plan_style_path "$target_rel")"
     if [[ "$PLAN" != "$target_path" && -f "$PLAN" ]]; then
       mkdir -p "$(dirname "$target_path")"
-      commands+=("rollback plan $PLAN -> $target_path")
+      commands+=("rollback plan $(repo_rel_path "$PLAN") -> $(repo_rel_path "$target_path")")
       mv "$PLAN" "$target_path"
       PLAN="$target_path"
       rollback_plan_path="$target_path"
@@ -186,15 +197,15 @@ fi
 if [[ ! -f "$pr_doc_path" && "$pr_doc_path" == */eternal-cycler-out/prs/active/* ]]; then
   fallback_path="${REPO_ROOT}/eternal-cycler-out/prs/completed/$(basename "$pr_doc_path")"
   if [[ -f "$fallback_path" ]]; then
-    commands+=("fallback pr doc $pr_doc_path -> $fallback_path")
+    commands+=("fallback pr doc $(repo_rel_path "$pr_doc_path") -> $(repo_rel_path "$fallback_path")")
     pr_doc_path="$fallback_path"
   fi
 fi
 
-commands+=("open $pr_doc_path")
+commands+=("open $(repo_rel_path "$pr_doc_path")")
 
 if [[ ! -f "$pr_doc_path" ]]; then
-  fail_validation "referenced PR tracking document not found: $pr_doc_path"
+  fail_validation "referenced PR tracking document not found: $(repo_rel_path "$pr_doc_path")"
 fi
 
 missing_fields=()

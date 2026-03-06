@@ -33,6 +33,17 @@ fi
 
 REPO_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel)}"
 
+repo_rel_path() {
+  local path="$1"
+  if [[ "$path" == "${REPO_ROOT%/}/"* ]]; then
+    printf '%s' "${path#${REPO_ROOT%/}/}"
+  elif [[ "$path" == "${REPO_ROOT%/}" ]]; then
+    printf '.'
+  else
+    printf '%s' "$path"
+  fi
+}
+
 commands=()
 commands+=("git branch --show-current")
 
@@ -106,7 +117,7 @@ if command -v gh >/dev/null 2>&1; then
 fi
 
 tracking_path="${EXECPLAN_PR_TRACKING_PATH:-${REPO_ROOT}/eternal-cycler-out/prs/active/pr_${current_branch//\//_}.md}"
-commands+=("mkdir -p $(dirname "$tracking_path")")
+commands+=("mkdir -p $(repo_rel_path "$(dirname "$tracking_path")")")
 mkdir -p "$(dirname "$tracking_path")"
 resume_date="$(date -u +"%Y-%m-%d %H:%MZ")"
 resume_commit="$(git rev-parse HEAD)"
@@ -128,7 +139,7 @@ if [[ -n "$pr_url" && "$pr_url" != "(not available locally)" && "$existing_pr_ur
   creation_commit="$resume_commit"
 fi
 
-commands+=("update $tracking_path")
+commands+=("update $(repo_rel_path "$tracking_path")")
 cat > "$tracking_path" <<EOF
 # PR Tracking: ${current_branch}
 

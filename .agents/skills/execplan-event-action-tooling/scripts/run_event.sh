@@ -3,8 +3,20 @@ set -euo pipefail
 
 # ETERNAL_CYCLER_ROOT and REPO_ROOT are exported by execplan_gate.sh before calling this script.
 # Fall back to git-based resolution if invoked directly (e.g. during testing).
-ETERNAL_CYCLER_ROOT="${ETERNAL_CYCLER_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)}"
-REPO_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel)}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ETERNAL_CYCLER_ROOT="${ETERNAL_CYCLER_ROOT:-$(cd "${SCRIPT_DIR}/../../eternal-cycler" && pwd)}"
+REPO_ROOT="${REPO_ROOT:-$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)}"
+
+repo_rel_path() {
+  local path="$1"
+  if [[ "$path" == "${REPO_ROOT%/}/"* ]]; then
+    printf '%s' "${path#${REPO_ROOT%/}/}"
+  elif [[ "$path" == "${REPO_ROOT%/}" ]]; then
+    printf '.'
+  else
+    printf '%s' "$path"
+  fi
+}
 
 PLAN=""
 while [[ $# -gt 0 ]]; do
@@ -31,7 +43,7 @@ if [[ -z "$PLAN" || ! -f "$PLAN" ]]; then
   exit 1
 fi
 
-commands="bash -n ${ETERNAL_CYCLER_ROOT}/scripts/*.sh ${REPO_ROOT}/.agents/skills/execplan-event-*/scripts/*.sh"
+commands="bash -n $(repo_rel_path "$ETERNAL_CYCLER_ROOT")/scripts/*.sh .agents/skills/execplan-event-*/scripts/*.sh"
 
 if ! bash -n "${ETERNAL_CYCLER_ROOT}"/scripts/*.sh "${REPO_ROOT}"/.agents/skills/execplan-event-*/scripts/*.sh; then
   echo "COMMANDS=$commands"
@@ -43,4 +55,3 @@ fi
 echo "COMMANDS=$commands"
 echo "FAILURE_SUMMARY=none"
 echo "STATUS=pass"
-

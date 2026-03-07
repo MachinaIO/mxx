@@ -51,6 +51,8 @@ commands+=("rg -n eternal-cycler-out/prs/active/|eternal-cycler-out/prs/complete
 pr_doc_path=""
 rollback_plan_path=""
 result_plan_path=""
+ROLLBACK_BLOCK_START="<!-- execplan-post-completion-rollback:start -->"
+ROLLBACK_BLOCK_END="<!-- execplan-post-completion-rollback:end -->"
 
 emit_fail() {
   local summary="$1"
@@ -72,10 +74,163 @@ to_plan_style_path() {
   fi
 }
 
+to_abs_repo_path() {
+  local path="$1"
+  if [[ "$path" == /* ]]; then
+    printf '%s' "$path"
+  else
+    printf '%s/%s' "$REPO_ROOT" "$path"
+  fi
+}
+
+rollback_receipt_rel_for_plan() {
+  local plan_path="$1"
+  printf 'eternal-cycler-out/plans/active/.post-completion-rollbacks/%s.receipt' "$(basename "$plan_path")"
+}
+
+generate_rollback_token() {
+  printf '%s\n' "$(date -u +%s%N)-$$-$RANDOM-$(basename "$PLAN")" | git hash-object --stdin | cut -c1-40
+}
+
+extract_rollback_field_from_plan() {
+  local key="$1"
+  sed -n "/${ROLLBACK_BLOCK_START}/,/${ROLLBACK_BLOCK_END}/p" "$PLAN" | \
+    sed -n -E "s/^- ${key}:[[:space:]]+(.+)$/\\1/p" | head -n1 | sed -E 's/[[:space:]]+$//'
+}
+
+extract_rollback_field_from_receipt() {
+  local receipt_path="$1"
+  local key="$2"
+  sed -n -E "s/^${key}=(.+)$/\\1/p" "$receipt_path" | head -n1 | sed -E 's/[[:space:]]+$//'
+}
+
+set_rollback_provenance_block() {
+  local source_rel="$1"
+  local retry_rel="$2"
+  local receipt_rel="$3"
+  local token="$4"
+  local recorded_at="$5"
+  local tmp
+
+  tmp="$(mktemp)"
+  awk \
+    -v start="$ROLLBACK_BLOCK_START" \
+    -v end="$ROLLBACK_BLOCK_END" \
+    -v source_rel="$source_rel" \
+    -v retry_rel="$retry_rel" \
+    -v receipt_rel="$receipt_rel" \
+    -v token="$token" \
+    -v recorded_at="$recorded_at" '
+    function print_block() {
+      print start
+      print "- rollback_source_plan: " source_rel
+      print "- rollback_retry_plan: " retry_rel
+      print "- rollback_receipt_doc: " receipt_rel
+      print "- rollback_token: " token
+      print "- rollback_recorded_at: " recorded_at
+      print end
+    }
+    index($0, start) {
+      if (!replaced) {
+        print_block()
+        replaced=1
+      }
+      in_block=1
+      next
+    }
+    index($0, end) {
+      in_block=0
+      next
+    }
+    !in_block { print }
+    END {
+      if (!replaced) {
+        print ""
+        print "## Post-completion Rollback Provenance"
+        print ""
+        print_block()
+      }
+    }
+  ' "$PLAN" > "$tmp"
+
+  mv "$tmp" "$PLAN"
+}
+
+write_rollback_provenance() {
+  local source_rel="$1"
+  local retry_rel="$2"
+  local receipt_rel receipt_path token recorded_at
+
+  receipt_rel="$(rollback_receipt_rel_for_plan "$retry_rel")"
+  receipt_path="$(to_abs_repo_path "$receipt_rel")"
+  token="$(generate_rollback_token)"
+  recorded_at="$(date -u +"%Y-%m-%d %H:%MZ")"
+
+  mkdir -p "$(dirname "$receipt_path")"
+  cat > "$receipt_path" <<EOF
+event_id=execplan.post_completion
+rollback_source_plan=${source_rel}
+rollback_retry_plan=${retry_rel}
+rollback_receipt_doc=${receipt_rel}
+rollback_token=${token}
+rollback_recorded_at=${recorded_at}
+EOF
+  commands+=("write $(repo_rel_path "$receipt_path")")
+  commands+=("record rollback provenance in $(repo_rel_path "$PLAN")")
+
+  set_rollback_provenance_block "$source_rel" "$retry_rel" "$receipt_rel" "$token" "$recorded_at"
+}
+
+validate_active_retry_provenance() {
+  local latest_status expected_source_rel expected_retry_rel expected_receipt_rel
+  local source_rel retry_rel receipt_rel token receipt_path
+  local receipt_event receipt_source receipt_retry receipt_doc receipt_token
+
+  latest_status="$(latest_post_completion_status || true)"
+  if [[ "$latest_status" != "fail" && "$latest_status" != "escalated" ]]; then
+    fail_validation "execplan.post_completion requires a completed plan path; active plans are allowed only after rollback from a failed post_completion attempt"
+  fi
+
+  expected_source_rel="eternal-cycler-out/plans/completed/$(basename "$PLAN")"
+  expected_retry_rel="eternal-cycler-out/plans/active/$(basename "$PLAN")"
+  expected_receipt_rel="$(rollback_receipt_rel_for_plan "$PLAN")"
+
+  source_rel="$(extract_rollback_field_from_plan "rollback_source_plan")"
+  retry_rel="$(extract_rollback_field_from_plan "rollback_retry_plan")"
+  receipt_rel="$(extract_rollback_field_from_plan "rollback_receipt_doc")"
+  token="$(extract_rollback_field_from_plan "rollback_token")"
+
+  if [[ -z "$source_rel" || -z "$retry_rel" || -z "$receipt_rel" || -z "$token" ]]; then
+    fail_validation "missing rollback provenance for active post_completion retry; rerun from the completed plan path to create a real rollback"
+  fi
+
+  if [[ "$source_rel" != "$expected_source_rel" || "$retry_rel" != "$expected_retry_rel" || "$receipt_rel" != "$expected_receipt_rel" ]]; then
+    fail_validation "rollback provenance does not match the expected completed/active retry paths for $(basename "$PLAN")"
+  fi
+
+  receipt_path="$(to_abs_repo_path "$receipt_rel")"
+  commands+=("open $(repo_rel_path "$receipt_path")")
+  if [[ ! -f "$receipt_path" ]]; then
+    fail_validation "missing rollback provenance receipt for active post_completion retry: $(repo_rel_path "$receipt_path")"
+  fi
+
+  receipt_event="$(extract_rollback_field_from_receipt "$receipt_path" "event_id")"
+  receipt_source="$(extract_rollback_field_from_receipt "$receipt_path" "rollback_source_plan")"
+  receipt_retry="$(extract_rollback_field_from_receipt "$receipt_path" "rollback_retry_plan")"
+  receipt_doc="$(extract_rollback_field_from_receipt "$receipt_path" "rollback_receipt_doc")"
+  receipt_token="$(extract_rollback_field_from_receipt "$receipt_path" "rollback_token")"
+
+  if [[ "$receipt_event" != "execplan.post_completion" || "$receipt_source" != "$source_rel" || \
+        "$receipt_retry" != "$retry_rel" || "$receipt_doc" != "$receipt_rel" || "$receipt_token" != "$token" ]]; then
+    fail_validation "rollback provenance receipt does not match the plan's recorded retry provenance"
+  fi
+}
+
 rollback_to_active() {
-  local target_rel target_path
+  local source_rel target_rel target_path
 
   if [[ "$PLAN" == eternal-cycler-out/plans/completed/* || "$PLAN" == */eternal-cycler-out/plans/completed/* ]]; then
+    source_rel="$(repo_rel_path "$PLAN")"
     target_rel="eternal-cycler-out/plans/active/$(basename "$PLAN")"
     target_path="$(to_plan_style_path "$target_rel")"
     if [[ "$PLAN" != "$target_path" && -f "$PLAN" ]]; then
@@ -84,6 +239,7 @@ rollback_to_active() {
       mv "$PLAN" "$target_path"
       PLAN="$target_path"
       rollback_plan_path="$target_path"
+      write_rollback_provenance "$source_rel" "$target_rel"
     fi
   fi
 
@@ -130,17 +286,14 @@ latest_post_completion_status() {
 }
 
 promote_retry_plan_to_completed() {
-  local latest_status target_rel target_path
+  local target_rel target_path receipt_rel receipt_path
 
   case "$PLAN" in
     eternal-cycler-out/plans/completed/*|*/eternal-cycler-out/plans/completed/*)
       return 0
       ;;
     eternal-cycler-out/plans/active/*|*/eternal-cycler-out/plans/active/*)
-      latest_status="$(latest_post_completion_status || true)"
-      if [[ "$latest_status" != "fail" && "$latest_status" != "escalated" ]]; then
-        fail_validation "execplan.post_completion requires a completed plan path; active plans are allowed only after rollback from a failed post_completion attempt"
-      fi
+      validate_active_retry_provenance
 
       target_rel="eternal-cycler-out/plans/completed/$(basename "$PLAN")"
       target_path="$(to_plan_style_path "$target_rel")"
@@ -150,6 +303,12 @@ promote_retry_plan_to_completed() {
         mv "$PLAN" "$target_path"
         PLAN="$target_path"
         result_plan_path="$target_path"
+      fi
+      receipt_rel="$(rollback_receipt_rel_for_plan "$PLAN")"
+      receipt_path="$(to_abs_repo_path "$receipt_rel")"
+      if [[ -f "$receipt_path" ]]; then
+        commands+=("remove $(repo_rel_path "$receipt_path")")
+        rm -f "$receipt_path"
       fi
       return 0
       ;;

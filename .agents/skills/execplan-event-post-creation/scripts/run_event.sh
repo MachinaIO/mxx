@@ -48,6 +48,45 @@ repo_rel_path() {
   fi
 }
 
+extract_tracking_field() {
+  local file="$1"
+  local key="$2"
+  [[ -f "$file" ]] || return 1
+  sed -n -E "s/^- ${key}:[[:space:]]+(.+)$/\\1/p" "$file" | head -n1 | sed -E 's/[[:space:]]+$//'
+}
+
+tracking_field_is_missing() {
+  local value="${1:-}"
+  [[ -z "$value" || "$value" == "(see original)" || "$value" == "(not available locally)" ]]
+}
+
+format_tracking_date_from_iso8601() {
+  local value="$1"
+  [[ -n "$value" && "$value" != "null" ]] || return 1
+  date -u -d "$value" +"%Y-%m-%d %H:%MZ" 2>/dev/null
+}
+
+derive_creation_commit_from_pr_json() {
+  local pr_json="$1"
+  jq -r '
+    def stamp: (.committedDate // .authoredDate // "");
+    (.createdAt // "") as $created_at
+    | (
+        [(.commits // [])[]? | select(stamp != "" and stamp <= $created_at)]
+        | sort_by(stamp)
+        | last
+        | .oid
+      )
+      // (
+        [(.commits // [])[]?]
+        | first
+        | .oid
+      )
+      // (.headRefOid // empty)
+      // empty
+  ' <<< "$pr_json"
+}
+
 commands=()
 commands+=("git branch --show-current")
 commands+=("git status --short")
@@ -57,31 +96,38 @@ git status --short >/dev/null
 
 resolve_pr_metadata() {
   local branch_name="$1"
-  local pr_list_json selected_json
+  local pr_list_json selected_json selected_url
 
   pr_url="${EXECPLAN_MANUAL_PR_URL:-"(not available locally)"}"
   pr_title="(not available locally)"
   pr_state="unknown"
   pr_head="$branch_name"
   pr_base="(unknown)"
+  pr_created_at_raw=""
+  pr_creation_commit_from_api=""
 
   if [[ "$gh_available" -ne 1 ]]; then
     return 0
   fi
 
   if [[ -n "${EXECPLAN_MANUAL_PR_URL:-}" && "${EXECPLAN_MANUAL_PR_URL}" != "(not available locally)" ]]; then
-    commands+=("gh pr view ${EXECPLAN_MANUAL_PR_URL} --json url,title,state,headRefName,baseRefName")
-    selected_json="$(gh pr view "${EXECPLAN_MANUAL_PR_URL}" --json url,title,state,headRefName,baseRefName 2>/dev/null || true)"
+    selected_url="${EXECPLAN_MANUAL_PR_URL}"
   else
-    commands+=("gh pr list --state open --head ${branch_name} --json url,title,state,headRefName,baseRefName,updatedAt --limit 20")
-    pr_list_json="$(gh pr list --state open --head "$branch_name" --json url,title,state,headRefName,baseRefName,updatedAt --limit 20 2>/dev/null || true)"
+    commands+=("gh pr list --state open --head ${branch_name} --json url,updatedAt --limit 20")
+    pr_list_json="$(gh pr list --state open --head "$branch_name" --json url,updatedAt --limit 20 2>/dev/null || true)"
     if [[ -n "$pr_list_json" ]]; then
-      selected_json="$(jq -c '[.[]] | sort_by(.updatedAt) | reverse | .[0] // empty' <<< "$pr_list_json")"
+      selected_url="$(jq -r '[.[]] | sort_by(.updatedAt) | reverse | .[0].url // empty' <<< "$pr_list_json")"
     else
-      selected_json=""
+      selected_url=""
     fi
   fi
 
+  if [[ -z "$selected_url" || "$selected_url" == "null" ]]; then
+    return 0
+  fi
+
+  commands+=("gh pr view ${selected_url} --json url,title,state,headRefName,baseRefName,createdAt,headRefOid,commits")
+  selected_json="$(gh pr view "$selected_url" --json url,title,state,headRefName,baseRefName,createdAt,headRefOid,commits 2>/dev/null || true)"
   if [[ -z "$selected_json" || "$selected_json" == "null" ]]; then
     return 0
   fi
@@ -91,6 +137,8 @@ resolve_pr_metadata() {
   pr_state="$(jq -r '.state // "unknown"' <<< "$selected_json")"
   pr_head="$(jq -r --arg branch "$branch_name" '.headRefName // $branch' <<< "$selected_json")"
   pr_base="$(jq -r '.baseRefName // "(unknown)"' <<< "$selected_json")"
+  pr_created_at_raw="$(jq -r '.createdAt // empty' <<< "$selected_json")"
+  pr_creation_commit_from_api="$(derive_creation_commit_from_pr_json "$selected_json")"
 }
 
 gh_available=0
@@ -110,7 +158,36 @@ mkdir -p "$(dirname "$tracking_path")"
 
 creation_date="$(date -u +"%Y-%m-%d %H:%MZ")"
 creation_commit="$(git rev-parse HEAD)"
+existing_pr_url="$(extract_tracking_field "$tracking_path" "PR link" || true)"
+existing_creation_date="$(extract_tracking_field "$tracking_path" "PR creation date" || true)"
+existing_creation_commit="$(extract_tracking_field "$tracking_path" "commit hash at PR creation time" || true)"
 resolve_pr_metadata "$branch"
+
+if [[ -n "$pr_url" && "$pr_url" != "(not available locally)" ]]; then
+  if [[ "$existing_pr_url" == "$pr_url" ]]; then
+    creation_date="$existing_creation_date"
+    creation_commit="$existing_creation_commit"
+  else
+    creation_date="$(format_tracking_date_from_iso8601 "$pr_created_at_raw" || true)"
+    creation_commit="$pr_creation_commit_from_api"
+  fi
+else
+  creation_date="$existing_creation_date"
+  creation_commit="$existing_creation_commit"
+fi
+
+if tracking_field_is_missing "$creation_date"; then
+  creation_date="$(format_tracking_date_from_iso8601 "$pr_created_at_raw" || true)"
+fi
+if tracking_field_is_missing "$creation_commit"; then
+  creation_commit="$pr_creation_commit_from_api"
+fi
+if tracking_field_is_missing "$creation_date"; then
+  creation_date="$(date -u +"%Y-%m-%d %H:%MZ")"
+fi
+if tracking_field_is_missing "$creation_commit"; then
+  creation_commit="$(git rev-parse HEAD)"
+fi
 
 commands+=("write $(repo_rel_path "$tracking_path")")
 cat > "$tracking_path" <<EOF

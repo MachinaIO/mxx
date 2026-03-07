@@ -409,6 +409,38 @@ extract_bullet_line_value() {
   sed -n -E "s/^- ${key}:[[:space:]]+(.+)$/\\1/p" "$file" | head -n1 | sed -E 's/[[:space:]]+$//'
 }
 
+tracking_field_is_missing() {
+  local value="${1:-}"
+  [[ -z "$value" || "$value" == "(see original)" || "$value" == "(not available locally)" ]]
+}
+
+format_tracking_date_from_iso8601() {
+  local value="$1"
+  [[ -n "$value" && "$value" != "null" ]] || return 1
+  date -u -d "$value" +"%Y-%m-%d %H:%MZ" 2>/dev/null
+}
+
+derive_creation_commit_from_pr_json() {
+  local pr_json="$1"
+  jq -r '
+    def stamp: (.committedDate // .authoredDate // "");
+    (.createdAt // "") as $created_at
+    | (
+        [(.commits // [])[]? | select(stamp != "" and stamp <= $created_at)]
+        | sort_by(stamp)
+        | last
+        | .oid
+      )
+      // (
+        [(.commits // [])[]?]
+        | first
+        | .oid
+      )
+      // (.headRefOid // empty)
+      // empty
+  ' <<< "$pr_json"
+}
+
 find_pr_tracking_doc() {
   local pr_url="$1"
   local dir found_path
@@ -429,29 +461,41 @@ sync_active_pr_tracking_doc() {
   local pr_url="$1"
   local target_branch="$2"
   local reference_commit="$3"
-  local tracking_path now_utc pr_info_json pr_title pr_state pr_head pr_base
+  local tracking_path now_utc pr_info_json pr_title pr_state pr_head pr_base pr_created_at_raw pr_creation_commit_from_api
   local existing_pr_url creation_date creation_commit
 
   tracking_path="eternal-cycler-out/prs/active/pr_${target_branch//\//_}.md"
   mkdir -p "$(dirname "$tracking_path")"
 
-  pr_info_json="$(gh pr view "$pr_url" --json url,title,state,headRefName,baseRefName 2>/dev/null || true)"
+  pr_info_json="$(gh pr view "$pr_url" --json url,title,state,headRefName,baseRefName,createdAt,headRefOid,commits 2>/dev/null || true)"
   [[ -n "$pr_info_json" ]] || die "failed to read PR metadata for tracking doc sync: $pr_url"
 
   pr_title="$(jq -r '.title // "(not available locally)"' <<< "$pr_info_json")"
   pr_state="$(jq -r '.state // "unknown"' <<< "$pr_info_json")"
   pr_head="$(jq -r --arg branch "$target_branch" '.headRefName // $branch' <<< "$pr_info_json")"
   pr_base="$(jq -r '.baseRefName // "(unknown)"' <<< "$pr_info_json")"
+  pr_created_at_raw="$(jq -r '.createdAt // empty' <<< "$pr_info_json")"
+  pr_creation_commit_from_api="$(derive_creation_commit_from_pr_json "$pr_info_json")"
 
   existing_pr_url="$(extract_bullet_line_value "$tracking_path" "PR link" || true)"
   creation_date="$(extract_bullet_line_value "$tracking_path" "PR creation date" || true)"
   creation_commit="$(extract_bullet_line_value "$tracking_path" "commit hash at PR creation time" || true)"
   now_utc="$(date -u +"%Y-%m-%d %H:%MZ")"
 
-  if [[ -z "$creation_date" || "$creation_date" == "(see original)" || "$creation_date" == "(not available locally)" || "$existing_pr_url" != "$pr_url" ]]; then
+  if [[ "$existing_pr_url" != "$pr_url" ]]; then
+    creation_date="$(format_tracking_date_from_iso8601 "$pr_created_at_raw" || true)"
+    creation_commit="$pr_creation_commit_from_api"
+  fi
+  if tracking_field_is_missing "$creation_date"; then
+    creation_date="$(format_tracking_date_from_iso8601 "$pr_created_at_raw" || true)"
+  fi
+  if tracking_field_is_missing "$creation_commit"; then
+    creation_commit="$pr_creation_commit_from_api"
+  fi
+  if tracking_field_is_missing "$creation_date"; then
     creation_date="$now_utc"
   fi
-  if [[ -z "$creation_commit" || "$creation_commit" == "(see original)" || "$creation_commit" == "(not available locally)" || "$existing_pr_url" != "$pr_url" ]]; then
+  if tracking_field_is_missing "$creation_commit"; then
     creation_commit="$reference_commit"
   fi
 

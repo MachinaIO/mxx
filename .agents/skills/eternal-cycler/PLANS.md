@@ -183,7 +183,7 @@ Two paths depending on whether you are starting a new plan or resuming an existi
 8. **Post-completion gate** — run out-of-sandbox:
    * `scripts/execplan_gate.sh --plan <completed_plan_md> --event execplan.post_completion`
    * `execplan.post_completion` is validation-only: no `git add`, `git commit`, or `git push`
-   * On failure: the gate script rolls the plan back to `eternal-cycler-out/plans/active/` before retrying and records rollback provenance in the active plan plus a sidecar receipt under `eternal-cycler-out/plans/active/.post-completion-rollbacks/`. Use the current plan path (which may be in `active/` after rollback) when invoking the gate on retry, and preserve that provenance until the retry passes. On escalation: same as step 6 — document failure, leave the plan in `eternal-cycler-out/plans/completed/` as failed, and stop.
+   * On failure: the gate script rolls the plan back to `eternal-cycler-out/plans/active/` before retrying and records rollback provenance in the active plan plus a sidecar receipt under `eternal-cycler-out/plans/active/.post-completion-rollbacks/`. Use the current plan path (which may be in `active/` after rollback) when invoking the gate on retry, and preserve that provenance until the retry passes. An active-path retry is valid only while its latest `execplan.post_completion` ledger entry is `fail`; once the event escalates, the gate must re-close the plan in `eternal-cycler-out/plans/completed/` and remove the active rollback receipt. On escalation: same as step 6 — document failure, leave the plan in `eternal-cycler-out/plans/completed/` as failed, and stop.
    * Lifecycle complete.
 
 ### Resume existing plan

@@ -166,6 +166,68 @@ sanitize() {
   echo "$text" | tr '\n' ' ' | sed -E 's/[;]+/,/g; s/[[:space:]]+/ /g; s/^ //; s/ $//'
 }
 
+repo_rel_path() {
+  local path="$1"
+  if [[ "$path" == "${REPO_ROOT%/}/"* ]]; then
+    printf '%s' "${path#${REPO_ROOT%/}/}"
+  elif [[ "$path" == "${REPO_ROOT%/}" ]]; then
+    printf '.'
+  else
+    printf '%s' "$path"
+  fi
+}
+
+append_command_note() {
+  local note="$1"
+  if [[ -z "$note" ]]; then
+    return 0
+  fi
+  if [[ -z "$COMMANDS" ]]; then
+    COMMANDS="$(sanitize "$note")"
+  else
+    COMMANDS="$(sanitize "$COMMANDS ; $note")"
+  fi
+}
+
+force_close_escalated_post_completion() {
+  local source_path target_rel target_path source_rel receipt_rel receipt_path
+
+  [[ "$HAS_PLAN_FILE" -eq 1 ]] || return 0
+  [[ "$EVENT" == "$POST_EVENT_ID" && "$FINAL_STATUS" == "escalated" ]] || return 0
+
+  receipt_rel="eternal-cycler-out/plans/active/.post-completion-rollbacks/$(basename "$PLAN").receipt"
+  receipt_path="${REPO_ROOT%/}/${receipt_rel}"
+
+  case "$PLAN" in
+    eternal-cycler-out/plans/active/*)
+      source_path="${REPO_ROOT%/}/${PLAN}"
+      ;;
+    "${REPO_ROOT%/}"/eternal-cycler-out/plans/active/*)
+      source_path="$PLAN"
+      ;;
+    *)
+      source_path=""
+      ;;
+  esac
+
+  if [[ -n "$source_path" && -f "$source_path" ]]; then
+    source_rel="$(repo_rel_path "$source_path")"
+    target_rel="eternal-cycler-out/plans/completed/$(basename "$source_path")"
+    target_path="${REPO_ROOT%/}/${target_rel}"
+    mkdir -p "$(dirname "$target_path")"
+    mv "$source_path" "$target_path"
+    PLAN="$target_path"
+    HAS_PLAN_FILE=1
+    ensure_ledger_block
+    append_command_note "force-close escalated post_completion plan ${source_rel} -> ${target_rel}"
+  fi
+
+  if [[ -f "$receipt_path" ]]; then
+    rm -f "$receipt_path"
+    append_command_note "remove ${receipt_rel}"
+  fi
+}
+
 ensure_ledger_block() {
   if [[ "$HAS_PLAN_FILE" -ne 1 ]]; then
     return 0
@@ -605,6 +667,8 @@ fi
 if [[ -z "$FAILURE_SUMMARY" ]]; then
   FAILURE_SUMMARY="none"
 fi
+
+force_close_escalated_post_completion
 
 FINISHED_AT="$(date -u +"%Y-%m-%d %H:%MZ")"
 ENTRY="- attempt_record: event_id=${EVENT}; attempt=${ATTEMPT}; status=${FINAL_STATUS}; started_at=${STARTED_AT}; finished_at=${FINISHED_AT}; commands=$(sanitize "$COMMANDS"); failure_summary=$(sanitize "$FAILURE_SUMMARY"); notify_reference=$(sanitize "$NOTIFY_REFERENCE");"

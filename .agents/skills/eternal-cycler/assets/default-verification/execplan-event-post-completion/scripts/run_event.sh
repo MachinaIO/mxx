@@ -187,7 +187,11 @@ validate_active_retry_provenance() {
   local receipt_event receipt_source receipt_retry receipt_doc receipt_token
 
   latest_status="$(latest_post_completion_status || true)"
-  if [[ "$latest_status" != "fail" && "$latest_status" != "escalated" ]]; then
+  if [[ "$latest_status" == "escalated" ]]; then
+    fail_validation "execplan.post_completion escalation is terminal; the failed plan must stay under eternal-cycler-out/plans/completed/"
+  fi
+
+  if [[ "$latest_status" != "fail" ]]; then
     fail_validation "execplan.post_completion requires a completed plan path; active plans are allowed only after rollback from a failed post_completion attempt"
   fi
 
@@ -323,6 +327,7 @@ has_unresolved_latest_nonpass_event() {
     /event_id=/ && /status=/ {
       event=""
       status=""
+      failure=""
       n=split($0, parts, ";")
       for (i=1; i<=n; i++) {
         if (parts[i] ~ /event_id=/) {
@@ -337,15 +342,25 @@ has_unresolved_latest_nonpass_event() {
           gsub(/^ +| +$/, "", tmp)
           status=tmp
         }
+        if (parts[i] ~ /failure_summary=/) {
+          tmp=parts[i]
+          gsub(/^.*failure_summary=/, "", tmp)
+          gsub(/^ +| +$/, "", tmp)
+          failure=tmp
+        }
       }
       if (event != "") {
         latest[event]=status
+        latest_failure[event]=failure
       }
     }
     END {
       for (e in latest) {
         if (e == "execplan.pre_creation" || e == "execplan.post_creation" || \
             e == "execplan.resume" || e == "execplan.post_completion") {
+          continue
+        }
+        if (latest[e] == "fail" && latest_failure[e] ~ /^unresolved verification status remains for execplan\./) {
           continue
         }
         if (latest[e] == "fail" || latest[e] == "escalated") {
@@ -367,6 +382,10 @@ extract_tracking_field() {
   local tracking_doc="$1"
   local key="$2"
   sed -n -E "s/^- ${key}:[[:space:]]+(.+)$/\\1/p" "$tracking_doc" | head -n1 | sed -E 's/[[:space:]]+$//'
+}
+
+extract_plan_tracking_doc() {
+  sed -n -E 's/^- pr_tracking_doc:[[:space:]]+(.+)$/\1/p' "$PLAN" | head -n1 | sed -E 's/[[:space:]]+$//'
 }
 
 resolve_open_pr_for_branch() {
@@ -412,7 +431,10 @@ if ! awk '
   fail_validation "missing pass entry for non-lifecycle event"
 fi
 
-pr_doc_path="$(rg -o "eternal-cycler-out/prs/(active|completed)/[^ )\t]+\\.md" "$PLAN" | head -n1 || true)"
+pr_doc_path="$(extract_plan_tracking_doc || true)"
+if [[ -z "$pr_doc_path" ]]; then
+  pr_doc_path="$(rg -o "eternal-cycler-out/prs/(active|completed)/[^ ,)\t]+\\.md" "$PLAN" | head -n1 || true)"
+fi
 if [[ -z "$pr_doc_path" ]]; then
   fail_validation "missing PR tracking document linkage in plan"
 fi

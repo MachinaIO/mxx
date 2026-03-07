@@ -797,15 +797,21 @@ TARGET_BRANCH="$(resolve_current_branch || true)"
 if [[ -n "$PR_URL" ]]; then
   "$SCRIPT_DIR/run_builder_reviewer_doctor.sh" --pr-url "$PR_URL" >/dev/null
 
-  pr_info_json="$(gh pr view "$PR_URL" --json url,headRefName,number 2>/dev/null || true)"
+  pr_info_json="$(gh pr view "$PR_URL" --json url,headRefName,number,state 2>/dev/null || true)"
   [[ -n "$pr_info_json" ]] || die "failed to read PR metadata: $PR_URL"
 
   pr_head_branch="$(jq -r '.headRefName // ""' <<< "$pr_info_json")"
+  pr_state="$(jq -r '.state // ""' <<< "$pr_info_json")"
   PR_URL="$(jq -r '.url // ""' <<< "$pr_info_json")"
 
   [[ -n "$pr_head_branch" ]] || die "failed to resolve PR head branch from: $PR_URL"
+  [[ -n "$pr_state" ]] || die "failed to resolve PR state from: $PR_URL"
   if [[ "$pr_head_branch" != "$TARGET_BRANCH" ]]; then
     die "--pr-url head branch ($pr_head_branch) must match current local branch ($TARGET_BRANCH)"
+  fi
+  if [[ "$pr_state" != "OPEN" ]]; then
+    log "provided --pr-url $PR_URL is $pr_state; resolving the branch's live open PR instead"
+    PR_URL=""
   fi
 fi
 

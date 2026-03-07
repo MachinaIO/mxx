@@ -34,11 +34,23 @@ fi
 # REPO_ROOT: root of the consuming git repository.
 REPO_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel)}"
 
+repo_rel_path() {
+  local path="$1"
+  if [[ "$path" == "${REPO_ROOT%/}/"* ]]; then
+    printf '%s' "${path#${REPO_ROOT%/}/}"
+  elif [[ "$path" == "${REPO_ROOT%/}" ]]; then
+    printf '.'
+  else
+    printf '%s' "$path"
+  fi
+}
+
 commands=()
 commands+=("rg -n eternal-cycler-out/prs/active/|eternal-cycler-out/prs/completed/ <plan>")
 
 pr_doc_path=""
 rollback_plan_path=""
+result_plan_path=""
 
 emit_fail() {
   local summary="$1"
@@ -68,7 +80,7 @@ rollback_to_active() {
     target_path="$(to_plan_style_path "$target_rel")"
     if [[ "$PLAN" != "$target_path" && -f "$PLAN" ]]; then
       mkdir -p "$(dirname "$target_path")"
-      commands+=("rollback plan $PLAN -> $target_path")
+      commands+=("rollback plan $(repo_rel_path "$PLAN") -> $(repo_rel_path "$target_path")")
       mv "$PLAN" "$target_path"
       PLAN="$target_path"
       rollback_plan_path="$target_path"
@@ -81,6 +93,70 @@ fail_validation() {
   local summary="$1"
   rollback_to_active
   emit_fail "$summary"
+}
+
+latest_post_completion_status() {
+  sed -n '/<!-- verification-ledger:start -->/,/<!-- verification-ledger:end -->/p' "$PLAN" | awk '
+    /event_id=/ && /status=/ {
+      event=""
+      status=""
+      n=split($0, parts, ";")
+      for (i=1; i<=n; i++) {
+        if (parts[i] ~ /event_id=/) {
+          tmp=parts[i]
+          gsub(/^.*event_id=/, "", tmp)
+          gsub(/^ +| +$/, "", tmp)
+          event=tmp
+        }
+        if (parts[i] ~ /status=/) {
+          tmp=parts[i]
+          gsub(/^.*status=/, "", tmp)
+          gsub(/^ +| +$/, "", tmp)
+          status=tmp
+        }
+      }
+      if (event == "execplan.post_completion") {
+        latest=status
+      }
+    }
+    END {
+      if (latest != "") {
+        print latest
+        exit 0
+      }
+      exit 1
+    }
+  '
+}
+
+promote_retry_plan_to_completed() {
+  local latest_status target_rel target_path
+
+  case "$PLAN" in
+    eternal-cycler-out/plans/completed/*|*/eternal-cycler-out/plans/completed/*)
+      return 0
+      ;;
+    eternal-cycler-out/plans/active/*|*/eternal-cycler-out/plans/active/*)
+      latest_status="$(latest_post_completion_status || true)"
+      if [[ "$latest_status" != "fail" && "$latest_status" != "escalated" ]]; then
+        fail_validation "execplan.post_completion requires a completed plan path; active plans are allowed only after rollback from a failed post_completion attempt"
+      fi
+
+      target_rel="eternal-cycler-out/plans/completed/$(basename "$PLAN")"
+      target_path="$(to_plan_style_path "$target_rel")"
+      if [[ "$PLAN" != "$target_path" ]]; then
+        mkdir -p "$(dirname "$target_path")"
+        commands+=("promote retry plan $(repo_rel_path "$PLAN") -> $(repo_rel_path "$target_path")")
+        mv "$PLAN" "$target_path"
+        PLAN="$target_path"
+        result_plan_path="$target_path"
+      fi
+      return 0
+      ;;
+    *)
+      fail_validation "execplan.post_completion requires a plan under eternal-cycler-out/plans/completed/ (or an active rollback retry)"
+      ;;
+  esac
 }
 
 has_unresolved_latest_nonpass_event() {
@@ -128,6 +204,29 @@ extract_pr_link_from_tracking_doc() {
   sed -n -E 's/^- PR link:[[:space:]]+(.+)$/\1/p' "$tracking_doc" | head -n1 | sed -E 's/[[:space:]]+$//'
 }
 
+extract_tracking_field() {
+  local tracking_doc="$1"
+  local key="$2"
+  sed -n -E "s/^- ${key}:[[:space:]]+(.+)$/\\1/p" "$tracking_doc" | head -n1 | sed -E 's/[[:space:]]+$//'
+}
+
+resolve_open_pr_for_branch() {
+  local branch_name="$1"
+  local pr_list_json
+
+  [[ -n "$branch_name" ]] || return 1
+  command -v gh >/dev/null 2>&1 || return 1
+
+  commands+=("gh pr list --state open --head ${branch_name} --json url,updatedAt --limit 20")
+  pr_list_json="$(gh pr list --state open --head "$branch_name" --json url,updatedAt --limit 20 2>/dev/null || true)"
+  if [[ -z "$pr_list_json" ]]; then
+    return 1
+  fi
+  jq -r '[.[]] | sort_by(.updatedAt) | reverse | .[0].url // empty' <<< "$pr_list_json"
+}
+
+promote_retry_plan_to_completed
+
 if ! rg -q "event_id=execplan.post_creation;.*status=pass" "$PLAN" && \
    ! rg -q "event_id=execplan.resume;.*status=pass" "$PLAN"; then
   fail_validation "missing pass entry for execplan.post_creation or execplan.resume"
@@ -165,15 +264,15 @@ fi
 if [[ ! -f "$pr_doc_path" && "$pr_doc_path" == */eternal-cycler-out/prs/active/* ]]; then
   fallback_path="${REPO_ROOT}/eternal-cycler-out/prs/completed/$(basename "$pr_doc_path")"
   if [[ -f "$fallback_path" ]]; then
-    commands+=("fallback pr doc $pr_doc_path -> $fallback_path")
+    commands+=("fallback pr doc $(repo_rel_path "$pr_doc_path") -> $(repo_rel_path "$fallback_path")")
     pr_doc_path="$fallback_path"
   fi
 fi
 
-commands+=("open $pr_doc_path")
+commands+=("open $(repo_rel_path "$pr_doc_path")")
 
 if [[ ! -f "$pr_doc_path" ]]; then
-  fail_validation "referenced PR tracking document not found: $pr_doc_path"
+  fail_validation "referenced PR tracking document not found: $(repo_rel_path "$pr_doc_path")"
 fi
 
 missing_fields=()
@@ -187,8 +286,25 @@ if [[ ${#missing_fields[@]} -gt 0 ]]; then
 fi
 
 pr_url="$(extract_pr_link_from_tracking_doc "$pr_doc_path")"
-if [[ -z "$pr_url" || "$pr_url" == "(not available locally)" ]]; then
-  fail_validation "PR tracking metadata missing resolvable PR link"
+branch_name="$(extract_tracking_field "$pr_doc_path" "branch name")"
+open_pr_url="$(resolve_open_pr_for_branch "$branch_name" || true)"
+
+if [[ -n "$open_pr_url" ]]; then
+  if [[ -z "$pr_url" || "$pr_url" == "(not available locally)" ]]; then
+    fail_validation "PR tracking metadata missing live PR link for branch '$branch_name'; current open PR is $open_pr_url"
+  fi
+  if [[ "$pr_url" != "$open_pr_url" ]]; then
+    fail_validation "PR tracking metadata is stale for branch '$branch_name'; recorded $pr_url but current open PR is $open_pr_url"
+  fi
+fi
+
+if [[ -n "$pr_url" && "$pr_url" != "(not available locally)" ]]; then
+  if command -v gh >/dev/null 2>&1; then
+    commands+=("gh pr view ${pr_url} --json url,state")
+    if ! gh pr view "$pr_url" --json url,state >/dev/null 2>&1; then
+      fail_validation "PR tracking metadata points to an unreadable PR link: $pr_url"
+    fi
+  fi
 fi
 
 if rg -q "^- \[ \]" "$PLAN"; then
@@ -211,4 +327,7 @@ fi
 
 echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
 echo "FAILURE_SUMMARY=none"
+if [[ -n "$result_plan_path" ]]; then
+  echo "PLAN_PATH=$result_plan_path"
+fi
 echo "STATUS=pass"

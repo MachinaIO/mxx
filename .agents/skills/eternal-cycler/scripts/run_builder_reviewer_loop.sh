@@ -522,24 +522,14 @@ EOF
   upsert_bullet_line "$completed_path" "PR link" "$pr_url"
   upsert_bullet_line "$completed_path" "branch name" "$target_branch"
   upsert_bullet_line "$completed_path" "PR state" "OPEN"
-  upsert_bullet_line "$completed_path" "review state" "OPEN"
+  upsert_bullet_line "$completed_path" "review state" "APPROVED"
   upsert_bullet_line "$completed_path" "tracking state" "COMPLETED"
   upsert_bullet_line "$completed_path" "completion commit" "$approved_commit"
   upsert_bullet_line "$completed_path" "completed at" "$now_utc"
 
-  if [[ -n "$moved_from" ]]; then
-    git add -A -- "$moved_from" "$completed_path" >/dev/null 2>&1 || die "failed to stage PR tracking move/update"
-  else
-    git add -A -- "$completed_path" >/dev/null 2>&1 || die "failed to stage PR tracking update"
-  fi
-
-  if ! git diff --cached --quiet; then
-    git commit -m "docs(pr): complete tracking on reviewer approval" >/dev/null 2>&1 || die "failed to commit PR tracking completion update"
-    git push origin "$target_branch" >/dev/null 2>&1 || die "failed to push PR tracking completion update to origin/$target_branch"
-    log "PR tracking document finalized and pushed: $completed_path"
-  else
-    log "PR tracking document already finalized: $completed_path"
-  fi
+  # Never create a new commit after the reviewer approves merge. The approved
+  # branch head must remain the final merge candidate.
+  log "PR tracking document finalized locally without commit/push: $completed_path"
 }
 
 resolve_or_create_pr_for_branch() {

@@ -50,6 +50,7 @@ commands+=("rg -n eternal-cycler-out/prs/active/|eternal-cycler-out/prs/complete
 
 pr_doc_path=""
 rollback_plan_path=""
+result_plan_path=""
 
 emit_fail() {
   local summary="$1"
@@ -92,6 +93,70 @@ fail_validation() {
   local summary="$1"
   rollback_to_active
   emit_fail "$summary"
+}
+
+latest_post_completion_status() {
+  sed -n '/<!-- verification-ledger:start -->/,/<!-- verification-ledger:end -->/p' "$PLAN" | awk '
+    /event_id=/ && /status=/ {
+      event=""
+      status=""
+      n=split($0, parts, ";")
+      for (i=1; i<=n; i++) {
+        if (parts[i] ~ /event_id=/) {
+          tmp=parts[i]
+          gsub(/^.*event_id=/, "", tmp)
+          gsub(/^ +| +$/, "", tmp)
+          event=tmp
+        }
+        if (parts[i] ~ /status=/) {
+          tmp=parts[i]
+          gsub(/^.*status=/, "", tmp)
+          gsub(/^ +| +$/, "", tmp)
+          status=tmp
+        }
+      }
+      if (event == "execplan.post_completion") {
+        latest=status
+      }
+    }
+    END {
+      if (latest != "") {
+        print latest
+        exit 0
+      }
+      exit 1
+    }
+  '
+}
+
+promote_retry_plan_to_completed() {
+  local latest_status target_rel target_path
+
+  case "$PLAN" in
+    eternal-cycler-out/plans/completed/*|*/eternal-cycler-out/plans/completed/*)
+      return 0
+      ;;
+    eternal-cycler-out/plans/active/*|*/eternal-cycler-out/plans/active/*)
+      latest_status="$(latest_post_completion_status || true)"
+      if [[ "$latest_status" != "fail" && "$latest_status" != "escalated" ]]; then
+        fail_validation "execplan.post_completion requires a completed plan path; active plans are allowed only after rollback from a failed post_completion attempt"
+      fi
+
+      target_rel="eternal-cycler-out/plans/completed/$(basename "$PLAN")"
+      target_path="$(to_plan_style_path "$target_rel")"
+      if [[ "$PLAN" != "$target_path" ]]; then
+        mkdir -p "$(dirname "$target_path")"
+        commands+=("promote retry plan $(repo_rel_path "$PLAN") -> $(repo_rel_path "$target_path")")
+        mv "$PLAN" "$target_path"
+        PLAN="$target_path"
+        result_plan_path="$target_path"
+      fi
+      return 0
+      ;;
+    *)
+      fail_validation "execplan.post_completion requires a plan under eternal-cycler-out/plans/completed/ (or an active rollback retry)"
+      ;;
+  esac
 }
 
 has_unresolved_latest_nonpass_event() {
@@ -159,6 +224,8 @@ resolve_open_pr_for_branch() {
   fi
   jq -r '[.[]] | sort_by(.updatedAt) | reverse | .[0].url // empty' <<< "$pr_list_json"
 }
+
+promote_retry_plan_to_completed
 
 if ! rg -q "event_id=execplan.post_creation;.*status=pass" "$PLAN" && \
    ! rg -q "event_id=execplan.resume;.*status=pass" "$PLAN"; then
@@ -260,4 +327,7 @@ fi
 
 echo "COMMANDS=$(IFS=' | '; echo "${commands[*]}")"
 echo "FAILURE_SUMMARY=none"
+if [[ -n "$result_plan_path" ]]; then
+  echo "PLAN_PATH=$result_plan_path"
+fi
 echo "STATUS=pass"

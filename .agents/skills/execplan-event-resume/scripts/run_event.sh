@@ -56,6 +56,10 @@ extract_tracking_field() {
   sed -n -E "s/^- ${key}:[[:space:]]+(.+)$/\\1/p" "$file" | head -n1 | sed -E 's/[[:space:]]+$//'
 }
 
+extract_plan_tracking_doc() {
+  sed -n -E 's/^- pr_tracking_doc:[[:space:]]+(.+)$/\1/p' "$PLAN" | head -n1 | sed -E 's/[[:space:]]+$//'
+}
+
 resolve_pr_metadata() {
   local branch_name="$1"
   local pr_list_json selected_json
@@ -116,7 +120,13 @@ if command -v gh >/dev/null 2>&1; then
   gh_available=1
 fi
 
-tracking_path="${EXECPLAN_PR_TRACKING_PATH:-${REPO_ROOT}/eternal-cycler-out/prs/active/pr_${current_branch//\//_}.md}"
+tracking_path="$(extract_plan_tracking_doc || true)"
+if [[ -n "$tracking_path" && "$tracking_path" != /* ]]; then
+  tracking_path="${REPO_ROOT}/${tracking_path}"
+fi
+if [[ -z "$tracking_path" ]]; then
+  tracking_path="${EXECPLAN_PR_TRACKING_PATH:-${REPO_ROOT}/eternal-cycler-out/prs/active/pr_${current_branch//\//_}.md}"
+fi
 commands+=("mkdir -p $(repo_rel_path "$(dirname "$tracking_path")")")
 mkdir -p "$(dirname "$tracking_path")"
 resume_date="$(date -u +"%Y-%m-%d %H:%MZ")"

@@ -1,7 +1,0 @@
-interface:
-  display_name: "Eternal Cycler"
-  short_description: "Automate the builder-reviewer agent interaction cycle"
-  default_prompt: "Run the eternal-cycler skill workflow and invoke the non-interactive loop script with explicit task input."
-
-policy:
-  allow_implicit_invocation: true

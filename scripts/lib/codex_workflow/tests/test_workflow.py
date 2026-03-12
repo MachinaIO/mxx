@@ -154,59 +154,147 @@ class WorkflowHarnessTests(unittest.TestCase):
         backups = list(self.paths.agents_dir.glob("session-broken.json.corrupt-*"))
         self.assertTrue(backups)
 
-    def test_planning_stop_allows_plan_proposal_turn_and_sets_waiting_flag(self) -> None:
-        self.write_plan(session_id="plan-accept", phase="planning")
+    def test_planning_stop_first_turn_sets_awaiting_flag_and_ends_turn(self) -> None:
+        self.write_plan(session_id="plan-first", phase="planning")
 
         outcome = handle_stop(
-            {
-                "session_id": "plan-accept",
-                "latest_assistant_message": "Here is the revised plan.\n\nReply with ACCEPT to approve this plan. If you want changes, describe the revisions concretely.",
-            },
+            {"session_id": "plan-first"},
             self.repo_root,
         )
 
         self.assertEqual(outcome.exit_code, 0)
         self.assertIsNone(outcome.stdout_payload)
-        state = load_state(self.paths, "plan-accept").state
+        state = load_state(self.paths, "plan-first").state
         self.assertEqual(state.phase, "planning")
         self.assertTrue(state.awaiting_plan_reply)
 
-    def test_planning_stop_blocks_when_plan_turn_does_not_end_with_approval_prompt(self) -> None:
-        self.write_plan(session_id="nested-accept", phase="planning")
-        exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="accept", msg=None))
+    def test_planning_stop_accept_reply_transitions_to_implementation(self) -> None:
+        self.write_plan(session_id="accept-transition", phase="planning")
+        state = load_state(self.paths, "accept-transition").state
+        state.awaiting_plan_reply = True
+        save_state(self.paths, state)
+        exec_runner = FakeExecRunner(
+            StructuredExecResult(ok=True, payload={"is_approve": True})
+        )
 
         outcome = handle_stop(
-            {"session_id": "nested-accept", "latest_assistant_message": "Here is a draft plan, but I forgot the required ending."},
+            {
+                "session_id": "accept-transition",
+                "latest_user_message": "Looks good, go ahead.",
+            },
             self.repo_root,
             exec_runner=exec_runner,
         )
 
         self.assertEqual(outcome.exit_code, 2)
-        self.assertIn("Planning turns must end", outcome.stderr_message)
-        self.assertEqual(len(exec_runner.calls), 0)
-        state = load_state(self.paths, "nested-accept").state
-        self.assertEqual(state.phase, "planning")
+        self.assertIn("Plan approval recorded", outcome.stderr_message)
+        state = load_state(self.paths, "accept-transition").state
+        self.assertEqual(state.phase, "implementation")
         self.assertFalse(state.awaiting_plan_reply)
+        self.assertEqual(state.last_plan_check.result, "accept")
+        self.assertIsNotNone(state.last_plan_check.at)
 
-    def test_planning_stop_blocks_if_reply_was_pending_but_builder_did_not_process_it(self) -> None:
-        self.write_plan(session_id="qualified-accept", phase="planning")
-        state = load_state(self.paths, "qualified-accept").state
+    def test_planning_stop_revision_reply_stays_in_planning(self) -> None:
+        self.write_plan(session_id="revision-reply", phase="planning")
+        state = load_state(self.paths, "revision-reply").state
         state.awaiting_plan_reply = True
         save_state(self.paths, state)
+        exec_runner = FakeExecRunner(
+            StructuredExecResult(
+                ok=True,
+                payload={"is_approve": False, "msg": "Add error handling for the edge case."},
+            )
+        )
 
         outcome = handle_stop(
             {
-                "session_id": "qualified-accept",
-                "latest_assistant_message": "I need more time to think about that.",
+                "session_id": "revision-reply",
+                "latest_user_message": "Please add error handling for the edge case.",
             },
             self.repo_root,
+            exec_runner=exec_runner,
         )
 
         self.assertEqual(outcome.exit_code, 2)
-        self.assertIn("A user reply to the current session plan is still pending.", outcome.stderr_message)
-        state = load_state(self.paths, "qualified-accept").state
+        self.assertIn("Plan revisions are still required", outcome.stderr_message)
+        self.assertIn("error handling", outcome.stderr_message)
+        state = load_state(self.paths, "revision-reply").state
         self.assertEqual(state.phase, "planning")
-        self.assertTrue(state.awaiting_plan_reply)
+        self.assertFalse(state.awaiting_plan_reply)
+        self.assertEqual(state.last_plan_check.result, "revision")
+        self.assertEqual(state.last_plan_check.msg, "Add error handling for the edge case.")
+
+    def test_planning_stop_exec_failure_falls_back_to_revision(self) -> None:
+        self.write_plan(session_id="exec-fail", phase="planning")
+        state = load_state(self.paths, "exec-fail").state
+        state.awaiting_plan_reply = True
+        save_state(self.paths, state)
+        exec_runner = FakeExecRunner(
+            StructuredExecResult(ok=False, error="codex exec crashed")
+        )
+
+        outcome = handle_stop(
+            {
+                "session_id": "exec-fail",
+                "latest_user_message": "ACCEPT",
+            },
+            self.repo_root,
+            exec_runner=exec_runner,
+        )
+
+        self.assertEqual(outcome.exit_code, 2)
+        self.assertIn("Plan revisions are still required", outcome.stderr_message)
+        state = load_state(self.paths, "exec-fail").state
+        self.assertEqual(state.phase, "planning")
+        self.assertFalse(state.awaiting_plan_reply)
+        self.assertEqual(state.last_plan_check.result, "revision")
+
+    def test_planning_stop_passes_user_message_in_exec_prompt(self) -> None:
+        self.write_plan(session_id="prompt-check", phase="planning")
+        state = load_state(self.paths, "prompt-check").state
+        state.awaiting_plan_reply = True
+        save_state(self.paths, state)
+        exec_runner = FakeExecRunner(
+            StructuredExecResult(ok=True, payload={"is_approve": True})
+        )
+
+        handle_stop(
+            {
+                "session_id": "prompt-check",
+                "latest_user_message": "Ship it!",
+            },
+            self.repo_root,
+            exec_runner=exec_runner,
+        )
+
+        self.assertEqual(len(exec_runner.calls), 1)
+        prompt, schema_path, label = exec_runner.calls[0]
+        self.assertIn("Ship it!", prompt)
+        self.assertTrue(str(schema_path).endswith("plan-approval.schema.json"))
+        self.assertEqual(label, "plan-classify")
+
+    def test_planning_stop_revision_without_msg_uses_user_message(self) -> None:
+        self.write_plan(session_id="no-msg-field", phase="planning")
+        state = load_state(self.paths, "no-msg-field").state
+        state.awaiting_plan_reply = True
+        save_state(self.paths, state)
+        exec_runner = FakeExecRunner(
+            StructuredExecResult(ok=True, payload={"is_approve": False})
+        )
+
+        outcome = handle_stop(
+            {
+                "session_id": "no-msg-field",
+                "latest_user_message": "Add more tests please.",
+            },
+            self.repo_root,
+            exec_runner=exec_runner,
+        )
+
+        self.assertEqual(outcome.exit_code, 2)
+        self.assertIn("Add more tests please.", outcome.stderr_message)
+        state = load_state(self.paths, "no-msg-field").state
+        self.assertEqual(state.last_plan_check.msg, "Add more tests please.")
 
     def test_stop_blocks_implementation_when_ordered_subtask_is_unchecked(self) -> None:
         self.write_plan(

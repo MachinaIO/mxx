@@ -6,20 +6,18 @@ At the start of each turn:
 1. Read `.agents/current-session-id`.
 2. Open `.agents/session-<session_id>.json`.
 3. Inspect the current `phase`.
-4. If `phase` is `planning` and `awaiting_plan_reply` is `true`, treat the current user message as a reply to the current session plan before doing anything else.
+4. If `phase` is `planning` and `awaiting_plan_reply` is `true`, the stop hook will classify the user's reply via `codex exec` and handle state transitions automatically. Focus on the work: implement if the user approved, or revise the plan if they requested changes.
 5. Act according to the rules below.
 
 ## Planning
 - Do not implement code yet.
-- If `awaiting_plan_reply` is `true`, first classify the current user message against the current session plan.
-- If the user approves the current session plan, update `.agents/session-<session_id>.json` to set `phase` to `implementation`, set `awaiting_plan_reply` to `false`, update `last_plan_check`, and start implementation immediately in the same turn.
-- If the user requests plan changes, keep `phase` as `planning`, set `awaiting_plan_reply` to `false`, update `last_plan_check`, revise the session plan, and then ask for approval again.
 - Create or update the session-specific plan at `plans/session-<session_id>.md`.
 - Discuss the plan with the user.
 - Update the plan document before ending the turn.
-- End each plan proposal with this exact instruction:
-  `Reply with ACCEPT to approve this plan. If you want changes, describe the revisions concretely.`
-- Do not set `awaiting_plan_reply` yourself after proposing a plan; `scripts/stop_hook.sh` records that state when the turn ends with the exact approval prompt.
+- Ask the user to approve the plan or describe specific revisions.
+- Do not manually update `awaiting_plan_reply`, `last_plan_check`, or `phase`; `scripts/stop_hook.sh` handles all planning state transitions automatically.
+- On the first stop in planning, the hook sets `awaiting_plan_reply` to `true` and ends the turn so the user can respond.
+- On the next stop, the hook classifies the user's reply with `codex exec` (hooks disabled, structured output). If the user approved, the hook transitions to implementation and blocks you to start working immediately. If the user requested changes, the hook blocks you with the revision feedback. Revise the session plan and let the turn end again to re-enter the approval cycle.
 
 ## Implementation
 - Read the session plan and work through subtasks in order.

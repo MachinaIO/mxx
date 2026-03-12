@@ -16,8 +16,6 @@ from .runners import CodexExecRunner, FinalTestRunner, ShellFinalTestRunner, Str
 from .state import ReviewSnapshot, SessionState, load_state, save_state, write_current_session_id
 from .transcript import latest_assistant_message_from_transcript, latest_user_message_from_transcript
 
-APPROVAL_PROMPT = "Reply with ACCEPT to approve this plan. If you want changes, describe the revisions concretely."
-
 
 @dataclass(frozen=True)
 class HookOutcome:
@@ -137,13 +135,6 @@ def _planning_revision_block_message(message: str | None) -> str:
     )
 
 
-def _planning_waiting_message() -> str:
-    return (
-        "Planning turns must end by updating the session plan and ending with the exact approval prompt: "
-        f"`{APPROVAL_PROMPT}`"
-    )
-
-
 def _recovered_state_block_message() -> str:
     return (
         "Session workflow state was missing or malformed and has been recovered to planning mode. "
@@ -156,12 +147,6 @@ def _missing_plan_structure_message() -> str:
         "The session plan is missing required checkbox sections. Restore "
         f"`{ORDERED_SUBTASKS_HEADING}` and `{FOLLOW_UP_SUBTASKS_HEADING}` before trying to finish."
     )
-
-
-def _ends_with_approval_prompt(message: str | None) -> bool:
-    if not message:
-        return False
-    return message.rstrip().endswith(APPROVAL_PROMPT)
 
 
 def handle_session_start(payload: dict[str, Any], repo_root: Path) -> HookOutcome:
@@ -187,20 +172,49 @@ def _handle_planning_stop(
     state: SessionState,
     exec_runner: StructuredExecRunner,
 ) -> HookOutcome:
-    latest_assistant_message = extract_latest_assistant_message(payload)
-    if _ends_with_approval_prompt(latest_assistant_message):
+    if not state.awaiting_plan_reply:
         state.awaiting_plan_reply = True
         save_state(paths, state)
         return HookOutcome(exit_code=0)
 
-    if state.awaiting_plan_reply:
-        return block_outcome(
-            "A user reply to the current session plan is still pending. Read BUILDER.md, classify the current "
-            "user message against the session plan at the start of the turn, update the session state, and then "
-            "either begin implementation or revise the plan."
-        )
+    state.awaiting_plan_reply = False
+    latest_user_message = extract_latest_user_message(payload)
 
-    return block_outcome(_planning_waiting_message())
+    schema_path = paths.schemas_dir / "plan-approval.schema.json"
+    prompt = (
+        "You are classifying a user's response to a proposed session plan.\n"
+        "The user was asked whether they approve the plan or want revisions.\n\n"
+        f"User response: {latest_user_message or '(no message provided)'}\n\n"
+        "If the user approves or accepts the plan, output is_approve=true.\n"
+        "If the user requests changes or provides feedback, "
+        "output is_approve=false and msg=<concise summary of requested revisions>.\n"
+        "If there is no clear user message, output is_approve=false "
+        "and msg='No user response was provided.'\n"
+    )
+    classify_result = exec_runner.run(prompt=prompt, schema_path=schema_path, label="plan-classify")
+
+    if not classify_result.ok or classify_result.payload is None:
+        state.last_plan_check = _record_review("revision", None)
+        save_state(paths, state)
+        return block_outcome(_planning_revision_block_message(
+            "Plan approval classification could not complete. "
+            "Treat user feedback as revision request."
+        ))
+
+    is_approve = classify_result.payload.get("is_approve")
+    msg = classify_result.payload.get("msg")
+    if not isinstance(msg, str):
+        msg = latest_user_message
+
+    if is_approve is True:
+        state.last_plan_check = _record_review("accept", latest_user_message)
+        state.phase = "implementation"
+        save_state(paths, state)
+        return block_outcome(_planning_accept_block_message())
+
+    state.last_plan_check = _record_review("revision", msg)
+    save_state(paths, state)
+    return block_outcome(_planning_revision_block_message(msg))
 
 
 def _handle_implementation_stop(
@@ -242,7 +256,7 @@ def _handle_implementation_stop(
         "Otherwise output result=revision and msg=<concrete problems and required fixes>.\n"
     )
     review_result = exec_runner.run(prompt=prompt, schema_path=schema_path, label="final-review")
-    if not review_result.ok or review_result.result is None:
+    if not review_result.ok or review_result.result not in {"accept", "revision"}:
         return block_outcome(
             "The final read-only reviewer could not complete. Stay in implementation mode, perform self-review, "
             "and continue fixing issues before trying again."

@@ -5,7 +5,7 @@ import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from .paths import RepoPaths
 
@@ -37,6 +37,7 @@ def summarize_logs(stdout_path: Path | None, stderr_path: Path | None) -> str:
 @dataclass(frozen=True)
 class StructuredExecResult:
     ok: bool
+    payload: dict[str, Any] | None = None
     result: str | None = None
     msg: str | None = None
     error: str | None = None
@@ -129,24 +130,13 @@ class CodexExecRunner:
             )
         result = payload.get("result")
         msg = payload.get("msg")
-        if result not in {"accept", "revision"}:
-            return StructuredExecResult(
-                ok=False,
-                error="Structured Codex output did not contain a valid result field.",
-                stdout_path=stdout_path,
-                stderr_path=stderr_path,
-                output_path=output_path,
-            )
+        if result is not None and not isinstance(result, str):
+            result = None
         if msg is not None and not isinstance(msg, str):
-            return StructuredExecResult(
-                ok=False,
-                error="Structured Codex output msg field was not a string.",
-                stdout_path=stdout_path,
-                stderr_path=stderr_path,
-                output_path=output_path,
-            )
+            msg = None
         return StructuredExecResult(
             ok=True,
+            payload=payload,
             result=result,
             msg=msg,
             stdout_path=stdout_path,

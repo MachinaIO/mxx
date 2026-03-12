@@ -9,6 +9,6 @@
       "type": "string"
     }
   },
-  "required": ["is_approve"],
+  "required": ["is_approve", "msg"],
   "additionalProperties": false
 }

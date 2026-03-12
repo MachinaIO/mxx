@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -127,6 +128,20 @@ class WorkflowHarnessTests(unittest.TestCase):
         self.assertFalse(state.awaiting_plan_reply)
         self.assertEqual(state.plan_doc, "./plans/session-abc123.md")
         self.assertTrue(self.paths.default_plan_path("abc123").exists())
+
+    def test_plan_approval_schema_requires_all_defined_properties(self) -> None:
+        schema_path = Path(__file__).resolve().parents[4] / "schemas" / "plan-approval.schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(set(schema["properties"]), {"is_approve", "msg"})
+        self.assertEqual(set(schema["required"]), {"is_approve", "msg"})
+
+    def test_review_decision_schema_requires_all_defined_properties(self) -> None:
+        schema_path = Path(__file__).resolve().parents[4] / "schemas" / "review-decision.schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(set(schema["properties"]), {"result", "msg"})
+        self.assertEqual(set(schema["required"]), {"result", "msg"})
 
     def test_session_start_is_idempotent_for_existing_state(self) -> None:
         plan_path = self.write_plan(session_id="abc123", phase="implementation", ordered_items=[(True, "Done")])

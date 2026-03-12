@@ -1,0 +1,8 @@
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+project_root_markers = [".git", "Cargo.toml"]
+
+[features]
+multi_agent = true
+voice_transcription = true
+codex_hooks = true

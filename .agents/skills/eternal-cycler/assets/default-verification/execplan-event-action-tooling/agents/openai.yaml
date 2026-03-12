@@ -1,7 +1,0 @@
-interface:
-  display_name: "Event Tooling"
-  short_description: "Run action.tooling checks"
-  default_prompt: "Execute tooling verification for an ExecPlan action."
-
-policy:
-  allow_implicit_invocation: true

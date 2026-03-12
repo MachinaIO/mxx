@@ -1,4 +1,4 @@
-**Principles for GPU Implementation**
+# Principles for GPU Implementation
 
 The builder agent must implement the GPU version in accordance with the principles below. Even if the submitted GPU implementation passes all tests, the reviewer agent must additionally review it against these principles to ensure it meets a sufficient quality bar.
 
@@ -11,3 +11,4 @@ The builder agent must implement the GPU version in accordance with the principl
 7. In general, minimize the number of host-side loops and kernel launches. However, this principle does not apply if reducing them would require excessive redundant recomputation on the device.
 8. In GPU testing, do not run each unit test only once. Run tests sufficiently many times and confirm that they pass every time. This is to avoid missing intermittent errors that occur nondeterministically due to synchronization issues.
 9. Keep the implementation as simple as possible, unless it violates the above principals.
+10. Any GPU-specific implementation written in a language other than CUDA or another GPU-only language, and enabled only when the `gpu` feature is enabled, must be consolidated into files whose names include the word `gpu`. This applies to functions, modules, and tests.

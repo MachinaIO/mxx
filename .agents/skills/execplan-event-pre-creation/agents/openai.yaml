@@ -1,7 +1,0 @@
-interface:
-  display_name: "Event Pre Creation"
-  short_description: "Run pre-creation checks"
-  default_prompt: "Execute pre-creation verification for an ExecPlan."
-
-policy:
-  allow_implicit_invocation: true

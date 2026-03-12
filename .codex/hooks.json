@@ -1,0 +1,28 @@
+{
+  "SessionStart": [
+    {
+      "matcher": ".*",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "bash scripts/session_start_hook.sh",
+          "timeout": 30,
+          "statusMessage": "Initializing session workflow state"
+        }
+      ]
+    }
+  ],
+  "Stop": [
+    {
+      "matcher": ".*",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "bash scripts/stop_hook.sh",
+          "timeout": 10800,
+          "statusMessage": "Running session completion gates"
+        }
+      ]
+    }
+  ]
+}

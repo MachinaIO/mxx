@@ -1,7 +1,0 @@
-interface:
-  display_name: "ExecPlan Event Index"
-  short_description: "Map ExecPlan event IDs to event-specific skills"
-  default_prompt: "Resolve event IDs to their event skill and script from the event map."
-
-policy:
-  allow_implicit_invocation: true

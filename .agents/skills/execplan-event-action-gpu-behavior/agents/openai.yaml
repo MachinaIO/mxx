@@ -1,7 +1,0 @@
-interface:
-  display_name: "Event GPU Behavior"
-  short_description: "Run action.gpu_behavior checks"
-  default_prompt: "Execute GPU behavior verification for an ExecPlan action."
-
-policy:
-  allow_implicit_invocation: true

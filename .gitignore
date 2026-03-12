@@ -3,3 +3,8 @@
 /logs
 /archive
 /ignores
+/__pycache__/
+*.py[cod]
+/.agents/current-session-id
+/.agents/session-*.json
+/plans/session-*.md

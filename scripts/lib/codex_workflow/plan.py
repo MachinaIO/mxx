@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .atomic import atomic_write_text
-from .state import utc_now_rfc3339
 
+PLAN_APPROVAL_HEADING = "## Plan approval"
+PLAN_APPROVAL_VALUES = {"approved", "unapproved"}
 ORDERED_SUBTASKS_HEADING = "## Ordered subtasks"
 FOLLOW_UP_SUBTASKS_HEADING = "## Follow-up subtasks (append-only)"
 CHECKBOX_RE = re.compile(r"^\s*-\s\[(?P<mark>[ xX])\]\s+(?P<text>.+?)\s*$")
@@ -22,18 +24,28 @@ class CheckboxItem:
 
 @dataclass(frozen=True)
 class PlanAnalysis:
+    approval_status: str | None
     ordered_items: list[CheckboxItem]
     follow_up_items: list[CheckboxItem]
     missing_sections: list[str]
     empty_sections: list[str]
+    invalid_sections: list[str]
 
     @property
     def tracked_items(self) -> list[CheckboxItem]:
         return [*self.ordered_items, *self.follow_up_items]
 
     @property
+    def is_approved(self) -> bool:
+        return self.approval_status == "approved"
+
+    @property
+    def phase(self) -> str:
+        return "implementation" if self.is_approved else "planning"
+
+    @property
     def all_checked(self) -> bool:
-        return not self.missing_sections and not self.empty_sections and all(
+        return not self.missing_sections and not self.empty_sections and not self.invalid_sections and all(
             item.checked for item in self.tracked_items
         )
 
@@ -45,9 +57,18 @@ class PlanAnalysis:
         return None
 
 
-def render_session_plan(session_id: str, created_at: str | None = None) -> str:
+def utc_now_rfc3339() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def render_session_plan(session_id: str, created_at: str | None = None, approval_status: str = "unapproved") -> str:
+    if approval_status not in PLAN_APPROVAL_VALUES:
+        raise ValueError(f"approval_status must be one of {sorted(PLAN_APPROVAL_VALUES)}")
     stamp = created_at or utc_now_rfc3339()
     return f"""# Session Plan: {session_id}
+
+{PLAN_APPROVAL_HEADING}
+{approval_status}
 
 ## Goal
 Describe the concrete user-visible outcome for this session.
@@ -58,9 +79,8 @@ Describe the concrete user-visible outcome for this session.
 - Run the most relevant unit tests immediately after each subtask before checking it off.
 
 ## Repo facts / assumptions
-- Session state lives in `.agents/session-{session_id}.json`.
-- The current-session pointer lives in `.agents/current-session-id`.
-- The stop hook mechanically checks markdown checkboxes in the required subtask sections.
+- Each workflow hook invocation must provide `session_id` in its JSON payload.
+- The stop hook derives planning vs implementation from this plan's approval flag and mechanically checks markdown checkboxes in the required subtask sections.
 
 ## Acceptance criteria
 - The workflow harness uses repository-local Codex hooks.
@@ -123,11 +143,32 @@ def _parse_checkboxes(lines: list[str], start: int, end: int, section: str) -> l
     return items
 
 
+def _parse_plan_approval(lines: list[str], heading: str) -> tuple[str | None, list[str], list[str]]:
+    bounds = _find_section_bounds(lines, heading)
+    missing_sections: list[str] = []
+    invalid_sections: list[str] = []
+    if bounds is None:
+        missing_sections.append(heading)
+        return None, missing_sections, invalid_sections
+    _, start, end = bounds
+    value: str | None = None
+    for line_no in range(start, end):
+        candidate = lines[line_no].strip()
+        if not candidate:
+            continue
+        value = candidate
+        break
+    if value not in PLAN_APPROVAL_VALUES:
+        invalid_sections.append(heading)
+        return None, missing_sections, invalid_sections
+    return value, missing_sections, invalid_sections
+
+
 def analyze_plan(plan_text: str) -> PlanAnalysis:
     lines = plan_text.splitlines()
+    approval_status, missing_sections, invalid_sections = _parse_plan_approval(lines, PLAN_APPROVAL_HEADING)
     ordered_bounds = _find_section_bounds(lines, ORDERED_SUBTASKS_HEADING)
     follow_up_bounds = _find_section_bounds(lines, FOLLOW_UP_SUBTASKS_HEADING)
-    missing_sections: list[str] = []
     empty_sections: list[str] = []
     ordered_items: list[CheckboxItem] = []
     follow_up_items: list[CheckboxItem] = []
@@ -149,10 +190,12 @@ def analyze_plan(plan_text: str) -> PlanAnalysis:
             empty_sections.append(FOLLOW_UP_SUBTASKS_HEADING)
 
     return PlanAnalysis(
+        approval_status=approval_status,
         ordered_items=ordered_items,
         follow_up_items=follow_up_items,
         missing_sections=missing_sections,
         empty_sections=empty_sections,
+        invalid_sections=invalid_sections,
     )
 
 

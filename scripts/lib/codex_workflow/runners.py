@@ -245,48 +245,30 @@ class CodexBuilderRunner:
         self.paths = paths
         self.session_id = session_id
         self.progress_stream = progress_stream if progress_stream is not None else sys.stderr
-        self.thread_id: str | None = None
 
     def run(self, prompt: str, label: str) -> BuilderExecResult:
         run_id = uuid.uuid4().hex
         safe_label = _sanitize_label(label)
         stdout_path = self.paths.tmp_dir / f"{self.session_id}-{safe_label}-{run_id}.stdout.log"
         stderr_path = self.paths.tmp_dir / f"{self.session_id}-{safe_label}-{run_id}.stderr.log"
-        observed_thread_id: dict[str, str | None] = {"value": self.thread_id}
+        observed_thread_id: dict[str, str | None] = {"value": None}
 
         def capture_stdout(line: str) -> None:
-            thread_id = _extract_thread_id_from_event_line(line)
-            if thread_id:
-                observed_thread_id["value"] = thread_id
+            if observed_thread_id["value"] is not None:
+                return
+            observed_thread_id["value"] = _extract_thread_id_from_event_line(line)
 
-        if self.thread_id is None:
-            command = [
-                "codex",
-                "exec",
-                "--skip-git-repo-check",
-                "--sandbox",
-                "workspace-write",
-                "--disable",
-                "codex_hooks",
-                "--json",
-                "--cd",
-                str(self.paths.repo_root),
-                prompt,
-            ]
-        else:
-            command = [
-                "codex",
-                "exec",
-                "resume",
-                "--skip-git-repo-check",
-                "--sandbox",
-                "workspace-write",
-                "--disable",
-                "codex_hooks",
-                "--json",
-                self.thread_id,
-                prompt,
-            ]
+        command = [
+            "codex",
+            "exec",
+            "resume",
+            "--skip-git-repo-check",
+            "--disable",
+            "codex_hooks",
+            "--json",
+            self.session_id,
+            prompt,
+        ]
         returncode = _run_streaming_subprocess(
             command=command,
             cwd=self.paths.repo_root,
@@ -295,12 +277,24 @@ class CodexBuilderRunner:
             mirror_stream=self.progress_stream,
             stdout_line_handler=capture_stdout,
         )
-        self.thread_id = observed_thread_id["value"]
+        summary = summarize_logs(stdout_path, stderr_path)
+        thread_id = observed_thread_id["value"]
+        ok = returncode == 0
+        if ok and thread_id is None:
+            ok = False
+            summary = (
+                "Nested builder did not emit a `thread.started` event, so the resumed session id could not be verified."
+            )
+        elif ok and thread_id != self.session_id:
+            ok = False
+            summary = (
+                f"Nested builder resumed unexpected session id `{thread_id}`; expected `{self.session_id}`."
+            )
         return BuilderExecResult(
-            ok=returncode == 0,
-            summary=summarize_logs(stdout_path, stderr_path),
+            ok=ok,
+            summary=summary,
             returncode=returncode,
-            thread_id=self.thread_id,
+            thread_id=thread_id,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
         )

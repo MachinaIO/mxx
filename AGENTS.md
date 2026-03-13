@@ -12,13 +12,15 @@ This repository uses a long-running Codex session workflow governed by `BUILDER.
 
 Complex work must use a session-specific plan document at `plans/session-<session_id>.md`.
 
-The builder must discover the current session id by reading `.agents/current-session-id`, then open `.agents/session-<session_id>.json` and inspect the current phase before acting.
+The builder must discover the current session id from the explicit session handoff or hook payload, then open `plans/session-<session_id>.md` and inspect the `## Plan approval` flag before acting.
 
 If the task is an explicit review rather than builder execution, follow `REVIEWER.md`.
+Explicit review sessions do not create `plans/session-<session_id>.md`; the session-start hook classifies that intent from the initial user prompt, and the stop hook exits immediately when the current session has no plan file.
 
-The builder behaves differently by phase:
-- In `planning`, update the session plan and discuss plan revisions with the user.
-- In `implementation`, execute the approved subtasks, run the most relevant tests after each subtask, and only then check the subtask off.
+The builder behaves differently by plan approval status:
+- When `## Plan approval` is `unapproved`, stay in planning: interview the user, revise the session plan, and ask for explicit approval.
+- When `## Plan approval` is `approved`, execute the approved subtasks, run the most relevant tests after each subtask, and only then check the subtask off.
 
 Automated review is performed by a hooks-disabled nested read-only `codex exec`.
-The stop hook records when the workflow is waiting for a reply to the current session plan. After plan approval, the stop hook itself transitions the session into implementation, launches hooks-disabled nested builder runs against the current session plan, and keeps cycling through final tests and reviewer checks until the reviewer accepts.
+During planning, the stop hook does no workflow work beyond allowing the stop.
+After the plan is marked `approved`, the stop hook reevaluates the current session plan on each stop. It launches hooks-disabled nested builder runs only when unchecked implementation work remains or when final tests / reviewer feedback append new follow-up tasks. If all tracked checkboxes are already checked and the final tests plus reviewer both pass, the stop hook accepts without launching another nested builder pass.

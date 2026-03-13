@@ -29,6 +29,7 @@ from .runners import (
 from .transcript import initial_user_message_from_transcript
 
 RETRY_DELAY_SECONDS = 1.0
+MAX_INFRA_RETRY_ATTEMPTS = 100
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,10 @@ class HookOutcome:
     exit_code: int
     stdout_payload: dict[str, object] | None = None
     stderr_message: str | None = None
+
+
+class RetryLimitExceeded(RuntimeError):
+    """Raised when repeated nested Codex infra failures should stop the hook."""
 
 
 def stop_outcome(reason: str) -> HookOutcome:
@@ -135,6 +140,13 @@ def _log_progress(message: str) -> None:
     sys.stderr.flush()
 
 
+def _raise_retry_limit_exceeded(kind: str, detail: str) -> None:
+    raise RetryLimitExceeded(
+        "Stop hook aborted after "
+        f"{MAX_INFRA_RETRY_ATTEMPTS} failed nested {kind} attempts. Last summary: {detail}"
+    )
+
+
 @dataclass(frozen=True)
 class ImplementationCheckResult:
     status: str
@@ -191,15 +203,19 @@ def _run_builder_with_retry(
     label: str,
     sleep_fn: Callable[[float], None],
 ) -> BuilderExecResult:
-    while True:
+    for attempt in range(1, MAX_INFRA_RETRY_ATTEMPTS + 1):
         result = builder_runner.run(prompt=prompt, label=label)
         if result.ok:
             return result
+        if attempt == MAX_INFRA_RETRY_ATTEMPTS:
+            _raise_retry_limit_exceeded("builder", result.summary)
         _log_progress(
             "[stop hook] Nested builder failed. "
+            f"Attempt {attempt}/{MAX_INFRA_RETRY_ATTEMPTS}. "
             f"Retrying in {RETRY_DELAY_SECONDS:.1f}s. Summary: {result.summary}"
         )
         sleep_fn(RETRY_DELAY_SECONDS)
+    _raise_retry_limit_exceeded("builder", "Retry loop exited unexpectedly.")
 
 
 def _run_review_with_retry(
@@ -209,16 +225,20 @@ def _run_review_with_retry(
     sleep_fn: Callable[[float], None],
 ) -> StructuredExecResult:
     schema_path = paths.schemas_dir / "review-decision.schema.json"
-    while True:
+    for attempt in range(1, MAX_INFRA_RETRY_ATTEMPTS + 1):
         review_result = exec_runner.run(prompt=prompt, schema_path=schema_path, label="final-review")
         if review_result.ok and review_result.result in {"accept", "revision"}:
             return review_result
         detail = review_result.error or "Reviewer did not return a valid structured decision."
+        if attempt == MAX_INFRA_RETRY_ATTEMPTS:
+            _raise_retry_limit_exceeded("reviewer", detail)
         _log_progress(
             "[stop hook] Nested reviewer failed. "
+            f"Attempt {attempt}/{MAX_INFRA_RETRY_ATTEMPTS}. "
             f"Retrying in {RETRY_DELAY_SECONDS:.1f}s. Summary: {detail}"
         )
         sleep_fn(RETRY_DELAY_SECONDS)
+    _raise_retry_limit_exceeded("reviewer", "Retry loop exited unexpectedly.")
 
 
 def _classify_session_start_intent(
@@ -325,15 +345,18 @@ def _run_implementation_loop(
     builder_reason = "Complete the remaining unchecked work in the session plan."
     attempt = 0
     while True:
-        check_result = _evaluate_implementation_once(
-            paths=paths,
-            session_id=session_id,
-            plan_path=plan_path,
-            plan_display_path=plan_display_path,
-            exec_runner=exec_runner,
-            test_runner=test_runner,
-            sleep_fn=sleep_fn,
-        )
+        try:
+            check_result = _evaluate_implementation_once(
+                paths=paths,
+                session_id=session_id,
+                plan_path=plan_path,
+                plan_display_path=plan_display_path,
+                exec_runner=exec_runner,
+                test_runner=test_runner,
+                sleep_fn=sleep_fn,
+            )
+        except RetryLimitExceeded as exc:
+            return block_outcome(str(exc))
         if check_result.status == "accepted":
             return stop_outcome(check_result.message)
         builder_reason = check_result.message
@@ -341,12 +364,15 @@ def _run_implementation_loop(
 
         attempt += 1
         _log_progress(f"[stop hook] Launching nested builder attempt {attempt} for session {session_id}.")
-        _run_builder_with_retry(
-            builder_runner=builder_runner,
-            prompt=_build_builder_prompt(session_id, plan_display_path, builder_reason),
-            label=f"builder-attempt-{attempt}",
-            sleep_fn=sleep_fn,
-        )
+        try:
+            _run_builder_with_retry(
+                builder_runner=builder_runner,
+                prompt=_build_builder_prompt(session_id, plan_display_path, builder_reason),
+                label=f"builder-attempt-{attempt}",
+                sleep_fn=sleep_fn,
+            )
+        except RetryLimitExceeded as exc:
+            return block_outcome(str(exc))
         _log_progress(f"[stop hook] Nested builder attempt {attempt} finished. Reevaluating completion gate.")
 
 

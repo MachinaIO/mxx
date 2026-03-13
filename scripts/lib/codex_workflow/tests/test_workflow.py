@@ -12,7 +12,7 @@ from unittest import mock
 
 from codex_workflow.atomic import atomic_write_text
 from codex_workflow.cli import emit_outcome
-from codex_workflow.hooks import handle_session_start, handle_stop
+from codex_workflow.hooks import MAX_INFRA_RETRY_ATTEMPTS, handle_session_start, handle_stop
 from codex_workflow.paths import RepoPaths
 from codex_workflow.plan import (
     FOLLOW_UP_SUBTASKS_HEADING,
@@ -666,6 +666,37 @@ class WorkflowHarnessTests(unittest.TestCase):
         self.assertEqual(sleep_calls, [1.0])
         self.assertEqual(len(builder_runner.calls), 2)
 
+    def test_builder_infra_failure_stops_after_retry_limit(self) -> None:
+        self.write_plan(
+            session_id="builder-retry-limit",
+            ordered_items=[(False, "Implement everything.")],
+            approval_status="approved",
+        )
+        sleep_calls: list[float] = []
+        builder_runner = FakeBuilderRunner(
+            *[
+                BuilderExecResult(ok=False, summary="permanent builder failure", returncode=1)
+                for _ in range(MAX_INFRA_RETRY_ATTEMPTS)
+            ]
+        )
+        test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
+        exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="accept", msg=None))
+
+        outcome = handle_stop(
+            {"session_id": "builder-retry-limit"},
+            self.repo_root,
+            exec_runner=exec_runner,
+            builder_runner=builder_runner,
+            test_runner=test_runner,
+            sleep_fn=sleep_calls.append,
+        )
+
+        self.assertEqual(outcome.exit_code, 2)
+        self.assertIn("100 failed nested builder attempts", outcome.stderr_message)
+        self.assertIn("permanent builder failure", outcome.stderr_message)
+        self.assertEqual(len(builder_runner.calls), MAX_INFRA_RETRY_ATTEMPTS)
+        self.assertEqual(len(sleep_calls), MAX_INFRA_RETRY_ATTEMPTS - 1)
+
     def test_complete_plan_is_evaluated_before_builder_launch(self) -> None:
         self.write_plan(
             session_id="precheck-complete",
@@ -716,6 +747,37 @@ class WorkflowHarnessTests(unittest.TestCase):
         self.assertEqual(outcome.exit_code, 0)
         self.assertEqual(sleep_calls, [1.0])
         self.assertEqual(len(exec_runner.calls), 2)
+
+    def test_reviewer_infra_failure_stops_after_retry_limit(self) -> None:
+        self.write_plan(
+            session_id="review-retry-limit",
+            ordered_items=[(True, "Implement everything.")],
+            approval_status="approved",
+        )
+        sleep_calls: list[float] = []
+        builder_runner = FakeBuilderRunner(BuilderExecResult(ok=True, summary="builder ok", returncode=0))
+        test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
+        exec_runner = FakeExecRunner(
+            *[
+                StructuredExecResult(ok=False, error="permanent review failure")
+                for _ in range(MAX_INFRA_RETRY_ATTEMPTS)
+            ]
+        )
+
+        outcome = handle_stop(
+            {"session_id": "review-retry-limit"},
+            self.repo_root,
+            exec_runner=exec_runner,
+            builder_runner=builder_runner,
+            test_runner=test_runner,
+            sleep_fn=sleep_calls.append,
+        )
+
+        self.assertEqual(outcome.exit_code, 2)
+        self.assertIn("100 failed nested reviewer attempts", outcome.stderr_message)
+        self.assertIn("permanent review failure", outcome.stderr_message)
+        self.assertEqual(len(exec_runner.calls), MAX_INFRA_RETRY_ATTEMPTS)
+        self.assertEqual(len(sleep_calls), MAX_INFRA_RETRY_ATTEMPTS - 1)
 
     def test_codex_builder_runner_resumes_same_session_id_on_first_and_later_runs(self) -> None:
         runner = CodexBuilderRunner(self.paths, "builder-runner", progress_stream=io.StringIO())

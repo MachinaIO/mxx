@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import sys
 import time
 from typing import Any, Callable
+
+from repo_validation import edited_paths_from_git
 
 from .atomic import atomic_write_text
 from .paths import RepoPaths
@@ -153,6 +155,25 @@ class ImplementationCheckResult:
     message: str
 
 
+def _default_edited_paths_provider(repo_root: Path) -> list[str] | None:
+    try:
+        return edited_paths_from_git(repo_root)
+    except RuntimeError:
+        return None
+
+
+def _requires_final_tests(edited_paths: list[str]) -> bool:
+    for path in edited_paths:
+        normalized = PurePosixPath(path)
+        if normalized.name == "Cargo.toml":
+            return True
+        if normalized.suffix == ".rs":
+            return True
+        if normalized.parts and normalized.parts[0] == "cuda":
+            return True
+    return False
+
+
 def _build_session_start_prompt(initial_user_message: str) -> str:
     return (
         "You are classifying the user's initial prompt for a Codex workflow session.\n"
@@ -263,6 +284,7 @@ def _evaluate_implementation_once(
     exec_runner: StructuredExecRunner,
     test_runner: FinalTestRunner,
     sleep_fn: Callable[[float], None],
+    edited_paths_provider: Callable[[Path], list[str] | None],
 ) -> ImplementationCheckResult:
     analysis = analyze_plan(plan_path.read_text(encoding="utf-8"))
     if analysis.missing_sections or analysis.invalid_sections or analysis.empty_sections:
@@ -295,17 +317,27 @@ def _evaluate_implementation_once(
             ),
         )
 
-    test_result = test_runner.run(label="final-tests")
-    if not test_result.ok:
-        follow_up_items = _make_test_follow_ups(test_result.summary)
-        append_follow_up_subtasks_file(plan_path, follow_up_items)
+    edited_paths = edited_paths_provider(paths.repo_root)
+    if edited_paths == []:
         return ImplementationCheckResult(
-            status="builder",
-            message=(
-                "Final tests failed. New follow-up subtasks were appended to the session plan. "
-                f"Address them first. Failure summary: {test_result.summary}"
-            ),
+            status="accepted",
+            message="All subtasks are complete and no files changed, so final tests and reviewer checks were skipped.",
         )
+
+    tests_were_run = False
+    if edited_paths is None or _requires_final_tests(edited_paths):
+        tests_were_run = True
+        test_result = test_runner.run(label="final-tests")
+        if not test_result.ok:
+            follow_up_items = _make_test_follow_ups(test_result.summary)
+            append_follow_up_subtasks_file(plan_path, follow_up_items)
+            return ImplementationCheckResult(
+                status="builder",
+                message=(
+                    "Final tests failed. New follow-up subtasks were appended to the session plan. "
+                    f"Address them first. Failure summary: {test_result.summary}"
+                ),
+            )
 
     review_result = _run_review_with_retry(
         paths=paths,
@@ -328,7 +360,11 @@ def _evaluate_implementation_once(
 
     return ImplementationCheckResult(
         status="accepted",
-        message="All subtasks are complete, final tests passed, and reviewer approved.",
+        message=(
+            "All subtasks are complete, final tests passed, and reviewer approved."
+            if tests_were_run
+            else "All subtasks are complete, final tests were skipped because no Rust, Cargo.toml, or cuda/ files changed, and reviewer approved."
+        ),
     )
 
 
@@ -341,6 +377,7 @@ def _run_implementation_loop(
     builder_runner: BuilderExecRunner,
     test_runner: FinalTestRunner,
     sleep_fn: Callable[[float], None],
+    edited_paths_provider: Callable[[Path], list[str] | None],
 ) -> HookOutcome:
     builder_reason = "Complete the remaining unchecked work in the session plan."
     attempt = 0
@@ -354,6 +391,7 @@ def _run_implementation_loop(
                 exec_runner=exec_runner,
                 test_runner=test_runner,
                 sleep_fn=sleep_fn,
+                edited_paths_provider=edited_paths_provider,
             )
         except RetryLimitExceeded as exc:
             return block_outcome(str(exc))
@@ -417,6 +455,7 @@ def handle_stop(
     builder_runner: BuilderExecRunner | None = None,
     test_runner: FinalTestRunner | None = None,
     sleep_fn: Callable[[float], None] | None = None,
+    edited_paths_provider: Callable[[Path], list[str] | None] | None = None,
 ) -> HookOutcome:
     paths = RepoPaths(repo_root)
     paths.ensure_directories()
@@ -444,6 +483,7 @@ def handle_stop(
     builder_runner = builder_runner or CodexBuilderRunner(paths, session_id)
     test_runner = test_runner or ShellFinalTestRunner(paths, session_id)
     sleep_fn = sleep_fn or time.sleep
+    edited_paths_provider = edited_paths_provider or _default_edited_paths_provider
     return _run_implementation_loop(
         paths=paths,
         session_id=session_id,
@@ -453,4 +493,5 @@ def handle_stop(
         builder_runner=builder_runner,
         test_runner=test_runner,
         sleep_fn=sleep_fn,
+        edited_paths_provider=edited_paths_provider,
     )

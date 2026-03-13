@@ -177,6 +177,10 @@ class WorkflowHarnessTests(unittest.TestCase):
         self.assertTrue(str(schema_path).endswith("session-start-intent.schema.json"))
         self.assertEqual(label, "session-start-intent")
 
+    def test_repo_paths_creates_revision_logs_directory(self) -> None:
+        self.assertTrue(self.paths.revision_logs_dir.exists())
+        self.assertEqual(self.paths.revision_logs_dir, self.repo_root / "revision_logs")
+
     def test_session_start_skips_plan_creation_for_explicit_review_requests(self) -> None:
         exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="review", msg="explicit review request"))
         outcome = handle_session_start(
@@ -721,6 +725,120 @@ class WorkflowHarnessTests(unittest.TestCase):
         self.assertEqual(test_runner.calls, ["final-tests"])
         self.assertEqual(len(exec_runner.calls), 1)
 
+    def test_complete_plan_skips_final_tests_and_review_when_no_files_changed(self) -> None:
+        self.write_plan(
+            session_id="no-file-changes",
+            ordered_items=[(True, "Implement everything.")],
+            approval_status="approved",
+        )
+        builder_runner = FakeBuilderRunner(BuilderExecResult(ok=True, summary="unused", returncode=0))
+        test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
+        exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="accept", msg=None))
+
+        outcome = handle_stop(
+            {"session_id": "no-file-changes"},
+            self.repo_root,
+            exec_runner=exec_runner,
+            builder_runner=builder_runner,
+            test_runner=test_runner,
+            sleep_fn=lambda _: None,
+            edited_paths_provider=lambda _: [],
+        )
+
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertEqual(
+            outcome.stdout_payload,
+            {
+                "continue": False,
+                "stopReason": "All subtasks are complete and no files changed, so final tests and reviewer checks were skipped.",
+            },
+        )
+        self.assertEqual(builder_runner.calls, [])
+        self.assertEqual(test_runner.calls, [])
+        self.assertEqual(exec_runner.calls, [])
+
+    def test_complete_plan_skips_final_tests_for_non_rust_non_cuda_changes(self) -> None:
+        self.write_plan(
+            session_id="docs-only-changes",
+            ordered_items=[(True, "Implement everything.")],
+            approval_status="approved",
+        )
+        builder_runner = FakeBuilderRunner(BuilderExecResult(ok=True, summary="unused", returncode=0))
+        test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
+        exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="accept", msg=None))
+
+        outcome = handle_stop(
+            {"session_id": "docs-only-changes"},
+            self.repo_root,
+            exec_runner=exec_runner,
+            builder_runner=builder_runner,
+            test_runner=test_runner,
+            sleep_fn=lambda _: None,
+            edited_paths_provider=lambda _: ["README.md", "docs/notes.txt"],
+        )
+
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertEqual(
+            outcome.stdout_payload,
+            {
+                "continue": False,
+                "stopReason": "All subtasks are complete, final tests were skipped because no Rust, Cargo.toml, or cuda/ files changed, and reviewer approved.",
+            },
+        )
+        self.assertEqual(builder_runner.calls, [])
+        self.assertEqual(test_runner.calls, [])
+        self.assertEqual(len(exec_runner.calls), 1)
+
+    def test_complete_plan_runs_final_tests_when_cargo_toml_changed(self) -> None:
+        self.write_plan(
+            session_id="cargo-toml-change",
+            ordered_items=[(True, "Implement everything.")],
+            approval_status="approved",
+        )
+        builder_runner = FakeBuilderRunner(BuilderExecResult(ok=True, summary="unused", returncode=0))
+        test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
+        exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="accept", msg=None))
+
+        outcome = handle_stop(
+            {"session_id": "cargo-toml-change"},
+            self.repo_root,
+            exec_runner=exec_runner,
+            builder_runner=builder_runner,
+            test_runner=test_runner,
+            sleep_fn=lambda _: None,
+            edited_paths_provider=lambda _: ["Cargo.toml", "README.md"],
+        )
+
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertEqual(builder_runner.calls, [])
+        self.assertEqual(test_runner.calls, ["final-tests"])
+        self.assertEqual(len(exec_runner.calls), 1)
+
+    def test_complete_plan_runs_final_tests_when_rust_file_changed(self) -> None:
+        self.write_plan(
+            session_id="rust-change",
+            ordered_items=[(True, "Implement everything.")],
+            approval_status="approved",
+        )
+        builder_runner = FakeBuilderRunner(BuilderExecResult(ok=True, summary="unused", returncode=0))
+        test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
+        exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="accept", msg=None))
+
+        outcome = handle_stop(
+            {"session_id": "rust-change"},
+            self.repo_root,
+            exec_runner=exec_runner,
+            builder_runner=builder_runner,
+            test_runner=test_runner,
+            sleep_fn=lambda _: None,
+            edited_paths_provider=lambda _: ["src/lib.rs"],
+        )
+
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertEqual(builder_runner.calls, [])
+        self.assertEqual(test_runner.calls, ["final-tests"])
+        self.assertEqual(len(exec_runner.calls), 1)
+
     def test_reviewer_infra_failure_retries_with_backoff(self) -> None:
         self.write_plan(
             session_id="review-retry",
@@ -806,6 +924,10 @@ class WorkflowHarnessTests(unittest.TestCase):
 
         self.assertTrue(first.ok)
         self.assertTrue(second.ok)
+        self.assertEqual(first.stdout_path.parent, self.paths.revision_logs_dir)
+        self.assertEqual(first.stderr_path.parent, self.paths.revision_logs_dir)
+        self.assertEqual(second.stdout_path.parent, self.paths.revision_logs_dir)
+        self.assertEqual(second.stderr_path.parent, self.paths.revision_logs_dir)
         self.assertEqual(first.thread_id, "builder-runner")
         self.assertEqual(second.thread_id, "builder-runner")
         self.assertEqual(commands[0][:3], ["codex", "exec", "resume"])

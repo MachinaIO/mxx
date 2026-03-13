@@ -17,8 +17,8 @@ class RepoPaths:
         return self.repo_root / "plans"
 
     @property
-    def tmp_dir(self) -> Path:
-        return self.agents_dir / "tmp"
+    def revision_logs_dir(self) -> Path:
+        return self.repo_root / "revision_logs"
 
     @property
     def scripts_dir(self) -> Path:
@@ -34,4 +34,4 @@ class RepoPaths:
     def ensure_directories(self) -> None:
         self.agents_dir.mkdir(parents=True, exist_ok=True)
         self.plans_dir.mkdir(parents=True, exist_ok=True)
-        self.tmp_dir.mkdir(parents=True, exist_ok=True)
+        self.revision_logs_dir.mkdir(parents=True, exist_ok=True)

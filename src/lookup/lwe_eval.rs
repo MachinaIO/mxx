@@ -1,3 +1,5 @@
+// Current limitation: this file only supports encoded input polynomials whose plaintext
+// is a constant polynomial for public lookup.
 use crate::{
     bgg::{encoding::BggEncoding, public_key::BggPublicKey},
     circuit::{evaluable::Evaluable, gate::GateId},

@@ -1,3 +1,5 @@
+// Current limitation: this file only supports encoded input polynomials whose plaintext
+// is a constant polynomial for public lookup.
 #[cfg(feature = "gpu")]
 use crate::poly::dcrt::gpu::detected_gpu_device_ids;
 #[cfg(feature = "gpu")]

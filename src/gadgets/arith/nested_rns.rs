@@ -23,10 +23,20 @@ pub struct NestedRnsPolyContext {
 }
 
 fn dummy_lut<P: Poly + 'static>(params: &P::Params) -> PublicLut<P> {
-    PublicLut::new_from_usize_range(
+    PublicLut::new(
         params,
         1,
-        |params, _| (0, P::from_usize_to_constant(params, 0)),
+        |params, x| {
+            if x != 0 {
+                return None;
+            }
+            let y_elem = P::from_usize_to_constant(params, 0)
+                .coeffs()
+                .into_iter()
+                .next()
+                .expect("constant-term coefficient must exist");
+            Some((0, y_elem))
+        },
         None,
     )
 }
@@ -35,11 +45,11 @@ fn max_output_row_from_biguint<P: Poly>(
     params: &P::Params,
     idx: usize,
     value: BigUint,
-) -> (usize, P::Elem) {
+) -> (u64, P::Elem) {
     let poly = P::from_biguint_to_constant(params, value);
     let coeff =
         poly.coeffs().into_iter().max().expect("max_output_row requires at least one coefficient");
-    (idx, coeff)
+    (u64::try_from(idx).expect("row index must fit in u64"), coeff)
 }
 
 impl NestedRnsPolyContext {
@@ -209,12 +219,20 @@ impl NestedRnsPolyContext {
                 (p_i - 1) as usize,
                 BigUint::from(p_i - 1),
             );
-            let lut_mod_p_lut = PublicLut::<P>::new_from_usize_range(
+            let lut_mod_p_lut = PublicLut::<P>::new(
                 params,
-                lut_mod_p_len,
+                lut_mod_p_len as u64,
                 move |params, t| {
-                    let output = BigUint::from((t as u64) % p_i);
-                    (t, P::from_biguint_to_constant(params, output))
+                    if t >= lut_mod_p_len as u64 {
+                        return None;
+                    }
+                    let output = BigUint::from(t % p_i);
+                    let y_elem = P::from_biguint_to_constant(params, output)
+                        .coeffs()
+                        .into_iter()
+                        .next()
+                        .expect("constant-term coefficient must exist");
+                    Some((t, y_elem))
                 },
                 Some(max_mod_p_row),
             );
@@ -245,16 +263,24 @@ impl NestedRnsPolyContext {
             let p_over_pi_inv = Arc::new(p_over_pi_inv);
             let p_moduli_big = Arc::new(p_moduli_big);
             let lut_x_to_y_len = p_i as usize;
-            let lut_x_to_y_lut = PublicLut::<P>::new_from_usize_range(
+            let lut_x_to_y_lut = PublicLut::<P>::new(
                 params,
-                lut_x_to_y_len,
+                lut_x_to_y_len as u64,
                 {
                     let p_over_pi_inv = Arc::clone(&p_over_pi_inv);
                     let p_moduli_big = Arc::clone(&p_moduli_big);
                     move |params, t| {
-                        let input = BigUint::from(t as u64);
+                        if t >= lut_x_to_y_len as u64 {
+                            return None;
+                        }
+                        let input = BigUint::from(t);
                         let output = (&input * p_over_pi_inv.as_ref()) % p_moduli_big.as_ref();
-                        (t, P::from_biguint_to_constant(params, output))
+                        let y_elem = P::from_biguint_to_constant(params, output)
+                            .coeffs()
+                            .into_iter()
+                            .next()
+                            .expect("constant-term coefficient must exist");
+                        Some((t, y_elem))
                     }
                 },
                 Some(max_x_to_y_row),
@@ -266,19 +292,27 @@ impl NestedRnsPolyContext {
             lut_x_to_y.push(lut_x_to_y_lut);
 
             let lut_x_to_real_len = p_i as usize;
-            let lut_x_to_real_lut = PublicLut::<P>::new_from_usize_range(
+            let lut_x_to_real_lut = PublicLut::<P>::new(
                 params,
-                lut_x_to_real_len,
+                lut_x_to_real_len as u64,
                 {
                     let p_over_pi_inv = Arc::clone(&p_over_pi_inv);
                     let p_moduli_big = Arc::clone(&p_moduli_big);
                     move |params, t| {
-                        let input = BigUint::from(t as u64);
+                        if t >= lut_x_to_real_len as u64 {
+                            return None;
+                        }
+                        let input = BigUint::from(t);
                         let y = ((&input * p_over_pi_inv.as_ref()) % p_moduli_big.as_ref())
                             .to_u64()
                             .expect("y must fit in u64");
                         let output = BigUint::from(round_div(y * scale, p_i));
-                        (t, P::from_biguint_to_constant(params, output))
+                        let y_elem = P::from_biguint_to_constant(params, output)
+                            .coeffs()
+                            .into_iter()
+                            .next()
+                            .expect("constant-term coefficient must exist");
+                        Some((t, y_elem))
                     }
                 },
                 Some(max_x_to_real_row),
@@ -313,12 +347,20 @@ impl NestedRnsPolyContext {
             max_real as usize,
             BigUint::from(round_div(max_real, scale)),
         );
-        let lut_real_to_v_lut = PublicLut::<P>::new_from_usize_range(
+        let lut_real_to_v_lut = PublicLut::<P>::new(
             params,
-            lut_real_to_v_len,
+            lut_real_to_v_len as u64,
             move |params, t| {
-                let output = BigUint::from(round_div(t as u64, scale));
-                (t, P::from_biguint_to_constant(params, output))
+                if t >= lut_real_to_v_len as u64 {
+                    return None;
+                }
+                let output = BigUint::from(round_div(t, scale));
+                let y_elem = P::from_biguint_to_constant(params, output)
+                    .coeffs()
+                    .into_iter()
+                    .next()
+                    .expect("constant-term coefficient must exist");
+                Some((t, y_elem))
             },
             Some(max_real_to_v_row),
         );

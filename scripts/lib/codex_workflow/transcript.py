@@ -29,6 +29,25 @@ def _extract_role_message_from_record(record: dict[str, object], role: str) -> s
     return None
 
 
+def initial_user_message_from_transcript(transcript_path: Path) -> str | None:
+    try:
+        lines = transcript_path.read_text(encoding="utf-8").splitlines()
+    except (FileNotFoundError, OSError):
+        return None
+
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        message = _extract_role_message_from_record(record, "user")
+        if message:
+            return message
+    return None
+
+
 def latest_user_message_from_transcript(transcript_path: Path) -> str | None:
     try:
         lines = transcript_path.read_text(encoding="utf-8").splitlines()

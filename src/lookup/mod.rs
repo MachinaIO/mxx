@@ -20,73 +20,46 @@ pub trait PltEvaluator<E: crate::circuit::evaluable::Evaluable>: Send + Sync {
 
 #[derive(Clone)]
 pub struct PublicLut<P: Poly> {
-    f: Arc<dyn Fn(&P::Params, &P) -> Option<(usize, P)> + Send + Sync>,
-    len: usize,
-    max_output_row: (usize, <P as Poly>::Elem),
+    f: Arc<dyn Fn(&P::Params, u64) -> Option<(u64, P::Elem)> + Send + Sync>,
+    len: u64,
+    max_output_row: (u64, <P as Poly>::Elem),
 }
 
 impl<P: Poly> PublicLut<P> {
     pub fn new<F>(
         params: &P::Params,
-        len: usize,
+        len: u64,
         f: F,
-        max_output_row: Option<(usize, P::Elem)>,
+        max_output_row: Option<(u64, P::Elem)>,
     ) -> Self
     where
-        F: Fn(&P::Params, &P) -> Option<(usize, P)> + Send + Sync + 'static,
+        F: Fn(&P::Params, u64) -> Option<(u64, P::Elem)> + Send + Sync + 'static,
     {
-        assert!(len > 0, "f must contain at least one element");
-        let f: Arc<dyn Fn(&P::Params, &P) -> Option<(usize, P)> + Send + Sync> = Arc::new(f);
         let max_output_row =
-            max_output_row.unwrap_or_else(|| Self::compute_max_output_row(params, f.as_ref(), len));
+            max_output_row.unwrap_or_else(|| Self::compute_max_output_row(params, &f, len));
+        let f = Arc::new(f);
         Self { f, len, max_output_row }
     }
 
-    /// Builds a LUT over inputs in the range [0, len), using `to_const_int` on the input
-    /// polynomial to recover the index. Pass `max_output_row` to avoid scanning all entries.
-    pub fn new_from_usize_range<F>(
-        params: &P::Params,
-        len: usize,
-        f: F,
-        max_output_row: Option<(usize, P::Elem)>,
-    ) -> Self
-    where
-        F: Fn(&P::Params, usize) -> (usize, P) + Send + Sync + 'static,
-    {
-        let f = Arc::new(f);
-        let lookup = {
-            let f = Arc::clone(&f);
-            move |params: &P::Params, x: &P| {
-                let idx = x.to_const_int();
-                if idx >= len {
-                    return None;
-                }
-                Some((f)(params, idx))
-            }
-        };
-        Self::new(params, len, lookup, max_output_row)
-    }
-
     pub fn len(&self) -> usize {
-        self.len
+        self.len as usize
     }
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    pub fn get(&self, params: &P::Params, x: &P) -> Option<(usize, P)> {
+    pub fn get(&self, params: &P::Params, x: u64) -> Option<(u64, P::Elem)> {
         (self.f)(params, x)
     }
 
     pub fn entries<'a>(
         &'a self,
         params: &'a P::Params,
-    ) -> Box<dyn Iterator<Item = (P, (usize, P))> + Send + 'a> {
-        Box::new((0..self.len).map(move |idx| {
-            let input = P::from_usize_to_constant(params, idx);
-            let (k, y) = (self.f)(params, &input)
-                .unwrap_or_else(|| panic!("LUT entry {} missing from 0..len range", idx));
+    ) -> Box<dyn Iterator<Item = (u64, (u64, P::Elem))> + Send + 'a> {
+        Box::new((0..self.len as u64).map(move |input| {
+            let (k, y) = (self.f)(params, input)
+                .unwrap_or_else(|| panic!("LUT entry {} missing from 0..len range", input));
             (input, (k, y))
         }))
     }
@@ -95,7 +68,7 @@ impl<P: Poly> PublicLut<P> {
     pub fn entries_multi_gpus<'a>(
         &'a self,
         params_by_device: &'a [&'a P::Params],
-    ) -> Box<dyn Iterator<Item = (Vec<P>, (usize, Vec<P>))> + Send + 'a> {
+    ) -> Box<dyn Iterator<Item = (Vec<u64>, (u64, Vec<P::Elem>))> + Send + 'a> {
         assert!(
             !params_by_device.is_empty(),
             "entries_multi_gpus requires at least one device parameter set"
@@ -103,10 +76,9 @@ impl<P: Poly> PublicLut<P> {
         Box::new((0..self.len).map(move |input_idx| {
             let mut x_by_device = Vec::with_capacity(params_by_device.len());
             let mut y_by_device = Vec::with_capacity(params_by_device.len());
-            let mut row_idx: Option<usize> = None;
+            let mut row_idx: Option<u64> = None;
             for &device_params in params_by_device {
-                let x = P::from_usize_to_constant(device_params, input_idx);
-                let (k, y) = (self.f)(device_params, &x).unwrap_or_else(|| {
+                let (k, y) = (self.f)(device_params, input_idx).unwrap_or_else(|| {
                     panic!(
                         "LUT entry {} missing from 0..len range on one of GPU device params",
                         input_idx
@@ -121,28 +93,26 @@ impl<P: Poly> PublicLut<P> {
                 } else {
                     row_idx = Some(k);
                 }
-                x_by_device.push(x);
+                x_by_device.push(input_idx);
                 y_by_device.push(y);
             }
             (x_by_device, (row_idx.expect("row idx must exist"), y_by_device))
         }))
     }
 
-    pub fn max_output_row(&self) -> &(usize, <P as Poly>::Elem) {
+    pub fn max_output_row(&self) -> &(u64, <P as Poly>::Elem) {
         &self.max_output_row
     }
 
     fn compute_max_output_row(
         params: &P::Params,
-        f: &dyn Fn(&P::Params, &P) -> Option<(usize, P)>,
-        len: usize,
-    ) -> (usize, P::Elem) {
+        f: &dyn Fn(&P::Params, u64) -> Option<(u64, P::Elem)>,
+        len: u64,
+    ) -> (u64, P::Elem) {
         (0..len)
-            .filter_map(|idx| {
-                let input = P::from_usize_to_constant(params, idx);
-                let (k, y_k) = f(params, &input)
-                    .unwrap_or_else(|| panic!("LUT entry {} missing from 0..len range", idx));
-                y_k.coeffs().into_iter().max().map(|coeff| (k, coeff))
+            .map(|input| {
+                f(params, input)
+                    .unwrap_or_else(|| panic!("LUT entry {} missing from 0..len range", input))
             })
             .max_by(|a, b| a.1.cmp(&b.1))
             .expect("no coefficients found in any y_k")

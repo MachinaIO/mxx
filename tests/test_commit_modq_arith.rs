@@ -242,8 +242,10 @@ async fn test_commit_modq_arith() {
 
     let expected = (&a_value * &b_value) % &active_q;
 
-    let a_inputs: Vec<DCRTPoly> = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, q_level);
-    let b_inputs: Vec<DCRTPoly> = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, q_level);
+    let a_inputs: Vec<DCRTPoly> =
+        encode_nested_rns_poly(P_MODULI_BITS, &params, std::slice::from_ref(&a_value), q_level);
+    let b_inputs: Vec<DCRTPoly> =
+        encode_nested_rns_poly(P_MODULI_BITS, &params, std::slice::from_ref(&b_value), q_level);
     let plaintext_inputs = [a_inputs.clone(), b_inputs.clone()].concat();
     let plaintext_inputs_shared = plaintext_inputs.clone();
 

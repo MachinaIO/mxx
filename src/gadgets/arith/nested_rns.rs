@@ -69,7 +69,6 @@ impl NestedRnsPolyContext {
             q_moduli_depth,
             max_q_moduli_depth
         );
-        let q_moduli_min = q_moduli.iter().min().expect("there should be at least one q modulus");
         let q_moduli_max = q_moduli.iter().max().expect("there should be at least one q modulus");
         let p_moduli = sample_crt_primes(p_moduli_bits, *q_moduli_max);
         debug!(
@@ -83,10 +82,12 @@ impl NestedRnsPolyContext {
             let dummy_lut_id = circuit.register_public_lookup(dummy_lut);
             let lut_mod_p_ids = vec![dummy_lut_id; p_moduli_depth];
             let mul_coeffwise_lut_ids = vec![dummy_lut_id; p_moduli_depth];
+            let y_to_mod_target_ids = vec![vec![dummy_lut_id; p_moduli_depth]; p_moduli_depth];
+            let v_to_mod_target_ids = vec![dummy_lut_id; p_moduli_depth];
             let lut_x_to_y_ids = vec![dummy_lut_id; p_moduli_depth];
             let lut_x_to_real_ids = vec![dummy_lut_id; p_moduli_depth];
             let lut_real_to_v_id = dummy_lut_id;
-            let mod_p_offsets = vec![0u64; p_moduli_depth];
+            let mod_p_offsets = p_moduli.clone();
             let p = p_moduli.iter().fold(BigUint::from(1u64), |acc, &pi| acc * BigUint::from(pi));
             let p_over_pis =
                 p_moduli.iter().map(|&p_i| &p / BigUint::from(p_i)).collect::<Vec<_>>();
@@ -138,6 +139,9 @@ impl NestedRnsPolyContext {
                         &p_moduli,
                         ring_dimension,
                         &lut_mod_p_ids,
+                        &mul_coeffwise_lut_ids,
+                        &y_to_mod_target_ids,
+                        &v_to_mod_target_ids,
                         &lut_x_to_y_ids,
                         &lut_x_to_real_ids,
                         lut_real_to_v_id,
@@ -153,6 +157,9 @@ impl NestedRnsPolyContext {
                         &p_moduli,
                         ring_dimension,
                         &lut_mod_p_ids,
+                        &mul_coeffwise_lut_ids,
+                        &y_to_mod_target_ids,
+                        &v_to_mod_target_ids,
                         &lut_x_to_y_ids,
                         &lut_x_to_real_ids,
                         lut_real_to_v_id,
@@ -169,6 +176,8 @@ impl NestedRnsPolyContext {
                         ring_dimension,
                         &lut_mod_p_ids,
                         &mul_coeffwise_lut_ids,
+                        &y_to_mod_target_ids,
+                        &v_to_mod_target_ids,
                         &lut_x_to_y_ids,
                         &lut_x_to_real_ids,
                         lut_real_to_v_id,
@@ -209,6 +218,8 @@ impl NestedRnsPolyContext {
         let p_over_pis = p_moduli.iter().map(|&p_i| &p / BigUint::from(p_i)).collect::<Vec<_>>();
         let mut lut_mod_p = Vec::with_capacity(p_moduli_depth);
         let mut lut_mul_coeffwise = Vec::with_capacity(p_moduli_depth);
+        let mut lut_y_to_mod_target = vec![Vec::with_capacity(p_moduli_depth); p_moduli_depth];
+        let mut lut_v_to_mod_target = Vec::with_capacity(p_moduli_depth);
         let mut lut_x_to_y = Vec::with_capacity(p_moduli_depth);
         let mut lut_x_to_real = Vec::with_capacity(p_moduli_depth);
         let mut scalars_y = vec![vec![vec![0; p_moduli_depth]; p_moduli_depth]; q_moduli_depth];
@@ -216,8 +227,10 @@ impl NestedRnsPolyContext {
         let mut mod_p_offsets = Vec::with_capacity(p_moduli_depth);
 
         for (p_i_idx, &p_i) in p_moduli.iter().enumerate() {
-            let lut_mod_p_len =
-                usize::try_from(*q_moduli_min).expect("q modulus must fit in usize for LUT length");
+            let addsub_bound = 2u128 * p_i as u128;
+            let full_reduce_bound = p_moduli_depth as u128 * (p_i as u128 - 1) + p_i as u128 + 1;
+            let lut_mod_p_len = usize::try_from(addsub_bound.max(full_reduce_bound))
+                .expect("lut_mod_p length must fit in usize");
             let max_mod_p_row = max_output_row_from_biguint::<P>(
                 params,
                 (p_i - 1) as usize,
@@ -242,13 +255,10 @@ impl NestedRnsPolyContext {
             );
             info!("Constructed lut_mod_p for p_{} = {} with size {}", p_i_idx, p_i, lut_mod_p_len);
             lut_mod_p.push(lut_mod_p_lut);
-            let mod_p_offset_bound = q_moduli_min
-                .checked_sub(p_moduli_depth as u64 * p_i + 1)
-                .expect("q modulus must exceed full_reduce bound");
-            mod_p_offsets.push((mod_p_offset_bound / p_i) * p_i);
+            mod_p_offsets.push(p_i);
 
-            let lut_mul_coeffwise_len =
-                usize::try_from((p_i as u128) * (p_i as u128)).expect("mul LUT size must fit in usize");
+            let lut_mul_coeffwise_len = usize::try_from((p_i as u128) * (p_i as u128))
+                .expect("mul LUT size must fit in usize");
             let max_mul_coeffwise_row = max_output_row_from_biguint::<P>(
                 params,
                 usize::try_from((p_i as u128) * ((p_i - 1) as u128) + 1)
@@ -279,6 +289,63 @@ impl NestedRnsPolyContext {
                 p_i_idx, p_i, lut_mul_coeffwise_len
             );
             lut_mul_coeffwise.push(lut_mul_coeffwise_lut);
+
+            let lut_v_to_mod_target_len = p_moduli_depth + 1;
+            let max_v_to_mod_target = (p_moduli_depth as u64) % p_i;
+            let lut_v_to_mod_target_lut = PublicLut::<P>::new(
+                params,
+                lut_v_to_mod_target_len as u64,
+                move |params, t| {
+                    if t >= lut_v_to_mod_target_len as u64 {
+                        return None;
+                    }
+                    let output = BigUint::from(t % p_i);
+                    let y_elem = P::from_biguint_to_constant(params, output)
+                        .coeffs()
+                        .into_iter()
+                        .next()
+                        .expect("constant-term coefficient must exist");
+                    Some((t, y_elem))
+                },
+                Some(max_output_row_from_biguint::<P>(
+                    params,
+                    usize::try_from(max_v_to_mod_target).expect("v row index must fit in usize"),
+                    BigUint::from(max_v_to_mod_target),
+                )),
+            );
+            info!(
+                "Constructed lut_v_to_mod_target for p_{} = {} with size {}",
+                p_i_idx, p_i, lut_v_to_mod_target_len
+            );
+            lut_v_to_mod_target.push(lut_v_to_mod_target_lut);
+
+            for &p_j in p_moduli.iter() {
+                let lut_y_to_mod_target_len =
+                    usize::try_from(p_j).expect("CRT source modulus must fit in usize");
+                let max_y_to_mod_target = (p_j - 1) % p_i;
+                let lut_y_to_mod_target_lut = PublicLut::<P>::new(
+                    params,
+                    lut_y_to_mod_target_len as u64,
+                    move |params, t| {
+                        if t >= lut_y_to_mod_target_len as u64 {
+                            return None;
+                        }
+                        let output = BigUint::from(t % p_i);
+                        let y_elem = P::from_biguint_to_constant(params, output)
+                            .coeffs()
+                            .into_iter()
+                            .next()
+                            .expect("constant-term coefficient must exist");
+                        Some((t, y_elem))
+                    },
+                    Some(max_output_row_from_biguint::<P>(
+                        params,
+                        usize::try_from(p_j - 1).expect("row index must fit in usize"),
+                        BigUint::from(max_y_to_mod_target),
+                    )),
+                );
+                lut_y_to_mod_target[p_i_idx].push(lut_y_to_mod_target_lut);
+            }
 
             let p_moduli_big = BigUint::from(p_i);
             let p_over_pi_mod_pi = (&p_over_pis[p_i_idx] % &p_moduli_big)
@@ -416,6 +483,18 @@ impl NestedRnsPolyContext {
             .iter()
             .map(|lut| circuit.register_public_lookup(lut.clone()))
             .collect::<Vec<_>>();
+        let y_to_mod_target_ids = lut_y_to_mod_target
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|lut| circuit.register_public_lookup(lut.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let v_to_mod_target_ids = lut_v_to_mod_target
+            .iter()
+            .map(|lut| circuit.register_public_lookup(lut.clone()))
+            .collect::<Vec<_>>();
         let lut_x_to_y_ids = lut_x_to_y
             .iter()
             .map(|lut| circuit.register_public_lookup(lut.clone()))
@@ -436,12 +515,12 @@ impl NestedRnsPolyContext {
             .collect::<Vec<_>>();
         let sub_lazy_reduce_ids = (0..q_moduli_depth)
             .map(|_| {
-                    circuit.register_sub_circuit(Self::sub_lazy_reduce_subcircuit::<P>(
-                        &p_moduli,
-                        ring_dimension,
-                        &lut_mod_p_ids,
-                    ))
-                })
+                circuit.register_sub_circuit(Self::sub_lazy_reduce_subcircuit::<P>(
+                    &p_moduli,
+                    ring_dimension,
+                    &lut_mod_p_ids,
+                ))
+            })
             .collect::<Vec<_>>();
         let mul_lazy_reduce_ids = (0..q_moduli_depth)
             .map(|_| {
@@ -453,49 +532,57 @@ impl NestedRnsPolyContext {
             .collect::<Vec<_>>();
         let add_full_reduce_ids = (0..q_moduli_depth)
             .map(|q_idx| {
-                    circuit.register_sub_circuit(Self::add_full_reduce_subcircuit::<P>(
-                        &p_moduli,
-                        ring_dimension,
-                        &lut_mod_p_ids,
-                        &lut_x_to_y_ids,
-                        &lut_x_to_real_ids,
-                        lut_real_to_v_id,
-                        &mod_p_offsets,
-                        &scalars_y[q_idx],
-                        &scalars_v[q_idx],
-                    ))
-                })
+                circuit.register_sub_circuit(Self::add_full_reduce_subcircuit::<P>(
+                    &p_moduli,
+                    ring_dimension,
+                    &lut_mod_p_ids,
+                    &mul_coeffwise_lut_ids,
+                    &y_to_mod_target_ids,
+                    &v_to_mod_target_ids,
+                    &lut_x_to_y_ids,
+                    &lut_x_to_real_ids,
+                    lut_real_to_v_id,
+                    &mod_p_offsets,
+                    &scalars_y[q_idx],
+                    &scalars_v[q_idx],
+                ))
+            })
             .collect::<Vec<_>>();
         let sub_full_reduce_ids = (0..q_moduli_depth)
             .map(|q_idx| {
-                    circuit.register_sub_circuit(Self::sub_full_reduce_subcircuit::<P>(
-                        &p_moduli,
-                        ring_dimension,
-                        &lut_mod_p_ids,
-                        &lut_x_to_y_ids,
-                        &lut_x_to_real_ids,
-                        lut_real_to_v_id,
-                        &mod_p_offsets,
-                        &scalars_y[q_idx],
-                        &scalars_v[q_idx],
-                    ))
-                })
+                circuit.register_sub_circuit(Self::sub_full_reduce_subcircuit::<P>(
+                    &p_moduli,
+                    ring_dimension,
+                    &lut_mod_p_ids,
+                    &mul_coeffwise_lut_ids,
+                    &y_to_mod_target_ids,
+                    &v_to_mod_target_ids,
+                    &lut_x_to_y_ids,
+                    &lut_x_to_real_ids,
+                    lut_real_to_v_id,
+                    &mod_p_offsets,
+                    &scalars_y[q_idx],
+                    &scalars_v[q_idx],
+                ))
+            })
             .collect::<Vec<_>>();
         let mul_full_reduce_ids = (0..q_moduli_depth)
             .map(|q_idx| {
-                    circuit.register_sub_circuit(Self::mul_full_reduce_subcircuit::<P>(
-                        &p_moduli,
-                        ring_dimension,
-                        &lut_mod_p_ids,
-                        &mul_coeffwise_lut_ids,
-                        &lut_x_to_y_ids,
-                        &lut_x_to_real_ids,
-                        lut_real_to_v_id,
-                        &mod_p_offsets,
-                        &scalars_y[q_idx],
-                        &scalars_v[q_idx],
-                    ))
-                })
+                circuit.register_sub_circuit(Self::mul_full_reduce_subcircuit::<P>(
+                    &p_moduli,
+                    ring_dimension,
+                    &lut_mod_p_ids,
+                    &mul_coeffwise_lut_ids,
+                    &y_to_mod_target_ids,
+                    &v_to_mod_target_ids,
+                    &lut_x_to_y_ids,
+                    &lut_x_to_real_ids,
+                    lut_real_to_v_id,
+                    &mod_p_offsets,
+                    &scalars_y[q_idx],
+                    &scalars_v[q_idx],
+                ))
+            })
             .collect::<Vec<_>>();
         let reconstruct_ids = (0..q_moduli_depth)
             .map(|q_idx| {
@@ -584,6 +671,9 @@ impl NestedRnsPolyContext {
         p_moduli: &[u64],
         ring_dimension: usize,
         lut_mod_p_ids: &[usize],
+        mul_coeffwise_lut_ids: &[usize],
+        y_to_mod_target_ids: &[Vec<usize>],
+        v_to_mod_target_ids: &[usize],
         lut_x_to_y_ids: &[usize],
         lut_x_to_real_ids: &[usize],
         lut_real_to_v_id: usize,
@@ -596,6 +686,9 @@ impl NestedRnsPolyContext {
         let reduce_circuit = Self::full_reduce_subcircuit::<P>(
             p_moduli,
             lut_mod_p_ids,
+            mul_coeffwise_lut_ids,
+            y_to_mod_target_ids,
+            v_to_mod_target_ids,
             lut_x_to_y_ids,
             lut_x_to_real_ids,
             lut_real_to_v_id,
@@ -618,6 +711,9 @@ impl NestedRnsPolyContext {
         p_moduli: &[u64],
         ring_dimension: usize,
         lut_mod_p_ids: &[usize],
+        mul_coeffwise_lut_ids: &[usize],
+        y_to_mod_target_ids: &[Vec<usize>],
+        v_to_mod_target_ids: &[usize],
         lut_x_to_y_ids: &[usize],
         lut_x_to_real_ids: &[usize],
         lut_real_to_v_id: usize,
@@ -626,10 +722,14 @@ impl NestedRnsPolyContext {
         scalars_v: &[u32],
     ) -> PolyCircuit<P> {
         let mut circuit = PolyCircuit::<P>::new();
-        let sub_circuit = Self::sub_lazy_reduce_subcircuit::<P>(p_moduli, ring_dimension, lut_mod_p_ids);
+        let sub_circuit =
+            Self::sub_lazy_reduce_subcircuit::<P>(p_moduli, ring_dimension, lut_mod_p_ids);
         let reduce_circuit = Self::full_reduce_subcircuit::<P>(
             p_moduli,
             lut_mod_p_ids,
+            mul_coeffwise_lut_ids,
+            y_to_mod_target_ids,
+            v_to_mod_target_ids,
             lut_x_to_y_ids,
             lut_x_to_real_ids,
             lut_real_to_v_id,
@@ -653,6 +753,8 @@ impl NestedRnsPolyContext {
         ring_dimension: usize,
         lut_mod_p_ids: &[usize],
         mul_coeffwise_lut_ids: &[usize],
+        y_to_mod_target_ids: &[Vec<usize>],
+        v_to_mod_target_ids: &[usize],
         lut_x_to_y_ids: &[usize],
         lut_x_to_real_ids: &[usize],
         lut_real_to_v_id: usize,
@@ -665,6 +767,9 @@ impl NestedRnsPolyContext {
         let reduce_circuit = Self::full_reduce_subcircuit::<P>(
             p_moduli,
             lut_mod_p_ids,
+            mul_coeffwise_lut_ids,
+            y_to_mod_target_ids,
+            v_to_mod_target_ids,
             lut_x_to_y_ids,
             lut_x_to_real_ids,
             lut_real_to_v_id,
@@ -748,6 +853,9 @@ impl NestedRnsPolyContext {
     fn full_reduce_subcircuit<P: Poly>(
         p_moduli: &[u64],
         lut_mod_p_ids: &[usize],
+        mul_coeffwise_lut_ids: &[usize],
+        y_to_mod_target_ids: &[Vec<usize>],
+        v_to_mod_target_ids: &[usize],
         lut_x_to_y_ids: &[usize],
         lut_x_to_real_ids: &[usize],
         lut_real_to_v_id: usize,
@@ -783,16 +891,27 @@ impl NestedRnsPolyContext {
             let mut p_i_sum = circuit.const_zero_gate();
             for p_j_idx in 0..p_moduli_depth {
                 let y_j = ys[p_j_idx];
-                let term = circuit.small_scalar_mul(y_j, &[scalars_y[p_idx][p_j_idx]]);
-                let term_mod_p = circuit.public_lookup_gate(term, lut_mod_p_ids[p_idx]);
+                let y_j_mod_p_i =
+                    circuit.public_lookup_gate(y_j, y_to_mod_target_ids[p_idx][p_j_idx]);
+                let packed_scalar = Self::repeated_u64_poly_gate(
+                    &mut circuit,
+                    p_moduli[p_idx] * scalars_y[p_idx][p_j_idx] as u64,
+                    ring_dimension,
+                );
+                let packed = circuit.add_gate(y_j_mod_p_i, packed_scalar);
+                let term_mod_p = circuit.public_lookup_gate(packed, mul_coeffwise_lut_ids[p_idx]);
                 p_i_sum = circuit.add_gate(p_i_sum, term_mod_p);
             }
-            let term = circuit.small_scalar_mul(v, &[scalars_v[p_idx]]);
-            let p_i_const = Self::repeated_u64_poly_gate(
+            let v_mod_p_i = circuit.public_lookup_gate(v, v_to_mod_target_ids[p_idx]);
+            let packed_scalar = Self::repeated_u64_poly_gate(
                 &mut circuit,
-                mod_p_offsets[p_idx],
+                p_moduli[p_idx] * scalars_v[p_idx] as u64,
                 ring_dimension,
             );
+            let packed = circuit.add_gate(v_mod_p_i, packed_scalar);
+            let term = circuit.public_lookup_gate(packed, mul_coeffwise_lut_ids[p_idx]);
+            let p_i_const =
+                Self::repeated_u64_poly_gate(&mut circuit, mod_p_offsets[p_idx], ring_dimension);
             let sum = circuit.add_gate(p_i_sum, p_i_const);
             let p_i_sum = circuit.sub_gate(sum, term);
             let p_i_sum_mod_p = circuit.public_lookup_gate(p_i_sum, lut_mod_p_ids[p_idx]);
@@ -1038,44 +1157,12 @@ pub(crate) fn sample_crt_primes(max_bit_width: usize, q_max: u64) -> Vec<u64> {
     results
 }
 
-pub enum NestedRnsEncodeInput<'a> {
-    Scalar(&'a BigUint),
-    Coeffs(&'a [BigUint]),
-}
-
-impl<'a> From<&'a BigUint> for NestedRnsEncodeInput<'a> {
-    fn from(value: &'a BigUint) -> Self {
-        Self::Scalar(value)
-    }
-}
-
-impl<'a> From<&'a [BigUint]> for NestedRnsEncodeInput<'a> {
-    fn from(values: &'a [BigUint]) -> Self {
-        Self::Coeffs(values)
-    }
-}
-
-impl<'a> From<&'a Vec<BigUint>> for NestedRnsEncodeInput<'a> {
-    fn from(values: &'a Vec<BigUint>) -> Self {
-        Self::Coeffs(values.as_slice())
-    }
-}
-
-impl<'a, const N: usize> From<&'a [BigUint; N]> for NestedRnsEncodeInput<'a> {
-    fn from(values: &'a [BigUint; N]) -> Self {
-        Self::Coeffs(values.as_slice())
-    }
-}
-
-pub fn encode_nested_rns_poly<'a, P: Poly, I>(
+pub fn encode_nested_rns_poly<P: Poly>(
     p_moduli_bits: usize,
     params: &P::Params,
-    input: I,
+    input_coeffs: &[BigUint],
     q_level: Option<usize>,
-) -> Vec<P>
-where
-    I: Into<NestedRnsEncodeInput<'a>>,
-{
+) -> Vec<P> {
     let (q_moduli, _, q_moduli_depth) = params.to_crt();
     let active_q_level = q_level.unwrap_or(q_moduli_depth);
     assert!(
@@ -1084,10 +1171,6 @@ where
         active_q_level,
         q_moduli_depth
     );
-    let input_coeffs = match input.into() {
-        NestedRnsEncodeInput::Scalar(value) => std::slice::from_ref(value),
-        NestedRnsEncodeInput::Coeffs(values) => values,
-    };
     let ring_dimension = params.ring_dimension() as usize;
     assert!(
         input_coeffs.len() <= ring_dimension,
@@ -1132,9 +1215,8 @@ mod tests {
         _modulus: &BigUint,
         ring_dimension: usize,
     ) -> (Vec<BigUint>, Vec<BigUint>) {
-        let a_coeffs = (0..ring_dimension)
-            .map(|idx| BigUint::from((idx % 3) as u64))
-            .collect::<Vec<_>>();
+        let a_coeffs =
+            (0..ring_dimension).map(|idx| BigUint::from((idx % 3) as u64)).collect::<Vec<_>>();
         let b_coeffs = (0..ring_dimension)
             .map(|idx| BigUint::from(((idx + 1) % 3) as u64))
             .collect::<Vec<_>>();
@@ -1167,6 +1249,35 @@ mod tests {
         (params, ctx)
     }
 
+    fn repeated_coeffs(value: &BigUint, len: usize) -> Vec<BigUint> {
+        vec![value.clone(); len]
+    }
+
+    fn random_coeffs(modulus: &BigUint, len: usize) -> Vec<BigUint> {
+        let mut rng = rand::rng();
+        (0..len)
+            .map(|_| crate::utils::gen_biguint_for_modulus(&mut rng, modulus))
+            .collect::<Vec<_>>()
+    }
+
+    fn assert_q_level_context(
+        params: &DCRTPolyParams,
+        ctx: &NestedRnsPolyContext,
+        q_level: usize,
+    ) -> BigUint {
+        assert_eq!(ctx.q_moduli_depth, q_level);
+        assert_eq!(ctx.add_lazy_reduce_ids.len(), q_level);
+        assert_eq!(ctx.sub_lazy_reduce_ids.len(), q_level);
+        assert_eq!(ctx.mul_lazy_reduce_ids.len(), q_level);
+        assert_eq!(ctx.add_full_reduce_ids.len(), q_level);
+        assert_eq!(ctx.sub_full_reduce_ids.len(), q_level);
+        assert_eq!(ctx.mul_full_reduce_ids.len(), q_level);
+        assert_eq!(ctx.reconstruct_ids.len(), q_level);
+
+        let (q_moduli, _, _) = params.to_crt();
+        q_moduli.iter().take(q_level).fold(BigUint::from(1u64), |acc, &qi| acc * BigUint::from(qi))
+    }
+
     #[sequential_test::sequential]
     #[test]
     fn test_nested_rns_poly_add_full_reduce_maxes() {
@@ -1175,7 +1286,14 @@ mod tests {
         let modulus = params.modulus();
         let a_value: BigUint = modulus.as_ref() - BigUint::from(1u64);
         let b_value: BigUint = modulus.as_ref() - BigUint::from(1u64);
-        test_nested_rns_poly_add_full_reduce_generic(circuit, params, ctx, a_value, b_value);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            circuit,
+            params,
+            ctx,
+            vec![a_value],
+            vec![b_value],
+            "add",
+        );
     }
 
     #[sequential_test::sequential]
@@ -1187,7 +1305,14 @@ mod tests {
         let mut rng = rand::rng();
         let a_value: BigUint = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
         let b_value: BigUint = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
-        test_nested_rns_poly_add_full_reduce_generic(circuit, params, ctx, a_value, b_value);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            circuit,
+            params,
+            ctx,
+            vec![a_value],
+            vec![b_value],
+            "add",
+        );
     }
 
     #[sequential_test::sequential]
@@ -1198,7 +1323,14 @@ mod tests {
         let modulus = params.modulus();
         let a_value: BigUint = BigUint::ZERO;
         let b_value: BigUint = modulus.as_ref() - BigUint::from(1u64);
-        test_nested_rns_poly_sub_full_reduce_generic(circuit, params, ctx, a_value, b_value);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            circuit,
+            params,
+            ctx,
+            vec![a_value],
+            vec![b_value],
+            "sub",
+        );
     }
 
     #[sequential_test::sequential]
@@ -1210,7 +1342,14 @@ mod tests {
         let mut rng = rand::rng();
         let a_value: BigUint = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
         let b_value: BigUint = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
-        test_nested_rns_poly_sub_full_reduce_generic(circuit, params, ctx, a_value, b_value);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            circuit,
+            params,
+            ctx,
+            vec![a_value],
+            vec![b_value],
+            "sub",
+        );
     }
 
     #[sequential_test::sequential]
@@ -1221,7 +1360,14 @@ mod tests {
         let modulus = params.modulus();
         let a_value: BigUint = modulus.as_ref() - BigUint::from(1u64);
         let b_value: BigUint = modulus.as_ref() - BigUint::from(1u64);
-        test_nested_rns_poly_mul_full_reduce_generic(circuit, params, ctx, a_value, b_value);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            circuit,
+            params,
+            ctx,
+            vec![a_value],
+            vec![b_value],
+            "mul",
+        );
     }
 
     #[sequential_test::sequential]
@@ -1233,7 +1379,14 @@ mod tests {
         let mut rng = rand::rng();
         let a_value: BigUint = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
         let b_value: BigUint = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
-        test_nested_rns_poly_mul_full_reduce_generic(circuit, params, ctx, a_value, b_value);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            circuit,
+            params,
+            ctx,
+            vec![a_value],
+            vec![b_value],
+            "mul",
+        );
     }
 
     #[sequential_test::sequential]
@@ -1242,46 +1395,33 @@ mod tests {
         let q_level = 2usize;
         let mut setup_circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context_with_q_level(&mut setup_circuit, Some(q_level));
-
-        assert_eq!(ctx.q_moduli_depth, q_level);
-        assert_eq!(ctx.add_lazy_reduce_ids.len(), q_level);
-        assert_eq!(ctx.sub_lazy_reduce_ids.len(), q_level);
-        assert_eq!(ctx.mul_lazy_reduce_ids.len(), q_level);
-        assert_eq!(ctx.add_full_reduce_ids.len(), q_level);
-        assert_eq!(ctx.sub_full_reduce_ids.len(), q_level);
-        assert_eq!(ctx.mul_full_reduce_ids.len(), q_level);
-        assert_eq!(ctx.reconstruct_ids.len(), q_level);
-
-        let (q_moduli, _, _) = params.to_crt();
-        let q_level_modulus = q_moduli
-            .iter()
-            .take(q_level)
-            .fold(BigUint::from(1u64), |acc, &qi| acc * BigUint::from(qi));
+        let q_level_modulus = assert_q_level_context(&params, &ctx, q_level);
 
         // Max-value multiplication under the limited q_level.
         let mut max_circuit = PolyCircuit::<DCRTPoly>::new();
         let (_, max_ctx) = create_test_context_with_q_level(&mut max_circuit, Some(q_level));
         let max_value = &q_level_modulus - BigUint::from(1u64);
-        test_nested_rns_poly_mul_full_reduce_generic(
+        test_nested_rns_poly_full_reduce_vector_generic(
             max_circuit,
             params.clone(),
             max_ctx,
-            max_value.clone(),
-            max_value,
+            vec![max_value.clone()],
+            vec![max_value],
+            "mul",
         );
 
         // Random multiplication under the limited q_level.
-        let mut rng = rand::rng();
-        let a_value = crate::utils::gen_biguint_for_modulus(&mut rng, &q_level_modulus);
-        let b_value = crate::utils::gen_biguint_for_modulus(&mut rng, &q_level_modulus);
+        let a_coeffs = random_coeffs(&q_level_modulus, 1);
+        let b_coeffs = random_coeffs(&q_level_modulus, 1);
         let mut random_circuit = PolyCircuit::<DCRTPoly>::new();
         let (_, random_ctx) = create_test_context_with_q_level(&mut random_circuit, Some(q_level));
-        test_nested_rns_poly_mul_full_reduce_generic(
+        test_nested_rns_poly_full_reduce_vector_generic(
             random_circuit,
             params,
             random_ctx,
-            a_value,
-            b_value,
+            a_coeffs,
+            b_coeffs,
+            "mul",
         );
     }
 
@@ -1290,9 +1430,8 @@ mod tests {
     fn test_encode_nested_rns_poly_stores_limbs_in_coefficients() {
         let params = DCRTPolyParams::new(4, 6, 18, BASE_BITS);
         let ring_dimension = params.ring_dimension() as usize;
-        let input_coeffs = (0..ring_dimension)
-            .map(|idx| BigUint::from((idx * 11 + 5) as u64))
-            .collect::<Vec<_>>();
+        let input_coeffs =
+            (0..ring_dimension).map(|idx| BigUint::from((idx * 11 + 5) as u64)).collect::<Vec<_>>();
         let (q_moduli, _, q_moduli_depth) = params.to_crt();
         let q_moduli_max = q_moduli.iter().max().expect("there should be at least one q modulus");
         let p_moduli = sample_crt_primes(P_MODULI_BITS, *q_moduli_max);
@@ -1319,9 +1458,13 @@ mod tests {
     fn test_nested_rns_poly_add_lazy_reduce_full_ring_dimension() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
-        let (a_coeffs, b_coeffs) =
-            deterministic_full_ring_inputs(params.modulus().as_ref(), params.ring_dimension() as usize);
-        test_nested_rns_poly_lazy_reduce_vector_generic(circuit, params, ctx, a_coeffs, b_coeffs, "add");
+        let (a_coeffs, b_coeffs) = deterministic_full_ring_inputs(
+            params.modulus().as_ref(),
+            params.ring_dimension() as usize,
+        );
+        test_nested_rns_poly_lazy_reduce_vector_generic(
+            circuit, params, ctx, a_coeffs, b_coeffs, "add",
+        );
     }
 
     #[sequential_test::sequential]
@@ -1329,9 +1472,13 @@ mod tests {
     fn test_nested_rns_poly_sub_lazy_reduce_full_ring_dimension() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
-        let (a_coeffs, b_coeffs) =
-            deterministic_full_ring_inputs(params.modulus().as_ref(), params.ring_dimension() as usize);
-        test_nested_rns_poly_lazy_reduce_vector_generic(circuit, params, ctx, a_coeffs, b_coeffs, "sub");
+        let (a_coeffs, b_coeffs) = deterministic_full_ring_inputs(
+            params.modulus().as_ref(),
+            params.ring_dimension() as usize,
+        );
+        test_nested_rns_poly_lazy_reduce_vector_generic(
+            circuit, params, ctx, a_coeffs, b_coeffs, "sub",
+        );
     }
 
     #[sequential_test::sequential]
@@ -1339,121 +1486,318 @@ mod tests {
     fn test_nested_rns_poly_mul_lazy_reduce_full_ring_dimension() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
-        let (a_coeffs, b_coeffs) =
-            deterministic_full_ring_inputs(params.modulus().as_ref(), params.ring_dimension() as usize);
-        test_nested_rns_poly_lazy_reduce_vector_generic(circuit, params, ctx, a_coeffs, b_coeffs, "mul");
+        let (a_coeffs, b_coeffs) = deterministic_full_ring_inputs(
+            params.modulus().as_ref(),
+            params.ring_dimension() as usize,
+        );
+        test_nested_rns_poly_lazy_reduce_vector_generic(
+            circuit, params, ctx, a_coeffs, b_coeffs, "mul",
+        );
     }
 
-    fn test_nested_rns_poly_add_full_reduce_generic(
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_add_full_reduce_maxes_half_ring_dimension() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let modulus = params.modulus();
+        let len = params.ring_dimension() as usize / 2;
+        let a_coeffs = repeated_coeffs(&(modulus.as_ref() - BigUint::from(1u64)), len);
+        let b_coeffs = repeated_coeffs(&(modulus.as_ref() - BigUint::from(1u64)), len);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            circuit, params, ctx, a_coeffs, b_coeffs, "add",
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_add_full_reduce_random_half_ring_dimension() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let len = params.ring_dimension() as usize / 2;
+        let a_coeffs = random_coeffs(params.modulus().as_ref(), len);
+        let b_coeffs = random_coeffs(params.modulus().as_ref(), len);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            circuit, params, ctx, a_coeffs, b_coeffs, "add",
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_sub_full_reduce_maxes_half_ring_dimension() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let modulus = params.modulus();
+        let len = params.ring_dimension() as usize / 2;
+        let a_coeffs = repeated_coeffs(&BigUint::ZERO, len);
+        let b_coeffs = repeated_coeffs(&(modulus.as_ref() - BigUint::from(1u64)), len);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            circuit, params, ctx, a_coeffs, b_coeffs, "sub",
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_sub_full_reduce_random_half_ring_dimension() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let len = params.ring_dimension() as usize / 2;
+        let a_coeffs = random_coeffs(params.modulus().as_ref(), len);
+        let b_coeffs = random_coeffs(params.modulus().as_ref(), len);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            circuit, params, ctx, a_coeffs, b_coeffs, "sub",
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_mul_full_reduce_maxes_half_ring_dimension() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let modulus = params.modulus();
+        let len = params.ring_dimension() as usize / 2;
+        let a_coeffs = repeated_coeffs(&(modulus.as_ref() - BigUint::from(1u64)), len);
+        let b_coeffs = repeated_coeffs(&(modulus.as_ref() - BigUint::from(1u64)), len);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            circuit, params, ctx, a_coeffs, b_coeffs, "mul",
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_mul_full_reduce_random_half_ring_dimension() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let len = params.ring_dimension() as usize / 2;
+        let a_coeffs = random_coeffs(params.modulus().as_ref(), len);
+        let b_coeffs = random_coeffs(params.modulus().as_ref(), len);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            circuit, params, ctx, a_coeffs, b_coeffs, "mul",
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_respects_q_level_half_ring_dimension() {
+        let q_level = 2usize;
+        let mut setup_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context_with_q_level(&mut setup_circuit, Some(q_level));
+        let len = params.ring_dimension() as usize / 2;
+        let q_level_modulus = assert_q_level_context(&params, &ctx, q_level);
+
+        let mut max_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_, max_ctx) = create_test_context_with_q_level(&mut max_circuit, Some(q_level));
+        let max_value = &q_level_modulus - BigUint::from(1u64);
+        let max_coeffs = repeated_coeffs(&max_value, len);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            max_circuit,
+            params.clone(),
+            max_ctx,
+            max_coeffs.clone(),
+            max_coeffs,
+            "mul",
+        );
+
+        let mut random_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_, random_ctx) = create_test_context_with_q_level(&mut random_circuit, Some(q_level));
+        let a_coeffs = random_coeffs(&q_level_modulus, len);
+        let b_coeffs = random_coeffs(&q_level_modulus, len);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            random_circuit,
+            params,
+            random_ctx,
+            a_coeffs,
+            b_coeffs,
+            "mul",
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_add_full_reduce_maxes_full_ring_dimension() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let modulus = params.modulus();
+        let len = params.ring_dimension() as usize;
+        let a_coeffs = repeated_coeffs(&(modulus.as_ref() - BigUint::from(1u64)), len);
+        let b_coeffs = repeated_coeffs(&(modulus.as_ref() - BigUint::from(1u64)), len);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            circuit, params, ctx, a_coeffs, b_coeffs, "add",
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_add_full_reduce_random_full_ring_dimension() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let len = params.ring_dimension() as usize;
+        let a_coeffs = random_coeffs(params.modulus().as_ref(), len);
+        let b_coeffs = random_coeffs(params.modulus().as_ref(), len);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            circuit, params, ctx, a_coeffs, b_coeffs, "add",
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_sub_full_reduce_maxes_full_ring_dimension() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let modulus = params.modulus();
+        let len = params.ring_dimension() as usize;
+        let a_coeffs = repeated_coeffs(&BigUint::ZERO, len);
+        let b_coeffs = repeated_coeffs(&(modulus.as_ref() - BigUint::from(1u64)), len);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            circuit, params, ctx, a_coeffs, b_coeffs, "sub",
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_sub_full_reduce_random_full_ring_dimension() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let len = params.ring_dimension() as usize;
+        let a_coeffs = random_coeffs(params.modulus().as_ref(), len);
+        let b_coeffs = random_coeffs(params.modulus().as_ref(), len);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            circuit, params, ctx, a_coeffs, b_coeffs, "sub",
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_mul_full_reduce_maxes_full_ring_dimension() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let modulus = params.modulus();
+        let len = params.ring_dimension() as usize;
+        let a_coeffs = repeated_coeffs(&(modulus.as_ref() - BigUint::from(1u64)), len);
+        let b_coeffs = repeated_coeffs(&(modulus.as_ref() - BigUint::from(1u64)), len);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            circuit, params, ctx, a_coeffs, b_coeffs, "mul",
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_mul_full_reduce_random_full_ring_dimension() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let len = params.ring_dimension() as usize;
+        let a_coeffs = random_coeffs(params.modulus().as_ref(), len);
+        let b_coeffs = random_coeffs(params.modulus().as_ref(), len);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            circuit, params, ctx, a_coeffs, b_coeffs, "mul",
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_respects_q_level_full_ring_dimension() {
+        let q_level = 2usize;
+        let mut setup_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context_with_q_level(&mut setup_circuit, Some(q_level));
+        let len = params.ring_dimension() as usize;
+        let q_level_modulus = assert_q_level_context(&params, &ctx, q_level);
+
+        let mut max_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_, max_ctx) = create_test_context_with_q_level(&mut max_circuit, Some(q_level));
+        let max_value = &q_level_modulus - BigUint::from(1u64);
+        let max_coeffs = repeated_coeffs(&max_value, len);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            max_circuit,
+            params.clone(),
+            max_ctx,
+            max_coeffs.clone(),
+            max_coeffs,
+            "mul",
+        );
+
+        let mut random_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_, random_ctx) = create_test_context_with_q_level(&mut random_circuit, Some(q_level));
+        let a_coeffs = random_coeffs(&q_level_modulus, len);
+        let b_coeffs = random_coeffs(&q_level_modulus, len);
+        test_nested_rns_poly_full_reduce_vector_generic(
+            random_circuit,
+            params,
+            random_ctx,
+            a_coeffs,
+            b_coeffs,
+            "mul",
+        );
+    }
+
+    fn test_nested_rns_poly_full_reduce_vector_generic(
         mut circuit: PolyCircuit<DCRTPoly>,
         params: DCRTPolyParams,
         ctx: Arc<NestedRnsPolyContext>,
-        a_value: BigUint,
-        b_value: BigUint,
+        a_coeffs: Vec<BigUint>,
+        b_coeffs: Vec<BigUint>,
+        op: &str,
     ) {
+        assert_eq!(a_coeffs.len(), b_coeffs.len());
+        assert!(
+            a_coeffs.len() <= params.ring_dimension() as usize,
+            "vector length must not exceed ring dimension"
+        );
+
         let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
         let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-        let sum = poly_a.add_full_reduce(&poly_b, None, &mut circuit);
-        let out = sum.reconstruct(None, &mut circuit);
-        circuit.output(vec![out]);
-        println!("non-free depth {}", circuit.non_free_depth());
-        println!("circuit size {:?}", circuit.count_gates_by_type_vec());
-
-        let modulus = params.modulus();
-        // println!("modulus {:?}", &modulus);
-        // println!("a_value {:?}", &a_value);
-        // println!("b_value {:?}", &b_value);
-        let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, None);
-        let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, None);
-        let expected_out = (&a_value + &b_value) % modulus.as_ref();
-        // println!("expected_out {:?}", &expected_out);
-        let plt_evaluator = PolyPltEvaluator::new();
-        let one = DCRTPoly::const_one(&params);
-        let eval_inputs = [a_inputs, b_inputs].concat();
-        let eval_results = circuit.eval(&params, one, eval_inputs, Some(&plt_evaluator));
-        // println!("eval_results {:?}", eval_results);
-        assert_eq!(eval_results.len(), 1);
-        assert_eq!(eval_results[0].coeffs_biguints()[0], expected_out);
-    }
-
-    fn test_nested_rns_poly_sub_full_reduce_generic(
-        mut circuit: PolyCircuit<DCRTPoly>,
-        params: DCRTPolyParams,
-        ctx: Arc<NestedRnsPolyContext>,
-        a_value: BigUint,
-        b_value: BigUint,
-    ) {
-        let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-        let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-        let sum = poly_a.sub_full_reduce(&poly_b, None, &mut circuit);
-        let out = sum.reconstruct(None, &mut circuit);
-        circuit.output(vec![out]);
-        println!("non-free depth {}", circuit.non_free_depth());
-        println!("circuit size {:?}", circuit.count_gates_by_type_vec());
-
-        let modulus = params.modulus();
-        // println!("modulus {:?}", &modulus);
-        // println!("a_value {:?}", &a_value);
-        // println!("b_value {:?}", &b_value);
-        let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, None);
-        let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, None);
-        let expected_out = {
-            let mut value = &a_value + modulus.as_ref();
-            value -= &b_value;
-            value %= modulus.as_ref();
-            value
+        let result = match op {
+            "add" => poly_a.add_full_reduce(&poly_b, None, &mut circuit),
+            "sub" => poly_a.sub_full_reduce(&poly_b, None, &mut circuit),
+            "mul" => poly_a.mul_full_reduce(&poly_b, None, &mut circuit),
+            _ => panic!("unsupported full reduce op: {op}"),
         };
-        // println!("expected_out {:?}", &expected_out);
-        let plt_evaluator = PolyPltEvaluator::new();
-        let one = DCRTPoly::const_one(&params);
-        let eval_inputs = [a_inputs, b_inputs].concat();
-        let eval_results = circuit.eval(&params, one, eval_inputs, Some(&plt_evaluator));
-        // println!("eval_results {:?}", eval_results);
-        assert_eq!(eval_results.len(), 1);
-        assert_eq!(eval_results[0].coeffs_biguints()[0], expected_out);
-    }
-
-    fn test_nested_rns_poly_mul_full_reduce_generic(
-        mut circuit: PolyCircuit<DCRTPoly>,
-        params: DCRTPolyParams,
-        ctx: Arc<NestedRnsPolyContext>,
-        a_value: BigUint,
-        b_value: BigUint,
-    ) {
-        let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-        let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-        let sum = poly_a.mul_full_reduce(&poly_b, None, &mut circuit);
-        let out = sum.reconstruct(None, &mut circuit);
+        let out = result.reconstruct(None, &mut circuit);
         circuit.output(vec![out]);
         println!("non-free depth {}", circuit.non_free_depth());
         println!("circuit size {:?}", circuit.count_gates_by_type_vec());
 
-        let modulus = params.modulus();
         let (q_moduli, _, _) = params.to_crt();
         let active_q_level = ctx.q_moduli_depth;
         let q_level_modulus = q_moduli
             .iter()
             .take(active_q_level)
             .fold(BigUint::from(1u64), |acc, &qi| acc * BigUint::from(qi));
+        let ring_dimension = params.ring_dimension() as usize;
         let a_inputs =
-            encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, Some(active_q_level));
+            encode_nested_rns_poly(P_MODULI_BITS, &params, &a_coeffs, Some(active_q_level));
         let b_inputs =
-            encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, Some(active_q_level));
-        let expected_mod_q_level =
-            ((&a_value % &q_level_modulus) * (&b_value % &q_level_modulus)) % &q_level_modulus;
+            encode_nested_rns_poly(P_MODULI_BITS, &params, &b_coeffs, Some(active_q_level));
+        let mut expected_coeffs = a_coeffs
+            .iter()
+            .zip(b_coeffs.iter())
+            .map(|(a, b)| {
+                let a_mod = a % &q_level_modulus;
+                let b_mod = b % &q_level_modulus;
+                match op {
+                    "add" => (a_mod + b_mod) % &q_level_modulus,
+                    "sub" => (a_mod + &q_level_modulus - b_mod) % &q_level_modulus,
+                    "mul" => (a_mod * b_mod) % &q_level_modulus,
+                    _ => unreachable!(),
+                }
+            })
+            .collect::<Vec<_>>();
+        expected_coeffs.resize(ring_dimension, BigUint::ZERO);
+
         let plt_evaluator = PolyPltEvaluator::new();
         let one = DCRTPoly::const_one(&params);
         let eval_inputs = [a_inputs, b_inputs].concat();
         let eval_results = circuit.eval(&params, one, eval_inputs, Some(&plt_evaluator));
         assert_eq!(eval_results.len(), 1);
-        let output = eval_results[0].coeffs_biguints()[0].clone();
+        let output_coeffs = eval_results[0].coeffs_biguints();
         if active_q_level == q_moduli.len() {
-            let expected_out = (&a_value * &b_value) % modulus.as_ref();
-            assert_eq!(output, expected_out);
+            assert_eq!(output_coeffs, expected_coeffs);
         } else {
-            assert_eq!(output.clone() % &q_level_modulus, expected_mod_q_level);
-            for &q_i in q_moduli.iter().skip(active_q_level) {
-                assert_eq!(output.clone() % BigUint::from(q_i), BigUint::ZERO);
+            assert_eq!(output_coeffs.len(), ring_dimension);
+            for (output, expected) in output_coeffs.iter().zip(expected_coeffs.iter()) {
+                assert_eq!(output % &q_level_modulus, *expected);
+                for &q_i in q_moduli.iter().skip(active_q_level) {
+                    assert_eq!(output % BigUint::from(q_i), BigUint::ZERO);
+                }
             }
         }
     }
@@ -1474,7 +1818,8 @@ mod tests {
             "mul" => poly_a.mul_lazy_reduce(&poly_b, None, &mut circuit),
             _ => panic!("unsupported lazy reduce op: {op}"),
         };
-        let outputs = result.inner.iter().flat_map(|level| level.iter().copied()).collect::<Vec<_>>();
+        let outputs =
+            result.inner.iter().flat_map(|level| level.iter().copied()).collect::<Vec<_>>();
         circuit.output(outputs);
 
         let (q_moduli, _, _) = params.to_crt();

@@ -10,6 +10,6 @@
       "type": "string"
     }
   },
-  "required": ["result"],
+  "required": ["result", "msg"],
   "additionalProperties": false
 }

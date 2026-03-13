@@ -6,6 +6,7 @@ This repository provides implementations for lattice-cryptography operations (po
 ## Global Requirements
 - All documentation in this repository, along with git commit messages and PRs, must be written in English.
 - When documenting file paths, use only paths relative to the repository top directory. Do not write absolute paths in documentation.
+- Directories named `references` are read-only reference directories for humans and agents. Agents may read them when relevant and must never edit them.
 
 ## Codex Workflow
 This repository uses a long-running Codex session workflow governed by `BUILDER.md` and `PLANS.md`.

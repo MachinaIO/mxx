@@ -1,7 +1,9 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+import sys
+import time
+from typing import Any, Callable
 
 from .atomic import atomic_write_text
 from .paths import RepoPaths
@@ -12,9 +14,20 @@ from .plan import (
     append_follow_up_subtasks_file,
     render_session_plan,
 )
-from .runners import CodexExecRunner, FinalTestRunner, ShellFinalTestRunner, StructuredExecRunner
+from .runners import (
+    BuilderExecRunner,
+    BuilderExecResult,
+    CodexBuilderRunner,
+    CodexExecRunner,
+    FinalTestRunner,
+    ShellFinalTestRunner,
+    StructuredExecResult,
+    StructuredExecRunner,
+)
 from .state import ReviewSnapshot, SessionState, load_state, save_state, write_current_session_id
 from .transcript import latest_assistant_message_from_transcript, latest_user_message_from_transcript
+
+RETRY_DELAY_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -117,13 +130,6 @@ def _make_review_follow_ups(summary: str) -> list[str]:
     return [f"Address reviewer feedback from the final read-only Codex review: {detail}"]
 
 
-def _planning_accept_block_message() -> str:
-    return (
-        "Plan approval recorded. Switch to implementation immediately, read BUILDER.md, "
-        "read the session plan, and start from the first unchecked subtask now."
-    )
-
-
 def _planning_revision_block_message(message: str | None) -> str:
     if message:
         return (
@@ -149,6 +155,186 @@ def _missing_plan_structure_message() -> str:
     )
 
 
+def _log_progress(message: str) -> None:
+    sys.stderr.write(message)
+    if not message.endswith("\n"):
+        sys.stderr.write("\n")
+    sys.stderr.flush()
+
+
+@dataclass(frozen=True)
+class ImplementationCheckResult:
+    status: str
+    message: str
+
+
+def _build_builder_prompt(session_id: str, state: SessionState, reason: str | None) -> str:
+    prompt = (
+        "You are the builder for the current Codex workflow session.\n"
+        f"Session id: {session_id}.\n"
+        f"Read `.agents/current-session-id`, `.agents/session-{session_id}.json`, `BUILDER.md`, and `{state.plan_doc}` before acting.\n"
+        "Treat the session plan as the only source of task scope and completion criteria.\n"
+        "Work through unchecked subtasks in order.\n"
+        "After each completed subtask, run the most relevant tests immediately and only then check it off.\n"
+        "Update the session plan's per-subtask validation, decision log, and progress log as you work.\n"
+        "If final tests or reviewer feedback create new obligations, append NEW unchecked items under "
+        f"`{FOLLOW_UP_SUBTASKS_HEADING}` instead of rewriting completed history.\n"
+        "Stop only when every tracked checkbox in the required subtask sections is checked.\n"
+    )
+    if reason:
+        prompt += f"\nImmediate priority from the outer stop hook: {reason}\n"
+    return prompt
+
+
+def _build_review_prompt(session_id: str, state: SessionState) -> str:
+    return (
+        "You are a read-only reviewer.\n"
+        f"The builder session id is {session_id}.\n"
+        f"Read the corresponding session plan at {state.plan_doc}.\n"
+        "Verify whether the implementation satisfies the goal, constraints, and acceptance criteria in that plan.\n"
+        "If acceptable, output result=accept.\n"
+        "Otherwise output result=revision and msg=<concrete problems and required fixes>.\n"
+    )
+
+
+def _run_builder_with_retry(
+    builder_runner: BuilderExecRunner,
+    prompt: str,
+    label: str,
+    sleep_fn: Callable[[float], None],
+) -> BuilderExecResult:
+    while True:
+        result = builder_runner.run(prompt=prompt, label=label)
+        if result.ok:
+            return result
+        _log_progress(
+            "[stop hook] Nested builder failed. "
+            f"Retrying in {RETRY_DELAY_SECONDS:.1f}s. Summary: {result.summary}"
+        )
+        sleep_fn(RETRY_DELAY_SECONDS)
+
+
+def _run_review_with_retry(
+    paths: RepoPaths,
+    exec_runner: StructuredExecRunner,
+    prompt: str,
+    sleep_fn: Callable[[float], None],
+) -> StructuredExecResult:
+    schema_path = paths.schemas_dir / "review-decision.schema.json"
+    while True:
+        review_result = exec_runner.run(prompt=prompt, schema_path=schema_path, label="final-review")
+        if review_result.ok and review_result.result in {"accept", "revision"}:
+            return review_result
+        detail = review_result.error or "Reviewer did not return a valid structured decision."
+        _log_progress(
+            "[stop hook] Nested reviewer failed. "
+            f"Retrying in {RETRY_DELAY_SECONDS:.1f}s. Summary: {detail}"
+        )
+        sleep_fn(RETRY_DELAY_SECONDS)
+
+
+def _evaluate_implementation_once(
+    paths: RepoPaths,
+    session_id: str,
+    state: SessionState,
+    exec_runner: StructuredExecRunner,
+    test_runner: FinalTestRunner,
+    sleep_fn: Callable[[float], None],
+) -> ImplementationCheckResult:
+    plan_path = _ensure_plan_exists(paths, session_id, state)
+    analysis = analyze_plan(plan_path.read_text(encoding="utf-8"))
+    if analysis.missing_sections or analysis.empty_sections:
+        return ImplementationCheckResult(status="builder", message=_missing_plan_structure_message())
+
+    if not analysis.all_checked:
+        next_item = analysis.first_unchecked
+        detail = f" Next unchecked subtask: {next_item.text}" if next_item else ""
+        return ImplementationCheckResult(
+            status="builder",
+            message=(
+                "Implementation is not complete. Continue with the next unchecked subtask and keep the plan document updated."
+                + detail
+            ),
+        )
+
+    test_result = test_runner.run(label="final-tests")
+    if not test_result.ok:
+        follow_up_items = _make_test_follow_ups(test_result.summary)
+        append_follow_up_subtasks_file(plan_path, follow_up_items)
+        return ImplementationCheckResult(
+            status="builder",
+            message=(
+                "Final tests failed. New follow-up subtasks were appended to the session plan. "
+                f"Address them first. Failure summary: {test_result.summary}"
+            ),
+        )
+
+    review_result = _run_review_with_retry(
+        paths=paths,
+        exec_runner=exec_runner,
+        prompt=_build_review_prompt(session_id, state),
+        sleep_fn=sleep_fn,
+    )
+
+    state.last_review = _record_review(review_result.result, review_result.msg)
+    if review_result.result == "revision":
+        append_follow_up_subtasks_file(
+            plan_path,
+            _make_review_follow_ups(review_result.msg or "Reviewer requested changes."),
+        )
+        save_state(paths, state)
+        return ImplementationCheckResult(
+            status="builder",
+            message=(
+                "Reviewer requested changes. New follow-up subtasks were appended to the session plan. "
+                f"Address them first. Reviewer feedback: {review_result.msg or 'No review message was provided.'}"
+            ),
+        )
+
+    state.completed = True
+    state.final_status = "approved"
+    save_state(paths, state)
+    return ImplementationCheckResult(
+        status="accepted",
+        message="All subtasks are complete, final tests passed, and reviewer approved.",
+    )
+
+
+def _run_implementation_loop(
+    paths: RepoPaths,
+    session_id: str,
+    state: SessionState,
+    exec_runner: StructuredExecRunner,
+    builder_runner: BuilderExecRunner,
+    test_runner: FinalTestRunner,
+    sleep_fn: Callable[[float], None],
+) -> HookOutcome:
+    builder_reason = "Complete the remaining unchecked work in the session plan."
+    attempt = 0
+    while True:
+        attempt += 1
+        _log_progress(f"[stop hook] Launching nested builder attempt {attempt} for session {session_id}.")
+        _run_builder_with_retry(
+            builder_runner=builder_runner,
+            prompt=_build_builder_prompt(session_id, state, builder_reason),
+            label=f"builder-attempt-{attempt}",
+            sleep_fn=sleep_fn,
+        )
+        _log_progress(f"[stop hook] Nested builder attempt {attempt} finished. Evaluating completion gate.")
+        check_result = _evaluate_implementation_once(
+            paths=paths,
+            session_id=session_id,
+            state=state,
+            exec_runner=exec_runner,
+            test_runner=test_runner,
+            sleep_fn=sleep_fn,
+        )
+        if check_result.status == "accepted":
+            return stop_outcome(check_result.message)
+        builder_reason = check_result.message
+        _log_progress(f"[stop hook] Additional implementation required. {builder_reason}")
+
+
 def handle_session_start(payload: dict[str, Any], repo_root: Path) -> HookOutcome:
     paths = RepoPaths(repo_root)
     paths.ensure_directories()
@@ -171,6 +357,9 @@ def _handle_planning_stop(
     session_id: str,
     state: SessionState,
     exec_runner: StructuredExecRunner,
+    builder_runner: BuilderExecRunner,
+    test_runner: FinalTestRunner,
+    sleep_fn: Callable[[float], None],
 ) -> HookOutcome:
     if not state.awaiting_plan_reply:
         state.awaiting_plan_reply = True
@@ -210,7 +399,15 @@ def _handle_planning_stop(
         state.last_plan_check = _record_review("accept", latest_user_message)
         state.phase = "implementation"
         save_state(paths, state)
-        return block_outcome(_planning_accept_block_message())
+        return _run_implementation_loop(
+            paths=paths,
+            session_id=session_id,
+            state=state,
+            exec_runner=exec_runner,
+            builder_runner=builder_runner,
+            test_runner=test_runner,
+            sleep_fn=sleep_fn,
+        )
 
     state.last_plan_check = _record_review("revision", msg)
     save_state(paths, state)
@@ -222,66 +419,30 @@ def _handle_implementation_stop(
     session_id: str,
     state: SessionState,
     exec_runner: StructuredExecRunner,
+    builder_runner: BuilderExecRunner,
     test_runner: FinalTestRunner,
+    sleep_fn: Callable[[float], None],
 ) -> HookOutcome:
-    plan_path = _ensure_plan_exists(paths, session_id, state)
-    analysis = analyze_plan(plan_path.read_text(encoding="utf-8"))
-    if analysis.missing_sections or analysis.empty_sections:
-        return block_outcome(_missing_plan_structure_message())
-
-    if not analysis.all_checked:
-        next_item = analysis.first_unchecked
-        detail = f" Next unchecked subtask: {next_item.text}" if next_item else ""
-        return block_outcome(
-            "Implementation is not complete. Continue with the next unchecked subtask and keep the plan document updated."
-            + detail
-        )
-
-    test_result = test_runner.run(label="final-tests")
-    if not test_result.ok:
-        follow_up_items = _make_test_follow_ups(test_result.summary)
-        append_follow_up_subtasks_file(plan_path, follow_up_items)
-        return block_outcome(
-            "Final tests failed. New follow-up subtasks were appended to the session plan. "
-            f"Address them first. Failure summary: {test_result.summary}"
-        )
-
-    schema_path = paths.schemas_dir / "review-decision.schema.json"
-    prompt = (
-        "You are a read-only reviewer.\n"
-        f"The builder session id is {session_id}.\n"
-        f"Read the corresponding session plan at {state.plan_doc}.\n"
-        "Verify whether the implementation satisfies the goal, constraints, and acceptance criteria in that plan.\n"
-        "If acceptable, output result=accept.\n"
-        "Otherwise output result=revision and msg=<concrete problems and required fixes>.\n"
+    if state.completed and state.final_status == "approved":
+        return stop_outcome("All subtasks are complete, final tests passed, and reviewer approved.")
+    return _run_implementation_loop(
+        paths=paths,
+        session_id=session_id,
+        state=state,
+        exec_runner=exec_runner,
+        builder_runner=builder_runner,
+        test_runner=test_runner,
+        sleep_fn=sleep_fn,
     )
-    review_result = exec_runner.run(prompt=prompt, schema_path=schema_path, label="final-review")
-    if not review_result.ok or review_result.result not in {"accept", "revision"}:
-        return block_outcome(
-            "The final read-only reviewer could not complete. Stay in implementation mode, perform self-review, "
-            "and continue fixing issues before trying again."
-        )
-
-    state.last_review = _record_review(review_result.result, review_result.msg)
-    if review_result.result == "revision":
-        append_follow_up_subtasks_file(plan_path, _make_review_follow_ups(review_result.msg or "Reviewer requested changes."))
-        save_state(paths, state)
-        return block_outcome(
-            "Reviewer requested changes. New follow-up subtasks were appended to the session plan. "
-            f"Address them first. Reviewer feedback: {review_result.msg or 'No review message was provided.'}"
-        )
-
-    state.completed = True
-    state.final_status = "approved"
-    save_state(paths, state)
-    return stop_outcome("All subtasks are complete, final tests passed, and reviewer approved.")
 
 
 def handle_stop(
     payload: dict[str, Any],
     repo_root: Path,
     exec_runner: StructuredExecRunner | None = None,
+    builder_runner: BuilderExecRunner | None = None,
     test_runner: FinalTestRunner | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
 ) -> HookOutcome:
     paths = RepoPaths(repo_root)
     paths.ensure_directories()
@@ -301,8 +462,10 @@ def handle_stop(
         return block_outcome(_recovered_state_block_message())
 
     exec_runner = exec_runner or CodexExecRunner(paths, session_id)
+    builder_runner = builder_runner or CodexBuilderRunner(paths, session_id)
     test_runner = test_runner or ShellFinalTestRunner(paths, session_id)
+    sleep_fn = sleep_fn or time.sleep
 
     if state.phase == "planning":
-        return _handle_planning_stop(payload, paths, session_id, state, exec_runner)
-    return _handle_implementation_stop(paths, session_id, state, exec_runner, test_runner)
+        return _handle_planning_stop(payload, paths, session_id, state, exec_runner, builder_runner, test_runner, sleep_fn)
+    return _handle_implementation_stop(paths, session_id, state, exec_runner, builder_runner, test_runner, sleep_fn)

@@ -21,4 +21,4 @@ The builder behaves differently by phase:
 - In `implementation`, execute the approved subtasks, run the most relevant tests after each subtask, and only then check the subtask off.
 
 Automated review is performed by a hooks-disabled nested read-only `codex exec`.
-The stop hook records when the workflow is waiting for a reply to the current session plan. The builder then handles that reply at the start of the next turn as described in `BUILDER.md`.
+The stop hook records when the workflow is waiting for a reply to the current session plan. After plan approval, the stop hook itself transitions the session into implementation, launches hooks-disabled nested builder runs against the current session plan, and keeps cycling through final tests and reviewer checks until the reviewer accepts.

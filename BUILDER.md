@@ -17,7 +17,7 @@ At the start of each turn:
 - Ask the user to approve the plan or describe specific revisions.
 - Do not manually update `awaiting_plan_reply`, `last_plan_check`, or `phase`; `scripts/stop_hook.sh` handles all planning state transitions automatically.
 - On the first stop in planning, the hook sets `awaiting_plan_reply` to `true` and ends the turn so the user can respond.
-- On the next stop, the hook classifies the user's reply with `codex exec` (hooks disabled, structured output). If the user approved, the hook transitions to implementation and blocks you to start working immediately. If the user requested changes, the hook blocks you with the revision feedback. Revise the session plan and let the turn end again to re-enter the approval cycle.
+- On the next stop, the hook classifies the user's reply with `codex exec` (hooks disabled, structured output). If the user approved, the hook transitions to implementation and immediately launches a nested hooks-disabled builder run for the approved session plan. If the user requested changes, the hook blocks you with the revision feedback. Revise the session plan and let the turn end again to re-enter the approval cycle.
 
 ## Implementation
 - Read the session plan and work through subtasks in order.
@@ -27,9 +27,10 @@ At the start of each turn:
 - Update the progress log and decision log as work proceeds.
 - If the stop hook reports test failures or reviewer feedback, do NOT rewrite existing subtasks or erase completed checkmarks.
 - Instead, append NEW unchecked follow-up subtasks that address the newly discovered bugs or feedback, then continue implementing those follow-up subtasks.
+- Expect the outer stop hook to relaunch the builder after final-test failures or reviewer revisions. Each nested builder run should resume from the current session plan and current repository state.
 - If independent subtasks do not share files or mutable context, parallelize them with sub agents.
 - If subtasks share files or shared mutable context, do not parallelize them.
 
 ## Strong Rule
 - Do not end the turn before the job is actually complete.
-- If the stop hook blocks completion with feedback, immediately continue with that feedback as the highest-priority work item.
+- The outer stop hook owns the final `scripts/run_tests.sh` and reviewer acceptance loop. Builder turns should stop only after the plan's tracked checkboxes are fully satisfied and current feedback has been incorporated.

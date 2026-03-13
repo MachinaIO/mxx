@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import json
+import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
+from typing import Callable
 
 from codex_workflow.atomic import atomic_write_text
 from codex_workflow.cli import emit_outcome
@@ -17,7 +21,7 @@ from codex_workflow.plan import (
     append_follow_up_subtasks,
     render_session_plan,
 )
-from codex_workflow.runners import FinalTestResult, StructuredExecResult
+from codex_workflow.runners import BuilderExecResult, CodexBuilderRunner, FinalTestResult, StructuredExecResult
 from codex_workflow.state import load_state, save_state, write_current_session_id
 from codex_workflow.transcript import latest_assistant_message_from_transcript, latest_user_message_from_transcript
 
@@ -82,6 +86,31 @@ class FakeTestRunner:
 
     def run(self, label: str) -> FinalTestResult:
         self.calls.append(label)
+        return self.results.pop(0)
+
+
+class FakeBuilderRunner:
+    def __init__(
+        self,
+        *results: BuilderExecResult,
+        progress_messages: list[str] | None = None,
+        on_calls: list[Callable[[], None] | None] | None = None,
+    ) -> None:
+        self.results = list(results)
+        self.progress_messages = list(progress_messages or [])
+        self.on_calls = list(on_calls or [])
+        self.calls: list[tuple[str, str]] = []
+
+    def run(self, prompt: str, label: str) -> BuilderExecResult:
+        self.calls.append((prompt, label))
+        call_index = len(self.calls) - 1
+        if call_index < len(self.progress_messages):
+            sys.stderr.write(self.progress_messages[call_index])
+            sys.stderr.flush()
+        if call_index < len(self.on_calls):
+            callback = self.on_calls[call_index]
+            if callback is not None:
+                callback()
         return self.results.pop(0)
 
 
@@ -184,13 +213,20 @@ class WorkflowHarnessTests(unittest.TestCase):
         self.assertTrue(state.awaiting_plan_reply)
 
     def test_planning_stop_accept_reply_transitions_to_implementation(self) -> None:
-        self.write_plan(session_id="accept-transition", phase="planning")
+        self.write_plan(
+            session_id="accept-transition",
+            phase="planning",
+            ordered_items=[(True, "Approved work already completed.")],
+        )
         state = load_state(self.paths, "accept-transition").state
         state.awaiting_plan_reply = True
         save_state(self.paths, state)
         exec_runner = FakeExecRunner(
-            StructuredExecResult(ok=True, payload={"is_approve": True})
+            StructuredExecResult(ok=True, payload={"is_approve": True}),
+            StructuredExecResult(ok=True, result="accept", msg=None),
         )
+        builder_runner = FakeBuilderRunner(BuilderExecResult(ok=True, summary="builder ok", returncode=0))
+        test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
 
         outcome = handle_stop(
             {
@@ -199,15 +235,20 @@ class WorkflowHarnessTests(unittest.TestCase):
             },
             self.repo_root,
             exec_runner=exec_runner,
+            builder_runner=builder_runner,
+            test_runner=test_runner,
+            sleep_fn=lambda _: None,
         )
 
-        self.assertEqual(outcome.exit_code, 2)
-        self.assertIn("Plan approval recorded", outcome.stderr_message)
+        self.assertEqual(outcome.exit_code, 0)
         state = load_state(self.paths, "accept-transition").state
         self.assertEqual(state.phase, "implementation")
         self.assertFalse(state.awaiting_plan_reply)
         self.assertEqual(state.last_plan_check.result, "accept")
         self.assertIsNotNone(state.last_plan_check.at)
+        self.assertTrue(state.completed)
+        self.assertEqual(len(builder_runner.calls), 1)
+        self.assertEqual(test_runner.calls, ["final-tests"])
 
     def test_planning_stop_revision_reply_stays_in_planning(self) -> None:
         self.write_plan(session_id="revision-reply", phase="planning")
@@ -265,13 +306,20 @@ class WorkflowHarnessTests(unittest.TestCase):
         self.assertEqual(state.last_plan_check.result, "revision")
 
     def test_planning_stop_passes_user_message_in_exec_prompt(self) -> None:
-        self.write_plan(session_id="prompt-check", phase="planning")
+        self.write_plan(
+            session_id="prompt-check",
+            phase="planning",
+            ordered_items=[(True, "Approved work already completed.")],
+        )
         state = load_state(self.paths, "prompt-check").state
         state.awaiting_plan_reply = True
         save_state(self.paths, state)
         exec_runner = FakeExecRunner(
-            StructuredExecResult(ok=True, payload={"is_approve": True})
+            StructuredExecResult(ok=True, payload={"is_approve": True}),
+            StructuredExecResult(ok=True, result="accept", msg=None),
         )
+        builder_runner = FakeBuilderRunner(BuilderExecResult(ok=True, summary="builder ok", returncode=0))
+        test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
 
         handle_stop(
             {
@@ -280,9 +328,12 @@ class WorkflowHarnessTests(unittest.TestCase):
             },
             self.repo_root,
             exec_runner=exec_runner,
+            builder_runner=builder_runner,
+            test_runner=test_runner,
+            sleep_fn=lambda _: None,
         )
 
-        self.assertEqual(len(exec_runner.calls), 1)
+        self.assertEqual(len(exec_runner.calls), 2)
         prompt, schema_path, label = exec_runner.calls[0]
         self.assertIn("Ship it!", prompt)
         self.assertTrue(str(schema_path).endswith("plan-approval.schema.json"))
@@ -311,11 +362,23 @@ class WorkflowHarnessTests(unittest.TestCase):
         state = load_state(self.paths, "no-msg-field").state
         self.assertEqual(state.last_plan_check.msg, "Add more tests please.")
 
-    def test_stop_blocks_implementation_when_ordered_subtask_is_unchecked(self) -> None:
+    def test_stop_relaunches_builder_until_unchecked_ordered_subtask_is_completed(self) -> None:
         self.write_plan(
             session_id="impl-unchecked",
             phase="implementation",
             ordered_items=[(False, "Implement the session start hook.")],
+        )
+        plan_path = self.paths.default_plan_path("impl-unchecked")
+        builder_runner = FakeBuilderRunner(
+            BuilderExecResult(ok=True, summary="builder pass 1", returncode=0),
+            BuilderExecResult(ok=True, summary="builder pass 2", returncode=0),
+            on_calls=[
+                None,
+                lambda: atomic_write_text(
+                    plan_path,
+                    build_plan_text("impl-unchecked", ordered_items=[(True, "Implement the session start hook.")]),
+                ),
+            ],
         )
         test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
         exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="accept", msg=None))
@@ -324,82 +387,137 @@ class WorkflowHarnessTests(unittest.TestCase):
             {"session_id": "impl-unchecked"},
             self.repo_root,
             exec_runner=exec_runner,
+            builder_runner=builder_runner,
             test_runner=test_runner,
+            sleep_fn=lambda _: None,
         )
 
-        self.assertEqual(outcome.exit_code, 2)
-        self.assertIn("Implementation is not complete", outcome.stderr_message)
-        self.assertEqual(test_runner.calls, [])
-        self.assertEqual(exec_runner.calls, [])
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertEqual(len(builder_runner.calls), 2)
+        self.assertEqual(test_runner.calls, ["final-tests"])
+        self.assertEqual(len(exec_runner.calls), 1)
 
-    def test_stop_requires_all_follow_up_checkboxes_to_be_checked_before_final_tests(self) -> None:
+    def test_stop_relaunches_builder_until_follow_up_checkbox_is_completed(self) -> None:
         self.write_plan(
             session_id="impl-follow-up-open",
             phase="implementation",
             ordered_items=[(True, "Done ordered work.")],
             follow_up_items=[(False, "Fix the reviewer-reported edge case.")],
         )
+        plan_path = self.paths.default_plan_path("impl-follow-up-open")
+        builder_runner = FakeBuilderRunner(
+            BuilderExecResult(ok=True, summary="builder pass 1", returncode=0),
+            BuilderExecResult(ok=True, summary="builder pass 2", returncode=0),
+            on_calls=[
+                None,
+                lambda: atomic_write_text(
+                    plan_path,
+                    build_plan_text(
+                        "impl-follow-up-open",
+                        ordered_items=[(True, "Done ordered work.")],
+                        follow_up_items=[(True, "Fix the reviewer-reported edge case.")],
+                    ),
+                ),
+            ],
+        )
         test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
+        exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="accept", msg=None))
 
         outcome = handle_stop(
             {"session_id": "impl-follow-up-open"},
             self.repo_root,
-            exec_runner=FakeExecRunner(),
+            exec_runner=exec_runner,
+            builder_runner=builder_runner,
             test_runner=test_runner,
+            sleep_fn=lambda _: None,
         )
 
-        self.assertEqual(outcome.exit_code, 2)
-        self.assertEqual(test_runner.calls, [])
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertEqual(len(builder_runner.calls), 2)
+        self.assertEqual(test_runner.calls, ["final-tests"])
 
-    def test_test_failure_appends_new_follow_up_subtask(self) -> None:
+    def test_test_failure_appends_follow_up_and_relaunches_builder(self) -> None:
         plan_path = self.write_plan(
             session_id="tests-fail",
             phase="implementation",
             ordered_items=[(True, "Implement everything.")],
         )
-        test_runner = FakeTestRunner(
-            FinalTestResult(ok=False, summary="workflow unit tests failed", returncode=1)
+        expected_follow_up = "Fix the failing final validation from `scripts/run_tests.sh`: workflow unit tests failed"
+        builder_runner = FakeBuilderRunner(
+            BuilderExecResult(ok=True, summary="builder pass 1", returncode=0),
+            BuilderExecResult(ok=True, summary="builder pass 2", returncode=0),
+            on_calls=[
+                None,
+                lambda: atomic_write_text(
+                    plan_path,
+                    plan_path.read_text(encoding="utf-8").replace(f"- [ ] {expected_follow_up}", f"- [x] {expected_follow_up}"),
+                ),
+            ],
         )
-        exec_runner = FakeExecRunner()
+        test_runner = FakeTestRunner(
+            FinalTestResult(ok=False, summary="workflow unit tests failed", returncode=1),
+            FinalTestResult(ok=True, summary="ok", returncode=0),
+        )
+        exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="accept", msg=None))
 
         outcome = handle_stop(
             {"session_id": "tests-fail"},
             self.repo_root,
             exec_runner=exec_runner,
+            builder_runner=builder_runner,
             test_runner=test_runner,
+            sleep_fn=lambda _: None,
         )
 
-        self.assertEqual(outcome.exit_code, 2)
-        self.assertIn("Final tests failed", outcome.stderr_message)
-        self.assertEqual(exec_runner.calls, [])
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertEqual(len(builder_runner.calls), 2)
+        self.assertEqual(exec_runner.calls[0][2], "final-review")
         plan_text = plan_path.read_text(encoding="utf-8")
         self.assertIn("Fix the failing final validation from `scripts/run_tests.sh`", plan_text)
         self.assertIn("- [x] Implement everything.", plan_text)
 
-    def test_reviewer_revision_appends_new_follow_up_subtask(self) -> None:
+    def test_reviewer_revision_appends_follow_up_and_relaunches_builder(self) -> None:
         plan_path = self.write_plan(
             session_id="review-revision",
             phase="implementation",
             ordered_items=[(True, "Implement everything.")],
         )
-        test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
+        expected_follow_up = "Address reviewer feedback from the final read-only Codex review: Handle the malformed state path."
+        builder_runner = FakeBuilderRunner(
+            BuilderExecResult(ok=True, summary="builder pass 1", returncode=0),
+            BuilderExecResult(ok=True, summary="builder pass 2", returncode=0),
+            on_calls=[
+                None,
+                lambda: atomic_write_text(
+                    plan_path,
+                    plan_path.read_text(encoding="utf-8").replace(f"- [ ] {expected_follow_up}", f"- [x] {expected_follow_up}"),
+                ),
+            ],
+        )
+        test_runner = FakeTestRunner(
+            FinalTestResult(ok=True, summary="ok", returncode=0),
+            FinalTestResult(ok=True, summary="ok", returncode=0),
+        )
         exec_runner = FakeExecRunner(
-            StructuredExecResult(ok=True, result="revision", msg="Handle the malformed state path.")
+            StructuredExecResult(ok=True, result="revision", msg="Handle the malformed state path."),
+            StructuredExecResult(ok=True, result="accept", msg=None),
         )
 
         outcome = handle_stop(
             {"session_id": "review-revision"},
             self.repo_root,
             exec_runner=exec_runner,
+            builder_runner=builder_runner,
             test_runner=test_runner,
+            sleep_fn=lambda _: None,
         )
 
-        self.assertEqual(outcome.exit_code, 2)
-        self.assertIn("Reviewer requested changes", outcome.stderr_message)
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertEqual(len(builder_runner.calls), 2)
         plan_text = plan_path.read_text(encoding="utf-8")
         self.assertIn("Address reviewer feedback from the final read-only Codex review", plan_text)
         state = load_state(self.paths, "review-revision").state
-        self.assertEqual(state.last_review.result, "revision")
+        self.assertEqual(state.last_review.result, "accept")
 
     def test_reviewer_accept_completes_the_session(self) -> None:
         self.write_plan(
@@ -407,6 +525,7 @@ class WorkflowHarnessTests(unittest.TestCase):
             phase="implementation",
             ordered_items=[(True, "Implement everything.")],
         )
+        builder_runner = FakeBuilderRunner(BuilderExecResult(ok=True, summary="builder ok", returncode=0))
         test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
         exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="accept", msg=None))
 
@@ -414,7 +533,9 @@ class WorkflowHarnessTests(unittest.TestCase):
             {"session_id": "review-accept"},
             self.repo_root,
             exec_runner=exec_runner,
+            builder_runner=builder_runner,
             test_runner=test_runner,
+            sleep_fn=lambda _: None,
         )
 
         self.assertEqual(outcome.exit_code, 0)
@@ -429,6 +550,131 @@ class WorkflowHarnessTests(unittest.TestCase):
         self.assertTrue(state.completed)
         self.assertEqual(state.final_status, "approved")
         self.assertEqual(state.last_review.result, "accept")
+
+    def test_builder_progress_is_streamed_to_stderr_only(self) -> None:
+        self.write_plan(
+            session_id="stderr-progress",
+            phase="implementation",
+            ordered_items=[(True, "Implement everything.")],
+        )
+        stderr_buffer = io.StringIO()
+        builder_runner = FakeBuilderRunner(
+            BuilderExecResult(ok=True, summary="builder ok", returncode=0),
+            progress_messages=["builder progress line\n"],
+        )
+        test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
+        exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="accept", msg=None))
+
+        with contextlib.redirect_stderr(stderr_buffer):
+            outcome = handle_stop(
+                {"session_id": "stderr-progress"},
+                self.repo_root,
+                exec_runner=exec_runner,
+                builder_runner=builder_runner,
+                test_runner=test_runner,
+                sleep_fn=lambda _: None,
+            )
+
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertIn("builder progress line", stderr_buffer.getvalue())
+        self.assertEqual(
+            outcome.stdout_payload,
+            {
+                "continue": False,
+                "stopReason": "All subtasks are complete, final tests passed, and reviewer approved.",
+            },
+        )
+
+    def test_builder_infra_failure_retries_with_backoff(self) -> None:
+        self.write_plan(
+            session_id="builder-retry",
+            phase="implementation",
+            ordered_items=[(True, "Implement everything.")],
+        )
+        sleep_calls: list[float] = []
+        builder_runner = FakeBuilderRunner(
+            BuilderExecResult(ok=False, summary="temporary builder failure", returncode=1),
+            BuilderExecResult(ok=True, summary="builder ok", returncode=0),
+        )
+        test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
+        exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="accept", msg=None))
+
+        outcome = handle_stop(
+            {"session_id": "builder-retry"},
+            self.repo_root,
+            exec_runner=exec_runner,
+            builder_runner=builder_runner,
+            test_runner=test_runner,
+            sleep_fn=sleep_calls.append,
+        )
+
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertEqual(sleep_calls, [1.0])
+        self.assertEqual(len(builder_runner.calls), 2)
+
+    def test_reviewer_infra_failure_retries_with_backoff(self) -> None:
+        self.write_plan(
+            session_id="review-retry",
+            phase="implementation",
+            ordered_items=[(True, "Implement everything.")],
+        )
+        sleep_calls: list[float] = []
+        builder_runner = FakeBuilderRunner(BuilderExecResult(ok=True, summary="builder ok", returncode=0))
+        test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
+        exec_runner = FakeExecRunner(
+            StructuredExecResult(ok=False, error="review infra failure"),
+            StructuredExecResult(ok=True, result="accept", msg=None),
+        )
+
+        outcome = handle_stop(
+            {"session_id": "review-retry"},
+            self.repo_root,
+            exec_runner=exec_runner,
+            builder_runner=builder_runner,
+            test_runner=test_runner,
+            sleep_fn=sleep_calls.append,
+        )
+
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertEqual(sleep_calls, [1.0])
+        self.assertEqual(len(exec_runner.calls), 2)
+
+    def test_codex_builder_runner_resumes_same_thread_after_first_run(self) -> None:
+        runner = CodexBuilderRunner(self.paths, "builder-runner", progress_stream=io.StringIO())
+        commands: list[list[str]] = []
+
+        def fake_run_streaming_subprocess(
+            command: list[str],
+            cwd: Path,
+            stdout_path: Path,
+            stderr_path: Path,
+            mirror_stream: io.StringIO | None = None,
+            stdout_line_handler: Callable[[str], None] | None = None,
+            stderr_line_handler: Callable[[str], None] | None = None,
+        ) -> int:
+            commands.append(command)
+            event = '{"type":"thread.started","thread_id":"thread-123"}\n'
+            stdout_path.write_text(event, encoding="utf-8")
+            stderr_path.write_text("builder stderr\n", encoding="utf-8")
+            if stdout_line_handler is not None:
+                stdout_line_handler(event)
+            return 0
+
+        with mock.patch("codex_workflow.runners._run_streaming_subprocess", side_effect=fake_run_streaming_subprocess):
+            first = runner.run(prompt="first prompt", label="first")
+            second = runner.run(prompt="second prompt", label="second")
+
+        self.assertEqual(first.thread_id, "thread-123")
+        self.assertEqual(second.thread_id, "thread-123")
+        self.assertEqual(
+            commands[0][:8],
+            ["codex", "exec", "--skip-git-repo-check", "--sandbox", "workspace-write", "--disable", "codex_hooks", "--json"],
+        )
+        self.assertNotIn("resume", commands[0])
+        self.assertEqual(commands[1][:3], ["codex", "exec", "resume"])
+        self.assertIn("--sandbox", commands[1])
+        self.assertIn("workspace-write", commands[1])
+        self.assertIn("thread-123", commands[1])
 
     def test_stop_recovers_missing_state_file_defensively(self) -> None:
         write_current_session_id(self.paths, "missing-state")

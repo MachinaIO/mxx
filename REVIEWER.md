@@ -6,6 +6,7 @@ This document applies to every Codex reviewer run in this repository, including 
 
 The reviewer evaluates the current builder result in read-only mode.
 The reviewer does not edit tracked files, does not update session state directly, does not check or uncheck plan items, and does not manage workflow transitions directly.
+The stop hook may invoke the implementation reviewer multiple times in one outer completion loop; each review must be independent and based only on current observable evidence.
 
 At the start of every review, reset reviewer posture completely.
 Review the current work as if it were authored by another party, and do not trust builder claims, summaries, or plan updates without checking the scoped evidence.

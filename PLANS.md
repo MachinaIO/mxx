@@ -32,7 +32,7 @@ This repository uses a self-contained plan style for long-running Codex work. Ea
 - Session-specific plans are living documents and must be updated throughout the task.
 - Completed subtasks must remain preserved as historical record. If tests fail or review finds problems later, add NEW follow-up subtasks instead of rewriting prior completed work.
 - Completed checkboxes must never be rewritten back into unchecked boxes.
-- The stop hook only runs final tests and reviewer checks after mechanically verifying that every tracked checkbox in the required subtask sections is already checked.
+- The stop hook launches hooks-disabled nested builder runs to drive implementation from the current session plan. It only runs final tests and reviewer checks after mechanically verifying that every tracked checkbox in the required subtask sections is already checked.
 - Acceptance criteria must describe observable behavior, not only internal code structure.
 - Per-subtask and final validation entries must name the exact command that was run and enough result detail to distinguish success from failure.
 - When work spans multiple files or subsystems, the plan should briefly orient the reader by naming the affected paths and how they fit together.
@@ -67,7 +67,7 @@ Describe the concrete user-visible outcome for this session.
 - Record the most relevant validation command and result immediately after each completed subtask.
 
 ## Final validation
-- Record the final test and review gate here.
+- Record the final nested-builder completion, final test gate, and repeated review gate here.
 
 ## Decision log
 - Append important decisions with timestamps.
@@ -81,3 +81,4 @@ Describe the concrete user-visible outcome for this session.
 - If tests fail or review finds problems after some tasks were completed, add NEW unchecked items under `## Follow-up subtasks (append-only)`.
 - Do not rewrite or delete completed historical subtasks.
 - Do not remove prior reviewer or validation obligations from the plan. Add new unchecked follow-up items instead.
+- Assume the stop hook may invoke the builder and reviewer multiple times in one completion cycle; keep the plan accurate enough that either nested run can resume from the file alone.

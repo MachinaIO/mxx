@@ -27,12 +27,11 @@ At the start of each turn:
 - Update the per-subtask validation, progress log, and decision log as work proceeds.
 - If final tests or reviewer feedback create new obligations, do NOT rewrite existing subtasks or erase completed checkmarks.
 - Instead, append NEW unchecked follow-up subtasks under `## Follow-up subtasks (append-only)` and continue implementing those follow-up subtasks.
-- Expect the outer stop hook to relaunch the builder only when the approved session plan still has unchecked work or when final-test failures / reviewer revisions append new follow-up tasks. If all tracked checkboxes are already checked and the final gates pass, the stop hook may accept without another nested builder run.
-- When the stop hook resumes nested builder work after a failed final test or review, it uses the current session id with hooks disabled.
+- Expect the outer stop hook to block the current turn when the approved session plan still has unchecked work or when final-test failures / reviewer revisions append new follow-up tasks. If all tracked checkboxes are already checked and the final gates pass, the stop hook may accept.
 - If independent subtasks do not share files or mutable context, parallelize them with sub agents.
 - If subtasks share files or shared mutable context, do not parallelize them.
 
 ## Strong Rule
 - Do not end the turn before the job is actually complete.
 - In planning, complete the turn only after the plan has been updated and the user has been asked for approval or revisions.
-- In implementation, the outer stop hook owns the final `scripts/run_tests.sh` and reviewer acceptance loop. Builder turns should stop only after the plan's tracked checkboxes are fully satisfied and current feedback has been incorporated; the stop hook only relaunches a nested builder if those gates reveal remaining work.
+- In implementation, the outer stop hook owns the final `scripts/run_tests.sh` and reviewer acceptance loop. Builder turns should stop only after the plan's tracked checkboxes are fully satisfied and current feedback has been incorporated; if those gates reveal remaining work, the stop hook blocks the turn so the same session can continue addressing it.

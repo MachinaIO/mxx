@@ -24,4 +24,4 @@ The builder behaves differently by plan approval status:
 
 Automated review is performed by a hooks-disabled nested read-only `codex exec`.
 During planning, the stop hook does no workflow work beyond allowing the stop.
-After the plan is marked `approved`, the stop hook reevaluates the current session plan on each stop. It launches hooks-disabled nested builder runs only when unchecked implementation work remains or when final tests / reviewer feedback append new follow-up tasks. If all tracked checkboxes are already checked and the final tests plus reviewer both pass, the stop hook accepts without launching another nested builder pass.
+After the plan is marked `approved`, the stop hook reevaluates the current session plan on each stop. If unchecked implementation work remains, or if final tests / reviewer feedback append new follow-up tasks, it blocks the current turn with an actionable resume message. If all tracked checkboxes are already checked and the final tests plus reviewer both pass, the stop hook accepts.

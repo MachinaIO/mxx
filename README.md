@@ -8,6 +8,10 @@ Applications of `mxx` include:
 ### Prerequisites
 - [OpenFHE](https://openfhe-development.readthedocs.io/en/latest/sphinx_rsts/intro/installation/installation.html) (System install required in `usr/local/lib`), make sure to install our [fork](https://github.com/MachinaIO/openfhe-development/tree/feat/improve_determinant) in `feat/improve_determinant` branch
 
+### Codex Workflow Note
+
+To use the repository-local stop hook workflow, build Codex from source at commit `9a44a7e499f18eaed5d06aabb5acf9184deb06b8` or any newer commit in the Codex repository.
+
 ## Overview
 
 ### Matrix Element

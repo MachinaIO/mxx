@@ -19,9 +19,6 @@ from .plan import (
     render_session_plan,
 )
 from .runners import (
-    BuilderExecRunner,
-    BuilderExecResult,
-    CodexBuilderRunner,
     CodexExecRunner,
     FinalTestRunner,
     ShellFinalTestRunner,
@@ -188,25 +185,6 @@ def _build_session_start_prompt(initial_user_message: str) -> str:
     )
 
 
-def _build_builder_prompt(session_id: str, plan_display_path: str, reason: str | None) -> str:
-    prompt = (
-        "You are the builder for the current Codex workflow session.\n"
-        f"Session id: {session_id}.\n"
-        f"Read `BUILDER.md` and `{plan_display_path}` before acting.\n"
-        "Use the explicit session id in this prompt; do not infer it from repository-local pointer files.\n"
-        "Treat the session plan as the only source of task scope and completion criteria.\n"
-        "Work through unchecked subtasks in order.\n"
-        "After each completed subtask, run the most relevant tests immediately and only then check it off.\n"
-        "Update the session plan's per-subtask validation, decision log, and progress log as you work.\n"
-        "If final tests or reviewer feedback create new obligations, append NEW unchecked items under "
-        f"`{FOLLOW_UP_SUBTASKS_HEADING}` instead of rewriting completed history.\n"
-        "Stop only when every tracked checkbox in the required subtask sections is checked.\n"
-    )
-    if reason:
-        prompt += f"\nImmediate priority from the outer stop hook: {reason}\n"
-    return prompt
-
-
 def _build_review_prompt(session_id: str, plan_display_path: str) -> str:
     return (
         "You are a read-only reviewer.\n"
@@ -216,27 +194,6 @@ def _build_review_prompt(session_id: str, plan_display_path: str) -> str:
         "If acceptable, output result=accept.\n"
         "Otherwise output result=revision and msg=<concrete problems and required fixes>.\n"
     )
-
-
-def _run_builder_with_retry(
-    builder_runner: BuilderExecRunner,
-    prompt: str,
-    label: str,
-    sleep_fn: Callable[[float], None],
-) -> BuilderExecResult:
-    for attempt in range(1, MAX_INFRA_RETRY_ATTEMPTS + 1):
-        result = builder_runner.run(prompt=prompt, label=label)
-        if result.ok:
-            return result
-        if attempt == MAX_INFRA_RETRY_ATTEMPTS:
-            _raise_retry_limit_exceeded("builder", result.summary)
-        _log_progress(
-            "[stop hook] Nested builder failed. "
-            f"Attempt {attempt}/{MAX_INFRA_RETRY_ATTEMPTS}. "
-            f"Retrying in {RETRY_DELAY_SECONDS:.1f}s. Summary: {result.summary}"
-        )
-        sleep_fn(RETRY_DELAY_SECONDS)
-    _raise_retry_limit_exceeded("builder", "Retry loop exited unexpectedly.")
 
 
 def _run_review_with_retry(
@@ -289,7 +246,7 @@ def _evaluate_implementation_once(
     analysis = analyze_plan(plan_path.read_text(encoding="utf-8"))
     if analysis.missing_sections or analysis.invalid_sections or analysis.empty_sections:
         return ImplementationCheckResult(
-            status="builder",
+            status="blocked",
             message=_missing_plan_structure_message(
                 analysis.missing_sections,
                 analysis.invalid_sections,
@@ -299,7 +256,7 @@ def _evaluate_implementation_once(
 
     if not analysis.is_approved:
         return ImplementationCheckResult(
-            status="builder",
+            status="blocked",
             message=(
                 "The session plan is still unapproved. Continue the planning interview and do not start implementation "
                 "until the plan approval flag is `approved`."
@@ -310,7 +267,7 @@ def _evaluate_implementation_once(
         next_item = analysis.first_unchecked
         detail = f" Next unchecked subtask: {next_item.text}" if next_item else ""
         return ImplementationCheckResult(
-            status="builder",
+            status="blocked",
             message=(
                 "Implementation is not complete. Continue with the next unchecked subtask and keep the plan document updated."
                 + detail
@@ -332,7 +289,7 @@ def _evaluate_implementation_once(
             follow_up_items = _make_test_follow_ups(test_result.summary)
             append_follow_up_subtasks_file(plan_path, follow_up_items)
             return ImplementationCheckResult(
-                status="builder",
+                status="blocked",
                 message=(
                     "Final tests failed. New follow-up subtasks were appended to the session plan. "
                     f"Address them first. Failure summary: {test_result.summary}"
@@ -351,7 +308,7 @@ def _evaluate_implementation_once(
             _make_review_follow_ups(review_result.msg or "Reviewer requested changes."),
         )
         return ImplementationCheckResult(
-            status="builder",
+            status="blocked",
             message=(
                 "Reviewer requested changes. New follow-up subtasks were appended to the session plan. "
                 f"Address them first. Reviewer feedback: {review_result.msg or 'No review message was provided.'}"
@@ -374,44 +331,27 @@ def _run_implementation_loop(
     plan_path: Path,
     plan_display_path: str,
     exec_runner: StructuredExecRunner,
-    builder_runner: BuilderExecRunner,
     test_runner: FinalTestRunner,
     sleep_fn: Callable[[float], None],
     edited_paths_provider: Callable[[Path], list[str] | None],
 ) -> HookOutcome:
-    builder_reason = "Complete the remaining unchecked work in the session plan."
-    attempt = 0
-    while True:
-        try:
-            check_result = _evaluate_implementation_once(
-                paths=paths,
-                session_id=session_id,
-                plan_path=plan_path,
-                plan_display_path=plan_display_path,
-                exec_runner=exec_runner,
-                test_runner=test_runner,
-                sleep_fn=sleep_fn,
-                edited_paths_provider=edited_paths_provider,
-            )
-        except RetryLimitExceeded as exc:
-            return block_outcome(str(exc))
-        if check_result.status == "accepted":
-            return stop_outcome(check_result.message)
-        builder_reason = check_result.message
-        _log_progress(f"[stop hook] Additional implementation required. {builder_reason}")
-
-        attempt += 1
-        _log_progress(f"[stop hook] Launching nested builder attempt {attempt} for session {session_id}.")
-        try:
-            _run_builder_with_retry(
-                builder_runner=builder_runner,
-                prompt=_build_builder_prompt(session_id, plan_display_path, builder_reason),
-                label=f"builder-attempt-{attempt}",
-                sleep_fn=sleep_fn,
-            )
-        except RetryLimitExceeded as exc:
-            return block_outcome(str(exc))
-        _log_progress(f"[stop hook] Nested builder attempt {attempt} finished. Reevaluating completion gate.")
+    try:
+        check_result = _evaluate_implementation_once(
+            paths=paths,
+            session_id=session_id,
+            plan_path=plan_path,
+            plan_display_path=plan_display_path,
+            exec_runner=exec_runner,
+            test_runner=test_runner,
+            sleep_fn=sleep_fn,
+            edited_paths_provider=edited_paths_provider,
+        )
+    except RetryLimitExceeded as exc:
+        return block_outcome(str(exc))
+    if check_result.status == "accepted":
+        return stop_outcome(check_result.message)
+    _log_progress(f"[stop hook] Additional implementation required. {check_result.message}")
+    return block_outcome(check_result.message)
 
 
 def handle_session_start(
@@ -452,7 +392,6 @@ def handle_stop(
     payload: dict[str, Any],
     repo_root: Path,
     exec_runner: StructuredExecRunner | None = None,
-    builder_runner: BuilderExecRunner | None = None,
     test_runner: FinalTestRunner | None = None,
     sleep_fn: Callable[[float], None] | None = None,
     edited_paths_provider: Callable[[Path], list[str] | None] | None = None,
@@ -480,7 +419,6 @@ def handle_stop(
         )
 
     exec_runner = exec_runner or CodexExecRunner(paths, session_id)
-    builder_runner = builder_runner or CodexBuilderRunner(paths, session_id)
     test_runner = test_runner or ShellFinalTestRunner(paths, session_id)
     sleep_fn = sleep_fn or time.sleep
     edited_paths_provider = edited_paths_provider or _default_edited_paths_provider
@@ -490,7 +428,6 @@ def handle_stop(
         plan_path=plan_path,
         plan_display_path=plan_display_path,
         exec_runner=exec_runner,
-        builder_runner=builder_runner,
         test_runner=test_runner,
         sleep_fn=sleep_fn,
         edited_paths_provider=edited_paths_provider,

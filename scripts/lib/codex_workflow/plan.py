@@ -85,7 +85,7 @@ Describe the concrete user-visible outcome for this session.
 ## Acceptance criteria
 - The workflow harness uses repository-local Codex hooks.
 - Planning transitions to implementation only after plan approval.
-- Final completion requires the stop hook to drive hooks-disabled nested builder runs until all tracked checkboxes are checked, final tests pass, and the reviewer approves.
+- Final completion requires the stop hook to block with actionable resume messages until all tracked checkboxes are checked, final tests pass, and the reviewer approves.
 
 {ORDERED_SUBTASKS_HEADING}
 - [ ] Replace this placeholder with the first approved implementation subtask.
@@ -97,7 +97,7 @@ Describe the concrete user-visible outcome for this session.
 - Record the test command and result immediately after each completed subtask.
 
 ## Final validation
-- Hooks-disabled nested builder `codex exec` completed with all tracked plan checkboxes checked
+- Stop hook blocked with actionable resume messages until all tracked plan checkboxes were checked
 - `scripts/run_tests.sh`
 - Hooks-disabled read-only reviewer via `codex exec` until acceptance
 

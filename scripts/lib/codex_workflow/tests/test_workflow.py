@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from codex_workflow.atomic import atomic_write_text
 from codex_workflow.cli import emit_outcome
@@ -18,7 +19,7 @@ from codex_workflow.plan import (
     append_follow_up_subtasks,
     render_session_plan,
 )
-from codex_workflow.runners import FinalTestResult, StructuredExecResult
+from codex_workflow.runners import FinalTestResult, ShellFinalTestRunner, StructuredExecResult
 from codex_workflow.transcript import (
     initial_user_message_from_transcript,
     latest_assistant_message_from_transcript,
@@ -86,10 +87,10 @@ class FakeExecRunner:
 class FakeTestRunner:
     def __init__(self, *results: FinalTestResult) -> None:
         self.results = list(results)
-        self.calls: list[str] = []
+        self.calls: list[tuple[str, bool, bool]] = []
 
-    def run(self, label: str) -> FinalTestResult:
-        self.calls.append(label)
+    def run(self, label: str, *, run_python: bool = True, run_rust: bool = True) -> FinalTestResult:
+        self.calls.append((label, run_python, run_rust))
         return self.results.pop(0)
 
 
@@ -418,7 +419,7 @@ class WorkflowHarnessTests(unittest.TestCase):
                 "stopReason": "All subtasks are complete, final tests passed, and reviewer approved.",
             },
         )
-        self.assertEqual(test_runner.calls, ["final-tests"])
+        self.assertEqual(test_runner.calls, [("final-tests", True, True)])
         self.assertEqual(len(exec_runner.calls), 1)
 
     def test_stop_blocks_when_unchecked_ordered_subtask_remains(self) -> None:
@@ -493,7 +494,7 @@ class WorkflowHarnessTests(unittest.TestCase):
         plan_text = plan_path.read_text(encoding="utf-8")
         self.assertIn("Fix the failing final validation from `scripts/run_tests.sh`", plan_text)
         self.assertIn("- [x] Implement everything.", plan_text)
-        self.assertEqual(test_runner.calls, ["final-tests"])
+        self.assertEqual(test_runner.calls, [("final-tests", True, True)])
 
     def test_reviewer_revision_appends_follow_up_and_blocks(self) -> None:
         plan_path = self.write_plan(
@@ -537,7 +538,7 @@ class WorkflowHarnessTests(unittest.TestCase):
         )
 
         self.assertEqual(outcome.exit_code, 0)
-        self.assertEqual(test_runner.calls, ["final-tests"])
+        self.assertEqual(test_runner.calls, [("final-tests", True, True)])
         self.assertEqual(len(exec_runner.calls), 1)
         self.assertFalse(self.paths.active_plan_path("precheck-complete").exists())
         self.assertTrue(self.paths.completed_plan_path("precheck-complete").exists())
@@ -625,7 +626,7 @@ class WorkflowHarnessTests(unittest.TestCase):
         self.assertEqual(test_runner.calls, [])
         self.assertEqual(exec_runner.calls, [])
 
-    def test_complete_plan_skips_final_tests_for_non_rust_non_cuda_changes(self) -> None:
+    def test_complete_plan_skips_final_tests_for_non_python_non_rust_non_cuda_changes(self) -> None:
         self.write_plan(
             session_id="docs-only-changes",
             ordered_items=[(True, "Implement everything.")],
@@ -648,7 +649,7 @@ class WorkflowHarnessTests(unittest.TestCase):
             outcome.stdout_payload,
             {
                 "continue": False,
-                "stopReason": "All subtasks are complete, final tests were skipped because no Rust, Cargo.toml, or cuda/ files changed, and reviewer approved.",
+                "stopReason": "All subtasks are complete, final tests were skipped because no Python, Rust, Cargo.toml, or cuda/ files changed, and reviewer approved.",
             },
         )
         self.assertEqual(test_runner.calls, [])
@@ -673,7 +674,7 @@ class WorkflowHarnessTests(unittest.TestCase):
         )
 
         self.assertEqual(outcome.exit_code, 0)
-        self.assertEqual(test_runner.calls, ["final-tests"])
+        self.assertEqual(test_runner.calls, [("final-tests", False, True)])
         self.assertEqual(len(exec_runner.calls), 1)
 
     def test_complete_plan_runs_final_tests_when_rust_file_changed(self) -> None:
@@ -695,8 +696,82 @@ class WorkflowHarnessTests(unittest.TestCase):
         )
 
         self.assertEqual(outcome.exit_code, 0)
-        self.assertEqual(test_runner.calls, ["final-tests"])
+        self.assertEqual(test_runner.calls, [("final-tests", False, True)])
         self.assertEqual(len(exec_runner.calls), 1)
+
+    def test_complete_plan_runs_only_python_tests_when_python_file_changed(self) -> None:
+        self.write_plan(
+            session_id="python-change",
+            ordered_items=[(True, "Implement everything.")],
+            approval_status="approved",
+        )
+        test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
+        exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="accept", msg=None))
+
+        outcome = handle_stop(
+            {"session_id": "python-change"},
+            self.repo_root,
+            exec_runner=exec_runner,
+            test_runner=test_runner,
+            sleep_fn=lambda _: None,
+            edited_paths_provider=lambda _: ["scripts/lib/codex_workflow/hooks.py"],
+        )
+
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertEqual(test_runner.calls, [("final-tests", True, False)])
+        self.assertEqual(len(exec_runner.calls), 1)
+
+    def test_complete_plan_runs_python_and_rust_tests_for_mixed_changes(self) -> None:
+        self.write_plan(
+            session_id="mixed-change",
+            ordered_items=[(True, "Implement everything.")],
+            approval_status="approved",
+        )
+        test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
+        exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="accept", msg=None))
+
+        outcome = handle_stop(
+            {"session_id": "mixed-change"},
+            self.repo_root,
+            exec_runner=exec_runner,
+            test_runner=test_runner,
+            sleep_fn=lambda _: None,
+            edited_paths_provider=lambda _: ["scripts/lib/codex_workflow/hooks.py", "src/lib.rs"],
+        )
+
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertEqual(test_runner.calls, [("final-tests", True, True)])
+        self.assertEqual(len(exec_runner.calls), 1)
+
+    def test_shell_final_test_runner_uses_python_only_flag(self) -> None:
+        runner = ShellFinalTestRunner(self.paths, "python-only")
+        with mock.patch("codex_workflow.runners.subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 0
+
+            runner.run(label="final-tests", run_python=True, run_rust=False)
+
+        command = run_mock.call_args.args[0]
+        self.assertEqual(command, [str(self.paths.scripts_dir / "run_tests.sh"), "--python"])
+
+    def test_shell_final_test_runner_uses_rust_only_flag(self) -> None:
+        runner = ShellFinalTestRunner(self.paths, "rust-only")
+        with mock.patch("codex_workflow.runners.subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 0
+
+            runner.run(label="final-tests", run_python=False, run_rust=True)
+
+        command = run_mock.call_args.args[0]
+        self.assertEqual(command, [str(self.paths.scripts_dir / "run_tests.sh"), "--rust"])
+
+    def test_shell_final_test_runner_uses_default_command_for_mixed_selection(self) -> None:
+        runner = ShellFinalTestRunner(self.paths, "mixed")
+        with mock.patch("codex_workflow.runners.subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 0
+
+            runner.run(label="final-tests", run_python=True, run_rust=True)
+
+        command = run_mock.call_args.args[0]
+        self.assertEqual(command, [str(self.paths.scripts_dir / "run_tests.sh")])
 
     def test_reviewer_infra_failure_retries_with_backoff(self) -> None:
         self.write_plan(

@@ -168,6 +168,16 @@ class ImplementationCheckResult:
     message: str
 
 
+@dataclass(frozen=True)
+class FinalTestSelection:
+    run_python: bool
+    run_rust: bool
+
+    @property
+    def requires_any(self) -> bool:
+        return self.run_python or self.run_rust
+
+
 def _default_edited_paths_provider(repo_root: Path) -> list[str] | None:
     try:
         return edited_paths_from_git(repo_root)
@@ -175,16 +185,20 @@ def _default_edited_paths_provider(repo_root: Path) -> list[str] | None:
         return None
 
 
-def _requires_final_tests(edited_paths: list[str]) -> bool:
+def _select_final_tests(edited_paths: list[str]) -> FinalTestSelection:
+    run_python = False
+    run_rust = False
     for path in edited_paths:
         normalized = PurePosixPath(path)
+        if normalized.suffix == ".py":
+            run_python = True
         if normalized.name == "Cargo.toml":
-            return True
+            run_rust = True
         if normalized.suffix == ".rs":
-            return True
+            run_rust = True
         if normalized.parts and normalized.parts[0] == "cuda":
-            return True
-    return False
+            run_rust = True
+    return FinalTestSelection(run_python=run_python, run_rust=run_rust)
 
 
 def _build_session_start_prompt(initial_user_message: str) -> str:
@@ -298,9 +312,18 @@ def _evaluate_implementation_once(
         )
 
     tests_were_run = False
-    if edited_paths is None or _requires_final_tests(edited_paths):
+    test_selection = (
+        FinalTestSelection(run_python=True, run_rust=True)
+        if edited_paths is None
+        else _select_final_tests(edited_paths)
+    )
+    if test_selection.requires_any:
         tests_were_run = True
-        test_result = test_runner.run(label="final-tests")
+        test_result = test_runner.run(
+            label="final-tests",
+            run_python=test_selection.run_python,
+            run_rust=test_selection.run_rust,
+        )
         if not test_result.ok:
             follow_up_items = _make_test_follow_ups(test_result.summary)
             append_follow_up_subtasks_file(plan_path, follow_up_items)
@@ -336,7 +359,7 @@ def _evaluate_implementation_once(
         message=(
             "All subtasks are complete, final tests passed, and reviewer approved."
             if tests_were_run
-            else "All subtasks are complete, final tests were skipped because no Rust, Cargo.toml, or cuda/ files changed, and reviewer approved."
+            else "All subtasks are complete, final tests were skipped because no Python, Rust, Cargo.toml, or cuda/ files changed, and reviewer approved."
         ),
     )
 

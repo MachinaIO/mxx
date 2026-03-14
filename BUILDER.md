@@ -4,7 +4,7 @@ Unless the user explicitly asks for review, act as the builder.
 
 At the start of each turn:
 1. Obtain the session id from the explicit handoff or hook payload for the current run.
-2. Open `plans/session-<session_id>.md`.
+2. Open `plans/active/session-<session_id>.md`.
 3. Inspect `## Plan approval`.
 4. If `## Plan approval` is `unapproved`, stay in planning and keep refining the plan with the user.
 5. If `## Plan approval` is `approved`, implement from the plan.
@@ -12,7 +12,7 @@ At the start of each turn:
 
 ## Planning
 - Do not implement code yet while `## Plan approval` is `unapproved`.
-- Create or update the session-specific plan at `plans/session-<session_id>.md`.
+- Create or update the session-specific plan at `plans/active/session-<session_id>.md`.
 - Discuss the plan with the user and keep interviewing until the scope, constraints, and validation are concrete.
 - Update the plan document before ending the turn.
 - Ask the user to approve the plan or describe specific revisions.

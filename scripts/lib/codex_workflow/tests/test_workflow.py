@@ -127,6 +127,27 @@ class WorkflowHarnessTests(unittest.TestCase):
         )
         return plan_path
 
+    def write_completed_plan(
+        self,
+        session_id: str = "session-1",
+        ordered_items: list[tuple[bool, str]] | None = None,
+        follow_up_items: list[tuple[bool, str]] | None = None,
+        approval_status: str = "approved",
+    ) -> Path:
+        if ordered_items is None:
+            ordered_items = [(False, "Replace this placeholder with a real subtask.")]
+        plan_path = self.paths.completed_plan_path(session_id)
+        atomic_write_text(
+            plan_path,
+            build_plan_text(
+                session_id,
+                ordered_items=ordered_items,
+                follow_up_items=follow_up_items,
+                approval_status=approval_status,
+            ),
+        )
+        return plan_path
+
     def test_session_start_initializes_plan_for_non_review_requests(self) -> None:
         exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="build", msg="implementation request"))
         outcome = handle_session_start(
@@ -151,6 +172,14 @@ class WorkflowHarnessTests(unittest.TestCase):
     def test_repo_paths_creates_revision_logs_directory(self) -> None:
         self.assertTrue(self.paths.revision_logs_dir.exists())
         self.assertEqual(self.paths.revision_logs_dir, self.repo_root / "revision_logs")
+        self.assertTrue(self.paths.active_revision_logs_dir.exists())
+        self.assertTrue(self.paths.completed_revision_logs_dir.exists())
+        self.assertEqual(self.paths.active_revision_logs_dir, self.repo_root / "revision_logs" / "active")
+        self.assertEqual(self.paths.completed_revision_logs_dir, self.repo_root / "revision_logs" / "completed")
+        self.assertTrue(self.paths.active_plans_dir.exists())
+        self.assertTrue(self.paths.completed_plans_dir.exists())
+        self.assertEqual(self.paths.active_plans_dir, self.repo_root / "plans" / "active")
+        self.assertEqual(self.paths.completed_plans_dir, self.repo_root / "plans" / "completed")
 
     def test_session_start_skips_plan_creation_for_explicit_review_requests(self) -> None:
         exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="review", msg="explicit review request"))
@@ -327,6 +356,20 @@ class WorkflowHarnessTests(unittest.TestCase):
         self.assertEqual(exec_runner.calls, [])
         self.assertEqual(test_runner.calls, [])
 
+    def test_stop_reactivates_completed_plan_before_evaluating(self) -> None:
+        self.write_completed_plan(
+            session_id="reactivate-plan",
+            ordered_items=[(False, "Continue the interrupted task.")],
+            approval_status="approved",
+        )
+
+        outcome = handle_stop({"session_id": "reactivate-plan"}, self.repo_root)
+
+        self.assertEqual(outcome.exit_code, 2)
+        self.assertTrue(self.paths.active_plan_path("reactivate-plan").exists())
+        self.assertFalse(self.paths.completed_plan_path("reactivate-plan").exists())
+        self.assertIn("Continue the interrupted task.", outcome.stderr_message)
+
     def test_stop_blocks_when_plan_approval_section_is_missing(self) -> None:
         plan_path = self.write_plan(session_id="missing-approval", approval_status="approved")
         original = plan_path.read_text(encoding="utf-8")
@@ -496,6 +539,62 @@ class WorkflowHarnessTests(unittest.TestCase):
         self.assertEqual(outcome.exit_code, 0)
         self.assertEqual(test_runner.calls, ["final-tests"])
         self.assertEqual(len(exec_runner.calls), 1)
+        self.assertFalse(self.paths.active_plan_path("precheck-complete").exists())
+        self.assertTrue(self.paths.completed_plan_path("precheck-complete").exists())
+
+    def test_accepted_stop_moves_active_revision_logs_to_completed(self) -> None:
+        self.write_plan(
+            session_id="archive-logs",
+            ordered_items=[(True, "Implement everything.")],
+            approval_status="approved",
+        )
+        active_stdout = self.paths.active_revision_logs_dir / "archive-logs-final-review-1.stdout.log"
+        active_stderr = self.paths.active_revision_logs_dir / "archive-logs-final-review-1.stderr.log"
+        atomic_write_text(active_stdout, "stdout\n")
+        atomic_write_text(active_stderr, "stderr\n")
+        test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
+        exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="accept", msg=None))
+
+        outcome = handle_stop(
+            {"session_id": "archive-logs"},
+            self.repo_root,
+            exec_runner=exec_runner,
+            test_runner=test_runner,
+            sleep_fn=lambda _: None,
+        )
+
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertFalse(active_stdout.exists())
+        self.assertFalse(active_stderr.exists())
+        self.assertTrue((self.paths.completed_revision_logs_dir / active_stdout.name).exists())
+        self.assertTrue((self.paths.completed_revision_logs_dir / active_stderr.name).exists())
+        self.assertFalse(self.paths.active_plan_path("archive-logs").exists())
+        self.assertTrue(self.paths.completed_plan_path("archive-logs").exists())
+
+    def test_blocked_stop_keeps_plan_and_revision_logs_active(self) -> None:
+        plan_path = self.write_plan(
+            session_id="keep-active",
+            ordered_items=[(True, "Implement everything.")],
+            approval_status="approved",
+        )
+        active_stdout = self.paths.active_revision_logs_dir / "keep-active-final-tests-1.stdout.log"
+        atomic_write_text(active_stdout, "stdout\n")
+        test_runner = FakeTestRunner(FinalTestResult(ok=False, summary="workflow unit tests failed", returncode=1))
+        exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="accept", msg=None))
+
+        outcome = handle_stop(
+            {"session_id": "keep-active"},
+            self.repo_root,
+            exec_runner=exec_runner,
+            test_runner=test_runner,
+            sleep_fn=lambda _: None,
+        )
+
+        self.assertEqual(outcome.exit_code, 2)
+        self.assertTrue(plan_path.exists())
+        self.assertFalse(self.paths.completed_plan_path("keep-active").exists())
+        self.assertTrue(active_stdout.exists())
+        self.assertFalse((self.paths.completed_revision_logs_dir / active_stdout.name).exists())
 
     def test_complete_plan_skips_final_tests_and_review_when_no_files_changed(self) -> None:
         self.write_plan(

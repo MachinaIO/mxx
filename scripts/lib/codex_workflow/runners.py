@@ -73,9 +73,9 @@ class CodexExecRunner:
     def run(self, prompt: str, schema_path: Path, label: str) -> StructuredExecResult:
         run_id = uuid.uuid4().hex
         safe_label = _sanitize_label(label)
-        stdout_path = self.paths.revision_logs_dir / f"{self.session_id}-{safe_label}-{run_id}.stdout.log"
-        stderr_path = self.paths.revision_logs_dir / f"{self.session_id}-{safe_label}-{run_id}.stderr.log"
-        output_path = self.paths.revision_logs_dir / f"{self.session_id}-{safe_label}-{run_id}.json"
+        stdout_path = self.paths.active_revision_logs_dir / f"{self.session_id}-{safe_label}-{run_id}.stdout.log"
+        stderr_path = self.paths.active_revision_logs_dir / f"{self.session_id}-{safe_label}-{run_id}.stderr.log"
+        output_path = self.paths.active_revision_logs_dir / f"{self.session_id}-{safe_label}-{run_id}.json"
         command = [
             "codex",
             "exec",
@@ -154,8 +154,8 @@ class ShellFinalTestRunner:
     def run(self, label: str) -> FinalTestResult:
         run_id = uuid.uuid4().hex
         safe_label = _sanitize_label(label)
-        stdout_path = self.paths.revision_logs_dir / f"{self.session_id}-{safe_label}-{run_id}.stdout.log"
-        stderr_path = self.paths.revision_logs_dir / f"{self.session_id}-{safe_label}-{run_id}.stderr.log"
+        stdout_path = self.paths.active_revision_logs_dir / f"{self.session_id}-{safe_label}-{run_id}.stdout.log"
+        stderr_path = self.paths.active_revision_logs_dir / f"{self.session_id}-{safe_label}-{run_id}.stderr.log"
         command = [str(self.paths.scripts_dir / "run_tests.sh")]
         with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open(
             "w", encoding="utf-8"

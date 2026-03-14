@@ -81,6 +81,7 @@ Describe the concrete user-visible outcome for this session.
 ## Repo facts / assumptions
 - Each workflow hook invocation must provide `session_id` in its JSON payload.
 - The stop hook derives planning vs implementation from this plan's approval flag and mechanically checks markdown checkboxes in the required subtask sections.
+- The active plan path for this session is `plans/active/session-{session_id}.md`; accepted sessions are archived under `plans/completed/`.
 
 ## Acceptance criteria
 - The workflow harness uses repository-local Codex hooks.

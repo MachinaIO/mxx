@@ -19,7 +19,7 @@ The session plan is also the workflow state. The `## Plan approval` section is t
 
 ## How To Use Session Plans
 - When authoring a session plan, start from the required template in this file and fill it with repository-specific detail rather than placeholders.
-- Explicit review-only sessions are outside this session-plan workflow: the session-start hook classifies them from the initial user prompt, does not create `plans/session-<session_id>.md`, and the stop hook later exits without workflow coordination when that plan file is absent.
+- Explicit review-only sessions are outside this session-plan workflow: the session-start hook classifies them from the initial user prompt, does not create `plans/active/session-<session_id>.md`, and the stop hook later exits without workflow coordination when both `plans/active/session-<session_id>.md` and `plans/completed/session-<session_id>.md` are absent.
 - While `## Plan approval` is `unapproved`, the builder stays in planning, revises the plan with the user, and does not implement code yet.
 - When the user explicitly approves the plan, the builder updates `## Plan approval` to `approved` and starts implementation from the same plan.
 - Workflow helpers derive the active session strictly from each hook payload; do not rely on repository-global pointer files.
@@ -46,7 +46,7 @@ The session plan is also the workflow state. The `## Plan approval` section is t
 - If a step is risky or can leave the repo in a partial state, document how to retry safely without losing previous progress.
 
 ## Session Plan Template
-Use this exact section structure for `plans/session-<session_id>.md` so the workflow helpers can parse it mechanically.
+Use this exact section structure for `plans/active/session-<session_id>.md` so the workflow helpers can parse it mechanically.
 
 ```md
 # Session Plan: <session_id>

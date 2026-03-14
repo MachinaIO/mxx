@@ -86,10 +86,26 @@ def extract_initial_user_message(payload: dict[str, Any]) -> str | None:
 
 
 def _ensure_plan_exists(paths: RepoPaths, session_id: str) -> Path:
-    plan_path = paths.default_plan_path(session_id)
-    if not plan_path.exists():
-        atomic_write_text(plan_path, render_session_plan(session_id))
+    plan_path = paths.active_plan_path(session_id)
+    if plan_path.exists():
+        return plan_path
+    reactivated_path = paths.move_completed_plan_to_active(session_id)
+    if reactivated_path is not None:
+        return reactivated_path
+    atomic_write_text(plan_path, render_session_plan(session_id))
     return plan_path
+
+
+def _find_stop_plan(paths: RepoPaths, session_id: str) -> Path | None:
+    active_path = paths.active_plan_path(session_id)
+    if active_path.exists():
+        return active_path
+    return paths.move_completed_plan_to_active(session_id)
+
+
+def _finalize_completed_session(paths: RepoPaths, session_id: str) -> None:
+    paths.move_session_revision_logs_to_completed(session_id)
+    paths.move_active_plan_to_completed(session_id)
 
 
 def _compact_message(text: str, max_len: int = 220) -> str:
@@ -349,6 +365,10 @@ def _run_implementation_loop(
     except RetryLimitExceeded as exc:
         return block_outcome(str(exc))
     if check_result.status == "accepted":
+        try:
+            _finalize_completed_session(paths, session_id)
+        except OSError as exc:
+            return block_outcome(f"Failed to archive completed workflow artifacts: {exc}")
         return stop_outcome(check_result.message)
     _log_progress(f"[stop hook] Additional implementation required. {check_result.message}")
     return block_outcome(check_result.message)
@@ -402,8 +422,8 @@ def handle_stop(
     if not session_id:
         return block_outcome("Stop hook requires `session_id` in the hook payload.")
 
-    plan_path = paths.default_plan_path(session_id)
-    if not plan_path.exists():
+    plan_path = _find_stop_plan(paths, session_id)
+    if plan_path is None:
         return HookOutcome(exit_code=0)
     plan_display_path = str(plan_path.relative_to(paths.repo_root))
     analysis = analyze_plan(plan_path.read_text(encoding="utf-8"))

@@ -8,5 +8,5 @@
 /.agents/current-session-id
 /.agents/session-*.json
 /.agents/tmp
-/plans/session-*.md
+/plans
 /revision_logs

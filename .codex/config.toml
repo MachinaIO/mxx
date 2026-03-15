@@ -1,5 +1,5 @@
 sandbox_mode = "workspace-write"
-approval_policy = "on-request"
+approval_policy = "never"
 project_root_markers = [".git", "Cargo.toml"]
 
 [features]

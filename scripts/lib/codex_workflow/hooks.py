@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import sys
 import time
 from typing import Any, Callable
+
+from repo_validation import edited_paths_from_git
 
 from .atomic import atomic_write_text
 from .paths import RepoPaths
@@ -17,9 +19,6 @@ from .plan import (
     render_session_plan,
 )
 from .runners import (
-    BuilderExecRunner,
-    BuilderExecResult,
-    CodexBuilderRunner,
     CodexExecRunner,
     FinalTestRunner,
     ShellFinalTestRunner,
@@ -87,10 +86,26 @@ def extract_initial_user_message(payload: dict[str, Any]) -> str | None:
 
 
 def _ensure_plan_exists(paths: RepoPaths, session_id: str) -> Path:
-    plan_path = paths.default_plan_path(session_id)
-    if not plan_path.exists():
-        atomic_write_text(plan_path, render_session_plan(session_id))
+    plan_path = paths.active_plan_path(session_id)
+    if plan_path.exists():
+        return plan_path
+    reactivated_path = paths.move_completed_plan_to_active(session_id)
+    if reactivated_path is not None:
+        return reactivated_path
+    atomic_write_text(plan_path, render_session_plan(session_id))
     return plan_path
+
+
+def _find_stop_plan(paths: RepoPaths, session_id: str) -> Path | None:
+    active_path = paths.active_plan_path(session_id)
+    if active_path.exists():
+        return active_path
+    return paths.move_completed_plan_to_active(session_id)
+
+
+def _finalize_completed_session(paths: RepoPaths, session_id: str) -> None:
+    paths.move_session_revision_logs_to_completed(session_id)
+    paths.move_active_plan_to_completed(session_id)
 
 
 def _compact_message(text: str, max_len: int = 220) -> str:
@@ -153,6 +168,39 @@ class ImplementationCheckResult:
     message: str
 
 
+@dataclass(frozen=True)
+class FinalTestSelection:
+    run_python: bool
+    run_rust: bool
+
+    @property
+    def requires_any(self) -> bool:
+        return self.run_python or self.run_rust
+
+
+def _default_edited_paths_provider(repo_root: Path) -> list[str] | None:
+    try:
+        return edited_paths_from_git(repo_root)
+    except RuntimeError:
+        return None
+
+
+def _select_final_tests(edited_paths: list[str]) -> FinalTestSelection:
+    run_python = False
+    run_rust = False
+    for path in edited_paths:
+        normalized = PurePosixPath(path)
+        if normalized.suffix == ".py":
+            run_python = True
+        if normalized.name == "Cargo.toml":
+            run_rust = True
+        if normalized.suffix == ".rs":
+            run_rust = True
+        if normalized.parts and normalized.parts[0] == "cuda":
+            run_rust = True
+    return FinalTestSelection(run_python=run_python, run_rust=run_rust)
+
+
 def _build_session_start_prompt(initial_user_message: str) -> str:
     return (
         "You are classifying the user's initial prompt for a Codex workflow session.\n"
@@ -167,25 +215,6 @@ def _build_session_start_prompt(initial_user_message: str) -> str:
     )
 
 
-def _build_builder_prompt(session_id: str, plan_display_path: str, reason: str | None) -> str:
-    prompt = (
-        "You are the builder for the current Codex workflow session.\n"
-        f"Session id: {session_id}.\n"
-        f"Read `BUILDER.md` and `{plan_display_path}` before acting.\n"
-        "Use the explicit session id in this prompt; do not infer it from repository-local pointer files.\n"
-        "Treat the session plan as the only source of task scope and completion criteria.\n"
-        "Work through unchecked subtasks in order.\n"
-        "After each completed subtask, run the most relevant tests immediately and only then check it off.\n"
-        "Update the session plan's per-subtask validation, decision log, and progress log as you work.\n"
-        "If final tests or reviewer feedback create new obligations, append NEW unchecked items under "
-        f"`{FOLLOW_UP_SUBTASKS_HEADING}` instead of rewriting completed history.\n"
-        "Stop only when every tracked checkbox in the required subtask sections is checked.\n"
-    )
-    if reason:
-        prompt += f"\nImmediate priority from the outer stop hook: {reason}\n"
-    return prompt
-
-
 def _build_review_prompt(session_id: str, plan_display_path: str) -> str:
     return (
         "You are a read-only reviewer.\n"
@@ -195,27 +224,6 @@ def _build_review_prompt(session_id: str, plan_display_path: str) -> str:
         "If acceptable, output result=accept.\n"
         "Otherwise output result=revision and msg=<concrete problems and required fixes>.\n"
     )
-
-
-def _run_builder_with_retry(
-    builder_runner: BuilderExecRunner,
-    prompt: str,
-    label: str,
-    sleep_fn: Callable[[float], None],
-) -> BuilderExecResult:
-    for attempt in range(1, MAX_INFRA_RETRY_ATTEMPTS + 1):
-        result = builder_runner.run(prompt=prompt, label=label)
-        if result.ok:
-            return result
-        if attempt == MAX_INFRA_RETRY_ATTEMPTS:
-            _raise_retry_limit_exceeded("builder", result.summary)
-        _log_progress(
-            "[stop hook] Nested builder failed. "
-            f"Attempt {attempt}/{MAX_INFRA_RETRY_ATTEMPTS}. "
-            f"Retrying in {RETRY_DELAY_SECONDS:.1f}s. Summary: {result.summary}"
-        )
-        sleep_fn(RETRY_DELAY_SECONDS)
-    _raise_retry_limit_exceeded("builder", "Retry loop exited unexpectedly.")
 
 
 def _run_review_with_retry(
@@ -263,11 +271,12 @@ def _evaluate_implementation_once(
     exec_runner: StructuredExecRunner,
     test_runner: FinalTestRunner,
     sleep_fn: Callable[[float], None],
+    edited_paths_provider: Callable[[Path], list[str] | None],
 ) -> ImplementationCheckResult:
     analysis = analyze_plan(plan_path.read_text(encoding="utf-8"))
     if analysis.missing_sections or analysis.invalid_sections or analysis.empty_sections:
         return ImplementationCheckResult(
-            status="builder",
+            status="blocked",
             message=_missing_plan_structure_message(
                 analysis.missing_sections,
                 analysis.invalid_sections,
@@ -277,7 +286,7 @@ def _evaluate_implementation_once(
 
     if not analysis.is_approved:
         return ImplementationCheckResult(
-            status="builder",
+            status="blocked",
             message=(
                 "The session plan is still unapproved. Continue the planning interview and do not start implementation "
                 "until the plan approval flag is `approved`."
@@ -288,24 +297,43 @@ def _evaluate_implementation_once(
         next_item = analysis.first_unchecked
         detail = f" Next unchecked subtask: {next_item.text}" if next_item else ""
         return ImplementationCheckResult(
-            status="builder",
+            status="blocked",
             message=(
                 "Implementation is not complete. Continue with the next unchecked subtask and keep the plan document updated."
                 + detail
             ),
         )
 
-    test_result = test_runner.run(label="final-tests")
-    if not test_result.ok:
-        follow_up_items = _make_test_follow_ups(test_result.summary)
-        append_follow_up_subtasks_file(plan_path, follow_up_items)
+    edited_paths = edited_paths_provider(paths.repo_root)
+    if edited_paths == []:
         return ImplementationCheckResult(
-            status="builder",
-            message=(
-                "Final tests failed. New follow-up subtasks were appended to the session plan. "
-                f"Address them first. Failure summary: {test_result.summary}"
-            ),
+            status="accepted",
+            message="All subtasks are complete and no files changed, so final tests and reviewer checks were skipped.",
         )
+
+    tests_were_run = False
+    test_selection = (
+        FinalTestSelection(run_python=True, run_rust=True)
+        if edited_paths is None
+        else _select_final_tests(edited_paths)
+    )
+    if test_selection.requires_any:
+        tests_were_run = True
+        test_result = test_runner.run(
+            label="final-tests",
+            run_python=test_selection.run_python,
+            run_rust=test_selection.run_rust,
+        )
+        if not test_result.ok:
+            follow_up_items = _make_test_follow_ups(test_result.summary)
+            append_follow_up_subtasks_file(plan_path, follow_up_items)
+            return ImplementationCheckResult(
+                status="blocked",
+                message=(
+                    "Final tests failed. New follow-up subtasks were appended to the session plan. "
+                    f"Address them first. Failure summary: {test_result.summary}"
+                ),
+            )
 
     review_result = _run_review_with_retry(
         paths=paths,
@@ -319,7 +347,7 @@ def _evaluate_implementation_once(
             _make_review_follow_ups(review_result.msg or "Reviewer requested changes."),
         )
         return ImplementationCheckResult(
-            status="builder",
+            status="blocked",
             message=(
                 "Reviewer requested changes. New follow-up subtasks were appended to the session plan. "
                 f"Address them first. Reviewer feedback: {review_result.msg or 'No review message was provided.'}"
@@ -328,7 +356,11 @@ def _evaluate_implementation_once(
 
     return ImplementationCheckResult(
         status="accepted",
-        message="All subtasks are complete, final tests passed, and reviewer approved.",
+        message=(
+            "All subtasks are complete, final tests passed, and reviewer approved."
+            if tests_were_run
+            else "All subtasks are complete, final tests were skipped because no Python, Rust, Cargo.toml, or cuda/ files changed, and reviewer approved."
+        ),
     )
 
 
@@ -338,42 +370,31 @@ def _run_implementation_loop(
     plan_path: Path,
     plan_display_path: str,
     exec_runner: StructuredExecRunner,
-    builder_runner: BuilderExecRunner,
     test_runner: FinalTestRunner,
     sleep_fn: Callable[[float], None],
+    edited_paths_provider: Callable[[Path], list[str] | None],
 ) -> HookOutcome:
-    builder_reason = "Complete the remaining unchecked work in the session plan."
-    attempt = 0
-    while True:
+    try:
+        check_result = _evaluate_implementation_once(
+            paths=paths,
+            session_id=session_id,
+            plan_path=plan_path,
+            plan_display_path=plan_display_path,
+            exec_runner=exec_runner,
+            test_runner=test_runner,
+            sleep_fn=sleep_fn,
+            edited_paths_provider=edited_paths_provider,
+        )
+    except RetryLimitExceeded as exc:
+        return block_outcome(str(exc))
+    if check_result.status == "accepted":
         try:
-            check_result = _evaluate_implementation_once(
-                paths=paths,
-                session_id=session_id,
-                plan_path=plan_path,
-                plan_display_path=plan_display_path,
-                exec_runner=exec_runner,
-                test_runner=test_runner,
-                sleep_fn=sleep_fn,
-            )
-        except RetryLimitExceeded as exc:
-            return block_outcome(str(exc))
-        if check_result.status == "accepted":
-            return stop_outcome(check_result.message)
-        builder_reason = check_result.message
-        _log_progress(f"[stop hook] Additional implementation required. {builder_reason}")
-
-        attempt += 1
-        _log_progress(f"[stop hook] Launching nested builder attempt {attempt} for session {session_id}.")
-        try:
-            _run_builder_with_retry(
-                builder_runner=builder_runner,
-                prompt=_build_builder_prompt(session_id, plan_display_path, builder_reason),
-                label=f"builder-attempt-{attempt}",
-                sleep_fn=sleep_fn,
-            )
-        except RetryLimitExceeded as exc:
-            return block_outcome(str(exc))
-        _log_progress(f"[stop hook] Nested builder attempt {attempt} finished. Reevaluating completion gate.")
+            _finalize_completed_session(paths, session_id)
+        except OSError as exc:
+            return block_outcome(f"Failed to archive completed workflow artifacts: {exc}")
+        return stop_outcome(check_result.message)
+    _log_progress(f"[stop hook] Additional implementation required. {check_result.message}")
+    return block_outcome(check_result.message)
 
 
 def handle_session_start(
@@ -414,9 +435,9 @@ def handle_stop(
     payload: dict[str, Any],
     repo_root: Path,
     exec_runner: StructuredExecRunner | None = None,
-    builder_runner: BuilderExecRunner | None = None,
     test_runner: FinalTestRunner | None = None,
     sleep_fn: Callable[[float], None] | None = None,
+    edited_paths_provider: Callable[[Path], list[str] | None] | None = None,
 ) -> HookOutcome:
     paths = RepoPaths(repo_root)
     paths.ensure_directories()
@@ -424,8 +445,8 @@ def handle_stop(
     if not session_id:
         return block_outcome("Stop hook requires `session_id` in the hook payload.")
 
-    plan_path = paths.default_plan_path(session_id)
-    if not plan_path.exists():
+    plan_path = _find_stop_plan(paths, session_id)
+    if plan_path is None:
         return HookOutcome(exit_code=0)
     plan_display_path = str(plan_path.relative_to(paths.repo_root))
     analysis = analyze_plan(plan_path.read_text(encoding="utf-8"))
@@ -441,16 +462,16 @@ def handle_stop(
         )
 
     exec_runner = exec_runner or CodexExecRunner(paths, session_id)
-    builder_runner = builder_runner or CodexBuilderRunner(paths, session_id)
     test_runner = test_runner or ShellFinalTestRunner(paths, session_id)
     sleep_fn = sleep_fn or time.sleep
+    edited_paths_provider = edited_paths_provider or _default_edited_paths_provider
     return _run_implementation_loop(
         paths=paths,
         session_id=session_id,
         plan_path=plan_path,
         plan_display_path=plan_display_path,
         exec_runner=exec_runner,
-        builder_runner=builder_runner,
         test_runner=test_runner,
         sleep_fn=sleep_fn,
+        edited_paths_provider=edited_paths_provider,
     )

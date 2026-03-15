@@ -10,6 +10,7 @@ use sequential_test::sequential;
 fn __sequential_anchor() {}
 
 pub mod bgg;
+pub mod bgg_poly;
 pub mod circuit;
 pub mod commit;
 pub mod element;

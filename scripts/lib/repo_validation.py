@@ -93,7 +93,7 @@ def compile_gpu_test_binaries(
 ) -> list[Path]:
     runner = runner or subprocess.run
     completed = runner(
-        ("cargo", "test", "gpu", "-r", "--features", "gpu", "--no-run", "--message-format=json"),
+        ("cargo", "test", "gpu", "-r", "--lib", "--features", "gpu", "--no-run", "--message-format=json"),
         cwd=repo_root,
         env=env,
         check=False,

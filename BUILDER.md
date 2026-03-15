@@ -22,7 +22,9 @@ At the start of each turn:
 ## Implementation
 - Read the session plan and work through subtasks in order.
 - If the current work touches CUDA, GPU kernels, GPU wrappers, GPU tests, or GPU-facing performance-sensitive behavior, read [GPU.md](GPU.md) and follow its principles.
+- When Rust formatting is needed, use `cargo +nightly fmt --all`.
 - After finishing a subtask, run its related tests immediately.
+- Do not run integration tests unless the user has explicitly instructed you to do so in the current session. Until then, keep validation limited to the narrowest relevant tests.
 - Only after the related tests pass, mark that subtask checkbox as checked.
 - Update the per-subtask validation, progress log, and decision log as work proceeds.
 - If final tests or reviewer feedback create new obligations, do NOT rewrite existing subtasks or erase completed checkmarks.

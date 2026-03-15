@@ -34,6 +34,8 @@ if [[ $run_python -eq 1 ]]; then
 fi
 
 if [[ $run_rust -eq 1 ]]; then
+  cargo +nightly fmt --all
+
   RUST_TEST_NOCAPTURE="${RUST_TEST_NOCAPTURE:-1}" \
     cargo test -r --lib
 

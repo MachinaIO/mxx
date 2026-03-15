@@ -26,6 +26,7 @@ pub fn secret_inner_product<P: Poly>(
 mod tests {
     use super::secret_inner_product;
     use crate::{
+        __PAIR, __TestState,
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         circuit::PolyCircuit,
         lookup::{
@@ -45,6 +46,7 @@ mod tests {
     };
     use keccak_asm::Keccak256;
 
+    #[sequential_test::sequential]
     #[test]
     fn test_secret_ip_with_rlwe_vectors() {
         let params = DCRTPolyParams::default();

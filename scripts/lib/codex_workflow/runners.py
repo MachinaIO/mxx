@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import json
 import subprocess
-import sys
-import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol, TextIO
+from typing import Any, Protocol
 
 from .paths import RepoPaths
 
@@ -57,106 +55,14 @@ class FinalTestResult:
     stderr_path: Path | None = None
 
 
-@dataclass(frozen=True)
-class BuilderExecResult:
-    ok: bool
-    summary: str
-    returncode: int
-    thread_id: str | None = None
-    stdout_path: Path | None = None
-    stderr_path: Path | None = None
-
-
 class StructuredExecRunner(Protocol):
     def run(self, prompt: str, schema_path: Path, label: str) -> StructuredExecResult:
         ...
 
 
 class FinalTestRunner(Protocol):
-    def run(self, label: str) -> FinalTestResult:
+    def run(self, label: str, *, run_python: bool = True, run_rust: bool = True) -> FinalTestResult:
         ...
-
-
-class BuilderExecRunner(Protocol):
-    def run(self, prompt: str, label: str) -> BuilderExecResult:
-        ...
-
-
-def _pump_stream(
-    pipe: Any,
-    log_handle: TextIO,
-    mirror_stream: TextIO | None,
-    line_handler: Callable[[str], None] | None = None,
-) -> None:
-    try:
-        for chunk in iter(pipe.readline, ""):
-            log_handle.write(chunk)
-            log_handle.flush()
-            if line_handler is not None:
-                line_handler(chunk)
-            if mirror_stream is not None:
-                mirror_stream.write(chunk)
-                mirror_stream.flush()
-    finally:
-        pipe.close()
-
-
-def _run_streaming_subprocess(
-    command: list[str],
-    cwd: Path,
-    stdout_path: Path,
-    stderr_path: Path,
-    mirror_stream: TextIO | None = None,
-    stdout_line_handler: Callable[[str], None] | None = None,
-    stderr_line_handler: Callable[[str], None] | None = None,
-) -> int:
-    with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open(
-        "w", encoding="utf-8"
-    ) as stderr_handle:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-        assert process.stdout is not None
-        assert process.stderr is not None
-        stdout_thread = threading.Thread(
-            target=_pump_stream,
-            args=(process.stdout, stdout_handle, mirror_stream, stdout_line_handler),
-            daemon=True,
-        )
-        stderr_thread = threading.Thread(
-            target=_pump_stream,
-            args=(process.stderr, stderr_handle, mirror_stream, stderr_line_handler),
-            daemon=True,
-        )
-        stdout_thread.start()
-        stderr_thread.start()
-        returncode = process.wait()
-        stdout_thread.join()
-        stderr_thread.join()
-        return returncode
-
-
-def _extract_thread_id_from_event_line(line: str) -> str | None:
-    stripped = line.strip()
-    if not stripped.startswith("{"):
-        return None
-    try:
-        payload = json.loads(stripped)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    if payload.get("type") != "thread.started":
-        return None
-    thread_id = payload.get("thread_id")
-    if isinstance(thread_id, str) and thread_id.strip():
-        return thread_id
-    return None
 
 
 class CodexExecRunner:
@@ -167,9 +73,9 @@ class CodexExecRunner:
     def run(self, prompt: str, schema_path: Path, label: str) -> StructuredExecResult:
         run_id = uuid.uuid4().hex
         safe_label = _sanitize_label(label)
-        stdout_path = self.paths.tmp_dir / f"{self.session_id}-{safe_label}-{run_id}.stdout.log"
-        stderr_path = self.paths.tmp_dir / f"{self.session_id}-{safe_label}-{run_id}.stderr.log"
-        output_path = self.paths.tmp_dir / f"{self.session_id}-{safe_label}-{run_id}.json"
+        stdout_path = self.paths.active_revision_logs_dir / f"{self.session_id}-{safe_label}-{run_id}.stdout.log"
+        stderr_path = self.paths.active_revision_logs_dir / f"{self.session_id}-{safe_label}-{run_id}.stderr.log"
+        output_path = self.paths.active_revision_logs_dir / f"{self.session_id}-{safe_label}-{run_id}.json"
         command = [
             "codex",
             "exec",
@@ -240,77 +146,23 @@ class CodexExecRunner:
         )
 
 
-class CodexBuilderRunner:
-    def __init__(self, paths: RepoPaths, session_id: str, progress_stream: TextIO | None = None) -> None:
-        self.paths = paths
-        self.session_id = session_id
-        self.progress_stream = progress_stream if progress_stream is not None else sys.stderr
-
-    def run(self, prompt: str, label: str) -> BuilderExecResult:
-        run_id = uuid.uuid4().hex
-        safe_label = _sanitize_label(label)
-        stdout_path = self.paths.tmp_dir / f"{self.session_id}-{safe_label}-{run_id}.stdout.log"
-        stderr_path = self.paths.tmp_dir / f"{self.session_id}-{safe_label}-{run_id}.stderr.log"
-        observed_thread_id: dict[str, str | None] = {"value": None}
-
-        def capture_stdout(line: str) -> None:
-            if observed_thread_id["value"] is not None:
-                return
-            observed_thread_id["value"] = _extract_thread_id_from_event_line(line)
-
-        command = [
-            "codex",
-            "exec",
-            "resume",
-            "--skip-git-repo-check",
-            "--disable",
-            "codex_hooks",
-            "--json",
-            self.session_id,
-            prompt,
-        ]
-        returncode = _run_streaming_subprocess(
-            command=command,
-            cwd=self.paths.repo_root,
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-            mirror_stream=self.progress_stream,
-            stdout_line_handler=capture_stdout,
-        )
-        summary = summarize_logs(stdout_path, stderr_path)
-        thread_id = observed_thread_id["value"]
-        ok = returncode == 0
-        if ok and thread_id is None:
-            ok = False
-            summary = (
-                "Nested builder did not emit a `thread.started` event, so the resumed session id could not be verified."
-            )
-        elif ok and thread_id != self.session_id:
-            ok = False
-            summary = (
-                f"Nested builder resumed unexpected session id `{thread_id}`; expected `{self.session_id}`."
-            )
-        return BuilderExecResult(
-            ok=ok,
-            summary=summary,
-            returncode=returncode,
-            thread_id=thread_id,
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-        )
-
-
 class ShellFinalTestRunner:
     def __init__(self, paths: RepoPaths, session_id: str) -> None:
         self.paths = paths
         self.session_id = session_id
 
-    def run(self, label: str) -> FinalTestResult:
+    def run(self, label: str, *, run_python: bool = True, run_rust: bool = True) -> FinalTestResult:
         run_id = uuid.uuid4().hex
         safe_label = _sanitize_label(label)
-        stdout_path = self.paths.tmp_dir / f"{self.session_id}-{safe_label}-{run_id}.stdout.log"
-        stderr_path = self.paths.tmp_dir / f"{self.session_id}-{safe_label}-{run_id}.stderr.log"
+        stdout_path = self.paths.active_revision_logs_dir / f"{self.session_id}-{safe_label}-{run_id}.stdout.log"
+        stderr_path = self.paths.active_revision_logs_dir / f"{self.session_id}-{safe_label}-{run_id}.stderr.log"
         command = [str(self.paths.scripts_dir / "run_tests.sh")]
+        if run_python and not run_rust:
+            command.append("--python")
+        elif run_rust and not run_python:
+            command.append("--rust")
+        elif not run_python and not run_rust:
+            raise ValueError("ShellFinalTestRunner.run requires at least one test suite.")
         with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open(
             "w", encoding="utf-8"
         ) as stderr_handle:

@@ -19,7 +19,7 @@ The session plan is also the workflow state. The `## Plan approval` section is t
 
 ## How To Use Session Plans
 - When authoring a session plan, start from the required template in this file and fill it with repository-specific detail rather than placeholders.
-- Explicit review-only sessions are outside this session-plan workflow: the session-start hook classifies them from the initial user prompt, does not create `plans/session-<session_id>.md`, and the stop hook later exits without workflow coordination when that plan file is absent.
+- Explicit review-only sessions are outside this session-plan workflow: the session-start hook classifies them from the initial user prompt, does not create `plans/active/session-<session_id>.md`, and the stop hook later exits without workflow coordination when both `plans/active/session-<session_id>.md` and `plans/completed/session-<session_id>.md` are absent.
 - While `## Plan approval` is `unapproved`, the builder stays in planning, revises the plan with the user, and does not implement code yet.
 - When the user explicitly approves the plan, the builder updates `## Plan approval` to `approved` and starts implementation from the same plan.
 - Workflow helpers derive the active session strictly from each hook payload; do not rely on repository-global pointer files.
@@ -39,14 +39,14 @@ The session plan is also the workflow state. The `## Plan approval` section is t
 - Completed subtasks must remain preserved as historical record. If tests fail or review finds problems later, add NEW follow-up subtasks instead of rewriting prior completed work.
 - Completed checkboxes must never be rewritten back into unchecked boxes.
 - While `## Plan approval` is `unapproved`, the stop hook does no workflow coordination beyond allowing the stop.
-- Once `## Plan approval` is `approved`, the stop hook first reevaluates the current session plan. If unchecked implementation work remains, it launches hooks-disabled nested builder runs to continue implementation. If every tracked checkbox in the required subtask sections is already checked, it runs the final tests and reviewer checks directly. Only failed final tests or non-accepting reviewer results append new follow-up tasks and trigger another nested builder pass.
+- Once `## Plan approval` is `approved`, the stop hook first reevaluates the current session plan. If unchecked implementation work remains, it blocks the current turn with an actionable resume message. If every tracked checkbox in the required subtask sections is already checked, it runs the final tests and reviewer checks directly. Only failed final tests or non-accepting reviewer results append new follow-up tasks and then block the turn so the same session can continue.
 - Acceptance criteria must describe observable behavior, not only internal code structure.
 - Per-subtask and final validation entries must name the exact command that was run and enough result detail to distinguish success from failure.
 - When work spans multiple files or subsystems, the plan should briefly orient the reader by naming the affected paths and how they fit together.
 - If a step is risky or can leave the repo in a partial state, document how to retry safely without losing previous progress.
 
 ## Session Plan Template
-Use this exact section structure for `plans/session-<session_id>.md` so the workflow helpers can parse it mechanically.
+Use this exact section structure for `plans/active/session-<session_id>.md` so the workflow helpers can parse it mechanically.
 
 ```md
 # Session Plan: <session_id>
@@ -77,7 +77,7 @@ Describe the concrete user-visible outcome for this session.
 - Record the most relevant validation command and result immediately after each completed subtask.
 
 ## Final validation
-- Record whether the stop hook needed any nested-builder passes, then record the final test gate and repeated review gate here.
+- Record whether the stop hook blocked with additional follow-up work, then record the final test gate and repeated review gate here.
 
 ## Decision log
 - Append important decisions with timestamps.
@@ -92,4 +92,4 @@ Describe the concrete user-visible outcome for this session.
 - If tests fail or review finds problems after some tasks were completed, add NEW unchecked items under `## Follow-up subtasks (append-only)`.
 - Do not rewrite or delete completed historical subtasks.
 - Do not remove prior reviewer or validation obligations from the plan. Add new unchecked follow-up items instead.
-- Assume the stop hook may invoke the builder and reviewer multiple times in one completion cycle after the plan is approved; keep the plan accurate enough that either nested run can resume from the file alone.
+- Assume the stop hook may block the turn and rerun the reviewer multiple times in one completion cycle after the plan is approved; keep the plan accurate enough that the same session can resume from the file alone.

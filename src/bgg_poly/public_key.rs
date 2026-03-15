@@ -188,11 +188,19 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "BggPolyPublicKey::add requires matching num_slots")]
     fn test_bgg_poly_pub_key_add_rejects_mismatched_num_slots() {
         let params = DCRTPolyParams::default();
         let matrix = DCRTPolyMatrix::identity(&params, 1, None);
-        let _ =
-            BggPolyPublicKey::new(matrix.clone(), true, 1) + BggPolyPublicKey::new(matrix, true, 2);
+        let panic = std::panic::catch_unwind(|| {
+            let _ = BggPolyPublicKey::new(matrix.clone(), true, 1) +
+                BggPolyPublicKey::new(matrix, true, 2);
+        })
+        .expect_err("mismatched num_slots should panic");
+        let panic_msg = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("panic payload should be a string");
+        assert!(panic_msg.contains("BggPolyPublicKey::add requires matching num_slots"));
     }
 }

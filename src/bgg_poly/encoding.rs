@@ -347,11 +347,24 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "BggPolyEncoding::new requires vectors.len() == pubkey.num_slots")]
     fn test_bgg_poly_encoding_new_rejects_slot_mismatch() {
         let params = DCRTPolyParams::default();
         let pubkey = BggPolyPublicKey::new(DCRTPolyMatrix::identity(&params, 1, None), true, 2);
-        let _ =
-            BggPolyEncoding::new(vec![DCRTPolyMatrix::identity(&params, 1, None)], pubkey, None);
+        let panic = std::panic::catch_unwind(|| {
+            let _ = BggPolyEncoding::new(
+                vec![DCRTPolyMatrix::identity(&params, 1, None)],
+                pubkey,
+                None,
+            );
+        })
+        .expect_err("slot mismatch should panic");
+        let panic_msg = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("panic payload should be a string");
+        assert!(
+            panic_msg.contains("BggPolyEncoding::new requires vectors.len() == pubkey.num_slots")
+        );
     }
 }

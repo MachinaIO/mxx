@@ -1,5 +1,5 @@
 use crate::{
-    bgg_poly::public_key::{BggPolyPublicKey, BggPolyPublicKeyCompact},
+    bgg::public_key::{BggPublicKey, BggPublicKeyCompact},
     circuit::evaluable::Evaluable,
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
@@ -14,46 +14,46 @@ use std::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BggPolyEncoding<M: PolyMatrix> {
     pub vectors: Vec<M>,
-    pub pubkey: BggPolyPublicKey<M>,
+    pub pubkey: BggPublicKey<M>,
     pub plaintexts: Option<Vec<<M as PolyMatrix>::P>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct BggPolyEncodingCompact<M: PolyMatrix> {
     pub vector_bytes: Vec<Vec<u8>>,
-    pub pubkey: BggPolyPublicKeyCompact<M>,
+    pub pubkey: BggPublicKeyCompact<M>,
     pub plaintext_bytes: Option<Vec<Vec<u8>>>,
 }
 
 impl<M: PolyMatrix> BggPolyEncoding<M> {
     pub fn new(
         vectors: Vec<M>,
-        pubkey: BggPolyPublicKey<M>,
+        pubkey: BggPublicKey<M>,
         plaintexts: Option<Vec<<M as PolyMatrix>::P>>,
     ) -> Self {
-        assert_eq!(
-            vectors.len(),
-            pubkey.num_slots,
-            "BggPolyEncoding::new requires vectors.len() == pubkey.num_slots"
-        );
         if let Some(plaintexts) = plaintexts.as_ref() {
             assert_eq!(
                 plaintexts.len(),
-                pubkey.num_slots,
-                "BggPolyEncoding::new requires plaintexts.len() == pubkey.num_slots"
+                vectors.len(),
+                "BggPolyEncoding::new requires plaintexts.len() == vectors.len()"
             );
         }
         Self { vectors, pubkey, plaintexts }
     }
 
+    fn num_slots(&self) -> usize {
+        self.vectors.len()
+    }
+
     pub fn concat_vector(&self, others: &[Self]) -> Vec<M> {
         for other in others {
             assert_eq!(
-                self.pubkey.num_slots, other.pubkey.num_slots,
+                self.num_slots(),
+                other.num_slots(),
                 "BggPolyEncoding::concat_vector requires matching num_slots"
             );
         }
-        (0..self.pubkey.num_slots)
+        (0..self.num_slots())
             .into_par_iter()
             .map(|slot| {
                 self.vectors[slot].concat_columns(
@@ -80,14 +80,13 @@ impl<M: PolyMatrix> BggPolyEncoding<M> {
                 M::read_from_files(params, 1, ncol, &dir_path, &format!("{id}_slot_{slot}_vector"))
             })
             .collect();
-        let pubkey = BggPolyPublicKey::read_from_files(
+        let pubkey = BggPublicKey::read_from_files(
             params,
             d1,
             ncol,
             &dir_path,
             &format!("{id}_pubkey"),
             reveal_plaintext,
-            num_slots,
         );
         let plaintexts = if reveal_plaintext {
             Some(
@@ -123,7 +122,8 @@ impl<M: PolyMatrix> Add<&Self> for BggPolyEncoding<M> {
 
     fn add(self, other: &Self) -> Self {
         assert_eq!(
-            self.pubkey.num_slots, other.pubkey.num_slots,
+            self.num_slots(),
+            other.num_slots(),
             "BggPolyEncoding::add requires matching num_slots"
         );
         let pubkey = self.pubkey + &other.pubkey;
@@ -156,7 +156,8 @@ impl<M: PolyMatrix> Sub<&Self> for BggPolyEncoding<M> {
 
     fn sub(self, other: &Self) -> Self {
         assert_eq!(
-            self.pubkey.num_slots, other.pubkey.num_slots,
+            self.num_slots(),
+            other.num_slots(),
             "BggPolyEncoding::sub requires matching num_slots"
         );
         let pubkey = self.pubkey - &other.pubkey;
@@ -189,7 +190,8 @@ impl<M: PolyMatrix> Mul<&Self> for BggPolyEncoding<M> {
 
     fn mul(self, other: &Self) -> Self {
         assert_eq!(
-            self.pubkey.num_slots, other.pubkey.num_slots,
+            self.num_slots(),
+            other.num_slots(),
             "BggPolyEncoding::mul requires matching num_slots"
         );
         let lhs_plaintexts = self.plaintexts.as_ref().unwrap_or_else(|| {
@@ -201,7 +203,7 @@ impl<M: PolyMatrix> Mul<&Self> for BggPolyEncoding<M> {
             .into_iter()
             .enumerate()
             .map(|(slot, lhs_vector)| {
-                let first_term = lhs_vector.mul_decompose(&other.pubkey.bgg_pubkey.matrix);
+                let first_term = lhs_vector.mul_decompose(&other.pubkey.matrix);
                 let second_term = other.vectors[slot].clone() * &lhs_plaintexts[slot];
                 first_term + second_term
             })
@@ -228,7 +230,10 @@ impl<M: PolyMatrix> Evaluable for BggPolyEncoding<M> {
                 .into_par_iter()
                 .map(|vector| vector.into_compact_bytes())
                 .collect(),
-            pubkey: self.pubkey.to_compact(),
+            pubkey: BggPublicKeyCompact::new(
+                self.pubkey.matrix.into_compact_bytes(),
+                self.pubkey.reveal_plaintext,
+            ),
             plaintext_bytes: self.plaintexts.map(|plaintexts| {
                 plaintexts.into_par_iter().map(|plaintext| plaintext.to_compact_bytes()).collect()
             }),
@@ -242,7 +247,10 @@ impl<M: PolyMatrix> Evaluable for BggPolyEncoding<M> {
                 .par_iter()
                 .map(|bytes| M::from_compact_bytes(params, bytes))
                 .collect(),
-            BggPolyPublicKey::from_compact(params, &compact.pubkey),
+            BggPublicKey {
+                matrix: M::from_compact_bytes(params, &compact.pubkey.matrix_bytes),
+                reveal_plaintext: compact.pubkey.reveal_plaintext,
+            },
             compact.plaintext_bytes.as_ref().map(|plaintexts| {
                 plaintexts.par_iter().map(|bytes| M::P::from_compact_bytes(params, bytes)).collect()
             }),
@@ -280,7 +288,7 @@ impl<M: PolyMatrix> Evaluable for BggPolyEncoding<M> {
 
     fn large_scalar_mul(&self, params: &Self::Params, scalar: &[BigUint]) -> Self {
         let scalar_poly = Self::P::from_biguints(params, scalar);
-        let row_size = self.pubkey.bgg_pubkey.matrix.row_size();
+        let row_size = self.pubkey.matrix.row_size();
         let scalar_gadget = M::gadget_matrix(params, row_size) * &scalar_poly;
         let vectors =
             self.vectors.par_iter().map(|vector| vector.mul_decompose(&scalar_gadget)).collect();
@@ -295,22 +303,43 @@ impl<M: PolyMatrix> Evaluable for BggPolyEncoding<M> {
 mod tests {
     use super::BggPolyEncoding;
     use crate::{
-        bgg::{encoding::BggEncoding, sampler::BGGPublicKeySampler},
-        bgg_poly::public_key::BggPolyPublicKey,
+        bgg::{encoding::BggEncoding, public_key::BggPublicKey, sampler::BGGPublicKeySampler},
         circuit::evaluable::Evaluable,
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
-        poly::{PolyParams, dcrt::params::DCRTPolyParams},
+        poly::{Poly, PolyParams, dcrt::params::DCRTPolyParams},
         sampler::hash::DCRTPolyHashSampler,
-        utils::create_random_poly,
+        utils::{block_size, create_random_poly},
     };
     use keccak_asm::Keccak256;
     use num_bigint::BigUint;
+    use std::path::Path;
+    use tempfile::tempdir;
 
     fn random_row_vector(params: &DCRTPolyParams, columns: usize) -> DCRTPolyMatrix {
         DCRTPolyMatrix::from_poly_vec_row(
             params,
             (0..columns).map(|_| create_random_poly(params)).collect(),
         )
+    }
+
+    fn write_matrix_to_files(matrix: &DCRTPolyMatrix, dir: &Path, id: &str) {
+        let entries_bytes = matrix
+            .block_entries(0..matrix.row_size(), 0..matrix.col_size())
+            .into_iter()
+            .map(|row| row.into_iter().map(|poly| poly.to_compact_bytes()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let bytes = bincode::encode_to_vec(&entries_bytes, bincode::config::standard()).unwrap();
+        let path = dir.join(format!(
+            "{}_{}_{}.{}_{}.{}.matrix",
+            id,
+            block_size(),
+            0,
+            matrix.row_size(),
+            0,
+            matrix.col_size()
+        ));
+        std::fs::write(&path, bytes)
+            .unwrap_or_else(|_| panic!("Failed to write matrix file {path:?}"));
     }
 
     #[test]
@@ -323,7 +352,7 @@ mod tests {
         let columns = d * params.modulus_digits();
         let sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
         let sampled_pub_keys = sampler.sample(&params, &tag.to_le_bytes(), &[true, true, true]);
-        let pubkey = BggPolyPublicKey { bgg_pubkey: sampled_pub_keys[1].clone(), num_slots };
+        let pubkey = sampled_pub_keys[1].clone();
 
         let lhs = BggPolyEncoding::new(
             (0..num_slots).map(|_| random_row_vector(&params, columns)).collect(),
@@ -353,8 +382,8 @@ mod tests {
         let columns = d * params.modulus_digits();
         let sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
         let sampled_pub_keys = sampler.sample(&params, &tag.to_le_bytes(), &[true, true, true]);
-        let lhs_pubkey = BggPolyPublicKey { bgg_pubkey: sampled_pub_keys[1].clone(), num_slots };
-        let rhs_pubkey = BggPolyPublicKey { bgg_pubkey: sampled_pub_keys[2].clone(), num_slots };
+        let lhs_pubkey = sampled_pub_keys[1].clone();
+        let rhs_pubkey = sampled_pub_keys[2].clone();
         let lhs = BggPolyEncoding::new(
             (0..num_slots).map(|_| random_row_vector(&params, columns)).collect(),
             lhs_pubkey.clone(),
@@ -370,11 +399,11 @@ mod tests {
             .map(|slot| {
                 BggEncoding::new(
                     lhs.vectors[slot].clone(),
-                    lhs_pubkey.bgg_pubkey.clone(),
+                    lhs_pubkey.clone(),
                     lhs.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
                 ) + &BggEncoding::new(
                     rhs.vectors[slot].clone(),
-                    rhs_pubkey.bgg_pubkey.clone(),
+                    rhs_pubkey.clone(),
                     rhs.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
                 )
             })
@@ -393,11 +422,11 @@ mod tests {
             .map(|slot| {
                 BggEncoding::new(
                     lhs.vectors[slot].clone(),
-                    lhs_pubkey.bgg_pubkey.clone(),
+                    lhs_pubkey.clone(),
                     lhs.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
                 ) - &BggEncoding::new(
                     rhs.vectors[slot].clone(),
-                    rhs_pubkey.bgg_pubkey.clone(),
+                    rhs_pubkey.clone(),
                     rhs.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
                 )
             })
@@ -416,11 +445,11 @@ mod tests {
             .map(|slot| {
                 BggEncoding::new(
                     lhs.vectors[slot].clone(),
-                    lhs_pubkey.bgg_pubkey.clone(),
+                    lhs_pubkey.clone(),
                     lhs.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
                 ) * &BggEncoding::new(
                     rhs.vectors[slot].clone(),
-                    rhs_pubkey.bgg_pubkey.clone(),
+                    rhs_pubkey.clone(),
                     rhs.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
                 )
             })
@@ -439,12 +468,12 @@ mod tests {
     #[test]
     fn test_bgg_poly_encoding_new_rejects_slot_mismatch() {
         let params = DCRTPolyParams::default();
-        let pubkey = BggPolyPublicKey::new(DCRTPolyMatrix::identity(&params, 1, None), true, 2);
+        let pubkey = BggPublicKey::new(DCRTPolyMatrix::identity(&params, 1, None), true);
         let panic = std::panic::catch_unwind(|| {
             let _ = BggPolyEncoding::new(
                 vec![DCRTPolyMatrix::identity(&params, 1, None)],
                 pubkey,
-                None,
+                Some(vec![create_random_poly(&params), create_random_poly(&params)]),
             );
         })
         .expect_err("slot mismatch should panic");
@@ -454,7 +483,7 @@ mod tests {
             .or_else(|| panic.downcast_ref::<&str>().copied())
             .expect("panic payload should be a string");
         assert!(
-            panic_msg.contains("BggPolyEncoding::new requires vectors.len() == pubkey.num_slots")
+            panic_msg.contains("BggPolyEncoding::new requires plaintexts.len() == vectors.len()")
         );
     }
 
@@ -468,7 +497,7 @@ mod tests {
         let columns = d * params.modulus_digits();
         let sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
         let sampled_pub_keys = sampler.sample(&params, &tag.to_le_bytes(), &[true, true, true]);
-        let pubkey = BggPolyPublicKey { bgg_pubkey: sampled_pub_keys[1].clone(), num_slots };
+        let pubkey = sampled_pub_keys[1].clone();
         let encoding = BggPolyEncoding::new(
             (0..num_slots).map(|_| random_row_vector(&params, columns)).collect(),
             pubkey.clone(),
@@ -484,7 +513,7 @@ mod tests {
         for slot in 0..num_slots {
             let expected = BggEncoding::new(
                 encoding.vectors[slot].clone(),
-                pubkey.bgg_pubkey.clone(),
+                pubkey.clone(),
                 encoding.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
             )
             .rotate(&params, 1);
@@ -500,7 +529,7 @@ mod tests {
         for slot in 0..num_slots {
             let expected = BggEncoding::new(
                 encoding.vectors[slot].clone(),
-                pubkey.bgg_pubkey.clone(),
+                pubkey.clone(),
                 encoding.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
             )
             .small_scalar_mul(&params, &[1, 2, 3]);
@@ -517,7 +546,7 @@ mod tests {
         for slot in 0..num_slots {
             let expected = BggEncoding::new(
                 encoding.vectors[slot].clone(),
-                pubkey.bgg_pubkey.clone(),
+                pubkey.clone(),
                 encoding.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
             )
             .large_scalar_mul(&params, &large_scalar);
@@ -527,5 +556,38 @@ mod tests {
                 expected.plaintext
             );
         }
+    }
+
+    #[test]
+    fn test_bgg_poly_encoding_read_from_files() {
+        let key: [u8; 32] = rand::random();
+        let tag: u64 = rand::random();
+        let params = DCRTPolyParams::default();
+        let d = 3;
+        let num_slots = 2;
+        let log_base_q = params.modulus_digits();
+        let columns = d * log_base_q;
+        let sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
+        let sampled_pub_keys = sampler.sample(&params, &tag.to_le_bytes(), &[true, true, true]);
+        let pubkey = sampled_pub_keys[1].clone();
+        let vectors =
+            (0..num_slots).map(|_| random_row_vector(&params, columns)).collect::<Vec<_>>();
+        let plaintexts = (0..num_slots).map(|_| create_random_poly(&params)).collect::<Vec<_>>();
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        for (slot, vector) in vectors.iter().enumerate() {
+            write_matrix_to_files(vector, dir_path, &format!("sample_slot_{slot}_vector"));
+        }
+        write_matrix_to_files(&pubkey.matrix, dir_path, "sample_pubkey");
+        for (slot, plaintext) in plaintexts.iter().enumerate() {
+            plaintext.write_to_file(dir_path, &format!("sample_slot_{slot}_plaintext"));
+        }
+
+        let restored = BggPolyEncoding::<DCRTPolyMatrix>::read_from_files(
+            &params, d, log_base_q, dir_path, "sample", true, num_slots,
+        );
+
+        assert_eq!(restored, BggPolyEncoding::new(vectors, pubkey, Some(plaintexts)));
     }
 }

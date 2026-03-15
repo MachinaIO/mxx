@@ -7,6 +7,7 @@ This repository provides implementations for lattice-cryptography operations (po
 - All documentation in this repository, along with git commit messages and PRs, must be written in English.
 - When documenting file paths, use only paths relative to the repository top directory. Do not write absolute paths in documentation.
 - Directories named `references` are read-only reference directories for humans and agents. Agents may read them when relevant and must never edit them.
+- Integration tests must not be run unless the user has explicitly asked for them in the current session. Prefer targeted unit tests or other narrow validation until such approval is given.
 
 ## Codex Workflow
 This repository uses a long-running Codex session workflow governed by `BUILDER.md` and `PLANS.md`.

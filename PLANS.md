@@ -33,6 +33,7 @@ The session plan is also the workflow state. The `## Plan approval` section is t
 ## Working Rules
 - Narrative sections such as Goal, Constraints, Repo facts / assumptions, and Acceptance criteria should be written in plain prose first. Use bullets only when they make the plan clearer.
 - After each subtask, run the most relevant unit tests immediately so bugs are caught with the smallest possible change scope.
+- Do not run integration tests unless the user has explicitly requested them in the current session; otherwise keep validation scoped to the narrowest relevant tests and record that limitation in the plan when it matters.
 - Each subtask must be small enough that implementation plus debugging fits within one context window.
 - If multiple subtasks do not touch the same files and do not require shared context, the builder should actively parallelize them with sub agents.
 - Session-specific plans are living documents and must be updated throughout the task.

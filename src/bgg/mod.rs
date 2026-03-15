@@ -400,24 +400,28 @@ mod tests {
 
         let mut sub_circuit = PolyCircuit::new();
         let sub_inputs = sub_circuit.input(2);
-        let sub_add = sub_circuit.add_gate(sub_inputs[0], sub_inputs[1]);
-        sub_circuit.output(vec![sub_add]);
+        let add_gate = sub_circuit.add_gate(sub_inputs[0], sub_inputs[1]);
+        let mul_gate = sub_circuit.mul_gate(sub_inputs[0], sub_inputs[1]);
+        sub_circuit.output(vec![add_gate, mul_gate]);
 
-        let mut circuit = PolyCircuit::new();
-        let circuit_inputs = circuit.input(2);
-        let sub_id = circuit.register_sub_circuit(sub_circuit);
-        let outputs = circuit.call_sub_circuit(sub_id, &[circuit_inputs[0], circuit_inputs[1]]);
-        circuit.output(outputs.clone());
+        let mut main_circuit = PolyCircuit::new();
+        let main_inputs = main_circuit.input(2);
+        let sub_circuit_id = main_circuit.register_sub_circuit(sub_circuit);
+        let sub_outputs =
+            main_circuit.call_sub_circuit(sub_circuit_id, &[main_inputs[0], main_inputs[1]]);
+        assert_eq!(sub_outputs.len(), 2);
+        let final_gate = main_circuit.sub_gate(sub_outputs[0], sub_outputs[1]);
+        main_circuit.output(vec![final_gate]);
 
         let eval_inputs = vec![enc1.clone(), enc2.clone()];
-        let result = circuit.eval(
+        let result = main_circuit.eval(
             &params,
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
-        let expected = enc1.clone() + enc2.clone();
+        let expected = (enc1.clone() + enc2.clone()) - (enc1.clone() * enc2.clone());
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].vector, expected.vector);
@@ -436,27 +440,37 @@ mod tests {
         let enc2 = encodings[2].clone();
         let enc3 = encodings[3].clone();
 
-        let mut inner = PolyCircuit::new();
-        let inner_inputs = inner.input(2);
-        let inner_mul = inner.mul_gate(inner_inputs[0], inner_inputs[1]);
-        inner.output(vec![inner_mul]);
+        let mut inner_circuit = PolyCircuit::new();
+        let inner_inputs = inner_circuit.input(2);
+        let mul_gate = inner_circuit.mul_gate(inner_inputs[0], inner_inputs[1]);
+        inner_circuit.output(vec![mul_gate]);
 
-        let mut outer = PolyCircuit::new();
-        let outer_inputs = outer.input(3);
-        let inner_id = outer.register_sub_circuit(inner);
-        let inner_outputs = outer.call_sub_circuit(inner_id, &[outer_inputs[0], outer_inputs[1]]);
-        let final_add = outer.add_gate(inner_outputs[0], outer_inputs[2]);
-        outer.output(vec![final_add]);
+        let mut middle_circuit = PolyCircuit::new();
+        let middle_inputs = middle_circuit.input(3);
+        let inner_circuit_id = middle_circuit.register_sub_circuit(inner_circuit);
+        let inner_outputs = middle_circuit
+            .call_sub_circuit(inner_circuit_id, &[middle_inputs[0], middle_inputs[1]]);
+        let add_gate = middle_circuit.add_gate(inner_outputs[0], middle_inputs[2]);
+        middle_circuit.output(vec![add_gate]);
+
+        let mut main_circuit = PolyCircuit::new();
+        let main_inputs = main_circuit.input(3);
+        let middle_circuit_id = main_circuit.register_sub_circuit(middle_circuit);
+        let middle_outputs = main_circuit
+            .call_sub_circuit(middle_circuit_id, &[main_inputs[0], main_inputs[1], main_inputs[2]]);
+        let scalar_mul_gate = main_circuit.mul_gate(middle_outputs[0], middle_outputs[0]);
+        main_circuit.output(vec![scalar_mul_gate]);
 
         let eval_inputs = vec![enc1.clone(), enc2.clone(), enc3.clone()];
-        let result = outer.eval(
+        let result = main_circuit.eval(
             &params,
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
         );
 
-        let expected = (enc1.clone() * enc2.clone()) + enc3.clone();
+        let expected = ((enc1.clone() * enc2.clone()) + enc3.clone()) *
+            ((enc1.clone() * enc2.clone()) + enc3.clone());
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].vector, expected.vector);

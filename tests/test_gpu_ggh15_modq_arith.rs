@@ -393,7 +393,9 @@ async fn test_gpu_ggh15_modq_arith() {
         input_values.iter().fold(BigUint::from(1u64), |acc, value| (acc * value) % &active_q);
     let plaintext_inputs: Vec<GpuDCRTPoly> = input_values
         .iter()
-        .flat_map(|value| encode_nested_rns_poly(cfg.p_moduli_bits, &params, value, q_level))
+        .flat_map(|value| {
+            encode_nested_rns_poly(cfg.p_moduli_bits, &params, std::slice::from_ref(value), q_level)
+        })
         .collect();
 
     let dry_circuit = build_modq_arith_value_circuit_gpu(

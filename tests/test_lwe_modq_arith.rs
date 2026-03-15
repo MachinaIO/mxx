@@ -276,7 +276,9 @@ async fn test_lwe_modq_arith() {
         input_values.iter().fold(BigUint::from(1u64), |acc, value| (acc * value) % &active_q);
     let plaintext_inputs = input_values
         .iter()
-        .flat_map(|value| encode_nested_rns_poly(P_MODULI_BITS, &params, value, q_level))
+        .flat_map(|value| {
+            encode_nested_rns_poly(P_MODULI_BITS, &params, std::slice::from_ref(value), q_level)
+        })
         .collect::<Vec<_>>();
     let plaintext_inputs_shared = plaintext_inputs.clone();
 

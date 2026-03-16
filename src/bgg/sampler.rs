@@ -1,3 +1,7 @@
+#[cfg(feature = "gpu")]
+#[path = "sampler_gpu.rs"]
+mod gpu;
+
 use crate::{
     bgg::{encoding::BggEncoding, poly_encoding::BggPolyEncoding, public_key::BggPublicKey},
     matrix::PolyMatrix,
@@ -6,8 +10,29 @@ use crate::{
     sampler::{DistType, PolyHashSampler, PolyUniformSampler},
 };
 use rayon::prelude::*;
-use std::{borrow::Borrow, marker::PhantomData};
+use std::{borrow::Borrow, marker::PhantomData, sync::Arc};
 use tracing::debug;
+
+#[cfg(feature = "gpu")]
+fn effective_slot_parallelism<M: PolyMatrix>(
+    params: &<M::P as Poly>::Params,
+    num_slots: usize,
+) -> usize {
+    if num_slots == 0 {
+        return 0;
+    }
+
+    gpu::effective_slot_parallelism_gpu(params, num_slots)
+}
+
+#[cfg(not(feature = "gpu"))]
+fn effective_slot_parallelism<M: PolyMatrix>(
+    params: &<M::P as Poly>::Params,
+    num_slots: usize,
+) -> usize {
+    let _ = params;
+    num_slots
+}
 
 /// A sampler of a public key A in the BGG+ RLWE encoding scheme
 #[derive(Clone)]
@@ -217,18 +242,27 @@ where
         num_slots: usize,
     ) -> Vec<S::M> {
         let secret_vec_size = self.secret_vec.col_size();
-        (0..num_slots)
-            .into_par_iter()
-            .map(|_| {
-                let uniform_sampler = S::new();
-                uniform_sampler.sample_uniform(
-                    params,
-                    secret_vec_size,
-                    secret_vec_size,
-                    DistType::TernaryDist,
-                )
-            })
-            .collect()
+        let slot_parallelism = effective_slot_parallelism::<S::M>(params, num_slots);
+        let mut slot_secret_mats = Vec::with_capacity(num_slots);
+
+        for slot_start in (0..num_slots).step_by(slot_parallelism.max(1)) {
+            let chunk_len = (slot_start + slot_parallelism).min(num_slots) - slot_start;
+            let mut chunk_secret_mats = (0..chunk_len)
+                .into_par_iter()
+                .map(|_| {
+                    let uniform_sampler = S::new();
+                    uniform_sampler.sample_uniform(
+                        params,
+                        secret_vec_size,
+                        secret_vec_size,
+                        DistType::TernaryDist,
+                    )
+                })
+                .collect::<Vec<_>>();
+            slot_secret_mats.append(&mut chunk_secret_mats);
+        }
+
+        slot_secret_mats
     }
 
     pub fn sample_with_slot_secret_mats<K, T>(
@@ -260,62 +294,82 @@ where
         let ncol = secret_vec_size * log_base_q;
         let base_secret_vec = self.secret_vec.clone();
         let gauss_sigma = self.gauss_sigma;
+        let slot_parallelism = effective_slot_parallelism::<S::M>(params, num_slots);
         let all_public_key_matrix: S::M = public_keys[0].borrow().matrix.concat_columns(
             &public_keys[1..].par_iter().map(|pk| &pk.borrow().matrix).collect::<Vec<_>>(),
         );
         let gadget = S::M::gadget_matrix(params, secret_vec_size);
         let constant_plaintexts =
             vec![<<S as PolyUniformSampler>::M as PolyMatrix>::P::const_one(params); num_slots];
-        let mut extended_plaintexts = Vec::with_capacity(packed_input_size);
-        extended_plaintexts.push(constant_plaintexts);
-        extended_plaintexts
-            .extend(plaintexts.par_iter().map(|slots| slots.as_ref().to_vec()).collect::<Vec<_>>());
+        let mut encoding_vector_bytes = (0..packed_input_size)
+            .map(|_| Vec::with_capacity(num_slots))
+            .collect::<Vec<Vec<Arc<[u8]>>>>();
 
-        let slot_vectors = (0..num_slots)
-            .into_par_iter()
-            .map(|slot| {
-                let transformed_secret_vec = base_secret_vec.clone() * &slot_secret_mats[slot];
-                let error: S::M = match gauss_sigma {
-                    None => S::M::zero(params, 1, ncol * packed_input_size),
-                    Some(sigma) => {
-                        let error_sampler = S::new();
-                        error_sampler.sample_uniform(
-                            params,
-                            1,
-                            ncol * packed_input_size,
-                            DistType::GaussDist { sigma },
-                        )
-                    }
-                };
-                let slot_plaintexts = extended_plaintexts
-                    .par_iter()
-                    .map(|plaintext_row| plaintext_row[slot].clone())
+        for slot_start in (0..num_slots).step_by(slot_parallelism.max(1)) {
+            let chunk_len = (slot_start + slot_parallelism).min(num_slots) - slot_start;
+            let chunk_slot_vectors = (0..chunk_len)
+                .into_par_iter()
+                .map(|offset| {
+                    let slot = slot_start + offset;
+                    let transformed_secret_vec = base_secret_vec.clone() * &slot_secret_mats[slot];
+                    let error: S::M = match gauss_sigma {
+                        None => S::M::zero(params, 1, ncol * packed_input_size),
+                        Some(sigma) => {
+                            let error_sampler = S::new();
+                            error_sampler.sample_uniform(
+                                params,
+                                1,
+                                ncol * packed_input_size,
+                                DistType::GaussDist { sigma },
+                            )
+                        }
+                    };
+                    let slot_plaintexts = std::iter::once(
+                        <<S as PolyUniformSampler>::M as PolyMatrix>::P::const_one(params),
+                    )
+                    .chain(
+                        plaintexts.iter().map(|plaintext_row| plaintext_row.as_ref()[slot].clone()),
+                    )
                     .collect::<Vec<_>>();
-                let encoded_polys_vec = S::M::from_poly_vec_row(params, slot_plaintexts);
-                let first_term = transformed_secret_vec.clone() * &all_public_key_matrix;
-                let second_term = encoded_polys_vec.tensor(&(transformed_secret_vec * &gadget));
-                let all_vector = first_term - second_term + error;
+                    let encoded_polys_vec = S::M::from_poly_vec_row(params, slot_plaintexts);
+                    let first_term = transformed_secret_vec.clone() * &all_public_key_matrix;
+                    let second_term = encoded_polys_vec.tensor(&(transformed_secret_vec * &gadget));
+                    let all_vector = first_term - second_term + error;
 
-                (0..packed_input_size)
-                    .map(|idx| all_vector.slice_columns(ncol * idx, ncol * (idx + 1)))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+                    (0..packed_input_size)
+                        .map(|idx| {
+                            Arc::<[u8]>::from(
+                                all_vector
+                                    .slice_columns(ncol * idx, ncol * (idx + 1))
+                                    .into_compact_bytes(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
 
-        (0..packed_input_size)
+            for slot_vector_bytes in chunk_slot_vectors {
+                for (idx, vector_bytes) in slot_vector_bytes.into_iter().enumerate() {
+                    encoding_vector_bytes[idx].push(vector_bytes);
+                }
+            }
+        }
+
+        encoding_vector_bytes
             .into_par_iter()
-            .map(|idx| {
+            .enumerate()
+            .map(|(idx, vector_bytes)| {
                 let pubkey = public_keys[idx].borrow().clone();
-                BggPolyEncoding::new(
-                    params.clone(),
-                    slot_vectors.par_iter().map(|slot| slot[idx].clone()).collect(),
-                    pubkey.clone(),
-                    if pubkey.reveal_plaintext {
-                        Some(extended_plaintexts[idx].clone())
+                let plaintexts = if pubkey.reveal_plaintext {
+                    Some(if idx == 0 {
+                        constant_plaintexts.clone()
                     } else {
-                        None
-                    },
-                )
+                        plaintexts[idx - 1].as_ref().to_vec()
+                    })
+                } else {
+                    None
+                };
+                BggPolyEncoding::from_vector_bytes(params.clone(), vector_bytes, pubkey, plaintexts)
             })
             .collect()
     }

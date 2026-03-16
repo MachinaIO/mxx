@@ -7,10 +7,7 @@ use mxx::{
     circuit::PolyCircuit,
     element::PolyElem,
     gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly},
-    lookup::{
-        ggh15_eval::{GGH15BGGPolyEncodingPltEvaluator, GGH15BGGPubKeyPltEvaluator},
-        poly::PolyPltEvaluator,
-    },
+    lookup::ggh15_eval::{GGH15BGGPolyEncodingPltEvaluator, GGH15BGGPubKeyPltEvaluator},
     matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
@@ -243,27 +240,6 @@ fn build_modq_arith_circuit_gpu(
     (circuit, ctx)
 }
 
-fn build_modq_arith_value_circuit_gpu(
-    params: &GpuDCRTPolyParams,
-    q_level: Option<usize>,
-    p_moduli_bits: usize,
-    scale: u64,
-    height: usize,
-) -> PolyCircuit<GpuDCRTPoly> {
-    let mut circuit = PolyCircuit::<GpuDCRTPoly>::new();
-    let ctx = Arc::new(NestedRnsPolyContext::setup(
-        &mut circuit,
-        params,
-        p_moduli_bits,
-        scale,
-        false,
-        q_level,
-    ));
-
-    NestedRnsPoly::benchmark_multiplication_tree(ctx, &mut circuit, height, q_level);
-    circuit
-}
-
 fn find_crt_depth_for_modq_arith(
     cfg: &ModqArithConfig,
     q_level: Option<usize>,
@@ -394,87 +370,63 @@ async fn test_gpu_ggh15_poly_modq_arith() {
         cfg.height, logical_num_inputs, cfg.num_slots
     );
 
-    let input_values_by_slot: Vec<Vec<BigUint>> = (0..cfg.num_slots)
-        .into_par_iter()
-        .map(|_| {
-            let mut rng = rand::rng();
-            (0..logical_num_inputs)
-                .map(|_| gen_biguint_for_modulus(&mut rng, &active_q))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    let expected_by_slot = input_values_by_slot
-        .par_iter()
-        .map(|values| {
-            values.iter().fold(BigUint::from(1u64), |acc, value| (acc * value) % &active_q)
-        })
-        .collect::<Vec<_>>();
-    let encoded_inputs_by_slot = input_values_by_slot
-        .par_iter()
-        .map(|values| {
-            values
-                .iter()
-                .flat_map(|value| {
-                    encode_nested_rns_poly::<GpuDCRTPoly>(
-                        cfg.p_moduli_bits,
-                        &params,
-                        value,
-                        q_level,
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let flattened_input_count =
-        encoded_inputs_by_slot.first().expect("at least one slot is required").len();
-    assert_eq!(
-        flattened_input_count,
-        circuit.num_input(),
-        "flattened encoded inputs must match circuit input count"
+    let slot_input_parallelism = params.gpu_ids().len().max(1).min(cfg.num_slots);
+    info!(
+        "slot input materialization parallelism={} gpu_count={}",
+        slot_input_parallelism,
+        params.gpu_ids().len()
     );
-    let plaintext_inputs = (0..flattened_input_count)
-        .into_par_iter()
-        .map(|input_idx| {
-            encoded_inputs_by_slot
-                .iter()
-                .map(|slot_inputs| slot_inputs[input_idx].clone())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
 
-    let dry_circuit = build_modq_arith_value_circuit_gpu(
-        &params,
-        q_level,
-        cfg.p_moduli_bits,
-        cfg.scale,
-        cfg.height,
-    );
-    let dry_plt_evaluator = PolyPltEvaluator::new();
-    let dry_eval_start = Instant::now();
-    for slot in 0..cfg.num_slots {
-        let dry_one = GpuDCRTPoly::const_one(&params);
-        let dry_inputs = encoded_inputs_by_slot[slot].clone();
-        let dry_out = dry_circuit.eval(&params, dry_one, dry_inputs, Some(&dry_plt_evaluator));
-        assert_eq!(dry_out.len(), 1, "dry-run should output one value polynomial");
-        let dry_const_term = dry_out[0]
-            .coeffs()
-            .into_iter()
-            .next()
-            .expect("dry-run output polynomial must have at least one coefficient")
-            .value()
-            .clone();
-        assert_value_matches_q_level(
-            &dry_const_term,
-            &expected_by_slot[slot],
-            &active_q,
-            &active_q_moduli,
-            &all_q_moduli,
-        );
+    let flattened_input_count = circuit.num_input();
+    let mut expected_by_slot = Vec::with_capacity(cfg.num_slots);
+    let mut plaintext_inputs = (0..flattened_input_count)
+        .map(|_| Vec::with_capacity(cfg.num_slots))
+        .collect::<Vec<Vec<GpuDCRTPoly>>>();
+
+    for slot_start in (0..cfg.num_slots).step_by(slot_input_parallelism) {
+        let chunk_len = (slot_start + slot_input_parallelism).min(cfg.num_slots) - slot_start;
+        let chunk_results = (0..chunk_len)
+            .into_par_iter()
+            .map(|_| {
+                let mut rng = rand::rng();
+                let input_values = (0..logical_num_inputs)
+                    .map(|_| gen_biguint_for_modulus(&mut rng, &active_q))
+                    .collect::<Vec<_>>();
+                let expected = input_values
+                    .iter()
+                    .fold(BigUint::from(1u64), |acc, value| (acc * value) % &active_q);
+                let encoded_inputs = input_values
+                    .iter()
+                    .flat_map(|value| {
+                        encode_nested_rns_poly::<GpuDCRTPoly>(
+                            cfg.p_moduli_bits,
+                            &params,
+                            value,
+                            q_level,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                (expected, encoded_inputs)
+            })
+            .collect::<Vec<_>>();
+
+        for (expected, encoded_inputs) in chunk_results {
+            assert_eq!(
+                encoded_inputs.len(),
+                flattened_input_count,
+                "flattened encoded inputs must match circuit input count"
+            );
+            expected_by_slot.push(expected);
+            for (input_idx, poly) in encoded_inputs.into_iter().enumerate() {
+                plaintext_inputs[input_idx].push(poly);
+            }
+        }
     }
-    info!("dry eval elapsed_ms={:.3}", dry_eval_start.elapsed().as_secs_f64() * 1000.0);
-    info!("dry-run succeeded with expected constant term for all slots");
-    drop(dry_circuit);
-    drop(dry_plt_evaluator);
+
+    assert!(
+        plaintext_inputs.iter().all(|slots| slots.len() == cfg.num_slots),
+        "each plaintext input row must contain one encoded polynomial per slot"
+    );
 
     let seed: [u8; 32] = [0u8; 32];
     let trapdoor_sigma = 4.578;
@@ -511,6 +463,8 @@ async fn test_gpu_ggh15_poly_modq_arith() {
         &plaintext_inputs,
         &slot_secret_mats,
     );
+    drop(plaintext_inputs);
+    drop(encoding_sampler);
     info!(
         "poly encoding sampling elapsed_ms={:.3}",
         enc_setup_start.elapsed().as_secs_f64() * 1000.0

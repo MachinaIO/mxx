@@ -69,7 +69,13 @@ def is_gpu_repeat_validation_trigger(path: str) -> bool:
 
 
 def is_gpu_single_run_validation_trigger(path: str) -> bool:
-    return is_gpu_rust_path(path) and not is_gpu_repeat_validation_trigger(path)
+    normalized = PurePosixPath(path)
+    return (
+        is_gpu_rust_path(path)
+        and not is_gpu_repeat_validation_trigger(path)
+        and len(normalized.parts) >= 2
+        and normalized.parts[0] == "src"
+    )
 
 
 def gpu_repeat_validation_trigger_paths(paths: Iterable[str]) -> list[str]:

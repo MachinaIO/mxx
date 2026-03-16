@@ -1,7 +1,16 @@
 use super::*;
 use crate::{bgg::public_key::BggPublicKey, poly::PolyParams};
 use rayon::prelude::*;
-use std::{ops::Mul, path::Path, sync::Arc};
+use std::{
+    ops::Mul,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Instant,
+};
+use tracing::debug;
 
 use crate::lookup::ggh15::encoding::GGH15PublicLookupSharedState;
 
@@ -124,27 +133,65 @@ where
     M::P: Send + Sync,
     for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
 {
+    let evaluate_started = Instant::now();
+    debug!(
+        "GGH15 BGG poly-encoding gpu slot evaluation started: gate_id={}, lut_id={}, slot_count={}, slot_parallelism={}",
+        gate_id,
+        lut_id,
+        input.num_slots(),
+        configured_parallelism
+    );
+    let prepare_started = Instant::now();
     let shared_by_device =
         prepare_public_lookup_shared_by_device::<M>(params, shared, configured_parallelism);
+    let prepared_device_ids =
+        shared_by_device.iter().map(|entry| entry.device_id).collect::<Vec<_>>();
+    debug!(
+        "Prepared GGH15 BGG poly-encoding gpu shared state: gate_id={}, lut_id={}, device_count={}, device_ids={:?}, elapsed_ms={:.3}",
+        gate_id,
+        lut_id,
+        shared_by_device.len(),
+        prepared_device_ids,
+        prepare_started.elapsed().as_secs_f64() * 1000.0
+    );
     let mut output_vector_bytes = Vec::with_capacity(input.num_slots());
     let mut output_plaintext_bytes = Vec::with_capacity(input.num_slots());
+    let completed_slots = AtomicUsize::new(0);
 
     for slot_start in (0..input.num_slots()).step_by(shared_by_device.len()) {
         let chunk_len = (slot_start + shared_by_device.len()).min(input.num_slots()) - slot_start;
+        let chunk_started = Instant::now();
         let chunk_shared = &shared_by_device[..chunk_len];
+        let chunk_device_ids = chunk_shared.iter().map(|entry| entry.device_id).collect::<Vec<_>>();
+        debug!(
+            "GGH15 BGG poly-encoding gpu slot chunk started: gate_id={}, lut_id={}, slot_range=[{}, {}), chunk_size={}, device_ids={:?}, completed_before={}/{}",
+            gate_id,
+            lut_id,
+            slot_start,
+            slot_start + chunk_len,
+            chunk_len,
+            chunk_device_ids,
+            completed_slots.load(Ordering::Relaxed),
+            input.num_slots()
+        );
         let c_b0_chunk = &c_b0_compact_bytes_by_slot[slot_start..slot_start + chunk_len];
         let input_vector_chunk = &input.vector_bytes[slot_start..slot_start + chunk_len];
         let x_chunk = &plaintext_compact_bytes_by_slot[slot_start..slot_start + chunk_len];
         let mut chunk_outputs = (0..chunk_len)
             .into_par_iter()
             .map(|offset| {
+                let slot_idx = slot_start + offset;
+                let slot_started = Instant::now();
                 let device_shared = &chunk_shared[offset];
-                let _ = device_shared.device_id;
+                let device_id = device_shared.device_id;
                 let local_params = &device_shared.params;
+                let decode_started = Instant::now();
                 let c_b0 = M::from_compact_bytes(local_params, c_b0_chunk[offset].as_ref());
                 let input_vector =
                     M::from_compact_bytes(local_params, input_vector_chunk[offset].as_ref());
                 let x = M::P::from_compact_bytes(local_params, x_chunk[offset].as_ref());
+                let decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+                let apply_started = Instant::now();
                 let slot_output = apply_public_lookup_to_slot::<M, HS>(
                     local_params,
                     plt,
@@ -158,20 +205,53 @@ where
                     gate_id,
                     lut_id,
                 );
+                let apply_ms = apply_started.elapsed().as_secs_f64() * 1000.0;
+                let serialize_started = Instant::now();
+                let vector_bytes = Arc::<[u8]>::from(slot_output.vector.into_compact_bytes());
+                let plaintext_bytes = Arc::<[u8]>::from(slot_output.plaintext.to_compact_bytes());
+                let serialize_ms = serialize_started.elapsed().as_secs_f64() * 1000.0;
                 drop(c_b0);
                 drop(input_vector);
                 drop(x);
-                (
-                    Arc::<[u8]>::from(slot_output.vector.into_compact_bytes()),
-                    Arc::<[u8]>::from(slot_output.plaintext.to_compact_bytes()),
-                )
+                let completed_slot_count = completed_slots.fetch_add(1, Ordering::Relaxed) + 1;
+                debug_slot_stage_timings(
+                    "GGH15 BGG poly-encoding gpu slot",
+                    gate_id,
+                    lut_id,
+                    slot_idx,
+                    completed_slot_count,
+                    input.num_slots(),
+                    decode_ms,
+                    apply_ms,
+                    serialize_ms,
+                    slot_started.elapsed().as_secs_f64() * 1000.0,
+                    Some(device_id),
+                );
+                (vector_bytes, plaintext_bytes)
             })
             .collect::<Vec<_>>();
         for (vector_bytes, plaintext_bytes) in chunk_outputs.drain(..) {
             output_vector_bytes.push(vector_bytes);
             output_plaintext_bytes.push(plaintext_bytes);
         }
+        debug!(
+            "GGH15 BGG poly-encoding gpu slot chunk finished: gate_id={}, lut_id={}, slot_range=[{}, {}), completed_after={}/{}, elapsed_ms={:.3}",
+            gate_id,
+            lut_id,
+            slot_start,
+            slot_start + chunk_len,
+            completed_slots.load(Ordering::Relaxed),
+            input.num_slots(),
+            chunk_started.elapsed().as_secs_f64() * 1000.0
+        );
     }
 
+    debug!(
+        "GGH15 BGG poly-encoding gpu slot evaluation finished: gate_id={}, lut_id={}, slot_count={}, elapsed_ms={:.3}",
+        gate_id,
+        lut_id,
+        input.num_slots(),
+        evaluate_started.elapsed().as_secs_f64() * 1000.0
+    );
     (output_vector_bytes, output_plaintext_bytes)
 }

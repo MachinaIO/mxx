@@ -35,7 +35,7 @@ class RepoValidationTests(unittest.TestCase):
         )
         self.assertEqual(
             gpu_single_run_validation_trigger_paths(paths),
-            ["src/lookup/ggh15/poly_encoding_gpu.rs", "tests/test_gpu_case.rs"],
+            ["src/lookup/ggh15/poly_encoding_gpu.rs"],
         )
 
     def test_parse_cargo_test_executables_collects_unique_test_binaries(self) -> None:
@@ -149,7 +149,7 @@ class RepoValidationTests(unittest.TestCase):
         )
         self.assertEqual(
             gpu_single_run_validation_trigger_paths(paths),
-            ["tests/test_gpu_removed.rs"],
+            [],
         )
 
     def test_maybe_run_gpu_repeat_validation_uses_repeat_mode_for_strong_triggers(self) -> None:

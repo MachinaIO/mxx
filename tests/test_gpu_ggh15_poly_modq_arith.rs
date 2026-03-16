@@ -169,6 +169,11 @@ fn assert_value_matches_q_level(
     }
 }
 
+fn round_div_biguint(value: &BigUint, divisor: &BigUint) -> BigUint {
+    let half = divisor >> 1;
+    (value + &half) / divisor
+}
+
 fn q_level_from_env() -> Option<usize> {
     std::env::var("GGH15_MODQ_ARITH_Q_LEVEL").ok().map(|raw| {
         let level =
@@ -356,9 +361,11 @@ async fn test_gpu_ggh15_poly_modq_arith() {
     );
     info!("forcing single GPU for this test: gpu_id={}", single_gpu_id);
     assert_eq!(params.modulus(), cpu_params.modulus());
+    let full_q = params.modulus();
 
     let (all_q_moduli, _, _) = params.to_crt();
     let (active_q_moduli, active_q, active_q_level) = active_q_moduli_and_modulus(&params, q_level);
+    let q_max = *active_q_moduli.iter().max().expect("active_q_moduli must not be empty");
     let (circuit, _ctx) =
         build_modq_arith_circuit_gpu(&params, q_level, cfg.p_moduli_bits, cfg.scale, cfg.height);
     info!("found crt_depth={}", crt_depth);
@@ -581,14 +588,49 @@ async fn test_gpu_ggh15_poly_modq_arith() {
     let gadget = GpuDCRTPolyMatrix::gadget_matrix(&params, d_secret);
 
     for slot in 0..cfg.num_slots {
+        let plaintext_coeffs = result_plaintexts[slot].coeffs();
+        let result_const_term = plaintext_coeffs
+            .first()
+            .expect("result plaintext polynomial must have at least one coefficient")
+            .value()
+            .clone();
+        assert_value_matches_q_level(
+            &result_const_term,
+            &expected_by_slot[slot],
+            &active_q,
+            &active_q_moduli,
+            &all_q_moduli,
+        );
+        let zero = BigUint::from(0u64);
+        assert!(
+            plaintext_coeffs.iter().skip(1).all(|coeff| coeff.value() == &zero),
+            "result plaintext polynomial must remain constant across non-zero coefficients"
+        );
+
         let expected_poly =
             GpuDCRTPoly::from_biguint_to_constant(&params, expected_by_slot[slot].clone());
-        assert_eq!(result_plaintexts[slot], expected_poly);
-
         let transformed_secret_vec = s_vec.clone() * &slot_secret_mats[slot];
-        let expected_vector = transformed_secret_vec.clone() * poly_out.pubkey.matrix.clone() -
-            (transformed_secret_vec * (gadget.clone() * result_plaintexts[slot].clone()));
-        assert_eq!(poly_out.vector(slot), expected_vector);
+        let expected_times_gadget =
+            transformed_secret_vec.clone() * (gadget.clone() * expected_poly);
+        let s_times_pk = transformed_secret_vec.clone() * &poly_out.pubkey.matrix;
+        let diff = poly_out.vector(slot) - s_times_pk + expected_times_gadget;
+        let coeff = diff
+            .entry(0, 0)
+            .coeffs()
+            .into_iter()
+            .next()
+            .expect("diff poly must have at least one coefficient")
+            .value()
+            .clone();
+
+        let random_int: u64 = rand::random::<u64>() % q_max;
+        let q_over_qmax = full_q.as_ref() / BigUint::from(q_max);
+        let randomized_coeff = coeff + q_over_qmax.clone() * BigUint::from(random_int);
+        let rounded = round_div_biguint(&randomized_coeff, &q_over_qmax);
+        let decoded_random: u64 = (&rounded % BigUint::from(q_max))
+            .try_into()
+            .expect("decoded random coefficient must fit u64");
+        assert_eq!(decoded_random, random_int);
     }
 
     gpu_device_sync();

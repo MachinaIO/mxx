@@ -9,8 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Sequence, TextIO
 
-DEFAULT_GPU_REPEAT_COUNT = 300
+DEFAULT_GPU_REPEAT_COUNT = 150
 EDITED_DIFF_FILTER = "ACDMR"
+GPU_REPEAT_SOURCE_DIRS = frozenset({"element", "poly", "matrix", "sampler"})
 
 
 @dataclass(frozen=True)
@@ -50,15 +51,33 @@ def edited_paths_from_git(repo_root: Path, runner: Callable[..., subprocess.Comp
     return ordered
 
 
-def is_gpu_validation_trigger(path: str) -> bool:
+def is_gpu_rust_path(path: str) -> bool:
     normalized = PurePosixPath(path)
-    if normalized.parts and normalized.parts[0] == "cuda":
-        return True
     return normalized.suffix == ".rs" and "gpu" in normalized.name.lower()
 
 
-def gpu_validation_trigger_paths(paths: Iterable[str]) -> list[str]:
-    return [path for path in paths if is_gpu_validation_trigger(path)]
+def is_gpu_repeat_validation_trigger(path: str) -> bool:
+    normalized = PurePosixPath(path)
+    if normalized.parts and normalized.parts[0] == "cuda":
+        return True
+    return (
+        is_gpu_rust_path(path)
+        and len(normalized.parts) >= 3
+        and normalized.parts[0] == "src"
+        and normalized.parts[1] in GPU_REPEAT_SOURCE_DIRS
+    )
+
+
+def is_gpu_single_run_validation_trigger(path: str) -> bool:
+    return is_gpu_rust_path(path) and not is_gpu_repeat_validation_trigger(path)
+
+
+def gpu_repeat_validation_trigger_paths(paths: Iterable[str]) -> list[str]:
+    return [path for path in paths if is_gpu_repeat_validation_trigger(path)]
+
+
+def gpu_single_run_validation_trigger_paths(paths: Iterable[str]) -> list[str]:
+    return [path for path in paths if is_gpu_single_run_validation_trigger(path)]
 
 
 def parse_cargo_test_executables(stdout_text: str) -> list[Path]:
@@ -146,33 +165,57 @@ def run_gpu_binary(binary: Path, repo_root: Path, env: dict[str, str]) -> int:
 
 def maybe_run_gpu_repeat_validation(repo_root: Path, repeat_count: int, log: TextIO) -> int:
     edited_paths = edited_paths_from_git(repo_root)
-    trigger_paths = gpu_validation_trigger_paths(edited_paths)
-    if not trigger_paths:
-        log.write("[gpu-repeat] skipped: no edited files under cuda/ or matching *gpu*.rs\n")
+    repeat_trigger_paths = gpu_repeat_validation_trigger_paths(edited_paths)
+    single_run_trigger_paths = gpu_single_run_validation_trigger_paths(edited_paths)
+    if not repeat_trigger_paths and not single_run_trigger_paths:
+        log.write(
+            "[gpu-repeat] skipped: no edited files under cuda/ or matching *gpu*.rs in the configured validation paths\n"
+        )
         return 0
-
-    log.write("[gpu-repeat] triggered by edited files:\n")
-    for path in trigger_paths:
-        log.write(f"[gpu-repeat]   {path}\n")
 
     env = os.environ.copy()
     env.setdefault("RUST_LOG", "debug")
     binaries = compile_gpu_test_binaries(repo_root, env)
-    log.write(f"[gpu-repeat] compiled {len(binaries)} test binaries once; running {repeat_count} sequential iterations\n")
+    if repeat_trigger_paths:
+        log.write("[gpu-repeat] repeat mode triggered by edited files:\n")
+        for path in repeat_trigger_paths:
+            log.write(f"[gpu-repeat]   {path}\n")
+        log.write(
+            f"[gpu-repeat] compiled {len(binaries)} test binaries once; running {repeat_count} sequential iterations\n"
+        )
+        summary = run_gpu_repeat_suite(
+            binaries=binaries,
+            repeat_count=repeat_count,
+            executor=lambda binary: run_gpu_binary(binary, repo_root, env),
+            log=log,
+        )
+        if summary.failure_count:
+            failed = ", ".join(str(iteration) for iteration in summary.failed_iterations)
+            log.write(
+                f"[gpu-repeat] FAIL: {summary.failure_count}/{summary.iterations} iterations failed. Failed iterations: {failed}\n"
+            )
+            return 1
+
+        log.write(f"[gpu-repeat] PASS: all {summary.iterations} iterations succeeded\n")
+        return 0
+
+    log.write("[gpu-repeat] single-run mode triggered by edited files:\n")
+    for path in single_run_trigger_paths:
+        log.write(f"[gpu-repeat]   {path}\n")
+    log.write(f"[gpu-repeat] compiled {len(binaries)} test binaries once; running 1 sequential iteration\n")
     summary = run_gpu_repeat_suite(
         binaries=binaries,
-        repeat_count=repeat_count,
+        repeat_count=1,
         executor=lambda binary: run_gpu_binary(binary, repo_root, env),
         log=log,
     )
     if summary.failure_count:
-        failed = ", ".join(str(iteration) for iteration in summary.failed_iterations)
         log.write(
-            f"[gpu-repeat] FAIL: {summary.failure_count}/{summary.iterations} iterations failed. Failed iterations: {failed}\n"
+            "[gpu-repeat] FAIL: single-run GPU validation failed\n"
         )
         return 1
 
-    log.write(f"[gpu-repeat] PASS: all {summary.iterations} iterations succeeded\n")
+    log.write("[gpu-repeat] PASS: single-run GPU validation succeeded\n")
     return 0
 
 

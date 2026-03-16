@@ -10,7 +10,6 @@ use crate::{
     poly::Poly,
     sampler::PolyHashSampler,
 };
-use rayon::prelude::*;
 use std::{
     marker::PhantomData,
     ops::Mul,
@@ -31,7 +30,7 @@ where
     pub hash_key: [u8; 32],
     pub dir_path: PathBuf,
     pub checkpoint_prefix: String,
-    c_b0_by_slot_by_params: Vec<(<<M as PolyMatrix>::P as Poly>::Params, Vec<Arc<M>>)>,
+    c_b0_compact_bytes_by_slot: Vec<Arc<[u8]>>,
     _hs: PhantomData<HS>,
 }
 
@@ -44,7 +43,7 @@ where
         hash_key: [u8; 32],
         dir_path: PathBuf,
         checkpoint_prefix: String,
-        params: &<M::P as Poly>::Params,
+        _params: &<M::P as Poly>::Params,
         secret_vec: M,
         b0_matrix: M,
         slot_secret_mats: Vec<M>,
@@ -54,51 +53,12 @@ where
             .map(|slot_secret_mat| {
                 let transformed_secret_vec = secret_vec.clone() * &slot_secret_mat;
                 let c_b0 = transformed_secret_vec * &b0_matrix;
-                c_b0.into_compact_bytes()
+                Arc::<[u8]>::from(c_b0.into_compact_bytes())
             })
             .collect::<Vec<_>>();
-        let c_b0_by_slot_by_params =
-            preload_c_b0_by_slot_by_params::<M>(params, &c_b0_compact_bytes_by_slot);
 
-        Self { hash_key, dir_path, checkpoint_prefix, c_b0_by_slot_by_params, _hs: PhantomData }
+        Self { hash_key, dir_path, checkpoint_prefix, c_b0_compact_bytes_by_slot, _hs: PhantomData }
     }
-
-    fn c_b0_by_slot_for_params(&self, params: &<M::P as Poly>::Params) -> &[Arc<M>] {
-        if let Some((_, cached)) =
-            self.c_b0_by_slot_by_params.iter().find(|(cached_params, _)| cached_params == params)
-        {
-            return cached.as_slice();
-        }
-        panic!("slot-wise c_b0 cache for params not found");
-    }
-}
-
-#[cfg(not(feature = "gpu"))]
-fn preload_c_b0_by_slot_by_params<M>(
-    params: &<M::P as Poly>::Params,
-    c_b0_compact_bytes_by_slot: &[Vec<u8>],
-) -> Vec<(<<M as PolyMatrix>::P as Poly>::Params, Vec<Arc<M>>)>
-where
-    M: PolyMatrix,
-{
-    vec![(
-        params.clone(),
-        c_b0_compact_bytes_by_slot
-            .iter()
-            .map(|bytes| Arc::new(M::from_compact_bytes(params, bytes)))
-            .collect(),
-    )]
-}
-
-#[cfg(feature = "gpu")]
-fn preload_c_b0_by_slot_by_params<M>(
-    params: &<M::P as Poly>::Params,
-    c_b0_compact_bytes_by_slot: &[Vec<u8>],
-) -> Vec<(<<M as PolyMatrix>::P as Poly>::Params, Vec<Arc<M>>)>
-where
-    M: PolyMatrix,
-{
-    gpu::preload_c_b0_by_slot_by_params_gpu::<M>(params, c_b0_compact_bytes_by_slot)
 }
 
 impl<M, HS> PltEvaluator<BggPolyEncoding<M>> for GGH15BGGPolyEncodingPltEvaluator<M, HS>
@@ -118,11 +78,10 @@ where
         lut_id: usize,
     ) -> BggPolyEncoding<M> {
         let public_lookup_started = Instant::now();
+        let num_slots = input.num_slots();
         debug!(
             "GGH15BGGPolyEncodingPltEvaluator::public_lookup start: gate_id={}, lut_id={}, slots={}",
-            gate_id,
-            lut_id,
-            input.vectors.len()
+            gate_id, lut_id, num_slots
         );
 
         let plaintexts = input
@@ -131,10 +90,19 @@ where
             .expect("the BGG poly encoding should reveal plaintexts for public lookup");
         assert_eq!(
             plaintexts.len(),
-            input.vectors.len(),
-            "BGG poly encoding public lookup requires plaintexts.len() == vectors.len()"
+            num_slots,
+            "BGG poly encoding public lookup requires plaintexts.len() == num_slots"
+        );
+        assert_eq!(
+            self.c_b0_compact_bytes_by_slot.len(),
+            num_slots,
+            "slot-wise c_b0 compact-bytes cache must match the BGG poly encoding slot count"
         );
 
+        let plaintext_compact_bytes_by_slot = plaintexts
+            .iter()
+            .map(|plaintext| Arc::<[u8]>::from(plaintext.to_compact_bytes()))
+            .collect::<Vec<_>>();
         let dir = Path::new(&self.dir_path);
         let d = input.pubkey.matrix.row_size();
         let checkpoint_prefix = &self.checkpoint_prefix;
@@ -146,47 +114,110 @@ where
             gate_id,
             d,
         );
-        let c_b0_by_slot = self.c_b0_by_slot_for_params(params);
-        assert_eq!(
-            c_b0_by_slot.len(),
-            input.vectors.len(),
-            "slot-wise c_b0 cache must match the BGG poly encoding slot count"
-        );
+        let out_pubkey = shared.out_pubkey.clone();
+        let configured_parallelism =
+            crate::env::bgg_poly_encoding_slot_parallelism().max(1).min(num_slots.max(1));
 
-        let slot_outputs = input
-            .vectors
-            .par_iter()
-            .zip(plaintexts.par_iter())
-            .zip(c_b0_by_slot.par_iter())
-            .map(|((vector, x), c_b0)| {
-                apply_public_lookup_to_slot::<M, HS>(
+        #[cfg(feature = "gpu")]
+        {
+            let (output_vector_bytes, output_plaintext_bytes) =
+                gpu::evaluate_public_lookup_slots_gpu::<M, HS>(
                     params,
                     plt,
                     dir,
                     checkpoint_prefix,
                     self.hash_key,
-                    c_b0.as_ref(),
-                    &shared,
-                    vector,
-                    x,
                     gate_id,
                     lut_id,
-                )
-            })
-            .collect::<Vec<_>>();
+                    input,
+                    &plaintext_compact_bytes_by_slot,
+                    &self.c_b0_compact_bytes_by_slot,
+                    &shared,
+                    configured_parallelism,
+                );
+            let output_plaintexts = output_plaintext_bytes
+                .iter()
+                .map(|bytes| M::P::from_compact_bytes(params, bytes.as_ref()))
+                .collect::<Vec<_>>();
+            let out = BggPolyEncoding::from_vector_bytes(
+                params.clone(),
+                output_vector_bytes,
+                out_pubkey,
+                Some(output_plaintexts),
+            );
+            debug!(
+                "GGH15BGGPolyEncodingPltEvaluator::public_lookup end: gate_id={}, lut_id={}, elapsed_ms={:.3}",
+                gate_id,
+                lut_id,
+                public_lookup_started.elapsed().as_secs_f64() * 1000.0
+            );
+            return out;
+        }
 
-        let (vectors, plaintexts): (Vec<_>, Vec<_>) = slot_outputs
-            .into_iter()
-            .map(|slot_output| (slot_output.vector, slot_output.plaintext))
-            .unzip();
-        let out = BggPolyEncoding::new(vectors, shared.out_pubkey, Some(plaintexts));
+        #[cfg(not(feature = "gpu"))]
+        {
+            let mut output_vector_bytes = Vec::with_capacity(num_slots);
+            let mut output_plaintext_bytes = Vec::with_capacity(num_slots);
 
-        debug!(
-            "GGH15BGGPolyEncodingPltEvaluator::public_lookup end: gate_id={}, lut_id={}, elapsed_ms={:.3}",
-            gate_id,
-            lut_id,
-            public_lookup_started.elapsed().as_secs_f64() * 1000.0
-        );
-        out
+            for slot_start in (0..num_slots).step_by(configured_parallelism) {
+                let chunk_len = (slot_start + configured_parallelism).min(num_slots) - slot_start;
+                let c_b0_chunk =
+                    &self.c_b0_compact_bytes_by_slot[slot_start..slot_start + chunk_len];
+                let input_vector_chunk = &input.vector_bytes[slot_start..slot_start + chunk_len];
+                let x_chunk = &plaintext_compact_bytes_by_slot[slot_start..slot_start + chunk_len];
+                let mut chunk_outputs = (0..chunk_len)
+                    .into_par_iter()
+                    .map(|offset| {
+                        let c_b0 = M::from_compact_bytes(params, c_b0_chunk[offset].as_ref());
+                        let input_vector =
+                            M::from_compact_bytes(params, input_vector_chunk[offset].as_ref());
+                        let x = M::P::from_compact_bytes(params, x_chunk[offset].as_ref());
+                        let slot_output = apply_public_lookup_to_slot::<M, HS>(
+                            params,
+                            plt,
+                            dir,
+                            checkpoint_prefix,
+                            self.hash_key,
+                            &c_b0,
+                            &shared,
+                            &input_vector,
+                            &x,
+                            gate_id,
+                            lut_id,
+                        );
+                        drop(c_b0);
+                        drop(input_vector);
+                        drop(x);
+                        (
+                            Arc::<[u8]>::from(slot_output.vector.into_compact_bytes()),
+                            Arc::<[u8]>::from(slot_output.plaintext.to_compact_bytes()),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                for (vector_bytes, plaintext_bytes) in chunk_outputs.drain(..) {
+                    output_vector_bytes.push(vector_bytes);
+                    output_plaintext_bytes.push(plaintext_bytes);
+                }
+            }
+
+            let output_plaintexts = output_plaintext_bytes
+                .iter()
+                .map(|bytes| M::P::from_compact_bytes(params, bytes.as_ref()))
+                .collect::<Vec<_>>();
+            let out = BggPolyEncoding::from_vector_bytes(
+                params.clone(),
+                output_vector_bytes,
+                out_pubkey,
+                Some(output_plaintexts),
+            );
+
+            debug!(
+                "GGH15BGGPolyEncodingPltEvaluator::public_lookup end: gate_id={}, lut_id={}, elapsed_ms={:.3}",
+                gate_id,
+                lut_id,
+                public_lookup_started.elapsed().as_secs_f64() * 1000.0
+            );
+            out
+        }
     }
 }

@@ -307,6 +307,7 @@ where
             .map(|idx| {
                 let pubkey = public_keys[idx].borrow().clone();
                 BggPolyEncoding::new(
+                    params.clone(),
                     slot_vectors.par_iter().map(|slot| slot[idx].clone()).collect(),
                     pubkey.clone(),
                     if pubkey.reveal_plaintext {
@@ -410,7 +411,7 @@ mod tests {
                         .clone();
                 let expected = transformed_secret_vec.clone() * encoding.pubkey.matrix.clone() -
                     (transformed_secret_vec * (gadget.clone() * plaintext));
-                assert_eq!(encoding.vectors[slot], expected);
+                assert_eq!(encoding.vector(slot), expected);
             }
         }
     }

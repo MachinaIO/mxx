@@ -65,6 +65,32 @@ pub fn ggh15_gate_parallelism() -> usize {
     }
 }
 
+/// `BGG_POLY_ENCODING_SLOT_PARALLELISM`: max number of BGG poly-encoding slots to process in
+/// parallel in slot-wise arithmetic / evaluable operations.
+/// Default: GPU feature enabled => detected GPU device count, otherwise 30.
+pub fn bgg_poly_encoding_slot_parallelism() -> usize {
+    let parsed = std::env::var("BGG_POLY_ENCODING_SLOT_PARALLELISM")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0);
+    #[cfg(feature = "gpu")]
+    {
+        let device_count = default_gpu_parallelism();
+        let value = parsed.unwrap_or(device_count);
+        assert!(
+            value <= device_count,
+            "BGG_POLY_ENCODING_SLOT_PARALLELISM must be <= available GPU devices: requested={}, devices={}",
+            value,
+            device_count
+        );
+        value
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        parsed.unwrap_or(30)
+    }
+}
+
 /// `BLOCK_SIZE`: generic processing block size used in utilities (default: 100).
 pub fn block_size() -> usize {
     std::env::var("BLOCK_SIZE").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(100)

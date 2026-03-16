@@ -287,14 +287,14 @@ async fn test_gpu_ggh15_poly_encoding_plt_eval_slot_secret_relation() {
     let result_plaintexts =
         result_poly.plaintexts.as_ref().expect("poly lookup result should reveal plaintexts");
     assert_eq!(result_plaintexts.len(), num_slots);
-    assert_eq!(result_poly.vectors.len(), num_slots);
+    assert_eq!(result_poly.num_slots(), num_slots);
     let gadget = GpuDCRTPolyMatrix::gadget_matrix(&params, d);
 
     for slot in 0..num_slots {
         let transformed_secret_vec = s_vec.clone() * &slot_secret_mats[slot];
         let expected_vector = transformed_secret_vec.clone() * result_poly.pubkey.matrix.clone() -
             (transformed_secret_vec * (gadget.clone() * result_plaintexts[slot].clone()));
-        assert_eq!(result_poly.vectors[slot], expected_vector);
+        assert_eq!(result_poly.vector(slot), expected_vector);
     }
 
     gpu_device_sync();

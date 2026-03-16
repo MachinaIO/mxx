@@ -207,10 +207,14 @@ where
     let gy_decomposed = gy.decompose();
     let gy_term = shared.preimage_gate2_gy.as_ref() * &gy_decomposed;
     c_const_rhs.add_in_place(&gy_term);
+    drop(gy_term);
+    drop(gy_decomposed);
+    drop(gy);
 
     let v_idx = derive_lut_v_idx_from_hash::<M, HS>(params, hash_key, lut_id, k_usize, shared.d);
     let v_term = shared.preimage_gate2_v.as_ref() * &v_idx;
     c_const_rhs.add_in_place(&v_term);
+    drop(v_term);
 
     let mut vx_product_acc: Option<M> = None;
     for (chunk_idx, preimage_gate2_vx_chunk) in shared.preimage_gate2_vx_chunks.iter().enumerate() {
@@ -227,21 +231,28 @@ where
         } else {
             vx_product_acc = Some(vx_chunk_product);
         }
+        drop(x_identity_decomposed_chunk);
     }
     let vx_product_acc =
         vx_product_acc.expect("gate2_vx chunk accumulation must have at least one chunk");
     let vx_term = &vx_product_acc * &v_idx;
     c_const_rhs.add_in_place(&vx_term);
+    drop(vx_term);
+    drop(vx_product_acc);
 
     let preimage_lut = read_matrix_from_multi_batch::<M>(params, dir, &lut_aux_row_id, 0)
         .unwrap_or_else(|| panic!("preimage_lut (index {}) for lut {} not found", k, lut_id));
     let preimage_lut_in_b0_basis = shared.preimage_gate1.as_ref() * &preimage_lut;
     c_const_rhs = c_const_rhs - preimage_lut_in_b0_basis;
+    drop(preimage_lut);
 
     let c_const = c_b0 * &c_const_rhs;
     let c_x_randomized_lhs = input_vector * shared.u_g_decomposed.as_ref();
     let c_x_randomized = &c_x_randomized_lhs * &v_idx;
+    drop(c_x_randomized_lhs);
+    drop(v_idx);
     let c_out = c_const + c_x_randomized;
+    drop(c_const_rhs);
 
     GGH15PublicLookupSlotOutput { vector: c_out, plaintext: y_poly }
 }

@@ -11,12 +11,240 @@ use crate::{
     sampler::{DistType, PolyHashSampler},
     storage::read::read_matrix_from_multi_batch,
 };
-use std::{marker::PhantomData, ops::Mul, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    marker::PhantomData,
+    ops::Mul,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 use tracing::debug;
 
 use super::pubkey::{
     derive_lut_v_idx_from_hash, read_matrix_from_chunks, small_gadget_chunk_count,
 };
+
+pub(super) struct GGH15PublicLookupSharedState<M: PolyMatrix> {
+    pub d: usize,
+    pub m_g: usize,
+    pub k_small: usize,
+    pub gadget_matrix: Arc<M>,
+    pub preimage_gate1: Arc<M>,
+    pub preimage_gate2_identity: Arc<M>,
+    pub preimage_gate2_gy: Arc<M>,
+    pub preimage_gate2_v: Arc<M>,
+    pub preimage_gate2_vx_chunks: Vec<Arc<M>>,
+    pub u_g_decomposed: Arc<M>,
+    pub out_pubkey: BggPublicKey<M>,
+}
+
+pub(super) struct GGH15PublicLookupSlotOutput<M: PolyMatrix> {
+    pub vector: M,
+    pub plaintext: M::P,
+}
+
+pub(super) fn build_public_lookup_shared_state<M, HS>(
+    params: &<M::P as Poly>::Params,
+    dir: &Path,
+    checkpoint_prefix: &str,
+    hash_key: [u8; 32],
+    gate_id: GateId,
+    d: usize,
+) -> GGH15PublicLookupSharedState<M>
+where
+    M: PolyMatrix,
+    HS: PolyHashSampler<[u8; 32], M = M>,
+{
+    let hash_sampler = HS::new();
+    let m_g = d * params.modulus_digits();
+    let k_small = small_gadget_chunk_count::<M>(params);
+
+    let preimage_gate2_identity = Arc::new(
+        read_matrix_from_multi_batch::<M>(
+            params,
+            dir,
+            &format!("{checkpoint_prefix}_preimage_gate2_identity_{}", gate_id),
+            0,
+        )
+        .unwrap_or_else(|| panic!("preimage_gate2_identity for gate {} not found", gate_id)),
+    );
+    debug_assert_eq!(
+        preimage_gate2_identity.col_size(),
+        m_g,
+        "preimage_gate2_identity must have m_g columns"
+    );
+
+    let preimage_gate2_gy = Arc::new(
+        read_matrix_from_multi_batch::<M>(
+            params,
+            dir,
+            &format!("{checkpoint_prefix}_preimage_gate2_gy_{}", gate_id),
+            0,
+        )
+        .unwrap_or_else(|| panic!("preimage_gate2_gy for gate {} not found", gate_id)),
+    );
+    debug_assert_eq!(preimage_gate2_gy.col_size(), m_g, "preimage_gate2_gy must have m_g columns");
+
+    let preimage_gate2_v = Arc::new(read_matrix_from_chunks::<M>(
+        params,
+        dir,
+        &format!("{checkpoint_prefix}_preimage_gate2_v_{}", gate_id),
+        m_g,
+        1,
+        "preimage_gate2_v",
+    ));
+    debug_assert_eq!(preimage_gate2_v.col_size(), m_g, "preimage_gate2_v must have m_g columns");
+
+    let preimage_gate2_vx_chunks = (0..k_small)
+        .map(|chunk_idx| {
+            let matrix = Arc::new(
+                read_matrix_from_multi_batch::<M>(
+                    params,
+                    dir,
+                    &format!(
+                        "{checkpoint_prefix}_preimage_gate2_vx_{}_chunk{}",
+                        gate_id, chunk_idx
+                    ),
+                    0,
+                )
+                .unwrap_or_else(|| {
+                    panic!("preimage_gate2_vx chunk {} for gate {} not found", chunk_idx, gate_id)
+                }),
+            );
+            debug_assert_eq!(
+                matrix.col_size(),
+                m_g,
+                "preimage_gate2_vx chunk must have m_g columns"
+            );
+            matrix
+        })
+        .collect();
+
+    let preimage_gate1 = Arc::new(
+        read_matrix_from_multi_batch::<M>(
+            params,
+            dir,
+            &format!("{checkpoint_prefix}_preimage_gate1_{}", gate_id),
+            0,
+        )
+        .unwrap_or_else(|| panic!("preimage_gate1 for gate {} not found", gate_id)),
+    );
+
+    let u_g_decomposed = Arc::new(hash_sampler.sample_hash_decomposed(
+        params,
+        hash_key,
+        format!("ggh15_lut_u_g_matrix_{}", gate_id),
+        d,
+        m_g,
+        DistType::FinRingDist,
+    ));
+    debug!(
+        "Derived decomposed u_g_matrix for gate encoding: gate_id={}, rows={}, cols={}",
+        gate_id,
+        u_g_decomposed.row_size(),
+        u_g_decomposed.col_size()
+    );
+
+    let out_pubkey = BggPublicKey {
+        matrix: hash_sampler.sample_hash(
+            params,
+            hash_key,
+            format!("ggh15_gate_a_out_{}", gate_id),
+            d,
+            m_g,
+            DistType::FinRingDist,
+        ),
+        reveal_plaintext: true,
+    };
+
+    GGH15PublicLookupSharedState {
+        d,
+        m_g,
+        k_small,
+        gadget_matrix: Arc::new(M::gadget_matrix(params, d)),
+        preimage_gate1,
+        preimage_gate2_identity,
+        preimage_gate2_gy,
+        preimage_gate2_v,
+        preimage_gate2_vx_chunks,
+        u_g_decomposed,
+        out_pubkey,
+    }
+}
+
+pub(super) fn apply_public_lookup_to_slot<M, HS>(
+    params: &<M::P as Poly>::Params,
+    plt: &PublicLut<M::P>,
+    dir: &Path,
+    checkpoint_prefix: &str,
+    hash_key: [u8; 32],
+    c_b0: &M,
+    shared: &GGH15PublicLookupSharedState<M>,
+    input_vector: &M,
+    x: &M::P,
+    gate_id: GateId,
+    lut_id: usize,
+) -> GGH15PublicLookupSlotOutput<M>
+where
+    M: PolyMatrix,
+    HS: PolyHashSampler<[u8; 32], M = M>,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
+{
+    let x_u64 = u64::try_from(x.to_const_int())
+        .expect("BGG encoding plaintext constant term must fit in u64 for public lookup");
+    let (k, y) = plt
+        .get(params, x_u64)
+        .unwrap_or_else(|| panic!("{:?} not found in LUT for gate {}", x_u64, gate_id));
+    let k_usize = usize::try_from(k).expect("LUT row index must fit in usize");
+    let y_poly = M::P::from_elem_to_constant(params, &y);
+
+    let lut_aux_prefix = format!("{checkpoint_prefix}_lut_aux_{}", lut_id);
+    let lut_aux_row_id = format!("{lut_aux_prefix}_idx{k}");
+
+    let mut c_const_rhs = shared.preimage_gate2_identity.as_ref().clone();
+
+    let gy = shared.gadget_matrix.as_ref().clone() * y_poly.clone();
+    let gy_decomposed = gy.decompose();
+    let gy_term = shared.preimage_gate2_gy.as_ref() * &gy_decomposed;
+    c_const_rhs.add_in_place(&gy_term);
+
+    let v_idx = derive_lut_v_idx_from_hash::<M, HS>(params, hash_key, lut_id, k_usize, shared.d);
+    let v_term = shared.preimage_gate2_v.as_ref() * &v_idx;
+    c_const_rhs.add_in_place(&v_term);
+
+    let mut vx_product_acc: Option<M> = None;
+    for (chunk_idx, preimage_gate2_vx_chunk) in shared.preimage_gate2_vx_chunks.iter().enumerate() {
+        let x_identity_decomposed_chunk = M::small_decomposed_identity_chunk_from_scalar(
+            params,
+            shared.m_g,
+            x,
+            chunk_idx,
+            shared.k_small,
+        );
+        let vx_chunk_product = preimage_gate2_vx_chunk.as_ref() * &x_identity_decomposed_chunk;
+        if let Some(acc) = vx_product_acc.as_mut() {
+            acc.add_in_place(&vx_chunk_product);
+        } else {
+            vx_product_acc = Some(vx_chunk_product);
+        }
+    }
+    let vx_product_acc =
+        vx_product_acc.expect("gate2_vx chunk accumulation must have at least one chunk");
+    let vx_term = &vx_product_acc * &v_idx;
+    c_const_rhs.add_in_place(&vx_term);
+
+    let preimage_lut = read_matrix_from_multi_batch::<M>(params, dir, &lut_aux_row_id, 0)
+        .unwrap_or_else(|| panic!("preimage_lut (index {}) for lut {} not found", k, lut_id));
+    let preimage_lut_in_b0_basis = shared.preimage_gate1.as_ref() * &preimage_lut;
+    c_const_rhs = c_const_rhs - preimage_lut_in_b0_basis;
+
+    let c_const = c_b0 * &c_const_rhs;
+    let c_x_randomized_lhs = input_vector * shared.u_g_decomposed.as_ref();
+    let c_x_randomized = &c_x_randomized_lhs * &v_idx;
+    let c_out = c_const + c_x_randomized;
+
+    GGH15PublicLookupSlotOutput { vector: c_out, plaintext: y_poly }
+}
 
 #[derive(Debug, Clone)]
 pub struct GGH15BGGEncodingPltEvaluator<M, HS>
@@ -106,152 +334,33 @@ where
             .plaintext
             .as_ref()
             .expect("the BGG encoding should reveal plaintext for public lookup");
-        let x_u64 = u64::try_from(x.to_const_int())
-            .expect("BGG encoding plaintext constant term must fit in u64 for public lookup");
-        let (k, y) = plt
-            .get(params, x_u64)
-            .unwrap_or_else(|| panic!("{:?} not found in LUT for gate {}", x_u64, gate_id));
-        let k_usize = usize::try_from(k).expect("LUT row index must fit in usize");
-        let y_poly = M::P::from_elem_to_constant(params, &y);
-
-        let dir = std::path::Path::new(&self.dir_path);
-        let checkpoint_prefix = &self.checkpoint_prefix;
-        let lut_aux_prefix = format!("{checkpoint_prefix}_lut_aux_{}", lut_id);
-        let lut_aux_row_id = format!("{lut_aux_prefix}_idx{k}");
-
-        let hash_sampler = HS::new();
+        let dir = Path::new(&self.dir_path);
         let d = input.pubkey.matrix.row_size();
-        let m_g = d * params.modulus_digits();
-        let k_small = small_gadget_chunk_count::<M>(params);
-
-        let preimage_gate2_identity = read_matrix_from_multi_batch::<M>(
+        let checkpoint_prefix = &self.checkpoint_prefix;
+        let shared = build_public_lookup_shared_state::<M, HS>(
             params,
             dir,
-            &format!("{checkpoint_prefix}_preimage_gate2_identity_{}", gate_id),
-            0,
-        )
-        .unwrap_or_else(|| panic!("preimage_gate2_identity for gate {} not found", gate_id));
-        debug_assert_eq!(
-            preimage_gate2_identity.col_size(),
-            m_g,
-            "preimage_gate2_identity must have m_g columns"
-        );
-        let mut c_const_rhs = preimage_gate2_identity;
-
-        let preimage_gate2_gy = read_matrix_from_multi_batch::<M>(
-            params,
-            dir,
-            &format!("{checkpoint_prefix}_preimage_gate2_gy_{}", gate_id),
-            0,
-        )
-        .unwrap_or_else(|| panic!("preimage_gate2_gy for gate {} not found", gate_id));
-        debug_assert_eq!(
-            preimage_gate2_gy.col_size(),
-            m_g,
-            "preimage_gate2_gy must have m_g columns"
-        );
-        let gy = M::gadget_matrix(params, d) * y_poly.clone();
-        let gy_decomposed = gy.decompose();
-        drop(gy);
-        let gy_term = preimage_gate2_gy * gy_decomposed;
-        c_const_rhs.add_in_place(&gy_term);
-        drop(gy_term);
-
-        let v_idx = derive_lut_v_idx_from_hash::<M, HS>(params, self.hash_key, lut_id, k_usize, d);
-        let preimage_gate2_v = read_matrix_from_chunks::<M>(
-            params,
-            dir,
-            &format!("{checkpoint_prefix}_preimage_gate2_v_{}", gate_id),
-            m_g,
-            1,
-            "preimage_gate2_v",
-        );
-        debug_assert_eq!(
-            preimage_gate2_v.col_size(),
-            m_g,
-            "preimage_gate2_v must have m_g columns"
-        );
-        let v_term = preimage_gate2_v * &v_idx;
-        c_const_rhs.add_in_place(&v_term);
-        drop(v_term);
-
-        let mut vx_product_acc: Option<M> = None;
-        for chunk_idx in 0..k_small {
-            let preimage_gate2_vx_chunk = read_matrix_from_multi_batch::<M>(
-                params,
-                dir,
-                &format!("{checkpoint_prefix}_preimage_gate2_vx_{}_chunk{}", gate_id, chunk_idx),
-                0,
-            )
-            .unwrap_or_else(|| {
-                panic!("preimage_gate2_vx chunk {} for gate {} not found", chunk_idx, gate_id)
-            });
-            debug_assert_eq!(
-                preimage_gate2_vx_chunk.col_size(),
-                m_g,
-                "preimage_gate2_vx chunk must have m_g columns"
-            );
-            let x_identity_decomposed_chunk =
-                M::small_decomposed_identity_chunk_from_scalar(params, m_g, x, chunk_idx, k_small);
-            let vx_chunk_product = preimage_gate2_vx_chunk * &x_identity_decomposed_chunk;
-            if let Some(acc) = vx_product_acc.as_mut() {
-                acc.add_in_place(&vx_chunk_product);
-            } else {
-                vx_product_acc = Some(vx_chunk_product);
-            }
-        }
-        let vx_product_acc =
-            vx_product_acc.expect("gate2_vx chunk accumulation must have at least one chunk");
-        let vx_term = vx_product_acc * &v_idx;
-        c_const_rhs.add_in_place(&vx_term);
-        drop(vx_term);
-
-        let preimage_lut = read_matrix_from_multi_batch::<M>(params, dir, &lut_aux_row_id, 0)
-            .unwrap_or_else(|| panic!("preimage_lut (index {}) for lut {} not found", k, lut_id));
-        let preimage_gate1 = read_matrix_from_multi_batch::<M>(
-            params,
-            dir,
-            &format!("{checkpoint_prefix}_preimage_gate1_{}", gate_id),
-            0,
-        )
-        .unwrap_or_else(|| panic!("preimage_gate1 for gate {} not found", gate_id));
-        let preimage_lut_in_b0_basis = preimage_gate1 * preimage_lut;
-        c_const_rhs = c_const_rhs - preimage_lut_in_b0_basis;
-
-        let c_b0 = self.c_b0_for_params(params);
-        let c_const = c_b0.as_ref() * &c_const_rhs;
-
-        let u_g_decomposed = hash_sampler.sample_hash_decomposed(
-            params,
+            checkpoint_prefix,
             self.hash_key,
-            format!("ggh15_lut_u_g_matrix_{}", gate_id),
+            gate_id,
             d,
-            m_g,
-            DistType::FinRingDist,
         );
-        debug!(
-            "Derived decomposed u_g_matrix for gate encoding: gate_id={}, lut_id={}, rows={}, cols={}",
+        let c_b0 = self.c_b0_for_params(params);
+        let slot_output = apply_public_lookup_to_slot::<M, HS>(
+            params,
+            plt,
+            dir,
+            checkpoint_prefix,
+            self.hash_key,
+            c_b0.as_ref(),
+            &shared,
+            &input.vector,
+            x,
             gate_id,
             lut_id,
-            u_g_decomposed.row_size(),
-            u_g_decomposed.col_size()
         );
-        let c_x_randomized = input.vector.clone() * u_g_decomposed * v_idx;
-        debug!("Computed c_x_randomized for gate encoding: gate_id={}, lut_id={}", gate_id, lut_id);
-        let c_out = c_const + c_x_randomized;
-        debug!("Computed c_out for gate encoding: gate_id={}, lut_id={}", gate_id, lut_id);
-        let out_pubkey = BggPublicKey {
-            matrix: hash_sampler.sample_hash(
-                params,
-                self.hash_key,
-                format!("ggh15_gate_a_out_{}", gate_id),
-                d,
-                m_g,
-                DistType::FinRingDist,
-            ),
-            reveal_plaintext: true,
-        };
-        let out = BggEncoding::new(c_out, out_pubkey, Some(y_poly));
+        let out =
+            BggEncoding::new(slot_output.vector, shared.out_pubkey, Some(slot_output.plaintext));
         debug!(
             "GGH15BGGEncodingPltEvaluator::public_lookup end: gate_id={}, lut_id={}, elapsed_ms={:.3}",
             gate_id,

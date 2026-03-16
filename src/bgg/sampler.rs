@@ -206,9 +206,18 @@ where
         T: AsRef<[<S::M as PolyMatrix>::P]> + Sync,
     {
         let num_slots = Self::assert_uniform_num_slots(plaintexts);
+        let slot_secret_mats = self.sample_slot_secret_mats(params, num_slots);
 
+        self.sample_with_slot_secret_mats(params, public_keys, plaintexts, &slot_secret_mats)
+    }
+
+    pub fn sample_slot_secret_mats(
+        &self,
+        params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
+        num_slots: usize,
+    ) -> Vec<S::M> {
         let secret_vec_size = self.secret_vec.col_size();
-        let slot_secret_mats = (0..num_slots)
+        (0..num_slots)
             .into_par_iter()
             .map(|_| {
                 let uniform_sampler = S::new();
@@ -219,12 +228,10 @@ where
                     DistType::TernaryDist,
                 )
             })
-            .collect::<Vec<_>>();
-
-        self.sample_with_slot_secret_mats(params, public_keys, plaintexts, &slot_secret_mats)
+            .collect()
     }
 
-    fn sample_with_slot_secret_mats<K, T>(
+    pub fn sample_with_slot_secret_mats<K, T>(
         &self,
         params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
         public_keys: &[K],

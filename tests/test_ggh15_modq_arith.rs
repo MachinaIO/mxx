@@ -345,13 +345,12 @@ async fn test_ggh15_modq_arith() {
     let input_encodings = encodings.split_off(1);
     let enc_one = encodings.pop().expect("encodings must contain one entry for const one");
 
-    let pk_evaluator =
-        GGH15BGGPubKeyPltEvaluator::<
-            DCRTPolyMatrix,
-            DCRTPolyUniformSampler,
-            DCRTPolyHashSampler<Keccak256>,
-            DCRTPolyTrapdoorSampler,
-        >::new(seed, d_secret, trapdoor_sigma, ERROR_SIGMA, dir.to_path_buf(), false);
+    let pk_evaluator = GGH15BGGPubKeyPltEvaluator::<
+        DCRTPolyMatrix,
+        DCRTPolyUniformSampler,
+        DCRTPolyHashSampler<Keccak256>,
+        DCRTPolyTrapdoorSampler,
+    >::new(seed, d_secret, trapdoor_sigma, ERROR_SIGMA, dir.to_path_buf());
 
     let pubkey_eval_start = std::time::Instant::now();
     let pubkey_out = circuit.eval(&params, pubkey_one, input_pubkeys, Some(&pk_evaluator));

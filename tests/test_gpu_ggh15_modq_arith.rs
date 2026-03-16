@@ -484,7 +484,7 @@ async fn test_gpu_ggh15_modq_arith() {
             GpuDCRTPolyUniformSampler,
             GpuDCRTPolyHashSampler<Keccak256>,
             GpuDCRTPolyTrapdoorSampler,
-        >::new(seed, d_secret, trapdoor_sigma, cfg.error_sigma, dir.to_path_buf(), false);
+        >::new(seed, d_secret, trapdoor_sigma, cfg.error_sigma, dir.to_path_buf());
     info!(
         "pk evaluator setup elapsed_ms={:.3}",
         pk_evaluator_setup_start.elapsed().as_secs_f64() * 1000.0

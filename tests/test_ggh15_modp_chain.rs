@@ -215,14 +215,13 @@ async fn test_ggh15_modp_chain_rounding() {
     init_storage_system(dir.to_path_buf());
 
     info!("plt pubkey evaluator setup start");
-    let insert_1_to_s = false;
     let plt_pubkey_evaluator =
         GGH15BGGPubKeyPltEvaluator::<
             DCRTPolyMatrix,
             DCRTPolyUniformSampler,
             DCRTPolyHashSampler<Keccak256>,
             DCRTPolyTrapdoorSampler,
-        >::new(key, D_SECRET, trapdoor_sigma, ERROR_SIGMA, dir.to_path_buf(), insert_1_to_s);
+        >::new(key, D_SECRET, trapdoor_sigma, ERROR_SIGMA, dir.to_path_buf());
     info!("plt pubkey evaluator setup done");
 
     info!("circuit eval pubkey start");

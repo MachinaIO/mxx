@@ -28,7 +28,8 @@ fn effective_slot_parallelism<M: PolyMatrix>(
     let requested = crate::env::bgg_poly_encoding_slot_parallelism().max(1);
     #[cfg(feature = "gpu")]
     {
-        gpu::effective_slot_parallelism_gpu(params, num_slots, requested)
+        let _ = params;
+        gpu::effective_slot_parallelism_gpu(num_slots, requested)
     }
     #[cfg(not(feature = "gpu"))]
     {

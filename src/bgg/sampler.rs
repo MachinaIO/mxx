@@ -22,7 +22,8 @@ fn effective_slot_parallelism<M: PolyMatrix>(
         return 0;
     }
 
-    gpu::effective_slot_parallelism_gpu(params, num_slots)
+    let _ = params;
+    gpu::effective_slot_parallelism_gpu(num_slots)
 }
 
 #[cfg(not(feature = "gpu"))]

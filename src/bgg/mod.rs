@@ -209,6 +209,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None,
         );
 
         let expected = enc1.clone() + enc2.clone();
@@ -241,6 +242,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None,
         );
 
         let expected = enc1.clone() - enc2.clone();
@@ -273,6 +275,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None,
         );
 
         let expected = enc1.clone() * enc2.clone();
@@ -308,6 +311,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None,
         );
 
         let expected =
@@ -348,6 +352,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None,
         );
 
         let sum1 = enc1.clone() + enc2.clone();
@@ -391,6 +396,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None,
         );
 
         let expected = enc1.clone() + enc2.clone();
@@ -433,6 +439,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None,
         );
 
         let expected = (enc1.clone() + enc2.clone()) - (enc1.clone() * enc2.clone());
@@ -482,6 +489,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None,
         );
 
         let expected = ((enc1.clone() * enc2.clone()) + enc3.clone()) *

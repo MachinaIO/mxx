@@ -38,7 +38,7 @@ impl PolyCircuit<DCRTPoly> {
         );
         info!("e_init_norm bits {}", bigdecimal_bits_ceil(e_init_norm));
         let input_errors = vec![input_error; input_size];
-        self.eval(&(), one_error, input_errors, plt_evaluator)
+        self.eval(&(), one_error, input_errors, plt_evaluator, None)
     }
 }
 

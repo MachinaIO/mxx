@@ -126,7 +126,7 @@ async fn test_gpu_ggh15_plt_eval_multi_inputs() {
 
     let one_pubkey = enc_one.pubkey.clone();
     let result_pubkey =
-        circuit.eval(&params, one_pubkey, input_pubkeys.clone(), Some(&plt_pubkey_evaluator));
+        circuit.eval(&params, one_pubkey, input_pubkeys.clone(), Some(&plt_pubkey_evaluator), None);
     plt_pubkey_evaluator.sample_aux_matrices(&params);
     wait_for_all_writes(dir.to_path_buf()).await.unwrap();
     assert_eq!(result_pubkey.len(), input_size);
@@ -142,8 +142,13 @@ async fn test_gpu_ggh15_plt_eval_multi_inputs() {
     >::new(key, dir_path.into(), checkpoint_prefix, &params, c_b0);
 
     let one_encoding = enc_one.clone();
-    let result_encoding =
-        circuit.eval(&params, one_encoding, input_encodings.clone(), Some(&plt_encoding_evaluator));
+    let result_encoding = circuit.eval(
+        &params,
+        one_encoding,
+        input_encodings.clone(),
+        Some(&plt_encoding_evaluator),
+        None,
+    );
     assert_eq!(result_encoding.len(), input_size);
 
     for i in 0..input_size {
@@ -250,6 +255,7 @@ async fn test_gpu_ggh15_poly_encoding_plt_eval_slot_secret_relation() {
         enc_one_poly.pubkey.clone(),
         vec![enc_input_poly.pubkey.clone()],
         Some(&plt_pubkey_evaluator),
+        None,
     );
     plt_pubkey_evaluator.sample_aux_matrices(&params);
     wait_for_all_writes(dir.to_path_buf()).await.unwrap();
@@ -277,6 +283,7 @@ async fn test_gpu_ggh15_poly_encoding_plt_eval_slot_secret_relation() {
         enc_one_poly.clone(),
         vec![enc_input_poly.clone()],
         Some(&poly_evaluator),
+        Some(1),
     );
     assert_eq!(result_poly.len(), 1);
     let result_poly = &result_poly[0];

@@ -72,7 +72,8 @@ mod tests {
 
         let poly_inputs = vec![a.clone(), b.clone(), neg_t.clone(), DCRTPoly::const_one(&params)];
         let one_poly = DCRTPoly::const_one(&params);
-        let poly_out = circuit.eval(&params, one_poly, poly_inputs, None::<&PolyPltEvaluator>);
+        let poly_out =
+            circuit.eval(&params, one_poly, poly_inputs, None::<&PolyPltEvaluator>, None);
         assert_eq!(poly_out.len(), 1);
         let expected_poly = b.clone() + (a.clone() * &neg_t);
         assert_eq!(poly_out[0], expected_poly);
@@ -95,6 +96,7 @@ mod tests {
                     DCRTPolyTrapdoorSampler,
                 >,
             >,
+            None,
         );
         assert_eq!(pk_out.len(), 1);
         let pk_expected =
@@ -113,6 +115,7 @@ mod tests {
             one_encoding,
             input_encodings,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None,
         );
         assert_eq!(enc_out.len(), 1);
         let enc_expected = (encodings[1].clone() * encodings[3].clone()) +

@@ -532,18 +532,22 @@ impl<P: Poly> PolyCircuit<P> {
     /// Evaluate the circuit using an iterative approach over a precomputed topological order.
     ///
     /// `helper_lookup` is P_{x_L}
+    /// `parallel_gates` overrides the gate-level parallelism limit; `None` preserves the
+    /// environment-driven default.
     pub fn eval<E, PE>(
         &self,
         params: &E::Params,
         one: E,
         inputs: Vec<E>,
         plt_evaluator: Option<&PE>,
+        parallel_gates: Option<usize>,
     ) -> Vec<E>
     where
         E: Evaluable<P = P>,
         PE: PltEvaluator<E>,
     {
         let (call_id_base, gate_id_base) = self.eval_gate_id_bases();
+        let parallel_gates = crate::env::resolve_circuit_parallel_gates(parallel_gates);
         let one_compact = Arc::new(one.to_compact());
         let one = Arc::new(E::from_compact(params, one_compact.as_ref()));
         let input_compacts =
@@ -557,6 +561,7 @@ impl<P: Poly> PolyCircuit<P> {
             0,
             call_id_base,
             gate_id_base,
+            parallel_gates,
         );
         outputs.into_iter().map(|value| E::from_compact(params, value.as_ref())).collect()
     }
@@ -593,6 +598,7 @@ impl<P: Poly> PolyCircuit<P> {
         call_prefix: usize,
         call_id_base: usize,
         gate_id_base: usize,
+        parallel_gates: Option<usize>,
     ) -> Vec<Arc<E::Compact>>
     where
         E: Evaluable<P = P>,
@@ -662,7 +668,6 @@ impl<P: Poly> PolyCircuit<P> {
         }
         debug!("Input wires are set");
 
-        let parallel_gates = crate::env::circuit_parallel_gates();
         let use_parallel = parallel_gates.map(|n| n != 1).unwrap_or(true);
         #[cfg(feature = "gpu")]
         let shard_params_and_one: Vec<(E::Params, Arc<E>)> = {
@@ -828,6 +833,7 @@ impl<P: Poly> PolyCircuit<P> {
                         child_prefix,
                         call_id_base,
                         gate_id_base,
+                        parallel_gates,
                     );
                     if sub_outputs.len() != call.output_gate_ids.len() {
                         panic!("sub-circuit output size mismatch");
@@ -1199,7 +1205,7 @@ mod tests {
     {
         let one = DCRTPoly::const_one(params);
         let eval_inputs = inputs.to_vec();
-        circuit.eval(params, one, eval_inputs, plt_evaluator)
+        circuit.eval(params, one, eval_inputs, plt_evaluator, None)
     }
 
     #[test]

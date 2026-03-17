@@ -258,49 +258,48 @@ where
         let ncol = secret_vec_size * log_base_q;
         let base_secret_vec = self.secret_vec.clone();
         let gauss_sigma = self.gauss_sigma;
-        let slot_parallelism = effective_slot_parallelism::<S::M>(params, num_slots);
         let all_public_key_matrix: S::M = public_keys[0].borrow().matrix.concat_columns(
             &public_keys[1..].par_iter().map(|pk| &pk.borrow().matrix).collect::<Vec<_>>(),
         );
         let gadget = S::M::gadget_matrix(params, secret_vec_size);
+        let constant_plaintext_bytes = Arc::<[u8]>::from(
+            <<S as PolyUniformSampler>::M as PolyMatrix>::P::const_one(params).to_compact_bytes(),
+        );
         #[cfg(feature = "gpu")]
-        let sampler_shared_by_device = gpu::prepare_sampler_shared_by_device(
+        let encoding_vector_bytes = gpu::sample_poly_encoding_vectors_gpu::<S, T>(
             params,
             &base_secret_vec,
             &all_public_key_matrix,
             &gadget,
-            slot_parallelism.max(1),
+            plaintexts,
+            slot_secret_mats,
+            num_slots,
+            packed_input_size,
+            ncol,
+            gauss_sigma,
         );
-        let constant_plaintext_bytes = Arc::<[u8]>::from(
-            <<S as PolyUniformSampler>::M as PolyMatrix>::P::const_one(params).to_compact_bytes(),
-        );
-        let mut encoding_vector_bytes = (0..packed_input_size)
-            .map(|_| Vec::with_capacity(num_slots))
-            .collect::<Vec<Vec<Arc<[u8]>>>>();
+        #[cfg(not(feature = "gpu"))]
+        let encoding_vector_bytes = {
+            let slot_parallelism = effective_slot_parallelism::<S::M>(params, num_slots);
+            let mut encoding_vector_bytes = (0..packed_input_size)
+                .map(|_| Vec::with_capacity(num_slots))
+                .collect::<Vec<Vec<Arc<[u8]>>>>();
 
-        for slot_start in (0..num_slots).step_by(slot_parallelism.max(1)) {
-            let chunk_len = (slot_start + slot_parallelism).min(num_slots) - slot_start;
-            #[cfg(feature = "gpu")]
-            let chunk_slot_vectors = {
-                let chunk_sampler_shared_by_device = &sampler_shared_by_device[..chunk_len];
-                (0..chunk_len)
+            for slot_start in (0..num_slots).step_by(slot_parallelism.max(1)) {
+                let chunk_len = (slot_start + slot_parallelism).min(num_slots) - slot_start;
+                let chunk_slot_vectors = (0..chunk_len)
                     .into_par_iter()
                     .map(|offset| {
                         let slot = slot_start + offset;
-                        let shared = &chunk_sampler_shared_by_device[offset];
-                        let local_params = &shared.params;
-                        let base_secret_vec = shared.base_secret_vec.as_ref();
-                        let all_public_key_matrix = shared.all_public_key_matrix.as_ref();
-                        let gadget = shared.gadget.as_ref();
                         let slot_secret_mat =
-                            S::M::from_compact_bytes(local_params, slot_secret_mats[slot].as_ref());
+                            S::M::from_compact_bytes(params, slot_secret_mats[slot].as_ref());
                         let transformed_secret_vec = base_secret_vec.clone() * &slot_secret_mat;
                         let error: S::M = match gauss_sigma {
-                            None => S::M::zero(local_params, 1, ncol * packed_input_size),
+                            None => S::M::zero(params, 1, ncol * packed_input_size),
                             Some(sigma) => {
                                 let error_sampler = S::new();
                                 error_sampler.sample_uniform(
-                                    local_params,
+                                    params,
                                     1,
                                     ncol * packed_input_size,
                                     DistType::GaussDist { sigma },
@@ -308,22 +307,19 @@ where
                             }
                         };
                         let slot_plaintexts = std::iter::once(
-                            <<S as PolyUniformSampler>::M as PolyMatrix>::P::const_one(
-                                local_params,
-                            ),
+                            <<S as PolyUniformSampler>::M as PolyMatrix>::P::const_one(params),
                         )
                         .chain(plaintexts.iter().map(|plaintext_row| {
                             <<S as PolyUniformSampler>::M as PolyMatrix>::P::from_compact_bytes(
-                                local_params,
+                                params,
                                 plaintext_row.as_ref()[slot].as_ref(),
                             )
                         }))
                         .collect::<Vec<_>>();
-                        let encoded_polys_vec =
-                            S::M::from_poly_vec_row(local_params, slot_plaintexts);
-                        let first_term = transformed_secret_vec.clone() * all_public_key_matrix;
+                        let encoded_polys_vec = S::M::from_poly_vec_row(params, slot_plaintexts);
+                        let first_term = transformed_secret_vec.clone() * &all_public_key_matrix;
                         let second_term =
-                            encoded_polys_vec.tensor(&(transformed_secret_vec * gadget));
+                            encoded_polys_vec.tensor(&(transformed_secret_vec * &gadget));
                         let all_vector = first_term - second_term + error;
 
                         (0..packed_input_size)
@@ -336,61 +332,17 @@ where
                             })
                             .collect::<Vec<_>>()
                     })
-                    .collect::<Vec<_>>()
-            };
-            #[cfg(not(feature = "gpu"))]
-            let chunk_slot_vectors = (0..chunk_len)
-                .into_par_iter()
-                .map(|offset| {
-                    let slot = slot_start + offset;
-                    let slot_secret_mat =
-                        S::M::from_compact_bytes(params, slot_secret_mats[slot].as_ref());
-                    let transformed_secret_vec = base_secret_vec.clone() * &slot_secret_mat;
-                    let error: S::M = match gauss_sigma {
-                        None => S::M::zero(params, 1, ncol * packed_input_size),
-                        Some(sigma) => {
-                            let error_sampler = S::new();
-                            error_sampler.sample_uniform(
-                                params,
-                                1,
-                                ncol * packed_input_size,
-                                DistType::GaussDist { sigma },
-                            )
-                        }
-                    };
-                    let slot_plaintexts = std::iter::once(
-                        <<S as PolyUniformSampler>::M as PolyMatrix>::P::const_one(params),
-                    )
-                    .chain(plaintexts.iter().map(|plaintext_row| {
-                        <<S as PolyUniformSampler>::M as PolyMatrix>::P::from_compact_bytes(
-                            params,
-                            plaintext_row.as_ref()[slot].as_ref(),
-                        )
-                    }))
                     .collect::<Vec<_>>();
-                    let encoded_polys_vec = S::M::from_poly_vec_row(params, slot_plaintexts);
-                    let first_term = transformed_secret_vec.clone() * &all_public_key_matrix;
-                    let second_term = encoded_polys_vec.tensor(&(transformed_secret_vec * &gadget));
-                    let all_vector = first_term - second_term + error;
 
-                    (0..packed_input_size)
-                        .map(|idx| {
-                            Arc::<[u8]>::from(
-                                all_vector
-                                    .slice_columns(ncol * idx, ncol * (idx + 1))
-                                    .into_compact_bytes(),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>();
-
-            for slot_vector_bytes in chunk_slot_vectors {
-                for (idx, vector_bytes) in slot_vector_bytes.into_iter().enumerate() {
-                    encoding_vector_bytes[idx].push(vector_bytes);
+                for slot_vector_bytes in chunk_slot_vectors {
+                    for (idx, vector_bytes) in slot_vector_bytes.into_iter().enumerate() {
+                        encoding_vector_bytes[idx].push(vector_bytes);
+                    }
                 }
             }
-        }
+
+            encoding_vector_bytes
+        };
 
         encoding_vector_bytes
             .into_par_iter()

@@ -12,7 +12,10 @@ use mxx::{
     poly::{
         Poly, PolyParams,
         dcrt::{
-            gpu::{GpuDCRTPoly, GpuDCRTPolyParams, gpu_device_sync},
+            gpu::{
+                GpuDCRTPoly, GpuDCRTPolyParams, detected_gpu_device_count, detected_gpu_device_ids,
+                gpu_device_sync,
+            },
             params::DCRTPolyParams,
         },
     },
@@ -28,7 +31,7 @@ use mxx::{
 use num_bigint::BigUint;
 use rayon::prelude::*;
 use std::{env, fs, path::Path, sync::Arc, time::Instant};
-use tracing::info;
+use tracing::{debug, info};
 
 const DEFAULT_RING_DIM: u32 = 1 << 14;
 const DEFAULT_CRT_BITS: usize = 24;
@@ -311,7 +314,7 @@ fn find_crt_depth_for_modq_arith(
 
 #[tokio::test]
 async fn test_gpu_ggh15_poly_modq_arith() {
-    let _ = tracing_subscriber::fmt::try_init();
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
     gpu_device_sync();
     let cfg = ModqArithConfig::from_env();
     info!("poly modq arith test config: {:?}", cfg);
@@ -321,10 +324,14 @@ async fn test_gpu_ggh15_poly_modq_arith() {
         1usize.checked_shl(cfg.height as u32).expect("GGH15_MODQ_ARITH_HEIGHT is too large");
     let (crt_depth, cpu_params) = find_crt_depth_for_modq_arith(&cfg, q_level);
     let (moduli, _, _) = cpu_params.to_crt();
-    let detected_gpu_params =
-        GpuDCRTPolyParams::new(cpu_params.ring_dimension(), moduli.clone(), cpu_params.base_bits());
-    let single_gpu_id = *detected_gpu_params
-        .gpu_ids()
+    let detected_gpu_ids = detected_gpu_device_ids();
+    let detected_gpu_count = detected_gpu_device_count();
+    assert_eq!(
+        detected_gpu_count,
+        detected_gpu_ids.len(),
+        "detected GPU count and ids length must match"
+    );
+    let single_gpu_id = *detected_gpu_ids
         .first()
         .expect("at least one GPU device is required for test_gpu_ggh15_poly_modq_arith");
     let params = GpuDCRTPolyParams::new_with_gpu(
@@ -333,9 +340,12 @@ async fn test_gpu_ggh15_poly_modq_arith() {
         cpu_params.base_bits(),
         vec![single_gpu_id],
         Some(1),
-        detected_gpu_params.batch(),
+        1,
     );
-    info!("forcing single GPU for this test: gpu_id={}", single_gpu_id);
+    info!(
+        "forcing single GPU for eval path: eval_gpu_id={} detected_gpu_count={} detected_gpu_ids={:?}",
+        single_gpu_id, detected_gpu_count, detected_gpu_ids
+    );
     assert_eq!(params.modulus(), cpu_params.modulus());
     let full_q = params.modulus();
 
@@ -370,11 +380,12 @@ async fn test_gpu_ggh15_poly_modq_arith() {
         cfg.height, logical_num_inputs, cfg.num_slots
     );
 
-    let slot_input_parallelism = params.gpu_ids().len().max(1).min(cfg.num_slots);
+    let slot_input_parallelism = detected_gpu_count.max(1).min(cfg.num_slots);
     info!(
-        "slot input materialization parallelism={} gpu_count={}",
+        "slot input materialization parallelism={} detected_gpu_count={} eval_gpu_ids={:?}",
         slot_input_parallelism,
-        params.gpu_ids().len()
+        detected_gpu_count,
+        params.gpu_ids()
     );
 
     let flattened_input_count = circuit.num_input();
@@ -383,45 +394,120 @@ async fn test_gpu_ggh15_poly_modq_arith() {
         .map(|_| Vec::with_capacity(cfg.num_slots))
         .collect::<Vec<Vec<GpuDCRTPoly>>>();
 
+    debug!(
+        "slot input materialization started: num_slots={} chunk_size={} flattened_input_count={} logical_num_inputs={} q_level={:?}",
+        cfg.num_slots, slot_input_parallelism, flattened_input_count, logical_num_inputs, q_level
+    );
     for slot_start in (0..cfg.num_slots).step_by(slot_input_parallelism) {
         let chunk_len = (slot_start + slot_input_parallelism).min(cfg.num_slots) - slot_start;
+        let chunk_gpu_ids = &detected_gpu_ids[..chunk_len];
+        debug!(
+            "slot input chunk started: slot_range=[{}, {}), chunk_len={}, gpu_ids={:?}, expected_slots_before={}",
+            slot_start,
+            slot_start + chunk_len,
+            chunk_len,
+            chunk_gpu_ids,
+            expected_by_slot.len()
+        );
         let chunk_results = (0..chunk_len)
             .into_par_iter()
-            .map(|_| {
+            .map(|offset| {
+                let slot_idx = slot_start + offset;
+                let gpu_id = chunk_gpu_ids[offset];
+                debug!(
+                    "slot input slot started: slot_idx={} gpu_id={} logical_num_inputs={}",
+                    slot_idx,
+                    gpu_id,
+                    logical_num_inputs
+                );
+                let local_params = params.params_for_device(gpu_id);
+                debug!(
+                    "slot input slot params prepared: slot_idx={} gpu_id={} local_gpu_ids={:?}",
+                    slot_idx,
+                    gpu_id,
+                    local_params.gpu_ids()
+                );
                 let mut rng = rand::rng();
                 let input_values = (0..logical_num_inputs)
                     .map(|_| gen_biguint_for_modulus(&mut rng, &active_q))
                     .collect::<Vec<_>>();
+                debug!(
+                    "slot input values sampled: slot_idx={} gpu_id={} sampled_inputs={}",
+                    slot_idx,
+                    gpu_id,
+                    input_values.len()
+                );
                 let expected = input_values
                     .iter()
                     .fold(BigUint::from(1u64), |acc, value| (acc * value) % &active_q);
                 let encoded_inputs = input_values
                     .iter()
-                    .flat_map(|value| {
-                        encode_nested_rns_poly::<GpuDCRTPoly>(
+                    .enumerate()
+                    .flat_map(|(input_idx, value)| {
+                        debug!(
+                            "slot input encode started: slot_idx={} gpu_id={} input_idx={} q_level={:?}",
+                            slot_idx,
+                            gpu_id,
+                            input_idx,
+                            q_level
+                        );
+                        let encoded = encode_nested_rns_poly::<GpuDCRTPoly>(
                             cfg.p_moduli_bits,
-                            &params,
+                            &local_params,
                             value,
                             q_level,
-                        )
+                        );
+                        debug!(
+                            "slot input encode finished: slot_idx={} gpu_id={} input_idx={} encoded_polys={}",
+                            slot_idx,
+                            gpu_id,
+                            input_idx,
+                            encoded.len()
+                        );
+                        encoded
                     })
                     .collect::<Vec<_>>();
-                (expected, encoded_inputs)
+                debug!(
+                    "slot input slot finished: slot_idx={} gpu_id={} encoded_inputs_len={}",
+                    slot_idx,
+                    gpu_id,
+                    encoded_inputs.len()
+                );
+                (slot_idx, gpu_id, expected, encoded_inputs)
             })
             .collect::<Vec<_>>();
+        debug!(
+            "slot input chunk encoded: slot_range=[{}, {}), completed_slots={}",
+            slot_start,
+            slot_start + chunk_len,
+            chunk_results.len()
+        );
 
-        for (expected, encoded_inputs) in chunk_results {
+        for (slot_idx, gpu_id, expected, encoded_inputs) in chunk_results {
             assert_eq!(
                 encoded_inputs.len(),
                 flattened_input_count,
-                "flattened encoded inputs must match circuit input count"
+                "flattened encoded inputs must match circuit input count (slot_idx={}, gpu_id={})",
+                slot_idx,
+                gpu_id
             );
             expected_by_slot.push(expected);
             for (input_idx, poly) in encoded_inputs.into_iter().enumerate() {
                 plaintext_inputs[input_idx].push(poly);
             }
         }
+        debug!(
+            "slot input chunk committed: slot_range=[{}, {}), expected_slots_after={}",
+            slot_start,
+            slot_start + chunk_len,
+            expected_by_slot.len()
+        );
     }
+    debug!(
+        "slot input materialization finished: total_slots={} flattened_input_count={}",
+        expected_by_slot.len(),
+        flattened_input_count
+    );
 
     assert!(
         plaintext_inputs.iter().all(|slots| slots.len() == cfg.num_slots),

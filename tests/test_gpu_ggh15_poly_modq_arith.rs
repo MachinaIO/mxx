@@ -541,7 +541,12 @@ async fn test_gpu_ggh15_poly_modq_arith() {
     let encoding_sampler =
         BGGPolyEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
     drop(secrets);
+    let slot_secret_mats_start = Instant::now();
     let slot_secret_mats = encoding_sampler.sample_slot_secret_mats(&params, cfg.num_slots);
+    debug!(
+        "sample_slot_secret_mats elapsed_ms={:.3}",
+        slot_secret_mats_start.elapsed().as_secs_f64() * 1000.0
+    );
     let mut poly_encodings =
         encoding_sampler.sample(&params, &pubkeys, &plaintext_inputs, Some(&slot_secret_mats));
     drop(plaintext_inputs);

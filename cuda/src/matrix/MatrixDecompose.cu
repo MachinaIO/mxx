@@ -429,7 +429,7 @@ static int gpu_matrix_fill_gadget_impl(
     }
 
     out->format = GPU_POLY_FORMAT_COEFF;
-    status = gpu_matrix_ntt_all(out, default_batch(out->ctx));
+    status = gpu_matrix_ntt_all(out);
     if (status != 0)
     {
         return status;
@@ -962,7 +962,6 @@ static int gpu_matrix_decompose_base_impl(
     };
 
     int status = 0;
-    const int batch = default_batch(src->ctx);
     if (src->format == GPU_POLY_FORMAT_EVAL)
     {
         const int matrix_format =
@@ -979,7 +978,7 @@ static int gpu_matrix_decompose_base_impl(
             cleanup_tmp_inputs();
             return status;
         }
-        status = gpu_matrix_intt_all(tmp_inputs_matrix, batch);
+        status = gpu_matrix_intt_all(tmp_inputs_matrix);
         if (status != 0)
         {
             cleanup_tmp_inputs();
@@ -1319,7 +1318,7 @@ static int gpu_matrix_decompose_base_impl(
     out->format = GPU_POLY_FORMAT_COEFF;
     if (requested_out_format == GPU_POLY_FORMAT_EVAL)
     {
-        status = gpu_matrix_ntt_all(out, batch);
+        status = gpu_matrix_ntt_all(out);
         if (status != 0)
         {
             cleanup();

@@ -66,7 +66,6 @@ async fn test_gpu_ggh15_plt_eval_multi_inputs() {
         cpu_params.base_bits(),
         vec![single_gpu_id],
         Some(1),
-        detected_gpu_params.batch(),
     );
 
     let plt = setup_lsb_bit_lut_gpu(16, &params);
@@ -185,7 +184,6 @@ async fn test_gpu_ggh15_poly_encoding_plt_eval_slot_secret_relation() {
         cpu_params.base_bits(),
         vec![single_gpu_id],
         Some(1),
-        detected_gpu_params.batch(),
     );
 
     let plt = setup_lsb_bit_lut_gpu(16, &params);

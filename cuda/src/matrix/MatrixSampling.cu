@@ -440,7 +440,7 @@ extern "C" int gpu_matrix_sample_distribution(
     }
 
     out->format = GPU_POLY_FORMAT_COEFF;
-    status = gpu_matrix_ntt_all(out, default_batch(out->ctx));
+    status = gpu_matrix_ntt_all(out);
     if (status != 0)
     {
         return status;

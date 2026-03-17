@@ -784,9 +784,8 @@ namespace
     }
 }
 
-int gpu_matrix_ntt_all(GpuMatrix *mat, int batch)
+int gpu_matrix_ntt_all(GpuMatrix *mat)
 {
-    (void)batch;
     if (!mat || !mat->ctx)
     {
         return set_error("invalid gpu_matrix_ntt_all arguments");
@@ -798,9 +797,8 @@ int gpu_matrix_ntt_all(GpuMatrix *mat, int batch)
     return run_matrix_transform_u64<true>(mat);
 }
 
-int gpu_matrix_intt_all(GpuMatrix *mat, int batch)
+int gpu_matrix_intt_all(GpuMatrix *mat)
 {
-    (void)batch;
     if (!mat || !mat->ctx)
     {
         return set_error("invalid gpu_matrix_intt_all arguments");

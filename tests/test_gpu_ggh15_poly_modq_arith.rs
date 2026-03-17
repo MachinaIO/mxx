@@ -340,7 +340,6 @@ async fn test_gpu_ggh15_poly_modq_arith() {
         cpu_params.base_bits(),
         vec![single_gpu_id],
         Some(1),
-        1,
     );
     info!(
         "forcing single GPU for eval path: eval_gpu_id={} detected_gpu_count={} detected_gpu_ids={:?}",

@@ -352,7 +352,6 @@ async fn test_gpu_ggh15_modq_arith() {
         cpu_params.base_bits(),
         vec![single_gpu_id],
         Some(1),
-        detected_gpu_params.batch(),
     );
     info!("forcing single GPU for this test: gpu_id={}", single_gpu_id);
     assert_eq!(params.modulus(), cpu_params.modulus());

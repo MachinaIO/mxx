@@ -532,7 +532,6 @@ extern "C"
         size_t moduli_len,
         const int *gpu_ids,
         size_t gpu_ids_len,
-        uint32_t batch,
         GpuContext **out_ctx)
     {
         GpuContext *gpu_ctx = nullptr;
@@ -648,7 +647,6 @@ extern "C"
             gpu_ctx->N = static_cast<int>(n_u64);
             gpu_ctx->level = static_cast<int>(L);
             gpu_ctx->gpu_ids = std::move(gpu_list);
-            gpu_ctx->batch = batch;
             gpu_ctx->dnum = resolved_dnum;
             gpu_ctx->max_aux_limbs = GPU_RUNTIME_MAX_LIMBS;
             gpu_ctx->garner_inverse_table = std::move(inverse_table);

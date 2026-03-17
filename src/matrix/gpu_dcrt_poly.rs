@@ -191,22 +191,22 @@ impl GpuDCRTPolyMatrix {
         assert!(self.nrow == 1 && self.ncol == 1, "matrix must be 1x1 for poly operation");
     }
 
-    pub(crate) fn singleton_ntt_in_place(&mut self, batch: i32) {
+    pub(crate) fn singleton_ntt_in_place(&mut self) {
         self.assert_singleton();
         if self.is_ntt {
             return;
         }
-        let status = unsafe { gpu_matrix_ntt_all(self.raw, batch) };
+        let status = unsafe { gpu_matrix_ntt_all(self.raw) };
         check_status(status, "gpu_matrix_ntt_all");
         self.is_ntt = true;
     }
 
-    pub(crate) fn singleton_intt_in_place(&mut self, batch: i32) {
+    pub(crate) fn singleton_intt_in_place(&mut self) {
         self.assert_singleton();
         if !self.is_ntt {
             return;
         }
-        let status = unsafe { gpu_matrix_intt_all(self.raw, batch) };
+        let status = unsafe { gpu_matrix_intt_all(self.raw) };
         check_status(status, "gpu_matrix_intt_all");
         self.is_ntt = false;
     }
@@ -215,7 +215,7 @@ impl GpuDCRTPolyMatrix {
         if self.nrow == 0 || self.ncol == 0 || !self.is_ntt {
             return;
         }
-        let status = unsafe { gpu_matrix_intt_all(self.raw, self.params.batch() as i32) };
+        let status = unsafe { gpu_matrix_intt_all(self.raw) };
         check_status(status, "gpu_matrix_intt_all");
         self.is_ntt = false;
     }
@@ -791,7 +791,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         check_status(status, "gpu_matrix_load_compact_bytes");
         out.is_ntt = false;
         if format == GPU_POLY_FORMAT_EVAL {
-            let status = unsafe { gpu_matrix_ntt_all(out.raw, out.params.batch() as i32) };
+            let status = unsafe { gpu_matrix_ntt_all(out.raw) };
             check_status(status, "gpu_matrix_ntt_all");
             out.is_ntt = true;
         }
@@ -1627,7 +1627,6 @@ mod tests {
             params.base_bits(),
             vec![src_device],
             Some(1),
-            1,
         );
         let dst_params = GpuDCRTPolyParams::new_with_gpu(
             params.ring_dimension(),
@@ -1635,7 +1634,6 @@ mod tests {
             params.base_bits(),
             vec![dst_device],
             Some(1),
-            1,
         );
 
         let near_modulus = src_params.modulus().as_ref() - BigUint::from(7u32);

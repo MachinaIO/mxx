@@ -419,7 +419,9 @@ mod tests {
             let result_plaintext = result_poly
                 .plaintext_for_params(&params, slot)
                 .expect("poly lookup result should reveal plaintexts");
-            let transformed_secret_vec = s_vec.clone() * &slot_secret_mats[slot];
+            let slot_secret_mat =
+                DCRTPolyMatrix::from_compact_bytes(&params, slot_secret_mats[slot].as_ref());
+            let transformed_secret_vec = s_vec.clone() * &slot_secret_mat;
             let expected_vector = transformed_secret_vec.clone() *
                 result_poly.pubkey.matrix.clone() -
                 (transformed_secret_vec * (gadget.clone() * result_plaintext));

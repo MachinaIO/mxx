@@ -226,7 +226,7 @@ where
         params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
         public_keys: &[K],
         plaintexts: &[T],
-        slot_secret_mats: Option<&[S::M]>,
+        slot_secret_mats: Option<&[Vec<u8>]>,
     ) -> Vec<BggPolyEncoding<S::M>>
     where
         K: Borrow<BggPublicKey<S::M>> + Sync,
@@ -276,7 +276,9 @@ where
                 .into_par_iter()
                 .map(|offset| {
                     let slot = slot_start + offset;
-                    let transformed_secret_vec = base_secret_vec.clone() * &slot_secret_mats[slot];
+                    let slot_secret_mat =
+                        S::M::from_compact_bytes(params, slot_secret_mats[slot].as_ref());
+                    let transformed_secret_vec = base_secret_vec.clone() * &slot_secret_mat;
                     let error: S::M = match gauss_sigma {
                         None => S::M::zero(params, 1, ncol * packed_input_size),
                         Some(sigma) => {
@@ -346,7 +348,7 @@ where
         &self,
         params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
         num_slots: usize,
-    ) -> Vec<S::M> {
+    ) -> Vec<Vec<u8>> {
         let secret_vec_size = self.secret_vec.col_size();
         let slot_parallelism = effective_slot_parallelism::<S::M>(params, num_slots);
         let mut slot_secret_mats = Vec::with_capacity(num_slots);
@@ -357,12 +359,14 @@ where
                 .into_par_iter()
                 .map(|_| {
                     let uniform_sampler = S::new();
-                    uniform_sampler.sample_uniform(
-                        params,
-                        secret_vec_size,
-                        secret_vec_size,
-                        DistType::TernaryDist,
-                    )
+                    uniform_sampler
+                        .sample_uniform(
+                            params,
+                            secret_vec_size,
+                            secret_vec_size,
+                            DistType::TernaryDist,
+                        )
+                        .into_compact_bytes()
                 })
                 .collect::<Vec<_>>();
             slot_secret_mats.append(&mut chunk_secret_mats);
@@ -450,7 +454,11 @@ mod tests {
             .collect::<Vec<_>>();
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let slot_secret_mats = (0..num_slots)
-            .map(|_| uniform_sampler.sample_uniform(&params, d, d, DistType::TernaryDist))
+            .map(|_| {
+                uniform_sampler
+                    .sample_uniform(&params, d, d, DistType::TernaryDist)
+                    .into_compact_bytes()
+            })
             .collect::<Vec<_>>();
         let sampled =
             sampler.sample(&params, &public_keys, &plaintext_bytes, Some(&slot_secret_mats));
@@ -472,7 +480,9 @@ mod tests {
         for (idx, encoding) in sampled.iter().enumerate() {
             assert_eq!(encoding.pubkey, public_keys[idx]);
             for slot in 0..num_slots {
-                let transformed_secret_vec = sampler.secret_vec.clone() * &slot_secret_mats[slot];
+                let slot_secret_mat =
+                    DCRTPolyMatrix::from_compact_bytes(&params, slot_secret_mats[slot].as_ref());
+                let transformed_secret_vec = sampler.secret_vec.clone() * &slot_secret_mat;
                 let plaintext =
                     encoding.plaintext(slot).expect("test public keys reveal plaintexts");
                 let expected = transformed_secret_vec.clone() * encoding.pubkey.matrix.clone() -

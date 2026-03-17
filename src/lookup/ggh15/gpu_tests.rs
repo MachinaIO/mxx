@@ -299,7 +299,9 @@ async fn test_gpu_ggh15_poly_encoding_plt_eval_slot_secret_relation() {
         let result_plaintext = result_poly
             .plaintext_for_params(&params, slot)
             .expect("poly lookup result should reveal plaintexts");
-        let transformed_secret_vec = s_vec.clone() * &slot_secret_mats[slot];
+        let slot_secret_mat =
+            GpuDCRTPolyMatrix::from_compact_bytes(&params, slot_secret_mats[slot].as_ref());
+        let transformed_secret_vec = s_vec.clone() * &slot_secret_mat;
         let expected_vector = transformed_secret_vec.clone() * result_poly.pubkey.matrix.clone() -
             (transformed_secret_vec * (gadget.clone() * result_plaintext));
         assert_eq!(result_poly.vector(slot), expected_vector);

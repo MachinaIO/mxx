@@ -94,14 +94,15 @@ where
         hash_key: [u8; 32],
         dir_path: PathBuf,
         checkpoint_prefix: String,
-        _params: &<M::P as Poly>::Params,
+        params: &<M::P as Poly>::Params,
         secret_vec: M,
         b0_matrix: M,
-        slot_secret_mats: Vec<M>,
+        slot_secret_mats: Vec<Vec<u8>>,
     ) -> Self {
         let c_b0_compact_bytes_by_slot = slot_secret_mats
             .into_iter()
-            .map(|slot_secret_mat| {
+            .map(|slot_secret_mat_bytes| {
+                let slot_secret_mat = M::from_compact_bytes(params, &slot_secret_mat_bytes);
                 let transformed_secret_vec = secret_vec.clone() * &slot_secret_mat;
                 let c_b0 = transformed_secret_vec * &b0_matrix;
                 Arc::<[u8]>::from(c_b0.into_compact_bytes())

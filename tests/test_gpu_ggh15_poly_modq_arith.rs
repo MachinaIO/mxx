@@ -648,7 +648,9 @@ async fn test_gpu_ggh15_poly_modq_arith() {
 
         let expected_poly =
             GpuDCRTPoly::from_biguint_to_constant(&params, expected_by_slot[slot].clone());
-        let transformed_secret_vec = s_vec.clone() * &slot_secret_mats[slot];
+        let slot_secret_mat =
+            GpuDCRTPolyMatrix::from_compact_bytes(&params, slot_secret_mats[slot].as_ref());
+        let transformed_secret_vec = s_vec.clone() * &slot_secret_mat;
         let expected_times_gadget =
             transformed_secret_vec.clone() * (gadget.clone() * expected_poly);
         let s_times_pk = transformed_secret_vec.clone() * &poly_out.pubkey.matrix;

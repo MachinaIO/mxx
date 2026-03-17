@@ -1,5 +1,8 @@
 use super::*;
-use crate::{bgg::public_key::BggPublicKey, poly::PolyParams};
+use crate::{
+    bgg::public_key::BggPublicKey,
+    poly::{PolyParams, dcrt::gpu::detected_gpu_device_ids},
+};
 use rayon::prelude::*;
 use std::{
     ops::Mul,
@@ -20,19 +23,19 @@ pub(super) struct GpuPublicLookupSharedByDevice<M: PolyMatrix> {
     pub shared: GGH15PublicLookupSharedState<M>,
 }
 
-pub(super) fn slot_device_ids<M>(
-    params: &<M::P as Poly>::Params,
-    slot_parallelism: usize,
-) -> Vec<i32>
-where
-    M: PolyMatrix,
-{
-    let device_ids = params.device_ids();
+pub(super) fn slot_device_ids(slot_parallelism: usize) -> Vec<i32> {
+    let device_ids = detected_gpu_device_ids();
     assert!(
         !device_ids.is_empty(),
         "at least one GPU device is required for GGH15 BGG poly-encoding lookup"
     );
-    device_ids.into_iter().take(slot_parallelism.max(1)).collect()
+    assert!(
+        slot_parallelism <= device_ids.len(),
+        "GGH15 BGG poly-encoding slot parallelism must be <= detected GPU count: requested={}, devices={}",
+        slot_parallelism,
+        device_ids.len()
+    );
+    device_ids.into_iter().take(slot_parallelism).collect()
 }
 
 pub(super) fn prepare_public_lookup_shared_by_device<M>(
@@ -59,7 +62,7 @@ where
     let u_g_decomposed_bytes = Arc::<[u8]>::from(shared.u_g_decomposed.as_ref().to_compact_bytes());
     let out_pubkey_matrix_bytes = Arc::<[u8]>::from(shared.out_pubkey.matrix.to_compact_bytes());
 
-    slot_device_ids::<M>(params, slot_parallelism)
+    slot_device_ids(slot_parallelism)
         .into_iter()
         .map(|device_id| {
             let local_params = params.params_for_device(device_id);
@@ -254,4 +257,34 @@ where
         evaluate_started.elapsed().as_secs_f64() * 1000.0
     );
     (output_vector_bytes, output_plaintext_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slot_device_ids;
+    use crate::{__PAIR, __TestState, poly::dcrt::gpu::detected_gpu_device_ids};
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_ggh15_slot_device_ids_uses_detected_gpu_ids() {
+        let detected_gpu_ids = detected_gpu_device_ids();
+
+        if detected_gpu_ids.is_empty() {
+            let panic = std::panic::catch_unwind(|| slot_device_ids(1))
+                .expect_err("without detected GPUs the helper should reject slot processing");
+            let panic_msg = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .expect("panic payload should be a string");
+            assert!(panic_msg.contains("at least one GPU device is required"));
+            return;
+        }
+
+        let slot_parallelism = detected_gpu_ids.len().min(2);
+        assert_eq!(
+            slot_device_ids(slot_parallelism),
+            detected_gpu_ids[..slot_parallelism].to_vec()
+        );
+    }
 }

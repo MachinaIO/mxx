@@ -19,7 +19,7 @@ use crate::{
     storage::write::{init_storage_system, storage_test_lock, wait_for_all_writes},
 };
 use keccak_asm::Keccak256;
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::Arc};
 
 use super::{
     GGH15BGGEncodingPltEvaluator, GGH15BGGPolyEncodingPltEvaluator, GGH15BGGPubKeyPltEvaluator,
@@ -210,9 +210,12 @@ async fn test_gpu_ggh15_poly_encoding_plt_eval_slot_secret_relation() {
 
     let uniform_sampler = GpuDCRTPolyUniformSampler::new();
     let secrets = uniform_sampler.sample_uniform(&params, 1, d, DistType::TernaryDist).get_row(0);
-    let plaintexts = (0..num_slots)
+    let plaintext_bytes = (0..num_slots)
         .map(|_| {
-            GpuDCRTPoly::from_usize_to_constant(&params, (rand::random::<u64>() % 16) as usize)
+            Arc::<[u8]>::from(
+                GpuDCRTPoly::from_usize_to_constant(&params, (rand::random::<u64>() % 16) as usize)
+                    .to_compact_bytes(),
+            )
         })
         .collect::<Vec<_>>();
 
@@ -221,11 +224,11 @@ async fn test_gpu_ggh15_poly_encoding_plt_eval_slot_secret_relation() {
         BGGPolyEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
     let slot_secret_mats = bgg_poly_encoding_sampler.sample_slot_secret_mats(&params, num_slots);
     let pubkeys = bgg_pubkey_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
-    let poly_encodings = bgg_poly_encoding_sampler.sample_with_slot_secret_mats(
+    let poly_encodings = bgg_poly_encoding_sampler.sample(
         &params,
         &pubkeys,
-        &[plaintexts],
-        &slot_secret_mats,
+        &[plaintext_bytes],
+        Some(&slot_secret_mats),
     );
     let enc_one_poly = poly_encodings[0].clone();
     let enc_input_poly = poly_encodings[1].clone();
@@ -289,16 +292,16 @@ async fn test_gpu_ggh15_poly_encoding_plt_eval_slot_secret_relation() {
     let result_poly = &result_poly[0];
     assert_eq!(result_poly.pubkey, result_pubkey[0]);
 
-    let result_plaintexts =
-        result_poly.plaintexts.as_ref().expect("poly lookup result should reveal plaintexts");
-    assert_eq!(result_plaintexts.len(), num_slots);
     assert_eq!(result_poly.num_slots(), num_slots);
     let gadget = GpuDCRTPolyMatrix::gadget_matrix(&params, d);
 
     for slot in 0..num_slots {
+        let result_plaintext = result_poly
+            .plaintext_for_params(&params, slot)
+            .expect("poly lookup result should reveal plaintexts");
         let transformed_secret_vec = s_vec.clone() * &slot_secret_mats[slot];
         let expected_vector = transformed_secret_vec.clone() * result_poly.pubkey.matrix.clone() -
-            (transformed_secret_vec * (gadget.clone() * result_plaintexts[slot].clone()));
+            (transformed_secret_vec * (gadget.clone() * result_plaintext));
         assert_eq!(result_poly.vector(slot), expected_vector);
     }
 

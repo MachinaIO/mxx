@@ -135,25 +135,20 @@ where
             gate_id, lut_id, num_slots
         );
 
-        let plaintexts = input
-            .plaintexts
+        let plaintext_compact_bytes_by_slot = input
+            .plaintext_bytes
             .as_ref()
             .expect("the BGG poly encoding should reveal plaintexts for public lookup");
         assert_eq!(
-            plaintexts.len(),
+            plaintext_compact_bytes_by_slot.len(),
             num_slots,
-            "BGG poly encoding public lookup requires plaintexts.len() == num_slots"
+            "BGG poly encoding public lookup requires plaintext_bytes.len() == num_slots"
         );
         assert_eq!(
             self.c_b0_compact_bytes_by_slot.len(),
             num_slots,
             "slot-wise c_b0 compact-bytes cache must match the BGG poly encoding slot count"
         );
-
-        let plaintext_compact_bytes_by_slot = plaintexts
-            .iter()
-            .map(|plaintext| Arc::<[u8]>::from(plaintext.to_compact_bytes()))
-            .collect::<Vec<_>>();
         let dir = Path::new(&self.dir_path);
         let d = input.pubkey.matrix.row_size();
         let checkpoint_prefix = &self.checkpoint_prefix;
@@ -198,15 +193,11 @@ where
                     &shared,
                     configured_parallelism,
                 );
-            let output_plaintexts = output_plaintext_bytes
-                .iter()
-                .map(|bytes| M::P::from_compact_bytes(params, bytes.as_ref()))
-                .collect::<Vec<_>>();
-            let out = BggPolyEncoding::from_vector_bytes(
+            let out = BggPolyEncoding::new(
                 params.clone(),
                 output_vector_bytes,
                 out_pubkey,
-                Some(output_plaintexts),
+                Some(output_plaintext_bytes),
             );
             debug!(
                 "GGH15 BGG poly-encoding public lookup finished: gate_id={}, lut_id={}, slot_count={}, elapsed_ms={:.3}",
@@ -310,15 +301,11 @@ where
                 );
             }
 
-            let output_plaintexts = output_plaintext_bytes
-                .iter()
-                .map(|bytes| M::P::from_compact_bytes(params, bytes.as_ref()))
-                .collect::<Vec<_>>();
-            let out = BggPolyEncoding::from_vector_bytes(
+            let out = BggPolyEncoding::new(
                 params.clone(),
                 output_vector_bytes,
                 out_pubkey,
-                Some(output_plaintexts),
+                Some(output_plaintext_bytes),
             );
 
             debug!(

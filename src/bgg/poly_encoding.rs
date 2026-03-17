@@ -13,6 +13,7 @@ use rayon::prelude::*;
 use std::{
     fmt::Debug,
     ops::{Add, Mul, Sub},
+    path::Path,
     sync::Arc,
 };
 
@@ -68,20 +69,21 @@ where
     }
 }
 
-fn map_slot_plaintexts_with_params<M, F>(
-    params: &<M::P as Poly>::Params,
-    num_slots: usize,
-    f: F,
-) -> Vec<M::P>
+fn share_bytes<B>(bytes: Vec<B>) -> Vec<Arc<[u8]>>
 where
-    M: PolyMatrix,
-    F: Fn(usize, &<M::P as Poly>::Params) -> M::P + Send + Sync,
+    B: Into<Arc<[u8]>>,
 {
-    let plaintext_bytes =
-        map_slots_with_params::<M, _, _>(params, num_slots, |slot, local_params| {
-            Arc::<[u8]>::from(f(slot, local_params).to_compact_bytes())
-        });
-    plaintext_bytes.iter().map(|bytes| M::P::from_compact_bytes(params, bytes.as_ref())).collect()
+    bytes.into_iter().map(Into::into).collect()
+}
+
+fn read_poly_compact_bytes_from_file<P: AsRef<Path> + Send + Sync>(
+    dir_path: P,
+    id: &str,
+) -> Arc<[u8]> {
+    let path = dir_path.as_ref().join(format!("{id}.poly"));
+    Arc::<[u8]>::from(
+        std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read polynomial file {path:?}")),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +91,7 @@ pub struct BggPolyEncoding<M: PolyMatrix> {
     pub params: <M::P as Poly>::Params,
     pub vector_bytes: Vec<Arc<[u8]>>,
     pub pubkey: BggPublicKey<M>,
-    pub plaintexts: Option<Vec<<M as PolyMatrix>::P>>,
+    pub plaintext_bytes: Option<Vec<Arc<[u8]>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,33 +102,25 @@ pub struct BggPolyEncodingCompact<M: PolyMatrix> {
 }
 
 impl<M: PolyMatrix> BggPolyEncoding<M> {
-    pub fn new(
+    pub fn new<B>(
         params: <M::P as Poly>::Params,
-        vectors: Vec<M>,
+        vector_bytes: Vec<B>,
         pubkey: BggPublicKey<M>,
-        plaintexts: Option<Vec<<M as PolyMatrix>::P>>,
-    ) -> Self {
-        let vector_bytes = vectors
-            .into_iter()
-            .map(|vector| Arc::<[u8]>::from(vector.into_compact_bytes()))
-            .collect();
-        Self::from_vector_bytes(params, vector_bytes, pubkey, plaintexts)
-    }
-
-    pub fn from_vector_bytes(
-        params: <M::P as Poly>::Params,
-        vector_bytes: Vec<Arc<[u8]>>,
-        pubkey: BggPublicKey<M>,
-        plaintexts: Option<Vec<<M as PolyMatrix>::P>>,
-    ) -> Self {
-        if let Some(plaintexts) = plaintexts.as_ref() {
+        plaintext_bytes: Option<Vec<B>>,
+    ) -> Self
+    where
+        B: Into<Arc<[u8]>>,
+    {
+        let vector_bytes = share_bytes(vector_bytes);
+        let plaintext_bytes = plaintext_bytes.map(share_bytes);
+        if let Some(plaintext_bytes) = plaintext_bytes.as_ref() {
             assert_eq!(
-                plaintexts.len(),
+                plaintext_bytes.len(),
                 vector_bytes.len(),
-                "BggPolyEncoding::from_vector_bytes requires plaintexts.len() == vector_bytes.len()"
+                "BggPolyEncoding::new requires plaintext_bytes.len() == vector_bytes.len()"
             );
         }
-        Self { params, vector_bytes, pubkey, plaintexts }
+        Self { params, vector_bytes, pubkey, plaintext_bytes }
     }
 
     pub fn num_slots(&self) -> usize {
@@ -139,6 +133,20 @@ impl<M: PolyMatrix> BggPolyEncoding<M> {
 
     pub fn vector_for_params(&self, params: &<M::P as Poly>::Params, slot: usize) -> M {
         M::from_compact_bytes(params, self.vector_bytes[slot].as_ref())
+    }
+
+    pub fn plaintext(&self, slot: usize) -> Option<M::P> {
+        self.plaintext_for_params(&self.params, slot)
+    }
+
+    pub fn plaintext_for_params(
+        &self,
+        params: &<M::P as Poly>::Params,
+        slot: usize,
+    ) -> Option<M::P> {
+        self.plaintext_bytes
+            .as_ref()
+            .map(|plaintext_bytes| M::P::from_compact_bytes(params, plaintext_bytes[slot].as_ref()))
     }
 
     pub fn concat_vector(&self, others: &[Self]) -> Vec<M> {
@@ -178,7 +186,7 @@ impl<M: PolyMatrix> BggPolyEncoding<M> {
         num_slots: usize,
     ) -> Self {
         let ncol = d1 * log_base_q;
-        let vectors = (0..num_slots)
+        let vectors: Vec<M> = (0..num_slots)
             .into_par_iter()
             .map(|slot| {
                 M::read_from_files(params, 1, ncol, &dir_path, &format!("{id}_slot_{slot}_vector"))
@@ -192,13 +200,12 @@ impl<M: PolyMatrix> BggPolyEncoding<M> {
             &format!("{id}_pubkey"),
             reveal_plaintext,
         );
-        let plaintexts = if reveal_plaintext {
+        let plaintext_bytes = if reveal_plaintext {
             Some(
                 (0..num_slots)
                     .into_par_iter()
                     .map(|slot| {
-                        M::P::read_from_file(
-                            params,
+                        read_poly_compact_bytes_from_file(
                             &dir_path,
                             &format!("{id}_slot_{slot}_plaintext"),
                         )
@@ -209,7 +216,11 @@ impl<M: PolyMatrix> BggPolyEncoding<M> {
             None
         };
 
-        Self::new(params.clone(), vectors, pubkey, plaintexts)
+        let vector_bytes = vectors
+            .into_iter()
+            .map(|vector| Arc::<[u8]>::from(vector.into_compact_bytes()))
+            .collect::<Vec<_>>();
+        Self::new(params.clone(), vector_bytes, pubkey, plaintext_bytes)
     }
 }
 
@@ -225,7 +236,7 @@ impl<M: PolyMatrix> Add<&Self> for BggPolyEncoding<M> {
     type Output = Self;
 
     fn add(self, other: &Self) -> Self {
-        let Self { params, vector_bytes, pubkey, plaintexts } = self;
+        let Self { params, vector_bytes, pubkey, plaintext_bytes } = self;
         assert_eq!(
             vector_bytes.len(),
             other.vector_bytes.len(),
@@ -242,13 +253,17 @@ impl<M: PolyMatrix> Add<&Self> for BggPolyEncoding<M> {
                 drop(rhs);
                 Arc::<[u8]>::from(out.into_compact_bytes())
             });
-        let plaintexts = match (plaintexts, other.plaintexts.as_ref()) {
+        let plaintext_bytes = match (plaintext_bytes, other.plaintext_bytes.as_ref()) {
             (Some(lhs), Some(rhs)) => {
-                Some(lhs.into_iter().zip(rhs.iter()).map(|(a, b)| a + b).collect())
+                Some(map_slots_with_params::<M, _, _>(&params, lhs.len(), |slot, local_params| {
+                    let a = M::P::from_compact_bytes(local_params, lhs[slot].as_ref());
+                    let b = M::P::from_compact_bytes(local_params, rhs[slot].as_ref());
+                    Arc::<[u8]>::from((a + b).to_compact_bytes())
+                }))
             }
             _ => None,
         };
-        Self::from_vector_bytes(params, vector_bytes, pubkey, plaintexts)
+        Self::new(params, vector_bytes, pubkey, plaintext_bytes)
     }
 }
 
@@ -264,7 +279,7 @@ impl<M: PolyMatrix> Sub<&Self> for BggPolyEncoding<M> {
     type Output = Self;
 
     fn sub(self, other: &Self) -> Self {
-        let Self { params, vector_bytes, pubkey, plaintexts } = self;
+        let Self { params, vector_bytes, pubkey, plaintext_bytes } = self;
         assert_eq!(
             vector_bytes.len(),
             other.vector_bytes.len(),
@@ -281,13 +296,17 @@ impl<M: PolyMatrix> Sub<&Self> for BggPolyEncoding<M> {
                 drop(rhs);
                 Arc::<[u8]>::from(out.into_compact_bytes())
             });
-        let plaintexts = match (plaintexts, other.plaintexts.as_ref()) {
+        let plaintext_bytes = match (plaintext_bytes, other.plaintext_bytes.as_ref()) {
             (Some(lhs), Some(rhs)) => {
-                Some(lhs.into_iter().zip(rhs.iter()).map(|(a, b)| a - b).collect())
+                Some(map_slots_with_params::<M, _, _>(&params, lhs.len(), |slot, local_params| {
+                    let a = M::P::from_compact_bytes(local_params, lhs[slot].as_ref());
+                    let b = M::P::from_compact_bytes(local_params, rhs[slot].as_ref());
+                    Arc::<[u8]>::from((a - b).to_compact_bytes())
+                }))
             }
             _ => None,
         };
-        Self::from_vector_bytes(params, vector_bytes, pubkey, plaintexts)
+        Self::new(params, vector_bytes, pubkey, plaintext_bytes)
     }
 }
 
@@ -303,7 +322,7 @@ impl<M: PolyMatrix> Mul<&Self> for BggPolyEncoding<M> {
     type Output = Self;
 
     fn mul(self, other: &Self) -> Self {
-        let Self { params, vector_bytes, pubkey, plaintexts } = self;
+        let Self { params, vector_bytes, pubkey, plaintext_bytes } = self;
         assert_eq!(
             vector_bytes.len(),
             other.vector_bytes.len(),
@@ -311,13 +330,9 @@ impl<M: PolyMatrix> Mul<&Self> for BggPolyEncoding<M> {
         );
         assert_eq!(params, other.params, "BggPolyEncoding::mul requires matching params");
 
-        let lhs_plaintexts = plaintexts.as_ref().unwrap_or_else(|| {
+        let lhs_plaintext_bytes = plaintext_bytes.as_ref().unwrap_or_else(|| {
             panic!("Unknown plaintext for the left-hand input of multiplication")
         });
-        let lhs_plaintext_bytes = lhs_plaintexts
-            .iter()
-            .map(|plaintext| Arc::<[u8]>::from(plaintext.to_compact_bytes()))
-            .collect::<Vec<_>>();
         let other_pubkey_matrix_bytes = Arc::<[u8]>::from(other.pubkey.matrix.to_compact_bytes());
 
         let pubkey = pubkey * &other.pubkey;
@@ -337,13 +352,17 @@ impl<M: PolyMatrix> Mul<&Self> for BggPolyEncoding<M> {
                 let out = first_term + second_term;
                 Arc::<[u8]>::from(out.into_compact_bytes())
             });
-        let plaintexts = match (plaintexts, other.plaintexts.as_ref()) {
+        let plaintext_bytes = match (plaintext_bytes, other.plaintext_bytes.as_ref()) {
             (Some(lhs), Some(rhs)) => {
-                Some(lhs.into_iter().zip(rhs.iter()).map(|(a, b)| a * b).collect())
+                Some(map_slots_with_params::<M, _, _>(&params, lhs.len(), |slot, local_params| {
+                    let a = M::P::from_compact_bytes(local_params, lhs[slot].as_ref());
+                    let b = M::P::from_compact_bytes(local_params, rhs[slot].as_ref());
+                    Arc::<[u8]>::from((a * b).to_compact_bytes())
+                }))
             }
             _ => None,
         };
-        Self::from_vector_bytes(params, vector_bytes, pubkey, plaintexts)
+        Self::new(params, vector_bytes, pubkey, plaintext_bytes)
     }
 }
 
@@ -359,34 +378,19 @@ impl<M: PolyMatrix> Evaluable for BggPolyEncoding<M> {
                 self.pubkey.matrix.into_compact_bytes(),
                 self.pubkey.reveal_plaintext,
             ),
-            plaintext_bytes: self.plaintexts.map(|plaintexts| {
-                plaintexts
-                    .into_iter()
-                    .map(|plaintext| Arc::<[u8]>::from(plaintext.to_compact_bytes()))
-                    .collect()
-            }),
+            plaintext_bytes: self.plaintext_bytes,
         }
     }
 
     fn from_compact(params: &Self::Params, compact: &Self::Compact) -> Self {
-        let plaintexts = compact.plaintext_bytes.as_ref().map(|plaintext_bytes| {
-            map_slot_plaintexts_with_params::<M, _>(
-                params,
-                plaintext_bytes.len(),
-                |slot, local_params| {
-                    M::P::from_compact_bytes(local_params, plaintext_bytes[slot].as_ref())
-                },
-            )
-        });
-
-        Self::from_vector_bytes(
+        Self::new(
             params.clone(),
             compact.vector_bytes.clone(),
             BggPublicKey {
                 matrix: M::from_compact_bytes(params, &compact.pubkey.matrix_bytes),
                 reveal_plaintext: compact.pubkey.reveal_plaintext,
             },
-            plaintexts,
+            compact.plaintext_bytes.clone(),
         )
     }
 
@@ -413,24 +417,16 @@ impl<M: PolyMatrix> Evaluable for BggPolyEncoding<M> {
                 drop(rotate_poly);
                 Arc::<[u8]>::from(out.into_compact_bytes())
             });
-        let plaintexts = self.plaintexts.as_ref().map(|plaintexts| {
-            let plaintext_bytes = plaintexts
-                .iter()
-                .map(|plaintext| Arc::<[u8]>::from(plaintext.to_compact_bytes()))
-                .collect::<Vec<_>>();
-            map_slot_plaintexts_with_params::<M, _>(
-                params,
-                plaintext_bytes.len(),
-                |slot, local_params| {
-                    let plaintext =
-                        M::P::from_compact_bytes(local_params, plaintext_bytes[slot].as_ref());
-                    let rotate_poly =
-                        M::P::from_compact_bytes(local_params, rotate_poly_bytes.as_ref());
-                    plaintext * rotate_poly
-                },
-            )
+        let plaintext_bytes = self.plaintext_bytes.as_ref().map(|plaintext_bytes| {
+            map_slots_with_params::<M, _, _>(params, plaintext_bytes.len(), |slot, local_params| {
+                let plaintext =
+                    M::P::from_compact_bytes(local_params, plaintext_bytes[slot].as_ref());
+                let rotate_poly =
+                    M::P::from_compact_bytes(local_params, rotate_poly_bytes.as_ref());
+                Arc::<[u8]>::from((plaintext * rotate_poly).to_compact_bytes())
+            })
         });
-        Self::from_vector_bytes(params.clone(), vector_bytes, pubkey, plaintexts)
+        Self::new(params.clone(), vector_bytes, pubkey, plaintext_bytes)
     }
 
     fn small_scalar_mul(&self, params: &Self::Params, scalar: &[u32]) -> Self {
@@ -443,27 +439,19 @@ impl<M: PolyMatrix> Evaluable for BggPolyEncoding<M> {
                 drop(scalar_poly);
                 Arc::<[u8]>::from(out.into_compact_bytes())
             });
-        let plaintexts = self.plaintexts.as_ref().map(|plaintexts| {
-            let plaintext_bytes = plaintexts
-                .iter()
-                .map(|plaintext| Arc::<[u8]>::from(plaintext.to_compact_bytes()))
-                .collect::<Vec<_>>();
-            map_slot_plaintexts_with_params::<M, _>(
-                params,
-                plaintext_bytes.len(),
-                |slot, local_params| {
-                    let plaintext =
-                        M::P::from_compact_bytes(local_params, plaintext_bytes[slot].as_ref());
-                    let scalar_poly = M::P::from_compact_bytes(local_params, scalar_bytes.as_ref());
-                    plaintext * scalar_poly
-                },
-            )
+        let plaintext_bytes = self.plaintext_bytes.as_ref().map(|plaintext_bytes| {
+            map_slots_with_params::<M, _, _>(params, plaintext_bytes.len(), |slot, local_params| {
+                let plaintext =
+                    M::P::from_compact_bytes(local_params, plaintext_bytes[slot].as_ref());
+                let scalar_poly = M::P::from_compact_bytes(local_params, scalar_bytes.as_ref());
+                Arc::<[u8]>::from((plaintext * scalar_poly).to_compact_bytes())
+            })
         });
-        Self::from_vector_bytes(
+        Self::new(
             params.clone(),
             vector_bytes,
             self.pubkey.small_scalar_mul(params, scalar),
-            plaintexts,
+            plaintext_bytes,
         )
     }
 
@@ -483,27 +471,19 @@ impl<M: PolyMatrix> Evaluable for BggPolyEncoding<M> {
                 drop(scalar_gadget);
                 Arc::<[u8]>::from(out.into_compact_bytes())
             });
-        let plaintexts = self.plaintexts.as_ref().map(|plaintexts| {
-            let plaintext_bytes = plaintexts
-                .iter()
-                .map(|plaintext| Arc::<[u8]>::from(plaintext.to_compact_bytes()))
-                .collect::<Vec<_>>();
-            map_slot_plaintexts_with_params::<M, _>(
-                params,
-                plaintext_bytes.len(),
-                |slot, local_params| {
-                    let plaintext =
-                        M::P::from_compact_bytes(local_params, plaintext_bytes[slot].as_ref());
-                    let scalar_poly = M::P::from_compact_bytes(local_params, scalar_bytes.as_ref());
-                    plaintext * scalar_poly
-                },
-            )
+        let plaintext_bytes = self.plaintext_bytes.as_ref().map(|plaintext_bytes| {
+            map_slots_with_params::<M, _, _>(params, plaintext_bytes.len(), |slot, local_params| {
+                let plaintext =
+                    M::P::from_compact_bytes(local_params, plaintext_bytes[slot].as_ref());
+                let scalar_poly = M::P::from_compact_bytes(local_params, scalar_bytes.as_ref());
+                Arc::<[u8]>::from((plaintext * scalar_poly).to_compact_bytes())
+            })
         });
-        Self::from_vector_bytes(
+        Self::new(
             params.clone(),
             vector_bytes,
             self.pubkey.large_scalar_mul(params, scalar),
-            plaintexts,
+            plaintext_bytes,
         )
     }
 }
@@ -516,7 +496,10 @@ mod tests {
         bgg::{encoding::BggEncoding, public_key::BggPublicKey, sampler::BGGPublicKeySampler},
         circuit::evaluable::Evaluable,
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
-        poly::{Poly, PolyParams, dcrt::params::DCRTPolyParams},
+        poly::{
+            Poly, PolyParams,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
         sampler::hash::DCRTPolyHashSampler,
         utils::{block_size, create_random_poly},
     };
@@ -530,6 +513,14 @@ mod tests {
             params,
             (0..columns).map(|_| create_random_poly(params)).collect(),
         )
+    }
+
+    fn plaintext_bytes(plaintexts: &[DCRTPoly]) -> Vec<Vec<u8>> {
+        plaintexts.iter().map(|plaintext| plaintext.to_compact_bytes()).collect()
+    }
+
+    fn vector_bytes(vectors: &[DCRTPolyMatrix]) -> Vec<Vec<u8>> {
+        vectors.iter().map(|vector| vector.to_compact_bytes()).collect()
     }
 
     fn write_matrix_to_files(matrix: &DCRTPolyMatrix, dir: &Path, id: &str) {
@@ -565,17 +556,25 @@ mod tests {
         let sampled_pub_keys = sampler.sample(&params, &tag.to_le_bytes(), &[true, true, true]);
         let pubkey = sampled_pub_keys[1].clone();
 
+        let lhs_plaintexts =
+            (0..num_slots).map(|_| create_random_poly(&params)).collect::<Vec<_>>();
+        let rhs_plaintexts =
+            (0..num_slots).map(|_| create_random_poly(&params)).collect::<Vec<_>>();
+        let lhs_vectors =
+            (0..num_slots).map(|_| random_row_vector(&params, columns)).collect::<Vec<_>>();
+        let rhs_vectors =
+            (0..num_slots).map(|_| random_row_vector(&params, columns)).collect::<Vec<_>>();
         let lhs = BggPolyEncoding::new(
             params.clone(),
-            (0..num_slots).map(|_| random_row_vector(&params, columns)).collect(),
+            vector_bytes(&lhs_vectors),
             pubkey.clone(),
-            Some((0..num_slots).map(|_| create_random_poly(&params)).collect()),
+            Some(plaintext_bytes(&lhs_plaintexts)),
         );
         let rhs = BggPolyEncoding::new(
             params.clone(),
-            (0..num_slots).map(|_| random_row_vector(&params, columns)).collect(),
+            vector_bytes(&rhs_vectors),
             pubkey,
-            Some((0..num_slots).map(|_| create_random_poly(&params)).collect()),
+            Some(plaintext_bytes(&rhs_plaintexts)),
         );
 
         let concatenated = lhs.concat_vector(std::slice::from_ref(&rhs));
@@ -600,86 +599,64 @@ mod tests {
         let sampled_pub_keys = sampler.sample(&params, &tag.to_le_bytes(), &[true, true, true]);
         let lhs_pubkey = sampled_pub_keys[1].clone();
         let rhs_pubkey = sampled_pub_keys[2].clone();
+        let lhs_plaintexts =
+            (0..num_slots).map(|_| create_random_poly(&params)).collect::<Vec<_>>();
+        let rhs_plaintexts =
+            (0..num_slots).map(|_| create_random_poly(&params)).collect::<Vec<_>>();
+        let lhs_vectors =
+            (0..num_slots).map(|_| random_row_vector(&params, columns)).collect::<Vec<_>>();
+        let rhs_vectors =
+            (0..num_slots).map(|_| random_row_vector(&params, columns)).collect::<Vec<_>>();
         let lhs = BggPolyEncoding::new(
             params.clone(),
-            (0..num_slots).map(|_| random_row_vector(&params, columns)).collect(),
+            vector_bytes(&lhs_vectors),
             lhs_pubkey.clone(),
-            Some((0..num_slots).map(|_| create_random_poly(&params)).collect()),
+            Some(plaintext_bytes(&lhs_plaintexts)),
         );
         let rhs = BggPolyEncoding::new(
             params.clone(),
-            (0..num_slots).map(|_| random_row_vector(&params, columns)).collect(),
+            vector_bytes(&rhs_vectors),
             rhs_pubkey.clone(),
-            Some((0..num_slots).map(|_| create_random_poly(&params)).collect()),
+            Some(plaintext_bytes(&rhs_plaintexts)),
         );
 
         let expected_add = (0..num_slots)
             .map(|slot| {
-                BggEncoding::new(
-                    lhs.vector(slot),
-                    lhs_pubkey.clone(),
-                    lhs.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
-                ) + &BggEncoding::new(
-                    rhs.vector(slot),
-                    rhs_pubkey.clone(),
-                    rhs.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
-                )
+                BggEncoding::new(lhs.vector(slot), lhs_pubkey.clone(), lhs.plaintext(slot)) +
+                    &BggEncoding::new(rhs.vector(slot), rhs_pubkey.clone(), rhs.plaintext(slot))
             })
             .collect::<Vec<_>>();
         let addition = lhs.clone() + rhs.clone();
         assert_eq!(addition.pubkey, lhs_pubkey.clone() + rhs_pubkey.clone());
         for (slot, expected) in expected_add.iter().enumerate() {
             assert_eq!(addition.vector(slot), expected.vector);
-            assert_eq!(
-                addition.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
-                expected.plaintext.clone()
-            );
+            assert_eq!(addition.plaintext(slot), expected.plaintext.clone());
         }
 
         let expected_sub = (0..num_slots)
             .map(|slot| {
-                BggEncoding::new(
-                    lhs.vector(slot),
-                    lhs_pubkey.clone(),
-                    lhs.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
-                ) - &BggEncoding::new(
-                    rhs.vector(slot),
-                    rhs_pubkey.clone(),
-                    rhs.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
-                )
+                BggEncoding::new(lhs.vector(slot), lhs_pubkey.clone(), lhs.plaintext(slot)) -
+                    &BggEncoding::new(rhs.vector(slot), rhs_pubkey.clone(), rhs.plaintext(slot))
             })
             .collect::<Vec<_>>();
         let subtraction = lhs.clone() - rhs.clone();
         assert_eq!(subtraction.pubkey, lhs_pubkey.clone() - rhs_pubkey.clone());
         for (slot, expected) in expected_sub.iter().enumerate() {
             assert_eq!(subtraction.vector(slot), expected.vector);
-            assert_eq!(
-                subtraction.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
-                expected.plaintext.clone()
-            );
+            assert_eq!(subtraction.plaintext(slot), expected.plaintext.clone());
         }
 
         let expected_mul = (0..num_slots)
             .map(|slot| {
-                BggEncoding::new(
-                    lhs.vector(slot),
-                    lhs_pubkey.clone(),
-                    lhs.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
-                ) * &BggEncoding::new(
-                    rhs.vector(slot),
-                    rhs_pubkey.clone(),
-                    rhs.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
-                )
+                BggEncoding::new(lhs.vector(slot), lhs_pubkey.clone(), lhs.plaintext(slot)) *
+                    &BggEncoding::new(rhs.vector(slot), rhs_pubkey.clone(), rhs.plaintext(slot))
             })
             .collect::<Vec<_>>();
         let multiplication = lhs.clone() * rhs.clone();
         assert_eq!(multiplication.pubkey, lhs_pubkey * rhs_pubkey);
         for (slot, expected) in expected_mul.iter().enumerate() {
             assert_eq!(multiplication.vector(slot), expected.vector);
-            assert_eq!(
-                multiplication.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
-                expected.plaintext.clone()
-            );
+            assert_eq!(multiplication.plaintext(slot), expected.plaintext.clone());
         }
     }
 
@@ -690,9 +667,9 @@ mod tests {
         let panic = std::panic::catch_unwind(|| {
             let _ = BggPolyEncoding::new(
                 params.clone(),
-                vec![DCRTPolyMatrix::identity(&params, 1, None)],
+                vector_bytes(&[DCRTPolyMatrix::identity(&params, 1, None)]),
                 pubkey,
-                Some(vec![create_random_poly(&params), create_random_poly(&params)]),
+                Some(plaintext_bytes(&[create_random_poly(&params), create_random_poly(&params)])),
             );
         })
         .expect_err("slot mismatch should panic");
@@ -701,9 +678,11 @@ mod tests {
             .map(String::as_str)
             .or_else(|| panic.downcast_ref::<&str>().copied())
             .expect("panic payload should be a string");
-        assert!(panic_msg.contains(
-            "BggPolyEncoding::from_vector_bytes requires plaintexts.len() == vector_bytes.len()"
-        ));
+        assert!(
+            panic_msg.contains(
+                "BggPolyEncoding::new requires plaintext_bytes.len() == vector_bytes.len()"
+            )
+        );
     }
 
     #[sequential_test::sequential]
@@ -718,11 +697,15 @@ mod tests {
         let sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(key, d);
         let sampled_pub_keys = sampler.sample(&params, &tag.to_le_bytes(), &[true, true, true]);
         let pubkey = sampled_pub_keys[1].clone();
+        let encoding_plaintexts =
+            (0..num_slots).map(|_| create_random_poly(&params)).collect::<Vec<_>>();
+        let encoding_vectors =
+            (0..num_slots).map(|_| random_row_vector(&params, columns)).collect::<Vec<_>>();
         let encoding = BggPolyEncoding::new(
             params.clone(),
-            (0..num_slots).map(|_| random_row_vector(&params, columns)).collect(),
+            vector_bytes(&encoding_vectors),
             pubkey.clone(),
-            Some((0..num_slots).map(|_| create_random_poly(&params)).collect()),
+            Some(plaintext_bytes(&encoding_plaintexts)),
         );
 
         let compact = encoding.clone().to_compact();
@@ -732,50 +715,32 @@ mod tests {
         let rotated = encoding.rotate(&params, 1);
         assert_eq!(rotated.pubkey, pubkey.rotate(&params, 1));
         for slot in 0..num_slots {
-            let expected = BggEncoding::new(
-                encoding.vector(slot),
-                pubkey.clone(),
-                encoding.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
-            )
-            .rotate(&params, 1);
+            let expected =
+                BggEncoding::new(encoding.vector(slot), pubkey.clone(), encoding.plaintext(slot))
+                    .rotate(&params, 1);
             assert_eq!(rotated.vector(slot), expected.vector);
-            assert_eq!(
-                rotated.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
-                expected.plaintext
-            );
+            assert_eq!(rotated.plaintext(slot), expected.plaintext);
         }
 
         let small_scaled = encoding.small_scalar_mul(&params, &[1, 2, 3]);
         assert_eq!(small_scaled.pubkey, pubkey.small_scalar_mul(&params, &[1, 2, 3]));
         for slot in 0..num_slots {
-            let expected = BggEncoding::new(
-                encoding.vector(slot),
-                pubkey.clone(),
-                encoding.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
-            )
-            .small_scalar_mul(&params, &[1, 2, 3]);
+            let expected =
+                BggEncoding::new(encoding.vector(slot), pubkey.clone(), encoding.plaintext(slot))
+                    .small_scalar_mul(&params, &[1, 2, 3]);
             assert_eq!(small_scaled.vector(slot), expected.vector);
-            assert_eq!(
-                small_scaled.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
-                expected.plaintext
-            );
+            assert_eq!(small_scaled.plaintext(slot), expected.plaintext);
         }
 
         let large_scalar = [BigUint::from(5u32), BigUint::from(8u32), BigUint::from(13u32)];
         let large_scaled = encoding.large_scalar_mul(&params, &large_scalar);
         assert_eq!(large_scaled.pubkey, pubkey.large_scalar_mul(&params, &large_scalar));
         for slot in 0..num_slots {
-            let expected = BggEncoding::new(
-                encoding.vector(slot),
-                pubkey.clone(),
-                encoding.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
-            )
-            .large_scalar_mul(&params, &large_scalar);
+            let expected =
+                BggEncoding::new(encoding.vector(slot), pubkey.clone(), encoding.plaintext(slot))
+                    .large_scalar_mul(&params, &large_scalar);
             assert_eq!(large_scaled.vector(slot), expected.vector);
-            assert_eq!(
-                large_scaled.plaintexts.as_ref().map(|plaintexts| plaintexts[slot].clone()),
-                expected.plaintext
-            );
+            assert_eq!(large_scaled.plaintext(slot), expected.plaintext);
         }
     }
 
@@ -810,6 +775,14 @@ mod tests {
             &params, d, log_base_q, dir_path, "sample", true, num_slots,
         );
 
-        assert_eq!(restored, BggPolyEncoding::new(params, vectors, pubkey, Some(plaintexts)));
+        assert_eq!(
+            restored,
+            BggPolyEncoding::new(
+                params,
+                vector_bytes(&vectors),
+                pubkey,
+                Some(plaintext_bytes(&plaintexts)),
+            )
+        );
     }
 }

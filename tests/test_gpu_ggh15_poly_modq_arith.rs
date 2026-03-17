@@ -6,7 +6,7 @@ use mxx::{
     bgg::sampler::{BGGPolyEncodingSampler, BGGPublicKeySampler},
     circuit::PolyCircuit,
     element::PolyElem,
-    gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly},
+    gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly_compact_bytes},
     lookup::ggh15_eval::{GGH15BGGPolyEncodingPltEvaluator, GGH15BGGPubKeyPltEvaluator},
     matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
     poly::{
@@ -391,7 +391,7 @@ async fn test_gpu_ggh15_poly_modq_arith() {
     let mut expected_by_slot = Vec::with_capacity(cfg.num_slots);
     let mut plaintext_inputs = (0..flattened_input_count)
         .map(|_| Vec::with_capacity(cfg.num_slots))
-        .collect::<Vec<Vec<GpuDCRTPoly>>>();
+        .collect::<Vec<Vec<Arc<[u8]>>>>();
 
     debug!(
         "slot input materialization started: num_slots={} chunk_size={} flattened_input_count={} logical_num_inputs={} q_level={:?}",
@@ -450,7 +450,7 @@ async fn test_gpu_ggh15_poly_modq_arith() {
                             input_idx,
                             q_level
                         );
-                        let encoded = encode_nested_rns_poly::<GpuDCRTPoly>(
+                        let encoded = encode_nested_rns_poly_compact_bytes::<GpuDCRTPoly>(
                             cfg.p_moduli_bits,
                             &local_params,
                             value,
@@ -463,7 +463,7 @@ async fn test_gpu_ggh15_poly_modq_arith() {
                             input_idx,
                             encoded.len()
                         );
-                        encoded
+                        encoded.into_iter().map(Arc::<[u8]>::from).collect::<Vec<_>>()
                     })
                     .collect::<Vec<_>>();
                 debug!(
@@ -491,8 +491,8 @@ async fn test_gpu_ggh15_poly_modq_arith() {
                 gpu_id
             );
             expected_by_slot.push(expected);
-            for (input_idx, poly) in encoded_inputs.into_iter().enumerate() {
-                plaintext_inputs[input_idx].push(poly);
+            for (input_idx, plaintext_bytes) in encoded_inputs.into_iter().enumerate() {
+                plaintext_inputs[input_idx].push(plaintext_bytes);
             }
         }
         debug!(
@@ -542,12 +542,8 @@ async fn test_gpu_ggh15_poly_modq_arith() {
         BGGPolyEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
     drop(secrets);
     let slot_secret_mats = encoding_sampler.sample_slot_secret_mats(&params, cfg.num_slots);
-    let poly_encodings = encoding_sampler.sample_with_slot_secret_mats(
-        &params,
-        &pubkeys,
-        &plaintext_inputs,
-        &slot_secret_mats,
-    );
+    let mut poly_encodings =
+        encoding_sampler.sample(&params, &pubkeys, &plaintext_inputs, Some(&slot_secret_mats));
     drop(plaintext_inputs);
     drop(encoding_sampler);
     info!(
@@ -605,7 +601,6 @@ async fn test_gpu_ggh15_poly_modq_arith() {
         slot_secret_mats.clone(),
     );
 
-    let mut poly_encodings = poly_encodings;
     let input_poly_encodings = poly_encodings.split_off(1);
     let one_poly_encoding =
         poly_encodings.pop().expect("poly encodings must contain one entry for const one");
@@ -625,14 +620,14 @@ async fn test_gpu_ggh15_poly_modq_arith() {
 
     let poly_out = &poly_out[0];
     assert_eq!(poly_out.pubkey, pubkey_out[0]);
-    let result_plaintexts =
-        poly_out.plaintexts.as_ref().expect("poly lookup result should reveal plaintexts");
-    assert_eq!(result_plaintexts.len(), cfg.num_slots);
     assert_eq!(poly_out.num_slots(), cfg.num_slots);
     let gadget = GpuDCRTPolyMatrix::gadget_matrix(&params, d_secret);
 
     for slot in 0..cfg.num_slots {
-        let plaintext_coeffs = result_plaintexts[slot].coeffs();
+        let result_plaintext = poly_out
+            .plaintext_for_params(&params, slot)
+            .expect("poly lookup result should reveal plaintexts");
+        let plaintext_coeffs = result_plaintext.coeffs();
         let result_const_term = plaintext_coeffs
             .first()
             .expect("result plaintext polynomial must have at least one coefficient")

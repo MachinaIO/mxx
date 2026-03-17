@@ -1,3 +1,7 @@
+#[cfg(feature = "gpu")]
+#[path = "nested_rns_gpu.rs"]
+mod gpu;
+
 use crate::{
     circuit::{PolyCircuit, gate::GateId},
     lookup::PublicLut,
@@ -6,6 +10,8 @@ use crate::{
 };
 use num_bigint::BigUint;
 use num_traits::{One, ToPrimitive};
+#[cfg(not(feature = "gpu"))]
+use rayon::prelude::*;
 use std::{marker::PhantomData, sync::Arc};
 use tracing::{debug, info};
 
@@ -964,12 +970,11 @@ pub(crate) fn sample_crt_primes(max_bit_width: usize, q_max: u64) -> Vec<u64> {
     results
 }
 
-pub fn encode_nested_rns_poly<P: Poly>(
+fn resolve_nested_rns_encoding_layout<P: Poly>(
     p_moduli_bits: usize,
     params: &P::Params,
-    input: &BigUint,
     q_level: Option<usize>,
-) -> Vec<P> {
+) -> (Vec<u64>, usize, Vec<u64>) {
     let (q_moduli, _, q_moduli_depth) = params.to_crt();
     let active_q_level = q_level.unwrap_or(q_moduli_depth);
     assert!(
@@ -980,6 +985,66 @@ pub fn encode_nested_rns_poly<P: Poly>(
     );
     let q_moduli_max = q_moduli.iter().max().expect("there should be at least one q modulus");
     let p_moduli = sample_crt_primes(p_moduli_bits, *q_moduli_max);
+    (q_moduli, active_q_level, p_moduli)
+}
+
+fn map_nested_rns_outputs_with_params<P, T, F>(
+    params: &P::Params,
+    output_count: usize,
+    f: F,
+) -> Vec<T>
+where
+    P: Poly,
+    T: Send,
+    F: Fn(usize, &P::Params) -> T + Send + Sync,
+{
+    if output_count == 0 {
+        return Vec::new();
+    }
+
+    #[cfg(feature = "gpu")]
+    {
+        return gpu::map_nested_rns_outputs_with_params_gpu::<P, T, F>(params, output_count, f);
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    {
+        (0..output_count).into_par_iter().map(|idx| f(idx, params)).collect()
+    }
+}
+
+pub fn encode_nested_rns_poly_compact_bytes<P: Poly>(
+    p_moduli_bits: usize,
+    params: &P::Params,
+    input: &BigUint,
+    q_level: Option<usize>,
+) -> Vec<Vec<u8>> {
+    let (q_moduli, active_q_level, p_moduli) =
+        resolve_nested_rns_encoding_layout::<P>(p_moduli_bits, params, q_level);
+    let input_mod_q = q_moduli
+        .iter()
+        .take(active_q_level)
+        .map(|&q_i| input % BigUint::from(q_i))
+        .collect::<Vec<_>>();
+    let p_moduli_depth = p_moduli.len();
+    let output_count = active_q_level * p_moduli_depth;
+
+    map_nested_rns_outputs_with_params::<P, _, _>(params, output_count, |idx, local_params| {
+        let q_idx = idx / p_moduli_depth;
+        let p_idx = idx % p_moduli_depth;
+        let residue = &input_mod_q[q_idx] % p_moduli[p_idx];
+        P::from_biguint_to_constant(local_params, residue).to_compact_bytes()
+    })
+}
+
+pub fn encode_nested_rns_poly<P: Poly>(
+    p_moduli_bits: usize,
+    params: &P::Params,
+    input: &BigUint,
+    q_level: Option<usize>,
+) -> Vec<P> {
+    let (q_moduli, active_q_level, p_moduli) =
+        resolve_nested_rns_encoding_layout::<P>(p_moduli_bits, params, q_level);
     let p_moduli_depth = p_moduli.len();
     let mut polys = vec![Vec::with_capacity(p_moduli_depth); active_q_level];
     for (q_idx, &q_i) in q_moduli.iter().take(active_q_level).enumerate() {
@@ -1149,6 +1214,24 @@ mod tests {
             a_value,
             b_value,
         );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_encode_nested_rns_poly_compact_bytes_matches_polys() {
+        let params = DCRTPolyParams::new(4, 6, 18, BASE_BITS);
+        let input = BigUint::from(12345u64);
+        let expected = encode_nested_rns_poly::<DCRTPoly>(P_MODULI_BITS, &params, &input, Some(2))
+            .into_iter()
+            .map(|poly| poly.to_compact_bytes())
+            .collect::<Vec<_>>();
+        let actual = encode_nested_rns_poly_compact_bytes::<DCRTPoly>(
+            P_MODULI_BITS,
+            &params,
+            &input,
+            Some(2),
+        );
+        assert_eq!(actual, expected);
     }
 
     fn test_nested_rns_poly_add_full_reduce_generic(

@@ -198,7 +198,7 @@ where
 {
     fn assert_uniform_num_slots<T>(plaintexts: &[T]) -> usize
     where
-        T: AsRef<[<S::M as PolyMatrix>::P]> + Sync,
+        T: AsRef<[Arc<[u8]>]> + Sync,
     {
         let num_slots = plaintexts.first().map_or(0, |slots| slots.as_ref().len());
         assert!(
@@ -225,56 +225,11 @@ where
         params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
         public_keys: &[K],
         plaintexts: &[T],
+        slot_secret_mats: Option<&[S::M]>,
     ) -> Vec<BggPolyEncoding<S::M>>
     where
         K: Borrow<BggPublicKey<S::M>> + Sync,
-        T: AsRef<[<S::M as PolyMatrix>::P]> + Sync,
-    {
-        let num_slots = Self::assert_uniform_num_slots(plaintexts);
-        let slot_secret_mats = self.sample_slot_secret_mats(params, num_slots);
-
-        self.sample_with_slot_secret_mats(params, public_keys, plaintexts, &slot_secret_mats)
-    }
-
-    pub fn sample_slot_secret_mats(
-        &self,
-        params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
-        num_slots: usize,
-    ) -> Vec<S::M> {
-        let secret_vec_size = self.secret_vec.col_size();
-        let slot_parallelism = effective_slot_parallelism::<S::M>(params, num_slots);
-        let mut slot_secret_mats = Vec::with_capacity(num_slots);
-
-        for slot_start in (0..num_slots).step_by(slot_parallelism.max(1)) {
-            let chunk_len = (slot_start + slot_parallelism).min(num_slots) - slot_start;
-            let mut chunk_secret_mats = (0..chunk_len)
-                .into_par_iter()
-                .map(|_| {
-                    let uniform_sampler = S::new();
-                    uniform_sampler.sample_uniform(
-                        params,
-                        secret_vec_size,
-                        secret_vec_size,
-                        DistType::TernaryDist,
-                    )
-                })
-                .collect::<Vec<_>>();
-            slot_secret_mats.append(&mut chunk_secret_mats);
-        }
-
-        slot_secret_mats
-    }
-
-    pub fn sample_with_slot_secret_mats<K, T>(
-        &self,
-        params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
-        public_keys: &[K],
-        plaintexts: &[T],
-        slot_secret_mats: &[S::M],
-    ) -> Vec<BggPolyEncoding<S::M>>
-    where
-        K: Borrow<BggPublicKey<S::M>> + Sync,
-        T: AsRef<[<S::M as PolyMatrix>::P]> + Sync,
+        T: AsRef<[Arc<[u8]>]> + Sync,
     {
         let num_slots = Self::assert_uniform_num_slots(plaintexts);
         assert_eq!(
@@ -282,6 +237,14 @@ where
             plaintexts.len() + 1,
             "BGGPolyEncodingSampler::sample requires public_keys.len() == plaintexts.len() + 1"
         );
+        let owned_slot_secret_mats;
+        let slot_secret_mats = match slot_secret_mats {
+            Some(slot_secret_mats) => slot_secret_mats,
+            None => {
+                owned_slot_secret_mats = self.sample_slot_secret_mats(params, num_slots);
+                &owned_slot_secret_mats
+            }
+        };
         assert_eq!(
             slot_secret_mats.len(),
             num_slots,
@@ -299,8 +262,9 @@ where
             &public_keys[1..].par_iter().map(|pk| &pk.borrow().matrix).collect::<Vec<_>>(),
         );
         let gadget = S::M::gadget_matrix(params, secret_vec_size);
-        let constant_plaintexts =
-            vec![<<S as PolyUniformSampler>::M as PolyMatrix>::P::const_one(params); num_slots];
+        let constant_plaintext_bytes = Arc::<[u8]>::from(
+            <<S as PolyUniformSampler>::M as PolyMatrix>::P::const_one(params).to_compact_bytes(),
+        );
         let mut encoding_vector_bytes = (0..packed_input_size)
             .map(|_| Vec::with_capacity(num_slots))
             .collect::<Vec<Vec<Arc<[u8]>>>>();
@@ -327,9 +291,12 @@ where
                     let slot_plaintexts = std::iter::once(
                         <<S as PolyUniformSampler>::M as PolyMatrix>::P::const_one(params),
                     )
-                    .chain(
-                        plaintexts.iter().map(|plaintext_row| plaintext_row.as_ref()[slot].clone()),
-                    )
+                    .chain(plaintexts.iter().map(|plaintext_row| {
+                        <<S as PolyUniformSampler>::M as PolyMatrix>::P::from_compact_bytes(
+                            params,
+                            plaintext_row.as_ref()[slot].as_ref(),
+                        )
+                    }))
                     .collect::<Vec<_>>();
                     let encoded_polys_vec = S::M::from_poly_vec_row(params, slot_plaintexts);
                     let first_term = transformed_secret_vec.clone() * &all_public_key_matrix;
@@ -360,18 +327,47 @@ where
             .enumerate()
             .map(|(idx, vector_bytes)| {
                 let pubkey = public_keys[idx].borrow().clone();
-                let plaintexts = if pubkey.reveal_plaintext {
+                let plaintext_bytes = if pubkey.reveal_plaintext {
                     Some(if idx == 0 {
-                        constant_plaintexts.clone()
+                        vec![constant_plaintext_bytes.clone(); num_slots]
                     } else {
                         plaintexts[idx - 1].as_ref().to_vec()
                     })
                 } else {
                     None
                 };
-                BggPolyEncoding::from_vector_bytes(params.clone(), vector_bytes, pubkey, plaintexts)
+                BggPolyEncoding::new(params.clone(), vector_bytes, pubkey, plaintext_bytes)
             })
             .collect()
+    }
+
+    pub fn sample_slot_secret_mats(
+        &self,
+        params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
+        num_slots: usize,
+    ) -> Vec<S::M> {
+        let secret_vec_size = self.secret_vec.col_size();
+        let slot_parallelism = effective_slot_parallelism::<S::M>(params, num_slots);
+        let mut slot_secret_mats = Vec::with_capacity(num_slots);
+
+        for slot_start in (0..num_slots).step_by(slot_parallelism.max(1)) {
+            let chunk_len = (slot_start + slot_parallelism).min(num_slots) - slot_start;
+            let mut chunk_secret_mats = (0..chunk_len)
+                .into_par_iter()
+                .map(|_| {
+                    let uniform_sampler = S::new();
+                    uniform_sampler.sample_uniform(
+                        params,
+                        secret_vec_size,
+                        secret_vec_size,
+                        DistType::TernaryDist,
+                    )
+                })
+                .collect::<Vec<_>>();
+            slot_secret_mats.append(&mut chunk_secret_mats);
+        }
+
+        slot_secret_mats
     }
 }
 
@@ -389,6 +385,7 @@ mod tests {
         utils::{create_random_poly, create_ternary_random_poly},
     };
     use keccak_asm::Keccak256;
+    use std::sync::Arc;
 
     #[sequential_test::sequential]
     #[test]
@@ -403,12 +400,15 @@ mod tests {
         let sampler =
             BGGPolyEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
         let plaintexts = vec![
-            vec![create_random_poly(&params), create_random_poly(&params)],
-            vec![create_random_poly(&params)],
+            vec![
+                Arc::<[u8]>::from(create_random_poly(&params).to_compact_bytes()),
+                Arc::<[u8]>::from(create_random_poly(&params).to_compact_bytes()),
+            ],
+            vec![Arc::<[u8]>::from(create_random_poly(&params).to_compact_bytes())],
         ];
 
         let panic = std::panic::catch_unwind(|| {
-            let _ = sampler.sample(&params, &public_keys, &plaintexts);
+            let _ = sampler.sample(&params, &public_keys, &plaintexts, None);
         })
         .expect_err("ragged plaintexts should panic");
         let panic_msg = panic
@@ -438,22 +438,34 @@ mod tests {
             (0..num_slots).map(|_| create_random_poly(&params)).collect::<Vec<_>>(),
             (0..num_slots).map(|_| create_random_poly(&params)).collect::<Vec<_>>(),
         ];
+        let plaintext_bytes = plaintexts
+            .iter()
+            .map(|plaintext_row| {
+                plaintext_row
+                    .iter()
+                    .map(|plaintext| Arc::<[u8]>::from(plaintext.to_compact_bytes()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let slot_secret_mats = (0..num_slots)
             .map(|_| uniform_sampler.sample_uniform(&params, d, d, DistType::TernaryDist))
             .collect::<Vec<_>>();
-        let sampled = sampler.sample_with_slot_secret_mats(
-            &params,
-            &public_keys,
-            &plaintexts,
-            &slot_secret_mats,
-        );
+        let sampled =
+            sampler.sample(&params, &public_keys, &plaintext_bytes, Some(&slot_secret_mats));
         let gadget = DCRTPolyMatrix::gadget_matrix(&params, d);
 
         assert_eq!(sampled.len(), plaintexts.len() + 1);
+        let constant_plaintexts = (0..num_slots)
+            .map(|slot| {
+                sampled[0]
+                    .plaintext_for_params(&params, slot)
+                    .expect("constant slot plaintexts should be known")
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            sampled[0].plaintexts.as_ref().expect("constant slot plaintexts should be known"),
-            &vec![<DCRTPolyMatrix as PolyMatrix>::P::const_one(&params); num_slots]
+            constant_plaintexts,
+            vec![<DCRTPolyMatrix as PolyMatrix>::P::const_one(&params); num_slots]
         );
 
         for (idx, encoding) in sampled.iter().enumerate() {
@@ -461,8 +473,7 @@ mod tests {
             for slot in 0..num_slots {
                 let transformed_secret_vec = sampler.secret_vec.clone() * &slot_secret_mats[slot];
                 let plaintext =
-                    encoding.plaintexts.as_ref().expect("test public keys reveal plaintexts")[slot]
-                        .clone();
+                    encoding.plaintext(slot).expect("test public keys reveal plaintexts");
                 let expected = transformed_secret_vec.clone() * encoding.pubkey.matrix.clone() -
                     (transformed_secret_vec * (gadget.clone() * plaintext));
                 assert_eq!(encoding.vector(slot), expected);

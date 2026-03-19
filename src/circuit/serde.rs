@@ -15,7 +15,7 @@ pub enum SerializablePolyGateType {
     Input,
     SmallScalarMul { scalar: Vec<u32> },
     LargeScalarMul { scalar: Vec<BigUint> },
-    SlotTransfer { mappings: Vec<u32> },
+    SlotTransfer { src_slots: Vec<u32> },
     Add,
     Sub,
     Mul,
@@ -95,8 +95,8 @@ impl SerializablePolyCircuit {
                 PolyGateType::LargeScalarMul { scalar } => {
                     SerializablePolyGateType::LargeScalarMul { scalar }
                 }
-                PolyGateType::SlotTransfer { mappings } => {
-                    SerializablePolyGateType::SlotTransfer { mappings }
+                PolyGateType::SlotTransfer { src_slots } => {
+                    SerializablePolyGateType::SlotTransfer { src_slots }
                 }
                 PolyGateType::Add => SerializablePolyGateType::Add,
                 PolyGateType::Sub => SerializablePolyGateType::Sub,
@@ -148,8 +148,8 @@ impl SerializablePolyCircuit {
                 SerializablePolyGateType::LargeScalarMul { scalar } => {
                     PolyGateType::LargeScalarMul { scalar }
                 }
-                SerializablePolyGateType::SlotTransfer { mappings } => {
-                    PolyGateType::SlotTransfer { mappings }
+                SerializablePolyGateType::SlotTransfer { src_slots } => {
+                    PolyGateType::SlotTransfer { src_slots }
                 }
                 SerializablePolyGateType::Add => PolyGateType::Add,
                 SerializablePolyGateType::Sub => PolyGateType::Sub,
@@ -309,12 +309,10 @@ mod tests {
         let b = DCRTPoly::const_one(&params);
         let one = DCRTPoly::const_one(&params);
         let out1_inputs = vec![a.clone(), b.clone()];
-        let out1 =
-            circuit.eval(&params, one, out1_inputs, None::<&PolyPltEvaluator>, None::<&()>, None);
+        let out1 = circuit.eval(&params, one, out1_inputs, None::<&PolyPltEvaluator>, None, None);
         let one = DCRTPoly::const_one(&params);
         let out2_inputs = vec![a, b];
-        let out2 =
-            roundtrip.eval(&params, one, out2_inputs, None::<&PolyPltEvaluator>, None::<&()>, None);
+        let out2 = roundtrip.eval(&params, one, out2_inputs, None::<&PolyPltEvaluator>, None, None);
         assert_eq!(out1, out2);
     }
 

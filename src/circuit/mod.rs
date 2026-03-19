@@ -25,6 +25,7 @@ use crate::{
     circuit::gate::GateId,
     lookup::{PltEvaluator, PublicLut},
     poly::Poly,
+    slot_transfer::SlotTransferEvaluator,
 };
 use tracing::{debug, info};
 
@@ -80,29 +81,6 @@ impl<P: Poly> LookupRegistry<P> {
         let lut_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.lookups.insert(lut_id, Arc::new(lookup));
         lut_id
-    }
-}
-
-pub trait SlotTransferEvaluator<E: Evaluable>: Send + Sync {
-    fn empty_output(&self, params: &E::Params, input: &E, num_slots: usize) -> E;
-
-    fn slot_transfer(
-        &self,
-        params: &E::Params,
-        input: &E,
-        src_slot: u32,
-        dst_slot: u32,
-        output: &mut E,
-    );
-}
-
-impl<E: Evaluable> SlotTransferEvaluator<E> for () {
-    fn empty_output(&self, _: &E::Params, _: &E, _: usize) -> E {
-        panic!("slot transfer evaluator missing")
-    }
-
-    fn slot_transfer(&self, _: &E::Params, _: &E, _: u32, _: u32, _: &mut E) {
-        panic!("slot transfer evaluator missing")
     }
 }
 
@@ -463,10 +441,10 @@ impl<P: Poly> PolyCircuit<P> {
         self.new_gate_generic(vec![input], PolyGateType::PubLut { lut_id })
     }
 
-    pub fn slot_transfer_gate(&mut self, input: GateId, mappings: &[u32]) -> GateId {
+    pub fn slot_transfer_gate(&mut self, input: GateId, src_slots: &[u32]) -> GateId {
         self.new_gate_generic(
             vec![input],
-            PolyGateType::SlotTransfer { mappings: mappings.to_vec() },
+            PolyGateType::SlotTransfer { src_slots: src_slots.to_vec() },
         )
     }
 
@@ -570,19 +548,18 @@ impl<P: Poly> PolyCircuit<P> {
     /// `helper_lookup` is P_{x_L}
     /// `parallel_gates` overrides the gate-level parallelism limit; `None` preserves the
     /// environment-driven default.
-    pub fn eval<E, PE, STE>(
+    pub fn eval<E, PE>(
         &self,
         params: &E::Params,
         one: E,
         inputs: Vec<E>,
         plt_evaluator: Option<&PE>,
-        slot_transfer_evaluator: Option<&STE>,
+        slot_transfer_evaluator: Option<&dyn SlotTransferEvaluator<E>>,
         parallel_gates: Option<usize>,
     ) -> Vec<E>
     where
         E: Evaluable<P = P>,
         PE: PltEvaluator<E>,
-        STE: SlotTransferEvaluator<E>,
     {
         let (call_id_base, gate_id_base) = self.eval_gate_id_bases();
         let parallel_gates = crate::env::resolve_circuit_parallel_gates(parallel_gates);
@@ -627,14 +604,14 @@ impl<P: Poly> PolyCircuit<P> {
         max_gates
     }
 
-    fn eval_scoped<E, PE, STE>(
+    fn eval_scoped<E, PE>(
         &self,
         params: &E::Params,
         one: &Arc<E>,
         one_compact: Arc<E::Compact>,
         inputs: &[Arc<E::Compact>],
         plt_evaluator: Option<&PE>,
-        slot_transfer_evaluator: Option<&STE>,
+        slot_transfer_evaluator: Option<&dyn SlotTransferEvaluator<E>>,
         call_prefix: usize,
         call_id_base: usize,
         gate_id_base: usize,
@@ -643,7 +620,6 @@ impl<P: Poly> PolyCircuit<P> {
     where
         E: Evaluable<P = P>,
         PE: PltEvaluator<E>,
-        STE: SlotTransferEvaluator<E>,
     {
         #[cfg(debug_assertions)]
         {
@@ -809,7 +785,7 @@ impl<P: Poly> PolyCircuit<P> {
                     debug!("Large scalar mul gate end");
                     Arc::new(result.to_compact())
                 }
-                PolyGateType::SlotTransfer { mappings } => {
+                PolyGateType::SlotTransfer { src_slots } => {
                     let input = wires
                         .get(&gate.input_gates[0])
                         .expect("wire missing for SlotTransfer")
@@ -817,17 +793,7 @@ impl<P: Poly> PolyCircuit<P> {
                     let input = E::from_compact(eval_params, input.as_ref());
                     let evaluator =
                         slot_transfer_evaluator.expect("slot transfer evaluator missing");
-                    let mut result = evaluator.empty_output(eval_params, &input, mappings.len());
-                    for (dst_slot, src_slot) in mappings.iter().copied().enumerate() {
-                        evaluator.slot_transfer(
-                            eval_params,
-                            &input,
-                            src_slot,
-                            dst_slot as u32,
-                            &mut result,
-                        );
-                    }
-                    Arc::new(result.to_compact())
+                    Arc::new(evaluator.slot_transfer(eval_params, &input, src_slots).to_compact())
                 }
                 PolyGateType::PubLut { lut_id } => {
                     debug!("Public Lookup gate start");
@@ -988,22 +954,15 @@ impl<P: Poly> PolyCircuit<P> {
                         ) => ComputedGateValue::Value(input.large_scalar_mul(eval_params, scalar)),
                         (
                             LoadedGateInputs::Unary(input),
-                            PolyGateType::SlotTransfer { mappings },
+                            PolyGateType::SlotTransfer { src_slots },
                         ) => {
                             let evaluator =
                                 slot_transfer_evaluator.expect("slot transfer evaluator missing");
-                            let mut result =
-                                evaluator.empty_output(eval_params, &input, mappings.len());
-                            for (dst_slot, src_slot) in mappings.iter().copied().enumerate() {
-                                evaluator.slot_transfer(
-                                    eval_params,
-                                    &input,
-                                    src_slot,
-                                    dst_slot as u32,
-                                    &mut result,
-                                );
-                            }
-                            ComputedGateValue::Value(result)
+                            ComputedGateValue::Value(evaluator.slot_transfer(
+                                eval_params,
+                                &input,
+                                src_slots,
+                            ))
                         }
                         (LoadedGateInputs::Unary(input), PolyGateType::PubLut { lut_id }) => {
                             let scoped_gate_id = call_prefix
@@ -1274,7 +1233,7 @@ mod tests {
     {
         let one = DCRTPoly::const_one(params);
         let eval_inputs = inputs.to_vec();
-        circuit.eval(params, one, eval_inputs, plt_evaluator, None::<&()>, None)
+        circuit.eval(params, one, eval_inputs, plt_evaluator, None, None)
     }
 
     #[test]

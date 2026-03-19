@@ -1,8 +1,8 @@
 use crate::{
-    circuit::{SlotTransferEvaluator, evaluable::PolyVec, gate::GateId},
+    circuit::{evaluable::PolyVec, gate::GateId},
     element::PolyElem,
     lookup::{PltEvaluator, PublicLut},
-    poly::{Poly, PolyParams},
+    poly::Poly,
 };
 use num_traits::ToPrimitive;
 
@@ -102,55 +102,6 @@ impl<P: Poly + 'static> PltEvaluator<PolyVec<P>> for PolyVecPltEvaluator {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct PolyVecSlotTransferEvaluator {}
-
-impl PolyVecSlotTransferEvaluator {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
-
-impl Default for PolyVecSlotTransferEvaluator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<P: Poly> SlotTransferEvaluator<PolyVec<P>> for PolyVecSlotTransferEvaluator {
-    fn empty_output(&self, params: &P::Params, _: &PolyVec<P>, num_slots: usize) -> PolyVec<P> {
-        assert!(
-            num_slots <= params.ring_dimension() as usize,
-            "slot count {} exceeds ring dimension {}",
-            num_slots,
-            params.ring_dimension()
-        );
-        PolyVec::new(vec![P::const_zero(params); num_slots])
-    }
-
-    fn slot_transfer(
-        &self,
-        _: &P::Params,
-        input: &PolyVec<P>,
-        src_slot: u32,
-        dst_slot: u32,
-        output: &mut PolyVec<P>,
-    ) {
-        let src_slot = src_slot as usize;
-        let dst_slot = dst_slot as usize;
-        let src_value = input
-            .as_slice()
-            .get(src_slot)
-            .unwrap_or_else(|| panic!("source slot {} out of range", src_slot))
-            .clone();
-        let dst_ref = output
-            .as_mut_slice()
-            .get_mut(dst_slot)
-            .unwrap_or_else(|| panic!("destination slot {} out of range", dst_slot));
-        *dst_ref = src_value;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +111,7 @@ mod tests {
             PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
+        slot_transfer::PolyVecSlotTransferEvaluator,
     };
     use std::sync::{Arc, Mutex};
 

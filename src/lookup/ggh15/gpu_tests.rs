@@ -130,7 +130,7 @@ async fn test_gpu_ggh15_plt_eval_multi_inputs() {
         one_pubkey,
         input_pubkeys.clone(),
         Some(&plt_pubkey_evaluator),
-        None::<&()>,
+        None,
         None,
     );
     plt_pubkey_evaluator.sample_aux_matrices(&params);
@@ -153,7 +153,7 @@ async fn test_gpu_ggh15_plt_eval_multi_inputs() {
         one_encoding,
         input_encodings.clone(),
         Some(&plt_encoding_evaluator),
-        None::<&()>,
+        None,
         None,
     );
     assert_eq!(result_encoding.len(), input_size);
@@ -265,7 +265,7 @@ async fn test_gpu_ggh15_poly_encoding_plt_eval_slot_secret_relation() {
         enc_one_poly.pubkey.clone(),
         vec![enc_input_poly.pubkey.clone()],
         Some(&plt_pubkey_evaluator),
-        None::<&()>,
+        None,
         None,
     );
     plt_pubkey_evaluator.sample_aux_matrices(&params);
@@ -294,7 +294,7 @@ async fn test_gpu_ggh15_poly_encoding_plt_eval_slot_secret_relation() {
         enc_one_poly.clone(),
         vec![enc_input_poly.clone()],
         Some(&poly_evaluator),
-        None::<&()>,
+        None,
         Some(1),
     );
     assert_eq!(result_poly.len(), 1);

@@ -288,7 +288,7 @@ async fn test_lwe_modq_arith() {
         dry_one,
         plaintext_inputs_shared.clone(),
         Some(&dry_plt_evaluator),
-        None::<&()>,
+        None,
         None,
     );
     assert_eq!(dry_out.len(), 1, "plain PolyCircuit dry-run should output one value polynomial");
@@ -310,14 +310,8 @@ async fn test_lwe_modq_arith() {
 
     let plt_evaluator = PolyPltEvaluator::new();
     let plain_one = DCRTPoly::const_one(&params);
-    let plain_out = circuit.eval(
-        &params,
-        plain_one,
-        plaintext_inputs_shared,
-        Some(&plt_evaluator),
-        None::<&()>,
-        None,
-    );
+    let plain_out =
+        circuit.eval(&params, plain_one, plaintext_inputs_shared, Some(&plt_evaluator), None, None);
     assert_eq!(plain_out.len(), 1);
     let plain_const = plain_out[0]
         .coeffs()
@@ -377,7 +371,7 @@ async fn test_lwe_modq_arith() {
         );
 
     let pubkey_out =
-        circuit.eval(&params, pubkey_one, input_pubkeys, Some(&pk_evaluator), None::<&()>, None);
+        circuit.eval(&params, pubkey_one, input_pubkeys, Some(&pk_evaluator), None, None);
     assert_eq!(pubkey_out.len(), 1);
 
     pk_evaluator.sample_aux_matrices(&params);
@@ -392,7 +386,7 @@ async fn test_lwe_modq_arith() {
         );
 
     let encoding_out =
-        circuit.eval(&params, enc_one, input_encodings, Some(&enc_evaluator), None::<&()>, None);
+        circuit.eval(&params, enc_one, input_encodings, Some(&enc_evaluator), None, None);
     assert_eq!(encoding_out.len(), 1);
 
     assert_eq!(encoding_out[0].pubkey, pubkey_out[0]);

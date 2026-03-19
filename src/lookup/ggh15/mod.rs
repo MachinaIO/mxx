@@ -140,7 +140,7 @@ mod tests {
             one_pubkey,
             input_pubkeys,
             Some(&plt_pubkey_evaluator),
-            None::<&()>,
+            None,
             None,
         );
         plt_pubkey_evaluator.sample_aux_matrices(&params);
@@ -167,7 +167,7 @@ mod tests {
             one_encoding,
             input_encodings,
             Some(&plt_encoding_evaluator),
-            None::<&()>,
+            None,
             None,
         );
         assert_eq!(result_encoding.len(), 1);
@@ -260,7 +260,7 @@ mod tests {
             one_pubkey,
             input_pubkeys.clone(),
             Some(&plt_pubkey_evaluator),
-            None::<&()>,
+            None,
             None,
         );
         plt_pubkey_evaluator.sample_aux_matrices(&params);
@@ -285,7 +285,7 @@ mod tests {
             one_encoding,
             input_encodings.clone(),
             Some(&plt_encoding_evaluator),
-            None::<&()>,
+            None,
             None,
         );
         assert_eq!(result_encoding.len(), input_size);
@@ -387,7 +387,7 @@ mod tests {
             enc_one_poly.pubkey.clone(),
             vec![enc_input_poly.pubkey.clone()],
             Some(&plt_pubkey_evaluator),
-            None::<&()>,
+            None,
             None,
         );
         plt_pubkey_evaluator.sample_aux_matrices(&params);
@@ -416,7 +416,7 @@ mod tests {
             enc_one_poly.clone(),
             vec![enc_input_poly.clone()],
             Some(&poly_evaluator),
-            None::<&()>,
+            None,
             Some(1),
         );
         assert_eq!(result_poly.len(), 1);

@@ -433,7 +433,7 @@ mod test {
             one_pubkey,
             input_pubkeys,
             Some(&plt_pubkey_evaluator),
-            None::<&()>,
+            None,
             None,
         );
         plt_pubkey_evaluator.sample_aux_matrices(&params);
@@ -455,7 +455,7 @@ mod test {
             one_encoding,
             input_encodings,
             Some(&plt_encoding_evaluator),
-            None::<&()>,
+            None,
             None,
         );
         assert_eq!(result_encoding.len(), 1);

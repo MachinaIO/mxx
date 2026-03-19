@@ -407,7 +407,7 @@ async fn test_gpu_ggh15_modq_arith() {
     let dry_one = GpuDCRTPoly::const_one(&params);
     let dry_inputs = plaintext_inputs.clone();
     let dry_out =
-        dry_circuit.eval(&params, dry_one, dry_inputs, Some(&dry_plt_evaluator), None::<&()>, None);
+        dry_circuit.eval(&params, dry_one, dry_inputs, Some(&dry_plt_evaluator), None, None);
     info!("dry eval elapsed_ms={:.3}", dry_eval_start.elapsed().as_secs_f64() * 1000.0);
     assert_eq!(dry_out.len(), 1, "dry-run should output one value polynomial");
     let dry_const_term = dry_out[0]
@@ -494,7 +494,7 @@ async fn test_gpu_ggh15_modq_arith() {
     let one_pubkey = pubkeys.pop().expect("pubkeys must contain one entry for const one");
     let pubkey_eval_start = Instant::now();
     let pubkey_out =
-        circuit.eval(&params, one_pubkey, input_pubkeys, Some(&pk_evaluator), None::<&()>, None);
+        circuit.eval(&params, one_pubkey, input_pubkeys, Some(&pk_evaluator), None, None);
     info!("pubkey eval elapsed_ms={:.3}", pubkey_eval_start.elapsed().as_secs_f64() * 1000.0);
     assert_eq!(pubkey_out.len(), 1);
 
@@ -554,14 +554,8 @@ async fn test_gpu_ggh15_modq_arith() {
     let input_encodings = encodings.split_off(1);
     let one_encoding = encodings.pop().expect("encodings must contain one entry for const one");
     let encoding_eval_start = Instant::now();
-    let encoding_out = circuit.eval(
-        &params,
-        one_encoding,
-        input_encodings,
-        Some(&enc_evaluator),
-        None::<&()>,
-        None,
-    );
+    let encoding_out =
+        circuit.eval(&params, one_encoding, input_encodings, Some(&enc_evaluator), None, None);
     info!("encoding eval elapsed_ms={:.3}", encoding_eval_start.elapsed().as_secs_f64() * 1000.0);
     assert_eq!(encoding_out.len(), 1);
 

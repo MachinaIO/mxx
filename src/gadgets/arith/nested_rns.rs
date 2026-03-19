@@ -1261,7 +1261,7 @@ mod tests {
         let one = DCRTPoly::const_one(&params);
         let eval_inputs = [a_inputs, b_inputs].concat();
         let eval_results =
-            circuit.eval(&params, one, eval_inputs, Some(&plt_evaluator), None::<&()>, None);
+            circuit.eval(&params, one, eval_inputs, Some(&plt_evaluator), None, None);
         // println!("eval_results {:?}", eval_results);
         assert_eq!(eval_results.len(), 1);
         assert_eq!(eval_results[0].coeffs_biguints()[0], expected_out);
@@ -1299,7 +1299,7 @@ mod tests {
         let one = DCRTPoly::const_one(&params);
         let eval_inputs = [a_inputs, b_inputs].concat();
         let eval_results =
-            circuit.eval(&params, one, eval_inputs, Some(&plt_evaluator), None::<&()>, None);
+            circuit.eval(&params, one, eval_inputs, Some(&plt_evaluator), None, None);
         // println!("eval_results {:?}", eval_results);
         assert_eq!(eval_results.len(), 1);
         assert_eq!(eval_results[0].coeffs_biguints()[0], expected_out);
@@ -1337,7 +1337,7 @@ mod tests {
         let one = DCRTPoly::const_one(&params);
         let eval_inputs = [a_inputs, b_inputs].concat();
         let eval_results =
-            circuit.eval(&params, one, eval_inputs, Some(&plt_evaluator), None::<&()>, None);
+            circuit.eval(&params, one, eval_inputs, Some(&plt_evaluator), None, None);
         assert_eq!(eval_results.len(), 1);
         let output = eval_results[0].coeffs_biguints()[0].clone();
         if active_q_level == q_moduli.len() {

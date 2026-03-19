@@ -239,7 +239,7 @@ async fn test_lwe_modp_chain_rounding() {
         enc_one_pubkey,
         input_pubkeys,
         Some(&plt_pubkey_evaluator),
-        None::<&()>,
+        None,
         None,
     );
     info!("circuit eval pubkey done");
@@ -257,14 +257,8 @@ async fn test_lwe_modp_chain_rounding() {
     info!("plt encoding evaluator setup done");
 
     info!("circuit eval encoding start");
-    let result_encoding = circuit.eval(
-        &params,
-        enc_one,
-        input_encodings,
-        Some(&plt_encoding_evaluator),
-        None::<&()>,
-        None,
-    );
+    let result_encoding =
+        circuit.eval(&params, enc_one, input_encodings, Some(&plt_encoding_evaluator), None, None);
     info!("circuit eval encoding done");
     assert_eq!(result_encoding.len(), 1);
 

@@ -270,7 +270,7 @@ where
             one_pubkey,
             input_pubkeys,
             Some(&gate_state_collector),
-            None::<&()>,
+            None,
             None,
         );
         let luts = gate_state_collector
@@ -764,7 +764,7 @@ mod tests {
             one_pubkey,
             input_pubkeys,
             Some(&plt_pubkey_evaluator),
-            None::<&()>,
+            None,
             None,
         );
         info!("circuit eval pubkey done");
@@ -805,7 +805,7 @@ mod tests {
             one_encoding,
             input_encodings,
             Some(&plt_encoding_evaluator),
-            None::<&()>,
+            None,
             None,
         );
         info!("circuit eval encoding done");
@@ -921,7 +921,7 @@ mod tests {
             one_pubkey,
             input_pubkeys.clone(),
             Some(&plt_pubkey_evaluator),
-            None::<&()>,
+            None,
             None,
         );
         info!("circuit eval pubkey done");
@@ -960,7 +960,7 @@ mod tests {
             one_encoding,
             input_encodings.clone(),
             Some(&plt_encoding_evaluator),
-            None::<&()>,
+            None,
             None,
         );
         info!("circuit eval encoding done");

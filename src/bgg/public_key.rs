@@ -1,8 +1,4 @@
-use crate::{
-    circuit::evaluable::Evaluable,
-    matrix::PolyMatrix,
-    poly::{Poly, PolyParams},
-};
+use crate::{circuit::evaluable::Evaluable, matrix::PolyMatrix, poly::Poly};
 use num_bigint::BigUint;
 use rayon::prelude::*;
 use std::{
@@ -125,17 +121,6 @@ impl<M: PolyMatrix> Evaluable for BggPublicKey<M> {
     #[cfg(feature = "gpu")]
     fn params_for_eval_device(params: &Self::Params, device_id: i32) -> Self::Params {
         params.params_for_device(device_id)
-    }
-
-    fn rotate(&self, params: &Self::Params, shift: i32) -> Self {
-        let shift = if shift >= 0 {
-            shift as usize
-        } else {
-            params.ring_dimension() as usize - shift.unsigned_abs() as usize
-        };
-        let rotate_poly = <M::P>::const_rotate_poly(params, shift);
-        let matrix = self.matrix.clone() * rotate_poly;
-        Self { matrix, reveal_plaintext: self.reveal_plaintext }
     }
 
     fn small_scalar_mul(&self, params: &Self::Params, scalar: &[u32]) -> Self {

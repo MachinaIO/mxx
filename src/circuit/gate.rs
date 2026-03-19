@@ -21,7 +21,6 @@ pub enum PolyGateKind {
     Mul,
     SmallScalarMul,
     LargeScalarMul,
-    Rotate,
     PubLut(usize),
     SubCircuitOutput,
 }
@@ -47,7 +46,6 @@ pub enum PolyGateType {
     Mul,
     SmallScalarMul { scalar: Vec<u32> },
     LargeScalarMul { scalar: Vec<BigUint> },
-    Rotate { shift: i32 },
     PubLut { lut_id: usize },
     SubCircuitOutput { call_id: usize, output_idx: usize, num_inputs: usize },
 }
@@ -56,7 +54,6 @@ impl PolyGateType {
     pub fn num_input(&self) -> usize {
         match self {
             PolyGateType::Input => 0,
-            PolyGateType::Rotate { .. } |
             PolyGateType::SmallScalarMul { .. } |
             PolyGateType::LargeScalarMul { .. } |
             PolyGateType::PubLut { .. } => 1,
@@ -73,7 +70,6 @@ impl PolyGateType {
             PolyGateType::Mul => PolyGateKind::Mul,
             PolyGateType::SmallScalarMul { .. } => PolyGateKind::SmallScalarMul,
             PolyGateType::LargeScalarMul { .. } => PolyGateKind::LargeScalarMul,
-            PolyGateType::Rotate { .. } => PolyGateKind::Rotate,
             PolyGateType::PubLut { lut_id } => PolyGateKind::PubLut(*lut_id),
             PolyGateType::SubCircuitOutput { .. } => PolyGateKind::SubCircuitOutput,
         }

@@ -18,7 +18,6 @@ pub enum SerializablePolyGateType {
     Add,
     Sub,
     Mul,
-    Rotate { shift: i32 },
     PubLut { lut_id: usize },
     SubCircuitOutput { call_id: usize, output_idx: usize, num_inputs: usize },
 }
@@ -29,7 +28,6 @@ impl SerializablePolyGateType {
             SerializablePolyGateType::Input => 0,
             SerializablePolyGateType::SmallScalarMul { .. } |
             SerializablePolyGateType::LargeScalarMul { .. } |
-            SerializablePolyGateType::Rotate { .. } |
             SerializablePolyGateType::PubLut { .. } => 1,
             SerializablePolyGateType::SubCircuitOutput { num_inputs, .. } => *num_inputs,
             SerializablePolyGateType::Add |
@@ -98,7 +96,6 @@ impl SerializablePolyCircuit {
                 PolyGateType::Add => SerializablePolyGateType::Add,
                 PolyGateType::Sub => SerializablePolyGateType::Sub,
                 PolyGateType::Mul => SerializablePolyGateType::Mul,
-                PolyGateType::Rotate { shift } => SerializablePolyGateType::Rotate { shift },
                 PolyGateType::PubLut { lut_id } => SerializablePolyGateType::PubLut { lut_id },
                 PolyGateType::SubCircuitOutput { call_id, output_idx, num_inputs } => {
                     SerializablePolyGateType::SubCircuitOutput { call_id, output_idx, num_inputs }
@@ -149,7 +146,6 @@ impl SerializablePolyCircuit {
                 SerializablePolyGateType::Add => PolyGateType::Add,
                 SerializablePolyGateType::Sub => PolyGateType::Sub,
                 SerializablePolyGateType::Mul => PolyGateType::Mul,
-                SerializablePolyGateType::Rotate { shift } => PolyGateType::Rotate { shift },
                 SerializablePolyGateType::PubLut { lut_id } => PolyGateType::PubLut { lut_id },
                 SerializablePolyGateType::SubCircuitOutput { call_id, output_idx, num_inputs } => {
                     PolyGateType::SubCircuitOutput { call_id, output_idx, num_inputs }

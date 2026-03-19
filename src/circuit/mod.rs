@@ -213,8 +213,7 @@ impl<P: Poly> PolyCircuit<P> {
     ///
     /// Definition:
     /// - Inputs and the reserved constant-one gate contribute 0 to depth.
-    /// - Add, Sub, SmallScalarMul, Rotate gates do not increase depth: level(add) =
-    ///   max(level(inputs)).
+    /// - Add, Sub, SmallScalarMul gates do not increase depth: level(add) = max(level(inputs)).
     /// - Any other non-input gate increases depth by 1: level(g) = max(level(inputs)) + 1.
     /// - Sub-circuits contribute their internal non-free depth based on the call inputs.
     /// - If there are no outputs, returns 0.
@@ -264,10 +263,9 @@ impl<P: Poly> PolyCircuit<P> {
                 .expect("non-input gate must have inputs");
 
             let level = match &gate.gate_type {
-                PolyGateType::Add |
-                PolyGateType::Sub |
-                PolyGateType::SmallScalarMul { .. } |
-                PolyGateType::Rotate { .. } => max_in,
+                PolyGateType::Add | PolyGateType::Sub | PolyGateType::SmallScalarMul { .. } => {
+                    max_in
+                }
                 PolyGateType::SubCircuitOutput { call_id, output_idx, .. } => {
                     let outputs = call_output_levels.entry(*call_id).or_insert_with(|| {
                         let call =
@@ -426,8 +424,16 @@ impl<P: Poly> PolyCircuit<P> {
         )
     }
 
-    pub fn rotate_gate(&mut self, input: GateId, shift: i32) -> GateId {
-        self.new_gate_generic(vec![input], PolyGateType::Rotate { shift })
+    /// Lowers a ring-dimension-normalized rotation into multiplication by the
+    /// monomial `x^shift`.
+    ///
+    /// `shift` must already be reduced modulo the ring dimension.
+    pub fn rotate_gate(&mut self, input: GateId, shift: u64) -> GateId {
+        let shift = usize::try_from(shift)
+            .expect("PolyCircuit::rotate_gate shift does not fit in usize on this platform");
+        let mut scalar = vec![0; shift + 1];
+        scalar[shift] = 1;
+        self.small_scalar_mul(input, &scalar)
     }
 
     pub fn public_lookup_gate(&mut self, input: GateId, lut_id: usize) -> GateId {
@@ -768,15 +774,6 @@ impl<P: Poly> PolyCircuit<P> {
                     debug!("Large scalar mul gate end");
                     Arc::new(result.to_compact())
                 }
-                PolyGateType::Rotate { shift } => {
-                    debug!("Rotate gate start");
-                    let input =
-                        wires.get(&gate.input_gates[0]).expect("wire missing for Rotate").clone();
-                    let input = E::from_compact(eval_params, input.as_ref());
-                    let result = input.rotate(eval_params, *shift);
-                    debug!("Rotate gate end");
-                    Arc::new(result.to_compact())
-                }
                 PolyGateType::PubLut { lut_id } => {
                     debug!("Public Lookup gate start");
                     let input = wires
@@ -890,7 +887,6 @@ impl<P: Poly> PolyCircuit<P> {
                         }
                         PolyGateType::SmallScalarMul { .. } |
                         PolyGateType::LargeScalarMul { .. } |
-                        PolyGateType::Rotate { .. } |
                         PolyGateType::PubLut { .. } => {
                             let input = wires
                                 .get(&gate.input_gates[0])
@@ -933,9 +929,6 @@ impl<P: Poly> PolyCircuit<P> {
                             LoadedGateInputs::Unary(input),
                             PolyGateType::LargeScalarMul { scalar },
                         ) => ComputedGateValue::Value(input.large_scalar_mul(eval_params, scalar)),
-                        (LoadedGateInputs::Unary(input), PolyGateType::Rotate { shift }) => {
-                            ComputedGateValue::Value(input.rotate(eval_params, *shift))
-                        }
                         (LoadedGateInputs::Unary(input), PolyGateType::PubLut { lut_id }) => {
                             let scoped_gate_id = call_prefix
                                 .checked_mul(gate_id_base)
@@ -1299,6 +1292,29 @@ mod tests {
         // Verify the result
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], expected);
+    }
+
+    #[test]
+    fn test_rotate_gate_uses_small_scalar_mul() {
+        let params = DCRTPolyParams::default();
+        let input = create_random_poly(&params);
+
+        let mut circuit = PolyCircuit::new();
+        let inputs = circuit.input(1);
+        let rotated = circuit.rotate_gate(inputs[0], 3);
+        circuit.output(vec![rotated]);
+
+        let result = eval_with_const_one(
+            &circuit,
+            &params,
+            std::slice::from_ref(&input),
+            None::<&PolyPltEvaluator>,
+        );
+        let expected = input * DCRTPoly::from_u32s(&params, &[0, 0, 0, 1]);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], expected);
+        assert_eq!(circuit.count_gates_by_type_vec().get(&PolyGateKind::SmallScalarMul), Some(&1));
     }
 
     #[test]

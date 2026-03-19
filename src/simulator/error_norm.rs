@@ -105,10 +105,6 @@ impl Evaluable for ErrorNorm {
         compact.clone()
     }
 
-    fn rotate(&self, _: &Self::Params, _: i32) -> Self {
-        self.clone()
-    }
-
     fn small_scalar_mul(&self, _: &Self::Params, scalar: &[u32]) -> Self {
         let scalar_max = BigDecimal::from(*scalar.iter().max().unwrap());
         let scalar_poly = PolyNorm::new(self.clone_ctx(), scalar_max);

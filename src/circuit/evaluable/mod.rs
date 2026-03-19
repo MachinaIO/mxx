@@ -1,4 +1,7 @@
 pub mod poly;
+pub mod poly_vec;
+
+pub use poly_vec::PolyVec;
 
 use num_bigint::BigUint;
 

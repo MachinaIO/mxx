@@ -572,7 +572,8 @@ async fn test_gpu_ggh15_poly_modq_arith() {
     let input_pubkeys = pubkeys.split_off(1);
     let one_pubkey = pubkeys.pop().expect("pubkeys must contain one entry for const one");
     let pubkey_eval_start = Instant::now();
-    let pubkey_out = circuit.eval(&params, one_pubkey, input_pubkeys, Some(&pk_evaluator), None);
+    let pubkey_out =
+        circuit.eval(&params, one_pubkey, input_pubkeys, Some(&pk_evaluator), None::<&()>, None);
     info!("pubkey eval elapsed_ms={:.3}", pubkey_eval_start.elapsed().as_secs_f64() * 1000.0);
     assert_eq!(pubkey_out.len(), 1);
 
@@ -615,6 +616,7 @@ async fn test_gpu_ggh15_poly_modq_arith() {
         one_poly_encoding,
         input_poly_encodings,
         Some(&poly_evaluator),
+        None::<&()>,
         Some(1),
     );
     info!(

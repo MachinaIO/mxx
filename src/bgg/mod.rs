@@ -209,6 +209,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<&()>,
             None,
         );
 
@@ -242,6 +243,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<&()>,
             None,
         );
 
@@ -275,6 +277,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<&()>,
             None,
         );
 
@@ -311,6 +314,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<&()>,
             None,
         );
 
@@ -352,6 +356,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<&()>,
             None,
         );
 
@@ -396,6 +401,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<&()>,
             None,
         );
 
@@ -439,6 +445,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<&()>,
             None,
         );
 
@@ -489,6 +496,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None::<&()>,
             None,
         );
 

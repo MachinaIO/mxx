@@ -1,3 +1,5 @@
+#[cfg(feature = "gpu")]
+use crate::poly::PolyParams;
 use crate::{
     bgg::public_key::{BggPublicKey, BggPublicKeyCompact},
     circuit::evaluable::Evaluable,

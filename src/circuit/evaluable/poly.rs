@@ -1,3 +1,5 @@
+#[cfg(feature = "gpu")]
+use crate::poly::PolyParams;
 use crate::{circuit::evaluable::Evaluable, poly::Poly};
 use num_bigint::BigUint;
 

@@ -15,6 +15,7 @@ pub enum SerializablePolyGateType {
     Input,
     SmallScalarMul { scalar: Vec<u32> },
     LargeScalarMul { scalar: Vec<BigUint> },
+    SlotTransfer { mappings: Vec<u32> },
     Add,
     Sub,
     Mul,
@@ -28,6 +29,7 @@ impl SerializablePolyGateType {
             SerializablePolyGateType::Input => 0,
             SerializablePolyGateType::SmallScalarMul { .. } |
             SerializablePolyGateType::LargeScalarMul { .. } |
+            SerializablePolyGateType::SlotTransfer { .. } |
             SerializablePolyGateType::PubLut { .. } => 1,
             SerializablePolyGateType::SubCircuitOutput { num_inputs, .. } => *num_inputs,
             SerializablePolyGateType::Add |
@@ -93,6 +95,9 @@ impl SerializablePolyCircuit {
                 PolyGateType::LargeScalarMul { scalar } => {
                     SerializablePolyGateType::LargeScalarMul { scalar }
                 }
+                PolyGateType::SlotTransfer { mappings } => {
+                    SerializablePolyGateType::SlotTransfer { mappings }
+                }
                 PolyGateType::Add => SerializablePolyGateType::Add,
                 PolyGateType::Sub => SerializablePolyGateType::Sub,
                 PolyGateType::Mul => SerializablePolyGateType::Mul,
@@ -142,6 +147,9 @@ impl SerializablePolyCircuit {
                 }
                 SerializablePolyGateType::LargeScalarMul { scalar } => {
                     PolyGateType::LargeScalarMul { scalar }
+                }
+                SerializablePolyGateType::SlotTransfer { mappings } => {
+                    PolyGateType::SlotTransfer { mappings }
                 }
                 SerializablePolyGateType::Add => PolyGateType::Add,
                 SerializablePolyGateType::Sub => PolyGateType::Sub,
@@ -301,10 +309,25 @@ mod tests {
         let b = DCRTPoly::const_one(&params);
         let one = DCRTPoly::const_one(&params);
         let out1_inputs = vec![a.clone(), b.clone()];
-        let out1 = circuit.eval(&params, one, out1_inputs, None::<&PolyPltEvaluator>, None);
+        let out1 =
+            circuit.eval(&params, one, out1_inputs, None::<&PolyPltEvaluator>, None::<&()>, None);
         let one = DCRTPoly::const_one(&params);
         let out2_inputs = vec![a, b];
-        let out2 = roundtrip.eval(&params, one, out2_inputs, None::<&PolyPltEvaluator>, None);
+        let out2 =
+            roundtrip.eval(&params, one, out2_inputs, None::<&PolyPltEvaluator>, None::<&()>, None);
         assert_eq!(out1, out2);
+    }
+
+    #[test]
+    fn test_serialization_roundtrip_with_slot_transfer_gate() {
+        let mut circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
+        let inputs = circuit.input(1);
+        let transferred = circuit.slot_transfer_gate(inputs[0], &[1, 0, 1]);
+        circuit.output(vec![transferred]);
+
+        let serializable = SerializablePolyCircuit::from_circuit(circuit.clone());
+        let roundtrip = serializable.to_circuit::<DCRTPoly>();
+
+        assert_eq!(roundtrip, circuit);
     }
 }

@@ -1,8 +1,8 @@
 use crate::{
-    circuit::gate::GateId,
+    circuit::{SlotTransferEvaluator, evaluable::PolyVec, gate::GateId},
     element::PolyElem,
     lookup::{PltEvaluator, PublicLut},
-    poly::Poly,
+    poly::{Poly, PolyParams},
 };
 use num_traits::ToPrimitive;
 
@@ -56,12 +56,110 @@ impl PolyPltEvaluator {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PolyVecPltEvaluator {
+    poly_evaluator: PolyPltEvaluator,
+}
+
+impl PolyVecPltEvaluator {
+    pub fn new() -> Self {
+        Self { poly_evaluator: PolyPltEvaluator::new() }
+    }
+}
+
+impl Default for PolyVecPltEvaluator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<P: Poly + 'static> PltEvaluator<PolyVec<P>> for PolyVecPltEvaluator {
+    fn public_lookup(
+        &self,
+        params: &P::Params,
+        plt: &PublicLut<P>,
+        one: &PolyVec<P>,
+        input: &PolyVec<P>,
+        gate_id: GateId,
+        lut_id: usize,
+    ) -> PolyVec<P> {
+        assert_eq!(
+            one.len(),
+            input.len(),
+            "slot vector one/input sizes must match for public lookup"
+        );
+        PolyVec::new(
+            input
+                .as_slice()
+                .iter()
+                .zip(one.as_slice().iter())
+                .map(|(slot_input, slot_one)| {
+                    self.poly_evaluator
+                        .public_lookup(params, plt, slot_one, slot_input, gate_id, lut_id)
+                })
+                .collect(),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PolyVecSlotTransferEvaluator {}
+
+impl PolyVecSlotTransferEvaluator {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl Default for PolyVecSlotTransferEvaluator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<P: Poly> SlotTransferEvaluator<PolyVec<P>> for PolyVecSlotTransferEvaluator {
+    fn empty_output(&self, params: &P::Params, _: &PolyVec<P>, num_slots: usize) -> PolyVec<P> {
+        assert!(
+            num_slots <= params.ring_dimension() as usize,
+            "slot count {} exceeds ring dimension {}",
+            num_slots,
+            params.ring_dimension()
+        );
+        PolyVec::new(vec![P::const_zero(params); num_slots])
+    }
+
+    fn slot_transfer(
+        &self,
+        _: &P::Params,
+        input: &PolyVec<P>,
+        src_slot: u32,
+        dst_slot: u32,
+        output: &mut PolyVec<P>,
+    ) {
+        let src_slot = src_slot as usize;
+        let dst_slot = dst_slot as usize;
+        let src_value = input
+            .as_slice()
+            .get(src_slot)
+            .unwrap_or_else(|| panic!("source slot {} out of range", src_slot))
+            .clone();
+        let dst_ref = output
+            .as_mut_slice()
+            .get_mut(dst_slot)
+            .unwrap_or_else(|| panic!("destination slot {} out of range", dst_slot));
+        *dst_ref = src_value;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::poly::{
-        PolyParams,
-        dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+    use crate::{
+        circuit::{PolyCircuit, PolyGateKind},
+        poly::{
+            PolyParams,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
     };
     use std::sync::{Arc, Mutex};
 
@@ -110,5 +208,74 @@ mod tests {
             expected_input_queries.as_slice()
         );
         assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn slot_transfer_evaluator_reassigns_slots_for_poly_vec_circuits() {
+        let params = DCRTPolyParams::new(8, 2, 17, 1);
+        let input = PolyVec::new(vec![
+            DCRTPoly::from_usize_to_constant(&params, 3),
+            DCRTPoly::from_usize_to_constant(&params, 5),
+            DCRTPoly::from_usize_to_constant(&params, 7),
+        ]);
+        let one = PolyVec::new(vec![DCRTPoly::const_one(&params); 3]);
+
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let inputs = circuit.input(1);
+        let transferred = circuit.slot_transfer_gate(inputs[0], &[2, 0, 1]);
+        circuit.output(vec![transferred]);
+
+        let slot_transfer_evaluator = PolyVecSlotTransferEvaluator::new();
+        let result = circuit.eval(
+            &params,
+            one,
+            vec![input],
+            None::<&PolyVecPltEvaluator>,
+            Some(&slot_transfer_evaluator),
+            None,
+        );
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].as_slice(),
+            &[
+                DCRTPoly::from_usize_to_constant(&params, 7),
+                DCRTPoly::from_usize_to_constant(&params, 3),
+                DCRTPoly::from_usize_to_constant(&params, 5),
+            ]
+        );
+        assert_eq!(circuit.non_free_depth(), 1);
+        assert_eq!(circuit.count_gates_by_type_vec().get(&PolyGateKind::SlotTransfer), Some(&1));
+    }
+
+    #[test]
+    #[should_panic(expected = "slot count 6 exceeds ring dimension 4")]
+    fn slot_transfer_evaluator_rejects_poly_vec_longer_than_ring_dimension() {
+        let params = DCRTPolyParams::new(4, 2, 17, 1);
+        let input = PolyVec::new(vec![
+            DCRTPoly::from_usize_to_constant(&params, 10),
+            DCRTPoly::from_usize_to_constant(&params, 11),
+            DCRTPoly::from_usize_to_constant(&params, 12),
+            DCRTPoly::from_usize_to_constant(&params, 13),
+            DCRTPoly::from_usize_to_constant(&params, 14),
+            DCRTPoly::from_usize_to_constant(&params, 15),
+        ]);
+        let one = PolyVec::new(vec![DCRTPoly::const_one(&params); 6]);
+
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let inputs = circuit.input(1);
+        let transferred = circuit.slot_transfer_gate(inputs[0], &[5, 4, 3, 2, 1, 0]);
+        circuit.output(vec![transferred]);
+
+        let slot_transfer_evaluator = PolyVecSlotTransferEvaluator::new();
+        let result = circuit.eval(
+            &params,
+            one,
+            vec![input],
+            None::<&PolyVecPltEvaluator>,
+            Some(&slot_transfer_evaluator),
+            None,
+        );
+        let _ = result;
     }
 }

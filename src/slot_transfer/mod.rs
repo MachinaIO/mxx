@@ -1,5 +1,7 @@
+pub mod dcrt_poly;
 pub mod poly_vec;
 
+pub use dcrt_poly::DCRTPolyEvalSlotsTransferEvaluator;
 pub use poly_vec::PolyVecSlotTransferEvaluator;
 
 use crate::circuit::evaluable::Evaluable;

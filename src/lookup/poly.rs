@@ -2,7 +2,10 @@ use crate::{
     circuit::{evaluable::PolyVec, gate::GateId},
     element::PolyElem,
     lookup::{PltEvaluator, PublicLut},
-    poly::Poly,
+    poly::{
+        Poly,
+        dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+    },
 };
 use num_traits::ToPrimitive;
 
@@ -53,6 +56,58 @@ impl Default for PolyPltEvaluator {
 impl PolyPltEvaluator {
     pub fn new() -> Self {
         Self {}
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DCRTPolyEvalSlotsPltEvaluator {}
+
+impl DCRTPolyEvalSlotsPltEvaluator {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl Default for DCRTPolyEvalSlotsPltEvaluator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PltEvaluator<DCRTPoly> for DCRTPolyEvalSlotsPltEvaluator {
+    fn public_lookup(
+        &self,
+        params: &DCRTPolyParams,
+        plt: &PublicLut<DCRTPoly>,
+        _: &DCRTPoly,
+        input: &DCRTPoly,
+        gate_id: GateId,
+        lut_id: usize,
+    ) -> DCRTPoly {
+        let output_slots = input
+            .eval_slots()
+            .into_iter()
+            .enumerate()
+            .map(|(slot_idx, slot)| {
+                let x_i = slot.to_u64().unwrap_or_else(|| {
+                    panic!(
+                        "lookup input slot must fit in u64; gate_id: {:?}, lut_id: {:?}, slot_idx: {:?}, slot: {:?}",
+                        gate_id, lut_id, slot_idx, slot
+                    )
+                });
+                plt.get(params, x_i)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "output of the lookup evaluation not found; gate_id: {:?}, lut_id: {:?}, slot_idx: {:?}, input_slot_u64: {:?}",
+                            gate_id, lut_id, slot_idx, x_i
+                        )
+                    })
+                    .1
+                    .value()
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        DCRTPoly::from_biguints_eval(params, &output_slots)
     }
 }
 

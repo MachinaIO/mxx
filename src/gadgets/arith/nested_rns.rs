@@ -782,6 +782,56 @@ impl<P: Poly> NestedRnsPoly<P> {
         Self { ctx, inner, _p: PhantomData }
     }
 
+    pub fn constant_from_tower_slot_residues(
+        ctx: Arc<NestedRnsPolyContext>,
+        params: &P::Params,
+        residues_by_q: &[Vec<u64>],
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        assert_eq!(
+            residues_by_q.len(),
+            ctx.q_moduli_depth,
+            "tower residue depth must match nested RNS q_moduli_depth"
+        );
+        let num_slots = residues_by_q.first().map(Vec::len).unwrap_or(0);
+        let inner = residues_by_q
+            .iter()
+            .map(|slot_residues| {
+                assert_eq!(
+                    slot_residues.len(),
+                    num_slots,
+                    "all tower residue vectors must have the same slot count"
+                );
+                ctx.p_moduli
+                    .iter()
+                    .map(|&p_i| {
+                        let slot_values = slot_residues
+                            .iter()
+                            .map(|&value| BigUint::from(value % p_i))
+                            .collect::<Vec<_>>();
+                        let poly = P::from_biguints_eval(params, &slot_values);
+                        circuit.const_poly(&poly)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Self::new(ctx, inner)
+    }
+
+    pub fn slot_transfer(&self, src_slots: &[u32], circuit: &mut PolyCircuit<P>) -> Self {
+        let inner = self
+            .inner
+            .iter()
+            .map(|q_level| {
+                q_level
+                    .iter()
+                    .map(|&gate_id| circuit.slot_transfer_gate(gate_id, src_slots))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Self::new(self.ctx.clone(), inner)
+    }
+
     pub fn add_lazy_reduce(
         &self,
         other: &Self,

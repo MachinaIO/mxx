@@ -11,11 +11,6 @@ int set_error(cudaError_t err)
     return gpu_set_last_error(cudaGetErrorString(err));
 }
 
-int default_batch(const GpuContext *ctx)
-{
-    return static_cast<int>(ctx && ctx->batch != 0 ? ctx->batch : 1);
-}
-
 bool parse_format(int format, GpuPolyFormat &out)
 {
     switch (format)

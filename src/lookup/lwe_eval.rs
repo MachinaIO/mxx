@@ -429,7 +429,7 @@ mod test {
         let one_pubkey = enc_one.pubkey.clone();
         let input_pubkeys = vec![enc1.pubkey.clone()];
         let result_pubkey =
-            circuit.eval(&params, one_pubkey, input_pubkeys, Some(&plt_pubkey_evaluator));
+            circuit.eval(&params, one_pubkey, input_pubkeys, Some(&plt_pubkey_evaluator), None);
         plt_pubkey_evaluator.sample_aux_matrices(&params);
         wait_for_all_writes(dir.to_path_buf()).await.unwrap();
         assert_eq!(result_pubkey.len(), 1);
@@ -444,8 +444,13 @@ mod test {
         // Evaluate the circuit
         let one_encoding = enc_one.clone();
         let input_encodings = vec![enc1.clone()];
-        let result_encoding =
-            circuit.eval(&params, one_encoding, input_encodings, Some(&plt_encoding_evaluator));
+        let result_encoding = circuit.eval(
+            &params,
+            one_encoding,
+            input_encodings,
+            Some(&plt_encoding_evaluator),
+            None,
+        );
         assert_eq!(result_encoding.len(), 1);
         let result_encoding = &result_encoding[0];
         assert_eq!(result_encoding.pubkey, result_pubkey.clone());

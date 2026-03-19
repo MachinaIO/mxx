@@ -255,6 +255,7 @@ async fn test_commit_modq_arith() {
         dry_one,
         plaintext_inputs_shared.clone(),
         Some(&dry_plt_evaluator),
+        None,
     );
     assert_eq!(dry_out.len(), 1, "plain PolyCircuit dry-run should output one value polynomial");
     let dry_const_term = dry_out[0]
@@ -275,7 +276,8 @@ async fn test_commit_modq_arith() {
 
     let plt_evaluator = PolyPltEvaluator::new();
     let plain_one = DCRTPoly::const_one(&params);
-    let plain_out = circuit.eval(&params, plain_one, plaintext_inputs_shared, Some(&plt_evaluator));
+    let plain_out =
+        circuit.eval(&params, plain_one, plaintext_inputs_shared, Some(&plt_evaluator), None);
     assert_eq!(plain_out.len(), 1);
     let plain_const = plain_out[0]
         .coeffs()
@@ -355,7 +357,8 @@ async fn test_commit_modq_arith() {
         );
 
     let pubkey_one = enc_one.pubkey.clone();
-    let pubkey_out = circuit.eval(&params, pubkey_one, pubkeys[1..].to_vec(), Some(&pk_evaluator));
+    let pubkey_out =
+        circuit.eval(&params, pubkey_one, pubkeys[1..].to_vec(), Some(&pk_evaluator), None);
     assert_eq!(pubkey_out.len(), 1);
 
     pk_evaluator.commit_all_lut_matrices::<DCRTPolyTrapdoorSampler>(
@@ -383,7 +386,7 @@ async fn test_commit_modq_arith() {
             pk_evaluator.wee25_public_params.clone(),
         );
 
-    let encoding_out = circuit.eval(&params, enc_one, input_encodings, Some(&enc_evaluator));
+    let encoding_out = circuit.eval(&params, enc_one, input_encodings, Some(&enc_evaluator), None);
     assert_eq!(encoding_out.len(), 1);
 
     assert_eq!(encoding_out[0].pubkey, pubkey_out[0]);

@@ -965,10 +965,9 @@ extern "C" int gpu_poly_store_compact_bytes(
         return set_error("coeff_count overflow in gpu_poly_store_compact_bytes");
     }
 
-    const int batch = default_batch(poly->ctx);
     if (poly->format == GPU_POLY_FORMAT_EVAL)
     {
-        const int status = gpu_matrix_intt_all(poly, batch);
+        const int status = gpu_matrix_intt_all(poly);
         if (status != 0)
         {
             return status;

@@ -265,7 +265,7 @@ where
         // setup pubkeys for all LUT gates
         let one_pubkey = one_pubkey.clone();
         let input_pubkeys = input_pubkeys.to_vec();
-        let _ = circuit.eval(params, one_pubkey, input_pubkeys, Some(&gate_state_collector));
+        let _ = circuit.eval(params, one_pubkey, input_pubkeys, Some(&gate_state_collector), None);
         let luts = gate_state_collector
             .luts
             .iter()
@@ -753,7 +753,7 @@ mod tests {
         let one_pubkey = enc_one.pubkey.clone();
         let input_pubkeys = vec![enc1.pubkey.clone()];
         let result_pubkey =
-            circuit.eval(&params, one_pubkey, input_pubkeys, Some(&plt_pubkey_evaluator));
+            circuit.eval(&params, one_pubkey, input_pubkeys, Some(&plt_pubkey_evaluator), None);
         info!("circuit eval pubkey done");
         info!("commit_all_lut_matrices start");
         plt_pubkey_evaluator.commit_all_lut_matrices::<DCRTPolyTrapdoorSampler>(
@@ -787,8 +787,13 @@ mod tests {
         info!("circuit eval encoding start");
         let one_encoding = enc_one.clone();
         let input_encodings = vec![enc1.clone()];
-        let result_encoding =
-            circuit.eval(&params, one_encoding, input_encodings, Some(&plt_encoding_evaluator));
+        let result_encoding = circuit.eval(
+            &params,
+            one_encoding,
+            input_encodings,
+            Some(&plt_encoding_evaluator),
+            None,
+        );
         info!("circuit eval encoding done");
         assert_eq!(result_encoding.len(), 1);
         let result_encoding = &result_encoding[0];
@@ -897,8 +902,13 @@ mod tests {
 
         info!("circuit eval pubkey start");
         let one_pubkey = enc_one.pubkey.clone();
-        let result_pubkey =
-            circuit.eval(&params, one_pubkey, input_pubkeys.clone(), Some(&plt_pubkey_evaluator));
+        let result_pubkey = circuit.eval(
+            &params,
+            one_pubkey,
+            input_pubkeys.clone(),
+            Some(&plt_pubkey_evaluator),
+            None,
+        );
         info!("circuit eval pubkey done");
         info!("commit_all_lut_matrices start");
         plt_pubkey_evaluator.commit_all_lut_matrices::<DCRTPolyTrapdoorSampler>(
@@ -935,6 +945,7 @@ mod tests {
             one_encoding,
             input_encodings.clone(),
             Some(&plt_encoding_evaluator),
+            None,
         );
         info!("circuit eval encoding done");
         assert_eq!(result_encoding.len(), input_size);

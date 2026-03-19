@@ -793,7 +793,16 @@ impl<P: Poly> PolyCircuit<P> {
                     let input = E::from_compact(eval_params, input.as_ref());
                     let evaluator =
                         slot_transfer_evaluator.expect("slot transfer evaluator missing");
-                    Arc::new(evaluator.slot_transfer(eval_params, &input, src_slots).to_compact())
+                    let scoped_gate_id = call_prefix
+                        .checked_mul(gate_id_base)
+                        .and_then(|base| base.checked_add(gate_id.0))
+                        .map(GateId)
+                        .expect("scoped gate id overflow");
+                    Arc::new(
+                        evaluator
+                            .slot_transfer(eval_params, &input, src_slots, scoped_gate_id)
+                            .to_compact(),
+                    )
                 }
                 PolyGateType::PubLut { lut_id } => {
                     debug!("Public Lookup gate start");
@@ -958,10 +967,16 @@ impl<P: Poly> PolyCircuit<P> {
                         ) => {
                             let evaluator =
                                 slot_transfer_evaluator.expect("slot transfer evaluator missing");
+                            let scoped_gate_id = call_prefix
+                                .checked_mul(gate_id_base)
+                                .and_then(|base| base.checked_add(gate_id.0))
+                                .map(GateId)
+                                .expect("scoped gate id overflow");
                             ComputedGateValue::Value(evaluator.slot_transfer(
                                 eval_params,
                                 &input,
                                 src_slots,
+                                scoped_gate_id,
                             ))
                         }
                         (LoadedGateInputs::Unary(input), PolyGateType::PubLut { lut_id }) => {

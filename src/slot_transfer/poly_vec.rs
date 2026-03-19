@@ -1,5 +1,5 @@
 use crate::{
-    circuit::evaluable::PolyVec,
+    circuit::{evaluable::PolyVec, gate::GateId},
     poly::{Poly, PolyParams},
     slot_transfer::SlotTransferEvaluator,
 };
@@ -25,6 +25,7 @@ impl<P: Poly> SlotTransferEvaluator<PolyVec<P>> for PolyVecSlotTransferEvaluator
         params: &P::Params,
         input: &PolyVec<P>,
         src_slots: &[u32],
+        _gate_id: GateId,
     ) -> PolyVec<P> {
         let num_slots = src_slots.len();
         assert!(

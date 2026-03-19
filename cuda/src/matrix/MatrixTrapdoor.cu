@@ -1162,10 +1162,9 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
     auto cleanup_tmp_inputs = [&]() {};
 
     int status = 0;
-    const int batch = default_batch(src->ctx);
     if (src->format == GPU_POLY_FORMAT_EVAL)
     {
-        status = gpu_matrix_intt_all(src, batch);
+        status = gpu_matrix_intt_all(src);
         if (status != 0)
         {
             return status;
@@ -1568,7 +1567,7 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
     out->format = GPU_POLY_FORMAT_COEFF;
     if (requested_out_format == GPU_POLY_FORMAT_EVAL)
     {
-        status = gpu_matrix_ntt_all(out, batch);
+        status = gpu_matrix_ntt_all(out);
         if (status != 0)
         {
             cleanup();
@@ -1724,7 +1723,6 @@ extern "C" int gpu_matrix_sample_p1_full(
         }
     };
 
-    const int batch = default_batch(a_mat->ctx);
     auto collect_coeff_input_matrix = [&](
                                           const GpuMatrix *src,
                                           GpuMatrix **owned,
@@ -1754,7 +1752,7 @@ extern "C" int gpu_matrix_sample_p1_full(
                 *owned = nullptr;
                 return status;
             }
-            status = gpu_matrix_intt_all(*owned, batch);
+            status = gpu_matrix_intt_all(*owned);
             if (status != 0)
             {
                 gpu_matrix_destroy(*owned);
@@ -2177,7 +2175,7 @@ extern "C" int gpu_matrix_sample_p1_full(
         }
     }
 
-    status = gpu_matrix_ntt_all(out, batch);
+    status = gpu_matrix_ntt_all(out);
     if (status != 0)
     {
         cleanup();

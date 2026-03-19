@@ -4,7 +4,6 @@
 
 int set_error(const char *msg);
 int set_error(cudaError_t err);
-int default_batch(const GpuContext *ctx);
 bool parse_format(int format, GpuPolyFormat &out);
 size_t matrix_poly_count(const GpuMatrix *mat);
 int matrix_limb_device(const GpuMatrix *mat, const dim3 &limb_id, int *out_device);

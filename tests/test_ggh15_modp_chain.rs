@@ -215,19 +215,18 @@ async fn test_ggh15_modp_chain_rounding() {
     init_storage_system(dir.to_path_buf());
 
     info!("plt pubkey evaluator setup start");
-    let insert_1_to_s = false;
     let plt_pubkey_evaluator =
         GGH15BGGPubKeyPltEvaluator::<
             DCRTPolyMatrix,
             DCRTPolyUniformSampler,
             DCRTPolyHashSampler<Keccak256>,
             DCRTPolyTrapdoorSampler,
-        >::new(key, D_SECRET, trapdoor_sigma, ERROR_SIGMA, dir.to_path_buf(), insert_1_to_s);
+        >::new(key, D_SECRET, trapdoor_sigma, ERROR_SIGMA, dir.to_path_buf());
     info!("plt pubkey evaluator setup done");
 
     info!("circuit eval pubkey start");
     let result_pubkey =
-        circuit.eval(&params, enc_one_pubkey, input_pubkeys, Some(&plt_pubkey_evaluator));
+        circuit.eval(&params, enc_one_pubkey, input_pubkeys, Some(&plt_pubkey_evaluator), None);
     info!("circuit eval pubkey done");
     assert_eq!(result_pubkey.len(), 1);
     let sample_aux_start = Instant::now();
@@ -267,7 +266,7 @@ async fn test_ggh15_modp_chain_rounding() {
 
     info!("circuit eval encoding start");
     let result_encoding =
-        circuit.eval(&params, enc_one, input_encodings, Some(&plt_encoding_evaluator));
+        circuit.eval(&params, enc_one, input_encodings, Some(&plt_encoding_evaluator), None);
     info!("circuit eval encoding done");
     assert_eq!(result_encoding.len(), 1);
 

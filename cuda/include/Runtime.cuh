@@ -25,7 +25,6 @@ int gpu_context_create(
     size_t moduli_len,
     const int *gpu_ids,
     size_t gpu_ids_len,
-    uint32_t batch,
     GpuContext **out_ctx);
 
 void gpu_context_destroy(GpuContext *ctx);
@@ -85,7 +84,6 @@ struct GpuContext
     int N;
     int level;
     std::vector<int> gpu_ids;
-    uint32_t batch;
     uint32_t dnum;
     size_t max_aux_limbs;
     std::vector<uint64_t> garner_inverse_table;

@@ -246,8 +246,13 @@ async fn test_commit_modp_chain_rounding() {
 
     info!("circuit eval pubkey start");
     let enc_one_pubkey = enc_one.pubkey.clone();
-    let result_pubkey =
-        circuit.eval(&params, enc_one_pubkey, pubkeys[1..].to_vec(), Some(&plt_pubkey_evaluator));
+    let result_pubkey = circuit.eval(
+        &params,
+        enc_one_pubkey,
+        pubkeys[1..].to_vec(),
+        Some(&plt_pubkey_evaluator),
+        None,
+    );
     info!("circuit eval pubkey done");
     assert_eq!(result_pubkey.len(), 1);
 
@@ -280,7 +285,7 @@ async fn test_commit_modp_chain_rounding() {
 
     info!("circuit eval encoding start");
     let result_encoding =
-        circuit.eval(&params, enc_one, input_encodings, Some(&plt_encoding_evaluator));
+        circuit.eval(&params, enc_one, input_encodings, Some(&plt_encoding_evaluator), None);
     info!("circuit eval encoding done");
     assert_eq!(result_encoding.len(), 1);
 

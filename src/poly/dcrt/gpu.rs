@@ -51,7 +51,6 @@ unsafe extern "C" {
         moduli_len: usize,
         gpu_ids: *const c_int,
         gpu_ids_len: usize,
-        batch: u32,
         out_ctx: *mut *mut GpuContextOpaque,
     ) -> c_int;
     fn gpu_context_destroy(ctx: *mut GpuContextOpaque);
@@ -175,8 +174,8 @@ unsafe extern "C" {
         sigma: f64,
         seed: u64,
     ) -> c_int;
-    pub(crate) fn gpu_matrix_ntt_all(mat: *mut GpuMatrixOpaque, batch: c_int) -> c_int;
-    pub(crate) fn gpu_matrix_intt_all(mat: *mut GpuMatrixOpaque, batch: c_int) -> c_int;
+    pub(crate) fn gpu_matrix_ntt_all(mat: *mut GpuMatrixOpaque) -> c_int;
+    pub(crate) fn gpu_matrix_intt_all(mat: *mut GpuMatrixOpaque) -> c_int;
     fn gpu_device_synchronize() -> c_int;
     fn gpu_device_count(out_count: *mut c_int) -> c_int;
     // fn gpu_device_mem_info(device: c_int, out_free: *mut usize, out_total: *mut usize) -> c_int;
@@ -373,7 +372,6 @@ struct DeviceContextCacheKey {
     moduli: Vec<u64>,
     base_bits: u32,
     device_id: i32,
-    batch: u32,
 }
 
 fn single_device_context_cache() -> &'static Mutex<HashMap<DeviceContextCacheKey, Weak<GpuContext>>>
@@ -393,7 +391,6 @@ pub struct GpuDCRTPolyParams {
     base_bits: u32,
     gpu_ids: Vec<i32>,
     dnum: u32,
-    batch: u32,
     ctx: Arc<GpuContext>,
 }
 
@@ -406,7 +403,6 @@ impl Debug for GpuDCRTPolyParams {
             .field("base_bits", &self.base_bits)
             .field("gpu_ids", &self.gpu_ids)
             .field("dnum", &self.dnum)
-            .field("batch", &self.batch)
             .finish()
     }
 }
@@ -417,8 +413,7 @@ impl PartialEq for GpuDCRTPolyParams {
             self.moduli == other.moduli &&
             self.base_bits == other.base_bits &&
             self.gpu_ids == other.gpu_ids &&
-            self.dnum == other.dnum &&
-            self.batch == other.batch
+            self.dnum == other.dnum
     }
 }
 
@@ -466,7 +461,6 @@ impl PolyParams for GpuDCRTPolyParams {
             base_bits: self.base_bits,
             gpu_ids: vec![device_id],
             dnum: 1,
-            batch: self.batch,
             ctx,
         }
     }
@@ -479,7 +473,6 @@ impl GpuDCRTPolyParams {
             moduli: self.moduli.clone(),
             base_bits: self.base_bits,
             device_id,
-            batch: self.batch,
         };
 
         if let Some(existing) = {
@@ -491,8 +484,7 @@ impl GpuDCRTPolyParams {
         }
 
         let log_n = log2_u32(self.ring_dimension);
-        let created =
-            Arc::new(GpuContext::create(log_n, &self.moduli, &[device_id], 1, self.batch));
+        let created = Arc::new(GpuContext::create(log_n, &self.moduli, &[device_id], 1));
 
         let cache = single_device_context_cache();
         let mut guard = cache.lock().expect("single_device_context_cache mutex poisoned");
@@ -508,7 +500,7 @@ impl GpuDCRTPolyParams {
         // Default params stay single-device so low-level matrix/poly ops keep the
         // invariant that all limbs of a matrix live on one device.
         let default_gpu_ids = gpu_ids.into_iter().take(1).collect::<Vec<_>>();
-        Self::new_with_gpu(ring_dimension, moduli, base_bits, default_gpu_ids, None, 1)
+        Self::new_with_gpu(ring_dimension, moduli, base_bits, default_gpu_ids, None)
     }
 
     pub fn new_with_gpu(
@@ -517,7 +509,6 @@ impl GpuDCRTPolyParams {
         base_bits: u32,
         gpu_ids: Vec<i32>,
         dnum: Option<u32>,
-        batch: u32,
     ) -> Self {
         assert!(!moduli.is_empty(), "moduli must not be empty");
         let crt_depth = moduli.len();
@@ -526,7 +517,7 @@ impl GpuDCRTPolyParams {
         let dnum =
             dnum.unwrap_or_else(|| if gpu_ids.is_empty() { 1 } else { gpu_ids.len() as u32 });
         let log_n = log2_u32(ring_dimension);
-        let ctx = Arc::new(GpuContext::create(log_n, &moduli, &gpu_ids, dnum, batch));
+        let ctx = Arc::new(GpuContext::create(log_n, &moduli, &gpu_ids, dnum));
 
         Self {
             ring_dimension,
@@ -537,7 +528,6 @@ impl GpuDCRTPolyParams {
             base_bits,
             gpu_ids,
             dnum,
-            batch,
             ctx,
         }
     }
@@ -556,10 +546,6 @@ impl GpuDCRTPolyParams {
 
     pub fn gpu_ids(&self) -> &[i32] {
         &self.gpu_ids
-    }
-
-    pub fn batch(&self) -> u32 {
-        self.batch
     }
 
     pub(crate) fn ctx_raw(&self) -> *mut GpuContextOpaque {
@@ -595,7 +581,6 @@ pub struct GpuContext {
     pub moduli: Vec<u64>,
     pub gpu_ids: Vec<i32>,
     pub dnum: u32,
-    pub batch: u32,
 }
 
 /// # Safety
@@ -604,12 +589,12 @@ unsafe impl Send for GpuContext {}
 unsafe impl Sync for GpuContext {}
 
 impl GpuContext {
-    fn create(log_n: u32, moduli: &[u64], gpu_ids: &[i32], dnum: u32, batch: u32) -> Self {
+    fn create(log_n: u32, moduli: &[u64], gpu_ids: &[i32], dnum: u32) -> Self {
         info!(
             "{}",
             format!(
-                "Creating GPU context with log_n={}, moduli={:?}, gpu_ids={:?}, dnum={}, batch={}",
-                log_n, moduli, gpu_ids, dnum, batch
+                "Creating GPU context with log_n={}, moduli={:?}, gpu_ids={:?}, dnum={}",
+                log_n, moduli, gpu_ids, dnum
             )
         );
         let l = moduli.len().saturating_sub(1) as u32;
@@ -628,7 +613,6 @@ impl GpuContext {
                 moduli.len(),
                 gpu_ids_ptr,
                 gpu_ids_len,
-                batch,
                 &mut ctx_ptr as *mut *mut GpuContextOpaque,
             )
         };
@@ -639,7 +623,7 @@ impl GpuContext {
         check_status(status, "gpu_context_get_N");
         let n = if n_out > 0 { n_out as usize } else { 1usize << log_n };
 
-        Self { raw: ctx_ptr, n, moduli: moduli.to_vec(), gpu_ids: gpu_ids.to_vec(), dnum, batch }
+        Self { raw: ctx_ptr, n, moduli: moduli.to_vec(), gpu_ids: gpu_ids.to_vec(), dnum }
     }
 
     pub(crate) fn raw_ptr(&self) -> *mut GpuContextOpaque {
@@ -754,7 +738,7 @@ impl GpuDCRTPoly {
             return self.clone();
         }
         let mut tmp = self.clone();
-        tmp.inner.singleton_intt_in_place(self.params_ref().batch() as c_int);
+        tmp.inner.singleton_intt_in_place();
         tmp
     }
 
@@ -763,7 +747,7 @@ impl GpuDCRTPoly {
             return self.clone();
         }
         let mut tmp = self.clone();
-        tmp.inner.singleton_ntt_in_place(self.params_ref().batch() as c_int);
+        tmp.inner.singleton_ntt_in_place();
         tmp
     }
 
@@ -775,7 +759,7 @@ impl GpuDCRTPoly {
         if self.is_ntt() {
             return;
         }
-        self.inner.singleton_ntt_in_place(self.params_ref().batch() as c_int);
+        self.inner.singleton_ntt_in_place();
     }
 
     fn assert_compatible(&self, other: &Self) {

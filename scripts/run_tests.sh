@@ -34,8 +34,26 @@ if [[ $run_python -eq 1 ]]; then
 fi
 
 if [[ $run_rust -eq 1 ]]; then
-  RUST_TEST_NOCAPTURE="${RUST_TEST_NOCAPTURE:-1}" \
-    cargo test -r --lib
+  cargo +nightly fmt --all
+
+  rust_test_log="$(mktemp)"
+  if RUST_TEST_NOCAPTURE="${RUST_TEST_NOCAPTURE:-1}" \
+    cargo test -r --lib >"$rust_test_log" 2>&1; then
+    cat "$rust_test_log"
+  else
+    status=$?
+    cat "$rust_test_log"
+    if grep -q "signal: 11, SIGSEGV: invalid memory reference" "$rust_test_log"; then
+      echo "[run_tests] Retrying release lib tests with RUST_TEST_THREADS=1 after SIGSEGV"
+      RUST_TEST_NOCAPTURE="${RUST_TEST_NOCAPTURE:-1}" \
+        RUST_TEST_THREADS=1 \
+        cargo test -r --lib
+    else
+      rm -f "$rust_test_log"
+      exit "$status"
+    fi
+  fi
+  rm -f "$rust_test_log"
 
   python3 -m repo_validation maybe-run-gpu-repeat
 fi

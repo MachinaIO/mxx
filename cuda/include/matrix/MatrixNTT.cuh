@@ -6,8 +6,8 @@ typedef struct GpuMatrix GpuMatrix;
 extern "C" {
 #endif
 
-int gpu_matrix_ntt_all(GpuMatrix *mat, int batch);
-int gpu_matrix_intt_all(GpuMatrix *mat, int batch);
+int gpu_matrix_ntt_all(GpuMatrix *mat);
+int gpu_matrix_intt_all(GpuMatrix *mat);
 
 #ifdef __cplusplus
 }

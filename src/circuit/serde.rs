@@ -305,10 +305,10 @@ mod tests {
         let b = DCRTPoly::const_one(&params);
         let one = DCRTPoly::const_one(&params);
         let out1_inputs = vec![a.clone(), b.clone()];
-        let out1 = circuit.eval(&params, one, out1_inputs, None::<&PolyPltEvaluator>);
+        let out1 = circuit.eval(&params, one, out1_inputs, None::<&PolyPltEvaluator>, None);
         let one = DCRTPoly::const_one(&params);
         let out2_inputs = vec![a, b];
-        let out2 = roundtrip.eval(&params, one, out2_inputs, None::<&PolyPltEvaluator>);
+        let out2 = roundtrip.eval(&params, one, out2_inputs, None::<&PolyPltEvaluator>, None);
         assert_eq!(out1, out2);
     }
 }

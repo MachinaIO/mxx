@@ -9,6 +9,8 @@ from .atomic import atomic_write_text
 
 PLAN_APPROVAL_HEADING = "## Plan approval"
 PLAN_APPROVAL_VALUES = {"approved", "unapproved"}
+PLAN_PHASE_HEADING = "## Phase"
+PLAN_PHASE_VALUES = {"planning", "implementation", "review"}
 ORDERED_SUBTASKS_HEADING = "## Ordered subtasks"
 FOLLOW_UP_SUBTASKS_HEADING = "## Follow-up subtasks (append-only)"
 CHECKBOX_RE = re.compile(r"^\s*-\s\[(?P<mark>[ xX])\]\s+(?P<text>.+?)\s*$")
@@ -25,6 +27,7 @@ class CheckboxItem:
 @dataclass(frozen=True)
 class PlanAnalysis:
     approval_status: str | None
+    phase_status: str | None
     ordered_items: list[CheckboxItem]
     follow_up_items: list[CheckboxItem]
     missing_sections: list[str]
@@ -41,7 +44,9 @@ class PlanAnalysis:
 
     @property
     def phase(self) -> str:
-        return "implementation" if self.is_approved else "planning"
+        if self.phase_status is None:
+            raise ValueError("PlanAnalysis.phase requires a valid `## Phase` value.")
+        return self.phase_status
 
     @property
     def all_checked(self) -> bool:
@@ -61,14 +66,30 @@ def utc_now_rfc3339() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def render_session_plan(session_id: str, created_at: str | None = None, approval_status: str = "unapproved") -> str:
+def render_session_plan(
+    session_id: str,
+    created_at: str | None = None,
+    approval_status: str = "unapproved",
+    phase: str | None = None,
+) -> str:
     if approval_status not in PLAN_APPROVAL_VALUES:
         raise ValueError(f"approval_status must be one of {sorted(PLAN_APPROVAL_VALUES)}")
+    if phase is None:
+        phase = "planning" if approval_status == "unapproved" else "implementation"
+    if phase not in PLAN_PHASE_VALUES:
+        raise ValueError(f"phase must be one of {sorted(PLAN_PHASE_VALUES)}")
+    if approval_status == "unapproved" and phase != "planning":
+        raise ValueError("phase must be `planning` while approval_status is `unapproved`")
+    if approval_status == "approved" and phase == "planning":
+        raise ValueError("phase must be `implementation` or `review` while approval_status is `approved`")
     stamp = created_at or utc_now_rfc3339()
     return f"""# Session Plan: {session_id}
 
 {PLAN_APPROVAL_HEADING}
 {approval_status}
+
+{PLAN_PHASE_HEADING}
+{phase}
 
 ## Goal
 Describe the concrete user-visible outcome for this session.
@@ -80,13 +101,14 @@ Describe the concrete user-visible outcome for this session.
 
 ## Repo facts / assumptions
 - Each workflow hook invocation must provide `session_id` in its JSON payload.
-- The stop hook derives planning vs implementation from this plan's approval flag and mechanically checks markdown checkboxes in the required subtask sections.
+- The stop hook derives planning vs approved work from `## Plan approval` and derives the approved-work stage from `## Phase`.
 - The active plan path for this session is `plans/active/session-{session_id}.md`; accepted sessions are archived under `plans/completed/`.
 
 ## Acceptance criteria
 - The workflow harness uses repository-local Codex hooks.
 - Planning transitions to implementation only after plan approval.
-- Final completion requires the stop hook to block with actionable resume messages until all tracked checkboxes are checked, final tests pass, and the reviewer approves.
+- Implementation stops run only the selected final tests; review stops run the selected final tests and then the reviewer until acceptance.
+- Final completion requires the review-phase stop hook to block with actionable resume messages until all tracked checkboxes are checked, final tests pass, and the reviewer approves.
 
 {ORDERED_SUBTASKS_HEADING}
 - [ ] Replace this placeholder with the first approved implementation subtask.
@@ -98,7 +120,8 @@ Describe the concrete user-visible outcome for this session.
 - Record the test command and result immediately after each completed subtask.
 
 ## Final validation
-- Stop hook blocked with actionable resume messages until all tracked plan checkboxes were checked
+- Implementation-phase stop hook ran only the selected final tests
+- Review-phase stop hook blocked with actionable resume messages until all tracked plan checkboxes were checked, final tests passed, and the reviewer accepted
 - `scripts/run_tests.sh`
 - Hooks-disabled read-only reviewer via `codex exec` until acceptance
 
@@ -165,9 +188,37 @@ def _parse_plan_approval(lines: list[str], heading: str) -> tuple[str | None, li
     return value, missing_sections, invalid_sections
 
 
+def _parse_plan_phase(lines: list[str], heading: str) -> tuple[str | None, list[str], list[str]]:
+    bounds = _find_section_bounds(lines, heading)
+    missing_sections: list[str] = []
+    invalid_sections: list[str] = []
+    if bounds is None:
+        missing_sections.append(heading)
+        return None, missing_sections, invalid_sections
+    _, start, end = bounds
+    value: str | None = None
+    for line_no in range(start, end):
+        candidate = lines[line_no].strip()
+        if not candidate:
+            continue
+        value = candidate
+        break
+    if value not in PLAN_PHASE_VALUES:
+        invalid_sections.append(heading)
+        return None, missing_sections, invalid_sections
+    return value, missing_sections, invalid_sections
+
+
 def analyze_plan(plan_text: str) -> PlanAnalysis:
     lines = plan_text.splitlines()
     approval_status, missing_sections, invalid_sections = _parse_plan_approval(lines, PLAN_APPROVAL_HEADING)
+    phase_status, phase_missing_sections, phase_invalid_sections = _parse_plan_phase(lines, PLAN_PHASE_HEADING)
+    missing_sections.extend(phase_missing_sections)
+    invalid_sections.extend(phase_invalid_sections)
+    if approval_status == "unapproved" and phase_status != "planning":
+        invalid_sections.append(PLAN_PHASE_HEADING)
+    if approval_status == "approved" and phase_status == "planning":
+        invalid_sections.append(PLAN_PHASE_HEADING)
     ordered_bounds = _find_section_bounds(lines, ORDERED_SUBTASKS_HEADING)
     follow_up_bounds = _find_section_bounds(lines, FOLLOW_UP_SUBTASKS_HEADING)
     empty_sections: list[str] = []
@@ -192,6 +243,7 @@ def analyze_plan(plan_text: str) -> PlanAnalysis:
 
     return PlanAnalysis(
         approval_status=approval_status,
+        phase_status=phase_status,
         ordered_items=ordered_items,
         follow_up_items=follow_up_items,
         missing_sections=missing_sections,

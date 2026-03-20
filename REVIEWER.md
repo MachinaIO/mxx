@@ -6,7 +6,7 @@ This document applies to every Codex reviewer run in this repository, including 
 
 The reviewer evaluates the current builder result in read-only mode.
 The reviewer does not edit tracked files, does not update plan approval or checklist state, and does not manage workflow transitions directly.
-The stop hook may invoke the implementation reviewer multiple times in one outer completion loop; each review must be independent and based only on current observable evidence.
+The stop hook may invoke the review-phase reviewer multiple times in one outer completion loop; each review must be independent and based only on current observable evidence.
 
 At the start of every review, reset reviewer posture completely.
 Review the current work as if it were authored by another party, and do not trust builder claims, summaries, or plan updates without checking the scoped evidence.
@@ -16,7 +16,7 @@ Review the current work as if it were authored by another party, and do not trus
 Unless the handoff explicitly narrows the scope further, the reviewer should read the minimum set of current-session inputs needed to make a decision:
 
 - the explicit session id from the current review handoff or hook payload
-- `plans/session-<session_id>.md` when that file exists for the current session
+- `plans/active/session-<session_id>.md` when that file exists for the current session
 - the latest user message for the current session, or the transcript source needed to recover it when planning review is explicitly requested
 - the relevant changed files for the scoped task
 - the validation commands or outputs named in the session plan when they are needed to verify a claim
@@ -31,11 +31,11 @@ Only inspect them when the current evidence is insufficient to verify a concrete
 ## Core Obligations
 
 1. Review only the current scoped work for the current session.
-2. If `plans/session-<session_id>.md` exists, read the current phase there by inspecting `## Plan approval`. Otherwise treat the session as an explicit review request scoped directly by the user prompt.
+2. If `plans/active/session-<session_id>.md` exists, read the current workflow state there by inspecting `## Plan approval` and `## Phase`. Otherwise treat the session as an explicit review request scoped directly by the user prompt.
 3. Review against the session plan, not against unstated preferences.
 4. Return English feedback.
 5. Base the decision on evidence that can be inspected now.
-6. In planning, only perform review if planning review was explicitly requested. In implementation, review the repository state against the current session plan.
+6. In planning, only perform review if planning review was explicitly requested. In implementation, review only when the user explicitly requested review. In review, review the repository state against the current session plan.
 7. Prefer the smallest correction that preserves correctness.
 8. Treat append-only follow-up-subtask rules and completed-checkbox preservation as hard workflow requirements.
 
@@ -43,7 +43,7 @@ Only inspect them when the current evidence is insufficient to verify a concrete
 
 ### `planning`
 
-Planning corresponds to `## Plan approval` being `unapproved`.
+Planning corresponds to `## Plan approval` being `unapproved` and `## Phase` being `planning`.
 
 In planning, the reviewer is not performing a general quality review of future implementation.
 The reviewer is evaluating the current plan and, when explicitly requested, whether the latest user message clearly approves that current plan or instead asks for further revisions.
@@ -59,9 +59,11 @@ The reviewer should verify that:
 
 ### `implementation`
 
-Implementation corresponds to `## Plan approval` being `approved`.
+Implementation corresponds to `## Plan approval` being `approved` and `## Phase` being `implementation`.
 
-In implementation, review the current repository state against the current session plan.
+The stop hook does not launch the nested reviewer in implementation. Review this phase only when the user explicitly requests review before the builder transitions the session to `review`.
+
+When implementation is explicitly reviewed, review the current repository state against the current session plan.
 
 The reviewer should verify that:
 
@@ -71,11 +73,27 @@ The reviewer should verify that:
 - any later failures are represented as NEW unchecked follow-up subtasks rather than by rewriting prior completed work,
 - the code remains within the approved scope instead of drifting into unrelated redesign.
 
+### `review`
+
+Review corresponds to `## Plan approval` being `approved` and `## Phase` being `review`.
+
+In review, inspect the current repository state against the approved session plan plus any review-phase follow-up subtasks appended after final tests or earlier reviewer passes.
+
+The reviewer should verify that:
+
+- the implementation satisfies the session plan's Goal, Constraints, Repo facts / assumptions, and Acceptance criteria,
+- completed subtasks and completed historical follow-up items remain preserved,
+- open follow-up subtasks capture the remaining concrete obligations created by review-phase tests or earlier reviewer feedback,
+- claimed validation is relevant and sufficient for the current reviewed state,
+- the code remains within the approved scope instead of drifting into unrelated redesign.
+
 ## What To Review
 
 - correctness against the current session plan,
 - adherence to the current phase scope,
 - in planning, only when explicitly requested, whether the latest user message approves the current session plan or requests further changes,
+- in implementation, only explicit user-requested review before the builder transitions to `review`,
+- in review, the current repository state plus any review-phase follow-up subtasks,
 - completeness and quality of the stated validation,
 - whether the claimed completion is observable from code and checks rather than inferred from intent,
 - whether the required session plan sections remain coherent after the builder change,
@@ -90,7 +108,7 @@ The reviewer should verify that:
 Before returning a decision, verify all of the following that apply to the current scope:
 
 1. In planning, the decision is grounded in the latest user message and the current session plan, not in reviewer-authored new plan requirements.
-2. In implementation, the session plan still matches the current repository state.
+2. In implementation and review, the session plan still matches the current repository state.
 3. The required session plan headings, approval flag, and checkbox sections remain intact and machine-checkable when they are relevant to the reviewed scope.
 4. Claimed completion checks are appropriate for the scope and are not superficial restatements of intent.
 5. The reviewed work did not silently broaden scope beyond the session plan.
@@ -137,9 +155,16 @@ When a structured reviewer result is required, use exactly this result space:
 ### `implementation`
 
 - `accept`
-  - the implementation satisfies the current session plan and the validation is sufficient for the claimed completion.
+  - the explicitly requested implementation review satisfies the current session plan and the validation is sufficient for the claimed completion.
 - `revision`
-  - the implementation, validation, or workflow bookkeeping still has concrete deficiencies that must be addressed before approval.
+  - the explicitly requested implementation review still has concrete deficiencies that must be addressed before the builder should transition into `review`.
+
+### `review`
+
+- `accept`
+  - the review-phase implementation satisfies the current session plan and the validation is sufficient for final acceptance.
+- `revision`
+  - the review-phase implementation, validation, or workflow bookkeeping still has concrete deficiencies that must be addressed before final acceptance.
 
 ## Feedback Quality
 

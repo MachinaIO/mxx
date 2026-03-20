@@ -11,19 +11,10 @@ This repository provides implementations for lattice-cryptography operations (po
 - Rust formatting must use `cargo +nightly fmt --all`.
 
 ## Codex Workflow
-This repository uses a long-running Codex session workflow governed by `BUILDER.md` and `PLANS.md`.
+This repository uses the session-plan workflow defined in `BUILDER.md`, `PLANS.md`, and `REVIEWER.md`.
 
-Complex work must use a session-specific plan document at `plans/active/session-<session_id>.md`.
-
-The builder must discover the current session id from the explicit session handoff or hook payload, then open `plans/active/session-<session_id>.md` and inspect the `## Plan approval` flag before acting.
-
-If the task is an explicit review rather than builder execution, follow `REVIEWER.md`.
-Explicit review sessions do not create `plans/active/session-<session_id>.md`; the session-start hook classifies that intent from the initial user prompt, and the stop hook exits immediately when neither `plans/active/session-<session_id>.md` nor `plans/completed/session-<session_id>.md` exists.
-
-The builder behaves differently by plan approval status:
-- When `## Plan approval` is `unapproved`, stay in planning: interview the user, revise the session plan, and ask for explicit approval.
-- When `## Plan approval` is `approved`, execute the approved subtasks, run the most relevant tests after each subtask, and only then check the subtask off.
-
-Automated review is performed by a hooks-disabled nested read-only `codex exec`.
-During planning, the stop hook does no workflow work beyond allowing the stop.
-After the plan is marked `approved`, the stop hook reevaluates the current session plan on each stop. If the active plan is missing but a matching completed plan exists, it first moves that plan back into `plans/active/`. If unchecked implementation work remains, or if final tests / reviewer feedback append new follow-up tasks, it blocks the current turn with an actionable resume message. If all tracked checkboxes are already checked and the final tests plus reviewer both pass, it moves the session plan into `plans/completed/`, moves any session-specific files from `revision_logs/active/` into `revision_logs/completed/`, and then accepts.
+- Use `plans/active/session-<session_id>.md` for complex work.
+- Discover the current session id from the handoff or hook payload.
+- Treat `## Plan approval` and `## Phase` in the session plan as the workflow state.
+- Follow `BUILDER.md` for normal builder turns and `REVIEWER.md` for explicit review turns.
+- Keep the session plan in sync with the work; detailed phase transitions and hook behavior live in the documents above.

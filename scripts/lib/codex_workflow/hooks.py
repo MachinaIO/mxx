@@ -14,6 +14,7 @@ from .plan import (
     FOLLOW_UP_SUBTASKS_HEADING,
     ORDERED_SUBTASKS_HEADING,
     PLAN_APPROVAL_HEADING,
+    PLAN_PHASE_HEADING,
     analyze_plan,
     append_follow_up_subtasks_file,
     render_session_plan,
@@ -143,7 +144,7 @@ def _missing_plan_structure_message(
     detail_text = "; ".join(details)
     return (
         "The session plan is missing required machine-checkable structure. Restore "
-        f"`{PLAN_APPROVAL_HEADING}`, `{ORDERED_SUBTASKS_HEADING}`, and `{FOLLOW_UP_SUBTASKS_HEADING}`. "
+        f"`{PLAN_APPROVAL_HEADING}`, `{PLAN_PHASE_HEADING}`, `{ORDERED_SUBTASKS_HEADING}`, and `{FOLLOW_UP_SUBTASKS_HEADING}`. "
         f"Current issues: {detail_text}"
     )
 
@@ -166,6 +167,7 @@ def _raise_retry_limit_exceeded(kind: str, detail: str) -> None:
 class ImplementationCheckResult:
     status: str
     message: str
+    should_archive: bool = False
 
 
 @dataclass(frozen=True)
@@ -263,6 +265,36 @@ def _classify_session_start_intent(
     )
 
 
+def _run_selected_final_tests(
+    paths: RepoPaths,
+    plan_path: Path,
+    test_runner: FinalTestRunner,
+    edited_paths_provider: Callable[[Path], list[str] | None],
+) -> tuple[str, str | None]:
+    edited_paths = edited_paths_provider(paths.repo_root)
+    if edited_paths == []:
+        return "skipped-no-changes", None
+
+    test_selection = (
+        FinalTestSelection(run_python=True, run_rust=True)
+        if edited_paths is None
+        else _select_final_tests(edited_paths)
+    )
+    if not test_selection.requires_any:
+        return "skipped-selection", None
+
+    test_result = test_runner.run(
+        label="final-tests",
+        run_python=test_selection.run_python,
+        run_rust=test_selection.run_rust,
+    )
+    if not test_result.ok:
+        follow_up_items = _make_test_follow_ups(test_result.summary)
+        append_follow_up_subtasks_file(plan_path, follow_up_items)
+        return "failed", test_result.summary
+    return "passed", None
+
+
 def _evaluate_implementation_once(
     paths: RepoPaths,
     session_id: str,
@@ -304,36 +336,56 @@ def _evaluate_implementation_once(
             ),
         )
 
-    edited_paths = edited_paths_provider(paths.repo_root)
-    if edited_paths == []:
-        return ImplementationCheckResult(
-            status="accepted",
-            message="All subtasks are complete and no files changed, so final tests and reviewer checks were skipped.",
+    if analysis.phase == "implementation":
+        test_status, test_summary = _run_selected_final_tests(
+            paths=paths,
+            plan_path=plan_path,
+            test_runner=test_runner,
+            edited_paths_provider=edited_paths_provider,
         )
-
-    tests_were_run = False
-    test_selection = (
-        FinalTestSelection(run_python=True, run_rust=True)
-        if edited_paths is None
-        else _select_final_tests(edited_paths)
-    )
-    if test_selection.requires_any:
-        tests_were_run = True
-        test_result = test_runner.run(
-            label="final-tests",
-            run_python=test_selection.run_python,
-            run_rust=test_selection.run_rust,
-        )
-        if not test_result.ok:
-            follow_up_items = _make_test_follow_ups(test_result.summary)
-            append_follow_up_subtasks_file(plan_path, follow_up_items)
+        if test_status == "failed":
             return ImplementationCheckResult(
                 status="blocked",
                 message=(
                     "Final tests failed. New follow-up subtasks were appended to the session plan. "
-                    f"Address them first. Failure summary: {test_result.summary}"
+                    f"Address them first. Failure summary: {test_summary}"
                 ),
             )
+        if test_status == "passed":
+            return ImplementationCheckResult(
+                status="accepted",
+                message=(
+                    "All subtasks are complete and the selected final tests passed. "
+                    "Reviewer execution was skipped because the session phase is `implementation`."
+                ),
+            )
+        if test_status == "skipped-no-changes":
+            return ImplementationCheckResult(
+                status="accepted",
+                message="All subtasks are complete and no files changed, so selected final tests were skipped.",
+            )
+        return ImplementationCheckResult(
+            status="accepted",
+            message=(
+                "All subtasks are complete, selected final tests were skipped because no Python, Rust, Cargo.toml, "
+                "or cuda/ files changed, and reviewer execution was skipped because the session phase is `implementation`."
+            ),
+        )
+
+    test_status, test_summary = _run_selected_final_tests(
+        paths=paths,
+        plan_path=plan_path,
+        test_runner=test_runner,
+        edited_paths_provider=edited_paths_provider,
+    )
+    if test_status == "failed":
+        return ImplementationCheckResult(
+            status="blocked",
+            message=(
+                "Final tests failed. New follow-up subtasks were appended to the session plan. "
+                f"Address them first. Failure summary: {test_summary}"
+            ),
+        )
 
     review_result = _run_review_with_retry(
         paths=paths,
@@ -354,13 +406,25 @@ def _evaluate_implementation_once(
             ),
         )
 
+    if test_status == "passed":
+        return ImplementationCheckResult(
+            status="accepted",
+            message="All subtasks are complete, selected final tests passed, and reviewer approved.",
+            should_archive=True,
+        )
+    if test_status == "skipped-no-changes":
+        return ImplementationCheckResult(
+            status="accepted",
+            message="All subtasks are complete, no files changed so selected final tests were skipped, and reviewer approved.",
+            should_archive=True,
+        )
     return ImplementationCheckResult(
         status="accepted",
         message=(
-            "All subtasks are complete, final tests passed, and reviewer approved."
-            if tests_were_run
-            else "All subtasks are complete, final tests were skipped because no Python, Rust, Cargo.toml, or cuda/ files changed, and reviewer approved."
+            "All subtasks are complete, selected final tests were skipped because no Python, Rust, Cargo.toml, or "
+            "cuda/ files changed, and reviewer approved."
         ),
+        should_archive=True,
     )
 
 
@@ -388,10 +452,11 @@ def _run_implementation_loop(
     except RetryLimitExceeded as exc:
         return block_outcome(str(exc))
     if check_result.status == "accepted":
-        try:
-            _finalize_completed_session(paths, session_id)
-        except OSError as exc:
-            return block_outcome(f"Failed to archive completed workflow artifacts: {exc}")
+        if check_result.should_archive:
+            try:
+                _finalize_completed_session(paths, session_id)
+            except OSError as exc:
+                return block_outcome(f"Failed to archive completed workflow artifacts: {exc}")
         return stop_outcome(check_result.message)
     _log_progress(f"[stop hook] Additional implementation required. {check_result.message}")
     return block_outcome(check_result.message)
@@ -450,9 +515,17 @@ def handle_stop(
         return HookOutcome(exit_code=0)
     plan_display_path = str(plan_path.relative_to(paths.repo_root))
     analysis = analyze_plan(plan_path.read_text(encoding="utf-8"))
+    if analysis.missing_sections or analysis.invalid_sections:
+        return block_outcome(
+            _missing_plan_structure_message(
+                analysis.missing_sections,
+                analysis.invalid_sections,
+                analysis.empty_sections,
+            )
+        )
     if analysis.approval_status == "unapproved":
         return HookOutcome(exit_code=0)
-    if analysis.missing_sections or analysis.invalid_sections or analysis.empty_sections:
+    if analysis.empty_sections:
         return block_outcome(
             _missing_plan_structure_message(
                 analysis.missing_sections,

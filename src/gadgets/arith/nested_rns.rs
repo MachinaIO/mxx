@@ -1585,8 +1585,8 @@ mod tests {
         let b_value = &q_level_modulus - BigUint::from(3u64);
         let expected =
             ((&a_value % &q_level_modulus) * (&b_value % &q_level_modulus)) % &q_level_modulus;
-        let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, None);
-        let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, None);
+        let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, enable_levels);
+        let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, enable_levels);
         let plt_evaluator = PolyPltEvaluator::new();
         let one = DCRTPoly::const_one(&params);
         let eval_inputs = [a_inputs, b_inputs].concat();

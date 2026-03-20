@@ -9,12 +9,12 @@ This repository provides implementations for lattice-cryptography operations (po
 - Directories named `references` are read-only reference directories for humans and agents. Agents may read them when relevant and must never edit them.
 - Integration tests must not be run unless the user has explicitly asked for them in the current session. Prefer targeted unit tests or other narrow validation until such approval is given.
 - Rust formatting must use `cargo +nightly fmt --all`.
+- Follow a lifecycle defined in `BUILDER.md`.
 
 ## Codex Workflow
-This repository uses the session-plan workflow defined in `BUILDER.md`, `PLANS.md`, and `REVIEWER.md`.
-
-- Use `plans/active/session-<session_id>.md` for complex work.
+This repository uses a long-running Codex session workflow governed by `BUILDER.md`, `PLANS.md`, and `REVIEWER.md`.
+- Before starting any task or reading any other files, read `REVIEWER.md` for explicit review tasks and `BUILDER.md` for all other tasks.
+- Follow `PLAN.md` to create and update a plan document for each session.
 - Discover the current session id from the handoff or hook payload.
 - Treat `## Plan approval` and `## Phase` in the session plan as the workflow state.
-- Follow `BUILDER.md` for normal builder turns and `REVIEWER.md` for explicit review turns.
 - Keep the session plan in sync with the work; detailed phase transitions and hook behavior live in the documents above.

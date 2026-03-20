@@ -15,6 +15,7 @@ from codex_workflow.plan import (
     FOLLOW_UP_SUBTASKS_HEADING,
     ORDERED_SUBTASKS_HEADING,
     PLAN_APPROVAL_HEADING,
+    PLAN_PHASE_HEADING,
     analyze_plan,
     append_follow_up_subtasks,
     render_session_plan,
@@ -32,15 +33,21 @@ def build_plan_text(
     ordered_items: list[tuple[bool, str]],
     follow_up_items: list[tuple[bool, str]] | None = None,
     approval_status: str = "approved",
+    phase: str | None = None,
 ) -> str:
     if follow_up_items is None:
         follow_up_items = [(True, "No follow-up subtasks have been added yet.")]
+    if phase is None:
+        phase = "planning" if approval_status == "unapproved" else "implementation"
     ordered_block = "\n".join(f"- [{'x' if checked else ' '}] {text}" for checked, text in ordered_items)
     follow_up_block = "\n".join(f"- [{'x' if checked else ' '}] {text}" for checked, text in follow_up_items)
     return f"""# Session Plan: {session_id}
 
 {PLAN_APPROVAL_HEADING}
 {approval_status}
+
+{PLAN_PHASE_HEADING}
+{phase}
 
 ## Goal
 Goal
@@ -113,6 +120,7 @@ class WorkflowHarnessTests(unittest.TestCase):
         ordered_items: list[tuple[bool, str]] | None = None,
         follow_up_items: list[tuple[bool, str]] | None = None,
         approval_status: str = "approved",
+        phase: str | None = None,
     ) -> Path:
         if ordered_items is None:
             ordered_items = [(False, "Replace this placeholder with a real subtask.")]
@@ -124,6 +132,7 @@ class WorkflowHarnessTests(unittest.TestCase):
                 ordered_items=ordered_items,
                 follow_up_items=follow_up_items,
                 approval_status=approval_status,
+                phase=phase,
             ),
         )
         return plan_path
@@ -134,6 +143,7 @@ class WorkflowHarnessTests(unittest.TestCase):
         ordered_items: list[tuple[bool, str]] | None = None,
         follow_up_items: list[tuple[bool, str]] | None = None,
         approval_status: str = "approved",
+        phase: str | None = None,
     ) -> Path:
         if ordered_items is None:
             ordered_items = [(False, "Replace this placeholder with a real subtask.")]
@@ -145,6 +155,7 @@ class WorkflowHarnessTests(unittest.TestCase):
                 ordered_items=ordered_items,
                 follow_up_items=follow_up_items,
                 approval_status=approval_status,
+                phase=phase,
             ),
         )
         return plan_path
@@ -162,6 +173,7 @@ class WorkflowHarnessTests(unittest.TestCase):
         self.assertTrue(plan_path.exists())
         analysis = analyze_plan(plan_path.read_text(encoding="utf-8"))
         self.assertEqual(analysis.approval_status, "unapproved")
+        self.assertEqual(analysis.phase, "planning")
         self.assertFalse((self.paths.agents_dir / "current-session-id").exists())
         self.assertEqual(list(self.paths.agents_dir.glob("session-abc123.json")), [])
         self.assertEqual(len(exec_runner.calls), 1)
@@ -394,7 +406,20 @@ class WorkflowHarnessTests(unittest.TestCase):
         self.assertIn("empty", outcome.stderr_message)
         self.assertIn(ORDERED_SUBTASKS_HEADING, outcome.stderr_message)
 
-    def test_approved_plan_enters_implementation_loop(self) -> None:
+    def test_stop_blocks_when_phase_is_incompatible_with_approval(self) -> None:
+        self.write_plan(
+            session_id="invalid-phase",
+            ordered_items=[(True, "Approved work already completed.")],
+            approval_status="approved",
+            phase="planning",
+        )
+
+        outcome = handle_stop({"session_id": "invalid-phase"}, self.repo_root)
+
+        self.assertEqual(outcome.exit_code, 2)
+        self.assertIn(PLAN_PHASE_HEADING, outcome.stderr_message)
+
+    def test_implementation_phase_runs_selected_tests_without_reviewer_or_archiving(self) -> None:
         self.write_plan(
             session_id="approved-loop",
             ordered_items=[(True, "Approved work already completed.")],
@@ -416,11 +441,13 @@ class WorkflowHarnessTests(unittest.TestCase):
             outcome.stdout_payload,
             {
                 "continue": False,
-                "stopReason": "All subtasks are complete, final tests passed, and reviewer approved.",
+                "stopReason": "All subtasks are complete and the selected final tests passed. Reviewer execution was skipped because the session phase is `implementation`.",
             },
         )
         self.assertEqual(test_runner.calls, [("final-tests", True, True)])
-        self.assertEqual(len(exec_runner.calls), 1)
+        self.assertEqual(exec_runner.calls, [])
+        self.assertTrue(self.paths.active_plan_path("approved-loop").exists())
+        self.assertFalse(self.paths.completed_plan_path("approved-loop").exists())
 
     def test_stop_blocks_when_unchecked_ordered_subtask_remains(self) -> None:
         self.write_plan(
@@ -496,11 +523,12 @@ class WorkflowHarnessTests(unittest.TestCase):
         self.assertIn("- [x] Implement everything.", plan_text)
         self.assertEqual(test_runner.calls, [("final-tests", True, True)])
 
-    def test_reviewer_revision_appends_follow_up_and_blocks(self) -> None:
+    def test_review_phase_reviewer_revision_appends_follow_up_and_blocks(self) -> None:
         plan_path = self.write_plan(
             session_id="review-revision",
             ordered_items=[(True, "Implement everything.")],
             approval_status="approved",
+            phase="review",
         )
         test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
         exec_runner = FakeExecRunner(
@@ -520,11 +548,12 @@ class WorkflowHarnessTests(unittest.TestCase):
         plan_text = plan_path.read_text(encoding="utf-8")
         self.assertIn("Address reviewer feedback from the final read-only Codex review", plan_text)
 
-    def test_complete_plan_is_evaluated_before_builder_launch(self) -> None:
+    def test_review_phase_runs_tests_and_reviewer_before_archiving(self) -> None:
         self.write_plan(
             session_id="precheck-complete",
             ordered_items=[(True, "Implement everything.")],
             approval_status="approved",
+            phase="review",
         )
         test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
         exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="accept", msg=None))
@@ -548,6 +577,7 @@ class WorkflowHarnessTests(unittest.TestCase):
             session_id="archive-logs",
             ordered_items=[(True, "Implement everything.")],
             approval_status="approved",
+            phase="review",
         )
         active_stdout = self.paths.active_revision_logs_dir / "archive-logs-final-review-1.stdout.log"
         active_stderr = self.paths.active_revision_logs_dir / "archive-logs-final-review-1.stderr.log"
@@ -597,7 +627,7 @@ class WorkflowHarnessTests(unittest.TestCase):
         self.assertTrue(active_stdout.exists())
         self.assertFalse((self.paths.completed_revision_logs_dir / active_stdout.name).exists())
 
-    def test_complete_plan_skips_final_tests_and_review_when_no_files_changed(self) -> None:
+    def test_implementation_phase_skips_tests_and_reviewer_when_no_files_changed(self) -> None:
         self.write_plan(
             session_id="no-file-changes",
             ordered_items=[(True, "Implement everything.")],
@@ -620,17 +650,18 @@ class WorkflowHarnessTests(unittest.TestCase):
             outcome.stdout_payload,
             {
                 "continue": False,
-                "stopReason": "All subtasks are complete and no files changed, so final tests and reviewer checks were skipped.",
+                "stopReason": "All subtasks are complete and no files changed, so selected final tests were skipped.",
             },
         )
         self.assertEqual(test_runner.calls, [])
         self.assertEqual(exec_runner.calls, [])
 
-    def test_complete_plan_skips_final_tests_for_non_python_non_rust_non_cuda_changes(self) -> None:
+    def test_review_phase_skips_tests_but_still_runs_reviewer_for_non_selected_changes(self) -> None:
         self.write_plan(
             session_id="docs-only-changes",
             ordered_items=[(True, "Implement everything.")],
             approval_status="approved",
+            phase="review",
         )
         test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
         exec_runner = FakeExecRunner(StructuredExecResult(ok=True, result="accept", msg=None))
@@ -649,7 +680,7 @@ class WorkflowHarnessTests(unittest.TestCase):
             outcome.stdout_payload,
             {
                 "continue": False,
-                "stopReason": "All subtasks are complete, final tests were skipped because no Python, Rust, Cargo.toml, or cuda/ files changed, and reviewer approved.",
+                "stopReason": "All subtasks are complete, selected final tests were skipped because no Python, Rust, Cargo.toml, or cuda/ files changed, and reviewer approved.",
             },
         )
         self.assertEqual(test_runner.calls, [])
@@ -675,7 +706,7 @@ class WorkflowHarnessTests(unittest.TestCase):
 
         self.assertEqual(outcome.exit_code, 0)
         self.assertEqual(test_runner.calls, [("final-tests", False, True)])
-        self.assertEqual(len(exec_runner.calls), 1)
+        self.assertEqual(exec_runner.calls, [])
 
     def test_complete_plan_runs_final_tests_when_rust_file_changed(self) -> None:
         self.write_plan(
@@ -697,7 +728,7 @@ class WorkflowHarnessTests(unittest.TestCase):
 
         self.assertEqual(outcome.exit_code, 0)
         self.assertEqual(test_runner.calls, [("final-tests", False, True)])
-        self.assertEqual(len(exec_runner.calls), 1)
+        self.assertEqual(exec_runner.calls, [])
 
     def test_complete_plan_runs_only_python_tests_when_python_file_changed(self) -> None:
         self.write_plan(
@@ -719,7 +750,7 @@ class WorkflowHarnessTests(unittest.TestCase):
 
         self.assertEqual(outcome.exit_code, 0)
         self.assertEqual(test_runner.calls, [("final-tests", True, False)])
-        self.assertEqual(len(exec_runner.calls), 1)
+        self.assertEqual(exec_runner.calls, [])
 
     def test_complete_plan_runs_python_and_rust_tests_for_mixed_changes(self) -> None:
         self.write_plan(
@@ -741,7 +772,7 @@ class WorkflowHarnessTests(unittest.TestCase):
 
         self.assertEqual(outcome.exit_code, 0)
         self.assertEqual(test_runner.calls, [("final-tests", True, True)])
-        self.assertEqual(len(exec_runner.calls), 1)
+        self.assertEqual(exec_runner.calls, [])
 
     def test_shell_final_test_runner_uses_python_only_flag(self) -> None:
         runner = ShellFinalTestRunner(self.paths, "python-only")
@@ -778,6 +809,7 @@ class WorkflowHarnessTests(unittest.TestCase):
             session_id="review-retry",
             ordered_items=[(True, "Implement everything.")],
             approval_status="approved",
+            phase="review",
         )
         sleep_calls: list[float] = []
         test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
@@ -803,6 +835,7 @@ class WorkflowHarnessTests(unittest.TestCase):
             session_id="review-retry-limit",
             ordered_items=[(True, "Implement everything.")],
             approval_status="approved",
+            phase="review",
         )
         sleep_calls: list[float] = []
         test_runner = FakeTestRunner(FinalTestResult(ok=True, summary="ok", returncode=0))
@@ -927,6 +960,7 @@ class WorkflowHarnessTests(unittest.TestCase):
 
         self.assertFalse(analysis.all_checked)
         self.assertEqual(analysis.approval_status, "unapproved")
+        self.assertEqual(analysis.phase_status, "planning")
         self.assertFalse(analysis.is_approved)
         self.assertEqual(analysis.phase, "planning")
         self.assertEqual(analysis.missing_sections, [])
@@ -944,8 +978,37 @@ class WorkflowHarnessTests(unittest.TestCase):
         )
 
         self.assertEqual(analysis.approval_status, "approved")
+        self.assertEqual(analysis.phase_status, "implementation")
         self.assertTrue(analysis.is_approved)
         self.assertEqual(analysis.phase, "implementation")
+
+    def test_plan_analysis_preserves_explicit_review_phase(self) -> None:
+        analysis = analyze_plan(
+            build_plan_text(
+                "review-analysis",
+                ordered_items=[(True, "Done ordered work.")],
+                approval_status="approved",
+                phase="review",
+            )
+        )
+
+        self.assertEqual(analysis.approval_status, "approved")
+        self.assertEqual(analysis.phase_status, "review")
+        self.assertEqual(analysis.phase, "review")
+
+    def test_plan_analysis_keeps_backward_compatibility_for_legacy_plans_without_phase(self) -> None:
+        legacy_plan = build_plan_text(
+            "legacy-analysis",
+            ordered_items=[(True, "Done ordered work.")],
+            approval_status="approved",
+        ).replace(f"\n{PLAN_PHASE_HEADING}\nimplementation\n", "", 1)
+
+        analysis = analyze_plan(legacy_plan)
+
+        self.assertEqual(analysis.approval_status, "approved")
+        self.assertIsNone(analysis.phase_status)
+        self.assertEqual(analysis.phase, "implementation")
+        self.assertEqual(analysis.invalid_sections, [])
 
 
 if __name__ == "__main__":

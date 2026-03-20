@@ -12,8 +12,6 @@
 //! - `num_slots` must be a power of two
 //! - `num_slots` must not exceed `params.ring_dimension()`
 
-use std::sync::Arc;
-
 use crate::{
     circuit::PolyCircuit,
     gadgets::arith::NestedRnsPoly,
@@ -276,16 +274,24 @@ fn apply_stage<P: Poly>(
     alpha_cur.add_full_reduce(&beta_partner, circuit)
 }
 
-fn build_uniform_scale_residues(
-    q_moduli: &[u64],
-    num_slots: usize,
-    scale_by_q: &[u64],
-) -> Vec<Vec<u64>> {
-    q_moduli
-        .par_iter()
-        .zip(scale_by_q.par_iter())
-        .map(|(_, &scale)| vec![scale; num_slots])
-        .collect()
+fn multiply_by_tower_constants<P: Poly>(
+    circuit: &mut PolyCircuit<P>,
+    input: &NestedRnsPoly<P>,
+    residues_by_q: &[Vec<u64>],
+) -> NestedRnsPoly<P> {
+    let tower_constants = residues_by_q
+        .iter()
+        .map(|row| {
+            let (&first, rest) =
+                row.split_first().expect("tower constants must contain at least one slot");
+            assert!(
+                rest.iter().all(|&value| value == first),
+                "multiply_by_tower_constants requires slot-uniform tower constants"
+            );
+            first
+        })
+        .collect::<Vec<_>>();
+    input.const_mul_full_reduce(&tower_constants, circuit)
 }
 
 pub fn forward_ntt<P: Poly>(
@@ -339,20 +345,17 @@ pub fn inverse_ntt<P: Poly>(
             mod_inverse(num_slots as u64, q_i).expect("num_slots must be invertible modulo q_i")
         })
         .collect::<Vec<_>>();
-    let scale = NestedRnsPoly::constant_from_tower_slot_residues(
-        Arc::clone(&current.ctx),
-        current.enable_levels,
-        params,
-        &build_uniform_scale_residues(&q_moduli, num_slots, &n_inverse_by_q),
-        circuit,
-    );
-    let scaled = scale.mul_full_reduce(&current, circuit);
+    let scale_residues_by_q =
+        n_inverse_by_q.par_iter().map(|&scale| vec![scale; num_slots]).collect::<Vec<_>>();
+    let scaled = multiply_by_tower_constants(circuit, &current, &scale_residues_by_q);
     scaled.slot_transfer(&bit_reverse_permutation(num_slots), circuit)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use crate::{
         __PAIR, __TestState,
         circuit::{PolyCircuit, PolyGateKind, evaluable::PolyVec},

@@ -868,7 +868,11 @@ impl<P: Poly> NestedRnsPoly<P> {
         Self::new(ctx, inner, enable_levels)
     }
 
-    pub fn slot_transfer(&self, src_slots: &[u32], circuit: &mut PolyCircuit<P>) -> Self {
+    pub fn slot_transfer(
+        &self,
+        src_slots: &[(u32, Option<u32>)],
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
         let inner = self
             .inner
             .iter()

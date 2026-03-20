@@ -441,7 +441,11 @@ impl<P: Poly> PolyCircuit<P> {
         self.new_gate_generic(vec![input], PolyGateType::PubLut { lut_id })
     }
 
-    pub fn slot_transfer_gate(&mut self, input: GateId, src_slots: &[u32]) -> GateId {
+    pub fn slot_transfer_gate(
+        &mut self,
+        input: GateId,
+        src_slots: &[(u32, Option<u32>)],
+    ) -> GateId {
         self.new_gate_generic(
             vec![input],
             PolyGateType::SlotTransfer { src_slots: src_slots.to_vec() },
@@ -2077,7 +2081,7 @@ mod tests {
     fn test_non_free_depth_counts_slot_transfer_as_non_free() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let inputs = circuit.input(1);
-        let transferred = circuit.slot_transfer_gate(inputs[0], &[0]);
+        let transferred = circuit.slot_transfer_gate(inputs[0], &[(0, None)]);
         circuit.output(vec![transferred]);
 
         assert_eq!(circuit.non_free_depth(), 1);

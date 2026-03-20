@@ -47,7 +47,7 @@ pub enum PolyGateType {
     Mul,
     SmallScalarMul { scalar: Vec<u32> },
     LargeScalarMul { scalar: Vec<BigUint> },
-    SlotTransfer { src_slots: Vec<u32> },
+    SlotTransfer { src_slots: Vec<(u32, Option<u32>)> },
     PubLut { lut_id: usize },
     SubCircuitOutput { call_id: usize, output_idx: usize, num_inputs: usize },
 }

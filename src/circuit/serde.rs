@@ -15,7 +15,7 @@ pub enum SerializablePolyGateType {
     Input,
     SmallScalarMul { scalar: Vec<u32> },
     LargeScalarMul { scalar: Vec<BigUint> },
-    SlotTransfer { src_slots: Vec<u32> },
+    SlotTransfer { src_slots: Vec<(u32, Option<u32>)> },
     Add,
     Sub,
     Mul,
@@ -320,7 +320,7 @@ mod tests {
     fn test_serialization_roundtrip_with_slot_transfer_gate() {
         let mut circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
         let inputs = circuit.input(1);
-        let transferred = circuit.slot_transfer_gate(inputs[0], &[1, 0, 1]);
+        let transferred = circuit.slot_transfer_gate(inputs[0], &[(1, None), (0, None), (1, None)]);
         circuit.output(vec![transferred]);
 
         let serializable = SerializablePolyCircuit::from_circuit(circuit.clone());

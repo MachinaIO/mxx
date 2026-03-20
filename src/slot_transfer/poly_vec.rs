@@ -1,5 +1,8 @@
 use crate::{
-    circuit::{evaluable::PolyVec, gate::GateId},
+    circuit::{
+        evaluable::{Evaluable, PolyVec},
+        gate::GateId,
+    },
     poly::{
         PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
@@ -28,7 +31,7 @@ impl SlotTransferEvaluator<PolyVec<DCRTPoly>> for PolyVecSlotTransferEvaluator {
         &self,
         params: &DCRTPolyParams,
         input: &PolyVec<DCRTPoly>,
-        src_slots: &[u32],
+        src_slots: &[(u32, Option<u32>)],
         _gate_id: GateId,
     ) -> PolyVec<DCRTPoly> {
         let num_slots = src_slots.len();
@@ -41,13 +44,16 @@ impl SlotTransferEvaluator<PolyVec<DCRTPoly>> for PolyVecSlotTransferEvaluator {
         PolyVec::new(
             src_slots
                 .par_iter()
-                .map(|src_slot| {
+                .map(|(src_slot, scalar)| {
                     let src_slot = *src_slot as usize;
-                    input
+                    let selected = input
                         .as_slice()
                         .get(src_slot)
-                        .unwrap_or_else(|| panic!("source slot {} out of range", src_slot))
-                        .clone()
+                        .unwrap_or_else(|| panic!("source slot {} out of range", src_slot));
+                    match scalar {
+                        Some(scalar) => selected.small_scalar_mul(params, &[*scalar]),
+                        None => selected.clone(),
+                    }
                 })
                 .collect(),
         )
@@ -88,7 +94,7 @@ mod tests {
 
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let inputs = circuit.input(1);
-        let transferred = circuit.slot_transfer_gate(inputs[0], &[2, 0, 1]);
+        let transferred = circuit.slot_transfer_gate(inputs[0], &[(2, None), (0, None), (1, None)]);
         circuit.output(vec![transferred]);
         let expected = vec![
             input.as_slice()[2].clone(),
@@ -128,7 +134,10 @@ mod tests {
 
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let inputs = circuit.input(1);
-        let transferred = circuit.slot_transfer_gate(inputs[0], &[5, 4, 3, 2, 1, 0]);
+        let transferred = circuit.slot_transfer_gate(
+            inputs[0],
+            &[(5, None), (4, None), (3, None), (2, None), (1, None), (0, None)],
+        );
         circuit.output(vec![transferred]);
 
         let slot_transfer_evaluator = PolyVecSlotTransferEvaluator::new();
@@ -141,5 +150,40 @@ mod tests {
             None,
         );
         let _ = result;
+    }
+
+    #[test]
+    fn slot_transfer_evaluator_applies_optional_small_scalars() {
+        let params = DCRTPolyParams::new(8, 2, 17, 1);
+        let input = PolyVec::new(vec![
+            basis_slot_poly(&params, 3, 0, 3),
+            basis_slot_poly(&params, 3, 1, 5),
+            basis_slot_poly(&params, 3, 2, 7),
+        ]);
+        let one = PolyVec::new(vec![DCRTPoly::const_one(&params); 3]);
+
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let inputs = circuit.input(1);
+        let transferred =
+            circuit.slot_transfer_gate(inputs[0], &[(2, Some(4)), (0, None), (1, Some(3))]);
+        circuit.output(vec![transferred]);
+        let expected = vec![
+            input.as_slice()[2].small_scalar_mul(&params, &[4]),
+            input.as_slice()[0].clone(),
+            input.as_slice()[1].small_scalar_mul(&params, &[3]),
+        ];
+
+        let slot_transfer_evaluator = PolyVecSlotTransferEvaluator::new();
+        let result = circuit.eval(
+            &params,
+            one,
+            vec![input],
+            None::<&PolyVecPltEvaluator>,
+            Some(&slot_transfer_evaluator),
+            None,
+        );
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].as_slice(), expected.as_slice());
     }
 }

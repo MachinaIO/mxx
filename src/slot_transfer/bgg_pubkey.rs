@@ -28,7 +28,7 @@ pub(crate) struct SlotAuxSample<M: PolyMatrix> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BggPublicKeySTGateState {
     pub input_pubkey_bytes: Vec<u8>,
-    pub src_slots: Vec<u32>,
+    pub src_slots: Vec<(u32, Option<u32>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -268,7 +268,7 @@ where
         slot_a_bytes_by_slot: &[Vec<u8>],
         gate_id: GateId,
         state: &BggPublicKeySTGateState,
-        slot_chunk: &[(usize, u32)],
+        slot_chunk: &[(usize, (u32, Option<u32>))],
     ) -> Vec<(usize, M)> {
         let m_g = self.secret_size * params.modulus_digits();
         let trap_sampler = TS::new(params, self.trapdoor_sigma);
@@ -284,7 +284,7 @@ where
         slot_chunk
             .par_iter()
             .copied()
-            .map(|(dst_slot, src_slot_u32)| {
+            .map(|(dst_slot, (src_slot_u32, scalar))| {
                 let src_slot =
                     usize::try_from(src_slot_u32).expect("source slot index must fit in usize");
                 assert!(
@@ -297,7 +297,13 @@ where
                 let s_i = M::from_compact_bytes(params, slot_secret_mats[src_slot].as_ref());
                 let a_j = M::from_compact_bytes(params, slot_a_bytes_by_slot[dst_slot].as_ref());
                 let lhs = s_j * &a_out;
-                let rhs = (s_i * &a_in) * a_j.decompose();
+                let rhs = match scalar {
+                    Some(scalar) => {
+                        let scalar_poly = M::P::from_usize_to_constant(params, scalar as usize);
+                        ((s_i * &a_in) * a_j.decompose()) * scalar_poly
+                    }
+                    None => (s_i * &a_in) * a_j.decompose(),
+                };
                 let mut target = lhs - rhs;
                 target.add_in_place(&self.sample_error_matrix(params, self.secret_size, m_g));
                 let preimage = trap_sampler.preimage(params, b0_trapdoor, b0_matrix, &target);
@@ -466,7 +472,7 @@ where
                 let selected_slot_indices = {
                     let mut indices = sampled_chunk
                         .iter()
-                        .flat_map(|(dst_slot, src_slot_u32)| {
+                        .flat_map(|(dst_slot, (src_slot_u32, _))| {
                             let src_slot = usize::try_from(*src_slot_u32)
                                 .expect("source slot index must fit in usize");
                             [*dst_slot, src_slot]
@@ -541,7 +547,7 @@ where
         &self,
         params: &<M::P as Poly>::Params,
         input: &BggPublicKey<M>,
-        src_slots: &[u32],
+        src_slots: &[(u32, Option<u32>)],
         gate_id: GateId,
     ) -> BggPublicKey<M> {
         assert_eq!(
@@ -596,7 +602,7 @@ mod tests {
         circuit::PolyCircuit,
         lookup::{PltEvaluator, PublicLut},
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
-        poly::{PolyParams, dcrt::params::DCRTPolyParams},
+        poly::{Poly, PolyParams, dcrt::params::DCRTPolyParams},
         sampler::{
             DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler,
             hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
@@ -660,7 +666,8 @@ mod tests {
 
         let mut circuit = PolyCircuit::new();
         let inputs = circuit.input(1);
-        let transferred = circuit.slot_transfer_gate(inputs[0], &[1, 0]);
+        let src_slots = [(1, None), (0, Some(3))];
+        let transferred = circuit.slot_transfer_gate(inputs[0], &src_slots);
         circuit.output(vec![transferred]);
 
         let evaluator =
@@ -694,7 +701,7 @@ mod tests {
 
         let stored = evaluator.gate_state(transferred).expect("missing stored gate state");
         assert_eq!(stored.input_pubkey_bytes, input_pubkey.matrix.to_compact_bytes());
-        assert_eq!(stored.src_slots, vec![1, 0]);
+        assert_eq!(stored.src_slots, src_slots);
     }
 
     #[test]
@@ -731,7 +738,7 @@ mod tests {
             &evaluator,
             &params,
             &input_pubkey,
-            &[0],
+            &[(0, None)],
             crate::circuit::gate::GateId(9),
         );
     }
@@ -779,7 +786,8 @@ mod tests {
 
         let mut circuit = PolyCircuit::new();
         let inputs = circuit.input(1);
-        let transferred = circuit.slot_transfer_gate(inputs[0], &[1, 0]);
+        let src_slots = [(1, None), (0, Some(3))];
+        let transferred = circuit.slot_transfer_gate(inputs[0], &src_slots);
         circuit.output(vec![transferred]);
 
         let evaluator =
@@ -877,7 +885,8 @@ mod tests {
             DistType::FinRingDist,
         );
 
-        for (dst_slot, src_slot) in [1usize, 0usize].into_iter().enumerate() {
+        for (dst_slot, (src_slot, scalar)) in src_slots.into_iter().enumerate() {
+            let src_slot = src_slot as usize;
             let s_j =
                 DCRTPolyMatrix::from_compact_bytes(&params, slot_secret_mats[dst_slot].as_ref());
             let s_i =
@@ -898,7 +907,17 @@ mod tests {
             )
             .expect("gate preimage checkpoint should exist");
 
-            let expected_target = s_j * &a_out - (s_i * &input_pubkey.matrix) * a_j.decompose();
+            let rhs = match scalar {
+                Some(scalar) => {
+                    let scalar_poly = <DCRTPolyMatrix as PolyMatrix>::P::from_usize_to_constant(
+                        &params,
+                        scalar as usize,
+                    );
+                    ((s_i * &input_pubkey.matrix) * a_j.decompose()) * scalar_poly
+                }
+                None => (s_i * &input_pubkey.matrix) * a_j.decompose(),
+            };
+            let expected_target = s_j * &a_out - rhs;
             assert_eq!(b0_matrix.clone() * &gate_preimage, expected_target);
         }
     }

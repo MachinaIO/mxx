@@ -273,7 +273,7 @@ where
         selected_slot_indices: &[usize],
         gate_id: GateId,
         state: &BggPublicKeySTGateState,
-        slot_chunk: &[(usize, u32)],
+        slot_chunk: &[(usize, (u32, Option<u32>))],
     ) -> Vec<(usize, M)> {
         let trap_sampler = TS::new(&shared_by_device[0].params, self.trapdoor_sigma);
         let selected_slot_positions = selected_slot_indices
@@ -286,7 +286,7 @@ where
             .par_iter()
             .copied()
             .enumerate()
-            .map(|(batch_pos, (dst_slot, src_slot_u32))| {
+            .map(|(batch_pos, (dst_slot, (src_slot_u32, scalar)))| {
                 let device_idx = sharded_batch_device_idx(shared_by_device.len(), 0, batch_pos);
                 let shared = &shared_by_device[device_idx];
                 let m_g = self.secret_size * shared.params.modulus_digits();
@@ -317,7 +317,14 @@ where
                 let s_i = &slot_secret_mats_by_device[device_idx][src_local_idx];
                 let a_j = &slot_a_mats_by_device[device_idx][dst_local_idx];
                 let lhs = s_j.clone() * &a_out;
-                let rhs = (s_i.clone() * &a_in) * a_j.decompose();
+                let rhs = match scalar {
+                    Some(scalar) => {
+                        let scalar_poly =
+                            M::P::from_usize_to_constant(&shared.params, scalar as usize);
+                        ((s_i.clone() * &a_in) * a_j.decompose()) * scalar_poly
+                    }
+                    None => (s_i.clone() * &a_in) * a_j.decompose(),
+                };
                 let mut target = lhs - rhs;
                 target.add_in_place(&self.sample_error_matrix(
                     &shared.params,
@@ -379,7 +386,7 @@ mod tests {
             gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
             trapdoor::GpuDCRTPolyTrapdoorSampler,
         },
-        slot_transfer::BggPublicKeySTEvaluator,
+        slot_transfer::bgg_pubkey::BggPublicKeySTEvaluator,
         storage::{
             read::read_matrix_from_multi_batch,
             write::{init_storage_system, storage_test_lock, wait_for_all_writes},
@@ -442,7 +449,7 @@ mod tests {
         let params = single_gpu_params();
         let hash_key = [0x73u8; 32];
         let num_inputs = 3usize;
-        let src_slots = [1, 0];
+        let src_slots = [(1, None), (0, Some(3))];
         let m_g = 2 * params.modulus_digits();
         let one = BggPublicKey::new(
             GpuDCRTPolyHashSampler::<Keccak256>::new().sample_hash(
@@ -566,7 +573,8 @@ mod tests {
 
             let mut circuit = PolyCircuit::new();
             let inputs = circuit.input(1);
-            let transferred = circuit.slot_transfer_gate(inputs[0], &[1, 0]);
+            let src_slots = [(1, None), (0, Some(3))];
+            let transferred = circuit.slot_transfer_gate(inputs[0], &src_slots);
             circuit.output(vec![transferred]);
 
             let evaluator = BggPublicKeySTEvaluator::<
@@ -671,7 +679,8 @@ mod tests {
                 DistType::FinRingDist,
             );
 
-            for (dst_slot, src_slot) in [1usize, 0usize].into_iter().enumerate() {
+            for (dst_slot, (src_slot, scalar)) in src_slots.into_iter().enumerate() {
+                let src_slot = src_slot as usize;
                 let s_j = GpuDCRTPolyMatrix::from_compact_bytes(
                     &params,
                     slot_secret_mats[dst_slot].as_ref(),
@@ -696,7 +705,18 @@ mod tests {
                 )
                 .expect("gpu gate preimage checkpoint should exist");
 
-                let expected_target = s_j * &a_out - (s_i * &input_pubkey.matrix) * a_j.decompose();
+                let rhs = match scalar {
+                    Some(scalar) => {
+                        let scalar_poly =
+                            <GpuDCRTPolyMatrix as PolyMatrix>::P::from_usize_to_constant(
+                                &params,
+                                scalar as usize,
+                            );
+                        ((s_i * &input_pubkey.matrix) * a_j.decompose()) * scalar_poly
+                    }
+                    None => (s_i * &input_pubkey.matrix) * a_j.decompose(),
+                };
+                let expected_target = s_j * &a_out - rhs;
                 assert_eq!(b0_matrix.clone() * &gate_preimage, expected_target);
             }
 

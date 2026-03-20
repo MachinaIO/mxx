@@ -144,7 +144,7 @@ def _missing_plan_structure_message(
     detail_text = "; ".join(details)
     return (
         "The session plan is missing required machine-checkable structure. Restore "
-        f"`{PLAN_APPROVAL_HEADING}`, `{PLAN_PHASE_HEADING}` when present, `{ORDERED_SUBTASKS_HEADING}`, and `{FOLLOW_UP_SUBTASKS_HEADING}`. "
+        f"`{PLAN_APPROVAL_HEADING}`, `{PLAN_PHASE_HEADING}`, `{ORDERED_SUBTASKS_HEADING}`, and `{FOLLOW_UP_SUBTASKS_HEADING}`. "
         f"Current issues: {detail_text}"
     )
 
@@ -515,9 +515,17 @@ def handle_stop(
         return HookOutcome(exit_code=0)
     plan_display_path = str(plan_path.relative_to(paths.repo_root))
     analysis = analyze_plan(plan_path.read_text(encoding="utf-8"))
+    if analysis.missing_sections or analysis.invalid_sections:
+        return block_outcome(
+            _missing_plan_structure_message(
+                analysis.missing_sections,
+                analysis.invalid_sections,
+                analysis.empty_sections,
+            )
+        )
     if analysis.approval_status == "unapproved":
         return HookOutcome(exit_code=0)
-    if analysis.missing_sections or analysis.invalid_sections or analysis.empty_sections:
+    if analysis.empty_sections:
         return block_outcome(
             _missing_plan_structure_message(
                 analysis.missing_sections,

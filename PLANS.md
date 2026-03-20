@@ -96,7 +96,7 @@ Describe the concrete user-visible outcome for this session.
 
 ## Subtask Rules
 - `## Plan approval` must contain exactly one machine-readable value: `approved` or `unapproved`.
-- `## Phase` should contain exactly one machine-readable value: `planning`, `implementation`, or `review`.
+- `## Phase` must contain exactly one machine-readable value: `planning`, `implementation`, or `review`.
 - `## Phase` must stay `planning` while `## Plan approval` is `unapproved`.
 - When `## Plan approval` is `approved`, `## Phase` must be `implementation` or `review`.
 - Both `## Ordered subtasks` and `## Follow-up subtasks (append-only)` must use markdown checkboxes.

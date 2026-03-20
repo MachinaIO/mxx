@@ -44,9 +44,9 @@ class PlanAnalysis:
 
     @property
     def phase(self) -> str:
-        if self.phase_status in PLAN_PHASE_VALUES:
-            return self.phase_status
-        return "implementation" if self.is_approved else "planning"
+        if self.phase_status is None:
+            raise ValueError("PlanAnalysis.phase requires a valid `## Phase` value.")
+        return self.phase_status
 
     @property
     def all_checked(self) -> bool:
@@ -101,7 +101,7 @@ Describe the concrete user-visible outcome for this session.
 
 ## Repo facts / assumptions
 - Each workflow hook invocation must provide `session_id` in its JSON payload.
-- The stop hook derives planning vs approved work from `## Plan approval` and derives the approved-work stage from `## Phase`, while remaining backward-compatible with older plans that do not yet have an explicit `## Phase` section.
+- The stop hook derives planning vs approved work from `## Plan approval` and derives the approved-work stage from `## Phase`.
 - The active plan path for this session is `plans/active/session-{session_id}.md`; accepted sessions are archived under `plans/completed/`.
 
 ## Acceptance criteria
@@ -188,11 +188,13 @@ def _parse_plan_approval(lines: list[str], heading: str) -> tuple[str | None, li
     return value, missing_sections, invalid_sections
 
 
-def _parse_optional_phase(lines: list[str], heading: str) -> tuple[str | None, list[str]]:
+def _parse_plan_phase(lines: list[str], heading: str) -> tuple[str | None, list[str], list[str]]:
     bounds = _find_section_bounds(lines, heading)
+    missing_sections: list[str] = []
     invalid_sections: list[str] = []
     if bounds is None:
-        return None, invalid_sections
+        missing_sections.append(heading)
+        return None, missing_sections, invalid_sections
     _, start, end = bounds
     value: str | None = None
     for line_no in range(start, end):
@@ -203,16 +205,17 @@ def _parse_optional_phase(lines: list[str], heading: str) -> tuple[str | None, l
         break
     if value not in PLAN_PHASE_VALUES:
         invalid_sections.append(heading)
-        return None, invalid_sections
-    return value, invalid_sections
+        return None, missing_sections, invalid_sections
+    return value, missing_sections, invalid_sections
 
 
 def analyze_plan(plan_text: str) -> PlanAnalysis:
     lines = plan_text.splitlines()
     approval_status, missing_sections, invalid_sections = _parse_plan_approval(lines, PLAN_APPROVAL_HEADING)
-    phase_status, phase_invalid_sections = _parse_optional_phase(lines, PLAN_PHASE_HEADING)
+    phase_status, phase_missing_sections, phase_invalid_sections = _parse_plan_phase(lines, PLAN_PHASE_HEADING)
+    missing_sections.extend(phase_missing_sections)
     invalid_sections.extend(phase_invalid_sections)
-    if approval_status == "unapproved" and phase_status not in {None, "planning"}:
+    if approval_status == "unapproved" and phase_status != "planning":
         invalid_sections.append(PLAN_PHASE_HEADING)
     if approval_status == "approved" and phase_status == "planning":
         invalid_sections.append(PLAN_PHASE_HEADING)

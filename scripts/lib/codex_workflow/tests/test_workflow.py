@@ -331,6 +331,17 @@ class WorkflowHarnessTests(unittest.TestCase):
         self.assertEqual(exec_runner.calls, [])
         self.assertEqual(test_runner.calls, [])
 
+    def test_planning_stop_blocks_when_phase_section_is_missing(self) -> None:
+        plan_path = self.write_plan(session_id="planning-missing-phase", approval_status="unapproved")
+        original = plan_path.read_text(encoding="utf-8")
+        broken = original.replace(f"{PLAN_PHASE_HEADING}\nplanning\n\n", "", 1)
+        atomic_write_text(plan_path, broken)
+
+        outcome = handle_stop({"session_id": "planning-missing-phase"}, self.repo_root)
+
+        self.assertEqual(outcome.exit_code, 2)
+        self.assertIn(PLAN_PHASE_HEADING, outcome.stderr_message)
+
     def test_stop_requires_session_id_in_payload(self) -> None:
         self.write_plan(
             session_id="pointer-session",
@@ -393,6 +404,17 @@ class WorkflowHarnessTests(unittest.TestCase):
 
         self.assertEqual(outcome.exit_code, 2)
         self.assertIn(PLAN_APPROVAL_HEADING, outcome.stderr_message)
+
+    def test_stop_blocks_when_phase_section_is_missing(self) -> None:
+        plan_path = self.write_plan(session_id="missing-phase", approval_status="approved")
+        original = plan_path.read_text(encoding="utf-8")
+        broken = original.replace(f"{PLAN_PHASE_HEADING}\nimplementation\n\n", "", 1)
+        atomic_write_text(plan_path, broken)
+
+        outcome = handle_stop({"session_id": "missing-phase"}, self.repo_root)
+
+        self.assertEqual(outcome.exit_code, 2)
+        self.assertIn(PLAN_PHASE_HEADING, outcome.stderr_message)
 
     def test_stop_blocks_when_required_checkbox_section_is_empty(self) -> None:
         plan_path = self.write_plan(session_id="empty-ordered", approval_status="approved")
@@ -996,19 +1018,18 @@ class WorkflowHarnessTests(unittest.TestCase):
         self.assertEqual(analysis.phase_status, "review")
         self.assertEqual(analysis.phase, "review")
 
-    def test_plan_analysis_keeps_backward_compatibility_for_legacy_plans_without_phase(self) -> None:
-        legacy_plan = build_plan_text(
-            "legacy-analysis",
+    def test_plan_analysis_requires_phase_section(self) -> None:
+        missing_phase_plan = build_plan_text(
+            "missing-phase-analysis",
             ordered_items=[(True, "Done ordered work.")],
             approval_status="approved",
         ).replace(f"\n{PLAN_PHASE_HEADING}\nimplementation\n", "", 1)
 
-        analysis = analyze_plan(legacy_plan)
+        analysis = analyze_plan(missing_phase_plan)
 
         self.assertEqual(analysis.approval_status, "approved")
         self.assertIsNone(analysis.phase_status)
-        self.assertEqual(analysis.phase, "implementation")
-        self.assertEqual(analysis.invalid_sections, [])
+        self.assertIn(PLAN_PHASE_HEADING, analysis.missing_sections)
 
 
 if __name__ == "__main__":

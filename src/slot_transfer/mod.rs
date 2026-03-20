@@ -1,5 +1,5 @@
 pub mod bgg_pubkey;
-#[cfg(all(test, feature = "gpu"))]
+#[cfg(feature = "gpu")]
 mod bgg_pubkey_gpu;
 pub mod poly_vec;
 

@@ -602,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn bgg_public_key_st_evaluator_records_gate_state_and_hashes_output_matrix() {
+    fn test_slot_transfer_bgg_public_key_records_gate_state_and_hashes_output_matrix() {
         let params = DCRTPolyParams::default();
         let hash_key = [0x42u8; 32];
         let m_g = 2 * params.modulus_digits();
@@ -671,7 +671,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "source slot count 1 does not match evaluator num_slots 2")]
-    fn bgg_public_key_st_evaluator_rejects_unexpected_slot_count() {
+    fn test_slot_transfer_bgg_public_key_rejects_unexpected_slot_count() {
         let params = DCRTPolyParams::default();
         let input_pubkey = BggPublicKey::new(
             DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
@@ -710,7 +710,7 @@ mod tests {
 
     #[tokio::test]
     #[sequential_test::sequential]
-    async fn bgg_public_key_st_evaluator_samples_and_persists_aux_matrices() {
+    async fn test_slot_transfer_bgg_public_key_samples_and_persists_aux_matrices() {
         let _storage_lock = storage_test_lock().await;
         let _ = tracing_subscriber::fmt::try_init();
 

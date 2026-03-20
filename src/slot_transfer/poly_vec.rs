@@ -83,7 +83,7 @@ mod tests {
     }
 
     #[test]
-    fn slot_transfer_evaluator_returns_selected_polys_unchanged() {
+    fn test_slot_transfer_poly_vec_returns_selected_polys_unchanged() {
         let params = DCRTPolyParams::new(8, 2, 17, 1);
         let input = PolyVec::new(vec![
             basis_slot_poly(&params, 3, 0, 3),
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "slot count 6 exceeds ring dimension 4")]
-    fn slot_transfer_evaluator_rejects_poly_vec_longer_than_ring_dimension() {
+    fn test_slot_transfer_poly_vec_rejects_poly_vec_longer_than_ring_dimension() {
         let params = DCRTPolyParams::new(4, 2, 17, 1);
         let input = PolyVec::new(vec![
             basis_slot_poly(&params, 6, 0, 10),
@@ -153,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn slot_transfer_evaluator_applies_optional_small_scalars() {
+    fn test_slot_transfer_poly_vec_applies_optional_small_scalars() {
         let params = DCRTPolyParams::new(8, 2, 17, 1);
         let input = PolyVec::new(vec![
             basis_slot_poly(&params, 3, 0, 3),

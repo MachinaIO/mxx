@@ -333,7 +333,7 @@ mod tests {
 
     #[tokio::test]
     #[sequential_test::sequential]
-    async fn bgg_poly_encoding_slot_transfer_evaluator_matches_slot_relation() {
+    async fn test_slot_transfer_bgg_poly_encoding_matches_slot_relation() {
         let _storage_lock = storage_test_lock().await;
 
         let params = DCRTPolyParams::default();

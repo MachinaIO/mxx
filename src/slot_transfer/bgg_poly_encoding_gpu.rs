@@ -194,7 +194,7 @@ mod tests {
 
     #[sequential_test::sequential]
     #[test]
-    fn bgg_poly_encoding_slot_transfer_uses_detected_gpu_ids() {
+    fn test_slot_transfer_bgg_poly_encoding_gpu_uses_detected_gpu_ids() {
         let detected_gpu_ids = detected_gpu_device_ids();
         if detected_gpu_ids.is_empty() {
             let panic = std::panic::catch_unwind(|| slot_device_ids(1))
@@ -217,7 +217,7 @@ mod tests {
 
     #[tokio::test]
     #[sequential_test::sequential]
-    async fn bgg_poly_encoding_slot_transfer_runs_on_gpu_repeatedly() {
+    async fn test_slot_transfer_bgg_poly_encoding_gpu_runs_on_gpu_repeatedly() {
         let detected_gpu_ids = detected_gpu_device_ids();
         assert!(
             !detected_gpu_ids.is_empty(),

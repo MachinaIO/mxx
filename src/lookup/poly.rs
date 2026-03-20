@@ -277,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn slot_transfer_evaluator_reassigns_slots_for_poly_vec_circuits() {
+    fn slot_transfer_evaluator_returns_selected_polys_unchanged() {
         let params = DCRTPolyParams::new(8, 2, 17, 1);
         let input = PolyVec::new(vec![
             basis_slot_poly(&params, 3, 0, 3),
@@ -290,6 +290,11 @@ mod tests {
         let inputs = circuit.input(1);
         let transferred = circuit.slot_transfer_gate(inputs[0], &[2, 0, 1]);
         circuit.output(vec![transferred]);
+        let expected = vec![
+            input.as_slice()[2].clone(),
+            input.as_slice()[0].clone(),
+            input.as_slice()[1].clone(),
+        ];
 
         let slot_transfer_evaluator = PolyVecSlotTransferEvaluator::new();
         let result = circuit.eval(
@@ -302,14 +307,7 @@ mod tests {
         );
 
         assert_eq!(result.len(), 1);
-        let observed = result[0]
-            .as_slice()
-            .iter()
-            .enumerate()
-            .map(|(slot_idx, poly)| poly.eval_slots()[slot_idx].clone())
-            .collect::<Vec<_>>();
-        let expected = vec![BigUint::from(7u64), BigUint::from(3u64), BigUint::from(5u64)];
-        assert_eq!(observed, expected);
+        assert_eq!(result[0].as_slice(), expected.as_slice());
         assert_eq!(circuit.non_free_depth(), 1);
         assert_eq!(circuit.count_gates_by_type_vec().get(&PolyGateKind::SlotTransfer), Some(&1));
     }

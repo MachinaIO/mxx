@@ -614,8 +614,25 @@ pub fn forward_ntt(
     num_slots: usize,
 ) -> NestedRnsPoly<DCRTPoly> {
     validate_num_slots::<DCRTPoly>(params, num_slots);
-    let identity_slots = (0..num_slots).collect::<Vec<_>>();
-    input.slot_transfer(&permutation_slot_transfer(&identity_slots), circuit)
+    let q_moduli = active_q_moduli(params, input);
+    let psi_by_q = q_moduli
+        .par_iter()
+        .map(|&q_i| primitive_power_of_two_root(q_i, num_slots * 2))
+        .collect::<Vec<_>>();
+    let twist_residues_by_q = q_moduli
+        .par_iter()
+        .zip(psi_by_q.par_iter())
+        .map(|(&q_i, &psi)| {
+            (0..num_slots)
+                .into_par_iter()
+                .map(|slot| mod_pow(psi, slot as u64, q_i))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let twisted = multiply_by_slot_constants(circuit, input, &twist_residues_by_q);
+    let cyclic = forward_ntt_cyclic(params, circuit, &twisted, num_slots);
+    let slot_order = negacyclic_slot_order(num_slots);
+    cyclic.slot_transfer(&permutation_slot_transfer(&slot_order), circuit)
 }
 
 pub fn inverse_ntt(
@@ -625,8 +642,31 @@ pub fn inverse_ntt(
     num_slots: usize,
 ) -> NestedRnsPoly<DCRTPoly> {
     validate_num_slots::<DCRTPoly>(params, num_slots);
-    let matrices = transform_matrices(params, resolved_active_levels(input), num_slots, false);
-    apply_linear_slot_transform(circuit, input, &matrices)
+    let q_moduli = active_q_moduli(params, input);
+    let psi_by_q = q_moduli
+        .par_iter()
+        .map(|&q_i| primitive_power_of_two_root(q_i, num_slots * 2))
+        .collect::<Vec<_>>();
+    let inverse_psi_by_q = psi_by_q
+        .par_iter()
+        .zip(q_moduli.par_iter())
+        .map(|(&psi, &q_i)| mod_inverse(psi, q_i).expect("psi must be invertible modulo q_i"))
+        .collect::<Vec<_>>();
+    let slot_order = negacyclic_slot_order(num_slots);
+    let inverse_slot_order = invert_permutation(&slot_order);
+    let permuted = input.slot_transfer(&permutation_slot_transfer(&inverse_slot_order), circuit);
+    let cyclic = inverse_ntt_cyclic(params, circuit, &permuted, num_slots);
+    let twist_residues_by_q = q_moduli
+        .par_iter()
+        .zip(inverse_psi_by_q.par_iter())
+        .map(|(&q_i, &inv_psi)| {
+            (0..num_slots)
+                .into_par_iter()
+                .map(|slot| mod_pow(inv_psi, slot as u64, q_i))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    multiply_by_slot_constants(circuit, &cyclic, &twist_residues_by_q)
 }
 
 #[cfg(test)]

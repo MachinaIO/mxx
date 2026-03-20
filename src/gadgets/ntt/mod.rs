@@ -335,11 +335,11 @@ mod tests {
     use super::*;
     use crate::{
         __PAIR, __TestState,
-        circuit::{PolyCircuit, PolyGateKind},
+        circuit::{PolyCircuit, PolyGateKind, evaluable::PolyVec},
         gadgets::arith::NestedRnsPolyContext,
-        lookup::poly::DCRTPolyEvalSlotsPltEvaluator,
+        lookup::poly::PolyVecEvalSlotsPltEvaluator,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
-        slot_transfer::DCRTPolyEvalSlotsTransferEvaluator,
+        slot_transfer::PolyVecSlotTransferEvaluator,
     };
     use num_bigint::BigUint;
 
@@ -366,24 +366,134 @@ mod tests {
         params: &DCRTPolyParams,
         ctx: &NestedRnsPolyContext,
         slots: &[u64],
-    ) -> Vec<DCRTPoly> {
-        let q_moduli = active_q_moduli(params, ctx);
-        q_moduli
+    ) -> Vec<PolyVec<DCRTPoly>> {
+        let residues_by_q = active_q_moduli(params, ctx)
+            .into_par_iter()
+            .map(|q_i| slots.iter().map(|&slot| slot % q_i).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        encode_input_by_tower(params, ctx, &residues_by_q)
+    }
+
+    fn encode_input_by_tower(
+        params: &DCRTPolyParams,
+        ctx: &NestedRnsPolyContext,
+        residues_by_q: &[Vec<u64>],
+    ) -> Vec<PolyVec<DCRTPoly>> {
+        assert_eq!(
+            residues_by_q.len(),
+            ctx.q_moduli_depth,
+            "tower residue depth must match nested RNS q_moduli_depth"
+        );
+        residues_by_q
             .par_iter()
-            .map(|&q_i| {
+            .map(|tower_residues| {
                 ctx.p_moduli
                     .par_iter()
-                    .map(|&p_i| {
-                        let values = slots
-                            .par_iter()
-                            .map(|&slot| BigUint::from((slot % q_i) % p_i))
-                            .collect::<Vec<_>>();
-                        DCRTPoly::from_biguints_eval(params, &values)
+                    .map(move |&p_i| {
+                        PolyVec::new(
+                            tower_residues
+                                .par_iter()
+                                .enumerate()
+                                .map(|(slot_idx, &slot)| {
+                                    basis_slot_poly(
+                                        params,
+                                        tower_residues.len(),
+                                        slot_idx,
+                                        slot % p_i,
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        )
                     })
                     .collect::<Vec<_>>()
             })
+            .collect::<Vec<_>>()
+            .into_iter()
             .flatten()
             .collect()
+    }
+
+    fn basis_slot_poly(
+        params: &DCRTPolyParams,
+        num_slots: usize,
+        slot_idx: usize,
+        value: u64,
+    ) -> DCRTPoly {
+        let slots = (0..num_slots)
+            .map(|idx| if idx == slot_idx { BigUint::from(value) } else { BigUint::from(0u64) })
+            .collect::<Vec<_>>();
+        DCRTPoly::from_biguints_eval(params, &slots)
+    }
+
+    fn decode_slots_by_tower(
+        output: &PolyVec<DCRTPoly>,
+        q_moduli: &[u64],
+        num_slots: usize,
+    ) -> Vec<Vec<u64>> {
+        assert_eq!(output.len(), num_slots, "output PolyVec slot count mismatch");
+        q_moduli
+            .iter()
+            .map(|&q_i| {
+                output
+                    .as_slice()
+                    .iter()
+                    .enumerate()
+                    .map(|(slot_idx, slot_poly)| {
+                        let output_slots = slot_poly.eval_slots();
+                        (&output_slots[slot_idx] % BigUint::from(q_i))
+                            .try_into()
+                            .expect("output slot residue must fit in u64")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn observe_matrix_by_tower(
+        output: &PolyVec<DCRTPoly>,
+        q_moduli: &[u64],
+        num_slots: usize,
+    ) -> Vec<Vec<Vec<u64>>> {
+        q_moduli
+            .iter()
+            .map(|&q_i| {
+                output
+                    .as_slice()
+                    .iter()
+                    .map(|slot_poly| {
+                        slot_poly
+                            .eval_slots()
+                            .into_iter()
+                            .take(num_slots)
+                            .map(|value| {
+                                (&value % BigUint::from(q_i))
+                                    .try_into()
+                                    .expect("output residue must fit in u64")
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn eval_outputs(
+        params: &DCRTPolyParams,
+        circuit: &PolyCircuit<DCRTPoly>,
+        inputs: Vec<PolyVec<DCRTPoly>>,
+        num_slots: usize,
+    ) -> Vec<PolyVec<DCRTPoly>> {
+        let one = PolyVec::new(vec![DCRTPoly::const_one(params); num_slots]);
+        let plt_evaluator = PolyVecEvalSlotsPltEvaluator::new();
+        let slot_transfer_evaluator = PolyVecSlotTransferEvaluator::new();
+        circuit.eval(
+            params,
+            one,
+            inputs,
+            Some(&plt_evaluator),
+            Some(&slot_transfer_evaluator),
+            None,
+        )
     }
 
     fn naive_forward_mod(slots: &[u64], modulus: u64, root: u64) -> Vec<u64> {
@@ -421,38 +531,28 @@ mod tests {
     fn eval_single_output(
         params: &DCRTPolyParams,
         circuit: &PolyCircuit<DCRTPoly>,
-        inputs: Vec<DCRTPoly>,
-    ) -> DCRTPoly {
-        let result = circuit.eval(
-            params,
-            DCRTPoly::const_one(params),
-            inputs,
-            Some(&DCRTPolyEvalSlotsPltEvaluator::new()),
-            Some(&DCRTPolyEvalSlotsTransferEvaluator::new()),
-            None,
-        );
+        inputs: Vec<PolyVec<DCRTPoly>>,
+        num_slots: usize,
+    ) -> PolyVec<DCRTPoly> {
+        let result = eval_outputs(params, circuit, inputs, num_slots);
         assert_eq!(result.len(), 1);
         result.into_iter().next().expect("single output must exist")
     }
 
     fn assert_slots_match_by_tower(
-        output: &DCRTPoly,
+        output: &PolyVec<DCRTPoly>,
         expected_by_q: &[Vec<u64>],
         q_moduli: &[u64],
         num_slots: usize,
     ) {
-        let output_slots = output.eval_slots();
-        for slot_idx in 0..num_slots {
-            for (q_idx, &q_i) in q_moduli.iter().enumerate() {
-                let actual: u64 = (&output_slots[slot_idx] % BigUint::from(q_i))
-                    .try_into()
-                    .expect("output slot residue must fit in u64");
-                assert_eq!(
-                    actual, expected_by_q[q_idx][slot_idx],
-                    "tower {} slot {} mismatch",
-                    q_idx, slot_idx
-                );
-            }
+        let observed_by_q = decode_slots_by_tower(output, q_moduli, num_slots);
+        let observed_matrix_by_q = observe_matrix_by_tower(output, q_moduli, num_slots);
+        for (q_idx, observed) in observed_by_q.iter().enumerate() {
+            assert_eq!(
+                observed, &expected_by_q[q_idx],
+                "tower {} mismatch; matrix {:?}",
+                q_idx, observed_matrix_by_q[q_idx]
+            );
         }
     }
 
@@ -493,7 +593,7 @@ mod tests {
 
         let slots = vec![3u64, 5u64];
         let eval_inputs = encode_packed_input(&params, ctx.as_ref(), &slots);
-        let output_poly = eval_single_output(&params, &circuit, eval_inputs);
+        let output_poly = eval_single_output(&params, &circuit, eval_inputs, 2);
         let q_moduli = active_q_moduli(&params, ctx.as_ref());
         let expected = q_moduli
             .iter()
@@ -516,7 +616,7 @@ mod tests {
 
         let slots = (0..16).map(|i| (3 * i + 7) as u64).collect::<Vec<_>>();
         let eval_inputs = encode_packed_input(&params, ctx.as_ref(), &slots);
-        let output_poly = eval_single_output(&params, &circuit, eval_inputs);
+        let output_poly = eval_single_output(&params, &circuit, eval_inputs, 16);
         let q_moduli = active_q_moduli(&params, ctx.as_ref());
         let expected = q_moduli
             .iter()
@@ -538,9 +638,9 @@ mod tests {
         assert_top_level_ntt_structure(&circuit);
 
         let slots = (0..16).map(|i| (11 * i + 5) as u64).collect::<Vec<_>>();
-        let eval_inputs = encode_packed_input(&params, ctx.as_ref(), &slots);
-        let output_poly = eval_single_output(&params, &circuit, eval_inputs);
         let q_moduli = active_q_moduli(&params, ctx.as_ref());
+        let eval_inputs = encode_packed_input(&params, ctx.as_ref(), &slots);
+        let output_poly = eval_single_output(&params, &circuit, eval_inputs, 16);
         let expected = q_moduli
             .iter()
             .map(|&q_i| naive_inverse_mod(&slots, q_i, primitive_power_of_two_root(q_i, 16)))
@@ -562,7 +662,7 @@ mod tests {
 
         let slots = vec![8u64, 3u64];
         let eval_inputs = encode_packed_input(&params, ctx.as_ref(), &slots);
-        let output_poly = eval_single_output(&params, &circuit, eval_inputs);
+        let output_poly = eval_single_output(&params, &circuit, eval_inputs, 2);
         let q_moduli = active_q_moduli(&params, ctx.as_ref());
         let expected = q_moduli
             .iter()
@@ -585,7 +685,7 @@ mod tests {
 
         let slots = (0..16).map(|i| (17 * i + 9) as u64).collect::<Vec<_>>();
         let eval_inputs = encode_packed_input(&params, ctx.as_ref(), &slots);
-        let output_poly = eval_single_output(&params, &circuit, eval_inputs);
+        let output_poly = eval_single_output(&params, &circuit, eval_inputs, 16);
         let q_moduli = active_q_moduli(&params, ctx.as_ref());
         assert_eq!(q_moduli.len(), 1, "expected a single 51-bit CRT tower");
         let expected = q_moduli
@@ -612,7 +712,7 @@ mod tests {
             circuit.output(vec![reconstructed]);
 
             let eval_inputs = encode_packed_input(&params, ctx.as_ref(), &slots);
-            let output_poly = eval_single_output(&params, &circuit, eval_inputs);
+            let output_poly = eval_single_output(&params, &circuit, eval_inputs, num_slots);
             let q_moduli = active_q_moduli(&params, ctx.as_ref());
             let expected = q_moduli
                 .iter()

@@ -112,6 +112,52 @@ impl PltEvaluator<DCRTPoly> for DCRTPolyEvalSlotsPltEvaluator {
 }
 
 #[derive(Debug, Clone)]
+pub struct PolyVecEvalSlotsPltEvaluator {
+    poly_evaluator: DCRTPolyEvalSlotsPltEvaluator,
+}
+
+impl PolyVecEvalSlotsPltEvaluator {
+    pub fn new() -> Self {
+        Self { poly_evaluator: DCRTPolyEvalSlotsPltEvaluator::new() }
+    }
+}
+
+impl Default for PolyVecEvalSlotsPltEvaluator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PltEvaluator<PolyVec<DCRTPoly>> for PolyVecEvalSlotsPltEvaluator {
+    fn public_lookup(
+        &self,
+        params: &DCRTPolyParams,
+        plt: &PublicLut<DCRTPoly>,
+        one: &PolyVec<DCRTPoly>,
+        input: &PolyVec<DCRTPoly>,
+        gate_id: GateId,
+        lut_id: usize,
+    ) -> PolyVec<DCRTPoly> {
+        assert_eq!(
+            one.len(),
+            input.len(),
+            "slot vector one/input sizes must match for public lookup"
+        );
+        PolyVec::new(
+            input
+                .as_slice()
+                .iter()
+                .zip(one.as_slice().iter())
+                .map(|(slot_input, slot_one)| {
+                    self.poly_evaluator
+                        .public_lookup(params, plt, slot_one, slot_input, gate_id, lut_id)
+                })
+                .collect(),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct PolyVecPltEvaluator {
     poly_evaluator: PolyPltEvaluator,
 }
@@ -168,7 +214,20 @@ mod tests {
         },
         slot_transfer::PolyVecSlotTransferEvaluator,
     };
+    use num_bigint::BigUint;
     use std::sync::{Arc, Mutex};
+
+    fn basis_slot_poly(
+        params: &DCRTPolyParams,
+        num_slots: usize,
+        slot_idx: usize,
+        value: u64,
+    ) -> DCRTPoly {
+        let slots = (0..num_slots)
+            .map(|idx| if idx == slot_idx { BigUint::from(value) } else { BigUint::from(0u64) })
+            .collect::<Vec<_>>();
+        DCRTPoly::from_biguints_eval(params, &slots)
+    }
 
     fn lut_output(k: u64) -> u64 {
         k + 10
@@ -221,9 +280,9 @@ mod tests {
     fn slot_transfer_evaluator_reassigns_slots_for_poly_vec_circuits() {
         let params = DCRTPolyParams::new(8, 2, 17, 1);
         let input = PolyVec::new(vec![
-            DCRTPoly::from_usize_to_constant(&params, 3),
-            DCRTPoly::from_usize_to_constant(&params, 5),
-            DCRTPoly::from_usize_to_constant(&params, 7),
+            basis_slot_poly(&params, 3, 0, 3),
+            basis_slot_poly(&params, 3, 1, 5),
+            basis_slot_poly(&params, 3, 2, 7),
         ]);
         let one = PolyVec::new(vec![DCRTPoly::const_one(&params); 3]);
 
@@ -243,14 +302,14 @@ mod tests {
         );
 
         assert_eq!(result.len(), 1);
-        assert_eq!(
-            result[0].as_slice(),
-            &[
-                DCRTPoly::from_usize_to_constant(&params, 7),
-                DCRTPoly::from_usize_to_constant(&params, 3),
-                DCRTPoly::from_usize_to_constant(&params, 5),
-            ]
-        );
+        let observed = result[0]
+            .as_slice()
+            .iter()
+            .enumerate()
+            .map(|(slot_idx, poly)| poly.eval_slots()[slot_idx].clone())
+            .collect::<Vec<_>>();
+        let expected = vec![BigUint::from(7u64), BigUint::from(3u64), BigUint::from(5u64)];
+        assert_eq!(observed, expected);
         assert_eq!(circuit.non_free_depth(), 1);
         assert_eq!(circuit.count_gates_by_type_vec().get(&PolyGateKind::SlotTransfer), Some(&1));
     }
@@ -260,12 +319,12 @@ mod tests {
     fn slot_transfer_evaluator_rejects_poly_vec_longer_than_ring_dimension() {
         let params = DCRTPolyParams::new(4, 2, 17, 1);
         let input = PolyVec::new(vec![
-            DCRTPoly::from_usize_to_constant(&params, 10),
-            DCRTPoly::from_usize_to_constant(&params, 11),
-            DCRTPoly::from_usize_to_constant(&params, 12),
-            DCRTPoly::from_usize_to_constant(&params, 13),
-            DCRTPoly::from_usize_to_constant(&params, 14),
-            DCRTPoly::from_usize_to_constant(&params, 15),
+            basis_slot_poly(&params, 6, 0, 10),
+            basis_slot_poly(&params, 6, 1, 11),
+            basis_slot_poly(&params, 6, 2, 12),
+            basis_slot_poly(&params, 6, 3, 13),
+            basis_slot_poly(&params, 6, 4, 14),
+            basis_slot_poly(&params, 6, 5, 15),
         ]);
         let one = PolyVec::new(vec![DCRTPoly::const_one(&params); 6]);
 

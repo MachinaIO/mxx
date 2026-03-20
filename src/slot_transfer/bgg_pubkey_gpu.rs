@@ -9,7 +9,11 @@ use crate::{
     slot_transfer::bgg_pubkey::{BggPublicKeySTEvaluator, BggPublicKeySTGateState, SlotAuxSample},
 };
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::mpsc::{Receiver, sync_channel},
+    thread,
+};
 
 pub(crate) struct GpuSlotTransferDeviceShared<M, T>
 where
@@ -32,9 +36,40 @@ where
     slot_idx: usize,
     device_idx: usize,
     slot_a: M,
-    slot_a_bytes: Vec<u8>,
     target_b0: M,
     target_b1: M,
+}
+
+struct PreparedSlotBatch<M>
+where
+    M: PolyMatrix,
+{
+    batch_slot_indices: Vec<usize>,
+    slot_secret_mats_by_device: Vec<Vec<M>>,
+}
+
+struct ComputedSlotBatch<M>
+where
+    M: PolyMatrix,
+{
+    samples: Vec<SlotAuxSample<M>>,
+}
+
+struct PreparedGateBatch<M>
+where
+    M: PolyMatrix,
+{
+    selected_slot_indices: Vec<usize>,
+    slot_chunk: Vec<(usize, (u32, Option<u32>))>,
+    slot_secret_mats_by_device: Vec<Vec<M>>,
+    slot_a_mats_by_device: Vec<Vec<M>>,
+}
+
+struct ComputedGateBatch<M>
+where
+    M: PolyMatrix,
+{
+    gate_preimages: Vec<(usize, M)>,
 }
 
 fn sharded_batch_device_idx(
@@ -46,9 +81,19 @@ fn sharded_batch_device_idx(
     (batch_device_offset + batch_pos) % num_devices
 }
 
+fn recv_next<T>(rx: &Receiver<T>, stage: &'static str) -> Option<T> {
+    match rx.recv() {
+        Ok(value) => Some(value),
+        Err(_) => {
+            tracing::debug!(stage, "slot-transfer gpu pipeline stage completed");
+            None
+        }
+    }
+}
+
 impl<M, US, HS, TS> BggPublicKeySTEvaluator<M, US, HS, TS>
 where
-    M: PolyMatrix,
+    M: PolyMatrix + Send + Sync,
     US: PolyUniformSampler<M = M> + Send + Sync,
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
@@ -123,23 +168,23 @@ where
             .collect()
     }
 
-    pub(crate) fn sample_slot_batch_gpu(
+    fn sample_slot_batch_gpu(
         &self,
         shared_by_device: &[GpuSlotTransferDeviceShared<M, TS::Trapdoor>],
-        slot_secret_mats_by_device: &[Vec<M>],
-        batch_slot_indices: &[usize],
-    ) -> Vec<SlotAuxSample<M>> {
+        prepared_batch: PreparedSlotBatch<M>,
+    ) -> ComputedSlotBatch<M> {
         let b1_size = self.secret_size * 2;
         let trap_sampler = TS::new(&shared_by_device[0].params, self.trapdoor_sigma);
+        let PreparedSlotBatch { batch_slot_indices, slot_secret_mats_by_device } = prepared_batch;
         let slot_targets = batch_slot_indices
             .par_iter()
             .copied()
             .enumerate()
-            .map(|(batch_pos, slot_idx)| {
-                let device_idx = batch_pos % shared_by_device.len();
+            .map(|(local_idx, slot_idx)| {
+                let device_idx = sharded_batch_device_idx(shared_by_device.len(), 0, local_idx);
                 let shared = &shared_by_device[device_idx];
                 let m_g = self.secret_size * shared.params.modulus_digits();
-                let slot_secret_mat = &slot_secret_mats_by_device[device_idx][slot_idx];
+                let slot_secret_mat = &slot_secret_mats_by_device[device_idx][local_idx];
                 assert_eq!(
                     slot_secret_mat.row_size(),
                     self.secret_size,
@@ -175,15 +220,7 @@ where
                 let neg_slot_secret_gadget = -(slot_secret_mat.clone() * &shared.gadget_matrix);
                 let mut target_b1 = a_i.clone().concat_rows(&[&neg_slot_secret_gadget]);
                 target_b1.add_in_place(&self.sample_error_matrix(&shared.params, b1_size, m_g));
-                let slot_a_bytes = a_i.to_compact_bytes();
-                GpuSlotAuxTarget {
-                    slot_idx,
-                    device_idx,
-                    slot_a: a_i,
-                    slot_a_bytes,
-                    target_b0,
-                    target_b1,
-                }
+                GpuSlotAuxTarget { slot_idx, device_idx, slot_a: a_i, target_b0, target_b1 }
             })
             .collect::<Vec<_>>();
         let mut slot_targets_by_idx = slot_targets
@@ -241,7 +278,7 @@ where
             .into_iter()
             .collect::<HashMap<usize, M>>();
 
-        batch_slot_indices
+        let samples = batch_slot_indices
             .iter()
             .copied()
             .map(|slot_idx| {
@@ -254,27 +291,127 @@ where
                 let preimage_b1 = preimages_b1
                     .remove(&slot_idx)
                     .unwrap_or_else(|| panic!("missing gpu b1 preimage for slot_idx={slot_idx}"));
-                SlotAuxSample {
-                    slot_idx,
-                    slot_a: slot_target.slot_a,
-                    slot_a_bytes: slot_target.slot_a_bytes,
-                    preimage_b0,
-                    preimage_b1,
-                }
+                SlotAuxSample { slot_idx, slot_a: slot_target.slot_a, preimage_b0, preimage_b1 }
             })
-            .collect()
+            .collect();
+        ComputedSlotBatch { samples }
     }
 
-    pub(crate) fn sample_gate_batch_gpu(
+    fn prepare_slot_batch_gpu(
+        &self,
+        slot_secret_mats: &[Vec<u8>],
+        shared_by_device: &[GpuSlotTransferDeviceShared<M, TS::Trapdoor>],
+        batch_slot_indices: &[usize],
+    ) -> PreparedSlotBatch<M> {
+        let selected_slot_secret_mats = batch_slot_indices
+            .iter()
+            .map(|slot_idx| slot_secret_mats[*slot_idx].clone())
+            .collect::<Vec<_>>();
+        let slot_secret_mats_by_device =
+            self.copy_compact_matrices_to_gpu_devices(&selected_slot_secret_mats, shared_by_device);
+        PreparedSlotBatch {
+            batch_slot_indices: batch_slot_indices.to_vec(),
+            slot_secret_mats_by_device,
+        }
+    }
+
+    fn finalize_slot_batch_gpu(
+        &self,
+        params: &<M::P as Poly>::Params,
+        computed_batch: ComputedSlotBatch<M>,
+        slot_a_bytes_by_slot: &mut [Vec<u8>],
+    ) {
+        let stored_samples = computed_batch
+            .samples
+            .into_par_iter()
+            .map(|sample| {
+                let slot_a_bytes = sample.slot_a.to_compact_bytes();
+                let preimage_b0_bytes = sample.preimage_b0.to_compact_bytes();
+                let preimage_b1_bytes = sample.preimage_b1.to_compact_bytes();
+                (sample.slot_idx, slot_a_bytes, preimage_b0_bytes, preimage_b1_bytes)
+            })
+            .collect::<Vec<_>>();
+
+        for (slot_idx, slot_a_bytes, preimage_b0_bytes, preimage_b1_bytes) in stored_samples {
+            slot_a_bytes_by_slot[slot_idx] = slot_a_bytes.clone();
+            Self::store_bytes_checkpoint(slot_a_bytes, &self.slot_a_id_prefix(params, slot_idx));
+            Self::store_bytes_checkpoint(
+                preimage_b0_bytes,
+                &self.slot_preimage_b0_id_prefix(params, slot_idx),
+            );
+            Self::store_bytes_checkpoint(
+                preimage_b1_bytes,
+                &self.slot_preimage_b1_id_prefix(params, slot_idx),
+            );
+        }
+    }
+
+    pub(crate) fn sample_slot_batches_gpu_pipelined(
+        &self,
+        params: &<M::P as Poly>::Params,
+        shared_by_device: &[GpuSlotTransferDeviceShared<M, TS::Trapdoor>],
+        slot_secret_mats: &[Vec<u8>],
+        slot_parallelism: usize,
+    ) -> Vec<Vec<u8>> {
+        let chunks = (0..self.num_slots)
+            .collect::<Vec<_>>()
+            .chunks(slot_parallelism.max(1))
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        let mut slot_a_bytes_by_slot = vec![Vec::new(); self.num_slots];
+        if chunks.is_empty() {
+            return slot_a_bytes_by_slot;
+        }
+
+        thread::scope(|scope| {
+            let slot_a_bytes_by_slot_ref = &mut slot_a_bytes_by_slot;
+            let (prepared_tx, prepared_rx) = sync_channel::<PreparedSlotBatch<M>>(1);
+            let (computed_tx, computed_rx) = sync_channel::<ComputedSlotBatch<M>>(1);
+
+            let load_handle = scope.spawn(move || {
+                for batch_slot_indices in chunks {
+                    let prepared_batch = self.prepare_slot_batch_gpu(
+                        slot_secret_mats,
+                        shared_by_device,
+                        &batch_slot_indices,
+                    );
+                    prepared_tx.send(prepared_batch).expect("slot pipeline compute stage dropped");
+                }
+            });
+            let compute_handle = scope.spawn(move || {
+                while let Some(prepared_batch) = recv_next(&prepared_rx, "slot-load") {
+                    let computed_batch =
+                        self.sample_slot_batch_gpu(shared_by_device, prepared_batch);
+                    computed_tx.send(computed_batch).expect("slot pipeline store stage dropped");
+                }
+            });
+            let store_handle = scope.spawn(move || {
+                while let Some(computed_batch) = recv_next(&computed_rx, "slot-compute") {
+                    self.finalize_slot_batch_gpu(params, computed_batch, slot_a_bytes_by_slot_ref);
+                }
+            });
+
+            load_handle.join().expect("slot pipeline load stage panicked");
+            compute_handle.join().expect("slot pipeline compute stage panicked");
+            store_handle.join().expect("slot pipeline store stage panicked");
+        });
+
+        slot_a_bytes_by_slot
+    }
+
+    fn sample_gate_batch_gpu(
         &self,
         shared_by_device: &[GpuSlotTransferDeviceShared<M, TS::Trapdoor>],
-        slot_secret_mats_by_device: &[Vec<M>],
-        slot_a_mats_by_device: &[Vec<M>],
-        selected_slot_indices: &[usize],
         gate_id: GateId,
         state: &BggPublicKeySTGateState,
-        slot_chunk: &[(usize, (u32, Option<u32>))],
-    ) -> Vec<(usize, M)> {
+        prepared_batch: PreparedGateBatch<M>,
+    ) -> ComputedGateBatch<M> {
+        let PreparedGateBatch {
+            selected_slot_indices,
+            slot_chunk,
+            slot_secret_mats_by_device,
+            slot_a_mats_by_device,
+        } = prepared_batch;
         let trap_sampler = TS::new(&shared_by_device[0].params, self.trapdoor_sigma);
         let selected_slot_positions = selected_slot_indices
             .iter()
@@ -353,7 +490,7 @@ where
             .into_iter()
             .collect::<HashMap<usize, M>>();
 
-        slot_chunk
+        let gate_preimages = slot_chunk
             .iter()
             .map(|(dst_slot, _)| {
                 let preimage = preimages_by_entry
@@ -361,7 +498,128 @@ where
                     .unwrap_or_else(|| panic!("missing gpu gate preimage for dst_slot={dst_slot}"));
                 (*dst_slot, preimage)
             })
-            .collect()
+            .collect();
+        ComputedGateBatch { gate_preimages }
+    }
+
+    fn prepare_gate_batch_gpu(
+        &self,
+        slot_secret_mats: &[Vec<u8>],
+        slot_a_bytes_by_slot: &[Vec<u8>],
+        shared_by_device: &[GpuSlotTransferDeviceShared<M, TS::Trapdoor>],
+        slot_chunk: &[(usize, (u32, Option<u32>))],
+    ) -> PreparedGateBatch<M> {
+        let mut selected_slot_indices = slot_chunk
+            .iter()
+            .flat_map(|(dst_slot, (src_slot_u32, _))| {
+                let src_slot =
+                    usize::try_from(*src_slot_u32).expect("source slot index must fit in usize");
+                [*dst_slot, src_slot]
+            })
+            .collect::<Vec<_>>();
+        selected_slot_indices.sort_unstable();
+        selected_slot_indices.dedup();
+
+        let selected_slot_secret_mats = selected_slot_indices
+            .iter()
+            .map(|slot_idx| slot_secret_mats[*slot_idx].clone())
+            .collect::<Vec<_>>();
+        let slot_secret_mats_by_device =
+            self.copy_compact_matrices_to_gpu_devices(&selected_slot_secret_mats, shared_by_device);
+        let selected_slot_a_mats = selected_slot_indices
+            .iter()
+            .map(|slot_idx| slot_a_bytes_by_slot[*slot_idx].clone())
+            .collect::<Vec<_>>();
+        let slot_a_mats_by_device =
+            self.copy_compact_matrices_to_gpu_devices(&selected_slot_a_mats, shared_by_device);
+
+        PreparedGateBatch {
+            selected_slot_indices,
+            slot_chunk: slot_chunk.to_vec(),
+            slot_secret_mats_by_device,
+            slot_a_mats_by_device,
+        }
+    }
+
+    fn finalize_gate_batch_gpu(
+        &self,
+        params: &<M::P as Poly>::Params,
+        gate_id: GateId,
+        computed_batch: ComputedGateBatch<M>,
+    ) {
+        let stored_preimages = computed_batch
+            .gate_preimages
+            .into_par_iter()
+            .map(|(dst_slot, preimage)| (dst_slot, preimage.to_compact_bytes()))
+            .collect::<Vec<_>>();
+
+        for (dst_slot, preimage_bytes) in stored_preimages {
+            Self::store_bytes_checkpoint(
+                preimage_bytes,
+                &self.gate_preimage_id_prefix(params, gate_id, dst_slot),
+            );
+        }
+    }
+
+    pub(crate) fn sample_gate_batches_gpu_pipelined(
+        &self,
+        params: &<M::P as Poly>::Params,
+        shared_by_device: &[GpuSlotTransferDeviceShared<M, TS::Trapdoor>],
+        slot_secret_mats: &[Vec<u8>],
+        slot_a_bytes_by_slot: &[Vec<u8>],
+        gate_id: GateId,
+        state: &BggPublicKeySTGateState,
+        gate_parallelism: usize,
+    ) {
+        let chunks = state
+            .src_slots
+            .iter()
+            .copied()
+            .enumerate()
+            .collect::<Vec<_>>()
+            .chunks(gate_parallelism.max(1))
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        if chunks.is_empty() {
+            return;
+        }
+
+        thread::scope(|scope| {
+            let (prepared_tx, prepared_rx) = sync_channel::<PreparedGateBatch<M>>(1);
+            let (computed_tx, computed_rx) = sync_channel::<ComputedGateBatch<M>>(1);
+
+            let load_handle = scope.spawn(move || {
+                for slot_chunk in chunks {
+                    let prepared_batch = self.prepare_gate_batch_gpu(
+                        slot_secret_mats,
+                        slot_a_bytes_by_slot,
+                        shared_by_device,
+                        &slot_chunk,
+                    );
+                    prepared_tx.send(prepared_batch).expect("gate pipeline compute stage dropped");
+                }
+            });
+            let compute_handle = scope.spawn(move || {
+                while let Some(prepared_batch) = recv_next(&prepared_rx, "gate-load") {
+                    let computed_batch = self.sample_gate_batch_gpu(
+                        shared_by_device,
+                        gate_id,
+                        state,
+                        prepared_batch,
+                    );
+                    computed_tx.send(computed_batch).expect("gate pipeline store stage dropped");
+                }
+            });
+            let store_handle = scope.spawn(move || {
+                while let Some(computed_batch) = recv_next(&computed_rx, "gate-compute") {
+                    self.finalize_gate_batch_gpu(params, gate_id, computed_batch);
+                }
+            });
+
+            load_handle.join().expect("gate pipeline load stage panicked");
+            compute_handle.join().expect("gate pipeline compute stage panicked");
+            store_handle.join().expect("gate pipeline store stage panicked");
+        });
     }
 }
 
@@ -396,6 +654,29 @@ mod tests {
     use std::{fs, path::Path};
 
     const SIGMA: f64 = 4.578;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        old_value: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old_value = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, old_value }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.old_value {
+                unsafe { std::env::set_var(self.key, value) };
+            } else {
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
 
     struct DummyPubKeyPltEvaluator;
 
@@ -533,13 +814,14 @@ mod tests {
     async fn bgg_public_key_st_evaluator_samples_aux_matrices_with_gpu_feature() {
         let _storage_lock = storage_test_lock().await;
         let _ = tracing_subscriber::fmt::try_init();
+        let _parallelism_guard = EnvVarGuard::set("SLOT_TRANSFER_SLOT_PARALLELISM", "1");
 
         for iter in 0..5usize {
             gpu_device_sync();
             let params = single_gpu_params();
             let hash_key = [0x55u8; 32];
             let secret_size = 2usize;
-            let num_slots = 2usize;
+            let num_slots = 3usize;
             let dir_path = format!("test_data/test_slot_transfer_gpu_aux_{iter}");
             let dir = Path::new(&dir_path);
             if dir.exists() {
@@ -573,7 +855,7 @@ mod tests {
 
             let mut circuit = PolyCircuit::new();
             let inputs = circuit.input(1);
-            let src_slots = [(1, None), (0, Some(3))];
+            let src_slots = [(1, None), (2, Some(3)), (0, Some(5))];
             let transferred = circuit.slot_transfer_gate(inputs[0], &src_slots);
             circuit.output(vec![transferred]);
 

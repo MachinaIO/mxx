@@ -6,9 +6,7 @@ use crate::{
         DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler,
         trapdoor::GpuPreimageRequest,
     },
-    slot_transfer::bgg_pubkey::{
-        BggPublicKeySTEvaluator, BggPublicKeySTGateState, GateAuxSample, SlotAuxSample,
-    },
+    slot_transfer::bgg_pubkey::{BggPublicKeySTEvaluator, BggPublicKeySTGateState, SlotAuxSample},
 };
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -37,6 +35,15 @@ where
     slot_a_bytes: Vec<u8>,
     target_b0: M,
     target_b1: M,
+}
+
+fn sharded_batch_device_idx(
+    num_devices: usize,
+    batch_device_offset: usize,
+    batch_pos: usize,
+) -> usize {
+    assert!(num_devices > 0, "batch sharding requires at least one device");
+    (batch_device_offset + batch_pos) % num_devices
 }
 
 impl<M, US, HS, TS> BggPublicKeySTEvaluator<M, US, HS, TS>
@@ -263,14 +270,24 @@ where
         shared_by_device: &[GpuSlotTransferDeviceShared<M, TS::Trapdoor>],
         slot_secret_mats_by_device: &[Vec<M>],
         slot_a_mats_by_device: &[Vec<M>],
-        batch: &[(GateId, BggPublicKeySTGateState)],
-    ) -> Vec<GateAuxSample<M>> {
+        selected_slot_indices: &[usize],
+        gate_id: GateId,
+        state: &BggPublicKeySTGateState,
+        slot_chunk: &[(usize, u32)],
+    ) -> Vec<(usize, M)> {
         let trap_sampler = TS::new(&shared_by_device[0].params, self.trapdoor_sigma);
-        let request_targets = batch
-            .par_iter()
+        let selected_slot_positions = selected_slot_indices
+            .iter()
+            .copied()
             .enumerate()
-            .map(|(batch_pos, (gate_id, state))| {
-                let device_idx = batch_pos % shared_by_device.len();
+            .map(|(local_idx, slot_idx)| (slot_idx, local_idx))
+            .collect::<HashMap<usize, usize>>();
+        let request_targets = slot_chunk
+            .par_iter()
+            .copied()
+            .enumerate()
+            .map(|(batch_pos, (dst_slot, src_slot_u32))| {
+                let device_idx = sharded_batch_device_idx(shared_by_device.len(), 0, batch_pos);
                 let shared = &shared_by_device[device_idx];
                 let m_g = self.secret_size * shared.params.modulus_digits();
                 let a_in = M::from_compact_bytes(&shared.params, &state.input_pubkey_bytes);
@@ -282,50 +299,41 @@ where
                     m_g,
                     DistType::FinRingDist,
                 );
-                state
-                    .src_slots
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .map(|(dst_slot, src_slot_u32)| {
-                        let src_slot = usize::try_from(src_slot_u32)
-                            .expect("source slot index must fit in usize");
-                        assert!(
-                            src_slot < self.num_slots,
-                            "source slot index {} out of range for num_slots {}",
-                            src_slot,
-                            self.num_slots
-                        );
-                        let s_j = &slot_secret_mats_by_device[device_idx][dst_slot];
-                        let s_i = &slot_secret_mats_by_device[device_idx][src_slot];
-                        let a_j = &slot_a_mats_by_device[device_idx][dst_slot];
-                        let lhs = s_j.clone() * &a_out;
-                        let rhs = (s_i.clone() * &a_in) * a_j.decompose();
-                        let mut target = lhs - rhs;
-                        target.add_in_place(&self.sample_error_matrix(
-                            &shared.params,
-                            self.secret_size,
-                            m_g,
-                        ));
-                        (*gate_id, dst_slot, device_idx, target)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flatten()
-            .enumerate()
-            .map(|(entry_idx, (gate_id, dst_slot, device_idx, target))| {
-                (entry_idx, gate_id, dst_slot, device_idx, target)
+                let src_slot =
+                    usize::try_from(src_slot_u32).expect("source slot index must fit in usize");
+                assert!(
+                    src_slot < self.num_slots,
+                    "source slot index {} out of range for num_slots {}",
+                    src_slot,
+                    self.num_slots
+                );
+                let dst_local_idx = *selected_slot_positions
+                    .get(&dst_slot)
+                    .unwrap_or_else(|| panic!("missing selected dst_slot={dst_slot}"));
+                let src_local_idx = *selected_slot_positions
+                    .get(&src_slot)
+                    .unwrap_or_else(|| panic!("missing selected src_slot={src_slot}"));
+                let s_j = &slot_secret_mats_by_device[device_idx][dst_local_idx];
+                let s_i = &slot_secret_mats_by_device[device_idx][src_local_idx];
+                let a_j = &slot_a_mats_by_device[device_idx][dst_local_idx];
+                let lhs = s_j.clone() * &a_out;
+                let rhs = (s_i.clone() * &a_in) * a_j.decompose();
+                let mut target = lhs - rhs;
+                target.add_in_place(&self.sample_error_matrix(
+                    &shared.params,
+                    self.secret_size,
+                    m_g,
+                ));
+                (dst_slot, device_idx, target)
             })
             .collect::<Vec<_>>();
 
         let requests = request_targets
             .iter()
-            .map(|(entry_idx, _, _, device_idx, target)| {
+            .map(|(dst_slot, device_idx, target)| {
                 let shared = &shared_by_device[*device_idx];
                 GpuPreimageRequest {
-                    entry_idx: *entry_idx,
+                    entry_idx: *dst_slot,
                     params: &shared.params,
                     trapdoor: &shared.b0_trapdoor,
                     public_matrix: &shared.b0_matrix,
@@ -337,30 +345,14 @@ where
             .preimage_batched_sharded(requests)
             .into_iter()
             .collect::<HashMap<usize, M>>();
-        let mut grouped = batch
-            .par_iter()
-            .map(|(gate_id, _)| {
-                (*gate_id, GateAuxSample { gate_id: *gate_id, dst_preimages: Vec::new() })
-            })
-            .collect::<HashMap<GateId, GateAuxSample<M>>>();
 
-        for (entry_idx, gate_id, dst_slot, _, _) in request_targets {
-            let preimage = preimages_by_entry
-                .remove(&entry_idx)
-                .unwrap_or_else(|| panic!("missing gpu gate preimage for entry_idx={entry_idx}"));
-            grouped
-                .get_mut(&gate_id)
-                .unwrap_or_else(|| panic!("missing gate grouping for gate_id={gate_id}"))
-                .dst_preimages
-                .push((dst_slot, preimage));
-        }
-
-        batch
+        slot_chunk
             .iter()
-            .map(|(gate_id, _)| {
-                grouped.remove(gate_id).unwrap_or_else(|| {
-                    panic!("missing grouped gpu gate sample for gate_id={gate_id}")
-                })
+            .map(|(dst_slot, _)| {
+                let preimage = preimages_by_entry
+                    .remove(dst_slot)
+                    .unwrap_or_else(|| panic!("missing gpu gate preimage for dst_slot={dst_slot}"));
+                (*dst_slot, preimage)
             })
             .collect()
     }
@@ -368,6 +360,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::sharded_batch_device_idx;
     use crate::{
         __PAIR, __TestState,
         bgg::public_key::BggPublicKey,
@@ -432,6 +425,14 @@ mod tests {
             vec![single_gpu_id],
             Some(1),
         )
+    }
+
+    #[test]
+    fn sharded_batch_device_idx_rotates_with_batch_position() {
+        assert_eq!(sharded_batch_device_idx(3, 0, 0), 0);
+        assert_eq!(sharded_batch_device_idx(3, 0, 1), 1);
+        assert_eq!(sharded_batch_device_idx(3, 0, 2), 2);
+        assert_eq!(sharded_batch_device_idx(3, 0, 3), 0);
     }
 
     #[sequential_test::sequential]

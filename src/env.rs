@@ -143,31 +143,6 @@ pub fn slot_transfer_slot_parallelism() -> usize {
     }
 }
 
-/// `SLOT_TRANSFER_GATE_PARALLELISM`: max number of gate auxiliary samples processed in parallel.
-/// Default: GPU feature enabled => detected GPU device count, otherwise 30.
-pub fn slot_transfer_gate_parallelism() -> usize {
-    let parsed = std::env::var("SLOT_TRANSFER_GATE_PARALLELISM")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| *n > 0);
-    #[cfg(feature = "gpu")]
-    {
-        let device_count = default_gpu_parallelism();
-        let value = parsed.unwrap_or(device_count);
-        assert!(
-            value <= device_count,
-            "SLOT_TRANSFER_GATE_PARALLELISM must be <= detected GPU count: requested={}, devices={}",
-            value,
-            device_count
-        );
-        value
-    }
-    #[cfg(not(feature = "gpu"))]
-    {
-        parsed.unwrap_or(30)
-    }
-}
-
 /// `BLOCK_SIZE`: generic processing block size used in utilities (default: 100).
 pub fn block_size() -> usize {
     std::env::var("BLOCK_SIZE").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(100)

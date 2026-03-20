@@ -102,6 +102,7 @@ fn build_modq_arith_circuit(
     params: &DCRTPolyParams,
     q_level: Option<usize>,
 ) -> (PolyCircuit<DCRTPoly>, Arc<NestedRnsPolyContext>) {
+    let height = 1usize;
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
     let ctx = Arc::new(NestedRnsPolyContext::setup(
         &mut circuit,
@@ -111,13 +112,7 @@ fn build_modq_arith_circuit(
         false,
         q_level,
     ));
-
-    let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-    let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-
-    let prod = poly_a.mul_full_reduce(&poly_b, None, &mut circuit);
-    let out = prod.reconstruct(None, &mut circuit);
-    circuit.output(vec![out]);
+    NestedRnsPoly::benchmark_multiplication_tree(ctx.clone(), &mut circuit, height, q_level);
     (circuit, ctx)
 }
 
@@ -125,6 +120,7 @@ fn build_modq_arith_value_circuit(
     params: &DCRTPolyParams,
     q_level: Option<usize>,
 ) -> PolyCircuit<DCRTPoly> {
+    let height = 1usize;
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
     let ctx = Arc::new(NestedRnsPolyContext::setup(
         &mut circuit,
@@ -134,12 +130,7 @@ fn build_modq_arith_value_circuit(
         false,
         q_level,
     ));
-
-    let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-    let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-    let prod = poly_a.mul_full_reduce(&poly_b, None, &mut circuit);
-    let out = prod.reconstruct(None, &mut circuit);
-    circuit.output(vec![out]);
+    NestedRnsPoly::benchmark_multiplication_tree(ctx, &mut circuit, height, q_level);
     circuit
 }
 

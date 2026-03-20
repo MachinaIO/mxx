@@ -6,7 +6,7 @@ use std::ops::{Add, Mul, Sub};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PolyVec<P: Poly> {
-    slots: Vec<P>,
+    pub slots: Vec<P>,
 }
 
 impl<P: Poly> PolyVec<P> {

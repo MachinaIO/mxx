@@ -170,33 +170,36 @@ fn build_forward_stage_plan(
     let m = 1usize << (stage_index + 1);
     let half = m / 2;
     let stride = num_slots / m;
-    let mut permutation = vec![0u32; num_slots];
-    for block_start in (0..num_slots).step_by(m) {
-        for j in 0..half {
-            let lo = block_start + j;
-            let hi = lo + half;
-            permutation[lo] = hi as u32;
-            permutation[hi] = lo as u32;
-        }
-    }
+    let permutation = (0..num_slots)
+        .into_par_iter()
+        .map(|slot| {
+            let offset = slot % m;
+            let partner = if offset < half { slot + half } else { slot - half };
+            u32::try_from(partner).expect("stage permutation exceeds u32")
+        })
+        .collect::<Vec<_>>();
     let (alpha_residues_by_q, beta_residues_by_q): (Vec<_>, Vec<_>) = q_moduli
         .par_iter()
         .zip(roots.par_iter())
         .map(|(&q_i, &root)| {
-            let mut alpha_row = vec![0u64; num_slots];
-            let mut beta_row = vec![0u64; num_slots];
-            for block_start in (0..num_slots).step_by(m) {
-                for j in 0..half {
-                    let lo = block_start + j;
-                    let hi = lo + half;
-                    let twiddle_exp = j * stride;
-                    let twiddle = mod_pow(root, twiddle_exp as u64, q_i);
-                    alpha_row[lo] = 1;
-                    beta_row[lo] = twiddle;
-                    alpha_row[hi] = mod_neg(twiddle, q_i);
-                    beta_row[hi] = 1;
-                }
-            }
+            let alpha_row = (0..num_slots)
+                .into_par_iter()
+                .map(|slot| {
+                    let offset = slot % m;
+                    let j = if offset < half { offset } else { offset - half };
+                    let twiddle = mod_pow(root, (j * stride) as u64, q_i);
+                    if offset < half { 1 } else { mod_neg(twiddle, q_i) }
+                })
+                .collect::<Vec<_>>();
+            let beta_row = (0..num_slots)
+                .into_par_iter()
+                .map(|slot| {
+                    let offset = slot % m;
+                    let j = if offset < half { offset } else { offset - half };
+                    let twiddle = mod_pow(root, (j * stride) as u64, q_i);
+                    if offset < half { twiddle } else { 1 }
+                })
+                .collect::<Vec<_>>();
             (alpha_row, beta_row)
         })
         .unzip();
@@ -213,33 +216,36 @@ fn build_inverse_stage_plan(
     let m = num_slots >> stage_index;
     let half = m / 2;
     let stride = num_slots / m;
-    let mut permutation = vec![0u32; num_slots];
-    for block_start in (0..num_slots).step_by(m) {
-        for j in 0..half {
-            let lo = block_start + j;
-            let hi = lo + half;
-            permutation[lo] = hi as u32;
-            permutation[hi] = lo as u32;
-        }
-    }
+    let permutation = (0..num_slots)
+        .into_par_iter()
+        .map(|slot| {
+            let offset = slot % m;
+            let partner = if offset < half { slot + half } else { slot - half };
+            u32::try_from(partner).expect("stage permutation exceeds u32")
+        })
+        .collect::<Vec<_>>();
     let (alpha_residues_by_q, beta_residues_by_q): (Vec<_>, Vec<_>) = q_moduli
         .par_iter()
         .zip(inverse_roots.par_iter())
         .map(|(&q_i, &inv_root)| {
-            let mut alpha_row = vec![0u64; num_slots];
-            let mut beta_row = vec![0u64; num_slots];
-            for block_start in (0..num_slots).step_by(m) {
-                for j in 0..half {
-                    let lo = block_start + j;
-                    let hi = lo + half;
-                    let twiddle_exp = j * stride;
-                    let twiddle = mod_pow(inv_root, twiddle_exp as u64, q_i);
-                    alpha_row[lo] = 1;
-                    beta_row[lo] = 1;
-                    alpha_row[hi] = mod_neg(twiddle, q_i);
-                    beta_row[hi] = twiddle;
-                }
-            }
+            let alpha_row = (0..num_slots)
+                .into_par_iter()
+                .map(|slot| {
+                    let offset = slot % m;
+                    let j = if offset < half { offset } else { offset - half };
+                    let twiddle = mod_pow(inv_root, (j * stride) as u64, q_i);
+                    if offset < half { 1 } else { mod_neg(twiddle, q_i) }
+                })
+                .collect::<Vec<_>>();
+            let beta_row = (0..num_slots)
+                .into_par_iter()
+                .map(|slot| {
+                    let offset = slot % m;
+                    let j = if offset < half { offset } else { offset - half };
+                    let twiddle = mod_pow(inv_root, (j * stride) as u64, q_i);
+                    if offset < half { 1 } else { twiddle }
+                })
+                .collect::<Vec<_>>();
             (alpha_row, beta_row)
         })
         .unzip();
@@ -280,7 +286,7 @@ fn multiply_by_tower_constants<P: Poly>(
     residues_by_q: &[Vec<u64>],
 ) -> NestedRnsPoly<P> {
     let tower_constants = residues_by_q
-        .iter()
+        .par_iter()
         .map(|row| {
             let (&first, rest) =
                 row.split_first().expect("tower constants must contain at least one slot");
@@ -455,11 +461,11 @@ mod tests {
     ) -> Vec<Vec<u64>> {
         assert_eq!(output.len(), num_slots, "output PolyVec slot count mismatch");
         q_moduli
-            .iter()
+            .par_iter()
             .map(|&q_i| {
                 output
                     .as_slice()
-                    .iter()
+                    .par_iter()
                     .enumerate()
                     .map(|(slot_idx, slot_poly)| {
                         let output_slots = slot_poly.eval_slots();
@@ -478,15 +484,15 @@ mod tests {
         num_slots: usize,
     ) -> Vec<Vec<Vec<u64>>> {
         q_moduli
-            .iter()
+            .par_iter()
             .map(|&q_i| {
                 output
                     .as_slice()
-                    .iter()
+                    .par_iter()
                     .map(|slot_poly| {
                         slot_poly
                             .eval_slots()
-                            .into_iter()
+                            .into_par_iter()
                             .take(num_slots)
                             .map(|value| {
                                 (&value % BigUint::from(q_i))
@@ -519,34 +525,131 @@ mod tests {
         )
     }
 
-    fn naive_forward_mod(slots: &[u64], modulus: u64, root: u64) -> Vec<u64> {
-        let n = slots.len();
-        (0..n)
+    fn basis_input_matrix(slots: &[u64], modulus: u64) -> Vec<Vec<u64>> {
+        (0..slots.len())
             .into_par_iter()
-            .map(|k| {
-                let mut acc = 0u64;
-                for (j, &value) in slots.iter().enumerate() {
-                    let twiddle = mod_pow(root, (j * k) as u64, modulus);
-                    acc = (acc + mod_mul(value % modulus, twiddle, modulus)) % modulus;
-                }
-                acc
+            .map(|row_idx| {
+                (0..slots.len())
+                    .into_par_iter()
+                    .map(|col_idx| if row_idx == col_idx { slots[row_idx] % modulus } else { 0 })
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
 
-    fn naive_inverse_mod(slots: &[u64], modulus: u64, root: u64) -> Vec<u64> {
-        let n = slots.len();
-        let inv_root = mod_inverse(root, modulus).expect("root must be invertible");
-        let n_inv = mod_inverse(n as u64, modulus).expect("n must be invertible");
-        (0..n)
+    fn permute_rows(matrix: &[Vec<u64>], permutation: &[u32]) -> Vec<Vec<u64>> {
+        permutation
+            .par_iter()
+            .map(|&src_slot| {
+                matrix
+                    .get(src_slot as usize)
+                    .unwrap_or_else(|| panic!("source slot {} out of range", src_slot))
+                    .clone()
+            })
+            .collect()
+    }
+
+    fn apply_stage_matrix(
+        current: &[Vec<u64>],
+        permutation: &[u32],
+        alpha_row: &[u64],
+        beta_row: &[u64],
+        modulus: u64,
+    ) -> Vec<Vec<u64>> {
+        let partner = permute_rows(current, permutation);
+        current
+            .par_iter()
+            .zip(partner.par_iter())
+            .map(|(current_row, partner_row)| {
+                (0..current_row.len())
+                    .into_par_iter()
+                    .map(|col_idx| {
+                        let current_value = current_row[col_idx];
+                        let partner_value = partner_row[col_idx];
+                        let alpha = alpha_row[col_idx];
+                        let beta = beta_row[col_idx];
+                        (mod_mul(alpha % modulus, current_value % modulus, modulus) +
+                            mod_mul(beta % modulus, partner_value % modulus, modulus)) %
+                            modulus
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn naive_forward_matrix_from_state(
+        current: &[Vec<u64>],
+        modulus: u64,
+        root: u64,
+    ) -> Vec<Vec<u64>> {
+        let num_slots = current.len();
+        let mut current = permute_rows(current, &bit_reverse_permutation(num_slots));
+        for stage_index in 0..num_slots.trailing_zeros() as usize {
+            let plan = build_forward_stage_plan(stage_index, num_slots, &[modulus], &[root]);
+            current = apply_stage_matrix(
+                &current,
+                &plan.permutation,
+                &plan.alpha_residues_by_q[0],
+                &plan.beta_residues_by_q[0],
+                modulus,
+            );
+        }
+        current
+    }
+
+    fn naive_forward_matrix_mod(slots: &[u64], modulus: u64, root: u64) -> Vec<Vec<u64>> {
+        naive_forward_matrix_from_state(&basis_input_matrix(slots, modulus), modulus, root)
+    }
+
+    fn naive_inverse_matrix_from_state(
+        current: &[Vec<u64>],
+        modulus: u64,
+        root: u64,
+    ) -> Vec<Vec<u64>> {
+        let num_slots = current.len();
+        let inverse_root = mod_inverse(root, modulus).expect("root must be invertible modulo q_i");
+        let mut current = current.to_vec();
+        for stage_index in 0..num_slots.trailing_zeros() as usize {
+            let plan =
+                build_inverse_stage_plan(stage_index, num_slots, &[modulus], &[inverse_root]);
+            current = apply_stage_matrix(
+                &current,
+                &plan.permutation,
+                &plan.alpha_residues_by_q[0],
+                &plan.beta_residues_by_q[0],
+                modulus,
+            );
+        }
+        let n_inv = mod_inverse(num_slots as u64, modulus)
+            .expect("num_slots must be invertible modulo q_i");
+        let scaled = current
             .into_par_iter()
-            .map(|k| {
-                let mut acc = 0u64;
-                for (j, &value) in slots.iter().enumerate() {
-                    let twiddle = mod_pow(inv_root, (j * k) as u64, modulus);
-                    acc = (acc + mod_mul(value % modulus, twiddle, modulus)) % modulus;
-                }
-                mod_mul(acc, n_inv, modulus)
+            .map(|row| {
+                row.into_par_iter()
+                    .map(|value| mod_mul(value % modulus, n_inv, modulus))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        permute_rows(&scaled, &bit_reverse_permutation(num_slots))
+    }
+
+    fn naive_inverse_matrix_mod(slots: &[u64], modulus: u64, root: u64) -> Vec<Vec<u64>> {
+        naive_inverse_matrix_from_state(&basis_input_matrix(slots, modulus), modulus, root)
+    }
+
+    fn observe_diagonal_by_tower(
+        output: &PolyVec<DCRTPoly>,
+        q_moduli: &[u64],
+        num_slots: usize,
+    ) -> Vec<Vec<u64>> {
+        decode_slots_by_tower(output, q_moduli, num_slots)
+    }
+
+    fn diagonal_from_matrix_by_tower(matrix_by_q: &[Vec<Vec<u64>>]) -> Vec<Vec<u64>> {
+        matrix_by_q
+            .par_iter()
+            .map(|matrix| {
+                matrix.par_iter().enumerate().map(|(row_idx, row)| row[row_idx]).collect::<Vec<_>>()
             })
             .collect()
     }
@@ -562,21 +665,22 @@ mod tests {
         result.into_iter().next().expect("single output must exist")
     }
 
-    fn assert_slots_match_by_tower(
+    fn assert_matrix_match_by_tower(
         output: &PolyVec<DCRTPoly>,
-        expected_by_q: &[Vec<u64>],
+        expected_matrix_by_q: &[Vec<Vec<u64>>],
         q_moduli: &[u64],
         num_slots: usize,
     ) {
-        let observed_by_q = decode_slots_by_tower(output, q_moduli, num_slots);
         let observed_matrix_by_q = observe_matrix_by_tower(output, q_moduli, num_slots);
-        for (q_idx, observed) in observed_by_q.iter().enumerate() {
-            assert_eq!(
-                observed, &expected_by_q[q_idx],
-                "tower {} mismatch; matrix {:?}",
-                q_idx, observed_matrix_by_q[q_idx]
-            );
-        }
+        let observed_diagonal_by_q = observe_diagonal_by_tower(output, q_moduli, num_slots);
+        let expected_diagonal_by_q = diagonal_from_matrix_by_tower(expected_matrix_by_q);
+        assert_eq!(
+            observed_matrix_by_q.as_slice(),
+            expected_matrix_by_q,
+            "matrix mismatch; observed diagonal {:?}, expected diagonal {:?}",
+            observed_diagonal_by_q,
+            expected_diagonal_by_q
+        );
     }
 
     fn assert_top_level_ntt_structure(circuit: &PolyCircuit<DCRTPoly>) {
@@ -604,7 +708,7 @@ mod tests {
 
     #[test]
     #[sequential_test::sequential]
-    fn forward_ntt_matches_naive_for_num_slots_2_single_tower() {
+    fn forward_ntt_matches_pass_through_slot_transfer_model_for_num_slots_2_single_tower() {
         let params = DCRTPolyParams::new(2, 1, 17, BASE_BITS);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = test_context(&mut circuit, &params);
@@ -618,16 +722,16 @@ mod tests {
         let eval_inputs = encode_packed_input(&params, ctx.as_ref(), &slots);
         let output_poly = eval_single_output(&params, &circuit, eval_inputs, 2);
         let q_moduli = active_q_moduli(&params, &input);
-        let expected = q_moduli
+        let expected_matrix = q_moduli
             .iter()
-            .map(|&q_i| naive_forward_mod(&slots, q_i, primitive_power_of_two_root(q_i, 2)))
+            .map(|&q_i| naive_forward_matrix_mod(&slots, q_i, primitive_power_of_two_root(q_i, 2)))
             .collect::<Vec<_>>();
-        assert_slots_match_by_tower(&output_poly, &expected, &q_moduli, 2);
+        assert_matrix_match_by_tower(&output_poly, &expected_matrix, &q_moduli, 2);
     }
 
     #[test]
     #[sequential_test::sequential]
-    fn forward_ntt_matches_naive_for_num_slots_16_multi_tower() {
+    fn forward_ntt_matches_pass_through_slot_transfer_model_for_num_slots_16_multi_tower() {
         let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = test_context(&mut circuit, &params);
@@ -641,16 +745,16 @@ mod tests {
         let eval_inputs = encode_packed_input(&params, ctx.as_ref(), &slots);
         let output_poly = eval_single_output(&params, &circuit, eval_inputs, 16);
         let q_moduli = active_q_moduli(&params, &input);
-        let expected = q_moduli
+        let expected_matrix = q_moduli
             .iter()
-            .map(|&q_i| naive_forward_mod(&slots, q_i, primitive_power_of_two_root(q_i, 16)))
+            .map(|&q_i| naive_forward_matrix_mod(&slots, q_i, primitive_power_of_two_root(q_i, 16)))
             .collect::<Vec<_>>();
-        assert_slots_match_by_tower(&output_poly, &expected, &q_moduli, 16);
+        assert_matrix_match_by_tower(&output_poly, &expected_matrix, &q_moduli, 16);
     }
 
     #[test]
     #[sequential_test::sequential]
-    fn inverse_ntt_matches_naive_for_num_slots_16_multi_tower() {
+    fn inverse_ntt_matches_pass_through_slot_transfer_model_for_num_slots_16_multi_tower() {
         let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = test_context(&mut circuit, &params);
@@ -664,16 +768,16 @@ mod tests {
         let q_moduli = active_q_moduli(&params, &input);
         let eval_inputs = encode_packed_input(&params, ctx.as_ref(), &slots);
         let output_poly = eval_single_output(&params, &circuit, eval_inputs, 16);
-        let expected = q_moduli
+        let expected_matrix = q_moduli
             .iter()
-            .map(|&q_i| naive_inverse_mod(&slots, q_i, primitive_power_of_two_root(q_i, 16)))
+            .map(|&q_i| naive_inverse_matrix_mod(&slots, q_i, primitive_power_of_two_root(q_i, 16)))
             .collect::<Vec<_>>();
-        assert_slots_match_by_tower(&output_poly, &expected, &q_moduli, 16);
+        assert_matrix_match_by_tower(&output_poly, &expected_matrix, &q_moduli, 16);
     }
 
     #[test]
     #[sequential_test::sequential]
-    fn inverse_ntt_matches_naive_for_num_slots_2_single_tower() {
+    fn inverse_ntt_matches_pass_through_slot_transfer_model_for_num_slots_2_single_tower() {
         let params = DCRTPolyParams::new(2, 1, 17, BASE_BITS);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = test_context(&mut circuit, &params);
@@ -687,16 +791,17 @@ mod tests {
         let eval_inputs = encode_packed_input(&params, ctx.as_ref(), &slots);
         let output_poly = eval_single_output(&params, &circuit, eval_inputs, 2);
         let q_moduli = active_q_moduli(&params, &input);
-        let expected = q_moduli
+        let expected_matrix = q_moduli
             .iter()
-            .map(|&q_i| naive_inverse_mod(&slots, q_i, primitive_power_of_two_root(q_i, 2)))
+            .map(|&q_i| naive_inverse_matrix_mod(&slots, q_i, primitive_power_of_two_root(q_i, 2)))
             .collect::<Vec<_>>();
-        assert_slots_match_by_tower(&output_poly, &expected, &q_moduli, 2);
+        assert_matrix_match_by_tower(&output_poly, &expected_matrix, &q_moduli, 2);
     }
 
     #[test]
     #[sequential_test::sequential]
-    fn forward_ntt_matches_naive_for_num_slots_16_single_tower_51_bit_modulus() {
+    fn forward_ntt_matches_pass_through_slot_transfer_model_for_num_slots_16_single_tower_51_bit_modulus()
+     {
         let params = DCRTPolyParams::new(16, 1, 51, BASE_BITS);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = test_context_with_p_moduli_bits(&mut circuit, &params, 10);
@@ -711,16 +816,17 @@ mod tests {
         let output_poly = eval_single_output(&params, &circuit, eval_inputs, 16);
         let q_moduli = active_q_moduli(&params, &input);
         assert_eq!(q_moduli.len(), 1, "expected a single 51-bit CRT tower");
-        let expected = q_moduli
+        let expected_matrix = q_moduli
             .iter()
-            .map(|&q_i| naive_forward_mod(&slots, q_i, primitive_power_of_two_root(q_i, 16)))
+            .map(|&q_i| naive_forward_matrix_mod(&slots, q_i, primitive_power_of_two_root(q_i, 16)))
             .collect::<Vec<_>>();
-        assert_slots_match_by_tower(&output_poly, &expected, &q_moduli, 16);
+        assert_matrix_match_by_tower(&output_poly, &expected_matrix, &q_moduli, 16);
     }
 
     #[test]
     #[sequential_test::sequential]
-    fn inverse_round_trip_restores_input_for_num_slots_2_and_16() {
+    fn forward_inverse_round_trip_matches_pass_through_slot_transfer_model_for_num_slots_2_and_16()
+    {
         for (ring_dimension, crt_depth, num_slots, slots) in [
             (2u32, 1usize, 2usize, vec![9u64, 4u64]),
             (16u32, 2usize, 16usize, (0..16).map(|i| (5 * i + 1) as u64).collect::<Vec<_>>()),
@@ -737,17 +843,29 @@ mod tests {
             let eval_inputs = encode_packed_input(&params, ctx.as_ref(), &slots);
             let output_poly = eval_single_output(&params, &circuit, eval_inputs, num_slots);
             let q_moduli = active_q_moduli(&params, &input);
-            let expected = q_moduli
+            let expected_matrix = q_moduli
                 .iter()
-                .map(|&q_i| slots.iter().map(|&slot| slot % q_i).collect::<Vec<_>>())
+                .map(|&q_i| {
+                    let forward_matrix = naive_forward_matrix_mod(
+                        &slots,
+                        q_i,
+                        primitive_power_of_two_root(q_i, num_slots),
+                    );
+                    naive_inverse_matrix_from_state(
+                        &forward_matrix,
+                        q_i,
+                        primitive_power_of_two_root(q_i, num_slots),
+                    )
+                })
                 .collect::<Vec<_>>();
-            assert_slots_match_by_tower(&output_poly, &expected, &q_moduli, num_slots);
+            assert_matrix_match_by_tower(&output_poly, &expected_matrix, &q_moduli, num_slots);
         }
     }
 
     #[test]
     #[sequential_test::sequential]
-    fn forward_inverse_round_trip_respects_reduced_active_levels() {
+    fn forward_inverse_round_trip_matches_pass_through_slot_transfer_model_with_reduced_active_levels()
+     {
         let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = test_context(&mut circuit, &params);
@@ -765,11 +883,19 @@ mod tests {
         let output_poly = eval_single_output(&params, &circuit, eval_inputs, 16);
         let q_moduli = active_q_moduli(&params, &input);
         assert_eq!(q_moduli.len(), 2, "reduced active level should use two towers");
-        let expected = q_moduli
+        let expected_matrix = q_moduli
             .iter()
-            .map(|&q_i| slots.iter().map(|&slot| slot % q_i).collect::<Vec<_>>())
+            .map(|&q_i| {
+                let forward_matrix =
+                    naive_forward_matrix_mod(&slots, q_i, primitive_power_of_two_root(q_i, 16));
+                naive_inverse_matrix_from_state(
+                    &forward_matrix,
+                    q_i,
+                    primitive_power_of_two_root(q_i, 16),
+                )
+            })
             .collect::<Vec<_>>();
-        assert_slots_match_by_tower(&output_poly, &expected, &q_moduli, 16);
+        assert_matrix_match_by_tower(&output_poly, &expected_matrix, &q_moduli, 16);
     }
 
     #[test]

@@ -14,7 +14,7 @@ This repository provides implementations for lattice-cryptography operations (po
 ## Codex Workflow
 This repository uses a long-running Codex session workflow governed by `BUILDER.md`, `PLANS.md`, and `REVIEWER.md`.
 - Before starting any task or reading any other files, read and follow `REVIEWER.md` for explicit review tasks and `BUILDER.md` for all other tasks.
-- Follow `PLAN.md` to create and update a plan document for each session.
+- Follow `PLANS.md` to create and update a plan document for each session.
 - Discover the current session id from the handoff or hook payload.
 - Treat `## Plan approval` and `## Phase` in the session plan as the workflow state.
 - The builder behaves differently by plan approval status:

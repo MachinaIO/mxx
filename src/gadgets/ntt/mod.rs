@@ -1,12 +1,15 @@
 //! Radix-2 NTT / inverse NTT gadgets over packed slots stored inside one `NestedRnsPoly`.
 //!
 //! Public ordering convention:
-//! - input slots are in normal order
-//! - output slots are in normal order
+//! - `forward_ntt` consumes coefficient slots in standard order and produces OpenFHE-style
+//!   bit-reversed evaluation slots
+//! - `inverse_ntt` consumes that same OpenFHE-style bit-reversed evaluation ordering and produces
+//!   coefficient slots in standard order
 //!
-//! Internally, the forward transform applies an initial bit-reversal permutation and then uses
-//! Cooley-Tukey stages. The inverse transform uses Gentleman-Sande stages, multiplies by `n^{-1}`,
-//! and then applies a final bit-reversal permutation.
+//! The butterfly stages mirror OpenFHE's power-of-two FTT convention directly: per active tower
+//! we derive a primitive `2n`-th root `psi`, precompute the bit-reversed power tables used by
+//! `table[m + i]`, run Cooley-Tukey butterflies for the forward transform, and run
+//! Gentleman-Sande butterflies plus a final `n^{-1}` multiplication for the inverse transform.
 //!
 //! Preconditions:
 //! - `num_slots` must be a power of two
@@ -136,61 +139,6 @@ fn bit_reverse_index(mut index: usize, bits: u32) -> usize {
     reversed
 }
 
-fn bit_reverse_permutation(num_slots: usize) -> Vec<(u32, Option<Vec<u64>>)> {
-    let bits = num_slots.trailing_zeros();
-    (0..num_slots)
-        .into_par_iter()
-        .map(|slot| {
-            (
-                u32::try_from(bit_reverse_index(slot, bits))
-                    .expect("bit-reversal permutation exceeds u32"),
-                None,
-            )
-        })
-        .collect()
-}
-
-fn permutation_slot_transfer(slot_sources: &[usize]) -> Vec<(u32, Option<Vec<u64>>)> {
-    slot_sources
-        .par_iter()
-        .map(|&src_slot| {
-            (u32::try_from(src_slot).expect("slot permutation source exceeds u32"), None)
-        })
-        .collect()
-}
-
-fn invert_permutation(slot_order: &[usize]) -> Vec<usize> {
-    let mut inverse = vec![0usize; slot_order.len()];
-    for (slot_idx, &ordered_slot) in slot_order.iter().enumerate() {
-        inverse[ordered_slot] = slot_idx;
-    }
-    inverse
-}
-
-fn packed_encoding_automorphism_generator(two_n: usize) -> u64 {
-    match two_n {
-        4 | 8 => (two_n - 1) as u64,
-        _ => 3,
-    }
-}
-
-fn negacyclic_slot_order(num_slots: usize) -> Vec<usize> {
-    let bits = num_slots.trailing_zeros();
-    let two_n = num_slots * 2;
-    let generator = packed_encoding_automorphism_generator(two_n);
-    let generator_inverse =
-        mod_inverse(generator, two_n as u64).expect("automorphism generator must be invertible");
-    (0..num_slots)
-        .into_par_iter()
-        .map(|slot| {
-            let odd_exponent = (2 * bit_reverse_index(slot, bits) + 1) as u64;
-            let ordered_odd_exponent = (generator_inverse * odd_exponent) % two_n as u64;
-            usize::try_from((ordered_odd_exponent - 1) / 2)
-                .expect("negacyclic slot order index must fit in usize")
-        })
-        .collect()
-}
-
 fn attach_slot_residues(
     src_slot_indices: Vec<u32>,
     residues_by_q: &[Vec<u64>],
@@ -234,130 +182,53 @@ fn active_q_moduli<P: Poly>(params: &impl PolyParams, poly: &NestedRnsPoly<P>) -
     q_moduli.into_par_iter().take(resolved_active_levels(poly)).collect()
 }
 
-fn invert_square_matrix_mod(matrix: &[Vec<u64>], modulus: u64) -> Vec<Vec<u64>> {
-    let n = matrix.len();
-    assert!(n > 0, "matrix must be non-empty");
-    assert!(
-        matrix.par_iter().all(|row| row.len() == n),
-        "matrix must be square: expected {n} columns in every row"
-    );
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenFheFttTables {
+    forward_by_q: Vec<Vec<u64>>,
+    inverse_by_q: Vec<Vec<u64>>,
+    n_inverse_by_q: Vec<u64>,
+}
 
-    let mut augmented = matrix
-        .iter()
-        .enumerate()
-        .map(|(row_idx, row)| {
-            let mut augmented_row = Vec::with_capacity(2 * n);
-            augmented_row.extend(row.iter().map(|&value| value % modulus));
-            augmented_row.extend((0..n).map(|col_idx| if row_idx == col_idx { 1 } else { 0 }));
-            augmented_row
-        })
-        .collect::<Vec<_>>();
-
-    for pivot_idx in 0..n {
-        let pivot_row = (pivot_idx..n)
-            .find(|&row_idx| augmented[row_idx][pivot_idx] != 0)
-            .expect("matrix must be invertible modulo the CRT modulus");
-        if pivot_row != pivot_idx {
-            augmented.swap(pivot_idx, pivot_row);
-        }
-
-        let pivot_inverse = mod_inverse(augmented[pivot_idx][pivot_idx], modulus)
-            .expect("pivot must be invertible modulo the CRT modulus");
-        for value in augmented[pivot_idx].iter_mut() {
-            *value = mod_mul(*value, pivot_inverse, modulus);
-        }
-
-        let pivot_snapshot = augmented[pivot_idx].clone();
-        for (row_idx, row) in augmented.iter_mut().enumerate() {
-            if row_idx == pivot_idx {
-                continue;
-            }
-            let factor = row[pivot_idx];
-            if factor == 0 {
-                continue;
-            }
-            for (col_idx, value) in row.iter_mut().enumerate() {
-                let correction = mod_mul(factor, pivot_snapshot[col_idx], modulus);
-                *value = (*value + modulus - correction) % modulus;
-            }
-        }
+fn bit_reversed_power_table(root: u64, modulus: u64, num_slots: usize) -> Vec<u64> {
+    let bits = num_slots.trailing_zeros();
+    let mut table = vec![0u64; num_slots];
+    let mut power = 1u64;
+    for idx in 0..num_slots {
+        table[bit_reverse_index(idx, bits)] = power;
+        power = mod_mul(power, root, modulus);
     }
-
-    augmented.into_iter().map(|row| row.into_iter().skip(n).collect()).collect()
+    table
 }
 
-fn inverse_ntt_matrix(params: &DCRTPolyParams, q_idx: usize, num_slots: usize) -> Vec<Vec<u64>> {
-    let q_i = params.to_crt().0[q_idx];
-    let columns = (0..num_slots)
-        .into_par_iter()
-        .map(|slot_idx| {
-            let basis_slots = (0..num_slots)
-                .map(|idx| if idx == slot_idx { BigUint::from(1u64) } else { BigUint::from(0u64) })
-                .collect::<Vec<_>>();
-            DCRTPoly::from_biguints_eval_single_mod(params, q_idx, &basis_slots)
-                .coeffs_biguints()
-                .into_iter()
-                .take(num_slots)
-                .map(|coeff| coeff.to_u64_digits().first().copied().unwrap_or(0) % q_i)
-                .collect::<Vec<_>>()
+fn openfhe_ftt_tables(q_moduli: &[u64], num_slots: usize) -> OpenFheFttTables {
+    let (forward_by_q, inverse_by_q, n_inverse_by_q): (Vec<_>, Vec<_>, Vec<_>) = q_moduli
+        .par_iter()
+        .map(|&q_i| {
+            let psi = primitive_power_of_two_root(q_i, 2 * num_slots);
+            let omega = mod_mul(psi, psi, q_i);
+            debug_assert_eq!(mod_pow(psi, num_slots as u64, q_i), q_i - 1);
+            debug_assert_eq!(mod_pow(omega, num_slots as u64, q_i), 1);
+            debug_assert!(num_slots == 1 || mod_pow(omega, (num_slots / 2) as u64, q_i) != 1);
+
+            let inverse_psi = mod_inverse(psi, q_i).expect("psi must be invertible modulo q_i");
+            let forward_table = bit_reversed_power_table(psi, q_i, num_slots);
+            let inverse_table = bit_reversed_power_table(inverse_psi, q_i, num_slots);
+            let n_inverse = mod_inverse(num_slots as u64, q_i)
+                .expect("num_slots must be invertible modulo q_i");
+            (forward_table, inverse_table, n_inverse)
         })
-        .collect::<Vec<_>>();
-
-    (0..num_slots)
-        .into_par_iter()
-        .map(|row_idx| columns.par_iter().map(|column| column[row_idx]).collect())
-        .collect()
-}
-
-fn transform_matrices(
-    params: &DCRTPolyParams,
-    active_levels: usize,
-    num_slots: usize,
-    invert: bool,
-) -> Vec<Vec<Vec<u64>>> {
-    (0..active_levels)
-        .into_par_iter()
-        .map(|q_idx| {
-            let inverse_matrix = inverse_ntt_matrix(params, q_idx, num_slots);
-            if invert {
-                invert_square_matrix_mod(&inverse_matrix, params.to_crt().0[q_idx])
-            } else {
-                inverse_matrix
-            }
-        })
-        .collect()
-}
-
-fn apply_linear_slot_transform<P: Poly>(
-    circuit: &mut PolyCircuit<P>,
-    input: &NestedRnsPoly<P>,
-    matrices_by_q: &[Vec<Vec<u64>>],
-) -> NestedRnsPoly<P> {
-    let num_slots = matrices_by_q.first().map_or(0, |matrix| matrix.len());
-    assert!(num_slots > 0, "transform matrix must not be empty");
-    assert!(
-        matrices_by_q.par_iter().all(|matrix| matrix.len() == num_slots &&
-            matrix.par_iter().all(|row| row.len() == num_slots)),
-        "all transform matrices must be square with dimension {num_slots}"
-    );
-
-    let zero_transfer = attach_slot_residues(
-        vec![0u32; num_slots],
-        &vec![vec![0u64; num_slots]; matrices_by_q.len()],
-    );
-    let mut acc = input.slot_transfer(&zero_transfer, circuit);
-
-    for src_slot in 0..num_slots {
-        let residues_by_q = matrices_by_q
-            .par_iter()
-            .map(|matrix| matrix.par_iter().map(|row| row[src_slot]).collect::<Vec<_>>())
-            .collect::<Vec<_>>();
-        let transfer = attach_slot_residues(vec![src_slot as u32; num_slots], &residues_by_q);
-        let contribution = input.slot_transfer(&transfer, circuit);
-        acc = acc.add_full_reduce(&contribution, circuit);
-    }
-
-    acc
+        .collect::<Vec<_>>()
+        .into_iter()
+        .fold(
+            (Vec::new(), Vec::new(), Vec::new()),
+            |mut acc, (forward_table, inverse_table, n_inverse)| {
+                acc.0.push(forward_table);
+                acc.1.push(inverse_table);
+                acc.2.push(n_inverse);
+                acc
+            },
+        );
+    OpenFheFttTables { forward_by_q, inverse_by_q, n_inverse_by_q }
 }
 
 pub fn encode_nested_rns_poly_vec(
@@ -395,39 +266,37 @@ fn build_forward_stage_plan(
     stage_index: usize,
     num_slots: usize,
     q_moduli: &[u64],
-    roots: &[u64],
+    root_tables_by_q: &[Vec<u64>],
 ) -> ButterflyStagePlan {
-    let m = 1usize << (stage_index + 1);
-    let half = m / 2;
-    let stride = num_slots / m;
+    let m = 1usize << stage_index;
+    let t = num_slots >> (stage_index + 1);
+    let group_len = t << 1;
     let partner_sources = (0..num_slots)
         .into_par_iter()
         .map(|slot| {
-            let offset = slot % m;
-            let partner = if offset < half { slot + half } else { slot - half };
+            let offset = slot % group_len;
+            let partner = if offset < t { slot + t } else { slot - t };
             u32::try_from(partner).expect("stage permutation exceeds u32")
         })
         .collect::<Vec<_>>();
     let (alpha_residues_by_q, beta_residues_by_q): (Vec<_>, Vec<_>) = q_moduli
         .par_iter()
-        .zip(roots.par_iter())
-        .map(|(&q_i, &root)| {
+        .zip(root_tables_by_q.par_iter())
+        .map(|(&q_i, root_table)| {
             let alpha_row = (0..num_slots)
                 .into_par_iter()
                 .map(|slot| {
-                    let offset = slot % m;
-                    let j = if offset < half { offset } else { offset - half };
-                    let twiddle = mod_pow(root, (j * stride) as u64, q_i);
-                    if offset < half { 1 } else { mod_neg(twiddle, q_i) }
+                    let i = slot / group_len;
+                    let omega = root_table[m + i];
+                    if slot % group_len < t { 1 } else { mod_neg(omega, q_i) }
                 })
                 .collect::<Vec<_>>();
             let beta_row = (0..num_slots)
                 .into_par_iter()
                 .map(|slot| {
-                    let offset = slot % m;
-                    let j = if offset < half { offset } else { offset - half };
-                    let twiddle = mod_pow(root, (j * stride) as u64, q_i);
-                    if offset < half { twiddle } else { 1 }
+                    let i = slot / group_len;
+                    let omega = root_table[m + i];
+                    if slot % group_len < t { omega } else { 1 }
                 })
                 .collect::<Vec<_>>();
             (alpha_row, beta_row)
@@ -450,39 +319,37 @@ fn build_inverse_stage_plan(
     stage_index: usize,
     num_slots: usize,
     q_moduli: &[u64],
-    inverse_roots: &[u64],
+    inverse_root_tables_by_q: &[Vec<u64>],
 ) -> ButterflyStagePlan {
-    let m = num_slots >> stage_index;
-    let half = m / 2;
-    let stride = num_slots / m;
+    let m = num_slots >> (stage_index + 1);
+    let t = 1usize << stage_index;
+    let group_len = t << 1;
     let partner_sources = (0..num_slots)
         .into_par_iter()
         .map(|slot| {
-            let offset = slot % m;
-            let partner = if offset < half { slot + half } else { slot - half };
+            let offset = slot % group_len;
+            let partner = if offset < t { slot + t } else { slot - t };
             u32::try_from(partner).expect("stage permutation exceeds u32")
         })
         .collect::<Vec<_>>();
     let (alpha_residues_by_q, beta_residues_by_q): (Vec<_>, Vec<_>) = q_moduli
         .par_iter()
-        .zip(inverse_roots.par_iter())
-        .map(|(&q_i, &inv_root)| {
+        .zip(inverse_root_tables_by_q.par_iter())
+        .map(|(&q_i, inverse_root_table)| {
             let alpha_row = (0..num_slots)
                 .into_par_iter()
                 .map(|slot| {
-                    let offset = slot % m;
-                    let j = if offset < half { offset } else { offset - half };
-                    let twiddle = mod_pow(inv_root, (j * stride) as u64, q_i);
-                    if offset < half { 1 } else { mod_neg(twiddle, q_i) }
+                    let i = slot / group_len;
+                    let omega = inverse_root_table[m + i];
+                    if slot % group_len < t { 1 } else { mod_neg(omega, q_i) }
                 })
                 .collect::<Vec<_>>();
             let beta_row = (0..num_slots)
                 .into_par_iter()
                 .map(|slot| {
-                    let offset = slot % m;
-                    let j = if offset < half { offset } else { offset - half };
-                    let twiddle = mod_pow(inv_root, (j * stride) as u64, q_i);
-                    if offset < half { 1 } else { twiddle }
+                    let i = slot / group_len;
+                    let omega = inverse_root_table[m + i];
+                    if slot % group_len < t { 1 } else { omega }
                 })
                 .collect::<Vec<_>>();
             (alpha_row, beta_row)
@@ -533,80 +400,6 @@ fn multiply_by_tower_constants<P: Poly>(
     input.const_mul_full_reduce(&tower_constants, circuit)
 }
 
-fn multiply_by_slot_constants<P: Poly>(
-    circuit: &mut PolyCircuit<P>,
-    input: &NestedRnsPoly<P>,
-    residues_by_q: &[Vec<u64>],
-) -> NestedRnsPoly<P> {
-    let num_slots = residues_by_q
-        .first()
-        .map(|row| row.len())
-        .expect("slot constants must contain at least one q tower");
-    let slot_transfer = attach_slot_residues(
-        (0..num_slots)
-            .into_par_iter()
-            .map(|slot| u32::try_from(slot).expect("slot identity source exceeds u32"))
-            .collect(),
-        residues_by_q,
-    );
-    input.slot_transfer(&slot_transfer, circuit).full_reduce(circuit)
-}
-
-fn forward_ntt_cyclic(
-    params: &DCRTPolyParams,
-    circuit: &mut PolyCircuit<DCRTPoly>,
-    input: &NestedRnsPoly<DCRTPoly>,
-    num_slots: usize,
-) -> NestedRnsPoly<DCRTPoly> {
-    let q_moduli = active_q_moduli(params, input);
-    let roots = q_moduli
-        .par_iter()
-        .map(|&q_i| primitive_power_of_two_root(q_i, num_slots))
-        .collect::<Vec<_>>();
-
-    let mut current = input.slot_transfer(&bit_reverse_permutation(num_slots), circuit);
-    for stage_index in 0..num_slots.trailing_zeros() as usize {
-        let plan = build_forward_stage_plan(stage_index, num_slots, &q_moduli, &roots);
-        current = apply_stage(circuit, &current, &plan);
-    }
-    current
-}
-
-fn inverse_ntt_cyclic(
-    params: &DCRTPolyParams,
-    circuit: &mut PolyCircuit<DCRTPoly>,
-    input: &NestedRnsPoly<DCRTPoly>,
-    num_slots: usize,
-) -> NestedRnsPoly<DCRTPoly> {
-    let q_moduli = active_q_moduli(params, input);
-    let roots = q_moduli
-        .par_iter()
-        .map(|&q_i| primitive_power_of_two_root(q_i, num_slots))
-        .collect::<Vec<_>>();
-    let inverse_roots = roots
-        .par_iter()
-        .zip(q_moduli.par_iter())
-        .map(|(&root, &q_i)| mod_inverse(root, q_i).expect("root must be invertible modulo q_i"))
-        .collect::<Vec<_>>();
-
-    let mut current = input.clone();
-    for stage_index in 0..num_slots.trailing_zeros() as usize {
-        let plan = build_inverse_stage_plan(stage_index, num_slots, &q_moduli, &inverse_roots);
-        current = apply_stage(circuit, &current, &plan);
-    }
-
-    let n_inverse_by_q = q_moduli
-        .par_iter()
-        .map(|&q_i| {
-            mod_inverse(num_slots as u64, q_i).expect("num_slots must be invertible modulo q_i")
-        })
-        .collect::<Vec<_>>();
-    let scale_residues_by_q =
-        n_inverse_by_q.par_iter().map(|&scale| vec![scale; num_slots]).collect::<Vec<_>>();
-    let scaled = multiply_by_tower_constants(circuit, &current, &scale_residues_by_q);
-    scaled.slot_transfer(&bit_reverse_permutation(num_slots), circuit)
-}
-
 pub fn forward_ntt(
     params: &DCRTPolyParams,
     circuit: &mut PolyCircuit<DCRTPoly>,
@@ -615,24 +408,15 @@ pub fn forward_ntt(
 ) -> NestedRnsPoly<DCRTPoly> {
     validate_num_slots::<DCRTPoly>(params, num_slots);
     let q_moduli = active_q_moduli(params, input);
-    let psi_by_q = q_moduli
-        .par_iter()
-        .map(|&q_i| primitive_power_of_two_root(q_i, num_slots * 2))
-        .collect::<Vec<_>>();
-    let twist_residues_by_q = q_moduli
-        .par_iter()
-        .zip(psi_by_q.par_iter())
-        .map(|(&q_i, &psi)| {
-            (0..num_slots)
-                .into_par_iter()
-                .map(|slot| mod_pow(psi, slot as u64, q_i))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let twisted = multiply_by_slot_constants(circuit, input, &twist_residues_by_q);
-    let cyclic = forward_ntt_cyclic(params, circuit, &twisted, num_slots);
-    let slot_order = negacyclic_slot_order(num_slots);
-    cyclic.slot_transfer(&permutation_slot_transfer(&slot_order), circuit)
+    let tables = openfhe_ftt_tables(&q_moduli, num_slots);
+
+    let mut current = input.clone();
+    for stage_index in 0..num_slots.trailing_zeros() as usize {
+        let plan =
+            build_forward_stage_plan(stage_index, num_slots, &q_moduli, &tables.forward_by_q);
+        current = apply_stage(circuit, &current, &plan);
+    }
+    current
 }
 
 pub fn inverse_ntt(
@@ -643,30 +427,18 @@ pub fn inverse_ntt(
 ) -> NestedRnsPoly<DCRTPoly> {
     validate_num_slots::<DCRTPoly>(params, num_slots);
     let q_moduli = active_q_moduli(params, input);
-    let psi_by_q = q_moduli
-        .par_iter()
-        .map(|&q_i| primitive_power_of_two_root(q_i, num_slots * 2))
-        .collect::<Vec<_>>();
-    let inverse_psi_by_q = psi_by_q
-        .par_iter()
-        .zip(q_moduli.par_iter())
-        .map(|(&psi, &q_i)| mod_inverse(psi, q_i).expect("psi must be invertible modulo q_i"))
-        .collect::<Vec<_>>();
-    let slot_order = negacyclic_slot_order(num_slots);
-    let inverse_slot_order = invert_permutation(&slot_order);
-    let permuted = input.slot_transfer(&permutation_slot_transfer(&inverse_slot_order), circuit);
-    let cyclic = inverse_ntt_cyclic(params, circuit, &permuted, num_slots);
-    let twist_residues_by_q = q_moduli
-        .par_iter()
-        .zip(inverse_psi_by_q.par_iter())
-        .map(|(&q_i, &inv_psi)| {
-            (0..num_slots)
-                .into_par_iter()
-                .map(|slot| mod_pow(inv_psi, slot as u64, q_i))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    multiply_by_slot_constants(circuit, &cyclic, &twist_residues_by_q)
+    let tables = openfhe_ftt_tables(&q_moduli, num_slots);
+
+    let mut current = input.clone();
+    for stage_index in 0..num_slots.trailing_zeros() as usize {
+        let plan =
+            build_inverse_stage_plan(stage_index, num_slots, &q_moduli, &tables.inverse_by_q);
+        current = apply_stage(circuit, &current, &plan);
+    }
+
+    let scale_residues_by_q =
+        tables.n_inverse_by_q.par_iter().map(|&scale| vec![scale; num_slots]).collect::<Vec<_>>();
+    multiply_by_tower_constants(circuit, &current, &scale_residues_by_q)
 }
 
 #[cfg(test)]
@@ -756,30 +528,29 @@ mod tests {
             .fold(BigUint::from(1u64), |acc, q_i| acc * BigUint::from(q_i))
     }
 
-    fn assert_reconstructed_matches_eval_coeffs(
+    fn assert_reconstructed_matches_expected_values(
         params: &DCRTPolyParams,
         actual_coeffs: &[BigUint],
-        slots: &[BigUint],
+        expected_values: &[BigUint],
         active_levels: usize,
     ) {
-        let expected_coeffs = eval_slot_coeffs(params, slots);
         assert_eq!(
             actual_coeffs.len(),
-            expected_coeffs.len(),
+            expected_values.len(),
             "coefficient vector length mismatch"
         );
 
         let (q_moduli, _, _) = params.to_crt();
         if active_levels == q_moduli.len() {
             assert_eq!(
-                actual_coeffs, expected_coeffs,
-                "reconstructed coefficients must match the polynomial encoded from evaluation slots"
+                actual_coeffs, expected_values,
+                "reconstructed values must match the expected public slot values"
             );
             return;
         }
 
         let q_level_modulus = active_q_level_modulus(params, active_levels);
-        actual_coeffs.par_iter().zip(expected_coeffs.par_iter()).enumerate().for_each(
+        actual_coeffs.par_iter().zip(expected_values.par_iter()).enumerate().for_each(
             |(coeff_idx, (actual, expected))| {
                 assert_eq!(
                     actual % &q_level_modulus,
@@ -795,6 +566,21 @@ mod tests {
                     );
                 }
             },
+        );
+    }
+
+    fn assert_reconstructed_matches_eval_coeffs(
+        params: &DCRTPolyParams,
+        actual_coeffs: &[BigUint],
+        slots: &[BigUint],
+        active_levels: usize,
+    ) {
+        let expected_coeffs = eval_slot_coeffs(params, slots);
+        assert_reconstructed_matches_expected_values(
+            params,
+            actual_coeffs,
+            &expected_coeffs,
+            active_levels,
         );
     }
 
@@ -839,7 +625,7 @@ mod tests {
         let eval_inputs = encode_nested_rns_poly_vec(&params, ctx.as_ref(), &slots, None);
         let output_poly = eval_single_output(&params, &circuit, eval_inputs, 2);
         let output_coeffs = reconstructed_output_coeffs(&output_poly, 2);
-        assert_reconstructed_matches_eval_coeffs(
+        assert_reconstructed_matches_expected_values(
             &params,
             &output_coeffs,
             &slots,
@@ -865,7 +651,7 @@ mod tests {
         let eval_inputs = encode_nested_rns_poly_vec(&params, ctx.as_ref(), &slots, None);
         let output_poly = eval_single_output(&params, &circuit, eval_inputs, 16);
         let output_coeffs = reconstructed_output_coeffs(&output_poly, 16);
-        assert_reconstructed_matches_eval_coeffs(
+        assert_reconstructed_matches_expected_values(
             &params,
             &output_coeffs,
             &slots,
@@ -892,7 +678,7 @@ mod tests {
             encode_nested_rns_poly_vec(&params, ctx.as_ref(), &slots, input.enable_levels);
         let output_poly = eval_single_output(&params, &circuit, eval_inputs, 16);
         let output_coeffs = reconstructed_output_coeffs(&output_poly, 16);
-        assert_reconstructed_matches_eval_coeffs(
+        assert_reconstructed_matches_expected_values(
             &params,
             &output_coeffs,
             &slots,
@@ -936,7 +722,7 @@ mod tests {
                 encode_nested_rns_poly_vec(&params, ctx.as_ref(), &slots, input.enable_levels);
             let output_poly = eval_single_output(&params, &circuit, eval_inputs, num_slots);
             let output_coeffs = reconstructed_output_coeffs(&output_poly, num_slots);
-            assert_reconstructed_matches_eval_coeffs(
+            assert_reconstructed_matches_expected_values(
                 &params,
                 &output_coeffs,
                 &slots,
@@ -966,7 +752,7 @@ mod tests {
             encode_nested_rns_poly_vec(&params, ctx.as_ref(), &slots, input.enable_levels);
         let output_poly = eval_single_output(&params, &circuit, eval_inputs, 16);
         let output_coeffs = reconstructed_output_coeffs(&output_poly, 16);
-        assert_reconstructed_matches_eval_coeffs(
+        assert_reconstructed_matches_expected_values(
             &params,
             &output_coeffs,
             &slots,
@@ -986,13 +772,17 @@ mod tests {
         circuit.output(vec![reconstructed]);
 
         let slots = random_slots(&params, resolved_active_levels(&input), 16);
-        let expected_coeffs = eval_slot_coeffs(&params, &slots);
         let eval_inputs =
             encode_nested_rns_poly_vec(&params, ctx.as_ref(), &slots, input.enable_levels);
         let output_poly = eval_single_output(&params, &circuit, eval_inputs, 16);
         let output_coeffs = reconstructed_output_coeffs(&output_poly, 16);
 
-        assert_eq!(output_coeffs, expected_coeffs);
+        assert_reconstructed_matches_eval_coeffs(
+            &params,
+            &output_coeffs,
+            &slots,
+            resolved_active_levels(&input),
+        );
     }
 
     #[test]

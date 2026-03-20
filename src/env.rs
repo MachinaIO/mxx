@@ -128,14 +128,7 @@ pub fn slot_transfer_slot_parallelism() -> usize {
     #[cfg(feature = "gpu")]
     {
         let device_count = default_gpu_parallelism();
-        let value = parsed.unwrap_or(device_count);
-        assert!(
-            value <= device_count,
-            "SLOT_TRANSFER_SLOT_PARALLELISM must be <= detected GPU count: requested={}, devices={}",
-            value,
-            device_count
-        );
-        value
+        parsed.unwrap_or(device_count).min(device_count).max(1)
     }
     #[cfg(not(feature = "gpu"))]
     {

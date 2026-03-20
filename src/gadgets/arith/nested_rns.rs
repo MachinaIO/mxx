@@ -17,6 +17,7 @@ use tracing::{debug, info};
 
 #[derive(Debug, Clone)]
 pub struct NestedRnsPolyContext {
+    pub p_moduli_bits: usize,
     pub p_moduli: Vec<u64>,
     pub q_moduli_depth: usize,
     lazy_reduce_id: usize,
@@ -205,6 +206,7 @@ impl NestedRnsPolyContext {
                 })
                 .collect::<Vec<_>>();
             return Self {
+                p_moduli_bits,
                 p_moduli,
                 q_moduli_depth,
                 lazy_reduce_id,
@@ -500,6 +502,7 @@ impl NestedRnsPolyContext {
             .collect::<Vec<_>>();
 
         Self {
+            p_moduli_bits,
             p_moduli,
             q_moduli_depth,
             lazy_reduce_id,
@@ -825,65 +828,60 @@ impl<P: Poly> NestedRnsPoly<P> {
         enable_levels: Option<usize>,
         circuit: &mut PolyCircuit<P>,
     ) -> Self {
-        let inner = (0..ctx.q_moduli_depth).map(|_| circuit.input(ctx.p_moduli.len())).collect();
-        Self::new(ctx, inner, enable_levels)
-    }
-
-    pub fn constant_from_tower_slot_residues(
-        ctx: Arc<NestedRnsPolyContext>,
-        enable_levels: Option<usize>,
-        params: &P::Params,
-        residues_by_q: &[Vec<u64>],
-        circuit: &mut PolyCircuit<P>,
-    ) -> Self {
-        assert_eq!(
-            residues_by_q.len() <= ctx.q_moduli_depth,
-            true,
-            "tower residue depth {} exceeds nested RNS q_moduli_depth {}",
-            residues_by_q.len(),
+        let input_count = enable_levels.unwrap_or(ctx.q_moduli_depth);
+        assert!(
+            input_count <= ctx.q_moduli_depth,
+            "enable_levels exceeds q_moduli_depth: enable_levels={input_count}, q_moduli_depth={}",
             ctx.q_moduli_depth
         );
-        let num_slots = residues_by_q.first().map(Vec::len).unwrap_or(0);
-        let inner = residues_by_q
-            .iter()
-            .map(|slot_residues| {
-                assert_eq!(
-                    slot_residues.len(),
-                    num_slots,
-                    "all tower residue vectors must have the same slot count"
-                );
-                ctx.p_moduli
-                    .iter()
-                    .map(|&p_i| {
-                        let slot_values = slot_residues
-                            .iter()
-                            .map(|&value| BigUint::from(value % p_i))
-                            .collect::<Vec<_>>();
-                        let poly = P::from_biguints_eval(params, &slot_values);
-                        circuit.const_poly(&poly)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+        let inner = (0..input_count).map(|_| circuit.input(ctx.p_moduli.len())).collect();
         Self::new(ctx, inner, enable_levels)
     }
 
     pub fn slot_transfer(
         &self,
-        src_slots: &[(u32, Option<u32>)],
+        src_slots: &[(u32, Option<Vec<u64>>)],
         circuit: &mut PolyCircuit<P>,
     ) -> Self {
-        let inner = self
-            .inner
-            .iter()
-            .map(|q_level| {
-                q_level
-                    .iter()
-                    .map(|&gate_id| circuit.slot_transfer_gate(gate_id, src_slots))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        Self { ctx: self.ctx.clone(), inner, enable_levels: self.enable_levels, _p: PhantomData }
+        let levels = self.resolve_enable_levels();
+        let mut inner = Vec::with_capacity(levels);
+        for q_moduli_idx in 0..levels {
+            let q_level = &self.inner[q_moduli_idx];
+            assert_eq!(
+                q_level.len(),
+                self.ctx.p_moduli.len(),
+                "mismatched p_moduli depth for q_moduli_idx {}",
+                q_moduli_idx
+            );
+            let lowered_level = q_level
+                .iter()
+                .zip(self.ctx.p_moduli.iter())
+                .map(|(&gate_id, &p_j)| {
+                    let lowered_src_slots = src_slots
+                        .iter()
+                        .enumerate()
+                        .map(|(slot_idx, (src_slot, slot_scalars))| {
+                            let scalar = slot_scalars.as_ref().map(|slot_scalars| {
+                                let residue = *slot_scalars.get(q_moduli_idx).unwrap_or_else(|| {
+                                    panic!(
+                                        "slot {} scalar depth {} does not cover q_moduli_idx {}",
+                                        slot_idx,
+                                        slot_scalars.len(),
+                                        q_moduli_idx
+                                    )
+                                });
+                                u32::try_from(residue % p_j)
+                                    .expect("slot-transfer scalar must fit in u32")
+                            });
+                            (*src_slot, scalar)
+                        })
+                        .collect::<Vec<_>>();
+                    circuit.slot_transfer_gate(gate_id, &lowered_src_slots)
+                })
+                .collect::<Vec<_>>();
+            inner.push(lowered_level);
+        }
+        Self::new(self.ctx.clone(), inner, self.enable_levels)
     }
 
     pub fn add_lazy_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
@@ -914,6 +912,21 @@ impl<P: Poly> NestedRnsPoly<P> {
     pub fn mul_full_reduce(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
         self.assert_matching_enable_levels(other);
         self.call_binary_subcircuit(other, circuit, &self.ctx.mul_full_reduce_ids)
+    }
+
+    pub fn full_reduce(&self, circuit: &mut PolyCircuit<P>) -> Self {
+        let levels = self.resolve_enable_levels();
+        assert!(
+            levels <= self.ctx.full_reduce_ids.len(),
+            "enable_levels exceeds full_reduce subcircuit depth"
+        );
+        let mut result_inner = Vec::with_capacity(levels);
+        for q_idx in 0..levels {
+            let reduced = circuit.call_sub_circuit(self.ctx.lazy_reduce_id, &self.inner[q_idx]);
+            let outputs = circuit.call_sub_circuit(self.ctx.full_reduce_ids[q_idx], &reduced);
+            result_inner.push(outputs);
+        }
+        Self::new(self.ctx.clone(), result_inner, self.enable_levels)
     }
 
     pub fn const_mul_full_reduce(

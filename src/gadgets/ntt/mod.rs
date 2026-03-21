@@ -377,7 +377,7 @@ fn apply_stage<P: Poly>(
         current.slot_transfer(&plan.alpha_slot_transfer, circuit).full_reduce(circuit);
     let beta_partner =
         current.slot_transfer(&plan.beta_slot_transfer, circuit).full_reduce(circuit);
-    alpha_current.add_full_reduce(&beta_partner, circuit)
+    alpha_current.add(&beta_partner, circuit).full_reduce(circuit)
 }
 
 fn multiply_by_tower_constants<P: Poly>(
@@ -397,7 +397,7 @@ fn multiply_by_tower_constants<P: Poly>(
             first
         })
         .collect::<Vec<_>>();
-    input.const_mul_full_reduce(&tower_constants, circuit)
+    input.const_mul(&tower_constants, circuit).full_reduce(circuit)
 }
 
 pub fn forward_ntt(

@@ -1328,6 +1328,19 @@ mod tests {
 
     #[sequential_test::sequential]
     #[test]
+    fn test_nested_rns_poly_mul_lazy_reduce_reconstruct_maxes() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let modulus = params.modulus();
+        let a_value: BigUint = modulus.as_ref() - BigUint::from(1u64);
+        let b_value: BigUint = modulus.as_ref() - BigUint::from(1u64);
+        test_nested_rns_poly_mul_lazy_reduce_reconstruct_generic(
+            circuit, params, ctx, a_value, b_value,
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
     fn test_nested_rns_poly_const_mul_full_reduce_random() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
@@ -1535,6 +1548,32 @@ mod tests {
                 assert_eq!(output.clone() % BigUint::from(q_i), BigUint::ZERO);
             }
         }
+    }
+
+    fn test_nested_rns_poly_mul_lazy_reduce_reconstruct_generic(
+        mut circuit: PolyCircuit<DCRTPoly>,
+        params: DCRTPolyParams,
+        ctx: Arc<NestedRnsPolyContext>,
+        a_value: BigUint,
+        b_value: BigUint,
+    ) {
+        let poly_a = NestedRnsPoly::input(ctx.clone(), None, &mut circuit);
+        let poly_b = NestedRnsPoly::input(ctx.clone(), None, &mut circuit);
+        let product = poly_a.mul_lazy_reduce(&poly_b, &mut circuit);
+        let out = product.reconstruct(&mut circuit);
+        circuit.output(vec![out]);
+
+        let modulus = params.modulus();
+        let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, None);
+        let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, None);
+        let expected_out = (&a_value * &b_value) % modulus.as_ref();
+        let plt_evaluator = PolyPltEvaluator::new();
+        let one = DCRTPoly::const_one(&params);
+        let eval_inputs = [a_inputs, b_inputs].concat();
+        let eval_results =
+            circuit.eval(&params, one, eval_inputs, Some(&plt_evaluator), None, None);
+        assert_eq!(eval_results.len(), 1);
+        assert_eq!(eval_results[0].coeffs_biguints()[0], expected_out);
     }
 
     fn test_nested_rns_poly_const_mul_full_reduce_generic(

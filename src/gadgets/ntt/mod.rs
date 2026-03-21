@@ -286,8 +286,8 @@ fn active_q_moduli<P: Poly>(params: &impl PolyParams, poly: &NestedRnsPoly<P>) -
     q_moduli.into_par_iter().take(resolved_active_levels(poly)).collect()
 }
 
-pub fn encode_nested_rns_poly_vec(
-    params: &DCRTPolyParams,
+pub fn encode_nested_rns_poly_vec<P: Poly>(
+    params: &P::Params,
     ctx: &NestedRnsPolyContext,
     slots: &[BigUint],
     q_level: Option<usize>,
@@ -511,8 +511,8 @@ pub fn forward_ntt<P: Poly>(
     input: &NestedRnsPoly<P>,
     num_slots: usize,
     radix: usize,
-) -> NestedRnsPoly<DCRTPoly> {
-    validate_num_slots::<DCRTPoly>(params, num_slots);
+) -> NestedRnsPoly<P> {
+    validate_num_slots::<P>(params, num_slots);
     let stage_count = validate_radix(num_slots, radix);
     if num_slots == 1 {
         return input.clone();
@@ -546,8 +546,8 @@ pub fn inverse_ntt<P: Poly>(
     input: &NestedRnsPoly<P>,
     num_slots: usize,
     radix: usize,
-) -> NestedRnsPoly<DCRTPoly> {
-    validate_num_slots::<DCRTPoly>(params, num_slots);
+) -> NestedRnsPoly<P> {
+    validate_num_slots::<P>(params, num_slots);
     let stage_count = validate_radix(num_slots, radix);
     if num_slots == 1 {
         return input.clone();

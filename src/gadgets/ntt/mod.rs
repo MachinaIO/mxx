@@ -1,4 +1,4 @@
-//! Radix-2 NTT / inverse NTT gadgets over packed slots stored inside one `NestedRnsPoly`.
+//! Fixed-radix NTT / inverse NTT gadgets over packed slots stored inside one `NestedRnsPoly`.
 //!
 //! Public ordering convention:
 //! - `forward_ntt` consumes coefficient slots in standard order and produces OpenFHE-style
@@ -8,12 +8,15 @@
 //!
 //! The butterfly stages mirror OpenFHE's power-of-two FTT convention directly: per active tower
 //! we derive a primitive `2n`-th root `psi`, precompute the bit-reversed power tables used by
-//! `table[m + i]`, run Cooley-Tukey butterflies for the forward transform, and run
-//! Gentleman-Sande butterflies plus a final `n^{-1}` multiplication for the inverse transform.
+//! `table[m + i]`, derive radix-2 Cooley-Tukey / Gentleman-Sande stage formulas, and then
+//! optionally collapse consecutive radix-2 stages into a caller-selected fixed power-of-two
+//! butterfly radix for circuit construction.
 //!
 //! Preconditions:
 //! - `num_slots` must be a power of two
 //! - `num_slots` must not exceed `params.ring_dimension()`
+//! - non-default butterfly radices must be powers of two whose `log2` evenly divides
+//!   `log2(num_slots)`
 
 use crate::{
     circuit::{PolyCircuit, evaluable::PolyVec},
@@ -29,8 +32,19 @@ use rayon::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ButterflyStagePlan {
-    alpha_slot_transfer: Vec<(u32, Option<Vec<u64>>)>,
-    beta_slot_transfer: Vec<(u32, Option<Vec<u64>>)>,
+    slot_transfer_terms: Vec<Vec<(u32, Option<Vec<u64>>)>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SymbolicLinearTerm {
+    src_slot: usize,
+    residues_by_q: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransformDirection {
+    Forward,
+    Inverse,
 }
 
 fn validate_num_slots<P: Poly>(params: &P::Params, num_slots: usize) {
@@ -41,6 +55,27 @@ fn validate_num_slots<P: Poly>(params: &P::Params, num_slots: usize) {
         num_slots,
         params.ring_dimension()
     );
+}
+
+fn validate_butterfly_radix(num_slots: usize, radix: usize) -> usize {
+    assert!(radix >= 2, "butterfly radix must be at least 2");
+    assert!(radix.is_power_of_two(), "butterfly radix must be a power of two");
+    if num_slots <= 1 {
+        return 0;
+    }
+    assert!(radix <= num_slots, "butterfly radix {} exceeds num_slots {}", radix, num_slots);
+
+    let radix_log = radix.trailing_zeros() as usize;
+    let slot_log = num_slots.trailing_zeros() as usize;
+    assert!(
+        slot_log.is_multiple_of(radix_log),
+        "num_slots {} is incompatible with butterfly radix {}: log2(num_slots)={} must be divisible by log2(radix)={}",
+        num_slots,
+        radix,
+        slot_log,
+        radix_log
+    );
+    radix_log
 }
 
 fn mod_mul(a: u64, b: u64, modulus: u64) -> u64 {
@@ -139,33 +174,6 @@ fn bit_reverse_index(mut index: usize, bits: u32) -> usize {
     reversed
 }
 
-fn attach_slot_residues(
-    src_slot_indices: Vec<u32>,
-    residues_by_q: &[Vec<u64>],
-) -> Vec<(u32, Option<Vec<u64>>)> {
-    let num_slots = src_slot_indices.len();
-    residues_by_q.par_iter().enumerate().for_each(|(q_idx, residues_for_q)| {
-        assert_eq!(
-            residues_for_q.len(),
-            num_slots,
-            "residue row {} has slot count {}, expected {}",
-            q_idx,
-            residues_for_q.len(),
-            num_slots
-        );
-    });
-    src_slot_indices
-        .into_par_iter()
-        .enumerate()
-        .map(|(slot_idx, src_slot)| {
-            let slot_residues =
-                residues_by_q.par_iter().map(|residues_for_q| residues_for_q[slot_idx]).collect();
-            let slot_residues = if residues_by_q.is_empty() { None } else { Some(slot_residues) };
-            (src_slot, slot_residues)
-        })
-        .collect()
-}
-
 fn resolved_active_levels<P: Poly>(poly: &NestedRnsPoly<P>) -> usize {
     let active_levels = poly.enable_levels.unwrap_or(poly.ctx.q_moduli_depth);
     assert!(
@@ -262,110 +270,155 @@ pub fn encode_nested_rns_poly_vec(
         .collect()
 }
 
-fn build_forward_stage_plan(
+fn identity_symbolic_stage_state(num_slots: usize, q_count: usize) -> Vec<Vec<SymbolicLinearTerm>> {
+    (0..num_slots)
+        .map(|slot| vec![SymbolicLinearTerm { src_slot: slot, residues_by_q: vec![1; q_count] }])
+        .collect()
+}
+
+fn accumulate_scaled_terms(
+    destination: &mut Vec<SymbolicLinearTerm>,
+    source_terms: &[SymbolicLinearTerm],
+    scale_by_q: &[u64],
+    q_moduli: &[u64],
+) {
+    for source_term in source_terms {
+        let scaled_residues = source_term
+            .residues_by_q
+            .iter()
+            .zip(scale_by_q.iter())
+            .zip(q_moduli.iter())
+            .map(|((&coefficient, &scale), &q_i)| mod_mul(coefficient, scale, q_i))
+            .collect::<Vec<_>>();
+        if scaled_residues.iter().all(|&value| value == 0) {
+            continue;
+        }
+
+        if let Some(existing) =
+            destination.iter_mut().find(|existing| existing.src_slot == source_term.src_slot)
+        {
+            for ((residue, scaled), &q_i) in
+                existing.residues_by_q.iter_mut().zip(scaled_residues.iter()).zip(q_moduli.iter())
+            {
+                *residue = (*residue + *scaled) % q_i;
+            }
+        } else {
+            destination.push(SymbolicLinearTerm {
+                src_slot: source_term.src_slot,
+                residues_by_q: scaled_residues,
+            });
+        }
+    }
+}
+
+fn apply_binary_stage_to_symbolic_state(
+    symbolic_state: &[Vec<SymbolicLinearTerm>],
+    direction: TransformDirection,
     stage_index: usize,
     num_slots: usize,
     q_moduli: &[u64],
     root_tables_by_q: &[Vec<u64>],
-) -> ButterflyStagePlan {
-    let m = 1usize << stage_index;
-    let t = num_slots >> (stage_index + 1);
-    let group_len = t << 1;
-    let partner_sources = (0..num_slots)
-        .into_par_iter()
+) -> Vec<Vec<SymbolicLinearTerm>> {
+    (0..symbolic_state.len())
         .map(|slot| {
+            let (m, t) = match direction {
+                TransformDirection::Forward => {
+                    (1usize << stage_index, num_slots >> (stage_index + 1))
+                }
+                TransformDirection::Inverse => {
+                    (num_slots >> (stage_index + 1), 1usize << stage_index)
+                }
+            };
+            let group_len = t << 1;
             let offset = slot % group_len;
-            let partner = if offset < t { slot + t } else { slot - t };
-            u32::try_from(partner).expect("stage permutation exceeds u32")
-        })
-        .collect::<Vec<_>>();
-    let (alpha_residues_by_q, beta_residues_by_q): (Vec<_>, Vec<_>) = q_moduli
-        .par_iter()
-        .zip(root_tables_by_q.par_iter())
-        .map(|(&q_i, root_table)| {
-            let alpha_row = (0..num_slots)
-                .into_par_iter()
-                .map(|slot| {
-                    let i = slot / group_len;
-                    let omega = root_table[m + i];
-                    if slot % group_len < t { 1 } else { mod_neg(omega, q_i) }
+            let partner_slot = if offset < t { slot + t } else { slot - t };
+            let stage_group = slot / group_len;
+            let (self_scale, partner_scale): (Vec<_>, Vec<_>) = q_moduli
+                .iter()
+                .zip(root_tables_by_q.iter())
+                .map(|(&q_i, root_table)| {
+                    let omega = root_table[m + stage_group];
+                    match direction {
+                        TransformDirection::Forward => {
+                            if offset < t {
+                                (1, omega)
+                            } else {
+                                (mod_neg(omega, q_i), 1)
+                            }
+                        }
+                        TransformDirection::Inverse => {
+                            if offset < t {
+                                (1, 1)
+                            } else {
+                                (mod_neg(omega, q_i), omega)
+                            }
+                        }
+                    }
                 })
-                .collect::<Vec<_>>();
-            let beta_row = (0..num_slots)
-                .into_par_iter()
-                .map(|slot| {
-                    let i = slot / group_len;
-                    let omega = root_table[m + i];
-                    if slot % group_len < t { omega } else { 1 }
-                })
-                .collect::<Vec<_>>();
-            (alpha_row, beta_row)
+                .unzip();
+            let mut combined =
+                Vec::with_capacity(symbolic_state[slot].len() + symbolic_state[partner_slot].len());
+            accumulate_scaled_terms(&mut combined, &symbolic_state[slot], &self_scale, q_moduli);
+            accumulate_scaled_terms(
+                &mut combined,
+                &symbolic_state[partner_slot],
+                &partner_scale,
+                q_moduli,
+            );
+            combined.retain(|term| term.residues_by_q.iter().any(|&value| value != 0));
+            combined.sort_by_key(|term| term.src_slot);
+            combined
         })
-        .unzip();
-
-    let alpha_slot_transfer = attach_slot_residues(
-        (0..num_slots)
-            .into_par_iter()
-            .map(|slot| u32::try_from(slot).expect("stage identity slot exceeds u32"))
-            .collect(),
-        &alpha_residues_by_q,
-    );
-    let beta_slot_transfer = attach_slot_residues(partner_sources, &beta_residues_by_q);
-
-    ButterflyStagePlan { alpha_slot_transfer, beta_slot_transfer }
+        .collect()
 }
 
-fn build_inverse_stage_plan(
-    stage_index: usize,
+fn symbolic_stage_plan(
+    symbolic_state: &[Vec<SymbolicLinearTerm>],
+    q_count: usize,
+) -> ButterflyStagePlan {
+    let term_count = symbolic_state.iter().map(|terms| terms.len()).max().unwrap_or(0);
+    assert!(term_count > 0, "stage plan must contain at least one transfer term");
+    let zero_residues = vec![0; q_count];
+    let slot_transfer_terms = (0..term_count)
+        .map(|term_idx| {
+            symbolic_state
+                .iter()
+                .map(|terms| {
+                    let term = terms.get(term_idx).cloned().unwrap_or(SymbolicLinearTerm {
+                        src_slot: 0,
+                        residues_by_q: zero_residues.clone(),
+                    });
+                    (
+                        u32::try_from(term.src_slot).expect("stage permutation exceeds u32"),
+                        Some(term.residues_by_q),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    ButterflyStagePlan { slot_transfer_terms }
+}
+
+fn build_stage_plan(
+    direction: TransformDirection,
+    start_stage_index: usize,
+    stages_per_butterfly: usize,
     num_slots: usize,
     q_moduli: &[u64],
-    inverse_root_tables_by_q: &[Vec<u64>],
+    root_tables_by_q: &[Vec<u64>],
 ) -> ButterflyStagePlan {
-    let m = num_slots >> (stage_index + 1);
-    let t = 1usize << stage_index;
-    let group_len = t << 1;
-    let partner_sources = (0..num_slots)
-        .into_par_iter()
-        .map(|slot| {
-            let offset = slot % group_len;
-            let partner = if offset < t { slot + t } else { slot - t };
-            u32::try_from(partner).expect("stage permutation exceeds u32")
-        })
-        .collect::<Vec<_>>();
-    let (alpha_residues_by_q, beta_residues_by_q): (Vec<_>, Vec<_>) = q_moduli
-        .par_iter()
-        .zip(inverse_root_tables_by_q.par_iter())
-        .map(|(&q_i, inverse_root_table)| {
-            let alpha_row = (0..num_slots)
-                .into_par_iter()
-                .map(|slot| {
-                    let i = slot / group_len;
-                    let omega = inverse_root_table[m + i];
-                    if slot % group_len < t { 1 } else { mod_neg(omega, q_i) }
-                })
-                .collect::<Vec<_>>();
-            let beta_row = (0..num_slots)
-                .into_par_iter()
-                .map(|slot| {
-                    let i = slot / group_len;
-                    let omega = inverse_root_table[m + i];
-                    if slot % group_len < t { 1 } else { omega }
-                })
-                .collect::<Vec<_>>();
-            (alpha_row, beta_row)
-        })
-        .unzip();
-
-    let alpha_slot_transfer = attach_slot_residues(
-        (0..num_slots)
-            .into_par_iter()
-            .map(|slot| u32::try_from(slot).expect("stage identity slot exceeds u32"))
-            .collect(),
-        &alpha_residues_by_q,
-    );
-    let beta_slot_transfer = attach_slot_residues(partner_sources, &beta_residues_by_q);
-
-    ButterflyStagePlan { alpha_slot_transfer, beta_slot_transfer }
+    let mut symbolic_state = identity_symbolic_stage_state(num_slots, q_moduli.len());
+    for stage_offset in 0..stages_per_butterfly {
+        symbolic_state = apply_binary_stage_to_symbolic_state(
+            &symbolic_state,
+            direction,
+            start_stage_index + stage_offset,
+            num_slots,
+            q_moduli,
+            root_tables_by_q,
+        );
+    }
+    symbolic_stage_plan(&symbolic_state, q_moduli.len())
 }
 
 fn apply_stage<P: Poly>(
@@ -373,11 +426,15 @@ fn apply_stage<P: Poly>(
     current: &NestedRnsPoly<P>,
     plan: &ButterflyStagePlan,
 ) -> NestedRnsPoly<P> {
-    let alpha_current =
-        current.slot_transfer(&plan.alpha_slot_transfer, circuit).full_reduce(circuit);
-    let beta_partner =
-        current.slot_transfer(&plan.beta_slot_transfer, circuit).full_reduce(circuit);
-    alpha_current.add_full_reduce(&beta_partner, circuit)
+    let mut stage_terms = plan.slot_transfer_terms.iter();
+    let first_term =
+        stage_terms.next().expect("stage plan must contain at least one transfer term");
+    let mut accumulated = current.slot_transfer(first_term, circuit).full_reduce(circuit);
+    for slot_transfer_term in stage_terms {
+        let next_term = current.slot_transfer(slot_transfer_term, circuit).full_reduce(circuit);
+        accumulated = accumulated.add_full_reduce(&next_term, circuit);
+    }
+    accumulated
 }
 
 fn multiply_by_tower_constants<P: Poly>(
@@ -405,15 +462,26 @@ pub fn forward_ntt(
     circuit: &mut PolyCircuit<DCRTPoly>,
     input: &NestedRnsPoly<DCRTPoly>,
     num_slots: usize,
+    radix: usize,
 ) -> NestedRnsPoly<DCRTPoly> {
     validate_num_slots::<DCRTPoly>(params, num_slots);
+    if num_slots == 1 {
+        return input.clone();
+    }
+    let stages_per_butterfly = validate_butterfly_radix(num_slots, radix);
     let q_moduli = active_q_moduli(params, input);
     let tables = openfhe_ftt_tables(&q_moduli, num_slots);
 
     let mut current = input.clone();
-    for stage_index in 0..num_slots.trailing_zeros() as usize {
-        let plan =
-            build_forward_stage_plan(stage_index, num_slots, &q_moduli, &tables.forward_by_q);
+    for stage_index in (0..num_slots.trailing_zeros() as usize).step_by(stages_per_butterfly) {
+        let plan = build_stage_plan(
+            TransformDirection::Forward,
+            stage_index,
+            stages_per_butterfly,
+            num_slots,
+            &q_moduli,
+            &tables.forward_by_q,
+        );
         current = apply_stage(circuit, &current, &plan);
     }
     current
@@ -424,15 +492,26 @@ pub fn inverse_ntt(
     circuit: &mut PolyCircuit<DCRTPoly>,
     input: &NestedRnsPoly<DCRTPoly>,
     num_slots: usize,
+    radix: usize,
 ) -> NestedRnsPoly<DCRTPoly> {
     validate_num_slots::<DCRTPoly>(params, num_slots);
+    if num_slots == 1 {
+        return input.clone();
+    }
+    let stages_per_butterfly = validate_butterfly_radix(num_slots, radix);
     let q_moduli = active_q_moduli(params, input);
     let tables = openfhe_ftt_tables(&q_moduli, num_slots);
 
     let mut current = input.clone();
-    for stage_index in 0..num_slots.trailing_zeros() as usize {
-        let plan =
-            build_inverse_stage_plan(stage_index, num_slots, &q_moduli, &tables.inverse_by_q);
+    for stage_index in (0..num_slots.trailing_zeros() as usize).step_by(stages_per_butterfly) {
+        let plan = build_stage_plan(
+            TransformDirection::Inverse,
+            stage_index,
+            stages_per_butterfly,
+            num_slots,
+            &q_moduli,
+            &tables.inverse_by_q,
+        );
         current = apply_stage(circuit, &current, &plan);
     }
 
@@ -615,8 +694,8 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = test_context(&mut circuit, &params);
         let input = NestedRnsPoly::input(ctx.clone(), None, &mut circuit);
-        let inverse = inverse_ntt(&params, &mut circuit, &input, 2);
-        let output = forward_ntt(&params, &mut circuit, &inverse, 2);
+        let inverse = inverse_ntt(&params, &mut circuit, &input, 2, 2);
+        let output = forward_ntt(&params, &mut circuit, &inverse, 2, 2);
         let reconstructed = output.reconstruct(&mut circuit);
         circuit.output(vec![reconstructed]);
         assert_top_level_ntt_structure(&circuit);
@@ -641,8 +720,8 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = test_context(&mut circuit, &params);
         let input = NestedRnsPoly::input(ctx.clone(), None, &mut circuit);
-        let inverse = inverse_ntt(&params, &mut circuit, &input, 16);
-        let output = forward_ntt(&params, &mut circuit, &inverse, 16);
+        let inverse = inverse_ntt(&params, &mut circuit, &input, 16, 2);
+        let output = forward_ntt(&params, &mut circuit, &inverse, 16, 2);
         let reconstructed = output.reconstruct(&mut circuit);
         circuit.output(vec![reconstructed]);
         assert_top_level_ntt_structure(&circuit);
@@ -667,8 +746,8 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = test_context_with_p_moduli_bits(&mut circuit, &params, 10);
         let input = NestedRnsPoly::input(ctx.clone(), None, &mut circuit);
-        let inverse = inverse_ntt(&params, &mut circuit, &input, 16);
-        let output = forward_ntt(&params, &mut circuit, &inverse, 16);
+        let inverse = inverse_ntt(&params, &mut circuit, &input, 16, 2);
+        let output = forward_ntt(&params, &mut circuit, &inverse, 16, 2);
         let reconstructed = output.reconstruct(&mut circuit);
         circuit.output(vec![reconstructed]);
         assert_top_level_ntt_structure(&circuit);
@@ -687,6 +766,7 @@ mod tests {
     }
 
     #[test]
+    #[sequential_test::sequential]
     fn test_ntt_encode_nested_rns_poly_vec_respects_q_level() {
         let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -712,8 +792,8 @@ mod tests {
             let mut circuit = PolyCircuit::<DCRTPoly>::new();
             let ctx = test_context(&mut circuit, &params);
             let input = NestedRnsPoly::input(ctx.clone(), None, &mut circuit);
-            let forward = forward_ntt(&params, &mut circuit, &input, num_slots);
-            let inverse = inverse_ntt(&params, &mut circuit, &forward, num_slots);
+            let forward = forward_ntt(&params, &mut circuit, &input, num_slots, 2);
+            let inverse = inverse_ntt(&params, &mut circuit, &forward, num_slots, 2);
             let reconstructed = inverse.reconstruct(&mut circuit);
             circuit.output(vec![reconstructed]);
 
@@ -739,9 +819,9 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = test_context(&mut circuit, &params);
         let input = NestedRnsPoly::input(ctx.clone(), Some(2), &mut circuit);
-        let forward = forward_ntt(&params, &mut circuit, &input, 16);
+        let forward = forward_ntt(&params, &mut circuit, &input, 16, 2);
         assert_eq!(forward.enable_levels, Some(2));
-        let inverse = inverse_ntt(&params, &mut circuit, &forward, 16);
+        let inverse = inverse_ntt(&params, &mut circuit, &forward, 16, 2);
         assert_eq!(inverse.enable_levels, Some(2));
         let reconstructed = inverse.reconstruct(&mut circuit);
         circuit.output(vec![reconstructed]);
@@ -762,12 +842,12 @@ mod tests {
 
     #[test]
     #[sequential_test::sequential]
-    fn test_ntt_inverse_reconstruct_matches_from_biguints_eval_coeffs() {
+    fn test_ntt_inverse_reconstruct_matches_from_biguints_eval_coeffs_radix2() {
         let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = test_context(&mut circuit, &params);
         let input = NestedRnsPoly::input(ctx.clone(), None, &mut circuit);
-        let inverse = inverse_ntt(&params, &mut circuit, &input, 16);
+        let inverse = inverse_ntt(&params, &mut circuit, &input, 16, 2);
         let reconstructed = inverse.reconstruct(&mut circuit);
         circuit.output(vec![reconstructed]);
 
@@ -787,12 +867,111 @@ mod tests {
 
     #[test]
     #[sequential_test::sequential]
+    fn test_ntt_inverse_reconstruct_matches_from_biguints_eval_coeffs_radix4() {
+        let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let ctx = test_context(&mut circuit, &params);
+        let input = NestedRnsPoly::input(ctx.clone(), None, &mut circuit);
+        let inverse = inverse_ntt(&params, &mut circuit, &input, 16, 4);
+        let reconstructed = inverse.reconstruct(&mut circuit);
+        circuit.output(vec![reconstructed]);
+
+        let slots = random_slots(&params, resolved_active_levels(&input), 16);
+        let eval_inputs =
+            encode_nested_rns_poly_vec(&params, ctx.as_ref(), &slots, input.enable_levels);
+        let output_poly = eval_single_output(&params, &circuit, eval_inputs, 16);
+        let output_coeffs = reconstructed_output_coeffs(&output_poly, 16);
+
+        assert_reconstructed_matches_eval_coeffs(
+            &params,
+            &output_coeffs,
+            &slots,
+            resolved_active_levels(&input),
+        );
+    }
+
+    #[test]
+    #[sequential_test::sequential]
+    fn test_ntt_forward_radix4_inverse_radix4_round_trip_reconstructs_original_input() {
+        let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let ctx = test_context(&mut circuit, &params);
+        let input = NestedRnsPoly::input(ctx.clone(), None, &mut circuit);
+        let forward = forward_ntt(&params, &mut circuit, &input, 16, 4);
+        let inverse = inverse_ntt(&params, &mut circuit, &forward, 16, 4);
+        let reconstructed = inverse.reconstruct(&mut circuit);
+        circuit.output(vec![reconstructed]);
+        assert_top_level_ntt_structure(&circuit);
+
+        let slots = random_slots(&params, resolved_active_levels(&input), 16);
+        let eval_inputs =
+            encode_nested_rns_poly_vec(&params, ctx.as_ref(), &slots, input.enable_levels);
+        let output_poly = eval_single_output(&params, &circuit, eval_inputs, 16);
+        let output_coeffs = reconstructed_output_coeffs(&output_poly, 16);
+        assert_reconstructed_matches_expected_values(
+            &params,
+            &output_coeffs,
+            &slots,
+            resolved_active_levels(&input),
+        );
+    }
+
+    #[test]
+    #[sequential_test::sequential]
+    fn test_ntt_inverse_radix4_forward_radix4_round_trip_reconstructs_original_input() {
+        let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let ctx = test_context(&mut circuit, &params);
+        let input = NestedRnsPoly::input(ctx.clone(), None, &mut circuit);
+        let inverse = inverse_ntt(&params, &mut circuit, &input, 16, 4);
+        let forward = forward_ntt(&params, &mut circuit, &inverse, 16, 4);
+        let reconstructed = forward.reconstruct(&mut circuit);
+        circuit.output(vec![reconstructed]);
+        assert_top_level_ntt_structure(&circuit);
+
+        let slots = random_slots(&params, resolved_active_levels(&input), 16);
+        let eval_inputs =
+            encode_nested_rns_poly_vec(&params, ctx.as_ref(), &slots, input.enable_levels);
+        let output_poly = eval_single_output(&params, &circuit, eval_inputs, 16);
+        let output_coeffs = reconstructed_output_coeffs(&output_poly, 16);
+        assert_reconstructed_matches_expected_values(
+            &params,
+            &output_coeffs,
+            &slots,
+            resolved_active_levels(&input),
+        );
+    }
+
+    #[test]
+    #[sequential_test::sequential]
+    #[should_panic(expected = "butterfly radix must be a power of two")]
+    fn test_ntt_forward_rejects_non_power_of_two_radix() {
+        let params = DCRTPolyParams::new(16, 1, 17, BASE_BITS);
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let ctx = test_context(&mut circuit, &params);
+        let input = NestedRnsPoly::input(ctx, None, &mut circuit);
+        let _ = forward_ntt(&params, &mut circuit, &input, 16, 3);
+    }
+
+    #[test]
+    #[sequential_test::sequential]
+    #[should_panic(expected = "num_slots 16 is incompatible with butterfly radix 8")]
+    fn test_ntt_forward_rejects_incompatible_power_of_two_radix() {
+        let params = DCRTPolyParams::new(16, 1, 17, BASE_BITS);
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let ctx = test_context(&mut circuit, &params);
+        let input = NestedRnsPoly::input(ctx, None, &mut circuit);
+        let _ = forward_ntt(&params, &mut circuit, &input, 16, 8);
+    }
+
+    #[test]
+    #[sequential_test::sequential]
     #[should_panic(expected = "num_slots must be a power of two")]
     fn test_ntt_forward_ntt_rejects_non_power_of_two_num_slots() {
         let params = DCRTPolyParams::new(8, 1, 17, BASE_BITS);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = test_context(&mut circuit, &params);
         let input = NestedRnsPoly::input(ctx, None, &mut circuit);
-        let _ = forward_ntt(&params, &mut circuit, &input, 3);
+        let _ = forward_ntt(&params, &mut circuit, &input, 3, 2);
     }
 }

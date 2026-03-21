@@ -125,7 +125,7 @@ mod tests {
             dcrt::gpu::{GpuDCRTPoly, GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync},
         },
         sampler::{
-            DistType, PolyHashSampler, PolyTrapdoorSampler,
+            DistType, PolyHashSampler,
             gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
             trapdoor::GpuDCRTPolyTrapdoorSampler,
         },

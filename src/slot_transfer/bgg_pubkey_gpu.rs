@@ -640,7 +640,7 @@ mod tests {
             },
         },
         sampler::{
-            DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler,
+            DistType, PolyHashSampler, PolyUniformSampler,
             gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
             trapdoor::GpuDCRTPolyTrapdoorSampler,
         },

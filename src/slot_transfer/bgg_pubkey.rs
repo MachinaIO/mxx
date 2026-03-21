@@ -196,6 +196,31 @@ where
         self.load_matrix_checkpoint(params, &self.b1_id_prefix(params))
     }
 
+    fn checkpoint_exists(&self, id_prefix: &str) -> bool {
+        read_bytes_from_multi_batch(self.dir_path.as_path(), id_prefix, 0).is_some()
+    }
+
+    fn has_complete_aux_checkpoint(
+        &self,
+        params: &<M::P as Poly>::Params,
+        gate_ids: &[GateId],
+    ) -> bool {
+        self.checkpoint_exists(&self.b0_id_prefix(params)) &&
+            self.checkpoint_exists(&self.b0_trapdoor_id_prefix(params)) &&
+            self.checkpoint_exists(&self.b1_id_prefix(params)) &&
+            self.checkpoint_exists(&self.b1_trapdoor_id_prefix(params)) &&
+            (0..self.num_slots).all(|slot_idx| {
+                self.checkpoint_exists(&self.slot_a_id_prefix(params, slot_idx)) &&
+                    self.checkpoint_exists(&self.slot_preimage_b0_id_prefix(params, slot_idx)) &&
+                    self.checkpoint_exists(&self.slot_preimage_b1_id_prefix(params, slot_idx))
+            }) &&
+            gate_ids.iter().copied().all(|gate_id| {
+                (0..self.num_slots).all(|dst_slot| {
+                    self.checkpoint_exists(&self.gate_preimage_id_prefix(params, gate_id, dst_slot))
+                })
+            })
+    }
+
     #[cfg(not(feature = "gpu"))]
     fn sample_slot_batch_cpu(
         &self,
@@ -342,6 +367,19 @@ where
         );
         init_storage_system(self.dir_path.clone());
 
+        let gate_ids: Vec<GateId> = self.gate_states.iter().map(|entry| *entry.key()).collect();
+        if self.has_complete_aux_checkpoint(params, &gate_ids) {
+            for gate_id in gate_ids {
+                self.gate_states.remove(&gate_id);
+            }
+            info!(
+                "Loaded complete slot-transfer auxiliary checkpoint; skipping resampling (dir={}, prefix={})",
+                self.dir_path.display(),
+                self.aux_checkpoint_prefix(params)
+            );
+            return;
+        }
+
         Self::store_matrix_checkpoint(b0_matrix.clone(), &self.b0_id_prefix(params));
         Self::store_bytes_checkpoint(
             TS::trapdoor_to_bytes(b0_trapdoor),
@@ -442,7 +480,6 @@ where
             }
         }
 
-        let gate_ids: Vec<GateId> = self.gate_states.iter().map(|entry| *entry.key()).collect();
         let gate_entries = gate_ids
             .into_par_iter()
             .filter_map(|gate_id| {

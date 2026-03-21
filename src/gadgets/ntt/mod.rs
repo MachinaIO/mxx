@@ -18,10 +18,7 @@
 use crate::{
     circuit::{PolyCircuit, evaluable::PolyVec},
     gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly},
-    poly::{
-        Poly, PolyParams,
-        dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
-    },
+    poly::{Poly, PolyParams},
     utils::mod_inverse,
 };
 use num_bigint::BigUint;
@@ -231,12 +228,12 @@ fn openfhe_ftt_tables(q_moduli: &[u64], num_slots: usize) -> OpenFheFttTables {
     OpenFheFttTables { forward_by_q, inverse_by_q, n_inverse_by_q }
 }
 
-pub fn encode_nested_rns_poly_vec(
-    params: &DCRTPolyParams,
+pub fn encode_nested_rns_poly_vec<P: Poly>(
+    params: &P::Params,
     ctx: &NestedRnsPolyContext,
     slots: &[BigUint],
     q_level: Option<usize>,
-) -> Vec<PolyVec<DCRTPoly>> {
+) -> Vec<PolyVec<P>> {
     let active_q_level = q_level.unwrap_or(ctx.q_moduli_depth);
     assert!(
         active_q_level <= ctx.q_moduli_depth,
@@ -246,7 +243,7 @@ pub fn encode_nested_rns_poly_vec(
     );
     let encoded_slots = slots
         .par_iter()
-        .map(|slot| encode_nested_rns_poly::<DCRTPoly>(ctx.p_moduli_bits, params, slot, q_level))
+        .map(|slot| encode_nested_rns_poly::<P>(ctx.p_moduli_bits, params, slot, q_level))
         .collect::<Vec<_>>();
     let input_count = active_q_level * ctx.p_moduli.len();
     (0..input_count)
@@ -400,13 +397,13 @@ fn multiply_by_tower_constants<P: Poly>(
     input.const_mul_full_reduce(&tower_constants, circuit)
 }
 
-pub fn forward_ntt(
-    params: &DCRTPolyParams,
-    circuit: &mut PolyCircuit<DCRTPoly>,
-    input: &NestedRnsPoly<DCRTPoly>,
+pub fn forward_ntt<P: Poly>(
+    params: &P::Params,
+    circuit: &mut PolyCircuit<P>,
+    input: &NestedRnsPoly<P>,
     num_slots: usize,
-) -> NestedRnsPoly<DCRTPoly> {
-    validate_num_slots::<DCRTPoly>(params, num_slots);
+) -> NestedRnsPoly<P> {
+    validate_num_slots::<P>(params, num_slots);
     let q_moduli = active_q_moduli(params, input);
     let tables = openfhe_ftt_tables(&q_moduli, num_slots);
 
@@ -419,13 +416,13 @@ pub fn forward_ntt(
     current
 }
 
-pub fn inverse_ntt(
-    params: &DCRTPolyParams,
-    circuit: &mut PolyCircuit<DCRTPoly>,
-    input: &NestedRnsPoly<DCRTPoly>,
+pub fn inverse_ntt<P: Poly>(
+    params: &P::Params,
+    circuit: &mut PolyCircuit<P>,
+    input: &NestedRnsPoly<P>,
     num_slots: usize,
-) -> NestedRnsPoly<DCRTPoly> {
-    validate_num_slots::<DCRTPoly>(params, num_slots);
+) -> NestedRnsPoly<P> {
+    validate_num_slots::<P>(params, num_slots);
     let q_moduli = active_q_moduli(params, input);
     let tables = openfhe_ftt_tables(&q_moduli, num_slots);
 
@@ -450,6 +447,7 @@ mod tests {
         __PAIR, __TestState,
         circuit::PolyGateKind,
         lookup::{poly::PolyPltEvaluator, poly_vec::PolyVecPltEvaluator},
+        poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         slot_transfer::PolyVecSlotTransferEvaluator,
     };
 
@@ -693,11 +691,13 @@ mod tests {
         let ctx = test_context(&mut circuit, &params);
         let slots = random_slots(&params, 2, 16);
 
-        let reduced_inputs = encode_nested_rns_poly_vec(&params, ctx.as_ref(), &slots, Some(2));
+        let reduced_inputs =
+            encode_nested_rns_poly_vec::<DCRTPoly>(&params, ctx.as_ref(), &slots, Some(2));
         assert_eq!(reduced_inputs.len(), 2 * ctx.p_moduli.len());
         assert!(reduced_inputs.iter().all(|poly_vec| poly_vec.len() == slots.len()));
 
-        let full_inputs = encode_nested_rns_poly_vec(&params, ctx.as_ref(), &slots, None);
+        let full_inputs =
+            encode_nested_rns_poly_vec::<DCRTPoly>(&params, ctx.as_ref(), &slots, None);
         assert_eq!(full_inputs.len(), ctx.q_moduli_depth * ctx.p_moduli.len());
         assert!(full_inputs.iter().all(|poly_vec| poly_vec.len() == slots.len()));
     }

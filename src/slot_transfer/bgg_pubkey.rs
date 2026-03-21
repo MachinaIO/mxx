@@ -7,9 +7,7 @@ use crate::{
     slot_transfer::SlotTransferEvaluator,
     storage::{
         read::read_bytes_from_multi_batch,
-        write::{
-            add_lookup_buffer, get_lookup_buffer, get_lookup_buffer_bytes, init_storage_system,
-        },
+        write::{add_lookup_buffer, get_lookup_buffer, get_lookup_buffer_bytes},
     },
 };
 use dashmap::DashMap;
@@ -356,7 +354,6 @@ where
             "Sampling slot-transfer auxiliary matrices (secret_size={}, num_slots={})",
             self.secret_size, self.num_slots
         );
-        init_storage_system(self.dir_path.clone());
 
         let gate_ids: Vec<GateId> = self.gate_states.iter().map(|entry| *entry.key()).collect();
         if self.has_complete_aux_checkpoint(params, &gate_ids) {

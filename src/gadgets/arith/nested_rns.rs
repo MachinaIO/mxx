@@ -88,6 +88,10 @@ fn sample_crt_primes_mul_budget_bound(
 }
 
 impl NestedRnsPolyContext {
+    pub(crate) fn q_moduli(&self) -> &[u64] {
+        &self.q_moduli
+    }
+
     pub fn setup<P: Poly + 'static>(
         circuit: &mut PolyCircuit<P>,
         params: &P::Params,

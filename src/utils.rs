@@ -15,7 +15,7 @@ use crate::{
 use bigdecimal::BigDecimal;
 use keccak_asm::Keccak256;
 use num_bigint::{BigInt, BigUint};
-use num_traits::Zero;
+use num_traits::{One, Zero};
 use rand::Rng;
 use std::{
     future::Future,
@@ -230,6 +230,36 @@ pub fn round_div(a: u64, b: u64) -> u64 {
     let half = b128 / 2;
     let rounded = (a128 + half) / b128;
     rounded as u64
+}
+
+pub fn pow_biguint_usize(base: &BigUint, exponent: usize) -> BigUint {
+    let exponent =
+        u32::try_from(exponent).expect("exponent must fit in u32 for BigUint::pow in nested_rns");
+    base.pow(exponent)
+}
+
+pub fn ceil_biguint_nth_root(value: &BigUint, n: usize) -> BigUint {
+    assert!(n > 0, "n must be at least 1");
+    if *value <= BigUint::one() {
+        return value.clone();
+    }
+
+    let mut low = BigUint::one();
+    let mut high = BigUint::from(2u64);
+    while pow_biguint_usize(&high, n) < *value {
+        high <<= 1u32;
+    }
+
+    while low < high {
+        let mid = (&low + &high) >> 1u32;
+        if pow_biguint_usize(&mid, n) < *value {
+            low = mid + BigUint::one();
+        } else {
+            high = mid;
+        }
+    }
+
+    low
 }
 
 pub fn bigdecimal_bits_ceil(x: &BigDecimal) -> u64 {

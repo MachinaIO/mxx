@@ -17,9 +17,7 @@
 
 use crate::{
     circuit::{PolyCircuit, evaluable::PolyVec},
-    gadgets::arith::{
-        DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly,
-    },
+    gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly},
     poly::{
         Poly, PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
@@ -387,7 +385,7 @@ fn apply_stage<P: Poly>(
         current.slot_transfer(&plan.alpha_slot_transfer, circuit).full_reduce(circuit);
     let beta_partner =
         current.slot_transfer(&plan.beta_slot_transfer, circuit).full_reduce(circuit);
-    alpha_current.add(&beta_partner, circuit).full_reduce(circuit)
+    alpha_current.add(&beta_partner, circuit)
 }
 
 fn multiply_by_tower_constants<P: Poly>(
@@ -459,6 +457,7 @@ mod tests {
     use crate::{
         __PAIR, __TestState,
         circuit::PolyGateKind,
+        gadgets::arith::DEFAULT_MAX_UNREDUCED_MULS,
         lookup::{poly::PolyPltEvaluator, poly_vec::PolyVecPltEvaluator},
         slot_transfer::PolyVecSlotTransferEvaluator,
     };

@@ -135,8 +135,14 @@ mod tests {
 
         let one_pubkey = enc_one.pubkey.clone();
         let input_pubkeys = vec![enc1.pubkey.clone()];
-        let result_pubkey =
-            circuit.eval(&params, one_pubkey, input_pubkeys, Some(&plt_pubkey_evaluator), None);
+        let result_pubkey = circuit.eval(
+            &params,
+            one_pubkey,
+            input_pubkeys,
+            Some(&plt_pubkey_evaluator),
+            None,
+            None,
+        );
         plt_pubkey_evaluator.sample_aux_matrices(&params);
         wait_for_all_writes(dir.to_path_buf()).await.unwrap();
         assert_eq!(result_pubkey.len(), 1);
@@ -161,6 +167,7 @@ mod tests {
             one_encoding,
             input_encodings,
             Some(&plt_encoding_evaluator),
+            None,
             None,
         );
         assert_eq!(result_encoding.len(), 1);
@@ -254,6 +261,7 @@ mod tests {
             input_pubkeys.clone(),
             Some(&plt_pubkey_evaluator),
             None,
+            None,
         );
         plt_pubkey_evaluator.sample_aux_matrices(&params);
         wait_for_all_writes(dir.to_path_buf()).await.unwrap();
@@ -277,6 +285,7 @@ mod tests {
             one_encoding,
             input_encodings.clone(),
             Some(&plt_encoding_evaluator),
+            None,
             None,
         );
         assert_eq!(result_encoding.len(), input_size);
@@ -379,6 +388,7 @@ mod tests {
             vec![enc_input_poly.pubkey.clone()],
             Some(&plt_pubkey_evaluator),
             None,
+            None,
         );
         plt_pubkey_evaluator.sample_aux_matrices(&params);
         wait_for_all_writes(dir.to_path_buf()).await.unwrap();
@@ -388,17 +398,17 @@ mod tests {
             .load_b0_matrix_checkpoint(&params)
             .expect("b0 matrix checkpoint should exist after sample_aux_matrices");
         let checkpoint_prefix = plt_pubkey_evaluator.checkpoint_prefix(&params);
+        let c_b0_compact_bytes_by_slot = GGH15BGGPolyEncodingPltEvaluator::<
+            DCRTPolyMatrix,
+            DCRTPolyHashSampler<Keccak256>,
+        >::build_c_b0_compact_bytes_by_slot(
+            &params, &s_vec, &b0_matrix, &slot_secret_mats
+        );
         let poly_evaluator = GGH15BGGPolyEncodingPltEvaluator::<
             DCRTPolyMatrix,
             DCRTPolyHashSampler<Keccak256>,
         >::new(
-            key,
-            dir_path.into(),
-            checkpoint_prefix,
-            &params,
-            s_vec.clone(),
-            b0_matrix,
-            slot_secret_mats.clone(),
+            key, dir_path.into(), checkpoint_prefix, c_b0_compact_bytes_by_slot
         );
 
         let result_poly = circuit.eval(
@@ -406,6 +416,7 @@ mod tests {
             enc_one_poly.clone(),
             vec![enc_input_poly.clone()],
             Some(&poly_evaluator),
+            None,
             Some(1),
         );
         assert_eq!(result_poly.len(), 1);

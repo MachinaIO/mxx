@@ -210,6 +210,7 @@ mod tests {
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
             None,
+            None,
         );
 
         let expected = enc1.clone() + enc2.clone();
@@ -243,6 +244,7 @@ mod tests {
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
             None,
+            None,
         );
 
         let expected = enc1.clone() - enc2.clone();
@@ -275,6 +277,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None,
             None,
         );
 
@@ -311,6 +314,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None,
             None,
         );
 
@@ -352,6 +356,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None,
             None,
         );
 
@@ -397,6 +402,7 @@ mod tests {
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
             None,
+            None,
         );
 
         let expected = enc1.clone() + enc2.clone();
@@ -439,6 +445,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None,
             None,
         );
 
@@ -489,6 +496,7 @@ mod tests {
             enc_one,
             eval_inputs,
             None::<&LWEBGGEncodingPltEvaluator<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>>,
+            None,
             None,
         );
 

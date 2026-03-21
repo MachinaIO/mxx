@@ -189,6 +189,7 @@ pub fn run_lattice_estimator_cli(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{__PAIR, __TestState};
     use num_bigint::BigUint;
     use std::{fs, os::unix::fs::PermissionsExt};
     use tempfile::TempDir;
@@ -213,6 +214,7 @@ exit {}
         mock_path
     }
 
+    #[sequential_test::sequential]
     #[test]
     fn test_run_lattice_estimator_cli_success() {
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -231,6 +233,7 @@ exit {}
         assert_eq!(result.unwrap(), 128);
     }
 
+    #[sequential_test::sequential]
     #[test]
     fn test_run_lattice_estimator_cli_with_logs() {
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -256,6 +259,7 @@ exit {}
         assert_eq!(result.unwrap(), 256);
     }
 
+    #[sequential_test::sequential]
     #[test]
     fn test_run_lattice_estimator_cli_with_exact_and_m() {
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -281,6 +285,7 @@ exit {}
         assert_eq!(result.unwrap(), 512);
     }
 
+    #[sequential_test::sequential]
     #[test]
     fn test_run_lattice_estimator_cli_non_zero_exit() {
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -305,6 +310,7 @@ exit {}
         }
     }
 
+    #[sequential_test::sequential]
     #[test]
     fn test_run_lattice_estimator_cli_parse_error() {
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -323,6 +329,7 @@ exit {}
         assert!(matches!(result.unwrap_err(), EstimatorCliError::ParseInt(_)));
     }
 
+    #[sequential_test::sequential]
     #[test]
     fn test_run_lattice_estimator_cli_empty_output() {
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -341,6 +348,7 @@ exit {}
         assert!(matches!(result.unwrap_err(), EstimatorCliError::ParseInt(_)));
     }
 
+    #[sequential_test::sequential]
     #[test]
     fn test_run_lattice_estimator_cli_whitespace_output() {
         let temp_dir = TempDir::new().expect("create temp dir");

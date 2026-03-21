@@ -5,6 +5,7 @@ use crate::{
     lookup::{PltEvaluator, PublicLut, commit_eval::compute_padded_len},
     poly::dcrt::poly::DCRTPoly,
     simulator::{SimulatorContext, poly_matrix_norm::PolyMatrixNorm, poly_norm::PolyNorm},
+    slot_transfer::SlotTransferEvaluator,
     utils::bigdecimal_bits_ceil,
 };
 use bigdecimal::BigDecimal;
@@ -38,7 +39,7 @@ impl PolyCircuit<DCRTPoly> {
         );
         info!("e_init_norm bits {}", bigdecimal_bits_ceil(e_init_norm));
         let input_errors = vec![input_error; input_size];
-        self.eval(&(), one_error, input_errors, plt_evaluator, None)
+        self.eval(&(), one_error, input_errors, plt_evaluator, None, None)
     }
 }
 
@@ -105,10 +106,6 @@ impl Evaluable for ErrorNorm {
         compact.clone()
     }
 
-    fn rotate(&self, _: &Self::Params, _: i32) -> Self {
-        self.clone()
-    }
-
     fn small_scalar_mul(&self, _: &Self::Params, scalar: &[u32]) -> Self {
         let scalar_max = BigDecimal::from(*scalar.iter().max().unwrap());
         let scalar_poly = PolyNorm::new(self.clone_ctx(), scalar_max);
@@ -127,6 +124,149 @@ impl Evaluable for ErrorNorm {
                 PolyMatrixNorm::gadget_decomposed(self.clone_ctx(), self.ctx().m_g),
             plaintext_norm: self.plaintext_norm.clone() * &scalar_poly,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NormBggPolyEncodingSTEvaluator {
+    pub const_term: PolyMatrixNorm,
+    pub transfer_plaintext_multiplier: PolyMatrixNorm,
+    pub input_vector_multiplier: PolyMatrixNorm,
+}
+
+impl NormBggPolyEncodingSTEvaluator {
+    pub fn new(
+        ctx: Arc<SimulatorContext>,
+        c_b0_error_norm: PolyMatrixNorm,
+        e_mat_sigma: &BigDecimal,
+        secret_sigma: Option<BigDecimal>,
+    ) -> Self {
+        assert_eq!(
+            c_b0_error_norm.clone_ctx(),
+            ctx,
+            "c_b0_error_norm context must match simulator context"
+        );
+        assert_eq!(
+            c_b0_error_norm.nrow, 1,
+            "c_b0_error_norm rows {} must be 1",
+            c_b0_error_norm.nrow
+        );
+        assert_eq!(
+            c_b0_error_norm.ncol, ctx.m_b,
+            "c_b0_error_norm cols {} must equal m_b {}",
+            c_b0_error_norm.ncol, ctx.m_b
+        );
+
+        let preimage_norm = compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base);
+        info!(
+            "{}",
+            format!(
+                "BGG poly-encoding slot-transfer preimage norm bits {}",
+                bigdecimal_bits_ceil(&preimage_norm)
+            )
+        );
+
+        let matrix_norm_bits = |m: &PolyMatrixNorm| bigdecimal_bits_ceil(&m.poly_norm.norm);
+        let log_matrix_norm_bits = |name: &str, m: &PolyMatrixNorm| {
+            debug!(
+                "NormBggPolyEncodingSTEvaluator::new {} matrix norm bits {}",
+                name,
+                matrix_norm_bits(m)
+            );
+        };
+        log_matrix_norm_bits("c_b0_error_norm", &c_b0_error_norm);
+        let s_vec = PolyMatrixNorm::new(
+            ctx.clone(),
+            1,
+            ctx.secret_size,
+            secret_sigma.unwrap_or(BigDecimal::one()),
+            None,
+        );
+        log_matrix_norm_bits("s_vec", &s_vec);
+
+        // `c_b0 * gate_preimage` with `B0 * gate_preimage = target + error`.
+        let gate_preimage =
+            PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, preimage_norm.clone(), None);
+        log_matrix_norm_bits("gate_preimage", &gate_preimage);
+        let gate_target_error =
+            PolyMatrixNorm::new(ctx.clone(), ctx.secret_size, ctx.m_g, e_mat_sigma * 6, None);
+        log_matrix_norm_bits("gate_target_error", &gate_target_error);
+        let gate_target_error_term = s_vec.clone() * &gate_target_error;
+        log_matrix_norm_bits("gate_target_error_term", &gate_target_error_term);
+        let c_b0_gate_term = c_b0_error_norm.clone() * &gate_preimage;
+        log_matrix_norm_bits("c_b0_gate_term", &c_b0_gate_term);
+        let const_term = &gate_target_error_term + &c_b0_gate_term;
+        log_matrix_norm_bits("const_term", &const_term);
+
+        // `((c_b0 * slot_preimage_b0) * slot_preimage_b1) * plaintext`.
+        let slot_preimage_b0 =
+            PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_b, preimage_norm.clone(), None);
+        log_matrix_norm_bits("slot_preimage_b0", &slot_preimage_b0);
+        let slot_preimage_b1 =
+            PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, preimage_norm.clone(), None);
+        log_matrix_norm_bits("slot_preimage_b1", &slot_preimage_b1);
+        let slot_preimage_b0_target_error =
+            PolyMatrixNorm::new(ctx.clone(), ctx.secret_size, ctx.m_b, e_mat_sigma * 6, None);
+        log_matrix_norm_bits("slot_preimage_b0_target_error", &slot_preimage_b0_target_error);
+        let slot_preimage_b1_target_error =
+            PolyMatrixNorm::new(ctx.clone(), ctx.secret_size * 2, ctx.m_g, e_mat_sigma * 6, None);
+        log_matrix_norm_bits("slot_preimage_b1_target_error", &slot_preimage_b1_target_error);
+        let slot_secret_and_identity = PolyMatrixNorm::new(
+            ctx.clone(),
+            ctx.secret_size,
+            ctx.secret_size * 2,
+            BigDecimal::one(),
+            None,
+        );
+        log_matrix_norm_bits("slot_secret_and_identity", &slot_secret_and_identity);
+        let slot_stage1_error_term =
+            s_vec.clone() * slot_secret_and_identity * slot_preimage_b1_target_error;
+        log_matrix_norm_bits("slot_stage1_error_term", &slot_stage1_error_term);
+        let slot_stage0_error_term =
+            s_vec.clone() * slot_preimage_b0_target_error * slot_preimage_b1.clone();
+        log_matrix_norm_bits("slot_stage0_error_term", &slot_stage0_error_term);
+        let c_b0_transfer_term = c_b0_error_norm * slot_preimage_b0 * slot_preimage_b1;
+        log_matrix_norm_bits("c_b0_transfer_term", &c_b0_transfer_term);
+        let transfer_plaintext_multiplier = slot_stage1_error_term.clone() +
+            slot_stage0_error_term.clone() +
+            c_b0_transfer_term.clone();
+        log_matrix_norm_bits("transfer_plaintext_multiplier", &transfer_plaintext_multiplier);
+
+        // `input_vector * slot_a.decompose()`.
+        let input_vector_multiplier = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g);
+        log_matrix_norm_bits("input_vector_multiplier", &input_vector_multiplier);
+
+        info!("BGG poly-encoding slot-transfer const term bits {}", matrix_norm_bits(&const_term));
+        info!(
+            "BGG poly-encoding slot-transfer plaintext multiplier bits {}",
+            matrix_norm_bits(&transfer_plaintext_multiplier)
+        );
+        info!(
+            "BGG poly-encoding slot-transfer input multiplier bits {}",
+            matrix_norm_bits(&input_vector_multiplier)
+        );
+
+        Self { const_term, transfer_plaintext_multiplier, input_vector_multiplier }
+    }
+}
+
+impl SlotTransferEvaluator<ErrorNorm> for NormBggPolyEncodingSTEvaluator {
+    fn slot_transfer(
+        &self,
+        _: &(),
+        input: &ErrorNorm,
+        src_slots: &[(u32, Option<u32>)],
+        _: GateId,
+    ) -> ErrorNorm {
+        let scalar_max =
+            src_slots.iter().map(|(_, scalar)| u64::from(scalar.unwrap_or(1))).max().unwrap_or(1);
+        let scalar_bd = BigDecimal::from(scalar_max);
+        let plaintext_norm = input.plaintext_norm.clone() * &scalar_bd;
+        let input_vector_term =
+            (input.matrix_norm.clone() * &self.input_vector_multiplier) * &scalar_bd;
+        let transfer_plaintext_term = self.transfer_plaintext_multiplier.clone() * &plaintext_norm;
+        let matrix_norm = &self.const_term + &input_vector_term + &transfer_plaintext_term;
+        ErrorNorm { matrix_norm, plaintext_norm }
     }
 }
 
@@ -523,6 +663,7 @@ mod tests {
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
         simulator::SimulatorContext,
+        slot_transfer::SlotTransferEvaluator,
     };
     use bigdecimal::BigDecimal;
 
@@ -615,6 +756,102 @@ mod tests {
         );
         let expected = &in_wire * &in_wire;
         assert_eq!(out[0], expected);
+    }
+
+    #[test]
+    fn test_wire_norm_slot_transfer_matches_bgg_poly_encoding_bound() {
+        let ctx = make_ctx();
+        let c_b0_error_norm =
+            PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_b, BigDecimal::from(11u64), None);
+        let evaluator = NormBggPolyEncodingSTEvaluator::new(
+            ctx.clone(),
+            c_b0_error_norm.clone(),
+            &BigDecimal::from_f64(E_B_SIGMA).unwrap(),
+            None,
+        );
+        let input = ErrorNorm::new(
+            PolyNorm::new(ctx.clone(), BigDecimal::from(5u64)),
+            PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, BigDecimal::from(7u64), None),
+        );
+        let src_slots = [(2, None), (0, Some(3)), (1, Some(2))];
+
+        let out = evaluator.slot_transfer(&(), &input, &src_slots, GateId(0));
+
+        let preimage_norm = compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base);
+        let s_vec = PolyMatrixNorm::new(ctx.clone(), 1, ctx.secret_size, BigDecimal::one(), None);
+        let gate_preimage =
+            PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, preimage_norm.clone(), None);
+        let gate_target_error = PolyMatrixNorm::new(
+            ctx.clone(),
+            ctx.secret_size,
+            ctx.m_g,
+            BigDecimal::from(24u64),
+            None,
+        );
+        let slot_preimage_b0 =
+            PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_b, preimage_norm.clone(), None);
+        let slot_preimage_b1 =
+            PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, preimage_norm.clone(), None);
+        let slot_preimage_b0_target_error = PolyMatrixNorm::new(
+            ctx.clone(),
+            ctx.secret_size,
+            ctx.m_b,
+            BigDecimal::from(24u64),
+            None,
+        );
+        let slot_preimage_b1_target_error = PolyMatrixNorm::new(
+            ctx.clone(),
+            ctx.secret_size * 2,
+            ctx.m_g,
+            BigDecimal::from(24u64),
+            None,
+        );
+        let slot_secret_and_identity = PolyMatrixNorm::new(
+            ctx.clone(),
+            ctx.secret_size,
+            ctx.secret_size * 2,
+            BigDecimal::one(),
+            None,
+        );
+        let scalar_bd = BigDecimal::from(3u64);
+        let input_vector_multiplier = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g);
+        let plaintext_norm = input.plaintext_norm.clone() * &scalar_bd;
+        let const_term =
+            s_vec.clone() * &gate_target_error + c_b0_error_norm.clone() * &gate_preimage;
+        let transfer_plaintext_multiplier =
+            s_vec.clone() * slot_secret_and_identity * slot_preimage_b1_target_error +
+                s_vec.clone() * slot_preimage_b0_target_error * slot_preimage_b1.clone() +
+                c_b0_error_norm * slot_preimage_b0 * slot_preimage_b1;
+        let matrix_norm = const_term +
+            (input.matrix_norm.clone() * &input_vector_multiplier) * &scalar_bd +
+            transfer_plaintext_multiplier * &plaintext_norm;
+
+        assert_eq!(out, ErrorNorm { plaintext_norm, matrix_norm });
+    }
+
+    #[test]
+    fn test_wire_norm_slot_transfer_bound_is_independent_of_slot_count() {
+        let ctx = make_ctx();
+        let evaluator = NormBggPolyEncodingSTEvaluator::new(
+            ctx.clone(),
+            PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_b, BigDecimal::from(9u64), None),
+            &BigDecimal::from_f64(E_B_SIGMA).unwrap(),
+            None,
+        );
+        let input = ErrorNorm::new(
+            PolyNorm::new(ctx.clone(), BigDecimal::from(4u64)),
+            PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, BigDecimal::from(6u64), None),
+        );
+
+        let out_single = evaluator.slot_transfer(&(), &input, &[(0, Some(2))], GateId(0));
+        let out_many = evaluator.slot_transfer(
+            &(),
+            &input,
+            &[(0, Some(2)), (1, Some(2)), (2, Some(2))],
+            GateId(1),
+        );
+
+        assert_eq!(out_single, out_many);
     }
 
     #[test]

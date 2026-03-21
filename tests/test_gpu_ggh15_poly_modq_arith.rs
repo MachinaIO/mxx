@@ -6,7 +6,10 @@ use mxx::{
     bgg::sampler::{BGGPolyEncodingSampler, BGGPublicKeySampler},
     circuit::PolyCircuit,
     element::PolyElem,
-    gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly_compact_bytes},
+    gadgets::arith::{
+        DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPoly, NestedRnsPolyContext,
+        encode_nested_rns_poly_compact_bytes,
+    },
     lookup::ggh15_eval::{GGH15BGGPolyEncodingPltEvaluator, GGH15BGGPubKeyPltEvaluator},
     matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
     poly::{
@@ -36,6 +39,7 @@ use tracing::{debug, info};
 const DEFAULT_RING_DIM: u32 = 1 << 14;
 const DEFAULT_CRT_BITS: usize = 24;
 const DEFAULT_P_MODULI_BITS: usize = 6;
+const DEFAULT_MAX_UNREDUCED_MULS_BUDGET: usize = DEFAULT_MAX_UNREDUCED_MULS;
 const DEFAULT_SCALE: u64 = 1 << 7;
 const DEFAULT_BASE_BITS: u32 = 12;
 const DEFAULT_MAX_CRT_DEPTH: usize = 32;
@@ -213,6 +217,7 @@ fn build_modq_arith_circuit_cpu(
         &mut circuit,
         params,
         p_moduli_bits,
+        DEFAULT_MAX_UNREDUCED_MULS_BUDGET,
         scale,
         false,
         q_level,
@@ -234,6 +239,7 @@ fn build_modq_arith_circuit_gpu(
         &mut circuit,
         params,
         p_moduli_bits,
+        DEFAULT_MAX_UNREDUCED_MULS_BUDGET,
         scale,
         false,
         q_level,

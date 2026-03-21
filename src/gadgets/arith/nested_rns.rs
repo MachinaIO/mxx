@@ -15,9 +15,12 @@ use rayon::prelude::*;
 use std::{marker::PhantomData, sync::Arc};
 use tracing::{debug, info};
 
+pub const DEFAULT_MAX_UNREDUCED_MULS: usize = 2;
+
 #[derive(Debug, Clone)]
 pub struct NestedRnsPolyContext {
     pub p_moduli_bits: usize,
+    pub max_unreduced_muls: usize,
     pub p_moduli: Vec<u64>,
     q_moduli: Vec<u64>,
     pub q_moduli_depth: usize,
@@ -66,6 +69,36 @@ fn div_ceil_biguint_by_u64(value: BigUint, divisor: u64) -> BigUint {
     (value + adjustment) / BigUint::from(divisor)
 }
 
+fn pow_biguint_usize(base: &BigUint, exponent: usize) -> BigUint {
+    let exponent =
+        u32::try_from(exponent).expect("exponent must fit in u32 for BigUint::pow in nested_rns");
+    base.pow(exponent)
+}
+
+fn ceil_biguint_nth_root(value: &BigUint, n: usize) -> BigUint {
+    assert!(n > 0, "n must be at least 1");
+    if *value <= BigUint::one() {
+        return value.clone();
+    }
+
+    let mut low = BigUint::one();
+    let mut high = BigUint::from(2u64);
+    while pow_biguint_usize(&high, n) < *value {
+        high <<= 1u32;
+    }
+
+    while low < high {
+        let mid = (&low + &high) >> 1u32;
+        if pow_biguint_usize(&mid, n) < *value {
+            low = mid + BigUint::one();
+        } else {
+            high = mid;
+        }
+    }
+
+    low
+}
+
 fn full_reduce_output_max_plaintext_bound(p_moduli: &[u64], q_modulus: u64) -> BigUint {
     let sum_p_moduli = p_moduli.iter().fold(BigUint::ZERO, |acc, &p_i| acc + BigUint::from(p_i));
     let modulus_count =
@@ -74,11 +107,22 @@ fn full_reduce_output_max_plaintext_bound(p_moduli: &[u64], q_modulus: u64) -> B
     div_ceil_biguint_by_u64(numerator, 4)
 }
 
+fn sample_crt_primes_mul_budget_bound(
+    sum_p_moduli: u64,
+    modulus_count: usize,
+    q_max: u64,
+) -> BigUint {
+    let modulus_count =
+        u64::try_from(modulus_count).expect("p_moduli length must fit in u64 for bound tracking");
+    BigUint::from(sum_p_moduli + modulus_count) * BigUint::from(q_max) / BigUint::from(2u64)
+}
+
 impl NestedRnsPolyContext {
     pub fn setup<P: Poly + 'static>(
         circuit: &mut PolyCircuit<P>,
         params: &P::Params,
         p_moduli_bits: usize,
+        max_unreduced_muls: usize,
         scale: u64,
         dummy_scalar: bool,
         q_level: Option<usize>,
@@ -93,10 +137,10 @@ impl NestedRnsPolyContext {
         );
         let q_moduli_min = q_moduli.iter().min().expect("there should be at least one q modulus");
         let q_moduli_max = q_moduli.iter().max().expect("there should be at least one q modulus");
-        let p_moduli = sample_crt_primes(p_moduli_bits, *q_moduli_max);
+        let p_moduli = sample_crt_primes(p_moduli_bits, *q_moduli_max, max_unreduced_muls);
         debug!(
-            "NestedRnsPolyContext setup: p_moduli = {:?}, q_moduli = {:?}, scale = {}",
-            p_moduli, q_moduli, scale
+            "NestedRnsPolyContext setup: p_moduli = {:?}, q_moduli = {:?}, scale = {}, max_unreduced_muls = {}",
+            p_moduli, q_moduli, scale, max_unreduced_muls
         );
         let p_moduli_depth = p_moduli.len();
         let active_q_moduli = q_moduli.iter().take(q_moduli_depth).copied().collect::<Vec<_>>();
@@ -188,6 +232,7 @@ impl NestedRnsPolyContext {
                 .collect::<Vec<_>>();
             return Self {
                 p_moduli_bits,
+                max_unreduced_muls,
                 p_moduli,
                 q_moduli: active_q_moduli,
                 q_moduli_depth,
@@ -450,6 +495,7 @@ impl NestedRnsPolyContext {
 
         Self {
             p_moduli_bits,
+            max_unreduced_muls,
             p_moduli,
             q_moduli: active_q_moduli,
             q_moduli_depth,
@@ -1041,7 +1087,11 @@ fn u64_to_u32_digits(mut value: u64) -> Vec<u32> {
 /// Return the first `count` pairwise coprime integers within the requested `bit_width`.
 ///
 /// Deterministic: the output depends only on `bit_width` and `count` (no randomness).
-pub(crate) fn sample_crt_primes(max_bit_width: usize, q_max: u64) -> Vec<u64> {
+pub(crate) fn sample_crt_primes(
+    max_bit_width: usize,
+    q_max: u64,
+    max_unreduced_muls: usize,
+) -> Vec<u64> {
     assert!(max_bit_width > 1, "bit_width must be at least 2 bits");
     assert!(max_bit_width < 32, "bit_width must be less than 32 bits");
     assert!(
@@ -1049,6 +1099,7 @@ pub(crate) fn sample_crt_primes(max_bit_width: usize, q_max: u64) -> Vec<u64> {
         "bit_width {max_bit_width} exceeds target pointer width {}",
         usize::BITS
     );
+    assert!(max_unreduced_muls > 0, "max_unreduced_muls must be at least 1");
     // assert!(count > 0, "count must be greater than 0");
 
     let lower = 3u64;
@@ -1066,8 +1117,8 @@ pub(crate) fn sample_crt_primes(max_bit_width: usize, q_max: u64) -> Vec<u64> {
             sum += candidate;
             prod *= BigUint::from(candidate);
         }
-        let bound_sqrt = ((sum + results.len() as u64) * q_max) / 2;
-        if BigUint::from(bound_sqrt).pow(2) < prod {
+        let mul_budget_bound = sample_crt_primes_mul_budget_bound(sum, results.len(), q_max);
+        if pow_biguint_usize(&mul_budget_bound, max_unreduced_muls) < prod {
             prod_reached = true;
             break;
         }
@@ -1076,7 +1127,7 @@ pub(crate) fn sample_crt_primes(max_bit_width: usize, q_max: u64) -> Vec<u64> {
     if !prod_reached {
         panic!(
             "failed to find enough pairwise coprime integers with bit width {max_bit_width} to \
-             satisfy q_max {q_max}; try increasing bit width"
+             satisfy q_max {q_max} and max_unreduced_muls {max_unreduced_muls}; try increasing bit width"
         );
     }
 
@@ -1085,6 +1136,7 @@ pub(crate) fn sample_crt_primes(max_bit_width: usize, q_max: u64) -> Vec<u64> {
 
 fn resolve_nested_rns_encoding_layout<P: Poly>(
     p_moduli_bits: usize,
+    max_unreduced_muls: usize,
     params: &P::Params,
     q_level: Option<usize>,
 ) -> (Vec<u64>, usize, Vec<u64>) {
@@ -1097,7 +1149,7 @@ fn resolve_nested_rns_encoding_layout<P: Poly>(
         q_moduli_depth
     );
     let q_moduli_max = q_moduli.iter().max().expect("there should be at least one q modulus");
-    let p_moduli = sample_crt_primes(p_moduli_bits, *q_moduli_max);
+    let p_moduli = sample_crt_primes(p_moduli_bits, *q_moduli_max, max_unreduced_muls);
     (q_moduli, active_q_level, p_moduli)
 }
 
@@ -1128,12 +1180,13 @@ where
 
 pub fn encode_nested_rns_poly_compact_bytes<P: Poly>(
     p_moduli_bits: usize,
+    max_unreduced_muls: usize,
     params: &P::Params,
     input: &BigUint,
     q_level: Option<usize>,
 ) -> Vec<Vec<u8>> {
     let (q_moduli, active_q_level, p_moduli) =
-        resolve_nested_rns_encoding_layout::<P>(p_moduli_bits, params, q_level);
+        resolve_nested_rns_encoding_layout::<P>(p_moduli_bits, max_unreduced_muls, params, q_level);
     let input_mod_q = q_moduli
         .iter()
         .take(active_q_level)
@@ -1152,12 +1205,13 @@ pub fn encode_nested_rns_poly_compact_bytes<P: Poly>(
 
 pub fn encode_nested_rns_poly<P: Poly>(
     p_moduli_bits: usize,
+    max_unreduced_muls: usize,
     params: &P::Params,
     input: &BigUint,
     q_level: Option<usize>,
 ) -> Vec<P> {
     let (q_moduli, active_q_level, p_moduli) =
-        resolve_nested_rns_encoding_layout::<P>(p_moduli_bits, params, q_level);
+        resolve_nested_rns_encoding_layout::<P>(p_moduli_bits, max_unreduced_muls, params, q_level);
     let p_moduli_depth = p_moduli.len();
     let mut polys = vec![Vec::with_capacity(p_moduli_depth); active_q_level];
     for (q_idx, &q_i) in q_moduli.iter().take(active_q_level).enumerate() {
@@ -1182,25 +1236,36 @@ mod tests {
     };
 
     const P_MODULI_BITS: usize = 6;
+    const MAX_UNREDUCED_MULS: usize = DEFAULT_MAX_UNREDUCED_MULS;
     const SCALE: u64 = 1 << 8;
     const BASE_BITS: u32 = 6;
 
     fn create_test_context(
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> (DCRTPolyParams, Arc<NestedRnsPolyContext>) {
-        create_test_context_with_q_level(circuit, None)
+        create_test_context_with_config(circuit, None, P_MODULI_BITS, MAX_UNREDUCED_MULS)
     }
 
     fn create_test_context_with_q_level(
         circuit: &mut PolyCircuit<DCRTPoly>,
         q_level: Option<usize>,
     ) -> (DCRTPolyParams, Arc<NestedRnsPolyContext>) {
+        create_test_context_with_config(circuit, q_level, P_MODULI_BITS, MAX_UNREDUCED_MULS)
+    }
+
+    fn create_test_context_with_config(
+        circuit: &mut PolyCircuit<DCRTPoly>,
+        q_level: Option<usize>,
+        p_moduli_bits: usize,
+        max_unreduced_muls: usize,
+    ) -> (DCRTPolyParams, Arc<NestedRnsPolyContext>) {
         let _ = tracing_subscriber::fmt::try_init();
         let params = DCRTPolyParams::new(4, 6, 18, BASE_BITS);
         let ctx = Arc::new(NestedRnsPolyContext::setup(
             circuit,
             &params,
-            P_MODULI_BITS,
+            p_moduli_bits,
+            max_unreduced_muls,
             SCALE,
             false,
             q_level,
@@ -1319,6 +1384,7 @@ mod tests {
         let (params, ctx) = create_test_context_with_q_level(&mut setup_circuit, Some(q_level));
 
         assert_eq!(ctx.q_moduli_depth, q_level);
+        assert_eq!(ctx.max_unreduced_muls, MAX_UNREDUCED_MULS);
         assert_eq!(ctx.full_reduce_ids.len(), q_level);
         assert_eq!(ctx.add_lazy_reduce_ids.len(), q_level);
         assert_eq!(ctx.sub_lazy_reduce_ids.len(), q_level);
@@ -1471,8 +1537,13 @@ mod tests {
         let manual_out = manual_sum.reconstruct(&mut manual_circuit);
         manual_circuit.output(vec![manual_out]);
 
-        let encoded_input =
-            encode_nested_rns_poly(P_MODULI_BITS, &params, &input_value, Some(q_level));
+        let encoded_input = encode_nested_rns_poly(
+            P_MODULI_BITS,
+            MAX_UNREDUCED_MULS,
+            &params,
+            &input_value,
+            Some(q_level),
+        );
         let eval_inputs =
             (0..operand_count).flat_map(|_| encoded_input.clone()).collect::<Vec<_>>();
         let plt_evaluator = PolyPltEvaluator::new();
@@ -1509,17 +1580,165 @@ mod tests {
     fn test_encode_nested_rns_poly_compact_bytes_matches_polys() {
         let params = DCRTPolyParams::new(4, 6, 18, BASE_BITS);
         let input = BigUint::from(12345u64);
-        let expected = encode_nested_rns_poly::<DCRTPoly>(P_MODULI_BITS, &params, &input, Some(2))
-            .into_iter()
-            .map(|poly| poly.to_compact_bytes())
-            .collect::<Vec<_>>();
+        let expected = encode_nested_rns_poly::<DCRTPoly>(
+            P_MODULI_BITS,
+            MAX_UNREDUCED_MULS,
+            &params,
+            &input,
+            Some(2),
+        )
+        .into_iter()
+        .map(|poly| poly.to_compact_bytes())
+        .collect::<Vec<_>>();
         let actual = encode_nested_rns_poly_compact_bytes::<DCRTPoly>(
             P_MODULI_BITS,
+            MAX_UNREDUCED_MULS,
             &params,
             &input,
             Some(2),
         );
         assert_eq!(actual, expected);
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_sample_crt_primes_respects_configured_mul_budget() {
+        let q_max = 43u64;
+        let max_unreduced_muls = 4usize;
+        let p_moduli = sample_crt_primes(P_MODULI_BITS, q_max, max_unreduced_muls);
+        let prod = p_moduli.iter().fold(BigUint::one(), |acc, &pi| acc * BigUint::from(pi));
+        let sum = p_moduli.iter().copied().sum::<u64>();
+        let mul_budget_bound = sample_crt_primes_mul_budget_bound(sum, p_moduli.len(), q_max);
+
+        assert!(pow_biguint_usize(&mul_budget_bound, max_unreduced_muls) < prod);
+
+        let smaller_budget_prod = sample_crt_primes(P_MODULI_BITS, q_max, MAX_UNREDUCED_MULS)
+            .iter()
+            .fold(BigUint::one(), |acc, &pi| acc * BigUint::from(pi));
+        assert!(smaller_budget_prod < prod);
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_sequential_mul_auto_reduce_uses_extended_mul_budget() {
+        let q_level = 1usize;
+        let p_moduli_bits = 10usize;
+        let max_unreduced_muls = 4usize;
+        let mut setup_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context_with_config(
+            &mut setup_circuit,
+            Some(q_level),
+            p_moduli_bits,
+            max_unreduced_muls,
+        );
+        let reduce_bound = ctx.full_reduce_max_plaintexts[0].clone();
+        let operand_count = max_unreduced_muls + 1;
+        let operand_bound = ceil_biguint_nth_root(&ctx.p_full, operand_count);
+
+        let pre_last_bound = pow_biguint_usize(&operand_bound, operand_count - 1);
+        let final_unreduced_bound = &pre_last_bound * &operand_bound;
+        assert!(pre_last_bound < ctx.p_full);
+        assert!(final_unreduced_bound >= ctx.p_full);
+        assert!(pow_biguint_usize(&reduce_bound, 2) < ctx.p_full);
+
+        let input_value = BigUint::one();
+        let q_level_modulus = BigUint::from(ctx.q_moduli[0]);
+        let expected_output = input_value.clone() % q_level_modulus.clone();
+
+        let mut auto_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_, auto_ctx) = create_test_context_with_config(
+            &mut auto_circuit,
+            Some(q_level),
+            p_moduli_bits,
+            max_unreduced_muls,
+        );
+        let auto_inputs = (0..operand_count)
+            .map(|_| {
+                let input =
+                    NestedRnsPoly::input(auto_ctx.clone(), Some(q_level), &mut auto_circuit);
+                NestedRnsPoly::new(
+                    input.ctx.clone(),
+                    input.inner.clone(),
+                    input.enable_levels,
+                    vec![operand_bound.clone()],
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut auto_product = auto_inputs[0].clone();
+        for poly in auto_inputs.iter().skip(1) {
+            auto_product = auto_product.mul(poly, &mut auto_circuit);
+        }
+        let auto_out = auto_product.reconstruct(&mut auto_circuit);
+        auto_circuit.output(vec![auto_out]);
+
+        let mut manual_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_, manual_ctx) = create_test_context_with_config(
+            &mut manual_circuit,
+            Some(q_level),
+            p_moduli_bits,
+            max_unreduced_muls,
+        );
+        let manual_inputs = (0..operand_count)
+            .map(|_| {
+                let input =
+                    NestedRnsPoly::input(manual_ctx.clone(), Some(q_level), &mut manual_circuit);
+                NestedRnsPoly::new(
+                    input.ctx.clone(),
+                    input.inner.clone(),
+                    input.enable_levels,
+                    vec![operand_bound.clone()],
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut manual_product = manual_inputs[0].clone();
+        for poly in manual_inputs.iter().skip(1).take(operand_count - 2) {
+            manual_product = manual_product.mul(poly, &mut manual_circuit);
+        }
+        manual_product = manual_product.full_reduce(&mut manual_circuit);
+        let last_input = manual_inputs
+            .last()
+            .expect("manual input chain must contain a final operand")
+            .full_reduce(&mut manual_circuit);
+        manual_product = manual_product.mul(&last_input, &mut manual_circuit);
+        let manual_out = manual_product.reconstruct(&mut manual_circuit);
+        manual_circuit.output(vec![manual_out]);
+
+        let encoded_input = encode_nested_rns_poly(
+            p_moduli_bits,
+            max_unreduced_muls,
+            &params,
+            &input_value,
+            Some(q_level),
+        );
+        let eval_inputs =
+            (0..operand_count).flat_map(|_| encoded_input.clone()).collect::<Vec<_>>();
+        let plt_evaluator = PolyPltEvaluator::new();
+        let one = DCRTPoly::const_one(&params);
+
+        let auto_eval = auto_circuit.eval(
+            &params,
+            one.clone(),
+            eval_inputs.clone(),
+            Some(&plt_evaluator),
+            None,
+            None,
+        );
+        let manual_eval =
+            manual_circuit.eval(&params, one, eval_inputs, Some(&plt_evaluator), None, None);
+
+        assert_eq!(auto_eval.len(), 1);
+        assert_eq!(manual_eval.len(), 1);
+        let auto_output = auto_eval[0].coeffs_biguints()[0].clone();
+        let manual_output = manual_eval[0].coeffs_biguints()[0].clone();
+        assert_eq!(auto_output, manual_output);
+        assert_eq!(auto_output % &q_level_modulus, expected_output);
+
+        let expected_depth = manual_circuit.non_free_depth();
+        assert_eq!(auto_circuit.non_free_depth(), expected_depth);
+        assert_eq!(
+            auto_circuit.count_gates_by_type_vec(),
+            manual_circuit.count_gates_by_type_vec()
+        );
     }
 
     fn test_nested_rns_poly_add_generic(
@@ -1541,8 +1760,10 @@ mod tests {
         // println!("modulus {:?}", &modulus);
         // println!("a_value {:?}", &a_value);
         // println!("b_value {:?}", &b_value);
-        let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, None);
-        let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, None);
+        let a_inputs =
+            encode_nested_rns_poly(P_MODULI_BITS, MAX_UNREDUCED_MULS, &params, &a_value, None);
+        let b_inputs =
+            encode_nested_rns_poly(P_MODULI_BITS, MAX_UNREDUCED_MULS, &params, &b_value, None);
         let expected_out = (&a_value + &b_value) % modulus.as_ref();
         // println!("expected_out {:?}", &expected_out);
         let plt_evaluator = PolyPltEvaluator::new();
@@ -1574,8 +1795,10 @@ mod tests {
         // println!("modulus {:?}", &modulus);
         // println!("a_value {:?}", &a_value);
         // println!("b_value {:?}", &b_value);
-        let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, None);
-        let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, None);
+        let a_inputs =
+            encode_nested_rns_poly(P_MODULI_BITS, MAX_UNREDUCED_MULS, &params, &a_value, None);
+        let b_inputs =
+            encode_nested_rns_poly(P_MODULI_BITS, MAX_UNREDUCED_MULS, &params, &b_value, None);
         let expected_out = {
             let mut value = &a_value + modulus.as_ref();
             value -= &b_value;
@@ -1615,10 +1838,20 @@ mod tests {
             .iter()
             .take(active_q_level)
             .fold(BigUint::from(1u64), |acc, &qi| acc * BigUint::from(qi));
-        let a_inputs =
-            encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, Some(active_q_level));
-        let b_inputs =
-            encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, Some(active_q_level));
+        let a_inputs = encode_nested_rns_poly(
+            P_MODULI_BITS,
+            MAX_UNREDUCED_MULS,
+            &params,
+            &a_value,
+            Some(active_q_level),
+        );
+        let b_inputs = encode_nested_rns_poly(
+            P_MODULI_BITS,
+            MAX_UNREDUCED_MULS,
+            &params,
+            &b_value,
+            Some(active_q_level),
+        );
         let expected_mod_q_level =
             ((&a_value % &q_level_modulus) * (&b_value % &q_level_modulus)) % &q_level_modulus;
         let plt_evaluator = PolyPltEvaluator::new();
@@ -1653,8 +1886,10 @@ mod tests {
         circuit.output(vec![out]);
 
         let modulus = params.modulus();
-        let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, None);
-        let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, None);
+        let a_inputs =
+            encode_nested_rns_poly(P_MODULI_BITS, MAX_UNREDUCED_MULS, &params, &a_value, None);
+        let b_inputs =
+            encode_nested_rns_poly(P_MODULI_BITS, MAX_UNREDUCED_MULS, &params, &b_value, None);
         let expected_out = (&a_value * &b_value) % modulus.as_ref();
         let plt_evaluator = PolyPltEvaluator::new();
         let one = DCRTPoly::const_one(&params);
@@ -1677,7 +1912,8 @@ mod tests {
         let out = product.reconstruct(&mut circuit);
         circuit.output(vec![out]);
 
-        let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, None);
+        let a_inputs =
+            encode_nested_rns_poly(P_MODULI_BITS, MAX_UNREDUCED_MULS, &params, &a_value, None);
         let plt_evaluator = PolyPltEvaluator::new();
         let one = DCRTPoly::const_one(&params);
         let eval_results = circuit.eval(&params, one, a_inputs, Some(&plt_evaluator), None, None);
@@ -1713,8 +1949,20 @@ mod tests {
         let b_value = &q_level_modulus - BigUint::from(3u64);
         let expected =
             ((&a_value % &q_level_modulus) * (&b_value % &q_level_modulus)) % &q_level_modulus;
-        let a_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, enable_levels);
-        let b_inputs = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, enable_levels);
+        let a_inputs = encode_nested_rns_poly(
+            P_MODULI_BITS,
+            MAX_UNREDUCED_MULS,
+            &params,
+            &a_value,
+            enable_levels,
+        );
+        let b_inputs = encode_nested_rns_poly(
+            P_MODULI_BITS,
+            MAX_UNREDUCED_MULS,
+            &params,
+            &b_value,
+            enable_levels,
+        );
         let plt_evaluator = PolyPltEvaluator::new();
         let one = DCRTPoly::const_one(&params);
         let eval_inputs = [a_inputs, b_inputs].concat();

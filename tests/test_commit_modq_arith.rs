@@ -5,7 +5,9 @@ use mxx::{
     circuit::PolyCircuit,
     commit::wee25::{Wee25Commit, Wee25PublicParams},
     element::PolyElem,
-    gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly},
+    gadgets::arith::{
+        DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly,
+    },
     lookup::{
         commit_eval::{CommitBGGEncodingPltEvaluator, CommitBGGPubKeyPltEvaluator},
         poly::PolyPltEvaluator,
@@ -30,6 +32,7 @@ use tracing::info;
 const RING_DIM: u32 = 1 << 8;
 const CRT_BITS: usize = 24;
 const P_MODULI_BITS: usize = 6;
+const MAX_UNREDUCED_MULS: usize = DEFAULT_MAX_UNREDUCED_MULS;
 const SCALE: u64 = 1 << 7;
 const BASE_BITS: u32 = 12;
 const MAX_CRT_DEPTH: usize = 32;
@@ -108,6 +111,7 @@ fn build_modq_arith_circuit(
         &mut circuit,
         params,
         P_MODULI_BITS,
+        MAX_UNREDUCED_MULS,
         SCALE,
         false,
         q_level,
@@ -126,6 +130,7 @@ fn build_modq_arith_value_circuit(
         &mut circuit,
         params,
         P_MODULI_BITS,
+        MAX_UNREDUCED_MULS,
         SCALE,
         false,
         q_level,
@@ -233,8 +238,10 @@ async fn test_commit_modq_arith() {
 
     let expected = (&a_value * &b_value) % &active_q;
 
-    let a_inputs: Vec<DCRTPoly> = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, q_level);
-    let b_inputs: Vec<DCRTPoly> = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, q_level);
+    let a_inputs: Vec<DCRTPoly> =
+        encode_nested_rns_poly(P_MODULI_BITS, MAX_UNREDUCED_MULS, &params, &a_value, q_level);
+    let b_inputs: Vec<DCRTPoly> =
+        encode_nested_rns_poly(P_MODULI_BITS, MAX_UNREDUCED_MULS, &params, &b_value, q_level);
     let plaintext_inputs = [a_inputs.clone(), b_inputs.clone()].concat();
     let plaintext_inputs_shared = plaintext_inputs.clone();
 

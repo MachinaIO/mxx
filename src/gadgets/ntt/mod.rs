@@ -17,7 +17,9 @@
 
 use crate::{
     circuit::{PolyCircuit, evaluable::PolyVec},
-    gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly},
+    gadgets::arith::{
+        DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly,
+    },
     poly::{
         Poly, PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
@@ -246,7 +248,15 @@ pub fn encode_nested_rns_poly_vec(
     );
     let encoded_slots = slots
         .par_iter()
-        .map(|slot| encode_nested_rns_poly::<DCRTPoly>(ctx.p_moduli_bits, params, slot, q_level))
+        .map(|slot| {
+            encode_nested_rns_poly::<DCRTPoly>(
+                ctx.p_moduli_bits,
+                ctx.max_unreduced_muls,
+                params,
+                slot,
+                q_level,
+            )
+        })
         .collect::<Vec<_>>();
     let input_count = active_q_level * ctx.p_moduli.len();
     (0..input_count)
@@ -454,6 +464,7 @@ mod tests {
     };
 
     const P_MODULI_BITS: usize = 10;
+    const MAX_UNREDUCED_MULS: usize = DEFAULT_MAX_UNREDUCED_MULS;
     const SCALE: u64 = 1 << 8;
     const BASE_BITS: u32 = 6;
 
@@ -469,7 +480,15 @@ mod tests {
         params: &DCRTPolyParams,
         p_moduli_bits: usize,
     ) -> Arc<NestedRnsPolyContext> {
-        Arc::new(NestedRnsPolyContext::setup(circuit, params, p_moduli_bits, SCALE, false, None))
+        Arc::new(NestedRnsPolyContext::setup(
+            circuit,
+            params,
+            p_moduli_bits,
+            MAX_UNREDUCED_MULS,
+            SCALE,
+            false,
+            None,
+        ))
     }
 
     fn random_slots(

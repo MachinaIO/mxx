@@ -614,17 +614,17 @@ async fn test_gpu_ggh15_poly_modq_arith() {
         .load_b0_matrix_checkpoint(&params)
         .expect("b0 matrix checkpoint should exist after sample_aux_matrices");
     let checkpoint_prefix = pk_evaluator.checkpoint_prefix(&params);
+    let c_b0_compact_bytes_by_slot = GGH15BGGPolyEncodingPltEvaluator::<
+        GpuDCRTPolyMatrix,
+        GpuDCRTPolyHashSampler<Keccak256>,
+    >::build_c_b0_compact_bytes_by_slot(
+        &params, &s_vec, &b0_matrix, &slot_secret_mats
+    );
     let poly_evaluator = GGH15BGGPolyEncodingPltEvaluator::<
         GpuDCRTPolyMatrix,
         GpuDCRTPolyHashSampler<Keccak256>,
     >::new(
-        seed,
-        dir.to_path_buf(),
-        checkpoint_prefix,
-        &params,
-        s_vec.clone(),
-        b0_matrix,
-        slot_secret_mats.clone(),
+        seed, dir.to_path_buf(), checkpoint_prefix, c_b0_compact_bytes_by_slot
     );
 
     let input_poly_encodings = poly_encodings.split_off(1);

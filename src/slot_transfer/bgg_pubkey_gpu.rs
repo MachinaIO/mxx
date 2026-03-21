@@ -877,8 +877,6 @@ mod tests {
             );
             assert_eq!(result.len(), 1);
 
-            let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
-            let (b0_trapdoor, b0_matrix) = trapdoor_sampler.trapdoor(&params, secret_size);
             let slot_secret_mats = (0..num_slots)
                 .map(|_| {
                     GpuDCRTPolyUniformSampler::new()
@@ -887,22 +885,16 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
 
-            evaluator.sample_aux_matrices(
-                &params,
-                &b0_matrix,
-                &b0_trapdoor,
-                slot_secret_mats.clone(),
-            );
+            evaluator.sample_aux_matrices(&params, slot_secret_mats.clone());
             wait_for_all_writes(dir.to_path_buf()).await.unwrap();
 
             let checkpoint_prefix = evaluator.checkpoint_prefix(&params);
             let b1_matrix = evaluator
                 .load_b1_matrix_checkpoint(&params)
                 .expect("b1 matrix checkpoint should exist after gpu sample_aux_matrices");
-            let loaded_b0 = evaluator
+            let b0_matrix = evaluator
                 .load_b0_matrix_checkpoint(&params)
                 .expect("b0 matrix checkpoint should exist after gpu sample_aux_matrices");
-            assert_eq!(loaded_b0, b0_matrix);
 
             let identity = GpuDCRTPolyMatrix::identity(&params, secret_size, None);
             let gadget_matrix = GpuDCRTPolyMatrix::gadget_matrix(&params, secret_size);

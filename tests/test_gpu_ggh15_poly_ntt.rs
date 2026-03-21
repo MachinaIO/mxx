@@ -27,7 +27,7 @@ use mxx::{
         },
     },
     sampler::{
-        DistType, PolyTrapdoorSampler, PolyUniformSampler,
+        DistType, PolyUniformSampler,
         gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
         trapdoor::GpuDCRTPolyTrapdoorSampler,
     },
@@ -565,11 +565,6 @@ async fn test_gpu_ggh15_poly_ntt() {
         enc_setup_start.elapsed().as_secs_f64() * 1000.0
     );
 
-    let trapdoor_setup_start = Instant::now();
-    let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, TRAPDOOR_SIGMA);
-    let (b0_trapdoor, b0_matrix) = trapdoor_sampler.trapdoor(&params, cfg.d_secret);
-    info!("trapdoor setup elapsed_ms={:.3}", trapdoor_setup_start.elapsed().as_secs_f64() * 1000.0);
-
     let pk_evaluator_setup_start = Instant::now();
     let plt_pubkey_evaluator =
         GGH15BGGPubKeyPltEvaluator::<
@@ -617,12 +612,7 @@ async fn test_gpu_ggh15_poly_ntt() {
         plt_sample_aux_start.elapsed().as_secs_f64() * 1000.0
     );
     let slot_sample_aux_start = Instant::now();
-    slot_pubkey_evaluator.sample_aux_matrices(
-        &params,
-        &b0_matrix,
-        &b0_trapdoor,
-        slot_secret_mats.clone(),
-    );
+    slot_pubkey_evaluator.sample_aux_matrices(&params, slot_secret_mats.clone());
     info!(
         "slot_pubkey_sample_aux_matrices elapsed_ms={:.3}",
         slot_sample_aux_start.elapsed().as_secs_f64() * 1000.0
@@ -637,7 +627,16 @@ async fn test_gpu_ggh15_poly_ntt() {
     let plt_b0_matrix = plt_pubkey_evaluator
         .load_b0_matrix_checkpoint(&params)
         .expect("b0 matrix checkpoint should exist after public lookup auxiliary sampling");
-    let c_b0 = s_vec.clone() * &b0_matrix;
+    let slot_b0_matrix = slot_pubkey_evaluator
+        .load_b0_matrix_checkpoint(&params)
+        .expect("b0 matrix checkpoint should exist after slot-transfer auxiliary sampling");
+    let plt_c_b0_compact_bytes_by_slot = GGH15BGGPolyEncodingPltEvaluator::<
+        GpuDCRTPolyMatrix,
+        GpuDCRTPolyHashSampler<Keccak256>,
+    >::build_c_b0_compact_bytes_by_slot(
+        &params, &s_vec, &plt_b0_matrix, &slot_secret_mats
+    );
+    let c_b0 = s_vec.clone() * &slot_b0_matrix;
     let plt_poly_evaluator = GGH15BGGPolyEncodingPltEvaluator::<
         GpuDCRTPolyMatrix,
         GpuDCRTPolyHashSampler<Keccak256>,
@@ -645,10 +644,7 @@ async fn test_gpu_ggh15_poly_ntt() {
         seed,
         dir.to_path_buf(),
         plt_pubkey_evaluator.checkpoint_prefix(&params),
-        &params,
-        s_vec.clone(),
-        plt_b0_matrix,
-        slot_secret_mats.clone(),
+        plt_c_b0_compact_bytes_by_slot,
     );
     let slot_poly_evaluator =
         BggPolyEncodingSTEvaluator::<GpuDCRTPolyMatrix, GpuDCRTPolyHashSampler<Keccak256>>::new(

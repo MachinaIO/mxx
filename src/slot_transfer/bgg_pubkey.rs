@@ -342,17 +342,8 @@ where
     pub fn sample_aux_matrices(
         &self,
         params: &<M::P as Poly>::Params,
-        b0_matrix: &M,
-        b0_trapdoor: &TS::Trapdoor,
         slot_secret_mats: Vec<Vec<u8>>,
     ) {
-        assert_eq!(
-            self.secret_size,
-            b0_matrix.row_size(),
-            "b0 matrix rows {} must match evaluator secret_size {}",
-            b0_matrix.row_size(),
-            self.secret_size
-        );
         assert_eq!(
             slot_secret_mats.len(),
             self.num_slots,
@@ -380,13 +371,14 @@ where
             return;
         }
 
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, self.secret_size);
         Self::store_matrix_checkpoint(b0_matrix.clone(), &self.b0_id_prefix(params));
         Self::store_bytes_checkpoint(
-            TS::trapdoor_to_bytes(b0_trapdoor),
+            TS::trapdoor_to_bytes(&b0_trapdoor),
             &self.b0_trapdoor_id_prefix(params),
         );
 
-        let trap_sampler = TS::new(params, self.trapdoor_sigma);
         let b1_size = self.secret_size.checked_mul(2).expect("slot-transfer b1 size overflow");
         let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, b1_size);
         Self::store_matrix_checkpoint(b1_matrix.clone(), &self.b1_id_prefix(params));
@@ -405,8 +397,8 @@ where
         #[cfg(feature = "gpu")]
         let gpu_shared = self.prepare_gpu_device_shared(
             params,
-            b0_matrix,
-            b0_trapdoor,
+            &b0_matrix,
+            &b0_trapdoor,
             &b1_matrix,
             &b1_trapdoor,
             slot_parallelism,
@@ -429,8 +421,8 @@ where
         for batch in (0..self.num_slots).collect::<Vec<_>>().chunks(slot_parallelism.max(1)) {
             let sampled = self.sample_slot_batch_cpu(
                 params,
-                b0_matrix,
-                b0_trapdoor,
+                &b0_matrix,
+                &b0_trapdoor,
                 &b1_matrix,
                 &b1_trapdoor,
                 &identity,
@@ -515,8 +507,8 @@ where
             for sampled_chunk in gate_slot_entries.chunks(gate_parallelism) {
                 let sampled_chunk = self.sample_gate_batch_cpu(
                     params,
-                    b0_matrix,
-                    b0_trapdoor,
+                    &b0_matrix,
+                    &b0_trapdoor,
                     &slot_secret_mats,
                     &slot_a_bytes_by_slot,
                     *gate_id,
@@ -606,9 +598,8 @@ mod tests {
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{Poly, PolyParams, dcrt::params::DCRTPolyParams},
         sampler::{
-            DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler,
-            hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
-            uniform::DCRTPolyUniformSampler,
+            DistType, PolyHashSampler, PolyUniformSampler, hash::DCRTPolyHashSampler,
+            trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
         },
         storage::{
             read::read_matrix_from_multi_batch,
@@ -809,9 +800,6 @@ mod tests {
         );
         assert_eq!(result.len(), 1);
 
-        let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
-        let (b0_trapdoor, b0_matrix) = trapdoor_sampler.trapdoor(&params, secret_size);
-
         let slot_secret_mats = (0..num_slots)
             .map(|_| {
                 DCRTPolyUniformSampler::new()
@@ -820,17 +808,16 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        evaluator.sample_aux_matrices(&params, &b0_matrix, &b0_trapdoor, slot_secret_mats.clone());
+        evaluator.sample_aux_matrices(&params, slot_secret_mats.clone());
         wait_for_all_writes(dir.to_path_buf()).await.unwrap();
 
         let checkpoint_prefix = evaluator.checkpoint_prefix(&params);
         let b1_matrix = evaluator
             .load_b1_matrix_checkpoint(&params)
             .expect("b1 matrix checkpoint should exist after sample_aux_matrices");
-        let loaded_b0 = evaluator
+        let b0_matrix = evaluator
             .load_b0_matrix_checkpoint(&params)
             .expect("b0 matrix checkpoint should exist after sample_aux_matrices");
-        assert_eq!(loaded_b0, b0_matrix);
 
         let identity = DCRTPolyMatrix::identity(&params, secret_size, None);
         let gadget_matrix = DCRTPolyMatrix::gadget_matrix(&params, secret_size);

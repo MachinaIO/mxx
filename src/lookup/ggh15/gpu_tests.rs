@@ -276,17 +276,17 @@ async fn test_gpu_ggh15_poly_encoding_plt_eval_slot_secret_relation() {
         .load_b0_matrix_checkpoint(&params)
         .expect("b0 matrix checkpoint should exist after sample_aux_matrices");
     let checkpoint_prefix = plt_pubkey_evaluator.checkpoint_prefix(&params);
+    let c_b0_compact_bytes_by_slot = GGH15BGGPolyEncodingPltEvaluator::<
+        GpuDCRTPolyMatrix,
+        GpuDCRTPolyHashSampler<Keccak256>,
+    >::build_c_b0_compact_bytes_by_slot(
+        &params, &s_vec, &b0_matrix, &slot_secret_mats
+    );
     let poly_evaluator = GGH15BGGPolyEncodingPltEvaluator::<
         GpuDCRTPolyMatrix,
         GpuDCRTPolyHashSampler<Keccak256>,
     >::new(
-        key,
-        dir_path.into(),
-        checkpoint_prefix,
-        &params,
-        s_vec.clone(),
-        b0_matrix,
-        slot_secret_mats.clone(),
+        key, dir_path.into(), checkpoint_prefix, c_b0_compact_bytes_by_slot
     );
 
     let result_poly = circuit.eval(

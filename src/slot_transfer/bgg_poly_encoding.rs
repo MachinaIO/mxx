@@ -288,7 +288,7 @@ mod tests {
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
         sampler::{
-            DistType, PolyHashSampler, PolyTrapdoorSampler, hash::DCRTPolyHashSampler,
+            DistType, PolyHashSampler, hash::DCRTPolyHashSampler,
             trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
         },
         slot_transfer::bgg_pubkey::BggPublicKeySTEvaluator,
@@ -375,8 +375,6 @@ mod tests {
         let one = encodings[0].clone();
         let input = encodings[1].clone();
 
-        let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
-        let (b0_trapdoor, b0_matrix) = trapdoor_sampler.trapdoor(&params, secret_size);
         let pubkey_evaluator =
             BggPublicKeySTEvaluator::<
                 DCRTPolyMatrix,
@@ -401,15 +399,13 @@ mod tests {
         );
         assert_eq!(result_pubkey.len(), 1);
 
-        pubkey_evaluator.sample_aux_matrices(
-            &params,
-            &b0_matrix,
-            &b0_trapdoor,
-            slot_secret_mats.clone(),
-        );
+        pubkey_evaluator.sample_aux_matrices(&params, slot_secret_mats.clone());
         wait_for_all_writes(dir.to_path_buf()).await.unwrap();
 
         let s_vec = DCRTPolyMatrix::from_poly_vec_row(&params, secrets.clone());
+        let b0_matrix = pubkey_evaluator
+            .load_b0_matrix_checkpoint(&params)
+            .expect("b0 matrix checkpoint should exist after sample_aux_matrices");
         let c_b0 = s_vec.clone() * &b0_matrix;
         let evaluator =
             BggPolyEncodingSTEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::new(

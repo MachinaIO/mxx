@@ -4,7 +4,9 @@ use mxx::{
     bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
     circuit::PolyCircuit,
     element::PolyElem,
-    gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly},
+    gadgets::arith::{
+        DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly,
+    },
     lookup::{
         ggh15_eval::{GGH15BGGEncodingPltEvaluator, GGH15BGGPubKeyPltEvaluator},
         poly::PolyPltEvaluator,
@@ -29,6 +31,7 @@ use tracing::info;
 const RING_DIM: u32 = 1 << 6;
 const DEFAULT_CRT_BITS: usize = 24;
 const P_MODULI_BITS: usize = 7;
+const MAX_UNREDUCED_MULS: usize = DEFAULT_MAX_UNREDUCED_MULS;
 const SCALE: u64 = 1 << 7;
 const DEFAULT_BASE_BITS: u32 = 12;
 const MAX_CRT_DEPTH: usize = 64;
@@ -133,6 +136,7 @@ fn build_modq_arith_circuit(
         &mut circuit,
         params,
         P_MODULI_BITS,
+        MAX_UNREDUCED_MULS,
         SCALE,
         false,
         q_level,
@@ -151,6 +155,7 @@ fn build_modq_arith_value_circuit(
         &mut circuit,
         params,
         P_MODULI_BITS,
+        MAX_UNREDUCED_MULS,
         SCALE,
         false,
         q_level,
@@ -268,7 +273,9 @@ async fn test_ggh15_modq_arith() {
 
     let plaintext_inputs = input_values
         .iter()
-        .flat_map(|value| encode_nested_rns_poly(P_MODULI_BITS, &params, value, q_level))
+        .flat_map(|value| {
+            encode_nested_rns_poly(P_MODULI_BITS, MAX_UNREDUCED_MULS, &params, value, q_level)
+        })
         .collect::<Vec<_>>();
     let plaintext_inputs_shared = plaintext_inputs.clone();
 

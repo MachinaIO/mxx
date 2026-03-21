@@ -6,7 +6,9 @@ use mxx::{
     bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
     circuit::PolyCircuit,
     element::PolyElem,
-    gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly},
+    gadgets::arith::{
+        DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly,
+    },
     lookup::{
         ggh15_eval::{GGH15BGGEncodingPltEvaluator, GGH15BGGPubKeyPltEvaluator},
         poly::PolyPltEvaluator,
@@ -36,6 +38,7 @@ use tracing::info;
 const DEFAULT_RING_DIM: u32 = 1 << 14;
 const DEFAULT_CRT_BITS: usize = 24;
 const DEFAULT_P_MODULI_BITS: usize = 6;
+const DEFAULT_MAX_UNREDUCED_MULS_BUDGET: usize = DEFAULT_MAX_UNREDUCED_MULS;
 const DEFAULT_SCALE: u64 = 1 << 7;
 const DEFAULT_BASE_BITS: u32 = 12;
 const DEFAULT_MAX_CRT_DEPTH: usize = 32;
@@ -208,6 +211,7 @@ fn build_modq_arith_circuit_cpu(
         &mut circuit,
         params,
         p_moduli_bits,
+        DEFAULT_MAX_UNREDUCED_MULS_BUDGET,
         scale,
         false,
         q_level,
@@ -229,6 +233,7 @@ fn build_modq_arith_circuit_gpu(
         &mut circuit,
         params,
         p_moduli_bits,
+        DEFAULT_MAX_UNREDUCED_MULS_BUDGET,
         scale,
         false,
         q_level,
@@ -250,6 +255,7 @@ fn build_modq_arith_value_circuit_gpu(
         &mut circuit,
         params,
         p_moduli_bits,
+        DEFAULT_MAX_UNREDUCED_MULS_BUDGET,
         scale,
         false,
         q_level,
@@ -392,7 +398,15 @@ async fn test_gpu_ggh15_modq_arith() {
         input_values.iter().fold(BigUint::from(1u64), |acc, value| (acc * value) % &active_q);
     let plaintext_inputs: Vec<GpuDCRTPoly> = input_values
         .iter()
-        .flat_map(|value| encode_nested_rns_poly(cfg.p_moduli_bits, &params, value, q_level))
+        .flat_map(|value| {
+            encode_nested_rns_poly(
+                cfg.p_moduli_bits,
+                DEFAULT_MAX_UNREDUCED_MULS_BUDGET,
+                &params,
+                value,
+                q_level,
+            )
+        })
         .collect();
 
     let dry_circuit = build_modq_arith_value_circuit_gpu(

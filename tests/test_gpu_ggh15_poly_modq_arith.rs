@@ -36,6 +36,7 @@ use tracing::{debug, info};
 const DEFAULT_RING_DIM: u32 = 1 << 14;
 const DEFAULT_CRT_BITS: usize = 24;
 const DEFAULT_P_MODULI_BITS: usize = 6;
+const DEFAULT_MAX_UNREDUCED_MULS_BUDGET: usize = 2;
 const DEFAULT_SCALE: u64 = 1 << 7;
 const DEFAULT_BASE_BITS: u32 = 12;
 const DEFAULT_MAX_CRT_DEPTH: usize = 32;
@@ -49,6 +50,7 @@ struct ModqArithConfig {
     ring_dim: u32,
     crt_bits: usize,
     p_moduli_bits: usize,
+    max_unreduced_muls: usize,
     scale: u64,
     base_bits: u32,
     max_crt_depth: usize,
@@ -95,6 +97,10 @@ impl ModqArithConfig {
         let crt_bits = env_or_parse_usize("GGH15_MODQ_ARITH_CRT_BITS", DEFAULT_CRT_BITS);
         let p_moduli_bits =
             env_or_parse_usize("GGH15_MODQ_ARITH_P_MODULI_BITS", DEFAULT_P_MODULI_BITS);
+        let max_unreduced_muls = env_or_parse_usize(
+            "GGH15_POLY_MODQ_ARITH_MAX_UNREDUCED_MULS",
+            DEFAULT_MAX_UNREDUCED_MULS_BUDGET,
+        );
         let scale = env_or_parse_u64("GGH15_MODQ_ARITH_SCALE", DEFAULT_SCALE);
         let base_bits = env_or_parse_u32("GGH15_MODQ_ARITH_BASE_BITS", DEFAULT_BASE_BITS);
         let max_crt_depth =
@@ -111,6 +117,7 @@ impl ModqArithConfig {
         assert!(ring_dim > 0, "GGH15_MODQ_ARITH_RING_DIM must be > 0");
         assert!(crt_bits > 0, "GGH15_MODQ_ARITH_CRT_BITS must be > 0");
         assert!(p_moduli_bits > 0, "GGH15_MODQ_ARITH_P_MODULI_BITS must be > 0");
+        assert!(max_unreduced_muls > 0, "GGH15_POLY_MODQ_ARITH_MAX_UNREDUCED_MULS must be > 0");
         assert!(scale > 0, "GGH15_MODQ_ARITH_SCALE must be > 0");
         assert!(base_bits > 0, "GGH15_MODQ_ARITH_BASE_BITS must be > 0");
         assert!(max_crt_depth > 0, "GGH15_MODQ_ARITH_MAX_CRT_DEPTH must be > 0");
@@ -122,6 +129,7 @@ impl ModqArithConfig {
             ring_dim,
             crt_bits,
             p_moduli_bits,
+            max_unreduced_muls,
             scale,
             base_bits,
             max_crt_depth,
@@ -205,6 +213,7 @@ fn build_modq_arith_circuit_cpu(
     params: &DCRTPolyParams,
     q_level: Option<usize>,
     p_moduli_bits: usize,
+    max_unreduced_muls: usize,
     scale: u64,
     height: usize,
 ) -> (PolyCircuit<mxx::poly::dcrt::poly::DCRTPoly>, Arc<NestedRnsPolyContext>) {
@@ -213,6 +222,7 @@ fn build_modq_arith_circuit_cpu(
         &mut circuit,
         params,
         p_moduli_bits,
+        max_unreduced_muls,
         scale,
         false,
         q_level,
@@ -226,6 +236,7 @@ fn build_modq_arith_circuit_gpu(
     params: &GpuDCRTPolyParams,
     q_level: Option<usize>,
     p_moduli_bits: usize,
+    max_unreduced_muls: usize,
     scale: u64,
     height: usize,
 ) -> (PolyCircuit<GpuDCRTPoly>, Arc<NestedRnsPolyContext>) {
@@ -234,6 +245,7 @@ fn build_modq_arith_circuit_gpu(
         &mut circuit,
         params,
         p_moduli_bits,
+        max_unreduced_muls,
         scale,
         false,
         q_level,
@@ -263,6 +275,7 @@ fn find_crt_depth_for_modq_arith(
             &params,
             q_level,
             cfg.p_moduli_bits,
+            cfg.max_unreduced_muls,
             cfg.scale,
             cfg.height,
         );
@@ -351,8 +364,14 @@ async fn test_gpu_ggh15_poly_modq_arith() {
     let (all_q_moduli, _, _) = params.to_crt();
     let (active_q_moduli, active_q, active_q_level) = active_q_moduli_and_modulus(&params, q_level);
     let q_max = *active_q_moduli.iter().max().expect("active_q_moduli must not be empty");
-    let (circuit, _ctx) =
-        build_modq_arith_circuit_gpu(&params, q_level, cfg.p_moduli_bits, cfg.scale, cfg.height);
+    let (circuit, _ctx) = build_modq_arith_circuit_gpu(
+        &params,
+        q_level,
+        cfg.p_moduli_bits,
+        cfg.max_unreduced_muls,
+        cfg.scale,
+        cfg.height,
+    );
     info!("found crt_depth={}", crt_depth);
     info!(
         "selected crt_depth={} ring_dim={} crt_bits={} base_bits={} q_level={:?} q_modulo={:?}",
@@ -452,6 +471,7 @@ async fn test_gpu_ggh15_poly_modq_arith() {
                         );
                         let encoded = encode_nested_rns_poly_compact_bytes::<GpuDCRTPoly>(
                             cfg.p_moduli_bits,
+                            cfg.max_unreduced_muls,
                             &local_params,
                             value,
                             q_level,

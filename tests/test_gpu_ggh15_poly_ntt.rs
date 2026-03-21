@@ -54,6 +54,7 @@ const DEFAULT_P_MODULI_BITS: usize = 6;
 const DEFAULT_SCALE: u64 = 1;
 const DEFAULT_BASE_BITS: u32 = 6;
 const DEFAULT_MAX_CRT_DEPTH: usize = 8;
+const DEFAULT_MAX_UNREDUCED_MULS: usize = 2;
 const DEFAULT_ERROR_SIGMA: f64 = 4.0;
 const DEFAULT_D_SECRET: usize = 1;
 const TRAPDOOR_SIGMA: f64 = 4.578;
@@ -67,6 +68,7 @@ struct NttConfig {
     scale: u64,
     base_bits: u32,
     max_crt_depth: usize,
+    max_unreduced_muls: usize,
     error_sigma: f64,
     d_secret: usize,
     dir_name_override: Option<String>,
@@ -135,6 +137,8 @@ impl NttConfig {
         let base_bits = env_or_parse_u32("GGH15_POLY_NTT_BASE_BITS", DEFAULT_BASE_BITS);
         let max_crt_depth =
             env_or_parse_usize("GGH15_POLY_NTT_MAX_CRT_DEPTH", DEFAULT_MAX_CRT_DEPTH);
+        let max_unreduced_muls =
+            env_or_parse_usize("GGH15_POLY_NTT_MAX_UNREDUCED_MULS", DEFAULT_MAX_UNREDUCED_MULS);
         let error_sigma = env_or_parse_f64("GGH15_POLY_NTT_ERROR_SIGMA", DEFAULT_ERROR_SIGMA);
         let d_secret = env_or_parse_usize("GGH15_POLY_NTT_D_SECRET", DEFAULT_D_SECRET);
         let dir_name_override = env::var("GGH15_POLY_NTT_DIR_NAME")
@@ -154,6 +158,7 @@ impl NttConfig {
         assert!(scale > 0, "GGH15_POLY_NTT_SCALE must be > 0");
         assert!(base_bits > 0, "GGH15_POLY_NTT_BASE_BITS must be > 0");
         assert!(max_crt_depth > 0, "GGH15_POLY_NTT_MAX_CRT_DEPTH must be > 0");
+        assert!(max_unreduced_muls > 0, "GGH15_POLY_NTT_MAX_UNREDUCED_MULS must be > 0");
         assert!(error_sigma > 0.0, "GGH15_POLY_NTT_ERROR_SIGMA must be > 0");
         assert!(d_secret > 0, "GGH15_POLY_NTT_D_SECRET must be > 0");
 
@@ -165,6 +170,7 @@ impl NttConfig {
             scale,
             base_bits,
             max_crt_depth,
+            max_unreduced_muls,
             error_sigma,
             d_secret,
             dir_name_override,
@@ -243,6 +249,7 @@ fn build_ntt_circuit_cpu(
     params: &DCRTPolyParams,
     q_level: Option<usize>,
     p_moduli_bits: usize,
+    max_unreduced_muls: usize,
     scale: u64,
     num_slots: usize,
 ) -> (PolyCircuit<DCRTPoly>, Arc<NestedRnsPolyContext>) {
@@ -251,12 +258,13 @@ fn build_ntt_circuit_cpu(
         &mut circuit,
         params,
         p_moduli_bits,
+        max_unreduced_muls,
         scale,
         false,
         q_level,
     ));
     let input = NestedRnsPoly::input(ctx.clone(), q_level, &mut circuit);
-    let inverse = inverse_ntt(params, &mut circuit, &input, num_slots, 2);
+    let inverse = inverse_ntt(params, &mut circuit, &input, num_slots);
     let reconstructed = inverse.reconstruct(&mut circuit);
     circuit.output(vec![reconstructed]);
     (circuit, ctx)
@@ -266,6 +274,7 @@ fn build_ntt_circuit_gpu(
     params: &GpuDCRTPolyParams,
     q_level: Option<usize>,
     p_moduli_bits: usize,
+    max_unreduced_muls: usize,
     scale: u64,
     num_slots: usize,
 ) -> (PolyCircuit<GpuDCRTPoly>, Arc<NestedRnsPolyContext>) {
@@ -274,12 +283,13 @@ fn build_ntt_circuit_gpu(
         &mut circuit,
         params,
         p_moduli_bits,
+        max_unreduced_muls,
         scale,
         false,
         q_level,
     ));
     let input = NestedRnsPoly::input(ctx.clone(), q_level, &mut circuit);
-    let inverse = inverse_ntt(params, &mut circuit, &input, num_slots, 2);
+    let inverse = inverse_ntt(params, &mut circuit, &input, num_slots);
     let reconstructed = inverse.reconstruct(&mut circuit);
     circuit.output(vec![reconstructed]);
     (circuit, ctx)
@@ -324,8 +334,14 @@ fn find_crt_depth_for_ntt(cfg: &NttConfig, q_level: Option<usize>) -> (usize, DC
         let (active_q_moduli, _, _) = active_q_moduli_and_modulus(&params, q_level);
         let full_q = params.modulus();
         let q_max = *active_q_moduli.iter().max().expect("active_q_moduli must not be empty");
-        let (circuit, _ctx) =
-            build_ntt_circuit_cpu(&params, q_level, cfg.p_moduli_bits, cfg.scale, cfg.num_slots);
+        let (circuit, _ctx) = build_ntt_circuit_cpu(
+            &params,
+            q_level,
+            cfg.p_moduli_bits,
+            cfg.max_unreduced_muls,
+            cfg.scale,
+            cfg.num_slots,
+        );
 
         let log_base_q = params.modulus_digits();
         let log_base_q_small = log_base_q / crt_depth;
@@ -414,8 +430,14 @@ async fn test_gpu_ggh15_poly_ntt() {
     let (all_q_moduli, _, _) = params.to_crt();
     let (active_q_moduli, active_q, active_q_level) = active_q_moduli_and_modulus(&params, q_level);
     let q_max = *active_q_moduli.iter().max().expect("active_q_moduli must not be empty");
-    let (circuit, _ctx) =
-        build_ntt_circuit_gpu(&params, q_level, cfg.p_moduli_bits, cfg.scale, cfg.num_slots);
+    let (circuit, _ctx) = build_ntt_circuit_gpu(
+        &params,
+        q_level,
+        cfg.p_moduli_bits,
+        cfg.max_unreduced_muls,
+        cfg.scale,
+        cfg.num_slots,
+    );
     info!("found crt_depth={}", crt_depth);
     info!(
         "selected crt_depth={} ring_dim={} num_slots={} crt_bits={} base_bits={} q_level={:?} q_moduli={:?}",
@@ -469,6 +491,7 @@ async fn test_gpu_ggh15_poly_ntt() {
                 let local_params = params.params_for_device(gpu_id);
                 let encoded_inputs = encode_nested_rns_poly_compact_bytes::<GpuDCRTPoly>(
                     cfg.p_moduli_bits,
+                    cfg.max_unreduced_muls,
                     &local_params,
                     &input_eval_slots[slot_idx],
                     q_level,

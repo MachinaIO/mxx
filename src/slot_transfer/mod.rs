@@ -1,8 +1,10 @@
-// pub mod bgg_pubkey;
-// #[cfg(feature = "gpu")]
-// mod bgg_pubkey_gpu;
+pub mod bgg_poly_encoding;
+pub mod bgg_pubkey;
+#[cfg(feature = "gpu")]
+mod bgg_pubkey_gpu;
 pub mod poly_vec;
 
+pub use bgg_poly_encoding::BggPolyEncodingSTEvaluator;
 // pub use bgg_pubkey::BggPublicKeySTEvaluator;
 pub use poly_vec::PolyVecSlotTransferEvaluator;
 

@@ -20,7 +20,6 @@ use tracing::info;
 pub(crate) struct SlotAuxSample<M: PolyMatrix> {
     pub(crate) slot_idx: usize,
     pub(crate) slot_a: M,
-    pub(crate) slot_a_bytes: Vec<u8>,
     pub(crate) preimage_b0: M,
     pub(crate) preimage_b1: M,
 }
@@ -28,7 +27,7 @@ pub(crate) struct SlotAuxSample<M: PolyMatrix> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BggPublicKeySTGateState {
     pub input_pubkey_bytes: Vec<u8>,
-    pub src_slots: Vec<u32>,
+    pub src_slots: Vec<(u32, Option<u32>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,11 +134,15 @@ where
         format!("{}_b1_trapdoor", self.aux_checkpoint_prefix(params))
     }
 
-    fn slot_a_id_prefix(&self, params: &<M::P as Poly>::Params, slot_idx: usize) -> String {
+    pub(crate) fn slot_a_id_prefix(
+        &self,
+        params: &<M::P as Poly>::Params,
+        slot_idx: usize,
+    ) -> String {
         format!("{}_slot_a_{}", self.aux_checkpoint_prefix(params), slot_idx)
     }
 
-    fn slot_preimage_b0_id_prefix(
+    pub(crate) fn slot_preimage_b0_id_prefix(
         &self,
         params: &<M::P as Poly>::Params,
         slot_idx: usize,
@@ -147,7 +150,7 @@ where
         format!("{}_slot_preimage_b0_{}", self.aux_checkpoint_prefix(params), slot_idx)
     }
 
-    fn slot_preimage_b1_id_prefix(
+    pub(crate) fn slot_preimage_b1_id_prefix(
         &self,
         params: &<M::P as Poly>::Params,
         slot_idx: usize,
@@ -155,7 +158,7 @@ where
         format!("{}_slot_preimage_b1_{}", self.aux_checkpoint_prefix(params), slot_idx)
     }
 
-    fn gate_preimage_id_prefix(
+    pub(crate) fn gate_preimage_id_prefix(
         &self,
         params: &<M::P as Poly>::Params,
         gate_id: GateId,
@@ -168,7 +171,7 @@ where
         add_lookup_buffer(get_lookup_buffer(vec![(0usize, matrix)], id_prefix));
     }
 
-    fn store_bytes_checkpoint(bytes: Vec<u8>, id_prefix: &str) {
+    pub(crate) fn store_bytes_checkpoint(bytes: Vec<u8>, id_prefix: &str) {
         add_lookup_buffer(get_lookup_buffer_bytes(vec![(0usize, bytes)], id_prefix));
     }
 
@@ -252,8 +255,7 @@ where
                 let mut target_b1 = a_i.clone().concat_rows(&[&neg_slot_secret_gadget]);
                 target_b1.add_in_place(&self.sample_error_matrix(params, b1_size, m_g));
                 let preimage_b1 = trap_sampler.preimage(params, b1_trapdoor, b1_matrix, &target_b1);
-                let slot_a_bytes = a_i.to_compact_bytes();
-                SlotAuxSample { slot_idx, slot_a: a_i, slot_a_bytes, preimage_b0, preimage_b1 }
+                SlotAuxSample { slot_idx, slot_a: a_i, preimage_b0, preimage_b1 }
             })
             .collect()
     }
@@ -268,7 +270,7 @@ where
         slot_a_bytes_by_slot: &[Vec<u8>],
         gate_id: GateId,
         state: &BggPublicKeySTGateState,
-        slot_chunk: &[(usize, u32)],
+        slot_chunk: &[(usize, (u32, Option<u32>))],
     ) -> Vec<(usize, M)> {
         let m_g = self.secret_size * params.modulus_digits();
         let trap_sampler = TS::new(params, self.trapdoor_sigma);
@@ -284,7 +286,7 @@ where
         slot_chunk
             .par_iter()
             .copied()
-            .map(|(dst_slot, src_slot_u32)| {
+            .map(|(dst_slot, (src_slot_u32, scalar))| {
                 let src_slot =
                     usize::try_from(src_slot_u32).expect("source slot index must fit in usize");
                 assert!(
@@ -297,7 +299,13 @@ where
                 let s_i = M::from_compact_bytes(params, slot_secret_mats[src_slot].as_ref());
                 let a_j = M::from_compact_bytes(params, slot_a_bytes_by_slot[dst_slot].as_ref());
                 let lhs = s_j * &a_out;
-                let rhs = (s_i * &a_in) * a_j.decompose();
+                let rhs = match scalar {
+                    Some(scalar) => {
+                        let scalar_poly = M::P::from_usize_to_constant(params, scalar as usize);
+                        ((s_i * &a_in) * a_j.decompose()) * scalar_poly
+                    }
+                    None => (s_i * &a_in) * a_j.decompose(),
+                };
                 let mut target = lhs - rhs;
                 target.add_in_place(&self.sample_error_matrix(params, self.secret_size, m_g));
                 let preimage = trap_sampler.preimage(params, b0_trapdoor, b0_matrix, &target);
@@ -357,7 +365,7 @@ where
         );
         let mut slot_a_bytes_by_slot = vec![Vec::new(); self.num_slots];
         #[cfg(feature = "gpu")]
-        let gpu_slot_shared = self.prepare_gpu_device_shared(
+        let gpu_shared = self.prepare_gpu_device_shared(
             params,
             b0_matrix,
             b0_trapdoor,
@@ -365,19 +373,22 @@ where
             &b1_trapdoor,
             slot_parallelism,
         );
-        #[cfg(feature = "gpu")]
-        let gpu_slot_secret_mats =
-            self.copy_compact_matrices_to_gpu_devices(&slot_secret_mats, &gpu_slot_shared);
         #[cfg(not(feature = "gpu"))]
         let identity = M::identity(params, self.secret_size, None);
         #[cfg(not(feature = "gpu"))]
         let gadget_matrix = M::gadget_matrix(params, self.secret_size);
 
+        #[cfg(feature = "gpu")]
+        {
+            slot_a_bytes_by_slot = self.sample_slot_batches_gpu_pipelined(
+                params,
+                &gpu_shared,
+                &slot_secret_mats,
+                slot_parallelism,
+            );
+        }
+        #[cfg(not(feature = "gpu"))]
         for batch in (0..self.num_slots).collect::<Vec<_>>().chunks(slot_parallelism.max(1)) {
-            #[cfg(feature = "gpu")]
-            let sampled =
-                self.sample_slot_batch_gpu(&gpu_slot_shared, &gpu_slot_secret_mats, batch);
-            #[cfg(not(feature = "gpu"))]
             let sampled = self.sample_slot_batch_cpu(
                 params,
                 b0_matrix,
@@ -393,6 +404,7 @@ where
                 .into_par_iter()
                 .map(|sample| {
                     let slot_idx = sample.slot_idx;
+                    let slot_a_bytes = sample.slot_a.to_compact_bytes();
                     let slot_a_id_prefix = self.slot_a_id_prefix(params, slot_idx);
                     let slot_preimage_b0_id_prefix =
                         self.slot_preimage_b0_id_prefix(params, slot_idx);
@@ -400,7 +412,7 @@ where
                         self.slot_preimage_b1_id_prefix(params, slot_idx);
                     (
                         slot_idx,
-                        sample.slot_a_bytes,
+                        slot_a_bytes,
                         vec![
                             (slot_a_id_prefix, sample.slot_a),
                             (slot_preimage_b0_id_prefix, sample.preimage_b0),
@@ -447,64 +459,23 @@ where
             "Slot-transfer gate auxiliary parallelism cap: SLOT_TRANSFER_SLOT_PARALLELISM={}",
             slot_parallelism
         );
-        #[cfg(feature = "gpu")]
-        let gpu_gate_shared = self.prepare_gpu_device_shared(
-            params,
-            b0_matrix,
-            b0_trapdoor,
-            &b1_matrix,
-            &b1_trapdoor,
-            slot_parallelism,
-        );
 
         for (gate_id, state) in &gate_entries {
             let gate_slot_entries = state.src_slots.iter().copied().enumerate().collect::<Vec<_>>();
             let gate_parallelism = slot_parallelism.min(gate_slot_entries.len().max(1));
             info!("Slot-transfer gate {} effective parallelism: {}", gate_id, gate_parallelism);
+            #[cfg(feature = "gpu")]
+            self.sample_gate_batches_gpu_pipelined(
+                params,
+                &gpu_shared,
+                &slot_secret_mats,
+                &slot_a_bytes_by_slot,
+                *gate_id,
+                state,
+                gate_parallelism,
+            );
+            #[cfg(not(feature = "gpu"))]
             for sampled_chunk in gate_slot_entries.chunks(gate_parallelism) {
-                #[cfg(feature = "gpu")]
-                let selected_slot_indices = {
-                    let mut indices = sampled_chunk
-                        .iter()
-                        .flat_map(|(dst_slot, src_slot_u32)| {
-                            let src_slot = usize::try_from(*src_slot_u32)
-                                .expect("source slot index must fit in usize");
-                            [*dst_slot, src_slot]
-                        })
-                        .collect::<Vec<_>>();
-                    indices.sort_unstable();
-                    indices.dedup();
-                    indices
-                };
-                #[cfg(feature = "gpu")]
-                let selected_slot_secret_mats = selected_slot_indices
-                    .iter()
-                    .map(|slot_idx| slot_secret_mats[*slot_idx].clone())
-                    .collect::<Vec<_>>();
-                #[cfg(feature = "gpu")]
-                let gpu_gate_slot_secret_mats = self.copy_compact_matrices_to_gpu_devices(
-                    &selected_slot_secret_mats,
-                    &gpu_gate_shared,
-                );
-                #[cfg(feature = "gpu")]
-                let selected_slot_a_mats = selected_slot_indices
-                    .iter()
-                    .map(|slot_idx| slot_a_bytes_by_slot[*slot_idx].clone())
-                    .collect::<Vec<_>>();
-                #[cfg(feature = "gpu")]
-                let gpu_gate_slot_a_mats = self
-                    .copy_compact_matrices_to_gpu_devices(&selected_slot_a_mats, &gpu_gate_shared);
-                #[cfg(feature = "gpu")]
-                let sampled_chunk = self.sample_gate_batch_gpu(
-                    &gpu_gate_shared,
-                    &gpu_gate_slot_secret_mats,
-                    &gpu_gate_slot_a_mats,
-                    &selected_slot_indices,
-                    *gate_id,
-                    state,
-                    sampled_chunk,
-                );
-                #[cfg(not(feature = "gpu"))]
                 let sampled_chunk = self.sample_gate_batch_cpu(
                     params,
                     b0_matrix,
@@ -541,7 +512,7 @@ where
         &self,
         params: &<M::P as Poly>::Params,
         input: &BggPublicKey<M>,
-        src_slots: &[u32],
+        src_slots: &[(u32, Option<u32>)],
         gate_id: GateId,
     ) -> BggPublicKey<M> {
         assert_eq!(
@@ -596,7 +567,7 @@ mod tests {
         circuit::PolyCircuit,
         lookup::{PltEvaluator, PublicLut},
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
-        poly::{PolyParams, dcrt::params::DCRTPolyParams},
+        poly::{Poly, PolyParams, dcrt::params::DCRTPolyParams},
         sampler::{
             DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler,
             hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
@@ -631,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn bgg_public_key_st_evaluator_records_gate_state_and_hashes_output_matrix() {
+    fn test_slot_transfer_bgg_public_key_records_gate_state_and_hashes_output_matrix() {
         let params = DCRTPolyParams::default();
         let hash_key = [0x42u8; 32];
         let m_g = 2 * params.modulus_digits();
@@ -660,7 +631,8 @@ mod tests {
 
         let mut circuit = PolyCircuit::new();
         let inputs = circuit.input(1);
-        let transferred = circuit.slot_transfer_gate(inputs[0], &[1, 0]);
+        let src_slots = [(1, None), (0, Some(3))];
+        let transferred = circuit.slot_transfer_gate(inputs[0], &src_slots);
         circuit.output(vec![transferred]);
 
         let evaluator =
@@ -694,12 +666,12 @@ mod tests {
 
         let stored = evaluator.gate_state(transferred).expect("missing stored gate state");
         assert_eq!(stored.input_pubkey_bytes, input_pubkey.matrix.to_compact_bytes());
-        assert_eq!(stored.src_slots, vec![1, 0]);
+        assert_eq!(stored.src_slots, src_slots);
     }
 
     #[test]
     #[should_panic(expected = "source slot count 1 does not match evaluator num_slots 2")]
-    fn bgg_public_key_st_evaluator_rejects_unexpected_slot_count() {
+    fn test_slot_transfer_bgg_public_key_rejects_unexpected_slot_count() {
         let params = DCRTPolyParams::default();
         let input_pubkey = BggPublicKey::new(
             DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
@@ -731,14 +703,14 @@ mod tests {
             &evaluator,
             &params,
             &input_pubkey,
-            &[0],
+            &[(0, None)],
             crate::circuit::gate::GateId(9),
         );
     }
 
     #[tokio::test]
     #[sequential_test::sequential]
-    async fn bgg_public_key_st_evaluator_samples_and_persists_aux_matrices() {
+    async fn test_slot_transfer_bgg_public_key_samples_and_persists_aux_matrices() {
         let _storage_lock = storage_test_lock().await;
         let _ = tracing_subscriber::fmt::try_init();
 
@@ -779,7 +751,8 @@ mod tests {
 
         let mut circuit = PolyCircuit::new();
         let inputs = circuit.input(1);
-        let transferred = circuit.slot_transfer_gate(inputs[0], &[1, 0]);
+        let src_slots = [(1, None), (0, Some(3))];
+        let transferred = circuit.slot_transfer_gate(inputs[0], &src_slots);
         circuit.output(vec![transferred]);
 
         let evaluator =
@@ -877,7 +850,8 @@ mod tests {
             DistType::FinRingDist,
         );
 
-        for (dst_slot, src_slot) in [1usize, 0usize].into_iter().enumerate() {
+        for (dst_slot, (src_slot, scalar)) in src_slots.into_iter().enumerate() {
+            let src_slot = src_slot as usize;
             let s_j =
                 DCRTPolyMatrix::from_compact_bytes(&params, slot_secret_mats[dst_slot].as_ref());
             let s_i =
@@ -898,7 +872,17 @@ mod tests {
             )
             .expect("gate preimage checkpoint should exist");
 
-            let expected_target = s_j * &a_out - (s_i * &input_pubkey.matrix) * a_j.decompose();
+            let rhs = match scalar {
+                Some(scalar) => {
+                    let scalar_poly = <DCRTPolyMatrix as PolyMatrix>::P::from_usize_to_constant(
+                        &params,
+                        scalar as usize,
+                    );
+                    ((s_i * &input_pubkey.matrix) * a_j.decompose()) * scalar_poly
+                }
+                None => (s_i * &input_pubkey.matrix) * a_j.decompose(),
+            };
+            let expected_target = s_j * &a_out - rhs;
             assert_eq!(b0_matrix.clone() * &gate_preimage, expected_target);
         }
     }

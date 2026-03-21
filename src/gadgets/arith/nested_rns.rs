@@ -720,20 +720,30 @@ impl<P: Poly> NestedRnsPoly<P> {
         src_slots: &[(u32, Option<Vec<u64>>)],
         circuit: &mut PolyCircuit<P>,
     ) -> Self {
-        let levels = self.resolve_enable_levels();
+        let mut operand = self.clone();
+        let predicted_bounds = self.compute_slot_transfer_output_bounds();
+        if self.bounds_exceed_p_full(&predicted_bounds) {
+            operand = self.full_reduce(circuit);
+        }
+        let final_bounds = operand.compute_slot_transfer_output_bounds();
+        operand.assert_bounds_within_p_full(
+            &final_bounds,
+            "slot_transfer output exceeds p_full even after automatic full_reduce",
+        );
+
+        let levels = operand.resolve_enable_levels();
         let mut inner = Vec::with_capacity(levels);
-        let mut max_plaintexts = Vec::with_capacity(levels);
         for q_moduli_idx in 0..levels {
-            let q_level = &self.inner[q_moduli_idx];
+            let q_level = &operand.inner[q_moduli_idx];
             assert_eq!(
                 q_level.len(),
-                self.ctx.p_moduli.len(),
+                operand.ctx.p_moduli.len(),
                 "mismatched p_moduli depth for q_moduli_idx {}",
                 q_moduli_idx
             );
             let transferred = q_level
                 .iter()
-                .zip(self.ctx.p_moduli.iter())
+                .zip(operand.ctx.p_moduli.iter())
                 .map(|(&gate_id, &p_j)| {
                     let lowered_src_slots = src_slots
                         .iter()
@@ -757,13 +767,9 @@ impl<P: Poly> NestedRnsPoly<P> {
                     circuit.slot_transfer_gate(gate_id, &lowered_src_slots)
                 })
                 .collect::<Vec<_>>();
-            inner.push(circuit.call_sub_circuit(self.ctx.lazy_reduce_id, &transferred));
-
-            max_plaintexts.push(
-                &self.max_plaintexts[q_moduli_idx] * (self.ctx.q_moduli[q_moduli_idx] - 1u64),
-            ); // max_plaintext after slot transfer is max_plaintext * (q_i - 1);
+            inner.push(circuit.call_sub_circuit(operand.ctx.lazy_reduce_id, &transferred));
         }
-        Self::new(self.ctx.clone(), inner, self.enable_levels, max_plaintexts)
+        Self::new(operand.ctx.clone(), inner, operand.enable_levels, final_bounds)
     }
 
     pub fn add(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
@@ -970,6 +976,15 @@ impl<P: Poly> NestedRnsPoly<P> {
             .map(|q_idx| {
                 &self.max_plaintexts[q_idx] *
                     BigUint::from(tower_constants[q_idx] % self.ctx.q_moduli[q_idx])
+            })
+            .collect()
+    }
+
+    fn compute_slot_transfer_output_bounds(&self) -> Vec<BigUint> {
+        let levels = self.resolve_enable_levels();
+        (0..levels)
+            .map(|q_idx| {
+                &self.max_plaintexts[q_idx] * BigUint::from(self.ctx.q_moduli[q_idx] - 1u64)
             })
             .collect()
     }
@@ -1469,6 +1484,59 @@ mod tests {
             BigUint::from(ctx.q_moduli[1] - 1) * BigUint::from(ctx.q_moduli[1] - 1),
         ];
         assert_eq!(transferred.max_plaintexts, expected);
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_slot_transfer_auto_reduce_matches_manual_full_reduce() {
+        let q_level = 1usize;
+
+        let mut setup_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_, ctx) = create_test_context_with_q_level(&mut setup_circuit, Some(q_level));
+        let slot_transfer_scale = BigUint::from(ctx.q_moduli[0] - 1);
+        let operand_bound = div_ceil_biguint_by_u64(ctx.p_full.clone(), ctx.q_moduli[0] - 1);
+        let reduced_transfer_bound = &ctx.full_reduce_max_plaintexts[0] * &slot_transfer_scale;
+        assert!(&operand_bound * &slot_transfer_scale >= ctx.p_full);
+        assert!(reduced_transfer_bound < ctx.p_full);
+
+        let mut auto_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_, auto_ctx) = create_test_context_with_q_level(&mut auto_circuit, Some(q_level));
+        let auto_input = NestedRnsPoly::input(auto_ctx.clone(), Some(q_level), &mut auto_circuit);
+        let auto_input = NestedRnsPoly::new(
+            auto_input.ctx.clone(),
+            auto_input.inner.clone(),
+            auto_input.enable_levels,
+            vec![operand_bound.clone()],
+        );
+        let auto_transferred = auto_input.slot_transfer(
+            &[(0, Some(vec![1])), (1, Some(vec![2])), (2, None)],
+            &mut auto_circuit,
+        );
+        assert_eq!(auto_transferred.max_plaintexts, vec![reduced_transfer_bound.clone()]);
+        auto_circuit.output(auto_transferred.inner[0].clone());
+
+        let mut manual_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_, manual_ctx) = create_test_context_with_q_level(&mut manual_circuit, Some(q_level));
+        let manual_input =
+            NestedRnsPoly::input(manual_ctx.clone(), Some(q_level), &mut manual_circuit);
+        let manual_input = NestedRnsPoly::new(
+            manual_input.ctx.clone(),
+            manual_input.inner.clone(),
+            manual_input.enable_levels,
+            vec![operand_bound],
+        );
+        let manual_transferred = manual_input.full_reduce(&mut manual_circuit).slot_transfer(
+            &[(0, Some(vec![1])), (1, Some(vec![2])), (2, None)],
+            &mut manual_circuit,
+        );
+        assert_eq!(manual_transferred.max_plaintexts, vec![reduced_transfer_bound]);
+        manual_circuit.output(manual_transferred.inner[0].clone());
+
+        assert_eq!(auto_circuit.non_free_depth(), manual_circuit.non_free_depth());
+        assert_eq!(
+            auto_circuit.count_gates_by_type_vec(),
+            manual_circuit.count_gates_by_type_vec()
+        );
     }
 
     #[sequential_test::sequential]

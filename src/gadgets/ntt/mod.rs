@@ -381,10 +381,8 @@ fn apply_stage<P: Poly>(
     current: &NestedRnsPoly<P>,
     plan: &ButterflyStagePlan,
 ) -> NestedRnsPoly<P> {
-    let alpha_current =
-        current.slot_transfer(&plan.alpha_slot_transfer, circuit).full_reduce(circuit);
-    let beta_partner =
-        current.slot_transfer(&plan.beta_slot_transfer, circuit).full_reduce(circuit);
+    let alpha_current = current.slot_transfer(&plan.alpha_slot_transfer, circuit);
+    let beta_partner = current.slot_transfer(&plan.beta_slot_transfer, circuit);
     alpha_current.add(&beta_partner, circuit)
 }
 
@@ -405,7 +403,7 @@ fn multiply_by_tower_constants<P: Poly>(
             first
         })
         .collect::<Vec<_>>();
-    input.const_mul(&tower_constants, circuit).full_reduce(circuit)
+    input.const_mul(&tower_constants, circuit)
 }
 
 pub fn forward_ntt(

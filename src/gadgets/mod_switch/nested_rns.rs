@@ -208,9 +208,9 @@ mod tests {
         circuit::PolyCircuit,
         lookup::poly::PolyPltEvaluator,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
-        utils::gen_biguint_for_modulus,
     };
     use num_traits::{One, ToPrimitive};
+    use rand::Rng;
 
     const P_MODULI_BITS: usize = 6;
     const MAX_UNREDUCED_MULS: usize = crate::gadgets::arith::DEFAULT_MAX_UNREDUCED_MULS;
@@ -238,22 +238,40 @@ mod tests {
         moduli.iter().fold(BigUint::one(), |acc, &q_i| acc * BigUint::from(q_i))
     }
 
+    fn crt_value_from_residues(moduli: &[u64], residues: &[u64]) -> BigUint {
+        assert_eq!(moduli.len(), residues.len(), "CRT residues must match modulus count");
+        let modulus = product_modulus(moduli);
+        moduli.iter().zip(residues.iter()).fold(BigUint::ZERO, |acc, (&q_i, &residue)| {
+            let q_i_big = BigUint::from(q_i);
+            let q_hat = &modulus / &q_i_big;
+            let q_hat_mod_q_i = (&q_hat % &q_i_big).to_u64().expect("CRT residue must fit in u64");
+            let q_hat_inv = mod_inverse(q_hat_mod_q_i, q_i).expect("CRT inverse must exist");
+            (acc + BigUint::from(residue) * q_hat * BigUint::from(q_hat_inv)) % &modulus
+        })
+    }
+
+    fn random_residues_in_ranges(moduli: &[u64]) -> Vec<u64> {
+        let mut rng = rand::rng();
+        moduli.iter().map(|&q_i| rng.random_range(0..q_i)).collect()
+    }
+
     #[test]
-    fn test_conv_to_next_level_zeroes_source_levels_and_extends_enable_levels() {
+    fn test_mod_switch_nested_rns_conv_to_next_level() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit, Some(3));
         let input = NestedRnsPoly::input(ctx.clone(), Some(2), &mut circuit);
+        let q_moduli = ctx.q_moduli();
+        let source_moduli = &q_moduli[..2];
         let converted = input.conv_to_next_level(&mut circuit);
         assert_eq!(converted.enable_levels, Some(3));
         assert_eq!(converted.inner.len(), 3);
         let reconstructed = converted.reconstruct(&mut circuit);
         circuit.output(vec![reconstructed]);
 
-        let q_moduli = ctx.q_moduli();
-        let source_moduli = &q_moduli[..2];
-        let input_modulus = product_modulus(source_moduli);
-        let mut rng = rand::rng();
-        let value = gen_biguint_for_modulus(&mut rng, &input_modulus);
+        let source_residues = [10u64, 5u64];
+        assert!(source_residues[0] < source_moduli[0]);
+        assert!(source_residues[1] < source_moduli[1]);
+        let value = crt_value_from_residues(source_moduli, &source_residues);
 
         let encoded_input = crate::gadgets::arith::encode_nested_rns_poly(
             P_MODULI_BITS,
@@ -271,10 +289,11 @@ mod tests {
         for &q_i in source_moduli {
             assert_eq!(output.clone() % BigUint::from(q_i), BigUint::ZERO);
         }
+        assert_ne!(output % BigUint::from(q_moduli[2]), BigUint::ZERO);
     }
 
     #[test]
-    fn test_mod_up_one_level_preserves_prefix_and_matches_conv_target() {
+    fn test_mod_switch_nested_rns_mod_up() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit, Some(3));
         let input = NestedRnsPoly::input(ctx.clone(), Some(2), &mut circuit);
@@ -288,10 +307,9 @@ mod tests {
 
         let q_moduli = ctx.q_moduli();
         let source_moduli = &q_moduli[..2];
+        let source_residues = random_residues_in_ranges(source_moduli);
+        let value = crt_value_from_residues(source_moduli, &source_residues);
         let target_modulus = q_moduli[2];
-        let input_modulus = product_modulus(source_moduli);
-        let mut rng = rand::rng();
-        let value = gen_biguint_for_modulus(&mut rng, &input_modulus);
 
         let encoded_input = crate::gadgets::arith::encode_nested_rns_poly(
             P_MODULI_BITS,
@@ -308,12 +326,12 @@ mod tests {
         let input_output = eval_results[0].coeffs_biguints()[0].clone();
         let converted_output = eval_results[1].coeffs_biguints()[0].clone();
         let output = eval_results[2].coeffs_biguints()[0].clone();
-        for &q_i in source_moduli {
+        for (idx, &q_i) in source_moduli.iter().enumerate() {
             assert_eq!(
                 input_output.clone() % BigUint::from(q_i),
-                value.clone() % BigUint::from(q_i)
+                BigUint::from(source_residues[idx])
             );
-            assert_eq!(output.clone() % BigUint::from(q_i), value.clone() % BigUint::from(q_i));
+            assert_eq!(output.clone() % BigUint::from(q_i), BigUint::from(source_residues[idx]));
         }
         assert_eq!(
             output % BigUint::from(target_modulus),
@@ -322,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mod_down_one_level_matches_formula() {
+    fn test_mod_switch_nested_rns_mod_down() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit, Some(3));
         let input = NestedRnsPoly::input(ctx.clone(), Some(3), &mut circuit);
@@ -335,8 +353,9 @@ mod tests {
         let input_modulus = product_modulus(all_moduli);
         let extra_modulus = q_moduli[2];
         let kept_moduli = &q_moduli[..2];
-        let mut rng = rand::rng();
-        let value = gen_biguint_for_modulus(&mut rng, &input_modulus);
+        let input_residues = random_residues_in_ranges(all_moduli);
+        let value = crt_value_from_residues(all_moduli, &input_residues);
+        assert!(value < input_modulus);
 
         let encoded_input = crate::gadgets::arith::encode_nested_rns_poly(
             P_MODULI_BITS,
@@ -352,10 +371,9 @@ mod tests {
         assert_eq!(eval_results.len(), 1);
         let output = eval_results[0].coeffs_biguints()[0].clone();
 
-        let extra_residue =
-            (&value % BigUint::from(extra_modulus)).to_u64().expect("test residue must fit in u64");
-        for &q_i in kept_moduli {
-            let residue = (&value % BigUint::from(q_i)).to_u64().expect("test residue must fit");
+        let extra_residue = input_residues[2];
+        for (idx, &q_i) in kept_moduli.iter().enumerate() {
+            let residue = input_residues[idx];
             let diff = (residue + q_i - (extra_residue % q_i)) % q_i;
             let inv = mod_inverse(extra_modulus % q_i, q_i).expect("inverse must exist");
             let expected = BigUint::from((diff as u128 * inv as u128 % q_i as u128) as u64);

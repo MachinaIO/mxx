@@ -187,6 +187,13 @@ impl<P: Poly> NestedRnsPoly<P> {
         let q_moduli = self.ctx.q_moduli();
         let extra_modulus = q_moduli[extra_level];
         let prefix = self.prefix_levels(kept_levels);
+        // Algorithm 2 in `references/full_rns_ckks.pdf` calls Conv_{B->C} on the removed basis B.
+        // In this repository's special case, B contains exactly one modulus P = q_l, so
+        // \hat P_0 = \prod_{i' != 0} p_{i'} is an empty product and therefore equals 1.
+        // The fast-conversion sum then collapses to the same integer a^(0) = [\tilde b]_P
+        // reduced into each kept q_i. At the `NestedRnsPoly` level, that one-modulus
+        // Conv_{B->C} specialization is exactly "repeat the removed level across the kept
+        // prefix" before subtracting and multiplying by P^{-1} mod q_i.
         let converted_extra = self.repeat_level_as_prefix(extra_level, kept_levels, circuit);
         let difference = prefix.sub(&converted_extra, circuit);
         let inverse_constants = q_moduli[..kept_levels]
@@ -255,6 +262,55 @@ mod tests {
         moduli.iter().map(|&q_i| rng.random_range(0..q_i)).collect()
     }
 
+    fn div_ceil_biguint_by_u64(value: BigUint, divisor: u64) -> BigUint {
+        let adjustment = BigUint::from(divisor.saturating_sub(1));
+        (value + adjustment) / BigUint::from(divisor)
+    }
+
+    fn full_reduce_output_max_plaintext_bound(p_moduli: &[u64], q_modulus: u64) -> BigUint {
+        let sum_p_moduli =
+            p_moduli.iter().fold(BigUint::ZERO, |acc, &p_i| acc + BigUint::from(p_i));
+        let modulus_count = u64::try_from(p_moduli.len())
+            .expect("p_moduli length must fit in u64 for bound tracking");
+        let numerator = (sum_p_moduli + BigUint::from(modulus_count)) * BigUint::from(q_modulus);
+        div_ceil_biguint_by_u64(numerator, 4)
+    }
+
+    fn full_reduce_wrap_upper_bound(p_moduli: &[u64], q_modulus: u64, coeff: &BigUint) -> BigUint {
+        let q_modulus_big = BigUint::from(q_modulus);
+        assert!(coeff < &q_modulus_big, "full_reduce coefficient must be a canonical q-residue");
+        let full_reduce_bound = full_reduce_output_max_plaintext_bound(p_moduli, q_modulus);
+        (&full_reduce_bound - BigUint::one() - coeff) / q_modulus_big
+    }
+
+    fn fast_conversion_unsigned_lift(
+        moduli: &[u64],
+        residues: &[u64],
+        p_moduli: &[u64],
+    ) -> (BigUint, BigUint, BigUint) {
+        assert_eq!(moduli.len(), residues.len(), "CRT residues must match modulus count");
+        let modulus = product_modulus(moduli);
+        let value = crt_value_from_residues(moduli, residues);
+        let mut full_reduce_wrap_slack = BigUint::ZERO;
+        let lifted = moduli.iter().enumerate().fold(BigUint::ZERO, |acc, (idx, &q_i)| {
+            let q_i_big = BigUint::from(q_i);
+            let q_hat = &modulus / &q_i_big;
+            let q_hat_mod_q_i = (&q_hat % &q_i_big).to_u64().expect("CRT residue must fit in u64");
+            let q_hat_inv = mod_inverse(q_hat_mod_q_i, q_i).expect("CRT inverse must exist");
+            let coeff = (BigUint::from(residues[idx]) * BigUint::from(q_hat_inv)) % &q_i_big;
+            full_reduce_wrap_slack += full_reduce_wrap_upper_bound(p_moduli, q_i, &coeff);
+            acc + coeff * q_hat
+        });
+        assert!(lifted >= value, "unsigned fast-conversion lift must not underflow");
+        let delta = &lifted - &value;
+        assert_eq!(delta.clone() % &modulus, BigUint::ZERO);
+        let e_plus = delta / &modulus;
+        assert!(e_plus < BigUint::from(moduli.len()));
+        assert!(lifted < BigUint::from(moduli.len()) * &modulus);
+        let impl_error_upper = &e_plus + full_reduce_wrap_slack;
+        (lifted, e_plus, impl_error_upper)
+    }
+
     #[test]
     fn test_mod_switch_nested_rns_conv_to_next_level() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -308,8 +364,12 @@ mod tests {
         let q_moduli = ctx.q_moduli();
         let source_moduli = &q_moduli[..2];
         let source_residues = random_residues_in_ranges(source_moduli);
+        let source_modulus = product_modulus(source_moduli);
         let value = crt_value_from_residues(source_moduli, &source_residues);
+        let (lifted, e_plus, impl_error_upper) =
+            fast_conversion_unsigned_lift(source_moduli, &source_residues, &ctx.p_moduli);
         let target_modulus = q_moduli[2];
+        let raised_modulus = product_modulus(&q_moduli[..3]);
 
         let encoded_input = crate::gadgets::arith::encode_nested_rns_poly(
             P_MODULI_BITS,
@@ -326,6 +386,12 @@ mod tests {
         let input_output = eval_results[0].coeffs_biguints()[0].clone();
         let converted_output = eval_results[1].coeffs_biguints()[0].clone();
         let output = eval_results[2].coeffs_biguints()[0].clone();
+        let input_reduced = input_output.clone() % &source_modulus;
+        let output_reduced = output.clone() % &raised_modulus;
+        assert_eq!(
+            input_reduced, value,
+            "input must reconstruct to original value modulo source modulus"
+        );
         for (idx, &q_i) in source_moduli.iter().enumerate() {
             assert_eq!(
                 input_output.clone() % BigUint::from(q_i),
@@ -334,8 +400,27 @@ mod tests {
             assert_eq!(output.clone() % BigUint::from(q_i), BigUint::from(source_residues[idx]));
         }
         assert_eq!(
-            output % BigUint::from(target_modulus),
-            converted_output % BigUint::from(target_modulus)
+            output.clone() % BigUint::from(target_modulus),
+            converted_output.clone() % BigUint::from(target_modulus)
+        );
+        assert!(lifted < raised_modulus, "lifted value must be less than raised modulus");
+        let mod_up_error = (&output_reduced - &value) / &source_modulus;
+        assert_eq!(
+            &lifted - &value,
+            &source_modulus * &e_plus,
+            "lifted value must equal value plus e_plus multiples of source modulus"
+        );
+        assert!(
+            impl_error_upper < BigUint::from(target_modulus),
+            "implementation-level mod up error bound must fit below the appended modulus to avoid wraparound"
+        );
+        assert!(
+            mod_up_error >= e_plus,
+            "mod up error must be at least the exact fast-conversion e_plus"
+        );
+        assert!(
+            mod_up_error <= impl_error_upper,
+            "mod up error must stay within the full_reduce-derived implementation bound"
         );
     }
 
@@ -353,6 +438,7 @@ mod tests {
         let input_modulus = product_modulus(all_moduli);
         let extra_modulus = q_moduli[2];
         let kept_moduli = &q_moduli[..2];
+        let kept_modulus = product_modulus(kept_moduli);
         let input_residues = random_residues_in_ranges(all_moduli);
         let value = crt_value_from_residues(all_moduli, &input_residues);
         assert!(value < input_modulus);
@@ -370,6 +456,7 @@ mod tests {
             circuit.eval(&params, one, encoded_input, Some(&plt_evaluator), None, None);
         assert_eq!(eval_results.len(), 1);
         let output = eval_results[0].coeffs_biguints()[0].clone();
+        let output_reduced = output.clone() % &kept_modulus;
 
         let extra_residue = input_residues[2];
         for (idx, &q_i) in kept_moduli.iter().enumerate() {
@@ -379,5 +466,10 @@ mod tests {
             let expected = BigUint::from((diff as u128 * inv as u128 % q_i as u128) as u64);
             assert_eq!(output.clone() % BigUint::from(q_i), expected);
         }
+        let scaled_output = BigUint::from(extra_modulus) * &output_reduced;
+        assert!(scaled_output <= value);
+        let mod_down_error = &value - scaled_output;
+        assert_eq!(mod_down_error, BigUint::from(extra_residue));
+        assert!(mod_down_error < BigUint::from(extra_modulus));
     }
 }

@@ -2,22 +2,18 @@
 //!
 //! Mapping from the paper notation to this repository:
 //! - One `NestedRnsPoly` stores one integer in q-RNS form.
-//! - The paper residues `a^(j) mod q_j` correspond to the active q-level prefix
-//!   `self.inner[0..enable_levels_or_inner_len]`.
-//! - This module supports the repository's contiguous-level special case: `Conv` converts from the
-//!   active prefix basis `C = {q_0, ..., q_{l-1}}` into the next contiguous block `{q_l, ...,
-//!   q_{l+k-1}}`, `ModUp` appends that block, and `ModDown` removes a contiguous suffix of the
-//!   currently active levels.
+//! - The paper residues correspond to the contiguous active q-level window
+//!   `q_{level_offset}, ..., q_{level_offset + active_levels - 1}` stored in `self.inner`.
+//! - This module supports both CKKS special-prime insertion/removal at the prefix side of the
+//!   active window and one-level suffix removal for rescaling.
 //!
 //! Output layout conventions:
-//! - `conv_to_next_levels(k)` returns a value with `enable_levels = Some(l + k)`. Levels `0..l` are
-//!   zero-filled placeholders and levels `l..l+k` store the converted residues.
-//! - `mod_up_levels(k)` returns a value with `enable_levels = Some(l + k)` where levels `0..l`
-//!   preserve the original active prefix and levels `l..l+k` store the appended residues.
-//! - `mod_down_levels(k)` assumes the removable moduli are the final `k` active levels and returns
-//!   only the kept prefix with `enable_levels = Some(l - k)`.
-//! - The legacy one-level entry points are thin wrappers around the multi-level variants with `k =
-//!   1`.
+//! - `conv_to_next_levels(k)` still converts into the contiguous suffix that follows the active
+//!   window.
+//! - `mod_up_levels(k)` prepends the contiguous `k`-modulus block immediately before the active
+//!   window.
+//! - `mod_down_levels(k)` removes the contiguous prefix block of size `k` from the active window.
+//! - `mod_down_one_level()` removes the final active suffix modulus to support rescaling.
 //!
 //! All per-modulus arithmetic is expressed by composing existing `NestedRnsPoly` operations
 //! rather than directly manipulating q-level residues as raw integers.
@@ -52,14 +48,27 @@ impl<P: Poly> NestedRnsPoly<P> {
         }
     }
 
-    fn zero_poly_with_levels(&self, levels: usize, circuit: &mut PolyCircuit<P>) -> Self {
+    fn mod_switch_level_offset(&self) -> usize {
+        self.level_offset
+    }
+
+    fn zero_poly_with_offset(
+        &self,
+        level_offset: usize,
+        levels: usize,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
         let inner = (0..levels)
             .map(|_| {
                 (0..self.ctx.p_moduli.len()).map(|_| circuit.const_zero_gate()).collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         let max_plaintexts = vec![BigUint::ZERO; levels];
-        Self::new(self.ctx.clone(), inner, Some(levels), max_plaintexts)
+        Self::new_with_offset(self.ctx.clone(), inner, level_offset, Some(levels), max_plaintexts)
+    }
+
+    fn zero_poly_with_levels(&self, levels: usize, circuit: &mut PolyCircuit<P>) -> Self {
+        self.zero_poly_with_offset(self.level_offset, levels, circuit)
     }
 
     fn retain_only_level(&self, level_idx: usize, circuit: &mut PolyCircuit<P>) -> Self {
@@ -74,17 +83,31 @@ impl<P: Poly> NestedRnsPoly<P> {
 
     fn prefix_levels(&self, levels: usize) -> Self {
         assert!(levels <= self.inner.len(), "requested prefix {levels} exceeds available levels");
-        Self::new(
+        Self::new_with_offset(
             self.ctx.clone(),
             self.inner[..levels].to_vec(),
+            self.level_offset,
             Some(levels),
             self.max_plaintexts[..levels].to_vec(),
+        )
+    }
+
+    fn suffix_levels(&self, skip_levels: usize) -> Self {
+        assert!(skip_levels <= self.inner.len(), "requested suffix skip exceeds available levels");
+        let levels = self.inner.len() - skip_levels;
+        Self::new_with_offset(
+            self.ctx.clone(),
+            self.inner[skip_levels..].to_vec(),
+            self.level_offset + skip_levels,
+            Some(levels),
+            self.max_plaintexts[skip_levels..].to_vec(),
         )
     }
 
     fn move_level_to_position(
         &self,
         source_idx: usize,
+        output_level_offset: usize,
         total_levels: usize,
         target_idx: usize,
         circuit: &mut PolyCircuit<P>,
@@ -92,7 +115,7 @@ impl<P: Poly> NestedRnsPoly<P> {
         assert!(source_idx < self.inner.len(), "source_idx {source_idx} out of range");
         assert!(target_idx < total_levels, "target_idx {target_idx} out of range");
 
-        let mut moved = self.zero_poly_with_levels(total_levels, circuit);
+        let mut moved = self.zero_poly_with_offset(output_level_offset, total_levels, circuit);
         moved.inner[target_idx] = self.inner[source_idx].clone();
         moved.max_plaintexts[target_idx] = self.max_plaintexts[source_idx].clone();
         moved
@@ -101,12 +124,13 @@ impl<P: Poly> NestedRnsPoly<P> {
     fn repeat_level_as_prefix(
         &self,
         source_idx: usize,
+        output_level_offset: usize,
         levels: usize,
         circuit: &mut PolyCircuit<P>,
     ) -> Self {
         assert!(source_idx < self.inner.len(), "source_idx {source_idx} out of range");
         let replicated_bound = self.max_plaintexts[source_idx].clone();
-        let mut repeated = self.zero_poly_with_levels(levels, circuit);
+        let mut repeated = self.zero_poly_with_offset(output_level_offset, levels, circuit);
         for level in 0..levels {
             repeated.inner[level] = self.inner[source_idx].clone();
             repeated.max_plaintexts[level] = replicated_bound.clone();
@@ -116,32 +140,37 @@ impl<P: Poly> NestedRnsPoly<P> {
 
     fn conv_between_levels(
         &self,
-        source_indices: &[usize],
-        target_indices: &[usize],
-        total_levels: usize,
+        source_local_indices: &[usize],
+        target_global_indices: &[usize],
+        output_level_offset: usize,
+        output_levels: usize,
         circuit: &mut PolyCircuit<P>,
     ) -> Self {
-        assert!(!source_indices.is_empty(), "Conv requires at least one source level");
-        assert!(!target_indices.is_empty(), "Conv requires at least one target level");
+        assert!(!source_local_indices.is_empty(), "Conv requires at least one source level");
+        assert!(!target_global_indices.is_empty(), "Conv requires at least one target level");
         let active_levels = self.mod_switch_active_levels();
-        for &source_idx in source_indices {
+        for &source_idx in source_local_indices {
             assert!(
                 source_idx < active_levels,
                 "source_idx {source_idx} out of range for {active_levels} active levels"
             );
         }
-        for &target_idx in target_indices {
+        for &target_idx in target_global_indices {
             assert!(
-                target_idx < total_levels,
-                "target_idx {target_idx} out of range for {total_levels} levels"
+                output_level_offset <= target_idx && target_idx < output_level_offset + output_levels,
+                "target_idx {target_idx} out of range for output window [{output_level_offset}, {})",
+                output_level_offset + output_levels
             );
         }
 
         let q_moduli = self.ctx.q_moduli();
-        let source_moduli = source_indices.iter().map(|&idx| q_moduli[idx]).collect::<Vec<_>>();
-        let mut accumulator = self.zero_poly_with_levels(total_levels, circuit);
-        for (source_pos, &source_idx) in source_indices.iter().enumerate() {
-            let source_modulus = q_moduli[source_idx];
+        let source_moduli = source_local_indices
+            .iter()
+            .map(|&idx| q_moduli[self.level_offset + idx])
+            .collect::<Vec<_>>();
+        let mut accumulator = self.zero_poly_with_offset(output_level_offset, output_levels, circuit);
+        for (source_pos, &source_idx) in source_local_indices.iter().enumerate() {
+            let source_modulus = q_moduli[self.level_offset + source_idx];
             let q_hat_mod_q_i = modular_product_except(&source_moduli, source_pos, source_modulus);
             let q_hat_inv_mod_q_i =
                 mod_inverse(q_hat_mod_q_i, source_modulus).unwrap_or_else(|| {
@@ -157,20 +186,26 @@ impl<P: Poly> NestedRnsPoly<P> {
                 .const_mul(&source_scale, circuit)
                 .full_reduce(circuit);
 
-            for &target_idx in target_indices {
+            for &target_idx in target_global_indices {
                 let target_modulus = q_moduli[target_idx];
                 let q_hat_mod_target =
                     modular_product_except(&source_moduli, source_pos, target_modulus);
-                let mut target_scale = vec![0u64; total_levels];
-                target_scale[target_idx] = q_hat_mod_target;
+                let mut target_scale = vec![0u64; output_levels];
+                target_scale[target_idx - output_level_offset] = q_hat_mod_target;
                 let target_term = source_term
-                    .move_level_to_position(source_idx, total_levels, target_idx, circuit)
+                    .move_level_to_position(
+                        source_idx,
+                        output_level_offset,
+                        output_levels,
+                        target_idx - output_level_offset,
+                        circuit,
+                    )
                     .const_mul(&target_scale, circuit);
                 accumulator = accumulator.add(&target_term, circuit);
             }
         }
 
-        accumulator.full_reduce(circuit)
+        accumulator
     }
 
     /// Evaluate the paper's `Conv` algorithm for a destination basis consisting of the next
@@ -181,17 +216,25 @@ impl<P: Poly> NestedRnsPoly<P> {
     /// the converted residues are written only into the appended levels.
     pub fn conv_to_next_levels(&self, extra_levels: usize, circuit: &mut PolyCircuit<P>) -> Self {
         let source_levels = self.mod_switch_active_levels();
+        let source_offset = self.mod_switch_level_offset();
         assert!(extra_levels > 0, "Conv requires at least one target level");
         assert!(
-            source_levels + extra_levels <= self.ctx.q_moduli_depth,
-            "Conv requires enough extra q-levels in the context: source_levels={source_levels}, extra_levels={extra_levels}, q_moduli_depth={}",
+            source_offset + source_levels + extra_levels <= self.ctx.q_moduli_depth,
+            "Conv requires enough extra q-levels in the context: source_offset={source_offset}, source_levels={source_levels}, extra_levels={extra_levels}, q_moduli_depth={}",
             self.ctx.q_moduli_depth
         );
 
-        let total_levels = source_levels + extra_levels;
         let source_indices = (0..source_levels).collect::<Vec<_>>();
-        let target_indices = (source_levels..total_levels).collect::<Vec<_>>();
-        self.conv_between_levels(&source_indices, &target_indices, total_levels, circuit)
+        let target_indices =
+            (source_offset + source_levels..source_offset + source_levels + extra_levels)
+                .collect::<Vec<_>>();
+        self.conv_between_levels(
+            &source_indices,
+            &target_indices,
+            source_offset,
+            source_levels + extra_levels,
+            circuit,
+        )
     }
 
     pub fn conv_to_next_level(&self, circuit: &mut PolyCircuit<P>) -> Self {
@@ -199,33 +242,44 @@ impl<P: Poly> NestedRnsPoly<P> {
     }
 
     /// Evaluate the paper's Algorithm 1 `ModUp` when a contiguous block of `extra_levels` moduli is
-    /// appended. The new moduli are the next q-levels available in the context.
-    ///
-    /// If the input uses the active prefix `q_0..q_{l-1}`, the output uses
-    /// `enable_levels = Some(l + extra_levels)` and preserves the original prefix while appending
-    /// the converted residues.
+    /// prepended immediately before the active window.
     pub fn mod_up_levels(&self, extra_levels: usize, circuit: &mut PolyCircuit<P>) -> Self {
         let source_levels = self.mod_switch_active_levels();
-        let converted = self.conv_to_next_levels(extra_levels, circuit);
-        let mut inner = self.inner[..source_levels].to_vec();
-        inner.extend(converted.inner[source_levels..source_levels + extra_levels].iter().cloned());
-
-        let mut max_plaintexts = self.max_plaintexts[..source_levels].to_vec();
-        max_plaintexts.extend(
-            converted.max_plaintexts[source_levels..source_levels + extra_levels].iter().cloned(),
+        let source_offset = self.mod_switch_level_offset();
+        assert!(extra_levels > 0, "ModUp requires at least one prepended level");
+        assert!(
+            extra_levels <= source_offset,
+            "ModUp requires {extra_levels} available prefix levels before source_offset {source_offset}"
         );
-        Self::new(self.ctx.clone(), inner, Some(source_levels + extra_levels), max_plaintexts)
+        let output_level_offset = source_offset - extra_levels;
+        let target_indices = (output_level_offset..source_offset).collect::<Vec<_>>();
+        let converted = self.conv_between_levels(
+            &(0..source_levels).collect::<Vec<_>>(),
+            &target_indices,
+            output_level_offset,
+            extra_levels,
+            circuit,
+        );
+        let mut inner = converted.inner;
+        inner.extend(self.inner.iter().cloned());
+
+        let mut max_plaintexts = converted.max_plaintexts;
+        max_plaintexts.extend(self.max_plaintexts.iter().cloned());
+        Self::new_with_offset(
+            self.ctx.clone(),
+            inner,
+            output_level_offset,
+            Some(source_levels + extra_levels),
+            max_plaintexts,
+        )
     }
 
     pub fn mod_up_one_level(&self, circuit: &mut PolyCircuit<P>) -> Self {
         self.mod_up_levels(1, circuit)
     }
 
-    /// Evaluate the paper's Algorithm 2 `ModDown` when the removable basis is the final
-    /// contiguous block of `remove_levels` active q-levels.
-    ///
-    /// The method expects an active prefix `(b_tilde^(0), ..., b_tilde^(l-1))` and returns the
-    /// kept prefix after dropping the final `remove_levels` q-levels.
+    /// Evaluate the paper's Algorithm 2 `ModDown` when the removable basis is the initial prefix
+    /// block of `remove_levels` active q-levels.
     pub fn mod_down_levels(&self, remove_levels: usize, circuit: &mut PolyCircuit<P>) -> Self {
         let active_levels = self.mod_switch_active_levels();
         assert!(remove_levels > 0, "ModDown requires at least one removable level");
@@ -234,28 +288,23 @@ impl<P: Poly> NestedRnsPoly<P> {
             "ModDown requires at least one kept level: active_levels={active_levels}, remove_levels={remove_levels}"
         );
 
+        let level_offset = self.mod_switch_level_offset();
         let kept_levels = active_levels - remove_levels;
-        let removed_indices = (kept_levels..active_levels).collect::<Vec<_>>();
-        let target_indices = (0..kept_levels).collect::<Vec<_>>();
+        let kept_offset = level_offset + remove_levels;
+        let removed_indices = (0..remove_levels).collect::<Vec<_>>();
+        let target_indices = (kept_offset..kept_offset + kept_levels).collect::<Vec<_>>();
         let q_moduli = self.ctx.q_moduli();
-        let removed_moduli = &q_moduli[kept_levels..active_levels];
-        let prefix = self.prefix_levels(kept_levels);
-        let converted_extra = if remove_levels == 1 {
-            let extra_level = kept_levels;
-            // Algorithm 2 in `references/full_rns_ckks.pdf` calls Conv_{B->C} on the removed basis
-            // B. In this repository's one-modulus special case, B contains exactly one
-            // modulus P = q_l, so \hat P_0 = \prod_{i' != 0} p_{i'} is an empty product
-            // and therefore equals 1. The fast-conversion sum then collapses to the
-            // same integer a^(0) = [\tilde b]_P reduced into each kept q_i. At the
-            // `NestedRnsPoly` level, that specialization is exactly "repeat the removed
-            // level across the kept prefix" before subtracting and multiplying by
-            // P^{-1} mod q_i.
-            self.repeat_level_as_prefix(extra_level, kept_levels, circuit)
-        } else {
-            self.conv_between_levels(&removed_indices, &target_indices, kept_levels, circuit)
-        };
-        let difference = prefix.sub(&converted_extra, circuit);
-        let inverse_constants = q_moduli[..kept_levels]
+        let removed_moduli = &q_moduli[level_offset..kept_offset];
+        let kept = self.suffix_levels(remove_levels);
+        let converted_extra = self.conv_between_levels(
+            &removed_indices,
+            &target_indices,
+            kept_offset,
+            kept_levels,
+            circuit,
+        );
+        let difference = kept.sub(&converted_extra, circuit);
+        let inverse_constants = q_moduli[kept_offset..kept_offset + kept_levels]
             .iter()
             .map(|&q_i| {
                 let removed_product_mod_q_i = modular_product(removed_moduli, q_i);
@@ -271,7 +320,29 @@ impl<P: Poly> NestedRnsPoly<P> {
     }
 
     pub fn mod_down_one_level(&self, circuit: &mut PolyCircuit<P>) -> Self {
-        self.mod_down_levels(1, circuit)
+        let active_levels = self.mod_switch_active_levels();
+        assert!(active_levels > 1, "ModDown requires at least one kept level");
+        let kept_levels = active_levels - 1;
+        let level_offset = self.mod_switch_level_offset();
+        let removed_local_idx = active_levels - 1;
+        let removed_global_idx = level_offset + removed_local_idx;
+        let q_moduli = self.ctx.q_moduli();
+        let removed_modulus = q_moduli[removed_global_idx];
+        let kept = self.prefix_levels(kept_levels);
+        let converted_extra = self.repeat_level_as_prefix(removed_local_idx, level_offset, kept_levels, circuit);
+        let difference = kept.sub(&converted_extra, circuit);
+        let inverse_constants = q_moduli[level_offset..level_offset + kept_levels]
+            .iter()
+            .map(|&q_i| {
+                mod_inverse(removed_modulus % q_i, q_i).unwrap_or_else(|| {
+                    panic!(
+                        "removed suffix modulus {} must be invertible modulo {}",
+                        removed_modulus, q_i
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        difference.const_mul(&inverse_constants, circuit)
     }
 }
 
@@ -364,6 +435,7 @@ mod tests {
     fn fast_conversion_unsigned_lift(
         moduli: &[u64],
         residues: &[u64],
+        target_moduli: &[u64],
         p_moduli: &[u64],
     ) -> (BigUint, BigUint, BigUint) {
         assert_eq!(moduli.len(), residues.len(), "CRT residues must match modulus count");
@@ -385,7 +457,13 @@ mod tests {
         let e_plus = delta / &modulus;
         assert!(e_plus < BigUint::from(moduli.len()));
         assert!(lifted < BigUint::from(moduli.len()) * &modulus);
-        let impl_error_upper = &e_plus + full_reduce_wrap_slack;
+        let accumulator_full_reduce_wrap_slack = target_moduli
+            .iter()
+            .map(|&q_i| full_reduce_wrap_upper_bound(p_moduli, q_i, &BigUint::ZERO))
+            .max()
+            .unwrap_or(BigUint::ZERO);
+        let impl_error_upper =
+            &e_plus + full_reduce_wrap_slack + accumulator_full_reduce_wrap_slack;
         (lifted, e_plus, impl_error_upper)
     }
 
@@ -432,7 +510,7 @@ mod tests {
         let source_modulus = product_modulus(source_moduli);
         let value = crt_value_from_residues(source_moduli, &source_residues);
         let (_lifted, e_plus, impl_error_upper) =
-            fast_conversion_unsigned_lift(source_moduli, &source_residues, &ctx.p_moduli);
+            fast_conversion_unsigned_lift(source_moduli, &source_residues, target_moduli, &ctx.p_moduli);
 
         let encoded_input = crate::gadgets::arith::encode_nested_rns_poly(
             P_MODULI_BITS,
@@ -470,42 +548,41 @@ mod tests {
     fn test_mod_switch_nested_rns_mod_up_levels() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit, Some(4));
-        let input = NestedRnsPoly::input(ctx.clone(), Some(2), &mut circuit);
-        let converted = input.conv_to_next_levels(2, &mut circuit);
+        let input = NestedRnsPoly::input_with_offset(ctx.clone(), 2, Some(2), &mut circuit);
         let raised = input.mod_up_levels(2, &mut circuit);
         assert_eq!(raised.enable_levels, Some(4));
+        assert_eq!(raised.level_offset, 0);
         let input_reconstructed = input.reconstruct(&mut circuit);
-        let converted_reconstructed = converted.reconstruct(&mut circuit);
         let raised_reconstructed = raised.reconstruct(&mut circuit);
-        circuit.output(vec![input_reconstructed, converted_reconstructed, raised_reconstructed]);
+        circuit.output(vec![input_reconstructed, raised_reconstructed]);
 
         let q_moduli = ctx.q_moduli();
-        let source_moduli = &q_moduli[..2];
-        let target_moduli = &q_moduli[2..4];
+        let target_moduli = &q_moduli[..2];
+        let source_moduli = &q_moduli[2..4];
         let source_residues = random_residues_in_ranges(source_moduli);
         let source_modulus = product_modulus(source_moduli);
         let value = crt_value_from_residues(source_moduli, &source_residues);
         let (lifted, e_plus, impl_error_upper) =
-            fast_conversion_unsigned_lift(source_moduli, &source_residues, &ctx.p_moduli);
+            fast_conversion_unsigned_lift(source_moduli, &source_residues, target_moduli, &ctx.p_moduli);
         let raised_modulus = product_modulus(&q_moduli[..4]);
         let smallest_target_modulus =
             BigUint::from(*target_moduli.iter().min().expect("target basis must be non-empty"));
 
-        let encoded_input = crate::gadgets::arith::encode_nested_rns_poly(
+        let encoded_input = crate::gadgets::arith::encode_nested_rns_poly_with_offset(
             P_MODULI_BITS,
             MAX_UNREDUCED_MULS,
             &params,
             &value,
+            2,
             Some(2),
         );
         let plt_evaluator = PolyPltEvaluator::new();
         let one = DCRTPoly::const_one(&params);
         let eval_results =
             circuit.eval(&params, one, encoded_input, Some(&plt_evaluator), None, None);
-        assert_eq!(eval_results.len(), 3);
+        assert_eq!(eval_results.len(), 2);
         let input_output = eval_results[0].coeffs_biguints()[0].clone();
-        let converted_output = eval_results[1].coeffs_biguints()[0].clone();
-        let output = eval_results[2].coeffs_biguints()[0].clone();
+        let output = eval_results[1].coeffs_biguints()[0].clone();
         let output_reduced = output.clone() % &raised_modulus;
         assert_eq!(input_output.clone() % &source_modulus, value);
         assert!(output_reduced >= value);
@@ -527,10 +604,10 @@ mod tests {
             assert_eq!(output.clone() % BigUint::from(q_i), BigUint::from(source_residues[idx]));
         }
         for &q_i in target_moduli {
-            assert_eq!(
-                output.clone() % BigUint::from(q_i),
-                converted_output.clone() % BigUint::from(q_i)
-            );
+            let recovered_error =
+                recover_unsigned_error_from_target_residue(&value, &source_modulus, q_i, &output);
+            assert!(recovered_error >= e_plus);
+            assert!(recovered_error <= impl_error_upper);
         }
 
         let mod_up_error = (&output_reduced - &value) / &source_modulus;
@@ -552,27 +629,30 @@ mod tests {
     #[test]
     fn test_mod_switch_nested_rns_mod_down_one_level() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (params, ctx) = create_test_context(&mut circuit, Some(3));
-        let input = NestedRnsPoly::input(ctx.clone(), Some(3), &mut circuit);
+        let (params, ctx) = create_test_context(&mut circuit, Some(4));
+        let input = NestedRnsPoly::input_with_offset(ctx.clone(), 1, Some(3), &mut circuit);
         let lowered = input.mod_down_one_level(&mut circuit);
+        assert_eq!(lowered.level_offset, 1);
+        assert_eq!(lowered.enable_levels, Some(2));
         let reconstructed = lowered.reconstruct(&mut circuit);
         circuit.output(vec![reconstructed]);
 
         let q_moduli = ctx.q_moduli();
-        let all_moduli = &q_moduli[..3];
+        let all_moduli = &q_moduli[1..4];
         let input_modulus = product_modulus(all_moduli);
-        let extra_modulus = q_moduli[2];
-        let kept_moduli = &q_moduli[..2];
+        let extra_modulus = q_moduli[3];
+        let kept_moduli = &q_moduli[1..3];
         let kept_modulus = product_modulus(kept_moduli);
         let input_residues = small_deterministic_residues(all_moduli);
         let value = crt_value_from_residues(all_moduli, &input_residues);
         assert!(value < input_modulus);
 
-        let encoded_input = crate::gadgets::arith::encode_nested_rns_poly(
+        let encoded_input = crate::gadgets::arith::encode_nested_rns_poly_with_offset(
             P_MODULI_BITS,
             MAX_UNREDUCED_MULS,
             &params,
             &value,
+            1,
             Some(3),
         );
         let plt_evaluator = PolyPltEvaluator::new();
@@ -604,21 +684,23 @@ mod tests {
         let (params, ctx) = create_test_context(&mut circuit, Some(4));
         let input = NestedRnsPoly::input(ctx.clone(), Some(4), &mut circuit);
         let lowered = input.mod_down_levels(2, &mut circuit);
+        assert_eq!(lowered.level_offset, 2);
+        assert_eq!(lowered.enable_levels, Some(2));
         let reconstructed = lowered.reconstruct(&mut circuit);
         circuit.output(vec![reconstructed]);
 
         let q_moduli = ctx.q_moduli();
         let all_moduli = &q_moduli[..4];
-        let kept_moduli = &q_moduli[..2];
-        let removed_moduli = &q_moduli[2..4];
+        let removed_moduli = &q_moduli[..2];
+        let kept_moduli = &q_moduli[2..4];
         let kept_modulus = product_modulus(kept_moduli);
         let removed_modulus = product_modulus(removed_moduli);
         let input_residues = random_residues_in_ranges(all_moduli);
-        let removed_residues = &input_residues[2..4];
+        let removed_residues = &input_residues[..2];
         let value = crt_value_from_residues(all_moduli, &input_residues);
         let t = &value / &removed_modulus;
         let (_lifted, e_plus, _impl_error_upper) =
-            fast_conversion_unsigned_lift(removed_moduli, removed_residues, &ctx.p_moduli);
+            fast_conversion_unsigned_lift(removed_moduli, removed_residues, kept_moduli, &ctx.p_moduli);
 
         let encoded_input = crate::gadgets::arith::encode_nested_rns_poly(
             P_MODULI_BITS,
@@ -626,6 +708,58 @@ mod tests {
             &params,
             &value,
             Some(4),
+        );
+        let plt_evaluator = PolyPltEvaluator::new();
+        let one = DCRTPoly::const_one(&params);
+        let eval_results =
+            circuit.eval(&params, one, encoded_input, Some(&plt_evaluator), None, None);
+        assert_eq!(eval_results.len(), 1);
+        let output = eval_results[0].coeffs_biguints()[0].clone();
+        let output_reduced = output.clone() % &kept_modulus;
+        let mod_down_error = modular_difference(&t, &output_reduced, &kept_modulus);
+
+        for &q_i in kept_moduli {
+            let q_big = BigUint::from(q_i);
+            let expected = modular_difference(
+                &(t.clone() % &q_big),
+                &(mod_down_error.clone() % &q_big),
+                &q_big,
+            );
+            assert_eq!(output.clone() % &q_big, expected);
+        }
+        assert!(mod_down_error >= e_plus);
+    }
+
+    #[test]
+    fn test_mod_switch_nested_rns_mod_down_levels_one_prefix_level() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit, Some(4));
+        let input = NestedRnsPoly::input(ctx.clone(), Some(3), &mut circuit);
+        let lowered = input.mod_down_levels(1, &mut circuit);
+        assert_eq!(lowered.level_offset, 1);
+        assert_eq!(lowered.enable_levels, Some(2));
+        let reconstructed = lowered.reconstruct(&mut circuit);
+        circuit.output(vec![reconstructed]);
+
+        let q_moduli = ctx.q_moduli();
+        let all_moduli = &q_moduli[..3];
+        let removed_moduli = &q_moduli[..1];
+        let kept_moduli = &q_moduli[1..3];
+        let kept_modulus = product_modulus(kept_moduli);
+        let removed_modulus = product_modulus(removed_moduli);
+        let input_residues = random_residues_in_ranges(all_moduli);
+        let removed_residues = &input_residues[..1];
+        let value = crt_value_from_residues(all_moduli, &input_residues);
+        let t = &value / &removed_modulus;
+        let (_lifted, e_plus, _impl_error_upper) =
+            fast_conversion_unsigned_lift(removed_moduli, removed_residues, kept_moduli, &ctx.p_moduli);
+
+        let encoded_input = crate::gadgets::arith::encode_nested_rns_poly(
+            P_MODULI_BITS,
+            MAX_UNREDUCED_MULS,
+            &params,
+            &value,
+            Some(3),
         );
         let plt_evaluator = PolyPltEvaluator::new();
         let one = DCRTPoly::const_one(&params);

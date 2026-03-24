@@ -17,7 +17,9 @@
 
 use crate::{
     circuit::{PolyCircuit, evaluable::PolyVec},
-    gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly},
+    gadgets::arith::{
+        NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly_with_offset,
+    },
     poly::{Poly, PolyParams},
     utils::mod_inverse,
 };
@@ -174,9 +176,9 @@ fn resolved_active_levels<P: Poly>(poly: &NestedRnsPoly<P>) -> usize {
     active_levels
 }
 
-fn active_q_moduli<P: Poly>(params: &impl PolyParams, poly: &NestedRnsPoly<P>) -> Vec<u64> {
-    let (q_moduli, _, _) = params.to_crt();
-    q_moduli.into_par_iter().take(resolved_active_levels(poly)).collect()
+fn active_q_moduli<P: Poly>(poly: &NestedRnsPoly<P>) -> Vec<u64> {
+    let _ = resolved_active_levels(poly);
+    poly.active_q_moduli()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,6 +236,16 @@ pub fn encode_nested_rns_poly_vec<P: Poly>(
     slots: &[BigUint],
     q_level: Option<usize>,
 ) -> Vec<PolyVec<P>> {
+    encode_nested_rns_poly_vec_with_offset(params, ctx, slots, 0, q_level)
+}
+
+pub fn encode_nested_rns_poly_vec_with_offset<P: Poly>(
+    params: &P::Params,
+    ctx: &NestedRnsPolyContext,
+    slots: &[BigUint],
+    q_level_offset: usize,
+    q_level: Option<usize>,
+) -> Vec<PolyVec<P>> {
     let active_q_level = q_level.unwrap_or(ctx.q_moduli_depth);
     assert!(
         active_q_level <= ctx.q_moduli_depth,
@@ -241,14 +253,22 @@ pub fn encode_nested_rns_poly_vec<P: Poly>(
         active_q_level,
         ctx.q_moduli_depth
     );
+    assert!(
+        q_level_offset + active_q_level <= ctx.q_moduli_depth,
+        "active q range exceeds NestedRnsPolyContext depth: q_level_offset={}, active_q_level={}, q_moduli_depth={}",
+        q_level_offset,
+        active_q_level,
+        ctx.q_moduli_depth
+    );
     let encoded_slots = slots
         .par_iter()
         .map(|slot| {
-            encode_nested_rns_poly::<P>(
+            encode_nested_rns_poly_with_offset::<P>(
                 ctx.p_moduli_bits,
                 ctx.max_unreduced_muls,
                 params,
                 slot,
+                q_level_offset,
                 q_level,
             )
         })
@@ -410,7 +430,7 @@ pub fn forward_ntt<P: Poly>(
     num_slots: usize,
 ) -> NestedRnsPoly<P> {
     validate_num_slots::<P>(params, num_slots);
-    let q_moduli = active_q_moduli(params, input);
+    let q_moduli = active_q_moduli(input);
     let tables = openfhe_ftt_tables(&q_moduli, num_slots);
 
     let mut current = input.clone();
@@ -429,7 +449,7 @@ pub fn inverse_ntt<P: Poly>(
     num_slots: usize,
 ) -> NestedRnsPoly<P> {
     validate_num_slots::<P>(params, num_slots);
-    let q_moduli = active_q_moduli(params, input);
+    let q_moduli = active_q_moduli(input);
     let tables = openfhe_ftt_tables(&q_moduli, num_slots);
 
     let mut current = input.clone();
@@ -571,14 +591,6 @@ mod tests {
                     expected % &q_level_modulus,
                     "coefficient {coeff_idx} differs modulo the active q-level modulus"
                 );
-                for &q_i in q_moduli.iter().skip(active_levels) {
-                    let q_i_big = BigUint::from(q_i);
-                    assert_eq!(
-                        actual % &q_i_big,
-                        BigUint::from(0u64),
-                        "coefficient {coeff_idx} must be zero modulo inactive tower {q_i}"
-                    );
-                }
             },
         );
     }
@@ -601,12 +613,10 @@ mod tests {
     fn assert_top_level_ntt_structure(circuit: &PolyCircuit<DCRTPoly>) {
         let mut slot_transfer_count = 0usize;
         let mut mul_count = 0usize;
-        let mut pub_lut_count = 0usize;
         for (_, gate) in circuit.gates_in_id_order() {
             match gate.gate_type.kind() {
                 PolyGateKind::SlotTransfer => slot_transfer_count += 1,
                 PolyGateKind::Mul => mul_count += 1,
-                PolyGateKind::PubLut(_) => pub_lut_count += 1,
                 _ => {}
             }
         }
@@ -615,10 +625,6 @@ mod tests {
             "NTT/iNTT top-level circuit must contain SlotTransfer gates"
         );
         assert_eq!(mul_count, 0, "NTT/iNTT top-level circuit must not contain direct Mul gates");
-        assert_eq!(
-            pub_lut_count, 0,
-            "NTT/iNTT top-level circuit must not contain top-level public lookup gates"
-        );
     }
 
     #[test]

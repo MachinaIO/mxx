@@ -402,12 +402,8 @@ where
                     let uniform_sampler = US::new();
                     let s_g = uniform_sampler.sample_uniform(shared.params, d, d, DistType::TernaryDist);
                     let gate_target1 = {
-                        let error = uniform_sampler.sample_uniform(
-                            shared.params,
-                            d,
-                            shared.b1_matrix.col_size(),
-                            DistType::GaussDist { sigma: self.error_sigma },
-                        );
+                        let error =
+                            self.sample_error_matrix(shared.params, d, shared.b1_matrix.col_size());
                         s_g.clone() * shared.b1_matrix + error
                     };
                     debug!(
@@ -456,7 +452,6 @@ where
                 .map(|(entry_pos, gate_id, state, s_g)| {
                     let shared = &shared[entry_pos];
                     let hash_sampler = HS::new();
-                    let uniform_sampler = US::new();
                     let out_matrix = hash_sampler.sample_hash(
                         shared.params,
                         self.hash_key,
@@ -467,12 +462,7 @@ where
                     );
                     let mut target_gate2_identity = s_g.clone() * &shared.w_block_identity;
                     target_gate2_identity.add_in_place(&out_matrix);
-                    let error = uniform_sampler.sample_uniform(
-                        shared.params,
-                        d,
-                        m_g,
-                        DistType::GaussDist { sigma: self.error_sigma },
-                    );
+                    let error = self.sample_error_matrix(shared.params, d, m_g);
                     target_gate2_identity.add_in_place(&error);
                     debug!(
                         "Constructed stage2 identity target for gate preimage: gate_id={}, lut_id={}, device_id={}",
@@ -523,16 +513,10 @@ where
             .iter()
             .map(|(entry_pos, _, _, s_g)| {
                 let shared = &shared[*entry_pos];
-                let uniform_sampler = US::new();
                 let mut target_gate2_gy = s_g.clone() * &shared.w_block_gy;
                 let target_high_gy = -M::gadget_matrix(shared.params, d);
                 target_gate2_gy.add_in_place(&target_high_gy);
-                let error = uniform_sampler.sample_uniform(
-                    shared.params,
-                    d,
-                    m_g,
-                    DistType::GaussDist { sigma: self.error_sigma },
-                );
+                let error = self.sample_error_matrix(shared.params, d, m_g);
                 target_gate2_gy.add_in_place(&error);
                 GpuPreimageRequest {
                     entry_idx: *entry_pos,
@@ -567,7 +551,6 @@ where
                 .map(|(entry_pos, gate_id, state, s_g)| {
                     let shared = &shared[entry_pos];
                     let hash_sampler = HS::new();
-                    let uniform_sampler = US::new();
                     let input_matrix = M::from_compact_bytes(shared.params, &state.input_pubkey_bytes);
                     let u_g_decomposed = hash_sampler.sample_hash_decomposed(
                         shared.params,
@@ -588,12 +571,7 @@ where
                     let mut target_gate2_v = s_g.clone() * &shared.w_block_v;
                     let target_high_v = -(input_matrix * u_g_decomposed);
                     target_gate2_v.add_in_place(&target_high_v);
-                    let error = uniform_sampler.sample_uniform(
-                        shared.params,
-                        d,
-                        m_g,
-                        DistType::GaussDist { sigma: self.error_sigma },
-                    );
+                    let error = self.sample_error_matrix(shared.params, d, m_g);
                     target_gate2_v.add_in_place(&error);
                     (entry_pos, gate_id, s_g, target_gate2_v)
                 })
@@ -640,7 +618,6 @@ where
                 .map(|(entry_pos, gate_id, s_g)| {
                     let shared = &shared[*entry_pos];
                     let hash_sampler = HS::new();
-                    let uniform_sampler = US::new();
                     let u_g_matrix = hash_sampler.sample_hash(
                         shared.params,
                         self.hash_key,
@@ -663,12 +640,7 @@ where
                     );
                     let mut target_gate2_vx_chunk = s_g.clone() * &w_block_vx_chunk;
                     target_gate2_vx_chunk.add_in_place(&target_high_vx_chunk);
-                    let error = uniform_sampler.sample_uniform(
-                        shared.params,
-                        d,
-                        m_g,
-                        DistType::GaussDist { sigma: self.error_sigma },
-                    );
+                    let error = self.sample_error_matrix(shared.params, d, m_g);
                     target_gate2_vx_chunk.add_in_place(&error);
                     GpuPreimageRequest {
                         entry_idx: *entry_pos,

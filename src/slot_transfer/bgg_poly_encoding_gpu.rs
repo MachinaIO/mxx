@@ -266,17 +266,8 @@ mod tests {
                     GpuDCRTPoly::from_usize_to_constant(&params, 4).to_compact_bytes(),
                 ),
             ]];
-            let encoding_sampler =
-                BGGPolyEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
-            let slot_secret_mats = encoding_sampler.sample_slot_secret_mats(&params, num_slots);
-            let encodings = encoding_sampler.sample(
-                &params,
-                &public_keys,
-                &plaintext_rows,
-                Some(&slot_secret_mats),
-            );
-            let one = encodings[0].clone();
-            let input = encodings[1].clone();
+            let one_pubkey = public_keys[0].clone();
+            let input_pubkey = public_keys[1].clone();
             let pubkey_evaluator =
                 BggPublicKeySTEvaluator::<
                     GpuDCRTPolyMatrix,
@@ -295,16 +286,31 @@ mod tests {
 
             let result_pubkey = circuit.eval(
                 &params,
-                one.pubkey.clone(),
-                vec![input.pubkey.clone()],
+                one_pubkey,
+                vec![input_pubkey.clone()],
                 None::<&DummyGpuPubKeyPltEvaluator>,
                 Some(&pubkey_evaluator),
                 None,
             );
             assert_eq!(result_pubkey.len(), 1);
 
-            pubkey_evaluator.sample_aux_matrices(&params, slot_secret_mats.clone());
+            pubkey_evaluator.sample_aux_matrices(&params);
             wait_for_all_writes(dir.to_path_buf()).await.unwrap();
+            let slot_secret_mats =
+                pubkey_evaluator.load_slot_secret_mats_checkpoint(&params).expect(
+                    "gpu slot secret matrix checkpoints should exist after sample_aux_matrices",
+                );
+
+            let encoding_sampler =
+                BGGPolyEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
+            let encodings = encoding_sampler.sample(
+                &params,
+                &public_keys,
+                &plaintext_rows,
+                Some(&slot_secret_mats),
+            );
+            let one = encodings[0].clone();
+            let input = encodings[1].clone();
 
             let s_vec = GpuDCRTPolyMatrix::from_poly_vec_row(&params, secrets.clone());
             let b0_matrix = pubkey_evaluator

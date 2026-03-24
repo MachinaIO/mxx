@@ -273,7 +273,7 @@ fn find_crt_depth_for_modq_arith(
     let base = BigDecimal::from_biguint(BigUint::from(1u32) << cfg.base_bits, 0);
     let error_sigma = BigDecimal::from_f64(cfg.error_sigma).expect("valid error sigma");
     let input_bound = BigDecimal::from((1u64 << cfg.p_moduli_bits) - 1);
-    let e_init_norm = &error_sigma * BigDecimal::from(6u64);
+    let e_init_norm = &error_sigma * BigDecimal::from_f32(6.5).unwrap();
 
     for crt_depth in 1..=cfg.max_crt_depth {
         let params = DCRTPolyParams::new(cfg.ring_dim, crt_depth, cfg.crt_bits, cfg.base_bits);

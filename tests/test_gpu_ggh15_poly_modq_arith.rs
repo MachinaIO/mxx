@@ -263,7 +263,7 @@ fn find_crt_depth_for_modq_arith(
     let base = BigDecimal::from_biguint(BigUint::from(1u32) << cfg.base_bits, 0);
     let error_sigma = BigDecimal::from_f64(cfg.error_sigma).expect("valid error sigma");
     let input_bound = BigDecimal::from((1u64 << cfg.p_moduli_bits) - 1);
-    let e_init_norm = &error_sigma * BigDecimal::from(6u64);
+    let e_init_norm = &error_sigma * BigDecimal::from_f32(6.5).unwrap();
 
     for crt_depth in 1..=cfg.max_crt_depth {
         let params = DCRTPolyParams::new(cfg.ring_dim, crt_depth, cfg.crt_bits, cfg.base_bits);
@@ -561,14 +561,8 @@ async fn test_gpu_ggh15_poly_modq_arith() {
     let encoding_sampler =
         BGGPolyEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
     drop(secrets);
-    let slot_secret_mats_start = Instant::now();
-    let slot_secret_mats = encoding_sampler.sample_slot_secret_mats(&params, cfg.num_slots);
-    debug!(
-        "sample_slot_secret_mats elapsed_ms={:.3}",
-        slot_secret_mats_start.elapsed().as_secs_f64() * 1000.0
-    );
-    let mut poly_encodings =
-        encoding_sampler.sample(&params, &pubkeys, &plaintext_inputs, Some(&slot_secret_mats));
+    let (mut poly_encodings, slot_secret_mats) =
+        encoding_sampler.sample_with_fresh_slot_secret_mats(&params, &pubkeys, &plaintext_inputs);
     drop(plaintext_inputs);
     drop(encoding_sampler);
     info!(

@@ -350,15 +350,9 @@ mod tests {
         let reveal_plaintexts = vec![true];
         let bgg_poly_encoding_sampler =
             BGGPolyEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
-        let slot_secret_mats =
-            bgg_poly_encoding_sampler.sample_slot_secret_mats(&params, num_slots);
         let pubkeys = bgg_pubkey_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
-        let poly_encodings = bgg_poly_encoding_sampler.sample(
-            &params,
-            &pubkeys,
-            &[plaintext_bytes],
-            Some(&slot_secret_mats),
-        );
+        let (poly_encodings, slot_secret_mats) = bgg_poly_encoding_sampler
+            .sample_with_fresh_slot_secret_mats(&params, &pubkeys, &[plaintext_bytes]);
         let enc_one_poly = poly_encodings[0].clone();
         let enc_input_poly = poly_encodings[1].clone();
 

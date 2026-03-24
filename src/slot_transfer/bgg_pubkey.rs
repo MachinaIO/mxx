@@ -140,6 +140,14 @@ where
         format!("{}_slot_a_{}", self.aux_checkpoint_prefix(params), slot_idx)
     }
 
+    pub(crate) fn slot_secret_mat_id_prefix(
+        &self,
+        params: &<M::P as Poly>::Params,
+        slot_idx: usize,
+    ) -> String {
+        format!("{}_slot_secret_mat_{}", self.aux_checkpoint_prefix(params), slot_idx)
+    }
+
     pub(crate) fn slot_preimage_b0_id_prefix(
         &self,
         params: &<M::P as Poly>::Params,
@@ -182,6 +190,10 @@ where
         Some(M::from_compact_bytes(params, &bytes))
     }
 
+    fn load_bytes_checkpoint(&self, id_prefix: &str) -> Option<Vec<u8>> {
+        read_bytes_from_multi_batch(self.dir_path.as_path(), id_prefix, 0)
+    }
+
     pub fn checkpoint_prefix(&self, params: &<M::P as Poly>::Params) -> String {
         self.aux_checkpoint_prefix(params)
     }
@@ -192,6 +204,17 @@ where
 
     pub fn load_b1_matrix_checkpoint(&self, params: &<M::P as Poly>::Params) -> Option<M> {
         self.load_matrix_checkpoint(params, &self.b1_id_prefix(params))
+    }
+
+    pub fn load_slot_secret_mats_checkpoint(
+        &self,
+        params: &<M::P as Poly>::Params,
+    ) -> Option<Vec<Vec<u8>>> {
+        (0..self.num_slots)
+            .map(|slot_idx| {
+                self.load_bytes_checkpoint(&self.slot_secret_mat_id_prefix(params, slot_idx))
+            })
+            .collect()
     }
 
     fn checkpoint_exists(&self, id_prefix: &str) -> bool {
@@ -208,7 +231,8 @@ where
             self.checkpoint_exists(&self.b1_id_prefix(params)) &&
             self.checkpoint_exists(&self.b1_trapdoor_id_prefix(params)) &&
             (0..self.num_slots).all(|slot_idx| {
-                self.checkpoint_exists(&self.slot_a_id_prefix(params, slot_idx)) &&
+                self.checkpoint_exists(&self.slot_secret_mat_id_prefix(params, slot_idx)) &&
+                    self.checkpoint_exists(&self.slot_a_id_prefix(params, slot_idx)) &&
                     self.checkpoint_exists(&self.slot_preimage_b0_id_prefix(params, slot_idx)) &&
                     self.checkpoint_exists(&self.slot_preimage_b1_id_prefix(params, slot_idx))
             }) &&
@@ -337,19 +361,33 @@ where
             .collect()
     }
 
-    pub fn sample_aux_matrices(
-        &self,
-        params: &<M::P as Poly>::Params,
-        slot_secret_mats: Vec<Vec<u8>>,
-    ) {
-        assert_eq!(
-            slot_secret_mats.len(),
-            self.num_slots,
-            "slot_secret_mats length {} must match evaluator num_slots {}",
-            slot_secret_mats.len(),
-            self.num_slots
-        );
+    fn sample_slot_secret_mats(&self, params: &<M::P as Poly>::Params) -> Vec<Vec<u8>> {
+        let slot_parallelism =
+            crate::env::slot_transfer_slot_parallelism().max(1).min(self.num_slots.max(1));
+        let mut slot_secret_mats = Vec::with_capacity(self.num_slots);
 
+        for slot_start in (0..self.num_slots).step_by(slot_parallelism.max(1)) {
+            let chunk_len = (slot_start + slot_parallelism).min(self.num_slots) - slot_start;
+            let mut chunk_secret_mats = (0..chunk_len)
+                .into_par_iter()
+                .map(|_| {
+                    US::new()
+                        .sample_uniform(
+                            params,
+                            self.secret_size,
+                            self.secret_size,
+                            DistType::TernaryDist,
+                        )
+                        .into_compact_bytes()
+                })
+                .collect::<Vec<_>>();
+            slot_secret_mats.append(&mut chunk_secret_mats);
+        }
+
+        slot_secret_mats
+    }
+
+    pub fn sample_aux_matrices(&self, params: &<M::P as Poly>::Params) {
         info!(
             "Sampling slot-transfer auxiliary matrices (secret_size={}, num_slots={})",
             self.secret_size, self.num_slots
@@ -367,6 +405,14 @@ where
             );
             return;
         }
+
+        let slot_secret_mats = self.sample_slot_secret_mats(params);
+        slot_secret_mats.par_iter().enumerate().for_each(|(slot_idx, slot_secret_mat_bytes)| {
+            Self::store_bytes_checkpoint(
+                slot_secret_mat_bytes.clone(),
+                &self.slot_secret_mat_id_prefix(params, slot_idx),
+            );
+        });
 
         let trap_sampler = TS::new(params, self.trapdoor_sigma);
         let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, self.secret_size);
@@ -595,7 +641,7 @@ mod tests {
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{Poly, PolyParams, dcrt::params::DCRTPolyParams},
         sampler::{
-            DistType, PolyHashSampler, PolyUniformSampler, hash::DCRTPolyHashSampler,
+            DistType, PolyHashSampler, hash::DCRTPolyHashSampler,
             trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
         },
         storage::{
@@ -797,16 +843,11 @@ mod tests {
         );
         assert_eq!(result.len(), 1);
 
-        let slot_secret_mats = (0..num_slots)
-            .map(|_| {
-                DCRTPolyUniformSampler::new()
-                    .sample_uniform(&params, secret_size, secret_size, DistType::TernaryDist)
-                    .into_compact_bytes()
-            })
-            .collect::<Vec<_>>();
-
-        evaluator.sample_aux_matrices(&params, slot_secret_mats.clone());
+        evaluator.sample_aux_matrices(&params);
         wait_for_all_writes(dir.to_path_buf()).await.unwrap();
+        let slot_secret_mats = evaluator
+            .load_slot_secret_mats_checkpoint(&params)
+            .expect("slot secret matrix checkpoints should exist after sample_aux_matrices");
 
         let checkpoint_prefix = evaluator.checkpoint_prefix(&params);
         let b1_matrix = evaluator

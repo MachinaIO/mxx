@@ -640,7 +640,7 @@ mod tests {
             },
         },
         sampler::{
-            DistType, PolyHashSampler, PolyUniformSampler,
+            DistType, PolyHashSampler,
             gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
             trapdoor::GpuDCRTPolyTrapdoorSampler,
         },
@@ -877,16 +877,11 @@ mod tests {
             );
             assert_eq!(result.len(), 1);
 
-            let slot_secret_mats = (0..num_slots)
-                .map(|_| {
-                    GpuDCRTPolyUniformSampler::new()
-                        .sample_uniform(&params, secret_size, secret_size, DistType::TernaryDist)
-                        .into_compact_bytes()
-                })
-                .collect::<Vec<_>>();
-
-            evaluator.sample_aux_matrices(&params, slot_secret_mats.clone());
+            evaluator.sample_aux_matrices(&params);
             wait_for_all_writes(dir.to_path_buf()).await.unwrap();
+            let slot_secret_mats = evaluator.load_slot_secret_mats_checkpoint(&params).expect(
+                "gpu slot secret matrix checkpoints should exist after sample_aux_matrices",
+            );
 
             let checkpoint_prefix = evaluator.checkpoint_prefix(&params);
             let b1_matrix = evaluator

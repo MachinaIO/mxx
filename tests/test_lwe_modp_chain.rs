@@ -125,7 +125,7 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
             log_base_q_small,
         ));
         let plt_evaluator = NormPltLWEEvaluator::new(ctx.clone(), &error_sigma);
-        let e_init_norm = &error_sigma * BigDecimal::from(6u64);
+        let e_init_norm = &error_sigma * BigDecimal::from_f32(6.5).unwrap();
         let input_bound = BigDecimal::from((P - 1) as u64);
 
         let out_errors = circuit.simulate_max_error_norm(

@@ -395,8 +395,12 @@ mod tests {
         let c_b0_compact_bytes_by_slot = GGH15BGGPolyEncodingPltEvaluator::<
             DCRTPolyMatrix,
             DCRTPolyHashSampler<Keccak256>,
-        >::build_c_b0_compact_bytes_by_slot(
-            &params, &s_vec, &b0_matrix, &slot_secret_mats
+        >::build_c_b0_compact_bytes_by_slot::<DCRTPolyUniformSampler>(
+            &params,
+            &s_vec,
+            &b0_matrix,
+            &slot_secret_mats,
+            None,
         );
         let poly_evaluator = GGH15BGGPolyEncodingPltEvaluator::<
             DCRTPolyMatrix,

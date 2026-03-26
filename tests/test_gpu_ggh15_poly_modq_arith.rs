@@ -33,7 +33,7 @@ use rayon::prelude::*;
 use std::{env, fs, path::Path, sync::Arc, time::Instant};
 use tracing::{debug, info};
 
-const DEFAULT_RING_DIM: u32 = 1 << 14;
+const DEFAULT_RING_DIM: u32 = 1 << 6;
 const DEFAULT_CRT_BITS: usize = 24;
 const DEFAULT_P_MODULI_BITS: usize = 6;
 const DEFAULT_MAX_UNREDUCED_MULS_BUDGET: usize = 2;
@@ -43,7 +43,7 @@ const DEFAULT_MAX_CRT_DEPTH: usize = 32;
 const DEFAULT_ERROR_SIGMA: f64 = 4.0;
 const DEFAULT_D_SECRET: usize = 1;
 const DEFAULT_HEIGHT: usize = 1;
-const DEFAULT_NUM_SLOTS: usize = 1024;
+const DEFAULT_NUM_SLOTS: usize = 2;
 
 #[derive(Debug, Clone)]
 struct ModqArithConfig {
@@ -558,8 +558,11 @@ async fn test_gpu_ggh15_poly_modq_arith() {
     info!("sampled {} public keys", pubkeys.len());
 
     let enc_setup_start = Instant::now();
-    let encoding_sampler =
-        BGGPolyEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
+    let encoding_sampler = BGGPolyEncodingSampler::<GpuDCRTPolyUniformSampler>::new(
+        &params,
+        &secrets,
+        Some(cfg.error_sigma),
+    );
     drop(secrets);
     let (mut poly_encodings, slot_secret_mats) =
         encoding_sampler.sample_with_fresh_slot_secret_mats(&params, &pubkeys, &plaintext_inputs);
@@ -611,8 +614,12 @@ async fn test_gpu_ggh15_poly_modq_arith() {
     let c_b0_compact_bytes_by_slot = GGH15BGGPolyEncodingPltEvaluator::<
         GpuDCRTPolyMatrix,
         GpuDCRTPolyHashSampler<Keccak256>,
-    >::build_c_b0_compact_bytes_by_slot(
-        &params, &s_vec, &b0_matrix, &slot_secret_mats
+    >::build_c_b0_compact_bytes_by_slot::<GpuDCRTPolyUniformSampler>(
+        &params,
+        &s_vec,
+        &b0_matrix,
+        &slot_secret_mats,
+        Some(cfg.error_sigma),
     );
     let poly_evaluator = GGH15BGGPolyEncodingPltEvaluator::<
         GpuDCRTPolyMatrix,

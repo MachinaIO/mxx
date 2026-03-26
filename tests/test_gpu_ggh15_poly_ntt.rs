@@ -56,10 +56,10 @@ const DEFAULT_NUM_SLOTS: usize = 2;
 const DEFAULT_CRT_BITS: usize = 24;
 const DEFAULT_P_MODULI_BITS: usize = 7;
 const DEFAULT_SCALE: u64 = 256;
-const DEFAULT_BASE_BITS: u32 = 6;
-const DEFAULT_MAX_CRT_DEPTH: usize = 30;
+const DEFAULT_BASE_BITS: u32 = 12;
+const DEFAULT_MAX_CRT_DEPTH: usize = 50;
 const DEFAULT_MAX_UNREDUCED_MULS: usize = 2;
-const DEFAULT_ERROR_SIGMA: f64 = 0.0;
+const DEFAULT_ERROR_SIGMA: f64 = 4.0;
 const DEFAULT_D_SECRET: usize = 1;
 const TRAPDOOR_SIGMA: f64 = 4.578;
 
@@ -343,10 +343,8 @@ fn find_crt_depth_for_ntt(cfg: &NttConfig, q_level: Option<usize>) -> (usize, DC
         ));
         let plt_evaluator =
             NormPltGGH15Evaluator::new(ctx.clone(), &error_sigma, &error_sigma, None);
-        let c_b0_error_norm =
-            PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_b, BigDecimal::from(0u64), None);
         let slot_transfer_evaluator =
-            NormBggPolyEncodingSTEvaluator::new(ctx.clone(), c_b0_error_norm, &error_sigma, None);
+            NormBggPolyEncodingSTEvaluator::new(ctx.clone(), cfg.error_sigma, &error_sigma, None);
         let input_bound = BigDecimal::from((1u64 << cfg.p_moduli_bits) - 1);
 
         let out_errors = simulate_max_error_norm_with_slot_transfer(
@@ -372,14 +370,23 @@ fn find_crt_depth_for_ntt(cfg: &NttConfig, q_level: Option<usize>) -> (usize, DC
         );
 
         if *error < BigDecimal::from_biguint(threshold.clone(), 0) {
+            let selected_crt_depth = crt_depth + 1;
+            let selected_params =
+                DCRTPolyParams::new(cfg.ring_dim, selected_crt_depth, cfg.crt_bits, cfg.base_bits);
+            let (selected_active_q_moduli, _, _) =
+                active_q_moduli_and_modulus(&selected_params, q_level);
+            let selected_q_max =
+                *selected_active_q_moduli.iter().max().expect("active_q_moduli must not be empty");
+            let selected_threshold =
+                selected_params.modulus().as_ref() / BigUint::from(2u64 * selected_q_max);
             info!(
                 "selected crt_depth={} with q_bits={} achieves max_error_bits={} < q/(2*q_max) bits={}",
-                crt_depth,
-                params.modulus_bits(),
+                selected_crt_depth,
+                selected_params.modulus_bits(),
                 max_error_bits,
-                bigdecimal_bits_ceil(&BigDecimal::from_biguint(threshold, 0))
+                bigdecimal_bits_ceil(&BigDecimal::from_biguint(selected_threshold, 0))
             );
-            return (crt_depth, params);
+            return (selected_crt_depth, selected_params);
         }
     }
 
@@ -664,8 +671,11 @@ async fn test_gpu_ggh15_poly_ntt() {
     );
 
     let enc_setup_start = Instant::now();
-    let encoding_sampler =
-        BGGPolyEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
+    let encoding_sampler = BGGPolyEncodingSampler::<GpuDCRTPolyUniformSampler>::new(
+        &params,
+        &secrets,
+        Some(cfg.error_sigma),
+    );
     drop(secrets);
     let mut poly_encodings = encoding_sampler.sample(
         &params,
@@ -689,16 +699,25 @@ async fn test_gpu_ggh15_poly_ntt() {
     let plt_c_b0_compact_bytes_by_slot = GGH15BGGPolyEncodingPltEvaluator::<
         GpuDCRTPolyMatrix,
         GpuDCRTPolyHashSampler<Keccak256>,
-    >::build_c_b0_compact_bytes_by_slot(
-        &params, &s_vec, &plt_b0_matrix, &slot_secret_mats
+    >::build_c_b0_compact_bytes_by_slot::<
+        GpuDCRTPolyUniformSampler,
+    >(
+        &params,
+        &s_vec,
+        &plt_b0_matrix,
+        &slot_secret_mats,
+        Some(cfg.error_sigma),
     );
-    let c_b0 = s_vec.clone() * &slot_b0_matrix;
-    // c_b0.add_in_place(uniform_sampler.sample_uniform(
-    //     &params,
-    //     s_vec.nrow,
-    //     slot_b0_matrix.ncol,
-    //     dist,
-    // ));
+    let mut c_b0 = s_vec.clone() * &slot_b0_matrix;
+    if cfg.error_sigma != 0.0 {
+        let c_b0_error = uniform_sampler.sample_uniform(
+            &params,
+            c_b0.row_size(),
+            c_b0.col_size(),
+            DistType::GaussDist { sigma: cfg.error_sigma },
+        );
+        c_b0 = c_b0 + c_b0_error;
+    }
     let plt_poly_evaluator = GGH15BGGPolyEncodingPltEvaluator::<
         GpuDCRTPolyMatrix,
         GpuDCRTPolyHashSampler<Keccak256>,

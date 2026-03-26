@@ -141,24 +141,15 @@ pub struct NormBggPolyEncodingSTEvaluator {
 impl NormBggPolyEncodingSTEvaluator {
     pub fn new(
         ctx: Arc<SimulatorContext>,
-        c_b0_error_norm: PolyMatrixNorm,
+        e_b0_sigma: f64,
         e_mat_sigma: &BigDecimal,
         secret_sigma: Option<BigDecimal>,
     ) -> Self {
-        assert_eq!(
-            c_b0_error_norm.clone_ctx(),
-            ctx,
-            "c_b0_error_norm context must match simulator context"
-        );
-        assert_eq!(
-            c_b0_error_norm.nrow, 1,
-            "c_b0_error_norm rows {} must be 1",
-            c_b0_error_norm.nrow
-        );
-        assert_eq!(
-            c_b0_error_norm.ncol, ctx.m_b,
-            "c_b0_error_norm cols {} must equal m_b {}",
-            c_b0_error_norm.ncol, ctx.m_b
+        let c_b0_error_norm = PolyMatrixNorm::sample_gauss(
+            ctx.clone(),
+            1,
+            ctx.m_b,
+            BigDecimal::from_f64(e_b0_sigma).expect("e_b0_sigma must be finite"),
         );
 
         let b0_preimage_norm =
@@ -815,11 +806,16 @@ mod tests {
     #[test]
     fn test_wire_norm_slot_transfer_matches_bgg_poly_encoding_bound() {
         let ctx = make_ctx();
-        let c_b0_error_norm =
-            PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_b, BigDecimal::from(11u64), None);
+        let e_b0_sigma = 11.0;
+        let c_b0_error_norm = PolyMatrixNorm::sample_gauss(
+            ctx.clone(),
+            1,
+            ctx.m_b,
+            BigDecimal::from_f64(e_b0_sigma).unwrap(),
+        );
         let evaluator = NormBggPolyEncodingSTEvaluator::new(
             ctx.clone(),
-            c_b0_error_norm.clone(),
+            e_b0_sigma,
             &BigDecimal::from_f64(E_B_SIGMA).unwrap(),
             None,
         );
@@ -889,9 +885,10 @@ mod tests {
     #[test]
     fn test_wire_norm_slot_transfer_bound_is_independent_of_slot_count() {
         let ctx = make_ctx();
+        let e_b0_sigma = 9.0;
         let evaluator = NormBggPolyEncodingSTEvaluator::new(
             ctx.clone(),
-            PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_b, BigDecimal::from(9u64), None),
+            e_b0_sigma,
             &BigDecimal::from_f64(E_B_SIGMA).unwrap(),
             None,
         );

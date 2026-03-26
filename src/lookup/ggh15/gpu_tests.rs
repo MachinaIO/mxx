@@ -274,8 +274,12 @@ async fn test_gpu_ggh15_poly_encoding_plt_eval_slot_secret_relation() {
     let c_b0_compact_bytes_by_slot = GGH15BGGPolyEncodingPltEvaluator::<
         GpuDCRTPolyMatrix,
         GpuDCRTPolyHashSampler<Keccak256>,
-    >::build_c_b0_compact_bytes_by_slot(
-        &params, &s_vec, &b0_matrix, &slot_secret_mats
+    >::build_c_b0_compact_bytes_by_slot::<GpuDCRTPolyUniformSampler>(
+        &params,
+        &s_vec,
+        &b0_matrix,
+        &slot_secret_mats,
+        None,
     );
     let poly_evaluator = GGH15BGGPolyEncodingPltEvaluator::<
         GpuDCRTPolyMatrix,

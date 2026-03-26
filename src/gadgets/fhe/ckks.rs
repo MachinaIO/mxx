@@ -55,11 +55,14 @@ pub fn sample_relinearization_eval_key_slots(
     } else {
         uniform_sampler.sample_poly(params, &DistType::GaussDist { sigma: error_sigma })
     };
+    let a0_eval = DCRTPoly::from_biguints_eval(params, &a0.eval_slots());
+    let error_eval = DCRTPoly::from_biguints_eval(params, &error.eval_slots());
     let special_prime_product = biguint_product(&q_moduli[..relinearization_extra_levels]);
     let special_prime_poly = DCRTPoly::from_biguint_to_constant(params, special_prime_product);
     let secret_key_square = secret_key.clone() * secret_key;
-    let b0 = (secret_key_square * &special_prime_poly) - &(a0.clone() * secret_key) + &error;
-    CKKSEvalKeyPolys { b0, b1: a0 }
+    let b0 =
+        (secret_key_square * &special_prime_poly) - &(a0_eval.clone() * secret_key) + &error_eval;
+    CKKSEvalKeyPolys { b0, b1: a0_eval }
 }
 
 #[derive(Debug, Clone)]
@@ -143,24 +146,24 @@ impl<P: Poly + 'static> CKKSCiphertext<P> {
         enable_levels: Option<usize>,
         circuit: &mut PolyCircuit<P>,
     ) -> Self {
-        let c0 = NestedRnsPoly::input_with_offset(
+        let c0 = NestedRnsPoly::input(
             ctx.nested_rns.clone(),
-            ctx.ciphertext_level_offset(),
             enable_levels,
+            Some(ctx.ciphertext_level_offset()),
             circuit,
         );
-        let c1 = NestedRnsPoly::input_with_offset(
+        let c1 = NestedRnsPoly::input(
             ctx.nested_rns.clone(),
-            ctx.ciphertext_level_offset(),
             enable_levels,
+            Some(ctx.ciphertext_level_offset()),
             circuit,
         );
         Self::new(ctx, c0, c1)
     }
 
     pub fn alloc_eval_keys(ctx: Arc<CKKSContext<P>>, circuit: &mut PolyCircuit<P>) -> Self {
-        let c0 = NestedRnsPoly::input(ctx.nested_rns.clone(), None, circuit);
-        let c1 = NestedRnsPoly::input(ctx.nested_rns.clone(), None, circuit);
+        let c0 = NestedRnsPoly::input(ctx.nested_rns.clone(), None, None, circuit);
+        let c1 = NestedRnsPoly::input(ctx.nested_rns.clone(), None, None, circuit);
         Self::new(ctx, c0, c1)
     }
 
@@ -189,7 +192,8 @@ impl<P: Poly + 'static> CKKSCiphertext<P> {
 
         // Match the paper's page-12 structure: ModUp(d2), multiply by the two evaluation-key
         // branches, then ModDown both branches before adding them back into (d0, d1).
-        let (relin_c0, relin_c1) = self.relinearize_d2_via_mod_up_down(&d2, eval_keys, circuit);
+        let (relin_c0, relin_c1) =
+            Self::relinearize_d2_via_mod_up_down(self.ctx.as_ref(), &d2, eval_keys, circuit);
         let c0 = d0.add(&relin_c0, circuit);
         let c1 = d1.add(&relin_c1, circuit);
         Self::new(self.ctx.clone(), c0, c1)
@@ -339,50 +343,64 @@ impl<P: Poly + 'static> CKKSCiphertext<P> {
         );
         Self::new(
             self.ctx.clone(),
-            NestedRnsPoly::new_with_offset(
+            NestedRnsPoly::new(
                 self.ctx.nested_rns.clone(),
                 self.c0.inner[..levels].to_vec(),
-                self.c0.level_offset,
+                Some(self.c0.level_offset),
                 Some(levels),
                 self.c0.max_plaintexts[..levels].to_vec(),
+                Some(self.c0.approx_error_bounds[..levels].to_vec()),
             ),
-            NestedRnsPoly::new_with_offset(
+            NestedRnsPoly::new(
                 self.ctx.nested_rns.clone(),
                 self.c1.inner[..levels].to_vec(),
-                self.c1.level_offset,
+                Some(self.c1.level_offset),
                 Some(levels),
                 self.c1.max_plaintexts[..levels].to_vec(),
+                Some(self.c1.approx_error_bounds[..levels].to_vec()),
             ),
         )
     }
 
     fn relinearize_d2_via_mod_up_down(
-        &self,
+        ctx: &CKKSContext<P>,
         d2_eval: &NestedRnsPoly<P>,
         eval_keys: &Self,
         circuit: &mut PolyCircuit<P>,
     ) -> (NestedRnsPoly<P>, NestedRnsPoly<P>) {
-        let active_levels = self.active_levels();
-        let extra_levels = self.ctx.relinearization_extra_levels;
+        assert!(
+            Arc::ptr_eq(&ctx.nested_rns, &d2_eval.ctx),
+            "d2 must share the NestedRnsPolyContext stored in CKKSContext"
+        );
+        let active_levels = d2_eval.enable_levels.unwrap_or(d2_eval.inner.len());
+        assert!(active_levels > 0, "d2 must expose at least one active q-level");
+        assert_eq!(
+            d2_eval.level_offset,
+            ctx.ciphertext_level_offset(),
+            "d2 must use the ciphertext q-level offset {}",
+            ctx.ciphertext_level_offset()
+        );
+        ctx.active_levels_for_mul(active_levels);
+
+        let extra_levels = ctx.relinearization_extra_levels;
         let eval_keys = eval_keys.prefix_levels(active_levels + extra_levels);
-        let d2_coeff = inverse_ntt(&self.ctx.params, circuit, d2_eval, self.ctx.num_slots)
-            .full_reduce(circuit);
+        let d2_coeff =
+            inverse_ntt(&ctx.params, circuit, d2_eval, ctx.num_slots).full_reduce(circuit);
         let d2_extended = d2_coeff.mod_up_levels(extra_levels, circuit);
-        let d2_extended_eval =
-            forward_ntt(&self.ctx.params, circuit, &d2_extended, self.ctx.num_slots);
+        let d2_extended_eval = forward_ntt(&ctx.params, circuit, &d2_extended, ctx.num_slots);
         let relin_c0_extended_eval = d2_extended_eval.mul(&eval_keys.c0, circuit);
         let relin_c1_extended_eval = d2_extended_eval.mul(&eval_keys.c1, circuit);
         let relin_c0_extended_coeff =
-            inverse_ntt(&self.ctx.params, circuit, &relin_c0_extended_eval, self.ctx.num_slots)
+            inverse_ntt(&ctx.params, circuit, &relin_c0_extended_eval, ctx.num_slots)
                 .full_reduce(circuit);
         let relin_c1_extended_coeff =
-            inverse_ntt(&self.ctx.params, circuit, &relin_c1_extended_eval, self.ctx.num_slots)
+            inverse_ntt(&ctx.params, circuit, &relin_c1_extended_eval, ctx.num_slots)
                 .full_reduce(circuit);
         let relin_c0_coeff = relin_c0_extended_coeff.mod_down_levels(extra_levels, circuit);
         let relin_c1_coeff = relin_c1_extended_coeff.mod_down_levels(extra_levels, circuit);
         (
-            forward_ntt(&self.ctx.params, circuit, &relin_c0_coeff, self.ctx.num_slots),
-            forward_ntt(&self.ctx.params, circuit, &relin_c1_coeff, self.ctx.num_slots),
+            forward_ntt(&ctx.params, circuit, &relin_c0_coeff, ctx.num_slots),
+            forward_ntt(&ctx.params, circuit, &relin_c1_coeff, ctx.num_slots),
         )
     }
 }
@@ -393,6 +411,7 @@ mod tests {
     use crate::{
         __PAIR, __TestState,
         circuit::{PolyCircuit, evaluable::PolyVec},
+        element::PolyElem,
         gadgets::{arith::DEFAULT_MAX_UNREDUCED_MULS, ntt::encode_nested_rns_poly_vec_with_offset},
         lookup::{poly::PolyPltEvaluator, poly_vec::PolyVecPltEvaluator},
         poly::{
@@ -401,9 +420,10 @@ mod tests {
         },
         sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
         slot_transfer::PolyVecSlotTransferEvaluator,
-        utils::gen_biguint_for_modulus,
+        utils::{gen_biguint_for_modulus, mod_inverse},
     };
     use num_bigint::BigUint;
+    use num_traits::{One, ToPrimitive, Zero};
     use rand::{SeedableRng, rngs::StdRng};
     use rayon::prelude::*;
 
@@ -411,14 +431,23 @@ mod tests {
     const CRT_DEPTH: usize = 12;
     const P_MODULI_BITS: usize = 7;
     const SCALE: u64 = 1 << 8;
-    const NUM_SLOTS: usize = 8;
-    const RELIN_EXTRA_LEVELS: usize = 4;
+    const NUM_SLOTS: usize = 2;
+    const RELIN_EXTRA_LEVELS: usize = 6;
+    const NUM_LEFT_MODULI: usize = 4;
     const CKKS_MUL_DEPTH: usize = 1;
-    const CKKS_MUL_TEST_CRT_DEPTH: usize = 2 + CKKS_MUL_DEPTH + RELIN_EXTRA_LEVELS;
+    const CKKS_MUL_TEST_CRT_DEPTH: usize = NUM_LEFT_MODULI + CKKS_MUL_DEPTH + RELIN_EXTRA_LEVELS;
 
     fn create_test_context_with_params(
         circuit: &mut PolyCircuit<DCRTPoly>,
         params: &DCRTPolyParams,
+    ) -> Arc<CKKSContext<DCRTPoly>> {
+        create_test_context_with_params_and_relin_levels(circuit, params, RELIN_EXTRA_LEVELS)
+    }
+
+    fn create_test_context_with_params_and_relin_levels(
+        circuit: &mut PolyCircuit<DCRTPoly>,
+        params: &DCRTPolyParams,
+        relinearization_extra_levels: usize,
     ) -> Arc<CKKSContext<DCRTPoly>> {
         Arc::new(CKKSContext::setup(
             circuit,
@@ -429,7 +458,7 @@ mod tests {
             SCALE,
             false,
             None,
-            RELIN_EXTRA_LEVELS,
+            relinearization_extra_levels,
         ))
     }
 
@@ -447,8 +476,108 @@ mod tests {
             .fold(BigUint::from(1u64), |acc, &q_i| acc * BigUint::from(q_i))
     }
 
-    fn scale_basis(params: &DCRTPolyParams) -> BigUint {
-        BigUint::from(1u64) << params.crt_bits()
+    fn div_ceil_biguint_by_u64(value: BigUint, divisor: u64) -> BigUint {
+        let adjustment = BigUint::from(divisor.saturating_sub(1));
+        (value + adjustment) / BigUint::from(divisor)
+    }
+
+    fn full_reduce_output_max_plaintext_bound(p_moduli: &[u64], q_modulus: u64) -> BigUint {
+        let sum_p_moduli =
+            p_moduli.iter().fold(BigUint::ZERO, |acc, &p_i| acc + BigUint::from(p_i));
+        let modulus_count =
+            u64::try_from(p_moduli.len()).expect("p_moduli length must fit in u64 for bounds");
+        let numerator = (sum_p_moduli + BigUint::from(modulus_count)) * BigUint::from(q_modulus);
+        div_ceil_biguint_by_u64(numerator, 4)
+    }
+
+    fn full_reduce_wrap_upper_bound(p_moduli: &[u64], q_modulus: u64, coeff: &BigUint) -> BigUint {
+        let q_modulus_big = BigUint::from(q_modulus);
+        assert!(coeff < &q_modulus_big, "full_reduce coefficient must be a canonical q-residue");
+        let full_reduce_bound = full_reduce_output_max_plaintext_bound(p_moduli, q_modulus);
+        (&full_reduce_bound - BigUint::from(1u64) - coeff) / q_modulus_big
+    }
+
+    fn fast_conversion_unsigned_lift(
+        moduli: &[u64],
+        residues: &[u64],
+        target_moduli: &[u64],
+        p_moduli: &[u64],
+    ) -> (BigUint, BigUint, BigUint) {
+        assert_eq!(moduli.len(), residues.len(), "CRT residues must match modulus count");
+        let modulus = biguint_product(moduli);
+        let value =
+            moduli.iter().zip(residues.iter()).fold(BigUint::ZERO, |acc, (&q_i, &residue)| {
+                let q_i_big = BigUint::from(q_i);
+                let q_hat = &modulus / &q_i_big;
+                let q_hat_mod_q_i =
+                    (&q_hat % &q_i_big).to_u64().expect("CRT residue must fit in u64");
+                let q_hat_inv = mod_inverse(q_hat_mod_q_i, q_i).expect("CRT inverse must exist");
+                (acc + BigUint::from(residue) * q_hat * BigUint::from(q_hat_inv)) % &modulus
+            });
+        let mut full_reduce_wrap_slack = BigUint::ZERO;
+        let lifted = moduli.iter().enumerate().fold(BigUint::ZERO, |acc, (idx, &q_i)| {
+            let q_i_big = BigUint::from(q_i);
+            let q_hat = &modulus / &q_i_big;
+            let q_hat_mod_q_i = (&q_hat % &q_i_big).to_u64().expect("CRT residue must fit in u64");
+            let q_hat_inv = mod_inverse(q_hat_mod_q_i, q_i).expect("CRT inverse must exist");
+            let coeff = (BigUint::from(residues[idx]) * BigUint::from(q_hat_inv)) % &q_i_big;
+            full_reduce_wrap_slack += full_reduce_wrap_upper_bound(p_moduli, q_i, &coeff);
+            acc + coeff * q_hat
+        });
+        let delta = &lifted - &value;
+        let e_plus = delta / &modulus;
+        let accumulator_full_reduce_wrap_slack = target_moduli
+            .iter()
+            .map(|&q_i| full_reduce_wrap_upper_bound(p_moduli, q_i, &BigUint::ZERO))
+            .max()
+            .unwrap_or(BigUint::ZERO);
+        let impl_error_upper =
+            &e_plus + full_reduce_wrap_slack + accumulator_full_reduce_wrap_slack;
+        (lifted, e_plus, impl_error_upper)
+    }
+
+    fn worst_case_residues(moduli: &[u64]) -> Vec<u64> {
+        moduli.iter().map(|&q_i| q_i.saturating_sub(1)).collect()
+    }
+
+    fn estimate_prefix_mod_up_error_bound(
+        ctx: &CKKSContext<DCRTPoly>,
+        active_levels: usize,
+    ) -> BigUint {
+        let q_moduli = ctx.nested_rns.q_moduli();
+        let source_moduli =
+            &q_moduli[ctx.ciphertext_level_offset()..ctx.ciphertext_level_offset() + active_levels];
+        let target_moduli = &q_moduli[..ctx.ciphertext_level_offset()];
+        let source_residues = worst_case_residues(source_moduli);
+        let (_, _, impl_error_upper) = fast_conversion_unsigned_lift(
+            source_moduli,
+            &source_residues,
+            target_moduli,
+            &ctx.nested_rns.p_moduli,
+        );
+        impl_error_upper
+    }
+
+    fn estimate_prefix_mod_down_error_bound(
+        ctx: &CKKSContext<DCRTPoly>,
+        active_levels: usize,
+        remove_levels: usize,
+    ) -> BigUint {
+        let q_moduli = ctx.nested_rns.q_moduli();
+        let removed_moduli = &q_moduli[..remove_levels];
+        let target_moduli = &q_moduli[remove_levels..remove_levels + active_levels];
+        let removed_residues = worst_case_residues(removed_moduli);
+        let (_, _, impl_error_upper) = fast_conversion_unsigned_lift(
+            removed_moduli,
+            &removed_residues,
+            target_moduli,
+            &ctx.nested_rns.p_moduli,
+        );
+        impl_error_upper
+    }
+
+    fn round_div_by_scale(value: &BigUint, scale: &BigUint) -> BigUint {
+        (value + (scale / 2u32)) / scale
     }
 
     fn seeded_random_slots(modulus: &BigUint, num_slots: usize, seed: u64) -> Vec<BigUint> {
@@ -470,6 +599,24 @@ mod tests {
     ) -> (DCRTPoly, DCRTPoly) {
         let modulus = q_level_modulus(ctx, active_levels);
         let c1_slots = seeded_random_slots(&modulus, ctx.num_slots, seed);
+        let c1 = DCRTPoly::from_biguints_eval(&ctx.params, &c1_slots);
+        let plaintext = DCRTPoly::from_biguints_eval(&ctx.params, plaintext_slots);
+        let c0 = plaintext - &(c1.clone() * secret_key);
+        (c0, c1)
+    }
+
+    fn encrypt_zero_error_ciphertext_with_small_mask(
+        ctx: &CKKSContext<DCRTPoly>,
+        plaintext_slots: &[BigUint],
+        secret_key: &DCRTPoly,
+        _active_levels: usize,
+        seed: u64,
+        small_mask_modulus: &BigUint,
+    ) -> (DCRTPoly, DCRTPoly) {
+        let c1_slots = seeded_random_slots(small_mask_modulus, ctx.num_slots, seed)
+            .into_iter()
+            .map(|slot| if slot.is_zero() { BigUint::one() } else { slot })
+            .collect::<Vec<_>>();
         let c1 = DCRTPoly::from_biguints_eval(&ctx.params, &c1_slots);
         let plaintext = DCRTPoly::from_biguints_eval(&ctx.params, plaintext_slots);
         let c0 = plaintext - &(c1.clone() * secret_key);
@@ -498,19 +645,6 @@ mod tests {
             Some(active_levels),
         );
         [c0_inputs, c1_inputs].concat()
-    }
-
-    fn eval_key_inputs_from_polys(
-        ctx: &CKKSContext<DCRTPoly>,
-        eval_keys: &CKKSEvalKeyPolys<DCRTPoly>,
-    ) -> Vec<PolyVec<DCRTPoly>> {
-        ciphertext_inputs_from_polys(
-            ctx,
-            &eval_keys.b0,
-            &eval_keys.b1,
-            0,
-            ctx.nested_rns.q_moduli_depth,
-        )
     }
 
     fn eval_outputs(
@@ -597,6 +731,91 @@ mod tests {
     }
 
     #[test]
+    fn test_ckks_sample_relinearization_eval_key_slots_matches_switching_identity_with_one_extra_level()
+     {
+        let relinearization_extra_levels = 1;
+        let params = DCRTPolyParams::new(
+            NUM_SLOTS as u32,
+            NUM_LEFT_MODULI + CKKS_MUL_DEPTH + relinearization_extra_levels,
+            24,
+            12,
+        );
+        let secret_key = sample_ternary_secret_key(&params);
+        let eval_keys = sample_relinearization_eval_key_slots(
+            &params,
+            &secret_key,
+            relinearization_extra_levels,
+            0.0,
+        );
+        let special_prime_product = {
+            let (q_moduli, _, _) = params.to_crt();
+            biguint_product(&q_moduli[..relinearization_extra_levels])
+        };
+        let special_prime_poly = DCRTPoly::from_biguint_to_constant(&params, special_prime_product);
+        let lhs = eval_keys.b0.clone() + &(eval_keys.b1.clone() * &secret_key);
+        let rhs = (secret_key.clone() * &secret_key) * &special_prime_poly;
+        let full_modulus = {
+            let (q_moduli, _, _) = params.to_crt();
+            q_moduli.iter().fold(BigUint::from(1u64), |acc, &q_i| acc * BigUint::from(q_i))
+        };
+        assert_slots_match_modulus(&lhs.eval_slots(), &rhs.eval_slots(), &full_modulus);
+    }
+
+    #[test]
+    fn test_ckks_alloc_eval_keys_round_trips_sampled_eval_key_inputs() {
+        let relinearization_extra_levels = 1;
+        let params = DCRTPolyParams::new(
+            NUM_SLOTS as u32,
+            NUM_LEFT_MODULI + CKKS_MUL_DEPTH + relinearization_extra_levels,
+            24,
+            12,
+        );
+        let secret_key = sample_ternary_secret_key(&params);
+        let eval_key_polys = sample_relinearization_eval_key_slots(
+            &params,
+            &secret_key,
+            relinearization_extra_levels,
+            0.0,
+        );
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let ctx = create_test_context_with_params_and_relin_levels(
+            &mut circuit,
+            &params,
+            relinearization_extra_levels,
+        );
+        let eval_keys = CKKSCiphertext::alloc_eval_keys(ctx.clone(), &mut circuit);
+        let (b0, _) = eval_keys.c0.reconstruct(&mut circuit);
+        let (b1, _) = eval_keys.c1.reconstruct(&mut circuit);
+        circuit.output(vec![b0, b1]);
+
+        let inputs = ciphertext_inputs_from_polys(
+            ctx.as_ref(),
+            &eval_key_polys.b0,
+            &eval_key_polys.b1,
+            0,
+            ctx.nested_rns.q_moduli_depth,
+        );
+        let outputs = eval_outputs(ctx.as_ref(), &circuit, inputs);
+        assert_eq!(outputs.len(), 2, "eval-key input round-trip must output b0 and b1");
+        let output_b0 = ciphertext_poly_from_output(&ctx.params, &outputs[0]);
+        let output_b1 = ciphertext_poly_from_output(&ctx.params, &outputs[1]);
+        let full_modulus = {
+            let (q_moduli, _, _) = params.to_crt();
+            q_moduli.iter().fold(BigUint::from(1u64), |acc, &q_i| acc * BigUint::from(q_i))
+        };
+        assert_slots_match_modulus(
+            &output_b0.eval_slots(),
+            &eval_key_polys.b0.eval_slots(),
+            &full_modulus,
+        );
+        assert_slots_match_modulus(
+            &output_b1.eval_slots(),
+            &eval_key_polys.b1.eval_slots(),
+            &full_modulus,
+        );
+    }
+
+    #[test]
     #[sequential_test::sequential]
     fn test_ckks_add_returns_ciphertext_that_decrypts_to_expected_slotwise_sum() {
         let params = DCRTPolyParams::new(NUM_SLOTS as u32, CRT_DEPTH, 18, BASE_BITS);
@@ -607,8 +826,8 @@ mod tests {
         let lhs = CKKSCiphertext::input(ctx.clone(), Some(active_levels), &mut circuit);
         let rhs = CKKSCiphertext::input(ctx.clone(), Some(active_levels), &mut circuit);
         let sum = lhs.add(&rhs, &mut circuit);
-        let sum_c0 = sum.c0.reconstruct(&mut circuit);
-        let sum_c1 = sum.c1.reconstruct(&mut circuit);
+        let (sum_c0, _) = sum.c0.reconstruct(&mut circuit);
+        let (sum_c1, _) = sum.c1.reconstruct(&mut circuit);
         circuit.output(vec![sum_c0, sum_c1]);
 
         let modulus = q_level_modulus(ctx.as_ref(), active_levels);
@@ -658,84 +877,331 @@ mod tests {
         assert_decrypted_slots_match_modulus(&decrypted, &expected, &modulus);
     }
 
-    // #[test]
-    // // #[sequential_test::sequential]
-    // fn test_ckks_mul_returns_ciphertext_that_decrypts_to_expected_slotwise_product() {
-    //     let params = DCRTPolyParams::new(NUM_SLOTS as u32, CKKS_MUL_TEST_CRT_DEPTH, 24, 12);
-    //     let secret_key = sample_ternary_secret_key(&params);
-    //     let mut circuit = PolyCircuit::<DCRTPoly>::new();
-    //     let ctx = create_test_context_with_params(&mut circuit, &params);
-    //     let active_levels = 2 + CKKS_MUL_DEPTH;
-    //     let lhs = CKKSCiphertext::input(ctx.clone(), Some(active_levels), &mut circuit);
-    //     let rhs = CKKSCiphertext::input(ctx.clone(), Some(active_levels), &mut circuit);
-    //     let eval_keys = CKKSCiphertext::alloc_eval_keys(ctx.clone(), &mut circuit);
-    //     let product = lhs.mul(&rhs, &eval_keys, &mut circuit).rescale(&mut circuit);
-    //     assert_eq!(product.active_levels(), 2);
-    //     assert_eq!(product.c0.enable_levels, Some(2));
-    //     assert_eq!(product.c1.enable_levels, Some(2));
-    //     let product_c0 = product.c0.reconstruct(&mut circuit);
-    //     let product_c1 = product.c1.reconstruct(&mut circuit);
-    //     circuit.output(vec![product_c0, product_c1]);
+    #[test]
+    #[sequential_test::sequential]
+    fn test_ckks_mul_pre_relinearization_tuple_matches_exact_plaintext_product() {
+        let mul_relin_extra_levels = 1;
+        let params = DCRTPolyParams::new(
+            NUM_SLOTS as u32,
+            NUM_LEFT_MODULI + CKKS_MUL_DEPTH + mul_relin_extra_levels,
+            24,
+            12,
+        );
+        let secret_key = sample_ternary_secret_key(&params);
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let ctx = create_test_context_with_params_and_relin_levels(
+            &mut circuit,
+            &params,
+            mul_relin_extra_levels,
+        );
+        let active_levels = NUM_LEFT_MODULI + CKKS_MUL_DEPTH;
+        let lhs = CKKSCiphertext::input(ctx.clone(), Some(active_levels), &mut circuit);
+        let rhs = CKKSCiphertext::input(ctx.clone(), Some(active_levels), &mut circuit);
 
-    //     let modulus = q_level_modulus(ctx.as_ref(), 2);
-    //     let scale = scale_basis(&params);
-    //     let small_slot_modulus = BigUint::from(4u64);
-    //     let lhs_base_slots = seeded_random_slots(&small_slot_modulus, ctx.num_slots, 0xC0DEC0DE);
-    //     let rhs_base_slots = seeded_random_slots(&small_slot_modulus, ctx.num_slots, 0x5EED1234);
-    //     let lhs_slots = lhs_base_slots.iter().map(|slot| slot * &scale).collect::<Vec<_>>();
-    //     let rhs_slots = rhs_base_slots.iter().map(|slot| slot * &scale).collect::<Vec<_>>();
-    //     let eval_key_polys =
-    //         sample_relinearization_eval_key_slots(&params, &secret_key, RELIN_EXTRA_LEVELS, 0.0);
-    //     let (lhs_c0, lhs_c1) = encrypt_zero_error_ciphertext(
-    //         ctx.as_ref(),
-    //         &lhs_slots,
-    //         &secret_key,
-    //         active_levels,
-    //         0xA11CE001,
+        // Section 4, Step 1 of the paper: build the extended ciphertext under (1, s, s^2)
+        // before any ModUp/ModDown or relinearization.
+        let d0 = lhs.c0.mul(&rhs.c0, &mut circuit);
+        let d1_left = lhs.c0.mul(&rhs.c1, &mut circuit);
+        let d1_right = lhs.c1.mul(&rhs.c0, &mut circuit);
+        let d1 = d1_left.add(&d1_right, &mut circuit);
+        let d2 = lhs.c1.mul(&rhs.c1, &mut circuit);
+        let (d0_poly, _) = d0.reconstruct(&mut circuit);
+        let (d1_poly, _) = d1.reconstruct(&mut circuit);
+        let (d2_poly, _) = d2.reconstruct(&mut circuit);
+        circuit.output(vec![d0_poly, d1_poly, d2_poly]);
+
+        let modulus = q_level_modulus(ctx.as_ref(), active_levels);
+        let lhs_slots = seeded_random_slots(&modulus, ctx.num_slots, 0xC0DEC0DE);
+        let rhs_slots = seeded_random_slots(&modulus, ctx.num_slots, 0x5EED1234);
+        let (lhs_c0, lhs_c1) = encrypt_zero_error_ciphertext(
+            ctx.as_ref(),
+            &lhs_slots,
+            &secret_key,
+            active_levels,
+            0xA11CE001,
+        );
+        let (rhs_c0, rhs_c1) = encrypt_zero_error_ciphertext(
+            ctx.as_ref(),
+            &rhs_slots,
+            &secret_key,
+            active_levels,
+            0xA11CE002,
+        );
+        let inputs = [
+            ciphertext_inputs_from_polys(
+                ctx.as_ref(),
+                &lhs_c0,
+                &lhs_c1,
+                ctx.ciphertext_level_offset(),
+                active_levels,
+            ),
+            ciphertext_inputs_from_polys(
+                ctx.as_ref(),
+                &rhs_c0,
+                &rhs_c1,
+                ctx.ciphertext_level_offset(),
+                active_levels,
+            ),
+        ]
+        .concat();
+        let outputs = eval_outputs(ctx.as_ref(), &circuit, inputs);
+        assert_eq!(outputs.len(), 3, "pre-relinearization multiply must output d0, d1, and d2");
+        let output_d0 = ciphertext_poly_from_output(&ctx.params, &outputs[0]);
+        let output_d1 = ciphertext_poly_from_output(&ctx.params, &outputs[1]);
+        let output_d2 = ciphertext_poly_from_output(&ctx.params, &outputs[2]);
+
+        let secret_key_square = secret_key.clone() * &secret_key;
+        let decrypted_extended =
+            output_d0 + &(output_d1 * &secret_key) + &(output_d2 * &secret_key_square);
+        let expected = lhs_slots
+            .iter()
+            .zip(rhs_slots.iter())
+            .map(|(lhs, rhs)| (lhs * rhs) % &modulus)
+            .collect::<Vec<_>>();
+        assert_decrypted_slots_match_modulus(&decrypted_extended, &expected, &modulus);
+    }
+
+    // #[test]
+    // #[sequential_test::sequential]
+    // fn test_ckks_relinearize_d2_via_mod_up_down_prints_reconstructed_approx_errors() {
+    //     let mul_relin_extra_levels = 1;
+    //     let params = DCRTPolyParams::new(
+    //         NUM_SLOTS as u32,
+    //         NUM_LEFT_MODULI + CKKS_MUL_DEPTH + mul_relin_extra_levels,
+    //         24,
+    //         12,
     //     );
-    //     let (rhs_c0, rhs_c1) = encrypt_zero_error_ciphertext(
-    //         ctx.as_ref(),
-    //         &rhs_slots,
+    //     let secret_key = sample_ternary_secret_key(&params);
+    //     let eval_key_polys = sample_relinearization_eval_key_slots(
+    //         &params,
     //         &secret_key,
-    //         active_levels,
-    //         0x5EED1234,
+    //         mul_relin_extra_levels,
+    //         0.0,
+    //     );
+    //     let mut circuit = PolyCircuit::<DCRTPoly>::new();
+    //     let ctx = create_test_context_with_params_and_relin_levels(
+    //         &mut circuit,
+    //         &params,
+    //         mul_relin_extra_levels,
+    //     );
+    //     let active_levels = NUM_LEFT_MODULI + CKKS_MUL_DEPTH;
+    //     // Within b = s * a1 + s^2 * a2, this helper only consumes the s^2 branch a2.
+    //     let a2_eval = NestedRnsPoly::input(
+    //         ctx.nested_rns.clone(),
+    //         Some(active_levels),
+    //         Some(ctx.ciphertext_level_offset()),
+    //         &mut circuit,
+    //     );
+    //     let eval_keys = CKKSCiphertext::alloc_eval_keys(ctx.clone(), &mut circuit);
+
+    //     let (relin_c0, relin_c1) = CKKSCiphertext::relinearize_d2_via_mod_up_down(
+    //         ctx.as_ref(),
+    //         &a2_eval,
+    //         &eval_keys,
+    //         &mut circuit,
+    //     );
+    //     let (relin_c0_poly, relin_c0_error) = relin_c0.reconstruct(&mut circuit);
+    //     let (relin_c1_poly, relin_c1_error) = relin_c1.reconstruct(&mut circuit);
+    //     println!("relin_c0_error: {}", relin_c0_error);
+    //     println!("relin_c1_error: {}", relin_c1_error);
+    //     circuit.output(vec![relin_c0_poly, relin_c1_poly]);
+
+    //     let modulus = q_level_modulus(ctx.as_ref(), active_levels);
+    //     let a2_slots = seeded_random_slots(&modulus, ctx.num_slots, 0xA211CE55);
+    //     let a2_eval_poly = DCRTPoly::from_biguints_eval(&ctx.params, &a2_slots);
+    //     let a2_inputs = encode_nested_rns_poly_vec_with_offset::<DCRTPoly>(
+    //         &ctx.params,
+    //         ctx.nested_rns.as_ref(),
+    //         &a2_eval_poly.eval_slots(),
+    //         ctx.ciphertext_level_offset(),
+    //         Some(active_levels),
     //     );
     //     let inputs = [
+    //         a2_inputs,
     //         ciphertext_inputs_from_polys(
     //             ctx.as_ref(),
-    //             &lhs_c0,
-    //             &lhs_c1,
-    //             ctx.ciphertext_level_offset(),
-    //             active_levels,
+    //             &eval_key_polys.b0,
+    //             &eval_key_polys.b1,
+    //             0,
+    //             ctx.nested_rns.q_moduli_depth,
     //         ),
-    //         ciphertext_inputs_from_polys(
-    //             ctx.as_ref(),
-    //             &rhs_c0,
-    //             &rhs_c1,
-    //             ctx.ciphertext_level_offset(),
-    //             active_levels,
-    //         ),
-    //         eval_key_inputs_from_polys(ctx.as_ref(), &eval_key_polys),
     //     ]
     //     .concat();
     //     let outputs = eval_outputs(ctx.as_ref(), &circuit, inputs);
-    //     assert_eq!(outputs.len(), 2, "CKKS ciphertext circuits must output c0 and c1");
-    //     let output_c0 = ciphertext_poly_from_output(&ctx.params, &outputs[0]);
-    //     let output_c1 = ciphertext_poly_from_output(&ctx.params, &outputs[1]);
-    //     let decrypted = decrypt_ciphertext(&ctx.params, &output_c0, &output_c1, &secret_key);
-    //     let expected = lhs_base_slots
+    //     assert_eq!(outputs.len(), 2, "relinearization helper must output a and b");
+
+    //     let relin_a_coeff_values = output_slot_values(&outputs[0]);
+    //     let relin_b_coeff_values = output_slot_values(&outputs[1]);
+    //     let coeff_modulus = ctx.params.modulus();
+    //     let relin_a_coeffs = relin_a_coeff_values
     //         .iter()
-    //         .zip(rhs_base_slots.iter())
-    //         .map(|(lhs, rhs)| lhs * rhs)
+    //         .map(|coeff| {
+    //             crate::element::finite_ring::FinRingElem::new(coeff.clone(),
+    // coeff_modulus.clone())         })
     //         .collect::<Vec<_>>();
-    //     let decrypted_slots =
-    //         decrypted.eval_slots().into_iter().map(|slot| slot % &modulus).collect::<Vec<_>>();
-    //     let rounded = decrypted_slots
+    //     let relin_b_coeffs = relin_b_coeff_values
     //         .iter()
-    //         .map(|slot| (slot + (&scale / 2u32)) / &scale)
+    //         .map(|coeff| {
+    //             crate::element::finite_ring::FinRingElem::new(coeff.clone(),
+    // coeff_modulus.clone())         })
     //         .collect::<Vec<_>>();
-    //     assert_eq!(rounded, expected);
+    //     let relin_a = DCRTPoly::from_coeffs(&ctx.params, &relin_a_coeffs);
+    //     let relin_b = DCRTPoly::from_coeffs(&ctx.params, &relin_b_coeffs);
+    //     let decrypted = decrypt_ciphertext(&ctx.params, &relin_a, &relin_b, &secret_key);
+    //     let special_prime_product = {
+    //         let (q_moduli, _, _) = params.to_crt();
+    //         biguint_product(&q_moduli[..mul_relin_extra_levels])
+    //     };
+    //     // let special_prime_poly =
+    //     //     DCRTPoly::from_biguint_to_constant(&ctx.params, special_prime_product);
+    //     let expected = (secret_key.clone() * &secret_key) * &a2_eval_poly;
+    //     println!("expected coeffs: {:?}", expected.coeffs_biguints());
+    //     let diff = decrypted.clone() - &expected;
+    //     println!("decrypted coeffs: {:?}", decrypted.coeffs_biguints());
+    //     println!("decrypted slots: {:?}", decrypted.eval_slots());
+    //     println!("decrypted_minus_s2_a2 coeffs: {:?}", diff.coeffs_biguints());
+    //     println!("decrypted_minus_s2_a2 slots: {:?}", diff.eval_slots());
     // }
+
+    #[test]
+    // #[ignore = "Ignored per current validation scope; run manually when investigating CKKS
+    // multiplication correctness"]
+    #[sequential_test::sequential]
+    fn test_ckks_mul_returns_ciphertext_that_decrypts_to_expected_slotwise_product() {
+        let mul_relin_extra_levels = 1;
+        let params = DCRTPolyParams::new(
+            NUM_SLOTS as u32,
+            NUM_LEFT_MODULI + CKKS_MUL_DEPTH + mul_relin_extra_levels,
+            50,
+            25,
+        );
+        let secret_key = sample_ternary_secret_key(&params);
+        let eval_key_polys = sample_relinearization_eval_key_slots(
+            &params,
+            &secret_key,
+            mul_relin_extra_levels,
+            0.0,
+        );
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let ctx = create_test_context_with_params_and_relin_levels(
+            &mut circuit,
+            &params,
+            mul_relin_extra_levels,
+        );
+        let input_active_levels = NUM_LEFT_MODULI + CKKS_MUL_DEPTH;
+        let lhs = CKKSCiphertext::input(ctx.clone(), Some(input_active_levels), &mut circuit);
+        let rhs = CKKSCiphertext::input(ctx.clone(), Some(input_active_levels), &mut circuit);
+        let eval_keys = CKKSCiphertext::alloc_eval_keys(ctx.clone(), &mut circuit);
+        let product = lhs.mul(&rhs, &eval_keys, &mut circuit);
+        let rescaled = product.rescale(&mut circuit);
+        assert_eq!(rescaled.active_levels(), NUM_LEFT_MODULI);
+        assert_eq!(rescaled.c0.enable_levels, Some(NUM_LEFT_MODULI));
+        assert_eq!(rescaled.c1.enable_levels, Some(NUM_LEFT_MODULI));
+        let (rescaled_c0, rescaled_c0_error) = rescaled.c0.reconstruct(&mut circuit);
+        println!("rescaled_c0_error: {}", rescaled_c0_error);
+        let (rescaled_c1, rescaled_c1_error) = rescaled.c1.reconstruct(&mut circuit);
+        println!("rescaled_c1_error: {}", rescaled_c1_error);
+        circuit.output(vec![rescaled_c0, rescaled_c1]);
+
+        let removed_modulus_u64 =
+            ctx.nested_rns.q_moduli()[ctx.ciphertext_level_offset() + NUM_LEFT_MODULI];
+        let removed_modulus = BigUint::from(removed_modulus_u64);
+        let modulus = q_level_modulus(ctx.as_ref(), NUM_LEFT_MODULI);
+        let estimated_mod_up_bound =
+            estimate_prefix_mod_up_error_bound(ctx.as_ref(), input_active_levels);
+        let estimated_mod_down_bound = estimate_prefix_mod_down_error_bound(
+            ctx.as_ref(),
+            input_active_levels,
+            mul_relin_extra_levels,
+        );
+        let total_error_bound =
+            estimated_mod_up_bound + (estimated_mod_down_bound * BigUint::from(2u64));
+        let rescale_error_bound = div_ceil_biguint_by_u64(total_error_bound, removed_modulus_u64);
+        let base_slot_bound = BigUint::from(4u64);
+        let max_base_slot = &base_slot_bound - BigUint::from(1u64);
+        let max_expected = &max_base_slot * &max_base_slot;
+        assert!(
+            removed_modulus > (&rescale_error_bound * BigUint::from(2u64)),
+            "removed modulus q_{NUM_LEFT_MODULI} must dominate the post-rescale approximation budget"
+        );
+        assert!(
+            (&max_expected * &removed_modulus) + &rescale_error_bound < modulus,
+            "kept modulus must keep the q_{NUM_LEFT_MODULI}-scaled product below wraparound after one rescale"
+        );
+        let small_mask_modulus = BigUint::from(1u64);
+        let lhs_base_slots = seeded_random_slots(&base_slot_bound, ctx.num_slots, 0xC0DEC0DE);
+        let rhs_base_slots = seeded_random_slots(&base_slot_bound, ctx.num_slots, 0x5EED1234);
+        let lhs_slots =
+            lhs_base_slots.iter().map(|slot| slot * &removed_modulus).collect::<Vec<_>>();
+        let rhs_slots =
+            rhs_base_slots.iter().map(|slot| slot * &removed_modulus).collect::<Vec<_>>();
+        let (lhs_c0, lhs_c1) = encrypt_zero_error_ciphertext_with_small_mask(
+            ctx.as_ref(),
+            &lhs_slots,
+            &secret_key,
+            input_active_levels,
+            0xA11CE001,
+            &small_mask_modulus,
+        );
+        let (rhs_c0, rhs_c1) = encrypt_zero_error_ciphertext_with_small_mask(
+            ctx.as_ref(),
+            &rhs_slots,
+            &secret_key,
+            input_active_levels,
+            0x5EED1234,
+            &small_mask_modulus,
+        );
+        let inputs = [
+            ciphertext_inputs_from_polys(
+                ctx.as_ref(),
+                &lhs_c0,
+                &lhs_c1,
+                ctx.ciphertext_level_offset(),
+                input_active_levels,
+            ),
+            ciphertext_inputs_from_polys(
+                ctx.as_ref(),
+                &rhs_c0,
+                &rhs_c1,
+                ctx.ciphertext_level_offset(),
+                input_active_levels,
+            ),
+            ciphertext_inputs_from_polys(
+                ctx.as_ref(),
+                &eval_key_polys.b0,
+                &eval_key_polys.b1,
+                0,
+                ctx.nested_rns.q_moduli_depth,
+            ),
+        ]
+        .concat();
+        let outputs = eval_outputs(ctx.as_ref(), &circuit, inputs);
+        assert_eq!(outputs.len(), 2, "CKKS ciphertext circuits must output c0 and c1");
+        let output_c0 = ciphertext_poly_from_output(&ctx.params, &outputs[0]);
+        let output_c1 = ciphertext_poly_from_output(&ctx.params, &outputs[1]);
+        let decrypted = decrypt_ciphertext(&ctx.params, &output_c0, &output_c1, &secret_key);
+        let expected = lhs_base_slots
+            .iter()
+            .zip(rhs_base_slots.iter())
+            .map(|(lhs, rhs)| lhs * rhs)
+            .collect::<Vec<_>>();
+        let decrypted_slots =
+            decrypted.eval_slots().into_iter().map(|slot| slot % &modulus).collect::<Vec<_>>();
+        let expected_scaled =
+            expected.iter().map(|slot| slot * &removed_modulus).collect::<Vec<_>>();
+        for (idx, target) in expected_scaled.iter().enumerate() {
+            assert!(
+                &(target + &rescale_error_bound) < &modulus,
+                "slot {} scaled target must stay below the kept modulus to avoid wraparound",
+                idx
+            );
+        }
+        let rounded = decrypted_slots
+            .iter()
+            .map(|slot| round_div_by_scale(slot, &removed_modulus))
+            .collect::<Vec<_>>();
+        assert_eq!(rounded, expected);
+    }
 
     #[test]
     #[sequential_test::sequential]
@@ -749,8 +1215,8 @@ mod tests {
         let rescaled = input.rescale(&mut circuit);
         assert_eq!(rescaled.c0.enable_levels, Some(active_levels - 1));
         assert_eq!(rescaled.c1.enable_levels, Some(active_levels - 1));
-        let rescaled_c0 = rescaled.c0.reconstruct(&mut circuit);
-        let rescaled_c1 = rescaled.c1.reconstruct(&mut circuit);
+        let (rescaled_c0, _) = rescaled.c0.reconstruct(&mut circuit);
+        let (rescaled_c1, _) = rescaled.c1.reconstruct(&mut circuit);
         circuit.output(vec![rescaled_c0, rescaled_c1]);
 
         let kept_modulus = q_level_modulus(ctx.as_ref(), active_levels - 1);

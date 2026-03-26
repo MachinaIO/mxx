@@ -17,9 +17,7 @@
 
 use crate::{
     circuit::{PolyCircuit, evaluable::PolyVec},
-    gadgets::arith::{
-        NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly_with_offset,
-    },
+    gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly_with_offset},
     poly::{Poly, PolyParams},
     utils::mod_inverse,
 };
@@ -634,10 +632,11 @@ mod tests {
         let params = DCRTPolyParams::new(2, 1, 17, BASE_BITS);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = test_context(&mut circuit, &params);
-        let input = NestedRnsPoly::input(ctx.clone(), None, &mut circuit);
+        let input = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
         let inverse = inverse_ntt(&params, &mut circuit, &input, 2);
         let output = forward_ntt(&params, &mut circuit, &inverse, 2);
-        let reconstructed = output.reconstruct(&mut circuit);
+        let (reconstructed, approx_error) = output.reconstruct(&mut circuit);
+        assert_eq!(approx_error, BigUint::ZERO);
         circuit.output(vec![reconstructed]);
         assert_top_level_ntt_structure(&circuit);
 
@@ -661,10 +660,11 @@ mod tests {
         let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = test_context(&mut circuit, &params);
-        let input = NestedRnsPoly::input(ctx.clone(), None, &mut circuit);
+        let input = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
         let inverse = inverse_ntt(&params, &mut circuit, &input, 16);
         let output = forward_ntt(&params, &mut circuit, &inverse, 16);
-        let reconstructed = output.reconstruct(&mut circuit);
+        let (reconstructed, approx_error) = output.reconstruct(&mut circuit);
+        assert_eq!(approx_error, BigUint::ZERO);
         circuit.output(vec![reconstructed]);
         assert_top_level_ntt_structure(&circuit);
 
@@ -688,10 +688,11 @@ mod tests {
         let params = DCRTPolyParams::new(16, 1, 51, BASE_BITS);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = test_context_with_p_moduli_bits(&mut circuit, &params, 10);
-        let input = NestedRnsPoly::input(ctx.clone(), None, &mut circuit);
+        let input = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
         let inverse = inverse_ntt(&params, &mut circuit, &input, 16);
         let output = forward_ntt(&params, &mut circuit, &inverse, 16);
-        let reconstructed = output.reconstruct(&mut circuit);
+        let (reconstructed, approx_error) = output.reconstruct(&mut circuit);
+        assert_eq!(approx_error, BigUint::ZERO);
         circuit.output(vec![reconstructed]);
         assert_top_level_ntt_structure(&circuit);
 
@@ -739,10 +740,11 @@ mod tests {
             let params = DCRTPolyParams::new(ring_dimension, crt_depth, 18, BASE_BITS);
             let mut circuit = PolyCircuit::<DCRTPoly>::new();
             let ctx = test_context(&mut circuit, &params);
-            let input = NestedRnsPoly::input(ctx.clone(), None, &mut circuit);
+            let input = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
             let forward = forward_ntt(&params, &mut circuit, &input, num_slots);
             let inverse = inverse_ntt(&params, &mut circuit, &forward, num_slots);
-            let reconstructed = inverse.reconstruct(&mut circuit);
+            let (reconstructed, approx_error) = inverse.reconstruct(&mut circuit);
+            assert_eq!(approx_error, BigUint::ZERO);
             circuit.output(vec![reconstructed]);
 
             let slots = random_slots(&params, resolved_active_levels(&input), num_slots);
@@ -770,12 +772,13 @@ mod tests {
         let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = test_context(&mut circuit, &params);
-        let input = NestedRnsPoly::input(ctx.clone(), Some(2), &mut circuit);
+        let input = NestedRnsPoly::input(ctx.clone(), Some(2), None, &mut circuit);
         let forward = forward_ntt(&params, &mut circuit, &input, 16);
         assert_eq!(forward.enable_levels, Some(2));
         let inverse = inverse_ntt(&params, &mut circuit, &forward, 16);
         assert_eq!(inverse.enable_levels, Some(2));
-        let reconstructed = inverse.reconstruct(&mut circuit);
+        let (reconstructed, approx_error) = inverse.reconstruct(&mut circuit);
+        assert_eq!(approx_error, BigUint::ZERO);
         circuit.output(vec![reconstructed]);
         assert_top_level_ntt_structure(&circuit);
 
@@ -802,9 +805,10 @@ mod tests {
         let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = test_context(&mut circuit, &params);
-        let input = NestedRnsPoly::input(ctx.clone(), None, &mut circuit);
+        let input = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
         let inverse = inverse_ntt(&params, &mut circuit, &input, 16);
-        let reconstructed = inverse.reconstruct(&mut circuit);
+        let (reconstructed, approx_error) = inverse.reconstruct(&mut circuit);
+        assert_eq!(approx_error, BigUint::ZERO);
         circuit.output(vec![reconstructed]);
 
         let slots = random_slots(&params, resolved_active_levels(&input), 16);
@@ -832,7 +836,7 @@ mod tests {
         let params = DCRTPolyParams::new(8, 1, 17, BASE_BITS);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = test_context(&mut circuit, &params);
-        let input = NestedRnsPoly::input(ctx, None, &mut circuit);
+        let input = NestedRnsPoly::input(ctx, None, None, &mut circuit);
         let _ = forward_ntt(&params, &mut circuit, &input, 3);
     }
 }

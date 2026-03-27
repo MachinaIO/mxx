@@ -411,7 +411,10 @@ mod tests {
         circuit::{PolyCircuit, evaluable::PolyVec},
         gadgets::{
             arith::DEFAULT_MAX_UNREDUCED_MULS,
-            mod_switch::nested_rns::mod_down_levels_reconstruct_error_upper_bound,
+            mod_switch::nested_rns::{
+                mod_down_levels_reconstruct_error_upper_bound,
+                mod_down_one_level_reconstruct_error_upper_bound,
+            },
             ntt::encode_nested_rns_poly_vec_with_offset,
         },
         lookup::{poly::PolyPltEvaluator, poly_vec::PolyVecPltEvaluator},
@@ -1225,6 +1228,186 @@ mod tests {
                 assert!(
                     diff <= total_bound,
                     "mul decrypted coefficient {coeff_idx} error {} exceeds bound {}",
+                    diff,
+                    total_bound
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[sequential_test::sequential]
+    fn test_ckks_mul_then_rescale_keeps_decrypted_coeff_error_within_bound() {
+        let mul_relin_extra_levels = 1;
+        let crt_bits = 24usize;
+        let params = DCRTPolyParams::new(
+            NUM_SLOTS as u32,
+            NUM_LEFT_MODULI + CKKS_MUL_DEPTH + mul_relin_extra_levels,
+            crt_bits,
+            12,
+        );
+        let scale_u64 =
+            1u64.checked_shl(crt_bits as u32).expect("test scale 2^crt_bits must fit in u64");
+        let scale = BigUint::from(scale_u64);
+        let plaintext_bound = BigUint::from(1u64) << (crt_bits / 2 - 1);
+        let secret_key = sample_ternary_secret_key(&params);
+        let eval_key_polys = sample_relinearization_eval_key_slots(
+            &params,
+            &secret_key,
+            mul_relin_extra_levels,
+            0.0,
+        );
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let ctx = create_test_context_with_params_scale_and_relin_levels(
+            &mut circuit,
+            &params,
+            scale_u64,
+            mul_relin_extra_levels,
+        );
+        let active_levels = NUM_LEFT_MODULI + CKKS_MUL_DEPTH;
+        let lhs = CKKSCiphertext::input(ctx.clone(), Some(active_levels), &mut circuit);
+        let rhs = CKKSCiphertext::input(ctx.clone(), Some(active_levels), &mut circuit);
+        let eval_keys = CKKSCiphertext::alloc_eval_keys(ctx.clone(), &mut circuit);
+        let product = lhs.mul(&rhs, &eval_keys, &mut circuit);
+        let coeff_product = product.to_coeff_domain(&mut circuit);
+        let lowered = CKKSCiphertext::new(
+            ctx.clone(),
+            coeff_product.c0.mod_down_one_level(&mut circuit),
+            coeff_product.c1.mod_down_one_level(&mut circuit),
+        );
+        let rescaled = lowered.to_eval_domain(&mut circuit);
+        assert_eq!(rescaled.active_levels(), active_levels - 1);
+        let rescaled_c0_poly = rescaled.c0.reconstruct(&mut circuit);
+        let rescaled_c1_poly = rescaled.c1.reconstruct(&mut circuit);
+        circuit.output(vec![rescaled_c0_poly, rescaled_c1_poly]);
+
+        let kept_modulus = q_level_modulus(ctx.as_ref(), active_levels - 1);
+        let lhs_plain_slots = seeded_random_slots(&plaintext_bound, ctx.num_slots, 0xC0DEC0DE);
+        let rhs_plain_slots = seeded_random_slots(&plaintext_bound, ctx.num_slots, 0x5EED1234);
+        let lhs_scaled_slots = lhs_plain_slots.iter().map(|slot| slot * &scale).collect::<Vec<_>>();
+        let rhs_scaled_slots = rhs_plain_slots.iter().map(|slot| slot * &scale).collect::<Vec<_>>();
+        let (lhs_c0, lhs_c1) = encrypt_zero_error_ciphertext(
+            ctx.as_ref(),
+            &lhs_scaled_slots,
+            &secret_key,
+            active_levels,
+            0xA11CE001,
+        );
+        let (rhs_c0, rhs_c1) = encrypt_zero_error_ciphertext(
+            ctx.as_ref(),
+            &rhs_scaled_slots,
+            &secret_key,
+            active_levels,
+            0xA11CE002,
+        );
+        let inputs = [
+            ciphertext_inputs_from_polys(
+                ctx.as_ref(),
+                &lhs_c0,
+                &lhs_c1,
+                ctx.ciphertext_level_offset(),
+                active_levels,
+            ),
+            ciphertext_inputs_from_polys(
+                ctx.as_ref(),
+                &rhs_c0,
+                &rhs_c1,
+                ctx.ciphertext_level_offset(),
+                active_levels,
+            ),
+            ciphertext_inputs_from_polys(
+                ctx.as_ref(),
+                &eval_key_polys.b0,
+                &eval_key_polys.b1,
+                0,
+                ctx.nested_rns.q_moduli_depth,
+            ),
+        ]
+        .concat();
+        let outputs = eval_outputs(ctx.as_ref(), &circuit, inputs);
+        assert_eq!(outputs.len(), 2, "CKKS mul-then-rescale circuit must output c0 and c1");
+        let rescaled_c0_slots = output_slot_values(&outputs[0]);
+        let rescaled_c1_slots = output_slot_values(&outputs[1]);
+        let rescaled_c0_coeffs = coeffs_from_eval_slots_for_q_window(
+            &ctx.params,
+            ctx.as_ref(),
+            &rescaled_c0_slots,
+            ctx.ciphertext_level_offset(),
+            active_levels - 1,
+        );
+        let rescaled_c1_coeffs = coeffs_from_eval_slots_for_q_window(
+            &ctx.params,
+            ctx.as_ref(),
+            &rescaled_c1_slots,
+            ctx.ciphertext_level_offset(),
+            active_levels - 1,
+        );
+        let rescaled_c0_coeff_poly = DCRTPoly::from_biguints(&ctx.params, &rescaled_c0_coeffs);
+        let rescaled_c1_coeff_poly = DCRTPoly::from_biguints(&ctx.params, &rescaled_c1_coeffs);
+
+        let secret_key_coeffs_kept =
+            reduce_coeffs_modulo(&secret_key.coeffs_biguints(), &kept_modulus);
+        let secret_key_coeff_poly_kept =
+            DCRTPoly::from_biguints(&ctx.params, &secret_key_coeffs_kept);
+        let decrypted_coeff_poly =
+            rescaled_c0_coeff_poly + &(rescaled_c1_coeff_poly * &secret_key_coeff_poly_kept);
+        let actual_coeffs =
+            reduce_coeffs_modulo(&decrypted_coeff_poly.coeffs_biguints(), &kept_modulus);
+
+        let expected_scaled_product_slots = lhs_plain_slots
+            .iter()
+            .zip(rhs_plain_slots.iter())
+            .map(|(lhs, rhs)| lhs * rhs * &scale * &scale)
+            .collect::<Vec<_>>();
+        let expected_pre_rescale_coeffs = coeffs_from_eval_slots_for_q_window(
+            &ctx.params,
+            ctx.as_ref(),
+            &expected_scaled_product_slots,
+            ctx.ciphertext_level_offset(),
+            active_levels,
+        );
+        let removed_modulus_u64 =
+            ctx.nested_rns.q_moduli()[ctx.ciphertext_level_offset() + active_levels - 1];
+        let removed_modulus = BigUint::from(removed_modulus_u64);
+        let expected_coeffs = expected_pre_rescale_coeffs
+            .iter()
+            .map(|coeff| coeff / &removed_modulus)
+            .collect::<Vec<_>>();
+
+        let secret_key_bound = BigUint::from(ctx.params.ring_dimension());
+        let branch_pre_rescale_bound = mod_down_levels_reconstruct_error_upper_bound(
+            &ctx.nested_rns.q_moduli()[..ctx.ciphertext_level_offset()],
+            &ctx.nested_rns.full_reduce_max_plaintexts[..ctx.ciphertext_level_offset()],
+        );
+        let branch_rescale_remainder_bound =
+            mod_down_one_level_reconstruct_error_upper_bound(removed_modulus_u64);
+        let branch_visible_rescale_bound = div_ceil_biguint_by_u64(
+            branch_pre_rescale_bound + branch_rescale_remainder_bound,
+            removed_modulus_u64,
+        );
+        let removed_level_idx = active_levels - 1;
+        let c0_removed_native_quotient_bound =
+            &coeff_product.c0.max_plaintexts[removed_level_idx] / &removed_modulus;
+        let c1_removed_native_quotient_bound =
+            &coeff_product.c1.max_plaintexts[removed_level_idx] / &removed_modulus;
+        let c0_post_rescale_bound =
+            &branch_visible_rescale_bound + c0_removed_native_quotient_bound;
+        let c1_post_rescale_bound =
+            &branch_visible_rescale_bound + c1_removed_native_quotient_bound;
+        let total_bound = &c0_post_rescale_bound + (&secret_key_bound * &c1_post_rescale_bound);
+
+        actual_coeffs.iter().zip(expected_coeffs.iter()).enumerate().for_each(
+            |(coeff_idx, (actual, expected))| {
+                let diff = centered_modular_distance(actual, expected, &kept_modulus);
+                if diff > total_bound {
+                    println!(
+                        "coeff_idx={coeff_idx} actual={} expected={} diff={} bound={}",
+                        actual, expected, diff, total_bound
+                    );
+                }
+                assert!(
+                    diff <= total_bound,
+                    "mul-then-rescale decrypted coefficient {coeff_idx} error {} exceeds bound {}",
                     diff,
                     total_bound
                 );

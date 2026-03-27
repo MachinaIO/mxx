@@ -411,7 +411,6 @@ mod tests {
     use crate::{
         __PAIR, __TestState,
         circuit::{PolyCircuit, evaluable::PolyVec},
-        element::PolyElem,
         gadgets::{arith::DEFAULT_MAX_UNREDUCED_MULS, ntt::encode_nested_rns_poly_vec_with_offset},
         lookup::{poly::PolyPltEvaluator, poly_vec::PolyVecPltEvaluator},
         poly::{
@@ -583,6 +582,26 @@ mod tests {
     fn seeded_random_slots(modulus: &BigUint, num_slots: usize, seed: u64) -> Vec<BigUint> {
         let mut rng = StdRng::seed_from_u64(seed);
         (0..num_slots).map(|_| gen_biguint_for_modulus(&mut rng, modulus)).collect()
+    }
+
+    fn reduce_slots_modulo(slots: &[BigUint], modulus: &BigUint) -> Vec<BigUint> {
+        slots.iter().map(|slot| slot % modulus).collect()
+    }
+
+    fn eval_poly_from_slots_modulus(
+        params: &DCRTPolyParams,
+        slots: &[BigUint],
+        modulus: &BigUint,
+    ) -> DCRTPoly {
+        DCRTPoly::from_biguints_eval(params, &reduce_slots_modulo(slots, modulus))
+    }
+
+    fn eval_poly_project_to_modulus(
+        params: &DCRTPolyParams,
+        poly: &DCRTPoly,
+        modulus: &BigUint,
+    ) -> DCRTPoly {
+        eval_poly_from_slots_modulus(params, &poly.eval_slots(), modulus)
     }
 
     fn sample_ternary_secret_key(params: &DCRTPolyParams) -> DCRTPoly {
@@ -961,107 +980,112 @@ mod tests {
         assert_decrypted_slots_match_modulus(&decrypted_extended, &expected, &modulus);
     }
 
-    // #[test]
-    // #[sequential_test::sequential]
-    // fn test_ckks_relinearize_d2_via_mod_up_down_prints_reconstructed_approx_errors() {
-    //     let mul_relin_extra_levels = 1;
-    //     let params = DCRTPolyParams::new(
-    //         NUM_SLOTS as u32,
-    //         NUM_LEFT_MODULI + CKKS_MUL_DEPTH + mul_relin_extra_levels,
-    //         24,
-    //         12,
-    //     );
-    //     let secret_key = sample_ternary_secret_key(&params);
-    //     let eval_key_polys = sample_relinearization_eval_key_slots(
-    //         &params,
-    //         &secret_key,
-    //         mul_relin_extra_levels,
-    //         0.0,
-    //     );
-    //     let mut circuit = PolyCircuit::<DCRTPoly>::new();
-    //     let ctx = create_test_context_with_params_and_relin_levels(
-    //         &mut circuit,
-    //         &params,
-    //         mul_relin_extra_levels,
-    //     );
-    //     let active_levels = NUM_LEFT_MODULI + CKKS_MUL_DEPTH;
-    //     // Within b = s * a1 + s^2 * a2, this helper only consumes the s^2 branch a2.
-    //     let a2_eval = NestedRnsPoly::input(
-    //         ctx.nested_rns.clone(),
-    //         Some(active_levels),
-    //         Some(ctx.ciphertext_level_offset()),
-    //         &mut circuit,
-    //     );
-    //     let eval_keys = CKKSCiphertext::alloc_eval_keys(ctx.clone(), &mut circuit);
+    #[test]
+    #[sequential_test::sequential]
+    fn test_ckks_relinearize_d2_via_mod_up_down_prints_reconstructed_approx_errors() {
+        let mul_relin_extra_levels = 1;
+        let params = DCRTPolyParams::new(
+            NUM_SLOTS as u32,
+            NUM_LEFT_MODULI + CKKS_MUL_DEPTH + mul_relin_extra_levels,
+            24,
+            12,
+        );
+        let secret_key = sample_ternary_secret_key(&params);
+        let eval_key_polys = sample_relinearization_eval_key_slots(
+            &params,
+            &secret_key,
+            mul_relin_extra_levels,
+            0.0,
+        );
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let ctx = create_test_context_with_params_and_relin_levels(
+            &mut circuit,
+            &params,
+            mul_relin_extra_levels,
+        );
+        let active_levels = NUM_LEFT_MODULI + CKKS_MUL_DEPTH;
+        // Within b = s * a1 + s^2 * a2, this helper only consumes the s^2 branch a2.
+        let a2_eval = NestedRnsPoly::input(
+            ctx.nested_rns.clone(),
+            Some(active_levels),
+            Some(ctx.ciphertext_level_offset()),
+            &mut circuit,
+        );
+        let eval_keys = CKKSCiphertext::alloc_eval_keys(ctx.clone(), &mut circuit);
 
-    //     let (relin_c0, relin_c1) = CKKSCiphertext::relinearize_d2_via_mod_up_down(
-    //         ctx.as_ref(),
-    //         &a2_eval,
-    //         &eval_keys,
-    //         &mut circuit,
-    //     );
-    //     let (relin_c0_poly, relin_c0_error) = relin_c0.reconstruct(&mut circuit);
-    //     let (relin_c1_poly, relin_c1_error) = relin_c1.reconstruct(&mut circuit);
-    //     println!("relin_c0_error: {}", relin_c0_error);
-    //     println!("relin_c1_error: {}", relin_c1_error);
-    //     circuit.output(vec![relin_c0_poly, relin_c1_poly]);
+        let (relin_c0, relin_c1) = CKKSCiphertext::relinearize_d2_via_mod_up_down(
+            ctx.as_ref(),
+            &a2_eval,
+            &eval_keys,
+            &mut circuit,
+        );
+        let (relin_c0_poly, relin_c0_error) = relin_c0.reconstruct(&mut circuit);
+        let (relin_c1_poly, relin_c1_error) = relin_c1.reconstruct(&mut circuit);
+        println!("relin_c0_error: {}", relin_c0_error);
+        println!("relin_c1_error: {}", relin_c1_error);
+        circuit.output(vec![relin_c0_poly, relin_c1_poly]);
 
-    //     let modulus = q_level_modulus(ctx.as_ref(), active_levels);
-    //     let a2_slots = seeded_random_slots(&modulus, ctx.num_slots, 0xA211CE55);
-    //     let a2_eval_poly = DCRTPoly::from_biguints_eval(&ctx.params, &a2_slots);
-    //     let a2_inputs = encode_nested_rns_poly_vec_with_offset::<DCRTPoly>(
-    //         &ctx.params,
-    //         ctx.nested_rns.as_ref(),
-    //         &a2_eval_poly.eval_slots(),
-    //         ctx.ciphertext_level_offset(),
-    //         Some(active_levels),
-    //     );
-    //     let inputs = [
-    //         a2_inputs,
-    //         ciphertext_inputs_from_polys(
-    //             ctx.as_ref(),
-    //             &eval_key_polys.b0,
-    //             &eval_key_polys.b1,
-    //             0,
-    //             ctx.nested_rns.q_moduli_depth,
-    //         ),
-    //     ]
-    //     .concat();
-    //     let outputs = eval_outputs(ctx.as_ref(), &circuit, inputs);
-    //     assert_eq!(outputs.len(), 2, "relinearization helper must output a and b");
+        let active_modulus = q_level_modulus(ctx.as_ref(), active_levels);
+        let a2_slots = seeded_random_slots(&active_modulus, ctx.num_slots, 0xA211CE55);
+        let a2_eval_poly = eval_poly_from_slots_modulus(&ctx.params, &a2_slots, &active_modulus);
+        let secret_key_active =
+            eval_poly_project_to_modulus(&ctx.params, &secret_key, &active_modulus);
+        let a2_inputs = encode_nested_rns_poly_vec_with_offset::<DCRTPoly>(
+            &ctx.params,
+            ctx.nested_rns.as_ref(),
+            &a2_slots,
+            ctx.ciphertext_level_offset(),
+            Some(active_levels),
+        );
+        let inputs = [
+            a2_inputs,
+            ciphertext_inputs_from_polys(
+                ctx.as_ref(),
+                &eval_key_polys.b0,
+                &eval_key_polys.b1,
+                0,
+                ctx.nested_rns.q_moduli_depth,
+            ),
+        ]
+        .concat();
+        let outputs = eval_outputs(ctx.as_ref(), &circuit, inputs);
+        assert_eq!(outputs.len(), 2, "relinearization helper must output a and b");
 
-    //     let relin_a_coeff_values = output_slot_values(&outputs[0]);
-    //     let relin_b_coeff_values = output_slot_values(&outputs[1]);
-    //     let coeff_modulus = ctx.params.modulus();
-    //     let relin_a_coeffs = relin_a_coeff_values
-    //         .iter()
-    //         .map(|coeff| {
-    //             crate::element::finite_ring::FinRingElem::new(coeff.clone(),
-    // coeff_modulus.clone())         })
-    //         .collect::<Vec<_>>();
-    //     let relin_b_coeffs = relin_b_coeff_values
-    //         .iter()
-    //         .map(|coeff| {
-    //             crate::element::finite_ring::FinRingElem::new(coeff.clone(),
-    // coeff_modulus.clone())         })
-    //         .collect::<Vec<_>>();
-    //     let relin_a = DCRTPoly::from_coeffs(&ctx.params, &relin_a_coeffs);
-    //     let relin_b = DCRTPoly::from_coeffs(&ctx.params, &relin_b_coeffs);
-    //     let decrypted = decrypt_ciphertext(&ctx.params, &relin_a, &relin_b, &secret_key);
-    //     let special_prime_product = {
-    //         let (q_moduli, _, _) = params.to_crt();
-    //         biguint_product(&q_moduli[..mul_relin_extra_levels])
-    //     };
-    //     // let special_prime_poly =
-    //     //     DCRTPoly::from_biguint_to_constant(&ctx.params, special_prime_product);
-    //     let expected = (secret_key.clone() * &secret_key) * &a2_eval_poly;
-    //     println!("expected coeffs: {:?}", expected.coeffs_biguints());
-    //     let diff = decrypted.clone() - &expected;
-    //     println!("decrypted coeffs: {:?}", decrypted.coeffs_biguints());
-    //     println!("decrypted slots: {:?}", decrypted.eval_slots());
-    //     println!("decrypted_minus_s2_a2 coeffs: {:?}", diff.coeffs_biguints());
-    //     println!("decrypted_minus_s2_a2 slots: {:?}", diff.eval_slots());
-    // }
+        let relin_a_coeff_values = output_slot_values(&outputs[0]);
+        let relin_b_coeff_values = output_slot_values(&outputs[1]);
+        let relin_a =
+            eval_poly_from_slots_modulus(&ctx.params, &relin_a_coeff_values, &active_modulus);
+        let relin_b =
+            eval_poly_from_slots_modulus(&ctx.params, &relin_b_coeff_values, &active_modulus);
+        let decrypted = eval_poly_project_to_modulus(
+            &ctx.params,
+            &decrypt_ciphertext(&ctx.params, &relin_a, &relin_b, &secret_key_active),
+            &active_modulus,
+        );
+        let expected = eval_poly_project_to_modulus(
+            &ctx.params,
+            &((secret_key_active.clone() * &secret_key_active) * &a2_eval_poly),
+            &active_modulus,
+        );
+        let diff = eval_poly_project_to_modulus(
+            &ctx.params,
+            &(decrypted.clone() - &expected),
+            &active_modulus,
+        );
+        // println!("decrypted coeffs: {:?}", decrypted.coeffs_biguints());
+        // println!("decrypted slots: {:?}", decrypted.eval_slots());
+        println!(
+            "decrypted_minus_s2_a2 coeffs: {:?}",
+            diff.coeffs_biguints()[0].clone() % &active_modulus
+        );
+        println!(
+            "decrypted_minus_s2_a2 coeffs {} vs q: {}",
+            diff.coeffs_biguints()[0].clone() % &active_modulus,
+            &active_modulus
+        );
+
+        // println!("decrypted_minus_s2_a2 slots: {:?}", diff.eval_slots());
+    }
 
     #[test]
     // #[ignore = "Ignored per current validation scope; run manually when investigating CKKS
@@ -1128,7 +1152,7 @@ mod tests {
             (&max_expected * &removed_modulus) + &rescale_error_bound < modulus,
             "kept modulus must keep the q_{NUM_LEFT_MODULI}-scaled product below wraparound after one rescale"
         );
-        let small_mask_modulus = BigUint::from(1u64);
+        let small_mask_modulus = BigUint::from(0u64);
         let lhs_base_slots = seeded_random_slots(&base_slot_bound, ctx.num_slots, 0xC0DEC0DE);
         let rhs_base_slots = seeded_random_slots(&base_slot_bound, ctx.num_slots, 0x5EED1234);
         let lhs_slots =
@@ -1185,8 +1209,8 @@ mod tests {
             .zip(rhs_base_slots.iter())
             .map(|(lhs, rhs)| lhs * rhs)
             .collect::<Vec<_>>();
-        let decrypted_slots =
-            decrypted.eval_slots().into_iter().map(|slot| slot % &modulus).collect::<Vec<_>>();
+        let decrypted_coeffs =
+            decrypted.coeffs_biguints().into_iter().map(|slot| slot % &modulus).collect::<Vec<_>>();
         let expected_scaled =
             expected.iter().map(|slot| slot * &removed_modulus).collect::<Vec<_>>();
         for (idx, target) in expected_scaled.iter().enumerate() {
@@ -1196,7 +1220,7 @@ mod tests {
                 idx
             );
         }
-        let rounded = decrypted_slots
+        let rounded = decrypted_coeffs
             .iter()
             .map(|slot| round_div_by_scale(slot, &removed_modulus))
             .collect::<Vec<_>>();

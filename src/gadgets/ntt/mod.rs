@@ -635,8 +635,7 @@ mod tests {
         let input = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
         let inverse = inverse_ntt(&params, &mut circuit, &input, 2);
         let output = forward_ntt(&params, &mut circuit, &inverse, 2);
-        let (reconstructed, approx_error) = output.reconstruct(&mut circuit);
-        assert_eq!(approx_error, BigUint::ZERO);
+        let reconstructed = output.reconstruct(&mut circuit);
         circuit.output(vec![reconstructed]);
         assert_top_level_ntt_structure(&circuit);
 
@@ -663,8 +662,7 @@ mod tests {
         let input = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
         let inverse = inverse_ntt(&params, &mut circuit, &input, 16);
         let output = forward_ntt(&params, &mut circuit, &inverse, 16);
-        let (reconstructed, approx_error) = output.reconstruct(&mut circuit);
-        assert_eq!(approx_error, BigUint::ZERO);
+        let reconstructed = output.reconstruct(&mut circuit);
         circuit.output(vec![reconstructed]);
         assert_top_level_ntt_structure(&circuit);
 
@@ -691,8 +689,7 @@ mod tests {
         let input = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
         let inverse = inverse_ntt(&params, &mut circuit, &input, 16);
         let output = forward_ntt(&params, &mut circuit, &inverse, 16);
-        let (reconstructed, approx_error) = output.reconstruct(&mut circuit);
-        assert_eq!(approx_error, BigUint::ZERO);
+        let reconstructed = output.reconstruct(&mut circuit);
         circuit.output(vec![reconstructed]);
         assert_top_level_ntt_structure(&circuit);
 
@@ -743,8 +740,7 @@ mod tests {
             let input = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
             let forward = forward_ntt(&params, &mut circuit, &input, num_slots);
             let inverse = inverse_ntt(&params, &mut circuit, &forward, num_slots);
-            let (reconstructed, approx_error) = inverse.reconstruct(&mut circuit);
-            assert_eq!(approx_error, BigUint::ZERO);
+            let reconstructed = inverse.reconstruct(&mut circuit);
             circuit.output(vec![reconstructed]);
 
             let slots = random_slots(&params, resolved_active_levels(&input), num_slots);
@@ -777,8 +773,7 @@ mod tests {
         assert_eq!(forward.enable_levels, Some(2));
         let inverse = inverse_ntt(&params, &mut circuit, &forward, 16);
         assert_eq!(inverse.enable_levels, Some(2));
-        let (reconstructed, approx_error) = inverse.reconstruct(&mut circuit);
-        assert_eq!(approx_error, BigUint::ZERO);
+        let reconstructed = inverse.reconstruct(&mut circuit);
         circuit.output(vec![reconstructed]);
         assert_top_level_ntt_structure(&circuit);
 
@@ -807,8 +802,7 @@ mod tests {
         let ctx = test_context(&mut circuit, &params);
         let input = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
         let inverse = inverse_ntt(&params, &mut circuit, &input, 16);
-        let (reconstructed, approx_error) = inverse.reconstruct(&mut circuit);
-        assert_eq!(approx_error, BigUint::ZERO);
+        let reconstructed = inverse.reconstruct(&mut circuit);
         circuit.output(vec![reconstructed]);
 
         let slots = random_slots(&params, resolved_active_levels(&input), 16);

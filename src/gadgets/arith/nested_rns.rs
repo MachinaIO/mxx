@@ -26,7 +26,7 @@ pub struct NestedRnsPolyContext {
     pub q_moduli_depth: usize,
     p_full: BigUint,
     p_over_pis: Vec<BigUint>,
-    full_reduce_max_plaintexts: Vec<BigUint>,
+    pub full_reduce_max_plaintexts: Vec<BigUint>,
     lut_x_to_y_ids: Vec<usize>,
     lut_x_to_real_ids: Vec<usize>,
     lut_real_to_v_id: usize,
@@ -67,17 +67,29 @@ fn max_output_row_from_biguint<P: Poly>(
     (u64::try_from(idx).expect("row index must fit in u64"), coeff)
 }
 
-fn div_ceil_biguint_by_u64(value: BigUint, divisor: u64) -> BigUint {
-    let adjustment = BigUint::from(divisor.saturating_sub(1));
-    (value + adjustment) / BigUint::from(divisor)
-}
-
+// Conservative output bound for the integer represented by one q-level after full_reduce.
+//
+// The current implementation uses canonical nonnegative residues throughout:
+// - each y_i produced by lut_x_to_y lies in [0, p_i),
+// - each coefficient [p_hat_i]_q and [p]_q is represented in [0, q),
+// - real_i = round(y_i * scale / p_i) is nonnegative, and because y_i <= p_i - 1 we have real_i <=
+//   scale, so v = round(sum_i real_i / scale) satisfies 0 <= v <= k where k = p_moduli.len().
+//
+// For one q-level with modulus q, full_reduce evaluates the integer
+//   x' = sum_i y_i * [p_hat_i]_q - v * [p]_q.
+// Using the bounds above,
+//   |x'|
+//   <= sum_i |y_i| * |[p_hat_i]_q| + |v| * |[p]_q|
+//   <  sum_i p_i * q + k * q
+//   =  (sum_i p_i + k) * q.
+//
+// This is intentionally looser than the centered-residue bound from the paper: it matches the
+// repository's [0, q) / [0, p_i) representation contract rather than the paper's symmetric one.
 fn full_reduce_output_max_plaintext_bound(p_moduli: &[u64], q_modulus: u64) -> BigUint {
     let sum_p_moduli = p_moduli.iter().fold(BigUint::ZERO, |acc, &p_i| acc + BigUint::from(p_i));
     let modulus_count =
         u64::try_from(p_moduli.len()).expect("p_moduli length must fit in u64 for bound tracking");
-    let numerator = sum_p_moduli + BigUint::from(modulus_count);
-    div_ceil_biguint_by_u64(numerator, 4) * BigUint::from(q_modulus)
+    (sum_p_moduli + BigUint::from(modulus_count)) * BigUint::from(q_modulus)
 }
 
 fn sample_crt_primes_mul_budget_bound(
@@ -638,7 +650,6 @@ pub struct NestedRnsPoly<P: Poly> {
     pub level_offset: usize,
     pub enable_levels: Option<usize>,
     pub max_plaintexts: Vec<BigUint>,
-    pub approx_error_bounds: Vec<BigUint>,
     _p: PhantomData<P>,
 }
 
@@ -649,20 +660,10 @@ impl<P: Poly> NestedRnsPoly<P> {
         level_offset: Option<usize>,
         enable_levels: Option<usize>,
         max_plaintexts: Vec<BigUint>,
-        approx_error_bounds: Option<Vec<BigUint>>,
     ) -> Self {
         let level_offset = level_offset.unwrap_or(0);
-        let approx_error_bounds =
-            approx_error_bounds.unwrap_or_else(|| vec![BigUint::ZERO; inner.len()]);
-        let poly = Self {
-            ctx,
-            inner,
-            level_offset,
-            enable_levels,
-            max_plaintexts,
-            approx_error_bounds,
-            _p: PhantomData,
-        };
+        let poly =
+            Self { ctx, inner, level_offset, enable_levels, max_plaintexts, _p: PhantomData };
         poly.validate_enable_levels(poly.enable_levels);
         poly
     }
@@ -688,7 +689,7 @@ impl<P: Poly> NestedRnsPoly<P> {
             .take(input_count)
             .map(|&q_i| BigUint::from(q_i - 1))
             .collect();
-        Self::new(ctx, inner, Some(level_offset), enable_levels, max_plaintexts, None)
+        Self::new(ctx, inner, Some(level_offset), enable_levels, max_plaintexts)
     }
 
     pub fn slot_transfer(
@@ -702,7 +703,6 @@ impl<P: Poly> NestedRnsPoly<P> {
             operand = self.full_reduce(circuit);
         }
         let final_bounds = operand.compute_slot_transfer_output_bounds(src_slots);
-        let final_error_bounds = operand.compute_slot_transfer_approx_error_bounds(src_slots);
         operand.assert_bounds_within_p_full(
             &final_bounds,
             "slot_transfer output exceeds p_full even after automatic full_reduce",
@@ -752,7 +752,6 @@ impl<P: Poly> NestedRnsPoly<P> {
             Some(operand.level_offset),
             operand.enable_levels,
             final_bounds,
-            Some(final_error_bounds),
         )
     }
 
@@ -762,7 +761,6 @@ impl<P: Poly> NestedRnsPoly<P> {
             circuit,
             &self.ctx.add_lazy_reduce_ids,
             |left, right, _| left + right,
-            |left_err, right_err, _left_max, _right_max, _| left_err + right_err,
         )
     }
 
@@ -772,7 +770,6 @@ impl<P: Poly> NestedRnsPoly<P> {
             circuit,
             &self.ctx.sub_lazy_reduce_ids,
             |left, _right, q_i| left + BigUint::from(q_i - 1),
-            |left_err, right_err, _left_max, _right_max, _| left_err + right_err,
         )
     }
 
@@ -782,9 +779,6 @@ impl<P: Poly> NestedRnsPoly<P> {
             circuit,
             &self.ctx.mul_lazy_reduce_ids,
             |left, right, _| left * right,
-            |left_err, right_err, left_max, right_max, _| {
-                (left_max * right_err) + (right_max * left_err) + (left_err * right_err)
-            },
         )
     }
 
@@ -806,14 +800,12 @@ impl<P: Poly> NestedRnsPoly<P> {
                 self.ctx.full_reduce_max_plaintexts[self.level_offset + local_idx].clone()
             })
             .collect::<Vec<_>>();
-        let approx_error_bounds = self.compute_full_reduce_approx_error_bounds();
         Self::new(
             self.ctx.clone(),
             result_inner,
             Some(self.level_offset),
             self.enable_levels,
             max_plaintexts,
-            Some(approx_error_bounds),
         )
     }
 
@@ -832,7 +824,6 @@ impl<P: Poly> NestedRnsPoly<P> {
             operand = self.full_reduce(circuit);
         }
         let final_bounds = operand.compute_const_mul_output_bounds(tower_constants);
-        let final_error_bounds = operand.compute_const_mul_approx_error_bounds(tower_constants);
         operand.assert_bounds_within_p_full(
             &final_bounds,
             "const_mul output exceeds p_full even after automatic full_reduce",
@@ -855,20 +846,17 @@ impl<P: Poly> NestedRnsPoly<P> {
             Some(self.level_offset),
             self.enable_levels,
             final_bounds,
-            Some(final_error_bounds),
         )
     }
 
-    pub fn reconstruct(&self, circuit: &mut PolyCircuit<P>) -> (GateId, BigUint) {
+    pub fn reconstruct(&self, circuit: &mut PolyCircuit<P>) -> GateId {
         let operand = if self.bounds_exceed_p_full(&self.max_plaintexts) {
-            println!("Reconstructing with full_reduce due to bounds_exceed_p_full");
             self.full_reduce(circuit)
         } else {
             self.clone()
         };
         let levels = operand.resolve_enable_levels();
         let mut sum_mod_q = circuit.const_zero_gate();
-        let mut approx_error_bound = BigUint::ZERO;
         let active_moduli = operand.active_q_moduli();
         let active_modulus =
             active_moduli.iter().fold(BigUint::from(1u64), |acc, &q_i| acc * BigUint::from(q_i));
@@ -882,14 +870,6 @@ impl<P: Poly> NestedRnsPoly<P> {
             )
             .expect("CRT modulus must be invertible within the active range");
             let reconst_coeff = (&q_over_qi * BigUint::from(inv)) % &active_modulus;
-            println!(
-                "operand.approx_error_bounds[q_idx] % q_i_big = {}",
-                &operand.approx_error_bounds[q_idx] % &q_i_big
-            );
-            approx_error_bound = (approx_error_bound +
-                (&reconst_coeff * &operand.approx_error_bounds[q_idx])) %
-                &active_modulus;
-
             let mut sum_without_reduce = circuit.const_zero_gate();
             let mut real_sum = circuit.const_zero_gate();
             for p_idx in 0..operand.ctx.p_moduli.len() {
@@ -912,7 +892,7 @@ impl<P: Poly> NestedRnsPoly<P> {
             let sum_q_k_scaled = circuit.large_scalar_mul(sum_q_k, &[reconst_coeff]);
             sum_mod_q = circuit.add_gate(sum_mod_q, sum_q_k_scaled);
         }
-        (sum_mod_q, approx_error_bound)
+        sum_mod_q
     }
 
     pub fn benchmark_multiplication_tree(
@@ -936,7 +916,7 @@ impl<P: Poly> NestedRnsPoly<P> {
             current_layer = next_layer;
         }
         let root = current_layer.pop().expect("multiplication tree must contain at least one node");
-        let (out, _) = root.reconstruct(circuit);
+        let out = root.reconstruct(circuit);
         circuit.output(vec![out]);
     }
 
@@ -946,7 +926,6 @@ impl<P: Poly> NestedRnsPoly<P> {
         circuit: &mut PolyCircuit<P>,
         subcircuit_ids: &[usize],
         max_plaintexts: Vec<BigUint>,
-        approx_error_bounds: Vec<BigUint>,
     ) -> Self {
         let levels = self.resolve_enable_levels();
         assert!(
@@ -974,21 +953,18 @@ impl<P: Poly> NestedRnsPoly<P> {
             Some(self.level_offset),
             self.enable_levels,
             max_plaintexts,
-            Some(approx_error_bounds),
         )
     }
 
-    fn apply_binary_operation<FB, FE>(
+    fn apply_binary_operation<FB>(
         &self,
         other: &Self,
         circuit: &mut PolyCircuit<P>,
         subcircuit_ids: &[usize],
         output_bound: FB,
-        error_bound: FE,
     ) -> Self
     where
         FB: Fn(&BigUint, &BigUint, u64) -> BigUint,
-        FE: Fn(&BigUint, &BigUint, &BigUint, &BigUint, u64) -> BigUint,
     {
         self.assert_matching_enable_levels(other);
         let mut left = self.clone();
@@ -999,19 +975,11 @@ impl<P: Poly> NestedRnsPoly<P> {
             right = other.full_reduce(circuit);
         }
         let final_bounds = left.compute_binary_output_bounds(&right, &output_bound);
-        let final_error_bounds =
-            left.compute_binary_output_approx_error_bounds(&right, &error_bound);
         left.assert_bounds_within_p_full(
             &final_bounds,
             "binary operation output exceeds p_full even after automatic full_reduce",
         );
-        left.call_binary_subcircuit(
-            &right,
-            circuit,
-            subcircuit_ids,
-            final_bounds,
-            final_error_bounds,
-        )
+        left.call_binary_subcircuit(&right, circuit, subcircuit_ids, final_bounds)
     }
 
     fn compute_binary_output_bounds<F>(&self, other: &Self, output_bound: &F) -> Vec<BigUint>
@@ -1022,28 +990,6 @@ impl<P: Poly> NestedRnsPoly<P> {
         (0..levels)
             .map(|q_idx| {
                 output_bound(
-                    &self.max_plaintexts[q_idx],
-                    &other.max_plaintexts[q_idx],
-                    self.ctx.q_moduli[self.level_offset + q_idx],
-                )
-            })
-            .collect()
-    }
-
-    fn compute_binary_output_approx_error_bounds<F>(
-        &self,
-        other: &Self,
-        output_bound: &F,
-    ) -> Vec<BigUint>
-    where
-        F: Fn(&BigUint, &BigUint, &BigUint, &BigUint, u64) -> BigUint,
-    {
-        let levels = self.resolve_enable_levels();
-        (0..levels)
-            .map(|q_idx| {
-                output_bound(
-                    &self.approx_error_bounds[q_idx],
-                    &other.approx_error_bounds[q_idx],
                     &self.max_plaintexts[q_idx],
                     &other.max_plaintexts[q_idx],
                     self.ctx.q_moduli[self.level_offset + q_idx],
@@ -1064,18 +1010,6 @@ impl<P: Poly> NestedRnsPoly<P> {
             .collect()
     }
 
-    fn compute_const_mul_approx_error_bounds(&self, tower_constants: &[u64]) -> Vec<BigUint> {
-        let levels = self.resolve_enable_levels();
-        (0..levels)
-            .map(|q_idx| {
-                &self.approx_error_bounds[q_idx] *
-                    BigUint::from(
-                        tower_constants[q_idx] % self.ctx.q_moduli[self.level_offset + q_idx],
-                    )
-            })
-            .collect()
-    }
-
     fn compute_slot_transfer_output_bounds(
         &self,
         src_slots: &[(u32, Option<Vec<u64>>)],
@@ -1083,15 +1017,6 @@ impl<P: Poly> NestedRnsPoly<P> {
         let levels = self.resolve_enable_levels();
         let tower_scales = self.compute_slot_transfer_tower_scales(src_slots);
         (0..levels).map(|q_idx| &self.max_plaintexts[q_idx] * &tower_scales[q_idx]).collect()
-    }
-
-    fn compute_slot_transfer_approx_error_bounds(
-        &self,
-        src_slots: &[(u32, Option<Vec<u64>>)],
-    ) -> Vec<BigUint> {
-        let levels = self.resolve_enable_levels();
-        let tower_scales = self.compute_slot_transfer_tower_scales(src_slots);
-        (0..levels).map(|q_idx| &self.approx_error_bounds[q_idx] * &tower_scales[q_idx]).collect()
     }
 
     fn compute_slot_transfer_tower_scales(
@@ -1118,27 +1043,6 @@ impl<P: Poly> NestedRnsPoly<P> {
                     })
                     .max()
                     .unwrap_or(BigUint::ZERO)
-            })
-            .collect()
-    }
-
-    fn compute_full_reduce_approx_error_bounds(&self) -> Vec<BigUint> {
-        let levels = self.resolve_enable_levels();
-        (0..levels)
-            .map(|local_idx| {
-                let q_i = BigUint::from(self.ctx.q_moduli[self.level_offset + local_idx]);
-                println!(
-                    "&self.approx_error_bounds[local_idx] % &q_i = {}",
-                    &self.approx_error_bounds[local_idx] % &q_i
-                );
-                println!(
-                    "(&self.approx_error_bounds[local_idx] % &q_i) +
-                    &self.ctx.full_reduce_max_plaintexts[self.level_offset + local_idx] = {}",
-                    (&self.approx_error_bounds[local_idx] % &q_i) +
-                        &self.ctx.full_reduce_max_plaintexts[self.level_offset + local_idx]
-                );
-                (&self.approx_error_bounds[local_idx] % &q_i) +
-                    &self.ctx.full_reduce_max_plaintexts[self.level_offset + local_idx]
             })
             .collect()
     }
@@ -1197,13 +1101,6 @@ impl<P: Poly> NestedRnsPoly<P> {
             self.max_plaintexts.len(),
             "max_plaintexts length {} must match inner q_moduli depth {}",
             self.max_plaintexts.len(),
-            self.inner.len()
-        );
-        assert_eq!(
-            self.inner.len(),
-            self.approx_error_bounds.len(),
-            "approx_error_bounds length {} must match inner q_moduli depth {}",
-            self.approx_error_bounds.len(),
             self.inner.len()
         );
         assert!(
@@ -1485,6 +1382,11 @@ mod tests {
         (params, ctx)
     }
 
+    fn div_ceil_biguint_by_u64(value: BigUint, divisor: u64) -> BigUint {
+        let adjustment = BigUint::from(divisor.saturating_sub(1));
+        (value + adjustment) / BigUint::from(divisor)
+    }
+
     #[sequential_test::sequential]
     #[test]
     fn test_nested_rns_poly_add_auto_reduce_maxes() {
@@ -1653,7 +1555,7 @@ mod tests {
         let mut auto_input =
             NestedRnsPoly::input(auto_ctx.clone(), Some(q_level), None, &mut auto_circuit);
         auto_input.max_plaintexts = vec![auto_ctx.p_full.clone()];
-        let (auto_out, _) = auto_input.reconstruct(&mut auto_circuit);
+        let auto_out = auto_input.reconstruct(&mut auto_circuit);
         auto_circuit.output(vec![auto_out]);
 
         let mut manual_circuit = PolyCircuit::<DCRTPoly>::new();
@@ -1661,7 +1563,7 @@ mod tests {
         let mut manual_input =
             NestedRnsPoly::input(manual_ctx.clone(), Some(q_level), None, &mut manual_circuit);
         manual_input.max_plaintexts = vec![manual_ctx.p_full.clone()];
-        let (manual_out, _) =
+        let manual_out =
             manual_input.full_reduce(&mut manual_circuit).reconstruct(&mut manual_circuit);
         manual_circuit.output(vec![manual_out]);
 
@@ -1800,7 +1702,6 @@ mod tests {
                     None,
                     input.enable_levels,
                     vec![operand_bound.clone()],
-                    None,
                 )
             })
             .collect::<Vec<_>>();
@@ -1808,7 +1709,7 @@ mod tests {
         for poly in auto_inputs.iter().skip(1) {
             auto_sum = auto_sum.add(poly, &mut auto_circuit);
         }
-        let (auto_out, _) = auto_sum.reconstruct(&mut auto_circuit);
+        let auto_out = auto_sum.reconstruct(&mut auto_circuit);
         auto_circuit.output(vec![auto_out]);
 
         let mut manual_circuit = PolyCircuit::<DCRTPoly>::new();
@@ -1827,7 +1728,6 @@ mod tests {
                     None,
                     input.enable_levels,
                     vec![operand_bound.clone()],
-                    None,
                 )
             })
             .collect::<Vec<_>>();
@@ -1841,7 +1741,7 @@ mod tests {
             .expect("manual input chain must contain a final operand")
             .full_reduce(&mut manual_circuit);
         manual_sum = manual_sum.add(&last_input, &mut manual_circuit);
-        let (manual_out, _) = manual_sum.reconstruct(&mut manual_circuit);
+        let manual_out = manual_sum.reconstruct(&mut manual_circuit);
         manual_circuit.output(vec![manual_out]);
 
         let encoded_input = encode_nested_rns_poly(
@@ -1969,7 +1869,6 @@ mod tests {
                     None,
                     input.enable_levels,
                     vec![operand_bound.clone()],
-                    None,
                 )
             })
             .collect::<Vec<_>>();
@@ -1977,7 +1876,7 @@ mod tests {
         for poly in auto_inputs.iter().skip(1) {
             auto_product = auto_product.mul(poly, &mut auto_circuit);
         }
-        let (auto_out, _) = auto_product.reconstruct(&mut auto_circuit);
+        let auto_out = auto_product.reconstruct(&mut auto_circuit);
         auto_circuit.output(vec![auto_out]);
 
         let mut manual_circuit = PolyCircuit::<DCRTPoly>::new();
@@ -2001,7 +1900,6 @@ mod tests {
                     None,
                     input.enable_levels,
                     vec![operand_bound.clone()],
-                    None,
                 )
             })
             .collect::<Vec<_>>();
@@ -2015,7 +1913,7 @@ mod tests {
             .expect("manual input chain must contain a final operand")
             .full_reduce(&mut manual_circuit);
         manual_product = manual_product.mul(&last_input, &mut manual_circuit);
-        let (manual_out, _) = manual_product.reconstruct(&mut manual_circuit);
+        let manual_out = manual_product.reconstruct(&mut manual_circuit);
         manual_circuit.output(vec![manual_out]);
 
         let encoded_input = encode_nested_rns_poly(
@@ -2066,12 +1964,10 @@ mod tests {
         let poly_a = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
         let poly_b = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
         let sum = poly_a.add(&poly_b, &mut circuit);
-        let (out, approx_error) = sum.reconstruct(&mut circuit);
+        let out = sum.reconstruct(&mut circuit);
         circuit.output(vec![out]);
         println!("non-free depth {}", circuit.non_free_depth());
         println!("circuit size {:?}", circuit.count_gates_by_type_vec());
-        println!("approx_error {}", approx_error);
-        assert_eq!(approx_error, BigUint::ZERO);
 
         let modulus = params.modulus();
         // println!("modulus {:?}", &modulus);
@@ -2103,12 +1999,10 @@ mod tests {
         let poly_a = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
         let poly_b = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
         let sum = poly_a.sub(&poly_b, &mut circuit);
-        let (out, approx_error) = sum.reconstruct(&mut circuit);
+        let out = sum.reconstruct(&mut circuit);
         circuit.output(vec![out]);
         println!("non-free depth {}", circuit.non_free_depth());
         println!("circuit size {:?}", circuit.count_gates_by_type_vec());
-        println!("approx_error {}", approx_error);
-        assert_eq!(approx_error, BigUint::ZERO);
 
         let modulus = params.modulus();
         // println!("modulus {:?}", &modulus);
@@ -2145,12 +2039,10 @@ mod tests {
         let poly_a = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
         let poly_b = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
         let sum = poly_a.mul(&poly_b, &mut circuit);
-        let (out, approx_error) = sum.reconstruct(&mut circuit);
+        let out = sum.reconstruct(&mut circuit);
         circuit.output(vec![out]);
         println!("non-free depth {}", circuit.non_free_depth());
         println!("circuit size {:?}", circuit.count_gates_by_type_vec());
-        println!("approx_error {}", approx_error);
-        assert_eq!(approx_error, BigUint::ZERO);
 
         let modulus = params.modulus();
         let (q_moduli, _, _) = params.to_crt();
@@ -2200,10 +2092,8 @@ mod tests {
         let poly_a = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
         let poly_b = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
         let product = poly_a.mul(&poly_b, &mut circuit);
-        let (out, approx_error) = product.reconstruct(&mut circuit);
+        let out = product.reconstruct(&mut circuit);
         circuit.output(vec![out]);
-        println!("approx_error {}", approx_error);
-        assert_eq!(approx_error, BigUint::ZERO);
 
         let modulus = params.modulus();
         let a_inputs =
@@ -2229,10 +2119,8 @@ mod tests {
     ) {
         let poly = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
         let product = poly.const_mul(&tower_constants, &mut circuit);
-        let (out, approx_error) = product.reconstruct(&mut circuit);
+        let out = product.reconstruct(&mut circuit);
         circuit.output(vec![out]);
-        println!("approx_error {}", approx_error);
-        assert_eq!(approx_error, BigUint::ZERO);
 
         let a_inputs =
             encode_nested_rns_poly(P_MODULI_BITS, MAX_UNREDUCED_MULS, &params, &a_value, None);
@@ -2259,7 +2147,7 @@ mod tests {
         let poly_a = NestedRnsPoly::input(ctx.clone(), enable_levels, None, &mut circuit);
         let poly_b = NestedRnsPoly::input(ctx, enable_levels, None, &mut circuit);
         let product = poly_a.mul(&poly_b, &mut circuit);
-        let (out, _) = product.reconstruct(&mut circuit);
+        let out = product.reconstruct(&mut circuit);
         circuit.output(vec![out]);
 
         let (q_moduli, _, _) = params.to_crt();

@@ -229,7 +229,7 @@ fn build_ntt_circuit_cpu(
         false,
         q_level,
     ));
-    let input = NestedRnsPoly::input(ctx.clone(), q_level, &mut circuit);
+    let input = NestedRnsPoly::input(ctx.clone(), q_level, None, &mut circuit);
     let inverse = inverse_ntt(params, &mut circuit, &input, num_slots);
     let output = forward_ntt(params, &mut circuit, &inverse, num_slots);
     let reconstructed = output.reconstruct(&mut circuit);
@@ -255,7 +255,7 @@ fn build_ntt_circuit_gpu(
         false,
         q_level,
     ));
-    let input = NestedRnsPoly::input(ctx.clone(), q_level, &mut circuit);
+    let input = NestedRnsPoly::input(ctx.clone(), q_level, None, &mut circuit);
     let inverse = inverse_ntt(params, &mut circuit, &input, num_slots);
     let output = forward_ntt(params, &mut circuit, &inverse, num_slots);
     let reconstructed = output.reconstruct(&mut circuit);

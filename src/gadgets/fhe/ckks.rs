@@ -1566,7 +1566,7 @@ mod tests {
             &params,
             &secret_key,
             mul_relin_extra_levels,
-            0.0,
+            INPUT_ERROR_SIGMA,
         );
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = create_test_context_with_params_scale_and_relin_levels_and_error_sigma(
@@ -1867,7 +1867,7 @@ mod tests {
             &params,
             &secret_key,
             mul_relin_extra_levels,
-            0.0,
+            INPUT_ERROR_SIGMA,
         );
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = create_test_context_with_params_scale_and_relin_levels_and_error_sigma(

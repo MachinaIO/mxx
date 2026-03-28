@@ -51,7 +51,7 @@ use rand::Rng;
 use std::{env, fs, path::Path, sync::Arc, time::Instant};
 use tracing::{debug, info};
 
-const DEFAULT_RING_DIM: u32 = 1 << 5;
+const DEFAULT_RING_DIM: u32 = 1 << 12;
 const DEFAULT_NUM_SLOTS: usize = 2;
 const DEFAULT_CRT_BITS: usize = 24;
 const DEFAULT_P_MODULI_BITS: usize = 7;
@@ -370,7 +370,7 @@ fn find_crt_depth_for_ntt(cfg: &NttConfig, q_level: Option<usize>) -> (usize, DC
         );
 
         if *error < BigDecimal::from_biguint(threshold.clone(), 0) {
-            let selected_crt_depth = crt_depth + 1;
+            let selected_crt_depth = crt_depth;
             let selected_params =
                 DCRTPolyParams::new(cfg.ring_dim, selected_crt_depth, cfg.crt_bits, cfg.base_bits);
             let (selected_active_q_moduli, _, _) =

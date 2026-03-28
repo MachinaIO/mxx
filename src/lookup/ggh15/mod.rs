@@ -350,15 +350,9 @@ mod tests {
         let reveal_plaintexts = vec![true];
         let bgg_poly_encoding_sampler =
             BGGPolyEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
-        let slot_secret_mats =
-            bgg_poly_encoding_sampler.sample_slot_secret_mats(&params, num_slots);
         let pubkeys = bgg_pubkey_sampler.sample(&params, &tag_bytes, &reveal_plaintexts);
-        let poly_encodings = bgg_poly_encoding_sampler.sample(
-            &params,
-            &pubkeys,
-            &[plaintext_bytes],
-            Some(&slot_secret_mats),
-        );
+        let (poly_encodings, slot_secret_mats) = bgg_poly_encoding_sampler
+            .sample_with_fresh_slot_secret_mats(&params, &pubkeys, &[plaintext_bytes]);
         let enc_one_poly = poly_encodings[0].clone();
         let enc_input_poly = poly_encodings[1].clone();
 
@@ -401,8 +395,12 @@ mod tests {
         let c_b0_compact_bytes_by_slot = GGH15BGGPolyEncodingPltEvaluator::<
             DCRTPolyMatrix,
             DCRTPolyHashSampler<Keccak256>,
-        >::build_c_b0_compact_bytes_by_slot(
-            &params, &s_vec, &b0_matrix, &slot_secret_mats
+        >::build_c_b0_compact_bytes_by_slot::<DCRTPolyUniformSampler>(
+            &params,
+            &s_vec,
+            &b0_matrix,
+            &slot_secret_mats,
+            None,
         );
         let poly_evaluator = GGH15BGGPolyEncodingPltEvaluator::<
             DCRTPolyMatrix,

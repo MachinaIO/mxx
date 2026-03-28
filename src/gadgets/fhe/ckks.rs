@@ -2,6 +2,10 @@ use crate::{
     circuit::PolyCircuit,
     gadgets::{
         arith::{NestedRnsPoly, NestedRnsPolyContext},
+        mod_switch::nested_rns::{
+            mod_down_levels_reconstruct_error_upper_bound,
+            mod_down_one_level_reconstruct_error_upper_bound,
+        },
         ntt::{forward_ntt, inverse_ntt},
     },
     poly::{
@@ -25,6 +29,11 @@ fn validate_num_slots<P: Poly>(params: &P::Params, num_slots: usize) {
 
 fn biguint_product(values: &[u64]) -> BigUint {
     values.iter().fold(BigUint::from(1u64), |acc, &value| acc * BigUint::from(value))
+}
+
+fn div_ceil_biguint_by_u64(value: BigUint, divisor: u64) -> BigUint {
+    let adjustment = BigUint::from(divisor.saturating_sub(1));
+    (value + adjustment) / BigUint::from(divisor)
 }
 
 #[derive(Debug, Clone)]
@@ -132,13 +141,85 @@ pub struct CKKSCiphertext<P: Poly> {
     pub ctx: Arc<CKKSContext<P>>,
     pub c0: NestedRnsPoly<P>,
     pub c1: NestedRnsPoly<P>,
+    pub error_bounds: (BigUint, BigUint),
 }
 
 impl<P: Poly + 'static> CKKSCiphertext<P> {
-    pub fn new(ctx: Arc<CKKSContext<P>>, c0: NestedRnsPoly<P>, c1: NestedRnsPoly<P>) -> Self {
-        let ciphertext = Self { ctx, c0, c1 };
+    pub fn new(
+        ctx: Arc<CKKSContext<P>>,
+        c0: NestedRnsPoly<P>,
+        c1: NestedRnsPoly<P>,
+        error_bounds: Option<(BigUint, BigUint)>,
+    ) -> Self {
+        let ciphertext = Self {
+            ctx,
+            c0,
+            c1,
+            error_bounds: error_bounds.unwrap_or_else(Self::zero_error_bounds),
+        };
         ciphertext.assert_consistent();
         ciphertext
+    }
+
+    fn zero_error_bounds() -> (BigUint, BigUint) {
+        (BigUint::from(0u64), BigUint::from(0u64))
+    }
+
+    fn add_error_bounds(lhs: &(BigUint, BigUint), rhs: &(BigUint, BigUint)) -> (BigUint, BigUint) {
+        (&lhs.0 + &rhs.0, &lhs.1 + &rhs.1)
+    }
+
+    fn mul_component_error_bound(&self) -> BigUint {
+        mod_down_levels_reconstruct_error_upper_bound(
+            &self.ctx.nested_rns.q_moduli()[..self.ctx.ciphertext_level_offset()],
+            &self.ctx.nested_rns.full_reduce_max_plaintexts[..self.ctx.ciphertext_level_offset()],
+        )
+    }
+
+    // Track the semantic per-branch error after one ciphertext-level rescale.
+    //
+    // 1. self.error_bounds.{0,1}: Each coefficient-domain branch already carries a pre-rescale
+    //    approximation error. This is the same branchwise ModDown error previously computed in the
+    //    tests for `mul()`.
+    //
+    // 2. branch_rescale_remainder_bound: `mod_down_one_level` satisfies a = q_L * b + r with 0 <= r
+    //    < q_L for each branch, so one new remainder term is introduced by the last one-level drop.
+    //
+    // 3. c{0,1}_visible_bound: The pre-rescale branch error and the one-level remainder are the
+    //    "visible" part of the post-rescale branch error, so they both shrink by one division by
+    //    q_L.
+    //
+    // 4. c{0,1}_removed_native_quotient_bound: These differ from the remainder term above. They
+    //    bound hidden q_L-multiples already present in the removed tower before rescale: a_tilde_L
+    //    = [a]_qL + q_L * e_L. Such native q_L-multiples cancel in a full reconstruct over Q, but a
+    //    one-level branchwise rescale exposes the quotient e_L on the kept basis.
+    fn rescale_error_bounds(
+        &self,
+        coeff_ciphertext: &Self,
+        removed_modulus_u64: u64,
+    ) -> (BigUint, BigUint) {
+        let branch_rescale_remainder_bound =
+            mod_down_one_level_reconstruct_error_upper_bound(removed_modulus_u64);
+        let removed_modulus = BigUint::from(removed_modulus_u64);
+        let removed_level_idx = self.active_levels() - 1;
+
+        let c0_visible_bound = div_ceil_biguint_by_u64(
+            &self.error_bounds.0 + &branch_rescale_remainder_bound,
+            removed_modulus_u64,
+        );
+        let c1_visible_bound = div_ceil_biguint_by_u64(
+            &self.error_bounds.1 + &branch_rescale_remainder_bound,
+            removed_modulus_u64,
+        );
+        let c0_removed_native_quotient_bound =
+            &coeff_ciphertext.c0.max_plaintexts[removed_level_idx] / &removed_modulus;
+        let c1_removed_native_quotient_bound =
+            &coeff_ciphertext.c1.max_plaintexts[removed_level_idx] / &removed_modulus;
+
+        (
+            &c0_visible_bound + c0_removed_native_quotient_bound,
+            &c1_visible_bound + c1_removed_native_quotient_bound,
+        )
     }
 
     pub fn input(
@@ -158,13 +239,13 @@ impl<P: Poly + 'static> CKKSCiphertext<P> {
             Some(ctx.ciphertext_level_offset()),
             circuit,
         );
-        Self::new(ctx, c0, c1)
+        Self::new(ctx, c0, c1, None)
     }
 
     pub fn alloc_eval_keys(ctx: Arc<CKKSContext<P>>, circuit: &mut PolyCircuit<P>) -> Self {
         let c0 = NestedRnsPoly::input(ctx.nested_rns.clone(), None, None, circuit);
         let c1 = NestedRnsPoly::input(ctx.nested_rns.clone(), None, None, circuit);
-        Self::new(ctx, c0, c1)
+        Self::new(ctx, c0, c1, None)
     }
 
     pub fn add(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
@@ -173,6 +254,7 @@ impl<P: Poly + 'static> CKKSCiphertext<P> {
             self.ctx.clone(),
             self.c0.add(&other.c0, circuit),
             self.c1.add(&other.c1, circuit),
+            Some(Self::add_error_bounds(&self.error_bounds, &other.error_bounds)),
         )
     }
 
@@ -196,7 +278,8 @@ impl<P: Poly + 'static> CKKSCiphertext<P> {
             Self::relinearize_d2_via_mod_up_down(self.ctx.as_ref(), &d2, eval_keys, circuit);
         let c0 = d0.add(&relin_c0, circuit);
         let c1 = d1.add(&relin_c1, circuit);
-        Self::new(self.ctx.clone(), c0, c1)
+        let component_bound = self.mul_component_error_bound();
+        Self::new(self.ctx.clone(), c0, c1, Some((component_bound.clone(), component_bound)))
     }
 
     pub fn rescale(&self, circuit: &mut PolyCircuit<P>) -> Self {
@@ -209,10 +292,15 @@ impl<P: Poly + 'static> CKKSCiphertext<P> {
         );
 
         let coeff_ciphertext = self.to_coeff_domain(circuit);
+        let removed_modulus_u64 =
+            self.ctx.nested_rns.q_moduli()[self.ctx.ciphertext_level_offset() + active_levels - 1];
+        let rescaled_error_bounds =
+            self.rescale_error_bounds(&coeff_ciphertext, removed_modulus_u64);
         let lowered = Self::new(
             self.ctx.clone(),
             coeff_ciphertext.c0.mod_down_one_level(circuit),
             coeff_ciphertext.c1.mod_down_one_level(circuit),
+            Some(rescaled_error_bounds),
         );
         lowered.to_eval_domain(circuit)
     }
@@ -222,6 +310,7 @@ impl<P: Poly + 'static> CKKSCiphertext<P> {
             self.ctx.clone(),
             inverse_ntt(&self.ctx.params, circuit, &self.c0, self.ctx.num_slots),
             inverse_ntt(&self.ctx.params, circuit, &self.c1, self.ctx.num_slots),
+            Some(self.error_bounds.clone()),
         )
     }
 
@@ -230,6 +319,7 @@ impl<P: Poly + 'static> CKKSCiphertext<P> {
             self.ctx.clone(),
             forward_ntt(&self.ctx.params, circuit, &self.c0, self.ctx.num_slots),
             forward_ntt(&self.ctx.params, circuit, &self.c1, self.ctx.num_slots),
+            Some(self.error_bounds.clone()),
         )
     }
 
@@ -357,6 +447,7 @@ impl<P: Poly + 'static> CKKSCiphertext<P> {
                 Some(levels),
                 self.c1.max_plaintexts[..levels].to_vec(),
             ),
+            Some(self.error_bounds.clone()),
         )
     }
 
@@ -411,10 +502,7 @@ mod tests {
         circuit::{PolyCircuit, evaluable::PolyVec},
         gadgets::{
             arith::DEFAULT_MAX_UNREDUCED_MULS,
-            mod_switch::nested_rns::{
-                mod_down_levels_reconstruct_error_upper_bound,
-                mod_down_one_level_reconstruct_error_upper_bound,
-            },
+            mod_switch::nested_rns::mod_down_levels_reconstruct_error_upper_bound,
             ntt::encode_nested_rns_poly_vec_with_offset,
         },
         lookup::{poly::PolyPltEvaluator, poly_vec::PolyVecPltEvaluator},
@@ -427,7 +515,7 @@ mod tests {
         utils::{gen_biguint_for_modulus, mod_inverse},
     };
     use num_bigint::BigUint;
-    use num_traits::{One, ToPrimitive, Zero};
+    use num_traits::ToPrimitive;
     use rand::{SeedableRng, rngs::StdRng};
     use rayon::prelude::*;
 
@@ -577,134 +665,129 @@ mod tests {
         forward.min(backward)
     }
 
-    fn div_ceil_biguint_by_u64(value: BigUint, divisor: u64) -> BigUint {
-        let adjustment = BigUint::from(divisor.saturating_sub(1));
-        (value + adjustment) / BigUint::from(divisor)
-    }
+    // fn full_reduce_output_max_plaintext_bound(p_moduli: &[u64], q_modulus: u64) -> BigUint {
+    //     let sum_p_moduli =
+    //         p_moduli.iter().fold(BigUint::ZERO, |acc, &p_i| acc + BigUint::from(p_i));
+    //     let modulus_count =
+    //         u64::try_from(p_moduli.len()).expect("p_moduli length must fit in u64 for bounds");
+    //     let numerator = (sum_p_moduli + BigUint::from(modulus_count)) * BigUint::from(q_modulus);
+    //     div_ceil_biguint_by_u64(numerator, 4)
+    // }
 
-    fn full_reduce_output_max_plaintext_bound(p_moduli: &[u64], q_modulus: u64) -> BigUint {
-        let sum_p_moduli =
-            p_moduli.iter().fold(BigUint::ZERO, |acc, &p_i| acc + BigUint::from(p_i));
-        let modulus_count =
-            u64::try_from(p_moduli.len()).expect("p_moduli length must fit in u64 for bounds");
-        let numerator = (sum_p_moduli + BigUint::from(modulus_count)) * BigUint::from(q_modulus);
-        div_ceil_biguint_by_u64(numerator, 4)
-    }
+    // fn full_reduce_wrap_upper_bound(p_moduli: &[u64], q_modulus: u64, coeff: &BigUint) -> BigUint
+    // {     let q_modulus_big = BigUint::from(q_modulus);
+    //     assert!(coeff < &q_modulus_big, "full_reduce coefficient must be a canonical q-residue");
+    //     let full_reduce_bound = full_reduce_output_max_plaintext_bound(p_moduli, q_modulus);
+    //     (&full_reduce_bound - BigUint::from(1u64) - coeff) / q_modulus_big
+    // }
 
-    fn full_reduce_wrap_upper_bound(p_moduli: &[u64], q_modulus: u64, coeff: &BigUint) -> BigUint {
-        let q_modulus_big = BigUint::from(q_modulus);
-        assert!(coeff < &q_modulus_big, "full_reduce coefficient must be a canonical q-residue");
-        let full_reduce_bound = full_reduce_output_max_plaintext_bound(p_moduli, q_modulus);
-        (&full_reduce_bound - BigUint::from(1u64) - coeff) / q_modulus_big
-    }
+    // fn fast_conversion_unsigned_lift(
+    //     moduli: &[u64],
+    //     residues: &[u64],
+    //     target_moduli: &[u64],
+    //     p_moduli: &[u64],
+    // ) -> (BigUint, BigUint, BigUint) {
+    //     assert_eq!(moduli.len(), residues.len(), "CRT residues must match modulus count");
+    //     let modulus = biguint_product(moduli);
+    //     let value =
+    //         moduli.iter().zip(residues.iter()).fold(BigUint::ZERO, |acc, (&q_i, &residue)| {
+    //             let q_i_big = BigUint::from(q_i);
+    //             let q_hat = &modulus / &q_i_big;
+    //             let q_hat_mod_q_i =
+    //                 (&q_hat % &q_i_big).to_u64().expect("CRT residue must fit in u64");
+    //             let q_hat_inv = mod_inverse(q_hat_mod_q_i, q_i).expect("CRT inverse must exist");
+    //             (acc + BigUint::from(residue) * q_hat * BigUint::from(q_hat_inv)) % &modulus
+    //         });
+    //     let mut full_reduce_wrap_slack = BigUint::ZERO;
+    //     let lifted = moduli.iter().enumerate().fold(BigUint::ZERO, |acc, (idx, &q_i)| {
+    //         let q_i_big = BigUint::from(q_i);
+    //         let q_hat = &modulus / &q_i_big;
+    //         let q_hat_mod_q_i = (&q_hat % &q_i_big).to_u64().expect("CRT residue must fit in
+    // u64");         let q_hat_inv = mod_inverse(q_hat_mod_q_i, q_i).expect("CRT inverse must
+    // exist");         let coeff = (BigUint::from(residues[idx]) * BigUint::from(q_hat_inv)) %
+    // &q_i_big;         full_reduce_wrap_slack += full_reduce_wrap_upper_bound(p_moduli, q_i,
+    // &coeff);         acc + coeff * q_hat
+    //     });
+    //     let delta = &lifted - &value;
+    //     let e_plus = delta / &modulus;
+    //     let accumulator_full_reduce_wrap_slack = target_moduli
+    //         .iter()
+    //         .map(|&q_i| full_reduce_wrap_upper_bound(p_moduli, q_i, &BigUint::ZERO))
+    //         .max()
+    //         .unwrap_or(BigUint::ZERO);
+    //     let impl_error_upper =
+    //         &e_plus + full_reduce_wrap_slack + accumulator_full_reduce_wrap_slack;
+    //     (lifted, e_plus, impl_error_upper)
+    // }
 
-    fn fast_conversion_unsigned_lift(
-        moduli: &[u64],
-        residues: &[u64],
-        target_moduli: &[u64],
-        p_moduli: &[u64],
-    ) -> (BigUint, BigUint, BigUint) {
-        assert_eq!(moduli.len(), residues.len(), "CRT residues must match modulus count");
-        let modulus = biguint_product(moduli);
-        let value =
-            moduli.iter().zip(residues.iter()).fold(BigUint::ZERO, |acc, (&q_i, &residue)| {
-                let q_i_big = BigUint::from(q_i);
-                let q_hat = &modulus / &q_i_big;
-                let q_hat_mod_q_i =
-                    (&q_hat % &q_i_big).to_u64().expect("CRT residue must fit in u64");
-                let q_hat_inv = mod_inverse(q_hat_mod_q_i, q_i).expect("CRT inverse must exist");
-                (acc + BigUint::from(residue) * q_hat * BigUint::from(q_hat_inv)) % &modulus
-            });
-        let mut full_reduce_wrap_slack = BigUint::ZERO;
-        let lifted = moduli.iter().enumerate().fold(BigUint::ZERO, |acc, (idx, &q_i)| {
-            let q_i_big = BigUint::from(q_i);
-            let q_hat = &modulus / &q_i_big;
-            let q_hat_mod_q_i = (&q_hat % &q_i_big).to_u64().expect("CRT residue must fit in u64");
-            let q_hat_inv = mod_inverse(q_hat_mod_q_i, q_i).expect("CRT inverse must exist");
-            let coeff = (BigUint::from(residues[idx]) * BigUint::from(q_hat_inv)) % &q_i_big;
-            full_reduce_wrap_slack += full_reduce_wrap_upper_bound(p_moduli, q_i, &coeff);
-            acc + coeff * q_hat
-        });
-        let delta = &lifted - &value;
-        let e_plus = delta / &modulus;
-        let accumulator_full_reduce_wrap_slack = target_moduli
-            .iter()
-            .map(|&q_i| full_reduce_wrap_upper_bound(p_moduli, q_i, &BigUint::ZERO))
-            .max()
-            .unwrap_or(BigUint::ZERO);
-        let impl_error_upper =
-            &e_plus + full_reduce_wrap_slack + accumulator_full_reduce_wrap_slack;
-        (lifted, e_plus, impl_error_upper)
-    }
+    // fn worst_case_residues(moduli: &[u64]) -> Vec<u64> {
+    //     moduli.iter().map(|&q_i| q_i.saturating_sub(1)).collect()
+    // }
 
-    fn worst_case_residues(moduli: &[u64]) -> Vec<u64> {
-        moduli.iter().map(|&q_i| q_i.saturating_sub(1)).collect()
-    }
+    // fn estimate_prefix_mod_up_error_bound(
+    //     ctx: &CKKSContext<DCRTPoly>,
+    //     active_levels: usize,
+    // ) -> BigUint {
+    //     let q_moduli = ctx.nested_rns.q_moduli();
+    //     let source_moduli =
+    //         &q_moduli[ctx.ciphertext_level_offset()..ctx.ciphertext_level_offset() +
+    // active_levels];     let target_moduli = &q_moduli[..ctx.ciphertext_level_offset()];
+    //     let source_residues = worst_case_residues(source_moduli);
+    //     let (_, _, impl_error_upper) = fast_conversion_unsigned_lift(
+    //         source_moduli,
+    //         &source_residues,
+    //         target_moduli,
+    //         &ctx.nested_rns.p_moduli,
+    //     );
+    //     impl_error_upper
+    // }
 
-    fn estimate_prefix_mod_up_error_bound(
-        ctx: &CKKSContext<DCRTPoly>,
-        active_levels: usize,
-    ) -> BigUint {
-        let q_moduli = ctx.nested_rns.q_moduli();
-        let source_moduli =
-            &q_moduli[ctx.ciphertext_level_offset()..ctx.ciphertext_level_offset() + active_levels];
-        let target_moduli = &q_moduli[..ctx.ciphertext_level_offset()];
-        let source_residues = worst_case_residues(source_moduli);
-        let (_, _, impl_error_upper) = fast_conversion_unsigned_lift(
-            source_moduli,
-            &source_residues,
-            target_moduli,
-            &ctx.nested_rns.p_moduli,
-        );
-        impl_error_upper
-    }
+    // fn estimate_prefix_mod_down_error_bound(
+    //     ctx: &CKKSContext<DCRTPoly>,
+    //     active_levels: usize,
+    //     remove_levels: usize,
+    // ) -> BigUint {
+    //     let q_moduli = ctx.nested_rns.q_moduli();
+    //     let removed_moduli = &q_moduli[..remove_levels];
+    //     let target_moduli = &q_moduli[remove_levels..remove_levels + active_levels];
+    //     let removed_residues = worst_case_residues(removed_moduli);
+    //     let (_, _, impl_error_upper) = fast_conversion_unsigned_lift(
+    //         removed_moduli,
+    //         &removed_residues,
+    //         target_moduli,
+    //         &ctx.nested_rns.p_moduli,
+    //     );
+    //     impl_error_upper
+    // }
 
-    fn estimate_prefix_mod_down_error_bound(
-        ctx: &CKKSContext<DCRTPoly>,
-        active_levels: usize,
-        remove_levels: usize,
-    ) -> BigUint {
-        let q_moduli = ctx.nested_rns.q_moduli();
-        let removed_moduli = &q_moduli[..remove_levels];
-        let target_moduli = &q_moduli[remove_levels..remove_levels + active_levels];
-        let removed_residues = worst_case_residues(removed_moduli);
-        let (_, _, impl_error_upper) = fast_conversion_unsigned_lift(
-            removed_moduli,
-            &removed_residues,
-            target_moduli,
-            &ctx.nested_rns.p_moduli,
-        );
-        impl_error_upper
-    }
-
-    fn round_div_by_scale(value: &BigUint, scale: &BigUint) -> BigUint {
-        (value + (scale / 2u32)) / scale
-    }
+    // fn round_div_by_scale(value: &BigUint, scale: &BigUint) -> BigUint {
+    //     (value + (scale / 2u32)) / scale
+    // }
 
     fn seeded_random_slots(modulus: &BigUint, num_slots: usize, seed: u64) -> Vec<BigUint> {
         let mut rng = StdRng::seed_from_u64(seed);
         (0..num_slots).map(|_| gen_biguint_for_modulus(&mut rng, modulus)).collect()
     }
 
-    fn reduce_slots_modulo(slots: &[BigUint], modulus: &BigUint) -> Vec<BigUint> {
-        slots.iter().map(|slot| slot % modulus).collect()
-    }
+    // fn reduce_slots_modulo(slots: &[BigUint], modulus: &BigUint) -> Vec<BigUint> {
+    //     slots.iter().map(|slot| slot % modulus).collect()
+    // }
 
-    fn eval_poly_from_slots_modulus(
-        params: &DCRTPolyParams,
-        slots: &[BigUint],
-        modulus: &BigUint,
-    ) -> DCRTPoly {
-        DCRTPoly::from_biguints_eval(params, &reduce_slots_modulo(slots, modulus))
-    }
+    // fn eval_poly_from_slots_modulus(
+    //     params: &DCRTPolyParams,
+    //     slots: &[BigUint],
+    //     modulus: &BigUint,
+    // ) -> DCRTPoly {
+    //     DCRTPoly::from_biguints_eval(params, &reduce_slots_modulo(slots, modulus))
+    // }
 
-    fn eval_poly_project_to_modulus(
-        params: &DCRTPolyParams,
-        poly: &DCRTPoly,
-        modulus: &BigUint,
-    ) -> DCRTPoly {
-        eval_poly_from_slots_modulus(params, &poly.eval_slots(), modulus)
-    }
+    // fn eval_poly_project_to_modulus(
+    //     params: &DCRTPolyParams,
+    //     poly: &DCRTPoly,
+    //     modulus: &BigUint,
+    // ) -> DCRTPoly {
+    //     eval_poly_from_slots_modulus(params, &poly.eval_slots(), modulus)
+    // }
 
     fn sample_ternary_secret_key(params: &DCRTPolyParams) -> DCRTPoly {
         let sampler = DCRTPolyUniformSampler::new();
@@ -726,23 +809,23 @@ mod tests {
         (c0, c1)
     }
 
-    fn encrypt_zero_error_ciphertext_with_small_mask(
-        ctx: &CKKSContext<DCRTPoly>,
-        plaintext_slots: &[BigUint],
-        secret_key: &DCRTPoly,
-        _active_levels: usize,
-        seed: u64,
-        small_mask_modulus: &BigUint,
-    ) -> (DCRTPoly, DCRTPoly) {
-        let c1_slots = seeded_random_slots(small_mask_modulus, ctx.num_slots, seed)
-            .into_iter()
-            .map(|slot| if slot.is_zero() { BigUint::one() } else { slot })
-            .collect::<Vec<_>>();
-        let c1 = DCRTPoly::from_biguints_eval(&ctx.params, &c1_slots);
-        let plaintext = DCRTPoly::from_biguints_eval(&ctx.params, plaintext_slots);
-        let c0 = plaintext - &(c1.clone() * secret_key);
-        (c0, c1)
-    }
+    // fn encrypt_zero_error_ciphertext_with_small_mask(
+    //     ctx: &CKKSContext<DCRTPoly>,
+    //     plaintext_slots: &[BigUint],
+    //     secret_key: &DCRTPoly,
+    //     _active_levels: usize,
+    //     seed: u64,
+    //     small_mask_modulus: &BigUint,
+    // ) -> (DCRTPoly, DCRTPoly) {
+    //     let c1_slots = seeded_random_slots(small_mask_modulus, ctx.num_slots, seed)
+    //         .into_iter()
+    //         .map(|slot| if slot.is_zero() { BigUint::one() } else { slot })
+    //         .collect::<Vec<_>>();
+    //     let c1 = DCRTPoly::from_biguints_eval(&ctx.params, &c1_slots);
+    //     let plaintext = DCRTPoly::from_biguints_eval(&ctx.params, plaintext_slots);
+    //     let c0 = plaintext - &(c1.clone() * secret_key);
+    //     (c0, c1)
+    // }
 
     fn ciphertext_inputs_from_polys(
         ctx: &CKKSContext<DCRTPoly>,
@@ -1213,13 +1296,8 @@ mod tests {
             active_levels,
         );
 
-        let component_bound = mod_down_levels_reconstruct_error_upper_bound(
-            &ctx.nested_rns.q_moduli()[..ctx.ciphertext_level_offset()],
-            &ctx.nested_rns.full_reduce_max_plaintexts[..ctx.ciphertext_level_offset()],
-        );
-        println!("component_bound: {component_bound}");
         let secret_key_bound = BigUint::from(ctx.params.ring_dimension());
-        let total_bound = &component_bound * (BigUint::from(1u64) + secret_key_bound);
+        let total_bound = &product.error_bounds.0 + (&secret_key_bound * &product.error_bounds.1);
         println!("total_bound: {total_bound}");
 
         actual_coeffs.iter().zip(expected_coeffs.iter()).enumerate().for_each(
@@ -1269,13 +1347,7 @@ mod tests {
         let rhs = CKKSCiphertext::input(ctx.clone(), Some(active_levels), &mut circuit);
         let eval_keys = CKKSCiphertext::alloc_eval_keys(ctx.clone(), &mut circuit);
         let product = lhs.mul(&rhs, &eval_keys, &mut circuit);
-        let coeff_product = product.to_coeff_domain(&mut circuit);
-        let lowered = CKKSCiphertext::new(
-            ctx.clone(),
-            coeff_product.c0.mod_down_one_level(&mut circuit),
-            coeff_product.c1.mod_down_one_level(&mut circuit),
-        );
-        let rescaled = lowered.to_eval_domain(&mut circuit);
+        let rescaled = product.rescale(&mut circuit);
         assert_eq!(rescaled.active_levels(), active_levels - 1);
         let rescaled_c0_poly = rescaled.c0.reconstruct(&mut circuit);
         let rescaled_c1_poly = rescaled.c1.reconstruct(&mut circuit);
@@ -1375,26 +1447,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         let secret_key_bound = BigUint::from(ctx.params.ring_dimension());
-        let branch_pre_rescale_bound = mod_down_levels_reconstruct_error_upper_bound(
-            &ctx.nested_rns.q_moduli()[..ctx.ciphertext_level_offset()],
-            &ctx.nested_rns.full_reduce_max_plaintexts[..ctx.ciphertext_level_offset()],
-        );
-        let branch_rescale_remainder_bound =
-            mod_down_one_level_reconstruct_error_upper_bound(removed_modulus_u64);
-        let branch_visible_rescale_bound = div_ceil_biguint_by_u64(
-            branch_pre_rescale_bound + branch_rescale_remainder_bound,
-            removed_modulus_u64,
-        );
-        let removed_level_idx = active_levels - 1;
-        let c0_removed_native_quotient_bound =
-            &coeff_product.c0.max_plaintexts[removed_level_idx] / &removed_modulus;
-        let c1_removed_native_quotient_bound =
-            &coeff_product.c1.max_plaintexts[removed_level_idx] / &removed_modulus;
-        let c0_post_rescale_bound =
-            &branch_visible_rescale_bound + c0_removed_native_quotient_bound;
-        let c1_post_rescale_bound =
-            &branch_visible_rescale_bound + c1_removed_native_quotient_bound;
-        let total_bound = &c0_post_rescale_bound + (&secret_key_bound * &c1_post_rescale_bound);
+        let total_bound = &rescaled.error_bounds.0 + (&secret_key_bound * &rescaled.error_bounds.1);
+        println!("total_bound: {total_bound}");
 
         actual_coeffs.iter().zip(expected_coeffs.iter()).enumerate().for_each(
             |(coeff_idx, (actual, expected))| {
@@ -1535,7 +1589,8 @@ mod tests {
             &ctx.nested_rns.full_reduce_max_plaintexts[..ctx.ciphertext_level_offset()],
         );
         let secret_key_bound = BigUint::from(ctx.params.ring_dimension());
-        let total_bound = &component_bound * (BigUint::from(1u64) + secret_key_bound);
+        let one_plus_key_bound = BigUint::from(1u64) + &secret_key_bound;
+        let total_bound = &component_bound * &one_plus_key_bound;
         println!("total_bound={}", total_bound);
 
         actual_coeffs.iter().zip(expected_coeffs.iter()).enumerate().for_each(

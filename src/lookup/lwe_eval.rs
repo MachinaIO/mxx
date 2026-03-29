@@ -186,8 +186,7 @@ where
         _: usize,
     ) -> BggEncoding<M> {
         let z = input.plaintext.as_ref().expect("the BGG encoding should revealed plaintext");
-        let z_u64 = u64::try_from(z.to_const_int())
-            .expect("BGG encoding plaintext constant term must fit in u64 for public lookup");
+        let z_u64 = z.const_coeff_u64();
         debug!("public lookup length is {}", plt.len());
         let (k, y_k) = plt
             .get(params, z_u64)
@@ -461,8 +460,7 @@ mod test {
         assert_eq!(result_encoding.len(), 1);
         let result_encoding = &result_encoding[0];
         assert_eq!(result_encoding.pubkey, result_pubkey.clone());
-        let expected_input = u64::try_from(plaintexts[0].to_const_int())
-            .expect("test plaintext constant term must fit in u64");
+        let expected_input = plaintexts[0].const_coeff_u64();
         let expected_plaintext_elem = plt.get(&params, expected_input).unwrap().1;
         let expected_plaintext = DCRTPoly::from_elem_to_constant(&params, &expected_plaintext_elem);
         assert_eq!(result_encoding.plaintext.clone().unwrap(), expected_plaintext.clone());

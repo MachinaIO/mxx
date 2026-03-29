@@ -190,8 +190,7 @@ where
     HS: PolyHashSampler<[u8; 32], M = M>,
     for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
 {
-    let x_u64 = u64::try_from(x.to_const_int())
-        .expect("BGG encoding plaintext constant term must fit in u64 for public lookup");
+    let x_u64 = x.const_coeff_u64();
     let (k, y) = plt
         .get(params, x_u64)
         .unwrap_or_else(|| panic!("{:?} not found in LUT for gate {}", x_u64, gate_id));

@@ -162,8 +162,7 @@ async fn test_gpu_ggh15_plt_eval_multi_inputs() {
         let result_encoding_i = &result_encoding[i];
         assert_eq!(result_encoding_i.pubkey, result_pubkey[i].clone());
 
-        let expected_input = u64::try_from(plaintexts[i].to_const_int())
-            .expect("test plaintext constant term must fit in u64");
+        let expected_input = plaintexts[i].const_coeff_u64();
         let expected_plaintext_elem = plt.get(&params, expected_input).unwrap().1;
         let expected_plaintext =
             GpuDCRTPoly::from_elem_to_constant(&params, &expected_plaintext_elem);

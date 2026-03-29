@@ -166,7 +166,11 @@ pub trait Poly:
     }
     fn to_bool_vec(&self) -> Vec<bool>;
     fn to_compact_bytes(&self) -> Vec<u8>;
-    fn to_const_int(&self) -> usize;
+    /// Returns the constant coefficient as a `u64`.
+    ///
+    /// This function ignores all non-constant coefficients. Implementations must
+    /// panic if the constant coefficient cannot be represented as `u64`.
+    fn const_coeff_u64(&self) -> u64;
 
     /// Reads a polynomial with id from files under the given directory.
     /// Uses synchronous `std::fs::read` since polynomial files are typically ~0.4MB,

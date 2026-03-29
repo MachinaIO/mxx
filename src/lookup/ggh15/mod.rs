@@ -174,8 +174,7 @@ mod tests {
         let result_encoding = &result_encoding[0];
         assert_eq!(result_encoding.pubkey, result_pubkey.clone());
 
-        let expected_input = u64::try_from(plaintexts[0].to_const_int())
-            .expect("test plaintext constant term must fit in u64");
+        let expected_input = plaintexts[0].const_coeff_u64();
         let expected_plaintext_elem = plt.get(&params, expected_input).unwrap().1;
         let expected_plaintext = DCRTPoly::from_elem_to_constant(&params, &expected_plaintext_elem);
         assert_eq!(result_encoding.plaintext.clone().unwrap(), expected_plaintext.clone());
@@ -294,8 +293,7 @@ mod tests {
             let result_encoding_i = &result_encoding[i];
             assert_eq!(result_encoding_i.pubkey, result_pubkey[i].clone());
 
-            let expected_input = u64::try_from(plaintexts[i].to_const_int())
-                .expect("test plaintext constant term must fit in u64");
+            let expected_input = plaintexts[i].const_coeff_u64();
             let expected_plaintext_elem = plt.get(&params, expected_input).unwrap().1;
             let expected_plaintext =
                 DCRTPoly::from_elem_to_constant(&params, &expected_plaintext_elem);

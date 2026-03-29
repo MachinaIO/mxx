@@ -6,7 +6,7 @@ use crate::{
     utils::chunk_size_for,
 };
 use num_bigint::BigUint;
-use num_traits::{One, Zero};
+use num_traits::{One, ToPrimitive, Zero};
 use openfhe::{
     cxx::UniquePtr,
     ffi::{self, DCRTPoly as DCRTPolyCxx},
@@ -355,17 +355,11 @@ impl Poly for DCRTPoly {
             .collect()
     }
 
-    fn to_const_int(&self) -> usize {
-        let mut sum = 0usize;
-        for (i, coeff) in self.coeffs().into_iter().enumerate() {
-            if i >= usize::BITS as usize {
-                break;
-            }
-            // Convert BigUint to usize safely, saturating if too large
-            let coeff_val = coeff.value().try_into().unwrap_or(usize::MAX);
-            sum = sum.saturating_add((1usize << i).saturating_mul(coeff_val));
-        }
-        sum
+    fn const_coeff_u64(&self) -> u64 {
+        let coeff = self.coeffs().into_iter().next().expect("constant coefficient is missing");
+        coeff.value().to_u64().unwrap_or_else(|| {
+            panic!("constant coefficient does not fit in u64: {}", coeff.value())
+        })
     }
 }
 
@@ -611,7 +605,7 @@ mod tests {
     use rand::prelude::*;
 
     #[test]
-    fn test_const_int_roundtrip() {
+    fn test_const_coeff_u64_extracts_constant_term() {
         let mut rng = rand::rng();
         let params = DCRTPolyParams::default();
 
@@ -619,11 +613,19 @@ mod tests {
             let value = rng.random_range(0..(2_i32.pow(params.ring_dimension() - 1) as usize));
             let lsb_poly = DCRTPoly::from_usize_to_lsb(&params, value);
             let poly = DCRTPoly::from_usize_to_constant(&params, value);
-            let back = poly.to_const_int();
-            let back_from_lsb = lsb_poly.to_const_int();
-            assert_eq!(value, back);
-            assert_eq!(value, back_from_lsb);
+            let back = poly.const_coeff_u64();
+            let back_from_lsb = lsb_poly.const_coeff_u64();
+            assert_eq!(value as u64, back);
+            assert_eq!((value & 1) as u64, back_from_lsb);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "constant coefficient does not fit in u64")]
+    fn test_const_coeff_u64_panics_when_constant_term_exceeds_u64() {
+        let params = DCRTPolyParams::new(8, 4, 20, 1);
+        let poly = DCRTPoly::from_biguint_to_constant(&params, BigUint::from(u64::MAX) + 1u32);
+        let _ = poly.const_coeff_u64();
     }
 
     #[test]

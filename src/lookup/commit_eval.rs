@@ -349,8 +349,7 @@ where
             .plaintext
             .as_ref()
             .expect("the BGG encoding should reveal plaintext for public lookup");
-        let x_u64 = u64::try_from(x.to_const_int())
-            .expect("BGG encoding plaintext constant term must fit in u64 for public lookup");
+        let x_u64 = x.const_coeff_u64();
         let (k, y) = plt
             .get(params, x_u64)
             .unwrap_or_else(|| panic!("{:?} not found in LUT for gate {}", x_u64, gate_id));
@@ -813,8 +812,7 @@ mod tests {
         let result_encoding = &result_encoding[0];
         assert_eq!(result_encoding.pubkey, result_pubkey.clone());
 
-        let expected_input = u64::try_from(plaintexts[0].to_const_int())
-            .expect("test plaintext constant term must fit in u64");
+        let expected_input = plaintexts[0].const_coeff_u64();
         let expected_plaintext_elem = plt.get(&params, expected_input).unwrap().1;
         let expected_plaintext = DCRTPoly::from_elem_to_constant(&params, &expected_plaintext_elem);
         assert_eq!(result_encoding.plaintext.clone().unwrap(), expected_plaintext.clone());
@@ -967,8 +965,7 @@ mod tests {
         assert_eq!(result_encoding.len(), input_size);
 
         for (idx, encoding) in result_encoding.iter().enumerate() {
-            let expected_input = u64::try_from(plaintexts[idx].to_const_int())
-                .expect("test plaintext constant term must fit in u64");
+            let expected_input = plaintexts[idx].const_coeff_u64();
             let expected_plaintext_elem = plt.get(&params, expected_input).unwrap().1;
             let expected_plaintext =
                 DCRTPoly::from_elem_to_constant(&params, &expected_plaintext_elem);

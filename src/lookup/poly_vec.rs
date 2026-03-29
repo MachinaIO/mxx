@@ -55,7 +55,7 @@ mod tests {
     }
 
     #[test]
-    fn test_poly_vec_plt_public_lookup_evaluates_each_coefficient_of_each_slot_with_lut() {
+    fn test_poly_vec_plt_public_lookup_uses_only_constant_term_per_slot() {
         let params = DCRTPolyParams::new(8, 2, 17, 1);
         let input_coeffs_by_slot: Vec<Vec<u32>> =
             vec![vec![0, 15, 1, 14, 2, 13, 3, 12], vec![4, 11, 5, 10, 6, 9, 7, 8]];
@@ -91,11 +91,7 @@ mod tests {
             input_coeffs_by_slot
                 .iter()
                 .map(|coeffs| {
-                    let expected_coeffs = coeffs
-                        .iter()
-                        .map(|&coeff| lut_output(coeff as u64) as u32)
-                        .collect::<Vec<_>>();
-                    DCRTPoly::from_u32s(&params, &expected_coeffs)
+                    DCRTPoly::from_usize_to_constant(&params, lut_output(coeffs[0] as u64) as usize)
                 })
                 .collect(),
         );

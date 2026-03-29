@@ -1,10 +1,8 @@
 use crate::{
     circuit::gate::GateId,
-    element::PolyElem,
     lookup::{PltEvaluator, PublicLut},
     poly::Poly,
 };
-use num_traits::ToPrimitive;
 
 #[derive(Debug, Clone)]
 pub struct PolyPltEvaluator {}
@@ -19,28 +17,17 @@ impl<P: Poly + 'static> PltEvaluator<P> for PolyPltEvaluator {
         gate_id: GateId,
         lut_id: usize,
     ) -> P {
-        let output_coeffs = input
-            .coeffs()
-            .into_iter()
-            .enumerate()
-            .map(|(coeff_idx, coeff)| {
-                let x_i = coeff.value().to_u64().unwrap_or_else(|| {
-                    panic!(
-                        "lookup input coefficient must fit in u64; gate_id: {:?}, lut_id: {:?}, coeff_idx: {:?}, coeff: {:?}",
-                        gate_id, lut_id, coeff_idx, coeff
-                    )
-                });
-                plt.get(params, x_i)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "output of the lookup evaluation not found; gate_id: {:?}, lut_id: {:?}, coeff_idx: {:?}, input_coeff_u64: {:?}",
-                            gate_id, lut_id, coeff_idx, x_i
-                        )
-                    })
-                    .1
+        let input_const = input.const_coeff_u64();
+        let output_const = plt
+            .get(params, input_const)
+            .unwrap_or_else(|| {
+                panic!(
+                    "lookup output not found for input constant term; gate_id: {:?}, lut_id: {:?}, input_const_u64: {:?}",
+                    gate_id, lut_id, input_const
+                )
             })
-            .collect::<Vec<_>>();
-        P::from_coeffs(params, &output_coeffs)
+            .1;
+        P::from_elem_to_constant(params, &output_const)
     }
 }
 
@@ -59,9 +46,12 @@ impl PolyPltEvaluator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::poly::{
-        PolyParams,
-        dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+    use crate::{
+        element::PolyElem,
+        poly::{
+            PolyParams,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
     };
 
     fn lut_output(k: u64) -> u64 {
@@ -69,7 +59,7 @@ mod tests {
     }
 
     #[test]
-    fn test_poly_plt_public_lookup_evaluates_each_coefficient_with_lut() {
+    fn test_poly_plt_public_lookup_uses_only_constant_term() {
         let params = DCRTPolyParams::new(8, 2, 17, 1);
         let input_coeffs: Vec<u32> = vec![0, 15, 1, 14, 2, 13, 3, 12];
         let input = DCRTPoly::from_u32s(&params, &input_coeffs);
@@ -95,9 +85,8 @@ mod tests {
         let one = DCRTPoly::const_one(&params);
         let output = evaluator.public_lookup(&params, &lut, &one, &input, GateId(7), 42);
 
-        let expected_coeffs: Vec<u32> =
-            input_coeffs.iter().map(|&coeff| lut_output(coeff as u64) as u32).collect();
-        let expected = DCRTPoly::from_u32s(&params, &expected_coeffs);
+        let expected =
+            DCRTPoly::from_usize_to_constant(&params, lut_output(input_coeffs[0] as u64) as usize);
 
         assert_eq!(output, expected);
     }

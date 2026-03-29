@@ -468,8 +468,11 @@ async fn test_gpu_ggh15_modq_arith() {
     info!("sampled {} public keys", pubkeys.len());
 
     let enc_setup_start = Instant::now();
-    let encoding_sampler =
-        BGGEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
+    let encoding_sampler = BGGEncodingSampler::<GpuDCRTPolyUniformSampler>::new(
+        &params,
+        &secrets,
+        Some(cfg.error_sigma),
+    );
     drop(secrets);
     let encodings = encoding_sampler.sample(&params, &pubkeys, &plaintext_inputs);
     drop(plaintext_inputs);

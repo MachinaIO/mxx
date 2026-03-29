@@ -32,6 +32,7 @@ use mxx::{
     utils::{bigdecimal_bits_ceil, gen_biguint_for_modulus},
 };
 use num_bigint::BigUint;
+use rayon::prelude::*;
 use std::{env, fs, path::Path, sync::Arc, time::Instant};
 use tracing::info;
 
@@ -397,7 +398,7 @@ async fn test_gpu_ggh15_modq_arith() {
     let expected =
         input_values.iter().fold(BigUint::from(1u64), |acc, value| (acc * value) % &active_q);
     let plaintext_inputs: Vec<GpuDCRTPoly> = input_values
-        .iter()
+        .par_iter()
         .flat_map(|value| {
             encode_nested_rns_poly(
                 cfg.p_moduli_bits,
@@ -420,6 +421,7 @@ async fn test_gpu_ggh15_modq_arith() {
     let dry_eval_start = Instant::now();
     let dry_one = GpuDCRTPoly::const_one(&params);
     let dry_inputs = plaintext_inputs.clone();
+    info!("starting dry-run evaluation to verify correctness before GPU evaluation");
     let dry_out =
         dry_circuit.eval(&params, dry_one, dry_inputs, Some(&dry_plt_evaluator), None, None);
     info!("dry eval elapsed_ms={:.3}", dry_eval_start.elapsed().as_secs_f64() * 1000.0);

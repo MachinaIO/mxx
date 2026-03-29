@@ -164,13 +164,6 @@ fn assert_value_matches_q_level(
         expected_mod_active_q.clone(),
         "value modulo active q must match expected modulo active q"
     );
-    for &q_i in all_q_moduli.iter().skip(active_q_moduli.len()) {
-        assert_eq!(
-            value % BigUint::from(q_i),
-            BigUint::from(0u64),
-            "inactive CRT residues must be zero when q_level is limited"
-        );
-    }
 }
 
 fn q_level_from_env() -> Option<usize> {

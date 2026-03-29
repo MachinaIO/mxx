@@ -3,11 +3,11 @@
 use keccak_asm::Keccak256;
 use mxx::{
     bgg::sampler::{BGGPolyEncodingSampler, BGGPublicKeySampler},
-    circuit::{PolyCircuit, PolyVec},
+    circuit::PolyCircuit,
     element::PolyElem,
     gadgets::{
+        arith::encode_nested_rns_poly_with_offset,
         fhe::ckks::{CKKSCiphertext, CKKSContext, sample_relinearization_eval_key_slots},
-        ntt::encode_nested_rns_poly_vec_with_offset,
     },
     lookup::ggh15_eval::{GGH15BGGPolyEncodingPltEvaluator, GGH15BGGPubKeyPltEvaluator},
     matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
@@ -34,14 +34,15 @@ use mxx::{
 };
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
+use rayon::prelude::*;
 use std::{env, fs, path::Path, sync::Arc, time::Instant};
 use tracing::{debug, info};
 
-const DEFAULT_RING_DIM: u32 = 1 << 4;
+const DEFAULT_RING_DIM: u32 = 1 << 3;
 const DEFAULT_NUM_SLOTS: usize = 2;
 const DEFAULT_CRT_BITS: usize = 24;
 const DEFAULT_P_MODULI_BITS: usize = 7;
-const DEFAULT_SCALE: u64 = 1 << 24;
+const DEFAULT_SCALE: u64 = 256;
 const DEFAULT_BASE_BITS: u32 = 12;
 const DEFAULT_ACTIVE_LEVELS: usize = 5;
 const DEFAULT_RELIN_EXTRA_LEVELS: usize = 1;
@@ -298,14 +299,52 @@ fn encode_eval_slots_with_offset_gpu(
     slots: &[BigUint],
     level_offset: usize,
     active_levels: usize,
-) -> Vec<PolyVec<GpuDCRTPoly>> {
-    encode_nested_rns_poly_vec_with_offset::<GpuDCRTPoly>(
-        params,
-        ctx.nested_rns.as_ref(),
-        slots,
-        level_offset,
-        Some(active_levels),
-    )
+) -> Vec<Vec<Vec<u8>>> {
+    let slot_parallelism = detected_gpu_device_count();
+    let device_ids = detected_gpu_device_ids();
+    assert!(
+        slot_parallelism > 0,
+        "at least one GPU device is required for CKKS GPU input encoding"
+    );
+    assert!(
+        slot_parallelism <= device_ids.len(),
+        "detected GPU count must not exceed detected GPU id count: count={}, ids={}",
+        slot_parallelism,
+        device_ids.len()
+    );
+
+    let mut encoded_slot_bytes = Vec::with_capacity(slots.len());
+    for (batch_idx, slot_batch) in slots.chunks(slot_parallelism).enumerate() {
+        let batch_device_ids = &device_ids[..slot_batch.len()];
+        debug!(
+            "encoding slot batch {}: slot_count={} device_ids={:?}",
+            batch_idx,
+            slot_batch.len(),
+            batch_device_ids
+        );
+        let batch_results = slot_batch
+            .par_iter()
+            .enumerate()
+            .map(|(offset, slot)| {
+                let device_id = batch_device_ids[offset];
+                let local_params = params.params_for_device(device_id);
+                encode_nested_rns_poly_with_offset::<GpuDCRTPoly>(
+                    ctx.nested_rns.p_moduli_bits,
+                    ctx.nested_rns.max_unreduced_muls,
+                    &local_params,
+                    slot,
+                    level_offset,
+                    Some(active_levels),
+                )
+                .into_iter()
+                .map(|poly| poly.to_compact_bytes())
+                .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        encoded_slot_bytes.extend(batch_results);
+    }
+
+    encoded_slot_bytes
 }
 
 fn ciphertext_inputs_from_polys(
@@ -315,44 +354,70 @@ fn ciphertext_inputs_from_polys(
     c1: &DCRTPoly,
     level_offset: usize,
     active_levels: usize,
-) -> Vec<PolyVec<GpuDCRTPoly>> {
+) -> Vec<Vec<Vec<u8>>> {
+    let c0_slots = c0.eval_slots();
+    let c1_slots = c1.eval_slots();
+    assert!(
+        ctx.num_slots <= c0_slots.len(),
+        "c0 eval slot count must cover num_slots: eval_slots={} num_slots={}",
+        c0_slots.len(),
+        ctx.num_slots
+    );
+    assert!(
+        ctx.num_slots <= c1_slots.len(),
+        "c1 eval slot count must cover num_slots: eval_slots={} num_slots={}",
+        c1_slots.len(),
+        ctx.num_slots
+    );
     let c0_inputs = encode_eval_slots_with_offset_gpu(
         params,
         ctx,
-        &c0.eval_slots(),
+        &c0_slots[..ctx.num_slots],
         level_offset,
         active_levels,
     );
     let c1_inputs = encode_eval_slots_with_offset_gpu(
         params,
         ctx,
-        &c1.eval_slots(),
+        &c1_slots[..ctx.num_slots],
         level_offset,
         active_levels,
     );
-    [c0_inputs, c1_inputs].concat()
-}
-
-fn poly_vecs_to_plaintext_rows(
-    encoded_inputs: Vec<PolyVec<GpuDCRTPoly>>,
-    num_slots: usize,
-) -> Vec<Vec<Arc<[u8]>>> {
-    encoded_inputs
+    assert_eq!(c0_inputs.len(), c1_inputs.len(), "c0 and c1 encoded slot counts must match");
+    c0_inputs
         .into_iter()
-        .map(|poly_vec| {
-            let slot_bytes = poly_vec
-                .into_inner()
-                .into_iter()
-                .map(|slot_poly| Arc::<[u8]>::from(slot_poly.to_compact_bytes()))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                slot_bytes.len(),
-                num_slots,
-                "each encoded PolyVec must contain one polynomial per slot"
-            );
-            slot_bytes
+        .zip(c1_inputs)
+        .map(|(mut c0_slot_inputs, c1_slot_inputs)| {
+            c0_slot_inputs.extend(c1_slot_inputs);
+            c0_slot_inputs
         })
         .collect()
+}
+
+fn slot_major_compact_bytes_to_plaintext_rows(
+    encoded_slot_inputs: Vec<Vec<Vec<u8>>>,
+    num_slots: usize,
+) -> Vec<Vec<Arc<[u8]>>> {
+    assert_eq!(
+        encoded_slot_inputs.len(),
+        num_slots,
+        "encoded slot input count must match num_slots"
+    );
+    let flattened_input_count =
+        encoded_slot_inputs.first().map(|slot_inputs| slot_inputs.len()).unwrap_or(0);
+    assert!(
+        encoded_slot_inputs.iter().all(|slot_inputs| slot_inputs.len() == flattened_input_count),
+        "each encoded slot must contain the same flattened input count"
+    );
+
+    let mut plaintext_rows =
+        (0..flattened_input_count).map(|_| Vec::with_capacity(num_slots)).collect::<Vec<_>>();
+    for slot_inputs in encoded_slot_inputs {
+        for (input_idx, bytes) in slot_inputs.into_iter().enumerate() {
+            plaintext_rows[input_idx].push(Arc::<[u8]>::from(bytes));
+        }
+    }
+    plaintext_rows
 }
 
 fn build_ckks_mul_rescale_circuit_gpu(
@@ -496,39 +561,62 @@ async fn test_gpu_ggh15_ckks_mul() {
         "slot input materialization started: num_slots={} flattened_input_count={} active_levels={} relin_extra_levels={}",
         cfg.num_slots, flattened_input_count, cfg.active_levels, cfg.relinearization_extra_levels
     );
-    let encoded_input_poly_vecs = [
-        ciphertext_inputs_from_polys(
-            &params,
-            ctx.as_ref(),
-            &lhs_c0,
-            &lhs_c1,
-            cfg.relinearization_extra_levels,
-            cfg.active_levels,
-        ),
-        ciphertext_inputs_from_polys(
-            &params,
-            ctx.as_ref(),
-            &rhs_c0,
-            &rhs_c1,
-            cfg.relinearization_extra_levels,
-            cfg.active_levels,
-        ),
-        ciphertext_inputs_from_polys(
-            &params,
-            ctx.as_ref(),
-            &eval_key_polys.b0,
-            &eval_key_polys.b1,
-            0,
-            cfg.crt_depth(),
-        ),
-    ]
-    .concat();
-    assert_eq!(
-        encoded_input_poly_vecs.len(),
-        flattened_input_count,
-        "flattened encoded inputs must match circuit input count"
+    let lhs_input_bytes_by_slot = ciphertext_inputs_from_polys(
+        &params,
+        ctx.as_ref(),
+        &lhs_c0,
+        &lhs_c1,
+        cfg.relinearization_extra_levels,
+        cfg.active_levels,
     );
-    let plaintext_inputs = poly_vecs_to_plaintext_rows(encoded_input_poly_vecs, cfg.num_slots);
+    let rhs_input_bytes_by_slot = ciphertext_inputs_from_polys(
+        &params,
+        ctx.as_ref(),
+        &rhs_c0,
+        &rhs_c1,
+        cfg.relinearization_extra_levels,
+        cfg.active_levels,
+    );
+    let eval_key_input_bytes_by_slot = ciphertext_inputs_from_polys(
+        &params,
+        ctx.as_ref(),
+        &eval_key_polys.b0,
+        &eval_key_polys.b1,
+        0,
+        cfg.crt_depth(),
+    );
+    assert_eq!(
+        lhs_input_bytes_by_slot.len(),
+        cfg.num_slots,
+        "lhs encoded slot count must match num_slots"
+    );
+    assert_eq!(
+        rhs_input_bytes_by_slot.len(),
+        cfg.num_slots,
+        "rhs encoded slot count must match num_slots"
+    );
+    assert_eq!(
+        eval_key_input_bytes_by_slot.len(),
+        cfg.num_slots,
+        "eval key encoded slot count must match num_slots"
+    );
+    let encoded_input_bytes_by_slot = lhs_input_bytes_by_slot
+        .into_iter()
+        .zip(rhs_input_bytes_by_slot)
+        .zip(eval_key_input_bytes_by_slot)
+        .map(|((mut lhs_slot_inputs, rhs_slot_inputs), eval_key_slot_inputs)| {
+            lhs_slot_inputs.extend(rhs_slot_inputs);
+            lhs_slot_inputs.extend(eval_key_slot_inputs);
+            lhs_slot_inputs
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        encoded_input_bytes_by_slot.first().map(|slot_inputs| slot_inputs.len()).unwrap_or(0),
+        flattened_input_count,
+        "flattened encoded inputs per slot must match circuit input count"
+    );
+    let plaintext_inputs =
+        slot_major_compact_bytes_to_plaintext_rows(encoded_input_bytes_by_slot, cfg.num_slots);
     info!(
         "slot input materialization elapsed_ms={:.3}",
         input_materialization_start.elapsed().as_secs_f64() * 1000.0

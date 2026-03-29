@@ -9,6 +9,9 @@ fn validate_positive_parallelism(name: &str, value: usize) -> usize {
 }
 
 #[cfg(feature = "gpu")]
+#[allow(dead_code)]
+// This helper is kept for callers that want an explicit GPU-device cap, but
+// `resolve_circuit_parallel_gates` intentionally does not call it.
 fn validate_gpu_parallelism(name: &str, value: usize) -> usize {
     let device_count = default_gpu_parallelism();
     assert!(
@@ -34,22 +37,16 @@ pub fn circuit_parallel_gates() -> Option<usize> {
 /// When `override_parallelism` is `None`, this preserves the existing
 /// `MXX_CIRCUIT_PARALLEL_GATES` behavior.
 pub fn resolve_circuit_parallel_gates(override_parallelism: Option<usize>) -> Option<usize> {
-    let override_parallelism = override_parallelism.map(|value| {
-        let value = validate_positive_parallelism("circuit gate parallelism", value);
-        #[cfg(feature = "gpu")]
-        let value = validate_gpu_parallelism("circuit gate parallelism", value);
-        value
-    });
+    let override_parallelism = override_parallelism
+        .map(|value| validate_positive_parallelism("circuit gate parallelism", value));
     let parsed = std::env::var("MXX_CIRCUIT_PARALLEL_GATES")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|n| *n > 0);
     #[cfg(feature = "gpu")]
     {
-        let value = override_parallelism.unwrap_or_else(|| {
-            let parsed = parsed.unwrap_or_else(default_gpu_parallelism);
-            validate_gpu_parallelism("MXX_CIRCUIT_PARALLEL_GATES", parsed)
-        });
+        let value =
+            override_parallelism.unwrap_or_else(|| parsed.unwrap_or_else(default_gpu_parallelism));
         Some(value)
     }
     #[cfg(not(feature = "gpu"))]
@@ -118,6 +115,24 @@ pub fn bgg_poly_encoding_slot_parallelism() -> usize {
     }
 }
 
+/// `SLOT_TRANSFER_SLOT_PARALLELISM`: max number of slot auxiliary samples processed in parallel.
+/// Default: GPU feature enabled => detected GPU device count, otherwise 30.
+pub fn slot_transfer_slot_parallelism() -> usize {
+    let parsed = std::env::var("SLOT_TRANSFER_SLOT_PARALLELISM")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0);
+    #[cfg(feature = "gpu")]
+    {
+        let device_count = default_gpu_parallelism();
+        parsed.unwrap_or(device_count).min(device_count).max(1)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        parsed.unwrap_or(30)
+    }
+}
+
 /// `BLOCK_SIZE`: generic processing block size used in utilities (default: 100).
 pub fn block_size() -> usize {
     std::env::var("BLOCK_SIZE").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(100)
@@ -148,4 +163,14 @@ pub fn wee25_commit_cache_persist_batch() -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_WEE25_COMMIT_CACHE_PERSIST_BATCH)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_circuit_parallel_gates;
+
+    #[test]
+    fn resolve_circuit_parallel_gates_preserves_large_override() {
+        assert_eq!(resolve_circuit_parallel_gates(Some(usize::MAX)), Some(usize::MAX));
+    }
 }

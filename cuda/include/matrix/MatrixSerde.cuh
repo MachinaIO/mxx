@@ -21,6 +21,12 @@ extern "C"
         int format,
         GpuEventSet **out_events);
 
+    int gpu_matrix_store_const_coeff_batch(
+        const GpuMatrix *mat,
+        uint64_t *words_out,
+        size_t words_per_poly,
+        GpuEventSet **out_events);
+
     int gpu_matrix_store_compact_bytes(
         GpuMatrix *mat,
         uint8_t *payload_out,

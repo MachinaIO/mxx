@@ -5,7 +5,9 @@ use mxx::{
     circuit::PolyCircuit,
     commit::wee25::{Wee25Commit, Wee25PublicParams},
     element::PolyElem,
-    gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly},
+    gadgets::arith::{
+        DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly,
+    },
     lookup::{
         commit_eval::{CommitBGGEncodingPltEvaluator, CommitBGGPubKeyPltEvaluator},
         poly::PolyPltEvaluator,
@@ -30,6 +32,7 @@ use tracing::info;
 const RING_DIM: u32 = 1 << 8;
 const CRT_BITS: usize = 24;
 const P_MODULI_BITS: usize = 6;
+const MAX_UNREDUCED_MULS: usize = DEFAULT_MAX_UNREDUCED_MULS;
 const SCALE: u64 = 1 << 7;
 const BASE_BITS: u32 = 12;
 const MAX_CRT_DEPTH: usize = 32;
@@ -102,22 +105,18 @@ fn build_modq_arith_circuit(
     params: &DCRTPolyParams,
     q_level: Option<usize>,
 ) -> (PolyCircuit<DCRTPoly>, Arc<NestedRnsPolyContext>) {
+    let height = 1usize;
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
     let ctx = Arc::new(NestedRnsPolyContext::setup(
         &mut circuit,
         params,
         P_MODULI_BITS,
+        MAX_UNREDUCED_MULS,
         SCALE,
         false,
         q_level,
     ));
-
-    let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-    let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-
-    let prod = poly_a.mul_full_reduce(&poly_b, None, &mut circuit);
-    let out = prod.reconstruct(None, &mut circuit);
-    circuit.output(vec![out]);
+    NestedRnsPoly::benchmark_multiplication_tree(ctx.clone(), &mut circuit, height, q_level);
     (circuit, ctx)
 }
 
@@ -125,21 +124,18 @@ fn build_modq_arith_value_circuit(
     params: &DCRTPolyParams,
     q_level: Option<usize>,
 ) -> PolyCircuit<DCRTPoly> {
+    let height = 1usize;
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
     let ctx = Arc::new(NestedRnsPolyContext::setup(
         &mut circuit,
         params,
         P_MODULI_BITS,
+        MAX_UNREDUCED_MULS,
         SCALE,
         false,
         q_level,
     ));
-
-    let poly_a = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-    let poly_b = NestedRnsPoly::input(ctx.clone(), &mut circuit);
-    let prod = poly_a.mul_full_reduce(&poly_b, None, &mut circuit);
-    let out = prod.reconstruct(None, &mut circuit);
-    circuit.output(vec![out]);
+    NestedRnsPoly::benchmark_multiplication_tree(ctx, &mut circuit, height, q_level);
     circuit
 }
 
@@ -150,7 +146,7 @@ fn find_crt_depth_for_modq_arith(
     let base = BigDecimal::from_biguint(BigUint::from(1u32) << BASE_BITS, 0);
     let error_sigma = BigDecimal::from_f64(ERROR_SIGMA).expect("valid error sigma");
     let input_bound = BigDecimal::from((1u64 << P_MODULI_BITS) - 1);
-    let e_init_norm = &error_sigma * BigDecimal::from(6u64);
+    let e_init_norm = &error_sigma * BigDecimal::from_f32(6.5).unwrap();
 
     for crt_depth in 1..=MAX_CRT_DEPTH {
         let params = DCRTPolyParams::new(RING_DIM, crt_depth, CRT_BITS, BASE_BITS);
@@ -242,8 +238,10 @@ async fn test_commit_modq_arith() {
 
     let expected = (&a_value * &b_value) % &active_q;
 
-    let a_inputs: Vec<DCRTPoly> = encode_nested_rns_poly(P_MODULI_BITS, &params, &a_value, q_level);
-    let b_inputs: Vec<DCRTPoly> = encode_nested_rns_poly(P_MODULI_BITS, &params, &b_value, q_level);
+    let a_inputs: Vec<DCRTPoly> =
+        encode_nested_rns_poly(P_MODULI_BITS, MAX_UNREDUCED_MULS, &params, &a_value, q_level);
+    let b_inputs: Vec<DCRTPoly> =
+        encode_nested_rns_poly(P_MODULI_BITS, MAX_UNREDUCED_MULS, &params, &b_value, q_level);
     let plaintext_inputs = [a_inputs.clone(), b_inputs.clone()].concat();
     let plaintext_inputs_shared = plaintext_inputs.clone();
 
@@ -255,6 +253,7 @@ async fn test_commit_modq_arith() {
         dry_one,
         plaintext_inputs_shared.clone(),
         Some(&dry_plt_evaluator),
+        None,
         None,
     );
     assert_eq!(dry_out.len(), 1, "plain PolyCircuit dry-run should output one value polynomial");
@@ -277,7 +276,7 @@ async fn test_commit_modq_arith() {
     let plt_evaluator = PolyPltEvaluator::new();
     let plain_one = DCRTPoly::const_one(&params);
     let plain_out =
-        circuit.eval(&params, plain_one, plaintext_inputs_shared, Some(&plt_evaluator), None);
+        circuit.eval(&params, plain_one, plaintext_inputs_shared, Some(&plt_evaluator), None, None);
     assert_eq!(plain_out.len(), 1);
     let plain_const = plain_out[0]
         .coeffs()
@@ -358,7 +357,7 @@ async fn test_commit_modq_arith() {
 
     let pubkey_one = enc_one.pubkey.clone();
     let pubkey_out =
-        circuit.eval(&params, pubkey_one, pubkeys[1..].to_vec(), Some(&pk_evaluator), None);
+        circuit.eval(&params, pubkey_one, pubkeys[1..].to_vec(), Some(&pk_evaluator), None, None);
     assert_eq!(pubkey_out.len(), 1);
 
     pk_evaluator.commit_all_lut_matrices::<DCRTPolyTrapdoorSampler>(
@@ -386,7 +385,8 @@ async fn test_commit_modq_arith() {
             pk_evaluator.wee25_public_params.clone(),
         );
 
-    let encoding_out = circuit.eval(&params, enc_one, input_encodings, Some(&enc_evaluator), None);
+    let encoding_out =
+        circuit.eval(&params, enc_one, input_encodings, Some(&enc_evaluator), None, None);
     assert_eq!(encoding_out.len(), 1);
 
     assert_eq!(encoding_out[0].pubkey, pubkey_out[0]);

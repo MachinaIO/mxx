@@ -139,7 +139,7 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, BigUint) {
         ));
         let plt_evaluator =
             NormPltGGH15Evaluator::new(ctx.clone(), &error_sigma, &error_sigma, None);
-        let e_init_norm = &error_sigma * BigDecimal::from(6u64);
+        let e_init_norm = &error_sigma * BigDecimal::from_f32(6.5).unwrap();
         let input_bound = BigDecimal::from((P - 1) as u64);
 
         let out_errors = circuit.simulate_max_error_norm(
@@ -309,7 +309,7 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
 
     info!("circuit eval pubkey start");
     let result_pubkey =
-        circuit.eval(&params, one_pubkey, input_pubkeys, Some(&plt_pubkey_evaluator), None);
+        circuit.eval(&params, one_pubkey, input_pubkeys, Some(&plt_pubkey_evaluator), None, None);
     info!("circuit eval pubkey done");
     assert_eq!(result_pubkey.len(), 1);
     let sample_aux_start = Instant::now();
@@ -349,7 +349,7 @@ async fn test_gpu_ggh15_modp_chain_rounding() {
 
     info!("circuit eval encoding start");
     let result_encoding =
-        circuit.eval(&params, enc_one, input_encodings, Some(&plt_encoding_evaluator), None);
+        circuit.eval(&params, enc_one, input_encodings, Some(&plt_encoding_evaluator), None, None);
     info!("circuit eval encoding done");
     assert_eq!(result_encoding.len(), 1);
 

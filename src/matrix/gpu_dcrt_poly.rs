@@ -17,7 +17,8 @@ use crate::{
                 gpu_matrix_intt_all, gpu_matrix_load_compact_bytes, gpu_matrix_load_rns_batch,
                 gpu_matrix_mul, gpu_matrix_mul_scalar, gpu_matrix_ntt_all,
                 gpu_matrix_sample_distribution, gpu_matrix_sample_p1_full,
-                gpu_matrix_store_compact_bytes, gpu_matrix_store_rns_batch, gpu_matrix_sub,
+                gpu_matrix_store_compact_bytes, gpu_matrix_store_const_coeff_batch,
+                gpu_matrix_store_rns_batch, gpu_matrix_sub,
             },
             params::DCRTPolyParams,
             poly::DCRTPoly,
@@ -435,6 +436,37 @@ impl GpuDCRTPolyMatrix {
             )
         };
         check_status(status, "gpu_matrix_store_rns_batch");
+        if !events.is_null() {
+            let wait_status = unsafe { gpu_event_set_wait(events) };
+            unsafe { gpu_event_set_destroy(events) };
+            check_status(wait_status, "gpu_event_set_wait");
+        }
+    }
+
+    pub(crate) fn store_const_coeff_words(&self, words_out: &mut [u64], words_per_poly: usize) {
+        if words_out.is_empty() || words_per_poly == 0 {
+            return;
+        }
+        let poly_count = self.nrow.saturating_mul(self.ncol);
+        let required_words = poly_count
+            .checked_mul(words_per_poly)
+            .expect("constant-coefficient output size overflow");
+        assert!(
+            words_out.len() >= required_words,
+            "constant-coefficient output buffer too small: got {}, need at least {}",
+            words_out.len(),
+            required_words
+        );
+        let mut events: *mut GpuEventSetOpaque = ptr::null_mut();
+        let status = unsafe {
+            gpu_matrix_store_const_coeff_batch(
+                self.raw,
+                words_out.as_mut_ptr(),
+                words_per_poly,
+                &mut events as *mut *mut GpuEventSetOpaque,
+            )
+        };
+        check_status(status, "gpu_matrix_store_const_coeff_batch");
         if !events.is_null() {
             let wait_status = unsafe { gpu_event_set_wait(events) };
             unsafe { gpu_event_set_destroy(events) };

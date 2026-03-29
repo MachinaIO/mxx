@@ -542,7 +542,7 @@ mod tests {
             .expect("ring dimension sqrt should exist");
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
         let m_g = (size * params.modulus_digits()) as u64;
-        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base);
+        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None);
         let modulus = params.modulus();
 
         for sample_idx in 0..4usize {
@@ -590,7 +590,7 @@ mod tests {
             .expect("ring dimension sqrt should exist");
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
         let m_g = (size * params.modulus_digits()) as u64;
-        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base);
+        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None);
         let modulus = params.modulus();
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
@@ -657,7 +657,7 @@ mod tests {
             .expect("ring dimension sqrt should exist");
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << base_params.base_bits(), 0);
         let m_g = (size * base_params.modulus_digits()) as u64;
-        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base);
+        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None);
         let modulus = base_params.modulus();
 
         struct DeviceCase {

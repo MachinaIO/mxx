@@ -3,6 +3,7 @@ mod ggh15;
 pub mod ggh15_eval;
 pub mod lwe_eval;
 pub mod poly;
+pub mod poly_vec;
 
 use crate::{circuit::gate::GateId, poly::Poly};
 use std::{fmt, sync::Arc};

@@ -83,6 +83,12 @@ unsafe extern "C" {
         format: c_int,
         out_events: *mut *mut GpuEventSetOpaque,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_store_const_coeff_batch(
+        mat: *const GpuMatrixOpaque,
+        words_out: *mut u64,
+        words_per_poly: usize,
+        out_events: *mut *mut GpuEventSetOpaque,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_store_compact_bytes(
         mat: *mut GpuMatrixOpaque,
         payload_out: *mut u8,
@@ -1039,17 +1045,22 @@ impl Poly for GpuDCRTPoly {
         self.inner().to_compact_bytes()
     }
 
-    fn to_const_int(&self) -> usize {
-        let mut sum = 0usize;
-        for (i, coeff) in self.coeffs().into_iter().enumerate() {
-            if i >= usize::BITS as usize {
-                break;
-            }
-            // Convert BigUint to usize safely, saturating if too large
-            let coeff_val = coeff.value().try_into().expect("coeff_val is an invalid usize");
-            sum = sum.saturating_add((1usize << i).saturating_mul(coeff_val));
+    fn const_coeff_u64(&self) -> u64 {
+        let poly = self.ensure_coeff_domain();
+        let level = poly.level();
+        let modulus_level = poly.params_ref().modulus_for_level(level);
+        let reconstruct_coeffs = poly.params_ref().reconstruct_coeffs_for_level(level);
+        let mut residues = vec![0u64; level + 1];
+        poly.inner.store_const_coeff_words(&mut residues, level + 1);
+
+        let mut acc = BigUint::ZERO;
+        for (limb, residue) in residues.into_iter().enumerate() {
+            acc += &reconstruct_coeffs[limb] * BigUint::from(residue);
         }
-        sum
+        let value = acc % &modulus_level;
+        value
+            .to_u64()
+            .unwrap_or_else(|| panic!("constant coefficient does not fit in u64: {value}"))
     }
 }
 
@@ -1152,7 +1163,7 @@ mod tests {
 
     #[test]
     #[sequential]
-    fn test_gpu_dcrtpoly_const_int_roundtrip() {
+    fn test_gpu_dcrtpoly_const_coeff_u64_extracts_constant_term() {
         gpu_device_sync();
         let mut rng = rand::rng();
         let params = gpu_test_params();
@@ -1163,10 +1174,10 @@ mod tests {
             let value = rng.random_range(0..max_value);
             let lsb_poly = GpuDCRTPoly::from_usize_to_lsb(&gpu_params, value);
             let poly = GpuDCRTPoly::from_usize_to_constant(&gpu_params, value);
-            let back = poly.to_const_int();
-            let back_from_lsb = lsb_poly.to_const_int();
-            assert_eq!(value, back);
-            assert_eq!(value, back_from_lsb);
+            let back = poly.const_coeff_u64();
+            let back_from_lsb = lsb_poly.const_coeff_u64();
+            assert_eq!(value as u64, back);
+            assert_eq!((value & 1) as u64, back_from_lsb);
         }
     }
 

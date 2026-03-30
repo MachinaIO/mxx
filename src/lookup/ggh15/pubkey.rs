@@ -13,7 +13,10 @@ use crate::{
     sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
     storage::{
         read::{read_bytes_from_multi_batch, read_matrix_from_multi_batch},
-        write::{GlobalTableIndex, add_lookup_buffer, get_lookup_buffer, get_lookup_buffer_bytes},
+        write::{
+            BatchLookupBuffer, GlobalTableIndex, add_lookup_buffer, get_lookup_buffer,
+            get_lookup_buffer_bytes,
+        },
     },
 };
 use dashmap::DashMap;
@@ -52,7 +55,7 @@ where
         Self { id_prefix, matrices }
     }
 
-    fn wait_then_store(self) {
+    fn into_lookup_buffer(self) -> BatchLookupBuffer {
         let mut payloads = Vec::with_capacity(self.matrices.len());
         let mut max_len = 0usize;
         for (idx, matrix) in self.matrices {
@@ -67,7 +70,11 @@ where
                 bytes.resize(padded_len, 0);
             }
         }
-        add_lookup_buffer(get_lookup_buffer_bytes(payloads, &self.id_prefix));
+        get_lookup_buffer_bytes(payloads, &self.id_prefix)
+    }
+
+    fn wait_then_store(self) {
+        let _ = add_lookup_buffer(self.into_lookup_buffer());
     }
 }
 

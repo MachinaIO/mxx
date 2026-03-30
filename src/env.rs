@@ -92,6 +92,8 @@ pub fn ggh15_gate_parallelism() -> usize {
 /// `BGG_POLY_ENCODING_SLOT_PARALLELISM`: max number of BGG poly-encoding slots to process in
 /// parallel in slot-wise arithmetic / evaluable operations.
 /// Default: GPU feature enabled => detected GPU device count, otherwise 30.
+/// GPU feature enabled: logical slot parallelism may exceed the detected device count; the GPU
+/// poly-encoding path assigns logical slots to detected devices in a round-robin pattern.
 pub fn bgg_poly_encoding_slot_parallelism() -> usize {
     let parsed = std::env::var("BGG_POLY_ENCODING_SLOT_PARALLELISM")
         .ok()
@@ -99,15 +101,7 @@ pub fn bgg_poly_encoding_slot_parallelism() -> usize {
         .filter(|n| *n > 0);
     #[cfg(feature = "gpu")]
     {
-        let device_count = default_gpu_parallelism();
-        let value = parsed.unwrap_or(device_count);
-        assert!(
-            value <= device_count,
-            "BGG_POLY_ENCODING_SLOT_PARALLELISM must be <= available GPU devices: requested={}, devices={}",
-            value,
-            device_count
-        );
-        value
+        parsed.unwrap_or_else(default_gpu_parallelism)
     }
     #[cfg(not(feature = "gpu"))]
     {

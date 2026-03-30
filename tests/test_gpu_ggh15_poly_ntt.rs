@@ -745,7 +745,7 @@ async fn test_gpu_ggh15_poly_ntt() {
         input_poly_encodings,
         Some(&plt_poly_evaluator),
         Some(&slot_poly_evaluator),
-        Some(1),
+        None,
     );
     info!(
         "poly encoding eval elapsed_ms={:.3}",

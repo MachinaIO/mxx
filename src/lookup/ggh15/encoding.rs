@@ -2,6 +2,9 @@
 #[path = "encoding_gpu.rs"]
 mod gpu;
 
+#[cfg(feature = "gpu")]
+pub(crate) use gpu::{public_lookup_gpu_device_ids, public_lookup_round_robin_device_slot};
+
 use crate::{
     bgg::{encoding::BggEncoding, public_key::BggPublicKey},
     circuit::{evaluable::Evaluable, gate::GateId},

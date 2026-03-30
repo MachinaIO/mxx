@@ -631,7 +631,7 @@ async fn test_gpu_ggh15_poly_modq_arith() {
         input_poly_encodings,
         Some(&poly_evaluator),
         None,
-        Some(1),
+        None,
     );
     info!(
         "poly encoding eval elapsed_ms={:.3}",

@@ -206,7 +206,7 @@ async fn test_gpu_ggh15_poly_encoding_plt_eval_slot_secret_relation() {
     circuit.output(vec![output]);
 
     let d = 2;
-    let num_slots = 3;
+    let num_slots = detected_gpu_params.gpu_ids().len() + 2;
     let key: [u8; 32] = rand::random();
     let bgg_pubkey_sampler =
         BGGPublicKeySampler::<_, GpuDCRTPolyHashSampler<Keccak256>>::new(key, d);

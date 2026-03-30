@@ -486,7 +486,7 @@ async fn test_gpu_ggh15_poly_slot_transfer() {
         input_poly_encodings,
         Some(&plt_poly_evaluator),
         Some(&slot_poly_evaluator),
-        Some(1),
+        None,
     );
     assert_eq!(poly_out.len(), 1);
 

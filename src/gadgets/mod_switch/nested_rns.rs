@@ -19,6 +19,34 @@
 use crate::{circuit::PolyCircuit, gadgets::arith::NestedRnsPoly, poly::Poly, utils::mod_inverse};
 use num_bigint::BigUint;
 
+fn reduce_nested_rns_terms_pairwise<P, F>(
+    mut current_layer: Vec<NestedRnsPoly<P>>,
+    circuit: &mut PolyCircuit<P>,
+    mut combine: F,
+) -> NestedRnsPoly<P>
+where
+    P: Poly,
+    F: FnMut(&NestedRnsPoly<P>, &NestedRnsPoly<P>, &mut PolyCircuit<P>) -> NestedRnsPoly<P>,
+{
+    assert!(
+        !current_layer.is_empty(),
+        "pairwise reduction requires at least one NestedRnsPoly term"
+    );
+    while current_layer.len() > 1 {
+        let mut next_layer = Vec::with_capacity((current_layer.len() + 1) / 2);
+        let mut iter = current_layer.into_iter();
+        while let Some(left) = iter.next() {
+            if let Some(right) = iter.next() {
+                next_layer.push(combine(&left, &right, circuit));
+            } else {
+                next_layer.push(left);
+            }
+        }
+        current_layer = next_layer;
+    }
+    current_layer.pop().expect("pairwise reduction must leave one term")
+}
+
 fn product_modulus(moduli: &[u64]) -> BigUint {
     moduli.iter().fold(BigUint::from(1u64), |acc, &q_i| acc * BigUint::from(q_i))
 }
@@ -231,8 +259,8 @@ impl<P: Poly> NestedRnsPoly<P> {
             .iter()
             .map(|&idx| q_moduli[self.level_offset + idx])
             .collect::<Vec<_>>();
-        let mut accumulator =
-            self.zero_poly_with_offset(output_level_offset, output_levels, circuit);
+        let mut target_terms =
+            Vec::with_capacity(source_local_indices.len() * target_global_indices.len());
         for (source_pos, &source_idx) in source_local_indices.iter().enumerate() {
             let source_modulus = q_moduli[self.level_offset + source_idx];
             let q_hat_mod_q_i = modular_product_except(&source_moduli, source_pos, source_modulus);
@@ -265,11 +293,13 @@ impl<P: Poly> NestedRnsPoly<P> {
                         circuit,
                     )
                     .const_mul(&target_scale, circuit);
-                accumulator = accumulator.add(&target_term, circuit);
+                target_terms.push(target_term);
             }
         }
 
-        accumulator
+        reduce_nested_rns_terms_pairwise(target_terms, circuit, |left, right, circuit| {
+            left.add(right, circuit)
+        })
     }
 
     /// Evaluate the paper's Algorithm 1 `ModUp` when a contiguous block of `extra_levels` moduli is

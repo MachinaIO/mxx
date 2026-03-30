@@ -143,6 +143,16 @@ pub fn lut_bytes_limit() -> Option<usize> {
     std::env::var("LUT_BYTES_LIMIT").ok().and_then(|s| s.parse::<usize>().ok())
 }
 
+/// `LUT_INDEX_SYNC_EVERY`: sync `lookup_tables.index` after this many append operations.
+/// Default: 100.
+pub fn lut_index_sync_every() -> usize {
+    std::env::var("LUT_INDEX_SYNC_EVERY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|value| validate_positive_parallelism("LUT_INDEX_SYNC_EVERY", value))
+        .unwrap_or(100)
+}
+
 const DEFAULT_WEE25_TOPJ_BATCH: usize = 200;
 const DEFAULT_WEE25_COMMIT_CACHE_PERSIST_BATCH: usize = 300;
 

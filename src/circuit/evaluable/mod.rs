@@ -1,4 +1,7 @@
 pub mod poly;
+pub mod poly_vec;
+
+pub use poly_vec::PolyVec;
 
 use num_bigint::BigUint;
 
@@ -32,7 +35,6 @@ pub trait Evaluable:
         params.clone()
     }
 
-    fn rotate(&self, params: &Self::Params, shift: i32) -> Self;
     fn small_scalar_mul(&self, params: &Self::Params, scalar: &[u32]) -> Self;
     fn large_scalar_mul(&self, params: &Self::Params, scalar: &[BigUint]) -> Self;
 }

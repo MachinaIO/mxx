@@ -1,8 +1,10 @@
+#[cfg(feature = "gpu")]
+use crate::poly::PolyParams;
 use crate::{
     bgg::public_key::{BggPublicKey, BggPublicKeyCompact},
     circuit::evaluable::Evaluable,
     matrix::PolyMatrix,
-    poly::{Poly, PolyParams},
+    poly::Poly,
 };
 use num_bigint::BigUint;
 use rayon::prelude::*;
@@ -175,19 +177,6 @@ impl<M: PolyMatrix> Evaluable for BggEncoding<M> {
     #[cfg(feature = "gpu")]
     fn params_for_eval_device(params: &Self::Params, device_id: i32) -> Self::Params {
         params.params_for_device(device_id)
-    }
-
-    fn rotate(&self, params: &Self::Params, shift: i32) -> Self {
-        let pubkey = self.pubkey.rotate(params, shift);
-        let shift = if shift >= 0 {
-            shift as usize
-        } else {
-            params.ring_dimension() as usize - shift.unsigned_abs() as usize
-        };
-        let rotate_poly = <M::P>::const_rotate_poly(params, shift);
-        let vector = self.vector.clone() * &rotate_poly;
-        let plaintext = self.plaintext.clone().map(|plaintext| plaintext * rotate_poly);
-        Self { vector, pubkey, plaintext }
     }
 
     fn small_scalar_mul(&self, params: &Self::Params, scalar: &[u32]) -> Self {

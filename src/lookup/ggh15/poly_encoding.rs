@@ -8,7 +8,7 @@ use crate::{
     lookup::{PltEvaluator, PublicLut},
     matrix::PolyMatrix,
     poly::Poly,
-    sampler::PolyHashSampler,
+    sampler::{DistType, PolyHashSampler, PolyUniformSampler},
 };
 use std::{
     marker::PhantomData,
@@ -90,25 +90,51 @@ where
     M: PolyMatrix,
     HS: PolyHashSampler<[u8; 32], M = M>,
 {
+    pub fn build_c_b0_compact_bytes_by_slot<US>(
+        params: &<M::P as Poly>::Params,
+        secret_vec: &M,
+        b0_matrix: &M,
+        slot_secret_mats: &[Vec<u8>],
+        gauss_sigma: Option<f64>,
+    ) -> Vec<Arc<[u8]>>
+    where
+        US: PolyUniformSampler<M = M>,
+        for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
+    {
+        let error_sampler = match gauss_sigma {
+            Some(sigma) if sigma == 0.0 => None,
+            None => None,
+            Some(sigma) => {
+                assert!(sigma > 0.0, "gauss_sigma must be positive when it is non-zero");
+                Some((US::new(), sigma))
+            }
+        };
+        slot_secret_mats
+            .iter()
+            .map(|slot_secret_mat_bytes| {
+                let slot_secret_mat = M::from_compact_bytes(params, slot_secret_mat_bytes);
+                let transformed_secret_vec = secret_vec.clone() * &slot_secret_mat;
+                let mut c_b0 = transformed_secret_vec * b0_matrix;
+                if let Some((error_sampler, sigma)) = &error_sampler {
+                    let error = error_sampler.sample_uniform(
+                        params,
+                        c_b0.row_size(),
+                        c_b0.col_size(),
+                        DistType::GaussDist { sigma: *sigma },
+                    );
+                    c_b0 = c_b0 + error;
+                }
+                Arc::<[u8]>::from(c_b0.into_compact_bytes())
+            })
+            .collect::<Vec<_>>()
+    }
+
     pub fn new(
         hash_key: [u8; 32],
         dir_path: PathBuf,
         checkpoint_prefix: String,
-        params: &<M::P as Poly>::Params,
-        secret_vec: M,
-        b0_matrix: M,
-        slot_secret_mats: Vec<Vec<u8>>,
+        c_b0_compact_bytes_by_slot: Vec<Arc<[u8]>>,
     ) -> Self {
-        let c_b0_compact_bytes_by_slot = slot_secret_mats
-            .into_iter()
-            .map(|slot_secret_mat_bytes| {
-                let slot_secret_mat = M::from_compact_bytes(params, &slot_secret_mat_bytes);
-                let transformed_secret_vec = secret_vec.clone() * &slot_secret_mat;
-                let c_b0 = transformed_secret_vec * &b0_matrix;
-                Arc::<[u8]>::from(c_b0.into_compact_bytes())
-            })
-            .collect::<Vec<_>>();
-
         Self { hash_key, dir_path, checkpoint_prefix, c_b0_compact_bytes_by_slot, _hs: PhantomData }
     }
 }

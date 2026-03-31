@@ -13,7 +13,10 @@ use crate::{
     sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
     storage::{
         read::{read_bytes_from_multi_batch, read_matrix_from_multi_batch},
-        write::{GlobalTableIndex, add_lookup_buffer, get_lookup_buffer, get_lookup_buffer_bytes},
+        write::{
+            BatchLookupBuffer, GlobalTableIndex, add_lookup_buffer, get_lookup_buffer,
+            get_lookup_buffer_bytes,
+        },
     },
 };
 use dashmap::DashMap;
@@ -52,7 +55,7 @@ where
         Self { id_prefix, matrices }
     }
 
-    fn wait_then_store(self) {
+    fn into_lookup_buffer(self) -> BatchLookupBuffer {
         let mut payloads = Vec::with_capacity(self.matrices.len());
         let mut max_len = 0usize;
         for (idx, matrix) in self.matrices {
@@ -67,7 +70,11 @@ where
                 bytes.resize(padded_len, 0);
             }
         }
-        add_lookup_buffer(get_lookup_buffer_bytes(payloads, &self.id_prefix));
+        get_lookup_buffer_bytes(payloads, &self.id_prefix)
+    }
+
+    fn wait_then_store(self) {
+        let _ = add_lookup_buffer(self.into_lookup_buffer());
     }
 }
 
@@ -189,6 +196,20 @@ where
             _us: PhantomData,
             _hs: PhantomData,
             _ts: PhantomData,
+        }
+    }
+
+    fn sample_error_matrix(&self, params: &<M::P as Poly>::Params, nrow: usize, ncol: usize) -> M {
+        assert!(self.error_sigma >= 0.0, "error_sigma {} must be nonnegative", self.error_sigma);
+        if self.error_sigma == 0.0 {
+            M::zero(params, nrow, ncol)
+        } else {
+            US::new().sample_uniform(
+                params,
+                nrow,
+                ncol,
+                DistType::GaussDist { sigma: self.error_sigma },
+            )
         }
     }
 
@@ -377,12 +398,7 @@ where
                 let uniform_sampler = US::new();
                 let s_g = uniform_sampler.sample_uniform(params, d, d, DistType::TernaryDist);
                 let gate_target1 = {
-                    let error = uniform_sampler.sample_uniform(
-                        params,
-                        d,
-                        b1_matrix.col_size(),
-                        DistType::GaussDist { sigma: self.error_sigma },
-                    );
+                    let error = self.sample_error_matrix(params, d, b1_matrix.col_size());
                     s_g.clone() * b1_matrix + error
                 };
                 (gate_id, state, s_g, gate_target1)
@@ -434,7 +450,6 @@ where
             .into_par_iter()
             .map(|(gate_id, state, s_g)| {
                 let hash_sampler = HS::new();
-                let uniform_sampler = US::new();
                 let out_matrix = hash_sampler.sample_hash(
                     params,
                     self.hash_key,
@@ -445,12 +460,7 @@ where
                 );
                 let mut target_gate2_identity = s_g.clone() * w_block_identity;
                 target_gate2_identity.add_in_place(&out_matrix);
-                let error = uniform_sampler.sample_uniform(
-                    params,
-                    d,
-                    m_g,
-                    DistType::GaussDist { sigma: self.error_sigma },
-                );
+                let error = self.sample_error_matrix(params, d, m_g);
                 target_gate2_identity.add_in_place(&error);
                 (gate_id, state, s_g, target_gate2_identity)
             })
@@ -503,16 +513,10 @@ where
         let stage3_entries = stage3_inputs
             .into_par_iter()
             .map(|(gate_id, state, s_g)| {
-                let uniform_sampler = US::new();
                 let mut target_gate2_gy = s_g.clone() * w_block_gy;
                 let target_high_gy = -M::gadget_matrix(params, d);
                 target_gate2_gy.add_in_place(&target_high_gy);
-                let error = uniform_sampler.sample_uniform(
-                    params,
-                    d,
-                    m_g,
-                    DistType::GaussDist { sigma: self.error_sigma },
-                );
+                let error = self.sample_error_matrix(params, d, m_g);
                 target_gate2_gy.add_in_place(&error);
                 (gate_id, state, s_g, target_gate2_gy)
             })
@@ -563,7 +567,6 @@ where
             .into_par_iter()
             .map(|(gate_id, state, s_g)| {
                 let hash_sampler = HS::new();
-                let uniform_sampler = US::new();
                 let input_matrix = M::from_compact_bytes(params, &state.input_pubkey_bytes);
                 let u_g_decomposed = hash_sampler.sample_hash_decomposed(
                     params,
@@ -583,12 +586,7 @@ where
                 let mut target_gate2_v = s_g.clone() * w_block_v;
                 let target_high_v = -(input_matrix * u_g_decomposed);
                 target_gate2_v.add_in_place(&target_high_v);
-                let error = uniform_sampler.sample_uniform(
-                    params,
-                    d,
-                    m_g,
-                    DistType::GaussDist { sigma: self.error_sigma },
-                );
+                let error = self.sample_error_matrix(params, d, m_g);
                 target_gate2_v.add_in_place(&error);
                 (gate_id, s_g, target_gate2_v)
             })
@@ -640,7 +638,6 @@ where
             .into_par_iter()
             .map(|(gate_id, s_g)| {
                 let hash_sampler = HS::new();
-                let uniform_sampler = US::new();
                 let u_g_matrix = hash_sampler.sample_hash(
                     params,
                     self.hash_key,
@@ -652,12 +649,7 @@ where
                 let mut target_gate2_vx = s_g.clone() * w_block_vx;
                 let target_high_vx = u_g_matrix * &small_gadget_matrix;
                 target_gate2_vx.add_in_place(&target_high_vx);
-                let error = uniform_sampler.sample_uniform(
-                    params,
-                    d,
-                    m_g * k_small,
-                    DistType::GaussDist { sigma: self.error_sigma },
-                );
+                let error = self.sample_error_matrix(params, d, m_g * k_small);
                 target_gate2_vx.add_in_place(&error);
                 (gate_id, target_gate2_vx)
             })

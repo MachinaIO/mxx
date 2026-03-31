@@ -39,6 +39,7 @@ mod tests {
     use super::super::{encode_nested_rns_poly, encode_nested_rns_poly_compact_bytes};
     use crate::{
         __PAIR, __TestState,
+        gadgets::arith::DEFAULT_MAX_UNREDUCED_MULS,
         poly::{
             Poly, PolyParams,
             dcrt::{
@@ -51,6 +52,7 @@ mod tests {
     use num_bigint::BigUint;
 
     const P_MODULI_BITS: usize = 6;
+    const MAX_UNREDUCED_MULS: usize = DEFAULT_MAX_UNREDUCED_MULS;
     const BASE_BITS: u32 = 6;
 
     #[test]
@@ -77,10 +79,16 @@ mod tests {
 
         for input in [12345u64, 23456u64, 34567u64] {
             let input = BigUint::from(input);
-            let expected =
-                encode_nested_rns_poly::<DCRTPoly>(P_MODULI_BITS, &cpu_params, &input, q_level);
+            let expected = encode_nested_rns_poly::<DCRTPoly>(
+                P_MODULI_BITS,
+                MAX_UNREDUCED_MULS,
+                &cpu_params,
+                &input,
+                q_level,
+            );
             let actual_bytes = encode_nested_rns_poly_compact_bytes::<GpuDCRTPoly>(
                 P_MODULI_BITS,
+                MAX_UNREDUCED_MULS,
                 &gpu_params,
                 &input,
                 q_level,

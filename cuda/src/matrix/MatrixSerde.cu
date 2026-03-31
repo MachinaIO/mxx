@@ -923,6 +923,146 @@ extern "C" int gpu_matrix_store_rns_batch(
     return serde_build_event_set_from_streams(streams, out_events);
 }
 
+extern "C" int gpu_matrix_store_const_coeff_batch(
+    const GpuMatrix *mat,
+    uint64_t *words_out,
+    size_t words_per_poly,
+    GpuEventSet **out_events)
+{
+    if (!mat || !out_events)
+    {
+        return set_error("invalid gpu_matrix_store_const_coeff_batch arguments");
+    }
+    *out_events = nullptr;
+    if (!mat->ctx)
+    {
+        return set_error("invalid context in gpu_matrix_store_const_coeff_batch");
+    }
+    if (mat->format != GPU_POLY_FORMAT_COEFF)
+    {
+        return set_error("gpu_matrix_store_const_coeff_batch requires coeff format");
+    }
+
+    size_t count = 0;
+    if (!serde_checked_mul_size(mat->rows, mat->cols, &count))
+    {
+        return set_error("matrix size overflow in gpu_matrix_store_const_coeff_batch");
+    }
+    if (count > 0 && !words_out)
+    {
+        return set_error("null words_out in gpu_matrix_store_const_coeff_batch");
+    }
+    if (count == 0)
+    {
+        return 0;
+    }
+
+    if (mat->level < 0)
+    {
+        return set_error("invalid level in gpu_matrix_store_const_coeff_batch");
+    }
+    const int N = mat->ctx->N;
+    if (N <= 0)
+    {
+        return set_error("invalid ring dimension in gpu_matrix_store_const_coeff_batch");
+    }
+    const size_t limb_count = static_cast<size_t>(mat->level + 1);
+    if (words_per_poly < limb_count)
+    {
+        return set_error("words_per_poly too small in gpu_matrix_store_const_coeff_batch");
+    }
+
+    size_t total_words = 0;
+    if (!serde_checked_mul_size(count, words_per_poly, &total_words))
+    {
+        return set_error("output size overflow in gpu_matrix_store_const_coeff_batch");
+    }
+    std::fill_n(words_out, total_words, static_cast<uint64_t>(0));
+
+    auto &limb_map = mat->ctx->limb_gpu_ids;
+    if (limb_map.size() < limb_count)
+    {
+        return set_error("unexpected limb mapping size in gpu_matrix_store_const_coeff_batch");
+    }
+
+    std::vector<SerdeStreamRef> streams;
+    streams.reserve(limb_count);
+    for (size_t limb = 0; limb < limb_count; ++limb)
+    {
+        const dim3 limb_id = limb_map[limb];
+        const uint8_t *src = matrix_limb_ptr_by_id(mat, 0, limb_id);
+        if (!src)
+        {
+            return set_error("null matrix limb base pointer in gpu_matrix_store_const_coeff_batch");
+        }
+
+        int device = -1;
+        cudaStream_t stream = nullptr;
+        int status = matrix_limb_device(mat, limb_id, &device);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_limb_stream(mat, limb_id, &stream);
+        if (status != 0)
+        {
+            return status;
+        }
+
+        size_t src_pitch = 0;
+        uint8_t src_coeff_bytes = 0;
+        if (!matrix_limb_metadata_by_id(mat, limb_id, &src_pitch, &src_coeff_bytes))
+        {
+            return set_error("invalid limb metadata in gpu_matrix_store_const_coeff_batch");
+        }
+        size_t src_width = 0;
+        if (!serde_checked_mul_size(static_cast<size_t>(N), static_cast<size_t>(src_coeff_bytes), &src_width))
+        {
+            return set_error("size overflow in gpu_matrix_store_const_coeff_batch");
+        }
+        if (src_coeff_bytes == 0 || src_pitch < src_width)
+        {
+            return set_error("invalid source stride in gpu_matrix_store_const_coeff_batch");
+        }
+
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        status = matrix_wait_limb_stream(mat, limb_id, device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+
+        uint8_t *dst =
+            reinterpret_cast<uint8_t *>(words_out) + limb * sizeof(uint64_t);
+        err = cudaMemcpy2DAsync(
+            dst,
+            words_per_poly * sizeof(uint64_t),
+            src,
+            src_pitch,
+            src_coeff_bytes,
+            count,
+            cudaMemcpyDeviceToHost,
+            stream);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+
+        status = matrix_track_limb_consumer(mat, limb_id, device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        serde_append_unique_stream(streams, device, stream);
+    }
+
+    return serde_build_event_set_from_streams(streams, out_events);
+}
+
 extern "C" int gpu_poly_store_compact_bytes(
     GpuMatrix *poly,
     uint8_t *payload_out,

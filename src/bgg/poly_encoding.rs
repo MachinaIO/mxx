@@ -2,11 +2,13 @@
 #[path = "poly_encoding_gpu.rs"]
 mod gpu;
 
+#[cfg(feature = "gpu")]
+use crate::poly::PolyParams;
 use crate::{
     bgg::public_key::{BggPublicKey, BggPublicKeyCompact},
     circuit::evaluable::Evaluable,
     matrix::PolyMatrix,
-    poly::{Poly, PolyParams},
+    poly::Poly,
 };
 use num_bigint::BigUint;
 use rayon::prelude::*;
@@ -400,36 +402,6 @@ impl<M: PolyMatrix> Evaluable for BggPolyEncoding<M> {
         params.params_for_device(device_id)
     }
 
-    fn rotate(&self, params: &Self::Params, shift: i32) -> Self {
-        let pubkey = self.pubkey.rotate(params, shift);
-        let shift = if shift >= 0 {
-            shift as usize
-        } else {
-            params.ring_dimension() as usize - shift.unsigned_abs() as usize
-        };
-        let rotate_poly_bytes =
-            Arc::<[u8]>::from(<M::P>::const_rotate_poly(params, shift).to_compact_bytes());
-        let vector_bytes =
-            map_slots_with_params::<M, _, _>(params, self.num_slots(), |slot, local_params| {
-                let vector = M::from_compact_bytes(local_params, self.vector_bytes[slot].as_ref());
-                let rotate_poly =
-                    M::P::from_compact_bytes(local_params, rotate_poly_bytes.as_ref());
-                let out = vector * &rotate_poly;
-                drop(rotate_poly);
-                Arc::<[u8]>::from(out.into_compact_bytes())
-            });
-        let plaintext_bytes = self.plaintext_bytes.as_ref().map(|plaintext_bytes| {
-            map_slots_with_params::<M, _, _>(params, plaintext_bytes.len(), |slot, local_params| {
-                let plaintext =
-                    M::P::from_compact_bytes(local_params, plaintext_bytes[slot].as_ref());
-                let rotate_poly =
-                    M::P::from_compact_bytes(local_params, rotate_poly_bytes.as_ref());
-                Arc::<[u8]>::from((plaintext * rotate_poly).to_compact_bytes())
-            })
-        });
-        Self::new(params.clone(), vector_bytes, pubkey, plaintext_bytes)
-    }
-
     fn small_scalar_mul(&self, params: &Self::Params, scalar: &[u32]) -> Self {
         let scalar_bytes = Arc::<[u8]>::from(Self::P::from_u32s(params, scalar).to_compact_bytes());
         let vector_bytes =
@@ -712,16 +684,6 @@ mod tests {
         let compact = encoding.clone().to_compact();
         let restored = BggPolyEncoding::from_compact(&params, &compact);
         assert_eq!(restored, encoding);
-
-        let rotated = encoding.rotate(&params, 1);
-        assert_eq!(rotated.pubkey, pubkey.rotate(&params, 1));
-        for slot in 0..num_slots {
-            let expected =
-                BggEncoding::new(encoding.vector(slot), pubkey.clone(), encoding.plaintext(slot))
-                    .rotate(&params, 1);
-            assert_eq!(rotated.vector(slot), expected.vector);
-            assert_eq!(rotated.plaintext(slot), expected.plaintext);
-        }
 
         let small_scaled = encoding.small_scalar_mul(&params, &[1, 2, 3]);
         assert_eq!(small_scaled.pubkey, pubkey.small_scalar_mul(&params, &[1, 2, 3]));

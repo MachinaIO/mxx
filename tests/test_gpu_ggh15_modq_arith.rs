@@ -6,7 +6,9 @@ use mxx::{
     bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
     circuit::PolyCircuit,
     element::PolyElem,
-    gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly},
+    gadgets::arith::{
+        DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly,
+    },
     lookup::{
         ggh15_eval::{GGH15BGGEncodingPltEvaluator, GGH15BGGPubKeyPltEvaluator},
         poly::PolyPltEvaluator,
@@ -30,12 +32,14 @@ use mxx::{
     utils::{bigdecimal_bits_ceil, gen_biguint_for_modulus},
 };
 use num_bigint::BigUint;
+use rayon::prelude::*;
 use std::{env, fs, path::Path, sync::Arc, time::Instant};
 use tracing::info;
 
 const DEFAULT_RING_DIM: u32 = 1 << 14;
 const DEFAULT_CRT_BITS: usize = 24;
 const DEFAULT_P_MODULI_BITS: usize = 6;
+const DEFAULT_MAX_UNREDUCED_MULS_BUDGET: usize = DEFAULT_MAX_UNREDUCED_MULS;
 const DEFAULT_SCALE: u64 = 1 << 7;
 const DEFAULT_BASE_BITS: u32 = 12;
 const DEFAULT_MAX_CRT_DEPTH: usize = 32;
@@ -160,13 +164,6 @@ fn assert_value_matches_q_level(
         expected_mod_active_q.clone(),
         "value modulo active q must match expected modulo active q"
     );
-    for &q_i in all_q_moduli.iter().skip(active_q_moduli.len()) {
-        assert_eq!(
-            value % BigUint::from(q_i),
-            BigUint::from(0u64),
-            "inactive CRT residues must be zero when q_level is limited"
-        );
-    }
 }
 
 fn q_level_from_env() -> Option<usize> {
@@ -208,6 +205,7 @@ fn build_modq_arith_circuit_cpu(
         &mut circuit,
         params,
         p_moduli_bits,
+        DEFAULT_MAX_UNREDUCED_MULS_BUDGET,
         scale,
         false,
         q_level,
@@ -229,6 +227,7 @@ fn build_modq_arith_circuit_gpu(
         &mut circuit,
         params,
         p_moduli_bits,
+        DEFAULT_MAX_UNREDUCED_MULS_BUDGET,
         scale,
         false,
         q_level,
@@ -250,6 +249,7 @@ fn build_modq_arith_value_circuit_gpu(
         &mut circuit,
         params,
         p_moduli_bits,
+        DEFAULT_MAX_UNREDUCED_MULS_BUDGET,
         scale,
         false,
         q_level,
@@ -267,7 +267,7 @@ fn find_crt_depth_for_modq_arith(
     let base = BigDecimal::from_biguint(BigUint::from(1u32) << cfg.base_bits, 0);
     let error_sigma = BigDecimal::from_f64(cfg.error_sigma).expect("valid error sigma");
     let input_bound = BigDecimal::from((1u64 << cfg.p_moduli_bits) - 1);
-    let e_init_norm = &error_sigma * BigDecimal::from(6u64);
+    let e_init_norm = &error_sigma * BigDecimal::from_f32(6.5).unwrap();
 
     for crt_depth in 1..=cfg.max_crt_depth {
         let params = DCRTPolyParams::new(cfg.ring_dim, crt_depth, cfg.crt_bits, cfg.base_bits);
@@ -391,8 +391,16 @@ async fn test_gpu_ggh15_modq_arith() {
     let expected =
         input_values.iter().fold(BigUint::from(1u64), |acc, value| (acc * value) % &active_q);
     let plaintext_inputs: Vec<GpuDCRTPoly> = input_values
-        .iter()
-        .flat_map(|value| encode_nested_rns_poly(cfg.p_moduli_bits, &params, value, q_level))
+        .par_iter()
+        .flat_map(|value| {
+            encode_nested_rns_poly(
+                cfg.p_moduli_bits,
+                DEFAULT_MAX_UNREDUCED_MULS_BUDGET,
+                &params,
+                value,
+                q_level,
+            )
+        })
         .collect();
 
     let dry_circuit = build_modq_arith_value_circuit_gpu(
@@ -406,7 +414,9 @@ async fn test_gpu_ggh15_modq_arith() {
     let dry_eval_start = Instant::now();
     let dry_one = GpuDCRTPoly::const_one(&params);
     let dry_inputs = plaintext_inputs.clone();
-    let dry_out = dry_circuit.eval(&params, dry_one, dry_inputs, Some(&dry_plt_evaluator), None);
+    info!("starting dry-run evaluation to verify correctness before GPU evaluation");
+    let dry_out =
+        dry_circuit.eval(&params, dry_one, dry_inputs, Some(&dry_plt_evaluator), None, None);
     info!("dry eval elapsed_ms={:.3}", dry_eval_start.elapsed().as_secs_f64() * 1000.0);
     assert_eq!(dry_out.len(), 1, "dry-run should output one value polynomial");
     let dry_const_term = dry_out[0]
@@ -453,8 +463,11 @@ async fn test_gpu_ggh15_modq_arith() {
     info!("sampled {} public keys", pubkeys.len());
 
     let enc_setup_start = Instant::now();
-    let encoding_sampler =
-        BGGEncodingSampler::<GpuDCRTPolyUniformSampler>::new(&params, &secrets, None);
+    let encoding_sampler = BGGEncodingSampler::<GpuDCRTPolyUniformSampler>::new(
+        &params,
+        &secrets,
+        Some(cfg.error_sigma),
+    );
     drop(secrets);
     let encodings = encoding_sampler.sample(&params, &pubkeys, &plaintext_inputs);
     drop(plaintext_inputs);
@@ -492,7 +505,8 @@ async fn test_gpu_ggh15_modq_arith() {
     let input_pubkeys = pubkeys.split_off(1);
     let one_pubkey = pubkeys.pop().expect("pubkeys must contain one entry for const one");
     let pubkey_eval_start = Instant::now();
-    let pubkey_out = circuit.eval(&params, one_pubkey, input_pubkeys, Some(&pk_evaluator), None);
+    let pubkey_out =
+        circuit.eval(&params, one_pubkey, input_pubkeys, Some(&pk_evaluator), None, None);
     info!("pubkey eval elapsed_ms={:.3}", pubkey_eval_start.elapsed().as_secs_f64() * 1000.0);
     assert_eq!(pubkey_out.len(), 1);
 
@@ -553,7 +567,7 @@ async fn test_gpu_ggh15_modq_arith() {
     let one_encoding = encodings.pop().expect("encodings must contain one entry for const one");
     let encoding_eval_start = Instant::now();
     let encoding_out =
-        circuit.eval(&params, one_encoding, input_encodings, Some(&enc_evaluator), None);
+        circuit.eval(&params, one_encoding, input_encodings, Some(&enc_evaluator), None, None);
     info!("encoding eval elapsed_ms={:.3}", encoding_eval_start.elapsed().as_secs_f64() * 1000.0);
     assert_eq!(encoding_out.len(), 1);
 

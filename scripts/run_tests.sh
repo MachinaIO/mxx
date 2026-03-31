@@ -35,6 +35,7 @@ fi
 
 if [[ $run_rust -eq 1 ]]; then
   cargo +nightly fmt --all
+  cargo test -r --features gpu --no-run
 
   rust_test_log="$(mktemp)"
   if RUST_TEST_NOCAPTURE="${RUST_TEST_NOCAPTURE:-1}" \

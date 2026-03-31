@@ -6,9 +6,13 @@ use std::{
     fs::{File, OpenOptions, read_dir, write as write_file},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, mpsc},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tracing::{debug, info};
 
@@ -174,40 +178,111 @@ pub struct GlobalTableIndex {
 }
 
 enum WriteCommand {
-    Append(BatchLookupBuffer),
-    Flush(mpsc::Sender<Result<(), io::Error>>),
-    Reset { dir_path: PathBuf, bytes_limit: Option<usize>, reply: mpsc::Sender<()> },
+    Append {
+        buffer: BatchLookupBuffer,
+        payload_len: usize,
+    },
+    Flush(mpsc::Sender<FlushResult>),
+    Reset {
+        dir_path: PathBuf,
+        bytes_limit: Option<usize>,
+        index_sync_every: usize,
+        reply: mpsc::Sender<()>,
+    },
+}
+
+struct FlushResult {
+    file_result: Result<(), io::Error>,
+    index_already_synced: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WriterProgressSnapshot {
+    enqueued_append_count: usize,
+    completed_append_count: usize,
+    enqueued_payload_bytes: usize,
+    completed_payload_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct WriterProgress {
+    enqueued_append_count: AtomicUsize,
+    completed_append_count: AtomicUsize,
+    enqueued_payload_bytes: AtomicUsize,
+    completed_payload_bytes: AtomicUsize,
+}
+
+impl WriterProgress {
+    fn reset(&self) {
+        self.enqueued_append_count.store(0, Ordering::Relaxed);
+        self.completed_append_count.store(0, Ordering::Relaxed);
+        self.enqueued_payload_bytes.store(0, Ordering::Relaxed);
+        self.completed_payload_bytes.store(0, Ordering::Relaxed);
+    }
+
+    fn record_enqueued(&self, payload_bytes: usize) {
+        self.enqueued_append_count.fetch_add(1, Ordering::Relaxed);
+        self.enqueued_payload_bytes.fetch_add(payload_bytes, Ordering::Relaxed);
+    }
+
+    fn rollback_enqueued(&self, payload_bytes: usize) {
+        self.enqueued_append_count.fetch_sub(1, Ordering::Relaxed);
+        self.enqueued_payload_bytes.fetch_sub(payload_bytes, Ordering::Relaxed);
+    }
+
+    fn record_completed(&self, payload_bytes: usize) {
+        self.completed_append_count.fetch_add(1, Ordering::Relaxed);
+        self.completed_payload_bytes.fetch_add(payload_bytes, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> WriterProgressSnapshot {
+        WriterProgressSnapshot {
+            enqueued_append_count: self.enqueued_append_count.load(Ordering::Relaxed),
+            completed_append_count: self.completed_append_count.load(Ordering::Relaxed),
+            enqueued_payload_bytes: self.enqueued_payload_bytes.load(Ordering::Relaxed),
+            completed_payload_bytes: self.completed_payload_bytes.load(Ordering::Relaxed),
+        }
+    }
 }
 
 struct WriterState {
     dir_path: PathBuf,
     bytes_limit: Option<usize>,
+    index_sync_every: usize,
     current_file_index: usize,
     current_file_size: usize,
     file: Option<File>,
     last_error: Option<io::Error>,
+    index_already_synced: bool,
+    pending_index_sync_writes: usize,
 }
 
 impl WriterState {
-    fn new(dir_path: PathBuf, bytes_limit: Option<usize>) -> Self {
+    fn new(dir_path: PathBuf, bytes_limit: Option<usize>, index_sync_every: usize) -> Self {
         Self {
             dir_path,
             bytes_limit,
+            index_sync_every,
             current_file_index: 0,
             current_file_size: 0,
             file: None,
             last_error: None,
+            index_already_synced: true,
+            pending_index_sync_writes: 0,
         }
     }
 
-    fn reset(&mut self, dir_path: PathBuf, bytes_limit: Option<usize>) {
+    fn reset(&mut self, dir_path: PathBuf, bytes_limit: Option<usize>, index_sync_every: usize) {
         self.dir_path = dir_path;
         self.bytes_limit = bytes_limit;
+        self.index_sync_every = index_sync_every;
         let (file_index, file_size) = Self::recover_tail_position(&self.dir_path);
         self.current_file_index = file_index;
         self.current_file_size = file_size;
         self.file = None;
         self.last_error = None;
+        self.index_already_synced = true;
+        self.pending_index_sync_writes = 0;
     }
 
     fn rotate_file(&mut self) {
@@ -268,8 +343,15 @@ pub struct MultiBatchLookupBuffer {
 
 static WRITE_SENDER: OnceLock<mpsc::Sender<WriteCommand>> = OnceLock::new();
 static METADATA: OnceLock<Arc<Mutex<GlobalTableIndex>>> = OnceLock::new();
+static WRITER_PROGRESS: OnceLock<WriterProgress> = OnceLock::new();
 #[cfg(test)]
 static STORAGE_TEST_SEM: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
+const WAIT_FOR_WRITES_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+fn writer_progress() -> &'static WriterProgress {
+    WRITER_PROGRESS.get_or_init(WriterProgress::default)
+}
 
 #[cfg(test)]
 pub async fn storage_test_lock() -> tokio::sync::OwnedSemaphorePermit {
@@ -280,7 +362,9 @@ pub async fn storage_test_lock() -> tokio::sync::OwnedSemaphorePermit {
 /// Initialize the storage system with an optional byte limit for batched lookup tables.
 pub fn init_storage_system(dir_path: PathBuf) {
     let bytes_limit = crate::env::lut_bytes_limit();
+    let index_sync_every = crate::env::lut_index_sync_every();
     info!("LUT_BYTES_LIMIT={:?}", bytes_limit);
+    info!("LUT_INDEX_SYNC_EVERY={}", index_sync_every);
     let metadata = METADATA.get_or_init(|| Arc::new(Mutex::new(GlobalTableIndex::default())));
 
     if WRITE_SENDER.get().is_none() {
@@ -288,7 +372,9 @@ pub fn init_storage_system(dir_path: PathBuf) {
         let _ = WRITE_SENDER.set(sender);
         let metadata = metadata.clone();
         let dir_for_thread = dir_path.clone();
-        thread::spawn(move || writer_thread_loop(receiver, metadata, dir_for_thread, bytes_limit));
+        thread::spawn(move || {
+            writer_thread_loop(receiver, metadata, dir_for_thread, bytes_limit, index_sync_every)
+        });
     }
 
     if let Some(meta) = METADATA.get() {
@@ -314,7 +400,10 @@ pub fn init_storage_system(dir_path: PathBuf) {
 
     if let Some(sender) = WRITE_SENDER.get() {
         let (reply_tx, reply_rx) = mpsc::channel();
-        if sender.send(WriteCommand::Reset { dir_path, bytes_limit, reply: reply_tx }).is_ok() {
+        if sender
+            .send(WriteCommand::Reset { dir_path, bytes_limit, index_sync_every, reply: reply_tx })
+            .is_ok()
+        {
             let _ = reply_rx.recv();
         }
     }
@@ -325,12 +414,14 @@ fn writer_thread_loop(
     metadata: Arc<Mutex<GlobalTableIndex>>,
     dir_path: PathBuf,
     bytes_limit: Option<usize>,
+    index_sync_every: usize,
 ) {
-    let mut state = WriterState::new(dir_path, bytes_limit);
+    let mut state = WriterState::new(dir_path, bytes_limit, index_sync_every);
+    let progress = writer_progress();
 
     while let Ok(command) = receiver.recv() {
         match command {
-            WriteCommand::Append(buffer) => {
+            WriteCommand::Append { buffer, payload_len } => {
                 if let Some(limit) = state.bytes_limit {
                     let id_prefix = buffer.id_prefix.clone();
                     let chunks = buffer.split_by_payload_limit(limit);
@@ -350,6 +441,7 @@ fn writer_thread_loop(
                 } else {
                     write_buffer(&mut state, buffer, &metadata);
                 }
+                progress.record_completed(payload_len);
             }
             WriteCommand::Flush(reply) => {
                 if let Some(file) = state.file.as_mut() {
@@ -357,11 +449,15 @@ fn writer_thread_loop(
                         state.record_error(err);
                     }
                 }
-                let result = state.last_error.take().map_or(Ok(()), Err);
-                let _ = reply.send(result);
+                let flush_result = FlushResult {
+                    file_result: state.last_error.take().map_or(Ok(()), Err),
+                    index_already_synced: state.index_already_synced,
+                };
+                let _ = reply.send(flush_result);
             }
-            WriteCommand::Reset { dir_path, bytes_limit, reply } => {
-                state.reset(dir_path, bytes_limit);
+            WriteCommand::Reset { dir_path, bytes_limit, index_sync_every, reply } => {
+                state.reset(dir_path, bytes_limit, index_sync_every);
+                progress.reset();
                 let _ = reply.send(());
             }
         }
@@ -408,11 +504,24 @@ fn write_buffer(
     };
     metadata.lock().unwrap().entries.insert(buffer.id_prefix, entry);
 
-    // Write index after each append so readers can resume mid-run.
+    state.index_already_synced = false;
+    state.pending_index_sync_writes = state.pending_index_sync_writes.saturating_add(1);
+    if state.pending_index_sync_writes >= state.index_sync_every {
+        sync_index_file(state, metadata);
+    }
+}
+
+fn sync_index_file(state: &mut WriterState, metadata: &Arc<Mutex<GlobalTableIndex>>) {
+    if state.index_already_synced {
+        return;
+    }
     let snapshot = { metadata.lock().unwrap().clone() };
     let index_path = state.dir_path.join("lookup_tables.index");
     if let Err(e) = write_global_index_sync(&snapshot, &index_path) {
         eprintln!("Failed to write global index: {}", e);
+    } else {
+        state.index_already_synced = true;
+        state.pending_index_sync_writes = 0;
     }
 }
 
@@ -599,7 +708,15 @@ pub fn add_lookup_buffer(buffer: BatchLookupBuffer) -> bool {
         }
     };
 
-    if sender.send(WriteCommand::Append(buffer)).is_ok() { true } else { false }
+    let payload_len = buffer.payload().len();
+    let progress = writer_progress();
+    progress.record_enqueued(payload_len);
+    if sender.send(WriteCommand::Append { buffer, payload_len }).is_ok() {
+        true
+    } else {
+        progress.rollback_enqueued(payload_len);
+        false
+    }
 }
 
 /// Batch serialize and store multiple matrices in a single file.
@@ -790,40 +907,233 @@ fn write_global_index_sync(index: &GlobalTableIndex, path: &Path) -> Result<(), 
     write_file(path, json.as_bytes())
 }
 
+fn blocking_wait_for_flush_with_progress(
+    reply_rx: mpsc::Receiver<FlushResult>,
+    start: WriterProgressSnapshot,
+) -> Result<FlushResult, io::Error> {
+    let initial_pending_append_count =
+        start.enqueued_append_count.saturating_sub(start.completed_append_count);
+    let initial_pending_payload_bytes =
+        start.enqueued_payload_bytes.saturating_sub(start.completed_payload_bytes);
+    debug!(
+        "wait_for_all_writes drain start: pending_append_count={}, pending_payload_bytes={}, completed_append_count={}, completed_payload_bytes={}",
+        initial_pending_append_count,
+        initial_pending_payload_bytes,
+        start.completed_append_count,
+        start.completed_payload_bytes
+    );
+
+    loop {
+        match reply_rx.recv_timeout(WAIT_FOR_WRITES_PROGRESS_LOG_INTERVAL) {
+            Ok(flush_result) => return Ok(flush_result),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let current = writer_progress().snapshot();
+                let completed_append_count = current
+                    .completed_append_count
+                    .saturating_sub(start.completed_append_count)
+                    .min(initial_pending_append_count);
+                let completed_payload_bytes = current
+                    .completed_payload_bytes
+                    .saturating_sub(start.completed_payload_bytes)
+                    .min(initial_pending_payload_bytes);
+                debug!(
+                    "wait_for_all_writes drain progress: completed_append_count={}/{}, pending_append_count={}, completed_payload_bytes={}/{}, pending_payload_bytes={}",
+                    completed_append_count,
+                    initial_pending_append_count,
+                    initial_pending_append_count.saturating_sub(completed_append_count),
+                    completed_payload_bytes,
+                    initial_pending_payload_bytes,
+                    initial_pending_payload_bytes.saturating_sub(completed_payload_bytes)
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "storage writer dropped flush reply channel",
+                ));
+            }
+        }
+    }
+}
+
 /// Wait for all pending writes to complete and write batched lookup tables
 pub async fn wait_for_all_writes(
     dir_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sender = WRITE_SENDER.get().ok_or("Storage system not initialized")?;
+    let progress_start = writer_progress().snapshot();
     let (reply_tx, reply_rx) = mpsc::channel();
     sender.send(WriteCommand::Flush(reply_tx))?;
-    match reply_rx.recv()? {
+    let flush_result = tokio::task::spawn_blocking(move || {
+        blocking_wait_for_flush_with_progress(reply_rx, progress_start)
+    })
+    .await
+    .map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, format!("storage flush join failed: {e}"))
+    })??;
+    match flush_result.file_result {
         Ok(()) => {}
         Err(e) => return Err(Box::new(e)),
     }
 
     if let Some(metadata) = METADATA.get() {
-        let snapshot = { metadata.lock().unwrap().clone() };
-        let total_indices: usize = snapshot.entries.values().map(|entry| entry.indices.len()).sum();
-        let approx_bytes = total_indices.saturating_mul(std::mem::size_of::<usize>());
-        info!(
-            "{}",
-            format!(
-                "Metadata entries={}, total_indices={}, approx_indices_bytes={}",
-                snapshot.entries.len(),
-                total_indices,
-                approx_bytes
-            )
-        );
-        let index_path = dir_path.join("lookup_tables.index");
-        if let Err(e) = write_global_index(&snapshot, &index_path).await {
-            eprintln!("Failed to write global index: {}", e);
+        if flush_result.index_already_synced {
+            let mut guard = metadata.lock().unwrap();
+            let total_indices: usize =
+                guard.entries.values().map(|entry| entry.indices.len()).sum();
+            let approx_bytes = total_indices.saturating_mul(std::mem::size_of::<usize>());
+            info!(
+                "{}",
+                format!(
+                    "Metadata entries={}, total_indices={}, approx_indices_bytes={}",
+                    guard.entries.len(),
+                    total_indices,
+                    approx_bytes
+                )
+            );
+            debug!(
+                "wait_for_all_writes skipped final index rewrite because lookup_tables.index is already synchronized"
+            );
+            guard.entries.clear();
         } else {
-            info!("{}", format!("Global index written with {} entries", snapshot.entries.len()));
+            let snapshot = { metadata.lock().unwrap().clone() };
+            let total_indices: usize =
+                snapshot.entries.values().map(|entry| entry.indices.len()).sum();
+            let approx_bytes = total_indices.saturating_mul(std::mem::size_of::<usize>());
+            info!(
+                "{}",
+                format!(
+                    "Metadata entries={}, total_indices={}, approx_indices_bytes={}",
+                    snapshot.entries.len(),
+                    total_indices,
+                    approx_bytes
+                )
+            );
+            let index_path = dir_path.join("lookup_tables.index");
+            if let Err(e) = write_global_index(&snapshot, &index_path).await {
+                eprintln!("Failed to write global index: {}", e);
+            } else {
+                info!(
+                    "{}",
+                    format!("Global index written with {} entries", snapshot.entries.len())
+                );
+            }
+            metadata.lock().unwrap().entries.clear();
         }
-        metadata.lock().unwrap().entries.clear();
     }
 
     info!("All writes completed");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        add_lookup_buffer, get_lookup_buffer_bytes, init_storage_system, storage_test_lock,
+        wait_for_all_writes,
+    };
+    use crate::storage::read::read_bytes_from_multi_batch;
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+    use tempfile::tempdir;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        old_value: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old_value = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, old_value }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.old_value {
+                unsafe { std::env::set_var(self.key, value) };
+            } else {
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_all_writes_flushes_queued_bytes_and_keeps_index_readable() {
+        let _storage_lock = storage_test_lock().await;
+        let dir = tempdir().expect("create temp dir");
+        init_storage_system(dir.path().to_path_buf());
+
+        let id_prefix = "storage_wait_progress_test";
+        let payload = vec![7u8; 64];
+        assert!(add_lookup_buffer(get_lookup_buffer_bytes(
+            vec![(0usize, payload.clone())],
+            id_prefix,
+        )));
+
+        wait_for_all_writes(dir.path().to_path_buf())
+            .await
+            .expect("wait_for_all_writes should flush pending writes");
+
+        let restored = read_bytes_from_multi_batch(dir.path(), id_prefix, 0)
+            .expect("payload should be readable after wait_for_all_writes");
+        assert_eq!(&restored[..payload.len()], payload.as_slice());
+    }
+
+    #[tokio::test]
+    async fn writer_syncs_index_after_configured_number_of_appends() {
+        let _storage_lock = storage_test_lock().await;
+        let _index_sync_guard = EnvVarGuard::set("LUT_INDEX_SYNC_EVERY", "2");
+        let dir = tempdir().expect("create temp dir");
+        init_storage_system(dir.path().to_path_buf());
+
+        let first_id = "batched_index_sync_first";
+        let second_id = "batched_index_sync_second";
+        let third_id = "batched_index_sync_third";
+        let first_payload = vec![1u8; 32];
+        let second_payload = vec![2u8; 32];
+        let third_payload = vec![3u8; 32];
+
+        assert!(add_lookup_buffer(get_lookup_buffer_bytes(
+            vec![(0usize, first_payload.clone())],
+            first_id,
+        )));
+        assert!(add_lookup_buffer(get_lookup_buffer_bytes(
+            vec![(0usize, second_payload.clone())],
+            second_id,
+        )));
+
+        let index_path = dir.path().join("lookup_tables.index");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !index_path.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            index_path.exists(),
+            "index should be written once the configured append batch is reached"
+        );
+
+        let restored_first = read_bytes_from_multi_batch(dir.path(), first_id, 0)
+            .expect("first payload should be readable after batched index sync");
+        let restored_second = read_bytes_from_multi_batch(dir.path(), second_id, 0)
+            .expect("second payload should be readable after batched index sync");
+        assert_eq!(&restored_first[..first_payload.len()], first_payload.as_slice());
+        assert_eq!(&restored_second[..second_payload.len()], second_payload.as_slice());
+
+        assert!(add_lookup_buffer(get_lookup_buffer_bytes(
+            vec![(0usize, third_payload.clone())],
+            third_id,
+        )));
+        wait_for_all_writes(dir.path().to_path_buf())
+            .await
+            .expect("wait_for_all_writes should flush the remaining dirty index state");
+
+        let restored_third = read_bytes_from_multi_batch(dir.path(), third_id, 0)
+            .expect("third payload should be readable after final wait_for_all_writes");
+        assert_eq!(&restored_third[..third_payload.len()], third_payload.as_slice());
+    }
 }

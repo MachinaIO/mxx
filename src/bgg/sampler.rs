@@ -363,7 +363,23 @@ where
             .collect()
     }
 
-    pub fn sample_slot_secret_mats(
+    pub fn sample_with_fresh_slot_secret_mats<K, T>(
+        &self,
+        params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
+        public_keys: &[K],
+        plaintexts: &[T],
+    ) -> (Vec<BggPolyEncoding<S::M>>, Vec<Vec<u8>>)
+    where
+        K: Borrow<BggPublicKey<S::M>> + Sync,
+        T: AsRef<[Arc<[u8]>]> + Sync,
+    {
+        let num_slots = Self::assert_uniform_num_slots(plaintexts);
+        let slot_secret_mats = self.sample_slot_secret_mats(params, num_slots);
+        let encodings = self.sample(params, public_keys, plaintexts, Some(&slot_secret_mats));
+        (encodings, slot_secret_mats)
+    }
+
+    fn sample_slot_secret_mats(
         &self,
         params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
         num_slots: usize,

@@ -1,7 +1,6 @@
-use crate::{
-    circuit::evaluable::Evaluable,
-    poly::{Poly, PolyParams},
-};
+#[cfg(feature = "gpu")]
+use crate::poly::PolyParams;
+use crate::{circuit::evaluable::Evaluable, poly::Poly};
 use num_bigint::BigUint;
 
 impl<P: Poly> Evaluable for P {
@@ -20,17 +19,6 @@ impl<P: Poly> Evaluable for P {
     #[cfg(feature = "gpu")]
     fn params_for_eval_device(params: &Self::Params, device_id: i32) -> Self::Params {
         params.params_for_device(device_id)
-    }
-
-    fn rotate(&self, params: &Self::Params, shift: i32) -> Self {
-        let mut coeffs = self.coeffs();
-        let shift = if shift >= 0 {
-            shift as usize
-        } else {
-            params.ring_dimension() as usize - shift.unsigned_abs() as usize
-        };
-        coeffs.rotate_right(shift);
-        Self::from_coeffs(params, &coeffs)
     }
 
     fn small_scalar_mul(&self, params: &Self::Params, scalar: &[u32]) -> Self {

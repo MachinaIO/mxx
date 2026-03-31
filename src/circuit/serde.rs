@@ -15,10 +15,10 @@ pub enum SerializablePolyGateType {
     Input,
     SmallScalarMul { scalar: Vec<u32> },
     LargeScalarMul { scalar: Vec<BigUint> },
+    SlotTransfer { src_slots: Vec<(u32, Option<u32>)> },
     Add,
     Sub,
     Mul,
-    Rotate { shift: i32 },
     PubLut { lut_id: usize },
     SubCircuitOutput { call_id: usize, output_idx: usize, num_inputs: usize },
 }
@@ -29,7 +29,7 @@ impl SerializablePolyGateType {
             SerializablePolyGateType::Input => 0,
             SerializablePolyGateType::SmallScalarMul { .. } |
             SerializablePolyGateType::LargeScalarMul { .. } |
-            SerializablePolyGateType::Rotate { .. } |
+            SerializablePolyGateType::SlotTransfer { .. } |
             SerializablePolyGateType::PubLut { .. } => 1,
             SerializablePolyGateType::SubCircuitOutput { num_inputs, .. } => *num_inputs,
             SerializablePolyGateType::Add |
@@ -95,10 +95,12 @@ impl SerializablePolyCircuit {
                 PolyGateType::LargeScalarMul { scalar } => {
                     SerializablePolyGateType::LargeScalarMul { scalar }
                 }
+                PolyGateType::SlotTransfer { src_slots } => {
+                    SerializablePolyGateType::SlotTransfer { src_slots }
+                }
                 PolyGateType::Add => SerializablePolyGateType::Add,
                 PolyGateType::Sub => SerializablePolyGateType::Sub,
                 PolyGateType::Mul => SerializablePolyGateType::Mul,
-                PolyGateType::Rotate { shift } => SerializablePolyGateType::Rotate { shift },
                 PolyGateType::PubLut { lut_id } => SerializablePolyGateType::PubLut { lut_id },
                 PolyGateType::SubCircuitOutput { call_id, output_idx, num_inputs } => {
                     SerializablePolyGateType::SubCircuitOutput { call_id, output_idx, num_inputs }
@@ -146,10 +148,12 @@ impl SerializablePolyCircuit {
                 SerializablePolyGateType::LargeScalarMul { scalar } => {
                     PolyGateType::LargeScalarMul { scalar }
                 }
+                SerializablePolyGateType::SlotTransfer { src_slots } => {
+                    PolyGateType::SlotTransfer { src_slots }
+                }
                 SerializablePolyGateType::Add => PolyGateType::Add,
                 SerializablePolyGateType::Sub => PolyGateType::Sub,
                 SerializablePolyGateType::Mul => PolyGateType::Mul,
-                SerializablePolyGateType::Rotate { shift } => PolyGateType::Rotate { shift },
                 SerializablePolyGateType::PubLut { lut_id } => PolyGateType::PubLut { lut_id },
                 SerializablePolyGateType::SubCircuitOutput { call_id, output_idx, num_inputs } => {
                     PolyGateType::SubCircuitOutput { call_id, output_idx, num_inputs }
@@ -305,10 +309,23 @@ mod tests {
         let b = DCRTPoly::const_one(&params);
         let one = DCRTPoly::const_one(&params);
         let out1_inputs = vec![a.clone(), b.clone()];
-        let out1 = circuit.eval(&params, one, out1_inputs, None::<&PolyPltEvaluator>, None);
+        let out1 = circuit.eval(&params, one, out1_inputs, None::<&PolyPltEvaluator>, None, None);
         let one = DCRTPoly::const_one(&params);
         let out2_inputs = vec![a, b];
-        let out2 = roundtrip.eval(&params, one, out2_inputs, None::<&PolyPltEvaluator>, None);
+        let out2 = roundtrip.eval(&params, one, out2_inputs, None::<&PolyPltEvaluator>, None, None);
         assert_eq!(out1, out2);
+    }
+
+    #[test]
+    fn test_serialization_roundtrip_with_slot_transfer_gate() {
+        let mut circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
+        let inputs = circuit.input(1);
+        let transferred = circuit.slot_transfer_gate(inputs[0], &[(1, None), (0, None), (1, None)]);
+        circuit.output(vec![transferred]);
+
+        let serializable = SerializablePolyCircuit::from_circuit(circuit.clone());
+        let roundtrip = serializable.to_circuit::<DCRTPoly>();
+
+        assert_eq!(roundtrip, circuit);
     }
 }

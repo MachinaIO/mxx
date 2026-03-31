@@ -15,7 +15,7 @@ use crate::{
 use bigdecimal::BigDecimal;
 use keccak_asm::Keccak256;
 use num_bigint::{BigInt, BigUint};
-use num_traits::Zero;
+use num_traits::{One, Zero};
 use rand::Rng;
 use std::{
     future::Future,
@@ -187,6 +187,42 @@ pub fn mod_inverse(a: u64, m: u64) -> Option<u64> {
     Some(result as u64)
 }
 
+/// Calculate modular inverse using the extended Euclidean algorithm for `BigUint` values.
+/// Returns `Some(x)` such that `(a * x) % m == 1`, or `None` if no inverse exists.
+pub fn mod_inverse_biguints(a: &BigUint, m: &BigUint) -> Option<BigUint> {
+    if m.is_zero() {
+        return None;
+    }
+
+    let m_big = BigInt::from(m.clone());
+    let mut r0 = m_big.clone();
+    let mut r1 = BigInt::from(a % m);
+    let mut t0 = BigInt::zero();
+    let mut t1 = BigInt::one();
+
+    while !r1.is_zero() {
+        let q = &r0 / &r1;
+
+        let r_next = &r0 - &q * &r1;
+        r0 = r1;
+        r1 = r_next;
+
+        let t_next = &t0 - &q * &t1;
+        t0 = t1;
+        t1 = t_next;
+    }
+
+    if r0 != BigInt::one() {
+        return None;
+    }
+
+    let mut result = t0 % &m_big;
+    if result < BigInt::zero() {
+        result += &m_big;
+    }
+    result.to_biguint()
+}
+
 /// Calculates the modular inverse of `a` modulo the CRT-composed modulus `q`.
 /// Each CRT modulus `q_i` is used to compute `a^{-1} mod q_i`, then results are recombined.
 pub fn mod_inverse_mod_q<P: Poly>(
@@ -232,6 +268,36 @@ pub fn round_div(a: u64, b: u64) -> u64 {
     rounded as u64
 }
 
+pub fn pow_biguint_usize(base: &BigUint, exponent: usize) -> BigUint {
+    let exponent =
+        u32::try_from(exponent).expect("exponent must fit in u32 for BigUint::pow in nested_rns");
+    base.pow(exponent)
+}
+
+pub fn ceil_biguint_nth_root(value: &BigUint, n: usize) -> BigUint {
+    assert!(n > 0, "n must be at least 1");
+    if *value <= BigUint::one() {
+        return value.clone();
+    }
+
+    let mut low = BigUint::one();
+    let mut high = BigUint::from(2u64);
+    while pow_biguint_usize(&high, n) < *value {
+        high <<= 1u32;
+    }
+
+    while low < high {
+        let mid = (&low + &high) >> 1u32;
+        if pow_biguint_usize(&mid, n) < *value {
+            low = mid + BigUint::one();
+        } else {
+            high = mid;
+        }
+    }
+
+    low
+}
+
 pub fn bigdecimal_bits_ceil(x: &BigDecimal) -> u64 {
     let (coeff, exp) = x.as_bigint_and_exponent();
     let exp_abs_u32: u32 =
@@ -244,4 +310,32 @@ pub fn bigdecimal_bits_ceil(x: &BigDecimal) -> u64 {
         coeff * &pow10
     };
     ceil_int.to_biguint().expect("norm should be non-negative").bits()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mod_inverse_biguints_returns_inverse_for_coprime_inputs() {
+        let modulus = BigUint::from(1_000_000_007u64);
+        let value = BigUint::from(123_456_789u64);
+        let inverse = mod_inverse_biguints(&value, &modulus).expect("inverse must exist");
+
+        assert_eq!((&value * &inverse) % &modulus, BigUint::one());
+    }
+
+    #[test]
+    fn test_mod_inverse_biguints_reduces_large_input_before_inversion() {
+        let modulus = BigUint::from(97u64);
+        let value = &modulus * BigUint::from(123_456u64) + BigUint::from(5u64);
+        let inverse = mod_inverse_biguints(&value, &modulus).expect("inverse must exist");
+
+        assert_eq!((value * &inverse) % &modulus, BigUint::one());
+    }
+
+    #[test]
+    fn test_mod_inverse_biguints_returns_none_for_non_coprime_inputs() {
+        assert_eq!(mod_inverse_biguints(&BigUint::from(12u64), &BigUint::from(18u64)), None);
+    }
 }

@@ -25,6 +25,13 @@ fn effective_slot_parallelism_gpu_with_requested(num_slots: usize, requested: us
     requested.min(num_slots).min(detected_gpu_device_ids().len().max(1))
 }
 
+fn effective_gauss_sigma(gauss_sigma: Option<f64>) -> Option<f64> {
+    match gauss_sigma {
+        Some(sigma) if sigma == 0.0 => None,
+        other => other,
+    }
+}
+
 pub(super) fn effective_slot_parallelism_gpu(num_slots: usize) -> usize {
     let requested = crate::env::bgg_poly_encoding_slot_parallelism().max(1);
     effective_slot_parallelism_gpu_with_requested(num_slots, requested)
@@ -88,6 +95,7 @@ where
     T: AsRef<[Arc<[u8]>]> + Sync,
 {
     let slot_parallelism = effective_slot_parallelism_gpu(num_slots).max(1);
+    let gauss_sigma = effective_gauss_sigma(gauss_sigma);
     let sampler_shared_by_device = prepare_sampler_shared_by_device(
         params,
         base_secret_vec,
@@ -165,7 +173,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::effective_slot_parallelism_gpu_with_requested;
+    use super::{effective_gauss_sigma, effective_slot_parallelism_gpu_with_requested};
     use crate::{__PAIR, __TestState, poly::dcrt::gpu::detected_gpu_device_ids};
 
     #[sequential_test::sequential]
@@ -176,5 +184,12 @@ mod tests {
         let actual = effective_slot_parallelism_gpu_with_requested(num_slots, detected_count);
         let expected = detected_count.min(num_slots);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_effective_gauss_sigma_treats_zero_as_none() {
+        assert_eq!(effective_gauss_sigma(None), None);
+        assert_eq!(effective_gauss_sigma(Some(0.0)), None);
+        assert_eq!(effective_gauss_sigma(Some(1.25)), Some(1.25));
     }
 }

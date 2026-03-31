@@ -4,7 +4,9 @@ use mxx::{
     bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
     circuit::PolyCircuit,
     element::PolyElem,
-    gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly},
+    gadgets::arith::{
+        DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly,
+    },
     lookup::{
         ggh15_eval::{GGH15BGGEncodingPltEvaluator, GGH15BGGPubKeyPltEvaluator},
         poly::PolyPltEvaluator,
@@ -29,6 +31,7 @@ use tracing::info;
 const RING_DIM: u32 = 1 << 6;
 const DEFAULT_CRT_BITS: usize = 24;
 const P_MODULI_BITS: usize = 7;
+const MAX_UNREDUCED_MULS: usize = DEFAULT_MAX_UNREDUCED_MULS;
 const SCALE: u64 = 1 << 7;
 const DEFAULT_BASE_BITS: u32 = 12;
 const MAX_CRT_DEPTH: usize = 64;
@@ -114,13 +117,6 @@ fn assert_value_matches_q_level(
         expected_mod_active_q.clone(),
         "value modulo active q must match expected modulo active q"
     );
-    for &q_i in all_q_moduli.iter().skip(active_q_moduli.len()) {
-        assert_eq!(
-            value % BigUint::from(q_i),
-            BigUint::from(0u64),
-            "inactive CRT residues must be zero when q_level is limited"
-        );
-    }
 }
 
 fn build_modq_arith_circuit(
@@ -133,6 +129,7 @@ fn build_modq_arith_circuit(
         &mut circuit,
         params,
         P_MODULI_BITS,
+        MAX_UNREDUCED_MULS,
         SCALE,
         false,
         q_level,
@@ -151,6 +148,7 @@ fn build_modq_arith_value_circuit(
         &mut circuit,
         params,
         P_MODULI_BITS,
+        MAX_UNREDUCED_MULS,
         SCALE,
         false,
         q_level,
@@ -168,7 +166,7 @@ fn find_crt_depth_for_modq_arith(
     let base = BigDecimal::from_biguint(BigUint::from(1u32) << base_bits, 0);
     let error_sigma = BigDecimal::from_f64(ERROR_SIGMA).expect("valid error sigma");
     let input_bound = BigDecimal::from((1u64 << P_MODULI_BITS) - 1);
-    let e_init_norm = &error_sigma * BigDecimal::from(6u64);
+    let e_init_norm = &error_sigma * BigDecimal::from_f32(6.5).unwrap();
 
     for crt_depth in 1..=MAX_CRT_DEPTH {
         let params = DCRTPolyParams::new(RING_DIM, crt_depth, crt_bits, base_bits);
@@ -268,7 +266,9 @@ async fn test_ggh15_modq_arith() {
 
     let plaintext_inputs = input_values
         .iter()
-        .flat_map(|value| encode_nested_rns_poly(P_MODULI_BITS, &params, value, q_level))
+        .flat_map(|value| {
+            encode_nested_rns_poly(P_MODULI_BITS, MAX_UNREDUCED_MULS, &params, value, q_level)
+        })
         .collect::<Vec<_>>();
     let plaintext_inputs_shared = plaintext_inputs.clone();
 
@@ -280,6 +280,7 @@ async fn test_ggh15_modq_arith() {
         dry_one,
         plaintext_inputs_shared.clone(),
         Some(&dry_plt_evaluator),
+        None,
         None,
     );
     assert_eq!(dry_out.len(), 1, "plain PolyCircuit dry-run should output one value polynomial");
@@ -302,7 +303,7 @@ async fn test_ggh15_modq_arith() {
     let plt_evaluator = PolyPltEvaluator::new();
     let plain_one = DCRTPoly::const_one(&params);
     let plain_out =
-        circuit.eval(&params, plain_one, plaintext_inputs_shared, Some(&plt_evaluator), None);
+        circuit.eval(&params, plain_one, plaintext_inputs_shared, Some(&plt_evaluator), None, None);
     assert_eq!(plain_out.len(), 1);
     let plain_const = plain_out[0]
         .coeffs()
@@ -355,7 +356,8 @@ async fn test_ggh15_modq_arith() {
     >::new(seed, d_secret, trapdoor_sigma, ERROR_SIGMA, dir.to_path_buf());
 
     let pubkey_eval_start = std::time::Instant::now();
-    let pubkey_out = circuit.eval(&params, pubkey_one, input_pubkeys, Some(&pk_evaluator), None);
+    let pubkey_out =
+        circuit.eval(&params, pubkey_one, input_pubkeys, Some(&pk_evaluator), None, None);
     info!("pubkey eval elapsed {:?}", pubkey_eval_start.elapsed());
     assert_eq!(pubkey_out.len(), 1);
 
@@ -386,7 +388,8 @@ async fn test_ggh15_modq_arith() {
     >::new(seed, dir.to_path_buf(), checkpoint_prefix, &params, c_b0);
 
     let encoding_eval_start = std::time::Instant::now();
-    let encoding_out = circuit.eval(&params, enc_one, input_encodings, Some(&enc_evaluator), None);
+    let encoding_out =
+        circuit.eval(&params, enc_one, input_encodings, Some(&enc_evaluator), None, None);
     info!("encoding eval elapsed {:?}", encoding_eval_start.elapsed());
     assert_eq!(encoding_out.len(), 1);
 

@@ -128,7 +128,7 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
         ));
         let plt_evaluator =
             NormPltCommitEvaluator::new(ctx.clone(), &error_sigma, TREE_BASE, &circuit);
-        let e_init_norm = &error_sigma * BigDecimal::from(6u64);
+        let e_init_norm = &error_sigma * BigDecimal::from_f32(6.5).unwrap();
         let input_bound = BigDecimal::from((P - 1) as u64);
 
         let out_errors = circuit.simulate_max_error_norm(
@@ -252,6 +252,7 @@ async fn test_commit_modp_chain_rounding() {
         pubkeys[1..].to_vec(),
         Some(&plt_pubkey_evaluator),
         None,
+        None,
     );
     info!("circuit eval pubkey done");
     assert_eq!(result_pubkey.len(), 1);
@@ -285,7 +286,7 @@ async fn test_commit_modp_chain_rounding() {
 
     info!("circuit eval encoding start");
     let result_encoding =
-        circuit.eval(&params, enc_one, input_encodings, Some(&plt_encoding_evaluator), None);
+        circuit.eval(&params, enc_one, input_encodings, Some(&plt_encoding_evaluator), None, None);
     info!("circuit eval encoding done");
     assert_eq!(result_encoding.len(), 1);
 

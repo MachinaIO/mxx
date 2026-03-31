@@ -9,6 +9,9 @@ fn validate_positive_parallelism(name: &str, value: usize) -> usize {
 }
 
 #[cfg(feature = "gpu")]
+#[allow(dead_code)]
+// This helper is kept for callers that want an explicit GPU-device cap, but
+// `resolve_circuit_parallel_gates` intentionally does not call it.
 fn validate_gpu_parallelism(name: &str, value: usize) -> usize {
     let device_count = default_gpu_parallelism();
     assert!(
@@ -34,22 +37,16 @@ pub fn circuit_parallel_gates() -> Option<usize> {
 /// When `override_parallelism` is `None`, this preserves the existing
 /// `MXX_CIRCUIT_PARALLEL_GATES` behavior.
 pub fn resolve_circuit_parallel_gates(override_parallelism: Option<usize>) -> Option<usize> {
-    let override_parallelism = override_parallelism.map(|value| {
-        let value = validate_positive_parallelism("circuit gate parallelism", value);
-        #[cfg(feature = "gpu")]
-        let value = validate_gpu_parallelism("circuit gate parallelism", value);
-        value
-    });
+    let override_parallelism = override_parallelism
+        .map(|value| validate_positive_parallelism("circuit gate parallelism", value));
     let parsed = std::env::var("MXX_CIRCUIT_PARALLEL_GATES")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|n| *n > 0);
     #[cfg(feature = "gpu")]
     {
-        let value = override_parallelism.unwrap_or_else(|| {
-            let parsed = parsed.unwrap_or_else(default_gpu_parallelism);
-            validate_gpu_parallelism("MXX_CIRCUIT_PARALLEL_GATES", parsed)
-        });
+        let value =
+            override_parallelism.unwrap_or_else(|| parsed.unwrap_or_else(default_gpu_parallelism));
         Some(value)
     }
     #[cfg(not(feature = "gpu"))]
@@ -95,6 +92,8 @@ pub fn ggh15_gate_parallelism() -> usize {
 /// `BGG_POLY_ENCODING_SLOT_PARALLELISM`: max number of BGG poly-encoding slots to process in
 /// parallel in slot-wise arithmetic / evaluable operations.
 /// Default: GPU feature enabled => detected GPU device count, otherwise 30.
+/// GPU feature enabled: logical slot parallelism may exceed the detected device count; the GPU
+/// poly-encoding path assigns logical slots to detected devices in a round-robin pattern.
 pub fn bgg_poly_encoding_slot_parallelism() -> usize {
     let parsed = std::env::var("BGG_POLY_ENCODING_SLOT_PARALLELISM")
         .ok()
@@ -102,15 +101,25 @@ pub fn bgg_poly_encoding_slot_parallelism() -> usize {
         .filter(|n| *n > 0);
     #[cfg(feature = "gpu")]
     {
+        parsed.unwrap_or_else(default_gpu_parallelism)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        parsed.unwrap_or(30)
+    }
+}
+
+/// `SLOT_TRANSFER_SLOT_PARALLELISM`: max number of slot auxiliary samples processed in parallel.
+/// Default: GPU feature enabled => detected GPU device count, otherwise 30.
+pub fn slot_transfer_slot_parallelism() -> usize {
+    let parsed = std::env::var("SLOT_TRANSFER_SLOT_PARALLELISM")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0);
+    #[cfg(feature = "gpu")]
+    {
         let device_count = default_gpu_parallelism();
-        let value = parsed.unwrap_or(device_count);
-        assert!(
-            value <= device_count,
-            "BGG_POLY_ENCODING_SLOT_PARALLELISM must be <= available GPU devices: requested={}, devices={}",
-            value,
-            device_count
-        );
-        value
+        parsed.unwrap_or(device_count).min(device_count).max(1)
     }
     #[cfg(not(feature = "gpu"))]
     {
@@ -126,6 +135,16 @@ pub fn block_size() -> usize {
 /// `LUT_BYTES_LIMIT`: max size of batched lookup tables in bytes (unset = no limit).
 pub fn lut_bytes_limit() -> Option<usize> {
     std::env::var("LUT_BYTES_LIMIT").ok().and_then(|s| s.parse::<usize>().ok())
+}
+
+/// `LUT_INDEX_SYNC_EVERY`: sync `lookup_tables.index` after this many append operations.
+/// Default: 100.
+pub fn lut_index_sync_every() -> usize {
+    std::env::var("LUT_INDEX_SYNC_EVERY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|value| validate_positive_parallelism("LUT_INDEX_SYNC_EVERY", value))
+        .unwrap_or(100)
 }
 
 const DEFAULT_WEE25_TOPJ_BATCH: usize = 200;
@@ -148,4 +167,14 @@ pub fn wee25_commit_cache_persist_batch() -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_WEE25_COMMIT_CACHE_PERSIST_BATCH)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_circuit_parallel_gates;
+
+    #[test]
+    fn resolve_circuit_parallel_gates_preserves_large_override() {
+        assert_eq!(resolve_circuit_parallel_gates(Some(usize::MAX)), Some(usize::MAX));
+    }
 }

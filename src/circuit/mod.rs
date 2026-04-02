@@ -536,6 +536,99 @@ impl<P: Poly> PolyCircuit<P> {
         levels
     }
 
+    fn push_gate_type_at_level(
+        layers: &mut Vec<Vec<PolyGateType>>,
+        level: usize,
+        gate_type: &PolyGateType,
+    ) {
+        if layers.len() <= level {
+            layers.resize(level + 1, vec![]);
+        }
+        layers[level].push(gate_type.clone());
+    }
+
+    pub(crate) fn expanded_gate_types_by_level(&self) -> Vec<Vec<PolyGateType>> {
+        let mut layers = vec![];
+        let input_levels = vec![0; self.num_input()];
+        self.expanded_gate_types_by_level_with_input_levels(&input_levels, &mut layers, true);
+        layers
+    }
+
+    fn expanded_gate_types_by_level_with_input_levels(
+        &self,
+        input_levels: &[usize],
+        layers: &mut Vec<Vec<PolyGateType>>,
+        include_inputs: bool,
+    ) -> Vec<usize> {
+        let mut gate_levels: HashMap<GateId, usize> = HashMap::new();
+        gate_levels.insert(GateId(0), 0);
+
+        let mut input_gate_ids: Vec<GateId> = self
+            .gates
+            .iter()
+            .filter_map(|(id, gate)| match gate.gate_type {
+                PolyGateType::Input if id.0 != 0 => Some(*id),
+                _ => None,
+            })
+            .collect();
+        input_gate_ids.sort_by_key(|gid| gid.0);
+        debug_assert_eq!(input_gate_ids.len(), input_levels.len());
+        for (gid, level) in input_gate_ids.into_iter().zip(input_levels.iter().copied()) {
+            gate_levels.insert(gid, level);
+        }
+
+        let mut call_output_levels: HashMap<usize, Vec<usize>> = HashMap::new();
+        for gate_id in self.topological_order().into_iter() {
+            let gate = self.gates.get(&gate_id).expect("gate not found");
+            let level = match &gate.gate_type {
+                PolyGateType::Input => *gate_levels.get(&gate_id).expect("input gate level missing"),
+                PolyGateType::SubCircuitOutput { call_id, output_idx, .. } => {
+                    let outputs = call_output_levels.entry(*call_id).or_insert_with(|| {
+                        let call =
+                            self.sub_circuit_calls.get(call_id).expect("sub-circuit call missing");
+                        let sub_circuit = self
+                            .sub_circuits
+                            .get(&call.sub_circuit_id)
+                            .expect("sub-circuit missing");
+                        let sub_input_levels: Vec<usize> = call
+                            .inputs
+                            .iter()
+                            .map(|id| *gate_levels.get(id).expect("sub-circuit input level missing"))
+                            .collect();
+                        sub_circuit
+                            .expanded_gate_types_by_level_with_input_levels(
+                                &sub_input_levels,
+                                layers,
+                                false,
+                            )
+                    });
+                    outputs.get(*output_idx).copied().unwrap_or_else(|| {
+                        panic!("sub-circuit output index {} out of range", output_idx)
+                    })
+                }
+                _ => {
+                    let max_input_level = gate
+                        .input_gates
+                        .iter()
+                        .map(|id| gate_levels[id])
+                        .max()
+                        .expect("non-input gate must have inputs");
+                    max_input_level + 1
+                }
+            };
+            gate_levels.insert(gate_id, level);
+            if matches!(gate.gate_type, PolyGateType::SubCircuitOutput { .. }) {
+                continue;
+            }
+            if matches!(gate.gate_type, PolyGateType::Input) && !include_inputs {
+                continue;
+            }
+            Self::push_gate_type_at_level(layers, level, &gate.gate_type);
+        }
+
+        self.output_ids.iter().map(|id| gate_levels[id]).collect()
+    }
+
     /// Returns the circuit depth defined as the maximum level index among
     /// all gates required to compute the outputs.
     ///

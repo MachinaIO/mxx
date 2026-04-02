@@ -1,5 +1,6 @@
 #![cfg(feature = "gpu")]
 
+use bigdecimal::{BigDecimal, FromPrimitive};
 use keccak_asm::Keccak256;
 use mxx::{
     bgg::sampler::{BGGPolyEncodingSampler, BGGPublicKeySampler},
@@ -9,7 +10,10 @@ use mxx::{
         arith::encode_nested_rns_poly_with_offset,
         fhe::ckks::{CKKSCiphertext, CKKSContext, sample_relinearization_eval_key_slots},
     },
-    lookup::ggh15_eval::{GGH15BGGPolyEncodingPltEvaluator, GGH15BGGPubKeyPltEvaluator},
+    lookup::{
+        PltEvaluator,
+        ggh15_eval::{GGH15BGGPolyEncodingPltEvaluator, GGH15BGGPubKeyPltEvaluator},
+    },
     matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
@@ -28,9 +32,15 @@ use mxx::{
         trapdoor::GpuDCRTPolyTrapdoorSampler,
         uniform::DCRTPolyUniformSampler,
     },
+    simulator::{
+        SimulatorContext,
+        error_norm::{ErrorNorm, NormBggPolyEncodingSTEvaluator, NormPltGGH15Evaluator},
+        poly_matrix_norm::PolyMatrixNorm,
+        poly_norm::PolyNorm,
+    },
     slot_transfer::{BggPolyEncodingSTEvaluator, bgg_pubkey::BggPublicKeySTEvaluator},
     storage::write::{init_storage_system, wait_for_all_writes},
-    utils::{gen_biguint_for_modulus, mod_inverse},
+    utils::{bigdecimal_bits_ceil, gen_biguint_for_modulus, mod_inverse},
 };
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
@@ -38,16 +48,16 @@ use rayon::prelude::*;
 use std::{env, fs, path::Path, sync::Arc, time::Instant};
 use tracing::{debug, info};
 
-const DEFAULT_RING_DIM: u32 = 1 << 3;
-const DEFAULT_NUM_SLOTS: usize = 2;
+const DEFAULT_RING_DIM: u32 = 1 << 14;
+const DEFAULT_NUM_SLOTS: usize = 1 << 14;
 const DEFAULT_CRT_BITS: usize = 24;
 const DEFAULT_P_MODULI_BITS: usize = 7;
 const DEFAULT_SCALE: u64 = 256;
 const DEFAULT_BASE_BITS: u32 = 12;
-const DEFAULT_ACTIVE_LEVELS: usize = 5;
+const DEFAULT_MAX_CRT_DEPTH: usize = 32;
 const DEFAULT_RELIN_EXTRA_LEVELS: usize = 1;
 const DEFAULT_MAX_UNREDUCED_MULS: usize = 2;
-const DEFAULT_ERROR_SIGMA: f64 = 0.0;
+const DEFAULT_ERROR_SIGMA: f64 = 4.0;
 const DEFAULT_D_SECRET: usize = 1;
 const DEFAULT_PLAINTEXT_BITS: usize = DEFAULT_CRT_BITS / 2 - 1;
 const TRAPDOOR_SIGMA: f64 = 4.578;
@@ -60,7 +70,7 @@ struct CkksMulConfig {
     p_moduli_bits: usize,
     scale: u64,
     base_bits: u32,
-    active_levels: usize,
+    max_crt_depth: usize,
     relinearization_extra_levels: usize,
     max_unreduced_muls: usize,
     error_sigma: f64,
@@ -69,10 +79,9 @@ struct CkksMulConfig {
     dir_name_override: Option<String>,
 }
 
-#[derive(Debug)]
-struct BuiltMulRescaleCircuit {
-    circuit: PolyCircuit<GpuDCRTPoly>,
-    ctx: Arc<CKKSContext<GpuDCRTPoly>>,
+struct BuiltMulRescaleCircuit<P: Poly> {
+    circuit: PolyCircuit<P>,
+    ctx: Arc<CKKSContext<P>>,
     output_error_bounds: (BigUint, BigUint),
 }
 
@@ -115,8 +124,8 @@ impl CkksMulConfig {
             env_or_parse_usize("GGH15_CKKS_MUL_P_MODULI_BITS", DEFAULT_P_MODULI_BITS);
         let scale = env_or_parse_u64("GGH15_CKKS_MUL_SCALE", DEFAULT_SCALE);
         let base_bits = env_or_parse_u32("GGH15_CKKS_MUL_BASE_BITS", DEFAULT_BASE_BITS);
-        let active_levels =
-            env_or_parse_usize("GGH15_CKKS_MUL_ACTIVE_LEVELS", DEFAULT_ACTIVE_LEVELS);
+        let max_crt_depth =
+            env_or_parse_usize("GGH15_CKKS_MUL_MAX_CRT_DEPTH", DEFAULT_MAX_CRT_DEPTH);
         let relinearization_extra_levels =
             env_or_parse_usize("GGH15_CKKS_MUL_RELIN_EXTRA_LEVELS", DEFAULT_RELIN_EXTRA_LEVELS);
         let max_unreduced_muls =
@@ -137,11 +146,12 @@ impl CkksMulConfig {
         assert!(p_moduli_bits > 0, "GGH15_CKKS_MUL_P_MODULI_BITS must be > 0");
         assert!(scale > 0, "GGH15_CKKS_MUL_SCALE must be > 0");
         assert!(base_bits > 0, "GGH15_CKKS_MUL_BASE_BITS must be > 0");
-        assert!(
-            active_levels > 1,
-            "GGH15_CKKS_MUL_ACTIVE_LEVELS must be greater than 1 for mul+rescale"
-        );
+        assert!(max_crt_depth > 0, "GGH15_CKKS_MUL_MAX_CRT_DEPTH must be > 0");
         assert!(relinearization_extra_levels > 0, "GGH15_CKKS_MUL_RELIN_EXTRA_LEVELS must be > 0");
+        assert!(
+            max_crt_depth > relinearization_extra_levels + 1,
+            "GGH15_CKKS_MUL_MAX_CRT_DEPTH must exceed GGH15_CKKS_MUL_RELIN_EXTRA_LEVELS + 1 for mul+rescale"
+        );
         assert!(max_unreduced_muls > 0, "GGH15_CKKS_MUL_MAX_UNREDUCED_MULS must be > 0");
         assert!(error_sigma >= 0.0, "GGH15_CKKS_MUL_ERROR_SIGMA must be >= 0");
         assert!(d_secret > 0, "GGH15_CKKS_MUL_D_SECRET must be > 0");
@@ -154,7 +164,7 @@ impl CkksMulConfig {
             p_moduli_bits,
             scale,
             base_bits,
-            active_levels,
+            max_crt_depth,
             relinearization_extra_levels,
             max_unreduced_muls,
             error_sigma,
@@ -164,19 +174,31 @@ impl CkksMulConfig {
         }
     }
 
-    fn crt_depth(&self) -> usize {
-        self.active_levels + self.relinearization_extra_levels
+    fn min_crt_depth(&self) -> usize {
+        self.relinearization_extra_levels + 2
+    }
+
+    fn active_levels_for_crt_depth(&self, crt_depth: usize) -> usize {
+        assert!(
+            crt_depth >= self.min_crt_depth(),
+            "crt_depth {} must be at least {} for mul+rescale with relinearization_extra_levels={}",
+            crt_depth,
+            self.min_crt_depth(),
+            self.relinearization_extra_levels
+        );
+        crt_depth - self.relinearization_extra_levels
     }
 
     fn plaintext_bound(&self) -> BigUint {
         BigUint::from(1u64) << self.plaintext_bits
     }
 
-    fn dir_name(&self) -> String {
+    fn dir_name(&self, crt_depth: usize) -> String {
+        let active_levels = self.active_levels_for_crt_depth(crt_depth);
         self.dir_name_override.clone().unwrap_or_else(|| {
             format!(
                 "test_data/test_gpu_ggh15_ckks_mul_active_{}_relin_{}",
-                self.active_levels, self.relinearization_extra_levels
+                active_levels, self.relinearization_extra_levels
             )
         })
     }
@@ -420,12 +442,41 @@ fn slot_major_compact_bytes_to_plaintext_rows(
     plaintext_rows
 }
 
-fn build_ckks_mul_rescale_circuit_gpu(
-    params: &GpuDCRTPolyParams,
+fn simulate_max_error_norm_with_slot_transfer<P: PltEvaluator<ErrorNorm>>(
+    circuit: &PolyCircuit<DCRTPoly>,
+    ctx: Arc<SimulatorContext>,
+    input_norm_bound: BigDecimal,
+    input_size: usize,
+    e_init_norm: &BigDecimal,
+    plt_evaluator: &P,
+    slot_transfer_evaluator: &NormBggPolyEncodingSTEvaluator,
+) -> Vec<ErrorNorm> {
+    let one_error = ErrorNorm::new(
+        PolyNorm::one(ctx.clone()),
+        PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, e_init_norm.clone(), None),
+    );
+    let input_error = ErrorNorm::new(
+        PolyNorm::new(ctx.clone(), input_norm_bound),
+        PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, e_init_norm.clone(), None),
+    );
+    let input_errors = vec![input_error; input_size];
+    circuit.eval(
+        &(),
+        one_error,
+        input_errors,
+        Some(plt_evaluator),
+        Some(slot_transfer_evaluator),
+        None,
+    )
+}
+
+fn build_ckks_mul_rescale_circuit<P: Poly + 'static>(
+    params: &P::Params,
     cfg: &CkksMulConfig,
-) -> BuiltMulRescaleCircuit {
+    active_levels: usize,
+) -> BuiltMulRescaleCircuit<P> {
     let build_start = Instant::now();
-    let mut circuit = PolyCircuit::<GpuDCRTPoly>::new();
+    let mut circuit = PolyCircuit::<P>::new();
 
     // Match the zero-input-error CKKS reference test; the configurable Gaussian noise is for the
     // outer GGH15 encoding samplers only.
@@ -441,8 +492,8 @@ fn build_ckks_mul_rescale_circuit_gpu(
         cfg.relinearization_extra_levels,
         None,
     ));
-    let lhs = CKKSCiphertext::input(ctx.clone(), Some(cfg.active_levels), &mut circuit);
-    let rhs = CKKSCiphertext::input(ctx.clone(), Some(cfg.active_levels), &mut circuit);
+    let lhs = CKKSCiphertext::input(ctx.clone(), Some(active_levels), &mut circuit);
+    let rhs = CKKSCiphertext::input(ctx.clone(), Some(active_levels), &mut circuit);
     let eval_keys = CKKSCiphertext::alloc_eval_keys(ctx.clone(), &mut circuit);
     let product = lhs.mul(&rhs, &eval_keys, &mut circuit);
     let rescaled = product.rescale(&mut circuit);
@@ -452,11 +503,87 @@ fn build_ckks_mul_rescale_circuit_gpu(
     circuit.output(vec![rescaled_c0_poly, rescaled_c1_poly]);
 
     info!(
-        "gpu ckks mul-rescale circuit build elapsed_ms={:.3}",
+        "ckks mul-rescale circuit build elapsed_ms={:.3}",
         build_start.elapsed().as_secs_f64() * 1000.0
     );
 
     BuiltMulRescaleCircuit { circuit, ctx, output_error_bounds }
+}
+
+fn find_crt_depth_for_ckks_mul(cfg: &CkksMulConfig) -> (usize, DCRTPolyParams) {
+    let ring_dim_sqrt = BigDecimal::from_u32(cfg.ring_dim).unwrap().sqrt().unwrap();
+    let base = BigDecimal::from_biguint(BigUint::from(1u32) << cfg.base_bits, 0);
+    let error_sigma = BigDecimal::from_f64(cfg.error_sigma).expect("valid error sigma");
+    let e_init_norm = &error_sigma * BigDecimal::from_f32(6.5).unwrap();
+    let input_bound = BigDecimal::from((1u64 << cfg.p_moduli_bits) - 1);
+
+    for crt_depth in cfg.min_crt_depth()..=cfg.max_crt_depth {
+        let active_levels = cfg.active_levels_for_crt_depth(crt_depth);
+        let params = DCRTPolyParams::new(cfg.ring_dim, crt_depth, cfg.crt_bits, cfg.base_bits);
+        let (all_q_moduli, _, actual_crt_depth) = params.to_crt();
+        let kept_q_moduli =
+            q_window_moduli(&all_q_moduli, cfg.relinearization_extra_levels, active_levels - 1);
+        let kept_modulus =
+            q_window_modulus(&all_q_moduli, cfg.relinearization_extra_levels, active_levels - 1);
+        let q_max = *kept_q_moduli.iter().max().expect("kept CRT modulus list must not be empty");
+        let threshold = &kept_modulus / BigUint::from(2u64 * q_max);
+        let threshold_bd = BigDecimal::from_biguint(threshold.clone(), 0);
+        let BuiltMulRescaleCircuit { circuit, .. } =
+            build_ckks_mul_rescale_circuit::<DCRTPoly>(&params, cfg, active_levels);
+
+        let log_base_q = params.modulus_digits();
+        let log_base_q_small = log_base_q / actual_crt_depth;
+        let ctx = Arc::new(SimulatorContext::new(
+            ring_dim_sqrt.clone(),
+            base.clone(),
+            cfg.d_secret,
+            log_base_q,
+            log_base_q_small,
+        ));
+        let plt_evaluator =
+            NormPltGGH15Evaluator::new(ctx.clone(), &error_sigma, &error_sigma, None);
+        let slot_transfer_evaluator =
+            NormBggPolyEncodingSTEvaluator::new(ctx.clone(), cfg.error_sigma, &error_sigma, None);
+        let out_errors = simulate_max_error_norm_with_slot_transfer(
+            &circuit,
+            ctx,
+            input_bound.clone(),
+            circuit.num_input(),
+            &e_init_norm,
+            &plt_evaluator,
+            &slot_transfer_evaluator,
+        );
+        assert_eq!(out_errors.len(), 2, "mul-then-rescale circuit must output two error bounds");
+
+        let max_error_bits = out_errors
+            .iter()
+            .map(|error| bigdecimal_bits_ceil(&error.matrix_norm.poly_norm.norm))
+            .max()
+            .expect("mul-then-rescale circuit must produce output error bounds");
+        let all_ok = out_errors.iter().all(|error| error.matrix_norm.poly_norm.norm < threshold_bd);
+
+        info!(
+            "crt_depth={} active_levels={} q_bits={} max_error_bits={} threshold_bits={}",
+            crt_depth,
+            active_levels,
+            kept_modulus.bits(),
+            max_error_bits,
+            bigdecimal_bits_ceil(&BigDecimal::from_biguint(threshold, 0))
+        );
+
+        if all_ok {
+            info!(
+                "selected crt_depth={} active_levels={} for CKKS mul-rescale with max_error_bits={}",
+                crt_depth, active_levels, max_error_bits
+            );
+            return (crt_depth, params);
+        }
+    }
+
+    panic!(
+        "crt_depth satisfying error < q/(2*q_max) for the CKKS mul-rescale circuit was not found up to GGH15_CKKS_MUL_MAX_CRT_DEPTH ({})",
+        cfg.max_crt_depth
+    );
 }
 
 #[tokio::test]
@@ -467,8 +594,8 @@ async fn test_gpu_ggh15_ckks_mul() {
     let cfg = CkksMulConfig::from_env();
     info!("ckks mul test config: {:?}", cfg);
 
-    let cpu_params =
-        DCRTPolyParams::new(cfg.ring_dim, cfg.crt_depth(), cfg.crt_bits, cfg.base_bits);
+    let (crt_depth, cpu_params) = find_crt_depth_for_ckks_mul(&cfg);
+    let active_levels = cfg.active_levels_for_crt_depth(crt_depth);
     let (moduli, _, _) = cpu_params.to_crt();
     let detected_gpu_ids = detected_gpu_device_ids();
     let detected_gpu_count = detected_gpu_device_count();
@@ -497,18 +624,18 @@ async fn test_gpu_ggh15_ckks_mul() {
     let (all_q_moduli, _, _) = params.to_crt();
     let q_max = *all_q_moduli.iter().max().expect("CRT modulus list must not be empty");
     let kept_modulus =
-        q_window_modulus(&all_q_moduli, cfg.relinearization_extra_levels, cfg.active_levels - 1);
+        q_window_modulus(&all_q_moduli, cfg.relinearization_extra_levels, active_levels - 1);
 
     let BuiltMulRescaleCircuit { circuit, ctx, output_error_bounds } =
-        build_ckks_mul_rescale_circuit_gpu(&params, &cfg);
+        build_ckks_mul_rescale_circuit::<GpuDCRTPoly>(&params, &cfg, active_levels);
     info!(
         "selected crt_depth={} ring_dim={} num_slots={} crt_bits={} base_bits={} active_levels={} relin_extra_levels={} q_moduli={:?}",
-        cfg.crt_depth(),
+        crt_depth,
         params.ring_dimension(),
         cfg.num_slots,
         cfg.crt_bits,
         cfg.base_bits,
-        cfg.active_levels,
+        active_levels,
         cfg.relinearization_extra_levels,
         all_q_moduli
     );
@@ -539,7 +666,7 @@ async fn test_gpu_ggh15_ckks_mul() {
         cfg.num_slots,
         &lhs_scaled_slots,
         &secret_key,
-        cfg.active_levels,
+        active_levels,
     );
     let (rhs_c0, rhs_c1) = encrypt_zero_error_ciphertext(
         &cpu_params,
@@ -548,7 +675,7 @@ async fn test_gpu_ggh15_ckks_mul() {
         cfg.num_slots,
         &rhs_scaled_slots,
         &secret_key,
-        cfg.active_levels,
+        active_levels,
     );
     info!(
         "ckks input synthesis elapsed_ms={:.3}",
@@ -559,7 +686,7 @@ async fn test_gpu_ggh15_ckks_mul() {
     let input_materialization_start = Instant::now();
     debug!(
         "slot input materialization started: num_slots={} flattened_input_count={} active_levels={} relin_extra_levels={}",
-        cfg.num_slots, flattened_input_count, cfg.active_levels, cfg.relinearization_extra_levels
+        cfg.num_slots, flattened_input_count, active_levels, cfg.relinearization_extra_levels
     );
     let lhs_input_bytes_by_slot = ciphertext_inputs_from_polys(
         &params,
@@ -567,7 +694,7 @@ async fn test_gpu_ggh15_ckks_mul() {
         &lhs_c0,
         &lhs_c1,
         cfg.relinearization_extra_levels,
-        cfg.active_levels,
+        active_levels,
     );
     let rhs_input_bytes_by_slot = ciphertext_inputs_from_polys(
         &params,
@@ -575,7 +702,7 @@ async fn test_gpu_ggh15_ckks_mul() {
         &rhs_c0,
         &rhs_c1,
         cfg.relinearization_extra_levels,
-        cfg.active_levels,
+        active_levels,
     );
     let eval_key_input_bytes_by_slot = ciphertext_inputs_from_polys(
         &params,
@@ -583,7 +710,7 @@ async fn test_gpu_ggh15_ckks_mul() {
         &eval_key_polys.b0,
         &eval_key_polys.b1,
         0,
-        cfg.crt_depth(),
+        crt_depth,
     );
     assert_eq!(
         lhs_input_bytes_by_slot.len(),
@@ -632,7 +759,7 @@ async fn test_gpu_ggh15_ckks_mul() {
     );
 
     let seed: [u8; 32] = [0u8; 32];
-    let dir_name = cfg.dir_name();
+    let dir_name = cfg.dir_name(crt_depth);
     let dir = Path::new(&dir_name);
     if !dir.exists() {
         fs::create_dir_all(dir).expect("failed to create test directory");
@@ -858,14 +985,14 @@ async fn test_gpu_ggh15_ckks_mul() {
         &all_q_moduli,
         &output_eval_slots[0],
         cfg.relinearization_extra_levels,
-        cfg.active_levels - 1,
+        active_levels - 1,
     );
     let rescaled_c1_coeffs = coeffs_from_eval_slots_for_q_window(
         &cpu_params,
         &all_q_moduli,
         &output_eval_slots[1],
         cfg.relinearization_extra_levels,
-        cfg.active_levels - 1,
+        active_levels - 1,
     );
     let rescaled_c0_coeff_poly = DCRTPoly::from_biguints(&cpu_params, &rescaled_c0_coeffs);
     let rescaled_c1_coeff_poly = DCRTPoly::from_biguints(&cpu_params, &rescaled_c1_coeffs);
@@ -887,10 +1014,9 @@ async fn test_gpu_ggh15_ckks_mul() {
         &all_q_moduli,
         &expected_scaled_product_slots,
         cfg.relinearization_extra_levels,
-        cfg.active_levels,
+        active_levels,
     );
-    let removed_modulus_u64 =
-        all_q_moduli[cfg.relinearization_extra_levels + cfg.active_levels - 1];
+    let removed_modulus_u64 = all_q_moduli[cfg.relinearization_extra_levels + active_levels - 1];
     let removed_modulus = BigUint::from(removed_modulus_u64);
     let expected_coeffs = expected_pre_rescale_coeffs
         .iter()

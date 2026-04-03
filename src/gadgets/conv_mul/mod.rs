@@ -345,4 +345,28 @@ mod tests {
             },
         );
     }
+
+    #[sequential_test::sequential]
+    #[test]
+    // #[ignore = "expensive circuit-structure reporting test; run with --ignored --nocapture"]
+    fn test_negacyclic_conv_mul_large_circuit_metrics() {
+        let crt_bits = 24usize;
+        let crt_depth = 1usize;
+        let ring_dim = 1u32 << 10;
+        let num_slots = 1usize << 10;
+        let params = DCRTPolyParams::new(ring_dim, crt_depth, crt_bits, BASE_BITS);
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let ctx = test_context(&mut circuit, &params);
+        let lhs = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
+        let rhs = NestedRnsPoly::input(ctx, None, None, &mut circuit);
+        let product = negacyclic_conv_mul(&params, &mut circuit, &lhs, &rhs, num_slots);
+        let output = product.reconstruct(&mut circuit);
+        circuit.output(vec![output]);
+
+        println!(
+            "negacyclic_conv_mul metrics: crt_bits={crt_bits}, crt_depth={crt_depth}, ring_dim={ring_dim}, num_slots={num_slots}"
+        );
+        println!("non-free depth {}", circuit.non_free_depth());
+        println!("gate counts {:?}", circuit.count_gates_by_type_vec());
+    }
 }

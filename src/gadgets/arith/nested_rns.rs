@@ -24,16 +24,17 @@ pub struct NestedRnsPolyContext {
     pub p_moduli: Vec<u64>,
     q_moduli: Vec<u64>,
     pub q_moduli_depth: usize,
+    p_max: u64,
+    lut_mod_p_max_map_size: BigUint,
     p_full: BigUint,
     p_over_pis: Vec<BigUint>,
     pub full_reduce_max_plaintexts: Vec<BigUint>,
     lut_x_to_y_ids: Vec<usize>,
     lut_x_to_real_ids: Vec<usize>,
     lut_real_to_v_id: usize,
+    add_without_reduce_id: usize,
     lazy_reduce_id: usize,
     full_reduce_ids: Vec<usize>,
-    add_lazy_reduce_ids: Vec<usize>,
-    sub_lazy_reduce_ids: Vec<usize>,
     mul_lazy_reduce_ids: Vec<usize>,
 }
 
@@ -102,9 +103,21 @@ fn sample_crt_primes_mul_budget_bound(
     BigUint::from(sum_p_moduli + modulus_count) * BigUint::from(q_max) / BigUint::from(2u64)
 }
 
+fn lut_mod_p_map_size(p_i: u64, max_p_modulus: u64, modulus_count: usize) -> u128 {
+    (p_i as u128 * max_p_modulus as u128).max(p_i as u128 * (2 * modulus_count) as u128)
+}
+
 impl NestedRnsPolyContext {
     pub(crate) fn q_moduli(&self) -> &[u64] {
         &self.q_moduli
+    }
+
+    fn reduced_p_max_trace(&self) -> BigUint {
+        BigUint::from(self.p_max - 1)
+    }
+
+    fn unreduced_trace_threshold(&self) -> BigUint {
+        BigUint::from(self.p_max)
     }
 
     pub fn setup<P: Poly + 'static>(
@@ -132,6 +145,9 @@ impl NestedRnsPolyContext {
             p_moduli, q_moduli, scale, max_unreduced_muls
         );
         let p_moduli_depth = p_moduli.len();
+        let max_p_modulus = *p_moduli.iter().max().expect("p_moduli must not be empty");
+        let lut_mod_p_max_map_size =
+            BigUint::from(lut_mod_p_map_size(max_p_modulus, max_p_modulus, p_moduli_depth));
         let active_q_moduli = q_moduli.iter().take(q_moduli_depth).copied().collect::<Vec<_>>();
         if dummy_scalar {
             let dummy_lut = dummy_lut::<P>(params);
@@ -166,22 +182,8 @@ impl NestedRnsPolyContext {
                     scalars_v[q_idx][p_i_idx] = p_mod_qk_mod_pi as u32;
                 }
             }
-            let add_lazy_reduce_ids = (0..q_moduli_depth)
-                .map(|_| {
-                    circuit.register_sub_circuit(Self::add_lazy_reduce_subcircuit::<P>(
-                        &p_moduli,
-                        &lut_mod_p_ids,
-                    ))
-                })
-                .collect::<Vec<_>>();
-            let sub_lazy_reduce_ids = (0..q_moduli_depth)
-                .map(|_| {
-                    circuit.register_sub_circuit(Self::sub_lazy_reduce_subcircuit::<P>(
-                        &p_moduli,
-                        &lut_mod_p_ids,
-                    ))
-                })
-                .collect::<Vec<_>>();
+            let add_without_reduce_id =
+                circuit.register_sub_circuit(Self::add_without_reduce_subcircuit::<P>(&p_moduli));
             let mul_lazy_reduce_ids = (0..q_moduli_depth)
                 .map(|_| {
                     circuit.register_sub_circuit(Self::mul_lazy_reduce_subcircuit::<P>(
@@ -211,16 +213,17 @@ impl NestedRnsPolyContext {
                 p_moduli,
                 q_moduli: active_q_moduli,
                 q_moduli_depth,
+                p_max: max_p_modulus,
+                lut_mod_p_max_map_size,
                 p_full,
                 p_over_pis,
                 full_reduce_max_plaintexts,
                 lut_x_to_y_ids,
                 lut_x_to_real_ids,
                 lut_real_to_v_id,
+                add_without_reduce_id,
                 lazy_reduce_id,
                 full_reduce_ids,
-                add_lazy_reduce_ids,
-                sub_lazy_reduce_ids,
                 mul_lazy_reduce_ids,
             };
         }
@@ -232,7 +235,6 @@ impl NestedRnsPolyContext {
             .collect::<Vec<_>>();
         let p_over_pis =
             p_moduli.iter().map(|&p_i| &p_full / BigUint::from(p_i)).collect::<Vec<_>>();
-        let max_p_modulus = *p_moduli.iter().max().expect("p_moduli must not be empty");
 
         let mut lut_mod_p = Vec::with_capacity(p_moduli_depth);
         let mut lut_x_to_y = Vec::with_capacity(p_moduli_depth);
@@ -241,8 +243,7 @@ impl NestedRnsPolyContext {
         let mut scalars_v = vec![vec![0; p_moduli_depth]; q_moduli_depth];
 
         for (p_i_idx, &p_i) in p_moduli.iter().enumerate() {
-            let lut_mod_p_map_size = (p_i as u128 * max_p_modulus as u128)
-                .max(p_i as u128 * (2 * p_moduli.len()) as u128);
+            let lut_mod_p_map_size = lut_mod_p_map_size(p_i, max_p_modulus, p_moduli.len());
             // .checked_mul(max_p_modulus as u128)
             // .expect("lut_mod_p_map_size overflow");
             debug_assert!(
@@ -417,22 +418,8 @@ impl NestedRnsPolyContext {
             .collect::<Vec<_>>();
         let lut_real_to_v_id = circuit.register_public_lookup(lut_real_to_v.clone());
 
-        let add_lazy_reduce_ids = (0..q_moduli_depth)
-            .map(|_| {
-                circuit.register_sub_circuit(Self::add_lazy_reduce_subcircuit::<P>(
-                    &p_moduli,
-                    &lut_mod_p_ids,
-                ))
-            })
-            .collect::<Vec<_>>();
-        let sub_lazy_reduce_ids = (0..q_moduli_depth)
-            .map(|_| {
-                circuit.register_sub_circuit(Self::sub_lazy_reduce_subcircuit::<P>(
-                    &p_moduli,
-                    &lut_mod_p_ids,
-                ))
-            })
-            .collect::<Vec<_>>();
+        let add_without_reduce_id =
+            circuit.register_sub_circuit(Self::add_without_reduce_subcircuit::<P>(&p_moduli));
         let mul_lazy_reduce_ids = (0..q_moduli_depth)
             .map(|_| {
                 circuit.register_sub_circuit(Self::mul_lazy_reduce_subcircuit::<P>(
@@ -462,52 +449,19 @@ impl NestedRnsPolyContext {
             p_moduli,
             q_moduli: active_q_moduli,
             q_moduli_depth,
+            p_max: max_p_modulus,
+            lut_mod_p_max_map_size,
             p_full,
             p_over_pis,
             full_reduce_max_plaintexts,
             lut_x_to_y_ids,
             lut_x_to_real_ids,
             lut_real_to_v_id,
+            add_without_reduce_id,
             lazy_reduce_id,
             full_reduce_ids,
-            add_lazy_reduce_ids,
-            sub_lazy_reduce_ids,
             mul_lazy_reduce_ids,
         }
-    }
-
-    fn add_lazy_reduce_subcircuit<P: Poly>(
-        p_moduli: &[u64],
-        lut_mod_p_ids: &[usize],
-    ) -> PolyCircuit<P> {
-        let mut circuit = PolyCircuit::<P>::new();
-        let add_circuit = Self::add_without_reduce_subcircuit::<P>(p_moduli);
-        let reduce_circuit = Self::lazy_reduce_subcircuit::<P>(p_moduli, lut_mod_p_ids);
-        let p_moduli_depth = p_moduli.len();
-        let inputs = circuit.input(p_moduli_depth * 2);
-        let add_circuit_id = circuit.register_sub_circuit(add_circuit);
-        let sum = circuit.call_sub_circuit(add_circuit_id, &inputs);
-        let reduce_circuit_id = circuit.register_sub_circuit(reduce_circuit);
-        let reduced = circuit.call_sub_circuit(reduce_circuit_id, &sum);
-        circuit.output(reduced);
-        circuit
-    }
-
-    fn sub_lazy_reduce_subcircuit<P: Poly>(
-        p_moduli: &[u64],
-        lut_mod_p_ids: &[usize],
-    ) -> PolyCircuit<P> {
-        let mut circuit = PolyCircuit::<P>::new();
-        let sub_circuit = Self::sub_without_reduce_subcircuit::<P>(p_moduli);
-        let reduce_circuit = Self::lazy_reduce_subcircuit::<P>(p_moduli, lut_mod_p_ids);
-        let p_moduli_depth = p_moduli.len();
-        let inputs = circuit.input(p_moduli_depth * 2);
-        let sub_circuit_id = circuit.register_sub_circuit(sub_circuit);
-        let diff = circuit.call_sub_circuit(sub_circuit_id, &inputs);
-        let reduce_circuit_id = circuit.register_sub_circuit(reduce_circuit);
-        let reduced = circuit.call_sub_circuit(reduce_circuit_id, &diff);
-        circuit.output(reduced);
-        circuit
     }
 
     fn mul_lazy_reduce_subcircuit<P: Poly>(
@@ -537,23 +491,6 @@ impl NestedRnsPolyContext {
         for p_idx in 0..p_moduli_depth {
             let sum_gate = circuit.add_gate(left[p_idx], right[p_idx]);
             result_p_moduli.push(sum_gate);
-        }
-        circuit.output(result_p_moduli);
-        circuit
-    }
-
-    fn sub_without_reduce_subcircuit<P: Poly>(p_moduli: &[u64]) -> PolyCircuit<P> {
-        let mut circuit = PolyCircuit::<P>::new();
-        let p_moduli_depth = p_moduli.len();
-        let inputs = circuit.input(p_moduli_depth * 2);
-        let mut result_p_moduli = Vec::with_capacity(p_moduli_depth);
-        let left = inputs[..p_moduli_depth].to_vec();
-        let right = inputs[p_moduli_depth..].to_vec();
-        for p_idx in 0..p_moduli_depth {
-            let p_i = circuit.const_digits(&[p_moduli[p_idx] as u32]);
-            let sum_gate = circuit.add_gate(left[p_idx], p_i);
-            let sub_gate = circuit.sub_gate(sum_gate, right[p_idx]);
-            result_p_moduli.push(sub_gate);
         }
         circuit.output(result_p_moduli);
         circuit
@@ -650,6 +587,7 @@ pub struct NestedRnsPoly<P: Poly> {
     pub level_offset: usize,
     pub enable_levels: Option<usize>,
     pub max_plaintexts: Vec<BigUint>,
+    pub(crate) p_max_traces: Vec<BigUint>,
     _p: PhantomData<P>,
 }
 
@@ -662,10 +600,24 @@ impl<P: Poly> NestedRnsPoly<P> {
         max_plaintexts: Vec<BigUint>,
     ) -> Self {
         let level_offset = level_offset.unwrap_or(0);
-        let poly =
-            Self { ctx, inner, level_offset, enable_levels, max_plaintexts, _p: PhantomData };
+        let p_max_traces = vec![ctx.reduced_p_max_trace(); inner.len()];
+        let poly = Self {
+            ctx,
+            inner,
+            level_offset,
+            enable_levels,
+            max_plaintexts,
+            p_max_traces,
+            _p: PhantomData,
+        };
         poly.validate_enable_levels(poly.enable_levels);
         poly
+    }
+
+    pub(crate) fn with_p_max_traces(mut self, p_max_traces: Vec<BigUint>) -> Self {
+        self.p_max_traces = p_max_traces;
+        self.validate_enable_levels(self.enable_levels);
+        self
     }
 
     pub fn input(
@@ -692,6 +644,86 @@ impl<P: Poly> NestedRnsPoly<P> {
         Self::new(ctx, inner, Some(level_offset), enable_levels, max_plaintexts)
     }
 
+    fn lazy_reduce_selected_levels(
+        &self,
+        reduce_levels: &[bool],
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        let levels = self.resolve_enable_levels();
+        assert_eq!(
+            reduce_levels.len(),
+            levels,
+            "lazy reduce mask length {} must match active levels {}",
+            reduce_levels.len(),
+            levels
+        );
+        if !reduce_levels.iter().any(|&flag| flag) {
+            return self.clone();
+        }
+
+        let mut inner = self.inner.clone();
+        let mut p_max_traces = self.p_max_traces.clone();
+        let reduced_trace = self.ctx.reduced_p_max_trace();
+        for q_idx in 0..levels {
+            if reduce_levels[q_idx] {
+                inner[q_idx] =
+                    circuit.call_sub_circuit(self.ctx.lazy_reduce_id, &self.inner[q_idx]);
+                p_max_traces[q_idx] = reduced_trace.clone();
+            }
+        }
+        Self::new(
+            self.ctx.clone(),
+            inner,
+            Some(self.level_offset),
+            self.enable_levels,
+            self.max_plaintexts.clone(),
+        )
+        .with_p_max_traces(p_max_traces)
+    }
+
+    fn lazy_reduce_if_unreduced(&self, circuit: &mut PolyCircuit<P>) -> Self {
+        let threshold = self.ctx.unreduced_trace_threshold();
+        let reduce_levels = self.p_max_traces[..self.resolve_enable_levels()]
+            .iter()
+            .map(|trace| trace >= &threshold)
+            .collect::<Vec<_>>();
+        self.lazy_reduce_selected_levels(&reduce_levels, circuit)
+    }
+
+    fn reduced_p_max_traces(&self) -> Vec<BigUint> {
+        vec![self.ctx.reduced_p_max_trace(); self.resolve_enable_levels()]
+    }
+
+    fn compute_add_output_p_max_traces(&self, other: &Self) -> Vec<BigUint> {
+        let levels = self.resolve_enable_levels();
+        (0..levels).map(|q_idx| &self.p_max_traces[q_idx] + &other.p_max_traces[q_idx]).collect()
+    }
+
+    fn trace_multiplier(&self, trace: &BigUint) -> BigUint {
+        (trace + BigUint::from(self.ctx.p_max - 1)) / BigUint::from(self.ctx.p_max)
+    }
+
+    fn compute_sub_output_p_max_traces(&self, other: &Self) -> Vec<BigUint> {
+        let levels = self.resolve_enable_levels();
+        let p_max = BigUint::from(self.ctx.p_max);
+        (0..levels)
+            .map(|q_idx| {
+                &self.p_max_traces[q_idx] +
+                    self.trace_multiplier(&other.p_max_traces[q_idx]) * &p_max
+            })
+            .collect()
+    }
+
+    fn assert_p_max_traces_within_lut_map_size(&self, traces: &[BigUint], message: &str) {
+        assert!(
+            traces.iter().all(|trace| trace < &self.ctx.lut_mod_p_max_map_size),
+            "{}: p_max_traces={:?}, lut_mod_p_max_map_size={}",
+            message,
+            traces,
+            self.ctx.lut_mod_p_max_map_size
+        );
+    }
+
     pub fn slot_transfer(
         &self,
         src_slots: &[(u32, Option<Vec<u64>>)],
@@ -702,6 +734,7 @@ impl<P: Poly> NestedRnsPoly<P> {
         if self.bounds_exceed_p_full(&predicted_bounds) {
             operand = self.full_reduce(circuit);
         }
+        operand = operand.lazy_reduce_if_unreduced(circuit);
         let final_bounds = operand.compute_slot_transfer_output_bounds(src_slots);
         operand.assert_bounds_within_p_full(
             &final_bounds,
@@ -753,29 +786,88 @@ impl<P: Poly> NestedRnsPoly<P> {
             operand.enable_levels,
             final_bounds,
         )
+        .with_p_max_traces(operand.reduced_p_max_traces())
     }
 
     pub fn add(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
-        self.apply_binary_operation(
-            other,
+        self.assert_matching_enable_levels(other);
+        let mut left = self.clone();
+        let mut right = other.clone();
+        let predicted_bounds =
+            self.compute_binary_output_bounds(other, &|left, right, _| left + right);
+        if self.bounds_exceed_p_full(&predicted_bounds) {
+            left = self.full_reduce(circuit);
+            right = other.full_reduce(circuit);
+        }
+
+        let predicted_traces = left.compute_add_output_p_max_traces(&right);
+        let reduce_levels = predicted_traces
+            .iter()
+            .map(|trace| trace >= &left.ctx.lut_mod_p_max_map_size)
+            .collect::<Vec<_>>();
+        left = left.lazy_reduce_selected_levels(&reduce_levels, circuit);
+        right = right.lazy_reduce_selected_levels(&reduce_levels, circuit);
+
+        let final_bounds =
+            left.compute_binary_output_bounds(&right, &|left, right, _| left + right);
+        left.assert_bounds_within_p_full(
+            &final_bounds,
+            "additive operation output exceeds p_full even after automatic full_reduce",
+        );
+        let final_traces = left.compute_add_output_p_max_traces(&right);
+        left.assert_p_max_traces_within_lut_map_size(
+            &final_traces,
+            "additive operation output exceeds lut_mod_p_map_size even after pre-reduction",
+        );
+        left.call_uniform_binary_subcircuit(
+            &right,
             circuit,
-            &self.ctx.add_lazy_reduce_ids,
-            |left, right, _| left + right,
+            self.ctx.add_without_reduce_id,
+            final_bounds,
+            final_traces,
         )
     }
 
     pub fn sub(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
-        self.apply_binary_operation(
-            other,
-            circuit,
-            &self.ctx.sub_lazy_reduce_ids,
-            |left, _right, q_i| left + BigUint::from(q_i - 1),
-        )
+        self.assert_matching_enable_levels(other);
+        let mut left = self.clone();
+        let mut right = other.clone();
+        let predicted_bounds = self.compute_binary_output_bounds(other, &|left, _right, q_i| {
+            left + BigUint::from(q_i - 1)
+        });
+        if self.bounds_exceed_p_full(&predicted_bounds) {
+            left = self.full_reduce(circuit);
+            right = other.full_reduce(circuit);
+        }
+
+        let predicted_traces = left.compute_sub_output_p_max_traces(&right);
+        let reduce_levels = predicted_traces
+            .iter()
+            .map(|trace| trace >= &left.ctx.lut_mod_p_max_map_size)
+            .collect::<Vec<_>>();
+        left = left.lazy_reduce_selected_levels(&reduce_levels, circuit);
+        right = right.lazy_reduce_selected_levels(&reduce_levels, circuit);
+
+        let final_bounds = left.compute_binary_output_bounds(&right, &|left, _right, q_i| {
+            left + BigUint::from(q_i - 1)
+        });
+        left.assert_bounds_within_p_full(
+            &final_bounds,
+            "subtractive operation output exceeds p_full even after automatic full_reduce",
+        );
+        let final_traces = left.compute_sub_output_p_max_traces(&right);
+        left.assert_p_max_traces_within_lut_map_size(
+            &final_traces,
+            "subtractive operation output exceeds lut_mod_p_map_size even after pre-reduction",
+        );
+        left.call_sub_with_trace_offsets(&right, circuit, final_bounds, final_traces)
     }
 
     pub fn mul(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
-        self.apply_binary_operation(
-            other,
+        let left = self.lazy_reduce_if_unreduced(circuit);
+        let right = other.lazy_reduce_if_unreduced(circuit);
+        left.apply_binary_operation(
+            &right,
             circuit,
             &self.ctx.mul_lazy_reduce_ids,
             |left, right, _| left * right,
@@ -783,6 +875,7 @@ impl<P: Poly> NestedRnsPoly<P> {
     }
 
     pub fn full_reduce(&self, circuit: &mut PolyCircuit<P>) -> Self {
+        let operand = self.lazy_reduce_if_unreduced(circuit);
         let levels = self.resolve_enable_levels();
         assert!(
             levels <= self.ctx.full_reduce_ids.len(),
@@ -790,9 +883,10 @@ impl<P: Poly> NestedRnsPoly<P> {
         );
         let mut result_inner = Vec::with_capacity(levels);
         for q_idx in 0..levels {
-            let reduced = circuit.call_sub_circuit(self.ctx.lazy_reduce_id, &self.inner[q_idx]);
-            let outputs = circuit
-                .call_sub_circuit(self.ctx.full_reduce_ids[self.level_offset + q_idx], &reduced);
+            let outputs = circuit.call_sub_circuit(
+                self.ctx.full_reduce_ids[self.level_offset + q_idx],
+                &operand.inner[q_idx],
+            );
             result_inner.push(outputs);
         }
         let max_plaintexts = (0..levels)
@@ -807,6 +901,7 @@ impl<P: Poly> NestedRnsPoly<P> {
             self.enable_levels,
             max_plaintexts,
         )
+        .with_p_max_traces(operand.reduced_p_max_traces())
     }
 
     pub fn const_mul(&self, tower_constants: &[u64], circuit: &mut PolyCircuit<P>) -> Self {
@@ -823,6 +918,7 @@ impl<P: Poly> NestedRnsPoly<P> {
         if self.bounds_exceed_p_full(&predicted_bounds) {
             operand = self.full_reduce(circuit);
         }
+        operand = operand.lazy_reduce_if_unreduced(circuit);
         let final_bounds = operand.compute_const_mul_output_bounds(tower_constants);
         operand.assert_bounds_within_p_full(
             &final_bounds,
@@ -847,13 +943,14 @@ impl<P: Poly> NestedRnsPoly<P> {
             self.enable_levels,
             final_bounds,
         )
+        .with_p_max_traces(operand.reduced_p_max_traces())
     }
 
     pub fn reconstruct(&self, circuit: &mut PolyCircuit<P>) -> GateId {
         let operand = if self.bounds_exceed_p_full(&self.max_plaintexts) {
             self.full_reduce(circuit)
         } else {
-            self.clone()
+            self.lazy_reduce_if_unreduced(circuit)
         };
         let levels = operand.resolve_enable_levels();
         let mut sum_mod_q = circuit.const_zero_gate();
@@ -926,6 +1023,7 @@ impl<P: Poly> NestedRnsPoly<P> {
         circuit: &mut PolyCircuit<P>,
         subcircuit_ids: &[usize],
         max_plaintexts: Vec<BigUint>,
+        p_max_traces: Vec<BigUint>,
     ) -> Self {
         let levels = self.resolve_enable_levels();
         assert!(
@@ -954,6 +1052,86 @@ impl<P: Poly> NestedRnsPoly<P> {
             self.enable_levels,
             max_plaintexts,
         )
+        .with_p_max_traces(p_max_traces)
+    }
+
+    fn call_uniform_binary_subcircuit(
+        &self,
+        other: &Self,
+        circuit: &mut PolyCircuit<P>,
+        subcircuit_id: usize,
+        max_plaintexts: Vec<BigUint>,
+        p_max_traces: Vec<BigUint>,
+    ) -> Self {
+        let levels = self.resolve_enable_levels();
+        assert!(
+            levels <= other.inner.len(),
+            "operand q_moduli depth {} does not cover active levels {}",
+            other.inner.len(),
+            levels
+        );
+        let mut result_inner = Vec::with_capacity(levels);
+        for q_idx in 0..levels {
+            let left = &self.inner[q_idx];
+            let right = &other.inner[q_idx];
+            assert_eq!(left.len(), right.len(), "mismatched p_moduli depth");
+            let mut inputs = Vec::with_capacity(left.len() + right.len());
+            inputs.extend_from_slice(left);
+            inputs.extend_from_slice(right);
+            let outputs = circuit.call_sub_circuit(subcircuit_id, &inputs);
+            result_inner.push(outputs);
+        }
+        Self::new(
+            self.ctx.clone(),
+            result_inner,
+            Some(self.level_offset),
+            self.enable_levels,
+            max_plaintexts,
+        )
+        .with_p_max_traces(p_max_traces)
+    }
+
+    fn call_sub_with_trace_offsets(
+        &self,
+        other: &Self,
+        circuit: &mut PolyCircuit<P>,
+        max_plaintexts: Vec<BigUint>,
+        p_max_traces: Vec<BigUint>,
+    ) -> Self {
+        let levels = self.resolve_enable_levels();
+        assert!(
+            levels <= other.inner.len(),
+            "operand q_moduli depth {} does not cover active levels {}",
+            other.inner.len(),
+            levels
+        );
+        let mut result_inner = Vec::with_capacity(levels);
+        for q_idx in 0..levels {
+            let left = &self.inner[q_idx];
+            let right = &other.inner[q_idx];
+            assert_eq!(left.len(), right.len(), "mismatched p_moduli depth");
+            let offset_multiplier = self.trace_multiplier(&other.p_max_traces[q_idx]);
+            let outputs = left
+                .iter()
+                .zip(right.iter())
+                .zip(self.ctx.p_moduli.iter())
+                .map(|((&left_gate, &right_gate), &p_i)| {
+                    let offset = &offset_multiplier * BigUint::from(p_i);
+                    let offset_gate = const_biguint_gate(circuit, &offset);
+                    let shifted_left = circuit.add_gate(left_gate, offset_gate);
+                    circuit.sub_gate(shifted_left, right_gate)
+                })
+                .collect::<Vec<_>>();
+            result_inner.push(outputs);
+        }
+        Self::new(
+            self.ctx.clone(),
+            result_inner,
+            Some(self.level_offset),
+            self.enable_levels,
+            max_plaintexts,
+        )
+        .with_p_max_traces(p_max_traces)
     }
 
     fn apply_binary_operation<FB>(
@@ -979,7 +1157,13 @@ impl<P: Poly> NestedRnsPoly<P> {
             &final_bounds,
             "binary operation output exceeds p_full even after automatic full_reduce",
         );
-        left.call_binary_subcircuit(&right, circuit, subcircuit_ids, final_bounds)
+        left.call_binary_subcircuit(
+            &right,
+            circuit,
+            subcircuit_ids,
+            final_bounds,
+            left.reduced_p_max_traces(),
+        )
     }
 
     fn compute_binary_output_bounds<F>(&self, other: &Self, output_bound: &F) -> Vec<BigUint>
@@ -1103,6 +1287,13 @@ impl<P: Poly> NestedRnsPoly<P> {
             self.max_plaintexts.len(),
             self.inner.len()
         );
+        assert_eq!(
+            self.inner.len(),
+            self.p_max_traces.len(),
+            "p_max_traces length {} must match inner q_moduli depth {}",
+            self.p_max_traces.len(),
+            self.inner.len()
+        );
         assert!(
             self.level_offset <= self.ctx.q_moduli_depth,
             "level_offset {} exceeds q_moduli_depth {}",
@@ -1124,6 +1315,15 @@ fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
         b = t;
     }
     a
+}
+
+fn const_biguint_gate<P: Poly>(circuit: &mut PolyCircuit<P>, value: &BigUint) -> GateId {
+    if let Some(value_u32) = value.to_u32() {
+        circuit.const_digits(&[value_u32])
+    } else {
+        let one = circuit.const_one_gate();
+        circuit.large_scalar_mul(one, std::slice::from_ref(value))
+    }
 }
 
 fn u64_to_u32_digits(mut value: u64) -> Vec<u32> {
@@ -1497,8 +1697,6 @@ mod tests {
         assert_eq!(ctx.q_moduli_depth, q_level);
         assert_eq!(ctx.max_unreduced_muls, MAX_UNREDUCED_MULS);
         assert_eq!(ctx.full_reduce_ids.len(), q_level);
-        assert_eq!(ctx.add_lazy_reduce_ids.len(), q_level);
-        assert_eq!(ctx.sub_lazy_reduce_ids.len(), q_level);
         assert_eq!(ctx.mul_lazy_reduce_ids.len(), q_level);
         assert_eq!(ctx.q_moduli.len(), q_level);
         assert_eq!(ctx.full_reduce_max_plaintexts.len(), q_level);

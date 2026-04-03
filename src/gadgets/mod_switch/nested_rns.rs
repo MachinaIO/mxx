@@ -155,6 +155,7 @@ impl<P: Poly> NestedRnsPoly<P> {
             .collect::<Vec<_>>();
         let max_plaintexts = vec![BigUint::ZERO; levels];
         Self::new(self.ctx.clone(), inner, Some(level_offset), Some(levels), max_plaintexts)
+            .with_p_max_traces(vec![BigUint::ZERO; levels])
     }
 
     fn zero_poly_with_levels(&self, levels: usize, circuit: &mut PolyCircuit<P>) -> Self {
@@ -168,6 +169,7 @@ impl<P: Poly> NestedRnsPoly<P> {
         let mut isolated = self.zero_poly_with_levels(levels, circuit);
         isolated.inner[level_idx] = self.inner[level_idx].clone();
         isolated.max_plaintexts[level_idx] = self.max_plaintexts[level_idx].clone();
+        isolated.p_max_traces[level_idx] = self.p_max_traces[level_idx].clone();
         isolated
     }
 
@@ -180,6 +182,7 @@ impl<P: Poly> NestedRnsPoly<P> {
             Some(levels),
             self.max_plaintexts[..levels].to_vec(),
         )
+        .with_p_max_traces(self.p_max_traces[..levels].to_vec())
     }
 
     fn suffix_levels(&self, skip_levels: usize) -> Self {
@@ -192,6 +195,7 @@ impl<P: Poly> NestedRnsPoly<P> {
             Some(levels),
             self.max_plaintexts[skip_levels..].to_vec(),
         )
+        .with_p_max_traces(self.p_max_traces[skip_levels..].to_vec())
     }
 
     fn move_level_to_position(
@@ -208,6 +212,7 @@ impl<P: Poly> NestedRnsPoly<P> {
         let mut moved = self.zero_poly_with_offset(output_level_offset, total_levels, circuit);
         moved.inner[target_idx] = self.inner[source_idx].clone();
         moved.max_plaintexts[target_idx] = self.max_plaintexts[source_idx].clone();
+        moved.p_max_traces[target_idx] = self.p_max_traces[source_idx].clone();
         moved
     }
 
@@ -220,10 +225,12 @@ impl<P: Poly> NestedRnsPoly<P> {
     ) -> Self {
         assert!(source_idx < self.inner.len(), "source_idx {source_idx} out of range");
         let replicated_bound = self.max_plaintexts[source_idx].clone();
+        let replicated_trace = self.p_max_traces[source_idx].clone();
         let mut repeated = self.zero_poly_with_offset(output_level_offset, levels, circuit);
         for level in 0..levels {
             repeated.inner[level] = self.inner[source_idx].clone();
             repeated.max_plaintexts[level] = replicated_bound.clone();
+            repeated.p_max_traces[level] = replicated_trace.clone();
         }
         repeated
     }
@@ -326,6 +333,8 @@ impl<P: Poly> NestedRnsPoly<P> {
 
         let mut max_plaintexts = converted.max_plaintexts;
         max_plaintexts.extend(self.max_plaintexts.iter().cloned());
+        let mut p_max_traces = converted.p_max_traces;
+        p_max_traces.extend(self.p_max_traces.iter().cloned());
         Self::new(
             self.ctx.clone(),
             inner,
@@ -333,6 +342,7 @@ impl<P: Poly> NestedRnsPoly<P> {
             Some(source_levels + extra_levels),
             max_plaintexts,
         )
+        .with_p_max_traces(p_max_traces)
     }
 
     pub fn mod_up_one_level(&self, circuit: &mut PolyCircuit<P>) -> Self {

@@ -220,23 +220,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{BggPublicKeyBenchEstimator, BggPublicKeyBenchSamples};
+    use super::BggPublicKeyBenchEstimator;
     use crate::{
         __PAIR, __TestState,
         bench_estimator::{
             BenchEstimator, CircuitBenchUnitEstimate, PublicLutSampleAuxBenchEstimator,
             SlotTransferSampleAuxBenchEstimator,
         },
-        bgg::public_key::BggPublicKey,
-        circuit::gate::GateId,
-        element::PolyElem,
-        lookup::{PltEvaluator, PublicLut},
-        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
-        poly::{
-            Poly, PolyParams,
-            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
-        },
-        slot_transfer::SlotTransferEvaluator,
+        matrix::dcrt_poly::DCRTPolyMatrix,
     };
     #[cfg(not(feature = "gpu"))]
     use crate::{
@@ -249,8 +240,8 @@ mod tests {
     };
     #[cfg(not(feature = "gpu"))]
     use keccak_asm::Keccak256;
-    use num_bigint::BigUint;
     use sequential_test::sequential;
+    use std::marker::PhantomData;
     #[cfg(not(feature = "gpu"))]
     use tempfile::tempdir;
 
@@ -292,111 +283,30 @@ mod tests {
         }
     }
 
-    struct DummyPubKeyPltEvaluator;
-
-    impl PltEvaluator<BggPublicKey<DCRTPolyMatrix>> for DummyPubKeyPltEvaluator {
-        fn public_lookup(
-            &self,
-            _params: &DCRTPolyParams,
-            _plt: &PublicLut<DCRTPoly>,
-            _one: &BggPublicKey<DCRTPolyMatrix>,
-            input: &BggPublicKey<DCRTPolyMatrix>,
-            _gate_id: GateId,
-            _lut_id: usize,
-        ) -> BggPublicKey<DCRTPolyMatrix> {
-            input.clone()
+    fn test_estimator() -> BggPublicKeyBenchEstimator<
+        DCRTPolyMatrix,
+        DummyPublicLutEstimator,
+        DummySlotTransferEstimator,
+    > {
+        BggPublicKeyBenchEstimator {
+            input_time: 0.0,
+            add_time: 1.0,
+            sub_time: 2.0,
+            mul_time: 3.0,
+            small_scalar_mul_time: 4.0,
+            large_scalar_mul_time: 5.0,
+            public_lut_time: 6.0,
+            slot_transfer_time: 7.0,
+            public_lut_estimator: DummyPublicLutEstimator,
+            slot_transfer_estimator: DummySlotTransferEstimator,
+            _m: PhantomData,
         }
-    }
-
-    struct DummyPubKeySTEvaluator;
-
-    impl SlotTransferEvaluator<BggPublicKey<DCRTPolyMatrix>> for DummyPubKeySTEvaluator {
-        fn slot_transfer(
-            &self,
-            _params: &DCRTPolyParams,
-            input: &BggPublicKey<DCRTPolyMatrix>,
-            _src_slots: &[(u32, Option<u32>)],
-            _gate_id: GateId,
-        ) -> BggPublicKey<DCRTPolyMatrix> {
-            input.clone()
-        }
-    }
-
-    fn sample_pubkey(params: &DCRTPolyParams) -> BggPublicKey<DCRTPolyMatrix> {
-        BggPublicKey::new(DCRTPolyMatrix::gadget_matrix(params, 1), true)
-    }
-
-    fn sample_public_lut(params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {
-        PublicLut::new(
-            params,
-            2,
-            |params: &DCRTPolyParams, x| {
-                Some((x, <DCRTPoly as Poly>::Elem::constant(&params.modulus(), x + 1)))
-            },
-            None,
-        )
-    }
-
-    fn test_estimator() -> (
-        BggPublicKeyBenchEstimator<
-            DCRTPolyMatrix,
-            DummyPublicLutEstimator,
-            DummySlotTransferEstimator,
-        >,
-        DCRTPolyParams,
-    ) {
-        let params = DCRTPolyParams::default();
-        let add_lhs = sample_pubkey(&params);
-        let add_rhs = sample_pubkey(&params);
-        let sub_lhs = sample_pubkey(&params);
-        let sub_rhs = sample_pubkey(&params);
-        let mul_lhs = sample_pubkey(&params);
-        let mul_rhs = sample_pubkey(&params);
-        let small_scalar_input = sample_pubkey(&params);
-        let large_scalar_input = sample_pubkey(&params);
-        let public_lut_one = sample_pubkey(&params);
-        let public_lut_input = sample_pubkey(&params);
-        let slot_transfer_input = sample_pubkey(&params);
-        let public_lut = sample_public_lut(&params);
-        let slot_transfer_src_slots = vec![(0, None), (1, Some(0))];
-        let small_scalar = vec![3u32, 5u32];
-        let large_scalar = vec![BigUint::from(7u32)];
-        let samples = BggPublicKeyBenchSamples {
-            params: &params,
-            add_lhs: &add_lhs,
-            add_rhs: &add_rhs,
-            sub_lhs: &sub_lhs,
-            sub_rhs: &sub_rhs,
-            mul_lhs: &mul_lhs,
-            mul_rhs: &mul_rhs,
-            small_scalar_input: &small_scalar_input,
-            small_scalar: &small_scalar,
-            large_scalar_input: &large_scalar_input,
-            large_scalar: &large_scalar,
-            public_lut_one: &public_lut_one,
-            public_lut_input: &public_lut_input,
-            public_lut: &public_lut,
-            public_lut_gate_id: GateId(11),
-            public_lut_id: 7,
-            slot_transfer_input: &slot_transfer_input,
-            slot_transfer_src_slots: &slot_transfer_src_slots,
-            slot_transfer_gate_id: GateId(13),
-        };
-        let estimator = BggPublicKeyBenchEstimator::benchmark(
-            &samples,
-            &DummyPubKeyPltEvaluator,
-            &DummyPubKeySTEvaluator,
-            DummyPublicLutEstimator,
-            DummySlotTransferEstimator,
-            1,
-        );
-        (estimator, params)
     }
 
     #[test]
     #[sequential]
     fn test_bgg_pubkey_bench_estimator_uses_requested_formulas_and_measured_gate_times() {
-        let (estimator, _) = test_estimator();
+        let estimator = test_estimator();
 
         let public_lut = estimator.estimate_public_lut_sample_aux_matrices(4, 2);
         assert_eq!(public_lut, CircuitBenchUnitEstimate { total_time: 42.0, latency: 10.0 });

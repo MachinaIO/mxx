@@ -2211,7 +2211,7 @@ mod tests {
             &params,
             num_slots,
             P_MODULI_BITS,
-            DEFAULT_MAX_UNREDUCED_MULS,
+            4,
             SCALE,
             false,
             None,

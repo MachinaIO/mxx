@@ -6,7 +6,7 @@ mod gpu;
 
 #[cfg(not(feature = "gpu"))]
 use crate::bench_estimator::{
-    CircuitBenchEstimate, PublicLutSampleAuxBenchEstimator, measure_bench_operation,
+    CircuitBenchUnitEstimate, PublicLutSampleAuxBenchEstimator, measure_bench_operation,
 };
 use crate::{
     bgg::public_key::BggPublicKey,
@@ -1744,7 +1744,7 @@ where
     M::P: 'static,
     <M::P as Poly>::Params: Default,
 {
-    fn sample_aux_matrices_lut_entry_time(&self) -> CircuitBenchEstimate {
+    fn sample_aux_matrices_lut_entry_time(&self) -> CircuitBenchUnitEstimate {
         let params = <M::P as Poly>::Params::default();
         let lut_id = 0usize;
         let trap_sampler = TS::new(&params, self.trapdoor_sigma);
@@ -1768,10 +1768,10 @@ where
                 &batch,
             ))
         });
-        CircuitBenchEstimate { latency: elapsed, total_time: elapsed }
+        CircuitBenchUnitEstimate { latency: elapsed, total_time: elapsed }
     }
 
-    fn sample_aux_matrices_lut_gate_time(&self) -> CircuitBenchEstimate {
+    fn sample_aux_matrices_lut_gate_time(&self) -> CircuitBenchUnitEstimate {
         let params = <M::P as Poly>::Params::default();
         let lut_id = 0usize;
         let trap_sampler = TS::new(&params, self.trapdoor_sigma);
@@ -1803,7 +1803,7 @@ where
                 &w_block_vx,
             ))
         });
-        CircuitBenchEstimate { latency: elapsed, total_time: elapsed }
+        CircuitBenchUnitEstimate { latency: elapsed, total_time: elapsed }
     }
 }
 

@@ -1,7 +1,7 @@
 use std::{marker::PhantomData, sync::Arc};
 
 use crate::{
-    bench_estimator::{BenchEstimator, CircuitBenchEstimate, measure_bench_operation},
+    bench_estimator::{BenchEstimator, CircuitBenchUnitEstimate, measure_bench_operation},
     bgg::{poly_encoding::BggPolyEncoding, public_key::BggPublicKey},
     circuit::{Evaluable, gate::GateId},
     element::PolyElem,
@@ -12,8 +12,8 @@ use crate::{
 };
 use num_bigint::BigUint;
 
-fn per_slot_gate_estimate(latency: f64, num_slots: usize) -> CircuitBenchEstimate {
-    CircuitBenchEstimate { latency, total_time: latency * num_slots as f64 }
+fn per_slot_gate_estimate(latency: f64, num_slots: usize) -> CircuitBenchUnitEstimate {
+    CircuitBenchUnitEstimate { latency, total_time: latency * num_slots as f64 }
 }
 
 pub struct BggPolyEncodingBenchSamples<'a, M: PolyMatrix> {
@@ -293,31 +293,31 @@ impl<M> BenchEstimator<BggPolyEncoding<M>> for BggPolyEncodingBenchEstimator<M>
 where
     M: PolyMatrix,
 {
-    fn estimate_input(&self) -> CircuitBenchEstimate {
+    fn estimate_input(&self) -> CircuitBenchUnitEstimate {
         per_slot_gate_estimate(self.input_time, self.num_slots)
     }
 
-    fn estimate_add(&self) -> CircuitBenchEstimate {
+    fn estimate_add(&self) -> CircuitBenchUnitEstimate {
         per_slot_gate_estimate(self.add_time, self.num_slots)
     }
 
-    fn estimate_sub(&self) -> CircuitBenchEstimate {
+    fn estimate_sub(&self) -> CircuitBenchUnitEstimate {
         per_slot_gate_estimate(self.sub_time, self.num_slots)
     }
 
-    fn estimate_mul(&self) -> CircuitBenchEstimate {
+    fn estimate_mul(&self) -> CircuitBenchUnitEstimate {
         per_slot_gate_estimate(self.mul_time, self.num_slots)
     }
 
-    fn estimate_small_scalar_mul(&self, _scalar: &[u32]) -> CircuitBenchEstimate {
+    fn estimate_small_scalar_mul(&self, _scalar: &[u32]) -> CircuitBenchUnitEstimate {
         per_slot_gate_estimate(self.small_scalar_mul_time, self.num_slots)
     }
 
-    fn estimate_large_scalar_mul(&self, _scalar: &[BigUint]) -> CircuitBenchEstimate {
+    fn estimate_large_scalar_mul(&self, _scalar: &[BigUint]) -> CircuitBenchUnitEstimate {
         per_slot_gate_estimate(self.large_scalar_mul_time, self.num_slots)
     }
 
-    fn estimate_slot_transfer(&self, src_slots: &[(u32, Option<u32>)]) -> CircuitBenchEstimate {
+    fn estimate_slot_transfer(&self, src_slots: &[(u32, Option<u32>)]) -> CircuitBenchUnitEstimate {
         assert_eq!(
             src_slots.len(),
             self.num_slots,
@@ -326,7 +326,7 @@ where
         per_slot_gate_estimate(self.slot_transfer_time, self.num_slots)
     }
 
-    fn estimate_public_lookup(&self, _lut_id: usize) -> CircuitBenchEstimate {
+    fn estimate_public_lookup(&self, _lut_id: usize) -> CircuitBenchUnitEstimate {
         per_slot_gate_estimate(self.public_lut_time, self.num_slots)
     }
 }
@@ -339,7 +339,7 @@ mod tests {
     };
     use crate::{
         __PAIR, __TestState,
-        bench_estimator::{BenchEstimator, CircuitBenchEstimate},
+        bench_estimator::{BenchEstimator, CircuitBenchUnitEstimate},
         bgg::poly_encoding::BggPolyEncoding,
         circuit::{evaluable::Evaluable, gate::GateId},
         element::PolyElem,
@@ -412,7 +412,7 @@ mod tests {
 
         assert_eq!(
             estimator.estimate_input(),
-            CircuitBenchEstimate { total_time: 0.0, latency: 0.0 }
+            CircuitBenchUnitEstimate { total_time: 0.0, latency: 0.0 }
         );
 
         let add = estimator.estimate_add();

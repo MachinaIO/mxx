@@ -10,15 +10,15 @@ use crate::{
 };
 use num_bigint::BigUint;
 
-use super::{BenchEstimator, CircuitBenchEstimate, measure_bench_operation};
+use super::{BenchEstimator, CircuitBenchUnitEstimate, measure_bench_operation};
 
-pub(crate) fn per_gate_time_estimate(time: f64) -> CircuitBenchEstimate {
-    CircuitBenchEstimate { latency: time, total_time: time }
+pub(crate) fn per_gate_time_estimate(time: f64) -> CircuitBenchUnitEstimate {
+    CircuitBenchUnitEstimate { latency: time, total_time: time }
 }
 
 pub trait PublicLutSampleAuxBenchEstimator {
-    fn sample_aux_matrices_lut_entry_time(&self) -> CircuitBenchEstimate;
-    fn sample_aux_matrices_lut_gate_time(&self) -> CircuitBenchEstimate;
+    fn sample_aux_matrices_lut_entry_time(&self) -> CircuitBenchUnitEstimate;
+    fn sample_aux_matrices_lut_gate_time(&self) -> CircuitBenchUnitEstimate;
 
     fn benchmark_public_lut_gate_time<R, F>(&self, iterations: usize, op: F) -> f64
     where
@@ -29,8 +29,8 @@ pub trait PublicLutSampleAuxBenchEstimator {
 }
 
 pub trait SlotTransferSampleAuxBenchEstimator {
-    fn sample_aux_matrices_slot_time(&self) -> CircuitBenchEstimate;
-    fn sample_aux_matrices_gate_time(&self) -> CircuitBenchEstimate;
+    fn sample_aux_matrices_slot_time(&self) -> CircuitBenchUnitEstimate;
+    fn sample_aux_matrices_gate_time(&self) -> CircuitBenchUnitEstimate;
 
     fn benchmark_slot_transfer_gate_time<R, F>(&self, iterations: usize, op: F) -> f64
     where
@@ -149,10 +149,10 @@ where
         &self,
         total_lut_entries: usize,
         total_lut_gates: usize,
-    ) -> CircuitBenchEstimate {
+    ) -> CircuitBenchUnitEstimate {
         let lut_entry_time = self.public_lut_estimator.sample_aux_matrices_lut_entry_time();
         let lut_gate_time = self.public_lut_estimator.sample_aux_matrices_lut_gate_time();
-        CircuitBenchEstimate {
+        CircuitBenchUnitEstimate {
             total_time: lut_entry_time.total_time * total_lut_entries as f64 +
                 lut_gate_time.total_time * total_lut_gates as f64,
             latency: lut_entry_time.latency + lut_gate_time.latency,
@@ -163,10 +163,10 @@ where
         &self,
         num_slots: usize,
         slot_transfer_gate_count: usize,
-    ) -> CircuitBenchEstimate {
+    ) -> CircuitBenchUnitEstimate {
         let slot_time = self.slot_transfer_estimator.sample_aux_matrices_slot_time();
         let gate_time = self.slot_transfer_estimator.sample_aux_matrices_gate_time();
-        CircuitBenchEstimate {
+        CircuitBenchUnitEstimate {
             total_time: slot_time.total_time * num_slots as f64 +
                 gate_time.total_time * slot_transfer_gate_count as f64,
             latency: slot_time.latency + gate_time.latency,
@@ -180,36 +180,39 @@ where
     PLE: PublicLutSampleAuxBenchEstimator,
     STE: SlotTransferSampleAuxBenchEstimator,
 {
-    fn estimate_input(&self) -> CircuitBenchEstimate {
+    fn estimate_input(&self) -> CircuitBenchUnitEstimate {
         per_gate_time_estimate(self.input_time)
     }
 
-    fn estimate_add(&self) -> CircuitBenchEstimate {
+    fn estimate_add(&self) -> CircuitBenchUnitEstimate {
         per_gate_time_estimate(self.add_time)
     }
 
-    fn estimate_sub(&self) -> CircuitBenchEstimate {
+    fn estimate_sub(&self) -> CircuitBenchUnitEstimate {
         per_gate_time_estimate(self.sub_time)
     }
 
-    fn estimate_mul(&self) -> CircuitBenchEstimate {
+    fn estimate_mul(&self) -> CircuitBenchUnitEstimate {
         per_gate_time_estimate(self.mul_time)
     }
 
-    fn estimate_small_scalar_mul(&self, _scalar: &[u32]) -> CircuitBenchEstimate {
+    fn estimate_small_scalar_mul(&self, _scalar: &[u32]) -> CircuitBenchUnitEstimate {
         per_gate_time_estimate(self.small_scalar_mul_time)
     }
 
-    fn estimate_large_scalar_mul(&self, _scalar: &[num_bigint::BigUint]) -> CircuitBenchEstimate {
+    fn estimate_large_scalar_mul(
+        &self,
+        _scalar: &[num_bigint::BigUint],
+    ) -> CircuitBenchUnitEstimate {
         per_gate_time_estimate(self.large_scalar_mul_time)
     }
 
-    fn estimate_slot_transfer(&self, src_slots: &[(u32, Option<u32>)]) -> CircuitBenchEstimate {
+    fn estimate_slot_transfer(&self, src_slots: &[(u32, Option<u32>)]) -> CircuitBenchUnitEstimate {
         let _ = src_slots;
         per_gate_time_estimate(self.slot_transfer_time)
     }
 
-    fn estimate_public_lookup(&self, lut_id: usize) -> CircuitBenchEstimate {
+    fn estimate_public_lookup(&self, lut_id: usize) -> CircuitBenchUnitEstimate {
         let _ = lut_id;
         per_gate_time_estimate(self.public_lut_time)
     }
@@ -221,7 +224,7 @@ mod tests {
     use crate::{
         __PAIR, __TestState,
         bench_estimator::{
-            BenchEstimator, CircuitBenchEstimate, PublicLutSampleAuxBenchEstimator,
+            BenchEstimator, CircuitBenchUnitEstimate, PublicLutSampleAuxBenchEstimator,
             SlotTransferSampleAuxBenchEstimator,
         },
         bgg::public_key::BggPublicKey,
@@ -254,12 +257,12 @@ mod tests {
     struct DummyPublicLutEstimator;
 
     impl PublicLutSampleAuxBenchEstimator for DummyPublicLutEstimator {
-        fn sample_aux_matrices_lut_entry_time(&self) -> CircuitBenchEstimate {
-            CircuitBenchEstimate { latency: 3.0, total_time: 5.0 }
+        fn sample_aux_matrices_lut_entry_time(&self) -> CircuitBenchUnitEstimate {
+            CircuitBenchUnitEstimate { latency: 3.0, total_time: 5.0 }
         }
 
-        fn sample_aux_matrices_lut_gate_time(&self) -> CircuitBenchEstimate {
-            CircuitBenchEstimate { latency: 7.0, total_time: 11.0 }
+        fn sample_aux_matrices_lut_gate_time(&self) -> CircuitBenchUnitEstimate {
+            CircuitBenchUnitEstimate { latency: 7.0, total_time: 11.0 }
         }
 
         fn benchmark_public_lut_gate_time<R, F>(&self, _iterations: usize, _op: F) -> f64
@@ -273,12 +276,12 @@ mod tests {
     struct DummySlotTransferEstimator;
 
     impl SlotTransferSampleAuxBenchEstimator for DummySlotTransferEstimator {
-        fn sample_aux_matrices_slot_time(&self) -> CircuitBenchEstimate {
-            CircuitBenchEstimate { latency: 19.0, total_time: 23.0 }
+        fn sample_aux_matrices_slot_time(&self) -> CircuitBenchUnitEstimate {
+            CircuitBenchUnitEstimate { latency: 19.0, total_time: 23.0 }
         }
 
-        fn sample_aux_matrices_gate_time(&self) -> CircuitBenchEstimate {
-            CircuitBenchEstimate { latency: 29.0, total_time: 31.0 }
+        fn sample_aux_matrices_gate_time(&self) -> CircuitBenchUnitEstimate {
+            CircuitBenchUnitEstimate { latency: 29.0, total_time: 31.0 }
         }
 
         fn benchmark_slot_transfer_gate_time<R, F>(&self, _iterations: usize, _op: F) -> f64
@@ -396,14 +399,14 @@ mod tests {
         let (estimator, _) = test_estimator();
 
         let public_lut = estimator.estimate_public_lut_sample_aux_matrices(4, 2);
-        assert_eq!(public_lut, CircuitBenchEstimate { total_time: 42.0, latency: 10.0 });
+        assert_eq!(public_lut, CircuitBenchUnitEstimate { total_time: 42.0, latency: 10.0 });
 
         let slot_transfer = estimator.estimate_slot_transfer_sample_aux_matrices(3, 2);
-        assert_eq!(slot_transfer, CircuitBenchEstimate { total_time: 131.0, latency: 48.0 });
+        assert_eq!(slot_transfer, CircuitBenchUnitEstimate { total_time: 131.0, latency: 48.0 });
 
         assert_eq!(
             estimator.estimate_input(),
-            CircuitBenchEstimate { total_time: 0.0, latency: 0.0 }
+            CircuitBenchUnitEstimate { total_time: 0.0, latency: 0.0 }
         );
         assert!(estimator.add_time >= 0.0);
         assert!(estimator.sub_time >= 0.0);
@@ -417,14 +420,14 @@ mod tests {
         assert!(estimator.slot_transfer_time >= 0.0);
         assert_eq!(
             estimator.estimate_public_lookup(7),
-            CircuitBenchEstimate {
+            CircuitBenchUnitEstimate {
                 total_time: estimator.public_lut_time,
                 latency: estimator.public_lut_time,
             }
         );
         assert_eq!(
             estimator.estimate_slot_transfer(&[(0, None), (1, Some(0))]),
-            CircuitBenchEstimate {
+            CircuitBenchUnitEstimate {
                 total_time: estimator.slot_transfer_time,
                 latency: estimator.slot_transfer_time,
             }

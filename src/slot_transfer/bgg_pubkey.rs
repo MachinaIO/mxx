@@ -1,6 +1,6 @@
 #[cfg(not(feature = "gpu"))]
 use crate::bench_estimator::{
-    CircuitBenchEstimate, SlotTransferSampleAuxBenchEstimator, measure_bench_operation,
+    CircuitBenchUnitEstimate, SlotTransferSampleAuxBenchEstimator, measure_bench_operation,
 };
 use crate::{
     bgg::public_key::BggPublicKey,
@@ -587,7 +587,7 @@ where
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
     <M::P as Poly>::Params: Default,
 {
-    fn sample_aux_matrices_slot_time(&self) -> CircuitBenchEstimate {
+    fn sample_aux_matrices_slot_time(&self) -> CircuitBenchUnitEstimate {
         let params = <M::P as Poly>::Params::default();
         let trap_sampler = TS::new(&params, self.trapdoor_sigma);
         let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(&params, self.secret_size);
@@ -619,10 +619,10 @@ where
                 &[0usize],
             ))
         });
-        CircuitBenchEstimate { latency: elapsed, total_time: elapsed }
+        CircuitBenchUnitEstimate { latency: elapsed, total_time: elapsed }
     }
 
-    fn sample_aux_matrices_gate_time(&self) -> CircuitBenchEstimate {
+    fn sample_aux_matrices_gate_time(&self) -> CircuitBenchUnitEstimate {
         let params = <M::P as Poly>::Params::default();
         let trap_sampler = TS::new(&params, self.trapdoor_sigma);
         let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(&params, self.secret_size);
@@ -677,7 +677,7 @@ where
                 &slot_chunk,
             ))
         });
-        CircuitBenchEstimate { latency: elapsed, total_time: elapsed }
+        CircuitBenchUnitEstimate { latency: elapsed, total_time: elapsed }
     }
 }
 

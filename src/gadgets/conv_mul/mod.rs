@@ -132,10 +132,7 @@ mod tests {
     use crate::{
         __PAIR, __TestState,
         circuit::{PolyCircuit, PolyGateKind, evaluable::PolyVec},
-        gadgets::{
-            arith::{DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPolyContext},
-            ntt::encode_nested_rns_poly_vec,
-        },
+        gadgets::{arith::NestedRnsPolyContext, ntt::encode_nested_rns_poly_vec},
         lookup::{poly::PolyPltEvaluator, poly_vec::PolyVecPltEvaluator},
         poly::{
             Poly, PolyParams,
@@ -148,7 +145,7 @@ mod tests {
     use std::sync::Arc;
 
     const P_MODULI_BITS: usize = 10;
-    const MAX_UNREDUCED_MULS: usize = DEFAULT_MAX_UNREDUCED_MULS;
+    const MAX_UNREDUCED_MULS: usize = 4;
     const SCALE: u64 = 1 << 8;
     const BASE_BITS: u32 = 6;
 

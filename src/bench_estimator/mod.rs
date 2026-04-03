@@ -1,4 +1,10 @@
-use std::collections::HashMap;
+pub mod bgg_poly_encoding;
+pub mod bgg_pubkey;
+
+pub use bgg_poly_encoding::*;
+pub use bgg_pubkey::*;
+
+use std::{collections::HashMap, hint::black_box, time::Instant};
 
 use num_bigint::BigUint;
 
@@ -10,17 +16,29 @@ pub struct CircuitBenchEstimate {
     pub latency: f64,
 }
 
-pub trait BenchEstimator<E: Evaluable> {
-    fn estimate_input(&self) -> f64;
-    fn estimate_add(&self) -> f64;
-    fn estimate_sub(&self) -> f64;
-    fn estimate_mul(&self) -> f64;
-    fn estimate_small_scalar_mul(&self, scalar: &[u32]) -> f64;
-    fn estimate_large_scalar_mul(&self, scalar: &[BigUint]) -> f64;
-    fn estimate_slot_transfer(&self, src_slots: &[(u32, Option<u32>)]) -> f64;
-    fn estimate_public_lookup(&self, lut_id: usize) -> f64;
+pub(crate) fn measure_bench_operation<R, F>(iterations: usize, mut op: F) -> f64
+where
+    F: FnMut() -> R,
+{
+    let iterations = iterations.max(1);
+    let start = Instant::now();
+    for _ in 0..iterations {
+        black_box(op());
+    }
+    start.elapsed().as_secs_f64() / iterations as f64
+}
 
-    fn estimate_gate_bench(&self, gate_type: &PolyGateType) -> f64 {
+pub trait BenchEstimator<E: Evaluable> {
+    fn estimate_input(&self) -> CircuitBenchEstimate;
+    fn estimate_add(&self) -> CircuitBenchEstimate;
+    fn estimate_sub(&self) -> CircuitBenchEstimate;
+    fn estimate_mul(&self) -> CircuitBenchEstimate;
+    fn estimate_small_scalar_mul(&self, scalar: &[u32]) -> CircuitBenchEstimate;
+    fn estimate_large_scalar_mul(&self, scalar: &[BigUint]) -> CircuitBenchEstimate;
+    fn estimate_slot_transfer(&self, src_slots: &[(u32, Option<u32>)]) -> CircuitBenchEstimate;
+    fn estimate_public_lookup(&self, lut_id: usize) -> CircuitBenchEstimate;
+
+    fn estimate_gate_bench(&self, gate_type: &PolyGateType) -> CircuitBenchEstimate {
         match gate_type {
             PolyGateType::Input => self.estimate_input(),
             PolyGateType::Add => self.estimate_add(),
@@ -46,9 +64,9 @@ pub trait BenchEstimator<E: Evaluable> {
 
             let mut layer_latency = 0.0_f64;
             for (gate_type, count) in layer_counts.into_iter() {
-                let gate_time = self.estimate_gate_bench(&gate_type);
-                estimate.total_time += gate_time * count as f64;
-                layer_latency = layer_latency.max(gate_time);
+                let gate_estimate = self.estimate_gate_bench(&gate_type);
+                estimate.total_time += gate_estimate.total_time * count as f64;
+                layer_latency = layer_latency.max(gate_estimate.latency);
             }
             estimate.latency += layer_latency;
         }
@@ -60,83 +78,102 @@ pub trait BenchEstimator<E: Evaluable> {
 mod tests {
     use super::{BenchEstimator, CircuitBenchEstimate};
     use crate::{
+        __PAIR, __TestState,
         circuit::{PolyCircuit, PolyGateType},
         poly::dcrt::poly::DCRTPoly,
     };
+    use sequential_test::sequential;
+
+    fn bench(latency: f64, total_time: f64) -> CircuitBenchEstimate {
+        CircuitBenchEstimate { latency, total_time }
+    }
 
     struct TestBenchEstimator;
 
     impl BenchEstimator<DCRTPoly> for TestBenchEstimator {
-        fn estimate_input(&self) -> f64 {
-            0.2
+        fn estimate_input(&self) -> CircuitBenchEstimate {
+            bench(0.2, 0.25)
         }
 
-        fn estimate_add(&self) -> f64 {
-            1.0
+        fn estimate_add(&self) -> CircuitBenchEstimate {
+            bench(1.0, 1.5)
         }
 
-        fn estimate_sub(&self) -> f64 {
-            2.0
+        fn estimate_sub(&self) -> CircuitBenchEstimate {
+            bench(2.0, 2.5)
         }
 
-        fn estimate_mul(&self) -> f64 {
-            3.0
+        fn estimate_mul(&self) -> CircuitBenchEstimate {
+            bench(3.0, 3.5)
         }
 
-        fn estimate_small_scalar_mul(&self, _scalar: &[u32]) -> f64 {
-            4.0
+        fn estimate_small_scalar_mul(&self, _scalar: &[u32]) -> CircuitBenchEstimate {
+            bench(4.0, 4.5)
         }
 
-        fn estimate_large_scalar_mul(&self, _scalar: &[num_bigint::BigUint]) -> f64 {
-            5.0
+        fn estimate_large_scalar_mul(
+            &self,
+            _scalar: &[num_bigint::BigUint],
+        ) -> CircuitBenchEstimate {
+            bench(5.0, 5.5)
         }
 
-        fn estimate_slot_transfer(&self, _src_slots: &[(u32, Option<u32>)]) -> f64 {
-            6.0
+        fn estimate_slot_transfer(
+            &self,
+            _src_slots: &[(u32, Option<u32>)],
+        ) -> CircuitBenchEstimate {
+            bench(6.0, 6.5)
         }
 
-        fn estimate_public_lookup(&self, _lut_id: usize) -> f64 {
-            7.0
+        fn estimate_public_lookup(&self, _lut_id: usize) -> CircuitBenchEstimate {
+            bench(7.0, 7.5)
         }
     }
 
     struct ExpandedSubCircuitBenchEstimator;
 
     impl BenchEstimator<DCRTPoly> for ExpandedSubCircuitBenchEstimator {
-        fn estimate_input(&self) -> f64 {
-            0.5
+        fn estimate_input(&self) -> CircuitBenchEstimate {
+            bench(0.5, 1.0)
         }
 
-        fn estimate_add(&self) -> f64 {
-            5.0
+        fn estimate_add(&self) -> CircuitBenchEstimate {
+            bench(5.0, 6.0)
         }
 
-        fn estimate_sub(&self) -> f64 {
-            0.0
+        fn estimate_sub(&self) -> CircuitBenchEstimate {
+            bench(0.0, 0.0)
         }
 
-        fn estimate_mul(&self) -> f64 {
-            2.0
+        fn estimate_mul(&self) -> CircuitBenchEstimate {
+            bench(2.0, 4.0)
         }
 
-        fn estimate_small_scalar_mul(&self, _scalar: &[u32]) -> f64 {
-            0.0
+        fn estimate_small_scalar_mul(&self, _scalar: &[u32]) -> CircuitBenchEstimate {
+            bench(0.0, 0.0)
         }
 
-        fn estimate_large_scalar_mul(&self, _scalar: &[num_bigint::BigUint]) -> f64 {
-            0.0
+        fn estimate_large_scalar_mul(
+            &self,
+            _scalar: &[num_bigint::BigUint],
+        ) -> CircuitBenchEstimate {
+            bench(0.0, 0.0)
         }
 
-        fn estimate_slot_transfer(&self, _src_slots: &[(u32, Option<u32>)]) -> f64 {
-            0.0
+        fn estimate_slot_transfer(
+            &self,
+            _src_slots: &[(u32, Option<u32>)],
+        ) -> CircuitBenchEstimate {
+            bench(0.0, 0.0)
         }
 
-        fn estimate_public_lookup(&self, _lut_id: usize) -> f64 {
-            0.0
+        fn estimate_public_lookup(&self, _lut_id: usize) -> CircuitBenchEstimate {
+            bench(0.0, 0.0)
         }
     }
 
     #[test]
+    #[sequential]
     fn test_estimate_circuit_bench_accumulates_layer_latency_and_total_time() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let inputs = circuit.input(4);
@@ -148,11 +185,12 @@ mod tests {
 
         let estimate = TestBenchEstimator.estimate_circuit_bench(&circuit);
 
-        assert!((estimate.total_time - 7.8).abs() < 1e-9);
+        assert!((estimate.total_time - 10.0).abs() < 1e-9);
         assert!((estimate.latency - 5.2).abs() < 1e-9);
     }
 
     #[test]
+    #[sequential]
     fn test_estimate_circuit_bench_expands_sub_circuit_without_counting_placeholders() {
         let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
         let sub_inputs = sub_circuit.input(2);
@@ -167,7 +205,7 @@ mod tests {
         main_circuit.output(vec![sub_outputs[0]]);
 
         let estimate = ExpandedSubCircuitBenchEstimator.estimate_circuit_bench(&main_circuit);
-        let expected = CircuitBenchEstimate { total_time: 8.5, latency: 7.5 };
+        let expected = CircuitBenchEstimate { total_time: 13.0, latency: 7.5 };
 
         assert!((estimate.total_time - expected.total_time).abs() < 1e-9);
         assert!((estimate.latency - expected.latency).abs() < 1e-9);
@@ -175,6 +213,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "unexpected SubCircuitOutput")]
+    #[sequential]
     fn test_estimate_gate_bench_panics_on_sub_circuit_output_placeholder() {
         let estimator = TestBenchEstimator;
         let gate_type = PolyGateType::SubCircuitOutput { call_id: 0, output_idx: 0, num_inputs: 1 };

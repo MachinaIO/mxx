@@ -581,7 +581,9 @@ impl<P: Poly> PolyCircuit<P> {
         for gate_id in self.topological_order().into_iter() {
             let gate = self.gates.get(&gate_id).expect("gate not found");
             let level = match &gate.gate_type {
-                PolyGateType::Input => *gate_levels.get(&gate_id).expect("input gate level missing"),
+                PolyGateType::Input => {
+                    *gate_levels.get(&gate_id).expect("input gate level missing")
+                }
                 PolyGateType::SubCircuitOutput { call_id, output_idx, .. } => {
                     let outputs = call_output_levels.entry(*call_id).or_insert_with(|| {
                         let call =
@@ -593,14 +595,15 @@ impl<P: Poly> PolyCircuit<P> {
                         let sub_input_levels: Vec<usize> = call
                             .inputs
                             .iter()
-                            .map(|id| *gate_levels.get(id).expect("sub-circuit input level missing"))
+                            .map(|id| {
+                                *gate_levels.get(id).expect("sub-circuit input level missing")
+                            })
                             .collect();
-                        sub_circuit
-                            .expanded_gate_types_by_level_with_input_levels(
-                                &sub_input_levels,
-                                layers,
-                                false,
-                            )
+                        sub_circuit.expanded_gate_types_by_level_with_input_levels(
+                            &sub_input_levels,
+                            layers,
+                            false,
+                        )
                     });
                     outputs.get(*output_idx).copied().unwrap_or_else(|| {
                         panic!("sub-circuit output index {} out of range", output_idx)

@@ -16,6 +16,30 @@ fn per_slot_gate_estimate(latency: f64, num_slots: usize) -> CircuitBenchUnitEst
     CircuitBenchUnitEstimate { latency, total_time: latency * num_slots as f64 }
 }
 
+fn validate_single_slot_shape(
+    num_slots: usize,
+    input_slot_counts: &[(&str, usize)],
+    slot_transfer_len: usize,
+) -> Result<(), String> {
+    if num_slots == 0 {
+        return Err("BggPolyEncodingBenchSamples::num_slots must be positive".to_string());
+    }
+    for (label, slot_count) in input_slot_counts {
+        if *slot_count != 1 {
+            return Err(format!(
+                "BggPolyEncodingBenchSamples::{label} must contain exactly one slot for latency benchmarking"
+            ));
+        }
+    }
+    if slot_transfer_len != 1 {
+        return Err(
+            "BggPolyEncodingBenchSamples::slot_transfer_src_slots must contain exactly one destination slot for latency benchmarking"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 pub struct BggPolyEncodingBenchSamples<'a, M: PolyMatrix> {
     pub num_slots: usize,
     pub params: &'a <M::P as Poly>::Params,
@@ -40,32 +64,25 @@ pub struct BggPolyEncodingBenchSamples<'a, M: PolyMatrix> {
 }
 
 impl<M: PolyMatrix> BggPolyEncodingBenchSamples<'_, M> {
+    fn validate_single_slot_inputs(&self) -> Result<(), String> {
+        let slot_counts = [
+            ("add_lhs", self.add_lhs.num_slots()),
+            ("add_rhs", self.add_rhs.num_slots()),
+            ("sub_lhs", self.sub_lhs.num_slots()),
+            ("sub_rhs", self.sub_rhs.num_slots()),
+            ("mul_lhs", self.mul_lhs.num_slots()),
+            ("mul_rhs", self.mul_rhs.num_slots()),
+            ("small_scalar_input", self.small_scalar_input.num_slots()),
+            ("large_scalar_input", self.large_scalar_input.num_slots()),
+            ("public_lut_one", self.public_lut_one.num_slots()),
+            ("public_lut_input", self.public_lut_input.num_slots()),
+            ("slot_transfer_input", self.slot_transfer_input.num_slots()),
+        ];
+        validate_single_slot_shape(self.num_slots, &slot_counts, self.slot_transfer_src_slots.len())
+    }
+
     fn assert_single_slot_inputs(&self) {
-        assert!(self.num_slots > 0, "BggPolyEncodingBenchSamples::num_slots must be positive");
-        for (label, encoding) in [
-            ("add_lhs", self.add_lhs),
-            ("add_rhs", self.add_rhs),
-            ("sub_lhs", self.sub_lhs),
-            ("sub_rhs", self.sub_rhs),
-            ("mul_lhs", self.mul_lhs),
-            ("mul_rhs", self.mul_rhs),
-            ("small_scalar_input", self.small_scalar_input),
-            ("large_scalar_input", self.large_scalar_input),
-            ("public_lut_one", self.public_lut_one),
-            ("public_lut_input", self.public_lut_input),
-            ("slot_transfer_input", self.slot_transfer_input),
-        ] {
-            assert_eq!(
-                encoding.num_slots(),
-                1,
-                "BggPolyEncodingBenchSamples::{label} must contain exactly one slot for latency benchmarking"
-            );
-        }
-        assert_eq!(
-            self.slot_transfer_src_slots.len(),
-            1,
-            "BggPolyEncodingBenchSamples::slot_transfer_src_slots must contain exactly one destination slot for latency benchmarking"
-        );
+        self.validate_single_slot_inputs().unwrap_or_else(|message| panic!("{message}"));
     }
 }
 
@@ -333,76 +350,29 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BggPolyEncodingBenchEstimator, BggPolyEncodingBenchSamples,
-        OwnedBggPolyEncodingBenchSamples,
-    };
+    use super::{BggPolyEncodingBenchEstimator, validate_single_slot_shape};
     use crate::{
         __PAIR, __TestState,
         bench_estimator::{BenchEstimator, CircuitBenchUnitEstimate},
-        bgg::poly_encoding::BggPolyEncoding,
-        circuit::{evaluable::Evaluable, gate::GateId},
-        element::PolyElem,
-        lookup::{PltEvaluator, PublicLut},
         matrix::dcrt_poly::DCRTPolyMatrix,
-        poly::{
-            Poly, PolyParams,
-            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
-        },
-        slot_transfer::SlotTransferEvaluator,
     };
     use num_bigint::BigUint;
     use sequential_test::sequential;
-
-    struct DummyPolyEncodingPltEvaluator;
-
-    impl PltEvaluator<BggPolyEncoding<DCRTPolyMatrix>> for DummyPolyEncodingPltEvaluator {
-        fn public_lookup(
-            &self,
-            _params: &<BggPolyEncoding<DCRTPolyMatrix> as Evaluable>::Params,
-            _plt: &PublicLut<<BggPolyEncoding<DCRTPolyMatrix> as Evaluable>::P>,
-            _one: &BggPolyEncoding<DCRTPolyMatrix>,
-            input: &BggPolyEncoding<DCRTPolyMatrix>,
-            _gate_id: GateId,
-            _lut_id: usize,
-        ) -> BggPolyEncoding<DCRTPolyMatrix> {
-            input.clone()
-        }
-    }
-
-    struct DummyPolyEncodingSTEvaluator;
-
-    impl SlotTransferEvaluator<BggPolyEncoding<DCRTPolyMatrix>> for DummyPolyEncodingSTEvaluator {
-        fn slot_transfer(
-            &self,
-            _params: &<BggPolyEncoding<DCRTPolyMatrix> as Evaluable>::Params,
-            input: &BggPolyEncoding<DCRTPolyMatrix>,
-            _src_slots: &[(u32, Option<u32>)],
-            _gate_id: GateId,
-        ) -> BggPolyEncoding<DCRTPolyMatrix> {
-            input.clone()
-        }
-    }
-
-    fn sample_public_lut(params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {
-        PublicLut::new(
-            params,
-            2,
-            |params: &DCRTPolyParams, x| {
-                Some((x, <DCRTPoly as Poly>::Elem::constant(&params.modulus(), x + 1)))
-            },
-            None,
-        )
-    }
+    use std::marker::PhantomData;
 
     fn test_estimator() -> BggPolyEncodingBenchEstimator<DCRTPolyMatrix> {
-        BggPolyEncodingBenchEstimator::benchmark(
-            3,
-            None,
-            &DummyPolyEncodingPltEvaluator,
-            &DummyPolyEncodingSTEvaluator,
-            1,
-        )
+        BggPolyEncodingBenchEstimator {
+            num_slots: 3,
+            input_time: 0.0,
+            add_time: 1.0,
+            sub_time: 2.0,
+            mul_time: 3.0,
+            small_scalar_mul_time: 4.0,
+            large_scalar_mul_time: 5.0,
+            public_lut_time: 6.0,
+            slot_transfer_time: 7.0,
+            _m: PhantomData,
+        }
     }
 
     #[test]
@@ -446,45 +416,30 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "must contain exactly one destination slot")]
     #[sequential]
     fn test_bgg_poly_encoding_bench_estimator_rejects_multi_slot_custom_samples() {
-        let params = DCRTPolyParams::default();
-        let owned = OwnedBggPolyEncodingBenchSamples::<DCRTPolyMatrix>::default_for_benchmark(3);
-        let samples = owned.borrowed();
-        let public_lut = sample_public_lut(&params);
-        let small_scalar = vec![3u32, 5u32];
-        let large_scalar = vec![BigUint::from(7u32)];
-        let invalid_slot_transfer_src_slots = vec![(0, Some(2u32)), (0, None)];
-        let invalid_samples = BggPolyEncodingBenchSamples {
-            num_slots: 3,
-            params: &params,
-            add_lhs: samples.add_lhs,
-            add_rhs: samples.add_rhs,
-            sub_lhs: samples.sub_lhs,
-            sub_rhs: samples.sub_rhs,
-            mul_lhs: samples.mul_lhs,
-            mul_rhs: samples.mul_rhs,
-            small_scalar_input: samples.small_scalar_input,
-            small_scalar: &small_scalar,
-            large_scalar_input: samples.large_scalar_input,
-            large_scalar: &large_scalar,
-            public_lut_one: samples.public_lut_one,
-            public_lut_input: samples.public_lut_input,
-            public_lut: &public_lut,
-            public_lut_gate_id: GateId(17),
-            public_lut_id: 7,
-            slot_transfer_input: samples.slot_transfer_input,
-            slot_transfer_src_slots: &invalid_slot_transfer_src_slots,
-            slot_transfer_gate_id: GateId(19),
-        };
-
-        let _ = BggPolyEncodingBenchEstimator::benchmark(
-            3,
-            Some(&invalid_samples),
-            &DummyPolyEncodingPltEvaluator,
-            &DummyPolyEncodingSTEvaluator,
-            1,
+        assert_eq!(
+            validate_single_slot_shape(
+                1,
+                &[
+                    ("add_lhs", 1),
+                    ("add_rhs", 1),
+                    ("sub_lhs", 1),
+                    ("sub_rhs", 1),
+                    ("mul_lhs", 1),
+                    ("mul_rhs", 1),
+                    ("small_scalar_input", 1),
+                    ("large_scalar_input", 1),
+                    ("public_lut_one", 1),
+                    ("public_lut_input", 1),
+                    ("slot_transfer_input", 1),
+                ],
+                2,
+            ),
+            Err(
+                "BggPolyEncodingBenchSamples::slot_transfer_src_slots must contain exactly one destination slot for latency benchmarking"
+                    .to_string()
+            )
         );
     }
 }

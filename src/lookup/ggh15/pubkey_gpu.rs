@@ -1,5 +1,11 @@
 use super::*;
-use crate::{poly::dcrt::gpu::detected_gpu_device_ids, sampler::trapdoor::GpuPreimageRequest};
+use crate::{
+    bench_estimator::{
+        CircuitBenchUnitEstimate, PublicLutSampleAuxBenchEstimator, measure_bench_operation,
+    },
+    poly::dcrt::gpu::detected_gpu_device_ids,
+    sampler::trapdoor::GpuPreimageRequest,
+};
 
 pub(super) struct GpuLutBaseDeviceShared<M, T>
 where
@@ -936,6 +942,78 @@ where
                 Self::format_duration(start.elapsed())
             );
         }
+    }
+}
+
+impl<M, US, HS, TS> PublicLutSampleAuxBenchEstimator for GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
+where
+    M: PolyMatrix + Send + Sync + 'static,
+    US: PolyUniformSampler<M = M> + Send + Sync,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    TS: PolyTrapdoorSampler<M = M> + Send + Sync,
+    M::P: 'static,
+    <M::P as Poly>::Params: Default,
+{
+    fn sample_aux_matrices_lut_entry_time(&self) -> CircuitBenchUnitEstimate {
+        let params = <M::P as Poly>::Params::default();
+        let lut_id = 0usize;
+        let trap_sampler = TS::new(&params, self.trapdoor_sigma);
+        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, self.d);
+        let gpu_lut_base_shared =
+            self.prepare_gpu_lut_base_device_shared(&params, &b1_trapdoor, &b1_matrix);
+        let gpu_lut_shared = self.prepare_gpu_lut_device_shared(lut_id, &gpu_lut_base_shared);
+        let batch =
+            vec![(0usize, 0usize, M::P::from_usize_to_constant(gpu_lut_shared[0].params, 1usize))];
+        let elapsed = measure_bench_operation(1, || {
+            self.sample_lut_preimages_gpu(&params, lut_id, "bench_lut_aux", &gpu_lut_shared, &batch)
+        });
+        CircuitBenchUnitEstimate { latency: elapsed, total_time: elapsed }
+    }
+
+    fn sample_aux_matrices_lut_gate_time(&self) -> CircuitBenchUnitEstimate {
+        let params = <M::P as Poly>::Params::default();
+        let lut_id = 0usize;
+        let trap_sampler = TS::new(&params, self.trapdoor_sigma);
+        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(&params, self.d);
+        let (_b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, self.d);
+        let gpu_gate_base_shared =
+            self.prepare_gpu_gate_base_device_shared(&params, &b0_trapdoor, &b0_matrix, &b1_matrix);
+        let w_block_identity = self.derive_w_block_identity(&params, lut_id);
+        let w_block_gy = self.derive_w_block_gy(&params, lut_id);
+        let w_block_v = self.derive_w_block_v(&params, lut_id);
+        let w_block_vx = self.derive_w_block_vx(&params, lut_id);
+        let w_block_identity_by_device =
+            self.copy_matrix_to_gpu_gate_devices(&w_block_identity, &gpu_gate_base_shared);
+        let w_block_gy_by_device =
+            self.copy_matrix_to_gpu_gate_devices(&w_block_gy, &gpu_gate_base_shared);
+        let w_block_v_by_device =
+            self.copy_matrix_to_gpu_gate_devices(&w_block_v, &gpu_gate_base_shared);
+        let w_block_vx_by_device =
+            self.copy_matrix_to_gpu_gate_devices(&w_block_vx, &gpu_gate_base_shared);
+        let gpu_gate_shared = self.prepare_gpu_gate_device_shared(
+            &gpu_gate_base_shared,
+            w_block_identity_by_device,
+            w_block_gy_by_device,
+            w_block_v_by_device,
+            w_block_vx_by_device,
+        );
+        let input_pubkey_bytes = M::gadget_matrix(&params, self.d).into_compact_bytes();
+        let elapsed = self.benchmark_public_lut_gate_time(1, || {
+            self.sample_gate_preimages_batch_gpu(
+                &params,
+                lut_id,
+                vec![(
+                    GateId(0),
+                    GateState {
+                        lut_id,
+                        input_pubkey_bytes: input_pubkey_bytes.clone(),
+                        _m: PhantomData,
+                    },
+                )],
+                &gpu_gate_shared,
+            )
+        });
+        CircuitBenchUnitEstimate { latency: elapsed, total_time: elapsed }
     }
 }
 

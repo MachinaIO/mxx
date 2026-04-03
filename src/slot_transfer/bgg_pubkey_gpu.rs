@@ -1,4 +1,7 @@
 use crate::{
+    bench_estimator::{
+        CircuitBenchUnitEstimate, SlotTransferSampleAuxBenchEstimator, measure_bench_operation,
+    },
     circuit::gate::GateId,
     matrix::PolyMatrix,
     poly::{Poly, PolyParams, dcrt::gpu::detected_gpu_device_ids},
@@ -620,6 +623,106 @@ where
             compute_handle.join().expect("gate pipeline compute stage panicked");
             store_handle.join().expect("gate pipeline store stage panicked");
         });
+    }
+}
+
+impl<M, US, HS, TS> SlotTransferSampleAuxBenchEstimator for BggPublicKeySTEvaluator<M, US, HS, TS>
+where
+    M: PolyMatrix + Send + Sync,
+    US: PolyUniformSampler<M = M> + Send + Sync,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    TS: PolyTrapdoorSampler<M = M> + Send + Sync,
+    <M::P as Poly>::Params: Default,
+{
+    fn sample_aux_matrices_slot_time(&self) -> CircuitBenchUnitEstimate {
+        let params = <M::P as Poly>::Params::default();
+        let trap_sampler = TS::new(&params, self.trapdoor_sigma);
+        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(&params, self.secret_size);
+        let b1_size =
+            self.secret_size.checked_mul(2).expect("slot-transfer benchmark b1 size overflow");
+        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, b1_size);
+        let gpu_shared = self.prepare_gpu_device_shared(
+            &params,
+            &b0_matrix,
+            &b0_trapdoor,
+            &b1_matrix,
+            &b1_trapdoor,
+            1,
+        );
+        let batch_slot_indices = vec![0usize];
+        let elapsed = measure_bench_operation(1, || {
+            let slot_secret_mats = vec![
+                US::new()
+                    .sample_uniform(
+                        &params,
+                        self.secret_size,
+                        self.secret_size,
+                        DistType::TernaryDist,
+                    )
+                    .into_compact_bytes(),
+            ];
+            let prepared_batch =
+                self.prepare_slot_batch_gpu(&slot_secret_mats, &gpu_shared, &batch_slot_indices);
+            self.sample_slot_batch_gpu(&gpu_shared, prepared_batch)
+        });
+        CircuitBenchUnitEstimate { latency: elapsed, total_time: elapsed }
+    }
+
+    fn sample_aux_matrices_gate_time(&self) -> CircuitBenchUnitEstimate {
+        let params = <M::P as Poly>::Params::default();
+        let trap_sampler = TS::new(&params, self.trapdoor_sigma);
+        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(&params, self.secret_size);
+        let b1_size =
+            self.secret_size.checked_mul(2).expect("slot-transfer benchmark b1 size overflow");
+        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, b1_size);
+        let benchmark_num_slots = self.num_slots.max(1);
+        let benchmark_parallelism = crate::env::slot_transfer_slot_parallelism()
+            .max(1)
+            .min(benchmark_num_slots)
+            .min(detected_gpu_device_ids().len().max(1));
+        let gpu_shared = self.prepare_gpu_device_shared(
+            &params,
+            &b0_matrix,
+            &b0_trapdoor,
+            &b1_matrix,
+            &b1_trapdoor,
+            benchmark_parallelism,
+        );
+        let slot_secret_mats = (0..benchmark_num_slots)
+            .map(|_| {
+                US::new()
+                    .sample_uniform(
+                        &params,
+                        self.secret_size,
+                        self.secret_size,
+                        DistType::TernaryDist,
+                    )
+                    .into_compact_bytes()
+            })
+            .collect::<Vec<_>>();
+        let slot_indices = (0..benchmark_num_slots).collect::<Vec<_>>();
+        let prepared_slot_batch =
+            self.prepare_slot_batch_gpu(&slot_secret_mats, &gpu_shared, &slot_indices);
+        let sampled_slots = self.sample_slot_batch_gpu(&gpu_shared, prepared_slot_batch);
+        let mut slot_a_bytes_by_slot = vec![Vec::new(); benchmark_num_slots];
+        for sample in sampled_slots.samples {
+            slot_a_bytes_by_slot[sample.slot_idx] = sample.slot_a.to_compact_bytes();
+        }
+        let state = BggPublicKeySTGateState {
+            input_pubkey_bytes: M::gadget_matrix(&params, self.secret_size).into_compact_bytes(),
+            src_slots: (0..benchmark_num_slots).map(|slot_idx| (slot_idx as u32, None)).collect(),
+        };
+        let slot_chunk = state.src_slots.iter().copied().enumerate().collect::<Vec<_>>();
+        let elapsed = self.benchmark_slot_transfer_gate_time(1, || {
+            let prepared_batch = self.prepare_gate_batch_gpu(
+                &slot_secret_mats,
+                &slot_a_bytes_by_slot,
+                &gpu_shared,
+                &slot_chunk,
+            );
+            self.sample_gate_batch_gpu(&gpu_shared, GateId(0), &state, prepared_batch)
+        });
+        CircuitBenchUnitEstimate { latency: elapsed, total_time: elapsed }
     }
 }
 

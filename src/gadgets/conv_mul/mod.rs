@@ -115,16 +115,6 @@ fn flatten_nested_rns_poly<P: Poly>(value: &NestedRnsPoly<P>) -> Vec<GateId> {
     value.inner.iter().flat_map(|level| level.iter().copied()).collect()
 }
 
-fn conservative_nested_rns_metadata<P: Poly>(
-    template: &NestedRnsPoly<P>,
-) -> (Vec<BigUint>, Vec<BigUint>) {
-    let levels = template.active_q_moduli().len();
-    (
-        vec![template.ctx.max_plaintext_below_p_full(); levels],
-        vec![template.ctx.max_p_max_trace_below_lut_map_size(); levels],
-    )
-}
-
 fn nested_rns_from_flat_outputs<P: Poly>(
     template: &NestedRnsPoly<P>,
     outputs: &[GateId],
@@ -147,6 +137,29 @@ fn nested_rns_from_flat_outputs<P: Poly>(
         max_plaintexts,
     )
     .with_p_max_traces(p_max_traces)
+}
+
+fn diagonal_term_output_template<P, F>(
+    lhs: &NestedRnsPoly<P>,
+    rhs: &NestedRnsPoly<P>,
+    diagonal: usize,
+    num_slots: usize,
+    build_product: F,
+) -> NestedRnsPoly<P>
+where
+    P: Poly + 'static,
+    F: Fn(&NestedRnsPoly<P>, &NestedRnsPoly<P>, &mut PolyCircuit<P>) -> NestedRnsPoly<P>,
+{
+    let mut template_circuit = PolyCircuit::<P>::new();
+    let template_ctx = Arc::new(lhs.ctx.register_subcircuits_in(&mut template_circuit));
+    let lhs_template =
+        NestedRnsPoly::input_like_with_ctx(lhs, template_ctx.clone(), &mut template_circuit);
+    let rhs_template = NestedRnsPoly::input_like_with_ctx(rhs, template_ctx, &mut template_circuit);
+    let lhs_diagonal =
+        negacyclic_diagonal(&mut template_circuit, &lhs_template, diagonal, num_slots);
+    let rhs_rotated =
+        rhs_template.slot_transfer(&rhs_rotation_plan(num_slots, diagonal), &mut template_circuit);
+    build_product(&lhs_diagonal, &rhs_rotated, &mut template_circuit)
 }
 
 fn diagonal_term_subcircuit<P: Poly + 'static>(
@@ -216,6 +229,18 @@ pub fn negacyclic_conv_mul<P: Poly + 'static>(
             )
         })
         .collect::<Vec<_>>();
+    let diagonal_output_templates = (0..num_slots)
+        .into_par_iter()
+        .map(|diagonal| {
+            diagonal_term_output_template(
+                lhs,
+                rhs,
+                diagonal,
+                num_slots,
+                |lhs_diagonal, rhs_rotated, circuit| lhs_diagonal.mul(rhs_rotated, circuit),
+            )
+        })
+        .collect::<Vec<_>>();
     debug!(
         "negacyclic_conv_mul built {} diagonal subcircuits in parallel: num_slots={}, active_levels={}, elapsed_ms={}",
         diagonal_subcircuits.len(),
@@ -227,15 +252,16 @@ pub fn negacyclic_conv_mul<P: Poly + 'static>(
     shared_inputs.extend(flatten_nested_rns_poly(rhs));
     let instantiate_start = Instant::now();
     let mut diagonal_terms = Vec::with_capacity(num_slots);
-    for diagonal_subcircuit in diagonal_subcircuits {
+    for (diagonal_subcircuit, output_template) in
+        diagonal_subcircuits.into_iter().zip(diagonal_output_templates.into_iter())
+    {
         let subcircuit_id = circuit.register_sub_circuit(diagonal_subcircuit);
         let outputs = circuit.call_sub_circuit(subcircuit_id, &shared_inputs);
-        let (max_plaintexts, p_max_traces) = conservative_nested_rns_metadata(lhs);
         diagonal_terms.push(nested_rns_from_flat_outputs(
             lhs,
             &outputs,
-            max_plaintexts,
-            p_max_traces,
+            output_template.max_plaintexts,
+            output_template.p_max_traces,
         ));
     }
     debug!(
@@ -282,6 +308,20 @@ pub fn negacyclic_conv_mul_right_sparse<P: Poly + 'static>(
             )
         })
         .collect::<Vec<_>>();
+    let diagonal_output_templates = (0..num_slots)
+        .into_par_iter()
+        .map(|diagonal| {
+            diagonal_term_output_template(
+                lhs,
+                rhs,
+                diagonal,
+                num_slots,
+                |lhs_diagonal, rhs_rotated, circuit| {
+                    lhs_diagonal.mul_right_sparse(rhs_rotated, rhs_q_idx, circuit)
+                },
+            )
+        })
+        .collect::<Vec<_>>();
     debug!(
         "negacyclic_conv_mul_right_sparse built {} diagonal subcircuits in parallel: num_slots={}, active_levels={}, elapsed_ms={}",
         diagonal_subcircuits.len(),
@@ -293,15 +333,16 @@ pub fn negacyclic_conv_mul_right_sparse<P: Poly + 'static>(
     shared_inputs.extend(flatten_nested_rns_poly(rhs));
     let instantiate_start = Instant::now();
     let mut diagonal_terms = Vec::with_capacity(num_slots);
-    for diagonal_subcircuit in diagonal_subcircuits {
+    for (diagonal_subcircuit, output_template) in
+        diagonal_subcircuits.into_iter().zip(diagonal_output_templates.into_iter())
+    {
         let subcircuit_id = circuit.register_sub_circuit(diagonal_subcircuit);
         let outputs = circuit.call_sub_circuit(subcircuit_id, &shared_inputs);
-        let (max_plaintexts, p_max_traces) = conservative_nested_rns_metadata(lhs);
         diagonal_terms.push(nested_rns_from_flat_outputs(
             lhs,
             &outputs,
-            max_plaintexts,
-            p_max_traces,
+            output_template.max_plaintexts,
+            output_template.p_max_traces,
         ));
     }
     debug!(

@@ -140,12 +140,25 @@ impl NestedRnsPolyContext {
         &self.q_moduli
     }
 
-    pub(crate) fn max_plaintext_below_p_full(&self) -> BigUint {
-        self.p_full.clone() - BigUint::from(1u64)
-    }
-
-    pub(crate) fn max_p_max_trace_below_lut_map_size(&self) -> BigUint {
-        self.lut_mod_p_max_map_size.clone() - BigUint::from(1u64)
+    pub(crate) fn full_reduce_output_metadata(
+        &self,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+    ) -> (Vec<BigUint>, Vec<BigUint>) {
+        let level_offset = level_offset.unwrap_or(0);
+        let input_count = enable_levels.unwrap_or(self.q_moduli_depth);
+        assert!(
+            level_offset + input_count <= self.q_moduli_depth,
+            "active range exceeds q_moduli_depth: level_offset={level_offset}, enable_levels={input_count}, q_moduli_depth={}",
+            self.q_moduli_depth
+        );
+        let max_plaintexts = self.full_reduce_max_plaintexts
+            [level_offset..level_offset + input_count]
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let p_max_traces = vec![self.reduced_p_max_trace(); input_count];
+        (max_plaintexts, p_max_traces)
     }
 
     fn reduced_p_max_trace(&self) -> BigUint {
@@ -869,6 +882,55 @@ impl<P: Poly> NestedRnsPoly<P> {
             .map(|&q_i| BigUint::from(q_i - 1))
             .collect();
         Self::new(ctx, inner, Some(level_offset), enable_levels, max_plaintexts)
+    }
+
+    pub(crate) fn input_with_metadata(
+        ctx: Arc<NestedRnsPolyContext>,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+        max_plaintexts: Vec<BigUint>,
+        p_max_traces: Vec<BigUint>,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        let level_offset = level_offset.unwrap_or(0);
+        let input_count = enable_levels.unwrap_or(ctx.q_moduli_depth);
+        assert!(
+            level_offset + input_count <= ctx.q_moduli_depth,
+            "active range exceeds q_moduli_depth: level_offset={level_offset}, enable_levels={input_count}, q_moduli_depth={}",
+            ctx.q_moduli_depth
+        );
+        assert_eq!(
+            max_plaintexts.len(),
+            input_count,
+            "max_plaintexts length {} must match active levels {}",
+            max_plaintexts.len(),
+            input_count
+        );
+        assert_eq!(
+            p_max_traces.len(),
+            input_count,
+            "p_max_traces length {} must match active levels {}",
+            p_max_traces.len(),
+            input_count
+        );
+        let inner = (0..input_count).map(|_| circuit.input(ctx.p_moduli.len())).collect();
+        Self::new(ctx, inner, Some(level_offset), enable_levels, max_plaintexts)
+            .with_p_max_traces(p_max_traces)
+    }
+
+    pub(crate) fn input_like_with_ctx(
+        template: &Self,
+        ctx: Arc<NestedRnsPolyContext>,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        Self::input_with_metadata(
+            ctx,
+            template.enable_levels,
+            Some(template.level_offset),
+            template.max_plaintexts.clone(),
+            template.p_max_traces.clone(),
+            circuit,
+        )
     }
 
     fn lazy_reduce_selected_levels(

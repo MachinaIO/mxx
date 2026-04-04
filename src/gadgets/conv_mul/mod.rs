@@ -169,6 +169,27 @@ fn diagonal_term_subcircuit<P: Poly + 'static>(
     circuit
 }
 
+fn diagonal_term_right_sparse_subcircuit<P: Poly + 'static>(
+    _params: &P::Params,
+    template_ctx: &crate::gadgets::arith::NestedRnsPolyContext,
+    active_levels: usize,
+    level_offset: usize,
+    rhs_q_idx: usize,
+    diagonal: usize,
+    num_slots: usize,
+) -> PolyCircuit<P> {
+    let mut circuit = PolyCircuit::<P>::new();
+    let ctx = Arc::new(template_ctx.register_subcircuits_in(&mut circuit));
+    let lhs =
+        NestedRnsPoly::input(ctx.clone(), Some(active_levels), Some(level_offset), &mut circuit);
+    let rhs = NestedRnsPoly::input(ctx, Some(active_levels), Some(level_offset), &mut circuit);
+    let lhs_diagonal = negacyclic_diagonal(&mut circuit, &lhs, diagonal, num_slots);
+    let rhs_rotated = rhs.slot_transfer(&rhs_rotation_plan(num_slots, diagonal), &mut circuit);
+    let product = lhs_diagonal.mul_right_sparse(&rhs_rotated, rhs_q_idx, &mut circuit);
+    circuit.output(product.inner.into_iter().flatten().collect());
+    circuit
+}
+
 pub fn negacyclic_conv_mul<P: Poly + 'static>(
     params: &P::Params,
     circuit: &mut PolyCircuit<P>,
@@ -226,6 +247,72 @@ pub fn negacyclic_conv_mul<P: Poly + 'static>(
     let result = reduce_terms_pairwise(diagonal_terms, circuit);
     debug!(
         "negacyclic_conv_mul reduction finished: num_slots={}, reduction_elapsed_ms={}, total_elapsed_ms={}",
+        num_slots,
+        reduction_start.elapsed().as_millis(),
+        total_start.elapsed().as_millis()
+    );
+    result
+}
+
+pub fn negacyclic_conv_mul_right_sparse<P: Poly + 'static>(
+    params: &P::Params,
+    circuit: &mut PolyCircuit<P>,
+    lhs: &NestedRnsPoly<P>,
+    rhs: &NestedRnsPoly<P>,
+    rhs_q_idx: usize,
+    num_slots: usize,
+) -> NestedRnsPoly<P> {
+    validate_inputs(params, lhs, rhs, num_slots);
+
+    let total_start = Instant::now();
+    let active_levels = lhs.active_q_moduli().len();
+    let level_offset = lhs.level_offset;
+    let parallel_build_start = Instant::now();
+    let diagonal_subcircuits = (0..num_slots)
+        .into_par_iter()
+        .map(|diagonal| {
+            diagonal_term_right_sparse_subcircuit(
+                params,
+                lhs.ctx.as_ref(),
+                active_levels,
+                level_offset,
+                rhs_q_idx,
+                diagonal,
+                num_slots,
+            )
+        })
+        .collect::<Vec<_>>();
+    debug!(
+        "negacyclic_conv_mul_right_sparse built {} diagonal subcircuits in parallel: num_slots={}, active_levels={}, elapsed_ms={}",
+        diagonal_subcircuits.len(),
+        num_slots,
+        active_levels,
+        parallel_build_start.elapsed().as_millis()
+    );
+    let mut shared_inputs = flatten_nested_rns_poly(lhs);
+    shared_inputs.extend(flatten_nested_rns_poly(rhs));
+    let instantiate_start = Instant::now();
+    let mut diagonal_terms = Vec::with_capacity(num_slots);
+    for diagonal_subcircuit in diagonal_subcircuits {
+        let subcircuit_id = circuit.register_sub_circuit(diagonal_subcircuit);
+        let outputs = circuit.call_sub_circuit(subcircuit_id, &shared_inputs);
+        let (max_plaintexts, p_max_traces) = conservative_nested_rns_metadata(lhs);
+        diagonal_terms.push(nested_rns_from_flat_outputs(
+            lhs,
+            &outputs,
+            max_plaintexts,
+            p_max_traces,
+        ));
+    }
+    debug!(
+        "negacyclic_conv_mul_right_sparse registered/called {} diagonal subcircuits: elapsed_ms={}",
+        diagonal_terms.len(),
+        instantiate_start.elapsed().as_millis()
+    );
+    let reduction_start = Instant::now();
+    let result = reduce_terms_pairwise(diagonal_terms, circuit);
+    debug!(
+        "negacyclic_conv_mul_right_sparse reduction finished: num_slots={}, reduction_elapsed_ms={}, total_elapsed_ms={}",
         num_slots,
         reduction_start.elapsed().as_millis(),
         total_start.elapsed().as_millis()

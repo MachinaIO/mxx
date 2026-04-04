@@ -5,7 +5,7 @@ use crate::{
             NestedRnsPoly, NestedRnsPolyContext, nested_rns_gadget_decomposed,
             nested_rns_gadget_vector,
         },
-        conv_mul::negacyclic_conv_mul,
+        conv_mul::negacyclic_conv_mul_right_sparse,
         ntt::encode_nested_rns_poly_vec_with_offset,
     },
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
@@ -67,6 +67,29 @@ fn flatten_nested_rns_entries<P: Poly>(entries: &[NestedRnsPoly<P>]) -> Vec<Gate
         .iter()
         .flat_map(|entry| entry.inner.iter().flat_map(|level| level.iter().copied()))
         .collect()
+}
+
+fn nested_rns_from_flat_outputs<P: Poly>(
+    template: &NestedRnsPoly<P>,
+    outputs: &[GateId],
+    max_plaintexts: Vec<BigUint>,
+    p_max_traces: Vec<BigUint>,
+) -> NestedRnsPoly<P> {
+    let levels = template.active_q_moduli().len();
+    let p_moduli_depth = template.ctx.p_moduli.len();
+    assert_eq!(
+        outputs.len(),
+        levels * p_moduli_depth,
+        "flattened Ring-GSW nested-RNS output size must match active_levels * p_moduli_depth"
+    );
+    NestedRnsPoly::new(
+        template.ctx.clone(),
+        outputs.chunks(p_moduli_depth).map(|row| row.to_vec()).collect::<Vec<_>>(),
+        Some(template.level_offset),
+        template.enable_levels,
+        max_plaintexts,
+    )
+    .with_p_max_traces(p_max_traces)
 }
 
 pub type NativeRingGswCiphertext = [Vec<DCRTPoly>; 2];
@@ -297,6 +320,35 @@ impl<P: Poly> RingGswContext<P> {
 }
 
 impl<P: Poly + 'static> RingGswContext<P> {
+    fn mul_sparse_entry_subcircuit(
+        params: &P::Params,
+        num_slots: usize,
+        template_ctx: &NestedRnsPolyContext,
+        active_levels: usize,
+        level_offset: usize,
+        sparse_q_idx: usize,
+    ) -> PolyCircuit<P> {
+        let mut circuit = PolyCircuit::<P>::new();
+        let ctx = Arc::new(template_ctx.register_subcircuits_in(&mut circuit));
+        let lhs = NestedRnsPoly::input(
+            ctx.clone(),
+            Some(active_levels),
+            Some(level_offset),
+            &mut circuit,
+        );
+        let rhs = NestedRnsPoly::input(ctx, Some(active_levels), Some(level_offset), &mut circuit);
+        let product = negacyclic_conv_mul_right_sparse(
+            params,
+            &mut circuit,
+            &lhs,
+            &rhs,
+            sparse_q_idx,
+            num_slots,
+        );
+        circuit.output(product.inner.into_iter().flatten().collect());
+        circuit
+    }
+
     pub fn setup(
         circuit: &mut PolyCircuit<P>,
         params: &P::Params,
@@ -384,6 +436,35 @@ impl<P: Poly + 'static> RingGswContext<P> {
         let local_dot_row_with_column_subcircuit_id = {
             let mut helper_circuit = PolyCircuit::<P>::new();
             let helper_ctx = Arc::new(template_ctx.register_subcircuits_in(&mut helper_circuit));
+            let chunk_width = helper_ctx.p_moduli.len() + 1;
+            let gadget_len = active_levels * chunk_width;
+            assert_eq!(
+                width,
+                2 * gadget_len,
+                "Ring-GSW mul helper width {} must equal 2 * gadget_len {}",
+                width,
+                gadget_len
+            );
+            let product_subcircuits_start = Instant::now();
+            let product_subcircuits = (0..width)
+                .into_par_iter()
+                .map(|col_idx| {
+                    let sparse_q_idx = (col_idx % gadget_len) / chunk_width;
+                    Self::mul_sparse_entry_subcircuit(
+                        params,
+                        num_slots,
+                        template_ctx,
+                        active_levels,
+                        level_offset,
+                        sparse_q_idx,
+                    )
+                })
+                .collect::<Vec<_>>();
+            debug!(
+                "RingGswContext::mul_column_subcircuit product helpers built in parallel: width={}, elapsed_ms={}",
+                width,
+                product_subcircuits_start.elapsed().as_millis()
+            );
             let row = (0..width)
                 .map(|_| {
                     NestedRnsPoly::input(
@@ -404,11 +485,28 @@ impl<P: Poly + 'static> RingGswContext<P> {
                     )
                 })
                 .collect::<Vec<_>>();
+            let product_subcircuit_ids = product_subcircuits
+                .into_iter()
+                .map(|subcircuit| helper_circuit.register_sub_circuit(subcircuit))
+                .collect::<Vec<_>>();
+            let levels = row[0].active_q_moduli().len();
+            let max_plaintexts = vec![row[0].ctx.max_plaintext_below_p_full(); levels];
+            let p_max_traces = vec![row[0].ctx.max_p_max_trace_below_lut_map_size(); levels];
             let products = row
                 .iter()
                 .zip(column.iter())
-                .map(|(lhs, rhs)| {
-                    negacyclic_conv_mul(params, &mut helper_circuit, lhs, rhs, num_slots)
+                .enumerate()
+                .map(|(col_idx, (lhs, rhs))| {
+                    let mut inputs = flatten_nested_rns_entries(std::slice::from_ref(lhs));
+                    inputs.extend(flatten_nested_rns_entries(std::slice::from_ref(rhs)));
+                    let outputs =
+                        helper_circuit.call_sub_circuit(product_subcircuit_ids[col_idx], &inputs);
+                    nested_rns_from_flat_outputs(
+                        lhs,
+                        &outputs,
+                        max_plaintexts.clone(),
+                        p_max_traces.clone(),
+                    )
                 })
                 .collect::<Vec<_>>();
             let result = reduce_nested_rns_terms_pairwise(
@@ -454,43 +552,32 @@ impl<P: Poly + 'static> RingGswContext<P> {
             g_inverse_start.elapsed().as_millis()
         );
         let dot_products_start = Instant::now();
+        let g_inverse_inputs = flatten_nested_rns_entries(&g_inverse_col);
+        let (lhs_row0_inputs, lhs_row1_inputs) = rayon::join(
+            || flatten_nested_rns_entries(&lhs_row0),
+            || flatten_nested_rns_entries(&lhs_row1),
+        );
         let row0: NestedRnsPoly<P> = {
             let template = &lhs_row0[0];
-            let mut inputs = flatten_nested_rns_entries(&lhs_row0);
-            inputs.extend(flatten_nested_rns_entries(&g_inverse_col));
+            let mut inputs = lhs_row0_inputs;
+            inputs.extend(g_inverse_inputs.clone());
             let outputs =
                 circuit.call_sub_circuit(local_dot_row_with_column_subcircuit_id, &inputs);
             let levels = template.active_q_moduli().len();
-            let p_moduli_depth = template.ctx.p_moduli.len();
             let max_plaintexts = vec![template.ctx.max_plaintext_below_p_full(); levels];
             let p_max_traces = vec![template.ctx.max_p_max_trace_below_lut_map_size(); levels];
-            NestedRnsPoly::new(
-                template.ctx.clone(),
-                outputs.chunks(p_moduli_depth).map(|row| row.to_vec()).collect::<Vec<_>>(),
-                Some(template.level_offset),
-                template.enable_levels,
-                max_plaintexts,
-            )
-            .with_p_max_traces(p_max_traces)
+            nested_rns_from_flat_outputs(template, &outputs, max_plaintexts, p_max_traces)
         };
         let row1: NestedRnsPoly<P> = {
             let template = &lhs_row1[0];
-            let mut inputs = flatten_nested_rns_entries(&lhs_row1);
-            inputs.extend(flatten_nested_rns_entries(&g_inverse_col));
+            let mut inputs = lhs_row1_inputs;
+            inputs.extend(g_inverse_inputs);
             let outputs =
                 circuit.call_sub_circuit(local_dot_row_with_column_subcircuit_id, &inputs);
             let levels = template.active_q_moduli().len();
-            let p_moduli_depth = template.ctx.p_moduli.len();
             let max_plaintexts = vec![template.ctx.max_plaintext_below_p_full(); levels];
             let p_max_traces = vec![template.ctx.max_p_max_trace_below_lut_map_size(); levels];
-            NestedRnsPoly::new(
-                template.ctx.clone(),
-                outputs.chunks(p_moduli_depth).map(|row| row.to_vec()).collect::<Vec<_>>(),
-                Some(template.level_offset),
-                template.enable_levels,
-                max_plaintexts,
-            )
-            .with_p_max_traces(p_max_traces)
+            nested_rns_from_flat_outputs(template, &outputs, max_plaintexts, p_max_traces)
         };
         circuit.output(flatten_nested_rns_entries(&[row0, row1]));
         debug!(
@@ -509,7 +596,7 @@ pub struct RingGswCiphertext<P: Poly> {
     pub rows: [Vec<NestedRnsPoly<P>>; 2],
 }
 
-impl<P: Poly> RingGswCiphertext<P> {
+impl<P: Poly + 'static> RingGswCiphertext<P> {
     pub fn new(ctx: Arc<RingGswContext<P>>, rows: [Vec<NestedRnsPoly<P>>; 2]) -> Self {
         let ciphertext = Self { ctx, rows };
         ciphertext.assert_consistent();
@@ -563,41 +650,6 @@ impl<P: Poly> RingGswCiphertext<P> {
             .map(|(lhs, rhs)| lhs.sub(rhs, circuit))
             .collect::<Vec<_>>();
         Self::new(self.ctx.clone(), [row0, row1])
-    }
-
-    pub fn scalar_mul(&self, scalar: u64, circuit: &mut PolyCircuit<P>) -> Self {
-        self.assert_consistent();
-        let template_entry =
-            self.rows[0].first().expect("RingGswCiphertext must contain at least one column");
-        let scalar_tower_constants = template_entry
-            .active_q_moduli()
-            .into_iter()
-            .map(|q_i| scalar % q_i)
-            .collect::<Vec<_>>();
-        let zero_tower_constants = vec![0u64; scalar_tower_constants.len()];
-        let scaled_gadget = NestedRnsPoly::gadget_vector(
-            self.ctx.nested_rns.clone(),
-            Some(self.ctx.active_levels),
-            Some(self.ctx.level_offset),
-            circuit,
-        )
-        .into_iter()
-        .map(|entry| entry.const_mul(&scalar_tower_constants, circuit))
-        .collect::<Vec<_>>();
-        let gadget_len = scaled_gadget.len();
-        let zero_entry = scaled_gadget
-            .first()
-            .expect("Ring-GSW scalar multiplication requires a non-empty gadget vector")
-            .const_mul(&zero_tower_constants, circuit);
-
-        let mut row0 = scaled_gadget.clone();
-        row0.extend(vec![zero_entry.clone(); gadget_len]);
-
-        let mut row1 = vec![zero_entry; gadget_len];
-        row1.extend(scaled_gadget);
-
-        let scalar_gadget = Self::new(self.ctx.clone(), [row0, row1]);
-        self.mul(&scalar_gadget, circuit)
     }
 
     pub fn mul(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
@@ -703,8 +755,9 @@ impl<P: Poly> RingGswCiphertext<P> {
     pub fn xor(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
         self.assert_compatible(other);
         let sum = self.add(other, circuit);
-        let doubled_product = self.mul(other, circuit).scalar_mul(2, circuit);
-        sum.sub(&doubled_product, circuit)
+        let product = self.mul(other, circuit);
+        let sum_minus_product = sum.sub(&product, circuit);
+        sum_minus_product.sub(&product, circuit)
     }
 
     pub fn reconstruct(&self, circuit: &mut PolyCircuit<P>) -> Vec<GateId> {
@@ -809,6 +862,7 @@ mod tests {
     };
     use num_bigint::BigUint;
     use num_traits::ToPrimitive;
+    use rand::Rng;
     use std::sync::Arc;
 
     const BASE_BITS: u32 = 6;
@@ -817,10 +871,6 @@ mod tests {
     const P_MODULI_BITS: usize = 6;
     const SCALE: u64 = 1 << 8;
     const NUM_SLOTS: usize = 4;
-    const PUBLIC_KEY_HASH_KEY: [u8; 32] = [0x42; 32];
-    const RANDOMIZER_HASH_KEY: [u8; 32] = [0x24; 32];
-    const BINARY_INPUT_CASES: [(u64, u64); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
-
     fn create_test_context_with(
         circuit: &mut PolyCircuit<DCRTPoly>,
         ring_dim: u32,
@@ -846,6 +896,18 @@ mod tests {
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> (DCRTPolyParams, Arc<RingGswContext<DCRTPoly>>) {
         create_test_context_with(circuit, NUM_SLOTS as u32, NUM_SLOTS, ACTIVE_LEVELS, CRT_BITS)
+    }
+
+    fn sample_binary_input_pair() -> (u64, u64) {
+        let mut rng = rand::rng();
+        (rng.random_range(0..2u64), rng.random_range(0..2u64))
+    }
+
+    fn sample_hash_key() -> [u8; 32] {
+        let mut rng = rand::rng();
+        let mut key = [0u8; 32];
+        rng.fill(&mut key);
+        key
     }
 
     fn eval_outputs(
@@ -894,11 +956,13 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
         let secret_key = sample_secret_key(&params);
+        let public_key_hash_key = sample_hash_key();
+        let randomizer_hash_key = sample_hash_key();
         let public_key = sample_public_key(
             &params,
             ctx.width(),
             &secret_key,
-            PUBLIC_KEY_HASH_KEY,
+            public_key_hash_key,
             b"ring_gsw_public_key",
             None,
         );
@@ -910,7 +974,7 @@ mod tests {
                 ctx.nested_rns.as_ref(),
                 &public_key,
                 plaintext,
-                RANDOMIZER_HASH_KEY,
+                randomizer_hash_key,
                 tag,
             );
             let decrypted =
@@ -940,69 +1004,70 @@ mod tests {
         let plaintext_modulus = 3u64;
 
         let secret_key = sample_secret_key(&params);
+        let public_key_hash_key = sample_hash_key();
+        let randomizer_hash_key = sample_hash_key();
         let public_key = sample_public_key(
             &params,
             lhs.width(),
             &secret_key,
-            PUBLIC_KEY_HASH_KEY,
+            public_key_hash_key,
             b"ring_gsw_public_key",
             None,
         );
         let q_modulus = BigUint::from(ctx.nested_rns.q_moduli()[0]);
 
-        for (x1, x2) in BINARY_INPUT_CASES {
-            let expected = (x1 + x2) % plaintext_modulus;
-            let lhs_tag = format!("add_lhs_{x1}_{x2}");
-            let rhs_tag = format!("add_rhs_{x1}_{x2}");
-            let lhs_native = encrypt_plaintext_bit(
-                &params,
-                ctx.nested_rns.as_ref(),
-                &public_key,
-                x1,
-                RANDOMIZER_HASH_KEY,
-                lhs_tag.as_bytes(),
-            );
-            let rhs_native = encrypt_plaintext_bit(
-                &params,
-                ctx.nested_rns.as_ref(),
-                &public_key,
-                x2,
-                RANDOMIZER_HASH_KEY,
-                rhs_tag.as_bytes(),
-            );
+        let (x1, x2) = sample_binary_input_pair();
+        let expected = (x1 + x2) % plaintext_modulus;
+        let lhs_tag = format!("add_lhs_{x1}_{x2}");
+        let rhs_tag = format!("add_rhs_{x1}_{x2}");
+        let lhs_native = encrypt_plaintext_bit(
+            &params,
+            ctx.nested_rns.as_ref(),
+            &public_key,
+            x1,
+            randomizer_hash_key,
+            lhs_tag.as_bytes(),
+        );
+        let rhs_native = encrypt_plaintext_bit(
+            &params,
+            ctx.nested_rns.as_ref(),
+            &public_key,
+            x2,
+            randomizer_hash_key,
+            rhs_tag.as_bytes(),
+        );
 
-            let inputs = [
-                ciphertext_inputs_from_native(
-                    &params,
-                    ctx.nested_rns.as_ref(),
-                    &lhs_native,
-                    0,
-                    Some(ctx.active_levels),
-                ),
-                ciphertext_inputs_from_native(
-                    &params,
-                    ctx.nested_rns.as_ref(),
-                    &rhs_native,
-                    0,
-                    Some(ctx.active_levels),
-                ),
-            ]
-            .concat();
-            let outputs = eval_outputs(&params, &circuit, inputs);
-            let reconstructed = ciphertext_from_outputs(&params, &outputs, lhs.width());
-            let decrypted = decrypt_ciphertext(
+        let inputs = [
+            ciphertext_inputs_from_native(
                 &params,
                 ctx.nested_rns.as_ref(),
-                &reconstructed,
-                &secret_key,
-                plaintext_modulus,
-            );
-            assert_eq!(
-                rounded_coeffs(&decrypted, plaintext_modulus, &q_modulus),
-                expected_coeffs(expected),
-                "Ring-GSW addition should decrypt to the plaintext-modulus sum for x1={x1}, x2={x2}"
-            );
-        }
+                &lhs_native,
+                0,
+                Some(ctx.active_levels),
+            ),
+            ciphertext_inputs_from_native(
+                &params,
+                ctx.nested_rns.as_ref(),
+                &rhs_native,
+                0,
+                Some(ctx.active_levels),
+            ),
+        ]
+        .concat();
+        let outputs = eval_outputs(&params, &circuit, inputs);
+        let reconstructed = ciphertext_from_outputs(&params, &outputs, lhs.width());
+        let decrypted = decrypt_ciphertext(
+            &params,
+            ctx.nested_rns.as_ref(),
+            &reconstructed,
+            &secret_key,
+            plaintext_modulus,
+        );
+        assert_eq!(
+            rounded_coeffs(&decrypted, plaintext_modulus, &q_modulus),
+            expected_coeffs(expected),
+            "Ring-GSW addition should decrypt to the plaintext-modulus sum for sampled x1={x1}, x2={x2}"
+        );
     }
 
     #[sequential_test::sequential]
@@ -1018,69 +1083,70 @@ mod tests {
         let plaintext_modulus = 3u64;
 
         let secret_key = sample_secret_key(&params);
+        let public_key_hash_key = sample_hash_key();
+        let randomizer_hash_key = sample_hash_key();
         let public_key = sample_public_key(
             &params,
             lhs.width(),
             &secret_key,
-            PUBLIC_KEY_HASH_KEY,
+            public_key_hash_key,
             b"ring_gsw_public_key",
             None,
         );
         let q_modulus = BigUint::from(ctx.nested_rns.q_moduli()[0]);
 
-        for (x1, x2) in BINARY_INPUT_CASES {
-            let expected = (x1 + plaintext_modulus - x2) % plaintext_modulus;
-            let lhs_tag = format!("sub_lhs_{x1}_{x2}");
-            let rhs_tag = format!("sub_rhs_{x1}_{x2}");
-            let lhs_native = encrypt_plaintext_bit(
-                &params,
-                ctx.nested_rns.as_ref(),
-                &public_key,
-                x1,
-                RANDOMIZER_HASH_KEY,
-                lhs_tag.as_bytes(),
-            );
-            let rhs_native = encrypt_plaintext_bit(
-                &params,
-                ctx.nested_rns.as_ref(),
-                &public_key,
-                x2,
-                RANDOMIZER_HASH_KEY,
-                rhs_tag.as_bytes(),
-            );
+        let (x1, x2) = sample_binary_input_pair();
+        let expected = (x1 + plaintext_modulus - x2) % plaintext_modulus;
+        let lhs_tag = format!("sub_lhs_{x1}_{x2}");
+        let rhs_tag = format!("sub_rhs_{x1}_{x2}");
+        let lhs_native = encrypt_plaintext_bit(
+            &params,
+            ctx.nested_rns.as_ref(),
+            &public_key,
+            x1,
+            randomizer_hash_key,
+            lhs_tag.as_bytes(),
+        );
+        let rhs_native = encrypt_plaintext_bit(
+            &params,
+            ctx.nested_rns.as_ref(),
+            &public_key,
+            x2,
+            randomizer_hash_key,
+            rhs_tag.as_bytes(),
+        );
 
-            let inputs = [
-                ciphertext_inputs_from_native(
-                    &params,
-                    ctx.nested_rns.as_ref(),
-                    &lhs_native,
-                    0,
-                    Some(ctx.active_levels),
-                ),
-                ciphertext_inputs_from_native(
-                    &params,
-                    ctx.nested_rns.as_ref(),
-                    &rhs_native,
-                    0,
-                    Some(ctx.active_levels),
-                ),
-            ]
-            .concat();
-            let outputs = eval_outputs(&params, &circuit, inputs);
-            let reconstructed = ciphertext_from_outputs(&params, &outputs, lhs.width());
-            let decrypted = decrypt_ciphertext(
+        let inputs = [
+            ciphertext_inputs_from_native(
                 &params,
                 ctx.nested_rns.as_ref(),
-                &reconstructed,
-                &secret_key,
-                plaintext_modulus,
-            );
-            assert_eq!(
-                rounded_coeffs(&decrypted, plaintext_modulus, &q_modulus),
-                expected_coeffs(expected),
-                "Ring-GSW subtraction should decrypt to the plaintext-modulus difference for x1={x1}, x2={x2}"
-            );
-        }
+                &lhs_native,
+                0,
+                Some(ctx.active_levels),
+            ),
+            ciphertext_inputs_from_native(
+                &params,
+                ctx.nested_rns.as_ref(),
+                &rhs_native,
+                0,
+                Some(ctx.active_levels),
+            ),
+        ]
+        .concat();
+        let outputs = eval_outputs(&params, &circuit, inputs);
+        let reconstructed = ciphertext_from_outputs(&params, &outputs, lhs.width());
+        let decrypted = decrypt_ciphertext(
+            &params,
+            ctx.nested_rns.as_ref(),
+            &reconstructed,
+            &secret_key,
+            plaintext_modulus,
+        );
+        assert_eq!(
+            rounded_coeffs(&decrypted, plaintext_modulus, &q_modulus),
+            expected_coeffs(expected),
+            "Ring-GSW subtraction should decrypt to the plaintext-modulus difference for sampled x1={x1}, x2={x2}"
+        );
     }
 
     #[sequential_test::sequential]
@@ -1096,128 +1162,70 @@ mod tests {
         let plaintext_modulus = 2u64;
 
         let secret_key = sample_secret_key(&params);
+        let public_key_hash_key = sample_hash_key();
+        let randomizer_hash_key = sample_hash_key();
         let public_key = sample_public_key(
             &params,
             lhs.width(),
             &secret_key,
-            PUBLIC_KEY_HASH_KEY,
+            public_key_hash_key,
             b"ring_gsw_public_key",
             None,
         );
         let q_modulus = BigUint::from(ctx.nested_rns.q_moduli()[0]);
 
-        for (x1, x2) in BINARY_INPUT_CASES {
-            let expected = (x1 * x2) % plaintext_modulus;
-            let lhs_tag = format!("mul_lhs_{x1}_{x2}");
-            let rhs_tag = format!("mul_rhs_{x1}_{x2}");
-            let lhs_native = encrypt_plaintext_bit(
-                &params,
-                ctx.nested_rns.as_ref(),
-                &public_key,
-                x1,
-                RANDOMIZER_HASH_KEY,
-                lhs_tag.as_bytes(),
-            );
-            let rhs_native = encrypt_plaintext_bit(
-                &params,
-                ctx.nested_rns.as_ref(),
-                &public_key,
-                x2,
-                RANDOMIZER_HASH_KEY,
-                rhs_tag.as_bytes(),
-            );
-
-            let inputs = [
-                ciphertext_inputs_from_native(
-                    &params,
-                    ctx.nested_rns.as_ref(),
-                    &lhs_native,
-                    0,
-                    Some(ctx.active_levels),
-                ),
-                ciphertext_inputs_from_native(
-                    &params,
-                    ctx.nested_rns.as_ref(),
-                    &rhs_native,
-                    0,
-                    Some(ctx.active_levels),
-                ),
-            ]
-            .concat();
-            let outputs = eval_outputs(&params, &circuit, inputs);
-            let reconstructed = ciphertext_from_outputs(&params, &outputs, lhs.width());
-            let decrypted = decrypt_ciphertext(
-                &params,
-                ctx.nested_rns.as_ref(),
-                &reconstructed,
-                &secret_key,
-                plaintext_modulus,
-            );
-            assert_eq!(
-                rounded_coeffs(&decrypted, plaintext_modulus, &q_modulus),
-                expected_coeffs(expected),
-                "Ring-GSW multiplication should decrypt to the plaintext-modulus product for x1={x1}, x2={x2}"
-            );
-        }
-    }
-
-    #[sequential_test::sequential]
-    #[test]
-    fn test_ring_gsw_scalar_mul_decrypts_to_expected_integer_product_without_error() {
-        let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (params, ctx) = create_test_context(&mut circuit);
-        let input = RingGswCiphertext::input(ctx.clone(), &mut circuit);
-        let scaled = input.scalar_mul(2, &mut circuit);
-        let reconstructed_scaled = scaled.reconstruct(&mut circuit);
-        circuit.output(reconstructed_scaled);
-
-        let plaintext_modulus = 3u64;
-
-        let secret_key = sample_secret_key(&params);
-        let public_key = sample_public_key(
+        let (x1, x2) = sample_binary_input_pair();
+        let expected = (x1 * x2) % plaintext_modulus;
+        let lhs_tag = format!("mul_lhs_{x1}_{x2}");
+        let rhs_tag = format!("mul_rhs_{x1}_{x2}");
+        let lhs_native = encrypt_plaintext_bit(
             &params,
-            input.width(),
-            &secret_key,
-            PUBLIC_KEY_HASH_KEY,
-            b"ring_gsw_public_key",
-            None,
+            ctx.nested_rns.as_ref(),
+            &public_key,
+            x1,
+            randomizer_hash_key,
+            lhs_tag.as_bytes(),
         );
-        let q_modulus = BigUint::from(ctx.nested_rns.q_moduli()[0]);
+        let rhs_native = encrypt_plaintext_bit(
+            &params,
+            ctx.nested_rns.as_ref(),
+            &public_key,
+            x2,
+            randomizer_hash_key,
+            rhs_tag.as_bytes(),
+        );
 
-        for x in [0u64, 1u64] {
-            let expected = (2 * x) % plaintext_modulus;
-            let input_tag = format!("scalar_mul_input_{x}");
-            let native = encrypt_plaintext_bit(
+        let inputs = [
+            ciphertext_inputs_from_native(
                 &params,
                 ctx.nested_rns.as_ref(),
-                &public_key,
-                x,
-                RANDOMIZER_HASH_KEY,
-                input_tag.as_bytes(),
-            );
-
-            let inputs = ciphertext_inputs_from_native(
-                &params,
-                ctx.nested_rns.as_ref(),
-                &native,
+                &lhs_native,
                 0,
                 Some(ctx.active_levels),
-            );
-            let outputs = eval_outputs(&params, &circuit, inputs);
-            let reconstructed = ciphertext_from_outputs(&params, &outputs, input.width());
-            let decrypted = decrypt_ciphertext(
+            ),
+            ciphertext_inputs_from_native(
                 &params,
                 ctx.nested_rns.as_ref(),
-                &reconstructed,
-                &secret_key,
-                plaintext_modulus,
-            );
-            assert_eq!(
-                rounded_coeffs(&decrypted, plaintext_modulus, &q_modulus),
-                expected_coeffs(expected),
-                "Ring-GSW scalar multiplication should decrypt to the expected plaintext-modulus scaled plaintext for x={x}"
-            );
-        }
+                &rhs_native,
+                0,
+                Some(ctx.active_levels),
+            ),
+        ]
+        .concat();
+        let outputs = eval_outputs(&params, &circuit, inputs);
+        let reconstructed = ciphertext_from_outputs(&params, &outputs, lhs.width());
+        let decrypted = decrypt_ciphertext(
+            &params,
+            ctx.nested_rns.as_ref(),
+            &reconstructed,
+            &secret_key,
+            plaintext_modulus,
+        );
+        assert_eq!(
+            rounded_coeffs(&decrypted, plaintext_modulus, &q_modulus),
+            expected_coeffs(expected),
+            "Ring-GSW multiplication should decrypt to the plaintext-modulus product for sampled x1={x1}, x2={x2}"
+        );
     }
 
     #[sequential_test::sequential]
@@ -1234,69 +1242,70 @@ mod tests {
         let plaintext_modulus = 3u64;
 
         let secret_key = sample_secret_key(&params);
+        let public_key_hash_key = sample_hash_key();
+        let randomizer_hash_key = sample_hash_key();
         let public_key = sample_public_key(
             &params,
             lhs.width(),
             &secret_key,
-            PUBLIC_KEY_HASH_KEY,
+            public_key_hash_key,
             b"ring_gsw_public_key",
             None,
         );
         let q_modulus = BigUint::from(ctx.nested_rns.q_moduli()[0]);
 
-        for (x1, x2) in BINARY_INPUT_CASES {
-            let expected = x1 ^ x2;
-            let lhs_tag = format!("xor_lhs_{x1}_{x2}");
-            let rhs_tag = format!("xor_rhs_{x1}_{x2}");
-            let lhs_native = encrypt_plaintext_bit(
-                &params,
-                ctx.nested_rns.as_ref(),
-                &public_key,
-                x1,
-                RANDOMIZER_HASH_KEY,
-                lhs_tag.as_bytes(),
-            );
-            let rhs_native = encrypt_plaintext_bit(
-                &params,
-                ctx.nested_rns.as_ref(),
-                &public_key,
-                x2,
-                RANDOMIZER_HASH_KEY,
-                rhs_tag.as_bytes(),
-            );
+        let (x1, x2) = sample_binary_input_pair();
+        let expected = x1 ^ x2;
+        let lhs_tag = format!("xor_lhs_{x1}_{x2}");
+        let rhs_tag = format!("xor_rhs_{x1}_{x2}");
+        let lhs_native = encrypt_plaintext_bit(
+            &params,
+            ctx.nested_rns.as_ref(),
+            &public_key,
+            x1,
+            randomizer_hash_key,
+            lhs_tag.as_bytes(),
+        );
+        let rhs_native = encrypt_plaintext_bit(
+            &params,
+            ctx.nested_rns.as_ref(),
+            &public_key,
+            x2,
+            randomizer_hash_key,
+            rhs_tag.as_bytes(),
+        );
 
-            let inputs = [
-                ciphertext_inputs_from_native(
-                    &params,
-                    ctx.nested_rns.as_ref(),
-                    &lhs_native,
-                    0,
-                    Some(ctx.active_levels),
-                ),
-                ciphertext_inputs_from_native(
-                    &params,
-                    ctx.nested_rns.as_ref(),
-                    &rhs_native,
-                    0,
-                    Some(ctx.active_levels),
-                ),
-            ]
-            .concat();
-            let outputs = eval_outputs(&params, &circuit, inputs);
-            let reconstructed = ciphertext_from_outputs(&params, &outputs, lhs.width());
-            let decrypted = decrypt_ciphertext(
+        let inputs = [
+            ciphertext_inputs_from_native(
                 &params,
                 ctx.nested_rns.as_ref(),
-                &reconstructed,
-                &secret_key,
-                plaintext_modulus,
-            );
-            assert_eq!(
-                rounded_coeffs(&decrypted, plaintext_modulus, &q_modulus),
-                expected_coeffs(expected),
-                "Ring-GSW xor should decrypt to the Boolean xor of the input bits for x1={x1}, x2={x2}"
-            );
-        }
+                &lhs_native,
+                0,
+                Some(ctx.active_levels),
+            ),
+            ciphertext_inputs_from_native(
+                &params,
+                ctx.nested_rns.as_ref(),
+                &rhs_native,
+                0,
+                Some(ctx.active_levels),
+            ),
+        ]
+        .concat();
+        let outputs = eval_outputs(&params, &circuit, inputs);
+        let reconstructed = ciphertext_from_outputs(&params, &outputs, lhs.width());
+        let decrypted = decrypt_ciphertext(
+            &params,
+            ctx.nested_rns.as_ref(),
+            &reconstructed,
+            &secret_key,
+            plaintext_modulus,
+        );
+        assert_eq!(
+            rounded_coeffs(&decrypted, plaintext_modulus, &q_modulus),
+            expected_coeffs(expected),
+            "Ring-GSW xor should decrypt to the Boolean xor of the sampled input bits for x1={x1}, x2={x2}"
+        );
     }
 
     #[sequential_test::sequential]
@@ -1313,76 +1322,77 @@ mod tests {
         let plaintext_modulus = 2u64;
 
         let secret_key = sample_secret_key(&params);
+        let public_key_hash_key = sample_hash_key();
+        let randomizer_hash_key = sample_hash_key();
         let public_key = sample_public_key(
             &params,
             lhs.width(),
             &secret_key,
-            PUBLIC_KEY_HASH_KEY,
+            public_key_hash_key,
             b"ring_gsw_public_key",
             None,
         );
         let q_modulus = BigUint::from(ctx.nested_rns.q_moduli()[0]);
 
-        for (x1, x2) in BINARY_INPUT_CASES {
-            let expected = x1 & x2;
-            let lhs_tag = format!("and_lhs_{x1}_{x2}");
-            let rhs_tag = format!("and_rhs_{x1}_{x2}");
-            let lhs_native = encrypt_plaintext_bit(
-                &params,
-                ctx.nested_rns.as_ref(),
-                &public_key,
-                x1,
-                RANDOMIZER_HASH_KEY,
-                lhs_tag.as_bytes(),
-            );
-            let rhs_native = encrypt_plaintext_bit(
-                &params,
-                ctx.nested_rns.as_ref(),
-                &public_key,
-                x2,
-                RANDOMIZER_HASH_KEY,
-                rhs_tag.as_bytes(),
-            );
+        let (x1, x2) = sample_binary_input_pair();
+        let expected = x1 & x2;
+        let lhs_tag = format!("and_lhs_{x1}_{x2}");
+        let rhs_tag = format!("and_rhs_{x1}_{x2}");
+        let lhs_native = encrypt_plaintext_bit(
+            &params,
+            ctx.nested_rns.as_ref(),
+            &public_key,
+            x1,
+            randomizer_hash_key,
+            lhs_tag.as_bytes(),
+        );
+        let rhs_native = encrypt_plaintext_bit(
+            &params,
+            ctx.nested_rns.as_ref(),
+            &public_key,
+            x2,
+            randomizer_hash_key,
+            rhs_tag.as_bytes(),
+        );
 
-            let inputs = [
-                ciphertext_inputs_from_native(
-                    &params,
-                    ctx.nested_rns.as_ref(),
-                    &lhs_native,
-                    0,
-                    Some(ctx.active_levels),
-                ),
-                ciphertext_inputs_from_native(
-                    &params,
-                    ctx.nested_rns.as_ref(),
-                    &rhs_native,
-                    0,
-                    Some(ctx.active_levels),
-                ),
-            ]
-            .concat();
-            let outputs = eval_outputs(&params, &circuit, inputs);
-            let reconstructed = ciphertext_from_outputs(&params, &outputs, lhs.width());
-            let decrypted = decrypt_ciphertext(
+        let inputs = [
+            ciphertext_inputs_from_native(
                 &params,
                 ctx.nested_rns.as_ref(),
-                &reconstructed,
-                &secret_key,
-                plaintext_modulus,
-            );
-            assert_eq!(
-                rounded_coeffs(&decrypted, plaintext_modulus, &q_modulus),
-                expected_coeffs(expected),
-                "Ring-GSW and should decrypt to the Boolean and of the input bits for x1={x1}, x2={x2}"
-            );
-        }
+                &lhs_native,
+                0,
+                Some(ctx.active_levels),
+            ),
+            ciphertext_inputs_from_native(
+                &params,
+                ctx.nested_rns.as_ref(),
+                &rhs_native,
+                0,
+                Some(ctx.active_levels),
+            ),
+        ]
+        .concat();
+        let outputs = eval_outputs(&params, &circuit, inputs);
+        let reconstructed = ciphertext_from_outputs(&params, &outputs, lhs.width());
+        let decrypted = decrypt_ciphertext(
+            &params,
+            ctx.nested_rns.as_ref(),
+            &reconstructed,
+            &secret_key,
+            plaintext_modulus,
+        );
+        assert_eq!(
+            rounded_coeffs(&decrypted, plaintext_modulus, &q_modulus),
+            expected_coeffs(expected),
+            "Ring-GSW and should decrypt to the Boolean and of the sampled input bits for x1={x1}, x2={x2}"
+        );
     }
 
     #[sequential_test::sequential]
     #[test]
     // #[ignore = "expensive circuit-structure reporting test; run with --ignored --nocapture"]
     fn test_ring_gsw_mul_large_circuit_metrics() {
-        let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+        let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
         let crt_bits = 24usize;
         let crt_depth = 1usize;
         let ring_dim = 1u32 << 10;

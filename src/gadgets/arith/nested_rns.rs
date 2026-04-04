@@ -41,6 +41,7 @@ pub struct NestedRnsPolyContext {
     gadget_decompose_id: usize,
     full_reduce_ids: Vec<usize>,
     mul_lazy_reduce_ids: Vec<usize>,
+    mul_right_sparse_ids: Vec<usize>,
 }
 
 fn dummy_lut<P: Poly + 'static>(params: &P::Params) -> PublicLut<P> {
@@ -237,6 +238,14 @@ impl NestedRnsPolyContext {
                     ))
                 })
                 .collect::<Vec<_>>();
+            let mul_right_sparse_ids = (0..q_moduli_depth)
+                .map(|_| {
+                    circuit.register_sub_circuit(Self::mul_right_sparse_subcircuit::<P>(
+                        &p_moduli,
+                        &lut_mod_p_ids,
+                    ))
+                })
+                .collect::<Vec<_>>();
             let lazy_reduce_id = circuit
                 .register_sub_circuit(Self::lazy_reduce_subcircuit::<P>(&p_moduli, &lut_mod_p_ids));
             let gadget_decompose_id =
@@ -282,6 +291,7 @@ impl NestedRnsPolyContext {
                 gadget_decompose_id,
                 full_reduce_ids,
                 mul_lazy_reduce_ids,
+                mul_right_sparse_ids,
             };
         }
 
@@ -487,6 +497,14 @@ impl NestedRnsPolyContext {
                 ))
             })
             .collect::<Vec<_>>();
+        let mul_right_sparse_ids = (0..q_moduli_depth)
+            .map(|_| {
+                circuit.register_sub_circuit(Self::mul_right_sparse_subcircuit::<P>(
+                    &p_moduli,
+                    &lut_mod_p_ids,
+                ))
+            })
+            .collect::<Vec<_>>();
         let lazy_reduce_id = circuit
             .register_sub_circuit(Self::lazy_reduce_subcircuit::<P>(&p_moduli, &lut_mod_p_ids));
         let gadget_decompose_id =
@@ -532,6 +550,7 @@ impl NestedRnsPolyContext {
             gadget_decompose_id,
             full_reduce_ids,
             mul_lazy_reduce_ids,
+            mul_right_sparse_ids,
         }
     }
 
@@ -567,6 +586,14 @@ impl NestedRnsPolyContext {
         let mul_lazy_reduce_ids = (0..q_moduli_depth)
             .map(|_| {
                 circuit.register_sub_circuit(Self::mul_lazy_reduce_subcircuit::<P>(
+                    &p_moduli,
+                    &self.lut_mod_p_ids,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mul_right_sparse_ids = (0..q_moduli_depth)
+            .map(|_| {
+                circuit.register_sub_circuit(Self::mul_right_sparse_subcircuit::<P>(
                     &p_moduli,
                     &self.lut_mod_p_ids,
                 ))
@@ -619,6 +646,7 @@ impl NestedRnsPolyContext {
             gadget_decompose_id,
             full_reduce_ids,
             mul_lazy_reduce_ids,
+            mul_right_sparse_ids,
         }
     }
 
@@ -637,6 +665,13 @@ impl NestedRnsPolyContext {
         let reduced = circuit.call_sub_circuit(reduce_circuit_id, &prod);
         circuit.output(reduced);
         circuit
+    }
+
+    fn mul_right_sparse_subcircuit<P: Poly>(
+        p_moduli: &[u64],
+        lut_mod_p_ids: &[usize],
+    ) -> PolyCircuit<P> {
+        Self::mul_lazy_reduce_subcircuit::<P>(p_moduli, lut_mod_p_ids)
     }
 
     fn add_without_reduce_subcircuit<P: Poly>(p_moduli: &[u64]) -> PolyCircuit<P> {
@@ -1066,6 +1101,49 @@ impl<P: Poly> NestedRnsPoly<P> {
         )
     }
 
+    pub fn mul_right_sparse(
+        &self,
+        other: &Self,
+        right_q_idx: usize,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        self.assert_matching_enable_levels(other);
+        let levels = self.resolve_enable_levels();
+        other.assert_sparse_at_q_idx(right_q_idx);
+
+        let mut left = self.clone();
+        let mut right = other.clone();
+        let mut predicted_bounds = vec![BigUint::ZERO; levels];
+        predicted_bounds[right_q_idx] =
+            &self.max_plaintexts[right_q_idx] * &other.max_plaintexts[right_q_idx];
+        if self.bounds_exceed_p_full(&predicted_bounds) {
+            left = self.full_reduce(circuit);
+            right = other.full_reduce(circuit);
+        }
+
+        left = left.lazy_reduce_if_unreduced(circuit);
+        right = right.lazy_reduce_if_unreduced(circuit);
+
+        let mut final_bounds = vec![BigUint::ZERO; levels];
+        final_bounds[right_q_idx] =
+            &left.max_plaintexts[right_q_idx] * &right.max_plaintexts[right_q_idx];
+        left.assert_bounds_within_p_full(
+            &final_bounds,
+            "mul_right_sparse output exceeds p_full even after automatic full_reduce",
+        );
+
+        let mut final_traces = vec![BigUint::ZERO; levels];
+        final_traces[right_q_idx] = left.ctx.reduced_p_max_trace();
+        left.call_sparse_right_subcircuit(
+            &right,
+            right_q_idx,
+            circuit,
+            &self.ctx.mul_right_sparse_ids,
+            final_bounds,
+            final_traces,
+        )
+    }
+
     pub fn full_reduce(&self, circuit: &mut PolyCircuit<P>) -> Self {
         let operand = self.lazy_reduce_if_unreduced(circuit);
         let levels = self.resolve_enable_levels();
@@ -1306,6 +1384,57 @@ impl<P: Poly> NestedRnsPoly<P> {
             let outputs =
                 circuit.call_sub_circuit(subcircuit_ids[self.level_offset + q_idx], &inputs);
             result_inner.push(outputs);
+        }
+        Self::new(
+            self.ctx.clone(),
+            result_inner,
+            Some(self.level_offset),
+            self.enable_levels,
+            max_plaintexts,
+        )
+        .with_p_max_traces(p_max_traces)
+    }
+
+    fn call_sparse_right_subcircuit(
+        &self,
+        other: &Self,
+        target_q_idx: usize,
+        circuit: &mut PolyCircuit<P>,
+        subcircuit_ids: &[usize],
+        max_plaintexts: Vec<BigUint>,
+        p_max_traces: Vec<BigUint>,
+    ) -> Self {
+        let levels = self.resolve_enable_levels();
+        assert!(
+            target_q_idx < levels,
+            "sparse target q_idx {} exceeds active levels {}",
+            target_q_idx,
+            levels
+        );
+        assert!(
+            levels <= other.inner.len(),
+            "operand q_moduli depth {} does not cover active levels {}",
+            other.inner.len(),
+            levels
+        );
+        assert!(levels <= subcircuit_ids.len(), "enable_levels exceeds subcircuit depth");
+        let zero_gate = circuit.const_zero_gate();
+        let p_moduli_depth = self.ctx.p_moduli.len();
+        let mut result_inner = Vec::with_capacity(levels);
+        for q_idx in 0..levels {
+            if q_idx == target_q_idx {
+                let left = &self.inner[q_idx];
+                let right = &other.inner[q_idx];
+                assert_eq!(left.len(), right.len(), "mismatched p_moduli depth");
+                let mut inputs = Vec::with_capacity(left.len() + right.len());
+                inputs.extend_from_slice(left);
+                inputs.extend_from_slice(right);
+                let outputs =
+                    circuit.call_sub_circuit(subcircuit_ids[self.level_offset + q_idx], &inputs);
+                result_inner.push(outputs);
+            } else {
+                result_inner.push(vec![zero_gate; p_moduli_depth]);
+            }
         }
         Self::new(
             self.ctx.clone(),
@@ -1644,6 +1773,31 @@ impl<P: Poly> NestedRnsPoly<P> {
             self.level_offset, other.level_offset,
             "mismatched level_offset: left={}, right={}",
             self.level_offset, other.level_offset
+        );
+    }
+
+    fn assert_sparse_at_q_idx(&self, target_q_idx: usize) {
+        let levels = self.resolve_enable_levels();
+        assert!(
+            target_q_idx < levels,
+            "mul_right_sparse target q_idx {} exceeds active levels {}",
+            target_q_idx,
+            levels
+        );
+        for q_idx in 0..levels {
+            let should_be_zero = q_idx != target_q_idx;
+            if should_be_zero {
+                assert!(
+                    self.max_plaintexts[q_idx] == BigUint::ZERO,
+                    "mul_right_sparse requires the right operand to be zero outside q_idx {}",
+                    target_q_idx
+                );
+            }
+        }
+        assert!(
+            self.max_plaintexts[target_q_idx] != BigUint::ZERO,
+            "mul_right_sparse requires a non-zero bound at q_idx {}",
+            target_q_idx
         );
     }
 
@@ -2141,7 +2295,7 @@ mod tests {
     use super::*;
     use crate::{
         __PAIR, __TestState,
-        circuit::evaluable::PolyVec,
+        circuit::{PolyGateKind, evaluable::PolyVec},
         gadgets::ntt::encode_nested_rns_poly_vec_with_offset,
         lookup::{poly::PolyPltEvaluator, poly_vec::PolyVecPltEvaluator},
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
@@ -2216,6 +2370,35 @@ mod tests {
         let p = ctx.p_moduli.iter().fold(BigUint::from(1u64), |acc, &pi| acc * BigUint::from(pi));
         println!("p: {}", p);
         ctx
+    }
+
+    fn sparse_gadget_entry(
+        ctx: Arc<NestedRnsPolyContext>,
+        target_q_idx: usize,
+        circuit: &mut PolyCircuit<DCRTPoly>,
+    ) -> NestedRnsPoly<DCRTPoly> {
+        let active_levels = ctx.q_moduli_depth;
+        assert!(
+            target_q_idx < active_levels,
+            "test sparse gadget q_idx {} exceeds active levels {}",
+            target_q_idx,
+            active_levels
+        );
+        let value = ctx.gadget_values[target_q_idx]
+            .first()
+            .cloned()
+            .expect("gadget values must contain at least one digit per q level");
+        let mut constant_cache = BTreeMap::new();
+        NestedRnsPoly::<DCRTPoly>::sparse_constant_level_poly(
+            ctx,
+            active_levels,
+            None,
+            0,
+            target_q_idx,
+            &value,
+            circuit,
+            &mut constant_cache,
+        )
     }
 
     fn build_gadget_decomposition_reconstruction_circuit(
@@ -2459,6 +2642,110 @@ mod tests {
         let a_value: BigUint = modulus.as_ref() - BigUint::from(1u64);
         let b_value: BigUint = modulus.as_ref() - BigUint::from(1u64);
         test_nested_rns_poly_mul_reconstruct_generic(circuit, params, ctx, a_value, b_value);
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_mul_right_sparse_matches_generic_mul() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let right_q_idx = if ctx.q_moduli_depth > 1 { 1 } else { 0 };
+        let lhs = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
+        let rhs_sparse = sparse_gadget_entry(ctx, right_q_idx, &mut circuit);
+        let sparse_product = lhs.mul_right_sparse(&rhs_sparse, right_q_idx, &mut circuit);
+        let generic_product = lhs.mul(&rhs_sparse, &mut circuit);
+        let sparse_out = sparse_product.reconstruct(&mut circuit);
+        let generic_out = generic_product.reconstruct(&mut circuit);
+        circuit.output(vec![sparse_out, generic_out]);
+
+        let modulus = params.modulus();
+        let input_values = vec![
+            BigUint::ZERO,
+            BigUint::from(7u64),
+            modulus.as_ref().clone() - BigUint::from(5u64),
+        ];
+        let one = DCRTPoly::const_one(&params);
+        let plt_evaluator = PolyPltEvaluator::new();
+        for lhs_value in input_values {
+            let lhs_inputs = encode_nested_rns_poly(
+                P_MODULI_BITS,
+                MAX_UNREDUCED_MULS,
+                &params,
+                &lhs_value,
+                None,
+            );
+            let eval_results =
+                circuit.eval(&params, one.clone(), lhs_inputs, Some(&plt_evaluator), None, None);
+            assert_eq!(eval_results.len(), 2);
+            assert_eq!(
+                eval_results[0].coeffs_biguints()[0],
+                eval_results[1].coeffs_biguints()[0],
+                "mul_right_sparse should match generic mul for lhs_value={lhs_value}"
+            );
+        }
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_mul_right_sparse_uses_fewer_gates_than_generic_mul() {
+        let right_q_idx = 0usize;
+        let (generic_counts, sparse_counts) = rayon::join(
+            || {
+                let mut generic_circuit = PolyCircuit::<DCRTPoly>::new();
+                let (_generic_params, generic_ctx) = create_test_context(&mut generic_circuit);
+                let generic_lhs =
+                    NestedRnsPoly::input(generic_ctx.clone(), None, None, &mut generic_circuit);
+                let generic_rhs =
+                    sparse_gadget_entry(generic_ctx, right_q_idx, &mut generic_circuit);
+                let generic_product = generic_lhs.mul(&generic_rhs, &mut generic_circuit);
+                let generic_out = generic_product.reconstruct(&mut generic_circuit);
+                generic_circuit.output(vec![generic_out]);
+                generic_circuit.count_gates_by_type_vec()
+            },
+            || {
+                let mut sparse_circuit = PolyCircuit::<DCRTPoly>::new();
+                let (_sparse_params, sparse_ctx) = create_test_context(&mut sparse_circuit);
+                let sparse_lhs =
+                    NestedRnsPoly::input(sparse_ctx.clone(), None, None, &mut sparse_circuit);
+                let sparse_rhs = sparse_gadget_entry(sparse_ctx, right_q_idx, &mut sparse_circuit);
+                let sparse_product =
+                    sparse_lhs.mul_right_sparse(&sparse_rhs, right_q_idx, &mut sparse_circuit);
+                let sparse_out = sparse_product.reconstruct(&mut sparse_circuit);
+                sparse_circuit.output(vec![sparse_out]);
+                sparse_circuit.count_gates_by_type_vec()
+            },
+        );
+
+        let generic_mul_gates = generic_counts.get(&PolyGateKind::Mul).copied().unwrap_or_default();
+        let sparse_mul_gates = sparse_counts.get(&PolyGateKind::Mul).copied().unwrap_or_default();
+        assert!(
+            sparse_mul_gates < generic_mul_gates,
+            "mul_right_sparse should use fewer Mul gates than generic mul: sparse={}, generic={}",
+            sparse_mul_gates,
+            generic_mul_gates
+        );
+
+        let generic_total: usize = generic_counts.values().copied().sum();
+        let sparse_total: usize = sparse_counts.values().copied().sum();
+        assert!(
+            sparse_total < generic_total,
+            "mul_right_sparse should use fewer expanded gates than generic mul: sparse={}, generic={}",
+            sparse_total,
+            generic_total
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    #[should_panic(
+        expected = "mul_right_sparse requires the right operand to be zero outside q_idx"
+    )]
+    fn test_nested_rns_poly_mul_right_sparse_requires_sparse_rhs() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_, ctx) = create_test_context(&mut circuit);
+        let lhs = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
+        let rhs = NestedRnsPoly::input(ctx, None, None, &mut circuit);
+        let _ = lhs.mul_right_sparse(&rhs, 0, &mut circuit);
     }
 
     #[sequential_test::sequential]

@@ -1078,14 +1078,16 @@ mod tests {
         num_slots: usize,
         active_levels: usize,
         crt_bits: usize,
+        p_moduli_bits: usize,
+        max_unused_muls: usize,
     ) -> (DCRTPolyParams, Arc<RingGswContext<DCRTPoly>>) {
         let params = DCRTPolyParams::new(ring_dim, active_levels, crt_bits, BASE_BITS);
         let ctx = Arc::new(RingGswContext::setup(
             circuit,
             &params,
             num_slots,
-            P_MODULI_BITS,
-            DEFAULT_MAX_UNREDUCED_MULS,
+            p_moduli_bits,
+            max_unused_muls,
             SCALE,
             Some(active_levels),
             None,
@@ -1096,7 +1098,15 @@ mod tests {
     fn create_test_context(
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> (DCRTPolyParams, Arc<RingGswContext<DCRTPoly>>) {
-        create_test_context_with(circuit, NUM_SLOTS as u32, NUM_SLOTS, ACTIVE_LEVELS, CRT_BITS)
+        create_test_context_with(
+            circuit,
+            NUM_SLOTS as u32,
+            NUM_SLOTS,
+            ACTIVE_LEVELS,
+            CRT_BITS,
+            P_MODULI_BITS,
+            DEFAULT_MAX_UNREDUCED_MULS,
+        )
     }
 
     fn sample_binary_input_pair() -> (u64, u64) {
@@ -1598,20 +1608,57 @@ mod tests {
         let crt_depth = 1usize;
         let ring_dim = 1u32 << 10;
         let num_slots = 1usize << 10;
+        let p_moduli_bits = 6;
+        let max_unused_muls = 2;
 
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (_params, ctx) =
-            create_test_context_with(&mut circuit, ring_dim, num_slots, crt_depth, crt_bits);
+        let (_params, ctx) = create_test_context_with(
+            &mut circuit,
+            ring_dim,
+            num_slots,
+            crt_depth,
+            crt_bits,
+            p_moduli_bits,
+            max_unused_muls,
+        );
         let lhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
-        let rhs = RingGswCiphertext::input(ctx, &mut circuit);
+        let rhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
         let product = lhs.mul(&rhs, &mut circuit);
         let outputs = product.reconstruct(&mut circuit);
         circuit.output(outputs);
 
         println!(
-            "ring_gsw_mul metrics: crt_bits={crt_bits}, crt_depth={crt_depth}, ring_dim={ring_dim}, num_slots={num_slots}"
+            "mul 1 ring_gsw_mul metrics: crt_bits={crt_bits}, crt_depth={crt_depth}, ring_dim={ring_dim}, num_slots={num_slots}"
         );
-        println!("non-free depth {}", circuit.non_free_depth());
-        println!("gate counts {:?}", circuit.count_gates_by_type_vec());
+        let mul1_depth = circuit.non_free_depth();
+        println!("mul 1 non-free depth end {}", mul1_depth);
+        println!("mul 1 gate counts {:?}", circuit.count_gates_by_type_vec());
+
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_params, ctx) = create_test_context_with(
+            &mut circuit,
+            ring_dim,
+            num_slots,
+            crt_depth,
+            crt_bits,
+            p_moduli_bits,
+            max_unused_muls,
+        );
+        let lhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
+        let rhs1 = RingGswCiphertext::input(ctx.clone(), &mut circuit);
+        let rhs2 = RingGswCiphertext::input(ctx, &mut circuit);
+        let product1 = lhs.mul(&rhs1, &mut circuit);
+        let product2 = product1.mul(&rhs2, &mut circuit);
+        let outputs = product2.reconstruct(&mut circuit);
+        circuit.output(outputs);
+
+        println!(
+            "mul 2 ring_gsw_mul metrics: crt_bits={crt_bits}, crt_depth={crt_depth}, ring_dim={ring_dim}, num_slots={num_slots}"
+        );
+        let mul2_depth = circuit.non_free_depth();
+        println!("mul 2 non-free depth end {}", mul2_depth);
+        println!("mul 2 gate counts {:?}", circuit.count_gates_by_type_vec());
+
+        println!("mul 2 vs mul 1 depth increase: {}", mul2_depth - mul1_depth);
     }
 }

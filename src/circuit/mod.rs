@@ -14,7 +14,7 @@ use rayon::{
     slice::ParallelSliceMut,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Debug,
     sync::{
         Arc,
@@ -647,6 +647,7 @@ impl<P: Poly> PolyCircuit<P> {
         let one = Arc::new(E::from_compact(params, one_compact.as_ref()));
         let input_compacts =
             inputs.into_iter().map(|input| Arc::new(input.to_compact())).collect::<Vec<_>>();
+        let scoped_gate_ids = self.build_scoped_gate_id_map(call_id_base, gate_id_base);
         let outputs = self.eval_scoped(
             params,
             &one,
@@ -657,15 +658,16 @@ impl<P: Poly> PolyCircuit<P> {
             0,
             call_id_base,
             gate_id_base,
+            &scoped_gate_ids,
             parallel_gates,
         );
         outputs.into_iter().map(|value| E::from_compact(params, value.as_ref())).collect()
     }
 
-    fn eval_gate_id_bases(&self) -> (usize, usize) {
+    fn eval_gate_id_bases(&self) -> (u128, u128) {
         let max_calls = self.max_sub_circuit_calls();
         let max_gates = self.max_gate_count();
-        (max_calls.saturating_add(1), max_gates.saturating_add(1))
+        ((max_calls as u128) + 1, (max_gates as u128) + 1)
     }
 
     fn max_sub_circuit_calls(&self) -> usize {
@@ -684,6 +686,83 @@ impl<P: Poly> PolyCircuit<P> {
         max_gates
     }
 
+    fn collect_scoped_gate_keys(
+        &self,
+        call_prefix: u128,
+        call_id_base: u128,
+        gate_id_base: u128,
+        scoped_keys: &mut BTreeSet<u128>,
+    ) {
+        for gate in self.gates.values() {
+            match gate.gate_type {
+                PolyGateType::SlotTransfer { .. } | PolyGateType::PubLut { .. } => {
+                    let scoped_key = call_prefix
+                        .checked_mul(gate_id_base)
+                        .and_then(|base| base.checked_add(gate.gate_id.0 as u128))
+                        .expect("scoped gate key overflow");
+                    scoped_keys.insert(scoped_key);
+                }
+                _ => {}
+            }
+        }
+        for (call_id, call) in &self.sub_circuit_calls {
+            let child_prefix = call_prefix
+                .checked_mul(call_id_base)
+                .and_then(|base| base.checked_add((*call_id as u128) + 1))
+                .expect("sub-circuit call prefix overflow");
+            self.sub_circuits
+                .get(&call.sub_circuit_id)
+                .expect("sub-circuit missing while collecting scoped gate keys")
+                .collect_scoped_gate_keys(child_prefix, call_id_base, gate_id_base, scoped_keys);
+        }
+    }
+
+    fn build_scoped_gate_id_map(
+        &self,
+        call_id_base: u128,
+        gate_id_base: u128,
+    ) -> HashMap<u128, GateId> {
+        let mut scoped_keys = BTreeSet::new();
+        self.collect_scoped_gate_keys(0, call_id_base, gate_id_base, &mut scoped_keys);
+
+        let mut scoped_gate_ids = HashMap::with_capacity(scoped_keys.len());
+        let mut max_direct_gate_id = 0usize;
+        let mut overflow_keys = Vec::new();
+        for scoped_key in scoped_keys {
+            if scoped_key <= usize::MAX as u128 {
+                let gate_id = GateId(scoped_key as usize);
+                max_direct_gate_id = max_direct_gate_id.max(gate_id.0);
+                scoped_gate_ids.insert(scoped_key, gate_id);
+            } else {
+                overflow_keys.push(scoped_key);
+            }
+        }
+
+        let mut next_overflow_gate_id =
+            max_direct_gate_id.checked_add(1).expect("scoped gate id remap overflow");
+        for scoped_key in overflow_keys {
+            let gate_id = GateId(next_overflow_gate_id);
+            scoped_gate_ids.insert(scoped_key, gate_id);
+            next_overflow_gate_id =
+                next_overflow_gate_id.checked_add(1).expect("scoped gate id remap overflow");
+        }
+
+        scoped_gate_ids
+    }
+
+    fn scoped_gate_id(
+        scoped_gate_ids: &HashMap<u128, GateId>,
+        call_prefix: u128,
+        gate_id: GateId,
+        gate_id_base: u128,
+    ) -> GateId {
+        let scoped_key = call_prefix
+            .checked_mul(gate_id_base)
+            .and_then(|base| base.checked_add(gate_id.0 as u128))
+            .expect("scoped gate key overflow");
+        *scoped_gate_ids.get(&scoped_key).expect("missing precomputed scoped gate id")
+    }
+
     fn eval_scoped<E, PE>(
         &self,
         params: &E::Params,
@@ -692,9 +771,10 @@ impl<P: Poly> PolyCircuit<P> {
         inputs: &[Arc<E::Compact>],
         plt_evaluator: Option<&PE>,
         slot_transfer_evaluator: Option<&dyn SlotTransferEvaluator<E>>,
-        call_prefix: usize,
-        call_id_base: usize,
-        gate_id_base: usize,
+        call_prefix: u128,
+        call_id_base: u128,
+        gate_id_base: u128,
+        scoped_gate_ids: &HashMap<u128, GateId>,
         parallel_gates: Option<usize>,
     ) -> Vec<Arc<E::Compact>>
     where
@@ -873,11 +953,8 @@ impl<P: Poly> PolyCircuit<P> {
                     let input = E::from_compact(eval_params, input.as_ref());
                     let evaluator =
                         slot_transfer_evaluator.expect("slot transfer evaluator missing");
-                    let scoped_gate_id = call_prefix
-                        .checked_mul(gate_id_base)
-                        .and_then(|base| base.checked_add(gate_id.0))
-                        .map(GateId)
-                        .expect("scoped gate id overflow");
+                    let scoped_gate_id =
+                        Self::scoped_gate_id(scoped_gate_ids, call_prefix, gate_id, gate_id_base);
                     Arc::new(
                         evaluator
                             .slot_transfer(eval_params, &input, src_slots, scoped_gate_id)
@@ -891,11 +968,8 @@ impl<P: Poly> PolyCircuit<P> {
                         .expect("wire missing for Public Lookup")
                         .clone();
                     let input = E::from_compact(eval_params, input.as_ref());
-                    let scoped_gate_id = call_prefix
-                        .checked_mul(gate_id_base)
-                        .and_then(|base| base.checked_add(gate_id.0))
-                        .map(GateId)
-                        .expect("scoped gate id overflow");
+                    let scoped_gate_id =
+                        Self::scoped_gate_id(scoped_gate_ids, call_prefix, gate_id, gate_id_base);
                     let lookup_guard =
                         self.lookup_registry.lookups.get(lut_id).expect("lookup table missing");
                     let result =
@@ -924,7 +998,7 @@ impl<P: Poly> PolyCircuit<P> {
                         .clone();
                     let child_prefix = call_prefix
                         .checked_mul(call_id_base)
-                        .and_then(|base| base.checked_add(call_id + 1))
+                        .and_then(|base| base.checked_add((*call_id as u128) + 1))
                         .expect("sub-circuit call prefix overflow");
                     let sub_inputs = call
                         .inputs
@@ -941,6 +1015,7 @@ impl<P: Poly> PolyCircuit<P> {
                         child_prefix,
                         call_id_base,
                         gate_id_base,
+                        scoped_gate_ids,
                         parallel_gates,
                     );
                     if sub_outputs.len() != call.output_gate_ids.len() {
@@ -1047,11 +1122,12 @@ impl<P: Poly> PolyCircuit<P> {
                         ) => {
                             let evaluator =
                                 slot_transfer_evaluator.expect("slot transfer evaluator missing");
-                            let scoped_gate_id = call_prefix
-                                .checked_mul(gate_id_base)
-                                .and_then(|base| base.checked_add(gate_id.0))
-                                .map(GateId)
-                                .expect("scoped gate id overflow");
+                            let scoped_gate_id = Self::scoped_gate_id(
+                                scoped_gate_ids,
+                                call_prefix,
+                                gate_id,
+                                gate_id_base,
+                            );
                             ComputedGateValue::Value(evaluator.slot_transfer(
                                 eval_params,
                                 &input,
@@ -1060,11 +1136,12 @@ impl<P: Poly> PolyCircuit<P> {
                             ))
                         }
                         (LoadedGateInputs::Unary(input), PolyGateType::PubLut { lut_id }) => {
-                            let scoped_gate_id = call_prefix
-                                .checked_mul(gate_id_base)
-                                .and_then(|base| base.checked_add(gate_id.0))
-                                .map(GateId)
-                                .expect("scoped gate id overflow");
+                            let scoped_gate_id = Self::scoped_gate_id(
+                                scoped_gate_ids,
+                                call_prefix,
+                                gate_id,
+                                gate_id_base,
+                            );
                             let lookup_guard = self
                                 .lookup_registry
                                 .lookups

@@ -11,12 +11,12 @@ use num_bigint::BigUint;
 use crate::circuit::{Evaluable, PolyCircuit, PolyGateType};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct CircuitBenchUnitEstimate {
+pub struct CircuitBenchEstimate {
     pub total_time: f64,
     pub latency: f64,
 }
 
-impl CircuitBenchUnitEstimate {
+impl CircuitBenchEstimate {
     fn parallelism_factor(&self) -> u128 {
         if self.total_time <= 0.0 || self.latency <= 0.0 {
             return 0;
@@ -45,16 +45,16 @@ where
 }
 
 pub trait BenchEstimator<E: Evaluable> {
-    fn estimate_input(&self) -> CircuitBenchUnitEstimate;
-    fn estimate_add(&self) -> CircuitBenchUnitEstimate;
-    fn estimate_sub(&self) -> CircuitBenchUnitEstimate;
-    fn estimate_mul(&self) -> CircuitBenchUnitEstimate;
-    fn estimate_small_scalar_mul(&self, scalar: &[u32]) -> CircuitBenchUnitEstimate;
-    fn estimate_large_scalar_mul(&self, scalar: &[BigUint]) -> CircuitBenchUnitEstimate;
-    fn estimate_slot_transfer(&self, src_slots: &[(u32, Option<u32>)]) -> CircuitBenchUnitEstimate;
-    fn estimate_public_lookup(&self, lut_id: usize) -> CircuitBenchUnitEstimate;
+    fn estimate_input(&self) -> CircuitBenchEstimate;
+    fn estimate_add(&self) -> CircuitBenchEstimate;
+    fn estimate_sub(&self) -> CircuitBenchEstimate;
+    fn estimate_mul(&self) -> CircuitBenchEstimate;
+    fn estimate_small_scalar_mul(&self, scalar: &[u32]) -> CircuitBenchEstimate;
+    fn estimate_large_scalar_mul(&self, scalar: &[BigUint]) -> CircuitBenchEstimate;
+    fn estimate_slot_transfer(&self, src_slots: &[(u32, Option<u32>)]) -> CircuitBenchEstimate;
+    fn estimate_public_lookup(&self, lut_id: usize) -> CircuitBenchEstimate;
 
-    fn estimate_gate_bench(&self, gate_type: &PolyGateType) -> CircuitBenchUnitEstimate {
+    fn estimate_gate_bench(&self, gate_type: &PolyGateType) -> CircuitBenchEstimate {
         match gate_type {
             PolyGateType::Input => self.estimate_input(),
             PolyGateType::Add => self.estimate_add(),
@@ -101,7 +101,7 @@ pub trait BenchEstimator<E: Evaluable> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BenchEstimator, CircuitBenchSummary, CircuitBenchUnitEstimate};
+    use super::{BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary};
     use crate::{
         __PAIR, __TestState,
         circuit::{PolyCircuit, PolyGateType},
@@ -109,48 +109,48 @@ mod tests {
     };
     use sequential_test::sequential;
 
-    fn bench(latency: f64, total_time: f64) -> CircuitBenchUnitEstimate {
-        CircuitBenchUnitEstimate { latency, total_time }
+    fn bench(latency: f64, total_time: f64) -> CircuitBenchEstimate {
+        CircuitBenchEstimate { latency, total_time }
     }
 
     struct TestBenchEstimator;
 
     impl BenchEstimator<DCRTPoly> for TestBenchEstimator {
-        fn estimate_input(&self) -> CircuitBenchUnitEstimate {
+        fn estimate_input(&self) -> CircuitBenchEstimate {
             bench(0.2, 0.25)
         }
 
-        fn estimate_add(&self) -> CircuitBenchUnitEstimate {
+        fn estimate_add(&self) -> CircuitBenchEstimate {
             bench(1.0, 1.5)
         }
 
-        fn estimate_sub(&self) -> CircuitBenchUnitEstimate {
+        fn estimate_sub(&self) -> CircuitBenchEstimate {
             bench(2.0, 2.5)
         }
 
-        fn estimate_mul(&self) -> CircuitBenchUnitEstimate {
+        fn estimate_mul(&self) -> CircuitBenchEstimate {
             bench(3.0, 3.5)
         }
 
-        fn estimate_small_scalar_mul(&self, _scalar: &[u32]) -> CircuitBenchUnitEstimate {
+        fn estimate_small_scalar_mul(&self, _scalar: &[u32]) -> CircuitBenchEstimate {
             bench(4.0, 4.5)
         }
 
         fn estimate_large_scalar_mul(
             &self,
             _scalar: &[num_bigint::BigUint],
-        ) -> CircuitBenchUnitEstimate {
+        ) -> CircuitBenchEstimate {
             bench(5.0, 5.5)
         }
 
         fn estimate_slot_transfer(
             &self,
             _src_slots: &[(u32, Option<u32>)],
-        ) -> CircuitBenchUnitEstimate {
+        ) -> CircuitBenchEstimate {
             bench(6.0, 6.5)
         }
 
-        fn estimate_public_lookup(&self, _lut_id: usize) -> CircuitBenchUnitEstimate {
+        fn estimate_public_lookup(&self, _lut_id: usize) -> CircuitBenchEstimate {
             bench(7.0, 7.5)
         }
     }
@@ -158,41 +158,41 @@ mod tests {
     struct ExpandedSubCircuitBenchEstimator;
 
     impl BenchEstimator<DCRTPoly> for ExpandedSubCircuitBenchEstimator {
-        fn estimate_input(&self) -> CircuitBenchUnitEstimate {
+        fn estimate_input(&self) -> CircuitBenchEstimate {
             bench(0.5, 1.0)
         }
 
-        fn estimate_add(&self) -> CircuitBenchUnitEstimate {
+        fn estimate_add(&self) -> CircuitBenchEstimate {
             bench(5.0, 6.0)
         }
 
-        fn estimate_sub(&self) -> CircuitBenchUnitEstimate {
+        fn estimate_sub(&self) -> CircuitBenchEstimate {
             bench(0.0, 0.0)
         }
 
-        fn estimate_mul(&self) -> CircuitBenchUnitEstimate {
+        fn estimate_mul(&self) -> CircuitBenchEstimate {
             bench(2.0, 4.0)
         }
 
-        fn estimate_small_scalar_mul(&self, _scalar: &[u32]) -> CircuitBenchUnitEstimate {
+        fn estimate_small_scalar_mul(&self, _scalar: &[u32]) -> CircuitBenchEstimate {
             bench(0.0, 0.0)
         }
 
         fn estimate_large_scalar_mul(
             &self,
             _scalar: &[num_bigint::BigUint],
-        ) -> CircuitBenchUnitEstimate {
+        ) -> CircuitBenchEstimate {
             bench(0.0, 0.0)
         }
 
         fn estimate_slot_transfer(
             &self,
             _src_slots: &[(u32, Option<u32>)],
-        ) -> CircuitBenchUnitEstimate {
+        ) -> CircuitBenchEstimate {
             bench(0.0, 0.0)
         }
 
-        fn estimate_public_lookup(&self, _lut_id: usize) -> CircuitBenchUnitEstimate {
+        fn estimate_public_lookup(&self, _lut_id: usize) -> CircuitBenchEstimate {
             bench(0.0, 0.0)
         }
     }

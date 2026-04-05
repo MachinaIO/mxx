@@ -1,7 +1,5 @@
 #[cfg(not(feature = "gpu"))]
-use crate::bench_estimator::{
-    CircuitBenchUnitEstimate, SlotTransferSampleAuxBenchEstimator, measure_bench_operation,
-};
+use crate::bench_estimator::{SampleAuxBenchEstimate, SlotTransferSampleAuxBenchEstimator};
 use crate::{
     bgg::public_key::BggPublicKey,
     circuit::gate::GateId,
@@ -17,7 +15,7 @@ use crate::{
 use dashmap::DashMap;
 use rayon::prelude::*;
 #[cfg(not(feature = "gpu"))]
-use std::hint::black_box;
+use std::time::Instant;
 use std::{marker::PhantomData, path::PathBuf};
 use tracing::info;
 
@@ -26,6 +24,48 @@ pub(crate) struct SlotAuxSample<M: PolyMatrix> {
     pub(crate) slot_a: M,
     pub(crate) preimage_b0: M,
     pub(crate) preimage_b1: M,
+}
+
+#[cfg(not(feature = "gpu"))]
+fn slot_aux_samples_compact_bytes<M>(samples: &[SlotAuxSample<M>]) -> u64
+where
+    M: PolyMatrix,
+{
+    samples.iter().fold(0u64, |total, sample| {
+        total
+            .checked_add(
+                u64::try_from(sample.slot_a.to_compact_bytes().len())
+                    .expect("slot_a compact_bytes length overflowed u64"),
+            )
+            .and_then(|total| {
+                total.checked_add(
+                    u64::try_from(sample.preimage_b0.to_compact_bytes().len())
+                        .expect("slot preimage_b0 compact_bytes length overflowed u64"),
+                )
+            })
+            .and_then(|total| {
+                total.checked_add(
+                    u64::try_from(sample.preimage_b1.to_compact_bytes().len())
+                        .expect("slot preimage_b1 compact_bytes length overflowed u64"),
+                )
+            })
+            .expect("slot auxiliary compact_bytes total overflowed u64")
+    })
+}
+
+#[cfg(not(feature = "gpu"))]
+fn gate_preimages_compact_bytes<M>(preimages: &[(usize, M)]) -> u64
+where
+    M: PolyMatrix,
+{
+    preimages.iter().fold(0u64, |total, (_, preimage)| {
+        total
+            .checked_add(
+                u64::try_from(preimage.to_compact_bytes().len())
+                    .expect("gate preimage compact_bytes length overflowed u64"),
+            )
+            .expect("gate preimage compact_bytes total overflowed u64")
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -587,7 +627,7 @@ where
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
     <M::P as Poly>::Params: Default,
 {
-    fn sample_aux_matrices_slot_time(&self) -> CircuitBenchUnitEstimate {
+    fn sample_aux_matrices_slot_time(&self) -> SampleAuxBenchEstimate {
         let params = <M::P as Poly>::Params::default();
         let trap_sampler = TS::new(&params, self.trapdoor_sigma);
         let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(&params, self.secret_size);
@@ -596,33 +636,32 @@ where
         let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, b1_size);
         let identity = M::identity(&params, self.secret_size, None);
         let gadget_matrix = M::gadget_matrix(&params, self.secret_size);
-        let elapsed = measure_bench_operation(1, || {
-            let slot_secret_mats = vec![
-                US::new()
-                    .sample_uniform(
-                        &params,
-                        self.secret_size,
-                        self.secret_size,
-                        DistType::TernaryDist,
-                    )
-                    .into_compact_bytes(),
-            ];
-            black_box(self.sample_slot_batch_cpu(
-                &params,
-                &b0_matrix,
-                &b0_trapdoor,
-                &b1_matrix,
-                &b1_trapdoor,
-                &identity,
-                &gadget_matrix,
-                &slot_secret_mats,
-                &[0usize],
-            ))
-        });
-        CircuitBenchUnitEstimate { latency: elapsed, total_time: elapsed }
+        let slot_secret_mats = vec![
+            US::new()
+                .sample_uniform(&params, self.secret_size, self.secret_size, DistType::TernaryDist)
+                .into_compact_bytes(),
+        ];
+        let start = Instant::now();
+        let sampled_slots = self.sample_slot_batch_cpu(
+            &params,
+            &b0_matrix,
+            &b0_trapdoor,
+            &b1_matrix,
+            &b1_trapdoor,
+            &identity,
+            &gadget_matrix,
+            &slot_secret_mats,
+            &[0usize],
+        );
+        let elapsed = start.elapsed().as_secs_f64();
+        SampleAuxBenchEstimate {
+            latency: elapsed,
+            total_time: elapsed,
+            compact_bytes: slot_aux_samples_compact_bytes(&sampled_slots),
+        }
     }
 
-    fn sample_aux_matrices_gate_time(&self) -> CircuitBenchUnitEstimate {
+    fn sample_aux_matrices_gate_time(&self) -> SampleAuxBenchEstimate {
         let params = <M::P as Poly>::Params::default();
         let trap_sampler = TS::new(&params, self.trapdoor_sigma);
         let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(&params, self.secret_size);
@@ -665,19 +704,23 @@ where
             src_slots: (0..benchmark_num_slots).map(|slot_idx| (slot_idx as u32, None)).collect(),
         };
         let slot_chunk = state.src_slots.iter().copied().enumerate().collect::<Vec<_>>();
-        let elapsed = self.benchmark_slot_transfer_gate_time(1, || {
-            black_box(self.sample_gate_batch_cpu(
-                &params,
-                &b0_matrix,
-                &b0_trapdoor,
-                &slot_secret_mats,
-                &slot_a_bytes_by_slot,
-                GateId(0),
-                &state,
-                &slot_chunk,
-            ))
-        });
-        CircuitBenchUnitEstimate { latency: elapsed, total_time: elapsed }
+        let start = Instant::now();
+        let sampled_gate_preimages = self.sample_gate_batch_cpu(
+            &params,
+            &b0_matrix,
+            &b0_trapdoor,
+            &slot_secret_mats,
+            &slot_a_bytes_by_slot,
+            GateId(0),
+            &state,
+            &slot_chunk,
+        );
+        let elapsed = start.elapsed().as_secs_f64();
+        SampleAuxBenchEstimate {
+            latency: elapsed,
+            total_time: elapsed,
+            compact_bytes: gate_preimages_compact_bytes(&sampled_gate_preimages),
+        }
     }
 }
 

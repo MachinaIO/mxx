@@ -5,9 +5,7 @@
 mod gpu;
 
 #[cfg(not(feature = "gpu"))]
-use crate::bench_estimator::{
-    CircuitBenchUnitEstimate, PublicLutSampleAuxBenchEstimator, measure_bench_operation,
-};
+use crate::bench_estimator::{PublicLutSampleAuxBenchEstimator, SampleAuxBenchEstimate};
 use crate::{
     bgg::public_key::BggPublicKey,
     circuit::{evaluable::Evaluable, gate::GateId},
@@ -25,8 +23,6 @@ use crate::{
 };
 use dashmap::DashMap;
 use rayon::prelude::*;
-#[cfg(not(feature = "gpu"))]
-use std::hint::black_box;
 use std::{
     collections::{HashMap, HashSet},
     fs::read_to_string,
@@ -82,6 +78,20 @@ where
     fn wait_then_store(self) {
         let _ = add_lookup_buffer(self.into_lookup_buffer());
     }
+}
+
+fn compact_bytes_job_total<M>(jobs: &[CompactBytesJob<M>]) -> u64
+where
+    M: PolyMatrix,
+{
+    jobs.iter().flat_map(|job| job.matrices.iter()).fold(0u64, |total, (_, matrix)| {
+        total
+            .checked_add(
+                u64::try_from(matrix.to_compact_bytes().len())
+                    .expect("compact_bytes length overflowed u64"),
+            )
+            .expect("compact_bytes total overflowed u64")
+    })
 }
 
 pub(crate) fn derive_lut_v_idx_from_hash<M, HS>(
@@ -1744,7 +1754,7 @@ where
     M::P: 'static,
     <M::P as Poly>::Params: Default,
 {
-    fn sample_aux_matrices_lut_entry_time(&self) -> CircuitBenchUnitEstimate {
+    fn sample_aux_matrices_lut_entry_time(&self) -> SampleAuxBenchEstimate {
         let params = <M::P as Poly>::Params::default();
         let lut_id = 0usize;
         let trap_sampler = TS::new(&params, self.trapdoor_sigma);
@@ -1754,24 +1764,28 @@ where
         let w_block_v = self.derive_w_block_v(&params, lut_id);
         let w_block_vx = self.derive_w_block_vx(&params, lut_id);
         let batch = vec![(0usize, M::P::from_usize_to_constant(&params, 1usize))];
-        let elapsed = measure_bench_operation(1, || {
-            black_box(self.sample_lut_preimages(
-                &params,
-                lut_id,
-                "bench_lut_aux",
-                &b1_trapdoor,
-                &b1_matrix,
-                &w_block_identity,
-                &w_block_gy,
-                &w_block_v,
-                &w_block_vx,
-                &batch,
-            ))
-        });
-        CircuitBenchUnitEstimate { latency: elapsed, total_time: elapsed }
+        let start = Instant::now();
+        let jobs = self.sample_lut_preimages(
+            &params,
+            lut_id,
+            "bench_lut_aux",
+            &b1_trapdoor,
+            &b1_matrix,
+            &w_block_identity,
+            &w_block_gy,
+            &w_block_v,
+            &w_block_vx,
+            &batch,
+        );
+        let elapsed = start.elapsed().as_secs_f64();
+        SampleAuxBenchEstimate {
+            latency: elapsed,
+            total_time: elapsed,
+            compact_bytes: compact_bytes_job_total(&jobs),
+        }
     }
 
-    fn sample_aux_matrices_lut_gate_time(&self) -> CircuitBenchUnitEstimate {
+    fn sample_aux_matrices_lut_gate_time(&self) -> SampleAuxBenchEstimate {
         let params = <M::P as Poly>::Params::default();
         let lut_id = 0usize;
         let trap_sampler = TS::new(&params, self.trapdoor_sigma);
@@ -1782,28 +1796,32 @@ where
         let w_block_v = self.derive_w_block_v(&params, lut_id);
         let w_block_vx = self.derive_w_block_vx(&params, lut_id);
         let input_pubkey_bytes = M::gadget_matrix(&params, self.d).into_compact_bytes();
-        let elapsed = self.benchmark_public_lut_gate_time(1, || {
-            black_box(self.sample_gate_preimages_batch(
-                &params,
-                lut_id,
-                vec![(
-                    GateId(0),
-                    GateState {
-                        lut_id,
-                        input_pubkey_bytes: input_pubkey_bytes.clone(),
-                        _m: PhantomData,
-                    },
-                )],
-                &b0_trapdoor,
-                &b0_matrix,
-                &b1_matrix,
-                &w_block_identity,
-                &w_block_gy,
-                &w_block_v,
-                &w_block_vx,
-            ))
-        });
-        CircuitBenchUnitEstimate { latency: elapsed, total_time: elapsed }
+        let start = Instant::now();
+        let jobs = self.sample_gate_preimages_batch(
+            &params,
+            lut_id,
+            vec![(
+                GateId(0),
+                GateState {
+                    lut_id,
+                    input_pubkey_bytes: input_pubkey_bytes.clone(),
+                    _m: PhantomData,
+                },
+            )],
+            &b0_trapdoor,
+            &b0_matrix,
+            &b1_matrix,
+            &w_block_identity,
+            &w_block_gy,
+            &w_block_v,
+            &w_block_vx,
+        );
+        let elapsed = start.elapsed().as_secs_f64();
+        SampleAuxBenchEstimate {
+            latency: elapsed,
+            total_time: elapsed,
+            compact_bytes: compact_bytes_job_total(&jobs),
+        }
     }
 }
 

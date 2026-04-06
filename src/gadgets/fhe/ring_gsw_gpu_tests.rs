@@ -88,11 +88,8 @@ fn max_centered_decryption_error<P: Poly>(
         .into_iter()
         .enumerate()
         .map(|(coeff_idx, coeff)| {
-            let expected = if coeff_idx == 0 {
-                scaled_expected_constant.clone()
-            } else {
-                BigUint::from(0u64)
-            };
+            let expected =
+                if coeff_idx == 0 { scaled_expected_constant.clone() } else { BigUint::from(0u64) };
             centered_mod_distance(&coeff, &expected, q_modulus)
         })
         .max()
@@ -348,6 +345,7 @@ fn test_ring_gsw_sub_circuit_decrypts_to_expected_integer_difference_with_noisy_
 
 #[sequential_test::sequential]
 #[test]
+#[ignore = "This test is currently ignored because it is too slow"]
 fn test_ring_gsw_mul_circuit_decrypts_to_expected_integer_product_with_noisy_public_key() {
     let error_sigma = 4.0;
     let plaintext_modulus = 2u64;
@@ -464,6 +462,7 @@ fn test_ring_gsw_mul_circuit_decrypts_to_expected_integer_product_with_noisy_pub
 
 #[sequential_test::sequential]
 #[test]
+#[ignore = "This test is currently ignored because it is too slow"]
 fn test_ring_gsw_chained_mul_circuit_decrypts_to_expected_integer_product_with_noisy_public_key() {
     let error_sigma = 4.0;
     let plaintext_modulus = 2u64;

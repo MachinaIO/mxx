@@ -10,10 +10,12 @@ use crate::{
 };
 use num_bigint::BigUint;
 
-use super::{BenchEstimator, CircuitBenchEstimate, measure_bench_operation};
+use super::{
+    BenchEstimator, CircuitBenchEstimate, benchmark_gate_operation, measure_bench_operation,
+};
 
-pub(crate) fn per_gate_time_estimate(time: f64) -> CircuitBenchEstimate {
-    CircuitBenchEstimate { latency: time, total_time: time }
+pub(crate) fn per_gate_time_estimate(time: f64, peak_vram: usize) -> CircuitBenchEstimate {
+    CircuitBenchEstimate::new(time, time).with_peak_vram(peak_vram)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -76,13 +78,21 @@ where
     STE: SlotTransferSampleAuxBenchEstimator,
 {
     pub input_time: f64,
+    pub input_peak_vram: usize,
     pub add_time: f64,
+    pub add_peak_vram: usize,
     pub sub_time: f64,
+    pub sub_peak_vram: usize,
     pub mul_time: f64,
+    pub mul_peak_vram: usize,
     pub small_scalar_mul_time: f64,
+    pub small_scalar_mul_peak_vram: usize,
     pub large_scalar_mul_time: f64,
+    pub large_scalar_mul_peak_vram: usize,
     pub public_lut_time: f64,
+    pub public_lut_peak_vram: usize,
     pub slot_transfer_time: f64,
+    pub slot_transfer_peak_vram: usize,
     pub public_lut_estimator: PLE,
     pub slot_transfer_estimator: STE,
     _m: PhantomData<M>,
@@ -106,19 +116,19 @@ where
         PE: PltEvaluator<BggPublicKey<M>>,
         SE: SlotTransferEvaluator<BggPublicKey<M>>,
     {
-        let add_time =
-            measure_bench_operation(iterations, || samples.add_lhs.clone() + samples.add_rhs);
-        let sub_time =
-            measure_bench_operation(iterations, || samples.sub_lhs.clone() - samples.sub_rhs);
-        let mul_time =
-            measure_bench_operation(iterations, || samples.mul_lhs.clone() * samples.mul_rhs);
-        let small_scalar_mul_time = measure_bench_operation(iterations, || {
+        let add_bench =
+            benchmark_gate_operation(iterations, || samples.add_lhs.clone() + samples.add_rhs);
+        let sub_bench =
+            benchmark_gate_operation(iterations, || samples.sub_lhs.clone() - samples.sub_rhs);
+        let mul_bench =
+            benchmark_gate_operation(iterations, || samples.mul_lhs.clone() * samples.mul_rhs);
+        let small_scalar_mul_bench = benchmark_gate_operation(iterations, || {
             samples.small_scalar_input.small_scalar_mul(samples.params, samples.small_scalar)
         });
-        let large_scalar_mul_time = measure_bench_operation(iterations, || {
+        let large_scalar_mul_bench = benchmark_gate_operation(iterations, || {
             samples.large_scalar_input.large_scalar_mul(samples.params, samples.large_scalar)
         });
-        let public_lut_time = measure_bench_operation(iterations, || {
+        let public_lut_bench = benchmark_gate_operation(iterations, || {
             public_lut_evaluator.public_lookup(
                 samples.params,
                 samples.public_lut,
@@ -128,7 +138,7 @@ where
                 samples.public_lut_id,
             )
         });
-        let slot_transfer_time = measure_bench_operation(iterations, || {
+        let slot_transfer_bench = benchmark_gate_operation(iterations, || {
             slot_transfer_evaluator.slot_transfer(
                 samples.params,
                 samples.slot_transfer_input,
@@ -139,13 +149,21 @@ where
 
         Self {
             input_time: 0.0,
-            add_time,
-            sub_time,
-            mul_time,
-            small_scalar_mul_time,
-            large_scalar_mul_time,
-            public_lut_time,
-            slot_transfer_time,
+            input_peak_vram: 0,
+            add_time: add_bench.time,
+            add_peak_vram: add_bench.peak_vram,
+            sub_time: sub_bench.time,
+            sub_peak_vram: sub_bench.peak_vram,
+            mul_time: mul_bench.time,
+            mul_peak_vram: mul_bench.peak_vram,
+            small_scalar_mul_time: small_scalar_mul_bench.time,
+            small_scalar_mul_peak_vram: small_scalar_mul_bench.peak_vram,
+            large_scalar_mul_time: large_scalar_mul_bench.time,
+            large_scalar_mul_peak_vram: large_scalar_mul_bench.peak_vram,
+            public_lut_time: public_lut_bench.time,
+            public_lut_peak_vram: public_lut_bench.peak_vram,
+            slot_transfer_time: slot_transfer_bench.time,
+            slot_transfer_peak_vram: slot_transfer_bench.peak_vram,
             public_lut_estimator,
             slot_transfer_estimator,
             _m: PhantomData,
@@ -208,37 +226,37 @@ where
     STE: SlotTransferSampleAuxBenchEstimator,
 {
     fn estimate_input(&self) -> CircuitBenchEstimate {
-        per_gate_time_estimate(self.input_time)
+        per_gate_time_estimate(self.input_time, self.input_peak_vram)
     }
 
     fn estimate_add(&self) -> CircuitBenchEstimate {
-        per_gate_time_estimate(self.add_time)
+        per_gate_time_estimate(self.add_time, self.add_peak_vram)
     }
 
     fn estimate_sub(&self) -> CircuitBenchEstimate {
-        per_gate_time_estimate(self.sub_time)
+        per_gate_time_estimate(self.sub_time, self.sub_peak_vram)
     }
 
     fn estimate_mul(&self) -> CircuitBenchEstimate {
-        per_gate_time_estimate(self.mul_time)
+        per_gate_time_estimate(self.mul_time, self.mul_peak_vram)
     }
 
     fn estimate_small_scalar_mul(&self, _scalar: &[u32]) -> CircuitBenchEstimate {
-        per_gate_time_estimate(self.small_scalar_mul_time)
+        per_gate_time_estimate(self.small_scalar_mul_time, self.small_scalar_mul_peak_vram)
     }
 
     fn estimate_large_scalar_mul(&self, _scalar: &[num_bigint::BigUint]) -> CircuitBenchEstimate {
-        per_gate_time_estimate(self.large_scalar_mul_time)
+        per_gate_time_estimate(self.large_scalar_mul_time, self.large_scalar_mul_peak_vram)
     }
 
     fn estimate_slot_transfer(&self, src_slots: &[(u32, Option<u32>)]) -> CircuitBenchEstimate {
         let _ = src_slots;
-        per_gate_time_estimate(self.slot_transfer_time)
+        per_gate_time_estimate(self.slot_transfer_time, self.slot_transfer_peak_vram)
     }
 
     fn estimate_public_lookup(&self, lut_id: usize) -> CircuitBenchEstimate {
         let _ = lut_id;
-        per_gate_time_estimate(self.public_lut_time)
+        per_gate_time_estimate(self.public_lut_time, self.public_lut_peak_vram)
     }
 }
 
@@ -314,13 +332,21 @@ mod tests {
     > {
         BggPublicKeyBenchEstimator {
             input_time: 0.0,
+            input_peak_vram: 0,
             add_time: 1.0,
+            add_peak_vram: 41,
             sub_time: 2.0,
+            sub_peak_vram: 43,
             mul_time: 3.0,
+            mul_peak_vram: 47,
             small_scalar_mul_time: 4.0,
+            small_scalar_mul_peak_vram: 53,
             large_scalar_mul_time: 5.0,
+            large_scalar_mul_peak_vram: 59,
             public_lut_time: 6.0,
+            public_lut_peak_vram: 61,
             slot_transfer_time: 7.0,
+            slot_transfer_peak_vram: 67,
             public_lut_estimator: DummyPublicLutEstimator,
             slot_transfer_estimator: DummySlotTransferEstimator,
             _m: PhantomData,
@@ -346,31 +372,39 @@ mod tests {
 
         assert_eq!(
             estimator.estimate_input(),
-            CircuitBenchEstimate { total_time: 0.0, latency: 0.0 }
+            CircuitBenchEstimate::new(0.0, 0.0).with_peak_vram(0)
         );
         assert!(estimator.add_time >= 0.0);
         assert!(estimator.sub_time >= 0.0);
         assert!(estimator.mul_time >= 0.0);
         assert!(estimator.small_scalar_mul_time >= 0.0);
         assert!(estimator.large_scalar_mul_time >= 0.0);
-        assert_eq!(estimator.estimate_add().latency, estimator.estimate_add().total_time);
-        assert_eq!(estimator.estimate_sub().latency, estimator.estimate_sub().total_time);
-        assert_eq!(estimator.estimate_mul().latency, estimator.estimate_mul().total_time);
+        assert_eq!(
+            estimator.estimate_add(),
+            CircuitBenchEstimate::new(estimator.add_time, estimator.add_time)
+                .with_peak_vram(estimator.add_peak_vram)
+        );
+        assert_eq!(
+            estimator.estimate_sub(),
+            CircuitBenchEstimate::new(estimator.sub_time, estimator.sub_time)
+                .with_peak_vram(estimator.sub_peak_vram)
+        );
+        assert_eq!(
+            estimator.estimate_mul(),
+            CircuitBenchEstimate::new(estimator.mul_time, estimator.mul_time)
+                .with_peak_vram(estimator.mul_peak_vram)
+        );
         assert!(estimator.public_lut_time >= 0.0);
         assert!(estimator.slot_transfer_time >= 0.0);
         assert_eq!(
             estimator.estimate_public_lookup(7),
-            CircuitBenchEstimate {
-                total_time: estimator.public_lut_time,
-                latency: estimator.public_lut_time,
-            }
+            CircuitBenchEstimate::new(estimator.public_lut_time, estimator.public_lut_time)
+                .with_peak_vram(estimator.public_lut_peak_vram)
         );
         assert_eq!(
             estimator.estimate_slot_transfer(&[(0, None), (1, Some(0))]),
-            CircuitBenchEstimate {
-                total_time: estimator.slot_transfer_time,
-                latency: estimator.slot_transfer_time,
-            }
+            CircuitBenchEstimate::new(estimator.slot_transfer_time, estimator.slot_transfer_time)
+                .with_peak_vram(estimator.slot_transfer_peak_vram)
         );
     }
 

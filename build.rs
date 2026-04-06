@@ -43,6 +43,7 @@ fn main() {
         let cuda_home = env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
         let cuda_lib_dir =
             env::var("CUDA_LIB_DIR").unwrap_or_else(|_| format!("{cuda_home}/lib64"));
+        let debug_build = env::var("DEBUG").is_ok_and(|debug| debug == "true");
         if env::var("NVCC").is_err() {
             let nvcc_path = format!("{cuda_home}/bin/nvcc");
             if PathBuf::from(&nvcc_path).exists() {
@@ -59,10 +60,12 @@ fn main() {
             .file("cuda/src/matrix/Matrix.cu")
             .include("cuda/include")
             .flag("-std=c++17")
-            .flag("-lineinfo")
             .flag("-Xcompiler")
             .flag("-fPIC")
             .flag(&format!("-arch=sm_{cuda_arch}"));
+        if !debug_build {
+            build.flag("-lineinfo");
+        }
         build.compile("gpupoly");
 
         println!("cargo::rustc-link-search=native={cuda_lib_dir}");

@@ -1,6 +1,7 @@
 use crate::{
     circuit::{
-        PolyCircuit, PolyGate, SubCircuitCall,
+        PolyCircuit, PolyGate, StoredSubCircuit, SubCircuitCall, SubCircuitDiskRef,
+        SubCircuitDiskStorage,
         gate::{GateId, PolyGateType},
     },
     poly::Poly,
@@ -8,7 +9,7 @@ use crate::{
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
 use serde_json;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SerializablePolyGateType {
@@ -65,9 +66,22 @@ pub struct SerializableSubCircuitCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SerializableSubCircuitDiskRef {
+    pub scoped_id: usize,
+    pub num_input: usize,
+    pub num_output: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SerializableStoredSubCircuit {
+    Inline(Box<SerializablePolyCircuit>),
+    OnDisk(SerializableSubCircuitDiskRef),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SerializablePolyCircuit {
     gates: BTreeMap<GateId, SerializablePolyGate>,
-    sub_circuits: BTreeMap<usize, SerializablePolyCircuit>,
+    sub_circuits: BTreeMap<usize, SerializableStoredSubCircuit>,
     sub_circuit_calls: BTreeMap<usize, SerializableSubCircuitCall>,
     output_ids: Vec<GateId>,
     num_input: usize,
@@ -76,7 +90,7 @@ pub struct SerializablePolyCircuit {
 impl SerializablePolyCircuit {
     pub fn new(
         gates: BTreeMap<GateId, SerializablePolyGate>,
-        sub_circuits: BTreeMap<usize, SerializablePolyCircuit>,
+        sub_circuits: BTreeMap<usize, SerializableStoredSubCircuit>,
         sub_circuit_calls: BTreeMap<usize, SerializableSubCircuitCall>,
         output_ids: Vec<GateId>,
         num_input: usize,
@@ -112,7 +126,18 @@ impl SerializablePolyCircuit {
 
         let mut sub_circuits = BTreeMap::new();
         for (circuit_id, sub_circuit) in circuit.sub_circuits.into_iter() {
-            let serializable_sub_circuit = Self::from_circuit(sub_circuit);
+            let serializable_sub_circuit = match sub_circuit {
+                StoredSubCircuit::InMemory(sub_circuit) => {
+                    SerializableStoredSubCircuit::Inline(Box::new(Self::from_circuit(*sub_circuit)))
+                }
+                StoredSubCircuit::OnDisk(disk_ref) => {
+                    SerializableStoredSubCircuit::OnDisk(SerializableSubCircuitDiskRef {
+                        scoped_id: disk_ref.scoped_id,
+                        num_input: disk_ref.num_input,
+                        num_output: disk_ref.num_output,
+                    })
+                }
+            };
             sub_circuits.insert(circuit_id, serializable_sub_circuit);
         }
         let mut sub_circuit_calls = BTreeMap::new();
@@ -129,11 +154,32 @@ impl SerializablePolyCircuit {
     }
 
     pub fn to_circuit<P: Poly>(self) -> PolyCircuit<P> {
+        self.to_circuit_with_disk_storage(None)
+    }
+
+    pub(crate) fn to_circuit_with_disk_storage<P: Poly>(
+        self,
+        disk_storage: Option<SubCircuitDiskStorage>,
+    ) -> PolyCircuit<P> {
         let mut circuit = PolyCircuit::new();
+        circuit.sub_circuit_disk_storage = disk_storage.clone();
         // Restore sub-circuits first
         for (circuit_id, serializable_sub_circuit) in self.sub_circuits.into_iter() {
-            let mut sub_circuit = serializable_sub_circuit.to_circuit();
-            sub_circuit.inherit_lookup_registry(Arc::clone(&circuit.lookup_registry));
+            let sub_circuit = match serializable_sub_circuit {
+                SerializableStoredSubCircuit::Inline(serializable_sub_circuit) => {
+                    let mut sub_circuit =
+                        serializable_sub_circuit.to_circuit_with_disk_storage(disk_storage.clone());
+                    sub_circuit.inherit_lookup_registry(Arc::clone(&circuit.lookup_registry));
+                    StoredSubCircuit::InMemory(Box::new(sub_circuit))
+                }
+                SerializableStoredSubCircuit::OnDisk(disk_ref) => {
+                    StoredSubCircuit::OnDisk(SubCircuitDiskRef {
+                        scoped_id: disk_ref.scoped_id,
+                        num_input: disk_ref.num_input,
+                        num_output: disk_ref.num_output,
+                    })
+                }
+            };
             circuit.sub_circuits.insert(circuit_id, sub_circuit);
         }
         // Insert gates preserving original GateIds
@@ -184,6 +230,21 @@ impl SerializablePolyCircuit {
 
     pub fn to_json_str(&self) -> String {
         serde_json::to_string(self).expect("Failed to serialize SerializablePolyCircuit")
+    }
+
+    pub fn from_json_file(path: impl AsRef<Path>) -> Self {
+        let path = path.as_ref();
+        let json_str = fs::read_to_string(path).unwrap_or_else(|err| {
+            panic!("Failed to read SerializablePolyCircuit from {}: {err}", path.display())
+        });
+        Self::from_json_str(&json_str)
+    }
+
+    pub fn to_json_file(&self, path: impl AsRef<Path>) {
+        let path = path.as_ref();
+        fs::write(path, self.to_json_str()).unwrap_or_else(|err| {
+            panic!("Failed to write SerializablePolyCircuit to {}: {err}", path.display())
+        });
     }
 }
 

@@ -25,7 +25,7 @@ use std::{
 
 use num_bigint::BigUint;
 
-use crate::circuit::{Evaluable, PolyCircuit, PolyGateType};
+use crate::circuit::{CircuitExecutionLayer, Evaluable, PolyCircuit, PolyGateType};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct BenchOperationMeasurement {
@@ -205,36 +205,76 @@ pub trait BenchEstimator<E: Evaluable> {
     }
 
     fn estimate_circuit_bench(&self, circuit: &PolyCircuit<E::P>) -> CircuitBenchSummary {
-        let mut estimate = CircuitBenchSummary::default();
-        for layer in circuit.expanded_gate_types_by_level() {
-            let mut layer_counts: HashMap<PolyGateType, usize> = HashMap::new();
-            for gate_type in layer {
-                *layer_counts.entry(gate_type).or_insert(0) += 1;
-            }
-
-            let mut layer_latency = 0.0_f64;
-            let mut layer_parallelism = 0u128;
-            for (gate_type, count) in layer_counts.into_iter() {
-                let gate_estimate = self.estimate_gate_bench(&gate_type);
-                estimate.total_time += gate_estimate.total_time * count as f64;
-                layer_latency = layer_latency.max(gate_estimate.latency);
-                let gate_parallelism = gate_estimate
-                    .parallelism_factor()
-                    .checked_mul(count as u128)
-                    .expect("layer parallelism overflowed u128 while scaling by gate count");
-                layer_parallelism = layer_parallelism
-                    .checked_add(gate_parallelism)
-                    .expect("layer parallelism overflowed u128 while summing gate kinds");
-                #[cfg(feature = "gpu")]
-                {
-                    estimate.peak_vram = estimate.peak_vram.max(gate_estimate.peak_vram);
-                }
-            }
-            estimate.latency += layer_latency;
-            estimate.max_parallelism = estimate.max_parallelism.max(layer_parallelism);
-        }
-        estimate
+        let mut summary_cache = HashMap::new();
+        estimate_circuit_bench_with_cache(self, circuit, &mut summary_cache)
     }
+}
+
+fn estimate_circuit_bench_with_cache<E, B>(
+    estimator: &B,
+    circuit: &PolyCircuit<E::P>,
+    summary_cache: &mut HashMap<*const PolyCircuit<E::P>, CircuitBenchSummary>,
+) -> CircuitBenchSummary
+where
+    E: Evaluable,
+    B: BenchEstimator<E> + ?Sized,
+{
+    let circuit_key = circuit as *const PolyCircuit<E::P>;
+    if let Some(summary) = summary_cache.get(&circuit_key) {
+        return *summary;
+    }
+
+    let mut estimate = CircuitBenchSummary::default();
+    for CircuitExecutionLayer { sub_circuit_ids, regular_gate_types } in circuit.execution_layers()
+    {
+        let mut layer_counts: HashMap<PolyGateType, usize> = HashMap::new();
+        let mut layer_latency = 0.0_f64;
+        let mut layer_parallelism = 0u128;
+
+        for sub_circuit_id in sub_circuit_ids {
+            let sub_circuit = circuit.registered_sub_circuit(sub_circuit_id);
+            let sub_summary =
+                estimate_circuit_bench_with_cache::<E, B>(estimator, sub_circuit, summary_cache);
+            estimate.total_time += sub_summary.total_time;
+            layer_latency += sub_summary.latency;
+            layer_parallelism = layer_parallelism.max(sub_summary.max_parallelism);
+            #[cfg(feature = "gpu")]
+            {
+                estimate.peak_vram = estimate.peak_vram.max(sub_summary.peak_vram);
+            }
+        }
+
+        for gate_type in regular_gate_types {
+            *layer_counts.entry(gate_type).or_insert(0) += 1;
+        }
+
+        let mut regular_latency = 0.0_f64;
+        let mut regular_parallelism = 0u128;
+        for (gate_type, count) in layer_counts.into_iter() {
+            let gate_estimate = estimator.estimate_gate_bench(&gate_type);
+            estimate.total_time += gate_estimate.total_time * count as f64;
+            regular_latency = regular_latency.max(gate_estimate.latency);
+            let gate_parallelism = gate_estimate
+                .parallelism_factor()
+                .checked_mul(count as u128)
+                .expect("layer parallelism overflowed u128 while scaling by gate count");
+            regular_parallelism = regular_parallelism
+                .checked_add(gate_parallelism)
+                .expect("layer parallelism overflowed u128 while summing gate kinds");
+            #[cfg(feature = "gpu")]
+            {
+                estimate.peak_vram = estimate.peak_vram.max(gate_estimate.peak_vram);
+            }
+        }
+
+        layer_latency += regular_latency;
+        layer_parallelism = layer_parallelism.max(regular_parallelism);
+        estimate.latency += layer_latency;
+        estimate.max_parallelism = estimate.max_parallelism.max(layer_parallelism);
+    }
+
+    summary_cache.insert(circuit_key, estimate);
+    estimate
 }
 
 #[cfg(test)]
@@ -355,6 +395,54 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct CountingBenchEstimator {
+        input_calls: AtomicUsize,
+        add_calls: AtomicUsize,
+    }
+
+    impl BenchEstimator<DCRTPoly> for CountingBenchEstimator {
+        fn estimate_input(&self) -> CircuitBenchEstimate {
+            self.input_calls.fetch_add(1, Ordering::SeqCst);
+            bench(1.0, 1.0, 0)
+        }
+
+        fn estimate_add(&self) -> CircuitBenchEstimate {
+            self.add_calls.fetch_add(1, Ordering::SeqCst);
+            bench(1.0, 1.0, 0)
+        }
+
+        fn estimate_sub(&self) -> CircuitBenchEstimate {
+            bench(0.0, 0.0, 0)
+        }
+
+        fn estimate_mul(&self) -> CircuitBenchEstimate {
+            bench(0.0, 0.0, 0)
+        }
+
+        fn estimate_small_scalar_mul(&self, _scalar: &[u32]) -> CircuitBenchEstimate {
+            bench(0.0, 0.0, 0)
+        }
+
+        fn estimate_large_scalar_mul(
+            &self,
+            _scalar: &[num_bigint::BigUint],
+        ) -> CircuitBenchEstimate {
+            bench(0.0, 0.0, 0)
+        }
+
+        fn estimate_slot_transfer(
+            &self,
+            _src_slots: &[(u32, Option<u32>)],
+        ) -> CircuitBenchEstimate {
+            bench(0.0, 0.0, 0)
+        }
+
+        fn estimate_public_lookup(&self, _lut_id: usize) -> CircuitBenchEstimate {
+            bench(0.0, 0.0, 0)
+        }
+    }
+
     #[test]
     #[sequential]
     fn test_estimate_circuit_bench_accumulates_layer_latency_and_total_time() {
@@ -376,26 +464,72 @@ mod tests {
 
     #[test]
     #[sequential]
-    fn test_estimate_circuit_bench_expands_sub_circuit_without_counting_placeholders() {
+    fn test_estimate_circuit_bench_counts_multi_output_subcircuit_call_once() {
+        let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
+        let sub_inputs = sub_circuit.input(2);
+        let sub_add = sub_circuit.add_gate(sub_inputs[0], sub_inputs[1]);
+        sub_circuit.output(vec![sub_add, sub_inputs[0]]);
+
+        let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
+        let main_inputs = main_circuit.input(2);
+        let sub_id = main_circuit.register_sub_circuit(sub_circuit);
+        let sub_outputs = main_circuit.call_sub_circuit(sub_id, &main_inputs);
+        main_circuit.output(sub_outputs);
+
+        let estimate = ExpandedSubCircuitBenchEstimator.estimate_circuit_bench(&main_circuit);
+        let expected = summary(10.0, 6.0, 4, 23);
+
+        assert!((estimate.total_time - expected.total_time).abs() < 1e-9);
+        assert!((estimate.latency - expected.latency).abs() < 1e-9);
+        assert_eq!(estimate.max_parallelism, expected.max_parallelism);
+        assert_eq!(estimate, expected);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_estimate_circuit_bench_sequences_subcircuit_calls_before_regular_gates() {
         let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
         let sub_inputs = sub_circuit.input(2);
         let sub_add = sub_circuit.add_gate(sub_inputs[0], sub_inputs[1]);
         sub_circuit.output(vec![sub_add]);
 
         let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
-        let main_inputs = main_circuit.input(3);
-        let mul = main_circuit.mul_gate(main_inputs[0], main_inputs[1]);
+        let main_inputs = main_circuit.input(4);
+        let top_add = main_circuit.add_gate(main_inputs[0], main_inputs[1]);
         let sub_id = main_circuit.register_sub_circuit(sub_circuit);
-        let sub_outputs = main_circuit.call_sub_circuit(sub_id, &[mul, main_inputs[2]]);
-        main_circuit.output(vec![sub_outputs[0]]);
+        let sub_outputs = main_circuit.call_sub_circuit(sub_id, &[main_inputs[2], main_inputs[3]]);
+        main_circuit.output(vec![top_add, sub_outputs[0]]);
 
         let estimate = ExpandedSubCircuitBenchEstimator.estimate_circuit_bench(&main_circuit);
-        let expected = summary(13.0, 7.5, 6, 29);
+        let expected = summary(18.0, 11.0, 8, 23);
 
         assert!((estimate.total_time - expected.total_time).abs() < 1e-9);
         assert!((estimate.latency - expected.latency).abs() < 1e-9);
         assert_eq!(estimate.max_parallelism, expected.max_parallelism);
         assert_eq!(estimate, expected);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_estimate_circuit_bench_reuses_cached_subcircuit_summary() {
+        let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
+        let sub_inputs = sub_circuit.input(2);
+        let sub_add = sub_circuit.add_gate(sub_inputs[0], sub_inputs[1]);
+        sub_circuit.output(vec![sub_add]);
+
+        let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
+        let main_inputs = main_circuit.input(4);
+        let sub_id = main_circuit.register_sub_circuit(sub_circuit);
+        let first = main_circuit.call_sub_circuit(sub_id, &[main_inputs[0], main_inputs[1]]);
+        let second = main_circuit.call_sub_circuit(sub_id, &[main_inputs[2], main_inputs[3]]);
+        main_circuit.output(vec![first[0], second[0]]);
+
+        let estimator = CountingBenchEstimator::default();
+        let estimate = estimator.estimate_circuit_bench(&main_circuit);
+
+        assert_eq!(estimate, summary(10.0, 5.0, 4, 0));
+        assert_eq!(estimator.input_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(estimator.add_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

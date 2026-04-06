@@ -724,7 +724,7 @@ mod tests {
         let graph_seed = sample_graph_seed();
         let goldreich = GoldreichFhePrg::setup(ring_gsw.clone(), 5, 1, graph_seed);
         let encrypted_inputs = (0..goldreich.input_size)
-            .map(|_| RingGswCiphertext::input(ring_gsw.clone(), &mut circuit))
+            .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
             .collect::<Vec<_>>();
         let encrypted_outputs = goldreich.evaluate(&encrypted_inputs, &mut circuit);
         let reconstructed_outputs = encrypted_outputs
@@ -830,7 +830,7 @@ mod tests {
         let graph_seed = sample_graph_seed();
         let goldreich = GoldreichFhePrg::setup(ring_gsw.clone(), 5, 1, graph_seed);
         let encrypted_inputs = (0..goldreich.input_size)
-            .map(|_| RingGswCiphertext::input(ring_gsw.clone(), &mut circuit))
+            .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
             .collect::<Vec<_>>();
         let encrypted_outputs = goldreich.evaluate(&encrypted_inputs, &mut circuit);
         let reconstructed_outputs = encrypted_outputs

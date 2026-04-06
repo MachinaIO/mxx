@@ -974,6 +974,7 @@ pub struct RingGswCiphertext<P: Poly> {
     pub ctx: Arc<RingGswContext<P>>,
     pub rows: [Vec<NestedRnsPoly<P>>; 2],
     pub randomizer_norm: PolyMatrixNorm,
+    pub max_plaintext: BigUint,
 }
 
 impl<P: Poly + 'static> RingGswCiphertext<P> {
@@ -1008,13 +1009,18 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
         ctx: Arc<RingGswContext<P>>,
         rows: [Vec<NestedRnsPoly<P>>; 2],
         randomizer_norm: PolyMatrixNorm,
+        max_plaintext: BigUint,
     ) -> Self {
-        let ciphertext = Self { ctx, rows, randomizer_norm };
+        let ciphertext = Self { ctx, rows, randomizer_norm, max_plaintext };
         ciphertext.assert_consistent();
         ciphertext
     }
 
-    pub fn input(ctx: Arc<RingGswContext<P>>, circuit: &mut PolyCircuit<P>) -> Self {
+    pub fn input(
+        ctx: Arc<RingGswContext<P>>,
+        max_plaintext: Option<BigUint>,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
         let [row0, row1] = Self::input_rows(
             ctx.nested_rns.clone(),
             ctx.width(),
@@ -1023,7 +1029,12 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
             circuit,
         );
         let randomizer_norm = ctx.fresh_randomizer_norm();
-        Self::new(ctx, [row0, row1], randomizer_norm)
+        Self::new(
+            ctx,
+            [row0, row1],
+            randomizer_norm,
+            max_plaintext.unwrap_or_else(|| BigUint::from(1u64)),
+        )
     }
 
     pub fn width(&self) -> usize {
@@ -1047,7 +1058,8 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
             .map(|(lhs, rhs)| lhs.add(rhs, circuit))
             .collect::<Vec<_>>();
         let randomizer_norm = &self.randomizer_norm + &other.randomizer_norm;
-        Self::new(self.ctx.clone(), [row0, row1], randomizer_norm)
+        let max_plaintext = &self.max_plaintext + &other.max_plaintext;
+        Self::new(self.ctx.clone(), [row0, row1], randomizer_norm, max_plaintext)
     }
 
     pub fn sub(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
@@ -1063,7 +1075,8 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
             .map(|(lhs, rhs)| lhs.sub(rhs, circuit))
             .collect::<Vec<_>>();
         let randomizer_norm = &self.randomizer_norm + &other.randomizer_norm;
-        Self::new(self.ctx.clone(), [row0, row1], randomizer_norm)
+        let max_plaintext = &self.max_plaintext + &other.max_plaintext;
+        Self::new(self.ctx.clone(), [row0, row1], randomizer_norm, max_plaintext)
     }
 
     pub fn mul(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
@@ -1141,7 +1154,8 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
 
         let randomizer_norm = (&self.randomizer_norm * self.ctx.decomposed_randomizer_norm()) +
             &other.randomizer_norm;
-        let result = Self::new(self.ctx.clone(), [row0, row1], randomizer_norm);
+        let max_plaintext = &self.max_plaintext * &other.max_plaintext;
+        let result = Self::new(self.ctx.clone(), [row0, row1], randomizer_norm, max_plaintext);
         debug!(
             "RingGswCiphertext::mul finished: width={}, entry_size={}, total_elapsed_ms={}",
             width,
@@ -1152,15 +1166,36 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
     }
 
     pub fn and(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
+        assert_eq!(
+            self.max_plaintext,
+            BigUint::from(1u64),
+            "RingGswCiphertext::and requires lhs.max_plaintext == 1"
+        );
+        assert_eq!(
+            other.max_plaintext,
+            BigUint::from(1u64),
+            "RingGswCiphertext::and requires rhs.max_plaintext == 1"
+        );
         self.mul(other, circuit)
     }
 
     pub fn xor(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
+        assert_eq!(
+            self.max_plaintext,
+            BigUint::from(1u64),
+            "RingGswCiphertext::xor requires lhs.max_plaintext == 1"
+        );
+        assert_eq!(
+            other.max_plaintext,
+            BigUint::from(1u64),
+            "RingGswCiphertext::xor requires rhs.max_plaintext == 1"
+        );
         self.assert_compatible(other);
         let sum = self.add(other, circuit);
         let product = self.mul(other, circuit);
         let sum_minus_product = sum.sub(&product, circuit);
-        sum_minus_product.sub(&product, circuit)
+        let result = sum_minus_product.sub(&product, circuit);
+        Self::new(result.ctx.clone(), result.rows, result.randomizer_norm, BigUint::from(1u64))
     }
 
     pub fn reconstruct(&self, circuit: &mut PolyCircuit<P>) -> Vec<GateId> {
@@ -1540,39 +1575,88 @@ mod tests {
     fn test_ring_gsw_input_randomizer_norm_starts_with_width_by_width_unit_bound() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (_params, ctx) = create_test_context(&mut circuit);
-        let input = RingGswCiphertext::input(ctx.clone(), &mut circuit);
+        let input = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
 
         assert_eq!(input.randomizer_norm, ctx.fresh_randomizer_norm());
         assert_eq!(input.randomizer_norm.nrow, ctx.width());
         assert_eq!(input.randomizer_norm.ncol, ctx.width());
         assert_eq!(input.randomizer_norm.poly_norm.norm, BigDecimal::from(1u64));
+        assert_eq!(input.max_plaintext, BigUint::from(1u64));
     }
 
     #[test]
-    fn test_ring_gsw_add_randomizer_norm_adds_lhs_and_rhs_bounds() {
+    fn test_ring_gsw_input_max_plaintext_accepts_explicit_override() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (_params, ctx) = create_test_context(&mut circuit);
-        let lhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
-        let rhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
+        let input = RingGswCiphertext::input(ctx, Some(BigUint::from(7u64)), &mut circuit);
+
+        assert_eq!(input.max_plaintext, BigUint::from(7u64));
+    }
+
+    #[test]
+    fn test_ring_gsw_add_randomizer_norm_and_sub_trace_sum_plaintext_bounds() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_params, ctx) = create_test_context(&mut circuit);
+        let lhs = RingGswCiphertext::input(ctx.clone(), Some(BigUint::from(3u64)), &mut circuit);
+        let rhs = RingGswCiphertext::input(ctx.clone(), Some(BigUint::from(5u64)), &mut circuit);
 
         let expected = &lhs.randomizer_norm + &rhs.randomizer_norm;
         let sum = lhs.add(&rhs, &mut circuit);
+        let difference = lhs.sub(&rhs, &mut circuit);
 
         assert_eq!(sum.randomizer_norm, expected);
+        assert_eq!(sum.max_plaintext, BigUint::from(8u64));
+        assert_eq!(difference.randomizer_norm, expected);
+        assert_eq!(difference.max_plaintext, BigUint::from(8u64));
     }
 
     #[test]
-    fn test_ring_gsw_mul_randomizer_norm_uses_decomposed_lhs_plus_rhs_bound() {
+    fn test_ring_gsw_mul_randomizer_norm_traces_plaintext_product() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (_params, ctx) = create_test_context(&mut circuit);
-        let lhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
-        let rhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
+        let lhs = RingGswCiphertext::input(ctx.clone(), Some(BigUint::from(3u64)), &mut circuit);
+        let rhs = RingGswCiphertext::input(ctx.clone(), Some(BigUint::from(5u64)), &mut circuit);
 
         let expected =
             (&lhs.randomizer_norm * ctx.decomposed_randomizer_norm()) + &rhs.randomizer_norm;
         let product = lhs.mul(&rhs, &mut circuit);
 
         assert_eq!(product.randomizer_norm, expected);
+        assert_eq!(product.max_plaintext, BigUint::from(15u64));
+    }
+
+    #[test]
+    fn test_ring_gsw_xor_keeps_boolean_plaintext_bound() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_params, ctx) = create_test_context(&mut circuit);
+        let lhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let rhs = RingGswCiphertext::input(ctx, None, &mut circuit);
+
+        let result = lhs.xor(&rhs, &mut circuit);
+
+        assert_eq!(result.max_plaintext, BigUint::from(1u64));
+    }
+
+    #[test]
+    #[should_panic(expected = "RingGswCiphertext::and requires lhs.max_plaintext == 1")]
+    fn test_ring_gsw_and_rejects_non_boolean_plaintext_bound() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_params, ctx) = create_test_context(&mut circuit);
+        let lhs = RingGswCiphertext::input(ctx.clone(), Some(BigUint::from(2u64)), &mut circuit);
+        let rhs = RingGswCiphertext::input(ctx, None, &mut circuit);
+
+        let _ = lhs.and(&rhs, &mut circuit);
+    }
+
+    #[test]
+    #[should_panic(expected = "RingGswCiphertext::xor requires rhs.max_plaintext == 1")]
+    fn test_ring_gsw_xor_rejects_non_boolean_plaintext_bound() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_params, ctx) = create_test_context(&mut circuit);
+        let lhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let rhs = RingGswCiphertext::input(ctx, Some(BigUint::from(2u64)), &mut circuit);
+
+        let _ = lhs.xor(&rhs, &mut circuit);
     }
 
     #[sequential_test::sequential]
@@ -1580,7 +1664,7 @@ mod tests {
     fn test_ring_gsw_encrypt_roundtrip_matches_circuit_and_native_decrypt_without_error() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
-        let ciphertext_input = RingGswCiphertext::input(ctx.clone(), &mut circuit);
+        let ciphertext_input = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
         let wire_secret_key = circuit.input(1)[0];
         let decrypted_input =
             ciphertext_input.decrypt(wire_secret_key, BigUint::from(2u64), &mut circuit);
@@ -1642,8 +1726,8 @@ mod tests {
     fn test_ring_gsw_add_circuit_decrypts_to_expected_integer_sum_without_error() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
-        let lhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
-        let rhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
+        let lhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let rhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
         let wire_secret_key = circuit.input(1)[0];
         let plaintext_modulus = 3u64;
         let sum = lhs.add(&rhs, &mut circuit);
@@ -1718,8 +1802,8 @@ mod tests {
     fn test_ring_gsw_sub_circuit_decrypts_to_expected_integer_difference_without_error() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
-        let lhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
-        let rhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
+        let lhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let rhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
         let wire_secret_key = circuit.input(1)[0];
         let plaintext_modulus = 3u64;
         let difference = lhs.sub(&rhs, &mut circuit);
@@ -1794,8 +1878,8 @@ mod tests {
     fn test_ring_gsw_mul_circuit_decrypts_to_expected_integer_product_without_error() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
-        let lhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
-        let rhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
+        let lhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let rhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
         let wire_secret_key = circuit.input(1)[0];
         let plaintext_modulus = 2u64;
         let product = lhs.mul(&rhs, &mut circuit);
@@ -1870,9 +1954,9 @@ mod tests {
     fn test_ring_gsw_chained_mul_circuit_decrypts_to_expected_integer_product_without_error() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
-        let lhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
-        let rhs1 = RingGswCiphertext::input(ctx.clone(), &mut circuit);
-        let rhs2 = RingGswCiphertext::input(ctx.clone(), &mut circuit);
+        let lhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let rhs1 = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let rhs2 = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
         let wire_secret_key = circuit.input(1)[0];
         let plaintext_modulus = 2u64;
         let product = lhs.mul(&rhs1, &mut circuit);
@@ -1987,8 +2071,8 @@ mod tests {
             p_moduli_bits,
             max_unused_muls,
         );
-        let lhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
-        let rhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
+        let lhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let rhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
         let product = lhs.mul(&rhs, &mut circuit);
         let outputs = product.reconstruct(&mut circuit);
         circuit.output(outputs);
@@ -2012,9 +2096,9 @@ mod tests {
             p_moduli_bits,
             max_unused_muls,
         );
-        let lhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
-        let rhs1 = RingGswCiphertext::input(ctx.clone(), &mut circuit);
-        let rhs2 = RingGswCiphertext::input(ctx, &mut circuit);
+        let lhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let rhs1 = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let rhs2 = RingGswCiphertext::input(ctx, None, &mut circuit);
         let product1 = lhs.mul(&rhs1, &mut circuit);
         let product2 = product1.mul(&rhs2, &mut circuit);
         let outputs = product2.reconstruct(&mut circuit);

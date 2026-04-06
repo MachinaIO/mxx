@@ -17,7 +17,9 @@ use crate::{
         DistType, PolyHashSampler, PolyUniformSampler, hash::DCRTPolyHashSampler,
         uniform::DCRTPolyUniformSampler,
     },
+    simulator::{SimulatorContext, poly_matrix_norm::PolyMatrixNorm},
 };
+use bigdecimal::BigDecimal;
 use keccak_asm::Keccak256;
 use num_bigint::BigUint;
 use num_traits::{ToPrimitive, Zero};
@@ -149,6 +151,18 @@ pub type NativeRingGswCiphertext = [Vec<DCRTPoly>; 2];
 
 fn active_q_modulus(ctx: &NestedRnsPolyContext) -> BigUint {
     BigUint::from(*ctx.q_moduli().first().expect("Ring-GSW helpers require one active q modulus"))
+}
+
+fn ring_gsw_randomizer_norm_ctx<P: Poly>(
+    params: &P::Params,
+    width: usize,
+    max_decomposition_value: u64,
+) -> Arc<SimulatorContext> {
+    let ring_dim_sqrt = BigDecimal::from(params.ring_dimension() as u64)
+        .sqrt()
+        .expect("sqrt(ring_dimension) failed");
+    let base = BigDecimal::from(max_decomposition_value) + BigDecimal::from(1u64);
+    Arc::new(SimulatorContext::new(ring_dim_sqrt, base, width, 1, 1))
 }
 
 fn native_gadget_matrix(params: &DCRTPolyParams, ctx: &NestedRnsPolyContext) -> DCRTPolyMatrix {
@@ -369,6 +383,7 @@ pub struct RingGswContext<P: Poly> {
     pub nested_rns: Arc<NestedRnsPolyContext>,
     pub level_offset: usize,
     pub active_levels: usize,
+    pub randomizer_norm_ctx: Arc<SimulatorContext>,
     pub mul_subcircuit_id: usize,
     pub mul_output_max_plaintexts: Vec<BigUint>,
     pub mul_output_p_max_traces: Vec<BigUint>,
@@ -381,6 +396,32 @@ impl<P: Poly> RingGswContext<P> {
 
     pub fn gadget_len(&self) -> usize {
         self.active_levels * (self.nested_rns.p_moduli.len() + 1)
+    }
+
+    pub fn fresh_randomizer_norm(&self) -> PolyMatrixNorm {
+        PolyMatrixNorm::new(
+            self.randomizer_norm_ctx.clone(),
+            self.width(),
+            self.width(),
+            BigDecimal::from(1u64),
+            None,
+        )
+    }
+
+    pub fn decomposed_randomizer_norm(&self) -> PolyMatrixNorm {
+        let max_p_modulus = *self
+            .nested_rns
+            .p_moduli
+            .iter()
+            .max()
+            .expect("RingGswContext requires at least one p modulus");
+        PolyMatrixNorm::new(
+            self.randomizer_norm_ctx.clone(),
+            self.width(),
+            self.width(),
+            BigDecimal::from(max_p_modulus),
+            None,
+        )
     }
 }
 
@@ -484,6 +525,12 @@ impl<P: Poly + 'static> RingGswContext<P> {
             nested_rns_start.elapsed().as_millis()
         );
         let width = 2 * active_levels * (nested_rns.p_moduli.len() + 1);
+        let max_p_modulus = *nested_rns
+            .p_moduli
+            .iter()
+            .max()
+            .expect("RingGswContext requires at least one p modulus");
+        let randomizer_norm_ctx = ring_gsw_randomizer_norm_ctx::<P>(params, width, max_p_modulus);
         let helper_storage =
             Self::shared_helper_storage(circuit.cloned_subcircuit_disk_storage(), "ring-gsw");
         let helper_build_start = Instant::now();
@@ -513,6 +560,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
             nested_rns,
             level_offset,
             active_levels,
+            randomizer_norm_ctx,
             mul_subcircuit_id,
             mul_output_max_plaintexts: mul_output_template.max_plaintexts,
             mul_output_p_max_traces: mul_output_template.p_max_traces,
@@ -925,6 +973,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
 pub struct RingGswCiphertext<P: Poly> {
     pub ctx: Arc<RingGswContext<P>>,
     pub rows: [Vec<NestedRnsPoly<P>>; 2],
+    pub randomizer_norm: PolyMatrixNorm,
 }
 
 impl<P: Poly + 'static> RingGswCiphertext<P> {
@@ -955,8 +1004,12 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
         row.iter().map(|entry| Self::normalize_mul_entry(entry, circuit)).collect()
     }
 
-    pub fn new(ctx: Arc<RingGswContext<P>>, rows: [Vec<NestedRnsPoly<P>>; 2]) -> Self {
-        let ciphertext = Self { ctx, rows };
+    pub fn new(
+        ctx: Arc<RingGswContext<P>>,
+        rows: [Vec<NestedRnsPoly<P>>; 2],
+        randomizer_norm: PolyMatrixNorm,
+    ) -> Self {
+        let ciphertext = Self { ctx, rows, randomizer_norm };
         ciphertext.assert_consistent();
         ciphertext
     }
@@ -969,7 +1022,8 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
             ctx.level_offset,
             circuit,
         );
-        Self::new(ctx, [row0, row1])
+        let randomizer_norm = ctx.fresh_randomizer_norm();
+        Self::new(ctx, [row0, row1], randomizer_norm)
     }
 
     pub fn width(&self) -> usize {
@@ -992,7 +1046,8 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
             .zip(other.rows[1].iter())
             .map(|(lhs, rhs)| lhs.add(rhs, circuit))
             .collect::<Vec<_>>();
-        Self::new(self.ctx.clone(), [row0, row1])
+        let randomizer_norm = &self.randomizer_norm + &other.randomizer_norm;
+        Self::new(self.ctx.clone(), [row0, row1], randomizer_norm)
     }
 
     pub fn sub(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
@@ -1007,7 +1062,8 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
             .zip(other.rows[1].iter())
             .map(|(lhs, rhs)| lhs.sub(rhs, circuit))
             .collect::<Vec<_>>();
-        Self::new(self.ctx.clone(), [row0, row1])
+        let randomizer_norm = &self.randomizer_norm + &other.randomizer_norm;
+        Self::new(self.ctx.clone(), [row0, row1], randomizer_norm)
     }
 
     pub fn mul(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
@@ -1083,7 +1139,9 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
             },
         );
 
-        let result = Self::new(self.ctx.clone(), [row0, row1]);
+        let randomizer_norm = (&self.randomizer_norm * self.ctx.decomposed_randomizer_norm()) +
+            &other.randomizer_norm;
+        let result = Self::new(self.ctx.clone(), [row0, row1], randomizer_norm);
         debug!(
             "RingGswCiphertext::mul finished: width={}, entry_size={}, total_elapsed_ms={}",
             width,
@@ -1174,6 +1232,21 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
             "RingGswCiphertext width {} must equal context width {}",
             width,
             self.ctx.width()
+        );
+        assert_eq!(
+            self.randomizer_norm.nrow, width,
+            "RingGswCiphertext randomizer trace rows {} must match width {}",
+            self.randomizer_norm.nrow, width
+        );
+        assert_eq!(
+            self.randomizer_norm.ncol, width,
+            "RingGswCiphertext randomizer trace cols {} must match width {}",
+            self.randomizer_norm.ncol, width
+        );
+        assert_eq!(
+            self.randomizer_norm.ctx(),
+            self.ctx.randomizer_norm_ctx.as_ref(),
+            "RingGswCiphertext randomizer trace context must match the RingGswContext norm context"
         );
 
         for row in &self.rows {
@@ -1361,6 +1434,7 @@ mod tests {
         },
         slot_transfer::PolyVecSlotTransferEvaluator,
     };
+    use bigdecimal::BigDecimal;
     use num_bigint::BigUint;
     use num_traits::ToPrimitive;
     use rand::Rng;
@@ -1460,6 +1534,45 @@ mod tests {
         let mut coeffs = vec![0u64; NUM_SLOTS];
         coeffs[0] = expected;
         coeffs
+    }
+
+    #[test]
+    fn test_ring_gsw_input_randomizer_norm_starts_with_width_by_width_unit_bound() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_params, ctx) = create_test_context(&mut circuit);
+        let input = RingGswCiphertext::input(ctx.clone(), &mut circuit);
+
+        assert_eq!(input.randomizer_norm, ctx.fresh_randomizer_norm());
+        assert_eq!(input.randomizer_norm.nrow, ctx.width());
+        assert_eq!(input.randomizer_norm.ncol, ctx.width());
+        assert_eq!(input.randomizer_norm.poly_norm.norm, BigDecimal::from(1u64));
+    }
+
+    #[test]
+    fn test_ring_gsw_add_randomizer_norm_adds_lhs_and_rhs_bounds() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_params, ctx) = create_test_context(&mut circuit);
+        let lhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
+        let rhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
+
+        let expected = &lhs.randomizer_norm + &rhs.randomizer_norm;
+        let sum = lhs.add(&rhs, &mut circuit);
+
+        assert_eq!(sum.randomizer_norm, expected);
+    }
+
+    #[test]
+    fn test_ring_gsw_mul_randomizer_norm_uses_decomposed_lhs_plus_rhs_bound() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_params, ctx) = create_test_context(&mut circuit);
+        let lhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
+        let rhs = RingGswCiphertext::input(ctx.clone(), &mut circuit);
+
+        let expected =
+            (&lhs.randomizer_norm * ctx.decomposed_randomizer_norm()) + &rhs.randomizer_norm;
+        let product = lhs.mul(&rhs, &mut circuit);
+
+        assert_eq!(product.randomizer_norm, expected);
     }
 
     #[sequential_test::sequential]

@@ -1180,6 +1180,7 @@ mod tests {
     use num_traits::ToPrimitive;
     use rand::Rng;
     use std::sync::Arc;
+    use tempfile::tempdir;
 
     const BASE_BITS: u32 = 6;
     const CRT_BITS: usize = 18;
@@ -1821,10 +1822,12 @@ mod tests {
         let crt_depth = 1usize;
         let ring_dim = 1u32 << 10;
         let num_slots = 1usize << 10;
-        let p_moduli_bits = 6;
-        let max_unused_muls = 2;
+        let p_moduli_bits = 7;
+        let max_unused_muls = 4;
 
+        let mul1_disk_dir = tempdir().expect("create temp dir for disk-backed sub-circuits");
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        circuit.enable_subcircuits_in_disk(mul1_disk_dir.path());
         let (_params, ctx) = create_test_context_with(
             &mut circuit,
             ring_dim,
@@ -1847,7 +1850,9 @@ mod tests {
         println!("mul 1 non-free depth end {}", mul1_depth);
         println!("mul 1 gate counts {:?}", circuit.count_gates_by_type_vec());
 
+        let mul2_disk_dir = tempdir().expect("create temp dir for disk-backed sub-circuits");
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        circuit.enable_subcircuits_in_disk(mul2_disk_dir.path());
         let (_params, ctx) = create_test_context_with(
             &mut circuit,
             ring_dim,

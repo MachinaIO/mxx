@@ -16,6 +16,8 @@ use rayon::{
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Debug,
+    fs,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -25,7 +27,7 @@ use std::{
 #[cfg(feature = "gpu")]
 use crate::poly::dcrt::gpu::detected_gpu_device_ids;
 use crate::{
-    circuit::gate::GateId,
+    circuit::{gate::GateId, serde::SerializablePolyCircuit},
     lookup::{PltEvaluator, PublicLut},
     poly::Poly,
     slot_transfer::SlotTransferEvaluator,
@@ -95,17 +97,51 @@ struct SubCircuitCall {
     num_outputs: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubCircuitDiskRef {
+    scoped_id: usize,
+    num_input: usize,
+    num_output: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StoredSubCircuit<P: Poly> {
+    InMemory(Box<PolyCircuit<P>>),
+    OnDisk(SubCircuitDiskRef),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SubCircuitDiskStorage {
+    dir: Arc<PathBuf>,
+    next_scoped_id: Arc<AtomicUsize>,
+}
+
+impl SubCircuitDiskStorage {
+    fn new(dir: PathBuf) -> Self {
+        Self { dir: Arc::new(dir), next_scoped_id: Arc::new(AtomicUsize::new(0)) }
+    }
+
+    fn alloc_scoped_id(&self) -> usize {
+        self.next_scoped_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn file_path(&self, scoped_id: usize) -> PathBuf {
+        self.dir.join(format!("{scoped_id}.json"))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PolyCircuit<P: Poly> {
     gates: BTreeMap<GateId, PolyGate>,
     print_value: BTreeMap<GateId, String>,
-    sub_circuits: BTreeMap<usize, PolyCircuit<P>>,
+    sub_circuits: BTreeMap<usize, StoredSubCircuit<P>>,
     sub_circuit_calls: BTreeMap<usize, SubCircuitCall>,
     output_ids: Vec<GateId>,
     num_input: usize,
     gate_counts: HashMap<PolyGateKind, usize>,
     lookup_registry: Arc<LookupRegistry<P>>,
     allow_register_lookup: bool,
+    sub_circuit_disk_storage: Option<SubCircuitDiskStorage>,
 }
 
 impl<P: Poly> PartialEq for PolyCircuit<P> {
@@ -147,6 +183,7 @@ impl<P: Poly> PolyCircuit<P> {
             gate_counts,
             lookup_registry,
             allow_register_lookup: true,
+            sub_circuit_disk_storage: None,
         }
     }
 
@@ -159,8 +196,90 @@ impl<P: Poly> PolyCircuit<P> {
         }
         self.allow_register_lookup = false;
         for sub in self.sub_circuits.values_mut() {
-            sub.inherit_lookup_registry(Arc::clone(&registry));
+            if let StoredSubCircuit::InMemory(sub) = sub {
+                sub.inherit_lookup_registry(Arc::clone(&registry));
+            }
         }
+    }
+
+    fn sub_circuit_storage(&self) -> &SubCircuitDiskStorage {
+        self.sub_circuit_disk_storage
+            .as_ref()
+            .expect("disk-backed sub-circuit storage is not enabled")
+    }
+
+    fn sub_circuit_file_path(&self, scoped_id: usize) -> PathBuf {
+        self.sub_circuit_storage().file_path(scoped_id)
+    }
+
+    fn load_disk_sub_circuit(&self, disk_ref: &SubCircuitDiskRef) -> Self {
+        let path = self.sub_circuit_file_path(disk_ref.scoped_id);
+        let mut loaded = SerializablePolyCircuit::from_json_file(&path)
+            .to_circuit_with_disk_storage(self.sub_circuit_disk_storage.clone());
+        loaded.inherit_lookup_registry(Arc::clone(&self.lookup_registry));
+        loaded
+    }
+
+    fn with_sub_circuit<R>(&self, circuit_id: usize, f: impl FnOnce(&Self) -> R) -> R {
+        let stored = self.sub_circuits.get(&circuit_id).expect("sub-circuit not found");
+        match stored {
+            StoredSubCircuit::InMemory(sub) => f(sub),
+            StoredSubCircuit::OnDisk(disk_ref) => {
+                let loaded = self.load_disk_sub_circuit(disk_ref);
+                f(&loaded)
+            }
+        }
+    }
+
+    fn sub_circuit_num_input(&self, circuit_id: usize) -> usize {
+        let stored = self.sub_circuits.get(&circuit_id).expect("sub-circuit not found");
+        match stored {
+            StoredSubCircuit::InMemory(sub) => sub.num_input(),
+            StoredSubCircuit::OnDisk(disk_ref) => disk_ref.num_input,
+        }
+    }
+
+    fn sub_circuit_num_output(&self, circuit_id: usize) -> usize {
+        let stored = self.sub_circuits.get(&circuit_id).expect("sub-circuit not found");
+        match stored {
+            StoredSubCircuit::InMemory(sub) => sub.num_output(),
+            StoredSubCircuit::OnDisk(disk_ref) => disk_ref.num_output,
+        }
+    }
+
+    fn persist_sub_circuit_to_disk(
+        storage: &SubCircuitDiskStorage,
+        lookup_registry: &Arc<LookupRegistry<P>>,
+        sub_circuit: Self,
+    ) -> SubCircuitDiskRef {
+        let mut sub_circuit = sub_circuit;
+        sub_circuit.sub_circuit_disk_storage = Some(storage.clone());
+
+        let child_ids = sub_circuit.sub_circuits.keys().copied().collect::<Vec<_>>();
+        for child_id in child_ids {
+            let child = sub_circuit
+                .sub_circuits
+                .remove(&child_id)
+                .expect("sub-circuit child missing during disk persistence");
+            let disk_ref = match child {
+                StoredSubCircuit::InMemory(child) => {
+                    Self::persist_sub_circuit_to_disk(storage, lookup_registry, *child)
+                }
+                StoredSubCircuit::OnDisk(disk_ref) => disk_ref,
+            };
+            sub_circuit.sub_circuits.insert(child_id, StoredSubCircuit::OnDisk(disk_ref));
+        }
+
+        let disk_ref = SubCircuitDiskRef {
+            scoped_id: storage.alloc_scoped_id(),
+            num_input: sub_circuit.num_input(),
+            num_output: sub_circuit.num_output(),
+        };
+        let path = storage.file_path(disk_ref.scoped_id);
+        let mut sub_circuit = sub_circuit;
+        sub_circuit.inherit_lookup_registry(Arc::clone(lookup_registry));
+        SerializablePolyCircuit::from_circuit(sub_circuit).to_json_file(&path);
+        disk_ref
     }
 
     /// Get number of inputs
@@ -204,8 +323,7 @@ impl<P: Poly> PolyCircuit<P> {
             *call_counts.entry(call.sub_circuit_id).or_insert(0) += 1;
         }
         for (sub_id, times) in call_counts {
-            let sub = self.sub_circuits.get(&sub_id).expect("sub-circuit not found");
-            let sub_counts = sub.expanded_gate_counts(false);
+            let sub_counts = self.with_sub_circuit(sub_id, |sub| sub.expanded_gate_counts(false));
             for (kind, count) in sub_counts {
                 *counts.entry(kind).or_insert(0) += count * times;
             }
@@ -303,11 +421,12 @@ impl<P: Poly> PolyCircuit<P> {
                 .map(|call_id| {
                     let call =
                         self.sub_circuit_calls.get(&call_id).expect("sub-circuit call missing");
-                    let sub_circuit =
-                        self.sub_circuits.get(&call.sub_circuit_id).expect("sub-circuit missing");
                     let sub_input_levels =
                         call.inputs.iter().map(|id| level_map[id]).collect::<Vec<_>>();
-                    (call_id, sub_circuit.non_free_depths_with_input_levels(&sub_input_levels))
+                    let output_levels = self.with_sub_circuit(call.sub_circuit_id, |sub_circuit| {
+                        sub_circuit.non_free_depths_with_input_levels(&sub_input_levels)
+                    });
+                    (call_id, output_levels)
                 })
                 .collect::<Vec<_>>();
             for (call_id, outputs) in computed_call_levels {
@@ -672,16 +791,18 @@ impl<P: Poly> PolyCircuit<P> {
 
     fn max_sub_circuit_calls(&self) -> usize {
         let mut max_calls = self.sub_circuit_calls.len();
-        for sub in self.sub_circuits.values() {
-            max_calls = max_calls.max(sub.max_sub_circuit_calls());
+        for sub_id in self.sub_circuits.keys().copied() {
+            let sub_max_calls = self.with_sub_circuit(sub_id, |sub| sub.max_sub_circuit_calls());
+            max_calls = max_calls.max(sub_max_calls);
         }
         max_calls
     }
 
     fn max_gate_count(&self) -> usize {
         let mut max_gates = self.gates.len();
-        for sub in self.sub_circuits.values() {
-            max_gates = max_gates.max(sub.max_gate_count());
+        for sub_id in self.sub_circuits.keys().copied() {
+            let sub_max_gates = self.with_sub_circuit(sub_id, |sub| sub.max_gate_count());
+            max_gates = max_gates.max(sub_max_gates);
         }
         max_gates
     }
@@ -710,10 +831,9 @@ impl<P: Poly> PolyCircuit<P> {
                 .checked_mul(call_id_base)
                 .and_then(|base| base.checked_add((*call_id as u128) + 1))
                 .expect("sub-circuit call prefix overflow");
-            self.sub_circuits
-                .get(&call.sub_circuit_id)
-                .expect("sub-circuit missing while collecting scoped gate keys")
-                .collect_scoped_gate_keys(child_prefix, call_id_base, gate_id_base, scoped_keys);
+            self.with_sub_circuit(call.sub_circuit_id, |sub| {
+                sub.collect_scoped_gate_keys(child_prefix, call_id_base, gate_id_base, scoped_keys);
+            });
         }
     }
 
@@ -991,11 +1111,6 @@ impl<P: Poly> PolyCircuit<P> {
                         .get(call_id)
                         .expect("sub-circuit call missing")
                         .clone();
-                    let sub_circuit = self
-                        .sub_circuits
-                        .get(&call.sub_circuit_id)
-                        .expect("sub-circuit missing")
-                        .clone();
                     let child_prefix = call_prefix
                         .checked_mul(call_id_base)
                         .and_then(|base| base.checked_add((*call_id as u128) + 1))
@@ -1005,19 +1120,21 @@ impl<P: Poly> PolyCircuit<P> {
                         .iter()
                         .map(|id| wires.get(id).expect("wire missing for sub-circuit").clone())
                         .collect::<Vec<_>>();
-                    let sub_outputs = sub_circuit.eval_scoped(
-                        eval_params,
-                        eval_one,
-                        one_compact.clone(),
-                        &sub_inputs,
-                        plt_evaluator,
-                        slot_transfer_evaluator,
-                        child_prefix,
-                        call_id_base,
-                        gate_id_base,
-                        scoped_gate_ids,
-                        parallel_gates,
-                    );
+                    let sub_outputs = self.with_sub_circuit(call.sub_circuit_id, |sub_circuit| {
+                        sub_circuit.eval_scoped(
+                            eval_params,
+                            eval_one,
+                            one_compact.clone(),
+                            &sub_inputs,
+                            plt_evaluator,
+                            slot_transfer_evaluator,
+                            child_prefix,
+                            call_id_base,
+                            gate_id_base,
+                            scoped_gate_ids,
+                            parallel_gates,
+                        )
+                    });
                     if sub_outputs.len() != call.output_gate_ids.len() {
                         panic!("sub-circuit output size mismatch");
                     }
@@ -1336,27 +1453,54 @@ impl<P: Poly> PolyCircuit<P> {
             }
         }
         for call in self.sub_circuit_calls.values() {
-            let sub = self.sub_circuits.get(&call.sub_circuit_id).expect("sub-circuit not found");
-            total += sub.lut_vector_len_with_subcircuits();
+            total += self
+                .with_sub_circuit(call.sub_circuit_id, |sub| sub.lut_vector_len_with_subcircuits());
         }
         total
+    }
+
+    pub fn enable_subcircuits_in_disk(&mut self, dir_path: impl AsRef<Path>) {
+        let dir = dir_path.as_ref().to_path_buf();
+        fs::create_dir_all(&dir).expect("failed to create sub-circuit disk directory");
+        let storage = SubCircuitDiskStorage::new(dir);
+        let circuit_ids = self.sub_circuits.keys().copied().collect::<Vec<_>>();
+        self.sub_circuit_disk_storage = Some(storage.clone());
+        for circuit_id in circuit_ids {
+            let stored = self
+                .sub_circuits
+                .remove(&circuit_id)
+                .expect("sub-circuit missing while enabling disk storage");
+            let disk_ref = match stored {
+                StoredSubCircuit::InMemory(sub) => {
+                    Self::persist_sub_circuit_to_disk(&storage, &self.lookup_registry, *sub)
+                }
+                StoredSubCircuit::OnDisk(disk_ref) => disk_ref,
+            };
+            self.sub_circuits.insert(circuit_id, StoredSubCircuit::OnDisk(disk_ref));
+        }
     }
 
     pub fn register_sub_circuit(&mut self, mut sub_circuit: Self) -> usize {
         sub_circuit.inherit_lookup_registry(Arc::clone(&self.lookup_registry));
         let circuit_id = self.sub_circuits.len();
-        self.sub_circuits.insert(circuit_id, sub_circuit);
+        let stored = match &self.sub_circuit_disk_storage {
+            Some(storage) => StoredSubCircuit::OnDisk(Self::persist_sub_circuit_to_disk(
+                storage,
+                &self.lookup_registry,
+                sub_circuit,
+            )),
+            None => StoredSubCircuit::InMemory(Box::new(sub_circuit)),
+        };
+        self.sub_circuits.insert(circuit_id, stored);
         circuit_id
     }
 
     pub fn call_sub_circuit(&mut self, circuit_id: usize, inputs: &[GateId]) -> Vec<GateId> {
         #[cfg(debug_assertions)]
         {
-            let sub_circuit = &self.sub_circuits[&circuit_id];
-            assert_eq!(inputs.len(), sub_circuit.num_input());
+            assert_eq!(inputs.len(), self.sub_circuit_num_input(circuit_id));
         }
-        let sub_circuit = self.sub_circuits.get(&circuit_id).expect("sub-circuit not found");
-        let num_outputs = sub_circuit.num_output();
+        let num_outputs = self.sub_circuit_num_output(circuit_id);
         let call_id = self.sub_circuit_calls.len();
         let inputs_vec = inputs.to_vec();
         let mut outputs = Vec::with_capacity(num_outputs);
@@ -1393,6 +1537,7 @@ mod tests {
         utils::{create_bit_random_poly, create_random_poly},
     };
     use num_bigint::BigUint;
+    use tempfile::tempdir;
 
     fn eval_with_const_one<PE>(
         circuit: &PolyCircuit<DCRTPoly>,
@@ -2024,6 +2169,63 @@ mod tests {
         let expected = (poly1.clone() + poly2.clone()) - (poly1 * poly2);
 
         // Verify the result
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], expected);
+    }
+
+    #[test]
+    fn test_nested_sub_circuits_from_disk() {
+        let dir = tempdir().expect("create temp dir");
+        let params = DCRTPolyParams::default();
+
+        let poly1 = create_random_poly(&params);
+        let poly2 = create_random_poly(&params);
+        let poly3 = create_random_poly(&params);
+
+        let mut inner_circuit = PolyCircuit::new();
+        let inner_inputs = inner_circuit.input(2);
+        let mul_gate = inner_circuit.mul_gate(inner_inputs[0], inner_inputs[1]);
+        inner_circuit.output(vec![mul_gate]);
+
+        let mut middle_circuit = PolyCircuit::new();
+        let middle_inputs = middle_circuit.input(3);
+        let inner_circuit_id = middle_circuit.register_sub_circuit(inner_circuit);
+        let inner_outputs = middle_circuit
+            .call_sub_circuit(inner_circuit_id, &[middle_inputs[0], middle_inputs[1]]);
+        let add_gate = middle_circuit.add_gate(inner_outputs[0], middle_inputs[2]);
+        middle_circuit.output(vec![add_gate]);
+
+        let mut main_circuit = PolyCircuit::new();
+        main_circuit.enable_subcircuits_in_disk(dir.path());
+        let main_inputs = main_circuit.input(3);
+        let middle_circuit_id = main_circuit.register_sub_circuit(middle_circuit);
+        let middle_outputs = main_circuit
+            .call_sub_circuit(middle_circuit_id, &[main_inputs[0], main_inputs[1], main_inputs[2]]);
+        let square_gate = main_circuit.mul_gate(middle_outputs[0], middle_outputs[0]);
+        main_circuit.output(vec![square_gate]);
+
+        assert!(
+            main_circuit
+                .sub_circuits
+                .values()
+                .all(|sub| matches!(sub, StoredSubCircuit::OnDisk(_)))
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).expect("read temp dir").count(), 2);
+
+        let gate_counts = main_circuit.count_gates_by_type_vec();
+        assert_eq!(main_circuit.lut_vector_len_with_subcircuits(), 0);
+        assert_eq!(gate_counts.get(&PolyGateKind::Mul).copied().unwrap_or(0), 2);
+        assert_eq!(main_circuit.non_free_depth(), 2);
+
+        let result = eval_with_const_one(
+            &main_circuit,
+            &params,
+            &[poly1.clone(), poly2.clone(), poly3.clone()],
+            None::<&PolyPltEvaluator>,
+        );
+
+        let expected =
+            ((poly1.clone() * poly2.clone()) + poly3.clone()) * ((poly1 * poly2) + poly3);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], expected);
     }

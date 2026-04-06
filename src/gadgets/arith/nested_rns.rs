@@ -1327,12 +1327,16 @@ impl<P: Poly> NestedRnsPoly<P> {
         decomposition
     }
 
-    pub fn reconstruct(&self, circuit: &mut PolyCircuit<P>) -> GateId {
-        let operand = if self.bounds_exceed_p_full(&self.max_plaintexts) {
+    pub(crate) fn prepare_for_reconstruct(&self, circuit: &mut PolyCircuit<P>) -> Self {
+        if self.bounds_exceed_p_full(&self.max_plaintexts) {
             self.full_reduce(circuit)
         } else {
             self.lazy_reduce_if_unreduced(circuit)
-        };
+        }
+    }
+
+    pub fn reconstruct(&self, circuit: &mut PolyCircuit<P>) -> GateId {
+        let operand = self.prepare_for_reconstruct(circuit);
         let levels = operand.resolve_enable_levels();
         let mut sum_mod_q = circuit.const_zero_gate();
         let active_moduli = operand.active_q_moduli();
@@ -1584,7 +1588,7 @@ impl<P: Poly> NestedRnsPoly<P> {
         )
     }
 
-    fn decomposition_terms_for_level(
+    pub(crate) fn decomposition_terms_for_level(
         &self,
         q_idx: usize,
         circuit: &mut PolyCircuit<P>,

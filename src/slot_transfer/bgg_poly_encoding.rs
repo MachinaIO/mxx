@@ -190,13 +190,13 @@ where
         src_slots: &[(u32, Option<u32>)],
         gate_id: GateId,
     ) -> BggPolyEncoding<M> {
-        let num_slots = input.num_slots();
-        assert_eq!(
+        let input_slots = input.num_slots();
+        let output_slots = src_slots.len();
+        assert!(
+            output_slots <= input_slots,
+            "output slot count {} exceeds input slot count {}",
             src_slots.len(),
-            num_slots,
-            "source slot count {} does not match input slot count {}",
-            src_slots.len(),
-            num_slots
+            input_slots
         );
         let plaintext_bytes_by_slot = input
             .plaintext_bytes
@@ -204,17 +204,17 @@ where
             .expect("BggPolyEncoding slot transfer requires plaintext_bytes");
         assert_eq!(
             plaintext_bytes_by_slot.len(),
-            num_slots,
+            input_slots,
             "BggPolyEncoding slot transfer requires plaintext_bytes.len() == num_slots"
         );
 
         let secret_size = input.pubkey.matrix.row_size();
         let out_pubkey = self.output_pubkey_for_params(params, secret_size, gate_id);
         let requested_parallelism =
-            crate::env::slot_transfer_slot_parallelism().max(1).min(num_slots.max(1));
+            crate::env::slot_transfer_slot_parallelism().max(1).min(output_slots.max(1));
         #[cfg(feature = "gpu")]
         let configured_parallelism =
-            gpu::effective_gpu_slot_parallelism(requested_parallelism).min(num_slots.max(1));
+            gpu::effective_gpu_slot_parallelism(requested_parallelism).min(output_slots.max(1));
         #[cfg(not(feature = "gpu"))]
         let configured_parallelism = requested_parallelism;
 
@@ -234,10 +234,11 @@ where
         #[cfg(not(feature = "gpu"))]
         let (output_vector_bytes, output_plaintext_bytes) = {
             let c_b0 = M::from_compact_bytes(params, &self.c_b0_bytes);
-            let mut output_vector_bytes = Vec::with_capacity(num_slots);
-            let mut output_plaintext_bytes = Vec::with_capacity(num_slots);
-            for slot_start in (0..num_slots).step_by(configured_parallelism) {
-                let chunk_len = (slot_start + configured_parallelism).min(num_slots) - slot_start;
+            let mut output_vector_bytes = Vec::with_capacity(output_slots);
+            let mut output_plaintext_bytes = Vec::with_capacity(output_slots);
+            for slot_start in (0..output_slots).step_by(configured_parallelism) {
+                let chunk_len =
+                    (slot_start + configured_parallelism).min(output_slots) - slot_start;
                 let chunk_outputs = (0..chunk_len)
                     .into_par_iter()
                     .map(|offset| {
@@ -276,6 +277,7 @@ mod tests {
     use crate::{
         __PAIR, __TestState,
         bgg::{
+            encoding::BggEncoding,
             poly_encoding::BggPolyEncoding,
             public_key::BggPublicKey,
             sampler::{BGGPolyEncodingSampler, BGGPublicKeySampler},
@@ -298,6 +300,12 @@ mod tests {
     use std::{fs, path::Path, sync::Arc};
 
     const SIGMA: f64 = 4.578;
+
+    fn monomial_scalar(shift: usize) -> Vec<u32> {
+        let mut scalar = vec![0; shift + 1];
+        scalar[shift] = 1;
+        scalar
+    }
 
     struct DummyPubKeyPltEvaluator;
 
@@ -468,5 +476,160 @@ mod tests {
                 .expect("slot-transfer output should reveal plaintext constants");
             assert_eq!(output_plaintext, scaled_plaintext);
         }
+    }
+
+    #[tokio::test]
+    #[sequential_test::sequential]
+    async fn test_slot_transfer_bgg_poly_encoding_single_output_slot_matches_weighted_sum() {
+        let _storage_lock = storage_test_lock().await;
+
+        let params = DCRTPolyParams::default();
+        let hash_key = [0x44u8; 32];
+        let secret_size = 2usize;
+        let num_slots = 3usize;
+        let dir_path = "test_data/test_slot_transfer_bgg_poly_encoding_single_output";
+        let dir = Path::new(dir_path);
+        if dir.exists() {
+            fs::remove_dir_all(dir).unwrap();
+        }
+        fs::create_dir_all(dir).unwrap();
+        init_storage_system(dir.to_path_buf());
+
+        let tag: u64 = 11;
+        let reveal_plaintexts = [true];
+        let bgg_pubkey_sampler =
+            BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(hash_key, secret_size);
+        let public_keys =
+            bgg_pubkey_sampler.sample(&params, &tag.to_le_bytes(), &reveal_plaintexts);
+
+        let secrets = (0..secret_size)
+            .map(|idx| DCRTPoly::from_usize_to_constant(&params, idx + 2))
+            .collect::<Vec<_>>();
+        let plaintext_values = [5u32, 9u32, 4u32];
+        let plaintext_rows = vec![
+            plaintext_values
+                .iter()
+                .map(|&value| {
+                    Arc::<[u8]>::from(
+                        DCRTPoly::from_usize_to_constant(&params, value as usize)
+                            .to_compact_bytes(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ];
+        let one_pubkey = public_keys[0].clone();
+        let input_pubkey = public_keys[1].clone();
+
+        let pubkey_evaluator =
+            BggPublicKeySTEvaluator::<
+                DCRTPolyMatrix,
+                DCRTPolyUniformSampler,
+                DCRTPolyHashSampler<Keccak256>,
+                DCRTPolyTrapdoorSampler,
+            >::new(hash_key, secret_size, num_slots, SIGMA, 0.0, dir.to_path_buf());
+
+        let mut circuit = PolyCircuit::new();
+        let inputs = circuit.input(1);
+        let extracted_slots = (0..num_slots)
+            .map(|slot| circuit.slot_transfer_gate(inputs[0], &[(slot as u32, None)]))
+            .collect::<Vec<_>>();
+        let weighted_slots = extracted_slots
+            .iter()
+            .enumerate()
+            .map(|(slot, &gate)| circuit.small_scalar_mul(gate, &monomial_scalar(slot)))
+            .collect::<Vec<_>>();
+        let accumulated = weighted_slots[1..]
+            .iter()
+            .fold(weighted_slots[0], |acc, &gate| circuit.add_gate(acc, gate));
+        circuit.output(vec![accumulated]);
+
+        let result_pubkey = circuit.eval(
+            &params,
+            one_pubkey,
+            vec![input_pubkey.clone()],
+            None::<&DummyPubKeyPltEvaluator>,
+            Some(&pubkey_evaluator),
+            None,
+        );
+        assert_eq!(result_pubkey.len(), 1);
+
+        pubkey_evaluator.sample_aux_matrices(&params);
+        wait_for_all_writes(dir.to_path_buf()).await.unwrap();
+        let slot_secret_mats = pubkey_evaluator
+            .load_slot_secret_mats_checkpoint(&params)
+            .expect("slot secret matrix checkpoints should exist after sample_aux_matrices");
+
+        let encoding_sampler =
+            BGGPolyEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
+        let encodings = encoding_sampler.sample(
+            &params,
+            &public_keys,
+            &plaintext_rows,
+            Some(&slot_secret_mats),
+        );
+        let one = encodings[0].clone();
+        let input = encodings[1].clone();
+
+        let s_vec = DCRTPolyMatrix::from_poly_vec_row(&params, secrets.clone());
+        let b0_matrix = pubkey_evaluator
+            .load_b0_matrix_checkpoint(&params)
+            .expect("b0 matrix checkpoint should exist after sample_aux_matrices");
+        let c_b0 = s_vec.clone() * &b0_matrix;
+        let evaluator =
+            BggPolyEncodingSTEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::new(
+                hash_key,
+                dir.to_path_buf(),
+                pubkey_evaluator.checkpoint_prefix(&params),
+                c_b0.to_compact_bytes(),
+            );
+
+        let result = circuit.eval(
+            &params,
+            one,
+            vec![input.clone()],
+            None::<&DummyPolyEncodingPltEvaluator>,
+            Some(&evaluator),
+            Some(1),
+        );
+        assert_eq!(result.len(), 1);
+        let output = &result[0];
+        assert_eq!(output.pubkey, result_pubkey[0]);
+        assert_eq!(output.num_slots(), 1);
+
+        let s_dst = DCRTPolyMatrix::from_compact_bytes(&params, slot_secret_mats[0].as_ref());
+        let gadget_matrix = DCRTPolyMatrix::gadget_matrix(&params, secret_size);
+        let expected_encoding = extracted_slots
+            .iter()
+            .enumerate()
+            .map(|(slot, gate_id)| {
+                let source_plaintext = input
+                    .plaintext(slot)
+                    .expect("input encoding should reveal plaintext constants");
+                let a_out = DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
+                    &params,
+                    hash_key,
+                    format!("slot_transfer_gate_a_out_{}", gate_id),
+                    secret_size,
+                    secret_size * params.modulus_digits(),
+                    DistType::FinRingDist,
+                );
+                let vector = (s_vec.clone() * &s_dst) *
+                    &(a_out.clone() - (gadget_matrix.clone() * &source_plaintext));
+                BggEncoding::new(vector, BggPublicKey::new(a_out, true), Some(source_plaintext))
+                    .small_scalar_mul(&params, &monomial_scalar(slot))
+            })
+            .reduce(|acc, encoding| acc + &encoding)
+            .expect("single-output-slot test requires at least one slot");
+        let expected_plaintext = DCRTPoly::from_u32s(&params, &plaintext_values);
+
+        assert_eq!(output.vector(0), expected_encoding.vector);
+        assert_eq!(output.pubkey, expected_encoding.pubkey);
+        assert_eq!(
+            output
+                .plaintext(0)
+                .expect("single-output-slot output should reveal plaintext polynomial"),
+            expected_plaintext
+        );
+        assert_eq!(expected_encoding.plaintext, Some(expected_plaintext));
     }
 }

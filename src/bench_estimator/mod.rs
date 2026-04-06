@@ -224,7 +224,9 @@ where
         return *summary;
     }
 
-    let mut estimate = CircuitBenchSummary::default();
+    let mut estimate = CircuitBenchSummary::new(0.0, 0.0, 0);
+    #[cfg(feature = "gpu")]
+    let mut peak_vram = 0;
     for CircuitExecutionLayer { sub_circuit_ids, regular_gate_types } in circuit.execution_layers()
     {
         let mut layer_counts: HashMap<PolyGateType, usize> = HashMap::new();
@@ -234,13 +236,13 @@ where
         for sub_circuit_id in sub_circuit_ids {
             let sub_circuit = circuit.registered_sub_circuit(sub_circuit_id);
             let sub_summary =
-                estimate_circuit_bench_with_cache::<E, B>(estimator, sub_circuit, summary_cache);
+                estimate_circuit_bench_with_cache::<E, B>(estimator, &sub_circuit, summary_cache);
             estimate.total_time += sub_summary.total_time;
             layer_latency += sub_summary.latency;
             layer_parallelism = layer_parallelism.max(sub_summary.max_parallelism);
             #[cfg(feature = "gpu")]
             {
-                estimate.peak_vram = estimate.peak_vram.max(sub_summary.peak_vram);
+                peak_vram = peak_vram.max(sub_summary.peak_vram);
             }
         }
 
@@ -263,7 +265,7 @@ where
                 .expect("layer parallelism overflowed u128 while summing gate kinds");
             #[cfg(feature = "gpu")]
             {
-                estimate.peak_vram = estimate.peak_vram.max(gate_estimate.peak_vram);
+                peak_vram = peak_vram.max(gate_estimate.peak_vram);
             }
         }
 
@@ -272,6 +274,17 @@ where
         estimate.latency += layer_latency;
         estimate.max_parallelism = estimate.max_parallelism.max(layer_parallelism);
     }
+
+    let estimate = estimate.with_peak_vram({
+        #[cfg(feature = "gpu")]
+        {
+            peak_vram
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            0
+        }
+    });
 
     summary_cache.insert(circuit_key, estimate);
     estimate

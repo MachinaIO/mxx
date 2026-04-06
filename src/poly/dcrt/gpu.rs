@@ -2,7 +2,7 @@ use crate::{
     element::{PolyElem, finite_ring::FinRingElem},
     impl_binop_with_refs,
     matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
-    poly::{Poly, PolyParams},
+    poly::{Poly, PolyParams, dcrt::params::DCRTPolyParams},
     utils::mod_inverse,
 };
 use num_bigint::BigUint;
@@ -424,6 +424,14 @@ impl PartialEq for GpuDCRTPolyParams {
 }
 
 impl Eq for GpuDCRTPolyParams {}
+
+impl Default for GpuDCRTPolyParams {
+    fn default() -> Self {
+        let cpu_params = DCRTPolyParams::default();
+        let (moduli, _, _) = cpu_params.to_crt();
+        Self::new(cpu_params.ring_dimension(), moduli, cpu_params.base_bits())
+    }
+}
 
 impl PolyParams for GpuDCRTPolyParams {
     type Modulus = Arc<BigUint>;

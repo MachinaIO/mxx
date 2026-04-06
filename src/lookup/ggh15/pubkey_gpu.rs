@@ -1,5 +1,9 @@
 use super::*;
-use crate::{poly::dcrt::gpu::detected_gpu_device_ids, sampler::trapdoor::GpuPreimageRequest};
+use crate::{
+    bench_estimator::{PublicLutSampleAuxBenchEstimator, SampleAuxBenchEstimate},
+    poly::dcrt::gpu::detected_gpu_device_ids,
+    sampler::trapdoor::GpuPreimageRequest,
+};
 
 pub(super) struct GpuLutBaseDeviceShared<M, T>
 where
@@ -395,9 +399,9 @@ where
         lut_id: usize,
         pending: Vec<(GateId, GateState<M>)>,
         shared: &[GpuGateDeviceShared<'_, M, TS::Trapdoor>],
-    ) {
+    ) -> u64 {
         if pending.is_empty() {
-            return;
+            return 0;
         }
 
         let d = self.d;
@@ -413,6 +417,7 @@ where
             "gate stage1 expects b1_matrix to have d rows"
         );
         let mut pending_store_buffers: Option<Vec<BatchLookupBuffer>> = None;
+        let mut total_compact_bytes = 0u64;
 
         let stage1_entries = pending
                 .into_par_iter()
@@ -448,6 +453,7 @@ where
                 target,
             });
         }
+        let mut stage1_compact_bytes = 0u64;
         pipeline_lookup_stage(&mut pending_store_buffers, || {
             let mut stage1_preimages = trap_sampler
                 .preimage_batched_sharded(stage1_requests)
@@ -466,8 +472,12 @@ where
                     )
                 })
                 .collect::<Vec<_>>();
+            stage1_compact_bytes = compact_bytes_job_total(&stage1_jobs);
             prepare_lookup_buffers(stage1_jobs)
         });
+        total_compact_bytes = total_compact_bytes
+            .checked_add(stage1_compact_bytes)
+            .expect("public LUT gpu stage1 compact_bytes overflowed u64");
 
         let stage2_entries = stage2_inputs
                 .into_par_iter()
@@ -508,6 +518,7 @@ where
                 target,
             });
         }
+        let mut stage2_compact_bytes = 0u64;
         pipeline_lookup_stage(&mut pending_store_buffers, || {
             let mut stage2_preimages = trap_sampler
                 .preimage_batched_sharded(stage2_requests)
@@ -530,9 +541,14 @@ where
                     )
                 })
                 .collect::<Vec<_>>();
+            stage2_compact_bytes = compact_bytes_job_total(&stage2_jobs);
             prepare_lookup_buffers(stage2_jobs)
         });
+        total_compact_bytes = total_compact_bytes
+            .checked_add(stage2_compact_bytes)
+            .expect("public LUT gpu stage2 compact_bytes overflowed u64");
 
+        let mut stage3_compact_bytes = 0u64;
         pipeline_lookup_stage(&mut pending_store_buffers, || {
             let stage3_requests = stage3_inputs
                 .iter()
@@ -573,8 +589,12 @@ where
                     )
                 })
                 .collect::<Vec<_>>();
+            stage3_compact_bytes = compact_bytes_job_total(&stage3_jobs);
             prepare_lookup_buffers(stage3_jobs)
         });
+        total_compact_bytes = total_compact_bytes
+            .checked_add(stage3_compact_bytes)
+            .expect("public LUT gpu stage3 compact_bytes overflowed u64");
 
         let stage4_entries = stage3_inputs
                 .into_par_iter()
@@ -619,6 +639,7 @@ where
                 target,
             });
         }
+        let mut stage4_compact_bytes = 0u64;
         pipeline_lookup_stage(&mut pending_store_buffers, || {
             let mut stage4_preimages = trap_sampler
                 .preimage_batched_sharded(stage4_requests)
@@ -641,13 +662,18 @@ where
                     )
                 })
                 .collect::<Vec<_>>();
+            stage4_compact_bytes = compact_bytes_job_total(&stage4_jobs);
             prepare_lookup_buffers(stage4_jobs)
         });
+        total_compact_bytes = total_compact_bytes
+            .checked_add(stage4_compact_bytes)
+            .expect("public LUT gpu stage4 compact_bytes overflowed u64");
 
         for chunk_idx in 0..k_small {
             let chunk_col_start =
                 chunk_idx.checked_mul(m_g).expect("stage5 chunk start column overflow");
             let chunk_col_end = chunk_col_start + m_g;
+            let mut stage5_compact_bytes = 0u64;
             pipeline_lookup_stage(&mut pending_store_buffers, || {
                 let stage5_requests = stage5_inputs
                     .iter()
@@ -712,13 +738,18 @@ where
                         )
                     })
                     .collect::<Vec<_>>();
+                stage5_compact_bytes = compact_bytes_job_total(&stage5_jobs);
                 prepare_lookup_buffers(stage5_jobs)
             });
+            total_compact_bytes = total_compact_bytes
+                .checked_add(stage5_compact_bytes)
+                .expect("public LUT gpu stage5 compact_bytes overflowed u64");
         }
 
         if let Some(previous_buffers) = pending_store_buffers.take() {
             store_lookup_buffers(previous_buffers);
         }
+        total_compact_bytes
     }
 
     #[cfg(feature = "gpu")]
@@ -936,6 +967,88 @@ where
                 Self::format_duration(start.elapsed())
             );
         }
+    }
+}
+
+impl<M, US, HS, TS> PublicLutSampleAuxBenchEstimator for GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
+where
+    M: PolyMatrix + Send + Sync + 'static,
+    US: PolyUniformSampler<M = M> + Send + Sync,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    TS: PolyTrapdoorSampler<M = M> + Send + Sync,
+    M::P: 'static,
+    <M::P as Poly>::Params: Default,
+{
+    fn sample_aux_matrices_lut_entry_time(&self) -> SampleAuxBenchEstimate {
+        let params = <M::P as Poly>::Params::default();
+        let lut_id = 0usize;
+        let trap_sampler = TS::new(&params, self.trapdoor_sigma);
+        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, self.d);
+        let gpu_lut_base_shared =
+            self.prepare_gpu_lut_base_device_shared(&params, &b1_trapdoor, &b1_matrix);
+        let gpu_lut_shared = self.prepare_gpu_lut_device_shared(lut_id, &gpu_lut_base_shared);
+        let batch =
+            vec![(0usize, 0usize, M::P::from_usize_to_constant(gpu_lut_shared[0].params, 1usize))];
+        let start = Instant::now();
+        let jobs = self.sample_lut_preimages_gpu(
+            &params,
+            lut_id,
+            "bench_lut_aux",
+            &gpu_lut_shared,
+            &batch,
+        );
+        let elapsed = start.elapsed().as_secs_f64();
+        SampleAuxBenchEstimate {
+            latency: elapsed,
+            total_time: elapsed,
+            compact_bytes: compact_bytes_job_total(&jobs),
+        }
+    }
+
+    fn sample_aux_matrices_lut_gate_time(&self) -> SampleAuxBenchEstimate {
+        let params = <M::P as Poly>::Params::default();
+        let lut_id = 0usize;
+        let trap_sampler = TS::new(&params, self.trapdoor_sigma);
+        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(&params, self.d);
+        let (_b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, self.d);
+        let gpu_gate_base_shared =
+            self.prepare_gpu_gate_base_device_shared(&params, &b0_trapdoor, &b0_matrix, &b1_matrix);
+        let w_block_identity = self.derive_w_block_identity(&params, lut_id);
+        let w_block_gy = self.derive_w_block_gy(&params, lut_id);
+        let w_block_v = self.derive_w_block_v(&params, lut_id);
+        let w_block_vx = self.derive_w_block_vx(&params, lut_id);
+        let w_block_identity_by_device =
+            self.copy_matrix_to_gpu_gate_devices(&w_block_identity, &gpu_gate_base_shared);
+        let w_block_gy_by_device =
+            self.copy_matrix_to_gpu_gate_devices(&w_block_gy, &gpu_gate_base_shared);
+        let w_block_v_by_device =
+            self.copy_matrix_to_gpu_gate_devices(&w_block_v, &gpu_gate_base_shared);
+        let w_block_vx_by_device =
+            self.copy_matrix_to_gpu_gate_devices(&w_block_vx, &gpu_gate_base_shared);
+        let gpu_gate_shared = self.prepare_gpu_gate_device_shared(
+            &gpu_gate_base_shared,
+            w_block_identity_by_device,
+            w_block_gy_by_device,
+            w_block_v_by_device,
+            w_block_vx_by_device,
+        );
+        let input_pubkey_bytes = M::gadget_matrix(&params, self.d).into_compact_bytes();
+        let start = Instant::now();
+        let compact_bytes = self.sample_gate_preimages_batch_gpu(
+            &params,
+            lut_id,
+            vec![(
+                GateId(0),
+                GateState {
+                    lut_id,
+                    input_pubkey_bytes: input_pubkey_bytes.clone(),
+                    _m: PhantomData,
+                },
+            )],
+            &gpu_gate_shared,
+        );
+        let elapsed = start.elapsed().as_secs_f64();
+        SampleAuxBenchEstimate { latency: elapsed, total_time: elapsed, compact_bytes }
     }
 }
 

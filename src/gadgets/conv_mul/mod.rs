@@ -293,50 +293,30 @@ pub fn negacyclic_conv_mul_right_sparse<P: Poly + 'static>(
     let total_start = Instant::now();
     let active_levels = lhs.active_q_moduli().len();
     let level_offset = lhs.level_offset;
-    let parallel_build_start = Instant::now();
-    let diagonal_subcircuits = (0..num_slots)
-        .into_par_iter()
-        .map(|diagonal| {
-            diagonal_term_right_sparse_subcircuit(
-                params,
-                lhs.ctx.as_ref(),
-                active_levels,
-                level_offset,
-                rhs_q_idx,
-                diagonal,
-                num_slots,
-            )
-        })
-        .collect::<Vec<_>>();
-    let diagonal_output_templates = (0..num_slots)
-        .into_par_iter()
-        .map(|diagonal| {
-            diagonal_term_output_template(
-                lhs,
-                rhs,
-                diagonal,
-                num_slots,
-                |lhs_diagonal, rhs_rotated, circuit| {
-                    lhs_diagonal.mul_right_sparse(rhs_rotated, rhs_q_idx, circuit)
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    debug!(
-        "negacyclic_conv_mul_right_sparse built {} diagonal subcircuits in parallel: num_slots={}, active_levels={}, elapsed_ms={}",
-        diagonal_subcircuits.len(),
-        num_slots,
-        active_levels,
-        parallel_build_start.elapsed().as_millis()
-    );
     let mut shared_inputs = flatten_nested_rns_poly(lhs);
     shared_inputs.extend(flatten_nested_rns_poly(rhs));
     let instantiate_start = Instant::now();
     let mut diagonal_terms = Vec::with_capacity(num_slots);
-    for (diagonal_subcircuit, output_template) in
-        diagonal_subcircuits.into_iter().zip(diagonal_output_templates.into_iter())
-    {
+    for diagonal in 0..num_slots {
+        let diagonal_subcircuit = diagonal_term_right_sparse_subcircuit(
+            params,
+            lhs.ctx.as_ref(),
+            active_levels,
+            level_offset,
+            rhs_q_idx,
+            diagonal,
+            num_slots,
+        );
         let subcircuit_id = circuit.register_sub_circuit(diagonal_subcircuit);
+        let output_template = diagonal_term_output_template(
+            lhs,
+            rhs,
+            diagonal,
+            num_slots,
+            |lhs_diagonal, rhs_rotated, circuit| {
+                lhs_diagonal.mul_right_sparse(rhs_rotated, rhs_q_idx, circuit)
+            },
+        );
         let outputs = circuit.call_sub_circuit(subcircuit_id, &shared_inputs);
         diagonal_terms.push(nested_rns_from_flat_outputs(
             lhs,
@@ -346,8 +326,10 @@ pub fn negacyclic_conv_mul_right_sparse<P: Poly + 'static>(
         ));
     }
     debug!(
-        "negacyclic_conv_mul_right_sparse registered/called {} diagonal subcircuits: elapsed_ms={}",
+        "negacyclic_conv_mul_right_sparse built/registered/called {} diagonal subcircuits sequentially: num_slots={}, active_levels={}, elapsed_ms={}",
         diagonal_terms.len(),
+        num_slots,
+        active_levels,
         instantiate_start.elapsed().as_millis()
     );
     let reduction_start = Instant::now();

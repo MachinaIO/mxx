@@ -523,6 +523,7 @@ mod tests {
     use num_traits::ToPrimitive;
     use rand::Rng;
     use std::{collections::HashSet, sync::Arc};
+    use tempfile::tempdir;
 
     const BASE_BITS: u32 = 6;
     const CRT_BITS: usize = 12;
@@ -531,21 +532,41 @@ mod tests {
     const SCALE: u64 = 1 << 8;
     const NUM_SLOTS: usize = 2;
 
-    fn create_test_context(
+    fn create_test_context_with(
         circuit: &mut PolyCircuit<DCRTPoly>,
+        ring_dim: u32,
+        num_slots: usize,
+        active_levels: usize,
+        crt_bits: usize,
+        p_moduli_bits: usize,
+        max_unused_muls: usize,
     ) -> (DCRTPolyParams, Arc<RingGswContext<DCRTPoly>>) {
-        let params = DCRTPolyParams::new(NUM_SLOTS as u32, ACTIVE_LEVELS, CRT_BITS, BASE_BITS);
+        let params = DCRTPolyParams::new(ring_dim, active_levels, crt_bits, BASE_BITS);
         let ctx = Arc::new(RingGswContext::setup(
             circuit,
             &params,
-            NUM_SLOTS,
-            P_MODULI_BITS,
-            DEFAULT_MAX_UNREDUCED_MULS,
+            num_slots,
+            p_moduli_bits,
+            max_unused_muls,
             SCALE,
-            Some(ACTIVE_LEVELS),
+            Some(active_levels),
             None,
         ));
         (params, ctx)
+    }
+
+    fn create_test_context(
+        circuit: &mut PolyCircuit<DCRTPoly>,
+    ) -> (DCRTPolyParams, Arc<RingGswContext<DCRTPoly>>) {
+        create_test_context_with(
+            circuit,
+            NUM_SLOTS as u32,
+            NUM_SLOTS,
+            ACTIVE_LEVELS,
+            CRT_BITS,
+            P_MODULI_BITS,
+            DEFAULT_MAX_UNREDUCED_MULS,
+        )
     }
 
     fn sample_hash_key() -> [u8; 32] {
@@ -780,5 +801,49 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    #[ignore = "expensive circuit-structure reporting test; run with --ignored --nocapture"]
+    fn test_goldreich_ring_gsw_large_circuit_non_free_depth_metrics() {
+        let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+        let ring_dim = 1u32 << 10;
+        let num_slots = 1usize << 10;
+        let active_levels = 1usize;
+        let crt_bits = 24usize;
+        let p_moduli_bits = 7usize;
+        let max_unused_muls = 4usize;
+
+        let disk_dir = tempdir().expect("create temp dir for disk-backed sub-circuits");
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        circuit.enable_subcircuits_in_disk(disk_dir.path());
+        let (_params, ring_gsw) = create_test_context_with(
+            &mut circuit,
+            ring_dim,
+            num_slots,
+            active_levels,
+            crt_bits,
+            p_moduli_bits,
+            max_unused_muls,
+        );
+        let graph_seed = sample_graph_seed();
+        let goldreich = GoldreichFhePrg::setup(ring_gsw.clone(), 5, 1, graph_seed);
+        let encrypted_inputs = (0..goldreich.input_size)
+            .map(|_| RingGswCiphertext::input(ring_gsw.clone(), &mut circuit))
+            .collect::<Vec<_>>();
+        let encrypted_outputs = goldreich.evaluate(&encrypted_inputs, &mut circuit);
+        let reconstructed_outputs = encrypted_outputs
+            .iter()
+            .flat_map(|ciphertext| ciphertext.reconstruct(&mut circuit))
+            .collect::<Vec<_>>();
+        circuit.output(reconstructed_outputs);
+
+        println!(
+            "goldreich ring_gsw metrics: crt_bits={crt_bits}, active_levels={active_levels}, ring_dim={ring_dim}, num_slots={num_slots}"
+        );
+        let depth = circuit.non_free_depth();
+        println!("goldreich ring_gsw non-free depth {}", depth);
+        println!("goldreich ring_gsw gate counts {:?}", circuit.count_gates_by_type_vec());
     }
 }

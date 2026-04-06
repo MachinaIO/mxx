@@ -4,6 +4,8 @@
 #[path = "pubkey_gpu.rs"]
 mod gpu;
 
+#[cfg(not(feature = "gpu"))]
+use crate::bench_estimator::{PublicLutSampleAuxBenchEstimator, SampleAuxBenchEstimate};
 use crate::{
     bgg::public_key::BggPublicKey,
     circuit::{evaluable::Evaluable, gate::GateId},
@@ -76,6 +78,20 @@ where
     fn wait_then_store(self) {
         let _ = add_lookup_buffer(self.into_lookup_buffer());
     }
+}
+
+fn compact_bytes_job_total<M>(jobs: &[CompactBytesJob<M>]) -> u64
+where
+    M: PolyMatrix,
+{
+    jobs.iter().flat_map(|job| job.matrices.iter()).fold(0u64, |total, (_, matrix)| {
+        total
+            .checked_add(
+                u64::try_from(matrix.to_compact_bytes().len())
+                    .expect("compact_bytes length overflowed u64"),
+            )
+            .expect("compact_bytes total overflowed u64")
+    })
 }
 
 pub(crate) fn derive_lut_v_idx_from_hash<M, HS>(
@@ -382,15 +398,16 @@ where
         w_block_gy: &M,
         w_block_v: &M,
         w_block_vx: &M,
-    ) {
+    ) -> Vec<CompactBytesJob<M>> {
         if pending.is_empty() {
-            return;
+            return Vec::new();
         }
         let d = self.d;
         let m_g = d * params.modulus_digits();
         let k_small = small_gadget_chunk_count::<M>(params);
         debug_assert_eq!(b1_matrix.row_size(), d, "gate stage1 expects b1_matrix rows = d");
         let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let mut jobs = Vec::new();
 
         let stage1_entries = pending
             .into_par_iter()
@@ -444,7 +461,7 @@ where
                 )
             })
             .collect::<Vec<_>>();
-        stage1_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+        jobs.extend(stage1_jobs);
 
         let stage2_entries = stage2_inputs
             .into_par_iter()
@@ -508,7 +525,7 @@ where
                 )
             })
             .collect::<Vec<_>>();
-        stage2_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+        jobs.extend(stage2_jobs);
 
         let stage3_entries = stage3_inputs
             .into_par_iter()
@@ -561,7 +578,7 @@ where
                 )
             })
             .collect::<Vec<_>>();
-        stage3_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+        jobs.extend(stage3_jobs);
 
         let stage4_entries = stage4_inputs
             .into_par_iter()
@@ -631,7 +648,7 @@ where
                 )
             })
             .collect::<Vec<_>>();
-        stage4_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+        jobs.extend(stage4_jobs);
 
         let small_gadget_matrix = M::small_gadget_matrix(params, m_g);
         let stage5_entries = stage5_inputs
@@ -710,7 +727,8 @@ where
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        stage5_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+        jobs.extend(stage5_jobs);
+        jobs
     }
 
     fn format_duration(duration: Duration) -> String {
@@ -1681,7 +1699,9 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                             &w_block_gy,
                             &w_block_v,
                             &w_block_vx,
-                        );
+                        )
+                        .into_par_iter()
+                        .for_each(CompactBytesJob::wait_then_store);
                         let gate_preimage_batch_elapsed = gate_preimage_batch_start.elapsed();
                         debug!(
                             "Finished sampling gate preimages batch: lut_id={}, batch_size={}, elapsed={}",
@@ -1721,6 +1741,87 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
             resumed_lut_rows,
             resumed_gates
         );
+    }
+}
+
+#[cfg(not(feature = "gpu"))]
+impl<M, US, HS, TS> PublicLutSampleAuxBenchEstimator for GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
+where
+    M: PolyMatrix + Send + Sync + 'static,
+    US: PolyUniformSampler<M = M> + Send + Sync,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    TS: PolyTrapdoorSampler<M = M> + Send + Sync,
+    M::P: 'static,
+    <M::P as Poly>::Params: Default,
+{
+    fn sample_aux_matrices_lut_entry_time(&self) -> SampleAuxBenchEstimate {
+        let params = <M::P as Poly>::Params::default();
+        let lut_id = 0usize;
+        let trap_sampler = TS::new(&params, self.trapdoor_sigma);
+        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, self.d);
+        let w_block_identity = self.derive_w_block_identity(&params, lut_id);
+        let w_block_gy = self.derive_w_block_gy(&params, lut_id);
+        let w_block_v = self.derive_w_block_v(&params, lut_id);
+        let w_block_vx = self.derive_w_block_vx(&params, lut_id);
+        let batch = vec![(0usize, M::P::from_usize_to_constant(&params, 1usize))];
+        let start = Instant::now();
+        let jobs = self.sample_lut_preimages(
+            &params,
+            lut_id,
+            "bench_lut_aux",
+            &b1_trapdoor,
+            &b1_matrix,
+            &w_block_identity,
+            &w_block_gy,
+            &w_block_v,
+            &w_block_vx,
+            &batch,
+        );
+        let elapsed = start.elapsed().as_secs_f64();
+        SampleAuxBenchEstimate {
+            latency: elapsed,
+            total_time: elapsed,
+            compact_bytes: compact_bytes_job_total(&jobs),
+        }
+    }
+
+    fn sample_aux_matrices_lut_gate_time(&self) -> SampleAuxBenchEstimate {
+        let params = <M::P as Poly>::Params::default();
+        let lut_id = 0usize;
+        let trap_sampler = TS::new(&params, self.trapdoor_sigma);
+        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(&params, self.d);
+        let (_b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, self.d);
+        let w_block_identity = self.derive_w_block_identity(&params, lut_id);
+        let w_block_gy = self.derive_w_block_gy(&params, lut_id);
+        let w_block_v = self.derive_w_block_v(&params, lut_id);
+        let w_block_vx = self.derive_w_block_vx(&params, lut_id);
+        let input_pubkey_bytes = M::gadget_matrix(&params, self.d).into_compact_bytes();
+        let start = Instant::now();
+        let jobs = self.sample_gate_preimages_batch(
+            &params,
+            lut_id,
+            vec![(
+                GateId(0),
+                GateState {
+                    lut_id,
+                    input_pubkey_bytes: input_pubkey_bytes.clone(),
+                    _m: PhantomData,
+                },
+            )],
+            &b0_trapdoor,
+            &b0_matrix,
+            &b1_matrix,
+            &w_block_identity,
+            &w_block_gy,
+            &w_block_v,
+            &w_block_vx,
+        );
+        let elapsed = start.elapsed().as_secs_f64();
+        SampleAuxBenchEstimate {
+            latency: elapsed,
+            total_time: elapsed,
+            compact_bytes: compact_bytes_job_total(&jobs),
+        }
     }
 }
 

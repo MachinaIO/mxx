@@ -1,5 +1,5 @@
 use crate::{
-    circuit::{PolyCircuit, evaluable::PolyVec, gate::GateId},
+    circuit::{PolyCircuit, SubCircuitDiskStorage, evaluable::PolyVec, gate::GateId},
     gadgets::{
         arith::{
             NestedRnsPoly, NestedRnsPolyContext, nested_rns_gadget_decomposed,
@@ -374,6 +374,19 @@ impl<P: Poly> RingGswContext<P> {
 }
 
 impl<P: Poly + 'static> RingGswContext<P> {
+    fn shared_helper_storage(
+        storage: Option<SubCircuitDiskStorage>,
+        prefix: &str,
+    ) -> SubCircuitDiskStorage {
+        storage.unwrap_or_else(|| SubCircuitDiskStorage::temporary(prefix))
+    }
+
+    fn helper_circuit_with_storage(storage: &SubCircuitDiskStorage) -> PolyCircuit<P> {
+        let mut circuit = PolyCircuit::<P>::new();
+        circuit.use_subcircuit_disk_storage(storage.clone());
+        circuit
+    }
+
     fn mul_sparse_entry_subcircuit(
         params: &P::Params,
         num_slots: usize,
@@ -383,8 +396,9 @@ impl<P: Poly + 'static> RingGswContext<P> {
         gadget_entry_idx: usize,
         rhs_max_plaintexts: Vec<BigUint>,
         rhs_p_max_traces: Vec<BigUint>,
+        sub_circuit_storage: SubCircuitDiskStorage,
     ) -> PolyCircuit<P> {
-        let mut circuit = PolyCircuit::<P>::new();
+        let mut circuit = Self::helper_circuit_with_storage(&sub_circuit_storage);
         let ctx = Arc::new(template_ctx.register_subcircuits_in(&mut circuit));
         let (lhs_max_plaintexts, lhs_p_max_traces) =
             ctx.full_reduce_output_metadata(Some(active_levels), Some(level_offset));
@@ -459,6 +473,8 @@ impl<P: Poly + 'static> RingGswContext<P> {
             nested_rns_start.elapsed().as_millis()
         );
         let width = 2 * active_levels * (nested_rns.p_moduli.len() + 1);
+        let helper_storage =
+            Self::shared_helper_storage(circuit.cloned_subcircuit_disk_storage(), "ring-gsw");
         let helper_build_start = Instant::now();
         let (mul_subcircuit, mul_output_template) = Self::mul_subcircuit(
             params,
@@ -467,6 +483,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
             active_levels,
             level_offset,
             width,
+            helper_storage,
         );
         debug!(
             "RingGswContext::setup mul helper subcircuit built: width={}, elapsed_ms={}",
@@ -498,9 +515,10 @@ impl<P: Poly + 'static> RingGswContext<P> {
         active_levels: usize,
         level_offset: usize,
         width: usize,
+        sub_circuit_storage: SubCircuitDiskStorage,
     ) -> (PolyCircuit<P>, NestedRnsPoly<P>) {
         let start = Instant::now();
-        let mut circuit = PolyCircuit::<P>::new();
+        let mut circuit = Self::helper_circuit_with_storage(&sub_circuit_storage);
         let nested_rns = Arc::new(template_ctx.register_subcircuits_in(&mut circuit));
         let (normalized_max_plaintexts, normalized_p_max_traces) =
             nested_rns.full_reduce_output_metadata(Some(active_levels), Some(level_offset));
@@ -513,6 +531,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
             active_levels,
             level_offset,
             width,
+            sub_circuit_storage.clone(),
         );
         let mul_column_subcircuit_id = circuit.register_sub_circuit(mul_column_subcircuit);
         debug!(
@@ -663,15 +682,16 @@ impl<P: Poly + 'static> RingGswContext<P> {
         active_levels: usize,
         level_offset: usize,
         width: usize,
+        sub_circuit_storage: SubCircuitDiskStorage,
     ) -> (PolyCircuit<P>, NestedRnsPoly<P>) {
         let start = Instant::now();
-        let mut circuit = PolyCircuit::<P>::new();
+        let mut circuit = Self::helper_circuit_with_storage(&sub_circuit_storage);
         let nested_rns = Arc::new(template_ctx.register_subcircuits_in(&mut circuit));
         let (normalized_max_plaintexts, normalized_p_max_traces) =
             nested_rns.full_reduce_output_metadata(Some(active_levels), Some(level_offset));
         let dot_helper_start = Instant::now();
         let (local_dot_row_with_column_subcircuit_id, local_dot_output_template) = {
-            let mut helper_circuit = PolyCircuit::<P>::new();
+            let mut helper_circuit = Self::helper_circuit_with_storage(&sub_circuit_storage);
             let helper_ctx = Arc::new(template_ctx.register_subcircuits_in(&mut helper_circuit));
             let (helper_max_plaintexts, helper_p_max_traces) =
                 helper_ctx.full_reduce_output_metadata(Some(active_levels), Some(level_offset));
@@ -690,22 +710,23 @@ impl<P: Poly + 'static> RingGswContext<P> {
                 gadget_len
             );
             let product_subcircuits_start = Instant::now();
-            let product_subcircuits = (0..width)
-                .map(|col_idx| {
-                    Self::mul_sparse_entry_subcircuit(
-                        params,
-                        num_slots,
-                        template_ctx,
-                        active_levels,
-                        level_offset,
-                        col_idx % gadget_len,
-                        gadget_entry_metadata_templates[col_idx % gadget_len].0.clone(),
-                        gadget_entry_metadata_templates[col_idx % gadget_len].1.clone(),
-                    )
-                })
-                .collect::<Vec<_>>();
+            let mut product_subcircuit_ids = Vec::with_capacity(width);
+            for col_idx in 0..width {
+                let subcircuit = Self::mul_sparse_entry_subcircuit(
+                    params,
+                    num_slots,
+                    template_ctx,
+                    active_levels,
+                    level_offset,
+                    col_idx % gadget_len,
+                    gadget_entry_metadata_templates[col_idx % gadget_len].0.clone(),
+                    gadget_entry_metadata_templates[col_idx % gadget_len].1.clone(),
+                    sub_circuit_storage.clone(),
+                );
+                product_subcircuit_ids.push(helper_circuit.register_sub_circuit(subcircuit));
+            }
             debug!(
-                "RingGswContext::mul_column_subcircuit product helpers built: width={}, elapsed_ms={}",
+                "RingGswContext::mul_column_subcircuit product helpers built/registered: width={}, elapsed_ms={}",
                 width,
                 product_subcircuits_start.elapsed().as_millis()
             );
@@ -733,13 +754,10 @@ impl<P: Poly + 'static> RingGswContext<P> {
                     )
                 })
                 .collect::<Vec<_>>();
-            let product_subcircuit_ids = product_subcircuits
-                .into_iter()
-                .map(|subcircuit| helper_circuit.register_sub_circuit(subcircuit))
-                .collect::<Vec<_>>();
             let product_output_templates = (0..width)
                 .map(|col_idx| {
-                    let mut template_circuit = PolyCircuit::<P>::new();
+                    let mut template_circuit =
+                        Self::helper_circuit_with_storage(&sub_circuit_storage);
                     let template_ctx =
                         Arc::new(row[col_idx].ctx.register_subcircuits_in(&mut template_circuit));
                     let lhs = NestedRnsPoly::input_like_with_ctx(
@@ -1817,7 +1835,7 @@ mod tests {
     #[test]
     #[ignore = "expensive circuit-structure reporting test; run with --ignored --nocapture"]
     fn test_ring_gsw_mul_large_circuit_metrics() {
-        let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+        let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
         let crt_bits = 24usize;
         let crt_depth = 1usize;
         let ring_dim = 1u32 << 10;

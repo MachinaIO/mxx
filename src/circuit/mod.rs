@@ -142,6 +142,12 @@ impl SubCircuitDiskStorage {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CircuitExecutionLayer {
+    pub(crate) sub_circuit_ids: Vec<usize>,
+    pub(crate) regular_gate_types: Vec<PolyGateType>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PolyCircuit<P: Poly> {
     gates: BTreeMap<GateId, PolyGate>,
@@ -892,6 +898,37 @@ impl<P: Poly> PolyCircuit<P> {
             levels[level].push(gate_id);
         }
         levels
+    }
+
+    pub(crate) fn execution_layers(&self) -> Vec<CircuitExecutionLayer> {
+        self.compute_levels()
+            .into_iter()
+            .map(|level| {
+                let mut seen_call_ids = HashSet::new();
+                let mut sub_circuit_ids = Vec::new();
+                let mut regular_gate_types = Vec::new();
+                for gate_id in level {
+                    let gate = self.gates.get(&gate_id).expect("gate not found");
+                    match &gate.gate_type {
+                        PolyGateType::SubCircuitOutput { call_id, .. } => {
+                            if seen_call_ids.insert(*call_id) {
+                                let call = self
+                                    .sub_circuit_calls
+                                    .get(call_id)
+                                    .expect("sub-circuit call missing");
+                                sub_circuit_ids.push(call.sub_circuit_id);
+                            }
+                        }
+                        _ => regular_gate_types.push(gate.gate_type.clone()),
+                    }
+                }
+                CircuitExecutionLayer { sub_circuit_ids, regular_gate_types }
+            })
+            .collect()
+    }
+
+    pub(crate) fn registered_sub_circuit(&self, circuit_id: usize) -> Self {
+        self.with_sub_circuit(circuit_id, Clone::clone)
     }
 
     /// Returns the circuit depth defined as the maximum level index among

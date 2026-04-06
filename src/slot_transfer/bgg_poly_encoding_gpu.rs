@@ -67,7 +67,7 @@ where
     M::P: Send + Sync,
     for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
 {
-    let slot_count = input.num_slots();
+    let slot_count = src_slots.len();
     let shared_by_device = prepare_slot_transfer_shared_by_device::<M, HS>(
         evaluator,
         params,

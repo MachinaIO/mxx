@@ -587,10 +587,9 @@ where
         src_slots: &[(u32, Option<u32>)],
         gate_id: GateId,
     ) -> BggPublicKey<M> {
-        assert_eq!(
-            src_slots.len(),
-            self.num_slots,
-            "source slot count {} does not match evaluator num_slots {}",
+        assert!(
+            src_slots.len() <= self.num_slots,
+            "output slot count {} exceeds evaluator num_slots {}",
             src_slots.len(),
             self.num_slots
         );
@@ -608,6 +607,16 @@ where
             input.matrix.col_size(),
             self.secret_size * params.modulus_digits()
         );
+        for (dst_slot, (src_slot, _scalar)) in src_slots.iter().enumerate() {
+            let src_slot = usize::try_from(*src_slot).expect("source slot index must fit in usize");
+            assert!(
+                src_slot < self.num_slots,
+                "source slot index {} out of range for evaluator num_slots {} at dst_slot {}",
+                src_slot,
+                self.num_slots,
+                dst_slot
+            );
+        }
 
         self.gate_states.insert(
             gate_id,
@@ -672,6 +681,7 @@ mod tests {
         }
     }
 
+    #[sequential_test::sequential]
     #[test]
     fn test_slot_transfer_bgg_public_key_records_gate_state_and_hashes_output_matrix() {
         let params = DCRTPolyParams::default();
@@ -740,9 +750,85 @@ mod tests {
         assert_eq!(stored.src_slots, src_slots);
     }
 
+    #[sequential_test::sequential]
     #[test]
-    #[should_panic(expected = "source slot count 1 does not match evaluator num_slots 2")]
-    fn test_slot_transfer_bgg_public_key_rejects_unexpected_slot_count() {
+    fn test_slot_transfer_bgg_public_key_accepts_smaller_output_slot_count() {
+        let params = DCRTPolyParams::default();
+        let hash_key = [0x19u8; 32];
+        let secret_size = 2usize;
+        let num_slots = 3usize;
+        let m_g = secret_size * params.modulus_digits();
+        let input_pubkey = BggPublicKey::new(
+            DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
+                &params,
+                hash_key,
+                "slot_transfer_small_output_input".to_string(),
+                secret_size,
+                m_g,
+                DistType::FinRingDist,
+            ),
+            true,
+        );
+        let one = BggPublicKey::new(
+            DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
+                &params,
+                hash_key,
+                "slot_transfer_small_output_one".to_string(),
+                secret_size,
+                m_g,
+                DistType::FinRingDist,
+            ),
+            true,
+        );
+
+        let mut circuit = PolyCircuit::new();
+        let inputs = circuit.input(1);
+        let src_slots = [(2, None)];
+        let transferred = circuit.slot_transfer_gate(inputs[0], &src_slots);
+        circuit.output(vec![transferred]);
+
+        let evaluator = BggPublicKeySTEvaluator::<
+            DCRTPolyMatrix,
+            DCRTPolyUniformSampler,
+            DCRTPolyHashSampler<Keccak256>,
+            DCRTPolyTrapdoorSampler,
+        >::new(
+            hash_key,
+            secret_size,
+            num_slots,
+            SIGMA,
+            0.0,
+            "test_data/test_slot_transfer_small_output".into(),
+        );
+        let result = circuit.eval(
+            &params,
+            one,
+            vec![input_pubkey.clone()],
+            None::<&DummyPubKeyPltEvaluator>,
+            Some(&evaluator),
+            None,
+        );
+
+        assert_eq!(result.len(), 1);
+        let expected_matrix = DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
+            &params,
+            hash_key,
+            format!("slot_transfer_gate_a_out_{}", transferred),
+            secret_size,
+            m_g,
+            DistType::FinRingDist,
+        );
+        assert_eq!(result[0], BggPublicKey::new(expected_matrix, true));
+
+        let stored = evaluator.gate_state(transferred).expect("missing stored gate state");
+        assert_eq!(stored.input_pubkey_bytes, input_pubkey.matrix.to_compact_bytes());
+        assert_eq!(stored.src_slots, src_slots);
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    #[should_panic(expected = "output slot count 3 exceeds evaluator num_slots 2")]
+    fn test_slot_transfer_bgg_public_key_rejects_output_slot_count_exceeding_num_slots() {
         let params = DCRTPolyParams::default();
         let input_pubkey = BggPublicKey::new(
             DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
@@ -774,7 +860,53 @@ mod tests {
             &evaluator,
             &params,
             &input_pubkey,
-            &[(0, None)],
+            &[(0, None), (1, None), (0, Some(2))],
+            crate::circuit::gate::GateId(9),
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    #[should_panic(
+        expected = "source slot index 2 out of range for evaluator num_slots 2 at dst_slot 0"
+    )]
+    fn test_slot_transfer_bgg_public_key_rejects_out_of_range_source_slot() {
+        let params = DCRTPolyParams::default();
+        let input_pubkey = BggPublicKey::new(
+            DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
+                &params,
+                [0x25u8; 32],
+                "slot_transfer_bad_source_slot_input".to_string(),
+                2,
+                2 * params.modulus_digits(),
+                DistType::FinRingDist,
+            ),
+            true,
+        );
+        let evaluator = BggPublicKeySTEvaluator::<
+            DCRTPolyMatrix,
+            DCRTPolyUniformSampler,
+            DCRTPolyHashSampler<Keccak256>,
+            DCRTPolyTrapdoorSampler,
+        >::new(
+            [0x25u8; 32],
+            2,
+            2,
+            SIGMA,
+            0.0,
+            "test_data/test_slot_transfer_bad_source".into(),
+        );
+
+        let _ = <BggPublicKeySTEvaluator<
+            DCRTPolyMatrix,
+            DCRTPolyUniformSampler,
+            DCRTPolyHashSampler<Keccak256>,
+            DCRTPolyTrapdoorSampler,
+        > as crate::slot_transfer::SlotTransferEvaluator<BggPublicKey<DCRTPolyMatrix>>>::slot_transfer(
+            &evaluator,
+            &params,
+            &input_pubkey,
+            &[(2, None)],
             crate::circuit::gate::GateId(9),
         );
     }

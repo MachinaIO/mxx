@@ -22,7 +22,7 @@ use crate::{
 use bigdecimal::BigDecimal;
 use keccak_asm::Keccak256;
 use num_bigint::BigUint;
-use num_traits::{ToPrimitive, Zero};
+use num_traits::{FromPrimitive, ToPrimitive, Zero};
 use rayon::prelude::*;
 use std::{sync::Arc, time::Instant};
 use tracing::debug;
@@ -291,17 +291,17 @@ pub fn encrypt_plaintext_bit<B: AsRef<[u8]>>(
     [ciphertext.get_row(0), ciphertext.get_row(1)]
 }
 
-pub fn ciphertext_inputs_from_native(
-    params: &DCRTPolyParams,
+pub fn ciphertext_inputs_from_native<P: Poly>(
+    params: &P::Params,
     ctx: &NestedRnsPolyContext,
     ciphertext: &NativeRingGswCiphertext,
     level_offset: usize,
     enable_levels: Option<usize>,
-) -> Vec<PolyVec<DCRTPoly>> {
+) -> Vec<PolyVec<P>> {
     let mut inputs = Vec::new();
     for row in ciphertext {
         for poly in row {
-            inputs.extend(encode_nested_rns_poly_vec_with_offset::<DCRTPoly>(
+            inputs.extend(encode_nested_rns_poly_vec_with_offset::<P>(
                 params,
                 ctx,
                 &poly.coeffs_biguints(),
@@ -1318,43 +1318,53 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
     }
 }
 
-impl RingGswCiphertext<DCRTPoly> {
-    fn decrypt_linear_combination_row(
-        &self,
-        row: &[NestedRnsPoly<DCRTPoly>],
-        scaled_g_inverse: &[Vec<u64>],
-        circuit: &mut PolyCircuit<DCRTPoly>,
-    ) -> NestedRnsPoly<DCRTPoly> {
+impl<P: Poly + 'static> RingGswCiphertext<P> {
+    pub fn estimate_decryption_error_norm(&self, error_sigma: f64) -> BigDecimal {
+        self.assert_consistent();
+        assert!(error_sigma.is_finite(), "error_sigma must be finite");
+        assert!(error_sigma >= 0.0, "error_sigma must be non-negative");
         assert_eq!(
-            scaled_g_inverse.len(),
-            self.gadget_len(),
-            "scaled gadget decomposition length {} must match gadget_len {}",
-            scaled_g_inverse.len(),
-            self.gadget_len()
+            self.width() % 2,
+            0,
+            "RingGswCiphertext width {} must be even to split into top/bottom halves",
+            self.width()
         );
-        let zero_towers = vec![0u64; self.ctx.active_levels];
-        let mut terms = scaled_g_inverse
+        let sigma = BigDecimal::from_f64(error_sigma)
+            .expect("finite error_sigma must convert to BigDecimal");
+        let (_top, bottom_half_randomizer) = self.randomizer_norm.split_rows(self.width() / 2);
+        let max_p_modulus = *self
+            .ctx
+            .nested_rns
+            .p_moduli
             .iter()
-            .enumerate()
-            .filter(|(_idx, tower_constants)| tower_constants.iter().any(|&value| value != 0))
-            .map(|(idx, tower_constants)| {
-                row[self.gadget_len() + idx].const_mul(tower_constants, circuit)
-            })
-            .collect::<Vec<_>>();
-        if terms.is_empty() {
-            return row[0].const_mul(&zero_towers, circuit);
-        }
-        reduce_nested_rns_terms_pairwise(terms.split_off(0), circuit, |left, right, circuit| {
-            left.add(right, circuit)
-        })
+            .max()
+            .expect("RingGswCiphertext requires at least one p modulus");
+        let p_max_matrix = PolyMatrixNorm::new(
+            self.ctx.randomizer_norm_ctx.clone(),
+            bottom_half_randomizer.ncol,
+            1,
+            BigDecimal::from(max_p_modulus),
+            None,
+        );
+        let public_key_error = PolyMatrixNorm::sample_gauss(
+            self.ctx.randomizer_norm_ctx.clone(),
+            1,
+            bottom_half_randomizer.nrow,
+            sigma,
+        );
+        let final_error = public_key_error * (bottom_half_randomizer * p_max_matrix);
+        final_error.poly_norm.norm
     }
 
-    pub fn decrypt(
+    pub fn decrypt<M>(
         &self,
         wire_secret_key: GateId,
         plaintext_modulus: BigUint,
-        circuit: &mut PolyCircuit<DCRTPoly>,
-    ) -> GateId {
+        circuit: &mut PolyCircuit<P>,
+    ) -> GateId
+    where
+        M: PolyMatrix<P = P>,
+    {
         self.assert_consistent();
         assert!(!plaintext_modulus.is_zero(), "plaintext_modulus must be positive");
         let gadget_len = self.gadget_len();
@@ -1366,7 +1376,7 @@ impl RingGswCiphertext<DCRTPoly> {
             gadget_len
         );
 
-        let gadget_constants = nested_rns_gadget_vector::<DCRTPoly, DCRTPolyMatrix>(
+        let gadget_constants = nested_rns_gadget_vector::<P, M>(
             &self.ctx.params,
             self.ctx.nested_rns.as_ref(),
             Some(self.ctx.active_levels),
@@ -1389,27 +1399,33 @@ impl RingGswCiphertext<DCRTPoly> {
             .iter()
             .fold(BigUint::from(1u64), |acc, &q_i| acc * BigUint::from(q_i)) /
             &plaintext_modulus;
-        let scaled_poly = DCRTPoly::from_biguint_to_constant(&self.ctx.params, scaled);
-        let scaled_g_inverse = native_gadget_decompose_window(
+        let scaled_poly = P::from_biguint_to_constant(&self.ctx.params, scaled);
+        let scaled_g_inverse_matrix = nested_rns_gadget_decomposed::<P, M>(
             &self.ctx.params,
             self.ctx.nested_rns.as_ref(),
-            &scaled_poly,
+            &M::from_poly_vec_column(&self.ctx.params, vec![scaled_poly]),
             Some(self.ctx.active_levels),
             Some(self.ctx.level_offset),
-        )
-        .into_iter()
-        .map(|entry| {
-            let coeff = entry.coeffs_biguints()[0].clone();
-            active_q_moduli
-                .iter()
-                .map(|&q_i| {
-                    (&coeff % BigUint::from(q_i))
-                        .to_u64()
-                        .expect("scaled gadget decomposition residue must fit in u64")
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
+        );
+        let (scaled_rows, scaled_cols) = scaled_g_inverse_matrix.size();
+        assert_eq!(
+            scaled_cols, 1,
+            "scaled gadget decomposition column count {} must equal 1",
+            scaled_cols
+        );
+        let scaled_g_inverse = (0..scaled_rows)
+            .map(|row_idx| {
+                let coeff = scaled_g_inverse_matrix.entry(row_idx, 0).coeffs_biguints()[0].clone();
+                active_q_moduli
+                    .iter()
+                    .map(|&q_i| {
+                        (&coeff % BigUint::from(q_i))
+                            .to_u64()
+                            .expect("scaled gadget decomposition residue must fit in u64")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
         let top_entry =
             self.decrypt_linear_combination_row(&self.rows[0], &scaled_g_inverse, circuit);
         let bottom_entry =
@@ -1452,6 +1468,36 @@ impl RingGswCiphertext<DCRTPoly> {
             circuit,
         );
         circuit.add_gate(sum, reconstructed_bottom)
+    }
+
+    fn decrypt_linear_combination_row(
+        &self,
+        row: &[NestedRnsPoly<P>],
+        scaled_g_inverse: &[Vec<u64>],
+        circuit: &mut PolyCircuit<P>,
+    ) -> NestedRnsPoly<P> {
+        assert_eq!(
+            scaled_g_inverse.len(),
+            self.gadget_len(),
+            "scaled gadget decomposition length {} must match gadget_len {}",
+            scaled_g_inverse.len(),
+            self.gadget_len()
+        );
+        let zero_towers = vec![0u64; self.ctx.active_levels];
+        let mut terms = scaled_g_inverse
+            .iter()
+            .enumerate()
+            .filter(|(_idx, tower_constants)| tower_constants.iter().any(|&value| value != 0))
+            .map(|(idx, tower_constants)| {
+                row[self.gadget_len() + idx].const_mul(tower_constants, circuit)
+            })
+            .collect::<Vec<_>>();
+        if terms.is_empty() {
+            return row[0].const_mul(&zero_towers, circuit);
+        }
+        reduce_nested_rns_terms_pairwise(terms.split_off(0), circuit, |left, right, circuit| {
+            left.add(right, circuit)
+        })
     }
 }
 
@@ -1531,12 +1577,23 @@ mod tests {
         key
     }
 
-    fn eval_outputs(
-        params: &DCRTPolyParams,
-        circuit: &PolyCircuit<DCRTPoly>,
-        inputs: Vec<PolyVec<DCRTPoly>>,
-    ) -> Vec<PolyVec<DCRTPoly>> {
-        let one = PolyVec::new(vec![DCRTPoly::const_one(params); NUM_SLOTS]);
+    fn eval_outputs<P: Poly + 'static>(
+        params: &P::Params,
+        num_slots: usize,
+        circuit: &PolyCircuit<P>,
+        inputs: Vec<PolyVec<P>>,
+    ) -> Vec<PolyVec<P>> {
+        eval_outputs_with_parallel_gates(params, num_slots, circuit, inputs, None)
+    }
+
+    fn eval_outputs_with_parallel_gates<P: Poly + 'static>(
+        params: &P::Params,
+        num_slots: usize,
+        circuit: &PolyCircuit<P>,
+        inputs: Vec<PolyVec<P>>,
+        parallel_gates: Option<usize>,
+    ) -> Vec<PolyVec<P>> {
+        let one = PolyVec::new(vec![P::const_one(params); num_slots]);
         let plt_evaluator = PolyVecPltEvaluator { plt_evaluator: PolyPltEvaluator::new() };
         let slot_transfer_evaluator = PolyVecSlotTransferEvaluator::new();
         circuit.eval(
@@ -1545,12 +1602,12 @@ mod tests {
             inputs,
             Some(&plt_evaluator),
             Some(&slot_transfer_evaluator),
-            None,
+            parallel_gates,
         )
     }
 
-    fn rounded_coeffs(
-        decrypted: &DCRTPoly,
+    fn rounded_coeffs<P: Poly>(
+        decrypted: &P,
         plaintext_modulus: u64,
         q_modulus: &BigUint,
     ) -> Vec<u64> {
@@ -1569,6 +1626,11 @@ mod tests {
         let mut coeffs = vec![0u64; NUM_SLOTS];
         coeffs[0] = expected;
         coeffs
+    }
+
+    #[cfg(feature = "gpu")]
+    mod gpu_tests {
+        include!("ring_gsw_gpu_tests.rs");
     }
 
     #[test]
@@ -1666,8 +1728,11 @@ mod tests {
         let (params, ctx) = create_test_context(&mut circuit);
         let ciphertext_input = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
         let wire_secret_key = circuit.input(1)[0];
-        let decrypted_input =
-            ciphertext_input.decrypt(wire_secret_key, BigUint::from(2u64), &mut circuit);
+        let decrypted_input = ciphertext_input.decrypt::<DCRTPolyMatrix>(
+            wire_secret_key,
+            BigUint::from(2u64),
+            &mut circuit,
+        );
         circuit.output(vec![decrypted_input]);
         let secret_key = sample_secret_key(&params);
         let public_key_hash_key = sample_hash_key();
@@ -1710,7 +1775,7 @@ mod tests {
                 vec![PolyVec::new(vec![secret_key.clone()])],
             ]
             .concat();
-            let outputs = eval_outputs(&params, &circuit, circuit_inputs);
+            let outputs = eval_outputs(&params, NUM_SLOTS, &circuit, circuit_inputs);
             assert_eq!(outputs.len(), 1);
             assert_eq!(outputs[0].len(), 1);
             assert_eq!(
@@ -1731,8 +1796,11 @@ mod tests {
         let wire_secret_key = circuit.input(1)[0];
         let plaintext_modulus = 3u64;
         let sum = lhs.add(&rhs, &mut circuit);
-        let decrypted_sum =
-            sum.decrypt(wire_secret_key, BigUint::from(plaintext_modulus), &mut circuit);
+        let decrypted_sum = sum.decrypt::<DCRTPolyMatrix>(
+            wire_secret_key,
+            BigUint::from(plaintext_modulus),
+            &mut circuit,
+        );
         circuit.output(vec![decrypted_sum]);
 
         let secret_key = sample_secret_key(&params);
@@ -1787,7 +1855,7 @@ mod tests {
             vec![PolyVec::new(vec![secret_key.clone()])],
         ]
         .concat();
-        let outputs = eval_outputs(&params, &circuit, inputs);
+        let outputs = eval_outputs(&params, NUM_SLOTS, &circuit, inputs);
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].len(), 1);
         assert_eq!(
@@ -1807,8 +1875,11 @@ mod tests {
         let wire_secret_key = circuit.input(1)[0];
         let plaintext_modulus = 3u64;
         let difference = lhs.sub(&rhs, &mut circuit);
-        let decrypted_difference =
-            difference.decrypt(wire_secret_key, BigUint::from(plaintext_modulus), &mut circuit);
+        let decrypted_difference = difference.decrypt::<DCRTPolyMatrix>(
+            wire_secret_key,
+            BigUint::from(plaintext_modulus),
+            &mut circuit,
+        );
         circuit.output(vec![decrypted_difference]);
 
         let secret_key = sample_secret_key(&params);
@@ -1863,7 +1934,7 @@ mod tests {
             vec![PolyVec::new(vec![secret_key.clone()])],
         ]
         .concat();
-        let outputs = eval_outputs(&params, &circuit, inputs);
+        let outputs = eval_outputs(&params, NUM_SLOTS, &circuit, inputs);
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].len(), 1);
         assert_eq!(
@@ -1883,8 +1954,11 @@ mod tests {
         let wire_secret_key = circuit.input(1)[0];
         let plaintext_modulus = 2u64;
         let product = lhs.mul(&rhs, &mut circuit);
-        let decrypted_product =
-            product.decrypt(wire_secret_key, BigUint::from(plaintext_modulus), &mut circuit);
+        let decrypted_product = product.decrypt::<DCRTPolyMatrix>(
+            wire_secret_key,
+            BigUint::from(plaintext_modulus),
+            &mut circuit,
+        );
         circuit.output(vec![decrypted_product]);
 
         let secret_key = sample_secret_key(&params);
@@ -1939,7 +2013,7 @@ mod tests {
             vec![PolyVec::new(vec![secret_key.clone()])],
         ]
         .concat();
-        let outputs = eval_outputs(&params, &circuit, inputs);
+        let outputs = eval_outputs(&params, NUM_SLOTS, &circuit, inputs);
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].len(), 1);
         assert_eq!(
@@ -1961,7 +2035,7 @@ mod tests {
         let plaintext_modulus = 2u64;
         let product = lhs.mul(&rhs1, &mut circuit);
         let chained_product = product.mul(&rhs2, &mut circuit);
-        let decrypted_product = chained_product.decrypt(
+        let decrypted_product = chained_product.decrypt::<DCRTPolyMatrix>(
             wire_secret_key,
             BigUint::from(plaintext_modulus),
             &mut circuit,
@@ -2037,7 +2111,7 @@ mod tests {
             vec![PolyVec::new(vec![secret_key.clone()])],
         ]
         .concat();
-        let outputs = eval_outputs(&params, &circuit, inputs);
+        let outputs = eval_outputs(&params, NUM_SLOTS, &circuit, inputs);
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].len(), 1);
         assert_eq!(

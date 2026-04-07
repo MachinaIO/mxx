@@ -148,6 +148,7 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, BigUint) {
             circuit.num_input(),
             &e_init_norm,
             Some(&plt_evaluator),
+            None,
         );
 
         let max_error = out_errors

@@ -102,6 +102,13 @@ struct SubCircuitCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubCircuitCallInfo {
+    pub(crate) sub_circuit_id: usize,
+    pub(crate) inputs: Vec<GateId>,
+    pub(crate) output_gate_ids: Vec<GateId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SubCircuitDiskRef {
     scoped_id: usize,
     num_input: usize,
@@ -116,13 +123,56 @@ pub(crate) enum StoredSubCircuit<P: Poly> {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SubCircuitDiskStorage {
-    dir: Arc<PathBuf>,
-    next_scoped_id: Arc<AtomicUsize>,
+    inner: Arc<SubCircuitDiskStorageInner>,
+}
+
+#[derive(Debug)]
+struct SubCircuitDiskStorageInner {
+    dir: PathBuf,
+    next_scoped_id: AtomicUsize,
+}
+
+impl SubCircuitDiskStorageInner {
+    fn cleanup_persisted_files(&self) {
+        let next_scoped_id = self.next_scoped_id.load(Ordering::Relaxed);
+        for scoped_id in 0..next_scoped_id {
+            let path = self.dir.join(format!("{scoped_id}.json"));
+            if let Err(err) = fs::remove_file(&path) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    debug!(
+                        "failed to remove persisted sub-circuit file {}: {}",
+                        path.display(),
+                        err
+                    );
+                }
+            }
+        }
+        if let Err(err) = fs::remove_dir(&self.dir) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                debug!(
+                    "failed to remove sub-circuit storage directory {}: {}",
+                    self.dir.display(),
+                    err
+                );
+            }
+        }
+    }
+}
+
+impl Drop for SubCircuitDiskStorageInner {
+    fn drop(&mut self) {
+        self.cleanup_persisted_files();
+    }
 }
 
 impl SubCircuitDiskStorage {
     fn new(dir: PathBuf) -> Self {
-        Self { dir: Arc::new(dir), next_scoped_id: Arc::new(AtomicUsize::new(0)) }
+        Self {
+            inner: Arc::new(SubCircuitDiskStorageInner {
+                dir,
+                next_scoped_id: AtomicUsize::new(0),
+            }),
+        }
     }
 
     pub(crate) fn temporary(prefix: &str) -> Self {
@@ -134,11 +184,11 @@ impl SubCircuitDiskStorage {
     }
 
     fn alloc_scoped_id(&self) -> usize {
-        self.next_scoped_id.fetch_add(1, Ordering::Relaxed)
+        self.inner.next_scoped_id.fetch_add(1, Ordering::Relaxed)
     }
 
     fn file_path(&self, scoped_id: usize) -> PathBuf {
-        self.dir.join(format!("{scoped_id}.json"))
+        self.inner.dir.join(format!("{scoped_id}.json"))
     }
 }
 
@@ -322,6 +372,36 @@ impl<P: Poly> PolyCircuit<P> {
 
     pub fn gates_in_id_order(&self) -> impl Iterator<Item = (&GateId, &PolyGate)> {
         self.gates.iter()
+    }
+
+    pub(crate) fn sorted_input_gate_ids(&self) -> Vec<GateId> {
+        let mut input_gate_ids = self
+            .gates
+            .iter()
+            .filter_map(|(id, gate)| match gate.gate_type {
+                PolyGateType::Input if id.0 != 0 => Some(*id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        input_gate_ids.sort_by_key(|gid| gid.0);
+        input_gate_ids
+    }
+
+    pub(crate) fn output_gate_ids(&self) -> &[GateId] {
+        &self.output_ids
+    }
+
+    pub(crate) fn lookup_table(&self, lut_id: usize) -> Arc<PublicLut<P>> {
+        self.lookup_registry.lookups.get(&lut_id).expect("lookup table missing").clone()
+    }
+
+    pub(crate) fn sub_circuit_call_info(&self, call_id: usize) -> SubCircuitCallInfo {
+        let call = self.sub_circuit_calls.get(&call_id).expect("sub-circuit call missing");
+        SubCircuitCallInfo {
+            sub_circuit_id: call.sub_circuit_id,
+            inputs: call.inputs.clone(),
+            output_gate_ids: call.output_gate_ids.clone(),
+        }
     }
 
     pub fn count_gates_by_type_vec(&self) -> HashMap<PolyGateKind, usize> {
@@ -1758,6 +1838,13 @@ mod tests {
         circuit.eval(params, one, eval_inputs, plt_evaluator, None, None)
     }
 
+    fn dir_is_empty_or_missing(path: &Path) -> bool {
+        match fs::read_dir(path) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+        }
+    }
+
     #[test]
     fn test_eval_add() {
         // Create parameters for testing
@@ -2433,6 +2520,68 @@ mod tests {
             ((poly1.clone() * poly2.clone()) + poly3.clone()) * ((poly1 * poly2) + poly3);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], expected);
+    }
+
+    #[test]
+    fn test_disk_backed_sub_circuit_files_are_removed_on_drop() {
+        let dir = tempdir().expect("create temp dir");
+        let storage_path = dir.path().to_path_buf();
+
+        {
+            let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
+            let sub_inputs = sub_circuit.input(2);
+            let mul_gate = sub_circuit.mul_gate(sub_inputs[0], sub_inputs[1]);
+            sub_circuit.output(vec![mul_gate]);
+
+            let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
+            main_circuit.enable_subcircuits_in_disk(&storage_path);
+            let main_inputs = main_circuit.input(2);
+            let sub_circuit_id = main_circuit.register_sub_circuit(sub_circuit);
+            let outputs =
+                main_circuit.call_sub_circuit(sub_circuit_id, &[main_inputs[0], main_inputs[1]]);
+            main_circuit.output(outputs);
+
+            assert_eq!(fs::read_dir(&storage_path).expect("read temp dir").count(), 1);
+        }
+
+        assert!(dir_is_empty_or_missing(&storage_path));
+    }
+
+    #[test]
+    fn test_disk_backed_sub_circuit_cleanup_waits_for_last_clone() {
+        let dir = tempdir().expect("create temp dir");
+        let storage_path = dir.path().to_path_buf();
+
+        let cloned_circuit = {
+            let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
+            let sub_inputs = sub_circuit.input(2);
+            let add_gate = sub_circuit.add_gate(sub_inputs[0], sub_inputs[1]);
+            sub_circuit.output(vec![add_gate]);
+
+            let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
+            main_circuit.enable_subcircuits_in_disk(&storage_path);
+            let main_inputs = main_circuit.input(2);
+            let sub_circuit_id = main_circuit.register_sub_circuit(sub_circuit);
+            let outputs =
+                main_circuit.call_sub_circuit(sub_circuit_id, &[main_inputs[0], main_inputs[1]]);
+            main_circuit.output(outputs);
+
+            assert_eq!(fs::read_dir(&storage_path).expect("read temp dir").count(), 1);
+            let cloned_circuit = main_circuit.clone();
+            drop(main_circuit);
+            assert_eq!(
+                fs::read_dir(&storage_path).expect("read temp dir after dropping original").count(),
+                1
+            );
+            cloned_circuit
+        };
+
+        assert_eq!(
+            fs::read_dir(&storage_path).expect("read temp dir before final drop").count(),
+            1
+        );
+        drop(cloned_circuit);
+        assert!(dir_is_empty_or_missing(&storage_path));
     }
 
     #[test]

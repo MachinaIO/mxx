@@ -291,6 +291,7 @@ fn find_crt_depth_for_modq_arith(
             circuit.num_input(),
             &e_init_norm,
             Some(&plt_evaluator),
+            None,
         );
 
         assert_eq!(out_errors.len(), 1);

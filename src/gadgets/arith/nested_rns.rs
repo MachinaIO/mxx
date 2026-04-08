@@ -4,6 +4,9 @@ mod gpu;
 
 use crate::{
     circuit::{PolyCircuit, gate::GateId},
+    gadgets::conv_mul::{
+        negacyclic_conv_mul_right_decomposed_term_many_subcircuit, negacyclic_conv_mul_right_sparse,
+    },
     lookup::PublicLut,
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
@@ -371,7 +374,7 @@ impl NestedRnsPolyContext {
 
             let p_over_pi_inv = Arc::new(p_over_pi_inv);
             let p_moduli_big = Arc::new(p_moduli_big);
-            let lut_x_to_y_len = p_i as usize;
+            let lut_x_to_y_len = lut_mod_p_map_size as usize;
             let lut_x_to_y_lut = PublicLut::<P>::new(
                 params,
                 lut_x_to_y_len as u64,
@@ -400,7 +403,7 @@ impl NestedRnsPolyContext {
             );
             lut_x_to_y.push(lut_x_to_y_lut);
 
-            let lut_x_to_real_len = p_i as usize;
+            let lut_x_to_real_len = lut_mod_p_map_size as usize;
             let lut_x_to_real_lut = PublicLut::<P>::new(
                 params,
                 lut_x_to_real_len as u64,
@@ -630,6 +633,65 @@ impl NestedRnsPolyContext {
             mul_lazy_reduce_id,
             mul_right_sparse_id,
         }
+    }
+
+    pub(crate) fn reduce_q_level_row<P: Poly>(
+        &self,
+        row: &[GateId],
+        circuit: &mut PolyCircuit<P>,
+    ) -> Vec<GateId> {
+        assert_eq!(
+            row.len(),
+            self.p_moduli.len(),
+            "q-level row depth {} must match p_moduli depth {}",
+            row.len(),
+            self.p_moduli.len()
+        );
+        circuit.call_sub_circuit(self.lazy_reduce_id, row)
+    }
+
+    pub(crate) fn slot_transfer_q_level_row_no_reduce<P: Poly>(
+        &self,
+        row: &[GateId],
+        src_slots: &[(u32, Option<u32>)],
+        circuit: &mut PolyCircuit<P>,
+    ) -> Vec<GateId> {
+        assert_eq!(
+            row.len(),
+            self.p_moduli.len(),
+            "q-level row depth {} must match p_moduli depth {}",
+            row.len(),
+            self.p_moduli.len()
+        );
+        row.iter()
+            .map(|&gate_id| circuit.slot_transfer_gate(gate_id, src_slots))
+            .collect::<Vec<_>>()
+    }
+
+    pub(crate) fn mul_q_level_rows<P: Poly>(
+        &self,
+        left: &[GateId],
+        right: &[GateId],
+        circuit: &mut PolyCircuit<P>,
+    ) -> Vec<GateId> {
+        assert_eq!(
+            left.len(),
+            self.p_moduli.len(),
+            "left q-level row depth {} must match p_moduli depth {}",
+            left.len(),
+            self.p_moduli.len()
+        );
+        assert_eq!(
+            right.len(),
+            self.p_moduli.len(),
+            "right q-level row depth {} must match p_moduli depth {}",
+            right.len(),
+            self.p_moduli.len()
+        );
+        let mut inputs = Vec::with_capacity(left.len() + right.len());
+        inputs.extend_from_slice(left);
+        inputs.extend_from_slice(right);
+        circuit.call_sub_circuit(self.mul_lazy_reduce_id, &inputs)
     }
 
     fn mul_lazy_reduce_subcircuit<P: Poly>(
@@ -1284,8 +1346,12 @@ impl<P: Poly> NestedRnsPoly<P> {
         let operand = if self.bounds_exceed_p_full(&self.max_plaintexts) {
             self.full_reduce(circuit)
         } else {
-            self.lazy_reduce_if_unreduced(circuit)
+            self.clone()
         };
+        operand.assert_p_max_traces_within_lut_map_size(
+            &operand.p_max_traces[..operand.resolve_enable_levels()],
+            "gadget_decompose input exceeds lut_mod_p_map_size",
+        );
         let levels = operand.resolve_enable_levels();
         let p_moduli_depth = operand.ctx.p_moduli.len();
         let w_bound =
@@ -1325,6 +1391,228 @@ impl<P: Poly> NestedRnsPoly<P> {
         }
 
         decomposition
+    }
+
+    pub fn conv_mul_right_decomposed_many(
+        &self,
+        params: &P::Params,
+        left_rows: &[&[Self]],
+        num_slots: usize,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Vec<Self>
+    where
+        P: 'static,
+    {
+        if left_rows.is_empty() {
+            return vec![];
+        }
+
+        assert!(num_slots > 0, "conv_mul_right_decomposed_many requires positive num_slots");
+        assert!(
+            num_slots <= params.ring_dimension() as usize,
+            "num_slots {} exceeds ring dimension {}",
+            num_slots,
+            params.ring_dimension()
+        );
+
+        let levels = self.resolve_enable_levels();
+        let p_moduli_depth = self.ctx.p_moduli.len();
+        let chunk_width = p_moduli_depth + 1;
+        let gadget_len = levels * chunk_width;
+        for (row_idx, row) in left_rows.iter().enumerate() {
+            assert_eq!(
+                row.len(),
+                gadget_len,
+                "left row {} length {} must match gadget_len {}",
+                row_idx,
+                row.len(),
+                gadget_len
+            );
+            for (entry_idx, entry) in row.iter().enumerate() {
+                entry.assert_matching_enable_levels(self);
+                assert!(
+                    Arc::ptr_eq(&entry.ctx, &self.ctx),
+                    "conv_mul_right_decomposed_many requires left row {} entry {} to share the NestedRnsPolyContext with right",
+                    row_idx,
+                    entry_idx
+                );
+            }
+        }
+
+        let right = self.prepare_for_decomposed_conv(circuit);
+        let prepared_left_rows = left_rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|entry| entry.prepare_for_decomposed_conv(circuit))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let row_count = prepared_left_rows.len();
+
+        let term_subcircuit = negacyclic_conv_mul_right_decomposed_term_many_subcircuit::<P>(
+            right.ctx.as_ref(),
+            row_count,
+            num_slots,
+        );
+        let term_subcircuit_id = circuit.register_sub_circuit(term_subcircuit);
+
+        let flat_term_output_templates =
+            map_nested_rns_values(row_count * gadget_len, |flat_idx| {
+                let row_idx = flat_idx / gadget_len;
+                let global_idx = flat_idx % gadget_len;
+                let left = &prepared_left_rows[row_idx][global_idx];
+                Self::conv_mul_right_decomposed_output_template(
+                    params,
+                    left,
+                    global_idx / chunk_width,
+                    global_idx % chunk_width,
+                    num_slots,
+                )
+            });
+        let term_output_templates = flat_term_output_templates
+            .chunks(gadget_len)
+            .map(|row| row.to_vec())
+            .collect::<Vec<_>>();
+
+        let mut row_terms = vec![Vec::with_capacity(gadget_len); row_count];
+        for q_idx in 0..levels {
+            let (ys, w) = right.decomposition_terms_for_level(q_idx, circuit);
+            for term_idx in 0..chunk_width {
+                let global_idx = q_idx * chunk_width + term_idx;
+                let term_gate = if term_idx < p_moduli_depth { ys[term_idx] } else { w };
+                let term_row = vec![term_gate; p_moduli_depth];
+                let mut inputs = Vec::with_capacity((row_count + 1) * p_moduli_depth);
+                for row in &prepared_left_rows {
+                    inputs.extend_from_slice(&row[global_idx].inner[q_idx]);
+                }
+                inputs.extend_from_slice(&term_row);
+                let outputs = circuit.call_sub_circuit(term_subcircuit_id, &inputs);
+                assert_eq!(
+                    outputs.len(),
+                    row_count * p_moduli_depth,
+                    "conv_mul_right_decomposed_many term helper output size must match row_count * p_moduli_depth"
+                );
+                for row_idx in 0..row_count {
+                    let start = row_idx * p_moduli_depth;
+                    let output_template = &term_output_templates[row_idx][global_idx];
+                    row_terms[row_idx].push(Self::sparse_level_poly_from_row_with_metadata(
+                        self.ctx.clone(),
+                        levels,
+                        self.enable_levels,
+                        self.level_offset,
+                        q_idx,
+                        outputs[start..start + p_moduli_depth].to_vec(),
+                        output_template.max_plaintexts[q_idx].clone(),
+                        output_template.p_max_traces[q_idx].clone(),
+                        circuit,
+                    ));
+                }
+            }
+        }
+
+        row_terms
+            .into_iter()
+            .map(|mut terms| {
+                let mut acc = terms
+                    .pop()
+                    .expect("conv_mul_right_decomposed_many requires at least one gadget term");
+                for term in terms {
+                    acc = acc.add(&term, circuit);
+                }
+                acc
+            })
+            .collect()
+    }
+
+    pub fn conv_mul_right_decomposed(
+        &self,
+        params: &P::Params,
+        left_row: &[Self],
+        num_slots: usize,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self
+    where
+        P: 'static,
+    {
+        self.conv_mul_right_decomposed_many(params, &[left_row], num_slots, circuit)
+            .into_iter()
+            .next()
+            .expect("conv_mul_right_decomposed must produce one output row")
+    }
+
+    fn prepare_for_decomposed_conv(&self, circuit: &mut PolyCircuit<P>) -> Self {
+        if self.bounds_exceed_p_full(&self.max_plaintexts) {
+            self.full_reduce(circuit)
+        } else {
+            self.assert_p_max_traces_within_lut_map_size(
+                &self.p_max_traces[..self.resolve_enable_levels()],
+                "decomposed convolution input exceeds lut_mod_p_map_size",
+            );
+            self.clone()
+        }
+    }
+
+    fn sparse_decomposed_term_input_template(
+        ctx: Arc<NestedRnsPolyContext>,
+        enable_levels: Option<usize>,
+        level_offset: usize,
+        target_q_idx: usize,
+        term_idx: usize,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        let active_levels = enable_levels.unwrap_or(ctx.q_moduli_depth - level_offset);
+        let target_row = circuit.input(ctx.p_moduli.len());
+        let (max_plaintext, p_max_trace) = if term_idx < ctx.p_moduli.len() {
+            let bound = BigUint::from(ctx.p_moduli[term_idx] - 1);
+            (bound.clone(), bound)
+        } else {
+            let bound =
+                BigUint::from(u64::try_from(ctx.p_moduli.len()).expect("p_moduli length fits u64"));
+            (bound.clone(), bound)
+        };
+        Self::sparse_level_poly_from_row_with_metadata(
+            ctx,
+            active_levels,
+            enable_levels,
+            level_offset,
+            target_q_idx,
+            target_row,
+            max_plaintext,
+            p_max_trace,
+            circuit,
+        )
+    }
+
+    fn conv_mul_right_decomposed_output_template(
+        params: &P::Params,
+        left: &Self,
+        target_q_idx: usize,
+        term_idx: usize,
+        num_slots: usize,
+    ) -> Self
+    where
+        P: 'static,
+    {
+        let mut template_circuit = PolyCircuit::<P>::new();
+        let template_ctx = Arc::new(left.ctx.register_subcircuits_in(&mut template_circuit));
+        let lhs = Self::input_like_with_ctx(left, template_ctx.clone(), &mut template_circuit);
+        let rhs = Self::sparse_decomposed_term_input_template(
+            template_ctx,
+            lhs.enable_levels,
+            lhs.level_offset,
+            target_q_idx,
+            term_idx,
+            &mut template_circuit,
+        );
+        negacyclic_conv_mul_right_sparse(
+            params,
+            &mut template_circuit,
+            &lhs,
+            &rhs,
+            target_q_idx,
+            num_slots,
+        )
     }
 
     pub(crate) fn prepare_for_reconstruct(&self, circuit: &mut PolyCircuit<P>) -> Self {
@@ -1668,10 +1956,10 @@ impl<P: Poly> NestedRnsPoly<P> {
             ctx.p_moduli.len()
         );
         assert!(
-            p_max_trace < BigUint::from(ctx.p_max),
-            "reduced sparse row trace {} must stay below p_max {}",
+            p_max_trace < ctx.lut_mod_p_max_map_size,
+            "sparse row trace {} must stay below lut_mod_p_max_map_size {}",
             p_max_trace,
-            ctx.p_max
+            ctx.lut_mod_p_max_map_size
         );
 
         let zero_gate = circuit.const_zero_gate();
@@ -2777,6 +3065,567 @@ mod tests {
         let lhs = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
         let rhs = NestedRnsPoly::input(ctx, None, None, &mut circuit);
         let _ = lhs.mul_right_sparse(&rhs, 0, &mut circuit);
+    }
+
+    fn build_manual_conv_mul_right_decomposed_many(
+        params: &DCRTPolyParams,
+        left_rows: &[Vec<NestedRnsPoly<DCRTPoly>>],
+        right: &NestedRnsPoly<DCRTPoly>,
+        num_slots: usize,
+        circuit: &mut PolyCircuit<DCRTPoly>,
+    ) -> Vec<NestedRnsPoly<DCRTPoly>> {
+        let p_moduli_depth = right.ctx.p_moduli.len();
+        let chunk_width = p_moduli_depth + 1;
+        let decomposed = right.gadget_decompose(circuit);
+        left_rows
+            .iter()
+            .map(|row| {
+                assert_eq!(
+                    row.len(),
+                    decomposed.len(),
+                    "manual decomposed-conv row length {} must match gadget decomposition length {}",
+                    row.len(),
+                    decomposed.len()
+                );
+                let terms = row
+                    .iter()
+                    .zip(decomposed.iter())
+                    .enumerate()
+                    .map(|(entry_idx, (left, decomp))| {
+                        crate::gadgets::conv_mul::negacyclic_conv_mul_right_sparse(
+                            params,
+                            circuit,
+                            left,
+                            decomp,
+                            entry_idx / chunk_width,
+                            num_slots,
+                        )
+                    });
+                let mut terms = terms.collect::<Vec<_>>().into_iter();
+                let first = terms
+                    .next()
+                    .expect("manual decomposed convolution requires at least one gadget term");
+                terms.fold(first, |acc, term| acc.add(&term, circuit))
+            })
+            .collect()
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_conv_mul_right_decomposed_many_matches_manual_pipeline() {
+        let q_level = Some(1usize);
+        let num_slots = 4usize;
+
+        let mut fused_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, fused_ctx) = create_test_context_with_q_level(&mut fused_circuit, q_level);
+        let chunk_width = fused_ctx.p_moduli.len() + 1;
+        let gadget_len = fused_ctx.q_moduli_depth * chunk_width;
+        let fused_left_rows = (0..2)
+            .map(|_| {
+                (0..gadget_len)
+                    .map(|_| {
+                        NestedRnsPoly::input(fused_ctx.clone(), q_level, None, &mut fused_circuit)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let fused_right =
+            NestedRnsPoly::input(fused_ctx.clone(), q_level, None, &mut fused_circuit);
+        let fused_outputs = fused_right.conv_mul_right_decomposed_many(
+            &params,
+            &[fused_left_rows[0].as_slice(), fused_left_rows[1].as_slice()],
+            num_slots,
+            &mut fused_circuit,
+        );
+        let fused_reconstructed = fused_outputs
+            .iter()
+            .map(|output| output.reconstruct(&mut fused_circuit))
+            .collect::<Vec<_>>();
+        fused_circuit.output(fused_reconstructed);
+
+        let mut manual_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_manual_params, manual_ctx) =
+            create_test_context_with_q_level(&mut manual_circuit, q_level);
+        let manual_left_rows = (0..2)
+            .map(|_| {
+                (0..gadget_len)
+                    .map(|_| {
+                        NestedRnsPoly::input(manual_ctx.clone(), q_level, None, &mut manual_circuit)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let manual_right =
+            NestedRnsPoly::input(manual_ctx.clone(), q_level, None, &mut manual_circuit);
+        let manual_outputs = build_manual_conv_mul_right_decomposed_many(
+            &params,
+            &manual_left_rows,
+            &manual_right,
+            num_slots,
+            &mut manual_circuit,
+        );
+        let manual_reconstructed = manual_outputs
+            .iter()
+            .map(|output| output.reconstruct(&mut manual_circuit))
+            .collect::<Vec<_>>();
+        manual_circuit.output(manual_reconstructed);
+
+        let left_input_values = (0..(2 * gadget_len))
+            .map(|idx| BigUint::from(u64::try_from(idx + 2).expect("test input index fits u64")))
+            .collect::<Vec<_>>();
+        let right_value = BigUint::from(13u64);
+        let fused_inputs = left_input_values
+            .iter()
+            .flat_map(|value| {
+                let mut coeffs = vec![BigUint::ZERO; num_slots];
+                coeffs[0] = value.clone();
+                encode_nested_rns_poly_vec_with_offset::<DCRTPoly>(
+                    &params,
+                    fused_ctx.as_ref(),
+                    &coeffs,
+                    0,
+                    q_level,
+                )
+            })
+            .chain({
+                let mut coeffs = vec![BigUint::ZERO; num_slots];
+                coeffs[0] = right_value.clone();
+                encode_nested_rns_poly_vec_with_offset::<DCRTPoly>(
+                    &params,
+                    fused_ctx.as_ref(),
+                    &coeffs,
+                    0,
+                    q_level,
+                )
+            })
+            .collect::<Vec<_>>();
+        let manual_inputs = left_input_values
+            .iter()
+            .flat_map(|value| {
+                let mut coeffs = vec![BigUint::ZERO; num_slots];
+                coeffs[0] = value.clone();
+                encode_nested_rns_poly_vec_with_offset::<DCRTPoly>(
+                    &params,
+                    manual_ctx.as_ref(),
+                    &coeffs,
+                    0,
+                    q_level,
+                )
+            })
+            .chain({
+                let mut coeffs = vec![BigUint::ZERO; num_slots];
+                coeffs[0] = right_value.clone();
+                encode_nested_rns_poly_vec_with_offset::<DCRTPoly>(
+                    &params,
+                    manual_ctx.as_ref(),
+                    &coeffs,
+                    0,
+                    q_level,
+                )
+            })
+            .collect::<Vec<_>>();
+        let fused_eval = eval_poly_vec_outputs(&params, &fused_circuit, fused_inputs);
+        let manual_eval = eval_poly_vec_outputs(&params, &manual_circuit, manual_inputs);
+        assert_eq!(fused_eval, manual_eval);
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_conv_mul_right_decomposed_many_does_not_increase_non_free_depth() {
+        let q_level = Some(1usize);
+        let num_slots = 4usize;
+
+        let mut fused_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, fused_ctx) = create_test_context_with_q_level(&mut fused_circuit, q_level);
+        let chunk_width = fused_ctx.p_moduli.len() + 1;
+        let gadget_len = fused_ctx.q_moduli_depth * chunk_width;
+        let fused_left_rows = (0..2)
+            .map(|_| {
+                (0..gadget_len)
+                    .map(|_| {
+                        NestedRnsPoly::input(fused_ctx.clone(), q_level, None, &mut fused_circuit)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let fused_right =
+            NestedRnsPoly::input(fused_ctx.clone(), q_level, None, &mut fused_circuit);
+        let fused_outputs = fused_right.conv_mul_right_decomposed_many(
+            &params,
+            &[fused_left_rows[0].as_slice(), fused_left_rows[1].as_slice()],
+            num_slots,
+            &mut fused_circuit,
+        );
+        let fused_reconstructed = fused_outputs
+            .iter()
+            .map(|output| output.reconstruct(&mut fused_circuit))
+            .collect::<Vec<_>>();
+        fused_circuit.output(fused_reconstructed);
+
+        let mut manual_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_manual_params, manual_ctx) =
+            create_test_context_with_q_level(&mut manual_circuit, q_level);
+        let manual_left_rows = (0..2)
+            .map(|_| {
+                (0..gadget_len)
+                    .map(|_| {
+                        NestedRnsPoly::input(manual_ctx.clone(), q_level, None, &mut manual_circuit)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let manual_right =
+            NestedRnsPoly::input(manual_ctx.clone(), q_level, None, &mut manual_circuit);
+        let manual_outputs = build_manual_conv_mul_right_decomposed_many(
+            &params,
+            &manual_left_rows,
+            &manual_right,
+            num_slots,
+            &mut manual_circuit,
+        );
+        let manual_reconstructed = manual_outputs
+            .iter()
+            .map(|output| output.reconstruct(&mut manual_circuit))
+            .collect::<Vec<_>>();
+        manual_circuit.output(manual_reconstructed);
+
+        assert!(
+            fused_circuit.non_free_depth() <= manual_circuit.non_free_depth(),
+            "fused right-decomposed convolution should not increase non-free depth: fused={}, manual={}",
+            fused_circuit.non_free_depth(),
+            manual_circuit.non_free_depth()
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_gadget_decompose_unreduced_matches_explicit_lazy_reduce() {
+        let q_level = Some(1usize);
+        let num_slots = 4usize;
+
+        let mut fused_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, fused_ctx) = create_test_context_with_q_level(&mut fused_circuit, q_level);
+        let fused_left = NestedRnsPoly::input(fused_ctx.clone(), q_level, None, &mut fused_circuit);
+        let fused_right =
+            NestedRnsPoly::input(fused_ctx.clone(), q_level, None, &mut fused_circuit);
+        let fused_unreduced = fused_left.add(&fused_right, &mut fused_circuit);
+        let fused_outputs = fused_unreduced
+            .gadget_decompose(&mut fused_circuit)
+            .into_iter()
+            .map(|term| term.reconstruct(&mut fused_circuit))
+            .collect::<Vec<_>>();
+        fused_circuit.output(fused_outputs);
+
+        let mut manual_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_manual_params, manual_ctx) =
+            create_test_context_with_q_level(&mut manual_circuit, q_level);
+        let manual_left =
+            NestedRnsPoly::input(manual_ctx.clone(), q_level, None, &mut manual_circuit);
+        let manual_right =
+            NestedRnsPoly::input(manual_ctx.clone(), q_level, None, &mut manual_circuit);
+        let manual_unreduced = manual_left.add(&manual_right, &mut manual_circuit);
+        let manual_reduced = manual_unreduced.lazy_reduce_if_unreduced(&mut manual_circuit);
+        let manual_outputs = manual_reduced
+            .gadget_decompose(&mut manual_circuit)
+            .into_iter()
+            .map(|term| term.reconstruct(&mut manual_circuit))
+            .collect::<Vec<_>>();
+        manual_circuit.output(manual_outputs);
+
+        let left_coeffs = vec![
+            BigUint::from(3u64),
+            BigUint::from(5u64),
+            BigUint::from(7u64),
+            BigUint::from(11u64),
+        ];
+        let right_coeffs = vec![
+            BigUint::from(13u64),
+            BigUint::from(17u64),
+            BigUint::from(19u64),
+            BigUint::from(23u64),
+        ];
+        let fused_inputs = [
+            encode_nested_rns_poly_vec_with_offset::<DCRTPoly>(
+                &params,
+                fused_ctx.as_ref(),
+                &left_coeffs,
+                0,
+                q_level,
+            ),
+            encode_nested_rns_poly_vec_with_offset::<DCRTPoly>(
+                &params,
+                fused_ctx.as_ref(),
+                &right_coeffs,
+                0,
+                q_level,
+            ),
+        ]
+        .concat();
+        let manual_inputs = [
+            encode_nested_rns_poly_vec_with_offset::<DCRTPoly>(
+                &params,
+                manual_ctx.as_ref(),
+                &left_coeffs,
+                0,
+                q_level,
+            ),
+            encode_nested_rns_poly_vec_with_offset::<DCRTPoly>(
+                &params,
+                manual_ctx.as_ref(),
+                &right_coeffs,
+                0,
+                q_level,
+            ),
+        ]
+        .concat();
+        let fused_eval = eval_poly_vec_outputs(&params, &fused_circuit, fused_inputs);
+        let manual_eval = eval_poly_vec_outputs(&params, &manual_circuit, manual_inputs);
+        assert_eq!(fused_eval, manual_eval);
+        assert_eq!(fused_eval.len(), fused_ctx.p_moduli.len() + 1);
+        assert!(num_slots > 0);
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_gadget_decompose_unreduced_does_not_increase_non_free_depth() {
+        let q_level = Some(1usize);
+
+        let mut fused_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_params, fused_ctx) = create_test_context_with_q_level(&mut fused_circuit, q_level);
+        let fused_left = NestedRnsPoly::input(fused_ctx.clone(), q_level, None, &mut fused_circuit);
+        let fused_right =
+            NestedRnsPoly::input(fused_ctx.clone(), q_level, None, &mut fused_circuit);
+        let fused_unreduced = fused_left.add(&fused_right, &mut fused_circuit);
+        let fused_outputs = fused_unreduced
+            .gadget_decompose(&mut fused_circuit)
+            .into_iter()
+            .map(|term| term.reconstruct(&mut fused_circuit))
+            .collect::<Vec<_>>();
+        fused_circuit.output(fused_outputs);
+
+        let mut manual_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_params, manual_ctx) = create_test_context_with_q_level(&mut manual_circuit, q_level);
+        let manual_left =
+            NestedRnsPoly::input(manual_ctx.clone(), q_level, None, &mut manual_circuit);
+        let manual_right =
+            NestedRnsPoly::input(manual_ctx.clone(), q_level, None, &mut manual_circuit);
+        let manual_unreduced = manual_left.add(&manual_right, &mut manual_circuit);
+        let manual_reduced = manual_unreduced.lazy_reduce_if_unreduced(&mut manual_circuit);
+        let manual_outputs = manual_reduced
+            .gadget_decompose(&mut manual_circuit)
+            .into_iter()
+            .map(|term| term.reconstruct(&mut manual_circuit))
+            .collect::<Vec<_>>();
+        manual_circuit.output(manual_outputs);
+
+        assert!(
+            fused_circuit.non_free_depth() < manual_circuit.non_free_depth(),
+            "unreduced gadget_decompose should reduce non-free depth: fused={}, manual={}",
+            fused_circuit.non_free_depth(),
+            manual_circuit.non_free_depth()
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_conv_mul_right_decomposed_many_unreduced_matches_explicit_lazy_reduce()
+    {
+        let q_level = Some(1usize);
+        let num_slots = 4usize;
+
+        let mut fused_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, fused_ctx) = create_test_context_with_q_level(&mut fused_circuit, q_level);
+        let chunk_width = fused_ctx.p_moduli.len() + 1;
+        let gadget_len = fused_ctx.q_moduli_depth * chunk_width;
+        let fused_left_row = (0..gadget_len)
+            .map(|_| {
+                let left0 =
+                    NestedRnsPoly::input(fused_ctx.clone(), q_level, None, &mut fused_circuit);
+                let left1 =
+                    NestedRnsPoly::input(fused_ctx.clone(), q_level, None, &mut fused_circuit);
+                left0.add(&left1, &mut fused_circuit)
+            })
+            .collect::<Vec<_>>();
+        let fused_right0 =
+            NestedRnsPoly::input(fused_ctx.clone(), q_level, None, &mut fused_circuit);
+        let fused_right1 =
+            NestedRnsPoly::input(fused_ctx.clone(), q_level, None, &mut fused_circuit);
+        let fused_right = fused_right0.add(&fused_right1, &mut fused_circuit);
+        let fused_outputs = fused_right.conv_mul_right_decomposed_many(
+            &params,
+            &[fused_left_row.as_slice()],
+            num_slots,
+            &mut fused_circuit,
+        );
+        let fused_reconstructed = fused_outputs
+            .iter()
+            .map(|output| output.reconstruct(&mut fused_circuit))
+            .collect::<Vec<_>>();
+        fused_circuit.output(fused_reconstructed);
+
+        let mut manual_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_manual_params, manual_ctx) =
+            create_test_context_with_q_level(&mut manual_circuit, q_level);
+        let manual_left_row = (0..gadget_len)
+            .map(|_| {
+                let left0 =
+                    NestedRnsPoly::input(manual_ctx.clone(), q_level, None, &mut manual_circuit);
+                let left1 =
+                    NestedRnsPoly::input(manual_ctx.clone(), q_level, None, &mut manual_circuit);
+                left0.add(&left1, &mut manual_circuit).lazy_reduce_if_unreduced(&mut manual_circuit)
+            })
+            .collect::<Vec<_>>();
+        let manual_right0 =
+            NestedRnsPoly::input(manual_ctx.clone(), q_level, None, &mut manual_circuit);
+        let manual_right1 =
+            NestedRnsPoly::input(manual_ctx.clone(), q_level, None, &mut manual_circuit);
+        let manual_right = manual_right0
+            .add(&manual_right1, &mut manual_circuit)
+            .lazy_reduce_if_unreduced(&mut manual_circuit);
+        let manual_outputs = manual_right.conv_mul_right_decomposed_many(
+            &params,
+            &[manual_left_row.as_slice()],
+            num_slots,
+            &mut manual_circuit,
+        );
+        let manual_reconstructed = manual_outputs
+            .iter()
+            .map(|output| output.reconstruct(&mut manual_circuit))
+            .collect::<Vec<_>>();
+        manual_circuit.output(manual_reconstructed);
+
+        let left_input_values = (0..(2 * gadget_len))
+            .map(|idx| BigUint::from(u64::try_from(idx + 2).expect("test input index fits u64")))
+            .collect::<Vec<_>>();
+        let right_input_values = [BigUint::from(101u64), BigUint::from(211u64)];
+        let fused_inputs = left_input_values
+            .iter()
+            .flat_map(|value| {
+                let mut coeffs = vec![BigUint::ZERO; num_slots];
+                coeffs[0] = value.clone();
+                encode_nested_rns_poly_vec_with_offset::<DCRTPoly>(
+                    &params,
+                    fused_ctx.as_ref(),
+                    &coeffs,
+                    0,
+                    q_level,
+                )
+            })
+            .chain(right_input_values.iter().flat_map(|value| {
+                let mut coeffs = vec![BigUint::ZERO; num_slots];
+                coeffs[0] = value.clone();
+                encode_nested_rns_poly_vec_with_offset::<DCRTPoly>(
+                    &params,
+                    fused_ctx.as_ref(),
+                    &coeffs,
+                    0,
+                    q_level,
+                )
+            }))
+            .collect::<Vec<_>>();
+        let manual_inputs = left_input_values
+            .iter()
+            .flat_map(|value| {
+                let mut coeffs = vec![BigUint::ZERO; num_slots];
+                coeffs[0] = value.clone();
+                encode_nested_rns_poly_vec_with_offset::<DCRTPoly>(
+                    &params,
+                    manual_ctx.as_ref(),
+                    &coeffs,
+                    0,
+                    q_level,
+                )
+            })
+            .chain(right_input_values.iter().flat_map(|value| {
+                let mut coeffs = vec![BigUint::ZERO; num_slots];
+                coeffs[0] = value.clone();
+                encode_nested_rns_poly_vec_with_offset::<DCRTPoly>(
+                    &params,
+                    manual_ctx.as_ref(),
+                    &coeffs,
+                    0,
+                    q_level,
+                )
+            }))
+            .collect::<Vec<_>>();
+        let fused_eval = eval_poly_vec_outputs(&params, &fused_circuit, fused_inputs);
+        let manual_eval = eval_poly_vec_outputs(&params, &manual_circuit, manual_inputs);
+        assert_eq!(fused_eval, manual_eval);
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_nested_rns_poly_conv_mul_right_decomposed_many_unreduced_does_not_increase_non_free_depth()
+     {
+        let q_level = Some(1usize);
+        let num_slots = 4usize;
+
+        let mut fused_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, fused_ctx) = create_test_context_with_q_level(&mut fused_circuit, q_level);
+        let chunk_width = fused_ctx.p_moduli.len() + 1;
+        let gadget_len = fused_ctx.q_moduli_depth * chunk_width;
+        let fused_left_row = (0..gadget_len)
+            .map(|_| {
+                let left0 =
+                    NestedRnsPoly::input(fused_ctx.clone(), q_level, None, &mut fused_circuit);
+                let left1 =
+                    NestedRnsPoly::input(fused_ctx.clone(), q_level, None, &mut fused_circuit);
+                left0.add(&left1, &mut fused_circuit)
+            })
+            .collect::<Vec<_>>();
+        let fused_right0 =
+            NestedRnsPoly::input(fused_ctx.clone(), q_level, None, &mut fused_circuit);
+        let fused_right1 =
+            NestedRnsPoly::input(fused_ctx.clone(), q_level, None, &mut fused_circuit);
+        let fused_right = fused_right0.add(&fused_right1, &mut fused_circuit);
+        let fused_outputs = fused_right.conv_mul_right_decomposed_many(
+            &params,
+            &[fused_left_row.as_slice()],
+            num_slots,
+            &mut fused_circuit,
+        );
+        let fused_reconstructed = fused_outputs
+            .iter()
+            .map(|output| output.reconstruct(&mut fused_circuit))
+            .collect::<Vec<_>>();
+        fused_circuit.output(fused_reconstructed);
+
+        let mut manual_circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_params, manual_ctx) = create_test_context_with_q_level(&mut manual_circuit, q_level);
+        let manual_left_row = (0..gadget_len)
+            .map(|_| {
+                let left0 =
+                    NestedRnsPoly::input(manual_ctx.clone(), q_level, None, &mut manual_circuit);
+                let left1 =
+                    NestedRnsPoly::input(manual_ctx.clone(), q_level, None, &mut manual_circuit);
+                left0.add(&left1, &mut manual_circuit).lazy_reduce_if_unreduced(&mut manual_circuit)
+            })
+            .collect::<Vec<_>>();
+        let manual_right0 =
+            NestedRnsPoly::input(manual_ctx.clone(), q_level, None, &mut manual_circuit);
+        let manual_right1 =
+            NestedRnsPoly::input(manual_ctx.clone(), q_level, None, &mut manual_circuit);
+        let manual_right = manual_right0
+            .add(&manual_right1, &mut manual_circuit)
+            .lazy_reduce_if_unreduced(&mut manual_circuit);
+        let manual_outputs = manual_right.conv_mul_right_decomposed_many(
+            &params,
+            &[manual_left_row.as_slice()],
+            num_slots,
+            &mut manual_circuit,
+        );
+        let manual_reconstructed = manual_outputs
+            .iter()
+            .map(|output| output.reconstruct(&mut manual_circuit))
+            .collect::<Vec<_>>();
+        manual_circuit.output(manual_reconstructed);
+
+        assert!(
+            fused_circuit.non_free_depth() < manual_circuit.non_free_depth(),
+            "unreduced conv_mul_right_decomposed_many should reduce non-free depth: fused={}, manual={}",
+            fused_circuit.non_free_depth(),
+            manual_circuit.non_free_depth()
+        );
     }
 
     #[sequential_test::sequential]

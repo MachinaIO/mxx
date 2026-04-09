@@ -912,8 +912,37 @@ impl<P: Poly> PolyCircuit<P> {
         GateId(gate_id)
     }
 
+    fn new_sub_circuit_output_gate(
+        &mut self,
+        call_id: usize,
+        output_idx: usize,
+        num_inputs: usize,
+    ) -> GateId {
+        #[cfg(debug_assertions)]
+        {
+            assert_eq!(self.output_ids.len(), 0);
+        }
+        let gate_id = GateId(self.gates.len());
+        let gate_type = PolyGateType::SubCircuitOutput { call_id, output_idx, num_inputs };
+        self.increment_gate_kind(gate_type.kind());
+        self.gates.insert(gate_id, PolyGate::new(gate_id, gate_type, Vec::new()));
+        gate_id
+    }
+
     fn increment_gate_kind(&mut self, kind: PolyGateKind) {
         *self.gate_counts.entry(kind).or_insert(0) += 1;
+    }
+
+    fn gate_dependency_inputs<'a>(&'a self, gate: &'a PolyGate) -> &'a [GateId] {
+        match &gate.gate_type {
+            PolyGateType::SubCircuitOutput { call_id, .. } => self
+                .sub_circuit_calls
+                .get(call_id)
+                .expect("sub-circuit call missing")
+                .inputs
+                .as_slice(),
+            _ => gate.input_gates.as_slice(),
+        }
     }
 
     /// Computes a topological order (as a vector of gate IDs) for all gates that
@@ -930,10 +959,11 @@ impl<P: Poly> PolyCircuit<P> {
 
         while let Some((node, child_idx)) = stack.pop() {
             let gate = self.gates.get(&node).expect("gate not found");
+            let dependency_inputs = self.gate_dependency_inputs(gate);
 
-            if child_idx < gate.input_gates.len() {
+            if child_idx < dependency_inputs.len() {
                 stack.push((node, child_idx + 1));
-                let child = gate.input_gates[child_idx];
+                let child = dependency_inputs[child_idx];
                 if visited.insert(child) {
                     stack.push((child, 0));
                 }
@@ -954,7 +984,8 @@ impl<P: Poly> PolyCircuit<P> {
         let orders = self.topological_order();
         for gate_id in orders.into_iter() {
             let gate = self.gates.get(&gate_id).expect("gate not found");
-            if gate.input_gates.is_empty() {
+            let dependency_inputs = self.gate_dependency_inputs(gate);
+            if dependency_inputs.is_empty() {
                 // Inputs and consts have no dependencies; place them at level 0
                 gate_levels.insert(gate_id, 0);
                 if levels.is_empty() {
@@ -964,8 +995,7 @@ impl<P: Poly> PolyCircuit<P> {
                 continue;
             }
             // Find the maximum level among all input gates, then add 1.
-            let max_input_level = gate
-                .input_gates
+            let max_input_level = dependency_inputs
                 .iter()
                 .map(|id| gate_levels[id])
                 .max()
@@ -1200,7 +1230,7 @@ impl<P: Poly> PolyCircuit<P> {
                 let mut local_count = HashMap::<GateId, usize>::new();
                 for gate_id in level {
                     let gate = self.gates.get(gate_id).expect("gate not found");
-                    for input_id in &gate.input_gates {
+                    for input_id in self.gate_dependency_inputs(gate) {
                         *local_count.entry(*input_id).or_insert(0) += 1;
                     }
                 }
@@ -1262,7 +1292,7 @@ impl<P: Poly> PolyCircuit<P> {
                 .collect()
         };
         let release_consumed_inputs = |gate: &PolyGate| {
-            for input_id in &gate.input_gates {
+            for input_id in self.gate_dependency_inputs(gate) {
                 if output_set.contains(input_id) {
                     continue;
                 }
@@ -1790,10 +1820,7 @@ impl<P: Poly> PolyCircuit<P> {
         let inputs_vec = inputs.to_vec();
         let mut outputs = Vec::with_capacity(num_outputs);
         for output_idx in 0..num_outputs {
-            let gate_type =
-                PolyGateType::SubCircuitOutput { call_id, output_idx, num_inputs: inputs.len() };
-            let gate_id = self.new_gate_generic(inputs_vec.clone(), gate_type);
-            outputs.push(gate_id);
+            outputs.push(self.new_sub_circuit_output_gate(call_id, output_idx, inputs.len()));
         }
         let call = SubCircuitCall {
             sub_circuit_id: circuit_id,

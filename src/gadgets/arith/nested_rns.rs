@@ -41,6 +41,7 @@ pub struct NestedRnsPolyContext {
     lut_real_to_v_id: usize,
     add_without_reduce_id: usize,
     lazy_reduce_id: usize,
+    decomposition_terms_id: usize,
     gadget_decompose_id: usize,
     full_reduce_ids: Vec<usize>,
     mul_lazy_reduce_id: usize,
@@ -164,8 +165,16 @@ impl NestedRnsPolyContext {
         (max_plaintexts, p_max_traces)
     }
 
-    fn reduced_p_max_trace(&self) -> BigUint {
+    pub(crate) fn reduced_p_max_trace(&self) -> BigUint {
         BigUint::from(self.p_max - 1)
+    }
+
+    pub(crate) fn p_full_ref(&self) -> &BigUint {
+        &self.p_full
+    }
+
+    pub(crate) fn lut_mod_p_max_map_size_ref(&self) -> &BigUint {
+        &self.lut_mod_p_max_map_size
     }
 
     fn unreduced_trace_threshold(&self) -> BigUint {
@@ -254,6 +263,12 @@ impl NestedRnsPolyContext {
             );
             let lazy_reduce_id = circuit
                 .register_sub_circuit(Self::lazy_reduce_subcircuit::<P>(&p_moduli, &lut_mod_p_ids));
+            let decomposition_terms_id =
+                circuit.register_sub_circuit(Self::decomposition_terms_subcircuit::<P>(
+                    &lut_x_to_y_ids,
+                    &lut_x_to_real_ids,
+                    lut_real_to_v_id,
+                ));
             let gadget_decompose_id =
                 circuit.register_sub_circuit(Self::gadget_decompose_subcircuit::<P>(
                     &p_moduli,
@@ -294,6 +309,7 @@ impl NestedRnsPolyContext {
                 lut_real_to_v_id,
                 add_without_reduce_id,
                 lazy_reduce_id,
+                decomposition_terms_id,
                 gadget_decompose_id,
                 full_reduce_ids,
                 mul_lazy_reduce_id,
@@ -502,6 +518,12 @@ impl NestedRnsPolyContext {
         );
         let lazy_reduce_id = circuit
             .register_sub_circuit(Self::lazy_reduce_subcircuit::<P>(&p_moduli, &lut_mod_p_ids));
+        let decomposition_terms_id =
+            circuit.register_sub_circuit(Self::decomposition_terms_subcircuit::<P>(
+                &lut_x_to_y_ids,
+                &lut_x_to_real_ids,
+                lut_real_to_v_id,
+            ));
         let gadget_decompose_id =
             circuit.register_sub_circuit(Self::gadget_decompose_subcircuit::<P>(
                 &p_moduli,
@@ -542,6 +564,7 @@ impl NestedRnsPolyContext {
             lut_real_to_v_id,
             add_without_reduce_id,
             lazy_reduce_id,
+            decomposition_terms_id,
             gadget_decompose_id,
             full_reduce_ids,
             mul_lazy_reduce_id,
@@ -588,6 +611,12 @@ impl NestedRnsPolyContext {
             &p_moduli,
             &self.lut_mod_p_ids,
         ));
+        let decomposition_terms_id =
+            circuit.register_sub_circuit(Self::decomposition_terms_subcircuit::<P>(
+                &self.lut_x_to_y_ids,
+                &self.lut_x_to_real_ids,
+                self.lut_real_to_v_id,
+            ));
         let gadget_decompose_id =
             circuit.register_sub_circuit(Self::gadget_decompose_subcircuit::<P>(
                 &p_moduli,
@@ -628,6 +657,7 @@ impl NestedRnsPolyContext {
             lut_real_to_v_id: self.lut_real_to_v_id,
             add_without_reduce_id,
             lazy_reduce_id,
+            decomposition_terms_id,
             gadget_decompose_id,
             full_reduce_ids,
             mul_lazy_reduce_id,
@@ -765,6 +795,32 @@ impl NestedRnsPolyContext {
         circuit
     }
 
+    fn decomposition_terms_subcircuit<P: Poly>(
+        lut_x_to_y_ids: &[usize],
+        lut_x_to_real_ids: &[usize],
+        lut_real_to_v_id: usize,
+    ) -> PolyCircuit<P> {
+        assert_eq!(
+            lut_x_to_y_ids.len(),
+            lut_x_to_real_ids.len(),
+            "decomposition-terms LUT depths must match"
+        );
+        let mut circuit = PolyCircuit::<P>::new();
+        let p_moduli_depth = lut_x_to_y_ids.len();
+        let inputs = circuit.input(p_moduli_depth);
+        let mut outputs = Vec::with_capacity(p_moduli_depth + 1);
+        let mut real_sum = circuit.const_zero_gate();
+        for p_idx in 0..p_moduli_depth {
+            let y_i = circuit.public_lookup_gate(inputs[p_idx], lut_x_to_y_ids[p_idx]);
+            outputs.push(y_i);
+            let real_i = circuit.public_lookup_gate(inputs[p_idx], lut_x_to_real_ids[p_idx]);
+            real_sum = circuit.add_gate(real_sum, real_i);
+        }
+        outputs.push(circuit.public_lookup_gate(real_sum, lut_real_to_v_id));
+        circuit.output(outputs);
+        circuit
+    }
+
     fn gadget_decompose_subcircuit<P: Poly>(
         p_moduli: &[u64],
         lut_mod_p_ids: &[usize],
@@ -775,17 +831,15 @@ impl NestedRnsPolyContext {
         let mut circuit = PolyCircuit::<P>::new();
         let p_moduli_depth = p_moduli.len();
         let inputs = circuit.input(p_moduli_depth);
-        let ys = (0..p_moduli_depth)
-            .map(|p_idx| circuit.public_lookup_gate(inputs[p_idx], lut_x_to_y_ids[p_idx]))
-            .collect::<Vec<_>>();
-        let reals = (0..p_moduli_depth)
-            .map(|p_idx| circuit.public_lookup_gate(inputs[p_idx], lut_x_to_real_ids[p_idx]))
-            .collect::<Vec<_>>();
-        let mut real_sum = circuit.const_zero_gate();
-        for real in reals {
-            real_sum = circuit.add_gate(real_sum, real);
-        }
-        let w = circuit.public_lookup_gate(real_sum, lut_real_to_v_id);
+        let decomposition_terms_id =
+            circuit.register_sub_circuit(Self::decomposition_terms_subcircuit::<P>(
+                lut_x_to_y_ids,
+                lut_x_to_real_ids,
+                lut_real_to_v_id,
+            ));
+        let decomposition_terms = circuit.call_sub_circuit(decomposition_terms_id, &inputs);
+        let ys = decomposition_terms[..p_moduli_depth].to_vec();
+        let w = decomposition_terms[p_moduli_depth];
         let lazy_reduce_id = circuit
             .register_sub_circuit(Self::lazy_reduce_subcircuit::<P>(p_moduli, lut_mod_p_ids));
 
@@ -1883,18 +1937,14 @@ impl<P: Poly> NestedRnsPoly<P> {
     ) -> (Vec<GateId>, GateId) {
         let levels = self.resolve_enable_levels();
         assert!(q_idx < levels, "q_idx {} exceeds active levels {}", q_idx, levels);
-
-        let mut ys = Vec::with_capacity(self.ctx.p_moduli.len());
-        let mut real_sum = circuit.const_zero_gate();
-        for p_idx in 0..self.ctx.p_moduli.len() {
-            let input = self.inner[q_idx][p_idx];
-            let y_i = circuit.public_lookup_gate(input, self.ctx.lut_x_to_y_ids[p_idx]);
-            ys.push(y_i);
-            let real_i = circuit.public_lookup_gate(input, self.ctx.lut_x_to_real_ids[p_idx]);
-            real_sum = circuit.add_gate(real_sum, real_i);
-        }
-        let w = circuit.public_lookup_gate(real_sum, self.ctx.lut_real_to_v_id);
-        (ys, w)
+        let outputs = circuit.call_sub_circuit(self.ctx.decomposition_terms_id, &self.inner[q_idx]);
+        assert_eq!(
+            outputs.len(),
+            self.ctx.p_moduli.len() + 1,
+            "decomposition_terms subcircuit output size must match |p| + 1"
+        );
+        let p_moduli_depth = self.ctx.p_moduli.len();
+        (outputs[..p_moduli_depth].to_vec(), outputs[p_moduli_depth])
     }
 
     fn sparse_constant_level_poly(

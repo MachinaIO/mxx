@@ -60,13 +60,12 @@ use tracing::info;
 const DEFAULT_RING_DIM: u32 = 1 << 2;
 const DEFAULT_INPUT_SIZE: usize = 5;
 const DEFAULT_OUTPUT_SIZE: usize = 1;
-const DEFAULT_ACTIVE_LEVELS: usize = 1;
 const DEFAULT_CRT_BITS: usize = 24;
 const DEFAULT_P_MODULI_BITS: usize = 7;
 const DEFAULT_MAX_UNREDUCED_MULS: usize = 4;
 const DEFAULT_SCALE: u64 = 1 << 8;
 const DEFAULT_BASE_BITS: u32 = 12;
-const DEFAULT_MAX_CRT_DEPTH: usize = 48;
+const DEFAULT_MAX_CRT_DEPTH: usize = 100;
 const DEFAULT_ERROR_SIGMA: f64 = 4.0;
 const DEFAULT_D_SECRET: usize = 1;
 const DEFAULT_BENCH_ITERATIONS: usize = 1;
@@ -96,7 +95,6 @@ struct GoldreichRingGswBenchConfig {
     ring_dim: u32,
     input_size: usize,
     output_size: usize,
-    active_levels: usize,
     crt_bits: usize,
     p_moduli_bits: usize,
     max_unreduced_muls: usize,
@@ -147,10 +145,6 @@ impl GoldreichRingGswBenchConfig {
             env_or_parse_usize("GGH15_GOLDREICH_RING_GSW_BENCH_INPUT_SIZE", DEFAULT_INPUT_SIZE);
         let output_size =
             env_or_parse_usize("GGH15_GOLDREICH_RING_GSW_BENCH_OUTPUT_SIZE", DEFAULT_OUTPUT_SIZE);
-        let active_levels = env_or_parse_usize(
-            "GGH15_GOLDREICH_RING_GSW_BENCH_ACTIVE_LEVELS",
-            DEFAULT_ACTIVE_LEVELS,
-        );
         let crt_bits =
             env_or_parse_usize("GGH15_GOLDREICH_RING_GSW_BENCH_CRT_BITS", DEFAULT_CRT_BITS);
         let p_moduli_bits = env_or_parse_usize(
@@ -184,7 +178,6 @@ impl GoldreichRingGswBenchConfig {
         assert!(ring_dim > 0, "GGH15_GOLDREICH_RING_GSW_BENCH_RING_DIM must be > 0");
         assert!(input_size >= 5, "GGH15_GOLDREICH_RING_GSW_BENCH_INPUT_SIZE must be at least 5");
         assert!(output_size > 0, "GGH15_GOLDREICH_RING_GSW_BENCH_OUTPUT_SIZE must be > 0");
-        assert!(active_levels > 0, "GGH15_GOLDREICH_RING_GSW_BENCH_ACTIVE_LEVELS must be > 0");
         assert!(crt_bits > 0, "GGH15_GOLDREICH_RING_GSW_BENCH_CRT_BITS must be > 0");
         assert!(p_moduli_bits > 0, "GGH15_GOLDREICH_RING_GSW_BENCH_P_MODULI_BITS must be > 0");
         assert!(
@@ -193,10 +186,7 @@ impl GoldreichRingGswBenchConfig {
         );
         assert!(scale > 0, "GGH15_GOLDREICH_RING_GSW_BENCH_SCALE must be > 0");
         assert!(base_bits > 0, "GGH15_GOLDREICH_RING_GSW_BENCH_BASE_BITS must be > 0");
-        assert!(
-            max_crt_depth >= active_levels,
-            "GGH15_GOLDREICH_RING_GSW_BENCH_MAX_CRT_DEPTH must be >= ACTIVE_LEVELS"
-        );
+        assert!(max_crt_depth > 0, "GGH15_GOLDREICH_RING_GSW_BENCH_MAX_CRT_DEPTH must be > 0");
         assert!(error_sigma >= 0.0, "GGH15_GOLDREICH_RING_GSW_BENCH_ERROR_SIGMA must be >= 0");
         assert!(d_secret > 0, "GGH15_GOLDREICH_RING_GSW_BENCH_D_SECRET must be > 0");
         assert!(
@@ -208,7 +198,6 @@ impl GoldreichRingGswBenchConfig {
             ring_dim,
             input_size,
             output_size,
-            active_levels,
             crt_bits,
             p_moduli_bits,
             max_unreduced_muls,
@@ -233,7 +222,7 @@ impl GoldreichRingGswBenchConfig {
                 self.ring_dim,
                 self.input_size,
                 self.output_size,
-                self.active_levels,
+                crt_depth,
                 self.crt_bits,
                 crt_depth
             )
@@ -274,9 +263,11 @@ fn active_q_moduli_and_modulus<T: PolyParams>(
 
 fn ring_gsw_q_modulus<P: Poly>(ctx: &RingGswContext<P>) -> BigUint {
     let (q_moduli, _, _) = ctx.params.to_crt();
-    BigUint::from(
-        *q_moduli.first().expect("Ring-GSW benchmark requires at least one active q modulus"),
-    )
+    q_moduli
+        .iter()
+        .skip(ctx.level_offset)
+        .take(ctx.active_levels)
+        .fold(BigUint::from(1u64), |acc, &q_i| acc * BigUint::from(q_i))
 }
 
 fn max_bigdecimal<I>(values: I) -> BigDecimal
@@ -314,8 +305,8 @@ fn probe_crt_depth_for_goldreich_ring_gsw_bench(
     e_init_norm: &BigDecimal,
 ) -> CrtDepthProbe {
     let params = DCRTPolyParams::new(cfg.ring_dim, crt_depth, cfg.crt_bits, cfg.base_bits);
-    let (active_q_moduli, active_q, actual_crt_depth) =
-        active_q_moduli_and_modulus(&params, cfg.active_levels);
+    let (_, _, actual_crt_depth) = params.to_crt();
+    let (active_q_moduli, active_q, _) = active_q_moduli_and_modulus(&params, actual_crt_depth);
     let full_q = params.modulus();
     let q_max = *active_q_moduli.iter().max().expect("active_q_moduli must not be empty");
     let (circuit, ctx, encrypted_outputs) =
@@ -360,7 +351,7 @@ fn probe_crt_depth_for_goldreich_ring_gsw_bench(
     info!(
         "crt_depth={} active_levels={} active_q_bits={} full_q_bits={} ring_gsw_q_bits={} non_free_depth={} num_inputs={} output_polys={} max_eval_error_bits={} eval_threshold_bits={} max_decryption_error_bits={} decryption_threshold_bits={} eval_ok={} decryption_ok={}",
         crt_depth,
-        cfg.active_levels,
+        actual_crt_depth,
         active_q.bits(),
         full_q.bits(),
         ring_gsw_q.bits(),
@@ -384,6 +375,7 @@ fn build_goldreich_ring_gsw_circuit<P: Poly + 'static>(
 ) -> (PolyCircuit<P>, Arc<RingGswContext<P>>, Vec<RingGswCiphertext<P>>) {
     let build_start = Instant::now();
     let mut circuit = PolyCircuit::<P>::new();
+    let (_, _, active_levels) = params.to_crt();
     let ctx = Arc::new(RingGswContext::setup(
         &mut circuit,
         params,
@@ -391,7 +383,7 @@ fn build_goldreich_ring_gsw_circuit<P: Poly + 'static>(
         cfg.p_moduli_bits,
         cfg.max_unreduced_muls,
         cfg.scale,
-        Some(cfg.active_levels),
+        Some(active_levels),
         None,
     ));
     let goldreich =
@@ -422,7 +414,7 @@ fn find_crt_depth_for_goldreich_ring_gsw_bench(
     let base = BigDecimal::from_biguint(BigUint::from(1u32) << cfg.base_bits, 0);
     let error_sigma = BigDecimal::from_f64(cfg.error_sigma).expect("valid error sigma");
     let e_init_norm = &error_sigma * BigDecimal::from_f32(6.5).unwrap();
-    let min_crt_depth = cfg.active_levels;
+    let min_crt_depth = 1usize;
     let mut low = min_crt_depth;
     let mut high = cfg.max_crt_depth;
     while low < high {
@@ -550,7 +542,7 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
     assert_eq!(params.modulus(), cpu_params.modulus());
 
     let (all_q_moduli, _, actual_crt_depth) = params.to_crt();
-    let (active_q_moduli, active_q, _) = active_q_moduli_and_modulus(&params, cfg.active_levels);
+    let (active_q_moduli, active_q, _) = active_q_moduli_and_modulus(&params, actual_crt_depth);
     let (circuit, ctx, encrypted_outputs) =
         build_goldreich_ring_gsw_circuit::<GpuDCRTPoly>(&params, &cfg);
     let max_selected_decryption_error = max_bigdecimal(
@@ -572,7 +564,7 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
         cfg.num_slots(),
         cfg.input_size,
         cfg.output_size,
-        cfg.active_levels,
+        actual_crt_depth,
         cfg.crt_bits,
         cfg.p_moduli_bits,
         cfg.base_bits,

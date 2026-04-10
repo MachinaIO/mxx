@@ -1,5 +1,5 @@
 use crate::{
-    circuit::{Evaluable, PolyCircuit, PolyGateType, gate::GateId},
+    circuit::{Evaluable, PolyCircuit, PolyGateType, SubCircuitParamValue, gate::GateId},
     element::PolyElem,
     impl_binop_with_refs,
     lookup::{PltEvaluator, PublicLut, commit_eval::compute_padded_len},
@@ -131,35 +131,43 @@ impl PolyCircuit<DCRTPoly> {
                         wires.get(&gate.input_gates[1]).expect("wire missing for Mul").clone();
                     left * &right
                 }
-                PolyGateType::SmallScalarMul { scalar } => wires
-                    .get(&gate.input_gates[0])
-                    .expect("wire missing for SmallScalarMul")
-                    .small_scalar_mul(&(), scalar),
-                PolyGateType::LargeScalarMul { scalar } => wires
-                    .get(&gate.input_gates[0])
-                    .expect("wire missing for LargeScalarMul")
-                    .large_scalar_mul(&(), scalar),
+                PolyGateType::SmallScalarMul { scalar } => {
+                    let scalar = scalar.resolve_small_scalar(&[]);
+                    wires
+                        .get(&gate.input_gates[0])
+                        .expect("wire missing for SmallScalarMul")
+                        .small_scalar_mul(&(), scalar)
+                }
+                PolyGateType::LargeScalarMul { scalar } => {
+                    let scalar = scalar.resolve_large_scalar(&[]);
+                    wires
+                        .get(&gate.input_gates[0])
+                        .expect("wire missing for LargeScalarMul")
+                        .large_scalar_mul(&(), scalar)
+                }
                 PolyGateType::SlotTransfer { src_slots } => {
+                    let src_slots = src_slots.resolve_slot_transfer(&[]);
                     let input =
                         wires.get(&gate.input_gates[0]).expect("wire missing for SlotTransfer");
                     slot_transfer_evaluator.expect("slot transfer evaluator missing").slot_transfer(
                         &(),
                         input,
-                        src_slots,
+                        src_slots.as_ref(),
                         gate_id,
                     )
                 }
                 PolyGateType::PubLut { lut_id } => {
+                    let lut_id = lut_id.resolve_public_lookup(&[]);
                     let input =
                         wires.get(&gate.input_gates[0]).expect("wire missing for Public Lookup");
-                    let lookup = self.lookup_table(*lut_id);
+                    let lookup = self.lookup_table(lut_id);
                     plt_evaluator.expect("public lookup evaluator missing").public_lookup(
                         &(),
                         lookup.as_ref(),
                         &one_error,
                         input,
                         gate_id,
-                        *lut_id,
+                        lut_id,
                     )
                 }
                 PolyGateType::SubCircuitOutput { call_id, .. } => {
@@ -179,6 +187,7 @@ impl PolyCircuit<DCRTPoly> {
                     let summary_idx = self.ensure_cached_sub_circuit_summary(
                         call.sub_circuit_id,
                         &input_exprs,
+                        &call.param_bindings,
                         &one_error,
                         &mut sub_circuit_summaries,
                         &mut cache_stats,
@@ -203,8 +212,77 @@ impl PolyCircuit<DCRTPoly> {
                     );
                     wires.get(&gate_id).expect("sub-circuit output should be populated").clone()
                 }
+                PolyGateType::SummedSubCircuitOutput { summed_call_id, .. } => {
+                    let call = self.summed_sub_circuit_call_info(*summed_call_id);
+                    let mut accumulated: Option<Vec<ErrorNorm>> = None;
+                    for (sub_inputs_ids, param_bindings) in
+                        call.call_inputs.iter().zip(call.param_bindings.iter())
+                    {
+                        let sub_inputs = sub_inputs_ids
+                            .iter()
+                            .map(|input_id| {
+                                wires
+                                    .get(input_id)
+                                    .expect("wire missing for summed sub-circuit input")
+                                    .clone()
+                            })
+                            .collect::<Vec<_>>();
+                        let input_exprs = sub_inputs
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, input)| ErrorNormSummaryExpr::input(idx, input))
+                            .collect::<Vec<_>>();
+                        let summary_idx = self.ensure_cached_sub_circuit_summary(
+                            call.sub_circuit_id,
+                            &input_exprs,
+                            param_bindings.as_ref(),
+                            &one_error,
+                            &mut sub_circuit_summaries,
+                            &mut cache_stats,
+                            plt_evaluator,
+                            slot_transfer_evaluator,
+                        );
+                        let sub_outputs = sub_circuit_summaries
+                            .get(&call.sub_circuit_id)
+                            .expect("error-norm summed sub-circuit summary cache missing")
+                            [summary_idx]
+                            .summary
+                            .evaluate(&sub_inputs);
+                        match accumulated.as_mut() {
+                            Some(current) => {
+                                for (acc, output) in current.iter_mut().zip(sub_outputs.into_iter())
+                                {
+                                    *acc = acc.clone() + &output;
+                                }
+                            }
+                            None => accumulated = Some(sub_outputs),
+                        }
+                    }
+                    let accumulated = accumulated
+                        .expect("summed sub-circuit call requires at least one inner call");
+                    for (output_gate_id, output) in
+                        call.output_gate_ids.iter().copied().zip(accumulated.into_iter())
+                    {
+                        wires.insert(output_gate_id, output);
+                    }
+                    let flattened_inputs =
+                        call.call_inputs.into_iter().flatten().collect::<Vec<_>>();
+                    self.release_error_norm_inputs(
+                        &flattened_inputs,
+                        &output_set,
+                        &mut remaining_use_count,
+                        &mut wires,
+                    );
+                    wires
+                        .get(&gate_id)
+                        .expect("summed sub-circuit output should be populated")
+                        .clone()
+                }
             };
-            if !matches!(gate.gate_type, PolyGateType::SubCircuitOutput { .. }) {
+            if !matches!(
+                &gate.gate_type,
+                PolyGateType::SubCircuitOutput { .. } | PolyGateType::SummedSubCircuitOutput { .. }
+            ) {
                 wires.insert(gate_id, value);
                 self.release_error_norm_inputs(
                     &gate.input_gates,
@@ -232,6 +310,7 @@ impl PolyCircuit<DCRTPoly> {
         &self,
         one_error: &ErrorNorm,
         input_exprs: &[ErrorNormSummaryExpr],
+        param_bindings: &[SubCircuitParamValue],
         plt_evaluator: Option<&P>,
         slot_transfer_evaluator: Option<&dyn AffineSlotTransferEvaluator>,
         cache_stats: &mut ErrorNormSubCircuitCacheStats,
@@ -276,35 +355,39 @@ impl PolyCircuit<DCRTPoly> {
                     left.mul_bound(right)
                 }
                 PolyGateType::SmallScalarMul { scalar } => {
+                    let scalar = scalar.resolve_small_scalar(param_bindings);
                     let input = gate_exprs
                         .get(&gate.input_gates[0])
                         .expect("error-norm expression missing for SmallScalarMul");
                     input.small_scalar_mul_bound(scalar)
                 }
                 PolyGateType::LargeScalarMul { scalar } => {
+                    let scalar = scalar.resolve_large_scalar(param_bindings);
                     let input = gate_exprs
                         .get(&gate.input_gates[0])
                         .expect("error-norm expression missing for LargeScalarMul");
                     input.large_scalar_mul_bound(scalar)
                 }
                 PolyGateType::SlotTransfer { src_slots } => {
+                    let src_slots = src_slots.resolve_slot_transfer(param_bindings);
                     let input = gate_exprs
                         .get(&gate.input_gates[0])
                         .expect("error-norm expression missing for SlotTransfer");
                     slot_transfer_evaluator
                         .expect("slot transfer evaluator missing")
-                        .slot_transfer_affine(input, src_slots, gate_id)
+                        .slot_transfer_affine(input, src_slots.as_ref(), gate_id)
                 }
                 PolyGateType::PubLut { lut_id } => {
+                    let lut_id = lut_id.resolve_public_lookup(param_bindings);
                     let input = gate_exprs
                         .get(&gate.input_gates[0])
                         .expect("error-norm expression missing for Public Lookup");
-                    let lookup = self.lookup_table(*lut_id);
+                    let lookup = self.lookup_table(lut_id);
                     plt_evaluator.expect("public lookup evaluator missing").public_lookup_affine(
                         input,
                         lookup.as_ref(),
                         gate_id,
-                        *lut_id,
+                        lut_id,
                     )
                 }
                 PolyGateType::SubCircuitOutput { call_id, .. } => {
@@ -322,6 +405,7 @@ impl PolyCircuit<DCRTPoly> {
                     let summary_idx = self.ensure_cached_sub_circuit_summary(
                         call.sub_circuit_id,
                         &actual_inputs,
+                        &call.param_bindings,
                         one_error,
                         &mut child_summaries,
                         cache_stats,
@@ -343,8 +427,66 @@ impl PolyCircuit<DCRTPoly> {
                         .expect("error-norm sub-circuit output should be populated")
                         .clone()
                 }
+                PolyGateType::SummedSubCircuitOutput { summed_call_id, .. } => {
+                    let call = self.summed_sub_circuit_call_info(*summed_call_id);
+                    let mut accumulated: Option<Vec<ErrorNormSummaryExpr>> = None;
+                    for (sub_inputs_ids, param_bindings) in
+                        call.call_inputs.iter().zip(call.param_bindings.iter())
+                    {
+                        let actual_inputs = sub_inputs_ids
+                            .iter()
+                            .map(|input_id| {
+                                gate_exprs
+                                    .get(input_id)
+                                    .expect(
+                                        "error-norm expression missing for summed sub-circuit input",
+                                    )
+                                    .clone()
+                            })
+                            .collect::<Vec<_>>();
+                        let summary_idx = self.ensure_cached_sub_circuit_summary(
+                            call.sub_circuit_id,
+                            &actual_inputs,
+                            param_bindings.as_ref(),
+                            one_error,
+                            &mut child_summaries,
+                            cache_stats,
+                            plt_evaluator,
+                            slot_transfer_evaluator,
+                        );
+                        let sub_outputs = child_summaries
+                            .get(&call.sub_circuit_id)
+                            .expect("error-norm summed child sub-circuit summary cache missing")
+                            [summary_idx]
+                            .summary
+                            .substitute(&actual_inputs);
+                        match accumulated.as_mut() {
+                            Some(current) => {
+                                for (acc, output) in current.iter_mut().zip(sub_outputs.into_iter())
+                                {
+                                    *acc = acc.add_bound(&output);
+                                }
+                            }
+                            None => accumulated = Some(sub_outputs),
+                        }
+                    }
+                    let accumulated = accumulated
+                        .expect("summed sub-circuit call requires at least one inner call");
+                    for (output_gate_id, output_expr) in
+                        call.output_gate_ids.iter().copied().zip(accumulated.into_iter())
+                    {
+                        gate_exprs.insert(output_gate_id, output_expr);
+                    }
+                    gate_exprs
+                        .get(&gate_id)
+                        .expect("error-norm summed sub-circuit output should be populated")
+                        .clone()
+                }
             };
-            if !matches!(gate.gate_type, PolyGateType::SubCircuitOutput { .. }) {
+            if !matches!(
+                &gate.gate_type,
+                PolyGateType::SubCircuitOutput { .. } | PolyGateType::SummedSubCircuitOutput { .. }
+            ) {
                 gate_exprs.insert(gate_id, expr);
             }
         }
@@ -366,6 +508,7 @@ impl PolyCircuit<DCRTPoly> {
         &self,
         sub_circuit_id: usize,
         input_exprs: &[ErrorNormSummaryExpr],
+        param_bindings: &[SubCircuitParamValue],
         one_error: &ErrorNorm,
         summary_cache: &mut HashMap<usize, Vec<ErrorNormSubCircuitSummaryRecord>>,
         cache_stats: &mut ErrorNormSubCircuitCacheStats,
@@ -376,9 +519,10 @@ impl PolyCircuit<DCRTPoly> {
             input_exprs.iter().map(|input| input.plaintext_norm.clone()).collect::<Vec<_>>();
         let profile_bits = error_norm_plaintext_profile_bits(&input_plaintext_norms);
         let entries = summary_cache.entry(sub_circuit_id).or_default();
-        if let Some(summary_idx) =
-            entries.iter().position(|entry| entry.input_plaintext_norms == input_plaintext_norms)
-        {
+        if let Some(summary_idx) = entries.iter().position(|entry| {
+            entry.input_plaintext_norms == input_plaintext_norms &&
+                entry.param_bindings == param_bindings
+        }) {
             cache_stats.hits += 1;
             debug!(
                 "error-norm sub-circuit summary cache hit sub_circuit_id={} profile_bits={:?} cached_profiles={}",
@@ -410,11 +554,16 @@ impl PolyCircuit<DCRTPoly> {
         let summary = self.registered_sub_circuit(sub_circuit_id).build_sub_circuit_summary(
             one_error,
             &canonical_input_exprs,
+            param_bindings,
             plt_evaluator,
             slot_transfer_evaluator,
             cache_stats,
         );
-        entries.push(ErrorNormSubCircuitSummaryRecord { input_plaintext_norms, summary });
+        entries.push(ErrorNormSubCircuitSummaryRecord {
+            input_plaintext_norms,
+            param_bindings: param_bindings.to_vec(),
+            summary,
+        });
         debug!(
             "error-norm sub-circuit summary cache store sub_circuit_id={} miss_kind={} cached_profiles_after={}",
             sub_circuit_id,
@@ -429,7 +578,13 @@ impl PolyCircuit<DCRTPoly> {
             .gates_in_id_order()
             .collect::<Vec<_>>()
             .par_iter()
-            .filter(|(_, gate)| !matches!(gate.gate_type, PolyGateType::SubCircuitOutput { .. }))
+            .filter(|(_, gate)| {
+                !matches!(
+                    &gate.gate_type,
+                    PolyGateType::SubCircuitOutput { .. } |
+                        PolyGateType::SummedSubCircuitOutput { .. }
+                )
+            })
             .fold(HashMap::new, |mut local, (_, gate)| {
                 for input_id in &gate.input_gates {
                     *local.entry(*input_id).or_insert(0) += 1;
@@ -439,14 +594,28 @@ impl PolyCircuit<DCRTPoly> {
             .reduce(HashMap::new, merge_gate_use_counts);
         let mut seen_call_ids = HashSet::new();
         for (_, gate) in self.gates_in_id_order() {
-            let PolyGateType::SubCircuitOutput { call_id, .. } = gate.gate_type else {
+            let PolyGateType::SubCircuitOutput { call_id, .. } = &gate.gate_type else {
                 continue;
             };
-            if !seen_call_ids.insert(call_id) {
+            if !seen_call_ids.insert(*call_id) {
                 continue;
             }
-            let call = self.sub_circuit_call_info(call_id);
+            let call = self.sub_circuit_call_info(*call_id);
             for input_id in call.inputs {
+                *use_count.entry(input_id).or_insert(0) += 1;
+            }
+        }
+        let mut seen_summed_call_ids = HashSet::new();
+        for (_, gate) in self.gates_in_id_order() {
+            let PolyGateType::SummedSubCircuitOutput { summed_call_id, .. } = &gate.gate_type
+            else {
+                continue;
+            };
+            if !seen_summed_call_ids.insert(*summed_call_id) {
+                continue;
+            }
+            let call = self.summed_sub_circuit_call_info(*summed_call_id);
+            for input_id in call.call_inputs.into_iter().flatten() {
                 *use_count.entry(input_id).or_insert(0) += 1;
             }
         }
@@ -905,6 +1074,7 @@ impl ErrorNormSubCircuitSummary {
 #[derive(Debug, Clone)]
 struct ErrorNormSubCircuitSummaryRecord {
     input_plaintext_norms: Vec<PolyNorm>,
+    param_bindings: Vec<SubCircuitParamValue>,
     summary: ErrorNormSubCircuitSummary,
 }
 

@@ -3,7 +3,7 @@
 mod gpu;
 
 use crate::{
-    circuit::{PolyCircuit, gate::GateId},
+    circuit::{PolyCircuit, SubCircuitParamKind, SubCircuitParamValue, gate::GateId},
     gadgets::conv_mul::{
         negacyclic_conv_mul_right_decomposed_term_many_subcircuit, negacyclic_conv_mul_right_sparse,
     },
@@ -14,7 +14,6 @@ use crate::{
 };
 use num_bigint::BigUint;
 use num_traits::{One, ToPrimitive};
-#[cfg(not(feature = "gpu"))]
 use rayon::prelude::*;
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 use tracing::{debug, info};
@@ -43,7 +42,8 @@ pub struct NestedRnsPolyContext {
     lazy_reduce_id: usize,
     decomposition_terms_id: usize,
     gadget_decompose_id: usize,
-    full_reduce_ids: Vec<usize>,
+    full_reduce_id: usize,
+    full_reduce_bindings: Vec<Vec<SubCircuitParamValue>>,
     mul_lazy_reduce_id: usize,
     mul_right_sparse_id: usize,
 }
@@ -137,6 +137,34 @@ fn precompute_nested_rns_gadget_values(
             level_values
         })
         .collect()
+}
+
+fn full_reduce_param_bindings(
+    scalars_y: &[Vec<u32>],
+    scalars_v: &[u32],
+) -> Vec<SubCircuitParamValue> {
+    let (mut y_bindings, v_bindings) = rayon::join(
+        || {
+            scalars_y
+                .par_iter()
+                .flat_map_iter(|row| {
+                    row.iter().map(|scalar| SubCircuitParamValue::SmallScalarMul(vec![*scalar]))
+                })
+                .collect::<Vec<_>>()
+        },
+        || {
+            scalars_v
+                .par_iter()
+                .map(|scalar| SubCircuitParamValue::SmallScalarMul(vec![*scalar]))
+                .collect::<Vec<_>>()
+        },
+    );
+    let total_len = y_bindings.len() + v_bindings.len();
+    y_bindings.reserve(v_bindings.len());
+    y_bindings.extend(v_bindings);
+    debug_assert_eq!(y_bindings.len(), total_len);
+    let bindings = y_bindings;
+    bindings
 }
 
 impl NestedRnsPolyContext {
@@ -277,18 +305,16 @@ impl NestedRnsPolyContext {
                     &lut_x_to_real_ids,
                     lut_real_to_v_id,
                 ));
-            let full_reduce_ids = (0..q_moduli_depth)
-                .map(|q_idx| {
-                    circuit.register_sub_circuit(Self::full_reduce_subcircuit::<P>(
-                        &p_moduli,
-                        &lut_mod_p_ids,
-                        &lut_x_to_y_ids,
-                        &lut_x_to_real_ids,
-                        lut_real_to_v_id,
-                        &scalars_y[q_idx],
-                        &scalars_v[q_idx],
-                    ))
-                })
+            let full_reduce_id = circuit.register_sub_circuit(Self::full_reduce_subcircuit::<P>(
+                &p_moduli,
+                &lut_mod_p_ids,
+                &lut_x_to_y_ids,
+                &lut_x_to_real_ids,
+                lut_real_to_v_id,
+            ));
+            let full_reduce_bindings = (0..q_moduli_depth)
+                .into_par_iter()
+                .map(|q_idx| full_reduce_param_bindings(&scalars_y[q_idx], &scalars_v[q_idx]))
                 .collect::<Vec<_>>();
             return Self {
                 p_moduli_bits,
@@ -311,7 +337,8 @@ impl NestedRnsPolyContext {
                 lazy_reduce_id,
                 decomposition_terms_id,
                 gadget_decompose_id,
-                full_reduce_ids,
+                full_reduce_id,
+                full_reduce_bindings,
                 mul_lazy_reduce_id,
                 mul_right_sparse_id,
             };
@@ -532,18 +559,16 @@ impl NestedRnsPolyContext {
                 &lut_x_to_real_ids,
                 lut_real_to_v_id,
             ));
-        let full_reduce_ids = (0..q_moduli_depth)
-            .map(|q_idx| {
-                circuit.register_sub_circuit(Self::full_reduce_subcircuit::<P>(
-                    &p_moduli,
-                    &lut_mod_p_ids,
-                    &lut_x_to_y_ids,
-                    &lut_x_to_real_ids,
-                    lut_real_to_v_id,
-                    &scalars_y[q_idx],
-                    &scalars_v[q_idx],
-                ))
-            })
+        let full_reduce_id = circuit.register_sub_circuit(Self::full_reduce_subcircuit::<P>(
+            &p_moduli,
+            &lut_mod_p_ids,
+            &lut_x_to_y_ids,
+            &lut_x_to_real_ids,
+            lut_real_to_v_id,
+        ));
+        let full_reduce_bindings = (0..q_moduli_depth)
+            .into_par_iter()
+            .map(|q_idx| full_reduce_param_bindings(&scalars_y[q_idx], &scalars_v[q_idx]))
             .collect::<Vec<_>>();
         Self {
             p_moduli_bits,
@@ -566,7 +591,8 @@ impl NestedRnsPolyContext {
             lazy_reduce_id,
             decomposition_terms_id,
             gadget_decompose_id,
-            full_reduce_ids,
+            full_reduce_id,
+            full_reduce_bindings,
             mul_lazy_reduce_id,
             mul_right_sparse_id,
         }
@@ -625,18 +651,16 @@ impl NestedRnsPolyContext {
                 &self.lut_x_to_real_ids,
                 self.lut_real_to_v_id,
             ));
-        let full_reduce_ids = (0..q_moduli_depth)
-            .map(|q_idx| {
-                circuit.register_sub_circuit(Self::full_reduce_subcircuit::<P>(
-                    &p_moduli,
-                    &self.lut_mod_p_ids,
-                    &self.lut_x_to_y_ids,
-                    &self.lut_x_to_real_ids,
-                    self.lut_real_to_v_id,
-                    &scalars_y[q_idx],
-                    &scalars_v[q_idx],
-                ))
-            })
+        let full_reduce_id = circuit.register_sub_circuit(Self::full_reduce_subcircuit::<P>(
+            &p_moduli,
+            &self.lut_mod_p_ids,
+            &self.lut_x_to_y_ids,
+            &self.lut_x_to_real_ids,
+            self.lut_real_to_v_id,
+        ));
+        let full_reduce_bindings = (0..q_moduli_depth)
+            .into_par_iter()
+            .map(|q_idx| full_reduce_param_bindings(&scalars_y[q_idx], &scalars_v[q_idx]))
             .collect::<Vec<_>>();
         Self {
             p_moduli_bits: self.p_moduli_bits,
@@ -659,7 +683,8 @@ impl NestedRnsPolyContext {
             lazy_reduce_id,
             decomposition_terms_id,
             gadget_decompose_id,
-            full_reduce_ids,
+            full_reduce_id,
+            full_reduce_bindings,
             mul_lazy_reduce_id,
             mul_right_sparse_id,
         }
@@ -678,24 +703,6 @@ impl NestedRnsPolyContext {
             self.p_moduli.len()
         );
         circuit.call_sub_circuit(self.lazy_reduce_id, row)
-    }
-
-    pub(crate) fn slot_transfer_q_level_row_no_reduce<P: Poly>(
-        &self,
-        row: &[GateId],
-        src_slots: &[(u32, Option<u32>)],
-        circuit: &mut PolyCircuit<P>,
-    ) -> Vec<GateId> {
-        assert_eq!(
-            row.len(),
-            self.p_moduli.len(),
-            "q-level row depth {} must match p_moduli depth {}",
-            row.len(),
-            self.p_moduli.len()
-        );
-        row.iter()
-            .map(|&gate_id| circuit.slot_transfer_gate(gate_id, src_slots))
-            .collect::<Vec<_>>()
     }
 
     pub(crate) fn mul_q_level_rows<P: Poly>(
@@ -859,13 +866,23 @@ impl NestedRnsPolyContext {
         lut_x_to_y_ids: &[usize],
         lut_x_to_real_ids: &[usize],
         lut_real_to_v_id: usize,
-        scalars_y: &[Vec<u32>],
-        scalars_v: &[u32],
     ) -> PolyCircuit<P> {
         let mut circuit = PolyCircuit::<P>::new();
         let p_moduli_depth = p_moduli.len();
         let inputs = circuit.input(p_moduli_depth);
         let x = &inputs[0..p_moduli_depth];
+        let scalar_y_param_ids = (0..p_moduli_depth)
+            .map(|_| {
+                (0..p_moduli_depth)
+                    .map(|_| {
+                        circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let scalar_v_param_ids = (0..p_moduli_depth)
+            .map(|_| circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul))
+            .collect::<Vec<_>>();
 
         // 1. y_i = [[x]_{p_i} * (p/p_oi)^(-1} mod p_i] mod p_i
         let ys = (0..p_moduli_depth)
@@ -889,11 +906,11 @@ impl NestedRnsPolyContext {
             let mut p_i_sum = circuit.const_zero_gate();
             for p_j_idx in 0..p_moduli_depth {
                 let y_j = ys[p_j_idx];
-                let term = circuit.small_scalar_mul(y_j, &[scalars_y[p_idx][p_j_idx]]);
+                let term = circuit.small_scalar_mul_param(y_j, scalar_y_param_ids[p_idx][p_j_idx]);
                 let term_mod_p = circuit.public_lookup_gate(term, lut_mod_p_ids[p_idx]);
                 p_i_sum = circuit.add_gate(p_i_sum, term_mod_p);
             }
-            let term = circuit.small_scalar_mul(v, &[scalars_v[p_idx]]);
+            let term = circuit.small_scalar_mul_param(v, scalar_v_param_ids[p_idx]);
             let p_i_const = circuit.const_digits(&[p_moduli.len() as u32 * p_moduli[p_idx] as u32]);
             let sum = circuit.add_gate(p_i_sum, p_i_const);
             let p_i_sum = circuit.sub_gate(sum, term);
@@ -1295,14 +1312,15 @@ impl<P: Poly> NestedRnsPoly<P> {
         let operand = self.lazy_reduce_if_unreduced(circuit);
         let levels = self.resolve_enable_levels();
         assert!(
-            levels <= self.ctx.full_reduce_ids.len(),
+            levels <= self.ctx.full_reduce_bindings.len(),
             "enable_levels exceeds full_reduce subcircuit depth"
         );
         let mut result_inner = Vec::with_capacity(levels);
         for q_idx in 0..levels {
-            let outputs = circuit.call_sub_circuit(
-                self.ctx.full_reduce_ids[self.level_offset + q_idx],
+            let outputs = circuit.call_sub_circuit_with_bindings(
+                self.ctx.full_reduce_id,
                 &operand.inner[q_idx],
+                &self.ctx.full_reduce_bindings[self.level_offset + q_idx],
             );
             result_inner.push(outputs);
         }
@@ -3707,7 +3725,7 @@ mod tests {
 
         assert_eq!(ctx.q_moduli_depth, q_level);
         assert_eq!(ctx.max_unreduced_muls, MAX_UNREDUCED_MULS);
-        assert_eq!(ctx.full_reduce_ids.len(), q_level);
+        assert_eq!(ctx.full_reduce_bindings.len(), q_level);
         assert_eq!(ctx.q_moduli.len(), q_level);
         assert_eq!(ctx.full_reduce_max_plaintexts.len(), q_level);
 

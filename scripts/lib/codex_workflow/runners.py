@@ -22,9 +22,26 @@ def _summarize_text(text: str, max_lines: int = 6) -> str:
     return " | ".join(lines[-max_lines:])
 
 
+def _has_failure_signal(text: str) -> bool:
+    return any(
+        needle in text
+        for needle in (
+            "test result: FAILED",
+            "error: test failed",
+            "[gpu-repeat] FAIL",
+            "FAILED.",
+            "panicked at ",
+        )
+    )
+
+
 def summarize_logs(stdout_path: Path | None, stderr_path: Path | None) -> str:
     stderr_text = stderr_path.read_text(encoding="utf-8") if stderr_path and stderr_path.exists() else ""
     stdout_text = stdout_path.read_text(encoding="utf-8") if stdout_path and stdout_path.exists() else ""
+    if _has_failure_signal(stdout_text) and not _has_failure_signal(stderr_text):
+        summary = _summarize_text(stdout_text)
+        if summary:
+            return summary
     summary = _summarize_text(stderr_text)
     if summary:
         return summary

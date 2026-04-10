@@ -1,12 +1,13 @@
 use crate::{
     circuit::{
-        PolyCircuit, PolyGate, StoredSubCircuit, SubCircuitCall, SubCircuitDiskRef,
-        SubCircuitDiskStorage,
-        gate::{GateId, PolyGateType},
+        GateParamSource, PolyCircuit, PolyGate, PolyGateType, StoredSubCircuit, SubCircuitCall,
+        SubCircuitParamKind, SubCircuitParamValue,
+        gate::{GateId, SlotTransferSpec},
     },
     poly::Poly,
 };
 use num_bigint::BigUint;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
@@ -14,14 +15,15 @@ use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SerializablePolyGateType {
     Input,
-    SmallScalarMul { scalar: Vec<u32> },
-    LargeScalarMul { scalar: Vec<BigUint> },
-    SlotTransfer { src_slots: Vec<(u32, Option<u32>)> },
+    SmallScalarMul { scalar: GateParamSource<Vec<u32>> },
+    LargeScalarMul { scalar: GateParamSource<Vec<BigUint>> },
+    SlotTransfer { src_slots: GateParamSource<SlotTransferSpec> },
     Add,
     Sub,
     Mul,
-    PubLut { lut_id: usize },
+    PubLut { lut_id: GateParamSource<usize> },
     SubCircuitOutput { call_id: usize, output_idx: usize, num_inputs: usize },
+    SummedSubCircuitOutput { summed_call_id: usize, output_idx: usize, num_inputs: usize },
 }
 
 impl SerializablePolyGateType {
@@ -32,7 +34,8 @@ impl SerializablePolyGateType {
             SerializablePolyGateType::LargeScalarMul { .. } |
             SerializablePolyGateType::SlotTransfer { .. } |
             SerializablePolyGateType::PubLut { .. } => 1,
-            SerializablePolyGateType::SubCircuitOutput { num_inputs, .. } => *num_inputs,
+            SerializablePolyGateType::SubCircuitOutput { num_inputs, .. } |
+            SerializablePolyGateType::SummedSubCircuitOutput { num_inputs, .. } => *num_inputs,
             SerializablePolyGateType::Add |
             SerializablePolyGateType::Sub |
             SerializablePolyGateType::Mul => 2,
@@ -61,165 +64,347 @@ impl SerializablePolyGate {
 pub struct SerializableSubCircuitCall {
     pub sub_circuit_id: usize,
     pub inputs: Vec<GateId>,
+    pub param_bindings: Vec<SubCircuitParamValue>,
+    pub scoped_call_id: usize,
     pub output_gate_ids: Vec<GateId>,
     pub num_outputs: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SerializableSubCircuitDiskRef {
-    pub scoped_id: usize,
-    pub num_input: usize,
-    pub num_output: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SerializableStoredSubCircuit {
-    Inline(Box<SerializablePolyCircuit>),
-    OnDisk(SerializableSubCircuitDiskRef),
+pub struct SerializableSummedSubCircuitCall {
+    pub sub_circuit_id: usize,
+    pub call_inputs: Vec<Vec<GateId>>,
+    pub param_bindings: Vec<Vec<SubCircuitParamValue>>,
+    pub scoped_call_ids: Vec<usize>,
+    pub output_gate_ids: Vec<GateId>,
+    pub num_outputs: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SerializablePolyCircuit {
     gates: BTreeMap<GateId, SerializablePolyGate>,
-    sub_circuits: BTreeMap<usize, SerializableStoredSubCircuit>,
+    sub_circuits: BTreeMap<usize, Box<SerializablePolyCircuit>>,
     sub_circuit_calls: BTreeMap<usize, SerializableSubCircuitCall>,
+    summed_sub_circuit_calls: BTreeMap<usize, SerializableSummedSubCircuitCall>,
+    sub_circuit_params: Vec<SubCircuitParamKind>,
     output_ids: Vec<GateId>,
     num_input: usize,
+    next_scoped_call_id: usize,
 }
 
 impl SerializablePolyCircuit {
     pub fn new(
         gates: BTreeMap<GateId, SerializablePolyGate>,
-        sub_circuits: BTreeMap<usize, SerializableStoredSubCircuit>,
+        sub_circuits: BTreeMap<usize, Box<SerializablePolyCircuit>>,
         sub_circuit_calls: BTreeMap<usize, SerializableSubCircuitCall>,
+        summed_sub_circuit_calls: BTreeMap<usize, SerializableSummedSubCircuitCall>,
+        sub_circuit_params: Vec<SubCircuitParamKind>,
         output_ids: Vec<GateId>,
         num_input: usize,
+        next_scoped_call_id: usize,
     ) -> Self {
-        Self { gates, sub_circuits, sub_circuit_calls, output_ids, num_input }
+        Self {
+            gates,
+            sub_circuits,
+            sub_circuit_calls,
+            summed_sub_circuit_calls,
+            sub_circuit_params,
+            output_ids,
+            num_input,
+            next_scoped_call_id,
+        }
     }
 
     pub fn from_circuit<P: Poly>(circuit: PolyCircuit<P>) -> Self {
-        let mut gates = BTreeMap::new();
-        for (gate_id, gate) in circuit.gates.into_iter() {
-            let gate_type = match gate.gate_type {
-                PolyGateType::Input => SerializablePolyGateType::Input,
-                PolyGateType::SmallScalarMul { scalar } => {
-                    SerializablePolyGateType::SmallScalarMul { scalar }
-                }
-                PolyGateType::LargeScalarMul { scalar } => {
-                    SerializablePolyGateType::LargeScalarMul { scalar }
-                }
-                PolyGateType::SlotTransfer { src_slots } => {
-                    SerializablePolyGateType::SlotTransfer { src_slots }
-                }
-                PolyGateType::Add => SerializablePolyGateType::Add,
-                PolyGateType::Sub => SerializablePolyGateType::Sub,
-                PolyGateType::Mul => SerializablePolyGateType::Mul,
-                PolyGateType::PubLut { lut_id } => SerializablePolyGateType::PubLut { lut_id },
-                PolyGateType::SubCircuitOutput { call_id, output_idx, num_inputs } => {
-                    SerializablePolyGateType::SubCircuitOutput { call_id, output_idx, num_inputs }
-                }
-            };
-            let serializable_gate = SerializablePolyGate::new(gate_id, gate_type, gate.input_gates);
-            gates.insert(gate_id, serializable_gate);
-        }
+        let call_entries = circuit
+            .sub_circuit_calls
+            .iter()
+            .map(|(call_id, call)| {
+                let param_bindings = circuit.binding_set(call.binding_set_id).as_ref().to_vec();
+                (
+                    *call_id,
+                    SerializableSubCircuitCall {
+                        sub_circuit_id: call.sub_circuit_id,
+                        inputs: call.inputs.clone(),
+                        param_bindings,
+                        scoped_call_id: call.scoped_call_id,
+                        output_gate_ids: call.output_gate_ids.clone(),
+                        num_outputs: call.num_outputs,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let summed_call_entries = circuit
+            .summed_sub_circuit_calls
+            .iter()
+            .map(|(summed_call_id, call)| {
+                let (call_inputs, param_bindings) = rayon::join(
+                    || {
+                        call.call_input_set_ids
+                            .iter()
+                            .map(|input_set_id| circuit.input_set(*input_set_id).as_ref().to_vec())
+                            .collect::<Vec<_>>()
+                    },
+                    || {
+                        call.call_binding_set_ids
+                            .iter()
+                            .map(|binding_set_id| {
+                                circuit.binding_set(*binding_set_id).as_ref().to_vec()
+                            })
+                            .collect::<Vec<_>>()
+                    },
+                );
+                (
+                    *summed_call_id,
+                    SerializableSummedSubCircuitCall {
+                        sub_circuit_id: call.sub_circuit_id,
+                        call_inputs,
+                        param_bindings,
+                        scoped_call_ids: call.scoped_call_ids.clone(),
+                        output_gate_ids: call.output_gate_ids.clone(),
+                        num_outputs: call.num_outputs,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let gate_entries = circuit.gates.into_iter().collect::<Vec<_>>();
+        let sub_circuit_entries = circuit.sub_circuits.into_iter().collect::<Vec<_>>();
 
-        let mut sub_circuits = BTreeMap::new();
-        for (circuit_id, sub_circuit) in circuit.sub_circuits.into_iter() {
-            let serializable_sub_circuit = match sub_circuit {
-                StoredSubCircuit::InMemory(sub_circuit) => {
-                    SerializableStoredSubCircuit::Inline(Box::new(Self::from_circuit(*sub_circuit)))
-                }
-                StoredSubCircuit::OnDisk(disk_ref) => {
-                    SerializableStoredSubCircuit::OnDisk(SerializableSubCircuitDiskRef {
-                        scoped_id: disk_ref.scoped_id,
-                        num_input: disk_ref.num_input,
-                        num_output: disk_ref.num_output,
+        let (gates_vec, (sub_circuits_vec, (calls_vec, summed_calls_vec))) = rayon::join(
+            || {
+                gate_entries
+                    .into_par_iter()
+                    .map(|(gate_id, gate)| {
+                        let gate_type = match gate.gate_type {
+                            PolyGateType::Input => SerializablePolyGateType::Input,
+                            PolyGateType::SmallScalarMul { scalar } => {
+                                SerializablePolyGateType::SmallScalarMul { scalar }
+                            }
+                            PolyGateType::LargeScalarMul { scalar } => {
+                                SerializablePolyGateType::LargeScalarMul { scalar }
+                            }
+                            PolyGateType::SlotTransfer { src_slots } => {
+                                SerializablePolyGateType::SlotTransfer { src_slots }
+                            }
+                            PolyGateType::Add => SerializablePolyGateType::Add,
+                            PolyGateType::Sub => SerializablePolyGateType::Sub,
+                            PolyGateType::Mul => SerializablePolyGateType::Mul,
+                            PolyGateType::PubLut { lut_id } => {
+                                SerializablePolyGateType::PubLut { lut_id }
+                            }
+                            PolyGateType::SubCircuitOutput { call_id, output_idx, num_inputs } => {
+                                SerializablePolyGateType::SubCircuitOutput {
+                                    call_id,
+                                    output_idx,
+                                    num_inputs,
+                                }
+                            }
+                            PolyGateType::SummedSubCircuitOutput {
+                                summed_call_id,
+                                output_idx,
+                                num_inputs,
+                            } => SerializablePolyGateType::SummedSubCircuitOutput {
+                                summed_call_id,
+                                output_idx,
+                                num_inputs,
+                            },
+                        };
+                        (gate_id, SerializablePolyGate::new(gate_id, gate_type, gate.input_gates))
                     })
-                }
-            };
-            sub_circuits.insert(circuit_id, serializable_sub_circuit);
-        }
-        let mut sub_circuit_calls = BTreeMap::new();
-        for (call_id, call) in circuit.sub_circuit_calls.into_iter() {
-            let serializable_call = SerializableSubCircuitCall {
-                sub_circuit_id: call.sub_circuit_id,
-                inputs: call.inputs,
-                output_gate_ids: call.output_gate_ids,
-                num_outputs: call.num_outputs,
-            };
-            sub_circuit_calls.insert(call_id, serializable_call);
-        }
-        Self::new(gates, sub_circuits, sub_circuit_calls, circuit.output_ids, circuit.num_input)
+                    .collect::<Vec<_>>()
+            },
+            || {
+                rayon::join(
+                    || {
+                        sub_circuit_entries
+                            .into_par_iter()
+                            .map(|(circuit_id, sub_circuit)| {
+                                let StoredSubCircuit::InMemory(sub_circuit) = sub_circuit;
+                                (
+                                    circuit_id,
+                                    Box::new(Self::from_circuit(sub_circuit.as_ref().clone())),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    },
+                    || {
+                        rayon::join(
+                            || {
+                                call_entries
+                                    .into_par_iter()
+                                    .map(|(call_id, call)| (call_id, call))
+                                    .collect::<Vec<_>>()
+                            },
+                            || {
+                                summed_call_entries
+                                    .into_par_iter()
+                                    .map(|(call_id, call)| (call_id, call))
+                                    .collect::<Vec<_>>()
+                            },
+                        )
+                    },
+                )
+            },
+        );
+
+        Self::new(
+            gates_vec.into_iter().collect(),
+            sub_circuits_vec.into_iter().collect(),
+            calls_vec.into_iter().collect(),
+            summed_calls_vec.into_iter().collect(),
+            circuit.sub_circuit_params,
+            circuit.output_ids,
+            circuit.num_input,
+            circuit.next_scoped_call_id,
+        )
     }
 
     pub fn to_circuit<P: Poly>(self) -> PolyCircuit<P> {
-        self.to_circuit_with_disk_storage(None)
-    }
-
-    pub(crate) fn to_circuit_with_disk_storage<P: Poly>(
-        self,
-        disk_storage: Option<SubCircuitDiskStorage>,
-    ) -> PolyCircuit<P> {
         let mut circuit = PolyCircuit::new();
-        circuit.sub_circuit_disk_storage = disk_storage.clone();
-        // Restore sub-circuits first
-        for (circuit_id, serializable_sub_circuit) in self.sub_circuits.into_iter() {
-            let sub_circuit = match serializable_sub_circuit {
-                SerializableStoredSubCircuit::Inline(serializable_sub_circuit) => {
-                    let mut sub_circuit =
-                        serializable_sub_circuit.to_circuit_with_disk_storage(disk_storage.clone());
-                    sub_circuit.inherit_lookup_registry(Arc::clone(&circuit.lookup_registry));
-                    StoredSubCircuit::InMemory(Box::new(sub_circuit))
-                }
-                SerializableStoredSubCircuit::OnDisk(disk_ref) => {
-                    StoredSubCircuit::OnDisk(SubCircuitDiskRef {
-                        scoped_id: disk_ref.scoped_id,
-                        num_input: disk_ref.num_input,
-                        num_output: disk_ref.num_output,
+
+        let sub_circuit_entries = self.sub_circuits.into_iter().collect::<Vec<_>>();
+        let gate_entries = self.gates.into_iter().collect::<Vec<_>>();
+        let call_entries = self.sub_circuit_calls.into_iter().collect::<Vec<_>>();
+        let summed_call_entries = self.summed_sub_circuit_calls.into_iter().collect::<Vec<_>>();
+
+        let (sub_circuits_vec, (gates_vec, (calls_vec, summed_calls_vec))) = rayon::join(
+            || {
+                sub_circuit_entries
+                    .into_par_iter()
+                    .map(|(circuit_id, sub_circuit)| {
+                        (
+                            circuit_id,
+                            StoredSubCircuit::InMemory(Arc::new(sub_circuit.to_circuit::<P>())),
+                        )
                     })
-                }
-            };
-            circuit.sub_circuits.insert(circuit_id, sub_circuit);
+                    .collect::<Vec<_>>()
+            },
+            || {
+                rayon::join(
+                    || {
+                        gate_entries
+                            .into_par_iter()
+                            .map(|(gate_id, sg)| {
+                                let gate_type = match sg.gate_type {
+                                    SerializablePolyGateType::Input => PolyGateType::Input,
+                                    SerializablePolyGateType::SmallScalarMul { scalar } => {
+                                        PolyGateType::SmallScalarMul { scalar }
+                                    }
+                                    SerializablePolyGateType::LargeScalarMul { scalar } => {
+                                        PolyGateType::LargeScalarMul { scalar }
+                                    }
+                                    SerializablePolyGateType::SlotTransfer { src_slots } => {
+                                        PolyGateType::SlotTransfer { src_slots }
+                                    }
+                                    SerializablePolyGateType::Add => PolyGateType::Add,
+                                    SerializablePolyGateType::Sub => PolyGateType::Sub,
+                                    SerializablePolyGateType::Mul => PolyGateType::Mul,
+                                    SerializablePolyGateType::PubLut { lut_id } => {
+                                        PolyGateType::PubLut { lut_id }
+                                    }
+                                    SerializablePolyGateType::SubCircuitOutput {
+                                        call_id,
+                                        output_idx,
+                                        num_inputs,
+                                    } => PolyGateType::SubCircuitOutput {
+                                        call_id,
+                                        output_idx,
+                                        num_inputs,
+                                    },
+                                    SerializablePolyGateType::SummedSubCircuitOutput {
+                                        summed_call_id,
+                                        output_idx,
+                                        num_inputs,
+                                    } => PolyGateType::SummedSubCircuitOutput {
+                                        summed_call_id,
+                                        output_idx,
+                                        num_inputs,
+                                    },
+                                };
+                                (gate_id, PolyGate::new(gate_id, gate_type, sg.input_gates))
+                            })
+                            .collect::<Vec<_>>()
+                    },
+                    || {
+                        rayon::join(
+                            || {
+                                call_entries
+                                    .into_par_iter()
+                                    .map(|(call_id, call)| (call_id, call))
+                                    .collect::<Vec<_>>()
+                            },
+                            || {
+                                summed_call_entries
+                                    .into_par_iter()
+                                    .map(|(call_id, call)| (call_id, call))
+                                    .collect::<Vec<_>>()
+                            },
+                        )
+                    },
+                )
+            },
+        );
+
+        circuit.sub_circuits = sub_circuits_vec.into_iter().collect();
+        circuit.gates = gates_vec.into_iter().collect();
+        let lookup_registry = circuit.lookup_registry.clone();
+        let binding_registry = circuit.binding_registry.clone();
+        let input_set_registry = circuit.input_set_registry.clone();
+        for sub_circuit in circuit.sub_circuits.values_mut() {
+            let StoredSubCircuit::InMemory(sub_circuit) = sub_circuit;
+            Arc::make_mut(sub_circuit).inherit_registries(
+                lookup_registry.clone(),
+                binding_registry.clone(),
+                input_set_registry.clone(),
+            );
         }
-        // Insert gates preserving original GateIds
-        let getes_len = self.gates.len();
-        for idx in 0..getes_len {
-            let sg = self.gates.get(&GateId(idx)).expect("serialized gate id missing").to_owned();
-            let gate_type = match sg.gate_type {
-                SerializablePolyGateType::Input => PolyGateType::Input,
-                SerializablePolyGateType::SmallScalarMul { scalar } => {
-                    PolyGateType::SmallScalarMul { scalar }
-                }
-                SerializablePolyGateType::LargeScalarMul { scalar } => {
-                    PolyGateType::LargeScalarMul { scalar }
-                }
-                SerializablePolyGateType::SlotTransfer { src_slots } => {
-                    PolyGateType::SlotTransfer { src_slots }
-                }
-                SerializablePolyGateType::Add => PolyGateType::Add,
-                SerializablePolyGateType::Sub => PolyGateType::Sub,
-                SerializablePolyGateType::Mul => PolyGateType::Mul,
-                SerializablePolyGateType::PubLut { lut_id } => PolyGateType::PubLut { lut_id },
-                SerializablePolyGateType::SubCircuitOutput { call_id, output_idx, num_inputs } => {
-                    PolyGateType::SubCircuitOutput { call_id, output_idx, num_inputs }
-                }
-            };
-            circuit
-                .gates
-                .insert(GateId(idx), PolyGate::new(GateId(idx), gate_type, sg.input_gates));
-        }
-        for (call_id, call) in self.sub_circuit_calls.into_iter() {
-            let sub_call = SubCircuitCall {
-                sub_circuit_id: call.sub_circuit_id,
-                inputs: call.inputs,
-                output_gate_ids: call.output_gate_ids,
-                num_outputs: call.num_outputs,
-            };
-            circuit.sub_circuit_calls.insert(call_id, sub_call);
-        }
+        circuit.sub_circuit_calls = calls_vec
+            .into_iter()
+            .map(|(call_id, call)| {
+                let binding_set_id = circuit.binding_registry.register(&call.param_bindings);
+                (
+                    call_id,
+                    SubCircuitCall {
+                        sub_circuit_id: call.sub_circuit_id,
+                        inputs: call.inputs,
+                        binding_set_id,
+                        scoped_call_id: call.scoped_call_id,
+                        output_gate_ids: call.output_gate_ids,
+                        num_outputs: call.num_outputs,
+                    },
+                )
+            })
+            .collect();
+        circuit.summed_sub_circuit_calls = summed_calls_vec
+            .into_iter()
+            .map(|(summed_call_id, call)| {
+                let call_input_set_ids = call
+                    .call_inputs
+                    .iter()
+                    .map(|inputs| circuit.intern_input_set(inputs))
+                    .collect::<Vec<_>>();
+                let call_binding_set_ids = call
+                    .param_bindings
+                    .iter()
+                    .map(|bindings| circuit.binding_registry.register(bindings))
+                    .collect::<Vec<_>>();
+                (
+                    summed_call_id,
+                    crate::circuit::SummedSubCircuitCall {
+                        sub_circuit_id: call.sub_circuit_id,
+                        call_input_set_ids,
+                        call_binding_set_ids,
+                        scoped_call_ids: call.scoped_call_ids,
+                        output_gate_ids: call.output_gate_ids,
+                        num_outputs: call.num_outputs,
+                    },
+                )
+            })
+            .collect();
+        circuit.sub_circuit_params = self.sub_circuit_params;
         circuit.num_input = self.num_input;
         circuit.output_ids = self.output_ids;
+        circuit.next_scoped_call_id = self.next_scoped_call_id;
         circuit.recompute_gate_counts();
         circuit
     }
@@ -259,103 +444,62 @@ mod tests {
 
     #[test]
     fn test_serialization_roundtrip() {
-        // Create a complex circuit with various operations
         let mut original_circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
-
-        // Add inputs
         let inputs = original_circuit.input(3);
-
-        // Add various gates
         let add_gate = original_circuit.add_gate(inputs[0], inputs[1]);
         let sub_gate = original_circuit.sub_gate(add_gate, inputs[2]);
         let mul_gate = original_circuit.mul_gate(inputs[1], inputs[2]);
 
-        // Create a sub-circuit
         let mut sub_circuit: PolyCircuit<_> = PolyCircuit::new();
         let sub_inputs = sub_circuit.input(2);
         let sub_add_gate = sub_circuit.add_gate(sub_inputs[0], sub_inputs[1]);
         let sub_mul_gate = sub_circuit.mul_gate(sub_inputs[0], sub_inputs[1]);
         sub_circuit.output(vec![sub_add_gate, sub_mul_gate]);
 
-        // Register the sub-circuit
         let sub_circuit_id = original_circuit.register_sub_circuit(sub_circuit);
-
-        // Call the sub-circuit
         let sub_outputs =
             original_circuit.call_sub_circuit(sub_circuit_id, &[inputs[0], inputs[1]]);
-
-        // Use the sub-circuit outputs
         let combined_gate = original_circuit.add_gate(sub_gate, sub_outputs[0]);
-
-        // Set the output
         original_circuit.output(vec![combined_gate, mul_gate, sub_outputs[1]]);
 
-        // Convert to SerializablePolyCircuit
         let serializable_circuit = SerializablePolyCircuit::from_circuit(original_circuit.clone());
-
-        // Convert back to PolyCircuit
         let roundtrip_circuit = serializable_circuit.to_circuit();
-
-        // Verify that the circuits are identical by directly comparing them
-        // This works because PolyCircuit implements the Eq trait
         assert_eq!(roundtrip_circuit, original_circuit);
     }
 
     #[test]
     fn test_serialization_roundtrip_json() {
-        // Create a complex circuit with various operations
         let mut original_circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
-
-        // Add inputs
         let inputs = original_circuit.input(3);
-
-        // Add various gates
         let add_gate = original_circuit.add_gate(inputs[0], inputs[1]);
         let mul_gate = original_circuit.mul_gate(inputs[1], inputs[2]);
 
-        // Create a sub-circuit
         let mut sub_circuit = PolyCircuit::new();
         let sub_inputs = sub_circuit.input(2);
         let sub_add_gate = sub_circuit.add_gate(sub_inputs[0], sub_inputs[1]);
         let sub_mul_gate = sub_circuit.mul_gate(sub_inputs[0], sub_inputs[1]);
         sub_circuit.output(vec![sub_add_gate, sub_mul_gate]);
 
-        // Register the sub-circuit
         let sub_circuit_id = original_circuit.register_sub_circuit(sub_circuit);
-
-        // Call the sub-circuit
         let sub_outputs =
             original_circuit.call_sub_circuit(sub_circuit_id, &[inputs[0], inputs[1]]);
-
-        // Use the sub-circuit outputs
         let combined_gate = original_circuit.add_gate(add_gate, sub_outputs[0]);
-
-        // Set the output
         original_circuit.output(vec![combined_gate, mul_gate, sub_outputs[1]]);
 
-        // Convert to SerializablePolyCircuit
         let serializable_circuit = SerializablePolyCircuit::from_circuit(original_circuit.clone());
         let serializable_circuit_json = serializable_circuit.to_json_str();
-        println!("{}", serializable_circuit_json);
-        // Convert back to PolyCircuit
         let serializable_circuit =
             SerializablePolyCircuit::from_json_str(&serializable_circuit_json);
         let roundtrip_circuit = serializable_circuit.to_circuit();
-
-        // Verify that the circuits are identical by directly comparing them
-        // This works because PolyCircuit implements the Eq trait
         assert_eq!(roundtrip_circuit, original_circuit);
     }
 
     #[test]
     fn test_serialization_roundtrip_with_nonconsecutive_inputs() {
-        // Create a circuit where input() is called twice with a gate in between,
-        // resulting in non-consecutive input GateIds.
         let mut circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
         let first_inputs = circuit.input(1);
         let _gap_gate = circuit.const_digits(&[1u32, 0u32, 1u32]);
         let second_inputs = circuit.input(1);
-        // Ensure the input GateIds are not consecutive
         assert_ne!(second_inputs[0].0, first_inputs[0].0 + 1);
 
         let add = circuit.add_gate(first_inputs[0], second_inputs[0]);
@@ -364,7 +508,6 @@ mod tests {
         let serializable = SerializablePolyCircuit::from_circuit(circuit.clone());
         let roundtrip = serializable.to_circuit::<DCRTPoly>();
 
-        // Verify behavioral equivalence by evaluating both circuits
         let params = DCRTPolyParams::default();
         let a = DCRTPoly::const_one(&params);
         let b = DCRTPoly::const_one(&params);
@@ -387,6 +530,59 @@ mod tests {
         let serializable = SerializablePolyCircuit::from_circuit(circuit.clone());
         let roundtrip = serializable.to_circuit::<DCRTPoly>();
 
+        assert_eq!(roundtrip, circuit);
+    }
+
+    #[test]
+    fn test_serialization_roundtrip_with_parameterized_sub_circuit() {
+        let mut sub_circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
+        let scalar_param =
+            sub_circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul);
+        let sub_inputs = sub_circuit.input(1);
+        let scaled = sub_circuit.small_scalar_mul_param(sub_inputs[0], scalar_param);
+        sub_circuit.output(vec![scaled]);
+
+        let mut circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
+        let inputs = circuit.input(1);
+        let sub_id = circuit.register_sub_circuit(sub_circuit);
+        let outputs = circuit.call_sub_circuit_with_bindings(
+            sub_id,
+            &[inputs[0]],
+            &[SubCircuitParamValue::SmallScalarMul(vec![5])],
+        );
+        circuit.output(outputs);
+
+        let serializable = SerializablePolyCircuit::from_circuit(circuit.clone());
+        let roundtrip = serializable.to_circuit::<DCRTPoly>();
+        assert_eq!(roundtrip, circuit);
+    }
+
+    #[test]
+    fn test_serialization_roundtrip_with_summed_sub_circuit() {
+        let mut sub_circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
+        let scalar_param =
+            sub_circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul);
+        let sub_inputs = sub_circuit.input(1);
+        let scaled = sub_circuit.small_scalar_mul_param(sub_inputs[0], scalar_param);
+        sub_circuit.output(vec![scaled]);
+
+        let mut circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
+        let inputs = circuit.input(1);
+        let sub_id = circuit.register_sub_circuit(sub_circuit);
+        let binding_two =
+            circuit.intern_binding_set(&[SubCircuitParamValue::SmallScalarMul(vec![2])]);
+        let binding_three =
+            circuit.intern_binding_set(&[SubCircuitParamValue::SmallScalarMul(vec![3])]);
+        let input_set_id = circuit.intern_input_set(&[inputs[0]]);
+        let outputs = circuit.call_sub_circuit_sum_many_with_binding_set_ids(
+            sub_id,
+            vec![input_set_id, input_set_id],
+            vec![binding_two, binding_three],
+        );
+        circuit.output(outputs);
+
+        let serializable = SerializablePolyCircuit::from_circuit(circuit.clone());
+        let roundtrip = serializable.to_circuit::<DCRTPoly>();
         assert_eq!(roundtrip, circuit);
     }
 }

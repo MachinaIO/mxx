@@ -3,23 +3,20 @@ pub mod gate;
 pub mod serde;
 
 pub use evaluable::*;
-pub use gate::{PolyGate, PolyGateKind, PolyGateType};
+pub use gate::{
+    GateParamSource, PolyGate, PolyGateKind, PolyGateType, SlotTransferSpec, SubCircuitParamKind,
+    SubCircuitParamValue,
+};
 
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use num_bigint::BigUint;
 #[cfg(feature = "gpu")]
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator};
-use rayon::{
-    iter::{IntoParallelRefIterator, ParallelIterator},
-    slice::ParallelSliceMut,
-};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    env,
     fmt::Debug,
-    fs,
-    path::{Path, PathBuf},
-    process,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -29,7 +26,7 @@ use std::{
 #[cfg(feature = "gpu")]
 use crate::poly::dcrt::gpu::detected_gpu_device_ids;
 use crate::{
-    circuit::{gate::GateId, serde::SerializablePolyCircuit},
+    circuit::gate::GateId,
     lookup::{PltEvaluator, PublicLut},
     poly::Poly,
     slot_transfer::SlotTransferEvaluator,
@@ -70,9 +67,23 @@ struct ComputedGateCtx<E: Evaluable> {
 }
 
 #[derive(Debug)]
-struct LookupRegistry<P: Poly> {
+pub(crate) struct LookupRegistry<P: Poly> {
     next_id: AtomicUsize,
     lookups: DashMap<usize, Arc<PublicLut<P>>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct BindingRegistry {
+    next_id: AtomicUsize,
+    binding_sets: DashMap<usize, Arc<[SubCircuitParamValue]>>,
+    binding_set_index: DashMap<Arc<[SubCircuitParamValue]>, usize>,
+}
+
+#[derive(Debug)]
+pub(crate) struct InputSetRegistry {
+    next_id: AtomicUsize,
+    input_sets: DashMap<usize, Arc<[GateId]>>,
+    input_set_index: DashMap<Arc<[GateId]>, usize>,
 }
 
 static TEMP_SUBCIRCUIT_STORAGE_ID: AtomicUsize = AtomicUsize::new(0);
@@ -93,10 +104,92 @@ impl<P: Poly> LookupRegistry<P> {
     }
 }
 
+impl BindingRegistry {
+    fn new() -> Self {
+        Self {
+            next_id: AtomicUsize::new(0),
+            binding_sets: DashMap::new(),
+            binding_set_index: DashMap::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.binding_sets.is_empty()
+    }
+
+    fn register_arc(&self, candidate: Arc<[SubCircuitParamValue]>) -> usize {
+        if let Some(existing) = self.binding_set_index.get(&candidate) {
+            return *existing;
+        }
+        match self.binding_set_index.entry(candidate.clone()) {
+            Entry::Occupied(existing) => *existing.get(),
+            Entry::Vacant(vacant) => {
+                let binding_set_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                self.binding_sets.insert(binding_set_id, candidate);
+                vacant.insert(binding_set_id);
+                binding_set_id
+            }
+        }
+    }
+
+    fn register(&self, bindings: &[SubCircuitParamValue]) -> usize {
+        self.register_arc(Arc::from(bindings.to_vec()))
+    }
+
+    fn get(&self, binding_set_id: usize) -> Arc<[SubCircuitParamValue]> {
+        self.binding_sets
+            .get(&binding_set_id)
+            .unwrap_or_else(|| panic!("binding set {binding_set_id} not found"))
+            .clone()
+    }
+}
+
+impl InputSetRegistry {
+    fn new() -> Self {
+        Self {
+            next_id: AtomicUsize::new(0),
+            input_sets: DashMap::new(),
+            input_set_index: DashMap::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.input_sets.is_empty()
+    }
+
+    fn register_arc(&self, candidate: Arc<[GateId]>) -> usize {
+        if let Some(existing) = self.input_set_index.get(&candidate) {
+            return *existing;
+        }
+        match self.input_set_index.entry(candidate.clone()) {
+            Entry::Occupied(existing) => *existing.get(),
+            Entry::Vacant(vacant) => {
+                let input_set_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                self.input_sets.insert(input_set_id, candidate);
+                vacant.insert(input_set_id);
+                input_set_id
+            }
+        }
+    }
+
+    fn register(&self, input_ids: &[GateId]) -> usize {
+        self.register_arc(Arc::from(input_ids.to_vec()))
+    }
+
+    fn get(&self, input_set_id: usize) -> Arc<[GateId]> {
+        self.input_sets
+            .get(&input_set_id)
+            .unwrap_or_else(|| panic!("input set {input_set_id} not found"))
+            .clone()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SubCircuitCall {
     sub_circuit_id: usize,
     inputs: Vec<GateId>,
+    binding_set_id: usize,
+    scoped_call_id: usize,
     output_gate_ids: Vec<GateId>,
     num_outputs: usize,
 }
@@ -105,97 +198,58 @@ struct SubCircuitCall {
 pub(crate) struct SubCircuitCallInfo {
     pub(crate) sub_circuit_id: usize,
     pub(crate) inputs: Vec<GateId>,
+    pub(crate) param_bindings: Arc<[SubCircuitParamValue]>,
     pub(crate) output_gate_ids: Vec<GateId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SubCircuitDiskRef {
-    scoped_id: usize,
-    num_input: usize,
-    num_output: usize,
+struct SummedSubCircuitCall {
+    sub_circuit_id: usize,
+    call_input_set_ids: Vec<usize>,
+    call_binding_set_ids: Vec<usize>,
+    scoped_call_ids: Vec<usize>,
+    output_gate_ids: Vec<GateId>,
+    num_outputs: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SummedSubCircuitCallInfo {
+    pub(crate) sub_circuit_id: usize,
+    pub(crate) call_inputs: Vec<Vec<GateId>>,
+    pub(crate) param_bindings: Vec<Arc<[SubCircuitParamValue]>>,
+    pub(crate) output_gate_ids: Vec<GateId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StoredSubCircuit<P: Poly> {
-    InMemory(Box<PolyCircuit<P>>),
-    OnDisk(SubCircuitDiskRef),
+    InMemory(Arc<PolyCircuit<P>>),
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct SubCircuitDiskStorage {
-    inner: Arc<SubCircuitDiskStorageInner>,
-}
-
-#[derive(Debug)]
-struct SubCircuitDiskStorageInner {
-    dir: PathBuf,
-    next_scoped_id: AtomicUsize,
-}
-
-impl SubCircuitDiskStorageInner {
-    fn cleanup_persisted_files(&self) {
-        let next_scoped_id = self.next_scoped_id.load(Ordering::Relaxed);
-        for scoped_id in 0..next_scoped_id {
-            let path = self.dir.join(format!("{scoped_id}.json"));
-            if let Err(err) = fs::remove_file(&path) {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    debug!(
-                        "failed to remove persisted sub-circuit file {}: {}",
-                        path.display(),
-                        err
-                    );
-                }
-            }
-        }
-        if let Err(err) = fs::remove_dir(&self.dir) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                debug!(
-                    "failed to remove sub-circuit storage directory {}: {}",
-                    self.dir.display(),
-                    err
-                );
-            }
-        }
-    }
-}
-
-impl Drop for SubCircuitDiskStorageInner {
-    fn drop(&mut self) {
-        self.cleanup_persisted_files();
-    }
-}
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct SubCircuitDiskStorage;
 
 impl SubCircuitDiskStorage {
-    fn new(dir: PathBuf) -> Self {
-        Self {
-            inner: Arc::new(SubCircuitDiskStorageInner {
-                dir,
-                next_scoped_id: AtomicUsize::new(0),
-            }),
-        }
+    fn new(_dir: &Path) -> Self {
+        Self
     }
 
-    pub(crate) fn temporary(prefix: &str) -> Self {
-        let unique_id = TEMP_SUBCIRCUIT_STORAGE_ID.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            env::temp_dir().join(format!("mxx-{prefix}-subcircuits-{}-{unique_id}", process::id()));
-        fs::create_dir_all(&dir).expect("failed to create temporary sub-circuit disk directory");
-        Self::new(dir)
-    }
-
-    fn alloc_scoped_id(&self) -> usize {
-        self.inner.next_scoped_id.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn file_path(&self, scoped_id: usize) -> PathBuf {
-        self.inner.dir.join(format!("{scoped_id}.json"))
+    pub(crate) fn temporary(_prefix: &str) -> Self {
+        let _ = TEMP_SUBCIRCUIT_STORAGE_ID.fetch_add(1, Ordering::Relaxed);
+        Self
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CircuitExecutionLayer {
-    pub(crate) sub_circuit_ids: Vec<usize>,
+    pub(crate) sub_circuit_call_ids: Vec<usize>,
+    pub(crate) summed_sub_circuit_call_ids: Vec<usize>,
     pub(crate) regular_gate_types: Vec<PolyGateType>,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct NonFreeDepthCacheKey {
+    circuit_ptr: usize,
+    input_levels: Box<[u32]>,
 }
 
 #[derive(Debug, Clone)]
@@ -204,10 +258,15 @@ pub struct PolyCircuit<P: Poly> {
     print_value: BTreeMap<GateId, String>,
     sub_circuits: BTreeMap<usize, StoredSubCircuit<P>>,
     sub_circuit_calls: BTreeMap<usize, SubCircuitCall>,
+    summed_sub_circuit_calls: BTreeMap<usize, SummedSubCircuitCall>,
+    sub_circuit_params: Vec<SubCircuitParamKind>,
     output_ids: Vec<GateId>,
     num_input: usize,
     gate_counts: HashMap<PolyGateKind, usize>,
     lookup_registry: Arc<LookupRegistry<P>>,
+    binding_registry: Arc<BindingRegistry>,
+    input_set_registry: Arc<InputSetRegistry>,
+    next_scoped_call_id: usize,
     allow_register_lookup: bool,
     sub_circuit_disk_storage: Option<SubCircuitDiskStorage>,
 }
@@ -218,9 +277,12 @@ impl<P: Poly> PartialEq for PolyCircuit<P> {
             self.print_value == other.print_value &&
             self.sub_circuits == other.sub_circuits &&
             self.sub_circuit_calls == other.sub_circuit_calls &&
+            self.summed_sub_circuit_calls == other.summed_sub_circuit_calls &&
+            self.sub_circuit_params == other.sub_circuit_params &&
             self.output_ids == other.output_ids &&
             self.gate_counts == other.gate_counts &&
             self.num_input == other.num_input &&
+            self.next_scoped_call_id == other.next_scoped_call_id &&
             self.allow_register_lookup == other.allow_register_lookup
     }
 }
@@ -241,39 +303,91 @@ impl<P: Poly> PolyCircuit<P> {
         let mut gate_counts = HashMap::new();
         gate_counts.insert(PolyGateKind::Input, 1);
         let lookup_registry = Arc::new(LookupRegistry::new());
+        let binding_registry = Arc::new(BindingRegistry::new());
+        let input_set_registry = Arc::new(InputSetRegistry::new());
         Self {
             gates,
             print_value: BTreeMap::new(),
             sub_circuits: BTreeMap::new(),
             sub_circuit_calls: BTreeMap::new(),
+            summed_sub_circuit_calls: BTreeMap::new(),
+            sub_circuit_params: vec![],
             output_ids: vec![],
             num_input: 0,
             gate_counts,
             lookup_registry,
+            binding_registry,
+            input_set_registry,
+            next_scoped_call_id: 0,
             allow_register_lookup: true,
             sub_circuit_disk_storage: None,
         }
     }
 
-    fn inherit_lookup_registry(&mut self, registry: Arc<LookupRegistry<P>>) {
-        if !Arc::ptr_eq(&self.lookup_registry, &registry) {
+    fn inherit_shared_registries(
+        &mut self,
+        lookup_registry: Arc<LookupRegistry<P>>,
+        binding_registry: Arc<BindingRegistry>,
+        input_set_registry: Arc<InputSetRegistry>,
+    ) {
+        if !Arc::ptr_eq(&self.lookup_registry, &lookup_registry) {
             if !self.lookup_registry.is_empty() {
                 panic!("sub-circuit may not register lookup tables");
             }
-            self.lookup_registry = Arc::clone(&registry);
+            self.lookup_registry = Arc::clone(&lookup_registry);
+        }
+        if !Arc::ptr_eq(&self.binding_registry, &binding_registry) {
+            if !self.binding_registry.is_empty() {
+                for call in self.sub_circuit_calls.values_mut() {
+                    let bindings = self.binding_registry.get(call.binding_set_id);
+                    call.binding_set_id = binding_registry.register_arc(bindings);
+                }
+                for call in self.summed_sub_circuit_calls.values_mut() {
+                    call.call_binding_set_ids.iter_mut().for_each(|binding_set_id| {
+                        let bindings = self.binding_registry.get(*binding_set_id);
+                        *binding_set_id = binding_registry.register_arc(bindings);
+                    });
+                }
+            }
+            self.binding_registry = Arc::clone(&binding_registry);
+        }
+        if !Arc::ptr_eq(&self.input_set_registry, &input_set_registry) {
+            if !self.input_set_registry.is_empty() {
+                for call in self.summed_sub_circuit_calls.values_mut() {
+                    call.call_input_set_ids.iter_mut().for_each(|input_set_id| {
+                        let input_ids = self.input_set_registry.get(*input_set_id);
+                        *input_set_id = input_set_registry.register_arc(input_ids);
+                    });
+                }
+            }
+            self.input_set_registry = Arc::clone(&input_set_registry);
         }
         self.allow_register_lookup = false;
         for sub in self.sub_circuits.values_mut() {
-            if let StoredSubCircuit::InMemory(sub) = sub {
-                sub.inherit_lookup_registry(Arc::clone(&registry));
-            }
+            let StoredSubCircuit::InMemory(sub) = sub;
+            Arc::make_mut(sub).inherit_shared_registries(
+                Arc::clone(&lookup_registry),
+                Arc::clone(&binding_registry),
+                Arc::clone(&input_set_registry),
+            );
         }
     }
 
-    fn sub_circuit_storage(&self) -> &SubCircuitDiskStorage {
-        self.sub_circuit_disk_storage
-            .as_ref()
-            .expect("disk-backed sub-circuit storage is not enabled")
+    pub(crate) fn inherit_registries_from_parent(&mut self, parent: &Self) {
+        self.inherit_shared_registries(
+            Arc::clone(&parent.lookup_registry),
+            Arc::clone(&parent.binding_registry),
+            Arc::clone(&parent.input_set_registry),
+        );
+    }
+
+    pub(crate) fn inherit_registries(
+        &mut self,
+        lookup_registry: Arc<LookupRegistry<P>>,
+        binding_registry: Arc<BindingRegistry>,
+        input_set_registry: Arc<InputSetRegistry>,
+    ) {
+        self.inherit_shared_registries(lookup_registry, binding_registry, input_set_registry);
     }
 
     pub(crate) fn cloned_subcircuit_disk_storage(&self) -> Option<SubCircuitDiskStorage> {
@@ -289,70 +403,18 @@ impl<P: Poly> PolyCircuit<P> {
         self.sub_circuit_disk_storage = Some(storage);
     }
 
-    fn sub_circuit_file_path(&self, scoped_id: usize) -> PathBuf {
-        self.sub_circuit_storage().file_path(scoped_id)
-    }
-
-    fn load_disk_sub_circuit(&self, disk_ref: &SubCircuitDiskRef) -> Self {
-        let path = self.sub_circuit_file_path(disk_ref.scoped_id);
-        let mut loaded = SerializablePolyCircuit::from_json_file(&path)
-            .to_circuit_with_disk_storage(self.sub_circuit_disk_storage.clone());
-        loaded.inherit_lookup_registry(Arc::clone(&self.lookup_registry));
-        loaded
-    }
-
     fn with_sub_circuit<R>(&self, circuit_id: usize, f: impl FnOnce(&Self) -> R) -> R {
         let stored = self.sub_circuits.get(&circuit_id).expect("sub-circuit not found");
         match stored {
-            StoredSubCircuit::InMemory(sub) => f(sub),
-            StoredSubCircuit::OnDisk(disk_ref) => {
-                let loaded = self.load_disk_sub_circuit(disk_ref);
-                f(&loaded)
-            }
+            StoredSubCircuit::InMemory(sub) => f(sub.as_ref()),
         }
     }
 
     fn sub_circuit_num_output(&self, circuit_id: usize) -> usize {
         let stored = self.sub_circuits.get(&circuit_id).expect("sub-circuit not found");
         match stored {
-            StoredSubCircuit::InMemory(sub) => sub.num_output(),
-            StoredSubCircuit::OnDisk(disk_ref) => disk_ref.num_output,
+            StoredSubCircuit::InMemory(sub) => sub.as_ref().num_output(),
         }
-    }
-
-    fn persist_sub_circuit_to_disk(
-        storage: &SubCircuitDiskStorage,
-        lookup_registry: &Arc<LookupRegistry<P>>,
-        sub_circuit: Self,
-    ) -> SubCircuitDiskRef {
-        let mut sub_circuit = sub_circuit;
-        sub_circuit.sub_circuit_disk_storage = Some(storage.clone());
-
-        let child_ids = sub_circuit.sub_circuits.keys().copied().collect::<Vec<_>>();
-        for child_id in child_ids {
-            let child = sub_circuit
-                .sub_circuits
-                .remove(&child_id)
-                .expect("sub-circuit child missing during disk persistence");
-            let disk_ref = match child {
-                StoredSubCircuit::InMemory(child) => {
-                    Self::persist_sub_circuit_to_disk(storage, lookup_registry, *child)
-                }
-                StoredSubCircuit::OnDisk(disk_ref) => disk_ref,
-            };
-            sub_circuit.sub_circuits.insert(child_id, StoredSubCircuit::OnDisk(disk_ref));
-        }
-
-        let disk_ref = SubCircuitDiskRef {
-            scoped_id: storage.alloc_scoped_id(),
-            num_input: sub_circuit.num_input(),
-            num_output: sub_circuit.num_output(),
-        };
-        let path = storage.file_path(disk_ref.scoped_id);
-        let mut sub_circuit = sub_circuit;
-        sub_circuit.inherit_lookup_registry(Arc::clone(lookup_registry));
-        SerializablePolyCircuit::from_circuit(sub_circuit).to_json_file(&path);
-        disk_ref
     }
 
     /// Get number of inputs
@@ -363,6 +425,11 @@ impl<P: Poly> PolyCircuit<P> {
     /// Get number of outputs
     pub fn num_output(&self) -> usize {
         self.output_ids.len()
+    }
+
+    /// Get number of sub-circuit parameters
+    pub fn num_sub_circuit_params(&self) -> usize {
+        self.sub_circuit_params.len()
     }
 
     /// Get number of gates
@@ -378,7 +445,7 @@ impl<P: Poly> PolyCircuit<P> {
         let mut input_gate_ids = self
             .gates
             .iter()
-            .filter_map(|(id, gate)| match gate.gate_type {
+            .filter_map(|(id, gate)| match &gate.gate_type {
                 PolyGateType::Input if id.0 != 0 => Some(*id),
                 _ => None,
             })
@@ -395,13 +462,79 @@ impl<P: Poly> PolyCircuit<P> {
         self.lookup_registry.lookups.get(&lut_id).expect("lookup table missing").clone()
     }
 
+    pub(crate) fn binding_set(&self, binding_set_id: usize) -> Arc<[SubCircuitParamValue]> {
+        self.binding_registry.get(binding_set_id)
+    }
+
+    pub(crate) fn intern_binding_set(&self, bindings: &[SubCircuitParamValue]) -> usize {
+        self.binding_registry.register(bindings)
+    }
+
+    pub(crate) fn input_set(&self, input_set_id: usize) -> Arc<[GateId]> {
+        self.input_set_registry.get(input_set_id)
+    }
+
+    pub(crate) fn intern_input_set(&self, input_ids: &[GateId]) -> usize {
+        self.input_set_registry.register(input_ids)
+    }
+
     pub(crate) fn sub_circuit_call_info(&self, call_id: usize) -> SubCircuitCallInfo {
         let call = self.sub_circuit_calls.get(&call_id).expect("sub-circuit call missing");
         SubCircuitCallInfo {
             sub_circuit_id: call.sub_circuit_id,
             inputs: call.inputs.clone(),
+            param_bindings: self.binding_set(call.binding_set_id),
             output_gate_ids: call.output_gate_ids.clone(),
         }
+    }
+
+    pub(crate) fn summed_sub_circuit_call_info(
+        &self,
+        summed_call_id: usize,
+    ) -> SummedSubCircuitCallInfo {
+        let call = self
+            .summed_sub_circuit_calls
+            .get(&summed_call_id)
+            .expect("summed sub-circuit call missing");
+        let (call_inputs, param_bindings) = rayon::join(
+            || {
+                call.call_input_set_ids
+                    .iter()
+                    .map(|input_set_id| self.input_set(*input_set_id).as_ref().to_vec())
+                    .collect::<Vec<_>>()
+            },
+            || {
+                call.call_binding_set_ids
+                    .iter()
+                    .map(|binding_set_id| self.binding_set(*binding_set_id))
+                    .collect::<Vec<_>>()
+            },
+        );
+        SummedSubCircuitCallInfo {
+            sub_circuit_id: call.sub_circuit_id,
+            call_inputs,
+            param_bindings,
+            output_gate_ids: call.output_gate_ids.clone(),
+        }
+    }
+
+    pub fn register_sub_circuit_param(&mut self, kind: SubCircuitParamKind) -> usize {
+        let param_id = self.sub_circuit_params.len();
+        self.sub_circuit_params.push(kind);
+        param_id
+    }
+
+    fn expect_sub_circuit_param_kind(&self, param_id: usize, expected: SubCircuitParamKind) {
+        let actual = self
+            .sub_circuit_params
+            .get(param_id)
+            .copied()
+            .unwrap_or_else(|| panic!("sub-circuit parameter {param_id} is out of range"));
+        assert_eq!(
+            actual, expected,
+            "sub-circuit parameter kind mismatch for param {param_id}: expected {:?}, got {:?}",
+            expected, actual
+        );
     }
 
     pub fn count_gates_by_type_vec(&self) -> HashMap<PolyGateKind, usize> {
@@ -412,7 +545,8 @@ impl<P: Poly> PolyCircuit<P> {
         let mut counts: HashMap<PolyGateKind, usize> = HashMap::new();
         for gate in self.gates.values() {
             let kind = gate.gate_type.kind();
-            if matches!(kind, PolyGateKind::SubCircuitOutput) {
+            if matches!(kind, PolyGateKind::SubCircuitOutput | PolyGateKind::SummedSubCircuitOutput)
+            {
                 continue;
             }
             if !include_inputs && matches!(kind, PolyGateKind::Input) {
@@ -431,6 +565,19 @@ impl<P: Poly> PolyCircuit<P> {
                 *counts.entry(kind).or_insert(0) += count * times;
             }
         }
+        for summed_call in self.summed_sub_circuit_calls.values() {
+            let times = summed_call.call_input_set_ids.len();
+            let sub_counts = self.with_sub_circuit(summed_call.sub_circuit_id, |sub| {
+                sub.expanded_gate_counts(false)
+            });
+            for (kind, count) in sub_counts {
+                *counts.entry(kind).or_insert(0) += count * times;
+            }
+            if times > 0 {
+                *counts.entry(PolyGateKind::Add).or_insert(0) +=
+                    summed_call.num_outputs * (times - 1);
+            }
+        }
         counts
     }
 
@@ -446,293 +593,230 @@ impl<P: Poly> PolyCircuit<P> {
         if self.output_ids.is_empty() {
             return 0;
         }
-        let input_levels = vec![0; self.num_input()];
-        let output_levels = self.non_free_depths_with_input_levels(&input_levels);
-        output_levels.par_iter().copied().max().unwrap_or(0)
+        let input_levels = vec![0u32; self.num_input()];
+        let mut depth_cache = HashMap::<NonFreeDepthCacheKey, Arc<[u32]>>::new();
+        let output_levels =
+            self.non_free_depths_with_input_levels_cached(&input_levels, &mut depth_cache);
+        output_levels.par_iter().copied().max().unwrap_or(0) as usize
     }
 
-    fn empty_input_depth_offset_row(&self) -> Vec<Option<usize>> {
-        vec![None; self.num_input()]
-    }
-
-    fn merge_input_depth_offset_rows<'a>(
+    fn non_free_depths_with_input_levels_cached(
         &self,
-        rows: impl IntoIterator<Item = &'a Vec<Option<usize>>>,
-        additional_depth: usize,
-    ) -> Vec<Option<usize>> {
-        let rows = rows.into_iter().collect::<Vec<_>>();
-        rows.par_iter()
-            .fold(
-                || self.empty_input_depth_offset_row(),
-                |mut merged, row| {
-                    for (idx, delta) in row.iter().enumerate() {
-                        let Some(delta) = delta else {
-                            continue;
-                        };
-                        let total = delta + additional_depth;
-                        match &mut merged[idx] {
-                            Some(existing) => *existing = (*existing).max(total),
-                            slot @ None => *slot = Some(total),
-                        }
-                    }
-                    merged
-                },
-            )
-            .reduce(
-                || self.empty_input_depth_offset_row(),
-                |mut left, right| {
-                    for (idx, delta) in right.into_iter().enumerate() {
-                        let Some(delta) = delta else {
-                            continue;
-                        };
-                        match &mut left[idx] {
-                            Some(existing) => *existing = (*existing).max(delta),
-                            slot @ None => *slot = Some(delta),
-                        }
-                    }
-                    left
-                },
-            )
-    }
-
-    fn non_free_depth_output_input_depth_offsets(&self) -> Vec<Vec<Option<usize>>> {
+        input_levels: &[u32],
+        depth_cache: &mut HashMap<NonFreeDepthCacheKey, Arc<[u32]>>,
+    ) -> Arc<[u32]> {
         if self.output_ids.is_empty() {
-            return vec![];
+            return Arc::from(Vec::<u32>::new());
         }
-
-        let topological_order = self.topological_order();
-        let topo_index_by_gate = topological_order
-            .iter()
-            .enumerate()
-            .map(|(idx, gate_id)| (*gate_id, idx))
-            .collect::<HashMap<_, _>>();
-        let mut input_gate_ids = self
-            .gates
-            .iter()
-            .filter_map(|(id, gate)| match gate.gate_type {
-                PolyGateType::Input if id.0 != 0 => Some(*id),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        input_gate_ids.par_sort_unstable_by_key(|gid| gid.0);
-        debug_assert_eq!(input_gate_ids.len(), self.num_input());
-        let input_index_by_gate = input_gate_ids
+        debug_assert_eq!(self.num_input(), input_levels.len());
+        let cache_key = NonFreeDepthCacheKey {
+            circuit_ptr: self as *const Self as usize,
+            input_levels: input_levels.to_vec().into_boxed_slice(),
+        };
+        if let Some(cached) = depth_cache.get(&cache_key) {
+            return cached.clone();
+        }
+        let input_index_by_gate = self
+            .sorted_input_gate_ids()
             .into_iter()
             .enumerate()
-            .map(|(idx, gate_id)| (gate_id, idx))
+            .map(|(input_idx, gate_id)| {
+                (gate_id, u32::try_from(input_idx).expect("input index overflowed u32"))
+            })
             .collect::<HashMap<_, _>>();
-
-        let reachable_call_ids = self
-            .sub_circuit_calls
-            .iter()
-            .filter_map(|(call_id, call)| {
-                call.output_gate_ids
-                    .iter()
-                    .any(|gate_id| topo_index_by_gate.contains_key(gate_id))
-                    .then_some(*call_id)
-            })
-            .collect::<Vec<_>>();
-        let reachable_sub_circuit_ids = reachable_call_ids
-            .iter()
-            .map(|call_id| {
-                self.sub_circuit_calls
-                    .get(call_id)
-                    .expect("sub-circuit call missing")
-                    .sub_circuit_id
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let sub_circuit_input_depth_offset_cache = reachable_sub_circuit_ids
-            .par_iter()
-            .map(|sub_circuit_id| {
-                (
-                    *sub_circuit_id,
-                    self.with_sub_circuit(*sub_circuit_id, |sub_circuit| {
-                        sub_circuit.non_free_depth_output_input_depth_offsets()
-                    }),
-                )
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .collect::<HashMap<_, _>>();
-        let mut ready_call_ids_by_topo_idx: HashMap<usize, Vec<usize>> = HashMap::new();
-        for call_id in reachable_call_ids {
-            let call = self.sub_circuit_calls.get(&call_id).expect("sub-circuit call missing");
-            let ready_topo_idx = call
-                .inputs
-                .iter()
-                .map(|input_id| {
-                    *topo_index_by_gate
-                        .get(input_id)
-                        .expect("sub-circuit call input missing from topological order")
-                })
-                .max()
-                .map_or(0, |idx| idx + 1);
-            let first_output_topo_idx = call
-                .output_gate_ids
-                .iter()
-                .filter_map(|gate_id| topo_index_by_gate.get(gate_id).copied())
-                .min()
-                .expect("reachable sub-circuit call missing output gate in topological order");
-            debug_assert!(ready_topo_idx <= first_output_topo_idx);
-            ready_call_ids_by_topo_idx.entry(ready_topo_idx).or_default().push(call_id);
-        }
-
-        let mut gate_input_depth_offsets: HashMap<GateId, Vec<Option<usize>>> = HashMap::new();
-        gate_input_depth_offsets.insert(GateId(0), self.empty_input_depth_offset_row());
-        let mut call_output_input_depth_offsets: HashMap<usize, Vec<Vec<Option<usize>>>> =
-            HashMap::new();
-
-        for (topo_idx, gate_id) in topological_order.iter().copied().enumerate() {
-            if let Some(ready_call_ids) = ready_call_ids_by_topo_idx.remove(&topo_idx) {
-                let newly_ready_call_outputs = ready_call_ids
-                    .par_iter()
-                    .map(|call_id| {
-                        let call =
-                            self.sub_circuit_calls.get(call_id).expect("sub-circuit call missing");
-                        let sub_output_input_depth_offsets = sub_circuit_input_depth_offset_cache
-                            .get(&call.sub_circuit_id)
-                            .expect("sub-circuit output depth offsets missing");
-                        let output_input_depth_offsets = sub_output_input_depth_offsets
-                            .par_iter()
-                            .map(|output_input_depth_offsets| {
-                                output_input_depth_offsets
-                                    .iter()
-                                    .enumerate()
-                                    .filter_map(|(child_input_idx, child_delta)| {
-                                        child_delta.map(|child_delta| {
-                                            (
-                                                gate_input_depth_offsets
-                                                    .get(&call.inputs[child_input_idx])
-                                                    .expect(
-                                                        "sub-circuit input depth offsets missing",
-                                                    ),
-                                                child_delta,
-                                            )
-                                        })
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .par_iter()
-                                    .fold(
-                                        || self.empty_input_depth_offset_row(),
-                                        |mut composed, (parent_input_depth_offsets, child_delta)| {
-                                            for (parent_input_idx, parent_delta) in
-                                                parent_input_depth_offsets.iter().enumerate()
-                                            {
-                                                let Some(parent_delta) = parent_delta else {
-                                                    continue;
-                                                };
-                                                let total = parent_delta + *child_delta;
-                                                match &mut composed[parent_input_idx] {
-                                                    Some(existing) => {
-                                                        *existing = (*existing).max(total)
-                                                    }
-                                                    slot @ None => *slot = Some(total),
-                                                }
-                                            }
-                                            composed
-                                        },
-                                    )
-                                    .reduce(
-                                        || self.empty_input_depth_offset_row(),
-                                        |mut left, right| {
-                                            for (idx, delta) in right.into_iter().enumerate() {
-                                                let Some(delta) = delta else {
-                                                    continue;
-                                                };
-                                                match &mut left[idx] {
-                                                    Some(existing) => {
-                                                        *existing = (*existing).max(delta)
-                                                    }
-                                                    slot @ None => *slot = Some(delta),
-                                                }
-                                            }
-                                            left
-                                        },
-                                    )
-                            })
-                            .collect::<Vec<_>>();
-                        (*call_id, output_input_depth_offsets)
-                    })
-                    .collect::<Vec<_>>();
-                for (call_id, output_input_depth_offsets) in newly_ready_call_outputs {
-                    call_output_input_depth_offsets.insert(call_id, output_input_depth_offsets);
-                }
+        let mut remaining_output_uses_by_call = vec![0u32; self.sub_circuit_calls.len()];
+        let mut remaining_output_uses_by_summed_call =
+            vec![0u32; self.summed_sub_circuit_calls.len()];
+        let output_set = self.output_ids.iter().copied().collect::<HashSet<_>>();
+        let mut remaining_use_count = HashMap::<GateId, u32>::new();
+        for gate in self.gates.values() {
+            if let PolyGateType::SubCircuitOutput { call_id, .. } = gate.gate_type {
+                remaining_output_uses_by_call[call_id] += 1;
+            } else if let PolyGateType::SummedSubCircuitOutput { summed_call_id, .. } =
+                gate.gate_type
+            {
+                remaining_output_uses_by_summed_call[summed_call_id] += 1;
             }
+            self.for_each_gate_dependency_input(gate, |input_id| {
+                *remaining_use_count.entry(input_id).or_insert(0) += 1;
+            });
+        }
 
-            let gate = self.gates.get(&gate_id).expect("gate not found");
-            let input_depth_offsets = match &gate.gate_type {
+        let mut live_gate_levels = HashMap::<GateId, u32>::new();
+        let mut call_output_levels =
+            (0..self.sub_circuit_calls.len()).map(|_| None).collect::<Vec<Option<Arc<[u32]>>>>();
+        let mut summed_call_output_levels = (0..self.summed_sub_circuit_calls.len())
+            .map(|_| None)
+            .collect::<Vec<Option<Arc<[u32]>>>>();
+
+        // Gates are created in dependency order, so GateId order is already topological.
+        for (&gate_id, gate) in self.gates.iter() {
+            let gate_level = match &gate.gate_type {
                 PolyGateType::Input => {
                     if gate_id == GateId(0) {
-                        self.empty_input_depth_offset_row()
+                        0
                     } else {
-                        let mut row = self.empty_input_depth_offset_row();
-                        let input_idx =
-                            input_index_by_gate.get(&gate_id).expect("input gate index missing");
-                        row[*input_idx] = Some(0);
-                        row
+                        let input_idx = input_index_by_gate
+                            .get(&gate_id)
+                            .copied()
+                            .expect("input gate index missing");
+                        input_levels[input_idx as usize]
                     }
                 }
-                PolyGateType::Add | PolyGateType::Sub | PolyGateType::SmallScalarMul { .. } => self
-                    .merge_input_depth_offset_rows(
-                        gate.input_gates.iter().map(|input_id| {
-                            gate_input_depth_offsets
-                                .get(input_id)
-                                .expect("input depth offsets missing")
-                        }),
-                        0,
-                    ),
+                PolyGateType::Add | PolyGateType::Sub | PolyGateType::SmallScalarMul { .. } => gate
+                    .input_gates
+                    .iter()
+                    .map(|input_id| {
+                        *live_gate_levels.get(input_id).unwrap_or_else(|| {
+                            panic!("non-free depth level missing for gate {input_id}")
+                        })
+                    })
+                    .max()
+                    .unwrap_or(0),
                 PolyGateType::LargeScalarMul { .. } |
                 PolyGateType::Mul |
                 PolyGateType::PubLut { .. } |
-                PolyGateType::SlotTransfer { .. } => self.merge_input_depth_offset_rows(
-                    gate.input_gates.iter().map(|input_id| {
-                        gate_input_depth_offsets.get(input_id).expect("input depth offsets missing")
-                    }),
-                    1,
-                ),
+                PolyGateType::SlotTransfer { .. } => {
+                    gate.input_gates
+                        .iter()
+                        .map(|input_id| {
+                            *live_gate_levels.get(input_id).unwrap_or_else(|| {
+                                panic!("non-free depth level missing for gate {input_id}")
+                            })
+                        })
+                        .max()
+                        .unwrap_or(0) +
+                        1
+                }
                 PolyGateType::SubCircuitOutput { call_id, output_idx, .. } => {
-                    let output_input_depth_offsets = call_output_input_depth_offsets
-                        .get(call_id)
-                        .expect("ready sub-circuit output depth offsets missing");
-                    output_input_depth_offsets.get(*output_idx).cloned().unwrap_or_else(|| {
-                        panic!("sub-circuit output index {} out of range", output_idx)
-                    })
+                    if call_output_levels[*call_id].is_none() {
+                        let call =
+                            self.sub_circuit_calls.get(call_id).expect("sub-circuit call missing");
+                        let child_input_levels = call
+                            .inputs
+                            .iter()
+                            .map(|input_id| {
+                                *live_gate_levels.get(input_id).unwrap_or_else(|| {
+                                    panic!("non-free depth level missing for gate {input_id}")
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        let output_levels = self.with_sub_circuit(call.sub_circuit_id, |sub| {
+                            sub.non_free_depths_with_input_levels_cached(
+                                &child_input_levels,
+                                depth_cache,
+                            )
+                        });
+                        call_output_levels[*call_id] = Some(output_levels);
+                    }
+                    let output_level = call_output_levels[*call_id]
+                        .as_ref()
+                        .and_then(|levels| levels.get(*output_idx))
+                        .copied()
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "sub-circuit output index {} out of range for call {}",
+                                output_idx, call_id
+                            )
+                        });
+                    debug_assert!(remaining_output_uses_by_call[*call_id] > 0);
+                    remaining_output_uses_by_call[*call_id] -= 1;
+                    if remaining_output_uses_by_call[*call_id] == 0 {
+                        call_output_levels[*call_id] = None;
+                    }
+                    output_level
+                }
+                PolyGateType::SummedSubCircuitOutput { summed_call_id, output_idx, .. } => {
+                    if summed_call_output_levels[*summed_call_id].is_none() {
+                        let call = self
+                            .summed_sub_circuit_calls
+                            .get(summed_call_id)
+                            .expect("summed sub-circuit call missing");
+                        let mut accumulated = vec![0u32; call.num_outputs];
+                        let mut output_levels_by_input_set = HashMap::<usize, Arc<[u32]>>::new();
+                        for input_set_id in &call.call_input_set_ids {
+                            let output_levels = if let Some(output_levels) =
+                                output_levels_by_input_set.get(input_set_id)
+                            {
+                                output_levels.clone()
+                            } else {
+                                let child_input_levels = self
+                                    .input_set(*input_set_id)
+                                    .iter()
+                                    .map(|input_id| {
+                                        *live_gate_levels.get(input_id).unwrap_or_else(|| {
+                                            panic!(
+                                                "non-free depth level missing for gate {input_id}"
+                                            )
+                                        })
+                                    })
+                                    .collect::<Vec<_>>();
+                                let output_levels =
+                                    self.with_sub_circuit(call.sub_circuit_id, |sub| {
+                                        sub.non_free_depths_with_input_levels_cached(
+                                            &child_input_levels,
+                                            depth_cache,
+                                        )
+                                    });
+                                output_levels_by_input_set
+                                    .insert(*input_set_id, output_levels.clone());
+                                output_levels
+                            };
+                            for (acc, level) in accumulated.iter_mut().zip(output_levels.iter()) {
+                                *acc = (*acc).max(*level);
+                            }
+                        }
+                        summed_call_output_levels[*summed_call_id] = Some(Arc::from(accumulated));
+                    }
+                    let output_level = summed_call_output_levels[*summed_call_id]
+                        .as_ref()
+                        .and_then(|levels| levels.get(*output_idx))
+                        .copied()
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "summed sub-circuit output index {} out of range for call {}",
+                                output_idx, summed_call_id
+                            )
+                        });
+                    debug_assert!(remaining_output_uses_by_summed_call[*summed_call_id] > 0);
+                    remaining_output_uses_by_summed_call[*summed_call_id] -= 1;
+                    if remaining_output_uses_by_summed_call[*summed_call_id] == 0 {
+                        summed_call_output_levels[*summed_call_id] = None;
+                    }
+                    output_level
                 }
             };
-            gate_input_depth_offsets.insert(gate_id, input_depth_offsets);
+            let gate_has_future_uses = remaining_use_count.get(&gate_id).copied().unwrap_or(0) > 0;
+            if gate_has_future_uses || output_set.contains(&gate_id) {
+                live_gate_levels.insert(gate_id, gate_level);
+            }
+            self.for_each_gate_dependency_input(gate, |input_id| {
+                let Some(remaining_uses) = remaining_use_count.get_mut(&input_id) else {
+                    return;
+                };
+                debug_assert!(
+                    *remaining_uses > 0,
+                    "remaining use counter underflow for gate {input_id}"
+                );
+                *remaining_uses -= 1;
+                if *remaining_uses == 0 && !output_set.contains(&input_id) {
+                    live_gate_levels.remove(&input_id);
+                }
+            });
         }
-        debug_assert!(ready_call_ids_by_topo_idx.is_empty());
 
-        self.output_ids
-            .par_iter()
-            .map(|output_id| {
-                gate_input_depth_offsets
-                    .get(output_id)
-                    .expect("output input depth offsets missing")
-                    .clone()
-            })
-            .collect()
-    }
-
-    fn non_free_depths_with_input_levels(&self, input_levels: &[usize]) -> Vec<usize> {
-        if self.output_ids.is_empty() {
-            return vec![];
-        }
-        debug_assert_eq!(self.num_input(), input_levels.len());
-        let output_input_depth_offsets = self.non_free_depth_output_input_depth_offsets();
-        output_input_depth_offsets
-            .par_iter()
-            .map(|output_input_depth_offsets| {
-                output_input_depth_offsets
-                    .iter()
-                    .zip(input_levels.iter().copied())
-                    .filter_map(|(delta, input_level)| delta.map(|delta| input_level + delta))
-                    .max()
-                    .unwrap_or(0)
-            })
-            .collect()
+        let output_levels = Arc::<[u32]>::from(
+            self.output_ids
+                .iter()
+                .map(|output_id| {
+                    *live_gate_levels.get(output_id).unwrap_or_else(|| {
+                        panic!("non-free depth level missing for output gate {output_id}")
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
+        depth_cache.insert(cache_key, output_levels.clone());
+        output_levels
     }
 
     pub fn recompute_gate_counts(&mut self) {
@@ -855,17 +939,41 @@ impl<P: Poly> PolyCircuit<P> {
     }
 
     pub fn small_scalar_mul(&mut self, input: GateId, scalar: &[u32]) -> GateId {
-        self.new_gate_generic(vec![input], PolyGateType::SmallScalarMul { scalar: scalar.to_vec() })
+        self.new_gate_generic(
+            vec![input],
+            PolyGateType::SmallScalarMul { scalar: GateParamSource::Const(scalar.to_vec()) },
+        )
+    }
+
+    pub fn small_scalar_mul_param(&mut self, input: GateId, param_id: usize) -> GateId {
+        self.expect_sub_circuit_param_kind(param_id, SubCircuitParamKind::SmallScalarMul);
+        self.new_gate_generic(
+            vec![input],
+            PolyGateType::SmallScalarMul { scalar: GateParamSource::Param(param_id) },
+        )
     }
 
     pub fn large_scalar_mul(&mut self, input: GateId, scalar: &[BigUint]) -> GateId {
-        self.new_gate_generic(vec![input], PolyGateType::LargeScalarMul { scalar: scalar.to_vec() })
+        self.new_gate_generic(
+            vec![input],
+            PolyGateType::LargeScalarMul { scalar: GateParamSource::Const(scalar.to_vec()) },
+        )
+    }
+
+    pub fn large_scalar_mul_param(&mut self, input: GateId, param_id: usize) -> GateId {
+        self.expect_sub_circuit_param_kind(param_id, SubCircuitParamKind::LargeScalarMul);
+        self.new_gate_generic(
+            vec![input],
+            PolyGateType::LargeScalarMul { scalar: GateParamSource::Param(param_id) },
+        )
     }
 
     pub fn poly_scalar_mul(&mut self, input: GateId, scalar: &P) -> GateId {
         self.new_gate_generic(
             vec![input],
-            PolyGateType::LargeScalarMul { scalar: scalar.coeffs_biguints() },
+            PolyGateType::LargeScalarMul {
+                scalar: GateParamSource::Const(scalar.coeffs_biguints()),
+            },
         )
     }
 
@@ -882,7 +990,18 @@ impl<P: Poly> PolyCircuit<P> {
     }
 
     pub fn public_lookup_gate(&mut self, input: GateId, lut_id: usize) -> GateId {
-        self.new_gate_generic(vec![input], PolyGateType::PubLut { lut_id })
+        self.new_gate_generic(
+            vec![input],
+            PolyGateType::PubLut { lut_id: GateParamSource::Const(lut_id) },
+        )
+    }
+
+    pub fn public_lookup_gate_param(&mut self, input: GateId, param_id: usize) -> GateId {
+        self.expect_sub_circuit_param_kind(param_id, SubCircuitParamKind::PubLut);
+        self.new_gate_generic(
+            vec![input],
+            PolyGateType::PubLut { lut_id: GateParamSource::Param(param_id) },
+        )
     }
 
     pub fn slot_transfer_gate(
@@ -892,7 +1011,17 @@ impl<P: Poly> PolyCircuit<P> {
     ) -> GateId {
         self.new_gate_generic(
             vec![input],
-            PolyGateType::SlotTransfer { src_slots: src_slots.to_vec() },
+            PolyGateType::SlotTransfer {
+                src_slots: GateParamSource::Const(SlotTransferSpec::explicit(src_slots.to_vec())),
+            },
+        )
+    }
+
+    pub fn slot_transfer_gate_param(&mut self, input: GateId, param_id: usize) -> GateId {
+        self.expect_sub_circuit_param_kind(param_id, SubCircuitParamKind::SlotTransfer);
+        self.new_gate_generic(
+            vec![input],
+            PolyGateType::SlotTransfer { src_slots: GateParamSource::Param(param_id) },
         )
     }
 
@@ -929,19 +1058,70 @@ impl<P: Poly> PolyCircuit<P> {
         gate_id
     }
 
+    fn new_summed_sub_circuit_output_gate(
+        &mut self,
+        summed_call_id: usize,
+        output_idx: usize,
+        num_inputs: usize,
+    ) -> GateId {
+        #[cfg(debug_assertions)]
+        {
+            assert_eq!(self.output_ids.len(), 0);
+        }
+        let gate_id = GateId(self.gates.len());
+        let gate_type =
+            PolyGateType::SummedSubCircuitOutput { summed_call_id, output_idx, num_inputs };
+        self.increment_gate_kind(gate_type.kind());
+        self.gates.insert(gate_id, PolyGate::new(gate_id, gate_type, Vec::new()));
+        gate_id
+    }
+
     fn increment_gate_kind(&mut self, kind: PolyGateKind) {
         *self.gate_counts.entry(kind).or_insert(0) += 1;
     }
 
-    fn gate_dependency_inputs<'a>(&'a self, gate: &'a PolyGate) -> &'a [GateId] {
+    fn gate_dependency_input_count(&self, gate: &PolyGate) -> usize {
         match &gate.gate_type {
-            PolyGateType::SubCircuitOutput { call_id, .. } => self
-                .sub_circuit_calls
-                .get(call_id)
-                .expect("sub-circuit call missing")
-                .inputs
-                .as_slice(),
-            _ => gate.input_gates.as_slice(),
+            PolyGateType::SubCircuitOutput { call_id, .. } => {
+                self.sub_circuit_calls.get(call_id).expect("sub-circuit call missing").inputs.len()
+            }
+            PolyGateType::SummedSubCircuitOutput { summed_call_id, .. } => self
+                .summed_sub_circuit_calls
+                .get(summed_call_id)
+                .expect("summed sub-circuit call missing")
+                .call_input_set_ids
+                .iter()
+                .map(|input_set_id| self.input_set(*input_set_id).len())
+                .sum(),
+            _ => gate.input_gates.len(),
+        }
+    }
+
+    fn for_each_gate_dependency_input(&self, gate: &PolyGate, mut f: impl FnMut(GateId)) {
+        match &gate.gate_type {
+            PolyGateType::SubCircuitOutput { call_id, .. } => {
+                let call = self.sub_circuit_calls.get(call_id).expect("sub-circuit call missing");
+                for &input_id in &call.inputs {
+                    f(input_id);
+                }
+            }
+            PolyGateType::SummedSubCircuitOutput { summed_call_id, .. } => {
+                let call = self
+                    .summed_sub_circuit_calls
+                    .get(summed_call_id)
+                    .expect("summed sub-circuit call missing");
+                for input_set_id in &call.call_input_set_ids {
+                    let input_ids = self.input_set(*input_set_id);
+                    for &input_id in input_ids.iter() {
+                        f(input_id);
+                    }
+                }
+            }
+            _ => {
+                for &input_id in &gate.input_gates {
+                    f(input_id);
+                }
+            }
         }
     }
 
@@ -959,7 +1139,11 @@ impl<P: Poly> PolyCircuit<P> {
 
         while let Some((node, child_idx)) = stack.pop() {
             let gate = self.gates.get(&node).expect("gate not found");
-            let dependency_inputs = self.gate_dependency_inputs(gate);
+            let dependency_inputs = {
+                let mut deps = Vec::with_capacity(self.gate_dependency_input_count(gate));
+                self.for_each_gate_dependency_input(gate, |input_id| deps.push(input_id));
+                deps
+            };
 
             if child_idx < dependency_inputs.len() {
                 stack.push((node, child_idx + 1));
@@ -984,8 +1168,8 @@ impl<P: Poly> PolyCircuit<P> {
         let orders = self.topological_order();
         for gate_id in orders.into_iter() {
             let gate = self.gates.get(&gate_id).expect("gate not found");
-            let dependency_inputs = self.gate_dependency_inputs(gate);
-            if dependency_inputs.is_empty() {
+            let dependency_count = self.gate_dependency_input_count(gate);
+            if dependency_count == 0 {
                 // Inputs and consts have no dependencies; place them at level 0
                 gate_levels.insert(gate_id, 0);
                 if levels.is_empty() {
@@ -995,11 +1179,13 @@ impl<P: Poly> PolyCircuit<P> {
                 continue;
             }
             // Find the maximum level among all input gates, then add 1.
-            let max_input_level = dependency_inputs
-                .iter()
-                .map(|id| gate_levels[id])
-                .max()
-                .expect("gate has input_gates but max() returned None");
+            let mut max_input_level: Option<usize> = None;
+            self.for_each_gate_dependency_input(gate, |input_id| {
+                let level = gate_levels[&input_id];
+                max_input_level = Some(max_input_level.map_or(level, |curr| curr.max(level)));
+            });
+            let max_input_level =
+                max_input_level.expect("gate has dependencies but max() returned None");
             let level = max_input_level + 1;
             gate_levels.insert(gate_id, level);
             if levels.len() <= level {
@@ -1015,30 +1201,44 @@ impl<P: Poly> PolyCircuit<P> {
             .into_iter()
             .map(|level| {
                 let mut seen_call_ids = HashSet::new();
-                let mut sub_circuit_ids = Vec::new();
+                let mut seen_summed_call_ids = HashSet::new();
+                let mut sub_circuit_call_ids = Vec::new();
+                let mut summed_sub_circuit_call_ids = Vec::new();
                 let mut regular_gate_types = Vec::new();
                 for gate_id in level {
                     let gate = self.gates.get(&gate_id).expect("gate not found");
                     match &gate.gate_type {
                         PolyGateType::SubCircuitOutput { call_id, .. } => {
                             if seen_call_ids.insert(*call_id) {
-                                let call = self
-                                    .sub_circuit_calls
-                                    .get(call_id)
-                                    .expect("sub-circuit call missing");
-                                sub_circuit_ids.push(call.sub_circuit_id);
+                                sub_circuit_call_ids.push(*call_id);
+                            }
+                        }
+                        PolyGateType::SummedSubCircuitOutput { summed_call_id, .. } => {
+                            if seen_summed_call_ids.insert(*summed_call_id) {
+                                summed_sub_circuit_call_ids.push(*summed_call_id);
                             }
                         }
                         _ => regular_gate_types.push(gate.gate_type.clone()),
                     }
                 }
-                CircuitExecutionLayer { sub_circuit_ids, regular_gate_types }
+                CircuitExecutionLayer {
+                    sub_circuit_call_ids,
+                    summed_sub_circuit_call_ids,
+                    regular_gate_types,
+                }
             })
             .collect()
     }
 
     pub(crate) fn registered_sub_circuit(&self, circuit_id: usize) -> Self {
         self.with_sub_circuit(circuit_id, Clone::clone)
+    }
+
+    pub(crate) fn registered_sub_circuit_ref(&self, circuit_id: usize) -> Arc<Self> {
+        let stored = self.sub_circuits.get(&circuit_id).expect("sub-circuit not found");
+        match stored {
+            StoredSubCircuit::InMemory(sub) => sub.clone(),
+        }
     }
 
     /// Returns the circuit depth defined as the maximum level index among
@@ -1082,6 +1282,7 @@ impl<P: Poly> PolyCircuit<P> {
             &one,
             one_compact,
             &input_compacts,
+            &[],
             plt_evaluator,
             slot_transfer_evaluator,
             0,
@@ -1100,7 +1301,7 @@ impl<P: Poly> PolyCircuit<P> {
     }
 
     fn max_sub_circuit_calls(&self) -> usize {
-        let mut max_calls = self.sub_circuit_calls.len();
+        let mut max_calls = self.next_scoped_call_id;
         for sub_id in self.sub_circuits.keys().copied() {
             let sub_max_calls = self.with_sub_circuit(sub_id, |sub| sub.max_sub_circuit_calls());
             max_calls = max_calls.max(sub_max_calls);
@@ -1125,7 +1326,7 @@ impl<P: Poly> PolyCircuit<P> {
         scoped_keys: &mut BTreeSet<u128>,
     ) {
         for gate in self.gates.values() {
-            match gate.gate_type {
+            match &gate.gate_type {
                 PolyGateType::SlotTransfer { .. } | PolyGateType::PubLut { .. } => {
                     let scoped_key = call_prefix
                         .checked_mul(gate_id_base)
@@ -1136,14 +1337,30 @@ impl<P: Poly> PolyCircuit<P> {
                 _ => {}
             }
         }
-        for (call_id, call) in &self.sub_circuit_calls {
+        for call in self.sub_circuit_calls.values() {
             let child_prefix = call_prefix
                 .checked_mul(call_id_base)
-                .and_then(|base| base.checked_add((*call_id as u128) + 1))
+                .and_then(|base| base.checked_add((call.scoped_call_id as u128) + 1))
                 .expect("sub-circuit call prefix overflow");
             self.with_sub_circuit(call.sub_circuit_id, |sub| {
                 sub.collect_scoped_gate_keys(child_prefix, call_id_base, gate_id_base, scoped_keys);
             });
+        }
+        for call in self.summed_sub_circuit_calls.values() {
+            for scoped_call_id in &call.scoped_call_ids {
+                let child_prefix = call_prefix
+                    .checked_mul(call_id_base)
+                    .and_then(|base| base.checked_add((*scoped_call_id as u128) + 1))
+                    .expect("summed sub-circuit call prefix overflow");
+                self.with_sub_circuit(call.sub_circuit_id, |sub| {
+                    sub.collect_scoped_gate_keys(
+                        child_prefix,
+                        call_id_base,
+                        gate_id_base,
+                        scoped_keys,
+                    );
+                });
+            }
         }
     }
 
@@ -1199,6 +1416,7 @@ impl<P: Poly> PolyCircuit<P> {
         one: &Arc<E>,
         one_compact: Arc<E::Compact>,
         inputs: &[Arc<E::Compact>],
+        param_bindings: &[SubCircuitParamValue],
         plt_evaluator: Option<&PE>,
         slot_transfer_evaluator: Option<&dyn SlotTransferEvaluator<E>>,
         call_prefix: u128,
@@ -1230,9 +1448,9 @@ impl<P: Poly> PolyCircuit<P> {
                 let mut local_count = HashMap::<GateId, usize>::new();
                 for gate_id in level {
                     let gate = self.gates.get(gate_id).expect("gate not found");
-                    for input_id in self.gate_dependency_inputs(gate) {
-                        *local_count.entry(*input_id).or_insert(0) += 1;
-                    }
+                    self.for_each_gate_dependency_input(gate, |input_id| {
+                        *local_count.entry(input_id).or_insert(0) += 1;
+                    });
                 }
                 local_count
             })
@@ -1254,7 +1472,7 @@ impl<P: Poly> PolyCircuit<P> {
         let mut input_gate_ids: Vec<GateId> = self
             .gates
             .iter()
-            .filter_map(|(id, gate)| match gate.gate_type {
+            .filter_map(|(id, gate)| match &gate.gate_type {
                 PolyGateType::Input if id.0 != 0 => Some(*id),
                 _ => None,
             })
@@ -1292,19 +1510,19 @@ impl<P: Poly> PolyCircuit<P> {
                 .collect()
         };
         let release_consumed_inputs = |gate: &PolyGate| {
-            for input_id in self.gate_dependency_inputs(gate) {
-                if output_set.contains(input_id) {
-                    continue;
+            self.for_each_gate_dependency_input(gate, |input_id| {
+                if output_set.contains(&input_id) {
+                    return;
                 }
-                let Some(counter) = remaining_use_count.get(input_id) else {
-                    continue;
+                let Some(counter) = remaining_use_count.get(&input_id) else {
+                    return;
                 };
                 let prev = counter.fetch_sub(1, Ordering::AcqRel);
                 debug_assert!(prev > 0, "remaining use counter underflow for gate {}", input_id);
                 if prev == 1 {
-                    wires.remove(input_id);
+                    wires.remove(&input_id);
                 }
-            }
+            });
         };
         let eval_gate = |gate_id: GateId, eval_params: &E::Params, eval_one: &Arc<E>| {
             debug!("{}", format!("Gate id {gate_id} started"));
@@ -1356,6 +1574,7 @@ impl<P: Poly> PolyCircuit<P> {
                     Arc::new(result.to_compact())
                 }
                 PolyGateType::SmallScalarMul { scalar } => {
+                    let scalar = scalar.resolve_small_scalar(param_bindings);
                     let input = wires
                         .get(&gate.input_gates[0])
                         .expect("wire missing for LargeScalarMul")
@@ -1366,6 +1585,7 @@ impl<P: Poly> PolyCircuit<P> {
                     Arc::new(result.to_compact())
                 }
                 PolyGateType::LargeScalarMul { scalar } => {
+                    let scalar = scalar.resolve_large_scalar(param_bindings);
                     let input = wires
                         .get(&gate.input_gates[0])
                         .expect("wire missing for LargeScalarMul")
@@ -1376,6 +1596,7 @@ impl<P: Poly> PolyCircuit<P> {
                     Arc::new(result.to_compact())
                 }
                 PolyGateType::SlotTransfer { src_slots } => {
+                    let src_slots = src_slots.resolve_slot_transfer(param_bindings);
                     let input = wires
                         .get(&gate.input_gates[0])
                         .expect("wire missing for SlotTransfer")
@@ -1387,11 +1608,12 @@ impl<P: Poly> PolyCircuit<P> {
                         Self::scoped_gate_id(scoped_gate_ids, call_prefix, gate_id, gate_id_base);
                     Arc::new(
                         evaluator
-                            .slot_transfer(eval_params, &input, src_slots, scoped_gate_id)
+                            .slot_transfer(eval_params, &input, src_slots.as_ref(), scoped_gate_id)
                             .to_compact(),
                     )
                 }
                 PolyGateType::PubLut { lut_id } => {
+                    let lut_id = lut_id.resolve_public_lookup(param_bindings);
                     debug!("Public Lookup gate start");
                     let input = wires
                         .get(&gate.input_gates[0])
@@ -1401,7 +1623,7 @@ impl<P: Poly> PolyCircuit<P> {
                     let scoped_gate_id =
                         Self::scoped_gate_id(scoped_gate_ids, call_prefix, gate_id, gate_id_base);
                     let lookup_guard =
-                        self.lookup_registry.lookups.get(lut_id).expect("lookup table missing");
+                        self.lookup_registry.lookups.get(&lut_id).expect("lookup table missing");
                     let result =
                         plt_evaluator.expect("public lookup evaluator missing").public_lookup(
                             eval_params,
@@ -1409,7 +1631,7 @@ impl<P: Poly> PolyCircuit<P> {
                             eval_one,
                             &input,
                             scoped_gate_id,
-                            *lut_id,
+                            lut_id,
                         );
                     debug!("Public Lookup gate end");
                     Arc::new(result.to_compact())
@@ -1421,9 +1643,10 @@ impl<P: Poly> PolyCircuit<P> {
                         .get(call_id)
                         .expect("sub-circuit call missing")
                         .clone();
+                    let param_bindings = self.binding_set(call.binding_set_id);
                     let child_prefix = call_prefix
                         .checked_mul(call_id_base)
-                        .and_then(|base| base.checked_add((*call_id as u128) + 1))
+                        .and_then(|base| base.checked_add((call.scoped_call_id as u128) + 1))
                         .expect("sub-circuit call prefix overflow");
                     let sub_inputs = call
                         .inputs
@@ -1436,6 +1659,7 @@ impl<P: Poly> PolyCircuit<P> {
                             eval_one,
                             one_compact.clone(),
                             &sub_inputs,
+                            param_bindings.as_ref(),
                             plt_evaluator,
                             slot_transfer_evaluator,
                             child_prefix,
@@ -1455,6 +1679,77 @@ impl<P: Poly> PolyCircuit<P> {
                     }
                     debug!("Sub-circuit call end");
                     sub_outputs[*output_idx].clone()
+                }
+                PolyGateType::SummedSubCircuitOutput { summed_call_id, output_idx: _, .. } => {
+                    debug!("Summed sub-circuit call start");
+                    let call = self
+                        .summed_sub_circuit_calls
+                        .get(summed_call_id)
+                        .expect("summed sub-circuit call missing")
+                        .clone();
+                    let mut accumulated: Option<Vec<E>> = None;
+                    for ((input_set_id, binding_set_id), scoped_call_id) in call
+                        .call_input_set_ids
+                        .iter()
+                        .zip(call.call_binding_set_ids.iter())
+                        .zip(call.scoped_call_ids.iter())
+                    {
+                        let bound_params = self.binding_set(*binding_set_id);
+                        let child_prefix = call_prefix
+                            .checked_mul(call_id_base)
+                            .and_then(|base| base.checked_add((*scoped_call_id as u128) + 1))
+                            .expect("summed sub-circuit call prefix overflow");
+                        let sub_inputs = self
+                            .input_set(*input_set_id)
+                            .iter()
+                            .map(|id| {
+                                wires.get(id).expect("wire missing for summed sub-circuit").clone()
+                            })
+                            .collect::<Vec<_>>();
+                        let sub_outputs =
+                            self.with_sub_circuit(call.sub_circuit_id, |sub_circuit| {
+                                sub_circuit.eval_scoped(
+                                    eval_params,
+                                    eval_one,
+                                    one_compact.clone(),
+                                    &sub_inputs,
+                                    bound_params.as_ref(),
+                                    plt_evaluator,
+                                    slot_transfer_evaluator,
+                                    child_prefix,
+                                    call_id_base,
+                                    gate_id_base,
+                                    scoped_gate_ids,
+                                    parallel_gates,
+                                )
+                            });
+                        let decoded_outputs = sub_outputs
+                            .into_iter()
+                            .map(|value| E::from_compact(eval_params, value.as_ref()))
+                            .collect::<Vec<_>>();
+                        match accumulated.as_mut() {
+                            Some(current) => {
+                                for (acc, output) in
+                                    current.iter_mut().zip(decoded_outputs.into_iter())
+                                {
+                                    *acc = acc.clone() + &output;
+                                }
+                            }
+                            None => accumulated = Some(decoded_outputs),
+                        }
+                    }
+                    let accumulated = accumulated
+                        .expect("summed sub-circuit call requires at least one inner call");
+                    for (output_gate_id, output) in
+                        call.output_gate_ids.iter().copied().zip(accumulated.into_iter())
+                    {
+                        wires.insert(output_gate_id, Arc::new(output.to_compact()));
+                    }
+                    debug!("Summed sub-circuit call end");
+                    wires
+                        .get(&gate_id)
+                        .expect("summed sub-circuit output should be populated")
+                        .clone()
                 }
             };
             if let Some(prefix) = self.print_value.get(&gate_id) {
@@ -1509,8 +1804,9 @@ impl<P: Poly> PolyCircuit<P> {
                             let input = E::from_compact(eval_params, input.as_ref());
                             LoadedGateInputs::Unary(input)
                         }
-                        PolyGateType::SubCircuitOutput { .. } => {
-                            panic!("SubCircuitOutput gate should not be in regular chunk path");
+                        PolyGateType::SubCircuitOutput { .. } |
+                        PolyGateType::SummedSubCircuitOutput { .. } => {
+                            panic!("sub-circuit output gate should not be in regular chunk path");
                         }
                     };
                     LoadedGateCtx { gate_id, gate, shard_idx, inputs }
@@ -1538,15 +1834,22 @@ impl<P: Poly> PolyCircuit<P> {
                         (
                             LoadedGateInputs::Unary(input),
                             PolyGateType::SmallScalarMul { scalar },
-                        ) => ComputedGateValue::Value(input.small_scalar_mul(eval_params, scalar)),
+                        ) => ComputedGateValue::Value(input.small_scalar_mul(
+                            eval_params,
+                            scalar.resolve_small_scalar(param_bindings),
+                        )),
                         (
                             LoadedGateInputs::Unary(input),
                             PolyGateType::LargeScalarMul { scalar },
-                        ) => ComputedGateValue::Value(input.large_scalar_mul(eval_params, scalar)),
+                        ) => ComputedGateValue::Value(input.large_scalar_mul(
+                            eval_params,
+                            scalar.resolve_large_scalar(param_bindings),
+                        )),
                         (
                             LoadedGateInputs::Unary(input),
                             PolyGateType::SlotTransfer { src_slots },
                         ) => {
+                            let src_slots = src_slots.resolve_slot_transfer(param_bindings);
                             let evaluator =
                                 slot_transfer_evaluator.expect("slot transfer evaluator missing");
                             let scoped_gate_id = Self::scoped_gate_id(
@@ -1558,11 +1861,12 @@ impl<P: Poly> PolyCircuit<P> {
                             ComputedGateValue::Value(evaluator.slot_transfer(
                                 eval_params,
                                 &input,
-                                src_slots,
+                                src_slots.as_ref(),
                                 scoped_gate_id,
                             ))
                         }
                         (LoadedGateInputs::Unary(input), PolyGateType::PubLut { lut_id }) => {
+                            let lut_id = lut_id.resolve_public_lookup(param_bindings);
                             let scoped_gate_id = Self::scoped_gate_id(
                                 scoped_gate_ids,
                                 call_prefix,
@@ -1572,7 +1876,7 @@ impl<P: Poly> PolyCircuit<P> {
                             let lookup_guard = self
                                 .lookup_registry
                                 .lookups
-                                .get(lut_id)
+                                .get(&lut_id)
                                 .expect("lookup table missing");
                             let result = plt_evaluator
                                 .expect("public lookup evaluator missing")
@@ -1582,7 +1886,7 @@ impl<P: Poly> PolyCircuit<P> {
                                     eval_one,
                                     &input,
                                     scoped_gate_id,
-                                    *lut_id,
+                                    lut_id,
                                 );
                             ComputedGateValue::Value(result)
                         }
@@ -1641,7 +1945,8 @@ impl<P: Poly> PolyCircuit<P> {
             let mut regular_gates = Vec::new();
             for gate_id in level.iter().copied() {
                 match self.gates.get(&gate_id).expect("gate not found").gate_type {
-                    PolyGateType::SubCircuitOutput { .. } => subcircuit_gates.push(gate_id),
+                    PolyGateType::SubCircuitOutput { .. } |
+                    PolyGateType::SummedSubCircuitOutput { .. } => subcircuit_gates.push(gate_id),
                     _ => regular_gates.push(gate_id),
                 }
             }
@@ -1754,70 +2059,94 @@ impl<P: Poly> PolyCircuit<P> {
     }
 
     pub fn lut_vector_len_with_subcircuits(&self) -> usize {
+        self.lut_vector_len_with_subcircuits_and_bindings(&[])
+    }
+
+    fn lut_vector_len_with_subcircuits_and_bindings(
+        &self,
+        param_bindings: &[SubCircuitParamValue],
+    ) -> usize {
         let mut total = 0usize;
         for gate in self.gates.values() {
-            if let PolyGateType::PubLut { lut_id } = gate.gate_type {
+            if let PolyGateType::PubLut { lut_id } = &gate.gate_type {
+                let lut_id = lut_id.resolve_public_lookup(param_bindings);
                 let lookup =
                     self.lookup_registry.lookups.get(&lut_id).expect("lookup table missing");
                 total += lookup.len();
             }
         }
         for call in self.sub_circuit_calls.values() {
-            total += self
-                .with_sub_circuit(call.sub_circuit_id, |sub| sub.lut_vector_len_with_subcircuits());
+            let param_bindings = self.binding_set(call.binding_set_id);
+            total += self.with_sub_circuit(call.sub_circuit_id, |sub| {
+                sub.lut_vector_len_with_subcircuits_and_bindings(param_bindings.as_ref())
+            });
+        }
+        for call in self.summed_sub_circuit_calls.values() {
+            for binding_set_id in &call.call_binding_set_ids {
+                let param_bindings = self.binding_set(*binding_set_id);
+                total += self.with_sub_circuit(call.sub_circuit_id, |sub| {
+                    sub.lut_vector_len_with_subcircuits_and_bindings(param_bindings.as_ref())
+                });
+            }
         }
         total
     }
 
     pub fn enable_subcircuits_in_disk(&mut self, dir_path: impl AsRef<Path>) {
-        let dir = dir_path.as_ref().to_path_buf();
-        fs::create_dir_all(&dir).expect("failed to create sub-circuit disk directory");
-        let storage = SubCircuitDiskStorage::new(dir);
-        let circuit_ids = self.sub_circuits.keys().copied().collect::<Vec<_>>();
-        self.sub_circuit_disk_storage = Some(storage.clone());
-        for circuit_id in circuit_ids {
-            let stored = self
-                .sub_circuits
-                .remove(&circuit_id)
-                .expect("sub-circuit missing while enabling disk storage");
-            let disk_ref = match stored {
-                StoredSubCircuit::InMemory(sub) => {
-                    Self::persist_sub_circuit_to_disk(&storage, &self.lookup_registry, *sub)
-                }
-                StoredSubCircuit::OnDisk(disk_ref) => disk_ref,
-            };
-            self.sub_circuits.insert(circuit_id, StoredSubCircuit::OnDisk(disk_ref));
-        }
+        let storage = SubCircuitDiskStorage::new(dir_path.as_ref());
+        self.sub_circuit_disk_storage = Some(storage);
     }
 
     pub fn register_sub_circuit(&mut self, mut sub_circuit: Self) -> usize {
-        sub_circuit.inherit_lookup_registry(Arc::clone(&self.lookup_registry));
+        sub_circuit.inherit_registries_from_parent(self);
         let circuit_id = self.sub_circuits.len();
-        let stored = match &self.sub_circuit_disk_storage {
-            Some(storage) => StoredSubCircuit::OnDisk(Self::persist_sub_circuit_to_disk(
-                storage,
-                &self.lookup_registry,
-                sub_circuit,
-            )),
-            None => StoredSubCircuit::InMemory(Box::new(sub_circuit)),
-        };
-        self.sub_circuits.insert(circuit_id, stored);
+        self.sub_circuits.insert(circuit_id, StoredSubCircuit::InMemory(Arc::new(sub_circuit)));
+        circuit_id
+    }
+
+    pub fn register_shared_sub_circuit(&mut self, sub_circuit: Arc<Self>) -> usize {
+        let circuit_id = self.sub_circuits.len();
+        self.sub_circuits.insert(circuit_id, StoredSubCircuit::InMemory(sub_circuit));
         circuit_id
     }
 
     pub fn call_sub_circuit(&mut self, circuit_id: usize, inputs: &[GateId]) -> Vec<GateId> {
+        self.call_sub_circuit_with_bindings(circuit_id, inputs, &[])
+    }
+
+    pub fn call_sub_circuit_with_bindings(
+        &mut self,
+        circuit_id: usize,
+        inputs: &[GateId],
+        param_bindings: &[SubCircuitParamValue],
+    ) -> Vec<GateId> {
         #[cfg(debug_assertions)]
         {
             let stored = self.sub_circuits.get(&circuit_id).expect("sub-circuit not found");
             let num_inputs = match stored {
                 StoredSubCircuit::InMemory(sub) => sub.num_input(),
-                StoredSubCircuit::OnDisk(disk_ref) => disk_ref.num_input,
             };
             assert_eq!(inputs.len(), num_inputs);
+            let expected_param_kinds = match stored {
+                StoredSubCircuit::InMemory(sub) => &sub.sub_circuit_params,
+            };
+            assert_eq!(param_bindings.len(), expected_param_kinds.len());
+            for (param_idx, (binding, expected_kind)) in
+                param_bindings.iter().zip(expected_param_kinds.iter()).enumerate()
+            {
+                assert_eq!(
+                    binding.kind(),
+                    *expected_kind,
+                    "sub-circuit parameter kind mismatch at binding {param_idx}"
+                );
+            }
         }
         let num_outputs = self.sub_circuit_num_output(circuit_id);
         let call_id = self.sub_circuit_calls.len();
         let inputs_vec = inputs.to_vec();
+        let binding_set_id = self.binding_registry.register(param_bindings);
+        let scoped_call_id = self.next_scoped_call_id;
+        self.next_scoped_call_id += 1;
         let mut outputs = Vec::with_capacity(num_outputs);
         for output_idx in 0..num_outputs {
             outputs.push(self.new_sub_circuit_output_gate(call_id, output_idx, inputs.len()));
@@ -1825,11 +2154,94 @@ impl<P: Poly> PolyCircuit<P> {
         let call = SubCircuitCall {
             sub_circuit_id: circuit_id,
             inputs: inputs_vec,
+            binding_set_id,
+            scoped_call_id,
             output_gate_ids: outputs.clone(),
             num_outputs,
         };
         self.sub_circuit_calls.insert(call_id, call);
         outputs
+    }
+
+    pub fn call_sub_circuit_sum_many_with_binding_set_ids(
+        &mut self,
+        circuit_id: usize,
+        call_input_set_ids: Vec<usize>,
+        call_binding_set_ids: Vec<usize>,
+    ) -> Vec<GateId> {
+        assert!(
+            !call_input_set_ids.is_empty(),
+            "summed sub-circuit call requires at least one inner call"
+        );
+        assert_eq!(
+            call_input_set_ids.len(),
+            call_binding_set_ids.len(),
+            "summed sub-circuit call requires one binding set per inner call"
+        );
+        #[cfg(debug_assertions)]
+        {
+            let stored = self.sub_circuits.get(&circuit_id).expect("sub-circuit not found");
+            let (num_inputs, expected_param_kinds) = match stored {
+                StoredSubCircuit::InMemory(sub) => (sub.num_input(), &sub.sub_circuit_params),
+            };
+            for (call_idx, (input_set_id, binding_set_id)) in
+                call_input_set_ids.iter().zip(call_binding_set_ids.iter()).enumerate()
+            {
+                let inputs = self.input_set(*input_set_id);
+                assert_eq!(
+                    inputs.len(),
+                    num_inputs,
+                    "summed sub-circuit input count mismatch at inner call {call_idx}"
+                );
+                let bindings = self.binding_set(*binding_set_id);
+                assert_eq!(
+                    bindings.len(),
+                    expected_param_kinds.len(),
+                    "summed sub-circuit parameter count mismatch at inner call {call_idx}"
+                );
+                for (param_idx, (binding, expected_kind)) in
+                    bindings.iter().zip(expected_param_kinds.iter()).enumerate()
+                {
+                    assert_eq!(
+                        binding.kind(),
+                        *expected_kind,
+                        "summed sub-circuit parameter kind mismatch at inner call {call_idx}, binding {param_idx}"
+                    );
+                }
+            }
+        }
+        let num_outputs = self.sub_circuit_num_output(circuit_id);
+        let summed_call_id = self.summed_sub_circuit_calls.len();
+        let scoped_call_ids = (0..call_input_set_ids.len())
+            .map(|_| {
+                let scoped_call_id = self.next_scoped_call_id;
+                self.next_scoped_call_id += 1;
+                scoped_call_id
+            })
+            .collect::<Vec<_>>();
+        let flattened_num_inputs =
+            call_input_set_ids.iter().map(|input_set_id| self.input_set(*input_set_id).len()).sum();
+        let output_gate_ids = (0..num_outputs)
+            .map(|output_idx| {
+                self.new_summed_sub_circuit_output_gate(
+                    summed_call_id,
+                    output_idx,
+                    flattened_num_inputs,
+                )
+            })
+            .collect::<Vec<_>>();
+        self.summed_sub_circuit_calls.insert(
+            summed_call_id,
+            SummedSubCircuitCall {
+                sub_circuit_id: circuit_id,
+                call_input_set_ids,
+                call_binding_set_ids,
+                scoped_call_ids,
+                output_gate_ids: output_gate_ids.clone(),
+                num_outputs,
+            },
+        );
+        output_gate_ids
     }
 }
 
@@ -1849,8 +2261,6 @@ mod tests {
         utils::{create_bit_random_poly, create_random_poly},
     };
     use num_bigint::BigUint;
-    use tempfile::tempdir;
-
     fn eval_with_const_one<PE>(
         circuit: &PolyCircuit<DCRTPoly>,
         params: &DCRTPolyParams,
@@ -1863,13 +2273,6 @@ mod tests {
         let one = DCRTPoly::const_one(params);
         let eval_inputs = inputs.to_vec();
         circuit.eval(params, one, eval_inputs, plt_evaluator, None, None)
-    }
-
-    fn dir_is_empty_or_missing(path: &Path) -> bool {
-        match fs::read_dir(path) {
-            Ok(mut entries) => entries.next().is_none(),
-            Err(err) => err.kind() == std::io::ErrorKind::NotFound,
-        }
     }
 
     #[test]
@@ -2493,8 +2896,185 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_sub_circuits_from_disk() {
-        let dir = tempdir().expect("create temp dir");
+    fn test_register_and_call_parameterized_sub_circuit() {
+        let params = DCRTPolyParams::default();
+        let input_poly = create_random_poly(&params);
+
+        let mut sub_circuit = PolyCircuit::new();
+        let scalar_param =
+            sub_circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul);
+        let sub_inputs = sub_circuit.input(1);
+        let scaled = sub_circuit.small_scalar_mul_param(sub_inputs[0], scalar_param);
+        sub_circuit.output(vec![scaled]);
+
+        let mut main_circuit = PolyCircuit::new();
+        let main_inputs = main_circuit.input(1);
+        let sub_id = main_circuit.register_sub_circuit(sub_circuit);
+        let doubled = main_circuit.call_sub_circuit_with_bindings(
+            sub_id,
+            &[main_inputs[0]],
+            &[SubCircuitParamValue::SmallScalarMul(vec![2])],
+        );
+        let tripled = main_circuit.call_sub_circuit_with_bindings(
+            sub_id,
+            &[main_inputs[0]],
+            &[SubCircuitParamValue::SmallScalarMul(vec![3])],
+        );
+        main_circuit.output(vec![doubled[0], tripled[0]]);
+
+        let result = eval_with_const_one(
+            &main_circuit,
+            &params,
+            std::slice::from_ref(&input_poly),
+            None::<&PolyPltEvaluator>,
+        );
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], input_poly.small_scalar_mul(&params, &[2]));
+        assert_eq!(result[1], input_poly.small_scalar_mul(&params, &[3]));
+        assert_eq!(main_circuit.non_free_depth(), 0);
+    }
+
+    #[test]
+    fn test_parameterized_sub_circuit_reuses_identical_binding_sets() {
+        let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
+        let scalar_param =
+            sub_circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul);
+        let sub_inputs = sub_circuit.input(1);
+        let scaled = sub_circuit.small_scalar_mul_param(sub_inputs[0], scalar_param);
+        sub_circuit.output(vec![scaled]);
+
+        let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
+        let main_inputs = main_circuit.input(1);
+        let sub_id = main_circuit.register_sub_circuit(sub_circuit);
+
+        let _ = main_circuit.call_sub_circuit_with_bindings(
+            sub_id,
+            &[main_inputs[0]],
+            &[SubCircuitParamValue::SmallScalarMul(vec![7])],
+        );
+        let _ = main_circuit.call_sub_circuit_with_bindings(
+            sub_id,
+            &[main_inputs[0]],
+            &[SubCircuitParamValue::SmallScalarMul(vec![7])],
+        );
+        let _ = main_circuit.call_sub_circuit_with_bindings(
+            sub_id,
+            &[main_inputs[0]],
+            &[SubCircuitParamValue::SmallScalarMul(vec![9])],
+        );
+
+        let binding_set_ids = main_circuit
+            .sub_circuit_calls
+            .values()
+            .map(|call| call.binding_set_id)
+            .collect::<Vec<_>>();
+        assert_eq!(binding_set_ids.len(), 3);
+        assert_eq!(binding_set_ids[0], binding_set_ids[1]);
+        assert_ne!(binding_set_ids[0], binding_set_ids[2]);
+        assert_eq!(main_circuit.binding_registry.binding_sets.len(), 2);
+    }
+
+    #[test]
+    fn test_register_sub_circuit_reuses_child_binding_sets_without_duplication() {
+        let mut leaf_circuit = PolyCircuit::<DCRTPoly>::new();
+        let scalar_param =
+            leaf_circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul);
+        let leaf_inputs = leaf_circuit.input(1);
+        let scaled = leaf_circuit.small_scalar_mul_param(leaf_inputs[0], scalar_param);
+        leaf_circuit.output(vec![scaled]);
+
+        let mut middle_circuit = PolyCircuit::<DCRTPoly>::new();
+        let middle_inputs = middle_circuit.input(1);
+        let leaf_id = middle_circuit.register_sub_circuit(leaf_circuit);
+        let _ = middle_circuit.call_sub_circuit_with_bindings(
+            leaf_id,
+            &[middle_inputs[0]],
+            &[SubCircuitParamValue::SmallScalarMul(vec![11])],
+        );
+        let _ = middle_circuit.call_sub_circuit_with_bindings(
+            leaf_id,
+            &[middle_inputs[0]],
+            &[SubCircuitParamValue::SmallScalarMul(vec![11])],
+        );
+        assert_eq!(middle_circuit.binding_registry.binding_sets.len(), 1);
+
+        let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
+        let main_inputs = main_circuit.input(1);
+        let middle_id = main_circuit.register_sub_circuit(middle_circuit);
+        let _ = main_circuit.call_sub_circuit(middle_id, &[main_inputs[0]]);
+
+        assert_eq!(main_circuit.binding_registry.binding_sets.len(), 2);
+        let StoredSubCircuit::InMemory(registered_middle) =
+            main_circuit.sub_circuits.get(&middle_id).expect("middle circuit missing");
+        assert!(Arc::ptr_eq(&registered_middle.binding_registry, &main_circuit.binding_registry));
+    }
+
+    #[test]
+    fn test_register_and_call_summed_parameterized_sub_circuit() {
+        let params = DCRTPolyParams::default();
+        let input_poly = create_random_poly(&params);
+
+        let mut sub_circuit = PolyCircuit::new();
+        let scalar_param =
+            sub_circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul);
+        let sub_inputs = sub_circuit.input(1);
+        let scaled = sub_circuit.small_scalar_mul_param(sub_inputs[0], scalar_param);
+        sub_circuit.output(vec![scaled]);
+
+        let mut main_circuit = PolyCircuit::new();
+        let main_inputs = main_circuit.input(1);
+        let sub_id = main_circuit.register_sub_circuit(sub_circuit);
+        let double_id =
+            main_circuit.intern_binding_set(&[SubCircuitParamValue::SmallScalarMul(vec![2])]);
+        let triple_id =
+            main_circuit.intern_binding_set(&[SubCircuitParamValue::SmallScalarMul(vec![3])]);
+        let input_set_id = main_circuit.intern_input_set(&[main_inputs[0]]);
+        let outputs = main_circuit.call_sub_circuit_sum_many_with_binding_set_ids(
+            sub_id,
+            vec![input_set_id, input_set_id, input_set_id],
+            vec![double_id, double_id, triple_id],
+        );
+        main_circuit.output(outputs.clone());
+
+        let result = eval_with_const_one(
+            &main_circuit,
+            &params,
+            std::slice::from_ref(&input_poly),
+            None::<&PolyPltEvaluator>,
+        );
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], input_poly.small_scalar_mul(&params, &[7]));
+        assert_eq!(main_circuit.non_free_depth(), 0);
+        assert_eq!(main_circuit.binding_registry.binding_sets.len(), 2);
+        assert_eq!(main_circuit.input_set_registry.input_sets.len(), 1);
+        assert_eq!(main_circuit.summed_sub_circuit_calls.len(), 1);
+    }
+
+    #[test]
+    fn test_summed_sub_circuit_non_free_depth_uses_max_inner_call_depth() {
+        let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
+        let sub_inputs = sub_circuit.input(2);
+        let product = sub_circuit.mul_gate(sub_inputs[0], sub_inputs[1]);
+        sub_circuit.output(vec![product]);
+
+        let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
+        let inputs = main_circuit.input(3);
+        let precomputed = main_circuit.mul_gate(inputs[0], inputs[1]);
+        let sub_id = main_circuit.register_sub_circuit(sub_circuit);
+        let direct_input_set_id = main_circuit.intern_input_set(&[inputs[0], inputs[2]]);
+        let precomputed_input_set_id = main_circuit.intern_input_set(&[precomputed, inputs[2]]);
+        let outputs = main_circuit.call_sub_circuit_sum_many_with_binding_set_ids(
+            sub_id,
+            vec![direct_input_set_id, precomputed_input_set_id],
+            vec![main_circuit.intern_binding_set(&[]), main_circuit.intern_binding_set(&[])],
+        );
+        main_circuit.output(outputs);
+
+        assert_eq!(main_circuit.non_free_depth(), 2);
+    }
+
+    #[test]
+    fn test_nested_sub_circuits_with_disk_api_compatibility() {
         let params = DCRTPolyParams::default();
 
         let poly1 = create_random_poly(&params);
@@ -2515,7 +3095,7 @@ mod tests {
         middle_circuit.output(vec![add_gate]);
 
         let mut main_circuit = PolyCircuit::new();
-        main_circuit.enable_subcircuits_in_disk(dir.path());
+        main_circuit.enable_subcircuits_in_disk("unused");
         let main_inputs = main_circuit.input(3);
         let middle_circuit_id = main_circuit.register_sub_circuit(middle_circuit);
         let middle_outputs = main_circuit
@@ -2527,9 +3107,8 @@ mod tests {
             main_circuit
                 .sub_circuits
                 .values()
-                .all(|sub| matches!(sub, StoredSubCircuit::OnDisk(_)))
+                .all(|sub| matches!(sub, StoredSubCircuit::InMemory(_)))
         );
-        assert_eq!(std::fs::read_dir(dir.path()).expect("read temp dir").count(), 2);
 
         let gate_counts = main_circuit.count_gates_by_type_vec();
         assert_eq!(main_circuit.lut_vector_len_with_subcircuits(), 0);
@@ -2550,65 +3129,38 @@ mod tests {
     }
 
     #[test]
-    fn test_disk_backed_sub_circuit_files_are_removed_on_drop() {
-        let dir = tempdir().expect("create temp dir");
-        let storage_path = dir.path().to_path_buf();
+    fn test_enable_subcircuits_in_disk_is_noop_for_in_memory_storage() {
+        let params = DCRTPolyParams::default();
+        let poly1 = create_random_poly(&params);
+        let poly2 = create_random_poly(&params);
 
-        {
-            let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
-            let sub_inputs = sub_circuit.input(2);
-            let mul_gate = sub_circuit.mul_gate(sub_inputs[0], sub_inputs[1]);
-            sub_circuit.output(vec![mul_gate]);
+        let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
+        let sub_inputs = sub_circuit.input(2);
+        let add_gate = sub_circuit.add_gate(sub_inputs[0], sub_inputs[1]);
+        sub_circuit.output(vec![add_gate]);
 
-            let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
-            main_circuit.enable_subcircuits_in_disk(&storage_path);
-            let main_inputs = main_circuit.input(2);
-            let sub_circuit_id = main_circuit.register_sub_circuit(sub_circuit);
-            let outputs =
-                main_circuit.call_sub_circuit(sub_circuit_id, &[main_inputs[0], main_inputs[1]]);
-            main_circuit.output(outputs);
+        let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
+        main_circuit.enable_subcircuits_in_disk("unused");
+        let main_inputs = main_circuit.input(2);
+        let sub_circuit_id = main_circuit.register_sub_circuit(sub_circuit);
+        let outputs =
+            main_circuit.call_sub_circuit(sub_circuit_id, &[main_inputs[0], main_inputs[1]]);
+        main_circuit.output(outputs);
 
-            assert_eq!(fs::read_dir(&storage_path).expect("read temp dir").count(), 1);
-        }
-
-        assert!(dir_is_empty_or_missing(&storage_path));
-    }
-
-    #[test]
-    fn test_disk_backed_sub_circuit_cleanup_waits_for_last_clone() {
-        let dir = tempdir().expect("create temp dir");
-        let storage_path = dir.path().to_path_buf();
-
-        let cloned_circuit = {
-            let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
-            let sub_inputs = sub_circuit.input(2);
-            let add_gate = sub_circuit.add_gate(sub_inputs[0], sub_inputs[1]);
-            sub_circuit.output(vec![add_gate]);
-
-            let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
-            main_circuit.enable_subcircuits_in_disk(&storage_path);
-            let main_inputs = main_circuit.input(2);
-            let sub_circuit_id = main_circuit.register_sub_circuit(sub_circuit);
-            let outputs =
-                main_circuit.call_sub_circuit(sub_circuit_id, &[main_inputs[0], main_inputs[1]]);
-            main_circuit.output(outputs);
-
-            assert_eq!(fs::read_dir(&storage_path).expect("read temp dir").count(), 1);
-            let cloned_circuit = main_circuit.clone();
-            drop(main_circuit);
-            assert_eq!(
-                fs::read_dir(&storage_path).expect("read temp dir after dropping original").count(),
-                1
-            );
-            cloned_circuit
-        };
-
-        assert_eq!(
-            fs::read_dir(&storage_path).expect("read temp dir before final drop").count(),
-            1
+        assert!(
+            main_circuit
+                .sub_circuits
+                .values()
+                .all(|sub| matches!(sub, StoredSubCircuit::InMemory(_)))
         );
-        drop(cloned_circuit);
-        assert!(dir_is_empty_or_missing(&storage_path));
+
+        let result = eval_with_const_one(
+            &main_circuit,
+            &params,
+            &[poly1.clone(), poly2.clone()],
+            None::<&PolyPltEvaluator>,
+        );
+        assert_eq!(result[0], poly1 + poly2);
     }
 
     #[test]

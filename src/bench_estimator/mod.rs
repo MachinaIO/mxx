@@ -25,7 +25,15 @@ use std::{
 
 use num_bigint::BigUint;
 
-use crate::circuit::{CircuitExecutionLayer, Evaluable, PolyCircuit, PolyGateType};
+use crate::circuit::{
+    CircuitExecutionLayer, Evaluable, PolyCircuit, PolyGateType, SubCircuitParamValue,
+};
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct BenchSummaryCacheKey {
+    circuit_ptr: usize,
+    param_bindings: Vec<SubCircuitParamValue>,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct BenchOperationMeasurement {
@@ -188,38 +196,61 @@ pub trait BenchEstimator<E: Evaluable> {
     fn estimate_slot_transfer(&self, src_slots: &[(u32, Option<u32>)]) -> CircuitBenchEstimate;
     fn estimate_public_lookup(&self, lut_id: usize) -> CircuitBenchEstimate;
 
-    fn estimate_gate_bench(&self, gate_type: &PolyGateType) -> CircuitBenchEstimate {
+    fn estimate_gate_bench_with_bindings(
+        &self,
+        gate_type: &PolyGateType,
+        param_bindings: &[SubCircuitParamValue],
+    ) -> CircuitBenchEstimate {
         match gate_type {
             PolyGateType::Input => self.estimate_input(),
             PolyGateType::Add => self.estimate_add(),
             PolyGateType::Sub => self.estimate_sub(),
             PolyGateType::Mul => self.estimate_mul(),
-            PolyGateType::SmallScalarMul { scalar } => self.estimate_small_scalar_mul(scalar),
-            PolyGateType::LargeScalarMul { scalar } => self.estimate_large_scalar_mul(scalar),
-            PolyGateType::SlotTransfer { src_slots } => self.estimate_slot_transfer(src_slots),
-            PolyGateType::PubLut { lut_id } => self.estimate_public_lookup(*lut_id),
-            PolyGateType::SubCircuitOutput { .. } => {
-                panic!("BenchEstimator::estimate_gate_bench received unexpected SubCircuitOutput")
+            PolyGateType::SmallScalarMul { scalar } => {
+                self.estimate_small_scalar_mul(scalar.resolve_small_scalar(param_bindings))
+            }
+            PolyGateType::LargeScalarMul { scalar } => {
+                self.estimate_large_scalar_mul(scalar.resolve_large_scalar(param_bindings))
+            }
+            PolyGateType::SlotTransfer { src_slots } => {
+                let src_slots = src_slots.resolve_slot_transfer(param_bindings);
+                self.estimate_slot_transfer(src_slots.as_ref())
+            }
+            PolyGateType::PubLut { lut_id } => {
+                self.estimate_public_lookup(lut_id.resolve_public_lookup(param_bindings))
+            }
+            PolyGateType::SubCircuitOutput { .. } | PolyGateType::SummedSubCircuitOutput { .. } => {
+                panic!(
+                    "BenchEstimator::estimate_gate_bench received unexpected SubCircuitOutput or SummedSubCircuitOutput"
+                )
             }
         }
     }
 
+    fn estimate_gate_bench(&self, gate_type: &PolyGateType) -> CircuitBenchEstimate {
+        self.estimate_gate_bench_with_bindings(gate_type, &[])
+    }
+
     fn estimate_circuit_bench(&self, circuit: &PolyCircuit<E::P>) -> CircuitBenchSummary {
         let mut summary_cache = HashMap::new();
-        estimate_circuit_bench_with_cache(self, circuit, &mut summary_cache)
+        estimate_circuit_bench_with_cache(self, circuit, &[], &mut summary_cache)
     }
 }
 
 fn estimate_circuit_bench_with_cache<E, B>(
     estimator: &B,
     circuit: &PolyCircuit<E::P>,
-    summary_cache: &mut HashMap<*const PolyCircuit<E::P>, CircuitBenchSummary>,
+    param_bindings: &[SubCircuitParamValue],
+    summary_cache: &mut HashMap<BenchSummaryCacheKey, CircuitBenchSummary>,
 ) -> CircuitBenchSummary
 where
     E: Evaluable,
     B: BenchEstimator<E> + ?Sized,
 {
-    let circuit_key = circuit as *const PolyCircuit<E::P>;
+    let circuit_key = BenchSummaryCacheKey {
+        circuit_ptr: circuit as *const PolyCircuit<E::P> as usize,
+        param_bindings: param_bindings.to_vec(),
+    };
     if let Some(summary) = summary_cache.get(&circuit_key) {
         return *summary;
     }
@@ -227,22 +258,50 @@ where
     let mut estimate = CircuitBenchSummary::new(0.0, 0.0, 0);
     #[cfg(feature = "gpu")]
     let mut peak_vram = 0;
-    for CircuitExecutionLayer { sub_circuit_ids, regular_gate_types } in circuit.execution_layers()
+    for CircuitExecutionLayer {
+        sub_circuit_call_ids,
+        summed_sub_circuit_call_ids,
+        regular_gate_types,
+    } in circuit.execution_layers()
     {
         let mut layer_counts: HashMap<PolyGateType, usize> = HashMap::new();
         let mut layer_latency = 0.0_f64;
         let mut layer_parallelism = 0u128;
 
-        for sub_circuit_id in sub_circuit_ids {
-            let sub_circuit = circuit.registered_sub_circuit(sub_circuit_id);
-            let sub_summary =
-                estimate_circuit_bench_with_cache::<E, B>(estimator, &sub_circuit, summary_cache);
+        for call_id in sub_circuit_call_ids {
+            let call = circuit.sub_circuit_call_info(call_id);
+            let sub_circuit = circuit.registered_sub_circuit(call.sub_circuit_id);
+            let sub_summary = estimate_circuit_bench_with_cache::<E, B>(
+                estimator,
+                &sub_circuit,
+                &call.param_bindings,
+                summary_cache,
+            );
             estimate.total_time += sub_summary.total_time;
             layer_latency += sub_summary.latency;
             layer_parallelism = layer_parallelism.max(sub_summary.max_parallelism);
             #[cfg(feature = "gpu")]
             {
                 peak_vram = peak_vram.max(sub_summary.peak_vram);
+            }
+        }
+        for summed_call_id in summed_sub_circuit_call_ids {
+            let call = circuit.summed_sub_circuit_call_info(summed_call_id);
+            let sub_circuit = circuit.registered_sub_circuit(call.sub_circuit_id);
+            for param_bindings in &call.param_bindings {
+                let sub_summary = estimate_circuit_bench_with_cache::<E, B>(
+                    estimator,
+                    &sub_circuit,
+                    param_bindings.as_ref(),
+                    summary_cache,
+                );
+                estimate.total_time += sub_summary.total_time;
+                layer_latency += sub_summary.latency;
+                layer_parallelism = layer_parallelism.max(sub_summary.max_parallelism);
+                #[cfg(feature = "gpu")]
+                {
+                    peak_vram = peak_vram.max(sub_summary.peak_vram);
+                }
             }
         }
 
@@ -253,7 +312,8 @@ where
         let mut regular_latency = 0.0_f64;
         let mut regular_parallelism = 0u128;
         for (gate_type, count) in layer_counts.into_iter() {
-            let gate_estimate = estimator.estimate_gate_bench(&gate_type);
+            let gate_estimate =
+                estimator.estimate_gate_bench_with_bindings(&gate_type, param_bindings);
             estimate.total_time += gate_estimate.total_time * count as f64;
             regular_latency = regular_latency.max(gate_estimate.latency);
             let gate_parallelism = gate_estimate

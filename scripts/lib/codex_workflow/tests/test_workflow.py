@@ -20,7 +20,12 @@ from codex_workflow.plan import (
     append_follow_up_subtasks,
     render_session_plan,
 )
-from codex_workflow.runners import FinalTestResult, ShellFinalTestRunner, StructuredExecResult
+from codex_workflow.runners import (
+    FinalTestResult,
+    ShellFinalTestRunner,
+    StructuredExecResult,
+    summarize_logs,
+)
 from codex_workflow.transcript import (
     initial_user_message_from_transcript,
     latest_assistant_message_from_transcript,
@@ -825,6 +830,45 @@ class WorkflowHarnessTests(unittest.TestCase):
 
         command = run_mock.call_args.args[0]
         self.assertEqual(command, [str(self.paths.scripts_dir / "run_tests.sh")])
+
+    def test_summarize_logs_prefers_stdout_when_it_contains_test_failure_and_stderr_only_has_compile_noise(
+        self,
+    ) -> None:
+        stdout_path = self.repo_root / "stdout.log"
+        stderr_path = self.repo_root / "stderr.log"
+        stdout_path.write_text(
+            "\n".join(
+                [
+                    "test something ... ok",
+                    "failures:",
+                    "---- bench_estimator::tests::test_estimate_gate_bench_panics_on_sub_circuit_output_placeholder stdout ----",
+                    "note: panic did not contain expected string",
+                    'expected substring: "unexpected SubCircuitOutput"',
+                    "test result: FAILED. 284 passed; 1 failed; 4 ignored; 0 measured; 0 filtered out; finished in 430.53s",
+                    "error: test failed, to rerun pass `--lib`",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        stderr_path.write_text(
+            "\n".join(
+                [
+                    "warning: `mxx` (lib) generated 3 warnings",
+                    "warning: `mxx` (lib test) generated 3 warnings (3 duplicates)",
+                    "Finished `release` profile [optimized] target(s) in 1m 05s",
+                    "Executable tests/test_gpu_ggh15_negacyclic_conv_mul.rs (target/release/deps/test_gpu_ggh15_negacyclic_conv_mul-b997dc1c6882de89)",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        summary = summarize_logs(stdout_path, stderr_path)
+
+        self.assertIn("test result: FAILED", summary)
+        self.assertIn("error: test failed", summary)
+        self.assertNotIn("Executable tests/test_gpu_ggh15_negacyclic_conv_mul.rs", summary)
 
     def test_reviewer_infra_failure_retries_with_backoff(self) -> None:
         self.write_plan(

@@ -63,7 +63,8 @@ impl SerializablePolyGate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SerializableSubCircuitCall {
     pub sub_circuit_id: usize,
-    pub inputs: Vec<GateId>,
+    pub shared_input_prefix: Option<Vec<GateId>>,
+    pub input_suffix: Vec<GateId>,
     pub param_bindings: Vec<SubCircuitParamValue>,
     pub scoped_call_id: usize,
     pub output_gate_ids: Vec<GateId>,
@@ -120,12 +121,19 @@ impl SerializablePolyCircuit {
             .sub_circuit_calls
             .iter()
             .map(|(call_id, call)| {
-                let param_bindings = circuit.binding_set(call.binding_set_id).as_ref().to_vec();
+                let (shared_input_prefix, param_bindings) = rayon::join(
+                    || {
+                        call.shared_input_prefix_set_id
+                            .map(|input_set_id| circuit.input_set(input_set_id).as_ref().to_vec())
+                    },
+                    || circuit.binding_set(call.binding_set_id).as_ref().to_vec(),
+                );
                 (
                     *call_id,
                     SerializableSubCircuitCall {
                         sub_circuit_id: call.sub_circuit_id,
-                        inputs: call.inputs.clone(),
+                        shared_input_prefix,
+                        input_suffix: call.input_suffix.clone(),
                         param_bindings,
                         scoped_call_id: call.scoped_call_id,
                         output_gate_ids: call.output_gate_ids.clone(),
@@ -361,12 +369,20 @@ impl SerializablePolyCircuit {
         circuit.sub_circuit_calls = calls_vec
             .into_iter()
             .map(|(call_id, call)| {
-                let binding_set_id = circuit.binding_registry.register(&call.param_bindings);
+                let (shared_input_prefix_set_id, binding_set_id) = rayon::join(
+                    || {
+                        call.shared_input_prefix
+                            .as_ref()
+                            .map(|inputs| circuit.intern_input_set(inputs))
+                    },
+                    || circuit.binding_registry.register(&call.param_bindings),
+                );
                 (
                     call_id,
                     SubCircuitCall {
                         sub_circuit_id: call.sub_circuit_id,
-                        inputs: call.inputs,
+                        shared_input_prefix_set_id,
+                        input_suffix: call.input_suffix,
                         binding_set_id,
                         scoped_call_id: call.scoped_call_id,
                         output_gate_ids: call.output_gate_ids,

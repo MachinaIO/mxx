@@ -187,7 +187,8 @@ impl InputSetRegistry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SubCircuitCall {
     sub_circuit_id: usize,
-    inputs: Vec<GateId>,
+    shared_input_prefix_set_id: Option<usize>,
+    input_suffix: Vec<GateId>,
     binding_set_id: usize,
     scoped_call_id: usize,
     output_gate_ids: Vec<GateId>,
@@ -353,6 +354,12 @@ impl<P: Poly> PolyCircuit<P> {
         }
         if !Arc::ptr_eq(&self.input_set_registry, &input_set_registry) {
             if !self.input_set_registry.is_empty() {
+                for call in self.sub_circuit_calls.values_mut() {
+                    if let Some(input_set_id) = call.shared_input_prefix_set_id.as_mut() {
+                        let input_ids = self.input_set_registry.get(*input_set_id);
+                        *input_set_id = input_set_registry.register_arc(input_ids);
+                    }
+                }
                 for call in self.summed_sub_circuit_calls.values_mut() {
                     call.call_input_set_ids.iter_mut().for_each(|input_set_id| {
                         let input_ids = self.input_set_registry.get(*input_set_id);
@@ -478,11 +485,40 @@ impl<P: Poly> PolyCircuit<P> {
         self.input_set_registry.register(input_ids)
     }
 
+    fn sub_circuit_call_input_len(&self, call: &SubCircuitCall) -> usize {
+        call.shared_input_prefix_set_id
+            .map(|input_set_id| self.input_set(input_set_id).len())
+            .unwrap_or(0) +
+            call.input_suffix.len()
+    }
+
+    fn with_sub_circuit_call_inputs<T>(
+        &self,
+        call: &SubCircuitCall,
+        f: impl FnOnce(&[GateId], &[GateId]) -> T,
+    ) -> T {
+        if let Some(input_set_id) = call.shared_input_prefix_set_id {
+            let shared_prefix = self.input_set(input_set_id);
+            f(shared_prefix.as_ref(), &call.input_suffix)
+        } else {
+            f(&[], &call.input_suffix)
+        }
+    }
+
+    fn collect_sub_circuit_call_inputs(&self, call: &SubCircuitCall) -> Vec<GateId> {
+        self.with_sub_circuit_call_inputs(call, |shared_prefix, suffix| {
+            let mut inputs = Vec::with_capacity(shared_prefix.len() + suffix.len());
+            inputs.extend_from_slice(shared_prefix);
+            inputs.extend_from_slice(suffix);
+            inputs
+        })
+    }
+
     pub(crate) fn sub_circuit_call_info(&self, call_id: usize) -> SubCircuitCallInfo {
         let call = self.sub_circuit_calls.get(&call_id).expect("sub-circuit call missing");
         SubCircuitCallInfo {
             sub_circuit_id: call.sub_circuit_id,
-            inputs: call.inputs.clone(),
+            inputs: self.collect_sub_circuit_call_inputs(call),
             param_bindings: self.binding_set(call.binding_set_id),
             output_gate_ids: call.output_gate_ids.clone(),
         }
@@ -692,15 +728,22 @@ impl<P: Poly> PolyCircuit<P> {
                     if call_output_levels[*call_id].is_none() {
                         let call =
                             self.sub_circuit_calls.get(call_id).expect("sub-circuit call missing");
-                        let child_input_levels = call
-                            .inputs
-                            .iter()
-                            .map(|input_id| {
-                                *live_gate_levels.get(input_id).unwrap_or_else(|| {
-                                    panic!("non-free depth level missing for gate {input_id}")
-                                })
-                            })
-                            .collect::<Vec<_>>();
+                        let child_input_levels =
+                            self.with_sub_circuit_call_inputs(call, |shared_prefix, suffix| {
+                                let mut levels =
+                                    Vec::with_capacity(shared_prefix.len() + suffix.len());
+                                levels.extend(shared_prefix.iter().map(|input_id| {
+                                    *live_gate_levels.get(input_id).unwrap_or_else(|| {
+                                        panic!("non-free depth level missing for gate {input_id}")
+                                    })
+                                }));
+                                levels.extend(suffix.iter().map(|input_id| {
+                                    *live_gate_levels.get(input_id).unwrap_or_else(|| {
+                                        panic!("non-free depth level missing for gate {input_id}")
+                                    })
+                                }));
+                                levels
+                            });
                         let output_levels = self.with_sub_circuit(call.sub_circuit_id, |sub| {
                             sub.non_free_depths_with_input_levels_cached(
                                 &child_input_levels,
@@ -1082,9 +1125,11 @@ impl<P: Poly> PolyCircuit<P> {
 
     fn gate_dependency_input_count(&self, gate: &PolyGate) -> usize {
         match &gate.gate_type {
-            PolyGateType::SubCircuitOutput { call_id, .. } => {
-                self.sub_circuit_calls.get(call_id).expect("sub-circuit call missing").inputs.len()
-            }
+            PolyGateType::SubCircuitOutput { call_id, .. } => self
+                .sub_circuit_calls
+                .get(call_id)
+                .map(|call| self.sub_circuit_call_input_len(call))
+                .expect("sub-circuit call missing"),
             PolyGateType::SummedSubCircuitOutput { summed_call_id, .. } => self
                 .summed_sub_circuit_calls
                 .get(summed_call_id)
@@ -1101,9 +1146,14 @@ impl<P: Poly> PolyCircuit<P> {
         match &gate.gate_type {
             PolyGateType::SubCircuitOutput { call_id, .. } => {
                 let call = self.sub_circuit_calls.get(call_id).expect("sub-circuit call missing");
-                for &input_id in &call.inputs {
-                    f(input_id);
-                }
+                self.with_sub_circuit_call_inputs(call, |shared_prefix, suffix| {
+                    for &input_id in shared_prefix {
+                        f(input_id);
+                    }
+                    for &input_id in suffix {
+                        f(input_id);
+                    }
+                });
             }
             PolyGateType::SummedSubCircuitOutput { summed_call_id, .. } => {
                 let call = self
@@ -1648,11 +1698,17 @@ impl<P: Poly> PolyCircuit<P> {
                         .checked_mul(call_id_base)
                         .and_then(|base| base.checked_add((call.scoped_call_id as u128) + 1))
                         .expect("sub-circuit call prefix overflow");
-                    let sub_inputs = call
-                        .inputs
-                        .iter()
-                        .map(|id| wires.get(id).expect("wire missing for sub-circuit").clone())
-                        .collect::<Vec<_>>();
+                    let sub_inputs =
+                        self.with_sub_circuit_call_inputs(&call, |shared_prefix, suffix| {
+                            let mut inputs = Vec::with_capacity(shared_prefix.len() + suffix.len());
+                            inputs.extend(shared_prefix.iter().map(|id| {
+                                wires.get(id).expect("wire missing for sub-circuit").clone()
+                            }));
+                            inputs.extend(suffix.iter().map(|id| {
+                                wires.get(id).expect("wire missing for sub-circuit").clone()
+                            }));
+                            inputs
+                        });
                     let sub_outputs = self.with_sub_circuit(call.sub_circuit_id, |sub_circuit| {
                         sub_circuit.eval_scoped(
                             eval_params,
@@ -2114,19 +2170,48 @@ impl<P: Poly> PolyCircuit<P> {
         self.call_sub_circuit_with_bindings(circuit_id, inputs, &[])
     }
 
+    pub fn call_sub_circuit_with_shared_input_prefix_and_bindings(
+        &mut self,
+        circuit_id: usize,
+        shared_input_prefix_set_id: usize,
+        input_suffix: &[GateId],
+        param_bindings: &[SubCircuitParamValue],
+    ) -> Vec<GateId> {
+        self.call_sub_circuit_with_prefix_and_bindings(
+            circuit_id,
+            Some(shared_input_prefix_set_id),
+            input_suffix,
+            param_bindings,
+        )
+    }
+
     pub fn call_sub_circuit_with_bindings(
         &mut self,
         circuit_id: usize,
         inputs: &[GateId],
         param_bindings: &[SubCircuitParamValue],
     ) -> Vec<GateId> {
+        self.call_sub_circuit_with_prefix_and_bindings(circuit_id, None, inputs, param_bindings)
+    }
+
+    fn call_sub_circuit_with_prefix_and_bindings(
+        &mut self,
+        circuit_id: usize,
+        shared_input_prefix_set_id: Option<usize>,
+        input_suffix: &[GateId],
+        param_bindings: &[SubCircuitParamValue],
+    ) -> Vec<GateId> {
+        let total_num_inputs = shared_input_prefix_set_id
+            .map(|input_set_id| self.input_set(input_set_id).len())
+            .unwrap_or(0) +
+            input_suffix.len();
         #[cfg(debug_assertions)]
         {
             let stored = self.sub_circuits.get(&circuit_id).expect("sub-circuit not found");
             let num_inputs = match stored {
                 StoredSubCircuit::InMemory(sub) => sub.num_input(),
             };
-            assert_eq!(inputs.len(), num_inputs);
+            assert_eq!(total_num_inputs, num_inputs);
             let expected_param_kinds = match stored {
                 StoredSubCircuit::InMemory(sub) => &sub.sub_circuit_params,
             };
@@ -2143,17 +2228,17 @@ impl<P: Poly> PolyCircuit<P> {
         }
         let num_outputs = self.sub_circuit_num_output(circuit_id);
         let call_id = self.sub_circuit_calls.len();
-        let inputs_vec = inputs.to_vec();
         let binding_set_id = self.binding_registry.register(param_bindings);
         let scoped_call_id = self.next_scoped_call_id;
         self.next_scoped_call_id += 1;
         let mut outputs = Vec::with_capacity(num_outputs);
         for output_idx in 0..num_outputs {
-            outputs.push(self.new_sub_circuit_output_gate(call_id, output_idx, inputs.len()));
+            outputs.push(self.new_sub_circuit_output_gate(call_id, output_idx, total_num_inputs));
         }
         let call = SubCircuitCall {
             sub_circuit_id: circuit_id,
-            inputs: inputs_vec,
+            shared_input_prefix_set_id,
+            input_suffix: input_suffix.to_vec(),
             binding_set_id,
             scoped_call_id,
             output_gate_ids: outputs.clone(),

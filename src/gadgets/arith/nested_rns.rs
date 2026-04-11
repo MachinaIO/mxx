@@ -39,6 +39,7 @@ pub struct NestedRnsPolyContext {
     lut_x_to_real_ids: Vec<usize>,
     lut_real_to_v_id: usize,
     add_without_reduce_id: usize,
+    sub_with_trace_offsets_id: usize,
     lazy_reduce_id: usize,
     decomposition_terms_id: usize,
     gadget_decompose_id: usize,
@@ -167,6 +168,18 @@ fn full_reduce_param_bindings(
     bindings
 }
 
+fn sub_with_trace_offset_param_bindings(
+    offset_multiplier: &BigUint,
+    p_moduli: &[u64],
+) -> Vec<SubCircuitParamValue> {
+    p_moduli
+        .par_iter()
+        .map(|&p_i| {
+            SubCircuitParamValue::LargeScalarMul(vec![offset_multiplier * BigUint::from(p_i)])
+        })
+        .collect()
+}
+
 impl NestedRnsPolyContext {
     pub(crate) fn q_moduli(&self) -> &[u64] {
         &self.q_moduli
@@ -283,6 +296,8 @@ impl NestedRnsPolyContext {
             }
             let add_without_reduce_id =
                 circuit.register_sub_circuit(Self::add_without_reduce_subcircuit::<P>(&p_moduli));
+            let sub_with_trace_offsets_id = circuit
+                .register_sub_circuit(Self::sub_with_trace_offsets_subcircuit::<P>(p_moduli_depth));
             let mul_lazy_reduce_id = circuit.register_sub_circuit(
                 Self::mul_lazy_reduce_subcircuit::<P>(&p_moduli, &lut_mod_p_ids),
             );
@@ -334,6 +349,7 @@ impl NestedRnsPolyContext {
                 lut_x_to_real_ids,
                 lut_real_to_v_id,
                 add_without_reduce_id,
+                sub_with_trace_offsets_id,
                 lazy_reduce_id,
                 decomposition_terms_id,
                 gadget_decompose_id,
@@ -538,6 +554,8 @@ impl NestedRnsPolyContext {
 
         let add_without_reduce_id =
             circuit.register_sub_circuit(Self::add_without_reduce_subcircuit::<P>(&p_moduli));
+        let sub_with_trace_offsets_id = circuit
+            .register_sub_circuit(Self::sub_with_trace_offsets_subcircuit::<P>(p_moduli_depth));
         let mul_lazy_reduce_id = circuit
             .register_sub_circuit(Self::mul_lazy_reduce_subcircuit::<P>(&p_moduli, &lut_mod_p_ids));
         let mul_right_sparse_id = circuit.register_sub_circuit(
@@ -588,6 +606,7 @@ impl NestedRnsPolyContext {
             lut_x_to_real_ids,
             lut_real_to_v_id,
             add_without_reduce_id,
+            sub_with_trace_offsets_id,
             lazy_reduce_id,
             decomposition_terms_id,
             gadget_decompose_id,
@@ -627,6 +646,8 @@ impl NestedRnsPolyContext {
 
         let add_without_reduce_id =
             circuit.register_sub_circuit(Self::add_without_reduce_subcircuit::<P>(&p_moduli));
+        let sub_with_trace_offsets_id = circuit
+            .register_sub_circuit(Self::sub_with_trace_offsets_subcircuit::<P>(p_moduli_depth));
         let mul_lazy_reduce_id = circuit.register_sub_circuit(
             Self::mul_lazy_reduce_subcircuit::<P>(&p_moduli, &self.lut_mod_p_ids),
         );
@@ -680,6 +701,7 @@ impl NestedRnsPolyContext {
             lut_x_to_real_ids: self.lut_x_to_real_ids.clone(),
             lut_real_to_v_id: self.lut_real_to_v_id,
             add_without_reduce_id,
+            sub_with_trace_offsets_id,
             lazy_reduce_id,
             decomposition_terms_id,
             gadget_decompose_id,
@@ -920,6 +942,25 @@ impl NestedRnsPolyContext {
         circuit.output(p_i_sums);
         circuit
     }
+
+    fn sub_with_trace_offsets_subcircuit<P: Poly>(p_moduli_depth: usize) -> PolyCircuit<P> {
+        let mut circuit = PolyCircuit::<P>::new();
+        let inputs = circuit.input(2 * p_moduli_depth);
+        let (left, right) = inputs.split_at(p_moduli_depth);
+        let one = circuit.const_one_gate();
+        let offset_param_ids = (0..p_moduli_depth)
+            .map(|_| circuit.register_sub_circuit_param(SubCircuitParamKind::LargeScalarMul))
+            .collect::<Vec<_>>();
+        let outputs = (0..p_moduli_depth)
+            .map(|p_idx| {
+                let offset_gate = circuit.large_scalar_mul_param(one, offset_param_ids[p_idx]);
+                let shifted_left = circuit.add_gate(left[p_idx], offset_gate);
+                circuit.sub_gate(shifted_left, right[p_idx])
+            })
+            .collect::<Vec<_>>();
+        circuit.output(outputs);
+        circuit
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1075,7 +1116,7 @@ impl<P: Poly> NestedRnsPoly<P> {
     fn lazy_reduce_if_unreduced(&self, circuit: &mut PolyCircuit<P>) -> Self {
         let threshold = self.ctx.unreduced_trace_threshold();
         let reduce_levels = self.p_max_traces[..self.resolve_enable_levels()]
-            .iter()
+            .par_iter()
             .map(|trace| trace >= &threshold)
             .collect::<Vec<_>>();
         self.lazy_reduce_selected_levels(&reduce_levels, circuit)
@@ -1087,7 +1128,11 @@ impl<P: Poly> NestedRnsPoly<P> {
 
     fn compute_add_output_p_max_traces(&self, other: &Self) -> Vec<BigUint> {
         let levels = self.resolve_enable_levels();
-        (0..levels).map(|q_idx| &self.p_max_traces[q_idx] + &other.p_max_traces[q_idx]).collect()
+        self.p_max_traces[..levels]
+            .par_iter()
+            .zip(other.p_max_traces[..levels].par_iter())
+            .map(|(left_trace, right_trace)| left_trace + right_trace)
+            .collect()
     }
 
     fn trace_multiplier(&self, trace: &BigUint) -> BigUint {
@@ -1097,10 +1142,11 @@ impl<P: Poly> NestedRnsPoly<P> {
     fn compute_sub_output_p_max_traces(&self, other: &Self) -> Vec<BigUint> {
         let levels = self.resolve_enable_levels();
         let p_max = BigUint::from(self.ctx.p_max);
-        (0..levels)
-            .map(|q_idx| {
-                &self.p_max_traces[q_idx] +
-                    self.trace_multiplier(&other.p_max_traces[q_idx]) * &p_max
+        self.p_max_traces[..levels]
+            .par_iter()
+            .zip(other.p_max_traces[..levels].par_iter())
+            .map(|(left_trace, right_trace)| {
+                left_trace + self.trace_multiplier(right_trace) * &p_max
             })
             .collect()
     }
@@ -1893,17 +1939,16 @@ impl<P: Poly> NestedRnsPoly<P> {
             let right = &other.inner[q_idx];
             assert_eq!(left.len(), right.len(), "mismatched p_moduli depth");
             let offset_multiplier = self.trace_multiplier(&other.p_max_traces[q_idx]);
-            let outputs = left
-                .iter()
-                .zip(right.iter())
-                .zip(self.ctx.p_moduli.iter())
-                .map(|((&left_gate, &right_gate), &p_i)| {
-                    let offset = &offset_multiplier * BigUint::from(p_i);
-                    let offset_gate = const_biguint_gate(circuit, &offset);
-                    let shifted_left = circuit.add_gate(left_gate, offset_gate);
-                    circuit.sub_gate(shifted_left, right_gate)
-                })
-                .collect::<Vec<_>>();
+            let bindings =
+                sub_with_trace_offset_param_bindings(&offset_multiplier, &self.ctx.p_moduli);
+            let mut inputs = Vec::with_capacity(left.len() + right.len());
+            inputs.extend_from_slice(left);
+            inputs.extend_from_slice(right);
+            let outputs = circuit.call_sub_circuit_with_bindings(
+                self.ctx.sub_with_trace_offsets_id,
+                &inputs,
+                &bindings,
+            );
             result_inner.push(outputs);
         }
         Self::new(

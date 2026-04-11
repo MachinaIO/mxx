@@ -517,7 +517,6 @@ impl PolyCircuit<DCRTPoly> {
     ) -> usize {
         let input_plaintext_norms =
             input_exprs.iter().map(|input| input.plaintext_norm.clone()).collect::<Vec<_>>();
-        let profile_bits = error_norm_plaintext_profile_bits(&input_plaintext_norms);
         let entries = summary_cache.entry(sub_circuit_id).or_default();
         if let Some(summary_idx) = entries.iter().position(|entry| {
             entry.input_plaintext_norms == input_plaintext_norms &&
@@ -525,9 +524,8 @@ impl PolyCircuit<DCRTPoly> {
         }) {
             cache_stats.hits += 1;
             debug!(
-                "error-norm sub-circuit summary cache hit sub_circuit_id={} profile_bits={:?} cached_profiles={}",
+                "error-norm sub-circuit summary cache hit sub_circuit_id={} cached_profiles={}",
                 sub_circuit_id,
-                profile_bits,
                 entries.len()
             );
             return summary_idx;
@@ -536,10 +534,9 @@ impl PolyCircuit<DCRTPoly> {
         cache_stats.misses += 1;
         let miss_kind = if entries.is_empty() { "first_call" } else { "new_plaintext_profile" };
         debug!(
-            "error-norm sub-circuit summary cache miss sub_circuit_id={} miss_kind={} profile_bits={:?} cached_profiles_before={}",
+            "error-norm sub-circuit summary cache miss sub_circuit_id={} miss_kind={} cached_profiles_before={}",
             sub_circuit_id,
             miss_kind,
-            profile_bits,
             entries.len()
         );
 

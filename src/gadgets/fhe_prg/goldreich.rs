@@ -31,7 +31,7 @@ use digest::Digest;
 use keccak_asm::Keccak256;
 use rayon::prelude::*;
 use std::{collections::HashSet, sync::Arc};
-
+use tracing::debug;
 /// Public graph-generation options for the Goldreich/TSA PRG.
 ///
 /// The default mode rejects only role-aware duplicates:
@@ -347,7 +347,8 @@ impl<P: Poly + 'static> GoldreichFhePrg<P> {
             );
         }
 
-        self.public_graph
+        let outputs = self
+            .public_graph
             .edges
             .iter()
             .map(|edge| {
@@ -364,7 +365,14 @@ impl<P: Poly + 'static> GoldreichFhePrg<P> {
                     |lhs, rhs, circuit| lhs.xor(rhs, circuit),
                 )
             })
-            .collect()
+            .collect::<Vec<_>>();
+        debug!(
+            "Goldreich PRG evaluated {} edges with Ring-GSW ciphertexts: input_size={}, output_size={}",
+            outputs.len(),
+            self.input_size,
+            self.output_size,
+        );
+        outputs
     }
 }
 

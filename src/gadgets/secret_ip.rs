@@ -10,7 +10,7 @@ pub fn secret_inner_product<P: Poly>(
 ) -> GateId {
     assert_eq!(public_vec.len(), secret_vec.len(), "vector lengths must match");
     if public_vec.is_empty() {
-        return circuit.const_zero_gate();
+        return circuit.const_zero_gate().as_single_wire();
     }
 
     // Multiply with public input on the left to keep BGG encoding semantics.
@@ -19,7 +19,7 @@ pub fn secret_inner_product<P: Poly>(
         let prod = circuit.mul_gate(public_id, secret_id);
         acc = circuit.add_gate(acc, prod);
     }
-    acc
+    acc.as_single_wire()
 }
 
 #[cfg(test)]
@@ -65,8 +65,8 @@ mod tests {
         let neg_t = -&t;
 
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let public_inputs = circuit.input(2);
-        let secret_inputs = circuit.input(2);
+        let public_inputs = circuit.input(2).to_vec();
+        let secret_inputs = circuit.input(2).to_vec();
         let out = secret_inner_product(&mut circuit, &public_inputs, &secret_inputs);
         circuit.output(vec![out]);
 

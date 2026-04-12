@@ -281,7 +281,8 @@ mod tests {
             let src_slots = [(2, None), (0, Some(3)), (1, Some(2))];
             let mut circuit = PolyCircuit::new();
             let inputs = circuit.input(1);
-            let transferred = circuit.slot_transfer_gate(inputs[0], &src_slots);
+            let transferred = circuit.slot_transfer_gate(inputs.at(0), &src_slots);
+            let transferred_gate = transferred.as_single_wire();
             circuit.output(vec![transferred]);
 
             let result_pubkey = circuit.eval(
@@ -342,7 +343,7 @@ mod tests {
             let a_out = GpuDCRTPolyHashSampler::<Keccak256>::new().sample_hash(
                 &params,
                 hash_key,
-                format!("slot_transfer_gate_a_out_{}", transferred),
+                format!("slot_transfer_gate_a_out_{}", transferred_gate),
                 secret_size,
                 secret_size * params.modulus_digits(),
                 DistType::FinRingDist,

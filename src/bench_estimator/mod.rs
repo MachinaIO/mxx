@@ -520,7 +520,7 @@ mod tests {
     #[sequential]
     fn test_estimate_circuit_bench_accumulates_layer_latency_and_total_time() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let inputs = circuit.input(4);
+        let inputs = circuit.input(4).to_vec();
         let add_0 = circuit.add_gate(inputs[0], inputs[1]);
         let add_1 = circuit.add_gate(inputs[2], inputs[3]);
         let sub = circuit.sub_gate(inputs[0], inputs[2]);
@@ -539,12 +539,12 @@ mod tests {
     #[sequential]
     fn test_estimate_circuit_bench_counts_multi_output_subcircuit_call_once() {
         let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
-        let sub_inputs = sub_circuit.input(2);
+        let sub_inputs = sub_circuit.input(2).to_vec();
         let sub_add = sub_circuit.add_gate(sub_inputs[0], sub_inputs[1]);
-        sub_circuit.output(vec![sub_add, sub_inputs[0]]);
+        sub_circuit.output(vec![sub_add, sub_inputs[0].into()]);
 
         let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
-        let main_inputs = main_circuit.input(2);
+        let main_inputs = main_circuit.input(2).to_vec();
         let sub_id = main_circuit.register_sub_circuit(sub_circuit);
         let sub_outputs = main_circuit.call_sub_circuit(sub_id, &main_inputs);
         main_circuit.output(sub_outputs);
@@ -562,12 +562,12 @@ mod tests {
     #[sequential]
     fn test_estimate_circuit_bench_sequences_subcircuit_calls_before_regular_gates() {
         let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
-        let sub_inputs = sub_circuit.input(2);
+        let sub_inputs = sub_circuit.input(2).to_vec();
         let sub_add = sub_circuit.add_gate(sub_inputs[0], sub_inputs[1]);
         sub_circuit.output(vec![sub_add]);
 
         let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
-        let main_inputs = main_circuit.input(4);
+        let main_inputs = main_circuit.input(4).to_vec();
         let top_add = main_circuit.add_gate(main_inputs[0], main_inputs[1]);
         let sub_id = main_circuit.register_sub_circuit(sub_circuit);
         let sub_outputs = main_circuit.call_sub_circuit(sub_id, &[main_inputs[2], main_inputs[3]]);
@@ -586,12 +586,12 @@ mod tests {
     #[sequential]
     fn test_estimate_circuit_bench_reuses_cached_subcircuit_summary() {
         let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
-        let sub_inputs = sub_circuit.input(2);
+        let sub_inputs = sub_circuit.input(2).to_vec();
         let sub_add = sub_circuit.add_gate(sub_inputs[0], sub_inputs[1]);
         sub_circuit.output(vec![sub_add]);
 
         let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
-        let main_inputs = main_circuit.input(4);
+        let main_inputs = main_circuit.input(4).to_vec();
         let sub_id = main_circuit.register_sub_circuit(sub_circuit);
         let first = main_circuit.call_sub_circuit(sub_id, &[main_inputs[0], main_inputs[1]]);
         let second = main_circuit.call_sub_circuit(sub_id, &[main_inputs[2], main_inputs[3]]);

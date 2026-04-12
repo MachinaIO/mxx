@@ -1,7 +1,8 @@
 use crate::{
     circuit::{
-        ErrorNormExecutionLayer, Evaluable, PolyCircuit, PolyGateType, SubCircuitParamValue,
-        gate::GateId,
+        BatchedWire, ErrorNormExecutionLayer, Evaluable, PolyCircuit, PolyGateType,
+        SubCircuitParamValue, batched_wire_slice_at, batched_wire_slice_len, gate::GateId,
+        iter_batched_wire_gates,
     },
     element::PolyElem,
     impl_binop_with_refs,
@@ -66,36 +67,45 @@ fn increment_dense_gate_use_count(counts: &[AtomicU32], gate_id: GateId) {
     assert_ne!(previous, u32::MAX, "error-norm dense use count overflow for gate {gate_id}");
 }
 
-fn increment_dense_gate_use_counts(counts: &[AtomicU32], input_ids: &[GateId]) {
-    for &input_id in input_ids {
+fn increment_dense_gate_use_counts<I>(counts: &[AtomicU32], input_ids: I)
+where
+    I: IntoIterator<Item = GateId>,
+{
+    for input_id in input_ids {
         increment_dense_gate_use_count(counts, input_id);
     }
 }
 
 fn resolve_shared_prefix_suffix_input_id(
-    shared_prefix: &[GateId],
-    suffix: &[GateId],
+    shared_prefix: &[BatchedWire],
+    suffix: &[BatchedWire],
     input_idx: usize,
 ) -> GateId {
-    if let Some(&gate_id) = shared_prefix.get(input_idx) {
-        return gate_id;
+    let shared_prefix_len = batched_wire_slice_len(shared_prefix);
+    if input_idx < shared_prefix_len {
+        return batched_wire_slice_at(shared_prefix, input_idx);
     }
     let suffix_idx = input_idx
-        .checked_sub(shared_prefix.len())
+        .checked_sub(shared_prefix_len)
         .unwrap_or_else(|| panic!("error-norm shared-prefix input index underflow: {input_idx}"));
-    *suffix.get(suffix_idx).unwrap_or_else(|| {
-        panic!(
-            "error-norm shared-prefix input index {input_idx} out of range (prefix={}, suffix={})",
-            shared_prefix.len(),
-            suffix.len()
-        )
-    })
+    if suffix_idx < batched_wire_slice_len(suffix) {
+        return batched_wire_slice_at(suffix, suffix_idx);
+    }
+    panic!(
+        "error-norm shared-prefix input index {input_idx} out of range (prefix={}, suffix={})",
+        shared_prefix_len,
+        batched_wire_slice_len(suffix)
+    );
 }
 
-fn resolve_input_set_gate_id(input_ids: &[GateId], input_idx: usize) -> GateId {
-    *input_ids.get(input_idx).unwrap_or_else(|| {
-        panic!("error-norm input-set index {input_idx} out of range (len={})", input_ids.len())
-    })
+fn resolve_input_set_gate_id(input_ids: &[BatchedWire], input_idx: usize) -> GateId {
+    if input_idx < batched_wire_slice_len(input_ids) {
+        return batched_wire_slice_at(input_ids, input_idx);
+    }
+    panic!(
+        "error-norm input-set index {input_idx} out of range (len={})",
+        batched_wire_slice_len(input_ids)
+    )
 }
 
 #[derive(Debug)]
@@ -765,8 +775,8 @@ impl PolyCircuit<DCRTPoly> {
 
     fn collect_error_norm_plaintext_norms_for_value_inputs(
         &self,
-        shared_prefix: &[GateId],
-        suffix: &[GateId],
+        shared_prefix: &[BatchedWire],
+        suffix: &[BatchedWire],
         wires: &ErrorNormWireStore,
         input_gate_positions: &[usize],
         input_values: &[Option<Arc<ErrorNorm>>],
@@ -775,9 +785,10 @@ impl PolyCircuit<DCRTPoly> {
             || {
                 shared_prefix
                     .par_iter()
+                    .flat_map_iter(|batch| batch.gate_ids())
                     .map(|input_id| {
                         self.clone_error_norm_plaintext_norm_for_value_gate(
-                            *input_id,
+                            input_id,
                             wires,
                             input_gate_positions,
                             input_values,
@@ -788,9 +799,10 @@ impl PolyCircuit<DCRTPoly> {
             || {
                 suffix
                     .par_iter()
+                    .flat_map_iter(|batch| batch.gate_ids())
                     .map(|input_id| {
                         self.clone_error_norm_plaintext_norm_for_value_gate(
-                            *input_id,
+                            input_id,
                             wires,
                             input_gate_positions,
                             input_values,
@@ -805,8 +817,8 @@ impl PolyCircuit<DCRTPoly> {
 
     fn collect_error_norm_values_for_inputs(
         &self,
-        shared_prefix: &[GateId],
-        suffix: &[GateId],
+        shared_prefix: &[BatchedWire],
+        suffix: &[BatchedWire],
         wires: &ErrorNormWireStore,
         input_gate_positions: &[usize],
         input_values: &[Option<Arc<ErrorNorm>>],
@@ -815,9 +827,10 @@ impl PolyCircuit<DCRTPoly> {
             || {
                 shared_prefix
                     .par_iter()
+                    .flat_map_iter(|batch| batch.gate_ids())
                     .map(|input_id| {
                         self.clone_error_norm_value_for_gate(
-                            *input_id,
+                            input_id,
                             wires,
                             input_gate_positions,
                             input_values,
@@ -828,9 +841,10 @@ impl PolyCircuit<DCRTPoly> {
             || {
                 suffix
                     .par_iter()
+                    .flat_map_iter(|batch| batch.gate_ids())
                     .map(|input_id| {
                         self.clone_error_norm_value_for_gate(
-                            *input_id,
+                            input_id,
                             wires,
                             input_gate_positions,
                             input_values,
@@ -845,8 +859,8 @@ impl PolyCircuit<DCRTPoly> {
 
     fn collect_error_norm_matrix_norms_for_inputs(
         &self,
-        shared_prefix: &[GateId],
-        suffix: &[GateId],
+        shared_prefix: &[BatchedWire],
+        suffix: &[BatchedWire],
         wires: &ErrorNormWireStore,
         input_gate_positions: &[usize],
         input_values: &[Option<Arc<ErrorNorm>>],
@@ -855,9 +869,10 @@ impl PolyCircuit<DCRTPoly> {
             || {
                 shared_prefix
                     .par_iter()
+                    .flat_map_iter(|batch| batch.gate_ids())
                     .map(|input_id| {
                         self.clone_error_norm_matrix_norm_for_gate(
-                            *input_id,
+                            input_id,
                             wires,
                             input_gate_positions,
                             input_values,
@@ -868,9 +883,10 @@ impl PolyCircuit<DCRTPoly> {
             || {
                 suffix
                     .par_iter()
+                    .flat_map_iter(|batch| batch.gate_ids())
                     .map(|input_id| {
                         self.clone_error_norm_matrix_norm_for_gate(
-                            *input_id,
+                            input_id,
                             wires,
                             input_gate_positions,
                             input_values,
@@ -885,8 +901,8 @@ impl PolyCircuit<DCRTPoly> {
 
     fn collect_error_norm_matrix_norm_refs_for_inputs<'a>(
         &self,
-        shared_prefix: &[GateId],
-        suffix: &[GateId],
+        shared_prefix: &[BatchedWire],
+        suffix: &[BatchedWire],
         wires: &'a ErrorNormWireStore,
         input_gate_positions: &[usize],
         input_values: &'a [Option<Arc<ErrorNorm>>],
@@ -895,9 +911,10 @@ impl PolyCircuit<DCRTPoly> {
             || {
                 shared_prefix
                     .par_iter()
+                    .flat_map_iter(|batch| batch.gate_ids())
                     .map(|input_id| {
                         self.borrow_error_norm_matrix_norm_for_gate(
-                            *input_id,
+                            input_id,
                             wires,
                             input_gate_positions,
                             input_values,
@@ -908,9 +925,10 @@ impl PolyCircuit<DCRTPoly> {
             || {
                 suffix
                     .par_iter()
+                    .flat_map_iter(|batch| batch.gate_ids())
                     .map(|input_id| {
                         self.borrow_error_norm_matrix_norm_for_gate(
-                            *input_id,
+                            input_id,
                             wires,
                             input_gate_positions,
                             input_values,
@@ -925,8 +943,8 @@ impl PolyCircuit<DCRTPoly> {
 
     fn collect_error_norm_plaintext_norms_for_summary_inputs(
         &self,
-        shared_prefix: &[GateId],
-        suffix: &[GateId],
+        shared_prefix: &[BatchedWire],
+        suffix: &[BatchedWire],
         gate_exprs: &[Option<Arc<ErrorNormSummaryExpr>>],
         input_gate_positions: &[usize],
         input_plaintext_norms: &[PolyNorm],
@@ -936,9 +954,10 @@ impl PolyCircuit<DCRTPoly> {
             || {
                 shared_prefix
                     .par_iter()
+                    .flat_map_iter(|batch| batch.gate_ids())
                     .map(|input_id| {
                         self.clone_error_norm_plaintext_norm_for_cached_summary_gate(
-                            *input_id,
+                            input_id,
                             gate_exprs,
                             input_gate_positions,
                             input_plaintext_norms,
@@ -950,9 +969,10 @@ impl PolyCircuit<DCRTPoly> {
             || {
                 suffix
                     .par_iter()
+                    .flat_map_iter(|batch| batch.gate_ids())
                     .map(|input_id| {
                         self.clone_error_norm_plaintext_norm_for_cached_summary_gate(
-                            *input_id,
+                            input_id,
                             gate_exprs,
                             input_gate_positions,
                             input_plaintext_norms,
@@ -968,8 +988,8 @@ impl PolyCircuit<DCRTPoly> {
 
     fn collect_error_norm_summary_exprs_for_inputs(
         &self,
-        shared_prefix: &[GateId],
-        suffix: &[GateId],
+        shared_prefix: &[BatchedWire],
+        suffix: &[BatchedWire],
         gate_exprs: &[Option<Arc<ErrorNormSummaryExpr>>],
         input_gate_positions: &[usize],
         input_plaintext_norms: &[PolyNorm],
@@ -979,9 +999,10 @@ impl PolyCircuit<DCRTPoly> {
             || {
                 shared_prefix
                     .par_iter()
+                    .flat_map_iter(|batch| batch.gate_ids())
                     .map(|input_id| {
                         self.clone_error_norm_summary_expr_for_cached_summary_gate(
-                            *input_id,
+                            input_id,
                             gate_exprs,
                             input_gate_positions,
                             input_plaintext_norms,
@@ -993,9 +1014,10 @@ impl PolyCircuit<DCRTPoly> {
             || {
                 suffix
                     .par_iter()
+                    .flat_map_iter(|batch| batch.gate_ids())
                     .map(|input_id| {
                         self.clone_error_norm_summary_expr_for_cached_summary_gate(
-                            *input_id,
+                            input_id,
                             gate_exprs,
                             input_gate_positions,
                             input_plaintext_norms,
@@ -1011,16 +1033,17 @@ impl PolyCircuit<DCRTPoly> {
 
     fn collect_error_norm_plaintext_norms_for_value_input_set(
         &self,
-        input_ids: &[GateId],
+        input_ids: &[BatchedWire],
         wires: &ErrorNormWireStore,
         input_gate_positions: &[usize],
         input_values: &[Option<Arc<ErrorNorm>>],
     ) -> Vec<PolyNorm> {
         input_ids
             .par_iter()
+            .flat_map_iter(|batch| batch.gate_ids())
             .map(|input_id| {
                 self.clone_error_norm_plaintext_norm_for_value_gate(
-                    *input_id,
+                    input_id,
                     wires,
                     input_gate_positions,
                     input_values,
@@ -1031,16 +1054,17 @@ impl PolyCircuit<DCRTPoly> {
 
     fn collect_error_norm_values_for_input_set(
         &self,
-        input_ids: &[GateId],
+        input_ids: &[BatchedWire],
         wires: &ErrorNormWireStore,
         input_gate_positions: &[usize],
         input_values: &[Option<Arc<ErrorNorm>>],
     ) -> Vec<ErrorNorm> {
         input_ids
             .par_iter()
+            .flat_map_iter(|batch| batch.gate_ids())
             .map(|input_id| {
                 self.clone_error_norm_value_for_gate(
-                    *input_id,
+                    input_id,
                     wires,
                     input_gate_positions,
                     input_values,
@@ -1051,16 +1075,17 @@ impl PolyCircuit<DCRTPoly> {
 
     fn collect_error_norm_arcs_for_input_set(
         &self,
-        input_ids: &[GateId],
+        input_ids: &[BatchedWire],
         wires: &ErrorNormWireStore,
         input_gate_positions: &[usize],
         input_values: &[Option<Arc<ErrorNorm>>],
     ) -> Vec<Arc<ErrorNorm>> {
         input_ids
             .par_iter()
+            .flat_map_iter(|batch| batch.gate_ids())
             .map(|input_id| {
                 self.clone_error_norm_arc_for_gate(
-                    *input_id,
+                    input_id,
                     wires,
                     input_gate_positions,
                     input_values,
@@ -1071,16 +1096,17 @@ impl PolyCircuit<DCRTPoly> {
 
     fn collect_error_norm_matrix_norms_for_input_set(
         &self,
-        input_ids: &[GateId],
+        input_ids: &[BatchedWire],
         wires: &ErrorNormWireStore,
         input_gate_positions: &[usize],
         input_values: &[Option<Arc<ErrorNorm>>],
     ) -> Vec<PolyMatrixNorm> {
         input_ids
             .par_iter()
+            .flat_map_iter(|batch| batch.gate_ids())
             .map(|input_id| {
                 self.clone_error_norm_matrix_norm_for_gate(
-                    *input_id,
+                    input_id,
                     wires,
                     input_gate_positions,
                     input_values,
@@ -1091,16 +1117,17 @@ impl PolyCircuit<DCRTPoly> {
 
     fn collect_error_norm_matrix_norm_refs_for_input_set<'a>(
         &self,
-        input_ids: &[GateId],
+        input_ids: &[BatchedWire],
         wires: &'a ErrorNormWireStore,
         input_gate_positions: &[usize],
         input_values: &'a [Option<Arc<ErrorNorm>>],
     ) -> Vec<&'a PolyMatrixNorm> {
         input_ids
             .par_iter()
+            .flat_map_iter(|batch| batch.gate_ids())
             .map(|input_id| {
                 self.borrow_error_norm_matrix_norm_for_gate(
-                    *input_id,
+                    input_id,
                     wires,
                     input_gate_positions,
                     input_values,
@@ -1111,7 +1138,7 @@ impl PolyCircuit<DCRTPoly> {
 
     fn collect_error_norm_plaintext_norms_for_summary_input_set(
         &self,
-        input_ids: &[GateId],
+        input_ids: &[BatchedWire],
         gate_exprs: &[Option<Arc<ErrorNormSummaryExpr>>],
         input_gate_positions: &[usize],
         input_plaintext_norms: &[PolyNorm],
@@ -1119,9 +1146,10 @@ impl PolyCircuit<DCRTPoly> {
     ) -> Vec<PolyNorm> {
         input_ids
             .par_iter()
+            .flat_map_iter(|batch| batch.gate_ids())
             .map(|input_id| {
                 self.clone_error_norm_plaintext_norm_for_cached_summary_gate(
-                    *input_id,
+                    input_id,
                     gate_exprs,
                     input_gate_positions,
                     input_plaintext_norms,
@@ -1133,7 +1161,7 @@ impl PolyCircuit<DCRTPoly> {
 
     fn collect_error_norm_summary_exprs_for_input_set(
         &self,
-        input_ids: &[GateId],
+        input_ids: &[BatchedWire],
         gate_exprs: &[Option<Arc<ErrorNormSummaryExpr>>],
         input_gate_positions: &[usize],
         input_plaintext_norms: &[PolyNorm],
@@ -1141,9 +1169,10 @@ impl PolyCircuit<DCRTPoly> {
     ) -> Vec<Arc<ErrorNormSummaryExpr>> {
         input_ids
             .par_iter()
+            .flat_map_iter(|batch| batch.gate_ids())
             .map(|input_id| {
                 self.clone_error_norm_summary_expr_for_cached_summary_gate(
-                    *input_id,
+                    input_id,
                     gate_exprs,
                     input_gate_positions,
                     input_plaintext_norms,
@@ -1306,7 +1335,7 @@ impl PolyCircuit<DCRTPoly> {
             {
                 let gate = self.gate(*gate_id);
                 self.release_error_norm_inputs(
-                    &gate.input_gates,
+                    gate.input_gates.iter().copied(),
                     &output_mask,
                     &mut remaining_use_count,
                     &mut wires,
@@ -1333,9 +1362,10 @@ impl PolyCircuit<DCRTPoly> {
                             |sub_circuit_id, param_bindings, _shared_prefix, suffix, _| {
                                 let suffix_plaintext_norms = suffix
                                     .par_iter()
+                                    .flat_map_iter(|batch| batch.gate_ids())
                                     .map(|input_id| {
                                         self.clone_error_norm_plaintext_norm_for_value_gate(
-                                            *input_id,
+                                            input_id,
                                             &wires,
                                             &input_gate_positions,
                                             &input_values,
@@ -1452,9 +1482,10 @@ impl PolyCircuit<DCRTPoly> {
                                             });
                                         let suffix_matrix_norms = suffix
                                             .par_iter()
+                                            .flat_map_iter(|batch| batch.gate_ids())
                                             .map(|input_id| {
                                                 self.clone_error_norm_matrix_norm_for_gate(
-                                                    *input_id,
+                                                    input_id,
                                                     &wires,
                                                     &input_gate_positions,
                                                     &input_values,
@@ -1517,7 +1548,7 @@ impl PolyCircuit<DCRTPoly> {
                             call_id,
                             |shared_prefix, suffix| {
                                 self.release_error_norm_inputs(
-                                    shared_prefix,
+                                    iter_batched_wire_gates(shared_prefix),
                                     &output_mask,
                                     &mut remaining_use_count,
                                     &mut wires,
@@ -1526,7 +1557,7 @@ impl PolyCircuit<DCRTPoly> {
                                     &mut input_values,
                                 );
                                 self.release_error_norm_inputs(
-                                    suffix,
+                                    iter_batched_wire_gates(suffix),
                                     &output_mask,
                                     &mut remaining_use_count,
                                     &mut wires,
@@ -1721,12 +1752,12 @@ impl PolyCircuit<DCRTPoly> {
                                 summed_outputs_start.elapsed().as_millis()
                             );
                             for input_set_id in call_input_set_ids {
-                                let input_ids = self.input_set(*input_set_id);
-                                self.release_error_norm_inputs(
-                                    input_ids.as_ref(),
-                                    &output_mask,
-                                    &mut remaining_use_count,
-                                    &mut wires,
+                                    let input_ids = self.input_set(*input_set_id);
+                                    self.release_error_norm_inputs(
+                                        iter_batched_wire_gates(input_ids.as_ref()),
+                                        &output_mask,
+                                        &mut remaining_use_count,
+                                        &mut wires,
                                     &mut wire_count,
                                     &input_gate_positions,
                                     &mut input_values,
@@ -2068,7 +2099,7 @@ impl PolyCircuit<DCRTPoly> {
             {
                 let gate = self.gate(*gate_id);
                 self.release_error_norm_summary_inputs(
-                    &gate.input_gates,
+                    gate.input_gates.iter().copied(),
                     &output_mask,
                     &mut remaining_use_count,
                     &mut gate_exprs,
@@ -2223,13 +2254,13 @@ impl PolyCircuit<DCRTPoly> {
                             call_id,
                             |shared_prefix, suffix| {
                                 self.release_error_norm_summary_inputs(
-                                    shared_prefix,
+                                    iter_batched_wire_gates(shared_prefix),
                                     &output_mask,
                                     &mut remaining_use_count,
                                     &mut gate_exprs,
                                 );
                                 self.release_error_norm_summary_inputs(
-                                    suffix,
+                                    iter_batched_wire_gates(suffix),
                                     &output_mask,
                                     &mut remaining_use_count,
                                     &mut gate_exprs,
@@ -2468,7 +2499,7 @@ impl PolyCircuit<DCRTPoly> {
                                 for input_set_id in call_input_set_ids {
                                     let input_ids = self.input_set(*input_set_id);
                                     self.release_error_norm_summary_inputs(
-                                        input_ids.as_ref(),
+                                        iter_batched_wire_gates(input_ids.as_ref()),
                                         &output_mask,
                                         &mut remaining_use_count,
                                         &mut gate_exprs,
@@ -2712,7 +2743,7 @@ impl PolyCircuit<DCRTPoly> {
                 || {
                     for gate_id in &layer.regular_gate_ids {
                         let gate = self.gate(*gate_id);
-                        increment_dense_gate_use_counts(counts, &gate.input_gates);
+                        increment_dense_gate_use_counts(counts, gate.input_gates.iter().copied());
                     }
                 },
                 || {
@@ -2722,8 +2753,14 @@ impl PolyCircuit<DCRTPoly> {
                                 self.with_sub_circuit_call_inputs_by_id(
                                     *call_id,
                                     |shared_prefix, suffix| {
-                                        increment_dense_gate_use_counts(counts, shared_prefix);
-                                        increment_dense_gate_use_counts(counts, suffix);
+                                        increment_dense_gate_use_counts(
+                                            counts,
+                                            iter_batched_wire_gates(shared_prefix),
+                                        );
+                                        increment_dense_gate_use_counts(
+                                            counts,
+                                            iter_batched_wire_gates(suffix),
+                                        );
                                     },
                                 );
                             }
@@ -2743,24 +2780,26 @@ impl PolyCircuit<DCRTPoly> {
         dense.finalize_live_nonzero()
     }
 
-    fn release_error_norm_inputs(
+    fn release_error_norm_inputs<I>(
         &self,
-        input_ids: &[GateId],
+        input_ids: I,
         output_mask: &[bool],
         remaining_use_count: &mut DenseGateUseCounts,
         wires: &mut ErrorNormWireStore,
         wire_count: &mut usize,
         input_gate_positions: &[usize],
         input_values: &mut [Option<Arc<ErrorNorm>>],
-    ) {
+    ) where
+        I: IntoIterator<Item = GateId>,
+    {
         for input_id in input_ids {
             if output_mask[input_id.0] {
                 continue;
             }
-            if !remaining_use_count.contains(*input_id) {
+            if !remaining_use_count.contains(input_id) {
                 continue;
             }
-            if remaining_use_count.decrement(*input_id) {
+            if remaining_use_count.decrement(input_id) {
                 let input_idx = input_gate_positions[input_id.0];
                 if input_idx != MISSING_GATE_POSITION {
                     input_values[input_idx] = None;
@@ -2789,21 +2828,23 @@ impl PolyCircuit<DCRTPoly> {
         }
     }
 
-    fn release_error_norm_summary_inputs(
+    fn release_error_norm_summary_inputs<I>(
         &self,
-        input_ids: &[GateId],
+        input_ids: I,
         output_mask: &[bool],
         remaining_use_count: &mut DenseGateUseCounts,
         gate_exprs: &mut [Option<Arc<ErrorNormSummaryExpr>>],
-    ) {
+    ) where
+        I: IntoIterator<Item = GateId>,
+    {
         for input_id in input_ids {
             if output_mask[input_id.0] {
                 continue;
             }
-            if !remaining_use_count.contains(*input_id) {
+            if !remaining_use_count.contains(input_id) {
                 continue;
             }
-            if remaining_use_count.decrement(*input_id) {
+            if remaining_use_count.decrement(input_id) {
                 gate_exprs[input_id.0] = None;
             }
         }
@@ -4088,7 +4129,7 @@ mod tests {
     fn test_wire_norm_addition() {
         let ctx = make_ctx();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let ins = circuit.input(2);
+        let ins = circuit.input(2).to_vec();
         let out_gid = circuit.add_gate(ins[0], ins[1]);
         circuit.output(vec![out_gid]);
         let input_bound = BigDecimal::from(5u64);
@@ -4115,7 +4156,7 @@ mod tests {
     fn test_wire_norm_subtraction() {
         let ctx = make_ctx();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let ins = circuit.input(2);
+        let ins = circuit.input(2).to_vec();
         let out_gid = circuit.sub_gate(ins[0], ins[1]);
         circuit.output(vec![out_gid]);
         let input_bound = BigDecimal::from(5u64);
@@ -4141,7 +4182,7 @@ mod tests {
         // ctx: secpar_sqrt=50, ring_dim_sqrt=1024, base=32, log_base_q=28
         let ctx = make_ctx();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let ins = circuit.input(2);
+        let ins = circuit.input(2).to_vec();
         let out_gid = circuit.mul_gate(ins[0], ins[1]);
         circuit.output(vec![out_gid]);
         let input_bound = BigDecimal::from(5u64);
@@ -4168,7 +4209,7 @@ mod tests {
     fn test_wire_norm_simulator_multiplication_matches_generic_eval() {
         let ctx = make_ctx();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let ins = circuit.input(2);
+        let ins = circuit.input(2).to_vec();
         let out_gid = circuit.mul_gate(ins[0], ins[1]);
         circuit.output(vec![out_gid]);
         let input_bound = BigDecimal::from(5u64);
@@ -4328,7 +4369,7 @@ mod tests {
 
         // Circuit: out = PLT(in)
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let inputs = circuit.input(1);
+        let inputs = circuit.input(1).to_vec();
         let plt_id = circuit.register_public_lookup(plt);
         let out_gate = circuit.public_lookup_gate(inputs[0], plt_id);
         circuit.output(vec![out_gate]);
@@ -4381,7 +4422,7 @@ mod tests {
 
         // Circuit: out = PLT(in)
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let inputs = circuit.input(1);
+        let inputs = circuit.input(1).to_vec();
         let plt_id = circuit.register_public_lookup(plt);
         let out_gate = circuit.public_lookup_gate(inputs[0], plt_id);
         circuit.output(vec![out_gate]);
@@ -4436,7 +4477,7 @@ mod tests {
         );
 
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let inputs = circuit.input(1);
+        let inputs = circuit.input(1).to_vec();
         let plt_id = circuit.register_public_lookup(plt);
         let out_gate = circuit.public_lookup_gate(inputs[0], plt_id);
         circuit.output(vec![out_gate]);
@@ -4490,13 +4531,13 @@ mod tests {
         );
 
         let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
-        let sub_inputs = sub_circuit.input(1);
+        let sub_inputs = sub_circuit.input(1).to_vec();
         let squared = sub_circuit.mul_gate(sub_inputs[0], sub_inputs[0]);
         let sub_out = sub_circuit.add_gate(squared, sub_inputs[0]);
         sub_circuit.output(vec![sub_out]);
 
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let inputs = circuit.input(2);
+        let inputs = circuit.input(2).to_vec();
         let sub_circuit_id = circuit.register_sub_circuit(sub_circuit);
         let left = circuit.call_sub_circuit(sub_circuit_id, &[inputs[0]]);
         let right = circuit.call_sub_circuit(sub_circuit_id, &[inputs[1]]);
@@ -4538,13 +4579,13 @@ mod tests {
     #[test]
     fn test_wire_norm_simulator_sub_circuit_recomputes_for_new_plaintext_profile() {
         let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
-        let sub_inputs = sub_circuit.input(1);
+        let sub_inputs = sub_circuit.input(1).to_vec();
         let squared = sub_circuit.mul_gate(sub_inputs[0], sub_inputs[0]);
         let sub_out = sub_circuit.add_gate(squared, sub_inputs[0]);
         sub_circuit.output(vec![sub_out]);
 
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let inputs = circuit.input(1);
+        let inputs = circuit.input(1).to_vec();
         let doubled = circuit.add_gate(inputs[0], inputs[0]);
         let sub_circuit_id = circuit.register_sub_circuit(sub_circuit);
         let left = circuit.call_sub_circuit(sub_circuit_id, &[inputs[0]]);
@@ -4579,12 +4620,12 @@ mod tests {
     #[test]
     fn test_wire_norm_simulator_nested_sub_circuit_matches_generic_eval() {
         let mut inner_sub_circuit = PolyCircuit::<DCRTPoly>::new();
-        let inner_inputs = inner_sub_circuit.input(1);
+        let inner_inputs = inner_sub_circuit.input(1).to_vec();
         let inner_out = inner_sub_circuit.add_gate(inner_inputs[0], inner_inputs[0]);
         inner_sub_circuit.output(vec![inner_out]);
 
         let mut outer_sub_circuit = PolyCircuit::<DCRTPoly>::new();
-        let outer_inputs = outer_sub_circuit.input(2);
+        let outer_inputs = outer_sub_circuit.input(2).to_vec();
         let inner_sub_circuit_id = outer_sub_circuit.register_sub_circuit(inner_sub_circuit);
         let inner_from_second =
             outer_sub_circuit.call_sub_circuit(inner_sub_circuit_id, &[outer_inputs[1]]);
@@ -4592,7 +4633,7 @@ mod tests {
         outer_sub_circuit.output(vec![outer_out]);
 
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let inputs = circuit.input(2);
+        let inputs = circuit.input(2).to_vec();
         let outer_sub_circuit_id = circuit.register_sub_circuit(outer_sub_circuit);
         let left = circuit.call_sub_circuit(outer_sub_circuit_id, &[inputs[0], inputs[1]]);
         let right = circuit.call_sub_circuit(outer_sub_circuit_id, &[inputs[1], inputs[0]]);
@@ -4654,7 +4695,7 @@ mod tests {
 
         // Circuit: out = PLT(in)
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let inputs = circuit.input(1);
+        let inputs = circuit.input(1).to_vec();
         let plt_id = circuit.register_public_lookup(plt);
         let out_gate = circuit.public_lookup_gate(inputs[0], plt_id);
         circuit.output(vec![out_gate]);

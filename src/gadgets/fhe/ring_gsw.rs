@@ -1,5 +1,5 @@
 use crate::{
-    circuit::{PolyCircuit, SubCircuitDiskStorage, evaluable::PolyVec, gate::GateId},
+    circuit::{BatchedWire, PolyCircuit, SubCircuitDiskStorage, evaluable::PolyVec, gate::GateId},
     gadgets::{
         arith::{
             NestedRnsPoly, NestedRnsPolyContext, nested_rns_gadget_decomposed,
@@ -88,10 +88,39 @@ where
     current_layer.pop().expect("pairwise reduction must leave one term")
 }
 
-fn flatten_nested_rns_entries<P: Poly>(entries: &[NestedRnsPoly<P>]) -> Vec<GateId> {
+fn compress_gate_ids_to_batches<I>(gate_ids: I) -> Vec<BatchedWire>
+where
+    I: IntoIterator<Item = GateId>,
+{
+    let mut gate_ids = gate_ids.into_iter();
+    let Some(first) = gate_ids.next() else {
+        return Vec::new();
+    };
+    let mut start = first;
+    let mut prev = first;
+    let mut batches = Vec::new();
+    for gate_id in gate_ids {
+        if gate_id.0 == prev.0 + 1 {
+            prev = gate_id;
+            continue;
+        }
+        batches.push(BatchedWire::new(start, GateId(prev.0 + 1)));
+        start = gate_id;
+        prev = gate_id;
+    }
+    batches.push(BatchedWire::new(start, GateId(prev.0 + 1)));
+    batches
+}
+
+fn flatten_nested_rns_entries<P: Poly>(entries: &[NestedRnsPoly<P>]) -> Vec<BatchedWire> {
     entries
         .par_iter()
-        .flat_map_iter(|entry| entry.inner.iter().flat_map(|level| level.iter().copied()))
+        .map(|entry| {
+            compress_gate_ids_to_batches(entry.inner.iter().flat_map(|level| level.iter().copied()))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flatten()
         .collect()
 }
 
@@ -99,7 +128,7 @@ fn flatten_nested_rns_q_level_rows_for_gadget_terms<P: Poly>(
     entries: &[NestedRnsPoly<P>],
     gadget_len: usize,
     chunk_width: usize,
-) -> Vec<GateId> {
+) -> Vec<BatchedWire> {
     assert!(
         !entries.is_empty(),
         "q-level row flattening requires at least one NestedRnsPoly entry"
@@ -114,21 +143,30 @@ fn flatten_nested_rns_q_level_rows_for_gadget_terms<P: Poly>(
     entries
         .par_iter()
         .enumerate()
-        .flat_map_iter(|(entry_offset, entry)| {
+        .map(|(entry_offset, entry)| {
             let sparse_q_idx = (entry_offset % gadget_len) / chunk_width;
-            entry.inner[sparse_q_idx].iter().copied()
+            compress_gate_ids_to_batches(entry.inner[sparse_q_idx].iter().copied())
         })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flatten()
         .collect()
 }
 
-fn nested_rns_from_flat_outputs<P: Poly>(
+fn nested_rns_from_flat_outputs<P: Poly, W: Into<BatchedWire> + Copy>(
     template: &NestedRnsPoly<P>,
-    outputs: &[GateId],
+    outputs: &[W],
     max_plaintexts: Vec<BigUint>,
     p_max_traces: Vec<BigUint>,
 ) -> NestedRnsPoly<P> {
     let levels = template.active_q_moduli().len();
     let p_moduli_depth = template.ctx.p_moduli.len();
+    let outputs = outputs
+        .iter()
+        .copied()
+        .map(Into::into)
+        .map(BatchedWire::as_single_wire)
+        .collect::<Vec<_>>();
     assert_eq!(
         outputs.len(),
         levels * p_moduli_depth,
@@ -150,7 +188,7 @@ fn sparse_nested_rns_output_template<P: Poly>(
     level_offset: usize,
     circuit: &mut PolyCircuit<P>,
 ) -> NestedRnsPoly<P> {
-    let zero_gate = circuit.const_zero_gate();
+    let zero_gate = circuit.const_zero_gate().as_single_wire();
     let inner = vec![vec![zero_gate; ctx.p_moduli.len()]; active_levels];
     NestedRnsPoly::new(
         ctx,
@@ -699,11 +737,11 @@ impl<P: Poly + 'static> RingGswContext<P> {
         let ctx =
             Arc::new(template_ctx.register_shared_subcircuits_in(source_circuit, &mut circuit));
         let lhs_row = circuit.input(ctx.p_moduli.len());
-        let term_gate = circuit.input(1)[0];
-        let term_row = vec![term_gate; ctx.p_moduli.len()];
+        let term_gate = circuit.input(1).at(0).as_single_wire();
         let term_helper_id = circuit.register_shared_sub_circuit(term_helper);
-        let mut inputs = lhs_row;
-        inputs.extend(term_row);
+        let mut inputs = Vec::with_capacity(1 + ctx.p_moduli.len());
+        inputs.push(lhs_row);
+        inputs.extend(std::iter::repeat_n(BatchedWire::single(term_gate), ctx.p_moduli.len()));
         let product_row = circuit.call_sub_circuit(term_helper_id, &inputs);
         let zero_gate = circuit.const_zero_gate();
         let mut outputs = Vec::with_capacity(active_levels * ctx.p_moduli.len());
@@ -836,6 +874,25 @@ impl<P: Poly + 'static> RingGswContext<P> {
             ));
         let mul_super_batch_tail_columns = width % mul_super_batch_columns;
         let mul_super_batch_tail_subcircuit_id = if mul_super_batch_tail_columns > 0 {
+            let (
+                mul_super_batch_tail_batch_columns,
+                mul_super_batch_tail_batch_subcircuit,
+                mul_super_batch_tail_tail_subcircuit,
+            ) = if mul_super_batch_tail_columns < mul_batch_columns {
+                (
+                    mul_super_batch_tail_columns,
+                    Arc::clone(mul_batch_tail_subcircuit.as_ref().expect(
+                        "tail super-batch smaller than batch must reuse tail batch helper",
+                    )),
+                    None,
+                )
+            } else {
+                (
+                    mul_batch_columns,
+                    Arc::clone(&mul_batch_subcircuit),
+                    mul_batch_tail_subcircuit.clone(),
+                )
+            };
             circuit.register_sub_circuit(Self::mul_super_batch_subcircuit(
                 circuit,
                 nested_rns.as_ref(),
@@ -843,9 +900,9 @@ impl<P: Poly + 'static> RingGswContext<P> {
                 level_offset,
                 width,
                 mul_super_batch_tail_columns,
-                mul_batch_columns,
-                Arc::clone(&mul_batch_subcircuit),
-                mul_batch_tail_subcircuit.clone(),
+                mul_super_batch_tail_batch_columns,
+                mul_super_batch_tail_batch_subcircuit,
+                mul_super_batch_tail_tail_subcircuit,
                 helper_storage.clone(),
             ))
         } else {
@@ -1005,9 +1062,12 @@ impl<P: Poly + 'static> RingGswContext<P> {
         let mut row1 = Vec::with_capacity(width);
         let column_loop_start = Instant::now();
         for col_idx in 0..width {
-            let mut rhs_suffix = Vec::with_capacity(2 * entry_size);
-            rhs_suffix.extend(rhs_row0[col_idx].inner.iter().flatten().copied());
-            rhs_suffix.extend(rhs_row1[col_idx].inner.iter().flatten().copied());
+            let (rhs_row0_inputs, rhs_row1_inputs) = rayon::join(
+                || flatten_nested_rns_entries(std::slice::from_ref(&rhs_row0[col_idx])),
+                || flatten_nested_rns_entries(std::slice::from_ref(&rhs_row1[col_idx])),
+            );
+            let mut rhs_suffix = rhs_row0_inputs;
+            rhs_suffix.extend(rhs_row1_inputs);
             let outputs = circuit.call_sub_circuit_with_shared_input_prefix_and_bindings(
                 mul_column_subcircuit_id,
                 lhs_input_set_id,
@@ -1469,15 +1529,15 @@ impl<P: Poly + 'static> RingGswContext<P> {
             .collect::<Vec<_>>();
         let row_q_levels =
             (0..width).map(|_| helper_circuit.input(helper_ctx.p_moduli.len())).collect::<Vec<_>>();
-        let column_terms = (0..width).map(|_| helper_circuit.input(1)[0]).collect::<Vec<_>>();
+        let column_terms =
+            (0..width).map(|_| helper_circuit.input(1).at(0).as_single_wire()).collect::<Vec<_>>();
         let products = row_q_levels
             .iter()
             .zip(column_terms.iter())
             .enumerate()
             .map(|(col_idx, (lhs_row, &term_gate))| {
                 let sparse_q_idx = (col_idx % gadget_len) / chunk_width;
-                let mut inputs = lhs_row.clone();
-                inputs.push(term_gate);
+                let inputs = [*lhs_row, BatchedWire::single(term_gate)];
                 let outputs =
                     helper_circuit.call_sub_circuit(product_subcircuit_ids[sparse_q_idx], &inputs);
                 let (output_max_plaintexts, output_p_max_traces) =
@@ -1495,7 +1555,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
             &mut helper_circuit,
             |lhs, rhs, helper_circuit| lhs.add(rhs, helper_circuit),
         );
-        helper_circuit.output(result.inner.iter().flatten().copied().collect());
+        helper_circuit.output(flatten_nested_rns_entries(std::slice::from_ref(&result)));
         (helper_circuit, result)
     }
 
@@ -1545,7 +1605,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
         let row1_q_levels =
             (0..width).map(|_| helper_circuit.input(helper_ctx.p_moduli.len())).collect::<Vec<_>>();
         let batch_column_terms = (0..batch_columns)
-            .map(|_| (0..width).map(|_| helper_circuit.input(1)[0]).collect::<Vec<_>>())
+            .map(|_| (0..width).map(|_| helper_circuit.input(1)).collect::<Vec<_>>())
             .collect::<Vec<_>>();
         debug!(
             "RingGswContext::mul_q_level_rows_with_raw_terms_batch_subcircuit inputs allocated: batch_columns={}, width={}, elapsed_ms={}",
@@ -1557,15 +1617,13 @@ impl<P: Poly + 'static> RingGswContext<P> {
         let mut row0_outputs = Vec::with_capacity(batch_columns * entry_size);
         let mut row1_outputs = Vec::with_capacity(batch_columns * entry_size);
         for column_terms in batch_column_terms.iter() {
-            let mut row0_inputs =
-                Vec::with_capacity(width * helper_ctx.p_moduli.len() + column_terms.len());
-            row0_inputs.extend(row0_q_levels.iter().flatten().copied());
+            let mut row0_inputs = Vec::with_capacity(row0_q_levels.len() + column_terms.len());
+            row0_inputs.extend(row0_q_levels.iter().copied());
             row0_inputs.extend(column_terms.iter().copied());
             row0_outputs.extend(helper_circuit.call_sub_circuit(row_subcircuit_id, &row0_inputs));
 
-            let mut row1_inputs =
-                Vec::with_capacity(width * helper_ctx.p_moduli.len() + column_terms.len());
-            row1_inputs.extend(row1_q_levels.iter().flatten().copied());
+            let mut row1_inputs = Vec::with_capacity(row1_q_levels.len() + column_terms.len());
+            row1_inputs.extend(row1_q_levels.iter().copied());
             row1_inputs.extend(column_terms.iter().copied());
             row1_outputs.extend(helper_circuit.call_sub_circuit(row_subcircuit_id, &row1_inputs));
         }
@@ -1676,15 +1734,16 @@ impl<P: Poly + 'static> RingGswContext<P> {
             let row_q_levels = (0..width)
                 .map(|_| helper_circuit.input(helper_ctx.p_moduli.len()))
                 .collect::<Vec<_>>();
-            let column_terms = (0..width).map(|_| helper_circuit.input(1)[0]).collect::<Vec<_>>();
+            let column_terms = (0..width)
+                .map(|_| helper_circuit.input(1).at(0).as_single_wire())
+                .collect::<Vec<_>>();
             let products = row_q_levels
                 .iter()
                 .zip(column_terms.iter())
                 .enumerate()
                 .map(|(col_idx, (lhs_row, &term_gate))| {
                     let sparse_q_idx = (col_idx % gadget_len) / chunk_width;
-                    let mut inputs = lhs_row.clone();
-                    inputs.push(term_gate);
+                    let inputs = [*lhs_row, BatchedWire::single(term_gate)];
                     let outputs = helper_circuit
                         .call_sub_circuit(product_subcircuit_ids[sparse_q_idx], &inputs);
                     let (output_max_plaintexts, output_p_max_traces) =
@@ -1703,7 +1762,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
                 |lhs, rhs, helper_circuit| lhs.add(rhs, helper_circuit),
             );
             let result_template = result.clone();
-            helper_circuit.output(result.inner.into_iter().flatten().collect());
+            helper_circuit.output(flatten_nested_rns_entries(std::slice::from_ref(&result)));
             (circuit.register_sub_circuit(helper_circuit), result_template)
         };
         debug!(
@@ -1782,7 +1841,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
         let row0: NestedRnsPoly<P> = {
             let template = &lhs_row0[0];
             let mut inputs = lhs_row0_inputs;
-            inputs.extend(g_inverse_terms.clone());
+            inputs.extend(g_inverse_terms.iter().copied().map(BatchedWire::single));
             let outputs =
                 circuit.call_sub_circuit(local_dot_row_with_column_subcircuit_id, &inputs);
             nested_rns_from_flat_outputs(
@@ -1795,7 +1854,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
         let row1: NestedRnsPoly<P> = {
             let template = &lhs_row1[0];
             let mut inputs = lhs_row1_inputs;
-            inputs.extend(g_inverse_terms);
+            inputs.extend(g_inverse_terms.into_iter().map(BatchedWire::single));
             let outputs =
                 circuit.call_sub_circuit(local_dot_row_with_column_subcircuit_id, &inputs);
             nested_rns_from_flat_outputs(
@@ -2418,7 +2477,7 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
         for term in collapsed_terms {
             collapsed = circuit.add_gate(collapsed, term);
         }
-        collapsed
+        collapsed.as_single_wire()
     }
 
     fn assert_consistent(&self) {
@@ -2631,7 +2690,7 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
             self.ctx.num_slots,
             circuit,
         );
-        circuit.add_gate(sum, reconstructed_bottom)
+        circuit.add_gate(sum, reconstructed_bottom).as_single_wire()
     }
 
     fn decrypt_linear_combination_row(
@@ -2891,7 +2950,7 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ctx) = create_test_context(&mut circuit);
         let ciphertext_input = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
-        let wire_secret_key = circuit.input(1)[0];
+        let wire_secret_key = circuit.input(1).at(0).as_single_wire();
         let decrypted_input = ciphertext_input.decrypt::<DCRTPolyMatrix>(
             wire_secret_key,
             BigUint::from(2u64),
@@ -2957,7 +3016,7 @@ mod tests {
         let (params, ctx) = create_test_context(&mut circuit);
         let lhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
         let rhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
-        let wire_secret_key = circuit.input(1)[0];
+        let wire_secret_key = circuit.input(1).at(0).as_single_wire();
         let plaintext_modulus = 3u64;
         let sum = lhs.add(&rhs, &mut circuit);
         let decrypted_sum = sum.decrypt::<DCRTPolyMatrix>(
@@ -3036,7 +3095,7 @@ mod tests {
         let (params, ctx) = create_test_context(&mut circuit);
         let lhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
         let rhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
-        let wire_secret_key = circuit.input(1)[0];
+        let wire_secret_key = circuit.input(1).at(0).as_single_wire();
         let plaintext_modulus = 3u64;
         let difference = lhs.sub(&rhs, &mut circuit);
         let decrypted_difference = difference.decrypt::<DCRTPolyMatrix>(
@@ -3115,7 +3174,7 @@ mod tests {
         let (params, ctx) = create_test_context(&mut circuit);
         let lhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
         let rhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
-        let wire_secret_key = circuit.input(1)[0];
+        let wire_secret_key = circuit.input(1).at(0).as_single_wire();
         let plaintext_modulus = 2u64;
         let product = lhs.mul(&rhs, &mut circuit);
         let decrypted_product = product.decrypt::<DCRTPolyMatrix>(
@@ -3195,7 +3254,7 @@ mod tests {
         let lhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
         let rhs1 = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
         let rhs2 = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
-        let wire_secret_key = circuit.input(1)[0];
+        let wire_secret_key = circuit.input(1).at(0).as_single_wire();
         let plaintext_modulus = 2u64;
         let product = lhs.mul(&rhs1, &mut circuit);
         let chained_product = product.mul(&rhs2, &mut circuit);

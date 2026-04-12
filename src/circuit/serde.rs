@@ -1,7 +1,7 @@
 use crate::{
     circuit::{
-        GateParamSource, PolyCircuit, PolyGate, PolyGateType, StoredSubCircuit, SubCircuitCall,
-        SubCircuitParamKind, SubCircuitParamValue,
+        BatchedWire, GateParamSource, PolyCircuit, PolyGate, PolyGateType, StoredSubCircuit,
+        SubCircuitCall, SubCircuitParamKind, SubCircuitParamValue,
         gate::{GateId, SlotTransferSpec},
     },
     poly::Poly,
@@ -63,8 +63,8 @@ impl SerializablePolyGate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SerializableSubCircuitCall {
     pub sub_circuit_id: usize,
-    pub shared_input_prefix: Option<Vec<GateId>>,
-    pub input_suffix: Vec<GateId>,
+    pub shared_input_prefix: Option<Vec<BatchedWire>>,
+    pub input_suffix: Vec<BatchedWire>,
     pub param_bindings: Vec<SubCircuitParamValue>,
     pub scoped_call_id: usize,
     pub output_gate_ids: Vec<GateId>,
@@ -74,7 +74,7 @@ pub struct SerializableSubCircuitCall {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SerializableSummedSubCircuitCall {
     pub sub_circuit_id: usize,
-    pub call_inputs: Vec<Vec<GateId>>,
+    pub call_inputs: Vec<Vec<BatchedWire>>,
     pub param_bindings: Vec<Vec<SubCircuitParamValue>>,
     pub scoped_call_ids: Vec<usize>,
     pub output_gate_ids: Vec<GateId>,
@@ -461,13 +461,13 @@ mod tests {
     #[test]
     fn test_serialization_roundtrip() {
         let mut original_circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
-        let inputs = original_circuit.input(3);
+        let inputs = original_circuit.input(3).to_vec();
         let add_gate = original_circuit.add_gate(inputs[0], inputs[1]);
         let sub_gate = original_circuit.sub_gate(add_gate, inputs[2]);
         let mul_gate = original_circuit.mul_gate(inputs[1], inputs[2]);
 
         let mut sub_circuit: PolyCircuit<_> = PolyCircuit::new();
-        let sub_inputs = sub_circuit.input(2);
+        let sub_inputs = sub_circuit.input(2).to_vec();
         let sub_add_gate = sub_circuit.add_gate(sub_inputs[0], sub_inputs[1]);
         let sub_mul_gate = sub_circuit.mul_gate(sub_inputs[0], sub_inputs[1]);
         sub_circuit.output(vec![sub_add_gate, sub_mul_gate]);
@@ -486,12 +486,12 @@ mod tests {
     #[test]
     fn test_serialization_roundtrip_json() {
         let mut original_circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
-        let inputs = original_circuit.input(3);
+        let inputs = original_circuit.input(3).to_vec();
         let add_gate = original_circuit.add_gate(inputs[0], inputs[1]);
         let mul_gate = original_circuit.mul_gate(inputs[1], inputs[2]);
 
         let mut sub_circuit = PolyCircuit::new();
-        let sub_inputs = sub_circuit.input(2);
+        let sub_inputs = sub_circuit.input(2).to_vec();
         let sub_add_gate = sub_circuit.add_gate(sub_inputs[0], sub_inputs[1]);
         let sub_mul_gate = sub_circuit.mul_gate(sub_inputs[0], sub_inputs[1]);
         sub_circuit.output(vec![sub_add_gate, sub_mul_gate]);
@@ -513,9 +513,9 @@ mod tests {
     #[test]
     fn test_serialization_roundtrip_with_nonconsecutive_inputs() {
         let mut circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
-        let first_inputs = circuit.input(1);
+        let first_inputs = circuit.input(1).to_vec();
         let _gap_gate = circuit.const_digits(&[1u32, 0u32, 1u32]);
-        let second_inputs = circuit.input(1);
+        let second_inputs = circuit.input(1).to_vec();
         assert_ne!(second_inputs[0].0, first_inputs[0].0 + 1);
 
         let add = circuit.add_gate(first_inputs[0], second_inputs[0]);
@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn test_serialization_roundtrip_with_slot_transfer_gate() {
         let mut circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
-        let inputs = circuit.input(1);
+        let inputs = circuit.input(1).to_vec();
         let transferred = circuit.slot_transfer_gate(inputs[0], &[(1, None), (0, None), (1, None)]);
         circuit.output(vec![transferred]);
 
@@ -554,12 +554,12 @@ mod tests {
         let mut sub_circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
         let scalar_param =
             sub_circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul);
-        let sub_inputs = sub_circuit.input(1);
+        let sub_inputs = sub_circuit.input(1).to_vec();
         let scaled = sub_circuit.small_scalar_mul_param(sub_inputs[0], scalar_param);
         sub_circuit.output(vec![scaled]);
 
         let mut circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
-        let inputs = circuit.input(1);
+        let inputs = circuit.input(1).to_vec();
         let sub_id = circuit.register_sub_circuit(sub_circuit);
         let outputs = circuit.call_sub_circuit_with_bindings(
             sub_id,
@@ -578,12 +578,12 @@ mod tests {
         let mut sub_circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
         let scalar_param =
             sub_circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul);
-        let sub_inputs = sub_circuit.input(1);
+        let sub_inputs = sub_circuit.input(1).to_vec();
         let scaled = sub_circuit.small_scalar_mul_param(sub_inputs[0], scalar_param);
         sub_circuit.output(vec![scaled]);
 
         let mut circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
-        let inputs = circuit.input(1);
+        let inputs = circuit.input(1).to_vec();
         let sub_id = circuit.register_sub_circuit(sub_circuit);
         let binding_two =
             circuit.intern_binding_set(&[SubCircuitParamValue::SmallScalarMul(vec![2])]);

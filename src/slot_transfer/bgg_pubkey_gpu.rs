@@ -908,7 +908,7 @@ mod tests {
         let input_gates = circuit.input(num_inputs);
         let transferred_gates = input_gates
             .iter()
-            .map(|&gate| circuit.slot_transfer_gate(gate, &src_slots))
+            .map(|gate| circuit.slot_transfer_gate(gate, &src_slots))
             .collect::<Vec<_>>();
         circuit.output(transferred_gates.clone());
 
@@ -935,9 +935,10 @@ mod tests {
         );
 
         assert_eq!(outputs.len(), transferred_gates.len());
-        for ((output, input), gate_id) in
+        for ((output, input), gate) in
             outputs.iter().zip(inputs.iter()).zip(transferred_gates.iter())
         {
+            let gate_id = gate.as_single_wire();
             let expected_matrix = GpuDCRTPolyHashSampler::<Keccak256>::new().sample_hash(
                 &params,
                 hash_key,
@@ -948,7 +949,7 @@ mod tests {
             );
             assert_eq!(*output, BggPublicKey::new(expected_matrix, true));
 
-            let stored = evaluator.gate_state(*gate_id).expect("missing stored gate state");
+            let stored = evaluator.gate_state(gate_id).expect("missing stored gate state");
             assert_eq!(stored.input_pubkey_bytes, input.matrix.to_compact_bytes());
             assert_eq!(stored.src_slots, src_slots);
         }
@@ -1002,7 +1003,8 @@ mod tests {
             let mut circuit = PolyCircuit::new();
             let inputs = circuit.input(1);
             let src_slots = [(1, None), (2, Some(3)), (0, Some(5))];
-            let transferred = circuit.slot_transfer_gate(inputs[0], &src_slots);
+            let transferred = circuit.slot_transfer_gate(inputs.at(0), &src_slots);
+            let transferred_gate = transferred.as_single_wire();
             circuit.output(vec![transferred]);
 
             let evaluator = BggPublicKeySTEvaluator::<
@@ -1088,7 +1090,7 @@ mod tests {
             let a_out = GpuDCRTPolyHashSampler::<Keccak256>::new().sample_hash(
                 &params,
                 hash_key,
-                format!("slot_transfer_gate_a_out_{}", transferred),
+                format!("slot_transfer_gate_a_out_{}", transferred_gate),
                 secret_size,
                 m_g,
                 DistType::FinRingDist,
@@ -1115,7 +1117,10 @@ mod tests {
                 let gate_preimage = read_matrix_from_multi_batch::<GpuDCRTPolyMatrix>(
                     &params,
                     dir,
-                    &format!("{checkpoint_prefix}_gate_preimage_{}_dst{}", transferred, dst_slot),
+                    &format!(
+                        "{checkpoint_prefix}_gate_preimage_{}_dst{}",
+                        transferred_gate, dst_slot
+                    ),
                     0,
                 )
                 .expect("gpu gate preimage checkpoint should exist");

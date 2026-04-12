@@ -93,7 +93,7 @@ mod tests {
         let one = PolyVec::new(vec![DCRTPoly::const_one(&params); 3]);
 
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let inputs = circuit.input(1);
+        let inputs = circuit.input(1).to_vec();
         let transferred = circuit.slot_transfer_gate(inputs[0], &[(2, None), (0, None), (1, None)]);
         circuit.output(vec![transferred]);
         let expected = vec![
@@ -133,7 +133,7 @@ mod tests {
         let one = PolyVec::new(vec![DCRTPoly::const_one(&params); 6]);
 
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let inputs = circuit.input(1);
+        let inputs = circuit.input(1).to_vec();
         let transferred = circuit.slot_transfer_gate(
             inputs[0],
             &[(5, None), (4, None), (3, None), (2, None), (1, None), (0, None)],
@@ -163,7 +163,7 @@ mod tests {
         let one = PolyVec::new(vec![DCRTPoly::const_one(&params); 3]);
 
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let inputs = circuit.input(1);
+        let inputs = circuit.input(1).to_vec();
         let transferred =
             circuit.slot_transfer_gate(inputs[0], &[(2, Some(4)), (0, None), (1, Some(3))]);
         circuit.output(vec![transferred]);

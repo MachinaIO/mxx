@@ -150,7 +150,9 @@ impl<P: Poly> NestedRnsPoly<P> {
     ) -> Self {
         let inner = (0..levels)
             .map(|_| {
-                (0..self.ctx.p_moduli.len()).map(|_| circuit.const_zero_gate()).collect::<Vec<_>>()
+                (0..self.ctx.p_moduli.len())
+                    .map(|_| circuit.const_zero_gate().as_single_wire())
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         let max_plaintexts = vec![BigUint::ZERO; levels];

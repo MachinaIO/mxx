@@ -16,6 +16,7 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Debug,
+    ops::Range,
     path::Path,
     sync::{
         Arc,
@@ -32,6 +33,158 @@ use crate::{
     slot_transfer::SlotTransferEvaluator,
 };
 use tracing::{debug, info};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ::serde::Serialize, ::serde::Deserialize)]
+pub struct BatchedWire {
+    start: GateId,
+    end: GateId,
+}
+
+impl BatchedWire {
+    pub fn new(start: GateId, end: GateId) -> Self {
+        assert!(start.0 <= end.0, "BatchedWire start {} must not exceed end {}", start, end);
+        Self { start, end }
+    }
+
+    pub fn single(gate_id: GateId) -> Self {
+        Self::new(gate_id, GateId(gate_id.0 + 1))
+    }
+
+    pub fn from_start_len(start: GateId, len: usize) -> Self {
+        Self::new(start, GateId(start.0 + len))
+    }
+
+    pub fn start(self) -> GateId {
+        self.start
+    }
+
+    pub fn end(self) -> GateId {
+        self.end
+    }
+
+    pub fn len(self) -> usize {
+        self.end.0 - self.start.0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.start == self.end
+    }
+
+    pub fn is_single_wire(self) -> bool {
+        self.len() == 1
+    }
+
+    pub fn as_single_wire(self) -> GateId {
+        debug_assert!(
+            self.is_single_wire(),
+            "expected a single-wire batch, got [{}, {})",
+            self.start.0,
+            self.end.0
+        );
+        self.start
+    }
+
+    pub fn at(self, idx: usize) -> Self {
+        self.slice(idx..idx + 1)
+    }
+
+    pub fn slice(self, range: Range<usize>) -> Self {
+        assert!(
+            range.start <= range.end && range.end <= self.len(),
+            "BatchedWire slice [{}, {}) is out of bounds for len {}",
+            range.start,
+            range.end,
+            self.len()
+        );
+        Self::new(GateId(self.start.0 + range.start), GateId(self.start.0 + range.end))
+    }
+
+    pub fn split_at(self, mid: usize) -> (Self, Self) {
+        assert!(mid <= self.len(), "BatchedWire split offset {} exceeds len {}", mid, self.len());
+        (self.slice(0..mid), self.slice(mid..self.len()))
+    }
+
+    pub fn from_batches<I, W>(batches: I) -> Self
+    where
+        I: IntoIterator<Item = W>,
+        W: Into<BatchedWire>,
+    {
+        let mut iter = batches.into_iter().map(Into::into);
+        let first = iter.next().expect("BatchedWire::from_batches requires at least one batch");
+        let mut merged = first;
+        for batch in iter {
+            assert_eq!(
+                merged.end(),
+                batch.start(),
+                "BatchedWire::from_batches requires contiguous batches, got {} then {}",
+                merged,
+                batch
+            );
+            merged = Self::new(merged.start(), batch.end());
+        }
+        merged
+    }
+
+    pub fn gate_ids(self) -> impl ExactSizeIterator<Item = GateId> {
+        (self.start.0..self.end.0).map(GateId)
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = GateId> {
+        self.gate_ids()
+    }
+
+    pub fn to_vec(self) -> Vec<GateId> {
+        self.gate_ids().collect()
+    }
+}
+
+impl From<GateId> for BatchedWire {
+    fn from(value: GateId) -> Self {
+        Self::single(value)
+    }
+}
+
+impl From<&GateId> for BatchedWire {
+    fn from(value: &GateId) -> Self {
+        Self::single(*value)
+    }
+}
+
+impl From<&BatchedWire> for BatchedWire {
+    fn from(value: &BatchedWire) -> Self {
+        *value
+    }
+}
+
+impl std::fmt::Display for BatchedWire {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}, {})", self.start.0, self.end.0)
+    }
+}
+
+pub(crate) fn batched_wire_slice_len(batches: &[BatchedWire]) -> usize {
+    batches.iter().copied().map(BatchedWire::len).sum()
+}
+
+pub(crate) fn iter_batched_wire_gates(
+    batches: &[BatchedWire],
+) -> impl Iterator<Item = GateId> + '_ {
+    batches.iter().copied().flat_map(BatchedWire::gate_ids)
+}
+
+pub(crate) fn batched_wire_slice_at(batches: &[BatchedWire], idx: usize) -> GateId {
+    let mut offset = idx;
+    for batch in batches {
+        if offset < batch.len() {
+            return GateId(batch.start().0 + offset);
+        }
+        offset -= batch.len();
+    }
+    panic!(
+        "batched wire index {idx} out of range for flattened len {}",
+        batched_wire_slice_len(batches)
+    );
+}
 
 #[cfg(feature = "gpu")]
 #[derive(Debug)]
@@ -82,8 +235,8 @@ pub(crate) struct BindingRegistry {
 #[derive(Debug)]
 pub(crate) struct InputSetRegistry {
     next_id: AtomicUsize,
-    input_sets: DashMap<usize, Arc<[GateId]>>,
-    input_set_index: DashMap<Arc<[GateId]>, usize>,
+    input_sets: DashMap<usize, Arc<[BatchedWire]>>,
+    input_set_index: DashMap<Arc<[BatchedWire]>, usize>,
 }
 
 static TEMP_SUBCIRCUIT_STORAGE_ID: AtomicUsize = AtomicUsize::new(0);
@@ -157,7 +310,7 @@ impl InputSetRegistry {
         self.input_sets.is_empty()
     }
 
-    fn register_arc(&self, candidate: Arc<[GateId]>) -> usize {
+    fn register_arc(&self, candidate: Arc<[BatchedWire]>) -> usize {
         if let Some(existing) = self.input_set_index.get(&candidate) {
             return *existing;
         }
@@ -172,11 +325,11 @@ impl InputSetRegistry {
         }
     }
 
-    fn register(&self, input_ids: &[GateId]) -> usize {
+    fn register(&self, input_ids: &[BatchedWire]) -> usize {
         self.register_arc(Arc::from(input_ids.to_vec()))
     }
 
-    fn get(&self, input_set_id: usize) -> Arc<[GateId]> {
+    fn get(&self, input_set_id: usize) -> Arc<[BatchedWire]> {
         self.input_sets
             .get(&input_set_id)
             .unwrap_or_else(|| panic!("input set {input_set_id} not found"))
@@ -188,7 +341,7 @@ impl InputSetRegistry {
 struct SubCircuitCall {
     sub_circuit_id: usize,
     shared_input_prefix_set_id: Option<usize>,
-    input_suffix: Vec<GateId>,
+    input_suffix: Vec<BatchedWire>,
     binding_set_id: usize,
     scoped_call_id: usize,
     output_gate_ids: Vec<GateId>,
@@ -198,7 +351,7 @@ struct SubCircuitCall {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SubCircuitCallInfo {
     pub(crate) sub_circuit_id: usize,
-    pub(crate) inputs: Vec<GateId>,
+    pub(crate) inputs: Vec<BatchedWire>,
     pub(crate) param_bindings: Arc<[SubCircuitParamValue]>,
     pub(crate) output_gate_ids: Vec<GateId>,
 }
@@ -216,7 +369,7 @@ struct SummedSubCircuitCall {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SummedSubCircuitCallInfo {
     pub(crate) sub_circuit_id: usize,
-    pub(crate) call_inputs: Vec<Vec<GateId>>,
+    pub(crate) call_inputs: Vec<Vec<BatchedWire>>,
     pub(crate) param_bindings: Vec<Arc<[SubCircuitParamValue]>>,
     pub(crate) output_gate_ids: Vec<GateId>,
 }
@@ -501,25 +654,30 @@ impl<P: Poly> PolyCircuit<P> {
         self.binding_registry.register(bindings)
     }
 
-    pub(crate) fn input_set(&self, input_set_id: usize) -> Arc<[GateId]> {
+    pub(crate) fn input_set(&self, input_set_id: usize) -> Arc<[BatchedWire]> {
         self.input_set_registry.get(input_set_id)
     }
 
-    pub(crate) fn intern_input_set(&self, input_ids: &[GateId]) -> usize {
-        self.input_set_registry.register(input_ids)
+    pub(crate) fn intern_input_set<I, W>(&self, input_ids: I) -> usize
+    where
+        I: IntoIterator<Item = W>,
+        W: Into<BatchedWire>,
+    {
+        let batches = input_ids.into_iter().map(Into::into).collect::<Vec<_>>();
+        self.input_set_registry.register(&batches)
     }
 
     fn sub_circuit_call_input_len(&self, call: &SubCircuitCall) -> usize {
         call.shared_input_prefix_set_id
-            .map(|input_set_id| self.input_set(input_set_id).len())
+            .map(|input_set_id| batched_wire_slice_len(self.input_set(input_set_id).as_ref()))
             .unwrap_or(0) +
-            call.input_suffix.len()
+            batched_wire_slice_len(&call.input_suffix)
     }
 
     fn with_sub_circuit_call_inputs<T>(
         &self,
         call: &SubCircuitCall,
-        f: impl FnOnce(&[GateId], &[GateId]) -> T,
+        f: impl FnOnce(&[BatchedWire], &[BatchedWire]) -> T,
     ) -> T {
         if let Some(input_set_id) = call.shared_input_prefix_set_id {
             let shared_prefix = self.input_set(input_set_id);
@@ -532,7 +690,7 @@ impl<P: Poly> PolyCircuit<P> {
     pub(crate) fn with_sub_circuit_call_inputs_by_id<T>(
         &self,
         call_id: usize,
-        f: impl FnOnce(&[GateId], &[GateId]) -> T,
+        f: impl FnOnce(&[BatchedWire], &[BatchedWire]) -> T,
     ) -> T {
         let call = self.sub_circuit_calls.get(&call_id).expect("sub-circuit call missing");
         self.with_sub_circuit_call_inputs(call, f)
@@ -541,7 +699,13 @@ impl<P: Poly> PolyCircuit<P> {
     pub(crate) fn with_sub_circuit_call_by_id<T>(
         &self,
         call_id: usize,
-        f: impl FnOnce(usize, Arc<[SubCircuitParamValue]>, &[GateId], &[GateId], &[GateId]) -> T,
+        f: impl FnOnce(
+            usize,
+            Arc<[SubCircuitParamValue]>,
+            &[BatchedWire],
+            &[BatchedWire],
+            &[GateId],
+        ) -> T,
     ) -> T {
         let call = self.sub_circuit_calls.get(&call_id).expect("sub-circuit call missing");
         let param_bindings = self.binding_set(call.binding_set_id);
@@ -567,13 +731,13 @@ impl<P: Poly> PolyCircuit<P> {
             .get(&summed_call_id)
             .expect("summed sub-circuit call missing");
         for input_set_id in &call.call_input_set_ids {
-            for &input_id in self.input_set(*input_set_id).iter() {
+            for input_id in iter_batched_wire_gates(self.input_set(*input_set_id).as_ref()) {
                 f(input_id);
             }
         }
     }
 
-    fn collect_sub_circuit_call_inputs(&self, call: &SubCircuitCall) -> Vec<GateId> {
+    fn collect_sub_circuit_call_inputs(&self, call: &SubCircuitCall) -> Vec<BatchedWire> {
         self.with_sub_circuit_call_inputs(call, |shared_prefix, suffix| {
             let mut inputs = Vec::with_capacity(shared_prefix.len() + suffix.len());
             inputs.extend_from_slice(shared_prefix);
@@ -815,15 +979,21 @@ impl<P: Poly> PolyCircuit<P> {
                             self.sub_circuit_calls.get(call_id).expect("sub-circuit call missing");
                         let child_input_levels =
                             self.with_sub_circuit_call_inputs(call, |shared_prefix, suffix| {
-                                let mut levels =
-                                    Vec::with_capacity(shared_prefix.len() + suffix.len());
-                                levels.extend(shared_prefix.iter().map(|input_id| {
-                                    *live_gate_levels.get(input_id).unwrap_or_else(|| {
-                                        panic!("non-free depth level missing for gate {input_id}")
-                                    })
-                                }));
-                                levels.extend(suffix.iter().map(|input_id| {
-                                    *live_gate_levels.get(input_id).unwrap_or_else(|| {
+                                let mut levels = Vec::with_capacity(
+                                    batched_wire_slice_len(shared_prefix) +
+                                        batched_wire_slice_len(suffix),
+                                );
+                                levels.extend(iter_batched_wire_gates(shared_prefix).map(
+                                    |input_id| {
+                                        *live_gate_levels.get(&input_id).unwrap_or_else(|| {
+                                            panic!(
+                                                "non-free depth level missing for gate {input_id}"
+                                            )
+                                        })
+                                    },
+                                ));
+                                levels.extend(iter_batched_wire_gates(suffix).map(|input_id| {
+                                    *live_gate_levels.get(&input_id).unwrap_or_else(|| {
                                         panic!("non-free depth level missing for gate {input_id}")
                                     })
                                 }));
@@ -870,9 +1040,12 @@ impl<P: Poly> PolyCircuit<P> {
                             } else {
                                 let child_input_levels = self
                                     .input_set(*input_set_id)
+                                    .as_ref()
                                     .iter()
+                                    .copied()
+                                    .flat_map(BatchedWire::gate_ids)
                                     .map(|input_id| {
-                                        *live_gate_levels.get(input_id).unwrap_or_else(|| {
+                                        *live_gate_levels.get(&input_id).unwrap_or_else(|| {
                                             panic!(
                                                 "non-free depth level missing for gate {input_id}"
                                             )
@@ -955,46 +1128,53 @@ impl<P: Poly> PolyCircuit<P> {
         }
     }
 
-    pub fn print(&mut self, gate_id: GateId, prefix: String) {
-        self.print_value.insert(gate_id, prefix);
+    pub fn print<I: Into<BatchedWire>>(&mut self, gate_id: I, prefix: String) {
+        self.print_value.insert(gate_id.into().as_single_wire(), prefix);
     }
 
-    pub fn input(&mut self, num_input: usize) -> Vec<GateId> {
-        let mut input_gates = Vec::with_capacity(num_input);
+    pub fn input(&mut self, num_input: usize) -> BatchedWire {
+        let start = GateId(self.gates.len());
         for _ in 0..num_input {
             let next_id = self.gates.len();
             let gid = GateId(next_id);
             self.increment_gate_kind(PolyGateKind::Input);
             self.gates.insert(gid, PolyGate::new(gid, PolyGateType::Input, vec![]));
-            input_gates.push(gid);
         }
         self.num_input += num_input;
-        input_gates
+        BatchedWire::from_start_len(start, num_input)
     }
 
-    pub fn output(&mut self, outputs: Vec<GateId>) {
+    pub fn output<I, W>(&mut self, outputs: I)
+    where
+        I: IntoIterator<Item = W>,
+        W: Into<BatchedWire>,
+    {
         #[cfg(debug_assertions)]
         assert_eq!(self.output_ids.len(), 0);
-        for gate_id in outputs.into_iter() {
-            self.output_ids.push(gate_id);
+        for output in outputs.into_iter() {
+            self.output_ids.extend(output.into().gate_ids());
         }
     }
 
-    pub fn const_zero_gate(&mut self) -> GateId {
+    pub fn const_zero_gate(&mut self) -> BatchedWire {
         self.not_gate(GateId(0))
     }
 
     /// index 0 have value 1
-    pub fn const_one_gate(&mut self) -> GateId {
-        GateId(0)
+    pub fn const_one_gate(&mut self) -> BatchedWire {
+        BatchedWire::single(GateId(0))
     }
 
-    pub fn const_minus_one_gate(&mut self) -> GateId {
+    pub fn const_minus_one_gate(&mut self) -> BatchedWire {
         let zero = self.const_zero_gate();
         self.sub_gate(zero, GateId(0))
     }
 
-    pub fn and_gate(&mut self, left: GateId, right: GateId) -> GateId {
+    pub fn and_gate<L: Into<BatchedWire>, R: Into<BatchedWire>>(
+        &mut self,
+        left: L,
+        right: R,
+    ) -> BatchedWire {
         self.mul_gate(left, right)
     }
 
@@ -1002,11 +1182,17 @@ impl<P: Poly> PolyCircuit<P> {
     /// This operation assumes that `x` is restricted to binary values (0 or 1),
     /// meaning it should only be used with polynomials sampled from a bit distribution.
     /// The computation is achieved by subtracting `x` from 1 (i.e., `0 - x + 1`).
-    pub fn not_gate(&mut self, input: GateId) -> GateId {
+    pub fn not_gate<I: Into<BatchedWire>>(&mut self, input: I) -> BatchedWire {
         self.sub_gate(GateId(0), input)
     }
 
-    pub fn or_gate(&mut self, left: GateId, right: GateId) -> GateId {
+    pub fn or_gate<L: Into<BatchedWire>, R: Into<BatchedWire>>(
+        &mut self,
+        left: L,
+        right: R,
+    ) -> BatchedWire {
+        let left = left.into();
+        let right = right.into();
         let add = self.add_gate(left, right);
         let mul = self.mul_gate(left, right);
         self.sub_gate(add, mul) // A + B - A*B
@@ -1015,7 +1201,13 @@ impl<P: Poly> PolyCircuit<P> {
     /// Computes the NAND gate as `NOT(AND(left, right))`.
     /// This operation follows the same restriction as the NOT gate:
     /// `left` and `right` must be bit distribution (0 or 1)
-    pub fn nand_gate(&mut self, left: GateId, right: GateId) -> GateId {
+    pub fn nand_gate<L: Into<BatchedWire>, R: Into<BatchedWire>>(
+        &mut self,
+        left: L,
+        right: R,
+    ) -> BatchedWire {
+        let left = left.into();
+        let right = right.into();
         let and_result = self.and_gate(left, right);
         self.not_gate(and_result) // NOT AND
     }
@@ -1023,12 +1215,24 @@ impl<P: Poly> PolyCircuit<P> {
     /// Computes the NOR gate as `NOT(OR(left, right))`.
     /// This operation follows the same restriction as the NOT gate:
     /// `left` and `right` must be bit distribution (0 or 1)
-    pub fn nor_gate(&mut self, left: GateId, right: GateId) -> GateId {
+    pub fn nor_gate<L: Into<BatchedWire>, R: Into<BatchedWire>>(
+        &mut self,
+        left: L,
+        right: R,
+    ) -> BatchedWire {
+        let left = left.into();
+        let right = right.into();
         let or_result = self.or_gate(left, right);
         self.not_gate(or_result) // NOT OR
     }
 
-    pub fn xor_gate(&mut self, left: GateId, right: GateId) -> GateId {
+    pub fn xor_gate<L: Into<BatchedWire>, R: Into<BatchedWire>>(
+        &mut self,
+        left: L,
+        right: R,
+    ) -> BatchedWire {
+        let left = left.into();
+        let right = right.into();
         let two = self.add_gate(GateId(0), GateId(0));
         let mul = self.mul_gate(left, right);
         let two_mul = self.mul_gate(two, mul);
@@ -1039,77 +1243,142 @@ impl<P: Poly> PolyCircuit<P> {
     /// Computes the XNOR gate as `NOT(XOR(left, right))`.
     /// This operation follows the same restriction as the NOT gate:
     /// `left` and `right` must be bit distribution (0 or 1)
-    pub fn xnor_gate(&mut self, left: GateId, right: GateId) -> GateId {
+    pub fn xnor_gate<L: Into<BatchedWire>, R: Into<BatchedWire>>(
+        &mut self,
+        left: L,
+        right: R,
+    ) -> BatchedWire {
+        let left = left.into();
+        let right = right.into();
         let xor_result = self.xor_gate(left, right);
         self.not_gate(xor_result) // NOT XOR
     }
 
-    pub fn const_digits(&mut self, digits: &[u32]) -> GateId {
+    pub fn const_digits(&mut self, digits: &[u32]) -> BatchedWire {
         let one = self.const_one_gate();
         self.small_scalar_mul(one, digits)
     }
 
-    pub fn const_poly(&mut self, poly: &P) -> GateId {
+    pub fn const_poly(&mut self, poly: &P) -> BatchedWire {
         let one = self.const_one_gate();
         self.large_scalar_mul(one, &poly.coeffs_biguints())
     }
 
-    pub fn add_gate(&mut self, left_input: GateId, right_input: GateId) -> GateId {
-        self.new_gate_generic(vec![left_input, right_input], PolyGateType::Add)
+    pub fn add_gate<L: Into<BatchedWire>, R: Into<BatchedWire>>(
+        &mut self,
+        left_input: L,
+        right_input: R,
+    ) -> BatchedWire {
+        let left_input = left_input.into();
+        let right_input = right_input.into();
+        debug_assert!(left_input.is_single_wire());
+        debug_assert!(right_input.is_single_wire());
+        BatchedWire::single(self.new_gate_generic(
+            vec![left_input.as_single_wire(), right_input.as_single_wire()],
+            PolyGateType::Add,
+        ))
     }
 
-    pub fn sub_gate(&mut self, left_input: GateId, right_input: GateId) -> GateId {
-        self.new_gate_generic(vec![left_input, right_input], PolyGateType::Sub)
+    pub fn sub_gate<L: Into<BatchedWire>, R: Into<BatchedWire>>(
+        &mut self,
+        left_input: L,
+        right_input: R,
+    ) -> BatchedWire {
+        let left_input = left_input.into();
+        let right_input = right_input.into();
+        debug_assert!(left_input.is_single_wire());
+        debug_assert!(right_input.is_single_wire());
+        BatchedWire::single(self.new_gate_generic(
+            vec![left_input.as_single_wire(), right_input.as_single_wire()],
+            PolyGateType::Sub,
+        ))
     }
 
-    pub fn mul_gate(&mut self, left_input: GateId, right_input: GateId) -> GateId {
-        self.new_gate_generic(vec![left_input, right_input], PolyGateType::Mul)
+    pub fn mul_gate<L: Into<BatchedWire>, R: Into<BatchedWire>>(
+        &mut self,
+        left_input: L,
+        right_input: R,
+    ) -> BatchedWire {
+        let left_input = left_input.into();
+        let right_input = right_input.into();
+        debug_assert!(left_input.is_single_wire());
+        debug_assert!(right_input.is_single_wire());
+        BatchedWire::single(self.new_gate_generic(
+            vec![left_input.as_single_wire(), right_input.as_single_wire()],
+            PolyGateType::Mul,
+        ))
     }
 
-    pub fn small_scalar_mul(&mut self, input: GateId, scalar: &[u32]) -> GateId {
-        self.new_gate_generic(
-            vec![input],
+    pub fn small_scalar_mul<I: Into<BatchedWire>>(
+        &mut self,
+        input: I,
+        scalar: &[u32],
+    ) -> BatchedWire {
+        let input = input.into();
+        debug_assert!(input.is_single_wire());
+        BatchedWire::single(self.new_gate_generic(
+            vec![input.as_single_wire()],
             PolyGateType::SmallScalarMul { scalar: GateParamSource::Const(scalar.to_vec()) },
-        )
+        ))
     }
 
-    pub fn small_scalar_mul_param(&mut self, input: GateId, param_id: usize) -> GateId {
+    pub fn small_scalar_mul_param<I: Into<BatchedWire>>(
+        &mut self,
+        input: I,
+        param_id: usize,
+    ) -> BatchedWire {
+        let input = input.into();
+        debug_assert!(input.is_single_wire());
         self.expect_sub_circuit_param_kind(param_id, SubCircuitParamKind::SmallScalarMul);
-        self.new_gate_generic(
-            vec![input],
+        BatchedWire::single(self.new_gate_generic(
+            vec![input.as_single_wire()],
             PolyGateType::SmallScalarMul { scalar: GateParamSource::Param(param_id) },
-        )
+        ))
     }
 
-    pub fn large_scalar_mul(&mut self, input: GateId, scalar: &[BigUint]) -> GateId {
-        self.new_gate_generic(
-            vec![input],
+    pub fn large_scalar_mul<I: Into<BatchedWire>>(
+        &mut self,
+        input: I,
+        scalar: &[BigUint],
+    ) -> BatchedWire {
+        let input = input.into();
+        debug_assert!(input.is_single_wire());
+        BatchedWire::single(self.new_gate_generic(
+            vec![input.as_single_wire()],
             PolyGateType::LargeScalarMul { scalar: GateParamSource::Const(scalar.to_vec()) },
-        )
+        ))
     }
 
-    pub fn large_scalar_mul_param(&mut self, input: GateId, param_id: usize) -> GateId {
+    pub fn large_scalar_mul_param<I: Into<BatchedWire>>(
+        &mut self,
+        input: I,
+        param_id: usize,
+    ) -> BatchedWire {
+        let input = input.into();
+        debug_assert!(input.is_single_wire());
         self.expect_sub_circuit_param_kind(param_id, SubCircuitParamKind::LargeScalarMul);
-        self.new_gate_generic(
-            vec![input],
+        BatchedWire::single(self.new_gate_generic(
+            vec![input.as_single_wire()],
             PolyGateType::LargeScalarMul { scalar: GateParamSource::Param(param_id) },
-        )
+        ))
     }
 
-    pub fn poly_scalar_mul(&mut self, input: GateId, scalar: &P) -> GateId {
-        self.new_gate_generic(
-            vec![input],
+    pub fn poly_scalar_mul<I: Into<BatchedWire>>(&mut self, input: I, scalar: &P) -> BatchedWire {
+        let input = input.into();
+        debug_assert!(input.is_single_wire());
+        BatchedWire::single(self.new_gate_generic(
+            vec![input.as_single_wire()],
             PolyGateType::LargeScalarMul {
                 scalar: GateParamSource::Const(scalar.coeffs_biguints()),
             },
-        )
+        ))
     }
 
     /// Lowers a ring-dimension-normalized rotation into multiplication by the
     /// monomial `x^shift`.
     ///
     /// `shift` must already be reduced modulo the ring dimension.
-    pub fn rotate_gate(&mut self, input: GateId, shift: u64) -> GateId {
+    pub fn rotate_gate<I: Into<BatchedWire>>(&mut self, input: I, shift: u64) -> BatchedWire {
         let shift = usize::try_from(shift)
             .expect("PolyCircuit::rotate_gate shift does not fit in usize on this platform");
         let mut scalar = vec![0; shift + 1];
@@ -1117,40 +1386,60 @@ impl<P: Poly> PolyCircuit<P> {
         self.small_scalar_mul(input, &scalar)
     }
 
-    pub fn public_lookup_gate(&mut self, input: GateId, lut_id: usize) -> GateId {
-        self.new_gate_generic(
-            vec![input],
-            PolyGateType::PubLut { lut_id: GateParamSource::Const(lut_id) },
-        )
-    }
-
-    pub fn public_lookup_gate_param(&mut self, input: GateId, param_id: usize) -> GateId {
-        self.expect_sub_circuit_param_kind(param_id, SubCircuitParamKind::PubLut);
-        self.new_gate_generic(
-            vec![input],
-            PolyGateType::PubLut { lut_id: GateParamSource::Param(param_id) },
-        )
-    }
-
-    pub fn slot_transfer_gate(
+    pub fn public_lookup_gate<I: Into<BatchedWire>>(
         &mut self,
-        input: GateId,
+        input: I,
+        lut_id: usize,
+    ) -> BatchedWire {
+        let input = input.into();
+        debug_assert!(input.is_single_wire());
+        BatchedWire::single(self.new_gate_generic(
+            vec![input.as_single_wire()],
+            PolyGateType::PubLut { lut_id: GateParamSource::Const(lut_id) },
+        ))
+    }
+
+    pub fn public_lookup_gate_param<I: Into<BatchedWire>>(
+        &mut self,
+        input: I,
+        param_id: usize,
+    ) -> BatchedWire {
+        let input = input.into();
+        debug_assert!(input.is_single_wire());
+        self.expect_sub_circuit_param_kind(param_id, SubCircuitParamKind::PubLut);
+        BatchedWire::single(self.new_gate_generic(
+            vec![input.as_single_wire()],
+            PolyGateType::PubLut { lut_id: GateParamSource::Param(param_id) },
+        ))
+    }
+
+    pub fn slot_transfer_gate<I: Into<BatchedWire>>(
+        &mut self,
+        input: I,
         src_slots: &[(u32, Option<u32>)],
-    ) -> GateId {
-        self.new_gate_generic(
-            vec![input],
+    ) -> BatchedWire {
+        let input = input.into();
+        debug_assert!(input.is_single_wire());
+        BatchedWire::single(self.new_gate_generic(
+            vec![input.as_single_wire()],
             PolyGateType::SlotTransfer {
                 src_slots: GateParamSource::Const(SlotTransferSpec::explicit(src_slots.to_vec())),
             },
-        )
+        ))
     }
 
-    pub fn slot_transfer_gate_param(&mut self, input: GateId, param_id: usize) -> GateId {
+    pub fn slot_transfer_gate_param<I: Into<BatchedWire>>(
+        &mut self,
+        input: I,
+        param_id: usize,
+    ) -> BatchedWire {
+        let input = input.into();
+        debug_assert!(input.is_single_wire());
         self.expect_sub_circuit_param_kind(param_id, SubCircuitParamKind::SlotTransfer);
-        self.new_gate_generic(
-            vec![input],
+        BatchedWire::single(self.new_gate_generic(
+            vec![input.as_single_wire()],
             PolyGateType::SlotTransfer { src_slots: GateParamSource::Param(param_id) },
-        )
+        ))
     }
 
     fn new_gate_generic(&mut self, inputs: Vec<GateId>, gate_type: PolyGateType) -> GateId {
@@ -1221,7 +1510,7 @@ impl<P: Poly> PolyCircuit<P> {
                 .expect("summed sub-circuit call missing")
                 .call_input_set_ids
                 .iter()
-                .map(|input_set_id| self.input_set(*input_set_id).len())
+                .map(|input_set_id| batched_wire_slice_len(self.input_set(*input_set_id).as_ref()))
                 .sum(),
             _ => gate.input_gates.len(),
         }
@@ -1232,10 +1521,10 @@ impl<P: Poly> PolyCircuit<P> {
             PolyGateType::SubCircuitOutput { call_id, .. } => {
                 let call = self.sub_circuit_calls.get(call_id).expect("sub-circuit call missing");
                 self.with_sub_circuit_call_inputs(call, |shared_prefix, suffix| {
-                    for &input_id in shared_prefix {
+                    for input_id in iter_batched_wire_gates(shared_prefix) {
                         f(input_id);
                     }
-                    for &input_id in suffix {
+                    for input_id in iter_batched_wire_gates(suffix) {
                         f(input_id);
                     }
                 });
@@ -1246,8 +1535,8 @@ impl<P: Poly> PolyCircuit<P> {
                     .get(summed_call_id)
                     .expect("summed sub-circuit call missing");
                 for input_set_id in &call.call_input_set_ids {
-                    let input_ids = self.input_set(*input_set_id);
-                    for &input_id in input_ids.iter() {
+                    for input_id in iter_batched_wire_gates(self.input_set(*input_set_id).as_ref())
+                    {
                         f(input_id);
                     }
                 }
@@ -1287,7 +1576,7 @@ impl<P: Poly> PolyCircuit<P> {
         }
         let mut max_dependency_level: Option<usize> = None;
         let mut has_input_dependency = false;
-        for &input_id in self.input_set(input_set_id).iter() {
+        for input_id in iter_batched_wire_gates(self.input_set(input_set_id).as_ref()) {
             if let Some(dep_node) = self.error_norm_node_for_gate(input_id) {
                 let dep_level = self.populate_error_norm_node_level(
                     dep_node,
@@ -1366,7 +1655,7 @@ impl<P: Poly> PolyCircuit<P> {
                         update_dep_level(shared_prefix_level);
                     }
                 }
-                for &input_id in &call.input_suffix {
+                for input_id in iter_batched_wire_gates(&call.input_suffix) {
                     if let Some(dep_node) = self.error_norm_node_for_gate(input_id) {
                         let dep_level = self.populate_error_norm_node_level(
                             dep_node,
@@ -1969,12 +2258,15 @@ impl<P: Poly> PolyCircuit<P> {
                         .expect("sub-circuit call prefix overflow");
                     let sub_inputs =
                         self.with_sub_circuit_call_inputs(&call, |shared_prefix, suffix| {
-                            let mut inputs = Vec::with_capacity(shared_prefix.len() + suffix.len());
-                            inputs.extend(shared_prefix.iter().map(|id| {
-                                wires.get(id).expect("wire missing for sub-circuit").clone()
+                            let mut inputs = Vec::with_capacity(
+                                batched_wire_slice_len(shared_prefix) +
+                                    batched_wire_slice_len(suffix),
+                            );
+                            inputs.extend(iter_batched_wire_gates(shared_prefix).map(|id| {
+                                wires.get(&id).expect("wire missing for sub-circuit").clone()
                             }));
-                            inputs.extend(suffix.iter().map(|id| {
-                                wires.get(id).expect("wire missing for sub-circuit").clone()
+                            inputs.extend(iter_batched_wire_gates(suffix).map(|id| {
+                                wires.get(&id).expect("wire missing for sub-circuit").clone()
                             }));
                             inputs
                         });
@@ -2026,9 +2318,12 @@ impl<P: Poly> PolyCircuit<P> {
                             .expect("summed sub-circuit call prefix overflow");
                         let sub_inputs = self
                             .input_set(*input_set_id)
+                            .as_ref()
                             .iter()
+                            .copied()
+                            .flat_map(BatchedWire::gate_ids)
                             .map(|id| {
-                                wires.get(id).expect("wire missing for summed sub-circuit").clone()
+                                wires.get(&id).expect("wire missing for summed sub-circuit").clone()
                             })
                             .collect::<Vec<_>>();
                         let sub_outputs =
@@ -2435,17 +2730,25 @@ impl<P: Poly> PolyCircuit<P> {
         circuit_id
     }
 
-    pub fn call_sub_circuit(&mut self, circuit_id: usize, inputs: &[GateId]) -> Vec<GateId> {
+    pub fn call_sub_circuit<I, W>(&mut self, circuit_id: usize, inputs: I) -> Vec<BatchedWire>
+    where
+        I: IntoIterator<Item = W>,
+        W: Into<BatchedWire>,
+    {
         self.call_sub_circuit_with_bindings(circuit_id, inputs, &[])
     }
 
-    pub fn call_sub_circuit_with_shared_input_prefix_and_bindings(
+    pub fn call_sub_circuit_with_shared_input_prefix_and_bindings<I, W>(
         &mut self,
         circuit_id: usize,
         shared_input_prefix_set_id: usize,
-        input_suffix: &[GateId],
+        input_suffix: I,
         param_bindings: &[SubCircuitParamValue],
-    ) -> Vec<GateId> {
+    ) -> Vec<BatchedWire>
+    where
+        I: IntoIterator<Item = W>,
+        W: Into<BatchedWire>,
+    {
         self.call_sub_circuit_with_prefix_and_bindings(
             circuit_id,
             Some(shared_input_prefix_set_id),
@@ -2454,26 +2757,35 @@ impl<P: Poly> PolyCircuit<P> {
         )
     }
 
-    pub fn call_sub_circuit_with_bindings(
+    pub fn call_sub_circuit_with_bindings<I, W>(
         &mut self,
         circuit_id: usize,
-        inputs: &[GateId],
+        inputs: I,
         param_bindings: &[SubCircuitParamValue],
-    ) -> Vec<GateId> {
+    ) -> Vec<BatchedWire>
+    where
+        I: IntoIterator<Item = W>,
+        W: Into<BatchedWire>,
+    {
         self.call_sub_circuit_with_prefix_and_bindings(circuit_id, None, inputs, param_bindings)
     }
 
-    fn call_sub_circuit_with_prefix_and_bindings(
+    fn call_sub_circuit_with_prefix_and_bindings<I, W>(
         &mut self,
         circuit_id: usize,
         shared_input_prefix_set_id: Option<usize>,
-        input_suffix: &[GateId],
+        input_suffix: I,
         param_bindings: &[SubCircuitParamValue],
-    ) -> Vec<GateId> {
+    ) -> Vec<BatchedWire>
+    where
+        I: IntoIterator<Item = W>,
+        W: Into<BatchedWire>,
+    {
+        let input_suffix = input_suffix.into_iter().map(Into::into).collect::<Vec<_>>();
         let total_num_inputs = shared_input_prefix_set_id
-            .map(|input_set_id| self.input_set(input_set_id).len())
+            .map(|input_set_id| batched_wire_slice_len(self.input_set(input_set_id).as_ref()))
             .unwrap_or(0) +
-            input_suffix.len();
+            batched_wire_slice_len(&input_suffix);
         #[cfg(debug_assertions)]
         {
             let stored = self.sub_circuits.get(&circuit_id).expect("sub-circuit not found");
@@ -2500,21 +2812,25 @@ impl<P: Poly> PolyCircuit<P> {
         let binding_set_id = self.binding_registry.register(param_bindings);
         let scoped_call_id = self.next_scoped_call_id;
         self.next_scoped_call_id += 1;
-        let mut outputs = Vec::with_capacity(num_outputs);
+        let mut output_gate_ids = Vec::with_capacity(num_outputs);
         for output_idx in 0..num_outputs {
-            outputs.push(self.new_sub_circuit_output_gate(call_id, output_idx, total_num_inputs));
+            output_gate_ids.push(self.new_sub_circuit_output_gate(
+                call_id,
+                output_idx,
+                total_num_inputs,
+            ));
         }
         let call = SubCircuitCall {
             sub_circuit_id: circuit_id,
             shared_input_prefix_set_id,
-            input_suffix: input_suffix.to_vec(),
+            input_suffix,
             binding_set_id,
             scoped_call_id,
-            output_gate_ids: outputs.clone(),
+            output_gate_ids: output_gate_ids.clone(),
             num_outputs,
         };
         self.sub_circuit_calls.insert(call_id, call);
-        outputs
+        output_gate_ids.into_iter().map(BatchedWire::single).collect()
     }
 
     pub fn call_sub_circuit_sum_many_with_binding_set_ids(
@@ -2522,7 +2838,7 @@ impl<P: Poly> PolyCircuit<P> {
         circuit_id: usize,
         call_input_set_ids: Vec<usize>,
         call_binding_set_ids: Vec<usize>,
-    ) -> Vec<GateId> {
+    ) -> Vec<BatchedWire> {
         assert!(
             !call_input_set_ids.is_empty(),
             "summed sub-circuit call requires at least one inner call"
@@ -2543,7 +2859,7 @@ impl<P: Poly> PolyCircuit<P> {
             {
                 let inputs = self.input_set(*input_set_id);
                 assert_eq!(
-                    inputs.len(),
+                    batched_wire_slice_len(inputs.as_ref()),
                     num_inputs,
                     "summed sub-circuit input count mismatch at inner call {call_idx}"
                 );
@@ -2573,8 +2889,10 @@ impl<P: Poly> PolyCircuit<P> {
                 scoped_call_id
             })
             .collect::<Vec<_>>();
-        let flattened_num_inputs =
-            call_input_set_ids.iter().map(|input_set_id| self.input_set(*input_set_id).len()).sum();
+        let flattened_num_inputs = call_input_set_ids
+            .iter()
+            .map(|input_set_id| batched_wire_slice_len(self.input_set(*input_set_id).as_ref()))
+            .sum();
         let output_gate_ids = (0..num_outputs)
             .map(|output_idx| {
                 self.new_summed_sub_circuit_output_gate(
@@ -2595,7 +2913,7 @@ impl<P: Poly> PolyCircuit<P> {
                 num_outputs,
             },
         );
-        output_gate_ids
+        output_gate_ids.into_iter().map(BatchedWire::single).collect()
     }
 }
 
@@ -2640,7 +2958,7 @@ mod tests {
 
         // Create a circuit with an Add operation
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(2);
+        let inputs = circuit.input(2).to_vec();
         let add_gate = circuit.add_gate(inputs[0], inputs[1]);
         circuit.output(vec![add_gate]);
 
@@ -2671,7 +2989,7 @@ mod tests {
 
         // Create a circuit with a Sub operation
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(2);
+        let inputs = circuit.input(2).to_vec();
         let sub_gate = circuit.sub_gate(inputs[0], inputs[1]);
         circuit.output(vec![sub_gate]);
 
@@ -2702,7 +3020,7 @@ mod tests {
 
         // Create a circuit with a Mul operation
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(2);
+        let inputs = circuit.input(2).to_vec();
         let mul_gate = circuit.mul_gate(inputs[0], inputs[1]);
         circuit.output(vec![mul_gate]);
 
@@ -2728,7 +3046,7 @@ mod tests {
         let input = create_random_poly(&params);
 
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(1);
+        let inputs = circuit.input(1).to_vec();
         let rotated = circuit.rotate_gate(inputs[0], 3);
         circuit.output(vec![rotated]);
 
@@ -2814,7 +3132,7 @@ mod tests {
 
         // Create a complex circuit: (poly1 + poly2) - poly3
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(3);
+        let inputs = circuit.input(3).to_vec();
 
         // poly1 + poly2
         let add_gate = circuit.add_gate(inputs[0], inputs[1]);
@@ -2851,7 +3169,7 @@ mod tests {
 
         // Create a circuit with multiple outputs
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(2);
+        let inputs = circuit.input(2).to_vec();
 
         // poly1 + poly2
         let add_gate = circuit.add_gate(inputs[0], inputs[1]);
@@ -2897,7 +3215,7 @@ mod tests {
         let mut circuit = PolyCircuit::new();
 
         // First input call: creates GateId(1) as input
-        let inputs_first = circuit.input(1);
+        let inputs_first = circuit.input(1).to_vec();
         assert_eq!(inputs_first.len(), 1);
 
         // Insert a gate between input calls so next input gate is non-consecutive
@@ -2905,7 +3223,7 @@ mod tests {
         circuit.const_digits(&[1u32, 0u32, 1u32]);
 
         // Second input call: creates a new input gate with a higher, non-consecutive GateId
-        let inputs_second = circuit.input(1);
+        let inputs_second = circuit.input(1).to_vec();
         assert_eq!(inputs_second.len(), 1);
 
         // Ensure non-consecutive input GateIds (there should be a gap)
@@ -2947,7 +3265,7 @@ mod tests {
         // Level 4: f = e * e
         // Output: f
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(4);
+        let inputs = circuit.input(4).to_vec();
 
         // Level 1
         let a = circuit.add_gate(inputs[0], inputs[1]); // poly1 + poly2
@@ -2987,7 +3305,7 @@ mod tests {
     fn test_boolean_gate_and() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(2);
+        let inputs = circuit.input(2).to_vec();
         let and_result = circuit.and_gate(inputs[0], inputs[1]);
         circuit.output(vec![and_result]);
         let poly1 = create_bit_random_poly(&params);
@@ -3007,7 +3325,7 @@ mod tests {
     fn test_boolean_gate_not() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(1);
+        let inputs = circuit.input(1).to_vec();
         let not_result = circuit.not_gate(inputs[0]);
         circuit.output(vec![not_result]);
         let poly1 = create_bit_random_poly(&params);
@@ -3026,7 +3344,7 @@ mod tests {
     fn test_boolean_gate_or() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(2);
+        let inputs = circuit.input(2).to_vec();
         let or_result = circuit.or_gate(inputs[0], inputs[1]);
         circuit.output(vec![or_result]);
         let poly1 = create_bit_random_poly(&params);
@@ -3046,7 +3364,7 @@ mod tests {
     fn test_boolean_gate_nand() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(2);
+        let inputs = circuit.input(2).to_vec();
         let nand_result = circuit.nand_gate(inputs[0], inputs[1]);
         circuit.output(vec![nand_result]);
         let poly1 = create_bit_random_poly(&params);
@@ -3066,7 +3384,7 @@ mod tests {
     fn test_boolean_gate_nor() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(2);
+        let inputs = circuit.input(2).to_vec();
         let nor_result = circuit.nor_gate(inputs[0], inputs[1]); // poly1 AND poly2
         circuit.output(vec![nor_result]);
         let poly1 = create_bit_random_poly(&params);
@@ -3087,7 +3405,7 @@ mod tests {
     fn test_boolean_gate_xor() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(2);
+        let inputs = circuit.input(2).to_vec();
         let nor_result = circuit.xor_gate(inputs[0], inputs[1]);
         circuit.output(vec![nor_result]);
         let poly1 = create_bit_random_poly(&params);
@@ -3108,7 +3426,7 @@ mod tests {
     fn test_boolean_gate_xnor() {
         let params = DCRTPolyParams::default();
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(2);
+        let inputs = circuit.input(2).to_vec();
         let xnor_result = circuit.xnor_gate(inputs[0], inputs[1]);
         circuit.output(vec![xnor_result]);
         let poly1 = create_bit_random_poly(&params);
@@ -3154,13 +3472,13 @@ mod tests {
 
         let x = DCRTPoly::const_one(&params);
 
-        let inputs = circuit.input(a_bits.len() + b_bits.len() + 1);
+        let inputs = circuit.input(a_bits.len() + b_bits.len() + 1).to_vec();
         assert_eq!(inputs.len(), params.modulus_bits() * 2 + 1);
 
         // Input: ct[bits], x
         // Output: ct[bits] * x
         let x_id = inputs[inputs.len() - 1];
-        let output_ids = inputs
+        let output_ids: Vec<_> = inputs
             .iter()
             .take(inputs.len() - 1)
             .map(|&input_id| circuit.mul_gate(input_id, x_id))
@@ -3201,7 +3519,7 @@ mod tests {
 
         // Create a sub-circuit that performs addition and multiplication
         let mut sub_circuit = PolyCircuit::new();
-        let sub_inputs = sub_circuit.input(2);
+        let sub_inputs = sub_circuit.input(2).to_vec();
 
         // Add operation: poly1 + poly2
         let add_gate = sub_circuit.add_gate(sub_inputs[0], sub_inputs[1]);
@@ -3214,7 +3532,7 @@ mod tests {
 
         // Create the main circuit
         let mut main_circuit = PolyCircuit::new();
-        let main_inputs = main_circuit.input(2);
+        let main_inputs = main_circuit.input(2).to_vec();
 
         // Register the sub-circuit and get its ID
         let sub_circuit_id = main_circuit.register_sub_circuit(sub_circuit);
@@ -3250,6 +3568,44 @@ mod tests {
     }
 
     #[test]
+    fn test_batched_wire_range_helpers() {
+        let batch = BatchedWire::from_start_len(GateId(5), 4);
+        let (left, right) = batch.split_at(2);
+
+        assert_eq!(left, BatchedWire::new(GateId(5), GateId(7)));
+        assert_eq!(right, BatchedWire::new(GateId(7), GateId(9)));
+        assert_eq!(left.at(1), BatchedWire::single(GateId(6)));
+        assert_eq!(batch.slice(1..3), BatchedWire::new(GateId(6), GateId(8)));
+        assert_eq!(BatchedWire::from_batches([left, right]), batch);
+    }
+
+    #[test]
+    fn test_sub_circuit_call_info_preserves_batched_input_ranges() {
+        let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
+        let sub_inputs = sub_circuit.input(3);
+        sub_circuit.output([sub_inputs]);
+
+        let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
+        let main_inputs = main_circuit.input(4);
+        let (shared_prefix, remainder) = main_inputs.split_at(2);
+        let suffix = remainder.at(0);
+        let prefix_set_id = main_circuit.intern_input_set([shared_prefix]);
+        let sub_id = main_circuit.register_sub_circuit(sub_circuit);
+        let outputs = main_circuit.call_sub_circuit_with_shared_input_prefix_and_bindings(
+            sub_id,
+            prefix_set_id,
+            [suffix],
+            &[],
+        );
+        main_circuit.output(outputs);
+
+        let call = main_circuit.sub_circuit_call_info(0);
+        assert_eq!(call.inputs, vec![shared_prefix, suffix]);
+        assert_eq!(main_circuit.input_set(prefix_set_id).as_ref(), &[shared_prefix]);
+        assert_eq!(main_circuit.non_free_depth(), 0);
+    }
+
+    #[test]
     fn test_register_and_call_parameterized_sub_circuit() {
         let params = DCRTPolyParams::default();
         let input_poly = create_random_poly(&params);
@@ -3257,12 +3613,12 @@ mod tests {
         let mut sub_circuit = PolyCircuit::new();
         let scalar_param =
             sub_circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul);
-        let sub_inputs = sub_circuit.input(1);
+        let sub_inputs = sub_circuit.input(1).to_vec();
         let scaled = sub_circuit.small_scalar_mul_param(sub_inputs[0], scalar_param);
         sub_circuit.output(vec![scaled]);
 
         let mut main_circuit = PolyCircuit::new();
-        let main_inputs = main_circuit.input(1);
+        let main_inputs = main_circuit.input(1).to_vec();
         let sub_id = main_circuit.register_sub_circuit(sub_circuit);
         let doubled = main_circuit.call_sub_circuit_with_bindings(
             sub_id,
@@ -3293,12 +3649,12 @@ mod tests {
         let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
         let scalar_param =
             sub_circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul);
-        let sub_inputs = sub_circuit.input(1);
+        let sub_inputs = sub_circuit.input(1).to_vec();
         let scaled = sub_circuit.small_scalar_mul_param(sub_inputs[0], scalar_param);
         sub_circuit.output(vec![scaled]);
 
         let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
-        let main_inputs = main_circuit.input(1);
+        let main_inputs = main_circuit.input(1).to_vec();
         let sub_id = main_circuit.register_sub_circuit(sub_circuit);
 
         let _ = main_circuit.call_sub_circuit_with_bindings(
@@ -3333,12 +3689,12 @@ mod tests {
         let mut leaf_circuit = PolyCircuit::<DCRTPoly>::new();
         let scalar_param =
             leaf_circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul);
-        let leaf_inputs = leaf_circuit.input(1);
+        let leaf_inputs = leaf_circuit.input(1).to_vec();
         let scaled = leaf_circuit.small_scalar_mul_param(leaf_inputs[0], scalar_param);
         leaf_circuit.output(vec![scaled]);
 
         let mut middle_circuit = PolyCircuit::<DCRTPoly>::new();
-        let middle_inputs = middle_circuit.input(1);
+        let middle_inputs = middle_circuit.input(1).to_vec();
         let leaf_id = middle_circuit.register_sub_circuit(leaf_circuit);
         let _ = middle_circuit.call_sub_circuit_with_bindings(
             leaf_id,
@@ -3353,7 +3709,7 @@ mod tests {
         assert_eq!(middle_circuit.binding_registry.binding_sets.len(), 1);
 
         let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
-        let main_inputs = main_circuit.input(1);
+        let main_inputs = main_circuit.input(1).to_vec();
         let middle_id = main_circuit.register_sub_circuit(middle_circuit);
         let _ = main_circuit.call_sub_circuit(middle_id, &[main_inputs[0]]);
 
@@ -3371,12 +3727,12 @@ mod tests {
         let mut sub_circuit = PolyCircuit::new();
         let scalar_param =
             sub_circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul);
-        let sub_inputs = sub_circuit.input(1);
+        let sub_inputs = sub_circuit.input(1).to_vec();
         let scaled = sub_circuit.small_scalar_mul_param(sub_inputs[0], scalar_param);
         sub_circuit.output(vec![scaled]);
 
         let mut main_circuit = PolyCircuit::new();
-        let main_inputs = main_circuit.input(1);
+        let main_inputs = main_circuit.input(1).to_vec();
         let sub_id = main_circuit.register_sub_circuit(sub_circuit);
         let double_id =
             main_circuit.intern_binding_set(&[SubCircuitParamValue::SmallScalarMul(vec![2])]);
@@ -3407,16 +3763,17 @@ mod tests {
     #[test]
     fn test_summed_sub_circuit_non_free_depth_uses_max_inner_call_depth() {
         let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
-        let sub_inputs = sub_circuit.input(2);
+        let sub_inputs = sub_circuit.input(2).to_vec();
         let product = sub_circuit.mul_gate(sub_inputs[0], sub_inputs[1]);
         sub_circuit.output(vec![product]);
 
         let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
-        let inputs = main_circuit.input(3);
+        let inputs = main_circuit.input(3).to_vec();
         let precomputed = main_circuit.mul_gate(inputs[0], inputs[1]);
         let sub_id = main_circuit.register_sub_circuit(sub_circuit);
         let direct_input_set_id = main_circuit.intern_input_set(&[inputs[0], inputs[2]]);
-        let precomputed_input_set_id = main_circuit.intern_input_set(&[precomputed, inputs[2]]);
+        let precomputed_input_set_id =
+            main_circuit.intern_input_set(&[precomputed, inputs[2].into()]);
         let outputs = main_circuit.call_sub_circuit_sum_many_with_binding_set_ids(
             sub_id,
             vec![direct_input_set_id, precomputed_input_set_id],
@@ -3436,12 +3793,12 @@ mod tests {
         let poly3 = create_random_poly(&params);
 
         let mut inner_circuit = PolyCircuit::new();
-        let inner_inputs = inner_circuit.input(2);
+        let inner_inputs = inner_circuit.input(2).to_vec();
         let mul_gate = inner_circuit.mul_gate(inner_inputs[0], inner_inputs[1]);
         inner_circuit.output(vec![mul_gate]);
 
         let mut middle_circuit = PolyCircuit::new();
-        let middle_inputs = middle_circuit.input(3);
+        let middle_inputs = middle_circuit.input(3).to_vec();
         let inner_circuit_id = middle_circuit.register_sub_circuit(inner_circuit);
         let inner_outputs = middle_circuit
             .call_sub_circuit(inner_circuit_id, &[middle_inputs[0], middle_inputs[1]]);
@@ -3450,7 +3807,7 @@ mod tests {
 
         let mut main_circuit = PolyCircuit::new();
         main_circuit.enable_subcircuits_in_disk("unused");
-        let main_inputs = main_circuit.input(3);
+        let main_inputs = main_circuit.input(3).to_vec();
         let middle_circuit_id = main_circuit.register_sub_circuit(middle_circuit);
         let middle_outputs = main_circuit
             .call_sub_circuit(middle_circuit_id, &[main_inputs[0], main_inputs[1], main_inputs[2]]);
@@ -3489,13 +3846,13 @@ mod tests {
         let poly2 = create_random_poly(&params);
 
         let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
-        let sub_inputs = sub_circuit.input(2);
+        let sub_inputs = sub_circuit.input(2).to_vec();
         let add_gate = sub_circuit.add_gate(sub_inputs[0], sub_inputs[1]);
         sub_circuit.output(vec![add_gate]);
 
         let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
         main_circuit.enable_subcircuits_in_disk("unused");
-        let main_inputs = main_circuit.input(2);
+        let main_inputs = main_circuit.input(2).to_vec();
         let sub_circuit_id = main_circuit.register_sub_circuit(sub_circuit);
         let outputs =
             main_circuit.call_sub_circuit(sub_circuit_id, &[main_inputs[0], main_inputs[1]]);
@@ -3529,13 +3886,13 @@ mod tests {
 
         // Create the innermost sub-circuit that performs multiplication
         let mut inner_circuit = PolyCircuit::new();
-        let inner_inputs = inner_circuit.input(2);
+        let inner_inputs = inner_circuit.input(2).to_vec();
         let mul_gate = inner_circuit.mul_gate(inner_inputs[0], inner_inputs[1]);
         inner_circuit.output(vec![mul_gate]);
 
         // Create a middle sub-circuit that uses the inner sub-circuit
         let mut middle_circuit = PolyCircuit::new();
-        let middle_inputs = middle_circuit.input(3);
+        let middle_inputs = middle_circuit.input(3).to_vec();
 
         // Register the inner circuit
         let inner_circuit_id = middle_circuit.register_sub_circuit(inner_circuit);
@@ -3550,7 +3907,7 @@ mod tests {
 
         // Create the main circuit
         let mut main_circuit = PolyCircuit::new();
-        let main_inputs = main_circuit.input(3);
+        let main_inputs = main_circuit.input(3).to_vec();
 
         // Register the middle circuit
         let middle_circuit_id = main_circuit.register_sub_circuit(middle_circuit);
@@ -3660,7 +4017,7 @@ mod tests {
     #[test]
     fn test_depth_zero_with_direct_input_output() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let inputs = circuit.input(1);
+        let inputs = circuit.input(1).to_vec();
         circuit.output(vec![inputs[0]]);
         assert_eq!(circuit.depth(), 0);
     }
@@ -3668,7 +4025,7 @@ mod tests {
     #[test]
     fn test_depth_one_with_add() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let inputs = circuit.input(2);
+        let inputs = circuit.input(2).to_vec();
         let add = circuit.add_gate(inputs[0], inputs[1]);
         circuit.output(vec![add]);
         assert_eq!(circuit.depth(), 1);
@@ -3677,7 +4034,7 @@ mod tests {
     #[test]
     fn test_depth_two_with_chain() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let inputs = circuit.input(3);
+        let inputs = circuit.input(3).to_vec();
         let add = circuit.add_gate(inputs[0], inputs[1]);
         let mul = circuit.mul_gate(add, inputs[2]);
         circuit.output(vec![mul]);
@@ -3687,13 +4044,13 @@ mod tests {
     #[test]
     fn test_non_free_depth_counts_sub_circuit() {
         let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
-        let sub_inputs = sub_circuit.input(1);
+        let sub_inputs = sub_circuit.input(1).to_vec();
         let mul1 = sub_circuit.mul_gate(sub_inputs[0], sub_inputs[0]);
         let mul2 = sub_circuit.mul_gate(mul1, sub_inputs[0]);
         sub_circuit.output(vec![mul2]);
 
         let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
-        let main_inputs = main_circuit.input(1);
+        let main_inputs = main_circuit.input(1).to_vec();
         let sub_id = main_circuit.register_sub_circuit(sub_circuit);
         let sub_outputs = main_circuit.call_sub_circuit(sub_id, &[main_inputs[0]]);
         main_circuit.output(vec![sub_outputs[0]]);
@@ -3704,16 +4061,16 @@ mod tests {
     #[test]
     fn test_non_free_depth_respects_sub_circuit_inputs() {
         let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
-        let sub_inputs = sub_circuit.input(2);
+        let sub_inputs = sub_circuit.input(2).to_vec();
         sub_circuit.output(vec![sub_inputs[0]]);
 
         let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
-        let main_inputs = main_circuit.input(3);
+        let main_inputs = main_circuit.input(3).to_vec();
         let mul1 = main_circuit.mul_gate(main_inputs[1], main_inputs[2]);
         let mul2 = main_circuit.mul_gate(mul1, main_inputs[1]);
 
         let sub_id = main_circuit.register_sub_circuit(sub_circuit);
-        let sub_outputs = main_circuit.call_sub_circuit(sub_id, &[main_inputs[0], mul2]);
+        let sub_outputs = main_circuit.call_sub_circuit(sub_id, &[main_inputs[0].into(), mul2]);
         main_circuit.output(vec![sub_outputs[0]]);
 
         assert_eq!(main_circuit.non_free_depth(), 0);
@@ -3722,7 +4079,7 @@ mod tests {
     #[test]
     fn test_non_free_depth_counts_slot_transfer_as_non_free() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let inputs = circuit.input(1);
+        let inputs = circuit.input(1).to_vec();
         let transferred = circuit.slot_transfer_gate(inputs[0], &[(0, None)]);
         circuit.output(vec![transferred]);
 
@@ -3732,7 +4089,7 @@ mod tests {
     #[test]
     fn test_non_free_depth_ignores_add_chains() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let inputs = circuit.input(4);
+        let inputs = circuit.input(4).to_vec();
         let add1 = circuit.add_gate(inputs[0], inputs[1]);
         let add2 = circuit.add_gate(add1, inputs[2]);
         let mul = circuit.mul_gate(add2, inputs[3]);
@@ -3744,13 +4101,13 @@ mod tests {
     #[test]
     fn test_non_free_depth_handles_multi_output_sub_circuit_call() {
         let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
-        let sub_inputs = sub_circuit.input(1);
+        let sub_inputs = sub_circuit.input(1).to_vec();
         let add = sub_circuit.add_gate(sub_inputs[0], sub_inputs[0]);
         let mul = sub_circuit.mul_gate(sub_inputs[0], sub_inputs[0]);
         sub_circuit.output(vec![add, mul]);
 
         let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
-        let main_inputs = main_circuit.input(1);
+        let main_inputs = main_circuit.input(1).to_vec();
         let sub_id = main_circuit.register_sub_circuit(sub_circuit);
         let sub_outputs = main_circuit.call_sub_circuit(sub_id, &[main_inputs[0]]);
         let sum = main_circuit.add_gate(sub_outputs[0], sub_outputs[1]);
@@ -3762,17 +4119,18 @@ mod tests {
     #[test]
     fn test_non_free_depth_handles_repeated_sub_circuit_calls_with_different_input_levels() {
         let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
-        let sub_inputs = sub_circuit.input(2);
+        let sub_inputs = sub_circuit.input(2).to_vec();
         let mul = sub_circuit.mul_gate(sub_inputs[0], sub_inputs[1]);
         sub_circuit.output(vec![mul]);
 
         let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
-        let main_inputs = main_circuit.input(3);
+        let main_inputs = main_circuit.input(3).to_vec();
         let precomputed = main_circuit.mul_gate(main_inputs[0], main_inputs[1]);
 
         let sub_id = main_circuit.register_sub_circuit(sub_circuit);
         let direct_call = main_circuit.call_sub_circuit(sub_id, &[main_inputs[0], main_inputs[2]]);
-        let nested_call = main_circuit.call_sub_circuit(sub_id, &[precomputed, main_inputs[2]]);
+        let nested_call =
+            main_circuit.call_sub_circuit(sub_id, &[precomputed, main_inputs[2].into()]);
         let output = main_circuit.add_gate(direct_call[0], nested_call[0]);
         main_circuit.output(vec![output]);
 
@@ -3782,17 +4140,17 @@ mod tests {
     #[test]
     fn test_non_free_depth_batches_multiple_ready_sub_circuit_calls() {
         let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
-        let sub_inputs = sub_circuit.input(2);
+        let sub_inputs = sub_circuit.input(2).to_vec();
         let mul = sub_circuit.mul_gate(sub_inputs[0], sub_inputs[1]);
         sub_circuit.output(vec![mul]);
 
         let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
-        let main_inputs = main_circuit.input(4);
+        let main_inputs = main_circuit.input(4).to_vec();
         let precomputed = main_circuit.mul_gate(main_inputs[0], main_inputs[1]);
 
         let sub_id = main_circuit.register_sub_circuit(sub_circuit);
-        let call1 = main_circuit.call_sub_circuit(sub_id, &[precomputed, main_inputs[2]]);
-        let call2 = main_circuit.call_sub_circuit(sub_id, &[precomputed, main_inputs[3]]);
+        let call1 = main_circuit.call_sub_circuit(sub_id, &[precomputed, main_inputs[2].into()]);
+        let call2 = main_circuit.call_sub_circuit(sub_id, &[precomputed, main_inputs[3].into()]);
         let output = main_circuit.add_gate(call1[0], call2[0]);
         main_circuit.output(vec![output]);
 

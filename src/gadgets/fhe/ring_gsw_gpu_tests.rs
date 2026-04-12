@@ -138,7 +138,7 @@ fn test_ring_gsw_add_circuit_decrypts_to_expected_integer_sum_with_noisy_public_
         estimated_error,
         threshold
     );
-    let wire_secret_key = circuit.input(1)[0];
+    let wire_secret_key = circuit.input(1).at(0).as_single_wire();
     let decrypted_sum = sum.decrypt::<GpuDCRTPolyMatrix>(
         wire_secret_key,
         BigUint::from(plaintext_modulus),
@@ -254,7 +254,7 @@ fn test_ring_gsw_sub_circuit_decrypts_to_expected_integer_difference_with_noisy_
         estimated_error,
         threshold
     );
-    let wire_secret_key = circuit.input(1)[0];
+    let wire_secret_key = circuit.input(1).at(0).as_single_wire();
     let decrypted_difference = difference.decrypt::<GpuDCRTPolyMatrix>(
         wire_secret_key,
         BigUint::from(plaintext_modulus),
@@ -371,7 +371,7 @@ fn test_ring_gsw_mul_circuit_decrypts_to_expected_integer_product_with_noisy_pub
         estimated_error,
         threshold
     );
-    let wire_secret_key = circuit.input(1)[0];
+    let wire_secret_key = circuit.input(1).at(0).as_single_wire();
     let decrypted_product = product.decrypt::<GpuDCRTPolyMatrix>(
         wire_secret_key,
         BigUint::from(plaintext_modulus),
@@ -489,7 +489,7 @@ fn test_ring_gsw_chained_mul_circuit_decrypts_to_expected_integer_product_with_n
         estimated_error,
         threshold
     );
-    let wire_secret_key = circuit.input(1)[0];
+    let wire_secret_key = circuit.input(1).at(0).as_single_wire();
     let decrypted_product = chained_product.decrypt::<GpuDCRTPolyMatrix>(
         wire_secret_key,
         BigUint::from(plaintext_modulus),

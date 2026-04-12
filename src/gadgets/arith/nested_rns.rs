@@ -712,6 +712,93 @@ impl NestedRnsPolyContext {
         }
     }
 
+    pub(crate) fn register_shared_subcircuits_in<P: Poly + 'static>(
+        &self,
+        source_circuit: &PolyCircuit<P>,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        circuit.inherit_registries_from_parent(source_circuit);
+        let p_moduli = self.p_moduli.clone();
+        let p_moduli_depth = p_moduli.len();
+        let q_moduli_depth = self.q_moduli_depth;
+        let mut scalars_y = vec![vec![vec![0; p_moduli_depth]; p_moduli_depth]; q_moduli_depth];
+        let mut scalars_v = vec![vec![0; p_moduli_depth]; q_moduli_depth];
+
+        for (p_i_idx, &p_i) in p_moduli.iter().enumerate() {
+            for (q_idx, &q_k) in self.q_moduli.iter().take(q_moduli_depth).enumerate() {
+                for (p_j_idx, p_over_pj) in self.p_over_pis.iter().enumerate() {
+                    let p_over_pj_mod_qk = (p_over_pj % BigUint::from(q_k))
+                        .to_u64()
+                        .expect("CRT residue must fit in u64");
+                    let p_over_pj_mod_qk_mod_pi = p_over_pj_mod_qk % p_i;
+                    scalars_y[q_idx][p_i_idx][p_j_idx] = p_over_pj_mod_qk_mod_pi as u32;
+                }
+                let p_mod_qk = (&self.p_full % BigUint::from(q_k))
+                    .to_u64()
+                    .expect("CRT residue must fit in u64");
+                let p_mod_qk_mod_pi = p_mod_qk % p_i;
+                scalars_v[q_idx][p_i_idx] = p_mod_qk_mod_pi as u32;
+            }
+        }
+
+        let add_without_reduce_id = circuit.register_shared_sub_circuit(
+            source_circuit.registered_sub_circuit_ref(self.add_without_reduce_id),
+        );
+        let sub_with_trace_offsets_id = circuit.register_shared_sub_circuit(
+            source_circuit.registered_sub_circuit_ref(self.sub_with_trace_offsets_id),
+        );
+        let mul_lazy_reduce_id = circuit.register_shared_sub_circuit(
+            source_circuit.registered_sub_circuit_ref(self.mul_lazy_reduce_id),
+        );
+        let mul_right_sparse_id = circuit.register_shared_sub_circuit(
+            source_circuit.registered_sub_circuit_ref(self.mul_right_sparse_id),
+        );
+        let lazy_reduce_id = circuit.register_shared_sub_circuit(
+            source_circuit.registered_sub_circuit_ref(self.lazy_reduce_id),
+        );
+        let decomposition_terms_id = circuit.register_shared_sub_circuit(
+            source_circuit.registered_sub_circuit_ref(self.decomposition_terms_id),
+        );
+        let gadget_decompose_id = circuit.register_shared_sub_circuit(
+            source_circuit.registered_sub_circuit_ref(self.gadget_decompose_id),
+        );
+        let full_reduce_id = circuit.register_shared_sub_circuit(
+            source_circuit.registered_sub_circuit_ref(self.full_reduce_id),
+        );
+        let full_reduce_bindings = (0..q_moduli_depth)
+            .into_par_iter()
+            .map(|q_idx| full_reduce_param_bindings(&scalars_y[q_idx], &scalars_v[q_idx]))
+            .collect::<Vec<_>>();
+
+        Self {
+            p_moduli_bits: self.p_moduli_bits,
+            max_unreduced_muls: self.max_unreduced_muls,
+            scale: self.scale,
+            p_moduli,
+            q_moduli: self.q_moduli.clone(),
+            q_moduli_depth,
+            p_max: self.p_max,
+            lut_mod_p_max_map_size: self.lut_mod_p_max_map_size.clone(),
+            p_full: self.p_full.clone(),
+            p_over_pis: self.p_over_pis.clone(),
+            gadget_values: self.gadget_values.clone(),
+            full_reduce_max_plaintexts: self.full_reduce_max_plaintexts.clone(),
+            lut_mod_p_ids: self.lut_mod_p_ids.clone(),
+            lut_x_to_y_ids: self.lut_x_to_y_ids.clone(),
+            lut_x_to_real_ids: self.lut_x_to_real_ids.clone(),
+            lut_real_to_v_id: self.lut_real_to_v_id,
+            add_without_reduce_id,
+            sub_with_trace_offsets_id,
+            lazy_reduce_id,
+            decomposition_terms_id,
+            gadget_decompose_id,
+            full_reduce_id,
+            full_reduce_bindings,
+            mul_lazy_reduce_id,
+            mul_right_sparse_id,
+        }
+    }
+
     pub(crate) fn reduce_q_level_row<P: Poly>(
         &self,
         row: &[GateId],
@@ -2862,7 +2949,7 @@ mod tests {
         enable_levels: Option<usize>,
         level_offset: Option<usize>,
     ) -> usize {
-        let _input = NestedRnsPoly::input(ctx.clone(), enable_levels, level_offset, circuit);
+        NestedRnsPoly::input(ctx.clone(), enable_levels, level_offset, circuit);
         let gadget =
             NestedRnsPoly::<DCRTPoly>::gadget_vector(ctx, enable_levels, level_offset, circuit);
         let output_gates =

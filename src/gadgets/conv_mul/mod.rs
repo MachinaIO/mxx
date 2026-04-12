@@ -238,6 +238,57 @@ pub(crate) fn negacyclic_conv_mul_right_decomposed_term_many_subcircuit<P: Poly 
     circuit
 }
 
+pub(crate) fn negacyclic_conv_mul_right_decomposed_term_many_shared_subcircuit<
+    P: Poly + 'static,
+>(
+    source_circuit: &PolyCircuit<P>,
+    template_ctx: &NestedRnsPolyContext,
+    row_count: usize,
+    num_slots: usize,
+) -> PolyCircuit<P> {
+    assert!(
+        row_count > 0,
+        "negacyclic_conv_mul_right_decomposed_term_many_shared_subcircuit requires at least one left row"
+    );
+
+    let mut circuit = PolyCircuit::<P>::new();
+    let ctx = Arc::new(template_ctx.register_shared_subcircuits_in(source_circuit, &mut circuit));
+    let p_moduli_depth = ctx.p_moduli.len();
+    let diagonal_product_id =
+        circuit.register_sub_circuit(q_level_diagonal_product_subcircuit::<P>(ctx.as_ref()));
+    let left_rows = (0..row_count).map(|_| circuit.input(p_moduli_depth)).collect::<Vec<_>>();
+    let term_row = circuit.input(p_moduli_depth);
+    let diagonal_binding_set_ids = {
+        let circuit_ref: &PolyCircuit<P> = &circuit;
+        (0..num_slots)
+            .into_par_iter()
+            .map(|diagonal| {
+                let bindings =
+                    q_level_diagonal_product_param_bindings(ctx.as_ref(), diagonal, num_slots);
+                circuit_ref.intern_binding_set(&bindings)
+            })
+            .collect::<Vec<_>>()
+    };
+    let summed_rows = left_rows
+        .iter()
+        .map(|left_row| {
+            let mut shared_inputs = Vec::with_capacity(p_moduli_depth * 2);
+            shared_inputs.extend_from_slice(left_row);
+            shared_inputs.extend_from_slice(&term_row);
+            let input_set_id = circuit.intern_input_set(&shared_inputs);
+            let call_input_set_ids = vec![input_set_id; num_slots];
+            circuit.call_sub_circuit_sum_many_with_binding_set_ids(
+                diagonal_product_id,
+                call_input_set_ids,
+                diagonal_binding_set_ids.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    circuit.output(summed_rows.into_iter().flatten().collect());
+    circuit
+}
+
 pub fn negacyclic_conv_mul<P: Poly + 'static>(
     params: &P::Params,
     circuit: &mut PolyCircuit<P>,

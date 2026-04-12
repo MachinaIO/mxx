@@ -247,6 +247,20 @@ pub(crate) struct CircuitExecutionLayer {
     pub(crate) regular_gate_types: Vec<PolyGateType>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ErrorNormExecutionLayer {
+    pub(crate) regular_gate_ids: Vec<GateId>,
+    pub(crate) sub_circuit_call_ids: Vec<usize>,
+    pub(crate) summed_sub_circuit_call_ids: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+enum ErrorNormExecutionNodeId {
+    Regular(GateId),
+    SubCircuitCall(usize),
+    SummedSubCircuitCall(usize),
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct NonFreeDepthCacheKey {
     circuit_ptr: usize,
@@ -372,6 +386,12 @@ impl<P: Poly> PolyCircuit<P> {
         self.allow_register_lookup = false;
         for sub in self.sub_circuits.values_mut() {
             let StoredSubCircuit::InMemory(sub) = sub;
+            if Arc::ptr_eq(&sub.lookup_registry, &lookup_registry) &&
+                Arc::ptr_eq(&sub.binding_registry, &binding_registry) &&
+                Arc::ptr_eq(&sub.input_set_registry, &input_set_registry)
+            {
+                continue;
+            }
             Arc::make_mut(sub).inherit_shared_registries(
                 Arc::clone(&lookup_registry),
                 Arc::clone(&binding_registry),
@@ -448,6 +468,10 @@ impl<P: Poly> PolyCircuit<P> {
         self.gates.iter()
     }
 
+    pub(crate) fn gate(&self, gate_id: GateId) -> &PolyGate {
+        self.gates.get(&gate_id).unwrap_or_else(|| panic!("gate {gate_id} not found"))
+    }
+
     pub(crate) fn sorted_input_gate_ids(&self) -> Vec<GateId> {
         let mut input_gate_ids = self
             .gates
@@ -505,6 +529,50 @@ impl<P: Poly> PolyCircuit<P> {
         }
     }
 
+    pub(crate) fn with_sub_circuit_call_inputs_by_id<T>(
+        &self,
+        call_id: usize,
+        f: impl FnOnce(&[GateId], &[GateId]) -> T,
+    ) -> T {
+        let call = self.sub_circuit_calls.get(&call_id).expect("sub-circuit call missing");
+        self.with_sub_circuit_call_inputs(call, f)
+    }
+
+    pub(crate) fn with_sub_circuit_call_by_id<T>(
+        &self,
+        call_id: usize,
+        f: impl FnOnce(usize, Arc<[SubCircuitParamValue]>, &[GateId], &[GateId], &[GateId]) -> T,
+    ) -> T {
+        let call = self.sub_circuit_calls.get(&call_id).expect("sub-circuit call missing");
+        let param_bindings = self.binding_set(call.binding_set_id);
+        self.with_sub_circuit_call_inputs(call, |shared_prefix, suffix| {
+            f(call.sub_circuit_id, param_bindings, shared_prefix, suffix, &call.output_gate_ids)
+        })
+    }
+
+    pub(crate) fn sub_circuit_call_shared_prefix_set_id(&self, call_id: usize) -> Option<usize> {
+        self.sub_circuit_calls
+            .get(&call_id)
+            .expect("sub-circuit call missing")
+            .shared_input_prefix_set_id
+    }
+
+    pub(crate) fn for_each_summed_sub_circuit_call_input(
+        &self,
+        summed_call_id: usize,
+        mut f: impl FnMut(GateId),
+    ) {
+        let call = self
+            .summed_sub_circuit_calls
+            .get(&summed_call_id)
+            .expect("summed sub-circuit call missing");
+        for input_set_id in &call.call_input_set_ids {
+            for &input_id in self.input_set(*input_set_id).iter() {
+                f(input_id);
+            }
+        }
+    }
+
     fn collect_sub_circuit_call_inputs(&self, call: &SubCircuitCall) -> Vec<GateId> {
         self.with_sub_circuit_call_inputs(call, |shared_prefix, suffix| {
             let mut inputs = Vec::with_capacity(shared_prefix.len() + suffix.len());
@@ -552,6 +620,23 @@ impl<P: Poly> PolyCircuit<P> {
             param_bindings,
             output_gate_ids: call.output_gate_ids.clone(),
         }
+    }
+
+    pub(crate) fn with_summed_sub_circuit_call_by_id<T>(
+        &self,
+        summed_call_id: usize,
+        f: impl FnOnce(usize, &[usize], &[usize], &[GateId]) -> T,
+    ) -> T {
+        let call = self
+            .summed_sub_circuit_calls
+            .get(&summed_call_id)
+            .expect("summed sub-circuit call missing");
+        f(
+            call.sub_circuit_id,
+            &call.call_input_set_ids,
+            &call.call_binding_set_ids,
+            &call.output_gate_ids,
+        )
     }
 
     pub fn register_sub_circuit_param(&mut self, kind: SubCircuitParamKind) -> usize {
@@ -1173,6 +1258,190 @@ impl<P: Poly> PolyCircuit<P> {
                 }
             }
         }
+    }
+
+    fn error_norm_node_for_gate(&self, gate_id: GateId) -> Option<ErrorNormExecutionNodeId> {
+        let gate = self.gate(gate_id);
+        match &gate.gate_type {
+            PolyGateType::Input => None,
+            PolyGateType::SubCircuitOutput { call_id, .. } => {
+                Some(ErrorNormExecutionNodeId::SubCircuitCall(*call_id))
+            }
+            PolyGateType::SummedSubCircuitOutput { summed_call_id, .. } => {
+                Some(ErrorNormExecutionNodeId::SummedSubCircuitCall(*summed_call_id))
+            }
+            _ => Some(ErrorNormExecutionNodeId::Regular(gate_id)),
+        }
+    }
+
+    fn populate_error_norm_input_set_max_level(
+        &self,
+        input_set_id: usize,
+        node_levels: &mut HashMap<ErrorNormExecutionNodeId, usize>,
+        input_set_levels: &mut HashMap<usize, Option<usize>>,
+        visiting: &mut HashSet<ErrorNormExecutionNodeId>,
+        levels: &mut Vec<ErrorNormExecutionLayer>,
+    ) -> Option<usize> {
+        if let Some(&max_level) = input_set_levels.get(&input_set_id) {
+            return max_level;
+        }
+        let mut max_dependency_level: Option<usize> = None;
+        let mut has_input_dependency = false;
+        for &input_id in self.input_set(input_set_id).iter() {
+            if let Some(dep_node) = self.error_norm_node_for_gate(input_id) {
+                let dep_level = self.populate_error_norm_node_level(
+                    dep_node,
+                    node_levels,
+                    input_set_levels,
+                    visiting,
+                    levels,
+                );
+                max_dependency_level = Some(match max_dependency_level {
+                    Some(curr) => curr.max(dep_level),
+                    None => dep_level,
+                });
+            } else {
+                has_input_dependency = true;
+            }
+        }
+        let max_dependency_level = if has_input_dependency {
+            Some(max_dependency_level.map_or(0, |dep_level| dep_level))
+        } else {
+            max_dependency_level
+        };
+        input_set_levels.insert(input_set_id, max_dependency_level);
+        max_dependency_level
+    }
+
+    fn populate_error_norm_node_level(
+        &self,
+        node: ErrorNormExecutionNodeId,
+        node_levels: &mut HashMap<ErrorNormExecutionNodeId, usize>,
+        input_set_levels: &mut HashMap<usize, Option<usize>>,
+        visiting: &mut HashSet<ErrorNormExecutionNodeId>,
+        levels: &mut Vec<ErrorNormExecutionLayer>,
+    ) -> usize {
+        if let Some(&level) = node_levels.get(&node) {
+            return level;
+        }
+        assert!(
+            visiting.insert(node),
+            "cycle detected while computing error-norm execution layers"
+        );
+        let mut max_dependency_level: Option<usize> = None;
+        let mut has_input_dependency = false;
+        let mut update_dep_level = |dep_level: usize| {
+            max_dependency_level = Some(match max_dependency_level {
+                Some(curr) => curr.max(dep_level),
+                None => dep_level,
+            });
+        };
+        match node {
+            ErrorNormExecutionNodeId::Regular(gate_id) => {
+                for &input_id in &self.gate(gate_id).input_gates {
+                    if let Some(dep_node) = self.error_norm_node_for_gate(input_id) {
+                        let dep_level = self.populate_error_norm_node_level(
+                            dep_node,
+                            node_levels,
+                            input_set_levels,
+                            visiting,
+                            levels,
+                        );
+                        update_dep_level(dep_level);
+                    } else {
+                        has_input_dependency = true;
+                    }
+                }
+            }
+            ErrorNormExecutionNodeId::SubCircuitCall(call_id) => {
+                let call = self.sub_circuit_calls.get(&call_id).expect("sub-circuit call missing");
+                if let Some(input_set_id) = call.shared_input_prefix_set_id {
+                    if let Some(shared_prefix_level) = self.populate_error_norm_input_set_max_level(
+                        input_set_id,
+                        node_levels,
+                        input_set_levels,
+                        visiting,
+                        levels,
+                    ) {
+                        update_dep_level(shared_prefix_level);
+                    }
+                }
+                for &input_id in &call.input_suffix {
+                    if let Some(dep_node) = self.error_norm_node_for_gate(input_id) {
+                        let dep_level = self.populate_error_norm_node_level(
+                            dep_node,
+                            node_levels,
+                            input_set_levels,
+                            visiting,
+                            levels,
+                        );
+                        update_dep_level(dep_level);
+                    } else {
+                        has_input_dependency = true;
+                    }
+                }
+            }
+            ErrorNormExecutionNodeId::SummedSubCircuitCall(summed_call_id) => {
+                let call = self
+                    .summed_sub_circuit_calls
+                    .get(&summed_call_id)
+                    .expect("summed sub-circuit call missing");
+                for &input_set_id in &call.call_input_set_ids {
+                    if let Some(input_set_level) = self.populate_error_norm_input_set_max_level(
+                        input_set_id,
+                        node_levels,
+                        input_set_levels,
+                        visiting,
+                        levels,
+                    ) {
+                        update_dep_level(input_set_level);
+                    }
+                }
+            }
+        }
+        visiting.remove(&node);
+        let max_dependency_level = if has_input_dependency {
+            Some(max_dependency_level.map_or(0, |dep_level| dep_level))
+        } else {
+            max_dependency_level
+        };
+        let level = max_dependency_level.map_or(0, |dep_level| dep_level + 1);
+        if levels.len() <= level {
+            levels.resize(level + 1, ErrorNormExecutionLayer::default());
+        }
+        match node {
+            ErrorNormExecutionNodeId::Regular(gate_id) => {
+                levels[level].regular_gate_ids.push(gate_id)
+            }
+            ErrorNormExecutionNodeId::SubCircuitCall(call_id) => {
+                levels[level].sub_circuit_call_ids.push(call_id)
+            }
+            ErrorNormExecutionNodeId::SummedSubCircuitCall(summed_call_id) => {
+                levels[level].summed_sub_circuit_call_ids.push(summed_call_id)
+            }
+        }
+        node_levels.insert(node, level);
+        level
+    }
+
+    pub(crate) fn error_norm_execution_layers(&self) -> Vec<ErrorNormExecutionLayer> {
+        let mut node_levels: HashMap<ErrorNormExecutionNodeId, usize> = HashMap::new();
+        let mut input_set_levels: HashMap<usize, Option<usize>> = HashMap::new();
+        let mut levels = Vec::<ErrorNormExecutionLayer>::new();
+        let mut visiting = HashSet::new();
+        for &output_gate in &self.output_ids {
+            let Some(node) = self.error_norm_node_for_gate(output_gate) else {
+                continue;
+            };
+            self.populate_error_norm_node_level(
+                node,
+                &mut node_levels,
+                &mut input_set_levels,
+                &mut visiting,
+                &mut levels,
+            );
+        }
+        levels
     }
 
     /// Computes a topological order (as a vector of gate IDs) for all gates that
@@ -2633,7 +2902,7 @@ mod tests {
 
         // Insert a gate between input calls so next input gate is non-consecutive
         // Use a const-digits gate which introduces a new gate with no inputs
-        let _const_gate = circuit.const_digits(&[1u32, 0u32, 1u32]);
+        circuit.const_digits(&[1u32, 0u32, 1u32]);
 
         // Second input call: creates a new input gate with a higher, non-consecutive GateId
         let inputs_second = circuit.input(1);

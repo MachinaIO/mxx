@@ -20,60 +20,24 @@ use rayon::{
         IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
     },
     join,
+    prelude::ParallelSlice,
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     ops::{Add, Mul, Sub},
-    sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
-    },
+    sync::Arc,
     time::Instant,
 };
 use tracing::{debug, info, trace};
 
-// Keep error-norm subcall/output batches modest. The benchmark's Ring-GSW helpers
-// have millions of scalar outputs, so smaller batches materially lower peak RSS
-// during recursive summary construction without changing the arithmetic bound.
-const ERROR_NORM_SUBCALL_BATCH_SIZE: usize = 32;
 const ERROR_NORM_OUTPUT_BATCH_SIZE: usize = 1024;
-const ERROR_NORM_PARALLEL_CALL_EVAL_BATCH: usize = 4;
-const ERROR_NORM_MAX_CACHED_PROFILES_PER_SUBCIRCUIT: usize = 32;
-const ERROR_NORM_MAX_CACHED_PROFILES_PER_LARGE_SUBCIRCUIT: usize = 4;
-const ERROR_NORM_MAX_CACHED_PROFILES_PER_VERY_LARGE_SUBCIRCUIT: usize = 1;
-const MISSING_GATE_POSITION: usize = usize::MAX;
+const ERROR_NORM_EXPR_PAR_BATCH_SIZE: usize = 64;
+const ERROR_NORM_CALL_COMMIT_BATCH_SIZE: usize = 32;
+const ERROR_NORM_SUMMED_CALL_COMMIT_BATCH_SIZE: usize = 1;
+const ERROR_NORM_SUMMED_INNER_REDUCE_BATCH_SIZE: usize = 8;
 
 fn gaussian_tail_bound_factor() -> BigDecimal {
     BigDecimal::from_f32(6.5).unwrap()
-}
-
-fn merge_optional_matrix_norm(
-    left: Option<PolyMatrixNorm>,
-    right: Option<PolyMatrixNorm>,
-) -> Option<PolyMatrixNorm> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left + right),
-        (Some(left), None) => Some(left),
-        (None, Some(right)) => Some(right),
-        (None, None) => None,
-    }
-}
-
-fn increment_dense_gate_use_count(counts: &[AtomicU32], gate_id: GateId) {
-    let previous = counts
-        .get(gate_id.0)
-        .unwrap_or_else(|| panic!("error-norm dense use count missing storage for gate {gate_id}"))
-        .fetch_add(1, Ordering::Relaxed);
-    assert_ne!(previous, u32::MAX, "error-norm dense use count overflow for gate {gate_id}");
-}
-
-fn increment_dense_gate_use_counts<I>(counts: &[AtomicU32], input_ids: I)
-where
-    I: IntoIterator<Item = GateId>,
-{
-    for input_id in input_ids {
-        increment_dense_gate_use_count(counts, input_id);
-    }
 }
 
 fn resolve_shared_prefix_suffix_input_id(
@@ -109,28 +73,72 @@ fn resolve_input_set_gate_id(input_ids: &[BatchedWire], input_idx: usize) -> Gat
 }
 
 #[derive(Debug)]
-struct DenseGateUseCounts {
-    counts: Vec<AtomicU32>,
+struct BatchedGateUseCountBatch {
+    range: BatchedWire,
+    counts: Box<[u32]>,
+}
+
+#[derive(Debug)]
+struct BatchedGateUseCounts {
+    batches: BTreeMap<GateId, BatchedGateUseCountBatch>,
     live_nonzero: usize,
 }
 
-impl DenseGateUseCounts {
-    fn zeroed(gate_capacity: usize) -> Self {
-        Self {
-            counts: std::iter::repeat_with(|| AtomicU32::new(0)).take(gate_capacity).collect(),
-            live_nonzero: 0,
+impl BatchedGateUseCounts {
+    fn from_dense_counts(counts: Vec<u32>) -> Self {
+        let mut batches = BTreeMap::new();
+        let mut live_nonzero = 0usize;
+        let mut batch_start: Option<GateId> = None;
+        let mut batch_counts = Vec::new();
+        for (gate_idx, count) in counts.into_iter().enumerate() {
+            if count == 0 {
+                if let Some(start) = batch_start.take() {
+                    let range = BatchedWire::from_start_len(start, batch_counts.len());
+                    batches.insert(
+                        start,
+                        BatchedGateUseCountBatch {
+                            range,
+                            counts: std::mem::take(&mut batch_counts).into_boxed_slice(),
+                        },
+                    );
+                }
+                continue;
+            }
+            live_nonzero += 1;
+            if batch_start.is_none() {
+                batch_start = Some(GateId(gate_idx));
+            }
+            batch_counts.push(count);
         }
+        if let Some(start) = batch_start {
+            let range = BatchedWire::from_start_len(start, batch_counts.len());
+            batches.insert(
+                start,
+                BatchedGateUseCountBatch { range, counts: batch_counts.into_boxed_slice() },
+            );
+        }
+        Self { batches, live_nonzero }
     }
 
-    fn finalize_live_nonzero(mut self) -> Self {
-        self.live_nonzero =
-            self.counts.par_iter().filter(|count| count.load(Ordering::Relaxed) != 0).count();
-        self
+    fn batch_containing(&self, gate_id: GateId) -> Option<&BatchedGateUseCountBatch> {
+        self.batches
+            .range(..=gate_id)
+            .next_back()
+            .and_then(|(_, batch)| if gate_id.0 < batch.range.end().0 { Some(batch) } else { None })
+    }
+
+    fn batch_containing_mut(&mut self, gate_id: GateId) -> Option<&mut BatchedGateUseCountBatch> {
+        self.batches
+            .range_mut(..=gate_id)
+            .next_back()
+            .and_then(|(_, batch)| if gate_id.0 < batch.range.end().0 { Some(batch) } else { None })
     }
 
     #[inline]
     fn contains(&self, gate_id: GateId) -> bool {
-        self.counts[gate_id.0].load(Ordering::Relaxed) != 0
+        self.batch_containing(gate_id)
+            .map(|batch| batch.counts[gate_id.0 - batch.range.start().0] != 0)
+            .unwrap_or(false)
     }
 
     #[inline]
@@ -139,15 +147,15 @@ impl DenseGateUseCounts {
     }
 
     fn decrement(&mut self, gate_id: GateId) -> bool {
-        let count = self
-            .counts
-            .get_mut(gate_id.0)
+        let batch = self
+            .batch_containing_mut(gate_id)
             .unwrap_or_else(|| panic!("error-norm use count missing storage for gate {gate_id}"));
-        let current = count.load(Ordering::Relaxed);
+        let count = &mut batch.counts[gate_id.0 - batch.range.start().0];
+        let current = *count;
         if current == 0 {
             return false;
         }
-        count.store(current - 1, Ordering::Relaxed);
+        *count = current - 1;
         if current == 1 {
             self.live_nonzero -= 1;
             return true;
@@ -161,29 +169,97 @@ struct ErrorNormSubCircuitCacheKey(usize);
 
 type ErrorNormSubCircuitSummaryCache =
     HashMap<ErrorNormSubCircuitCacheKey, Vec<ErrorNormSubCircuitSummaryRecord>>;
-type ErrorNormValueStore = Vec<Option<Arc<ErrorNorm>>>;
+type ErrorNormInputGatePositions = HashMap<GateId, usize>;
+
+const ERROR_NORM_MAX_CACHED_PROFILES_PER_SUBCIRCUIT: usize = 1;
+
+#[derive(Debug)]
+struct BatchedValueStoreEntry<T> {
+    range: BatchedWire,
+    values: Box<[Option<Arc<T>>]>,
+}
+
+#[derive(Debug)]
+struct BatchedValueStore<T> {
+    entries: BTreeMap<GateId, BatchedValueStoreEntry<T>>,
+    live_entries: usize,
+}
+
+impl<T> Default for BatchedValueStore<T> {
+    fn default() -> Self {
+        Self { entries: BTreeMap::new(), live_entries: 0 }
+    }
+}
+
+impl<T> BatchedValueStore<T> {
+    fn entry_containing(&self, gate_id: GateId) -> Option<&BatchedValueStoreEntry<T>> {
+        self.entries
+            .range(..=gate_id)
+            .next_back()
+            .and_then(|(_, entry)| if gate_id.0 < entry.range.end().0 { Some(entry) } else { None })
+    }
+
+    fn entry_containing_mut(&mut self, gate_id: GateId) -> Option<&mut BatchedValueStoreEntry<T>> {
+        self.entries
+            .range_mut(..=gate_id)
+            .next_back()
+            .and_then(|(_, entry)| if gate_id.0 < entry.range.end().0 { Some(entry) } else { None })
+    }
+
+    fn get(&self, gate_id: GateId) -> Option<Arc<T>> {
+        self.entry_containing(gate_id).and_then(|entry| {
+            entry.values[gate_id.0 - entry.range.start().0].as_ref().map(Arc::clone)
+        })
+    }
+
+    fn insert_single(&mut self, gate_id: GateId, value: T) {
+        self.insert_batch(BatchedWire::single(gate_id), vec![value]);
+    }
+
+    fn insert_batch(&mut self, range: BatchedWire, values: Vec<T>) {
+        assert_eq!(
+            range.len(),
+            values.len(),
+            "batched value store range len {} must match value count {}",
+            range.len(),
+            values.len()
+        );
+        let values = values
+            .into_iter()
+            .map(|value| Some(Arc::new(value)))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        self.live_entries += values.len();
+        self.entries.insert(range.start(), BatchedValueStoreEntry { range, values });
+    }
+
+    fn insert_batch_shared(&mut self, range: BatchedWire, values: Vec<Arc<T>>) {
+        assert_eq!(
+            range.len(),
+            values.len(),
+            "batched value store range len {} must match value count {}",
+            range.len(),
+            values.len()
+        );
+        let values = values.into_iter().map(Some).collect::<Vec<_>>().into_boxed_slice();
+        self.live_entries += values.len();
+        self.entries.insert(range.start(), BatchedValueStoreEntry { range, values });
+    }
+
+    fn take(&mut self, gate_id: GateId) -> Option<Arc<T>> {
+        let entry = self.entry_containing_mut(gate_id)?;
+        let slot = &mut entry.values[gate_id.0 - entry.range.start().0];
+        let value = slot.take();
+        if value.is_some() {
+            self.live_entries -= 1;
+        }
+        value
+    }
+}
+
+type ErrorNormValueStore = BatchedValueStore<ErrorNorm>;
 type ErrorNormWireStore = ErrorNormValueStore;
-
-fn error_norm_profile_cache_cap(sub_circuit: &PolyCircuit<DCRTPoly>) -> usize {
-    if sub_circuit.num_input() >= 500_000 ||
-        sub_circuit.num_output() >= 1_000 ||
-        sub_circuit.num_gates() >= 1_000_000
-    {
-        ERROR_NORM_MAX_CACHED_PROFILES_PER_VERY_LARGE_SUBCIRCUIT
-    } else if sub_circuit.num_input() >= 50_000 || sub_circuit.num_gates() >= 100_000 {
-        ERROR_NORM_MAX_CACHED_PROFILES_PER_LARGE_SUBCIRCUIT
-    } else {
-        ERROR_NORM_MAX_CACHED_PROFILES_PER_SUBCIRCUIT
-    }
-}
-
-fn error_norm_parallel_call_eval_batch(output_count: usize) -> usize {
-    if output_count >= ERROR_NORM_OUTPUT_BATCH_SIZE {
-        1
-    } else {
-        ERROR_NORM_PARALLEL_CALL_EVAL_BATCH
-    }
-}
+type ErrorNormExprStore = BatchedValueStore<ErrorNormSummaryExpr>;
 
 impl PolyCircuit<DCRTPoly> {
     pub fn simulate_max_error_norm<P: AffinePltEvaluator>(
@@ -212,11 +288,11 @@ impl PolyCircuit<DCRTPoly> {
         self.eval_max_error_norm(one_error, input_errors, plt_evaluator, slot_transfer_evaluator)
     }
 
-    fn eval_parallel_regular_error_norm_gate(
+    fn eval_pure_regular_error_norm_gate(
         &self,
         gate_id: GateId,
         wires: &ErrorNormWireStore,
-        input_gate_positions: &[usize],
+        input_gate_positions: &ErrorNormInputGatePositions,
         input_values: &[Option<Arc<ErrorNorm>>],
     ) -> ErrorNorm {
         let gate = self.gate(gate_id);
@@ -286,16 +362,16 @@ impl PolyCircuit<DCRTPoly> {
                 )
                 .large_scalar_mul(&(), scalar)
             }
-            _ => panic!("gate {gate_id} is not parallel-eligible in error-norm evaluation"),
+            _ => panic!("gate {gate_id} is not pure in error-norm evaluation"),
         }
     }
 
-    fn eval_sequential_regular_error_norm_gate<P: AffinePltEvaluator>(
+    fn eval_evaluator_regular_error_norm_gate<P: AffinePltEvaluator>(
         &self,
         gate_id: GateId,
         one_error: &ErrorNorm,
         wires: &ErrorNormWireStore,
-        input_gate_positions: &[usize],
+        input_gate_positions: &ErrorNormInputGatePositions,
         input_values: &[Option<Arc<ErrorNorm>>],
         plt_evaluator: Option<&P>,
         slot_transfer_evaluator: Option<&dyn AffineSlotTransferEvaluator>,
@@ -335,7 +411,7 @@ impl PolyCircuit<DCRTPoly> {
                     lut_id,
                 )
             }
-            _ => self.eval_parallel_regular_error_norm_gate(
+            _ => self.eval_pure_regular_error_norm_gate(
                 gate_id,
                 wires,
                 input_gate_positions,
@@ -344,118 +420,75 @@ impl PolyCircuit<DCRTPoly> {
         }
     }
 
-    fn error_norm_input_gate_positions(&self, input_gate_ids: &[GateId]) -> Vec<usize> {
-        let mut positions = vec![MISSING_GATE_POSITION; self.num_gates() + 1];
+    fn error_norm_input_gate_positions(
+        &self,
+        input_gate_ids: &[GateId],
+    ) -> ErrorNormInputGatePositions {
+        let mut positions = HashMap::with_capacity(input_gate_ids.len());
         for (idx, gate_id) in input_gate_ids.iter().copied().enumerate() {
-            positions[gate_id.0] = idx;
+            positions.insert(gate_id, idx);
         }
         positions
     }
 
-    fn clone_error_norm_summary_expr_for_gate(
-        &self,
-        gate_id: GateId,
-        gate_exprs: &[Option<Arc<ErrorNormSummaryExpr>>],
-        input_gate_positions: &[usize],
-        input_plaintext_norms: &[PolyNorm],
-    ) -> Arc<ErrorNormSummaryExpr> {
-        if let Some(expr) = gate_exprs.get(gate_id.0).and_then(|expr| expr.as_ref()) {
-            return expr.clone();
-        }
-        let input_idx = *input_gate_positions
-            .get(gate_id.0)
-            .unwrap_or_else(|| panic!("error-norm expression missing for gate {gate_id}"));
-        assert_ne!(
-            input_idx, MISSING_GATE_POSITION,
-            "error-norm expression missing for gate {gate_id}"
-        );
-        Arc::new(ErrorNormSummaryExpr::input_with_plaintext_norm(
-            input_idx,
-            input_plaintext_norms[input_idx].clone(),
-        ))
-    }
-
-    fn clone_error_norm_plaintext_norm_for_gate(
-        &self,
-        gate_id: GateId,
-        gate_exprs: &[Option<Arc<ErrorNormSummaryExpr>>],
-        input_gate_positions: &[usize],
-        input_plaintext_norms: &[PolyNorm],
-    ) -> PolyNorm {
-        if let Some(expr) = gate_exprs.get(gate_id.0).and_then(|expr| expr.as_ref()) {
-            return expr.plaintext_norm.clone();
-        }
-        let input_idx = *input_gate_positions
-            .get(gate_id.0)
-            .unwrap_or_else(|| panic!("error-norm plaintext norm missing for gate {gate_id}"));
-        assert_ne!(
-            input_idx, MISSING_GATE_POSITION,
-            "error-norm plaintext norm missing for gate {gate_id}"
-        );
-        input_plaintext_norms[input_idx].clone()
-    }
-
-    fn find_cached_error_norm_summary_record<'a>(
+    fn find_cached_error_norm_summary(
         &self,
         sub_circuit_id: usize,
         input_plaintext_norms: &[PolyNorm],
-        param_bindings: &[SubCircuitParamValue],
-        summary_cache: &'a ErrorNormSubCircuitSummaryCache,
-    ) -> &'a ErrorNormSubCircuitSummaryRecord {
+        summary_cache: &ErrorNormSubCircuitSummaryCache,
+    ) -> Arc<ErrorNormSubCircuitSummary> {
         let cache_key = self.error_norm_sub_circuit_cache_key(sub_circuit_id);
         summary_cache
             .get(&cache_key)
             .and_then(|entries| {
-                entries.par_iter().find_any(|entry| {
-                    entry.input_plaintext_norms.matches_slice(input_plaintext_norms) &&
-                        entry.param_bindings.as_ref() == param_bindings
+                entries.iter().find_map(|entry| {
+                    if entry.input_plaintext_norms.matches_slice(input_plaintext_norms) {
+                        Some(Arc::clone(&entry.summary))
+                    } else {
+                        None
+                    }
                 })
             })
             .unwrap_or_else(|| {
                 panic!(
-                    "error-norm child sub-circuit summary cache missing for sub_circuit_id={} inputs={} bindings={}",
+                    "error-norm child sub-circuit summary cache missing for sub_circuit_id={} inputs={}",
                     sub_circuit_id,
                     input_plaintext_norms.len(),
-                    param_bindings.len()
                 )
             })
     }
 
-    fn find_cached_error_norm_summary_index_for_key(
+    fn find_cached_error_norm_summary_for_key(
         &self,
         cache_key: ErrorNormSubCircuitCacheKey,
         input_plaintext_norms: &[PolyNorm],
-        param_bindings: &[SubCircuitParamValue],
         summary_cache: &ErrorNormSubCircuitSummaryCache,
-    ) -> Option<usize> {
+    ) -> Option<Arc<ErrorNormSubCircuitSummary>> {
         summary_cache.get(&cache_key).and_then(|entries| {
-            entries
-                .par_iter()
-                .enumerate()
-                .find_any(|(_, entry)| {
-                    entry.input_plaintext_norms.matches_slice(input_plaintext_norms) &&
-                        entry.param_bindings.as_ref() == param_bindings
-                })
-                .map(|(idx, _)| idx)
+            entries.iter().find_map(|entry| {
+                if entry.input_plaintext_norms.matches_slice(input_plaintext_norms) {
+                    Some(Arc::clone(&entry.summary))
+                } else {
+                    None
+                }
+            })
         })
     }
 
-    fn find_cached_error_norm_summary_index_for_profile(
+    fn find_cached_error_norm_summary_for_profile(
         &self,
         cache_key: ErrorNormSubCircuitCacheKey,
         input_plaintext_profile: &ErrorNormInputPlaintextProfile,
-        param_bindings: &[SubCircuitParamValue],
         summary_cache: &ErrorNormSubCircuitSummaryCache,
-    ) -> Option<usize> {
+    ) -> Option<Arc<ErrorNormSubCircuitSummary>> {
         summary_cache.get(&cache_key).and_then(|entries| {
-            entries
-                .par_iter()
-                .enumerate()
-                .find_any(|(_, entry)| {
-                    entry.input_plaintext_norms.matches_profile(input_plaintext_profile) &&
-                        entry.param_bindings.as_ref() == param_bindings
-                })
-                .map(|(idx, _)| idx)
+            entries.iter().find_map(|entry| {
+                if entry.input_plaintext_norms.matches_profile(input_plaintext_profile) {
+                    Some(Arc::clone(&entry.summary))
+                } else {
+                    None
+                }
+            })
         })
     }
 
@@ -470,18 +503,15 @@ impl PolyCircuit<DCRTPoly> {
     fn clone_error_norm_summary_expr_for_cached_summary_gate(
         &self,
         gate_id: GateId,
-        gate_exprs: &[Option<Arc<ErrorNormSummaryExpr>>],
-        input_gate_positions: &[usize],
+        gate_exprs: &ErrorNormExprStore,
+        input_gate_positions: &ErrorNormInputGatePositions,
         input_plaintext_norms: &[PolyNorm],
         summary_cache: &ErrorNormSubCircuitSummaryCache,
     ) -> Arc<ErrorNormSummaryExpr> {
-        if let Some(expr) = gate_exprs.get(gate_id.0).and_then(|expr| expr.as_ref()) {
-            return expr.clone();
+        if let Some(expr) = gate_exprs.get(gate_id) {
+            return expr;
         }
-        let input_idx = *input_gate_positions
-            .get(gate_id.0)
-            .unwrap_or_else(|| panic!("error-norm expression missing for gate {gate_id}"));
-        if input_idx != MISSING_GATE_POSITION {
+        if let Some(&input_idx) = input_gate_positions.get(&gate_id) {
             return Arc::new(ErrorNormSummaryExpr::input_with_plaintext_norm(
                 input_idx,
                 input_plaintext_norms[input_idx].clone(),
@@ -491,7 +521,7 @@ impl PolyCircuit<DCRTPoly> {
             PolyGateType::SubCircuitOutput { call_id, output_idx, .. } => self
                 .with_sub_circuit_call_by_id(
                     call_id,
-                    |sub_circuit_id, param_bindings, shared_prefix, suffix, _output_gate_ids| {
+                    |sub_circuit_id, _param_bindings, shared_prefix, suffix, _output_gate_ids| {
                         let actual_input_plaintext_norms = self
                             .collect_error_norm_plaintext_norms_for_summary_inputs(
                                 shared_prefix,
@@ -501,14 +531,11 @@ impl PolyCircuit<DCRTPoly> {
                                 input_plaintext_norms,
                                 summary_cache,
                             );
-                        let summary = &self
-                            .find_cached_error_norm_summary_record(
-                                sub_circuit_id,
-                                &actual_input_plaintext_norms,
-                                param_bindings.as_ref(),
-                                summary_cache,
-                            )
-                            .summary;
+                        let summary = self.find_cached_error_norm_summary(
+                            sub_circuit_id,
+                            &actual_input_plaintext_norms,
+                            summary_cache,
+                        );
                         let actual_inputs = self.collect_error_norm_summary_exprs_for_inputs(
                             shared_prefix,
                             suffix,
@@ -529,7 +556,7 @@ impl PolyCircuit<DCRTPoly> {
                             call_input_set_ids
                                 .par_iter()
                                 .zip(call_binding_set_ids.par_iter())
-                                .map(|(&input_set_id, &binding_set_id)| {
+                                .map(|(&input_set_id, &_binding_set_id)| {
                                     let input_ids = self.input_set(input_set_id);
                                     let actual_input_plaintext_norms = self
                                         .collect_error_norm_plaintext_norms_for_summary_input_set(
@@ -539,15 +566,11 @@ impl PolyCircuit<DCRTPoly> {
                                             input_plaintext_norms,
                                             summary_cache,
                                         );
-                                    let param_bindings = self.binding_set(binding_set_id);
-                                    let summary = &self
-                                        .find_cached_error_norm_summary_record(
-                                            sub_circuit_id,
-                                            &actual_input_plaintext_norms,
-                                            param_bindings.as_ref(),
-                                            summary_cache,
-                                        )
-                                        .summary;
+                                    let summary = self.find_cached_error_norm_summary(
+                                        sub_circuit_id,
+                                        &actual_input_plaintext_norms,
+                                        summary_cache,
+                                    );
                                     let actual_inputs = self
                                         .collect_error_norm_summary_exprs_for_input_set(
                                             input_ids.as_ref(),
@@ -558,7 +581,10 @@ impl PolyCircuit<DCRTPoly> {
                                         );
                                     summary.substitute_output(output_idx, &actual_inputs)
                                 })
-                                .reduce_with(|left, right| left.add_bound(&right))
+                                .reduce_with(|mut left, right| {
+                                    left.add_assign_bound(right);
+                                    left
+                                })
                                 .unwrap_or_else(|| {
                                     panic!(
                                         "error-norm summary summed sub-circuit call {} has no inner calls",
@@ -575,25 +601,22 @@ impl PolyCircuit<DCRTPoly> {
     fn clone_error_norm_plaintext_norm_for_cached_summary_gate(
         &self,
         gate_id: GateId,
-        gate_exprs: &[Option<Arc<ErrorNormSummaryExpr>>],
-        input_gate_positions: &[usize],
+        gate_exprs: &ErrorNormExprStore,
+        input_gate_positions: &ErrorNormInputGatePositions,
         input_plaintext_norms: &[PolyNorm],
         summary_cache: &ErrorNormSubCircuitSummaryCache,
     ) -> PolyNorm {
-        if let Some(expr) = gate_exprs.get(gate_id.0).and_then(|expr| expr.as_ref()) {
+        if let Some(expr) = gate_exprs.get(gate_id) {
             return expr.plaintext_norm.clone();
         }
-        let input_idx = *input_gate_positions
-            .get(gate_id.0)
-            .unwrap_or_else(|| panic!("error-norm plaintext norm missing for gate {gate_id}"));
-        if input_idx != MISSING_GATE_POSITION {
+        if let Some(&input_idx) = input_gate_positions.get(&gate_id) {
             return input_plaintext_norms[input_idx].clone();
         }
         match self.gate(gate_id).gate_type.clone() {
             PolyGateType::SubCircuitOutput { call_id, output_idx, .. } => self
                 .with_sub_circuit_call_by_id(
                     call_id,
-                    |sub_circuit_id, param_bindings, shared_prefix, suffix, _| {
+                    |sub_circuit_id, _param_bindings, shared_prefix, suffix, _| {
                         let actual_input_plaintext_norms = self
                             .collect_error_norm_plaintext_norms_for_summary_inputs(
                                 shared_prefix,
@@ -603,16 +626,12 @@ impl PolyCircuit<DCRTPoly> {
                                 input_plaintext_norms,
                                 summary_cache,
                             );
-                        self.find_cached_error_norm_summary_record(
+                        self.find_cached_error_norm_summary(
                             sub_circuit_id,
                             &actual_input_plaintext_norms,
-                            param_bindings.as_ref(),
                             summary_cache,
                         )
-                        .summary
-                        .output_exprs[output_idx]
-                            .plaintext_norm
-                            .clone()
+                        .output_plaintext_norm_at(output_idx)
                     },
                 ),
             PolyGateType::SummedSubCircuitOutput { summed_call_id, output_idx, .. } => self
@@ -622,7 +641,7 @@ impl PolyCircuit<DCRTPoly> {
                         call_input_set_ids
                             .par_iter()
                             .zip(call_binding_set_ids.par_iter())
-                            .map(|(&input_set_id, &binding_set_id)| {
+                            .map(|(&input_set_id, &_binding_set_id)| {
                                 let actual_input_plaintext_norms = self
                                     .collect_error_norm_plaintext_norms_for_summary_input_set(
                                         self.input_set(input_set_id).as_ref(),
@@ -631,16 +650,12 @@ impl PolyCircuit<DCRTPoly> {
                                         input_plaintext_norms,
                                         summary_cache,
                                     );
-                                self.find_cached_error_norm_summary_record(
+                                self.find_cached_error_norm_summary(
                                     sub_circuit_id,
                                     &actual_input_plaintext_norms,
-                                    self.binding_set(binding_set_id).as_ref(),
                                     summary_cache,
                                 )
-                                .summary
-                                .output_exprs[output_idx]
-                                    .plaintext_norm
-                                    .clone()
+                                .output_plaintext_norm_at(output_idx)
                             })
                             .reduce_with(|acc, norm| &acc + &norm)
                             .unwrap_or_else(|| {
@@ -659,16 +674,13 @@ impl PolyCircuit<DCRTPoly> {
         &self,
         gate_id: GateId,
         wires: &ErrorNormWireStore,
-        input_gate_positions: &[usize],
+        input_gate_positions: &ErrorNormInputGatePositions,
         input_values: &[Option<Arc<ErrorNorm>>],
     ) -> ErrorNorm {
-        if let Some(value) = wires.get(gate_id.0).and_then(|value| value.as_ref()) {
+        if let Some(value) = wires.get(gate_id) {
             return value.as_ref().clone();
         }
-        if let Some(&input_idx) = input_gate_positions.get(gate_id.0) {
-            if input_idx == MISSING_GATE_POSITION {
-                panic!("error-norm value missing for gate {gate_id}");
-            }
+        if let Some(&input_idx) = input_gate_positions.get(&gate_id) {
             return input_values[input_idx]
                 .as_ref()
                 .unwrap_or_else(|| panic!("error-norm value missing for input gate {gate_id}"))
@@ -678,43 +690,17 @@ impl PolyCircuit<DCRTPoly> {
         panic!("error-norm value missing for gate {gate_id}")
     }
 
-    fn clone_error_norm_arc_for_gate(
-        &self,
-        gate_id: GateId,
-        wires: &ErrorNormWireStore,
-        input_gate_positions: &[usize],
-        input_values: &[Option<Arc<ErrorNorm>>],
-    ) -> Arc<ErrorNorm> {
-        if let Some(value) = wires.get(gate_id.0).and_then(|value| value.as_ref()) {
-            return Arc::clone(value);
-        }
-        if let Some(&input_idx) = input_gate_positions.get(gate_id.0) {
-            if input_idx == MISSING_GATE_POSITION {
-                panic!("error-norm value missing for gate {gate_id}");
-            }
-            return Arc::clone(
-                input_values[input_idx]
-                    .as_ref()
-                    .unwrap_or_else(|| panic!("error-norm value missing for input gate {gate_id}")),
-            );
-        }
-        panic!("error-norm value missing for gate {gate_id}")
-    }
-
     fn clone_error_norm_matrix_norm_for_gate(
         &self,
         gate_id: GateId,
         wires: &ErrorNormWireStore,
-        input_gate_positions: &[usize],
+        input_gate_positions: &ErrorNormInputGatePositions,
         input_values: &[Option<Arc<ErrorNorm>>],
     ) -> PolyMatrixNorm {
-        if let Some(value) = wires.get(gate_id.0).and_then(|value| value.as_ref()) {
+        if let Some(value) = wires.get(gate_id) {
             return value.matrix_norm.clone();
         }
-        if let Some(&input_idx) = input_gate_positions.get(gate_id.0) {
-            if input_idx == MISSING_GATE_POSITION {
-                panic!("error-norm matrix norm missing for gate {gate_id}");
-            }
+        if let Some(&input_idx) = input_gate_positions.get(&gate_id) {
             return input_values[input_idx]
                 .as_ref()
                 .unwrap_or_else(|| {
@@ -726,44 +712,17 @@ impl PolyCircuit<DCRTPoly> {
         panic!("error-norm matrix norm missing for gate {gate_id}")
     }
 
-    fn borrow_error_norm_matrix_norm_for_gate<'a>(
-        &self,
-        gate_id: GateId,
-        wires: &'a ErrorNormWireStore,
-        input_gate_positions: &[usize],
-        input_values: &'a [Option<Arc<ErrorNorm>>],
-    ) -> &'a PolyMatrixNorm {
-        if let Some(value) = wires.get(gate_id.0).and_then(|value| value.as_ref()) {
-            return &value.matrix_norm;
-        }
-        if let Some(&input_idx) = input_gate_positions.get(gate_id.0) {
-            if input_idx == MISSING_GATE_POSITION {
-                panic!("error-norm matrix norm missing for gate {gate_id}");
-            }
-            return &input_values[input_idx]
-                .as_ref()
-                .unwrap_or_else(|| {
-                    panic!("error-norm matrix norm missing for input gate {gate_id}")
-                })
-                .matrix_norm;
-        }
-        panic!("error-norm matrix norm missing for gate {gate_id}")
-    }
-
     fn clone_error_norm_plaintext_norm_for_value_gate(
         &self,
         gate_id: GateId,
         wires: &ErrorNormWireStore,
-        input_gate_positions: &[usize],
+        input_gate_positions: &ErrorNormInputGatePositions,
         input_values: &[Option<Arc<ErrorNorm>>],
     ) -> PolyNorm {
-        if let Some(value) = wires.get(gate_id.0).and_then(|value| value.as_ref()) {
+        if let Some(value) = wires.get(gate_id) {
             return value.plaintext_norm.clone();
         }
-        if let Some(&input_idx) = input_gate_positions.get(gate_id.0) {
-            if input_idx == MISSING_GATE_POSITION {
-                panic!("error-norm value missing for gate {gate_id}");
-            }
+        if let Some(&input_idx) = input_gate_positions.get(&gate_id) {
             return input_values[input_idx]
                 .as_ref()
                 .unwrap_or_else(|| panic!("error-norm value missing for input gate {gate_id}"))
@@ -773,180 +732,12 @@ impl PolyCircuit<DCRTPoly> {
         panic!("error-norm value missing for gate {gate_id}")
     }
 
-    fn collect_error_norm_plaintext_norms_for_value_inputs(
-        &self,
-        shared_prefix: &[BatchedWire],
-        suffix: &[BatchedWire],
-        wires: &ErrorNormWireStore,
-        input_gate_positions: &[usize],
-        input_values: &[Option<Arc<ErrorNorm>>],
-    ) -> Vec<PolyNorm> {
-        let (mut prefix_norms, suffix_norms) = join(
-            || {
-                shared_prefix
-                    .par_iter()
-                    .flat_map_iter(|batch| batch.gate_ids())
-                    .map(|input_id| {
-                        self.clone_error_norm_plaintext_norm_for_value_gate(
-                            input_id,
-                            wires,
-                            input_gate_positions,
-                            input_values,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            },
-            || {
-                suffix
-                    .par_iter()
-                    .flat_map_iter(|batch| batch.gate_ids())
-                    .map(|input_id| {
-                        self.clone_error_norm_plaintext_norm_for_value_gate(
-                            input_id,
-                            wires,
-                            input_gate_positions,
-                            input_values,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            },
-        );
-        prefix_norms.extend(suffix_norms);
-        prefix_norms
-    }
-
-    fn collect_error_norm_values_for_inputs(
-        &self,
-        shared_prefix: &[BatchedWire],
-        suffix: &[BatchedWire],
-        wires: &ErrorNormWireStore,
-        input_gate_positions: &[usize],
-        input_values: &[Option<Arc<ErrorNorm>>],
-    ) -> Vec<ErrorNorm> {
-        let (mut prefix_values, suffix_values) = join(
-            || {
-                shared_prefix
-                    .par_iter()
-                    .flat_map_iter(|batch| batch.gate_ids())
-                    .map(|input_id| {
-                        self.clone_error_norm_value_for_gate(
-                            input_id,
-                            wires,
-                            input_gate_positions,
-                            input_values,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            },
-            || {
-                suffix
-                    .par_iter()
-                    .flat_map_iter(|batch| batch.gate_ids())
-                    .map(|input_id| {
-                        self.clone_error_norm_value_for_gate(
-                            input_id,
-                            wires,
-                            input_gate_positions,
-                            input_values,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            },
-        );
-        prefix_values.extend(suffix_values);
-        prefix_values
-    }
-
-    fn collect_error_norm_matrix_norms_for_inputs(
-        &self,
-        shared_prefix: &[BatchedWire],
-        suffix: &[BatchedWire],
-        wires: &ErrorNormWireStore,
-        input_gate_positions: &[usize],
-        input_values: &[Option<Arc<ErrorNorm>>],
-    ) -> Vec<PolyMatrixNorm> {
-        let (mut prefix_values, suffix_values) = join(
-            || {
-                shared_prefix
-                    .par_iter()
-                    .flat_map_iter(|batch| batch.gate_ids())
-                    .map(|input_id| {
-                        self.clone_error_norm_matrix_norm_for_gate(
-                            input_id,
-                            wires,
-                            input_gate_positions,
-                            input_values,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            },
-            || {
-                suffix
-                    .par_iter()
-                    .flat_map_iter(|batch| batch.gate_ids())
-                    .map(|input_id| {
-                        self.clone_error_norm_matrix_norm_for_gate(
-                            input_id,
-                            wires,
-                            input_gate_positions,
-                            input_values,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            },
-        );
-        prefix_values.extend(suffix_values);
-        prefix_values
-    }
-
-    fn collect_error_norm_matrix_norm_refs_for_inputs<'a>(
-        &self,
-        shared_prefix: &[BatchedWire],
-        suffix: &[BatchedWire],
-        wires: &'a ErrorNormWireStore,
-        input_gate_positions: &[usize],
-        input_values: &'a [Option<Arc<ErrorNorm>>],
-    ) -> Vec<&'a PolyMatrixNorm> {
-        let (mut prefix_values, suffix_values) = join(
-            || {
-                shared_prefix
-                    .par_iter()
-                    .flat_map_iter(|batch| batch.gate_ids())
-                    .map(|input_id| {
-                        self.borrow_error_norm_matrix_norm_for_gate(
-                            input_id,
-                            wires,
-                            input_gate_positions,
-                            input_values,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            },
-            || {
-                suffix
-                    .par_iter()
-                    .flat_map_iter(|batch| batch.gate_ids())
-                    .map(|input_id| {
-                        self.borrow_error_norm_matrix_norm_for_gate(
-                            input_id,
-                            wires,
-                            input_gate_positions,
-                            input_values,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            },
-        );
-        prefix_values.extend(suffix_values);
-        prefix_values
-    }
-
     fn collect_error_norm_plaintext_norms_for_summary_inputs(
         &self,
         shared_prefix: &[BatchedWire],
         suffix: &[BatchedWire],
-        gate_exprs: &[Option<Arc<ErrorNormSummaryExpr>>],
-        input_gate_positions: &[usize],
+        gate_exprs: &ErrorNormExprStore,
+        input_gate_positions: &ErrorNormInputGatePositions,
         input_plaintext_norms: &[PolyNorm],
         summary_cache: &ErrorNormSubCircuitSummaryCache,
     ) -> Vec<PolyNorm> {
@@ -990,8 +781,8 @@ impl PolyCircuit<DCRTPoly> {
         &self,
         shared_prefix: &[BatchedWire],
         suffix: &[BatchedWire],
-        gate_exprs: &[Option<Arc<ErrorNormSummaryExpr>>],
-        input_gate_positions: &[usize],
+        gate_exprs: &ErrorNormExprStore,
+        input_gate_positions: &ErrorNormInputGatePositions,
         input_plaintext_norms: &[PolyNorm],
         summary_cache: &ErrorNormSubCircuitSummaryCache,
     ) -> Vec<Arc<ErrorNormSummaryExpr>> {
@@ -1035,7 +826,7 @@ impl PolyCircuit<DCRTPoly> {
         &self,
         input_ids: &[BatchedWire],
         wires: &ErrorNormWireStore,
-        input_gate_positions: &[usize],
+        input_gate_positions: &ErrorNormInputGatePositions,
         input_values: &[Option<Arc<ErrorNorm>>],
     ) -> Vec<PolyNorm> {
         input_ids
@@ -1052,95 +843,11 @@ impl PolyCircuit<DCRTPoly> {
             .collect::<Vec<_>>()
     }
 
-    fn collect_error_norm_values_for_input_set(
-        &self,
-        input_ids: &[BatchedWire],
-        wires: &ErrorNormWireStore,
-        input_gate_positions: &[usize],
-        input_values: &[Option<Arc<ErrorNorm>>],
-    ) -> Vec<ErrorNorm> {
-        input_ids
-            .par_iter()
-            .flat_map_iter(|batch| batch.gate_ids())
-            .map(|input_id| {
-                self.clone_error_norm_value_for_gate(
-                    input_id,
-                    wires,
-                    input_gate_positions,
-                    input_values,
-                )
-            })
-            .collect::<Vec<_>>()
-    }
-
-    fn collect_error_norm_arcs_for_input_set(
-        &self,
-        input_ids: &[BatchedWire],
-        wires: &ErrorNormWireStore,
-        input_gate_positions: &[usize],
-        input_values: &[Option<Arc<ErrorNorm>>],
-    ) -> Vec<Arc<ErrorNorm>> {
-        input_ids
-            .par_iter()
-            .flat_map_iter(|batch| batch.gate_ids())
-            .map(|input_id| {
-                self.clone_error_norm_arc_for_gate(
-                    input_id,
-                    wires,
-                    input_gate_positions,
-                    input_values,
-                )
-            })
-            .collect::<Vec<_>>()
-    }
-
-    fn collect_error_norm_matrix_norms_for_input_set(
-        &self,
-        input_ids: &[BatchedWire],
-        wires: &ErrorNormWireStore,
-        input_gate_positions: &[usize],
-        input_values: &[Option<Arc<ErrorNorm>>],
-    ) -> Vec<PolyMatrixNorm> {
-        input_ids
-            .par_iter()
-            .flat_map_iter(|batch| batch.gate_ids())
-            .map(|input_id| {
-                self.clone_error_norm_matrix_norm_for_gate(
-                    input_id,
-                    wires,
-                    input_gate_positions,
-                    input_values,
-                )
-            })
-            .collect::<Vec<_>>()
-    }
-
-    fn collect_error_norm_matrix_norm_refs_for_input_set<'a>(
-        &self,
-        input_ids: &[BatchedWire],
-        wires: &'a ErrorNormWireStore,
-        input_gate_positions: &[usize],
-        input_values: &'a [Option<Arc<ErrorNorm>>],
-    ) -> Vec<&'a PolyMatrixNorm> {
-        input_ids
-            .par_iter()
-            .flat_map_iter(|batch| batch.gate_ids())
-            .map(|input_id| {
-                self.borrow_error_norm_matrix_norm_for_gate(
-                    input_id,
-                    wires,
-                    input_gate_positions,
-                    input_values,
-                )
-            })
-            .collect::<Vec<_>>()
-    }
-
     fn collect_error_norm_plaintext_norms_for_summary_input_set(
         &self,
         input_ids: &[BatchedWire],
-        gate_exprs: &[Option<Arc<ErrorNormSummaryExpr>>],
-        input_gate_positions: &[usize],
+        gate_exprs: &ErrorNormExprStore,
+        input_gate_positions: &ErrorNormInputGatePositions,
         input_plaintext_norms: &[PolyNorm],
         summary_cache: &ErrorNormSubCircuitSummaryCache,
     ) -> Vec<PolyNorm> {
@@ -1162,8 +869,8 @@ impl PolyCircuit<DCRTPoly> {
     fn collect_error_norm_summary_exprs_for_input_set(
         &self,
         input_ids: &[BatchedWire],
-        gate_exprs: &[Option<Arc<ErrorNormSummaryExpr>>],
-        input_gate_positions: &[usize],
+        gate_exprs: &ErrorNormExprStore,
+        input_gate_positions: &ErrorNormInputGatePositions,
         input_plaintext_norms: &[PolyNorm],
         summary_cache: &ErrorNormSubCircuitSummaryCache,
     ) -> Vec<Arc<ErrorNormSummaryExpr>> {
@@ -1198,15 +905,11 @@ impl PolyCircuit<DCRTPoly> {
         let input_gate_positions = self.error_norm_input_gate_positions(&input_gate_ids);
 
         let output_gate_ids = self.output_gate_ids();
-        let mut output_mask = vec![false; self.num_gates() + 1];
-        for gate_id in output_gate_ids {
-            output_mask[gate_id.0] = true;
-        }
+        let output_gate_ids_set = output_gate_ids.iter().copied().collect::<HashSet<_>>();
         let mut input_values =
             inputs.into_iter().map(|value| Some(Arc::new(value))).collect::<Vec<_>>();
-        let mut wires: ErrorNormWireStore = vec![None; self.num_gates() + 1];
-        wires[0] = Some(Arc::new(one_error.clone()));
-        let mut wire_count = 1usize;
+        let mut wires = ErrorNormWireStore::default();
+        wires.insert_single(GateId(0), one_error.clone());
 
         let mut sub_circuit_summaries: ErrorNormSubCircuitSummaryCache = HashMap::new();
         let mut cache_stats = ErrorNormSubCircuitCacheStats::default();
@@ -1234,7 +937,7 @@ impl PolyCircuit<DCRTPoly> {
         ) in execution_layers.into_iter().enumerate()
         {
             let level_start = Instant::now();
-            let (parallel_regular_gate_ids, sequential_regular_gate_ids) = regular_gate_ids
+            let (pure_regular_gate_ids, evaluator_regular_gate_ids) = regular_gate_ids
                 .into_par_iter()
                 .fold(
                     || (Vec::new(), Vec::new()),
@@ -1270,21 +973,21 @@ impl PolyCircuit<DCRTPoly> {
                     },
                 );
             debug!(
-                "error-norm eval level ready level={} regular={} parallel_regular={} sequential_regular={} sub_calls={} summed_sub_calls={} elapsed_ms=0",
+                "error-norm eval level ready level={} regular={} pure_regular={} evaluator_regular={} sub_calls={} summed_sub_calls={} elapsed_ms=0",
                 level_idx,
-                parallel_regular_gate_ids.len() + sequential_regular_gate_ids.len(),
-                parallel_regular_gate_ids.len(),
-                sequential_regular_gate_ids.len(),
+                pure_regular_gate_ids.len() + evaluator_regular_gate_ids.len(),
+                pure_regular_gate_ids.len(),
+                evaluator_regular_gate_ids.len(),
                 sub_circuit_call_ids.len(),
                 summed_sub_circuit_call_ids.len(),
             );
 
-            let parallel_regular_results = parallel_regular_gate_ids
+            let pure_regular_results = pure_regular_gate_ids
                 .par_iter()
                 .map(|gate_id| {
                     (
                         *gate_id,
-                        self.eval_parallel_regular_error_norm_gate(
+                        self.eval_pure_regular_error_norm_gate(
                             *gate_id,
                             &wires,
                             &input_gate_positions,
@@ -1293,13 +996,13 @@ impl PolyCircuit<DCRTPoly> {
                     )
                 })
                 .collect::<Vec<_>>();
-            let sequential_regular_start = Instant::now();
-            let sequential_regular_results = sequential_regular_gate_ids
+            let evaluator_regular_start = Instant::now();
+            let evaluator_regular_results = evaluator_regular_gate_ids
                 .par_iter()
                 .map(|gate_id| {
                     (
                         *gate_id,
-                        self.eval_sequential_regular_error_norm_gate(
+                        self.eval_evaluator_regular_error_norm_gate(
                             *gate_id,
                             &one_error,
                             &wires,
@@ -1312,34 +1015,25 @@ impl PolyCircuit<DCRTPoly> {
                 })
                 .collect::<Vec<_>>();
             debug!(
-                "error-norm eval level sequential regular finished level={} sequential_regular={} elapsed_ms={}",
+                "error-norm eval level evaluator regular finished level={} evaluator_regular={} elapsed_ms={}",
                 level_idx,
-                sequential_regular_gate_ids.len(),
-                sequential_regular_start.elapsed().as_millis()
+                evaluator_regular_gate_ids.len(),
+                evaluator_regular_start.elapsed().as_millis()
             );
 
-            for (gate_id, value) in
-                parallel_regular_results.into_iter().chain(sequential_regular_results.into_iter())
-            {
-                self.store_error_norm_value(
-                    gate_id,
-                    value,
-                    output_mask[gate_id.0],
-                    &remaining_use_count,
-                    &mut wires,
-                    &mut wire_count,
-                );
-            }
-            for gate_id in
-                parallel_regular_gate_ids.iter().chain(sequential_regular_gate_ids.iter())
-            {
+            self.store_error_norm_value_pairs(
+                pure_regular_results.into_iter().chain(evaluator_regular_results.into_iter()),
+                &output_gate_ids_set,
+                &remaining_use_count,
+                &mut wires,
+            );
+            for gate_id in pure_regular_gate_ids.iter().chain(evaluator_regular_gate_ids.iter()) {
                 let gate = self.gate(*gate_id);
                 self.release_error_norm_inputs(
                     gate.input_gates.iter().copied(),
-                    &output_mask,
+                    &output_gate_ids_set,
                     &mut remaining_use_count,
                     &mut wires,
-                    &mut wire_count,
                     &input_gate_positions,
                     &mut input_values,
                 );
@@ -1349,9 +1043,8 @@ impl PolyCircuit<DCRTPoly> {
             let cache_misses_before_sub = cache_stats.misses;
             let prepare_sub_calls_start = Instant::now();
             let mut prepared_sub_call_count = 0usize;
-            let mut shared_prefix_plaintext_norms = HashMap::<usize, Arc<[PolyNorm]>>::new();
-            let mut shared_prefix_values = HashMap::<usize, Arc<[Arc<ErrorNorm>]>>::new();
-            for call_id_chunk in sub_circuit_call_ids.chunks(ERROR_NORM_SUBCALL_BATCH_SIZE) {
+            for call_id_chunk in sub_circuit_call_ids.chunks(ERROR_NORM_CALL_COMMIT_BATCH_SIZE) {
+                let mut shared_prefix_plaintext_norms = HashMap::<usize, Arc<[PolyNorm]>>::new();
                 let prepared_profiles = call_id_chunk
                     .par_iter()
                     .map(|call_id| {
@@ -1409,29 +1102,121 @@ impl PolyCircuit<DCRTPoly> {
                                         )
                                     })
                                     .clone();
-                                shared_prefix_values
-                                    .entry(input_set_id)
-                                    .or_insert_with(|| {
-                                        Arc::from(self.collect_error_norm_arcs_for_input_set(
-                                            self.input_set(input_set_id).as_ref(),
-                                            &wires,
-                                            &input_gate_positions,
-                                            &input_values,
-                                        ))
-                                    });
-                                ErrorNormInputPlaintextProfile::SharedPrefix {
-                                    prefix_norms,
-                                    suffix_norms: Arc::from(suffix_plaintext_norms),
-                                }
-                            } else {
-                                ErrorNormInputPlaintextProfile::Flat(Arc::from(
+                                ErrorNormInputPlaintextProfile::shared_prefix_from_parts(
+                                    prefix_norms.as_ref(),
                                     suffix_plaintext_norms,
-                                ))
+                                )
+                            } else {
+                                ErrorNormInputPlaintextProfile::flat_from_vec(
+                                    suffix_plaintext_norms,
+                                )
                             };
                             (call_id, sub_circuit_id, param_bindings, input_plaintext_profile)
                         },
                     )
                     .collect::<Vec<_>>();
+                let mut process_prepared_sub_circuit_calls =
+                    |prepared_sub_circuit_calls: &[(usize, Arc<ErrorNormSubCircuitSummary>)],
+                     call_batch_size: usize| {
+                        prepared_sub_call_count += prepared_sub_circuit_calls.len();
+                        for prepared_chunk in prepared_sub_circuit_calls.chunks(call_batch_size) {
+                            let max_output_len = prepared_chunk
+                                .iter()
+                                .map(|(_, summary)| summary.output_len())
+                                .max()
+                                .unwrap_or(0);
+                            for chunk_start in
+                                (0..max_output_len).step_by(ERROR_NORM_OUTPUT_BATCH_SIZE)
+                            {
+                                let prepared_outputs = prepared_chunk
+                                    .par_iter()
+                                    .filter_map(|(call_id, summary)| {
+                                        if chunk_start >= summary.output_len() {
+                                            return None;
+                                        }
+                                        self.with_sub_circuit_call_by_id(
+                                            *call_id,
+                                            |actual_sub_circuit_id,
+                                             _param_bindings,
+                                             shared_prefix,
+                                             suffix,
+                                             output_gate_ids| {
+                                                let _ = actual_sub_circuit_id;
+                                                assert_eq!(
+                                                    output_gate_ids.len(),
+                                                    summary.output_len(),
+                                                    "error-norm sub-circuit output count mismatch for call {call_id}"
+                                                );
+                                                let output_range =
+                                                    BatchedWire::from_batches(output_gate_ids.iter().copied());
+                                                let chunk_end =
+                                                    (chunk_start + ERROR_NORM_OUTPUT_BATCH_SIZE)
+                                                        .min(output_range.len());
+                                                let outputs = summary
+                                                    .evaluate_output_range_with_shared_cache(
+                                                        chunk_start..chunk_end,
+                                                        &|input_idx| {
+                                                            let input_id =
+                                                                resolve_shared_prefix_suffix_input_id(
+                                                                    shared_prefix,
+                                                                    suffix,
+                                                                    input_idx,
+                                                                );
+                                                            self.clone_error_norm_matrix_norm_for_gate(
+                                                                input_id,
+                                                                &wires,
+                                                                &input_gate_positions,
+                                                                &input_values,
+                                                            )
+                                                        },
+                                                    );
+                                                Some((
+                                                    *call_id,
+                                                    output_range.slice(chunk_start..chunk_end),
+                                                    outputs,
+                                                    chunk_end == output_range.len(),
+                                                ))
+                                            },
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
+                                for (call_id, output_range, outputs, finished_call) in
+                                    prepared_outputs
+                                {
+                                    self.store_error_norm_value_batch(
+                                        output_range,
+                                        outputs,
+                                        &output_gate_ids_set,
+                                        &remaining_use_count,
+                                        &mut wires,
+                                    );
+                                    if finished_call {
+                                        self.with_sub_circuit_call_inputs_by_id(
+                                            call_id,
+                                            |shared_prefix, suffix| {
+                                                self.release_error_norm_inputs(
+                                                    iter_batched_wire_gates(shared_prefix),
+                                                    &output_gate_ids_set,
+                                                    &mut remaining_use_count,
+                                                    &mut wires,
+                                                    &input_gate_positions,
+                                                    &mut input_values,
+                                                );
+                                                self.release_error_norm_inputs(
+                                                    iter_batched_wire_gates(suffix),
+                                                    &output_gate_ids_set,
+                                                    &mut remaining_use_count,
+                                                    &mut wires,
+                                                    &input_gate_positions,
+                                                    &mut input_values,
+                                                );
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    };
                 let prepared_sub_circuit_calls = self.resolve_cached_sub_circuit_summary_batch(
                     prepared_profiles,
                     &one_error,
@@ -1440,135 +1225,10 @@ impl PolyCircuit<DCRTPoly> {
                     plt_evaluator,
                     slot_transfer_evaluator,
                 );
-                prepared_sub_call_count += prepared_sub_circuit_calls.len();
-                let parallel_call_eval_batch = prepared_sub_circuit_calls
-                    .first()
-                    .map(|(_, summary)| {
-                        error_norm_parallel_call_eval_batch(summary.output_exprs.len())
-                    })
-                    .unwrap_or(ERROR_NORM_PARALLEL_CALL_EVAL_BATCH);
-                for prepared_chunk in prepared_sub_circuit_calls.chunks(parallel_call_eval_batch) {
-                    let evaluated_calls = prepared_chunk
-                        .par_iter()
-                        .map(|(call_id, summary)| {
-                            self.with_sub_circuit_call_by_id(
-                                *call_id,
-                                |actual_sub_circuit_id,
-                                 _param_bindings,
-                                 shared_prefix,
-                                 suffix,
-                                 output_gate_ids| {
-                                    let _ = actual_sub_circuit_id;
-                                    assert_eq!(
-                                        output_gate_ids.len(),
-                                        summary.output_exprs.len(),
-                                        "error-norm sub-circuit output count mismatch for call {call_id}"
-                                    );
-                                    let subcall_outputs_start = Instant::now();
-                                    trace!(
-                                        "error-norm eval sub-call outputs start call_id={} outputs={}",
-                                        call_id,
-                                        output_gate_ids.len()
-                                    );
-                                    let outputs = if let Some(input_set_id) =
-                                        self.sub_circuit_call_shared_prefix_set_id(*call_id)
-                                    {
-                                        let prefix_values = shared_prefix_values
-                                            .get(&input_set_id)
-                                            .unwrap_or_else(|| {
-                                                panic!(
-                                                    "error-norm shared-prefix value cache missing for input set {input_set_id}"
-                                                )
-                                            });
-                                        let suffix_matrix_norms = suffix
-                                            .par_iter()
-                                            .flat_map_iter(|batch| batch.gate_ids())
-                                            .map(|input_id| {
-                                                self.clone_error_norm_matrix_norm_for_gate(
-                                                    input_id,
-                                                    &wires,
-                                                    &input_gate_positions,
-                                                    &input_values,
-                                                )
-                                            })
-                                            .collect::<Vec<_>>();
-                                        summary.evaluate_with(&|input_idx| {
-                                            if input_idx < prefix_values.len() {
-                                                prefix_values[input_idx].matrix_norm.clone()
-                                            } else {
-                                                suffix_matrix_norms[input_idx - prefix_values.len()]
-                                                    .clone()
-                                            }
-                                        })
-                                    } else {
-                                        let input_matrix_norms =
-                                            self.collect_error_norm_matrix_norm_refs_for_inputs(
-                                                shared_prefix,
-                                                suffix,
-                                                &wires,
-                                                &input_gate_positions,
-                                                &input_values,
-                                            );
-                                        summary.evaluate_refs(&input_matrix_norms)
-                                    };
-                                    trace!(
-                                        "error-norm eval sub-call outputs finished call_id={} outputs={} elapsed_ms={}",
-                                        call_id,
-                                        output_gate_ids.len(),
-                                        subcall_outputs_start.elapsed().as_millis()
-                                    );
-                                    (*call_id, outputs)
-                                },
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    for (call_id, outputs) in evaluated_calls {
-                        self.with_sub_circuit_call_by_id(
-                            call_id,
-                            |_actual_sub_circuit_id,
-                             _param_bindings,
-                             _shared_prefix,
-                             _suffix,
-                             output_gate_ids| {
-                                for (output_gate_id, output) in
-                                    output_gate_ids.iter().copied().zip(outputs.into_iter())
-                                {
-                                    self.store_error_norm_value(
-                                        output_gate_id,
-                                        output,
-                                        output_mask[output_gate_id.0],
-                                        &remaining_use_count,
-                                        &mut wires,
-                                        &mut wire_count,
-                                    );
-                                }
-                            },
-                        );
-                        self.with_sub_circuit_call_inputs_by_id(
-                            call_id,
-                            |shared_prefix, suffix| {
-                                self.release_error_norm_inputs(
-                                    iter_batched_wire_gates(shared_prefix),
-                                    &output_mask,
-                                    &mut remaining_use_count,
-                                    &mut wires,
-                                    &mut wire_count,
-                                    &input_gate_positions,
-                                    &mut input_values,
-                                );
-                                self.release_error_norm_inputs(
-                                    iter_batched_wire_gates(suffix),
-                                    &output_mask,
-                                    &mut remaining_use_count,
-                                    &mut wires,
-                                    &mut wire_count,
-                                    &input_gate_positions,
-                                    &mut input_values,
-                                );
-                            },
-                        );
-                    }
-                }
+                process_prepared_sub_circuit_calls(
+                    &prepared_sub_circuit_calls,
+                    ERROR_NORM_CALL_COMMIT_BATCH_SIZE,
+                );
             }
             debug!(
                 "error-norm eval level sub-call preparation finished level={} sub_calls={} cache_hits_delta={} cache_misses_delta={} elapsed_ms={}",
@@ -1583,10 +1243,10 @@ impl PolyCircuit<DCRTPoly> {
             let cache_misses_before_summed = cache_stats.misses;
             let prepare_summed_sub_calls_start = Instant::now();
             let mut prepared_summed_call_count = 0usize;
-            for summed_call_id_chunk in
-                summed_sub_circuit_call_ids.chunks(ERROR_NORM_SUBCALL_BATCH_SIZE)
+            for summed_call_chunk in
+                summed_sub_circuit_call_ids.chunks(ERROR_NORM_SUMMED_CALL_COMMIT_BATCH_SIZE)
             {
-                let prepared_profiles = summed_call_id_chunk
+                let prepared_profiles = summed_call_chunk
                     .par_iter()
                     .map(|summed_call_id| {
                         self.with_summed_sub_circuit_call_by_id(
@@ -1617,21 +1277,12 @@ impl PolyCircuit<DCRTPoly> {
                         let cache_key = self.error_norm_sub_circuit_cache_key(*sub_circuit_id);
                         let cached_summaries = inner_profiles
                             .par_iter()
-                            .map(|(input_plaintext_norms, param_bindings)| {
-                                self.find_cached_error_norm_summary_index_for_key(
+                            .map(|(input_plaintext_norms, _param_bindings)| {
+                                self.find_cached_error_norm_summary_for_key(
                                     cache_key,
                                     input_plaintext_norms,
-                                    param_bindings.as_ref(),
                                     &sub_circuit_summaries,
                                 )
-                                .map(|summary_idx| {
-                                    Arc::clone(
-                                        &sub_circuit_summaries.get(&cache_key).expect(
-                                            "error-norm summed sub-circuit summary cache missing",
-                                        )[summary_idx]
-                                            .summary,
-                                    )
-                                })
                             })
                             .collect::<Vec<_>>();
                         (*summed_call_id, cached_summaries)
@@ -1655,9 +1306,9 @@ impl PolyCircuit<DCRTPoly> {
                             } else {
                                 self.ensure_cached_sub_circuit_summary(
                                     sub_circuit_id,
-                                    ErrorNormInputPlaintextProfile::Flat(Arc::from(
+                                    ErrorNormInputPlaintextProfile::flat_from_vec(
                                         input_plaintext_norms,
-                                    )),
+                                    ),
                                     param_bindings,
                                     &one_error,
                                     &mut sub_circuit_summaries,
@@ -1671,100 +1322,113 @@ impl PolyCircuit<DCRTPoly> {
                     prepared_summed_sub_circuit_calls.push((summed_call_id, inner_summaries));
                 }
                 prepared_summed_call_count += prepared_summed_sub_circuit_calls.len();
-                for (summed_call_id, inner_summaries) in prepared_summed_sub_circuit_calls {
-                    self.with_summed_sub_circuit_call_by_id(
-                        summed_call_id,
-                        |actual_sub_circuit_id,
-                         call_input_set_ids,
-                         _call_binding_set_ids,
-                         output_gate_ids| {
-                            let _ = actual_sub_circuit_id;
-                            let first_summary = &inner_summaries[0];
-                            assert_eq!(
-                                output_gate_ids.len(),
-                                first_summary.output_exprs.len(),
-                                "error-norm summed sub-circuit output count mismatch for call {summed_call_id}"
-                            );
-                            let summed_outputs_start = Instant::now();
-                            trace!(
-                                "error-norm eval summed sub-call outputs start summed_call_id={} outputs={} inner_calls={}",
-                                summed_call_id,
-                                output_gate_ids.len(),
-                                call_input_set_ids.len()
-                            );
-                            for (chunk_idx, output_gate_id_chunk) in
-                                output_gate_ids.chunks(ERROR_NORM_OUTPUT_BATCH_SIZE).enumerate()
-                            {
-                                let chunk_start = chunk_idx * ERROR_NORM_OUTPUT_BATCH_SIZE;
-                                let chunk_end = chunk_start + output_gate_id_chunk.len();
-                                let mut accumulated_chunk: Option<Vec<ErrorNorm>> = None;
-                                for (input_set_id, summary) in
-                                    call_input_set_ids.iter().zip(inner_summaries.iter())
-                                {
-                                    let input_matrix_norms =
-                                        self.collect_error_norm_matrix_norm_refs_for_input_set(
-                                            self.input_set(*input_set_id).as_ref(),
-                                            &wires,
-                                            &input_gate_positions,
-                                            &input_values,
+                for prepared_chunk in
+                    prepared_summed_sub_circuit_calls.chunks(ERROR_NORM_CALL_COMMIT_BATCH_SIZE)
+                {
+                    let max_output_len = prepared_chunk
+                        .iter()
+                        .map(|(_, summaries)| summaries[0].output_len())
+                        .max()
+                        .unwrap_or(0);
+                    for chunk_start in (0..max_output_len).step_by(ERROR_NORM_OUTPUT_BATCH_SIZE) {
+                        let prepared_outputs = prepared_chunk
+                            .par_iter()
+                            .filter_map(|(summed_call_id, inner_summaries)| {
+                                self.with_summed_sub_circuit_call_by_id(
+                                    *summed_call_id,
+                                    |actual_sub_circuit_id,
+                                     call_input_set_ids,
+                                     _call_binding_set_ids,
+                                     output_gate_ids| {
+                                        let _ = actual_sub_circuit_id;
+                                        let first_summary = &inner_summaries[0];
+                                        assert_eq!(
+                                            output_gate_ids.len(),
+                                            first_summary.output_len(),
+                                            "error-norm summed sub-circuit output count mismatch for call {summed_call_id}"
                                         );
-                                    let sub_outputs = summary.output_exprs[chunk_start..chunk_end]
-                                        .par_iter()
-                                        .map(|expr| expr.evaluate_refs(&input_matrix_norms))
-                                        .collect::<Vec<_>>();
-                                    match accumulated_chunk.as_mut() {
-                                        Some(current) => {
-                                            for (acc, output) in
-                                                current.iter_mut().zip(sub_outputs.into_iter())
-                                            {
-                                                *acc = acc.clone() + &output;
-                                            }
+                                        let output_range =
+                                            BatchedWire::from_batches(output_gate_ids.iter().copied());
+                                        if chunk_start >= output_range.len() {
+                                            return None;
                                         }
-                                        None => accumulated_chunk = Some(sub_outputs),
-                                    }
-                                }
-                                for (output_gate_id, output) in output_gate_id_chunk
-                                    .iter()
-                                    .copied()
-                                    .zip(
-                                        accumulated_chunk
+                                        let chunk_end = (chunk_start + ERROR_NORM_OUTPUT_BATCH_SIZE)
+                                            .min(output_range.len());
+                                        let chunk_values = call_input_set_ids
+                                            .par_iter()
+                                            .zip(inner_summaries.par_iter())
+                                            .map(|(input_set_id, summary)| {
+                                                let input_ids = self.input_set(*input_set_id);
+                                            summary.evaluate_output_range_with_shared_cache(
+                                                chunk_start..chunk_end,
+                                                &|input_idx| {
+                                                    let input_id = resolve_input_set_gate_id(
+                                                        input_ids.as_ref(),
+                                                            input_idx,
+                                                        );
+                                                        self.clone_error_norm_matrix_norm_for_gate(
+                                                            input_id,
+                                                            &wires,
+                                                            &input_gate_positions,
+                                                            &input_values,
+                                                        )
+                                                    },
+                                                )
+                                            })
+                                            .reduce_with(|mut left, right| {
+                                                for (left_value, right_value) in
+                                                    left.iter_mut().zip(right)
+                                                {
+                                                    *left_value = &*left_value + &right_value;
+                                                }
+                                                left
+                                            })
                                             .expect(
                                                 "summed sub-circuit call requires at least one inner call",
-                                            )
-                                            .into_iter(),
-                                    )
-                                {
-                                    self.store_error_norm_value(
-                                        output_gate_id,
-                                        output,
-                                        output_mask[output_gate_id.0],
-                                        &remaining_use_count,
-                                        &mut wires,
-                                        &mut wire_count,
-                                    );
-                                }
-                            }
-                            trace!(
-                                "error-norm eval summed sub-call outputs finished summed_call_id={} outputs={} inner_calls={} elapsed_ms={}",
-                                summed_call_id,
-                                output_gate_ids.len(),
-                                call_input_set_ids.len(),
-                                summed_outputs_start.elapsed().as_millis()
+                                            );
+                                        Some((
+                                            *summed_call_id,
+                                            output_range.slice(chunk_start..chunk_end),
+                                            chunk_values,
+                                            chunk_end == output_range.len(),
+                                        ))
+                                    },
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        for (summed_call_id, output_range, chunk_values, finished_call) in
+                            prepared_outputs
+                        {
+                            self.store_error_norm_value_batch(
+                                output_range,
+                                chunk_values,
+                                &output_gate_ids_set,
+                                &remaining_use_count,
+                                &mut wires,
                             );
-                            for input_set_id in call_input_set_ids {
-                                    let input_ids = self.input_set(*input_set_id);
-                                    self.release_error_norm_inputs(
-                                        iter_batched_wire_gates(input_ids.as_ref()),
-                                        &output_mask,
-                                        &mut remaining_use_count,
-                                        &mut wires,
-                                    &mut wire_count,
-                                    &input_gate_positions,
-                                    &mut input_values,
+                            if finished_call {
+                                self.with_summed_sub_circuit_call_by_id(
+                                    summed_call_id,
+                                    |_actual_sub_circuit_id,
+                                     call_input_set_ids,
+                                     _call_binding_set_ids,
+                                     _output_gate_ids| {
+                                        for input_set_id in call_input_set_ids {
+                                            let input_ids = self.input_set(*input_set_id);
+                                            self.release_error_norm_inputs(
+                                                iter_batched_wire_gates(input_ids.as_ref()),
+                                                &output_gate_ids_set,
+                                                &mut remaining_use_count,
+                                                &mut wires,
+                                                &input_gate_positions,
+                                                &mut input_values,
+                                            );
+                                        }
+                                    },
                                 );
                             }
-                        },
-                    );
+                        }
+                    }
                 }
             }
             debug!(
@@ -1778,7 +1442,7 @@ impl PolyCircuit<DCRTPoly> {
             debug!(
                 "error-norm eval level finished level={} remaining_wires={} total_elapsed_ms={}",
                 level_idx,
-                wire_count,
+                wires.live_entries,
                 level_start.elapsed().as_millis()
             );
         }
@@ -1794,8 +1458,8 @@ impl PolyCircuit<DCRTPoly> {
             .iter()
             .copied()
             .map(|gate_id| {
-                if let Some(value) = wires[gate_id.0].take() {
-                    wire_count -= 1;
+                if let Some(value) = wires.take(gate_id) {
+                    let value: Arc<ErrorNorm> = value;
                     value.as_ref().clone()
                 } else {
                     self.clone_error_norm_value_for_gate(
@@ -1809,11 +1473,11 @@ impl PolyCircuit<DCRTPoly> {
             .collect()
     }
 
-    fn build_parallel_regular_error_norm_expr(
+    fn build_pure_regular_error_norm_expr(
         &self,
         gate_id: GateId,
-        gate_exprs: &[Option<Arc<ErrorNormSummaryExpr>>],
-        input_gate_positions: &[usize],
+        gate_exprs: &ErrorNormExprStore,
+        input_gate_positions: &ErrorNormInputGatePositions,
         input_plaintext_norms: &[PolyNorm],
         param_bindings: &[SubCircuitParamValue],
         summary_cache: &ErrorNormSubCircuitSummaryCache,
@@ -1876,15 +1540,15 @@ impl PolyCircuit<DCRTPoly> {
                 );
                 input.as_ref().large_scalar_mul_bound(scalar)
             }
-            _ => panic!("gate {gate_id} is not parallel-eligible in error-norm summary eval"),
+            _ => panic!("gate {gate_id} is not pure in error-norm summary eval"),
         }
     }
 
-    fn build_sequential_regular_error_norm_expr<P: AffinePltEvaluator>(
+    fn build_evaluator_regular_error_norm_expr<P: AffinePltEvaluator>(
         &self,
         gate_id: GateId,
-        gate_exprs: &[Option<Arc<ErrorNormSummaryExpr>>],
-        input_gate_positions: &[usize],
+        gate_exprs: &ErrorNormExprStore,
+        input_gate_positions: &ErrorNormInputGatePositions,
         input_plaintext_norms: &[PolyNorm],
         param_bindings: &[SubCircuitParamValue],
         summary_cache: &ErrorNormSubCircuitSummaryCache,
@@ -1923,7 +1587,7 @@ impl PolyCircuit<DCRTPoly> {
                     lut_id,
                 )
             }
-            _ => self.build_parallel_regular_error_norm_expr(
+            _ => self.build_pure_regular_error_norm_expr(
                 gate_id,
                 gate_exprs,
                 input_gate_positions,
@@ -1936,6 +1600,7 @@ impl PolyCircuit<DCRTPoly> {
 
     fn build_sub_circuit_summary<P: AffinePltEvaluator>(
         &self,
+        sub_circuit_id: usize,
         one_error: &ErrorNorm,
         input_plaintext_norms: &[PolyNorm],
         param_bindings: &[SubCircuitParamValue],
@@ -1951,37 +1616,58 @@ impl PolyCircuit<DCRTPoly> {
             "error-norm summary plaintext profile length must match sub-circuit inputs"
         );
         let output_gate_ids = self.output_gate_ids();
-        let mut output_mask = vec![false; self.num_gates() + 1];
-        let mut primary_output_positions = vec![MISSING_GATE_POSITION; self.num_gates() + 1];
-        let mut extra_output_positions: HashMap<GateId, Vec<usize>> = HashMap::new();
-        for (idx, gate_id) in output_gate_ids.iter().copied().enumerate() {
-            output_mask[gate_id.0] = true;
-            let primary = &mut primary_output_positions[gate_id.0];
-            if *primary == MISSING_GATE_POSITION {
-                *primary = idx;
-            } else {
-                extra_output_positions.entry(gate_id).or_default().push(idx);
-            }
+        let output_gate_ids_set = output_gate_ids.iter().copied().collect::<HashSet<_>>();
+        let log_large_summary = self.num_gates() >= 100_000 || output_gate_ids.len() >= 100_000;
+        if log_large_summary {
+            debug!(
+                "error-norm summary build start sub_circuit_id={} inputs={} outputs={} gates={}",
+                sub_circuit_id,
+                input_gate_ids.len(),
+                output_gate_ids.len(),
+                self.num_gates()
+            );
         }
-        let mut final_output_exprs: Vec<Option<Arc<ErrorNormSummaryExpr>>> =
+        let mut output_positions = HashMap::<GateId, Vec<usize>>::new();
+        for (idx, gate_id) in output_gate_ids.iter().copied().enumerate() {
+            output_positions.entry(gate_id).or_default().push(idx);
+        }
+        let mut final_output_exprs: Vec<Option<ErrorNormSummaryExpr>> =
             vec![None; output_gate_ids.len()];
         let input_gate_positions = self.error_norm_input_gate_positions(&input_gate_ids);
-        let mut gate_exprs = vec![None; self.num_gates() + 1];
-        gate_exprs[GateId(0).0] = Some(Arc::new(ErrorNormSummaryExpr::constant(one_error.clone())));
+        let mut gate_exprs = ErrorNormExprStore::default();
+        gate_exprs.insert_single(GateId(0), ErrorNormSummaryExpr::constant(one_error.clone()));
         let execution_layers_start = Instant::now();
         let execution_layers = self.error_norm_execution_layers();
-        trace!(
-            "error-norm summary execution layers ready levels={} elapsed_ms={}",
-            execution_layers.len(),
-            execution_layers_start.elapsed().as_millis()
-        );
+        if log_large_summary {
+            debug!(
+                "error-norm summary execution layers ready sub_circuit_id={} levels={} elapsed_ms={}",
+                sub_circuit_id,
+                execution_layers.len(),
+                execution_layers_start.elapsed().as_millis()
+            );
+        } else {
+            trace!(
+                "error-norm summary execution layers ready levels={} elapsed_ms={}",
+                execution_layers.len(),
+                execution_layers_start.elapsed().as_millis()
+            );
+        }
         let remaining_use_count_start = Instant::now();
         let mut remaining_use_count = self.error_norm_remaining_use_count(&execution_layers);
-        trace!(
-            "error-norm summary remaining-use-count ready entries={} elapsed_ms={}",
-            remaining_use_count.len(),
-            remaining_use_count_start.elapsed().as_millis()
-        );
+        if log_large_summary {
+            debug!(
+                "error-norm summary remaining-use-count ready sub_circuit_id={} entries={} elapsed_ms={}",
+                sub_circuit_id,
+                remaining_use_count.len(),
+                remaining_use_count_start.elapsed().as_millis()
+            );
+        } else {
+            trace!(
+                "error-norm summary remaining-use-count ready entries={} elapsed_ms={}",
+                remaining_use_count.len(),
+                remaining_use_count_start.elapsed().as_millis()
+            );
+        }
         for (
             level_idx,
             ErrorNormExecutionLayer {
@@ -1992,7 +1678,7 @@ impl PolyCircuit<DCRTPoly> {
         ) in execution_layers.into_iter().enumerate()
         {
             let level_start = Instant::now();
-            let (parallel_regular_gate_ids, sequential_regular_gate_ids) = regular_gate_ids
+            let (pure_regular_gate_ids, evaluator_regular_gate_ids) = regular_gate_ids
                 .into_par_iter()
                 .fold(
                     || (Vec::new(), Vec::new()),
@@ -2029,22 +1715,35 @@ impl PolyCircuit<DCRTPoly> {
                         left
                     },
                 );
-            trace!(
-                "error-norm summary level ready level={} regular={} parallel_regular={} sequential_regular={} sub_calls={} summed_sub_calls={} elapsed_ms=0",
-                level_idx,
-                parallel_regular_gate_ids.len() + sequential_regular_gate_ids.len(),
-                parallel_regular_gate_ids.len(),
-                sequential_regular_gate_ids.len(),
-                sub_circuit_call_ids.len(),
-                summed_sub_circuit_call_ids.len(),
-            );
+            if log_large_summary {
+                debug!(
+                    "error-norm summary level ready sub_circuit_id={} level={} regular={} pure_regular={} evaluator_regular={} sub_calls={} summed_sub_calls={} elapsed_ms=0",
+                    sub_circuit_id,
+                    level_idx,
+                    pure_regular_gate_ids.len() + evaluator_regular_gate_ids.len(),
+                    pure_regular_gate_ids.len(),
+                    evaluator_regular_gate_ids.len(),
+                    sub_circuit_call_ids.len(),
+                    summed_sub_circuit_call_ids.len(),
+                );
+            } else {
+                trace!(
+                    "error-norm summary level ready level={} regular={} pure_regular={} evaluator_regular={} sub_calls={} summed_sub_calls={} elapsed_ms=0",
+                    level_idx,
+                    pure_regular_gate_ids.len() + evaluator_regular_gate_ids.len(),
+                    pure_regular_gate_ids.len(),
+                    evaluator_regular_gate_ids.len(),
+                    sub_circuit_call_ids.len(),
+                    summed_sub_circuit_call_ids.len(),
+                );
+            }
 
-            let parallel_regular_exprs = parallel_regular_gate_ids
+            let pure_regular_exprs = pure_regular_gate_ids
                 .par_iter()
                 .map(|gate_id| {
                     (
                         *gate_id,
-                        self.build_parallel_regular_error_norm_expr(
+                        self.build_pure_regular_error_norm_expr(
                             *gate_id,
                             &gate_exprs,
                             &input_gate_positions,
@@ -2055,13 +1754,13 @@ impl PolyCircuit<DCRTPoly> {
                     )
                 })
                 .collect::<Vec<_>>();
-            let sequential_regular_start = Instant::now();
-            let sequential_regular_exprs = sequential_regular_gate_ids
+            let evaluator_regular_start = Instant::now();
+            let evaluator_regular_exprs = evaluator_regular_gate_ids
                 .par_iter()
                 .map(|gate_id| {
                     (
                         *gate_id,
-                        self.build_sequential_regular_error_norm_expr(
+                        self.build_evaluator_regular_error_norm_expr(
                             *gate_id,
                             &gate_exprs,
                             &input_gate_positions,
@@ -2074,33 +1773,35 @@ impl PolyCircuit<DCRTPoly> {
                     )
                 })
                 .collect::<Vec<_>>();
-            trace!(
-                "error-norm summary level sequential regular finished level={} sequential_regular={} elapsed_ms={}",
-                level_idx,
-                sequential_regular_gate_ids.len(),
-                sequential_regular_start.elapsed().as_millis()
-            );
-
-            for (gate_id, expr) in
-                parallel_regular_exprs.into_iter().chain(sequential_regular_exprs.into_iter())
-            {
-                self.store_error_norm_summary_expr(
-                    gate_id,
-                    expr,
-                    &primary_output_positions,
-                    &extra_output_positions,
-                    &remaining_use_count,
-                    &mut gate_exprs,
-                    &mut final_output_exprs,
+            if log_large_summary {
+                debug!(
+                    "error-norm summary level evaluator regular finished sub_circuit_id={} level={} evaluator_regular={} elapsed_ms={}",
+                    sub_circuit_id,
+                    level_idx,
+                    evaluator_regular_gate_ids.len(),
+                    evaluator_regular_start.elapsed().as_millis()
+                );
+            } else {
+                trace!(
+                    "error-norm summary level evaluator regular finished level={} evaluator_regular={} elapsed_ms={}",
+                    level_idx,
+                    evaluator_regular_gate_ids.len(),
+                    evaluator_regular_start.elapsed().as_millis()
                 );
             }
-            for gate_id in
-                parallel_regular_gate_ids.iter().chain(sequential_regular_gate_ids.iter())
-            {
+
+            self.store_error_norm_summary_expr_batch(
+                pure_regular_exprs.into_iter().chain(evaluator_regular_exprs.into_iter()),
+                &output_positions,
+                &remaining_use_count,
+                &mut gate_exprs,
+                &mut final_output_exprs,
+            );
+            for gate_id in pure_regular_gate_ids.iter().chain(evaluator_regular_gate_ids.iter()) {
                 let gate = self.gate(*gate_id);
                 self.release_error_norm_summary_inputs(
                     gate.input_gates.iter().copied(),
-                    &output_mask,
+                    &output_gate_ids_set,
                     &mut remaining_use_count,
                     &mut gate_exprs,
                 );
@@ -2110,27 +1811,35 @@ impl PolyCircuit<DCRTPoly> {
             let cache_misses_before_sub = cache_stats.misses;
             let prepare_sub_calls_start = Instant::now();
             let mut prepared_sub_call_count = 0usize;
-            for call_id_chunk in sub_circuit_call_ids.chunks(ERROR_NORM_SUBCALL_BATCH_SIZE) {
+            let mut shared_prefix_plaintext_norms = HashMap::<usize, Arc<[PolyNorm]>>::new();
+            for call_id_chunk in sub_circuit_call_ids.chunks(ERROR_NORM_CALL_COMMIT_BATCH_SIZE) {
                 let prepared_profiles = call_id_chunk
                     .par_iter()
                     .map(|call_id| {
+                        let shared_prefix_set_id =
+                            self.sub_circuit_call_shared_prefix_set_id(*call_id);
                         self.with_sub_circuit_call_by_id(
                             *call_id,
-                            |sub_circuit_id, param_bindings, shared_prefix, suffix, _| {
-                                let child_input_plaintext_norms = self
-                                    .collect_error_norm_plaintext_norms_for_summary_inputs(
-                                        shared_prefix,
-                                        suffix,
-                                        &gate_exprs,
-                                        &input_gate_positions,
-                                        input_plaintext_norms,
-                                        &*summary_cache,
-                                    );
+                            |sub_circuit_id, param_bindings, _shared_prefix, suffix, _| {
+                                let suffix_plaintext_norms = suffix
+                                    .par_iter()
+                                    .flat_map_iter(|batch| batch.gate_ids())
+                                    .map(|input_id| {
+                                        self.clone_error_norm_plaintext_norm_for_cached_summary_gate(
+                                            input_id,
+                                            &gate_exprs,
+                                            &input_gate_positions,
+                                            input_plaintext_norms,
+                                            &*summary_cache,
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
                                 (
                                     *call_id,
                                     sub_circuit_id,
                                     param_bindings,
-                                    child_input_plaintext_norms,
+                                    shared_prefix_set_id,
+                                    suffix_plaintext_norms,
                                 )
                             },
                         )
@@ -2139,18 +1848,181 @@ impl PolyCircuit<DCRTPoly> {
                 let prepared_profiles = prepared_profiles
                     .into_iter()
                     .map(
-                        |(call_id, sub_circuit_id, param_bindings, child_input_plaintext_norms)| {
-                            (
-                                call_id,
-                                sub_circuit_id,
-                                param_bindings,
-                                ErrorNormInputPlaintextProfile::Flat(Arc::from(
-                                    child_input_plaintext_norms,
-                                )),
-                            )
+                        |(
+                            call_id,
+                            sub_circuit_id,
+                            param_bindings,
+                            shared_prefix_set_id,
+                            suffix_plaintext_norms,
+                        )| {
+                            let input_plaintext_profile = if let Some(input_set_id) =
+                                shared_prefix_set_id
+                            {
+                                let prefix_norms = shared_prefix_plaintext_norms
+                                    .entry(input_set_id)
+                                    .or_insert_with(|| {
+                                        Arc::from(
+                                            self.collect_error_norm_plaintext_norms_for_summary_input_set(
+                                                self.input_set(input_set_id).as_ref(),
+                                                &gate_exprs,
+                                                &input_gate_positions,
+                                                input_plaintext_norms,
+                                                &*summary_cache,
+                                            ),
+                                        )
+                                    })
+                                    .clone();
+                                ErrorNormInputPlaintextProfile::shared_prefix_from_parts(
+                                    prefix_norms.as_ref(),
+                                    suffix_plaintext_norms,
+                                )
+                            } else {
+                                ErrorNormInputPlaintextProfile::flat_from_vec(
+                                    suffix_plaintext_norms,
+                                )
+                            };
+                            (call_id, sub_circuit_id, param_bindings, input_plaintext_profile)
                         },
                     )
                     .collect::<Vec<_>>();
+                let mut process_prepared_sub_circuit_calls =
+                    |prepared_sub_circuit_calls: &[(usize, Arc<ErrorNormSubCircuitSummary>)],
+                     summary_cache_ref: &ErrorNormSubCircuitSummaryCache,
+                     call_batch_size: usize| {
+                        prepared_sub_call_count += prepared_sub_circuit_calls.len();
+                        for prepared_chunk in prepared_sub_circuit_calls.chunks(call_batch_size) {
+                            let max_output_len = prepared_chunk
+                                .iter()
+                                .map(|(_, summary)| summary.output_len())
+                                .max()
+                                .unwrap_or(0);
+                            let use_whole_call_shared_cache = prepared_chunk.len() <= 4 &&
+                                max_output_len <= ERROR_NORM_OUTPUT_BATCH_SIZE * 4;
+                            for chunk_start in
+                                (0..max_output_len).step_by(ERROR_NORM_OUTPUT_BATCH_SIZE)
+                            {
+                                let prepared_outputs = prepared_chunk
+                                .par_iter()
+                                .filter_map(|(call_id, summary)| {
+                                    if use_whole_call_shared_cache {
+                                        if chunk_start > 0 {
+                                            return None;
+                                        }
+                                    } else if chunk_start >= summary.output_len() {
+                                        return None;
+                                    }
+                                    self.with_sub_circuit_call_by_id(
+                                        *call_id,
+                                        |actual_sub_circuit_id,
+                                         _param_bindings,
+                                         shared_prefix,
+                                         suffix,
+                                         output_gate_ids| {
+                                            let _ = actual_sub_circuit_id;
+                                            assert_eq!(
+                                                output_gate_ids.len(),
+                                                summary.output_len(),
+                                                "error-norm summary sub-circuit output count mismatch for call {call_id}"
+                                            );
+                                            let output_range =
+                                                BatchedWire::from_batches(output_gate_ids.iter().copied());
+                                            let (output_slice, outputs, finished_call) =
+                                                if use_whole_call_shared_cache {
+                                                    (
+                                                        output_range,
+                                                        summary.substitute_output_range_with_input_fn(
+                                                            0..output_range.len(),
+                                                            &|input_idx| {
+                                                                let input_id =
+                                                                    resolve_shared_prefix_suffix_input_id(
+                                                                        shared_prefix,
+                                                                        suffix,
+                                                                        input_idx,
+                                                                    );
+                                                                self.clone_error_norm_summary_expr_for_cached_summary_gate(
+                                                                    input_id,
+                                                                    &gate_exprs,
+                                                                    &input_gate_positions,
+                                                                    input_plaintext_norms,
+                                                                    summary_cache_ref,
+                                                                )
+                                                            },
+                                                        ),
+                                                        true,
+                                                    )
+                                                } else {
+                                                    let chunk_end =
+                                                        (chunk_start +
+                                                            ERROR_NORM_OUTPUT_BATCH_SIZE)
+                                                            .min(output_range.len());
+                                                    (
+                                                        output_range.slice(
+                                                            chunk_start..chunk_end,
+                                                        ),
+                                                        summary.substitute_output_range_with_input_fn(
+                                                            chunk_start..chunk_end,
+                                                            &|input_idx| {
+                                                                let input_id =
+                                                                    resolve_shared_prefix_suffix_input_id(
+                                                                        shared_prefix,
+                                                                        suffix,
+                                                                        input_idx,
+                                                                    );
+                                                                self.clone_error_norm_summary_expr_for_cached_summary_gate(
+                                                                    input_id,
+                                                                    &gate_exprs,
+                                                                    &input_gate_positions,
+                                                                    input_plaintext_norms,
+                                                                    summary_cache_ref,
+                                                                )
+                                                            },
+                                                        ),
+                                                        chunk_end == output_range.len(),
+                                                    )
+                                                };
+                                            Some((
+                                                *call_id,
+                                                output_slice,
+                                                outputs,
+                                                finished_call,
+                                            ))
+                                        },
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                                for (call_id, output_range, outputs, finished_call) in
+                                    prepared_outputs
+                                {
+                                    self.store_error_norm_summary_expr_batch(
+                                        output_range.gate_ids().zip(outputs.into_iter()),
+                                        &output_positions,
+                                        &remaining_use_count,
+                                        &mut gate_exprs,
+                                        &mut final_output_exprs,
+                                    );
+                                    if finished_call {
+                                        self.with_sub_circuit_call_inputs_by_id(
+                                            call_id,
+                                            |shared_prefix, suffix| {
+                                                self.release_error_norm_summary_inputs(
+                                                    iter_batched_wire_gates(shared_prefix),
+                                                    &output_gate_ids_set,
+                                                    &mut remaining_use_count,
+                                                    &mut gate_exprs,
+                                                );
+                                                self.release_error_norm_summary_inputs(
+                                                    iter_batched_wire_gates(suffix),
+                                                    &output_gate_ids_set,
+                                                    &mut remaining_use_count,
+                                                    &mut gate_exprs,
+                                                );
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    };
                 let prepared_sub_circuit_calls = self.resolve_cached_sub_circuit_summary_batch(
                     prepared_profiles,
                     one_error,
@@ -2159,238 +2031,117 @@ impl PolyCircuit<DCRTPoly> {
                     plt_evaluator,
                     slot_transfer_evaluator,
                 );
-                prepared_sub_call_count += prepared_sub_circuit_calls.len();
-                let parallel_call_eval_batch = prepared_sub_circuit_calls
-                    .first()
-                    .map(|(_, summary)| {
-                        error_norm_parallel_call_eval_batch(summary.output_exprs.len())
-                    })
-                    .unwrap_or(ERROR_NORM_PARALLEL_CALL_EVAL_BATCH);
-                for prepared_chunk in prepared_sub_circuit_calls.chunks(parallel_call_eval_batch) {
-                    let evaluated_calls = prepared_chunk
-                        .par_iter()
-                        .map(|(call_id, summary)| {
-                            self.with_sub_circuit_call_by_id(
-                                *call_id,
-                                |actual_sub_circuit_id,
-                                 _param_bindings,
-                                 shared_prefix,
-                                 suffix,
-                                 output_gate_ids| {
-                                    let _ = actual_sub_circuit_id;
-                                    assert_eq!(
-                                        output_gate_ids.len(),
-                                        summary.output_exprs.len(),
-                                        "error-norm summary sub-circuit output count mismatch for call {call_id}"
-                                    );
-                                    let subcall_outputs_start = Instant::now();
-                                    trace!(
-                                        "error-norm summary sub-call outputs start level={} call_id={} outputs={}",
-                                        level_idx,
-                                        call_id,
-                                        output_gate_ids.len()
-                                    );
-                                    let mut outputs = Vec::with_capacity(output_gate_ids.len());
-                                    for output_expr_chunk in
-                                        summary.output_exprs.chunks(ERROR_NORM_OUTPUT_BATCH_SIZE)
-                                    {
-                                        let actual_input_at = |input_idx: usize| {
-                                            let gate_id = resolve_shared_prefix_suffix_input_id(
-                                                shared_prefix,
-                                                suffix,
-                                                input_idx,
-                                            );
-                                            self.clone_error_norm_summary_expr_for_cached_summary_gate(
-                                                gate_id,
-                                                &gate_exprs,
-                                                &input_gate_positions,
-                                                input_plaintext_norms,
-                                                &*summary_cache,
-                                            )
-                                        };
-                                        outputs.extend(
-                                            output_expr_chunk
-                                                .par_iter()
-                                                .map(|expr| expr.substitute_inputs_with(&actual_input_at))
-                                                .collect::<Vec<_>>(),
-                                        );
-                                    }
-                                    trace!(
-                                        "error-norm summary sub-call outputs finished level={} call_id={} outputs={} elapsed_ms={}",
-                                        level_idx,
-                                        call_id,
-                                        output_gate_ids.len(),
-                                        subcall_outputs_start.elapsed().as_millis()
-                                    );
-                                    (*call_id, outputs)
-                                },
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    for (call_id, outputs) in evaluated_calls {
-                        self.with_sub_circuit_call_by_id(
-                            call_id,
-                            |_actual_sub_circuit_id,
-                             _param_bindings,
-                             _shared_prefix,
-                             _suffix,
-                             output_gate_ids| {
-                                for (output_gate_id, output_expr) in
-                                    output_gate_ids.iter().copied().zip(outputs.into_iter())
-                                {
-                                    self.store_error_norm_summary_expr(
-                                        output_gate_id,
-                                        output_expr,
-                                        &primary_output_positions,
-                                        &extra_output_positions,
-                                        &remaining_use_count,
-                                        &mut gate_exprs,
-                                        &mut final_output_exprs,
-                                    );
-                                }
-                            },
-                        );
-                        self.with_sub_circuit_call_inputs_by_id(
-                            call_id,
-                            |shared_prefix, suffix| {
-                                self.release_error_norm_summary_inputs(
-                                    iter_batched_wire_gates(shared_prefix),
-                                    &output_mask,
-                                    &mut remaining_use_count,
-                                    &mut gate_exprs,
-                                );
-                                self.release_error_norm_summary_inputs(
-                                    iter_batched_wire_gates(suffix),
-                                    &output_mask,
-                                    &mut remaining_use_count,
-                                    &mut gate_exprs,
-                                );
-                            },
-                        );
-                    }
+                process_prepared_sub_circuit_calls(
+                    &prepared_sub_circuit_calls,
+                    &*summary_cache,
+                    ERROR_NORM_CALL_COMMIT_BATCH_SIZE,
+                );
+                if log_large_summary &&
+                    (prepared_sub_call_count % (ERROR_NORM_CALL_COMMIT_BATCH_SIZE * 8) == 0 ||
+                        prepared_sub_call_count == sub_circuit_call_ids.len())
+                {
+                    debug!(
+                        "error-norm summary sub-call commit batch finished sub_circuit_id={} level={} processed_calls={} total_calls={} elapsed_ms={}",
+                        sub_circuit_id,
+                        level_idx,
+                        prepared_sub_call_count,
+                        sub_circuit_call_ids.len(),
+                        prepare_sub_calls_start.elapsed().as_millis()
+                    );
                 }
             }
-            trace!(
-                "error-norm summary level sub-call preparation finished level={} sub_calls={} cache_hits_delta={} cache_misses_delta={} elapsed_ms={}",
-                level_idx,
-                prepared_sub_call_count,
-                cache_stats.hits - cache_hits_before_sub,
-                cache_stats.misses - cache_misses_before_sub,
-                prepare_sub_calls_start.elapsed().as_millis()
-            );
+            if log_large_summary {
+                debug!(
+                    "error-norm summary level sub-call preparation finished sub_circuit_id={} level={} sub_calls={} cache_hits_delta={} cache_misses_delta={} elapsed_ms={}",
+                    sub_circuit_id,
+                    level_idx,
+                    prepared_sub_call_count,
+                    cache_stats.hits - cache_hits_before_sub,
+                    cache_stats.misses - cache_misses_before_sub,
+                    prepare_sub_calls_start.elapsed().as_millis()
+                );
+            } else {
+                trace!(
+                    "error-norm summary level sub-call preparation finished level={} sub_calls={} cache_hits_delta={} cache_misses_delta={} elapsed_ms={}",
+                    level_idx,
+                    prepared_sub_call_count,
+                    cache_stats.hits - cache_hits_before_sub,
+                    cache_stats.misses - cache_misses_before_sub,
+                    prepare_sub_calls_start.elapsed().as_millis()
+                );
+            }
 
             let cache_hits_before_summed = cache_stats.hits;
             let cache_misses_before_summed = cache_stats.misses;
             let prepare_summed_sub_calls_start = Instant::now();
             let mut prepared_summed_call_count = 0usize;
-            for summed_call_id_chunk in
-                summed_sub_circuit_call_ids.chunks(ERROR_NORM_SUBCALL_BATCH_SIZE)
+            for summed_call_chunk in
+                summed_sub_circuit_call_ids.chunks(ERROR_NORM_SUMMED_CALL_COMMIT_BATCH_SIZE)
             {
-                let prepared_profiles = summed_call_id_chunk
-                    .par_iter()
-                    .map(|summed_call_id| {
-                        self.with_summed_sub_circuit_call_by_id(
+                let mut prepared_summed_sub_circuit_calls =
+                    Vec::with_capacity(summed_call_chunk.len());
+                for summed_call_id in summed_call_chunk {
+                    let (sub_circuit_id, inner_profile_specs) = self
+                        .with_summed_sub_circuit_call_by_id(
                             *summed_call_id,
                             |sub_circuit_id, call_input_set_ids, call_binding_set_ids, _| {
-                                let inner_profiles = call_input_set_ids
-                                    .par_iter()
-                                    .zip(call_binding_set_ids.par_iter())
-                                    .map(|(input_set_id, binding_set_id)| {
-                                        let child_input_plaintext_norms = self
-                                            .collect_error_norm_plaintext_norms_for_summary_input_set(
-                                                self.input_set(*input_set_id).as_ref(),
-                                                &gate_exprs,
-                                                &input_gate_positions,
-                                                input_plaintext_norms,
-                                                &*summary_cache,
-                                            );
-                                        (
-                                            child_input_plaintext_norms,
-                                            self.binding_set(*binding_set_id),
-                                        )
-                                    })
-                                    .collect::<Vec<_>>();
-                                (*summed_call_id, sub_circuit_id, inner_profiles)
-                            },
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let cached_inner_profile_hits = prepared_profiles
-                    .par_iter()
-                    .map(|(summed_call_id, sub_circuit_id, inner_profiles)| {
-                        let cache_key = self.error_norm_sub_circuit_cache_key(*sub_circuit_id);
-                        let cached_summaries = inner_profiles
-                            .par_iter()
-                            .map(|(child_input_plaintext_norms, param_bindings)| {
-                                self.find_cached_error_norm_summary_index_for_key(
-                                    cache_key,
-                                    child_input_plaintext_norms,
-                                    param_bindings.as_ref(),
-                                    summary_cache,
+                                (
+                                    sub_circuit_id,
+                                    call_input_set_ids
+                                        .iter()
+                                        .copied()
+                                        .zip(call_binding_set_ids.iter().copied())
+                                        .collect::<Vec<_>>(),
                                 )
-                                .map(|summary_idx| {
-                                    Arc::clone(
-                                        &summary_cache.get(&cache_key).expect(
-                                            "error-norm summed child sub-circuit summary cache missing",
-                                        )[summary_idx]
-                                            .summary,
-                                    )
-                                })
-                            })
-                            .collect::<Vec<_>>();
-                        (*summed_call_id, cached_summaries)
-                    })
-                    .collect::<Vec<_>>();
-                let mut prepared_summed_sub_circuit_calls =
-                    Vec::with_capacity(prepared_profiles.len());
-                for (
-                    (summed_call_id, sub_circuit_id, inner_profiles),
-                    (cached_summed_call_id, cached_summaries),
-                ) in prepared_profiles.into_iter().zip(cached_inner_profile_hits.into_iter())
-                {
-                    debug_assert_eq!(summed_call_id, cached_summed_call_id);
-                    let inner_summaries = inner_profiles
-                        .into_iter()
-                        .zip(cached_summaries.into_iter())
-                        .map(
-                            |(
-                                (child_input_plaintext_norms, param_bindings),
-                                cached_summary_idx,
-                            )| {
-                                if let Some(summary) = cached_summary_idx {
-                                    cache_stats.hits += 1;
-                                    summary
-                                } else {
-                                    self.ensure_cached_sub_circuit_summary(
-                                        sub_circuit_id,
-                                        ErrorNormInputPlaintextProfile::Flat(Arc::from(
-                                            child_input_plaintext_norms,
-                                        )),
-                                        param_bindings,
-                                        one_error,
-                                        summary_cache,
-                                        cache_stats,
-                                        plt_evaluator,
-                                        slot_transfer_evaluator,
-                                    )
-                                }
                             },
-                        )
+                        );
+                    let cache_key = self.error_norm_sub_circuit_cache_key(sub_circuit_id);
+                    let inner_summaries = inner_profile_specs
+                        .into_iter()
+                        .map(|(input_set_id, binding_set_id)| {
+                            let child_input_plaintext_norms = self
+                                .collect_error_norm_plaintext_norms_for_summary_input_set(
+                                    self.input_set(input_set_id).as_ref(),
+                                    &gate_exprs,
+                                    &input_gate_positions,
+                                    input_plaintext_norms,
+                                    &*summary_cache,
+                                );
+                            if let Some(summary) = self.find_cached_error_norm_summary_for_key(
+                                cache_key,
+                                &child_input_plaintext_norms,
+                                summary_cache,
+                            ) {
+                                cache_stats.hits += 1;
+                                summary
+                            } else {
+                                self.ensure_cached_sub_circuit_summary(
+                                    sub_circuit_id,
+                                    ErrorNormInputPlaintextProfile::flat_from_vec(
+                                        child_input_plaintext_norms,
+                                    ),
+                                    self.binding_set(binding_set_id),
+                                    one_error,
+                                    summary_cache,
+                                    cache_stats,
+                                    plt_evaluator,
+                                    slot_transfer_evaluator,
+                                )
+                            }
+                        })
                         .collect::<Vec<_>>();
-                    prepared_summed_sub_circuit_calls.push((summed_call_id, inner_summaries));
+                    prepared_summed_sub_circuit_calls.push((*summed_call_id, inner_summaries));
                 }
                 prepared_summed_call_count += prepared_summed_sub_circuit_calls.len();
-                let parallel_call_eval_batch = prepared_summed_sub_circuit_calls
-                    .first()
-                    .and_then(|(_, inner_summaries)| inner_summaries.first())
-                    .map(|summary| error_norm_parallel_call_eval_batch(summary.output_exprs.len()))
-                    .unwrap_or(ERROR_NORM_PARALLEL_CALL_EVAL_BATCH);
-                for prepared_chunk in
-                    prepared_summed_sub_circuit_calls.chunks(parallel_call_eval_batch)
-                {
-                    let evaluated_calls = prepared_chunk
+                let max_output_len = prepared_summed_sub_circuit_calls
+                    .iter()
+                    .map(|(_, summaries)| summaries[0].output_len())
+                    .max()
+                    .unwrap_or(0);
+                for chunk_start in (0..max_output_len).step_by(ERROR_NORM_OUTPUT_BATCH_SIZE) {
+                    let prepared_outputs = prepared_summed_sub_circuit_calls
                         .par_iter()
-                        .map(|(summed_call_id, inner_summaries)| {
+                        .filter_map(|(summed_call_id, inner_summaries)| {
                             self.with_summed_sub_circuit_call_by_id(
                                 *summed_call_id,
                                 |actual_sub_circuit_id,
@@ -2401,130 +2152,143 @@ impl PolyCircuit<DCRTPoly> {
                                     let first_summary = &inner_summaries[0];
                                     assert_eq!(
                                         output_gate_ids.len(),
-                                        first_summary.output_exprs.len(),
+                                        first_summary.output_len(),
                                         "error-norm summary summed sub-circuit output count mismatch for call {summed_call_id}"
                                     );
-                                    let summed_outputs_start = Instant::now();
-                                    trace!(
-                                        "error-norm summary summed sub-call outputs start level={} summed_call_id={} outputs={} inner_calls={}",
-                                        level_idx,
-                                        summed_call_id,
-                                        output_gate_ids.len(),
-                                        call_input_set_ids.len()
-                                    );
-                                    let mut outputs = Vec::with_capacity(output_gate_ids.len());
-                                    for chunk_idx in
-                                        0..output_gate_ids.chunks(ERROR_NORM_OUTPUT_BATCH_SIZE).len()
-                                    {
-                                        let chunk_start = chunk_idx * ERROR_NORM_OUTPUT_BATCH_SIZE;
-                                        let chunk_end =
-                                            (chunk_start + ERROR_NORM_OUTPUT_BATCH_SIZE)
-                                                .min(output_gate_ids.len());
-                                        let mut accumulated_chunk: Option<Vec<ErrorNormSummaryExpr>> =
-                                            None;
-                                        for (input_set_id, summary) in
-                                            call_input_set_ids.iter().zip(inner_summaries.iter())
-                                        {
-                                            let input_ids = self.input_set(*input_set_id);
-                                            let actual_input_at = |input_idx: usize| {
-                                                let gate_id = resolve_input_set_gate_id(
-                                                    input_ids.as_ref(),
-                                                    input_idx,
-                                                );
-                                                self.clone_error_norm_summary_expr_for_cached_summary_gate(
-                                                    gate_id,
-                                                    &gate_exprs,
-                                                    &input_gate_positions,
-                                                    input_plaintext_norms,
-                                                    &*summary_cache,
-                                                )
-                                            };
-                                            let sub_outputs = summary.output_exprs
-                                                [chunk_start..chunk_end]
-                                                .par_iter()
-                                                .map(|expr| expr.substitute_inputs_with(&actual_input_at))
-                                                .collect::<Vec<_>>();
-                                            match accumulated_chunk.as_mut() {
-                                                Some(current) => {
-                                                    for (acc, output) in
-                                                        current.iter_mut().zip(sub_outputs.into_iter())
-                                                    {
-                                                        *acc = acc.add_bound(&output);
-                                                    }
-                                                }
-                                                None => accumulated_chunk = Some(sub_outputs),
-                                            }
-                                        }
-                                        outputs.extend(
-                                            accumulated_chunk
-                                                .expect(
-                                                    "summed sub-circuit call requires at least one inner call",
-                                                )
-                                                .into_iter(),
-                                        );
+                                    let output_range =
+                                        BatchedWire::from_batches(output_gate_ids.iter().copied());
+                                    if chunk_start >= output_range.len() {
+                                        return None;
                                     }
-                                    trace!(
-                                        "error-norm summary summed sub-call outputs finished level={} summed_call_id={} outputs={} inner_calls={} elapsed_ms={}",
-                                        level_idx,
-                                        summed_call_id,
-                                        output_gate_ids.len(),
-                                        call_input_set_ids.len(),
-                                        summed_outputs_start.elapsed().as_millis()
+                                    let chunk_end = (chunk_start + ERROR_NORM_OUTPUT_BATCH_SIZE)
+                                        .min(output_range.len());
+                                    let inner_summary_pairs = call_input_set_ids
+                                        .iter()
+                                        .zip(inner_summaries.iter())
+                                        .collect::<Vec<_>>();
+                                    let mut outputs: Option<Vec<ErrorNormSummaryExpr>> = None;
+                                    for inner_summary_chunk in inner_summary_pairs
+                                        .chunks(ERROR_NORM_SUMMED_INNER_REDUCE_BATCH_SIZE)
+                                    {
+                                        let partial_outputs = inner_summary_chunk
+                                            .par_iter()
+                                            .map(|(input_set_id, summary)| {
+                                                let input_ids = self.input_set(**input_set_id);
+                                                summary.substitute_output_range_with_input_fn(
+                                                    chunk_start..chunk_end,
+                                                    &|input_idx| {
+                                                        let input_id = resolve_input_set_gate_id(
+                                                            input_ids.as_ref(),
+                                                            input_idx,
+                                                        );
+                                                        self.clone_error_norm_summary_expr_for_cached_summary_gate(
+                                                            input_id,
+                                                            &gate_exprs,
+                                                            &input_gate_positions,
+                                                            input_plaintext_norms,
+                                                            &*summary_cache,
+                                                        )
+                                                    },
+                                                )
+                                            })
+                                            .reduce_with(|mut left, right| {
+                                                for (left_expr, right_expr) in left.iter_mut().zip(right)
+                                                {
+                                                    left_expr.add_assign_bound(right_expr);
+                                                }
+                                                left
+                                            })
+                                            .expect(
+                                                "summed sub-circuit call requires at least one inner call",
+                                            );
+                                        if let Some(accumulated_outputs) = outputs.as_mut() {
+                                            for (left_expr, right_expr) in
+                                                accumulated_outputs.iter_mut().zip(partial_outputs)
+                                            {
+                                                left_expr.add_assign_bound(right_expr);
+                                            }
+                                        } else {
+                                            outputs = Some(partial_outputs);
+                                        }
+                                    }
+                                    let outputs = outputs.expect(
+                                        "summed sub-circuit call requires at least one inner call",
                                     );
-                                    (*summed_call_id, outputs)
+                                    Some((
+                                        *summed_call_id,
+                                        output_range.slice(chunk_start..chunk_end),
+                                        outputs,
+                                        chunk_end == output_range.len(),
+                                    ))
                                 },
                             )
                         })
                         .collect::<Vec<_>>();
-                    for (summed_call_id, outputs) in evaluated_calls {
-                        self.with_summed_sub_circuit_call_by_id(
-                            summed_call_id,
-                            |_actual_sub_circuit_id,
-                             call_input_set_ids,
-                             _call_binding_set_ids,
-                             output_gate_ids| {
-                                for (output_gate_id, output_expr) in
-                                    output_gate_ids.iter().copied().zip(outputs.into_iter())
-                                {
-                                    self.store_error_norm_summary_expr(
-                                        output_gate_id,
-                                        output_expr,
-                                        &primary_output_positions,
-                                        &extra_output_positions,
-                                        &remaining_use_count,
-                                        &mut gate_exprs,
-                                        &mut final_output_exprs,
-                                    );
-                                }
-                                for input_set_id in call_input_set_ids {
-                                    let input_ids = self.input_set(*input_set_id);
-                                    self.release_error_norm_summary_inputs(
-                                        iter_batched_wire_gates(input_ids.as_ref()),
-                                        &output_mask,
-                                        &mut remaining_use_count,
-                                        &mut gate_exprs,
-                                    );
-                                }
-                            },
+                    for (summed_call_id, output_range, outputs, finished_call) in prepared_outputs {
+                        self.store_error_norm_summary_expr_batch(
+                            output_range.gate_ids().zip(outputs.into_iter()),
+                            &output_positions,
+                            &remaining_use_count,
+                            &mut gate_exprs,
+                            &mut final_output_exprs,
                         );
+                        if finished_call {
+                            self.with_summed_sub_circuit_call_by_id(
+                                summed_call_id,
+                                |_actual_sub_circuit_id,
+                                 call_input_set_ids,
+                                 _call_binding_set_ids,
+                                 _output_gate_ids| {
+                                    for input_set_id in call_input_set_ids {
+                                        let input_ids = self.input_set(*input_set_id);
+                                        self.release_error_norm_summary_inputs(
+                                            iter_batched_wire_gates(input_ids.as_ref()),
+                                            &output_gate_ids_set,
+                                            &mut remaining_use_count,
+                                            &mut gate_exprs,
+                                        );
+                                    }
+                                },
+                            );
+                        }
                     }
                 }
             }
-            trace!(
-                "error-norm summary level summed-sub-call preparation finished level={} summed_sub_calls={} cache_hits_delta={} cache_misses_delta={} elapsed_ms={}",
-                level_idx,
-                prepared_summed_call_count,
-                cache_stats.hits - cache_hits_before_summed,
-                cache_stats.misses - cache_misses_before_summed,
-                prepare_summed_sub_calls_start.elapsed().as_millis()
-            );
-            trace!(
-                "error-norm summary level finished level={} gate_exprs={} remaining_use_entries={} total_elapsed_ms={}",
-                level_idx,
-                gate_exprs.iter().filter(|expr| expr.is_some()).count(),
-                remaining_use_count.len(),
-                level_start.elapsed().as_millis()
-            );
+            if log_large_summary {
+                debug!(
+                    "error-norm summary level summed-sub-call preparation finished sub_circuit_id={} level={} summed_sub_calls={} cache_hits_delta={} cache_misses_delta={} elapsed_ms={}",
+                    sub_circuit_id,
+                    level_idx,
+                    prepared_summed_call_count,
+                    cache_stats.hits - cache_hits_before_summed,
+                    cache_stats.misses - cache_misses_before_summed,
+                    prepare_summed_sub_calls_start.elapsed().as_millis()
+                );
+                debug!(
+                    "error-norm summary level finished sub_circuit_id={} level={} gate_exprs={} remaining_use_entries={} total_elapsed_ms={}",
+                    sub_circuit_id,
+                    level_idx,
+                    gate_exprs.live_entries,
+                    remaining_use_count.len(),
+                    level_start.elapsed().as_millis()
+                );
+            } else {
+                trace!(
+                    "error-norm summary level summed-sub-call preparation finished level={} summed_sub_calls={} cache_hits_delta={} cache_misses_delta={} elapsed_ms={}",
+                    level_idx,
+                    prepared_summed_call_count,
+                    cache_stats.hits - cache_hits_before_summed,
+                    cache_stats.misses - cache_misses_before_summed,
+                    prepare_summed_sub_calls_start.elapsed().as_millis()
+                );
+                trace!(
+                    "error-norm summary level finished level={} gate_exprs={} remaining_use_entries={} total_elapsed_ms={}",
+                    level_idx,
+                    gate_exprs.live_entries,
+                    remaining_use_count.len(),
+                    level_start.elapsed().as_millis()
+                );
+            }
         }
 
         let final_output_start = Instant::now();
@@ -2545,15 +2309,27 @@ impl PolyCircuit<DCRTPoly> {
                         input_plaintext_norms,
                         &*summary_cache,
                     )
+                    .as_ref()
+                    .clone()
                 })
             })
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let output_plaintext_norms = CompressedPolyNormRuns::from_slice(
+            &output_exprs.iter().map(|expr| expr.plaintext_norm.clone()).collect::<Vec<_>>(),
+        );
+        let output_matrix_exprs = output_exprs
+            .into_vec()
+            .into_iter()
+            .map(|expr| expr.matrix_expr)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         trace!(
             "error-norm summary final outputs finished outputs={} elapsed_ms={}",
-            output_exprs.len(),
+            output_matrix_exprs.len(),
             final_output_start.elapsed().as_millis()
         );
-        ErrorNormSubCircuitSummary { output_exprs }
+        ErrorNormSubCircuitSummary { output_plaintext_norms, output_matrix_exprs }
     }
 
     fn ensure_cached_sub_circuit_summary<P: AffinePltEvaluator>(
@@ -2569,44 +2345,45 @@ impl PolyCircuit<DCRTPoly> {
     ) -> Arc<ErrorNormSubCircuitSummary> {
         let sub_circuit = self.registered_sub_circuit_ref(sub_circuit_id);
         let cache_key = ErrorNormSubCircuitCacheKey(Arc::as_ptr(&sub_circuit) as usize);
-        let cache_cap = error_norm_profile_cache_cap(sub_circuit.as_ref());
         let existing_len = summary_cache.get(&cache_key).map_or(0, Vec::len);
-        if let Some(summary_idx) = self.find_cached_error_norm_summary_index_for_profile(
+        if let Some(summary) = self.find_cached_error_norm_summary_for_profile(
             cache_key,
             &input_plaintext_profile,
-            param_bindings.as_ref(),
             summary_cache,
         ) {
             cache_stats.hits += 1;
             trace!(
-                "error-norm sub-circuit summary cache hit sub_circuit_id={} cached_profiles={} cache_cap={}",
-                sub_circuit_id, existing_len, cache_cap
+                "error-norm sub-circuit summary cache hit sub_circuit_id={} cached_profiles={}",
+                sub_circuit_id, existing_len
             );
-            return Arc::clone(
-                &summary_cache
-                    .get(&cache_key)
-                    .expect("error-norm sub-circuit summary cache missing")[summary_idx]
-                    .summary,
-            );
+            return summary;
         }
 
         cache_stats.misses += 1;
         let miss_kind = if existing_len == 0 { "first_call" } else { "new_plaintext_profile" };
         if miss_kind == "first_call" {
             debug!(
-                "error-norm sub-circuit summary cache miss sub_circuit_id={} miss_kind={} cached_profiles_before={} cache_cap={}",
-                sub_circuit_id, miss_kind, existing_len, cache_cap
+                "error-norm sub-circuit summary cache miss sub_circuit_id={} miss_kind={} cached_profiles_before={}",
+                sub_circuit_id, miss_kind, existing_len
             );
         } else {
             trace!(
-                "error-norm sub-circuit summary cache miss sub_circuit_id={} miss_kind={} cached_profiles_before={} cache_cap={}",
-                sub_circuit_id, miss_kind, existing_len, cache_cap
+                "error-norm sub-circuit summary cache miss sub_circuit_id={} miss_kind={} cached_profiles_before={}",
+                sub_circuit_id, miss_kind, existing_len
             );
+        }
+
+        if existing_len >= ERROR_NORM_MAX_CACHED_PROFILES_PER_SUBCIRCUIT {
+            if let Some(entries) = summary_cache.get_mut(&cache_key) {
+                let overflow = existing_len + 1 - ERROR_NORM_MAX_CACHED_PROFILES_PER_SUBCIRCUIT;
+                entries.drain(..overflow.min(entries.len()));
+            }
         }
 
         let build_summary_start = Instant::now();
         let input_plaintext_norms = input_plaintext_profile.materialize();
         let summary = sub_circuit.as_ref().build_sub_circuit_summary(
+            sub_circuit_id,
             one_error,
             &input_plaintext_norms,
             param_bindings.as_ref(),
@@ -2616,32 +2393,30 @@ impl PolyCircuit<DCRTPoly> {
             cache_stats,
         );
         let summary = Arc::new(summary);
+        let build_elapsed_ms = build_summary_start.elapsed().as_millis();
         let entries = summary_cache.entry(cache_key).or_default();
         entries.push(ErrorNormSubCircuitSummaryRecord {
             input_plaintext_norms: input_plaintext_profile,
-            param_bindings,
             summary: Arc::clone(&summary),
         });
-        while entries.len() > cache_cap {
-            entries.remove(0);
+        if entries.len() > ERROR_NORM_MAX_CACHED_PROFILES_PER_SUBCIRCUIT {
+            let overflow = entries.len() - ERROR_NORM_MAX_CACHED_PROFILES_PER_SUBCIRCUIT;
+            entries.drain(..overflow);
         }
-        let build_elapsed_ms = build_summary_start.elapsed().as_millis();
         if miss_kind == "first_call" || build_elapsed_ms > 1000 {
             debug!(
-                "error-norm sub-circuit summary cache store sub_circuit_id={} miss_kind={} cached_profiles_after={} cache_cap={} build_elapsed_ms={}",
+                "error-norm sub-circuit summary cache store sub_circuit_id={} miss_kind={} cached_profiles_after={} build_elapsed_ms={}",
                 sub_circuit_id,
                 miss_kind,
                 entries.len(),
-                cache_cap,
                 build_elapsed_ms
             );
         } else {
             trace!(
-                "error-norm sub-circuit summary cache store sub_circuit_id={} miss_kind={} cached_profiles_after={} cache_cap={} build_elapsed_ms={}",
+                "error-norm sub-circuit summary cache store sub_circuit_id={} miss_kind={} cached_profiles_after={} build_elapsed_ms={}",
                 sub_circuit_id,
                 miss_kind,
                 entries.len(),
-                cache_cap,
                 build_elapsed_ms
             );
         }
@@ -2664,32 +2439,22 @@ impl PolyCircuit<DCRTPoly> {
     ) -> Vec<(Id, Arc<ErrorNormSubCircuitSummary>)> {
         let cached_profile_hits = prepared_profiles
             .iter()
-            .map(|(call_id, sub_circuit_id, param_bindings, input_plaintext_profile)| {
+            .map(|(call_id, sub_circuit_id, _param_bindings, input_plaintext_profile)| {
                 let cache_key = self.error_norm_sub_circuit_cache_key(*sub_circuit_id);
                 let cached_summary = self
-                    .find_cached_error_norm_summary_index_for_profile(
+                    .find_cached_error_norm_summary_for_profile(
                         cache_key,
                         input_plaintext_profile,
-                        param_bindings.as_ref(),
                         summary_cache,
                     )
-                    .map(|summary_idx| {
-                        Arc::clone(
-                            &summary_cache
-                                .get(&cache_key)
-                                .expect("error-norm sub-circuit summary cache missing")
-                                [summary_idx]
-                                .summary,
-                        )
-                    });
+                    .map(|summary| Arc::clone(&summary));
                 (*call_id, cached_summary)
             })
             .collect::<Vec<_>>();
         let mut resolved = Vec::with_capacity(prepared_profiles.len());
         let mut batch_local_misses = Vec::<(
-            usize,
+            ErrorNormSubCircuitCacheKey,
             ErrorNormInputPlaintextProfile,
-            Arc<[SubCircuitParamValue]>,
             Arc<ErrorNormSubCircuitSummary>,
         )>::new();
         for (
@@ -2697,16 +2462,17 @@ impl PolyCircuit<DCRTPoly> {
             (_cached_call_id, cached_summary),
         ) in prepared_profiles.into_iter().zip(cached_profile_hits.into_iter())
         {
+            let cache_key = self.error_norm_sub_circuit_cache_key(sub_circuit_id);
             let summary = if let Some(summary) = cached_summary {
                 cache_stats.hits += 1;
                 summary
-            } else if let Some((_, _, _, summary)) = batch_local_misses.iter().find(
-                |(seen_sub_circuit_id, seen_profile, seen_param_bindings, _)| {
-                    *seen_sub_circuit_id == sub_circuit_id &&
-                        seen_profile.matches_profile(&input_plaintext_profile) &&
-                        seen_param_bindings.as_ref() == param_bindings.as_ref()
-                },
-            ) {
+            } else if let Some((_, _, summary)) =
+                batch_local_misses.iter().find(|(miss_cache_key, miss_profile, _)| {
+                    *miss_cache_key == cache_key &&
+                        miss_profile.matches_profile(&input_plaintext_profile)
+                })
+            {
+                cache_stats.hits += 1;
                 Arc::clone(summary)
             } else {
                 let summary = self.ensure_cached_sub_circuit_summary(
@@ -2720,9 +2486,8 @@ impl PolyCircuit<DCRTPoly> {
                     slot_transfer_evaluator,
                 );
                 batch_local_misses.push((
-                    sub_circuit_id,
-                    input_plaintext_profile,
-                    param_bindings,
+                    cache_key,
+                    input_plaintext_profile.clone(),
                     Arc::clone(&summary),
                 ));
                 summary
@@ -2735,149 +2500,205 @@ impl PolyCircuit<DCRTPoly> {
     fn error_norm_remaining_use_count(
         &self,
         execution_layers: &[ErrorNormExecutionLayer],
-    ) -> DenseGateUseCounts {
-        let dense = DenseGateUseCounts::zeroed(self.num_gates() + 1);
-        let counts = &dense.counts;
-        execution_layers.par_iter().for_each(|layer| {
-            join(
-                || {
-                    for gate_id in &layer.regular_gate_ids {
-                        let gate = self.gate(*gate_id);
-                        increment_dense_gate_use_counts(counts, gate.input_gates.iter().copied());
+    ) -> BatchedGateUseCounts {
+        let mut counts = vec![0u32; self.num_gates() + 1];
+        let mut increment = |gate_id: GateId| {
+            counts[gate_id.0] += 1;
+        };
+        for layer in execution_layers {
+            for gate_id in &layer.regular_gate_ids {
+                let gate = self.gate(*gate_id);
+                for input_id in gate.input_gates.iter().copied() {
+                    increment(input_id);
+                }
+            }
+            for call_id in &layer.sub_circuit_call_ids {
+                self.with_sub_circuit_call_inputs_by_id(*call_id, |shared_prefix, suffix| {
+                    for input_id in iter_batched_wire_gates(shared_prefix) {
+                        increment(input_id);
                     }
-                },
-                || {
-                    join(
-                        || {
-                            for call_id in &layer.sub_circuit_call_ids {
-                                self.with_sub_circuit_call_inputs_by_id(
-                                    *call_id,
-                                    |shared_prefix, suffix| {
-                                        increment_dense_gate_use_counts(
-                                            counts,
-                                            iter_batched_wire_gates(shared_prefix),
-                                        );
-                                        increment_dense_gate_use_counts(
-                                            counts,
-                                            iter_batched_wire_gates(suffix),
-                                        );
-                                    },
-                                );
-                            }
-                        },
-                        || {
-                            for summed_call_id in &layer.summed_sub_circuit_call_ids {
-                                self.for_each_summed_sub_circuit_call_input(
-                                    *summed_call_id,
-                                    |input_id| increment_dense_gate_use_count(counts, input_id),
-                                );
-                            }
-                        },
-                    );
-                },
-            );
-        });
-        dense.finalize_live_nonzero()
+                    for input_id in iter_batched_wire_gates(suffix) {
+                        increment(input_id);
+                    }
+                });
+            }
+            for summed_call_id in &layer.summed_sub_circuit_call_ids {
+                self.for_each_summed_sub_circuit_call_input(*summed_call_id, |input_id| {
+                    increment(input_id);
+                });
+            }
+        }
+        BatchedGateUseCounts::from_dense_counts(counts)
     }
 
     fn release_error_norm_inputs<I>(
         &self,
         input_ids: I,
-        output_mask: &[bool],
-        remaining_use_count: &mut DenseGateUseCounts,
+        output_gate_ids_set: &HashSet<GateId>,
+        remaining_use_count: &mut BatchedGateUseCounts,
         wires: &mut ErrorNormWireStore,
-        wire_count: &mut usize,
-        input_gate_positions: &[usize],
+        input_gate_positions: &ErrorNormInputGatePositions,
         input_values: &mut [Option<Arc<ErrorNorm>>],
     ) where
         I: IntoIterator<Item = GateId>,
     {
         for input_id in input_ids {
-            if output_mask[input_id.0] {
+            if output_gate_ids_set.contains(&input_id) {
                 continue;
             }
             if !remaining_use_count.contains(input_id) {
                 continue;
             }
             if remaining_use_count.decrement(input_id) {
-                let input_idx = input_gate_positions[input_id.0];
-                if input_idx != MISSING_GATE_POSITION {
+                if let Some(&input_idx) = input_gate_positions.get(&input_id) {
                     input_values[input_idx] = None;
-                } else if wires[input_id.0].take().is_some() {
-                    *wire_count -= 1;
+                } else {
+                    let _ = wires.take(input_id);
                 }
             }
         }
     }
 
-    fn store_error_norm_value(
+    fn store_error_norm_value_batch(
         &self,
-        gate_id: GateId,
-        value: ErrorNorm,
-        is_output: bool,
-        remaining_use_count: &DenseGateUseCounts,
+        gate_range: BatchedWire,
+        values: Vec<ErrorNorm>,
+        output_gate_ids_set: &HashSet<GateId>,
+        remaining_use_count: &BatchedGateUseCounts,
         wires: &mut ErrorNormWireStore,
-        wire_count: &mut usize,
     ) {
-        let keep_in_wires = remaining_use_count.contains(gate_id) || is_output;
-        if keep_in_wires {
-            if wires[gate_id.0].is_none() {
-                *wire_count += 1;
+        let mut keep_start: Option<GateId> = None;
+        let mut keep_values = Vec::new();
+        let flush = |keep_start: &mut Option<GateId>,
+                     keep_values: &mut Vec<ErrorNorm>,
+                     wires: &mut ErrorNormWireStore| {
+            if let Some(start) = keep_start.take() {
+                let range = BatchedWire::from_start_len(start, keep_values.len());
+                wires.insert_batch(range, std::mem::take(keep_values));
             }
-            wires[gate_id.0] = Some(Arc::new(value));
+        };
+        for (offset, value) in values.into_iter().enumerate() {
+            let gate_id = GateId(gate_range.start().0 + offset);
+            let keep_in_wires =
+                remaining_use_count.contains(gate_id) || output_gate_ids_set.contains(&gate_id);
+            if keep_in_wires {
+                if keep_start.is_none() {
+                    keep_start = Some(gate_id);
+                }
+                keep_values.push(value);
+            } else {
+                flush(&mut keep_start, &mut keep_values, wires);
+            }
         }
+        flush(&mut keep_start, &mut keep_values, wires);
+    }
+
+    fn store_error_norm_value_pairs<I>(
+        &self,
+        gate_values: I,
+        output_gate_ids_set: &HashSet<GateId>,
+        remaining_use_count: &BatchedGateUseCounts,
+        wires: &mut ErrorNormWireStore,
+    ) where
+        I: IntoIterator<Item = (GateId, ErrorNorm)>,
+    {
+        let mut keep_start: Option<GateId> = None;
+        let mut keep_values = Vec::new();
+        let flush = |keep_start: &mut Option<GateId>,
+                     keep_values: &mut Vec<ErrorNorm>,
+                     wires: &mut ErrorNormWireStore| {
+            if let Some(start) = keep_start.take() {
+                let range = BatchedWire::from_start_len(start, keep_values.len());
+                wires.insert_batch(range, std::mem::take(keep_values));
+            }
+        };
+        for (gate_id, value) in gate_values {
+            let keep_in_wires =
+                remaining_use_count.contains(gate_id) || output_gate_ids_set.contains(&gate_id);
+            if keep_in_wires {
+                match keep_start {
+                    Some(start) if gate_id.0 != start.0 + keep_values.len() => {
+                        flush(&mut keep_start, &mut keep_values, wires);
+                        keep_start = Some(gate_id);
+                    }
+                    None => keep_start = Some(gate_id),
+                    _ => {}
+                }
+                keep_values.push(value);
+            } else {
+                flush(&mut keep_start, &mut keep_values, wires);
+            }
+        }
+        flush(&mut keep_start, &mut keep_values, wires);
     }
 
     fn release_error_norm_summary_inputs<I>(
         &self,
         input_ids: I,
-        output_mask: &[bool],
-        remaining_use_count: &mut DenseGateUseCounts,
-        gate_exprs: &mut [Option<Arc<ErrorNormSummaryExpr>>],
+        output_gate_ids_set: &HashSet<GateId>,
+        remaining_use_count: &mut BatchedGateUseCounts,
+        gate_exprs: &mut ErrorNormExprStore,
     ) where
         I: IntoIterator<Item = GateId>,
     {
         for input_id in input_ids {
-            if output_mask[input_id.0] {
+            if output_gate_ids_set.contains(&input_id) {
                 continue;
             }
             if !remaining_use_count.contains(input_id) {
                 continue;
             }
             if remaining_use_count.decrement(input_id) {
-                gate_exprs[input_id.0] = None;
+                let _ = gate_exprs.take(input_id);
             }
         }
     }
 
-    fn store_error_norm_summary_expr(
+    fn store_error_norm_summary_expr_batch<I>(
         &self,
-        gate_id: GateId,
-        expr: ErrorNormSummaryExpr,
-        primary_output_positions: &[usize],
-        extra_output_positions: &HashMap<GateId, Vec<usize>>,
-        remaining_use_count: &DenseGateUseCounts,
-        gate_exprs: &mut [Option<Arc<ErrorNormSummaryExpr>>],
-        final_output_exprs: &mut [Option<Arc<ErrorNormSummaryExpr>>],
-    ) {
-        let expr = Arc::new(expr);
-        let primary_output_idx = primary_output_positions[gate_id.0];
-        let is_output = primary_output_idx != MISSING_GATE_POSITION;
-        // Mirror `store_error_norm_value`: keep final outputs in the per-gate cache
-        // as well, so later summary reconstruction can still resolve them through
-        // `gate_exprs` even when they have no remaining internal consumers.
-        let keep_in_gate_exprs = remaining_use_count.contains(gate_id) || is_output;
-        if keep_in_gate_exprs {
-            gate_exprs[gate_id.0] = Some(expr.clone());
-        }
-        if is_output {
-            if let Some(extra_output_idxs) = extra_output_positions.get(&gate_id) {
-                for &output_idx in extra_output_idxs {
-                    final_output_exprs[output_idx] = Some(expr.clone());
+        gate_expr_pairs: I,
+        output_positions: &HashMap<GateId, Vec<usize>>,
+        remaining_use_count: &BatchedGateUseCounts,
+        gate_exprs: &mut ErrorNormExprStore,
+        final_output_exprs: &mut [Option<ErrorNormSummaryExpr>],
+    ) where
+        I: IntoIterator<Item = (GateId, ErrorNormSummaryExpr)>,
+    {
+        let mut keep_start: Option<GateId> = None;
+        let mut keep_exprs = Vec::new();
+        let flush = |keep_start: &mut Option<GateId>,
+                     keep_exprs: &mut Vec<Arc<ErrorNormSummaryExpr>>,
+                     gate_exprs: &mut ErrorNormExprStore| {
+            if let Some(start) = keep_start.take() {
+                let range = BatchedWire::from_start_len(start, keep_exprs.len());
+                gate_exprs.insert_batch_shared(range, std::mem::take(keep_exprs));
+            }
+        };
+        for (gate_id, expr) in gate_expr_pairs {
+            let expr = Arc::new(expr);
+            let output_idxs = output_positions.get(&gate_id);
+            let is_output = output_idxs.is_some();
+            let keep_in_gate_exprs = remaining_use_count.contains(gate_id) || is_output;
+            if keep_in_gate_exprs {
+                match keep_start {
+                    Some(start) if gate_id.0 != start.0 + keep_exprs.len() => {
+                        flush(&mut keep_start, &mut keep_exprs, gate_exprs);
+                        keep_start = Some(gate_id);
+                    }
+                    None => keep_start = Some(gate_id),
+                    _ => {}
+                }
+                keep_exprs.push(expr.clone());
+            } else {
+                flush(&mut keep_start, &mut keep_exprs, gate_exprs);
+            }
+            if let Some(output_idxs) = output_idxs {
+                for &output_idx in output_idxs {
+                    final_output_exprs[output_idx] = Some(expr.as_ref().clone());
                 }
             }
-            final_output_exprs[primary_output_idx] = Some(expr);
         }
+        flush(&mut keep_start, &mut keep_exprs, gate_exprs);
     }
 }
 
@@ -2985,123 +2806,96 @@ pub trait AffineSlotTransferEvaluator: SlotTransferEvaluator<ErrorNorm> + Sync {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AffineErrorNormTerm {
-    input_idx: usize,
-    pending_scalar: BigDecimal,
-    pending_poly: Option<PolyNorm>,
-    matrix_factor: Option<PolyMatrixNorm>,
+enum AffineMatrixTransformOp {
+    Scalar(BigDecimal),
+    Poly(PolyNorm),
+    Matrix(PolyMatrixNorm),
+    SplitColsLeft(usize),
 }
 
-impl AffineErrorNormTerm {
-    fn input(input_idx: usize) -> Self {
-        Self {
-            input_idx,
-            pending_scalar: BigDecimal::one(),
-            pending_poly: None,
-            matrix_factor: None,
-        }
-    }
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AffineMatrixTransform {
+    ops: Arc<[AffineMatrixTransformOp]>,
+}
 
-    fn transform_scalar_in_place(&mut self, scalar: &BigDecimal) {
-        if let Some(matrix_factor) = &mut self.matrix_factor {
-            *matrix_factor = matrix_factor.clone() * scalar;
-        } else {
-            self.pending_scalar *= scalar;
-        }
-    }
-
-    fn transform_poly_in_place(&mut self, poly: &PolyNorm) {
-        if let Some(matrix_factor) = &mut self.matrix_factor {
-            *matrix_factor = matrix_factor.clone() * poly;
-        } else {
-            self.pending_poly = Some(match self.pending_poly.take() {
-                Some(existing) => existing * poly.clone(),
-                None => poly.clone(),
-            });
-        }
-    }
-
-    fn transform_matrix_in_place(&mut self, matrix: &PolyMatrixNorm) {
-        let mut matrix = matrix.clone();
-        if self.pending_scalar != BigDecimal::one() {
-            matrix = matrix * &self.pending_scalar;
-            self.pending_scalar = BigDecimal::one();
-        }
-        if let Some(poly) = self.pending_poly.take() {
-            matrix = poly * matrix;
-        }
-        self.matrix_factor = Some(match self.matrix_factor.take() {
-            Some(existing) => existing * matrix,
-            None => matrix,
-        });
-    }
-
-    fn split_cols_left_in_place(&mut self, left_col_size: usize) {
-        let matrix_factor = self
-            .matrix_factor
-            .take()
-            .expect("split_cols requires a matrix factor in the affine error-norm term");
-        self.matrix_factor = Some(matrix_factor.split_cols(left_col_size).0);
-    }
-
-    fn compose_after(&self, outer: &AffineErrorNormTerm) -> Self {
-        let mut composed = self.clone();
-        composed.transform_scalar_in_place(&outer.pending_scalar);
-        if let Some(poly) = &outer.pending_poly {
-            composed.transform_poly_in_place(poly);
-        }
-        if let Some(matrix) = &outer.matrix_factor {
-            composed.transform_matrix_in_place(matrix);
-        }
-        composed
-    }
-
-    fn apply_to_matrix(&self, input: &PolyMatrixNorm) -> PolyMatrixNorm {
-        let mut value = input.clone();
-        if self.pending_scalar != BigDecimal::one() {
-            value = value * &self.pending_scalar;
-        }
-        if let Some(poly) = &self.pending_poly {
-            value = value * poly;
-        }
-        if let Some(matrix) = &self.matrix_factor {
-            value *= matrix.clone();
+impl AffineMatrixTransform {
+    fn apply(&self, mut value: PolyMatrixNorm) -> PolyMatrixNorm {
+        for op in self.ops.iter() {
+            value = match op {
+                AffineMatrixTransformOp::Scalar(scalar) => value * scalar,
+                AffineMatrixTransformOp::Poly(poly) => value * poly,
+                AffineMatrixTransformOp::Matrix(matrix) => value * matrix.clone(),
+                AffineMatrixTransformOp::SplitColsLeft(left_col_size) => {
+                    value.split_cols(*left_col_size).0
+                }
+            };
         }
         value
     }
 
-    fn apply_to_const(&self, const_term: Option<&PolyMatrixNorm>) -> Option<PolyMatrixNorm> {
-        let mut value = const_term.cloned()?;
-        if self.pending_scalar != BigDecimal::one() {
-            value = value * &self.pending_scalar;
-        }
-        if let Some(poly) = &self.pending_poly {
-            value = value * poly;
-        }
-        if let Some(matrix) = &self.matrix_factor {
-            value *= matrix.clone();
-        }
-        Some(value)
+    fn then_op(&self, op: AffineMatrixTransformOp) -> Self {
+        let mut ops = self.ops.iter().cloned().collect::<Vec<_>>();
+        ops.push(op);
+        Self { ops: Arc::from(ops) }
+    }
+
+    fn cache_key(&self) -> (usize, usize) {
+        (self.ops.as_ptr() as usize, self.ops.len())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct AffineInputTerm {
+    input_idx: usize,
+    transform: AffineMatrixTransform,
+    coefficient: BigDecimal,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct AffineErrorNormExpr {
     const_term: Option<PolyMatrixNorm>,
-    input_terms: Vec<AffineErrorNormTerm>,
+    input_terms: Box<[AffineInputTerm]>,
 }
 
 impl AffineErrorNormExpr {
+    fn combine_like_terms(input_terms: Vec<AffineInputTerm>) -> Box<[AffineInputTerm]> {
+        let mut grouped = HashMap::<(usize, usize, usize), usize>::new();
+        let mut combined = Vec::<AffineInputTerm>::with_capacity(input_terms.len());
+        for mut term in input_terms {
+            let key = {
+                let (ops_ptr, ops_len) = term.transform.cache_key();
+                (term.input_idx, ops_ptr, ops_len)
+            };
+            if let Some(&combined_idx) = grouped.get(&key) {
+                combined[combined_idx].coefficient += term.coefficient;
+                continue;
+            }
+            let combined_idx = combined.len();
+            term.coefficient = term.coefficient.clone();
+            combined.push(term);
+            grouped.insert(key, combined_idx);
+        }
+        combined.into_boxed_slice()
+    }
+
     fn zero() -> Self {
-        Self { const_term: None, input_terms: vec![] }
+        Self::default()
     }
 
     fn constant(const_term: PolyMatrixNorm) -> Self {
-        Self { const_term: Some(const_term), input_terms: vec![] }
+        Self { const_term: Some(const_term), input_terms: Vec::new().into_boxed_slice() }
     }
 
     fn input(input_idx: usize) -> Self {
-        Self { const_term: None, input_terms: vec![AffineErrorNormTerm::input(input_idx)] }
+        Self {
+            const_term: None,
+            input_terms: vec![AffineInputTerm {
+                input_idx,
+                transform: AffineMatrixTransform::default(),
+                coefficient: BigDecimal::one(),
+            }]
+            .into_boxed_slice(),
+        }
     }
 
     fn add_expr(&self, rhs: &Self) -> Self {
@@ -3111,123 +2905,193 @@ impl AffineErrorNormExpr {
             (None, Some(right)) => Some(right.clone()),
             (None, None) => None,
         };
-        let mut input_terms = self.input_terms.clone();
-        input_terms.extend(rhs.input_terms.clone());
-        Self { const_term, input_terms }
+        let mut input_terms = Vec::with_capacity(self.input_terms.len() + rhs.input_terms.len());
+        input_terms.extend(self.input_terms.iter().cloned());
+        input_terms.extend(rhs.input_terms.iter().cloned());
+        Self { const_term, input_terms: Self::combine_like_terms(input_terms) }
+    }
+
+    fn add_assign_expr(&mut self, rhs: Self) {
+        let left_const = self.const_term.take();
+        self.const_term = match (left_const, rhs.const_term) {
+            (Some(left), Some(right)) => Some(left + &right),
+            (Some(left), None) => Some(left),
+            (None, Some(right)) => Some(right),
+            (None, None) => None,
+        };
+
+        let mut input_terms =
+            Vec::with_capacity(self.input_terms.len().saturating_add(rhs.input_terms.len()));
+        input_terms.extend(std::mem::take(&mut self.input_terms).into_vec());
+        input_terms.extend(rhs.input_terms.into_vec());
+        self.input_terms = Self::combine_like_terms(input_terms);
     }
 
     fn transform_scalar(&self, scalar: &BigDecimal) -> Self {
-        let const_term = self.const_term.clone().map(|const_term| const_term * scalar);
-        let input_terms = self
-            .input_terms
-            .par_iter()
-            .map(|term| {
-                let mut term = term.clone();
-                term.transform_scalar_in_place(scalar);
-                term
-            })
-            .collect();
-        Self { const_term, input_terms }
+        if scalar == &BigDecimal::one() {
+            return self.clone();
+        }
+        Self {
+            const_term: self.const_term.clone().map(|value| value * scalar),
+            input_terms: self
+                .input_terms
+                .iter()
+                .map(|term| AffineInputTerm {
+                    input_idx: term.input_idx,
+                    transform: term
+                        .transform
+                        .then_op(AffineMatrixTransformOp::Scalar(scalar.clone())),
+                    coefficient: term.coefficient.clone(),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
     }
 
     fn transform_poly(&self, poly: &PolyNorm) -> Self {
-        let const_term = self.const_term.clone().map(|const_term| const_term * poly);
-        let input_terms = self
-            .input_terms
-            .par_iter()
-            .map(|term| {
-                let mut term = term.clone();
-                term.transform_poly_in_place(poly);
-                term
-            })
-            .collect();
-        Self { const_term, input_terms }
+        Self {
+            const_term: self.const_term.clone().map(|value| value * poly),
+            input_terms: self
+                .input_terms
+                .iter()
+                .map(|term| AffineInputTerm {
+                    input_idx: term.input_idx,
+                    transform: term.transform.then_op(AffineMatrixTransformOp::Poly(poly.clone())),
+                    coefficient: term.coefficient.clone(),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
     }
 
     fn transform_matrix(&self, matrix: &PolyMatrixNorm) -> Self {
-        let const_term = self.const_term.clone().map(|const_term| const_term * matrix.clone());
-        let input_terms = self
-            .input_terms
-            .par_iter()
-            .map(|term| {
-                let mut term = term.clone();
-                term.transform_matrix_in_place(matrix);
-                term
-            })
-            .collect();
-        Self { const_term, input_terms }
+        Self {
+            const_term: self.const_term.clone().map(|value| value * matrix.clone()),
+            input_terms: self
+                .input_terms
+                .iter()
+                .map(|term| AffineInputTerm {
+                    input_idx: term.input_idx,
+                    transform: term
+                        .transform
+                        .then_op(AffineMatrixTransformOp::Matrix(matrix.clone())),
+                    coefficient: term.coefficient.clone(),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
     }
 
     fn split_cols_left(&self, left_col_size: usize) -> Self {
-        let const_term =
-            self.const_term.clone().map(|const_term| const_term.split_cols(left_col_size).0);
-        let input_terms = self
-            .input_terms
-            .par_iter()
-            .map(|term| {
-                let mut term = term.clone();
-                term.split_cols_left_in_place(left_col_size);
-                term
-            })
-            .collect();
-        Self { const_term, input_terms }
-    }
-
-    fn substitute_inputs(&self, actual_inputs: &[Arc<ErrorNormSummaryExpr>]) -> Self {
-        self.substitute_inputs_with(&|input_idx| {
-            actual_inputs
-                .get(input_idx)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "affine error-norm input index {input_idx} out of range during substitution"
-                    )
+        Self {
+            const_term: self.const_term.clone().map(|value| value.split_cols(left_col_size).0),
+            input_terms: self
+                .input_terms
+                .iter()
+                .map(|term| AffineInputTerm {
+                    input_idx: term.input_idx,
+                    transform: term
+                        .transform
+                        .then_op(AffineMatrixTransformOp::SplitColsLeft(left_col_size)),
+                    coefficient: term.coefficient.clone(),
                 })
-                .clone()
-        })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
     }
 
-    fn substitute_inputs_with<F>(&self, actual_input_at: &F) -> Self
+    fn substitute_inputs_with_cached<F>(
+        &self,
+        actual_input_at: &F,
+        cache: &mut HashMap<usize, AffineErrorNormExpr>,
+    ) -> Self
     where
         F: Fn(usize) -> Arc<ErrorNormSummaryExpr> + Sync,
     {
-        self.input_terms
-            .par_iter()
-            .map(|term| actual_input_at(term.input_idx).matrix_expr.apply_outer_transform(term))
-            .reduce(Self::zero, |left, right| left.add_expr(&right))
-            .add_expr(&Self { const_term: self.const_term.clone(), input_terms: vec![] })
+        let mut transform_cache =
+            HashMap::<(usize, usize, usize, usize), AffineMatrixTransform>::new();
+        let mut substituted = if let Some(const_term) = &self.const_term {
+            Self::constant(const_term.clone())
+        } else {
+            Self::zero()
+        };
+        for term in &self.input_terms {
+            let actual_expr = cache
+                .entry(term.input_idx)
+                .or_insert_with(|| actual_input_at(term.input_idx).matrix_expr.clone());
+            let transformed = Self {
+                const_term: actual_expr.const_term.clone().map(|value| {
+                    let value = term.transform.apply(value);
+                    if term.coefficient == BigDecimal::one() {
+                        value
+                    } else {
+                        value * &term.coefficient
+                    }
+                }),
+                input_terms: Self::combine_like_terms(
+                    actual_expr
+                        .input_terms
+                        .iter()
+                        .map(|actual_term| {
+                            let key = {
+                                let (left_ptr, left_len) = actual_term.transform.cache_key();
+                                let (right_ptr, right_len) = term.transform.cache_key();
+                                (left_ptr, left_len, right_ptr, right_len)
+                            };
+                            let transform = transform_cache
+                                .entry(key)
+                                .or_insert_with(|| {
+                                    let mut ops = actual_term
+                                        .transform
+                                        .ops
+                                        .iter()
+                                        .cloned()
+                                        .collect::<Vec<_>>();
+                                    ops.extend(term.transform.ops.iter().cloned());
+                                    AffineMatrixTransform { ops: Arc::from(ops) }
+                                })
+                                .clone();
+                            AffineInputTerm {
+                                input_idx: actual_term.input_idx,
+                                transform,
+                                coefficient: &actual_term.coefficient * &term.coefficient,
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+            };
+            substituted.add_assign_expr(transformed);
+        }
+        substituted
     }
 
-    fn apply_outer_transform(&self, transform: &AffineErrorNormTerm) -> Self {
-        let const_term = transform.apply_to_const(self.const_term.as_ref());
-        let input_terms =
-            self.input_terms.par_iter().map(|term| term.compose_after(transform)).collect();
-        Self { const_term, input_terms }
-    }
-
-    fn evaluate_refs(&self, input_matrix_norms: &[&PolyMatrixNorm]) -> PolyMatrixNorm {
-        self.evaluate_with(&|input_idx| {
-            (*input_matrix_norms.get(input_idx).unwrap_or_else(|| {
-                panic!("affine error-norm input index {input_idx} out of range during evaluation")
-            }))
-            .clone()
-        })
-    }
-
-    fn evaluate_with<F>(&self, input_matrix_norm_at: &F) -> PolyMatrixNorm
+    fn evaluate_with_cached<F>(
+        &self,
+        input_matrix_norm_at: &F,
+        cache: &mut HashMap<usize, PolyMatrixNorm>,
+    ) -> PolyMatrixNorm
     where
         F: Fn(usize) -> PolyMatrixNorm + Sync,
     {
-        merge_optional_matrix_norm(
-            self.const_term.clone(),
-            self.input_terms
-                .par_iter()
-                .map(|term| {
-                    let input = input_matrix_norm_at(term.input_idx);
-                    Some(term.apply_to_matrix(&input))
-                })
-                .reduce(|| None, merge_optional_matrix_norm),
-        )
-        .expect("affine error-norm expression must produce a matrix norm")
+        let mut value = self.const_term.clone().unwrap_or_else(|| {
+            if let Some(first_term) = self.input_terms.first() {
+                let input = cache
+                    .entry(first_term.input_idx)
+                    .or_insert_with(|| input_matrix_norm_at(first_term.input_idx))
+                    .clone();
+                return first_term.transform.apply(input) * BigDecimal::from(0u32);
+            }
+            panic!("affine error-norm zero expression must not be evaluated directly");
+        });
+        for term in &self.input_terms {
+            let input = cache
+                .entry(term.input_idx)
+                .or_insert_with(|| input_matrix_norm_at(term.input_idx))
+                .clone();
+            let transformed = term.transform.apply(input);
+            value = value + &(transformed * &term.coefficient);
+        }
+        value
     }
 }
 
@@ -3254,6 +3118,11 @@ impl ErrorNormSummaryExpr {
             plaintext_norm: &self.plaintext_norm + &rhs.plaintext_norm,
             matrix_expr: self.matrix_expr.add_expr(&rhs.matrix_expr),
         }
+    }
+
+    fn add_assign_bound(&mut self, rhs: Self) {
+        self.plaintext_norm = &self.plaintext_norm + &rhs.plaintext_norm;
+        self.matrix_expr.add_assign_expr(rhs.matrix_expr);
     }
 
     fn mul_bound(&self, rhs: &Self) -> Self {
@@ -3290,52 +3159,52 @@ impl ErrorNormSummaryExpr {
             )),
         }
     }
-
-    fn substitute_inputs(&self, actual_inputs: &[Arc<ErrorNormSummaryExpr>]) -> Self {
-        Self {
-            plaintext_norm: self.plaintext_norm.clone(),
-            matrix_expr: self.matrix_expr.substitute_inputs(actual_inputs),
-        }
-    }
-
-    fn substitute_inputs_with<F>(&self, actual_input_at: &F) -> Self
-    where
-        F: Fn(usize) -> Arc<ErrorNormSummaryExpr> + Sync,
-    {
-        Self {
-            plaintext_norm: self.plaintext_norm.clone(),
-            matrix_expr: self.matrix_expr.substitute_inputs_with(actual_input_at),
-        }
-    }
-
-    fn evaluate_refs(&self, input_matrix_norms: &[&PolyMatrixNorm]) -> ErrorNorm {
-        self.evaluate_with(&|input_idx| {
-            (*input_matrix_norms.get(input_idx).unwrap_or_else(|| {
-                panic!("affine error-norm input index {input_idx} out of range during evaluation")
-            }))
-            .clone()
-        })
-    }
-
-    fn evaluate_with<F>(&self, input_matrix_norm_at: &F) -> ErrorNorm
-    where
-        F: Fn(usize) -> PolyMatrixNorm + Sync,
-    {
-        ErrorNorm::new(
-            self.plaintext_norm.clone(),
-            self.matrix_expr.evaluate_with(input_matrix_norm_at),
-        )
-    }
 }
 
 #[derive(Debug, Clone)]
 struct ErrorNormSubCircuitSummary {
-    output_exprs: Vec<Arc<ErrorNormSummaryExpr>>,
+    output_plaintext_norms: CompressedPolyNormRuns,
+    output_matrix_exprs: Box<[AffineErrorNormExpr]>,
 }
 
 impl ErrorNormSubCircuitSummary {
-    fn substitute(&self, actual_inputs: &[Arc<ErrorNormSummaryExpr>]) -> Vec<ErrorNormSummaryExpr> {
-        self.output_exprs.par_iter().map(|expr| expr.substitute_inputs(actual_inputs)).collect()
+    fn output_len(&self) -> usize {
+        self.output_matrix_exprs.len()
+    }
+
+    fn output_plaintext_norm_at(&self, output_idx: usize) -> PolyNorm {
+        self.output_plaintext_norms.clone_at(output_idx)
+    }
+
+    fn substitute_output_range_with_input_fn<F>(
+        &self,
+        output_range: std::ops::Range<usize>,
+        actual_input_at: &F,
+    ) -> Vec<ErrorNormSummaryExpr>
+    where
+        F: Fn(usize) -> Arc<ErrorNormSummaryExpr> + Sync,
+    {
+        let plaintext_norms = self.output_plaintext_norms.materialize_range(output_range.clone());
+        self.output_matrix_exprs[output_range]
+            .iter()
+            .zip(plaintext_norms.into_iter())
+            .collect::<Vec<_>>()
+            .par_chunks(ERROR_NORM_EXPR_PAR_BATCH_SIZE)
+            .map(|expr_chunk| {
+                let mut cache = HashMap::<usize, AffineErrorNormExpr>::new();
+                expr_chunk
+                    .iter()
+                    .map(|(matrix_expr, plaintext_norm)| ErrorNormSummaryExpr {
+                        plaintext_norm: plaintext_norm.clone(),
+                        matrix_expr: matrix_expr
+                            .substitute_inputs_with_cached(actual_input_at, &mut cache),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     fn substitute_output(
@@ -3343,73 +3212,210 @@ impl ErrorNormSubCircuitSummary {
         output_idx: usize,
         actual_inputs: &[Arc<ErrorNormSummaryExpr>],
     ) -> ErrorNormSummaryExpr {
-        self.output_exprs
+        let matrix_expr = self
+            .output_matrix_exprs
             .get(output_idx)
-            .unwrap_or_else(|| panic!("error-norm summary output index {output_idx} out of range"))
-            .substitute_inputs(actual_inputs)
+            .unwrap_or_else(|| panic!("error-norm summary output index {output_idx} out of range"));
+        ErrorNormSummaryExpr {
+            plaintext_norm: self.output_plaintext_norm_at(output_idx),
+            matrix_expr: matrix_expr.substitute_inputs_with_cached(
+                &|input_idx| {
+                    actual_inputs
+                        .get(input_idx)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "error-norm summary input index {input_idx} out of range during substitution"
+                            )
+                        })
+                        .clone()
+                },
+                &mut HashMap::new(),
+            ),
+        }
     }
 
-    fn evaluate_refs(&self, input_matrix_norms: &[&PolyMatrixNorm]) -> Vec<ErrorNorm> {
-        self.output_exprs.par_iter().map(|expr| expr.evaluate_refs(input_matrix_norms)).collect()
-    }
-
-    fn evaluate_with<F>(&self, input_matrix_norm_at: &F) -> Vec<ErrorNorm>
+    fn evaluate_output_range_with_shared_cache<F>(
+        &self,
+        output_range: std::ops::Range<usize>,
+        input_matrix_norm_at: &F,
+    ) -> Vec<ErrorNorm>
     where
         F: Fn(usize) -> PolyMatrixNorm + Sync,
     {
-        self.output_exprs.par_iter().map(|expr| expr.evaluate_with(input_matrix_norm_at)).collect()
+        let plaintext_norms = self.output_plaintext_norms.materialize_range(output_range.clone());
+        self.output_matrix_exprs[output_range]
+            .iter()
+            .zip(plaintext_norms.into_iter())
+            .collect::<Vec<_>>()
+            .par_chunks(ERROR_NORM_EXPR_PAR_BATCH_SIZE)
+            .map(|expr_chunk| {
+                let mut cache = HashMap::<usize, PolyMatrixNorm>::new();
+                expr_chunk
+                    .iter()
+                    .map(|(matrix_expr, plaintext_norm)| {
+                        ErrorNorm::new(
+                            plaintext_norm.clone(),
+                            matrix_expr.evaluate_with_cached(input_matrix_norm_at, &mut cache),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PolyNormRun {
+    len: usize,
+    norm: PolyNorm,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompressedPolyNormRuns {
+    total_len: usize,
+    runs: Arc<[PolyNormRun]>,
+}
+
+impl CompressedPolyNormRuns {
+    fn from_slice(norms: &[PolyNorm]) -> Self {
+        if norms.is_empty() {
+            return Self { total_len: 0, runs: Arc::from([]) };
+        }
+        let mut runs = Vec::new();
+        let mut current = norms[0].clone();
+        let mut current_len = 1usize;
+        for norm in &norms[1..] {
+            if *norm == current {
+                current_len += 1;
+            } else {
+                runs.push(PolyNormRun { len: current_len, norm: current });
+                current = norm.clone();
+                current_len = 1;
+            }
+        }
+        runs.push(PolyNormRun { len: current_len, norm: current });
+        Self { total_len: norms.len(), runs: Arc::from(runs) }
+    }
+
+    fn from_vec(norms: Vec<PolyNorm>) -> Self {
+        Self::from_slice(&norms)
+    }
+
+    fn len(&self) -> usize {
+        self.total_len
+    }
+
+    fn matches_slice(&self, input_plaintext_norms: &[PolyNorm]) -> bool {
+        if self.total_len != input_plaintext_norms.len() {
+            return false;
+        }
+        let mut offset = 0usize;
+        for run in self.runs.iter() {
+            let end = offset + run.len;
+            if input_plaintext_norms[offset..end].iter().any(|norm| norm != &run.norm) {
+                return false;
+            }
+            offset = end;
+        }
+        true
+    }
+
+    fn materialize(&self) -> Vec<PolyNorm> {
+        let mut norms = Vec::with_capacity(self.total_len);
+        for run in self.runs.iter() {
+            norms.extend(std::iter::repeat_n(run.norm.clone(), run.len));
+        }
+        norms
+    }
+
+    fn materialize_range(&self, range: std::ops::Range<usize>) -> Vec<PolyNorm> {
+        assert!(
+            range.start <= range.end && range.end <= self.total_len,
+            "poly norm range {:?} out of bounds for total_len={}",
+            range,
+            self.total_len
+        );
+        let mut norms = Vec::with_capacity(range.len());
+        let mut offset = 0usize;
+        for run in self.runs.iter() {
+            let run_end = offset + run.len;
+            if run_end <= range.start {
+                offset = run_end;
+                continue;
+            }
+            if offset >= range.end {
+                break;
+            }
+            let overlap_start = range.start.max(offset);
+            let overlap_end = range.end.min(run_end);
+            norms.extend(std::iter::repeat_n(run.norm.clone(), overlap_end - overlap_start));
+            offset = run_end;
+        }
+        norms
+    }
+
+    fn clone_at(&self, idx: usize) -> PolyNorm {
+        self.materialize_range(idx..idx + 1)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("poly norm index {idx} out of bounds"))
     }
 }
 
 #[derive(Debug, Clone)]
 enum ErrorNormInputPlaintextProfile {
-    Flat(Arc<[PolyNorm]>),
-    SharedPrefix { prefix_norms: Arc<[PolyNorm]>, suffix_norms: Arc<[PolyNorm]> },
+    Flat(CompressedPolyNormRuns),
+    SharedPrefix { prefix_norms: CompressedPolyNormRuns, suffix_norms: CompressedPolyNormRuns },
 }
 
 impl ErrorNormInputPlaintextProfile {
+    fn flat_from_vec(norms: Vec<PolyNorm>) -> Self {
+        Self::Flat(CompressedPolyNormRuns::from_vec(norms))
+    }
+
+    fn shared_prefix_from_parts(prefix_norms: &[PolyNorm], suffix_norms: Vec<PolyNorm>) -> Self {
+        Self::SharedPrefix {
+            prefix_norms: CompressedPolyNormRuns::from_slice(prefix_norms),
+            suffix_norms: CompressedPolyNormRuns::from_vec(suffix_norms),
+        }
+    }
+
     fn matches_slice(&self, input_plaintext_norms: &[PolyNorm]) -> bool {
         match self {
-            Self::Flat(norms) => norms.as_ref() == input_plaintext_norms,
+            Self::Flat(norms) => norms.matches_slice(input_plaintext_norms),
             Self::SharedPrefix { prefix_norms, suffix_norms } => {
                 input_plaintext_norms.len() == prefix_norms.len() + suffix_norms.len() &&
-                    input_plaintext_norms.starts_with(prefix_norms.as_ref()) &&
-                    &input_plaintext_norms[prefix_norms.len()..] == suffix_norms.as_ref()
+                    prefix_norms.matches_slice(&input_plaintext_norms[..prefix_norms.len()]) &&
+                    suffix_norms.matches_slice(&input_plaintext_norms[prefix_norms.len()..])
             }
         }
     }
 
     fn matches_profile(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Flat(left), Self::Flat(right)) => left.as_ref() == right.as_ref(),
+            (Self::Flat(left), Self::Flat(right)) => left == right,
             (
                 Self::SharedPrefix { prefix_norms: left_prefix, suffix_norms: left_suffix },
                 Self::SharedPrefix { prefix_norms: right_prefix, suffix_norms: right_suffix },
-            ) => {
-                left_prefix.as_ref() == right_prefix.as_ref() &&
-                    left_suffix.as_ref() == right_suffix.as_ref()
+            ) => left_prefix == right_prefix && left_suffix == right_suffix,
+            (Self::Flat(norms), other) | (other, Self::Flat(norms)) => {
+                let materialized = norms.materialize();
+                other.matches_slice(&materialized)
             }
-            (Self::Flat(norms), other) | (other, Self::Flat(norms)) => other.matches_slice(norms),
         }
     }
 
     fn materialize(&self) -> Vec<PolyNorm> {
         match self {
-            Self::Flat(norms) => norms.as_ref().to_vec(),
+            Self::Flat(norms) => norms.materialize(),
             Self::SharedPrefix { prefix_norms, suffix_norms } => {
                 let mut norms = Vec::with_capacity(prefix_norms.len() + suffix_norms.len());
-                norms.extend(prefix_norms.iter().cloned());
-                norms.extend(suffix_norms.iter().cloned());
+                norms.extend(prefix_norms.materialize());
+                norms.extend(suffix_norms.materialize());
                 norms
-            }
-        }
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            Self::Flat(norms) => norms.len(),
-            Self::SharedPrefix { prefix_norms, suffix_norms } => {
-                prefix_norms.len() + suffix_norms.len()
             }
         }
     }
@@ -3418,7 +3424,6 @@ impl ErrorNormInputPlaintextProfile {
 #[derive(Debug, Clone)]
 struct ErrorNormSubCircuitSummaryRecord {
     input_plaintext_norms: ErrorNormInputPlaintextProfile,
-    param_bindings: Arc<[SubCircuitParamValue]>,
     summary: Arc<ErrorNormSubCircuitSummary>,
 }
 

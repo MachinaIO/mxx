@@ -816,8 +816,8 @@ mod tests {
     #[ignore = "expensive circuit-structure reporting test; run with --ignored --nocapture"]
     fn test_goldreich_ring_gsw_large_circuit_non_free_depth_metrics() {
         let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
-        let ring_dim = 1u32 << 10;
-        let num_slots = 1usize << 10;
+        let ring_dim = 1u32 << 16;
+        let num_slots = 1usize << 16;
         let active_levels = 1usize;
         let crt_bits = 24usize;
         let p_moduli_bits = 7usize;

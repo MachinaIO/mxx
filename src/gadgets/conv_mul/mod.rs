@@ -25,10 +25,6 @@ use rayon::prelude::*;
 use std::{sync::Arc, time::Instant};
 use tracing::debug;
 
-fn single_wire_gate_ids(wires: Vec<BatchedWire>) -> Vec<crate::circuit::gate::GateId> {
-    wires.into_iter().map(BatchedWire::as_single_wire).collect()
-}
-
 fn validate_inputs<P: Poly>(
     params: &P::Params,
     lhs: &NestedRnsPoly<P>,
@@ -342,11 +338,10 @@ pub fn negacyclic_conv_mul<P: Poly + 'static>(
             q_level_diagonal_product_param_bindings(lhs.ctx.as_ref(), diagonal, num_slots);
         let mut inner = Vec::with_capacity(active_levels);
         for q_idx in 0..active_levels {
-            let mut inputs = lhs.inner[q_idx].clone();
-            inputs.extend_from_slice(&rhs.inner[q_idx]);
+            let inputs = vec![lhs.inner[q_idx], rhs.inner[q_idx]];
             let outputs =
                 circuit.call_sub_circuit_with_bindings(diagonal_product_id, &inputs, &bindings);
-            inner.push(single_wire_gate_ids(outputs));
+            inner.push(BatchedWire::from_batches(outputs));
         }
         diagonal_terms.push(
             NestedRnsPoly::new(
@@ -396,8 +391,7 @@ pub fn negacyclic_conv_mul_right_sparse<P: Poly + 'static>(
     );
     let diagonal_product_id =
         circuit.register_sub_circuit(q_level_diagonal_product_subcircuit::<P>(lhs.ctx.as_ref()));
-    let mut shared_inputs = lhs.inner[rhs_q_idx].clone();
-    shared_inputs.extend_from_slice(&rhs.inner[rhs_q_idx]);
+    let shared_inputs = vec![lhs.inner[rhs_q_idx], rhs.inner[rhs_q_idx]];
     let diagonal_output_templates = (0..num_slots)
         .into_par_iter()
         .map(|diagonal| {
@@ -414,14 +408,14 @@ pub fn negacyclic_conv_mul_right_sparse<P: Poly + 'static>(
         .collect::<Vec<_>>();
     let instantiate_start = Instant::now();
     let mut diagonal_terms = Vec::with_capacity(num_slots);
-    let zero_gate = circuit.const_zero_gate().as_single_wire();
     for (diagonal, output_template) in diagonal_output_templates.into_iter().enumerate() {
         let bindings =
             q_level_diagonal_product_param_bindings(lhs.ctx.as_ref(), diagonal, num_slots);
         let outputs =
             circuit.call_sub_circuit_with_bindings(diagonal_product_id, &shared_inputs, &bindings);
-        let mut inner = vec![vec![zero_gate; lhs.ctx.p_moduli.len()]; active_levels];
-        inner[rhs_q_idx] = single_wire_gate_ids(outputs);
+        let mut inner =
+            (0..active_levels).map(|_| lhs.ctx.zero_level_batch(circuit)).collect::<Vec<_>>();
+        inner[rhs_q_idx] = BatchedWire::from_batches(outputs);
         diagonal_terms.push(
             NestedRnsPoly::new(
                 lhs.ctx.clone(),

@@ -28,9 +28,6 @@ use rayon::prelude::*;
 use std::{sync::Arc, time::Instant};
 use tracing::debug;
 
-const MUL_TOP_LEVEL_BATCH_COLUMNS: usize = 8;
-const MUL_TOP_LEVEL_SUPER_BATCH_GROUPS: usize = 2;
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RingGswAddEntryPlanKey {
     pre_full_reduce: bool,
@@ -49,6 +46,8 @@ struct RingGswEntryOutputMetadata {
     max_plaintexts: Vec<BigUint>,
     p_max_traces: Vec<BigUint>,
 }
+
+const MUL_COLUMN_SUBCIRCUIT_BATCH: usize = 8;
 
 fn validate_num_slots<P: Poly>(params: &P::Params, num_slots: usize) {
     assert!(num_slots > 0, "num_slots must be positive");
@@ -88,36 +87,33 @@ where
     current_layer.pop().expect("pairwise reduction must leave one term")
 }
 
-fn compress_gate_ids_to_batches<I>(gate_ids: I) -> Vec<BatchedWire>
+fn compress_gate_ids_to_batches<I, W>(gate_ids: I) -> Vec<BatchedWire>
 where
-    I: IntoIterator<Item = GateId>,
+    I: IntoIterator<Item = W>,
+    W: Into<BatchedWire>,
 {
-    let mut gate_ids = gate_ids.into_iter();
+    let mut gate_ids = gate_ids.into_iter().map(Into::into);
     let Some(first) = gate_ids.next() else {
         return Vec::new();
     };
-    let mut start = first;
-    let mut prev = first;
+    let mut current = first;
     let mut batches = Vec::new();
     for gate_id in gate_ids {
-        if gate_id.0 == prev.0 + 1 {
-            prev = gate_id;
+        if current.end() == gate_id.start() {
+            current = BatchedWire::new(current.start(), gate_id.end());
             continue;
         }
-        batches.push(BatchedWire::new(start, GateId(prev.0 + 1)));
-        start = gate_id;
-        prev = gate_id;
+        batches.push(current);
+        current = gate_id;
     }
-    batches.push(BatchedWire::new(start, GateId(prev.0 + 1)));
+    batches.push(current);
     batches
 }
 
 fn flatten_nested_rns_entries<P: Poly>(entries: &[NestedRnsPoly<P>]) -> Vec<BatchedWire> {
     entries
         .par_iter()
-        .map(|entry| {
-            compress_gate_ids_to_batches(entry.inner.iter().flat_map(|level| level.iter().copied()))
-        })
+        .map(|entry| compress_gate_ids_to_batches(entry.inner.iter().copied()))
         .collect::<Vec<_>>()
         .into_iter()
         .flatten()
@@ -145,7 +141,7 @@ fn flatten_nested_rns_q_level_rows_for_gadget_terms<P: Poly>(
         .enumerate()
         .map(|(entry_offset, entry)| {
             let sparse_q_idx = (entry_offset % gadget_len) / chunk_width;
-            compress_gate_ids_to_batches(entry.inner[sparse_q_idx].iter().copied())
+            vec![entry.inner[sparse_q_idx]]
         })
         .collect::<Vec<_>>()
         .into_iter()
@@ -174,30 +170,15 @@ fn nested_rns_from_flat_outputs<P: Poly, W: Into<BatchedWire> + Copy>(
     );
     NestedRnsPoly::new(
         template.ctx.clone(),
-        outputs.chunks(p_moduli_depth).map(|row| row.to_vec()).collect::<Vec<_>>(),
+        outputs
+            .chunks(p_moduli_depth)
+            .map(|row| BatchedWire::from_batches(row.iter().copied()))
+            .collect::<Vec<_>>(),
         Some(template.level_offset),
         template.enable_levels,
         max_plaintexts,
     )
     .with_p_max_traces(p_max_traces)
-}
-
-fn sparse_nested_rns_output_template<P: Poly>(
-    ctx: Arc<NestedRnsPolyContext>,
-    active_levels: usize,
-    level_offset: usize,
-    circuit: &mut PolyCircuit<P>,
-) -> NestedRnsPoly<P> {
-    let zero_gate = circuit.const_zero_gate().as_single_wire();
-    let inner = vec![vec![zero_gate; ctx.p_moduli.len()]; active_levels];
-    NestedRnsPoly::new(
-        ctx,
-        inner,
-        Some(level_offset),
-        Some(active_levels),
-        vec![BigUint::ZERO; active_levels],
-    )
-    .with_p_max_traces(vec![BigUint::ZERO; active_levels])
 }
 
 fn raw_decomposed_term_bound(template_ctx: &NestedRnsPolyContext, term_idx: usize) -> BigUint {
@@ -210,144 +191,73 @@ fn raw_decomposed_term_bound(template_ctx: &NestedRnsPolyContext, term_idx: usiz
     }
 }
 
-fn raw_decomposed_entry_metadata(
-    template_ctx: &NestedRnsPolyContext,
-    active_levels: usize,
-    sparse_q_idx: usize,
-    term_idx: usize,
-) -> (Vec<BigUint>, Vec<BigUint>) {
-    let term_bound = raw_decomposed_term_bound(template_ctx, term_idx);
-    let mut max_plaintexts = vec![BigUint::ZERO; active_levels];
-    let mut p_max_traces = vec![BigUint::ZERO; active_levels];
-    max_plaintexts[sparse_q_idx] = term_bound.clone();
-    p_max_traces[sparse_q_idx] = term_bound;
-    (max_plaintexts, p_max_traces)
-}
-
-fn add_nested_rns_metadata(
+fn add_nested_rns_scalar_metadata(
     ctx: &NestedRnsPolyContext,
-    active_levels: usize,
+    sparse_q_idx: usize,
     level_offset: usize,
-    left_max_plaintexts: &[BigUint],
-    left_p_max_traces: &[BigUint],
-    right_max_plaintexts: &[BigUint],
-    right_p_max_traces: &[BigUint],
-) -> (Vec<BigUint>, Vec<BigUint>) {
-    assert_eq!(
-        left_max_plaintexts.len(),
-        active_levels,
-        "left metadata depth must match active levels"
-    );
-    assert_eq!(left_p_max_traces.len(), active_levels, "left trace depth must match active levels");
-    assert_eq!(
-        right_max_plaintexts.len(),
-        active_levels,
-        "right metadata depth must match active levels"
-    );
-    assert_eq!(
-        right_p_max_traces.len(),
-        active_levels,
-        "right trace depth must match active levels"
-    );
+    left_max_plaintext: &BigUint,
+    left_p_max_trace: &BigUint,
+    right_max_plaintext: &BigUint,
+    right_p_max_trace: &BigUint,
+) -> (BigUint, BigUint) {
     let reduced_trace = ctx.reduced_p_max_trace();
-    let mut left_bounds = left_max_plaintexts.to_vec();
-    let mut right_bounds = right_max_plaintexts.to_vec();
-    let mut left_traces = left_p_max_traces.to_vec();
-    let mut right_traces = right_p_max_traces.to_vec();
+    let reduced_bound = ctx.full_reduce_max_plaintexts[level_offset + sparse_q_idx].clone();
+    let mut left_bound = left_max_plaintext.clone();
+    let mut right_bound = right_max_plaintext.clone();
+    let mut left_trace = left_p_max_trace.clone();
+    let mut right_trace = right_p_max_trace.clone();
 
-    let predicted_bounds = left_bounds
-        .par_iter()
-        .zip(right_bounds.par_iter())
-        .map(|(left_bound, right_bound)| left_bound + right_bound)
-        .collect::<Vec<_>>();
-    if predicted_bounds.iter().any(|bound| bound >= ctx.p_full_ref()) {
-        let reduced_bounds =
-            ctx.full_reduce_max_plaintexts[level_offset..level_offset + active_levels].to_vec();
-        left_bounds = reduced_bounds.clone();
-        right_bounds = reduced_bounds;
-        left_traces = vec![reduced_trace.clone(); active_levels];
-        right_traces = vec![reduced_trace.clone(); active_levels];
+    if &left_bound + &right_bound >= *ctx.p_full_ref() {
+        left_bound = reduced_bound.clone();
+        right_bound = reduced_bound;
+        left_trace = reduced_trace.clone();
+        right_trace = reduced_trace.clone();
     }
 
-    let trace_needs_reduce = left_traces
-        .par_iter()
-        .zip(right_traces.par_iter())
-        .map(|(left_trace, right_trace)| {
-            left_trace + right_trace >= *ctx.lut_mod_p_max_map_size_ref()
-        })
-        .collect::<Vec<_>>();
-    left_traces = left_traces
-        .into_par_iter()
-        .zip(trace_needs_reduce.par_iter())
-        .map(|(trace, should_reduce)| if *should_reduce { reduced_trace.clone() } else { trace })
-        .collect();
-    right_traces = right_traces
-        .into_par_iter()
-        .zip(trace_needs_reduce.par_iter())
-        .map(|(trace, should_reduce)| if *should_reduce { reduced_trace.clone() } else { trace })
-        .collect();
+    if &left_trace + &right_trace >= *ctx.lut_mod_p_max_map_size_ref() {
+        left_trace = reduced_trace.clone();
+        right_trace = reduced_trace;
+    }
 
-    let final_bounds = left_bounds
-        .par_iter()
-        .zip(right_bounds.par_iter())
-        .map(|(left_bound, right_bound)| left_bound + right_bound)
-        .collect::<Vec<_>>();
+    let final_bound = left_bound + right_bound;
+    assert!(final_bound < *ctx.p_full_ref(), "metadata-only add output exceeds p_full");
+    let final_trace = left_trace + right_trace;
     assert!(
-        final_bounds.iter().all(|bound| bound < ctx.p_full_ref()),
-        "metadata-only add output exceeds p_full"
-    );
-    let final_traces = left_traces
-        .par_iter()
-        .zip(right_traces.par_iter())
-        .map(|(left_trace, right_trace)| left_trace + right_trace)
-        .collect::<Vec<_>>();
-    assert!(
-        final_traces.iter().all(|trace| trace < ctx.lut_mod_p_max_map_size_ref()),
+        final_trace < *ctx.lut_mod_p_max_map_size_ref(),
         "metadata-only add output exceeds lut_mod_p_max_map_size"
     );
-    (final_bounds, final_traces)
+    (final_bound, final_trace)
 }
 
-fn raw_decomposed_conv_output_metadata(
+fn raw_decomposed_conv_output_scalar_metadata(
     ctx: &NestedRnsPolyContext,
-    active_levels: usize,
     level_offset: usize,
     sparse_q_idx: usize,
     term_idx: usize,
     lhs_q_level_bound: &BigUint,
     num_slots: usize,
-) -> (Vec<BigUint>, Vec<BigUint>) {
-    assert!(
-        sparse_q_idx < active_levels,
-        "sparse_q_idx {} exceeds active levels {}",
-        sparse_q_idx,
-        active_levels
-    );
+) -> (BigUint, BigUint) {
     assert!(num_slots > 0, "num_slots must be positive");
 
-    let term_bound = raw_decomposed_term_bound(ctx, term_idx);
-    let mut term_max_plaintexts = vec![BigUint::ZERO; active_levels];
-    let mut term_p_max_traces = vec![BigUint::ZERO; active_levels];
-    term_max_plaintexts[sparse_q_idx] = lhs_q_level_bound * &term_bound;
-    term_p_max_traces[sparse_q_idx] = ctx.reduced_p_max_trace();
-
-    let mut current_layer = vec![(term_max_plaintexts, term_p_max_traces); num_slots];
+    let term_bound = lhs_q_level_bound * raw_decomposed_term_bound(ctx, term_idx);
+    let reduced_trace = ctx.reduced_p_max_trace();
+    let mut current_layer = vec![(term_bound, reduced_trace); num_slots];
     while current_layer.len() > 1 {
         let mut next_layer = Vec::with_capacity(current_layer.len().div_ceil(2));
         let mut iter = current_layer.into_iter();
-        while let Some((left_bounds, left_traces)) = iter.next() {
-            if let Some((right_bounds, right_traces)) = iter.next() {
-                next_layer.push(add_nested_rns_metadata(
+        while let Some((left_bound, left_trace)) = iter.next() {
+            if let Some((right_bound, right_trace)) = iter.next() {
+                next_layer.push(add_nested_rns_scalar_metadata(
                     ctx,
-                    active_levels,
+                    sparse_q_idx,
                     level_offset,
-                    &left_bounds,
-                    &left_traces,
-                    &right_bounds,
-                    &right_traces,
+                    &left_bound,
+                    &left_trace,
+                    &right_bound,
+                    &right_trace,
                 ));
             } else {
-                next_layer.push((left_bounds, left_traces));
+                next_layer.push((left_bound, left_trace));
             }
         }
         current_layer = next_layer;
@@ -599,10 +509,7 @@ pub struct RingGswContext<P: Poly> {
     pub randomizer_norm_ctx: Arc<SimulatorContext>,
     add_entry_cache: DashMap<RingGswAddEntryPlanKey, usize>,
     sub_entry_cache: DashMap<RingGswSubEntryPlanKey, usize>,
-    pub mul_super_batch_columns: usize,
-    pub mul_super_batch_subcircuit_id: usize,
-    pub mul_super_batch_tail_columns: usize,
-    pub mul_super_batch_tail_subcircuit_id: usize,
+    pub mul_subcircuit_id: usize,
     pub mul_output_max_plaintexts: Vec<BigUint>,
     pub mul_output_p_max_traces: Vec<BigUint>,
 }
@@ -724,38 +631,6 @@ impl<P: Poly + 'static> RingGswContext<P> {
         )
     }
 
-    fn mul_raw_decomposed_q_level_entry_subcircuit(
-        source_circuit: &PolyCircuit<P>,
-        template_ctx: &NestedRnsPolyContext,
-        active_levels: usize,
-        _level_offset: usize,
-        sparse_q_idx: usize,
-        term_helper: Arc<PolyCircuit<P>>,
-        sub_circuit_storage: SubCircuitDiskStorage,
-    ) -> PolyCircuit<P> {
-        let mut circuit = Self::helper_circuit_with_storage(&sub_circuit_storage);
-        let ctx =
-            Arc::new(template_ctx.register_shared_subcircuits_in(source_circuit, &mut circuit));
-        let lhs_row = circuit.input(ctx.p_moduli.len());
-        let term_gate = circuit.input(1).at(0).as_single_wire();
-        let term_helper_id = circuit.register_shared_sub_circuit(term_helper);
-        let mut inputs = Vec::with_capacity(1 + ctx.p_moduli.len());
-        inputs.push(lhs_row);
-        inputs.extend(std::iter::repeat_n(BatchedWire::single(term_gate), ctx.p_moduli.len()));
-        let product_row = circuit.call_sub_circuit(term_helper_id, &inputs);
-        let zero_gate = circuit.const_zero_gate();
-        let mut outputs = Vec::with_capacity(active_levels * ctx.p_moduli.len());
-        for q_idx in 0..active_levels {
-            if q_idx == sparse_q_idx {
-                outputs.extend(product_row.iter().copied());
-            } else {
-                outputs.extend(std::iter::repeat_n(zero_gate, ctx.p_moduli.len()));
-            }
-        }
-        circuit.output(outputs);
-        circuit
-    }
-
     pub fn setup(
         circuit: &mut PolyCircuit<P>,
         params: &P::Params,
@@ -806,8 +681,8 @@ impl<P: Poly + 'static> RingGswContext<P> {
         let randomizer_norm_ctx = ring_gsw_randomizer_norm_ctx::<P>(params, width, max_p_modulus);
         let helper_storage =
             Self::shared_helper_storage(circuit.cloned_subcircuit_disk_storage(), "ring-gsw");
-        let helper_build_start = Instant::now();
-        let (mul_column_subcircuit, mul_output_template) = Self::mul_column_subcircuit(
+        let mul_subcircuit_start = Instant::now();
+        let (mul_subcircuit, mul_output_template) = Self::mul_subcircuit(
             circuit,
             params,
             num_slots,
@@ -817,102 +692,11 @@ impl<P: Poly + 'static> RingGswContext<P> {
             width,
             helper_storage.clone(),
         );
-        let mul_column_subcircuit = Arc::new(mul_column_subcircuit);
+        let mul_subcircuit_id = circuit.register_sub_circuit(mul_subcircuit);
         debug!(
-            "RingGswContext::setup mul helper subcircuit built: width={}, elapsed_ms={}",
+            "RingGswContext::setup full mul subcircuit registered: width={}, elapsed_ms={}",
             width,
-            helper_build_start.elapsed().as_millis()
-        );
-        let mul_batch_columns = width.min(MUL_TOP_LEVEL_BATCH_COLUMNS);
-        let batch_helper_start = Instant::now();
-        let mul_batch_subcircuit = Arc::new(Self::mul_columns_batch_subcircuit(
-            circuit,
-            nested_rns.as_ref(),
-            active_levels,
-            level_offset,
-            width,
-            mul_batch_columns,
-            Arc::clone(&mul_column_subcircuit),
-            helper_storage.clone(),
-        ));
-        let mul_batch_tail_columns = width % mul_batch_columns;
-        let mul_batch_tail_subcircuit = if mul_batch_tail_columns > 0 {
-            Some(Arc::new(Self::mul_columns_batch_subcircuit(
-                circuit,
-                nested_rns.as_ref(),
-                active_levels,
-                level_offset,
-                width,
-                mul_batch_tail_columns,
-                Arc::clone(&mul_column_subcircuit),
-                helper_storage.clone(),
-            )))
-        } else {
-            None
-        };
-        debug!(
-            "RingGswContext::setup mul batch helpers built: batch_columns={}, tail_columns={}, elapsed_ms={}",
-            mul_batch_columns,
-            mul_batch_tail_columns,
-            batch_helper_start.elapsed().as_millis()
-        );
-        let mul_super_batch_columns =
-            (mul_batch_columns * MUL_TOP_LEVEL_SUPER_BATCH_GROUPS).min(width);
-        let super_batch_helper_start = Instant::now();
-        let mul_super_batch_subcircuit_id =
-            circuit.register_sub_circuit(Self::mul_super_batch_subcircuit(
-                circuit,
-                nested_rns.as_ref(),
-                active_levels,
-                level_offset,
-                width,
-                mul_super_batch_columns,
-                mul_batch_columns,
-                Arc::clone(&mul_batch_subcircuit),
-                mul_batch_tail_subcircuit.clone(),
-                helper_storage.clone(),
-            ));
-        let mul_super_batch_tail_columns = width % mul_super_batch_columns;
-        let mul_super_batch_tail_subcircuit_id = if mul_super_batch_tail_columns > 0 {
-            let (
-                mul_super_batch_tail_batch_columns,
-                mul_super_batch_tail_batch_subcircuit,
-                mul_super_batch_tail_tail_subcircuit,
-            ) = if mul_super_batch_tail_columns < mul_batch_columns {
-                (
-                    mul_super_batch_tail_columns,
-                    Arc::clone(mul_batch_tail_subcircuit.as_ref().expect(
-                        "tail super-batch smaller than batch must reuse tail batch helper",
-                    )),
-                    None,
-                )
-            } else {
-                (
-                    mul_batch_columns,
-                    Arc::clone(&mul_batch_subcircuit),
-                    mul_batch_tail_subcircuit.clone(),
-                )
-            };
-            circuit.register_sub_circuit(Self::mul_super_batch_subcircuit(
-                circuit,
-                nested_rns.as_ref(),
-                active_levels,
-                level_offset,
-                width,
-                mul_super_batch_tail_columns,
-                mul_super_batch_tail_batch_columns,
-                mul_super_batch_tail_batch_subcircuit,
-                mul_super_batch_tail_tail_subcircuit,
-                helper_storage.clone(),
-            ))
-        } else {
-            mul_super_batch_subcircuit_id
-        };
-        debug!(
-            "RingGswContext::setup mul super-batch helpers built: super_batch_columns={}, tail_columns={}, elapsed_ms={}",
-            mul_super_batch_columns,
-            mul_super_batch_tail_columns,
-            super_batch_helper_start.elapsed().as_millis()
+            mul_subcircuit_start.elapsed().as_millis()
         );
         let ctx = Arc::new(Self {
             params: params.clone(),
@@ -923,10 +707,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
             randomizer_norm_ctx,
             add_entry_cache: DashMap::new(),
             sub_entry_cache: DashMap::new(),
-            mul_super_batch_columns,
-            mul_super_batch_subcircuit_id,
-            mul_super_batch_tail_columns,
-            mul_super_batch_tail_subcircuit_id,
+            mul_subcircuit_id,
             mul_output_max_plaintexts: mul_output_template.max_plaintexts,
             mul_output_p_max_traces: mul_output_template.p_max_traces,
         });
@@ -975,10 +756,81 @@ impl<P: Poly + 'static> RingGswContext<P> {
             width,
             sub_circuit_storage.clone(),
         );
-        let mul_column_subcircuit_id = circuit.register_sub_circuit(mul_column_subcircuit);
-        debug!(
-            "RingGswContext::mul_subcircuit column helper registered: width={}, elapsed_ms={}",
+        let mul_column_subcircuit = Arc::new(mul_column_subcircuit);
+        let batch_columns = width.min(MUL_COLUMN_SUBCIRCUIT_BATCH);
+        let super_batch_columns = width.min(batch_columns * MUL_COLUMN_SUBCIRCUIT_BATCH);
+        let batch_subcircuit = Arc::new(Self::mul_columns_batch_subcircuit(
+            source_circuit,
+            template_ctx,
+            active_levels,
+            level_offset,
             width,
+            batch_columns,
+            Arc::clone(&mul_column_subcircuit),
+            sub_circuit_storage.clone(),
+        ));
+        let super_batch_tail_columns = super_batch_columns % batch_columns;
+        let super_batch_tail_subcircuit = (super_batch_tail_columns > 0).then(|| {
+            Arc::new(Self::mul_columns_batch_subcircuit(
+                source_circuit,
+                template_ctx,
+                active_levels,
+                level_offset,
+                width,
+                super_batch_tail_columns,
+                Arc::clone(&mul_column_subcircuit),
+                sub_circuit_storage.clone(),
+            ))
+        });
+        let super_batch_subcircuit = Arc::new(Self::mul_super_batch_subcircuit(
+            source_circuit,
+            template_ctx,
+            active_levels,
+            level_offset,
+            width,
+            super_batch_columns,
+            batch_columns,
+            Arc::clone(&batch_subcircuit),
+            super_batch_tail_subcircuit,
+            sub_circuit_storage.clone(),
+        ));
+        let super_batch_subcircuit_id =
+            circuit.register_shared_sub_circuit(Arc::clone(&super_batch_subcircuit));
+        let width_tail_columns = width % super_batch_columns;
+        let width_tail_subcircuit_id = if width_tail_columns > 0 {
+            let width_tail_batch_tail_columns = width_tail_columns % batch_columns;
+            let width_tail_batch_tail_subcircuit = (width_tail_batch_tail_columns > 0).then(|| {
+                Arc::new(Self::mul_columns_batch_subcircuit(
+                    source_circuit,
+                    template_ctx,
+                    active_levels,
+                    level_offset,
+                    width,
+                    width_tail_batch_tail_columns,
+                    Arc::clone(&mul_column_subcircuit),
+                    sub_circuit_storage.clone(),
+                ))
+            });
+            Some(circuit.register_shared_sub_circuit(Arc::new(Self::mul_super_batch_subcircuit(
+                source_circuit,
+                template_ctx,
+                active_levels,
+                level_offset,
+                width,
+                width_tail_columns,
+                batch_columns,
+                Arc::clone(&batch_subcircuit),
+                width_tail_batch_tail_subcircuit,
+                sub_circuit_storage.clone(),
+            ))))
+        } else {
+            None
+        };
+        debug!(
+            "RingGswContext::mul_subcircuit helper hierarchy registered: width={}, batch_columns={}, super_batch_columns={}, elapsed_ms={}",
+            width,
+            batch_columns,
+            super_batch_columns,
             column_helper_start.elapsed().as_millis()
         );
 
@@ -1037,11 +889,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
             input_start.elapsed().as_millis()
         );
 
-        let template_entry =
-            lhs_row0.first().expect("RingGswContext::mul_subcircuit requires positive width");
-        let levels = template_entry.active_q_moduli().len();
-        let p_moduli_depth = template_entry.ctx.p_moduli.len();
-        let entry_size = levels * p_moduli_depth;
+        let entry_size = active_levels * template_ctx.p_moduli.len();
 
         let lhs_inputs_start = Instant::now();
         let (lhs_row0_inputs, lhs_row1_inputs) = rayon::join(
@@ -1058,39 +906,37 @@ impl<P: Poly + 'static> RingGswContext<P> {
             lhs_inputs_start.elapsed().as_millis()
         );
 
-        let mut row0 = Vec::with_capacity(width);
-        let mut row1 = Vec::with_capacity(width);
+        let mut row0_outputs = Vec::with_capacity(width * entry_size);
+        let mut row1_outputs = Vec::with_capacity(width * entry_size);
         let column_loop_start = Instant::now();
-        for col_idx in 0..width {
+        for col_start in (0..width).step_by(super_batch_columns) {
+            let col_end = (col_start + super_batch_columns).min(width);
+            let actual_super_batch_columns = col_end - col_start;
             let (rhs_row0_inputs, rhs_row1_inputs) = rayon::join(
-                || flatten_nested_rns_entries(std::slice::from_ref(&rhs_row0[col_idx])),
-                || flatten_nested_rns_entries(std::slice::from_ref(&rhs_row1[col_idx])),
+                || flatten_nested_rns_entries(&rhs_row0[col_start..col_end]),
+                || flatten_nested_rns_entries(&rhs_row1[col_start..col_end]),
             );
             let mut rhs_suffix = rhs_row0_inputs;
             rhs_suffix.extend(rhs_row1_inputs);
+            let current_super_batch_subcircuit_id =
+                if actual_super_batch_columns == super_batch_columns {
+                    super_batch_subcircuit_id
+                } else {
+                    width_tail_subcircuit_id.expect(
+                        "Ring-GSW width tail helper must exist for non-zero top-level tail columns",
+                    )
+                };
             let outputs = circuit.call_sub_circuit_with_shared_input_prefix_and_bindings(
-                mul_column_subcircuit_id,
+                current_super_batch_subcircuit_id,
                 lhs_input_set_id,
                 &rhs_suffix,
                 &[],
             );
-            assert_eq!(
-                outputs.len(),
-                2 * entry_size,
-                "Ring-GSW column mul subcircuit output size must match two ciphertext entries"
-            );
-            row0.push(nested_rns_from_flat_outputs(
-                template_entry,
-                &outputs[..entry_size],
-                mul_output_template.max_plaintexts.clone(),
-                mul_output_template.p_max_traces.clone(),
-            ));
-            row1.push(nested_rns_from_flat_outputs(
-                template_entry,
-                &outputs[entry_size..],
-                mul_output_template.max_plaintexts.clone(),
-                mul_output_template.p_max_traces.clone(),
-            ));
+            debug_assert_eq!(outputs.len(), 2 * actual_super_batch_columns * entry_size);
+            let (row0_batch_outputs, row1_batch_outputs) =
+                outputs.split_at(actual_super_batch_columns * entry_size);
+            row0_outputs.extend_from_slice(row0_batch_outputs);
+            row1_outputs.extend_from_slice(row1_batch_outputs);
         }
         debug!(
             "RingGswContext::mul_subcircuit column loop finished: width={}, elapsed_ms={}",
@@ -1098,8 +944,6 @@ impl<P: Poly + 'static> RingGswContext<P> {
             column_loop_start.elapsed().as_millis()
         );
 
-        let (row0_outputs, row1_outputs) =
-            rayon::join(|| flatten_nested_rns_entries(&row0), || flatten_nested_rns_entries(&row1));
         let mut outputs = row0_outputs;
         outputs.extend(row1_outputs);
         circuit.output(outputs);
@@ -1456,189 +1300,6 @@ impl<P: Poly + 'static> RingGswContext<P> {
         circuit
     }
 
-    fn mul_q_level_row_with_raw_terms_subcircuit(
-        source_circuit: &PolyCircuit<P>,
-        num_slots: usize,
-        template_ctx: &NestedRnsPolyContext,
-        active_levels: usize,
-        level_offset: usize,
-        width: usize,
-        sub_circuit_storage: SubCircuitDiskStorage,
-    ) -> (PolyCircuit<P>, NestedRnsPoly<P>) {
-        let mut helper_circuit = Self::helper_circuit_with_storage(&sub_circuit_storage);
-        let helper_ctx = Arc::new(
-            template_ctx.register_shared_subcircuits_in(source_circuit, &mut helper_circuit),
-        );
-        let (helper_max_plaintexts, _helper_p_max_traces) =
-            helper_ctx.full_reduce_output_metadata(Some(active_levels), Some(level_offset));
-        let chunk_width = template_ctx.p_moduli.len() + 1;
-        let gadget_len = active_levels * chunk_width;
-        assert_eq!(
-            width,
-            2 * gadget_len,
-            "Ring-GSW q-level row helper width {} must equal 2 * gadget_len {}",
-            width,
-            gadget_len
-        );
-        let product_template = sparse_nested_rns_output_template(
-            helper_ctx.clone(),
-            active_levels,
-            level_offset,
-            &mut helper_circuit,
-        );
-        let term_helper =
-            Arc::new(negacyclic_conv_mul_right_decomposed_term_many_shared_subcircuit::<P>(
-                source_circuit,
-                template_ctx,
-                1,
-                num_slots,
-            ));
-        let product_subcircuits = (0..active_levels)
-            .into_par_iter()
-            .map(|sparse_q_idx| {
-                Self::mul_raw_decomposed_q_level_entry_subcircuit(
-                    source_circuit,
-                    template_ctx,
-                    active_levels,
-                    level_offset,
-                    sparse_q_idx,
-                    Arc::clone(&term_helper),
-                    sub_circuit_storage.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let product_subcircuit_ids = product_subcircuits
-            .into_iter()
-            .map(|subcircuit| helper_circuit.register_sub_circuit(subcircuit))
-            .collect::<Vec<_>>();
-        let product_output_metadata = (0..gadget_len)
-            .into_par_iter()
-            .map(|entry_idx| {
-                let sparse_q_idx = entry_idx / chunk_width;
-                let term_idx = entry_idx % chunk_width;
-                raw_decomposed_conv_output_metadata(
-                    helper_ctx.as_ref(),
-                    active_levels,
-                    level_offset,
-                    sparse_q_idx,
-                    term_idx,
-                    &helper_max_plaintexts[sparse_q_idx],
-                    num_slots,
-                )
-            })
-            .collect::<Vec<_>>();
-        let row_q_levels =
-            (0..width).map(|_| helper_circuit.input(helper_ctx.p_moduli.len())).collect::<Vec<_>>();
-        let column_terms =
-            (0..width).map(|_| helper_circuit.input(1).at(0).as_single_wire()).collect::<Vec<_>>();
-        let products = row_q_levels
-            .iter()
-            .zip(column_terms.iter())
-            .enumerate()
-            .map(|(col_idx, (lhs_row, &term_gate))| {
-                let sparse_q_idx = (col_idx % gadget_len) / chunk_width;
-                let inputs = [*lhs_row, BatchedWire::single(term_gate)];
-                let outputs =
-                    helper_circuit.call_sub_circuit(product_subcircuit_ids[sparse_q_idx], &inputs);
-                let (output_max_plaintexts, output_p_max_traces) =
-                    &product_output_metadata[col_idx % gadget_len];
-                nested_rns_from_flat_outputs(
-                    &product_template,
-                    &outputs,
-                    output_max_plaintexts.clone(),
-                    output_p_max_traces.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let result = reduce_nested_rns_terms_pairwise(
-            products,
-            &mut helper_circuit,
-            |lhs, rhs, helper_circuit| lhs.add(rhs, helper_circuit),
-        );
-        helper_circuit.output(flatten_nested_rns_entries(std::slice::from_ref(&result)));
-        (helper_circuit, result)
-    }
-
-    fn mul_q_level_rows_with_raw_terms_batch_subcircuit(
-        source_circuit: &PolyCircuit<P>,
-        num_slots: usize,
-        template_ctx: &NestedRnsPolyContext,
-        active_levels: usize,
-        level_offset: usize,
-        width: usize,
-        batch_columns: usize,
-        sub_circuit_storage: SubCircuitDiskStorage,
-    ) -> (PolyCircuit<P>, NestedRnsPoly<P>) {
-        assert!(batch_columns > 0, "batch_columns must be positive");
-        let mut helper_circuit = Self::helper_circuit_with_storage(&sub_circuit_storage);
-        let chunk_width = template_ctx.p_moduli.len() + 1;
-        let gadget_len = active_levels * chunk_width;
-        assert_eq!(
-            width,
-            2 * gadget_len,
-            "Ring-GSW q-level batch helper width {} must equal 2 * gadget_len {}",
-            width,
-            gadget_len
-        );
-        let helper_build_start = Instant::now();
-        let (row_subcircuit, row_output_template) = Self::mul_q_level_row_with_raw_terms_subcircuit(
-            source_circuit,
-            num_slots,
-            template_ctx,
-            active_levels,
-            level_offset,
-            width,
-            sub_circuit_storage.clone(),
-        );
-        let row_subcircuit_id = helper_circuit.register_sub_circuit(row_subcircuit);
-        debug!(
-            "RingGswContext::mul_q_level_rows_with_raw_terms_batch_subcircuit row helper registered: batch_columns={}, active_levels={}, elapsed_ms={}",
-            batch_columns,
-            active_levels,
-            helper_build_start.elapsed().as_millis()
-        );
-        let helper_ctx = Arc::new(
-            template_ctx.register_shared_subcircuits_in(source_circuit, &mut helper_circuit),
-        );
-        let row0_q_levels =
-            (0..width).map(|_| helper_circuit.input(helper_ctx.p_moduli.len())).collect::<Vec<_>>();
-        let row1_q_levels =
-            (0..width).map(|_| helper_circuit.input(helper_ctx.p_moduli.len())).collect::<Vec<_>>();
-        let batch_column_terms = (0..batch_columns)
-            .map(|_| (0..width).map(|_| helper_circuit.input(1)).collect::<Vec<_>>())
-            .collect::<Vec<_>>();
-        debug!(
-            "RingGswContext::mul_q_level_rows_with_raw_terms_batch_subcircuit inputs allocated: batch_columns={}, width={}, elapsed_ms={}",
-            batch_columns,
-            width,
-            helper_build_start.elapsed().as_millis()
-        );
-        let entry_size = active_levels * helper_ctx.p_moduli.len();
-        let mut row0_outputs = Vec::with_capacity(batch_columns * entry_size);
-        let mut row1_outputs = Vec::with_capacity(batch_columns * entry_size);
-        for column_terms in batch_column_terms.iter() {
-            let mut row0_inputs = Vec::with_capacity(row0_q_levels.len() + column_terms.len());
-            row0_inputs.extend(row0_q_levels.iter().copied());
-            row0_inputs.extend(column_terms.iter().copied());
-            row0_outputs.extend(helper_circuit.call_sub_circuit(row_subcircuit_id, &row0_inputs));
-
-            let mut row1_inputs = Vec::with_capacity(row1_q_levels.len() + column_terms.len());
-            row1_inputs.extend(row1_q_levels.iter().copied());
-            row1_inputs.extend(column_terms.iter().copied());
-            row1_outputs.extend(helper_circuit.call_sub_circuit(row_subcircuit_id, &row1_inputs));
-        }
-        let mut outputs = row0_outputs;
-        outputs.extend(row1_outputs);
-        helper_circuit.output(outputs);
-        debug!(
-            "RingGswContext::mul_q_level_rows_with_raw_terms_batch_subcircuit finished: batch_columns={}, width={}, total_elapsed_ms={}",
-            batch_columns,
-            width,
-            helper_build_start.elapsed().as_millis()
-        );
-        (helper_circuit, row_output_template)
-    }
-
     fn mul_column_subcircuit(
         source_circuit: &PolyCircuit<P>,
         _params: &P::Params,
@@ -1672,12 +1333,6 @@ impl<P: Poly + 'static> RingGswContext<P> {
             );
             let (helper_max_plaintexts, _helper_p_max_traces) =
                 helper_ctx.full_reduce_output_metadata(Some(active_levels), Some(level_offset));
-            let product_template = sparse_nested_rns_output_template(
-                helper_ctx.clone(),
-                active_levels,
-                level_offset,
-                &mut helper_circuit,
-            );
             let term_helper =
                 Arc::new(negacyclic_conv_mul_right_decomposed_term_many_shared_subcircuit::<P>(
                     source_circuit,
@@ -1686,50 +1341,39 @@ impl<P: Poly + 'static> RingGswContext<P> {
                     num_slots,
                 ));
             let product_subcircuits_start = Instant::now();
-            let product_subcircuits = (0..active_levels)
-                .into_par_iter()
-                .map(|sparse_q_idx| {
-                    Self::mul_raw_decomposed_q_level_entry_subcircuit(
-                        source_circuit,
-                        template_ctx,
-                        active_levels,
-                        level_offset,
-                        sparse_q_idx,
-                        Arc::clone(&term_helper),
-                        sub_circuit_storage.clone(),
+            let term_helper_id =
+                helper_circuit.register_shared_sub_circuit(Arc::clone(&term_helper));
+            let make_sparse_q_level_poly =
+                |target_q_idx: usize,
+                 target_row: BatchedWire,
+                 max_plaintext: BigUint,
+                 p_max_trace: BigUint,
+                 helper_circuit: &mut PolyCircuit<P>| {
+                    let mut inner = Vec::with_capacity(active_levels);
+                    for q_idx in 0..active_levels {
+                        if q_idx == target_q_idx {
+                            inner.push(target_row);
+                        } else {
+                            inner.push(helper_ctx.zero_level_batch(helper_circuit));
+                        }
+                    }
+                    let mut max_plaintexts = vec![BigUint::ZERO; active_levels];
+                    let mut p_max_traces = vec![BigUint::ZERO; active_levels];
+                    max_plaintexts[target_q_idx] = max_plaintext;
+                    p_max_traces[target_q_idx] = p_max_trace;
+                    NestedRnsPoly::new(
+                        helper_ctx.clone(),
+                        inner,
+                        Some(level_offset),
+                        Some(active_levels),
+                        max_plaintexts,
                     )
-                })
-                .collect::<Vec<_>>();
-            let product_subcircuit_ids = product_subcircuits
-                .into_iter()
-                .map(|subcircuit| helper_circuit.register_sub_circuit(subcircuit))
-                .collect::<Vec<_>>();
+                    .with_p_max_traces(p_max_traces)
+                };
             debug!(
-                "RingGswContext::mul_column_subcircuit q-level product helpers built/registered: active_levels={}, elapsed_ms={}",
+                "RingGswContext::mul_column_subcircuit q-level product helper prepared: active_levels={}, elapsed_ms={}",
                 active_levels,
                 product_subcircuits_start.elapsed().as_millis()
-            );
-            let product_template_start = Instant::now();
-            let product_output_metadata = (0..gadget_len)
-                .into_par_iter()
-                .map(|entry_idx| {
-                    let sparse_q_idx = entry_idx / chunk_width;
-                    let term_idx = entry_idx % chunk_width;
-                    raw_decomposed_conv_output_metadata(
-                        helper_ctx.as_ref(),
-                        active_levels,
-                        level_offset,
-                        sparse_q_idx,
-                        term_idx,
-                        &helper_max_plaintexts[sparse_q_idx],
-                        num_slots,
-                    )
-                })
-                .collect::<Vec<_>>();
-            debug!(
-                "RingGswContext::mul_column_subcircuit product metadata built in parallel: gadget_len={}, elapsed_ms={}",
-                gadget_len,
-                product_template_start.elapsed().as_millis()
             );
             let row_q_levels = (0..width)
                 .map(|_| helper_circuit.input(helper_ctx.p_moduli.len()))
@@ -1737,33 +1381,103 @@ impl<P: Poly + 'static> RingGswContext<P> {
             let column_terms = (0..width)
                 .map(|_| helper_circuit.input(1).at(0).as_single_wire())
                 .collect::<Vec<_>>();
-            let products = row_q_levels
-                .iter()
-                .zip(column_terms.iter())
-                .enumerate()
-                .map(|(col_idx, (lhs_row, &term_gate))| {
+            let empty_binding_set_id = helper_circuit.intern_binding_set(&[]);
+            let mut grouped_input_set_ids = vec![Vec::<Vec<usize>>::new(); active_levels];
+            let mut current_input_set_ids = vec![Vec::<usize>::new(); active_levels];
+            let mut current_group_bounds = vec![BigUint::ZERO; active_levels];
+            let mut current_group_traces = vec![BigUint::ZERO; active_levels];
+            let mut grouped_bounds = vec![Vec::<BigUint>::new(); active_levels];
+            let mut grouped_traces = vec![Vec::<BigUint>::new(); active_levels];
+            row_q_levels.iter().zip(column_terms.iter()).enumerate().for_each(
+                |(col_idx, (lhs_row, &term_gate))| {
                     let sparse_q_idx = (col_idx % gadget_len) / chunk_width;
-                    let inputs = [*lhs_row, BatchedWire::single(term_gate)];
-                    let outputs = helper_circuit
-                        .call_sub_circuit(product_subcircuit_ids[sparse_q_idx], &inputs);
-                    let (output_max_plaintexts, output_p_max_traces) =
-                        &product_output_metadata[col_idx % gadget_len];
-                    nested_rns_from_flat_outputs(
-                        &product_template,
-                        &outputs,
-                        output_max_plaintexts.clone(),
-                        output_p_max_traces.clone(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let result = reduce_nested_rns_terms_pairwise(
-                products,
-                &mut helper_circuit,
-                |lhs, rhs, helper_circuit| lhs.add(rhs, helper_circuit),
+                    let term_idx = col_idx % chunk_width;
+                    let mut inputs = Vec::with_capacity(1 + helper_ctx.p_moduli.len());
+                    inputs.push(*lhs_row);
+                    inputs.extend(std::iter::repeat_n(
+                        BatchedWire::single(term_gate),
+                        helper_ctx.p_moduli.len(),
+                    ));
+                    let input_set_id = helper_circuit.intern_input_set(inputs);
+                    let (term_bound, term_trace) = raw_decomposed_conv_output_scalar_metadata(
+                        helper_ctx.as_ref(),
+                        level_offset,
+                        sparse_q_idx,
+                        term_idx,
+                        &helper_max_plaintexts[sparse_q_idx],
+                        num_slots,
+                    );
+                    let next_bound = &current_group_bounds[sparse_q_idx] + &term_bound;
+                    let next_trace = &current_group_traces[sparse_q_idx] + &term_trace;
+                    if !current_input_set_ids[sparse_q_idx].is_empty() &&
+                        (next_bound >= *helper_ctx.p_full_ref() ||
+                            next_trace >= *helper_ctx.lut_mod_p_max_map_size_ref())
+                    {
+                        grouped_input_set_ids[sparse_q_idx]
+                            .push(std::mem::take(&mut current_input_set_ids[sparse_q_idx]));
+                        grouped_bounds[sparse_q_idx]
+                            .push(std::mem::take(&mut current_group_bounds[sparse_q_idx]));
+                        grouped_traces[sparse_q_idx]
+                            .push(std::mem::take(&mut current_group_traces[sparse_q_idx]));
+                    }
+                    current_input_set_ids[sparse_q_idx].push(input_set_id);
+                    current_group_bounds[sparse_q_idx] += term_bound;
+                    current_group_traces[sparse_q_idx] += term_trace;
+                },
             );
-            let result_template = result.clone();
+            for sparse_q_idx in 0..active_levels {
+                if !current_input_set_ids[sparse_q_idx].is_empty() {
+                    grouped_input_set_ids[sparse_q_idx]
+                        .push(std::mem::take(&mut current_input_set_ids[sparse_q_idx]));
+                    grouped_bounds[sparse_q_idx]
+                        .push(std::mem::take(&mut current_group_bounds[sparse_q_idx]));
+                    grouped_traces[sparse_q_idx]
+                        .push(std::mem::take(&mut current_group_traces[sparse_q_idx]));
+                }
+            }
+            let mut result_inner = Vec::with_capacity(active_levels);
+            let mut result_max_plaintexts = Vec::with_capacity(active_levels);
+            let mut result_p_max_traces = Vec::with_capacity(active_levels);
+            for sparse_q_idx in 0..active_levels {
+                let grouped_polys = grouped_input_set_ids[sparse_q_idx]
+                    .iter()
+                    .zip(grouped_bounds[sparse_q_idx].iter())
+                    .zip(grouped_traces[sparse_q_idx].iter())
+                    .map(|((input_set_ids, max_plaintext), p_max_trace)| {
+                        let outputs = helper_circuit
+                            .call_sub_circuit_sum_many_with_binding_set_ids(
+                                term_helper_id,
+                                input_set_ids.clone(),
+                                vec![empty_binding_set_id; input_set_ids.len()],
+                            );
+                        make_sparse_q_level_poly(
+                            sparse_q_idx,
+                            BatchedWire::from_batches(outputs),
+                            max_plaintext.clone(),
+                            p_max_trace.clone(),
+                            &mut helper_circuit,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let q_level_result = reduce_nested_rns_terms_pairwise(
+                    grouped_polys,
+                    &mut helper_circuit,
+                    |lhs, rhs, helper_circuit| lhs.add(rhs, helper_circuit),
+                );
+                result_inner.push(q_level_result.inner[sparse_q_idx]);
+                result_max_plaintexts.push(q_level_result.max_plaintexts[sparse_q_idx].clone());
+                result_p_max_traces.push(q_level_result.p_max_traces[sparse_q_idx].clone());
+            }
+            let result = NestedRnsPoly::new(
+                helper_ctx,
+                result_inner,
+                Some(level_offset),
+                Some(active_levels),
+                result_max_plaintexts,
+            )
+            .with_p_max_traces(result_p_max_traces);
             helper_circuit.output(flatten_nested_rns_entries(std::slice::from_ref(&result)));
-            (circuit.register_sub_circuit(helper_circuit), result_template)
+            (circuit.register_sub_circuit(helper_circuit), result)
         };
         debug!(
             "RingGswContext::mul_column_subcircuit dot helper ready: width={}, elapsed_ms={}",
@@ -2313,62 +2027,44 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
         );
 
         let mul_start = Instant::now();
-        let mut row0 = Vec::with_capacity(width);
-        let mut row1 = Vec::with_capacity(width);
-        let super_batch_columns = self.ctx.mul_super_batch_columns;
-        for col_start in (0..width).step_by(super_batch_columns) {
-            let col_end = (col_start + super_batch_columns).min(width);
-            let actual_super_batch_columns = col_end - col_start;
-            let current_super_batch_subcircuit_id = if actual_super_batch_columns ==
-                self.ctx.mul_super_batch_columns
-            {
-                self.ctx.mul_super_batch_subcircuit_id
-            } else if actual_super_batch_columns == self.ctx.mul_super_batch_tail_columns {
-                self.ctx.mul_super_batch_tail_subcircuit_id
-            } else {
-                unreachable!(
-                    "unexpected Ring-GSW mul super-batch width {}; configured super-batch={}, tail={}",
-                    actual_super_batch_columns,
-                    self.ctx.mul_super_batch_columns,
-                    self.ctx.mul_super_batch_tail_columns
-                );
-            };
-            let (rhs_row0_inputs, rhs_row1_inputs) = rayon::join(
-                || flatten_nested_rns_entries(&rhs_row0[col_start..col_end]),
-                || flatten_nested_rns_entries(&rhs_row1[col_start..col_end]),
-            );
-            let mut rhs_suffix = rhs_row0_inputs;
-            rhs_suffix.extend(rhs_row1_inputs);
-            let outputs = circuit.call_sub_circuit_with_shared_input_prefix_and_bindings(
-                current_super_batch_subcircuit_id,
-                lhs_input_set_id,
-                &rhs_suffix,
-                &[],
-            );
-            debug_assert_eq!(outputs.len(), 2 * actual_super_batch_columns * entry_size);
-            let (row0_batch_outputs, row1_batch_outputs) =
-                outputs.split_at(actual_super_batch_columns * entry_size);
-            row0.extend((0..actual_super_batch_columns).map(|batch_idx| {
-                let start = batch_idx * entry_size;
+        let (rhs_row0_inputs, rhs_row1_inputs) = rayon::join(
+            || flatten_nested_rns_entries(&rhs_row0),
+            || flatten_nested_rns_entries(&rhs_row1),
+        );
+        let mut rhs_suffix = rhs_row0_inputs;
+        rhs_suffix.extend(rhs_row1_inputs);
+        let outputs = circuit.call_sub_circuit_with_shared_input_prefix_and_bindings(
+            self.ctx.mul_subcircuit_id,
+            lhs_input_set_id,
+            &rhs_suffix,
+            &[],
+        );
+        debug_assert_eq!(outputs.len(), 2 * width * entry_size);
+        let (row0_outputs, row1_outputs) = outputs.split_at(width * entry_size);
+        let row0 = (0..width)
+            .map(|col_idx| {
+                let start = col_idx * entry_size;
                 let end = start + entry_size;
                 nested_rns_from_flat_outputs(
                     template_entry,
-                    &row0_batch_outputs[start..end],
+                    &row0_outputs[start..end],
                     self.ctx.mul_output_max_plaintexts.clone(),
                     self.ctx.mul_output_p_max_traces.clone(),
                 )
-            }));
-            row1.extend((0..actual_super_batch_columns).map(|batch_idx| {
-                let start = batch_idx * entry_size;
+            })
+            .collect::<Vec<_>>();
+        let row1 = (0..width)
+            .map(|col_idx| {
+                let start = col_idx * entry_size;
                 let end = start + entry_size;
                 nested_rns_from_flat_outputs(
                     template_entry,
-                    &row1_batch_outputs[start..end],
+                    &row1_outputs[start..end],
                     self.ctx.mul_output_max_plaintexts.clone(),
                     self.ctx.mul_output_p_max_traces.clone(),
                 )
-            }));
-        }
+            })
+            .collect::<Vec<_>>();
         debug!(
             "RingGswCiphertext::mul subcircuit call finished: width={}, elapsed_ms={}",
             width,

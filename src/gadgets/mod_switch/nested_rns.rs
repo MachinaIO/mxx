@@ -148,13 +148,7 @@ impl<P: Poly> NestedRnsPoly<P> {
         levels: usize,
         circuit: &mut PolyCircuit<P>,
     ) -> Self {
-        let inner = (0..levels)
-            .map(|_| {
-                (0..self.ctx.p_moduli.len())
-                    .map(|_| circuit.const_zero_gate().as_single_wire())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+        let inner = (0..levels).map(|_| self.ctx.zero_level_batch(circuit)).collect::<Vec<_>>();
         let max_plaintexts = vec![BigUint::ZERO; levels];
         Self::new(self.ctx.clone(), inner, Some(level_offset), Some(levels), max_plaintexts)
             .with_p_max_traces(vec![BigUint::ZERO; levels])
@@ -169,7 +163,7 @@ impl<P: Poly> NestedRnsPoly<P> {
         assert!(level_idx < levels, "level_idx {level_idx} out of range for {levels} levels");
 
         let mut isolated = self.zero_poly_with_levels(levels, circuit);
-        isolated.inner[level_idx] = self.inner[level_idx].clone();
+        isolated.inner[level_idx] = self.inner[level_idx];
         isolated.max_plaintexts[level_idx] = self.max_plaintexts[level_idx].clone();
         isolated.p_max_traces[level_idx] = self.p_max_traces[level_idx].clone();
         isolated
@@ -212,7 +206,7 @@ impl<P: Poly> NestedRnsPoly<P> {
         assert!(target_idx < total_levels, "target_idx {target_idx} out of range");
 
         let mut moved = self.zero_poly_with_offset(output_level_offset, total_levels, circuit);
-        moved.inner[target_idx] = self.inner[source_idx].clone();
+        moved.inner[target_idx] = self.inner[source_idx];
         moved.max_plaintexts[target_idx] = self.max_plaintexts[source_idx].clone();
         moved.p_max_traces[target_idx] = self.p_max_traces[source_idx].clone();
         moved
@@ -230,7 +224,7 @@ impl<P: Poly> NestedRnsPoly<P> {
         let replicated_trace = self.p_max_traces[source_idx].clone();
         let mut repeated = self.zero_poly_with_offset(output_level_offset, levels, circuit);
         for level in 0..levels {
-            repeated.inner[level] = self.inner[source_idx].clone();
+            repeated.inner[level] = self.inner[source_idx];
             repeated.max_plaintexts[level] = replicated_bound.clone();
             repeated.p_max_traces[level] = replicated_trace.clone();
         }

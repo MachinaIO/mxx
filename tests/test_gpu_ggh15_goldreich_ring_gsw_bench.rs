@@ -316,6 +316,7 @@ where
 struct CrtDepthProbe {
     params: DCRTPolyParams,
     eval_ok: bool,
+    decryption_ok: bool,
 }
 
 impl CrtDepthProbe {
@@ -395,7 +396,7 @@ fn probe_crt_depth_for_goldreich_ring_gsw_bench(
         decryption_ok
     );
 
-    CrtDepthProbe { params, eval_ok }
+    CrtDepthProbe { params, eval_ok, decryption_ok }
 }
 
 fn build_goldreich_ring_gsw_circuit<P: Poly + 'static>(
@@ -444,6 +445,34 @@ fn find_crt_depth_for_goldreich_ring_gsw_bench(
     let base = BigDecimal::from_biguint(BigUint::from(1u32) << cfg.base_bits, 0);
     let error_sigma = BigDecimal::from_f64(cfg.error_sigma).expect("valid error sigma");
     let e_init_norm = &error_sigma * BigDecimal::from_f32(6.5).unwrap();
+
+    if let Some(raw_crt_depth) = env::var("CRT_DEPTH").ok().filter(|value| !value.trim().is_empty())
+    {
+        let requested_crt_depth = raw_crt_depth
+            .parse::<usize>()
+            .unwrap_or_else(|e| panic!("CRT_DEPTH must be a valid usize: {e}"));
+        assert!(requested_crt_depth > 0, "CRT_DEPTH must be > 0");
+        let probe = probe_crt_depth_for_goldreich_ring_gsw_bench(
+            cfg,
+            requested_crt_depth,
+            &ring_dim_sqrt,
+            &base,
+            &error_sigma,
+            &e_init_norm,
+        );
+        let (_, _, actual_crt_depth) = probe.params.to_crt();
+        info!(
+            "using CRT_DEPTH override: requested_crt_depth={} actual_crt_depth={} eval_ok={} decryption_ok={}",
+            requested_crt_depth, actual_crt_depth, probe.eval_ok, probe.decryption_ok
+        );
+        assert!(
+            probe.eval_ok,
+            "CRT_DEPTH={} failed the eval threshold check for the Goldreich Ring-GSW benchmark",
+            requested_crt_depth
+        );
+        return (requested_crt_depth, probe.params);
+    }
+
     let min_crt_depth = 1usize;
     let mut low = min_crt_depth;
     let mut high = cfg.max_crt_depth;

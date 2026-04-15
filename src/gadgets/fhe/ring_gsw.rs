@@ -47,7 +47,15 @@ struct RingGswEntryOutputMetadata {
     p_max_traces: Vec<BigUint>,
 }
 
+#[derive(Debug, Clone)]
+struct LocalDotTermGroup {
+    term_inputs: Vec<(BatchedWire, GateId)>,
+    max_plaintext: BigUint,
+    p_max_trace: BigUint,
+}
+
 const MUL_COLUMN_SUBCIRCUIT_BATCH: usize = 8;
+const LOCAL_DOT_TERM_HELPER_BATCH: usize = 8;
 
 fn validate_num_slots<P: Poly>(params: &P::Params, num_slots: usize) {
     assert!(num_slots > 0, "num_slots must be positive");
@@ -263,6 +271,86 @@ fn raw_decomposed_conv_output_scalar_metadata(
         current_layer = next_layer;
     }
     current_layer.pop().expect("raw decomposed convolution metadata requires at least one term")
+}
+
+fn build_local_dot_term_groups_for_level(
+    helper_ctx: &NestedRnsPolyContext,
+    level_offset: usize,
+    sparse_q_idx: usize,
+    chunk_width: usize,
+    gadget_len: usize,
+    helper_max_plaintext: &BigUint,
+    row_q_levels: &[BatchedWire],
+    column_terms: &[GateId],
+    num_slots: usize,
+) -> Vec<LocalDotTermGroup> {
+    assert_eq!(
+        row_q_levels.len(),
+        column_terms.len(),
+        "local-dot row and term vectors must have the same length"
+    );
+    let width = row_q_levels.len();
+    assert_eq!(
+        width,
+        2 * gadget_len,
+        "local-dot width {} must equal 2 * gadget_len {}",
+        width,
+        gadget_len
+    );
+
+    let mut grouped_term_inputs = Vec::<Vec<(BatchedWire, GateId)>>::new();
+    let mut current_term_inputs = Vec::<(BatchedWire, GateId)>::new();
+    let mut current_group_bound = BigUint::ZERO;
+    let mut current_group_trace = BigUint::ZERO;
+    let mut grouped_bounds = Vec::<BigUint>::new();
+    let mut grouped_traces = Vec::<BigUint>::new();
+
+    for half_idx in 0..2 {
+        let level_base = half_idx * gadget_len + sparse_q_idx * chunk_width;
+        for term_idx in 0..chunk_width {
+            let col_idx = level_base + term_idx;
+            let lhs_row = row_q_levels[col_idx];
+            let term_gate = column_terms[col_idx];
+            let (term_bound, term_trace) = raw_decomposed_conv_output_scalar_metadata(
+                helper_ctx,
+                level_offset,
+                sparse_q_idx,
+                term_idx,
+                helper_max_plaintext,
+                num_slots,
+            );
+            let next_bound = &current_group_bound + &term_bound;
+            let next_trace = &current_group_trace + &term_trace;
+            if !current_term_inputs.is_empty() &&
+                (next_bound >= *helper_ctx.p_full_ref() ||
+                    next_trace >= *helper_ctx.lut_mod_p_max_map_size_ref())
+            {
+                grouped_term_inputs.push(std::mem::take(&mut current_term_inputs));
+                grouped_bounds.push(std::mem::take(&mut current_group_bound));
+                grouped_traces.push(std::mem::take(&mut current_group_trace));
+            }
+            current_term_inputs.push((lhs_row, term_gate));
+            current_group_bound += term_bound;
+            current_group_trace += term_trace;
+        }
+    }
+
+    if !current_term_inputs.is_empty() {
+        grouped_term_inputs.push(current_term_inputs);
+        grouped_bounds.push(current_group_bound);
+        grouped_traces.push(current_group_trace);
+    }
+
+    grouped_term_inputs
+        .into_iter()
+        .zip(grouped_bounds)
+        .zip(grouped_traces)
+        .map(|((term_inputs, max_plaintext), p_max_trace)| LocalDotTermGroup {
+            term_inputs,
+            max_plaintext,
+            p_max_trace,
+        })
+        .collect()
 }
 
 pub type NativeRingGswCiphertext = [Vec<DCRTPoly>; 2];
@@ -1300,6 +1388,78 @@ impl<P: Poly + 'static> RingGswContext<P> {
         circuit
     }
 
+    fn local_dot_term_batch_subcircuit(
+        source_circuit: &PolyCircuit<P>,
+        template_ctx: &NestedRnsPolyContext,
+        direct_term_calls: usize,
+        term_helper: Arc<PolyCircuit<P>>,
+        sub_circuit_storage: SubCircuitDiskStorage,
+    ) -> PolyCircuit<P> {
+        assert!(direct_term_calls > 0, "direct_term_calls must be positive");
+        let mut circuit = Self::helper_circuit_with_storage(&sub_circuit_storage);
+        let helper_ctx =
+            Arc::new(template_ctx.register_shared_subcircuits_in(source_circuit, &mut circuit));
+        let p_moduli_depth = helper_ctx.p_moduli.len();
+        let term_helper_id = circuit.register_shared_sub_circuit(term_helper);
+        let empty_binding_set_id = circuit.intern_binding_set(&[]);
+        let call_input_set_ids = (0..direct_term_calls)
+            .map(|_| {
+                let lhs_row = circuit.input(p_moduli_depth);
+                let term_gate = circuit.input(1).at(0).as_single_wire();
+                let mut inputs = Vec::with_capacity(1 + p_moduli_depth);
+                inputs.push(lhs_row);
+                inputs.extend(std::iter::repeat_n(BatchedWire::single(term_gate), p_moduli_depth));
+                circuit.intern_input_set(inputs)
+            })
+            .collect::<Vec<_>>();
+        let outputs = circuit.call_sub_circuit_sum_many_with_binding_set_ids(
+            term_helper_id,
+            call_input_set_ids,
+            vec![empty_binding_set_id; direct_term_calls],
+        );
+        circuit.output(outputs);
+        circuit
+    }
+
+    fn local_dot_term_input_set_id(
+        helper_circuit: &mut PolyCircuit<P>,
+        term_inputs: &[(BatchedWire, GateId)],
+    ) -> usize {
+        assert!(
+            !term_inputs.is_empty(),
+            "local-dot input-set construction requires at least one term input"
+        );
+        let mut inputs = Vec::with_capacity(2 * term_inputs.len());
+        for (lhs_row, term_gate) in term_inputs.iter().copied() {
+            inputs.push(lhs_row);
+            inputs.push(BatchedWire::single(term_gate));
+        }
+        helper_circuit.intern_input_set(inputs)
+    }
+
+    fn local_dot_group_chunk_input_set_ids(
+        helper_circuit: &mut PolyCircuit<P>,
+        term_group: &[(BatchedWire, GateId)],
+        terms_per_chunk: usize,
+    ) -> (Vec<usize>, Option<(usize, usize)>) {
+        assert!(terms_per_chunk > 0, "terms_per_chunk must be positive");
+        assert!(!term_group.is_empty(), "local-dot chunking requires at least one term input");
+        let full_chunk_count = term_group.len() / terms_per_chunk;
+        let full_chunk_input_set_ids = term_group
+            .chunks_exact(terms_per_chunk)
+            .take(full_chunk_count)
+            .map(|chunk| Self::local_dot_term_input_set_id(helper_circuit, chunk))
+            .collect::<Vec<_>>();
+        let tail_len = term_group.len() % terms_per_chunk;
+        let tail_input_set_id = if tail_len > 0 {
+            let tail_slice = &term_group[full_chunk_count * terms_per_chunk..];
+            Some((tail_len, Self::local_dot_term_input_set_id(helper_circuit, tail_slice)))
+        } else {
+            None
+        };
+        (full_chunk_input_set_ids, tail_input_set_id)
+    }
+
     fn mul_column_subcircuit(
         source_circuit: &PolyCircuit<P>,
         _params: &P::Params,
@@ -1341,8 +1501,29 @@ impl<P: Poly + 'static> RingGswContext<P> {
                     num_slots,
                 ));
             let product_subcircuits_start = Instant::now();
-            let term_helper_id =
-                helper_circuit.register_shared_sub_circuit(Arc::clone(&term_helper));
+            let term_batch_capacity = LOCAL_DOT_TERM_HELPER_BATCH;
+            let term_batch_subcircuit_id = helper_circuit.register_shared_sub_circuit(Arc::new(
+                Self::local_dot_term_batch_subcircuit(
+                    source_circuit,
+                    template_ctx,
+                    term_batch_capacity,
+                    Arc::clone(&term_helper),
+                    sub_circuit_storage.clone(),
+                ),
+            ));
+            let term_tail_subcircuit_ids = (1..term_batch_capacity)
+                .map(|tail_terms| {
+                    helper_circuit.register_shared_sub_circuit(Arc::new(
+                        Self::local_dot_term_batch_subcircuit(
+                            source_circuit,
+                            template_ctx,
+                            tail_terms,
+                            Arc::clone(&term_helper),
+                            sub_circuit_storage.clone(),
+                        ),
+                    ))
+                })
+                .collect::<Vec<_>>();
             let make_sparse_q_level_poly =
                 |target_q_idx: usize,
                  target_row: BatchedWire,
@@ -1371,8 +1552,9 @@ impl<P: Poly + 'static> RingGswContext<P> {
                     .with_p_max_traces(p_max_traces)
                 };
             debug!(
-                "RingGswContext::mul_column_subcircuit q-level product helper prepared: active_levels={}, elapsed_ms={}",
+                "RingGswContext::mul_column_subcircuit q-level product helper prepared: active_levels={}, direct_term_batch={}, elapsed_ms={}",
                 active_levels,
+                term_batch_capacity,
                 product_subcircuits_start.elapsed().as_millis()
             );
             let row_q_levels = (0..width)
@@ -1382,80 +1564,75 @@ impl<P: Poly + 'static> RingGswContext<P> {
                 .map(|_| helper_circuit.input(1).at(0).as_single_wire())
                 .collect::<Vec<_>>();
             let empty_binding_set_id = helper_circuit.intern_binding_set(&[]);
-            let mut grouped_input_set_ids = vec![Vec::<Vec<usize>>::new(); active_levels];
-            let mut current_input_set_ids = vec![Vec::<usize>::new(); active_levels];
-            let mut current_group_bounds = vec![BigUint::ZERO; active_levels];
-            let mut current_group_traces = vec![BigUint::ZERO; active_levels];
-            let mut grouped_bounds = vec![Vec::<BigUint>::new(); active_levels];
-            let mut grouped_traces = vec![Vec::<BigUint>::new(); active_levels];
-            row_q_levels.iter().zip(column_terms.iter()).enumerate().for_each(
-                |(col_idx, (lhs_row, &term_gate))| {
-                    let sparse_q_idx = (col_idx % gadget_len) / chunk_width;
-                    let term_idx = col_idx % chunk_width;
-                    let mut inputs = Vec::with_capacity(1 + helper_ctx.p_moduli.len());
-                    inputs.push(*lhs_row);
-                    inputs.extend(std::iter::repeat_n(
-                        BatchedWire::single(term_gate),
-                        helper_ctx.p_moduli.len(),
-                    ));
-                    let input_set_id = helper_circuit.intern_input_set(inputs);
-                    let (term_bound, term_trace) = raw_decomposed_conv_output_scalar_metadata(
+            let grouped_term_groups = (0..active_levels)
+                .into_par_iter()
+                .map(|sparse_q_idx| {
+                    build_local_dot_term_groups_for_level(
                         helper_ctx.as_ref(),
                         level_offset,
                         sparse_q_idx,
-                        term_idx,
+                        chunk_width,
+                        gadget_len,
                         &helper_max_plaintexts[sparse_q_idx],
+                        &row_q_levels,
+                        &column_terms,
                         num_slots,
-                    );
-                    let next_bound = &current_group_bounds[sparse_q_idx] + &term_bound;
-                    let next_trace = &current_group_traces[sparse_q_idx] + &term_trace;
-                    if !current_input_set_ids[sparse_q_idx].is_empty() &&
-                        (next_bound >= *helper_ctx.p_full_ref() ||
-                            next_trace >= *helper_ctx.lut_mod_p_max_map_size_ref())
-                    {
-                        grouped_input_set_ids[sparse_q_idx]
-                            .push(std::mem::take(&mut current_input_set_ids[sparse_q_idx]));
-                        grouped_bounds[sparse_q_idx]
-                            .push(std::mem::take(&mut current_group_bounds[sparse_q_idx]));
-                        grouped_traces[sparse_q_idx]
-                            .push(std::mem::take(&mut current_group_traces[sparse_q_idx]));
-                    }
-                    current_input_set_ids[sparse_q_idx].push(input_set_id);
-                    current_group_bounds[sparse_q_idx] += term_bound;
-                    current_group_traces[sparse_q_idx] += term_trace;
-                },
-            );
-            for sparse_q_idx in 0..active_levels {
-                if !current_input_set_ids[sparse_q_idx].is_empty() {
-                    grouped_input_set_ids[sparse_q_idx]
-                        .push(std::mem::take(&mut current_input_set_ids[sparse_q_idx]));
-                    grouped_bounds[sparse_q_idx]
-                        .push(std::mem::take(&mut current_group_bounds[sparse_q_idx]));
-                    grouped_traces[sparse_q_idx]
-                        .push(std::mem::take(&mut current_group_traces[sparse_q_idx]));
-                }
-            }
+                    )
+                })
+                .collect::<Vec<_>>();
             let mut result_inner = Vec::with_capacity(active_levels);
             let mut result_max_plaintexts = Vec::with_capacity(active_levels);
             let mut result_p_max_traces = Vec::with_capacity(active_levels);
             for sparse_q_idx in 0..active_levels {
-                let grouped_polys = grouped_input_set_ids[sparse_q_idx]
+                let grouped_polys = grouped_term_groups[sparse_q_idx]
                     .iter()
-                    .zip(grouped_bounds[sparse_q_idx].iter())
-                    .zip(grouped_traces[sparse_q_idx].iter())
-                    .map(|((input_set_ids, max_plaintext), p_max_trace)| {
-                        let outputs = helper_circuit
-                            .call_sub_circuit_sum_many_with_binding_set_ids(
-                                term_helper_id,
-                                input_set_ids.clone(),
-                                vec![empty_binding_set_id; input_set_ids.len()],
+                    .map(|group| {
+                        let (full_chunk_input_set_ids, tail_input_set_id) =
+                            Self::local_dot_group_chunk_input_set_ids(
+                                &mut helper_circuit,
+                                &group.term_inputs,
+                                term_batch_capacity,
                             );
-                        make_sparse_q_level_poly(
-                            sparse_q_idx,
-                            BatchedWire::from_batches(outputs),
-                            max_plaintext.clone(),
-                            p_max_trace.clone(),
+                        let mut partial_polys = Vec::with_capacity(
+                            usize::from(!full_chunk_input_set_ids.is_empty()) +
+                                usize::from(tail_input_set_id.is_some()),
+                        );
+                        if !full_chunk_input_set_ids.is_empty() {
+                            let full_chunk_count = full_chunk_input_set_ids.len();
+                            let outputs = helper_circuit
+                                .call_sub_circuit_sum_many_with_binding_set_ids(
+                                    term_batch_subcircuit_id,
+                                    full_chunk_input_set_ids,
+                                    vec![empty_binding_set_id; full_chunk_count],
+                                );
+                            partial_polys.push(make_sparse_q_level_poly(
+                                sparse_q_idx,
+                                BatchedWire::from_batches(outputs),
+                                group.max_plaintext.clone(),
+                                group.p_max_trace.clone(),
+                                &mut helper_circuit,
+                            ));
+                        }
+                        if let Some((tail_len, tail_input_set_id)) = tail_input_set_id {
+                            let tail_subcircuit_id = term_tail_subcircuit_ids[tail_len - 1];
+                            let outputs = helper_circuit
+                                .call_sub_circuit_sum_many_with_binding_set_ids(
+                                    tail_subcircuit_id,
+                                    vec![tail_input_set_id],
+                                    vec![empty_binding_set_id],
+                                );
+                            partial_polys.push(make_sparse_q_level_poly(
+                                sparse_q_idx,
+                                BatchedWire::from_batches(outputs),
+                                group.max_plaintext.clone(),
+                                group.p_max_trace.clone(),
+                                &mut helper_circuit,
+                            ));
+                        }
+                        reduce_nested_rns_terms_pairwise(
+                            partial_polys,
                             &mut helper_circuit,
+                            |lhs, rhs, helper_circuit| lhs.add(rhs, helper_circuit),
                         )
                     })
                     .collect::<Vec<_>>();

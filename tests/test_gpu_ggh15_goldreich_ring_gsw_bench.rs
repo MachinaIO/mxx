@@ -49,13 +49,14 @@ use mxx::{
     utils::bigdecimal_bits_ceil,
 };
 use num_bigint::BigUint;
+use rayon::prelude::*;
 use std::{
     env, fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
 };
-use tracing::info;
+use tracing::{debug, info};
 
 const DEFAULT_RING_DIM: u32 = 1 << 16;
 const DEFAULT_INPUT_SIZE: usize = 5;
@@ -65,7 +66,7 @@ const DEFAULT_P_MODULI_BITS: usize = 7;
 const DEFAULT_MAX_UNREDUCED_MULS: usize = 4;
 const DEFAULT_SCALE: u64 = 1 << 8;
 const DEFAULT_BASE_BITS: u32 = 14;
-const DEFAULT_MAX_CRT_DEPTH: usize = 100;
+const DEFAULT_MAX_CRT_DEPTH: usize = 64;
 const DEFAULT_ERROR_SIGMA: f64 = 4.0;
 const DEFAULT_D_SECRET: usize = 1;
 const DEFAULT_BENCH_ITERATIONS: usize = 1;
@@ -361,20 +362,26 @@ fn probe_crt_depth_for_goldreich_ring_gsw_bench(
         Some(&plt_evaluator),
         Some(&slot_transfer_evaluator),
     );
+    debug!("simulate_max_error_norm finished output_errors={}", out_errors.len());
     let threshold = full_q.as_ref() / BigUint::from(2u64 * q_max);
     let threshold_bd = BigDecimal::from_biguint(threshold.clone(), 0);
     let max_eval_error = max_bigdecimal(
-        out_errors.iter().map(|error| error.matrix_norm.poly_norm.norm.clone()).collect::<Vec<_>>(),
+        out_errors
+            .par_iter()
+            .map(|error| error.matrix_norm.poly_norm.norm.clone())
+            .collect::<Vec<_>>(),
     );
+    debug!("max_eval_error_bits={}", bigdecimal_bits_ceil(&max_eval_error));
     let ring_gsw_q = ring_gsw_q_modulus(ctx.as_ref());
     let ring_gsw_threshold = &ring_gsw_q / BigUint::from(2u64);
     let ring_gsw_threshold_bd = BigDecimal::from_biguint(ring_gsw_threshold.clone(), 0);
     let max_decryption_error = max_bigdecimal(
         encrypted_outputs
-            .iter()
+            .par_iter()
             .map(|ciphertext| ciphertext.estimate_decryption_error_norm(cfg.error_sigma))
             .collect::<Vec<_>>(),
     );
+    debug!("max_decryption_error_bits={}", bigdecimal_bits_ceil(&max_decryption_error));
     let eval_ok = max_eval_error < threshold_bd;
     let decryption_ok = max_decryption_error < ring_gsw_threshold_bd;
 

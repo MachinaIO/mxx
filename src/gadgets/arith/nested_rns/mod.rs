@@ -23,12 +23,12 @@ use rayon::prelude::*;
 use std::{marker::PhantomData, sync::Arc};
 use tracing::debug;
 
+use encoding::sample_crt_primes;
 pub use encoding::{
     encode_nested_rns_poly, encode_nested_rns_poly_compact_bytes,
     encode_nested_rns_poly_compact_bytes_with_offset, encode_nested_rns_poly_with_offset,
     nested_rns_gadget_decomposed, nested_rns_gadget_vector,
 };
-use encoding::sample_crt_primes;
 
 pub const DEFAULT_MAX_UNREDUCED_MULS: usize = 2;
 

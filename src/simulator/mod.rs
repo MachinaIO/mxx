@@ -1,6 +1,7 @@
 use bigdecimal::BigDecimal;
 
 pub mod error_norm;
+pub mod eval_error;
 pub mod lattice_estimator;
 pub mod poly_matrix_norm;
 pub mod poly_norm;

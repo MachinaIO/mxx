@@ -1,5 +1,5 @@
 use crate::{
-    circuit::{PolyCircuit, gate::GateId},
+    circuit::{BatchedWire, PolyCircuit, gate::GateId},
     element::PolyElem,
     lookup::PublicLut,
     poly::{Poly, PolyParams},
@@ -29,6 +29,11 @@ use std::{marker::PhantomData, sync::Arc};
 // these lookups can be applied directly without any slot-packing machinery.
 
 type Columns = Vec<Vec<GateId>>;
+
+#[inline]
+fn single_wire<I: Into<BatchedWire>>(wire: I) -> GateId {
+    wire.into().as_single_wire()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CarryArithLutIds {
@@ -96,8 +101,8 @@ impl<P: Poly + 'static> CarryArithPolyContext<P> {
     ) -> Self {
         debug_assert!(limb_bit_size < 32);
         let base = 1usize << limb_bit_size;
-        let const_zero = circuit.const_zero_gate();
-        let const_base = circuit.const_digits(&[base as u32]);
+        let const_zero = single_wire(circuit.const_zero_gate());
+        let const_base = single_wire(circuit.const_digits(&[base as u32]));
         let scalar_base = BigUint::from(base);
         let luts = if limb_bit_size > 1 {
             Some(Self::setup_luts(circuit, params, base, dummy_scalar))
@@ -197,7 +202,7 @@ impl<P: Poly + 'static> CarryArithPoly<P> {
         circuit: &mut PolyCircuit<P>,
         limbs: &[P],
     ) -> Self {
-        let limbs = limbs.iter().map(|poly| circuit.const_poly(poly)).collect();
+        let limbs = limbs.iter().map(|poly| single_wire(circuit.const_poly(poly))).collect();
         Self { ctx, limbs, _p: PhantomData }
     }
 
@@ -207,7 +212,7 @@ impl<P: Poly + 'static> CarryArithPoly<P> {
         input_bit_size: usize,
     ) -> Self {
         let num_limbs = input_bit_size.div_ceil(ctx.limb_bit_size);
-        let limb_gateids = circuit.input(num_limbs);
+        let limb_gateids = circuit.input(num_limbs).to_vec();
         Self { ctx, limbs: limb_gateids, _p: PhantomData }
     }
 
@@ -230,8 +235,8 @@ impl<P: Poly + 'static> CarryArithPoly<P> {
             (other.limbs.len(), &other.limbs, &self.limbs)
         };
 
-        let zero = circuit.const_zero_gate();
-        let one = circuit.const_one_gate();
+        let zero = single_wire(circuit.const_zero_gate());
+        let one = single_wire(circuit.const_one_gate());
         let mut ss = Vec::with_capacity(w);
         let mut gs = Vec::with_capacity(w);
         let mut ps = Vec::with_capacity(w);
@@ -271,14 +276,14 @@ impl<P: Poly + 'static> CarryArithPoly<P> {
     ) -> (GateId, GateId) {
         match self.ctx.luts {
             None => {
-                let s = circuit.xor_gate(x, y);
-                let g = circuit.and_gate(x, y);
+                let s = single_wire(circuit.xor_gate(x, y));
+                let g = single_wire(circuit.and_gate(x, y));
                 (s, g)
             }
             Some(luts) => {
-                let t = circuit.add_gate(x, y);
-                let s = circuit.public_lookup_gate(t, luts.add_mod);
-                let g = circuit.public_lookup_gate(t, luts.add_floor);
+                let t = single_wire(circuit.add_gate(x, y));
+                let s = single_wire(circuit.public_lookup_gate(t, luts.add_mod));
+                let g = single_wire(circuit.public_lookup_gate(t, luts.add_floor));
                 (s, g)
             }
         }
@@ -287,10 +292,10 @@ impl<P: Poly + 'static> CarryArithPoly<P> {
     #[inline]
     fn add_mod(&self, circuit: &mut PolyCircuit<P>, x: GateId, y: GateId) -> GateId {
         match self.ctx.luts {
-            None => circuit.xor_gate(x, y),
+            None => single_wire(circuit.xor_gate(x, y)),
             Some(luts) => {
-                let t = circuit.add_gate(x, y);
-                circuit.public_lookup_gate(t, luts.add_mod)
+                let t = single_wire(circuit.add_gate(x, y));
+                single_wire(circuit.public_lookup_gate(t, luts.add_mod))
             }
         }
     }
@@ -298,10 +303,10 @@ impl<P: Poly + 'static> CarryArithPoly<P> {
     #[inline]
     fn add_floor(&self, circuit: &mut PolyCircuit<P>, x: GateId, y: GateId) -> GateId {
         match self.ctx.luts {
-            None => circuit.and_gate(x, y),
+            None => single_wire(circuit.and_gate(x, y)),
             Some(luts) => {
-                let t = circuit.add_gate(x, y);
-                circuit.public_lookup_gate(t, luts.add_floor)
+                let t = single_wire(circuit.add_gate(x, y));
+                single_wire(circuit.public_lookup_gate(t, luts.add_floor))
             }
         }
     }
@@ -311,11 +316,11 @@ impl<P: Poly + 'static> CarryArithPoly<P> {
         debug_assert_eq!(self.ctx, other.ctx);
 
         let w = self.limbs.len();
-        let zero = circuit.const_zero_gate();
-        let one = circuit.const_one_gate();
+        let zero = single_wire(circuit.const_zero_gate());
+        let one = single_wire(circuit.const_one_gate());
         let base_minus_one = {
             let b_minus_1 = (1u32 << self.ctx.limb_bit_size) - 1;
-            circuit.const_digits(&[b_minus_1])
+            single_wire(circuit.const_digits(&[b_minus_1]))
         };
 
         let mut g = Vec::with_capacity(w);
@@ -329,21 +334,21 @@ impl<P: Poly + 'static> CarryArithPoly<P> {
             let b = other.limbs[i];
             let (g_i, p_i) = match self.ctx.luts {
                 None => {
-                    let not_a = circuit.not_gate(a);
-                    let gi = circuit.and_gate(not_a, b);
-                    let xor_ab = circuit.xor_gate(a, b);
-                    let pi = circuit.not_gate(xor_ab);
+                    let not_a = single_wire(circuit.not_gate(a));
+                    let gi = single_wire(circuit.and_gate(not_a, b));
+                    let xor_ab = single_wire(circuit.xor_gate(a, b));
+                    let pi = single_wire(circuit.not_gate(xor_ab));
                     (gi, pi)
                 }
                 Some(luts) => {
-                    let y = circuit.sub_gate(base_minus_one, b);
+                    let y = single_wire(circuit.sub_gate(base_minus_one, b));
                     let (s, h) = self.add_mod_floor(circuit, a, y);
                     let eq = self.add_floor(circuit, s, one);
-                    let not_h = circuit.not_gate(h);
-                    let not_eq = circuit.not_gate(eq);
-                    let two_not_eq = circuit.add_gate(not_eq, not_eq);
-                    let key = circuit.add_gate(not_h, two_not_eq);
-                    let gi = circuit.public_lookup_gate(key, luts.kss_p);
+                    let not_h = single_wire(circuit.not_gate(h));
+                    let not_eq = single_wire(circuit.not_gate(eq));
+                    let two_not_eq = single_wire(circuit.add_gate(not_eq, not_eq));
+                    let key = single_wire(circuit.add_gate(not_h, two_not_eq));
+                    let gi = single_wire(circuit.public_lookup_gate(key, luts.kss_p));
                     (gi, eq)
                 }
             };
@@ -360,13 +365,13 @@ impl<P: Poly + 'static> CarryArithPoly<P> {
             let (a, b) = ab_pairs[i];
             match self.ctx.luts {
                 None => {
-                    let xor = circuit.xor_gate(a, b);
-                    let diff = circuit.xor_gate(xor, b_in);
+                    let xor = single_wire(circuit.xor_gate(a, b));
+                    let diff = single_wire(circuit.xor_gate(xor, b_in));
                     diff_limbs.push(diff);
                 }
                 Some(_) => {
-                    let b_comp = circuit.sub_gate(self.ctx.const_base, b);
-                    let y = circuit.sub_gate(b_comp, b_in);
+                    let b_comp = single_wire(circuit.sub_gate(self.ctx.const_base, b));
+                    let y = single_wire(circuit.sub_gate(b_comp, b_in));
                     diff_limbs.push(self.add_mod(circuit, a, y));
                 }
             }
@@ -411,11 +416,11 @@ impl<P: Poly + 'static> CarryArithPoly<P> {
         debug_assert_eq!(self.ctx, other.ctx);
         debug_assert_eq!(self.limbs.len(), other.limbs.len());
         let mut limbs = Vec::with_capacity(self.limbs.len());
-        let not = circuit.not_gate(selector);
+        let not = single_wire(circuit.not_gate(selector));
         for i in 0..self.limbs.len() {
             let (case1, _) = self.mul_mod_floor(circuit, self.limbs[i], selector, false);
             let (case2, _) = self.mul_mod_floor(circuit, other.limbs[i], not, false);
-            limbs.push(circuit.add_gate(case1, case2));
+            limbs.push(single_wire(circuit.add_gate(case1, case2)));
         }
         Self { ctx: self.ctx.clone(), limbs, _p: PhantomData }
     }
@@ -425,8 +430,8 @@ impl<P: Poly + 'static> CarryArithPoly<P> {
         let mut result = self.limbs[0];
         for i in 1..self.limbs.len() {
             let shift = BigUint::from(1u32) << (self.ctx.limb_bit_size * i);
-            let weighted_limb = circuit.large_scalar_mul(self.limbs[i], &[shift]);
-            result = circuit.add_gate(result, weighted_limb);
+            let weighted_limb = single_wire(circuit.large_scalar_mul(self.limbs[i], &[shift]));
+            result = single_wire(circuit.add_gate(result, weighted_limb));
         }
         result
     }
@@ -440,14 +445,15 @@ impl<P: Poly + 'static> CarryArithPoly<P> {
         output_floor: bool,
     ) -> (GateId, Option<GateId>) {
         match self.ctx.luts {
-            None => (circuit.and_gate(x, y), None),
+            None => (single_wire(circuit.and_gate(x, y)), None),
             Some(luts) => {
-                let shifted =
-                    circuit.large_scalar_mul(y, std::slice::from_ref(&self.ctx.scalar_base));
-                let key = circuit.add_gate(x, shifted);
-                let mod_out = circuit.public_lookup_gate(key, luts.mul_mod);
+                let shifted = single_wire(
+                    circuit.large_scalar_mul(y, std::slice::from_ref(&self.ctx.scalar_base)),
+                );
+                let key = single_wire(circuit.add_gate(x, shifted));
+                let mod_out = single_wire(circuit.public_lookup_gate(key, luts.mul_mod));
                 let floor_out = if output_floor {
-                    Some(circuit.public_lookup_gate(key, luts.mul_floor))
+                    Some(single_wire(circuit.public_lookup_gate(key, luts.mul_floor)))
                 } else {
                     None
                 };
@@ -469,8 +475,8 @@ impl<P: Poly + 'static> CarryArithPoly<P> {
         let w = sum_vec.len().min(max_limbs);
         sum_vec.truncate(w);
 
-        let zero = circuit.const_zero_gate();
-        let one = circuit.const_one_gate();
+        let zero = single_wire(circuit.const_zero_gate());
+        let one = single_wire(circuit.const_one_gate());
         let mut ss = Vec::with_capacity(w);
         let mut gs = Vec::with_capacity(w);
         let mut ps = Vec::with_capacity(w);
@@ -518,21 +524,21 @@ impl<P: Poly + 'static> CarryArithPoly<P> {
                 let pk = ps[k];
                 match self.ctx.luts {
                     None => {
-                        let pk_and_gj = circuit.and_gate(pk, gj);
-                        gs_next[k] = circuit.or_gate(gk, pk_and_gj);
-                        ps_next[k] = circuit.and_gate(pk, pj);
+                        let pk_and_gj = single_wire(circuit.and_gate(pk, gj));
+                        gs_next[k] = single_wire(circuit.or_gate(gk, pk_and_gj));
+                        ps_next[k] = single_wire(circuit.and_gate(pk, pj));
                     }
                     Some(luts) => {
-                        let two_gj = circuit.add_gate(gj, gj);
-                        let two_pk = circuit.add_gate(pk, pk);
-                        let four_pk = circuit.add_gate(two_pk, two_pk);
-                        let sum = circuit.add_gate(two_gj, four_pk);
-                        let key_g = circuit.add_gate(gk, sum);
-                        gs_next[k] = circuit.public_lookup_gate(key_g, luts.kss_g);
+                        let two_gj = single_wire(circuit.add_gate(gj, gj));
+                        let two_pk = single_wire(circuit.add_gate(pk, pk));
+                        let four_pk = single_wire(circuit.add_gate(two_pk, two_pk));
+                        let sum = single_wire(circuit.add_gate(two_gj, four_pk));
+                        let key_g = single_wire(circuit.add_gate(gk, sum));
+                        gs_next[k] = single_wire(circuit.public_lookup_gate(key_g, luts.kss_g));
 
-                        let two_pj = circuit.add_gate(pj, pj);
-                        let key_p = circuit.add_gate(pk, two_pj);
-                        ps_next[k] = circuit.public_lookup_gate(key_p, luts.kss_p);
+                        let two_pj = single_wire(circuit.add_gate(pj, pj));
+                        let key_p = single_wire(circuit.add_gate(pk, two_pj));
+                        ps_next[k] = single_wire(circuit.public_lookup_gate(key_p, luts.kss_p));
                     }
                 }
             }
@@ -594,20 +600,22 @@ impl<P: Poly + 'static> CarryArithPoly<P> {
                         let (digit, carry) = match self.ctx.luts {
                             None => {
                                 let (a, b, c) = (col[idx], col[idx + 1], col[idx + 2]);
-                                let xor_ab = circuit.xor_gate(a, b);
-                                let digit = circuit.xor_gate(xor_ab, c);
-                                let and_ab = circuit.and_gate(a, b);
-                                let and_abc = circuit.and_gate(xor_ab, c);
-                                let carry = circuit.or_gate(and_ab, and_abc);
+                                let xor_ab = single_wire(circuit.xor_gate(a, b));
+                                let digit = single_wire(circuit.xor_gate(xor_ab, c));
+                                let and_ab = single_wire(circuit.and_gate(a, b));
+                                let and_abc = single_wire(circuit.and_gate(xor_ab, c));
+                                let carry = single_wire(circuit.or_gate(and_ab, and_abc));
                                 (digit, carry)
                             }
                             Some(luts) => {
                                 let mut sum = col[idx];
                                 for item in &col[(idx + 1)..(idx + group_len)] {
-                                    sum = circuit.add_gate(sum, *item);
+                                    sum = single_wire(circuit.add_gate(sum, *item));
                                 }
-                                let digit = circuit.public_lookup_gate(sum, luts.add_mod);
-                                let carry = circuit.public_lookup_gate(sum, luts.add_floor);
+                                let digit =
+                                    single_wire(circuit.public_lookup_gate(sum, luts.add_mod));
+                                let carry =
+                                    single_wire(circuit.public_lookup_gate(sum, luts.add_floor));
                                 (digit, carry)
                             }
                         };
@@ -632,7 +640,7 @@ impl<P: Poly + 'static> CarryArithPoly<P> {
             return (vec![], vec![]);
         }
 
-        let zero = circuit.const_zero_gate();
+        let zero = single_wire(circuit.const_zero_gate());
         let mut sum_vec = Vec::with_capacity(w);
         let mut carry_vec = vec![zero; w + 1];
 

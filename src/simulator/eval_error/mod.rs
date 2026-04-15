@@ -3,9 +3,8 @@ use super::{
 };
 use crate::{
     circuit::{
-        BatchedWire, ErrorNormExecutionLayer, Evaluable, PolyCircuit, PolyGateType,
-        SubCircuitParamValue, batched_wire_slice_at, batched_wire_slice_len, gate::GateId,
-        iter_batched_wire_gates,
+        BatchedWire, Evaluable, PolyCircuit, PolyGateType, SubCircuitParamValue,
+        batched_wire_slice_at, batched_wire_slice_len, gate::GateId, iter_batched_wire_gates,
     },
     element::PolyElem,
     lookup::{PltEvaluator, PublicLut, commit_eval::compute_padded_len},
@@ -33,6 +32,8 @@ use std::{
     time::Instant,
 };
 use tracing::{debug, info};
+
+use self::layers::ErrorNormExecutionLayer;
 
 const ERROR_NORM_OUTPUT_BATCH_SIZE: usize = 1024;
 const ERROR_NORM_EXPR_PAR_BATCH_SIZE: usize = 32;
@@ -1336,6 +1337,7 @@ struct ErrorNormPreparedSubCircuitSummaryRequest {
 mod engine;
 mod evaluators;
 mod gates;
+mod layers;
 mod store;
 mod summary;
 

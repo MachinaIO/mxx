@@ -1,4 +1,4 @@
-use super::*;
+use super::{encoding::sample_crt_primes_mul_budget_bound, *};
 use crate::{
     __PAIR, __TestState,
     circuit::{PolyGateKind, evaluable::PolyVec},
@@ -14,7 +14,6 @@ use crate::{
     utils::{ceil_biguint_nth_root, pow_biguint_usize},
 };
 use num_traits::One;
-use super::encoding::sample_crt_primes_mul_budget_bound;
 
 const P_MODULI_BITS: usize = 6;
 const MAX_UNREDUCED_MULS: usize = DEFAULT_MAX_UNREDUCED_MULS;

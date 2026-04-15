@@ -1,7 +1,7 @@
 use crate::{
     circuit::{
-        BatchedWire, GateParamSource, PolyCircuit, PolyGate, PolyGateType, StoredSubCircuit,
-        SubCircuitCall, SubCircuitParamKind, SubCircuitParamValue,
+        BatchedWire, GateParamSource, PolyCircuit, PolyGate, PolyGateType, SubCircuitCall,
+        SubCircuitParamKind, SubCircuitParamValue,
         gate::{GateId, SlotTransferSpec},
     },
     poly::Poly,
@@ -227,7 +227,6 @@ impl SerializablePolyCircuit {
                         sub_circuit_entries
                             .into_par_iter()
                             .map(|(circuit_id, sub_circuit)| {
-                                let StoredSubCircuit::InMemory(sub_circuit) = sub_circuit;
                                 (
                                     circuit_id,
                                     Box::new(Self::from_circuit(sub_circuit.as_ref().clone())),
@@ -280,10 +279,7 @@ impl SerializablePolyCircuit {
                 sub_circuit_entries
                     .into_par_iter()
                     .map(|(circuit_id, sub_circuit)| {
-                        (
-                            circuit_id,
-                            StoredSubCircuit::InMemory(Arc::new(sub_circuit.to_circuit::<P>())),
-                        )
+                        (circuit_id, Arc::new(sub_circuit.to_circuit::<P>()))
                     })
                     .collect::<Vec<_>>()
             },
@@ -359,7 +355,6 @@ impl SerializablePolyCircuit {
         let binding_registry = circuit.binding_registry.clone();
         let input_set_registry = circuit.input_set_registry.clone();
         for sub_circuit in circuit.sub_circuits.values_mut() {
-            let StoredSubCircuit::InMemory(sub_circuit) = sub_circuit;
             Arc::make_mut(sub_circuit).inherit_registries(
                 lookup_registry.clone(),
                 binding_registry.clone(),

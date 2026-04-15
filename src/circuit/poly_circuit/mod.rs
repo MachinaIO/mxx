@@ -7,7 +7,6 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Debug,
     ops::Range,
-    path::Path,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -240,8 +239,6 @@ pub(crate) struct InputSetRegistry {
     input_set_index: DashMap<Arc<[BatchedWire]>, usize>,
 }
 
-static TEMP_SUBCIRCUIT_STORAGE_ID: AtomicUsize = AtomicUsize::new(0);
-
 impl<P: Poly> LookupRegistry<P> {
     fn new() -> Self {
         Self { next_id: AtomicUsize::new(0), lookups: DashMap::new() }
@@ -376,43 +373,10 @@ pub(crate) struct SummedSubCircuitCallInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum StoredSubCircuit<P: Poly> {
-    InMemory(Arc<PolyCircuit<P>>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct SubCircuitDiskStorage;
-
-impl SubCircuitDiskStorage {
-    fn new(_dir: &Path) -> Self {
-        Self
-    }
-
-    pub(crate) fn temporary(_prefix: &str) -> Self {
-        let _ = TEMP_SUBCIRCUIT_STORAGE_ID.fetch_add(1, Ordering::Relaxed);
-        Self
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CircuitExecutionLayer {
     pub(crate) sub_circuit_call_ids: Vec<usize>,
     pub(crate) summed_sub_circuit_call_ids: Vec<usize>,
     pub(crate) regular_gate_types: Vec<PolyGateType>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ErrorNormExecutionLayer {
-    pub(crate) regular_gate_ids: Vec<GateId>,
-    pub(crate) sub_circuit_call_ids: Vec<usize>,
-    pub(crate) summed_sub_circuit_call_ids: Vec<usize>,
-}
-
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-enum ErrorNormExecutionNodeId {
-    Regular(GateId),
-    SubCircuitCall(usize),
-    SummedSubCircuitCall(usize),
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -425,7 +389,7 @@ struct NonFreeDepthCacheKey {
 pub struct PolyCircuit<P: Poly> {
     pub(crate) gates: BTreeMap<GateId, PolyGate>,
     pub(crate) print_value: BTreeMap<GateId, String>,
-    pub(crate) sub_circuits: BTreeMap<usize, StoredSubCircuit<P>>,
+    pub(crate) sub_circuits: BTreeMap<usize, Arc<PolyCircuit<P>>>,
     pub(crate) sub_circuit_calls: BTreeMap<usize, SubCircuitCall>,
     pub(crate) summed_sub_circuit_calls: BTreeMap<usize, SummedSubCircuitCall>,
     pub(crate) sub_circuit_params: Vec<SubCircuitParamKind>,
@@ -437,7 +401,6 @@ pub struct PolyCircuit<P: Poly> {
     pub(crate) input_set_registry: Arc<InputSetRegistry>,
     pub(crate) next_scoped_call_id: usize,
     pub(crate) allow_register_lookup: bool,
-    pub(crate) sub_circuit_disk_storage: Option<SubCircuitDiskStorage>,
 }
 
 impl<P: Poly> PartialEq for PolyCircuit<P> {

@@ -1163,19 +1163,38 @@ impl<P: Poly> NestedRnsPoly<P> {
     }
 
     fn assert_matching_enable_levels(&self, other: &Self) {
-        assert_eq!(self.enable_levels, other.enable_levels);
-        assert_eq!(self.level_offset, other.level_offset);
+        assert_eq!(
+            self.enable_levels, other.enable_levels,
+            "mismatched enable_levels: left={:?}, right={:?}",
+            self.enable_levels, other.enable_levels
+        );
+        assert_eq!(
+            self.level_offset, other.level_offset,
+            "mismatched level_offset: left={:?}, right={:?}",
+            self.level_offset, other.level_offset
+        );
     }
 
     fn assert_sparse_at_q_idx(&self, target_q_idx: usize) {
         let levels = self.resolve_enable_levels();
-        assert!(target_q_idx < levels);
+        assert!(
+            target_q_idx < levels,
+            "mul_right_sparse target q_idx {} exceeds active levels {}",
+            target_q_idx,
+            levels
+        );
         for q_idx in 0..levels {
             if q_idx != target_q_idx {
-                assert!(self.max_plaintexts[q_idx] == BigUint::ZERO);
+                assert!(
+                    self.max_plaintexts[q_idx] == BigUint::ZERO,
+                    "mul_right_sparse requires the right operand to be zero outside q_idx"
+                );
             }
         }
-        assert!(self.max_plaintexts[target_q_idx] != BigUint::ZERO);
+        assert!(
+            self.max_plaintexts[target_q_idx] != BigUint::ZERO,
+            "mul_right_sparse requires a non-zero bound at q_idx"
+        );
     }
 
     fn resolve_enable_levels(&self) -> usize {

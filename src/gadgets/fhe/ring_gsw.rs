@@ -1,5 +1,5 @@
 use crate::{
-    circuit::{BatchedWire, PolyCircuit, SubCircuitDiskStorage, evaluable::PolyVec, gate::GateId},
+    circuit::{BatchedWire, PolyCircuit, evaluable::PolyVec, gate::GateId},
     gadgets::{
         arith::{
             NestedRnsPoly, NestedRnsPolyContext, nested_rns_gadget_decomposed,
@@ -639,17 +639,8 @@ impl<P: Poly> RingGswContext<P> {
 }
 
 impl<P: Poly + 'static> RingGswContext<P> {
-    fn shared_helper_storage(
-        storage: Option<SubCircuitDiskStorage>,
-        prefix: &str,
-    ) -> SubCircuitDiskStorage {
-        storage.unwrap_or_else(|| SubCircuitDiskStorage::temporary(prefix))
-    }
-
-    fn helper_circuit_with_storage(storage: &SubCircuitDiskStorage) -> PolyCircuit<P> {
-        let mut circuit = PolyCircuit::<P>::new();
-        circuit.use_subcircuit_disk_storage(storage.clone());
-        circuit
+    fn helper_circuit() -> PolyCircuit<P> {
+        PolyCircuit::<P>::new()
     }
 
     fn entry_input_from_template(
@@ -671,13 +662,12 @@ impl<P: Poly + 'static> RingGswContext<P> {
         source_circuit: &PolyCircuit<P>,
         lhs: &NestedRnsPoly<P>,
         rhs: &NestedRnsPoly<P>,
-        sub_circuit_storage: SubCircuitDiskStorage,
         combine: F,
     ) -> (PolyCircuit<P>, RingGswEntryOutputMetadata)
     where
         F: Fn(&NestedRnsPoly<P>, &NestedRnsPoly<P>, &mut PolyCircuit<P>) -> NestedRnsPoly<P> + Copy,
     {
-        let mut helper_circuit = Self::helper_circuit_with_storage(&sub_circuit_storage);
+        let mut helper_circuit = Self::helper_circuit();
         let helper_ctx =
             Arc::new(lhs.ctx.register_shared_subcircuits_in(source_circuit, &mut helper_circuit));
         let lhs_entry =
@@ -693,30 +683,20 @@ impl<P: Poly + 'static> RingGswContext<P> {
         source_circuit: &PolyCircuit<P>,
         lhs: &NestedRnsPoly<P>,
         rhs: &NestedRnsPoly<P>,
-        sub_circuit_storage: SubCircuitDiskStorage,
     ) -> (PolyCircuit<P>, RingGswEntryOutputMetadata) {
-        Self::entry_binary_subcircuit(
-            source_circuit,
-            lhs,
-            rhs,
-            sub_circuit_storage,
-            |left, right, circuit| left.add(right, circuit),
-        )
+        Self::entry_binary_subcircuit(source_circuit, lhs, rhs, |left, right, circuit| {
+            left.add(right, circuit)
+        })
     }
 
     fn sub_entry_subcircuit(
         source_circuit: &PolyCircuit<P>,
         lhs: &NestedRnsPoly<P>,
         rhs: &NestedRnsPoly<P>,
-        sub_circuit_storage: SubCircuitDiskStorage,
     ) -> (PolyCircuit<P>, RingGswEntryOutputMetadata) {
-        Self::entry_binary_subcircuit(
-            source_circuit,
-            lhs,
-            rhs,
-            sub_circuit_storage,
-            |left, right, circuit| left.sub(right, circuit),
-        )
+        Self::entry_binary_subcircuit(source_circuit, lhs, rhs, |left, right, circuit| {
+            left.sub(right, circuit)
+        })
     }
 
     pub fn setup(
@@ -767,8 +747,6 @@ impl<P: Poly + 'static> RingGswContext<P> {
             .max()
             .expect("RingGswContext requires at least one p modulus");
         let randomizer_norm_ctx = ring_gsw_randomizer_norm_ctx::<P>(params, width, max_p_modulus);
-        let helper_storage =
-            Self::shared_helper_storage(circuit.cloned_subcircuit_disk_storage(), "ring-gsw");
         let mul_subcircuit_start = Instant::now();
         let (mul_subcircuit, mul_output_template) = Self::mul_subcircuit(
             circuit,
@@ -778,7 +756,6 @@ impl<P: Poly + 'static> RingGswContext<P> {
             active_levels,
             level_offset,
             width,
-            helper_storage.clone(),
         );
         let mul_subcircuit_id = circuit.register_sub_circuit(mul_subcircuit);
         debug!(
@@ -816,10 +793,9 @@ impl<P: Poly + 'static> RingGswContext<P> {
         active_levels: usize,
         level_offset: usize,
         width: usize,
-        sub_circuit_storage: SubCircuitDiskStorage,
     ) -> (PolyCircuit<P>, NestedRnsPoly<P>) {
         let start = Instant::now();
-        let mut circuit = Self::helper_circuit_with_storage(&sub_circuit_storage);
+        let mut circuit = Self::helper_circuit();
         let nested_rns =
             Arc::new(template_ctx.register_shared_subcircuits_in(source_circuit, &mut circuit));
         let (normalized_max_plaintexts, normalized_p_max_traces) =
@@ -842,7 +818,6 @@ impl<P: Poly + 'static> RingGswContext<P> {
             active_levels,
             level_offset,
             width,
-            sub_circuit_storage.clone(),
         );
         let mul_column_subcircuit = Arc::new(mul_column_subcircuit);
         let batch_columns = width.min(MUL_COLUMN_SUBCIRCUIT_BATCH);
@@ -855,7 +830,6 @@ impl<P: Poly + 'static> RingGswContext<P> {
             width,
             batch_columns,
             Arc::clone(&mul_column_subcircuit),
-            sub_circuit_storage.clone(),
         ));
         let super_batch_tail_columns = super_batch_columns % batch_columns;
         let super_batch_tail_subcircuit = (super_batch_tail_columns > 0).then(|| {
@@ -867,7 +841,6 @@ impl<P: Poly + 'static> RingGswContext<P> {
                 width,
                 super_batch_tail_columns,
                 Arc::clone(&mul_column_subcircuit),
-                sub_circuit_storage.clone(),
             ))
         });
         let super_batch_subcircuit = Arc::new(Self::mul_super_batch_subcircuit(
@@ -880,7 +853,6 @@ impl<P: Poly + 'static> RingGswContext<P> {
             batch_columns,
             Arc::clone(&batch_subcircuit),
             super_batch_tail_subcircuit,
-            sub_circuit_storage.clone(),
         ));
         let super_batch_subcircuit_id =
             circuit.register_shared_sub_circuit(Arc::clone(&super_batch_subcircuit));
@@ -896,7 +868,6 @@ impl<P: Poly + 'static> RingGswContext<P> {
                     width,
                     width_tail_batch_tail_columns,
                     Arc::clone(&mul_column_subcircuit),
-                    sub_circuit_storage.clone(),
                 ))
             });
             Some(circuit.register_shared_sub_circuit(Arc::new(Self::mul_super_batch_subcircuit(
@@ -909,7 +880,6 @@ impl<P: Poly + 'static> RingGswContext<P> {
                 batch_columns,
                 Arc::clone(&batch_subcircuit),
                 width_tail_batch_tail_subcircuit,
-                sub_circuit_storage.clone(),
             ))))
         } else {
             None
@@ -1052,7 +1022,6 @@ impl<P: Poly + 'static> RingGswContext<P> {
         width: usize,
         batch_columns: usize,
         mul_column_subcircuit: Arc<PolyCircuit<P>>,
-        sub_circuit_storage: SubCircuitDiskStorage,
     ) -> PolyCircuit<P> {
         assert!(batch_columns > 0, "batch_columns must be positive");
         assert!(
@@ -1062,7 +1031,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
             width
         );
         let start = Instant::now();
-        let mut circuit = Self::helper_circuit_with_storage(&sub_circuit_storage);
+        let mut circuit = Self::helper_circuit();
         let nested_rns =
             Arc::new(template_ctx.register_shared_subcircuits_in(source_circuit, &mut circuit));
         let (normalized_max_plaintexts, normalized_p_max_traces) =
@@ -1209,7 +1178,6 @@ impl<P: Poly + 'static> RingGswContext<P> {
         batch_columns: usize,
         batch_subcircuit: Arc<PolyCircuit<P>>,
         batch_tail_subcircuit: Option<Arc<PolyCircuit<P>>>,
-        sub_circuit_storage: SubCircuitDiskStorage,
     ) -> PolyCircuit<P> {
         assert!(super_batch_columns > 0, "super_batch_columns must be positive");
         assert!(
@@ -1225,7 +1193,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
             super_batch_columns
         );
         let start = Instant::now();
-        let mut circuit = Self::helper_circuit_with_storage(&sub_circuit_storage);
+        let mut circuit = Self::helper_circuit();
         let nested_rns =
             Arc::new(template_ctx.register_shared_subcircuits_in(source_circuit, &mut circuit));
         let (normalized_max_plaintexts, normalized_p_max_traces) =
@@ -1393,10 +1361,9 @@ impl<P: Poly + 'static> RingGswContext<P> {
         template_ctx: &NestedRnsPolyContext,
         direct_term_calls: usize,
         term_helper: Arc<PolyCircuit<P>>,
-        sub_circuit_storage: SubCircuitDiskStorage,
     ) -> PolyCircuit<P> {
         assert!(direct_term_calls > 0, "direct_term_calls must be positive");
-        let mut circuit = Self::helper_circuit_with_storage(&sub_circuit_storage);
+        let mut circuit = Self::helper_circuit();
         let helper_ctx =
             Arc::new(template_ctx.register_shared_subcircuits_in(source_circuit, &mut circuit));
         let p_moduli_depth = helper_ctx.p_moduli.len();
@@ -1468,10 +1435,9 @@ impl<P: Poly + 'static> RingGswContext<P> {
         active_levels: usize,
         level_offset: usize,
         width: usize,
-        sub_circuit_storage: SubCircuitDiskStorage,
     ) -> (PolyCircuit<P>, NestedRnsPoly<P>) {
         let start = Instant::now();
-        let mut circuit = Self::helper_circuit_with_storage(&sub_circuit_storage);
+        let mut circuit = Self::helper_circuit();
         let nested_rns =
             Arc::new(template_ctx.register_shared_subcircuits_in(source_circuit, &mut circuit));
         let chunk_width = template_ctx.p_moduli.len() + 1;
@@ -1487,7 +1453,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
             nested_rns.full_reduce_output_metadata(Some(active_levels), Some(level_offset));
         let dot_helper_start = Instant::now();
         let (local_dot_row_with_column_subcircuit_id, local_dot_output_template) = {
-            let mut helper_circuit = Self::helper_circuit_with_storage(&sub_circuit_storage);
+            let mut helper_circuit = Self::helper_circuit();
             let helper_ctx = Arc::new(
                 template_ctx.register_shared_subcircuits_in(source_circuit, &mut helper_circuit),
             );
@@ -1508,7 +1474,6 @@ impl<P: Poly + 'static> RingGswContext<P> {
                     template_ctx,
                     term_batch_capacity,
                     Arc::clone(&term_helper),
-                    sub_circuit_storage.clone(),
                 ),
             ));
             let term_tail_subcircuit_ids = (1..term_batch_capacity)
@@ -1519,7 +1484,6 @@ impl<P: Poly + 'static> RingGswContext<P> {
                             template_ctx,
                             tail_terms,
                             Arc::clone(&term_helper),
-                            sub_circuit_storage.clone(),
                         ),
                     ))
                 })
@@ -1960,12 +1924,8 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
         if let Some(existing) = self.ctx.add_entry_cache.get(cache_key) {
             return *existing.value();
         }
-        let helper_storage = RingGswContext::<P>::shared_helper_storage(
-            circuit.cloned_subcircuit_disk_storage(),
-            "ring-gsw-add-entry",
-        );
         let (subcircuit, _output_metadata) =
-            RingGswContext::add_entry_subcircuit(circuit, left, right, helper_storage);
+            RingGswContext::add_entry_subcircuit(circuit, left, right);
         let subcircuit_id = circuit.register_sub_circuit(subcircuit);
         self.ctx.add_entry_cache.insert(cache_key.clone(), subcircuit_id);
         subcircuit_id
@@ -1981,12 +1941,8 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
         if let Some(existing) = self.ctx.sub_entry_cache.get(cache_key) {
             return *existing.value();
         }
-        let helper_storage = RingGswContext::<P>::shared_helper_storage(
-            circuit.cloned_subcircuit_disk_storage(),
-            "ring-gsw-sub-entry",
-        );
         let (subcircuit, _output_metadata) =
-            RingGswContext::sub_entry_subcircuit(circuit, left, right, helper_storage);
+            RingGswContext::sub_entry_subcircuit(circuit, left, right);
         let subcircuit_id = circuit.register_sub_circuit(subcircuit);
         self.ctx.sub_entry_cache.insert(cache_key.clone(), subcircuit_id);
         subcircuit_id

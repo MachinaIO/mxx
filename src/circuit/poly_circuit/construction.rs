@@ -25,7 +25,6 @@ impl<P: Poly> PolyCircuit<P> {
             input_set_registry,
             next_scoped_call_id: 0,
             allow_register_lookup: true,
-            sub_circuit_disk_storage: None,
         }
     }
 

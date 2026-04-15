@@ -1,4 +1,5 @@
 use super::*;
+use std::path::Path;
 
 impl<P: Poly> PolyCircuit<P> {
     fn inherit_shared_registries(
@@ -47,7 +48,6 @@ impl<P: Poly> PolyCircuit<P> {
         }
         self.allow_register_lookup = false;
         for sub in self.sub_circuits.values_mut() {
-            let StoredSubCircuit::InMemory(sub) = sub;
             if Arc::ptr_eq(&sub.lookup_registry, &lookup_registry) &&
                 Arc::ptr_eq(&sub.binding_registry, &binding_registry) &&
                 Arc::ptr_eq(&sub.input_set_registry, &input_set_registry)
@@ -79,31 +79,14 @@ impl<P: Poly> PolyCircuit<P> {
         self.inherit_shared_registries(lookup_registry, binding_registry, input_set_registry);
     }
 
-    pub(crate) fn cloned_subcircuit_disk_storage(&self) -> Option<SubCircuitDiskStorage> {
-        self.sub_circuit_disk_storage.clone()
-    }
-
-    pub(crate) fn use_subcircuit_disk_storage(&mut self, storage: SubCircuitDiskStorage) {
-        if !self.sub_circuits.is_empty() {
-            panic!(
-                "disk-backed sub-circuit storage must be configured before registering sub-circuits"
-            );
-        }
-        self.sub_circuit_disk_storage = Some(storage);
-    }
-
     pub(crate) fn with_sub_circuit<R>(&self, circuit_id: usize, f: impl FnOnce(&Self) -> R) -> R {
         let stored = self.sub_circuits.get(&circuit_id).expect("sub-circuit not found");
-        match stored {
-            StoredSubCircuit::InMemory(sub) => f(sub.as_ref()),
-        }
+        f(stored.as_ref())
     }
 
     pub(crate) fn sub_circuit_num_output(&self, circuit_id: usize) -> usize {
         let stored = self.sub_circuits.get(&circuit_id).expect("sub-circuit not found");
-        match stored {
-            StoredSubCircuit::InMemory(sub) => sub.as_ref().num_output(),
-        }
+        stored.as_ref().num_output()
     }
 
     pub(crate) fn lookup_table(&self, lut_id: usize) -> Arc<PublicLut<P>> {
@@ -295,10 +278,7 @@ impl<P: Poly> PolyCircuit<P> {
     }
 
     pub(crate) fn registered_sub_circuit_ref(&self, circuit_id: usize) -> Arc<Self> {
-        let stored = self.sub_circuits.get(&circuit_id).expect("sub-circuit not found");
-        match stored {
-            StoredSubCircuit::InMemory(sub) => sub.clone(),
-        }
+        self.sub_circuits.get(&circuit_id).expect("sub-circuit not found").clone()
     }
 
     pub fn register_public_lookup(&mut self, public_lookup: PublicLut<P>) -> usize {
@@ -342,21 +322,24 @@ impl<P: Poly> PolyCircuit<P> {
         total
     }
 
-    pub fn enable_subcircuits_in_disk(&mut self, dir_path: impl AsRef<Path>) {
-        let storage = SubCircuitDiskStorage::new(dir_path.as_ref());
-        self.sub_circuit_disk_storage = Some(storage);
-    }
+    /// Compatibility no-op.
+    ///
+    /// Older callers can still opt into "disk" storage, but sub-circuits are now stored only as
+    /// shared in-memory `Arc<PolyCircuit<_>>` values. Keeping this method avoids a broader API
+    /// churn outside the current refactor scope.
+    pub fn enable_subcircuits_in_disk(&mut self, _dir_path: impl AsRef<Path>) {}
 
     pub fn register_sub_circuit(&mut self, mut sub_circuit: Self) -> usize {
         sub_circuit.inherit_registries_from_parent(self);
         let circuit_id = self.sub_circuits.len();
-        self.sub_circuits.insert(circuit_id, StoredSubCircuit::InMemory(Arc::new(sub_circuit)));
+        self.sub_circuits.insert(circuit_id, Arc::new(sub_circuit));
         circuit_id
     }
 
-    pub fn register_shared_sub_circuit(&mut self, sub_circuit: Arc<Self>) -> usize {
+    pub fn register_shared_sub_circuit(&mut self, mut sub_circuit: Arc<Self>) -> usize {
+        Arc::make_mut(&mut sub_circuit).inherit_registries_from_parent(self);
         let circuit_id = self.sub_circuits.len();
-        self.sub_circuits.insert(circuit_id, StoredSubCircuit::InMemory(sub_circuit));
+        self.sub_circuits.insert(circuit_id, sub_circuit);
         circuit_id
     }
 
@@ -419,13 +402,9 @@ impl<P: Poly> PolyCircuit<P> {
         #[cfg(debug_assertions)]
         {
             let stored = self.sub_circuits.get(&circuit_id).expect("sub-circuit not found");
-            let num_inputs = match stored {
-                StoredSubCircuit::InMemory(sub) => sub.num_input(),
-            };
+            let num_inputs = stored.num_input();
             assert_eq!(total_num_inputs, num_inputs);
-            let expected_param_kinds = match stored {
-                StoredSubCircuit::InMemory(sub) => &sub.sub_circuit_params,
-            };
+            let expected_param_kinds = &stored.sub_circuit_params;
             assert_eq!(param_bindings.len(), expected_param_kinds.len());
             for (param_idx, (binding, expected_kind)) in
                 param_bindings.iter().zip(expected_param_kinds.iter()).enumerate()
@@ -481,9 +460,8 @@ impl<P: Poly> PolyCircuit<P> {
         #[cfg(debug_assertions)]
         {
             let stored = self.sub_circuits.get(&circuit_id).expect("sub-circuit not found");
-            let (num_inputs, expected_param_kinds) = match stored {
-                StoredSubCircuit::InMemory(sub) => (sub.num_input(), &sub.sub_circuit_params),
-            };
+            let (num_inputs, expected_param_kinds) =
+                (stored.num_input(), &stored.sub_circuit_params);
             for (call_idx, (input_set_id, binding_set_id)) in
                 call_input_set_ids.iter().zip(call_binding_set_ids.iter()).enumerate()
             {

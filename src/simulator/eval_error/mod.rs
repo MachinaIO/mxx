@@ -3,8 +3,9 @@ use super::{
 };
 use crate::{
     circuit::{
-        BatchedWire, Evaluable, PolyCircuit, PolyGateType, SubCircuitParamValue,
-        batched_wire_slice_at, batched_wire_slice_len, gate::GateId, iter_batched_wire_gates,
+        BatchedWire, Evaluable, GroupedCallExecutionLayer, PolyCircuit, PolyGateType,
+        SubCircuitParamValue, batched_wire_slice_at, batched_wire_slice_len, gate::GateId,
+        iter_batched_wire_gates,
     },
     element::PolyElem,
     lookup::{PltEvaluator, PublicLut, commit_eval::compute_padded_len},

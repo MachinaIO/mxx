@@ -11,7 +11,10 @@ use crate::{
     sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
     utils::{create_bit_random_poly, create_random_poly},
 };
+use dashmap::DashMap;
 use num_bigint::BigUint;
+use std::sync::Arc;
+
 fn eval_with_const_one<PE>(
     circuit: &PolyCircuit<DCRTPoly>,
     params: &DCRTPolyParams,
@@ -1218,4 +1221,36 @@ fn test_non_free_depth_batches_multiple_ready_sub_circuit_calls() {
     main_circuit.output(vec![output]);
 
     assert_eq!(main_circuit.non_free_depth(), 2);
+}
+
+#[test]
+fn test_non_free_depth_cache_reuses_exact_profile_arc() {
+    let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
+    let sub_inputs = sub_circuit.input(2).to_vec();
+    let mul = sub_circuit.mul_gate(sub_inputs[0], sub_inputs[1]);
+    sub_circuit.output(vec![mul]);
+
+    let cache = DashMap::new();
+    let first = sub_circuit.non_free_depths_with_input_levels_cached(&[2, 5], &cache);
+    let second = sub_circuit.non_free_depths_with_input_levels_cached(&[2, 5], &cache);
+
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(first.as_ref(), &[6]);
+}
+
+#[test]
+fn test_non_free_depth_cache_min_normalization_is_not_generally_safe() {
+    let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
+    let input = sub_circuit.input(1).to_vec()[0];
+    let const_product = sub_circuit.mul_gate(GateId(0), GateId(0));
+    let output = sub_circuit.add_gate(const_product, input);
+    sub_circuit.output(vec![output]);
+
+    let cache = DashMap::new();
+    let low_input = sub_circuit.non_free_depths_with_input_levels_cached(&[0], &cache);
+    let high_input = sub_circuit.non_free_depths_with_input_levels_cached(&[5], &cache);
+
+    assert_eq!(low_input.as_ref(), &[1]);
+    assert_eq!(high_input.as_ref(), &[5]);
+    assert_ne!(low_input.as_ref(), high_input.as_ref());
 }

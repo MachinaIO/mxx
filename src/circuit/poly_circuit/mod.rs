@@ -379,9 +379,16 @@ pub(crate) struct CircuitExecutionLayer {
     pub(crate) regular_gate_types: Vec<PolyGateType>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GroupedCallExecutionLayer {
+    pub(crate) regular_gate_ids: Vec<GateId>,
+    pub(crate) sub_circuit_call_ids: Vec<usize>,
+    pub(crate) summed_sub_circuit_call_ids: Vec<usize>,
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct NonFreeDepthCacheKey {
-    circuit_ptr: usize,
+pub(crate) struct NonFreeDepthCacheKey {
+    circuit_key: usize,
     input_levels: Box<[u32]>,
 }
 

@@ -8,7 +8,7 @@ use crate::{
     sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
     slot_transfer::SlotTransferEvaluator,
     storage::{
-        read::read_bytes_from_multi_batch,
+        read::{read_bytes_from_multi_batch, read_matrix_from_multi_batch},
         write::{add_lookup_buffer, get_lookup_buffer, get_lookup_buffer_bytes},
     },
 };
@@ -22,8 +22,8 @@ use tracing::info;
 pub(crate) struct SlotAuxSample<M: PolyMatrix> {
     pub(crate) slot_idx: usize,
     pub(crate) slot_a: M,
-    pub(crate) preimage_b0: M,
-    pub(crate) preimage_b1: M,
+    pub(crate) preimage_b0_chunks: Vec<M>,
+    pub(crate) preimage_b1_chunks: Vec<M>,
 }
 
 #[cfg(not(feature = "gpu"))]
@@ -38,32 +38,50 @@ where
                     .expect("slot_a compact_bytes length overflowed u64"),
             )
             .and_then(|total| {
-                total.checked_add(
-                    u64::try_from(sample.preimage_b0.to_compact_bytes().len())
-                        .expect("slot preimage_b0 compact_bytes length overflowed u64"),
-                )
+                total.checked_add(sample.preimage_b0_chunks.iter().fold(
+                    0u64,
+                    |chunk_total, chunk| {
+                        chunk_total
+                            .checked_add(
+                                u64::try_from(chunk.to_compact_bytes().len())
+                                    .expect("slot preimage_b0 compact_bytes length overflowed u64"),
+                            )
+                            .expect("slot preimage_b0 compact_bytes total overflowed u64")
+                    },
+                ))
             })
             .and_then(|total| {
-                total.checked_add(
-                    u64::try_from(sample.preimage_b1.to_compact_bytes().len())
-                        .expect("slot preimage_b1 compact_bytes length overflowed u64"),
-                )
+                total.checked_add(sample.preimage_b1_chunks.iter().fold(
+                    0u64,
+                    |chunk_total, chunk| {
+                        chunk_total
+                            .checked_add(
+                                u64::try_from(chunk.to_compact_bytes().len())
+                                    .expect("slot preimage_b1 compact_bytes length overflowed u64"),
+                            )
+                            .expect("slot preimage_b1 compact_bytes total overflowed u64")
+                    },
+                ))
             })
             .expect("slot auxiliary compact_bytes total overflowed u64")
     })
 }
 
 #[cfg(not(feature = "gpu"))]
-fn gate_preimages_compact_bytes<M>(preimages: &[(usize, M)]) -> u64
+fn gate_preimages_compact_bytes<M>(preimages: &[(usize, Vec<M>)]) -> u64
 where
     M: PolyMatrix,
 {
-    preimages.iter().fold(0u64, |total, (_, preimage)| {
+    preimages.iter().fold(0u64, |total, (_, preimage_chunks)| {
         total
-            .checked_add(
-                u64::try_from(preimage.to_compact_bytes().len())
-                    .expect("gate preimage compact_bytes length overflowed u64"),
-            )
+            .checked_add(preimage_chunks.iter().fold(0u64, |chunk_total, preimage| {
+                chunk_total
+                    .checked_add(
+                        u64::try_from(preimage.to_compact_bytes().len())
+                            .expect("gate preimage compact_bytes length overflowed u64"),
+                    )
+                    .expect("gate preimage compact_bytes total overflowed u64")
+            }))
             .expect("gate preimage compact_bytes total overflowed u64")
     })
 }
@@ -80,6 +98,122 @@ where
 pub(crate) fn decomposition_column_chunk_width(total_cols: usize) -> usize {
     assert!(total_cols > 0, "decomposition_column_chunk_width requires total_cols > 0");
     total_cols.min(crate::env::aux_sampling_chunk_width().max(1))
+}
+
+pub(crate) fn column_chunk_count(total_cols: usize) -> usize {
+    let chunk_cols = decomposition_column_chunk_width(total_cols);
+    total_cols.div_ceil(chunk_cols)
+}
+
+pub(crate) fn column_chunk_bounds(total_cols: usize, chunk_idx: usize) -> (usize, usize) {
+    let chunk_cols = decomposition_column_chunk_width(total_cols);
+    let col_start = chunk_idx.checked_mul(chunk_cols).expect("column chunk start overflow");
+    assert!(
+        col_start < total_cols,
+        "column chunk index out of range: total_cols={}, chunk_idx={}, chunk_cols={}",
+        total_cols,
+        chunk_idx,
+        chunk_cols
+    );
+    let col_len = (total_cols - col_start).min(chunk_cols);
+    (col_start, col_len)
+}
+
+pub(crate) fn column_chunk_id_prefix(id_prefix: &str, chunk_idx: usize) -> String {
+    format!("{id_prefix}_chunk{chunk_idx}")
+}
+
+pub(crate) fn trapdoor_public_column_count<M>(params: &<M::P as Poly>::Params, size: usize) -> usize
+where
+    M: PolyMatrix,
+{
+    size.checked_mul(params.modulus_digits() + 2).expect("trapdoor public column count overflow")
+}
+
+#[cfg(test)]
+pub(crate) fn read_matrix_from_column_chunks<M>(
+    params: &<M::P as Poly>::Params,
+    dir: &std::path::Path,
+    id_prefix: &str,
+    total_cols: usize,
+) -> M
+where
+    M: PolyMatrix,
+{
+    let chunk_count = column_chunk_count(total_cols);
+    let mut chunks = Vec::with_capacity(chunk_count);
+    for chunk_idx in 0..chunk_count {
+        let (_, expected_cols) = column_chunk_bounds(total_cols, chunk_idx);
+        let chunk_prefix = column_chunk_id_prefix(id_prefix, chunk_idx);
+        let chunk = if let Some(matrix) =
+            read_matrix_from_multi_batch::<M>(params, dir, &chunk_prefix, 0)
+        {
+            matrix
+        } else {
+            let bytes = read_bytes_from_multi_batch(dir, &chunk_prefix, 0).unwrap_or_else(|| {
+                panic!("missing slot-transfer checkpoint bytes for {id_prefix} chunk {chunk_idx}")
+            });
+            M::from_compact_bytes(params, &bytes)
+        };
+        assert_eq!(
+            chunk.col_size(),
+            expected_cols,
+            "slot-transfer checkpoint chunk {} must have {} columns for {}",
+            chunk_idx,
+            expected_cols,
+            id_prefix
+        );
+        chunks.push(chunk);
+    }
+    concat_column_chunks(chunks)
+}
+
+pub(crate) fn read_matrix_column_chunk<M>(
+    params: &<M::P as Poly>::Params,
+    dir: &std::path::Path,
+    id_prefix: &str,
+    total_cols: usize,
+    chunk_idx: usize,
+) -> M
+where
+    M: PolyMatrix,
+{
+    let (_, expected_cols) = column_chunk_bounds(total_cols, chunk_idx);
+    let chunk_prefix = column_chunk_id_prefix(id_prefix, chunk_idx);
+    let chunk =
+        if let Some(matrix) = read_matrix_from_multi_batch::<M>(params, dir, &chunk_prefix, 0) {
+            matrix
+        } else {
+            let bytes = read_bytes_from_multi_batch(dir, &chunk_prefix, 0).unwrap_or_else(|| {
+                panic!("missing slot-transfer checkpoint bytes for {id_prefix} chunk {chunk_idx}")
+            });
+            M::from_compact_bytes(params, &bytes)
+        };
+    assert_eq!(
+        chunk.col_size(),
+        expected_cols,
+        "slot-transfer checkpoint chunk {} must have {} columns for {}",
+        chunk_idx,
+        expected_cols,
+        id_prefix
+    );
+    chunk
+}
+
+pub(crate) fn left_mul_chunked_checkpoint_column<M>(
+    params: &<M::P as Poly>::Params,
+    dir: &std::path::Path,
+    id_prefix: &str,
+    total_cols: usize,
+    chunk_idx: usize,
+    lhs: &M,
+) -> M
+where
+    M: PolyMatrix,
+    for<'a, 'b> &'a M: std::ops::Mul<&'b M, Output = M>,
+{
+    let rhs_chunk = read_matrix_column_chunk(params, dir, id_prefix, total_cols, chunk_idx);
+    lhs * &rhs_chunk
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,11 +395,19 @@ where
     }
 
     fn store_matrix_checkpoint(matrix: M, id_prefix: &str) {
-        add_lookup_buffer(get_lookup_buffer(vec![(0usize, matrix)], id_prefix));
+        Self::store_matrix_checkpoint_at(matrix, id_prefix, 0);
+    }
+
+    fn store_matrix_checkpoint_at(matrix: M, id_prefix: &str, chunk_idx: usize) {
+        add_lookup_buffer(get_lookup_buffer(vec![(chunk_idx, matrix)], id_prefix));
     }
 
     pub(crate) fn store_bytes_checkpoint(bytes: Vec<u8>, id_prefix: &str) {
-        add_lookup_buffer(get_lookup_buffer_bytes(vec![(0usize, bytes)], id_prefix));
+        Self::store_bytes_checkpoint_at(bytes, id_prefix, 0);
+    }
+
+    pub(crate) fn store_bytes_checkpoint_at(bytes: Vec<u8>, id_prefix: &str, chunk_idx: usize) {
+        add_lookup_buffer(get_lookup_buffer_bytes(vec![(chunk_idx, bytes)], id_prefix));
     }
 
     fn load_matrix_checkpoint(
@@ -355,11 +497,24 @@ where
         read_bytes_from_multi_batch(self.dir_path.as_path(), id_prefix, 0).is_some()
     }
 
+    fn checkpoint_chunks_exist(&self, id_prefix: &str, total_cols: usize) -> bool {
+        (0..column_chunk_count(total_cols)).all(|chunk_idx| {
+            read_bytes_from_multi_batch(
+                self.dir_path.as_path(),
+                &column_chunk_id_prefix(id_prefix, chunk_idx),
+                0,
+            )
+            .is_some()
+        })
+    }
+
     fn has_complete_aux_checkpoint(
         &self,
         params: &<M::P as Poly>::Params,
         gate_ids: &[GateId],
     ) -> bool {
+        let m_g = self.secret_size * params.modulus_digits();
+        let b1_public_cols = trapdoor_public_column_count::<M>(params, self.secret_size * 2);
         self.checkpoint_exists(&self.b0_id_prefix(params)) &&
             self.checkpoint_exists(&self.b0_trapdoor_id_prefix(params)) &&
             self.checkpoint_exists(&self.b1_id_prefix(params)) &&
@@ -367,12 +522,21 @@ where
             (0..self.num_slots).all(|slot_idx| {
                 self.checkpoint_exists(&self.slot_secret_mat_id_prefix(params, slot_idx)) &&
                     self.checkpoint_exists(&self.slot_a_id_prefix(params, slot_idx)) &&
-                    self.checkpoint_exists(&self.slot_preimage_b0_id_prefix(params, slot_idx)) &&
-                    self.checkpoint_exists(&self.slot_preimage_b1_id_prefix(params, slot_idx))
+                    self.checkpoint_chunks_exist(
+                        &self.slot_preimage_b0_id_prefix(params, slot_idx),
+                        b1_public_cols,
+                    ) &&
+                    self.checkpoint_chunks_exist(
+                        &self.slot_preimage_b1_id_prefix(params, slot_idx),
+                        m_g,
+                    )
             }) &&
             gate_ids.iter().copied().all(|gate_id| {
                 (0..self.num_slots).all(|dst_slot| {
-                    self.checkpoint_exists(&self.gate_preimage_id_prefix(params, gate_id, dst_slot))
+                    self.checkpoint_chunks_exist(
+                        &self.gate_preimage_id_prefix(params, gate_id, dst_slot),
+                        m_g,
+                    )
                 })
             })
     }
@@ -392,6 +556,9 @@ where
     ) -> Vec<SlotAuxSample<M>> {
         let m_g = self.secret_size * params.modulus_digits();
         let b1_size = self.secret_size * 2;
+        let b0_target_cols = b1_matrix.col_size();
+        let b0_chunk_count = column_chunk_count(b0_target_cols);
+        let b1_chunk_count = column_chunk_count(m_g);
         batch_slot_indices
             .par_iter()
             .copied()
@@ -424,19 +591,36 @@ where
                     DistType::FinRingDist,
                 );
                 let s_concat_identity = slot_secret_mat.clone().concat_columns(&[identity]);
-                let mut target_b0 = s_concat_identity * b1_matrix;
-                target_b0.add_in_place(&self.sample_error_matrix(
-                    params,
-                    self.secret_size,
-                    b1_matrix.col_size(),
-                ));
-                let preimage_b0 = trap_sampler.preimage(params, b0_trapdoor, b0_matrix, &target_b0);
+                let preimage_b0_chunks = (0..b0_chunk_count)
+                    .map(|chunk_idx| {
+                        let (col_start, col_len) = column_chunk_bounds(b0_target_cols, chunk_idx);
+                        let col_end = col_start + col_len;
+                        let mut target_chunk = s_concat_identity.clone() *
+                            &b1_matrix.slice(0, b1_size, col_start, col_end);
+                        target_chunk.add_in_place(&self.sample_error_matrix(
+                            params,
+                            self.secret_size,
+                            col_len,
+                        ));
+                        trap_sampler.preimage(params, b0_trapdoor, b0_matrix, &target_chunk)
+                    })
+                    .collect::<Vec<_>>();
 
-                let neg_slot_secret_gadget = -(slot_secret_mat * gadget_matrix);
-                let mut target_b1 = a_i.clone().concat_rows(&[&neg_slot_secret_gadget]);
-                target_b1.add_in_place(&self.sample_error_matrix(params, b1_size, m_g));
-                let preimage_b1 = trap_sampler.preimage(params, b1_trapdoor, b1_matrix, &target_b1);
-                SlotAuxSample { slot_idx, slot_a: a_i, preimage_b0, preimage_b1 }
+                let preimage_b1_chunks = (0..b1_chunk_count)
+                    .map(|chunk_idx| {
+                        let (col_start, col_len) = column_chunk_bounds(m_g, chunk_idx);
+                        let col_end = col_start + col_len;
+                        let a_i_chunk = a_i.slice(0, self.secret_size, col_start, col_end);
+                        let neg_slot_secret_gadget_chunk = -(slot_secret_mat.clone() *
+                            &gadget_matrix.slice(0, self.secret_size, col_start, col_end));
+                        let mut target_chunk =
+                            a_i_chunk.concat_rows(&[&neg_slot_secret_gadget_chunk]);
+                        target_chunk
+                            .add_in_place(&self.sample_error_matrix(params, b1_size, col_len));
+                        trap_sampler.preimage(params, b1_trapdoor, b1_matrix, &target_chunk)
+                    })
+                    .collect::<Vec<_>>();
+                SlotAuxSample { slot_idx, slot_a: a_i, preimage_b0_chunks, preimage_b1_chunks }
             })
             .collect()
     }
@@ -452,18 +636,11 @@ where
         gate_id: GateId,
         state: &BggPublicKeySTGateState,
         slot_chunk: &[(usize, (u32, Option<u32>))],
-    ) -> Vec<(usize, M)> {
+    ) -> Vec<(usize, Vec<M>)> {
         let m_g = self.secret_size * params.modulus_digits();
+        let chunk_count = column_chunk_count(m_g);
         let trap_sampler = TS::new(params, self.trapdoor_sigma);
         let a_in = M::from_compact_bytes(params, &state.input_pubkey_bytes);
-        let a_out = HS::new().sample_hash(
-            params,
-            self.hash_key,
-            format!("slot_transfer_gate_a_out_{}", gate_id),
-            self.secret_size,
-            m_g,
-            DistType::FinRingDist,
-        );
         slot_chunk
             .par_iter()
             .copied()
@@ -479,13 +656,40 @@ where
                 let s_j = M::from_compact_bytes(params, slot_secret_mats[dst_slot].as_ref());
                 let s_i = M::from_compact_bytes(params, slot_secret_mats[src_slot].as_ref());
                 let a_j = M::from_compact_bytes(params, slot_a_bytes_by_slot[dst_slot].as_ref());
-                let lhs = s_j * &a_out;
                 let lhs_input = s_i * &a_in;
-                let rhs = self.compute_gate_rhs_chunked(params, &lhs_input, &a_j, scalar);
-                let mut target = lhs - rhs;
-                target.add_in_place(&self.sample_error_matrix(params, self.secret_size, m_g));
-                let preimage = trap_sampler.preimage(params, b0_trapdoor, b0_matrix, &target);
-                (dst_slot, preimage)
+                let scalar_poly =
+                    scalar.map(|value| M::P::from_usize_to_constant(params, value as usize));
+                let preimage_chunks = (0..chunk_count)
+                    .map(|chunk_idx| {
+                        let (col_start, col_len) = column_chunk_bounds(m_g, chunk_idx);
+                        let lhs_chunk = s_j.clone() *
+                            &HS::new().sample_hash_columns(
+                                params,
+                                self.hash_key,
+                                format!("slot_transfer_gate_a_out_{}", gate_id),
+                                self.secret_size,
+                                m_g,
+                                col_start,
+                                col_len,
+                                DistType::FinRingDist,
+                            );
+                        let a_j_chunk =
+                            a_j.slice_columns(col_start, col_start + col_len).decompose();
+                        let rhs_chunk = lhs_input.clone() * a_j_chunk;
+                        let rhs_chunk = match &scalar_poly {
+                            Some(poly) => rhs_chunk * poly,
+                            None => rhs_chunk,
+                        };
+                        let mut target_chunk = lhs_chunk - rhs_chunk;
+                        target_chunk.add_in_place(&self.sample_error_matrix(
+                            params,
+                            self.secret_size,
+                            col_len,
+                        ));
+                        trap_sampler.preimage(params, b0_trapdoor, b0_matrix, &target_chunk)
+                    })
+                    .collect::<Vec<_>>();
+                (dst_slot, preimage_chunks)
             })
             .collect()
     }
@@ -607,41 +811,53 @@ where
                 .map(|sample| {
                     let slot_idx = sample.slot_idx;
                     let slot_a_bytes = sample.slot_a.to_compact_bytes();
-                    let slot_a_id_prefix = self.slot_a_id_prefix(params, slot_idx);
-                    let slot_preimage_b0_id_prefix =
-                        self.slot_preimage_b0_id_prefix(params, slot_idx);
-                    let slot_preimage_b1_id_prefix =
-                        self.slot_preimage_b1_id_prefix(params, slot_idx);
                     (
                         slot_idx,
                         slot_a_bytes,
-                        vec![
-                            (slot_a_id_prefix, sample.slot_a),
-                            (slot_preimage_b0_id_prefix, sample.preimage_b0),
-                            (slot_preimage_b1_id_prefix, sample.preimage_b1),
-                        ],
+                        sample.slot_a,
+                        sample
+                            .preimage_b0_chunks
+                            .into_iter()
+                            .map(|matrix| matrix.into_compact_bytes())
+                            .collect::<Vec<_>>(),
+                        sample
+                            .preimage_b1_chunks
+                            .into_iter()
+                            .map(|matrix| matrix.into_compact_bytes())
+                            .collect::<Vec<_>>(),
                     )
                 })
                 .collect::<Vec<_>>();
             let sampled_slot_bytes = sampled_slot_jobs
                 .par_iter()
-                .map(|(slot_idx, slot_a_bytes, _)| (*slot_idx, slot_a_bytes.clone()))
+                .map(|(slot_idx, slot_a_bytes, _, _, _)| (*slot_idx, slot_a_bytes.clone()))
                 .collect::<Vec<_>>();
             for (slot_idx, slot_a_bytes) in sampled_slot_bytes {
                 slot_a_bytes_by_slot[slot_idx] = slot_a_bytes;
             }
-            let mut slot_job_iter =
-                sampled_slot_jobs.into_iter().flat_map(|(_, _, jobs)| jobs.into_iter());
-            loop {
-                let slot_job_chunk =
-                    slot_job_iter.by_ref().take(slot_parallelism.max(1)).collect::<Vec<_>>();
-                if slot_job_chunk.is_empty() {
-                    break;
-                }
-                slot_job_chunk.into_par_iter().for_each(|(id_prefix, matrix)| {
-                    Self::store_matrix_checkpoint(matrix, &id_prefix)
-                });
-            }
+            sampled_slot_jobs.into_par_iter().for_each(
+                |(slot_idx, _slot_a_bytes, slot_a, preimage_b0_bytes, preimage_b1_bytes)| {
+                    Self::store_matrix_checkpoint(slot_a, &self.slot_a_id_prefix(params, slot_idx));
+                    for (chunk_idx, bytes) in preimage_b0_bytes.into_iter().enumerate() {
+                        Self::store_bytes_checkpoint(
+                            bytes,
+                            &column_chunk_id_prefix(
+                                &self.slot_preimage_b0_id_prefix(params, slot_idx),
+                                chunk_idx,
+                            ),
+                        );
+                    }
+                    for (chunk_idx, bytes) in preimage_b1_bytes.into_iter().enumerate() {
+                        Self::store_bytes_checkpoint(
+                            bytes,
+                            &column_chunk_id_prefix(
+                                &self.slot_preimage_b1_id_prefix(params, slot_idx),
+                                chunk_idx,
+                            ),
+                        );
+                    }
+                },
+            );
         }
 
         let gate_entries = gate_ids
@@ -689,12 +905,20 @@ where
                 );
                 let gate_jobs = sampled_chunk
                     .into_par_iter()
-                    .map(|(dst_slot, preimage)| {
-                        (self.gate_preimage_id_prefix(params, *gate_id, dst_slot), preimage)
+                    .flat_map_iter(|(dst_slot, preimage_chunks)| {
+                        preimage_chunks.into_iter().enumerate().map(move |(chunk_idx, preimage)| {
+                            (
+                                column_chunk_id_prefix(
+                                    &self.gate_preimage_id_prefix(params, *gate_id, dst_slot),
+                                    chunk_idx,
+                                ),
+                                preimage.into_compact_bytes(),
+                            )
+                        })
                     })
                     .collect::<Vec<_>>();
-                gate_jobs.into_par_iter().for_each(|(id_prefix, preimage)| {
-                    Self::store_matrix_checkpoint(preimage, &id_prefix);
+                gate_jobs.into_par_iter().for_each(|(id_prefix, preimage_bytes)| {
+                    Self::store_bytes_checkpoint(preimage_bytes, &id_prefix);
                 });
             }
         }
@@ -838,7 +1062,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::BggPublicKeySTEvaluator;
+    use super::{
+        BggPublicKeySTEvaluator, read_matrix_from_column_chunks, trapdoor_public_column_count,
+    };
     use crate::{
         __PAIR, __TestState,
         bgg::public_key::BggPublicKey,
@@ -1213,20 +1439,18 @@ mod tests {
             );
             assert_eq!(a_i, expected_a_i);
 
-            let slot_preimage_b0 = read_matrix_from_multi_batch::<DCRTPolyMatrix>(
+            let slot_preimage_b0 = read_matrix_from_column_chunks::<DCRTPolyMatrix>(
                 &params,
                 dir,
                 &format!("{checkpoint_prefix}_slot_preimage_b0_{slot_idx}"),
-                0,
-            )
-            .expect("slot preimage in b0 basis should exist");
-            let slot_preimage_b1 = read_matrix_from_multi_batch::<DCRTPolyMatrix>(
+                trapdoor_public_column_count::<DCRTPolyMatrix>(&params, secret_size * 2),
+            );
+            let slot_preimage_b1 = read_matrix_from_column_chunks::<DCRTPolyMatrix>(
                 &params,
                 dir,
                 &format!("{checkpoint_prefix}_slot_preimage_b1_{slot_idx}"),
-                0,
-            )
-            .expect("slot preimage in b1 basis should exist");
+                m_g,
+            );
 
             let expected_target_b0 = s_i.clone().concat_columns(&[&identity]) * &b1_matrix;
             let neg_slot_secret_gadget = -(s_i.clone() * &gadget_matrix);
@@ -1258,13 +1482,12 @@ mod tests {
                 m_g,
                 DistType::FinRingDist,
             );
-            let gate_preimage = read_matrix_from_multi_batch::<DCRTPolyMatrix>(
+            let gate_preimage = read_matrix_from_column_chunks::<DCRTPolyMatrix>(
                 &params,
                 dir,
                 &format!("{checkpoint_prefix}_gate_preimage_{}_dst{}", transferred_gate, dst_slot),
-                0,
-            )
-            .expect("gate preimage checkpoint should exist");
+                m_g,
+            );
 
             let rhs = match scalar {
                 Some(scalar) => {

@@ -65,23 +65,10 @@ where
     M: PolyMatrix,
 {
     let gadget_matrix_bytes = Arc::<[u8]>::from(shared.gadget_matrix.as_ref().to_compact_bytes());
-    let preimage_gate1_bytes = Arc::<[u8]>::from(shared.preimage_gate1.as_ref().to_compact_bytes());
-    let preimage_gate2_identity_bytes =
-        Arc::<[u8]>::from(shared.preimage_gate2_identity.as_ref().to_compact_bytes());
-    let preimage_gate2_gy_bytes =
-        Arc::<[u8]>::from(shared.preimage_gate2_gy.as_ref().to_compact_bytes());
-    let preimage_gate2_v_bytes =
-        Arc::<[u8]>::from(shared.preimage_gate2_v.as_ref().to_compact_bytes());
-    let preimage_gate2_vx_chunk_bytes = shared
-        .preimage_gate2_vx_chunks
-        .iter()
-        .map(|chunk: &Arc<M>| Arc::<[u8]>::from(chunk.as_ref().to_compact_bytes()))
-        .collect::<Vec<_>>();
-    let u_g_decomposed_bytes = Arc::<[u8]>::from(shared.u_g_decomposed.as_ref().to_compact_bytes());
     let out_pubkey_matrix_bytes = Arc::<[u8]>::from(shared.out_pubkey.matrix.to_compact_bytes());
 
     slot_device_ids()
-        .into_iter()
+        .into_par_iter()
         .map(|device_id| {
             let local_params = params.params_for_device(device_id);
             GpuPublicLookupSharedByDevice {
@@ -95,32 +82,15 @@ where
                         &local_params,
                         gadget_matrix_bytes.as_ref(),
                     )),
-                    preimage_gate1: Arc::new(M::from_compact_bytes(
-                        &local_params,
-                        preimage_gate1_bytes.as_ref(),
-                    )),
-                    preimage_gate2_identity: Arc::new(M::from_compact_bytes(
-                        &local_params,
-                        preimage_gate2_identity_bytes.as_ref(),
-                    )),
-                    preimage_gate2_gy: Arc::new(M::from_compact_bytes(
-                        &local_params,
-                        preimage_gate2_gy_bytes.as_ref(),
-                    )),
-                    preimage_gate2_v: Arc::new(M::from_compact_bytes(
-                        &local_params,
-                        preimage_gate2_v_bytes.as_ref(),
-                    )),
-                    preimage_gate2_vx_chunks: preimage_gate2_vx_chunk_bytes
-                        .iter()
-                        .map(|chunk_bytes: &Arc<[u8]>| {
-                            Arc::new(M::from_compact_bytes(&local_params, chunk_bytes.as_ref()))
-                        })
-                        .collect(),
-                    u_g_decomposed: Arc::new(M::from_compact_bytes(
-                        &local_params,
-                        u_g_decomposed_bytes.as_ref(),
-                    )),
+                    preimage_gate1_id_prefix: shared.preimage_gate1_id_prefix.clone(),
+                    preimage_gate2_identity_id_prefix: shared
+                        .preimage_gate2_identity_id_prefix
+                        .clone(),
+                    preimage_gate2_gy_id_prefix: shared.preimage_gate2_gy_id_prefix.clone(),
+                    preimage_gate2_v_id_prefix: shared.preimage_gate2_v_id_prefix.clone(),
+                    preimage_gate2_vx_small_id_prefixes: shared
+                        .preimage_gate2_vx_small_id_prefixes
+                        .clone(),
                     out_pubkey: BggPublicKey {
                         matrix: M::from_compact_bytes(
                             &local_params,

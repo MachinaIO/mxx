@@ -209,6 +209,11 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             let public_left = public_matrix.slice(0, d, 0, p1_rows);
             let public_right = public_matrix.slice(0, d, p1_rows, p1_rows + p2_rows);
             let p_hat_image = (&public_left * &p1) + (&public_right * &p2);
+            let p_hat_image = if p_hat_image.col_size() == target_cols {
+                p_hat_image
+            } else {
+                p_hat_image.slice_columns(0, target_cols)
+            };
             target - &p_hat_image
         };
         tracing::debug!(

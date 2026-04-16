@@ -892,9 +892,7 @@ mod tests {
             gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
             trapdoor::GpuDCRTPolyTrapdoorSampler,
         },
-        slot_transfer::bgg_pubkey::{
-            BggPublicKeySTEvaluator, read_matrix_from_column_chunks, trapdoor_public_column_count,
-        },
+        slot_transfer::bgg_pubkey::{BggPublicKeySTEvaluator, trapdoor_public_column_count},
         storage::{
             read::read_matrix_from_multi_batch,
             write::{init_storage_system, storage_test_lock, wait_for_all_writes},
@@ -926,6 +924,55 @@ mod tests {
                 unsafe { std::env::remove_var(self.key) };
             }
         }
+    }
+
+    fn concat_column_chunks<M>(chunks: Vec<M>) -> M
+    where
+        M: PolyMatrix,
+    {
+        let mut chunk_iter = chunks.into_iter();
+        let first = chunk_iter.next().expect("column chunk list must be non-empty");
+        first.concat_columns_owned(chunk_iter.collect())
+    }
+
+    fn read_matrix_from_column_chunks<M>(
+        params: &<M::P as Poly>::Params,
+        dir: &Path,
+        id_prefix: &str,
+        total_cols: usize,
+    ) -> M
+    where
+        M: PolyMatrix,
+    {
+        let chunk_count = super::column_chunk_count(total_cols);
+        let mut chunks = Vec::with_capacity(chunk_count);
+        for chunk_idx in 0..chunk_count {
+            let (_, expected_cols) = super::column_chunk_bounds(total_cols, chunk_idx);
+            let chunk_prefix = super::column_chunk_id_prefix(id_prefix, chunk_idx);
+            let chunk = if let Some(matrix) =
+                read_matrix_from_multi_batch::<M>(params, dir, &chunk_prefix, 0)
+            {
+                matrix
+            } else {
+                let bytes = super::read_bytes_from_multi_batch(dir, &chunk_prefix, 0)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "missing slot-transfer checkpoint bytes for {id_prefix} chunk {chunk_idx}"
+                        )
+                    });
+                M::from_compact_bytes(params, &bytes)
+            };
+            assert_eq!(
+                chunk.col_size(),
+                expected_cols,
+                "slot-transfer checkpoint chunk {} must have {} columns for {}",
+                chunk_idx,
+                expected_cols,
+                id_prefix
+            );
+            chunks.push(chunk);
+        }
+        concat_column_chunks(chunks)
     }
 
     struct DummyPubKeyPltEvaluator;

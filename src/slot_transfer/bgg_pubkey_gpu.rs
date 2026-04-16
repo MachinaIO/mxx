@@ -671,17 +671,17 @@ where
     US: PolyUniformSampler<M = M> + Send + Sync,
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
-    <M::P as Poly>::Params: Default,
 {
-    fn sample_aux_matrices_slot_time(&self) -> SampleAuxBenchEstimate {
-        let params = <M::P as Poly>::Params::default();
-        let trap_sampler = TS::new(&params, self.trapdoor_sigma);
-        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(&params, self.secret_size);
+    type Params = <M::P as Poly>::Params;
+
+    fn sample_aux_matrices_slot_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate {
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, self.secret_size);
         let b1_size =
             self.secret_size.checked_mul(2).expect("slot-transfer benchmark b1 size overflow");
-        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, b1_size);
+        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, b1_size);
         let gpu_shared = self.prepare_gpu_device_shared(
-            &params,
+            params,
             &b0_matrix,
             &b0_trapdoor,
             &b1_matrix,
@@ -706,20 +706,19 @@ where
         }
     }
 
-    fn sample_aux_matrices_gate_time(&self) -> SampleAuxBenchEstimate {
-        let params = <M::P as Poly>::Params::default();
-        let trap_sampler = TS::new(&params, self.trapdoor_sigma);
-        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(&params, self.secret_size);
+    fn sample_aux_matrices_gate_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate {
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, self.secret_size);
         let b1_size =
             self.secret_size.checked_mul(2).expect("slot-transfer benchmark b1 size overflow");
-        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, b1_size);
+        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, b1_size);
         let benchmark_num_slots = self.num_slots.max(1);
         let benchmark_parallelism = crate::env::slot_transfer_slot_parallelism()
             .max(1)
             .min(benchmark_num_slots)
             .min(detected_gpu_device_ids().len().max(1));
         let gpu_shared = self.prepare_gpu_device_shared(
-            &params,
+            params,
             &b0_matrix,
             &b0_trapdoor,
             &b1_matrix,
@@ -730,7 +729,7 @@ where
             .map(|_| {
                 US::new()
                     .sample_uniform(
-                        &params,
+                        params,
                         self.secret_size,
                         self.secret_size,
                         DistType::TernaryDist,
@@ -747,7 +746,7 @@ where
             slot_a_bytes_by_slot[sample.slot_idx] = sample.slot_a.to_compact_bytes();
         }
         let state = BggPublicKeySTGateState {
-            input_pubkey_bytes: M::gadget_matrix(&params, self.secret_size).into_compact_bytes(),
+            input_pubkey_bytes: M::gadget_matrix(params, self.secret_size).into_compact_bytes(),
             src_slots: (0..benchmark_num_slots).map(|slot_idx| (slot_idx as u32, None)).collect(),
         };
         let slot_chunk = state.src_slots.iter().copied().enumerate().collect::<Vec<_>>();
@@ -908,7 +907,7 @@ mod tests {
         let input_gates = circuit.input(num_inputs);
         let transferred_gates = input_gates
             .iter()
-            .map(|&gate| circuit.slot_transfer_gate(gate, &src_slots))
+            .map(|gate| circuit.slot_transfer_gate(gate, &src_slots))
             .collect::<Vec<_>>();
         circuit.output(transferred_gates.clone());
 
@@ -935,9 +934,10 @@ mod tests {
         );
 
         assert_eq!(outputs.len(), transferred_gates.len());
-        for ((output, input), gate_id) in
+        for ((output, input), gate) in
             outputs.iter().zip(inputs.iter()).zip(transferred_gates.iter())
         {
+            let gate_id = gate.as_single_wire();
             let expected_matrix = GpuDCRTPolyHashSampler::<Keccak256>::new().sample_hash(
                 &params,
                 hash_key,
@@ -948,7 +948,7 @@ mod tests {
             );
             assert_eq!(*output, BggPublicKey::new(expected_matrix, true));
 
-            let stored = evaluator.gate_state(*gate_id).expect("missing stored gate state");
+            let stored = evaluator.gate_state(gate_id).expect("missing stored gate state");
             assert_eq!(stored.input_pubkey_bytes, input.matrix.to_compact_bytes());
             assert_eq!(stored.src_slots, src_slots);
         }
@@ -1002,7 +1002,8 @@ mod tests {
             let mut circuit = PolyCircuit::new();
             let inputs = circuit.input(1);
             let src_slots = [(1, None), (2, Some(3)), (0, Some(5))];
-            let transferred = circuit.slot_transfer_gate(inputs[0], &src_slots);
+            let transferred = circuit.slot_transfer_gate(inputs.at(0), &src_slots);
+            let transferred_gate = transferred.as_single_wire();
             circuit.output(vec![transferred]);
 
             let evaluator = BggPublicKeySTEvaluator::<
@@ -1088,7 +1089,7 @@ mod tests {
             let a_out = GpuDCRTPolyHashSampler::<Keccak256>::new().sample_hash(
                 &params,
                 hash_key,
-                format!("slot_transfer_gate_a_out_{}", transferred),
+                format!("slot_transfer_gate_a_out_{}", transferred_gate),
                 secret_size,
                 m_g,
                 DistType::FinRingDist,
@@ -1115,7 +1116,10 @@ mod tests {
                 let gate_preimage = read_matrix_from_multi_batch::<GpuDCRTPolyMatrix>(
                     &params,
                     dir,
-                    &format!("{checkpoint_prefix}_gate_preimage_{}_dst{}", transferred, dst_slot),
+                    &format!(
+                        "{checkpoint_prefix}_gate_preimage_{}_dst{}",
+                        transferred_gate, dst_slot
+                    ),
                     0,
                 )
                 .expect("gpu gate preimage checkpoint should exist");

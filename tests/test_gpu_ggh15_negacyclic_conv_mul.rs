@@ -509,16 +509,16 @@ fn build_benchmark_public_lookup_gate(
 ) -> (PublicLut<GpuDCRTPoly>, usize, GateId) {
     let lut = build_benchmark_public_lut(params);
     let mut circuit = PolyCircuit::<GpuDCRTPoly>::new();
-    let input = circuit.input(1)[0];
+    let input = circuit.input(1).at(0);
     let lut_id = circuit.register_public_lookup(lut.clone());
-    let gate_id = circuit.public_lookup_gate(input, lut_id);
+    let gate_id = circuit.public_lookup_gate(input, lut_id).as_single_wire();
     (lut, lut_id, gate_id)
 }
 
 fn build_benchmark_slot_transfer_gate(src_slots: &[(u32, Option<u32>)]) -> GateId {
     let mut circuit = PolyCircuit::<GpuDCRTPoly>::new();
-    let input = circuit.input(1)[0];
-    circuit.slot_transfer_gate(input, src_slots)
+    let input = circuit.input(1).at(0);
+    circuit.slot_transfer_gate(input, src_slots).as_single_wire()
 }
 
 fn identity_slot_transfer_plan(num_slots: usize) -> Vec<(u32, Option<u32>)> {

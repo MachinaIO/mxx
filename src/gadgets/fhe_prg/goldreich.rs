@@ -31,7 +31,7 @@ use digest::Digest;
 use keccak_asm::Keccak256;
 use rayon::prelude::*;
 use std::{collections::HashSet, sync::Arc};
-
+use tracing::debug;
 /// Public graph-generation options for the Goldreich/TSA PRG.
 ///
 /// The default mode rejects only role-aware duplicates:
@@ -347,7 +347,8 @@ impl<P: Poly + 'static> GoldreichFhePrg<P> {
             );
         }
 
-        self.public_graph
+        let outputs = self
+            .public_graph
             .edges
             .iter()
             .map(|edge| {
@@ -364,7 +365,14 @@ impl<P: Poly + 'static> GoldreichFhePrg<P> {
                     |lhs, rhs, circuit| lhs.xor(rhs, circuit),
                 )
             })
-            .collect()
+            .collect::<Vec<_>>();
+        debug!(
+            "Goldreich PRG evaluated {} edges with Ring-GSW ciphertexts: input_size={}, output_size={}",
+            outputs.len(),
+            self.input_size,
+            self.output_size,
+        );
+        outputs
     }
 }
 
@@ -724,7 +732,7 @@ mod tests {
         let graph_seed = sample_graph_seed();
         let goldreich = GoldreichFhePrg::setup(ring_gsw.clone(), 5, 1, graph_seed);
         let encrypted_inputs = (0..goldreich.input_size)
-            .map(|_| RingGswCiphertext::input(ring_gsw.clone(), &mut circuit))
+            .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
             .collect::<Vec<_>>();
         let encrypted_outputs = goldreich.evaluate(&encrypted_inputs, &mut circuit);
         let reconstructed_outputs = encrypted_outputs
@@ -808,8 +816,8 @@ mod tests {
     #[ignore = "expensive circuit-structure reporting test; run with --ignored --nocapture"]
     fn test_goldreich_ring_gsw_large_circuit_non_free_depth_metrics() {
         let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
-        let ring_dim = 1u32 << 10;
-        let num_slots = 1usize << 10;
+        let ring_dim = 1u32 << 16;
+        let num_slots = 1usize << 16;
         let active_levels = 1usize;
         let crt_bits = 24usize;
         let p_moduli_bits = 7usize;
@@ -830,7 +838,7 @@ mod tests {
         let graph_seed = sample_graph_seed();
         let goldreich = GoldreichFhePrg::setup(ring_gsw.clone(), 5, 1, graph_seed);
         let encrypted_inputs = (0..goldreich.input_size)
-            .map(|_| RingGswCiphertext::input(ring_gsw.clone(), &mut circuit))
+            .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
             .collect::<Vec<_>>();
         let encrypted_outputs = goldreich.evaluate(&encrypted_inputs, &mut circuit);
         let reconstructed_outputs = encrypted_outputs

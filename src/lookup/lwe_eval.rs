@@ -374,7 +374,7 @@ mod test {
         let plt = setup_lsb_bit_lut(16, &params);
         // Create a simple circuit with the lookup table
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(1);
+        let inputs = circuit.input(1).to_vec();
         let plt_id = circuit.register_public_lookup(plt.clone());
         let output = circuit.public_lookup_gate(inputs[0], plt_id);
         circuit.output(vec![output]);

@@ -97,10 +97,10 @@ fn build_modp_chain_circuit_cpu(params: &DCRTPolyParams, p: u64) -> PolyCircuit<
 
     let lut_id = circuit.register_public_lookup(build_mod_p_lut_cpu(params, p));
 
-    let t1 = circuit.mul_gate(inputs[0], inputs[1]);
+    let t1 = circuit.mul_gate(inputs.at(0), inputs.at(1));
     let t1_mod = circuit.public_lookup_gate(t1, lut_id);
 
-    let t2 = circuit.mul_gate(t1_mod, inputs[2]);
+    let t2 = circuit.mul_gate(t1_mod, inputs.at(2));
     let t2_mod = circuit.public_lookup_gate(t2, lut_id);
     circuit.output(vec![t2_mod]);
     circuit
@@ -148,6 +148,7 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, BigUint) {
             circuit.num_input(),
             &e_init_norm,
             Some(&plt_evaluator),
+            None,
         );
 
         let max_error = out_errors
@@ -213,10 +214,10 @@ fn build_modp_chain_circuit_gpu(params: &GpuDCRTPolyParams, p: u64) -> PolyCircu
 
     let lut_id = circuit.register_public_lookup(build_mod_p_lut_gpu(params, p));
 
-    let t1 = circuit.mul_gate(inputs[0], inputs[1]);
+    let t1 = circuit.mul_gate(inputs.at(0), inputs.at(1));
     let t1_mod = circuit.public_lookup_gate(t1, lut_id);
 
-    let t2 = circuit.mul_gate(t1_mod, inputs[2]);
+    let t2 = circuit.mul_gate(t1_mod, inputs.at(2));
     let t2_mod = circuit.public_lookup_gate(t2, lut_id);
     circuit.output(vec![t2_mod]);
     circuit

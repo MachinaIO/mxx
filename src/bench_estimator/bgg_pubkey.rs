@@ -9,6 +9,7 @@ use crate::{
     slot_transfer::SlotTransferEvaluator,
 };
 use num_bigint::BigUint;
+use tracing::debug;
 
 use super::{
     BenchEstimator, CircuitBenchEstimate, benchmark_gate_operation, measure_bench_operation,
@@ -26,8 +27,10 @@ pub struct SampleAuxBenchEstimate {
 }
 
 pub trait PublicLutSampleAuxBenchEstimator {
-    fn sample_aux_matrices_lut_entry_time(&self) -> SampleAuxBenchEstimate;
-    fn sample_aux_matrices_lut_gate_time(&self) -> SampleAuxBenchEstimate;
+    type Params;
+
+    fn sample_aux_matrices_lut_entry_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate;
+    fn sample_aux_matrices_lut_gate_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate;
 
     fn benchmark_public_lut_gate_time<R, F>(&self, iterations: usize, op: F) -> f64
     where
@@ -38,8 +41,10 @@ pub trait PublicLutSampleAuxBenchEstimator {
 }
 
 pub trait SlotTransferSampleAuxBenchEstimator {
-    fn sample_aux_matrices_slot_time(&self) -> SampleAuxBenchEstimate;
-    fn sample_aux_matrices_gate_time(&self) -> SampleAuxBenchEstimate;
+    type Params;
+
+    fn sample_aux_matrices_slot_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate;
+    fn sample_aux_matrices_gate_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate;
 
     fn benchmark_slot_transfer_gate_time<R, F>(&self, iterations: usize, op: F) -> f64
     where
@@ -74,8 +79,8 @@ pub struct BggPublicKeyBenchSamples<'a, M: PolyMatrix> {
 pub struct BggPublicKeyBenchEstimator<M, PLE, STE>
 where
     M: PolyMatrix,
-    PLE: PublicLutSampleAuxBenchEstimator,
-    STE: SlotTransferSampleAuxBenchEstimator,
+    PLE: PublicLutSampleAuxBenchEstimator<Params = <M::P as Poly>::Params>,
+    STE: SlotTransferSampleAuxBenchEstimator<Params = <M::P as Poly>::Params>,
 {
     pub input_time: f64,
     pub input_peak_vram: usize,
@@ -101,8 +106,8 @@ where
 impl<M, PLE, STE> BggPublicKeyBenchEstimator<M, PLE, STE>
 where
     M: PolyMatrix,
-    PLE: PublicLutSampleAuxBenchEstimator,
-    STE: SlotTransferSampleAuxBenchEstimator,
+    PLE: PublicLutSampleAuxBenchEstimator<Params = <M::P as Poly>::Params>,
+    STE: SlotTransferSampleAuxBenchEstimator<Params = <M::P as Poly>::Params>,
 {
     pub fn benchmark<PE, SE>(
         samples: &BggPublicKeyBenchSamples<'_, M>,
@@ -118,16 +123,27 @@ where
     {
         let add_bench =
             benchmark_gate_operation(iterations, || samples.add_lhs.clone() + samples.add_rhs);
+        debug!("BggPublicKeyBenchEstimator::benchmark add_bench={:?}", add_bench);
         let sub_bench =
             benchmark_gate_operation(iterations, || samples.sub_lhs.clone() - samples.sub_rhs);
+        debug!("BggPublicKeyBenchEstimator::benchmark sub_bench={:?}", sub_bench);
         let mul_bench =
             benchmark_gate_operation(iterations, || samples.mul_lhs.clone() * samples.mul_rhs);
+        debug!("BggPublicKeyBenchEstimator::benchmark mul_bench={:?}", mul_bench);
         let small_scalar_mul_bench = benchmark_gate_operation(iterations, || {
             samples.small_scalar_input.small_scalar_mul(samples.params, samples.small_scalar)
         });
+        debug!(
+            "BggPublicKeyBenchEstimator::benchmark small_scalar_mul_bench={:?}",
+            small_scalar_mul_bench
+        );
         let large_scalar_mul_bench = benchmark_gate_operation(iterations, || {
             samples.large_scalar_input.large_scalar_mul(samples.params, samples.large_scalar)
         });
+        debug!(
+            "BggPublicKeyBenchEstimator::benchmark large_scalar_mul_bench={:?}",
+            large_scalar_mul_bench
+        );
         let public_lut_bench = benchmark_gate_operation(iterations, || {
             public_lut_evaluator.public_lookup(
                 samples.params,
@@ -138,6 +154,7 @@ where
                 samples.public_lut_id,
             )
         });
+        debug!("BggPublicKeyBenchEstimator::benchmark public_lut_bench={:?}", public_lut_bench);
         let slot_transfer_bench = benchmark_gate_operation(iterations, || {
             slot_transfer_evaluator.slot_transfer(
                 samples.params,
@@ -146,6 +163,10 @@ where
                 samples.slot_transfer_gate_id,
             )
         });
+        debug!(
+            "BggPublicKeyBenchEstimator::benchmark slot_transfer_bench={:?}",
+            slot_transfer_bench
+        );
 
         Self {
             input_time: 0.0,
@@ -172,12 +193,17 @@ where
 
     pub fn estimate_public_lut_sample_aux_matrices(
         &self,
+        params: &<M::P as Poly>::Params,
         total_lut_entries: usize,
         total_lut_gates: usize,
     ) -> SampleAuxBenchEstimate {
-        let lut_entry_time = self.public_lut_estimator.sample_aux_matrices_lut_entry_time();
-        let lut_gate_time = self.public_lut_estimator.sample_aux_matrices_lut_gate_time();
-        SampleAuxBenchEstimate {
+        let lut_entry_time = self.public_lut_estimator.sample_aux_matrices_lut_entry_time(params);
+        let lut_gate_time = self.public_lut_estimator.sample_aux_matrices_lut_gate_time(params);
+        debug!(
+            "BggPublicKeyBenchEstimator::estimate_public_lut_sample_aux_matrices components: total_lut_entries={}, total_lut_gates={}, lut_entry_time={:?}, lut_gate_time={:?}",
+            total_lut_entries, total_lut_gates, lut_entry_time, lut_gate_time
+        );
+        let estimate = SampleAuxBenchEstimate {
             total_time: lut_entry_time.total_time * total_lut_entries as f64 +
                 lut_gate_time.total_time * total_lut_gates as f64,
             latency: lut_entry_time.latency + lut_gate_time.latency,
@@ -191,17 +217,27 @@ where
                         .and_then(|gate_bytes| entry_bytes.checked_add(gate_bytes))
                 })
                 .expect("public LUT sample-aux compact_bytes overflowed u64"),
-        }
+        };
+        debug!(
+            "BggPublicKeyBenchEstimator::estimate_public_lut_sample_aux_matrices estimate={:?}",
+            estimate
+        );
+        estimate
     }
 
     pub fn estimate_slot_transfer_sample_aux_matrices(
         &self,
+        params: &<M::P as Poly>::Params,
         num_slots: usize,
         slot_transfer_gate_count: usize,
     ) -> SampleAuxBenchEstimate {
-        let slot_time = self.slot_transfer_estimator.sample_aux_matrices_slot_time();
-        let gate_time = self.slot_transfer_estimator.sample_aux_matrices_gate_time();
-        SampleAuxBenchEstimate {
+        let slot_time = self.slot_transfer_estimator.sample_aux_matrices_slot_time(params);
+        let gate_time = self.slot_transfer_estimator.sample_aux_matrices_gate_time(params);
+        debug!(
+            "BggPublicKeyBenchEstimator::estimate_slot_transfer_sample_aux_matrices components: num_slots={}, slot_transfer_gate_count={}, slot_time={:?}, gate_time={:?}",
+            num_slots, slot_transfer_gate_count, slot_time, gate_time
+        );
+        let estimate = SampleAuxBenchEstimate {
             total_time: slot_time.total_time * num_slots as f64 +
                 gate_time.total_time * slot_transfer_gate_count as f64,
             latency: slot_time.latency + gate_time.latency,
@@ -215,15 +251,20 @@ where
                         .and_then(|gate_bytes| slot_bytes.checked_add(gate_bytes))
                 })
                 .expect("slot-transfer sample-aux compact_bytes overflowed u64"),
-        }
+        };
+        debug!(
+            "BggPublicKeyBenchEstimator::estimate_slot_transfer_sample_aux_matrices estimate={:?}",
+            estimate
+        );
+        estimate
     }
 }
 
 impl<M, PLE, STE> BenchEstimator<BggPublicKey<M>> for BggPublicKeyBenchEstimator<M, PLE, STE>
 where
     M: PolyMatrix,
-    PLE: PublicLutSampleAuxBenchEstimator,
-    STE: SlotTransferSampleAuxBenchEstimator,
+    PLE: PublicLutSampleAuxBenchEstimator<Params = <M::P as Poly>::Params>,
+    STE: SlotTransferSampleAuxBenchEstimator<Params = <M::P as Poly>::Params>,
 {
     fn estimate_input(&self) -> CircuitBenchEstimate {
         per_gate_time_estimate(self.input_time, self.input_peak_vram)
@@ -270,6 +311,18 @@ mod tests {
             SampleAuxBenchEstimate, SlotTransferSampleAuxBenchEstimator,
         },
         matrix::dcrt_poly::DCRTPolyMatrix,
+        poly::{Poly, dcrt::poly::DCRTPoly},
+    };
+    #[cfg(feature = "gpu")]
+    use crate::{
+        lookup::ggh15_eval::GGH15BGGPubKeyPltEvaluator,
+        matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix,
+        poly::dcrt::gpu::{GpuDCRTPolyParams, gpu_device_sync},
+        sampler::{
+            gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
+            trapdoor::GpuDCRTPolyTrapdoorSampler,
+        },
+        slot_transfer::bgg_pubkey::BggPublicKeySTEvaluator,
     };
     #[cfg(not(feature = "gpu"))]
     use crate::{
@@ -280,21 +333,31 @@ mod tests {
         },
         slot_transfer::bgg_pubkey::BggPublicKeySTEvaluator,
     };
+    #[cfg(feature = "gpu")]
+    use keccak_asm::Keccak256;
     #[cfg(not(feature = "gpu"))]
     use keccak_asm::Keccak256;
     use sequential_test::sequential;
     use std::marker::PhantomData;
-    #[cfg(not(feature = "gpu"))]
+    #[cfg(any(feature = "gpu", not(feature = "gpu")))]
     use tempfile::tempdir;
 
     struct DummyPublicLutEstimator;
 
     impl PublicLutSampleAuxBenchEstimator for DummyPublicLutEstimator {
-        fn sample_aux_matrices_lut_entry_time(&self) -> SampleAuxBenchEstimate {
+        type Params = <DCRTPoly as Poly>::Params;
+
+        fn sample_aux_matrices_lut_entry_time(
+            &self,
+            _params: &Self::Params,
+        ) -> SampleAuxBenchEstimate {
             SampleAuxBenchEstimate { latency: 3.0, total_time: 5.0, compact_bytes: 7 }
         }
 
-        fn sample_aux_matrices_lut_gate_time(&self) -> SampleAuxBenchEstimate {
+        fn sample_aux_matrices_lut_gate_time(
+            &self,
+            _params: &Self::Params,
+        ) -> SampleAuxBenchEstimate {
             SampleAuxBenchEstimate { latency: 7.0, total_time: 11.0, compact_bytes: 13 }
         }
 
@@ -309,11 +372,13 @@ mod tests {
     struct DummySlotTransferEstimator;
 
     impl SlotTransferSampleAuxBenchEstimator for DummySlotTransferEstimator {
-        fn sample_aux_matrices_slot_time(&self) -> SampleAuxBenchEstimate {
+        type Params = <DCRTPoly as Poly>::Params;
+
+        fn sample_aux_matrices_slot_time(&self, _params: &Self::Params) -> SampleAuxBenchEstimate {
             SampleAuxBenchEstimate { latency: 19.0, total_time: 23.0, compact_bytes: 29 }
         }
 
-        fn sample_aux_matrices_gate_time(&self) -> SampleAuxBenchEstimate {
+        fn sample_aux_matrices_gate_time(&self, _params: &Self::Params) -> SampleAuxBenchEstimate {
             SampleAuxBenchEstimate { latency: 29.0, total_time: 31.0, compact_bytes: 37 }
         }
 
@@ -357,14 +422,15 @@ mod tests {
     #[sequential]
     fn test_bgg_pubkey_bench_estimator_uses_requested_formulas_and_measured_gate_times() {
         let estimator = test_estimator();
+        let params = <DCRTPoly as Poly>::Params::default();
 
-        let public_lut = estimator.estimate_public_lut_sample_aux_matrices(4, 2);
+        let public_lut = estimator.estimate_public_lut_sample_aux_matrices(&params, 4, 2);
         assert_eq!(
             public_lut,
             SampleAuxBenchEstimate { total_time: 42.0, latency: 10.0, compact_bytes: 54 }
         );
 
-        let slot_transfer = estimator.estimate_slot_transfer_sample_aux_matrices(3, 2);
+        let slot_transfer = estimator.estimate_slot_transfer_sample_aux_matrices(&params, 3, 2);
         assert_eq!(
             slot_transfer,
             SampleAuxBenchEstimate { total_time: 131.0, latency: 48.0, compact_bytes: 161 }
@@ -419,8 +485,9 @@ mod tests {
             DCRTPolyHashSampler<Keccak256>,
             DCRTPolyTrapdoorSampler,
         >::new([0x11u8; 32], 2, 4.578, 0.0, dir.path().to_path_buf());
-        let lut_entry = plt_estimator.sample_aux_matrices_lut_entry_time();
-        let lut_gate = plt_estimator.sample_aux_matrices_lut_gate_time();
+        let params = <DCRTPoly as Poly>::Params::default();
+        let lut_entry = plt_estimator.sample_aux_matrices_lut_entry_time(&params);
+        let lut_gate = plt_estimator.sample_aux_matrices_lut_gate_time(&params);
         assert!(lut_entry.latency >= 0.0);
         assert_eq!(lut_entry.latency, lut_entry.total_time);
         assert!(lut_entry.compact_bytes > 0);
@@ -434,13 +501,52 @@ mod tests {
             DCRTPolyHashSampler<Keccak256>,
             DCRTPolyTrapdoorSampler,
         >::new([0x22u8; 32], 2, 2, 4.578, 0.0, dir.path().to_path_buf());
-        let slot_time = st_estimator.sample_aux_matrices_slot_time();
-        let gate_time = st_estimator.sample_aux_matrices_gate_time();
+        let slot_time = st_estimator.sample_aux_matrices_slot_time(&params);
+        let gate_time = st_estimator.sample_aux_matrices_gate_time(&params);
         assert!(slot_time.latency >= 0.0);
         assert_eq!(slot_time.latency, slot_time.total_time);
         assert!(slot_time.compact_bytes > 0);
         assert!(gate_time.latency >= 0.0);
         assert_eq!(gate_time.latency, gate_time.total_time);
         assert!(gate_time.compact_bytes > 0);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    #[sequential]
+    fn test_real_gpu_pubkey_aux_estimators_use_explicit_params() {
+        gpu_device_sync();
+        let dir = tempdir().expect("temporary benchmark dir should be created");
+        let params = GpuDCRTPolyParams::default();
+        let plt_estimator = GGH15BGGPubKeyPltEvaluator::<
+            GpuDCRTPolyMatrix,
+            GpuDCRTPolyUniformSampler,
+            GpuDCRTPolyHashSampler<Keccak256>,
+            GpuDCRTPolyTrapdoorSampler,
+        >::new([0x11u8; 32], 2, 4.578, 0.0, dir.path().to_path_buf());
+        let lut_entry = plt_estimator.sample_aux_matrices_lut_entry_time(&params);
+        let lut_gate = plt_estimator.sample_aux_matrices_lut_gate_time(&params);
+        assert!(lut_entry.latency >= 0.0);
+        assert_eq!(lut_entry.latency, lut_entry.total_time);
+        assert!(lut_entry.compact_bytes > 0);
+        assert!(lut_gate.latency >= 0.0);
+        assert_eq!(lut_gate.latency, lut_gate.total_time);
+        assert!(lut_gate.compact_bytes > 0);
+
+        let st_estimator = BggPublicKeySTEvaluator::<
+            GpuDCRTPolyMatrix,
+            GpuDCRTPolyUniformSampler,
+            GpuDCRTPolyHashSampler<Keccak256>,
+            GpuDCRTPolyTrapdoorSampler,
+        >::new([0x22u8; 32], 2, 2, 4.578, 0.0, dir.path().to_path_buf());
+        let slot_time = st_estimator.sample_aux_matrices_slot_time(&params);
+        let gate_time = st_estimator.sample_aux_matrices_gate_time(&params);
+        assert!(slot_time.latency >= 0.0);
+        assert_eq!(slot_time.latency, slot_time.total_time);
+        assert!(slot_time.compact_bytes > 0);
+        assert!(gate_time.latency >= 0.0);
+        assert_eq!(gate_time.latency, gate_time.total_time);
+        assert!(gate_time.compact_bytes > 0);
+        gpu_device_sync();
     }
 }

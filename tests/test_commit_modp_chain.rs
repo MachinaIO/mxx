@@ -85,7 +85,7 @@ fn build_mod_p_lut(params: &DCRTPolyParams, p: u64) -> PublicLut<DCRTPoly> {
 
 fn build_modp_chain_circuit(params: &DCRTPolyParams, p: u64) -> PolyCircuit<DCRTPoly> {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
-    let inputs = circuit.input(3);
+    let inputs = circuit.input(3).to_vec();
 
     let lut_id = circuit.register_public_lookup(build_mod_p_lut(params, p));
 
@@ -137,6 +137,7 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
             circuit.num_input(),
             &e_init_norm,
             Some(&plt_evaluator),
+            None,
         );
 
         let max_error = out_errors

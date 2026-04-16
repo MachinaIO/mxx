@@ -11,6 +11,7 @@ use crate::{
     slot_transfer::SlotTransferEvaluator,
 };
 use num_bigint::BigUint;
+use tracing::debug;
 
 fn per_slot_gate_estimate(
     latency: f64,
@@ -274,16 +275,27 @@ where
 
         let add_bench =
             benchmark_gate_operation(iterations, || samples.add_lhs.clone() + samples.add_rhs);
+        debug!("BggPolyEncodingBenchEstimator::benchmark add_bench={:?}", add_bench);
         let sub_bench =
             benchmark_gate_operation(iterations, || samples.sub_lhs.clone() - samples.sub_rhs);
+        debug!("BggPolyEncodingBenchEstimator::benchmark sub_bench={:?}", sub_bench);
         let mul_bench =
             benchmark_gate_operation(iterations, || samples.mul_lhs.clone() * samples.mul_rhs);
+        debug!("BggPolyEncodingBenchEstimator::benchmark mul_bench={:?}", mul_bench);
         let small_scalar_mul_bench = benchmark_gate_operation(iterations, || {
             samples.small_scalar_input.small_scalar_mul(samples.params, samples.small_scalar)
         });
+        debug!(
+            "BggPolyEncodingBenchEstimator::benchmark small_scalar_mul_bench={:?}",
+            small_scalar_mul_bench
+        );
         let large_scalar_mul_bench = benchmark_gate_operation(iterations, || {
             samples.large_scalar_input.large_scalar_mul(samples.params, samples.large_scalar)
         });
+        debug!(
+            "BggPolyEncodingBenchEstimator::benchmark large_scalar_mul_bench={:?}",
+            large_scalar_mul_bench
+        );
         let public_lut_bench = benchmark_gate_operation(iterations, || {
             public_lut_evaluator.public_lookup(
                 samples.params,
@@ -294,6 +306,7 @@ where
                 samples.public_lut_id,
             )
         });
+        debug!("BggPolyEncodingBenchEstimator::benchmark public_lut_bench={:?}", public_lut_bench);
         let slot_transfer_bench = benchmark_gate_operation(iterations, || {
             slot_transfer_evaluator.slot_transfer(
                 samples.params,
@@ -302,6 +315,10 @@ where
                 samples.slot_transfer_gate_id,
             )
         });
+        debug!(
+            "BggPolyEncodingBenchEstimator::benchmark slot_transfer_bench={:?}",
+            slot_transfer_bench
+        );
 
         Self {
             num_slots: samples.num_slots,

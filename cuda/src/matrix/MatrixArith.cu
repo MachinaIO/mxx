@@ -20,6 +20,7 @@ namespace
     constexpr int kMatmulTileM = GPU_MATMUL_TILE_M;
     constexpr int kMatmulTileN = GPU_MATMUL_TILE_N;
     constexpr int kMatmulTileK = GPU_MATMUL_TILE_K;
+    constexpr size_t kMatmulMaxGridZ = 65535;
     static_assert(kMatmulTileM > 0 && kMatmulTileN > 0 && kMatmulTileK > 0, "invalid matmul tile size");
     static_assert(kMatmulTileM * kMatmulTileN <= 1024, "matmul tile thread count exceeds CUDA limit");
     __global__ void block_elementwise_all_limbs_kernel(
@@ -156,80 +157,78 @@ namespace
         const size_t col_base = static_cast<size_t>(blockIdx.x) * kMatmulTileN;
         const size_t row = row_base + threadIdx.y;
         const size_t col = col_base + threadIdx.x;
-        const size_t coeff_idx = static_cast<size_t>(blockIdx.z);
-        if (coeff_idx >= n)
-        {
-            return;
-        }
-
         const int tid = static_cast<int>(threadIdx.y) * blockDim.x + threadIdx.x;
         const int threads = blockDim.x * blockDim.y;
-
-        uint64_t acc = 0;
-        for (size_t k0 = 0; k0 < inner; k0 += kMatmulTileK)
+        for (size_t coeff_idx = static_cast<size_t>(blockIdx.z);
+             coeff_idx < n;
+             coeff_idx += static_cast<size_t>(gridDim.z))
         {
-            for (int i = tid; i < kMatmulTileM * kMatmulTileK; i += threads)
+            uint64_t acc = 0;
+            for (size_t k0 = 0; k0 < inner; k0 += kMatmulTileK)
             {
-                const int r = i / kMatmulTileK;
-                const int k = i - r * kMatmulTileK;
-                const size_t lhs_row = row_base + static_cast<size_t>(r);
-                const size_t lhs_k = k0 + static_cast<size_t>(k);
-                uint64_t val = 0;
-                if (lhs_row < rows && lhs_k < inner)
+                for (int i = tid; i < kMatmulTileM * kMatmulTileK; i += threads)
                 {
-                    const size_t lhs_poly_idx = lhs_row * inner + lhs_k;
-                    val = matrix_load_limb_u64(
-                        lhs_base,
-                        lhs_poly_idx,
-                        coeff_idx,
-                        lhs_stride_bytes,
-                        lhs_coeff_bytes);
+                    const int r = i / kMatmulTileK;
+                    const int k = i - r * kMatmulTileK;
+                    const size_t lhs_row = row_base + static_cast<size_t>(r);
+                    const size_t lhs_k = k0 + static_cast<size_t>(k);
+                    uint64_t val = 0;
+                    if (lhs_row < rows && lhs_k < inner)
+                    {
+                        const size_t lhs_poly_idx = lhs_row * inner + lhs_k;
+                        val = matrix_load_limb_u64(
+                            lhs_base,
+                            lhs_poly_idx,
+                            coeff_idx,
+                            lhs_stride_bytes,
+                            lhs_coeff_bytes);
+                    }
+                    lhs_tile[r][k] = val;
                 }
-                lhs_tile[r][k] = val;
-            }
-            for (int i = tid; i < kMatmulTileK * kMatmulTileN; i += threads)
-            {
-                const int k = i / kMatmulTileN;
-                const int c = i - k * kMatmulTileN;
-                const size_t rhs_k = k0 + static_cast<size_t>(k);
-                const size_t rhs_col = col_base + static_cast<size_t>(c);
-                uint64_t val = 0;
-                if (rhs_k < inner && rhs_col < cols)
+                for (int i = tid; i < kMatmulTileK * kMatmulTileN; i += threads)
                 {
-                    const size_t rhs_poly_idx = rhs_k * cols + rhs_col;
-                    val = matrix_load_limb_u64(
-                        rhs_base,
-                        rhs_poly_idx,
-                        coeff_idx,
-                        rhs_stride_bytes,
-                        rhs_coeff_bytes);
+                    const int k = i / kMatmulTileN;
+                    const int c = i - k * kMatmulTileN;
+                    const size_t rhs_k = k0 + static_cast<size_t>(k);
+                    const size_t rhs_col = col_base + static_cast<size_t>(c);
+                    uint64_t val = 0;
+                    if (rhs_k < inner && rhs_col < cols)
+                    {
+                        const size_t rhs_poly_idx = rhs_k * cols + rhs_col;
+                        val = matrix_load_limb_u64(
+                            rhs_base,
+                            rhs_poly_idx,
+                            coeff_idx,
+                            rhs_stride_bytes,
+                            rhs_coeff_bytes);
+                    }
+                    rhs_tile[k][c] = val;
                 }
-                rhs_tile[k][c] = val;
+                __syncthreads();
+
+                if (row < rows && col < cols)
+                {
+                    for (int kk = 0; kk < kMatmulTileK; ++kk)
+                    {
+                        const uint64_t prod =
+                            mul_mod_u64(lhs_tile[threadIdx.y][kk], rhs_tile[kk][threadIdx.x], modulus);
+                        acc = add_mod_u64(acc, prod, modulus);
+                    }
+                }
+                __syncthreads();
             }
-            __syncthreads();
 
             if (row < rows && col < cols)
             {
-                for (int kk = 0; kk < kMatmulTileK; ++kk)
-                {
-                    const uint64_t prod =
-                        mul_mod_u64(lhs_tile[threadIdx.y][kk], rhs_tile[kk][threadIdx.x], modulus);
-                    acc = add_mod_u64(acc, prod, modulus);
-                }
+                const size_t out_poly_idx = row * cols + col;
+                matrix_store_limb_u64(
+                    out_base,
+                    out_poly_idx,
+                    coeff_idx,
+                    out_stride_bytes,
+                    out_coeff_bytes,
+                    acc);
             }
-            __syncthreads();
-        }
-
-        if (row < rows && col < cols)
-        {
-            const size_t out_poly_idx = row * cols + col;
-            matrix_store_limb_u64(
-                out_base,
-                out_poly_idx,
-                coeff_idx,
-                out_stride_bytes,
-                out_coeff_bytes,
-                acc);
         }
     }
 
@@ -384,10 +383,11 @@ namespace
         }
 
         const dim3 threads(kMatmulTileN, kMatmulTileM);
+        const size_t grid_z = n < kMatmulMaxGridZ ? n : kMatmulMaxGridZ;
         const dim3 blocks(
             static_cast<unsigned int>((cols + kMatmulTileN - 1) / kMatmulTileN),
             static_cast<unsigned int>((rows + kMatmulTileM - 1) / kMatmulTileM),
-            static_cast<unsigned int>(n));
+            static_cast<unsigned int>(grid_z));
 
         block_matmul_kernel<<<blocks, threads, 0, stream>>>(
             lhs_base,

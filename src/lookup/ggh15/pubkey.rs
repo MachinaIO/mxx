@@ -1240,6 +1240,26 @@ where
         Some(M::from_compact_bytes(params, &bytes))
     }
 
+    pub fn record_public_lookup_state(
+        &self,
+        plt: &PublicLut<<BggPublicKey<M> as Evaluable>::P>,
+        input: &BggPublicKey<M>,
+        gate_id: GateId,
+        lut_id: usize,
+    ) {
+        debug!("Recording public lookup state for gate {}", gate_id);
+        self.lut_state.entry(lut_id).or_insert_with(|| plt.clone());
+        self.gate_state.insert(
+            gate_id,
+            GateState {
+                lut_id,
+                input_pubkey_bytes: input.matrix.to_compact_bytes(),
+                _m: PhantomData,
+            },
+        );
+        debug!("Public lookup state recorded for gate {}", gate_id);
+    }
+
     pub fn sample_aux_matrices(&self, params: &<M::P as Poly>::Params) {
         info!("Sampling LUT and gate auxiliary matrices");
         let start = Instant::now();
@@ -1752,21 +1772,21 @@ where
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
     M::P: 'static,
-    <M::P as Poly>::Params: Default,
 {
-    fn sample_aux_matrices_lut_entry_time(&self) -> SampleAuxBenchEstimate {
-        let params = <M::P as Poly>::Params::default();
+    type Params = <M::P as Poly>::Params;
+
+    fn sample_aux_matrices_lut_entry_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate {
         let lut_id = 0usize;
-        let trap_sampler = TS::new(&params, self.trapdoor_sigma);
-        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, self.d);
-        let w_block_identity = self.derive_w_block_identity(&params, lut_id);
-        let w_block_gy = self.derive_w_block_gy(&params, lut_id);
-        let w_block_v = self.derive_w_block_v(&params, lut_id);
-        let w_block_vx = self.derive_w_block_vx(&params, lut_id);
-        let batch = vec![(0usize, M::P::from_usize_to_constant(&params, 1usize))];
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, self.d);
+        let w_block_identity = self.derive_w_block_identity(params, lut_id);
+        let w_block_gy = self.derive_w_block_gy(params, lut_id);
+        let w_block_v = self.derive_w_block_v(params, lut_id);
+        let w_block_vx = self.derive_w_block_vx(params, lut_id);
+        let batch = vec![(0usize, M::P::from_usize_to_constant(params, 1usize))];
         let start = Instant::now();
         let jobs = self.sample_lut_preimages(
-            &params,
+            params,
             lut_id,
             "bench_lut_aux",
             &b1_trapdoor,
@@ -1785,20 +1805,19 @@ where
         }
     }
 
-    fn sample_aux_matrices_lut_gate_time(&self) -> SampleAuxBenchEstimate {
-        let params = <M::P as Poly>::Params::default();
+    fn sample_aux_matrices_lut_gate_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate {
         let lut_id = 0usize;
-        let trap_sampler = TS::new(&params, self.trapdoor_sigma);
-        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(&params, self.d);
-        let (_b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, self.d);
-        let w_block_identity = self.derive_w_block_identity(&params, lut_id);
-        let w_block_gy = self.derive_w_block_gy(&params, lut_id);
-        let w_block_v = self.derive_w_block_v(&params, lut_id);
-        let w_block_vx = self.derive_w_block_vx(&params, lut_id);
-        let input_pubkey_bytes = M::gadget_matrix(&params, self.d).into_compact_bytes();
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, self.d);
+        let (_b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, self.d);
+        let w_block_identity = self.derive_w_block_identity(params, lut_id);
+        let w_block_gy = self.derive_w_block_gy(params, lut_id);
+        let w_block_v = self.derive_w_block_v(params, lut_id);
+        let w_block_vx = self.derive_w_block_vx(params, lut_id);
+        let input_pubkey_bytes = M::gadget_matrix(params, self.d).into_compact_bytes();
         let start = Instant::now();
         let jobs = self.sample_gate_preimages_batch(
-            &params,
+            params,
             lut_id,
             vec![(
                 GateId(0),
@@ -1843,8 +1862,7 @@ where
         lut_id: usize,
     ) -> BggPublicKey<M> {
         let d = input.matrix.row_size();
-        debug!("Starting public lookup for gate {}", gate_id);
-        self.lut_state.entry(lut_id).or_insert_with(|| plt.clone());
+        self.record_public_lookup_state(plt, input, gate_id, lut_id);
 
         let hash_sampler = HS::new();
         let a_out = hash_sampler.sample_hash(
@@ -1855,16 +1873,6 @@ where
             d * params.modulus_digits(),
             DistType::FinRingDist,
         );
-        let output_pubkey = BggPublicKey { matrix: a_out, reveal_plaintext: true };
-        self.gate_state.insert(
-            gate_id,
-            GateState {
-                lut_id,
-                input_pubkey_bytes: input.matrix.to_compact_bytes(),
-                _m: PhantomData,
-            },
-        );
-        debug!("Public lookup for gate {} recorded", gate_id);
-        output_pubkey
+        BggPublicKey { matrix: a_out, reveal_plaintext: true }
     }
 }

@@ -185,7 +185,7 @@ fn build_simple_slot_transfer_circuit_cpu(
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
     let inputs = circuit.input(1);
     let lut_id = circuit.register_public_lookup(plt);
-    let looked_up = circuit.public_lookup_gate(inputs[0], lut_id);
+    let looked_up = circuit.public_lookup_gate(inputs.at(0), lut_id);
     let transferred = circuit.slot_transfer_gate(looked_up, &SRC_SLOTS);
     circuit.output(vec![transferred]);
     circuit
@@ -199,7 +199,7 @@ fn build_simple_slot_transfer_circuit_gpu(
     let mut circuit = PolyCircuit::<GpuDCRTPoly>::new();
     let inputs = circuit.input(1);
     let lut_id = circuit.register_public_lookup(plt);
-    let looked_up = circuit.public_lookup_gate(inputs[0], lut_id);
+    let looked_up = circuit.public_lookup_gate(inputs.at(0), lut_id);
     let transferred = circuit.slot_transfer_gate(looked_up, &SRC_SLOTS);
     circuit.output(vec![transferred]);
     circuit
@@ -345,7 +345,7 @@ async fn test_gpu_ggh15_poly_slot_transfer() {
     let circuit = build_simple_slot_transfer_circuit_gpu(&params, cfg.lut_size);
     assert_eq!(circuit.non_free_depth(), 2, "circuit depth should stay simple");
     let gate_counts = circuit.count_gates_by_type_vec();
-    assert_eq!(gate_counts.get(&PolyGateKind::PubLut(0)), Some(&1));
+    assert_eq!(gate_counts.get(&PolyGateKind::PubLut), Some(&1));
     assert_eq!(gate_counts.get(&PolyGateKind::SlotTransfer), Some(&1));
 
     let seed = [0u8; 32];

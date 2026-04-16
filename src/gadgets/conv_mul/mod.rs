@@ -15,11 +15,12 @@
 //! small slot-transfer scalars instead of large `q_i - 1` residues.
 
 use crate::{
-    circuit::{PolyCircuit, gate::GateId},
-    gadgets::arith::NestedRnsPoly,
+    circuit::{
+        BatchedWire, PolyCircuit, SlotTransferSpec, SubCircuitParamKind, SubCircuitParamValue,
+    },
+    gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext},
     poly::{Poly, PolyParams},
 };
-use num_bigint::BigUint;
 use rayon::prelude::*;
 use std::{sync::Arc, time::Instant};
 use tracing::debug;
@@ -69,6 +70,67 @@ fn rhs_rotation_plan(num_slots: usize, diagonal: usize) -> Vec<(u32, Option<Vec<
         .collect()
 }
 
+fn q_level_diagonal_product_param_bindings(
+    ctx: &NestedRnsPolyContext,
+    diagonal: usize,
+    num_slots: usize,
+) -> Vec<SubCircuitParamValue> {
+    let rhs_binding =
+        SubCircuitParamValue::SlotTransfer(SlotTransferSpec::rotation(diagonal, num_slots));
+    let lhs_bindings = ctx
+        .p_moduli
+        .par_iter()
+        .map(|&p_i| {
+            let negative_scalar =
+                u32::try_from(p_i - 1).expect("signed slot-transfer scalar must fit in u32");
+            SubCircuitParamValue::SlotTransfer(SlotTransferSpec::repeated(
+                diagonal,
+                num_slots,
+                diagonal,
+                Some(negative_scalar),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let mut bindings = Vec::with_capacity(lhs_bindings.len() + 1);
+    bindings.extend(lhs_bindings);
+    bindings.push(rhs_binding);
+    bindings
+}
+
+fn q_level_diagonal_product_subcircuit<P: Poly + 'static>(
+    template_ctx: &NestedRnsPolyContext,
+) -> PolyCircuit<P> {
+    let mut circuit = PolyCircuit::<P>::new();
+    let ctx = Arc::new(template_ctx.register_subcircuits_in(&mut circuit));
+    let p_moduli_depth = ctx.p_moduli.len();
+    let lhs_slot_transfer_param_ids = (0..p_moduli_depth)
+        .map(|_| circuit.register_sub_circuit_param(SubCircuitParamKind::SlotTransfer))
+        .collect::<Vec<_>>();
+    let rhs_slot_transfer_param_id =
+        circuit.register_sub_circuit_param(SubCircuitParamKind::SlotTransfer);
+    let lhs_row = circuit.input(p_moduli_depth).to_vec();
+    let rhs_row = circuit.input(p_moduli_depth).to_vec();
+    let lhs_transferred = lhs_row
+        .iter()
+        .enumerate()
+        .map(|(p_idx, &gate_id)| {
+            circuit
+                .slot_transfer_gate_param(gate_id, lhs_slot_transfer_param_ids[p_idx])
+                .as_single_wire()
+        })
+        .collect::<Vec<_>>();
+    let lhs_diagonal = ctx.reduce_q_level_row(&lhs_transferred, &mut circuit);
+    let rhs_rotated = rhs_row
+        .iter()
+        .map(|&gate_id| {
+            circuit.slot_transfer_gate_param(gate_id, rhs_slot_transfer_param_id).as_single_wire()
+        })
+        .collect::<Vec<_>>();
+    let product_row = ctx.mul_q_level_rows(&lhs_diagonal, &rhs_rotated, &mut circuit);
+    circuit.output(product_row);
+    circuit
+}
+
 fn negacyclic_diagonal<P: Poly>(
     circuit: &mut PolyCircuit<P>,
     input: &NestedRnsPoly<P>,
@@ -111,34 +173,6 @@ fn reduce_terms_pairwise<P: Poly>(
     current_layer.pop().expect("reduction tree must leave one term")
 }
 
-fn flatten_nested_rns_poly<P: Poly>(value: &NestedRnsPoly<P>) -> Vec<GateId> {
-    value.inner.iter().flat_map(|level| level.iter().copied()).collect()
-}
-
-fn nested_rns_from_flat_outputs<P: Poly>(
-    template: &NestedRnsPoly<P>,
-    outputs: &[GateId],
-    max_plaintexts: Vec<BigUint>,
-    p_max_traces: Vec<BigUint>,
-) -> NestedRnsPoly<P> {
-    let levels = template.active_q_moduli().len();
-    let p_moduli_depth = template.ctx.p_moduli.len();
-    assert_eq!(
-        outputs.len(),
-        levels * p_moduli_depth,
-        "flattened negacyclic_conv_mul subcircuit output size must match active_levels * p_moduli_depth"
-    );
-    let inner = outputs.chunks(p_moduli_depth).map(|row| row.to_vec()).collect::<Vec<_>>();
-    NestedRnsPoly::new(
-        template.ctx.clone(),
-        inner,
-        Some(template.level_offset),
-        template.enable_levels,
-        max_plaintexts,
-    )
-    .with_p_max_traces(p_max_traces)
-}
-
 fn diagonal_term_output_template<P, F>(
     lhs: &NestedRnsPoly<P>,
     rhs: &NestedRnsPoly<P>,
@@ -162,44 +196,104 @@ where
     build_product(&lhs_diagonal, &rhs_rotated, &mut template_circuit)
 }
 
-fn diagonal_term_subcircuit<P: Poly + 'static>(
-    _params: &P::Params,
-    template_ctx: &crate::gadgets::arith::NestedRnsPolyContext,
-    active_levels: usize,
-    level_offset: usize,
-    diagonal: usize,
+pub(crate) fn negacyclic_conv_mul_right_decomposed_term_many_subcircuit<P: Poly + 'static>(
+    template_ctx: &NestedRnsPolyContext,
+    row_count: usize,
     num_slots: usize,
 ) -> PolyCircuit<P> {
+    assert!(
+        row_count > 0,
+        "negacyclic_conv_mul_right_decomposed_term_many_subcircuit requires at least one left row"
+    );
+
     let mut circuit = PolyCircuit::<P>::new();
     let ctx = Arc::new(template_ctx.register_subcircuits_in(&mut circuit));
-    let lhs =
-        NestedRnsPoly::input(ctx.clone(), Some(active_levels), Some(level_offset), &mut circuit);
-    let rhs = NestedRnsPoly::input(ctx, Some(active_levels), Some(level_offset), &mut circuit);
-    let lhs_diagonal = negacyclic_diagonal(&mut circuit, &lhs, diagonal, num_slots);
-    let rhs_rotated = rhs.slot_transfer(&rhs_rotation_plan(num_slots, diagonal), &mut circuit);
-    let product = lhs_diagonal.mul(&rhs_rotated, &mut circuit);
-    circuit.output(product.inner.into_iter().flatten().collect());
+    let p_moduli_depth = ctx.p_moduli.len();
+    let diagonal_product_id =
+        circuit.register_sub_circuit(q_level_diagonal_product_subcircuit::<P>(ctx.as_ref()));
+    let left_rows =
+        (0..row_count).map(|_| circuit.input(p_moduli_depth).to_vec()).collect::<Vec<_>>();
+    let term_row = circuit.input(p_moduli_depth).to_vec();
+    let diagonal_binding_set_ids = {
+        let circuit_ref: &PolyCircuit<P> = &circuit;
+        (0..num_slots)
+            .into_par_iter()
+            .map(|diagonal| {
+                let bindings =
+                    q_level_diagonal_product_param_bindings(ctx.as_ref(), diagonal, num_slots);
+                circuit_ref.intern_binding_set(&bindings)
+            })
+            .collect::<Vec<_>>()
+    };
+    let summed_rows = left_rows
+        .iter()
+        .map(|left_row| {
+            let mut shared_inputs = Vec::with_capacity(p_moduli_depth * 2);
+            shared_inputs.extend_from_slice(left_row);
+            shared_inputs.extend_from_slice(&term_row);
+            let input_set_id = circuit.intern_input_set(&shared_inputs);
+            let call_input_set_ids = vec![input_set_id; num_slots];
+            circuit.call_sub_circuit_sum_many_with_binding_set_ids(
+                diagonal_product_id,
+                call_input_set_ids,
+                diagonal_binding_set_ids.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    circuit.output(summed_rows.into_iter().flatten());
     circuit
 }
 
-fn diagonal_term_right_sparse_subcircuit<P: Poly + 'static>(
-    _params: &P::Params,
-    template_ctx: &crate::gadgets::arith::NestedRnsPolyContext,
-    active_levels: usize,
-    level_offset: usize,
-    rhs_q_idx: usize,
-    diagonal: usize,
+pub(crate) fn negacyclic_conv_mul_right_decomposed_term_many_shared_subcircuit<
+    P: Poly + 'static,
+>(
+    source_circuit: &PolyCircuit<P>,
+    template_ctx: &NestedRnsPolyContext,
+    row_count: usize,
     num_slots: usize,
 ) -> PolyCircuit<P> {
+    assert!(
+        row_count > 0,
+        "negacyclic_conv_mul_right_decomposed_term_many_shared_subcircuit requires at least one left row"
+    );
+
     let mut circuit = PolyCircuit::<P>::new();
-    let ctx = Arc::new(template_ctx.register_subcircuits_in(&mut circuit));
-    let lhs =
-        NestedRnsPoly::input(ctx.clone(), Some(active_levels), Some(level_offset), &mut circuit);
-    let rhs = NestedRnsPoly::input(ctx, Some(active_levels), Some(level_offset), &mut circuit);
-    let lhs_diagonal = negacyclic_diagonal(&mut circuit, &lhs, diagonal, num_slots);
-    let rhs_rotated = rhs.slot_transfer(&rhs_rotation_plan(num_slots, diagonal), &mut circuit);
-    let product = lhs_diagonal.mul_right_sparse(&rhs_rotated, rhs_q_idx, &mut circuit);
-    circuit.output(product.inner.into_iter().flatten().collect());
+    let ctx = Arc::new(template_ctx.register_shared_subcircuits_in(source_circuit, &mut circuit));
+    let p_moduli_depth = ctx.p_moduli.len();
+    let diagonal_product_id =
+        circuit.register_sub_circuit(q_level_diagonal_product_subcircuit::<P>(ctx.as_ref()));
+    let left_rows =
+        (0..row_count).map(|_| circuit.input(p_moduli_depth).to_vec()).collect::<Vec<_>>();
+    let term_row = circuit.input(p_moduli_depth).to_vec();
+    let diagonal_binding_set_ids = {
+        let circuit_ref: &PolyCircuit<P> = &circuit;
+        (0..num_slots)
+            .into_par_iter()
+            .map(|diagonal| {
+                let bindings =
+                    q_level_diagonal_product_param_bindings(ctx.as_ref(), diagonal, num_slots);
+                circuit_ref.intern_binding_set(&bindings)
+            })
+            .collect::<Vec<_>>()
+    };
+    let summed_rows = left_rows
+        .iter()
+        .map(|left_row| {
+            let mut shared_inputs = Vec::with_capacity(p_moduli_depth * 2);
+            shared_inputs.extend_from_slice(left_row);
+            shared_inputs.extend_from_slice(&term_row);
+            let input_set_id = circuit.intern_input_set(&shared_inputs);
+            let call_input_set_ids = vec![input_set_id; num_slots];
+            circuit.call_sub_circuit_sum_many_with_binding_set_ids(
+                diagonal_product_id,
+                call_input_set_ids,
+                diagonal_binding_set_ids.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    circuit.output(summed_rows.into_iter().flatten());
     circuit
 }
 
@@ -216,19 +310,6 @@ pub fn negacyclic_conv_mul<P: Poly + 'static>(
     let active_levels = lhs.active_q_moduli().len();
     let level_offset = lhs.level_offset;
     let parallel_build_start = Instant::now();
-    let diagonal_subcircuits = (0..num_slots)
-        .into_par_iter()
-        .map(|diagonal| {
-            diagonal_term_subcircuit(
-                params,
-                lhs.ctx.as_ref(),
-                active_levels,
-                level_offset,
-                diagonal,
-                num_slots,
-            )
-        })
-        .collect::<Vec<_>>();
     let diagonal_output_templates = (0..num_slots)
         .into_par_iter()
         .map(|diagonal| {
@@ -241,31 +322,40 @@ pub fn negacyclic_conv_mul<P: Poly + 'static>(
             )
         })
         .collect::<Vec<_>>();
+    let diagonal_product_id =
+        circuit.register_sub_circuit(q_level_diagonal_product_subcircuit::<P>(lhs.ctx.as_ref()));
     debug!(
-        "negacyclic_conv_mul built {} diagonal subcircuits in parallel: num_slots={}, active_levels={}, elapsed_ms={}",
-        diagonal_subcircuits.len(),
+        "negacyclic_conv_mul prepared {} diagonal templates in parallel: num_slots={}, active_levels={}, elapsed_ms={}",
+        diagonal_output_templates.len(),
         num_slots,
         active_levels,
         parallel_build_start.elapsed().as_millis()
     );
-    let mut shared_inputs = flatten_nested_rns_poly(lhs);
-    shared_inputs.extend(flatten_nested_rns_poly(rhs));
     let instantiate_start = Instant::now();
     let mut diagonal_terms = Vec::with_capacity(num_slots);
-    for (diagonal_subcircuit, output_template) in
-        diagonal_subcircuits.into_iter().zip(diagonal_output_templates.into_iter())
-    {
-        let subcircuit_id = circuit.register_sub_circuit(diagonal_subcircuit);
-        let outputs = circuit.call_sub_circuit(subcircuit_id, &shared_inputs);
-        diagonal_terms.push(nested_rns_from_flat_outputs(
-            lhs,
-            &outputs,
-            output_template.max_plaintexts,
-            output_template.p_max_traces,
-        ));
+    for (diagonal, output_template) in diagonal_output_templates.into_iter().enumerate() {
+        let bindings =
+            q_level_diagonal_product_param_bindings(lhs.ctx.as_ref(), diagonal, num_slots);
+        let mut inner = Vec::with_capacity(active_levels);
+        for q_idx in 0..active_levels {
+            let inputs = vec![lhs.inner[q_idx], rhs.inner[q_idx]];
+            let outputs =
+                circuit.call_sub_circuit_with_bindings(diagonal_product_id, &inputs, &bindings);
+            inner.push(BatchedWire::from_batches(outputs));
+        }
+        diagonal_terms.push(
+            NestedRnsPoly::new(
+                lhs.ctx.clone(),
+                inner,
+                Some(level_offset),
+                lhs.enable_levels,
+                output_template.max_plaintexts,
+            )
+            .with_p_max_traces(output_template.p_max_traces),
+        );
     }
     debug!(
-        "negacyclic_conv_mul registered/called {} diagonal subcircuits: elapsed_ms={}",
+        "negacyclic_conv_mul instantiated {} diagonal terms from one parameterized row subcircuit: elapsed_ms={}",
         diagonal_terms.len(),
         instantiate_start.elapsed().as_millis()
     );
@@ -293,40 +383,52 @@ pub fn negacyclic_conv_mul_right_sparse<P: Poly + 'static>(
     let total_start = Instant::now();
     let active_levels = lhs.active_q_moduli().len();
     let level_offset = lhs.level_offset;
-    let mut shared_inputs = flatten_nested_rns_poly(lhs);
-    shared_inputs.extend(flatten_nested_rns_poly(rhs));
+    assert!(
+        rhs_q_idx < active_levels,
+        "rhs_q_idx {} exceeds active levels {}",
+        rhs_q_idx,
+        active_levels
+    );
+    let diagonal_product_id =
+        circuit.register_sub_circuit(q_level_diagonal_product_subcircuit::<P>(lhs.ctx.as_ref()));
+    let shared_inputs = vec![lhs.inner[rhs_q_idx], rhs.inner[rhs_q_idx]];
+    let diagonal_output_templates = (0..num_slots)
+        .into_par_iter()
+        .map(|diagonal| {
+            diagonal_term_output_template(
+                lhs,
+                rhs,
+                diagonal,
+                num_slots,
+                |lhs_diagonal, rhs_rotated, circuit| {
+                    lhs_diagonal.mul_right_sparse(rhs_rotated, rhs_q_idx, circuit)
+                },
+            )
+        })
+        .collect::<Vec<_>>();
     let instantiate_start = Instant::now();
     let mut diagonal_terms = Vec::with_capacity(num_slots);
-    for diagonal in 0..num_slots {
-        let diagonal_subcircuit = diagonal_term_right_sparse_subcircuit(
-            params,
-            lhs.ctx.as_ref(),
-            active_levels,
-            level_offset,
-            rhs_q_idx,
-            diagonal,
-            num_slots,
+    for (diagonal, output_template) in diagonal_output_templates.into_iter().enumerate() {
+        let bindings =
+            q_level_diagonal_product_param_bindings(lhs.ctx.as_ref(), diagonal, num_slots);
+        let outputs =
+            circuit.call_sub_circuit_with_bindings(diagonal_product_id, &shared_inputs, &bindings);
+        let mut inner =
+            (0..active_levels).map(|_| lhs.ctx.zero_level_batch(circuit)).collect::<Vec<_>>();
+        inner[rhs_q_idx] = BatchedWire::from_batches(outputs);
+        diagonal_terms.push(
+            NestedRnsPoly::new(
+                lhs.ctx.clone(),
+                inner,
+                Some(level_offset),
+                lhs.enable_levels,
+                output_template.max_plaintexts,
+            )
+            .with_p_max_traces(output_template.p_max_traces),
         );
-        let subcircuit_id = circuit.register_sub_circuit(diagonal_subcircuit);
-        let output_template = diagonal_term_output_template(
-            lhs,
-            rhs,
-            diagonal,
-            num_slots,
-            |lhs_diagonal, rhs_rotated, circuit| {
-                lhs_diagonal.mul_right_sparse(rhs_rotated, rhs_q_idx, circuit)
-            },
-        );
-        let outputs = circuit.call_sub_circuit(subcircuit_id, &shared_inputs);
-        diagonal_terms.push(nested_rns_from_flat_outputs(
-            lhs,
-            &outputs,
-            output_template.max_plaintexts,
-            output_template.p_max_traces,
-        ));
     }
     debug!(
-        "negacyclic_conv_mul_right_sparse built/registered/called {} diagonal subcircuits sequentially: num_slots={}, active_levels={}, elapsed_ms={}",
+        "negacyclic_conv_mul_right_sparse instantiated {} diagonal terms from one parameterized row subcircuit: num_slots={}, active_levels={}, elapsed_ms={}",
         diagonal_terms.len(),
         num_slots,
         active_levels,
@@ -444,6 +546,24 @@ mod tests {
         let lhs_poly = DCRTPoly::from_biguints(params, lhs);
         let rhs_poly = DCRTPoly::from_biguints(params, rhs);
         (&lhs_poly * &rhs_poly).coeffs_biguints()
+    }
+
+    fn build_manual_negacyclic_conv_mul_right_sparse(
+        params: &DCRTPolyParams,
+        circuit: &mut PolyCircuit<DCRTPoly>,
+        lhs: &NestedRnsPoly<DCRTPoly>,
+        rhs: &NestedRnsPoly<DCRTPoly>,
+        rhs_q_idx: usize,
+        num_slots: usize,
+    ) -> NestedRnsPoly<DCRTPoly> {
+        validate_inputs(params, lhs, rhs, num_slots);
+        let mut diagonal_terms = Vec::with_capacity(num_slots);
+        for diagonal in 0..num_slots {
+            let lhs_diagonal = negacyclic_diagonal(circuit, lhs, diagonal, num_slots);
+            let rhs_rotated = rhs.slot_transfer(&rhs_rotation_plan(num_slots, diagonal), circuit);
+            diagonal_terms.push(lhs_diagonal.mul_right_sparse(&rhs_rotated, rhs_q_idx, circuit));
+        }
+        reduce_terms_pairwise(diagonal_terms, circuit)
     }
 
     #[sequential_test::sequential]
@@ -625,6 +745,124 @@ mod tests {
                     "coefficient {coeff_idx} differs modulo the active q-window modulus at level offset {level_offset}"
                 );
             },
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_negacyclic_conv_mul_right_sparse_matches_manual_pipeline() {
+        let num_slots = 4usize;
+        let target_q_idx = 1usize;
+        let params = DCRTPolyParams::new(4, 3, 18, BASE_BITS);
+
+        let mut auto_circuit = PolyCircuit::<DCRTPoly>::new();
+        let auto_ctx = test_context(&mut auto_circuit, &params);
+        let auto_lhs = NestedRnsPoly::input(auto_ctx.clone(), None, None, &mut auto_circuit);
+        let auto_rhs = NestedRnsPoly::input(auto_ctx.clone(), None, None, &mut auto_circuit);
+        let auto_chunk_width = auto_ctx.p_moduli.len() + 1;
+        let auto_sparse_idx = target_q_idx * auto_chunk_width + auto_ctx.p_moduli.len();
+        let auto_sparse_rhs = auto_rhs.gadget_decompose(&mut auto_circuit).remove(auto_sparse_idx);
+        let auto_product = negacyclic_conv_mul_right_sparse(
+            &params,
+            &mut auto_circuit,
+            &auto_lhs,
+            &auto_sparse_rhs,
+            target_q_idx,
+            num_slots,
+        );
+        let auto_output = auto_product.reconstruct(&mut auto_circuit);
+        auto_circuit.output(vec![auto_output]);
+
+        let mut manual_circuit = PolyCircuit::<DCRTPoly>::new();
+        let manual_ctx = test_context(&mut manual_circuit, &params);
+        let manual_lhs = NestedRnsPoly::input(manual_ctx.clone(), None, None, &mut manual_circuit);
+        let manual_rhs = NestedRnsPoly::input(manual_ctx.clone(), None, None, &mut manual_circuit);
+        let manual_chunk_width = manual_ctx.p_moduli.len() + 1;
+        let manual_sparse_idx = target_q_idx * manual_chunk_width + manual_ctx.p_moduli.len();
+        let manual_sparse_rhs =
+            manual_rhs.gadget_decompose(&mut manual_circuit).remove(manual_sparse_idx);
+        let manual_product = build_manual_negacyclic_conv_mul_right_sparse(
+            &params,
+            &mut manual_circuit,
+            &manual_lhs,
+            &manual_sparse_rhs,
+            target_q_idx,
+            num_slots,
+        );
+        let manual_output = manual_product.reconstruct(&mut manual_circuit);
+        manual_circuit.output(vec![manual_output]);
+
+        let modulus: Arc<BigUint> = params.modulus().into();
+        let lhs_coeffs = random_slots_for_modulus(modulus.as_ref(), num_slots);
+        let rhs_coeffs = random_slots_for_modulus(modulus.as_ref(), num_slots);
+        let auto_inputs = [
+            encode_nested_rns_poly_vec::<DCRTPoly>(&params, auto_ctx.as_ref(), &lhs_coeffs, None),
+            encode_nested_rns_poly_vec::<DCRTPoly>(&params, auto_ctx.as_ref(), &rhs_coeffs, None),
+        ]
+        .concat();
+        let manual_inputs = [
+            encode_nested_rns_poly_vec::<DCRTPoly>(&params, manual_ctx.as_ref(), &lhs_coeffs, None),
+            encode_nested_rns_poly_vec::<DCRTPoly>(&params, manual_ctx.as_ref(), &rhs_coeffs, None),
+        ]
+        .concat();
+        let auto_result = eval_single_output(&params, &auto_circuit, auto_inputs, num_slots);
+        let manual_result = eval_single_output(&params, &manual_circuit, manual_inputs, num_slots);
+
+        assert_eq!(
+            reconstructed_output_coeffs(&auto_result, num_slots),
+            reconstructed_output_coeffs(&manual_result, num_slots),
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_negacyclic_conv_mul_right_sparse_does_not_increase_non_free_depth() {
+        let num_slots = 4usize;
+        let target_q_idx = 1usize;
+        let params = DCRTPolyParams::new(4, 3, 18, BASE_BITS);
+
+        let mut auto_circuit = PolyCircuit::<DCRTPoly>::new();
+        let auto_ctx = test_context(&mut auto_circuit, &params);
+        let auto_lhs = NestedRnsPoly::input(auto_ctx.clone(), None, None, &mut auto_circuit);
+        let auto_rhs = NestedRnsPoly::input(auto_ctx.clone(), None, None, &mut auto_circuit);
+        let auto_chunk_width = auto_ctx.p_moduli.len() + 1;
+        let auto_sparse_idx = target_q_idx * auto_chunk_width + auto_ctx.p_moduli.len();
+        let auto_sparse_rhs = auto_rhs.gadget_decompose(&mut auto_circuit).remove(auto_sparse_idx);
+        let auto_product = negacyclic_conv_mul_right_sparse(
+            &params,
+            &mut auto_circuit,
+            &auto_lhs,
+            &auto_sparse_rhs,
+            target_q_idx,
+            num_slots,
+        );
+        let auto_output = auto_product.reconstruct(&mut auto_circuit);
+        auto_circuit.output(vec![auto_output]);
+
+        let mut manual_circuit = PolyCircuit::<DCRTPoly>::new();
+        let manual_ctx = test_context(&mut manual_circuit, &params);
+        let manual_lhs = NestedRnsPoly::input(manual_ctx.clone(), None, None, &mut manual_circuit);
+        let manual_rhs = NestedRnsPoly::input(manual_ctx.clone(), None, None, &mut manual_circuit);
+        let manual_chunk_width = manual_ctx.p_moduli.len() + 1;
+        let manual_sparse_idx = target_q_idx * manual_chunk_width + manual_ctx.p_moduli.len();
+        let manual_sparse_rhs =
+            manual_rhs.gadget_decompose(&mut manual_circuit).remove(manual_sparse_idx);
+        let manual_product = build_manual_negacyclic_conv_mul_right_sparse(
+            &params,
+            &mut manual_circuit,
+            &manual_lhs,
+            &manual_sparse_rhs,
+            target_q_idx,
+            num_slots,
+        );
+        let manual_output = manual_product.reconstruct(&mut manual_circuit);
+        manual_circuit.output(vec![manual_output]);
+
+        assert!(
+            auto_circuit.non_free_depth() <= manual_circuit.non_free_depth(),
+            "sparse conv path depth regressed: auto={}, manual={}",
+            auto_circuit.non_free_depth(),
+            manual_circuit.non_free_depth()
         );
     }
 

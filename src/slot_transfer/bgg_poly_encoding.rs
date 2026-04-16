@@ -384,8 +384,9 @@ mod tests {
 
         let src_slots = [(2, None), (0, Some(3)), (1, Some(2))];
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(1);
-        let transferred = circuit.slot_transfer_gate(inputs[0], &src_slots);
+        let input_gate = circuit.input(1).at(0);
+        let transferred = circuit.slot_transfer_gate(input_gate, &src_slots);
+        let transferred_gate = transferred.as_single_wire();
         circuit.output(vec![transferred]);
 
         let result_pubkey = circuit.eval(
@@ -443,7 +444,7 @@ mod tests {
         let a_out = DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
             &params,
             hash_key,
-            format!("slot_transfer_gate_a_out_{}", transferred),
+            format!("slot_transfer_gate_a_out_{}", transferred_gate),
             secret_size,
             secret_size * params.modulus_digits(),
             DistType::FinRingDist,
@@ -529,9 +530,9 @@ mod tests {
             >::new(hash_key, secret_size, num_slots, SIGMA, 0.0, dir.to_path_buf());
 
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(1);
+        let input_gate = circuit.input(1).at(0);
         let extracted_slots = (0..num_slots)
-            .map(|slot| circuit.slot_transfer_gate(inputs[0], &[(slot as u32, None)]))
+            .map(|slot| circuit.slot_transfer_gate(input_gate, &[(slot as u32, None)]))
             .collect::<Vec<_>>();
         let weighted_slots = extracted_slots
             .iter()
@@ -605,6 +606,7 @@ mod tests {
                 let source_plaintext = input
                     .plaintext(slot)
                     .expect("input encoding should reveal plaintext constants");
+                let gate_id = gate_id.as_single_wire();
                 let a_out = DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
                     &params,
                     hash_key,

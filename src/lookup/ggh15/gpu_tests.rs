@@ -75,7 +75,7 @@ async fn test_gpu_ggh15_plt_eval_multi_inputs() {
     let inputs = circuit.input(input_size);
     let plt_id = circuit.register_public_lookup(plt.clone());
     let outputs =
-        inputs.iter().map(|&input| circuit.public_lookup_gate(input, plt_id)).collect::<Vec<_>>();
+        inputs.iter().map(|input| circuit.public_lookup_gate(input, plt_id)).collect::<Vec<_>>();
     circuit.output(outputs);
 
     let d = 2;
@@ -202,7 +202,7 @@ async fn test_gpu_ggh15_poly_encoding_plt_eval_slot_secret_relation() {
     let mut circuit = PolyCircuit::new();
     let inputs = circuit.input(1);
     let plt_id = circuit.register_public_lookup(plt.clone());
-    let output = circuit.public_lookup_gate(inputs[0], plt_id);
+    let output = circuit.public_lookup_gate(inputs.at(0), plt_id);
     circuit.output(vec![output]);
 
     let d = 2;

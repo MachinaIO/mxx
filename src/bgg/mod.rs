@@ -199,7 +199,7 @@ mod tests {
         let enc2 = encodings[2].clone();
 
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(2);
+        let inputs = circuit.input(2).to_vec();
         let add_gate = circuit.add_gate(inputs[0], inputs[1]);
         circuit.output(vec![add_gate]);
 
@@ -233,7 +233,7 @@ mod tests {
         let enc2 = encodings[2].clone();
 
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(2);
+        let inputs = circuit.input(2).to_vec();
         let sub_gate = circuit.sub_gate(inputs[0], inputs[1]);
         circuit.output(vec![sub_gate]);
 
@@ -267,7 +267,7 @@ mod tests {
         let enc2 = encodings[2].clone();
 
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(2);
+        let inputs = circuit.input(2).to_vec();
         let mul_gate = circuit.mul_gate(inputs[0], inputs[1]);
         circuit.output(vec![mul_gate]);
 
@@ -302,7 +302,7 @@ mod tests {
         let enc3 = encodings[3].clone();
 
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(3);
+        let inputs = circuit.input(3).to_vec();
         let add_gate = circuit.add_gate(inputs[0], inputs[1]);
         let square_gate = circuit.mul_gate(add_gate, add_gate);
         let sub_gate = circuit.sub_gate(square_gate, inputs[2]);
@@ -341,7 +341,7 @@ mod tests {
         let enc4 = encodings[4].clone();
 
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(4);
+        let inputs = circuit.input(4).to_vec();
         let a = circuit.add_gate(inputs[0], inputs[1]);
         let b = circuit.mul_gate(inputs[2], inputs[3]);
         let c = circuit.mul_gate(a, b);
@@ -385,10 +385,10 @@ mod tests {
         let enc2 = encodings[2].clone();
 
         let mut circuit = PolyCircuit::new();
-        let first_inputs = circuit.input(1);
+        let first_inputs = circuit.input(1).to_vec();
         assert_eq!(first_inputs.len(), 1);
         let _const_gate = circuit.const_digits(&[1u32, 0u32, 1u32]);
-        let second_inputs = circuit.input(1);
+        let second_inputs = circuit.input(1).to_vec();
         assert_eq!(second_inputs.len(), 1);
         assert_ne!(second_inputs[0].0, first_inputs[0].0 + 1);
 
@@ -425,13 +425,13 @@ mod tests {
         let enc2 = encodings[2].clone();
 
         let mut sub_circuit = PolyCircuit::new();
-        let sub_inputs = sub_circuit.input(2);
+        let sub_inputs = sub_circuit.input(2).to_vec();
         let add_gate = sub_circuit.add_gate(sub_inputs[0], sub_inputs[1]);
         let mul_gate = sub_circuit.mul_gate(sub_inputs[0], sub_inputs[1]);
         sub_circuit.output(vec![add_gate, mul_gate]);
 
         let mut main_circuit = PolyCircuit::new();
-        let main_inputs = main_circuit.input(2);
+        let main_inputs = main_circuit.input(2).to_vec();
         let sub_circuit_id = main_circuit.register_sub_circuit(sub_circuit);
         let sub_outputs =
             main_circuit.call_sub_circuit(sub_circuit_id, &[main_inputs[0], main_inputs[1]]);
@@ -470,12 +470,12 @@ mod tests {
         let enc3 = encodings[3].clone();
 
         let mut inner_circuit = PolyCircuit::new();
-        let inner_inputs = inner_circuit.input(2);
+        let inner_inputs = inner_circuit.input(2).to_vec();
         let mul_gate = inner_circuit.mul_gate(inner_inputs[0], inner_inputs[1]);
         inner_circuit.output(vec![mul_gate]);
 
         let mut middle_circuit = PolyCircuit::new();
-        let middle_inputs = middle_circuit.input(3);
+        let middle_inputs = middle_circuit.input(3).to_vec();
         let inner_circuit_id = middle_circuit.register_sub_circuit(inner_circuit);
         let inner_outputs = middle_circuit
             .call_sub_circuit(inner_circuit_id, &[middle_inputs[0], middle_inputs[1]]);
@@ -483,7 +483,7 @@ mod tests {
         middle_circuit.output(vec![add_gate]);
 
         let mut main_circuit = PolyCircuit::new();
-        let main_inputs = main_circuit.input(3);
+        let main_inputs = main_circuit.input(3).to_vec();
         let middle_circuit_id = main_circuit.register_sub_circuit(middle_circuit);
         let middle_outputs = main_circuit
             .call_sub_circuit(middle_circuit_id, &[main_inputs[0], main_inputs[1], main_inputs[2]]);

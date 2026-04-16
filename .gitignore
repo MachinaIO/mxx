@@ -10,3 +10,4 @@
 /.agents/tmp
 /plans
 /revision_logs
+/*.log

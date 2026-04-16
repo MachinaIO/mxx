@@ -263,6 +263,53 @@ where
             .collect()
     }
 
+    pub fn record_slot_transfer_state(
+        &self,
+        params: &<M::P as Poly>::Params,
+        input: &BggPublicKey<M>,
+        src_slots: &[(u32, Option<u32>)],
+        gate_id: GateId,
+    ) {
+        assert!(
+            src_slots.len() <= self.num_slots,
+            "output slot count {} exceeds evaluator num_slots {}",
+            src_slots.len(),
+            self.num_slots
+        );
+        assert_eq!(
+            input.matrix.row_size(),
+            self.secret_size,
+            "input pubkey rows {} must match evaluator secret_size {}",
+            input.matrix.row_size(),
+            self.secret_size
+        );
+        assert_eq!(
+            input.matrix.col_size(),
+            self.secret_size * params.modulus_digits(),
+            "input pubkey columns {} must equal secret_size * modulus_digits {}",
+            input.matrix.col_size(),
+            self.secret_size * params.modulus_digits()
+        );
+        for (dst_slot, (src_slot, _scalar)) in src_slots.iter().enumerate() {
+            let src_slot = usize::try_from(*src_slot).expect("source slot index must fit in usize");
+            assert!(
+                src_slot < self.num_slots,
+                "source slot index {} out of range for evaluator num_slots {} at dst_slot {}",
+                src_slot,
+                self.num_slots,
+                dst_slot
+            );
+        }
+
+        self.gate_states.insert(
+            gate_id,
+            BggPublicKeySTGateState {
+                input_pubkey_bytes: input.matrix.to_compact_bytes(),
+                src_slots: src_slots.to_vec(),
+            },
+        );
+    }
+
     fn checkpoint_exists(&self, id_prefix: &str) -> bool {
         read_bytes_from_multi_batch(self.dir_path.as_path(), id_prefix, 0).is_some()
     }
@@ -625,25 +672,25 @@ where
     US: PolyUniformSampler<M = M> + Send + Sync,
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
-    <M::P as Poly>::Params: Default,
 {
-    fn sample_aux_matrices_slot_time(&self) -> SampleAuxBenchEstimate {
-        let params = <M::P as Poly>::Params::default();
-        let trap_sampler = TS::new(&params, self.trapdoor_sigma);
-        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(&params, self.secret_size);
+    type Params = <M::P as Poly>::Params;
+
+    fn sample_aux_matrices_slot_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate {
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, self.secret_size);
         let b1_size =
             self.secret_size.checked_mul(2).expect("slot-transfer benchmark b1 size overflow");
-        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, b1_size);
-        let identity = M::identity(&params, self.secret_size, None);
-        let gadget_matrix = M::gadget_matrix(&params, self.secret_size);
+        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, b1_size);
+        let identity = M::identity(params, self.secret_size, None);
+        let gadget_matrix = M::gadget_matrix(params, self.secret_size);
         let slot_secret_mats = vec![
             US::new()
-                .sample_uniform(&params, self.secret_size, self.secret_size, DistType::TernaryDist)
+                .sample_uniform(params, self.secret_size, self.secret_size, DistType::TernaryDist)
                 .into_compact_bytes(),
         ];
         let start = Instant::now();
         let sampled_slots = self.sample_slot_batch_cpu(
-            &params,
+            params,
             &b0_matrix,
             &b0_trapdoor,
             &b1_matrix,
@@ -661,21 +708,20 @@ where
         }
     }
 
-    fn sample_aux_matrices_gate_time(&self) -> SampleAuxBenchEstimate {
-        let params = <M::P as Poly>::Params::default();
-        let trap_sampler = TS::new(&params, self.trapdoor_sigma);
-        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(&params, self.secret_size);
+    fn sample_aux_matrices_gate_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate {
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, self.secret_size);
         let b1_size =
             self.secret_size.checked_mul(2).expect("slot-transfer benchmark b1 size overflow");
-        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, b1_size);
-        let identity = M::identity(&params, self.secret_size, None);
-        let gadget_matrix = M::gadget_matrix(&params, self.secret_size);
+        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, b1_size);
+        let identity = M::identity(params, self.secret_size, None);
+        let gadget_matrix = M::gadget_matrix(params, self.secret_size);
         let benchmark_num_slots = self.num_slots.max(1);
         let slot_secret_mats = (0..benchmark_num_slots)
             .map(|_| {
                 US::new()
                     .sample_uniform(
-                        &params,
+                        params,
                         self.secret_size,
                         self.secret_size,
                         DistType::TernaryDist,
@@ -685,7 +731,7 @@ where
             .collect::<Vec<_>>();
         let slot_indices = (0..benchmark_num_slots).collect::<Vec<_>>();
         let sampled_slots = self.sample_slot_batch_cpu(
-            &params,
+            params,
             &b0_matrix,
             &b0_trapdoor,
             &b1_matrix,
@@ -700,7 +746,7 @@ where
             slot_a_bytes_by_slot[sample.slot_idx] = sample.slot_a.to_compact_bytes();
         }
         let state = BggPublicKeySTGateState {
-            input_pubkey_bytes: M::gadget_matrix(&params, self.secret_size).into_compact_bytes(),
+            input_pubkey_bytes: M::gadget_matrix(params, self.secret_size).into_compact_bytes(),
             src_slots: (0..benchmark_num_slots).map(|slot_idx| (slot_idx as u32, None)).collect(),
         };
         let slot_chunk = state.src_slots.iter().copied().enumerate().collect::<Vec<_>>();
@@ -739,44 +785,7 @@ where
         src_slots: &[(u32, Option<u32>)],
         gate_id: GateId,
     ) -> BggPublicKey<M> {
-        assert!(
-            src_slots.len() <= self.num_slots,
-            "output slot count {} exceeds evaluator num_slots {}",
-            src_slots.len(),
-            self.num_slots
-        );
-        assert_eq!(
-            input.matrix.row_size(),
-            self.secret_size,
-            "input pubkey rows {} must match evaluator secret_size {}",
-            input.matrix.row_size(),
-            self.secret_size
-        );
-        assert_eq!(
-            input.matrix.col_size(),
-            self.secret_size * params.modulus_digits(),
-            "input pubkey columns {} must equal secret_size * modulus_digits {}",
-            input.matrix.col_size(),
-            self.secret_size * params.modulus_digits()
-        );
-        for (dst_slot, (src_slot, _scalar)) in src_slots.iter().enumerate() {
-            let src_slot = usize::try_from(*src_slot).expect("source slot index must fit in usize");
-            assert!(
-                src_slot < self.num_slots,
-                "source slot index {} out of range for evaluator num_slots {} at dst_slot {}",
-                src_slot,
-                self.num_slots,
-                dst_slot
-            );
-        }
-
-        self.gate_states.insert(
-            gate_id,
-            BggPublicKeySTGateState {
-                input_pubkey_bytes: input.matrix.to_compact_bytes(),
-                src_slots: src_slots.to_vec(),
-            },
-        );
+        self.record_slot_transfer_state(params, input, src_slots, gate_id);
 
         let hash_sampler = HS::new();
         let a_out = hash_sampler.sample_hash(
@@ -863,9 +872,10 @@ mod tests {
         );
 
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(1);
+        let input = circuit.input(1).at(0);
         let src_slots = [(1, None), (0, Some(3))];
-        let transferred = circuit.slot_transfer_gate(inputs[0], &src_slots);
+        let transferred = circuit.slot_transfer_gate(input, &src_slots);
+        let transferred_gate = transferred.as_single_wire();
         circuit.output(vec![transferred]);
 
         let evaluator =
@@ -890,14 +900,14 @@ mod tests {
         let expected_matrix = DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
             &params,
             hash_key,
-            format!("slot_transfer_gate_a_out_{}", transferred),
+            format!("slot_transfer_gate_a_out_{}", transferred_gate),
             input_pubkey.matrix.row_size(),
             input_pubkey.matrix.row_size() * params.modulus_digits(),
             DistType::FinRingDist,
         );
         assert_eq!(result[0], BggPublicKey::new(expected_matrix, true));
 
-        let stored = evaluator.gate_state(transferred).expect("missing stored gate state");
+        let stored = evaluator.gate_state(transferred_gate).expect("missing stored gate state");
         assert_eq!(stored.input_pubkey_bytes, input_pubkey.matrix.to_compact_bytes());
         assert_eq!(stored.src_slots, src_slots);
     }
@@ -934,9 +944,10 @@ mod tests {
         );
 
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(1);
+        let input = circuit.input(1).at(0);
         let src_slots = [(2, None)];
-        let transferred = circuit.slot_transfer_gate(inputs[0], &src_slots);
+        let transferred = circuit.slot_transfer_gate(input, &src_slots);
+        let transferred_gate = transferred.as_single_wire();
         circuit.output(vec![transferred]);
 
         let evaluator = BggPublicKeySTEvaluator::<
@@ -965,14 +976,14 @@ mod tests {
         let expected_matrix = DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
             &params,
             hash_key,
-            format!("slot_transfer_gate_a_out_{}", transferred),
+            format!("slot_transfer_gate_a_out_{}", transferred_gate),
             secret_size,
             m_g,
             DistType::FinRingDist,
         );
         assert_eq!(result[0], BggPublicKey::new(expected_matrix, true));
 
-        let stored = evaluator.gate_state(transferred).expect("missing stored gate state");
+        let stored = evaluator.gate_state(transferred_gate).expect("missing stored gate state");
         assert_eq!(stored.input_pubkey_bytes, input_pubkey.matrix.to_compact_bytes());
         assert_eq!(stored.src_slots, src_slots);
     }
@@ -1105,9 +1116,10 @@ mod tests {
         );
 
         let mut circuit = PolyCircuit::new();
-        let inputs = circuit.input(1);
+        let input = circuit.input(1).at(0);
         let src_slots = [(1, None), (0, Some(3))];
-        let transferred = circuit.slot_transfer_gate(inputs[0], &src_slots);
+        let transferred = circuit.slot_transfer_gate(input, &src_slots);
+        let transferred_gate = transferred.as_single_wire();
         circuit.output(vec![transferred]);
 
         let evaluator =
@@ -1190,7 +1202,7 @@ mod tests {
         let a_out = DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
             &params,
             hash_key,
-            format!("slot_transfer_gate_a_out_{}", transferred),
+            format!("slot_transfer_gate_a_out_{}", transferred_gate),
             secret_size,
             m_g,
             DistType::FinRingDist,
@@ -1213,7 +1225,7 @@ mod tests {
             let gate_preimage = read_matrix_from_multi_batch::<DCRTPolyMatrix>(
                 &params,
                 dir,
-                &format!("{checkpoint_prefix}_gate_preimage_{}_dst{}", transferred, dst_slot),
+                &format!("{checkpoint_prefix}_gate_preimage_{}_dst{}", transferred_gate, dst_slot),
                 0,
             )
             .expect("gate preimage checkpoint should exist");

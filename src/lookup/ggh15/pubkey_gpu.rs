@@ -977,26 +977,21 @@ where
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
     M::P: 'static,
-    <M::P as Poly>::Params: Default,
 {
-    fn sample_aux_matrices_lut_entry_time(&self) -> SampleAuxBenchEstimate {
-        let params = <M::P as Poly>::Params::default();
+    type Params = <M::P as Poly>::Params;
+
+    fn sample_aux_matrices_lut_entry_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate {
         let lut_id = 0usize;
-        let trap_sampler = TS::new(&params, self.trapdoor_sigma);
-        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, self.d);
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, self.d);
         let gpu_lut_base_shared =
-            self.prepare_gpu_lut_base_device_shared(&params, &b1_trapdoor, &b1_matrix);
+            self.prepare_gpu_lut_base_device_shared(params, &b1_trapdoor, &b1_matrix);
         let gpu_lut_shared = self.prepare_gpu_lut_device_shared(lut_id, &gpu_lut_base_shared);
         let batch =
             vec![(0usize, 0usize, M::P::from_usize_to_constant(gpu_lut_shared[0].params, 1usize))];
         let start = Instant::now();
-        let jobs = self.sample_lut_preimages_gpu(
-            &params,
-            lut_id,
-            "bench_lut_aux",
-            &gpu_lut_shared,
-            &batch,
-        );
+        let jobs =
+            self.sample_lut_preimages_gpu(params, lut_id, "bench_lut_aux", &gpu_lut_shared, &batch);
         let elapsed = start.elapsed().as_secs_f64();
         SampleAuxBenchEstimate {
             latency: elapsed,
@@ -1005,18 +1000,17 @@ where
         }
     }
 
-    fn sample_aux_matrices_lut_gate_time(&self) -> SampleAuxBenchEstimate {
-        let params = <M::P as Poly>::Params::default();
+    fn sample_aux_matrices_lut_gate_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate {
         let lut_id = 0usize;
-        let trap_sampler = TS::new(&params, self.trapdoor_sigma);
-        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(&params, self.d);
-        let (_b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, self.d);
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, self.d);
+        let (_b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, self.d);
         let gpu_gate_base_shared =
-            self.prepare_gpu_gate_base_device_shared(&params, &b0_trapdoor, &b0_matrix, &b1_matrix);
-        let w_block_identity = self.derive_w_block_identity(&params, lut_id);
-        let w_block_gy = self.derive_w_block_gy(&params, lut_id);
-        let w_block_v = self.derive_w_block_v(&params, lut_id);
-        let w_block_vx = self.derive_w_block_vx(&params, lut_id);
+            self.prepare_gpu_gate_base_device_shared(params, &b0_trapdoor, &b0_matrix, &b1_matrix);
+        let w_block_identity = self.derive_w_block_identity(params, lut_id);
+        let w_block_gy = self.derive_w_block_gy(params, lut_id);
+        let w_block_v = self.derive_w_block_v(params, lut_id);
+        let w_block_vx = self.derive_w_block_vx(params, lut_id);
         let w_block_identity_by_device =
             self.copy_matrix_to_gpu_gate_devices(&w_block_identity, &gpu_gate_base_shared);
         let w_block_gy_by_device =
@@ -1032,10 +1026,10 @@ where
             w_block_v_by_device,
             w_block_vx_by_device,
         );
-        let input_pubkey_bytes = M::gadget_matrix(&params, self.d).into_compact_bytes();
+        let input_pubkey_bytes = M::gadget_matrix(params, self.d).into_compact_bytes();
         let start = Instant::now();
         let compact_bytes = self.sample_gate_preimages_batch_gpu(
-            &params,
+            params,
             lut_id,
             vec![(
                 GateId(0),

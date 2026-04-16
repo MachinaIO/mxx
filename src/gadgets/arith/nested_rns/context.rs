@@ -1,4 +1,5 @@
 use super::*;
+use crate::gadgets::arith::ModularArithmeticContext;
 
 /// Pack one q-level worth of p-residue wires into the repository's `BatchedWire` shape.
 ///
@@ -209,14 +210,6 @@ impl NestedRnsPolyContext {
 
     pub(crate) fn reduced_p_max_trace(&self) -> BigUint {
         BigUint::from(self.p_max - 1)
-    }
-
-    pub(crate) fn p_full_ref(&self) -> &BigUint {
-        &self.p_full
-    }
-
-    pub(crate) fn lut_mod_p_max_map_size_ref(&self) -> &BigUint {
-        &self.lut_mod_p_max_map_size
     }
 
     pub(super) fn unreduced_trace_threshold(&self) -> BigUint {
@@ -904,5 +897,73 @@ impl NestedRnsPolyContext {
             .collect::<Vec<_>>();
         circuit.output(outputs);
         circuit
+    }
+}
+
+impl<P: Poly + 'static> ModularArithmeticContext<P> for NestedRnsPolyContext {
+    fn register_local_in(&self, circuit: &mut PolyCircuit<P>) -> Self {
+        self.register_subcircuits_in(circuit)
+    }
+
+    fn register_shared_in(
+        &self,
+        source_circuit: &PolyCircuit<P>,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        self.register_shared_subcircuits_in(source_circuit, circuit)
+    }
+
+    fn q_moduli_depth(&self) -> usize {
+        self.q_moduli_depth
+    }
+
+    fn decomposition_len(&self) -> usize {
+        self.p_moduli.len() + 1
+    }
+
+    fn q_level_row_width(&self) -> usize {
+        self.p_moduli.len()
+    }
+
+    fn full_reduce_output_metadata(
+        &self,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+    ) -> (Vec<BigUint>, Vec<BigUint>) {
+        NestedRnsPolyContext::full_reduce_output_metadata(self, enable_levels, level_offset)
+    }
+
+    fn reduced_p_max_trace(&self) -> BigUint {
+        NestedRnsPolyContext::reduced_p_max_trace(self)
+    }
+
+    fn randomizer_decomposition_bound(&self) -> u64 {
+        self.p_moduli
+            .iter()
+            .copied()
+            .max()
+            .expect("NestedRnsPolyContext requires at least one p modulus")
+    }
+
+    fn decomposition_term_bound(&self, term_idx: usize) -> BigUint {
+        if term_idx < self.p_moduli.len() {
+            BigUint::from(self.p_moduli[term_idx] - 1)
+        } else {
+            BigUint::from(
+                u64::try_from(self.p_moduli.len()).expect("p_moduli length must fit in u64"),
+            )
+        }
+    }
+
+    fn full_reduce_level_plaintext_bound(&self, q_idx: usize) -> BigUint {
+        self.full_reduce_max_plaintexts[q_idx].clone()
+    }
+
+    fn plaintext_capacity_bound(&self) -> BigUint {
+        self.p_full.clone()
+    }
+
+    fn trace_capacity_bound(&self) -> BigUint {
+        self.lut_mod_p_max_map_size.clone()
     }
 }

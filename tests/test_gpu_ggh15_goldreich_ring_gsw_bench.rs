@@ -289,7 +289,7 @@ fn active_q_moduli_and_modulus<T: PolyParams>(
     (active_q_moduli, active_q, crt_depth)
 }
 
-fn ring_gsw_q_modulus<P: Poly>(ctx: &RingGswContext<P>) -> BigUint {
+fn ring_gsw_q_modulus<P: Poly + 'static>(ctx: &RingGswContext<P>) -> BigUint {
     let (q_moduli, _, _) = ctx.params.to_crt();
     q_moduli
         .iter()
@@ -315,7 +315,6 @@ where
 struct CrtDepthProbe {
     params: DCRTPolyParams,
     eval_ok: bool,
-    decryption_ok: bool,
 }
 
 impl CrtDepthProbe {
@@ -401,7 +400,7 @@ fn probe_crt_depth_for_goldreich_ring_gsw_bench(
         decryption_ok
     );
 
-    CrtDepthProbe { params, eval_ok, decryption_ok }
+    CrtDepthProbe { params, eval_ok }
 }
 
 fn build_goldreich_ring_gsw_circuit<P: Poly + 'static>(

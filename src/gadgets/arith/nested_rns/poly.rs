@@ -1,5 +1,11 @@
 use super::{context::nested_rns_level_from_wires, *};
-use crate::utils::mod_inverse;
+use crate::{
+    gadgets::arith::{
+        DecomposeArithmeticGadget, ModularArithmeticContext, ModularArithmeticGadget,
+    },
+    matrix::PolyMatrix,
+    utils::mod_inverse,
+};
 use num_traits::ToPrimitive;
 
 /// Build the large-scalar bindings used by the subtraction helper that adds trace offsets first.
@@ -71,11 +77,8 @@ impl<P: Poly> NestedRnsPoly<P> {
             ctx.q_moduli_depth
         );
         let inner = (0..input_count).map(|_| circuit.input(ctx.p_moduli.len())).collect();
-        let max_plaintexts = ctx
-            .q_moduli
-            .iter()
-            .skip(level_offset)
-            .take(input_count)
+        let max_plaintexts = ctx.q_moduli[level_offset..level_offset + input_count]
+            .par_iter()
             .map(|&q_i| BigUint::from(q_i - 1))
             .collect();
         Self::new(ctx, inner, Some(level_offset), enable_levels, max_plaintexts)
@@ -1241,4 +1244,253 @@ fn u64_to_u32_digits(mut value: u64) -> Vec<u32> {
         value >>= 32;
     }
     digits
+}
+
+impl<P: Poly + 'static> ModularArithmeticGadget<P> for NestedRnsPoly<P> {
+    type Context = NestedRnsPolyContext;
+
+    fn context(&self) -> &Arc<Self::Context> {
+        &self.ctx
+    }
+
+    fn level_offset(&self) -> usize {
+        self.level_offset
+    }
+
+    fn enable_levels(&self) -> Option<usize> {
+        self.enable_levels
+    }
+
+    fn max_plaintexts(&self) -> &[BigUint] {
+        &self.max_plaintexts
+    }
+
+    fn p_max_traces(&self) -> &[BigUint] {
+        &self.p_max_traces
+    }
+
+    fn input(
+        ctx: Arc<Self::Context>,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        NestedRnsPoly::input(ctx, enable_levels, level_offset, circuit)
+    }
+
+    fn input_with_metadata(
+        ctx: Arc<Self::Context>,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+        max_plaintexts: Vec<BigUint>,
+        p_max_traces: Vec<BigUint>,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        NestedRnsPoly::input_with_metadata(
+            ctx,
+            enable_levels,
+            level_offset,
+            max_plaintexts,
+            p_max_traces,
+            circuit,
+        )
+    }
+
+    fn active_q_moduli(&self) -> Vec<u64> {
+        self.active_q_moduli()
+    }
+
+    fn flatten(&self) -> Vec<BatchedWire> {
+        self.inner
+            .iter()
+            .copied()
+            .flat_map(|row| row.gate_ids().map(BatchedWire::single).collect::<Vec<_>>())
+            .collect()
+    }
+
+    fn from_flat_outputs(
+        template: &Self,
+        outputs: &[GateId],
+        max_plaintexts: Vec<BigUint>,
+        p_max_traces: Vec<BigUint>,
+    ) -> Self {
+        let levels = template.active_q_moduli().len();
+        let p_moduli_depth = template.ctx.p_moduli.len();
+        assert_eq!(
+            outputs.len(),
+            levels * p_moduli_depth,
+            "flattened nested-RNS output size must match active_levels * p_moduli_depth"
+        );
+        NestedRnsPoly::new(
+            template.ctx.clone(),
+            outputs
+                .chunks(p_moduli_depth)
+                .map(|row| BatchedWire::from_batches(row.iter().copied()))
+                .collect::<Vec<_>>(),
+            Some(template.level_offset),
+            template.enable_levels,
+            max_plaintexts,
+        )
+        .with_p_max_traces(p_max_traces)
+    }
+
+    fn q_level_row_batch(&self, q_idx: usize) -> BatchedWire {
+        self.inner[q_idx]
+    }
+
+    fn sparse_level_poly_with_metadata(
+        ctx: Arc<Self::Context>,
+        active_levels: usize,
+        enable_levels: Option<usize>,
+        level_offset: usize,
+        target_q_idx: usize,
+        target_row: BatchedWire,
+        max_plaintext: BigUint,
+        p_max_trace: BigUint,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        Self::sparse_level_poly_from_row_with_metadata(
+            ctx,
+            active_levels,
+            enable_levels,
+            level_offset,
+            target_q_idx,
+            target_row,
+            max_plaintext,
+            p_max_trace,
+            circuit,
+        )
+    }
+
+    fn slot_transfer(
+        &self,
+        src_slots: &[(u32, Option<Vec<u64>>)],
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        self.slot_transfer(src_slots, circuit)
+    }
+
+    fn add(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
+        self.add(other, circuit)
+    }
+
+    fn sub(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
+        self.sub(other, circuit)
+    }
+
+    fn mul(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
+        self.mul(other, circuit)
+    }
+
+    fn mul_right_sparse(
+        &self,
+        other: &Self,
+        rhs_q_idx: usize,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        self.mul_right_sparse(other, rhs_q_idx, circuit)
+    }
+
+    fn full_reduce(&self, circuit: &mut PolyCircuit<P>) -> Self {
+        self.full_reduce(circuit)
+    }
+
+    fn prepare_for_reconstruct(&self, circuit: &mut PolyCircuit<P>) -> Self {
+        self.prepare_for_reconstruct(circuit)
+    }
+
+    fn const_mul(&self, tower_constants: &[u64], circuit: &mut PolyCircuit<P>) -> Self {
+        self.const_mul(tower_constants, circuit)
+    }
+
+    fn reconstruct(&self, circuit: &mut PolyCircuit<P>) -> GateId {
+        self.reconstruct(circuit)
+    }
+}
+
+impl<P: Poly + 'static> DecomposeArithmeticGadget<P> for NestedRnsPoly<P> {
+    fn gadget_matrix<M: PolyMatrix<P = P>>(
+        params: &P::Params,
+        ctx: &Self::Context,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+    ) -> M {
+        M::from_poly_vec_row(
+            params,
+            nested_rns_gadget_vector::<P, M>(params, ctx, enable_levels, level_offset).get_row(0),
+        )
+    }
+
+    fn gadget_decomposed<M: PolyMatrix<P = P>>(
+        params: &P::Params,
+        ctx: &Self::Context,
+        target: &M,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+    ) -> M {
+        nested_rns_gadget_decomposed(params, ctx, target, enable_levels, level_offset)
+    }
+
+    fn gadget_decomposition_norm_bound(
+        ctx: &Self::Context,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+    ) -> BigUint {
+        let levels = <NestedRnsPolyContext as ModularArithmeticContext<P>>::active_levels(
+            ctx,
+            enable_levels,
+            level_offset,
+        );
+        BigUint::from(
+            u64::try_from(
+                levels *
+                    <NestedRnsPolyContext as ModularArithmeticContext<P>>::decomposition_len(ctx),
+            )
+            .expect("gadget decomposition width must fit in u64"),
+        )
+    }
+
+    fn randomizer_decomposition_norm_bound(
+        ctx: &Self::Context,
+        _enable_levels: Option<usize>,
+        _level_offset: Option<usize>,
+    ) -> BigUint {
+        BigUint::from(
+            *ctx.p_moduli
+                .iter()
+                .max()
+                .expect("NestedRnsPolyContext requires at least one p modulus"),
+        )
+    }
+
+    fn gadget_vector(
+        ctx: Arc<Self::Context>,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Vec<Self> {
+        NestedRnsPoly::gadget_vector(ctx, enable_levels, level_offset, circuit)
+    }
+
+    fn gadget_decompose(&self, circuit: &mut PolyCircuit<P>) -> Vec<Self> {
+        self.gadget_decompose(circuit)
+    }
+
+    fn decomposition_terms_for_level(
+        &self,
+        q_idx: usize,
+        circuit: &mut PolyCircuit<P>,
+    ) -> (Vec<GateId>, GateId) {
+        self.decomposition_terms_for_level(q_idx, circuit)
+    }
+
+    fn conv_mul_right_decomposed_many(
+        &self,
+        params: &P::Params,
+        left_rows: &[&[Self]],
+        num_slots: usize,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Vec<Self> {
+        self.conv_mul_right_decomposed_many(params, left_rows, num_slots, circuit)
+    }
 }

@@ -2,11 +2,11 @@ use crate::{
     circuit::{BatchedWire, PolyCircuit, evaluable::PolyVec, gate::GateId},
     gadgets::{
         arith::{
-            NestedRnsPoly, NestedRnsPolyContext, nested_rns_gadget_decomposed,
-            nested_rns_gadget_vector,
+            DecomposeArithmeticGadget, ModularArithmeticContext, ModularArithmeticGadget,
+            NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly_with_offset,
+            nested_rns_gadget_decomposed, nested_rns_gadget_vector,
         },
         conv_mul::negacyclic_conv_mul_right_decomposed_term_many_shared_subcircuit,
-        ntt::encode_nested_rns_poly_vec_with_offset,
     },
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     poly::{
@@ -67,14 +67,15 @@ fn validate_num_slots<P: Poly>(params: &P::Params, num_slots: usize) {
     );
 }
 
-fn reduce_nested_rns_terms_pairwise<P, F>(
-    mut current_layer: Vec<NestedRnsPoly<P>>,
+fn reduce_nested_rns_terms_pairwise<P, A, F>(
+    mut current_layer: Vec<A>,
     circuit: &mut PolyCircuit<P>,
     mut combine: F,
-) -> NestedRnsPoly<P>
+) -> A
 where
     P: Poly,
-    F: FnMut(&NestedRnsPoly<P>, &NestedRnsPoly<P>, &mut PolyCircuit<P>) -> NestedRnsPoly<P>,
+    A: ModularArithmeticGadget<P>,
+    F: FnMut(&A, &A, &mut PolyCircuit<P>) -> A,
 {
     assert!(
         !current_layer.is_empty(),
@@ -118,18 +119,20 @@ where
     batches
 }
 
-fn flatten_nested_rns_entries<P: Poly>(entries: &[NestedRnsPoly<P>]) -> Vec<BatchedWire> {
+fn flatten_nested_rns_entries<P: Poly, A: ModularArithmeticGadget<P>>(
+    entries: &[A],
+) -> Vec<BatchedWire> {
     entries
         .par_iter()
-        .map(|entry| compress_gate_ids_to_batches(entry.inner.iter().copied()))
+        .map(|entry| compress_gate_ids_to_batches(entry.flatten()))
         .collect::<Vec<_>>()
         .into_iter()
         .flatten()
         .collect()
 }
 
-fn flatten_nested_rns_q_level_rows_for_gadget_terms<P: Poly>(
-    entries: &[NestedRnsPoly<P>],
+fn flatten_nested_rns_q_level_rows_for_gadget_terms<P: Poly, A: ModularArithmeticGadget<P>>(
+    entries: &[A],
     gadget_len: usize,
     chunk_width: usize,
 ) -> Vec<BatchedWire> {
@@ -149,7 +152,7 @@ fn flatten_nested_rns_q_level_rows_for_gadget_terms<P: Poly>(
         .enumerate()
         .map(|(entry_offset, entry)| {
             let sparse_q_idx = (entry_offset % gadget_len) / chunk_width;
-            vec![entry.inner[sparse_q_idx]]
+            vec![entry.q_level_row_batch(sparse_q_idx)]
         })
         .collect::<Vec<_>>()
         .into_iter()
@@ -157,50 +160,34 @@ fn flatten_nested_rns_q_level_rows_for_gadget_terms<P: Poly>(
         .collect()
 }
 
-fn nested_rns_from_flat_outputs<P: Poly, W: Into<BatchedWire> + Copy>(
-    template: &NestedRnsPoly<P>,
+fn nested_rns_from_flat_outputs<
+    P: Poly,
+    A: ModularArithmeticGadget<P>,
+    W: Into<BatchedWire> + Copy + Send + Sync,
+>(
+    template: &A,
     outputs: &[W],
     max_plaintexts: Vec<BigUint>,
     p_max_traces: Vec<BigUint>,
-) -> NestedRnsPoly<P> {
-    let levels = template.active_q_moduli().len();
-    let p_moduli_depth = template.ctx.p_moduli.len();
+) -> A {
     let outputs = outputs
-        .iter()
+        .par_iter()
         .copied()
-        .map(Into::into)
+        .map(|output| output.into())
         .map(BatchedWire::as_single_wire)
         .collect::<Vec<_>>();
-    assert_eq!(
-        outputs.len(),
-        levels * p_moduli_depth,
-        "flattened Ring-GSW nested-RNS output size must match active_levels * p_moduli_depth"
-    );
-    NestedRnsPoly::new(
-        template.ctx.clone(),
-        outputs
-            .chunks(p_moduli_depth)
-            .map(|row| BatchedWire::from_batches(row.iter().copied()))
-            .collect::<Vec<_>>(),
-        Some(template.level_offset),
-        template.enable_levels,
-        max_plaintexts,
-    )
-    .with_p_max_traces(p_max_traces)
+    A::from_flat_outputs(template, &outputs, max_plaintexts, p_max_traces)
 }
 
-fn raw_decomposed_term_bound(template_ctx: &NestedRnsPolyContext, term_idx: usize) -> BigUint {
-    if term_idx < template_ctx.p_moduli.len() {
-        BigUint::from(template_ctx.p_moduli[term_idx] - 1)
-    } else {
-        BigUint::from(
-            u64::try_from(template_ctx.p_moduli.len()).expect("p_moduli length must fit in u64"),
-        )
-    }
+fn raw_decomposed_term_bound<P: Poly, C: ModularArithmeticContext<P>>(
+    template_ctx: &C,
+    term_idx: usize,
+) -> BigUint {
+    template_ctx.decomposition_term_bound(term_idx)
 }
 
-fn add_nested_rns_scalar_metadata(
-    ctx: &NestedRnsPolyContext,
+fn add_nested_rns_scalar_metadata<P: Poly, C: ModularArithmeticContext<P>>(
+    ctx: &C,
     sparse_q_idx: usize,
     level_offset: usize,
     left_max_plaintext: &BigUint,
@@ -209,36 +196,39 @@ fn add_nested_rns_scalar_metadata(
     right_p_max_trace: &BigUint,
 ) -> (BigUint, BigUint) {
     let reduced_trace = ctx.reduced_p_max_trace();
-    let reduced_bound = ctx.full_reduce_max_plaintexts[level_offset + sparse_q_idx].clone();
+    let reduced_bound = ctx.full_reduce_level_plaintext_bound(level_offset + sparse_q_idx);
     let mut left_bound = left_max_plaintext.clone();
     let mut right_bound = right_max_plaintext.clone();
     let mut left_trace = left_p_max_trace.clone();
     let mut right_trace = right_p_max_trace.clone();
 
-    if &left_bound + &right_bound >= *ctx.p_full_ref() {
+    if &left_bound + &right_bound >= ctx.plaintext_capacity_bound() {
         left_bound = reduced_bound.clone();
         right_bound = reduced_bound;
         left_trace = reduced_trace.clone();
         right_trace = reduced_trace.clone();
     }
 
-    if &left_trace + &right_trace >= *ctx.lut_mod_p_max_map_size_ref() {
+    if &left_trace + &right_trace >= ctx.trace_capacity_bound() {
         left_trace = reduced_trace.clone();
         right_trace = reduced_trace;
     }
 
     let final_bound = left_bound + right_bound;
-    assert!(final_bound < *ctx.p_full_ref(), "metadata-only add output exceeds p_full");
+    assert!(
+        final_bound < ctx.plaintext_capacity_bound(),
+        "metadata-only add output exceeds p_full"
+    );
     let final_trace = left_trace + right_trace;
     assert!(
-        final_trace < *ctx.lut_mod_p_max_map_size_ref(),
+        final_trace < ctx.trace_capacity_bound(),
         "metadata-only add output exceeds lut_mod_p_max_map_size"
     );
     (final_bound, final_trace)
 }
 
-fn raw_decomposed_conv_output_scalar_metadata(
-    ctx: &NestedRnsPolyContext,
+fn raw_decomposed_conv_output_scalar_metadata<P: Poly, C: ModularArithmeticContext<P>>(
+    ctx: &C,
     level_offset: usize,
     sparse_q_idx: usize,
     term_idx: usize,
@@ -273,8 +263,8 @@ fn raw_decomposed_conv_output_scalar_metadata(
     current_layer.pop().expect("raw decomposed convolution metadata requires at least one term")
 }
 
-fn build_local_dot_term_groups_for_level(
-    helper_ctx: &NestedRnsPolyContext,
+fn build_local_dot_term_groups_for_level<P: Poly, C: ModularArithmeticContext<P>>(
+    helper_ctx: &C,
     level_offset: usize,
     sparse_q_idx: usize,
     chunk_width: usize,
@@ -311,7 +301,7 @@ fn build_local_dot_term_groups_for_level(
             let col_idx = level_base + term_idx;
             let lhs_row = row_q_levels[col_idx];
             let term_gate = column_terms[col_idx];
-            let (term_bound, term_trace) = raw_decomposed_conv_output_scalar_metadata(
+            let (term_bound, term_trace) = raw_decomposed_conv_output_scalar_metadata::<P, C>(
                 helper_ctx,
                 level_offset,
                 sparse_q_idx,
@@ -322,8 +312,8 @@ fn build_local_dot_term_groups_for_level(
             let next_bound = &current_group_bound + &term_bound;
             let next_trace = &current_group_trace + &term_trace;
             if !current_term_inputs.is_empty() &&
-                (next_bound >= *helper_ctx.p_full_ref() ||
-                    next_trace >= *helper_ctx.lut_mod_p_max_map_size_ref())
+                (next_bound >= helper_ctx.plaintext_capacity_bound() ||
+                    next_trace >= helper_ctx.trace_capacity_bound())
             {
                 grouped_term_inputs.push(std::mem::take(&mut current_term_inputs));
                 grouped_bounds.push(std::mem::take(&mut current_group_bound));
@@ -504,19 +494,47 @@ pub fn ciphertext_inputs_from_native<P: Poly>(
     level_offset: usize,
     enable_levels: Option<usize>,
 ) -> Vec<PolyVec<P>> {
-    let mut inputs = Vec::new();
-    for row in ciphertext {
-        for poly in row {
-            inputs.extend(encode_nested_rns_poly_vec_with_offset::<P>(
-                params,
-                ctx,
-                &poly.coeffs_biguints(),
-                level_offset,
-                enable_levels,
-            ));
-        }
-    }
-    inputs
+    ciphertext
+        .par_iter()
+        .map(|row| {
+            row.par_iter()
+                .map(|poly| {
+                    let coeff_encodings = poly
+                        .coeffs_biguints()
+                        .into_par_iter()
+                        .map(|coeff| {
+                            encode_nested_rns_poly_with_offset::<P>(
+                                ctx.p_moduli_bits,
+                                ctx.max_unreduced_muls,
+                                params,
+                                &coeff,
+                                level_offset,
+                                enable_levels,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let encoded_len = coeff_encodings.first().map(|encoded| encoded.len()).expect(
+                        "native Ring-GSW ciphertext polynomials must have at least one slot",
+                    );
+                    (0..encoded_len)
+                        .into_par_iter()
+                        .map(|gate_idx| {
+                            PolyVec::new(
+                                coeff_encodings
+                                    .par_iter()
+                                    .map(|encoded| encoded[gate_idx].clone())
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect()
 }
 
 fn ciphertext_poly_from_output(params: &DCRTPolyParams, output: &PolyVec<DCRTPoly>) -> DCRTPoly {
@@ -588,10 +606,11 @@ pub fn decrypt_ciphertext(
 }
 
 #[derive(Debug, Clone)]
-pub struct RingGswContext<P: Poly> {
+pub struct RingGswContext<P: Poly, A: DecomposeArithmeticGadget<P> = NestedRnsPoly<P>> {
     pub params: P::Params,
     pub num_slots: usize,
-    pub nested_rns: Arc<NestedRnsPolyContext>,
+    pub arith_ctx: Arc<A::Context>,
+    pub nested_rns: Arc<A::Context>,
     pub level_offset: usize,
     pub active_levels: usize,
     pub randomizer_norm_ctx: Arc<SimulatorContext>,
@@ -602,13 +621,13 @@ pub struct RingGswContext<P: Poly> {
     pub mul_output_p_max_traces: Vec<BigUint>,
 }
 
-impl<P: Poly> RingGswContext<P> {
+impl<P: Poly, A: DecomposeArithmeticGadget<P>> RingGswContext<P, A> {
     pub fn width(&self) -> usize {
-        2 * self.active_levels * (self.nested_rns.p_moduli.len() + 1)
+        2 * self.gadget_len()
     }
 
     pub fn gadget_len(&self) -> usize {
-        self.active_levels * (self.nested_rns.p_moduli.len() + 1)
+        self.arith_ctx.gadget_len(Some(self.active_levels), Some(self.level_offset))
     }
 
     pub fn fresh_randomizer_norm(&self) -> PolyMatrixNorm {
@@ -622,67 +641,69 @@ impl<P: Poly> RingGswContext<P> {
     }
 
     pub fn decomposed_randomizer_norm(&self) -> PolyMatrixNorm {
-        let max_p_modulus = *self
-            .nested_rns
-            .p_moduli
-            .iter()
-            .max()
-            .expect("RingGswContext requires at least one p modulus");
         PolyMatrixNorm::new(
             self.randomizer_norm_ctx.clone(),
             self.width(),
             self.width(),
-            BigDecimal::from(max_p_modulus),
+            BigDecimal::from(
+                A::randomizer_decomposition_norm_bound(
+                    self.arith_ctx.as_ref(),
+                    Some(self.active_levels),
+                    Some(self.level_offset),
+                )
+                .to_u64()
+                .expect("gadget decomposition norm bound must fit in u64 for SimulatorContext"),
+            ),
             None,
         )
     }
 }
 
-impl<P: Poly + 'static> RingGswContext<P> {
+impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P>> RingGswContext<P, A> {
     fn helper_circuit() -> PolyCircuit<P> {
         PolyCircuit::<P>::new()
     }
 
     fn entry_input_from_template(
-        template: &NestedRnsPoly<P>,
-        ctx: Arc<NestedRnsPolyContext>,
+        template: &A,
+        ctx: Arc<A::Context>,
         circuit: &mut PolyCircuit<P>,
-    ) -> NestedRnsPoly<P> {
-        NestedRnsPoly::input_with_metadata(
+    ) -> A {
+        A::input_with_metadata(
             ctx,
-            template.enable_levels,
-            Some(template.level_offset),
-            template.max_plaintexts.clone(),
-            template.p_max_traces.clone(),
+            template.enable_levels(),
+            Some(template.level_offset()),
+            template.max_plaintexts().to_vec(),
+            template.p_max_traces().to_vec(),
             circuit,
         )
     }
 
     fn entry_binary_subcircuit<F>(
         source_circuit: &PolyCircuit<P>,
-        lhs: &NestedRnsPoly<P>,
-        rhs: &NestedRnsPoly<P>,
+        lhs: &A,
+        rhs: &A,
         combine: F,
     ) -> (PolyCircuit<P>, RingGswEntryOutputMetadata)
     where
-        F: Fn(&NestedRnsPoly<P>, &NestedRnsPoly<P>, &mut PolyCircuit<P>) -> NestedRnsPoly<P> + Copy,
+        F: Fn(&A, &A, &mut PolyCircuit<P>) -> A + Copy,
     {
         let mut helper_circuit = Self::helper_circuit();
         let helper_ctx =
-            Arc::new(lhs.ctx.register_shared_subcircuits_in(source_circuit, &mut helper_circuit));
+            Arc::new(lhs.context().register_shared_in(source_circuit, &mut helper_circuit));
         let lhs_entry =
             Self::entry_input_from_template(lhs, helper_ctx.clone(), &mut helper_circuit);
         let rhs_entry = Self::entry_input_from_template(rhs, helper_ctx, &mut helper_circuit);
         let output = combine(&lhs_entry, &rhs_entry, &mut helper_circuit);
-        let metadata = RingGswCiphertext::entry_output_metadata(&output);
+        let metadata = RingGswCiphertext::<P, A>::entry_output_metadata(&output);
         helper_circuit.output(flatten_nested_rns_entries(std::slice::from_ref(&output)));
         (helper_circuit, metadata)
     }
 
     fn add_entry_subcircuit(
         source_circuit: &PolyCircuit<P>,
-        lhs: &NestedRnsPoly<P>,
-        rhs: &NestedRnsPoly<P>,
+        lhs: &A,
+        rhs: &A,
     ) -> (PolyCircuit<P>, RingGswEntryOutputMetadata) {
         Self::entry_binary_subcircuit(source_circuit, lhs, rhs, |left, right, circuit| {
             left.add(right, circuit)
@@ -691,68 +712,44 @@ impl<P: Poly + 'static> RingGswContext<P> {
 
     fn sub_entry_subcircuit(
         source_circuit: &PolyCircuit<P>,
-        lhs: &NestedRnsPoly<P>,
-        rhs: &NestedRnsPoly<P>,
+        lhs: &A,
+        rhs: &A,
     ) -> (PolyCircuit<P>, RingGswEntryOutputMetadata) {
         Self::entry_binary_subcircuit(source_circuit, lhs, rhs, |left, right, circuit| {
             left.sub(right, circuit)
         })
     }
 
-    pub fn setup(
+    pub fn from_arith_context(
         circuit: &mut PolyCircuit<P>,
         params: &P::Params,
         num_slots: usize,
-        p_moduli_bits: usize,
-        max_unreduced_muls: usize,
-        scale: u64,
+        arith_ctx: Arc<A::Context>,
         enable_levels: Option<usize>,
         level_offset: Option<usize>,
     ) -> Self {
         validate_num_slots::<P>(params, num_slots);
         let level_offset = level_offset.unwrap_or(0);
-        let (_, _, max_q_moduli_depth) = params.to_crt();
-        let active_levels = enable_levels.unwrap_or_else(|| {
-            max_q_moduli_depth
-                .checked_sub(level_offset)
-                .expect("level_offset must not exceed q_moduli_depth")
-        });
+        let active_levels = arith_ctx.active_levels(enable_levels, Some(level_offset));
         assert!(active_levels > 0, "RingGswContext requires at least one active q level");
-        let nested_rns_depth = level_offset + active_levels;
-        assert!(
-            nested_rns_depth <= max_q_moduli_depth,
-            "active Ring-GSW q-window exceeds NestedRnsPolyContext depth"
-        );
         let setup_start = Instant::now();
-        let nested_rns_start = Instant::now();
-        let nested_rns = Arc::new(NestedRnsPolyContext::setup(
-            circuit,
-            params,
-            p_moduli_bits,
-            max_unreduced_muls,
-            scale,
-            false,
-            Some(nested_rns_depth),
-        ));
-        debug!(
-            "RingGswContext::setup nested_rns context ready: active_levels={}, width_hint={}, elapsed_ms={}",
-            active_levels,
-            2 * active_levels * (nested_rns.p_moduli.len() + 1),
-            nested_rns_start.elapsed().as_millis()
-        );
-        let width = 2 * active_levels * (nested_rns.p_moduli.len() + 1);
-        let max_p_modulus = *nested_rns
-            .p_moduli
-            .iter()
-            .max()
-            .expect("RingGswContext requires at least one p modulus");
-        let randomizer_norm_ctx = ring_gsw_randomizer_norm_ctx::<P>(params, width, max_p_modulus);
+        let registered_arith_ctx = Arc::new(arith_ctx.register_local_in(circuit));
+        let width = 2 * registered_arith_ctx.gadget_len(Some(active_levels), Some(level_offset));
+        let max_decomposition_value = A::randomizer_decomposition_norm_bound(
+            registered_arith_ctx.as_ref(),
+            Some(active_levels),
+            Some(level_offset),
+        )
+        .to_u64()
+        .expect("gadget decomposition norm bound must fit in u64 for SimulatorContext");
+        let randomizer_norm_ctx =
+            ring_gsw_randomizer_norm_ctx::<P>(params, width, max_decomposition_value);
         let mul_subcircuit_start = Instant::now();
         let (mul_subcircuit, mul_output_template) = Self::mul_subcircuit(
             circuit,
             params,
             num_slots,
-            nested_rns.as_ref(),
+            registered_arith_ctx.as_ref(),
             active_levels,
             level_offset,
             width,
@@ -766,15 +763,16 @@ impl<P: Poly + 'static> RingGswContext<P> {
         let ctx = Arc::new(Self {
             params: params.clone(),
             num_slots,
-            nested_rns,
+            arith_ctx: registered_arith_ctx.clone(),
+            nested_rns: registered_arith_ctx,
             level_offset,
             active_levels,
             randomizer_norm_ctx,
             add_entry_cache: DashMap::new(),
             sub_entry_cache: DashMap::new(),
             mul_subcircuit_id,
-            mul_output_max_plaintexts: mul_output_template.max_plaintexts,
-            mul_output_p_max_traces: mul_output_template.p_max_traces,
+            mul_output_max_plaintexts: mul_output_template.max_plaintexts().to_vec(),
+            mul_output_p_max_traces: mul_output_template.p_max_traces().to_vec(),
         });
         debug!(
             "RingGswContext::setup completed: width={}, wrapper_prebuild_elapsed_ms={}, total_elapsed_ms={}",
@@ -789,18 +787,17 @@ impl<P: Poly + 'static> RingGswContext<P> {
         source_circuit: &PolyCircuit<P>,
         params: &P::Params,
         num_slots: usize,
-        template_ctx: &NestedRnsPolyContext,
+        template_ctx: &A::Context,
         active_levels: usize,
         level_offset: usize,
         width: usize,
-    ) -> (PolyCircuit<P>, NestedRnsPoly<P>) {
+    ) -> (PolyCircuit<P>, A) {
         let start = Instant::now();
         let mut circuit = Self::helper_circuit();
-        let nested_rns =
-            Arc::new(template_ctx.register_shared_subcircuits_in(source_circuit, &mut circuit));
+        let arith_ctx = Arc::new(template_ctx.register_shared_in(source_circuit, &mut circuit));
         let (normalized_max_plaintexts, normalized_p_max_traces) =
-            nested_rns.full_reduce_output_metadata(Some(active_levels), Some(level_offset));
-        let chunk_width = template_ctx.p_moduli.len() + 1;
+            arith_ctx.full_reduce_output_metadata(Some(active_levels), Some(level_offset));
+        let chunk_width = template_ctx.decomposition_len();
         let gadget_len = active_levels * chunk_width;
         assert_eq!(
             width,
@@ -895,8 +892,8 @@ impl<P: Poly + 'static> RingGswContext<P> {
         let input_start = Instant::now();
         let lhs_row0 = (0..width)
             .map(|_| {
-                NestedRnsPoly::input_with_metadata(
-                    nested_rns.clone(),
+                A::input_with_metadata(
+                    arith_ctx.clone(),
                     Some(active_levels),
                     Some(level_offset),
                     normalized_max_plaintexts.clone(),
@@ -907,8 +904,8 @@ impl<P: Poly + 'static> RingGswContext<P> {
             .collect::<Vec<_>>();
         let lhs_row1 = (0..width)
             .map(|_| {
-                NestedRnsPoly::input_with_metadata(
-                    nested_rns.clone(),
+                A::input_with_metadata(
+                    arith_ctx.clone(),
                     Some(active_levels),
                     Some(level_offset),
                     normalized_max_plaintexts.clone(),
@@ -919,8 +916,8 @@ impl<P: Poly + 'static> RingGswContext<P> {
             .collect::<Vec<_>>();
         let rhs_row0 = (0..width)
             .map(|_| {
-                NestedRnsPoly::input_with_metadata(
-                    nested_rns.clone(),
+                A::input_with_metadata(
+                    arith_ctx.clone(),
                     Some(active_levels),
                     Some(level_offset),
                     normalized_max_plaintexts.clone(),
@@ -931,8 +928,8 @@ impl<P: Poly + 'static> RingGswContext<P> {
             .collect::<Vec<_>>();
         let rhs_row1 = (0..width)
             .map(|_| {
-                NestedRnsPoly::input_with_metadata(
-                    nested_rns.clone(),
+                A::input_with_metadata(
+                    arith_ctx.clone(),
                     Some(active_levels),
                     Some(level_offset),
                     normalized_max_plaintexts.clone(),
@@ -947,7 +944,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
             input_start.elapsed().as_millis()
         );
 
-        let entry_size = active_levels * template_ctx.p_moduli.len();
+        let entry_size = lhs_row0[0].flat_output_size();
 
         let lhs_inputs_start = Instant::now();
         let (lhs_row0_inputs, lhs_row1_inputs) = rayon::join(
@@ -1016,7 +1013,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
 
     fn mul_columns_batch_subcircuit(
         source_circuit: &PolyCircuit<P>,
-        template_ctx: &NestedRnsPolyContext,
+        template_ctx: &A::Context,
         active_levels: usize,
         level_offset: usize,
         width: usize,
@@ -1032,10 +1029,9 @@ impl<P: Poly + 'static> RingGswContext<P> {
         );
         let start = Instant::now();
         let mut circuit = Self::helper_circuit();
-        let nested_rns =
-            Arc::new(template_ctx.register_shared_subcircuits_in(source_circuit, &mut circuit));
+        let arith_ctx = Arc::new(template_ctx.register_shared_in(source_circuit, &mut circuit));
         let (normalized_max_plaintexts, normalized_p_max_traces) =
-            nested_rns.full_reduce_output_metadata(Some(active_levels), Some(level_offset));
+            arith_ctx.full_reduce_output_metadata(Some(active_levels), Some(level_offset));
 
         let column_helper_start = Instant::now();
         let mul_column_subcircuit_id = circuit.register_shared_sub_circuit(mul_column_subcircuit);
@@ -1049,8 +1045,8 @@ impl<P: Poly + 'static> RingGswContext<P> {
         let input_start = Instant::now();
         let lhs_row0 = (0..width)
             .map(|_| {
-                NestedRnsPoly::input_with_metadata(
-                    nested_rns.clone(),
+                A::input_with_metadata(
+                    arith_ctx.clone(),
                     Some(active_levels),
                     Some(level_offset),
                     normalized_max_plaintexts.clone(),
@@ -1061,8 +1057,8 @@ impl<P: Poly + 'static> RingGswContext<P> {
             .collect::<Vec<_>>();
         let lhs_row1 = (0..width)
             .map(|_| {
-                NestedRnsPoly::input_with_metadata(
-                    nested_rns.clone(),
+                A::input_with_metadata(
+                    arith_ctx.clone(),
                     Some(active_levels),
                     Some(level_offset),
                     normalized_max_plaintexts.clone(),
@@ -1073,8 +1069,8 @@ impl<P: Poly + 'static> RingGswContext<P> {
             .collect::<Vec<_>>();
         let rhs_row0 = (0..batch_columns)
             .map(|_| {
-                NestedRnsPoly::input_with_metadata(
-                    nested_rns.clone(),
+                A::input_with_metadata(
+                    arith_ctx.clone(),
                     Some(active_levels),
                     Some(level_offset),
                     normalized_max_plaintexts.clone(),
@@ -1085,8 +1081,8 @@ impl<P: Poly + 'static> RingGswContext<P> {
             .collect::<Vec<_>>();
         let rhs_row1 = (0..batch_columns)
             .map(|_| {
-                NestedRnsPoly::input_with_metadata(
-                    nested_rns.clone(),
+                A::input_with_metadata(
+                    arith_ctx.clone(),
                     Some(active_levels),
                     Some(level_offset),
                     normalized_max_plaintexts.clone(),
@@ -1105,9 +1101,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
         let template_entry = lhs_row0
             .first()
             .expect("RingGswContext::mul_columns_batch_subcircuit requires positive width");
-        let levels = template_entry.active_q_moduli().len();
-        let p_moduli_depth = template_entry.ctx.p_moduli.len();
-        let entry_size = levels * p_moduli_depth;
+        let entry_size = template_entry.flat_output_size();
 
         let lhs_inputs_start = Instant::now();
         let (lhs_row0_inputs, lhs_row1_inputs) = rayon::join(
@@ -1170,7 +1164,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
 
     fn mul_super_batch_subcircuit(
         source_circuit: &PolyCircuit<P>,
-        template_ctx: &NestedRnsPolyContext,
+        template_ctx: &A::Context,
         active_levels: usize,
         level_offset: usize,
         width: usize,
@@ -1194,10 +1188,9 @@ impl<P: Poly + 'static> RingGswContext<P> {
         );
         let start = Instant::now();
         let mut circuit = Self::helper_circuit();
-        let nested_rns =
-            Arc::new(template_ctx.register_shared_subcircuits_in(source_circuit, &mut circuit));
+        let arith_ctx = Arc::new(template_ctx.register_shared_in(source_circuit, &mut circuit));
         let (normalized_max_plaintexts, normalized_p_max_traces) =
-            nested_rns.full_reduce_output_metadata(Some(active_levels), Some(level_offset));
+            arith_ctx.full_reduce_output_metadata(Some(active_levels), Some(level_offset));
 
         let batch_helper_start = Instant::now();
         let batch_subcircuit_id = circuit.register_shared_sub_circuit(batch_subcircuit);
@@ -1224,8 +1217,8 @@ impl<P: Poly + 'static> RingGswContext<P> {
         let input_start = Instant::now();
         let lhs_row0 = (0..width)
             .map(|_| {
-                NestedRnsPoly::input_with_metadata(
-                    nested_rns.clone(),
+                A::input_with_metadata(
+                    arith_ctx.clone(),
                     Some(active_levels),
                     Some(level_offset),
                     normalized_max_plaintexts.clone(),
@@ -1236,8 +1229,8 @@ impl<P: Poly + 'static> RingGswContext<P> {
             .collect::<Vec<_>>();
         let lhs_row1 = (0..width)
             .map(|_| {
-                NestedRnsPoly::input_with_metadata(
-                    nested_rns.clone(),
+                A::input_with_metadata(
+                    arith_ctx.clone(),
                     Some(active_levels),
                     Some(level_offset),
                     normalized_max_plaintexts.clone(),
@@ -1248,8 +1241,8 @@ impl<P: Poly + 'static> RingGswContext<P> {
             .collect::<Vec<_>>();
         let rhs_row0 = (0..super_batch_columns)
             .map(|_| {
-                NestedRnsPoly::input_with_metadata(
-                    nested_rns.clone(),
+                A::input_with_metadata(
+                    arith_ctx.clone(),
                     Some(active_levels),
                     Some(level_offset),
                     normalized_max_plaintexts.clone(),
@@ -1260,8 +1253,8 @@ impl<P: Poly + 'static> RingGswContext<P> {
             .collect::<Vec<_>>();
         let rhs_row1 = (0..super_batch_columns)
             .map(|_| {
-                NestedRnsPoly::input_with_metadata(
-                    nested_rns.clone(),
+                A::input_with_metadata(
+                    arith_ctx.clone(),
                     Some(active_levels),
                     Some(level_offset),
                     normalized_max_plaintexts.clone(),
@@ -1280,9 +1273,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
         let template_entry = lhs_row0
             .first()
             .expect("RingGswContext::mul_super_batch_subcircuit requires positive width");
-        let levels = template_entry.active_q_moduli().len();
-        let p_moduli_depth = template_entry.ctx.p_moduli.len();
-        let entry_size = levels * p_moduli_depth;
+        let entry_size = template_entry.flat_output_size();
 
         let lhs_inputs_start = Instant::now();
         let (lhs_row0_inputs, lhs_row1_inputs) = rayon::join(
@@ -1429,7 +1420,107 @@ impl<P: Poly + 'static> RingGswContext<P> {
 
     fn mul_column_subcircuit(
         source_circuit: &PolyCircuit<P>,
-        _params: &P::Params,
+        params: &P::Params,
+        num_slots: usize,
+        template_ctx: &A::Context,
+        active_levels: usize,
+        level_offset: usize,
+        width: usize,
+    ) -> (PolyCircuit<P>, A) {
+        let start = Instant::now();
+        let mut circuit = Self::helper_circuit();
+        let arith_ctx = Arc::new(template_ctx.register_shared_in(source_circuit, &mut circuit));
+        let gadget_len = arith_ctx.gadget_len(Some(active_levels), Some(level_offset));
+        assert_eq!(
+            width,
+            2 * gadget_len,
+            "Ring-GSW mul helper width {} must equal 2 * gadget_len {}",
+            width,
+            gadget_len
+        );
+        let (normalized_max_plaintexts, normalized_p_max_traces) =
+            arith_ctx.full_reduce_output_metadata(Some(active_levels), Some(level_offset));
+        let input_start = Instant::now();
+        let lhs_row0 = (0..width)
+            .map(|_| {
+                A::input_with_metadata(
+                    arith_ctx.clone(),
+                    Some(active_levels),
+                    Some(level_offset),
+                    normalized_max_plaintexts.clone(),
+                    normalized_p_max_traces.clone(),
+                    &mut circuit,
+                )
+            })
+            .collect::<Vec<_>>();
+        let lhs_row1 = (0..width)
+            .map(|_| {
+                A::input_with_metadata(
+                    arith_ctx.clone(),
+                    Some(active_levels),
+                    Some(level_offset),
+                    normalized_max_plaintexts.clone(),
+                    normalized_p_max_traces.clone(),
+                    &mut circuit,
+                )
+            })
+            .collect::<Vec<_>>();
+        let rhs_top = A::input_with_metadata(
+            arith_ctx.clone(),
+            Some(active_levels),
+            Some(level_offset),
+            normalized_max_plaintexts.clone(),
+            normalized_p_max_traces.clone(),
+            &mut circuit,
+        );
+        let rhs_bottom = A::input_with_metadata(
+            arith_ctx.clone(),
+            Some(active_levels),
+            Some(level_offset),
+            normalized_max_plaintexts,
+            normalized_p_max_traces,
+            &mut circuit,
+        );
+        debug!(
+            "RingGswContext::mul_column_subcircuit inputs allocated: width={}, elapsed_ms={}",
+            width,
+            input_start.elapsed().as_millis()
+        );
+        let dot_products_start = Instant::now();
+        let lhs_row0_top = &lhs_row0[..gadget_len];
+        let lhs_row0_bottom = &lhs_row0[gadget_len..];
+        let lhs_row1_top = &lhs_row1[..gadget_len];
+        let lhs_row1_bottom = &lhs_row1[gadget_len..];
+        let top_products = rhs_top.conv_mul_right_decomposed_many(
+            params,
+            &[lhs_row0_top, lhs_row1_top],
+            num_slots,
+            &mut circuit,
+        );
+        let bottom_products = rhs_bottom.conv_mul_right_decomposed_many(
+            params,
+            &[lhs_row0_bottom, lhs_row1_bottom],
+            num_slots,
+            &mut circuit,
+        );
+        let row0 = top_products[0].add(&bottom_products[0], &mut circuit);
+        let row1 = top_products[1].add(&bottom_products[1], &mut circuit);
+        let output_template = row0.clone();
+        circuit.output(flatten_nested_rns_entries(&[row0, row1]));
+        debug!(
+            "RingGswContext::mul_column_subcircuit finished: width={}, dot_products_elapsed_ms={}, total_elapsed_ms={}",
+            width,
+            dot_products_start.elapsed().as_millis(),
+            start.elapsed().as_millis()
+        );
+        (circuit, output_template)
+    }
+}
+
+impl<P: Poly + 'static> RingGswContext<P, NestedRnsPoly<P>> {
+    fn mul_subcircuit_nested_rns(
+        source_circuit: &PolyCircuit<P>,
+        params: &P::Params,
         num_slots: usize,
         template_ctx: &NestedRnsPolyContext,
         active_levels: usize,
@@ -1440,18 +1531,202 @@ impl<P: Poly + 'static> RingGswContext<P> {
         let mut circuit = Self::helper_circuit();
         let nested_rns =
             Arc::new(template_ctx.register_shared_subcircuits_in(source_circuit, &mut circuit));
-        let chunk_width = template_ctx.p_moduli.len() + 1;
-        let gadget_len = active_levels * chunk_width;
-        assert_eq!(
-            width,
-            2 * gadget_len,
-            "Ring-GSW mul helper width {} must equal 2 * gadget_len {}",
-            width,
-            gadget_len
-        );
         let (normalized_max_plaintexts, normalized_p_max_traces) =
             nested_rns.full_reduce_output_metadata(Some(active_levels), Some(level_offset));
-        let dot_helper_start = Instant::now();
+        let chunk_width = template_ctx.p_moduli.len() + 1;
+        let gadget_len = active_levels * chunk_width;
+        assert_eq!(width, 2 * gadget_len);
+
+        let (mul_column_subcircuit, mul_output_template) = Self::mul_column_subcircuit_nested_rns(
+            source_circuit,
+            params,
+            num_slots,
+            template_ctx,
+            active_levels,
+            level_offset,
+            width,
+        );
+        let mul_column_subcircuit = Arc::new(mul_column_subcircuit);
+        let batch_columns = width.min(MUL_COLUMN_SUBCIRCUIT_BATCH);
+        let super_batch_columns = width.min(batch_columns * MUL_COLUMN_SUBCIRCUIT_BATCH);
+        let batch_subcircuit = Arc::new(Self::mul_columns_batch_subcircuit(
+            source_circuit,
+            template_ctx,
+            active_levels,
+            level_offset,
+            width,
+            batch_columns,
+            Arc::clone(&mul_column_subcircuit),
+        ));
+        let super_batch_tail_columns = super_batch_columns % batch_columns;
+        let super_batch_tail_subcircuit = (super_batch_tail_columns > 0).then(|| {
+            Arc::new(Self::mul_columns_batch_subcircuit(
+                source_circuit,
+                template_ctx,
+                active_levels,
+                level_offset,
+                width,
+                super_batch_tail_columns,
+                Arc::clone(&mul_column_subcircuit),
+            ))
+        });
+        let super_batch_subcircuit = Arc::new(Self::mul_super_batch_subcircuit(
+            source_circuit,
+            template_ctx,
+            active_levels,
+            level_offset,
+            width,
+            super_batch_columns,
+            batch_columns,
+            Arc::clone(&batch_subcircuit),
+            super_batch_tail_subcircuit,
+        ));
+        let super_batch_subcircuit_id =
+            circuit.register_shared_sub_circuit(Arc::clone(&super_batch_subcircuit));
+        let width_tail_columns = width % super_batch_columns;
+        let width_tail_subcircuit_id = if width_tail_columns > 0 {
+            let width_tail_batch_tail_columns = width_tail_columns % batch_columns;
+            let width_tail_batch_tail_subcircuit = (width_tail_batch_tail_columns > 0).then(|| {
+                Arc::new(Self::mul_columns_batch_subcircuit(
+                    source_circuit,
+                    template_ctx,
+                    active_levels,
+                    level_offset,
+                    width,
+                    width_tail_batch_tail_columns,
+                    Arc::clone(&mul_column_subcircuit),
+                ))
+            });
+            Some(circuit.register_shared_sub_circuit(Arc::new(Self::mul_super_batch_subcircuit(
+                source_circuit,
+                template_ctx,
+                active_levels,
+                level_offset,
+                width,
+                width_tail_columns,
+                batch_columns,
+                Arc::clone(&batch_subcircuit),
+                width_tail_batch_tail_subcircuit,
+            ))))
+        } else {
+            None
+        };
+
+        let lhs_row0 = (0..width)
+            .map(|_| {
+                NestedRnsPoly::input_with_metadata(
+                    nested_rns.clone(),
+                    Some(active_levels),
+                    Some(level_offset),
+                    normalized_max_plaintexts.clone(),
+                    normalized_p_max_traces.clone(),
+                    &mut circuit,
+                )
+            })
+            .collect::<Vec<_>>();
+        let lhs_row1 = (0..width)
+            .map(|_| {
+                NestedRnsPoly::input_with_metadata(
+                    nested_rns.clone(),
+                    Some(active_levels),
+                    Some(level_offset),
+                    normalized_max_plaintexts.clone(),
+                    normalized_p_max_traces.clone(),
+                    &mut circuit,
+                )
+            })
+            .collect::<Vec<_>>();
+        let rhs_row0 = (0..width)
+            .map(|_| {
+                NestedRnsPoly::input_with_metadata(
+                    nested_rns.clone(),
+                    Some(active_levels),
+                    Some(level_offset),
+                    normalized_max_plaintexts.clone(),
+                    normalized_p_max_traces.clone(),
+                    &mut circuit,
+                )
+            })
+            .collect::<Vec<_>>();
+        let rhs_row1 = (0..width)
+            .map(|_| {
+                NestedRnsPoly::input_with_metadata(
+                    nested_rns.clone(),
+                    Some(active_levels),
+                    Some(level_offset),
+                    normalized_max_plaintexts.clone(),
+                    normalized_p_max_traces.clone(),
+                    &mut circuit,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let entry_size = lhs_row0[0].flat_output_size();
+        let (lhs_row0_inputs, lhs_row1_inputs) = rayon::join(
+            || flatten_nested_rns_entries(&lhs_row0),
+            || flatten_nested_rns_entries(&lhs_row1),
+        );
+        let mut lhs_inputs = lhs_row0_inputs;
+        lhs_inputs.extend(lhs_row1_inputs);
+        let lhs_input_set_id = circuit.intern_input_set(&lhs_inputs);
+
+        let mut row0_outputs = Vec::with_capacity(width * entry_size);
+        let mut row1_outputs = Vec::with_capacity(width * entry_size);
+        for col_start in (0..width).step_by(super_batch_columns) {
+            let col_end = (col_start + super_batch_columns).min(width);
+            let actual_super_batch_columns = col_end - col_start;
+            let (rhs_row0_inputs, rhs_row1_inputs) = rayon::join(
+                || flatten_nested_rns_entries(&rhs_row0[col_start..col_end]),
+                || flatten_nested_rns_entries(&rhs_row1[col_start..col_end]),
+            );
+            let mut rhs_suffix = rhs_row0_inputs;
+            rhs_suffix.extend(rhs_row1_inputs);
+            let current_super_batch_subcircuit_id =
+                if actual_super_batch_columns == super_batch_columns {
+                    super_batch_subcircuit_id
+                } else {
+                    width_tail_subcircuit_id.expect("width tail helper must exist")
+                };
+            let outputs = circuit.call_sub_circuit_with_shared_input_prefix_and_bindings(
+                current_super_batch_subcircuit_id,
+                lhs_input_set_id,
+                &rhs_suffix,
+                &[],
+            );
+            let (row0_batch_outputs, row1_batch_outputs) =
+                outputs.split_at(actual_super_batch_columns * entry_size);
+            row0_outputs.extend_from_slice(row0_batch_outputs);
+            row1_outputs.extend_from_slice(row1_batch_outputs);
+        }
+
+        let mut outputs = row0_outputs;
+        outputs.extend(row1_outputs);
+        circuit.output(outputs);
+        debug!(
+            "RingGswContext::mul_subcircuit_nested_rns finished: width={}, total_elapsed_ms={}",
+            width,
+            start.elapsed().as_millis()
+        );
+        (circuit, mul_output_template)
+    }
+
+    fn mul_column_subcircuit_nested_rns(
+        source_circuit: &PolyCircuit<P>,
+        _params: &P::Params,
+        num_slots: usize,
+        template_ctx: &NestedRnsPolyContext,
+        active_levels: usize,
+        level_offset: usize,
+        width: usize,
+    ) -> (PolyCircuit<P>, NestedRnsPoly<P>) {
+        let mut circuit = Self::helper_circuit();
+        let nested_rns =
+            Arc::new(template_ctx.register_shared_subcircuits_in(source_circuit, &mut circuit));
+        let chunk_width = template_ctx.p_moduli.len() + 1;
+        let gadget_len = active_levels * chunk_width;
+        assert_eq!(width, 2 * gadget_len);
+        let (normalized_max_plaintexts, normalized_p_max_traces) =
+            nested_rns.full_reduce_output_metadata(Some(active_levels), Some(level_offset));
         let (local_dot_row_with_column_subcircuit_id, local_dot_output_template) = {
             let mut helper_circuit = Self::helper_circuit();
             let helper_ctx = Arc::new(
@@ -1466,7 +1741,6 @@ impl<P: Poly + 'static> RingGswContext<P> {
                     1,
                     num_slots,
                 ));
-            let product_subcircuits_start = Instant::now();
             let term_batch_capacity = LOCAL_DOT_TERM_HELPER_BATCH;
             let term_batch_subcircuit_id = helper_circuit.register_shared_sub_circuit(Arc::new(
                 Self::local_dot_term_batch_subcircuit(
@@ -1515,12 +1789,6 @@ impl<P: Poly + 'static> RingGswContext<P> {
                     )
                     .with_p_max_traces(p_max_traces)
                 };
-            debug!(
-                "RingGswContext::mul_column_subcircuit q-level product helper prepared: active_levels={}, direct_term_batch={}, elapsed_ms={}",
-                active_levels,
-                term_batch_capacity,
-                product_subcircuits_start.elapsed().as_millis()
-            );
             let row_q_levels = (0..width)
                 .map(|_| helper_circuit.input(helper_ctx.p_moduli.len()))
                 .collect::<Vec<_>>();
@@ -1531,7 +1799,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
             let grouped_term_groups = (0..active_levels)
                 .into_par_iter()
                 .map(|sparse_q_idx| {
-                    build_local_dot_term_groups_for_level(
+                    build_local_dot_term_groups_for_level::<P, NestedRnsPolyContext>(
                         helper_ctx.as_ref(),
                         level_offset,
                         sparse_q_idx,
@@ -1557,10 +1825,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
                                 &group.term_inputs,
                                 term_batch_capacity,
                             );
-                        let mut partial_polys = Vec::with_capacity(
-                            usize::from(!full_chunk_input_set_ids.is_empty()) +
-                                usize::from(tail_input_set_id.is_some()),
-                        );
+                        let mut partial_polys = Vec::new();
                         if !full_chunk_input_set_ids.is_empty() {
                             let full_chunk_count = full_chunk_input_set_ids.len();
                             let outputs = helper_circuit
@@ -1620,12 +1885,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
             helper_circuit.output(flatten_nested_rns_entries(std::slice::from_ref(&result)));
             (circuit.register_sub_circuit(helper_circuit), result)
         };
-        debug!(
-            "RingGswContext::mul_column_subcircuit dot helper ready: width={}, elapsed_ms={}",
-            width,
-            dot_helper_start.elapsed().as_millis()
-        );
-        let input_start = Instant::now();
+
         let lhs_row0 = (0..width)
             .map(|_| {
                 NestedRnsPoly::input_with_metadata(
@@ -1666,12 +1926,6 @@ impl<P: Poly + 'static> RingGswContext<P> {
             normalized_p_max_traces,
             &mut circuit,
         );
-        debug!(
-            "RingGswContext::mul_column_subcircuit inputs allocated: width={}, elapsed_ms={}",
-            width,
-            input_start.elapsed().as_millis()
-        );
-        let g_inverse_start = Instant::now();
         let mut g_inverse_terms = Vec::with_capacity(width);
         for q_idx in 0..active_levels {
             let (ys, w) = rhs_top.decomposition_terms_for_level(q_idx, &mut circuit);
@@ -1683,17 +1937,11 @@ impl<P: Poly + 'static> RingGswContext<P> {
             g_inverse_terms.extend(ys);
             g_inverse_terms.push(w);
         }
-        debug!(
-            "RingGswContext::mul_column_subcircuit raw decomposition terms built: width={}, elapsed_ms={}",
-            width,
-            g_inverse_start.elapsed().as_millis()
-        );
-        let dot_products_start = Instant::now();
         let (lhs_row0_inputs, lhs_row1_inputs) = rayon::join(
             || flatten_nested_rns_q_level_rows_for_gadget_terms(&lhs_row0, gadget_len, chunk_width),
             || flatten_nested_rns_q_level_rows_for_gadget_terms(&lhs_row1, gadget_len, chunk_width),
         );
-        let row0: NestedRnsPoly<P> = {
+        let row0 = {
             let template = &lhs_row0[0];
             let mut inputs = lhs_row0_inputs;
             inputs.extend(g_inverse_terms.iter().copied().map(BatchedWire::single));
@@ -1706,7 +1954,7 @@ impl<P: Poly + 'static> RingGswContext<P> {
                 local_dot_output_template.p_max_traces.clone(),
             )
         };
-        let row1: NestedRnsPoly<P> = {
+        let row1 = {
             let template = &lhs_row1[0];
             let mut inputs = lhs_row1_inputs;
             inputs.extend(g_inverse_terms.into_iter().map(BatchedWire::single));
@@ -1720,46 +1968,104 @@ impl<P: Poly + 'static> RingGswContext<P> {
             )
         };
         circuit.output(flatten_nested_rns_entries(&[row0, row1]));
-        debug!(
-            "RingGswContext::mul_column_subcircuit finished: width={}, dot_products_elapsed_ms={}, total_elapsed_ms={}",
-            width,
-            dot_products_start.elapsed().as_millis(),
-            start.elapsed().as_millis()
-        );
         (circuit, local_dot_output_template)
+    }
+
+    pub fn setup(
+        circuit: &mut PolyCircuit<P>,
+        params: &P::Params,
+        num_slots: usize,
+        p_moduli_bits: usize,
+        max_unreduced_muls: usize,
+        scale: u64,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+    ) -> Self {
+        let level_offset = level_offset.unwrap_or(0);
+        let (_, _, max_q_moduli_depth) = params.to_crt();
+        let active_levels = enable_levels.unwrap_or_else(|| {
+            max_q_moduli_depth
+                .checked_sub(level_offset)
+                .expect("level_offset must not exceed q_moduli_depth")
+        });
+        let nested_rns_depth = level_offset + active_levels;
+        assert!(
+            nested_rns_depth <= max_q_moduli_depth,
+            "active Ring-GSW q-window exceeds NestedRnsPolyContext depth"
+        );
+        let nested_rns = Arc::new(NestedRnsPolyContext::setup(
+            circuit,
+            params,
+            p_moduli_bits,
+            max_unreduced_muls,
+            scale,
+            false,
+            Some(nested_rns_depth),
+        ));
+        validate_num_slots::<P>(params, num_slots);
+        let width = 2 * active_levels * (nested_rns.p_moduli.len() + 1);
+        let max_p_modulus = *nested_rns
+            .p_moduli
+            .iter()
+            .max()
+            .expect("RingGswContext requires at least one p modulus");
+        let randomizer_norm_ctx = ring_gsw_randomizer_norm_ctx::<P>(params, width, max_p_modulus);
+        let (mul_subcircuit, mul_output_template) = Self::mul_subcircuit_nested_rns(
+            circuit,
+            params,
+            num_slots,
+            nested_rns.as_ref(),
+            active_levels,
+            level_offset,
+            width,
+        );
+        let mul_subcircuit_id = circuit.register_sub_circuit(mul_subcircuit);
+        Self {
+            params: params.clone(),
+            num_slots,
+            arith_ctx: nested_rns.clone(),
+            nested_rns,
+            level_offset,
+            active_levels,
+            randomizer_norm_ctx,
+            add_entry_cache: DashMap::new(),
+            sub_entry_cache: DashMap::new(),
+            mul_subcircuit_id,
+            mul_output_max_plaintexts: mul_output_template.max_plaintexts().to_vec(),
+            mul_output_p_max_traces: mul_output_template.p_max_traces().to_vec(),
+        }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct RingGswCiphertext<P: Poly> {
-    pub ctx: Arc<RingGswContext<P>>,
-    pub rows: [Vec<NestedRnsPoly<P>>; 2],
+pub struct RingGswCiphertext<P: Poly, A: DecomposeArithmeticGadget<P> = NestedRnsPoly<P>> {
+    pub ctx: Arc<RingGswContext<P, A>>,
+    pub rows: [Vec<A>; 2],
     pub randomizer_norm: PolyMatrixNorm,
     pub max_plaintext: BigUint,
 }
 
-impl<P: Poly + 'static> RingGswCiphertext<P> {
-    fn entry_output_metadata(entry: &NestedRnsPoly<P>) -> RingGswEntryOutputMetadata {
+impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P>> RingGswCiphertext<P, A> {
+    fn entry_output_metadata(entry: &A) -> RingGswEntryOutputMetadata {
         RingGswEntryOutputMetadata {
-            max_plaintexts: entry.max_plaintexts.clone(),
-            p_max_traces: entry.p_max_traces.clone(),
+            max_plaintexts: entry.max_plaintexts().to_vec(),
+            p_max_traces: entry.p_max_traces().to_vec(),
         }
     }
 
-    fn active_q_moduli(entry: &NestedRnsPoly<P>) -> &[u64] {
-        let levels = entry.max_plaintexts.len();
-        &entry.ctx.q_moduli()[entry.level_offset..entry.level_offset + levels]
+    fn active_q_moduli(entry: &A) -> Vec<u64> {
+        entry.active_q_moduli()
     }
 
-    fn full_reduce_entry_output_metadata(entry: &NestedRnsPoly<P>) -> RingGswEntryOutputMetadata {
-        let levels = entry.max_plaintexts.len();
+    fn full_reduce_entry_output_metadata(entry: &A) -> RingGswEntryOutputMetadata {
+        let levels = entry.max_plaintexts().len();
         let (max_plaintexts, p_max_traces) =
-            entry.ctx.full_reduce_output_metadata(Some(levels), Some(entry.level_offset));
+            entry.context().full_reduce_output_metadata(Some(levels), Some(entry.level_offset()));
         RingGswEntryOutputMetadata { max_plaintexts, p_max_traces }
     }
 
     fn lazy_reduce_entry_output_metadata(
-        ctx: &NestedRnsPolyContext,
+        ctx: &A::Context,
         metadata: &RingGswEntryOutputMetadata,
         reduce_levels: &[bool],
     ) -> RingGswEntryOutputMetadata {
@@ -1779,30 +2085,25 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
         }
     }
 
-    fn map_binary_row_entries<T, F>(
-        lhs_row: &[NestedRnsPoly<P>],
-        rhs_row: &[NestedRnsPoly<P>],
-        f: F,
-    ) -> Vec<T>
+    fn map_binary_row_entries<T, F>(lhs_row: &[A], rhs_row: &[A], f: F) -> Vec<T>
     where
         T: Send,
-        F: Fn(&NestedRnsPoly<P>, &NestedRnsPoly<P>) -> T + Sync + Send,
+        F: Fn(&A, &A) -> T + Sync + Send,
     {
         debug_assert_eq!(lhs_row.len(), rhs_row.len());
         lhs_row.par_iter().zip(rhs_row.par_iter()).map(|(lhs, rhs)| f(lhs, rhs)).collect()
     }
 
     fn compute_add_entry_plan_and_output(
-        left: &NestedRnsPoly<P>,
-        right: &NestedRnsPoly<P>,
+        left: &A,
+        right: &A,
     ) -> (RingGswAddEntryPlanKey, RingGswEntryOutputMetadata) {
-        debug_assert_eq!(left.max_plaintexts.len(), right.max_plaintexts.len());
+        debug_assert_eq!(left.max_plaintexts().len(), right.max_plaintexts().len());
         let q_moduli = Self::active_q_moduli(left);
-        let p_full = left.ctx.p_full_ref().clone();
-        let pre_full_reduce = q_moduli
-            .par_iter()
-            .enumerate()
-            .any(|(q_idx, _)| &left.max_plaintexts[q_idx] + &right.max_plaintexts[q_idx] > p_full);
+        let p_full = left.context().plaintext_capacity_bound();
+        let pre_full_reduce = q_moduli.par_iter().enumerate().any(|(q_idx, _)| {
+            &left.max_plaintexts()[q_idx] + &right.max_plaintexts()[q_idx] > p_full
+        });
         let left_before_reduce = if pre_full_reduce {
             Self::full_reduce_entry_output_metadata(left)
         } else {
@@ -1818,16 +2119,16 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
             .par_iter()
             .zip(right_before_reduce.p_max_traces.par_iter())
             .map(|(lhs_trace, rhs_trace)| {
-                lhs_trace + rhs_trace >= *left.ctx.lut_mod_p_max_map_size_ref()
+                lhs_trace + rhs_trace >= left.context().trace_capacity_bound()
             })
             .collect::<Vec<_>>();
         let left_after_reduce = Self::lazy_reduce_entry_output_metadata(
-            left.ctx.as_ref(),
+            left.context().as_ref(),
             &left_before_reduce,
             &reduce_levels,
         );
         let right_after_reduce = Self::lazy_reduce_entry_output_metadata(
-            right.ctx.as_ref(),
+            right.context().as_ref(),
             &right_before_reduce,
             &reduce_levels,
         );
@@ -1849,16 +2150,16 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
     }
 
     fn compute_sub_entry_plan_and_output(
-        left: &NestedRnsPoly<P>,
-        right: &NestedRnsPoly<P>,
+        left: &A,
+        right: &A,
     ) -> (RingGswSubEntryPlanKey, RingGswEntryOutputMetadata) {
-        debug_assert_eq!(left.max_plaintexts.len(), right.max_plaintexts.len());
+        debug_assert_eq!(left.max_plaintexts().len(), right.max_plaintexts().len());
         let q_moduli = Self::active_q_moduli(left);
-        let p_full = left.ctx.p_full_ref().clone();
+        let p_full = left.context().plaintext_capacity_bound();
         let pre_full_reduce = q_moduli
             .par_iter()
             .enumerate()
-            .any(|(q_idx, &q_i)| &left.max_plaintexts[q_idx] + BigUint::from(q_i - 1) > p_full);
+            .any(|(q_idx, &q_i)| &left.max_plaintexts()[q_idx] + BigUint::from(q_i - 1) > p_full);
         let left_before_reduce = if pre_full_reduce {
             Self::full_reduce_entry_output_metadata(left)
         } else {
@@ -1869,7 +2170,7 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
         } else {
             Self::entry_output_metadata(right)
         };
-        let p_max_minus_one = left.ctx.reduced_p_max_trace();
+        let p_max_minus_one = left.context().reduced_p_max_trace();
         let p_max = &p_max_minus_one + BigUint::from(1u64);
         let trace_multiplier = |trace: &BigUint| (trace + &p_max_minus_one) / &p_max;
         let predicted_traces = left_before_reduce
@@ -1880,15 +2181,15 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
             .collect::<Vec<_>>();
         let reduce_levels = predicted_traces
             .par_iter()
-            .map(|trace| trace >= left.ctx.lut_mod_p_max_map_size_ref())
+            .map(|trace| trace >= &left.context().trace_capacity_bound())
             .collect::<Vec<_>>();
         let left_after_reduce = Self::lazy_reduce_entry_output_metadata(
-            left.ctx.as_ref(),
+            left.context().as_ref(),
             &left_before_reduce,
             &reduce_levels,
         );
         let right_after_reduce = Self::lazy_reduce_entry_output_metadata(
-            right.ctx.as_ref(),
+            right.context().as_ref(),
             &right_before_reduce,
             &reduce_levels,
         );
@@ -1916,8 +2217,8 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
 
     fn ensure_add_entry_subcircuit(
         &self,
-        left: &NestedRnsPoly<P>,
-        right: &NestedRnsPoly<P>,
+        left: &A,
+        right: &A,
         cache_key: &RingGswAddEntryPlanKey,
         circuit: &mut PolyCircuit<P>,
     ) -> usize {
@@ -1933,8 +2234,8 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
 
     fn ensure_sub_entry_subcircuit(
         &self,
-        left: &NestedRnsPoly<P>,
-        right: &NestedRnsPoly<P>,
+        left: &A,
+        right: &A,
         cache_key: &RingGswSubEntryPlanKey,
         circuit: &mut PolyCircuit<P>,
     ) -> usize {
@@ -1950,12 +2251,12 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
 
     fn call_entry_subcircuit(
         &self,
-        left: &NestedRnsPoly<P>,
-        right: &NestedRnsPoly<P>,
+        left: &A,
+        right: &A,
         subcircuit_id: usize,
         output_metadata: &RingGswEntryOutputMetadata,
         circuit: &mut PolyCircuit<P>,
-    ) -> NestedRnsPoly<P> {
+    ) -> A {
         let mut inputs = flatten_nested_rns_entries(std::slice::from_ref(left));
         inputs.extend(flatten_nested_rns_entries(std::slice::from_ref(right)));
         let outputs = circuit.call_sub_circuit(subcircuit_id, &inputs);
@@ -1967,20 +2268,17 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
         )
     }
 
-    fn normalize_mul_entry(
-        entry: &NestedRnsPoly<P>,
-        circuit: &mut PolyCircuit<P>,
-    ) -> NestedRnsPoly<P> {
+    fn normalize_mul_entry(entry: &A, circuit: &mut PolyCircuit<P>) -> A {
         let levels = entry.active_q_moduli().len();
         let (reduced_max_plaintexts, reduced_p_max_traces) =
-            entry.ctx.full_reduce_output_metadata(Some(levels), Some(entry.level_offset));
+            entry.context().full_reduce_output_metadata(Some(levels), Some(entry.level_offset()));
         let needs_full_reduce = entry
-            .max_plaintexts
+            .max_plaintexts()
             .iter()
             .zip(reduced_max_plaintexts.iter())
             .any(|(current, reduced)| current > reduced);
         let needs_trace_reduce = entry
-            .p_max_traces
+            .p_max_traces()
             .iter()
             .zip(reduced_p_max_traces.iter())
             .any(|(current, reduced)| current > reduced);
@@ -1993,16 +2291,13 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
         }
     }
 
-    fn normalize_mul_row(
-        row: &[NestedRnsPoly<P>],
-        circuit: &mut PolyCircuit<P>,
-    ) -> Vec<NestedRnsPoly<P>> {
+    fn normalize_mul_row(row: &[A], circuit: &mut PolyCircuit<P>) -> Vec<A> {
         row.iter().map(|entry| Self::normalize_mul_entry(entry, circuit)).collect()
     }
 
     pub fn new(
-        ctx: Arc<RingGswContext<P>>,
-        rows: [Vec<NestedRnsPoly<P>>; 2],
+        ctx: Arc<RingGswContext<P, A>>,
+        rows: [Vec<A>; 2],
         randomizer_norm: PolyMatrixNorm,
         max_plaintext: BigUint,
     ) -> Self {
@@ -2012,12 +2307,12 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
     }
 
     pub fn input(
-        ctx: Arc<RingGswContext<P>>,
+        ctx: Arc<RingGswContext<P, A>>,
         max_plaintext: Option<BigUint>,
         circuit: &mut PolyCircuit<P>,
     ) -> Self {
         let [row0, row1] = Self::input_rows(
-            ctx.nested_rns.clone(),
+            ctx.arith_ctx.clone(),
             ctx.width(),
             ctx.active_levels,
             ctx.level_offset,
@@ -2133,9 +2428,7 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
         let helper_start = Instant::now();
         let template_entry =
             self.rows[0].first().expect("RingGswCiphertext must contain at least one column");
-        let levels = template_entry.active_q_moduli().len();
-        let p_moduli_depth = template_entry.ctx.p_moduli.len();
-        let entry_size = levels * p_moduli_depth;
+        let entry_size = template_entry.flat_output_size();
         let lhs_row0 = Self::normalize_mul_row(&self.rows[0], circuit);
         let lhs_row1 = Self::normalize_mul_row(&self.rows[1], circuit);
         let rhs_row0 = Self::normalize_mul_row(&other.rows[0], circuit);
@@ -2261,31 +2554,17 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
     }
 
     fn input_rows(
-        nested_rns: Arc<NestedRnsPolyContext>,
+        arith_ctx: Arc<A::Context>,
         width: usize,
         active_levels: usize,
         level_offset: usize,
         circuit: &mut PolyCircuit<P>,
-    ) -> [Vec<NestedRnsPoly<P>>; 2] {
+    ) -> [Vec<A>; 2] {
         let row0 = (0..width)
-            .map(|_| {
-                NestedRnsPoly::input(
-                    nested_rns.clone(),
-                    Some(active_levels),
-                    Some(level_offset),
-                    circuit,
-                )
-            })
+            .map(|_| A::input(arith_ctx.clone(), Some(active_levels), Some(level_offset), circuit))
             .collect::<Vec<_>>();
         let row1 = (0..width)
-            .map(|_| {
-                NestedRnsPoly::input(
-                    nested_rns.clone(),
-                    Some(active_levels),
-                    Some(level_offset),
-                    circuit,
-                )
-            })
+            .map(|_| A::input(arith_ctx.clone(), Some(active_levels), Some(level_offset), circuit))
             .collect::<Vec<_>>();
         [row0, row1]
     }
@@ -2339,15 +2618,16 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
         for row in &self.rows {
             for entry in row {
                 assert!(
-                    Arc::ptr_eq(&entry.ctx, &self.ctx.nested_rns),
-                    "RingGswCiphertext entries must share the RingGswContext NestedRnsPolyContext"
+                    Arc::ptr_eq(entry.context(), &self.ctx.arith_ctx),
+                    "RingGswCiphertext entries must share the RingGswContext arithmetic context"
                 );
                 assert_eq!(
-                    entry.level_offset, self.ctx.level_offset,
+                    entry.level_offset(),
+                    self.ctx.level_offset,
                     "RingGswCiphertext entries must share the RingGswContext q-level offset"
                 );
                 assert_eq!(
-                    entry.enable_levels,
+                    entry.enable_levels(),
                     Some(self.ctx.active_levels),
                     "RingGswCiphertext entries must share the RingGswContext active-level configuration"
                 );
@@ -2370,7 +2650,7 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
     }
 }
 
-impl<P: Poly + 'static> RingGswCiphertext<P> {
+impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P>> RingGswCiphertext<P, A> {
     pub fn estimate_decryption_error_norm(&self, error_sigma: f64) -> BigDecimal {
         self.assert_consistent();
         assert!(error_sigma.is_finite(), "error_sigma must be finite");
@@ -2384,18 +2664,19 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
         let sigma = BigDecimal::from_f64(error_sigma)
             .expect("finite error_sigma must convert to BigDecimal");
         let (_top, bottom_half_randomizer) = self.randomizer_norm.split_rows(self.width() / 2);
-        let max_p_modulus = *self
-            .ctx
-            .nested_rns
-            .p_moduli
-            .iter()
-            .max()
-            .expect("RingGswCiphertext requires at least one p modulus");
         let p_max_matrix = PolyMatrixNorm::new(
             self.ctx.randomizer_norm_ctx.clone(),
             bottom_half_randomizer.ncol,
             1,
-            BigDecimal::from(max_p_modulus),
+            BigDecimal::from(
+                A::randomizer_decomposition_norm_bound(
+                    self.ctx.arith_ctx.as_ref(),
+                    Some(self.ctx.active_levels),
+                    Some(self.ctx.level_offset),
+                )
+                .to_u64()
+                .expect("gadget decomposition norm bound must fit in u64 for SimulatorContext"),
+            ),
             None,
         );
         let public_key_error = PolyMatrixNorm::sample_gauss(
@@ -2428,9 +2709,9 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
             gadget_len
         );
 
-        let gadget_constants = nested_rns_gadget_vector::<P, M>(
+        let gadget_constants = A::gadget_matrix::<M>(
             &self.ctx.params,
-            self.ctx.nested_rns.as_ref(),
+            self.ctx.arith_ctx.as_ref(),
             Some(self.ctx.active_levels),
             Some(self.ctx.level_offset),
         )
@@ -2452,9 +2733,9 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
             .fold(BigUint::from(1u64), |acc, &q_i| acc * BigUint::from(q_i)) /
             &plaintext_modulus;
         let scaled_poly = P::from_biguint_to_constant(&self.ctx.params, scaled);
-        let scaled_g_inverse_matrix = nested_rns_gadget_decomposed::<P, M>(
+        let scaled_g_inverse_matrix = A::gadget_decomposed::<M>(
             &self.ctx.params,
-            self.ctx.nested_rns.as_ref(),
+            self.ctx.arith_ctx.as_ref(),
             &M::from_poly_vec_column(&self.ctx.params, vec![scaled_poly]),
             Some(self.ctx.active_levels),
             Some(self.ctx.level_offset),
@@ -2483,7 +2764,7 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
         let bottom_entry =
             self.decrypt_linear_combination_row(&self.rows[1], &scaled_g_inverse, circuit);
         let prepared_top = top_entry.prepare_for_reconstruct(circuit);
-        let p_depth = prepared_top.ctx.p_moduli.len();
+        let p_depth = self.ctx.arith_ctx.decomposition_len().saturating_sub(1);
         let mut weighted_top_terms = Vec::with_capacity(gadget_len);
         for q_idx in 0..prepared_top.active_q_moduli().len() {
             let level_base = q_idx * (p_depth + 1);
@@ -2524,10 +2805,10 @@ impl<P: Poly + 'static> RingGswCiphertext<P> {
 
     fn decrypt_linear_combination_row(
         &self,
-        row: &[NestedRnsPoly<P>],
+        row: &[A],
         scaled_g_inverse: &[Vec<u64>],
         circuit: &mut PolyCircuit<P>,
-    ) -> NestedRnsPoly<P> {
+    ) -> A {
         assert_eq!(
             scaled_g_inverse.len(),
             self.gadget_len(),
@@ -2705,6 +2986,50 @@ mod tests {
         let input = RingGswCiphertext::input(ctx, Some(BigUint::from(7u64)), &mut circuit);
 
         assert_eq!(input.max_plaintext, BigUint::from(7u64));
+    }
+
+    #[test]
+    fn test_ciphertext_inputs_from_native_keeps_all_ring_coefficients_when_num_slots_is_smaller() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context_with(
+            &mut circuit,
+            8,
+            NUM_SLOTS,
+            ACTIVE_LEVELS,
+            CRT_BITS,
+            P_MODULI_BITS,
+            DEFAULT_MAX_UNREDUCED_MULS,
+        );
+        let secret_key = sample_secret_key(&params);
+        let public_key_hash_key = sample_hash_key();
+        let randomizer_hash_key = sample_hash_key();
+        let public_key = sample_public_key(
+            &params,
+            ctx.width(),
+            &secret_key,
+            public_key_hash_key,
+            b"ring_gsw_public_key_full_coeff_encoding",
+            None,
+        );
+        let ciphertext = encrypt_plaintext_bit(
+            &params,
+            ctx.nested_rns.as_ref(),
+            &public_key,
+            1,
+            randomizer_hash_key,
+            b"ring_gsw_ciphertext_inputs_full_coeff_encoding",
+        );
+
+        let inputs = ciphertext_inputs_from_native::<DCRTPoly>(
+            &params,
+            ctx.nested_rns.as_ref(),
+            &ciphertext,
+            0,
+            Some(ctx.active_levels),
+        );
+
+        assert!(!inputs.is_empty());
+        assert!(inputs.iter().all(|input| input.len() == params.ring_dimension() as usize));
     }
 
     #[test]

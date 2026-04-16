@@ -14,9 +14,11 @@ use mxx::{
     circuit::{PolyCircuit, evaluable::PolyVec, gate::GateId},
     element::PolyElem,
     gadgets::{
-        arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly_compact_bytes},
+        arith::{
+            NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly_compact_bytes,
+            encode_nested_rns_poly_with_offset,
+        },
         conv_mul::negacyclic_conv_mul,
-        ntt::encode_nested_rns_poly_vec,
     },
     lookup::{
         PltEvaluator, PublicLut,
@@ -55,6 +57,7 @@ use mxx::{
     utils::{bigdecimal_bits_ceil, gen_biguint_for_modulus},
 };
 use num_bigint::BigUint;
+use rayon::prelude::*;
 use std::{env, fs, path::Path, sync::Arc, time::Instant};
 use tracing::info;
 
@@ -71,6 +74,46 @@ const DEFAULT_D_SECRET: usize = 1;
 const DEFAULT_BENCH_ITERATIONS: usize = 1;
 const DEFAULT_Q_LEVEL: usize = 1;
 const TRAPDOOR_SIGMA: f64 = 4.578;
+
+fn encode_nested_rns_poly_vec<P: Poly>(
+    params: &P::Params,
+    ctx: &NestedRnsPolyContext,
+    slots: &[BigUint],
+    q_level: Option<usize>,
+) -> Vec<PolyVec<P>> {
+    let active_q_level = q_level.unwrap_or(ctx.q_moduli_depth);
+    assert!(
+        active_q_level <= ctx.q_moduli_depth,
+        "q_level {} exceeds NestedRnsPolyContext q_moduli_depth {}",
+        active_q_level,
+        ctx.q_moduli_depth
+    );
+    let encoded_slots = slots
+        .par_iter()
+        .map(|slot| {
+            encode_nested_rns_poly_with_offset::<P>(
+                ctx.p_moduli_bits,
+                ctx.max_unreduced_muls,
+                params,
+                slot,
+                0,
+                q_level,
+            )
+        })
+        .collect::<Vec<_>>();
+    let input_count = active_q_level * ctx.p_moduli.len();
+    (0..input_count)
+        .into_par_iter()
+        .map(|input_idx| {
+            PolyVec::new(
+                encoded_slots
+                    .par_iter()
+                    .map(|slot_encoding| slot_encoding[input_idx].clone())
+                    .collect(),
+            )
+        })
+        .collect()
+}
 
 type GpuMatrix = GpuDCRTPolyMatrix;
 type GpuHashSampler = GpuDCRTPolyHashSampler<Keccak256>;

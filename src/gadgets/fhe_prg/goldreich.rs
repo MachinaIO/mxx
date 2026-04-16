@@ -32,6 +32,32 @@ use keccak_asm::Keccak256;
 use rayon::prelude::*;
 use std::{collections::HashSet, sync::Arc};
 use tracing::debug;
+
+pub trait BooleanCiphertext<P: Poly>: Clone {
+    type Context;
+
+    fn context(&self) -> &Arc<Self::Context>;
+
+    fn and(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self;
+
+    fn xor(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self;
+}
+
+impl<P: Poly + 'static> BooleanCiphertext<P> for RingGswCiphertext<P> {
+    type Context = RingGswContext<P>;
+
+    fn context(&self) -> &Arc<Self::Context> {
+        &self.ctx
+    }
+
+    fn and(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
+        RingGswCiphertext::and(self, other, circuit)
+    }
+
+    fn xor(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
+        RingGswCiphertext::xor(self, other, circuit)
+    }
+}
 /// Public graph-generation options for the Goldreich/TSA PRG.
 ///
 /// The default mode rejects only role-aware duplicates:
@@ -258,25 +284,28 @@ impl GoldreichGraph {
 /// dimensions. Those values are setup-time constants rather than runtime circuit inputs; the only
 /// runtime inputs to [`GoldreichFhePrg::evaluate`] are encrypted secret bits.
 #[derive(Debug, Clone)]
-pub struct GoldreichFhePrg<P: Poly> {
-    pub ring_gsw: Arc<RingGswContext<P>>,
+pub struct GoldreichFhePrg<P: Poly, C: BooleanCiphertext<P> = RingGswCiphertext<P>> {
+    pub ring_gsw: Arc<C::Context>,
     pub input_size: usize,
     pub output_size: usize,
     pub public_graph: GoldreichGraph,
 }
 
-impl<P: Poly> GoldreichFhePrg<P> {
+impl<P: Poly, C: BooleanCiphertext<P>> GoldreichFhePrg<P, C> {
     /// Returns the fixed public graph used by this PRG instance.
     pub fn graph(&self) -> &GoldreichGraph {
         &self.public_graph
     }
 }
 
-impl<P: Poly + 'static> GoldreichFhePrg<P> {
+impl<P: Poly + 'static, C> GoldreichFhePrg<P, C>
+where
+    C: BooleanCiphertext<P>,
+{
     /// Generates the fixed public graph from a public `graph_seed` and stores it with the
     /// Ring-GSW context.
     pub fn setup(
-        ring_gsw: Arc<RingGswContext<P>>,
+        ring_gsw: Arc<C::Context>,
         input_size: usize,
         output_size: usize,
         graph_seed: [u8; 32],
@@ -293,7 +322,7 @@ impl<P: Poly + 'static> GoldreichFhePrg<P> {
     /// Like [`GoldreichFhePrg::setup`], but allows callers to enable the optional stricter
     /// duplicate-rejection mode used by [`GoldreichGraphGeneration`].
     pub fn setup_with_options(
-        ring_gsw: Arc<RingGswContext<P>>,
+        ring_gsw: Arc<C::Context>,
         input_size: usize,
         output_size: usize,
         graph_seed: [u8; 32],
@@ -307,10 +336,7 @@ impl<P: Poly + 'static> GoldreichFhePrg<P> {
 
     /// Builds the PRG from an already validated public graph instead of generating one from a
     /// `graph_seed`.
-    pub fn from_public_graph(
-        ring_gsw: Arc<RingGswContext<P>>,
-        public_graph: GoldreichGraph,
-    ) -> Self {
+    pub fn from_public_graph(ring_gsw: Arc<C::Context>, public_graph: GoldreichGraph) -> Self {
         let input_size = public_graph.input_size;
         let output_size = public_graph.output_size();
         Self { ring_gsw, input_size, output_size, public_graph }
@@ -327,11 +353,7 @@ impl<P: Poly + 'static> GoldreichFhePrg<P> {
     ///
     /// The XOR reduction is assembled as a balanced pairwise tree to minimize depth growth in the
     /// repository's concrete Ring-GSW implementation.
-    pub fn evaluate(
-        &self,
-        input_bits: &[RingGswCiphertext<P>],
-        circuit: &mut PolyCircuit<P>,
-    ) -> Vec<RingGswCiphertext<P>> {
+    pub fn evaluate(&self, input_bits: &[C], circuit: &mut PolyCircuit<P>) -> Vec<C> {
         assert_eq!(
             input_bits.len(),
             self.input_size,
@@ -341,7 +363,7 @@ impl<P: Poly + 'static> GoldreichFhePrg<P> {
         );
         for (idx, bit) in input_bits.iter().enumerate() {
             assert!(
-                Arc::ptr_eq(&bit.ctx, &self.ring_gsw),
+                Arc::ptr_eq(bit.context(), &self.ring_gsw),
                 "Goldreich PRG input bit {} must share the GoldreichFhePrg RingGswContext",
                 idx
             );
@@ -404,18 +426,15 @@ fn all_distinct(values: &[usize]) -> bool {
     true
 }
 
-fn reduce_ring_gsw_terms_pairwise<P, F>(
-    mut current_layer: Vec<RingGswCiphertext<P>>,
+fn reduce_ring_gsw_terms_pairwise<P, C, F>(
+    mut current_layer: Vec<C>,
     circuit: &mut PolyCircuit<P>,
     mut combine: F,
-) -> RingGswCiphertext<P>
+) -> C
 where
     P: Poly + 'static,
-    F: FnMut(
-        &RingGswCiphertext<P>,
-        &RingGswCiphertext<P>,
-        &mut PolyCircuit<P>,
-    ) -> RingGswCiphertext<P>,
+    C: BooleanCiphertext<P>,
+    F: FnMut(&C, &C, &mut PolyCircuit<P>) -> C,
 {
     assert!(
         !current_layer.is_empty(),

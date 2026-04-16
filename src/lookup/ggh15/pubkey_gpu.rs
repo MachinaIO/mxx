@@ -4,16 +4,47 @@ use crate::{
     poly::dcrt::gpu::detected_gpu_device_ids,
     sampler::trapdoor::GpuPreimageRequest,
 };
+use std::ops::Deref;
 
-pub(super) struct GpuLutBaseDeviceShared<M, T>
+enum DeviceReplica<'a, T> {
+    Borrowed(&'a T),
+    Owned(T),
+}
+
+impl<T> DeviceReplica<'_, T> {
+    fn as_ref(&self) -> &T {
+        match self {
+            Self::Borrowed(value) => value,
+            Self::Owned(value) => value,
+        }
+    }
+}
+
+impl<T> Deref for DeviceReplica<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+fn source_device_first(mut device_ids: Vec<i32>, source_device_id: i32) -> Vec<i32> {
+    if let Some(source_pos) = device_ids.iter().position(|&device_id| device_id == source_device_id)
+    {
+        device_ids.swap(0, source_pos);
+    }
+    device_ids
+}
+
+pub(super) struct GpuLutBaseDeviceShared<'a, M, T>
 where
     M: PolyMatrix,
     T: Send + Sync,
 {
     device_id: i32,
     params: <<M as PolyMatrix>::P as Poly>::Params,
-    trapdoor: T,
-    b1_matrix: M,
+    trapdoor: DeviceReplica<'a, T>,
+    b1_matrix: DeviceReplica<'a, M>,
 }
 
 struct GpuLutDeviceShared<'a, M, T>
@@ -32,16 +63,16 @@ where
     gadget_matrix: M,
 }
 
-pub(super) struct GpuGateBaseDeviceShared<M, T>
+pub(super) struct GpuGateBaseDeviceShared<'a, M, T>
 where
     M: PolyMatrix,
     T: Send + Sync,
 {
     device_id: i32,
     params: <<M as PolyMatrix>::P as Poly>::Params,
-    b0_trapdoor: T,
-    b0_matrix: M,
-    b1_matrix: M,
+    b0_trapdoor: DeviceReplica<'a, T>,
+    b0_matrix: DeviceReplica<'a, M>,
+    b1_matrix: DeviceReplica<'a, M>,
 }
 
 struct GpuGateDeviceShared<'a, M, T>
@@ -54,10 +85,10 @@ where
     b0_trapdoor: &'a T,
     b0_matrix: &'a M,
     b1_matrix: &'a M,
-    w_block_identity: M,
-    w_block_gy: M,
-    w_block_v: M,
-    w_block_vx: M,
+    w_block_identity: DeviceReplica<'a, M>,
+    w_block_gy: DeviceReplica<'a, M>,
+    w_block_v: DeviceReplica<'a, M>,
+    w_block_vx: DeviceReplica<'a, M>,
 }
 
 #[cfg(feature = "gpu")]
@@ -113,28 +144,54 @@ where
     M::P: 'static,
 {
     #[cfg(feature = "gpu")]
-    pub(super) fn prepare_gpu_lut_base_device_shared(
+    pub(super) fn prepare_gpu_lut_base_device_shared<'a>(
         &self,
         params: &<BggPublicKey<M> as Evaluable>::Params,
-        b1_trapdoor: &TS::Trapdoor,
-        b1_matrix: &M,
-    ) -> Vec<GpuLutBaseDeviceShared<M, TS::Trapdoor>> {
-        let device_ids = detected_gpu_device_ids();
+        b1_trapdoor: &'a TS::Trapdoor,
+        b1_matrix: &'a M,
+    ) -> Vec<GpuLutBaseDeviceShared<'a, M, TS::Trapdoor>> {
+        let source_device_id = params
+            .device_ids()
+            .into_iter()
+            .next()
+            .expect("gpu params must include at least one device id");
+        let device_ids = source_device_first(detected_gpu_device_ids(), source_device_id);
         assert!(
             !device_ids.is_empty(),
             "at least one GPU device is required for gpu sample_lut_preimages"
         );
 
-        let b1_trapdoor_bytes = TS::trapdoor_to_bytes(b1_trapdoor);
-        let b1_matrix_bytes = b1_matrix.to_compact_bytes();
+        let needs_cross_device_copy =
+            device_ids.iter().any(|&device_id| device_id != source_device_id);
+        let b1_trapdoor_bytes = needs_cross_device_copy.then(|| TS::trapdoor_to_bytes(b1_trapdoor));
+        let b1_matrix_bytes = needs_cross_device_copy.then(|| b1_matrix.to_compact_bytes());
 
         device_ids
             .into_iter()
             .map(|device_id| {
-                let local_params = params.params_for_device(device_id);
-                let local_trapdoor = TS::trapdoor_from_bytes(&local_params, &b1_trapdoor_bytes)
-                    .expect("failed to deserialize trapdoor for preloaded LUT device resources");
-                let local_b1_matrix = M::from_compact_bytes(&local_params, &b1_matrix_bytes);
+                let local_params = if device_id == source_device_id {
+                    params.clone()
+                } else {
+                    params.params_for_device(device_id)
+                };
+                let (local_trapdoor, local_b1_matrix) = if device_id == source_device_id {
+                    (DeviceReplica::Borrowed(b1_trapdoor), DeviceReplica::Borrowed(b1_matrix))
+                } else {
+                    let trapdoor_bytes = b1_trapdoor_bytes.as_ref().expect(
+                        "cross-device LUT trapdoor copy requested without serialized source bytes",
+                    );
+                    let matrix_bytes = b1_matrix_bytes.as_ref().expect(
+                        "cross-device LUT matrix copy requested without serialized source bytes",
+                    );
+                    (
+                        DeviceReplica::Owned(
+                            TS::trapdoor_from_bytes(&local_params, trapdoor_bytes).expect(
+                                "failed to deserialize trapdoor for preloaded LUT device resources",
+                            ),
+                        ),
+                        DeviceReplica::Owned(M::from_compact_bytes(&local_params, matrix_bytes)),
+                    )
+                };
                 GpuLutBaseDeviceShared {
                     device_id,
                     params: local_params,
@@ -149,7 +206,7 @@ where
     fn prepare_gpu_lut_device_shared<'a>(
         &self,
         lut_id: usize,
-        base_shared: &'a [GpuLutBaseDeviceShared<M, TS::Trapdoor>],
+        base_shared: &'a [GpuLutBaseDeviceShared<'_, M, TS::Trapdoor>],
     ) -> Vec<GpuLutDeviceShared<'a, M, TS::Trapdoor>> {
         base_shared
             .iter()
@@ -162,8 +219,8 @@ where
                 GpuLutDeviceShared {
                     device_id: base.device_id,
                     params: &base.params,
-                    trapdoor: &base.trapdoor,
-                    b1_matrix: &base.b1_matrix,
+                    trapdoor: base.trapdoor.as_ref(),
+                    b1_matrix: base.b1_matrix.as_ref(),
                     w_block_identity,
                     w_block_gy,
                     w_block_v,
@@ -175,33 +232,62 @@ where
     }
 
     #[cfg(feature = "gpu")]
-    pub(super) fn prepare_gpu_gate_base_device_shared(
+    pub(super) fn prepare_gpu_gate_base_device_shared<'a>(
         &self,
         params: &<BggPublicKey<M> as Evaluable>::Params,
-        b0_trapdoor: &TS::Trapdoor,
-        b0_matrix: &M,
-        b1_matrix: &M,
-    ) -> Vec<GpuGateBaseDeviceShared<M, TS::Trapdoor>> {
-        let device_ids = detected_gpu_device_ids();
+        b0_trapdoor: &'a TS::Trapdoor,
+        b0_matrix: &'a M,
+        b1_matrix: &'a M,
+    ) -> Vec<GpuGateBaseDeviceShared<'a, M, TS::Trapdoor>> {
+        let source_device_id = params
+            .device_ids()
+            .into_iter()
+            .next()
+            .expect("gpu params must include at least one device id");
+        let device_ids = source_device_first(detected_gpu_device_ids(), source_device_id);
         assert!(
             !device_ids.is_empty(),
             "at least one GPU device is required for gpu gate preimage sampling"
         );
 
-        let b0_trapdoor_bytes = TS::trapdoor_to_bytes(b0_trapdoor);
-        let b0_matrix_bytes = b0_matrix.to_compact_bytes();
-        let b1_matrix_bytes = b1_matrix.to_compact_bytes();
+        let needs_cross_device_copy =
+            device_ids.iter().any(|&device_id| device_id != source_device_id);
+        let b0_trapdoor_bytes = needs_cross_device_copy.then(|| TS::trapdoor_to_bytes(b0_trapdoor));
+        let b0_matrix_bytes = needs_cross_device_copy.then(|| b0_matrix.to_compact_bytes());
+        let b1_matrix_bytes = needs_cross_device_copy.then(|| b1_matrix.to_compact_bytes());
 
         device_ids
             .into_iter()
             .map(|device_id| {
-                let local_params = params.params_for_device(device_id);
-                let local_b0_trapdoor = TS::trapdoor_from_bytes(&local_params, &b0_trapdoor_bytes)
-                    .expect(
-                        "failed to deserialize b0 trapdoor for preloaded gate device resources",
-                    );
-                let local_b0_matrix = M::from_compact_bytes(&local_params, &b0_matrix_bytes);
-                let local_b1_matrix = M::from_compact_bytes(&local_params, &b1_matrix_bytes);
+                let local_params =
+                    if device_id == source_device_id { params.clone() } else { params.params_for_device(device_id) };
+                let (local_b0_trapdoor, local_b0_matrix, local_b1_matrix) =
+                    if device_id == source_device_id {
+                        (
+                            DeviceReplica::Borrowed(b0_trapdoor),
+                            DeviceReplica::Borrowed(b0_matrix),
+                            DeviceReplica::Borrowed(b1_matrix),
+                        )
+                    } else {
+                        let trapdoor_bytes = b0_trapdoor_bytes.as_ref().expect(
+                            "cross-device gate trapdoor copy requested without serialized source bytes",
+                        );
+                        let b0_bytes = b0_matrix_bytes.as_ref().expect(
+                            "cross-device gate b0 copy requested without serialized source bytes",
+                        );
+                        let b1_bytes = b1_matrix_bytes.as_ref().expect(
+                            "cross-device gate b1 copy requested without serialized source bytes",
+                        );
+                        (
+                            DeviceReplica::Owned(
+                                TS::trapdoor_from_bytes(&local_params, trapdoor_bytes).expect(
+                                    "failed to deserialize b0 trapdoor for preloaded gate device resources",
+                                ),
+                            ),
+                            DeviceReplica::Owned(M::from_compact_bytes(&local_params, b0_bytes)),
+                            DeviceReplica::Owned(M::from_compact_bytes(&local_params, b1_bytes)),
+                        )
+                    };
                 GpuGateBaseDeviceShared {
                     device_id,
                     params: local_params,
@@ -214,26 +300,45 @@ where
     }
 
     #[cfg(feature = "gpu")]
-    fn copy_matrix_to_gpu_gate_devices(
+    fn copy_matrix_to_gpu_gate_devices<'a>(
         &self,
-        matrix: &M,
-        base_shared: &[GpuGateBaseDeviceShared<M, TS::Trapdoor>],
-    ) -> Vec<M> {
-        let bytes = matrix.to_compact_bytes();
+        params: &<BggPublicKey<M> as Evaluable>::Params,
+        matrix: &'a M,
+        base_shared: &[GpuGateBaseDeviceShared<'_, M, TS::Trapdoor>],
+    ) -> Vec<DeviceReplica<'a, M>> {
+        let source_device_id = params
+            .device_ids()
+            .into_iter()
+            .next()
+            .expect("gpu params must include at least one device id");
+        let needs_cross_device_copy =
+            base_shared.iter().any(|device_shared| device_shared.device_id != source_device_id);
+        let bytes = needs_cross_device_copy.then(|| matrix.to_compact_bytes());
         base_shared
             .iter()
-            .map(|device_shared| M::from_compact_bytes(&device_shared.params, &bytes))
+            .map(|device_shared| {
+                if device_shared.device_id == source_device_id {
+                    DeviceReplica::Borrowed(matrix)
+                } else {
+                    DeviceReplica::Owned(M::from_compact_bytes(
+                        &device_shared.params,
+                        bytes.as_ref().expect(
+                            "cross-device gate replica requested without serialized source bytes",
+                        ),
+                    ))
+                }
+            })
             .collect()
     }
 
     #[cfg(feature = "gpu")]
     fn prepare_gpu_gate_device_shared<'a>(
         &self,
-        base_shared: &'a [GpuGateBaseDeviceShared<M, TS::Trapdoor>],
-        w_block_identity_by_device: Vec<M>,
-        w_block_gy_by_device: Vec<M>,
-        w_block_v_by_device: Vec<M>,
-        w_block_vx_by_device: Vec<M>,
+        base_shared: &'a [GpuGateBaseDeviceShared<'_, M, TS::Trapdoor>],
+        w_block_identity_by_device: Vec<DeviceReplica<'a, M>>,
+        w_block_gy_by_device: Vec<DeviceReplica<'a, M>>,
+        w_block_v_by_device: Vec<DeviceReplica<'a, M>>,
+        w_block_vx_by_device: Vec<DeviceReplica<'a, M>>,
     ) -> Vec<GpuGateDeviceShared<'a, M, TS::Trapdoor>> {
         let len = base_shared.len();
         assert_eq!(
@@ -268,9 +373,9 @@ where
                 GpuGateDeviceShared {
                     device_id: base.device_id,
                     params: &base.params,
-                    b0_trapdoor: &base.b0_trapdoor,
-                    b0_matrix: &base.b0_matrix,
-                    b1_matrix: &base.b1_matrix,
+                    b0_trapdoor: base.b0_trapdoor.as_ref(),
+                    b0_matrix: base.b0_matrix.as_ref(),
+                    b1_matrix: base.b1_matrix.as_ref(),
                     w_block_identity: w_identity_it
                         .next()
                         .expect("missing w_block_identity replica for gate device"),
@@ -492,7 +597,7 @@ where
                         m_g,
                         DistType::FinRingDist,
                     );
-                    let mut target_gate2_identity = s_g.clone() * &shared.w_block_identity;
+                    let mut target_gate2_identity = s_g.clone() * shared.w_block_identity.as_ref();
                     target_gate2_identity.add_in_place(&out_matrix);
                     let error = self.sample_error_matrix(shared.params, d, m_g);
                     target_gate2_identity.add_in_place(&error);
@@ -554,7 +659,7 @@ where
                 .iter()
                 .map(|(entry_pos, _, _, s_g)| {
                     let shared = shared_for_logical_idx(shared, *entry_pos);
-                    let mut target_gate2_gy = s_g.clone() * &shared.w_block_gy;
+                    let mut target_gate2_gy = s_g.clone() * shared.w_block_gy.as_ref();
                     let target_high_gy = -M::gadget_matrix(shared.params, d);
                     target_gate2_gy.add_in_place(&target_high_gy);
                     let error = self.sample_error_matrix(shared.params, d, m_g);
@@ -618,7 +723,7 @@ where
                         u_g_decomposed.col_size(),
                         shared.device_id
                     );
-                    let mut target_gate2_v = s_g.clone() * &shared.w_block_v;
+                    let mut target_gate2_v = s_g.clone() * shared.w_block_v.as_ref();
                     let target_high_v = -(input_matrix * u_g_decomposed);
                     target_gate2_v.add_in_place(&target_high_v);
                     let error = self.sample_error_matrix(shared.params, d, m_g);
@@ -694,7 +799,7 @@ where
                             chunk_idx,
                             m_g,
                         );
-                        let w_block_vx_chunk = shared.w_block_vx.slice(
+                        let w_block_vx_chunk = shared.w_block_vx.as_ref().slice(
                             0,
                             shared.w_block_vx.row_size(),
                             chunk_col_start,
@@ -919,13 +1024,13 @@ where
         start: &Instant,
     ) {
         let w_block_identity_by_device =
-            self.copy_matrix_to_gpu_gate_devices(w_block_identity, gpu_gate_base_shared);
+            self.copy_matrix_to_gpu_gate_devices(params, w_block_identity, gpu_gate_base_shared);
         let w_block_gy_by_device =
-            self.copy_matrix_to_gpu_gate_devices(w_block_gy, gpu_gate_base_shared);
+            self.copy_matrix_to_gpu_gate_devices(params, w_block_gy, gpu_gate_base_shared);
         let w_block_v_by_device =
-            self.copy_matrix_to_gpu_gate_devices(w_block_v, gpu_gate_base_shared);
+            self.copy_matrix_to_gpu_gate_devices(params, w_block_v, gpu_gate_base_shared);
         let w_block_vx_by_device =
-            self.copy_matrix_to_gpu_gate_devices(w_block_vx, gpu_gate_base_shared);
+            self.copy_matrix_to_gpu_gate_devices(params, w_block_vx, gpu_gate_base_shared);
         let gpu_gate_shared = self.prepare_gpu_gate_device_shared(
             gpu_gate_base_shared,
             w_block_identity_by_device,
@@ -1012,13 +1117,13 @@ where
         let w_block_v = self.derive_w_block_v(params, lut_id);
         let w_block_vx = self.derive_w_block_vx(params, lut_id);
         let w_block_identity_by_device =
-            self.copy_matrix_to_gpu_gate_devices(&w_block_identity, &gpu_gate_base_shared);
+            self.copy_matrix_to_gpu_gate_devices(params, &w_block_identity, &gpu_gate_base_shared);
         let w_block_gy_by_device =
-            self.copy_matrix_to_gpu_gate_devices(&w_block_gy, &gpu_gate_base_shared);
+            self.copy_matrix_to_gpu_gate_devices(params, &w_block_gy, &gpu_gate_base_shared);
         let w_block_v_by_device =
-            self.copy_matrix_to_gpu_gate_devices(&w_block_v, &gpu_gate_base_shared);
+            self.copy_matrix_to_gpu_gate_devices(params, &w_block_v, &gpu_gate_base_shared);
         let w_block_vx_by_device =
-            self.copy_matrix_to_gpu_gate_devices(&w_block_vx, &gpu_gate_base_shared);
+            self.copy_matrix_to_gpu_gate_devices(params, &w_block_vx, &gpu_gate_base_shared);
         let gpu_gate_shared = self.prepare_gpu_gate_device_shared(
             &gpu_gate_base_shared,
             w_block_identity_by_device,
@@ -1048,7 +1153,7 @@ where
 
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
-    use super::round_robin_device_slot;
+    use super::{round_robin_device_slot, source_device_first};
 
     #[test]
     fn round_robin_device_slot_wraps_after_last_device() {
@@ -1071,5 +1176,11 @@ mod tests {
         let min_count = *counts.iter().min().expect("counts must be non-empty");
         let max_count = *counts.iter().max().expect("counts must be non-empty");
         assert!(max_count - min_count <= 1, "counts={counts:?}");
+    }
+
+    #[test]
+    fn source_device_first_moves_source_to_front() {
+        assert_eq!(source_device_first(vec![2, 0, 1], 0), vec![0, 2, 1]);
+        assert_eq!(source_device_first(vec![0, 1, 2], 0), vec![0, 1, 2]);
     }
 }

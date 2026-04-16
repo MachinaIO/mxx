@@ -108,6 +108,16 @@ unsafe extern "C" {
         lhs: *const GpuMatrixOpaque,
         rhs: *const GpuMatrixOpaque,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_add_block(
+        out: *mut GpuMatrixOpaque,
+        src: *const GpuMatrixOpaque,
+        dst_row: usize,
+        dst_col: usize,
+        src_row: usize,
+        src_col: usize,
+        rows: usize,
+        cols: usize,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_sub(
         out: *mut GpuMatrixOpaque,
         lhs: *const GpuMatrixOpaque,

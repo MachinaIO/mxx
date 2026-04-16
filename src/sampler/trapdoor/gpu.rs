@@ -14,14 +14,15 @@ fn coeff_cached_matrix(src: &GpuDCRTPolyMatrix) -> GpuDCRTPolyMatrix {
     src.clone().into_coeff_domain()
 }
 
+struct GpuPerturbationSamples {
+    p1: GpuDCRTPolyMatrix,
+    p2: GpuDCRTPolyMatrix,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuDCRTTrapdoor {
     pub r: GpuDCRTPolyMatrix,
     pub e: GpuDCRTPolyMatrix,
-    pub a_mat: GpuDCRTPolyMatrix,
-    pub b_mat: GpuDCRTPolyMatrix,
-    pub d_mat: GpuDCRTPolyMatrix,
-    pub re: GpuDCRTPolyMatrix,
     a_mat_coeff: GpuDCRTPolyMatrix,
     b_mat_coeff: GpuDCRTPolyMatrix,
     d_mat_coeff: GpuDCRTPolyMatrix,
@@ -34,18 +35,14 @@ impl GpuDCRTTrapdoor {
         let dist = DistType::GaussDist { sigma };
         let r = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
         let e = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
-        let a_mat = &r * &r.transpose(); // d x d
-        let b_mat = &r * &e.transpose(); // d x d
-        let d_mat = &e * &e.transpose(); // d x d
-        let re = r.concat_rows(&[&e]);
-        let a_mat_coeff = coeff_cached_matrix(&a_mat);
-        let b_mat_coeff = coeff_cached_matrix(&b_mat);
-        let d_mat_coeff = coeff_cached_matrix(&d_mat);
-        Self { r, e, a_mat, b_mat, d_mat, re, a_mat_coeff, b_mat_coeff, d_mat_coeff }
+        let a_mat_coeff = coeff_cached_matrix(&(&r * &r.transpose()));
+        let b_mat_coeff = coeff_cached_matrix(&(&r * &e.transpose()));
+        let d_mat_coeff = coeff_cached_matrix(&(&e * &e.transpose()));
+        Self { r, e, a_mat_coeff, b_mat_coeff, d_mat_coeff }
     }
 
     pub fn to_compact_bytes(&self) -> Vec<u8> {
-        let mats = [&self.r, &self.e, &self.a_mat, &self.b_mat, &self.d_mat, &self.re];
+        let mats = [&self.r, &self.e];
         let mut parts = Vec::with_capacity(mats.len());
         let mut total_len = 0usize;
         for mat in mats {
@@ -80,24 +77,16 @@ impl GpuDCRTTrapdoor {
         };
         let r_bytes = next(bytes, &mut offset)?;
         let e_bytes = next(bytes, &mut offset)?;
-        let a_bytes = next(bytes, &mut offset)?;
-        let b_bytes = next(bytes, &mut offset)?;
-        let d_bytes = next(bytes, &mut offset)?;
-        let re_bytes = next(bytes, &mut offset)?;
         if offset != bytes.len() {
             return None;
         }
 
         let r = GpuDCRTPolyMatrix::from_compact_bytes(params, &r_bytes);
         let e = GpuDCRTPolyMatrix::from_compact_bytes(params, &e_bytes);
-        let a_mat = GpuDCRTPolyMatrix::from_compact_bytes(params, &a_bytes);
-        let b_mat = GpuDCRTPolyMatrix::from_compact_bytes(params, &b_bytes);
-        let d_mat = GpuDCRTPolyMatrix::from_compact_bytes(params, &d_bytes);
-        let re = GpuDCRTPolyMatrix::from_compact_bytes(params, &re_bytes);
-        let a_mat_coeff = coeff_cached_matrix(&a_mat);
-        let b_mat_coeff = coeff_cached_matrix(&b_mat);
-        let d_mat_coeff = coeff_cached_matrix(&d_mat);
-        Some(Self { r, e, a_mat, b_mat, d_mat, re, a_mat_coeff, b_mat_coeff, d_mat_coeff })
+        let a_mat_coeff = coeff_cached_matrix(&(&r * &r.transpose()));
+        let b_mat_coeff = coeff_cached_matrix(&(&r * &e.transpose()));
+        let d_mat_coeff = coeff_cached_matrix(&(&e * &e.transpose()));
+        Some(Self { r, e, a_mat_coeff, b_mat_coeff, d_mat_coeff })
     }
 }
 
@@ -194,7 +183,7 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         );
 
         let p_hat_start = Instant::now();
-        let p_hat = sample_pert_square_mat_gpu_native(
+        let GpuPerturbationSamples { p1, p2 } = sample_pert_square_mat_gpu_native_parts(
             params,
             trapdoor,
             s,
@@ -205,11 +194,23 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         );
         tracing::debug!(
             elapsed_ms = p_hat_start.elapsed().as_secs_f64() * 1_000.0,
-            "gpu preimage: sampled p_hat"
+            "gpu preimage: sampled perturbation blocks"
         );
 
         let perturb_start = Instant::now();
-        let perturbed_syndrome = target - &(public_matrix * &p_hat);
+        let perturbed_syndrome = {
+            let p1_rows = p1.row_size();
+            let p2_rows = p2.row_size();
+            debug_assert_eq!(
+                public_matrix.col_size(),
+                p1_rows + p2_rows,
+                "public matrix columns must match perturbation rows",
+            );
+            let public_left = public_matrix.slice(0, d, 0, p1_rows);
+            let public_right = public_matrix.slice(0, d, p1_rows, p1_rows + p2_rows);
+            let p_hat_image = (&public_left * &p1) + (&public_right * &p2);
+            target - &p_hat_image
+        };
         tracing::debug!(
             elapsed_ms = perturb_start.elapsed().as_secs_f64() * 1_000.0,
             "gpu preimage: computed perturbed_syndrome"
@@ -230,42 +231,53 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             elapsed_ms = r_mul_start.elapsed().as_secs_f64() * 1_000.0,
             "gpu preimage: computed r * z_hat"
         );
+        let assemble_start = Instant::now();
+        let mut out = GpuDCRTPolyMatrix::new_empty_with_state(
+            params,
+            p1.row_size() + p2.row_size(),
+            target_cols,
+            p1.level(),
+            p1.is_ntt(),
+        );
+        out.copy_block_from(&p1, 0, 0, 0, 0, p1.row_size(), target_cols);
+        out.copy_block_from(&p2, p1.row_size(), 0, 0, 0, p2.row_size(), target_cols);
+        drop(p1);
+        drop(p2);
+
+        out.add_block_from(&r_z_hat, 0, 0, 0, 0, r_z_hat.row_size(), target_cols);
+        tracing::debug!(
+            elapsed_ms = assemble_start.elapsed().as_secs_f64() * 1_000.0,
+            row_start = 0usize,
+            rows = r_z_hat.row_size(),
+            step = "r_z_hat",
+            "gpu preimage: merged correction block"
+        );
+        drop(r_z_hat);
+
         let e_mul_start = Instant::now();
         let e_z_hat = &trapdoor.e * &z_hat_mat;
         tracing::debug!(
             elapsed_ms = e_mul_start.elapsed().as_secs_f64() * 1_000.0,
             "gpu preimage: computed e * z_hat"
         );
-
-        let assemble_start = Instant::now();
-        let mut out = p_hat;
-        let total_ncol = out.col_size();
-        let out_nrow = out.row_size();
-        let mut add_block_to_out =
-            |dst_row: usize, block: &GpuDCRTPolyMatrix, step: &'static str| {
-                let block_start = Instant::now();
-                let rows = block.row_size();
-                let mut out_block = out.slice(dst_row, dst_row + rows, 0, total_ncol);
-                out_block.add_in_place(block);
-                out.copy_block_from(&out_block, dst_row, 0, 0, 0, rows, total_ncol);
-                tracing::debug!(
-                    elapsed_ms = block_start.elapsed().as_secs_f64() * 1_000.0,
-                    row_start = dst_row,
-                    rows = rows,
-                    step = step,
-                    "gpu preimage: merged correction block"
-                );
-            };
-        add_block_to_out(0, &r_z_hat, "r_z_hat");
-        let e_row_start = r_z_hat.row_size();
-        add_block_to_out(e_row_start, &e_z_hat, "e_z_hat");
-        let z_row_start = e_row_start + e_z_hat.row_size();
-        debug_assert_eq!(
-            z_row_start + z_hat_mat.row_size(),
-            out_nrow,
-            "preimage correction row blocks must cover output rows"
+        out.add_block_from(&e_z_hat, d, 0, 0, 0, e_z_hat.row_size(), target_cols);
+        tracing::debug!(
+            elapsed_ms = assemble_start.elapsed().as_secs_f64() * 1_000.0,
+            row_start = d,
+            rows = e_z_hat.row_size(),
+            step = "e_z_hat",
+            "gpu preimage: merged correction block"
         );
-        add_block_to_out(z_row_start, &z_hat_mat, "z_hat_mat");
+        drop(e_z_hat);
+
+        out.add_block_from(&z_hat_mat, 2 * d, 0, 0, 0, z_hat_mat.row_size(), target_cols);
+        tracing::debug!(
+            elapsed_ms = assemble_start.elapsed().as_secs_f64() * 1_000.0,
+            row_start = 2 * d,
+            rows = z_hat_mat.row_size(),
+            step = "z_hat_mat",
+            "gpu preimage: merged correction block"
+        );
         tracing::debug!(
             elapsed_ms = assemble_start.elapsed().as_secs_f64() * 1_000.0,
             "gpu preimage: assembled output matrix"
@@ -333,7 +345,7 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
     }
 }
 
-fn sample_pert_square_mat_gpu_native(
+fn sample_pert_square_mat_gpu_native_parts(
     params: &GpuDCRTPolyParams,
     trapdoor: &GpuDCRTTrapdoor,
     s: f64,
@@ -341,7 +353,7 @@ fn sample_pert_square_mat_gpu_native(
     dgg_stddev: f64,
     sigma_large: f64,
     total_ncol: usize,
-) -> GpuDCRTPolyMatrix {
+) -> GpuPerturbationSamples {
     let uniform_sampler = GpuDCRTPolyUniformSampler::new();
     let d = trapdoor.r.row_size();
     let dk = trapdoor.r.col_size();
@@ -365,7 +377,7 @@ fn sample_pert_square_mat_gpu_native(
         DistType::GaussDist { sigma: sigma_large },
     );
     tracing::debug!("gpu preimage sample_pert: sampled p2");
-    let tp2 = &trapdoor.re * &p2;
+    let tp2 = trapdoor.r.concat_rows(&[&trapdoor.e]) * &p2;
     tracing::debug!("gpu preimage sample_pert: computed tp2");
 
     // Keep perturbation generation on device: this sampler uses the full
@@ -384,6 +396,31 @@ fn sample_pert_square_mat_gpu_native(
     );
     tracing::debug!("gpu preimage sample_pert: sampled p1");
 
+    GpuPerturbationSamples { p1, p2 }
+}
+
+fn sample_pert_square_mat_gpu_native(
+    params: &GpuDCRTPolyParams,
+    trapdoor: &GpuDCRTTrapdoor,
+    s: f64,
+    c: f64,
+    dgg_stddev: f64,
+    sigma_large: f64,
+    total_ncol: usize,
+) -> GpuDCRTPolyMatrix {
+    let GpuPerturbationSamples { p1, p2 } = sample_pert_square_mat_gpu_native_parts(
+        params,
+        trapdoor,
+        s,
+        c,
+        dgg_stddev,
+        sigma_large,
+        total_ncol,
+    );
+    let d = trapdoor.r.row_size();
+    let num_blocks = total_ncol.div_ceil(d);
+    let padded_ncol = num_blocks * d;
+    let padding_ncol = padded_ncol - total_ncol;
     let mut p_hat = GpuDCRTPolyMatrix::new_empty_with_state(
         params,
         p1.row_size() + p2.row_size(),

@@ -9,16 +9,16 @@ use crate::{
                 GPU_MATRIX_DIST_BIT, GPU_MATRIX_DIST_GAUSS, GPU_MATRIX_DIST_TERNARY,
                 GPU_MATRIX_DIST_UNIFORM, GPU_POLY_FORMAT_COEFF, GPU_POLY_FORMAT_EVAL, GpuDCRTPoly,
                 GpuDCRTPolyParams, GpuEventSetOpaque, GpuMatrixOpaque, check_status,
-                gpu_event_set_destroy, gpu_event_set_wait, gpu_matrix_add, gpu_matrix_copy,
-                gpu_matrix_copy_block, gpu_matrix_create, gpu_matrix_decompose_base,
-                gpu_matrix_decompose_base_small, gpu_matrix_destroy, gpu_matrix_equal,
-                gpu_matrix_fill_gadget, gpu_matrix_fill_small_decomposed_identity_chunk,
-                gpu_matrix_fill_small_gadget, gpu_matrix_gauss_samp_gq_arb_base,
-                gpu_matrix_intt_all, gpu_matrix_load_compact_bytes, gpu_matrix_load_rns_batch,
-                gpu_matrix_mul, gpu_matrix_mul_scalar, gpu_matrix_ntt_all,
-                gpu_matrix_sample_distribution, gpu_matrix_sample_p1_full,
-                gpu_matrix_store_compact_bytes, gpu_matrix_store_const_coeff_batch,
-                gpu_matrix_store_rns_batch, gpu_matrix_sub,
+                gpu_event_set_destroy, gpu_event_set_wait, gpu_matrix_add, gpu_matrix_add_block,
+                gpu_matrix_copy, gpu_matrix_copy_block, gpu_matrix_create,
+                gpu_matrix_decompose_base, gpu_matrix_decompose_base_small, gpu_matrix_destroy,
+                gpu_matrix_equal, gpu_matrix_fill_gadget,
+                gpu_matrix_fill_small_decomposed_identity_chunk, gpu_matrix_fill_small_gadget,
+                gpu_matrix_gauss_samp_gq_arb_base, gpu_matrix_intt_all,
+                gpu_matrix_load_compact_bytes, gpu_matrix_load_rns_batch, gpu_matrix_mul,
+                gpu_matrix_mul_scalar, gpu_matrix_ntt_all, gpu_matrix_sample_distribution,
+                gpu_matrix_sample_p1_full, gpu_matrix_store_compact_bytes,
+                gpu_matrix_store_const_coeff_batch, gpu_matrix_store_rns_batch, gpu_matrix_sub,
             },
             params::DCRTPolyParams,
             poly::DCRTPoly,
@@ -326,6 +326,29 @@ impl GpuDCRTPolyMatrix {
         let status = unsafe { gpu_matrix_add(self.raw, self.raw, rhs.raw) };
         check_status(status, "gpu_matrix_add");
         self.is_ntt = rhs.is_ntt;
+    }
+
+    pub fn add_block_from(
+        &mut self,
+        src: &Self,
+        dst_row: usize,
+        dst_col: usize,
+        src_row: usize,
+        src_col: usize,
+        rows: usize,
+        cols: usize,
+    ) {
+        debug_assert_eq!(self.params, src.params, "add_block_from requires same params");
+        debug_assert_eq!(self.level, src.level, "add_block_from requires same level");
+        debug_assert_eq!(self.is_ntt, src.is_ntt, "add_block_from requires same domain");
+        if rows == 0 || cols == 0 {
+            return;
+        }
+        let status = unsafe {
+            gpu_matrix_add_block(self.raw, src.raw, dst_row, dst_col, src_row, src_col, rows, cols)
+        };
+        check_status(status, "gpu_matrix_add_block");
+        self.is_ntt = src.is_ntt;
     }
 
     pub fn sub_in_place(&mut self, rhs: &Self) {

@@ -190,6 +190,14 @@ unsafe extern "C" {
         sigma: f64,
         seed: u64,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_sample_distribution_columns(
+        out: *mut GpuMatrixOpaque,
+        dist_type: c_int,
+        sigma: f64,
+        seed: u64,
+        full_ncol: usize,
+        col_offset: usize,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_ntt_all(mat: *mut GpuMatrixOpaque) -> c_int;
     pub(crate) fn gpu_matrix_intt_all(mat: *mut GpuMatrixOpaque) -> c_int;
     fn gpu_device_synchronize() -> c_int;

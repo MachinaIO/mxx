@@ -54,33 +54,29 @@ pub struct DCRTPolyHashSampler<H: OutputSizeUser + digest::Digest> {
     _h: PhantomData<H>,
 }
 
-impl<H> PolyHashSampler<[u8; 32]> for DCRTPolyHashSampler<H>
+fn sample_hash_matrix_range<H, B>(
+    params: &<<DCRTPolyMatrix as PolyMatrix>::P as Poly>::Params,
+    hash_key: [u8; 32],
+    tag: B,
+    nrow: usize,
+    col_range: Range<usize>,
+    dist: DistType,
+) -> DCRTPolyMatrix
 where
     H: OutputSizeUser + digest::Digest + Clone + Send + Sync,
+    B: AsRef<[u8]>,
 {
-    type M = DCRTPolyMatrix;
-
-    fn new() -> Self {
-        Self { _h: PhantomData }
-    }
-
-    fn sample_hash<B: AsRef<[u8]>>(
-        &self,
-        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
-        hash_key: [u8; 32],
-        tag: B,
-        nrow: usize,
-        ncol: usize,
-        dist: DistType,
-    ) -> DCRTPolyMatrix {
-        let out_sz = <H as digest::Digest>::output_size();
-        let n = params.ring_dimension() as usize;
-        let q = params.modulus();
-        let mut new_matrix = DCRTPolyMatrix::new_empty(params, nrow, ncol);
-        let mut hasher: H = H::new();
-        hasher.update(hash_key);
-        hasher.update(tag.as_ref());
-        let f = |row_offsets: Range<usize>, col_offsets: Range<usize>| -> Vec<Vec<DCRTPoly>> {
+    let out_sz = <H as digest::Digest>::output_size();
+    let n = params.ring_dimension() as usize;
+    let q = params.modulus();
+    let ncol = col_range.end.saturating_sub(col_range.start);
+    let mut new_matrix = DCRTPolyMatrix::new_empty(params, nrow, ncol);
+    let mut hasher: H = H::new();
+    hasher.update(hash_key);
+    hasher.update(tag.as_ref());
+    let f =
+        move |row_offsets: Range<usize>, local_col_offsets: Range<usize>| -> Vec<Vec<DCRTPoly>> {
+            let global_col_start = col_range.start;
             match dist {
                 DistType::FinRingDist => {
                     let modulus_bits = q.bits() as usize;
@@ -92,8 +88,9 @@ where
                     };
                     parallel_iter!(row_offsets)
                         .map(|i| {
-                            parallel_iter!(col_offsets.clone())
-                                .map(|j| {
+                            parallel_iter!(local_col_offsets.clone())
+                                .map(|local_j| {
+                                    let j = global_col_start + local_j;
                                     let mut hasher = hasher.clone();
                                     hasher.update(i.to_le_bytes());
                                     hasher.update(j.to_le_bytes());
@@ -118,8 +115,9 @@ where
                 }
                 DistType::BitDist => parallel_iter!(row_offsets)
                     .map(|i| {
-                        parallel_iter!(col_offsets.clone())
-                            .map(|j| {
+                        parallel_iter!(local_col_offsets.clone())
+                            .map(|local_j| {
+                                let j = global_col_start + local_j;
                                 let mut hasher = hasher.clone();
                                 hasher.update(i.to_le_bytes());
                                 hasher.update(j.to_le_bytes());
@@ -146,13 +144,56 @@ where
                             .collect::<Vec<DCRTPoly>>()
                     })
                     .collect::<Vec<Vec<DCRTPoly>>>(),
-                _ => {
-                    panic!("Unsupported distribution type")
-                }
+                _ => panic!("Unsupported distribution type"),
             }
         };
-        new_matrix.replace_entries(0..nrow, 0..ncol, f);
-        new_matrix
+    new_matrix.replace_entries(0..nrow, 0..ncol, f);
+    new_matrix
+}
+
+impl<H> PolyHashSampler<[u8; 32]> for DCRTPolyHashSampler<H>
+where
+    H: OutputSizeUser + digest::Digest + Clone + Send + Sync,
+{
+    type M = DCRTPolyMatrix;
+
+    fn new() -> Self {
+        Self { _h: PhantomData }
+    }
+
+    fn sample_hash<B: AsRef<[u8]>>(
+        &self,
+        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
+        hash_key: [u8; 32],
+        tag: B,
+        nrow: usize,
+        ncol: usize,
+        dist: DistType,
+    ) -> DCRTPolyMatrix {
+        sample_hash_matrix_range::<H, _>(params, hash_key, tag, nrow, 0..ncol, dist)
+    }
+
+    fn sample_hash_columns<B: AsRef<[u8]>>(
+        &self,
+        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
+        hash_key: [u8; 32],
+        tag: B,
+        nrow: usize,
+        total_ncol: usize,
+        col_start: usize,
+        col_len: usize,
+        dist: DistType,
+    ) -> DCRTPolyMatrix {
+        let col_end =
+            col_start.checked_add(col_len).expect("sample_hash_columns column range overflow");
+        assert!(
+            col_end <= total_ncol,
+            "sample_hash_columns range out of bounds: start={}, len={}, total_ncol={}",
+            col_start,
+            col_len,
+            total_ncol
+        );
+        sample_hash_matrix_range::<H, _>(params, hash_key, tag, nrow, col_start..col_end, dist)
     }
 }
 
@@ -192,5 +233,41 @@ mod tests {
         let matrix = matrix_result;
         assert_eq!(matrix.row_size(), nrow, "Matrix row count mismatch");
         assert_eq!(matrix.col_size(), ncol, "Matrix column count mismatch");
+    }
+
+    #[test]
+    fn test_poly_hash_sampler_column_subrange_matches_full_sample() {
+        let key = [3u8; 32];
+        let params = DCRTPolyParams::default();
+        let sampler = DCRTPolyHashSampler::<Keccak256>::new();
+        let tag = b"column-subrange";
+        let full = sampler.sample_hash(&params, key, tag, 4, 9, DistType::FinRingDist);
+        let chunk =
+            sampler.sample_hash_columns(&params, key, tag, 4, 9, 2, 3, DistType::FinRingDist);
+        assert_eq!(chunk, full.slice_columns(2, 5));
+
+        let decomposed = sampler.sample_hash_decomposed_columns(
+            &params,
+            key,
+            tag,
+            4,
+            9,
+            2,
+            3,
+            DistType::FinRingDist,
+        );
+        assert_eq!(decomposed, full.slice_columns(2, 5).decompose());
+
+        let small_decomposed = sampler.sample_hash_small_decomposed_columns(
+            &params,
+            key,
+            tag,
+            4,
+            9,
+            2,
+            3,
+            DistType::FinRingDist,
+        );
+        assert_eq!(small_decomposed, full.slice_columns(2, 5).small_decompose());
     }
 }

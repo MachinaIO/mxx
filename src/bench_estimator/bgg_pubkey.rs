@@ -9,6 +9,7 @@ use crate::{
     slot_transfer::SlotTransferEvaluator,
 };
 use num_bigint::BigUint;
+use tracing::debug;
 
 use super::{
     BenchEstimator, CircuitBenchEstimate, benchmark_gate_operation, measure_bench_operation,
@@ -118,16 +119,27 @@ where
     {
         let add_bench =
             benchmark_gate_operation(iterations, || samples.add_lhs.clone() + samples.add_rhs);
+        debug!("BggPublicKeyBenchEstimator::benchmark add_bench={:?}", add_bench);
         let sub_bench =
             benchmark_gate_operation(iterations, || samples.sub_lhs.clone() - samples.sub_rhs);
+        debug!("BggPublicKeyBenchEstimator::benchmark sub_bench={:?}", sub_bench);
         let mul_bench =
             benchmark_gate_operation(iterations, || samples.mul_lhs.clone() * samples.mul_rhs);
+        debug!("BggPublicKeyBenchEstimator::benchmark mul_bench={:?}", mul_bench);
         let small_scalar_mul_bench = benchmark_gate_operation(iterations, || {
             samples.small_scalar_input.small_scalar_mul(samples.params, samples.small_scalar)
         });
+        debug!(
+            "BggPublicKeyBenchEstimator::benchmark small_scalar_mul_bench={:?}",
+            small_scalar_mul_bench
+        );
         let large_scalar_mul_bench = benchmark_gate_operation(iterations, || {
             samples.large_scalar_input.large_scalar_mul(samples.params, samples.large_scalar)
         });
+        debug!(
+            "BggPublicKeyBenchEstimator::benchmark large_scalar_mul_bench={:?}",
+            large_scalar_mul_bench
+        );
         let public_lut_bench = benchmark_gate_operation(iterations, || {
             public_lut_evaluator.public_lookup(
                 samples.params,
@@ -138,6 +150,10 @@ where
                 samples.public_lut_id,
             )
         });
+        debug!(
+            "BggPublicKeyBenchEstimator::benchmark public_lut_bench={:?}",
+            public_lut_bench
+        );
         let slot_transfer_bench = benchmark_gate_operation(iterations, || {
             slot_transfer_evaluator.slot_transfer(
                 samples.params,
@@ -146,6 +162,10 @@ where
                 samples.slot_transfer_gate_id,
             )
         });
+        debug!(
+            "BggPublicKeyBenchEstimator::benchmark slot_transfer_bench={:?}",
+            slot_transfer_bench
+        );
 
         Self {
             input_time: 0.0,
@@ -177,7 +197,14 @@ where
     ) -> SampleAuxBenchEstimate {
         let lut_entry_time = self.public_lut_estimator.sample_aux_matrices_lut_entry_time();
         let lut_gate_time = self.public_lut_estimator.sample_aux_matrices_lut_gate_time();
-        SampleAuxBenchEstimate {
+        debug!(
+            "BggPublicKeyBenchEstimator::estimate_public_lut_sample_aux_matrices components: total_lut_entries={}, total_lut_gates={}, lut_entry_time={:?}, lut_gate_time={:?}",
+            total_lut_entries,
+            total_lut_gates,
+            lut_entry_time,
+            lut_gate_time
+        );
+        let estimate = SampleAuxBenchEstimate {
             total_time: lut_entry_time.total_time * total_lut_entries as f64 +
                 lut_gate_time.total_time * total_lut_gates as f64,
             latency: lut_entry_time.latency + lut_gate_time.latency,
@@ -191,7 +218,12 @@ where
                         .and_then(|gate_bytes| entry_bytes.checked_add(gate_bytes))
                 })
                 .expect("public LUT sample-aux compact_bytes overflowed u64"),
-        }
+        };
+        debug!(
+            "BggPublicKeyBenchEstimator::estimate_public_lut_sample_aux_matrices estimate={:?}",
+            estimate
+        );
+        estimate
     }
 
     pub fn estimate_slot_transfer_sample_aux_matrices(
@@ -201,7 +233,14 @@ where
     ) -> SampleAuxBenchEstimate {
         let slot_time = self.slot_transfer_estimator.sample_aux_matrices_slot_time();
         let gate_time = self.slot_transfer_estimator.sample_aux_matrices_gate_time();
-        SampleAuxBenchEstimate {
+        debug!(
+            "BggPublicKeyBenchEstimator::estimate_slot_transfer_sample_aux_matrices components: num_slots={}, slot_transfer_gate_count={}, slot_time={:?}, gate_time={:?}",
+            num_slots,
+            slot_transfer_gate_count,
+            slot_time,
+            gate_time
+        );
+        let estimate = SampleAuxBenchEstimate {
             total_time: slot_time.total_time * num_slots as f64 +
                 gate_time.total_time * slot_transfer_gate_count as f64,
             latency: slot_time.latency + gate_time.latency,
@@ -215,7 +254,12 @@ where
                         .and_then(|gate_bytes| slot_bytes.checked_add(gate_bytes))
                 })
                 .expect("slot-transfer sample-aux compact_bytes overflowed u64"),
-        }
+        };
+        debug!(
+            "BggPublicKeyBenchEstimator::estimate_slot_transfer_sample_aux_matrices estimate={:?}",
+            estimate
+        );
+        estimate
     }
 }
 

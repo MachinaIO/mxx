@@ -372,13 +372,6 @@ pub(crate) struct SummedSubCircuitCallInfo {
     pub(crate) output_gate_ids: Vec<GateId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CircuitExecutionLayer {
-    pub(crate) sub_circuit_call_ids: Vec<usize>,
-    pub(crate) summed_sub_circuit_call_ids: Vec<usize>,
-    pub(crate) regular_gate_types: Vec<PolyGateType>,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct GroupedCallExecutionLayer {
     pub(crate) regular_gate_ids: Vec<GateId>,

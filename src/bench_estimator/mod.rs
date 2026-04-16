@@ -26,7 +26,7 @@ use std::{
 use num_bigint::BigUint;
 
 use crate::circuit::{
-    CircuitExecutionLayer, Evaluable, PolyCircuit, PolyGateType, SubCircuitParamValue,
+    Evaluable, GroupedCallExecutionLayer, PolyCircuit, PolyGateType, SubCircuitParamValue,
 };
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -258,11 +258,29 @@ where
     let mut estimate = CircuitBenchSummary::new(0.0, 0.0, 0);
     #[cfg(feature = "gpu")]
     let mut peak_vram = 0;
-    for CircuitExecutionLayer {
+    let reachable_inputs = circuit.reachable_input_gate_ids();
+    if !reachable_inputs.is_empty() {
+        let input_estimate = estimator.estimate_input();
+        let input_count = reachable_inputs.len() as f64;
+        estimate.total_time += input_estimate.total_time * input_count;
+        estimate.latency += input_estimate.latency;
+        estimate.max_parallelism = estimate.max_parallelism.max(
+            input_estimate
+                .parallelism_factor()
+                .checked_mul(reachable_inputs.len() as u128)
+                .expect("input parallelism overflowed u128 while scaling by input count"),
+        );
+        #[cfg(feature = "gpu")]
+        {
+            peak_vram = peak_vram.max(input_estimate.peak_vram);
+        }
+    }
+
+    for GroupedCallExecutionLayer {
         sub_circuit_call_ids,
         summed_sub_circuit_call_ids,
-        regular_gate_types,
-    } in circuit.execution_layers()
+        regular_gate_ids,
+    } in circuit.grouped_execution_layers()
     {
         let mut layer_counts: HashMap<PolyGateType, usize> = HashMap::new();
         let mut layer_latency = 0.0_f64;
@@ -270,10 +288,10 @@ where
 
         for call_id in sub_circuit_call_ids {
             let call = circuit.sub_circuit_call_info(call_id);
-            let sub_circuit = circuit.registered_sub_circuit(call.sub_circuit_id);
+            let sub_circuit = circuit.registered_sub_circuit_ref(call.sub_circuit_id);
             let sub_summary = estimate_circuit_bench_with_cache::<E, B>(
                 estimator,
-                &sub_circuit,
+                sub_circuit.as_ref(),
                 &call.param_bindings,
                 summary_cache,
             );
@@ -287,11 +305,11 @@ where
         }
         for summed_call_id in summed_sub_circuit_call_ids {
             let call = circuit.summed_sub_circuit_call_info(summed_call_id);
-            let sub_circuit = circuit.registered_sub_circuit(call.sub_circuit_id);
+            let sub_circuit = circuit.registered_sub_circuit_ref(call.sub_circuit_id);
             for param_bindings in &call.param_bindings {
                 let sub_summary = estimate_circuit_bench_with_cache::<E, B>(
                     estimator,
-                    &sub_circuit,
+                    sub_circuit.as_ref(),
                     param_bindings.as_ref(),
                     summary_cache,
                 );
@@ -305,7 +323,8 @@ where
             }
         }
 
-        for gate_type in regular_gate_types {
+        for gate_id in regular_gate_ids {
+            let gate_type = circuit.gate(gate_id).gate_type.clone();
             *layer_counts.entry(gate_type).or_insert(0) += 1;
         }
 

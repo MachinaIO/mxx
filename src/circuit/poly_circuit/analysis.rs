@@ -874,17 +874,18 @@ impl<P: Poly> PolyCircuit<P> {
         levels
     }
 
-    pub(crate) fn execution_layers(&self) -> Vec<CircuitExecutionLayer> {
-        self.grouped_execution_layers()
+    /// Return the reachable non-constant input gates needed to produce the current outputs.
+    ///
+    /// `grouped_execution_layers()` intentionally excludes input gates because both
+    /// `non_free_depth()` and `eval_error` preload them before layered execution starts. Some
+    /// callers, notably `bench_estimator`, still need to charge an explicit input layer, so this
+    /// helper exposes the reachable real inputs without reviving the old placeholder-based
+    /// `execution_layers()` API.
+    pub(crate) fn reachable_input_gate_ids(&self) -> Vec<GateId> {
+        self.topological_order()
             .into_iter()
-            .map(|level| CircuitExecutionLayer {
-                sub_circuit_call_ids: level.sub_circuit_call_ids,
-                summed_sub_circuit_call_ids: level.summed_sub_circuit_call_ids,
-                regular_gate_types: level
-                    .regular_gate_ids
-                    .into_iter()
-                    .map(|gate_id| self.gate(gate_id).gate_type.clone())
-                    .collect(),
+            .filter(|gate_id| {
+                matches!(self.gate(*gate_id).gate_type, PolyGateType::Input) && gate_id.0 != 0
             })
             .collect()
     }

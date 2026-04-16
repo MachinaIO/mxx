@@ -273,10 +273,6 @@ impl<P: Poly> PolyCircuit<P> {
         );
     }
 
-    pub(crate) fn registered_sub_circuit(&self, circuit_id: usize) -> Self {
-        self.with_sub_circuit(circuit_id, Clone::clone)
-    }
-
     pub(crate) fn registered_sub_circuit_ref(&self, circuit_id: usize) -> Arc<Self> {
         self.sub_circuits.get(&circuit_id).expect("sub-circuit not found").clone()
     }

@@ -578,6 +578,27 @@ fn sample_benchmark_pubkeys(
     sampler.sample(params, tag, &reveal_plaintexts)
 }
 
+fn constant_and_shared_benchmark_pubkeys(
+    pubkeys: &[BggPublicKey<GpuMatrix>],
+) -> (&BggPublicKey<GpuMatrix>, &BggPublicKey<GpuMatrix>) {
+    assert_eq!(
+        pubkeys.len(),
+        2,
+        "benchmark pubkeys must contain exactly the constant-one key and one reusable input key"
+    );
+    (&pubkeys[0], &pubkeys[1])
+}
+
+fn repeated_shared_benchmark_pubkeys<'a>(
+    pubkeys: &'a [BggPublicKey<GpuMatrix>],
+    non_constant_count: usize,
+) -> Vec<&'a BggPublicKey<GpuMatrix>> {
+    let (constant_one, shared_input) = constant_and_shared_benchmark_pubkeys(pubkeys);
+    std::iter::once(constant_one)
+        .chain((0..non_constant_count).map(move |_| shared_input))
+        .collect()
+}
+
 #[tokio::test]
 async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
@@ -657,6 +678,9 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
         ring_gsw_q.bits(),
         bigdecimal_bits_ceil(&max_selected_decryption_error)
     );
+    drop(encrypted_outputs);
+    drop(ctx);
+    gpu_device_sync();
 
     let pubkey_bench_dir = cfg.pubkey_bench_dir(crt_depth);
     ensure_dir_exists(&pubkey_bench_dir);
@@ -670,13 +694,11 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
         &params,
         DEFAULT_BENCH_SEED,
         cfg.d_secret,
-        10,
+        1,
         b"GGH15_GOLDREICH_RING_GSW_PKBENCH",
     );
-    assert!(
-        pubkey_bench_public_keys.len() > 10,
-        "public-key benchmark samples must provide the expected number of entries"
-    );
+    let (pubkey_bench_public_lut_one, pubkey_bench_shared_input) =
+        constant_and_shared_benchmark_pubkeys(&pubkey_bench_public_keys);
     let pubkey_bench_plt_evaluator = GpuPubKeyPltEvaluator::new(
         DEFAULT_BENCH_SEED,
         cfg.d_secret,
@@ -695,22 +717,22 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
     let pubkey_bench_estimator_owner = BggPublicKeyBenchEstimator::benchmark(
         &BggPublicKeyBenchSamples {
             params: &params,
-            add_lhs: &pubkey_bench_public_keys[1],
-            add_rhs: &pubkey_bench_public_keys[2],
-            sub_lhs: &pubkey_bench_public_keys[3],
-            sub_rhs: &pubkey_bench_public_keys[4],
-            mul_lhs: &pubkey_bench_public_keys[5],
-            mul_rhs: &pubkey_bench_public_keys[6],
-            small_scalar_input: &pubkey_bench_public_keys[7],
+            add_lhs: pubkey_bench_shared_input,
+            add_rhs: pubkey_bench_shared_input,
+            sub_lhs: pubkey_bench_shared_input,
+            sub_rhs: pubkey_bench_shared_input,
+            mul_lhs: pubkey_bench_shared_input,
+            mul_rhs: pubkey_bench_shared_input,
+            small_scalar_input: pubkey_bench_shared_input,
             small_scalar: &[3u32, 5u32],
-            large_scalar_input: &pubkey_bench_public_keys[8],
+            large_scalar_input: pubkey_bench_shared_input,
             large_scalar: &[BigUint::from(7u32)],
-            public_lut_one: &pubkey_bench_public_keys[0],
-            public_lut_input: &pubkey_bench_public_keys[9],
+            public_lut_one: pubkey_bench_public_lut_one,
+            public_lut_input: pubkey_bench_shared_input,
             public_lut: &bench_lut,
             public_lut_gate_id: pubkey_bench_public_lut_gate_id,
             public_lut_id: pubkey_bench_public_lut_id,
-            slot_transfer_input: &pubkey_bench_public_keys[10],
+            slot_transfer_input: pubkey_bench_shared_input,
             slot_transfer_src_slots: &pubkey_bench_slot_transfer_src_slots,
             slot_transfer_gate_id: pubkey_bench_slot_transfer_gate_id,
         },
@@ -757,21 +779,21 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
         pubkey_circuit_bench.max_parallelism,
         pubkey_circuit_bench.peak_vram
     );
+    drop(pubkey_bench_public_keys);
+    gpu_device_sync();
 
     let poly_bench_dir = cfg.poly_bench_dir(crt_depth);
     ensure_dir_exists(&poly_bench_dir);
     init_storage_system(poly_bench_dir.clone());
-    let one_slot_bench_pubkeys = sample_benchmark_pubkeys(
+    let poly_bench_pubkeys = sample_benchmark_pubkeys(
         &params,
         DEFAULT_BENCH_SEED,
         cfg.d_secret,
-        10,
+        1,
         b"GGH15_GOLDREICH_RING_GSW_POLYBENCH",
     );
-    assert!(
-        one_slot_bench_pubkeys.len() > 10,
-        "poly benchmark pubkey samples must provide the expected number of entries"
-    );
+    let (_poly_bench_public_lut_one, poly_bench_shared_input) =
+        constant_and_shared_benchmark_pubkeys(&poly_bench_pubkeys);
     let poly_bench_pubkey_plt_evaluator = GpuPubKeyPltEvaluator::new(
         DEFAULT_BENCH_SEED,
         cfg.d_secret,
@@ -794,13 +816,13 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
         build_benchmark_slot_transfer_gate(&poly_bench_slot_transfer_src_slots);
     poly_bench_pubkey_plt_evaluator.record_public_lookup_state(
         &bench_lut,
-        &one_slot_bench_pubkeys[9],
+        poly_bench_shared_input,
         poly_bench_public_lut_gate_id,
         poly_bench_public_lut_id,
     );
     poly_bench_pubkey_slot_evaluator.record_slot_transfer_state(
         &params,
-        &one_slot_bench_pubkeys[10],
+        poly_bench_shared_input,
         &poly_bench_slot_transfer_src_slots,
         poly_bench_slot_transfer_gate_id,
     );
@@ -841,9 +863,10 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
         &bench_secrets,
         Some(cfg.error_sigma),
     );
+    let repeated_poly_bench_pubkeys = repeated_shared_benchmark_pubkeys(&poly_bench_pubkeys, 10);
     let bench_poly_encodings = bench_encoding_sampler.sample(
         &params,
-        &one_slot_bench_pubkeys,
+        &repeated_poly_bench_pubkeys,
         &bench_plaintext_rows,
         Some(&bench_slot_secret_mats),
     );

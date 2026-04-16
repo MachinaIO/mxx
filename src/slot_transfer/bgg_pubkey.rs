@@ -19,6 +19,7 @@ use std::time::Instant;
 use std::{marker::PhantomData, path::PathBuf};
 use tracing::info;
 
+#[cfg(not(feature = "gpu"))]
 pub(crate) struct SlotAuxSample<M: PolyMatrix> {
     pub(crate) slot_idx: usize,
     pub(crate) slot_a: M,
@@ -86,15 +87,6 @@ where
     })
 }
 
-pub(crate) fn concat_column_chunks<M>(chunks: Vec<M>) -> M
-where
-    M: PolyMatrix,
-{
-    let mut chunk_iter = chunks.into_iter();
-    let first = chunk_iter.next().expect("column chunk list must be non-empty");
-    first.concat_columns_owned(chunk_iter.collect())
-}
-
 pub(crate) fn decomposition_column_chunk_width(total_cols: usize) -> usize {
     assert!(total_cols > 0, "decomposition_column_chunk_width requires total_cols > 0");
     total_cols.min(crate::env::aux_sampling_chunk_width().max(1))
@@ -128,44 +120,6 @@ where
     M: PolyMatrix,
 {
     size.checked_mul(params.modulus_digits() + 2).expect("trapdoor public column count overflow")
-}
-
-#[cfg(test)]
-pub(crate) fn read_matrix_from_column_chunks<M>(
-    params: &<M::P as Poly>::Params,
-    dir: &std::path::Path,
-    id_prefix: &str,
-    total_cols: usize,
-) -> M
-where
-    M: PolyMatrix,
-{
-    let chunk_count = column_chunk_count(total_cols);
-    let mut chunks = Vec::with_capacity(chunk_count);
-    for chunk_idx in 0..chunk_count {
-        let (_, expected_cols) = column_chunk_bounds(total_cols, chunk_idx);
-        let chunk_prefix = column_chunk_id_prefix(id_prefix, chunk_idx);
-        let chunk = if let Some(matrix) =
-            read_matrix_from_multi_batch::<M>(params, dir, &chunk_prefix, 0)
-        {
-            matrix
-        } else {
-            let bytes = read_bytes_from_multi_batch(dir, &chunk_prefix, 0).unwrap_or_else(|| {
-                panic!("missing slot-transfer checkpoint bytes for {id_prefix} chunk {chunk_idx}")
-            });
-            M::from_compact_bytes(params, &bytes)
-        };
-        assert_eq!(
-            chunk.col_size(),
-            expected_cols,
-            "slot-transfer checkpoint chunk {} must have {} columns for {}",
-            chunk_idx,
-            expected_cols,
-            id_prefix
-        );
-        chunks.push(chunk);
-    }
-    concat_column_chunks(chunks)
 }
 
 pub(crate) fn read_matrix_column_chunk<M>(
@@ -293,34 +247,6 @@ where
             )
         }
     }
-
-    #[cfg(not(feature = "gpu"))]
-    fn compute_gate_rhs_chunked(
-        &self,
-        params: &<M::P as Poly>::Params,
-        lhs_input: &M,
-        a_j: &M,
-        scalar: Option<u32>,
-    ) -> M {
-        let m_g = self.secret_size * params.modulus_digits();
-        let chunk_cols = decomposition_column_chunk_width(m_g);
-        let scalar_poly = scalar.map(|value| M::P::from_usize_to_constant(params, value as usize));
-        let rhs_chunks = (0..m_g)
-            .step_by(chunk_cols)
-            .map(|col_start| {
-                let col_len = (m_g - col_start).min(chunk_cols);
-                let col_end = col_start + col_len;
-                let a_j_chunk = a_j.slice_columns(col_start, col_end).decompose();
-                let rhs_chunk = lhs_input.clone() * a_j_chunk;
-                match &scalar_poly {
-                    Some(poly) => rhs_chunk * poly,
-                    None => rhs_chunk,
-                }
-            })
-            .collect::<Vec<_>>();
-        concat_column_chunks(rhs_chunks)
-    }
-
     fn aux_checkpoint_prefix(&self, params: &<M::P as Poly>::Params) -> String {
         let (_, crt_bits, crt_depth) = params.to_crt();
         format!(
@@ -1062,9 +988,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BggPublicKeySTEvaluator, read_matrix_from_column_chunks, trapdoor_public_column_count,
-    };
+    use super::{BggPublicKeySTEvaluator, trapdoor_public_column_count};
     use crate::{
         __PAIR, __TestState,
         bgg::public_key::BggPublicKey,
@@ -1085,6 +1009,55 @@ mod tests {
     use std::{fs, path::Path};
 
     const SIGMA: f64 = 4.578;
+
+    fn concat_column_chunks<M>(chunks: Vec<M>) -> M
+    where
+        M: PolyMatrix,
+    {
+        let mut chunk_iter = chunks.into_iter();
+        let first = chunk_iter.next().expect("column chunk list must be non-empty");
+        first.concat_columns_owned(chunk_iter.collect())
+    }
+
+    fn read_matrix_from_column_chunks<M>(
+        params: &<M::P as Poly>::Params,
+        dir: &Path,
+        id_prefix: &str,
+        total_cols: usize,
+    ) -> M
+    where
+        M: PolyMatrix,
+    {
+        let chunk_count = super::column_chunk_count(total_cols);
+        let mut chunks = Vec::with_capacity(chunk_count);
+        for chunk_idx in 0..chunk_count {
+            let (_, expected_cols) = super::column_chunk_bounds(total_cols, chunk_idx);
+            let chunk_prefix = super::column_chunk_id_prefix(id_prefix, chunk_idx);
+            let chunk = if let Some(matrix) =
+                read_matrix_from_multi_batch::<M>(params, dir, &chunk_prefix, 0)
+            {
+                matrix
+            } else {
+                let bytes = super::read_bytes_from_multi_batch(dir, &chunk_prefix, 0)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "missing slot-transfer checkpoint bytes for {id_prefix} chunk {chunk_idx}"
+                        )
+                    });
+                M::from_compact_bytes(params, &bytes)
+            };
+            assert_eq!(
+                chunk.col_size(),
+                expected_cols,
+                "slot-transfer checkpoint chunk {} must have {} columns for {}",
+                chunk_idx,
+                expected_cols,
+                id_prefix
+            );
+            chunks.push(chunk);
+        }
+        concat_column_chunks(chunks)
+    }
 
     struct DummyPubKeyPltEvaluator;
 

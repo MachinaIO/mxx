@@ -315,7 +315,6 @@ where
 struct CrtDepthProbe {
     params: DCRTPolyParams,
     eval_ok: bool,
-    decryption_ok: bool,
 }
 
 impl CrtDepthProbe {
@@ -401,7 +400,7 @@ fn probe_crt_depth_for_goldreich_ring_gsw_bench(
         decryption_ok
     );
 
-    CrtDepthProbe { params, eval_ok, decryption_ok }
+    CrtDepthProbe { params, eval_ok }
 }
 
 fn build_goldreich_ring_gsw_circuit<P: Poly + 'static>(

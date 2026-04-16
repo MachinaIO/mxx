@@ -41,7 +41,6 @@ where
     M: PolyMatrix,
     T: Send + Sync,
 {
-    device_id: i32,
     params: <<M as PolyMatrix>::P as Poly>::Params,
     trapdoor: DeviceReplica<'a, T>,
     b1_matrix: DeviceReplica<'a, M>,
@@ -52,7 +51,6 @@ where
     M: PolyMatrix,
     T: Send + Sync,
 {
-    device_id: i32,
     params: &'a <<M as PolyMatrix>::P as Poly>::Params,
     trapdoor: &'a T,
     b1_matrix: &'a M,
@@ -79,7 +77,6 @@ where
     M: PolyMatrix,
     T: Send + Sync,
 {
-    device_id: i32,
     params: &'a <<M as PolyMatrix>::P as Poly>::Params,
     b0_trapdoor: &'a T,
     b0_matrix: &'a M,
@@ -188,7 +185,6 @@ where
                     )
                 };
                 GpuLutBaseDeviceShared {
-                    device_id,
                     params: local_params,
                     trapdoor: local_trapdoor,
                     b1_matrix: local_b1_matrix,
@@ -211,7 +207,6 @@ where
                 let w_block_v = self.derive_w_block_v(&base.params, lut_id);
                 let gadget_matrix = M::gadget_matrix(&base.params, self.d);
                 GpuLutDeviceShared {
-                    device_id: base.device_id,
                     params: &base.params,
                     trapdoor: base.trapdoor.as_ref(),
                     b1_matrix: base.b1_matrix.as_ref(),
@@ -357,7 +352,6 @@ where
             .map(|idx| {
                 let base = &base_shared[idx];
                 GpuGateDeviceShared {
-                    device_id: base.device_id,
                     params: &base.params,
                     b0_trapdoor: base.b0_trapdoor.as_ref(),
                     b0_matrix: base.b0_matrix.as_ref(),

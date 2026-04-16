@@ -47,10 +47,6 @@ struct CompactBytesJob {
 }
 
 impl CompactBytesJob {
-    fn from_bytes(id_prefix: String, matrices: Vec<(usize, Vec<u8>)>) -> Self {
-        Self { id_prefix, matrices }
-    }
-
     fn new<M>(id_prefix: String, matrices: Vec<(usize, M)>) -> Self
     where
         M: PolyMatrix,
@@ -102,55 +98,6 @@ where
     params.modulus_digits() / crt_depth
 }
 
-pub(crate) fn read_matrix_from_chunks<M>(
-    params: &<M::P as Poly>::Params,
-    dir: &Path,
-    id_prefix: &str,
-    expected_chunk_cols: usize,
-    chunk_count: usize,
-    label: &str,
-) -> M
-where
-    M: PolyMatrix,
-{
-    assert!(chunk_count > 0, "{label} chunk_count must be > 0 (id_prefix={id_prefix})");
-    let first = read_matrix_from_multi_batch::<M>(params, dir, id_prefix, 0)
-        .unwrap_or_else(|| panic!("{label} (index 0) not found: id_prefix={id_prefix}"));
-    assert_eq!(
-        first.col_size(),
-        expected_chunk_cols,
-        "{label} chunk 0 must have {expected_chunk_cols} columns (id_prefix={id_prefix})"
-    );
-    if chunk_count == 1 {
-        return first;
-    }
-
-    let mut chunks = Vec::with_capacity(chunk_count - 1);
-    for chunk_idx in 1..chunk_count {
-        let chunk = read_matrix_from_multi_batch::<M>(params, dir, id_prefix, chunk_idx)
-            .unwrap_or_else(|| {
-                panic!("{label} chunk {chunk_idx} not found: id_prefix={id_prefix}")
-            });
-        assert_eq!(
-            chunk.col_size(),
-            expected_chunk_cols,
-            "{label} chunk {} must have {expected_chunk_cols} columns (id_prefix={id_prefix})",
-            chunk_idx
-        );
-        chunks.push(chunk);
-    }
-    first.concat_columns_owned(chunks)
-}
-
-fn concat_column_chunks<M>(chunks: Vec<M>) -> M
-where
-    M: PolyMatrix,
-{
-    let mut chunk_iter = chunks.into_iter();
-    let first = chunk_iter.next().expect("column chunk list must be non-empty");
-    first.concat_columns_owned(chunk_iter.collect())
-}
-
 fn column_chunk_id_prefix(id_prefix: &str, chunk_idx: usize) -> String {
     format!("{id_prefix}_chunk{chunk_idx}")
 }
@@ -184,24 +131,6 @@ where
     M: PolyMatrix,
 {
     size.checked_mul(params.modulus_digits() + 2).expect("trapdoor public column count overflow")
-}
-
-pub(crate) fn read_matrix_from_column_chunks<M>(
-    params: &<M::P as Poly>::Params,
-    dir: &Path,
-    id_prefix: &str,
-    total_cols: usize,
-    label: &str,
-) -> M
-where
-    M: PolyMatrix,
-{
-    let chunk_count = column_chunk_count(total_cols);
-    let mut chunks = Vec::with_capacity(chunk_count);
-    for chunk_idx in 0..chunk_count {
-        chunks.push(read_matrix_column_chunk(params, dir, id_prefix, total_cols, chunk_idx, label));
-    }
-    concat_column_chunks(chunks)
 }
 
 pub(crate) fn read_matrix_column_chunk<M>(

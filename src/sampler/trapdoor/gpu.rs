@@ -404,46 +404,6 @@ fn sample_pert_square_mat_gpu_native_parts(
     GpuPerturbationSamples { p1, p2 }
 }
 
-fn sample_pert_square_mat_gpu_native(
-    params: &GpuDCRTPolyParams,
-    trapdoor: &GpuDCRTTrapdoor,
-    s: f64,
-    c: f64,
-    dgg_stddev: f64,
-    sigma_large: f64,
-    total_ncol: usize,
-) -> GpuDCRTPolyMatrix {
-    let GpuPerturbationSamples { p1, p2 } = sample_pert_square_mat_gpu_native_parts(
-        params,
-        trapdoor,
-        s,
-        c,
-        dgg_stddev,
-        sigma_large,
-        total_ncol,
-    );
-    let d = trapdoor.r.row_size();
-    let num_blocks = total_ncol.div_ceil(d);
-    let padded_ncol = num_blocks * d;
-    let padding_ncol = padded_ncol - total_ncol;
-    let mut p_hat = GpuDCRTPolyMatrix::new_empty_with_state(
-        params,
-        p1.row_size() + p2.row_size(),
-        total_ncol,
-        p1.level(),
-        p1.is_ntt(),
-    );
-    debug_assert!(p1.col_size() >= total_ncol, "p1 must include target columns");
-    debug_assert!(p2.col_size() >= total_ncol, "p2 must include target columns");
-    p_hat.copy_block_from(&p1, 0, 0, 0, 0, p1.row_size(), total_ncol);
-    p_hat.copy_block_from(&p2, p1.row_size(), 0, 0, 0, p2.row_size(), total_ncol);
-    tracing::debug!("gpu preimage sample_pert: assembled p_hat without concat+slice");
-    if padding_ncol > 0 {
-        tracing::debug!("gpu preimage sample_pert: skipped padded columns during assembly");
-    }
-    p_hat
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +428,46 @@ mod tests {
 
     fn gpu_test_params() -> DCRTPolyParams {
         DCRTPolyParams::new(128, 2, 16, 8)
+    }
+
+    fn sample_pert_square_mat_gpu_native(
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        s: f64,
+        c: f64,
+        dgg_stddev: f64,
+        sigma_large: f64,
+        total_ncol: usize,
+    ) -> GpuDCRTPolyMatrix {
+        let GpuPerturbationSamples { p1, p2 } = sample_pert_square_mat_gpu_native_parts(
+            params,
+            trapdoor,
+            s,
+            c,
+            dgg_stddev,
+            sigma_large,
+            total_ncol,
+        );
+        let d = trapdoor.r.row_size();
+        let num_blocks = total_ncol.div_ceil(d);
+        let padded_ncol = num_blocks * d;
+        let padding_ncol = padded_ncol - total_ncol;
+        let mut p_hat = GpuDCRTPolyMatrix::new_empty_with_state(
+            params,
+            p1.row_size() + p2.row_size(),
+            total_ncol,
+            p1.level(),
+            p1.is_ntt(),
+        );
+        debug_assert!(p1.col_size() >= total_ncol, "p1 must include target columns");
+        debug_assert!(p2.col_size() >= total_ncol, "p2 must include target columns");
+        p_hat.copy_block_from(&p1, 0, 0, 0, 0, p1.row_size(), total_ncol);
+        p_hat.copy_block_from(&p2, p1.row_size(), 0, 0, 0, p2.row_size(), total_ncol);
+        tracing::debug!("gpu preimage sample_pert: assembled p_hat without concat+slice");
+        if padding_ncol > 0 {
+            tracing::debug!("gpu preimage sample_pert: skipped padded columns during assembly");
+        }
+        p_hat
     }
 
     fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {

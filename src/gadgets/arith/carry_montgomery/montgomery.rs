@@ -207,12 +207,12 @@ mod tests {
         )
     }
 
-    fn create_test_context(
+    fn create_test_context_with_limb_size(
         circuit: &mut PolyCircuit<DCRTPoly>,
+        params: DCRTPolyParams,
+        limb_bit_size: usize,
     ) -> (DCRTPolyParams, Arc<MontgomeryPolyContext<DCRTPoly>>) {
-        let params = DCRTPolyParams::default();
-        let ctx =
-            Arc::new(MontgomeryPolyContext::setup(&mut *circuit, &params, LIMB_BIT_SIZE, false));
+        let ctx = Arc::new(MontgomeryPolyContext::setup(circuit, &params, limb_bit_size, false));
         (params, ctx)
     }
 
@@ -229,12 +229,47 @@ mod tests {
     }
 
     fn test_montgomery_roundtrip_case(value: BigUint) {
+        test_montgomery_roundtrip_case_with_params(DCRTPolyParams::default(), LIMB_BIT_SIZE, value);
+    }
+
+    fn test_montgomery_add_case(lhs_value: BigUint, rhs_value: BigUint) {
+        test_montgomery_add_case_with_params(
+            DCRTPolyParams::default(),
+            LIMB_BIT_SIZE,
+            lhs_value,
+            rhs_value,
+        );
+    }
+
+    fn test_montgomery_sub_case(lhs_value: BigUint, rhs_value: BigUint) {
+        test_montgomery_sub_case_with_params(
+            DCRTPolyParams::default(),
+            LIMB_BIT_SIZE,
+            lhs_value,
+            rhs_value,
+        );
+    }
+
+    fn test_montgomery_mul_case(lhs_value: BigUint, rhs_value: BigUint) {
+        test_montgomery_mul_case_with_params(
+            DCRTPolyParams::default(),
+            LIMB_BIT_SIZE,
+            lhs_value,
+            rhs_value,
+        );
+    }
+
+    fn test_montgomery_roundtrip_case_with_params(
+        params: DCRTPolyParams,
+        limb_bit_size: usize,
+        value: BigUint,
+    ) {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (params, ctx) = create_test_context(&mut circuit);
+        let (params, ctx) = create_test_context_with_limb_size(&mut circuit, params, limb_bit_size);
         let input = CarryArithPoly::<DCRTPoly>::input(
             ctx.carry_arith_ctx.clone(),
             &mut circuit,
-            ctx.num_limbs * LIMB_BIT_SIZE,
+            ctx.num_limbs * limb_bit_size,
         );
         let mont = MontgomeryPoly::from_regular(&mut circuit, ctx.clone(), input);
         let regular = mont.to_regular(&mut circuit);
@@ -246,31 +281,41 @@ mod tests {
         assert_eq!(eval_result, expected);
     }
 
-    fn test_montgomery_add_case(lhs_value: BigUint, rhs_value: BigUint) {
+    fn test_montgomery_add_case_with_params(
+        params: DCRTPolyParams,
+        limb_bit_size: usize,
+        lhs_value: BigUint,
+        rhs_value: BigUint,
+    ) {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (params, ctx) = create_test_context(&mut circuit);
+        let (params, ctx) = create_test_context_with_limb_size(&mut circuit, params, limb_bit_size);
         let lhs = MontgomeryPoly::input(ctx.clone(), &mut circuit);
         let rhs = MontgomeryPoly::input(ctx.clone(), &mut circuit);
         let result = lhs.add(&rhs, &mut circuit);
         circuit.output(result.value.limbs.clone());
 
-        let mut eval_inputs = encode_montgomery_poly(LIMB_BIT_SIZE, &params, &lhs_value);
-        eval_inputs.extend(encode_montgomery_poly(LIMB_BIT_SIZE, &params, &rhs_value));
+        let mut eval_inputs = encode_montgomery_poly(limb_bit_size, &params, &lhs_value);
+        eval_inputs.extend(encode_montgomery_poly(limb_bit_size, &params, &rhs_value));
         let eval_result = eval_with_const_one(&circuit, &params, &eval_inputs);
-        let expected = encode_montgomery_poly(LIMB_BIT_SIZE, &params, &(lhs_value + rhs_value));
+        let expected = encode_montgomery_poly(limb_bit_size, &params, &(lhs_value + rhs_value));
         assert_eq!(eval_result, expected);
     }
 
-    fn test_montgomery_sub_case(lhs_value: BigUint, rhs_value: BigUint) {
+    fn test_montgomery_sub_case_with_params(
+        params: DCRTPolyParams,
+        limb_bit_size: usize,
+        lhs_value: BigUint,
+        rhs_value: BigUint,
+    ) {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (params, ctx) = create_test_context(&mut circuit);
+        let (params, ctx) = create_test_context_with_limb_size(&mut circuit, params, limb_bit_size);
         let lhs = MontgomeryPoly::input(ctx.clone(), &mut circuit);
         let rhs = MontgomeryPoly::input(ctx.clone(), &mut circuit);
         let result = lhs.sub(&rhs, &mut circuit);
         circuit.output(result.value.limbs.clone());
 
-        let mut eval_inputs = encode_montgomery_poly(LIMB_BIT_SIZE, &params, &lhs_value);
-        eval_inputs.extend(encode_montgomery_poly(LIMB_BIT_SIZE, &params, &rhs_value));
+        let mut eval_inputs = encode_montgomery_poly(limb_bit_size, &params, &lhs_value);
+        eval_inputs.extend(encode_montgomery_poly(limb_bit_size, &params, &rhs_value));
         let eval_result = eval_with_const_one(&circuit, &params, &eval_inputs);
         let modulus = params.modulus();
         let expected_value = if lhs_value >= rhs_value {
@@ -278,22 +323,27 @@ mod tests {
         } else {
             lhs_value + modulus.as_ref() - rhs_value
         };
-        let expected = encode_montgomery_poly(LIMB_BIT_SIZE, &params, &expected_value);
+        let expected = encode_montgomery_poly(limb_bit_size, &params, &expected_value);
         assert_eq!(eval_result, expected);
     }
 
-    fn test_montgomery_mul_case(lhs_value: BigUint, rhs_value: BigUint) {
+    fn test_montgomery_mul_case_with_params(
+        params: DCRTPolyParams,
+        limb_bit_size: usize,
+        lhs_value: BigUint,
+        rhs_value: BigUint,
+    ) {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (params, ctx) = create_test_context(&mut circuit);
+        let (params, ctx) = create_test_context_with_limb_size(&mut circuit, params, limb_bit_size);
         let lhs = MontgomeryPoly::input(ctx.clone(), &mut circuit);
         let rhs = MontgomeryPoly::input(ctx.clone(), &mut circuit);
         let result = lhs.mul(&rhs, &mut circuit);
         circuit.output(result.value.limbs.clone());
 
-        let mut eval_inputs = encode_montgomery_poly(LIMB_BIT_SIZE, &params, &lhs_value);
-        eval_inputs.extend(encode_montgomery_poly(LIMB_BIT_SIZE, &params, &rhs_value));
+        let mut eval_inputs = encode_montgomery_poly(limb_bit_size, &params, &lhs_value);
+        eval_inputs.extend(encode_montgomery_poly(limb_bit_size, &params, &rhs_value));
         let eval_result = eval_with_const_one(&circuit, &params, &eval_inputs);
-        let expected = encode_montgomery_poly(LIMB_BIT_SIZE, &params, &(lhs_value * rhs_value));
+        let expected = encode_montgomery_poly(limb_bit_size, &params, &(lhs_value * rhs_value));
         assert_eq!(eval_result, expected);
     }
 
@@ -374,5 +424,94 @@ mod tests {
         let max_value = max_value_for_modulus(modulus.as_ref());
         test_montgomery_mul_case(min_value, max_value.clone());
         test_montgomery_mul_case(max_value.clone(), max_value);
+    }
+
+    #[test]
+    fn test_montgomery_roundtrip_random_limb1() {
+        let params = DCRTPolyParams::new(4, 2, 15, 13);
+        let modulus = params.modulus();
+        let mut rng = rand::rng();
+        let value = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+        test_montgomery_roundtrip_case_with_params(params, 1, value);
+    }
+
+    #[test]
+    fn test_montgomery_roundtrip_min_max_limb1() {
+        let params = DCRTPolyParams::new(4, 2, 15, 13);
+        let modulus = params.modulus();
+        let min_value = BigUint::from(0u32);
+        let max_value = max_value_for_modulus(modulus.as_ref());
+        test_montgomery_roundtrip_case_with_params(params.clone(), 1, min_value);
+        test_montgomery_roundtrip_case_with_params(params, 1, max_value);
+    }
+
+    #[test]
+    fn test_montgomery_add_random_limb1() {
+        let params = DCRTPolyParams::new(4, 2, 15, 13);
+        let modulus = params.modulus();
+        let mut rng = rand::rng();
+        let lhs_value = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+        let rhs_value = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+        test_montgomery_add_case_with_params(params, 1, lhs_value, rhs_value);
+    }
+
+    #[test]
+    fn test_montgomery_add_min_max_limb1() {
+        let params = DCRTPolyParams::new(4, 2, 15, 13);
+        let modulus = params.modulus();
+        let min_value = BigUint::from(0u32);
+        let max_value = max_value_for_modulus(modulus.as_ref());
+        test_montgomery_add_case_with_params(
+            params.clone(),
+            1,
+            min_value.clone(),
+            max_value.clone(),
+        );
+        test_montgomery_add_case_with_params(params, 1, max_value.clone(), max_value);
+    }
+
+    #[test]
+    fn test_montgomery_sub_random_limb1() {
+        let params = DCRTPolyParams::new(4, 2, 15, 13);
+        let modulus = params.modulus();
+        let mut rng = rand::rng();
+        let lhs_value = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+        let rhs_value = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+        test_montgomery_sub_case_with_params(params, 1, lhs_value, rhs_value);
+    }
+
+    #[test]
+    fn test_montgomery_sub_min_max_limb1() {
+        let params = DCRTPolyParams::new(4, 2, 15, 13);
+        let modulus = params.modulus();
+        let min_value = BigUint::from(0u32);
+        let max_value = max_value_for_modulus(modulus.as_ref());
+        test_montgomery_sub_case_with_params(
+            params.clone(),
+            1,
+            min_value.clone(),
+            max_value.clone(),
+        );
+        test_montgomery_sub_case_with_params(params, 1, max_value, min_value);
+    }
+
+    #[test]
+    fn test_montgomery_mul_random_limb1() {
+        let params = DCRTPolyParams::new(4, 2, 15, 13);
+        let modulus = params.modulus();
+        let mut rng = rand::rng();
+        let lhs_value = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+        let rhs_value = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+        test_montgomery_mul_case_with_params(params, 1, lhs_value, rhs_value);
+    }
+
+    #[test]
+    fn test_montgomery_mul_min_max_limb1() {
+        let params = DCRTPolyParams::new(4, 2, 15, 13);
+        let modulus = params.modulus();
+        let min_value = BigUint::from(0u32);
+        let max_value = max_value_for_modulus(modulus.as_ref());
+        test_montgomery_mul_case_with_params(params.clone(), 1, min_value, max_value.clone());
+        test_montgomery_mul_case_with_params(params, 1, max_value.clone(), max_value);
     }
 }

@@ -716,21 +716,21 @@ mod tests {
         )
     }
 
-    fn create_test_context(
+    fn create_test_context_with_limb_size(
         circuit: &mut PolyCircuit<DCRTPoly>,
+        params: DCRTPolyParams,
+        limb_bit_size: usize,
     ) -> (DCRTPolyParams, Arc<CarryArithPolyContext<DCRTPoly>>) {
-        let params = DCRTPolyParams::default();
-        let ctx =
-            Arc::new(CarryArithPolyContext::setup(&mut *circuit, &params, LIMB_BIT_SIZE, false));
+        let ctx = Arc::new(CarryArithPolyContext::setup(circuit, &params, limb_bit_size, false));
         (params, ctx)
     }
 
-    fn input_limb_len(params: &DCRTPolyParams) -> usize {
-        params.modulus_bits().div_ceil(LIMB_BIT_SIZE)
+    fn input_limb_len_with_limb_size(params: &DCRTPolyParams, limb_bit_size: usize) -> usize {
+        params.modulus_bits().div_ceil(limb_bit_size)
     }
 
-    fn input_bit_size(params: &DCRTPolyParams) -> usize {
-        input_limb_len(params) * LIMB_BIT_SIZE
+    fn input_bit_size_with_limb_size(params: &DCRTPolyParams, limb_bit_size: usize) -> usize {
+        input_limb_len_with_limb_size(params, limb_bit_size) * limb_bit_size
     }
 
     fn max_value_for_modulus(modulus: &BigUint) -> BigUint {
@@ -738,16 +738,47 @@ mod tests {
     }
 
     fn test_carry_arith_add_case(lhs_value: BigUint, rhs_value: BigUint) {
-        let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (params, ctx) = create_test_context(&mut circuit);
-        let limb_len = input_limb_len(&params);
-        let lhs =
-            CarryArithPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, input_bit_size(&params));
-        let rhs =
-            CarryArithPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, input_bit_size(&params));
+        test_carry_arith_add_case_with_params(
+            DCRTPolyParams::default(),
+            LIMB_BIT_SIZE,
+            lhs_value,
+            rhs_value,
+        );
+    }
 
-        let lhs_inputs = encode_carry_arith_poly(LIMB_BIT_SIZE, limb_len, &params, &lhs_value);
-        let rhs_inputs = encode_carry_arith_poly(LIMB_BIT_SIZE, limb_len, &params, &rhs_value);
+    fn test_carry_arith_less_than_case(lhs_value: BigUint, rhs_value: BigUint) {
+        test_carry_arith_less_than_case_with_params(
+            DCRTPolyParams::default(),
+            LIMB_BIT_SIZE,
+            lhs_value,
+            rhs_value,
+        );
+    }
+
+    fn test_carry_arith_mul_case(lhs_value: BigUint, rhs_value: BigUint) {
+        test_carry_arith_mul_case_with_params(
+            DCRTPolyParams::default(),
+            LIMB_BIT_SIZE,
+            lhs_value,
+            rhs_value,
+        );
+    }
+
+    fn test_carry_arith_add_case_with_params(
+        params: DCRTPolyParams,
+        limb_bit_size: usize,
+        lhs_value: BigUint,
+        rhs_value: BigUint,
+    ) {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context_with_limb_size(&mut circuit, params, limb_bit_size);
+        let limb_len = input_limb_len_with_limb_size(&params, limb_bit_size);
+        let input_bit_size = input_bit_size_with_limb_size(&params, limb_bit_size);
+        let lhs = CarryArithPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, input_bit_size);
+        let rhs = CarryArithPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, input_bit_size);
+
+        let lhs_inputs = encode_carry_arith_poly(limb_bit_size, limb_len, &params, &lhs_value);
+        let rhs_inputs = encode_carry_arith_poly(limb_bit_size, limb_len, &params, &rhs_value);
 
         let result = lhs.add(&rhs, &mut circuit);
         circuit.output(result.limbs.clone());
@@ -756,20 +787,25 @@ mod tests {
         eval_inputs.extend(rhs_inputs);
         let eval_result = eval_with_const_one(&circuit, &params, &eval_inputs);
         let expected =
-            encode_carry_arith_poly(LIMB_BIT_SIZE, limb_len + 1, &params, &(lhs_value + rhs_value));
+            encode_carry_arith_poly(limb_bit_size, limb_len + 1, &params, &(lhs_value + rhs_value));
         assert_eq!(eval_result, expected);
     }
 
-    fn test_carry_arith_less_than_case(lhs_value: BigUint, rhs_value: BigUint) {
+    fn test_carry_arith_less_than_case_with_params(
+        params: DCRTPolyParams,
+        limb_bit_size: usize,
+        lhs_value: BigUint,
+        rhs_value: BigUint,
+    ) {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (params, ctx) = create_test_context(&mut circuit);
-        let limb_len = input_limb_len(&params);
-        let bit_size = input_bit_size(&params);
+        let (params, ctx) = create_test_context_with_limb_size(&mut circuit, params, limb_bit_size);
+        let limb_len = input_limb_len_with_limb_size(&params, limb_bit_size);
+        let bit_size = input_bit_size_with_limb_size(&params, limb_bit_size);
         let lhs = CarryArithPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, bit_size);
         let rhs = CarryArithPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, bit_size);
 
-        let lhs_inputs = encode_carry_arith_poly(LIMB_BIT_SIZE, limb_len, &params, &lhs_value);
-        let rhs_inputs = encode_carry_arith_poly(LIMB_BIT_SIZE, limb_len, &params, &rhs_value);
+        let lhs_inputs = encode_carry_arith_poly(limb_bit_size, limb_len, &params, &lhs_value);
+        let rhs_inputs = encode_carry_arith_poly(limb_bit_size, limb_len, &params, &rhs_value);
 
         let (lt_result, diff) = lhs.less_than(&rhs, &mut circuit);
         let mut outputs = vec![lt_result];
@@ -785,25 +821,29 @@ mod tests {
         } else {
             (BigUint::from(0u32), lhs_value - rhs_value)
         };
-        let expected_lt = encode_carry_arith_poly(LIMB_BIT_SIZE, 1, &params, &expected_lt_value);
+        let expected_lt = encode_carry_arith_poly(limb_bit_size, 1, &params, &expected_lt_value);
         let expected_diff =
-            encode_carry_arith_poly(LIMB_BIT_SIZE, limb_len, &params, &expected_diff_value);
+            encode_carry_arith_poly(limb_bit_size, limb_len, &params, &expected_diff_value);
         let mut expected = expected_lt;
         expected.extend(expected_diff);
         assert_eq!(eval_result, expected);
     }
 
-    fn test_carry_arith_mul_case(lhs_value: BigUint, rhs_value: BigUint) {
+    fn test_carry_arith_mul_case_with_params(
+        params: DCRTPolyParams,
+        limb_bit_size: usize,
+        lhs_value: BigUint,
+        rhs_value: BigUint,
+    ) {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (params, ctx) = create_test_context(&mut circuit);
-        let limb_len = input_limb_len(&params);
-        let lhs =
-            CarryArithPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, input_bit_size(&params));
-        let rhs =
-            CarryArithPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, input_bit_size(&params));
+        let (params, ctx) = create_test_context_with_limb_size(&mut circuit, params, limb_bit_size);
+        let limb_len = input_limb_len_with_limb_size(&params, limb_bit_size);
+        let input_bit_size = input_bit_size_with_limb_size(&params, limb_bit_size);
+        let lhs = CarryArithPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, input_bit_size);
+        let rhs = CarryArithPoly::<DCRTPoly>::input(ctx.clone(), &mut circuit, input_bit_size);
 
-        let lhs_inputs = encode_carry_arith_poly(LIMB_BIT_SIZE, limb_len, &params, &lhs_value);
-        let rhs_inputs = encode_carry_arith_poly(LIMB_BIT_SIZE, limb_len, &params, &rhs_value);
+        let lhs_inputs = encode_carry_arith_poly(limb_bit_size, limb_len, &params, &lhs_value);
+        let rhs_inputs = encode_carry_arith_poly(limb_bit_size, limb_len, &params, &rhs_value);
 
         let result = lhs.mul(&rhs, &mut circuit, None);
         circuit.output(result.limbs.clone());
@@ -812,7 +852,7 @@ mod tests {
         eval_inputs.extend(rhs_inputs);
         let eval_result = eval_with_const_one(&circuit, &params, &eval_inputs);
         let expected =
-            encode_carry_arith_poly(LIMB_BIT_SIZE, 2 * limb_len, &params, &(lhs_value * rhs_value));
+            encode_carry_arith_poly(limb_bit_size, 2 * limb_len, &params, &(lhs_value * rhs_value));
         assert_eq!(eval_result, expected);
     }
 
@@ -874,5 +914,75 @@ mod tests {
         let max_value = max_value_for_modulus(modulus.as_ref());
         test_carry_arith_mul_case(min_value, max_value.clone());
         test_carry_arith_mul_case(max_value.clone(), max_value);
+    }
+
+    #[test]
+    fn test_carry_arith_add_random_limb1() {
+        let params = DCRTPolyParams::new(4, 2, 15, 13);
+        let modulus = params.modulus();
+        let mut rng = rand::rng();
+        let lhs_value = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+        let rhs_value = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+        test_carry_arith_add_case_with_params(params, 1, lhs_value, rhs_value);
+    }
+
+    #[test]
+    fn test_carry_arith_add_min_max_limb1() {
+        let params = DCRTPolyParams::new(4, 2, 15, 13);
+        let modulus = params.modulus();
+        let min_value = BigUint::from(0u32);
+        let max_value = max_value_for_modulus(modulus.as_ref());
+        test_carry_arith_add_case_with_params(
+            params.clone(),
+            1,
+            min_value.clone(),
+            max_value.clone(),
+        );
+        test_carry_arith_add_case_with_params(params, 1, max_value.clone(), max_value);
+    }
+
+    #[test]
+    fn test_carry_arith_less_than_random_limb1() {
+        let params = DCRTPolyParams::new(4, 2, 15, 13);
+        let modulus = params.modulus();
+        let mut rng = rand::rng();
+        let lhs_value = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+        let rhs_value = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+        test_carry_arith_less_than_case_with_params(params, 1, lhs_value, rhs_value);
+    }
+
+    #[test]
+    fn test_carry_arith_less_than_min_max_limb1() {
+        let params = DCRTPolyParams::new(4, 2, 15, 13);
+        let modulus = params.modulus();
+        let min_value = BigUint::from(0u32);
+        let max_value = max_value_for_modulus(modulus.as_ref());
+        test_carry_arith_less_than_case_with_params(
+            params.clone(),
+            1,
+            min_value.clone(),
+            max_value.clone(),
+        );
+        test_carry_arith_less_than_case_with_params(params, 1, max_value, min_value);
+    }
+
+    #[test]
+    fn test_carry_arith_mul_random_limb1() {
+        let params = DCRTPolyParams::new(4, 2, 15, 13);
+        let modulus = params.modulus();
+        let mut rng = rand::rng();
+        let lhs_value = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+        let rhs_value = crate::utils::gen_biguint_for_modulus(&mut rng, modulus.as_ref());
+        test_carry_arith_mul_case_with_params(params, 1, lhs_value, rhs_value);
+    }
+
+    #[test]
+    fn test_carry_arith_mul_min_max_limb1() {
+        let params = DCRTPolyParams::new(4, 2, 15, 13);
+        let modulus = params.modulus();
+        let min_value = BigUint::from(0u32);
+        let max_value = max_value_for_modulus(modulus.as_ref());
+        test_carry_arith_mul_case_with_params(params.clone(), 1, min_value, max_value.clone());
+        test_carry_arith_mul_case_with_params(params, 1, max_value.clone(), max_value);
     }
 }

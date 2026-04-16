@@ -894,7 +894,7 @@ mod tests {
         },
         slot_transfer::bgg_pubkey::{BggPublicKeySTEvaluator, trapdoor_public_column_count},
         storage::{
-            read::read_matrix_from_multi_batch,
+            read::{read_bytes_from_multi_batch, read_matrix_from_multi_batch},
             write::{init_storage_system, storage_test_lock, wait_for_all_writes},
         },
     };
@@ -954,7 +954,7 @@ mod tests {
             {
                 matrix
             } else {
-                let bytes = super::read_bytes_from_multi_batch(dir, &chunk_prefix, 0)
+                let bytes = read_bytes_from_multi_batch(dir, &chunk_prefix, 0)
                     .unwrap_or_else(|| {
                         panic!(
                             "missing slot-transfer checkpoint bytes for {id_prefix} chunk {chunk_idx}"

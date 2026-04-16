@@ -11,14 +11,14 @@ use mxx::{
         public_key::BggPublicKey,
         sampler::{BGGPolyEncodingSampler, BGGPublicKeySampler},
     },
-    circuit::{PolyCircuit, gate::GateId},
+    circuit::{PolyCircuit, PolyGateKind, gate::GateId},
     element::PolyElem,
     gadgets::{
         fhe::ring_gsw::{RingGswCiphertext, RingGswContext},
         fhe_prg::goldreich::GoldreichFhePrg,
     },
     lookup::{
-        PltEvaluator, PublicLut,
+        PublicLut,
         ggh15_eval::{GGH15BGGPolyEncodingPltEvaluator, GGH15BGGPubKeyPltEvaluator},
     },
     matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
@@ -43,7 +43,7 @@ use mxx::{
         error_norm::{NormBggPolyEncodingSTEvaluator, NormPltGGH15Evaluator},
     },
     slot_transfer::{
-        BggPolyEncodingSTEvaluator, SlotTransferEvaluator, bgg_pubkey::BggPublicKeySTEvaluator,
+        BggPolyEncodingSTEvaluator, bgg_pubkey::BggPublicKeySTEvaluator,
     },
     storage::write::{init_storage_system, wait_for_all_writes},
     utils::bigdecimal_bits_ceil,
@@ -619,6 +619,11 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
             .collect::<Vec<_>>(),
     );
     let ring_gsw_q = ring_gsw_q_modulus(ctx.as_ref());
+    let gate_counts = circuit.count_gates_by_type_vec();
+    let total_lut_entries = circuit.total_registered_public_lut_entries();
+    let total_public_lut_gates = gate_counts.get(&PolyGateKind::PubLut).copied().unwrap_or(0);
+    let total_slot_transfer_gates =
+        gate_counts.get(&PolyGateKind::SlotTransfer).copied().unwrap_or(0);
     info!(
         "forcing single GPU for benchmark path: eval_gpu_id={} detected_gpu_count={} detected_gpu_ids={:?}",
         single_gpu_id, detected_gpu_count, detected_gpu_ids
@@ -640,7 +645,7 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
     info!(
         "circuit non_free_depth={} gate_counts={:?} num_inputs={} encrypted_outputs={} reconstructed_output_polys={}",
         circuit.non_free_depth(),
-        circuit.count_gates_by_type_vec(),
+        gate_counts,
         circuit.num_input(),
         encrypted_outputs.len(),
         encrypted_outputs.len() * 2 * ctx.width()
@@ -728,6 +733,15 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
         ),
         cfg.bench_iterations,
     );
+    let pubkey_public_lut_aux_estimate = pubkey_bench_estimator_owner
+        .estimate_public_lut_sample_aux_matrices(total_lut_entries, total_public_lut_gates);
+    let pubkey_slot_transfer_aux_estimate = pubkey_bench_estimator_owner
+        .estimate_slot_transfer_sample_aux_matrices(cfg.num_slots(), total_slot_transfer_gates);
+    info!(
+        "pubkey sample_aux estimates: public_lut={:?} slot_transfer={:?}",
+        pubkey_public_lut_aux_estimate,
+        pubkey_slot_transfer_aux_estimate
+    );
     let pubkey_circuit_bench = pubkey_bench_estimator_owner.estimate_circuit_bench(&circuit);
     info!(
         "pubkey circuit bench estimate: total_time={:.6} latency={:.6} max_parallelism={} peak_vram={}",
@@ -771,15 +785,13 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
         build_benchmark_public_lookup_gate(&params);
     let poly_bench_slot_transfer_gate_id =
         build_benchmark_slot_transfer_gate(&poly_bench_slot_transfer_src_slots);
-    let _ = poly_bench_pubkey_plt_evaluator.public_lookup(
-        &params,
+    poly_bench_pubkey_plt_evaluator.record_public_lookup_state(
         &bench_lut,
-        &one_slot_bench_pubkeys[0],
         &one_slot_bench_pubkeys[9],
         poly_bench_public_lut_gate_id,
         poly_bench_public_lut_id,
     );
-    let _ = poly_bench_pubkey_slot_evaluator.slot_transfer(
+    poly_bench_pubkey_slot_evaluator.record_slot_transfer_state(
         &params,
         &one_slot_bench_pubkeys[10],
         &poly_bench_slot_transfer_src_slots,

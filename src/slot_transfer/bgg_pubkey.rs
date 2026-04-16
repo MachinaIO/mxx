@@ -263,6 +263,53 @@ where
             .collect()
     }
 
+    pub fn record_slot_transfer_state(
+        &self,
+        params: &<M::P as Poly>::Params,
+        input: &BggPublicKey<M>,
+        src_slots: &[(u32, Option<u32>)],
+        gate_id: GateId,
+    ) {
+        assert!(
+            src_slots.len() <= self.num_slots,
+            "output slot count {} exceeds evaluator num_slots {}",
+            src_slots.len(),
+            self.num_slots
+        );
+        assert_eq!(
+            input.matrix.row_size(),
+            self.secret_size,
+            "input pubkey rows {} must match evaluator secret_size {}",
+            input.matrix.row_size(),
+            self.secret_size
+        );
+        assert_eq!(
+            input.matrix.col_size(),
+            self.secret_size * params.modulus_digits(),
+            "input pubkey columns {} must equal secret_size * modulus_digits {}",
+            input.matrix.col_size(),
+            self.secret_size * params.modulus_digits()
+        );
+        for (dst_slot, (src_slot, _scalar)) in src_slots.iter().enumerate() {
+            let src_slot = usize::try_from(*src_slot).expect("source slot index must fit in usize");
+            assert!(
+                src_slot < self.num_slots,
+                "source slot index {} out of range for evaluator num_slots {} at dst_slot {}",
+                src_slot,
+                self.num_slots,
+                dst_slot
+            );
+        }
+
+        self.gate_states.insert(
+            gate_id,
+            BggPublicKeySTGateState {
+                input_pubkey_bytes: input.matrix.to_compact_bytes(),
+                src_slots: src_slots.to_vec(),
+            },
+        );
+    }
+
     fn checkpoint_exists(&self, id_prefix: &str) -> bool {
         read_bytes_from_multi_batch(self.dir_path.as_path(), id_prefix, 0).is_some()
     }
@@ -739,44 +786,7 @@ where
         src_slots: &[(u32, Option<u32>)],
         gate_id: GateId,
     ) -> BggPublicKey<M> {
-        assert!(
-            src_slots.len() <= self.num_slots,
-            "output slot count {} exceeds evaluator num_slots {}",
-            src_slots.len(),
-            self.num_slots
-        );
-        assert_eq!(
-            input.matrix.row_size(),
-            self.secret_size,
-            "input pubkey rows {} must match evaluator secret_size {}",
-            input.matrix.row_size(),
-            self.secret_size
-        );
-        assert_eq!(
-            input.matrix.col_size(),
-            self.secret_size * params.modulus_digits(),
-            "input pubkey columns {} must equal secret_size * modulus_digits {}",
-            input.matrix.col_size(),
-            self.secret_size * params.modulus_digits()
-        );
-        for (dst_slot, (src_slot, _scalar)) in src_slots.iter().enumerate() {
-            let src_slot = usize::try_from(*src_slot).expect("source slot index must fit in usize");
-            assert!(
-                src_slot < self.num_slots,
-                "source slot index {} out of range for evaluator num_slots {} at dst_slot {}",
-                src_slot,
-                self.num_slots,
-                dst_slot
-            );
-        }
-
-        self.gate_states.insert(
-            gate_id,
-            BggPublicKeySTGateState {
-                input_pubkey_bytes: input.matrix.to_compact_bytes(),
-                src_slots: src_slots.to_vec(),
-            },
-        );
+        self.record_slot_transfer_state(params, input, src_slots, gate_id);
 
         let hash_sampler = HS::new();
         let a_out = hash_sampler.sample_hash(

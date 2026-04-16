@@ -36,6 +36,10 @@ impl<P: Poly> PolyCircuit<P> {
         self.expanded_gate_counts(true)
     }
 
+    pub fn total_registered_public_lut_entries(&self) -> usize {
+        self.lookup_registry.lookups.iter().map(|lookup| lookup.value().len()).sum()
+    }
+
     fn expanded_gate_counts(&self, include_inputs: bool) -> HashMap<PolyGateKind, usize> {
         let mut counts: HashMap<PolyGateKind, usize> = HashMap::new();
         for gate in self.gates.values() {

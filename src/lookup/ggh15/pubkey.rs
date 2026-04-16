@@ -1240,6 +1240,26 @@ where
         Some(M::from_compact_bytes(params, &bytes))
     }
 
+    pub fn record_public_lookup_state(
+        &self,
+        plt: &PublicLut<<BggPublicKey<M> as Evaluable>::P>,
+        input: &BggPublicKey<M>,
+        gate_id: GateId,
+        lut_id: usize,
+    ) {
+        debug!("Recording public lookup state for gate {}", gate_id);
+        self.lut_state.entry(lut_id).or_insert_with(|| plt.clone());
+        self.gate_state.insert(
+            gate_id,
+            GateState {
+                lut_id,
+                input_pubkey_bytes: input.matrix.to_compact_bytes(),
+                _m: PhantomData,
+            },
+        );
+        debug!("Public lookup state recorded for gate {}", gate_id);
+    }
+
     pub fn sample_aux_matrices(&self, params: &<M::P as Poly>::Params) {
         info!("Sampling LUT and gate auxiliary matrices");
         let start = Instant::now();
@@ -1843,8 +1863,7 @@ where
         lut_id: usize,
     ) -> BggPublicKey<M> {
         let d = input.matrix.row_size();
-        debug!("Starting public lookup for gate {}", gate_id);
-        self.lut_state.entry(lut_id).or_insert_with(|| plt.clone());
+        self.record_public_lookup_state(plt, input, gate_id, lut_id);
 
         let hash_sampler = HS::new();
         let a_out = hash_sampler.sample_hash(
@@ -1855,16 +1874,6 @@ where
             d * params.modulus_digits(),
             DistType::FinRingDist,
         );
-        let output_pubkey = BggPublicKey { matrix: a_out, reveal_plaintext: true };
-        self.gate_state.insert(
-            gate_id,
-            GateState {
-                lut_id,
-                input_pubkey_bytes: input.matrix.to_compact_bytes(),
-                _m: PhantomData,
-            },
-        );
-        debug!("Public lookup for gate {} recorded", gate_id);
-        output_pubkey
+        BggPublicKey { matrix: a_out, reveal_plaintext: true }
     }
 }

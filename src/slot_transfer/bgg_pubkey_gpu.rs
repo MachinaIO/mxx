@@ -7,7 +7,10 @@ use crate::{
         DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler,
         trapdoor::GpuPreimageRequest,
     },
-    slot_transfer::bgg_pubkey::{BggPublicKeySTEvaluator, BggPublicKeySTGateState, SlotAuxSample},
+    slot_transfer::bgg_pubkey::{
+        BggPublicKeySTEvaluator, BggPublicKeySTGateState, SlotAuxSample, concat_column_chunks,
+        decomposition_column_chunk_width,
+    },
 };
 use rayon::prelude::*;
 use std::{
@@ -47,7 +50,7 @@ where
     M: PolyMatrix,
 {
     batch_slot_indices: Vec<usize>,
-    slot_secret_mats_by_device: Vec<Vec<M>>,
+    slot_secret_mats_by_device: Vec<HashMap<usize, M>>,
 }
 
 struct ComputedSlotBatch<M>
@@ -61,10 +64,9 @@ struct PreparedGateBatch<M>
 where
     M: PolyMatrix,
 {
-    selected_slot_indices: Vec<usize>,
     slot_chunk: Vec<(usize, (u32, Option<u32>))>,
-    slot_secret_mats_by_device: Vec<Vec<M>>,
-    slot_a_mats_by_device: Vec<Vec<M>>,
+    slot_secret_mats_by_device: Vec<HashMap<usize, M>>,
+    slot_a_mats_by_device: Vec<HashMap<usize, M>>,
 }
 
 struct ComputedGateBatch<M>
@@ -194,22 +196,6 @@ where
             .collect()
     }
 
-    pub(crate) fn copy_compact_matrices_to_gpu_devices(
-        &self,
-        matrix_bytes: &[Vec<u8>],
-        shared_by_device: &[GpuSlotTransferDeviceShared<M, TS::Trapdoor>],
-    ) -> Vec<Vec<M>> {
-        shared_by_device
-            .par_iter()
-            .map(|shared| {
-                matrix_bytes
-                    .iter()
-                    .map(|bytes| M::from_compact_bytes(&shared.params, bytes))
-                    .collect()
-            })
-            .collect()
-    }
-
     fn sample_slot_batch_gpu(
         &self,
         shared_by_device: &[GpuSlotTransferDeviceShared<M, TS::Trapdoor>],
@@ -226,7 +212,13 @@ where
                 let device_idx = sharded_batch_device_idx(shared_by_device.len(), 0, local_idx);
                 let shared = &shared_by_device[device_idx];
                 let m_g = self.secret_size * shared.params.modulus_digits();
-                let slot_secret_mat = &slot_secret_mats_by_device[device_idx][local_idx];
+                let slot_secret_mat = slot_secret_mats_by_device[device_idx]
+                    .get(&slot_idx)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "missing decoded slot secret matrix for slot_idx={slot_idx} on device_idx={device_idx}"
+                        )
+                    });
                 assert_eq!(
                     slot_secret_mat.row_size(),
                     self.secret_size,
@@ -345,12 +337,26 @@ where
         shared_by_device: &[GpuSlotTransferDeviceShared<M, TS::Trapdoor>],
         batch_slot_indices: &[usize],
     ) -> PreparedSlotBatch<M> {
-        let selected_slot_secret_mats = batch_slot_indices
-            .iter()
-            .map(|slot_idx| slot_secret_mats[*slot_idx].clone())
+        let mut slot_secret_bytes_by_device =
+            vec![HashMap::<usize, Vec<u8>>::new(); shared_by_device.len()];
+        for (batch_pos, slot_idx) in batch_slot_indices.iter().copied().enumerate() {
+            let device_idx = sharded_batch_device_idx(shared_by_device.len(), 0, batch_pos);
+            slot_secret_bytes_by_device[device_idx]
+                .entry(slot_idx)
+                .or_insert_with(|| slot_secret_mats[slot_idx].clone());
+        }
+        let slot_secret_mats_by_device = shared_by_device
+            .par_iter()
+            .enumerate()
+            .map(|(device_idx, shared)| {
+                slot_secret_bytes_by_device[device_idx]
+                    .iter()
+                    .map(|(slot_idx, bytes)| {
+                        (*slot_idx, M::from_compact_bytes(&shared.params, bytes))
+                    })
+                    .collect::<HashMap<usize, M>>()
+            })
             .collect::<Vec<_>>();
-        let slot_secret_mats_by_device =
-            self.copy_compact_matrices_to_gpu_devices(&selected_slot_secret_mats, shared_by_device);
         PreparedSlotBatch {
             batch_slot_indices: batch_slot_indices.to_vec(),
             slot_secret_mats_by_device,
@@ -448,19 +454,9 @@ where
         state: &BggPublicKeySTGateState,
         prepared_batch: PreparedGateBatch<M>,
     ) -> ComputedGateBatch<M> {
-        let PreparedGateBatch {
-            selected_slot_indices,
-            slot_chunk,
-            slot_secret_mats_by_device,
-            slot_a_mats_by_device,
-        } = prepared_batch;
+        let PreparedGateBatch { slot_chunk, slot_secret_mats_by_device, slot_a_mats_by_device } =
+            prepared_batch;
         let trap_sampler = TS::new(&shared_by_device[0].params, self.trapdoor_sigma);
-        let selected_slot_positions = selected_slot_indices
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(local_idx, slot_idx)| (slot_idx, local_idx))
-            .collect::<HashMap<usize, usize>>();
         let request_targets = slot_chunk
             .par_iter()
             .copied()
@@ -469,6 +465,7 @@ where
                 let device_idx = sharded_batch_device_idx(shared_by_device.len(), 0, batch_pos);
                 let shared = &shared_by_device[device_idx];
                 let m_g = self.secret_size * shared.params.modulus_digits();
+                let chunk_cols = decomposition_column_chunk_width(m_g);
                 let a_in = M::from_compact_bytes(&shared.params, &state.input_pubkey_bytes);
                 let a_out = HS::new().sample_hash(
                     &shared.params,
@@ -486,24 +483,40 @@ where
                     src_slot,
                     self.num_slots
                 );
-                let dst_local_idx = *selected_slot_positions
-                    .get(&dst_slot)
-                    .unwrap_or_else(|| panic!("missing selected dst_slot={dst_slot}"));
-                let src_local_idx = *selected_slot_positions
-                    .get(&src_slot)
-                    .unwrap_or_else(|| panic!("missing selected src_slot={src_slot}"));
-                let s_j = &slot_secret_mats_by_device[device_idx][dst_local_idx];
-                let s_i = &slot_secret_mats_by_device[device_idx][src_local_idx];
-                let a_j = &slot_a_mats_by_device[device_idx][dst_local_idx];
+                let s_j = slot_secret_mats_by_device[device_idx].get(&dst_slot).unwrap_or_else(|| {
+                    panic!(
+                        "missing decoded dst slot secret matrix for dst_slot={dst_slot} on device_idx={device_idx}"
+                    )
+                });
+                let s_i = slot_secret_mats_by_device[device_idx].get(&src_slot).unwrap_or_else(|| {
+                    panic!(
+                        "missing decoded src slot secret matrix for src_slot={src_slot} on device_idx={device_idx}"
+                    )
+                });
+                let a_j = slot_a_mats_by_device[device_idx].get(&dst_slot).unwrap_or_else(|| {
+                    panic!(
+                        "missing decoded dst slot a-matrix for dst_slot={dst_slot} on device_idx={device_idx}"
+                    )
+                });
                 let lhs = s_j.clone() * &a_out;
-                let rhs = match scalar {
-                    Some(scalar) => {
-                        let scalar_poly =
-                            M::P::from_usize_to_constant(&shared.params, scalar as usize);
-                        ((s_i.clone() * &a_in) * a_j.decompose()) * scalar_poly
-                    }
-                    None => (s_i.clone() * &a_in) * a_j.decompose(),
-                };
+                let lhs_input = s_i.clone() * &a_in;
+                let scalar_poly =
+                    scalar.map(|value| M::P::from_usize_to_constant(&shared.params, value as usize));
+                let rhs = concat_column_chunks(
+                    (0..m_g)
+                        .step_by(chunk_cols)
+                        .map(|col_start| {
+                            let col_len = (m_g - col_start).min(chunk_cols);
+                            let col_end = col_start + col_len;
+                            let a_j_chunk = a_j.slice_columns(col_start, col_end).decompose();
+                            let rhs_chunk = lhs_input.clone() * a_j_chunk;
+                            match &scalar_poly {
+                                Some(poly) => rhs_chunk * poly,
+                                None => rhs_chunk,
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                );
                 let mut target = lhs - rhs;
                 target.add_in_place(&self.sample_error_matrix(
                     &shared.params,
@@ -551,32 +564,51 @@ where
         shared_by_device: &[GpuSlotTransferDeviceShared<M, TS::Trapdoor>],
         slot_chunk: &[(usize, (u32, Option<u32>))],
     ) -> PreparedGateBatch<M> {
-        let mut selected_slot_indices = slot_chunk
-            .iter()
-            .flat_map(|(dst_slot, (src_slot_u32, _))| {
-                let src_slot =
-                    usize::try_from(*src_slot_u32).expect("source slot index must fit in usize");
-                [*dst_slot, src_slot]
+        let mut slot_secret_bytes_by_device =
+            vec![HashMap::<usize, Vec<u8>>::new(); shared_by_device.len()];
+        let mut slot_a_bytes_by_device =
+            vec![HashMap::<usize, Vec<u8>>::new(); shared_by_device.len()];
+        for (batch_pos, (dst_slot, (src_slot_u32, _))) in slot_chunk.iter().copied().enumerate() {
+            let src_slot =
+                usize::try_from(src_slot_u32).expect("source slot index must fit in usize");
+            let device_idx = sharded_batch_device_idx(shared_by_device.len(), 0, batch_pos);
+            slot_secret_bytes_by_device[device_idx]
+                .entry(dst_slot)
+                .or_insert_with(|| slot_secret_mats[dst_slot].clone());
+            slot_secret_bytes_by_device[device_idx]
+                .entry(src_slot)
+                .or_insert_with(|| slot_secret_mats[src_slot].clone());
+            slot_a_bytes_by_device[device_idx]
+                .entry(dst_slot)
+                .or_insert_with(|| slot_a_bytes_by_slot[dst_slot].clone());
+        }
+
+        let slot_secret_mats_by_device = shared_by_device
+            .par_iter()
+            .enumerate()
+            .map(|(device_idx, shared)| {
+                slot_secret_bytes_by_device[device_idx]
+                    .iter()
+                    .map(|(slot_idx, bytes)| {
+                        (*slot_idx, M::from_compact_bytes(&shared.params, bytes))
+                    })
+                    .collect::<HashMap<usize, M>>()
             })
             .collect::<Vec<_>>();
-        selected_slot_indices.sort_unstable();
-        selected_slot_indices.dedup();
-
-        let selected_slot_secret_mats = selected_slot_indices
-            .iter()
-            .map(|slot_idx| slot_secret_mats[*slot_idx].clone())
+        let slot_a_mats_by_device = shared_by_device
+            .par_iter()
+            .enumerate()
+            .map(|(device_idx, shared)| {
+                slot_a_bytes_by_device[device_idx]
+                    .iter()
+                    .map(|(slot_idx, bytes)| {
+                        (*slot_idx, M::from_compact_bytes(&shared.params, bytes))
+                    })
+                    .collect::<HashMap<usize, M>>()
+            })
             .collect::<Vec<_>>();
-        let slot_secret_mats_by_device =
-            self.copy_compact_matrices_to_gpu_devices(&selected_slot_secret_mats, shared_by_device);
-        let selected_slot_a_mats = selected_slot_indices
-            .iter()
-            .map(|slot_idx| slot_a_bytes_by_slot[*slot_idx].clone())
-            .collect::<Vec<_>>();
-        let slot_a_mats_by_device =
-            self.copy_compact_matrices_to_gpu_devices(&selected_slot_a_mats, shared_by_device);
 
         PreparedGateBatch {
-            selected_slot_indices,
             slot_chunk: slot_chunk.to_vec(),
             slot_secret_mats_by_device,
             slot_a_mats_by_device,

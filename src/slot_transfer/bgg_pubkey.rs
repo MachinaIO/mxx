@@ -68,6 +68,20 @@ where
     })
 }
 
+pub(crate) fn concat_column_chunks<M>(chunks: Vec<M>) -> M
+where
+    M: PolyMatrix,
+{
+    let mut chunk_iter = chunks.into_iter();
+    let first = chunk_iter.next().expect("column chunk list must be non-empty");
+    first.concat_columns_owned(chunk_iter.collect())
+}
+
+pub(crate) fn decomposition_column_chunk_width(total_cols: usize) -> usize {
+    assert!(total_cols > 0, "decomposition_column_chunk_width requires total_cols > 0");
+    total_cols.min(crate::env::aux_sampling_chunk_width().max(1))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BggPublicKeySTGateState {
     pub input_pubkey_bytes: Vec<u8>,
@@ -144,6 +158,33 @@ where
                 DistType::GaussDist { sigma: self.error_sigma },
             )
         }
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn compute_gate_rhs_chunked(
+        &self,
+        params: &<M::P as Poly>::Params,
+        lhs_input: &M,
+        a_j: &M,
+        scalar: Option<u32>,
+    ) -> M {
+        let m_g = self.secret_size * params.modulus_digits();
+        let chunk_cols = decomposition_column_chunk_width(m_g);
+        let scalar_poly = scalar.map(|value| M::P::from_usize_to_constant(params, value as usize));
+        let rhs_chunks = (0..m_g)
+            .step_by(chunk_cols)
+            .map(|col_start| {
+                let col_len = (m_g - col_start).min(chunk_cols);
+                let col_end = col_start + col_len;
+                let a_j_chunk = a_j.slice_columns(col_start, col_end).decompose();
+                let rhs_chunk = lhs_input.clone() * a_j_chunk;
+                match &scalar_poly {
+                    Some(poly) => rhs_chunk * poly,
+                    None => rhs_chunk,
+                }
+            })
+            .collect::<Vec<_>>();
+        concat_column_chunks(rhs_chunks)
     }
 
     fn aux_checkpoint_prefix(&self, params: &<M::P as Poly>::Params) -> String {
@@ -439,13 +480,8 @@ where
                 let s_i = M::from_compact_bytes(params, slot_secret_mats[src_slot].as_ref());
                 let a_j = M::from_compact_bytes(params, slot_a_bytes_by_slot[dst_slot].as_ref());
                 let lhs = s_j * &a_out;
-                let rhs = match scalar {
-                    Some(scalar) => {
-                        let scalar_poly = M::P::from_usize_to_constant(params, scalar as usize);
-                        ((s_i * &a_in) * a_j.decompose()) * scalar_poly
-                    }
-                    None => (s_i * &a_in) * a_j.decompose(),
-                };
+                let lhs_input = s_i * &a_in;
+                let rhs = self.compute_gate_rhs_chunked(params, &lhs_input, &a_j, scalar);
                 let mut target = lhs - rhs;
                 target.add_in_place(&self.sample_error_matrix(params, self.secret_size, m_g));
                 let preimage = trap_sampler.preimage(params, b0_trapdoor, b0_matrix, &target);

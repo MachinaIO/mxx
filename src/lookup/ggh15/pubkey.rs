@@ -167,6 +167,20 @@ where
     first.concat_columns_owned(chunks)
 }
 
+fn concat_column_chunks<M>(chunks: Vec<M>) -> M
+where
+    M: PolyMatrix,
+{
+    let mut chunk_iter = chunks.into_iter();
+    let first = chunk_iter.next().expect("column chunk list must be non-empty");
+    first.concat_columns_owned(chunk_iter.collect())
+}
+
+fn decomposition_column_chunk_width(total_cols: usize) -> usize {
+    assert!(total_cols > 0, "decomposition_column_chunk_width requires total_cols > 0");
+    total_cols.min(crate::env::aux_sampling_chunk_width().max(1))
+}
+
 pub struct GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
 where
     M: PolyMatrix + Send + Sync + 'static,
@@ -240,7 +254,6 @@ where
         w_block_identity: &M,
         w_block_gy: &M,
         w_block_v: &M,
-        w_block_vx: &M,
         batch: &[(usize, M::P)],
     ) -> Vec<CompactBytesJob<M>> {
         let sample_lut_preimages_start = Instant::now();
@@ -251,6 +264,7 @@ where
         let gadget_matrix = M::gadget_matrix(params, d);
         let (_, _, crt_depth) = params.to_crt();
         let k_small = params.modulus_digits() / crt_depth;
+        let chunk_cols = decomposition_column_chunk_width(m);
         debug_assert_eq!(
             w_block_identity.col_size(),
             m,
@@ -266,111 +280,67 @@ where
             m,
             "w_block_v columns must equal d * modulus_digits^2"
         );
-        debug_assert_eq!(
-            w_block_vx.col_size(),
-            m * k_small,
-            "w_block_vx columns must equal d * modulus_digits^2"
-        );
 
         let jobs = if batch.is_empty() {
             Vec::new()
         } else {
-            let batch_size = batch.len();
-            let entry_indices = batch.iter().map(|(idx, _)| *idx).collect::<Vec<_>>();
-
-            let mut w_t_idx_batched = if batch_size == 1 {
-                w_block_identity.clone()
-            } else {
-                let identity_refs =
-                    std::iter::repeat(w_block_identity).take(batch_size).collect::<Vec<_>>();
-                identity_refs[0].concat_columns(&identity_refs[1..])
-            };
-
-            let gy_terms = batch
+            batch
                 .par_iter()
                 .map(|(idx, y_poly)| {
                     let gy = gadget_matrix.clone() * y_poly;
-                    let gy_decomposed = gy.decompose();
-                    drop(gy);
-                    debug!(
-                        "Computed gy_decomposed for LUT preimage: lut_id={}, row_idx={}",
-                        lut_id, idx
-                    );
-                    gy_decomposed
-                })
-                .collect::<Vec<_>>();
-            let gy_cat = if gy_terms.len() == 1 {
-                gy_terms.into_iter().next().expect("gy_terms must contain one matrix")
-            } else {
-                let mut gy_iter = gy_terms.into_iter();
-                let gy_first = gy_iter.next().expect("gy_terms must be non-empty");
-                gy_first.concat_columns_owned(gy_iter.collect())
-            };
-            let w_gy_batched = w_block_gy.clone() * gy_cat;
-            w_t_idx_batched.add_in_place(&w_gy_batched);
-            drop(w_gy_batched);
-
-            let v_idx_terms = batch
-                .par_iter()
-                .map(|(idx, _)| {
-                    let v_idx =
-                        derive_lut_v_idx_from_hash::<M, HS>(params, self.hash_key, lut_id, *idx, d);
-                    debug!(
-                        "Derived v_idx for LUT preimage from hash: lut_id={}, row_idx={}",
-                        lut_id, idx
-                    );
-                    (*idx, v_idx)
-                })
-                .collect::<Vec<_>>();
-            let v_refs = v_idx_terms.iter().map(|(_, v_idx)| v_idx).collect::<Vec<_>>();
-            let v_cat = if v_refs.len() == 1 {
-                v_refs[0].clone()
-            } else {
-                v_refs[0].concat_columns(&v_refs[1..])
-            };
-            drop(v_refs);
-            let w_v_batched = w_block_v.clone() * v_cat;
-            w_t_idx_batched.add_in_place(&w_v_batched);
-            drop(w_v_batched);
-
-            let vx_rhs_terms = v_idx_terms
-                .par_iter()
-                .map(|(idx, v_idx)| {
                     let idx_poly = M::P::from_usize_to_constant(params, *idx);
-                    let idx_identity_decomposed =
-                        M::identity(params, m, Some(idx_poly)).small_decompose();
-                    let vx_rhs = idx_identity_decomposed * v_idx;
-                    debug!("Computed vx_rhs for LUT preimage: lut_id={}, row_idx={}", lut_id, idx);
-                    vx_rhs
-                })
-                .collect::<Vec<_>>();
-            let vx_rhs_cat = if vx_rhs_terms.len() == 1 {
-                vx_rhs_terms.into_iter().next().expect("vx_rhs_terms must contain one matrix")
-            } else {
-                let mut rhs_iter = vx_rhs_terms.into_iter();
-                let rhs_first = rhs_iter.next().expect("vx_rhs_terms must be non-empty");
-                rhs_first.concat_columns_owned(rhs_iter.collect())
-            };
-            drop(v_idx_terms);
-            let w_vx_batched = w_block_vx.clone() * vx_rhs_cat;
-            w_t_idx_batched.add_in_place(&w_vx_batched);
-            drop(w_vx_batched);
+                    let target_chunks = (0..m)
+                        .step_by(chunk_cols)
+                        .map(|col_start| {
+                            let col_len = (m - col_start).min(chunk_cols);
+                            let col_end = col_start + col_len;
+                            let mut target_chunk = w_block_identity.slice(0, d, col_start, col_end);
+                            let gy_chunk = gy.slice_columns(col_start, col_end).decompose();
+                            let w_gy_chunk = w_block_gy.clone() * gy_chunk;
+                            target_chunk.add_in_place(&w_gy_chunk);
 
-            let batched_target = w_t_idx_batched;
+                            let v_idx_chunk = HS::new().sample_hash_decomposed_columns(
+                                params,
+                                self.hash_key,
+                                format!("ggh15_lut_v_idx_{}_{}", lut_id, idx),
+                                d,
+                                m,
+                                col_start,
+                                col_len,
+                                DistType::FinRingDist,
+                            );
+                            let w_v_chunk = w_block_v.clone() * &v_idx_chunk;
+                            target_chunk.add_in_place(&w_v_chunk);
 
-            let batched_preimage =
-                trap_sampler.preimage(params, b1_trapdoor, b1_matrix, &batched_target);
-            let preimage_nrow = batched_preimage.row_size();
-            entry_indices
-                .into_iter()
-                .enumerate()
-                .map(|(entry_pos, idx)| {
-                    let col_start =
-                        entry_pos.checked_mul(m).expect("preimage slice column offset overflow");
-                    let col_end = col_start + m;
-                    let k_l_preimage = batched_preimage.slice(0, preimage_nrow, col_start, col_end);
+                            for small_chunk_idx in 0..k_small {
+                                let w_vx_chunk = self.derive_w_block_with_tag_columns(
+                                    params,
+                                    lut_id,
+                                    "block_vx",
+                                    m * k_small,
+                                    small_chunk_idx * m,
+                                    m,
+                                );
+                                let idx_identity_chunk =
+                                    M::small_decomposed_identity_chunk_from_scalar(
+                                        params,
+                                        m,
+                                        &idx_poly,
+                                        small_chunk_idx,
+                                        k_small,
+                                    );
+                                let vx_rhs_chunk = idx_identity_chunk * &v_idx_chunk;
+                                let w_vx_contrib = w_vx_chunk * vx_rhs_chunk;
+                                target_chunk.add_in_place(&w_vx_contrib);
+                            }
+                            target_chunk
+                        })
+                        .collect::<Vec<_>>();
+                    debug!("Constructed chunked LUT target: lut_id={}, row_idx={}", lut_id, idx);
+                    let target = concat_column_chunks(target_chunks);
+                    let preimage = trap_sampler.preimage(params, b1_trapdoor, b1_matrix, &target);
                     let lut_aux_id = format!("{lut_aux_id_prefix}_idx{idx}");
-                    CompactBytesJob::new(lut_aux_id, vec![(0usize, k_l_preimage)])
+                    CompactBytesJob::new(lut_aux_id, vec![(0usize, preimage)])
                 })
                 .collect::<Vec<_>>()
         };
@@ -397,7 +367,6 @@ where
         w_block_identity: &M,
         w_block_gy: &M,
         w_block_v: &M,
-        w_block_vx: &M,
     ) -> Vec<CompactBytesJob<M>> {
         if pending.is_empty() {
             return Vec::new();
@@ -405,6 +374,7 @@ where
         let d = self.d;
         let m_g = d * params.modulus_digits();
         let k_small = small_gadget_chunk_count::<M>(params);
+        let chunk_cols = decomposition_column_chunk_width(m_g);
         debug_assert_eq!(b1_matrix.row_size(), d, "gate stage1 expects b1_matrix rows = d");
         let trap_sampler = TS::new(params, self.trapdoor_sigma);
         let mut jobs = Vec::new();
@@ -585,26 +555,33 @@ where
             .map(|(gate_id, state, s_g)| {
                 let hash_sampler = HS::new();
                 let input_matrix = M::from_compact_bytes(params, &state.input_pubkey_bytes);
-                let u_g_decomposed = hash_sampler.sample_hash_decomposed(
-                    params,
-                    self.hash_key,
-                    format!("ggh15_lut_u_g_matrix_{}", gate_id),
-                    d,
-                    m_g,
-                    DistType::FinRingDist,
+                let target_gate2_v = concat_column_chunks(
+                    (0..m_g)
+                        .step_by(chunk_cols)
+                        .map(|col_start| {
+                            let col_len = (m_g - col_start).min(chunk_cols);
+                            let col_end = col_start + col_len;
+                            let mut target_chunk =
+                                s_g.clone() * &w_block_v.slice(0, d, col_start, col_end);
+                            let u_g_decomposed_chunk = hash_sampler.sample_hash_decomposed_columns(
+                                params,
+                                self.hash_key,
+                                format!("ggh15_lut_u_g_matrix_{}", gate_id),
+                                d,
+                                m_g,
+                                col_start,
+                                col_len,
+                                DistType::FinRingDist,
+                            );
+                            let target_high_v_chunk =
+                                -(input_matrix.clone() * u_g_decomposed_chunk);
+                            target_chunk.add_in_place(&target_high_v_chunk);
+                            let error = self.sample_error_matrix(params, d, col_len);
+                            target_chunk.add_in_place(&error);
+                            target_chunk
+                        })
+                        .collect::<Vec<_>>(),
                 );
-                debug!(
-                    "Derived decomposed u_g_matrix for gate: gate_id={}, lut_id={}, rows={}, cols={}",
-                    gate_id,
-                    lut_id,
-                    u_g_decomposed.row_size(),
-                    u_g_decomposed.col_size()
-                );
-                let mut target_gate2_v = s_g.clone() * w_block_v;
-                let target_high_v = -(input_matrix * u_g_decomposed);
-                target_gate2_v.add_in_place(&target_high_v);
-                let error = self.sample_error_matrix(params, d, m_g);
-                target_gate2_v.add_in_place(&error);
                 (gate_id, s_g, target_gate2_v)
             })
             .collect::<Vec<_>>();
@@ -650,7 +627,6 @@ where
             .collect::<Vec<_>>();
         jobs.extend(stage4_jobs);
 
-        let small_gadget_matrix = M::small_gadget_matrix(params, m_g);
         let stage5_entries = stage5_inputs
             .into_par_iter()
             .map(|(gate_id, s_g)| {
@@ -663,11 +639,34 @@ where
                     m_g,
                     DistType::FinRingDist,
                 );
-                let mut target_gate2_vx = s_g.clone() * w_block_vx;
-                let target_high_vx = u_g_matrix * &small_gadget_matrix;
-                target_gate2_vx.add_in_place(&target_high_vx);
-                let error = self.sample_error_matrix(params, d, m_g * k_small);
-                target_gate2_vx.add_in_place(&error);
+                let target_gate2_vx = concat_column_chunks(
+                    (0..k_small)
+                        .map(|chunk_idx| {
+                            let chunk_col_start = chunk_idx
+                                .checked_mul(m_g)
+                                .expect("stage5 chunk start column overflow");
+                            let w_block_vx_chunk = self.derive_w_block_with_tag_columns(
+                                params,
+                                lut_id,
+                                "block_vx",
+                                m_g * k_small,
+                                chunk_col_start,
+                                m_g,
+                            );
+                            let mut target_chunk = s_g.clone() * &w_block_vx_chunk;
+                            let target_high_vx_chunk = self.build_stage5_target_high_vx_chunk(
+                                params,
+                                &u_g_matrix,
+                                chunk_idx,
+                                m_g,
+                            );
+                            target_chunk.add_in_place(&target_high_vx_chunk);
+                            let error = self.sample_error_matrix(params, d, m_g);
+                            target_chunk.add_in_place(&error);
+                            target_chunk
+                        })
+                        .collect::<Vec<_>>(),
+                );
                 (gate_id, target_gate2_vx)
             })
             .collect::<Vec<_>>();
@@ -754,6 +753,28 @@ where
         )
     }
 
+    fn derive_w_block_with_tag_columns(
+        &self,
+        params: &<M::P as Poly>::Params,
+        lut_id: usize,
+        tag: &str,
+        total_cols: usize,
+        col_start: usize,
+        col_len: usize,
+    ) -> M {
+        let d = self.d;
+        HS::new().sample_hash_columns(
+            params,
+            self.hash_key,
+            format!("ggh15_lut_w_{tag}_{}", lut_id),
+            d,
+            total_cols,
+            col_start,
+            col_len,
+            DistType::FinRingDist,
+        )
+    }
+
     fn derive_w_block_identity(&self, params: &<M::P as Poly>::Params, lut_id: usize) -> M {
         let m_g = self.d * params.modulus_digits();
         self.derive_w_block_with_tag(params, lut_id, "block_identity", m_g)
@@ -769,10 +790,33 @@ where
         self.derive_w_block_with_tag(params, lut_id, "block_v", m_g)
     }
 
-    fn derive_w_block_vx(&self, params: &<M::P as Poly>::Params, lut_id: usize) -> M {
-        let m_g = self.d * params.modulus_digits();
+    fn build_stage5_target_high_vx_chunk(
+        &self,
+        params: &<M::P as Poly>::Params,
+        u_g_matrix: &M,
+        chunk_idx: usize,
+        m_g: usize,
+    ) -> M {
+        let d = self.d;
         let k_small = small_gadget_chunk_count::<M>(params);
-        self.derive_w_block_with_tag(params, lut_id, "block_vx", m_g * k_small)
+        debug_assert!(chunk_idx < k_small, "chunk_idx must be < k_small");
+
+        let chunk_start = chunk_idx.checked_mul(m_g).expect("stage5 chunk column offset overflow");
+        let mut target_high_vx_chunk = M::zero(params, d, m_g);
+        let scalar_by_digit = (0..k_small)
+            .map(|digit| M::P::from_power_of_base_to_constant(params, digit))
+            .collect::<Vec<_>>();
+
+        for local_col in 0..m_g {
+            let global_col = chunk_start + local_col;
+            let src_col = global_col / k_small;
+            let digit = global_col % k_small;
+            let src_column = u_g_matrix.slice(0, d, src_col, src_col + 1);
+            let scaled_column = src_column * &scalar_by_digit[digit];
+            target_high_vx_chunk.copy_block_from(&scaled_column, 0, local_col, 0, 0, d, 1);
+        }
+
+        target_high_vx_chunk
     }
 
     fn aux_checkpoint_prefix(&self, params: &<M::P as Poly>::Params) -> String {
@@ -1507,7 +1551,6 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
             let w_block_identity = self.derive_w_block_identity(params, lut_id);
             let w_block_gy = self.derive_w_block_gy(params, lut_id);
             let w_block_v = self.derive_w_block_v(params, lut_id);
-            let w_block_vx = self.derive_w_block_vx(params, lut_id);
 
             #[cfg(feature = "gpu")]
             {
@@ -1537,7 +1580,6 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                         &w_block_identity,
                         &w_block_gy,
                         &w_block_v,
-                        &w_block_vx,
                         current_batch,
                     )
                 };
@@ -1638,7 +1680,6 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                     previous_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
                 }
             }
-            drop(w_block_vx);
             drop(w_block_v);
             drop(w_block_gy);
             drop(w_block_identity);
@@ -1676,7 +1717,6 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
             let w_block_identity = self.derive_w_block_identity(params, lut_id);
             let w_block_gy = self.derive_w_block_gy(params, lut_id);
             let w_block_v = self.derive_w_block_v(params, lut_id);
-            let w_block_vx = self.derive_w_block_vx(params, lut_id);
             #[cfg(feature = "gpu")]
             {
                 self.process_gate_group_gpu(
@@ -1688,7 +1728,6 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                     &w_block_identity,
                     &w_block_gy,
                     &w_block_v,
-                    &w_block_vx,
                     total_gate_count,
                     &mut total_gates,
                     &start,
@@ -1718,7 +1757,6 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                             &w_block_identity,
                             &w_block_gy,
                             &w_block_v,
-                            &w_block_vx,
                         )
                         .into_par_iter()
                         .for_each(CompactBytesJob::wait_then_store);
@@ -1743,7 +1781,6 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
                     );
                 }
             }
-            drop(w_block_vx);
             drop(w_block_v);
             drop(w_block_gy);
             drop(w_block_identity);
@@ -1782,7 +1819,6 @@ where
         let w_block_identity = self.derive_w_block_identity(params, lut_id);
         let w_block_gy = self.derive_w_block_gy(params, lut_id);
         let w_block_v = self.derive_w_block_v(params, lut_id);
-        let w_block_vx = self.derive_w_block_vx(params, lut_id);
         let batch = vec![(0usize, M::P::from_usize_to_constant(params, 1usize))];
         let start = Instant::now();
         let jobs = self.sample_lut_preimages(
@@ -1794,7 +1830,6 @@ where
             &w_block_identity,
             &w_block_gy,
             &w_block_v,
-            &w_block_vx,
             &batch,
         );
         let elapsed = start.elapsed().as_secs_f64();
@@ -1813,7 +1848,6 @@ where
         let w_block_identity = self.derive_w_block_identity(params, lut_id);
         let w_block_gy = self.derive_w_block_gy(params, lut_id);
         let w_block_v = self.derive_w_block_v(params, lut_id);
-        let w_block_vx = self.derive_w_block_vx(params, lut_id);
         let input_pubkey_bytes = M::gadget_matrix(params, self.d).into_compact_bytes();
         let start = Instant::now();
         let jobs = self.sample_gate_preimages_batch(
@@ -1833,7 +1867,6 @@ where
             &w_block_identity,
             &w_block_gy,
             &w_block_v,
-            &w_block_vx,
         );
         let elapsed = start.elapsed().as_secs_f64();
         SampleAuxBenchEstimate {

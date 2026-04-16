@@ -59,7 +59,6 @@ where
     w_block_identity: M,
     w_block_gy: M,
     w_block_v: M,
-    w_block_vx: M,
     gadget_matrix: M,
 }
 
@@ -88,7 +87,6 @@ where
     w_block_identity: DeviceReplica<'a, M>,
     w_block_gy: DeviceReplica<'a, M>,
     w_block_v: DeviceReplica<'a, M>,
-    w_block_vx: DeviceReplica<'a, M>,
 }
 
 #[cfg(feature = "gpu")]
@@ -214,7 +212,6 @@ where
                 let w_block_identity = self.derive_w_block_identity(&base.params, lut_id);
                 let w_block_gy = self.derive_w_block_gy(&base.params, lut_id);
                 let w_block_v = self.derive_w_block_v(&base.params, lut_id);
-                let w_block_vx = self.derive_w_block_vx(&base.params, lut_id);
                 let gadget_matrix = M::gadget_matrix(&base.params, self.d);
                 GpuLutDeviceShared {
                     device_id: base.device_id,
@@ -224,7 +221,6 @@ where
                     w_block_identity,
                     w_block_gy,
                     w_block_v,
-                    w_block_vx,
                     gadget_matrix,
                 }
             })
@@ -338,7 +334,6 @@ where
         w_block_identity_by_device: Vec<DeviceReplica<'a, M>>,
         w_block_gy_by_device: Vec<DeviceReplica<'a, M>>,
         w_block_v_by_device: Vec<DeviceReplica<'a, M>>,
-        w_block_vx_by_device: Vec<DeviceReplica<'a, M>>,
     ) -> Vec<GpuGateDeviceShared<'a, M, TS::Trapdoor>> {
         let len = base_shared.len();
         assert_eq!(
@@ -356,16 +351,10 @@ where
             w_block_v_by_device.len(),
             "w_block_v device replicas must match gate base shared length"
         );
-        assert_eq!(
-            len,
-            w_block_vx_by_device.len(),
-            "w_block_vx device replicas must match gate base shared length"
-        );
 
         let mut w_identity_it = w_block_identity_by_device.into_iter();
         let mut w_gy_it = w_block_gy_by_device.into_iter();
         let mut w_v_it = w_block_v_by_device.into_iter();
-        let mut w_vx_it = w_block_vx_by_device.into_iter();
 
         (0..len)
             .map(|idx| {
@@ -381,7 +370,6 @@ where
                         .expect("missing w_block_identity replica for gate device"),
                     w_block_gy: w_gy_it.next().expect("missing w_block_gy replica for gate device"),
                     w_block_v: w_v_it.next().expect("missing w_block_v replica for gate device"),
-                    w_block_vx: w_vx_it.next().expect("missing w_block_vx replica for gate device"),
                 }
             })
             .collect()
@@ -402,6 +390,7 @@ where
         let m = d * params.modulus_digits();
         let (_, _, crt_depth) = params.to_crt();
         let k_small = params.modulus_digits() / crt_depth;
+        let chunk_cols = decomposition_column_chunk_width(m);
         debug_assert!(!shared.is_empty(), "gpu shared resources must not be empty");
         debug_assert_eq!(
             shared[0].w_block_identity.col_size(),
@@ -418,11 +407,6 @@ where
             m,
             "w_block_v columns must equal d * modulus_digits^2"
         );
-        debug_assert_eq!(
-            shared[0].w_block_vx.col_size(),
-            m * k_small,
-            "w_block_vx columns must equal d * modulus_digits^2"
-        );
 
         let jobs = {
             if batch.is_empty() {
@@ -435,26 +419,57 @@ where
                             let shared_dev = &shared[*device_slot];
 
                             let gy = shared_dev.gadget_matrix.clone() * local_y_poly;
-                            let gy_decomposed = gy.decompose();
-                            let mut target = shared_dev.w_block_gy.clone() * gy_decomposed;
-
-                            let v_idx = derive_lut_v_idx_from_hash::<M, HS>(
-                                shared_dev.params,
-                                self.hash_key,
-                                lut_id,
-                                *idx,
-                                d,
-                            );
-                            let w_v = shared_dev.w_block_v.clone() * &v_idx;
-                            target.add_in_place(&w_v);
-
                             let idx_poly = M::P::from_usize_to_constant(shared_dev.params, *idx);
-                            let idx_identity_decomposed =
-                                M::identity(shared_dev.params, m, Some(idx_poly)).small_decompose();
-                            let vx_rhs = idx_identity_decomposed * &v_idx;
-                            let w_vx = shared_dev.w_block_vx.clone() * vx_rhs;
-                            target.add_in_place(&w_vx);
-                            target.add_in_place(&shared_dev.w_block_identity);
+                            let target = concat_column_chunks(
+                                (0..m)
+                                    .step_by(chunk_cols)
+                                    .map(|col_start| {
+                                        let col_len = (m - col_start).min(chunk_cols);
+                                        let col_end = col_start + col_len;
+                                        let mut target_chunk =
+                                            shared_dev.w_block_identity.slice(0, d, col_start, col_end);
+                                        let gy_chunk = gy.slice_columns(col_start, col_end).decompose();
+                                        let w_gy_chunk = shared_dev.w_block_gy.clone() * gy_chunk;
+                                        target_chunk.add_in_place(&w_gy_chunk);
+
+                                        let v_idx_chunk = HS::new().sample_hash_decomposed_columns(
+                                            shared_dev.params,
+                                            self.hash_key,
+                                            format!("ggh15_lut_v_idx_{}_{}", lut_id, idx),
+                                            d,
+                                            m,
+                                            col_start,
+                                            col_len,
+                                            DistType::FinRingDist,
+                                        );
+                                        let w_v_chunk = shared_dev.w_block_v.clone() * &v_idx_chunk;
+                                        target_chunk.add_in_place(&w_v_chunk);
+
+                                        for small_chunk_idx in 0..k_small {
+                                            let w_vx_chunk = self.derive_w_block_with_tag_columns(
+                                                shared_dev.params,
+                                                lut_id,
+                                                "block_vx",
+                                                m * k_small,
+                                                small_chunk_idx * m,
+                                                m,
+                                            );
+                                            let idx_identity_chunk =
+                                                M::small_decomposed_identity_chunk_from_scalar(
+                                                    shared_dev.params,
+                                                    m,
+                                                    &idx_poly,
+                                                    small_chunk_idx,
+                                                    k_small,
+                                                );
+                                            let vx_rhs_chunk = idx_identity_chunk * &v_idx_chunk;
+                                            let w_vx_contrib = w_vx_chunk * vx_rhs_chunk;
+                                            target_chunk.add_in_place(&w_vx_contrib);
+                                        }
+                                        target_chunk
+                                    })
+                                    .collect::<Vec<_>>(),
+                            );
                             debug!(
                                 "Constructed device-local target for LUT preimage: lut_id={}, row_idx={}, device_id={}",
                                 lut_id,
@@ -512,11 +527,8 @@ where
         let d = self.d;
         let m_g = d * params.modulus_digits();
         let k_small = small_gadget_chunk_count::<M>(params);
+        let chunk_cols = decomposition_column_chunk_width(m_g);
         let trap_sampler = TS::new(params, self.trapdoor_sigma);
-        debug_assert!(
-            shared.iter().all(|entry| entry.w_block_vx.col_size() == m_g * k_small),
-            "w_block_vx columns must equal m_g * k_small"
-        );
         debug_assert!(
             shared.iter().all(|entry| entry.b1_matrix.row_size() == d),
             "gate stage1 expects b1_matrix to have d rows"
@@ -702,35 +714,41 @@ where
             .expect("public LUT gpu stage3 compact_bytes overflowed u64");
 
         let stage4_entries = stage3_inputs
-                .into_par_iter()
-                .map(|(entry_pos, gate_id, state, s_g)| {
-                    let shared = shared_for_logical_idx(shared, entry_pos);
-                    let hash_sampler = HS::new();
-                    let input_matrix = M::from_compact_bytes(shared.params, &state.input_pubkey_bytes);
-                    let u_g_decomposed = hash_sampler.sample_hash_decomposed(
-                        shared.params,
-                        self.hash_key,
-                        format!("ggh15_lut_u_g_matrix_{}", gate_id),
-                        d,
-                        m_g,
-                        DistType::FinRingDist,
-                    );
-                    debug!(
-                        "Derived decomposed u_g_matrix for gate: gate_id={}, lut_id={}, rows={}, cols={}, device_id={}",
-                        gate_id,
-                        lut_id,
-                        u_g_decomposed.row_size(),
-                        u_g_decomposed.col_size(),
-                        shared.device_id
-                    );
-                    let mut target_gate2_v = s_g.clone() * shared.w_block_v.as_ref();
-                    let target_high_v = -(input_matrix * u_g_decomposed);
-                    target_gate2_v.add_in_place(&target_high_v);
-                    let error = self.sample_error_matrix(shared.params, d, m_g);
-                    target_gate2_v.add_in_place(&error);
-                    (entry_pos, gate_id, s_g, target_gate2_v)
-                })
-                .collect::<Vec<_>>();
+            .into_par_iter()
+            .map(|(entry_pos, gate_id, state, s_g)| {
+                let shared = shared_for_logical_idx(shared, entry_pos);
+                let hash_sampler = HS::new();
+                let input_matrix = M::from_compact_bytes(shared.params, &state.input_pubkey_bytes);
+                let target_gate2_v = concat_column_chunks(
+                    (0..m_g)
+                        .step_by(chunk_cols)
+                        .map(|col_start| {
+                            let col_len = (m_g - col_start).min(chunk_cols);
+                            let col_end = col_start + col_len;
+                            let mut target_chunk = s_g.clone() *
+                                &shared.w_block_v.as_ref().slice(0, d, col_start, col_end);
+                            let u_g_decomposed_chunk = hash_sampler.sample_hash_decomposed_columns(
+                                shared.params,
+                                self.hash_key,
+                                format!("ggh15_lut_u_g_matrix_{}", gate_id),
+                                d,
+                                m_g,
+                                col_start,
+                                col_len,
+                                DistType::FinRingDist,
+                            );
+                            let target_high_v_chunk =
+                                -(input_matrix.clone() * u_g_decomposed_chunk);
+                            target_chunk.add_in_place(&target_high_v_chunk);
+                            let error = self.sample_error_matrix(shared.params, d, col_len);
+                            target_chunk.add_in_place(&error);
+                            target_chunk
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                (entry_pos, gate_id, s_g, target_gate2_v)
+            })
+            .collect::<Vec<_>>();
         let mut stage5_inputs = Vec::with_capacity(stage4_entries.len());
         let mut stage4_requests = Vec::with_capacity(stage4_entries.len());
         for (entry_pos, gate_id, s_g, target) in stage4_entries {
@@ -777,7 +795,6 @@ where
         for chunk_idx in 0..k_small {
             let chunk_col_start =
                 chunk_idx.checked_mul(m_g).expect("stage5 chunk start column overflow");
-            let chunk_col_end = chunk_col_start + m_g;
             let mut stage5_compact_bytes = 0u64;
             pipeline_lookup_stage(&mut pending_store_buffers, || {
                 let stage5_requests = stage5_inputs
@@ -799,11 +816,13 @@ where
                             chunk_idx,
                             m_g,
                         );
-                        let w_block_vx_chunk = shared.w_block_vx.as_ref().slice(
-                            0,
-                            shared.w_block_vx.row_size(),
+                        let w_block_vx_chunk = self.derive_w_block_with_tag_columns(
+                            shared.params,
+                            lut_id,
+                            "block_vx",
+                            m_g * k_small,
                             chunk_col_start,
-                            chunk_col_end,
+                            m_g,
                         );
                         let mut target_gate2_vx_chunk = s_g.clone() * &w_block_vx_chunk;
                         target_gate2_vx_chunk.add_in_place(&target_high_vx_chunk);
@@ -855,36 +874,6 @@ where
             store_lookup_buffers(previous_buffers);
         }
         total_compact_bytes
-    }
-
-    #[cfg(feature = "gpu")]
-    fn build_stage5_target_high_vx_chunk(
-        &self,
-        params: &<M::P as Poly>::Params,
-        u_g_matrix: &M,
-        chunk_idx: usize,
-        m_g: usize,
-    ) -> M {
-        let d = self.d;
-        let k_small = small_gadget_chunk_count::<M>(params);
-        debug_assert!(chunk_idx < k_small, "chunk_idx must be < k_small");
-
-        let chunk_start = chunk_idx.checked_mul(m_g).expect("stage5 chunk column offset overflow");
-        let mut target_high_vx_chunk = M::zero(params, d, m_g);
-        let scalar_by_digit = (0..k_small)
-            .map(|digit| M::P::from_power_of_base_to_constant(params, digit))
-            .collect::<Vec<_>>();
-
-        for local_col in 0..m_g {
-            let global_col = chunk_start + local_col;
-            let src_col = global_col / k_small;
-            let digit = global_col % k_small;
-            let src_column = u_g_matrix.slice(0, d, src_col, src_col + 1);
-            let scaled_column = src_column * &scalar_by_digit[digit];
-            target_high_vx_chunk.copy_block_from(&scaled_column, 0, local_col, 0, 0, d, 1);
-        }
-
-        target_high_vx_chunk
     }
 
     pub(super) fn sample_lut_preimage_batches_gpu(
@@ -1018,7 +1007,6 @@ where
         w_block_identity: &M,
         w_block_gy: &M,
         w_block_v: &M,
-        w_block_vx: &M,
         total_gate_count: usize,
         total_gates: &mut usize,
         start: &Instant,
@@ -1029,14 +1017,11 @@ where
             self.copy_matrix_to_gpu_gate_devices(params, w_block_gy, gpu_gate_base_shared);
         let w_block_v_by_device =
             self.copy_matrix_to_gpu_gate_devices(params, w_block_v, gpu_gate_base_shared);
-        let w_block_vx_by_device =
-            self.copy_matrix_to_gpu_gate_devices(params, w_block_vx, gpu_gate_base_shared);
         let gpu_gate_shared = self.prepare_gpu_gate_device_shared(
             gpu_gate_base_shared,
             w_block_identity_by_device,
             w_block_gy_by_device,
             w_block_v_by_device,
-            w_block_vx_by_device,
         );
 
         while !gates.is_empty() {
@@ -1115,21 +1100,17 @@ where
         let w_block_identity = self.derive_w_block_identity(params, lut_id);
         let w_block_gy = self.derive_w_block_gy(params, lut_id);
         let w_block_v = self.derive_w_block_v(params, lut_id);
-        let w_block_vx = self.derive_w_block_vx(params, lut_id);
         let w_block_identity_by_device =
             self.copy_matrix_to_gpu_gate_devices(params, &w_block_identity, &gpu_gate_base_shared);
         let w_block_gy_by_device =
             self.copy_matrix_to_gpu_gate_devices(params, &w_block_gy, &gpu_gate_base_shared);
         let w_block_v_by_device =
             self.copy_matrix_to_gpu_gate_devices(params, &w_block_v, &gpu_gate_base_shared);
-        let w_block_vx_by_device =
-            self.copy_matrix_to_gpu_gate_devices(params, &w_block_vx, &gpu_gate_base_shared);
         let gpu_gate_shared = self.prepare_gpu_gate_device_shared(
             &gpu_gate_base_shared,
             w_block_identity_by_device,
             w_block_gy_by_device,
             w_block_v_by_device,
-            w_block_vx_by_device,
         );
         let input_pubkey_bytes = M::gadget_matrix(params, self.d).into_compact_bytes();
         let start = Instant::now();

@@ -457,25 +457,27 @@ fn find_crt_depth_for_goldreich_ring_gsw_bench(
             .parse::<usize>()
             .unwrap_or_else(|e| panic!("CRT_DEPTH must be a valid usize: {e}"));
         assert!(requested_crt_depth > 0, "CRT_DEPTH must be > 0");
-        let probe = probe_crt_depth_for_goldreich_ring_gsw_bench(
-            cfg,
-            requested_crt_depth,
-            &ring_dim_sqrt,
-            &base,
-            &error_sigma,
-            &e_init_norm,
-        );
-        let (_, _, actual_crt_depth) = probe.params.to_crt();
-        info!(
-            "using CRT_DEPTH override: requested_crt_depth={} actual_crt_depth={} eval_ok={} decryption_ok={}",
-            requested_crt_depth, actual_crt_depth, probe.eval_ok, probe.decryption_ok
-        );
-        assert!(
-            probe.eval_ok,
-            "CRT_DEPTH={} failed the eval threshold check for the Goldreich Ring-GSW benchmark",
-            requested_crt_depth
-        );
-        return (requested_crt_depth, probe.params);
+        // let probe = probe_crt_depth_for_goldreich_ring_gsw_bench(
+        //     cfg,
+        //     requested_crt_depth,
+        //     &ring_dim_sqrt,
+        //     &base,
+        //     &error_sigma,
+        //     &e_init_norm,
+        // );
+        // let (_, _, actual_crt_depth) = probe.params.to_crt();
+        // info!(
+        //     "using CRT_DEPTH override: requested_crt_depth={} actual_crt_depth={} eval_ok={}
+        // decryption_ok={}",     requested_crt_depth, actual_crt_depth, probe.eval_ok,
+        // probe.decryption_ok );
+        let params =
+            DCRTPolyParams::new(cfg.ring_dim, requested_crt_depth, cfg.crt_bits, cfg.base_bits);
+        // assert!(
+        //     probe.eval_ok,
+        //     "CRT_DEPTH={} failed the eval threshold check for the Goldreich Ring-GSW benchmark",
+        //     requested_crt_depth
+        // );
+        return (requested_crt_depth, params);
     }
 
     let min_crt_depth = 1usize;

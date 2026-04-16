@@ -671,17 +671,17 @@ where
     US: PolyUniformSampler<M = M> + Send + Sync,
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
-    <M::P as Poly>::Params: Default,
 {
-    fn sample_aux_matrices_slot_time(&self) -> SampleAuxBenchEstimate {
-        let params = <M::P as Poly>::Params::default();
-        let trap_sampler = TS::new(&params, self.trapdoor_sigma);
-        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(&params, self.secret_size);
+    type Params = <M::P as Poly>::Params;
+
+    fn sample_aux_matrices_slot_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate {
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, self.secret_size);
         let b1_size =
             self.secret_size.checked_mul(2).expect("slot-transfer benchmark b1 size overflow");
-        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, b1_size);
+        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, b1_size);
         let gpu_shared = self.prepare_gpu_device_shared(
-            &params,
+            params,
             &b0_matrix,
             &b0_trapdoor,
             &b1_matrix,
@@ -706,20 +706,19 @@ where
         }
     }
 
-    fn sample_aux_matrices_gate_time(&self) -> SampleAuxBenchEstimate {
-        let params = <M::P as Poly>::Params::default();
-        let trap_sampler = TS::new(&params, self.trapdoor_sigma);
-        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(&params, self.secret_size);
+    fn sample_aux_matrices_gate_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate {
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, self.secret_size);
         let b1_size =
             self.secret_size.checked_mul(2).expect("slot-transfer benchmark b1 size overflow");
-        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, b1_size);
+        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, b1_size);
         let benchmark_num_slots = self.num_slots.max(1);
         let benchmark_parallelism = crate::env::slot_transfer_slot_parallelism()
             .max(1)
             .min(benchmark_num_slots)
             .min(detected_gpu_device_ids().len().max(1));
         let gpu_shared = self.prepare_gpu_device_shared(
-            &params,
+            params,
             &b0_matrix,
             &b0_trapdoor,
             &b1_matrix,
@@ -730,7 +729,7 @@ where
             .map(|_| {
                 US::new()
                     .sample_uniform(
-                        &params,
+                        params,
                         self.secret_size,
                         self.secret_size,
                         DistType::TernaryDist,
@@ -747,7 +746,7 @@ where
             slot_a_bytes_by_slot[sample.slot_idx] = sample.slot_a.to_compact_bytes();
         }
         let state = BggPublicKeySTGateState {
-            input_pubkey_bytes: M::gadget_matrix(&params, self.secret_size).into_compact_bytes(),
+            input_pubkey_bytes: M::gadget_matrix(params, self.secret_size).into_compact_bytes(),
             src_slots: (0..benchmark_num_slots).map(|slot_idx| (slot_idx as u32, None)).collect(),
         };
         let slot_chunk = state.src_slots.iter().copied().enumerate().collect::<Vec<_>>();

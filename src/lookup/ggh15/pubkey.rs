@@ -1772,21 +1772,21 @@ where
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
     M::P: 'static,
-    <M::P as Poly>::Params: Default,
 {
-    fn sample_aux_matrices_lut_entry_time(&self) -> SampleAuxBenchEstimate {
-        let params = <M::P as Poly>::Params::default();
+    type Params = <M::P as Poly>::Params;
+
+    fn sample_aux_matrices_lut_entry_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate {
         let lut_id = 0usize;
-        let trap_sampler = TS::new(&params, self.trapdoor_sigma);
-        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, self.d);
-        let w_block_identity = self.derive_w_block_identity(&params, lut_id);
-        let w_block_gy = self.derive_w_block_gy(&params, lut_id);
-        let w_block_v = self.derive_w_block_v(&params, lut_id);
-        let w_block_vx = self.derive_w_block_vx(&params, lut_id);
-        let batch = vec![(0usize, M::P::from_usize_to_constant(&params, 1usize))];
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, self.d);
+        let w_block_identity = self.derive_w_block_identity(params, lut_id);
+        let w_block_gy = self.derive_w_block_gy(params, lut_id);
+        let w_block_v = self.derive_w_block_v(params, lut_id);
+        let w_block_vx = self.derive_w_block_vx(params, lut_id);
+        let batch = vec![(0usize, M::P::from_usize_to_constant(params, 1usize))];
         let start = Instant::now();
         let jobs = self.sample_lut_preimages(
-            &params,
+            params,
             lut_id,
             "bench_lut_aux",
             &b1_trapdoor,
@@ -1805,20 +1805,19 @@ where
         }
     }
 
-    fn sample_aux_matrices_lut_gate_time(&self) -> SampleAuxBenchEstimate {
-        let params = <M::P as Poly>::Params::default();
+    fn sample_aux_matrices_lut_gate_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate {
         let lut_id = 0usize;
-        let trap_sampler = TS::new(&params, self.trapdoor_sigma);
-        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(&params, self.d);
-        let (_b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(&params, self.d);
-        let w_block_identity = self.derive_w_block_identity(&params, lut_id);
-        let w_block_gy = self.derive_w_block_gy(&params, lut_id);
-        let w_block_v = self.derive_w_block_v(&params, lut_id);
-        let w_block_vx = self.derive_w_block_vx(&params, lut_id);
-        let input_pubkey_bytes = M::gadget_matrix(&params, self.d).into_compact_bytes();
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, self.d);
+        let (_b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, self.d);
+        let w_block_identity = self.derive_w_block_identity(params, lut_id);
+        let w_block_gy = self.derive_w_block_gy(params, lut_id);
+        let w_block_v = self.derive_w_block_v(params, lut_id);
+        let w_block_vx = self.derive_w_block_vx(params, lut_id);
+        let input_pubkey_bytes = M::gadget_matrix(params, self.d).into_compact_bytes();
         let start = Instant::now();
         let jobs = self.sample_gate_preimages_batch(
-            &params,
+            params,
             lut_id,
             vec![(
                 GateId(0),

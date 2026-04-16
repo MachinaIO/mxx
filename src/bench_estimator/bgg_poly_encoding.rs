@@ -306,10 +306,7 @@ where
                 samples.public_lut_id,
             )
         });
-        debug!(
-            "BggPolyEncodingBenchEstimator::benchmark public_lut_bench={:?}",
-            public_lut_bench
-        );
+        debug!("BggPolyEncodingBenchEstimator::benchmark public_lut_bench={:?}", public_lut_bench);
         let slot_transfer_bench = benchmark_gate_operation(iterations, || {
             slot_transfer_evaluator.slot_transfer(
                 samples.params,

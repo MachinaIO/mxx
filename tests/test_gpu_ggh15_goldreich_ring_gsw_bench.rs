@@ -42,9 +42,7 @@ use mxx::{
         SimulatorContext,
         error_norm::{NormBggPolyEncodingSTEvaluator, NormPltGGH15Evaluator},
     },
-    slot_transfer::{
-        BggPolyEncodingSTEvaluator, bgg_pubkey::BggPublicKeySTEvaluator,
-    },
+    slot_transfer::{BggPolyEncodingSTEvaluator, bgg_pubkey::BggPublicKeySTEvaluator},
     storage::write::{init_storage_system, wait_for_all_writes},
     utils::bigdecimal_bits_ceil,
 };
@@ -734,13 +732,20 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
         cfg.bench_iterations,
     );
     let pubkey_public_lut_aux_estimate = pubkey_bench_estimator_owner
-        .estimate_public_lut_sample_aux_matrices(total_lut_entries, total_public_lut_gates);
+        .estimate_public_lut_sample_aux_matrices(
+            &params,
+            total_lut_entries,
+            total_public_lut_gates,
+        );
     let pubkey_slot_transfer_aux_estimate = pubkey_bench_estimator_owner
-        .estimate_slot_transfer_sample_aux_matrices(cfg.num_slots(), total_slot_transfer_gates);
+        .estimate_slot_transfer_sample_aux_matrices(
+            &params,
+            cfg.num_slots(),
+            total_slot_transfer_gates,
+        );
     info!(
         "pubkey sample_aux estimates: public_lut={:?} slot_transfer={:?}",
-        pubkey_public_lut_aux_estimate,
-        pubkey_slot_transfer_aux_estimate
+        pubkey_public_lut_aux_estimate, pubkey_slot_transfer_aux_estimate
     );
     let pubkey_circuit_bench = pubkey_bench_estimator_owner.estimate_circuit_bench(&circuit);
     info!(

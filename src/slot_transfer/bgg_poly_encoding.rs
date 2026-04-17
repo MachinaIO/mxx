@@ -22,7 +22,9 @@ use crate::{
 };
 #[cfg(not(feature = "gpu"))]
 use rayon::prelude::*;
-use std::{marker::PhantomData, ops::Mul, path::PathBuf, sync::Arc};
+#[cfg(not(feature = "gpu"))]
+use std::sync::Arc;
+use std::{marker::PhantomData, ops::Mul, path::PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct BggPolyEncodingSTEvaluator<M, HS>
@@ -98,6 +100,7 @@ where
         )
     }
 
+    #[cfg(not(feature = "gpu"))]
     fn output_slot_for_params(
         &self,
         params: &<M::P as Poly>::Params,

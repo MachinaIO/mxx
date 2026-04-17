@@ -1,6 +1,7 @@
 use super::*;
 use crate::poly::{PolyParams, dcrt::gpu::detected_gpu_device_ids};
 use rayon::prelude::*;
+use std::sync::Arc;
 
 pub(super) struct GpuSlotTransferSharedByDevice<M: PolyMatrix> {
     pub params: <<M as PolyMatrix>::P as Poly>::Params,
@@ -49,38 +50,169 @@ where
         .collect()
 }
 
-fn evaluate_slot_transfer_chunk_gpu<M, HS>(
+fn collect_chunk_bytes_by_device<M, F>(
+    shared_by_device: &[GpuSlotTransferSharedByDevice<M>],
+    chunk_count: usize,
+    build_chunk: F,
+) -> Vec<Vec<u8>>
+where
+    M: PolyMatrix + Send + Sync,
+    F: Fn(&GpuSlotTransferSharedByDevice<M>, usize) -> Vec<u8> + Send + Sync,
+{
+    let mut chunk_bytes = (0..chunk_count).map(|_| None).collect::<Vec<_>>();
+    for wave in (0..chunk_count).collect::<Vec<_>>().chunks(shared_by_device.len().max(1)) {
+        let wave_results = wave
+            .par_iter()
+            .enumerate()
+            .map(|(device_slot, chunk_idx)| {
+                let shared = &shared_by_device[device_slot];
+                (*chunk_idx, build_chunk(shared, *chunk_idx))
+            })
+            .collect::<Vec<_>>();
+        for (chunk_idx, bytes) in wave_results {
+            chunk_bytes[chunk_idx] = Some(bytes);
+        }
+    }
+    chunk_bytes
+        .into_iter()
+        .enumerate()
+        .map(|(chunk_idx, maybe_bytes)| {
+            maybe_bytes.unwrap_or_else(|| {
+                panic!("missing slot-transfer chunk bytes for chunk {chunk_idx}")
+            })
+        })
+        .collect()
+}
+
+fn concat_chunk_bytes_on_base<M>(params: &<M::P as Poly>::Params, chunk_bytes: Vec<Vec<u8>>) -> M
+where
+    M: PolyMatrix,
+{
+    if chunk_bytes.len() == 1 {
+        return M::from_compact_bytes(params, &chunk_bytes[0]);
+    }
+    let mut chunk_iter = chunk_bytes.into_iter().map(|bytes| M::from_compact_bytes(params, &bytes));
+    let first = chunk_iter.next().expect("slot-transfer chunk byte list must be non-empty");
+    first.concat_columns_owned(chunk_iter.collect())
+}
+
+fn output_slot_for_params_gpu<M, HS>(
     evaluator: &BggPolyEncodingSTEvaluator<M, HS>,
+    params: &<M::P as Poly>::Params,
     input: &BggPolyEncoding<M>,
     plaintext_bytes_by_slot: &[Arc<[u8]>],
     src_slots: &[(u32, Option<u32>)],
     gate_id: GateId,
+    dst_slot: usize,
     shared_by_device: &[GpuSlotTransferSharedByDevice<M>],
-    slot_start: usize,
-    chunk_len: usize,
-) -> Vec<(Arc<[u8]>, Arc<[u8]>)>
+) -> (Arc<[u8]>, Arc<[u8]>)
 where
     M: PolyMatrix + Send + Sync,
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     M::P: Send + Sync,
     for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
 {
-    (0..chunk_len)
-        .into_par_iter()
-        .map(|offset| {
-            let device_shared = &shared_by_device[offset];
-            evaluator.output_slot_for_params(
-                &device_shared.params,
-                &device_shared.c_b0,
-                input,
-                plaintext_bytes_by_slot,
-                src_slots,
-                &device_shared.out_pubkey_matrix,
-                gate_id,
-                slot_start + offset,
+    let (src_slot_u32, scalar) = src_slots[dst_slot];
+    let src_slot = usize::try_from(src_slot_u32).expect("source slot index must fit in usize");
+    assert!(
+        src_slot < input.num_slots(),
+        "source slot index {} out of range for input slot count {}",
+        src_slot,
+        input.num_slots()
+    );
+
+    let input_vector = M::from_compact_bytes(params, input.vector_bytes[src_slot].as_ref());
+    let secret_size = shared_by_device[0].out_pubkey_matrix.row_size();
+    let src_plaintext =
+        M::P::from_compact_bytes(params, plaintext_bytes_by_slot[src_slot].as_ref());
+    let constant_term = src_plaintext
+        .coeffs_biguints()
+        .into_iter()
+        .next()
+        .expect("plaintext polynomial must contain a constant coefficient");
+    drop(src_plaintext);
+    let mut output_plaintext = M::P::from_biguint_to_constant(params, constant_term);
+    let dir = evaluator.dir_path.as_path();
+
+    let slot_preimage_b0_total_cols = trapdoor_public_column_count::<M>(params, secret_size * 2);
+    let slot_preimage_b0_chunk_bytes = collect_chunk_bytes_by_device(
+        shared_by_device,
+        column_chunk_count(slot_preimage_b0_total_cols),
+        |shared, chunk_idx| {
+            left_mul_chunked_checkpoint_column(
+                &shared.params,
+                dir,
+                &evaluator.slot_preimage_b0_id_prefix(src_slot),
+                slot_preimage_b0_total_cols,
+                chunk_idx,
+                &shared.c_b0,
             )
-        })
-        .collect::<Vec<_>>()
+            .into_compact_bytes()
+        },
+    );
+    let c_b0_slot_preimage_b0: M = concat_chunk_bytes_on_base(params, slot_preimage_b0_chunk_bytes);
+    let c_b0_slot_preimage_b0_bytes = Arc::<[u8]>::from(c_b0_slot_preimage_b0.to_compact_bytes());
+
+    let slot_preimage_b1_total_cols = secret_size * params.modulus_digits();
+    let c_transfer_chunk_bytes = collect_chunk_bytes_by_device(
+        shared_by_device,
+        column_chunk_count(slot_preimage_b1_total_cols),
+        |shared, chunk_idx| {
+            let local_c_b0_slot_preimage_b0 =
+                M::from_compact_bytes(&shared.params, c_b0_slot_preimage_b0_bytes.as_ref());
+            let slot_preimage_b1_chunk = read_matrix_column_chunk::<M>(
+                &shared.params,
+                dir,
+                &evaluator.slot_preimage_b1_id_prefix(dst_slot),
+                slot_preimage_b1_total_cols,
+                chunk_idx,
+            );
+            (&local_c_b0_slot_preimage_b0 * &slot_preimage_b1_chunk).into_compact_bytes()
+        },
+    );
+    let c_transfer: M = concat_chunk_bytes_on_base(params, c_transfer_chunk_bytes);
+
+    let out_pubkey_matrix = &shared_by_device[0].out_pubkey_matrix;
+    let slot_a = evaluator.slot_a_for_params(params, out_pubkey_matrix.row_size(), dst_slot);
+    let slot_a_decomposed = slot_a.decompose();
+    drop(slot_a);
+    let transfer_plaintext_term = c_transfer.clone() * &output_plaintext;
+    let mut pre_out = (&input_vector * &slot_a_decomposed) + &transfer_plaintext_term;
+    drop(input_vector);
+    drop(slot_a_decomposed);
+    drop(transfer_plaintext_term);
+    drop(c_transfer);
+
+    if let Some(scalar) = scalar {
+        let scalar_poly = M::P::from_usize_to_constant(params, scalar as usize);
+        pre_out = pre_out * &scalar_poly;
+        output_plaintext = output_plaintext * &scalar_poly;
+    }
+
+    let gate_total_cols = secret_size * params.modulus_digits();
+    let gate_chunk_bytes = collect_chunk_bytes_by_device(
+        shared_by_device,
+        column_chunk_count(gate_total_cols),
+        |shared, chunk_idx| {
+            left_mul_chunked_checkpoint_column(
+                &shared.params,
+                dir,
+                &evaluator.gate_preimage_id_prefix(gate_id, dst_slot),
+                gate_total_cols,
+                chunk_idx,
+                &shared.c_b0,
+            )
+            .into_compact_bytes()
+        },
+    );
+    let c_gate: M = concat_chunk_bytes_on_base(params, gate_chunk_bytes);
+    let out_vector: M = c_gate + &pre_out;
+    drop(pre_out);
+
+    (
+        Arc::<[u8]>::from(out_vector.into_compact_bytes()),
+        Arc::<[u8]>::from(output_plaintext.to_compact_bytes()),
+    )
 }
 
 pub(super) fn evaluate_slot_transfer_slots_gpu<M, HS>(
@@ -107,26 +239,22 @@ where
         out_pubkey.matrix.row_size(),
         configured_parallelism,
     );
-    let chunk_width = shared_by_device.len();
     let mut output_vector_bytes = Vec::with_capacity(slot_count);
     let mut output_plaintext_bytes = Vec::with_capacity(slot_count);
 
-    for slot_start in (0..slot_count).step_by(chunk_width.max(1)) {
-        let chunk_len = (slot_start + chunk_width).min(slot_count) - slot_start;
-        let chunk_outputs = evaluate_slot_transfer_chunk_gpu::<M, HS>(
+    for dst_slot in 0..slot_count {
+        let (vector_bytes, plaintext_bytes) = output_slot_for_params_gpu::<M, HS>(
             evaluator,
+            params,
             input,
             plaintext_bytes_by_slot,
             src_slots,
             gate_id,
+            dst_slot,
             &shared_by_device,
-            slot_start,
-            chunk_len,
         );
-        let (chunk_vector_bytes, chunk_plaintext_bytes): (Vec<_>, Vec<_>) =
-            chunk_outputs.into_iter().unzip();
-        output_vector_bytes.extend(chunk_vector_bytes);
-        output_plaintext_bytes.extend(chunk_plaintext_bytes);
+        output_vector_bytes.push(vector_bytes);
+        output_plaintext_bytes.push(plaintext_bytes);
     }
 
     (output_vector_bytes, output_plaintext_bytes)

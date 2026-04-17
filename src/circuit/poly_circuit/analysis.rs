@@ -699,6 +699,7 @@ impl<P: Poly> PolyCircuit<P> {
         input_set_id: usize,
         node_levels: &mut HashMap<GroupedCallExecutionNodeId, usize>,
         input_set_levels: &mut HashMap<usize, Option<usize>>,
+        reachable_inputs: &mut BTreeSet<GateId>,
         visiting: &mut HashSet<GroupedCallExecutionNodeId>,
         levels: &mut Vec<GroupedCallExecutionLayer>,
     ) -> Option<usize> {
@@ -716,6 +717,7 @@ impl<P: Poly> PolyCircuit<P> {
                     dep_node,
                     node_levels,
                     input_set_levels,
+                    reachable_inputs,
                     visiting,
                     levels,
                 );
@@ -725,6 +727,7 @@ impl<P: Poly> PolyCircuit<P> {
                 });
             } else {
                 has_input_dependency = true;
+                self.record_reachable_input(input_id, reachable_inputs);
             }
         }
         let max_dependency_level = if has_input_dependency {
@@ -741,6 +744,7 @@ impl<P: Poly> PolyCircuit<P> {
         node: GroupedCallExecutionNodeId,
         node_levels: &mut HashMap<GroupedCallExecutionNodeId, usize>,
         input_set_levels: &mut HashMap<usize, Option<usize>>,
+        reachable_inputs: &mut BTreeSet<GateId>,
         visiting: &mut HashSet<GroupedCallExecutionNodeId>,
         levels: &mut Vec<GroupedCallExecutionLayer>,
     ) -> usize {
@@ -767,12 +771,14 @@ impl<P: Poly> PolyCircuit<P> {
                             dep_node,
                             node_levels,
                             input_set_levels,
+                            reachable_inputs,
                             visiting,
                             levels,
                         );
                         update_dep_level(dep_level);
                     } else {
                         has_input_dependency = true;
+                        self.record_reachable_input(input_id, reachable_inputs);
                     }
                 }
             }
@@ -784,6 +790,7 @@ impl<P: Poly> PolyCircuit<P> {
                             input_set_id,
                             node_levels,
                             input_set_levels,
+                            reachable_inputs,
                             visiting,
                             levels,
                         )
@@ -797,12 +804,14 @@ impl<P: Poly> PolyCircuit<P> {
                             dep_node,
                             node_levels,
                             input_set_levels,
+                            reachable_inputs,
                             visiting,
                             levels,
                         );
                         update_dep_level(dep_level);
                     } else {
                         has_input_dependency = true;
+                        self.record_reachable_input(input_id, reachable_inputs);
                     }
                 }
             }
@@ -817,6 +826,7 @@ impl<P: Poly> PolyCircuit<P> {
                             input_set_id,
                             node_levels,
                             input_set_levels,
+                            reachable_inputs,
                             visiting,
                             levels,
                         )
@@ -851,6 +861,38 @@ impl<P: Poly> PolyCircuit<P> {
         level
     }
 
+    fn record_reachable_input(&self, gate_id: GateId, reachable_inputs: &mut BTreeSet<GateId>) {
+        if gate_id.0 != 0 && matches!(self.gate(gate_id).gate_type, PolyGateType::Input) {
+            reachable_inputs.insert(gate_id);
+        }
+    }
+
+    fn build_grouped_execution_plan(&self) -> GroupedExecutionPlan {
+        let mut node_levels: HashMap<GroupedCallExecutionNodeId, usize> = HashMap::new();
+        let mut input_set_levels: HashMap<usize, Option<usize>> = HashMap::new();
+        let mut levels = Vec::<GroupedCallExecutionLayer>::new();
+        let mut reachable_inputs = BTreeSet::<GateId>::new();
+        let mut visiting = HashSet::new();
+        for &output_gate in &self.output_ids {
+            let Some(node) = self.grouped_execution_node_for_gate(output_gate) else {
+                self.record_reachable_input(output_gate, &mut reachable_inputs);
+                continue;
+            };
+            self.populate_grouped_execution_node_level(
+                node,
+                &mut node_levels,
+                &mut input_set_levels,
+                &mut reachable_inputs,
+                &mut visiting,
+                &mut levels,
+            );
+        }
+        GroupedExecutionPlan {
+            layers: levels,
+            reachable_input_gate_ids: reachable_inputs.into_iter().collect(),
+        }
+    }
+
     /// Build the grouped execution schedule shared by `non_free_depth()` and `eval_error`.
     ///
     /// The generic circuit-level planner lives here because the grouping itself is purely
@@ -859,39 +901,11 @@ impl<P: Poly> PolyCircuit<P> {
     /// depths, while `eval_error` reuses the same grouping to propagate symbolic or concrete error
     /// values.
     pub(crate) fn grouped_execution_layers(&self) -> Vec<GroupedCallExecutionLayer> {
-        let mut node_levels: HashMap<GroupedCallExecutionNodeId, usize> = HashMap::new();
-        let mut input_set_levels: HashMap<usize, Option<usize>> = HashMap::new();
-        let mut levels = Vec::<GroupedCallExecutionLayer>::new();
-        let mut visiting = HashSet::new();
-        for &output_gate in &self.output_ids {
-            let Some(node) = self.grouped_execution_node_for_gate(output_gate) else {
-                continue;
-            };
-            self.populate_grouped_execution_node_level(
-                node,
-                &mut node_levels,
-                &mut input_set_levels,
-                &mut visiting,
-                &mut levels,
-            );
-        }
-        levels
+        self.build_grouped_execution_plan().layers
     }
 
-    /// Return the reachable non-constant input gates needed to produce the current outputs.
-    ///
-    /// `grouped_execution_layers()` intentionally excludes input gates because both
-    /// `non_free_depth()` and `eval_error` preload them before layered execution starts. Some
-    /// callers, notably `bench_estimator`, still need to charge an explicit input layer, so this
-    /// helper exposes the reachable real inputs without reviving the old placeholder-based
-    /// `execution_layers()` API.
-    pub(crate) fn reachable_input_gate_ids(&self) -> Vec<GateId> {
-        self.topological_order()
-            .into_iter()
-            .filter(|gate_id| {
-                matches!(self.gate(*gate_id).gate_type, PolyGateType::Input) && gate_id.0 != 0
-            })
-            .collect()
+    pub(crate) fn grouped_execution_plan(&self) -> GroupedExecutionPlan {
+        self.build_grouped_execution_plan()
     }
 
     /// Returns the circuit depth defined as the maximum level index among

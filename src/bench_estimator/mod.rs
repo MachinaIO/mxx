@@ -33,7 +33,8 @@ use tracing::debug;
 
 use crate::{
     circuit::{
-        Evaluable, GroupedCallExecutionLayer, PolyCircuit, PolyGateType, SubCircuitParamValue,
+        Evaluable, GroupedCallExecutionLayer, GroupedExecutionPlan, PolyCircuit, PolyGateType,
+        SubCircuitParamValue,
     },
     poly::Poly,
 };
@@ -390,7 +391,9 @@ where
     let mut estimate = CircuitBenchSummary::new(0.0, 0.0, 0);
     #[cfg(feature = "gpu")]
     let mut peak_vram = 0;
-    let reachable_inputs = circuit.reachable_input_gate_ids();
+    let grouped_plan = circuit.grouped_execution_plan();
+    let GroupedExecutionPlan { layers: grouped_layers, reachable_input_gate_ids: reachable_inputs } =
+        grouped_plan;
     debug!(
         "estimate_circuit_bench cache miss: circuit_ptr={}, param_bindings={}, reachable_inputs={} starting input estimate",
         circuit_key.circuit_ptr,
@@ -424,15 +427,12 @@ where
             estimate.max_parallelism
         );
     }
-
-    let grouped_layers_start = Instant::now();
-    let grouped_layers = circuit.grouped_execution_layers();
     debug!(
         "estimate_circuit_bench grouped layers ready: circuit_ptr={}, param_bindings={}, layer_count={}, elapsed_ms={:.3}",
         circuit_key.circuit_ptr,
         param_bindings.len(),
         grouped_layers.len(),
-        grouped_layers_start.elapsed().as_secs_f64() * 1000.0
+        start.elapsed().as_secs_f64() * 1000.0
     );
 
     for (

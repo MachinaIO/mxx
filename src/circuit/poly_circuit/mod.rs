@@ -379,6 +379,12 @@ pub(crate) struct GroupedCallExecutionLayer {
     pub(crate) summed_sub_circuit_call_ids: Vec<usize>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GroupedExecutionPlan {
+    pub(crate) layers: Vec<GroupedCallExecutionLayer>,
+    pub(crate) reachable_input_gate_ids: Vec<GateId>,
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) struct NonFreeDepthCacheKey {
     circuit_key: usize,

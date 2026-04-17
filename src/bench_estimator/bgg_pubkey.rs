@@ -51,11 +51,20 @@ impl SampleAuxBenchEstimate {
     }
 }
 
-pub trait PublicLutSampleAuxBenchEstimator {
+pub trait PublicLutSampleAuxBenchEstimator<M: PolyMatrix> {
     type Params;
 
     fn sample_aux_matrices_lut_entry_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate;
     fn sample_aux_matrices_lut_gate_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate;
+    fn write_dummy_aux_for_poly_encode_bench(
+        &self,
+        params: &Self::Params,
+        plt: &PublicLut<M::P>,
+        used_inputs: &[u64],
+        lut_id: usize,
+        gate_id: GateId,
+        error_sigma: f64,
+    );
 
     fn benchmark_public_lut_gate_time<R, F>(&self, iterations: usize, op: F) -> f64
     where
@@ -65,11 +74,17 @@ pub trait PublicLutSampleAuxBenchEstimator {
     }
 }
 
-pub trait SlotTransferSampleAuxBenchEstimator {
+pub trait SlotTransferSampleAuxBenchEstimator<M: PolyMatrix> {
     type Params;
 
     fn sample_aux_matrices_slot_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate;
     fn sample_aux_matrices_gate_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate;
+    fn write_dummy_aux_for_poly_encode_bench(
+        &self,
+        params: &Self::Params,
+        gate_id: GateId,
+        error_sigma: f64,
+    );
 
     fn benchmark_slot_transfer_gate_time<R, F>(&self, iterations: usize, op: F) -> f64
     where
@@ -104,8 +119,8 @@ pub struct BggPublicKeyBenchSamples<'a, M: PolyMatrix> {
 pub struct BggPublicKeyBenchEstimator<M, PLE, STE>
 where
     M: PolyMatrix,
-    PLE: PublicLutSampleAuxBenchEstimator<Params = <M::P as Poly>::Params>,
-    STE: SlotTransferSampleAuxBenchEstimator<Params = <M::P as Poly>::Params>,
+    PLE: PublicLutSampleAuxBenchEstimator<M, Params = <M::P as Poly>::Params>,
+    STE: SlotTransferSampleAuxBenchEstimator<M, Params = <M::P as Poly>::Params>,
 {
     pub input_time: f64,
     pub input_peak_vram: usize,
@@ -131,8 +146,8 @@ where
 impl<M, PLE, STE> BggPublicKeyBenchEstimator<M, PLE, STE>
 where
     M: PolyMatrix,
-    PLE: PublicLutSampleAuxBenchEstimator<Params = <M::P as Poly>::Params>,
-    STE: SlotTransferSampleAuxBenchEstimator<Params = <M::P as Poly>::Params>,
+    PLE: PublicLutSampleAuxBenchEstimator<M, Params = <M::P as Poly>::Params>,
+    STE: SlotTransferSampleAuxBenchEstimator<M, Params = <M::P as Poly>::Params>,
 {
     pub fn benchmark<PE, SE>(
         samples: &BggPublicKeyBenchSamples<'_, M>,
@@ -272,8 +287,8 @@ where
 impl<M, PLE, STE> BenchEstimator<BggPublicKey<M>> for BggPublicKeyBenchEstimator<M, PLE, STE>
 where
     M: PolyMatrix,
-    PLE: PublicLutSampleAuxBenchEstimator<Params = <M::P as Poly>::Params>,
-    STE: SlotTransferSampleAuxBenchEstimator<Params = <M::P as Poly>::Params>,
+    PLE: PublicLutSampleAuxBenchEstimator<M, Params = <M::P as Poly>::Params>,
+    STE: SlotTransferSampleAuxBenchEstimator<M, Params = <M::P as Poly>::Params>,
 {
     fn estimate_input(&self) -> CircuitBenchEstimate {
         per_gate_time_estimate(self.input_time, self.input_peak_vram)
@@ -319,6 +334,8 @@ mod tests {
             BenchEstimator, CircuitBenchEstimate, PublicLutSampleAuxBenchEstimator,
             SampleAuxBenchEstimate, SlotTransferSampleAuxBenchEstimator,
         },
+        circuit::gate::GateId,
+        lookup::PublicLut,
         matrix::dcrt_poly::DCRTPolyMatrix,
         poly::{Poly, dcrt::poly::DCRTPoly},
     };
@@ -354,7 +371,7 @@ mod tests {
 
     struct DummyPublicLutEstimator;
 
-    impl PublicLutSampleAuxBenchEstimator for DummyPublicLutEstimator {
+    impl PublicLutSampleAuxBenchEstimator<DCRTPolyMatrix> for DummyPublicLutEstimator {
         type Params = <DCRTPoly as Poly>::Params;
 
         fn sample_aux_matrices_lut_entry_time(
@@ -379,6 +396,18 @@ mod tests {
             }
         }
 
+        fn write_dummy_aux_for_poly_encode_bench(
+            &self,
+            _params: &Self::Params,
+            _plt: &PublicLut<DCRTPoly>,
+            _used_inputs: &[u64],
+            _lut_id: usize,
+            _gate_id: GateId,
+            _error_sigma: f64,
+        ) {
+            panic!("dummy public-lut estimator does not write synthetic checkpoints")
+        }
+
         fn benchmark_public_lut_gate_time<R, F>(&self, _iterations: usize, _op: F) -> f64
         where
             F: FnMut() -> R,
@@ -389,7 +418,7 @@ mod tests {
 
     struct DummySlotTransferEstimator;
 
-    impl SlotTransferSampleAuxBenchEstimator for DummySlotTransferEstimator {
+    impl SlotTransferSampleAuxBenchEstimator<DCRTPolyMatrix> for DummySlotTransferEstimator {
         type Params = <DCRTPoly as Poly>::Params;
 
         fn sample_aux_matrices_slot_time(&self, _params: &Self::Params) -> SampleAuxBenchEstimate {
@@ -406,6 +435,15 @@ mod tests {
                 total_time: 31.0,
                 compact_bytes: BigUint::from(37u32),
             }
+        }
+
+        fn write_dummy_aux_for_poly_encode_bench(
+            &self,
+            _params: &Self::Params,
+            _gate_id: GateId,
+            _error_sigma: f64,
+        ) {
+            panic!("dummy slot-transfer estimator does not write synthetic checkpoints")
         }
 
         fn benchmark_slot_transfer_gate_time<R, F>(&self, _iterations: usize, _op: F) -> f64

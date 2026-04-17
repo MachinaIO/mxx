@@ -379,6 +379,82 @@ where
         add_lookup_buffer(get_lookup_buffer_bytes(vec![(chunk_idx, bytes)], id_prefix));
     }
 
+    fn synthetic_checkpoint_sigma(error_sigma: f64) -> f64 {
+        if error_sigma > 0.0 { error_sigma } else { 1.0 }
+    }
+
+    pub(crate) fn write_dummy_aux_for_poly_encode_bench_impl(
+        &self,
+        params: &<M::P as Poly>::Params,
+        gate_id: GateId,
+        error_sigma: f64,
+    ) {
+        let sigma = Self::synthetic_checkpoint_sigma(error_sigma);
+        let secret_size = self.secret_size;
+        let modulus_digits = params.modulus_digits();
+        let b0_public_cols = trapdoor_public_column_count::<M>(params, secret_size);
+        let slot_preimage_b0_total_cols =
+            trapdoor_public_column_count::<M>(params, secret_size * 2);
+        let slot_preimage_b1_total_cols = secret_size * modulus_digits;
+        let uniform_sampler = US::new();
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+
+        let slot_secret_mat =
+            uniform_sampler.sample_uniform(params, secret_size, secret_size, DistType::TernaryDist);
+        Self::store_bytes_checkpoint(
+            slot_secret_mat.to_compact_bytes(),
+            &self.slot_secret_mat_id_prefix(params, 0),
+        );
+
+        let (_b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, secret_size);
+        Self::store_matrix_checkpoint(b0_matrix, &self.b0_id_prefix(params));
+
+        let slot_preimage_b0_prefix = self.slot_preimage_b0_id_prefix(params, 0);
+        for chunk_idx in 0..column_chunk_count(slot_preimage_b0_total_cols) {
+            let (_, col_len) = column_chunk_bounds(slot_preimage_b0_total_cols, chunk_idx);
+            let preimage_chunk = uniform_sampler.sample_uniform(
+                params,
+                b0_public_cols,
+                col_len,
+                DistType::GaussDist { sigma },
+            );
+            Self::store_matrix_checkpoint(
+                preimage_chunk,
+                &column_chunk_id_prefix(&slot_preimage_b0_prefix, chunk_idx),
+            );
+        }
+
+        let slot_preimage_b1_prefix = self.slot_preimage_b1_id_prefix(params, 0);
+        for chunk_idx in 0..column_chunk_count(slot_preimage_b1_total_cols) {
+            let (_, col_len) = column_chunk_bounds(slot_preimage_b1_total_cols, chunk_idx);
+            let preimage_chunk = uniform_sampler.sample_uniform(
+                params,
+                slot_preimage_b0_total_cols,
+                col_len,
+                DistType::GaussDist { sigma },
+            );
+            Self::store_matrix_checkpoint(
+                preimage_chunk,
+                &column_chunk_id_prefix(&slot_preimage_b1_prefix, chunk_idx),
+            );
+        }
+
+        let gate_preimage_prefix = self.gate_preimage_id_prefix(params, gate_id, 0);
+        for chunk_idx in 0..column_chunk_count(slot_preimage_b1_total_cols) {
+            let (_, col_len) = column_chunk_bounds(slot_preimage_b1_total_cols, chunk_idx);
+            let preimage_chunk = uniform_sampler.sample_uniform(
+                params,
+                b0_public_cols,
+                col_len,
+                DistType::GaussDist { sigma },
+            );
+            Self::store_matrix_checkpoint(
+                preimage_chunk,
+                &column_chunk_id_prefix(&gate_preimage_prefix, chunk_idx),
+            );
+        }
+    }
+
     fn load_matrix_checkpoint(
         &self,
         params: &<M::P as Poly>::Params,
@@ -892,7 +968,8 @@ where
 }
 
 #[cfg(not(feature = "gpu"))]
-impl<M, US, HS, TS> SlotTransferSampleAuxBenchEstimator for BggPublicKeySTEvaluator<M, US, HS, TS>
+impl<M, US, HS, TS> SlotTransferSampleAuxBenchEstimator<M>
+    for BggPublicKeySTEvaluator<M, US, HS, TS>
 where
     M: PolyMatrix,
     US: PolyUniformSampler<M = M> + Send + Sync,
@@ -1003,6 +1080,15 @@ where
         let first_chunk_bytes = preimage_chunk.into_compact_bytes();
         let elapsed = start.elapsed().as_secs_f64();
         SampleAuxBenchEstimate::from_chunk(elapsed, total_chunk_count, first_chunk_bytes.len())
+    }
+
+    fn write_dummy_aux_for_poly_encode_bench(
+        &self,
+        params: &Self::Params,
+        gate_id: GateId,
+        error_sigma: f64,
+    ) {
+        self.write_dummy_aux_for_poly_encode_bench_impl(params, gate_id, error_sigma);
     }
 }
 

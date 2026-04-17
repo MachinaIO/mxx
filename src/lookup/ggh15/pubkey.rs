@@ -999,6 +999,108 @@ where
         self.aux_checkpoint_prefix(params)
     }
 
+    fn synthetic_checkpoint_sigma(error_sigma: f64) -> f64 {
+        if error_sigma > 0.0 { error_sigma } else { 1.0 }
+    }
+
+    fn store_matrix_checkpoint(matrix: M, id_prefix: &str) {
+        let _ = add_lookup_buffer(get_lookup_buffer(vec![(0, matrix)], id_prefix));
+    }
+
+    fn store_matrix_chunk_checkpoint(matrix: M, id_prefix: &str, chunk_idx: usize) {
+        Self::store_matrix_checkpoint(matrix, &column_chunk_id_prefix(id_prefix, chunk_idx));
+    }
+
+    pub(crate) fn write_dummy_aux_for_poly_encode_bench_impl(
+        &self,
+        params: &<M::P as Poly>::Params,
+        plt: &PublicLut<M::P>,
+        used_inputs: &[u64],
+        lut_id: usize,
+        gate_id: GateId,
+        error_sigma: f64,
+    ) {
+        let sigma = Self::synthetic_checkpoint_sigma(error_sigma);
+        let d = self.d;
+        let m_g = d * params.modulus_digits();
+        let m_b = trapdoor_public_column_count::<M>(params, d);
+        let k_small = small_gadget_chunk_count::<M>(params);
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let uniform_sampler = US::new();
+        let (_b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, d);
+        Self::store_matrix_checkpoint(
+            b0_matrix,
+            &format!("{}_b0", self.aux_checkpoint_prefix(params)),
+        );
+
+        let mut lut_row_ids = used_inputs
+            .iter()
+            .map(|&x| {
+                let (row_idx, _) = plt.get(params, x).unwrap_or_else(|| {
+                    panic!("synthetic poly-bench checkpoint input {x} missing from LUT")
+                });
+                usize::try_from(row_idx).expect("LUT row index must fit usize")
+            })
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        lut_row_ids.sort_unstable();
+        let lut_aux_prefix = self.lut_aux_id_prefix(params, lut_id);
+        for row_idx in lut_row_ids {
+            let row_prefix = format!("{lut_aux_prefix}_idx{row_idx}");
+            for chunk_idx in 0..column_chunk_count(m_g) {
+                let (_, col_len) = column_chunk_bounds(m_g, chunk_idx);
+                let preimage_chunk = uniform_sampler.sample_uniform(
+                    params,
+                    m_b,
+                    col_len,
+                    DistType::GaussDist { sigma },
+                );
+                Self::store_matrix_chunk_checkpoint(preimage_chunk, &row_prefix, chunk_idx);
+            }
+        }
+
+        let gate1_prefix = self.preimage_gate1_id_prefix(params, gate_id);
+        for chunk_idx in 0..column_chunk_count(m_b) {
+            let (_, col_len) = column_chunk_bounds(m_b, chunk_idx);
+            let preimage_chunk =
+                uniform_sampler.sample_uniform(params, m_b, col_len, DistType::GaussDist { sigma });
+            Self::store_matrix_chunk_checkpoint(preimage_chunk, &gate1_prefix, chunk_idx);
+        }
+
+        for id_prefix in [
+            self.preimage_gate2_identity_id_prefix(params, gate_id),
+            self.preimage_gate2_gy_id_prefix(params, gate_id),
+            self.preimage_gate2_v_id_prefix(params, gate_id),
+        ] {
+            for chunk_idx in 0..column_chunk_count(m_g) {
+                let (_, col_len) = column_chunk_bounds(m_g, chunk_idx);
+                let preimage_chunk = uniform_sampler.sample_uniform(
+                    params,
+                    m_b,
+                    col_len,
+                    DistType::GaussDist { sigma },
+                );
+                Self::store_matrix_chunk_checkpoint(preimage_chunk, &id_prefix, chunk_idx);
+            }
+        }
+
+        for small_chunk_idx in 0..k_small {
+            let vx_prefix =
+                self.preimage_gate2_vx_small_id_prefix(params, gate_id, small_chunk_idx);
+            for chunk_idx in 0..column_chunk_count(m_g) {
+                let (_, col_len) = column_chunk_bounds(m_g, chunk_idx);
+                let preimage_chunk = uniform_sampler.sample_uniform(
+                    params,
+                    m_b,
+                    col_len,
+                    DistType::GaussDist { sigma },
+                );
+                Self::store_matrix_chunk_checkpoint(preimage_chunk, &vx_prefix, chunk_idx);
+            }
+        }
+    }
+
     fn load_checkpoint_index(&self) -> Option<GlobalTableIndex> {
         let index_path = self.dir_path.join("lookup_tables.index");
         match read_to_string(&index_path) {
@@ -1909,7 +2011,8 @@ resuming is disabled and auxiliary matrices will be resampled from scratch",
 }
 
 #[cfg(not(feature = "gpu"))]
-impl<M, US, HS, TS> PublicLutSampleAuxBenchEstimator for GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
+impl<M, US, HS, TS> PublicLutSampleAuxBenchEstimator<M>
+    for GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
 where
     M: PolyMatrix + Send + Sync + 'static,
     US: PolyUniformSampler<M = M> + Send + Sync,
@@ -2068,6 +2171,25 @@ where
                 stage4_estimate.compact_bytes +
                 stage5_estimate.compact_bytes,
         }
+    }
+
+    fn write_dummy_aux_for_poly_encode_bench(
+        &self,
+        params: &Self::Params,
+        plt: &PublicLut<M::P>,
+        used_inputs: &[u64],
+        lut_id: usize,
+        gate_id: GateId,
+        error_sigma: f64,
+    ) {
+        self.write_dummy_aux_for_poly_encode_bench_impl(
+            params,
+            plt,
+            used_inputs,
+            lut_id,
+            gate_id,
+            error_sigma,
+        );
     }
 }
 

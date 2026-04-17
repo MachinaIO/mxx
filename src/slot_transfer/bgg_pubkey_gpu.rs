@@ -968,7 +968,8 @@ where
     }
 }
 
-impl<M, US, HS, TS> SlotTransferSampleAuxBenchEstimator for BggPublicKeySTEvaluator<M, US, HS, TS>
+impl<M, US, HS, TS> SlotTransferSampleAuxBenchEstimator<M>
+    for BggPublicKeySTEvaluator<M, US, HS, TS>
 where
     M: PolyMatrix + Send + Sync,
     US: PolyUniformSampler<M = M> + Send + Sync,
@@ -1129,6 +1130,15 @@ where
         let chunk_bytes = preimage_chunk.into_compact_bytes();
         let elapsed = start.elapsed().as_secs_f64();
         SampleAuxBenchEstimate::from_chunk(elapsed, total_chunk_count, chunk_bytes.len())
+    }
+
+    fn write_dummy_aux_for_poly_encode_bench(
+        &self,
+        params: &Self::Params,
+        gate_id: GateId,
+        error_sigma: f64,
+    ) {
+        self.write_dummy_aux_for_poly_encode_bench_impl(params, gate_id, error_sigma);
     }
 }
 

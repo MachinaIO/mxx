@@ -5,7 +5,8 @@ use keccak_asm::Keccak256;
 use mxx::{
     bench_estimator::{
         BenchEstimator, BggPolyEncodingBenchEstimator, BggPolyEncodingBenchSamples,
-        BggPublicKeyBenchEstimator, BggPublicKeyBenchSamples,
+        BggPublicKeyBenchEstimator, BggPublicKeyBenchSamples, PublicLutSampleAuxBenchEstimator,
+        SlotTransferSampleAuxBenchEstimator,
     },
     bgg::{
         public_key::BggPublicKey,
@@ -826,11 +827,23 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
         &poly_bench_slot_transfer_src_slots,
         poly_bench_slot_transfer_gate_id,
     );
+    let poly_bench_used_lut_inputs = [2u64];
     let poly_bench_aux_start = Instant::now();
-    poly_bench_pubkey_plt_evaluator.sample_aux_matrices(&params);
-    poly_bench_pubkey_slot_evaluator.sample_aux_matrices(&params);
+    poly_bench_pubkey_plt_evaluator.write_dummy_aux_for_poly_encode_bench(
+        &params,
+        &bench_lut,
+        &poly_bench_used_lut_inputs,
+        poly_bench_public_lut_id,
+        poly_bench_public_lut_gate_id,
+        cfg.error_sigma,
+    );
+    poly_bench_pubkey_slot_evaluator.write_dummy_aux_for_poly_encode_bench(
+        &params,
+        poly_bench_slot_transfer_gate_id,
+        cfg.error_sigma,
+    );
     info!(
-        "poly bench sample_aux_matrices elapsed_ms={:.3}",
+        "poly bench synthetic_aux_checkpoint_write elapsed_ms={:.3}",
         poly_bench_aux_start.elapsed().as_secs_f64() * 1000.0
     );
     wait_for_all_writes(poly_bench_dir.clone())

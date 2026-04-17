@@ -1229,7 +1229,8 @@ where
     }
 }
 
-impl<M, US, HS, TS> PublicLutSampleAuxBenchEstimator for GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
+impl<M, US, HS, TS> PublicLutSampleAuxBenchEstimator<M>
+    for GGH15BGGPubKeyPltEvaluator<M, US, HS, TS>
 where
     M: PolyMatrix + Send + Sync + 'static,
     US: PolyUniformSampler<M = M> + Send + Sync,
@@ -1385,6 +1386,25 @@ where
                 stage4_estimate.compact_bytes +
                 stage5_estimate.compact_bytes,
         }
+    }
+
+    fn write_dummy_aux_for_poly_encode_bench(
+        &self,
+        params: &Self::Params,
+        plt: &PublicLut<M::P>,
+        used_inputs: &[u64],
+        lut_id: usize,
+        gate_id: GateId,
+        error_sigma: f64,
+    ) {
+        self.write_dummy_aux_for_poly_encode_bench_impl(
+            params,
+            plt,
+            used_inputs,
+            lut_id,
+            gate_id,
+            error_sigma,
+        );
     }
 }
 

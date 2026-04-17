@@ -1,7 +1,10 @@
 use super::carry_arith::{CarryArithPoly, CarryArithPolyContext, encode_carry_arith_poly};
 use crate::{
     circuit::{BatchedWire, PolyCircuit, gate::GateId},
-    gadgets::arith::{ModularArithmeticContext, ModularArithmeticGadget},
+    gadgets::arith::{
+        DecomposeArithmeticGadget, ModularArithmeticContext, ModularArithmeticGadget,
+    },
+    matrix::PolyMatrix,
     poly::{Poly, PolyParams},
     utils::{mod_inverse, mod_inverse_biguints},
 };
@@ -174,6 +177,25 @@ impl<P: Poly + 'static> MontgomeryPolyContext<P> {
         let levels = self.active_range(enable_levels, level_offset).len();
         &self.reconst_coeffs[level_offset][levels - 1]
     }
+
+    fn active_modulus(&self, enable_levels: Option<usize>, level_offset: usize) -> BigUint {
+        self.q_moduli[self.active_range(enable_levels, level_offset)]
+            .par_iter()
+            .map(|&q_i| BigUint::from(q_i))
+            .reduce(BigUint::one, |acc, modulus| acc * modulus)
+    }
+
+    fn sparse_native_constant(
+        &self,
+        enable_levels: Option<usize>,
+        level_offset: usize,
+        target_q_idx: usize,
+        value: &BigUint,
+    ) -> BigUint {
+        let active_modulus = self.active_modulus(enable_levels, level_offset);
+        (value * &self.reconst_coeffs_for_window(enable_levels, level_offset)[target_q_idx]) %
+            active_modulus
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +276,10 @@ impl<P: Poly + 'static> MontgomeryPoly<P> {
 
     fn zero_level(ctx: &MontgomeryPolyContext<P>) -> CarryArithPoly<P> {
         CarryArithPoly::zero(ctx.carry_arith_ctx.clone(), Self::bit_size(ctx))
+    }
+
+    fn digit_radix(ctx: &MontgomeryPolyContext<P>) -> BigUint {
+        BigUint::one() << ctx.carry_arith_ctx.limb_bit_size
     }
 
     fn active_range(&self) -> std::ops::Range<usize> {
@@ -454,6 +480,77 @@ impl<P: Poly + 'static> MontgomeryPoly<P> {
     pub fn active_q_moduli(&self) -> Vec<u64> {
         self.ctx.q_moduli[self.active_range()].to_vec()
     }
+
+    fn digit_value_poly(
+        ctx: &MontgomeryPolyContext<P>,
+        digit_gate: GateId,
+        circuit: &mut PolyCircuit<P>,
+    ) -> CarryArithPoly<P> {
+        let mut limbs = vec![circuit.const_zero_gate().as_single_wire(); ctx.num_limbs];
+        limbs[0] = digit_gate;
+        CarryArithPoly::new(ctx.carry_arith_ctx.clone(), limbs)
+    }
+
+    fn sparse_regular_level_poly_with_metadata(
+        ctx: Arc<MontgomeryPolyContext<P>>,
+        active_levels: usize,
+        enable_levels: Option<usize>,
+        level_offset: usize,
+        target_q_idx: usize,
+        target_value: CarryArithPoly<P>,
+        max_plaintext: BigUint,
+        p_max_trace: BigUint,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        assert!(target_q_idx < active_levels, "target_q_idx must lie within active_levels");
+        let mut values =
+            (0..active_levels).map(|_| Self::zero_level(ctx.as_ref())).collect::<Vec<_>>();
+        values[target_q_idx] = Self::pad_value(ctx.as_ref(), target_value);
+        let mont = Self::from_regular_values(
+            circuit,
+            ctx.clone(),
+            values,
+            enable_levels,
+            Some(level_offset),
+        );
+        let mut max_plaintexts = vec![BigUint::ZERO; active_levels];
+        let mut p_max_traces = vec![BigUint::ZERO; active_levels];
+        max_plaintexts[target_q_idx] = max_plaintext;
+        p_max_traces[target_q_idx] = p_max_trace;
+        Self::with_metadata(
+            ctx,
+            mont.value,
+            enable_levels,
+            Some(level_offset),
+            max_plaintexts,
+            p_max_traces,
+        )
+    }
+
+    fn native_sparse_gadget_constant(
+        params: &P::Params,
+        ctx: &MontgomeryPolyContext<P>,
+        enable_levels: Option<usize>,
+        level_offset: usize,
+        target_q_idx: usize,
+        value: &BigUint,
+    ) -> P {
+        P::from_biguint_to_constant(
+            params,
+            ctx.sparse_native_constant(enable_levels, level_offset, target_q_idx, value),
+        )
+    }
+
+    fn decompose_regular_value(ctx: &MontgomeryPolyContext<P>, value: &BigUint) -> Vec<BigUint> {
+        let radix = Self::digit_radix(ctx);
+        let mut digits = Vec::with_capacity(ctx.num_limbs);
+        let mut remaining = value.clone();
+        for _ in 0..ctx.num_limbs {
+            digits.push(&remaining % &radix);
+            remaining /= &radix;
+        }
+        digits
+    }
 }
 
 impl<P: Poly + 'static> ModularArithmeticContext<P> for MontgomeryPolyContext<P> {
@@ -474,7 +571,7 @@ impl<P: Poly + 'static> ModularArithmeticContext<P> for MontgomeryPolyContext<P>
     }
 
     fn decomposition_len(&self) -> usize {
-        1
+        self.num_limbs
     }
 
     fn q_level_row_width(&self) -> usize {
@@ -504,7 +601,7 @@ impl<P: Poly + 'static> ModularArithmeticContext<P> for MontgomeryPolyContext<P>
     }
 
     fn decomposition_term_bound(&self, _term_idx: usize) -> BigUint {
-        BigUint::from(1u64)
+        MontgomeryPoly::<P>::digit_radix(self) - BigUint::from(1u64)
     }
 
     fn full_reduce_level_plaintext_bound(&self, q_idx: usize) -> BigUint {
@@ -764,32 +861,100 @@ impl<P: Poly + 'static> ModularArithmeticGadget<P> for MontgomeryPoly<P> {
     }
 }
 
-/* impl<P: Poly + 'static> DecomposeArithmeticGadget<P> for MontgomeryPoly<P> {
+impl<P: Poly + 'static> DecomposeArithmeticGadget<P> for MontgomeryPoly<P> {
     fn gadget_matrix<M: PolyMatrix<P = P>>(
         params: &P::Params,
-        _ctx: &Self::Context,
-        _enable_levels: Option<usize>,
-        _level_offset: Option<usize>,
+        ctx: &Self::Context,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
     ) -> M {
-        M::from_poly_vec_row(params, vec![P::const_one(params)])
+        let level_offset = level_offset.unwrap_or(0);
+        let active_levels = ctx.active_levels(enable_levels, Some(level_offset));
+        let radix = Self::digit_radix(ctx);
+        let row = (0..active_levels * ctx.num_limbs)
+            .into_par_iter()
+            .map(|entry_idx| {
+                let q_idx = entry_idx / ctx.num_limbs;
+                let digit_idx = entry_idx % ctx.num_limbs;
+                let value = radix
+                    .pow(u32::try_from(digit_idx).expect("Montgomery digit index must fit in u32"));
+                Self::native_sparse_gadget_constant(
+                    params,
+                    ctx,
+                    enable_levels,
+                    level_offset,
+                    q_idx,
+                    &value,
+                )
+            })
+            .collect::<Vec<_>>();
+        M::from_poly_vec_row(params, row)
     }
 
     fn gadget_decomposed<M: PolyMatrix<P = P>>(
-        _params: &P::Params,
-        _ctx: &Self::Context,
+        params: &P::Params,
+        ctx: &Self::Context,
         target: &M,
-        _enable_levels: Option<usize>,
-        _level_offset: Option<usize>,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
     ) -> M {
-        target.clone()
+        let level_offset = level_offset.unwrap_or(0);
+        let active_q_moduli = &ctx.q_moduli[ctx.active_range(enable_levels, level_offset)];
+        let gadget_len = active_q_moduli.len() * ctx.num_limbs;
+        let (row_size, col_size) = target.size();
+        let entry_polys = (0..row_size * col_size)
+            .into_par_iter()
+            .map(|entry_idx| {
+                let row_idx = entry_idx / col_size;
+                let col_idx = entry_idx % col_size;
+                let coeffs = target.entry(row_idx, col_idx).coeffs_biguints();
+                let mut output_polys =
+                    (0..gadget_len).map(|_| vec![BigUint::ZERO; coeffs.len()]).collect::<Vec<_>>();
+                for (coeff_idx, coeff) in coeffs.iter().enumerate() {
+                    for (q_idx, &q_i) in active_q_moduli.iter().enumerate() {
+                        let residue = coeff % BigUint::from(q_i);
+                        for (digit_idx, digit) in
+                            Self::decompose_regular_value(ctx, &residue).into_iter().enumerate()
+                        {
+                            let target_row = q_idx * ctx.num_limbs + digit_idx;
+                            output_polys[target_row][coeff_idx] = ctx.sparse_native_constant(
+                                enable_levels,
+                                level_offset,
+                                q_idx,
+                                &digit,
+                            );
+                        }
+                    }
+                }
+                (
+                    row_idx,
+                    col_idx,
+                    output_polys
+                        .into_iter()
+                        .map(|coeffs| P::from_biguints(params, &coeffs))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut decomposed = (0..row_size * gadget_len)
+            .map(|_| vec![P::const_zero(params); col_size])
+            .collect::<Vec<_>>();
+        for (row_idx, col_idx, output_polys) in entry_polys {
+            for (target_row, poly) in output_polys.into_iter().enumerate() {
+                decomposed[row_idx * gadget_len + target_row][col_idx] = poly;
+            }
+        }
+
+        M::from_poly_vec(params, decomposed)
     }
 
     fn gadget_decomposition_norm_bound(
-        _ctx: &Self::Context,
+        ctx: &Self::Context,
         _enable_levels: Option<usize>,
         _level_offset: Option<usize>,
     ) -> BigUint {
-        BigUint::from(1u64)
+        Self::digit_radix(ctx) - BigUint::from(1u64)
     }
 
     fn gadget_vector(
@@ -798,15 +963,74 @@ impl<P: Poly + 'static> ModularArithmeticGadget<P> for MontgomeryPoly<P> {
         level_offset: Option<usize>,
         circuit: &mut PolyCircuit<P>,
     ) -> Vec<Self> {
-        Self::validate_window(ctx.as_ref(), enable_levels, level_offset.unwrap_or(0));
-        let one = MontgomeryPolyContext::constant_carry_arith_poly(
-            circuit,
-            &ctx.params,
-            ctx.carry_arith_ctx.clone(),
-            ctx.num_limbs,
-            &BigUint::from(1u64),
-        );
-        vec![MontgomeryPoly::from_regular(circuit, ctx, one)]
+        let level_offset = level_offset.unwrap_or(0);
+        Self::validate_window(ctx.as_ref(), enable_levels, level_offset);
+        let active_levels = ctx.active_range(enable_levels, level_offset).len();
+        let radix = Self::digit_radix(ctx.as_ref());
+        let mut gadget = Vec::with_capacity(active_levels * ctx.num_limbs);
+        for q_idx in 0..active_levels {
+            for digit_idx in 0..ctx.num_limbs {
+                let value = radix
+                    .pow(u32::try_from(digit_idx).expect("Montgomery digit index must fit in u32"));
+                let carry = MontgomeryPolyContext::constant_carry_arith_poly(
+                    circuit,
+                    &ctx.params,
+                    ctx.carry_arith_ctx.clone(),
+                    ctx.num_limbs,
+                    &value,
+                );
+                gadget.push(Self::sparse_regular_level_poly_with_metadata(
+                    ctx.clone(),
+                    active_levels,
+                    enable_levels,
+                    level_offset,
+                    q_idx,
+                    carry,
+                    value.clone(),
+                    value.clone(),
+                    circuit,
+                ));
+            }
+        }
+        gadget
+    }
+
+    fn gadget_decompose(&self, circuit: &mut PolyCircuit<P>) -> Vec<Self> {
+        let regular_rows = self.to_regular(circuit);
+        let active_levels = self.resolve_enable_levels();
+        let digit_bound = Self::digit_radix(self.ctx.as_ref()) - BigUint::from(1u64);
+        let mut decomposition = Vec::with_capacity(active_levels * self.ctx.num_limbs);
+        for (q_idx, regular_row) in regular_rows.into_iter().enumerate() {
+            for digit_gate in regular_row.limbs {
+                let digit_value = Self::digit_value_poly(self.ctx.as_ref(), digit_gate, circuit);
+                decomposition.push(Self::sparse_regular_level_poly_with_metadata(
+                    self.ctx.clone(),
+                    active_levels,
+                    self.enable_levels,
+                    self.level_offset,
+                    q_idx,
+                    digit_value,
+                    digit_bound.clone(),
+                    digit_bound.clone(),
+                    circuit,
+                ));
+            }
+        }
+        decomposition
+    }
+
+    fn decomposition_terms_for_level(
+        &self,
+        q_idx: usize,
+        circuit: &mut PolyCircuit<P>,
+    ) -> (Vec<GateId>, GateId) {
+        let regular_rows = self.to_regular(circuit);
+        let row = &regular_rows[q_idx].limbs;
+        debug_assert_eq!(row.len(), self.ctx.num_limbs);
+        (
+            row[..row.len().saturating_sub(1)].to_vec(),
+            *row.last().expect("Montgomery decomposition requires at least one limb"),
+        )
     }
 
     fn conv_mul_right_decomposed_many(
@@ -816,28 +1040,26 @@ impl<P: Poly + 'static> ModularArithmeticGadget<P> for MontgomeryPoly<P> {
         _num_slots: usize,
         circuit: &mut PolyCircuit<P>,
     ) -> Vec<Self> {
+        let decomposed_rhs = self.gadget_decompose(circuit);
         left_rows
             .iter()
             .map(|row| {
-                assert_eq!(row.len(), 1, "MontgomeryPoly decomposed rows must have length 1");
-                row[0].mul(self, circuit)
+                assert_eq!(
+                    row.len(),
+                    decomposed_rhs.len(),
+                    "Montgomery decomposed rows must match the gadget decomposition width",
+                );
+                let mut row_iter = row.iter().zip(decomposed_rhs.iter());
+                let (first_left, first_right) =
+                    row_iter.next().expect("Montgomery decomposition width must be non-zero");
+                row_iter.fold(first_left.mul(first_right, circuit), |acc, (left, right)| {
+                    let product = left.mul(right, circuit);
+                    acc.add(&product, circuit)
+                })
             })
             .collect()
     }
-
-    fn gadget_decompose(&self, _circuit: &mut PolyCircuit<P>) -> Vec<Self> {
-        vec![self.clone()]
-    }
-
-    fn decomposition_terms_for_level(
-        &self,
-        q_idx: usize,
-        circuit: &mut PolyCircuit<P>,
-    ) -> (Vec<GateId>, GateId) {
-        assert_eq!(q_idx, 0, "MontgomeryPoly has exactly one q-level");
-        (Vec::new(), self.reconstruct(circuit))
-    }
-} */
+}
 
 pub fn encode_montgomery_poly<P: Poly>(
     limb_bit_size: usize,
@@ -884,8 +1106,9 @@ mod tests {
     use crate::{
         __PAIR, __TestState,
         element::PolyElem,
-        gadgets::arith::ModularArithmeticGadget,
+        gadgets::arith::{DecomposeArithmeticGadget, ModularArithmeticGadget},
         lookup::poly::PolyPltEvaluator,
+        matrix::dcrt_poly::DCRTPolyMatrix,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         utils::gen_biguint_for_modulus,
     };
@@ -990,7 +1213,7 @@ mod tests {
         );
         let result = eval_const_term(&circuit, &params, &eval_inputs);
         let modulus = active_modulus(&params, enable_levels, level_offset);
-        assert_eq!(result % &modulus, value % &modulus);
+        assert_eq!(result % &modulus, value.clone() % &modulus);
     }
 
     fn test_montgomery_binary_case_with_window<F>(
@@ -1033,6 +1256,72 @@ mod tests {
         let result = eval_const_term(&circuit, &params, &eval_inputs);
         let modulus = active_modulus(&params, enable_levels, level_offset);
         assert_eq!(result % &modulus, expected % &modulus);
+    }
+
+    fn test_montgomery_gadget_decompose_identity_with_window(
+        params: DCRTPolyParams,
+        limb_bit_size: usize,
+        enable_levels: Option<usize>,
+        level_offset: usize,
+        value: BigUint,
+    ) {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context_with_limb_size(&mut circuit, params, limb_bit_size);
+        let input = build_window_input(ctx.clone(), enable_levels, level_offset, &mut circuit);
+        let gadget = MontgomeryPoly::<DCRTPoly>::gadget_vector(
+            ctx.clone(),
+            enable_levels,
+            Some(level_offset),
+            &mut circuit,
+        );
+        let decomposition = input.gadget_decompose(&mut circuit);
+        assert_eq!(gadget.len(), decomposition.len());
+        let recomposed = gadget
+            .iter()
+            .zip(decomposition.iter())
+            .fold(None, |acc: Option<MontgomeryPoly<DCRTPoly>>, (g, d)| {
+                let product = g.mul(d, &mut circuit);
+                Some(match acc {
+                    Some(acc) => acc.add(&product, &mut circuit),
+                    None => product,
+                })
+            })
+            .expect("Montgomery decomposition width must be non-zero");
+        let output = recomposed.finalize(&mut circuit);
+        circuit.output(vec![output]);
+
+        let eval_inputs = encode_montgomery_poly_with_window(
+            limb_bit_size,
+            &params,
+            &value,
+            enable_levels,
+            level_offset,
+        );
+        let result = eval_const_term(&circuit, &params, &eval_inputs);
+        let modulus = active_modulus(&params, enable_levels, level_offset);
+        assert_eq!(result % &modulus, value.clone() % &modulus);
+
+        let native_gadget = MontgomeryPoly::<DCRTPoly>::gadget_matrix::<DCRTPolyMatrix>(
+            &params,
+            ctx.as_ref(),
+            enable_levels,
+            Some(level_offset),
+        );
+        let native_decomp = MontgomeryPoly::<DCRTPoly>::gadget_decomposed::<DCRTPolyMatrix>(
+            &params,
+            ctx.as_ref(),
+            &DCRTPolyMatrix::from_poly_vec(
+                &params,
+                vec![vec![DCRTPoly::from_biguint_to_constant(&params, value.clone())]],
+            ),
+            enable_levels,
+            Some(level_offset),
+        );
+        assert_eq!(
+            native_gadget.col_size(),
+            native_decomp.row_size(),
+            "native Montgomery gadget matrix width must match the decomposition height",
+        );
     }
 
     fn random_value(modulus: &BigUint) -> BigUint {
@@ -1209,5 +1498,35 @@ mod tests {
         let modulus = active_modulus(&params, None, 0);
         let value = random_value(&modulus);
         test_montgomery_roundtrip_case_with_window(params, 1, None, 0, value);
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_montgomery_gadget_decompose_identity_full_depth() {
+        let params = default_test_params();
+        let modulus = active_modulus(&params, None, 0);
+        let value = random_value(&modulus);
+        test_montgomery_gadget_decompose_identity_with_window(
+            params,
+            LIMB_BIT_SIZE,
+            None,
+            0,
+            value,
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_montgomery_gadget_decompose_identity_partial_levels() {
+        let params = default_test_params();
+        let modulus = active_modulus(&params, Some(2), 1);
+        let value = random_value(&modulus);
+        test_montgomery_gadget_decompose_identity_with_window(
+            params,
+            LIMB_BIT_SIZE,
+            Some(2),
+            1,
+            value,
+        );
     }
 }

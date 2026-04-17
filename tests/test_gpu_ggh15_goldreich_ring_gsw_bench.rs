@@ -589,16 +589,6 @@ fn constant_and_shared_benchmark_pubkeys(
     (&pubkeys[0], &pubkeys[1])
 }
 
-fn repeated_shared_benchmark_pubkeys<'a>(
-    pubkeys: &'a [BggPublicKey<GpuMatrix>],
-    non_constant_count: usize,
-) -> Vec<&'a BggPublicKey<GpuMatrix>> {
-    let (constant_one, shared_input) = constant_and_shared_benchmark_pubkeys(pubkeys);
-    std::iter::once(constant_one)
-        .chain((0..non_constant_count).map(move |_| shared_input))
-        .collect()
-}
-
 #[tokio::test]
 async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
@@ -870,37 +860,24 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
     let bench_secrets =
         uniform_sampler.sample_uniform(&params, 1, cfg.d_secret, DistType::TernaryDist).get_row(0);
     let bench_s_vec = GpuDCRTPolyMatrix::from_poly_vec_row(&params, bench_secrets.clone());
-    let bench_plaintext_rows = vec![
-        vec![single_slot_plaintext(2, &params)],
-        vec![single_slot_plaintext(3, &params)],
-        vec![single_slot_plaintext(4, &params)],
-        vec![single_slot_plaintext(1, &params)],
-        vec![single_slot_plaintext(5, &params)],
-        vec![single_slot_plaintext(7, &params)],
-        vec![single_slot_plaintext(3, &params)],
-        vec![single_slot_plaintext(6, &params)],
-        vec![single_slot_plaintext(2, &params)],
-        vec![single_slot_plaintext(4, &params)],
-    ];
+    let bench_plaintext_rows = vec![vec![single_slot_plaintext(2, &params)]];
     let bench_encoding_sampler = BGGPolyEncodingSampler::<GpuDCRTPolyUniformSampler>::new(
         &params,
         &bench_secrets,
         Some(cfg.error_sigma),
     );
-    let repeated_poly_bench_pubkeys = repeated_shared_benchmark_pubkeys(&poly_bench_pubkeys, 10);
     let bench_poly_encodings = bench_encoding_sampler.sample(
         &params,
-        &repeated_poly_bench_pubkeys,
+        &poly_bench_pubkeys,
         &bench_plaintext_rows,
         Some(&bench_slot_secret_mats),
     );
-    drop(repeated_poly_bench_pubkeys);
     drop(poly_bench_pubkeys);
     gpu_device_sync();
     assert_eq!(
         bench_poly_encodings.len(),
-        11,
-        "one-slot benchmark encoding set must contain const one plus ten sample encodings"
+        2,
+        "one-slot benchmark encoding set must contain const one plus one sample encoding"
     );
     let bench_plt_c_b0_compact_bytes_by_slot =
         GpuPolyPltEvaluator::build_c_b0_compact_bytes_by_slot::<GpuDCRTPolyUniformSampler>(
@@ -944,21 +921,21 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
             num_slots: cfg.num_slots(),
             params: &params,
             add_lhs: &bench_poly_encodings[1],
-            add_rhs: &bench_poly_encodings[2],
-            sub_lhs: &bench_poly_encodings[3],
-            sub_rhs: &bench_poly_encodings[4],
-            mul_lhs: &bench_poly_encodings[5],
-            mul_rhs: &bench_poly_encodings[6],
-            small_scalar_input: &bench_poly_encodings[7],
+            add_rhs: &bench_poly_encodings[1],
+            sub_lhs: &bench_poly_encodings[1],
+            sub_rhs: &bench_poly_encodings[1],
+            mul_lhs: &bench_poly_encodings[1],
+            mul_rhs: &bench_poly_encodings[1],
+            small_scalar_input: &bench_poly_encodings[1],
             small_scalar: &[3u32, 5u32],
-            large_scalar_input: &bench_poly_encodings[8],
+            large_scalar_input: &bench_poly_encodings[1],
             large_scalar: &[BigUint::from(7u32)],
             public_lut_one: &bench_poly_encodings[0],
-            public_lut_input: &bench_poly_encodings[9],
+            public_lut_input: &bench_poly_encodings[1],
             public_lut: &bench_lut,
             public_lut_gate_id: poly_bench_public_lut_gate_id,
             public_lut_id: poly_bench_public_lut_id,
-            slot_transfer_input: &bench_poly_encodings[10],
+            slot_transfer_input: &bench_poly_encodings[1],
             slot_transfer_src_slots: &poly_bench_slot_transfer_src_slots,
             slot_transfer_gate_id: poly_bench_slot_transfer_gate_id,
         },

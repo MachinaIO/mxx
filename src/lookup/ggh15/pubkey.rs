@@ -82,6 +82,7 @@ impl CompactBytesJob {
     }
 }
 
+#[cfg(feature = "gpu")]
 fn compact_bytes_job_total(jobs: &[CompactBytesJob]) -> u64 {
     jobs.iter().flat_map(|job| job.matrices.iter()).fold(0u64, |total, (_, bytes)| {
         total
@@ -124,6 +125,13 @@ pub(crate) fn column_chunk_bounds(total_cols: usize, chunk_idx: usize) -> (usize
     );
     let col_len = (total_cols - col_start).min(chunk_cols);
     (col_start, col_len)
+}
+
+pub(crate) fn lut_entry_chunk_count<M>(params: &<M::P as Poly>::Params, d: usize) -> usize
+where
+    M: PolyMatrix,
+{
+    column_chunk_count(d * params.modulus_digits())
 }
 
 pub(crate) fn trapdoor_public_column_count<M>(params: &<M::P as Poly>::Params, size: usize) -> usize
@@ -395,6 +403,196 @@ where
     }
 
     #[cfg(not(feature = "gpu"))]
+    fn build_lut_preimage_target_chunk(
+        &self,
+        params: &<M::P as Poly>::Params,
+        lut_id: usize,
+        idx: usize,
+        y_poly: &M::P,
+        idx_scalar_by_digit: &[M::P],
+        gadget_matrix: &M,
+        w_block_identity: &M,
+        w_block_gy: &M,
+        w_block_v: &M,
+        chunk_idx: usize,
+    ) -> M {
+        let d = self.d;
+        let m = d * params.modulus_digits();
+        let (_, _, crt_depth) = params.to_crt();
+        let k_small = params.modulus_digits() / crt_depth;
+        let (col_start, col_len) = column_chunk_bounds(m, chunk_idx);
+        let col_end = col_start + col_len;
+        let mut target_chunk = w_block_identity.slice(0, d, col_start, col_end);
+        let gy_chunk = (gadget_matrix.slice(0, d, col_start, col_end) * y_poly.clone()).decompose();
+        target_chunk.add_in_place(&(w_block_gy.clone() * gy_chunk));
+
+        let v_idx_chunk = HS::new().sample_hash_decomposed_columns(
+            params,
+            self.hash_key,
+            format!("ggh15_lut_v_idx_{}_{}", lut_id, idx),
+            d,
+            m,
+            col_start,
+            col_len,
+            DistType::FinRingDist,
+        );
+        target_chunk.add_in_place(&(w_block_v.clone() * &v_idx_chunk));
+
+        for small_chunk_idx in 0..k_small {
+            let w_vx_chunk = self.derive_w_block_with_tag_columns(
+                params,
+                lut_id,
+                "block_vx",
+                m * k_small,
+                small_chunk_idx * m,
+                m,
+            );
+            let vx_rhs_chunk = build_small_decomposed_scalar_mul_chunk::<M>(
+                params,
+                &v_idx_chunk,
+                idx_scalar_by_digit,
+                small_chunk_idx,
+            );
+            target_chunk.add_in_place(&(w_vx_chunk * vx_rhs_chunk));
+        }
+
+        target_chunk
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn build_gate_stage5_target_chunk(
+        &self,
+        params: &<M::P as Poly>::Params,
+        lut_id: usize,
+        s_g: &M,
+        u_g_matrix: &M,
+        small_chunk_idx: usize,
+        col_chunk_idx: usize,
+    ) -> M {
+        let d = self.d;
+        let m_g = d * params.modulus_digits();
+        let k_small = small_gadget_chunk_count::<M>(params);
+        let (col_start, col_len) = column_chunk_bounds(m_g, col_chunk_idx);
+        let small_chunk_start =
+            small_chunk_idx.checked_mul(m_g).expect("stage5 small-chunk start column overflow");
+        let target_high_chunk = self.build_stage5_target_high_vx_chunk(
+            params,
+            u_g_matrix,
+            small_chunk_idx,
+            col_start,
+            col_len,
+        );
+        let w_block_vx_chunk = self.derive_w_block_with_tag_columns(
+            params,
+            lut_id,
+            "block_vx",
+            m_g * k_small,
+            small_chunk_start + col_start,
+            col_len,
+        );
+        let mut target_chunk = s_g.clone() * &w_block_vx_chunk;
+        target_chunk.add_in_place(&target_high_chunk);
+        target_chunk.add_in_place(&self.sample_error_matrix(params, d, col_len));
+        target_chunk
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn build_gate_stage1_target_chunk(
+        &self,
+        params: &<M::P as Poly>::Params,
+        s_g: &M,
+        b1_matrix: &M,
+        chunk_idx: usize,
+    ) -> M {
+        let d = self.d;
+        let (col_start, col_len) = column_chunk_bounds(b1_matrix.col_size(), chunk_idx);
+        let col_end = col_start + col_len;
+        let mut target_chunk = s_g.clone() * &b1_matrix.slice(0, d, col_start, col_end);
+        target_chunk.add_in_place(&self.sample_error_matrix(params, d, col_len));
+        target_chunk
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn build_gate_stage2_identity_target_chunk(
+        &self,
+        params: &<M::P as Poly>::Params,
+        gate_id: GateId,
+        s_g: &M,
+        w_block_identity: &M,
+        chunk_idx: usize,
+    ) -> M {
+        let d = self.d;
+        let m_g = d * params.modulus_digits();
+        let (col_start, col_len) = column_chunk_bounds(m_g, chunk_idx);
+        let col_end = col_start + col_len;
+        let mut target_chunk = s_g.clone() * &w_block_identity.slice(0, d, col_start, col_end);
+        let out_chunk = HS::new().sample_hash_columns(
+            params,
+            self.hash_key,
+            format!("ggh15_gate_a_out_{}", gate_id),
+            d,
+            m_g,
+            col_start,
+            col_len,
+            DistType::FinRingDist,
+        );
+        target_chunk.add_in_place(&out_chunk);
+        target_chunk.add_in_place(&self.sample_error_matrix(params, d, col_len));
+        target_chunk
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn build_gate_stage3_gy_target_chunk(
+        &self,
+        params: &<M::P as Poly>::Params,
+        s_g: &M,
+        w_block_gy: &M,
+        gadget_matrix: &M,
+        chunk_idx: usize,
+    ) -> M {
+        let d = self.d;
+        let m_g = d * params.modulus_digits();
+        let (col_start, col_len) = column_chunk_bounds(m_g, chunk_idx);
+        let col_end = col_start + col_len;
+        let mut target_chunk = s_g.clone() * &w_block_gy.slice(0, d, col_start, col_end);
+        let target_high_chunk = -gadget_matrix.slice(0, d, col_start, col_end);
+        target_chunk.add_in_place(&target_high_chunk);
+        target_chunk.add_in_place(&self.sample_error_matrix(params, d, col_len));
+        target_chunk
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn build_gate_stage4_v_target_chunk(
+        &self,
+        params: &<M::P as Poly>::Params,
+        gate_id: GateId,
+        s_g: &M,
+        input_matrix: &M,
+        w_block_v: &M,
+        chunk_idx: usize,
+    ) -> M {
+        let d = self.d;
+        let m_g = d * params.modulus_digits();
+        let (col_start, col_len) = column_chunk_bounds(m_g, chunk_idx);
+        let col_end = col_start + col_len;
+        let mut target_chunk = s_g.clone() * &w_block_v.slice(0, d, col_start, col_end);
+        let u_g_decomposed_chunk = HS::new().sample_hash_decomposed_columns(
+            params,
+            self.hash_key,
+            format!("ggh15_lut_u_g_matrix_{}", gate_id),
+            d,
+            m_g,
+            col_start,
+            col_len,
+            DistType::FinRingDist,
+        );
+        let target_high_chunk = -(input_matrix.clone() * u_g_decomposed_chunk);
+        target_chunk.add_in_place(&target_high_chunk);
+        target_chunk.add_in_place(&self.sample_error_matrix(params, d, col_len));
+        target_chunk
+    }
+
+    #[cfg(not(feature = "gpu"))]
     fn sample_lut_preimages(
         &self,
         params: &<BggPublicKey<M> as Evaluable>::Params,
@@ -438,7 +636,6 @@ where
             batch
                 .par_iter()
                 .map(|(idx, y_poly)| {
-                    let gy = gadget_matrix.clone() * y_poly;
                     let idx_poly = M::P::from_usize_to_constant(params, *idx);
                     let idx_scalar_by_digit =
                         small_decomposed_scalar_digits::<M>(params, &idx_poly, k_small);
@@ -446,45 +643,19 @@ where
                     (0..m)
                         .step_by(chunk_cols)
                         .enumerate()
-                        .map(|(chunk_idx, col_start)| {
-                            let col_len = (m - col_start).min(chunk_cols);
-                            let col_end = col_start + col_len;
-                            let mut target_chunk = w_block_identity.slice(0, d, col_start, col_end);
-                            let gy_chunk = gy.slice_columns(col_start, col_end).decompose();
-                            let w_gy_chunk = w_block_gy.clone() * gy_chunk;
-                            target_chunk.add_in_place(&w_gy_chunk);
-
-                            let v_idx_chunk = HS::new().sample_hash_decomposed_columns(
+                        .map(|(chunk_idx, _)| {
+                            let target_chunk = self.build_lut_preimage_target_chunk(
                                 params,
-                                self.hash_key,
-                                format!("ggh15_lut_v_idx_{}_{}", lut_id, idx),
-                                d,
-                                m,
-                                col_start,
-                                col_len,
-                                DistType::FinRingDist,
+                                lut_id,
+                                *idx,
+                                y_poly,
+                                &idx_scalar_by_digit,
+                                &gadget_matrix,
+                                w_block_identity,
+                                w_block_gy,
+                                w_block_v,
+                                chunk_idx,
                             );
-                            let w_v_chunk = w_block_v.clone() * &v_idx_chunk;
-                            target_chunk.add_in_place(&w_v_chunk);
-
-                            for small_chunk_idx in 0..k_small {
-                                let w_vx_chunk = self.derive_w_block_with_tag_columns(
-                                    params,
-                                    lut_id,
-                                    "block_vx",
-                                    m * k_small,
-                                    small_chunk_idx * m,
-                                    m,
-                                );
-                                let vx_rhs_chunk = build_small_decomposed_scalar_mul_chunk::<M>(
-                                    params,
-                                    &v_idx_chunk,
-                                    &idx_scalar_by_digit,
-                                    small_chunk_idx,
-                                );
-                                let w_vx_contrib = w_vx_chunk * vx_rhs_chunk;
-                                target_chunk.add_in_place(&w_vx_contrib);
-                            }
                             let preimage_chunk = trap_sampler.preimage(
                                 params,
                                 b1_trapdoor,
@@ -546,11 +717,8 @@ where
                 let mut jobs = Vec::new();
 
                 for chunk_idx in 0..stage1_chunk_count {
-                    let (col_start, col_len) = column_chunk_bounds(b1_matrix.col_size(), chunk_idx);
-                    let col_end = col_start + col_len;
-                    let mut target_chunk = s_g.clone() * &b1_matrix.slice(0, d, col_start, col_end);
-                    let error = self.sample_error_matrix(params, d, col_len);
-                    target_chunk.add_in_place(&error);
+                    let target_chunk =
+                        self.build_gate_stage1_target_chunk(params, &s_g, b1_matrix, chunk_idx);
                     let preimage_chunk =
                         trap_sampler.preimage(params, b0_trapdoor, b0_matrix, &target_chunk);
                     debug!(
@@ -567,23 +735,13 @@ where
                 }
 
                 for chunk_idx in 0..stage_mg_chunk_count {
-                    let (col_start, col_len) = column_chunk_bounds(m_g, chunk_idx);
-                    let col_end = col_start + col_len;
-                    let mut target_chunk =
-                        s_g.clone() * &w_block_identity.slice(0, d, col_start, col_end);
-                    let out_chunk = hash_sampler.sample_hash_columns(
+                    let target_chunk = self.build_gate_stage2_identity_target_chunk(
                         params,
-                        self.hash_key,
-                        format!("ggh15_gate_a_out_{}", gate_id),
-                        d,
-                        m_g,
-                        col_start,
-                        col_len,
-                        DistType::FinRingDist,
+                        gate_id,
+                        &s_g,
+                        w_block_identity,
+                        chunk_idx,
                     );
-                    target_chunk.add_in_place(&out_chunk);
-                    let error = self.sample_error_matrix(params, d, col_len);
-                    target_chunk.add_in_place(&error);
                     let preimage_chunk =
                         trap_sampler.preimage(params, b0_trapdoor, b0_matrix, &target_chunk);
                     debug!(
@@ -601,14 +759,13 @@ where
 
                 let gadget_matrix = M::gadget_matrix(params, d);
                 for chunk_idx in 0..stage_mg_chunk_count {
-                    let (col_start, col_len) = column_chunk_bounds(m_g, chunk_idx);
-                    let col_end = col_start + col_len;
-                    let mut target_chunk =
-                        s_g.clone() * &w_block_gy.slice(0, d, col_start, col_end);
-                    let target_high_chunk = -gadget_matrix.slice(0, d, col_start, col_end);
-                    target_chunk.add_in_place(&target_high_chunk);
-                    let error = self.sample_error_matrix(params, d, col_len);
-                    target_chunk.add_in_place(&error);
+                    let target_chunk = self.build_gate_stage3_gy_target_chunk(
+                        params,
+                        &s_g,
+                        w_block_gy,
+                        &gadget_matrix,
+                        chunk_idx,
+                    );
                     let preimage_chunk =
                         trap_sampler.preimage(params, b0_trapdoor, b0_matrix, &target_chunk);
                     debug!(
@@ -626,23 +783,14 @@ where
 
                 let input_matrix = M::from_compact_bytes(params, &state.input_pubkey_bytes);
                 for chunk_idx in 0..stage_mg_chunk_count {
-                    let (col_start, col_len) = column_chunk_bounds(m_g, chunk_idx);
-                    let col_end = col_start + col_len;
-                    let mut target_chunk = s_g.clone() * &w_block_v.slice(0, d, col_start, col_end);
-                    let u_g_decomposed_chunk = hash_sampler.sample_hash_decomposed_columns(
+                    let target_chunk = self.build_gate_stage4_v_target_chunk(
                         params,
-                        self.hash_key,
-                        format!("ggh15_lut_u_g_matrix_{}", gate_id),
-                        d,
-                        m_g,
-                        col_start,
-                        col_len,
-                        DistType::FinRingDist,
+                        gate_id,
+                        &s_g,
+                        &input_matrix,
+                        w_block_v,
+                        chunk_idx,
                     );
-                    let target_high_chunk = -(input_matrix.clone() * u_g_decomposed_chunk);
-                    target_chunk.add_in_place(&target_high_chunk);
-                    let error = self.sample_error_matrix(params, d, col_len);
-                    target_chunk.add_in_place(&error);
                     let preimage_chunk =
                         trap_sampler.preimage(params, b0_trapdoor, b0_matrix, &target_chunk);
                     debug!(
@@ -667,30 +815,15 @@ where
                     DistType::FinRingDist,
                 );
                 for small_chunk_idx in 0..k_small {
-                    let small_chunk_start = small_chunk_idx
-                        .checked_mul(m_g)
-                        .expect("stage5 small-chunk start column overflow");
                     for col_chunk_idx in 0..stage_mg_chunk_count {
-                        let (col_start, col_len) = column_chunk_bounds(m_g, col_chunk_idx);
-                        let w_block_vx_chunk = self.derive_w_block_with_tag_columns(
+                        let target_chunk = self.build_gate_stage5_target_chunk(
                             params,
                             lut_id,
-                            "block_vx",
-                            m_g * k_small,
-                            small_chunk_start + col_start,
-                            col_len,
-                        );
-                        let mut target_chunk = s_g.clone() * &w_block_vx_chunk;
-                        let target_high_chunk = self.build_stage5_target_high_vx_chunk(
-                            params,
+                            &s_g,
                             &u_g_matrix,
                             small_chunk_idx,
-                            col_start,
-                            col_len,
+                            col_chunk_idx,
                         );
-                        target_chunk.add_in_place(&target_high_chunk);
-                        let error = self.sample_error_matrix(params, d, col_len);
-                        target_chunk.add_in_place(&error);
                         let preimage_chunk =
                             trap_sampler.preimage(params, b0_trapdoor, b0_matrix, &target_chunk);
                         debug!(
@@ -1793,25 +1926,30 @@ where
         let w_block_identity = self.derive_w_block_identity(params, lut_id);
         let w_block_gy = self.derive_w_block_gy(params, lut_id);
         let w_block_v = self.derive_w_block_v(params, lut_id);
-        let batch = vec![(0usize, M::P::from_usize_to_constant(params, 1usize))];
+        let d = self.d;
+        let chunk_count = lut_entry_chunk_count::<M>(params, d);
+        let y_poly = M::P::from_usize_to_constant(params, 1usize);
+        let gadget_matrix = M::gadget_matrix(params, d);
+        let k_small = small_gadget_chunk_count::<M>(params);
+        let idx_poly = M::P::from_usize_to_constant(params, 0usize);
+        let idx_scalar_by_digit = small_decomposed_scalar_digits::<M>(params, &idx_poly, k_small);
         let start = Instant::now();
-        let jobs = self.sample_lut_preimages(
+        let target_chunk = self.build_lut_preimage_target_chunk(
             params,
             lut_id,
-            "bench_lut_aux",
-            &b1_trapdoor,
-            &b1_matrix,
+            0,
+            &y_poly,
+            &idx_scalar_by_digit,
+            &gadget_matrix,
             &w_block_identity,
             &w_block_gy,
             &w_block_v,
-            &batch,
+            0,
         );
+        let preimage_chunk = trap_sampler.preimage(params, &b1_trapdoor, &b1_matrix, &target_chunk);
+        let chunk_bytes = preimage_chunk.into_compact_bytes();
         let elapsed = start.elapsed().as_secs_f64();
-        SampleAuxBenchEstimate {
-            latency: elapsed,
-            total_time: elapsed,
-            compact_bytes: compact_bytes_job_total(&jobs),
-        }
+        SampleAuxBenchEstimate::from_chunk(elapsed, chunk_count, chunk_bytes.len())
     }
 
     fn sample_aux_matrices_lut_gate_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate {
@@ -1822,31 +1960,113 @@ where
         let w_block_identity = self.derive_w_block_identity(params, lut_id);
         let w_block_gy = self.derive_w_block_gy(params, lut_id);
         let w_block_v = self.derive_w_block_v(params, lut_id);
-        let input_pubkey_bytes = M::gadget_matrix(params, self.d).into_compact_bytes();
+        let d = self.d;
+        let m_g = d * params.modulus_digits();
+        let stage1_chunk_count = column_chunk_count(b1_matrix.col_size());
+        let stage_mg_chunk_count = column_chunk_count(m_g);
+        let k_small = small_gadget_chunk_count::<M>(params);
+        let s_g = US::new().sample_uniform(params, d, d, DistType::TernaryDist);
+        let input_matrix = M::gadget_matrix(params, d);
+        let gadget_matrix = M::gadget_matrix(params, d);
+
         let start = Instant::now();
-        let jobs = self.sample_gate_preimages_batch(
+        let stage1_target = self.build_gate_stage1_target_chunk(params, &s_g, &b1_matrix, 0);
+        let stage1_bytes = trap_sampler
+            .preimage(params, &b0_trapdoor, &b0_matrix, &stage1_target)
+            .into_compact_bytes();
+        let stage1_latency = start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        let stage2_target = self.build_gate_stage2_identity_target_chunk(
             params,
-            lut_id,
-            vec![(
-                GateId(0),
-                GateState {
-                    lut_id,
-                    input_pubkey_bytes: input_pubkey_bytes.clone(),
-                    _m: PhantomData,
-                },
-            )],
-            &b0_trapdoor,
-            &b0_matrix,
-            &b1_matrix,
+            GateId(0),
+            &s_g,
             &w_block_identity,
-            &w_block_gy,
-            &w_block_v,
+            0,
         );
-        let elapsed = start.elapsed().as_secs_f64();
+        let stage2_bytes = trap_sampler
+            .preimage(params, &b0_trapdoor, &b0_matrix, &stage2_target)
+            .into_compact_bytes();
+        let stage2_latency = start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        let stage3_target =
+            self.build_gate_stage3_gy_target_chunk(params, &s_g, &w_block_gy, &gadget_matrix, 0);
+        let stage3_bytes = trap_sampler
+            .preimage(params, &b0_trapdoor, &b0_matrix, &stage3_target)
+            .into_compact_bytes();
+        let stage3_latency = start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        let stage4_target = self.build_gate_stage4_v_target_chunk(
+            params,
+            GateId(0),
+            &s_g,
+            &input_matrix,
+            &w_block_v,
+            0,
+        );
+        let stage4_bytes = trap_sampler
+            .preimage(params, &b0_trapdoor, &b0_matrix, &stage4_target)
+            .into_compact_bytes();
+        let stage4_latency = start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        let u_g_matrix = HS::new().sample_hash(
+            params,
+            self.hash_key,
+            format!("ggh15_lut_u_g_matrix_{}", GateId(0)),
+            d,
+            m_g,
+            DistType::FinRingDist,
+        );
+        let target_chunk =
+            self.build_gate_stage5_target_chunk(params, lut_id, &s_g, &u_g_matrix, 0, 0);
+        let preimage_chunk = trap_sampler.preimage(params, &b0_trapdoor, &b0_matrix, &target_chunk);
+        let chunk_bytes = preimage_chunk.into_compact_bytes();
+        let stage5_latency = start.elapsed().as_secs_f64();
+
+        let stage1_estimate = SampleAuxBenchEstimate::from_chunk(
+            stage1_latency,
+            stage1_chunk_count,
+            stage1_bytes.len(),
+        );
+        let stage2_estimate = SampleAuxBenchEstimate::from_chunk(
+            stage2_latency,
+            stage_mg_chunk_count,
+            stage2_bytes.len(),
+        );
+        let stage3_estimate = SampleAuxBenchEstimate::from_chunk(
+            stage3_latency,
+            stage_mg_chunk_count,
+            stage3_bytes.len(),
+        );
+        let stage4_estimate = SampleAuxBenchEstimate::from_chunk(
+            stage4_latency,
+            stage_mg_chunk_count,
+            stage4_bytes.len(),
+        );
+        let stage5_estimate = SampleAuxBenchEstimate::from_chunk(
+            stage5_latency,
+            k_small * stage_mg_chunk_count,
+            chunk_bytes.len(),
+        );
         SampleAuxBenchEstimate {
-            latency: elapsed,
-            total_time: elapsed,
-            compact_bytes: compact_bytes_job_total(&jobs),
+            total_time: stage1_estimate.total_time +
+                stage2_estimate.total_time +
+                stage3_estimate.total_time +
+                stage4_estimate.total_time +
+                stage5_estimate.total_time,
+            latency: stage1_estimate.latency +
+                stage2_estimate.latency +
+                stage3_estimate.latency +
+                stage4_estimate.latency +
+                stage5_estimate.latency,
+            compact_bytes: stage1_estimate.compact_bytes +
+                stage2_estimate.compact_bytes +
+                stage3_estimate.compact_bytes +
+                stage4_estimate.compact_bytes +
+                stage5_estimate.compact_bytes,
         }
     }
 }
@@ -1961,6 +2181,6 @@ mod tests {
             &params,
         );
         assert!(estimate.total_time >= 0.0);
-        assert!(estimate.compact_bytes > 0);
+        assert!(estimate.compact_bytes > num_bigint::BigUint::default());
     }
 }

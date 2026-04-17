@@ -3,7 +3,6 @@ use crate::poly::{PolyParams, dcrt::gpu::detected_gpu_device_ids};
 use rayon::prelude::*;
 
 pub(super) struct GpuSlotTransferSharedByDevice<M: PolyMatrix> {
-    pub device_id: i32,
     pub params: <<M as PolyMatrix>::P as Poly>::Params,
     pub c_b0: M,
     pub out_pubkey_matrix: M,
@@ -32,23 +31,56 @@ fn prepare_slot_transfer_shared_by_device<M, HS>(
 ) -> Vec<GpuSlotTransferSharedByDevice<M>>
 where
     M: PolyMatrix,
-    HS: PolyHashSampler<[u8; 32], M = M>,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
 {
     slot_device_ids(slot_parallelism)
-        .into_iter()
+        .into_par_iter()
         .map(|device_id| {
             let local_params = params.params_for_device(device_id);
             let out_pubkey =
                 evaluator.output_pubkey_for_params(&local_params, secret_size, gate_id);
             let c_b0 = M::from_compact_bytes(&local_params, &evaluator.c_b0_bytes);
             GpuSlotTransferSharedByDevice {
-                device_id,
                 params: local_params,
                 c_b0,
                 out_pubkey_matrix: out_pubkey.matrix,
             }
         })
         .collect()
+}
+
+fn evaluate_slot_transfer_chunk_gpu<M, HS>(
+    evaluator: &BggPolyEncodingSTEvaluator<M, HS>,
+    input: &BggPolyEncoding<M>,
+    plaintext_bytes_by_slot: &[Arc<[u8]>],
+    src_slots: &[(u32, Option<u32>)],
+    gate_id: GateId,
+    shared_by_device: &[GpuSlotTransferSharedByDevice<M>],
+    slot_start: usize,
+    chunk_len: usize,
+) -> Vec<(Arc<[u8]>, Arc<[u8]>)>
+where
+    M: PolyMatrix + Send + Sync,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    M::P: Send + Sync,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
+{
+    (0..chunk_len)
+        .into_par_iter()
+        .map(|offset| {
+            let device_shared = &shared_by_device[offset];
+            evaluator.output_slot_for_params(
+                &device_shared.params,
+                &device_shared.c_b0,
+                input,
+                plaintext_bytes_by_slot,
+                src_slots,
+                &device_shared.out_pubkey_matrix,
+                gate_id,
+                slot_start + offset,
+            )
+        })
+        .collect::<Vec<_>>()
 }
 
 pub(super) fn evaluate_slot_transfer_slots_gpu<M, HS>(
@@ -81,23 +113,16 @@ where
 
     for slot_start in (0..slot_count).step_by(chunk_width.max(1)) {
         let chunk_len = (slot_start + chunk_width).min(slot_count) - slot_start;
-        let chunk_outputs = (0..chunk_len)
-            .into_par_iter()
-            .map(|offset| {
-                let device_shared = &shared_by_device[offset];
-                let _device_id = device_shared.device_id;
-                evaluator.output_slot_for_params(
-                    &device_shared.params,
-                    &device_shared.c_b0,
-                    input,
-                    plaintext_bytes_by_slot,
-                    src_slots,
-                    &device_shared.out_pubkey_matrix,
-                    gate_id,
-                    slot_start + offset,
-                )
-            })
-            .collect::<Vec<_>>();
+        let chunk_outputs = evaluate_slot_transfer_chunk_gpu::<M, HS>(
+            evaluator,
+            input,
+            plaintext_bytes_by_slot,
+            src_slots,
+            gate_id,
+            &shared_by_device,
+            slot_start,
+            chunk_len,
+        );
         let (chunk_vector_bytes, chunk_plaintext_bytes): (Vec<_>, Vec<_>) =
             chunk_outputs.into_iter().unzip();
         output_vector_bytes.extend(chunk_vector_bytes);

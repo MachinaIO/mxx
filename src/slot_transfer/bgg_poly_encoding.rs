@@ -3,6 +3,10 @@
 mod gpu;
 
 use crate::{
+    bench_estimator::{
+        PolyEncodingChunkBenchMeasurement, PolyEncodingSlotTransferBenchEstimator,
+        benchmark_gate_operation,
+    },
     bgg::{poly_encoding::BggPolyEncoding, public_key::BggPublicKey},
     circuit::{evaluable::Evaluable, gate::GateId},
     matrix::PolyMatrix,
@@ -318,6 +322,99 @@ where
             out_pubkey,
             Some(output_plaintext_bytes),
         )
+    }
+}
+
+impl<M, HS> PolyEncodingSlotTransferBenchEstimator<M> for BggPolyEncodingSTEvaluator<M, HS>
+where
+    M: PolyMatrix + Send + Sync,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    M::P: Send + Sync,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
+{
+    fn benchmark_slot_transfer_chunk(
+        &self,
+        samples: &crate::bench_estimator::BggPolyEncodingBenchSamples<'_, M>,
+        iterations: usize,
+    ) -> PolyEncodingChunkBenchMeasurement {
+        let input = samples.slot_transfer_input;
+        let c_b0 = M::from_compact_bytes(samples.params, &self.c_b0_bytes);
+        let secret_size = input.pubkey.matrix.row_size();
+        let src_slot = usize::try_from(samples.slot_transfer_src_slots[0].0)
+            .expect("source slot index must fit in usize");
+        let dst_slot = 0usize;
+        let slot_preimage_b0_total_cols =
+            trapdoor_public_column_count::<M>(samples.params, secret_size * 2);
+        let b0_chunk_count = column_chunk_count(slot_preimage_b0_total_cols);
+        let m_g = secret_size * samples.params.modulus_digits();
+        let b1_chunk_count = column_chunk_count(m_g);
+        let gate_chunk_count = column_chunk_count(m_g);
+
+        let c_b0_slot_preimage_b0_chunks = (0..b0_chunk_count)
+            .map(|chunk_idx| {
+                left_mul_chunked_checkpoint_column(
+                    samples.params,
+                    self.dir_path.as_path(),
+                    &self.slot_preimage_b0_id_prefix(src_slot),
+                    slot_preimage_b0_total_cols,
+                    chunk_idx,
+                    &c_b0,
+                )
+            })
+            .collect::<Vec<_>>();
+        let c_b0_slot_preimage_b0 = if c_b0_slot_preimage_b0_chunks.len() == 1 {
+            c_b0_slot_preimage_b0_chunks
+                .into_iter()
+                .next()
+                .expect("slot_preimage_b0 chunk list must be non-empty")
+        } else {
+            let mut iter = c_b0_slot_preimage_b0_chunks.into_iter();
+            let first = iter.next().expect("slot_preimage_b0 chunk list must be non-empty");
+            first.concat_columns_owned(iter.collect())
+        };
+
+        let b0_bench = benchmark_gate_operation(iterations, || {
+            left_mul_chunked_checkpoint_column(
+                samples.params,
+                self.dir_path.as_path(),
+                &self.slot_preimage_b0_id_prefix(src_slot),
+                slot_preimage_b0_total_cols,
+                0,
+                &c_b0,
+            )
+            .into_compact_bytes()
+        });
+        let b1_bench = benchmark_gate_operation(iterations, || {
+            let slot_preimage_b1_chunk = read_matrix_column_chunk::<M>(
+                samples.params,
+                self.dir_path.as_path(),
+                &self.slot_preimage_b1_id_prefix(dst_slot),
+                m_g,
+                0,
+            );
+            (&c_b0_slot_preimage_b0 * &slot_preimage_b1_chunk).into_compact_bytes()
+        });
+        let gate_bench = benchmark_gate_operation(iterations, || {
+            left_mul_chunked_checkpoint_column(
+                samples.params,
+                self.dir_path.as_path(),
+                &self.gate_preimage_id_prefix(samples.slot_transfer_gate_id, dst_slot),
+                m_g,
+                0,
+                &c_b0,
+            )
+            .into_compact_bytes()
+        });
+
+        let total_chunk_count = b0_chunk_count + b1_chunk_count + gate_chunk_count;
+        let total_single_slot_time = b0_bench.time * b0_chunk_count as f64 +
+            b1_bench.time * b1_chunk_count as f64 +
+            gate_bench.time * gate_chunk_count as f64;
+        PolyEncodingChunkBenchMeasurement {
+            latency: total_single_slot_time / total_chunk_count.max(1) as f64,
+            chunk_count: total_chunk_count,
+            peak_vram: b0_bench.peak_vram.max(b1_bench.peak_vram).max(gate_bench.peak_vram),
+        }
     }
 }
 

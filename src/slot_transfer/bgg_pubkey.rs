@@ -13,6 +13,8 @@ use crate::{
     },
 };
 use dashmap::DashMap;
+#[cfg(not(feature = "gpu"))]
+use num_bigint::BigUint;
 use rayon::prelude::*;
 #[cfg(not(feature = "gpu"))]
 use std::time::Instant;
@@ -25,66 +27,6 @@ pub(crate) struct SlotAuxSample<M: PolyMatrix> {
     pub(crate) slot_a: M,
     pub(crate) preimage_b0_chunks: Vec<M>,
     pub(crate) preimage_b1_chunks: Vec<M>,
-}
-
-#[cfg(not(feature = "gpu"))]
-fn slot_aux_samples_compact_bytes<M>(samples: &[SlotAuxSample<M>]) -> u64
-where
-    M: PolyMatrix,
-{
-    samples.iter().fold(0u64, |total, sample| {
-        total
-            .checked_add(
-                u64::try_from(sample.slot_a.to_compact_bytes().len())
-                    .expect("slot_a compact_bytes length overflowed u64"),
-            )
-            .and_then(|total| {
-                total.checked_add(sample.preimage_b0_chunks.iter().fold(
-                    0u64,
-                    |chunk_total, chunk| {
-                        chunk_total
-                            .checked_add(
-                                u64::try_from(chunk.to_compact_bytes().len())
-                                    .expect("slot preimage_b0 compact_bytes length overflowed u64"),
-                            )
-                            .expect("slot preimage_b0 compact_bytes total overflowed u64")
-                    },
-                ))
-            })
-            .and_then(|total| {
-                total.checked_add(sample.preimage_b1_chunks.iter().fold(
-                    0u64,
-                    |chunk_total, chunk| {
-                        chunk_total
-                            .checked_add(
-                                u64::try_from(chunk.to_compact_bytes().len())
-                                    .expect("slot preimage_b1 compact_bytes length overflowed u64"),
-                            )
-                            .expect("slot preimage_b1 compact_bytes total overflowed u64")
-                    },
-                ))
-            })
-            .expect("slot auxiliary compact_bytes total overflowed u64")
-    })
-}
-
-#[cfg(not(feature = "gpu"))]
-fn gate_preimages_compact_bytes<M>(preimages: &[(usize, Vec<M>)]) -> u64
-where
-    M: PolyMatrix,
-{
-    preimages.iter().fold(0u64, |total, (_, preimage_chunks)| {
-        total
-            .checked_add(preimage_chunks.iter().fold(0u64, |chunk_total, preimage| {
-                chunk_total
-                    .checked_add(
-                        u64::try_from(preimage.to_compact_bytes().len())
-                            .expect("gate preimage compact_bytes length overflowed u64"),
-                    )
-                    .expect("gate preimage compact_bytes total overflowed u64")
-            }))
-            .expect("gate preimage compact_bytes total overflowed u64")
-    })
 }
 
 pub(crate) fn decomposition_column_chunk_width(total_cols: usize) -> usize {
@@ -120,6 +62,22 @@ where
     M: PolyMatrix,
 {
     size.checked_mul(params.modulus_digits() + 2).expect("trapdoor public column count overflow")
+}
+
+pub(crate) fn slot_aux_chunk_count<M>(params: &<M::P as Poly>::Params, secret_size: usize) -> usize
+where
+    M: PolyMatrix,
+{
+    let m_g = secret_size * params.modulus_digits();
+    let b1_public_cols = trapdoor_public_column_count::<M>(params, secret_size * 2);
+    column_chunk_count(b1_public_cols) + column_chunk_count(m_g)
+}
+
+pub(crate) fn slot_gate_chunk_count<M>(params: &<M::P as Poly>::Params, secret_size: usize) -> usize
+where
+    M: PolyMatrix,
+{
+    column_chunk_count(secret_size * params.modulus_digits())
 }
 
 pub(crate) fn read_matrix_column_chunk<M>(
@@ -247,6 +205,91 @@ where
             )
         }
     }
+
+    #[cfg(not(feature = "gpu"))]
+    fn build_slot_aux_b1_target_chunk(
+        &self,
+        params: &<M::P as Poly>::Params,
+        slot_idx: usize,
+        slot_secret_mat: &M,
+        gadget_matrix: &M,
+        chunk_idx: usize,
+    ) -> M {
+        let m_g = self.secret_size * params.modulus_digits();
+        let b1_size = self.secret_size.checked_mul(2).expect("slot-transfer b1 size overflow");
+        let (col_start, col_len) = column_chunk_bounds(m_g, chunk_idx);
+        let col_end = col_start + col_len;
+        let a_i_chunk = HS::new().sample_hash_columns(
+            params,
+            self.hash_key,
+            format!("slot_transfer_slot_a_{}", slot_idx),
+            self.secret_size,
+            m_g,
+            col_start,
+            col_len,
+            DistType::FinRingDist,
+        );
+        let neg_slot_secret_gadget_chunk = -(slot_secret_mat.clone() *
+            &gadget_matrix.slice(0, self.secret_size, col_start, col_end));
+        let mut target_chunk = a_i_chunk.concat_rows(&[&neg_slot_secret_gadget_chunk]);
+        target_chunk.add_in_place(&self.sample_error_matrix(params, b1_size, col_len));
+        target_chunk
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn build_slot_aux_b0_target_chunk(
+        &self,
+        params: &<M::P as Poly>::Params,
+        slot_secret_mat: &M,
+        identity: &M,
+        b1_matrix: &M,
+        chunk_idx: usize,
+    ) -> M {
+        let b1_size = self.secret_size.checked_mul(2).expect("slot-transfer b1 size overflow");
+        let b0_target_cols = trapdoor_public_column_count::<M>(params, b1_size);
+        let (col_start, col_len) = column_chunk_bounds(b0_target_cols, chunk_idx);
+        let col_end = col_start + col_len;
+        let s_concat_identity = slot_secret_mat.clone().concat_columns(&[identity]);
+        let mut target_chunk = s_concat_identity * &b1_matrix.slice(0, b1_size, col_start, col_end);
+        target_chunk.add_in_place(&self.sample_error_matrix(params, self.secret_size, col_len));
+        target_chunk
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn build_gate_target_chunk(
+        &self,
+        params: &<M::P as Poly>::Params,
+        gate_id: GateId,
+        lhs_input: &M,
+        s_j: &M,
+        a_j: &M,
+        scalar_poly: Option<&M::P>,
+        chunk_idx: usize,
+    ) -> M {
+        let m_g = self.secret_size * params.modulus_digits();
+        let (col_start, col_len) = column_chunk_bounds(m_g, chunk_idx);
+        let lhs_chunk = s_j.clone() *
+            &HS::new().sample_hash_columns(
+                params,
+                self.hash_key,
+                format!("slot_transfer_gate_a_out_{}", gate_id),
+                self.secret_size,
+                m_g,
+                col_start,
+                col_len,
+                DistType::FinRingDist,
+            );
+        let a_j_chunk = a_j.slice_columns(col_start, col_start + col_len).decompose();
+        let rhs_chunk = lhs_input.clone() * a_j_chunk;
+        let rhs_chunk = match scalar_poly {
+            Some(poly) => rhs_chunk * poly,
+            None => rhs_chunk,
+        };
+        let mut target_chunk = lhs_chunk - rhs_chunk;
+        target_chunk.add_in_place(&self.sample_error_matrix(params, self.secret_size, col_len));
+        target_chunk
+    }
+
     fn aux_checkpoint_prefix(&self, params: &<M::P as Poly>::Params) -> String {
         let (_, crt_bits, crt_depth) = params.to_crt();
         format!(
@@ -481,7 +524,6 @@ where
         batch_slot_indices: &[usize],
     ) -> Vec<SlotAuxSample<M>> {
         let m_g = self.secret_size * params.modulus_digits();
-        let b1_size = self.secret_size * 2;
         let b0_target_cols = b1_matrix.col_size();
         let b0_chunk_count = column_chunk_count(b0_target_cols);
         let b1_chunk_count = column_chunk_count(m_g);
@@ -516,33 +558,28 @@ where
                     m_g,
                     DistType::FinRingDist,
                 );
-                let s_concat_identity = slot_secret_mat.clone().concat_columns(&[identity]);
                 let preimage_b0_chunks = (0..b0_chunk_count)
                     .map(|chunk_idx| {
-                        let (col_start, col_len) = column_chunk_bounds(b0_target_cols, chunk_idx);
-                        let col_end = col_start + col_len;
-                        let mut target_chunk = s_concat_identity.clone() *
-                            &b1_matrix.slice(0, b1_size, col_start, col_end);
-                        target_chunk.add_in_place(&self.sample_error_matrix(
+                        let target_chunk = self.build_slot_aux_b0_target_chunk(
                             params,
-                            self.secret_size,
-                            col_len,
-                        ));
+                            &slot_secret_mat,
+                            identity,
+                            b1_matrix,
+                            chunk_idx,
+                        );
                         trap_sampler.preimage(params, b0_trapdoor, b0_matrix, &target_chunk)
                     })
                     .collect::<Vec<_>>();
 
                 let preimage_b1_chunks = (0..b1_chunk_count)
                     .map(|chunk_idx| {
-                        let (col_start, col_len) = column_chunk_bounds(m_g, chunk_idx);
-                        let col_end = col_start + col_len;
-                        let a_i_chunk = a_i.slice(0, self.secret_size, col_start, col_end);
-                        let neg_slot_secret_gadget_chunk = -(slot_secret_mat.clone() *
-                            &gadget_matrix.slice(0, self.secret_size, col_start, col_end));
-                        let mut target_chunk =
-                            a_i_chunk.concat_rows(&[&neg_slot_secret_gadget_chunk]);
-                        target_chunk
-                            .add_in_place(&self.sample_error_matrix(params, b1_size, col_len));
+                        let target_chunk = self.build_slot_aux_b1_target_chunk(
+                            params,
+                            slot_idx,
+                            &slot_secret_mat,
+                            gadget_matrix,
+                            chunk_idx,
+                        );
                         trap_sampler.preimage(params, b1_trapdoor, b1_matrix, &target_chunk)
                     })
                     .collect::<Vec<_>>();
@@ -587,31 +624,15 @@ where
                     scalar.map(|value| M::P::from_usize_to_constant(params, value as usize));
                 let preimage_chunks = (0..chunk_count)
                     .map(|chunk_idx| {
-                        let (col_start, col_len) = column_chunk_bounds(m_g, chunk_idx);
-                        let lhs_chunk = s_j.clone() *
-                            &HS::new().sample_hash_columns(
-                                params,
-                                self.hash_key,
-                                format!("slot_transfer_gate_a_out_{}", gate_id),
-                                self.secret_size,
-                                m_g,
-                                col_start,
-                                col_len,
-                                DistType::FinRingDist,
-                            );
-                        let a_j_chunk =
-                            a_j.slice_columns(col_start, col_start + col_len).decompose();
-                        let rhs_chunk = lhs_input.clone() * a_j_chunk;
-                        let rhs_chunk = match &scalar_poly {
-                            Some(poly) => rhs_chunk * poly,
-                            None => rhs_chunk,
-                        };
-                        let mut target_chunk = lhs_chunk - rhs_chunk;
-                        target_chunk.add_in_place(&self.sample_error_matrix(
+                        let target_chunk = self.build_gate_target_chunk(
                             params,
-                            self.secret_size,
-                            col_len,
-                        ));
+                            gate_id,
+                            &lhs_input,
+                            &s_j,
+                            &a_j,
+                            scalar_poly.as_ref(),
+                            chunk_idx,
+                        );
                         trap_sampler.preimage(params, b0_trapdoor, b0_matrix, &target_chunk)
                     })
                     .collect::<Vec<_>>();
@@ -867,92 +888,102 @@ where
         let b1_size =
             self.secret_size.checked_mul(2).expect("slot-transfer benchmark b1 size overflow");
         let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, b1_size);
-        let identity = M::identity(params, self.secret_size, None);
         let gadget_matrix = M::gadget_matrix(params, self.secret_size);
-        let slot_secret_mats = vec![
-            US::new()
-                .sample_uniform(params, self.secret_size, self.secret_size, DistType::TernaryDist)
-                .into_compact_bytes(),
-        ];
-        let start = Instant::now();
-        let sampled_slots = self.sample_slot_batch_cpu(
+        let m_g = self.secret_size * params.modulus_digits();
+        let b0_chunk_count = column_chunk_count(trapdoor_public_column_count::<M>(params, b1_size));
+        let b1_chunk_count = column_chunk_count(m_g);
+        let slot_secret_mat = US::new().sample_uniform(
             params,
-            &b0_matrix,
-            &b0_trapdoor,
-            &b1_matrix,
-            &b1_trapdoor,
-            &identity,
-            &gadget_matrix,
-            &slot_secret_mats,
-            &[0usize],
+            self.secret_size,
+            self.secret_size,
+            DistType::TernaryDist,
         );
-        let elapsed = start.elapsed().as_secs_f64();
+        let slot_a_bytes = HS::new()
+            .sample_hash(
+                params,
+                self.hash_key,
+                "slot_transfer_slot_a_0".to_string(),
+                self.secret_size,
+                m_g,
+                DistType::FinRingDist,
+            )
+            .into_compact_bytes();
+        let identity = M::identity(params, self.secret_size, None);
+
+        let start = Instant::now();
+        let b0_target_chunk =
+            self.build_slot_aux_b0_target_chunk(params, &slot_secret_mat, &identity, &b1_matrix, 0);
+        let b0_chunk_bytes = trap_sampler
+            .preimage(params, &b0_trapdoor, &b0_matrix, &b0_target_chunk)
+            .into_compact_bytes();
+        let b0_latency = start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        let b1_target_chunk =
+            self.build_slot_aux_b1_target_chunk(params, 0, &slot_secret_mat, &gadget_matrix, 0);
+        let b1_chunk_bytes = trap_sampler
+            .preimage(params, &b1_trapdoor, &b1_matrix, &b1_target_chunk)
+            .into_compact_bytes();
+        let b1_latency = start.elapsed().as_secs_f64();
+
+        let b0_estimate =
+            SampleAuxBenchEstimate::from_chunk(b0_latency, b0_chunk_count, b0_chunk_bytes.len());
+        let b1_estimate = SampleAuxBenchEstimate::from_chunk_with_base(
+            b1_latency,
+            b1_chunk_count,
+            b1_chunk_bytes.len(),
+            BigUint::from(slot_a_bytes.len()),
+        );
+        debug_assert_eq!(
+            slot_aux_chunk_count::<M>(params, self.secret_size),
+            b0_chunk_count + b1_chunk_count,
+            "slot auxiliary chunk-count decomposition mismatch"
+        );
         SampleAuxBenchEstimate {
-            latency: elapsed,
-            total_time: elapsed,
-            compact_bytes: slot_aux_samples_compact_bytes(&sampled_slots),
+            total_time: b0_estimate.total_time + b1_estimate.total_time,
+            latency: b0_estimate.latency + b1_estimate.latency,
+            compact_bytes: b0_estimate.compact_bytes + b1_estimate.compact_bytes,
         }
     }
 
     fn sample_aux_matrices_gate_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate {
         let trap_sampler = TS::new(params, self.trapdoor_sigma);
         let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, self.secret_size);
-        let b1_size =
-            self.secret_size.checked_mul(2).expect("slot-transfer benchmark b1 size overflow");
-        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, b1_size);
-        let identity = M::identity(params, self.secret_size, None);
-        let gadget_matrix = M::gadget_matrix(params, self.secret_size);
-        let benchmark_num_slots = self.num_slots.max(1);
-        let slot_secret_mats = (0..benchmark_num_slots)
-            .map(|_| {
-                US::new()
-                    .sample_uniform(
-                        params,
-                        self.secret_size,
-                        self.secret_size,
-                        DistType::TernaryDist,
-                    )
-                    .into_compact_bytes()
-            })
-            .collect::<Vec<_>>();
-        let slot_indices = (0..benchmark_num_slots).collect::<Vec<_>>();
-        let sampled_slots = self.sample_slot_batch_cpu(
-            params,
-            &b0_matrix,
-            &b0_trapdoor,
-            &b1_matrix,
-            &b1_trapdoor,
-            &identity,
-            &gadget_matrix,
-            &slot_secret_mats,
-            &slot_indices,
-        );
-        let mut slot_a_bytes_by_slot = vec![Vec::new(); benchmark_num_slots];
-        for sample in sampled_slots {
-            slot_a_bytes_by_slot[sample.slot_idx] = sample.slot_a.to_compact_bytes();
-        }
+        let total_chunk_count = slot_gate_chunk_count::<M>(params, self.secret_size);
+        let m_g = self.secret_size * params.modulus_digits();
+        let slot_secret_mats = vec![
+            US::new()
+                .sample_uniform(params, self.secret_size, self.secret_size, DistType::TernaryDist)
+                .into_compact_bytes(),
+        ];
+        let slot_a_bytes_by_slot = vec![
+            HS::new()
+                .sample_hash(
+                    params,
+                    self.hash_key,
+                    "slot_transfer_slot_a_0".to_string(),
+                    self.secret_size,
+                    m_g,
+                    DistType::FinRingDist,
+                )
+                .into_compact_bytes(),
+        ];
         let state = BggPublicKeySTGateState {
             input_pubkey_bytes: M::gadget_matrix(params, self.secret_size).into_compact_bytes(),
-            src_slots: (0..benchmark_num_slots).map(|slot_idx| (slot_idx as u32, None)).collect(),
+            src_slots: vec![(0u32, None)],
         };
-        let slot_chunk = state.src_slots.iter().copied().enumerate().collect::<Vec<_>>();
         let start = Instant::now();
-        let sampled_gate_preimages = self.sample_gate_batch_cpu(
-            &params,
-            &b0_matrix,
-            &b0_trapdoor,
-            &slot_secret_mats,
-            &slot_a_bytes_by_slot,
-            GateId(0),
-            &state,
-            &slot_chunk,
-        );
+        let a_in = M::from_compact_bytes(params, &state.input_pubkey_bytes);
+        let s_j = M::from_compact_bytes(params, &slot_secret_mats[0]);
+        let s_i = M::from_compact_bytes(params, &slot_secret_mats[0]);
+        let a_j = M::from_compact_bytes(params, &slot_a_bytes_by_slot[0]);
+        let lhs_input = s_i * &a_in;
+        let target_chunk =
+            self.build_gate_target_chunk(params, GateId(0), &lhs_input, &s_j, &a_j, None, 0);
+        let preimage_chunk = trap_sampler.preimage(params, &b0_trapdoor, &b0_matrix, &target_chunk);
+        let first_chunk_bytes = preimage_chunk.into_compact_bytes();
         let elapsed = start.elapsed().as_secs_f64();
-        SampleAuxBenchEstimate {
-            latency: elapsed,
-            total_time: elapsed,
-            compact_bytes: gate_preimages_compact_bytes(&sampled_gate_preimages),
-        }
+        SampleAuxBenchEstimate::from_chunk(elapsed, total_chunk_count, first_chunk_bytes.len())
     }
 }
 

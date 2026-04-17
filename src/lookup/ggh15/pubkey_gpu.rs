@@ -367,6 +367,192 @@ where
     }
 
     #[cfg(feature = "gpu")]
+    fn build_lut_preimage_target_chunk_gpu(
+        &self,
+        shared_dev: &GpuLutDeviceShared<'_, M, TS::Trapdoor>,
+        lut_id: usize,
+        idx: usize,
+        local_y_poly: &M::P,
+        idx_scalar_by_digit: &[M::P],
+        chunk_idx: usize,
+    ) -> M {
+        let d = self.d;
+        let m = d * shared_dev.params.modulus_digits();
+        let (_, _, crt_depth) = shared_dev.params.to_crt();
+        let k_small = shared_dev.params.modulus_digits() / crt_depth;
+        let (col_start, col_len) = column_chunk_bounds(m, chunk_idx);
+        let col_end = col_start + col_len;
+        let mut target_chunk = shared_dev.w_block_identity.slice(0, d, col_start, col_end);
+        let gy_chunk = (shared_dev.gadget_matrix.slice(0, d, col_start, col_end) *
+            local_y_poly.clone())
+        .decompose();
+        target_chunk.add_in_place(&(shared_dev.w_block_gy.clone() * gy_chunk));
+
+        let v_idx_chunk = HS::new().sample_hash_decomposed_columns(
+            shared_dev.params,
+            self.hash_key,
+            format!("ggh15_lut_v_idx_{}_{}", lut_id, idx),
+            d,
+            m,
+            col_start,
+            col_len,
+            DistType::FinRingDist,
+        );
+        target_chunk.add_in_place(&(shared_dev.w_block_v.clone() * &v_idx_chunk));
+
+        for small_chunk_idx in 0..k_small {
+            let w_vx_chunk = self.derive_w_block_with_tag_columns(
+                shared_dev.params,
+                lut_id,
+                "block_vx",
+                m * k_small,
+                small_chunk_idx * m,
+                m,
+            );
+            let vx_rhs_chunk = build_small_decomposed_scalar_mul_chunk::<M>(
+                shared_dev.params,
+                &v_idx_chunk,
+                idx_scalar_by_digit,
+                small_chunk_idx,
+            );
+            target_chunk.add_in_place(&(w_vx_chunk * vx_rhs_chunk));
+        }
+
+        target_chunk
+    }
+
+    #[cfg(feature = "gpu")]
+    fn build_gate_stage1_target_chunk_gpu(
+        &self,
+        shared: &GpuGateDeviceShared<'_, M, TS::Trapdoor>,
+        s_g: &M,
+        chunk_idx: usize,
+    ) -> M {
+        let d = self.d;
+        let (col_start, col_len) = column_chunk_bounds(shared.b1_matrix.col_size(), chunk_idx);
+        let col_end = col_start + col_len;
+        let mut target_chunk = s_g.clone() * &shared.b1_matrix.slice(0, d, col_start, col_end);
+        target_chunk.add_in_place(&self.sample_error_matrix(shared.params, d, col_len));
+        target_chunk
+    }
+
+    #[cfg(feature = "gpu")]
+    fn build_gate_stage2_identity_target_chunk_gpu(
+        &self,
+        shared: &GpuGateDeviceShared<'_, M, TS::Trapdoor>,
+        gate_id: GateId,
+        s_g: &M,
+        chunk_idx: usize,
+    ) -> M {
+        let d = self.d;
+        let m_g = d * shared.params.modulus_digits();
+        let (col_start, col_len) = column_chunk_bounds(m_g, chunk_idx);
+        let col_end = col_start + col_len;
+        let mut target_chunk =
+            s_g.clone() * &shared.w_block_identity.as_ref().slice(0, d, col_start, col_end);
+        let out_chunk = HS::new().sample_hash_columns(
+            shared.params,
+            self.hash_key,
+            format!("ggh15_gate_a_out_{}", gate_id),
+            d,
+            m_g,
+            col_start,
+            col_len,
+            DistType::FinRingDist,
+        );
+        target_chunk.add_in_place(&out_chunk);
+        target_chunk.add_in_place(&self.sample_error_matrix(shared.params, d, col_len));
+        target_chunk
+    }
+
+    #[cfg(feature = "gpu")]
+    fn build_gate_stage3_gy_target_chunk_gpu(
+        &self,
+        shared: &GpuGateDeviceShared<'_, M, TS::Trapdoor>,
+        s_g: &M,
+        chunk_idx: usize,
+    ) -> M {
+        let d = self.d;
+        let m_g = d * shared.params.modulus_digits();
+        let (col_start, col_len) = column_chunk_bounds(m_g, chunk_idx);
+        let col_end = col_start + col_len;
+        let mut target_chunk =
+            s_g.clone() * &shared.w_block_gy.as_ref().slice(0, d, col_start, col_end);
+        let target_high_chunk = -M::gadget_matrix(shared.params, d).slice(0, d, col_start, col_end);
+        target_chunk.add_in_place(&target_high_chunk);
+        target_chunk.add_in_place(&self.sample_error_matrix(shared.params, d, col_len));
+        target_chunk
+    }
+
+    #[cfg(feature = "gpu")]
+    fn build_gate_stage4_v_target_chunk_gpu(
+        &self,
+        shared: &GpuGateDeviceShared<'_, M, TS::Trapdoor>,
+        gate_id: GateId,
+        s_g: &M,
+        input_matrix: &M,
+        chunk_idx: usize,
+    ) -> M {
+        let d = self.d;
+        let m_g = d * shared.params.modulus_digits();
+        let (col_start, col_len) = column_chunk_bounds(m_g, chunk_idx);
+        let col_end = col_start + col_len;
+        let mut target_chunk =
+            s_g.clone() * &shared.w_block_v.as_ref().slice(0, d, col_start, col_end);
+        let u_g_decomposed_chunk = HS::new().sample_hash_decomposed_columns(
+            shared.params,
+            self.hash_key,
+            format!("ggh15_lut_u_g_matrix_{}", gate_id),
+            d,
+            m_g,
+            col_start,
+            col_len,
+            DistType::FinRingDist,
+        );
+        let target_high_chunk = -(input_matrix.clone() * u_g_decomposed_chunk);
+        target_chunk.add_in_place(&target_high_chunk);
+        target_chunk.add_in_place(&self.sample_error_matrix(shared.params, d, col_len));
+        target_chunk
+    }
+
+    #[cfg(feature = "gpu")]
+    fn build_gate_stage5_target_chunk_gpu(
+        &self,
+        shared: &GpuGateDeviceShared<'_, M, TS::Trapdoor>,
+        lut_id: usize,
+        s_g: &M,
+        u_g_matrix: &M,
+        small_chunk_idx: usize,
+        col_chunk_idx: usize,
+    ) -> M {
+        let d = self.d;
+        let m_g = d * shared.params.modulus_digits();
+        let k_small = small_gadget_chunk_count::<M>(shared.params);
+        let (col_start, col_len) = column_chunk_bounds(m_g, col_chunk_idx);
+        let small_chunk_start =
+            small_chunk_idx.checked_mul(m_g).expect("stage5 small-chunk start column overflow");
+        let target_high_vx_chunk = self.build_stage5_target_high_vx_chunk(
+            shared.params,
+            u_g_matrix,
+            small_chunk_idx,
+            col_start,
+            col_len,
+        );
+        let w_block_vx_chunk = self.derive_w_block_with_tag_columns(
+            shared.params,
+            lut_id,
+            "block_vx",
+            m_g * k_small,
+            small_chunk_start + col_start,
+            col_len,
+        );
+        let mut target_chunk = s_g.clone() * &w_block_vx_chunk;
+        target_chunk.add_in_place(&target_high_vx_chunk);
+        target_chunk.add_in_place(&self.sample_error_matrix(shared.params, d, col_len));
+        target_chunk
+    }
+
+    #[cfg(feature = "gpu")]
     fn sample_lut_preimages_gpu(
         &self,
         params: &<BggPublicKey<M> as Evaluable>::Params,
@@ -381,7 +567,6 @@ where
         let m = d * params.modulus_digits();
         let (_, _, crt_depth) = params.to_crt();
         let k_small = params.modulus_digits() / crt_depth;
-        let chunk_cols = decomposition_column_chunk_width(m);
         debug_assert!(!shared.is_empty(), "gpu shared resources must not be empty");
         debug_assert_eq!(
             shared[0].w_block_identity.col_size(),
@@ -406,93 +591,70 @@ where
                 let trap_sampler = TS::new(params, self.trapdoor_sigma);
                 let row_states = batch
                     .par_iter()
-                    .map(|(idx, device_slot, local_y_poly)| {
-                        let shared_dev = &shared[*device_slot];
-                        let gy = shared_dev.gadget_matrix.clone() * local_y_poly;
-                        let idx_poly = M::P::from_usize_to_constant(shared_dev.params, *idx);
+                    .map(|(idx, _device_slot, local_y_poly)| {
+                        let idx_poly = M::P::from_usize_to_constant(shared[0].params, *idx);
                         let idx_scalar_by_digit = small_decomposed_scalar_digits::<M>(
-                            shared_dev.params,
+                            shared[0].params,
                             &idx_poly,
                             k_small,
                         );
-                        (*idx, *device_slot, gy, idx_scalar_by_digit)
+                        (*idx, local_y_poly.clone(), idx_scalar_by_digit)
                     })
                     .collect::<Vec<_>>();
-                (0..m)
-                    .step_by(chunk_cols)
+                let chunk_count = column_chunk_count(m);
+                let tasks = row_states
+                    .iter()
                     .enumerate()
-                    .flat_map(|(chunk_idx, col_start)| {
-                        let col_len = (m - col_start).min(chunk_cols);
-                        let col_end = col_start + col_len;
-                        let requests = row_states
-                            .iter()
-                            .map(|(idx, device_slot, gy, idx_scalar_by_digit)| {
-                                let shared_dev = &shared[*device_slot];
-                                let mut target_chunk =
-                                    shared_dev.w_block_identity.slice(0, d, col_start, col_end);
-                                let gy_chunk = gy.slice_columns(col_start, col_end).decompose();
-                                let w_gy_chunk = shared_dev.w_block_gy.clone() * gy_chunk;
-                                target_chunk.add_in_place(&w_gy_chunk);
-
-                                let v_idx_chunk = HS::new().sample_hash_decomposed_columns(
-                                    shared_dev.params,
-                                    self.hash_key,
-                                    format!("ggh15_lut_v_idx_{}_{}", lut_id, idx),
-                                    d,
-                                    m,
-                                    col_start,
-                                    col_len,
-                                    DistType::FinRingDist,
-                                );
-                                let w_v_chunk = shared_dev.w_block_v.clone() * &v_idx_chunk;
-                                target_chunk.add_in_place(&w_v_chunk);
-
-                                for small_chunk_idx in 0..k_small {
-                                    let w_vx_chunk = self.derive_w_block_with_tag_columns(
-                                        shared_dev.params,
-                                        lut_id,
-                                        "block_vx",
-                                        m * k_small,
-                                        small_chunk_idx * m,
-                                        m,
-                                    );
-                                    let vx_rhs_chunk = build_small_decomposed_scalar_mul_chunk::<M>(
-                                        shared_dev.params,
-                                        &v_idx_chunk,
-                                        idx_scalar_by_digit,
-                                        small_chunk_idx,
-                                    );
-                                    let w_vx_contrib = w_vx_chunk * vx_rhs_chunk;
-                                    target_chunk.add_in_place(&w_vx_contrib);
-                                }
-                                GpuPreimageRequest {
-                                    entry_idx: *idx,
-                                    params: shared_dev.params,
-                                    trapdoor: shared_dev.trapdoor,
-                                    public_matrix: shared_dev.b1_matrix,
-                                    target: target_chunk,
-                                }
-                            })
-                            .collect::<Vec<_>>();
-                        let mut preimage_by_idx = trap_sampler
-                            .preimage_batched_sharded(requests)
-                            .into_iter()
-                            .collect::<HashMap<usize, M>>();
-                        row_states
-                            .iter()
-                            .map(|(idx, _, _, _)| {
-                                let lut_aux_id = format!("{lut_aux_id_prefix}_idx{idx}");
-                                let preimage_chunk = preimage_by_idx.remove(idx).unwrap_or_else(|| {
-                                    panic!("missing LUT preimage chunk for row idx={idx}, chunk_idx={chunk_idx}")
-                                });
-                                CompactBytesJob::new(
-                                    column_chunk_id_prefix(&lut_aux_id, chunk_idx),
-                                    vec![(0usize, preimage_chunk)],
-                                )
-                            })
-                            .collect::<Vec<_>>()
+                    .flat_map(|(state_idx, _)| {
+                        (0..chunk_count).map(move |chunk_idx| (state_idx, chunk_idx))
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                let mut jobs = Vec::with_capacity(tasks.len());
+                for wave in tasks.chunks(shared.len().max(1)) {
+                    let requests = wave
+                        .par_iter()
+                        .enumerate()
+                        .map(|(device_slot, (state_idx, chunk_idx))| {
+                            let shared_dev = &shared[device_slot];
+                            let (idx, local_y_poly, idx_scalar_by_digit) = &row_states[*state_idx];
+                            let target_chunk = self.build_lut_preimage_target_chunk_gpu(
+                                shared_dev,
+                                lut_id,
+                                *idx,
+                                local_y_poly,
+                                idx_scalar_by_digit,
+                                *chunk_idx,
+                            );
+                            GpuPreimageRequest {
+                                entry_idx: device_slot,
+                                params: shared_dev.params,
+                                trapdoor: shared_dev.trapdoor,
+                                public_matrix: shared_dev.b1_matrix,
+                                target: target_chunk,
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let mut preimage_by_device = trap_sampler
+                        .preimage_batched_sharded(requests)
+                        .into_iter()
+                        .collect::<HashMap<usize, M>>();
+                    for (device_slot, (state_idx, chunk_idx)) in wave.iter().enumerate() {
+                        let (idx, _, _) = &row_states[*state_idx];
+                        let lut_aux_id = format!("{lut_aux_id_prefix}_idx{idx}");
+                        let preimage_chunk =
+                            preimage_by_device.remove(&device_slot).unwrap_or_else(|| {
+                                panic!(
+                                    "missing LUT preimage chunk for row idx={}, chunk_idx={}",
+                                    idx, chunk_idx
+                                )
+                            });
+                        jobs.push(CompactBytesJob::new(
+                            column_chunk_id_prefix(&lut_aux_id, *chunk_idx),
+                            vec![(0usize, preimage_chunk)],
+                        ));
+                    }
+                }
+                jobs
             }
         };
 
@@ -538,28 +700,34 @@ where
             .map(|(entry_pos, (gate_id, state))| {
                 let shared = shared_for_logical_idx(shared, entry_pos);
                 let uniform_sampler = US::new();
-                let s_g =
-                    uniform_sampler.sample_uniform(shared.params, d, d, DistType::TernaryDist);
-                (entry_pos, gate_id, state, s_g)
+                let s_g_bytes = uniform_sampler
+                    .sample_uniform(shared.params, d, d, DistType::TernaryDist)
+                    .into_compact_bytes();
+                (entry_pos, gate_id, state.input_pubkey_bytes, s_g_bytes)
             })
             .collect::<Vec<_>>();
 
-        for chunk_idx in 0..stage1_chunk_count {
+        let stage1_tasks = stage_inputs
+            .iter()
+            .enumerate()
+            .flat_map(|(input_idx, _)| {
+                (0..stage1_chunk_count).map(move |chunk_idx| (input_idx, chunk_idx))
+            })
+            .collect::<Vec<_>>();
+        for wave in stage1_tasks.chunks(shared.len().max(1)) {
             let mut stage1_compact_bytes = 0u64;
             pipeline_lookup_stage(&mut pending_store_buffers, || {
-                let requests = stage_inputs
-                    .iter()
-                    .map(|(entry_pos, _, _, s_g)| {
-                        let shared = shared_for_logical_idx(shared, *entry_pos);
-                        let (col_start, col_len) =
-                            column_chunk_bounds(shared.b1_matrix.col_size(), chunk_idx);
-                        let col_end = col_start + col_len;
-                        let mut target_chunk =
-                            s_g.clone() * &shared.b1_matrix.slice(0, d, col_start, col_end);
-                        let error = self.sample_error_matrix(shared.params, d, col_len);
-                        target_chunk.add_in_place(&error);
+                let requests = wave
+                    .par_iter()
+                    .enumerate()
+                    .map(|(device_slot, (input_idx, chunk_idx))| {
+                        let shared = &shared[device_slot];
+                        let (_, _, _, s_g_bytes) = &stage_inputs[*input_idx];
+                        let s_g = M::from_compact_bytes(shared.params, s_g_bytes);
+                        let target_chunk =
+                            self.build_gate_stage1_target_chunk_gpu(shared, &s_g, *chunk_idx);
                         GpuPreimageRequest {
-                            entry_idx: *entry_pos,
+                            entry_idx: device_slot,
                             params: shared.params,
                             trapdoor: shared.b0_trapdoor,
                             public_matrix: shared.b0_matrix,
@@ -571,16 +739,21 @@ where
                     .preimage_batched_sharded(requests)
                     .into_iter()
                     .collect::<HashMap<usize, M>>();
-                let jobs = stage_inputs
+                let jobs = wave
                     .iter()
-                    .map(|(entry_pos, gate_id, _, _)| {
-                        let preimage_chunk = preimages.remove(entry_pos).unwrap_or_else(|| {
-                            panic!("missing gate stage1 chunk for entry_pos={entry_pos}")
+                    .enumerate()
+                    .map(|(device_slot, (input_idx, chunk_idx))| {
+                        let (_, gate_id, _, _) = &stage_inputs[*input_idx];
+                        let preimage_chunk = preimages.remove(&device_slot).unwrap_or_else(|| {
+                            panic!(
+                                "missing gate stage1 chunk for input_idx={}, chunk_idx={}",
+                                input_idx, chunk_idx
+                            )
                         });
                         CompactBytesJob::new(
                             column_chunk_id_prefix(
                                 &self.preimage_gate1_id_prefix(params, *gate_id),
-                                chunk_idx,
+                                *chunk_idx,
                             ),
                             vec![(0usize, preimage_chunk)],
                         )
@@ -594,32 +767,28 @@ where
                 .expect("public LUT gpu stage1 compact_bytes overflowed u64");
         }
 
-        for chunk_idx in 0..stage_mg_chunk_count {
+        let stage_mg_tasks = stage_inputs
+            .iter()
+            .enumerate()
+            .flat_map(|(input_idx, _)| {
+                (0..stage_mg_chunk_count).map(move |chunk_idx| (input_idx, chunk_idx))
+            })
+            .collect::<Vec<_>>();
+        for wave in stage_mg_tasks.chunks(shared.len().max(1)) {
             let mut stage2_compact_bytes = 0u64;
             pipeline_lookup_stage(&mut pending_store_buffers, || {
-                let requests = stage_inputs
-                    .iter()
-                    .map(|(entry_pos, gate_id, _, s_g)| {
-                        let shared = shared_for_logical_idx(shared, *entry_pos);
-                        let (col_start, col_len) = column_chunk_bounds(m_g, chunk_idx);
-                        let col_end = col_start + col_len;
-                        let mut target_chunk = s_g.clone() *
-                            &shared.w_block_identity.as_ref().slice(0, d, col_start, col_end);
-                        let out_chunk = HS::new().sample_hash_columns(
-                            shared.params,
-                            self.hash_key,
-                            format!("ggh15_gate_a_out_{}", gate_id),
-                            d,
-                            m_g,
-                            col_start,
-                            col_len,
-                            DistType::FinRingDist,
+                let requests = wave
+                    .par_iter()
+                    .enumerate()
+                    .map(|(device_slot, (input_idx, chunk_idx))| {
+                        let shared = &shared[device_slot];
+                        let (_, gate_id, _, s_g_bytes) = &stage_inputs[*input_idx];
+                        let s_g = M::from_compact_bytes(shared.params, s_g_bytes);
+                        let target_chunk = self.build_gate_stage2_identity_target_chunk_gpu(
+                            shared, *gate_id, &s_g, *chunk_idx,
                         );
-                        target_chunk.add_in_place(&out_chunk);
-                        let error = self.sample_error_matrix(shared.params, d, col_len);
-                        target_chunk.add_in_place(&error);
                         GpuPreimageRequest {
-                            entry_idx: *entry_pos,
+                            entry_idx: device_slot,
                             params: shared.params,
                             trapdoor: shared.b0_trapdoor,
                             public_matrix: shared.b0_matrix,
@@ -631,16 +800,21 @@ where
                     .preimage_batched_sharded(requests)
                     .into_iter()
                     .collect::<HashMap<usize, M>>();
-                let jobs = stage_inputs
+                let jobs = wave
                     .iter()
-                    .map(|(entry_pos, gate_id, _, _)| {
-                        let preimage_chunk = preimages.remove(entry_pos).unwrap_or_else(|| {
-                            panic!("missing gate stage2 identity chunk for entry_pos={entry_pos}")
+                    .enumerate()
+                    .map(|(device_slot, (input_idx, chunk_idx))| {
+                        let (_, gate_id, _, _) = &stage_inputs[*input_idx];
+                        let preimage_chunk = preimages.remove(&device_slot).unwrap_or_else(|| {
+                            panic!(
+                                "missing gate stage2 chunk for input_idx={}, chunk_idx={}",
+                                input_idx, chunk_idx
+                            )
                         });
                         CompactBytesJob::new(
                             column_chunk_id_prefix(
                                 &self.preimage_gate2_identity_id_prefix(params, *gate_id),
-                                chunk_idx,
+                                *chunk_idx,
                             ),
                             vec![(0usize, preimage_chunk)],
                         )
@@ -654,24 +828,20 @@ where
                 .expect("public LUT gpu stage2 compact_bytes overflowed u64");
         }
 
-        for chunk_idx in 0..stage_mg_chunk_count {
+        for wave in stage_mg_tasks.chunks(shared.len().max(1)) {
             let mut stage3_compact_bytes = 0u64;
             pipeline_lookup_stage(&mut pending_store_buffers, || {
-                let requests = stage_inputs
-                    .iter()
-                    .map(|(entry_pos, _, _, s_g)| {
-                        let shared = shared_for_logical_idx(shared, *entry_pos);
-                        let (col_start, col_len) = column_chunk_bounds(m_g, chunk_idx);
-                        let col_end = col_start + col_len;
-                        let mut target_chunk = s_g.clone() *
-                            &shared.w_block_gy.as_ref().slice(0, d, col_start, col_end);
-                        let target_high_chunk =
-                            -M::gadget_matrix(shared.params, d).slice(0, d, col_start, col_end);
-                        target_chunk.add_in_place(&target_high_chunk);
-                        let error = self.sample_error_matrix(shared.params, d, col_len);
-                        target_chunk.add_in_place(&error);
+                let requests = wave
+                    .par_iter()
+                    .enumerate()
+                    .map(|(device_slot, (input_idx, chunk_idx))| {
+                        let shared = &shared[device_slot];
+                        let (_, _, _, s_g_bytes) = &stage_inputs[*input_idx];
+                        let s_g = M::from_compact_bytes(shared.params, s_g_bytes);
+                        let target_chunk =
+                            self.build_gate_stage3_gy_target_chunk_gpu(shared, &s_g, *chunk_idx);
                         GpuPreimageRequest {
-                            entry_idx: *entry_pos,
+                            entry_idx: device_slot,
                             params: shared.params,
                             trapdoor: shared.b0_trapdoor,
                             public_matrix: shared.b0_matrix,
@@ -683,16 +853,21 @@ where
                     .preimage_batched_sharded(requests)
                     .into_iter()
                     .collect::<HashMap<usize, M>>();
-                let jobs = stage_inputs
+                let jobs = wave
                     .iter()
-                    .map(|(entry_pos, gate_id, _, _)| {
-                        let preimage_chunk = preimages.remove(entry_pos).unwrap_or_else(|| {
-                            panic!("missing gate stage3 gy chunk for entry_pos={entry_pos}")
+                    .enumerate()
+                    .map(|(device_slot, (input_idx, chunk_idx))| {
+                        let (_, gate_id, _, _) = &stage_inputs[*input_idx];
+                        let preimage_chunk = preimages.remove(&device_slot).unwrap_or_else(|| {
+                            panic!(
+                                "missing gate stage3 chunk for input_idx={}, chunk_idx={}",
+                                input_idx, chunk_idx
+                            )
                         });
                         CompactBytesJob::new(
                             column_chunk_id_prefix(
                                 &self.preimage_gate2_gy_id_prefix(params, *gate_id),
-                                chunk_idx,
+                                *chunk_idx,
                             ),
                             vec![(0usize, preimage_chunk)],
                         )
@@ -706,42 +881,26 @@ where
                 .expect("public LUT gpu stage3 compact_bytes overflowed u64");
         }
 
-        let stage4_inputs = stage_inputs
-            .into_par_iter()
-            .map(|(entry_pos, gate_id, state, s_g)| {
-                let shared = shared_for_logical_idx(shared, entry_pos);
-                let input_matrix = M::from_compact_bytes(shared.params, &state.input_pubkey_bytes);
-                (entry_pos, gate_id, s_g, input_matrix)
-            })
-            .collect::<Vec<_>>();
-
-        for chunk_idx in 0..stage_mg_chunk_count {
+        for wave in stage_mg_tasks.chunks(shared.len().max(1)) {
             let mut stage4_compact_bytes = 0u64;
             pipeline_lookup_stage(&mut pending_store_buffers, || {
-                let requests = stage4_inputs
-                    .iter()
-                    .map(|(entry_pos, gate_id, s_g, input_matrix)| {
-                        let shared = shared_for_logical_idx(shared, *entry_pos);
-                        let (col_start, col_len) = column_chunk_bounds(m_g, chunk_idx);
-                        let col_end = col_start + col_len;
-                        let mut target_chunk = s_g.clone() *
-                            &shared.w_block_v.as_ref().slice(0, d, col_start, col_end);
-                        let u_g_decomposed_chunk = HS::new().sample_hash_decomposed_columns(
-                            shared.params,
-                            self.hash_key,
-                            format!("ggh15_lut_u_g_matrix_{}", gate_id),
-                            d,
-                            m_g,
-                            col_start,
-                            col_len,
-                            DistType::FinRingDist,
+                let requests = wave
+                    .par_iter()
+                    .enumerate()
+                    .map(|(device_slot, (input_idx, chunk_idx))| {
+                        let shared = &shared[device_slot];
+                        let (_, gate_id, input_pubkey_bytes, s_g_bytes) = &stage_inputs[*input_idx];
+                        let s_g = M::from_compact_bytes(shared.params, s_g_bytes);
+                        let input_matrix = M::from_compact_bytes(shared.params, input_pubkey_bytes);
+                        let target_chunk = self.build_gate_stage4_v_target_chunk_gpu(
+                            shared,
+                            *gate_id,
+                            &s_g,
+                            &input_matrix,
+                            *chunk_idx,
                         );
-                        let target_high_chunk = -(input_matrix.clone() * u_g_decomposed_chunk);
-                        target_chunk.add_in_place(&target_high_chunk);
-                        let error = self.sample_error_matrix(shared.params, d, col_len);
-                        target_chunk.add_in_place(&error);
                         GpuPreimageRequest {
-                            entry_idx: *entry_pos,
+                            entry_idx: device_slot,
                             params: shared.params,
                             trapdoor: shared.b0_trapdoor,
                             public_matrix: shared.b0_matrix,
@@ -753,16 +912,21 @@ where
                     .preimage_batched_sharded(requests)
                     .into_iter()
                     .collect::<HashMap<usize, M>>();
-                let jobs = stage4_inputs
+                let jobs = wave
                     .iter()
-                    .map(|(entry_pos, gate_id, _, _)| {
-                        let preimage_chunk = preimages.remove(entry_pos).unwrap_or_else(|| {
-                            panic!("missing gate stage4 v chunk for entry_pos={entry_pos}")
+                    .enumerate()
+                    .map(|(device_slot, (input_idx, chunk_idx))| {
+                        let (_, gate_id, _, _) = &stage_inputs[*input_idx];
+                        let preimage_chunk = preimages.remove(&device_slot).unwrap_or_else(|| {
+                            panic!(
+                                "missing gate stage4 chunk for input_idx={}, chunk_idx={}",
+                                input_idx, chunk_idx
+                            )
                         });
                         CompactBytesJob::new(
                             column_chunk_id_prefix(
                                 &self.preimage_gate2_v_id_prefix(params, *gate_id),
-                                chunk_idx,
+                                *chunk_idx,
                             ),
                             vec![(0usize, preimage_chunk)],
                         )
@@ -776,101 +940,103 @@ where
                 .expect("public LUT gpu stage4 compact_bytes overflowed u64");
         }
 
-        let stage5_inputs = stage4_inputs
-            .into_par_iter()
-            .map(|(entry_pos, gate_id, s_g, _)| {
-                let shared = shared_for_logical_idx(shared, entry_pos);
-                let u_g_matrix = HS::new().sample_hash(
-                    shared.params,
-                    self.hash_key,
-                    format!("ggh15_lut_u_g_matrix_{}", gate_id),
-                    d,
-                    m_g,
-                    DistType::FinRingDist,
-                );
-                (entry_pos, gate_id, s_g, u_g_matrix)
+        let stage5_inputs = stage_inputs
+            .iter()
+            .map(|(entry_pos, gate_id, _, s_g_bytes)| {
+                let shared = shared_for_logical_idx(shared, *entry_pos);
+                let u_g_bytes = HS::new()
+                    .sample_hash(
+                        shared.params,
+                        self.hash_key,
+                        format!("ggh15_lut_u_g_matrix_{}", gate_id),
+                        d,
+                        m_g,
+                        DistType::FinRingDist,
+                    )
+                    .into_compact_bytes();
+                (*entry_pos, *gate_id, s_g_bytes.clone(), u_g_bytes)
             })
             .collect::<Vec<_>>();
-
-        for small_chunk_idx in 0..k_small {
-            let small_chunk_start =
-                small_chunk_idx.checked_mul(m_g).expect("stage5 small-chunk start column overflow");
-            for col_chunk_idx in 0..stage_mg_chunk_count {
-                let mut stage5_compact_bytes = 0u64;
-                pipeline_lookup_stage(&mut pending_store_buffers, || {
-                    let (col_start, col_len) = column_chunk_bounds(m_g, col_chunk_idx);
-                    let stage5_requests = stage5_inputs
-                        .iter()
-                        .map(|(entry_pos, _gate_id, s_g, u_g_matrix)| {
-                            let shared = shared_for_logical_idx(shared, *entry_pos);
-                            let target_high_vx_chunk = self.build_stage5_target_high_vx_chunk(
-                                shared.params,
-                                u_g_matrix,
-                                small_chunk_idx,
-                                col_start,
-                                col_len,
-                            );
-                            let w_block_vx_chunk = self.derive_w_block_with_tag_columns(
-                                shared.params,
-                                lut_id,
-                                "block_vx",
-                                m_g * k_small,
-                                small_chunk_start + col_start,
-                                col_len,
-                            );
-                            let mut target_gate2_vx_chunk = s_g.clone() * &w_block_vx_chunk;
-                            target_gate2_vx_chunk.add_in_place(&target_high_vx_chunk);
-                            let error = self.sample_error_matrix(shared.params, d, col_len);
-                            target_gate2_vx_chunk.add_in_place(&error);
-                            GpuPreimageRequest {
-                                entry_idx: *entry_pos,
-                                params: shared.params,
-                                trapdoor: shared.b0_trapdoor,
-                                public_matrix: shared.b0_matrix,
-                                target: target_gate2_vx_chunk,
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    let mut stage5_preimages = trap_sampler
-                        .preimage_batched_sharded(stage5_requests)
-                        .into_iter()
-                        .collect::<HashMap<usize, M>>();
-                    let stage5_jobs = stage5_inputs
-                        .iter()
-                        .map(|(entry_pos, gate_id, _, _)| {
-                            let preimage_gate2_vx_chunk =
-                                stage5_preimages.remove(entry_pos).unwrap_or_else(|| {
-                                    panic!(
-                                        "missing gate stage5 preimage for entry_pos={entry_pos}, small_chunk_idx={small_chunk_idx}, col_chunk_idx={col_chunk_idx}"
-                                    )
-                                });
-                            debug!(
-                                "Sampled gate preimage 2 (vx part): gate_id={}, lut_id={}, small_chunk_idx={}, col_chunk_idx={}",
-                                gate_id,
-                                lut_id,
-                                small_chunk_idx,
-                                col_chunk_idx
-                            );
-                            CompactBytesJob::new(
-                                column_chunk_id_prefix(
-                                    &self.preimage_gate2_vx_small_id_prefix(
-                                        params,
-                                        *gate_id,
-                                        small_chunk_idx,
-                                    ),
-                                    col_chunk_idx,
+        let stage5_tasks = stage5_inputs
+            .iter()
+            .enumerate()
+            .flat_map(|(input_idx, _)| {
+                (0..k_small).flat_map(move |small_chunk_idx| {
+                    (0..stage_mg_chunk_count)
+                        .map(move |col_chunk_idx| (input_idx, small_chunk_idx, col_chunk_idx))
+                })
+            })
+            .collect::<Vec<_>>();
+        for wave in stage5_tasks.chunks(shared.len().max(1)) {
+            let mut stage5_compact_bytes = 0u64;
+            pipeline_lookup_stage(&mut pending_store_buffers, || {
+                let requests = wave
+                    .par_iter()
+                    .enumerate()
+                    .map(|(device_slot, (input_idx, small_chunk_idx, col_chunk_idx))| {
+                        let shared = &shared[device_slot];
+                        let (_, _gate_id, s_g_bytes, u_g_bytes) = &stage5_inputs[*input_idx];
+                        let s_g = M::from_compact_bytes(shared.params, s_g_bytes);
+                        let u_g_matrix = M::from_compact_bytes(shared.params, u_g_bytes);
+                        let target_gate2_vx_chunk = self.build_gate_stage5_target_chunk_gpu(
+                            shared,
+                            lut_id,
+                            &s_g,
+                            &u_g_matrix,
+                            *small_chunk_idx,
+                            *col_chunk_idx,
+                        );
+                        GpuPreimageRequest {
+                            entry_idx: device_slot,
+                            params: shared.params,
+                            trapdoor: shared.b0_trapdoor,
+                            public_matrix: shared.b0_matrix,
+                            target: target_gate2_vx_chunk,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let mut stage5_preimages = trap_sampler
+                    .preimage_batched_sharded(requests)
+                    .into_iter()
+                    .collect::<HashMap<usize, M>>();
+                let stage5_jobs = wave
+                    .iter()
+                    .enumerate()
+                    .map(|(device_slot, (input_idx, small_chunk_idx, col_chunk_idx))| {
+                        let (_, gate_id, _, _) = &stage5_inputs[*input_idx];
+                        let preimage_gate2_vx_chunk =
+                            stage5_preimages.remove(&device_slot).unwrap_or_else(|| {
+                                panic!(
+                                    "missing gate stage5 preimage for input_idx={}, small_chunk_idx={}, col_chunk_idx={}",
+                                    input_idx, small_chunk_idx, col_chunk_idx
+                                )
+                            });
+                        debug!(
+                            "Sampled gate preimage 2 (vx part): gate_id={}, lut_id={}, small_chunk_idx={}, col_chunk_idx={}",
+                            gate_id,
+                            lut_id,
+                            small_chunk_idx,
+                            col_chunk_idx
+                        );
+                        CompactBytesJob::new(
+                            column_chunk_id_prefix(
+                                &self.preimage_gate2_vx_small_id_prefix(
+                                    params,
+                                    *gate_id,
+                                    *small_chunk_idx,
                                 ),
-                                vec![(0, preimage_gate2_vx_chunk)],
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    stage5_compact_bytes = compact_bytes_job_total(&stage5_jobs);
-                    prepare_lookup_buffers(stage5_jobs)
-                });
-                total_compact_bytes = total_compact_bytes
-                    .checked_add(stage5_compact_bytes)
-                    .expect("public LUT gpu stage5 compact_bytes overflowed u64");
-            }
+                                *col_chunk_idx,
+                            ),
+                            vec![(0, preimage_gate2_vx_chunk)],
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                stage5_compact_bytes = compact_bytes_job_total(&stage5_jobs);
+                prepare_lookup_buffers(stage5_jobs)
+            });
+            total_compact_bytes = total_compact_bytes
+                .checked_add(stage5_compact_bytes)
+                .expect("public LUT gpu stage5 compact_bytes overflowed u64");
         }
 
         if let Some(previous_buffers) = pending_store_buffers.take() {
@@ -1080,17 +1246,21 @@ where
         let gpu_lut_base_shared =
             self.prepare_gpu_lut_base_device_shared(params, &b1_trapdoor, &b1_matrix);
         let gpu_lut_shared = self.prepare_gpu_lut_device_shared(lut_id, &gpu_lut_base_shared);
-        let batch =
-            vec![(0usize, 0usize, M::P::from_usize_to_constant(gpu_lut_shared[0].params, 1usize))];
+        let shared = &gpu_lut_shared[0];
+        let d = self.d;
+        let chunk_count = lut_entry_chunk_count::<M>(params, d);
+        let y_poly = M::P::from_usize_to_constant(shared.params, 1usize);
+        let k_small = small_gadget_chunk_count::<M>(shared.params);
+        let idx_poly = M::P::from_usize_to_constant(shared.params, 0usize);
+        let idx_digits = small_decomposed_scalar_digits::<M>(shared.params, &idx_poly, k_small);
         let start = Instant::now();
-        let jobs =
-            self.sample_lut_preimages_gpu(params, lut_id, "bench_lut_aux", &gpu_lut_shared, &batch);
+        let target_chunk =
+            self.build_lut_preimage_target_chunk_gpu(shared, lut_id, 0, &y_poly, &idx_digits, 0);
+        let preimage_chunk =
+            trap_sampler.preimage(shared.params, shared.trapdoor, shared.b1_matrix, &target_chunk);
+        let chunk_bytes = preimage_chunk.into_compact_bytes();
         let elapsed = start.elapsed().as_secs_f64();
-        SampleAuxBenchEstimate {
-            latency: elapsed,
-            total_time: elapsed,
-            compact_bytes: compact_bytes_job_total(&jobs),
-        }
+        SampleAuxBenchEstimate::from_chunk(elapsed, chunk_count, chunk_bytes.len())
     }
 
     fn sample_aux_matrices_lut_gate_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate {
@@ -1115,23 +1285,106 @@ where
             w_block_gy_by_device,
             w_block_v_by_device,
         );
-        let input_pubkey_bytes = M::gadget_matrix(params, self.d).into_compact_bytes();
+        let d = self.d;
+        let m_g = d * params.modulus_digits();
+        let stage1_chunk_count = column_chunk_count(gpu_gate_shared[0].b1_matrix.col_size());
+        let stage_mg_chunk_count = column_chunk_count(m_g);
+        let k_small = small_gadget_chunk_count::<M>(params);
+        let shared = &gpu_gate_shared[0];
+        let s_g = US::new().sample_uniform(shared.params, d, d, DistType::TernaryDist);
+        let input_matrix = M::gadget_matrix(shared.params, d);
+
         let start = Instant::now();
-        let compact_bytes = self.sample_gate_preimages_batch_gpu(
-            params,
-            lut_id,
-            vec![(
-                GateId(0),
-                GateState {
-                    lut_id,
-                    input_pubkey_bytes: input_pubkey_bytes.clone(),
-                    _m: PhantomData,
-                },
-            )],
-            &gpu_gate_shared,
+        let stage1_target = self.build_gate_stage1_target_chunk_gpu(shared, &s_g, 0);
+        let stage1_bytes = trap_sampler
+            .preimage(shared.params, shared.b0_trapdoor, shared.b0_matrix, &stage1_target)
+            .into_compact_bytes();
+        let stage1_latency = start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        let stage2_target =
+            self.build_gate_stage2_identity_target_chunk_gpu(shared, GateId(0), &s_g, 0);
+        let stage2_bytes = trap_sampler
+            .preimage(shared.params, shared.b0_trapdoor, shared.b0_matrix, &stage2_target)
+            .into_compact_bytes();
+        let stage2_latency = start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        let stage3_target = self.build_gate_stage3_gy_target_chunk_gpu(shared, &s_g, 0);
+        let stage3_bytes = trap_sampler
+            .preimage(shared.params, shared.b0_trapdoor, shared.b0_matrix, &stage3_target)
+            .into_compact_bytes();
+        let stage3_latency = start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        let stage4_target =
+            self.build_gate_stage4_v_target_chunk_gpu(shared, GateId(0), &s_g, &input_matrix, 0);
+        let stage4_bytes = trap_sampler
+            .preimage(shared.params, shared.b0_trapdoor, shared.b0_matrix, &stage4_target)
+            .into_compact_bytes();
+        let stage4_latency = start.elapsed().as_secs_f64();
+
+        let u_g_matrix = HS::new().sample_hash(
+            shared.params,
+            self.hash_key,
+            format!("ggh15_lut_u_g_matrix_{}", GateId(0)),
+            d,
+            m_g,
+            DistType::FinRingDist,
         );
-        let elapsed = start.elapsed().as_secs_f64();
-        SampleAuxBenchEstimate { latency: elapsed, total_time: elapsed, compact_bytes }
+        let start = Instant::now();
+        let target_chunk =
+            self.build_gate_stage5_target_chunk_gpu(shared, lut_id, &s_g, &u_g_matrix, 0, 0);
+        let preimage_chunk = trap_sampler.preimage(
+            shared.params,
+            shared.b0_trapdoor,
+            shared.b0_matrix,
+            &target_chunk,
+        );
+        let chunk_bytes = preimage_chunk.into_compact_bytes();
+        let stage5_latency = start.elapsed().as_secs_f64();
+        let stage1_estimate = SampleAuxBenchEstimate::from_chunk(
+            stage1_latency,
+            stage1_chunk_count,
+            stage1_bytes.len(),
+        );
+        let stage2_estimate = SampleAuxBenchEstimate::from_chunk(
+            stage2_latency,
+            stage_mg_chunk_count,
+            stage2_bytes.len(),
+        );
+        let stage3_estimate = SampleAuxBenchEstimate::from_chunk(
+            stage3_latency,
+            stage_mg_chunk_count,
+            stage3_bytes.len(),
+        );
+        let stage4_estimate = SampleAuxBenchEstimate::from_chunk(
+            stage4_latency,
+            stage_mg_chunk_count,
+            stage4_bytes.len(),
+        );
+        let stage5_estimate = SampleAuxBenchEstimate::from_chunk(
+            stage5_latency,
+            k_small * stage_mg_chunk_count,
+            chunk_bytes.len(),
+        );
+        SampleAuxBenchEstimate {
+            total_time: stage1_estimate.total_time +
+                stage2_estimate.total_time +
+                stage3_estimate.total_time +
+                stage4_estimate.total_time +
+                stage5_estimate.total_time,
+            latency: stage1_estimate.latency +
+                stage2_estimate.latency +
+                stage3_estimate.latency +
+                stage4_estimate.latency +
+                stage5_estimate.latency,
+            compact_bytes: stage1_estimate.compact_bytes +
+                stage2_estimate.compact_bytes +
+                stage3_estimate.compact_bytes +
+                stage4_estimate.compact_bytes +
+                stage5_estimate.compact_bytes,
+        }
     }
 }
 

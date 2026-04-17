@@ -3,7 +3,9 @@
 mod gpu;
 
 #[cfg(feature = "gpu")]
-pub(crate) use gpu::{public_lookup_gpu_device_ids, public_lookup_round_robin_device_slot};
+pub(crate) use gpu::public_lookup_gpu_device_ids;
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) use gpu::public_lookup_round_robin_device_slot;
 
 use crate::{
     bgg::{encoding::BggEncoding, public_key::BggPublicKey},
@@ -44,6 +46,144 @@ pub(super) struct GGH15PublicLookupSharedState<M: PolyMatrix> {
 pub(super) struct GGH15PublicLookupSlotOutput<M: PolyMatrix> {
     pub vector: M,
     pub plaintext: M::P,
+}
+
+pub(super) fn build_public_lookup_output_chunk<M, HS>(
+    params: &<M::P as Poly>::Params,
+    plt: &PublicLut<M::P>,
+    dir: &Path,
+    checkpoint_prefix: &str,
+    hash_key: [u8; 32],
+    c_b0: &M,
+    shared: &GGH15PublicLookupSharedState<M>,
+    input_vector: &M,
+    x: &M::P,
+    gate_id: GateId,
+    lut_id: usize,
+    chunk_idx: usize,
+) -> M
+where
+    M: PolyMatrix,
+    HS: PolyHashSampler<[u8; 32], M = M>,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
+{
+    let x_u64 = x.const_coeff_u64();
+    let (k, y) = plt
+        .get(params, x_u64)
+        .unwrap_or_else(|| panic!("{:?} not found in LUT for gate {}", x_u64, gate_id));
+    let k_usize = usize::try_from(k).expect("LUT row index must fit in usize");
+    let y_poly = M::P::from_elem_to_constant(params, &y);
+
+    let lut_aux_prefix = format!("{checkpoint_prefix}_lut_aux_{}", lut_id);
+    let lut_aux_row_id = format!("{lut_aux_prefix}_idx{k}");
+    let gy = shared.gadget_matrix.as_ref().clone() * y_poly;
+    let scalar_by_digit = small_decomposed_scalar_digits::<M>(params, x, shared.k_small);
+    let gate1_total_cols = trapdoor_public_column_count::<M>(params, shared.d);
+    let u_g_id = format!("ggh15_lut_u_g_matrix_{}", gate_id);
+    let (col_start, col_len) = column_chunk_bounds(shared.m_g, chunk_idx);
+
+    let mut c_const_chunk = left_mul_chunked_checkpoint_column(
+        params,
+        dir,
+        &shared.preimage_gate2_identity_id_prefix,
+        shared.m_g,
+        chunk_idx,
+        c_b0,
+        "preimage_gate2_identity",
+    );
+
+    let gy_decomposed_chunk = gy.slice_columns(col_start, col_start + col_len).decompose();
+    let gy_mid = mul_chunked_checkpoint_with_rhs(
+        params,
+        dir,
+        &shared.preimage_gate2_gy_id_prefix,
+        shared.m_g,
+        &gy_decomposed_chunk,
+        "preimage_gate2_gy",
+    );
+    c_const_chunk.add_in_place(&(c_b0 * &gy_mid));
+
+    let v_idx_chunk = HS::new().sample_hash_decomposed_columns(
+        params,
+        hash_key,
+        format!("ggh15_lut_v_idx_{}_{}", lut_id, k_usize),
+        shared.d,
+        shared.m_g,
+        col_start,
+        col_len,
+        DistType::FinRingDist,
+    );
+    let v_mid = mul_chunked_checkpoint_with_rhs(
+        params,
+        dir,
+        &shared.preimage_gate2_v_id_prefix,
+        shared.m_g,
+        &v_idx_chunk,
+        "preimage_gate2_v",
+    );
+    c_const_chunk.add_in_place(&(c_b0 * &v_mid));
+
+    for small_chunk_idx in 0..shared.k_small {
+        let vx_rhs_chunk = build_small_decomposed_scalar_mul_chunk::<M>(
+            params,
+            &v_idx_chunk,
+            &scalar_by_digit,
+            small_chunk_idx,
+        );
+        let vx_mid = mul_chunked_checkpoint_with_rhs(
+            params,
+            dir,
+            &shared.preimage_gate2_vx_small_id_prefixes[small_chunk_idx],
+            shared.m_g,
+            &vx_rhs_chunk,
+            "preimage_gate2_vx",
+        );
+        c_const_chunk.add_in_place(&(c_b0 * &vx_mid));
+    }
+
+    let preimage_lut_chunk = read_matrix_column_chunk(
+        params,
+        dir,
+        &lut_aux_row_id,
+        shared.m_g,
+        chunk_idx,
+        "preimage_lut",
+    );
+    let preimage_lut_in_b0_basis = mul_chunked_checkpoint_with_rhs(
+        params,
+        dir,
+        &shared.preimage_gate1_id_prefix,
+        gate1_total_cols,
+        &preimage_lut_chunk,
+        "preimage_gate1",
+    );
+    c_const_chunk = c_const_chunk - (c_b0 * &preimage_lut_in_b0_basis);
+    let mut c_x_chunk_acc: Option<M> = None;
+    for inner_chunk_idx in 0..column_chunk_count(shared.m_g) {
+        let (inner_start, inner_len) = column_chunk_bounds(shared.m_g, inner_chunk_idx);
+        let u_g_decomposed_chunk = HS::new().sample_hash_decomposed_columns(
+            params,
+            hash_key,
+            u_g_id.clone(),
+            shared.d,
+            shared.m_g,
+            inner_start,
+            inner_len,
+            DistType::FinRingDist,
+        );
+        let lhs_mid = input_vector * &u_g_decomposed_chunk;
+        let v_rhs = v_idx_chunk.slice(inner_start, inner_start + inner_len, 0, col_len);
+        let randomized_mid = &lhs_mid * &v_rhs;
+        if let Some(acc) = c_x_chunk_acc.as_mut() {
+            acc.add_in_place(&randomized_mid);
+        } else {
+            c_x_chunk_acc = Some(randomized_mid);
+        }
+    }
+    let c_x_chunk =
+        c_x_chunk_acc.expect("public lookup randomized chunk accumulation must be non-empty");
+    c_const_chunk.add_in_place(&c_x_chunk);
+    c_const_chunk
 }
 
 pub(super) fn build_public_lookup_shared_state<M, HS>(
@@ -116,127 +256,28 @@ where
     for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
 {
     let x_u64 = x.const_coeff_u64();
-    let (k, y) = plt
+    let (_, y) = plt
         .get(params, x_u64)
         .unwrap_or_else(|| panic!("{:?} not found in LUT for gate {}", x_u64, gate_id));
-    let k_usize = usize::try_from(k).expect("LUT row index must fit in usize");
     let y_poly = M::P::from_elem_to_constant(params, &y);
 
-    let lut_aux_prefix = format!("{checkpoint_prefix}_lut_aux_{}", lut_id);
-    let lut_aux_row_id = format!("{lut_aux_prefix}_idx{k}");
-
-    let gy = shared.gadget_matrix.as_ref().clone() * y_poly.clone();
-    let scalar_by_digit = small_decomposed_scalar_digits::<M>(params, x, shared.k_small);
-    let gate1_total_cols = trapdoor_public_column_count::<M>(params, shared.d);
-    let u_g_id = format!("ggh15_lut_u_g_matrix_{}", gate_id);
     let mut output_chunks = Vec::with_capacity(column_chunk_count(shared.m_g));
     for chunk_idx in 0..column_chunk_count(shared.m_g) {
-        let (col_start, col_len) = column_chunk_bounds(shared.m_g, chunk_idx);
-        let col_end = col_start + col_len;
-        let mut c_const_chunk = left_mul_chunked_checkpoint_column(
+        output_chunks.push(build_public_lookup_output_chunk::<M, HS>(
             params,
+            plt,
             dir,
-            &shared.preimage_gate2_identity_id_prefix,
-            shared.m_g,
-            chunk_idx,
-            c_b0,
-            "preimage_gate2_identity",
-        );
-
-        let gy_decomposed_chunk = gy.slice_columns(col_start, col_end).decompose();
-        let gy_mid = mul_chunked_checkpoint_with_rhs(
-            params,
-            dir,
-            &shared.preimage_gate2_gy_id_prefix,
-            shared.m_g,
-            &gy_decomposed_chunk,
-            "preimage_gate2_gy",
-        );
-        c_const_chunk.add_in_place(&(c_b0 * &gy_mid));
-
-        let v_idx_chunk = HS::new().sample_hash_decomposed_columns(
-            params,
+            checkpoint_prefix,
             hash_key,
-            format!("ggh15_lut_v_idx_{}_{}", lut_id, k_usize),
-            shared.d,
-            shared.m_g,
-            col_start,
-            col_len,
-            DistType::FinRingDist,
-        );
-        let v_mid = mul_chunked_checkpoint_with_rhs(
-            params,
-            dir,
-            &shared.preimage_gate2_v_id_prefix,
-            shared.m_g,
-            &v_idx_chunk,
-            "preimage_gate2_v",
-        );
-        c_const_chunk.add_in_place(&(c_b0 * &v_mid));
-
-        for small_chunk_idx in 0..shared.k_small {
-            let vx_rhs_chunk = build_small_decomposed_scalar_mul_chunk::<M>(
-                params,
-                &v_idx_chunk,
-                &scalar_by_digit,
-                small_chunk_idx,
-            );
-            let vx_mid = mul_chunked_checkpoint_with_rhs(
-                params,
-                dir,
-                &shared.preimage_gate2_vx_small_id_prefixes[small_chunk_idx],
-                shared.m_g,
-                &vx_rhs_chunk,
-                "preimage_gate2_vx",
-            );
-            c_const_chunk.add_in_place(&(c_b0 * &vx_mid));
-        }
-
-        let preimage_lut_chunk = read_matrix_column_chunk(
-            params,
-            dir,
-            &lut_aux_row_id,
-            shared.m_g,
+            c_b0,
+            shared,
+            input_vector,
+            x,
+            gate_id,
+            lut_id,
             chunk_idx,
-            "preimage_lut",
-        );
-        let preimage_lut_in_b0_basis = mul_chunked_checkpoint_with_rhs(
-            params,
-            dir,
-            &shared.preimage_gate1_id_prefix,
-            gate1_total_cols,
-            &preimage_lut_chunk,
-            "preimage_gate1",
-        );
-        c_const_chunk = c_const_chunk - (c_b0 * &preimage_lut_in_b0_basis);
-        let mut c_x_chunk_acc: Option<M> = None;
-        for inner_chunk_idx in 0..column_chunk_count(shared.m_g) {
-            let (inner_start, inner_len) = column_chunk_bounds(shared.m_g, inner_chunk_idx);
-            let u_g_decomposed_chunk = HS::new().sample_hash_decomposed_columns(
-                params,
-                hash_key,
-                u_g_id.clone(),
-                shared.d,
-                shared.m_g,
-                inner_start,
-                inner_len,
-                DistType::FinRingDist,
-            );
-            let lhs_mid = input_vector * &u_g_decomposed_chunk;
-            let v_rhs = v_idx_chunk.slice(inner_start, inner_start + inner_len, 0, col_len);
-            let randomized_mid = &lhs_mid * &v_rhs;
-            if let Some(acc) = c_x_chunk_acc.as_mut() {
-                acc.add_in_place(&randomized_mid);
-            } else {
-                c_x_chunk_acc = Some(randomized_mid);
-            }
-        }
-        let c_x_chunk =
-            c_x_chunk_acc.expect("public lookup randomized chunk accumulation must be non-empty");
-        c_const_chunk.add_in_place(&c_x_chunk);
-        output_chunks.push(c_const_chunk);
+        ));
     }
-    drop(gy);
 
     let c_out = if output_chunks.len() == 1 {
         output_chunks.into_iter().next().expect("public lookup output chunk list must be non-empty")

@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     bgg::public_key::BggPublicKey,
-    lookup::ggh15::{public_lookup_gpu_device_ids, public_lookup_round_robin_device_slot},
+    lookup::ggh15::{pubkey::column_chunk_count, public_lookup_gpu_device_ids},
     poly::PolyParams,
 };
 use rayon::prelude::*;
@@ -16,7 +16,9 @@ use std::{
 };
 use tracing::debug;
 
-use crate::lookup::ggh15::encoding::GGH15PublicLookupSharedState;
+use crate::lookup::ggh15::encoding::{
+    GGH15PublicLookupSharedState, build_public_lookup_output_chunk,
+};
 
 pub(super) struct GpuPublicLookupSharedByDevice<M: PolyMatrix> {
     pub device_id: i32,
@@ -27,39 +29,33 @@ pub(super) struct GpuPublicLookupSharedByDevice<M: PolyMatrix> {
 struct DecodedPublicLookupSlot<'a, M: PolyMatrix> {
     slot_idx: usize,
     slot_started: Instant,
-    decode_ms: f64,
-    device_shared: &'a GpuPublicLookupSharedByDevice<M>,
-    c_b0: M,
-    input_vector: M,
-    x: M::P,
+    prepare_ms: f64,
+    _marker: std::marker::PhantomData<&'a GpuPublicLookupSharedByDevice<M>>,
+    c_b0_bytes: Arc<[u8]>,
+    input_vector_bytes: Arc<[u8]>,
+    x_bytes: Arc<[u8]>,
 }
 
 struct DecodedPublicLookupChunk<'a, M: PolyMatrix> {
     slot_start: usize,
     chunk_len: usize,
     chunk_started: Instant,
-    device_ids: Vec<i32>,
     slots: Vec<DecodedPublicLookupSlot<'a, M>>,
 }
 
-fn slot_device_ids() -> Vec<i32> {
-    public_lookup_gpu_device_ids()
+pub(super) fn effective_gpu_slot_parallelism(requested: usize) -> usize {
+    requested.min(public_lookup_gpu_device_ids().len().max(1)).max(1)
 }
 
-fn shared_device_for_slot_idx<M>(
-    shared_by_device: &[GpuPublicLookupSharedByDevice<M>],
-    slot_idx: usize,
-) -> &GpuPublicLookupSharedByDevice<M>
-where
-    M: PolyMatrix,
-{
-    let device_slot = public_lookup_round_robin_device_slot(slot_idx, shared_by_device.len());
-    &shared_by_device[device_slot]
+fn slot_device_ids_for_parallelism(slot_parallelism: usize) -> Vec<i32> {
+    let effective_parallelism = effective_gpu_slot_parallelism(slot_parallelism);
+    public_lookup_gpu_device_ids().into_iter().take(effective_parallelism).collect()
 }
 
 pub(super) fn prepare_public_lookup_shared_by_device<M>(
     params: &<M::P as Poly>::Params,
     shared: &GGH15PublicLookupSharedState<M>,
+    slot_parallelism: usize,
 ) -> Vec<GpuPublicLookupSharedByDevice<M>>
 where
     M: PolyMatrix,
@@ -67,7 +63,7 @@ where
     let gadget_matrix_bytes = Arc::<[u8]>::from(shared.gadget_matrix.as_ref().to_compact_bytes());
     let out_pubkey_matrix_bytes = Arc::<[u8]>::from(shared.out_pubkey.matrix.to_compact_bytes());
 
-    slot_device_ids()
+    slot_device_ids_for_parallelism(slot_parallelism)
         .into_par_iter()
         .map(|device_id| {
             let local_params = params.params_for_device(device_id);
@@ -121,11 +117,9 @@ where
     M::P: Send + Sync,
 {
     let chunk_started = Instant::now();
-    let device_ids = (0..chunk_len)
-        .map(|offset| shared_device_for_slot_idx(shared_by_device, slot_start + offset).device_id)
-        .collect::<Vec<_>>();
+    let device_ids = shared_by_device.iter().map(|entry| entry.device_id).collect::<Vec<_>>();
     debug!(
-        "GGH15 BGG poly-encoding gpu slot chunk started: gate_id={}, lut_id={}, slot_range=[{}, {}), chunk_size={}, device_ids={:?}, completed_before={}/{}",
+        "GGH15 BGG poly-encoding gpu slot chunk started: gate_id={}, lut_id={}, slot_range=[{}, {}), chunk_size={}, worker_device_ids={:?}, completed_before={}/{}",
         gate_id,
         lut_id,
         slot_start,
@@ -140,26 +134,23 @@ where
         .map(|offset| {
             let slot_started = Instant::now();
             let slot_idx = slot_start + offset;
-            let device_shared = shared_device_for_slot_idx(shared_by_device, slot_idx);
-            let local_params = &device_shared.params;
-            let decode_started = Instant::now();
-            let c_b0 = M::from_compact_bytes(local_params, c_b0_chunk[offset].as_ref());
-            let input_vector =
-                M::from_compact_bytes(local_params, input_vector_chunk[offset].as_ref());
-            let x = M::P::from_compact_bytes(local_params, x_chunk[offset].as_ref());
-            let decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+            let prepare_started = Instant::now();
+            let c_b0_bytes = Arc::clone(&c_b0_chunk[offset]);
+            let input_vector_bytes = Arc::clone(&input_vector_chunk[offset]);
+            let x_bytes = Arc::clone(&x_chunk[offset]);
+            let prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
             DecodedPublicLookupSlot {
                 slot_idx,
                 slot_started,
-                decode_ms,
-                device_shared,
-                c_b0,
-                input_vector,
-                x,
+                prepare_ms,
+                _marker: std::marker::PhantomData,
+                c_b0_bytes,
+                input_vector_bytes,
+                x_bytes,
             }
         })
         .collect::<Vec<_>>();
-    DecodedPublicLookupChunk { slot_start, chunk_len, chunk_started, device_ids, slots }
+    DecodedPublicLookupChunk { slot_start, chunk_len, chunk_started, slots }
 }
 
 fn apply_and_serialize_public_lookup_chunk<M, HS>(
@@ -171,6 +162,7 @@ fn apply_and_serialize_public_lookup_chunk<M, HS>(
     checkpoint_prefix: &str,
     hash_key: [u8; 32],
     completed_slots: &AtomicUsize,
+    shared_by_device: &[GpuPublicLookupSharedByDevice<M>],
     decoded_chunk: DecodedPublicLookupChunk<'_, M>,
 ) -> Vec<(Arc<[u8]>, Arc<[u8]>)>
 where
@@ -179,44 +171,94 @@ where
     M::P: Send + Sync,
     for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
 {
-    let DecodedPublicLookupChunk { slot_start, chunk_len, chunk_started, device_ids, slots } =
-        decoded_chunk;
+    let DecodedPublicLookupChunk { slot_start, chunk_len, chunk_started, slots } = decoded_chunk;
+    let chunk_count = column_chunk_count(shared_by_device[0].shared.m_g);
+    let base_params = &shared_by_device[0].params;
+    let slot_plaintext_bytes = slots
+        .iter()
+        .map(|slot| {
+            let x = M::P::from_compact_bytes(base_params, slot.x_bytes.as_ref());
+            let x_u64 = x.const_coeff_u64();
+            let (_, y) = plt
+                .get(base_params, x_u64)
+                .unwrap_or_else(|| panic!("{:?} not found in LUT for gate {}", x_u64, gate_id));
+            Arc::<[u8]>::from(M::P::from_elem_to_constant(base_params, &y).to_compact_bytes())
+        })
+        .collect::<Vec<_>>();
+    let mut chunk_bytes_by_slot = (0..chunk_len)
+        .map(|_| (0..chunk_count).map(|_| None).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let tasks = (0..chunk_len)
+        .flat_map(|slot_local_idx| {
+            (0..chunk_count).map(move |chunk_idx| (slot_local_idx, chunk_idx))
+        })
+        .collect::<Vec<_>>();
+    for wave in tasks.chunks(shared_by_device.len().max(1)) {
+        let wave_results = wave
+            .par_iter()
+            .enumerate()
+            .map(|(device_slot, (slot_local_idx, chunk_idx))| {
+                let shared_dev = &shared_by_device[device_slot];
+                let slot = &slots[*slot_local_idx];
+                let c_b0 = M::from_compact_bytes(&shared_dev.params, slot.c_b0_bytes.as_ref());
+                let input_vector =
+                    M::from_compact_bytes(&shared_dev.params, slot.input_vector_bytes.as_ref());
+                let x = M::P::from_compact_bytes(&shared_dev.params, slot.x_bytes.as_ref());
+                let output_chunk = build_public_lookup_output_chunk::<M, HS>(
+                    &shared_dev.params,
+                    plt,
+                    dir,
+                    checkpoint_prefix,
+                    hash_key,
+                    &c_b0,
+                    &shared_dev.shared,
+                    &input_vector,
+                    &x,
+                    gate_id,
+                    lut_id,
+                    *chunk_idx,
+                );
+                (*slot_local_idx, *chunk_idx, output_chunk.into_compact_bytes())
+            })
+            .collect::<Vec<_>>();
+        for (slot_local_idx, chunk_idx, bytes) in wave_results {
+            chunk_bytes_by_slot[slot_local_idx][chunk_idx] = Some(bytes);
+        }
+    }
     let chunk_outputs = slots
-        .into_par_iter()
-        .map(|decoded_slot| {
-            let DecodedPublicLookupSlot {
-                slot_idx,
-                slot_started,
-                decode_ms,
-                device_shared,
-                c_b0,
-                input_vector,
-                x,
-            } = decoded_slot;
-            let device_id = device_shared.device_id;
-            let local_params = &device_shared.params;
+        .into_iter()
+        .enumerate()
+        .map(|(slot_local_idx, decoded_slot)| {
+            let DecodedPublicLookupSlot { slot_idx, slot_started, prepare_ms, .. } = decoded_slot;
             let apply_started = Instant::now();
-            let slot_output = apply_public_lookup_to_slot::<M, HS>(
-                local_params,
-                plt,
-                dir,
-                checkpoint_prefix,
-                hash_key,
-                &c_b0,
-                &device_shared.shared,
-                &input_vector,
-                &x,
-                gate_id,
-                lut_id,
-            );
+            let output_chunks = chunk_bytes_by_slot[slot_local_idx]
+                .drain(..)
+                .enumerate()
+                .map(|(chunk_idx, maybe_bytes)| {
+                    let chunk_bytes = maybe_bytes.unwrap_or_else(|| {
+                        panic!(
+                            "missing public-lookup output chunk bytes for slot_local_idx={}, chunk_idx={}",
+                            slot_local_idx, chunk_idx
+                        )
+                    });
+                    M::from_compact_bytes(base_params, &chunk_bytes)
+                })
+                .collect::<Vec<_>>();
+            let out_vector = if output_chunks.len() == 1 {
+                output_chunks
+                    .into_iter()
+                    .next()
+                    .expect("public-lookup output chunk list must be non-empty")
+            } else {
+                let mut iter = output_chunks.into_iter();
+                let first = iter.next().expect("public-lookup output chunk list must be non-empty");
+                first.concat_columns_owned(iter.collect())
+            };
             let apply_ms = apply_started.elapsed().as_secs_f64() * 1000.0;
             let serialize_started = Instant::now();
-            let vector_bytes = Arc::<[u8]>::from(slot_output.vector.into_compact_bytes());
-            let plaintext_bytes = Arc::<[u8]>::from(slot_output.plaintext.to_compact_bytes());
+            let vector_bytes = Arc::<[u8]>::from(out_vector.into_compact_bytes());
+            let plaintext_bytes = Arc::clone(&slot_plaintext_bytes[slot_local_idx]);
             let serialize_ms = serialize_started.elapsed().as_secs_f64() * 1000.0;
-            drop(c_b0);
-            drop(input_vector);
-            drop(x);
             let completed_slot_count = completed_slots.fetch_add(1, Ordering::Relaxed) + 1;
             debug_slot_stage_timings(
                 "GGH15 BGG poly-encoding gpu slot",
@@ -225,25 +267,24 @@ where
                 slot_idx,
                 completed_slot_count,
                 input_slot_count,
-                decode_ms,
+                prepare_ms,
                 apply_ms,
                 serialize_ms,
                 slot_started.elapsed().as_secs_f64() * 1000.0,
-                Some(device_id),
+                None,
             );
             (vector_bytes, plaintext_bytes)
         })
         .collect::<Vec<_>>();
     debug!(
-        "GGH15 BGG poly-encoding gpu slot chunk finished: gate_id={}, lut_id={}, slot_range=[{}, {}), completed_after={}/{}, elapsed_ms={:.3}, device_ids={:?}",
+        "GGH15 BGG poly-encoding gpu slot chunk finished: gate_id={}, lut_id={}, slot_range=[{}, {}), completed_after={}/{}, elapsed_ms={:.3}",
         gate_id,
         lut_id,
         slot_start,
         slot_start + chunk_len,
         completed_slots.load(Ordering::Relaxed),
         input_slot_count,
-        chunk_started.elapsed().as_secs_f64() * 1000.0,
-        device_ids
+        chunk_started.elapsed().as_secs_f64() * 1000.0
     );
     chunk_outputs
 }
@@ -277,7 +318,8 @@ where
         configured_parallelism
     );
     let prepare_started = Instant::now();
-    let shared_by_device = prepare_public_lookup_shared_by_device::<M>(params, shared);
+    let shared_by_device =
+        prepare_public_lookup_shared_by_device::<M>(params, shared, configured_parallelism);
     let prepared_device_ids =
         shared_by_device.iter().map(|entry| entry.device_id).collect::<Vec<_>>();
     debug!(
@@ -324,6 +366,7 @@ where
                         checkpoint_prefix,
                         hash_key,
                         &completed_slots,
+                        &shared_by_device,
                         decoded_chunk,
                     )
                 },
@@ -360,6 +403,7 @@ where
                 checkpoint_prefix,
                 hash_key,
                 &completed_slots,
+                &shared_by_device,
                 decoded_chunk,
             );
             let (chunk_vector_bytes, chunk_plaintext_bytes): (Vec<_>, Vec<_>) =
@@ -381,7 +425,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::slot_device_ids;
+    use super::{effective_gpu_slot_parallelism, slot_device_ids_for_parallelism};
     use crate::{
         __PAIR, __TestState, lookup::ggh15::public_lookup_round_robin_device_slot,
         poly::dcrt::gpu::detected_gpu_device_ids,
@@ -393,7 +437,7 @@ mod tests {
         let detected_gpu_ids = detected_gpu_device_ids();
 
         if detected_gpu_ids.is_empty() {
-            let panic = std::panic::catch_unwind(slot_device_ids)
+            let panic = std::panic::catch_unwind(|| slot_device_ids_for_parallelism(1))
                 .expect_err("without detected GPUs the helper should reject slot processing");
             let panic_msg = panic
                 .downcast_ref::<String>()
@@ -404,7 +448,18 @@ mod tests {
             return;
         }
 
-        assert_eq!(slot_device_ids(), detected_gpu_ids);
+        let slot_parallelism = detected_gpu_ids.len().min(2);
+        assert_eq!(
+            slot_device_ids_for_parallelism(slot_parallelism),
+            detected_gpu_ids[..slot_parallelism].to_vec()
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_ggh15_effective_gpu_slot_parallelism_clamps_to_detected_gpus() {
+        let detected_count = detected_gpu_device_ids().len().max(1);
+        assert_eq!(effective_gpu_slot_parallelism(detected_count + 5), detected_count);
     }
 
     #[test]

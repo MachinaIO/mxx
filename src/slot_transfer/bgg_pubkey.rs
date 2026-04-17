@@ -718,12 +718,11 @@ where
         );
         let mut slot_a_bytes_by_slot = vec![Vec::new(); self.num_slots];
         #[cfg(feature = "gpu")]
-        let gpu_shared = self.prepare_gpu_device_shared(
+        let gpu_slot_b0_shared = self.prepare_gpu_slot_aux_b0_shared(
             params,
             &b0_matrix,
             &b0_trapdoor,
             &b1_matrix,
-            &b1_trapdoor,
             slot_parallelism,
         );
         #[cfg(not(feature = "gpu"))]
@@ -733,9 +732,22 @@ where
 
         #[cfg(feature = "gpu")]
         {
-            slot_a_bytes_by_slot = self.sample_slot_batches_gpu_pipelined(
+            self.sample_slot_b0_batches_gpu_pipelined(
                 params,
-                &gpu_shared,
+                &gpu_slot_b0_shared,
+                &slot_secret_mats,
+                slot_parallelism,
+            );
+            drop(gpu_slot_b0_shared);
+            let gpu_slot_b1_shared = self.prepare_gpu_slot_aux_b1_shared(
+                params,
+                &b1_matrix,
+                &b1_trapdoor,
+                slot_parallelism,
+            );
+            slot_a_bytes_by_slot = self.sample_slot_b1_batches_gpu_pipelined(
+                params,
+                &gpu_slot_b1_shared,
                 &slot_secret_mats,
                 slot_parallelism,
             );
@@ -829,9 +841,16 @@ where
             let gate_parallelism = slot_parallelism.min(gate_slot_entries.len().max(1));
             info!("Slot-transfer gate {} effective parallelism: {}", gate_id, gate_parallelism);
             #[cfg(feature = "gpu")]
+            let gpu_gate_shared = self.prepare_gpu_slot_gate_shared(
+                params,
+                &b0_matrix,
+                &b0_trapdoor,
+                gate_parallelism,
+            );
+            #[cfg(feature = "gpu")]
             self.sample_gate_batches_gpu_pipelined(
                 params,
-                &gpu_shared,
+                &gpu_gate_shared,
                 &slot_secret_mats,
                 &slot_a_bytes_by_slot,
                 *gate_id,

@@ -760,6 +760,7 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
             total_lut_entries,
             total_public_lut_gates,
         );
+    gpu_device_sync();
     let pubkey_slot_transfer_aux_estimate = pubkey_bench_estimator_owner
         .estimate_slot_transfer_sample_aux_matrices(
             &params,

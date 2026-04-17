@@ -21,7 +21,7 @@ use std::{
     time::Instant,
 };
 
-pub(crate) struct GpuSlotTransferDeviceShared<M, T>
+pub(crate) struct GpuSlotAuxB0DeviceShared<M, T>
 where
     M: PolyMatrix,
     T: Send + Sync,
@@ -29,10 +29,29 @@ where
     params: <<M as PolyMatrix>::P as Poly>::Params,
     b0_trapdoor: T,
     b0_matrix: M,
-    b1_trapdoor: T,
     b1_matrix: M,
     identity: M,
+}
+
+pub(crate) struct GpuSlotAuxB1DeviceShared<M, T>
+where
+    M: PolyMatrix,
+    T: Send + Sync,
+{
+    params: <<M as PolyMatrix>::P as Poly>::Params,
+    b1_trapdoor: T,
+    b1_matrix: M,
     gadget_matrix: M,
+}
+
+pub(crate) struct GpuSlotGateDeviceShared<M, T>
+where
+    M: PolyMatrix,
+    T: Send + Sync,
+{
+    params: <<M as PolyMatrix>::P as Poly>::Params,
+    b0_trapdoor: T,
+    b0_matrix: M,
 }
 
 struct GpuSlotAuxTarget {
@@ -50,15 +69,23 @@ where
     _m: std::marker::PhantomData<M>,
 }
 
-struct StoredSlotAuxSample {
+struct StoredSlotB0AuxSample {
+    slot_idx: usize,
+    preimage_b0_bytes: Vec<Vec<u8>>,
+}
+
+struct ComputedSlotB0Batch {
+    samples: Vec<StoredSlotB0AuxSample>,
+}
+
+struct StoredSlotB1AuxSample {
     slot_idx: usize,
     slot_a_bytes: Vec<u8>,
-    preimage_b0_bytes: Vec<Vec<u8>>,
     preimage_b1_bytes: Vec<Vec<u8>>,
 }
 
-struct ComputedSlotBatch {
-    samples: Vec<StoredSlotAuxSample>,
+struct ComputedSlotB1Batch {
+    samples: Vec<StoredSlotB1AuxSample>,
 }
 
 struct PreparedGateBatch<M>
@@ -102,15 +129,14 @@ where
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
 {
-    pub(crate) fn prepare_gpu_device_shared(
+    pub(crate) fn prepare_gpu_slot_aux_b0_shared(
         &self,
         params: &<M::P as Poly>::Params,
         b0_matrix: &M,
         b0_trapdoor: &TS::Trapdoor,
         b1_matrix: &M,
-        b1_trapdoor: &TS::Trapdoor,
         parallelism: usize,
-    ) -> Vec<GpuSlotTransferDeviceShared<M, TS::Trapdoor>> {
+    ) -> Vec<GpuSlotAuxB0DeviceShared<M, TS::Trapdoor>> {
         let device_ids = detected_gpu_device_ids();
         assert!(
             !device_ids.is_empty(),
@@ -126,16 +152,14 @@ where
         let b0_matrix_bytes = b0_matrix.to_compact_bytes();
         let b1_matrix_bytes = b1_matrix.to_compact_bytes();
         let b0_trapdoor_bytes = TS::trapdoor_to_bytes(b0_trapdoor);
-        let b1_trapdoor_bytes = TS::trapdoor_to_bytes(b1_trapdoor);
 
         device_ids
             .into_par_iter()
             .take(parallelism)
             .map(|device_id| {
                 let local_params = params.params_for_device(device_id);
-                GpuSlotTransferDeviceShared {
+                GpuSlotAuxB0DeviceShared {
                     identity: M::identity(&local_params, self.secret_size, None),
-                    gadget_matrix: M::gadget_matrix(&local_params, self.secret_size),
                     b0_trapdoor: TS::trapdoor_from_bytes(&local_params, &b0_trapdoor_bytes)
                         .unwrap_or_else(|| {
                             panic!(
@@ -143,6 +167,42 @@ where
                             )
                         }),
                     b0_matrix: M::from_compact_bytes(&local_params, &b0_matrix_bytes),
+                    b1_matrix: M::from_compact_bytes(&local_params, &b1_matrix_bytes),
+                    params: local_params,
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn prepare_gpu_slot_aux_b1_shared(
+        &self,
+        params: &<M::P as Poly>::Params,
+        b1_matrix: &M,
+        b1_trapdoor: &TS::Trapdoor,
+        parallelism: usize,
+    ) -> Vec<GpuSlotAuxB1DeviceShared<M, TS::Trapdoor>> {
+        let device_ids = detected_gpu_device_ids();
+        assert!(
+            !device_ids.is_empty(),
+            "at least one GPU device is required for slot-transfer auxiliary sampling"
+        );
+        assert!(
+            parallelism <= device_ids.len(),
+            "slot-transfer GPU parallelism must be <= detected GPU count: requested={}, devices={}",
+            parallelism,
+            device_ids.len()
+        );
+
+        let b1_matrix_bytes = b1_matrix.to_compact_bytes();
+        let b1_trapdoor_bytes = TS::trapdoor_to_bytes(b1_trapdoor);
+
+        device_ids
+            .into_par_iter()
+            .take(parallelism)
+            .map(|device_id| {
+                let local_params = params.params_for_device(device_id);
+                GpuSlotAuxB1DeviceShared {
+                    gadget_matrix: M::gadget_matrix(&local_params, self.secret_size),
                     b1_trapdoor: TS::trapdoor_from_bytes(&local_params, &b1_trapdoor_bytes)
                         .unwrap_or_else(|| {
                             panic!(
@@ -156,9 +216,112 @@ where
             .collect()
     }
 
+    pub(crate) fn prepare_gpu_slot_gate_shared(
+        &self,
+        params: &<M::P as Poly>::Params,
+        b0_matrix: &M,
+        b0_trapdoor: &TS::Trapdoor,
+        parallelism: usize,
+    ) -> Vec<GpuSlotGateDeviceShared<M, TS::Trapdoor>> {
+        let device_ids = detected_gpu_device_ids();
+        assert!(
+            !device_ids.is_empty(),
+            "at least one GPU device is required for slot-transfer auxiliary sampling"
+        );
+        assert!(
+            parallelism <= device_ids.len(),
+            "slot-transfer GPU parallelism must be <= detected GPU count: requested={}, devices={}",
+            parallelism,
+            device_ids.len()
+        );
+
+        let b0_matrix_bytes = b0_matrix.to_compact_bytes();
+        let b0_trapdoor_bytes = TS::trapdoor_to_bytes(b0_trapdoor);
+
+        device_ids
+            .into_par_iter()
+            .take(parallelism)
+            .map(|device_id| {
+                let local_params = params.params_for_device(device_id);
+                GpuSlotGateDeviceShared {
+                    b0_trapdoor: TS::trapdoor_from_bytes(&local_params, &b0_trapdoor_bytes)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "failed to decode slot-transfer b0 trapdoor for device {device_id}"
+                            )
+                        }),
+                    b0_matrix: M::from_compact_bytes(&local_params, &b0_matrix_bytes),
+                    params: local_params,
+                }
+            })
+            .collect()
+    }
+
+    fn benchmark_gpu_params(&self, params: &<M::P as Poly>::Params) -> <M::P as Poly>::Params {
+        let device_id = *detected_gpu_device_ids()
+            .first()
+            .expect("at least one GPU device is required for slot-transfer auxiliary benchmarking");
+        params.params_for_device(device_id)
+    }
+
+    fn prepare_gpu_slot_aux_b0_bench_shared(
+        &self,
+        params: &<M::P as Poly>::Params,
+        b0_matrix: &M,
+        b0_trapdoor: &TS::Trapdoor,
+        b1_matrix_bytes: &[u8],
+    ) -> GpuSlotAuxB0DeviceShared<M, TS::Trapdoor> {
+        let local_params = self.benchmark_gpu_params(params);
+        let b0_matrix_bytes = b0_matrix.to_compact_bytes();
+        let b0_trapdoor_bytes = TS::trapdoor_to_bytes(b0_trapdoor);
+        GpuSlotAuxB0DeviceShared {
+            identity: M::identity(&local_params, self.secret_size, None),
+            b0_trapdoor: TS::trapdoor_from_bytes(&local_params, &b0_trapdoor_bytes)
+                .expect("failed to decode slot-transfer benchmark b0 trapdoor"),
+            b0_matrix: M::from_compact_bytes(&local_params, &b0_matrix_bytes),
+            b1_matrix: M::from_compact_bytes(&local_params, b1_matrix_bytes),
+            params: local_params,
+        }
+    }
+
+    fn prepare_gpu_slot_aux_b1_bench_shared(
+        &self,
+        params: &<M::P as Poly>::Params,
+        b1_matrix: &M,
+        b1_trapdoor: &TS::Trapdoor,
+    ) -> GpuSlotAuxB1DeviceShared<M, TS::Trapdoor> {
+        let local_params = self.benchmark_gpu_params(params);
+        let b1_matrix_bytes = b1_matrix.to_compact_bytes();
+        let b1_trapdoor_bytes = TS::trapdoor_to_bytes(b1_trapdoor);
+        GpuSlotAuxB1DeviceShared {
+            gadget_matrix: M::gadget_matrix(&local_params, self.secret_size),
+            b1_trapdoor: TS::trapdoor_from_bytes(&local_params, &b1_trapdoor_bytes)
+                .expect("failed to decode slot-transfer benchmark b1 trapdoor"),
+            b1_matrix: M::from_compact_bytes(&local_params, &b1_matrix_bytes),
+            params: local_params,
+        }
+    }
+
+    fn prepare_gpu_slot_gate_bench_shared(
+        &self,
+        params: &<M::P as Poly>::Params,
+        b0_matrix: &M,
+        b0_trapdoor: &TS::Trapdoor,
+    ) -> GpuSlotGateDeviceShared<M, TS::Trapdoor> {
+        let local_params = self.benchmark_gpu_params(params);
+        let b0_matrix_bytes = b0_matrix.to_compact_bytes();
+        let b0_trapdoor_bytes = TS::trapdoor_to_bytes(b0_trapdoor);
+        GpuSlotGateDeviceShared {
+            b0_trapdoor: TS::trapdoor_from_bytes(&local_params, &b0_trapdoor_bytes)
+                .expect("failed to decode slot-transfer benchmark b0 trapdoor"),
+            b0_matrix: M::from_compact_bytes(&local_params, &b0_matrix_bytes),
+            params: local_params,
+        }
+    }
+
     fn build_slot_aux_b1_target_chunk_gpu(
         &self,
-        shared: &GpuSlotTransferDeviceShared<M, TS::Trapdoor>,
+        shared: &GpuSlotAuxB1DeviceShared<M, TS::Trapdoor>,
         slot_idx: usize,
         slot_secret_mat: &M,
         chunk_idx: usize,
@@ -186,7 +349,7 @@ where
 
     fn build_slot_aux_b0_target_chunk_gpu(
         &self,
-        shared: &GpuSlotTransferDeviceShared<M, TS::Trapdoor>,
+        shared: &GpuSlotAuxB0DeviceShared<M, TS::Trapdoor>,
         slot_secret_mat: &M,
         chunk_idx: usize,
     ) -> M {
@@ -207,7 +370,7 @@ where
 
     fn build_gate_target_chunk_gpu(
         &self,
-        shared: &GpuSlotTransferDeviceShared<M, TS::Trapdoor>,
+        shared: &GpuSlotGateDeviceShared<M, TS::Trapdoor>,
         gate_id: GateId,
         lhs_input: &M,
         s_j: &M,
@@ -243,53 +406,20 @@ where
         target_chunk
     }
 
-    fn sample_slot_batch_gpu(
+    fn sample_slot_b0_batch_gpu(
         &self,
-        shared_by_device: &[GpuSlotTransferDeviceShared<M, TS::Trapdoor>],
+        shared_by_device: &[GpuSlotAuxB0DeviceShared<M, TS::Trapdoor>],
         prepared_batch: PreparedSlotBatch<M>,
-    ) -> ComputedSlotBatch {
+    ) -> ComputedSlotB0Batch {
         let trap_sampler = TS::new(&shared_by_device[0].params, self.trapdoor_sigma);
         let PreparedSlotBatch { batch_slot_indices, slot_secret_bytes_by_slot, .. } =
             prepared_batch;
-        let m_g = self.secret_size * shared_by_device[0].params.modulus_digits();
         let b0_target_cols = shared_by_device[0].b1_matrix.col_size();
         let b0_chunk_count = column_chunk_count(b0_target_cols);
-        let b1_chunk_count = column_chunk_count(m_g);
-        let slot_targets = batch_slot_indices
-            .par_iter()
-            .copied()
-            .map(|slot_idx| {
-                let shared = &shared_by_device[slot_idx % shared_by_device.len()];
-                let slot_a_bytes = HS::new()
-                    .sample_hash(
-                        &shared.params,
-                        self.hash_key,
-                        format!("slot_transfer_slot_a_{}", slot_idx),
-                        self.secret_size,
-                        m_g,
-                        DistType::FinRingDist,
-                    )
-                    .into_compact_bytes();
-                let slot_secret_bytes = slot_secret_bytes_by_slot
-                    .get(&slot_idx)
-                    .unwrap_or_else(|| panic!("missing slot secret bytes for slot_idx={slot_idx}"))
-                    .clone();
-                GpuSlotAuxTarget { slot_idx, slot_secret_bytes, slot_a_bytes }
-            })
-            .collect::<Vec<_>>();
-        let mut slot_targets_by_idx = slot_targets
-            .into_iter()
-            .map(|target| (target.slot_idx, target))
-            .collect::<HashMap<usize, GpuSlotAuxTarget>>();
         let mut preimages_b0 = batch_slot_indices
             .iter()
             .copied()
             .map(|slot_idx| (slot_idx, vec![Vec::new(); b0_chunk_count]))
-            .collect::<HashMap<usize, Vec<Vec<u8>>>>();
-        let mut preimages_b1 = batch_slot_indices
-            .iter()
-            .copied()
-            .map(|slot_idx| (slot_idx, vec![Vec::new(); b1_chunk_count]))
             .collect::<HashMap<usize, Vec<Vec<u8>>>>();
 
         let b0_tasks = batch_slot_indices
@@ -302,12 +432,13 @@ where
                 .par_iter()
                 .enumerate()
                 .map(|(device_idx, (slot_idx, chunk_idx))| {
-                    let slot_target = slot_targets_by_idx.get(slot_idx).unwrap_or_else(|| {
-                        panic!("missing gpu slot target for slot_idx={slot_idx}")
-                    });
                     let shared = &shared_by_device[device_idx];
-                    let slot_secret_mat =
-                        M::from_compact_bytes(&shared.params, &slot_target.slot_secret_bytes);
+                    let slot_secret_mat = M::from_compact_bytes(
+                        &shared.params,
+                        slot_secret_bytes_by_slot.get(slot_idx).unwrap_or_else(|| {
+                            panic!("missing slot secret bytes for slot_idx={slot_idx}")
+                        }),
+                    );
                     let target_chunk = self.build_slot_aux_b0_target_chunk_gpu(
                         shared,
                         &slot_secret_mat,
@@ -337,6 +468,61 @@ where
                 })[*chunk_idx] = preimage_chunk.to_compact_bytes();
             }
         }
+
+        let samples = batch_slot_indices
+            .iter()
+            .copied()
+            .map(|slot_idx| {
+                let preimage_b0_chunks = preimages_b0
+                    .remove(&slot_idx)
+                    .unwrap_or_else(|| panic!("missing gpu b0 preimage for slot_idx={slot_idx}"));
+                StoredSlotB0AuxSample { slot_idx, preimage_b0_bytes: preimage_b0_chunks }
+            })
+            .collect();
+        ComputedSlotB0Batch { samples }
+    }
+
+    fn sample_slot_b1_batch_gpu(
+        &self,
+        shared_by_device: &[GpuSlotAuxB1DeviceShared<M, TS::Trapdoor>],
+        prepared_batch: PreparedSlotBatch<M>,
+    ) -> ComputedSlotB1Batch {
+        let trap_sampler = TS::new(&shared_by_device[0].params, self.trapdoor_sigma);
+        let PreparedSlotBatch { batch_slot_indices, slot_secret_bytes_by_slot, .. } =
+            prepared_batch;
+        let m_g = self.secret_size * shared_by_device[0].params.modulus_digits();
+        let b1_chunk_count = column_chunk_count(m_g);
+        let slot_targets = batch_slot_indices
+            .par_iter()
+            .copied()
+            .map(|slot_idx| {
+                let shared = &shared_by_device[slot_idx % shared_by_device.len()];
+                let slot_a_bytes = HS::new()
+                    .sample_hash(
+                        &shared.params,
+                        self.hash_key,
+                        format!("slot_transfer_slot_a_{}", slot_idx),
+                        self.secret_size,
+                        m_g,
+                        DistType::FinRingDist,
+                    )
+                    .into_compact_bytes();
+                let slot_secret_bytes = slot_secret_bytes_by_slot
+                    .get(&slot_idx)
+                    .unwrap_or_else(|| panic!("missing slot secret bytes for slot_idx={slot_idx}"))
+                    .clone();
+                GpuSlotAuxTarget { slot_idx, slot_secret_bytes, slot_a_bytes }
+            })
+            .collect::<Vec<_>>();
+        let mut slot_targets_by_idx = slot_targets
+            .into_iter()
+            .map(|target| (target.slot_idx, target))
+            .collect::<HashMap<usize, GpuSlotAuxTarget>>();
+        let mut preimages_b1 = batch_slot_indices
+            .iter()
+            .copied()
+            .map(|slot_idx| (slot_idx, vec![Vec::new(); b1_chunk_count]))
+            .collect::<HashMap<usize, Vec<Vec<u8>>>>();
 
         let b1_tasks = batch_slot_indices
             .iter()
@@ -392,27 +578,22 @@ where
                 let slot_target = slot_targets_by_idx
                     .remove(&slot_idx)
                     .unwrap_or_else(|| panic!("missing gpu slot target for slot_idx={slot_idx}"));
-                let preimage_b0_chunks = preimages_b0
-                    .remove(&slot_idx)
-                    .unwrap_or_else(|| panic!("missing gpu b0 preimage for slot_idx={slot_idx}"));
                 let preimage_b1_chunks = preimages_b1
                     .remove(&slot_idx)
                     .unwrap_or_else(|| panic!("missing gpu b1 preimage for slot_idx={slot_idx}"));
-                StoredSlotAuxSample {
+                StoredSlotB1AuxSample {
                     slot_idx,
                     slot_a_bytes: slot_target.slot_a_bytes,
-                    preimage_b0_bytes: preimage_b0_chunks,
                     preimage_b1_bytes: preimage_b1_chunks,
                 }
             })
             .collect();
-        ComputedSlotBatch { samples }
+        ComputedSlotB1Batch { samples }
     }
 
     fn prepare_slot_batch_gpu(
         &self,
         slot_secret_mats: &[Vec<u8>],
-        _shared_by_device: &[GpuSlotTransferDeviceShared<M, TS::Trapdoor>],
         batch_slot_indices: &[usize],
     ) -> PreparedSlotBatch<M> {
         PreparedSlotBatch {
@@ -426,10 +607,28 @@ where
         }
     }
 
-    fn finalize_slot_batch_gpu(
+    fn finalize_slot_b0_batch_gpu(
         &self,
         params: &<M::P as Poly>::Params,
-        computed_batch: ComputedSlotBatch,
+        computed_batch: ComputedSlotB0Batch,
+    ) {
+        computed_batch.samples.into_par_iter().for_each(|sample| {
+            for (chunk_idx, bytes) in sample.preimage_b0_bytes.into_iter().enumerate() {
+                Self::store_bytes_checkpoint(
+                    bytes,
+                    &column_chunk_id_prefix(
+                        &self.slot_preimage_b0_id_prefix(params, sample.slot_idx),
+                        chunk_idx,
+                    ),
+                );
+            }
+        });
+    }
+
+    fn finalize_slot_b1_batch_gpu(
+        &self,
+        params: &<M::P as Poly>::Params,
+        computed_batch: ComputedSlotB1Batch,
         slot_a_bytes_by_slot: &mut [Vec<u8>],
     ) {
         let samples = computed_batch.samples;
@@ -439,15 +638,6 @@ where
                 sample.slot_a_bytes.clone(),
                 &self.slot_a_id_prefix(params, slot_idx),
             );
-            for (chunk_idx, bytes) in sample.preimage_b0_bytes.iter().cloned().enumerate() {
-                Self::store_bytes_checkpoint(
-                    bytes,
-                    &column_chunk_id_prefix(
-                        &self.slot_preimage_b0_id_prefix(params, slot_idx),
-                        chunk_idx,
-                    ),
-                );
-            }
             for (chunk_idx, bytes) in sample.preimage_b1_bytes.iter().cloned().enumerate() {
                 Self::store_bytes_checkpoint(
                     bytes,
@@ -463,10 +653,56 @@ where
         }
     }
 
-    pub(crate) fn sample_slot_batches_gpu_pipelined(
+    pub(crate) fn sample_slot_b0_batches_gpu_pipelined(
         &self,
         params: &<M::P as Poly>::Params,
-        shared_by_device: &[GpuSlotTransferDeviceShared<M, TS::Trapdoor>],
+        shared_by_device: &[GpuSlotAuxB0DeviceShared<M, TS::Trapdoor>],
+        slot_secret_mats: &[Vec<u8>],
+        slot_parallelism: usize,
+    ) {
+        let chunks = (0..self.num_slots)
+            .collect::<Vec<_>>()
+            .chunks(slot_parallelism.max(1))
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        if chunks.is_empty() {
+            return;
+        }
+
+        thread::scope(|scope| {
+            let (prepared_tx, prepared_rx) = sync_channel::<PreparedSlotBatch<M>>(1);
+            let (computed_tx, computed_rx) = sync_channel::<ComputedSlotB0Batch>(1);
+
+            let load_handle = scope.spawn(move || {
+                for batch_slot_indices in chunks {
+                    let prepared_batch =
+                        self.prepare_slot_batch_gpu(slot_secret_mats, &batch_slot_indices);
+                    prepared_tx.send(prepared_batch).expect("slot pipeline compute stage dropped");
+                }
+            });
+            let compute_handle = scope.spawn(move || {
+                while let Some(prepared_batch) = recv_next(&prepared_rx, "slot-load") {
+                    let computed_batch =
+                        self.sample_slot_b0_batch_gpu(shared_by_device, prepared_batch);
+                    computed_tx.send(computed_batch).expect("slot pipeline store stage dropped");
+                }
+            });
+            let store_handle = scope.spawn(move || {
+                while let Some(computed_batch) = recv_next(&computed_rx, "slot-compute") {
+                    self.finalize_slot_b0_batch_gpu(params, computed_batch);
+                }
+            });
+
+            load_handle.join().expect("slot pipeline load stage panicked");
+            compute_handle.join().expect("slot pipeline compute stage panicked");
+            store_handle.join().expect("slot pipeline store stage panicked");
+        });
+    }
+
+    pub(crate) fn sample_slot_b1_batches_gpu_pipelined(
+        &self,
+        params: &<M::P as Poly>::Params,
+        shared_by_device: &[GpuSlotAuxB1DeviceShared<M, TS::Trapdoor>],
         slot_secret_mats: &[Vec<u8>],
         slot_parallelism: usize,
     ) -> Vec<Vec<u8>> {
@@ -483,28 +719,29 @@ where
         thread::scope(|scope| {
             let slot_a_bytes_by_slot_ref = &mut slot_a_bytes_by_slot;
             let (prepared_tx, prepared_rx) = sync_channel::<PreparedSlotBatch<M>>(1);
-            let (computed_tx, computed_rx) = sync_channel::<ComputedSlotBatch>(1);
+            let (computed_tx, computed_rx) = sync_channel::<ComputedSlotB1Batch>(1);
 
             let load_handle = scope.spawn(move || {
                 for batch_slot_indices in chunks {
-                    let prepared_batch = self.prepare_slot_batch_gpu(
-                        slot_secret_mats,
-                        shared_by_device,
-                        &batch_slot_indices,
-                    );
+                    let prepared_batch =
+                        self.prepare_slot_batch_gpu(slot_secret_mats, &batch_slot_indices);
                     prepared_tx.send(prepared_batch).expect("slot pipeline compute stage dropped");
                 }
             });
             let compute_handle = scope.spawn(move || {
                 while let Some(prepared_batch) = recv_next(&prepared_rx, "slot-load") {
                     let computed_batch =
-                        self.sample_slot_batch_gpu(shared_by_device, prepared_batch);
+                        self.sample_slot_b1_batch_gpu(shared_by_device, prepared_batch);
                     computed_tx.send(computed_batch).expect("slot pipeline store stage dropped");
                 }
             });
             let store_handle = scope.spawn(move || {
                 while let Some(computed_batch) = recv_next(&computed_rx, "slot-compute") {
-                    self.finalize_slot_batch_gpu(params, computed_batch, slot_a_bytes_by_slot_ref);
+                    self.finalize_slot_b1_batch_gpu(
+                        params,
+                        computed_batch,
+                        slot_a_bytes_by_slot_ref,
+                    );
                 }
             });
 
@@ -518,7 +755,7 @@ where
 
     fn sample_gate_batch_gpu(
         &self,
-        shared_by_device: &[GpuSlotTransferDeviceShared<M, TS::Trapdoor>],
+        shared_by_device: &[GpuSlotGateDeviceShared<M, TS::Trapdoor>],
         gate_id: GateId,
         state: &BggPublicKeySTGateState,
         prepared_batch: PreparedGateBatch<M>,
@@ -625,7 +862,6 @@ where
         &self,
         slot_secret_mats: &[Vec<u8>],
         slot_a_bytes_by_slot: &[Vec<u8>],
-        _shared_by_device: &[GpuSlotTransferDeviceShared<M, TS::Trapdoor>],
         slot_chunk: &[(usize, (u32, Option<u32>))],
     ) -> PreparedGateBatch<M> {
         let mut slot_secret_bytes_by_slot = HashMap::<usize, Vec<u8>>::new();
@@ -674,7 +910,7 @@ where
     pub(crate) fn sample_gate_batches_gpu_pipelined(
         &self,
         params: &<M::P as Poly>::Params,
-        shared_by_device: &[GpuSlotTransferDeviceShared<M, TS::Trapdoor>],
+        shared_by_device: &[GpuSlotGateDeviceShared<M, TS::Trapdoor>],
         slot_secret_mats: &[Vec<u8>],
         slot_a_bytes_by_slot: &[Vec<u8>],
         gate_id: GateId,
@@ -703,7 +939,6 @@ where
                     let prepared_batch = self.prepare_gate_batch_gpu(
                         slot_secret_mats,
                         slot_a_bytes_by_slot,
-                        shared_by_device,
                         &slot_chunk,
                     );
                     prepared_tx.send(prepared_batch).expect("gate pipeline compute stage dropped");
@@ -743,34 +978,22 @@ where
     type Params = <M::P as Poly>::Params;
 
     fn sample_aux_matrices_slot_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate {
-        let trap_sampler = TS::new(params, self.trapdoor_sigma);
-        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, self.secret_size);
         let b1_size =
             self.secret_size.checked_mul(2).expect("slot-transfer benchmark b1 size overflow");
-        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, b1_size);
-        let gpu_shared = self.prepare_gpu_device_shared(
-            params,
-            &b0_matrix,
-            &b0_trapdoor,
-            &b1_matrix,
-            &b1_trapdoor,
-            1,
-        );
         let total_chunk_count =
             crate::slot_transfer::bgg_pubkey::slot_aux_chunk_count::<M>(params, self.secret_size);
-        let shared = &gpu_shared[0];
-        let b0_chunk_count = column_chunk_count(shared.b1_matrix.col_size());
+        let benchmark_params = self.benchmark_gpu_params(params);
         let slot_secret_mat = US::new().sample_uniform(
-            &shared.params,
+            &benchmark_params,
             self.secret_size,
             self.secret_size,
             DistType::TernaryDist,
         );
-        let m_g = self.secret_size * shared.params.modulus_digits();
+        let m_g = self.secret_size * benchmark_params.modulus_digits();
         let b1_chunk_count = column_chunk_count(m_g);
         let slot_a_bytes = HS::new()
             .sample_hash(
-                &shared.params,
+                &benchmark_params,
                 self.hash_key,
                 "slot_transfer_slot_a_0".to_string(),
                 self.secret_size,
@@ -778,20 +1001,58 @@ where
                 DistType::FinRingDist,
             )
             .into_compact_bytes();
+
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let (unused_b1_trapdoor, b1_matrix_for_b0) = trap_sampler.trapdoor(params, b1_size);
+        let b1_matrix_bytes_for_b0 = b1_matrix_for_b0.to_compact_bytes();
+        drop(b1_matrix_for_b0);
+        drop(unused_b1_trapdoor);
+        let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, self.secret_size);
+        let b0_shared = self.prepare_gpu_slot_aux_b0_bench_shared(
+            params,
+            &b0_matrix,
+            &b0_trapdoor,
+            &b1_matrix_bytes_for_b0,
+        );
+        let b0_chunk_count = column_chunk_count(b0_shared.b1_matrix.col_size());
+        let trap_sampler_b0 = TS::new(&b0_shared.params, self.trapdoor_sigma);
         let start = Instant::now();
-        let b0_target_chunk = self.build_slot_aux_b0_target_chunk_gpu(shared, &slot_secret_mat, 0);
-        let b0_chunk_bytes = trap_sampler
-            .preimage(&shared.params, &shared.b0_trapdoor, &shared.b0_matrix, &b0_target_chunk)
+        let b0_target_chunk =
+            self.build_slot_aux_b0_target_chunk_gpu(&b0_shared, &slot_secret_mat, 0);
+        let b0_chunk_bytes = trap_sampler_b0
+            .preimage(
+                &b0_shared.params,
+                &b0_shared.b0_trapdoor,
+                &b0_shared.b0_matrix,
+                &b0_target_chunk,
+            )
             .into_compact_bytes();
         let b0_latency = start.elapsed().as_secs_f64();
+        drop(b0_target_chunk);
+        drop(b0_shared);
+        drop(b0_matrix);
+        drop(b0_trapdoor);
 
+        let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, b1_size);
+        let b1_shared = self.prepare_gpu_slot_aux_b1_bench_shared(params, &b1_matrix, &b1_trapdoor);
+        let trap_sampler_b1 = TS::new(&b1_shared.params, self.trapdoor_sigma);
         let start = Instant::now();
         let b1_target_chunk =
-            self.build_slot_aux_b1_target_chunk_gpu(shared, 0, &slot_secret_mat, 0);
-        let b1_chunk_bytes = trap_sampler
-            .preimage(&shared.params, &shared.b1_trapdoor, &shared.b1_matrix, &b1_target_chunk)
+            self.build_slot_aux_b1_target_chunk_gpu(&b1_shared, 0, &slot_secret_mat, 0);
+        let b1_chunk_bytes = trap_sampler_b1
+            .preimage(
+                &b1_shared.params,
+                &b1_shared.b1_trapdoor,
+                &b1_shared.b1_matrix,
+                &b1_target_chunk,
+            )
             .into_compact_bytes();
         let b1_latency = start.elapsed().as_secs_f64();
+        drop(b1_target_chunk);
+        drop(b1_shared);
+        drop(b1_matrix);
+        drop(b1_trapdoor);
 
         let b0_estimate =
             SampleAuxBenchEstimate::from_chunk(b0_latency, b0_chunk_count, b0_chunk_bytes.len());
@@ -816,29 +1077,13 @@ where
     fn sample_aux_matrices_gate_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate {
         let trap_sampler = TS::new(params, self.trapdoor_sigma);
         let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, self.secret_size);
-        let b1_size =
-            self.secret_size.checked_mul(2).expect("slot-transfer benchmark b1 size overflow");
-        let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, b1_size);
-        let benchmark_num_slots = self.num_slots.max(1);
-        let benchmark_parallelism = crate::env::slot_transfer_slot_parallelism()
-            .max(1)
-            .min(benchmark_num_slots)
-            .min(detected_gpu_device_ids().len().max(1));
-        let gpu_shared = self.prepare_gpu_device_shared(
-            params,
-            &b0_matrix,
-            &b0_trapdoor,
-            &b1_matrix,
-            &b1_trapdoor,
-            benchmark_parallelism,
-        );
         let total_chunk_count =
             crate::slot_transfer::bgg_pubkey::slot_gate_chunk_count::<M>(params, self.secret_size);
-        let shared = &gpu_shared[0];
-        let m_g = self.secret_size * shared.params.modulus_digits();
+        let gate_shared = self.prepare_gpu_slot_gate_bench_shared(params, &b0_matrix, &b0_trapdoor);
+        let m_g = self.secret_size * gate_shared.params.modulus_digits();
         let slot_secret_bytes = US::new()
             .sample_uniform(
-                &shared.params,
+                &gate_shared.params,
                 self.secret_size,
                 self.secret_size,
                 DistType::TernaryDist,
@@ -846,7 +1091,7 @@ where
             .into_compact_bytes();
         let slot_a_bytes = HS::new()
             .sample_hash(
-                &shared.params,
+                &gate_shared.params,
                 self.hash_key,
                 "slot_transfer_slot_a_0".to_string(),
                 self.secret_size,
@@ -855,22 +1100,30 @@ where
             )
             .into_compact_bytes();
         let state = BggPublicKeySTGateState {
-            input_pubkey_bytes: M::gadget_matrix(&shared.params, self.secret_size)
+            input_pubkey_bytes: M::gadget_matrix(&gate_shared.params, self.secret_size)
                 .into_compact_bytes(),
             src_slots: vec![(0u32, None)],
         };
+        let trap_sampler_gate = TS::new(&gate_shared.params, self.trapdoor_sigma);
         let start = Instant::now();
-        let a_in = M::from_compact_bytes(&shared.params, &state.input_pubkey_bytes);
-        let s_j = M::from_compact_bytes(&shared.params, &slot_secret_bytes);
-        let s_i = M::from_compact_bytes(&shared.params, &slot_secret_bytes);
-        let a_j = M::from_compact_bytes(&shared.params, &slot_a_bytes);
+        let a_in = M::from_compact_bytes(&gate_shared.params, &state.input_pubkey_bytes);
+        let s_j = M::from_compact_bytes(&gate_shared.params, &slot_secret_bytes);
+        let s_i = M::from_compact_bytes(&gate_shared.params, &slot_secret_bytes);
+        let a_j = M::from_compact_bytes(&gate_shared.params, &slot_a_bytes);
         let lhs_input = s_i * &a_in;
-        let target_chunk =
-            self.build_gate_target_chunk_gpu(shared, GateId(0), &lhs_input, &s_j, &a_j, None, 0);
-        let preimage_chunk = trap_sampler.preimage(
-            &shared.params,
-            &shared.b0_trapdoor,
-            &shared.b0_matrix,
+        let target_chunk = self.build_gate_target_chunk_gpu(
+            &gate_shared,
+            GateId(0),
+            &lhs_input,
+            &s_j,
+            &a_j,
+            None,
+            0,
+        );
+        let preimage_chunk = trap_sampler_gate.preimage(
+            &gate_shared.params,
+            &gate_shared.b0_trapdoor,
+            &gate_shared.b0_matrix,
             &target_chunk,
         );
         let chunk_bytes = preimage_chunk.into_compact_bytes();

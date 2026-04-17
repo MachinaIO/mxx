@@ -836,16 +836,27 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
     wait_for_all_writes(poly_bench_dir.clone())
         .await
         .expect("benchmark storage writes should complete");
-
-    let uniform_sampler = GpuDCRTPolyUniformSampler::new();
-    let bench_secrets =
-        uniform_sampler.sample_uniform(&params, 1, cfg.d_secret, DistType::TernaryDist).get_row(0);
-    let bench_s_vec = GpuDCRTPolyMatrix::from_poly_vec_row(&params, bench_secrets.clone());
     let bench_slot_secret_mats = single_slot_secret_mats(
         &poly_bench_pubkey_slot_evaluator
             .load_slot_secret_mats_checkpoint(&params)
             .expect("one-slot slot secret matrix checkpoints must exist for poly benchmark"),
     );
+    let bench_plt_b0_matrix = poly_bench_pubkey_plt_evaluator
+        .load_b0_matrix_checkpoint(&params)
+        .expect("one-slot public-lookup b0 checkpoint must exist for poly benchmark");
+    let bench_slot_b0_matrix = poly_bench_pubkey_slot_evaluator
+        .load_b0_matrix_checkpoint(&params)
+        .expect("one-slot slot-transfer b0 checkpoint must exist for poly benchmark");
+    let bench_plt_checkpoint_prefix = poly_bench_pubkey_plt_evaluator.checkpoint_prefix(&params);
+    let bench_slot_checkpoint_prefix = poly_bench_pubkey_slot_evaluator.checkpoint_prefix(&params);
+    drop(poly_bench_pubkey_plt_evaluator);
+    drop(poly_bench_pubkey_slot_evaluator);
+    gpu_device_sync();
+
+    let uniform_sampler = GpuDCRTPolyUniformSampler::new();
+    let bench_secrets =
+        uniform_sampler.sample_uniform(&params, 1, cfg.d_secret, DistType::TernaryDist).get_row(0);
+    let bench_s_vec = GpuDCRTPolyMatrix::from_poly_vec_row(&params, bench_secrets.clone());
     let bench_plaintext_rows = vec![
         vec![single_slot_plaintext(2, &params)],
         vec![single_slot_plaintext(3, &params)],
@@ -870,18 +881,14 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
         &bench_plaintext_rows,
         Some(&bench_slot_secret_mats),
     );
+    drop(repeated_poly_bench_pubkeys);
+    drop(poly_bench_pubkeys);
+    gpu_device_sync();
     assert_eq!(
         bench_poly_encodings.len(),
         11,
         "one-slot benchmark encoding set must contain const one plus ten sample encodings"
     );
-
-    let bench_plt_b0_matrix = poly_bench_pubkey_plt_evaluator
-        .load_b0_matrix_checkpoint(&params)
-        .expect("one-slot public-lookup b0 checkpoint must exist for poly benchmark");
-    let bench_slot_b0_matrix = poly_bench_pubkey_slot_evaluator
-        .load_b0_matrix_checkpoint(&params)
-        .expect("one-slot slot-transfer b0 checkpoint must exist for poly benchmark");
     let bench_plt_c_b0_compact_bytes_by_slot =
         GpuPolyPltEvaluator::build_c_b0_compact_bytes_by_slot::<GpuDCRTPolyUniformSampler>(
             &params,
@@ -903,15 +910,22 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
     let bench_poly_plt_evaluator = GpuPolyPltEvaluator::new(
         DEFAULT_BENCH_SEED,
         poly_bench_dir.clone(),
-        poly_bench_pubkey_plt_evaluator.checkpoint_prefix(&params),
+        bench_plt_checkpoint_prefix,
         bench_plt_c_b0_compact_bytes_by_slot,
     );
     let bench_poly_slot_evaluator = GpuPolySlotEvaluator::new(
         DEFAULT_BENCH_SEED,
         poly_bench_dir.clone(),
-        poly_bench_pubkey_slot_evaluator.checkpoint_prefix(&params),
+        bench_slot_checkpoint_prefix,
         bench_slot_c_b0.to_compact_bytes(),
     );
+    drop(bench_plt_b0_matrix);
+    drop(bench_slot_b0_matrix);
+    drop(bench_slot_secret_mats);
+    drop(bench_s_vec);
+    drop(bench_secrets);
+    drop(bench_encoding_sampler);
+    gpu_device_sync();
     let poly_bench_estimator = BggPolyEncodingBenchEstimator::<GpuMatrix>::benchmark_with_samples(
         &BggPolyEncodingBenchSamples {
             num_slots: cfg.num_slots(),

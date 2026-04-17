@@ -6,7 +6,9 @@ use mxx::{
     bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
     circuit::PolyCircuit,
     element::PolyElem,
-    gadgets::arith::{MontgomeryPoly, MontgomeryPolyContext, encode_montgomery_poly},
+    gadgets::arith::{
+        ModularArithmeticContext, MontgomeryPoly, MontgomeryPolyContext, encode_montgomery_poly,
+    },
     lookup::{
         ggh15_eval::{GGH15BGGEncodingPltEvaluator, GGH15BGGPubKeyPltEvaluator},
         poly::PolyPltEvaluator,
@@ -312,16 +314,18 @@ async fn test_gpu_ggh15_montgomery_modq_arith() {
     assert_eq!(circuit.num_output(), 1, "multiplication tree should emit one output gate");
     assert_eq!(
         circuit.num_input(),
-        num_inputs * ctx.num_limbs,
-        "Montgomery inputs should contribute one limb polynomial per input limb"
+        num_inputs * ctx.num_limbs * ctx.q_moduli_depth(),
+        "Montgomery inputs should contribute one limb polynomial per input limb at each active q-level"
     );
     assert!(total_gates > 0, "circuit must contain gates");
 
     let mut rng = rand::rng();
     let input_values: Vec<BigUint> =
         (0..num_inputs).map(|_| gen_biguint_for_modulus(&mut rng, &full_q)).collect();
-    let expected =
-        input_values.iter().fold(BigUint::from(1u64), |acc, value| (acc * value) % full_q.as_ref());
+    let expected = input_values
+        .par_iter()
+        .cloned()
+        .reduce(|| BigUint::from(1u64), |acc, value| (acc * value) % full_q.as_ref());
     let plaintext_inputs: Vec<GpuDCRTPoly> = input_values
         .par_iter()
         .flat_map(|value| encode_montgomery_poly(cfg.limb_bit_size, &params, value))

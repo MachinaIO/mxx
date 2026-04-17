@@ -56,8 +56,8 @@ struct PreparedBenchSummaryRequest<P: Poly> {
 #[derive(Debug, Default)]
 struct CachedSummaryAggregate {
     total_time: f64,
-    latency: f64,
-    max_parallelism: u128,
+    max_latency: f64,
+    total_parallelism: u128,
     #[cfg(feature = "gpu")]
     peak_vram: usize,
 }
@@ -189,16 +189,19 @@ fn aggregate_cached_sub_summaries<P: Poly>(
                 .expect("bench summary cache missing warmed subcircuit summary");
             CachedSummaryAggregate {
                 total_time: summary.total_time,
-                latency: summary.latency,
-                max_parallelism: summary.max_parallelism,
+                max_latency: summary.latency,
+                total_parallelism: summary.max_parallelism,
                 #[cfg(feature = "gpu")]
                 peak_vram: summary.peak_vram,
             }
         })
         .reduce(CachedSummaryAggregate::default, |mut left, right| {
             left.total_time += right.total_time;
-            left.latency += right.latency;
-            left.max_parallelism = left.max_parallelism.max(right.max_parallelism);
+            left.max_latency = left.max_latency.max(right.max_latency);
+            left.total_parallelism = left
+                .total_parallelism
+                .checked_add(right.total_parallelism)
+                .expect("layer parallelism overflowed u128 while summing subcircuit requests");
             #[cfg(feature = "gpu")]
             {
                 left.peak_vram = left.peak_vram.max(right.peak_vram);
@@ -593,25 +596,31 @@ where
         );
 
         debug!(
-            "estimate_circuit_bench layer cached aggregates ready: circuit_ptr={}, param_bindings={}, layer_index={}, direct_calls={}, direct_total_time={:.6}, direct_latency={:.6}, summed_invocations={}, summed_total_time={:.6}, summed_latency={:.6}",
+            "estimate_circuit_bench layer cached aggregates ready: circuit_ptr={}, param_bindings={}, layer_index={}, direct_calls={}, direct_total_time={:.6}, direct_max_latency={:.6}, direct_total_parallelism={}, summed_invocations={}, summed_total_time={:.6}, summed_max_latency={:.6}, summed_total_parallelism={}",
             circuit_key.circuit_ptr,
             param_bindings.len(),
             layer_idx,
             direct_requests.len(),
             direct_aggregate.total_time,
-            direct_aggregate.latency,
+            direct_aggregate.max_latency,
+            direct_aggregate.total_parallelism,
             summed_requests.len(),
             summed_aggregate.total_time,
-            summed_aggregate.latency
+            summed_aggregate.max_latency,
+            summed_aggregate.total_parallelism
         );
 
         estimate.total_time += direct_aggregate.total_time + summed_aggregate.total_time;
-        let layer_latency =
-            direct_aggregate.latency + summed_aggregate.latency + regular_aggregate.max_latency;
+        let layer_latency = direct_aggregate
+            .max_latency
+            .max(summed_aggregate.max_latency)
+            .max(regular_aggregate.max_latency);
         let layer_parallelism = direct_aggregate
-            .max_parallelism
-            .max(summed_aggregate.max_parallelism)
-            .max(regular_aggregate.total_parallelism);
+            .total_parallelism
+            .checked_add(summed_aggregate.total_parallelism)
+            .expect("layer parallelism overflowed u128 while summing direct and summed subcircuit requests")
+            .max(regular_aggregate.total_parallelism)
+            ;
         #[cfg(feature = "gpu")]
         {
             peak_vram = peak_vram.max(direct_aggregate.peak_vram).max(summed_aggregate.peak_vram);
@@ -896,7 +905,7 @@ mod tests {
         main_circuit.output(vec![top_add, sub_outputs[0]]);
 
         let estimate = ExpandedSubCircuitBenchEstimator.estimate_circuit_bench(&main_circuit);
-        let expected = summary(18.0, 11.0, 8, 23);
+        let expected = summary(18.0, 6.0, 8, 23);
 
         assert!((estimate.total_time - expected.total_time).abs() < 1e-9);
         assert!((estimate.latency - expected.latency).abs() < 1e-9);
@@ -922,7 +931,7 @@ mod tests {
         let estimator = CountingBenchEstimator::default();
         let estimate = estimator.estimate_circuit_bench(&main_circuit);
 
-        assert_eq!(estimate, summary(10.0, 5.0, 4, 0));
+        assert_eq!(estimate, summary(10.0, 3.0, 4, 0));
         assert_eq!(estimator.input_calls.load(Ordering::SeqCst), 2);
         assert_eq!(estimator.add_calls.load(Ordering::SeqCst), 1);
         assert_eq!(estimator.small_scalar_mul_calls.load(Ordering::SeqCst), 0);
@@ -956,7 +965,7 @@ mod tests {
         let estimator = CountingBenchEstimator::default();
         let estimate = estimator.estimate_circuit_bench(&main_circuit);
 
-        assert_eq!(estimate, summary(5.0, 5.0, 1, 0));
+        assert_eq!(estimate, summary(5.0, 3.0, 2, 0));
         assert_eq!(estimator.input_calls.load(Ordering::SeqCst), 2);
         assert_eq!(estimator.add_calls.load(Ordering::SeqCst), 0);
         assert_eq!(estimator.small_scalar_mul_calls.load(Ordering::SeqCst), 1);

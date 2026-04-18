@@ -184,41 +184,6 @@ where
     lhs * &rhs_chunk
 }
 
-pub(crate) fn mul_chunked_checkpoint_with_rhs<M>(
-    params: &<M::P as Poly>::Params,
-    dir: &Path,
-    id_prefix: &str,
-    total_inner_cols: usize,
-    rhs: &M,
-    label: &str,
-) -> M
-where
-    M: PolyMatrix,
-{
-    assert_eq!(
-        rhs.row_size(),
-        total_inner_cols,
-        "{label} rhs rows {} must equal total_inner_cols {}",
-        rhs.row_size(),
-        total_inner_cols
-    );
-    let chunk_count = column_chunk_count(total_inner_cols);
-    let mut acc: Option<M> = None;
-    for chunk_idx in 0..chunk_count {
-        let (row_start, row_len) = column_chunk_bounds(total_inner_cols, chunk_idx);
-        let left_chunk: M =
-            read_matrix_column_chunk(params, dir, id_prefix, total_inner_cols, chunk_idx, label);
-        let rhs_chunk = rhs.slice(row_start, row_start + row_len, 0, rhs.col_size());
-        let product = left_chunk * rhs_chunk;
-        if let Some(accum) = acc.as_mut() {
-            accum.add_in_place(&product);
-        } else {
-            acc = Some(product);
-        }
-    }
-    acc.expect("mul_chunked_checkpoint_with_rhs requires at least one chunk")
-}
-
 pub(crate) fn small_decomposed_scalar_digits<M>(
     params: &<M::P as Poly>::Params,
     scalar: &M::P,

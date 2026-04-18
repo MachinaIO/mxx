@@ -1,12 +1,68 @@
 use std::{
-    fs::{File, read_to_string},
+    collections::HashMap,
+    fs::{File, metadata, read_to_string},
     io::{Read, Seek, SeekFrom},
-    path::Path,
-    time::Instant,
+    path::{Path, PathBuf},
+    sync::{Arc, OnceLock, RwLock},
+    time::{Instant, SystemTime},
 };
 
 use crate::{matrix::PolyMatrix, poly::Poly, storage::write::GlobalTableIndex};
 use tracing::{debug, warn};
+
+#[derive(Clone)]
+struct CachedGlobalTableIndex {
+    modified: Option<SystemTime>,
+    len: u64,
+    index: Arc<GlobalTableIndex>,
+}
+
+fn global_table_index_cache() -> &'static RwLock<HashMap<PathBuf, CachedGlobalTableIndex>> {
+    static CACHE: OnceLock<RwLock<HashMap<PathBuf, CachedGlobalTableIndex>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn load_global_table_index(dir: &Path) -> Option<Arc<GlobalTableIndex>> {
+    let index_path = dir.join("lookup_tables.index");
+    let metadata = metadata(&index_path).ok()?;
+    let modified = metadata.modified().ok();
+    let len = metadata.len();
+
+    if let Some(cached) = global_table_index_cache()
+        .read()
+        .expect("global table index cache read lock poisoned")
+        .get(&index_path)
+        .cloned() &&
+        cached.modified == modified &&
+        cached.len == len
+    {
+        debug!(
+            "read_matrix_from_multi_batch: lookup_tables.index cache hit with {} entries",
+            cached.index.entries.len()
+        );
+        return Some(cached.index);
+    }
+
+    let index_data = read_to_string(&index_path).ok()?;
+    let global_index = serde_json::from_str::<GlobalTableIndex>(&index_data).ok()?;
+    if global_index.entries.is_empty() {
+        return None;
+    }
+
+    debug!(
+        "read_matrix_from_multi_batch: lookup_tables.index loaded with {} entries",
+        global_index.entries.len()
+    );
+    let global_index = Arc::new(global_index);
+    global_table_index_cache()
+        .write()
+        .expect("global table index cache write lock poisoned")
+        .insert(
+            index_path,
+            CachedGlobalTableIndex { modified, len, index: Arc::clone(&global_index) },
+        );
+    Some(global_index)
+}
 
 /// Read a specific matrix from split batch files by its ID prefix and index.
 /// Uses indexed format for O(1) access to lookup tables.
@@ -20,15 +76,7 @@ where
     M: PolyMatrix,
 {
     let start = Instant::now();
-    let index_path = dir.join("lookup_tables.index");
-    if let Ok(index_data) = read_to_string(&index_path) &&
-        let Ok(global_index) = serde_json::from_str::<GlobalTableIndex>(&index_data) &&
-        !global_index.entries.is_empty()
-    {
-        debug!(
-            "read_matrix_from_multi_batch: lookup_tables.index loaded with {} entries",
-            global_index.entries.len()
-        );
+    if let Some(global_index) = load_global_table_index(dir) {
         if let Some(entry) = global_index.entries.get(id_prefix) {
             if let Some(matrix) =
                 read_matrix_from_entry(params, dir, id_prefix, target_k, entry, start)
@@ -60,11 +108,7 @@ pub fn read_bytes_from_multi_batch(
     id_prefix: &str,
     target_k: usize,
 ) -> Option<Vec<u8>> {
-    let index_path = dir.join("lookup_tables.index");
-    if let Ok(index_data) = read_to_string(&index_path) &&
-        let Ok(global_index) = serde_json::from_str::<GlobalTableIndex>(&index_data) &&
-        !global_index.entries.is_empty()
-    {
+    if let Some(global_index) = load_global_table_index(dir) {
         if let Some(entry) = global_index.entries.get(id_prefix) {
             if let Some(bytes) = read_bytes_from_entry(dir, id_prefix, target_k, entry) {
                 return Some(bytes);
@@ -149,4 +193,79 @@ fn read_bytes_from_entry(
 /// Return the position of `target_k` within the indices list.
 fn find_matrix_position(indices: &[usize], target_k: usize) -> Option<usize> {
     indices.iter().position(|&idx| idx == target_k)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_global_table_index;
+    use crate::storage::write::{GlobalTableIndex, TableIndexEntry};
+    use std::{collections::HashMap, fs, sync::Arc, thread, time::Duration};
+    use tempfile::tempdir;
+
+    fn write_index(
+        dir: &std::path::Path,
+        entries: HashMap<String, TableIndexEntry>,
+    ) -> GlobalTableIndex {
+        let index = GlobalTableIndex { entries };
+        fs::write(
+            dir.join("lookup_tables.index"),
+            serde_json::to_vec(&index).expect("index json should serialize"),
+        )
+        .expect("index file should be written");
+        index
+    }
+
+    #[test]
+    fn load_global_table_index_reuses_cache_until_file_changes() {
+        let dir = tempdir().expect("temporary directory should be created");
+        let initial_index = write_index(
+            dir.path(),
+            HashMap::from([(
+                "first".to_string(),
+                TableIndexEntry {
+                    file_index: 0,
+                    file_offset: 0,
+                    num_matrices: 1,
+                    bytes_per_matrix: 16,
+                    indices: vec![0],
+                },
+            )]),
+        );
+
+        let first = load_global_table_index(dir.path()).expect("initial index should load");
+        let second = load_global_table_index(dir.path()).expect("cached index should load");
+        assert!(Arc::ptr_eq(&first, &second), "unchanged file should reuse cached Arc");
+        assert_eq!(first.entries.len(), initial_index.entries.len());
+
+        thread::sleep(Duration::from_millis(20));
+        write_index(
+            dir.path(),
+            HashMap::from([
+                (
+                    "first".to_string(),
+                    TableIndexEntry {
+                        file_index: 0,
+                        file_offset: 0,
+                        num_matrices: 1,
+                        bytes_per_matrix: 16,
+                        indices: vec![0],
+                    },
+                ),
+                (
+                    "second".to_string(),
+                    TableIndexEntry {
+                        file_index: 1,
+                        file_offset: 32,
+                        num_matrices: 1,
+                        bytes_per_matrix: 24,
+                        indices: vec![0],
+                    },
+                ),
+            ]),
+        );
+
+        let updated = load_global_table_index(dir.path()).expect("updated index should load");
+        assert!(!Arc::ptr_eq(&first, &updated), "changed file should invalidate the cached Arc");
+        assert!(updated.entries.contains_key("second"));
+    }
 }

@@ -15,6 +15,7 @@ use crate::{
     poly::{Poly, PolyParams},
     sampler::{DistType, PolyHashSampler},
 };
+use rayon::prelude::*;
 use std::{
     marker::PhantomData,
     ops::Mul,
@@ -26,8 +27,8 @@ use tracing::debug;
 
 use super::pubkey::{
     build_small_decomposed_scalar_mul_chunk, column_chunk_bounds, column_chunk_count,
-    left_mul_chunked_checkpoint_column, mul_chunked_checkpoint_with_rhs, read_matrix_column_chunk,
-    small_decomposed_scalar_digits, small_gadget_chunk_count, trapdoor_public_column_count,
+    left_mul_chunked_checkpoint_column, read_matrix_column_chunk, small_decomposed_scalar_digits,
+    small_gadget_chunk_count, trapdoor_public_column_count,
 };
 
 pub(super) struct GGH15PublicLookupSharedState<M: PolyMatrix> {
@@ -46,6 +47,128 @@ pub(super) struct GGH15PublicLookupSharedState<M: PolyMatrix> {
 pub(super) struct GGH15PublicLookupSlotOutput<M: PolyMatrix> {
     pub vector: M,
     pub plaintext: M::P,
+}
+
+fn mul_chunked_checkpoint_with_rhs<M>(
+    params: &<M::P as Poly>::Params,
+    dir: &Path,
+    id_prefix: &str,
+    total_inner_cols: usize,
+    rhs: &M,
+    label: &str,
+) -> M
+where
+    M: PolyMatrix + Send + Sync,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
+{
+    assert_eq!(
+        rhs.row_size(),
+        total_inner_cols,
+        "{label} rhs rows {} must equal total_inner_cols {}",
+        rhs.row_size(),
+        total_inner_cols
+    );
+    let chunk_count = column_chunk_count(total_inner_cols);
+    let wave_width = crate::env::ggh15_gate_parallelism().min(chunk_count).max(1);
+    let mut next_chunk_idx = 0usize;
+    let mut current_wave = load_checkpoint_mul_wave(
+        params,
+        dir,
+        id_prefix,
+        total_inner_cols,
+        rhs,
+        label,
+        next_chunk_idx,
+        wave_width,
+    );
+    next_chunk_idx += current_wave.len();
+
+    let mut acc: Option<M> = None;
+    while !current_wave.is_empty() {
+        if next_chunk_idx < chunk_count {
+            let next_wave_width = (chunk_count - next_chunk_idx).min(wave_width);
+            let (_, next_wave) = rayon::join(
+                || {
+                    let wave_sum = reduce_checkpoint_mul_wave(current_wave);
+                    append_checkpoint_product(&mut acc, wave_sum);
+                },
+                || {
+                    load_checkpoint_mul_wave(
+                        params,
+                        dir,
+                        id_prefix,
+                        total_inner_cols,
+                        rhs,
+                        label,
+                        next_chunk_idx,
+                        next_wave_width,
+                    )
+                },
+            );
+            current_wave = next_wave;
+            next_chunk_idx += next_wave_width;
+        } else {
+            append_checkpoint_product(&mut acc, reduce_checkpoint_mul_wave(current_wave));
+            break;
+        }
+    }
+    acc.expect("mul_chunked_checkpoint_with_rhs requires at least one chunk")
+}
+
+fn load_checkpoint_mul_wave<M>(
+    params: &<M::P as Poly>::Params,
+    dir: &Path,
+    id_prefix: &str,
+    total_inner_cols: usize,
+    rhs: &M,
+    label: &str,
+    wave_start: usize,
+    wave_width: usize,
+) -> Vec<(M, M)>
+where
+    M: PolyMatrix + Sync,
+{
+    (wave_start..wave_start + wave_width)
+        .into_par_iter()
+        .map(|chunk_idx| {
+            let (row_start, row_len) = column_chunk_bounds(total_inner_cols, chunk_idx);
+            let left_chunk = read_matrix_column_chunk(
+                params,
+                dir,
+                id_prefix,
+                total_inner_cols,
+                chunk_idx,
+                label,
+            );
+            let rhs_chunk = rhs.slice(row_start, row_start + row_len, 0, rhs.col_size());
+            (left_chunk, rhs_chunk)
+        })
+        .collect()
+}
+
+fn reduce_checkpoint_mul_wave<M>(wave: Vec<(M, M)>) -> M
+where
+    M: PolyMatrix + Send,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
+{
+    wave.into_par_iter()
+        .map(|(left_chunk, rhs_chunk)| &left_chunk * &rhs_chunk)
+        .reduce_with(|mut accum, product| {
+            accum.add_in_place(&product);
+            accum
+        })
+        .expect("checkpoint multiply wave must be non-empty")
+}
+
+fn append_checkpoint_product<M>(acc: &mut Option<M>, product: M)
+where
+    M: PolyMatrix,
+{
+    if let Some(accum) = acc.as_mut() {
+        accum.add_in_place(&product);
+    } else {
+        *acc = Some(product);
+    }
 }
 
 pub(super) fn build_public_lookup_output_chunk<M, HS>(

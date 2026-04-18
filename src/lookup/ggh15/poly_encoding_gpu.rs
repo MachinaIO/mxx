@@ -43,6 +43,15 @@ struct DecodedPublicLookupChunk<'a, M: PolyMatrix> {
     slots: Vec<DecodedPublicLookupSlot<'a, M>>,
 }
 
+struct LoadedPublicLookupTask<M: PolyMatrix> {
+    device_slot: usize,
+    slot_local_idx: usize,
+    chunk_idx: usize,
+    c_b0: M,
+    input_vector: M,
+    x: M::P,
+}
+
 pub(super) fn effective_gpu_slot_parallelism(requested: usize) -> usize {
     requested.min(public_lookup_gpu_device_ids().len().max(1)).max(1)
 }
@@ -193,35 +202,42 @@ where
             (0..chunk_count).map(move |chunk_idx| (slot_local_idx, chunk_idx))
         })
         .collect::<Vec<_>>();
-    for wave in tasks.chunks(shared_by_device.len().max(1)) {
-        let wave_results = wave
-            .par_iter()
-            .enumerate()
-            .map(|(device_slot, (slot_local_idx, chunk_idx))| {
-                let shared_dev = &shared_by_device[device_slot];
-                let slot = &slots[*slot_local_idx];
-                let c_b0 = M::from_compact_bytes(&shared_dev.params, slot.c_b0_bytes.as_ref());
-                let input_vector =
-                    M::from_compact_bytes(&shared_dev.params, slot.input_vector_bytes.as_ref());
-                let x = M::P::from_compact_bytes(&shared_dev.params, slot.x_bytes.as_ref());
-                let output_chunk = build_public_lookup_output_chunk::<M, HS>(
-                    &shared_dev.params,
-                    plt,
-                    dir,
-                    checkpoint_prefix,
-                    hash_key,
-                    &c_b0,
-                    &shared_dev.shared,
-                    &input_vector,
-                    &x,
-                    gate_id,
-                    lut_id,
-                    *chunk_idx,
-                );
-                (*slot_local_idx, *chunk_idx, output_chunk.into_compact_bytes())
-            })
-            .collect::<Vec<_>>();
-        for (slot_local_idx, chunk_idx, bytes) in wave_results {
+    let wave_width = shared_by_device.len().max(1);
+    let mut wave_iter = tasks.chunks(wave_width);
+    if let Some(initial_wave) = wave_iter.next() {
+        let mut current_loaded_wave =
+            load_public_lookup_wave_tasks::<M>(shared_by_device, &slots, initial_wave);
+        for wave in wave_iter {
+            let (wave_results, next_loaded_wave) = rayon::join(
+                || {
+                    compute_public_lookup_wave::<M, HS>(
+                        plt,
+                        dir,
+                        checkpoint_prefix,
+                        hash_key,
+                        gate_id,
+                        lut_id,
+                        shared_by_device,
+                        current_loaded_wave,
+                    )
+                },
+                || load_public_lookup_wave_tasks::<M>(shared_by_device, &slots, wave),
+            );
+            for (slot_local_idx, chunk_idx, bytes) in wave_results {
+                chunk_bytes_by_slot[slot_local_idx][chunk_idx] = Some(bytes);
+            }
+            current_loaded_wave = next_loaded_wave;
+        }
+        for (slot_local_idx, chunk_idx, bytes) in compute_public_lookup_wave::<M, HS>(
+            plt,
+            dir,
+            checkpoint_prefix,
+            hash_key,
+            gate_id,
+            lut_id,
+            shared_by_device,
+            current_loaded_wave,
+        ) {
             chunk_bytes_by_slot[slot_local_idx][chunk_idx] = Some(bytes);
         }
     }
@@ -287,6 +303,74 @@ where
         chunk_started.elapsed().as_secs_f64() * 1000.0
     );
     chunk_outputs
+}
+
+fn load_public_lookup_wave_tasks<M>(
+    shared_by_device: &[GpuPublicLookupSharedByDevice<M>],
+    slots: &[DecodedPublicLookupSlot<'_, M>],
+    wave: &[(usize, usize)],
+) -> Vec<LoadedPublicLookupTask<M>>
+where
+    M: PolyMatrix + Send + Sync,
+    M::P: Send + Sync,
+{
+    wave.par_iter()
+        .enumerate()
+        .map(|(device_slot, (slot_local_idx, chunk_idx))| {
+            let shared_dev = &shared_by_device[device_slot];
+            let slot = &slots[*slot_local_idx];
+            LoadedPublicLookupTask {
+                device_slot,
+                slot_local_idx: *slot_local_idx,
+                chunk_idx: *chunk_idx,
+                c_b0: M::from_compact_bytes(&shared_dev.params, slot.c_b0_bytes.as_ref()),
+                input_vector: M::from_compact_bytes(
+                    &shared_dev.params,
+                    slot.input_vector_bytes.as_ref(),
+                ),
+                x: M::P::from_compact_bytes(&shared_dev.params, slot.x_bytes.as_ref()),
+            }
+        })
+        .collect::<Vec<_>>()
+}
+
+fn compute_public_lookup_wave<M, HS>(
+    plt: &PublicLut<M::P>,
+    dir: &Path,
+    checkpoint_prefix: &str,
+    hash_key: [u8; 32],
+    gate_id: GateId,
+    lut_id: usize,
+    shared_by_device: &[GpuPublicLookupSharedByDevice<M>],
+    loaded_wave: Vec<LoadedPublicLookupTask<M>>,
+) -> Vec<(usize, usize, Vec<u8>)>
+where
+    M: PolyMatrix + Send + Sync,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    M::P: Send + Sync,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
+{
+    loaded_wave
+        .into_par_iter()
+        .map(|loaded| {
+            let shared_dev = &shared_by_device[loaded.device_slot];
+            let output_chunk = build_public_lookup_output_chunk::<M, HS>(
+                &shared_dev.params,
+                plt,
+                dir,
+                checkpoint_prefix,
+                hash_key,
+                &loaded.c_b0,
+                &shared_dev.shared,
+                &loaded.input_vector,
+                &loaded.x,
+                gate_id,
+                lut_id,
+                loaded.chunk_idx,
+            );
+            (loaded.slot_local_idx, loaded.chunk_idx, output_chunk.into_compact_bytes())
+        })
+        .collect::<Vec<_>>()
 }
 
 pub(super) fn evaluate_public_lookup_slots_gpu<M, HS>(

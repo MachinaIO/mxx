@@ -1,12 +1,32 @@
 use super::{context::nested_rns_level_from_wires, *};
 use crate::{
     gadgets::arith::{
-        DecomposeArithmeticGadget, ModularArithmeticContext, ModularArithmeticGadget,
+        BinaryPlannerResult, DecomposeArithmeticGadget, ModularArithmeticContext,
+        ModularArithmeticGadget, ModularArithmeticPlanner,
     },
     matrix::PolyMatrix,
     utils::mod_inverse,
 };
 use num_traits::ToPrimitive;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NestedRnsPlannerMetadata {
+    pub max_plaintexts: Vec<BigUint>,
+    pub p_max_traces: Vec<BigUint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NestedRnsAddPlanKey {
+    pub pre_full_reduce: bool,
+    pub reduce_levels: Vec<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NestedRnsSubPlanKey {
+    pub pre_full_reduce: bool,
+    pub reduce_levels: Vec<bool>,
+    pub trace_multipliers: Vec<BigUint>,
+}
 
 /// Build the large-scalar bindings used by the subtraction helper that adds trace offsets first.
 ///
@@ -120,6 +140,23 @@ impl<P: Poly> NestedRnsPoly<P> {
             template.p_max_traces.clone(),
             circuit,
         )
+    }
+
+    fn planner_metadata(&self) -> NestedRnsPlannerMetadata {
+        NestedRnsPlannerMetadata {
+            max_plaintexts: self.max_plaintexts.clone(),
+            p_max_traces: self.p_max_traces.clone(),
+        }
+    }
+
+    fn normalized_planner_metadata(
+        ctx: &NestedRnsPolyContext,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+    ) -> NestedRnsPlannerMetadata {
+        let (max_plaintexts, p_max_traces) =
+            ctx.full_reduce_output_metadata(enable_levels, level_offset);
+        NestedRnsPlannerMetadata { max_plaintexts, p_max_traces }
     }
 
     /// Lazily reduce only the q-levels selected by `reduce_levels`.
@@ -1408,6 +1445,238 @@ impl<P: Poly + 'static> ModularArithmeticGadget<P> for NestedRnsPoly<P> {
     }
 }
 
+impl<P: Poly + 'static> ModularArithmeticPlanner<P> for NestedRnsPoly<P> {
+    type Metadata = NestedRnsPlannerMetadata;
+    type AddPlanKey = NestedRnsAddPlanKey;
+    type SubPlanKey = NestedRnsSubPlanKey;
+
+    fn metadata(entry: &Self) -> Self::Metadata {
+        entry.planner_metadata()
+    }
+
+    fn normalized_metadata(
+        ctx: &Self::Context,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+    ) -> Self::Metadata {
+        Self::normalized_planner_metadata(ctx, enable_levels, level_offset)
+    }
+
+    fn input_with_planner_metadata(
+        ctx: Arc<Self::Context>,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+        metadata: &Self::Metadata,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        Self::input_with_metadata(
+            ctx,
+            enable_levels,
+            level_offset,
+            metadata.max_plaintexts.clone(),
+            metadata.p_max_traces.clone(),
+            circuit,
+        )
+    }
+
+    fn from_flat_outputs_with_planner_metadata(
+        template: &Self,
+        outputs: &[GateId],
+        metadata: &Self::Metadata,
+    ) -> Self {
+        Self::from_flat_outputs(
+            template,
+            outputs,
+            metadata.max_plaintexts.clone(),
+            metadata.p_max_traces.clone(),
+        )
+    }
+
+    fn compute_add_plan_and_output(
+        left: &Self,
+        right: &Self,
+    ) -> BinaryPlannerResult<Self::AddPlanKey, Self::Metadata> {
+        debug_assert_eq!(left.max_plaintexts.len(), right.max_plaintexts.len());
+        let p_full =
+            <NestedRnsPolyContext as ModularArithmeticContext<P>>::plaintext_capacity_bound(
+                left.ctx.as_ref(),
+            );
+        let pre_full_reduce = left
+            .max_plaintexts
+            .par_iter()
+            .zip(right.max_plaintexts.par_iter())
+            .any(|(lhs_bound, rhs_bound)| lhs_bound + rhs_bound > p_full);
+        let left_before_reduce = if pre_full_reduce {
+            Self::normalized_planner_metadata(
+                left.ctx.as_ref(),
+                Some(left.resolve_enable_levels()),
+                Some(left.level_offset),
+            )
+        } else {
+            left.planner_metadata()
+        };
+        let right_before_reduce = if pre_full_reduce {
+            Self::normalized_planner_metadata(
+                right.ctx.as_ref(),
+                Some(right.resolve_enable_levels()),
+                Some(right.level_offset),
+            )
+        } else {
+            right.planner_metadata()
+        };
+        let reduce_levels = left_before_reduce
+            .p_max_traces
+            .par_iter()
+            .zip(right_before_reduce.p_max_traces.par_iter())
+            .map(|(lhs_trace, rhs_trace)| lhs_trace + rhs_trace >= left.ctx.lut_mod_p_max_map_size)
+            .collect::<Vec<_>>();
+        let reduced_trace = left.ctx.reduced_p_max_trace();
+        let reduce_traces = |traces: &[BigUint]| {
+            traces
+                .iter()
+                .zip(reduce_levels.iter())
+                .map(|(trace, reduce)| if *reduce { reduced_trace.clone() } else { trace.clone() })
+                .collect::<Vec<_>>()
+        };
+        let left_after_reduce = NestedRnsPlannerMetadata {
+            max_plaintexts: left_before_reduce.max_plaintexts.clone(),
+            p_max_traces: reduce_traces(&left_before_reduce.p_max_traces),
+        };
+        let right_after_reduce = NestedRnsPlannerMetadata {
+            max_plaintexts: right_before_reduce.max_plaintexts.clone(),
+            p_max_traces: reduce_traces(&right_before_reduce.p_max_traces),
+        };
+        BinaryPlannerResult {
+            cache_key: NestedRnsAddPlanKey { pre_full_reduce, reduce_levels },
+            output_metadata: NestedRnsPlannerMetadata {
+                max_plaintexts: left_after_reduce
+                    .max_plaintexts
+                    .par_iter()
+                    .zip(right_after_reduce.max_plaintexts.par_iter())
+                    .map(|(lhs_bound, rhs_bound)| lhs_bound + rhs_bound)
+                    .collect(),
+                p_max_traces: left_after_reduce
+                    .p_max_traces
+                    .par_iter()
+                    .zip(right_after_reduce.p_max_traces.par_iter())
+                    .map(|(lhs_trace, rhs_trace)| lhs_trace + rhs_trace)
+                    .collect(),
+            },
+        }
+    }
+
+    fn compute_sub_plan_and_output(
+        left: &Self,
+        right: &Self,
+    ) -> BinaryPlannerResult<Self::SubPlanKey, Self::Metadata> {
+        debug_assert_eq!(left.max_plaintexts.len(), right.max_plaintexts.len());
+        let p_full =
+            <NestedRnsPolyContext as ModularArithmeticContext<P>>::plaintext_capacity_bound(
+                left.ctx.as_ref(),
+            );
+        let pre_full_reduce = left
+            .active_q_moduli()
+            .par_iter()
+            .enumerate()
+            .any(|(q_idx, &q_i)| &left.max_plaintexts[q_idx] + BigUint::from(q_i - 1) > p_full);
+        let left_before_reduce = if pre_full_reduce {
+            Self::normalized_planner_metadata(
+                left.ctx.as_ref(),
+                Some(left.resolve_enable_levels()),
+                Some(left.level_offset),
+            )
+        } else {
+            left.planner_metadata()
+        };
+        let right_before_reduce = if pre_full_reduce {
+            Self::normalized_planner_metadata(
+                right.ctx.as_ref(),
+                Some(right.resolve_enable_levels()),
+                Some(right.level_offset),
+            )
+        } else {
+            right.planner_metadata()
+        };
+        let p_max_minus_one = left.ctx.reduced_p_max_trace();
+        let p_max = &p_max_minus_one + BigUint::from(1u64);
+        let trace_multiplier = |trace: &BigUint| (trace + &p_max_minus_one) / &p_max;
+        let predicted_traces = left_before_reduce
+            .p_max_traces
+            .par_iter()
+            .zip(right_before_reduce.p_max_traces.par_iter())
+            .map(|(lhs_trace, rhs_trace)| lhs_trace + trace_multiplier(rhs_trace) * &p_max)
+            .collect::<Vec<_>>();
+        let reduce_levels = predicted_traces
+            .par_iter()
+            .map(|trace| trace >= &left.ctx.lut_mod_p_max_map_size)
+            .collect::<Vec<_>>();
+        let reduced_trace = left.ctx.reduced_p_max_trace();
+        let reduce_traces = |traces: &[BigUint]| {
+            traces
+                .iter()
+                .zip(reduce_levels.iter())
+                .map(|(trace, reduce)| if *reduce { reduced_trace.clone() } else { trace.clone() })
+                .collect::<Vec<_>>()
+        };
+        let left_after_reduce = NestedRnsPlannerMetadata {
+            max_plaintexts: left_before_reduce.max_plaintexts.clone(),
+            p_max_traces: reduce_traces(&left_before_reduce.p_max_traces),
+        };
+        let right_after_reduce = NestedRnsPlannerMetadata {
+            max_plaintexts: right_before_reduce.max_plaintexts.clone(),
+            p_max_traces: reduce_traces(&right_before_reduce.p_max_traces),
+        };
+        let trace_multipliers =
+            right_after_reduce.p_max_traces.par_iter().map(trace_multiplier).collect::<Vec<_>>();
+        BinaryPlannerResult {
+            cache_key: NestedRnsSubPlanKey {
+                pre_full_reduce,
+                reduce_levels,
+                trace_multipliers: trace_multipliers.clone(),
+            },
+            output_metadata: NestedRnsPlannerMetadata {
+                max_plaintexts: left_after_reduce
+                    .max_plaintexts
+                    .par_iter()
+                    .zip(left.active_q_moduli().par_iter())
+                    .map(|(lhs_bound, &q_i)| lhs_bound + BigUint::from(q_i - 1))
+                    .collect(),
+                p_max_traces: left_after_reduce
+                    .p_max_traces
+                    .par_iter()
+                    .zip(trace_multipliers.par_iter())
+                    .map(|(lhs_trace, multiplier)| lhs_trace + multiplier * &p_max)
+                    .collect(),
+            },
+        }
+    }
+
+    fn normalize_mul_input(entry: &Self, circuit: &mut PolyCircuit<P>) -> Self {
+        let reduced_metadata = Self::normalized_planner_metadata(
+            entry.ctx.as_ref(),
+            Some(entry.resolve_enable_levels()),
+            Some(entry.level_offset),
+        );
+        let needs_full_reduce = entry
+            .max_plaintexts
+            .iter()
+            .zip(reduced_metadata.max_plaintexts.iter())
+            .any(|(current, reduced)| current > reduced);
+        let needs_trace_reduce = entry
+            .p_max_traces
+            .iter()
+            .zip(reduced_metadata.p_max_traces.iter())
+            .any(|(current, reduced)| current > reduced);
+        if needs_full_reduce {
+            entry.full_reduce(circuit)
+        } else if needs_trace_reduce {
+            entry.prepare_for_reconstruct(circuit)
+        } else {
+            entry.clone()
+        }
+    }
+}
+
 impl<P: Poly + 'static> DecomposeArithmeticGadget<P> for NestedRnsPoly<P> {
     fn gadget_matrix<M: PolyMatrix<P = P>>(
         params: &P::Params,
@@ -1492,5 +1761,19 @@ impl<P: Poly + 'static> DecomposeArithmeticGadget<P> for NestedRnsPoly<P> {
         circuit: &mut PolyCircuit<P>,
     ) -> Vec<Self> {
         self.conv_mul_right_decomposed_many(params, left_rows, num_slots, circuit)
+    }
+
+    fn mul_rows_with_decomposed_rhs(
+        params: &P::Params,
+        lhs_row0: &[Self],
+        lhs_row1: &[Self],
+        rhs_top: &Self,
+        rhs_bottom: &Self,
+        num_slots: usize,
+        circuit: &mut PolyCircuit<P>,
+    ) -> [Self; 2] {
+        super::decomposed_mul::mul_rows_with_decomposed_rhs(
+            params, lhs_row0, lhs_row1, rhs_top, rhs_bottom, num_slots, circuit,
+        )
     }
 }

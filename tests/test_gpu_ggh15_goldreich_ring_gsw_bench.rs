@@ -14,7 +14,11 @@ use mxx::{
     circuit::{PolyCircuit, PolyGateKind, gate::GateId},
     element::PolyElem,
     gadgets::{
-        fhe::ring_gsw::{RingGswCiphertext, RingGswContext},
+        arith::NestedRnsPolyContext,
+        fhe::ring_gsw_nested_rns::{
+            NestedRnsRingGswCiphertext as RingGswCiphertext,
+            NestedRnsRingGswContext as RingGswContext,
+        },
         fhe_prg::goldreich::GoldreichFhePrg,
     },
     lookup::{
@@ -411,13 +415,20 @@ fn build_goldreich_ring_gsw_circuit<P: Poly + 'static>(
     let mut circuit = PolyCircuit::<P>::new();
     let (_, _, crt_depth) = params.to_crt();
     let active_levels = cfg.active_levels_for_crt_depth(crt_depth);
-    let ctx = Arc::new(RingGswContext::setup(
+    let nested_rns = Arc::new(NestedRnsPolyContext::setup(
         &mut circuit,
         params,
-        cfg.num_slots(),
         cfg.p_moduli_bits,
         cfg.max_unreduced_muls,
         cfg.scale,
+        false,
+        Some(active_levels),
+    ));
+    let ctx = Arc::new(RingGswContext::from_arith_context(
+        &mut circuit,
+        params,
+        cfg.num_slots(),
+        nested_rns,
         Some(active_levels),
         None,
     ));

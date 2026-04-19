@@ -216,6 +216,10 @@ impl NestedRnsPolyContext {
         BigUint::from(self.p_max)
     }
 
+    pub(crate) fn trace_capacity_bound(&self) -> BigUint {
+        self.lut_mod_p_max_map_size.clone()
+    }
+
     fn register_local_support_subcircuits<P: Poly + 'static>(
         circuit: &mut PolyCircuit<P>,
         p_moduli: &[u64],
@@ -925,18 +929,6 @@ impl<P: Poly + 'static> ModularArithmeticContext<P> for NestedRnsPolyContext {
         self.p_moduli.len()
     }
 
-    fn full_reduce_output_metadata(
-        &self,
-        enable_levels: Option<usize>,
-        level_offset: Option<usize>,
-    ) -> (Vec<BigUint>, Vec<BigUint>) {
-        NestedRnsPolyContext::full_reduce_output_metadata(self, enable_levels, level_offset)
-    }
-
-    fn reduced_p_max_trace(&self) -> BigUint {
-        NestedRnsPolyContext::reduced_p_max_trace(self)
-    }
-
     fn randomizer_decomposition_bound(&self) -> u64 {
         self.p_moduli
             .iter()
@@ -955,15 +947,7 @@ impl<P: Poly + 'static> ModularArithmeticContext<P> for NestedRnsPolyContext {
         }
     }
 
-    fn full_reduce_level_plaintext_bound(&self, q_idx: usize) -> BigUint {
-        self.full_reduce_max_plaintexts[q_idx].clone()
-    }
-
     fn plaintext_capacity_bound(&self) -> BigUint {
         self.p_full.clone()
-    }
-
-    fn trace_capacity_bound(&self) -> BigUint {
-        self.lut_mod_p_max_map_size.clone()
     }
 }

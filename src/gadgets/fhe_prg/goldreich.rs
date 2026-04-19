@@ -24,7 +24,9 @@
 //! XOR composition balanced instead of chaining it left-to-right.
 use crate::{
     circuit::PolyCircuit,
-    gadgets::fhe::ring_gsw::{RingGswCiphertext, RingGswContext},
+    gadgets::fhe::ring_gsw_nested_rns::{
+        NestedRnsRingGswCiphertext as RingGswCiphertext, NestedRnsRingGswContext as RingGswContext,
+    },
     poly::Poly,
 };
 use digest::Digest;
@@ -535,11 +537,11 @@ mod tests {
         __PAIR, __TestState,
         circuit::{PolyCircuit, evaluable::PolyVec},
         gadgets::{
-            arith::DEFAULT_MAX_UNREDUCED_MULS,
-            fhe::ring_gsw::{
-                NativeRingGswCiphertext, RingGswContext, ciphertext_from_outputs,
-                ciphertext_inputs_from_native, decrypt_ciphertext, encrypt_plaintext_bit,
-                sample_public_key, sample_secret_key,
+            arith::{DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPolyContext},
+            fhe::ring_gsw_nested_rns::{
+                NativeRingGswCiphertext, NestedRnsRingGswContext as RingGswContext,
+                ciphertext_from_outputs, ciphertext_inputs_from_native, decrypt_ciphertext,
+                encrypt_plaintext_bit, sample_public_key, sample_secret_key,
             },
         },
         lookup::{poly::PolyPltEvaluator, poly_vec::PolyVecPltEvaluator},
@@ -569,13 +571,20 @@ mod tests {
         max_unused_muls: usize,
     ) -> (DCRTPolyParams, Arc<RingGswContext<DCRTPoly>>) {
         let params = DCRTPolyParams::new(ring_dim, active_levels, crt_bits, BASE_BITS);
-        let ctx = Arc::new(RingGswContext::setup(
+        let nested_rns = Arc::new(NestedRnsPolyContext::setup(
             circuit,
             &params,
-            num_slots,
             p_moduli_bits,
             max_unused_muls,
             SCALE,
+            false,
+            Some(active_levels),
+        ));
+        let ctx = Arc::new(RingGswContext::from_arith_context(
+            circuit,
+            &params,
+            num_slots,
+            nested_rns,
             Some(active_levels),
             None,
         ));

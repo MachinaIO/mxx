@@ -2,7 +2,8 @@ use super::carry_arith::{CarryArithPoly, CarryArithPolyContext, encode_carry_ari
 use crate::{
     circuit::{BatchedWire, PolyCircuit, gate::GateId},
     gadgets::arith::{
-        DecomposeArithmeticGadget, ModularArithmeticContext, ModularArithmeticGadget,
+        BinaryPlannerResult, DecomposeArithmeticGadget, ModularArithmeticContext,
+        ModularArithmeticGadget, ModularArithmeticPlanner,
     },
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
@@ -13,6 +14,18 @@ use num_traits::{One, ToPrimitive};
 use rayon::prelude::*;
 use std::sync::Arc;
 use tracing::debug;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MontgomeryPlannerMetadata {
+    pub max_plaintexts: Vec<BigUint>,
+    pub p_max_traces: Vec<BigUint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MontgomeryAddPlanKey;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MontgomerySubPlanKey;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MontgomeryPolyContext<P: Poly> {
@@ -264,6 +277,26 @@ impl<P: Poly + 'static> MontgomeryPoly<P> {
             "MontgomeryPoly trace metadata must match active q levels",
         );
         Self { ctx, value, level_offset, enable_levels, max_plaintexts, p_max_traces }
+    }
+
+    fn planner_metadata(&self) -> MontgomeryPlannerMetadata {
+        MontgomeryPlannerMetadata {
+            max_plaintexts: self.max_plaintexts.clone(),
+            p_max_traces: self.p_max_traces.clone(),
+        }
+    }
+
+    fn normalized_planner_metadata(
+        ctx: &MontgomeryPolyContext<P>,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+    ) -> MontgomeryPlannerMetadata {
+        let level_offset = level_offset.unwrap_or(0);
+        Self::validate_window(ctx, enable_levels, level_offset);
+        MontgomeryPlannerMetadata {
+            max_plaintexts: Self::default_max_plaintexts(ctx, enable_levels, level_offset),
+            p_max_traces: Self::default_p_max_traces(ctx, enable_levels, level_offset),
+        }
     }
 
     fn bit_size(ctx: &MontgomeryPolyContext<P>) -> usize {
@@ -578,24 +611,6 @@ impl<P: Poly + 'static> ModularArithmeticContext<P> for MontgomeryPolyContext<P>
         self.num_limbs
     }
 
-    fn full_reduce_output_metadata(
-        &self,
-        enable_levels: Option<usize>,
-        level_offset: Option<usize>,
-    ) -> (Vec<BigUint>, Vec<BigUint>) {
-        let level_offset = level_offset.unwrap_or(0);
-        MontgomeryPoly::<P>::validate_window(self, enable_levels, level_offset);
-        (
-            MontgomeryPoly::<P>::default_max_plaintexts(self, enable_levels, level_offset),
-            MontgomeryPoly::<P>::default_p_max_traces(self, enable_levels, level_offset),
-        )
-    }
-
-    fn reduced_p_max_trace(&self) -> BigUint {
-        self.q_moduli_big.iter().max().expect("q_moduli_big must not be empty") -
-            BigUint::from(1u64)
-    }
-
     fn randomizer_decomposition_bound(&self) -> u64 {
         self.q_moduli.iter().copied().max().expect("q_moduli must not be empty").saturating_sub(1)
     }
@@ -604,15 +619,7 @@ impl<P: Poly + 'static> ModularArithmeticContext<P> for MontgomeryPolyContext<P>
         MontgomeryPoly::<P>::digit_radix(self) - BigUint::from(1u64)
     }
 
-    fn full_reduce_level_plaintext_bound(&self, q_idx: usize) -> BigUint {
-        &self.q_moduli_big[q_idx] - BigUint::from(1u64)
-    }
-
     fn plaintext_capacity_bound(&self) -> BigUint {
-        self.modulus.as_ref().clone()
-    }
-
-    fn trace_capacity_bound(&self) -> BigUint {
         self.modulus.as_ref().clone()
     }
 }
@@ -858,6 +865,86 @@ impl<P: Poly + 'static> ModularArithmeticGadget<P> for MontgomeryPoly<P> {
 
     fn reconstruct(&self, circuit: &mut PolyCircuit<P>) -> GateId {
         self.reconstruct_value(circuit)
+    }
+}
+
+impl<P: Poly + 'static> ModularArithmeticPlanner<P> for MontgomeryPoly<P> {
+    type Metadata = MontgomeryPlannerMetadata;
+    type AddPlanKey = MontgomeryAddPlanKey;
+    type SubPlanKey = MontgomerySubPlanKey;
+
+    fn metadata(entry: &Self) -> Self::Metadata {
+        entry.planner_metadata()
+    }
+
+    fn normalized_metadata(
+        ctx: &Self::Context,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+    ) -> Self::Metadata {
+        Self::normalized_planner_metadata(ctx, enable_levels, level_offset)
+    }
+
+    fn input_with_planner_metadata(
+        ctx: Arc<Self::Context>,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+        metadata: &Self::Metadata,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        Self::input_with_metadata(
+            ctx,
+            enable_levels,
+            level_offset,
+            metadata.max_plaintexts.clone(),
+            metadata.p_max_traces.clone(),
+            circuit,
+        )
+    }
+
+    fn from_flat_outputs_with_planner_metadata(
+        template: &Self,
+        outputs: &[GateId],
+        metadata: &Self::Metadata,
+    ) -> Self {
+        Self::from_flat_outputs(
+            template,
+            outputs,
+            metadata.max_plaintexts.clone(),
+            metadata.p_max_traces.clone(),
+        )
+    }
+
+    fn compute_add_plan_and_output(
+        left: &Self,
+        _right: &Self,
+    ) -> BinaryPlannerResult<Self::AddPlanKey, Self::Metadata> {
+        BinaryPlannerResult {
+            cache_key: MontgomeryAddPlanKey,
+            output_metadata: Self::normalized_planner_metadata(
+                left.ctx.as_ref(),
+                left.enable_levels,
+                Some(left.level_offset),
+            ),
+        }
+    }
+
+    fn compute_sub_plan_and_output(
+        left: &Self,
+        _right: &Self,
+    ) -> BinaryPlannerResult<Self::SubPlanKey, Self::Metadata> {
+        BinaryPlannerResult {
+            cache_key: MontgomerySubPlanKey,
+            output_metadata: Self::normalized_planner_metadata(
+                left.ctx.as_ref(),
+                left.enable_levels,
+                Some(left.level_offset),
+            ),
+        }
+    }
+
+    fn normalize_mul_input(entry: &Self, _circuit: &mut PolyCircuit<P>) -> Self {
+        entry.clone()
     }
 }
 

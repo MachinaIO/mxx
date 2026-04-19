@@ -8,7 +8,7 @@ use crate::{
 };
 use num_bigint::BigUint;
 use rayon::prelude::*;
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, hash::Hash, sync::Arc};
 
 pub use carry_montgomery::*;
 pub use nested_rns::*;
@@ -22,29 +22,25 @@ pub trait ModularArithmeticContext<P: Poly>: Clone + Debug + Send + Sync + 'stat
         circuit: &mut PolyCircuit<P>,
     ) -> Self;
 
+    fn register_shared_subcircuits_in(
+        &self,
+        source_circuit: &PolyCircuit<P>,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self {
+        self.register_shared_in(source_circuit, circuit)
+    }
+
     fn q_moduli_depth(&self) -> usize;
 
     fn decomposition_len(&self) -> usize;
 
     fn q_level_row_width(&self) -> usize;
 
-    fn full_reduce_output_metadata(
-        &self,
-        enable_levels: Option<usize>,
-        level_offset: Option<usize>,
-    ) -> (Vec<BigUint>, Vec<BigUint>);
-
-    fn reduced_p_max_trace(&self) -> BigUint;
-
     fn randomizer_decomposition_bound(&self) -> u64;
 
     fn decomposition_term_bound(&self, term_idx: usize) -> BigUint;
 
-    fn full_reduce_level_plaintext_bound(&self, q_idx: usize) -> BigUint;
-
     fn plaintext_capacity_bound(&self) -> BigUint;
-
-    fn trace_capacity_bound(&self) -> BigUint;
 
     fn active_levels(&self, enable_levels: Option<usize>, level_offset: Option<usize>) -> usize {
         let level_offset = level_offset.unwrap_or(0);
@@ -165,6 +161,52 @@ pub trait ModularArithmeticGadget<P: Poly>: Clone + Debug + Send + Sync + 'stati
     fn reconstruct(&self, circuit: &mut PolyCircuit<P>) -> GateId;
 }
 
+#[derive(Debug, Clone)]
+pub struct BinaryPlannerResult<K, M> {
+    pub cache_key: K,
+    pub output_metadata: M,
+}
+
+pub trait ModularArithmeticPlanner<P: Poly>: ModularArithmeticGadget<P> {
+    type Metadata: Clone + Debug + Send + Sync + 'static;
+    type AddPlanKey: Clone + Debug + Eq + Hash + Send + Sync + 'static;
+    type SubPlanKey: Clone + Debug + Eq + Hash + Send + Sync + 'static;
+
+    fn metadata(entry: &Self) -> Self::Metadata;
+
+    fn normalized_metadata(
+        ctx: &Self::Context,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+    ) -> Self::Metadata;
+
+    fn input_with_planner_metadata(
+        ctx: Arc<Self::Context>,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+        metadata: &Self::Metadata,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Self;
+
+    fn from_flat_outputs_with_planner_metadata(
+        template: &Self,
+        outputs: &[GateId],
+        metadata: &Self::Metadata,
+    ) -> Self;
+
+    fn compute_add_plan_and_output(
+        left: &Self,
+        right: &Self,
+    ) -> BinaryPlannerResult<Self::AddPlanKey, Self::Metadata>;
+
+    fn compute_sub_plan_and_output(
+        left: &Self,
+        right: &Self,
+    ) -> BinaryPlannerResult<Self::SubPlanKey, Self::Metadata>;
+
+    fn normalize_mul_input(entry: &Self, circuit: &mut PolyCircuit<P>) -> Self;
+}
+
 pub trait DecomposeArithmeticGadget<P: Poly>: ModularArithmeticGadget<P> {
     fn gadget_matrix<M: PolyMatrix<P = P>>(
         params: &P::Params,
@@ -217,6 +259,44 @@ pub trait DecomposeArithmeticGadget<P: Poly>: ModularArithmeticGadget<P> {
         num_slots: usize,
         circuit: &mut PolyCircuit<P>,
     ) -> Vec<Self>;
+
+    fn mul_rows_with_decomposed_rhs(
+        params: &P::Params,
+        lhs_row0: &[Self],
+        lhs_row1: &[Self],
+        rhs_top: &Self,
+        rhs_bottom: &Self,
+        num_slots: usize,
+        circuit: &mut PolyCircuit<P>,
+    ) -> [Self; 2] {
+        assert_eq!(lhs_row0.len(), lhs_row1.len(), "Ring-GSW row lengths must match");
+        assert!(
+            lhs_row0.len().is_multiple_of(2),
+            "Ring-GSW row width {} must be even",
+            lhs_row0.len()
+        );
+        let gadget_len = lhs_row0.len() / 2;
+        let lhs_row0_top = &lhs_row0[..gadget_len];
+        let lhs_row0_bottom = &lhs_row0[gadget_len..];
+        let lhs_row1_top = &lhs_row1[..gadget_len];
+        let lhs_row1_bottom = &lhs_row1[gadget_len..];
+        let top_products = rhs_top.conv_mul_right_decomposed_many(
+            params,
+            &[lhs_row0_top, lhs_row1_top],
+            num_slots,
+            circuit,
+        );
+        let bottom_products = rhs_bottom.conv_mul_right_decomposed_many(
+            params,
+            &[lhs_row0_bottom, lhs_row1_bottom],
+            num_slots,
+            circuit,
+        );
+        [
+            top_products[0].add(&bottom_products[0], circuit),
+            top_products[1].add(&bottom_products[1], circuit),
+        ]
+    }
 }
 
 pub fn flatten_gadget_entries<P, A>(entries: &[A]) -> Vec<BatchedWire>

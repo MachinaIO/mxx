@@ -1,7 +1,9 @@
 use super::*;
 use crate::{
+    gadgets::fhe::ring_gsw_nested_rns::active_q_modulus,
     matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix,
     poly::dcrt::gpu::{GpuDCRTPoly, GpuDCRTPolyParams},
+    sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
 };
 use bigdecimal::BigDecimal;
 use num_bigint::BigUint;
@@ -30,13 +32,20 @@ fn create_gpu_test_context_with(
 ) -> (DCRTPolyParams, GpuDCRTPolyParams, Arc<RingGswContext<GpuDCRTPoly>>) {
     let cpu_params = DCRTPolyParams::new(ring_dim, active_levels, crt_bits, BASE_BITS);
     let gpu_params = gpu_params_from_cpu(&cpu_params);
-    let ctx = Arc::new(RingGswContext::setup(
+    let nested_rns = Arc::new(NestedRnsPolyContext::setup(
         circuit,
         &gpu_params,
-        num_slots,
         p_moduli_bits,
         max_unused_muls,
         SCALE,
+        false,
+        Some(active_levels),
+    ));
+    let ctx = Arc::new(RingGswContext::from_arith_context(
+        circuit,
+        &gpu_params,
+        num_slots,
+        nested_rns,
         Some(active_levels),
         None,
     ));

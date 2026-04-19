@@ -2,6 +2,7 @@
 mod gpu;
 
 mod context;
+mod decomposed_mul;
 mod encoding;
 mod poly;
 

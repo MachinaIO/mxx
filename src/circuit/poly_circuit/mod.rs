@@ -385,10 +385,21 @@ pub(crate) struct GroupedExecutionPlan {
     pub(crate) reachable_input_gate_ids: Vec<GateId>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct NonFreeDepthContributionVector {
+    pub(crate) counts: [u32; 10],
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct NonFreeDepthProfile {
+    pub(crate) total_depth: u32,
+    pub(crate) contributions: NonFreeDepthContributionVector,
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) struct NonFreeDepthCacheKey {
     circuit_key: usize,
-    input_levels: Box<[u32]>,
+    input_profiles: Box<[NonFreeDepthProfile]>,
 }
 
 #[derive(Debug, Clone)]

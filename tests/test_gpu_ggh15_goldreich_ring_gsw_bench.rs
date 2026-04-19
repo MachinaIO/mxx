@@ -383,14 +383,15 @@ fn probe_crt_depth_for_goldreich_ring_gsw_bench(
     let eval_ok = max_eval_error < threshold_bd;
     let decryption_ok = max_decryption_error < ring_gsw_threshold_bd;
 
+    let non_free_depth_contributions = circuit.non_free_depth_contributions();
     info!(
-        "crt_depth={} active_levels={} active_q_bits={} full_q_bits={} ring_gsw_q_bits={} non_free_depth={} num_inputs={} output_polys={} max_eval_error_bits={} eval_threshold_bits={} max_decryption_error_bits={} decryption_threshold_bits={} eval_ok={} decryption_ok={}",
+        "crt_depth={} active_levels={} active_q_bits={} full_q_bits={} ring_gsw_q_bits={} non_free_depth_contributions={:?} num_inputs={} output_polys={} max_eval_error_bits={} eval_threshold_bits={} max_decryption_error_bits={} decryption_threshold_bits={} eval_ok={} decryption_ok={}",
         crt_depth,
         active_levels,
         active_q.bits(),
         full_q.bits(),
         ring_gsw_q.bits(),
-        circuit.non_free_depth(),
+        non_free_depth_contributions,
         circuit.num_input(),
         out_errors.len(),
         bigdecimal_bits_ceil(&max_eval_error),
@@ -653,9 +654,10 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
         cfg.base_bits,
         all_q_moduli
     );
+    let non_free_depth_contributions = circuit.non_free_depth_contributions();
     info!(
-        "circuit non_free_depth={} gate_counts={:?} num_inputs={} encrypted_outputs={} reconstructed_output_polys={}",
-        circuit.non_free_depth(),
+        "circuit non_free_depth_contributions={:?} gate_counts={:?} num_inputs={} encrypted_outputs={} reconstructed_output_polys={}",
+        non_free_depth_contributions,
         gate_counts,
         circuit.num_input(),
         encrypted_outputs.len(),

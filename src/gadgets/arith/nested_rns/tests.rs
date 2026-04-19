@@ -79,6 +79,10 @@ fn create_test_context_for_params(
     ctx
 }
 
+fn circuit_non_free_depth_total<P: Poly>(circuit: &PolyCircuit<P>) -> usize {
+    circuit.non_free_depth_contributions().values().sum()
+}
+
 fn sparse_gadget_entry(
     ctx: Arc<NestedRnsPolyContext>,
     target_q_idx: usize,
@@ -642,11 +646,13 @@ fn test_nested_rns_poly_conv_mul_right_decomposed_many_does_not_increase_non_fre
         .collect::<Vec<_>>();
     manual_circuit.output(manual_reconstructed);
 
+    let fused_depth = circuit_non_free_depth_total(&fused_circuit);
+    let manual_depth = circuit_non_free_depth_total(&manual_circuit);
     assert!(
-        fused_circuit.non_free_depth() <= manual_circuit.non_free_depth(),
+        fused_depth <= manual_depth,
         "fused right-decomposed convolution should not increase non-free depth: fused={}, manual={}",
-        fused_circuit.non_free_depth(),
-        manual_circuit.non_free_depth()
+        fused_depth,
+        manual_depth
     );
 }
 
@@ -761,11 +767,13 @@ fn test_nested_rns_poly_gadget_decompose_unreduced_does_not_increase_non_free_de
         .collect::<Vec<_>>();
     manual_circuit.output(manual_outputs);
 
+    let fused_depth = circuit_non_free_depth_total(&fused_circuit);
+    let manual_depth = circuit_non_free_depth_total(&manual_circuit);
     assert!(
-        fused_circuit.non_free_depth() < manual_circuit.non_free_depth(),
+        fused_depth < manual_depth,
         "unreduced gadget_decompose should reduce non-free depth: fused={}, manual={}",
-        fused_circuit.non_free_depth(),
-        manual_circuit.non_free_depth()
+        fused_depth,
+        manual_depth
     );
 }
 
@@ -954,11 +962,13 @@ fn test_nested_rns_poly_conv_mul_right_decomposed_many_unreduced_does_not_increa
         .collect::<Vec<_>>();
     manual_circuit.output(manual_reconstructed);
 
+    let fused_depth = circuit_non_free_depth_total(&fused_circuit);
+    let manual_depth = circuit_non_free_depth_total(&manual_circuit);
     assert!(
-        fused_circuit.non_free_depth() < manual_circuit.non_free_depth(),
+        fused_depth < manual_depth,
         "unreduced conv_mul_right_decomposed_many should reduce non-free depth: fused={}, manual={}",
-        fused_circuit.non_free_depth(),
-        manual_circuit.non_free_depth()
+        fused_depth,
+        manual_depth
     );
 }
 
@@ -1239,7 +1249,7 @@ fn test_nested_rns_poly_gadget_decomposition_large_circuit_metrics() {
     println!(
         "nested_rns gadget decomposition metrics: crt_bits={crt_bits}, crt_depth={crt_depth}, ring_dim={ring_dim}, num_slots={num_slots}"
     );
-    println!("non-free depth {}", circuit.non_free_depth());
+    println!("non-free depth contributions {:?}", circuit.non_free_depth_contributions());
     println!("gate counts {:?}", circuit.count_gates_by_type_vec());
 }
 
@@ -1286,7 +1296,10 @@ fn test_nested_rns_poly_reconstruct_auto_reduce_matches_manual_full_reduce() {
         manual_circuit.eval(&params, one, encoded_input, Some(&plt_evaluator), None, None);
 
     assert_eq!(auto_eval, manual_eval);
-    assert_eq!(auto_circuit.non_free_depth(), manual_circuit.non_free_depth());
+    assert_eq!(
+        auto_circuit.non_free_depth_contributions(),
+        manual_circuit.non_free_depth_contributions()
+    );
     assert_eq!(auto_circuit.count_gates_by_type_vec(), manual_circuit.count_gates_by_type_vec());
 }
 
@@ -1340,7 +1353,10 @@ fn test_nested_rns_poly_slot_transfer_auto_reduce_matches_manual_full_reduce() {
     assert_eq!(manual_transferred.max_plaintexts, vec![reduced_transfer_bound]);
     manual_circuit.output(vec![manual_transferred.inner[0]]);
 
-    assert_eq!(auto_circuit.non_free_depth(), manual_circuit.non_free_depth());
+    assert_eq!(
+        auto_circuit.non_free_depth_contributions(),
+        manual_circuit.non_free_depth_contributions()
+    );
     assert_eq!(auto_circuit.count_gates_by_type_vec(), manual_circuit.count_gates_by_type_vec());
 }
 
@@ -1459,8 +1475,8 @@ fn test_nested_rns_poly_sequential_add_auto_reduce_runs_full_reduce_once() {
     assert_eq!(auto_output, manual_output);
     assert_eq!(auto_output % &q_level_modulus, expected_output);
 
-    let expected_depth = manual_circuit.non_free_depth();
-    assert_eq!(auto_circuit.non_free_depth(), expected_depth);
+    let expected_depth = manual_circuit.non_free_depth_contributions();
+    assert_eq!(auto_circuit.non_free_depth_contributions(), expected_depth);
     assert_eq!(auto_circuit.count_gates_by_type_vec(), manual_circuit.count_gates_by_type_vec());
 }
 
@@ -1623,8 +1639,8 @@ fn test_nested_rns_poly_sequential_mul_auto_reduce_uses_extended_mul_budget() {
     assert_eq!(auto_output, manual_output);
     assert_eq!(auto_output % &q_level_modulus, expected_output);
 
-    let expected_depth = manual_circuit.non_free_depth();
-    assert_eq!(auto_circuit.non_free_depth(), expected_depth);
+    let expected_depth = manual_circuit.non_free_depth_contributions();
+    assert_eq!(auto_circuit.non_free_depth_contributions(), expected_depth);
     assert_eq!(auto_circuit.count_gates_by_type_vec(), manual_circuit.count_gates_by_type_vec());
 }
 
@@ -1640,7 +1656,7 @@ fn test_nested_rns_poly_add_generic(
     let sum = poly_a.add(&poly_b, &mut circuit);
     let out = sum.reconstruct(&mut circuit);
     circuit.output(vec![out]);
-    println!("non-free depth {}", circuit.non_free_depth());
+    println!("non-free depth contributions {:?}", circuit.non_free_depth_contributions());
     println!("circuit size {:?}", circuit.count_gates_by_type_vec());
 
     let modulus = params.modulus();
@@ -1674,7 +1690,7 @@ fn test_nested_rns_poly_sub_generic(
     let sum = poly_a.sub(&poly_b, &mut circuit);
     let out = sum.reconstruct(&mut circuit);
     circuit.output(vec![out]);
-    println!("non-free depth {}", circuit.non_free_depth());
+    println!("non-free depth contributions {:?}", circuit.non_free_depth_contributions());
     println!("circuit size {:?}", circuit.count_gates_by_type_vec());
 
     let modulus = params.modulus();
@@ -1713,7 +1729,7 @@ fn test_nested_rns_poly_mul_generic(
     let sum = poly_a.mul(&poly_b, &mut circuit);
     let out = sum.reconstruct(&mut circuit);
     circuit.output(vec![out]);
-    println!("non-free depth {}", circuit.non_free_depth());
+    println!("non-free depth contributions {:?}", circuit.non_free_depth_contributions());
     println!("circuit size {:?}", circuit.count_gates_by_type_vec());
 
     let modulus = params.modulus();

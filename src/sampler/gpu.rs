@@ -68,6 +68,23 @@ where
         sample_gpu_matrix_with_seed(params, nrow, ncol, dist, seed)
     }
 
+    fn sample_hash_columns<B: AsRef<[u8]>>(
+        &self,
+        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
+        key: [u8; 32],
+        tag: B,
+        nrow: usize,
+        total_ncol: usize,
+        col_start: usize,
+        col_len: usize,
+        dist: DistType,
+    ) -> Self::M {
+        let seed = hash_seed_for_matrix::<H>(key, tag.as_ref());
+        sample_gpu_matrix_with_seed_columns(
+            params, nrow, total_ncol, col_start, col_len, dist, seed,
+        )
+    }
+
     fn sample_hash_decomposed<B: AsRef<[u8]>>(
         &self,
         params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
@@ -170,6 +187,62 @@ fn sample_gpu_matrix_with_seed(
     }
 }
 
+fn sample_gpu_matrix_with_seed_columns(
+    params: &GpuDCRTPolyParams,
+    nrow: usize,
+    total_ncol: usize,
+    col_start: usize,
+    col_len: usize,
+    dist: DistType,
+    seed: u64,
+) -> GpuDCRTPolyMatrix {
+    if nrow == 0 || col_len == 0 {
+        return GpuDCRTPolyMatrix::zero(params, nrow, col_len);
+    }
+    match dist {
+        DistType::FinRingDist => GpuDCRTPolyMatrix::sample_distribution_columns(
+            params,
+            nrow,
+            total_ncol,
+            col_start,
+            col_len,
+            GpuMatrixSampleDist::Uniform,
+            0.0,
+            seed,
+        ),
+        DistType::GaussDist { sigma } => GpuDCRTPolyMatrix::sample_distribution_columns(
+            params,
+            nrow,
+            total_ncol,
+            col_start,
+            col_len,
+            GpuMatrixSampleDist::Gauss,
+            sigma,
+            seed,
+        ),
+        DistType::BitDist => GpuDCRTPolyMatrix::sample_distribution_columns(
+            params,
+            nrow,
+            total_ncol,
+            col_start,
+            col_len,
+            GpuMatrixSampleDist::Bit,
+            0.0,
+            seed,
+        ),
+        DistType::TernaryDist => GpuDCRTPolyMatrix::sample_distribution_columns(
+            params,
+            nrow,
+            total_ncol,
+            col_start,
+            col_len,
+            GpuMatrixSampleDist::Ternary,
+            0.0,
+            seed,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +309,46 @@ mod tests {
         let sampled_legacy = sampler.sample_hash(&params, key, tag, 3, 4, DistType::FinRingDist);
         let sampled_legacy_decomposed = sampled_legacy.decompose();
         assert_eq!(sampled_decomposed, sampled_legacy_decomposed);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_hash_sampler_column_subrange_matches_full_sample() {
+        gpu_device_sync();
+        let cpu_params = gpu_test_params();
+        let params = gpu_params_from_cpu(&cpu_params);
+        let sampler = GpuDCRTPolyHashSampler::<Keccak256>::new();
+        let key = [13u8; 32];
+        let tag = b"gpu-hash-columns";
+
+        let full = sampler.sample_hash(&params, key, tag, 4, 9, DistType::FinRingDist);
+        let chunk =
+            sampler.sample_hash_columns(&params, key, tag, 4, 9, 2, 3, DistType::FinRingDist);
+        assert_eq!(chunk, full.slice_columns(2, 5));
+
+        let decomposed = sampler.sample_hash_decomposed_columns(
+            &params,
+            key,
+            tag,
+            4,
+            9,
+            2,
+            3,
+            DistType::FinRingDist,
+        );
+        assert_eq!(decomposed, full.slice_columns(2, 5).decompose());
+
+        let small_decomposed = sampler.sample_hash_small_decomposed_columns(
+            &params,
+            key,
+            tag,
+            4,
+            9,
+            2,
+            3,
+            DistType::FinRingDist,
+        );
+        assert_eq!(small_decomposed, full.slice_columns(2, 5).small_decompose());
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub(crate) fn public_lookup_gpu_device_ids() -> Vec<i32> {
     device_ids
 }
 
+#[cfg(test)]
 pub(crate) fn public_lookup_round_robin_device_slot(
     logical_idx: usize,
     device_count: usize,

@@ -44,6 +44,31 @@ pub trait PolyHashSampler<K: AsRef<[u8]>> {
         dist: DistType,
     ) -> Self::M;
 
+    /// Samples the conceptual matrix returned by `sample_hash(..., total_ncol, ...)`, then returns
+    /// only the requested column window `[col_start, col_start + col_len)`.
+    fn sample_hash_columns<B: AsRef<[u8]>>(
+        &self,
+        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
+        key: [u8; 32],
+        tag: B,
+        nrow: usize,
+        total_ncol: usize,
+        col_start: usize,
+        col_len: usize,
+        dist: DistType,
+    ) -> Self::M {
+        let col_end =
+            col_start.checked_add(col_len).expect("sample_hash_columns column range overflow");
+        assert!(
+            col_end <= total_ncol,
+            "sample_hash_columns range out of bounds: start={}, len={}, total_ncol={}",
+            col_start,
+            col_len,
+            total_ncol
+        );
+        self.sample_hash(params, key, tag, nrow, total_ncol, dist).slice_columns(col_start, col_end)
+    }
+
     fn sample_hash_decomposed<B: AsRef<[u8]>>(
         &self,
         params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
@@ -56,6 +81,21 @@ pub trait PolyHashSampler<K: AsRef<[u8]>> {
         self.sample_hash(params, key, tag, nrow, ncol, dist).decompose_owned()
     }
 
+    fn sample_hash_decomposed_columns<B: AsRef<[u8]>>(
+        &self,
+        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
+        key: [u8; 32],
+        tag: B,
+        nrow: usize,
+        total_ncol: usize,
+        col_start: usize,
+        col_len: usize,
+        dist: DistType,
+    ) -> Self::M {
+        self.sample_hash_columns(params, key, tag, nrow, total_ncol, col_start, col_len, dist)
+            .decompose_owned()
+    }
+
     fn sample_hash_small_decomposed<B: AsRef<[u8]>>(
         &self,
         params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
@@ -66,6 +106,21 @@ pub trait PolyHashSampler<K: AsRef<[u8]>> {
         dist: DistType,
     ) -> Self::M {
         self.sample_hash(params, key, tag, nrow, ncol, dist).small_decompose_owned()
+    }
+
+    fn sample_hash_small_decomposed_columns<B: AsRef<[u8]>>(
+        &self,
+        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
+        key: [u8; 32],
+        tag: B,
+        nrow: usize,
+        total_ncol: usize,
+        col_start: usize,
+        col_len: usize,
+        dist: DistType,
+    ) -> Self::M {
+        self.sample_hash_columns(params, key, tag, nrow, total_ncol, col_start, col_len, dist)
+            .small_decompose_owned()
     }
 }
 

@@ -52,6 +52,11 @@ fn validate_inputs<P: Poly>(
     );
 }
 
+#[cfg(test)]
+fn circuit_non_free_depth_total<P: Poly>(circuit: &PolyCircuit<P>) -> usize {
+    circuit.non_free_depth_contributions().values().sum()
+}
+
 fn repeated_slot_plan(
     src_slot: usize,
     num_slots: usize,
@@ -858,11 +863,13 @@ mod tests {
         let manual_output = manual_product.reconstruct(&mut manual_circuit);
         manual_circuit.output(vec![manual_output]);
 
+        let auto_depth = circuit_non_free_depth_total(&auto_circuit);
+        let manual_depth = circuit_non_free_depth_total(&manual_circuit);
         assert!(
-            auto_circuit.non_free_depth() <= manual_circuit.non_free_depth(),
+            auto_depth <= manual_depth,
             "sparse conv path depth regressed: auto={}, manual={}",
-            auto_circuit.non_free_depth(),
-            manual_circuit.non_free_depth()
+            auto_depth,
+            manual_depth
         );
     }
 
@@ -886,7 +893,7 @@ mod tests {
         println!(
             "negacyclic_conv_mul metrics: crt_bits={crt_bits}, crt_depth={crt_depth}, ring_dim={ring_dim}, num_slots={num_slots}"
         );
-        println!("non-free depth {}", circuit.non_free_depth());
+        println!("non-free depth contributions {:?}", circuit.non_free_depth_contributions());
         println!("gate counts {:?}", circuit.count_gates_by_type_vec());
     }
 }

@@ -850,8 +850,8 @@ mod tests {
         println!(
             "goldreich ring_gsw metrics: crt_bits={crt_bits}, active_levels={active_levels}, ring_dim={ring_dim}, num_slots={num_slots}"
         );
-        let depth = circuit.non_free_depth();
-        println!("goldreich ring_gsw non-free depth {}", depth);
+        let depth_contributions = circuit.non_free_depth_contributions();
+        println!("goldreich ring_gsw non-free depth contributions {:?}", depth_contributions);
         println!("goldreich ring_gsw gate counts {:?}", circuit.count_gates_by_type_vec());
     }
 }

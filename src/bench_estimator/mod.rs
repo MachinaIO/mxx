@@ -10,12 +10,16 @@ pub(crate) use gpu::benchmark_gate_operation;
 #[cfg(feature = "gpu")]
 pub use gpu::*;
 
-use std::{collections::HashMap, hint::black_box, time::Instant};
+use std::{
+    collections::HashMap,
+    hint::black_box,
+    sync::{Arc, RwLock},
+    time::Instant,
+};
 #[cfg(any(test, feature = "gpu"))]
 use std::{
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -27,14 +31,35 @@ use num_bigint::BigUint;
 use rayon::prelude::*;
 use tracing::debug;
 
-use crate::circuit::{
-    Evaluable, GroupedCallExecutionLayer, PolyCircuit, PolyGateType, SubCircuitParamValue,
+use crate::{
+    circuit::{
+        Evaluable, GroupedCallExecutionLayer, GroupedExecutionPlan, PolyCircuit, PolyGateType,
+        SubCircuitParamValue,
+    },
+    poly::Poly,
 };
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct BenchSummaryCacheKey {
     circuit_ptr: usize,
+}
+
+type BenchSummaryCache = RwLock<HashMap<BenchSummaryCacheKey, CircuitBenchSummary>>;
+
+#[derive(Clone)]
+struct PreparedBenchSummaryRequest<P: Poly> {
+    sub_circuit: Arc<PolyCircuit<P>>,
     param_bindings: Vec<SubCircuitParamValue>,
+    cache_key: BenchSummaryCacheKey,
+}
+
+#[derive(Debug, Default)]
+struct CachedSummaryAggregate {
+    total_time: f64,
+    max_latency: f64,
+    total_parallelism: u128,
+    #[cfg(feature = "gpu")]
+    peak_vram: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -110,6 +135,79 @@ impl CircuitBenchSummary {
     pub(crate) fn with_peak_vram(self, _peak_vram: usize) -> Self {
         self
     }
+}
+
+fn bench_summary_cache_get(
+    summary_cache: &BenchSummaryCache,
+    cache_key: &BenchSummaryCacheKey,
+) -> Option<CircuitBenchSummary> {
+    summary_cache.read().expect("bench summary cache read lock poisoned").get(cache_key).copied()
+}
+
+fn bench_summary_cache_contains(
+    summary_cache: &BenchSummaryCache,
+    cache_key: &BenchSummaryCacheKey,
+) -> bool {
+    summary_cache.read().expect("bench summary cache read lock poisoned").contains_key(cache_key)
+}
+
+fn bench_summary_cache_insert(
+    summary_cache: &BenchSummaryCache,
+    cache_key: BenchSummaryCacheKey,
+    summary: CircuitBenchSummary,
+) {
+    summary_cache
+        .write()
+        .expect("bench summary cache write lock poisoned")
+        .insert(cache_key, summary);
+}
+
+fn bench_summary_cache_len(summary_cache: &BenchSummaryCache) -> usize {
+    summary_cache.read().expect("bench summary cache read lock poisoned").len()
+}
+
+fn prepared_bench_summary_request<P: Poly>(
+    _sub_circuit_id: usize,
+    sub_circuit: Arc<PolyCircuit<P>>,
+    param_bindings: Vec<SubCircuitParamValue>,
+) -> PreparedBenchSummaryRequest<P> {
+    PreparedBenchSummaryRequest {
+        cache_key: BenchSummaryCacheKey { circuit_ptr: Arc::as_ptr(&sub_circuit) as usize },
+        sub_circuit,
+        param_bindings,
+    }
+}
+
+fn aggregate_cached_sub_summaries<P: Poly>(
+    summary_cache: &BenchSummaryCache,
+    requests: &[PreparedBenchSummaryRequest<P>],
+) -> CachedSummaryAggregate {
+    requests
+        .par_iter()
+        .map(|request| {
+            let summary = bench_summary_cache_get(summary_cache, &request.cache_key)
+                .expect("bench summary cache missing warmed subcircuit summary");
+            CachedSummaryAggregate {
+                total_time: summary.total_time,
+                max_latency: summary.latency,
+                total_parallelism: summary.max_parallelism,
+                #[cfg(feature = "gpu")]
+                peak_vram: summary.peak_vram,
+            }
+        })
+        .reduce(CachedSummaryAggregate::default, |mut left, right| {
+            left.total_time += right.total_time;
+            left.max_latency = left.max_latency.max(right.max_latency);
+            left.total_parallelism = left
+                .total_parallelism
+                .checked_add(right.total_parallelism)
+                .expect("layer parallelism overflowed u128 while summing subcircuit requests");
+            #[cfg(feature = "gpu")]
+            {
+                left.peak_vram = left.peak_vram.max(right.peak_vram);
+            }
+            left
+        })
 }
 
 #[derive(Debug, Default)]
@@ -246,14 +344,14 @@ pub trait BenchEstimator<E: Evaluable> {
     where
         Self: Sync,
     {
-        let mut summary_cache = HashMap::new();
+        let summary_cache = RwLock::new(HashMap::new());
         let start = Instant::now();
         debug!(
             "estimate_circuit_bench start: circuit_ptr={}, outputs={}, initial_param_bindings=0",
             circuit as *const PolyCircuit<E::P> as usize,
             circuit.num_output()
         );
-        let estimate = estimate_circuit_bench_with_cache(self, circuit, &[], &mut summary_cache);
+        let estimate = estimate_circuit_bench_with_cache(self, circuit, &[], &summary_cache);
         debug!(
             "estimate_circuit_bench finished: circuit_ptr={}, outputs={}, total_time={:.6}, latency={:.6}, max_parallelism={}, cache_entries={}, elapsed_ms={:.3}",
             circuit as *const PolyCircuit<E::P> as usize,
@@ -261,7 +359,7 @@ pub trait BenchEstimator<E: Evaluable> {
             estimate.total_time,
             estimate.latency,
             estimate.max_parallelism,
-            summary_cache.len(),
+            bench_summary_cache_len(&summary_cache),
             start.elapsed().as_secs_f64() * 1000.0
         );
         estimate
@@ -272,37 +370,37 @@ fn estimate_circuit_bench_with_cache<E, B>(
     estimator: &B,
     circuit: &PolyCircuit<E::P>,
     param_bindings: &[SubCircuitParamValue],
-    summary_cache: &mut HashMap<BenchSummaryCacheKey, CircuitBenchSummary>,
+    summary_cache: &BenchSummaryCache,
 ) -> CircuitBenchSummary
 where
     E: Evaluable,
     B: BenchEstimator<E> + Sync + ?Sized,
 {
-    let circuit_key = BenchSummaryCacheKey {
-        circuit_ptr: circuit as *const PolyCircuit<E::P> as usize,
-        param_bindings: param_bindings.to_vec(),
-    };
-    if let Some(summary) = summary_cache.get(&circuit_key) {
+    let circuit_key =
+        BenchSummaryCacheKey { circuit_ptr: circuit as *const PolyCircuit<E::P> as usize };
+    if let Some(summary) = bench_summary_cache_get(summary_cache, &circuit_key) {
         debug!(
             "estimate_circuit_bench cache hit: circuit_ptr={}, param_bindings={}, total_time={:.6}, latency={:.6}, max_parallelism={}",
             circuit_key.circuit_ptr,
-            circuit_key.param_bindings.len(),
+            param_bindings.len(),
             summary.total_time,
             summary.latency,
             summary.max_parallelism
         );
-        return *summary;
+        return summary;
     }
 
     let start = Instant::now();
     let mut estimate = CircuitBenchSummary::new(0.0, 0.0, 0);
     #[cfg(feature = "gpu")]
     let mut peak_vram = 0;
-    let reachable_inputs = circuit.reachable_input_gate_ids();
+    let grouped_plan = circuit.grouped_execution_plan();
+    let GroupedExecutionPlan { layers: grouped_layers, reachable_input_gate_ids: reachable_inputs } =
+        grouped_plan;
     debug!(
         "estimate_circuit_bench cache miss: circuit_ptr={}, param_bindings={}, reachable_inputs={} starting input estimate",
         circuit_key.circuit_ptr,
-        circuit_key.param_bindings.len(),
+        param_bindings.len(),
         reachable_inputs.len()
     );
     if !reachable_inputs.is_empty() {
@@ -320,16 +418,24 @@ where
         {
             peak_vram = peak_vram.max(input_estimate.peak_vram);
         }
+        debug!(
+            "estimate_circuit_bench input estimate applied: circuit_ptr={}, param_bindings={}, reachable_inputs={}, input_total_time={:.6}, input_latency={:.6}, accumulated_total_time={:.6}, accumulated_latency={:.6}, accumulated_max_parallelism={}",
+            circuit_key.circuit_ptr,
+            param_bindings.len(),
+            reachable_inputs.len(),
+            input_estimate.total_time * input_count,
+            input_estimate.latency,
+            estimate.total_time,
+            estimate.latency,
+            estimate.max_parallelism
+        );
     }
-
-    let grouped_layers_start = Instant::now();
-    let grouped_layers = circuit.grouped_execution_layers();
     debug!(
         "estimate_circuit_bench grouped layers ready: circuit_ptr={}, param_bindings={}, layer_count={}, elapsed_ms={:.3}",
         circuit_key.circuit_ptr,
-        circuit_key.param_bindings.len(),
+        param_bindings.len(),
         grouped_layers.len(),
-        grouped_layers_start.elapsed().as_secs_f64() * 1000.0
+        start.elapsed().as_secs_f64() * 1000.0
     );
 
     for (
@@ -345,7 +451,7 @@ where
         debug!(
             "estimate_circuit_bench layer start: circuit_ptr={}, param_bindings={}, layer_index={}, sub_calls={}, summed_sub_calls={}, regular_gates={}",
             circuit_key.circuit_ptr,
-            circuit_key.param_bindings.len(),
+            param_bindings.len(),
             layer_idx,
             sub_circuit_call_ids.len(),
             summed_sub_circuit_call_ids.len(),
@@ -364,102 +470,183 @@ where
                 }
                 left
             });
-        let mut layer_latency = 0.0_f64;
-        let mut layer_parallelism = 0u128;
-
-        for call_id in sub_circuit_call_ids {
-            let call = circuit.sub_circuit_call_info(call_id);
-            let sub_circuit = circuit.registered_sub_circuit_ref(call.sub_circuit_id);
-            let sub_summary = estimate_circuit_bench_with_cache::<E, B>(
-                estimator,
-                sub_circuit.as_ref(),
-                &call.param_bindings,
-                summary_cache,
-            );
-            estimate.total_time += sub_summary.total_time;
-            layer_latency += sub_summary.latency;
-            layer_parallelism = layer_parallelism.max(sub_summary.max_parallelism);
-            #[cfg(feature = "gpu")]
-            {
-                peak_vram = peak_vram.max(sub_summary.peak_vram);
-            }
+        let layer_regular_gate_total: usize = layer_counts.values().copied().sum();
+        debug!(
+            "estimate_circuit_bench layer regular counts ready: circuit_ptr={}, param_bindings={}, layer_index={}, regular_gate_kinds={}, regular_gate_total={}",
+            circuit_key.circuit_ptr,
+            param_bindings.len(),
+            layer_idx,
+            layer_counts.len(),
+            layer_regular_gate_total
+        );
+        let direct_requests = sub_circuit_call_ids
+            .iter()
+            .map(|call_id| {
+                let call = circuit.sub_circuit_call_info(*call_id);
+                let sub_circuit = circuit.registered_sub_circuit_ref(call.sub_circuit_id);
+                prepared_bench_summary_request(
+                    call.sub_circuit_id,
+                    sub_circuit,
+                    call.param_bindings.to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let summed_requests = summed_sub_circuit_call_ids
+            .iter()
+            .flat_map(|summed_call_id| {
+                let call = circuit.summed_sub_circuit_call_info(*summed_call_id);
+                let sub_circuit = circuit.registered_sub_circuit_ref(call.sub_circuit_id);
+                call.param_bindings
+                    .iter()
+                    .map(|bindings| {
+                        prepared_bench_summary_request(
+                            call.sub_circuit_id,
+                            Arc::clone(&sub_circuit),
+                            bindings.as_ref().to_vec(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut unique_requests_by_key =
+            HashMap::<BenchSummaryCacheKey, PreparedBenchSummaryRequest<E::P>>::new();
+        for request in direct_requests.iter().chain(summed_requests.iter()) {
+            unique_requests_by_key
+                .entry(request.cache_key.clone())
+                .or_insert_with(|| request.clone());
         }
-        for summed_call_id in summed_sub_circuit_call_ids {
-            let call = circuit.summed_sub_circuit_call_info(summed_call_id);
-            let sub_circuit = circuit.registered_sub_circuit_ref(call.sub_circuit_id);
-            for param_bindings in &call.param_bindings {
-                let sub_summary = estimate_circuit_bench_with_cache::<E, B>(
+        let missing_requests = unique_requests_by_key
+            .into_values()
+            .filter(|request| !bench_summary_cache_contains(summary_cache, &request.cache_key))
+            .collect::<Vec<_>>();
+        if !missing_requests.is_empty() {
+            debug!(
+                "estimate_circuit_bench layer subcircuit warmup: circuit_ptr={}, param_bindings={}, layer_index={}, direct_requests={}, summed_requests={}, unique_missing_requests={}",
+                circuit_key.circuit_ptr,
+                param_bindings.len(),
+                layer_idx,
+                direct_requests.len(),
+                summed_requests.len(),
+                missing_requests.len()
+            );
+            for request in missing_requests {
+                let _ = estimate_circuit_bench_with_cache::<E, B>(
                     estimator,
-                    sub_circuit.as_ref(),
-                    param_bindings.as_ref(),
+                    request.sub_circuit.as_ref(),
+                    &request.param_bindings,
                     summary_cache,
                 );
-                estimate.total_time += sub_summary.total_time;
-                layer_latency += sub_summary.latency;
-                layer_parallelism = layer_parallelism.max(sub_summary.max_parallelism);
-                #[cfg(feature = "gpu")]
-                {
-                    peak_vram = peak_vram.max(sub_summary.peak_vram);
-                }
             }
         }
+        let (direct_aggregate, (summed_aggregate, regular_aggregate)) = rayon::join(
+            || aggregate_cached_sub_summaries(summary_cache, &direct_requests),
+            || {
+                rayon::join(
+                    || aggregate_cached_sub_summaries(summary_cache, &summed_requests),
+                    || {
+                        layer_counts
+                            .into_par_iter()
+                            .map(|(gate_type, count)| {
+                                let gate_estimate =
+                                    estimator.estimate_gate_bench_with_bindings(&gate_type, param_bindings);
+                                let gate_total_time = gate_estimate.total_time * count as f64;
+                                let gate_parallelism = gate_estimate
+                                    .parallelism_factor()
+                                    .checked_mul(count as u128)
+                                    .expect(
+                                        "layer parallelism overflowed u128 while scaling by gate count",
+                                    );
+                                debug!(
+                                    "estimate_circuit_bench regular gate kind: circuit_ptr={}, param_bindings={}, layer_index={}, gate_type={:?}, count={}, gate_total_time={:.6}, gate_latency={:.6}, gate_parallelism={}",
+                                    circuit_key.circuit_ptr,
+                                    param_bindings.len(),
+                                    layer_idx,
+                                    gate_type,
+                                    count,
+                                    gate_total_time,
+                                    gate_estimate.latency,
+                                    gate_parallelism
+                                );
+                                RegularGateAggregate {
+                                    total_time: gate_total_time,
+                                    max_latency: gate_estimate.latency,
+                                    total_parallelism: gate_parallelism,
+                                    #[cfg(feature = "gpu")]
+                                    peak_vram: gate_estimate.peak_vram,
+                                }
+                            })
+                            .reduce(RegularGateAggregate::default, |mut left, right| {
+                                left.total_time += right.total_time;
+                                left.max_latency = left.max_latency.max(right.max_latency);
+                                left.total_parallelism = left
+                                    .total_parallelism
+                                    .checked_add(right.total_parallelism)
+                                    .expect(
+                                        "layer parallelism overflowed u128 while summing gate kinds",
+                                    );
+                                #[cfg(feature = "gpu")]
+                                {
+                                    left.peak_vram = left.peak_vram.max(right.peak_vram);
+                                }
+                                left
+                            })
+                    },
+                )
+            },
+        );
 
-        let regular_aggregate = layer_counts
-            .into_par_iter()
-            .map(|(gate_type, count)| {
-                let gate_estimate =
-                    estimator.estimate_gate_bench_with_bindings(&gate_type, param_bindings);
-                let gate_total_time = gate_estimate.total_time * count as f64;
-                let gate_parallelism = gate_estimate
-                    .parallelism_factor()
-                    .checked_mul(count as u128)
-                    .expect("layer parallelism overflowed u128 while scaling by gate count");
-                debug!(
-                    "estimate_circuit_bench regular gate kind: circuit_ptr={}, param_bindings={}, layer_index={}, gate_type={:?}, count={}, gate_total_time={:.6}, gate_latency={:.6}, gate_parallelism={}",
-                    circuit_key.circuit_ptr,
-                    circuit_key.param_bindings.len(),
-                    layer_idx,
-                    gate_type,
-                    count,
-                    gate_total_time,
-                    gate_estimate.latency,
-                    gate_parallelism
-                );
-                RegularGateAggregate {
-                    total_time: gate_total_time,
-                    max_latency: gate_estimate.latency,
-                    total_parallelism: gate_parallelism,
-                    #[cfg(feature = "gpu")]
-                    peak_vram: gate_estimate.peak_vram,
-                }
-            })
-            .reduce(RegularGateAggregate::default, |mut left, right| {
-                left.total_time += right.total_time;
-                left.max_latency = left.max_latency.max(right.max_latency);
-                left.total_parallelism = left
-                    .total_parallelism
-                    .checked_add(right.total_parallelism)
-                    .expect("layer parallelism overflowed u128 while summing gate kinds");
-                #[cfg(feature = "gpu")]
-                {
-                    left.peak_vram = left.peak_vram.max(right.peak_vram);
-                }
-                left
-            });
+        debug!(
+            "estimate_circuit_bench layer cached aggregates ready: circuit_ptr={}, param_bindings={}, layer_index={}, direct_calls={}, direct_total_time={:.6}, direct_max_latency={:.6}, direct_total_parallelism={}, summed_invocations={}, summed_total_time={:.6}, summed_max_latency={:.6}, summed_total_parallelism={}",
+            circuit_key.circuit_ptr,
+            param_bindings.len(),
+            layer_idx,
+            direct_requests.len(),
+            direct_aggregate.total_time,
+            direct_aggregate.max_latency,
+            direct_aggregate.total_parallelism,
+            summed_requests.len(),
+            summed_aggregate.total_time,
+            summed_aggregate.max_latency,
+            summed_aggregate.total_parallelism
+        );
+
+        estimate.total_time += direct_aggregate.total_time + summed_aggregate.total_time;
+        let layer_latency = direct_aggregate
+            .max_latency
+            .max(summed_aggregate.max_latency)
+            .max(regular_aggregate.max_latency);
+        let layer_parallelism = direct_aggregate
+            .total_parallelism
+            .checked_add(summed_aggregate.total_parallelism)
+            .expect("layer parallelism overflowed u128 while summing direct and summed subcircuit requests")
+            .max(regular_aggregate.total_parallelism)
+            ;
+        #[cfg(feature = "gpu")]
+        {
+            peak_vram = peak_vram.max(direct_aggregate.peak_vram).max(summed_aggregate.peak_vram);
+        }
 
         estimate.total_time += regular_aggregate.total_time;
-        layer_latency += regular_aggregate.max_latency;
-        layer_parallelism = layer_parallelism.max(regular_aggregate.total_parallelism);
         #[cfg(feature = "gpu")]
         {
             peak_vram = peak_vram.max(regular_aggregate.peak_vram);
         }
+        debug!(
+            "estimate_circuit_bench regular aggregate applied: circuit_ptr={}, param_bindings={}, layer_index={}, regular_gate_total={}, regular_total_time={:.6}, regular_max_latency={:.6}, regular_parallelism={}",
+            circuit_key.circuit_ptr,
+            param_bindings.len(),
+            layer_idx,
+            layer_regular_gate_total,
+            regular_aggregate.total_time,
+            regular_aggregate.max_latency,
+            regular_aggregate.total_parallelism
+        );
         estimate.latency += layer_latency;
         estimate.max_parallelism = estimate.max_parallelism.max(layer_parallelism);
         debug!(
             "estimate_circuit_bench layer finished: circuit_ptr={}, param_bindings={}, layer_index={}, accumulated_total_time={:.6}, accumulated_latency={:.6}, accumulated_max_parallelism={}, elapsed_ms={:.3}",
             circuit_key.circuit_ptr,
-            circuit_key.param_bindings.len(),
+            param_bindings.len(),
             layer_idx,
             estimate.total_time,
             estimate.latency,
@@ -482,13 +669,13 @@ where
     debug!(
         "estimate_circuit_bench cache store: circuit_ptr={}, param_bindings={}, total_time={:.6}, latency={:.6}, max_parallelism={}, elapsed_ms={:.3}",
         circuit_key.circuit_ptr,
-        circuit_key.param_bindings.len(),
+        param_bindings.len(),
         estimate.total_time,
         estimate.latency,
         estimate.max_parallelism,
         start.elapsed().as_secs_f64() * 1000.0
     );
-    summary_cache.insert(circuit_key, estimate);
+    bench_summary_cache_insert(summary_cache, circuit_key, estimate);
     estimate
 }
 
@@ -499,7 +686,7 @@ mod tests {
     };
     use crate::{
         __PAIR, __TestState,
-        circuit::{PolyCircuit, PolyGateType},
+        circuit::{PolyCircuit, PolyGateType, SubCircuitParamValue},
         poly::dcrt::poly::DCRTPoly,
     };
     use sequential_test::sequential;
@@ -614,6 +801,7 @@ mod tests {
     struct CountingBenchEstimator {
         input_calls: AtomicUsize,
         add_calls: AtomicUsize,
+        small_scalar_mul_calls: AtomicUsize,
     }
 
     impl BenchEstimator<DCRTPoly> for CountingBenchEstimator {
@@ -636,7 +824,8 @@ mod tests {
         }
 
         fn estimate_small_scalar_mul(&self, _scalar: &[u32]) -> CircuitBenchEstimate {
-            bench(0.0, 0.0, 0)
+            self.small_scalar_mul_calls.fetch_add(1, Ordering::SeqCst);
+            bench(1.0, 1.0, 0)
         }
 
         fn estimate_large_scalar_mul(
@@ -716,7 +905,7 @@ mod tests {
         main_circuit.output(vec![top_add, sub_outputs[0]]);
 
         let estimate = ExpandedSubCircuitBenchEstimator.estimate_circuit_bench(&main_circuit);
-        let expected = summary(18.0, 11.0, 8, 23);
+        let expected = summary(18.0, 6.0, 8, 23);
 
         assert!((estimate.total_time - expected.total_time).abs() < 1e-9);
         assert!((estimate.latency - expected.latency).abs() < 1e-9);
@@ -742,9 +931,44 @@ mod tests {
         let estimator = CountingBenchEstimator::default();
         let estimate = estimator.estimate_circuit_bench(&main_circuit);
 
-        assert_eq!(estimate, summary(10.0, 5.0, 4, 0));
+        assert_eq!(estimate, summary(10.0, 3.0, 4, 0));
         assert_eq!(estimator.input_calls.load(Ordering::SeqCst), 2);
         assert_eq!(estimator.add_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(estimator.small_scalar_mul_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_estimate_circuit_bench_reuses_cached_subcircuit_summary_across_param_bindings() {
+        let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
+        let scalar_param = sub_circuit
+            .register_sub_circuit_param(crate::circuit::SubCircuitParamKind::SmallScalarMul);
+        let sub_inputs = sub_circuit.input(1).to_vec();
+        let scaled = sub_circuit.small_scalar_mul_param(sub_inputs[0], scalar_param);
+        sub_circuit.output(vec![scaled]);
+
+        let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
+        let main_inputs = main_circuit.input(1).to_vec();
+        let sub_id = main_circuit.register_sub_circuit(sub_circuit);
+        let doubled = main_circuit.call_sub_circuit_with_bindings(
+            sub_id,
+            &[main_inputs[0]],
+            &[SubCircuitParamValue::SmallScalarMul(vec![2])],
+        );
+        let tripled = main_circuit.call_sub_circuit_with_bindings(
+            sub_id,
+            &[main_inputs[0]],
+            &[SubCircuitParamValue::SmallScalarMul(vec![3])],
+        );
+        main_circuit.output(vec![doubled[0], tripled[0]]);
+
+        let estimator = CountingBenchEstimator::default();
+        let estimate = estimator.estimate_circuit_bench(&main_circuit);
+
+        assert_eq!(estimate, summary(5.0, 3.0, 2, 0));
+        assert_eq!(estimator.input_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(estimator.add_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(estimator.small_scalar_mul_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

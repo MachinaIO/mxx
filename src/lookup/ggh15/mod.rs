@@ -6,7 +6,9 @@ mod pubkey;
 
 pub use encoding::GGH15BGGEncodingPltEvaluator;
 #[cfg(feature = "gpu")]
-pub(crate) use encoding::{public_lookup_gpu_device_ids, public_lookup_round_robin_device_slot};
+pub(crate) use encoding::public_lookup_gpu_device_ids;
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) use encoding::public_lookup_round_robin_device_slot;
 pub use poly_encoding::GGH15BGGPolyEncodingPltEvaluator;
 pub use pubkey::GGH15BGGPubKeyPltEvaluator;
 

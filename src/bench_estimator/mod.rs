@@ -72,32 +72,33 @@ pub(crate) struct BenchOperationMeasurement {
 pub struct CircuitBenchEstimate {
     pub total_time: f64,
     pub latency: f64,
+    pub max_parallelism: u128,
     #[cfg(feature = "gpu")]
     pub peak_vram: usize,
 }
 
 impl CircuitBenchEstimate {
-    pub(crate) fn new(total_time: f64, latency: f64) -> Self {
+    pub(crate) fn new(
+        total_time: f64,
+        latency: f64,
+        max_parallelism: u128,
+        peak_vram: usize,
+    ) -> Self {
+        #[cfg(not(feature = "gpu"))]
+        let _ = peak_vram;
         Self {
             total_time,
             latency,
+            max_parallelism,
             #[cfg(feature = "gpu")]
-            peak_vram: 0,
+            peak_vram,
         }
     }
 
-    #[cfg(feature = "gpu")]
-    pub(crate) fn with_peak_vram(mut self, peak_vram: usize) -> Self {
-        self.peak_vram = peak_vram;
-        self
-    }
-
-    #[cfg(not(feature = "gpu"))]
-    pub(crate) fn with_peak_vram(self, _peak_vram: usize) -> Self {
-        self
-    }
-
     fn parallelism_factor(&self) -> u128 {
+        if self.max_parallelism > 0 {
+            return self.max_parallelism;
+        }
         if self.total_time <= 0.0 || self.latency <= 0.0 {
             return 0;
         }
@@ -115,25 +116,21 @@ pub struct CircuitBenchSummary {
 }
 
 impl CircuitBenchSummary {
-    pub(crate) fn new(total_time: f64, latency: f64, max_parallelism: u128) -> Self {
+    pub(crate) fn new(
+        total_time: f64,
+        latency: f64,
+        max_parallelism: u128,
+        peak_vram: usize,
+    ) -> Self {
+        #[cfg(not(feature = "gpu"))]
+        let _ = peak_vram;
         Self {
             total_time,
             latency,
             max_parallelism,
             #[cfg(feature = "gpu")]
-            peak_vram: 0,
+            peak_vram,
         }
-    }
-
-    #[cfg(feature = "gpu")]
-    pub(crate) fn with_peak_vram(mut self, peak_vram: usize) -> Self {
-        self.peak_vram = peak_vram;
-        self
-    }
-
-    #[cfg(not(feature = "gpu"))]
-    pub(crate) fn with_peak_vram(self, _peak_vram: usize) -> Self {
-        self
     }
 }
 
@@ -391,7 +388,7 @@ where
     }
 
     let start = Instant::now();
-    let mut estimate = CircuitBenchSummary::new(0.0, 0.0, 0);
+    let mut estimate = CircuitBenchSummary::new(0.0, 0.0, 0, 0);
     #[cfg(feature = "gpu")]
     let mut peak_vram = 0;
     let grouped_plan = circuit.grouped_execution_plan();
@@ -655,16 +652,15 @@ where
         );
     }
 
-    let estimate = estimate.with_peak_vram({
+    let estimate = CircuitBenchSummary::new(
+        estimate.total_time,
+        estimate.latency,
+        estimate.max_parallelism,
         #[cfg(feature = "gpu")]
-        {
-            peak_vram
-        }
+        peak_vram,
         #[cfg(not(feature = "gpu"))]
-        {
-            0
-        }
-    });
+        0,
+    );
 
     debug!(
         "estimate_circuit_bench cache store: circuit_ptr={}, param_bindings={}, total_time={:.6}, latency={:.6}, max_parallelism={}, elapsed_ms={:.3}",
@@ -701,7 +697,7 @@ mod tests {
     };
 
     fn bench(latency: f64, total_time: f64, peak_vram: usize) -> CircuitBenchEstimate {
-        CircuitBenchEstimate::new(total_time, latency).with_peak_vram(peak_vram)
+        CircuitBenchEstimate::new(total_time, latency, 0, peak_vram)
     }
 
     fn summary(
@@ -710,7 +706,7 @@ mod tests {
         max_parallelism: u128,
         peak_vram: usize,
     ) -> CircuitBenchSummary {
-        CircuitBenchSummary::new(total_time, latency, max_parallelism).with_peak_vram(peak_vram)
+        CircuitBenchSummary::new(total_time, latency, max_parallelism, peak_vram)
     }
 
     struct TestBenchEstimator;

@@ -9,6 +9,12 @@ pub(super) struct GpuSlotTransferSharedByDevice<M: PolyMatrix> {
     pub out_pubkey_matrix: M,
 }
 
+struct LoadedSlotTransferChunk<M: PolyMatrix> {
+    device_slot: usize,
+    chunk_idx: usize,
+    rhs_chunk: M,
+}
+
 pub(super) fn effective_gpu_slot_parallelism(slot_parallelism: usize) -> usize {
     let device_ids = detected_gpu_device_ids();
     assert!(
@@ -21,6 +27,121 @@ pub(super) fn effective_gpu_slot_parallelism(slot_parallelism: usize) -> usize {
 fn slot_device_ids(slot_parallelism: usize) -> Vec<i32> {
     let clamped_parallelism = effective_gpu_slot_parallelism(slot_parallelism);
     detected_gpu_device_ids().into_iter().take(clamped_parallelism).collect()
+}
+
+fn collect_pipelined_chunk_bytes<Loaded, FL, FC>(
+    chunk_count: usize,
+    wave_width: usize,
+    load_wave: FL,
+    compute_wave: FC,
+) -> Vec<Vec<u8>>
+where
+    Loaded: Send,
+    FL: Fn(usize, usize) -> Vec<Loaded> + Sync,
+    FC: Fn(Vec<Loaded>) -> Vec<(usize, Vec<u8>)> + Sync,
+{
+    if chunk_count == 0 {
+        return Vec::new();
+    }
+    let wave_width = wave_width.max(1).min(chunk_count);
+    let mut chunk_bytes = (0..chunk_count).map(|_| None).collect::<Vec<_>>();
+    let mut next_chunk_idx = 0usize;
+    let mut current_wave = load_wave(next_chunk_idx, wave_width);
+    next_chunk_idx += current_wave.len();
+
+    while !current_wave.is_empty() {
+        if next_chunk_idx < chunk_count {
+            let next_wave_width = (chunk_count - next_chunk_idx).min(wave_width);
+            let (wave_results, next_wave) = rayon::join(
+                || compute_wave(current_wave),
+                || load_wave(next_chunk_idx, next_wave_width),
+            );
+            for (chunk_idx, bytes) in wave_results {
+                chunk_bytes[chunk_idx] = Some(bytes);
+            }
+            current_wave = next_wave;
+            next_chunk_idx += next_wave_width;
+        } else {
+            for (chunk_idx, bytes) in compute_wave(current_wave) {
+                chunk_bytes[chunk_idx] = Some(bytes);
+            }
+            break;
+        }
+    }
+
+    chunk_bytes
+        .into_par_iter()
+        .enumerate()
+        .map(|(chunk_idx, maybe_bytes)| {
+            maybe_bytes.unwrap_or_else(|| {
+                panic!("missing slot-transfer chunk bytes for chunk {chunk_idx}")
+            })
+        })
+        .collect()
+}
+
+fn load_checkpoint_chunk_wave<M>(
+    shared_by_device: &[GpuSlotTransferSharedByDevice<M>],
+    dir: &std::path::Path,
+    id_prefix: &str,
+    total_cols: usize,
+    wave_start: usize,
+    wave_width: usize,
+) -> Vec<LoadedSlotTransferChunk<M>>
+where
+    M: PolyMatrix + Send + Sync,
+{
+    (wave_start..wave_start + wave_width)
+        .into_par_iter()
+        .enumerate()
+        .map(|(device_slot, chunk_idx)| {
+            let shared = &shared_by_device[device_slot];
+            let rhs_chunk = read_matrix_column_chunk::<M>(
+                &shared.params,
+                dir,
+                id_prefix,
+                total_cols,
+                chunk_idx,
+            );
+            LoadedSlotTransferChunk { device_slot, chunk_idx, rhs_chunk }
+        })
+        .collect()
+}
+
+fn compute_c_b0_left_mul_wave<M>(
+    shared_by_device: &[GpuSlotTransferSharedByDevice<M>],
+    loaded_wave: Vec<LoadedSlotTransferChunk<M>>,
+) -> Vec<(usize, Vec<u8>)>
+where
+    M: PolyMatrix + Send + Sync,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
+{
+    loaded_wave
+        .into_par_iter()
+        .map(|loaded| {
+            let shared = &shared_by_device[loaded.device_slot];
+            (loaded.chunk_idx, (&shared.c_b0 * &loaded.rhs_chunk).into_compact_bytes())
+        })
+        .collect()
+}
+
+fn compute_predecoded_left_mul_wave<M>(
+    lhs_by_device: &[M],
+    loaded_wave: Vec<LoadedSlotTransferChunk<M>>,
+) -> Vec<(usize, Vec<u8>)>
+where
+    M: PolyMatrix + Send + Sync,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
+{
+    loaded_wave
+        .into_par_iter()
+        .map(|loaded| {
+            (
+                loaded.chunk_idx,
+                (&lhs_by_device[loaded.device_slot] * &loaded.rhs_chunk).into_compact_bytes(),
+            )
+        })
+        .collect()
 }
 
 fn prepare_slot_transfer_shared_by_device<M, HS>(
@@ -50,50 +171,61 @@ where
         .collect()
 }
 
-fn collect_chunk_bytes_by_device<M, F>(
+fn collect_left_mul_chunk_bytes_by_device<M>(
     shared_by_device: &[GpuSlotTransferSharedByDevice<M>],
-    chunk_count: usize,
-    build_chunk: F,
+    dir: &std::path::Path,
+    id_prefix: &str,
+    total_cols: usize,
 ) -> Vec<Vec<u8>>
 where
     M: PolyMatrix + Send + Sync,
-    F: Fn(&GpuSlotTransferSharedByDevice<M>, usize) -> Vec<u8> + Send + Sync,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
 {
-    let mut chunk_bytes = (0..chunk_count).map(|_| None).collect::<Vec<_>>();
-    for wave in (0..chunk_count).collect::<Vec<_>>().chunks(shared_by_device.len().max(1)) {
-        let wave_results = wave
-            .par_iter()
-            .enumerate()
-            .map(|(device_slot, chunk_idx)| {
-                let shared = &shared_by_device[device_slot];
-                (*chunk_idx, build_chunk(shared, *chunk_idx))
-            })
-            .collect::<Vec<_>>();
-        for (chunk_idx, bytes) in wave_results {
-            chunk_bytes[chunk_idx] = Some(bytes);
-        }
-    }
-    chunk_bytes
-        .into_iter()
-        .enumerate()
-        .map(|(chunk_idx, maybe_bytes)| {
-            maybe_bytes.unwrap_or_else(|| {
-                panic!("missing slot-transfer chunk bytes for chunk {chunk_idx}")
-            })
-        })
-        .collect()
+    let chunk_count = column_chunk_count(total_cols);
+    collect_pipelined_chunk_bytes(
+        chunk_count,
+        shared_by_device.len().max(1),
+        |wave_start, wave_width| {
+            load_checkpoint_chunk_wave(
+                shared_by_device,
+                dir,
+                id_prefix,
+                total_cols,
+                wave_start,
+                wave_width,
+            )
+        },
+        |loaded_wave| compute_c_b0_left_mul_wave(shared_by_device, loaded_wave),
+    )
 }
 
-fn concat_chunk_bytes_on_base<M>(params: &<M::P as Poly>::Params, chunk_bytes: Vec<Vec<u8>>) -> M
+fn collect_predecoded_left_mul_chunk_bytes_by_device<M>(
+    shared_by_device: &[GpuSlotTransferSharedByDevice<M>],
+    lhs_by_device: &[M],
+    dir: &std::path::Path,
+    id_prefix: &str,
+    total_cols: usize,
+) -> Vec<Vec<u8>>
 where
-    M: PolyMatrix,
+    M: PolyMatrix + Send + Sync,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
 {
-    if chunk_bytes.len() == 1 {
-        return M::from_compact_bytes(params, &chunk_bytes[0]);
-    }
-    let mut chunk_iter = chunk_bytes.into_iter().map(|bytes| M::from_compact_bytes(params, &bytes));
-    let first = chunk_iter.next().expect("slot-transfer chunk byte list must be non-empty");
-    first.concat_columns_owned(chunk_iter.collect())
+    let chunk_count = column_chunk_count(total_cols);
+    collect_pipelined_chunk_bytes(
+        chunk_count,
+        shared_by_device.len().max(1),
+        |wave_start, wave_width| {
+            load_checkpoint_chunk_wave(
+                shared_by_device,
+                dir,
+                id_prefix,
+                total_cols,
+                wave_start,
+                wave_width,
+            )
+        },
+        |loaded_wave| compute_predecoded_left_mul_wave(lhs_by_device, loaded_wave),
+    )
 }
 
 fn output_slot_for_params_gpu<M, HS>(
@@ -121,61 +253,45 @@ where
         input.num_slots()
     );
 
-    let input_vector = M::from_compact_bytes(params, input.vector_bytes[src_slot].as_ref());
     let secret_size = shared_by_device[0].out_pubkey_matrix.row_size();
-    let src_plaintext =
-        M::P::from_compact_bytes(params, plaintext_bytes_by_slot[src_slot].as_ref());
-    let constant_term = src_plaintext
-        .coeffs_biguints()
-        .into_iter()
-        .next()
-        .expect("plaintext polynomial must contain a constant coefficient");
-    drop(src_plaintext);
+    let input_vector = M::from_compact_bytes(params, input.vector_bytes[src_slot].as_ref());
+    let constant_term =
+        M::P::from_compact_bytes(params, plaintext_bytes_by_slot[src_slot].as_ref())
+            .coeffs_biguints()
+            .into_iter()
+            .next()
+            .expect("plaintext polynomial must contain a constant coefficient");
     let mut output_plaintext = M::P::from_biguint_to_constant(params, constant_term);
     let dir = evaluator.dir_path.as_path();
 
     let slot_preimage_b0_total_cols = trapdoor_public_column_count::<M>(params, secret_size * 2);
-    let slot_preimage_b0_chunk_bytes = collect_chunk_bytes_by_device(
+    let slot_preimage_b0_chunk_bytes = collect_left_mul_chunk_bytes_by_device(
         shared_by_device,
-        column_chunk_count(slot_preimage_b0_total_cols),
-        |shared, chunk_idx| {
-            left_mul_chunked_checkpoint_column(
-                &shared.params,
-                dir,
-                &evaluator.slot_preimage_b0_id_prefix(src_slot),
-                slot_preimage_b0_total_cols,
-                chunk_idx,
-                &shared.c_b0,
-            )
-            .into_compact_bytes()
-        },
+        dir,
+        &evaluator.slot_preimage_b0_id_prefix(src_slot),
+        slot_preimage_b0_total_cols,
     );
-    let c_b0_slot_preimage_b0: M = concat_chunk_bytes_on_base(params, slot_preimage_b0_chunk_bytes);
-    let c_b0_slot_preimage_b0_bytes = Arc::<[u8]>::from(c_b0_slot_preimage_b0.to_compact_bytes());
+    let c_b0_slot_preimage_b0: M =
+        concat_slot_transfer_chunk_bytes(params, slot_preimage_b0_chunk_bytes);
+    let reload_params = shared_by_device.iter().map(|shared| &shared.params).collect::<Vec<_>>();
+    let c_b0_slot_preimage_b0_by_device =
+        redistribute_slot_transfer_stage_matrix(&c_b0_slot_preimage_b0, &reload_params);
 
     let slot_preimage_b1_total_cols = secret_size * params.modulus_digits();
-    let c_transfer_chunk_bytes = collect_chunk_bytes_by_device(
+    let c_transfer_chunk_bytes = collect_predecoded_left_mul_chunk_bytes_by_device(
         shared_by_device,
-        column_chunk_count(slot_preimage_b1_total_cols),
-        |shared, chunk_idx| {
-            let local_c_b0_slot_preimage_b0 =
-                M::from_compact_bytes(&shared.params, c_b0_slot_preimage_b0_bytes.as_ref());
-            let slot_preimage_b1_chunk = read_matrix_column_chunk::<M>(
-                &shared.params,
-                dir,
-                &evaluator.slot_preimage_b1_id_prefix(dst_slot),
-                slot_preimage_b1_total_cols,
-                chunk_idx,
-            );
-            (&local_c_b0_slot_preimage_b0 * &slot_preimage_b1_chunk).into_compact_bytes()
-        },
+        &c_b0_slot_preimage_b0_by_device,
+        dir,
+        &evaluator.slot_preimage_b1_id_prefix(dst_slot),
+        slot_preimage_b1_total_cols,
     );
-    let c_transfer: M = concat_chunk_bytes_on_base(params, c_transfer_chunk_bytes);
-
     let out_pubkey_matrix = &shared_by_device[0].out_pubkey_matrix;
-    let slot_a = evaluator.slot_a_for_params(params, out_pubkey_matrix.row_size(), dst_slot);
-    let slot_a_decomposed = slot_a.decompose();
-    drop(slot_a);
+    // The only intended overlap in the GPU slot-transfer path is "load/store next chunk wave"
+    // versus "compute current chunk wave" inside `collect_pipelined_chunk_bytes(...)`. Stage-local
+    // algebra stays sequential here so we do not overlap two independent compute tasks.
+    let c_transfer: M = concat_slot_transfer_chunk_bytes(params, c_transfer_chunk_bytes);
+    let slot_a_decomposed: M =
+        evaluator.slot_a_for_params(params, out_pubkey_matrix.row_size(), dst_slot).decompose();
     let transfer_plaintext_term = c_transfer.clone() * &output_plaintext;
     let mut pre_out = (&input_vector * &slot_a_decomposed) + &transfer_plaintext_term;
     drop(input_vector);
@@ -190,22 +306,13 @@ where
     }
 
     let gate_total_cols = secret_size * params.modulus_digits();
-    let gate_chunk_bytes = collect_chunk_bytes_by_device(
+    let gate_chunk_bytes = collect_left_mul_chunk_bytes_by_device(
         shared_by_device,
-        column_chunk_count(gate_total_cols),
-        |shared, chunk_idx| {
-            left_mul_chunked_checkpoint_column(
-                &shared.params,
-                dir,
-                &evaluator.gate_preimage_id_prefix(gate_id, dst_slot),
-                gate_total_cols,
-                chunk_idx,
-                &shared.c_b0,
-            )
-            .into_compact_bytes()
-        },
+        dir,
+        &evaluator.gate_preimage_id_prefix(gate_id, dst_slot),
+        gate_total_cols,
     );
-    let c_gate: M = concat_chunk_bytes_on_base(params, gate_chunk_bytes);
+    let c_gate: M = concat_slot_transfer_chunk_bytes(params, gate_chunk_bytes);
     let out_vector: M = c_gate + &pre_out;
     drop(pre_out);
 

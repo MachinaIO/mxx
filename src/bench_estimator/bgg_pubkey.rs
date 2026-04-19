@@ -16,7 +16,7 @@ use super::{
 };
 
 pub(crate) fn per_gate_time_estimate(time: f64, peak_vram: usize) -> CircuitBenchEstimate {
-    CircuitBenchEstimate::new(time, time).with_peak_vram(peak_vram)
+    CircuitBenchEstimate::new(time, time, 0, peak_vram)
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -508,10 +508,7 @@ mod tests {
             }
         );
 
-        assert_eq!(
-            estimator.estimate_input(),
-            CircuitBenchEstimate::new(0.0, 0.0).with_peak_vram(0)
-        );
+        assert_eq!(estimator.estimate_input(), CircuitBenchEstimate::new(0.0, 0.0, 0, 0));
         assert!(estimator.add_time >= 0.0);
         assert!(estimator.sub_time >= 0.0);
         assert!(estimator.mul_time >= 0.0);
@@ -519,30 +516,50 @@ mod tests {
         assert!(estimator.large_scalar_mul_time >= 0.0);
         assert_eq!(
             estimator.estimate_add(),
-            CircuitBenchEstimate::new(estimator.add_time, estimator.add_time)
-                .with_peak_vram(estimator.add_peak_vram)
+            CircuitBenchEstimate::new(
+                estimator.add_time,
+                estimator.add_time,
+                0,
+                estimator.add_peak_vram,
+            )
         );
         assert_eq!(
             estimator.estimate_sub(),
-            CircuitBenchEstimate::new(estimator.sub_time, estimator.sub_time)
-                .with_peak_vram(estimator.sub_peak_vram)
+            CircuitBenchEstimate::new(
+                estimator.sub_time,
+                estimator.sub_time,
+                0,
+                estimator.sub_peak_vram,
+            )
         );
         assert_eq!(
             estimator.estimate_mul(),
-            CircuitBenchEstimate::new(estimator.mul_time, estimator.mul_time)
-                .with_peak_vram(estimator.mul_peak_vram)
+            CircuitBenchEstimate::new(
+                estimator.mul_time,
+                estimator.mul_time,
+                0,
+                estimator.mul_peak_vram,
+            )
         );
         assert!(estimator.public_lut_time >= 0.0);
         assert!(estimator.slot_transfer_time >= 0.0);
         assert_eq!(
             estimator.estimate_public_lookup(7),
-            CircuitBenchEstimate::new(estimator.public_lut_time, estimator.public_lut_time)
-                .with_peak_vram(estimator.public_lut_peak_vram)
+            CircuitBenchEstimate::new(
+                estimator.public_lut_time,
+                estimator.public_lut_time,
+                0,
+                estimator.public_lut_peak_vram,
+            )
         );
         assert_eq!(
             estimator.estimate_slot_transfer(&[(0, None), (1, Some(0))]),
-            CircuitBenchEstimate::new(estimator.slot_transfer_time, estimator.slot_transfer_time)
-                .with_peak_vram(estimator.slot_transfer_peak_vram)
+            CircuitBenchEstimate::new(
+                estimator.slot_transfer_time,
+                estimator.slot_transfer_time,
+                0,
+                estimator.slot_transfer_peak_vram,
+            )
         );
     }
 

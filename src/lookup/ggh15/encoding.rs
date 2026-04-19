@@ -49,7 +49,7 @@ pub(super) struct GGH15PublicLookupSlotOutput<M: PolyMatrix> {
     pub plaintext: M::P,
 }
 
-fn mul_chunked_checkpoint_with_rhs<M>(
+pub(super) fn mul_chunked_checkpoint_with_rhs<M>(
     params: &<M::P as Poly>::Params,
     dir: &Path,
     id_prefix: &str,
@@ -171,6 +171,48 @@ where
     }
 }
 
+pub(super) fn sample_public_lookup_u_g_chunk<M, HS>(
+    params: &<M::P as Poly>::Params,
+    hash_key: [u8; 32],
+    u_g_id: &str,
+    d: usize,
+    m_g: usize,
+    inner_chunk_idx: usize,
+) -> M
+where
+    M: PolyMatrix,
+    HS: PolyHashSampler<[u8; 32], M = M>,
+{
+    let (inner_start, inner_len) = column_chunk_bounds(m_g, inner_chunk_idx);
+    HS::new().sample_hash_decomposed_columns(
+        params,
+        hash_key,
+        u_g_id.to_owned(),
+        d,
+        m_g,
+        inner_start,
+        inner_len,
+        DistType::FinRingDist,
+    )
+}
+
+pub(super) fn compute_public_lookup_randomized_mid<M>(
+    input_vector: &M,
+    v_idx_chunk: &M,
+    u_g_decomposed_chunk: &M,
+    inner_chunk_idx: usize,
+    output_col_len: usize,
+) -> M
+where
+    M: PolyMatrix,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
+{
+    let (inner_start, inner_len) = column_chunk_bounds(v_idx_chunk.row_size(), inner_chunk_idx);
+    let lhs_mid = input_vector * u_g_decomposed_chunk;
+    let v_rhs = v_idx_chunk.slice(inner_start, inner_start + inner_len, 0, output_col_len);
+    &lhs_mid * &v_rhs
+}
+
 pub(super) fn build_public_lookup_output_chunk<M, HS>(
     params: &<M::P as Poly>::Params,
     plt: &PublicLut<M::P>,
@@ -190,6 +232,14 @@ where
     HS: PolyHashSampler<[u8; 32], M = M>,
     for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
 {
+    // Resolve the LUT row selected by x and convert the output element y into a constant poly.
+    // The online public-lookup chunk computes the output encoding chunk
+    //
+    //   c_out[chunk] = c_const[chunk] + c_x[chunk]
+    //
+    // where:
+    // - c_const collects the x-independent checkpoint products for this selected LUT row.
+    // - c_x collects the randomized x-dependent products driven by the sampled u_g chunks.
     let x_u64 = x.const_coeff_u64();
     let (k, y) = plt
         .get(params, x_u64)
@@ -205,27 +255,45 @@ where
     let u_g_id = format!("ggh15_lut_u_g_matrix_{}", gate_id);
     let (col_start, col_len) = column_chunk_bounds(shared.m_g, chunk_idx);
 
-    let mut c_const_chunk = left_mul_chunked_checkpoint_column(
-        params,
-        dir,
-        &shared.preimage_gate2_identity_id_prefix,
-        shared.m_g,
-        chunk_idx,
-        c_b0,
-        "preimage_gate2_identity",
-    );
-
-    let gy_decomposed_chunk = gy.slice_columns(col_start, col_start + col_len).decompose();
-    let gy_mid = mul_chunked_checkpoint_with_rhs(
-        params,
-        dir,
-        &shared.preimage_gate2_gy_id_prefix,
-        shared.m_g,
-        &gy_decomposed_chunk,
-        "preimage_gate2_gy",
+    // Stage 1: build the chunk contribution of
+    //
+    //   checkpoint_gate2_identity + c_b0 * checkpoint_gate2_gy(gy)
+    //
+    // for the current output chunk. `gy = G * y` is the gadget-times-plaintext term that
+    // shifts the selected LUT output into the encoding basis.
+    let (mut c_const_chunk, gy_mid) = rayon::join(
+        || {
+            left_mul_chunked_checkpoint_column(
+                params,
+                dir,
+                &shared.preimage_gate2_identity_id_prefix,
+                shared.m_g,
+                chunk_idx,
+                c_b0,
+                "preimage_gate2_identity",
+            )
+        },
+        || {
+            let gy_decomposed_chunk = gy.slice_columns(col_start, col_start + col_len).decompose();
+            mul_chunked_checkpoint_with_rhs(
+                params,
+                dir,
+                &shared.preimage_gate2_gy_id_prefix,
+                shared.m_g,
+                &gy_decomposed_chunk,
+                "preimage_gate2_gy",
+            )
+        },
     );
     c_const_chunk.add_in_place(&(c_b0 * &gy_mid));
 
+    // Stage 2: sample the hashed v_idx chunk for the selected LUT row and fold in the
+    // checkpoint product corresponding to the plain v term:
+    //
+    //   c_const += c_b0 * checkpoint_gate2_v(v_idx_chunk)
+    //
+    // If there is no small-gadget decomposition stage (`k_small == 0`), this stage also
+    // prefetches the selected LUT preimage chunk needed by gate1 below.
     let v_idx_chunk = HS::new().sample_hash_decomposed_columns(
         params,
         hash_key,
@@ -236,16 +304,52 @@ where
         col_len,
         DistType::FinRingDist,
     );
-    let v_mid = mul_chunked_checkpoint_with_rhs(
-        params,
-        dir,
-        &shared.preimage_gate2_v_id_prefix,
-        shared.m_g,
-        &v_idx_chunk,
-        "preimage_gate2_v",
-    );
+    let prefetch_preimage_lut_with_v = shared.k_small == 0;
+    let (v_mid, mut prefetched_preimage_lut_chunk) = if prefetch_preimage_lut_with_v {
+        let (v_mid, preimage_lut_chunk) = rayon::join(
+            || {
+                mul_chunked_checkpoint_with_rhs(
+                    params,
+                    dir,
+                    &shared.preimage_gate2_v_id_prefix,
+                    shared.m_g,
+                    &v_idx_chunk,
+                    "preimage_gate2_v",
+                )
+            },
+            || {
+                read_matrix_column_chunk(
+                    params,
+                    dir,
+                    &lut_aux_row_id,
+                    shared.m_g,
+                    chunk_idx,
+                    "preimage_lut",
+                )
+            },
+        );
+        (v_mid, Some(preimage_lut_chunk))
+    } else {
+        (
+            mul_chunked_checkpoint_with_rhs(
+                params,
+                dir,
+                &shared.preimage_gate2_v_id_prefix,
+                shared.m_g,
+                &v_idx_chunk,
+                "preimage_gate2_v",
+            ),
+            None,
+        )
+    };
     c_const_chunk.add_in_place(&(c_b0 * &v_mid));
 
+    // Stage 3: for each small-gadget digit of x, add the corresponding
+    //
+    //   c_b0 * checkpoint_gate2_vx_small(v_idx_chunk * digit(x))
+    //
+    // contribution. The last small-gadget stage also prefetches the selected LUT preimage chunk,
+    // so gate1 can start immediately afterwards without another branchy load path.
     for small_chunk_idx in 0..shared.k_small {
         let vx_rhs_chunk = build_small_decomposed_scalar_mul_chunk::<M>(
             params,
@@ -253,58 +357,127 @@ where
             &scalar_by_digit,
             small_chunk_idx,
         );
-        let vx_mid = mul_chunked_checkpoint_with_rhs(
-            params,
-            dir,
-            &shared.preimage_gate2_vx_small_id_prefixes[small_chunk_idx],
-            shared.m_g,
-            &vx_rhs_chunk,
-            "preimage_gate2_vx",
-        );
+        let prefetch_preimage_lut_now = small_chunk_idx + 1 == shared.k_small;
+        let vx_mid = if prefetch_preimage_lut_now {
+            let (vx_mid, preimage_lut_chunk) = rayon::join(
+                || {
+                    mul_chunked_checkpoint_with_rhs(
+                        params,
+                        dir,
+                        &shared.preimage_gate2_vx_small_id_prefixes[small_chunk_idx],
+                        shared.m_g,
+                        &vx_rhs_chunk,
+                        "preimage_gate2_vx",
+                    )
+                },
+                || {
+                    read_matrix_column_chunk(
+                        params,
+                        dir,
+                        &lut_aux_row_id,
+                        shared.m_g,
+                        chunk_idx,
+                        "preimage_lut",
+                    )
+                },
+            );
+            prefetched_preimage_lut_chunk = Some(preimage_lut_chunk);
+            vx_mid
+        } else {
+            mul_chunked_checkpoint_with_rhs(
+                params,
+                dir,
+                &shared.preimage_gate2_vx_small_id_prefixes[small_chunk_idx],
+                shared.m_g,
+                &vx_rhs_chunk,
+                "preimage_gate2_vx",
+            )
+        };
         c_const_chunk.add_in_place(&(c_b0 * &vx_mid));
     }
-
-    let preimage_lut_chunk = read_matrix_column_chunk(
-        params,
-        dir,
-        &lut_aux_row_id,
-        shared.m_g,
-        chunk_idx,
-        "preimage_lut",
+    let preimage_lut_chunk = prefetched_preimage_lut_chunk.expect(
+        "public lookup must prefetch preimage_lut either with v or with the last vx_small stage",
     );
-    let preimage_lut_in_b0_basis = mul_chunked_checkpoint_with_rhs(
-        params,
-        dir,
-        &shared.preimage_gate1_id_prefix,
-        gate1_total_cols,
-        &preimage_lut_chunk,
-        "preimage_gate1",
+
+    // Stage 4: map the selected LUT preimage chunk through gate1:
+    //
+    //   preimage_lut_in_b0_basis = checkpoint_gate1(preimage_lut_chunk)
+    //
+    // and subtract its c_b0 image from the constant accumulator. In parallel, pre-sample the
+    // first u_g chunk needed by the randomized x-dependent stage below.
+    let inner_chunk_total = column_chunk_count(shared.m_g);
+    let (preimage_lut_in_b0_basis, mut current_u_g_decomposed_chunk) = rayon::join(
+        || {
+            mul_chunked_checkpoint_with_rhs(
+                params,
+                dir,
+                &shared.preimage_gate1_id_prefix,
+                gate1_total_cols,
+                &preimage_lut_chunk,
+                "preimage_gate1",
+            )
+        },
+        || {
+            sample_public_lookup_u_g_chunk::<M, HS>(
+                params, hash_key, &u_g_id, shared.d, shared.m_g, 0,
+            )
+        },
     );
     c_const_chunk = c_const_chunk - (c_b0 * &preimage_lut_in_b0_basis);
+
+    // Stage 5: accumulate the randomized x-dependent part
+    //
+    //   c_x += (input_vector * u_g_chunk) * v_idx_chunk[chunk]
+    //
+    // chunk by chunk. Each loop iteration computes the current randomized contribution while
+    // pre-sampling the next u_g chunk, so the host-side hash expansion overlaps with the current
+    // matrix multiply.
     let mut c_x_chunk_acc: Option<M> = None;
-    for inner_chunk_idx in 0..column_chunk_count(shared.m_g) {
-        let (inner_start, inner_len) = column_chunk_bounds(shared.m_g, inner_chunk_idx);
-        let u_g_decomposed_chunk = HS::new().sample_hash_decomposed_columns(
-            params,
-            hash_key,
-            u_g_id.clone(),
-            shared.d,
-            shared.m_g,
-            inner_start,
-            inner_len,
-            DistType::FinRingDist,
+    let mut current_inner_chunk_idx = 0usize;
+    for next_inner_chunk_idx in 1..inner_chunk_total {
+        let (randomized_mid, next_u_g_decomposed_chunk) = rayon::join(
+            || {
+                compute_public_lookup_randomized_mid(
+                    input_vector,
+                    &v_idx_chunk,
+                    &current_u_g_decomposed_chunk,
+                    current_inner_chunk_idx,
+                    col_len,
+                )
+            },
+            || {
+                sample_public_lookup_u_g_chunk::<M, HS>(
+                    params,
+                    hash_key,
+                    &u_g_id,
+                    shared.d,
+                    shared.m_g,
+                    next_inner_chunk_idx,
+                )
+            },
         );
-        let lhs_mid = input_vector * &u_g_decomposed_chunk;
-        let v_rhs = v_idx_chunk.slice(inner_start, inner_start + inner_len, 0, col_len);
-        let randomized_mid = &lhs_mid * &v_rhs;
-        if let Some(acc) = c_x_chunk_acc.as_mut() {
-            acc.add_in_place(&randomized_mid);
-        } else {
-            c_x_chunk_acc = Some(randomized_mid);
-        }
+        append_checkpoint_product(&mut c_x_chunk_acc, randomized_mid);
+        current_u_g_decomposed_chunk = next_u_g_decomposed_chunk;
+        current_inner_chunk_idx = next_inner_chunk_idx;
     }
+    append_checkpoint_product(
+        &mut c_x_chunk_acc,
+        compute_public_lookup_randomized_mid(
+            input_vector,
+            &v_idx_chunk,
+            &current_u_g_decomposed_chunk,
+            current_inner_chunk_idx,
+            col_len,
+        ),
+    );
     let c_x_chunk =
         c_x_chunk_acc.expect("public lookup randomized chunk accumulation must be non-empty");
+
+    // Final chunk output:
+    //
+    //   c_out[chunk] = c_const[chunk] + c_x[chunk]
+    //
+    // still in the output encoding/vector basis.
     c_const_chunk.add_in_place(&c_x_chunk);
     c_const_chunk
 }

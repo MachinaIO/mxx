@@ -26,8 +26,16 @@ use tracing::debug;
 #[cfg(not(feature = "gpu"))]
 use super::encoding::apply_public_lookup_to_slot;
 use super::{
-    encoding::{build_public_lookup_output_chunk, build_public_lookup_shared_state},
-    pubkey::lut_entry_chunk_count,
+    encoding::{
+        build_public_lookup_output_chunk, build_public_lookup_shared_state,
+        compute_public_lookup_randomized_mid, mul_chunked_checkpoint_with_rhs,
+        sample_public_lookup_u_g_chunk,
+    },
+    pubkey::{
+        build_small_decomposed_scalar_mul_chunk, column_chunk_bounds, column_chunk_count,
+        left_mul_chunked_checkpoint_column, lut_entry_chunk_count, read_matrix_column_chunk,
+        small_decomposed_scalar_digits, trapdoor_public_column_count,
+    },
 };
 
 #[cfg(not(feature = "gpu"))]
@@ -371,6 +379,10 @@ where
         samples: &crate::bench_estimator::BggPolyEncodingBenchSamples<'_, M>,
         iterations: usize,
     ) -> PolyEncodingChunkBenchMeasurement {
+        // `build_public_lookup_output_chunk(..., chunk_idx)` is the runtime unit for one output
+        // chunk. The benchmark below keeps that exact latency measurement for `chunk_idx = 0`,
+        // then expands `total_time` by replaying the same runtime stages with explicit stage
+        // counts so an auditor can match each term back to `build_public_lookup_output_chunk(...)`.
         let plaintext_compact_bytes_by_slot =
             samples.public_lut_input.plaintext_bytes.as_ref().expect(
                 "the BGG poly encoding should reveal plaintexts for public-lookup benchmarking",
@@ -393,6 +405,7 @@ where
         );
         let x =
             M::P::from_compact_bytes(samples.params, plaintext_compact_bytes_by_slot[0].as_ref());
+        let output_chunk_count = lut_entry_chunk_count::<M>(samples.params, d);
         let bench = benchmark_gate_operation(iterations, || {
             build_public_lookup_output_chunk::<M, HS>(
                 samples.params,
@@ -410,9 +423,179 @@ where
             )
             .into_compact_bytes()
         });
+        let x_u64 = x.const_coeff_u64();
+        let (k, y) = samples.public_lut.get(samples.params, x_u64).unwrap_or_else(|| {
+            panic!("{:?} not found in LUT for gate {}", x_u64, samples.public_lut_gate_id)
+        });
+        let k_usize = usize::try_from(k).expect("LUT row index must fit in usize");
+        let y_poly = M::P::from_elem_to_constant(samples.params, &y);
+        let gy = shared.gadget_matrix.as_ref().clone() * y_poly.clone();
+        let scalar_by_digit =
+            small_decomposed_scalar_digits::<M>(samples.params, &x, shared.k_small);
+        let gate1_total_cols = trapdoor_public_column_count::<M>(samples.params, shared.d);
+        let u_g_id = format!("ggh15_lut_u_g_matrix_{}", samples.public_lut_gate_id);
+        let lut_aux_prefix =
+            format!("{}_lut_aux_{}", self.checkpoint_prefix, samples.public_lut_id);
+        let lut_aux_row_id = format!("{lut_aux_prefix}_idx{k}");
+        let chunk_idx = 0usize;
+        let (col_start, col_len) = column_chunk_bounds(shared.m_g, chunk_idx);
+        let gy_decomposed_chunk = gy.slice_columns(col_start, col_start + col_len).decompose();
+        let v_idx_chunk = HS::new().sample_hash_decomposed_columns(
+            samples.params,
+            self.hash_key,
+            format!("ggh15_lut_v_idx_{}_{}", samples.public_lut_id, k_usize),
+            shared.d,
+            shared.m_g,
+            col_start,
+            col_len,
+            DistType::FinRingDist,
+        );
+        let preimage_lut_chunk = read_matrix_column_chunk(
+            samples.params,
+            dir,
+            &lut_aux_row_id,
+            shared.m_g,
+            chunk_idx,
+            "preimage_lut",
+        );
+        let inner_chunk_total = column_chunk_count(shared.m_g);
+
+        // Runtime stage 0: derive the per-output-chunk hash/decomposition inputs used by the
+        // later checkpoint multiplies.
+        let prep_bench = benchmark_gate_operation(iterations, || {
+            let gy = shared.gadget_matrix.as_ref().clone() * y_poly.clone();
+            let scalar_digits =
+                small_decomposed_scalar_digits::<M>(samples.params, &x, shared.k_small);
+            let v_idx_chunk = HS::new().sample_hash_decomposed_columns(
+                samples.params,
+                self.hash_key,
+                format!("ggh15_lut_v_idx_{}_{}", samples.public_lut_id, k_usize),
+                shared.d,
+                shared.m_g,
+                col_start,
+                col_len,
+                DistType::FinRingDist,
+            );
+            (
+                gy.slice_columns(col_start, col_start + col_len).decompose(),
+                scalar_digits,
+                v_idx_chunk,
+            )
+        });
+        // Runtime stage 1: `preimage_gate2_identity` plus `preimage_gate2_gy`.
+        let const_gy_bench = benchmark_gate_operation(iterations, || {
+            let mut c_const_chunk = left_mul_chunked_checkpoint_column(
+                samples.params,
+                dir,
+                &shared.preimage_gate2_identity_id_prefix,
+                shared.m_g,
+                chunk_idx,
+                &c_b0,
+                "preimage_gate2_identity",
+            );
+            let gy_mid = mul_chunked_checkpoint_with_rhs(
+                samples.params,
+                dir,
+                &shared.preimage_gate2_gy_id_prefix,
+                shared.m_g,
+                &gy_decomposed_chunk,
+                "preimage_gate2_gy",
+            );
+            c_const_chunk.add_in_place(&(&c_b0 * &gy_mid));
+            c_const_chunk
+        });
+        // Runtime stage 2: `preimage_gate2_v`.
+        let v_bench = benchmark_gate_operation(iterations, || {
+            let v_mid = mul_chunked_checkpoint_with_rhs(
+                samples.params,
+                dir,
+                &shared.preimage_gate2_v_id_prefix,
+                shared.m_g,
+                &v_idx_chunk,
+                "preimage_gate2_v",
+            );
+            &c_b0 * &v_mid
+        });
+        // Runtime stage 3: `preimage_gate2_vx_small[*]`, repeated `k_small` times.
+        let vx_small_bench = if shared.k_small == 0 {
+            None
+        } else {
+            Some(benchmark_gate_operation(iterations, || {
+                let vx_rhs_chunk = build_small_decomposed_scalar_mul_chunk::<M>(
+                    samples.params,
+                    &v_idx_chunk,
+                    &scalar_by_digit,
+                    0,
+                );
+                let vx_mid = mul_chunked_checkpoint_with_rhs(
+                    samples.params,
+                    dir,
+                    &shared.preimage_gate2_vx_small_id_prefixes[0],
+                    shared.m_g,
+                    &vx_rhs_chunk,
+                    "preimage_gate2_vx",
+                );
+                &c_b0 * &vx_mid
+            }))
+        };
+        // Runtime stage 4: load one `preimage_lut` output chunk.
+        let preimage_lut_bench = benchmark_gate_operation(iterations, || {
+            read_matrix_column_chunk::<M>(
+                samples.params,
+                dir,
+                &lut_aux_row_id,
+                shared.m_g,
+                chunk_idx,
+                "preimage_lut",
+            )
+        });
+        // Runtime stage 5: `preimage_gate1`.
+        let gate1_bench = benchmark_gate_operation(iterations, || {
+            let preimage_lut_in_b0_basis = mul_chunked_checkpoint_with_rhs(
+                samples.params,
+                dir,
+                &shared.preimage_gate1_id_prefix,
+                gate1_total_cols,
+                &preimage_lut_chunk,
+                "preimage_gate1",
+            );
+            &c_b0 * &preimage_lut_in_b0_basis
+        });
+        // Runtime stage 6: one `inner_chunk_idx` iteration of the randomized `u_g` / `v_idx`
+        // accumulation loop. The loop runs `column_chunk_count(m_g)` times per output chunk.
+        let randomized_bench = benchmark_gate_operation(iterations, || {
+            let u_g_decomposed_chunk = sample_public_lookup_u_g_chunk::<M, HS>(
+                samples.params,
+                self.hash_key,
+                &u_g_id,
+                shared.d,
+                shared.m_g,
+                0,
+            );
+            compute_public_lookup_randomized_mid(
+                &input_vector,
+                &v_idx_chunk,
+                &u_g_decomposed_chunk,
+                0,
+                col_len,
+            )
+        });
+        let per_output_chunk_fixed_time = prep_bench.time +
+            const_gy_bench.time +
+            v_bench.time +
+            preimage_lut_bench.time +
+            gate1_bench.time;
+        let per_output_chunk_vx_small_time =
+            shared.k_small as f64 * vx_small_bench.map_or(0.0, |bench| bench.time);
+        let per_output_chunk_randomized_time = inner_chunk_total as f64 * randomized_bench.time;
+        let total_time = output_chunk_count as f64 *
+            (per_output_chunk_fixed_time +
+                per_output_chunk_vx_small_time +
+                per_output_chunk_randomized_time);
         PolyEncodingChunkBenchMeasurement {
             latency: bench.time,
-            chunk_count: lut_entry_chunk_count::<M>(samples.params, d),
+            total_time,
+            max_parallelism: output_chunk_count,
             peak_vram: bench.peak_vram,
         }
     }

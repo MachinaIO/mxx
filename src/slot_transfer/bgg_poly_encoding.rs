@@ -14,17 +14,129 @@ use crate::{
     sampler::{DistType, PolyHashSampler},
     slot_transfer::{
         SlotTransferEvaluator,
-        bgg_pubkey::{
-            column_chunk_count, left_mul_chunked_checkpoint_column, read_matrix_column_chunk,
-            trapdoor_public_column_count,
-        },
+        bgg_pubkey::{column_chunk_count, read_matrix_column_chunk, trapdoor_public_column_count},
     },
 };
-#[cfg(not(feature = "gpu"))]
 use rayon::prelude::*;
 #[cfg(not(feature = "gpu"))]
 use std::sync::Arc;
 use std::{marker::PhantomData, ops::Mul, path::PathBuf};
+
+pub(super) fn build_slot_transfer_output_chunk<M>(
+    params: &<M::P as Poly>::Params,
+    dir: &std::path::Path,
+    id_prefix: &str,
+    total_cols: usize,
+    chunk_idx: usize,
+    lhs: &M,
+) -> M
+where
+    M: PolyMatrix,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
+{
+    let rhs_chunk = read_matrix_column_chunk::<M>(params, dir, id_prefix, total_cols, chunk_idx);
+    lhs * &rhs_chunk
+}
+
+pub(super) fn compute_slot_transfer_stage_chunk_bytes<M>(
+    params: &<M::P as Poly>::Params,
+    dir: &std::path::Path,
+    id_prefix: &str,
+    total_cols: usize,
+    lhs: &M,
+) -> Vec<Vec<u8>>
+where
+    M: PolyMatrix,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
+{
+    // This is the chunk-parallel portion shared by the runtime and by the benchmark. Each output
+    // byte blob corresponds to one checkpoint column chunk multiplied by the same left-hand
+    // matrix that the runtime stage uses.
+    (0..column_chunk_count(total_cols))
+        .into_par_iter()
+        .map(|chunk_idx| {
+            build_slot_transfer_output_chunk(params, dir, id_prefix, total_cols, chunk_idx, lhs)
+                .into_compact_bytes()
+        })
+        .collect()
+}
+
+pub(super) fn concat_slot_transfer_chunk_bytes<M>(
+    params: &<M::P as Poly>::Params,
+    chunk_bytes: Vec<Vec<u8>>,
+) -> M
+where
+    M: PolyMatrix,
+{
+    // This is the exact stage boundary used by the runtime after the chunk-parallel work above:
+    // all chunk results are deserialized on the base device and concatenated into one full stage
+    // matrix before any later stage consumes them.
+    concat_slot_transfer_chunk_bytes_ref(params, &chunk_bytes)
+}
+
+pub(super) fn concat_slot_transfer_chunk_bytes_ref<M>(
+    params: &<M::P as Poly>::Params,
+    chunk_bytes: &[Vec<u8>],
+) -> M
+where
+    M: PolyMatrix,
+{
+    if chunk_bytes.len() == 1 {
+        return M::from_compact_bytes(params, &chunk_bytes[0]);
+    }
+    let mut chunk_iter = chunk_bytes.iter().map(|bytes| M::from_compact_bytes(params, bytes));
+    let first = chunk_iter.next().expect("slot-transfer chunk byte list must be non-empty");
+    first.concat_columns_owned(chunk_iter.collect())
+}
+
+pub(super) fn redistribute_slot_transfer_stage_matrix<M>(
+    matrix: &M,
+    params_by_target: &[&<M::P as Poly>::Params],
+) -> Vec<M>
+where
+    M: PolyMatrix,
+{
+    // `build_slot_transfer_stage_matrix_with_reloads(...)` and the GPU runtime both serialize the
+    // concatenated stage result once and reload that full vector/matrix on the consumer device(s).
+    let matrix_bytes = matrix.to_compact_bytes();
+    params_by_target.iter().map(|params| M::from_compact_bytes(params, &matrix_bytes)).collect()
+}
+
+#[cfg(not(feature = "gpu"))]
+pub(super) fn build_slot_transfer_stage_matrix<M>(
+    params: &<M::P as Poly>::Params,
+    dir: &std::path::Path,
+    id_prefix: &str,
+    total_cols: usize,
+    lhs: &M,
+) -> M
+where
+    M: PolyMatrix,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
+{
+    concat_slot_transfer_chunk_bytes(
+        params,
+        compute_slot_transfer_stage_chunk_bytes(params, dir, id_prefix, total_cols, lhs),
+    )
+}
+
+#[cfg(not(feature = "gpu"))]
+pub(super) fn build_slot_transfer_stage_matrix_with_reloads<M>(
+    params: &<M::P as Poly>::Params,
+    dir: &std::path::Path,
+    id_prefix: &str,
+    total_cols: usize,
+    lhs: &M,
+    reload_params: &[&<M::P as Poly>::Params],
+) -> (M, Vec<M>)
+where
+    M: PolyMatrix,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
+{
+    let base_matrix = build_slot_transfer_stage_matrix(params, dir, id_prefix, total_cols, lhs);
+    let reloaded = redistribute_slot_transfer_stage_matrix(&base_matrix, reload_params);
+    (base_matrix, reloaded)
+}
 
 #[derive(Debug, Clone)]
 pub struct BggPolyEncodingSTEvaluator<M, HS>
@@ -113,6 +225,7 @@ where
         dst_slot: usize,
     ) -> (Arc<[u8]>, Arc<[u8]>)
     where
+        HS: Sync,
         for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
     {
         let (src_slot_u32, scalar) = src_slots[dst_slot];
@@ -139,51 +252,26 @@ where
 
         let slot_preimage_b0_total_cols =
             trapdoor_public_column_count::<M>(params, secret_size * 2);
-        let c_b0_slot_preimage_b0_chunks = (0..column_chunk_count(slot_preimage_b0_total_cols))
-            .map(|chunk_idx| {
-                left_mul_chunked_checkpoint_column(
-                    params,
-                    self.dir_path.as_path(),
-                    &self.slot_preimage_b0_id_prefix(src_slot),
-                    slot_preimage_b0_total_cols,
-                    chunk_idx,
-                    c_b0,
-                )
-            })
-            .collect::<Vec<_>>();
-        let c_b0_slot_preimage_b0 = if c_b0_slot_preimage_b0_chunks.len() == 1 {
-            c_b0_slot_preimage_b0_chunks
-                .into_iter()
-                .next()
-                .expect("slot_preimage_b0 chunk list must be non-empty")
-        } else {
-            let mut iter = c_b0_slot_preimage_b0_chunks.into_iter();
-            let first = iter.next().expect("slot_preimage_b0 chunk list must be non-empty");
-            first.concat_columns_owned(iter.collect())
-        };
+        let (_c_b0_slot_preimage_b0, mut c_b0_slot_preimage_b0_reloaded) =
+            build_slot_transfer_stage_matrix_with_reloads(
+                params,
+                self.dir_path.as_path(),
+                &self.slot_preimage_b0_id_prefix(src_slot),
+                slot_preimage_b0_total_cols,
+                c_b0,
+                &[params],
+            );
+        let c_b0_slot_preimage_b0 = c_b0_slot_preimage_b0_reloaded
+            .pop()
+            .expect("slot_preimage_b0 reload list must contain one matrix");
         let slot_preimage_b1_total_cols = secret_size * params.modulus_digits();
-        let c_transfer_chunks = (0..column_chunk_count(slot_preimage_b1_total_cols))
-            .map(|chunk_idx| {
-                let slot_preimage_b1_chunk = read_matrix_column_chunk::<M>(
-                    params,
-                    self.dir_path.as_path(),
-                    &self.slot_preimage_b1_id_prefix(dst_slot),
-                    slot_preimage_b1_total_cols,
-                    chunk_idx,
-                );
-                &c_b0_slot_preimage_b0 * &slot_preimage_b1_chunk
-            })
-            .collect::<Vec<_>>();
-        let c_transfer = if c_transfer_chunks.len() == 1 {
-            c_transfer_chunks
-                .into_iter()
-                .next()
-                .expect("slot_preimage_b1 chunk list must be non-empty")
-        } else {
-            let mut iter = c_transfer_chunks.into_iter();
-            let first = iter.next().expect("slot_preimage_b1 chunk list must be non-empty");
-            first.concat_columns_owned(iter.collect())
-        };
+        let c_transfer = build_slot_transfer_stage_matrix(
+            params,
+            self.dir_path.as_path(),
+            &self.slot_preimage_b1_id_prefix(dst_slot),
+            slot_preimage_b1_total_cols,
+            &c_b0_slot_preimage_b0,
+        );
 
         let slot_a = self.slot_a_for_params(params, out_pubkey_matrix.row_size(), dst_slot);
         let slot_a_decomposed = slot_a.decompose();
@@ -203,25 +291,13 @@ where
         }
 
         let gate_total_cols = secret_size * params.modulus_digits();
-        let gate_chunks = (0..column_chunk_count(gate_total_cols))
-            .map(|chunk_idx| {
-                left_mul_chunked_checkpoint_column(
-                    params,
-                    self.dir_path.as_path(),
-                    &self.gate_preimage_id_prefix(gate_id, dst_slot),
-                    gate_total_cols,
-                    chunk_idx,
-                    c_b0,
-                )
-            })
-            .collect::<Vec<_>>();
-        let c_gate = if gate_chunks.len() == 1 {
-            gate_chunks.into_iter().next().expect("gate chunk list must be non-empty")
-        } else {
-            let mut iter = gate_chunks.into_iter();
-            let first = iter.next().expect("gate chunk list must be non-empty");
-            first.concat_columns_owned(iter.collect())
-        };
+        let c_gate = build_slot_transfer_stage_matrix(
+            params,
+            self.dir_path.as_path(),
+            &self.gate_preimage_id_prefix(gate_id, dst_slot),
+            gate_total_cols,
+            c_b0,
+        );
 
         let out_vector = c_gate + &pre_out;
         drop(pre_out);
@@ -340,6 +416,22 @@ where
         samples: &crate::bench_estimator::BggPolyEncodingBenchSamples<'_, M>,
         iterations: usize,
     ) -> PolyEncodingChunkBenchMeasurement {
+        // `output_slot_for_params(...)` executes one destination slot in three stages:
+        //
+        // 1. `slot_preimage_b0`
+        //    - all chunks: `build_slot_transfer_output_chunk(...)`
+        //    - one concat: `concat_slot_transfer_chunk_bytes_ref(...)`
+        //    - one reload: `redistribute_slot_transfer_stage_matrix(...)`
+        // 2. `slot_preimage_b1`
+        //    - all chunks: `build_slot_transfer_output_chunk(...)`
+        //    - one concat: `concat_slot_transfer_chunk_bytes_ref(...)`
+        // 3. `gate_preimage`
+        //    - all chunks: `build_slot_transfer_output_chunk(...)`
+        //    - one concat: `concat_slot_transfer_chunk_bytes_ref(...)`
+        //
+        // The benchmark below measures those exact runtime boundaries. Repeated chunk work is
+        // scaled by the stage chunk count; concat and b0 reload are counted once because the
+        // runtime does them once per destination slot, not once per chunk.
         let input = samples.slot_transfer_input;
         let c_b0 = M::from_compact_bytes(samples.params, &self.c_b0_bytes);
         let secret_size = input.pubkey.matrix.row_size();
@@ -353,70 +445,108 @@ where
         let b1_chunk_count = column_chunk_count(m_g);
         let gate_chunk_count = column_chunk_count(m_g);
 
-        let c_b0_slot_preimage_b0_chunks = (0..b0_chunk_count)
-            .map(|chunk_idx| {
-                left_mul_chunked_checkpoint_column(
-                    samples.params,
-                    self.dir_path.as_path(),
-                    &self.slot_preimage_b0_id_prefix(src_slot),
-                    slot_preimage_b0_total_cols,
-                    chunk_idx,
-                    &c_b0,
-                )
-            })
-            .collect::<Vec<_>>();
-        let c_b0_slot_preimage_b0 = if c_b0_slot_preimage_b0_chunks.len() == 1 {
-            c_b0_slot_preimage_b0_chunks
-                .into_iter()
-                .next()
-                .expect("slot_preimage_b0 chunk list must be non-empty")
-        } else {
-            let mut iter = c_b0_slot_preimage_b0_chunks.into_iter();
-            let first = iter.next().expect("slot_preimage_b0 chunk list must be non-empty");
-            first.concat_columns_owned(iter.collect())
-        };
+        let b0_chunk_bytes = compute_slot_transfer_stage_chunk_bytes(
+            samples.params,
+            self.dir_path.as_path(),
+            &self.slot_preimage_b0_id_prefix(src_slot),
+            slot_preimage_b0_total_cols,
+            &c_b0,
+        );
+        let c_b0_slot_preimage_b0_base =
+            concat_slot_transfer_chunk_bytes_ref(samples.params, &b0_chunk_bytes);
+        let mut c_b0_slot_preimage_b0_reloaded =
+            redistribute_slot_transfer_stage_matrix(&c_b0_slot_preimage_b0_base, &[samples.params]);
+        let c_b0_slot_preimage_b0 = c_b0_slot_preimage_b0_reloaded
+            .pop()
+            .expect("slot_preimage_b0 reload list must contain one matrix");
+        let b1_chunk_bytes = compute_slot_transfer_stage_chunk_bytes(
+            samples.params,
+            self.dir_path.as_path(),
+            &self.slot_preimage_b1_id_prefix(dst_slot),
+            m_g,
+            &c_b0_slot_preimage_b0,
+        );
+        let gate_chunk_bytes = compute_slot_transfer_stage_chunk_bytes(
+            samples.params,
+            self.dir_path.as_path(),
+            &self.gate_preimage_id_prefix(samples.slot_transfer_gate_id, dst_slot),
+            m_g,
+            &c_b0,
+        );
 
-        let b0_bench = benchmark_gate_operation(iterations, || {
-            left_mul_chunked_checkpoint_column(
+        let b0_chunk_bench = benchmark_gate_operation(iterations, || {
+            let _ = build_slot_transfer_output_chunk(
                 samples.params,
                 self.dir_path.as_path(),
                 &self.slot_preimage_b0_id_prefix(src_slot),
                 slot_preimage_b0_total_cols,
                 0,
                 &c_b0,
-            )
-            .into_compact_bytes()
+            );
         });
-        let b1_bench = benchmark_gate_operation(iterations, || {
-            let slot_preimage_b1_chunk = read_matrix_column_chunk::<M>(
+        let b0_concat_bench = benchmark_gate_operation(iterations, || {
+            let _ = concat_slot_transfer_chunk_bytes_ref::<M>(samples.params, &b0_chunk_bytes);
+        });
+        let b0_reload_bench = benchmark_gate_operation(iterations, || {
+            let _ = redistribute_slot_transfer_stage_matrix(
+                &c_b0_slot_preimage_b0_base,
+                &[samples.params],
+            );
+        });
+        let b1_chunk_bench = benchmark_gate_operation(iterations, || {
+            let _ = build_slot_transfer_output_chunk(
                 samples.params,
                 self.dir_path.as_path(),
                 &self.slot_preimage_b1_id_prefix(dst_slot),
                 m_g,
                 0,
+                &c_b0_slot_preimage_b0,
             );
-            (&c_b0_slot_preimage_b0 * &slot_preimage_b1_chunk).into_compact_bytes()
         });
-        let gate_bench = benchmark_gate_operation(iterations, || {
-            left_mul_chunked_checkpoint_column(
+        let b1_concat_bench = benchmark_gate_operation(iterations, || {
+            let _ = concat_slot_transfer_chunk_bytes_ref::<M>(samples.params, &b1_chunk_bytes);
+        });
+        let gate_chunk_bench = benchmark_gate_operation(iterations, || {
+            let _ = build_slot_transfer_output_chunk(
                 samples.params,
                 self.dir_path.as_path(),
                 &self.gate_preimage_id_prefix(samples.slot_transfer_gate_id, dst_slot),
                 m_g,
                 0,
                 &c_b0,
-            )
-            .into_compact_bytes()
+            );
+        });
+        let gate_concat_bench = benchmark_gate_operation(iterations, || {
+            let _ = concat_slot_transfer_chunk_bytes_ref::<M>(samples.params, &gate_chunk_bytes);
         });
 
-        let total_chunk_count = b0_chunk_count + b1_chunk_count + gate_chunk_count;
-        let total_single_slot_time = b0_bench.time * b0_chunk_count as f64 +
-            b1_bench.time * b1_chunk_count as f64 +
-            gate_bench.time * gate_chunk_count as f64;
+        let b0_stage_latency = b0_chunk_bench.time + b0_concat_bench.time + b0_reload_bench.time;
+        let b1_stage_latency = b1_chunk_bench.time + b1_concat_bench.time;
+        let gate_stage_latency = gate_chunk_bench.time + gate_concat_bench.time;
+
+        let b0_stage_total_time = b0_chunk_bench.time * b0_chunk_count as f64 +
+            b0_concat_bench.time +
+            b0_reload_bench.time;
+        let b1_stage_total_time =
+            b1_chunk_bench.time * b1_chunk_count as f64 + b1_concat_bench.time;
+        let gate_stage_total_time =
+            gate_chunk_bench.time * gate_chunk_count as f64 + gate_concat_bench.time;
+
+        let latency = b0_stage_latency + b1_stage_latency + gate_stage_latency;
+        let total_time = b0_stage_total_time + b1_stage_total_time + gate_stage_total_time;
+        let max_parallelism = b0_chunk_count.max(b1_chunk_count).max(gate_chunk_count);
         PolyEncodingChunkBenchMeasurement {
-            latency: total_single_slot_time / total_chunk_count.max(1) as f64,
-            chunk_count: total_chunk_count,
-            peak_vram: b0_bench.peak_vram.max(b1_bench.peak_vram).max(gate_bench.peak_vram),
+            latency,
+            total_time,
+            max_parallelism,
+            peak_vram: b0_chunk_bench
+                .peak_vram
+                .max(b0_concat_bench.peak_vram)
+                .max(b0_reload_bench.peak_vram)
+                .max(b1_chunk_bench.peak_vram)
+                .max(b1_concat_bench.peak_vram)
+                .max(gate_chunk_bench.peak_vram)
+                .max(gate_concat_bench.peak_vram),
         }
     }
 }

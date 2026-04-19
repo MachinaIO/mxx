@@ -112,22 +112,6 @@ where
     chunk
 }
 
-pub(crate) fn left_mul_chunked_checkpoint_column<M>(
-    params: &<M::P as Poly>::Params,
-    dir: &std::path::Path,
-    id_prefix: &str,
-    total_cols: usize,
-    chunk_idx: usize,
-    lhs: &M,
-) -> M
-where
-    M: PolyMatrix,
-    for<'a, 'b> &'a M: std::ops::Mul<&'b M, Output = M>,
-{
-    let rhs_chunk = read_matrix_column_chunk(params, dir, id_prefix, total_cols, chunk_idx);
-    lhs * &rhs_chunk
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BggPublicKeySTGateState {
     pub input_pubkey_bytes: Vec<u8>,

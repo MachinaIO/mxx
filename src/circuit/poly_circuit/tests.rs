@@ -37,12 +37,6 @@ fn circuit_non_free_depth_total<P: Poly>(circuit: &PolyCircuit<P>) -> usize {
     total_non_free_depth(&circuit.non_free_depth_contributions())
 }
 
-fn synthetic_input_profile(total_depth: u32) -> NonFreeDepthProfile {
-    let mut counts = [0u32; 10];
-    counts[3] = total_depth;
-    NonFreeDepthProfile { total_depth, contributions: NonFreeDepthContributionVector { counts } }
-}
-
 #[test]
 fn test_eval_add() {
     // Create parameters for testing
@@ -1245,18 +1239,11 @@ fn test_non_free_depth_cache_reuses_exact_profile_arc() {
     sub_circuit.output(vec![mul]);
 
     let cache = DashMap::new();
-    let first = sub_circuit.non_free_depth_profiles_with_input_profiles_cached(
-        &[synthetic_input_profile(2), synthetic_input_profile(5)],
-        &cache,
-    );
-    let second = sub_circuit.non_free_depth_profiles_with_input_profiles_cached(
-        &[synthetic_input_profile(2), synthetic_input_profile(5)],
-        &cache,
-    );
+    let first = sub_circuit.non_free_depths_with_input_levels_cached(&[2, 5], &cache);
+    let second = sub_circuit.non_free_depths_with_input_levels_cached(&[2, 5], &cache);
 
     assert!(Arc::ptr_eq(&first, &second));
-    assert_eq!(first[0].total_depth, 6);
-    assert_eq!(first[0].contributions.counts[3], 6);
+    assert_eq!(first.as_ref(), &[6]);
 }
 
 #[test]
@@ -1268,12 +1255,10 @@ fn test_non_free_depth_cache_min_normalization_is_not_generally_safe() {
     sub_circuit.output(vec![output]);
 
     let cache = DashMap::new();
-    let low_input = sub_circuit
-        .non_free_depth_profiles_with_input_profiles_cached(&[synthetic_input_profile(0)], &cache);
-    let high_input = sub_circuit
-        .non_free_depth_profiles_with_input_profiles_cached(&[synthetic_input_profile(5)], &cache);
+    let low_input = sub_circuit.non_free_depths_with_input_levels_cached(&[0], &cache);
+    let high_input = sub_circuit.non_free_depths_with_input_levels_cached(&[5], &cache);
 
-    assert_eq!(low_input[0].total_depth, 1);
-    assert_eq!(high_input[0].total_depth, 5);
+    assert_eq!(low_input.as_ref(), &[1]);
+    assert_eq!(high_input.as_ref(), &[5]);
     assert_ne!(low_input.as_ref(), high_input.as_ref());
 }

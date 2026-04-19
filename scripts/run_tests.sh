@@ -6,6 +6,10 @@ cd "$REPO_ROOT"
 
 export PYTHONPATH="$REPO_ROOT/scripts/lib${PYTHONPATH:+:$PYTHONPATH}"
 
+if ! command -v cargo >/dev/null 2>&1 && [[ -x "${HOME:-}/.cargo/bin/cargo" ]]; then
+  export PATH="${HOME}/.cargo/bin:${PATH:-}"
+fi
+
 run_python=0
 run_rust=0
 

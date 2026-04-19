@@ -3206,8 +3206,9 @@ mod tests {
         println!(
             "mul 1 ring_gsw_mul metrics: crt_bits={crt_bits}, crt_depth={crt_depth}, ring_dim={ring_dim}, num_slots={num_slots}"
         );
-        let mul1_depth = circuit.non_free_depth();
-        println!("mul 1 non-free depth end {}", mul1_depth);
+        let mul1_depth_contributions = circuit.non_free_depth_contributions();
+        let mul1_depth: usize = mul1_depth_contributions.values().sum();
+        println!("mul 1 non-free depth contributions {:?}", mul1_depth_contributions);
         println!("mul 1 gate counts {:?}", circuit.count_gates_by_type_vec());
 
         let mul2_disk_dir = tempdir().expect("create temp dir for disk-backed sub-circuits");
@@ -3233,8 +3234,9 @@ mod tests {
         println!(
             "mul 2 ring_gsw_mul metrics: crt_bits={crt_bits}, crt_depth={crt_depth}, ring_dim={ring_dim}, num_slots={num_slots}"
         );
-        let mul2_depth = circuit.non_free_depth();
-        println!("mul 2 non-free depth end {}", mul2_depth);
+        let mul2_depth_contributions = circuit.non_free_depth_contributions();
+        let mul2_depth: usize = mul2_depth_contributions.values().sum();
+        println!("mul 2 non-free depth contributions {:?}", mul2_depth_contributions);
         println!("mul 2 gate counts {:?}", circuit.count_gates_by_type_vec());
 
         println!("mul 2 vs mul 1 depth increase: {}", mul2_depth - mul1_depth);

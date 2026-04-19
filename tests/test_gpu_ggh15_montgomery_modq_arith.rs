@@ -301,11 +301,10 @@ async fn test_gpu_ggh15_montgomery_modq_arith() {
         all_q_moduli
     );
     info!("multiplication tree config: height={} num_inputs={}", cfg.height, num_inputs);
+    let non_free_depth_contributions = circuit.non_free_depth_contributions();
     info!(
-        "circuit total_gates={} non_free_depth={} gate_counts={:?}",
-        total_gates,
-        circuit.non_free_depth(),
-        gate_counts
+        "circuit total_gates={} non_free_depth_contributions={:?} gate_counts={:?}",
+        total_gates, non_free_depth_contributions, gate_counts
     );
 
     assert_eq!(params.modulus(), cpu_params.modulus());

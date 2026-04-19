@@ -1,7 +1,9 @@
 use std::{marker::PhantomData, sync::Arc};
 
 use crate::{
-    bench_estimator::{BenchEstimator, CircuitBenchEstimate, benchmark_gate_operation},
+    bench_estimator::{
+        BenchEstimator, BenchOperationMeasurement, CircuitBenchEstimate, benchmark_gate_operation,
+    },
     bgg::{poly_encoding::BggPolyEncoding, public_key::BggPublicKey},
     circuit::{Evaluable, gate::GateId},
     element::PolyElem,
@@ -19,6 +21,29 @@ fn per_slot_gate_estimate(
     peak_vram: usize,
 ) -> CircuitBenchEstimate {
     CircuitBenchEstimate::new(latency * num_slots as f64, latency).with_peak_vram(peak_vram)
+}
+
+fn chunked_slot_gate_estimate(
+    time_per_chunk: f64,
+    chunk_count: usize,
+    num_slots: usize,
+    peak_vram: usize,
+) -> CircuitBenchEstimate {
+    let chunk_count = chunk_count.max(1);
+    CircuitBenchEstimate::new(
+        time_per_chunk * chunk_count as f64 * num_slots as f64,
+        time_per_chunk,
+    )
+    .with_peak_vram(peak_vram)
+}
+
+fn benchmark_single_slot_operation<R, F>(iterations: usize, f: F) -> BenchOperationMeasurement
+where
+    F: FnMut() -> R,
+{
+    // BGG poly-encoding benchmarks run on single-slot benchmark samples. Chunked runtime paths
+    // are normalized to per-wave latency in `estimate_*` using the corresponding chunk counts.
+    benchmark_gate_operation(iterations, f)
 }
 
 fn validate_single_slot_shape(
@@ -66,6 +91,37 @@ pub struct BggPolyEncodingBenchSamples<'a, M: PolyMatrix> {
     pub slot_transfer_input: &'a BggPolyEncoding<M>,
     pub slot_transfer_src_slots: &'a [(u32, Option<u32>)],
     pub slot_transfer_gate_id: GateId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PolyEncodingChunkBenchMeasurement {
+    pub latency: f64,
+    pub chunk_count: usize,
+    pub peak_vram: usize,
+}
+
+pub trait PolyEncodingPublicLutBenchEstimator<M>:
+    PltEvaluator<BggPolyEncoding<M>> + Send + Sync
+where
+    M: PolyMatrix,
+{
+    fn benchmark_public_lookup_chunk(
+        &self,
+        samples: &BggPolyEncodingBenchSamples<'_, M>,
+        iterations: usize,
+    ) -> PolyEncodingChunkBenchMeasurement;
+}
+
+pub trait PolyEncodingSlotTransferBenchEstimator<M>:
+    SlotTransferEvaluator<BggPolyEncoding<M>> + Send + Sync
+where
+    M: PolyMatrix,
+{
+    fn benchmark_slot_transfer_chunk(
+        &self,
+        samples: &BggPolyEncodingBenchSamples<'_, M>,
+        iterations: usize,
+    ) -> PolyEncodingChunkBenchMeasurement;
 }
 
 impl<M: PolyMatrix> BggPolyEncodingBenchSamples<'_, M> {
@@ -215,10 +271,12 @@ where
     pub small_scalar_mul_peak_vram: usize,
     pub large_scalar_mul_time: f64,
     pub large_scalar_mul_peak_vram: usize,
-    pub public_lut_time: f64,
+    pub public_lut_time_per_chunk: f64,
     pub public_lut_peak_vram: usize,
-    pub slot_transfer_time: f64,
+    pub public_lut_chunk_count: usize,
+    pub slot_transfer_time_per_chunk: f64,
     pub slot_transfer_peak_vram: usize,
+    pub slot_transfer_chunk_count: usize,
     _m: PhantomData<M>,
 }
 
@@ -234,8 +292,8 @@ where
         iterations: usize,
     ) -> Self
     where
-        PE: PltEvaluator<BggPolyEncoding<M>>,
-        SE: SlotTransferEvaluator<BggPolyEncoding<M>>,
+        PE: PolyEncodingPublicLutBenchEstimator<M>,
+        SE: PolyEncodingSlotTransferBenchEstimator<M>,
         <M::P as Poly>::Params: Default,
     {
         if let Some(samples) = samples {
@@ -268,53 +326,42 @@ where
         iterations: usize,
     ) -> Self
     where
-        PE: PltEvaluator<BggPolyEncoding<M>>,
-        SE: SlotTransferEvaluator<BggPolyEncoding<M>>,
+        PE: PolyEncodingPublicLutBenchEstimator<M>,
+        SE: PolyEncodingSlotTransferBenchEstimator<M>,
     {
         samples.assert_single_slot_inputs();
 
-        let add_bench =
-            benchmark_gate_operation(iterations, || samples.add_lhs.clone() + samples.add_rhs);
+        let add_bench = benchmark_single_slot_operation(iterations, || {
+            samples.add_lhs.clone() + samples.add_rhs
+        });
         debug!("BggPolyEncodingBenchEstimator::benchmark add_bench={:?}", add_bench);
-        let sub_bench =
-            benchmark_gate_operation(iterations, || samples.sub_lhs.clone() - samples.sub_rhs);
+        let sub_bench = benchmark_single_slot_operation(iterations, || {
+            samples.sub_lhs.clone() - samples.sub_rhs
+        });
         debug!("BggPolyEncodingBenchEstimator::benchmark sub_bench={:?}", sub_bench);
-        let mul_bench =
-            benchmark_gate_operation(iterations, || samples.mul_lhs.clone() * samples.mul_rhs);
+        let mul_bench = benchmark_single_slot_operation(iterations, || {
+            samples.mul_lhs.clone() * samples.mul_rhs
+        });
         debug!("BggPolyEncodingBenchEstimator::benchmark mul_bench={:?}", mul_bench);
-        let small_scalar_mul_bench = benchmark_gate_operation(iterations, || {
+        let small_scalar_mul_bench = benchmark_single_slot_operation(iterations, || {
             samples.small_scalar_input.small_scalar_mul(samples.params, samples.small_scalar)
         });
         debug!(
             "BggPolyEncodingBenchEstimator::benchmark small_scalar_mul_bench={:?}",
             small_scalar_mul_bench
         );
-        let large_scalar_mul_bench = benchmark_gate_operation(iterations, || {
+        let large_scalar_mul_bench = benchmark_single_slot_operation(iterations, || {
             samples.large_scalar_input.large_scalar_mul(samples.params, samples.large_scalar)
         });
         debug!(
             "BggPolyEncodingBenchEstimator::benchmark large_scalar_mul_bench={:?}",
             large_scalar_mul_bench
         );
-        let public_lut_bench = benchmark_gate_operation(iterations, || {
-            public_lut_evaluator.public_lookup(
-                samples.params,
-                samples.public_lut,
-                samples.public_lut_one,
-                samples.public_lut_input,
-                samples.public_lut_gate_id,
-                samples.public_lut_id,
-            )
-        });
+        let public_lut_bench =
+            public_lut_evaluator.benchmark_public_lookup_chunk(samples, iterations);
         debug!("BggPolyEncodingBenchEstimator::benchmark public_lut_bench={:?}", public_lut_bench);
-        let slot_transfer_bench = benchmark_gate_operation(iterations, || {
-            slot_transfer_evaluator.slot_transfer(
-                samples.params,
-                samples.slot_transfer_input,
-                samples.slot_transfer_src_slots,
-                samples.slot_transfer_gate_id,
-            )
-        });
+        let slot_transfer_bench =
+            slot_transfer_evaluator.benchmark_slot_transfer_chunk(samples, iterations);
         debug!(
             "BggPolyEncodingBenchEstimator::benchmark slot_transfer_bench={:?}",
             slot_transfer_bench
@@ -334,10 +381,12 @@ where
             small_scalar_mul_peak_vram: small_scalar_mul_bench.peak_vram,
             large_scalar_mul_time: large_scalar_mul_bench.time,
             large_scalar_mul_peak_vram: large_scalar_mul_bench.peak_vram,
-            public_lut_time: public_lut_bench.time,
+            public_lut_time_per_chunk: public_lut_bench.latency,
             public_lut_peak_vram: public_lut_bench.peak_vram,
-            slot_transfer_time: slot_transfer_bench.time,
+            public_lut_chunk_count: public_lut_bench.chunk_count,
+            slot_transfer_time_per_chunk: slot_transfer_bench.latency,
             slot_transfer_peak_vram: slot_transfer_bench.peak_vram,
+            slot_transfer_chunk_count: slot_transfer_bench.chunk_count,
             _m: PhantomData,
         }
     }
@@ -385,15 +434,21 @@ where
             self.num_slots,
             "BggPolyEncodingBenchEstimator::estimate_slot_transfer requires src_slots.len() == num_slots"
         );
-        per_slot_gate_estimate(
-            self.slot_transfer_time,
+        chunked_slot_gate_estimate(
+            self.slot_transfer_time_per_chunk,
+            self.slot_transfer_chunk_count,
             self.num_slots,
             self.slot_transfer_peak_vram,
         )
     }
 
     fn estimate_public_lookup(&self, _lut_id: usize) -> CircuitBenchEstimate {
-        per_slot_gate_estimate(self.public_lut_time, self.num_slots, self.public_lut_peak_vram)
+        chunked_slot_gate_estimate(
+            self.public_lut_time_per_chunk,
+            self.public_lut_chunk_count,
+            self.num_slots,
+            self.public_lut_peak_vram,
+        )
     }
 }
 
@@ -424,10 +479,12 @@ mod tests {
             small_scalar_mul_peak_vram: 83,
             large_scalar_mul_time: 5.0,
             large_scalar_mul_peak_vram: 89,
-            public_lut_time: 6.0,
+            public_lut_time_per_chunk: 6.0,
             public_lut_peak_vram: 97,
-            slot_transfer_time: 7.0,
+            public_lut_chunk_count: 2,
+            slot_transfer_time_per_chunk: 7.0,
             slot_transfer_peak_vram: 101,
+            slot_transfer_chunk_count: 4,
             _m: PhantomData,
         }
     }
@@ -477,14 +534,14 @@ mod tests {
         let public_lookup = estimator.estimate_public_lookup(7);
         assert_eq!(
             public_lookup,
-            CircuitBenchEstimate::new(18.0, 6.0).with_peak_vram(estimator.public_lut_peak_vram)
+            CircuitBenchEstimate::new(36.0, 6.0).with_peak_vram(estimator.public_lut_peak_vram)
         );
 
         let slot_transfer =
             estimator.estimate_slot_transfer(&[(0, None), (0, Some(2)), (0, Some(1))]);
         assert_eq!(
             slot_transfer,
-            CircuitBenchEstimate::new(21.0, 7.0).with_peak_vram(estimator.slot_transfer_peak_vram)
+            CircuitBenchEstimate::new(84.0, 7.0).with_peak_vram(estimator.slot_transfer_peak_vram)
         );
     }
 

@@ -195,6 +195,33 @@ pub trait PolyMatrix:
     fn decompose_owned(self) -> Self {
         self.decompose()
     }
+    /// Returns one row-chunk of `self.decompose()` without changing the column count.
+    /// Each chunk has shape `(self.row_size(), self.col_size())`, and `chunk_count` must match
+    /// the decomposition digit count for the current params.
+    fn decompose_chunk(&self, chunk_idx: usize, chunk_count: usize) -> Self {
+        assert!(chunk_count > 0, "decompose_chunk chunk_count must be > 0");
+        assert!(
+            chunk_idx < chunk_count,
+            "decompose_chunk chunk_idx out of range: chunk_idx={}, chunk_count={}",
+            chunk_idx,
+            chunk_count
+        );
+        let full = self.decompose();
+        let rows_per_chunk = self.row_size();
+        let expected_rows = rows_per_chunk
+            .checked_mul(chunk_count)
+            .expect("decompose_chunk expected row count overflow");
+        assert_eq!(
+            full.row_size(),
+            expected_rows,
+            "decompose_chunk expected decomposed row count {} but got {}",
+            expected_rows,
+            full.row_size()
+        );
+        let row_start =
+            chunk_idx.checked_mul(rows_per_chunk).expect("decompose_chunk row offset overflow");
+        full.slice(row_start, row_start + rows_per_chunk, 0, self.col_size())
+    }
     /// Returns a compact decomposition matrix D such that
     /// small_gadget_matrix(size) * D == self
     /// under the assumption that coefficients are bounded by min(moduli)
@@ -202,6 +229,34 @@ pub trait PolyMatrix:
     fn small_decompose(&self) -> Self;
     fn small_decompose_owned(self) -> Self {
         self.small_decompose()
+    }
+    /// Returns one row-chunk of `self.small_decompose()` without changing the column count.
+    /// Each chunk has shape `(self.row_size(), self.col_size())`, and `chunk_count` must match
+    /// the compact decomposition digit count for the current params.
+    fn small_decompose_chunk(&self, chunk_idx: usize, chunk_count: usize) -> Self {
+        assert!(chunk_count > 0, "small_decompose_chunk chunk_count must be > 0");
+        assert!(
+            chunk_idx < chunk_count,
+            "small_decompose_chunk chunk_idx out of range: chunk_idx={}, chunk_count={}",
+            chunk_idx,
+            chunk_count
+        );
+        let full = self.small_decompose();
+        let rows_per_chunk = self.row_size();
+        let expected_rows = rows_per_chunk
+            .checked_mul(chunk_count)
+            .expect("small_decompose_chunk expected row count overflow");
+        assert_eq!(
+            full.row_size(),
+            expected_rows,
+            "small_decompose_chunk expected decomposed row count {} but got {}",
+            expected_rows,
+            full.row_size()
+        );
+        let row_start = chunk_idx
+            .checked_mul(rows_per_chunk)
+            .expect("small_decompose_chunk row offset overflow");
+        full.slice(row_start, row_start + rows_per_chunk, 0, self.col_size())
     }
     /// Builds one row-chunk of `identity(size, scalar).small_decompose()` without materializing
     /// the full `(size * chunk_count) x size` matrix.

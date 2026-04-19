@@ -114,7 +114,10 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].as_slice(), expected.as_slice());
-        assert_eq!(circuit.non_free_depth(), 1);
+        assert_eq!(
+            circuit.non_free_depth_contributions().get(&PolyGateKind::SlotTransfer),
+            Some(&1)
+        );
         assert_eq!(circuit.count_gates_by_type_vec().get(&PolyGateKind::SlotTransfer), Some(&1));
     }
 

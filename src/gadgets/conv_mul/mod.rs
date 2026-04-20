@@ -52,11 +52,6 @@ fn validate_inputs<P: Poly>(
     );
 }
 
-#[cfg(test)]
-fn circuit_non_free_depth_total<P: Poly>(circuit: &PolyCircuit<P>) -> usize {
-    circuit.non_free_depth_contributions().values().sum()
-}
-
 fn repeated_slot_plan(
     src_slot: usize,
     num_slots: usize,
@@ -524,6 +519,10 @@ mod tests {
         );
         assert_eq!(result.len(), 1);
         result.into_iter().next().expect("single output must exist")
+    }
+
+    fn circuit_non_free_depth_total<P: Poly>(circuit: &PolyCircuit<P>) -> usize {
+        circuit.non_free_depth_contributions().values().sum()
     }
 
     fn reconstructed_output_coeffs(output: &PolyVec<DCRTPoly>, num_slots: usize) -> Vec<BigUint> {

@@ -23,18 +23,13 @@ fn per_slot_gate_estimate(
     CircuitBenchEstimate::new(latency * num_slots as f64, latency).with_peak_vram(peak_vram)
 }
 
-fn chunked_slot_gate_estimate(
-    time_per_chunk: f64,
-    chunk_count: usize,
+fn measured_slot_gate_estimate(
+    latency: f64,
+    total_time: f64,
     num_slots: usize,
     peak_vram: usize,
 ) -> CircuitBenchEstimate {
-    let chunk_count = chunk_count.max(1);
-    CircuitBenchEstimate::new(
-        time_per_chunk * chunk_count as f64 * num_slots as f64,
-        time_per_chunk,
-    )
-    .with_peak_vram(peak_vram)
+    CircuitBenchEstimate::new(total_time * num_slots as f64, latency).with_peak_vram(peak_vram)
 }
 
 fn benchmark_single_slot_operation<R, F>(iterations: usize, f: F) -> BenchOperationMeasurement
@@ -96,7 +91,8 @@ pub struct BggPolyEncodingBenchSamples<'a, M: PolyMatrix> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PolyEncodingChunkBenchMeasurement {
     pub latency: f64,
-    pub chunk_count: usize,
+    pub max_parallelism: u128,
+    pub total_time: f64,
     pub peak_vram: usize,
 }
 
@@ -271,12 +267,14 @@ where
     pub small_scalar_mul_peak_vram: usize,
     pub large_scalar_mul_time: f64,
     pub large_scalar_mul_peak_vram: usize,
-    pub public_lut_time_per_chunk: f64,
+    pub public_lut_latency: f64,
+    pub public_lut_max_parallelism: u128,
+    pub public_lut_total_time: f64,
     pub public_lut_peak_vram: usize,
-    pub public_lut_chunk_count: usize,
-    pub slot_transfer_time_per_chunk: f64,
+    pub slot_transfer_latency: f64,
+    pub slot_transfer_max_parallelism: u128,
+    pub slot_transfer_total_time: f64,
     pub slot_transfer_peak_vram: usize,
-    pub slot_transfer_chunk_count: usize,
     _m: PhantomData<M>,
 }
 
@@ -381,12 +379,14 @@ where
             small_scalar_mul_peak_vram: small_scalar_mul_bench.peak_vram,
             large_scalar_mul_time: large_scalar_mul_bench.time,
             large_scalar_mul_peak_vram: large_scalar_mul_bench.peak_vram,
-            public_lut_time_per_chunk: public_lut_bench.latency,
+            public_lut_latency: public_lut_bench.latency,
+            public_lut_max_parallelism: public_lut_bench.max_parallelism,
+            public_lut_total_time: public_lut_bench.total_time,
             public_lut_peak_vram: public_lut_bench.peak_vram,
-            public_lut_chunk_count: public_lut_bench.chunk_count,
-            slot_transfer_time_per_chunk: slot_transfer_bench.latency,
+            slot_transfer_latency: slot_transfer_bench.latency,
+            slot_transfer_max_parallelism: slot_transfer_bench.max_parallelism,
+            slot_transfer_total_time: slot_transfer_bench.total_time,
             slot_transfer_peak_vram: slot_transfer_bench.peak_vram,
-            slot_transfer_chunk_count: slot_transfer_bench.chunk_count,
             _m: PhantomData,
         }
     }
@@ -434,20 +434,30 @@ where
             self.num_slots,
             "BggPolyEncodingBenchEstimator::estimate_slot_transfer requires src_slots.len() == num_slots"
         );
-        chunked_slot_gate_estimate(
-            self.slot_transfer_time_per_chunk,
-            self.slot_transfer_chunk_count,
+        measured_slot_gate_estimate(
+            self.slot_transfer_latency,
+            self.slot_transfer_total_time,
             self.num_slots,
             self.slot_transfer_peak_vram,
+        )
+        .with_max_parallelism(
+            self.slot_transfer_max_parallelism
+                .checked_mul(self.num_slots as u128)
+                .expect("slot transfer parallelism overflowed u128 while scaling by slot count"),
         )
     }
 
     fn estimate_public_lookup(&self, _lut_id: usize) -> CircuitBenchEstimate {
-        chunked_slot_gate_estimate(
-            self.public_lut_time_per_chunk,
-            self.public_lut_chunk_count,
+        measured_slot_gate_estimate(
+            self.public_lut_latency,
+            self.public_lut_total_time,
             self.num_slots,
             self.public_lut_peak_vram,
+        )
+        .with_max_parallelism(
+            self.public_lut_max_parallelism
+                .checked_mul(self.num_slots as u128)
+                .expect("public lookup parallelism overflowed u128 while scaling by slot count"),
         )
     }
 }
@@ -479,12 +489,14 @@ mod tests {
             small_scalar_mul_peak_vram: 83,
             large_scalar_mul_time: 5.0,
             large_scalar_mul_peak_vram: 89,
-            public_lut_time_per_chunk: 6.0,
+            public_lut_latency: 6.0,
+            public_lut_max_parallelism: 2,
+            public_lut_total_time: 12.0,
             public_lut_peak_vram: 97,
-            public_lut_chunk_count: 2,
-            slot_transfer_time_per_chunk: 7.0,
+            slot_transfer_latency: 7.0,
+            slot_transfer_max_parallelism: 4,
+            slot_transfer_total_time: 28.0,
             slot_transfer_peak_vram: 101,
-            slot_transfer_chunk_count: 4,
             _m: PhantomData,
         }
     }

@@ -72,6 +72,7 @@ pub(crate) struct BenchOperationMeasurement {
 pub struct CircuitBenchEstimate {
     pub total_time: f64,
     pub latency: f64,
+    pub max_parallelism: u128,
     #[cfg(feature = "gpu")]
     pub peak_vram: usize,
 }
@@ -81,9 +82,19 @@ impl CircuitBenchEstimate {
         Self {
             total_time,
             latency,
+            max_parallelism: if total_time <= 0.0 || latency <= 0.0 {
+                0
+            } else {
+                (total_time / latency).ceil() as u128
+            },
             #[cfg(feature = "gpu")]
             peak_vram: 0,
         }
+    }
+
+    pub(crate) fn with_max_parallelism(mut self, max_parallelism: u128) -> Self {
+        self.max_parallelism = max_parallelism;
+        self
     }
 
     #[cfg(feature = "gpu")]
@@ -98,10 +109,7 @@ impl CircuitBenchEstimate {
     }
 
     fn parallelism_factor(&self) -> u128 {
-        if self.total_time <= 0.0 || self.latency <= 0.0 {
-            return 0;
-        }
-        (self.total_time / self.latency).ceil() as u128
+        self.max_parallelism
     }
 }
 

@@ -51,6 +51,20 @@ struct ComputedPublicLookupSlot<M: PolyMatrix> {
     compute_ms: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct PublicLookupStageBenchMeasurement {
+    latency: f64,
+    max_parallelism: u128,
+    total_time: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct PublicLookupSlotBenchMeasurement {
+    pub latency: f64,
+    pub max_parallelism: u128,
+    pub total_time: f64,
+}
+
 const LHS_CB0: usize = 0;
 const LHS_INPUT_VECTOR: usize = 1;
 
@@ -89,12 +103,23 @@ struct PublicLookupStage2Contribution {
     family: PublicLookupStage1Family,
     output_chunk_idx: usize,
     bytes: Arc<[u8]>,
+    key: PublicLookupStage1Key,
+    load_ms: f64,
+    compute_ms: f64,
 }
 
 struct LoadedPublicLookupStage1Task<M: PolyMatrix> {
     device_slot: usize,
     task: PublicLookupStage1Task,
     rhs_chunk: M,
+    load_ms: f64,
+}
+
+struct ComputedPublicLookupStage1Task {
+    task: PublicLookupStage1Task,
+    bytes: Arc<[u8]>,
+    load_ms: f64,
+    compute_ms: f64,
 }
 
 struct LoadedPublicLookupStage2Task<M: PolyMatrix> {
@@ -102,6 +127,7 @@ struct LoadedPublicLookupStage2Task<M: PolyMatrix> {
     task: PublicLookupStage2Task,
     stage1_mid: M,
     rhs_chunk: M,
+    load_ms: f64,
 }
 
 struct PublicLookupStage2WaveDeviceContext<'a, M: PolyMatrix> {
@@ -115,6 +141,20 @@ struct PublicLookupStage2WaveDeviceContext<'a, M: PolyMatrix> {
     shared_dev: &'a GpuPublicLookupSharedByDevice<M>,
     metadata: &'a (M, String, String),
     x: &'a M::P,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PublicLookupTaskGroupBenchStats {
+    task_count: usize,
+    max_load_ms: f64,
+    max_compute_ms: f64,
+    max_store_ms: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum PublicLookupStage1BenchGroup {
+    DirectIdentity,
+    Intermediate(PublicLookupStage1Family),
 }
 
 pub(super) fn effective_gpu_slot_parallelism(requested: usize) -> usize {
@@ -223,6 +263,57 @@ fn stage1_task_lhs_family(task: &PublicLookupStage1Task) -> usize {
     }
 }
 
+fn stage1_task_bench_group(task: &PublicLookupStage1Task) -> PublicLookupStage1BenchGroup {
+    match task {
+        PublicLookupStage1Task::DirectIdentity { .. } => {
+            PublicLookupStage1BenchGroup::DirectIdentity
+        }
+        PublicLookupStage1Task::Intermediate { key } => {
+            PublicLookupStage1BenchGroup::Intermediate(key.family)
+        }
+    }
+}
+
+fn maybe_elapsed_ms(started: Option<Instant>) -> f64 {
+    started.map(|start| start.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0)
+}
+
+fn update_group_store_timing<K>(
+    group_stats: &mut HashMap<K, PublicLookupTaskGroupBenchStats>,
+    group: K,
+    load_ms: f64,
+    compute_ms: f64,
+    store_ms: f64,
+) where
+    K: Eq + std::hash::Hash + Copy,
+{
+    let stats = group_stats.entry(group).or_default();
+    stats.max_load_ms = stats.max_load_ms.max(load_ms);
+    stats.max_compute_ms = stats.max_compute_ms.max(compute_ms);
+    stats.max_store_ms = stats.max_store_ms.max(store_ms);
+}
+
+fn finalize_stage_bench<K>(
+    group_stats: &HashMap<K, PublicLookupTaskGroupBenchStats>,
+    stage_parallelism: usize,
+) -> PublicLookupStageBenchMeasurement
+where
+    K: Eq + std::hash::Hash,
+{
+    let latency = group_stats.values().fold(0.0_f64, |max_latency, stats| {
+        max_latency.max(stats.max_load_ms.max(stats.max_compute_ms).max(stats.max_store_ms))
+    });
+    let total_time = group_stats.values().fold(0.0_f64, |sum, stats| {
+        let group_latency = stats.max_load_ms.max(stats.max_compute_ms).max(stats.max_store_ms);
+        sum + group_latency * stats.task_count as f64
+    });
+    PublicLookupStageBenchMeasurement {
+        latency,
+        max_parallelism: stage_parallelism as u128,
+        total_time,
+    }
+}
+
 fn load_public_lookup_slot<M>(
     slot_idx: usize,
     slot_count: usize,
@@ -287,6 +378,7 @@ fn compute_public_lookup_slot<M, HS>(
     checkpoint_prefix: &str,
     hash_key: [u8; 32],
     shared_by_device: &[GpuPublicLookupSharedByDevice<M>],
+    slot_bench_output: Option<&mut PublicLookupSlotBenchMeasurement>,
 ) -> ComputedPublicLookupSlot<M>
 where
     M: PolyMatrix + Send + Sync,
@@ -295,6 +387,9 @@ where
     for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
 {
     let stage_started = Instant::now();
+    let collect_bench = slot_bench_output.is_some();
+    let mut slot_bench_measurement = PublicLookupSlotBenchMeasurement::default();
+    let stage0_started = Instant::now();
     let base_params = &shared_by_device[0].params;
     let x = &slot.x_by_device[0];
     let x_u64 = x.const_coeff_u64();
@@ -307,6 +402,7 @@ where
         trapdoor_public_column_count::<M>(base_params, shared_by_device[0].shared.d);
     let output_chunk_count = column_chunk_count(shared_by_device[0].shared.m_g);
     let gate1_chunk_count = column_chunk_count(gate1_total_cols);
+    let stage0_ms = stage0_started.elapsed().as_secs_f64() * 1000.0;
 
     // Stage 0: fix the slot-local LUT output and matrix shapes that every later stage reuses.
     let stage1_started = Instant::now();
@@ -333,6 +429,16 @@ where
             }
         }));
     }
+    let mut stage1_group_stats = if collect_bench {
+        let mut stats =
+            HashMap::<PublicLookupStage1BenchGroup, PublicLookupTaskGroupBenchStats>::new();
+        for task in &stage1_tasks {
+            stats.entry(stage1_task_bench_group(task)).or_default().task_count += 1;
+        }
+        stats
+    } else {
+        HashMap::new()
+    };
     let stage1_batches =
         assign_tasks_with_affinity(stage1_tasks, shared_by_device.len(), stage1_task_lhs_family);
     let stage1_wave_count = stage1_batches.iter().map(Vec::len).max().unwrap_or(0);
@@ -344,6 +450,7 @@ where
             .enumerate()
             .filter_map(|(device_slot, (batch, shared_dev))| {
                 let task = batch.get(wave_idx).copied()?;
+                let load_started = collect_bench.then(Instant::now);
                 let rhs_chunk = match task {
                     PublicLookupStage1Task::DirectIdentity { output_chunk_idx } => {
                         read_matrix_column_chunk(
@@ -404,7 +511,12 @@ where
                         }
                     },
                 };
-                Some(LoadedPublicLookupStage1Task { device_slot, task, rhs_chunk })
+                Some(LoadedPublicLookupStage1Task {
+                    device_slot,
+                    task,
+                    rhs_chunk,
+                    load_ms: maybe_elapsed_ms(load_started),
+                })
             })
             .collect::<Vec<_>>();
         (!loaded_wave.is_empty()).then_some(loaded_wave)
@@ -413,6 +525,7 @@ where
         loaded_wave
             .into_par_iter()
             .map(|loaded_task| {
+                let compute_started = collect_bench.then(Instant::now);
                 let lhs = match loaded_task.task {
                     PublicLookupStage1Task::DirectIdentity { .. } => {
                         &slot.c_b0_by_device[loaded_task.device_slot]
@@ -426,15 +539,23 @@ where
                     }
                 };
                 let output = lhs * &loaded_task.rhs_chunk;
-                (loaded_task.task, Arc::<[u8]>::from(output.into_compact_bytes()))
+                ComputedPublicLookupStage1Task {
+                    task: loaded_task.task,
+                    bytes: Arc::<[u8]>::from(output.into_compact_bytes()),
+                    load_ms: loaded_task.load_ms,
+                    compute_ms: maybe_elapsed_ms(compute_started),
+                }
             })
             .collect::<Vec<_>>()
     };
-    let store_stage1_wave =
-        |device_outputs: Vec<(PublicLookupStage1Task, Arc<[u8]>)>,
+    let mut store_stage1_wave =
+        |device_outputs: Vec<ComputedPublicLookupStage1Task>,
          direct_identity_by_chunk: &mut Vec<Option<Arc<[u8]>>>,
          stage1_results: &mut HashMap<PublicLookupStage1Key, Arc<[u8]>>| {
-            for (task, bytes) in device_outputs {
+            for output in device_outputs {
+                let store_started = collect_bench.then(Instant::now);
+                let task = output.task;
+                let bytes = output.bytes;
                 match task {
                     PublicLookupStage1Task::DirectIdentity { output_chunk_idx } => {
                         direct_identity_by_chunk[output_chunk_idx] = Some(bytes);
@@ -442,6 +563,15 @@ where
                     PublicLookupStage1Task::Intermediate { key } => {
                         stage1_results.insert(key, bytes);
                     }
+                }
+                if collect_bench {
+                    update_group_store_timing(
+                        &mut stage1_group_stats,
+                        stage1_task_bench_group(&task),
+                        output.load_ms,
+                        output.compute_ms,
+                        maybe_elapsed_ms(store_started),
+                    );
                 }
             }
         };
@@ -491,6 +621,14 @@ where
         );
     }
     let stage1_ms = stage1_started.elapsed().as_secs_f64() * 1000.0;
+    if collect_bench {
+        let stage1_bench =
+            finalize_stage_bench(&stage1_group_stats, stage1_batches.iter().map(Vec::len).sum());
+        slot_bench_measurement.latency += stage1_bench.latency;
+        slot_bench_measurement.max_parallelism =
+            slot_bench_measurement.max_parallelism.max(stage1_bench.max_parallelism);
+        slot_bench_measurement.total_time += stage1_bench.total_time;
+    }
 
     let stage2_started = Instant::now();
     let mut stage2_tasks = Vec::new();
@@ -514,6 +652,15 @@ where
             );
         }
     }
+    let mut stage2_group_stats = if collect_bench {
+        let mut stats = HashMap::<PublicLookupStage1Key, PublicLookupTaskGroupBenchStats>::new();
+        for task in &stage2_tasks {
+            stats.entry(task.key).or_default().task_count += 1;
+        }
+        stats
+    } else {
+        HashMap::new()
+    };
     let stage2_batches =
         assign_tasks_with_affinity(stage2_tasks, shared_by_device.len(), |task| task.key);
     let stage2_wave_count = stage2_batches.iter().map(Vec::len).max().unwrap_or(0);
@@ -601,6 +748,7 @@ where
                 .into_par_iter()
                 .filter_map(|ctx| {
                     let task = ctx.batch.get(wave_idx).copied()?;
+                    let load_started = collect_bench.then(Instant::now);
                     let stage1_mid = ctx
                         .stage1_cache
                         .entry(task.key)
@@ -707,6 +855,7 @@ where
                         task,
                         stage1_mid,
                         rhs_chunk,
+                        load_ms: maybe_elapsed_ms(load_started),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -717,45 +866,61 @@ where
             .into_par_iter()
             .map(|loaded_task| {
                 let _device_slot = loaded_task.device_slot;
+                let compute_started = collect_bench.then(Instant::now);
                 let contribution = &loaded_task.stage1_mid * &loaded_task.rhs_chunk;
                 PublicLookupStage2Contribution {
                     family: loaded_task.task.key.family,
                     output_chunk_idx: loaded_task.task.output_chunk_idx,
+                    key: loaded_task.task.key,
                     bytes: Arc::<[u8]>::from(contribution.into_compact_bytes()),
+                    load_ms: loaded_task.load_ms,
+                    compute_ms: maybe_elapsed_ms(compute_started),
                 }
             })
             .collect::<Vec<_>>()
     };
-    let store_stage2_wave = |contributions: Vec<PublicLookupStage2Contribution>,
-                             reduced_chunks: &mut Vec<Option<M>>| {
-        for contribution in contributions {
-            let contribution_matrix =
-                M::from_compact_bytes(&shared_by_device[0].params, contribution.bytes.as_ref());
-            let accum = reduced_chunks[contribution.output_chunk_idx].get_or_insert_with(|| {
-                M::zero(
-                    &shared_by_device[0].params,
-                    contribution_matrix.row_size(),
-                    contribution_matrix.col_size(),
-                )
-            });
-            match contribution.family {
-                PublicLookupStage1Family::Gate1 => {
-                    let neg_contribution = M::zero(
-                        &shared_by_device[0].params,
-                        contribution_matrix.row_size(),
-                        contribution_matrix.col_size(),
-                    ) - contribution_matrix;
-                    accum.add_in_place(&neg_contribution);
+    let mut store_stage2_wave =
+        |contributions: Vec<PublicLookupStage2Contribution>,
+         reduced_chunks: &mut Vec<Option<M>>| {
+            for contribution in contributions {
+                let store_started = collect_bench.then(Instant::now);
+                let contribution_matrix =
+                    M::from_compact_bytes(&shared_by_device[0].params, contribution.bytes.as_ref());
+                let accum =
+                    reduced_chunks[contribution.output_chunk_idx].get_or_insert_with(|| {
+                        M::zero(
+                            &shared_by_device[0].params,
+                            contribution_matrix.row_size(),
+                            contribution_matrix.col_size(),
+                        )
+                    });
+                match contribution.family {
+                    PublicLookupStage1Family::Gate1 => {
+                        let neg_contribution = M::zero(
+                            &shared_by_device[0].params,
+                            contribution_matrix.row_size(),
+                            contribution_matrix.col_size(),
+                        ) - contribution_matrix;
+                        accum.add_in_place(&neg_contribution);
+                    }
+                    PublicLookupStage1Family::Gy |
+                    PublicLookupStage1Family::V |
+                    PublicLookupStage1Family::Vx |
+                    PublicLookupStage1Family::Randomized => {
+                        accum.add_in_place(&contribution_matrix);
+                    }
                 }
-                PublicLookupStage1Family::Gy |
-                PublicLookupStage1Family::V |
-                PublicLookupStage1Family::Vx |
-                PublicLookupStage1Family::Randomized => {
-                    accum.add_in_place(&contribution_matrix);
+                if collect_bench {
+                    update_group_store_timing(
+                        &mut stage2_group_stats,
+                        contribution.key,
+                        contribution.load_ms,
+                        contribution.compute_ms,
+                        maybe_elapsed_ms(store_started),
+                    );
                 }
             }
-        }
-    };
+        };
     // Stage 2: pipeline loading the next rhs wave, computing the current GPU wave, and
     // storing the previous wave into the signed output-chunk accumulators.
     let mut reduced_chunks = (0..output_chunk_count)
@@ -819,6 +984,7 @@ where
     }
     // Stage 3: after the staged signed reduction, each reduced chunk already equals the
     // final public-lookup block for this slot.
+    let stage3_started = Instant::now();
     let reduced_chunks = reduced_chunks
         .into_iter()
         .enumerate()
@@ -827,8 +993,23 @@ where
         })
         .collect::<Vec<_>>();
     let stage2_ms = stage2_started.elapsed().as_secs_f64() * 1000.0;
+    if collect_bench {
+        let stage2_bench =
+            finalize_stage_bench(&stage2_group_stats, stage2_batches.iter().map(Vec::len).sum());
+        slot_bench_measurement.latency += stage2_bench.latency;
+        slot_bench_measurement.max_parallelism =
+            slot_bench_measurement.max_parallelism.max(stage2_bench.max_parallelism);
+        slot_bench_measurement.total_time += stage2_bench.total_time;
+    }
+    let stage3_ms = stage3_started.elapsed().as_secs_f64() * 1000.0;
+    if collect_bench {
+        slot_bench_measurement.latency += stage3_ms;
+        slot_bench_measurement.max_parallelism = slot_bench_measurement.max_parallelism.max(1);
+        slot_bench_measurement.total_time += stage3_ms;
+    }
 
     // Stage 4: concatenate the reduced chunks into the final device-local output vector.
+    let stage4_started = Instant::now();
     let output_vector = if reduced_chunks.len() == 1 {
         reduced_chunks
             .into_iter()
@@ -839,6 +1020,20 @@ where
         let first = iter.next().expect("public-lookup output chunk list must be non-empty");
         first.concat_columns_owned(iter.collect())
     };
+    let stage4_ms = stage4_started.elapsed().as_secs_f64() * 1000.0;
+    if collect_bench {
+        slot_bench_measurement.latency += stage4_ms;
+        slot_bench_measurement.max_parallelism = slot_bench_measurement.max_parallelism.max(1);
+        slot_bench_measurement.total_time += stage4_ms;
+    }
+    if collect_bench {
+        slot_bench_measurement.latency += stage0_ms;
+        slot_bench_measurement.max_parallelism = slot_bench_measurement.max_parallelism.max(1);
+        slot_bench_measurement.total_time += stage0_ms;
+    }
+    if let Some(slot_bench_out) = slot_bench_output {
+        *slot_bench_out = slot_bench_measurement;
+    }
 
     ComputedPublicLookupSlot {
         slot_idx: slot.slot_idx,
@@ -889,6 +1084,81 @@ where
         computed_slot.compute_ms
     );
     (vector_bytes, computed_slot.plaintext_bytes)
+}
+
+pub(super) fn benchmark_public_lookup_chunk_gpu<M, HS>(
+    evaluator: &super::GGH15BGGPolyEncodingPltEvaluator<M, HS>,
+    samples: &crate::bench_estimator::BggPolyEncodingBenchSamples<'_, M>,
+    iterations: usize,
+) -> crate::bench_estimator::PolyEncodingChunkBenchMeasurement
+where
+    M: PolyMatrix + Send + Sync,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    M::P: Send + Sync,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
+{
+    let plaintext_compact_bytes_by_slot =
+        samples.public_lut_input.plaintext_bytes.as_ref().expect(
+            "the BGG poly encoding should reveal plaintexts for public-lookup benchmarking",
+        );
+    let dir = Path::new(&evaluator.dir_path);
+    let d = samples.public_lut_input.pubkey.matrix.row_size();
+    let shared = build_public_lookup_shared_state::<M, HS>(
+        samples.params,
+        dir,
+        &evaluator.checkpoint_prefix,
+        evaluator.hash_key,
+        samples.public_lut_gate_id,
+        d,
+    );
+    let configured_parallelism =
+        effective_gpu_slot_parallelism(crate::env::bgg_poly_encoding_slot_parallelism().max(1));
+    let shared_by_device = prepare_public_lookup_shared_by_device::<M>(
+        samples.params,
+        &shared,
+        configured_parallelism,
+    );
+    let iterations = iterations.max(1);
+    let mut latency_sum = 0.0;
+    let mut total_time_sum = 0.0;
+    let mut max_parallelism = 0;
+
+    for _ in 0..iterations {
+        let completed_slots = AtomicUsize::new(0);
+        let loaded_slot = load_public_lookup_slot::<M>(
+            0,
+            1,
+            samples.public_lut_gate_id,
+            samples.public_lut_id,
+            &completed_slots,
+            &shared_by_device,
+            &evaluator.c_b0_compact_bytes_by_slot[0],
+            &samples.public_lut_input.vector_bytes[0],
+            &plaintext_compact_bytes_by_slot[0],
+        );
+        let mut slot_bench = PublicLookupSlotBenchMeasurement::default();
+        let _computed_slot = compute_public_lookup_slot::<M, HS>(
+            loaded_slot,
+            samples.public_lut_gate_id,
+            samples.public_lut_id,
+            samples.public_lut,
+            dir,
+            &evaluator.checkpoint_prefix,
+            evaluator.hash_key,
+            &shared_by_device,
+            Some(&mut slot_bench),
+        );
+        latency_sum += slot_bench.latency;
+        total_time_sum += slot_bench.total_time;
+        max_parallelism = max_parallelism.max(slot_bench.max_parallelism);
+    }
+
+    crate::bench_estimator::PolyEncodingChunkBenchMeasurement {
+        latency: latency_sum / iterations as f64,
+        max_parallelism,
+        total_time: total_time_sum / iterations as f64,
+        peak_vram: 0,
+    }
 }
 
 pub(super) fn evaluate_public_lookup_slots_gpu<M, HS>(
@@ -959,6 +1229,7 @@ where
             checkpoint_prefix,
             hash_key,
             &shared_by_device,
+            None,
         );
         let (vector_bytes, plaintext_bytes) =
             store_public_lookup_slot(computed_slot, slot_count, gate_id, lut_id, &completed_slots);

@@ -415,7 +415,8 @@ where
             gate_bench.time * gate_chunk_count as f64;
         PolyEncodingChunkBenchMeasurement {
             latency: total_single_slot_time / total_chunk_count.max(1) as f64,
-            chunk_count: total_chunk_count,
+            max_parallelism: total_chunk_count as u128,
+            total_time: total_single_slot_time,
             peak_vram: b0_bench.peak_vram.max(b1_bench.peak_vram).max(gate_bench.peak_vram),
         }
     }

@@ -207,16 +207,115 @@ where
     }
 }
 
-fn concat_chunk_bytes_on_base<M>(params: &<M::P as Poly>::Params, chunk_bytes: Vec<Vec<u8>>) -> M
+fn add_stage_bench_to_slot_measurement(
+    slot_bench_measurement: &mut SlotTransferSlotBenchMeasurement,
+    stage_bench: SlotTransferStageBenchMeasurement,
+) {
+    slot_bench_measurement.latency += stage_bench.latency;
+    slot_bench_measurement.max_parallelism =
+        slot_bench_measurement.max_parallelism.max(stage_bench.max_parallelism);
+    slot_bench_measurement.total_time += stage_bench.total_time;
+}
+
+fn add_scalar_stage_to_slot_measurement(
+    slot_bench_measurement: &mut SlotTransferSlotBenchMeasurement,
+    stage_ms: f64,
+) {
+    slot_bench_measurement.latency += stage_ms;
+    slot_bench_measurement.max_parallelism = slot_bench_measurement.max_parallelism.max(1);
+    slot_bench_measurement.total_time += stage_ms;
+}
+
+fn build_stage1_tasks(
+    b0_chunk_count: usize,
+    gate_chunk_count: usize,
+) -> Vec<SlotTransferStage1Task> {
+    let mut stage1_tasks = Vec::new();
+    stage1_tasks
+        .extend((0..b0_chunk_count).map(|chunk_idx| SlotTransferStage1Task::B0Chunk { chunk_idx }));
+    stage1_tasks.extend(
+        (0..gate_chunk_count).map(|chunk_idx| SlotTransferStage1Task::GateChunk { chunk_idx }),
+    );
+    stage1_tasks.push(SlotTransferStage1Task::InputDirect);
+    stage1_tasks
+}
+
+fn load_stage1_rhs_chunk<M, HS>(
+    evaluator: &BggPolyEncodingSTEvaluator<M, HS>,
+    shared: &GpuSlotTransferSharedByDevice<M>,
+    dir: &std::path::Path,
+    src_slot: usize,
+    dst_slot: usize,
+    gate_id: GateId,
+    slot_preimage_b0_total_cols: usize,
+    gate_total_cols: usize,
+    task: SlotTransferStage1Task,
+) -> M
 where
     M: PolyMatrix,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+{
+    match task {
+        SlotTransferStage1Task::B0Chunk { chunk_idx } => read_matrix_column_chunk(
+            &shared.params,
+            dir,
+            &evaluator.slot_preimage_b0_id_prefix(src_slot),
+            slot_preimage_b0_total_cols,
+            chunk_idx,
+        ),
+        SlotTransferStage1Task::GateChunk { chunk_idx } => read_matrix_column_chunk(
+            &shared.params,
+            dir,
+            &evaluator.gate_preimage_id_prefix(gate_id, dst_slot),
+            gate_total_cols,
+            chunk_idx,
+        ),
+        SlotTransferStage1Task::InputDirect => evaluator
+            .slot_a_for_params(&shared.params, shared.out_pubkey_matrix.row_size(), dst_slot)
+            .decompose(),
+    }
+}
+
+fn concat_chunk_bytes_on_base<M, B>(params: &<M::P as Poly>::Params, chunk_bytes: Vec<B>) -> M
+where
+    M: PolyMatrix + Send,
+    B: AsRef<[u8]> + Send,
 {
     if chunk_bytes.len() == 1 {
-        return M::from_compact_bytes(params, &chunk_bytes[0]);
+        return M::from_compact_bytes(params, chunk_bytes[0].as_ref());
     }
-    let mut chunk_iter = chunk_bytes.into_iter().map(|bytes| M::from_compact_bytes(params, &bytes));
+    let mut chunk_iter = chunk_bytes
+        .into_par_iter()
+        .map(|bytes| M::from_compact_bytes(params, bytes.as_ref()))
+        .collect::<Vec<_>>()
+        .into_iter();
     let first = chunk_iter.next().expect("slot-transfer chunk byte list must be non-empty");
     first.concat_columns_owned(chunk_iter.collect())
+}
+
+fn reduce_slot_transfer_matrix_bytes<M>(
+    params: &<M::P as Poly>::Params,
+    input_direct_bytes: Arc<[u8]>,
+    c_transfer_chunk_bytes: Vec<Arc<[u8]>>,
+    c_gate_bytes: Arc<[u8]>,
+    output_plaintext: &M::P,
+    scalar_poly: Option<&M::P>,
+) -> M
+where
+    M: PolyMatrix + Send,
+{
+    let mut accum = M::from_compact_bytes(params, input_direct_bytes.as_ref());
+    let c_transfer = concat_chunk_bytes_on_base::<M, Arc<[u8]>>(params, c_transfer_chunk_bytes);
+    let transfer_term = c_transfer * output_plaintext.clone();
+    let ((), c_gate) = rayon::join(
+        || accum.add_in_place(&transfer_term),
+        || M::from_compact_bytes(params, c_gate_bytes.as_ref()),
+    );
+    if let Some(scalar_poly) = scalar_poly {
+        accum = accum * scalar_poly;
+    }
+    accum.add_in_place(&c_gate);
+    accum
 }
 
 fn output_slot_for_params_gpu<M, HS>(
@@ -298,29 +397,17 @@ where
             .filter_map(|(device_slot, (batch, shared))| {
                 let task = batch.get(wave_idx).copied()?;
                 let load_started = collect_bench.then(Instant::now);
-                let rhs_chunk = match task {
-                    SlotTransferStage1Task::B0Chunk { chunk_idx } => read_matrix_column_chunk(
-                        &shared.params,
-                        dir,
-                        &evaluator.slot_preimage_b0_id_prefix(src_slot),
-                        slot_preimage_b0_total_cols,
-                        chunk_idx,
-                    ),
-                    SlotTransferStage1Task::GateChunk { chunk_idx } => read_matrix_column_chunk(
-                        &shared.params,
-                        dir,
-                        &evaluator.gate_preimage_id_prefix(gate_id, dst_slot),
-                        gate_total_cols,
-                        chunk_idx,
-                    ),
-                    SlotTransferStage1Task::InputDirect => evaluator
-                        .slot_a_for_params(
-                            &shared.params,
-                            shared.out_pubkey_matrix.row_size(),
-                            dst_slot,
-                        )
-                        .decompose(),
-                };
+                let rhs_chunk = load_stage1_rhs_chunk::<M, HS>(
+                    evaluator,
+                    shared,
+                    dir,
+                    src_slot,
+                    dst_slot,
+                    gate_id,
+                    slot_preimage_b0_total_cols,
+                    gate_total_cols,
+                    task,
+                );
                 Some(LoadedSlotTransferStage1Task {
                     device_slot,
                     task,
@@ -431,18 +518,15 @@ where
         .collect::<Vec<_>>();
     let c_b0_slot_preimage_b0: M = concat_chunk_bytes_on_base(params, b0_chunk_bytes);
     let c_b0_slot_preimage_b0_bytes = Arc::<[u8]>::from(c_b0_slot_preimage_b0.into_compact_bytes());
-    let c_gate: M = concat_chunk_bytes_on_base(params, gate_chunk_bytes);
-    let input_direct = M::from_compact_bytes(
-        params,
-        input_direct_bytes.expect("missing slot-transfer input-direct bytes").as_slice(),
+    let c_gate_bytes = Arc::<[u8]>::from(
+        concat_chunk_bytes_on_base::<M, Vec<u8>>(params, gate_chunk_bytes).into_compact_bytes(),
     );
+    let input_direct_bytes =
+        Arc::<[u8]>::from(input_direct_bytes.expect("missing slot-transfer input-direct bytes"));
     if collect_bench {
         let stage1_bench =
             finalize_stage_bench(&stage1_group_stats, stage1_batches.iter().map(Vec::len).sum());
-        slot_bench_measurement.latency += stage1_bench.latency;
-        slot_bench_measurement.max_parallelism =
-            slot_bench_measurement.max_parallelism.max(stage1_bench.max_parallelism);
-        slot_bench_measurement.total_time += stage1_bench.total_time;
+        add_stage_bench_to_slot_measurement(&mut slot_bench_measurement, stage1_bench);
     }
     let _stage1_ms = stage1_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -512,7 +596,7 @@ where
     let mut store_stage2_wave = |outputs: Vec<ComputedSlotTransferStage2Task>| {
         for output in outputs {
             let store_started = collect_bench.then(Instant::now);
-            c_transfer_chunk_bytes[output.task.chunk_idx] = Some(output.bytes);
+            c_transfer_chunk_bytes[output.task.chunk_idx] = Some(Arc::<[u8]>::from(output.bytes));
             if collect_bench {
                 update_group_store_timing(
                     &mut stage2_group_stats,
@@ -562,52 +646,42 @@ where
     if let Some(outputs) = previous_stage2_outputs.take() {
         store_stage2_wave(outputs);
     }
-    let c_transfer: M = concat_chunk_bytes_on_base(
-        params,
-        c_transfer_chunk_bytes
-            .into_iter()
-            .enumerate()
-            .map(|(chunk_idx, maybe_bytes)| {
-                maybe_bytes.unwrap_or_else(|| {
-                    panic!("missing slot-transfer transfer chunk bytes for chunk {chunk_idx}")
-                })
+    let c_transfer_chunk_bytes = c_transfer_chunk_bytes
+        .into_iter()
+        .enumerate()
+        .map(|(chunk_idx, maybe_bytes)| {
+            maybe_bytes.unwrap_or_else(|| {
+                panic!("missing slot-transfer transfer chunk bytes for chunk {chunk_idx}")
             })
-            .collect(),
-    );
+        })
+        .collect::<Vec<_>>();
     if collect_bench {
         let stage2_bench =
             finalize_stage_bench(&stage2_group_stats, stage2_batches.iter().map(Vec::len).sum());
-        slot_bench_measurement.latency += stage2_bench.latency;
-        slot_bench_measurement.max_parallelism =
-            slot_bench_measurement.max_parallelism.max(stage2_bench.max_parallelism);
-        slot_bench_measurement.total_time += stage2_bench.total_time;
+        add_stage_bench_to_slot_measurement(&mut slot_bench_measurement, stage2_bench);
     }
     let _stage2_ms = stage2_started.elapsed().as_secs_f64() * 1000.0;
 
     let stage3_started = Instant::now();
-    let transfer_plaintext_term = c_transfer.clone() * &output_plaintext;
-    let mut pre_out = input_direct + &transfer_plaintext_term;
-    if let Some(scalar) = scalar {
-        let scalar_poly = M::P::from_usize_to_constant(params, scalar as usize);
-        pre_out = pre_out * &scalar_poly;
-        output_plaintext = output_plaintext * &scalar_poly;
+    let scalar_poly = scalar.map(|scalar| M::P::from_usize_to_constant(params, scalar as usize));
+    let out_vector = reduce_slot_transfer_matrix_bytes::<M>(
+        params,
+        input_direct_bytes,
+        c_transfer_chunk_bytes,
+        c_gate_bytes,
+        &output_plaintext,
+        scalar_poly.as_ref(),
+    );
+    if let Some(scalar_poly) = scalar_poly.as_ref() {
+        output_plaintext = output_plaintext * scalar_poly;
     }
-    let out_vector: M = c_gate + &pre_out;
-    let stage3_ms = stage3_started.elapsed().as_secs_f64() * 1000.0;
-    if collect_bench {
-        slot_bench_measurement.latency += stage3_ms;
-        slot_bench_measurement.max_parallelism = slot_bench_measurement.max_parallelism.max(1);
-        slot_bench_measurement.total_time += stage3_ms;
-    }
-
-    let stage4_started = Instant::now();
     let output_vector_bytes = Arc::<[u8]>::from(out_vector.into_compact_bytes());
     let output_plaintext_bytes = Arc::<[u8]>::from(output_plaintext.to_compact_bytes());
-    let stage4_ms = stage4_started.elapsed().as_secs_f64() * 1000.0;
     if collect_bench {
-        slot_bench_measurement.latency += stage4_ms;
-        slot_bench_measurement.max_parallelism = slot_bench_measurement.max_parallelism.max(1);
-        slot_bench_measurement.total_time += stage4_ms;
+        add_scalar_stage_to_slot_measurement(
+            &mut slot_bench_measurement,
+            stage3_started.elapsed().as_secs_f64() * 1000.0,
+        );
     }
     if let Some(slot_bench_output) = slot_bench_output {
         *slot_bench_output = slot_bench_measurement;
@@ -662,6 +736,225 @@ where
     (output_vector_bytes, output_plaintext_bytes)
 }
 
+fn benchmark_output_slot_for_params_gpu<M, HS>(
+    evaluator: &BggPolyEncodingSTEvaluator<M, HS>,
+    params: &<M::P as Poly>::Params,
+    input: &BggPolyEncoding<M>,
+    plaintext_bytes_by_slot: &[Arc<[u8]>],
+    src_slots: &[(u32, Option<u32>)],
+    gate_id: GateId,
+    dst_slot: usize,
+    shared: &GpuSlotTransferSharedByDevice<M>,
+) -> SlotTransferSlotBenchMeasurement
+where
+    M: PolyMatrix + Send + Sync,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    M::P: Send + Sync,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
+{
+    let mut slot_bench_measurement = SlotTransferSlotBenchMeasurement::default();
+    let (src_slot_u32, scalar) = src_slots[dst_slot];
+    let src_slot = usize::try_from(src_slot_u32).expect("source slot index must fit in usize");
+    assert!(
+        src_slot < input.num_slots(),
+        "source slot index {} out of range for input slot count {}",
+        src_slot,
+        input.num_slots()
+    );
+
+    let input_vector_bytes = &input.vector_bytes[src_slot];
+    let secret_size = shared.out_pubkey_matrix.row_size();
+    let src_plaintext =
+        M::P::from_compact_bytes(params, plaintext_bytes_by_slot[src_slot].as_ref());
+    let constant_term = src_plaintext
+        .coeffs_biguints()
+        .into_iter()
+        .next()
+        .expect("plaintext polynomial must contain a constant coefficient");
+    let mut output_plaintext = M::P::from_biguint_to_constant(params, constant_term);
+    let dir = evaluator.dir_path.as_path();
+    let slot_preimage_b0_total_cols = trapdoor_public_column_count::<M>(params, secret_size * 2);
+    let slot_preimage_b1_total_cols = secret_size * params.modulus_digits();
+    let gate_total_cols = secret_size * params.modulus_digits();
+    let b0_chunk_count = column_chunk_count(slot_preimage_b0_total_cols);
+    let b1_chunk_count = column_chunk_count(slot_preimage_b1_total_cols);
+    let gate_chunk_count = column_chunk_count(gate_total_cols);
+
+    let stage1_tasks = build_stage1_tasks(b0_chunk_count, gate_chunk_count);
+    let mut stage1_group_stats =
+        HashMap::<SlotTransferStage1BenchGroup, SlotTransferTaskGroupBenchStats>::new();
+    let mut stage1_representative_tasks = Vec::new();
+    for task in stage1_tasks {
+        let entry = stage1_group_stats.entry(stage1_task_bench_group(&task)).or_default();
+        if entry.task_count == 0 {
+            stage1_representative_tasks.push(task);
+        }
+        entry.task_count += 1;
+    }
+    let input_vector = M::from_compact_bytes(&shared.params, input_vector_bytes.as_ref());
+    let mut b0_chunk_bytes = (0..b0_chunk_count).map(|_| None).collect::<Vec<_>>();
+    let mut gate_chunk_bytes = (0..gate_chunk_count).map(|_| None).collect::<Vec<_>>();
+    let mut input_direct_bytes = None;
+    for task in stage1_representative_tasks {
+        let load_started = Instant::now();
+        let rhs_chunk = load_stage1_rhs_chunk::<M, HS>(
+            evaluator,
+            shared,
+            dir,
+            src_slot,
+            dst_slot,
+            gate_id,
+            slot_preimage_b0_total_cols,
+            gate_total_cols,
+            task,
+        );
+        let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+        let compute_started = Instant::now();
+        let lhs = match task {
+            SlotTransferStage1Task::InputDirect => &input_vector,
+            SlotTransferStage1Task::B0Chunk { .. } | SlotTransferStage1Task::GateChunk { .. } => {
+                &shared.c_b0
+            }
+        };
+        let output = lhs * &rhs_chunk;
+        let compute_ms = compute_started.elapsed().as_secs_f64() * 1000.0;
+        let store_started = Instant::now();
+        let output_bytes = output.into_compact_bytes();
+        match task {
+            SlotTransferStage1Task::B0Chunk { chunk_idx } => {
+                let bytes = Some(output_bytes);
+                for chunk_bytes in &mut b0_chunk_bytes {
+                    *chunk_bytes = bytes.clone();
+                }
+                debug_assert!(chunk_idx < b0_chunk_count);
+            }
+            SlotTransferStage1Task::GateChunk { chunk_idx } => {
+                let bytes = Some(output_bytes);
+                for chunk_bytes in &mut gate_chunk_bytes {
+                    *chunk_bytes = bytes.clone();
+                }
+                debug_assert!(chunk_idx < gate_chunk_count);
+            }
+            SlotTransferStage1Task::InputDirect => {
+                input_direct_bytes = Some(output_bytes);
+            }
+        }
+        update_group_store_timing(
+            &mut stage1_group_stats,
+            stage1_task_bench_group(&task),
+            load_ms,
+            compute_ms,
+            store_started.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+    let c_b0_slot_preimage_b0: M = concat_chunk_bytes_on_base(
+        params,
+        b0_chunk_bytes
+            .into_iter()
+            .enumerate()
+            .map(|(chunk_idx, maybe_bytes)| {
+                maybe_bytes.unwrap_or_else(|| {
+                    panic!("missing slot-transfer b0 chunk bytes for chunk {chunk_idx}")
+                })
+            })
+            .collect(),
+    );
+    let c_b0_slot_preimage_b0_bytes = Arc::<[u8]>::from(c_b0_slot_preimage_b0.into_compact_bytes());
+    let c_gate_bytes = Arc::<[u8]>::from(
+        concat_chunk_bytes_on_base::<M, Vec<u8>>(
+            params,
+            gate_chunk_bytes
+                .into_iter()
+                .enumerate()
+                .map(|(chunk_idx, maybe_bytes)| {
+                    maybe_bytes.unwrap_or_else(|| {
+                        panic!("missing slot-transfer gate chunk bytes for chunk {chunk_idx}")
+                    })
+                })
+                .collect(),
+        )
+        .into_compact_bytes(),
+    );
+    let input_direct_bytes =
+        Arc::<[u8]>::from(input_direct_bytes.expect("missing slot-transfer input-direct bytes"));
+    let stage1_bench = finalize_stage_bench(
+        &stage1_group_stats,
+        stage1_group_stats.values().map(|stats| stats.task_count).sum(),
+    );
+    add_stage_bench_to_slot_measurement(&mut slot_bench_measurement, stage1_bench);
+
+    let stage2_tasks = (0..b1_chunk_count)
+        .map(|chunk_idx| SlotTransferStage2Task { chunk_idx })
+        .collect::<Vec<_>>();
+    let mut stage2_group_stats = HashMap::<usize, SlotTransferTaskGroupBenchStats>::new();
+    stage2_group_stats.entry(0usize).or_default().task_count = stage2_tasks.len();
+    let mut c_transfer_chunk_bytes = (0..b1_chunk_count).map(|_| None).collect::<Vec<_>>();
+    for task in stage2_tasks.into_iter().take(1) {
+        let load_started = Instant::now();
+        let lhs = M::from_compact_bytes(&shared.params, c_b0_slot_preimage_b0_bytes.as_ref());
+        let rhs_chunk = read_matrix_column_chunk::<M>(
+            &shared.params,
+            dir,
+            &evaluator.slot_preimage_b1_id_prefix(dst_slot),
+            slot_preimage_b1_total_cols,
+            task.chunk_idx,
+        );
+        let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+        let compute_started = Instant::now();
+        let output = &lhs * &rhs_chunk;
+        let compute_ms = compute_started.elapsed().as_secs_f64() * 1000.0;
+        let store_started = Instant::now();
+        let output_bytes = output.into_compact_bytes();
+        let bytes = Some(Arc::<[u8]>::from(output_bytes));
+        for chunk_bytes in &mut c_transfer_chunk_bytes {
+            *chunk_bytes = bytes.clone();
+        }
+        update_group_store_timing(
+            &mut stage2_group_stats,
+            0usize,
+            load_ms,
+            compute_ms,
+            store_started.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+    let c_transfer_chunk_bytes = c_transfer_chunk_bytes
+        .into_iter()
+        .enumerate()
+        .map(|(chunk_idx, maybe_bytes)| {
+            maybe_bytes.unwrap_or_else(|| {
+                panic!("missing slot-transfer transfer chunk bytes for chunk {chunk_idx}")
+            })
+        })
+        .collect::<Vec<_>>();
+    let stage2_bench = finalize_stage_bench(
+        &stage2_group_stats,
+        stage2_group_stats.values().map(|stats| stats.task_count).sum(),
+    );
+    add_stage_bench_to_slot_measurement(&mut slot_bench_measurement, stage2_bench);
+
+    let stage3_started = Instant::now();
+    let scalar_poly = scalar.map(|scalar| M::P::from_usize_to_constant(params, scalar as usize));
+    let out_vector = reduce_slot_transfer_matrix_bytes::<M>(
+        params,
+        input_direct_bytes,
+        c_transfer_chunk_bytes,
+        c_gate_bytes,
+        &output_plaintext,
+        scalar_poly.as_ref(),
+    );
+    if let Some(scalar_poly) = scalar_poly.as_ref() {
+        output_plaintext = output_plaintext * scalar_poly;
+    }
+    let _output_vector_bytes = Arc::<[u8]>::from(out_vector.into_compact_bytes());
+    let _output_plaintext_bytes = Arc::<[u8]>::from(output_plaintext.to_compact_bytes());
+    add_scalar_stage_to_slot_measurement(
+        &mut slot_bench_measurement,
+        stage3_started.elapsed().as_secs_f64() * 1000.0,
+    );
+
+    slot_bench_measurement
+}
+
 pub(super) fn benchmark_slot_transfer_chunk_gpu<M, HS>(
     evaluator: &BggPolyEncodingSTEvaluator<M, HS>,
     samples: &crate::bench_estimator::BggPolyEncodingBenchSamples<'_, M>,
@@ -700,8 +993,7 @@ where
     let mut max_parallelism = 0u128;
 
     for _ in 0..iterations {
-        let mut slot_bench = SlotTransferSlotBenchMeasurement::default();
-        let _ = output_slot_for_params_gpu::<M, HS>(
+        let slot_bench = benchmark_output_slot_for_params_gpu::<M, HS>(
             evaluator,
             params,
             input,
@@ -709,8 +1001,7 @@ where
             samples.slot_transfer_src_slots,
             samples.slot_transfer_gate_id,
             0,
-            &shared_by_device,
-            Some(&mut slot_bench),
+            &shared_by_device[0],
         );
         latency_sum += slot_bench.latency;
         total_time_sum += slot_bench.total_time;

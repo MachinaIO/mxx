@@ -112,6 +112,7 @@ where
     chunk
 }
 
+#[cfg(not(feature = "gpu"))]
 pub(crate) fn left_mul_chunked_checkpoint_column<M>(
     params: &<M::P as Poly>::Params,
     dir: &std::path::Path,

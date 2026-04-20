@@ -3,10 +3,7 @@
 mod gpu;
 
 use crate::{
-    bench_estimator::{
-        PolyEncodingChunkBenchMeasurement, PolyEncodingPublicLutBenchEstimator,
-        benchmark_gate_operation,
-    },
+    bench_estimator::{PolyEncodingChunkBenchMeasurement, PolyEncodingPublicLutBenchEstimator},
     bgg::poly_encoding::BggPolyEncoding,
     circuit::{evaluable::Evaluable, gate::GateId},
     lookup::{PltEvaluator, PublicLut},
@@ -25,10 +22,12 @@ use tracing::debug;
 
 #[cfg(not(feature = "gpu"))]
 use super::encoding::apply_public_lookup_to_slot;
-use super::{
-    encoding::{build_public_lookup_output_chunk, build_public_lookup_shared_state},
-    pubkey::lut_entry_chunk_count,
-};
+use super::encoding::build_public_lookup_shared_state;
+
+#[cfg(not(feature = "gpu"))]
+use super::{encoding::build_public_lookup_output_chunk, pubkey::lut_entry_chunk_count};
+#[cfg(not(feature = "gpu"))]
+use crate::bench_estimator::benchmark_gate_operation;
 
 #[cfg(not(feature = "gpu"))]
 use rayon::prelude::*;
@@ -371,49 +370,60 @@ where
         samples: &crate::bench_estimator::BggPolyEncodingBenchSamples<'_, M>,
         iterations: usize,
     ) -> PolyEncodingChunkBenchMeasurement {
-        let plaintext_compact_bytes_by_slot =
-            samples.public_lut_input.plaintext_bytes.as_ref().expect(
-                "the BGG poly encoding should reveal plaintexts for public-lookup benchmarking",
-            );
-        let dir = Path::new(&self.dir_path);
-        let d = samples.public_lut_input.pubkey.matrix.row_size();
-        let shared = build_public_lookup_shared_state::<M, HS>(
-            samples.params,
-            dir,
-            &self.checkpoint_prefix,
-            self.hash_key,
-            samples.public_lut_gate_id,
-            d,
-        );
-        let c_b0 =
-            M::from_compact_bytes(samples.params, self.c_b0_compact_bytes_by_slot[0].as_ref());
-        let input_vector = M::from_compact_bytes(
-            samples.params,
-            samples.public_lut_input.vector_bytes[0].as_ref(),
-        );
-        let x =
-            M::P::from_compact_bytes(samples.params, plaintext_compact_bytes_by_slot[0].as_ref());
-        let bench = benchmark_gate_operation(iterations, || {
-            build_public_lookup_output_chunk::<M, HS>(
+        #[cfg(feature = "gpu")]
+        {
+            return gpu::benchmark_public_lookup_chunk_gpu::<M, HS>(self, samples, iterations);
+        }
+
+        #[cfg(not(feature = "gpu"))]
+        {
+            let plaintext_compact_bytes_by_slot =
+                samples.public_lut_input.plaintext_bytes.as_ref().expect(
+                    "the BGG poly encoding should reveal plaintexts for public-lookup benchmarking",
+                );
+            let dir = Path::new(&self.dir_path);
+            let d = samples.public_lut_input.pubkey.matrix.row_size();
+            let shared = build_public_lookup_shared_state::<M, HS>(
                 samples.params,
-                samples.public_lut,
                 dir,
                 &self.checkpoint_prefix,
                 self.hash_key,
-                &c_b0,
-                &shared,
-                &input_vector,
-                &x,
                 samples.public_lut_gate_id,
-                samples.public_lut_id,
-                0,
-            )
-            .into_compact_bytes()
-        });
-        PolyEncodingChunkBenchMeasurement {
-            latency: bench.time,
-            chunk_count: lut_entry_chunk_count::<M>(samples.params, d),
-            peak_vram: bench.peak_vram,
+                d,
+            );
+            let c_b0 =
+                M::from_compact_bytes(samples.params, self.c_b0_compact_bytes_by_slot[0].as_ref());
+            let input_vector = M::from_compact_bytes(
+                samples.params,
+                samples.public_lut_input.vector_bytes[0].as_ref(),
+            );
+            let x = M::P::from_compact_bytes(
+                samples.params,
+                plaintext_compact_bytes_by_slot[0].as_ref(),
+            );
+            let bench = benchmark_gate_operation(iterations, || {
+                build_public_lookup_output_chunk::<M, HS>(
+                    samples.params,
+                    samples.public_lut,
+                    dir,
+                    &self.checkpoint_prefix,
+                    self.hash_key,
+                    &c_b0,
+                    &shared,
+                    &input_vector,
+                    &x,
+                    samples.public_lut_gate_id,
+                    samples.public_lut_id,
+                    0,
+                )
+                .into_compact_bytes()
+            });
+            PolyEncodingChunkBenchMeasurement {
+                latency: bench.time,
+                max_parallelism: lut_entry_chunk_count::<M>(samples.params, d) as u128,
+                total_time: bench.time * lut_entry_chunk_count::<M>(samples.params, d) as f64,
+                peak_vram: bench.peak_vram,
+            }
         }
     }
 }

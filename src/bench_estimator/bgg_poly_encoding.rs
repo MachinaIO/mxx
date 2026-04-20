@@ -440,6 +440,11 @@ where
             self.num_slots,
             self.slot_transfer_peak_vram,
         )
+        .with_max_parallelism(
+            self.slot_transfer_max_parallelism
+                .checked_mul(self.num_slots as u128)
+                .expect("slot transfer parallelism overflowed u128 while scaling by slot count"),
+        )
     }
 
     fn estimate_public_lookup(&self, _lut_id: usize) -> CircuitBenchEstimate {

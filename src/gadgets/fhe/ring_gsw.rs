@@ -175,8 +175,8 @@ impl<P: Poly, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>> Rin
 impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>>
     RingGswContext<P, A>
 {
-    pub(super) fn helper_circuit() -> PolyCircuit<P> {
-        PolyCircuit::<P>::new()
+    pub(super) fn helper_circuit(source_circuit: &PolyCircuit<P>) -> PolyCircuit<P> {
+        source_circuit.fresh_sub_circuit()
     }
 
     fn entry_input_from_template(
@@ -203,10 +203,8 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
     where
         F: Fn(&A, &A, &mut PolyCircuit<P>) -> A + Copy,
     {
-        let mut helper_circuit = Self::helper_circuit();
-        let helper_ctx = Arc::new(
-            lhs.context().register_shared_subcircuits_in(source_circuit, &mut helper_circuit),
-        );
+        let mut helper_circuit = Self::helper_circuit(source_circuit);
+        let helper_ctx = lhs.context().clone();
         let lhs_entry =
             Self::entry_input_from_template(lhs, helper_ctx.clone(), &mut helper_circuit);
         let rhs_entry = Self::entry_input_from_template(rhs, helper_ctx, &mut helper_circuit);
@@ -249,7 +247,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         let active_levels = arith_ctx.active_levels(enable_levels, Some(level_offset));
         assert!(active_levels > 0, "RingGswContext requires at least one active q level");
         let setup_start = Instant::now();
-        let registered_arith_ctx = Arc::new(arith_ctx.register_local_in(circuit));
+        let registered_arith_ctx = arith_ctx;
         let width = 2 * registered_arith_ctx.gadget_len(Some(active_levels), Some(level_offset));
         let max_decomposition_value = A::randomizer_decomposition_norm_bound(
             registered_arith_ctx.as_ref(),
@@ -308,9 +306,8 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         width: usize,
     ) -> (PolyCircuit<P>, A) {
         let start = Instant::now();
-        let mut circuit = Self::helper_circuit();
-        let arith_ctx =
-            Arc::new(template_ctx.register_shared_subcircuits_in(source_circuit, &mut circuit));
+        let mut circuit = Self::helper_circuit(source_circuit);
+        let arith_ctx = Arc::new(template_ctx.clone());
         let normalized_metadata =
             A::normalized_metadata(arith_ctx.as_ref(), Some(active_levels), Some(level_offset));
         let chunk_width = template_ctx.decomposition_len();
@@ -368,7 +365,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             super_batch_tail_subcircuit,
         ));
         let super_batch_subcircuit_id =
-            circuit.register_shared_sub_circuit(Arc::clone(&super_batch_subcircuit));
+            circuit.register_sub_circuit(Arc::clone(&super_batch_subcircuit));
         let width_tail_columns = width % super_batch_columns;
         let width_tail_subcircuit_id = if width_tail_columns > 0 {
             let width_tail_batch_tail_columns = width_tail_columns % batch_columns;
@@ -383,7 +380,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                     Arc::clone(&mul_column_subcircuit),
                 ))
             });
-            Some(circuit.register_shared_sub_circuit(Arc::new(Self::mul_super_batch_subcircuit(
+            Some(circuit.register_sub_circuit(Arc::new(Self::mul_super_batch_subcircuit(
                 source_circuit,
                 template_ctx,
                 active_levels,
@@ -540,14 +537,13 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             width
         );
         let start = Instant::now();
-        let mut circuit = Self::helper_circuit();
-        let arith_ctx =
-            Arc::new(template_ctx.register_shared_subcircuits_in(source_circuit, &mut circuit));
+        let mut circuit = Self::helper_circuit(source_circuit);
+        let arith_ctx = Arc::new(template_ctx.clone());
         let normalized_metadata =
             A::normalized_metadata(arith_ctx.as_ref(), Some(active_levels), Some(level_offset));
 
         let column_helper_start = Instant::now();
-        let mul_column_subcircuit_id = circuit.register_shared_sub_circuit(mul_column_subcircuit);
+        let mul_column_subcircuit_id = circuit.register_sub_circuit(mul_column_subcircuit);
         debug!(
             "RingGswContext::mul_columns_batch_subcircuit column helper registered: width={}, batch_columns={}, elapsed_ms={}",
             width,
@@ -696,18 +692,17 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             super_batch_columns
         );
         let start = Instant::now();
-        let mut circuit = Self::helper_circuit();
-        let arith_ctx =
-            Arc::new(template_ctx.register_shared_subcircuits_in(source_circuit, &mut circuit));
+        let mut circuit = Self::helper_circuit(source_circuit);
+        let arith_ctx = Arc::new(template_ctx.clone());
         let normalized_metadata =
             A::normalized_metadata(arith_ctx.as_ref(), Some(active_levels), Some(level_offset));
 
         let batch_helper_start = Instant::now();
-        let batch_subcircuit_id = circuit.register_shared_sub_circuit(batch_subcircuit);
+        let batch_subcircuit_id = circuit.register_sub_circuit(batch_subcircuit);
         let batch_tail_columns = super_batch_columns % batch_columns;
         let batch_tail_subcircuit_id = if batch_tail_columns > 0 {
             Some(
-                circuit.register_shared_sub_circuit(
+                circuit.register_sub_circuit(
                     batch_tail_subcircuit
                         .expect("super-batch tail helper must exist for non-zero tail columns"),
                 ),
@@ -863,9 +858,8 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         width: usize,
     ) -> (PolyCircuit<P>, A) {
         let start = Instant::now();
-        let mut circuit = Self::helper_circuit();
-        let arith_ctx =
-            Arc::new(template_ctx.register_shared_subcircuits_in(source_circuit, &mut circuit));
+        let mut circuit = Self::helper_circuit(source_circuit);
+        let arith_ctx = Arc::new(template_ctx.clone());
         let gadget_len = arith_ctx.gadget_len(Some(active_levels), Some(level_offset));
         assert_eq!(
             width,

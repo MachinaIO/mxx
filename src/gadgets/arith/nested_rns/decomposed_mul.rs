@@ -244,11 +244,10 @@ fn decomposed_term_batch_subcircuit<P: Poly + 'static>(
     term_helper: Arc<PolyCircuit<P>>,
 ) -> PolyCircuit<P> {
     assert!(direct_term_calls > 0, "direct_term_calls must be positive");
-    let mut circuit = PolyCircuit::<P>::new();
-    let helper_ctx =
-        Arc::new(template_ctx.register_shared_subcircuits_in(source_circuit, &mut circuit));
+    let mut circuit = source_circuit.fresh_sub_circuit();
+    let helper_ctx = Arc::new(template_ctx.clone());
     let p_moduli_depth = helper_ctx.p_moduli.len();
-    let term_helper_id = circuit.register_shared_sub_circuit(term_helper);
+    let term_helper_id = circuit.register_sub_circuit(term_helper);
     let empty_binding_set_id = circuit.intern_binding_set(&[]);
     let call_input_set_ids = (0..direct_term_calls)
         .map(|_| {
@@ -327,9 +326,8 @@ pub(crate) fn mul_rows_with_decomposed_rhs<P: Poly + 'static>(
     assert_eq!(width, 2 * gadget_len);
     assert_eq!(lhs_row1.len(), width);
     let (decomposed_row_subcircuit_id, output_template) = {
-        let mut helper_circuit = PolyCircuit::<P>::new();
-        let helper_ctx =
-            Arc::new(nested_rns.register_shared_subcircuits_in(circuit, &mut helper_circuit));
+        let mut helper_circuit = circuit.fresh_sub_circuit();
+        let helper_ctx = Arc::new(nested_rns.as_ref().clone());
         let helper_metadata = NestedRnsPoly::<P>::normalized_metadata(
             helper_ctx.as_ref(),
             Some(active_levels),
@@ -344,7 +342,7 @@ pub(crate) fn mul_rows_with_decomposed_rhs<P: Poly + 'static>(
             ));
         let term_batch_capacity = DIRECT_TERM_HELPER_BATCH;
         let term_batch_subcircuit_id =
-            helper_circuit.register_shared_sub_circuit(Arc::new(decomposed_term_batch_subcircuit(
+            helper_circuit.register_sub_circuit(Arc::new(decomposed_term_batch_subcircuit(
                 circuit,
                 nested_rns.as_ref(),
                 term_batch_capacity,
@@ -352,14 +350,12 @@ pub(crate) fn mul_rows_with_decomposed_rhs<P: Poly + 'static>(
             )));
         let term_tail_subcircuit_ids = (1..term_batch_capacity)
             .map(|tail_terms| {
-                helper_circuit.register_shared_sub_circuit(Arc::new(
-                    decomposed_term_batch_subcircuit(
-                        circuit,
-                        nested_rns.as_ref(),
-                        tail_terms,
-                        Arc::clone(&term_helper),
-                    ),
-                ))
+                helper_circuit.register_sub_circuit(Arc::new(decomposed_term_batch_subcircuit(
+                    circuit,
+                    nested_rns.as_ref(),
+                    tail_terms,
+                    Arc::clone(&term_helper),
+                )))
             })
             .collect::<Vec<_>>();
         let make_sparse_q_level_poly =

@@ -14,22 +14,6 @@ pub use carry_montgomery::*;
 pub use nested_rns::*;
 
 pub trait ModularArithmeticContext<P: Poly>: Clone + Debug + Send + Sync + 'static {
-    fn register_local_in(&self, circuit: &mut PolyCircuit<P>) -> Self;
-
-    fn register_shared_in(
-        &self,
-        source_circuit: &PolyCircuit<P>,
-        circuit: &mut PolyCircuit<P>,
-    ) -> Self;
-
-    fn register_shared_subcircuits_in(
-        &self,
-        source_circuit: &PolyCircuit<P>,
-        circuit: &mut PolyCircuit<P>,
-    ) -> Self {
-        self.register_shared_in(source_circuit, circuit)
-    }
-
     fn q_moduli_depth(&self) -> usize;
 
     fn decomposition_len(&self) -> usize;
@@ -86,21 +70,6 @@ pub trait ModularArithmeticGadget<P: Poly>: Clone + Debug + Send + Sync + 'stati
         p_max_traces: Vec<BigUint>,
         circuit: &mut PolyCircuit<P>,
     ) -> Self;
-
-    fn input_like_with_ctx(
-        template: &Self,
-        ctx: Arc<Self::Context>,
-        circuit: &mut PolyCircuit<P>,
-    ) -> Self {
-        Self::input_with_metadata(
-            ctx,
-            template.enable_levels(),
-            Some(template.level_offset()),
-            template.max_plaintexts().to_vec(),
-            template.p_max_traces().to_vec(),
-            circuit,
-        )
-    }
 
     fn active_q_moduli(&self) -> Vec<u64>;
 

@@ -124,10 +124,11 @@ fn q_level_diagonal_product_param_bindings<P: Poly, C: NegacyclicConvolutionCont
 }
 
 fn q_level_diagonal_product_subcircuit<P: Poly + 'static, C: NegacyclicConvolutionContext<P>>(
+    source_circuit: &PolyCircuit<P>,
     template_ctx: &C,
 ) -> PolyCircuit<P> {
-    let mut circuit = PolyCircuit::<P>::new();
-    let ctx = Arc::new(template_ctx.register_local_in(&mut circuit));
+    let mut circuit = source_circuit.fresh_sub_circuit();
+    let ctx = Arc::new(template_ctx.clone());
     let p_moduli_depth = ctx.q_level_row_width();
     let lhs_slot_transfer_param_ids = (0..p_moduli_depth)
         .map(|_| circuit.register_sub_circuit_param(SubCircuitParamKind::SlotTransfer))
@@ -206,6 +207,7 @@ where
 }
 
 fn diagonal_term_output_template<P, A, F>(
+    source_circuit: &PolyCircuit<P>,
     lhs: &A,
     rhs: &A,
     diagonal: usize,
@@ -218,10 +220,24 @@ where
     F: Fn(&A, &A, &mut PolyCircuit<P>) -> A,
     A::Context: NegacyclicConvolutionContext<P>,
 {
-    let mut template_circuit = PolyCircuit::<P>::new();
-    let template_ctx = Arc::new(lhs.context().register_local_in(&mut template_circuit));
-    let lhs_template = A::input_like_with_ctx(lhs, template_ctx.clone(), &mut template_circuit);
-    let rhs_template = A::input_like_with_ctx(rhs, template_ctx, &mut template_circuit);
+    let mut template_circuit = source_circuit.fresh_sub_circuit();
+    let template_ctx = lhs.context().clone();
+    let lhs_template = A::input_with_metadata(
+        template_ctx.clone(),
+        lhs.enable_levels(),
+        Some(lhs.level_offset()),
+        lhs.max_plaintexts().to_vec(),
+        lhs.p_max_traces().to_vec(),
+        &mut template_circuit,
+    );
+    let rhs_template = A::input_with_metadata(
+        template_ctx,
+        rhs.enable_levels(),
+        Some(rhs.level_offset()),
+        rhs.max_plaintexts().to_vec(),
+        rhs.p_max_traces().to_vec(),
+        &mut template_circuit,
+    );
     let lhs_diagonal =
         negacyclic_diagonal(&mut template_circuit, &lhs_template, diagonal, num_slots);
     let rhs_rotated =
@@ -230,6 +246,7 @@ where
 }
 
 pub(crate) fn negacyclic_conv_mul_right_decomposed_term_many_subcircuit<P: Poly + 'static>(
+    source_circuit: &PolyCircuit<P>,
     template_ctx: &impl NegacyclicConvolutionContext<P>,
     row_count: usize,
     num_slots: usize,
@@ -239,11 +256,13 @@ pub(crate) fn negacyclic_conv_mul_right_decomposed_term_many_subcircuit<P: Poly 
         "negacyclic_conv_mul_right_decomposed_term_many_subcircuit requires at least one left row"
     );
 
-    let mut circuit = PolyCircuit::<P>::new();
-    let ctx = Arc::new(template_ctx.register_local_in(&mut circuit));
+    let mut circuit = source_circuit.fresh_sub_circuit();
+    let ctx = Arc::new(template_ctx.clone());
     let p_moduli_depth = ctx.q_level_row_width();
-    let diagonal_product_id =
-        circuit.register_sub_circuit(q_level_diagonal_product_subcircuit::<P, _>(ctx.as_ref()));
+    let diagonal_product_id = circuit.register_sub_circuit(q_level_diagonal_product_subcircuit::<
+        P,
+        _,
+    >(source_circuit, ctx.as_ref()));
     let left_rows =
         (0..row_count).map(|_| circuit.input(p_moduli_depth).to_vec()).collect::<Vec<_>>();
     let term_row = circuit.input(p_moduli_depth).to_vec();
@@ -294,11 +313,13 @@ pub(crate) fn negacyclic_conv_mul_right_decomposed_term_many_shared_subcircuit<
         "negacyclic_conv_mul_right_decomposed_term_many_shared_subcircuit requires at least one left row"
     );
 
-    let mut circuit = PolyCircuit::<P>::new();
-    let ctx = Arc::new(template_ctx.register_shared_in(source_circuit, &mut circuit));
+    let mut circuit = source_circuit.fresh_sub_circuit();
+    let ctx = Arc::new(template_ctx.clone());
     let p_moduli_depth = ctx.q_level_row_width();
-    let diagonal_product_id =
-        circuit.register_sub_circuit(q_level_diagonal_product_subcircuit::<P, _>(ctx.as_ref()));
+    let diagonal_product_id = circuit.register_sub_circuit(q_level_diagonal_product_subcircuit::<
+        P,
+        _,
+    >(source_circuit, ctx.as_ref()));
     let left_rows =
         (0..row_count).map(|_| circuit.input(p_moduli_depth).to_vec()).collect::<Vec<_>>();
     let term_row = circuit.input(p_moduli_depth).to_vec();
@@ -355,6 +376,7 @@ where
         .into_par_iter()
         .map(|diagonal| {
             diagonal_term_output_template(
+                circuit,
                 lhs,
                 rhs,
                 diagonal,
@@ -363,8 +385,9 @@ where
             )
         })
         .collect::<Vec<_>>();
-    let diagonal_product_id = circuit
-        .register_sub_circuit(q_level_diagonal_product_subcircuit::<P, _>(lhs.context().as_ref()));
+    let diagonal_product_subcircuit =
+        q_level_diagonal_product_subcircuit::<P, _>(circuit, lhs.context().as_ref());
+    let diagonal_product_id = circuit.register_sub_circuit(diagonal_product_subcircuit);
     debug!(
         "negacyclic_conv_mul prepared {} diagonal templates in parallel: num_slots={}, active_levels={}, elapsed_ms={}",
         diagonal_output_templates.len(),
@@ -431,13 +454,15 @@ where
         rhs_q_idx,
         active_levels
     );
-    let diagonal_product_id = circuit
-        .register_sub_circuit(q_level_diagonal_product_subcircuit::<P, _>(lhs.context().as_ref()));
+    let diagonal_product_subcircuit =
+        q_level_diagonal_product_subcircuit::<P, _>(circuit, lhs.context().as_ref());
+    let diagonal_product_id = circuit.register_sub_circuit(diagonal_product_subcircuit);
     let shared_inputs = vec![lhs.q_level_row_batch(rhs_q_idx), rhs.q_level_row_batch(rhs_q_idx)];
     let diagonal_output_templates = (0..num_slots)
         .into_par_iter()
         .map(|diagonal| {
             diagonal_term_output_template(
+                circuit,
                 lhs,
                 rhs,
                 diagonal,

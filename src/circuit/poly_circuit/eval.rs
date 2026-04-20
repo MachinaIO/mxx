@@ -46,7 +46,7 @@ impl<P: Poly> PolyCircuit<P> {
 
     fn max_sub_circuit_calls(&self) -> usize {
         let mut max_calls = self.next_scoped_call_id;
-        for sub_id in self.sub_circuits.keys().copied() {
+        for sub_id in self.direct_sub_circuit_ids() {
             let sub_max_calls = self.with_sub_circuit(sub_id, |sub| sub.max_sub_circuit_calls());
             max_calls = max_calls.max(sub_max_calls);
         }
@@ -55,7 +55,7 @@ impl<P: Poly> PolyCircuit<P> {
 
     fn max_gate_count(&self) -> usize {
         let mut max_gates = self.gates.len();
-        for sub_id in self.sub_circuits.keys().copied() {
+        for sub_id in self.direct_sub_circuit_ids() {
             let sub_max_gates = self.with_sub_circuit(sub_id, |sub| sub.max_gate_count());
             max_gates = max_gates.max(sub_max_gates);
         }

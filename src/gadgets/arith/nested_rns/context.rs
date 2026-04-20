@@ -268,40 +268,6 @@ impl NestedRnsPolyContext {
         }
     }
 
-    fn register_shared_support_subcircuits<P: Poly + 'static>(
-        &self,
-        source_circuit: &PolyCircuit<P>,
-        circuit: &mut PolyCircuit<P>,
-    ) -> NestedRnsRegisteredSubcircuitIds {
-        circuit.inherit_registries_from_parent(source_circuit);
-        NestedRnsRegisteredSubcircuitIds {
-            add_without_reduce_id: circuit.register_shared_sub_circuit(
-                source_circuit.registered_sub_circuit_ref(self.add_without_reduce_id),
-            ),
-            sub_with_trace_offsets_id: circuit.register_shared_sub_circuit(
-                source_circuit.registered_sub_circuit_ref(self.sub_with_trace_offsets_id),
-            ),
-            lazy_reduce_id: circuit.register_shared_sub_circuit(
-                source_circuit.registered_sub_circuit_ref(self.lazy_reduce_id),
-            ),
-            decomposition_terms_id: circuit.register_shared_sub_circuit(
-                source_circuit.registered_sub_circuit_ref(self.decomposition_terms_id),
-            ),
-            gadget_decompose_id: circuit.register_shared_sub_circuit(
-                source_circuit.registered_sub_circuit_ref(self.gadget_decompose_id),
-            ),
-            full_reduce_id: circuit.register_shared_sub_circuit(
-                source_circuit.registered_sub_circuit_ref(self.full_reduce_id),
-            ),
-            mul_lazy_reduce_id: circuit.register_shared_sub_circuit(
-                source_circuit.registered_sub_circuit_ref(self.mul_lazy_reduce_id),
-            ),
-            mul_right_sparse_id: circuit.register_shared_sub_circuit(
-                source_circuit.registered_sub_circuit_ref(self.mul_right_sparse_id),
-            ),
-        }
-    }
-
     pub fn setup<P: Poly + 'static>(
         circuit: &mut PolyCircuit<P>,
         params: &P::Params,
@@ -379,10 +345,6 @@ impl NestedRnsPolyContext {
                 p_over_pis,
                 gadget_values,
                 full_reduce_max_plaintexts,
-                lut_mod_p_ids,
-                lut_x_to_y_ids,
-                lut_x_to_real_ids,
-                lut_real_to_v_id,
                 add_without_reduce_id: registered_ids.add_without_reduce_id,
                 sub_with_trace_offsets_id: registered_ids.sub_with_trace_offsets_id,
                 lazy_reduce_id: registered_ids.lazy_reduce_id,
@@ -565,103 +527,6 @@ impl NestedRnsPolyContext {
             p_over_pis,
             gadget_values,
             full_reduce_max_plaintexts,
-            lut_mod_p_ids,
-            lut_x_to_y_ids,
-            lut_x_to_real_ids,
-            lut_real_to_v_id,
-            add_without_reduce_id: registered_ids.add_without_reduce_id,
-            sub_with_trace_offsets_id: registered_ids.sub_with_trace_offsets_id,
-            lazy_reduce_id: registered_ids.lazy_reduce_id,
-            decomposition_terms_id: registered_ids.decomposition_terms_id,
-            gadget_decompose_id: registered_ids.gadget_decompose_id,
-            full_reduce_id: registered_ids.full_reduce_id,
-            full_reduce_bindings,
-            mul_lazy_reduce_id: registered_ids.mul_lazy_reduce_id,
-            mul_right_sparse_id: registered_ids.mul_right_sparse_id,
-        }
-    }
-
-    pub(crate) fn register_subcircuits_in<P: Poly + 'static>(
-        &self,
-        circuit: &mut PolyCircuit<P>,
-    ) -> Self {
-        let p_moduli = self.p_moduli.clone();
-        let q_moduli_depth = self.q_moduli_depth;
-        let registered_ids = Self::register_local_support_subcircuits::<P>(
-            circuit,
-            &p_moduli,
-            &self.lut_mod_p_ids,
-            &self.lut_x_to_y_ids,
-            &self.lut_x_to_real_ids,
-            self.lut_real_to_v_id,
-        );
-        let full_reduce_bindings = build_full_reduce_bindings(
-            &p_moduli,
-            &self.q_moduli[..q_moduli_depth],
-            &self.p_full,
-            &self.p_over_pis,
-        );
-        Self {
-            p_moduli_bits: self.p_moduli_bits,
-            max_unreduced_muls: self.max_unreduced_muls,
-            scale: self.scale,
-            p_moduli,
-            q_moduli: self.q_moduli.clone(),
-            q_moduli_depth,
-            p_max: self.p_max,
-            lut_mod_p_max_map_size: self.lut_mod_p_max_map_size.clone(),
-            p_full: self.p_full.clone(),
-            p_over_pis: self.p_over_pis.clone(),
-            gadget_values: self.gadget_values.clone(),
-            full_reduce_max_plaintexts: self.full_reduce_max_plaintexts.clone(),
-            lut_mod_p_ids: self.lut_mod_p_ids.clone(),
-            lut_x_to_y_ids: self.lut_x_to_y_ids.clone(),
-            lut_x_to_real_ids: self.lut_x_to_real_ids.clone(),
-            lut_real_to_v_id: self.lut_real_to_v_id,
-            add_without_reduce_id: registered_ids.add_without_reduce_id,
-            sub_with_trace_offsets_id: registered_ids.sub_with_trace_offsets_id,
-            lazy_reduce_id: registered_ids.lazy_reduce_id,
-            decomposition_terms_id: registered_ids.decomposition_terms_id,
-            gadget_decompose_id: registered_ids.gadget_decompose_id,
-            full_reduce_id: registered_ids.full_reduce_id,
-            full_reduce_bindings,
-            mul_lazy_reduce_id: registered_ids.mul_lazy_reduce_id,
-            mul_right_sparse_id: registered_ids.mul_right_sparse_id,
-        }
-    }
-
-    pub(crate) fn register_shared_subcircuits_in<P: Poly + 'static>(
-        &self,
-        source_circuit: &PolyCircuit<P>,
-        circuit: &mut PolyCircuit<P>,
-    ) -> Self {
-        let p_moduli = self.p_moduli.clone();
-        let q_moduli_depth = self.q_moduli_depth;
-        let registered_ids = self.register_shared_support_subcircuits(source_circuit, circuit);
-        let full_reduce_bindings = build_full_reduce_bindings(
-            &p_moduli,
-            &self.q_moduli[..q_moduli_depth],
-            &self.p_full,
-            &self.p_over_pis,
-        );
-
-        Self {
-            p_moduli_bits: self.p_moduli_bits,
-            max_unreduced_muls: self.max_unreduced_muls,
-            scale: self.scale,
-            p_moduli,
-            q_moduli: self.q_moduli.clone(),
-            q_moduli_depth,
-            p_max: self.p_max,
-            lut_mod_p_max_map_size: self.lut_mod_p_max_map_size.clone(),
-            p_full: self.p_full.clone(),
-            p_over_pis: self.p_over_pis.clone(),
-            gadget_values: self.gadget_values.clone(),
-            full_reduce_max_plaintexts: self.full_reduce_max_plaintexts.clone(),
-            lut_mod_p_ids: self.lut_mod_p_ids.clone(),
-            lut_x_to_y_ids: self.lut_x_to_y_ids.clone(),
-            lut_x_to_real_ids: self.lut_x_to_real_ids.clone(),
-            lut_real_to_v_id: self.lut_real_to_v_id,
             add_without_reduce_id: registered_ids.add_without_reduce_id,
             sub_with_trace_offsets_id: registered_ids.sub_with_trace_offsets_id,
             lazy_reduce_id: registered_ids.lazy_reduce_id,
@@ -905,18 +770,6 @@ impl NestedRnsPolyContext {
 }
 
 impl<P: Poly + 'static> ModularArithmeticContext<P> for NestedRnsPolyContext {
-    fn register_local_in(&self, circuit: &mut PolyCircuit<P>) -> Self {
-        self.register_subcircuits_in(circuit)
-    }
-
-    fn register_shared_in(
-        &self,
-        source_circuit: &PolyCircuit<P>,
-        circuit: &mut PolyCircuit<P>,
-    ) -> Self {
-        self.register_shared_subcircuits_in(source_circuit, circuit)
-    }
-
     fn q_moduli_depth(&self) -> usize {
         self.q_moduli_depth
     }

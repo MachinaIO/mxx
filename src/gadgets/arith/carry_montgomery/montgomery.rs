@@ -587,18 +587,6 @@ impl<P: Poly + 'static> MontgomeryPoly<P> {
 }
 
 impl<P: Poly + 'static> ModularArithmeticContext<P> for MontgomeryPolyContext<P> {
-    fn register_local_in(&self, _circuit: &mut PolyCircuit<P>) -> Self {
-        self.clone()
-    }
-
-    fn register_shared_in(
-        &self,
-        _source_circuit: &PolyCircuit<P>,
-        _circuit: &mut PolyCircuit<P>,
-    ) -> Self {
-        self.clone()
-    }
-
     fn q_moduli_depth(&self) -> usize {
         self.q_moduli.len()
     }

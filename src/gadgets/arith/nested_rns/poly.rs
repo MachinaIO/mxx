@@ -125,23 +125,6 @@ impl<P: Poly> NestedRnsPoly<P> {
             .with_p_max_traces(p_max_traces)
     }
 
-    /// Allocate a fresh input that matches another nested-RNS value's metadata but uses a new
-    /// context.
-    pub(crate) fn input_like_with_ctx(
-        template: &Self,
-        ctx: Arc<NestedRnsPolyContext>,
-        circuit: &mut PolyCircuit<P>,
-    ) -> Self {
-        Self::input_with_metadata(
-            ctx,
-            template.enable_levels,
-            Some(template.level_offset),
-            template.max_plaintexts.clone(),
-            template.p_max_traces.clone(),
-            circuit,
-        )
-    }
-
     fn planner_metadata(&self) -> NestedRnsPlannerMetadata {
         NestedRnsPlannerMetadata {
             max_plaintexts: self.max_plaintexts.clone(),
@@ -642,6 +625,7 @@ impl<P: Poly> NestedRnsPoly<P> {
         let row_count = prepared_left_rows.len();
 
         let term_subcircuit = negacyclic_conv_mul_right_decomposed_term_many_subcircuit::<P>(
+            circuit,
             right.ctx.as_ref(),
             row_count,
             num_slots,
@@ -654,6 +638,7 @@ impl<P: Poly> NestedRnsPoly<P> {
                 let global_idx = flat_idx % gadget_len;
                 let left = &prepared_left_rows[row_idx][global_idx];
                 Self::conv_mul_right_decomposed_output_template(
+                    circuit,
                     params,
                     left,
                     global_idx / chunk_width,
@@ -773,6 +758,7 @@ impl<P: Poly> NestedRnsPoly<P> {
     }
 
     fn conv_mul_right_decomposed_output_template(
+        source_circuit: &PolyCircuit<P>,
         params: &P::Params,
         left: &Self,
         target_q_idx: usize,
@@ -782,9 +768,16 @@ impl<P: Poly> NestedRnsPoly<P> {
     where
         P: 'static,
     {
-        let mut template_circuit = PolyCircuit::<P>::new();
-        let template_ctx = Arc::new(left.ctx.register_subcircuits_in(&mut template_circuit));
-        let lhs = Self::input_like_with_ctx(left, template_ctx.clone(), &mut template_circuit);
+        let mut template_circuit = source_circuit.fresh_sub_circuit();
+        let template_ctx = left.ctx.clone();
+        let lhs = Self::input_with_metadata(
+            template_ctx.clone(),
+            left.enable_levels,
+            Some(left.level_offset),
+            left.max_plaintexts.clone(),
+            left.p_max_traces.clone(),
+            &mut template_circuit,
+        );
         let rhs = Self::sparse_decomposed_term_input_template(
             template_ctx,
             lhs.enable_levels,

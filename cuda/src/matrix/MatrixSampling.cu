@@ -210,6 +210,9 @@ __device__ __forceinline__ int64_t centered_residue_i64(uint64_t value, uint64_t
 __global__ void matrix_sample_distribution_multi_limb_kernel(
     uint8_t *dst_base,
     size_t poly_count,
+    size_t local_ncol,
+    size_t full_ncol,
+    size_t col_offset,
     size_t n,
     size_t dst_stride_bytes,
     uint8_t dst_coeff_bytes,
@@ -225,8 +228,11 @@ __global__ void matrix_sample_distribution_multi_limb_kernel(
     {
         return;
     }
-    const size_t poly_idx = idx / n;
-    const size_t coeff_idx = idx - poly_idx * n;
+    const size_t local_poly_idx = idx / n;
+    const size_t coeff_idx = idx - local_poly_idx * n;
+    const size_t row_idx = local_poly_idx / local_ncol;
+    const size_t local_col_idx = local_poly_idx - row_idx * local_ncol;
+    const size_t global_poly_idx = row_idx * full_ncol + (col_offset + local_col_idx);
 
     uint64_t sample = 0;
     if (dist_type == GPU_MATRIX_DIST_UNIFORM)
@@ -235,7 +241,7 @@ __global__ void matrix_sample_distribution_multi_limb_kernel(
         rng_init(
             rng,
             seed,
-            static_cast<uint64_t>(poly_idx + 1),
+            static_cast<uint64_t>(global_poly_idx + 1),
             static_cast<uint64_t>(coeff_idx + 1),
             static_cast<uint64_t>(limb_idx + 1),
             0x6f70656e66686531ULL);
@@ -247,7 +253,7 @@ __global__ void matrix_sample_distribution_multi_limb_kernel(
         rng_init(
             rng,
             seed,
-            static_cast<uint64_t>(poly_idx + 1),
+            static_cast<uint64_t>(global_poly_idx + 1),
             static_cast<uint64_t>(coeff_idx + 1),
             0,
             0x6f70656e66686532ULL);
@@ -260,7 +266,7 @@ __global__ void matrix_sample_distribution_multi_limb_kernel(
         rng_init(
             rng,
             seed,
-            static_cast<uint64_t>(poly_idx + 1),
+            static_cast<uint64_t>(global_poly_idx + 1),
             static_cast<uint64_t>(coeff_idx + 1),
             0,
             0x6f70656e66686533ULL);
@@ -272,7 +278,7 @@ __global__ void matrix_sample_distribution_multi_limb_kernel(
         rng_init(
             rng,
             seed,
-            static_cast<uint64_t>(poly_idx + 1),
+            static_cast<uint64_t>(global_poly_idx + 1),
             static_cast<uint64_t>(coeff_idx + 1),
             0,
             0x6f70656e66686534ULL);
@@ -283,7 +289,7 @@ __global__ void matrix_sample_distribution_multi_limb_kernel(
 
     matrix_store_limb_u64(
         dst_base,
-        poly_idx,
+        local_poly_idx,
         coeff_idx,
         dst_stride_bytes,
         dst_coeff_bytes,
@@ -293,6 +299,9 @@ __global__ void matrix_sample_distribution_multi_limb_kernel(
 int launch_sample_distribution_multi_limb_kernel(
     uint8_t *dst_base,
     size_t poly_count,
+    size_t local_ncol,
+    size_t full_ncol,
+    size_t col_offset,
     size_t n,
     size_t dst_stride_bytes,
     uint8_t dst_coeff_bytes,
@@ -320,6 +329,9 @@ int launch_sample_distribution_multi_limb_kernel(
     matrix_sample_distribution_multi_limb_kernel<<<blocks, threads, 0, stream>>>(
         dst_base,
         poly_count,
+        local_ncol,
+        full_ncol,
+        col_offset,
         n,
         dst_stride_bytes,
         dst_coeff_bytes,
@@ -336,12 +348,13 @@ int launch_sample_distribution_multi_limb_kernel(
     return 0;
 }
 
-
-extern "C" int gpu_matrix_sample_distribution(
+static int gpu_matrix_sample_distribution_impl(
     GpuMatrix *out,
     int dist_type,
     double sigma,
-    uint64_t seed)
+    uint64_t seed,
+    size_t full_ncol,
+    size_t col_offset)
 {
     if (!out)
     {
@@ -354,6 +367,10 @@ extern "C" int gpu_matrix_sample_distribution(
     if (dist_type == GPU_MATRIX_DIST_GAUSS && !(sigma > 0.0))
     {
         return set_error("sigma must be positive in gpu_matrix_sample_distribution");
+    }
+    if (col_offset > full_ncol || out->cols > full_ncol - col_offset)
+    {
+        return set_error("column range out of bounds in gpu_matrix_sample_distribution");
     }
 
     const size_t count = out->rows * out->cols;
@@ -417,6 +434,9 @@ extern "C" int gpu_matrix_sample_distribution(
         status = launch_sample_distribution_multi_limb_kernel(
             dst_base,
             count,
+            out->cols,
+            full_ncol,
+            col_offset,
             static_cast<size_t>(out->ctx->N),
             dst_stride_bytes,
             dst_coeff_bytes,
@@ -447,4 +467,25 @@ extern "C" int gpu_matrix_sample_distribution(
     }
     out->format = GPU_POLY_FORMAT_EVAL;
     return 0;
+}
+
+
+extern "C" int gpu_matrix_sample_distribution(
+    GpuMatrix *out,
+    int dist_type,
+    double sigma,
+    uint64_t seed)
+{
+    return gpu_matrix_sample_distribution_impl(out, dist_type, sigma, seed, out ? out->cols : 0, 0);
+}
+
+extern "C" int gpu_matrix_sample_distribution_columns(
+    GpuMatrix *out,
+    int dist_type,
+    double sigma,
+    uint64_t seed,
+    size_t full_ncol,
+    size_t col_offset)
+{
+    return gpu_matrix_sample_distribution_impl(out, dist_type, sigma, seed, full_ncol, col_offset);
 }

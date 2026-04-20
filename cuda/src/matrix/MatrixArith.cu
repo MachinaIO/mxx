@@ -134,6 +134,60 @@ namespace
         matrix_store_limb_u64(dst_base, dst_poly_idx, coeff_idx, dst_stride, dst_bytes, value);
     }
 
+    __global__ void block_add_rect_all_limbs_kernel(
+        const uint8_t *const *src_bases,
+        uint8_t *const *dst_bases,
+        const size_t *src_stride_bytes,
+        const size_t *dst_stride_bytes,
+        const uint8_t *src_coeff_bytes,
+        const uint8_t *dst_coeff_bytes,
+        const uint64_t *moduli,
+        size_t limb_count,
+        size_t add_rows,
+        size_t add_cols,
+        size_t n,
+        size_t src_cols,
+        size_t dst_cols,
+        size_t src_row,
+        size_t src_col,
+        size_t dst_row,
+        size_t dst_col)
+    {
+        const size_t limb_idx = static_cast<size_t>(blockIdx.z);
+        if (limb_idx >= limb_count)
+        {
+            return;
+        }
+        const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        const size_t total_poly = add_rows * add_cols;
+        const size_t total = total_poly * n;
+        if (idx >= total)
+        {
+            return;
+        }
+
+        const size_t poly_offset = idx / n;
+        const size_t coeff_idx = idx - poly_offset * n;
+        const size_t local_row = poly_offset / add_cols;
+        const size_t local_col = poly_offset - local_row * add_cols;
+        const size_t src_poly_idx = (src_row + local_row) * src_cols + (src_col + local_col);
+        const size_t dst_poly_idx = (dst_row + local_row) * dst_cols + (dst_col + local_col);
+
+        const size_t src_stride = src_stride_bytes[limb_idx];
+        const size_t dst_stride = dst_stride_bytes[limb_idx];
+        const uint8_t src_bytes = src_coeff_bytes[limb_idx];
+        const uint8_t dst_bytes = dst_coeff_bytes[limb_idx];
+        const uint8_t *src_base = src_bases[limb_idx];
+        uint8_t *dst_base = dst_bases[limb_idx];
+        const uint64_t modulus = moduli[limb_idx];
+        const uint64_t src_value =
+            matrix_load_limb_u64(src_base, src_poly_idx, coeff_idx, src_stride, src_bytes);
+        const uint64_t dst_value =
+            matrix_load_limb_u64(dst_base, dst_poly_idx, coeff_idx, dst_stride, dst_bytes);
+        const uint64_t sum = add_mod_u64(dst_value, src_value, modulus);
+        matrix_store_limb_u64(dst_base, dst_poly_idx, coeff_idx, dst_stride, dst_bytes, sum);
+    }
+
     __global__ void block_matmul_kernel(
         const uint8_t *lhs_base,
         const uint8_t *rhs_base,
@@ -463,6 +517,73 @@ namespace
             limb_count,
             copy_rows,
             copy_cols,
+            n,
+            src_cols,
+            dst_cols,
+            src_row,
+            src_col,
+            dst_row,
+            dst_col);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        return 0;
+    }
+
+    int launch_add_block_kernel_all_limbs(
+        const uint8_t *const *src_bases,
+        uint8_t *const *dst_bases,
+        const size_t *src_stride_bytes,
+        const size_t *dst_stride_bytes,
+        const uint8_t *src_coeff_bytes,
+        const uint8_t *dst_coeff_bytes,
+        const uint64_t *moduli,
+        size_t limb_count,
+        size_t n,
+        size_t src_cols,
+        size_t dst_cols,
+        size_t src_row,
+        size_t src_col,
+        size_t dst_row,
+        size_t dst_col,
+        size_t add_rows,
+        size_t add_cols,
+        cudaStream_t stream)
+    {
+        if (!src_bases || !dst_bases || !src_stride_bytes || !dst_stride_bytes ||
+            !src_coeff_bytes || !dst_coeff_bytes || !moduli)
+        {
+            return set_error("null metadata pointer in launch_add_block_kernel_all_limbs");
+        }
+        if (limb_count == 0 || add_rows == 0 || add_cols == 0 || n == 0)
+        {
+            return 0;
+        }
+        if (src_cols == 0 || dst_cols == 0)
+        {
+            return set_error("invalid matrix shape in launch_add_block_kernel_all_limbs");
+        }
+
+        const int threads = 256;
+        const size_t total = add_rows * add_cols * n;
+        const dim3 blocks(
+            static_cast<unsigned int>((total + static_cast<size_t>(threads) - 1) /
+                                      static_cast<size_t>(threads)),
+            1u,
+            static_cast<unsigned int>(limb_count));
+        block_add_rect_all_limbs_kernel<<<blocks, threads, 0, stream>>>(
+            src_bases,
+            dst_bases,
+            src_stride_bytes,
+            dst_stride_bytes,
+            src_coeff_bytes,
+            dst_coeff_bytes,
+            moduli,
+            limb_count,
+            add_rows,
+            add_cols,
             n,
             src_cols,
             dst_cols,
@@ -2036,6 +2157,354 @@ namespace
     }
 
     template <typename T>
+    int launch_add_block_for_all_limbs(
+        GpuMatrix *out,
+        const GpuMatrix *src,
+        size_t src_row,
+        size_t src_col,
+        size_t dst_row,
+        size_t dst_col,
+        size_t add_rows,
+        size_t add_cols,
+        size_t src_cols,
+        size_t dst_cols,
+        size_t n,
+        int level)
+    {
+        if constexpr (!std::is_same_v<T, uint64_t>)
+        {
+            return set_error("unsupported limb type in launch_add_block_for_all_limbs");
+        }
+        if (add_rows == 0 || add_cols == 0 || n == 0)
+        {
+            return 0;
+        }
+        if (level < 0)
+        {
+            return set_error("invalid level in launch_add_block_for_all_limbs");
+        }
+        if (!src || !out || !src->ctx)
+        {
+            return set_error("invalid matrix arguments in launch_add_block_for_all_limbs");
+        }
+
+        const size_t limb_count = static_cast<size_t>(level + 1);
+        auto &limb_map = src->ctx->limb_gpu_ids;
+        if (limb_map.size() < limb_count)
+        {
+            return set_error("unexpected limb mapping size in launch_add_block_for_all_limbs");
+        }
+        if (src->ctx->moduli.size() < limb_count)
+        {
+            return set_error("unexpected modulus count in launch_add_block_for_all_limbs");
+        }
+
+        std::vector<dim3> active_limb_ids(limb_count);
+        std::vector<const uint8_t *> src_bases(limb_count, nullptr);
+        std::vector<uint8_t *> dst_bases(limb_count, nullptr);
+        std::vector<size_t> src_stride_bytes(limb_count, 0);
+        std::vector<size_t> dst_stride_bytes(limb_count, 0);
+        std::vector<uint8_t> src_coeff_bytes(limb_count, 0);
+        std::vector<uint8_t> dst_coeff_bytes(limb_count, 0);
+        std::vector<uint64_t> moduli(limb_count, 0);
+
+        int dispatch_device = -1;
+        cudaStream_t dispatch_stream = nullptr;
+        int status = 0;
+        for (int limb = 0; limb <= level; ++limb)
+        {
+            const size_t limb_idx = static_cast<size_t>(limb);
+            const dim3 limb_id = limb_map[limb_idx];
+            active_limb_ids[limb_idx] = limb_id;
+
+            int src_device = -1;
+            int dst_device = -1;
+            status = matrix_limb_device(src, limb_id, &src_device);
+            if (status != 0)
+            {
+                return status;
+            }
+            status = matrix_limb_device(out, limb_id, &dst_device);
+            if (status != 0)
+            {
+                return status;
+            }
+            if (src_device != dst_device)
+            {
+                return set_error("source/destination device mismatch in launch_add_block_for_all_limbs");
+            }
+
+            if (limb == 0)
+            {
+                dispatch_device = dst_device;
+                status = matrix_limb_stream(out, limb_id, &dispatch_stream);
+                if (status != 0)
+                {
+                    return status;
+                }
+                if (!dispatch_stream)
+                {
+                    return set_error("null dispatch stream in launch_add_block_for_all_limbs");
+                }
+            }
+            else if (dst_device != dispatch_device)
+            {
+                return set_error(
+                    "single-device path requires all limbs on one device in launch_add_block_for_all_limbs");
+            }
+
+            const uint8_t *src_base = matrix_limb_ptr_by_id(src, 0, limb_id);
+            uint8_t *dst_base = matrix_limb_ptr_by_id(out, 0, limb_id);
+            if (!src_base || !dst_base)
+            {
+                return set_error("null limb base pointer in launch_add_block_for_all_limbs");
+            }
+            if (!matrix_limb_metadata_by_id(src, limb_id, &src_stride_bytes[limb_idx], &src_coeff_bytes[limb_idx]) ||
+                !matrix_limb_metadata_by_id(out, limb_id, &dst_stride_bytes[limb_idx], &dst_coeff_bytes[limb_idx]))
+            {
+                return set_error("invalid matrix limb metadata in launch_add_block_for_all_limbs");
+            }
+            if (src_coeff_bytes[limb_idx] != dst_coeff_bytes[limb_idx])
+            {
+                return set_error("inconsistent limb byte-width in launch_add_block_for_all_limbs");
+            }
+
+            src_bases[limb_idx] = src_base;
+            dst_bases[limb_idx] = dst_base;
+            moduli[limb_idx] = src->ctx->moduli[limb_idx];
+        }
+        if (dispatch_device < 0 || !dispatch_stream)
+        {
+            return set_error("invalid dispatch metadata in launch_add_block_for_all_limbs");
+        }
+
+        cudaError_t err = cudaSetDevice(dispatch_device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        for (size_t limb_idx = 0; limb_idx < limb_count; ++limb_idx)
+        {
+            const dim3 limb_id = active_limb_ids[limb_idx];
+            status = matrix_wait_limb_stream(src, limb_id, dispatch_device, dispatch_stream);
+            if (status != 0)
+            {
+                return status;
+            }
+            status = matrix_wait_limb_stream(out, limb_id, dispatch_device, dispatch_stream);
+            if (status != 0)
+            {
+                return status;
+            }
+        }
+
+        const size_t ptr_bytes = limb_count * sizeof(uint8_t *);
+        const size_t stride_bytes = limb_count * sizeof(size_t);
+        const size_t coeff_bytes_bytes = limb_count * sizeof(uint8_t);
+        const size_t modulus_bytes = limb_count * sizeof(uint64_t);
+        const uint8_t **src_bases_device = nullptr;
+        uint8_t **dst_bases_device = nullptr;
+        size_t *src_stride_bytes_device = nullptr;
+        size_t *dst_stride_bytes_device = nullptr;
+        uint8_t *src_coeff_bytes_device = nullptr;
+        uint8_t *dst_coeff_bytes_device = nullptr;
+        uint64_t *moduli_device = nullptr;
+        auto cleanup = [&]()
+        {
+            if (dispatch_device >= 0)
+            {
+                cudaSetDevice(dispatch_device);
+            }
+            if (moduli_device)
+            {
+                cudaFreeAsync(moduli_device, dispatch_stream);
+                moduli_device = nullptr;
+            }
+            if (dst_coeff_bytes_device)
+            {
+                cudaFreeAsync(dst_coeff_bytes_device, dispatch_stream);
+                dst_coeff_bytes_device = nullptr;
+            }
+            if (src_coeff_bytes_device)
+            {
+                cudaFreeAsync(src_coeff_bytes_device, dispatch_stream);
+                src_coeff_bytes_device = nullptr;
+            }
+            if (dst_stride_bytes_device)
+            {
+                cudaFreeAsync(dst_stride_bytes_device, dispatch_stream);
+                dst_stride_bytes_device = nullptr;
+            }
+            if (src_stride_bytes_device)
+            {
+                cudaFreeAsync(src_stride_bytes_device, dispatch_stream);
+                src_stride_bytes_device = nullptr;
+            }
+            if (dst_bases_device)
+            {
+                cudaFreeAsync(dst_bases_device, dispatch_stream);
+                dst_bases_device = nullptr;
+            }
+            if (src_bases_device)
+            {
+                cudaFreeAsync(const_cast<uint8_t **>(src_bases_device), dispatch_stream);
+                src_bases_device = nullptr;
+            }
+        };
+
+        err = cudaMallocAsync(reinterpret_cast<void **>(&src_bases_device), ptr_bytes, dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMallocAsync(reinterpret_cast<void **>(&dst_bases_device), ptr_bytes, dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMallocAsync(reinterpret_cast<void **>(&src_stride_bytes_device), stride_bytes, dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMallocAsync(reinterpret_cast<void **>(&dst_stride_bytes_device), stride_bytes, dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMallocAsync(reinterpret_cast<void **>(&src_coeff_bytes_device), coeff_bytes_bytes, dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMallocAsync(reinterpret_cast<void **>(&dst_coeff_bytes_device), coeff_bytes_bytes, dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMallocAsync(reinterpret_cast<void **>(&moduli_device), modulus_bytes, dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+
+        err = cudaMemcpyAsync(src_bases_device, src_bases.data(), ptr_bytes, cudaMemcpyHostToDevice, dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(dst_bases_device, dst_bases.data(), ptr_bytes, cudaMemcpyHostToDevice, dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(
+            src_stride_bytes_device,
+            src_stride_bytes.data(),
+            stride_bytes,
+            cudaMemcpyHostToDevice,
+            dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(
+            dst_stride_bytes_device,
+            dst_stride_bytes.data(),
+            stride_bytes,
+            cudaMemcpyHostToDevice,
+            dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(
+            src_coeff_bytes_device,
+            src_coeff_bytes.data(),
+            coeff_bytes_bytes,
+            cudaMemcpyHostToDevice,
+            dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(
+            dst_coeff_bytes_device,
+            dst_coeff_bytes.data(),
+            coeff_bytes_bytes,
+            cudaMemcpyHostToDevice,
+            dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(moduli_device, moduli.data(), modulus_bytes, cudaMemcpyHostToDevice, dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+
+        status = launch_add_block_kernel_all_limbs(
+            src_bases_device,
+            dst_bases_device,
+            src_stride_bytes_device,
+            dst_stride_bytes_device,
+            src_coeff_bytes_device,
+            dst_coeff_bytes_device,
+            moduli_device,
+            limb_count,
+            n,
+            src_cols,
+            dst_cols,
+            src_row,
+            src_col,
+            dst_row,
+            dst_col,
+            add_rows,
+            add_cols,
+            dispatch_stream);
+        if (status != 0)
+        {
+            cleanup();
+            return status;
+        }
+
+        for (size_t limb_idx = 0; limb_idx < limb_count; ++limb_idx)
+        {
+            const dim3 limb_id = active_limb_ids[limb_idx];
+            status = matrix_track_limb_consumer(src, limb_id, dispatch_device, dispatch_stream);
+            if (status != 0)
+            {
+                cleanup();
+                return status;
+            }
+            status = matrix_record_limb_write(out, limb_id, dispatch_stream);
+            if (status != 0)
+            {
+                cleanup();
+                return status;
+            }
+        }
+
+        cleanup();
+        return 0;
+    }
+
+    template <typename T>
     int launch_matrix_equal_for_limb(
         const GpuMatrix *lhs,
         const GpuMatrix *rhs,
@@ -2223,6 +2692,82 @@ extern "C" int gpu_matrix_add(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     }
 
     out->format = GPU_POLY_FORMAT_EVAL;
+    return 0;
+}
+
+extern "C" int gpu_matrix_add_block(
+    GpuMatrix *out,
+    const GpuMatrix *src,
+    size_t dst_row,
+    size_t dst_col,
+    size_t src_row,
+    size_t src_col,
+    size_t rows,
+    size_t cols)
+{
+    if (!out || !src)
+    {
+        return set_error("invalid gpu_matrix_add_block arguments");
+    }
+    if (src_row + rows > src->rows || src_col + cols > src->cols)
+    {
+        return set_error("source bounds exceeded in gpu_matrix_add_block");
+    }
+    if (dst_row + rows > out->rows || dst_col + cols > out->cols)
+    {
+        return set_error("dest bounds exceeded in gpu_matrix_add_block");
+    }
+    if (src->ctx != out->ctx || src->level != out->level)
+    {
+        return set_error("context mismatch in gpu_matrix_add_block");
+    }
+    if (!src->ctx)
+    {
+        return set_error("null context in gpu_matrix_add_block");
+    }
+
+    if (rows == 0 || cols == 0)
+    {
+        out->format = src->format;
+        return 0;
+    }
+
+    const int level = src->level;
+    if (level < 0)
+    {
+        return set_error("invalid level in gpu_matrix_add_block");
+    }
+    const int N = src->ctx->N;
+    if (N <= 0)
+    {
+        out->format = src->format;
+        return 0;
+    }
+    auto &limb_map = src->ctx->limb_gpu_ids;
+    if (limb_map.size() < static_cast<size_t>(level + 1))
+    {
+        return set_error("unexpected limb mapping size in gpu_matrix_add_block");
+    }
+
+    int status = launch_add_block_for_all_limbs<uint64_t>(
+        out,
+        src,
+        src_row,
+        src_col,
+        dst_row,
+        dst_col,
+        rows,
+        cols,
+        src->cols,
+        out->cols,
+        static_cast<size_t>(N),
+        level);
+    if (status != 0)
+    {
+        return status;
+    }
+
+    out->format = src->format;
     return 0;
 }
 

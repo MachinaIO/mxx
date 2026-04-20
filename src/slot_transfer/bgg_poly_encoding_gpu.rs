@@ -1,12 +1,81 @@
 use super::*;
 use crate::poly::{PolyParams, dcrt::gpu::detected_gpu_device_ids};
 use rayon::prelude::*;
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 pub(super) struct GpuSlotTransferSharedByDevice<M: PolyMatrix> {
-    pub device_id: i32,
     pub params: <<M as PolyMatrix>::P as Poly>::Params,
     pub c_b0: M,
     pub out_pubkey_matrix: M,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct SlotTransferSlotBenchMeasurement {
+    pub latency: f64,
+    pub max_parallelism: u128,
+    pub total_time: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SlotTransferStageBenchMeasurement {
+    latency: f64,
+    max_parallelism: u128,
+    total_time: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SlotTransferTaskGroupBenchStats {
+    task_count: usize,
+    max_load_ms: f64,
+    max_compute_ms: f64,
+    max_store_ms: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum SlotTransferStage1Task {
+    B0Chunk { chunk_idx: usize },
+    GateChunk { chunk_idx: usize },
+    InputDirect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum SlotTransferStage1BenchGroup {
+    B0,
+    Gate,
+    InputDirect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct SlotTransferStage2Task {
+    chunk_idx: usize,
+}
+
+struct LoadedSlotTransferStage1Task<M: PolyMatrix> {
+    device_slot: usize,
+    task: SlotTransferStage1Task,
+    rhs_chunk: M,
+    load_ms: f64,
+}
+
+struct ComputedSlotTransferStage1Task {
+    task: SlotTransferStage1Task,
+    bytes: Vec<u8>,
+    load_ms: f64,
+    compute_ms: f64,
+}
+
+struct LoadedSlotTransferStage2Task<M: PolyMatrix> {
+    task: SlotTransferStage2Task,
+    lhs: M,
+    rhs_chunk: M,
+    load_ms: f64,
+}
+
+struct ComputedSlotTransferStage2Task {
+    task: SlotTransferStage2Task,
+    bytes: Vec<u8>,
+    load_ms: f64,
+    compute_ms: f64,
 }
 
 pub(super) fn effective_gpu_slot_parallelism(slot_parallelism: usize) -> usize {
@@ -32,23 +101,519 @@ fn prepare_slot_transfer_shared_by_device<M, HS>(
 ) -> Vec<GpuSlotTransferSharedByDevice<M>>
 where
     M: PolyMatrix,
-    HS: PolyHashSampler<[u8; 32], M = M>,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
 {
     slot_device_ids(slot_parallelism)
-        .into_iter()
+        .into_par_iter()
         .map(|device_id| {
             let local_params = params.params_for_device(device_id);
             let out_pubkey =
                 evaluator.output_pubkey_for_params(&local_params, secret_size, gate_id);
             let c_b0 = M::from_compact_bytes(&local_params, &evaluator.c_b0_bytes);
             GpuSlotTransferSharedByDevice {
-                device_id,
                 params: local_params,
                 c_b0,
                 out_pubkey_matrix: out_pubkey.matrix,
             }
         })
         .collect()
+}
+
+fn assign_tasks_with_affinity<T, K, F>(
+    tasks: Vec<T>,
+    device_count: usize,
+    affinity_key: F,
+) -> Vec<Vec<T>>
+where
+    K: Eq + std::hash::Hash + Copy,
+    F: Fn(&T) -> K,
+{
+    let mut per_device = (0..device_count).map(|_| Vec::new()).collect::<Vec<_>>();
+    let mut device_loads = vec![0usize; device_count];
+    let mut preferred_device_by_key = HashMap::<K, usize>::new();
+
+    for task in tasks {
+        let key = affinity_key(&task);
+        let min_load = device_loads.iter().copied().min().expect("device_count must be positive");
+        let preferred = preferred_device_by_key.get(&key).copied();
+        let chosen_device = preferred
+            .filter(|&device_slot| device_loads[device_slot] == min_load)
+            .unwrap_or_else(|| {
+                device_loads
+                    .iter()
+                    .position(|&load| load == min_load)
+                    .expect("at least one device must have the minimum load")
+            });
+        device_loads[chosen_device] += 1;
+        preferred_device_by_key.entry(key).or_insert(chosen_device);
+        per_device[chosen_device].push(task);
+    }
+
+    per_device
+}
+
+fn stage1_task_lhs_family(task: &SlotTransferStage1Task) -> usize {
+    match task {
+        SlotTransferStage1Task::InputDirect => 1,
+        SlotTransferStage1Task::B0Chunk { .. } | SlotTransferStage1Task::GateChunk { .. } => 0,
+    }
+}
+
+fn stage1_task_bench_group(task: &SlotTransferStage1Task) -> SlotTransferStage1BenchGroup {
+    match task {
+        SlotTransferStage1Task::B0Chunk { .. } => SlotTransferStage1BenchGroup::B0,
+        SlotTransferStage1Task::GateChunk { .. } => SlotTransferStage1BenchGroup::Gate,
+        SlotTransferStage1Task::InputDirect => SlotTransferStage1BenchGroup::InputDirect,
+    }
+}
+
+fn maybe_elapsed_ms(started: Option<Instant>) -> f64 {
+    started.map(|start| start.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0)
+}
+
+fn update_group_store_timing<K>(
+    group_stats: &mut HashMap<K, SlotTransferTaskGroupBenchStats>,
+    group: K,
+    load_ms: f64,
+    compute_ms: f64,
+    store_ms: f64,
+) where
+    K: Eq + std::hash::Hash + Copy,
+{
+    let stats = group_stats.entry(group).or_default();
+    stats.max_load_ms = stats.max_load_ms.max(load_ms);
+    stats.max_compute_ms = stats.max_compute_ms.max(compute_ms);
+    stats.max_store_ms = stats.max_store_ms.max(store_ms);
+}
+
+fn finalize_stage_bench<K>(
+    group_stats: &HashMap<K, SlotTransferTaskGroupBenchStats>,
+    stage_parallelism: usize,
+) -> SlotTransferStageBenchMeasurement
+where
+    K: Eq + std::hash::Hash,
+{
+    let latency = group_stats.values().fold(0.0_f64, |max_latency, stats| {
+        max_latency.max(stats.max_load_ms.max(stats.max_compute_ms).max(stats.max_store_ms))
+    });
+    let total_time = group_stats.values().fold(0.0_f64, |sum, stats| {
+        let group_latency = stats.max_load_ms.max(stats.max_compute_ms).max(stats.max_store_ms);
+        sum + group_latency * stats.task_count as f64
+    });
+    SlotTransferStageBenchMeasurement {
+        latency,
+        max_parallelism: stage_parallelism as u128,
+        total_time,
+    }
+}
+
+fn concat_chunk_bytes_on_base<M>(params: &<M::P as Poly>::Params, chunk_bytes: Vec<Vec<u8>>) -> M
+where
+    M: PolyMatrix,
+{
+    if chunk_bytes.len() == 1 {
+        return M::from_compact_bytes(params, &chunk_bytes[0]);
+    }
+    let mut chunk_iter = chunk_bytes.into_iter().map(|bytes| M::from_compact_bytes(params, &bytes));
+    let first = chunk_iter.next().expect("slot-transfer chunk byte list must be non-empty");
+    first.concat_columns_owned(chunk_iter.collect())
+}
+
+fn output_slot_for_params_gpu<M, HS>(
+    evaluator: &BggPolyEncodingSTEvaluator<M, HS>,
+    params: &<M::P as Poly>::Params,
+    input: &BggPolyEncoding<M>,
+    plaintext_bytes_by_slot: &[Arc<[u8]>],
+    src_slots: &[(u32, Option<u32>)],
+    gate_id: GateId,
+    dst_slot: usize,
+    shared_by_device: &[GpuSlotTransferSharedByDevice<M>],
+    slot_bench_output: Option<&mut SlotTransferSlotBenchMeasurement>,
+) -> (Arc<[u8]>, Arc<[u8]>)
+where
+    M: PolyMatrix + Send + Sync,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    M::P: Send + Sync,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
+{
+    let collect_bench = slot_bench_output.is_some();
+    let mut slot_bench_measurement = SlotTransferSlotBenchMeasurement::default();
+    let (src_slot_u32, scalar) = src_slots[dst_slot];
+    let src_slot = usize::try_from(src_slot_u32).expect("source slot index must fit in usize");
+    assert!(
+        src_slot < input.num_slots(),
+        "source slot index {} out of range for input slot count {}",
+        src_slot,
+        input.num_slots()
+    );
+
+    let input_vector_bytes = &input.vector_bytes[src_slot];
+    let secret_size = shared_by_device[0].out_pubkey_matrix.row_size();
+    let src_plaintext =
+        M::P::from_compact_bytes(params, plaintext_bytes_by_slot[src_slot].as_ref());
+    let constant_term = src_plaintext
+        .coeffs_biguints()
+        .into_iter()
+        .next()
+        .expect("plaintext polynomial must contain a constant coefficient");
+    drop(src_plaintext);
+    let mut output_plaintext = M::P::from_biguint_to_constant(params, constant_term);
+    let dir = evaluator.dir_path.as_path();
+    let slot_preimage_b0_total_cols = trapdoor_public_column_count::<M>(params, secret_size * 2);
+    let slot_preimage_b1_total_cols = secret_size * params.modulus_digits();
+    let gate_total_cols = secret_size * params.modulus_digits();
+    let stage1_started = Instant::now();
+    let b0_chunk_count = column_chunk_count(slot_preimage_b0_total_cols);
+    let b1_chunk_count = column_chunk_count(slot_preimage_b1_total_cols);
+    let gate_chunk_count = column_chunk_count(gate_total_cols);
+    let mut stage1_tasks = Vec::new();
+    stage1_tasks
+        .extend((0..b0_chunk_count).map(|chunk_idx| SlotTransferStage1Task::B0Chunk { chunk_idx }));
+    stage1_tasks.extend(
+        (0..gate_chunk_count).map(|chunk_idx| SlotTransferStage1Task::GateChunk { chunk_idx }),
+    );
+    stage1_tasks.push(SlotTransferStage1Task::InputDirect);
+    let mut stage1_group_stats = if collect_bench {
+        let mut stats =
+            HashMap::<SlotTransferStage1BenchGroup, SlotTransferTaskGroupBenchStats>::new();
+        for task in &stage1_tasks {
+            stats.entry(stage1_task_bench_group(task)).or_default().task_count += 1;
+        }
+        stats
+    } else {
+        HashMap::new()
+    };
+    let stage1_batches =
+        assign_tasks_with_affinity(stage1_tasks, shared_by_device.len(), stage1_task_lhs_family);
+    let stage1_wave_count = stage1_batches.iter().map(Vec::len).max().unwrap_or(0);
+    let input_vector_by_device = shared_by_device
+        .par_iter()
+        .map(|shared| M::from_compact_bytes(&shared.params, input_vector_bytes.as_ref()))
+        .collect::<Vec<_>>();
+    let load_stage1_wave = |wave_idx: usize| {
+        let loaded_wave = stage1_batches
+            .par_iter()
+            .zip(shared_by_device.par_iter())
+            .enumerate()
+            .filter_map(|(device_slot, (batch, shared))| {
+                let task = batch.get(wave_idx).copied()?;
+                let load_started = collect_bench.then(Instant::now);
+                let rhs_chunk = match task {
+                    SlotTransferStage1Task::B0Chunk { chunk_idx } => read_matrix_column_chunk(
+                        &shared.params,
+                        dir,
+                        &evaluator.slot_preimage_b0_id_prefix(src_slot),
+                        slot_preimage_b0_total_cols,
+                        chunk_idx,
+                    ),
+                    SlotTransferStage1Task::GateChunk { chunk_idx } => read_matrix_column_chunk(
+                        &shared.params,
+                        dir,
+                        &evaluator.gate_preimage_id_prefix(gate_id, dst_slot),
+                        gate_total_cols,
+                        chunk_idx,
+                    ),
+                    SlotTransferStage1Task::InputDirect => evaluator
+                        .slot_a_for_params(
+                            &shared.params,
+                            shared.out_pubkey_matrix.row_size(),
+                            dst_slot,
+                        )
+                        .decompose(),
+                };
+                Some(LoadedSlotTransferStage1Task {
+                    device_slot,
+                    task,
+                    rhs_chunk,
+                    load_ms: maybe_elapsed_ms(load_started),
+                })
+            })
+            .collect::<Vec<_>>();
+        (!loaded_wave.is_empty()).then_some(loaded_wave)
+    };
+    let compute_stage1_wave = |loaded_wave: Vec<LoadedSlotTransferStage1Task<M>>| {
+        loaded_wave
+            .into_par_iter()
+            .map(|loaded_task| {
+                let compute_started = collect_bench.then(Instant::now);
+                let lhs = match loaded_task.task {
+                    SlotTransferStage1Task::InputDirect => {
+                        &input_vector_by_device[loaded_task.device_slot]
+                    }
+                    SlotTransferStage1Task::B0Chunk { .. } |
+                    SlotTransferStage1Task::GateChunk { .. } => {
+                        &shared_by_device[loaded_task.device_slot].c_b0
+                    }
+                };
+                let output = lhs * &loaded_task.rhs_chunk;
+                ComputedSlotTransferStage1Task {
+                    task: loaded_task.task,
+                    bytes: output.into_compact_bytes(),
+                    load_ms: loaded_task.load_ms,
+                    compute_ms: maybe_elapsed_ms(compute_started),
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut b0_chunk_bytes = (0..b0_chunk_count).map(|_| None).collect::<Vec<_>>();
+    let mut gate_chunk_bytes = (0..gate_chunk_count).map(|_| None).collect::<Vec<_>>();
+    let mut input_direct_bytes = None;
+    let mut store_stage1_wave = |outputs: Vec<ComputedSlotTransferStage1Task>| {
+        for output in outputs {
+            let store_started = collect_bench.then(Instant::now);
+            match output.task {
+                SlotTransferStage1Task::B0Chunk { chunk_idx } => {
+                    b0_chunk_bytes[chunk_idx] = Some(output.bytes);
+                }
+                SlotTransferStage1Task::GateChunk { chunk_idx } => {
+                    gate_chunk_bytes[chunk_idx] = Some(output.bytes);
+                }
+                SlotTransferStage1Task::InputDirect => {
+                    input_direct_bytes = Some(output.bytes);
+                }
+            }
+            if collect_bench {
+                update_group_store_timing(
+                    &mut stage1_group_stats,
+                    stage1_task_bench_group(&output.task),
+                    output.load_ms,
+                    output.compute_ms,
+                    maybe_elapsed_ms(store_started),
+                );
+            }
+        }
+    };
+    let mut next_stage1_wave_idx = 1usize;
+    let mut current_stage1_wave = if stage1_wave_count == 0 { None } else { load_stage1_wave(0) };
+    let mut previous_stage1_outputs = None;
+    while let Some(loaded_stage1_wave) = current_stage1_wave.take() {
+        let should_load_next = next_stage1_wave_idx < stage1_wave_count;
+        let previous_outputs_to_store = previous_stage1_outputs.take();
+        let ((computed_outputs, next_loaded_wave), ()) = rayon::join(
+            || {
+                rayon::join(
+                    || compute_stage1_wave(loaded_stage1_wave),
+                    || if should_load_next { load_stage1_wave(next_stage1_wave_idx) } else { None },
+                )
+            },
+            || {
+                if let Some(outputs) = previous_outputs_to_store {
+                    store_stage1_wave(outputs);
+                }
+            },
+        );
+        previous_stage1_outputs = Some(computed_outputs);
+        current_stage1_wave = next_loaded_wave;
+        if should_load_next {
+            next_stage1_wave_idx += 1;
+        }
+    }
+    if let Some(outputs) = previous_stage1_outputs.take() {
+        store_stage1_wave(outputs);
+    }
+    let b0_chunk_bytes = b0_chunk_bytes
+        .into_iter()
+        .enumerate()
+        .map(|(chunk_idx, maybe_bytes)| {
+            maybe_bytes.unwrap_or_else(|| {
+                panic!("missing slot-transfer b0 chunk bytes for chunk {chunk_idx}")
+            })
+        })
+        .collect::<Vec<_>>();
+    let gate_chunk_bytes = gate_chunk_bytes
+        .into_iter()
+        .enumerate()
+        .map(|(chunk_idx, maybe_bytes)| {
+            maybe_bytes.unwrap_or_else(|| {
+                panic!("missing slot-transfer gate chunk bytes for chunk {chunk_idx}")
+            })
+        })
+        .collect::<Vec<_>>();
+    let c_b0_slot_preimage_b0: M = concat_chunk_bytes_on_base(params, b0_chunk_bytes);
+    let c_b0_slot_preimage_b0_bytes = Arc::<[u8]>::from(c_b0_slot_preimage_b0.into_compact_bytes());
+    let c_gate: M = concat_chunk_bytes_on_base(params, gate_chunk_bytes);
+    let input_direct = M::from_compact_bytes(
+        params,
+        input_direct_bytes.expect("missing slot-transfer input-direct bytes").as_slice(),
+    );
+    if collect_bench {
+        let stage1_bench =
+            finalize_stage_bench(&stage1_group_stats, stage1_batches.iter().map(Vec::len).sum());
+        slot_bench_measurement.latency += stage1_bench.latency;
+        slot_bench_measurement.max_parallelism =
+            slot_bench_measurement.max_parallelism.max(stage1_bench.max_parallelism);
+        slot_bench_measurement.total_time += stage1_bench.total_time;
+    }
+    let _stage1_ms = stage1_started.elapsed().as_secs_f64() * 1000.0;
+
+    let stage2_started = Instant::now();
+    let stage2_tasks = (0..b1_chunk_count)
+        .map(|chunk_idx| SlotTransferStage2Task { chunk_idx })
+        .collect::<Vec<_>>();
+    let mut stage2_group_stats = if collect_bench {
+        let mut stats = HashMap::<usize, SlotTransferTaskGroupBenchStats>::new();
+        let entry = stats.entry(0).or_default();
+        entry.task_count = stage2_tasks.len();
+        stats
+    } else {
+        HashMap::new()
+    };
+    let stage2_batches =
+        assign_tasks_with_affinity(stage2_tasks, shared_by_device.len(), |_| 0usize);
+    let stage2_wave_count = stage2_batches.iter().map(Vec::len).max().unwrap_or(0);
+    let mut stage1_mid_cache_by_device =
+        (0..shared_by_device.len()).map(|_| None).collect::<Vec<_>>();
+    let load_stage2_wave = |wave_idx: usize, stage1_mid_cache_by_device: &mut Vec<Option<M>>| {
+        let loaded_wave = stage2_batches
+            .iter()
+            .zip(shared_by_device.iter())
+            .zip(stage1_mid_cache_by_device.iter_mut())
+            .filter_map(|((batch, shared), stage1_mid_cache)| {
+                let task = batch.get(wave_idx).copied()?;
+                let load_started = collect_bench.then(Instant::now);
+                let lhs = stage1_mid_cache
+                    .get_or_insert_with(|| {
+                        M::from_compact_bytes(&shared.params, c_b0_slot_preimage_b0_bytes.as_ref())
+                    })
+                    .clone();
+                let rhs_chunk = read_matrix_column_chunk::<M>(
+                    &shared.params,
+                    dir,
+                    &evaluator.slot_preimage_b1_id_prefix(dst_slot),
+                    slot_preimage_b1_total_cols,
+                    task.chunk_idx,
+                );
+                Some(LoadedSlotTransferStage2Task {
+                    task,
+                    lhs,
+                    rhs_chunk,
+                    load_ms: maybe_elapsed_ms(load_started),
+                })
+            })
+            .collect::<Vec<_>>();
+        (!loaded_wave.is_empty()).then_some(loaded_wave)
+    };
+    let compute_stage2_wave = |loaded_wave: Vec<LoadedSlotTransferStage2Task<M>>| {
+        loaded_wave
+            .into_par_iter()
+            .map(|loaded_task| {
+                let compute_started = collect_bench.then(Instant::now);
+                let output = &loaded_task.lhs * &loaded_task.rhs_chunk;
+                ComputedSlotTransferStage2Task {
+                    task: loaded_task.task,
+                    bytes: output.into_compact_bytes(),
+                    load_ms: loaded_task.load_ms,
+                    compute_ms: maybe_elapsed_ms(compute_started),
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut c_transfer_chunk_bytes = (0..b1_chunk_count).map(|_| None).collect::<Vec<_>>();
+    let mut store_stage2_wave = |outputs: Vec<ComputedSlotTransferStage2Task>| {
+        for output in outputs {
+            let store_started = collect_bench.then(Instant::now);
+            c_transfer_chunk_bytes[output.task.chunk_idx] = Some(output.bytes);
+            if collect_bench {
+                update_group_store_timing(
+                    &mut stage2_group_stats,
+                    0usize,
+                    output.load_ms,
+                    output.compute_ms,
+                    maybe_elapsed_ms(store_started),
+                );
+            }
+        }
+    };
+    let mut next_stage2_wave_idx = 1usize;
+    let mut current_stage2_wave = if stage2_wave_count == 0 {
+        None
+    } else {
+        load_stage2_wave(0, &mut stage1_mid_cache_by_device)
+    };
+    let mut previous_stage2_outputs = None;
+    while let Some(loaded_stage2_wave) = current_stage2_wave.take() {
+        let should_load_next = next_stage2_wave_idx < stage2_wave_count;
+        let previous_outputs_to_store = previous_stage2_outputs.take();
+        let ((computed_outputs, next_loaded_wave), ()) = rayon::join(
+            || {
+                rayon::join(
+                    || compute_stage2_wave(loaded_stage2_wave),
+                    || {
+                        if should_load_next {
+                            load_stage2_wave(next_stage2_wave_idx, &mut stage1_mid_cache_by_device)
+                        } else {
+                            None
+                        }
+                    },
+                )
+            },
+            || {
+                if let Some(outputs) = previous_outputs_to_store {
+                    store_stage2_wave(outputs);
+                }
+            },
+        );
+        previous_stage2_outputs = Some(computed_outputs);
+        current_stage2_wave = next_loaded_wave;
+        if should_load_next {
+            next_stage2_wave_idx += 1;
+        }
+    }
+    if let Some(outputs) = previous_stage2_outputs.take() {
+        store_stage2_wave(outputs);
+    }
+    let c_transfer: M = concat_chunk_bytes_on_base(
+        params,
+        c_transfer_chunk_bytes
+            .into_iter()
+            .enumerate()
+            .map(|(chunk_idx, maybe_bytes)| {
+                maybe_bytes.unwrap_or_else(|| {
+                    panic!("missing slot-transfer transfer chunk bytes for chunk {chunk_idx}")
+                })
+            })
+            .collect(),
+    );
+    if collect_bench {
+        let stage2_bench =
+            finalize_stage_bench(&stage2_group_stats, stage2_batches.iter().map(Vec::len).sum());
+        slot_bench_measurement.latency += stage2_bench.latency;
+        slot_bench_measurement.max_parallelism =
+            slot_bench_measurement.max_parallelism.max(stage2_bench.max_parallelism);
+        slot_bench_measurement.total_time += stage2_bench.total_time;
+    }
+    let _stage2_ms = stage2_started.elapsed().as_secs_f64() * 1000.0;
+
+    let stage3_started = Instant::now();
+    let transfer_plaintext_term = c_transfer.clone() * &output_plaintext;
+    let mut pre_out = input_direct + &transfer_plaintext_term;
+    if let Some(scalar) = scalar {
+        let scalar_poly = M::P::from_usize_to_constant(params, scalar as usize);
+        pre_out = pre_out * &scalar_poly;
+        output_plaintext = output_plaintext * &scalar_poly;
+    }
+    let out_vector: M = c_gate + &pre_out;
+    let stage3_ms = stage3_started.elapsed().as_secs_f64() * 1000.0;
+    if collect_bench {
+        slot_bench_measurement.latency += stage3_ms;
+        slot_bench_measurement.max_parallelism = slot_bench_measurement.max_parallelism.max(1);
+        slot_bench_measurement.total_time += stage3_ms;
+    }
+
+    let stage4_started = Instant::now();
+    let output_vector_bytes = Arc::<[u8]>::from(out_vector.into_compact_bytes());
+    let output_plaintext_bytes = Arc::<[u8]>::from(output_plaintext.to_compact_bytes());
+    let stage4_ms = stage4_started.elapsed().as_secs_f64() * 1000.0;
+    if collect_bench {
+        slot_bench_measurement.latency += stage4_ms;
+        slot_bench_measurement.max_parallelism = slot_bench_measurement.max_parallelism.max(1);
+        slot_bench_measurement.total_time += stage4_ms;
+    }
+    if let Some(slot_bench_output) = slot_bench_output {
+        *slot_bench_output = slot_bench_measurement;
+    }
+
+    (output_vector_bytes, output_plaintext_bytes)
 }
 
 pub(super) fn evaluate_slot_transfer_slots_gpu<M, HS>(
@@ -75,36 +640,89 @@ where
         out_pubkey.matrix.row_size(),
         configured_parallelism,
     );
-    let chunk_width = shared_by_device.len();
     let mut output_vector_bytes = Vec::with_capacity(slot_count);
     let mut output_plaintext_bytes = Vec::with_capacity(slot_count);
 
-    for slot_start in (0..slot_count).step_by(chunk_width.max(1)) {
-        let chunk_len = (slot_start + chunk_width).min(slot_count) - slot_start;
-        let chunk_outputs = (0..chunk_len)
-            .into_par_iter()
-            .map(|offset| {
-                let device_shared = &shared_by_device[offset];
-                let _device_id = device_shared.device_id;
-                evaluator.output_slot_for_params(
-                    &device_shared.params,
-                    &device_shared.c_b0,
-                    input,
-                    plaintext_bytes_by_slot,
-                    src_slots,
-                    &device_shared.out_pubkey_matrix,
-                    gate_id,
-                    slot_start + offset,
-                )
-            })
-            .collect::<Vec<_>>();
-        let (chunk_vector_bytes, chunk_plaintext_bytes): (Vec<_>, Vec<_>) =
-            chunk_outputs.into_iter().unzip();
-        output_vector_bytes.extend(chunk_vector_bytes);
-        output_plaintext_bytes.extend(chunk_plaintext_bytes);
+    for dst_slot in 0..slot_count {
+        let (vector_bytes, plaintext_bytes) = output_slot_for_params_gpu::<M, HS>(
+            evaluator,
+            params,
+            input,
+            plaintext_bytes_by_slot,
+            src_slots,
+            gate_id,
+            dst_slot,
+            &shared_by_device,
+            None,
+        );
+        output_vector_bytes.push(vector_bytes);
+        output_plaintext_bytes.push(plaintext_bytes);
     }
 
     (output_vector_bytes, output_plaintext_bytes)
+}
+
+pub(super) fn benchmark_slot_transfer_chunk_gpu<M, HS>(
+    evaluator: &BggPolyEncodingSTEvaluator<M, HS>,
+    samples: &crate::bench_estimator::BggPolyEncodingBenchSamples<'_, M>,
+    iterations: usize,
+) -> crate::bench_estimator::PolyEncodingChunkBenchMeasurement
+where
+    M: PolyMatrix + Send + Sync,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    M::P: Send + Sync,
+    for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
+{
+    let params = samples.params;
+    let input = samples.slot_transfer_input;
+    let plaintext_bytes_by_slot = input
+        .plaintext_bytes
+        .as_ref()
+        .expect("BggPolyEncoding slot transfer benchmark requires plaintext_bytes");
+    let secret_size = input.pubkey.matrix.row_size();
+    let out_pubkey =
+        evaluator.output_pubkey_for_params(params, secret_size, samples.slot_transfer_gate_id);
+    let configured_parallelism = effective_gpu_slot_parallelism(
+        crate::env::slot_transfer_slot_parallelism()
+            .max(1)
+            .min(samples.slot_transfer_src_slots.len().max(1)),
+    );
+    let shared_by_device = prepare_slot_transfer_shared_by_device::<M, HS>(
+        evaluator,
+        params,
+        samples.slot_transfer_gate_id,
+        out_pubkey.matrix.row_size(),
+        configured_parallelism,
+    );
+    let iterations = iterations.max(1);
+    let mut latency_sum = 0.0;
+    let mut total_time_sum = 0.0;
+    let mut max_parallelism = 0u128;
+
+    for _ in 0..iterations {
+        let mut slot_bench = SlotTransferSlotBenchMeasurement::default();
+        let _ = output_slot_for_params_gpu::<M, HS>(
+            evaluator,
+            params,
+            input,
+            plaintext_bytes_by_slot,
+            samples.slot_transfer_src_slots,
+            samples.slot_transfer_gate_id,
+            0,
+            &shared_by_device,
+            Some(&mut slot_bench),
+        );
+        latency_sum += slot_bench.latency;
+        total_time_sum += slot_bench.total_time;
+        max_parallelism = max_parallelism.max(slot_bench.max_parallelism);
+    }
+
+    crate::bench_estimator::PolyEncodingChunkBenchMeasurement {
+        latency: latency_sum / iterations as f64,
+        max_parallelism,
+        total_time: total_time_sum / iterations as f64,
+        peak_vram: 0,
+    }
 }
 
 #[cfg(test)]

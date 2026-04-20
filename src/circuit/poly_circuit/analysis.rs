@@ -31,6 +31,75 @@ struct PreparedNonFreeDepthRequest<P: Poly> {
     sub_circuit: Arc<PolyCircuit<P>>,
 }
 
+const COMPAT_NON_FREE_DEPTH_KIND_ORDER: [PolyGateKind; 10] = [
+    PolyGateKind::Input,
+    PolyGateKind::Add,
+    PolyGateKind::Sub,
+    PolyGateKind::Mul,
+    PolyGateKind::SmallScalarMul,
+    PolyGateKind::LargeScalarMul,
+    PolyGateKind::SlotTransfer,
+    PolyGateKind::PubLut,
+    PolyGateKind::SubCircuitOutput,
+    PolyGateKind::SummedSubCircuitOutput,
+];
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct CompatNonFreeDepthContributionVector {
+    counts: [u32; 10],
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct CompatNonFreeDepthProfile {
+    total_depth: u32,
+    contributions: CompatNonFreeDepthContributionVector,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct CompatNonFreeDepthCacheKey {
+    circuit_key: usize,
+    input_profiles: Box<[CompatNonFreeDepthProfile]>,
+}
+
+impl CompatNonFreeDepthContributionVector {
+    fn incremented(mut self, kind: PolyGateKind) -> Self {
+        self.counts[Self::kind_index(kind)] += 1;
+        self
+    }
+
+    fn to_hash_map(self) -> HashMap<PolyGateKind, usize> {
+        COMPAT_NON_FREE_DEPTH_KIND_ORDER
+            .into_iter()
+            .zip(self.counts)
+            .filter_map(|(kind, count)| (count > 0).then_some((kind, count as usize)))
+            .collect()
+    }
+
+    fn kind_index(kind: PolyGateKind) -> usize {
+        match kind {
+            PolyGateKind::Input => 0,
+            PolyGateKind::Add => 1,
+            PolyGateKind::Sub => 2,
+            PolyGateKind::Mul => 3,
+            PolyGateKind::SmallScalarMul => 4,
+            PolyGateKind::LargeScalarMul => 5,
+            PolyGateKind::SlotTransfer => 6,
+            PolyGateKind::PubLut => 7,
+            PolyGateKind::SubCircuitOutput => 8,
+            PolyGateKind::SummedSubCircuitOutput => 9,
+        }
+    }
+}
+
+impl CompatNonFreeDepthProfile {
+    fn incremented(self, kind: PolyGateKind) -> Self {
+        Self {
+            total_depth: self.total_depth + 1,
+            contributions: self.contributions.incremented(kind),
+        }
+    }
+}
+
 impl<P: Poly> PolyCircuit<P> {
     pub fn count_gates_by_type_vec(&self) -> HashMap<PolyGateKind, usize> {
         self.expanded_gate_counts(true)
@@ -97,6 +166,22 @@ impl<P: Poly> PolyCircuit<P> {
         let output_levels =
             self.non_free_depths_with_input_levels_cached(&input_levels, &depth_cache);
         output_levels.par_iter().copied().max().unwrap_or(0) as usize
+    }
+
+    /// Compatibility helper kept for older tests that still inspect one max-depth gate-kind
+    /// contribution profile.
+    pub fn non_free_depth_contributions(&self) -> HashMap<PolyGateKind, usize> {
+        if self.output_ids.is_empty() {
+            return HashMap::new();
+        }
+        let input_profiles = vec![CompatNonFreeDepthProfile::default(); self.num_input()];
+        let depth_cache =
+            DashMap::<CompatNonFreeDepthCacheKey, Arc<[CompatNonFreeDepthProfile]>>::new();
+        let output_profiles = self.compat_non_free_depth_profiles_with_input_profiles_cached(
+            &input_profiles,
+            &depth_cache,
+        );
+        output_profiles.iter().copied().max().unwrap_or_default().contributions.to_hash_map()
     }
 
     pub(crate) fn non_free_depths_with_input_levels_cached(
@@ -384,6 +469,220 @@ impl<P: Poly> PolyCircuit<P> {
         );
         depth_cache.insert(cache_key, output_levels.clone());
         output_levels
+    }
+
+    fn compat_non_free_depth_profiles_with_input_profiles_cached(
+        &self,
+        input_profiles: &[CompatNonFreeDepthProfile],
+        depth_cache: &DashMap<CompatNonFreeDepthCacheKey, Arc<[CompatNonFreeDepthProfile]>>,
+    ) -> Arc<[CompatNonFreeDepthProfile]> {
+        if self.output_ids.is_empty() {
+            return Arc::from(Vec::<CompatNonFreeDepthProfile>::new());
+        }
+        debug_assert_eq!(self.num_input(), input_profiles.len());
+        let cache_key = CompatNonFreeDepthCacheKey {
+            circuit_key: self as *const Self as usize,
+            input_profiles: input_profiles.to_vec().into_boxed_slice(),
+        };
+        if let Some(cached) = depth_cache.get(&cache_key) {
+            return Arc::clone(cached.value());
+        }
+
+        let mut gate_memo = HashMap::<GateId, CompatNonFreeDepthProfile>::new();
+        gate_memo.insert(GateId(0), CompatNonFreeDepthProfile::default());
+        for (input_idx, gate_id) in self.sorted_input_gate_ids().into_iter().enumerate() {
+            gate_memo.insert(gate_id, input_profiles[input_idx]);
+        }
+        let mut direct_call_memo = HashMap::<usize, Arc<[CompatNonFreeDepthProfile]>>::new();
+        let mut summed_call_memo = HashMap::<usize, Arc<[CompatNonFreeDepthProfile]>>::new();
+        let output_profiles = Arc::<[CompatNonFreeDepthProfile]>::from(
+            self.output_ids
+                .iter()
+                .copied()
+                .map(|output_id| {
+                    self.compat_non_free_depth_profile_for_gate(
+                        output_id,
+                        depth_cache,
+                        &mut gate_memo,
+                        &mut direct_call_memo,
+                        &mut summed_call_memo,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        depth_cache.insert(cache_key, output_profiles.clone());
+        output_profiles
+    }
+
+    fn compat_non_free_depth_profile_for_gate(
+        &self,
+        gate_id: GateId,
+        depth_cache: &DashMap<CompatNonFreeDepthCacheKey, Arc<[CompatNonFreeDepthProfile]>>,
+        gate_memo: &mut HashMap<GateId, CompatNonFreeDepthProfile>,
+        direct_call_memo: &mut HashMap<usize, Arc<[CompatNonFreeDepthProfile]>>,
+        summed_call_memo: &mut HashMap<usize, Arc<[CompatNonFreeDepthProfile]>>,
+    ) -> CompatNonFreeDepthProfile {
+        if let Some(profile) = gate_memo.get(&gate_id).copied() {
+            return profile;
+        }
+
+        let profile = match &self.gate(gate_id).gate_type {
+            PolyGateType::Add | PolyGateType::Sub | PolyGateType::SmallScalarMul { .. } => self
+                .gate(gate_id)
+                .input_gates
+                .iter()
+                .copied()
+                .map(|input_id| {
+                    self.compat_non_free_depth_profile_for_gate(
+                        input_id,
+                        depth_cache,
+                        gate_memo,
+                        direct_call_memo,
+                        summed_call_memo,
+                    )
+                })
+                .max()
+                .unwrap_or_default(),
+            PolyGateType::LargeScalarMul { .. } |
+            PolyGateType::Mul |
+            PolyGateType::PubLut { .. } |
+            PolyGateType::SlotTransfer { .. } => self
+                .gate(gate_id)
+                .input_gates
+                .iter()
+                .copied()
+                .map(|input_id| {
+                    self.compat_non_free_depth_profile_for_gate(
+                        input_id,
+                        depth_cache,
+                        gate_memo,
+                        direct_call_memo,
+                        summed_call_memo,
+                    )
+                })
+                .max()
+                .unwrap_or_default()
+                .incremented(self.gate(gate_id).gate_type.kind()),
+            PolyGateType::SubCircuitOutput { call_id, output_idx, .. } => self
+                .compat_non_free_depth_direct_call_outputs(
+                    *call_id,
+                    depth_cache,
+                    gate_memo,
+                    direct_call_memo,
+                    summed_call_memo,
+                )
+                .get(*output_idx)
+                .copied()
+                .unwrap_or_default(),
+            PolyGateType::SummedSubCircuitOutput { summed_call_id, output_idx, .. } => self
+                .compat_non_free_depth_summed_call_outputs(
+                    *summed_call_id,
+                    depth_cache,
+                    gate_memo,
+                    direct_call_memo,
+                    summed_call_memo,
+                )
+                .get(*output_idx)
+                .copied()
+                .unwrap_or_default(),
+            PolyGateType::Input => CompatNonFreeDepthProfile::default(),
+        };
+
+        gate_memo.insert(gate_id, profile);
+        profile
+    }
+
+    fn compat_non_free_depth_direct_call_outputs(
+        &self,
+        call_id: usize,
+        depth_cache: &DashMap<CompatNonFreeDepthCacheKey, Arc<[CompatNonFreeDepthProfile]>>,
+        gate_memo: &mut HashMap<GateId, CompatNonFreeDepthProfile>,
+        direct_call_memo: &mut HashMap<usize, Arc<[CompatNonFreeDepthProfile]>>,
+        summed_call_memo: &mut HashMap<usize, Arc<[CompatNonFreeDepthProfile]>>,
+    ) -> Arc<[CompatNonFreeDepthProfile]> {
+        if let Some(cached) = direct_call_memo.get(&call_id) {
+            return Arc::clone(cached);
+        }
+
+        let call = self.sub_circuit_calls.get(&call_id).expect("sub-circuit call missing");
+        let sub_circuit = self.registered_sub_circuit_ref(call.sub_circuit_id);
+        let child_input_profiles =
+            self.with_sub_circuit_call_inputs(call, |shared_prefix, suffix| {
+                iter_batched_wire_gates(shared_prefix)
+                    .chain(iter_batched_wire_gates(suffix))
+                    .map(|input_id| {
+                        self.compat_non_free_depth_profile_for_gate(
+                            input_id,
+                            depth_cache,
+                            gate_memo,
+                            direct_call_memo,
+                            summed_call_memo,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+        let outputs = sub_circuit.compat_non_free_depth_profiles_with_input_profiles_cached(
+            &child_input_profiles,
+            depth_cache,
+        );
+        direct_call_memo.insert(call_id, outputs.clone());
+        outputs
+    }
+
+    fn compat_non_free_depth_summed_call_outputs(
+        &self,
+        summed_call_id: usize,
+        depth_cache: &DashMap<CompatNonFreeDepthCacheKey, Arc<[CompatNonFreeDepthProfile]>>,
+        gate_memo: &mut HashMap<GateId, CompatNonFreeDepthProfile>,
+        direct_call_memo: &mut HashMap<usize, Arc<[CompatNonFreeDepthProfile]>>,
+        summed_call_memo: &mut HashMap<usize, Arc<[CompatNonFreeDepthProfile]>>,
+    ) -> Arc<[CompatNonFreeDepthProfile]> {
+        if let Some(cached) = summed_call_memo.get(&summed_call_id) {
+            return Arc::clone(cached);
+        }
+
+        let call = self
+            .summed_sub_circuit_calls
+            .get(&summed_call_id)
+            .expect("summed sub-circuit call missing");
+        let sub_circuit = self.registered_sub_circuit_ref(call.sub_circuit_id);
+        let mut accumulated = vec![CompatNonFreeDepthProfile::default(); call.num_outputs];
+        for input_set_id in &call.call_input_set_ids {
+            let child_input_profiles = self
+                .input_set(*input_set_id)
+                .as_ref()
+                .iter()
+                .copied()
+                .flat_map(BatchedWire::gate_ids)
+                .map(|input_id| {
+                    self.compat_non_free_depth_profile_for_gate(
+                        input_id,
+                        depth_cache,
+                        gate_memo,
+                        direct_call_memo,
+                        summed_call_memo,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let output_profiles = sub_circuit
+                .compat_non_free_depth_profiles_with_input_profiles_cached(
+                    &child_input_profiles,
+                    depth_cache,
+                );
+            assert_eq!(
+                output_profiles.len(),
+                call.output_gate_ids.len(),
+                "summed sub-circuit output arity mismatch for call {}",
+                summed_call_id
+            );
+            for (acc_profile, output_profile) in accumulated.iter_mut().zip(output_profiles.iter())
+            {
+                *acc_profile = (*acc_profile).max(*output_profile);
+            }
+        }
+        let outputs = Arc::<[CompatNonFreeDepthProfile]>::from(accumulated);
+        summed_call_memo.insert(summed_call_id, outputs.clone());
+        outputs
     }
 
     /// Compute one regular gate's non-free depth from its already-live inputs.
@@ -699,6 +998,7 @@ impl<P: Poly> PolyCircuit<P> {
         input_set_id: usize,
         node_levels: &mut HashMap<GroupedCallExecutionNodeId, usize>,
         input_set_levels: &mut HashMap<usize, Option<usize>>,
+        reachable_inputs: &mut BTreeSet<GateId>,
         visiting: &mut HashSet<GroupedCallExecutionNodeId>,
         levels: &mut Vec<GroupedCallExecutionLayer>,
     ) -> Option<usize> {
@@ -716,6 +1016,7 @@ impl<P: Poly> PolyCircuit<P> {
                     dep_node,
                     node_levels,
                     input_set_levels,
+                    reachable_inputs,
                     visiting,
                     levels,
                 );
@@ -725,6 +1026,7 @@ impl<P: Poly> PolyCircuit<P> {
                 });
             } else {
                 has_input_dependency = true;
+                self.record_reachable_input(input_id, reachable_inputs);
             }
         }
         let max_dependency_level = if has_input_dependency {
@@ -741,6 +1043,7 @@ impl<P: Poly> PolyCircuit<P> {
         node: GroupedCallExecutionNodeId,
         node_levels: &mut HashMap<GroupedCallExecutionNodeId, usize>,
         input_set_levels: &mut HashMap<usize, Option<usize>>,
+        reachable_inputs: &mut BTreeSet<GateId>,
         visiting: &mut HashSet<GroupedCallExecutionNodeId>,
         levels: &mut Vec<GroupedCallExecutionLayer>,
     ) -> usize {
@@ -767,12 +1070,14 @@ impl<P: Poly> PolyCircuit<P> {
                             dep_node,
                             node_levels,
                             input_set_levels,
+                            reachable_inputs,
                             visiting,
                             levels,
                         );
                         update_dep_level(dep_level);
                     } else {
                         has_input_dependency = true;
+                        self.record_reachable_input(input_id, reachable_inputs);
                     }
                 }
             }
@@ -784,6 +1089,7 @@ impl<P: Poly> PolyCircuit<P> {
                             input_set_id,
                             node_levels,
                             input_set_levels,
+                            reachable_inputs,
                             visiting,
                             levels,
                         )
@@ -797,12 +1103,14 @@ impl<P: Poly> PolyCircuit<P> {
                             dep_node,
                             node_levels,
                             input_set_levels,
+                            reachable_inputs,
                             visiting,
                             levels,
                         );
                         update_dep_level(dep_level);
                     } else {
                         has_input_dependency = true;
+                        self.record_reachable_input(input_id, reachable_inputs);
                     }
                 }
             }
@@ -817,6 +1125,7 @@ impl<P: Poly> PolyCircuit<P> {
                             input_set_id,
                             node_levels,
                             input_set_levels,
+                            reachable_inputs,
                             visiting,
                             levels,
                         )
@@ -851,6 +1160,38 @@ impl<P: Poly> PolyCircuit<P> {
         level
     }
 
+    fn record_reachable_input(&self, gate_id: GateId, reachable_inputs: &mut BTreeSet<GateId>) {
+        if gate_id.0 != 0 && matches!(self.gate(gate_id).gate_type, PolyGateType::Input) {
+            reachable_inputs.insert(gate_id);
+        }
+    }
+
+    fn build_grouped_execution_plan(&self) -> GroupedExecutionPlan {
+        let mut node_levels: HashMap<GroupedCallExecutionNodeId, usize> = HashMap::new();
+        let mut input_set_levels: HashMap<usize, Option<usize>> = HashMap::new();
+        let mut levels = Vec::<GroupedCallExecutionLayer>::new();
+        let mut reachable_inputs = BTreeSet::<GateId>::new();
+        let mut visiting = HashSet::new();
+        for &output_gate in &self.output_ids {
+            let Some(node) = self.grouped_execution_node_for_gate(output_gate) else {
+                self.record_reachable_input(output_gate, &mut reachable_inputs);
+                continue;
+            };
+            self.populate_grouped_execution_node_level(
+                node,
+                &mut node_levels,
+                &mut input_set_levels,
+                &mut reachable_inputs,
+                &mut visiting,
+                &mut levels,
+            );
+        }
+        GroupedExecutionPlan {
+            layers: levels,
+            reachable_input_gate_ids: reachable_inputs.into_iter().collect(),
+        }
+    }
+
     /// Build the grouped execution schedule shared by `non_free_depth()` and `eval_error`.
     ///
     /// The generic circuit-level planner lives here because the grouping itself is purely
@@ -859,39 +1200,11 @@ impl<P: Poly> PolyCircuit<P> {
     /// depths, while `eval_error` reuses the same grouping to propagate symbolic or concrete error
     /// values.
     pub(crate) fn grouped_execution_layers(&self) -> Vec<GroupedCallExecutionLayer> {
-        let mut node_levels: HashMap<GroupedCallExecutionNodeId, usize> = HashMap::new();
-        let mut input_set_levels: HashMap<usize, Option<usize>> = HashMap::new();
-        let mut levels = Vec::<GroupedCallExecutionLayer>::new();
-        let mut visiting = HashSet::new();
-        for &output_gate in &self.output_ids {
-            let Some(node) = self.grouped_execution_node_for_gate(output_gate) else {
-                continue;
-            };
-            self.populate_grouped_execution_node_level(
-                node,
-                &mut node_levels,
-                &mut input_set_levels,
-                &mut visiting,
-                &mut levels,
-            );
-        }
-        levels
+        self.build_grouped_execution_plan().layers
     }
 
-    /// Return the reachable non-constant input gates needed to produce the current outputs.
-    ///
-    /// `grouped_execution_layers()` intentionally excludes input gates because both
-    /// `non_free_depth()` and `eval_error` preload them before layered execution starts. Some
-    /// callers, notably `bench_estimator`, still need to charge an explicit input layer, so this
-    /// helper exposes the reachable real inputs without reviving the old placeholder-based
-    /// `execution_layers()` API.
-    pub(crate) fn reachable_input_gate_ids(&self) -> Vec<GateId> {
-        self.topological_order()
-            .into_iter()
-            .filter(|gate_id| {
-                matches!(self.gate(*gate_id).gate_type, PolyGateType::Input) && gate_id.0 != 0
-            })
-            .collect()
+    pub(crate) fn grouped_execution_plan(&self) -> GroupedExecutionPlan {
+        self.build_grouped_execution_plan()
     }
 
     /// Returns the circuit depth defined as the maximum level index among

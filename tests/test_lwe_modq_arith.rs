@@ -253,9 +253,10 @@ async fn test_lwe_modq_arith() {
         q_level,
         all_q_moduli
     );
+    let non_free_depth_contributions = circuit.non_free_depth_contributions();
     info!(
-        "circuit non_free_depth={} gate_counts={:?}",
-        circuit.non_free_depth(),
+        "circuit non_free_depth_contributions={:?} gate_counts={:?}",
+        non_free_depth_contributions,
         circuit.count_gates_by_type_vec()
     );
 

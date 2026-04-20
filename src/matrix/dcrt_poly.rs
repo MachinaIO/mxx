@@ -585,6 +585,58 @@ mod tests {
     }
 
     #[test]
+    fn test_matrix_decompose_chunk_matches_full_decompose() {
+        let params = DCRTPolyParams::new(4, 2, 17, 3);
+        let matrix = DCRTPolyMatrix::from_poly_vec(
+            &params,
+            vec![
+                vec![
+                    DCRTPoly::from_usize_to_constant(&params, 5),
+                    DCRTPoly::from_usize_to_constant(&params, 7),
+                ],
+                vec![
+                    DCRTPoly::from_usize_to_constant(&params, 11),
+                    DCRTPoly::from_usize_to_constant(&params, 13),
+                ],
+            ],
+        );
+        let chunk_count = params.modulus_digits();
+        let full = matrix.decompose();
+        let chunks = (0..chunk_count)
+            .map(|chunk_idx| matrix.decompose_chunk(chunk_idx, chunk_count))
+            .collect::<Vec<_>>();
+        let chunk_refs = chunks.iter().skip(1).collect::<Vec<_>>();
+        let rebuilt = chunks[0].concat_rows(&chunk_refs);
+        assert_eq!(rebuilt, full);
+    }
+
+    #[test]
+    fn test_matrix_small_decompose_chunk_matches_full_small_decompose() {
+        let params = DCRTPolyParams::new(4, 2, 17, 3);
+        let matrix = DCRTPolyMatrix::from_poly_vec(
+            &params,
+            vec![
+                vec![
+                    DCRTPoly::from_usize_to_constant(&params, 5),
+                    DCRTPoly::from_usize_to_constant(&params, 7),
+                ],
+                vec![
+                    DCRTPoly::from_usize_to_constant(&params, 11),
+                    DCRTPoly::from_usize_to_constant(&params, 13),
+                ],
+            ],
+        );
+        let chunk_count = params.crt_bits().div_ceil(params.base_bits() as usize);
+        let full = matrix.small_decompose();
+        let chunks = (0..chunk_count)
+            .map(|chunk_idx| matrix.small_decompose_chunk(chunk_idx, chunk_count))
+            .collect::<Vec<_>>();
+        let chunk_refs = chunks.iter().skip(1).collect::<Vec<_>>();
+        let rebuilt = chunks[0].concat_rows(&chunk_refs);
+        assert_eq!(rebuilt, full);
+    }
+
+    #[test]
     fn test_small_decomposed_identity_chunk_equivalence() {
         let params = DCRTPolyParams::default();
         let d = 2usize;

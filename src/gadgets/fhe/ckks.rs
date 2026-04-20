@@ -2229,7 +2229,7 @@ mod tests {
         println!(
             "ckks metrics: crt_bits={crt_bits}, crt_depth={crt_depth}, ring_dim={ring_dim}, num_slots={num_slots}, active_levels={active_levels}, relinearization_extra_levels={relinearization_extra_levels}"
         );
-        println!("non-free depth {}", circuit.non_free_depth());
+        println!("non-free depth contributions {:?}", circuit.non_free_depth_contributions());
         println!("gate counts {:?}", circuit.count_gates_by_type_vec());
     }
 }

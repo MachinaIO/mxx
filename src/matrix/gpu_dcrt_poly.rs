@@ -9,14 +9,15 @@ use crate::{
                 GPU_MATRIX_DIST_BIT, GPU_MATRIX_DIST_GAUSS, GPU_MATRIX_DIST_TERNARY,
                 GPU_MATRIX_DIST_UNIFORM, GPU_POLY_FORMAT_COEFF, GPU_POLY_FORMAT_EVAL, GpuDCRTPoly,
                 GpuDCRTPolyParams, GpuEventSetOpaque, GpuMatrixOpaque, check_status,
-                gpu_event_set_destroy, gpu_event_set_wait, gpu_matrix_add, gpu_matrix_copy,
-                gpu_matrix_copy_block, gpu_matrix_create, gpu_matrix_decompose_base,
-                gpu_matrix_decompose_base_small, gpu_matrix_destroy, gpu_matrix_equal,
-                gpu_matrix_fill_gadget, gpu_matrix_fill_small_decomposed_identity_chunk,
-                gpu_matrix_fill_small_gadget, gpu_matrix_gauss_samp_gq_arb_base,
-                gpu_matrix_intt_all, gpu_matrix_load_compact_bytes, gpu_matrix_load_rns_batch,
-                gpu_matrix_mul, gpu_matrix_mul_scalar, gpu_matrix_ntt_all,
-                gpu_matrix_sample_distribution, gpu_matrix_sample_p1_full,
+                gpu_event_set_destroy, gpu_event_set_wait, gpu_matrix_add, gpu_matrix_add_block,
+                gpu_matrix_copy, gpu_matrix_copy_block, gpu_matrix_create,
+                gpu_matrix_decompose_base, gpu_matrix_decompose_base_small, gpu_matrix_destroy,
+                gpu_matrix_equal, gpu_matrix_fill_gadget,
+                gpu_matrix_fill_small_decomposed_identity_chunk, gpu_matrix_fill_small_gadget,
+                gpu_matrix_gauss_samp_gq_arb_base, gpu_matrix_intt_all,
+                gpu_matrix_load_compact_bytes, gpu_matrix_load_rns_batch, gpu_matrix_mul,
+                gpu_matrix_mul_scalar, gpu_matrix_ntt_all, gpu_matrix_sample_distribution,
+                gpu_matrix_sample_distribution_columns, gpu_matrix_sample_p1_full,
                 gpu_matrix_store_compact_bytes, gpu_matrix_store_const_coeff_batch,
                 gpu_matrix_store_rns_batch, gpu_matrix_sub,
             },
@@ -328,6 +329,29 @@ impl GpuDCRTPolyMatrix {
         self.is_ntt = rhs.is_ntt;
     }
 
+    pub fn add_block_from(
+        &mut self,
+        src: &Self,
+        dst_row: usize,
+        dst_col: usize,
+        src_row: usize,
+        src_col: usize,
+        rows: usize,
+        cols: usize,
+    ) {
+        debug_assert_eq!(self.params, src.params, "add_block_from requires same params");
+        debug_assert_eq!(self.level, src.level, "add_block_from requires same level");
+        debug_assert_eq!(self.is_ntt, src.is_ntt, "add_block_from requires same domain");
+        if rows == 0 || cols == 0 {
+            return;
+        }
+        let status = unsafe {
+            gpu_matrix_add_block(self.raw, src.raw, dst_row, dst_col, src_row, src_col, rows, cols)
+        };
+        check_status(status, "gpu_matrix_add_block");
+        self.is_ntt = src.is_ntt;
+    }
+
     pub fn sub_in_place(&mut self, rhs: &Self) {
         debug_assert_eq!(self.params, rhs.params, "sub_in_place requires same params");
         debug_assert_eq!(self.level, rhs.level, "sub_in_place requires same level");
@@ -362,6 +386,44 @@ impl GpuDCRTPolyMatrix {
         }
         let status = unsafe { gpu_matrix_sample_distribution(out.raw, dist.as_ffi(), sigma, seed) };
         check_status(status, "gpu_matrix_sample_distribution");
+        out
+    }
+
+    pub(crate) fn sample_distribution_columns(
+        params: &GpuDCRTPolyParams,
+        nrow: usize,
+        total_ncol: usize,
+        col_start: usize,
+        col_len: usize,
+        dist: GpuMatrixSampleDist,
+        sigma: f64,
+        seed: u64,
+    ) -> Self {
+        let col_end = col_start
+            .checked_add(col_len)
+            .expect("sample_distribution_columns column range overflow");
+        assert!(
+            col_end <= total_ncol,
+            "sample_distribution_columns range out of bounds: start={}, len={}, total_ncol={}",
+            col_start,
+            col_len,
+            total_ncol
+        );
+        let out = Self::new_empty(params, nrow, col_len);
+        if nrow == 0 || col_len == 0 {
+            return out;
+        }
+        let status = unsafe {
+            gpu_matrix_sample_distribution_columns(
+                out.raw,
+                dist.as_ffi(),
+                sigma,
+                seed,
+                total_ncol,
+                col_start,
+            )
+        };
+        check_status(status, "gpu_matrix_sample_distribution_columns");
         out
     }
 
@@ -1814,6 +1876,64 @@ mod tests {
         assert_eq!(expected_matrix.size().0, 2);
         assert_eq!(expected_matrix.size().1, 8);
         assert_eq!(matrix, expected_matrix);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_decompose_chunk_matches_full_decompose() {
+        gpu_device_sync();
+        let params = gpu_test_params();
+        let gpu_params = gpu_params_from_cpu(&params);
+        let matrix = GpuDCRTPolyMatrix::from_poly_vec(
+            &gpu_params,
+            vec![
+                vec![
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 5),
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 7),
+                ],
+                vec![
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 11),
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 13),
+                ],
+            ],
+        );
+        let chunk_count = gpu_params.modulus_digits();
+        let full = matrix.decompose();
+        let chunks = (0..chunk_count)
+            .map(|chunk_idx| matrix.decompose_chunk(chunk_idx, chunk_count))
+            .collect::<Vec<_>>();
+        let chunk_refs = chunks.iter().skip(1).collect::<Vec<_>>();
+        let rebuilt = chunks[0].concat_rows(&chunk_refs);
+        assert_eq!(rebuilt, full);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_small_decompose_chunk_matches_full_small_decompose() {
+        gpu_device_sync();
+        let params = gpu_test_params();
+        let gpu_params = gpu_params_from_cpu(&params);
+        let matrix = GpuDCRTPolyMatrix::from_poly_vec(
+            &gpu_params,
+            vec![
+                vec![
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 5),
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 7),
+                ],
+                vec![
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 11),
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 13),
+                ],
+            ],
+        );
+        let chunk_count = gpu_params.crt_bits().div_ceil(gpu_params.base_bits() as usize);
+        let full = matrix.small_decompose();
+        let chunks = (0..chunk_count)
+            .map(|chunk_idx| matrix.small_decompose_chunk(chunk_idx, chunk_count))
+            .collect::<Vec<_>>();
+        let chunk_refs = chunks.iter().skip(1).collect::<Vec<_>>();
+        let rebuilt = chunks[0].concat_rows(&chunk_refs);
+        assert_eq!(rebuilt, full);
     }
 
     #[test]

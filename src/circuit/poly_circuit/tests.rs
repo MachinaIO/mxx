@@ -13,7 +13,7 @@ use crate::{
 };
 use dashmap::DashMap;
 use num_bigint::BigUint;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 fn eval_with_const_one<PE>(
     circuit: &PolyCircuit<DCRTPoly>,
@@ -27,6 +27,14 @@ where
     let one = DCRTPoly::const_one(params);
     let eval_inputs = inputs.to_vec();
     circuit.eval(params, one, eval_inputs, plt_evaluator, None, None)
+}
+
+fn total_non_free_depth(contributions: &HashMap<PolyGateKind, usize>) -> usize {
+    contributions.values().sum()
+}
+
+fn circuit_non_free_depth_total<P: Poly>(circuit: &PolyCircuit<P>) -> usize {
+    total_non_free_depth(&circuit.non_free_depth_contributions())
 }
 
 #[test]
@@ -683,7 +691,7 @@ fn test_sub_circuit_call_info_preserves_batched_input_ranges() {
     let call = main_circuit.sub_circuit_call_info(0);
     assert_eq!(call.inputs, vec![shared_prefix, suffix]);
     assert_eq!(main_circuit.input_set(prefix_set_id).as_ref(), &[shared_prefix]);
-    assert_eq!(main_circuit.non_free_depth(), 0);
+    assert_eq!(main_circuit.non_free_depth_contributions(), HashMap::new());
 }
 
 #[test]
@@ -721,7 +729,7 @@ fn test_register_and_call_parameterized_sub_circuit() {
     assert_eq!(result.len(), 2);
     assert_eq!(result[0], input_poly.small_scalar_mul(&params, &[2]));
     assert_eq!(result[1], input_poly.small_scalar_mul(&params, &[3]));
-    assert_eq!(main_circuit.non_free_depth(), 0);
+    assert_eq!(main_circuit.non_free_depth_contributions(), HashMap::new());
 }
 
 #[test]
@@ -827,7 +835,7 @@ fn test_register_and_call_summed_parameterized_sub_circuit() {
     );
     assert_eq!(result.len(), 1);
     assert_eq!(result[0], input_poly.small_scalar_mul(&params, &[7]));
-    assert_eq!(main_circuit.non_free_depth(), 0);
+    assert_eq!(main_circuit.non_free_depth_contributions(), HashMap::new());
     assert_eq!(main_circuit.binding_registry.binding_sets.len(), 2);
     assert_eq!(main_circuit.input_set_registry.input_sets.len(), 1);
     assert_eq!(main_circuit.summed_sub_circuit_calls.len(), 1);
@@ -853,7 +861,7 @@ fn test_summed_sub_circuit_non_free_depth_uses_max_inner_call_depth() {
     );
     main_circuit.output(outputs);
 
-    assert_eq!(main_circuit.non_free_depth(), 2);
+    assert_eq!(circuit_non_free_depth_total(&main_circuit), 2);
 }
 
 #[test]
@@ -894,7 +902,7 @@ fn test_nested_sub_circuits_with_disk_api_compatibility() {
     let gate_counts = main_circuit.count_gates_by_type_vec();
     assert_eq!(main_circuit.lut_vector_len_with_subcircuits(), 0);
     assert_eq!(gate_counts.get(&PolyGateKind::Mul).copied().unwrap_or(0), 2);
-    assert_eq!(main_circuit.non_free_depth(), 2);
+    assert_eq!(circuit_non_free_depth_total(&main_circuit), 2);
 
     let result = eval_with_const_one(
         &main_circuit,
@@ -1117,7 +1125,7 @@ fn test_non_free_depth_counts_sub_circuit() {
     let sub_outputs = main_circuit.call_sub_circuit(sub_id, &[main_inputs[0]]);
     main_circuit.output(vec![sub_outputs[0]]);
 
-    assert_eq!(main_circuit.non_free_depth(), 2);
+    assert_eq!(main_circuit.non_free_depth_contributions().get(&PolyGateKind::Mul), Some(&2));
 }
 
 #[test]
@@ -1135,7 +1143,7 @@ fn test_non_free_depth_respects_sub_circuit_inputs() {
     let sub_outputs = main_circuit.call_sub_circuit(sub_id, &[main_inputs[0].into(), mul2]);
     main_circuit.output(vec![sub_outputs[0]]);
 
-    assert_eq!(main_circuit.non_free_depth(), 0);
+    assert_eq!(main_circuit.non_free_depth_contributions(), HashMap::new());
 }
 
 #[test]
@@ -1145,7 +1153,7 @@ fn test_non_free_depth_counts_slot_transfer_as_non_free() {
     let transferred = circuit.slot_transfer_gate(inputs[0], &[(0, None)]);
     circuit.output(vec![transferred]);
 
-    assert_eq!(circuit.non_free_depth(), 1);
+    assert_eq!(circuit.non_free_depth_contributions().get(&PolyGateKind::SlotTransfer), Some(&1));
 }
 
 #[test]
@@ -1157,7 +1165,7 @@ fn test_non_free_depth_ignores_add_chains() {
     let mul = circuit.mul_gate(add2, inputs[3]);
     circuit.output(vec![mul]);
 
-    assert_eq!(circuit.non_free_depth(), 1);
+    assert_eq!(circuit.non_free_depth_contributions().get(&PolyGateKind::Mul), Some(&1));
 }
 
 #[test]
@@ -1175,7 +1183,7 @@ fn test_non_free_depth_handles_multi_output_sub_circuit_call() {
     let sum = main_circuit.add_gate(sub_outputs[0], sub_outputs[1]);
     main_circuit.output(vec![sum]);
 
-    assert_eq!(main_circuit.non_free_depth(), 1);
+    assert_eq!(main_circuit.non_free_depth_contributions().get(&PolyGateKind::Mul), Some(&1));
 }
 
 #[test]
@@ -1195,7 +1203,7 @@ fn test_non_free_depth_handles_repeated_sub_circuit_calls_with_different_input_l
     let output = main_circuit.add_gate(direct_call[0], nested_call[0]);
     main_circuit.output(vec![output]);
 
-    assert_eq!(main_circuit.non_free_depth(), 2);
+    assert_eq!(circuit_non_free_depth_total(&main_circuit), 2);
 }
 
 #[test]
@@ -1215,7 +1223,7 @@ fn test_non_free_depth_batches_multiple_ready_sub_circuit_calls() {
     let output = main_circuit.add_gate(call1[0], call2[0]);
     main_circuit.output(vec![output]);
 
-    assert_eq!(main_circuit.non_free_depth(), 2);
+    assert_eq!(circuit_non_free_depth_total(&main_circuit), 2);
 }
 
 #[test]

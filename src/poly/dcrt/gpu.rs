@@ -108,6 +108,16 @@ unsafe extern "C" {
         lhs: *const GpuMatrixOpaque,
         rhs: *const GpuMatrixOpaque,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_add_block(
+        out: *mut GpuMatrixOpaque,
+        src: *const GpuMatrixOpaque,
+        dst_row: usize,
+        dst_col: usize,
+        src_row: usize,
+        src_col: usize,
+        rows: usize,
+        cols: usize,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_sub(
         out: *mut GpuMatrixOpaque,
         lhs: *const GpuMatrixOpaque,
@@ -179,6 +189,14 @@ unsafe extern "C" {
         dist_type: c_int,
         sigma: f64,
         seed: u64,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_sample_distribution_columns(
+        out: *mut GpuMatrixOpaque,
+        dist_type: c_int,
+        sigma: f64,
+        seed: u64,
+        full_ncol: usize,
+        col_offset: usize,
     ) -> c_int;
     pub(crate) fn gpu_matrix_ntt_all(mat: *mut GpuMatrixOpaque) -> c_int;
     pub(crate) fn gpu_matrix_intt_all(mat: *mut GpuMatrixOpaque) -> c_int;

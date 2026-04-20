@@ -100,6 +100,7 @@ struct PublicLookupStage2Task {
 }
 
 struct PublicLookupStage2Contribution {
+    device_slot: usize,
     family: PublicLookupStage1Family,
     output_chunk_idx: usize,
     bytes: Arc<[u8]>,
@@ -116,6 +117,7 @@ struct LoadedPublicLookupStage1Task<M: PolyMatrix> {
 }
 
 struct ComputedPublicLookupStage1Task {
+    device_slot: usize,
     task: PublicLookupStage1Task,
     bytes: Arc<[u8]>,
     load_ms: f64,
@@ -450,7 +452,26 @@ where
             .enumerate()
             .filter_map(|(device_slot, (batch, shared_dev))| {
                 let task = batch.get(wave_idx).copied()?;
+                let task_label = match task {
+                    PublicLookupStage1Task::DirectIdentity { output_chunk_idx } => {
+                        format!("direct_identity(output_chunk={output_chunk_idx})")
+                    }
+                    PublicLookupStage1Task::Intermediate { key } => format!(
+                        "intermediate(family={:?}, inner_chunk={})",
+                        key.family, key.inner_chunk_idx
+                    ),
+                };
                 let load_started = collect_bench.then(Instant::now);
+                debug!(
+                    "GGH15 BGG poly-encoding gpu public-lookup stage1 load start: gate_id={}, lut_id={}, slot={}, wave={}, device_slot={}, device_id={}, task={}",
+                    gate_id,
+                    lut_id,
+                    slot.slot_idx,
+                    wave_idx,
+                    device_slot,
+                    shared_dev.device_id,
+                    task_label
+                );
                 let rhs_chunk = match task {
                     PublicLookupStage1Task::DirectIdentity { output_chunk_idx } => {
                         read_matrix_column_chunk(
@@ -511,11 +532,25 @@ where
                         }
                     },
                 };
+                let load_ms = maybe_elapsed_ms(load_started);
+                debug!(
+                    "GGH15 BGG poly-encoding gpu public-lookup stage1 load complete: gate_id={}, lut_id={}, slot={}, wave={}, device_slot={}, device_id={}, task={}, rhs_rows={}, rhs_cols={}, load_ms={:.3}",
+                    gate_id,
+                    lut_id,
+                    slot.slot_idx,
+                    wave_idx,
+                    device_slot,
+                    shared_dev.device_id,
+                    task_label,
+                    rhs_chunk.row_size(),
+                    rhs_chunk.col_size(),
+                    load_ms
+                );
                 Some(LoadedPublicLookupStage1Task {
                     device_slot,
                     task,
                     rhs_chunk,
-                    load_ms: maybe_elapsed_ms(load_started),
+                    load_ms,
                 })
             })
             .collect::<Vec<_>>();
@@ -525,6 +560,24 @@ where
         loaded_wave
             .into_par_iter()
             .map(|loaded_task| {
+                let task_label = match loaded_task.task {
+                    PublicLookupStage1Task::DirectIdentity { output_chunk_idx } => {
+                        format!("direct_identity(output_chunk={output_chunk_idx})")
+                    }
+                    PublicLookupStage1Task::Intermediate { key } => format!(
+                        "intermediate(family={:?}, inner_chunk={})",
+                        key.family, key.inner_chunk_idx
+                    ),
+                };
+                debug!(
+                    "GGH15 BGG poly-encoding gpu public-lookup stage1 compute start: gate_id={}, lut_id={}, slot={}, device_slot={}, device_id={}, task={}",
+                    gate_id,
+                    lut_id,
+                    slot.slot_idx,
+                    loaded_task.device_slot,
+                    shared_by_device[loaded_task.device_slot].device_id,
+                    task_label
+                );
                 let compute_started = collect_bench.then(Instant::now);
                 let lhs = match loaded_task.task {
                     PublicLookupStage1Task::DirectIdentity { .. } => {
@@ -539,11 +592,25 @@ where
                     }
                 };
                 let output = lhs * &loaded_task.rhs_chunk;
+                let output_bytes = output.into_compact_bytes();
+                let compute_ms = maybe_elapsed_ms(compute_started);
+                debug!(
+                    "GGH15 BGG poly-encoding gpu public-lookup stage1 compute complete: gate_id={}, lut_id={}, slot={}, device_slot={}, device_id={}, task={}, output_bytes={}, compute_ms={:.3}",
+                    gate_id,
+                    lut_id,
+                    slot.slot_idx,
+                    loaded_task.device_slot,
+                    shared_by_device[loaded_task.device_slot].device_id,
+                    task_label,
+                    output_bytes.len(),
+                    compute_ms
+                );
                 ComputedPublicLookupStage1Task {
+                    device_slot: loaded_task.device_slot,
                     task: loaded_task.task,
-                    bytes: Arc::<[u8]>::from(output.into_compact_bytes()),
+                    bytes: Arc::<[u8]>::from(output_bytes),
                     load_ms: loaded_task.load_ms,
-                    compute_ms: maybe_elapsed_ms(compute_started),
+                    compute_ms,
                 }
             })
             .collect::<Vec<_>>()
@@ -555,6 +622,24 @@ where
             for output in device_outputs {
                 let store_started = collect_bench.then(Instant::now);
                 let task = output.task;
+                let task_label = match task {
+                    PublicLookupStage1Task::DirectIdentity { output_chunk_idx } => {
+                        format!("direct_identity(output_chunk={output_chunk_idx})")
+                    }
+                    PublicLookupStage1Task::Intermediate { key } => format!(
+                        "intermediate(family={:?}, inner_chunk={})",
+                        key.family, key.inner_chunk_idx
+                    ),
+                };
+                debug!(
+                    "GGH15 BGG poly-encoding gpu public-lookup stage1 store start: gate_id={}, lut_id={}, slot={}, device_slot={}, device_id={}, task={}",
+                    gate_id,
+                    lut_id,
+                    slot.slot_idx,
+                    output.device_slot,
+                    shared_by_device[output.device_slot].device_id,
+                    task_label
+                );
                 let bytes = output.bytes;
                 match task {
                     PublicLookupStage1Task::DirectIdentity { output_chunk_idx } => {
@@ -564,13 +649,24 @@ where
                         stage1_results.insert(key, bytes);
                     }
                 }
+                let store_ms = maybe_elapsed_ms(store_started);
+                debug!(
+                    "GGH15 BGG poly-encoding gpu public-lookup stage1 store complete: gate_id={}, lut_id={}, slot={}, device_slot={}, device_id={}, task={}, store_ms={:.3}",
+                    gate_id,
+                    lut_id,
+                    slot.slot_idx,
+                    output.device_slot,
+                    shared_by_device[output.device_slot].device_id,
+                    task_label,
+                    store_ms
+                );
                 if collect_bench {
                     update_group_store_timing(
                         &mut stage1_group_stats,
                         stage1_task_bench_group(&task),
                         output.load_ms,
                         output.compute_ms,
-                        maybe_elapsed_ms(store_started),
+                        store_ms,
                     );
                 }
             }
@@ -748,7 +844,21 @@ where
                 .into_par_iter()
                 .filter_map(|ctx| {
                     let task = ctx.batch.get(wave_idx).copied()?;
+                    let task_label = format!(
+                        "family={:?}, inner_chunk={}, output_chunk={}",
+                        task.key.family, task.key.inner_chunk_idx, task.output_chunk_idx
+                    );
                     let load_started = collect_bench.then(Instant::now);
+                    debug!(
+                        "GGH15 BGG poly-encoding gpu public-lookup stage2 load start: gate_id={}, lut_id={}, slot={}, wave={}, device_slot={}, device_id={}, task={}",
+                        gate_id,
+                        lut_id,
+                        slot.slot_idx,
+                        wave_idx,
+                        ctx.device_slot,
+                        ctx.shared_dev.device_id,
+                        task_label
+                    );
                     let stage1_mid = ctx
                         .stage1_cache
                         .entry(task.key)
@@ -850,12 +960,28 @@ where
                         0,
                         rhs_full.col_size(),
                     );
+                    let load_ms = maybe_elapsed_ms(load_started);
+                    debug!(
+                        "GGH15 BGG poly-encoding gpu public-lookup stage2 load complete: gate_id={}, lut_id={}, slot={}, wave={}, device_slot={}, device_id={}, task={}, stage1_mid_rows={}, stage1_mid_cols={}, rhs_rows={}, rhs_cols={}, load_ms={:.3}",
+                        gate_id,
+                        lut_id,
+                        slot.slot_idx,
+                        wave_idx,
+                        ctx.device_slot,
+                        ctx.shared_dev.device_id,
+                        task_label,
+                        stage1_mid.row_size(),
+                        stage1_mid.col_size(),
+                        rhs_chunk.row_size(),
+                        rhs_chunk.col_size(),
+                        load_ms
+                    );
                     Some(LoadedPublicLookupStage2Task {
                         device_slot: ctx.device_slot,
                         task,
                         stage1_mid,
                         rhs_chunk,
-                        load_ms: maybe_elapsed_ms(load_started),
+                        load_ms,
                     })
                 })
                 .collect::<Vec<_>>();
@@ -865,16 +991,44 @@ where
         loaded_wave
             .into_par_iter()
             .map(|loaded_task| {
-                let _device_slot = loaded_task.device_slot;
+                let task_label = format!(
+                    "family={:?}, inner_chunk={}, output_chunk={}",
+                    loaded_task.task.key.family,
+                    loaded_task.task.key.inner_chunk_idx,
+                    loaded_task.task.output_chunk_idx
+                );
+                debug!(
+                    "GGH15 BGG poly-encoding gpu public-lookup stage2 compute start: gate_id={}, lut_id={}, slot={}, device_slot={}, device_id={}, task={}",
+                    gate_id,
+                    lut_id,
+                    slot.slot_idx,
+                    loaded_task.device_slot,
+                    shared_by_device[loaded_task.device_slot].device_id,
+                    task_label
+                );
                 let compute_started = collect_bench.then(Instant::now);
                 let contribution = &loaded_task.stage1_mid * &loaded_task.rhs_chunk;
+                let contribution_bytes = contribution.into_compact_bytes();
+                let compute_ms = maybe_elapsed_ms(compute_started);
+                debug!(
+                    "GGH15 BGG poly-encoding gpu public-lookup stage2 compute complete: gate_id={}, lut_id={}, slot={}, device_slot={}, device_id={}, task={}, output_bytes={}, compute_ms={:.3}",
+                    gate_id,
+                    lut_id,
+                    slot.slot_idx,
+                    loaded_task.device_slot,
+                    shared_by_device[loaded_task.device_slot].device_id,
+                    task_label,
+                    contribution_bytes.len(),
+                    compute_ms
+                );
                 PublicLookupStage2Contribution {
+                    device_slot: loaded_task.device_slot,
                     family: loaded_task.task.key.family,
                     output_chunk_idx: loaded_task.task.output_chunk_idx,
                     key: loaded_task.task.key,
-                    bytes: Arc::<[u8]>::from(contribution.into_compact_bytes()),
+                    bytes: Arc::<[u8]>::from(contribution_bytes),
                     load_ms: loaded_task.load_ms,
-                    compute_ms: maybe_elapsed_ms(compute_started),
+                    compute_ms,
                 }
             })
             .collect::<Vec<_>>()
@@ -884,6 +1038,21 @@ where
          reduced_chunks: &mut Vec<Option<M>>| {
             for contribution in contributions {
                 let store_started = collect_bench.then(Instant::now);
+                let task_label = format!(
+                    "family={:?}, inner_chunk={}, output_chunk={}",
+                    contribution.key.family,
+                    contribution.key.inner_chunk_idx,
+                    contribution.output_chunk_idx
+                );
+                debug!(
+                    "GGH15 BGG poly-encoding gpu public-lookup stage2 store start: gate_id={}, lut_id={}, slot={}, device_slot={}, device_id={}, task={}",
+                    gate_id,
+                    lut_id,
+                    slot.slot_idx,
+                    contribution.device_slot,
+                    shared_by_device[contribution.device_slot].device_id,
+                    task_label
+                );
                 let contribution_matrix =
                     M::from_compact_bytes(&shared_by_device[0].params, contribution.bytes.as_ref());
                 let accum =
@@ -910,13 +1079,26 @@ where
                         accum.add_in_place(&contribution_matrix);
                     }
                 }
+                let store_ms = maybe_elapsed_ms(store_started);
+                debug!(
+                    "GGH15 BGG poly-encoding gpu public-lookup stage2 store complete: gate_id={}, lut_id={}, slot={}, device_slot={}, device_id={}, task={}, accum_rows={}, accum_cols={}, store_ms={:.3}",
+                    gate_id,
+                    lut_id,
+                    slot.slot_idx,
+                    contribution.device_slot,
+                    shared_by_device[contribution.device_slot].device_id,
+                    task_label,
+                    accum.row_size(),
+                    accum.col_size(),
+                    store_ms
+                );
                 if collect_bench {
                     update_group_store_timing(
                         &mut stage2_group_stats,
                         contribution.key,
                         contribution.load_ms,
                         contribution.compute_ms,
-                        maybe_elapsed_ms(store_started),
+                        store_ms,
                     );
                 }
             }

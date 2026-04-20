@@ -26,21 +26,19 @@ use std::{
 use tracing::debug;
 
 use super::pubkey::{
-    build_small_decomposed_scalar_mul_chunk, column_chunk_bounds, column_chunk_count,
-    left_mul_chunked_checkpoint_column, read_matrix_column_chunk, small_decomposed_scalar_digits,
-    small_gadget_chunk_count, trapdoor_public_column_count,
+    column_chunk_bounds, column_chunk_count, left_mul_chunked_checkpoint_column,
+    read_matrix_column_chunk, trapdoor_public_column_count,
 };
 
 pub(super) struct GGH15PublicLookupSharedState<M: PolyMatrix> {
     pub d: usize,
     pub m_g: usize,
-    pub k_small: usize,
     pub gadget_matrix: Arc<M>,
     pub preimage_gate1_id_prefix: String,
     pub preimage_gate2_identity_id_prefix: String,
     pub preimage_gate2_gy_id_prefix: String,
     pub preimage_gate2_v_id_prefix: String,
-    pub preimage_gate2_vx_small_id_prefixes: Vec<String>,
+    pub preimage_gate2_vx_id_prefix: String,
     pub out_pubkey: BggPublicKey<M>,
 }
 
@@ -200,7 +198,6 @@ where
     let lut_aux_prefix = format!("{checkpoint_prefix}_lut_aux_{}", lut_id);
     let lut_aux_row_id = format!("{lut_aux_prefix}_idx{k}");
     let gy = shared.gadget_matrix.as_ref().clone() * y_poly;
-    let scalar_by_digit = small_decomposed_scalar_digits::<M>(params, x, shared.k_small);
     let gate1_total_cols = trapdoor_public_column_count::<M>(params, shared.d);
     let u_g_id = format!("ggh15_lut_u_g_matrix_{}", gate_id);
     let (col_start, col_len) = column_chunk_bounds(shared.m_g, chunk_idx);
@@ -246,23 +243,16 @@ where
     );
     c_const_chunk.add_in_place(&(c_b0 * &v_mid));
 
-    for small_chunk_idx in 0..shared.k_small {
-        let vx_rhs_chunk = build_small_decomposed_scalar_mul_chunk::<M>(
-            params,
-            &v_idx_chunk,
-            &scalar_by_digit,
-            small_chunk_idx,
-        );
-        let vx_mid = mul_chunked_checkpoint_with_rhs(
-            params,
-            dir,
-            &shared.preimage_gate2_vx_small_id_prefixes[small_chunk_idx],
-            shared.m_g,
-            &vx_rhs_chunk,
-            "preimage_gate2_vx",
-        );
-        c_const_chunk.add_in_place(&(c_b0 * &vx_mid));
-    }
+    let vx_rhs_chunk = v_idx_chunk.clone() * x.clone();
+    let vx_mid = mul_chunked_checkpoint_with_rhs(
+        params,
+        dir,
+        &shared.preimage_gate2_vx_id_prefix,
+        shared.m_g,
+        &vx_rhs_chunk,
+        "preimage_gate2_vx",
+    );
+    c_const_chunk.add_in_place(&(c_b0 * &vx_mid));
 
     let preimage_lut_chunk = read_matrix_column_chunk(
         params,
@@ -322,7 +312,6 @@ where
     HS: PolyHashSampler<[u8; 32], M = M>,
 {
     let m_g = d * params.modulus_digits();
-    let k_small = small_gadget_chunk_count::<M>(params);
 
     let out_pubkey = BggPublicKey {
         matrix: HS::new().sample_hash(
@@ -339,7 +328,6 @@ where
     GGH15PublicLookupSharedState {
         d,
         m_g,
-        k_small,
         gadget_matrix: Arc::new(M::gadget_matrix(params, d)),
         preimage_gate1_id_prefix: format!("{checkpoint_prefix}_preimage_gate1_{}", gate_id),
         preimage_gate2_identity_id_prefix: format!(
@@ -348,14 +336,7 @@ where
         ),
         preimage_gate2_gy_id_prefix: format!("{checkpoint_prefix}_preimage_gate2_gy_{}", gate_id),
         preimage_gate2_v_id_prefix: format!("{checkpoint_prefix}_preimage_gate2_v_{}", gate_id),
-        preimage_gate2_vx_small_id_prefixes: (0..k_small)
-            .map(|small_chunk_idx| {
-                format!(
-                    "{checkpoint_prefix}_preimage_gate2_vx_{}_small{}",
-                    gate_id, small_chunk_idx
-                )
-            })
-            .collect(),
+        preimage_gate2_vx_id_prefix: format!("{checkpoint_prefix}_preimage_gate2_vx_{}", gate_id),
         out_pubkey,
     }
 }

@@ -82,7 +82,6 @@ where
                 shared: GGH15PublicLookupSharedState {
                     d: shared.d,
                     m_g: shared.m_g,
-                    k_small: shared.k_small,
                     gadget_matrix: Arc::new(M::from_compact_bytes(
                         &local_params,
                         gadget_matrix_bytes.as_ref(),
@@ -93,9 +92,7 @@ where
                         .clone(),
                     preimage_gate2_gy_id_prefix: shared.preimage_gate2_gy_id_prefix.clone(),
                     preimage_gate2_v_id_prefix: shared.preimage_gate2_v_id_prefix.clone(),
-                    preimage_gate2_vx_small_id_prefixes: shared
-                        .preimage_gate2_vx_small_id_prefixes
-                        .clone(),
+                    preimage_gate2_vx_id_prefix: shared.preimage_gate2_vx_id_prefix.clone(),
                     out_pubkey: BggPublicKey {
                         matrix: M::from_compact_bytes(
                             &local_params,

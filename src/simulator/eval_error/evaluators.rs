@@ -241,6 +241,7 @@ impl AffinePltEvaluator for NormPltLWEEvaluator {
 #[derive(Debug, Clone)]
 pub struct NormPltGGH15Evaluator {
     pub const_term: PolyMatrixNorm,
+    pub input_plaintext_multiplier: PolyMatrixNorm,
     pub e_input_multiplier: PolyMatrixNorm,
 }
 
@@ -294,19 +295,6 @@ impl NormPltGGH15Evaluator {
         let gy_decomposed = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g);
         // Corresponds to `v_idx` in `public_lookup`.
         let v_idx = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g);
-        // Corresponds to the vertically stacked
-        // `small_decomposed_identity_chunk_from_scalar(...)` blocks used in vx accumulation.
-        let small_decomposed_identity_chunks = PolyMatrixNorm::new(
-            ctx.clone(),
-            ctx.m_g * ctx.log_base_q_small,
-            ctx.m_g,
-            ctx.base.clone() - BigDecimal::from(1u64),
-            Some((ctx.m_g - 1) * ctx.log_base_q_small),
-        );
-        // Corresponds to `(small_decomposed_identity_chunk_from_scalar * v_idx)` in
-        // `public_lookup`.
-        let small_times_v = small_decomposed_identity_chunks * &v_idx;
-
         // Corresponds to `preimage_gate2_identity` (B0 preimage for identity/out term).
         let preimage_gate2_identity_from_b0 =
             PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, preimage_norm.clone(), None);
@@ -316,14 +304,9 @@ impl NormPltGGH15Evaluator {
         // Corresponds to `preimage_gate2_v` (B0 preimage for v_idx term).
         let preimage_gate2_v_from_b0 =
             PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, preimage_norm.clone(), None);
-        // Corresponds to concatenated `preimage_gate2_vx_chunk` blocks.
-        let preimage_gate2_vx_from_b0 = PolyMatrixNorm::new(
-            ctx.clone(),
-            ctx.m_b,
-            ctx.m_g * ctx.log_base_q_small,
-            preimage_norm.clone(),
-            None,
-        );
+        // Corresponds to `preimage_gate2_vx` after the stage-5 refactor.
+        let preimage_gate2_vx_from_b0 =
+            PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, preimage_norm.clone(), None);
         // Corresponds to Gaussian `error` added in stage2 target
         // `S_g * w_block_identity + out_matrix + error`.
         let stage2_identity_target_error = PolyMatrixNorm::new(
@@ -352,11 +335,11 @@ impl NormPltGGH15Evaluator {
             None,
         );
         // Corresponds to Gaussian `error` added in stage5 target
-        // `S_g * w_block_vx + (u_g_matrix * gadget_small) + error`.
+        // `S_g * w_block_vx + u_g_matrix + error`.
         let stage5_vx_target_error = PolyMatrixNorm::new(
             ctx.clone(),
             ctx.secret_size,
-            ctx.m_g * ctx.log_base_q_small,
+            ctx.m_g,
             e_mat_sigma * &gaussian_bound,
             None,
         );
@@ -377,17 +360,16 @@ impl NormPltGGH15Evaluator {
         let gate2_vx_from_s = s_vec.clone() * &stage5_vx_target_error;
         let gate2_vx_total = &gate2_vx_from_eb + &gate2_vx_from_s;
 
-        // Corresponds to
-        // `c_b0 * (preimage_gate2_gy * gy_decomposed + preimage_gate2_v * v_idx + vx_product_acc *
-        // v_idx)`.
+        // Corresponds to `c_b0 * (preimage_gate2_gy * gy_decomposed + preimage_gate2_v * v_idx)`.
         let const_term_gate2_gy_total = gate2_gy_total.clone() * gy_decomposed.clone();
         let const_term_gate2_v_total = gate2_v_total.clone() * v_idx.clone();
-        let const_term_gate2_vx_total = gate2_vx_total.clone() * small_times_v.clone();
         let mut const_term_gate2_t_total = const_term_gate2_gy_total.clone();
         const_term_gate2_t_total += const_term_gate2_v_total.clone();
-        const_term_gate2_t_total += const_term_gate2_vx_total.clone();
         // Corresponds to `c_b0 * preimage_gate2_identity`.
         let const_term_gate2_identity_total = gate2_identity_total.clone();
+        // Corresponds to the `c_b0 * (preimage_gate2_vx * (x * v_idx))` term after the refactor.
+        // This is no longer part of the constant term because it scales with the input plaintext.
+        let input_plaintext_multiplier = gate2_vx_total.clone() * v_idx.clone();
 
         // Corresponds to the stored `preimage_lut` loaded in `public_lookup`.
         // In the GGH15 public-key evaluator, `sample_lut_preimages` already samples this matrix
@@ -410,10 +392,17 @@ impl NormPltGGH15Evaluator {
                 bigdecimal_bits_ceil(&const_term.poly_norm.norm)
             )
         );
+        info!(
+            "{}",
+            format!(
+                "GGH15 PLT input-plaintext multiplier norm bits {}",
+                bigdecimal_bits_ceil(&input_plaintext_multiplier.poly_norm.norm)
+            )
+        );
 
         if dump_const_term_breakdown {
             info!(
-                "GGH15 const term breakdown bits: gate1_total={} gate1_from_eb={} gate1_from_s={} gate2_identity_total={} gate2_identity_from_eb={} gate2_identity_from_s={} gate2_gy_total={} gate2_gy_from_eb={} gate2_gy_from_s={} gate2_v_total={} gate2_v_from_eb={} gate2_v_from_s={} gate2_vx_total={} gate2_vx_from_eb={} gate2_vx_from_s={} term_gate2_identity={} term_gate2_gy={} term_gate2_v={} term_gate2_vx={} term_gate2_t={} term_lut_subtraction={} const_total={}",
+                "GGH15 const term breakdown bits: gate1_total={} gate1_from_eb={} gate1_from_s={} gate2_identity_total={} gate2_identity_from_eb={} gate2_identity_from_s={} gate2_gy_total={} gate2_gy_from_eb={} gate2_gy_from_s={} gate2_v_total={} gate2_v_from_eb={} gate2_v_from_s={} gate2_vx_total={} gate2_vx_from_eb={} gate2_vx_from_s={} term_gate2_identity={} term_gate2_gy={} term_gate2_v={} term_gate2_t={} term_gate2_vx_input_plaintext_multiplier={} term_lut_subtraction={} const_total={}",
                 gate1_total_bits,
                 gate1_from_eb_bits,
                 gate1_from_s_bits,
@@ -432,8 +421,8 @@ impl NormPltGGH15Evaluator {
                 matrix_norm_bits(&const_term_gate2_identity_total),
                 matrix_norm_bits(&const_term_gate2_gy_total),
                 matrix_norm_bits(&const_term_gate2_v_total),
-                matrix_norm_bits(&const_term_gate2_vx_total),
                 matrix_norm_bits(&const_term_gate2_t_total),
+                matrix_norm_bits(&input_plaintext_multiplier),
                 matrix_norm_bits(&const_term_lut_subtraction_total),
                 matrix_norm_bits(&const_term)
             );
@@ -449,7 +438,7 @@ impl NormPltGGH15Evaluator {
             )
         );
 
-        Self { const_term, e_input_multiplier }
+        Self { const_term, input_plaintext_multiplier, e_input_multiplier }
     }
 }
 
@@ -466,7 +455,9 @@ impl PltEvaluator<ErrorNorm> for NormPltGGH15Evaluator {
         let plaintext_bd =
             BigDecimal::from(num_bigint::BigInt::from(plt.max_output_row().1.value().clone()));
         let plaintext_norm = PolyNorm::new(input.clone_ctx(), plaintext_bd);
-        let matrix_norm = &self.const_term + &input.matrix_norm * &self.e_input_multiplier;
+        let plaintext_term = self.input_plaintext_multiplier.clone() * &input.plaintext_norm;
+        let matrix_norm =
+            &self.const_term + &plaintext_term + &input.matrix_norm * &self.e_input_multiplier;
         ErrorNorm { matrix_norm, plaintext_norm }
     }
 }
@@ -482,10 +473,11 @@ impl AffinePltEvaluator for NormPltGGH15Evaluator {
         let plaintext_bd =
             BigDecimal::from(num_bigint::BigInt::from(plt.max_output_row().1.value().clone()));
         let plaintext_norm = PolyNorm::new(input.plaintext_norm.ctx.clone(), plaintext_bd);
+        let plaintext_term = self.input_plaintext_multiplier.clone() * &input.plaintext_norm;
         let matrix_expr = input
             .matrix_expr
             .transform_matrix(&self.e_input_multiplier)
-            .add_expr(&AffineErrorNormExpr::constant(self.const_term.clone()));
+            .add_expr(&AffineErrorNormExpr::constant(&self.const_term + &plaintext_term));
         ErrorNormSummaryExpr { plaintext_norm, matrix_expr }
     }
 }

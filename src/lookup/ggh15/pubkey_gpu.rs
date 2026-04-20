@@ -373,13 +373,11 @@ where
         lut_id: usize,
         idx: usize,
         local_y_poly: &M::P,
-        idx_scalar_by_digit: &[M::P],
+        idx_poly: &M::P,
         chunk_idx: usize,
     ) -> M {
         let d = self.d;
         let m = d * shared_dev.params.modulus_digits();
-        let (_, _, crt_depth) = shared_dev.params.to_crt();
-        let k_small = shared_dev.params.modulus_digits() / crt_depth;
         let (col_start, col_len) = column_chunk_bounds(m, chunk_idx);
         let col_end = col_start + col_len;
         let mut target_chunk = shared_dev.w_block_identity.slice(0, d, col_start, col_end);
@@ -400,23 +398,9 @@ where
         );
         target_chunk.add_in_place(&(shared_dev.w_block_v.clone() * &v_idx_chunk));
 
-        for small_chunk_idx in 0..k_small {
-            let w_vx_chunk = self.derive_w_block_with_tag_columns(
-                shared_dev.params,
-                lut_id,
-                "block_vx",
-                m * k_small,
-                small_chunk_idx * m,
-                m,
-            );
-            let vx_rhs_chunk = build_small_decomposed_scalar_mul_chunk::<M>(
-                shared_dev.params,
-                &v_idx_chunk,
-                idx_scalar_by_digit,
-                small_chunk_idx,
-            );
-            target_chunk.add_in_place(&(w_vx_chunk * vx_rhs_chunk));
-        }
+        let w_vx_chunk = self.derive_w_block_with_tag(shared_dev.params, lut_id, "block_vx", m);
+        let vx_rhs_chunk = v_idx_chunk.clone() * idx_poly.clone();
+        target_chunk.add_in_place(&(w_vx_chunk * vx_rhs_chunk));
 
         target_chunk
     }
@@ -522,28 +506,19 @@ where
         lut_id: usize,
         s_g: &M,
         u_g_matrix: &M,
-        small_chunk_idx: usize,
         col_chunk_idx: usize,
     ) -> M {
         let d = self.d;
         let m_g = d * shared.params.modulus_digits();
-        let k_small = small_gadget_chunk_count::<M>(shared.params);
         let (col_start, col_len) = column_chunk_bounds(m_g, col_chunk_idx);
-        let small_chunk_start =
-            small_chunk_idx.checked_mul(m_g).expect("stage5 small-chunk start column overflow");
-        let target_high_vx_chunk = self.build_stage5_target_high_vx_chunk(
-            shared.params,
-            u_g_matrix,
-            small_chunk_idx,
-            col_start,
-            col_len,
-        );
+        let target_high_vx_chunk =
+            self.build_stage5_target_high_vx_chunk(u_g_matrix, col_start, col_len);
         let w_block_vx_chunk = self.derive_w_block_with_tag_columns(
             shared.params,
             lut_id,
             "block_vx",
-            m_g * k_small,
-            small_chunk_start + col_start,
+            m_g,
+            col_start,
             col_len,
         );
         let mut target_chunk = s_g.clone() * &w_block_vx_chunk;
@@ -565,8 +540,6 @@ where
         debug!("Sampling LUT preimages started: lut_id={}, batch_size={}", lut_id, batch.len());
         let d = self.d;
         let m = d * params.modulus_digits();
-        let (_, _, crt_depth) = params.to_crt();
-        let k_small = params.modulus_digits() / crt_depth;
         debug_assert!(!shared.is_empty(), "gpu shared resources must not be empty");
         debug_assert_eq!(
             shared[0].w_block_identity.col_size(),
@@ -593,12 +566,7 @@ where
                     .par_iter()
                     .map(|(idx, _device_slot, local_y_poly)| {
                         let idx_poly = M::P::from_usize_to_constant(shared[0].params, *idx);
-                        let idx_scalar_by_digit = small_decomposed_scalar_digits::<M>(
-                            shared[0].params,
-                            &idx_poly,
-                            k_small,
-                        );
-                        (*idx, local_y_poly.clone(), idx_scalar_by_digit)
+                        (*idx, local_y_poly.clone(), idx_poly)
                     })
                     .collect::<Vec<_>>();
                 let chunk_count = column_chunk_count(m);
@@ -616,13 +584,13 @@ where
                         .enumerate()
                         .map(|(device_slot, (state_idx, chunk_idx))| {
                             let shared_dev = &shared[device_slot];
-                            let (idx, local_y_poly, idx_scalar_by_digit) = &row_states[*state_idx];
+                            let (idx, local_y_poly, idx_poly) = &row_states[*state_idx];
                             let target_chunk = self.build_lut_preimage_target_chunk_gpu(
                                 shared_dev,
                                 lut_id,
                                 *idx,
                                 local_y_poly,
-                                idx_scalar_by_digit,
+                                idx_poly,
                                 *chunk_idx,
                             );
                             GpuPreimageRequest {
@@ -682,7 +650,6 @@ where
 
         let d = self.d;
         let m_g = d * params.modulus_digits();
-        let k_small = small_gadget_chunk_count::<M>(params);
         let trap_sampler = TS::new(params, self.trapdoor_sigma);
         debug_assert!(
             shared.iter().all(|entry| entry.b1_matrix.row_size() == d),
@@ -961,10 +928,7 @@ where
             .iter()
             .enumerate()
             .flat_map(|(input_idx, _)| {
-                (0..k_small).flat_map(move |small_chunk_idx| {
-                    (0..stage_mg_chunk_count)
-                        .map(move |col_chunk_idx| (input_idx, small_chunk_idx, col_chunk_idx))
-                })
+                (0..stage_mg_chunk_count).map(move |col_chunk_idx| (input_idx, col_chunk_idx))
             })
             .collect::<Vec<_>>();
         for wave in stage5_tasks.chunks(shared.len().max(1)) {
@@ -973,7 +937,7 @@ where
                 let requests = wave
                     .par_iter()
                     .enumerate()
-                    .map(|(device_slot, (input_idx, small_chunk_idx, col_chunk_idx))| {
+                    .map(|(device_slot, (input_idx, col_chunk_idx))| {
                         let shared = &shared[device_slot];
                         let (_, _gate_id, s_g_bytes, u_g_bytes) = &stage5_inputs[*input_idx];
                         let s_g = M::from_compact_bytes(shared.params, s_g_bytes);
@@ -983,7 +947,6 @@ where
                             lut_id,
                             &s_g,
                             &u_g_matrix,
-                            *small_chunk_idx,
                             *col_chunk_idx,
                         );
                         GpuPreimageRequest {
@@ -1002,29 +965,24 @@ where
                 let stage5_jobs = wave
                     .iter()
                     .enumerate()
-                    .map(|(device_slot, (input_idx, small_chunk_idx, col_chunk_idx))| {
+                    .map(|(device_slot, (input_idx, col_chunk_idx))| {
                         let (_, gate_id, _, _) = &stage5_inputs[*input_idx];
                         let preimage_gate2_vx_chunk =
                             stage5_preimages.remove(&device_slot).unwrap_or_else(|| {
                                 panic!(
-                                    "missing gate stage5 preimage for input_idx={}, small_chunk_idx={}, col_chunk_idx={}",
-                                    input_idx, small_chunk_idx, col_chunk_idx
+                                    "missing gate stage5 preimage for input_idx={}, col_chunk_idx={}",
+                                    input_idx, col_chunk_idx
                                 )
                             });
                         debug!(
-                            "Sampled gate preimage 2 (vx part): gate_id={}, lut_id={}, small_chunk_idx={}, col_chunk_idx={}",
+                            "Sampled gate preimage 2 (vx part): gate_id={}, lut_id={}, col_chunk_idx={}",
                             gate_id,
                             lut_id,
-                            small_chunk_idx,
                             col_chunk_idx
                         );
                         CompactBytesJob::new(
                             column_chunk_id_prefix(
-                                &self.preimage_gate2_vx_small_id_prefix(
-                                    params,
-                                    *gate_id,
-                                    *small_chunk_idx,
-                                ),
+                                &self.preimage_gate2_vx_id_prefix(params, *gate_id),
                                 *col_chunk_idx,
                             ),
                             vec![(0, preimage_gate2_vx_chunk)],
@@ -1251,12 +1209,10 @@ where
         let d = self.d;
         let chunk_count = lut_entry_chunk_count::<M>(params, d);
         let y_poly = M::P::from_usize_to_constant(shared.params, 1usize);
-        let k_small = small_gadget_chunk_count::<M>(shared.params);
         let idx_poly = M::P::from_usize_to_constant(shared.params, 0usize);
-        let idx_digits = small_decomposed_scalar_digits::<M>(shared.params, &idx_poly, k_small);
         let start = Instant::now();
         let target_chunk =
-            self.build_lut_preimage_target_chunk_gpu(shared, lut_id, 0, &y_poly, &idx_digits, 0);
+            self.build_lut_preimage_target_chunk_gpu(shared, lut_id, 0, &y_poly, &idx_poly, 0);
         let preimage_chunk =
             trap_sampler.preimage(shared.params, shared.trapdoor, shared.b1_matrix, &target_chunk);
         let chunk_bytes = preimage_chunk.into_compact_bytes();
@@ -1290,7 +1246,6 @@ where
         let m_g = d * params.modulus_digits();
         let stage1_chunk_count = column_chunk_count(gpu_gate_shared[0].b1_matrix.col_size());
         let stage_mg_chunk_count = column_chunk_count(m_g);
-        let k_small = small_gadget_chunk_count::<M>(params);
         let shared = &gpu_gate_shared[0];
         let s_g = US::new().sample_uniform(shared.params, d, d, DistType::TernaryDist);
         let input_matrix = M::gadget_matrix(shared.params, d);
@@ -1335,7 +1290,7 @@ where
         );
         let start = Instant::now();
         let target_chunk =
-            self.build_gate_stage5_target_chunk_gpu(shared, lut_id, &s_g, &u_g_matrix, 0, 0);
+            self.build_gate_stage5_target_chunk_gpu(shared, lut_id, &s_g, &u_g_matrix, 0);
         let preimage_chunk = trap_sampler.preimage(
             shared.params,
             shared.b0_trapdoor,
@@ -1366,7 +1321,7 @@ where
         );
         let stage5_estimate = SampleAuxBenchEstimate::from_chunk(
             stage5_latency,
-            k_small * stage_mg_chunk_count,
+            stage_mg_chunk_count,
             chunk_bytes.len(),
         );
         SampleAuxBenchEstimate {
@@ -1410,23 +1365,7 @@ where
 
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
-    use super::{
-        build_small_decomposed_scalar_mul_chunk, round_robin_device_slot,
-        small_decomposed_scalar_digits, source_device_first,
-    };
-    use crate::{
-        __PAIR, __TestState,
-        matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
-        poly::{
-            Poly, PolyParams,
-            dcrt::{
-                gpu::{GpuDCRTPoly, GpuDCRTPolyParams, gpu_device_sync},
-                params::DCRTPolyParams,
-            },
-        },
-    };
-    use num_bigint::BigUint;
-    use sequential_test::sequential;
+    use super::{round_robin_device_slot, source_device_first};
 
     #[test]
     fn round_robin_device_slot_wraps_after_last_device() {
@@ -1455,51 +1394,5 @@ mod tests {
     fn source_device_first_moves_source_to_front() {
         assert_eq!(source_device_first(vec![2, 0, 1], 0), vec![0, 2, 1]);
         assert_eq!(source_device_first(vec![0, 1, 2], 0), vec![0, 1, 2]);
-    }
-
-    #[test]
-    #[sequential]
-    fn gpu_small_decomposed_scalar_mul_chunk_matches_dense_identity_chunk() {
-        gpu_device_sync();
-        let cpu_params = DCRTPolyParams::new(128, 2, 16, 4);
-        let (moduli, _, _) = cpu_params.to_crt();
-        let params =
-            GpuDCRTPolyParams::new(cpu_params.ring_dimension(), moduli, cpu_params.base_bits());
-        let chunk_count = super::small_gadget_chunk_count::<GpuDCRTPolyMatrix>(&params);
-        let nrow = 8usize;
-        let ncol = 3usize;
-        assert_eq!(nrow % chunk_count, 0, "test requires nrow divisible by chunk_count");
-
-        let scalar = GpuDCRTPoly::from_biguint_to_constant(&params, BigUint::from(13u32));
-        let scalar_by_digit =
-            small_decomposed_scalar_digits::<GpuDCRTPolyMatrix>(&params, &scalar, chunk_count);
-        let source = GpuDCRTPolyMatrix::from_poly_vec(
-            &params,
-            (0..nrow)
-                .map(|row| {
-                    (0..ncol)
-                        .map(|col| GpuDCRTPoly::from_usize_to_constant(&params, row * 10 + col + 1))
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>(),
-        );
-
-        for chunk_idx in 0..chunk_count {
-            let dense_chunk = GpuDCRTPolyMatrix::small_decomposed_identity_chunk_from_scalar(
-                &params,
-                nrow,
-                &scalar,
-                chunk_idx,
-                chunk_count,
-            );
-            let expected = dense_chunk * source.clone();
-            let actual = build_small_decomposed_scalar_mul_chunk::<GpuDCRTPolyMatrix>(
-                &params,
-                &source,
-                &scalar_by_digit,
-                chunk_idx,
-            );
-            assert_eq!(actual, expected, "chunk mismatch at chunk_idx={chunk_idx}");
-        }
     }
 }

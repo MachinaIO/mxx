@@ -1,5 +1,8 @@
 use super::*;
-use crate::poly::{PolyParams, dcrt::gpu::detected_gpu_device_ids};
+use crate::poly::{
+    PolyParams,
+    dcrt::gpu::{GPU_POLY_FORMAT_COEFF, GPU_POLY_FORMAT_EVAL, detected_gpu_device_ids},
+};
 use rayon::prelude::*;
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
@@ -76,6 +79,33 @@ struct ComputedSlotTransferStage2Task {
     bytes: Vec<u8>,
     load_ms: f64,
     compute_ms: f64,
+}
+
+fn zero_compact_bytes_from_template<M: PolyMatrix>(
+    params: &<M::P as Poly>::Params,
+    template_bytes: &[u8],
+    nrow: usize,
+    ncol: usize,
+) -> Vec<u8> {
+    let (version, format_tag, level_u32, _, _, max_coeff_bits, _, _): (
+        u8,
+        u8,
+        u32,
+        usize,
+        usize,
+        u16,
+        u16,
+        Vec<u8>,
+    ) = bincode::decode_from_slice(template_bytes, bincode::config::standard())
+        .expect("Failed to decode template compact bytes for zero matrix")
+        .0;
+    assert_eq!(version, 1, "Unsupported compact matrix version: {version}");
+    let is_ntt = match format_tag {
+        x if x == GPU_POLY_FORMAT_COEFF as u8 => false,
+        x if x == GPU_POLY_FORMAT_EVAL as u8 => true,
+        _ => panic!("Invalid compact matrix format tag: {format_tag}"),
+    };
+    M::zero_compact_bytes(params, nrow, ncol, level_u32 as usize, is_ntt, max_coeff_bits)
 }
 
 pub(super) fn effective_gpu_slot_parallelism(slot_parallelism: usize) -> usize {
@@ -792,9 +822,12 @@ where
         entry.task_count += 1;
     }
     let input_vector = M::from_compact_bytes(&shared.params, input_vector_bytes.as_ref());
-    let mut b0_chunk_bytes = (0..b0_chunk_count).map(|_| None).collect::<Vec<_>>();
-    let mut gate_chunk_bytes = (0..gate_chunk_count).map(|_| None).collect::<Vec<_>>();
-    let mut input_direct_bytes = None;
+    let mut b0_output_shape = None::<(usize, usize)>;
+    let mut b0_template_bytes = None::<Arc<[u8]>>;
+    let mut gate_output_shape = None::<(usize, usize)>;
+    let mut gate_template_bytes = None::<Arc<[u8]>>;
+    let mut input_direct_shape = None::<(usize, usize)>;
+    let mut input_direct_template_bytes = None::<Arc<[u8]>>;
     for task in stage1_representative_tasks {
         let load_started = Instant::now();
         let rhs_chunk = load_stage1_rhs_chunk::<M, HS>(
@@ -817,26 +850,24 @@ where
             }
         };
         let output = lhs * &rhs_chunk;
+        let output_shape = (output.row_size(), output.col_size());
         let compute_s = compute_started.elapsed().as_secs_f64();
         let store_started = Instant::now();
-        let output_bytes = output.into_compact_bytes();
+        let output_bytes = Arc::<[u8]>::from(output.into_compact_bytes());
         match task {
             SlotTransferStage1Task::B0Chunk { chunk_idx } => {
-                let bytes = Some(output_bytes);
-                for chunk_bytes in &mut b0_chunk_bytes {
-                    *chunk_bytes = bytes.clone();
-                }
+                b0_output_shape = Some(output_shape);
+                b0_template_bytes = Some(output_bytes);
                 debug_assert!(chunk_idx < b0_chunk_count);
             }
             SlotTransferStage1Task::GateChunk { chunk_idx } => {
-                let bytes = Some(output_bytes);
-                for chunk_bytes in &mut gate_chunk_bytes {
-                    *chunk_bytes = bytes.clone();
-                }
+                gate_output_shape = Some(output_shape);
+                gate_template_bytes = Some(output_bytes);
                 debug_assert!(chunk_idx < gate_chunk_count);
             }
             SlotTransferStage1Task::InputDirect => {
-                input_direct_bytes = Some(output_bytes);
+                input_direct_shape = Some(output_shape);
+                input_direct_template_bytes = Some(output_bytes);
             }
         }
         update_group_store_timing(
@@ -847,36 +878,39 @@ where
             store_started.elapsed().as_secs_f64(),
         );
     }
-    let c_b0_slot_preimage_b0: M = concat_chunk_bytes_on_base(
+    let (b0_rows, _) =
+        b0_output_shape.expect("missing slot-transfer representative b0 output shape");
+    let (gate_rows, _) =
+        gate_output_shape.expect("missing slot-transfer representative gate output shape");
+    let (input_direct_rows, input_direct_cols) =
+        input_direct_shape.expect("missing slot-transfer representative input-direct output shape");
+    let c_b0_slot_preimage_b0_bytes = Arc::<[u8]>::from(zero_compact_bytes_from_template::<M>(
         params,
-        b0_chunk_bytes
-            .into_iter()
-            .enumerate()
-            .map(|(chunk_idx, maybe_bytes)| {
-                maybe_bytes.unwrap_or_else(|| {
-                    panic!("missing slot-transfer b0 chunk bytes for chunk {chunk_idx}")
-                })
-            })
-            .collect(),
-    );
-    let c_b0_slot_preimage_b0_bytes = Arc::<[u8]>::from(c_b0_slot_preimage_b0.into_compact_bytes());
-    let c_gate_bytes = Arc::<[u8]>::from(
-        concat_chunk_bytes_on_base::<M, Vec<u8>>(
-            params,
-            gate_chunk_bytes
-                .into_iter()
-                .enumerate()
-                .map(|(chunk_idx, maybe_bytes)| {
-                    maybe_bytes.unwrap_or_else(|| {
-                        panic!("missing slot-transfer gate chunk bytes for chunk {chunk_idx}")
-                    })
-                })
-                .collect(),
-        )
-        .into_compact_bytes(),
-    );
-    let input_direct_bytes =
-        Arc::<[u8]>::from(input_direct_bytes.expect("missing slot-transfer input-direct bytes"));
+        b0_template_bytes
+            .as_ref()
+            .expect("missing slot-transfer representative b0 template bytes")
+            .as_ref(),
+        b0_rows,
+        slot_preimage_b0_total_cols,
+    ));
+    let c_gate_bytes = Arc::<[u8]>::from(zero_compact_bytes_from_template::<M>(
+        params,
+        gate_template_bytes
+            .as_ref()
+            .expect("missing slot-transfer representative gate template bytes")
+            .as_ref(),
+        gate_rows,
+        gate_total_cols,
+    ));
+    let input_direct_bytes = Arc::<[u8]>::from(zero_compact_bytes_from_template::<M>(
+        params,
+        input_direct_template_bytes
+            .as_ref()
+            .expect("missing slot-transfer representative input-direct template bytes")
+            .as_ref(),
+        input_direct_rows,
+        input_direct_cols,
+    ));
     let stage1_bench = finalize_stage_bench(
         &stage1_group_stats,
         stage1_group_stats.values().map(|stats| stats.task_count).sum(),
@@ -888,7 +922,8 @@ where
         .collect::<Vec<_>>();
     let mut stage2_group_stats = HashMap::<usize, SlotTransferTaskGroupBenchStats>::new();
     stage2_group_stats.entry(0usize).or_default().task_count = stage2_tasks.len();
-    let mut c_transfer_chunk_bytes = (0..b1_chunk_count).map(|_| None).collect::<Vec<_>>();
+    let mut c_transfer_output_shape = None::<(usize, usize)>;
+    let mut c_transfer_template_bytes = None::<Arc<[u8]>>;
     for task in stage2_tasks.into_iter().take(1) {
         let load_started = Instant::now();
         let lhs = M::from_compact_bytes(&shared.params, c_b0_slot_preimage_b0_bytes.as_ref());
@@ -902,13 +937,12 @@ where
         let load_s = load_started.elapsed().as_secs_f64();
         let compute_started = Instant::now();
         let output = &lhs * &rhs_chunk;
+        let output_shape = (output.row_size(), output.col_size());
         let compute_s = compute_started.elapsed().as_secs_f64();
         let store_started = Instant::now();
-        let output_bytes = output.into_compact_bytes();
-        let bytes = Some(Arc::<[u8]>::from(output_bytes));
-        for chunk_bytes in &mut c_transfer_chunk_bytes {
-            *chunk_bytes = bytes.clone();
-        }
+        let output_bytes = Arc::<[u8]>::from(output.into_compact_bytes());
+        c_transfer_output_shape = Some(output_shape);
+        c_transfer_template_bytes = Some(output_bytes);
         update_group_store_timing(
             &mut stage2_group_stats,
             0usize,
@@ -917,15 +951,17 @@ where
             store_started.elapsed().as_secs_f64(),
         );
     }
-    let c_transfer_chunk_bytes = c_transfer_chunk_bytes
-        .into_iter()
-        .enumerate()
-        .map(|(chunk_idx, maybe_bytes)| {
-            maybe_bytes.unwrap_or_else(|| {
-                panic!("missing slot-transfer transfer chunk bytes for chunk {chunk_idx}")
-            })
-        })
-        .collect::<Vec<_>>();
+    let (c_transfer_rows, _) = c_transfer_output_shape
+        .expect("missing slot-transfer representative transfer output shape");
+    let c_transfer_bytes = Arc::<[u8]>::from(zero_compact_bytes_from_template::<M>(
+        params,
+        c_transfer_template_bytes
+            .as_ref()
+            .expect("missing slot-transfer representative transfer template bytes")
+            .as_ref(),
+        c_transfer_rows,
+        slot_preimage_b1_total_cols,
+    ));
     let stage2_bench = finalize_stage_bench(
         &stage2_group_stats,
         stage2_group_stats.values().map(|stats| stats.task_count).sum(),
@@ -934,14 +970,17 @@ where
 
     let stage3_started = Instant::now();
     let scalar_poly = scalar.map(|scalar| M::P::from_usize_to_constant(params, scalar as usize));
-    let out_vector = reduce_slot_transfer_matrix_bytes::<M>(
-        params,
-        input_direct_bytes,
-        c_transfer_chunk_bytes,
-        c_gate_bytes,
-        &output_plaintext,
-        scalar_poly.as_ref(),
+    let mut out_vector = M::from_compact_bytes(params, input_direct_bytes.as_ref());
+    let c_transfer = M::from_compact_bytes(params, c_transfer_bytes.as_ref());
+    let transfer_term = c_transfer * output_plaintext.clone();
+    let ((), c_gate) = rayon::join(
+        || out_vector.add_in_place(&transfer_term),
+        || M::from_compact_bytes(params, c_gate_bytes.as_ref()),
     );
+    if let Some(scalar_poly) = scalar_poly.as_ref() {
+        out_vector = out_vector * scalar_poly;
+    }
+    out_vector.add_in_place(&c_gate);
     if let Some(scalar_poly) = scalar_poly.as_ref() {
         output_plaintext = output_plaintext * scalar_poly;
     }

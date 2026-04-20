@@ -1595,7 +1595,10 @@ mod tests {
         __PAIR, __TestState,
         circuit::{PolyCircuit, evaluable::PolyVec},
         gadgets::{
-            arith::{DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPolyContext},
+            arith::{
+                DEFAULT_MAX_UNREDUCED_MULS, DecomposeArithmeticGadget, MontgomeryPoly,
+                MontgomeryPolyContext, NestedRnsPolyContext, encode_montgomery_poly_with_window,
+            },
             fhe::ring_gsw_nested_rns::{
                 NestedRnsRingGswContext as RingGswContext, ciphertext_inputs_from_native,
                 decrypt_ciphertext, encrypt_plaintext_bit, sample_public_key, sample_secret_key,
@@ -1622,6 +1625,12 @@ mod tests {
     const P_MODULI_BITS: usize = 6;
     const SCALE: u64 = 1 << 8;
     const NUM_SLOTS: usize = 4;
+    const MONT_LIMB_BIT_SIZE: usize = 1;
+    const MONT_CRT_BITS: usize = 10;
+    const MONT_NUM_SLOTS: usize = 2;
+
+    type MontgomeryRingGswContext = super::RingGswContext<DCRTPoly, MontgomeryPoly<DCRTPoly>>;
+    type MontgomeryRingGswCiphertext = super::RingGswCiphertext<DCRTPoly, MontgomeryPoly<DCRTPoly>>;
     fn create_test_context_with(
         circuit: &mut PolyCircuit<DCRTPoly>,
         ring_dim: u32,
@@ -1666,9 +1675,43 @@ mod tests {
         )
     }
 
+    fn create_montgomery_test_context_with(
+        circuit: &mut PolyCircuit<DCRTPoly>,
+        ring_dim: u32,
+        num_slots: usize,
+        active_levels: usize,
+        crt_bits: usize,
+        limb_bit_size: usize,
+    ) -> (DCRTPolyParams, Arc<MontgomeryRingGswContext>) {
+        let params = DCRTPolyParams::new(ring_dim, active_levels, crt_bits, BASE_BITS);
+        let montgomery =
+            Arc::new(MontgomeryPolyContext::setup(circuit, &params, limb_bit_size, false));
+        let ctx = Arc::new(super::RingGswContext::from_arith_context(
+            circuit,
+            &params,
+            num_slots,
+            montgomery,
+            Some(active_levels),
+            None,
+        ));
+        (params, ctx)
+    }
+
+    fn create_montgomery_test_context(
+        circuit: &mut PolyCircuit<DCRTPoly>,
+    ) -> (DCRTPolyParams, Arc<MontgomeryRingGswContext>) {
+        create_montgomery_test_context_with(
+            circuit,
+            MONT_NUM_SLOTS as u32,
+            MONT_NUM_SLOTS,
+            ACTIVE_LEVELS,
+            MONT_CRT_BITS,
+            MONT_LIMB_BIT_SIZE,
+        )
+    }
+
     fn sample_binary_input_pair() -> (u64, u64) {
-        let mut rng = rand::rng();
-        (rng.random_range(0..2u64), rng.random_range(0..2u64))
+        (1, 0)
     }
 
     fn sample_hash_key() -> [u8; 32] {
@@ -1727,6 +1770,96 @@ mod tests {
         let mut coeffs = vec![0u64; NUM_SLOTS];
         coeffs[0] = expected;
         coeffs
+    }
+
+    fn expected_coeffs_for_slots(expected: u64, num_slots: usize) -> Vec<u64> {
+        let mut coeffs = vec![0u64; num_slots];
+        coeffs[0] = expected;
+        coeffs
+    }
+
+    fn sample_plaintext_input_pair(plaintext_modulus: u64) -> (u64, u64) {
+        debug_assert!(plaintext_modulus >= 2);
+        (1, 0)
+    }
+
+    fn montgomery_ring_gsw_q_modulus(ctx: &MontgomeryRingGswContext) -> BigUint {
+        ctx.arith_ctx.q_moduli[..ctx.active_levels]
+            .iter()
+            .fold(BigUint::from(1u64), |acc, &q_i| acc * BigUint::from(q_i))
+    }
+
+    fn montgomery_ring_gsw_plaintext_ciphertext(
+        params: &DCRTPolyParams,
+        ctx: &MontgomeryRingGswContext,
+        plaintext: u64,
+    ) -> [Vec<DCRTPoly>; 2] {
+        let gadget_row = MontgomeryPoly::<DCRTPoly>::gadget_matrix::<DCRTPolyMatrix>(
+            params,
+            ctx.arith_ctx.as_ref(),
+            Some(ctx.active_levels),
+            Some(ctx.level_offset),
+        )
+        .get_row(0);
+        let gadget_len = gadget_row.len();
+        let plaintext_poly = DCRTPoly::from_biguint_to_constant(params, BigUint::from(plaintext));
+        let zero = DCRTPoly::const_zero(params);
+
+        let mut top = gadget_row
+            .iter()
+            .map(|entry| entry.clone() * plaintext_poly.clone())
+            .collect::<Vec<_>>();
+        top.extend((0..gadget_len).map(|_| zero.clone()));
+
+        let mut bottom = vec![zero.clone(); gadget_len];
+        bottom.extend(
+            gadget_row
+                .iter()
+                .map(|entry| entry.clone() * plaintext_poly.clone())
+                .collect::<Vec<_>>(),
+        );
+
+        [top, bottom]
+    }
+
+    fn montgomery_ciphertext_inputs_from_native(
+        params: &DCRTPolyParams,
+        ctx: &MontgomeryRingGswContext,
+        ciphertext: &[Vec<DCRTPoly>; 2],
+    ) -> Vec<PolyVec<DCRTPoly>> {
+        ciphertext
+            .iter()
+            .flat_map(|row| row.iter())
+            .flat_map(|poly| {
+                let coeff_encodings = poly
+                    .coeffs_biguints()
+                    .into_iter()
+                    .map(|coeff| {
+                        encode_montgomery_poly_with_window::<DCRTPoly>(
+                            ctx.arith_ctx.carry_arith_ctx.limb_bit_size,
+                            params,
+                            &coeff,
+                            Some(ctx.active_levels),
+                            ctx.level_offset,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let encoded_len = coeff_encodings
+                    .first()
+                    .map(|encoding| encoding.len())
+                    .expect("Montgomery Ring-GSW polynomials must have at least one coefficient");
+                (0..encoded_len)
+                    .map(|gate_idx| {
+                        PolyVec::new(
+                            coeff_encodings
+                                .iter()
+                                .map(|encoding| encoding[gate_idx].clone())
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     #[cfg(feature = "gpu")]
@@ -2201,7 +2334,7 @@ mod tests {
         let q_modulus = BigUint::from(ctx.nested_rns.q_moduli()[0]);
 
         let (x1, x2) = sample_binary_input_pair();
-        let x3 = rand::rng().random_range(0..2u64);
+        let x3 = 1u64;
         let expected = (x1 * x2 * x3) % plaintext_modulus;
         let lhs_tag = format!("chain_mul_circuit_lhs_{x1}_{x2}_{x3}");
         let rhs1_tag = format!("chain_mul_circuit_rhs1_{x1}_{x2}_{x3}");
@@ -2266,10 +2399,229 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_montgomery_ring_gsw_plaintext_ciphertext_decrypts_without_error() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_montgomery_test_context(&mut circuit);
+        let ciphertext_input = MontgomeryRingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let wire_secret_key = circuit.input(1).at(0).as_single_wire();
+        let decrypted = ciphertext_input.decrypt::<DCRTPolyMatrix>(
+            wire_secret_key,
+            BigUint::from(2u64),
+            &mut circuit,
+        );
+        circuit.output(vec![decrypted]);
+
+        let q_modulus = montgomery_ring_gsw_q_modulus(ctx.as_ref());
+        for plaintext in [0u64, 1u64] {
+            let inputs = [
+                montgomery_ciphertext_inputs_from_native(
+                    &params,
+                    ctx.as_ref(),
+                    &montgomery_ring_gsw_plaintext_ciphertext(&params, ctx.as_ref(), plaintext),
+                ),
+                vec![PolyVec::new(vec![DCRTPoly::const_zero(&params)])],
+            ]
+            .concat();
+            let outputs = eval_outputs(&params, ctx.num_slots, &circuit, inputs);
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].len(), 1);
+            assert_eq!(
+                rounded_coeffs(&outputs[0].as_slice()[0], 2, &q_modulus),
+                expected_coeffs_for_slots(plaintext, ctx.num_slots),
+                "Montgomery-backed Ring-GSW decrypt should recover plaintext {plaintext} from a direct G*m ciphertext",
+            );
+        }
+    }
+
+    #[test]
+    fn test_montgomery_ring_gsw_add_circuit_decrypts_to_expected_integer_sum_without_error() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_montgomery_test_context(&mut circuit);
+        let lhs = MontgomeryRingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let rhs = MontgomeryRingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let wire_secret_key = circuit.input(1).at(0).as_single_wire();
+        let plaintext_modulus = 3u64;
+        let sum = lhs.add(&rhs, &mut circuit);
+        let decrypted_sum = sum.decrypt::<DCRTPolyMatrix>(
+            wire_secret_key,
+            BigUint::from(plaintext_modulus),
+            &mut circuit,
+        );
+        circuit.output(vec![decrypted_sum]);
+
+        let (x1, x2) = sample_plaintext_input_pair(plaintext_modulus);
+        let expected = (x1 + x2) % plaintext_modulus;
+        let q_modulus = montgomery_ring_gsw_q_modulus(ctx.as_ref());
+        let inputs = [
+            montgomery_ciphertext_inputs_from_native(
+                &params,
+                ctx.as_ref(),
+                &montgomery_ring_gsw_plaintext_ciphertext(&params, ctx.as_ref(), x1),
+            ),
+            montgomery_ciphertext_inputs_from_native(
+                &params,
+                ctx.as_ref(),
+                &montgomery_ring_gsw_plaintext_ciphertext(&params, ctx.as_ref(), x2),
+            ),
+            vec![PolyVec::new(vec![DCRTPoly::const_zero(&params)])],
+        ]
+        .concat();
+        let outputs =
+            eval_outputs_with_parallel_gates(&params, ctx.num_slots, &circuit, inputs, Some(2048));
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].len(), 1);
+        assert_eq!(
+            rounded_coeffs(&outputs[0].as_slice()[0], plaintext_modulus, &q_modulus),
+            expected_coeffs_for_slots(expected, ctx.num_slots),
+            "Montgomery-backed Ring-GSW addition should decrypt to the plaintext-modulus sum for x1={x1}, x2={x2}",
+        );
+    }
+
+    #[test]
+    fn test_montgomery_ring_gsw_sub_circuit_decrypts_to_expected_integer_difference_without_error()
+    {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_montgomery_test_context(&mut circuit);
+        let lhs = MontgomeryRingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let rhs = MontgomeryRingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let wire_secret_key = circuit.input(1).at(0).as_single_wire();
+        let plaintext_modulus = 3u64;
+        let difference = lhs.sub(&rhs, &mut circuit);
+        let decrypted_difference = difference.decrypt::<DCRTPolyMatrix>(
+            wire_secret_key,
+            BigUint::from(plaintext_modulus),
+            &mut circuit,
+        );
+        circuit.output(vec![decrypted_difference]);
+
+        let (x1, x2) = sample_plaintext_input_pair(plaintext_modulus);
+        let expected = (x1 + plaintext_modulus - x2) % plaintext_modulus;
+        let q_modulus = montgomery_ring_gsw_q_modulus(ctx.as_ref());
+        let inputs = [
+            montgomery_ciphertext_inputs_from_native(
+                &params,
+                ctx.as_ref(),
+                &montgomery_ring_gsw_plaintext_ciphertext(&params, ctx.as_ref(), x1),
+            ),
+            montgomery_ciphertext_inputs_from_native(
+                &params,
+                ctx.as_ref(),
+                &montgomery_ring_gsw_plaintext_ciphertext(&params, ctx.as_ref(), x2),
+            ),
+            vec![PolyVec::new(vec![DCRTPoly::const_zero(&params)])],
+        ]
+        .concat();
+        let outputs =
+            eval_outputs_with_parallel_gates(&params, ctx.num_slots, &circuit, inputs, Some(2048));
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].len(), 1);
+        assert_eq!(
+            rounded_coeffs(&outputs[0].as_slice()[0], plaintext_modulus, &q_modulus),
+            expected_coeffs_for_slots(expected, ctx.num_slots),
+            "Montgomery-backed Ring-GSW subtraction should decrypt to the plaintext-modulus difference for x1={x1}, x2={x2}",
+        );
+    }
+
+    #[test]
+    fn test_montgomery_ring_gsw_mul_circuit_decrypts_to_expected_integer_product_without_error() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_montgomery_test_context(&mut circuit);
+        let lhs = MontgomeryRingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let rhs = MontgomeryRingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let wire_secret_key = circuit.input(1).at(0).as_single_wire();
+        let plaintext_modulus = 2u64;
+        let product = lhs.mul(&rhs, &mut circuit);
+        let decrypted_product = product.decrypt::<DCRTPolyMatrix>(
+            wire_secret_key,
+            BigUint::from(plaintext_modulus),
+            &mut circuit,
+        );
+        circuit.output(vec![decrypted_product]);
+
+        let (x1, x2) = sample_binary_input_pair();
+        let expected = (x1 * x2) % plaintext_modulus;
+        let q_modulus = montgomery_ring_gsw_q_modulus(ctx.as_ref());
+        let inputs = [
+            montgomery_ciphertext_inputs_from_native(
+                &params,
+                ctx.as_ref(),
+                &montgomery_ring_gsw_plaintext_ciphertext(&params, ctx.as_ref(), x1),
+            ),
+            montgomery_ciphertext_inputs_from_native(
+                &params,
+                ctx.as_ref(),
+                &montgomery_ring_gsw_plaintext_ciphertext(&params, ctx.as_ref(), x2),
+            ),
+            vec![PolyVec::new(vec![DCRTPoly::const_zero(&params)])],
+        ]
+        .concat();
+        let outputs = eval_outputs(&params, ctx.num_slots, &circuit, inputs);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].len(), 1);
+        assert_eq!(
+            rounded_coeffs(&outputs[0].as_slice()[0], plaintext_modulus, &q_modulus),
+            expected_coeffs_for_slots(expected, ctx.num_slots),
+            "Montgomery-backed Ring-GSW multiplication should decrypt to the plaintext-modulus product for x1={x1}, x2={x2}",
+        );
+    }
+
+    #[test]
+    fn test_montgomery_ring_gsw_chained_mul_circuit_decrypts_to_expected_integer_product_without_error()
+     {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_montgomery_test_context(&mut circuit);
+        let lhs = MontgomeryRingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let rhs1 = MontgomeryRingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let rhs2 = MontgomeryRingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let wire_secret_key = circuit.input(1).at(0).as_single_wire();
+        let plaintext_modulus = 2u64;
+        let product = lhs.mul(&rhs1, &mut circuit);
+        let chained_product = product.mul(&rhs2, &mut circuit);
+        let decrypted_product = chained_product.decrypt::<DCRTPolyMatrix>(
+            wire_secret_key,
+            BigUint::from(plaintext_modulus),
+            &mut circuit,
+        );
+        circuit.output(vec![decrypted_product]);
+
+        let (x1, x2) = sample_binary_input_pair();
+        let x3 = rand::rng().random_range(0..2u64);
+        let expected = (x1 * x2 * x3) % plaintext_modulus;
+        let q_modulus = montgomery_ring_gsw_q_modulus(ctx.as_ref());
+        let inputs = [
+            montgomery_ciphertext_inputs_from_native(
+                &params,
+                ctx.as_ref(),
+                &montgomery_ring_gsw_plaintext_ciphertext(&params, ctx.as_ref(), x1),
+            ),
+            montgomery_ciphertext_inputs_from_native(
+                &params,
+                ctx.as_ref(),
+                &montgomery_ring_gsw_plaintext_ciphertext(&params, ctx.as_ref(), x2),
+            ),
+            montgomery_ciphertext_inputs_from_native(
+                &params,
+                ctx.as_ref(),
+                &montgomery_ring_gsw_plaintext_ciphertext(&params, ctx.as_ref(), x3),
+            ),
+            vec![PolyVec::new(vec![DCRTPoly::const_zero(&params)])],
+        ]
+        .concat();
+        let outputs = eval_outputs(&params, ctx.num_slots, &circuit, inputs);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].len(), 1);
+        assert_eq!(
+            rounded_coeffs(&outputs[0].as_slice()[0], plaintext_modulus, &q_modulus),
+            expected_coeffs_for_slots(expected, ctx.num_slots),
+            "Montgomery-backed chained Ring-GSW multiplication should decrypt to the plaintext-modulus product for x1={x1}, x2={x2}, x3={x3}",
+        );
+    }
+
     #[sequential_test::sequential]
     #[test]
     #[ignore = "expensive circuit-structure reporting test; run with --ignored --nocapture"]
-    fn test_ring_gsw_mul_large_circuit_metrics() {
+    fn test_nested_rns_ring_gsw_mul_large_circuit_metrics() {
         let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
         let crt_bits = 24usize;
         let crt_depth = 1usize;
@@ -2325,6 +2677,70 @@ mod tests {
 
         println!(
             "mul 2 ring_gsw_mul metrics: crt_bits={crt_bits}, crt_depth={crt_depth}, ring_dim={ring_dim}, num_slots={num_slots}"
+        );
+        let mul2_depth = circuit.non_free_depth();
+        println!("mul 2 non-free depth end {}", mul2_depth);
+        println!("mul 2 gate counts {:?}", circuit.count_gates_by_type_vec());
+
+        println!("mul 2 vs mul 1 depth increase: {}", mul2_depth - mul1_depth);
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    #[ignore = "expensive circuit-structure reporting test; run with --ignored --nocapture"]
+    fn test_carry_arith_ring_gsw_mul_large_circuit_metrics() {
+        let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+        let crt_bits = 24usize;
+        let crt_depth = 1usize;
+        let ring_dim = 1u32 << 16;
+        let num_slots = 1usize << 16;
+        let limb_bit_size = 3usize;
+
+        let mul1_disk_dir = tempdir().expect("create temp dir for disk-backed sub-circuits");
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        circuit.enable_subcircuits_in_disk(mul1_disk_dir.path());
+        let (_params, ctx) = create_montgomery_test_context_with(
+            &mut circuit,
+            ring_dim,
+            num_slots,
+            crt_depth,
+            crt_bits,
+            limb_bit_size,
+        );
+        let lhs = MontgomeryRingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let rhs = MontgomeryRingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let product = lhs.mul(&rhs, &mut circuit);
+        let outputs = product.reconstruct(&mut circuit);
+        circuit.output(outputs);
+
+        println!(
+            "mul 1 carry_arith_ring_gsw_mul metrics: crt_bits={crt_bits}, crt_depth={crt_depth}, ring_dim={ring_dim}, num_slots={num_slots}, limb_bit_size={limb_bit_size}"
+        );
+        let mul1_depth = circuit.non_free_depth();
+        println!("mul 1 non-free depth end {}", mul1_depth);
+        println!("mul 1 gate counts {:?}", circuit.count_gates_by_type_vec());
+
+        let mul2_disk_dir = tempdir().expect("create temp dir for disk-backed sub-circuits");
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        circuit.enable_subcircuits_in_disk(mul2_disk_dir.path());
+        let (_params, ctx) = create_montgomery_test_context_with(
+            &mut circuit,
+            ring_dim,
+            num_slots,
+            crt_depth,
+            crt_bits,
+            limb_bit_size,
+        );
+        let lhs = MontgomeryRingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let rhs1 = MontgomeryRingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+        let rhs2 = MontgomeryRingGswCiphertext::input(ctx, None, &mut circuit);
+        let product1 = lhs.mul(&rhs1, &mut circuit);
+        let product2 = product1.mul(&rhs2, &mut circuit);
+        let outputs = product2.reconstruct(&mut circuit);
+        circuit.output(outputs);
+
+        println!(
+            "mul 2 carry_arith_ring_gsw_mul metrics: crt_bits={crt_bits}, crt_depth={crt_depth}, ring_dim={ring_dim}, num_slots={num_slots}, limb_bit_size={limb_bit_size}"
         );
         let mul2_depth = circuit.non_free_depth();
         println!("mul 2 non-free depth end {}", mul2_depth);

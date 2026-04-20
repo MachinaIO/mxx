@@ -808,7 +808,7 @@ where
             gate_total_cols,
             task,
         );
-        let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+        let load_s = load_started.elapsed().as_secs_f64();
         let compute_started = Instant::now();
         let lhs = match task {
             SlotTransferStage1Task::InputDirect => &input_vector,
@@ -817,7 +817,7 @@ where
             }
         };
         let output = lhs * &rhs_chunk;
-        let compute_ms = compute_started.elapsed().as_secs_f64() * 1000.0;
+        let compute_s = compute_started.elapsed().as_secs_f64();
         let store_started = Instant::now();
         let output_bytes = output.into_compact_bytes();
         match task {
@@ -842,9 +842,9 @@ where
         update_group_store_timing(
             &mut stage1_group_stats,
             stage1_task_bench_group(&task),
-            load_ms,
-            compute_ms,
-            store_started.elapsed().as_secs_f64() * 1000.0,
+            load_s,
+            compute_s,
+            store_started.elapsed().as_secs_f64(),
         );
     }
     let c_b0_slot_preimage_b0: M = concat_chunk_bytes_on_base(
@@ -899,10 +899,10 @@ where
             slot_preimage_b1_total_cols,
             task.chunk_idx,
         );
-        let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+        let load_s = load_started.elapsed().as_secs_f64();
         let compute_started = Instant::now();
         let output = &lhs * &rhs_chunk;
-        let compute_ms = compute_started.elapsed().as_secs_f64() * 1000.0;
+        let compute_s = compute_started.elapsed().as_secs_f64();
         let store_started = Instant::now();
         let output_bytes = output.into_compact_bytes();
         let bytes = Some(Arc::<[u8]>::from(output_bytes));
@@ -912,9 +912,9 @@ where
         update_group_store_timing(
             &mut stage2_group_stats,
             0usize,
-            load_ms,
-            compute_ms,
-            store_started.elapsed().as_secs_f64() * 1000.0,
+            load_s,
+            compute_s,
+            store_started.elapsed().as_secs_f64(),
         );
     }
     let c_transfer_chunk_bytes = c_transfer_chunk_bytes
@@ -949,7 +949,7 @@ where
     let _output_plaintext_bytes = Arc::<[u8]>::from(output_plaintext.to_compact_bytes());
     add_scalar_stage_to_slot_measurement(
         &mut slot_bench_measurement,
-        stage3_started.elapsed().as_secs_f64() * 1000.0,
+        stage3_started.elapsed().as_secs_f64(),
     );
 
     slot_bench_measurement

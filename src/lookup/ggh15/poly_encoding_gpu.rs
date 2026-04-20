@@ -1530,9 +1530,9 @@ where
             gate1_total_cols,
             task,
         );
-        let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+        let load_s = load_started.elapsed().as_secs_f64();
         debug!(
-            "GGH15 BGG poly-encoding gpu public-lookup stage1 load complete: gate_id={}, lut_id={}, slot={}, wave={}, device_slot=0, device_id={}, task={}, rhs_rows={}, rhs_cols={}, load_ms={:.3}",
+            "GGH15 BGG poly-encoding gpu public-lookup stage1 load complete: gate_id={}, lut_id={}, slot={}, wave={}, device_slot=0, device_id={}, task={}, rhs_rows={}, rhs_cols={}, load_s={:.6}",
             gate_id,
             lut_id,
             slot.slot_idx,
@@ -1541,7 +1541,7 @@ where
             task_label,
             rhs_chunk.row_size(),
             rhs_chunk.col_size(),
-            load_ms
+            load_s
         );
         debug!(
             "GGH15 BGG poly-encoding gpu public-lookup stage1 compute start: gate_id={}, lut_id={}, slot={}, device_slot=0, device_id={}, task={}",
@@ -1559,9 +1559,9 @@ where
             }
         };
         let output = lhs * &rhs_chunk;
-        let compute_ms = compute_started.elapsed().as_secs_f64() * 1000.0;
+        let compute_s = compute_started.elapsed().as_secs_f64();
         debug!(
-            "GGH15 BGG poly-encoding gpu public-lookup stage1 compute complete: gate_id={}, lut_id={}, slot={}, device_slot=0, device_id={}, task={}, output_rows={}, output_cols={}, compute_ms={:.3}",
+            "GGH15 BGG poly-encoding gpu public-lookup stage1 compute complete: gate_id={}, lut_id={}, slot={}, device_slot=0, device_id={}, task={}, output_rows={}, output_cols={}, compute_s={:.6}",
             gate_id,
             lut_id,
             slot.slot_idx,
@@ -1569,7 +1569,7 @@ where
             task_label,
             output.row_size(),
             output.col_size(),
-            compute_ms
+            compute_s
         );
         debug!(
             "GGH15 BGG poly-encoding gpu public-lookup stage1 store start: gate_id={}, lut_id={}, slot={}, device_slot=0, device_id={}, task={}",
@@ -1590,31 +1590,31 @@ where
                 drop(bytes);
             }
         }
-        let store_ms = store_started.elapsed().as_secs_f64() * 1000.0;
+        let store_s = store_started.elapsed().as_secs_f64();
         debug!(
-            "GGH15 BGG poly-encoding gpu public-lookup stage1 store complete: gate_id={}, lut_id={}, slot={}, device_slot=0, device_id={}, task={}, output_bytes={}, store_ms={:.3}",
+            "GGH15 BGG poly-encoding gpu public-lookup stage1 store complete: gate_id={}, lut_id={}, slot={}, device_slot=0, device_id={}, task={}, output_bytes={}, store_s={:.6}",
             gate_id,
             lut_id,
             slot.slot_idx,
             shared_dev.device_id,
             task_label,
             output_byte_len,
-            store_ms
+            store_s
         );
         update_group_store_timing(
             &mut stage1_group_stats,
             stage1_task_bench_group(&task),
-            load_ms,
-            compute_ms,
-            store_ms,
+            load_s,
+            compute_s,
+            store_s,
         );
     }
     debug!(
-        "GGH15 BGG poly-encoding gpu public-lookup benchmark stage1 measured: gate_id={}, lut_id={}, slot={}, elapsed_ms={:.3}",
+        "GGH15 BGG poly-encoding gpu public-lookup benchmark stage1 measured: gate_id={}, lut_id={}, slot={}, elapsed_s={:.6}",
         gate_id,
         lut_id,
         slot.slot_idx,
-        stage1_started.elapsed().as_secs_f64() * 1000.0
+        stage1_started.elapsed().as_secs_f64()
     );
     let stage1_bench = finalize_stage_bench(
         &stage1_group_stats,
@@ -1693,9 +1693,9 @@ where
             gate1_total_cols,
             task,
         );
-        let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+        let load_s = load_started.elapsed().as_secs_f64();
         debug!(
-            "GGH15 BGG poly-encoding gpu public-lookup stage2 load complete: gate_id={}, lut_id={}, slot={}, wave={}, device_slot=0, device_id={}, task={}, stage1_mid_rows={}, stage1_mid_cols={}, rhs_rows={}, rhs_cols={}, load_ms={:.3}",
+            "GGH15 BGG poly-encoding gpu public-lookup stage2 load complete: gate_id={}, lut_id={}, slot={}, wave={}, device_slot=0, device_id={}, task={}, stage1_mid_rows={}, stage1_mid_cols={}, rhs_rows={}, rhs_cols={}, load_s={:.6}",
             gate_id,
             lut_id,
             slot.slot_idx,
@@ -1706,7 +1706,7 @@ where
             stage1_mid.col_size(),
             rhs_chunk.row_size(),
             rhs_chunk.col_size(),
-            load_ms
+            load_s
         );
         debug!(
             "GGH15 BGG poly-encoding gpu public-lookup stage2 compute start: gate_id={}, lut_id={}, slot={}, device_slot=0, device_id={}, task={}",
@@ -1714,9 +1714,9 @@ where
         );
         let compute_started = Instant::now();
         let contribution = &stage1_mid * &rhs_chunk;
-        let compute_ms = compute_started.elapsed().as_secs_f64() * 1000.0;
+        let compute_s = compute_started.elapsed().as_secs_f64();
         debug!(
-            "GGH15 BGG poly-encoding gpu public-lookup stage2 compute complete: gate_id={}, lut_id={}, slot={}, device_slot=0, device_id={}, task={}, output_rows={}, output_cols={}, compute_ms={:.3}",
+            "GGH15 BGG poly-encoding gpu public-lookup stage2 compute complete: gate_id={}, lut_id={}, slot={}, device_slot=0, device_id={}, task={}, output_rows={}, output_cols={}, compute_s={:.6}",
             gate_id,
             lut_id,
             slot.slot_idx,
@@ -1724,7 +1724,7 @@ where
             task_label,
             contribution.row_size(),
             contribution.col_size(),
-            compute_ms
+            compute_s
         );
         debug!(
             "GGH15 BGG poly-encoding gpu public-lookup stage2 store start: gate_id={}, lut_id={}, slot={}, device_slot=0, device_id={}, task={}",
@@ -1735,25 +1735,25 @@ where
         let contribution_byte_len = contribution_bytes.len();
         stage3_contribution_bytes_by_chunk[task.output_chunk_idx]
             .push((task.key.family, Arc::<[u8]>::from(contribution_bytes)));
-        let store_ms = store_started.elapsed().as_secs_f64() * 1000.0;
+        let store_s = store_started.elapsed().as_secs_f64();
         debug!(
-            "GGH15 BGG poly-encoding gpu public-lookup stage2 store complete: gate_id={}, lut_id={}, slot={}, device_slot=0, device_id={}, task={}, output_bytes={}, store_ms={:.3}",
+            "GGH15 BGG poly-encoding gpu public-lookup stage2 store complete: gate_id={}, lut_id={}, slot={}, device_slot=0, device_id={}, task={}, output_bytes={}, store_s={:.6}",
             gate_id,
             lut_id,
             slot.slot_idx,
             shared_dev.device_id,
             task_label,
             contribution_byte_len,
-            store_ms
+            store_s
         );
-        update_group_store_timing(&mut stage2_group_stats, task.key, load_ms, compute_ms, store_ms);
+        update_group_store_timing(&mut stage2_group_stats, task.key, load_s, compute_s, store_s);
     }
     debug!(
-        "GGH15 BGG poly-encoding gpu public-lookup benchmark stage2 measured: gate_id={}, lut_id={}, slot={}, elapsed_ms={:.3}",
+        "GGH15 BGG poly-encoding gpu public-lookup benchmark stage2 measured: gate_id={}, lut_id={}, slot={}, elapsed_s={:.6}",
         gate_id,
         lut_id,
         slot.slot_idx,
-        stage2_started.elapsed().as_secs_f64() * 1000.0
+        stage2_started.elapsed().as_secs_f64()
     );
     let stage2_bench = finalize_stage_bench(
         &stage2_group_stats,
@@ -1769,7 +1769,7 @@ where
     );
     add_scalar_stage_to_slot_measurement(
         &mut slot_bench_measurement,
-        stage3_started.elapsed().as_secs_f64() * 1000.0,
+        stage3_started.elapsed().as_secs_f64(),
     );
 
     let stage4_started = Instant::now();
@@ -1785,7 +1785,7 @@ where
     };
     add_scalar_stage_to_slot_measurement(
         &mut slot_bench_measurement,
-        stage4_started.elapsed().as_secs_f64() * 1000.0,
+        stage4_started.elapsed().as_secs_f64(),
     );
 
     slot_bench_measurement

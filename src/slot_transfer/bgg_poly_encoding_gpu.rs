@@ -5,11 +5,12 @@ use crate::poly::{
 };
 use rayon::prelude::*;
 use std::{collections::HashMap, sync::Arc, time::Instant};
+use tracing::debug;
 
 pub(super) struct GpuSlotTransferSharedByDevice<M: PolyMatrix> {
+    pub device_id: i32,
     pub params: <<M as PolyMatrix>::P as Poly>::Params,
     pub c_b0: M,
-    pub out_pubkey_matrix: M,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -29,9 +30,9 @@ struct SlotTransferStageBenchMeasurement {
 #[derive(Clone, Copy, Debug, Default)]
 struct SlotTransferTaskGroupBenchStats {
     task_count: usize,
-    max_load_ms: f64,
-    max_compute_ms: f64,
-    max_store_ms: f64,
+    max_load_s: f64,
+    max_compute_s: f64,
+    max_store_s: f64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -57,28 +58,28 @@ struct LoadedSlotTransferStage1Task<M: PolyMatrix> {
     device_slot: usize,
     task: SlotTransferStage1Task,
     rhs_chunk: M,
-    load_ms: f64,
+    load_s: f64,
 }
 
 struct ComputedSlotTransferStage1Task {
     task: SlotTransferStage1Task,
     bytes: Vec<u8>,
-    load_ms: f64,
-    compute_ms: f64,
+    load_s: f64,
+    compute_s: f64,
 }
 
 struct LoadedSlotTransferStage2Task<M: PolyMatrix> {
     task: SlotTransferStage2Task,
     lhs: M,
     rhs_chunk: M,
-    load_ms: f64,
+    load_s: f64,
 }
 
 struct ComputedSlotTransferStage2Task {
     task: SlotTransferStage2Task,
     bytes: Vec<u8>,
-    load_ms: f64,
-    compute_ms: f64,
+    load_s: f64,
+    compute_s: f64,
 }
 
 fn zero_compact_bytes_from_template<M: PolyMatrix>(
@@ -125,8 +126,6 @@ fn slot_device_ids(slot_parallelism: usize) -> Vec<i32> {
 fn prepare_slot_transfer_shared_by_device<M, HS>(
     evaluator: &BggPolyEncodingSTEvaluator<M, HS>,
     params: &<M::P as Poly>::Params,
-    gate_id: GateId,
-    secret_size: usize,
     slot_parallelism: usize,
 ) -> Vec<GpuSlotTransferSharedByDevice<M>>
 where
@@ -137,14 +136,8 @@ where
         .into_par_iter()
         .map(|device_id| {
             let local_params = params.params_for_device(device_id);
-            let out_pubkey =
-                evaluator.output_pubkey_for_params(&local_params, secret_size, gate_id);
             let c_b0 = M::from_compact_bytes(&local_params, &evaluator.c_b0_bytes);
-            GpuSlotTransferSharedByDevice {
-                params: local_params,
-                c_b0,
-                out_pubkey_matrix: out_pubkey.matrix,
-            }
+            GpuSlotTransferSharedByDevice { device_id, params: local_params, c_b0 }
         })
         .collect()
 }
@@ -197,23 +190,23 @@ fn stage1_task_bench_group(task: &SlotTransferStage1Task) -> SlotTransferStage1B
     }
 }
 
-fn maybe_elapsed_ms(started: Option<Instant>) -> f64 {
-    started.map(|start| start.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0)
+fn maybe_elapsed_s(started: Option<Instant>) -> f64 {
+    started.map(|start| start.elapsed().as_secs_f64()).unwrap_or(0.0)
 }
 
 fn update_group_store_timing<K>(
     group_stats: &mut HashMap<K, SlotTransferTaskGroupBenchStats>,
     group: K,
-    load_ms: f64,
-    compute_ms: f64,
-    store_ms: f64,
+    load_s: f64,
+    compute_s: f64,
+    store_s: f64,
 ) where
     K: Eq + std::hash::Hash + Copy,
 {
     let stats = group_stats.entry(group).or_default();
-    stats.max_load_ms = stats.max_load_ms.max(load_ms);
-    stats.max_compute_ms = stats.max_compute_ms.max(compute_ms);
-    stats.max_store_ms = stats.max_store_ms.max(store_ms);
+    stats.max_load_s = stats.max_load_s.max(load_s);
+    stats.max_compute_s = stats.max_compute_s.max(compute_s);
+    stats.max_store_s = stats.max_store_s.max(store_s);
 }
 
 fn finalize_stage_bench<K>(
@@ -224,10 +217,10 @@ where
     K: Eq + std::hash::Hash,
 {
     let latency = group_stats.values().fold(0.0_f64, |max_latency, stats| {
-        max_latency.max(stats.max_load_ms.max(stats.max_compute_ms).max(stats.max_store_ms))
+        max_latency.max(stats.max_load_s.max(stats.max_compute_s).max(stats.max_store_s))
     });
     let total_time = group_stats.values().fold(0.0_f64, |sum, stats| {
-        let group_latency = stats.max_load_ms.max(stats.max_compute_ms).max(stats.max_store_ms);
+        let group_latency = stats.max_load_s.max(stats.max_compute_s).max(stats.max_store_s);
         sum + group_latency * stats.task_count as f64
     });
     SlotTransferStageBenchMeasurement {
@@ -249,11 +242,11 @@ fn add_stage_bench_to_slot_measurement(
 
 fn add_scalar_stage_to_slot_measurement(
     slot_bench_measurement: &mut SlotTransferSlotBenchMeasurement,
-    stage_ms: f64,
+    stage_s: f64,
 ) {
-    slot_bench_measurement.latency += stage_ms;
+    slot_bench_measurement.latency += stage_s;
     slot_bench_measurement.max_parallelism = slot_bench_measurement.max_parallelism.max(1);
-    slot_bench_measurement.total_time += stage_ms;
+    slot_bench_measurement.total_time += stage_s;
 }
 
 fn build_stage1_tasks(
@@ -273,6 +266,7 @@ fn build_stage1_tasks(
 fn load_stage1_rhs_chunk<M, HS>(
     evaluator: &BggPolyEncodingSTEvaluator<M, HS>,
     shared: &GpuSlotTransferSharedByDevice<M>,
+    secret_size: usize,
     dir: &std::path::Path,
     src_slot: usize,
     dst_slot: usize,
@@ -300,9 +294,9 @@ where
             gate_total_cols,
             chunk_idx,
         ),
-        SlotTransferStage1Task::InputDirect => evaluator
-            .slot_a_for_params(&shared.params, shared.out_pubkey_matrix.row_size(), dst_slot)
-            .decompose(),
+        SlotTransferStage1Task::InputDirect => {
+            evaluator.slot_a_for_params(&shared.params, secret_size, dst_slot).decompose()
+        }
     }
 }
 
@@ -377,7 +371,7 @@ where
     );
 
     let input_vector_bytes = &input.vector_bytes[src_slot];
-    let secret_size = shared_by_device[0].out_pubkey_matrix.row_size();
+    let secret_size = input.pubkey.matrix.row_size();
     let src_plaintext =
         M::P::from_compact_bytes(params, plaintext_bytes_by_slot[src_slot].as_ref());
     let constant_term = src_plaintext
@@ -430,6 +424,7 @@ where
                 let rhs_chunk = load_stage1_rhs_chunk::<M, HS>(
                     evaluator,
                     shared,
+                    secret_size,
                     dir,
                     src_slot,
                     dst_slot,
@@ -442,7 +437,7 @@ where
                     device_slot,
                     task,
                     rhs_chunk,
-                    load_ms: maybe_elapsed_ms(load_started),
+                    load_s: maybe_elapsed_s(load_started),
                 })
             })
             .collect::<Vec<_>>();
@@ -466,8 +461,8 @@ where
                 ComputedSlotTransferStage1Task {
                     task: loaded_task.task,
                     bytes: output.into_compact_bytes(),
-                    load_ms: loaded_task.load_ms,
-                    compute_ms: maybe_elapsed_ms(compute_started),
+                    load_s: loaded_task.load_s,
+                    compute_s: maybe_elapsed_s(compute_started),
                 }
             })
             .collect::<Vec<_>>()
@@ -493,9 +488,9 @@ where
                 update_group_store_timing(
                     &mut stage1_group_stats,
                     stage1_task_bench_group(&output.task),
-                    output.load_ms,
-                    output.compute_ms,
-                    maybe_elapsed_ms(store_started),
+                    output.load_s,
+                    output.compute_s,
+                    maybe_elapsed_s(store_started),
                 );
             }
         }
@@ -528,6 +523,7 @@ where
     if let Some(outputs) = previous_stage1_outputs.take() {
         store_stage1_wave(outputs);
     }
+    drop(input_vector_by_device);
     let b0_chunk_bytes = b0_chunk_bytes
         .into_iter()
         .enumerate()
@@ -558,7 +554,7 @@ where
             finalize_stage_bench(&stage1_group_stats, stage1_batches.iter().map(Vec::len).sum());
         add_stage_bench_to_slot_measurement(&mut slot_bench_measurement, stage1_bench);
     }
-    let _stage1_ms = stage1_started.elapsed().as_secs_f64() * 1000.0;
+    let _stage1_s = stage1_started.elapsed().as_secs_f64();
 
     let stage2_started = Instant::now();
     let stage2_tasks = (0..b1_chunk_count)
@@ -601,7 +597,7 @@ where
                     task,
                     lhs,
                     rhs_chunk,
-                    load_ms: maybe_elapsed_ms(load_started),
+                    load_s: maybe_elapsed_s(load_started),
                 })
             })
             .collect::<Vec<_>>();
@@ -616,8 +612,8 @@ where
                 ComputedSlotTransferStage2Task {
                     task: loaded_task.task,
                     bytes: output.into_compact_bytes(),
-                    load_ms: loaded_task.load_ms,
-                    compute_ms: maybe_elapsed_ms(compute_started),
+                    load_s: loaded_task.load_s,
+                    compute_s: maybe_elapsed_s(compute_started),
                 }
             })
             .collect::<Vec<_>>()
@@ -631,9 +627,9 @@ where
                 update_group_store_timing(
                     &mut stage2_group_stats,
                     0usize,
-                    output.load_ms,
-                    output.compute_ms,
-                    maybe_elapsed_ms(store_started),
+                    output.load_s,
+                    output.compute_s,
+                    maybe_elapsed_s(store_started),
                 );
             }
         }
@@ -690,7 +686,7 @@ where
             finalize_stage_bench(&stage2_group_stats, stage2_batches.iter().map(Vec::len).sum());
         add_stage_bench_to_slot_measurement(&mut slot_bench_measurement, stage2_bench);
     }
-    let _stage2_ms = stage2_started.elapsed().as_secs_f64() * 1000.0;
+    let _stage2_s = stage2_started.elapsed().as_secs_f64();
 
     let stage3_started = Instant::now();
     let scalar_poly = scalar.map(|scalar| M::P::from_usize_to_constant(params, scalar as usize));
@@ -710,7 +706,7 @@ where
     if collect_bench {
         add_scalar_stage_to_slot_measurement(
             &mut slot_bench_measurement,
-            stage3_started.elapsed().as_secs_f64() * 1000.0,
+            stage3_started.elapsed().as_secs_f64(),
         );
     }
     if let Some(slot_bench_output) = slot_bench_output {
@@ -727,7 +723,6 @@ pub(super) fn evaluate_slot_transfer_slots_gpu<M, HS>(
     plaintext_bytes_by_slot: &[Arc<[u8]>],
     src_slots: &[(u32, Option<u32>)],
     gate_id: GateId,
-    out_pubkey: &BggPublicKey<M>,
     configured_parallelism: usize,
 ) -> (Vec<Arc<[u8]>>, Vec<Arc<[u8]>>)
 where
@@ -737,13 +732,8 @@ where
     for<'a, 'b> &'a M: Mul<&'b M, Output = M>,
 {
     let slot_count = src_slots.len();
-    let shared_by_device = prepare_slot_transfer_shared_by_device::<M, HS>(
-        evaluator,
-        params,
-        gate_id,
-        out_pubkey.matrix.row_size(),
-        configured_parallelism,
-    );
+    let shared_by_device =
+        prepare_slot_transfer_shared_by_device::<M, HS>(evaluator, params, configured_parallelism);
     let mut output_vector_bytes = Vec::with_capacity(slot_count);
     let mut output_plaintext_bytes = Vec::with_capacity(slot_count);
 
@@ -793,7 +783,7 @@ where
     );
 
     let input_vector_bytes = &input.vector_bytes[src_slot];
-    let secret_size = shared.out_pubkey_matrix.row_size();
+    let secret_size = input.pubkey.matrix.row_size();
     let src_plaintext =
         M::P::from_compact_bytes(params, plaintext_bytes_by_slot[src_slot].as_ref());
     let constant_term = src_plaintext
@@ -810,6 +800,7 @@ where
     let b1_chunk_count = column_chunk_count(slot_preimage_b1_total_cols);
     let gate_chunk_count = column_chunk_count(gate_total_cols);
 
+    let stage1_started = Instant::now();
     let stage1_tasks = build_stage1_tasks(b0_chunk_count, gate_chunk_count);
     let mut stage1_group_stats =
         HashMap::<SlotTransferStage1BenchGroup, SlotTransferTaskGroupBenchStats>::new();
@@ -828,11 +819,25 @@ where
     let mut gate_template_bytes = None::<Arc<[u8]>>;
     let mut input_direct_shape = None::<(usize, usize)>;
     let mut input_direct_template_bytes = None::<Arc<[u8]>>;
-    for task in stage1_representative_tasks {
+    for (wave_idx, task) in stage1_representative_tasks.into_iter().enumerate() {
+        let task_label = match task {
+            SlotTransferStage1Task::B0Chunk { chunk_idx } => {
+                format!("family=B0, chunk={chunk_idx}")
+            }
+            SlotTransferStage1Task::GateChunk { chunk_idx } => {
+                format!("family=Gate, chunk={chunk_idx}")
+            }
+            SlotTransferStage1Task::InputDirect => "family=InputDirect".to_string(),
+        };
         let load_started = Instant::now();
+        debug!(
+            "BGG poly-encoding gpu slot-transfer stage1 load start: gate_id={}, src_slot={}, dst_slot={}, wave={}, device_id={}, task={}",
+            gate_id, src_slot, dst_slot, wave_idx, shared.device_id, task_label
+        );
         let rhs_chunk = load_stage1_rhs_chunk::<M, HS>(
             evaluator,
             shared,
+            secret_size,
             dir,
             src_slot,
             dst_slot,
@@ -842,7 +847,23 @@ where
             task,
         );
         let load_s = load_started.elapsed().as_secs_f64();
+        debug!(
+            "BGG poly-encoding gpu slot-transfer stage1 load complete: gate_id={}, src_slot={}, dst_slot={}, wave={}, device_id={}, task={}, rhs_rows={}, rhs_cols={}, load_s={:.6}",
+            gate_id,
+            src_slot,
+            dst_slot,
+            wave_idx,
+            shared.device_id,
+            task_label,
+            rhs_chunk.row_size(),
+            rhs_chunk.col_size(),
+            load_s
+        );
         let compute_started = Instant::now();
+        debug!(
+            "BGG poly-encoding gpu slot-transfer stage1 compute start: gate_id={}, src_slot={}, dst_slot={}, wave={}, device_id={}, task={}",
+            gate_id, src_slot, dst_slot, wave_idx, shared.device_id, task_label
+        );
         let lhs = match task {
             SlotTransferStage1Task::InputDirect => &input_vector,
             SlotTransferStage1Task::B0Chunk { .. } | SlotTransferStage1Task::GateChunk { .. } => {
@@ -852,8 +873,25 @@ where
         let output = lhs * &rhs_chunk;
         let output_shape = (output.row_size(), output.col_size());
         let compute_s = compute_started.elapsed().as_secs_f64();
+        debug!(
+            "BGG poly-encoding gpu slot-transfer stage1 compute complete: gate_id={}, src_slot={}, dst_slot={}, wave={}, device_id={}, task={}, output_rows={}, output_cols={}, compute_s={:.6}",
+            gate_id,
+            src_slot,
+            dst_slot,
+            wave_idx,
+            shared.device_id,
+            task_label,
+            output_shape.0,
+            output_shape.1,
+            compute_s
+        );
         let store_started = Instant::now();
+        debug!(
+            "BGG poly-encoding gpu slot-transfer stage1 store start: gate_id={}, src_slot={}, dst_slot={}, wave={}, device_id={}, task={}",
+            gate_id, src_slot, dst_slot, wave_idx, shared.device_id, task_label
+        );
         let output_bytes = Arc::<[u8]>::from(output.into_compact_bytes());
+        let output_bytes_len = output_bytes.len();
         match task {
             SlotTransferStage1Task::B0Chunk { chunk_idx } => {
                 b0_output_shape = Some(output_shape);
@@ -870,12 +908,24 @@ where
                 input_direct_template_bytes = Some(output_bytes);
             }
         }
+        let store_s = store_started.elapsed().as_secs_f64();
+        debug!(
+            "BGG poly-encoding gpu slot-transfer stage1 store complete: gate_id={}, src_slot={}, dst_slot={}, wave={}, device_id={}, task={}, output_bytes={}, store_s={:.6}",
+            gate_id,
+            src_slot,
+            dst_slot,
+            wave_idx,
+            shared.device_id,
+            task_label,
+            output_bytes_len,
+            store_s
+        );
         update_group_store_timing(
             &mut stage1_group_stats,
             stage1_task_bench_group(&task),
             load_s,
             compute_s,
-            store_started.elapsed().as_secs_f64(),
+            store_s,
         );
     }
     let (b0_rows, _) =
@@ -884,6 +934,10 @@ where
         gate_output_shape.expect("missing slot-transfer representative gate output shape");
     let (input_direct_rows, input_direct_cols) =
         input_direct_shape.expect("missing slot-transfer representative input-direct output shape");
+    debug!(
+        "BGG poly-encoding gpu slot-transfer benchmark stage1 zero-bytes start: gate_id={}, src_slot={}, dst_slot={}, device_id={}, target=c_b0_slot_preimage_b0, rows={}, cols={}",
+        gate_id, src_slot, dst_slot, shared.device_id, b0_rows, slot_preimage_b0_total_cols
+    );
     let c_b0_slot_preimage_b0_bytes = Arc::<[u8]>::from(zero_compact_bytes_from_template::<M>(
         params,
         b0_template_bytes
@@ -893,6 +947,18 @@ where
         b0_rows,
         slot_preimage_b0_total_cols,
     ));
+    debug!(
+        "BGG poly-encoding gpu slot-transfer benchmark stage1 zero-bytes complete: gate_id={}, src_slot={}, dst_slot={}, device_id={}, target=c_b0_slot_preimage_b0, output_bytes={}",
+        gate_id,
+        src_slot,
+        dst_slot,
+        shared.device_id,
+        c_b0_slot_preimage_b0_bytes.len()
+    );
+    debug!(
+        "BGG poly-encoding gpu slot-transfer benchmark stage1 zero-bytes start: gate_id={}, src_slot={}, dst_slot={}, device_id={}, target=c_gate, rows={}, cols={}",
+        gate_id, src_slot, dst_slot, shared.device_id, gate_rows, gate_total_cols
+    );
     let c_gate_bytes = Arc::<[u8]>::from(zero_compact_bytes_from_template::<M>(
         params,
         gate_template_bytes
@@ -902,6 +968,18 @@ where
         gate_rows,
         gate_total_cols,
     ));
+    debug!(
+        "BGG poly-encoding gpu slot-transfer benchmark stage1 zero-bytes complete: gate_id={}, src_slot={}, dst_slot={}, device_id={}, target=c_gate, output_bytes={}",
+        gate_id,
+        src_slot,
+        dst_slot,
+        shared.device_id,
+        c_gate_bytes.len()
+    );
+    debug!(
+        "BGG poly-encoding gpu slot-transfer benchmark stage1 zero-bytes start: gate_id={}, src_slot={}, dst_slot={}, device_id={}, target=input_direct, rows={}, cols={}",
+        gate_id, src_slot, dst_slot, shared.device_id, input_direct_rows, input_direct_cols
+    );
     let input_direct_bytes = Arc::<[u8]>::from(zero_compact_bytes_from_template::<M>(
         params,
         input_direct_template_bytes
@@ -911,12 +989,29 @@ where
         input_direct_rows,
         input_direct_cols,
     ));
+    debug!(
+        "BGG poly-encoding gpu slot-transfer benchmark stage1 zero-bytes complete: gate_id={}, src_slot={}, dst_slot={}, device_id={}, target=input_direct, output_bytes={}",
+        gate_id,
+        src_slot,
+        dst_slot,
+        shared.device_id,
+        input_direct_bytes.len()
+    );
     let stage1_bench = finalize_stage_bench(
         &stage1_group_stats,
         stage1_group_stats.values().map(|stats| stats.task_count).sum(),
     );
     add_stage_bench_to_slot_measurement(&mut slot_bench_measurement, stage1_bench);
+    debug!(
+        "BGG poly-encoding gpu slot-transfer benchmark stage1 measured: gate_id={}, src_slot={}, dst_slot={}, elapsed_s={:.6}",
+        gate_id,
+        src_slot,
+        dst_slot,
+        stage1_started.elapsed().as_secs_f64()
+    );
+    drop(input_vector);
 
+    let stage2_started = Instant::now();
     let stage2_tasks = (0..b1_chunk_count)
         .map(|chunk_idx| SlotTransferStage2Task { chunk_idx })
         .collect::<Vec<_>>();
@@ -924,9 +1019,39 @@ where
     stage2_group_stats.entry(0usize).or_default().task_count = stage2_tasks.len();
     let mut c_transfer_output_shape = None::<(usize, usize)>;
     let mut c_transfer_template_bytes = None::<Arc<[u8]>>;
-    for task in stage2_tasks.into_iter().take(1) {
+    for (wave_idx, task) in stage2_tasks.into_iter().take(1).enumerate() {
+        let task_label = format!("chunk={}", task.chunk_idx);
         let load_started = Instant::now();
+        debug!(
+            "BGG poly-encoding gpu slot-transfer stage2 load start: gate_id={}, src_slot={}, dst_slot={}, wave={}, device_id={}, task={}",
+            gate_id, src_slot, dst_slot, wave_idx, shared.device_id, task_label
+        );
+        debug!(
+            "BGG poly-encoding gpu slot-transfer stage2 lhs load start: gate_id={}, src_slot={}, dst_slot={}, wave={}, device_id={}, task={}, lhs_bytes={}",
+            gate_id,
+            src_slot,
+            dst_slot,
+            wave_idx,
+            shared.device_id,
+            task_label,
+            c_b0_slot_preimage_b0_bytes.len()
+        );
         let lhs = M::from_compact_bytes(&shared.params, c_b0_slot_preimage_b0_bytes.as_ref());
+        debug!(
+            "BGG poly-encoding gpu slot-transfer stage2 lhs load complete: gate_id={}, src_slot={}, dst_slot={}, wave={}, device_id={}, task={}, lhs_rows={}, lhs_cols={}",
+            gate_id,
+            src_slot,
+            dst_slot,
+            wave_idx,
+            shared.device_id,
+            task_label,
+            lhs.row_size(),
+            lhs.col_size()
+        );
+        debug!(
+            "BGG poly-encoding gpu slot-transfer stage2 rhs load start: gate_id={}, src_slot={}, dst_slot={}, wave={}, device_id={}, task={}",
+            gate_id, src_slot, dst_slot, wave_idx, shared.device_id, task_label
+        );
         let rhs_chunk = read_matrix_column_chunk::<M>(
             &shared.params,
             dir,
@@ -935,24 +1060,70 @@ where
             task.chunk_idx,
         );
         let load_s = load_started.elapsed().as_secs_f64();
+        debug!(
+            "BGG poly-encoding gpu slot-transfer stage2 rhs load complete: gate_id={}, src_slot={}, dst_slot={}, wave={}, device_id={}, task={}, rhs_rows={}, rhs_cols={}",
+            gate_id,
+            src_slot,
+            dst_slot,
+            wave_idx,
+            shared.device_id,
+            task_label,
+            rhs_chunk.row_size(),
+            rhs_chunk.col_size()
+        );
+        debug!(
+            "BGG poly-encoding gpu slot-transfer stage2 load complete: gate_id={}, src_slot={}, dst_slot={}, wave={}, device_id={}, task={}, load_s={:.6}",
+            gate_id, src_slot, dst_slot, wave_idx, shared.device_id, task_label, load_s
+        );
         let compute_started = Instant::now();
+        debug!(
+            "BGG poly-encoding gpu slot-transfer stage2 compute start: gate_id={}, src_slot={}, dst_slot={}, wave={}, device_id={}, task={}",
+            gate_id, src_slot, dst_slot, wave_idx, shared.device_id, task_label
+        );
         let output = &lhs * &rhs_chunk;
         let output_shape = (output.row_size(), output.col_size());
         let compute_s = compute_started.elapsed().as_secs_f64();
+        debug!(
+            "BGG poly-encoding gpu slot-transfer stage2 compute complete: gate_id={}, src_slot={}, dst_slot={}, wave={}, device_id={}, task={}, output_rows={}, output_cols={}, compute_s={:.6}",
+            gate_id,
+            src_slot,
+            dst_slot,
+            wave_idx,
+            shared.device_id,
+            task_label,
+            output_shape.0,
+            output_shape.1,
+            compute_s
+        );
         let store_started = Instant::now();
+        debug!(
+            "BGG poly-encoding gpu slot-transfer stage2 store start: gate_id={}, src_slot={}, dst_slot={}, wave={}, device_id={}, task={}",
+            gate_id, src_slot, dst_slot, wave_idx, shared.device_id, task_label
+        );
         let output_bytes = Arc::<[u8]>::from(output.into_compact_bytes());
+        let output_bytes_len = output_bytes.len();
         c_transfer_output_shape = Some(output_shape);
         c_transfer_template_bytes = Some(output_bytes);
-        update_group_store_timing(
-            &mut stage2_group_stats,
-            0usize,
-            load_s,
-            compute_s,
-            store_started.elapsed().as_secs_f64(),
+        let store_s = store_started.elapsed().as_secs_f64();
+        debug!(
+            "BGG poly-encoding gpu slot-transfer stage2 store complete: gate_id={}, src_slot={}, dst_slot={}, wave={}, device_id={}, task={}, output_bytes={}, store_s={:.6}",
+            gate_id,
+            src_slot,
+            dst_slot,
+            wave_idx,
+            shared.device_id,
+            task_label,
+            output_bytes_len,
+            store_s
         );
+        update_group_store_timing(&mut stage2_group_stats, 0usize, load_s, compute_s, store_s);
     }
     let (c_transfer_rows, _) = c_transfer_output_shape
         .expect("missing slot-transfer representative transfer output shape");
+    debug!(
+        "BGG poly-encoding gpu slot-transfer benchmark stage2 zero-bytes start: gate_id={}, src_slot={}, dst_slot={}, device_id={}, target=c_transfer, rows={}, cols={}",
+        gate_id, src_slot, dst_slot, shared.device_id, c_transfer_rows, slot_preimage_b1_total_cols
+    );
     let c_transfer_bytes = Arc::<[u8]>::from(zero_compact_bytes_from_template::<M>(
         params,
         c_transfer_template_bytes
@@ -962,30 +1133,151 @@ where
         c_transfer_rows,
         slot_preimage_b1_total_cols,
     ));
+    debug!(
+        "BGG poly-encoding gpu slot-transfer benchmark stage2 zero-bytes complete: gate_id={}, src_slot={}, dst_slot={}, device_id={}, target=c_transfer, output_bytes={}",
+        gate_id,
+        src_slot,
+        dst_slot,
+        shared.device_id,
+        c_transfer_bytes.len()
+    );
     let stage2_bench = finalize_stage_bench(
         &stage2_group_stats,
         stage2_group_stats.values().map(|stats| stats.task_count).sum(),
     );
     add_stage_bench_to_slot_measurement(&mut slot_bench_measurement, stage2_bench);
+    debug!(
+        "BGG poly-encoding gpu slot-transfer benchmark stage2 measured: gate_id={}, src_slot={}, dst_slot={}, elapsed_s={:.6}",
+        gate_id,
+        src_slot,
+        dst_slot,
+        stage2_started.elapsed().as_secs_f64()
+    );
 
     let stage3_started = Instant::now();
     let scalar_poly = scalar.map(|scalar| M::P::from_usize_to_constant(params, scalar as usize));
+    debug!(
+        "BGG poly-encoding gpu slot-transfer stage3 input-direct load start: gate_id={}, src_slot={}, dst_slot={}, device_id={}, input_direct_bytes={}",
+        gate_id,
+        src_slot,
+        dst_slot,
+        shared.device_id,
+        input_direct_bytes.len()
+    );
     let mut out_vector = M::from_compact_bytes(params, input_direct_bytes.as_ref());
+    debug!(
+        "BGG poly-encoding gpu slot-transfer stage3 input-direct load complete: gate_id={}, src_slot={}, dst_slot={}, device_id={}, out_rows={}, out_cols={}",
+        gate_id,
+        src_slot,
+        dst_slot,
+        shared.device_id,
+        out_vector.row_size(),
+        out_vector.col_size()
+    );
+    debug!(
+        "BGG poly-encoding gpu slot-transfer stage3 c_transfer load start: gate_id={}, src_slot={}, dst_slot={}, device_id={}, c_transfer_bytes={}",
+        gate_id,
+        src_slot,
+        dst_slot,
+        shared.device_id,
+        c_transfer_bytes.len()
+    );
     let c_transfer = M::from_compact_bytes(params, c_transfer_bytes.as_ref());
+    debug!(
+        "BGG poly-encoding gpu slot-transfer stage3 c_transfer load complete: gate_id={}, src_slot={}, dst_slot={}, device_id={}, transfer_rows={}, transfer_cols={}",
+        gate_id,
+        src_slot,
+        dst_slot,
+        shared.device_id,
+        c_transfer.row_size(),
+        c_transfer.col_size()
+    );
+    let transfer_compute_started = Instant::now();
+    debug!(
+        "BGG poly-encoding gpu slot-transfer stage3 transfer-term compute start: gate_id={}, src_slot={}, dst_slot={}, device_id={}",
+        gate_id, src_slot, dst_slot, shared.device_id
+    );
     let transfer_term = c_transfer * output_plaintext.clone();
+    debug!(
+        "BGG poly-encoding gpu slot-transfer stage3 transfer-term compute complete: gate_id={}, src_slot={}, dst_slot={}, device_id={}, rows={}, cols={}, compute_s={:.6}",
+        gate_id,
+        src_slot,
+        dst_slot,
+        shared.device_id,
+        transfer_term.row_size(),
+        transfer_term.col_size(),
+        transfer_compute_started.elapsed().as_secs_f64()
+    );
     let ((), c_gate) = rayon::join(
-        || out_vector.add_in_place(&transfer_term),
-        || M::from_compact_bytes(params, c_gate_bytes.as_ref()),
+        || {
+            debug!(
+                "BGG poly-encoding gpu slot-transfer stage3 transfer-term add start: gate_id={}, src_slot={}, dst_slot={}, device_id={}",
+                gate_id, src_slot, dst_slot, shared.device_id
+            );
+            out_vector.add_in_place(&transfer_term);
+            debug!(
+                "BGG poly-encoding gpu slot-transfer stage3 transfer-term add complete: gate_id={}, src_slot={}, dst_slot={}, device_id={}",
+                gate_id, src_slot, dst_slot, shared.device_id
+            );
+        },
+        || {
+            debug!(
+                "BGG poly-encoding gpu slot-transfer stage3 c_gate load start: gate_id={}, src_slot={}, dst_slot={}, device_id={}, c_gate_bytes={}",
+                gate_id,
+                src_slot,
+                dst_slot,
+                shared.device_id,
+                c_gate_bytes.len()
+            );
+            let c_gate = M::from_compact_bytes(params, c_gate_bytes.as_ref());
+            debug!(
+                "BGG poly-encoding gpu slot-transfer stage3 c_gate load complete: gate_id={}, src_slot={}, dst_slot={}, device_id={}, gate_rows={}, gate_cols={}",
+                gate_id,
+                src_slot,
+                dst_slot,
+                shared.device_id,
+                c_gate.row_size(),
+                c_gate.col_size()
+            );
+            c_gate
+        },
     );
     if let Some(scalar_poly) = scalar_poly.as_ref() {
+        debug!(
+            "BGG poly-encoding gpu slot-transfer stage3 scalar multiply start: gate_id={}, src_slot={}, dst_slot={}, device_id={}",
+            gate_id, src_slot, dst_slot, shared.device_id
+        );
         out_vector = out_vector * scalar_poly;
+        debug!(
+            "BGG poly-encoding gpu slot-transfer stage3 scalar multiply complete: gate_id={}, src_slot={}, dst_slot={}, device_id={}",
+            gate_id, src_slot, dst_slot, shared.device_id
+        );
     }
+    debug!(
+        "BGG poly-encoding gpu slot-transfer stage3 c_gate add start: gate_id={}, src_slot={}, dst_slot={}, device_id={}",
+        gate_id, src_slot, dst_slot, shared.device_id
+    );
     out_vector.add_in_place(&c_gate);
+    debug!(
+        "BGG poly-encoding gpu slot-transfer stage3 c_gate add complete: gate_id={}, src_slot={}, dst_slot={}, device_id={}",
+        gate_id, src_slot, dst_slot, shared.device_id
+    );
     if let Some(scalar_poly) = scalar_poly.as_ref() {
         output_plaintext = output_plaintext * scalar_poly;
     }
+    debug!(
+        "BGG poly-encoding gpu slot-transfer stage3 output serialize start: gate_id={}, src_slot={}, dst_slot={}, device_id={}",
+        gate_id, src_slot, dst_slot, shared.device_id
+    );
     let _output_vector_bytes = Arc::<[u8]>::from(out_vector.into_compact_bytes());
     let _output_plaintext_bytes = Arc::<[u8]>::from(output_plaintext.to_compact_bytes());
+    debug!(
+        "BGG poly-encoding gpu slot-transfer benchmark stage3 measured: gate_id={}, src_slot={}, dst_slot={}, elapsed_s={:.6}",
+        gate_id,
+        src_slot,
+        dst_slot,
+        stage3_started.elapsed().as_secs_f64()
+    );
     add_scalar_stage_to_slot_measurement(
         &mut slot_bench_measurement,
         stage3_started.elapsed().as_secs_f64(),
@@ -1011,21 +1303,13 @@ where
         .plaintext_bytes
         .as_ref()
         .expect("BggPolyEncoding slot transfer benchmark requires plaintext_bytes");
-    let secret_size = input.pubkey.matrix.row_size();
-    let out_pubkey =
-        evaluator.output_pubkey_for_params(params, secret_size, samples.slot_transfer_gate_id);
     let configured_parallelism = effective_gpu_slot_parallelism(
         crate::env::slot_transfer_slot_parallelism()
             .max(1)
             .min(samples.slot_transfer_src_slots.len().max(1)),
     );
-    let shared_by_device = prepare_slot_transfer_shared_by_device::<M, HS>(
-        evaluator,
-        params,
-        samples.slot_transfer_gate_id,
-        out_pubkey.matrix.row_size(),
-        configured_parallelism,
-    );
+    let shared_by_device =
+        prepare_slot_transfer_shared_by_device::<M, HS>(evaluator, params, configured_parallelism);
     let iterations = iterations.max(1);
     let mut latency_sum = 0.0;
     let mut total_time_sum = 0.0;

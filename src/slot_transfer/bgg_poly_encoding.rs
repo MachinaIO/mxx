@@ -282,7 +282,6 @@ where
                 plaintext_bytes_by_slot,
                 src_slots,
                 gate_id,
-                &out_pubkey,
                 configured_parallelism,
             );
 

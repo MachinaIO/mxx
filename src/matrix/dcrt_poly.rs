@@ -383,6 +383,17 @@ impl PolyMatrix for DCRTPolyMatrix {
         matrix
     }
 
+    fn zero_compact_bytes(
+        params: &<Self::P as Poly>::Params,
+        nrow: usize,
+        ncol: usize,
+        _level: usize,
+        _is_ntt: bool,
+        _max_coeff_bits: u16,
+    ) -> Vec<u8> {
+        Self::zero(params, nrow, ncol).into_compact_bytes()
+    }
+
     fn block_entries(
         &self,
         rows: std::ops::Range<usize>,

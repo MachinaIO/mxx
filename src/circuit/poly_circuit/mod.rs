@@ -239,8 +239,13 @@ pub(crate) struct InputSetRegistry {
     input_set_index: DashMap<Arc<[BatchedWire]>, usize>,
 }
 
+pub(crate) struct SubCircuitRegistry<P: Poly> {
+    next_id: AtomicUsize,
+    sub_circuits: DashMap<usize, Arc<PolyCircuit<P>>>,
+}
+
 impl<P: Poly> LookupRegistry<P> {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { next_id: AtomicUsize::new(0), lookups: DashMap::new() }
     }
 
@@ -256,7 +261,7 @@ impl<P: Poly> LookupRegistry<P> {
 }
 
 impl BindingRegistry {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             next_id: AtomicUsize::new(0),
             binding_sets: DashMap::new(),
@@ -295,8 +300,32 @@ impl BindingRegistry {
     }
 }
 
+impl<P: Poly> SubCircuitRegistry<P> {
+    pub(crate) fn new() -> Self {
+        Self { next_id: AtomicUsize::new(0), sub_circuits: DashMap::new() }
+    }
+
+    fn register_arc(&self, sub_circuit: Arc<PolyCircuit<P>>) -> usize {
+        let circuit_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.sub_circuits.insert(circuit_id, sub_circuit);
+        circuit_id
+    }
+
+    pub(crate) fn register_arc_with_id(&self, circuit_id: usize, sub_circuit: Arc<PolyCircuit<P>>) {
+        self.next_id.fetch_max(circuit_id + 1, Ordering::Relaxed);
+        self.sub_circuits.entry(circuit_id).or_insert(sub_circuit);
+    }
+
+    fn get(&self, circuit_id: usize) -> Arc<PolyCircuit<P>> {
+        self.sub_circuits
+            .get(&circuit_id)
+            .unwrap_or_else(|| panic!("sub-circuit {circuit_id} not found"))
+            .clone()
+    }
+}
+
 impl InputSetRegistry {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             next_id: AtomicUsize::new(0),
             input_sets: DashMap::new(),
@@ -391,11 +420,10 @@ pub(crate) struct NonFreeDepthCacheKey {
     input_levels: Box<[u32]>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PolyCircuit<P: Poly> {
     pub(crate) gates: BTreeMap<GateId, PolyGate>,
     pub(crate) print_value: BTreeMap<GateId, String>,
-    pub(crate) sub_circuits: BTreeMap<usize, Arc<PolyCircuit<P>>>,
     pub(crate) sub_circuit_calls: BTreeMap<usize, SubCircuitCall>,
     pub(crate) summed_sub_circuit_calls: BTreeMap<usize, SummedSubCircuitCall>,
     pub(crate) sub_circuit_params: Vec<SubCircuitParamKind>,
@@ -405,6 +433,7 @@ pub struct PolyCircuit<P: Poly> {
     pub(crate) lookup_registry: Arc<LookupRegistry<P>>,
     pub(crate) binding_registry: Arc<BindingRegistry>,
     pub(crate) input_set_registry: Arc<InputSetRegistry>,
+    pub(crate) sub_circuit_registry: Arc<SubCircuitRegistry<P>>,
     pub(crate) next_scoped_call_id: usize,
     pub(crate) allow_register_lookup: bool,
 }
@@ -413,19 +442,53 @@ impl<P: Poly> PartialEq for PolyCircuit<P> {
     fn eq(&self, other: &Self) -> bool {
         self.gates == other.gates &&
             self.print_value == other.print_value &&
-            self.sub_circuits == other.sub_circuits &&
+            self.direct_sub_circuit_ids() == other.direct_sub_circuit_ids() &&
             self.sub_circuit_calls == other.sub_circuit_calls &&
             self.summed_sub_circuit_calls == other.summed_sub_circuit_calls &&
             self.sub_circuit_params == other.sub_circuit_params &&
             self.output_ids == other.output_ids &&
             self.gate_counts == other.gate_counts &&
             self.num_input == other.num_input &&
+            self.direct_sub_circuit_ids().into_iter().all(|circuit_id| {
+                self.registered_sub_circuit_ref(circuit_id) ==
+                    other.registered_sub_circuit_ref(circuit_id)
+            }) &&
             self.next_scoped_call_id == other.next_scoped_call_id &&
             self.allow_register_lookup == other.allow_register_lookup
     }
 }
 
 impl<P: Poly> Eq for PolyCircuit<P> {}
+
+impl<P: Poly> std::fmt::Debug for SubCircuitRegistry<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubCircuitRegistry")
+            .field("next_id", &self.next_id.load(Ordering::Relaxed))
+            .field("len", &self.sub_circuits.len())
+            .finish()
+    }
+}
+
+impl<P: Poly> std::fmt::Debug for PolyCircuit<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let direct_sub_circuit_ids = self.direct_sub_circuit_ids().into_iter().collect::<Vec<_>>();
+        f.debug_struct("PolyCircuit")
+            .field("num_gates", &self.gates.len())
+            .field("num_inputs", &self.num_input)
+            .field("num_outputs", &self.output_ids.len())
+            .field("num_sub_circuit_params", &self.sub_circuit_params.len())
+            .field("sub_circuit_calls", &self.sub_circuit_calls)
+            .field("summed_sub_circuit_calls", &self.summed_sub_circuit_calls)
+            .field("direct_sub_circuit_ids", &direct_sub_circuit_ids)
+            .field("lookup_registry", &self.lookup_registry)
+            .field("binding_registry", &self.binding_registry)
+            .field("input_set_registry", &self.input_set_registry)
+            .field("sub_circuit_registry", &self.sub_circuit_registry)
+            .field("next_scoped_call_id", &self.next_scoped_call_id)
+            .field("allow_register_lookup", &self.allow_register_lookup)
+            .finish()
+    }
+}
 
 impl<P: Poly> Default for PolyCircuit<P> {
     fn default() -> Self {

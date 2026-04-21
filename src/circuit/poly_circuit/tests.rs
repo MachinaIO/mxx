@@ -797,8 +797,7 @@ fn test_register_sub_circuit_reuses_child_binding_sets_without_duplication() {
     let _ = main_circuit.call_sub_circuit(middle_id, &[main_inputs[0]]);
 
     assert_eq!(main_circuit.binding_registry.binding_sets.len(), 2);
-    let registered_middle =
-        main_circuit.sub_circuits.get(&middle_id).expect("middle circuit missing");
+    let registered_middle = main_circuit.registered_sub_circuit_ref(middle_id);
     assert!(Arc::ptr_eq(&registered_middle.binding_registry, &main_circuit.binding_registry));
 }
 
@@ -895,12 +894,10 @@ fn test_nested_sub_circuits_with_disk_api_compatibility() {
     let square_gate = main_circuit.mul_gate(middle_outputs[0], middle_outputs[0]);
     main_circuit.output(vec![square_gate]);
 
-    assert!(
-        main_circuit
-            .sub_circuits
-            .values()
-            .all(|sub| Arc::ptr_eq(&sub.lookup_registry, &main_circuit.lookup_registry))
-    );
+    assert!(main_circuit.direct_sub_circuit_ids().into_iter().all(|sub_id| {
+        let sub = main_circuit.registered_sub_circuit_ref(sub_id);
+        Arc::ptr_eq(&sub.lookup_registry, &main_circuit.lookup_registry)
+    }));
 
     let gate_counts = main_circuit.count_gates_by_type_vec();
     assert_eq!(main_circuit.lut_vector_len_with_subcircuits(), 0);
@@ -937,12 +934,10 @@ fn test_enable_subcircuits_in_disk_is_noop_for_in_memory_storage() {
     let outputs = main_circuit.call_sub_circuit(sub_circuit_id, &[main_inputs[0], main_inputs[1]]);
     main_circuit.output(outputs);
 
-    assert!(
-        main_circuit
-            .sub_circuits
-            .values()
-            .all(|sub| Arc::ptr_eq(&sub.lookup_registry, &main_circuit.lookup_registry))
-    );
+    assert!(main_circuit.direct_sub_circuit_ids().into_iter().all(|sub_id| {
+        let sub = main_circuit.registered_sub_circuit_ref(sub_id);
+        Arc::ptr_eq(&sub.lookup_registry, &main_circuit.lookup_registry)
+    }));
 
     let result = eval_with_const_one(
         &main_circuit,

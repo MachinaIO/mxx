@@ -7,6 +7,7 @@ impl<P: Poly> PolyCircuit<P> {
         lookup_registry: Arc<LookupRegistry<P>>,
         binding_registry: Arc<BindingRegistry>,
         input_set_registry: Arc<InputSetRegistry>,
+        sub_circuit_registry: Arc<SubCircuitRegistry<P>>,
     ) {
         if !Arc::ptr_eq(&self.lookup_registry, &lookup_registry) {
             if !self.lookup_registry.is_empty() {
@@ -46,20 +47,67 @@ impl<P: Poly> PolyCircuit<P> {
             }
             self.input_set_registry = Arc::clone(&input_set_registry);
         }
-        self.allow_register_lookup = false;
-        for sub in self.sub_circuits.values_mut() {
-            if Arc::ptr_eq(&sub.lookup_registry, &lookup_registry) &&
-                Arc::ptr_eq(&sub.binding_registry, &binding_registry) &&
-                Arc::ptr_eq(&sub.input_set_registry, &input_set_registry)
-            {
-                continue;
+        if !Arc::ptr_eq(&self.sub_circuit_registry, &sub_circuit_registry) {
+            let previous_registry = Arc::clone(&self.sub_circuit_registry);
+            let previous_registry_key = Arc::as_ptr(&previous_registry) as usize;
+            let mut remapped_sub_circuit_ids = HashMap::new();
+            for call in self.sub_circuit_calls.values_mut() {
+                call.sub_circuit_id = Self::import_sub_circuit_to_registry(
+                    &previous_registry,
+                    previous_registry_key,
+                    &lookup_registry,
+                    &binding_registry,
+                    &input_set_registry,
+                    &sub_circuit_registry,
+                    call.sub_circuit_id,
+                    &mut remapped_sub_circuit_ids,
+                );
             }
-            Arc::make_mut(sub).inherit_shared_registries(
-                Arc::clone(&lookup_registry),
-                Arc::clone(&binding_registry),
-                Arc::clone(&input_set_registry),
-            );
+            for call in self.summed_sub_circuit_calls.values_mut() {
+                call.sub_circuit_id = Self::import_sub_circuit_to_registry(
+                    &previous_registry,
+                    previous_registry_key,
+                    &lookup_registry,
+                    &binding_registry,
+                    &input_set_registry,
+                    &sub_circuit_registry,
+                    call.sub_circuit_id,
+                    &mut remapped_sub_circuit_ids,
+                );
+            }
+            self.sub_circuit_registry = Arc::clone(&sub_circuit_registry);
         }
+        self.allow_register_lookup = false;
+    }
+
+    fn import_sub_circuit_to_registry(
+        previous_registry: &Arc<SubCircuitRegistry<P>>,
+        previous_registry_key: usize,
+        lookup_registry: &Arc<LookupRegistry<P>>,
+        binding_registry: &Arc<BindingRegistry>,
+        input_set_registry: &Arc<InputSetRegistry>,
+        target_registry: &Arc<SubCircuitRegistry<P>>,
+        circuit_id: usize,
+        remapped_sub_circuit_ids: &mut HashMap<(usize, usize), usize>,
+    ) -> usize {
+        if Arc::ptr_eq(previous_registry, target_registry) {
+            return circuit_id;
+        }
+        let remap_key = (previous_registry_key, circuit_id);
+        if let Some(&remapped_id) = remapped_sub_circuit_ids.get(&remap_key) {
+            return remapped_id;
+        }
+
+        let mut sub_circuit = previous_registry.get(circuit_id);
+        Arc::make_mut(&mut sub_circuit).inherit_shared_registries(
+            Arc::clone(lookup_registry),
+            Arc::clone(binding_registry),
+            Arc::clone(input_set_registry),
+            Arc::clone(target_registry),
+        );
+        let remapped_id = target_registry.register_arc(sub_circuit);
+        remapped_sub_circuit_ids.insert(remap_key, remapped_id);
+        remapped_id
     }
 
     pub(crate) fn inherit_registries_from_parent(&mut self, parent: &Self) {
@@ -67,25 +115,23 @@ impl<P: Poly> PolyCircuit<P> {
             Arc::clone(&parent.lookup_registry),
             Arc::clone(&parent.binding_registry),
             Arc::clone(&parent.input_set_registry),
+            Arc::clone(&parent.sub_circuit_registry),
         );
     }
 
-    pub(crate) fn inherit_registries(
-        &mut self,
-        lookup_registry: Arc<LookupRegistry<P>>,
-        binding_registry: Arc<BindingRegistry>,
-        input_set_registry: Arc<InputSetRegistry>,
-    ) {
-        self.inherit_shared_registries(lookup_registry, binding_registry, input_set_registry);
+    pub fn fresh_sub_circuit(&self) -> Self {
+        let mut circuit = Self::new();
+        circuit.inherit_registries_from_parent(self);
+        circuit
     }
 
     pub(crate) fn with_sub_circuit<R>(&self, circuit_id: usize, f: impl FnOnce(&Self) -> R) -> R {
-        let stored = self.sub_circuits.get(&circuit_id).expect("sub-circuit not found");
+        let stored = self.sub_circuit_registry.get(circuit_id);
         f(stored.as_ref())
     }
 
     pub(crate) fn sub_circuit_num_output(&self, circuit_id: usize) -> usize {
-        let stored = self.sub_circuits.get(&circuit_id).expect("sub-circuit not found");
+        let stored = self.sub_circuit_registry.get(circuit_id);
         stored.as_ref().num_output()
     }
 
@@ -273,8 +319,16 @@ impl<P: Poly> PolyCircuit<P> {
         );
     }
 
+    pub(crate) fn direct_sub_circuit_ids(&self) -> BTreeSet<usize> {
+        self.sub_circuit_calls
+            .values()
+            .map(|call| call.sub_circuit_id)
+            .chain(self.summed_sub_circuit_calls.values().map(|call| call.sub_circuit_id))
+            .collect()
+    }
+
     pub(crate) fn registered_sub_circuit_ref(&self, circuit_id: usize) -> Arc<Self> {
-        self.sub_circuits.get(&circuit_id).expect("sub-circuit not found").clone()
+        self.sub_circuit_registry.get(circuit_id)
     }
 
     pub fn register_public_lookup(&mut self, public_lookup: PublicLut<P>) -> usize {
@@ -325,18 +379,13 @@ impl<P: Poly> PolyCircuit<P> {
     /// churn outside the current refactor scope.
     pub fn enable_subcircuits_in_disk(&mut self, _dir_path: impl AsRef<Path>) {}
 
-    pub fn register_sub_circuit(&mut self, mut sub_circuit: Self) -> usize {
-        sub_circuit.inherit_registries_from_parent(self);
-        let circuit_id = self.sub_circuits.len();
-        self.sub_circuits.insert(circuit_id, Arc::new(sub_circuit));
-        circuit_id
-    }
-
-    pub fn register_shared_sub_circuit(&mut self, mut sub_circuit: Arc<Self>) -> usize {
+    pub fn register_sub_circuit<T>(&mut self, sub_circuit: T) -> usize
+    where
+        T: Into<Arc<Self>>,
+    {
+        let mut sub_circuit = sub_circuit.into();
         Arc::make_mut(&mut sub_circuit).inherit_registries_from_parent(self);
-        let circuit_id = self.sub_circuits.len();
-        self.sub_circuits.insert(circuit_id, sub_circuit);
-        circuit_id
+        self.sub_circuit_registry.register_arc(sub_circuit)
     }
 
     pub fn call_sub_circuit<I, W>(&mut self, circuit_id: usize, inputs: I) -> Vec<BatchedWire>
@@ -397,7 +446,7 @@ impl<P: Poly> PolyCircuit<P> {
             batched_wire_slice_len(&input_suffix);
         #[cfg(debug_assertions)]
         {
-            let stored = self.sub_circuits.get(&circuit_id).expect("sub-circuit not found");
+            let stored = self.sub_circuit_registry.get(circuit_id);
             let num_inputs = stored.num_input();
             assert_eq!(total_num_inputs, num_inputs);
             let expected_param_kinds = &stored.sub_circuit_params;
@@ -455,7 +504,7 @@ impl<P: Poly> PolyCircuit<P> {
         );
         #[cfg(debug_assertions)]
         {
-            let stored = self.sub_circuits.get(&circuit_id).expect("sub-circuit not found");
+            let stored = self.sub_circuit_registry.get(circuit_id);
             let (num_inputs, expected_param_kinds) =
                 (stored.num_input(), &stored.sub_circuit_params);
             for (call_idx, (input_set_id, binding_set_id)) in

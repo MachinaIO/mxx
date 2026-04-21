@@ -2,6 +2,7 @@
 mod gpu;
 
 mod context;
+mod decomposed_mul;
 mod encoding;
 mod poly;
 
@@ -51,10 +52,6 @@ pub struct NestedRnsPolyContext {
     p_over_pis: Vec<BigUint>,
     gadget_values: Vec<Vec<BigUint>>,
     pub full_reduce_max_plaintexts: Vec<BigUint>,
-    lut_mod_p_ids: Vec<usize>,
-    lut_x_to_y_ids: Vec<usize>,
-    lut_x_to_real_ids: Vec<usize>,
-    lut_real_to_v_id: usize,
     add_without_reduce_id: usize,
     sub_with_trace_offsets_id: usize,
     lazy_reduce_id: usize,

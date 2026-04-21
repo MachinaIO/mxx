@@ -15,7 +15,11 @@ use mxx::{
     circuit::{PolyCircuit, PolyGateKind, gate::GateId},
     element::PolyElem,
     gadgets::{
-        fhe::ring_gsw::{RingGswCiphertext, RingGswContext},
+        arith::NestedRnsPolyContext,
+        fhe::ring_gsw_nested_rns::{
+            NestedRnsRingGswCiphertext as RingGswCiphertext,
+            NestedRnsRingGswContext as RingGswContext,
+        },
         fhe_prg::goldreich::GoldreichFhePrg,
     },
     lookup::{
@@ -290,7 +294,7 @@ fn active_q_moduli_and_modulus<T: PolyParams>(
     (active_q_moduli, active_q, crt_depth)
 }
 
-fn ring_gsw_q_modulus<P: Poly>(ctx: &RingGswContext<P>) -> BigUint {
+fn ring_gsw_q_modulus<P: Poly + 'static>(ctx: &RingGswContext<P>) -> BigUint {
     let (q_moduli, _, _) = ctx.params.to_crt();
     q_moduli
         .iter()
@@ -413,13 +417,20 @@ fn build_goldreich_ring_gsw_circuit<P: Poly + 'static>(
     let mut circuit = PolyCircuit::<P>::new();
     let (_, _, crt_depth) = params.to_crt();
     let active_levels = cfg.active_levels_for_crt_depth(crt_depth);
-    let ctx = Arc::new(RingGswContext::setup(
+    let nested_rns = Arc::new(NestedRnsPolyContext::setup(
         &mut circuit,
         params,
-        cfg.num_slots(),
         cfg.p_moduli_bits,
         cfg.max_unreduced_muls,
         cfg.scale,
+        false,
+        Some(active_levels),
+    ));
+    let ctx = Arc::new(RingGswContext::from_arith_context(
+        &mut circuit,
+        params,
+        cfg.num_slots(),
+        nested_rns,
         Some(active_levels),
         None,
     ));

@@ -892,6 +892,17 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         out
     }
 
+    fn zero_compact_bytes(
+        params: &<Self::P as Poly>::Params,
+        nrow: usize,
+        ncol: usize,
+        level: usize,
+        is_ntt: bool,
+        max_coeff_bits: u16,
+    ) -> Vec<u8> {
+        GpuDCRTPolyMatrix::zero_compact_bytes(params, nrow, ncol, level, is_ntt, max_coeff_bits)
+    }
+
     fn from_poly_vec(params: &<Self::P as Poly>::Params, vec: Vec<Vec<Self::P>>) -> Self {
         if vec.is_empty() {
             return Self::new_empty(params, 0, 0);
@@ -1464,6 +1475,39 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
     }
 }
 
+impl GpuDCRTPolyMatrix {
+    pub(crate) fn zero_compact_bytes(
+        params: &GpuDCRTPolyParams,
+        nrow: usize,
+        ncol: usize,
+        level: usize,
+        is_ntt: bool,
+        max_coeff_bits: u16,
+    ) -> Vec<u8> {
+        assert!(level < params.crt_depth(), "invalid level for compact zero matrix");
+        let max_coeff_bits = max_coeff_bits.max(1);
+        let bytes_per_coeff = ((max_coeff_bits as usize).div_ceil(8)) as u16;
+        let coeff_count =
+            nrow.saturating_mul(ncol).saturating_mul(params.ring_dimension() as usize);
+        let payload_len = coeff_count.saturating_mul(max_coeff_bits as usize).div_ceil(8);
+        let format = if is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
+        bincode::encode_to_vec(
+            (
+                1u8,
+                format as u8,
+                level as u32,
+                nrow,
+                ncol,
+                max_coeff_bits,
+                bytes_per_coeff,
+                vec![0u8; payload_len],
+            ),
+            bincode::config::standard(),
+        )
+        .expect("Failed to serialize zero matrix to compact bytes")
+    }
+}
+
 impl Add for GpuDCRTPolyMatrix {
     type Output = GpuDCRTPolyMatrix;
 
@@ -1786,6 +1830,33 @@ mod tests {
         let gadget_matrix = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, size);
         assert_eq!(gadget_matrix.size().0, size);
         assert_eq!(gadget_matrix.size().1, size * gpu_params.modulus_bits());
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_zero_compact_bytes_roundtrip() {
+        gpu_device_sync();
+        let params = gpu_test_params();
+        let gpu_params = gpu_params_from_cpu(&params);
+        let cases = [(2usize, 3usize, 0usize, false, 17u16), (1usize, 4usize, 1usize, true, 23u16)];
+
+        for (nrow, ncol, level, is_ntt, max_coeff_bits) in cases {
+            let bytes = GpuDCRTPolyMatrix::zero_compact_bytes(
+                &gpu_params,
+                nrow,
+                ncol,
+                level,
+                is_ntt,
+                max_coeff_bits,
+            );
+            let decoded = GpuDCRTPolyMatrix::from_compact_bytes(&gpu_params, &bytes);
+            let expected =
+                GpuDCRTPolyMatrix::new_zero_with_state(&gpu_params, nrow, ncol, level, is_ntt);
+            assert_eq!(
+                decoded, expected,
+                "zero_compact_bytes should decode to the expected zero matrix"
+            );
+        }
     }
 
     #[test]

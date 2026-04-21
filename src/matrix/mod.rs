@@ -89,6 +89,14 @@ pub trait PolyMatrix:
         self.clone().into_compact_bytes()
     }
     fn from_compact_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self;
+    fn zero_compact_bytes(
+        params: &<Self::P as Poly>::Params,
+        nrow: usize,
+        ncol: usize,
+        level: usize,
+        is_ntt: bool,
+        max_coeff_bits: u16,
+    ) -> Vec<u8>;
     fn from_poly_vec(params: &<Self::P as Poly>::Params, vec: Vec<Vec<Self::P>>) -> Self;
     /// Creates a row vector (1 x n matrix) from a vector of n DCRTPoly elements.
     fn from_poly_vec_row(params: &<Self::P as Poly>::Params, vec: Vec<Self::P>) -> Self {

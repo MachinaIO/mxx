@@ -911,6 +911,7 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
         bench_slot_checkpoint_prefix,
         bench_slot_c_b0.to_compact_bytes(),
     );
+    drop(bench_slot_c_b0);
     drop(bench_plt_b0_matrix);
     drop(bench_slot_b0_matrix);
     drop(bench_slot_secret_mats);
@@ -945,6 +946,10 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
         &bench_poly_slot_evaluator,
         cfg.bench_iterations,
     );
+    drop(bench_poly_encodings);
+    drop(bench_poly_plt_evaluator);
+    drop(bench_poly_slot_evaluator);
+    gpu_device_sync();
     let poly_circuit_bench = poly_bench_estimator.estimate_circuit_bench(&circuit);
     info!(
         "bgg poly encoding circuit bench estimate: total_time={:.6} latency={:.6} max_parallelism={} peak_vram={}",

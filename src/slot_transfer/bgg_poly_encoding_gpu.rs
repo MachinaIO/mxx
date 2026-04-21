@@ -1,7 +1,10 @@
 use super::*;
-use crate::poly::{
-    PolyParams,
-    dcrt::gpu::{GPU_POLY_FORMAT_COEFF, GPU_POLY_FORMAT_EVAL, detected_gpu_device_ids},
+use crate::{
+    poly::{
+        PolyParams,
+        dcrt::gpu::{GPU_POLY_FORMAT_COEFF, GPU_POLY_FORMAT_EVAL, detected_gpu_device_ids},
+    },
+    slot_transfer::bgg_pubkey::column_chunk_bounds,
 };
 use rayon::prelude::*;
 use std::{collections::HashMap, sync::Arc, time::Instant};
@@ -39,7 +42,7 @@ struct SlotTransferTaskGroupBenchStats {
 enum SlotTransferStage1Task {
     B0Chunk { chunk_idx: usize },
     GateChunk { chunk_idx: usize },
-    InputDirect,
+    InputDirect { chunk_idx: usize },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -177,7 +180,7 @@ where
 
 fn stage1_task_lhs_family(task: &SlotTransferStage1Task) -> usize {
     match task {
-        SlotTransferStage1Task::InputDirect => 1,
+        SlotTransferStage1Task::InputDirect { .. } => 1,
         SlotTransferStage1Task::B0Chunk { .. } | SlotTransferStage1Task::GateChunk { .. } => 0,
     }
 }
@@ -186,7 +189,7 @@ fn stage1_task_bench_group(task: &SlotTransferStage1Task) -> SlotTransferStage1B
     match task {
         SlotTransferStage1Task::B0Chunk { .. } => SlotTransferStage1BenchGroup::B0,
         SlotTransferStage1Task::GateChunk { .. } => SlotTransferStage1BenchGroup::Gate,
-        SlotTransferStage1Task::InputDirect => SlotTransferStage1BenchGroup::InputDirect,
+        SlotTransferStage1Task::InputDirect { .. } => SlotTransferStage1BenchGroup::InputDirect,
     }
 }
 
@@ -252,6 +255,7 @@ fn add_scalar_stage_to_slot_measurement(
 fn build_stage1_tasks(
     b0_chunk_count: usize,
     gate_chunk_count: usize,
+    input_direct_chunk_count: usize,
 ) -> Vec<SlotTransferStage1Task> {
     let mut stage1_tasks = Vec::new();
     stage1_tasks
@@ -259,7 +263,10 @@ fn build_stage1_tasks(
     stage1_tasks.extend(
         (0..gate_chunk_count).map(|chunk_idx| SlotTransferStage1Task::GateChunk { chunk_idx }),
     );
-    stage1_tasks.push(SlotTransferStage1Task::InputDirect);
+    stage1_tasks.extend(
+        (0..input_direct_chunk_count)
+            .map(|chunk_idx| SlotTransferStage1Task::InputDirect { chunk_idx }),
+    );
     stage1_tasks
 }
 
@@ -294,8 +301,18 @@ where
             gate_total_cols,
             chunk_idx,
         ),
-        SlotTransferStage1Task::InputDirect => {
-            evaluator.slot_a_for_params(&shared.params, secret_size, dst_slot).decompose()
+        SlotTransferStage1Task::InputDirect { chunk_idx } => {
+            let (col_start, col_len) = column_chunk_bounds(gate_total_cols, chunk_idx);
+            HS::new().sample_hash_decomposed_columns(
+                &shared.params,
+                evaluator.hash_key,
+                format!("slot_transfer_slot_a_{}", dst_slot),
+                secret_size,
+                gate_total_cols,
+                col_start,
+                col_len,
+                DistType::FinRingDist,
+            )
         }
     }
 }
@@ -389,13 +406,13 @@ where
     let b0_chunk_count = column_chunk_count(slot_preimage_b0_total_cols);
     let b1_chunk_count = column_chunk_count(slot_preimage_b1_total_cols);
     let gate_chunk_count = column_chunk_count(gate_total_cols);
+    let input_direct_chunk_count = column_chunk_count(gate_total_cols);
     let mut stage1_tasks = Vec::new();
-    stage1_tasks
-        .extend((0..b0_chunk_count).map(|chunk_idx| SlotTransferStage1Task::B0Chunk { chunk_idx }));
-    stage1_tasks.extend(
-        (0..gate_chunk_count).map(|chunk_idx| SlotTransferStage1Task::GateChunk { chunk_idx }),
-    );
-    stage1_tasks.push(SlotTransferStage1Task::InputDirect);
+    stage1_tasks.extend(build_stage1_tasks(
+        b0_chunk_count,
+        gate_chunk_count,
+        input_direct_chunk_count,
+    ));
     let mut stage1_group_stats = if collect_bench {
         let mut stats =
             HashMap::<SlotTransferStage1BenchGroup, SlotTransferTaskGroupBenchStats>::new();
@@ -449,7 +466,7 @@ where
             .map(|loaded_task| {
                 let compute_started = collect_bench.then(Instant::now);
                 let lhs = match loaded_task.task {
-                    SlotTransferStage1Task::InputDirect => {
+                    SlotTransferStage1Task::InputDirect { .. } => {
                         &input_vector_by_device[loaded_task.device_slot]
                     }
                     SlotTransferStage1Task::B0Chunk { .. } |
@@ -469,7 +486,8 @@ where
     };
     let mut b0_chunk_bytes = (0..b0_chunk_count).map(|_| None).collect::<Vec<_>>();
     let mut gate_chunk_bytes = (0..gate_chunk_count).map(|_| None).collect::<Vec<_>>();
-    let mut input_direct_bytes = None;
+    let mut input_direct_chunk_bytes =
+        (0..input_direct_chunk_count).map(|_| None).collect::<Vec<_>>();
     let mut store_stage1_wave = |outputs: Vec<ComputedSlotTransferStage1Task>| {
         for output in outputs {
             let store_started = collect_bench.then(Instant::now);
@@ -480,8 +498,8 @@ where
                 SlotTransferStage1Task::GateChunk { chunk_idx } => {
                     gate_chunk_bytes[chunk_idx] = Some(output.bytes);
                 }
-                SlotTransferStage1Task::InputDirect => {
-                    input_direct_bytes = Some(output.bytes);
+                SlotTransferStage1Task::InputDirect { chunk_idx } => {
+                    input_direct_chunk_bytes[chunk_idx] = Some(output.bytes);
                 }
             }
             if collect_bench {
@@ -547,8 +565,19 @@ where
     let c_gate_bytes = Arc::<[u8]>::from(
         concat_chunk_bytes_on_base::<M, Vec<u8>>(params, gate_chunk_bytes).into_compact_bytes(),
     );
-    let input_direct_bytes =
-        Arc::<[u8]>::from(input_direct_bytes.expect("missing slot-transfer input-direct bytes"));
+    let input_direct_chunk_bytes = input_direct_chunk_bytes
+        .into_iter()
+        .enumerate()
+        .map(|(chunk_idx, maybe_bytes)| {
+            maybe_bytes.unwrap_or_else(|| {
+                panic!("missing slot-transfer input-direct chunk bytes for chunk {chunk_idx}")
+            })
+        })
+        .collect::<Vec<_>>();
+    let input_direct_bytes = Arc::<[u8]>::from(
+        concat_chunk_bytes_on_base::<M, Vec<u8>>(params, input_direct_chunk_bytes)
+            .into_compact_bytes(),
+    );
     if collect_bench {
         let stage1_bench =
             finalize_stage_bench(&stage1_group_stats, stage1_batches.iter().map(Vec::len).sum());
@@ -799,9 +828,11 @@ where
     let b0_chunk_count = column_chunk_count(slot_preimage_b0_total_cols);
     let b1_chunk_count = column_chunk_count(slot_preimage_b1_total_cols);
     let gate_chunk_count = column_chunk_count(gate_total_cols);
+    let input_direct_chunk_count = column_chunk_count(gate_total_cols);
 
     let stage1_started = Instant::now();
-    let stage1_tasks = build_stage1_tasks(b0_chunk_count, gate_chunk_count);
+    let stage1_tasks =
+        build_stage1_tasks(b0_chunk_count, gate_chunk_count, input_direct_chunk_count);
     let mut stage1_group_stats =
         HashMap::<SlotTransferStage1BenchGroup, SlotTransferTaskGroupBenchStats>::new();
     let mut stage1_representative_tasks = Vec::new();
@@ -827,7 +858,9 @@ where
             SlotTransferStage1Task::GateChunk { chunk_idx } => {
                 format!("family=Gate, chunk={chunk_idx}")
             }
-            SlotTransferStage1Task::InputDirect => "family=InputDirect".to_string(),
+            SlotTransferStage1Task::InputDirect { chunk_idx } => {
+                format!("family=InputDirect, chunk={chunk_idx}")
+            }
         };
         let load_started = Instant::now();
         debug!(
@@ -865,7 +898,7 @@ where
             gate_id, src_slot, dst_slot, wave_idx, shared.device_id, task_label
         );
         let lhs = match task {
-            SlotTransferStage1Task::InputDirect => &input_vector,
+            SlotTransferStage1Task::InputDirect { .. } => &input_vector,
             SlotTransferStage1Task::B0Chunk { .. } | SlotTransferStage1Task::GateChunk { .. } => {
                 &shared.c_b0
             }
@@ -903,9 +936,10 @@ where
                 gate_template_bytes = Some(output_bytes);
                 debug_assert!(chunk_idx < gate_chunk_count);
             }
-            SlotTransferStage1Task::InputDirect => {
+            SlotTransferStage1Task::InputDirect { chunk_idx } => {
                 input_direct_shape = Some(output_shape);
                 input_direct_template_bytes = Some(output_bytes);
+                debug_assert!(chunk_idx < input_direct_chunk_count);
             }
         }
         let store_s = store_started.elapsed().as_secs_f64();
@@ -932,7 +966,7 @@ where
         b0_output_shape.expect("missing slot-transfer representative b0 output shape");
     let (gate_rows, _) =
         gate_output_shape.expect("missing slot-transfer representative gate output shape");
-    let (input_direct_rows, input_direct_cols) =
+    let (input_direct_rows, _) =
         input_direct_shape.expect("missing slot-transfer representative input-direct output shape");
     debug!(
         "BGG poly-encoding gpu slot-transfer benchmark stage1 zero-bytes start: gate_id={}, src_slot={}, dst_slot={}, device_id={}, target=c_b0_slot_preimage_b0, rows={}, cols={}",
@@ -978,7 +1012,7 @@ where
     );
     debug!(
         "BGG poly-encoding gpu slot-transfer benchmark stage1 zero-bytes start: gate_id={}, src_slot={}, dst_slot={}, device_id={}, target=input_direct, rows={}, cols={}",
-        gate_id, src_slot, dst_slot, shared.device_id, input_direct_rows, input_direct_cols
+        gate_id, src_slot, dst_slot, shared.device_id, input_direct_rows, gate_total_cols
     );
     let input_direct_bytes = Arc::<[u8]>::from(zero_compact_bytes_from_template::<M>(
         params,
@@ -987,7 +1021,7 @@ where
             .expect("missing slot-transfer representative input-direct template bytes")
             .as_ref(),
         input_direct_rows,
-        input_direct_cols,
+        gate_total_cols,
     ));
     debug!(
         "BGG poly-encoding gpu slot-transfer benchmark stage1 zero-bytes complete: gate_id={}, src_slot={}, dst_slot={}, device_id={}, target=input_direct, output_bytes={}",

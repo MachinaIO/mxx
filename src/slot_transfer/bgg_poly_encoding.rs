@@ -63,6 +63,7 @@ where
         format!("{}_gate_preimage_{}_dst{}", self.checkpoint_prefix, gate_id, dst_slot)
     }
 
+    #[cfg(not(feature = "gpu"))]
     fn slot_a_for_params(
         &self,
         params: &<M::P as Poly>::Params,

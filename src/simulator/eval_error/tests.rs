@@ -8,6 +8,7 @@ use crate::{
     },
     simulator::SimulatorContext,
     slot_transfer::SlotTransferEvaluator,
+    utils::bigdecimal_bits_ceil,
 };
 use bigdecimal::BigDecimal;
 
@@ -150,6 +151,64 @@ fn test_wire_norm_simulator_multiplication_matches_generic_eval() {
         None::<&NormPltLWEEvaluator>,
     );
     assert_eq!(out, generic);
+}
+
+#[test]
+fn test_wire_norm_simulator_mul_binary_tree_plaintext_one_matches_generic_eval() {
+    let tree_height = 10usize;
+    let input_size = 1usize << tree_height;
+    let input_plaintext_norm = BigDecimal::one();
+    let ring_dim_sqrt = BigDecimal::from(1u64 << 8);
+    let base = BigDecimal::from(14u64);
+    let secret_size = 1usize;
+    let log_base_q = 2usize * 30;
+    let log_base_q_small = 2usize;
+    let e_init_norm = BigDecimal::from(E_INIT_NORM);
+    let ctx = Arc::new(SimulatorContext::new(
+        ring_dim_sqrt,
+        base,
+        secret_size,
+        log_base_q,
+        log_base_q_small,
+    ));
+
+    let mut circuit = PolyCircuit::<DCRTPoly>::new();
+    let mut current_level = circuit.input(input_size).to_vec();
+
+    for _ in 0..tree_height {
+        let mut next_level = Vec::with_capacity(current_level.len() / 2);
+        for pair in current_level.chunks_exact(2) {
+            next_level.push(circuit.mul_gate(pair[0], pair[1]).as_single_wire());
+        }
+        current_level = next_level;
+    }
+
+    assert_eq!(current_level.len(), 1);
+    circuit.output(vec![current_level[0]]);
+
+    let simulated = circuit.simulate_max_error_norm(
+        ctx.clone(),
+        input_plaintext_norm.clone(),
+        input_size,
+        &e_init_norm,
+        None::<&NormPltLWEEvaluator>,
+        None,
+    );
+    let generic = simulate_max_error_norm_via_generic_eval_reference(
+        &circuit,
+        ctx,
+        input_plaintext_norm,
+        input_size,
+        &e_init_norm,
+        None::<&NormPltLWEEvaluator>,
+    );
+
+    assert_eq!(simulated.len(), 1);
+    assert_eq!(simulated, generic);
+    println!(
+        "mul_binary_tree_output_error_bits={}",
+        bigdecimal_bits_ceil(&simulated[0].matrix_norm.poly_norm.norm)
+    );
 }
 
 #[test]

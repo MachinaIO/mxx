@@ -2,7 +2,7 @@ use super::{encoding::sample_crt_primes_mul_budget_bound, *};
 use crate::{
     __PAIR, __TestState,
     circuit::{PolyGateKind, evaluable::PolyVec},
-    gadgets::ntt::encode_nested_rns_poly_vec_with_offset,
+    gadgets::arith::encode_nested_rns_poly_with_offset,
     lookup::{poly::PolyPltEvaluator, poly_vec::PolyVecPltEvaluator},
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     poly::{
@@ -19,6 +19,37 @@ const P_MODULI_BITS: usize = 6;
 const MAX_UNREDUCED_MULS: usize = DEFAULT_MAX_UNREDUCED_MULS;
 const SCALE: u64 = 1 << 8;
 const BASE_BITS: u32 = 6;
+
+fn encode_nested_rns_poly_vec_with_offset<P: Poly>(
+    params: &P::Params,
+    ctx: &NestedRnsPolyContext,
+    coeffs: &[BigUint],
+    level_offset: usize,
+    enable_levels: Option<usize>,
+) -> Vec<PolyVec<P>> {
+    let encodings = coeffs
+        .iter()
+        .map(|coeff| {
+            encode_nested_rns_poly_with_offset::<P>(
+                ctx.p_moduli_bits,
+                ctx.max_unreduced_muls,
+                params,
+                coeff,
+                level_offset,
+                enable_levels,
+            )
+        })
+        .collect::<Vec<_>>();
+    let encoded_len =
+        encodings.first().map(|encoded| encoded.len()).expect("coeff vector must not be empty");
+    (0..encoded_len)
+        .map(|gate_idx| {
+            PolyVec::new(
+                encodings.iter().map(|encoded| encoded[gate_idx].clone()).collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
 
 fn create_test_context(
     circuit: &mut PolyCircuit<DCRTPoly>,

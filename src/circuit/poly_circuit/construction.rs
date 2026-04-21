@@ -10,10 +10,10 @@ impl<P: Poly> PolyCircuit<P> {
         let lookup_registry = Arc::new(LookupRegistry::new());
         let binding_registry = Arc::new(BindingRegistry::new());
         let input_set_registry = Arc::new(InputSetRegistry::new());
+        let sub_circuit_registry = Arc::new(SubCircuitRegistry::new());
         Self {
             gates,
             print_value: BTreeMap::new(),
-            sub_circuits: BTreeMap::new(),
             sub_circuit_calls: BTreeMap::new(),
             summed_sub_circuit_calls: BTreeMap::new(),
             sub_circuit_params: vec![],
@@ -23,6 +23,7 @@ impl<P: Poly> PolyCircuit<P> {
             lookup_registry,
             binding_registry,
             input_set_registry,
+            sub_circuit_registry,
             next_scoped_call_id: 0,
             allow_register_lookup: true,
         }

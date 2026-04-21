@@ -94,6 +94,25 @@ pub struct SerializablePolyCircuit {
 }
 
 impl SerializablePolyCircuit {
+    fn direct_serialized_sub_circuits<P: Poly>(
+        circuit: &PolyCircuit<P>,
+    ) -> Vec<(usize, Box<SerializablePolyCircuit>)> {
+        circuit
+            .direct_sub_circuit_ids()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|circuit_id| {
+                (
+                    circuit_id,
+                    Box::new(Self::from_circuit(
+                        circuit.registered_sub_circuit_ref(circuit_id).as_ref().clone(),
+                    )),
+                )
+            })
+            .collect::<Vec<_>>()
+    }
+
     pub fn new(
         gates: BTreeMap<GateId, SerializablePolyGate>,
         sub_circuits: BTreeMap<usize, Box<SerializablePolyCircuit>>,
@@ -175,10 +194,10 @@ impl SerializablePolyCircuit {
                 )
             })
             .collect::<Vec<_>>();
+        let sub_circuits_vec = Self::direct_serialized_sub_circuits(&circuit);
         let gate_entries = circuit.gates.into_iter().collect::<Vec<_>>();
-        let sub_circuit_entries = circuit.sub_circuits.into_iter().collect::<Vec<_>>();
 
-        let (gates_vec, (sub_circuits_vec, (calls_vec, summed_calls_vec))) = rayon::join(
+        let (gates_vec, ((sub_circuits_vec, calls_vec), summed_calls_vec)) = rayon::join(
             || {
                 gate_entries
                     .into_par_iter()
@@ -224,31 +243,21 @@ impl SerializablePolyCircuit {
             || {
                 rayon::join(
                     || {
-                        sub_circuit_entries
-                            .into_par_iter()
-                            .map(|(circuit_id, sub_circuit)| {
-                                (
-                                    circuit_id,
-                                    Box::new(Self::from_circuit(sub_circuit.as_ref().clone())),
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    },
-                    || {
                         rayon::join(
+                            || sub_circuits_vec,
                             || {
                                 call_entries
                                     .into_par_iter()
                                     .map(|(call_id, call)| (call_id, call))
                                     .collect::<Vec<_>>()
                             },
-                            || {
-                                summed_call_entries
-                                    .into_par_iter()
-                                    .map(|(call_id, call)| (call_id, call))
-                                    .collect::<Vec<_>>()
-                            },
                         )
+                    },
+                    || {
+                        summed_call_entries
+                            .into_par_iter()
+                            .map(|(call_id, call)| (call_id, call))
+                            .collect::<Vec<_>>()
                     },
                 )
             },
@@ -267,7 +276,34 @@ impl SerializablePolyCircuit {
     }
 
     pub fn to_circuit<P: Poly>(self) -> PolyCircuit<P> {
+        let lookup_registry = Arc::new(crate::circuit::poly_circuit::LookupRegistry::new());
+        let binding_registry = Arc::new(crate::circuit::poly_circuit::BindingRegistry::new());
+        let input_set_registry = Arc::new(crate::circuit::poly_circuit::InputSetRegistry::new());
+        let sub_circuit_registry =
+            Arc::new(crate::circuit::poly_circuit::SubCircuitRegistry::new());
+        self.to_circuit_with_registries(
+            lookup_registry,
+            binding_registry,
+            input_set_registry,
+            sub_circuit_registry,
+            true,
+        )
+    }
+
+    fn to_circuit_with_registries<P: Poly>(
+        self,
+        lookup_registry: Arc<crate::circuit::poly_circuit::LookupRegistry<P>>,
+        binding_registry: Arc<crate::circuit::poly_circuit::BindingRegistry>,
+        input_set_registry: Arc<crate::circuit::poly_circuit::InputSetRegistry>,
+        sub_circuit_registry: Arc<crate::circuit::poly_circuit::SubCircuitRegistry<P>>,
+        allow_register_lookup: bool,
+    ) -> PolyCircuit<P> {
         let mut circuit = PolyCircuit::new();
+        circuit.lookup_registry = lookup_registry.clone();
+        circuit.binding_registry = binding_registry.clone();
+        circuit.input_set_registry = input_set_registry.clone();
+        circuit.sub_circuit_registry = sub_circuit_registry.clone();
+        circuit.allow_register_lookup = allow_register_lookup;
 
         let sub_circuit_entries = self.sub_circuits.into_iter().collect::<Vec<_>>();
         let gate_entries = self.gates.into_iter().collect::<Vec<_>>();
@@ -279,7 +315,16 @@ impl SerializablePolyCircuit {
                 sub_circuit_entries
                     .into_par_iter()
                     .map(|(circuit_id, sub_circuit)| {
-                        (circuit_id, Arc::new(sub_circuit.to_circuit::<P>()))
+                        (
+                            circuit_id,
+                            Arc::new(sub_circuit.to_circuit_with_registries(
+                                lookup_registry.clone(),
+                                binding_registry.clone(),
+                                input_set_registry.clone(),
+                                sub_circuit_registry.clone(),
+                                false,
+                            )),
+                        )
                     })
                     .collect::<Vec<_>>()
             },
@@ -349,17 +394,9 @@ impl SerializablePolyCircuit {
             },
         );
 
-        circuit.sub_circuits = sub_circuits_vec.into_iter().collect();
         circuit.gates = gates_vec.into_iter().collect();
-        let lookup_registry = circuit.lookup_registry.clone();
-        let binding_registry = circuit.binding_registry.clone();
-        let input_set_registry = circuit.input_set_registry.clone();
-        for sub_circuit in circuit.sub_circuits.values_mut() {
-            Arc::make_mut(sub_circuit).inherit_registries(
-                lookup_registry.clone(),
-                binding_registry.clone(),
-                input_set_registry.clone(),
-            );
+        for (circuit_id, sub_circuit) in sub_circuits_vec {
+            circuit.sub_circuit_registry.register_arc_with_id(circuit_id, sub_circuit);
         }
         circuit.sub_circuit_calls = calls_vec
             .into_iter()

@@ -444,7 +444,7 @@ fn build_goldreich_ring_gsw_circuit<P: Poly + 'static>(
     let encrypted_inputs = (0..goldreich.input_size)
         .map(|_| RingGswCiphertext::input(ctx.clone(), None, &mut circuit))
         .collect::<Vec<_>>();
-    let encrypted_outputs = goldreich.evaluate(&encrypted_inputs, &mut circuit);
+    let encrypted_outputs = goldreich.evaluate_uniform(&encrypted_inputs, &mut circuit);
     let reconstructed_outputs = encrypted_outputs
         .iter()
         .flat_map(|ciphertext| ciphertext.reconstruct(&mut circuit))

@@ -1856,12 +1856,12 @@ where
         max_parallelism = max_parallelism.max(slot_bench.max_parallelism);
     }
 
-    crate::bench_estimator::PolyEncodingChunkBenchMeasurement {
-        latency: latency_sum / iterations as f64,
+    crate::bench_estimator::PolyEncodingChunkBenchMeasurement::new(
+        total_time_sum / iterations as f64,
+        latency_sum / iterations as f64,
         max_parallelism,
-        total_time: total_time_sum / iterations as f64,
-        peak_vram: 0,
-    }
+        0,
+    )
 }
 
 pub(super) fn evaluate_public_lookup_slots_gpu<M, HS>(

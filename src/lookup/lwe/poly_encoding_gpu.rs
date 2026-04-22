@@ -363,15 +363,16 @@ where
         .max(k_low_compute_bench.peak_vram)
         .max(stage2_bench.peak_vram);
 
-    PolyEncodingChunkBenchMeasurement {
+    let max_parallelism = u128::try_from(
+        output_chunk_count.checked_mul(2).expect("stage-1 task count overflowed usize"),
+    )
+    .expect("stage-1 task count overflowed u128");
+    PolyEncodingChunkBenchMeasurement::new(
+        latency * max_parallelism as f64,
         latency,
-        max_parallelism: u128::try_from(
-            output_chunk_count.checked_mul(2).expect("stage-1 task count overflowed usize"),
-        )
-        .expect("stage-1 task count overflowed u128"),
-        total_time: latency,
+        max_parallelism,
         peak_vram,
-    }
+    )
 }
 
 pub(super) fn public_lookup_poly_gpu<M, SH>(

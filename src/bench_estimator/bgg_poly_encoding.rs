@@ -96,6 +96,12 @@ pub struct PolyEncodingChunkBenchMeasurement {
     pub peak_vram: usize,
 }
 
+impl PolyEncodingChunkBenchMeasurement {
+    pub fn new(total_time: f64, latency: f64, max_parallelism: u128, peak_vram: usize) -> Self {
+        Self { latency, max_parallelism, total_time, peak_vram }
+    }
+}
+
 pub trait PolyEncodingPublicLutBenchEstimator<M>:
     PltEvaluator<BggPolyEncoding<M>> + Send + Sync
 where

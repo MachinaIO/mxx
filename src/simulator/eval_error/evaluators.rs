@@ -177,28 +177,33 @@ impl AffineSlotTransferEvaluator for NormBggPolyEncodingSTEvaluator {
 
 #[derive(Debug, Clone)]
 pub struct NormPltLWEEvaluator {
-    pub e_b_times_preimage: PolyMatrixNorm,
-    pub preimage_lower: PolyMatrixNorm,
+    pub e_b_times_k_high: PolyMatrixNorm,
+    pub k_low: PolyMatrixNorm,
 }
 
 impl NormPltLWEEvaluator {
     pub fn new(ctx: Arc<SimulatorContext>, e_b_sigma: &BigDecimal) -> Self {
-        let norm = compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None);
-        let norm_bits = bigdecimal_bits_ceil(&norm);
-        info!("{}", format!("preimage norm bits {}", norm_bits));
+        let k_high_norm =
+            compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None);
+        let k_high_norm_bits = bigdecimal_bits_ceil(&k_high_norm);
+        let k_low = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g);
+        info!("{}", format!("preimage norm bits {}", k_high_norm_bits));
+        info!(
+            "LWE PLT k_low decomposition norm bits {}",
+            bigdecimal_bits_ceil(&k_low.poly_norm.norm)
+        );
         let e_b_init = PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_b, e_b_sigma * 6, None);
-        let e_b_times_preimage =
-            &e_b_init * &PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, norm.clone(), None);
-        let preimage_lower = PolyMatrixNorm::new(ctx.clone(), ctx.m_g, ctx.m_g, norm.clone(), None);
+        let e_b_times_k_high =
+            &e_b_init * &PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, k_high_norm, None);
         info!(
             "LWE PLT const term norm bits {}",
-            bigdecimal_bits_ceil(&e_b_times_preimage.poly_norm.norm)
+            bigdecimal_bits_ceil(&e_b_times_k_high.poly_norm.norm)
         );
         info!(
             "LWE PLT e_input multiplier norm bits {}",
-            bigdecimal_bits_ceil(&preimage_lower.poly_norm.norm)
+            bigdecimal_bits_ceil(&k_low.poly_norm.norm)
         );
-        Self { e_b_times_preimage, preimage_lower }
+        Self { e_b_times_k_high, k_low }
     }
 }
 
@@ -212,7 +217,7 @@ impl PltEvaluator<ErrorNorm> for NormPltLWEEvaluator {
         _: GateId,
         _: usize,
     ) -> ErrorNorm {
-        let matrix_norm = &self.e_b_times_preimage + (&input.matrix_norm * &self.preimage_lower);
+        let matrix_norm = &self.e_b_times_k_high + (&input.matrix_norm * &self.k_low);
         let plaintext_bd =
             BigDecimal::from(num_bigint::BigInt::from(plt.max_output_row().1.value().clone()));
         let plaintext_norm = PolyNorm::new(input.clone_ctx(), plaintext_bd);
@@ -233,8 +238,8 @@ impl AffinePltEvaluator for NormPltLWEEvaluator {
         let plaintext_norm = PolyNorm::new(input.plaintext_norm.ctx.clone(), plaintext_bd);
         let matrix_expr = input
             .matrix_expr
-            .transform_matrix(&self.preimage_lower)
-            .add_expr(&AffineErrorNormExpr::constant(self.e_b_times_preimage.clone()));
+            .transform_matrix(&self.k_low)
+            .add_expr(&AffineErrorNormExpr::constant(self.e_b_times_k_high.clone()));
         ErrorNormSummaryExpr { plaintext_norm, matrix_expr }
     }
 }

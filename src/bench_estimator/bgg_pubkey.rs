@@ -54,8 +54,12 @@ impl SampleAuxBenchEstimate {
 pub trait PublicLutSampleAuxBenchEstimator<M: PolyMatrix> {
     type Params;
 
-    fn sample_aux_matrices_lut_entry_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate;
-    fn sample_aux_matrices_lut_gate_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate;
+    fn estimate_public_lut_sample_aux_matrices(
+        &self,
+        params: &Self::Params,
+        total_lut_entries: usize,
+        total_lut_gates: usize,
+    ) -> SampleAuxBenchEstimate;
     fn write_dummy_aux_for_poly_encode_bench(
         &self,
         params: &Self::Params,
@@ -237,22 +241,14 @@ where
         total_lut_entries: usize,
         total_lut_gates: usize,
     ) -> SampleAuxBenchEstimate {
-        let lut_entry_time = self.public_lut_estimator.sample_aux_matrices_lut_entry_time(params);
-        let lut_gate_time = self.public_lut_estimator.sample_aux_matrices_lut_gate_time(params);
-        debug!(
-            "BggPublicKeyBenchEstimator::estimate_public_lut_sample_aux_matrices components: total_lut_entries={}, total_lut_gates={}, lut_entry_time={:?}, lut_gate_time={:?}",
-            total_lut_entries, total_lut_gates, lut_entry_time, lut_gate_time
+        let estimate = self.public_lut_estimator.estimate_public_lut_sample_aux_matrices(
+            params,
+            total_lut_entries,
+            total_lut_gates,
         );
-        let estimate = SampleAuxBenchEstimate {
-            total_time: lut_entry_time.total_time * total_lut_entries as f64 +
-                lut_gate_time.total_time * total_lut_gates as f64,
-            latency: lut_entry_time.latency + lut_gate_time.latency,
-            compact_bytes: &lut_entry_time.compact_bytes * BigUint::from(total_lut_entries) +
-                &lut_gate_time.compact_bytes * BigUint::from(total_lut_gates),
-        };
         debug!(
-            "BggPublicKeyBenchEstimator::estimate_public_lut_sample_aux_matrices estimate={:?}",
-            estimate
+            "BggPublicKeyBenchEstimator::estimate_public_lut_sample_aux_matrices estimate: total_lut_entries={}, total_lut_gates={}, estimate={:?}",
+            total_lut_entries, total_lut_gates, estimate
         );
         estimate
     }
@@ -341,10 +337,11 @@ mod tests {
     };
     #[cfg(feature = "gpu")]
     use crate::{
-        lookup::ggh15_eval::GGH15BGGPubKeyPltEvaluator,
+        lookup::{ggh15_eval::GGH15BGGPubKeyPltEvaluator, lwe_eval::LWEBGGPubKeyPltEvaluator},
         matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix,
         poly::dcrt::gpu::{GpuDCRTPolyParams, gpu_device_sync},
         sampler::{
+            PolyTrapdoorSampler,
             gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
             trapdoor::GpuDCRTPolyTrapdoorSampler,
         },
@@ -352,9 +349,9 @@ mod tests {
     };
     #[cfg(not(feature = "gpu"))]
     use crate::{
-        lookup::ggh15_eval::GGH15BGGPubKeyPltEvaluator,
+        lookup::{ggh15_eval::GGH15BGGPubKeyPltEvaluator, lwe_eval::LWEBGGPubKeyPltEvaluator},
         sampler::{
-            hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
+            PolyTrapdoorSampler, hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
             uniform::DCRTPolyUniformSampler,
         },
         slot_transfer::bgg_pubkey::BggPublicKeySTEvaluator,
@@ -365,7 +362,7 @@ mod tests {
     use keccak_asm::Keccak256;
     use num_bigint::BigUint;
     use sequential_test::sequential;
-    use std::marker::PhantomData;
+    use std::{marker::PhantomData, sync::Arc};
     #[cfg(any(feature = "gpu", not(feature = "gpu")))]
     use tempfile::tempdir;
 
@@ -374,25 +371,28 @@ mod tests {
     impl PublicLutSampleAuxBenchEstimator<DCRTPolyMatrix> for DummyPublicLutEstimator {
         type Params = <DCRTPoly as Poly>::Params;
 
-        fn sample_aux_matrices_lut_entry_time(
+        fn estimate_public_lut_sample_aux_matrices(
             &self,
             _params: &Self::Params,
+            total_lut_entries: usize,
+            total_lut_gates: usize,
         ) -> SampleAuxBenchEstimate {
-            SampleAuxBenchEstimate {
+            let lut_entry = SampleAuxBenchEstimate {
                 latency: 3.0,
                 total_time: 5.0,
                 compact_bytes: BigUint::from(7u32),
-            }
-        }
-
-        fn sample_aux_matrices_lut_gate_time(
-            &self,
-            _params: &Self::Params,
-        ) -> SampleAuxBenchEstimate {
-            SampleAuxBenchEstimate {
+            };
+            let lut_gate = SampleAuxBenchEstimate {
                 latency: 7.0,
                 total_time: 11.0,
                 compact_bytes: BigUint::from(13u32),
+            };
+            SampleAuxBenchEstimate {
+                total_time: lut_entry.total_time * total_lut_entries as f64 +
+                    lut_gate.total_time * total_lut_gates as f64,
+                latency: lut_entry.latency + lut_gate.latency,
+                compact_bytes: &lut_entry.compact_bytes * BigUint::from(total_lut_entries) +
+                    &lut_gate.compact_bytes * BigUint::from(total_lut_gates),
             }
         }
 
@@ -558,14 +558,10 @@ mod tests {
             DCRTPolyTrapdoorSampler,
         >::new([0x11u8; 32], 2, 4.578, 0.0, dir.path().to_path_buf());
         let params = <DCRTPoly as Poly>::Params::default();
-        let lut_entry = plt_estimator.sample_aux_matrices_lut_entry_time(&params);
-        let lut_gate = plt_estimator.sample_aux_matrices_lut_gate_time(&params);
-        assert!(lut_entry.latency >= 0.0);
-        assert!(lut_entry.total_time >= lut_entry.latency);
-        assert!(lut_entry.compact_bytes > BigUint::default());
-        assert!(lut_gate.latency >= 0.0);
-        assert!(lut_gate.total_time >= lut_gate.latency);
-        assert!(lut_gate.compact_bytes > BigUint::default());
+        let public_lut = plt_estimator.estimate_public_lut_sample_aux_matrices(&params, 1, 1);
+        assert!(public_lut.latency >= 0.0);
+        assert!(public_lut.total_time >= public_lut.latency);
+        assert!(public_lut.compact_bytes > BigUint::default());
 
         let st_estimator = BggPublicKeySTEvaluator::<
             DCRTPolyMatrix,
@@ -581,6 +577,24 @@ mod tests {
         assert!(gate_time.latency >= 0.0);
         assert!(gate_time.total_time >= gate_time.latency);
         assert!(gate_time.compact_bytes > BigUint::default());
+
+        let lwe_trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, 4.578);
+        let (lwe_trapdoor, lwe_pub_matrix) = lwe_trapdoor_sampler.trapdoor(&params, 2);
+        let lwe_estimator = LWEBGGPubKeyPltEvaluator::<
+            DCRTPolyMatrix,
+            DCRTPolyHashSampler<Keccak256>,
+            DCRTPolyTrapdoorSampler,
+        >::new(
+            [0x44u8; 32],
+            lwe_trapdoor_sampler,
+            Arc::new(lwe_pub_matrix),
+            Arc::new(lwe_trapdoor),
+            dir.path().to_path_buf(),
+        );
+        let lwe_public_lut = lwe_estimator.estimate_public_lut_sample_aux_matrices(&params, 4, 2);
+        assert!(lwe_public_lut.latency >= 0.0);
+        assert!(lwe_public_lut.total_time >= lwe_public_lut.latency);
+        assert!(lwe_public_lut.compact_bytes > BigUint::default());
     }
 
     #[cfg(feature = "gpu")]
@@ -596,14 +610,10 @@ mod tests {
             GpuDCRTPolyHashSampler<Keccak256>,
             GpuDCRTPolyTrapdoorSampler,
         >::new([0x11u8; 32], 2, 4.578, 0.0, dir.path().to_path_buf());
-        let lut_entry = plt_estimator.sample_aux_matrices_lut_entry_time(&params);
-        let lut_gate = plt_estimator.sample_aux_matrices_lut_gate_time(&params);
-        assert!(lut_entry.latency >= 0.0);
-        assert!(lut_entry.total_time >= lut_entry.latency);
-        assert!(lut_entry.compact_bytes > BigUint::default());
-        assert!(lut_gate.latency >= 0.0);
-        assert!(lut_gate.total_time >= lut_gate.latency);
-        assert!(lut_gate.compact_bytes > BigUint::default());
+        let public_lut = plt_estimator.estimate_public_lut_sample_aux_matrices(&params, 1, 1);
+        assert!(public_lut.latency >= 0.0);
+        assert!(public_lut.total_time >= public_lut.latency);
+        assert!(public_lut.compact_bytes > BigUint::default());
 
         let st_estimator = BggPublicKeySTEvaluator::<
             GpuDCRTPolyMatrix,
@@ -619,6 +629,24 @@ mod tests {
         assert!(gate_time.latency >= 0.0);
         assert!(gate_time.total_time >= gate_time.latency);
         assert!(gate_time.compact_bytes > BigUint::default());
+
+        let lwe_trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, 4.578);
+        let (lwe_trapdoor, lwe_pub_matrix) = lwe_trapdoor_sampler.trapdoor(&params, 2);
+        let lwe_estimator = LWEBGGPubKeyPltEvaluator::<
+            GpuDCRTPolyMatrix,
+            GpuDCRTPolyHashSampler<Keccak256>,
+            GpuDCRTPolyTrapdoorSampler,
+        >::new(
+            [0x44u8; 32],
+            lwe_trapdoor_sampler,
+            Arc::new(lwe_pub_matrix),
+            Arc::new(lwe_trapdoor),
+            dir.path().to_path_buf(),
+        );
+        let lwe_public_lut = lwe_estimator.estimate_public_lut_sample_aux_matrices(&params, 4, 2);
+        assert!(lwe_public_lut.latency >= 0.0);
+        assert!(lwe_public_lut.total_time >= lwe_public_lut.latency);
+        assert!(lwe_public_lut.compact_bytes > BigUint::default());
         gpu_device_sync();
     }
 }

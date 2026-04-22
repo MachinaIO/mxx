@@ -1198,7 +1198,12 @@ where
 {
     type Params = <M::P as Poly>::Params;
 
-    fn sample_aux_matrices_lut_entry_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate {
+    fn estimate_public_lut_sample_aux_matrices(
+        &self,
+        params: &Self::Params,
+        total_lut_entries: usize,
+        total_lut_gates: usize,
+    ) -> SampleAuxBenchEstimate {
         let lut_id = 0usize;
         let trap_sampler = TS::new(params, self.trapdoor_sigma);
         let (b1_trapdoor, b1_matrix) = trap_sampler.trapdoor(params, self.d);
@@ -1217,10 +1222,9 @@ where
             trap_sampler.preimage(shared.params, shared.trapdoor, shared.b1_matrix, &target_chunk);
         let chunk_bytes = preimage_chunk.into_compact_bytes();
         let elapsed = start.elapsed().as_secs_f64();
-        SampleAuxBenchEstimate::from_chunk(elapsed, chunk_count, chunk_bytes.len())
-    }
+        let lut_entry_time =
+            SampleAuxBenchEstimate::from_chunk(elapsed, chunk_count, chunk_bytes.len());
 
-    fn sample_aux_matrices_lut_gate_time(&self, params: &Self::Params) -> SampleAuxBenchEstimate {
         let lut_id = 0usize;
         let trap_sampler = TS::new(params, self.trapdoor_sigma);
         let (b0_trapdoor, b0_matrix) = trap_sampler.trapdoor(params, self.d);
@@ -1324,7 +1328,7 @@ where
             stage_mg_chunk_count,
             chunk_bytes.len(),
         );
-        SampleAuxBenchEstimate {
+        let lut_gate_time = SampleAuxBenchEstimate {
             total_time: stage1_estimate.total_time +
                 stage2_estimate.total_time +
                 stage3_estimate.total_time +
@@ -1340,6 +1344,14 @@ where
                 stage3_estimate.compact_bytes +
                 stage4_estimate.compact_bytes +
                 stage5_estimate.compact_bytes,
+        };
+        SampleAuxBenchEstimate {
+            total_time: lut_entry_time.total_time * total_lut_entries as f64 +
+                lut_gate_time.total_time * total_lut_gates as f64,
+            latency: lut_entry_time.latency + lut_gate_time.latency,
+            compact_bytes: &lut_entry_time.compact_bytes *
+                num_bigint::BigUint::from(total_lut_entries) +
+                &lut_gate_time.compact_bytes * num_bigint::BigUint::from(total_lut_gates),
         }
     }
 

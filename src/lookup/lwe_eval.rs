@@ -1,1 +1,3 @@
-pub use crate::lookup::lwe::{LWEBGGEncodingPltEvaluator, LWEBGGPubKeyPltEvaluator};
+pub use crate::lookup::lwe::{
+    LWEBGGEncodingPltEvaluator, LWEBGGPolyEncodingPltEvaluator, LWEBGGPubKeyPltEvaluator,
+};

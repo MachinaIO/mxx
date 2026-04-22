@@ -24,7 +24,7 @@ use mxx::{
     },
     lookup::{
         PublicLut,
-        ggh15_eval::{GGH15BGGPolyEncodingPltEvaluator, GGH15BGGPubKeyPltEvaluator},
+        lwe_eval::{LWEBGGPolyEncodingPltEvaluator, LWEBGGPubKeyPltEvaluator},
     },
     matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
     poly::{
@@ -39,13 +39,13 @@ use mxx::{
         },
     },
     sampler::{
-        DistType, PolyUniformSampler,
+        DistType, PolyTrapdoorSampler, PolyUniformSampler,
         gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
         trapdoor::GpuDCRTPolyTrapdoorSampler,
     },
     simulator::{
         SimulatorContext,
-        error_norm::{NormBggPolyEncodingSTEvaluator, NormPltGGH15Evaluator},
+        error_norm::{NormBggPolyEncodingSTEvaluator, NormPltLWEEvaluator},
     },
     slot_transfer::{BggPolyEncodingSTEvaluator, bgg_pubkey::BggPublicKeySTEvaluator},
     storage::write::{init_storage_system, wait_for_all_writes},
@@ -79,19 +79,15 @@ const TRAPDOOR_SIGMA: f64 = 4.578;
 
 type GpuMatrix = GpuDCRTPolyMatrix;
 type GpuHashSampler = GpuDCRTPolyHashSampler<Keccak256>;
-type GpuPubKeyPltEvaluator = GGH15BGGPubKeyPltEvaluator<
-    GpuMatrix,
-    GpuDCRTPolyUniformSampler,
-    GpuHashSampler,
-    GpuDCRTPolyTrapdoorSampler,
->;
+type GpuPubKeyPltEvaluator =
+    LWEBGGPubKeyPltEvaluator<GpuMatrix, GpuHashSampler, GpuDCRTPolyTrapdoorSampler>;
 type GpuPubKeySlotEvaluator = BggPublicKeySTEvaluator<
     GpuMatrix,
     GpuDCRTPolyUniformSampler,
     GpuHashSampler,
     GpuDCRTPolyTrapdoorSampler,
 >;
-type GpuPolyPltEvaluator = GGH15BGGPolyEncodingPltEvaluator<GpuMatrix, GpuHashSampler>;
+type GpuPolyPltEvaluator = LWEBGGPolyEncodingPltEvaluator<GpuMatrix, GpuHashSampler>;
 type GpuPolySlotEvaluator = BggPolyEncodingSTEvaluator<GpuMatrix, GpuHashSampler>;
 
 #[derive(Debug, Clone)]
@@ -144,73 +140,63 @@ fn env_or_parse_f64(key: &str, default: f64) -> f64 {
 
 impl GoldreichRingGswBenchConfig {
     fn from_env() -> Self {
-        let ring_dim =
-            env_or_parse_u32("GGH15_GOLDREICH_RING_GSW_BENCH_RING_DIM", DEFAULT_RING_DIM);
+        let ring_dim = env_or_parse_u32("LWE_GOLDREICH_RING_GSW_BENCH_RING_DIM", DEFAULT_RING_DIM);
         let input_size =
-            env_or_parse_usize("GGH15_GOLDREICH_RING_GSW_BENCH_INPUT_SIZE", DEFAULT_INPUT_SIZE);
+            env_or_parse_usize("LWE_GOLDREICH_RING_GSW_BENCH_INPUT_SIZE", DEFAULT_INPUT_SIZE);
         let output_size =
-            env_or_parse_usize("GGH15_GOLDREICH_RING_GSW_BENCH_OUTPUT_SIZE", DEFAULT_OUTPUT_SIZE);
+            env_or_parse_usize("LWE_GOLDREICH_RING_GSW_BENCH_OUTPUT_SIZE", DEFAULT_OUTPUT_SIZE);
         let crt_bits =
-            env_or_parse_usize("GGH15_GOLDREICH_RING_GSW_BENCH_CRT_BITS", DEFAULT_CRT_BITS);
-        let p_moduli_bits = env_or_parse_usize(
-            "GGH15_GOLDREICH_RING_GSW_BENCH_P_MODULI_BITS",
-            DEFAULT_P_MODULI_BITS,
-        );
+            env_or_parse_usize("LWE_GOLDREICH_RING_GSW_BENCH_CRT_BITS", DEFAULT_CRT_BITS);
+        let p_moduli_bits =
+            env_or_parse_usize("LWE_GOLDREICH_RING_GSW_BENCH_P_MODULI_BITS", DEFAULT_P_MODULI_BITS);
         let max_unreduced_muls = env_or_parse_usize(
-            "GGH15_GOLDREICH_RING_GSW_BENCH_MAX_UNREDUCED_MULS",
+            "LWE_GOLDREICH_RING_GSW_BENCH_MAX_UNREDUCED_MULS",
             DEFAULT_MAX_UNREDUCED_MULS,
         );
-        let scale = env_or_parse_u64("GGH15_GOLDREICH_RING_GSW_BENCH_SCALE", DEFAULT_SCALE);
+        let scale = env_or_parse_u64("LWE_GOLDREICH_RING_GSW_BENCH_SCALE", DEFAULT_SCALE);
         let base_bits =
-            env_or_parse_u32("GGH15_GOLDREICH_RING_GSW_BENCH_BASE_BITS", DEFAULT_BASE_BITS);
-        let max_crt_depth = env_or_parse_usize(
-            "GGH15_GOLDREICH_RING_GSW_BENCH_MAX_CRT_DEPTH",
-            DEFAULT_MAX_CRT_DEPTH,
-        );
+            env_or_parse_u32("LWE_GOLDREICH_RING_GSW_BENCH_BASE_BITS", DEFAULT_BASE_BITS);
+        let max_crt_depth =
+            env_or_parse_usize("LWE_GOLDREICH_RING_GSW_BENCH_MAX_CRT_DEPTH", DEFAULT_MAX_CRT_DEPTH);
         let error_sigma =
-            env_or_parse_f64("GGH15_GOLDREICH_RING_GSW_BENCH_ERROR_SIGMA", DEFAULT_ERROR_SIGMA);
+            env_or_parse_f64("LWE_GOLDREICH_RING_GSW_BENCH_ERROR_SIGMA", DEFAULT_ERROR_SIGMA);
         let d_secret =
-            env_or_parse_usize("GGH15_GOLDREICH_RING_GSW_BENCH_D_SECRET", DEFAULT_D_SECRET);
+            env_or_parse_usize("LWE_GOLDREICH_RING_GSW_BENCH_D_SECRET", DEFAULT_D_SECRET);
         let bench_iterations = env_or_parse_usize(
-            "GGH15_GOLDREICH_RING_GSW_BENCH_BENCH_ITERATIONS",
+            "LWE_GOLDREICH_RING_GSW_BENCH_BENCH_ITERATIONS",
             DEFAULT_BENCH_ITERATIONS,
         );
-        let active_levels_override = env::var("GGH15_GOLDREICH_RING_GSW_BENCH_ACTIVE_LEVELS")
+        let active_levels_override = env::var("LWE_GOLDREICH_RING_GSW_BENCH_ACTIVE_LEVELS")
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .map(|value| {
                 value.parse::<usize>().unwrap_or_else(|e| {
-                    panic!(
-                        "GGH15_GOLDREICH_RING_GSW_BENCH_ACTIVE_LEVELS must be a valid usize: {e}"
-                    )
+                    panic!("LWE_GOLDREICH_RING_GSW_BENCH_ACTIVE_LEVELS must be a valid usize: {e}")
                 })
             });
-        let dir_name_override = env::var("GGH15_GOLDREICH_RING_GSW_BENCH_DIR_NAME")
+        let dir_name_override = env::var("LWE_GOLDREICH_RING_GSW_BENCH_DIR_NAME")
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
 
-        assert!(ring_dim > 0, "GGH15_GOLDREICH_RING_GSW_BENCH_RING_DIM must be > 0");
-        assert!(input_size >= 5, "GGH15_GOLDREICH_RING_GSW_BENCH_INPUT_SIZE must be at least 5");
-        assert!(output_size > 0, "GGH15_GOLDREICH_RING_GSW_BENCH_OUTPUT_SIZE must be > 0");
-        assert!(crt_bits > 0, "GGH15_GOLDREICH_RING_GSW_BENCH_CRT_BITS must be > 0");
-        assert!(p_moduli_bits > 0, "GGH15_GOLDREICH_RING_GSW_BENCH_P_MODULI_BITS must be > 0");
+        assert!(ring_dim > 0, "LWE_GOLDREICH_RING_GSW_BENCH_RING_DIM must be > 0");
+        assert!(input_size >= 5, "LWE_GOLDREICH_RING_GSW_BENCH_INPUT_SIZE must be at least 5");
+        assert!(output_size > 0, "LWE_GOLDREICH_RING_GSW_BENCH_OUTPUT_SIZE must be > 0");
+        assert!(crt_bits > 0, "LWE_GOLDREICH_RING_GSW_BENCH_CRT_BITS must be > 0");
+        assert!(p_moduli_bits > 0, "LWE_GOLDREICH_RING_GSW_BENCH_P_MODULI_BITS must be > 0");
         assert!(
             max_unreduced_muls > 0,
-            "GGH15_GOLDREICH_RING_GSW_BENCH_MAX_UNREDUCED_MULS must be > 0"
+            "LWE_GOLDREICH_RING_GSW_BENCH_MAX_UNREDUCED_MULS must be > 0"
         );
-        assert!(scale > 0, "GGH15_GOLDREICH_RING_GSW_BENCH_SCALE must be > 0");
-        assert!(base_bits > 0, "GGH15_GOLDREICH_RING_GSW_BENCH_BASE_BITS must be > 0");
-        assert!(max_crt_depth > 0, "GGH15_GOLDREICH_RING_GSW_BENCH_MAX_CRT_DEPTH must be > 0");
-        assert!(error_sigma >= 0.0, "GGH15_GOLDREICH_RING_GSW_BENCH_ERROR_SIGMA must be >= 0");
-        assert!(d_secret > 0, "GGH15_GOLDREICH_RING_GSW_BENCH_D_SECRET must be > 0");
-        assert!(
-            bench_iterations > 0,
-            "GGH15_GOLDREICH_RING_GSW_BENCH_BENCH_ITERATIONS must be > 0"
-        );
+        assert!(scale > 0, "LWE_GOLDREICH_RING_GSW_BENCH_SCALE must be > 0");
+        assert!(base_bits > 0, "LWE_GOLDREICH_RING_GSW_BENCH_BASE_BITS must be > 0");
+        assert!(max_crt_depth > 0, "LWE_GOLDREICH_RING_GSW_BENCH_MAX_CRT_DEPTH must be > 0");
+        assert!(error_sigma >= 0.0, "LWE_GOLDREICH_RING_GSW_BENCH_ERROR_SIGMA must be >= 0");
+        assert!(d_secret > 0, "LWE_GOLDREICH_RING_GSW_BENCH_D_SECRET must be > 0");
+        assert!(bench_iterations > 0, "LWE_GOLDREICH_RING_GSW_BENCH_BENCH_ITERATIONS must be > 0");
         if let Some(active_levels) = active_levels_override {
-            assert!(active_levels > 0, "GGH15_GOLDREICH_RING_GSW_BENCH_ACTIVE_LEVELS must be > 0");
+            assert!(active_levels > 0, "LWE_GOLDREICH_RING_GSW_BENCH_ACTIVE_LEVELS must be > 0");
         }
 
         Self {
@@ -238,7 +224,7 @@ impl GoldreichRingGswBenchConfig {
     fn bench_dir_base(&self, crt_depth: usize) -> String {
         self.dir_name_override.clone().unwrap_or_else(|| {
             format!(
-                "test_data/test_gpu_ggh15_goldreich_ring_gsw_bench_ring{}_in{}_out{}_active{}_crt{}_depth{}",
+                "test_data/test_gpu_lwe_goldreich_ring_gsw_bench_ring{}_in{}_out{}_active{}_crt{}_depth{}",
                 self.ring_dim,
                 self.input_size,
                 self.output_size,
@@ -263,7 +249,7 @@ impl GoldreichRingGswBenchConfig {
         let active_levels = self.active_levels_override.unwrap_or(crt_depth);
         assert!(
             active_levels <= crt_depth,
-            "GGH15_GOLDREICH_RING_GSW_BENCH_ACTIVE_LEVELS exceeds crt_depth: active_levels={}, crt_depth={}",
+            "LWE_GOLDREICH_RING_GSW_BENCH_ACTIVE_LEVELS exceeds crt_depth: active_levels={}, crt_depth={}",
             active_levels,
             crt_depth
         );
@@ -353,7 +339,7 @@ fn probe_crt_depth_for_goldreich_ring_gsw_bench(
         log_base_q,
         log_base_q_small,
     ));
-    let plt_evaluator = NormPltGGH15Evaluator::new(sim_ctx.clone(), error_sigma, error_sigma, None);
+    let plt_evaluator = NormPltLWEEvaluator::new(sim_ctx.clone(), error_sigma);
     let slot_transfer_evaluator =
         NormBggPolyEncodingSTEvaluator::new(sim_ctx.clone(), cfg.error_sigma, error_sigma, None);
     let out_errors = circuit.simulate_max_error_norm(
@@ -474,26 +460,8 @@ fn find_crt_depth_for_goldreich_ring_gsw_bench(
             .parse::<usize>()
             .unwrap_or_else(|e| panic!("CRT_DEPTH must be a valid usize: {e}"));
         assert!(requested_crt_depth > 0, "CRT_DEPTH must be > 0");
-        // let probe = probe_crt_depth_for_goldreich_ring_gsw_bench(
-        //     cfg,
-        //     requested_crt_depth,
-        //     &ring_dim_sqrt,
-        //     &base,
-        //     &error_sigma,
-        //     &e_init_norm,
-        // );
-        // let (_, _, actual_crt_depth) = probe.params.to_crt();
-        // info!(
-        //     "using CRT_DEPTH override: requested_crt_depth={} actual_crt_depth={} eval_ok={}
-        // decryption_ok={}",     requested_crt_depth, actual_crt_depth, probe.eval_ok,
-        // probe.decryption_ok );
         let params =
             DCRTPolyParams::new(cfg.ring_dim, requested_crt_depth, cfg.crt_bits, cfg.base_bits);
-        // assert!(
-        //     probe.eval_ok,
-        //     "CRT_DEPTH={} failed the eval threshold check for the Goldreich Ring-GSW benchmark",
-        //     requested_crt_depth
-        // );
         return (requested_crt_depth, params);
     }
 
@@ -531,7 +499,7 @@ fn find_crt_depth_for_goldreich_ring_gsw_bench(
     }
 
     panic!(
-        "crt_depth satisfying the GGH15 error threshold was not found up to GGH15_GOLDREICH_RING_GSW_BENCH_MAX_CRT_DEPTH ({})",
+        "crt_depth satisfying the LWE error threshold was not found up to LWE_GOLDREICH_RING_GSW_BENCH_MAX_CRT_DEPTH ({})",
         cfg.max_crt_depth
     );
 }
@@ -606,8 +574,25 @@ fn constant_and_shared_benchmark_pubkeys(
     (&pubkeys[0], &pubkeys[1])
 }
 
+fn build_lwe_pubkey_plt_evaluator(
+    params: &GpuDCRTPolyParams,
+    hash_key: [u8; 32],
+    d_secret: usize,
+    dir_path: PathBuf,
+) -> GpuPubKeyPltEvaluator {
+    let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(params, TRAPDOOR_SIGMA);
+    let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(params, d_secret);
+    GpuPubKeyPltEvaluator::new(
+        hash_key,
+        trapdoor_sampler,
+        Arc::new(pub_matrix),
+        Arc::new(trapdoor),
+        dir_path,
+    )
+}
+
 #[tokio::test]
-async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
+async fn test_gpu_lwe_goldreich_ring_gsw_bench() {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
     gpu_device_sync();
 
@@ -625,7 +610,7 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
     );
     let single_gpu_id = *detected_gpu_ids
         .first()
-        .expect("at least one GPU device is required for test_gpu_ggh15_goldreich_ring_gsw_bench");
+        .expect("at least one GPU device is required for test_gpu_lwe_goldreich_ring_gsw_bench");
     let params = GpuDCRTPolyParams::new_with_gpu(
         cpu_params.ring_dimension(),
         moduli,
@@ -703,15 +688,14 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
         DEFAULT_BENCH_SEED,
         cfg.d_secret,
         1,
-        b"GGH15_GOLDREICH_RING_GSW_PKBENCH",
+        b"LWE_GOLDREICH_RING_GSW_PKBENCH",
     );
     let (pubkey_bench_public_lut_one, pubkey_bench_shared_input) =
         constant_and_shared_benchmark_pubkeys(&pubkey_bench_public_keys);
-    let pubkey_bench_plt_evaluator = GpuPubKeyPltEvaluator::new(
+    let pubkey_bench_plt_evaluator = build_lwe_pubkey_plt_evaluator(
+        &params,
         DEFAULT_BENCH_SEED,
         cfg.d_secret,
-        TRAPDOOR_SIGMA,
-        cfg.error_sigma,
         pubkey_bench_dir.clone(),
     );
     let pubkey_bench_slot_evaluator = GpuPubKeySlotEvaluator::new(
@@ -746,11 +730,10 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
         },
         &pubkey_bench_plt_evaluator,
         &pubkey_bench_slot_evaluator,
-        GpuPubKeyPltEvaluator::new(
+        build_lwe_pubkey_plt_evaluator(
+            &params,
             DEFAULT_BENCH_SEED,
             cfg.d_secret,
-            TRAPDOOR_SIGMA,
-            cfg.error_sigma,
             pubkey_bench_dir.clone(),
         ),
         GpuPubKeySlotEvaluator::new(
@@ -799,15 +782,15 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
         DEFAULT_BENCH_SEED,
         cfg.d_secret,
         1,
-        b"GGH15_GOLDREICH_RING_GSW_POLYBENCH",
+        b"LWE_GOLDREICH_RING_GSW_POLYBENCH",
     );
     let (_poly_bench_public_lut_one, poly_bench_shared_input) =
         constant_and_shared_benchmark_pubkeys(&poly_bench_pubkeys);
-    let poly_bench_pubkey_plt_evaluator = GpuPubKeyPltEvaluator::new(
+    let poly_bench_b_matrix = poly_bench_shared_input.matrix.clone();
+    let poly_bench_pubkey_plt_evaluator = build_lwe_pubkey_plt_evaluator(
+        &params,
         DEFAULT_BENCH_SEED,
         cfg.d_secret,
-        TRAPDOOR_SIGMA,
-        cfg.error_sigma,
         poly_bench_dir.clone(),
     );
     let poly_bench_pubkey_slot_evaluator = GpuPubKeySlotEvaluator::new(
@@ -823,12 +806,6 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
         build_benchmark_public_lookup_gate(&params);
     let poly_bench_slot_transfer_gate_id =
         build_benchmark_slot_transfer_gate(&poly_bench_slot_transfer_src_slots);
-    poly_bench_pubkey_plt_evaluator.record_public_lookup_state(
-        &bench_lut,
-        poly_bench_shared_input,
-        poly_bench_public_lut_gate_id,
-        poly_bench_public_lut_id,
-    );
     poly_bench_pubkey_slot_evaluator.record_slot_transfer_state(
         &params,
         poly_bench_shared_input,
@@ -862,13 +839,6 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
             .load_slot_secret_mats_checkpoint(&params)
             .expect("one-slot slot secret matrix checkpoints must exist for poly benchmark"),
     );
-    let bench_plt_b0_matrix = poly_bench_pubkey_plt_evaluator
-        .load_b0_matrix_checkpoint(&params)
-        .expect("one-slot public-lookup b0 checkpoint must exist for poly benchmark");
-    let bench_slot_b0_matrix = poly_bench_pubkey_slot_evaluator
-        .load_b0_matrix_checkpoint(&params)
-        .expect("one-slot slot-transfer b0 checkpoint must exist for poly benchmark");
-    let bench_plt_checkpoint_prefix = poly_bench_pubkey_plt_evaluator.checkpoint_prefix(&params);
     let bench_slot_checkpoint_prefix = poly_bench_pubkey_slot_evaluator.checkpoint_prefix(&params);
     drop(poly_bench_pubkey_plt_evaluator);
     drop(poly_bench_pubkey_slot_evaluator);
@@ -897,15 +867,15 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
         2,
         "one-slot benchmark encoding set must contain const one plus one sample encoding"
     );
-    let bench_plt_c_b0_compact_bytes_by_slot =
-        GpuPolyPltEvaluator::build_c_b0_compact_bytes_by_slot::<GpuDCRTPolyUniformSampler>(
+    let bench_plt_c_b_compact_bytes_by_slot =
+        GpuPolyPltEvaluator::build_c_b_compact_bytes_by_slot::<GpuDCRTPolyUniformSampler>(
             &params,
             &bench_s_vec,
-            &bench_plt_b0_matrix,
+            &poly_bench_b_matrix,
             &bench_slot_secret_mats,
             Some(cfg.error_sigma),
         );
-    let mut bench_slot_c_b0 = bench_s_vec.clone() * &bench_slot_b0_matrix;
+    let mut bench_slot_c_b0 = bench_s_vec.clone() * &poly_bench_b_matrix;
     if cfg.error_sigma != 0.0 {
         let slot_c_b0_error = uniform_sampler.sample_uniform(
             &params,
@@ -918,8 +888,7 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
     let bench_poly_plt_evaluator = GpuPolyPltEvaluator::new(
         DEFAULT_BENCH_SEED,
         poly_bench_dir.clone(),
-        bench_plt_checkpoint_prefix,
-        bench_plt_c_b0_compact_bytes_by_slot,
+        bench_plt_c_b_compact_bytes_by_slot,
     );
     let bench_poly_slot_evaluator = GpuPolySlotEvaluator::new(
         DEFAULT_BENCH_SEED,
@@ -928,8 +897,6 @@ async fn test_gpu_ggh15_goldreich_ring_gsw_bench() {
         bench_slot_c_b0.to_compact_bytes(),
     );
     drop(bench_slot_c_b0);
-    drop(bench_plt_b0_matrix);
-    drop(bench_slot_b0_matrix);
     drop(bench_slot_secret_mats);
     drop(bench_s_vec);
     drop(bench_secrets);

@@ -23,7 +23,7 @@
 //! `PolyCircuit` is deeper than the abstract Boolean circuit. The implementation therefore keeps
 //! XOR composition balanced instead of chaining it left-to-right.
 use crate::{
-    circuit::PolyCircuit,
+    circuit::{BatchedWire, PolyCircuit},
     gadgets::fhe::ring_gsw_nested_rns::{
         NestedRnsRingGswCiphertext as RingGswCiphertext, NestedRnsRingGswContext as RingGswContext,
     },
@@ -40,9 +40,19 @@ pub trait BooleanCiphertext<P: Poly>: Clone {
 
     fn context(&self) -> &Arc<Self::Context>;
 
+    fn add(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self;
+
+    fn sub(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self;
+
     fn and(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self;
 
     fn xor(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self;
+
+    fn sub_circuit_input(context: Arc<Self::Context>, circuit: &mut PolyCircuit<P>) -> Self;
+
+    fn sub_circuit_wires(&self) -> Vec<BatchedWire>;
+
+    fn from_sub_circuit_outputs(template: &Self, outputs: &[BatchedWire]) -> Self;
 }
 
 impl<P: Poly + 'static> BooleanCiphertext<P> for RingGswCiphertext<P> {
@@ -52,12 +62,32 @@ impl<P: Poly + 'static> BooleanCiphertext<P> for RingGswCiphertext<P> {
         &self.ctx
     }
 
+    fn add(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
+        RingGswCiphertext::add(self, other, circuit)
+    }
+
+    fn sub(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
+        RingGswCiphertext::sub(self, other, circuit)
+    }
+
     fn and(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
         RingGswCiphertext::and(self, other, circuit)
     }
 
     fn xor(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
         RingGswCiphertext::xor(self, other, circuit)
+    }
+
+    fn sub_circuit_input(context: Arc<Self::Context>, circuit: &mut PolyCircuit<P>) -> Self {
+        RingGswCiphertext::input(context, None, circuit)
+    }
+
+    fn sub_circuit_wires(&self) -> Vec<BatchedWire> {
+        self.sub_circuit_wires()
+    }
+
+    fn from_sub_circuit_outputs(template: &Self, outputs: &[BatchedWire]) -> Self {
+        RingGswCiphertext::from_sub_circuit_outputs(template, outputs)
     }
 }
 /// Public graph-generation options for the Goldreich/TSA PRG.
@@ -291,6 +321,8 @@ pub struct GoldreichFhePrg<P: Poly, C: BooleanCiphertext<P> = RingGswCiphertext<
     pub input_size: usize,
     pub output_size: usize,
     pub public_graph: GoldreichGraph,
+    output_bit_sub_circuit_id: usize,
+    output_bit_template: C,
 }
 
 impl<P: Poly, C: BooleanCiphertext<P>> GoldreichFhePrg<P, C> {
@@ -304,15 +336,18 @@ impl<P: Poly + 'static, C> GoldreichFhePrg<P, C>
 where
     C: BooleanCiphertext<P>,
 {
-    /// Generates the fixed public graph from a public `graph_seed` and stores it with the
+    /// Generates the fixed public graph from a public `graph_seed`, registers the reusable
+    /// one-output-bit Goldreich sub-circuit in `circuit`, and stores the result with the
     /// Ring-GSW context.
     pub fn setup(
+        circuit: &mut PolyCircuit<P>,
         ring_gsw: Arc<C::Context>,
         input_size: usize,
         output_size: usize,
         graph_seed: [u8; 32],
     ) -> Self {
         Self::setup_with_options(
+            circuit,
             ring_gsw,
             input_size,
             output_size,
@@ -324,6 +359,7 @@ where
     /// Like [`GoldreichFhePrg::setup`], but allows callers to enable the optional stricter
     /// duplicate-rejection mode used by [`GoldreichGraphGeneration`].
     pub fn setup_with_options(
+        circuit: &mut PolyCircuit<P>,
         ring_gsw: Arc<C::Context>,
         input_size: usize,
         output_size: usize,
@@ -331,31 +367,35 @@ where
         generation: GoldreichGraphGeneration,
     ) -> Self {
         Self::from_public_graph(
+            circuit,
             ring_gsw,
             GoldreichGraph::generate(input_size, output_size, graph_seed, generation),
         )
     }
 
     /// Builds the PRG from an already validated public graph instead of generating one from a
-    /// `graph_seed`.
-    pub fn from_public_graph(ring_gsw: Arc<C::Context>, public_graph: GoldreichGraph) -> Self {
+    /// `graph_seed`, while also registering the reusable Goldreich output-bit sub-circuit.
+    pub fn from_public_graph(
+        circuit: &mut PolyCircuit<P>,
+        ring_gsw: Arc<C::Context>,
+        public_graph: GoldreichGraph,
+    ) -> Self {
         let input_size = public_graph.input_size;
         let output_size = public_graph.output_size();
-        Self { ring_gsw, input_size, output_size, public_graph }
+        let (output_bit_sub_circuit, output_bit_template) =
+            goldreich_output_bit_sub_circuit(Arc::clone(&ring_gsw), circuit);
+        let output_bit_sub_circuit_id = circuit.register_sub_circuit(output_bit_sub_circuit);
+        Self {
+            ring_gsw,
+            input_size,
+            output_size,
+            public_graph,
+            output_bit_sub_circuit_id,
+            output_bit_template,
+        }
     }
 
-    /// Homomorphically evaluates all TSA predicate edges on encrypted input bits.
-    ///
-    /// For one edge the logical structure is:
-    ///
-    /// ```text
-    /// t_and = x[d] AND x[e]
-    /// y     = XOR_tree([x[a], x[b], x[c], t_and])
-    /// ```
-    ///
-    /// The XOR reduction is assembled as a balanced pairwise tree to minimize depth growth in the
-    /// repository's concrete Ring-GSW implementation.
-    pub fn evaluate(&self, input_bits: &[C], circuit: &mut PolyCircuit<P>) -> Vec<C> {
+    fn validate_input_bits(&self, input_bits: &[C]) {
         assert_eq!(
             input_bits.len(),
             self.input_size,
@@ -370,33 +410,153 @@ where
                 idx
             );
         }
+    }
 
-        let outputs = self
-            .public_graph
+    fn evaluate_uniform_with_graph(
+        &self,
+        graph: &GoldreichGraph,
+        input_bits: &[C],
+        circuit: &mut PolyCircuit<P>,
+    ) -> Vec<C> {
+        debug_assert_eq!(graph.input_size, self.input_size);
+        debug_assert_eq!(graph.output_size(), self.output_size);
+        graph
             .edges
             .iter()
             .map(|edge| {
-                let and_term =
-                    input_bits[edge.and_inputs[0]].and(&input_bits[edge.and_inputs[1]], circuit);
-                reduce_ring_gsw_terms_pairwise(
-                    vec![
-                        input_bits[edge.xor_inputs[0]].clone(),
-                        input_bits[edge.xor_inputs[1]].clone(),
-                        input_bits[edge.xor_inputs[2]].clone(),
-                        and_term,
-                    ],
-                    circuit,
-                    |lhs, rhs, circuit| lhs.xor(rhs, circuit),
-                )
+                let mut sub_circuit_inputs = Vec::new();
+                for input_idx in edge.all_inputs() {
+                    sub_circuit_inputs.extend(input_bits[input_idx].sub_circuit_wires());
+                }
+                let outputs =
+                    circuit.call_sub_circuit(self.output_bit_sub_circuit_id, &sub_circuit_inputs);
+                C::from_sub_circuit_outputs(&self.output_bit_template, &outputs)
             })
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+    }
+
+    /// Homomorphically evaluates all TSA predicate edges on encrypted input bits and returns
+    /// uniform Goldreich output bits.
+    ///
+    /// For one edge the logical structure is:
+    ///
+    /// ```text
+    /// t_and = x[d] AND x[e]
+    /// y     = XOR_tree([x[a], x[b], x[c], t_and])
+    /// ```
+    ///
+    /// The XOR reduction is assembled as a balanced pairwise tree to minimize depth growth in the
+    /// repository's concrete Ring-GSW implementation.
+    pub fn evaluate_uniform(&self, input_bits: &[C], circuit: &mut PolyCircuit<P>) -> Vec<C> {
+        self.validate_input_bits(input_bits);
+        let outputs = self.evaluate_uniform_with_graph(&self.public_graph, input_bits, circuit);
         debug!(
-            "Goldreich PRG evaluated {} edges with Ring-GSW ciphertexts: input_size={}, output_size={}",
+            "Goldreich PRG uniform evaluation produced {} output bits: input_size={}, output_size={}",
             outputs.len(),
             self.input_size,
             self.output_size,
         );
         outputs
+    }
+}
+
+/// Fixed-`n` CBD-style error evaluator built from setup-time Goldreich uniform samplers.
+///
+/// The wrapped [`GoldreichFhePrg`] remains responsible for evaluating one public Goldreich graph
+/// into uniform output bits. This wrapper fixes the CBD sample count `n` at setup time, derives
+/// `2n` distinct Goldreich graphs from a public seed, registers one reusable CBD coefficient
+/// sub-circuit for that `n`, and then evaluates one centered-binomial-style error ciphertext per
+/// output position.
+pub struct GoldreichFheCbdError<P: Poly, C: BooleanCiphertext<P> = RingGswCiphertext<P>> {
+    pub uniform_prg: GoldreichFhePrg<P, C>,
+    pub cbd_n: usize,
+    uniform_graphs: Vec<GoldreichGraph>,
+    cbd_error_sub_circuit_id: usize,
+    cbd_output_templates: Vec<C>,
+}
+
+impl<P: Poly, C: BooleanCiphertext<P>> GoldreichFheCbdError<P, C> {
+    pub fn uniform_graphs(&self) -> &[GoldreichGraph] {
+        &self.uniform_graphs
+    }
+}
+
+impl<P: Poly + 'static, C> GoldreichFheCbdError<P, C>
+where
+    C: BooleanCiphertext<P>,
+{
+    pub fn setup(
+        circuit: &mut PolyCircuit<P>,
+        ring_gsw: Arc<C::Context>,
+        input_size: usize,
+        output_size: usize,
+        graph_seed: [u8; 32],
+        cbd_n: usize,
+    ) -> Self {
+        Self::setup_with_options(
+            circuit,
+            ring_gsw,
+            input_size,
+            output_size,
+            graph_seed,
+            cbd_n,
+            GoldreichGraphGeneration::default(),
+        )
+    }
+
+    pub fn setup_with_options(
+        circuit: &mut PolyCircuit<P>,
+        ring_gsw: Arc<C::Context>,
+        input_size: usize,
+        output_size: usize,
+        graph_seed: [u8; 32],
+        cbd_n: usize,
+        generation: GoldreichGraphGeneration,
+    ) -> Self {
+        assert!(cbd_n > 0, "Goldreich CBD evaluator requires cbd_n > 0");
+        let uniform_prg = GoldreichFhePrg::setup_with_options(
+            circuit,
+            ring_gsw,
+            input_size,
+            output_size,
+            graph_seed,
+            generation,
+        );
+        let uniform_graphs = derive_distinct_goldreich_graphs(
+            input_size,
+            output_size,
+            graph_seed,
+            generation,
+            2 * cbd_n,
+        );
+        let (cbd_error_sub_circuit, cbd_output_templates) =
+            goldreich_cbd_error_sub_circuit(&uniform_prg, &uniform_graphs, cbd_n, circuit);
+        let cbd_error_sub_circuit_id = circuit.register_sub_circuit(cbd_error_sub_circuit);
+        Self { uniform_prg, cbd_n, uniform_graphs, cbd_error_sub_circuit_id, cbd_output_templates }
+    }
+
+    pub fn evaluate_cbd_error(&self, input_bits: &[C], circuit: &mut PolyCircuit<P>) -> Vec<C> {
+        self.uniform_prg.validate_input_bits(input_bits);
+        let mut cbd_inputs = Vec::with_capacity(input_bits.len());
+        for input_bit in input_bits {
+            cbd_inputs.extend(input_bit.sub_circuit_wires());
+        }
+        let outputs = circuit.call_sub_circuit(self.cbd_error_sub_circuit_id, &cbd_inputs);
+        let mut next_output_start = 0usize;
+        self.cbd_output_templates
+            .iter()
+            .map(|template| {
+                let output_gate_count =
+                    template.sub_circuit_wires().into_iter().map(BatchedWire::len).sum::<usize>();
+                let next_output_end = next_output_start + output_gate_count;
+                let output = C::from_sub_circuit_outputs(
+                    template,
+                    &outputs[next_output_start..next_output_end],
+                );
+                next_output_start = next_output_end;
+                output
+            })
+            .collect::<Vec<_>>()
     }
 }
 
@@ -428,7 +588,7 @@ fn all_distinct(values: &[usize]) -> bool {
     true
 }
 
-fn reduce_ring_gsw_terms_pairwise<P, C, F>(
+fn reduce_ciphertext_terms_pairwise<P, C, F>(
     mut current_layer: Vec<C>,
     circuit: &mut PolyCircuit<P>,
     mut combine: F,
@@ -438,10 +598,7 @@ where
     C: BooleanCiphertext<P>,
     F: FnMut(&C, &C, &mut PolyCircuit<P>) -> C,
 {
-    assert!(
-        !current_layer.is_empty(),
-        "pairwise reduction requires at least one RingGswCiphertext term"
-    );
+    assert!(!current_layer.is_empty(), "pairwise reduction requires at least one ciphertext term");
     while current_layer.len() > 1 {
         let mut next_layer = Vec::with_capacity(current_layer.len().div_ceil(2));
         let mut iter = current_layer.into_iter();
@@ -455,6 +612,116 @@ where
         current_layer = next_layer;
     }
     current_layer.pop().expect("pairwise reduction must leave one term")
+}
+
+fn goldreich_output_bit_sub_circuit<P, C>(
+    ring_gsw: Arc<C::Context>,
+    source_circuit: &PolyCircuit<P>,
+) -> (PolyCircuit<P>, C)
+where
+    P: Poly + 'static,
+    C: BooleanCiphertext<P>,
+{
+    let mut circuit = source_circuit.fresh_sub_circuit();
+    let inputs = (0..5)
+        .map(|_| C::sub_circuit_input(Arc::clone(&ring_gsw), &mut circuit))
+        .collect::<Vec<_>>();
+    let and_term = inputs[3].and(&inputs[4], &mut circuit);
+    let output = reduce_ciphertext_terms_pairwise(
+        vec![inputs[0].clone(), inputs[1].clone(), inputs[2].clone(), and_term],
+        &mut circuit,
+        |lhs, rhs, circuit| lhs.xor(rhs, circuit),
+    );
+    circuit.output(output.sub_circuit_wires());
+    (circuit, output)
+}
+
+fn goldreich_cbd_error_sub_circuit<P, C>(
+    uniform_prg: &GoldreichFhePrg<P, C>,
+    uniform_graphs: &[GoldreichGraph],
+    cbd_n: usize,
+    source_circuit: &PolyCircuit<P>,
+) -> (PolyCircuit<P>, Vec<C>)
+where
+    P: Poly + 'static,
+    C: BooleanCiphertext<P>,
+{
+    assert!(cbd_n > 0, "Goldreich CBD coefficient sub-circuit requires cbd_n > 0");
+    assert_eq!(
+        uniform_graphs.len(),
+        2 * cbd_n,
+        "Goldreich CBD sub-circuit requires exactly 2 * cbd_n distinct uniform graphs"
+    );
+    let mut circuit = source_circuit.fresh_sub_circuit();
+    let inputs = (0..uniform_prg.input_size)
+        .map(|_| C::sub_circuit_input(Arc::clone(&uniform_prg.ring_gsw), &mut circuit))
+        .collect::<Vec<_>>();
+    let uniform_samples = uniform_graphs
+        .iter()
+        .map(|graph| uniform_prg.evaluate_uniform_with_graph(graph, &inputs, &mut circuit))
+        .collect::<Vec<_>>();
+    let outputs = (0..uniform_prg.output_size)
+        .map(|output_idx| {
+            let positive = reduce_ciphertext_terms_pairwise(
+                uniform_samples[..cbd_n]
+                    .iter()
+                    .map(|sample| sample[output_idx].clone())
+                    .collect::<Vec<_>>(),
+                &mut circuit,
+                |lhs, rhs, circuit| lhs.add(rhs, circuit),
+            );
+            let negative = reduce_ciphertext_terms_pairwise(
+                uniform_samples[cbd_n..]
+                    .iter()
+                    .map(|sample| sample[output_idx].clone())
+                    .collect::<Vec<_>>(),
+                &mut circuit,
+                |lhs, rhs, circuit| lhs.add(rhs, circuit),
+            );
+            positive.sub(&negative, &mut circuit)
+        })
+        .collect::<Vec<_>>();
+    let flat_outputs =
+        outputs.iter().flat_map(|output| output.sub_circuit_wires()).collect::<Vec<_>>();
+    circuit.output(flat_outputs);
+    (circuit, outputs)
+}
+
+fn derive_graph_seed(base_seed: [u8; 32], counter: u64) -> [u8; 32] {
+    let mut hasher = Keccak256::new();
+    hasher.update(b"GoldreichCBDGraph/v1");
+    hasher.update(base_seed);
+    hasher.update(counter.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut derived = [0u8; 32];
+    derived.copy_from_slice(digest.as_ref());
+    derived
+}
+
+fn same_graph_structure(lhs: &GoldreichGraph, rhs: &GoldreichGraph) -> bool {
+    lhs.input_size == rhs.input_size && lhs.edges == rhs.edges && lhs.generation == rhs.generation
+}
+
+fn derive_distinct_goldreich_graphs(
+    input_size: usize,
+    output_size: usize,
+    graph_seed: [u8; 32],
+    generation: GoldreichGraphGeneration,
+    sample_count: usize,
+) -> Vec<GoldreichGraph> {
+    let mut graphs = Vec::with_capacity(sample_count);
+    let mut counter = 0u64;
+    while graphs.len() < sample_count {
+        let candidate_seed = derive_graph_seed(graph_seed, counter);
+        let candidate =
+            GoldreichGraph::generate(input_size, output_size, candidate_seed, generation);
+        counter = counter.wrapping_add(1);
+        if graphs.iter().any(|existing| same_graph_structure(existing, &candidate)) {
+            continue;
+        }
+        graphs.push(candidate);
+    }
+    graphs
 }
 
 #[cfg(test)]
@@ -661,6 +928,44 @@ mod tests {
         coeffs
     }
 
+    fn centered_mod_u64(value: i64, plaintext_modulus: u64) -> u64 {
+        let modulus = plaintext_modulus as i64;
+        value.rem_euclid(modulus) as u64
+    }
+
+    fn evaluate_plaintext_cbd_error(
+        graphs: &[GoldreichGraph],
+        input_bits: &[u64],
+        cbd_n: usize,
+    ) -> Vec<i64> {
+        assert_eq!(
+            graphs.len(),
+            2 * cbd_n,
+            "CBD plaintext helper expects exactly 2 * cbd_n Goldreich graphs"
+        );
+        let uniform_samples = graphs
+            .iter()
+            .map(|graph| evaluate_plaintext_goldreich(graph, input_bits))
+            .collect::<Vec<_>>();
+        let output_size = uniform_samples
+            .first()
+            .map(Vec::len)
+            .expect("CBD plaintext helper requires at least one sampled graph");
+        (0..output_size)
+            .map(|output_idx| {
+                let positive = uniform_samples[..cbd_n]
+                    .iter()
+                    .map(|sample| sample[output_idx] as i64)
+                    .sum::<i64>();
+                let negative = uniform_samples[cbd_n..]
+                    .iter()
+                    .map(|sample| sample[output_idx] as i64)
+                    .sum::<i64>();
+                positive - negative
+            })
+            .collect::<Vec<_>>()
+    }
+
     fn ciphertexts_from_outputs(
         params: &DCRTPolyParams,
         outputs: &[PolyVec<DCRTPoly>],
@@ -758,11 +1063,11 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ring_gsw) = create_test_context(&mut circuit);
         let graph_seed = sample_graph_seed();
-        let goldreich = GoldreichFhePrg::setup(ring_gsw.clone(), 5, 1, graph_seed);
+        let goldreich = GoldreichFhePrg::setup(&mut circuit, ring_gsw.clone(), 5, 1, graph_seed);
         let encrypted_inputs = (0..goldreich.input_size)
             .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
             .collect::<Vec<_>>();
-        let encrypted_outputs = goldreich.evaluate(&encrypted_inputs, &mut circuit);
+        let encrypted_outputs = goldreich.evaluate_uniform(&encrypted_inputs, &mut circuit);
         let reconstructed_outputs = encrypted_outputs
             .iter()
             .flat_map(|ciphertext| ciphertext.reconstruct(&mut circuit))
@@ -839,6 +1144,177 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_goldreich_evaluate_uniform_uses_one_subcircuit_call_per_output_bit() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_params, ring_gsw) = create_test_context(&mut circuit);
+        let output_size = 3;
+        let goldreich: GoldreichFhePrg<DCRTPoly> = GoldreichFhePrg::setup(
+            &mut circuit,
+            ring_gsw.clone(),
+            5,
+            output_size,
+            sample_graph_seed(),
+        );
+        let encrypted_inputs = (0..goldreich.input_size)
+            .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
+            .collect::<Vec<_>>();
+        let input_wire_count = encrypted_inputs[0].sub_circuit_wires().len();
+        let output_gate_count = goldreich
+            .output_bit_template
+            .sub_circuit_wires()
+            .into_iter()
+            .map(BatchedWire::len)
+            .sum::<usize>();
+
+        let _ = goldreich.evaluate_uniform(&encrypted_inputs, &mut circuit);
+
+        assert_eq!(
+            circuit.sub_circuit_calls.len(),
+            output_size,
+            "Goldreich evaluate_uniform must issue exactly one direct sub-circuit call per output bit"
+        );
+        for call_id in 0..output_size {
+            let call = circuit.sub_circuit_call_info(call_id);
+            assert_eq!(
+                call.sub_circuit_id, goldreich.output_bit_sub_circuit_id,
+                "Goldreich evaluate_uniform must reuse the setup-time Goldreich output sub-circuit"
+            );
+            assert_eq!(
+                call.inputs.len(),
+                5 * input_wire_count,
+                "each Goldreich output sub-circuit call must receive five ciphertext inputs"
+            );
+            assert_eq!(
+                call.output_gate_ids.len(),
+                output_gate_count,
+                "each Goldreich output sub-circuit call must expose one ciphertext output"
+            );
+        }
+    }
+
+    #[test]
+    fn test_goldreich_cbd_error_uses_distinct_uniform_graphs() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_params, ring_gsw) = create_test_context(&mut circuit);
+        let cbd_error: GoldreichFheCbdError<DCRTPoly> =
+            GoldreichFheCbdError::setup(&mut circuit, ring_gsw, 5, 3, sample_graph_seed(), 2);
+
+        assert_eq!(
+            cbd_error.uniform_graphs().len(),
+            4,
+            "CBD setup must derive exactly 2 * cbd_n distinct Goldreich graphs"
+        );
+        for left in 0..cbd_error.uniform_graphs().len() {
+            for right in left + 1..cbd_error.uniform_graphs().len() {
+                assert!(
+                    !same_graph_structure(
+                        &cbd_error.uniform_graphs()[left],
+                        &cbd_error.uniform_graphs()[right],
+                    ),
+                    "CBD setup must use distinct Goldreich graphs for different sampled bits"
+                );
+            }
+        }
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_goldreich_cbd_error_output_decrypts_to_plaintext_reference() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ring_gsw) = create_test_context(&mut circuit);
+        let cbd_n = 1usize;
+        let cbd_error: GoldreichFheCbdError<DCRTPoly> = GoldreichFheCbdError::setup(
+            &mut circuit,
+            ring_gsw.clone(),
+            5,
+            1,
+            sample_graph_seed(),
+            cbd_n,
+        );
+        let encrypted_inputs = (0..cbd_error.uniform_prg.input_size)
+            .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
+            .collect::<Vec<_>>();
+        let encrypted_outputs = cbd_error.evaluate_cbd_error(&encrypted_inputs, &mut circuit);
+        let reconstructed_outputs = encrypted_outputs
+            .iter()
+            .flat_map(|ciphertext| ciphertext.reconstruct(&mut circuit))
+            .collect::<Vec<_>>();
+        circuit.output(reconstructed_outputs);
+
+        let plaintext_modulus = (2 * cbd_n + 1) as u64;
+        let secret_key = sample_secret_key(&params);
+        let public_key_hash_key = sample_hash_key();
+        let randomizer_hash_key = sample_hash_key();
+        let public_key = sample_public_key(
+            &params,
+            ring_gsw.width(),
+            &secret_key,
+            public_key_hash_key,
+            b"goldreich_cbd_ring_gsw_public_key",
+            None,
+        );
+        let plaintext_inputs = sample_binary_vector(cbd_error.uniform_prg.input_size);
+        let expected_coefficients =
+            evaluate_plaintext_cbd_error(cbd_error.uniform_graphs(), &plaintext_inputs, cbd_n);
+        let native_inputs = plaintext_inputs
+            .par_iter()
+            .enumerate()
+            .map(|(idx, bit)| {
+                let tag = format!("goldreich_cbd_input_bit_{idx}");
+                encrypt_plaintext_bit(
+                    &params,
+                    ring_gsw.nested_rns.as_ref(),
+                    &public_key,
+                    *bit,
+                    randomizer_hash_key,
+                    tag.as_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let circuit_inputs = native_inputs
+            .iter()
+            .flat_map(|ciphertext| {
+                ciphertext_inputs_from_native(
+                    &params,
+                    ring_gsw.nested_rns.as_ref(),
+                    ciphertext,
+                    0,
+                    Some(ring_gsw.active_levels),
+                )
+            })
+            .collect::<Vec<_>>();
+        let outputs = eval_outputs(&params, &circuit, circuit_inputs);
+        let reconstructed_ciphertexts =
+            ciphertexts_from_outputs(&params, &outputs, ring_gsw.width());
+        let q_modulus = BigUint::from(ring_gsw.nested_rns.q_moduli()[0]);
+
+        assert_eq!(
+            reconstructed_ciphertexts.len(),
+            cbd_error.uniform_prg.output_size,
+            "homomorphic Goldreich CBD evaluation must reconstruct one ciphertext per error coefficient"
+        );
+        reconstructed_ciphertexts
+            .par_iter()
+            .zip(expected_coefficients.par_iter())
+            .enumerate()
+            .for_each(|(idx, (ciphertext, expected))| {
+                let decrypted = decrypt_ciphertext(
+                    &params,
+                    ring_gsw.nested_rns.as_ref(),
+                    ciphertext,
+                    &secret_key,
+                    plaintext_modulus,
+                );
+                assert_eq!(
+                    rounded_coeffs(&decrypted, plaintext_modulus, &q_modulus),
+                    expected_coeffs(centered_mod_u64(*expected, plaintext_modulus)),
+                    "Goldreich CBD output coefficient {idx} must decrypt to the centered-binomial plaintext result modulo {plaintext_modulus}"
+                );
+            });
+    }
+
     #[sequential_test::sequential]
     #[test]
     #[ignore = "expensive circuit-structure reporting test; run with --ignored --nocapture"]
@@ -864,11 +1340,11 @@ mod tests {
             max_unused_muls,
         );
         let graph_seed = sample_graph_seed();
-        let goldreich = GoldreichFhePrg::setup(ring_gsw.clone(), 5, 1, graph_seed);
+        let goldreich = GoldreichFhePrg::setup(&mut circuit, ring_gsw.clone(), 5, 1, graph_seed);
         let encrypted_inputs = (0..goldreich.input_size)
             .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
             .collect::<Vec<_>>();
-        let encrypted_outputs = goldreich.evaluate(&encrypted_inputs, &mut circuit);
+        let encrypted_outputs = goldreich.evaluate_uniform(&encrypted_inputs, &mut circuit);
         let reconstructed_outputs = encrypted_outputs
             .iter()
             .flat_map(|ciphertext| ciphertext.reconstruct(&mut circuit))

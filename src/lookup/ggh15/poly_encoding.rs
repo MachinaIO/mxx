@@ -418,12 +418,13 @@ where
                 )
                 .into_compact_bytes()
             });
-            PolyEncodingChunkBenchMeasurement {
-                latency: bench.time,
-                max_parallelism: lut_entry_chunk_count::<M>(samples.params, d) as u128,
-                total_time: bench.time * lut_entry_chunk_count::<M>(samples.params, d) as f64,
-                peak_vram: bench.peak_vram,
-            }
+            let max_parallelism = lut_entry_chunk_count::<M>(samples.params, d) as u128;
+            PolyEncodingChunkBenchMeasurement::new(
+                bench.time * max_parallelism as f64,
+                bench.time,
+                max_parallelism,
+                bench.peak_vram,
+            )
         }
     }
 }

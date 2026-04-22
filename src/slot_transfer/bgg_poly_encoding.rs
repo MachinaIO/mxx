@@ -429,12 +429,12 @@ where
         let total_single_slot_time = b0_bench.time * b0_chunk_count as f64 +
             b1_bench.time * b1_chunk_count as f64 +
             gate_bench.time * gate_chunk_count as f64;
-        PolyEncodingChunkBenchMeasurement {
-            latency: total_single_slot_time / total_chunk_count.max(1) as f64,
-            max_parallelism: total_chunk_count as u128,
-            total_time: total_single_slot_time,
-            peak_vram: b0_bench.peak_vram.max(b1_bench.peak_vram).max(gate_bench.peak_vram),
-        }
+        PolyEncodingChunkBenchMeasurement::new(
+            total_single_slot_time,
+            total_single_slot_time / total_chunk_count.max(1) as f64,
+            total_chunk_count as u128,
+            b0_bench.peak_vram.max(b1_bench.peak_vram).max(gate_bench.peak_vram),
+        )
     }
 }
 

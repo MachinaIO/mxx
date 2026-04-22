@@ -492,7 +492,7 @@ where
                         input_idx,
                         self.input_count,
                     );
-                    let gadget = M::gadget_matrix(&shared.params, self.secret_size);
+                    let gadget = M::gadget_matrix(&shared.params, super::DIAMOND_SECRET_SIZE);
                     let target = if input_idx == 0 {
                         let one_pubkey = BggPublicKey::new(
                             M::from_compact_bytes(&shared.params, one_bytes.as_ref()),
@@ -929,7 +929,6 @@ where
         self.validate_lengths(input_digits, decoders);
         self.ensure_dir();
         self.write_metadata(&super::DiamondInjectorMetadata {
-            secret_size: self.secret_size,
             input_count: self.input_count,
             base: self.base,
             decoder_count: self.decoder_count,
@@ -1106,10 +1105,6 @@ where
         self.validate_digits(input_digits);
         let metadata = self.read_metadata();
         assert_eq!(
-            metadata.secret_size, self.secret_size,
-            "DiamondInjector metadata secret size mismatch"
-        );
-        assert_eq!(
             metadata.input_count, self.input_count,
             "DiamondInjector metadata input count mismatch"
         );
@@ -1282,15 +1277,14 @@ mod tests {
     fn sample_pubkey(
         params: &GpuDCRTPolyParams,
         hash_key: [u8; 32],
-        secret_size: usize,
         tag: &str,
     ) -> BggPublicKey<GpuDCRTPolyMatrix> {
         let matrix = GpuDCRTPolyHashSampler::<Keccak256>::new().sample_hash(
             params,
             hash_key,
             tag,
-            secret_size,
-            secret_size * params.modulus_digits(),
+            super::super::DIAMOND_SECRET_SIZE,
+            super::super::DIAMOND_SECRET_SIZE * params.modulus_digits(),
             DistType::FinRingDist,
         );
         BggPublicKey::new(matrix, true)
@@ -1321,7 +1315,6 @@ mod tests {
         );
 
         let hash_key = [11u8; 32];
-        let secret_size = 2;
         let input_count = 3;
         let base = 4;
         let decoder_count = 2;
@@ -1330,7 +1323,6 @@ mod tests {
         let injector = TestInjector::new(
             params.clone(),
             hash_key,
-            secret_size,
             input_count,
             base,
             decoder_count,
@@ -1339,15 +1331,10 @@ mod tests {
             dir.path().to_path_buf(),
         );
 
-        let one_pubkey = sample_pubkey(&params, hash_key, secret_size, "diamond_gpu_one_pubkey");
+        let one_pubkey = sample_pubkey(&params, hash_key, "diamond_gpu_one_pubkey");
         let input_pubkeys = (0..input_count)
             .map(|digit_idx| {
-                sample_pubkey(
-                    &params,
-                    hash_key,
-                    secret_size,
-                    &format!("diamond_gpu_input_pubkey_{digit_idx}"),
-                )
+                sample_pubkey(&params, hash_key, &format!("diamond_gpu_input_pubkey_{digit_idx}"))
             })
             .collect::<Vec<_>>();
         let decoder_pubkeys = (0..decoder_count)
@@ -1355,7 +1342,6 @@ mod tests {
                 sample_pubkey(
                     &params,
                     hash_key,
-                    secret_size,
                     &format!("diamond_gpu_decoder_pubkey_{decoder_idx}"),
                 )
             })
@@ -1367,8 +1353,13 @@ mod tests {
         let (one_output, digit_outputs, decoder_outputs) =
             injector.online_eval(&digits, &one_pubkey, &input_pubkeys, &decoder_pubkeys);
 
-        let secret_matrix = injector.reconstruct_secret_product(&digits);
-        let gadget = GpuDCRTPolyMatrix::gadget_matrix(&params, secret_size);
+        let mut secret_matrix = injector.read_matrix(injector.secret_epsilon_id());
+        for (digit_idx, digit_value) in digits.iter().copied().enumerate() {
+            secret_matrix = secret_matrix *
+                injector
+                    .read_matrix(&injector.digit_secret_id(digit_idx + 1, digit_value as usize));
+        }
+        let gadget = GpuDCRTPolyMatrix::gadget_matrix(&params, super::super::DIAMOND_SECRET_SIZE);
         let secret_times_gadget = secret_matrix.clone() * &gadget;
 
         assert_eq!(one_output.vector, secret_matrix.clone() * (&one_pubkey.matrix - &gadget));

@@ -13,6 +13,11 @@ use std::{fs, marker::PhantomData, path::PathBuf};
 #[cfg(feature = "gpu")]
 #[path = "diamond_gpu.rs"]
 mod gpu;
+mod simulation;
+
+pub use simulation::DiamondInputErrorSimulation;
+
+const DIAMOND_SECRET_SIZE: usize = 1;
 
 pub trait InputInjector<K, E> {
     /// Precompute and persist the auxiliary matrices needed to inject one
@@ -43,7 +48,6 @@ where
 {
     pub params: <M::P as Poly>::Params,
     pub hash_key: [u8; 32],
-    pub secret_size: usize,
     pub input_count: usize,
     pub base: usize,
     pub decoder_count: usize,
@@ -57,7 +61,6 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct DiamondInjectorMetadata {
-    secret_size: usize,
     input_count: usize,
     base: usize,
     decoder_count: usize,
@@ -73,7 +76,6 @@ where
     pub fn new(
         params: <M::P as Poly>::Params,
         hash_key: [u8; 32],
-        secret_size: usize,
         input_count: usize,
         base: usize,
         decoder_count: usize,
@@ -86,7 +88,6 @@ where
         Self {
             params,
             hash_key,
-            secret_size,
             input_count,
             base,
             decoder_count,
@@ -170,11 +171,11 @@ where
     }
 
     fn state_row_size(&self) -> usize {
-        self.secret_size.checked_mul(2).expect("DiamondInjector state row size overflow")
+        DIAMOND_SECRET_SIZE.checked_mul(2).expect("DiamondInjector state row size overflow")
     }
 
     fn gadget_col_size(&self, params: &<M::P as Poly>::Params) -> usize {
-        self.secret_size
+        DIAMOND_SECRET_SIZE
             .checked_mul(params.modulus_digits())
             .expect("DiamondInjector gadget column count overflow")
     }
@@ -228,7 +229,12 @@ where
     }
 
     fn sample_secret_mask_with_params(&self, params: &<M::P as Poly>::Params) -> M {
-        US::new().sample_uniform(params, self.secret_size, self.secret_size, DistType::TernaryDist)
+        US::new().sample_uniform(
+            params,
+            DIAMOND_SECRET_SIZE,
+            DIAMOND_SECRET_SIZE,
+            DistType::TernaryDist,
+        )
     }
 
     fn sample_error_matrix_with_dims(
@@ -429,7 +435,7 @@ where
         params: &<M::P as Poly>::Params,
         secret_mask: &M,
     ) -> M {
-        let zero_block = M::zero(params, self.secret_size, self.secret_size);
+        let zero_block = M::zero(params, DIAMOND_SECRET_SIZE, DIAMOND_SECRET_SIZE);
         let top = secret_mask.concat_columns(&[&zero_block]);
         let bottom = zero_block.concat_columns(&[secret_mask]);
         top.concat_rows(&[&bottom])
@@ -445,14 +451,14 @@ where
         // The newly created branch for the current digit must carry both a
         // constant term and the chosen digit value. Because the code multiplies
         // states from the left, the selector is written in row-vector form.
-        let zero_block = M::zero(params, self.secret_size, self.secret_size);
+        let zero_block = M::zero(params, DIAMOND_SECRET_SIZE, DIAMOND_SECRET_SIZE);
         let top = secret_mask.concat_columns(&[&(secret_mask.clone() * &digit)]);
         let bottom = zero_block.clone().concat_columns(&[&zero_block]);
         top.concat_rows(&[&bottom])
     }
 
     fn initial_selector_with_params(&self, params: &<M::P as Poly>::Params, secret_mask: &M) -> M {
-        let zero_block = M::zero(params, self.secret_size, self.secret_size);
+        let zero_block = M::zero(params, DIAMOND_SECRET_SIZE, DIAMOND_SECRET_SIZE);
         secret_mask.concat_columns(&[&zero_block])
     }
 
@@ -464,7 +470,7 @@ where
         let mut p_epsilon = selector * b0_matrix.concat_columns(&[&w00]);
         p_epsilon.add_in_place(&self.sample_error_matrix_with_dims(
             &self.params,
-            self.secret_size,
+            DIAMOND_SECRET_SIZE,
             self.state_col_size(&self.params),
         ));
         p_epsilon
@@ -520,7 +526,7 @@ where
         let col_end = col_start + col_len;
         let target = one.matrix.slice_columns(col_start, col_end) -
             &gadget.slice_columns(col_start, col_end);
-        let zero_block = M::zero(params, self.secret_size, col_len);
+        let zero_block = M::zero(params, DIAMOND_SECRET_SIZE, col_len);
         target.concat_rows(&[&zero_block])
     }
 
@@ -554,7 +560,7 @@ where
         let (col_start, col_len) = column_chunk_bounds(total_cols, chunk_idx);
         let col_end = col_start + col_len;
         let pubkey_chunk = pubkey.matrix.slice_columns(col_start, col_end);
-        let zero_block = M::zero(params, self.secret_size, col_len);
+        let zero_block = M::zero(params, DIAMOND_SECRET_SIZE, col_len);
         pubkey_chunk.concat_rows(&[&zero_block])
     }
 
@@ -571,16 +577,6 @@ where
         let first = chunk_iter.next().expect("chunked artifact should have at least one chunk");
         let rest = chunk_iter.collect::<Vec<_>>();
         if rest.is_empty() { first } else { first.concat_columns_owned(rest) }
-    }
-
-    fn reconstruct_secret_product(&self, input_digits: &[u32]) -> M {
-        self.validate_digits(input_digits);
-        let mut secret = self.read_matrix(self.secret_epsilon_id());
-        for (digit_idx, digit_value) in input_digits.iter().copied().enumerate() {
-            secret = secret *
-                self.read_matrix(&self.digit_secret_id(digit_idx + 1, digit_value as usize));
-        }
-        secret
     }
 
     fn build_output_encoding(
@@ -619,14 +615,13 @@ where
             self.validate_lengths(input_digits, decoders);
             self.ensure_dir();
             self.write_metadata(&DiamondInjectorMetadata {
-                secret_size: self.secret_size,
                 input_count: self.input_count,
                 base: self.base,
                 decoder_count: self.decoder_count,
             });
 
             let trap_sampler = TS::new(&self.params, self.trapdoor_sigma);
-            let gadget = M::gadget_matrix(&self.params, self.secret_size);
+            let gadget = M::gadget_matrix(&self.params, DIAMOND_SECRET_SIZE);
             let mut b_checkpoints = Vec::with_capacity(self.input_count + 1);
             let mut trapdoors = Vec::with_capacity(self.input_count + 1);
             // Load or sample the per-level trapdoor checkpoints that all later
@@ -785,10 +780,6 @@ where
             self.validate_digits(input_digits);
             let metadata = self.read_metadata();
             assert_eq!(
-                metadata.secret_size, self.secret_size,
-                "DiamondInjector metadata secret size mismatch"
-            );
-            assert_eq!(
                 metadata.input_count, self.input_count,
                 "DiamondInjector metadata input count mismatch"
             );
@@ -872,7 +863,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{DiamondInjector, InputInjector};
+    use super::{DIAMOND_SECRET_SIZE, DiamondInjector, InputInjector};
     use crate::{
         __PAIR, __TestState,
         bgg::public_key::BggPublicKey,
@@ -882,8 +873,16 @@ mod tests {
             DistType, PolyHashSampler, hash::DCRTPolyHashSampler,
             trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
         },
+        simulator::{
+            SimulatorContext, error_norm::compute_preimage_norm, poly_matrix_norm::PolyMatrixNorm,
+        },
+        utils::bigdecimal_bits_ceil,
     };
+    use bigdecimal::BigDecimal;
     use keccak_asm::Keccak256;
+    use num_bigint::{BigInt, BigUint};
+    use num_traits::FromPrimitive;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     type TestInjector = DiamondInjector<
@@ -896,15 +895,14 @@ mod tests {
     fn sample_pubkey(
         params: &DCRTPolyParams,
         hash_key: [u8; 32],
-        secret_size: usize,
         tag: &str,
     ) -> BggPublicKey<DCRTPolyMatrix> {
         let matrix = DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
             params,
             hash_key,
             tag,
-            secret_size,
-            secret_size * params.modulus_digits(),
+            DIAMOND_SECRET_SIZE,
+            DIAMOND_SECRET_SIZE * params.modulus_digits(),
             DistType::FinRingDist,
         );
         BggPublicKey::new(matrix, true)
@@ -917,7 +915,6 @@ mod tests {
 
         let params = DCRTPolyParams::default();
         let hash_key = [7u8; 32];
-        let secret_size = 2;
         let input_count = 3;
         let base = 4;
         let decoder_count = 2;
@@ -926,7 +923,6 @@ mod tests {
         let injector = TestInjector::new(
             params.clone(),
             hash_key,
-            secret_size,
             input_count,
             base,
             decoder_count,
@@ -935,25 +931,15 @@ mod tests {
             dir.path().to_path_buf(),
         );
 
-        let one_pubkey = sample_pubkey(&params, hash_key, secret_size, "diamond_one_pubkey");
+        let one_pubkey = sample_pubkey(&params, hash_key, "diamond_one_pubkey");
         let input_pubkeys = (0..input_count)
             .map(|digit_idx| {
-                sample_pubkey(
-                    &params,
-                    hash_key,
-                    secret_size,
-                    &format!("diamond_input_pubkey_{digit_idx}"),
-                )
+                sample_pubkey(&params, hash_key, &format!("diamond_input_pubkey_{digit_idx}"))
             })
             .collect::<Vec<_>>();
         let decoder_pubkeys = (0..decoder_count)
             .map(|decoder_idx| {
-                sample_pubkey(
-                    &params,
-                    hash_key,
-                    secret_size,
-                    &format!("diamond_decoder_pubkey_{decoder_idx}"),
-                )
+                sample_pubkey(&params, hash_key, &format!("diamond_decoder_pubkey_{decoder_idx}"))
             })
             .collect::<Vec<_>>();
 
@@ -966,8 +952,13 @@ mod tests {
         assert_eq!(digit_outputs.len(), input_count);
         assert_eq!(decoder_outputs.len(), decoder_count);
 
-        let secret_matrix = injector.reconstruct_secret_product(&digits);
-        let gadget = DCRTPolyMatrix::gadget_matrix(&params, secret_size);
+        let mut secret_matrix = injector.read_matrix(injector.secret_epsilon_id());
+        for (digit_idx, digit_value) in digits.iter().copied().enumerate() {
+            secret_matrix = secret_matrix *
+                injector
+                    .read_matrix(&injector.digit_secret_id(digit_idx + 1, digit_value as usize));
+        }
+        let gadget = DCRTPolyMatrix::gadget_matrix(&params, DIAMOND_SECRET_SIZE);
         let secret_times_gadget = secret_matrix.clone() * &gadget;
 
         assert_eq!(one_output.vector, secret_matrix.clone() * (&one_pubkey.matrix - &gadget));
@@ -985,5 +976,176 @@ mod tests {
             assert_eq!(output.vector, secret_matrix.clone() * &decoder_pubkeys[decoder_idx].matrix);
             assert_eq!(output.plaintext, Some(TestPoly::const_zero(&params)));
         }
+    }
+
+    #[test]
+    fn test_diamond_injector_simulate_output_error_bounds_matches_repeated_preimage_bound() {
+        let params = DCRTPolyParams::default();
+        let injector = TestInjector::new(
+            params.clone(),
+            [19u8; 32],
+            3,
+            4,
+            2,
+            4.578,
+            3.0,
+            std::env::temp_dir(),
+        );
+
+        let simulated = injector.simulate_output_error_bounds();
+        let state_cols = injector.state_col_size(&params);
+        let gadget_cols = injector.gadget_col_size(&params);
+        let ring_dim_sqrt = BigDecimal::from(params.ring_dimension() as u64)
+            .sqrt()
+            .expect("sqrt(ring_dimension) failed");
+        let base = BigDecimal::from(BigInt::from(BigUint::from(1u64) << params.base_bits()));
+        let ctx = Arc::new(SimulatorContext::new(
+            ring_dim_sqrt,
+            base,
+            DIAMOND_SECRET_SIZE,
+            params.modulus_digits(),
+            params.modulus_digits(),
+        ));
+        let initial_sigma =
+            BigDecimal::from_f64(injector.error_sigma).expect("error_sigma must be finite");
+        let expected_initial = PolyMatrixNorm::sample_gauss(
+            ctx.clone(),
+            DIAMOND_SECRET_SIZE,
+            state_cols,
+            initial_sigma,
+        );
+        let expected_transition_target_error = PolyMatrixNorm::sample_gauss(
+            ctx.clone(),
+            injector.state_row_size(),
+            state_cols,
+            BigDecimal::from_f64(injector.error_sigma).expect("error_sigma must be finite"),
+        );
+        let expected_preimage_norm = compute_preimage_norm(
+            &ctx.ring_dim_sqrt,
+            ctx.m_g as u64,
+            &ctx.base,
+            Some(injector.state_row_size() / DIAMOND_SECRET_SIZE),
+        );
+        let expected_transition = PolyMatrixNorm::new(
+            ctx.clone(),
+            state_cols,
+            state_cols,
+            expected_preimage_norm.clone(),
+            None,
+        );
+        let expected_output =
+            PolyMatrixNorm::new(ctx.clone(), state_cols, gadget_cols, expected_preimage_norm, None);
+        let expected_regular_selector = PolyMatrixNorm::new(
+            ctx.clone(),
+            injector.state_row_size(),
+            injector.state_row_size(),
+            BigDecimal::from(1u64),
+            None,
+        );
+        let expected_special_selector = PolyMatrixNorm::new(
+            ctx.clone(),
+            injector.state_row_size(),
+            injector.state_row_size(),
+            BigDecimal::from(injector.base.saturating_sub(1).max(1) as u64),
+            Some(DIAMOND_SECRET_SIZE),
+        );
+        let expected_initial_secret_factor = PolyMatrixNorm::new(
+            ctx.clone(),
+            DIAMOND_SECRET_SIZE,
+            injector.state_row_size(),
+            BigDecimal::from(1u64),
+            None,
+        );
+
+        let mut expected_secret_factors = vec![expected_initial_secret_factor];
+        let mut expected_state_errors = vec![expected_initial];
+        let advance_expected_state =
+            |prev_secret: &[PolyMatrixNorm], prev_state_errors: &[PolyMatrixNorm]| {
+                let mut next_secret = prev_secret
+                    .iter()
+                    .map(|secret| secret.clone() * &expected_regular_selector)
+                    .collect::<Vec<_>>();
+                let mut next_state_errors = prev_secret
+                    .iter()
+                    .zip(prev_state_errors.iter())
+                    .map(|(secret, state_error)| {
+                        state_error.clone() * &expected_transition +
+                            secret.clone() * &expected_transition_target_error
+                    })
+                    .collect::<Vec<_>>();
+
+                let born_secret = prev_secret[0].clone() * &expected_special_selector;
+                let born_state_error = prev_state_errors[0].clone() * &expected_transition +
+                    prev_secret[0].clone() * &expected_transition_target_error;
+                next_secret.push(born_secret);
+                next_state_errors.push(born_state_error);
+
+                (next_secret, next_state_errors)
+            };
+
+        for _ in 1..=injector.input_count {
+            let (next_secret, next_state_errors) =
+                advance_expected_state(&expected_secret_factors, &expected_state_errors);
+            expected_secret_factors = next_secret;
+            expected_state_errors = next_state_errors;
+        }
+
+        let expected_inputs = (0..injector.input_count)
+            .map(|input_idx| expected_state_errors[input_idx + 1].clone() * &expected_output)
+            .collect::<Vec<_>>();
+        assert_eq!(simulated.input_errors, expected_inputs);
+
+        let expected_decoders =
+            vec![expected_state_errors[0].clone() * &expected_output; injector.decoder_count];
+        assert_eq!(simulated.decoder_errors, expected_decoders);
+    }
+
+    #[test]
+    #[ignore = "metrics-style reporting test; run with --ignored --nocapture"]
+    fn test_diamond_injector_large_output_error_metrics() {
+        let ring_dim = 1u32 << 16;
+        let crt_depth = 40usize;
+        let crt_bits = 28usize;
+        let base_bits = 14u32;
+        let input_count = 8usize;
+        let digit_bits = 4u32;
+        let input_base = 1usize << digit_bits;
+        let decoder_count = 4usize;
+        let params = DCRTPolyParams::new(ring_dim, crt_depth, crt_bits, base_bits);
+        let injector = TestInjector::new(
+            params.clone(),
+            [29u8; 32],
+            input_count,
+            input_base,
+            decoder_count,
+            4.578,
+            4.578,
+            std::env::temp_dir(),
+        );
+
+        let simulated = injector.simulate_output_error_bounds();
+        let max_input_error = simulated
+            .input_errors
+            .iter()
+            .map(|norm| norm.poly_norm.norm.clone())
+            .max()
+            .expect("input error list must be non-empty");
+        let max_decoder_error = simulated
+            .decoder_errors
+            .iter()
+            .map(|norm| norm.poly_norm.norm.clone())
+            .max()
+            .expect("decoder error list must be non-empty");
+        let max_error = std::cmp::max(max_input_error.clone(), max_decoder_error.clone());
+
+        println!(
+            "diamond injector output-error metrics: ring_dim={ring_dim}, crt_depth={crt_depth}, crt_bits={crt_bits}, base_bits={base_bits}, digit_bits={digit_bits}, input_base={input_base}, input_count={input_count}, decoder_count={decoder_count}, fixed_secret_size=1"
+        );
+        println!(
+            "diamond injector output-error bits: max_input={}, max_decoder={}, max_total={}",
+            bigdecimal_bits_ceil(&max_input_error),
+            bigdecimal_bits_ceil(&max_decoder_error),
+            bigdecimal_bits_ceil(&max_error),
+        );
     }
 }

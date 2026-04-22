@@ -10,6 +10,7 @@ use crate::{
     poly::{Poly, PolyParams, dcrt::gpu::detected_gpu_device_ids},
     sampler::trapdoor::GpuPreimageRequest,
 };
+use num_bigint::BigUint;
 use rayon::prelude::*;
 use std::{
     collections::HashMap,
@@ -561,13 +562,8 @@ where
         );
         let compact_len = chunk.into_compact_bytes().len();
         let elapsed = start.elapsed().as_secs_f64();
-        SampleAuxBenchEstimate::from_chunk(
-            elapsed,
-            total_preimages
-                .checked_mul(chunk_count)
-                .expect("total LWE GPU sample-aux chunk count overflowed usize"),
-            compact_len,
-        )
+        let total_chunk_count = BigUint::from(total_preimages) * BigUint::from(chunk_count);
+        SampleAuxBenchEstimate::from_chunk_big_count(elapsed, total_chunk_count, compact_len)
     }
 
     fn write_dummy_aux_for_poly_encode_bench(

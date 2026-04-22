@@ -20,6 +20,7 @@ use crate::{
     },
 };
 use dashmap::DashMap;
+use num_bigint::BigUint;
 use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
@@ -502,11 +503,10 @@ where
         let chunk =
             sample_bench_preimage_chunk::<M, SH, ST>(self, params, GateId(0), 0, 0, 0, 1, 0);
         let elapsed = start.elapsed().as_secs_f64();
-        SampleAuxBenchEstimate::from_chunk(
+        let total_chunk_count = BigUint::from(total_preimages) * BigUint::from(chunk_count);
+        SampleAuxBenchEstimate::from_chunk_big_count(
             elapsed,
-            total_preimages
-                .checked_mul(chunk_count)
-                .expect("total LWE sample-aux chunk count overflowed usize"),
+            total_chunk_count,
             chunk.into_compact_bytes().len(),
         )
     }

@@ -20,7 +20,6 @@ use crate::{
     },
 };
 use dashmap::DashMap;
-use num_bigint::BigUint;
 use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
@@ -40,6 +39,8 @@ use super::{
 use super::{column_chunk_bounds, derive_k_low_chunk};
 #[cfg(not(feature = "gpu"))]
 use crate::poly::PolyParams;
+#[cfg(not(feature = "gpu"))]
+use num_bigint::BigUint;
 
 #[derive(Debug)]
 pub(super) struct GateState<M>

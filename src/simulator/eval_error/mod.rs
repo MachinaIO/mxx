@@ -26,10 +26,7 @@ use rayon::{
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::Arc,
     time::Instant,
 };
 use tracing::{debug, info};
@@ -39,7 +36,9 @@ use self::layers::ErrorNormExecutionLayer;
 const ERROR_NORM_OUTPUT_BATCH_SIZE: usize = 1024;
 const ERROR_NORM_EXPR_PAR_BATCH_SIZE: usize = 32;
 const ERROR_NORM_CALL_COMMIT_BATCH_SIZE: usize = 128;
+const ERROR_NORM_DIRECT_PREPARE_BATCH_SIZE: usize = 4;
 const ERROR_NORM_SUMMED_CALL_COMMIT_BATCH_SIZE: usize = 16;
+const ERROR_NORM_SUMMED_GROUP_REDUCE_BATCH_SIZE: usize = 16;
 const ERROR_NORM_SUMMED_INNER_REDUCE_BATCH_SIZE: usize = 32;
 
 /// Global cache for sub-circuit summaries.
@@ -98,6 +97,12 @@ struct ErrorNormSummaryNode {
     param_bindings: Arc<[SubCircuitParamValue]>,
     output_plaintext_norms: Arc<[PolyNorm]>,
     direct_call_keys: HashMap<usize, ErrorNormSubCircuitSummaryCacheKey>,
+}
+
+#[derive(Clone, Copy)]
+struct ErrorNormSummaryResolveContext<'a> {
+    sub_circuit_id: usize,
+    direct_call_keys: &'a HashMap<usize, ErrorNormSubCircuitSummaryCacheKey>,
 }
 
 #[derive(Debug, Default)]
@@ -517,6 +522,10 @@ impl AffineErrorNormExpr {
         }
     }
 
+    fn small_affine_input_source(&self) -> Option<Self> {
+        if self.input_terms.len() <= 1 { Some(self.clone()) } else { None }
+    }
+
     fn substitute_term_with_caches<F>(
         term: &AffineInputTerm,
         actual_input_at: &F,
@@ -861,6 +870,10 @@ impl ErrorNormSummaryExpr {
         self.matrix_expr.forwarded_input_source()
     }
 
+    fn small_affine_input_source(&self) -> Option<AffineErrorNormExpr> {
+        self.matrix_expr.small_affine_input_source()
+    }
+
     fn constant(value: ErrorNorm) -> Self {
         Self {
             plaintext_norm: value.plaintext_norm,
@@ -994,6 +1007,8 @@ impl ErrorNormSummaryGateStore {
 /// the cached expressions directly, remap forwarded inputs cheaply, or perform full affine
 /// substitution when the actual caller inputs are themselves symbolic.
 struct ErrorNormSubCircuitSummary {
+    sub_circuit_id: usize,
+    direct_call_keys: Arc<HashMap<usize, ErrorNormSubCircuitSummaryCacheKey>>,
     outputs: Box<[Arc<ErrorNormSummaryExpr>]>,
 }
 
@@ -1033,6 +1048,16 @@ impl ErrorNormSubCircuitSummary {
             .all(|(input_idx, expr)| expr.as_ref().is_identity_input(input_idx))
     }
 
+    fn small_affine_input_sources(
+        actual_inputs: &[Arc<ErrorNormSummaryExpr>],
+    ) -> Option<Box<[AffineErrorNormExpr]>> {
+        actual_inputs
+            .iter()
+            .map(|expr| expr.as_ref().small_affine_input_source())
+            .collect::<Option<Vec<_>>>()
+            .map(Vec::into_boxed_slice)
+    }
+
     fn remap_output_range_shared(
         &self,
         output_range: std::ops::Range<usize>,
@@ -1060,6 +1085,82 @@ impl ErrorNormSubCircuitSummary {
         }
     }
 
+    fn compose_output_range_shared(
+        &self,
+        output_range: std::ops::Range<usize>,
+        input_sources: &[AffineErrorNormExpr],
+    ) -> Vec<Arc<ErrorNormSummaryExpr>> {
+        let outputs = &self.outputs[output_range];
+        let compose_one = |expr: &Arc<ErrorNormSummaryExpr>| {
+            let matrix_expr = {
+                let mut transform_cache =
+                    HashMap::<(usize, usize, usize, usize), AffineMatrixTransform>::new();
+                let mut const_term = expr.matrix_expr.const_term.clone();
+                let mut input_terms = Vec::with_capacity(expr.matrix_expr.input_terms.len());
+                for term in expr.matrix_expr.input_terms.iter() {
+                    let source = input_sources.get(term.input_idx).unwrap_or_else(|| {
+                        panic!(
+                            "error-norm summary input index {} out of range during affine composition",
+                            term.input_idx
+                        )
+                    });
+                    if let Some(source_const) = &source.const_term {
+                        let transformed_const = term.transform.apply(source_const.clone());
+                        let scaled_const = if term.coefficient == BigDecimal::one() {
+                            transformed_const
+                        } else {
+                            transformed_const * &term.coefficient
+                        };
+                        const_term = Some(match const_term {
+                            Some(current) => current + &scaled_const,
+                            None => scaled_const,
+                        });
+                    }
+                    input_terms.extend(source.input_terms.iter().map(|source_term| {
+                        let key = {
+                            let (left_ptr, left_len) = source_term.transform.cache_key();
+                            let (right_ptr, right_len) = term.transform.cache_key();
+                            (left_ptr, left_len, right_ptr, right_len)
+                        };
+                        let transform = transform_cache
+                            .entry(key)
+                            .or_insert_with(|| {
+                                let mut ops =
+                                    source_term.transform.ops.iter().cloned().collect::<Vec<_>>();
+                                ops.extend(term.transform.ops.iter().cloned());
+                                AffineMatrixTransform { ops: Arc::from(ops) }
+                            })
+                            .clone();
+                        AffineInputTerm {
+                            input_idx: source_term.input_idx,
+                            transform,
+                            coefficient: &source_term.coefficient * &term.coefficient,
+                        }
+                    }));
+                }
+                AffineErrorNormExpr {
+                    const_term,
+                    input_terms: AffineErrorNormExpr::combine_like_terms(input_terms),
+                }
+            };
+            Arc::new(ErrorNormSummaryExpr {
+                plaintext_norm: expr.plaintext_norm.clone(),
+                matrix_expr,
+            })
+        };
+        if outputs.len() < ERROR_NORM_EXPR_PAR_BATCH_SIZE {
+            outputs.par_iter().map(compose_one).collect()
+        } else {
+            outputs
+                .par_chunks(ERROR_NORM_EXPR_PAR_BATCH_SIZE)
+                .map(|output_chunk| output_chunk.iter().map(compose_one).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .flatten()
+                .collect()
+        }
+    }
+
     fn substitute_output_range_shared(
         &self,
         output_range: std::ops::Range<usize>,
@@ -1070,6 +1171,9 @@ impl ErrorNormSubCircuitSummary {
         }
         if let Some(input_sources) = Self::forwarded_input_sources(actual_inputs) {
             return self.remap_output_range_shared(output_range, input_sources.as_ref());
+        }
+        if let Some(input_sources) = Self::small_affine_input_sources(actual_inputs) {
+            return self.compose_output_range_shared(output_range, input_sources.as_ref());
         }
         self.substitute_output_range_with_input_fn(output_range, &|input_idx| {
             actual_inputs
@@ -1098,6 +1202,15 @@ impl ErrorNormSubCircuitSummary {
             return Arc::new(
                 self.outputs[output_idx].as_ref().remap_input_indices(input_sources.as_ref()),
             );
+        }
+        if let Some(input_sources) = Self::small_affine_input_sources(actual_inputs) {
+            return self
+                .compose_output_range_shared(output_idx..output_idx + 1, input_sources.as_ref())
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| {
+                    panic!("error-norm summary output index {output_idx} out of range")
+                });
         }
         Arc::new(self.substitute_output(output_idx, actual_inputs))
     }

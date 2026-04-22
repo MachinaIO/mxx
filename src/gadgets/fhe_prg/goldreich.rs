@@ -321,8 +321,6 @@ pub struct GoldreichFhePrg<P: Poly, C: BooleanCiphertext<P> = RingGswCiphertext<
     pub input_size: usize,
     pub output_size: usize,
     pub public_graph: GoldreichGraph,
-    output_bit_sub_circuit_id: usize,
-    output_bit_template: C,
 }
 
 impl<P: Poly, C: BooleanCiphertext<P>> GoldreichFhePrg<P, C> {
@@ -336,8 +334,7 @@ impl<P: Poly + 'static, C> GoldreichFhePrg<P, C>
 where
     C: BooleanCiphertext<P>,
 {
-    /// Generates the fixed public graph from a public `graph_seed`, registers the reusable
-    /// one-output-bit Goldreich sub-circuit in `circuit`, and stores the result with the
+    /// Generates the fixed public graph from a public `graph_seed` and stores it with the
     /// Ring-GSW context.
     pub fn setup(
         circuit: &mut PolyCircuit<P>,
@@ -374,25 +371,15 @@ where
     }
 
     /// Builds the PRG from an already validated public graph instead of generating one from a
-    /// `graph_seed`, while also registering the reusable Goldreich output-bit sub-circuit.
+    /// `graph_seed`.
     pub fn from_public_graph(
-        circuit: &mut PolyCircuit<P>,
+        _circuit: &mut PolyCircuit<P>,
         ring_gsw: Arc<C::Context>,
         public_graph: GoldreichGraph,
     ) -> Self {
         let input_size = public_graph.input_size;
         let output_size = public_graph.output_size();
-        let (output_bit_sub_circuit, output_bit_template) =
-            goldreich_output_bit_sub_circuit(Arc::clone(&ring_gsw), circuit);
-        let output_bit_sub_circuit_id = circuit.register_sub_circuit(output_bit_sub_circuit);
-        Self {
-            ring_gsw,
-            input_size,
-            output_size,
-            public_graph,
-            output_bit_sub_circuit_id,
-            output_bit_template,
-        }
+        Self { ring_gsw, input_size, output_size, public_graph }
     }
 
     fn validate_input_bits(&self, input_bits: &[C]) {
@@ -424,13 +411,18 @@ where
             .edges
             .iter()
             .map(|edge| {
-                let mut sub_circuit_inputs = Vec::new();
-                for input_idx in edge.all_inputs() {
-                    sub_circuit_inputs.extend(input_bits[input_idx].sub_circuit_wires());
-                }
-                let outputs =
-                    circuit.call_sub_circuit(self.output_bit_sub_circuit_id, &sub_circuit_inputs);
-                C::from_sub_circuit_outputs(&self.output_bit_template, &outputs)
+                let and_term =
+                    input_bits[edge.and_inputs[0]].and(&input_bits[edge.and_inputs[1]], circuit);
+                reduce_ciphertext_terms_pairwise(
+                    vec![
+                        input_bits[edge.xor_inputs[0]].clone(),
+                        input_bits[edge.xor_inputs[1]].clone(),
+                        input_bits[edge.xor_inputs[2]].clone(),
+                        and_term,
+                    ],
+                    circuit,
+                    |lhs: &C, rhs: &C, circuit| lhs.xor(rhs, circuit),
+                )
             })
             .collect::<Vec<_>>()
     }
@@ -612,28 +604,6 @@ where
         current_layer = next_layer;
     }
     current_layer.pop().expect("pairwise reduction must leave one term")
-}
-
-fn goldreich_output_bit_sub_circuit<P, C>(
-    ring_gsw: Arc<C::Context>,
-    source_circuit: &PolyCircuit<P>,
-) -> (PolyCircuit<P>, C)
-where
-    P: Poly + 'static,
-    C: BooleanCiphertext<P>,
-{
-    let mut circuit = source_circuit.fresh_sub_circuit();
-    let inputs = (0..5)
-        .map(|_| C::sub_circuit_input(Arc::clone(&ring_gsw), &mut circuit))
-        .collect::<Vec<_>>();
-    let and_term = inputs[3].and(&inputs[4], &mut circuit);
-    let output = reduce_ciphertext_terms_pairwise(
-        vec![inputs[0].clone(), inputs[1].clone(), inputs[2].clone(), and_term],
-        &mut circuit,
-        |lhs, rhs, circuit| lhs.xor(rhs, circuit),
-    );
-    circuit.output(output.sub_circuit_wires());
-    (circuit, output)
 }
 
 fn goldreich_cbd_error_sub_circuit<P, C>(
@@ -1142,55 +1112,6 @@ mod tests {
                 );
             },
         );
-    }
-
-    #[test]
-    fn test_goldreich_evaluate_uniform_uses_one_subcircuit_call_per_output_bit() {
-        let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let (_params, ring_gsw) = create_test_context(&mut circuit);
-        let output_size = 3;
-        let goldreich: GoldreichFhePrg<DCRTPoly> = GoldreichFhePrg::setup(
-            &mut circuit,
-            ring_gsw.clone(),
-            5,
-            output_size,
-            sample_graph_seed(),
-        );
-        let encrypted_inputs = (0..goldreich.input_size)
-            .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
-            .collect::<Vec<_>>();
-        let input_wire_count = encrypted_inputs[0].sub_circuit_wires().len();
-        let output_gate_count = goldreich
-            .output_bit_template
-            .sub_circuit_wires()
-            .into_iter()
-            .map(BatchedWire::len)
-            .sum::<usize>();
-
-        let _ = goldreich.evaluate_uniform(&encrypted_inputs, &mut circuit);
-
-        assert_eq!(
-            circuit.sub_circuit_calls.len(),
-            output_size,
-            "Goldreich evaluate_uniform must issue exactly one direct sub-circuit call per output bit"
-        );
-        for call_id in 0..output_size {
-            let call = circuit.sub_circuit_call_info(call_id);
-            assert_eq!(
-                call.sub_circuit_id, goldreich.output_bit_sub_circuit_id,
-                "Goldreich evaluate_uniform must reuse the setup-time Goldreich output sub-circuit"
-            );
-            assert_eq!(
-                call.inputs.len(),
-                5 * input_wire_count,
-                "each Goldreich output sub-circuit call must receive five ciphertext inputs"
-            );
-            assert_eq!(
-                call.output_gate_ids.len(),
-                output_gate_count,
-                "each Goldreich output sub-circuit call must expose one ciphertext output"
-            );
-        }
     }
 
     #[test]

@@ -1104,13 +1104,13 @@ mod tests {
     #[ignore = "metrics-style reporting test; run with --ignored --nocapture"]
     fn test_diamond_injector_large_output_error_metrics() {
         let ring_dim = 1u32 << 16;
-        let crt_depth = 40usize;
+        let crt_depth = 60usize;
         let crt_bits = 28usize;
         let base_bits = 14u32;
-        let input_count = 8usize;
-        let digit_bits = 4u32;
+        let input_count = 32usize;
+        let digit_bits = 8u32;
         let input_base = 1usize << digit_bits;
-        let decoder_count = 4usize;
+        let decoder_count = 1usize;
         let params = DCRTPolyParams::new(ring_dim, crt_depth, crt_bits, base_bits);
         let injector = TestInjector::new(
             params.clone(),

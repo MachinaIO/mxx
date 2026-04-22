@@ -380,6 +380,10 @@ mod tests {
         let bench = poly_evaluator.benchmark_public_lookup_chunk(&bench_samples, 1);
         assert!(bench.latency >= 0.0);
         assert!(bench.total_time >= bench.latency);
-        assert_eq!(bench.max_parallelism, k_high_chunk_count::<DCRTPolyMatrix>(&params, d) as u128);
+        #[cfg(feature = "gpu")]
+        let expected_parallelism = (2 * k_high_chunk_count::<DCRTPolyMatrix>(&params, d)) as u128;
+        #[cfg(not(feature = "gpu"))]
+        let expected_parallelism = k_high_chunk_count::<DCRTPolyMatrix>(&params, d) as u128;
+        assert_eq!(bench.max_parallelism, expected_parallelism);
     }
 }

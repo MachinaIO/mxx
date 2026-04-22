@@ -1305,6 +1305,54 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         outputs
     }
 
+    pub(crate) fn sub_circuit_wires(&self) -> Vec<BatchedWire> {
+        let (row0, row1) = rayon::join(
+            || flatten_nested_rns_entries(&self.rows[0]),
+            || flatten_nested_rns_entries(&self.rows[1]),
+        );
+        let mut wires = row0;
+        wires.extend(row1);
+        wires
+    }
+
+    pub(crate) fn from_sub_circuit_outputs(template: &Self, outputs: &[BatchedWire]) -> Self {
+        let outputs = outputs.iter().copied().map(BatchedWire::as_single_wire).collect::<Vec<_>>();
+        let width = template.width();
+        let template_entry =
+            template.rows[0].first().expect("RingGswCiphertext must contain at least one column");
+        let entry_size = template_entry.flat_output_size();
+        assert_eq!(
+            outputs.len(),
+            2 * width * entry_size,
+            "Ring-GSW sub-circuit output size must match one ciphertext"
+        );
+        let (row0_outputs, row1_outputs) = outputs.split_at(width * entry_size);
+        let row0 = template.rows[0]
+            .iter()
+            .enumerate()
+            .map(|(col_idx, entry)| {
+                let start = col_idx * entry_size;
+                let end = start + entry_size;
+                nested_rns_from_flat_outputs(entry, &row0_outputs[start..end], &A::metadata(entry))
+            })
+            .collect::<Vec<_>>();
+        let row1 = template.rows[1]
+            .iter()
+            .enumerate()
+            .map(|(col_idx, entry)| {
+                let start = col_idx * entry_size;
+                let end = start + entry_size;
+                nested_rns_from_flat_outputs(entry, &row1_outputs[start..end], &A::metadata(entry))
+            })
+            .collect::<Vec<_>>();
+        Self::new(
+            template.ctx.clone(),
+            [row0, row1],
+            template.randomizer_norm.clone(),
+            template.max_plaintext.clone(),
+        )
+    }
+
     fn input_rows(
         arith_ctx: Arc<A::Context>,
         width: usize,

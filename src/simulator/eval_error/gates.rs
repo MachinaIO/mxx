@@ -296,7 +296,7 @@ impl PolyCircuit<DCRTPoly> {
         plt_evaluator: Option<&impl AffinePltEvaluator>,
         slot_transfer_evaluator: Option<&dyn AffineSlotTransferEvaluator>,
         summary_cache: &ErrorNormSubCircuitSummaryCache,
-        node: &ErrorNormSummaryNode,
+        resolve_ctx: ErrorNormSummaryResolveContext<'_>,
     ) -> ErrorNormSummaryExpr {
         let gate = self.gate(gate_id);
         match &gate.gate_type {
@@ -310,7 +310,7 @@ impl PolyCircuit<DCRTPoly> {
                     plt_evaluator,
                     slot_transfer_evaluator,
                     summary_cache,
-                    node,
+                    resolve_ctx,
                 );
                 let right = self.clone_error_norm_summary_expr_for_summary_gate_direct(
                     gate.input_gates[1],
@@ -321,7 +321,7 @@ impl PolyCircuit<DCRTPoly> {
                     plt_evaluator,
                     slot_transfer_evaluator,
                     summary_cache,
-                    node,
+                    resolve_ctx,
                 );
                 left.as_ref().add_bound(right.as_ref())
             }
@@ -335,7 +335,7 @@ impl PolyCircuit<DCRTPoly> {
                     plt_evaluator,
                     slot_transfer_evaluator,
                     summary_cache,
-                    node,
+                    resolve_ctx,
                 );
                 let right = self.clone_error_norm_summary_expr_for_summary_gate_direct(
                     gate.input_gates[1],
@@ -346,7 +346,7 @@ impl PolyCircuit<DCRTPoly> {
                     plt_evaluator,
                     slot_transfer_evaluator,
                     summary_cache,
-                    node,
+                    resolve_ctx,
                 );
                 left.as_ref().mul_bound(right.as_ref())
             }
@@ -361,7 +361,7 @@ impl PolyCircuit<DCRTPoly> {
                     plt_evaluator,
                     slot_transfer_evaluator,
                     summary_cache,
-                    node,
+                    resolve_ctx,
                 );
                 input.as_ref().small_scalar_mul_bound(scalar)
             }
@@ -376,7 +376,7 @@ impl PolyCircuit<DCRTPoly> {
                     plt_evaluator,
                     slot_transfer_evaluator,
                     summary_cache,
-                    node,
+                    resolve_ctx,
                 );
                 input.as_ref().large_scalar_mul_bound(scalar)
             }
@@ -395,7 +395,7 @@ impl PolyCircuit<DCRTPoly> {
         plt_evaluator: Option<&P>,
         slot_transfer_evaluator: Option<&dyn AffineSlotTransferEvaluator>,
         summary_cache: &ErrorNormSubCircuitSummaryCache,
-        node: &ErrorNormSummaryNode,
+        resolve_ctx: ErrorNormSummaryResolveContext<'_>,
     ) -> ErrorNormSummaryExpr {
         let gate = self.gate(gate_id);
         match &gate.gate_type {
@@ -410,7 +410,7 @@ impl PolyCircuit<DCRTPoly> {
                     plt_evaluator,
                     slot_transfer_evaluator,
                     summary_cache,
-                    node,
+                    resolve_ctx,
                 );
                 slot_transfer_evaluator
                     .expect("slot transfer evaluator missing")
@@ -427,7 +427,7 @@ impl PolyCircuit<DCRTPoly> {
                     plt_evaluator,
                     slot_transfer_evaluator,
                     summary_cache,
-                    node,
+                    resolve_ctx,
                 );
                 let lookup = self.lookup_table(lut_id);
                 plt_evaluator.expect("public lookup evaluator missing").public_lookup_affine(
@@ -447,7 +447,7 @@ impl PolyCircuit<DCRTPoly> {
                 plt_evaluator,
                 slot_transfer_evaluator,
                 summary_cache,
-                node,
+                resolve_ctx,
             ),
         }
     }

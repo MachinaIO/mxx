@@ -156,16 +156,13 @@ impl PolyCircuit<DCRTPoly> {
     pub(super) fn release_error_norm_summary_inputs<I>(
         &self,
         input_ids: I,
-        output_gate_ids_set: &HashSet<GateId>,
+        _output_gate_ids_set: &HashSet<GateId>,
         remaining_use_count: &mut BatchedGateUseCounts,
         gate_exprs: &mut ErrorNormExprStore,
     ) where
         I: IntoIterator<Item = GateId>,
     {
         for input_id in input_ids {
-            if output_gate_ids_set.contains(&input_id) {
-                continue;
-            }
             if !remaining_use_count.contains(input_id) {
                 continue;
             }
@@ -184,16 +181,13 @@ impl PolyCircuit<DCRTPoly> {
         &self,
         shared_prefix: &[BatchedWire],
         suffix: &[BatchedWire],
-        output_gate_ids_set: &HashSet<GateId>,
+        _output_gate_ids_set: &HashSet<GateId>,
         remaining_use_count: &BatchedGateUseCounts,
     ) -> Vec<(GateId, u32)> {
         let mut release_counts = HashMap::<GateId, u32>::new();
         for input_id in
             iter_batched_wire_gates(shared_prefix).chain(iter_batched_wire_gates(suffix))
         {
-            if output_gate_ids_set.contains(&input_id) {
-                continue;
-            }
             if !remaining_use_count.contains(input_id) {
                 continue;
             }

@@ -10,6 +10,7 @@ use crate::{
     poly::{Poly, PolyParams, dcrt::gpu::detected_gpu_device_ids},
     sampler::trapdoor::GpuPreimageRequest,
 };
+use num_bigint::BigUint;
 use rayon::prelude::*;
 use std::{
     collections::HashMap,
@@ -49,7 +50,6 @@ where
     M: PolyMatrix,
     T: Send + Sync,
 {
-    device_id: i32,
     params: <<M as PolyMatrix>::P as Poly>::Params,
     trapdoor: DeviceReplica<'a, T>,
     pub_matrix: DeviceReplica<'a, M>,
@@ -154,7 +154,6 @@ where
             };
             let gadget = M::gadget_matrix(&local_params, row_size);
             GpuLweDeviceShared {
-                device_id,
                 params: local_params,
                 trapdoor: local_trapdoor,
                 pub_matrix: local_pub_matrix,
@@ -281,6 +280,115 @@ where
         .collect()
 }
 
+fn store_chunk_tasks_gpu<M, SH, ST>(
+    evaluator: &LWEBGGPubKeyPltEvaluator<M, SH, ST>,
+    params: &<M::P as Poly>::Params,
+    row_size: usize,
+    tasks: Vec<GpuLweChunkTask<M::P>>,
+    progress_label: &str,
+) where
+    M: PolyMatrix + Send + Sync + 'static,
+    SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    ST: PolyTrapdoorSampler<M = M> + Send + Sync,
+    M::P: 'static,
+    <M::P as Poly>::Elem: Send + Sync,
+{
+    if tasks.is_empty() {
+        return;
+    }
+
+    let shared = prepare_gpu_device_shared::<M, SH, ST>(evaluator, params, row_size);
+    let wave_width = shared.len().max(1);
+    let total_tasks = tasks.len();
+    let completed_tasks = AtomicUsize::new(0);
+    let mut cursor = 0usize;
+    let mut current_loaded =
+        load_wave::<M, ST>(&shared, &tasks[cursor..(cursor + wave_width).min(total_tasks)]);
+    cursor += current_loaded.len();
+    let mut pending_store_jobs: Option<Vec<CompactBytesJob>> = None;
+
+    while !current_loaded.is_empty() {
+        let current_task_count = current_loaded.len();
+        let has_next = cursor < total_tasks;
+        let current_loaded_owned = current_loaded;
+
+        let (computed_wave, next_loaded) = if let Some(previous_jobs) = pending_store_jobs.take() {
+            if has_next {
+                let next_end = (cursor + wave_width).min(total_tasks);
+                let next_tasks = tasks[cursor..next_end].to_vec();
+                let ((computed_wave, next_loaded), ()) = rayon::join(
+                    || {
+                        rayon::join(
+                            || {
+                                compute_wave::<M, SH, ST>(
+                                    evaluator,
+                                    &shared,
+                                    current_loaded_owned,
+                                    row_size,
+                                )
+                            },
+                            || load_wave::<M, ST>(&shared, &next_tasks),
+                        )
+                    },
+                    || previous_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store),
+                );
+                cursor = next_end;
+                (computed_wave, next_loaded)
+            } else {
+                let (computed_wave, ()) = rayon::join(
+                    || {
+                        compute_wave::<M, SH, ST>(
+                            evaluator,
+                            &shared,
+                            current_loaded_owned,
+                            row_size,
+                        )
+                    },
+                    || previous_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store),
+                );
+                (computed_wave, Vec::new())
+            }
+        } else if has_next {
+            let next_end = (cursor + wave_width).min(total_tasks);
+            let next_tasks = tasks[cursor..next_end].to_vec();
+            let (computed_wave, next_loaded) = rayon::join(
+                || compute_wave::<M, SH, ST>(evaluator, &shared, current_loaded_owned, row_size),
+                || load_wave::<M, ST>(&shared, &next_tasks),
+            );
+            cursor = next_end;
+            (computed_wave, next_loaded)
+        } else {
+            (
+                compute_wave::<M, SH, ST>(evaluator, &shared, current_loaded_owned, row_size),
+                Vec::new(),
+            )
+        };
+
+        let jobs = computed_wave_to_jobs(computed_wave);
+        debug!(
+            "{} wave computed: wave_tasks={}, compact_bytes_total={}",
+            progress_label,
+            current_task_count,
+            compact_bytes_job_total(&jobs)
+        );
+        pending_store_jobs = Some(jobs);
+        let done =
+            completed_tasks.fetch_add(current_task_count, Ordering::Relaxed) + current_task_count;
+        info!(
+            "{} progress: {}/{} chunk tasks ({:.1}%)",
+            progress_label,
+            done,
+            total_tasks,
+            100.0 * (done as f64) / (total_tasks as f64)
+        );
+        current_loaded = next_loaded;
+    }
+
+    if let Some(previous_jobs) = pending_store_jobs.take() {
+        previous_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
+    }
+}
+
 pub(super) fn sample_aux_matrices_gpu<M, SH, ST>(
     evaluator: &LWEBGGPubKeyPltEvaluator<M, SH, ST>,
     params: &<M::P as Poly>::Params,
@@ -376,117 +484,26 @@ pub(super) fn sample_aux_matrices_gpu<M, SH, ST>(
         return;
     }
 
-    let shared = prepare_gpu_device_shared::<M, SH, ST>(evaluator, params, row_size);
-    let wave_width = shared.len().max(1);
-    let total_tasks = tasks.len();
     info!(
-        "LWE GPU sample_aux_matrices start: gates={}, rows_total={}, rows_pending={}, rows_resumed={}, chunk_count={}, devices={}, chunk_tasks={}",
+        "LWE GPU sample_aux_matrices start: gates={}, rows_total={}, rows_pending={}, rows_resumed={}, chunk_count={}, chunk_tasks={}",
         gate_count,
         total_rows,
         pending_rows,
         resumed_rows,
         chunk_count,
-        shared.len(),
-        total_tasks
+        tasks.len()
     );
-    for (slot_idx, shared_dev) in shared.iter().enumerate() {
-        debug!(
-            "LWE GPU device slot prepared: slot={}, device_id={}, modulus_digits={}",
-            slot_idx,
-            shared_dev.device_id,
-            shared_dev.params.modulus_digits()
-        );
-    }
-
-    let completed_tasks = AtomicUsize::new(0);
-    let mut cursor = 0usize;
-    let mut current_loaded =
-        load_wave::<M, ST>(&shared, &tasks[cursor..(cursor + wave_width).min(total_tasks)]);
-    cursor += current_loaded.len();
-    let mut pending_store_jobs: Option<Vec<CompactBytesJob>> = None;
-
-    while !current_loaded.is_empty() {
-        let current_task_count = current_loaded.len();
-        let has_next = cursor < total_tasks;
-        let current_loaded_owned = current_loaded;
-
-        let (computed_wave, next_loaded) = if let Some(previous_jobs) = pending_store_jobs.take() {
-            if has_next {
-                let next_end = (cursor + wave_width).min(total_tasks);
-                let next_tasks = tasks[cursor..next_end].to_vec();
-                let ((computed_wave, next_loaded), ()) = rayon::join(
-                    || {
-                        rayon::join(
-                            || {
-                                compute_wave::<M, SH, ST>(
-                                    evaluator,
-                                    &shared,
-                                    current_loaded_owned,
-                                    row_size,
-                                )
-                            },
-                            || load_wave::<M, ST>(&shared, &next_tasks),
-                        )
-                    },
-                    || previous_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store),
-                );
-                cursor = next_end;
-                (computed_wave, next_loaded)
-            } else {
-                let (computed_wave, ()) = rayon::join(
-                    || {
-                        compute_wave::<M, SH, ST>(
-                            evaluator,
-                            &shared,
-                            current_loaded_owned,
-                            row_size,
-                        )
-                    },
-                    || previous_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store),
-                );
-                (computed_wave, Vec::new())
-            }
-        } else if has_next {
-            let next_end = (cursor + wave_width).min(total_tasks);
-            let next_tasks = tasks[cursor..next_end].to_vec();
-            let (computed_wave, next_loaded) = rayon::join(
-                || compute_wave::<M, SH, ST>(evaluator, &shared, current_loaded_owned, row_size),
-                || load_wave::<M, ST>(&shared, &next_tasks),
-            );
-            cursor = next_end;
-            (computed_wave, next_loaded)
-        } else {
-            (
-                compute_wave::<M, SH, ST>(evaluator, &shared, current_loaded_owned, row_size),
-                Vec::new(),
-            )
-        };
-
-        let jobs = computed_wave_to_jobs(computed_wave);
-        debug!(
-            "LWE GPU wave computed: wave_tasks={}, compact_bytes_total={}",
-            current_task_count,
-            compact_bytes_job_total(&jobs)
-        );
-        pending_store_jobs = Some(jobs);
-        let done =
-            completed_tasks.fetch_add(current_task_count, Ordering::Relaxed) + current_task_count;
-        info!(
-            "LWE GPU sample_aux_matrices progress: {}/{} chunk tasks ({:.1}%)",
-            done,
-            total_tasks,
-            100.0 * (done as f64) / (total_tasks as f64)
-        );
-        current_loaded = next_loaded;
-    }
-
-    if let Some(previous_jobs) = pending_store_jobs.take() {
-        previous_jobs.into_par_iter().for_each(CompactBytesJob::wait_then_store);
-    }
+    store_chunk_tasks_gpu::<M, SH, ST>(
+        evaluator,
+        params,
+        row_size,
+        tasks,
+        "LWE GPU sample_aux_matrices",
+    );
 
     info!(
         "LWE GPU sample_aux_matrices finished: chunk_tasks={}, rows_total={}, rows_resumed={}, elapsed={:?}",
-        total_tasks,
+        pending_rows * chunk_count,
         total_rows,
         resumed_rows,
         start.elapsed()
@@ -561,46 +578,111 @@ where
         );
         let compact_len = chunk.into_compact_bytes().len();
         let elapsed = start.elapsed().as_secs_f64();
-        SampleAuxBenchEstimate::from_chunk(
-            elapsed,
-            total_preimages
-                .checked_mul(chunk_count)
-                .expect("total LWE GPU sample-aux chunk count overflowed usize"),
-            compact_len,
-        )
+        let total_chunk_count = BigUint::from(total_preimages) * BigUint::from(chunk_count);
+        SampleAuxBenchEstimate::from_chunk_big_count(elapsed, total_chunk_count, compact_len)
     }
 
     fn write_dummy_aux_for_poly_encode_bench(
         &self,
         params: &Self::Params,
         plt: &PublicLut<M::P>,
-        _used_inputs: &[u64],
+        used_inputs: &[u64],
         lut_id: usize,
         gate_id: GateId,
         _error_sigma: f64,
     ) {
+        let row_size = self.pub_matrix.row_size();
+        let chunk_count = k_high_chunk_count::<M>(params, row_size);
+        let checkpoint_index = load_checkpoint_index(&self.dir_path);
+        let checkpoint_part_index_cache = build_part_index_cache(checkpoint_index.as_ref());
         let input_pubkey = SH::new().sample_hash(
             params,
             self.hash_key,
             b"lwe_bench_input_pubkey",
-            self.pub_matrix.row_size(),
-            self.pub_matrix.row_size() * params.modulus_digits(),
+            row_size,
+            row_size * params.modulus_digits(),
             crate::sampler::DistType::FinRingDist,
         );
-        let output_pubkey =
-            derive_a_lt_matrix::<M, SH>(params, self.pub_matrix.row_size(), self.hash_key, gate_id);
-        let buffer = super::sample_k_high_buffer::<M, SH, ST, _>(
-            plt,
-            params,
-            self.hash_key,
-            &self.trap_sampler,
-            self.pub_matrix.as_ref(),
-            self.trapdoor.as_ref(),
-            &input_pubkey,
-            &output_pubkey,
-            gate_id,
-            lut_id,
+        let output_pubkey = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, gate_id);
+        let input_pubkey_bytes = Arc::<[u8]>::from(input_pubkey.into_compact_bytes());
+        let output_pubkey_bytes = Arc::<[u8]>::from(output_pubkey.into_compact_bytes());
+
+        let mut lut_rows = used_inputs
+            .iter()
+            .map(|&x| {
+                let (row_idx, y_elem) = plt.get(params, x).unwrap_or_else(|| {
+                    panic!("synthetic poly-bench checkpoint input {x} missing from LUT")
+                });
+                (
+                    usize::try_from(x).expect("LUT input must fit usize"),
+                    usize::try_from(row_idx).expect("LUT row index must fit usize"),
+                    y_elem.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        lut_rows.sort_unstable_by_key(|(_, row_idx, _)| *row_idx);
+        lut_rows.dedup_by(|(_, left_idx, _), (_, right_idx, _)| left_idx == right_idx);
+
+        let task_builds = lut_rows
+            .into_par_iter()
+            .map(|(x_k_usize, lut_entry_idx, y_elem)| {
+                if k_high_row_checkpoint_complete(
+                    checkpoint_index.as_ref(),
+                    checkpoint_part_index_cache.as_ref(),
+                    gate_id,
+                    lut_id,
+                    row_size,
+                    params.modulus_digits(),
+                    lut_entry_idx,
+                ) {
+                    return (Vec::new(), 1usize);
+                }
+
+                let entry_tasks = (0..chunk_count)
+                    .map(|chunk_idx| GpuLweChunkTask {
+                        gate_id,
+                        lut_id,
+                        lut_entry_idx,
+                        x_k_usize,
+                        chunk_idx,
+                        input_pubkey_bytes: Arc::clone(&input_pubkey_bytes),
+                        output_pubkey_bytes: Arc::clone(&output_pubkey_bytes),
+                        y_elem: y_elem.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                (entry_tasks, 0usize)
+            })
+            .collect::<Vec<_>>();
+        let resumed_rows: usize = task_builds.iter().map(|(_, resumed)| *resumed).sum();
+        let tasks =
+            task_builds.into_iter().flat_map(|(entry_tasks, _)| entry_tasks).collect::<Vec<_>>();
+        let pending_rows = tasks.len() / chunk_count.max(1);
+        if tasks.is_empty() {
+            info!(
+                "No pending LWE GPU dummy poly-bench chunks to sample (rows_total={}, rows_resumed={})",
+                resumed_rows, resumed_rows
+            );
+            return;
+        }
+
+        info!(
+            "LWE GPU dummy poly-bench sample_aux start: rows_total={}, rows_pending={}, rows_resumed={}, chunk_count={}",
+            pending_rows + resumed_rows,
+            pending_rows,
+            resumed_rows,
+            chunk_count
         );
-        add_lookup_buffer(buffer);
+        store_chunk_tasks_gpu::<M, SH, ST>(
+            self,
+            params,
+            row_size,
+            tasks,
+            "LWE GPU dummy poly-bench sample_aux",
+        );
+        info!(
+            "LWE GPU dummy poly-bench sample_aux finished: rows_total={}, rows_resumed={}",
+            pending_rows + resumed_rows,
+            resumed_rows
+        );
     }
 }

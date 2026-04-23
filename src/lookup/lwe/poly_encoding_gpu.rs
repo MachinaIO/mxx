@@ -137,6 +137,20 @@ where
                 BenchContributionFamily::KHigh => &shared_dev.c_b,
                 BenchContributionFamily::KLow => &input_vector_by_device[loaded.device_slot],
             };
+            assert_eq!(
+                lhs.col_size(),
+                rhs_chunk.row_size(),
+                "LWE GPU bench contribution dimension mismatch: family={:?}, chunk_idx={}, gate_id={}, lut_id={}, lut_entry_idx={}, lhs={}x{}, rhs={}x{}",
+                loaded.task.family,
+                loaded.task.chunk_idx,
+                gate_id,
+                lut_id,
+                lut_entry_idx,
+                lhs.row_size(),
+                lhs.col_size(),
+                rhs_chunk.row_size(),
+                rhs_chunk.col_size()
+            );
             let output = lhs * &rhs_chunk;
             BenchComputedContributionTask { bytes: Arc::<[u8]>::from(output.into_compact_bytes()) }
         })

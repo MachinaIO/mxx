@@ -20,8 +20,10 @@ from .plan import (
     render_session_plan,
 )
 from .runners import (
+    BuildCheckRunner,
     CodexExecRunner,
     FinalTestRunner,
+    ShellBuildCheckRunner,
     ShellFinalTestRunner,
     StructuredExecResult,
     StructuredExecRunner,
@@ -121,6 +123,11 @@ def _make_test_follow_ups(summary: str) -> list[str]:
     return [f"Fix the failing final validation from `scripts/run_tests.sh`: {detail}"]
 
 
+def _make_build_follow_ups(summary: str) -> list[str]:
+    detail = _compact_message(summary)
+    return [f"Fix the failing implementation formatting/build validation from `scripts/run_build_checks.sh`: {detail}"]
+
+
 def _make_review_follow_ups(summary: str) -> list[str]:
     detail = _compact_message(summary)
     return [f"Address reviewer feedback from the final read-only Codex review: {detail}"]
@@ -201,6 +208,15 @@ def _select_final_tests(edited_paths: list[str]) -> FinalTestSelection:
         if normalized.parts and normalized.parts[0] == "cuda":
             run_rust = True
     return FinalTestSelection(run_python=run_python, run_rust=run_rust)
+
+
+def _rust_build_check_required(path: str) -> bool:
+    normalized = PurePosixPath(path)
+    return (
+        normalized.suffix == ".rs"
+        or normalized.name == "Cargo.toml"
+        or bool(normalized.parts and normalized.parts[0] == "cuda")
+    )
 
 
 def _build_session_start_prompt(initial_user_message: str) -> str:
@@ -295,6 +311,25 @@ def _run_selected_final_tests(
     return "passed", None
 
 
+def _run_selected_build_checks(
+    paths: RepoPaths,
+    plan_path: Path,
+    build_runner: BuildCheckRunner,
+    edited_paths_provider: Callable[[Path], list[str] | None],
+) -> tuple[str, str | None]:
+    edited_paths = edited_paths_provider(paths.repo_root)
+    if edited_paths == []:
+        return "skipped-no-changes", None
+    if edited_paths is not None and not any(_rust_build_check_required(path) for path in edited_paths):
+        return "skipped-selection", None
+
+    build_result = build_runner.run(label="implementation-build")
+    if not build_result.ok:
+        append_follow_up_subtasks_file(plan_path, _make_build_follow_ups(build_result.summary))
+        return "failed", build_result.summary
+    return "passed", None
+
+
 def _evaluate_implementation_once(
     paths: RepoPaths,
     session_id: str,
@@ -302,6 +337,7 @@ def _evaluate_implementation_once(
     plan_display_path: str,
     exec_runner: StructuredExecRunner,
     test_runner: FinalTestRunner,
+    build_runner: BuildCheckRunner,
     sleep_fn: Callable[[float], None],
     edited_paths_provider: Callable[[Path], list[str] | None],
 ) -> ImplementationCheckResult:
@@ -337,6 +373,42 @@ def _evaluate_implementation_once(
         )
 
     if analysis.phase == "implementation":
+        build_status, build_summary = _run_selected_build_checks(
+            paths=paths,
+            plan_path=plan_path,
+            build_runner=build_runner,
+            edited_paths_provider=edited_paths_provider,
+        )
+        if build_status == "failed":
+            return ImplementationCheckResult(
+                status="blocked",
+                message=(
+                    "Implementation formatting/build checks failed. New follow-up subtasks were appended to the session plan. "
+                    f"Address them first. Failure summary: {build_summary}"
+                ),
+            )
+        if build_status == "passed":
+            return ImplementationCheckResult(
+                status="accepted",
+                message=(
+                    "All subtasks are complete and implementation formatting/build checks passed. "
+                    "Unit tests and reviewer execution were skipped because the session phase is `implementation`."
+                ),
+            )
+        if build_status == "skipped-no-changes":
+            return ImplementationCheckResult(
+                status="accepted",
+                message="All subtasks are complete and no files changed, so implementation formatting/build checks were skipped.",
+            )
+        return ImplementationCheckResult(
+            status="accepted",
+            message=(
+                "All subtasks are complete, implementation formatting/build checks were skipped because no Rust, Cargo.toml, "
+                "or cuda/ files changed, and unit tests plus reviewer execution were skipped because the session phase is `implementation`."
+            ),
+        )
+
+    if analysis.phase == "testing":
         test_status, test_summary = _run_selected_final_tests(
             paths=paths,
             plan_path=plan_path,
@@ -347,7 +419,7 @@ def _evaluate_implementation_once(
             return ImplementationCheckResult(
                 status="blocked",
                 message=(
-                    "Final tests failed. New follow-up subtasks were appended to the session plan. "
+                    "Testing-phase final tests failed. New follow-up subtasks were appended to the session plan. "
                     f"Address them first. Failure summary: {test_summary}"
                 ),
             )
@@ -355,36 +427,27 @@ def _evaluate_implementation_once(
             return ImplementationCheckResult(
                 status="accepted",
                 message=(
-                    "All subtasks are complete and the selected final tests passed. "
-                    "Reviewer execution was skipped because the session phase is `implementation`."
+                    "All subtasks are complete and testing-phase final tests passed. "
+                    "Reviewer execution was skipped because the session phase is `testing`."
                 ),
             )
         if test_status == "skipped-no-changes":
             return ImplementationCheckResult(
                 status="accepted",
-                message="All subtasks are complete and no files changed, so selected final tests were skipped.",
+                message="All subtasks are complete and no files changed, so testing-phase final tests were skipped.",
             )
         return ImplementationCheckResult(
             status="accepted",
             message=(
-                "All subtasks are complete, selected final tests were skipped because no Python, Rust, Cargo.toml, "
-                "or cuda/ files changed, and reviewer execution was skipped because the session phase is `implementation`."
+                "All subtasks are complete, testing-phase final tests were skipped because no Python, Rust, Cargo.toml, "
+                "or cuda/ files changed, and reviewer execution was skipped because the session phase is `testing`."
             ),
         )
 
-    test_status, test_summary = _run_selected_final_tests(
-        paths=paths,
-        plan_path=plan_path,
-        test_runner=test_runner,
-        edited_paths_provider=edited_paths_provider,
-    )
-    if test_status == "failed":
+    if analysis.phase != "review":
         return ImplementationCheckResult(
             status="blocked",
-            message=(
-                "Final tests failed. New follow-up subtasks were appended to the session plan. "
-                f"Address them first. Failure summary: {test_summary}"
-            ),
+            message=f"Unsupported approved workflow phase `{analysis.phase}`.",
         )
 
     review_result = _run_review_with_retry(
@@ -406,24 +469,9 @@ def _evaluate_implementation_once(
             ),
         )
 
-    if test_status == "passed":
-        return ImplementationCheckResult(
-            status="accepted",
-            message="All subtasks are complete, selected final tests passed, and reviewer approved.",
-            should_archive=True,
-        )
-    if test_status == "skipped-no-changes":
-        return ImplementationCheckResult(
-            status="accepted",
-            message="All subtasks are complete, no files changed so selected final tests were skipped, and reviewer approved.",
-            should_archive=True,
-        )
     return ImplementationCheckResult(
         status="accepted",
-        message=(
-            "All subtasks are complete, selected final tests were skipped because no Python, Rust, Cargo.toml, or "
-            "cuda/ files changed, and reviewer approved."
-        ),
+        message="All subtasks are complete and reviewer approved.",
         should_archive=True,
     )
 
@@ -435,6 +483,7 @@ def _run_implementation_loop(
     plan_display_path: str,
     exec_runner: StructuredExecRunner,
     test_runner: FinalTestRunner,
+    build_runner: BuildCheckRunner,
     sleep_fn: Callable[[float], None],
     edited_paths_provider: Callable[[Path], list[str] | None],
 ) -> HookOutcome:
@@ -446,6 +495,7 @@ def _run_implementation_loop(
             plan_display_path=plan_display_path,
             exec_runner=exec_runner,
             test_runner=test_runner,
+            build_runner=build_runner,
             sleep_fn=sleep_fn,
             edited_paths_provider=edited_paths_provider,
         )
@@ -501,6 +551,7 @@ def handle_stop(
     repo_root: Path,
     exec_runner: StructuredExecRunner | None = None,
     test_runner: FinalTestRunner | None = None,
+    build_runner: BuildCheckRunner | None = None,
     sleep_fn: Callable[[float], None] | None = None,
     edited_paths_provider: Callable[[Path], list[str] | None] | None = None,
 ) -> HookOutcome:
@@ -536,6 +587,7 @@ def handle_stop(
 
     exec_runner = exec_runner or CodexExecRunner(paths, session_id)
     test_runner = test_runner or ShellFinalTestRunner(paths, session_id)
+    build_runner = build_runner or ShellBuildCheckRunner(paths, session_id)
     sleep_fn = sleep_fn or time.sleep
     edited_paths_provider = edited_paths_provider or _default_edited_paths_provider
     return _run_implementation_loop(
@@ -545,6 +597,7 @@ def handle_stop(
         plan_display_path=plan_display_path,
         exec_runner=exec_runner,
         test_runner=test_runner,
+        build_runner=build_runner,
         sleep_fn=sleep_fn,
         edited_paths_provider=edited_paths_provider,
     )

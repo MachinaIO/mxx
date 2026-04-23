@@ -10,7 +10,7 @@ from .atomic import atomic_write_text
 PLAN_APPROVAL_HEADING = "## Plan approval"
 PLAN_APPROVAL_VALUES = {"approved", "unapproved"}
 PLAN_PHASE_HEADING = "## Phase"
-PLAN_PHASE_VALUES = {"planning", "implementation", "review"}
+PLAN_PHASE_VALUES = {"planning", "implementation", "testing", "review"}
 ORDERED_SUBTASKS_HEADING = "## Ordered subtasks"
 FOLLOW_UP_SUBTASKS_HEADING = "## Follow-up subtasks (append-only)"
 CHECKBOX_RE = re.compile(r"^\s*-\s\[(?P<mark>[ xX])\]\s+(?P<text>.+?)\s*$")
@@ -81,7 +81,7 @@ def render_session_plan(
     if approval_status == "unapproved" and phase != "planning":
         raise ValueError("phase must be `planning` while approval_status is `unapproved`")
     if approval_status == "approved" and phase == "planning":
-        raise ValueError("phase must be `implementation` or `review` while approval_status is `approved`")
+        raise ValueError("phase must be `implementation`, `testing`, or `review` while approval_status is `approved`")
     stamp = created_at or utc_now_rfc3339()
     return f"""# Session Plan: {session_id}
 
@@ -97,7 +97,7 @@ Describe the concrete user-visible outcome for this session.
 ## Constraints
 - Preserve completed subtasks as historical record.
 - Keep each implementation subtask small enough to complete, debug, and validate within one context window.
-- Run the most relevant unit tests immediately after each subtask before checking it off.
+- Run the most relevant local validation immediately after each subtask before checking it off.
 
 ## Repo facts / assumptions
 - Each workflow hook invocation must provide `session_id` in its JSON payload.
@@ -107,8 +107,9 @@ Describe the concrete user-visible outcome for this session.
 ## Acceptance criteria
 - The workflow harness uses repository-local Codex hooks.
 - Planning transitions to implementation only after plan approval.
-- Implementation stops run only the selected final tests; review stops run the selected final tests and then the reviewer until acceptance.
-- Final completion requires the review-phase stop hook to block with actionable resume messages until all tracked checkboxes are checked, final tests pass, and the reviewer approves.
+- Implementation stops run only formatting and build checks.
+- Testing stops run the selected final tests.
+- Final completion requires the review-phase stop hook to block with actionable resume messages until all tracked checkboxes are checked and the reviewer approves.
 
 {ORDERED_SUBTASKS_HEADING}
 - [ ] Replace this placeholder with the first approved implementation subtask.
@@ -117,11 +118,12 @@ Describe the concrete user-visible outcome for this session.
 - [x] No follow-up subtasks have been added yet.
 
 ## Per-subtask validation
-- Record the test command and result immediately after each completed subtask.
+- Record the validation command and result immediately after each completed subtask.
 
 ## Final validation
-- Implementation-phase stop hook ran only the selected final tests
-- Review-phase stop hook blocked with actionable resume messages until all tracked plan checkboxes were checked, final tests passed, and the reviewer accepted
+- Implementation-phase stop hook ran only formatting and build checks
+- Testing-phase stop hook ran the selected final `scripts/run_tests.sh` gate
+- Review-phase stop hook blocked with actionable resume messages until all tracked plan checkboxes were checked and the reviewer accepted
 - `scripts/run_tests.sh`
 - Hooks-disabled read-only reviewer via `codex exec` until acceptance
 

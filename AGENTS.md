@@ -19,6 +19,7 @@ This repository uses a long-running Codex session workflow governed by `BUILDER.
 - Treat `## Plan approval` and `## Phase` in the session plan as the workflow state.
 - The builder behaves differently by plan approval status:
 - - When `## Plan approval` is `unapproved`, stay in planning: interview the user, revise the session plan, and ask for explicit approval.
-- - When `## Plan approval` is `approved` and `## Phase` is `implementation`, execute the approved subtasks, run the most relevant tests after each subtask, and only then check the subtask off.
-- - When `## Plan approval` is `approved` and `## Phase` is `review`, address only the concrete follow-up work created by review-phase tests or reviewer feedback, keeping completed historical subtasks intact.
+- - When `## Plan approval` is `approved` and `## Phase` is `implementation`, execute the approved subtasks, run the narrowest relevant local validation after each subtask, and only then check the subtask off. The implementation-phase stop hook checks only unfinished tasks plus formatting/build.
+- - When `## Plan approval` is `approved` and `## Phase` is `testing`, run or address the selected unit-test gate before entering review.
+- - When `## Plan approval` is `approved` and `## Phase` is `review`, address only the concrete follow-up work created by reviewer feedback, keeping completed historical subtasks intact.
 - Keep the session plan in sync with the work; detailed phase transitions and hook behavior live in the documents above.

@@ -2,7 +2,7 @@
 
 This repository uses a self-contained plan style for long-running Codex work. Each session plan must be detailed enough that a new contributor, starting only from the current working tree and the single session plan file, can understand the goal, continue the work, and validate the result.
 
-The session plan is also the workflow state. `## Plan approval` tells the workflow whether the session is still in planning or has entered approved work, and `## Phase` tells the workflow whether approved work is still in `implementation` or has advanced into `review`.
+The session plan is also the workflow state. `## Plan approval` tells the workflow whether the session is still in planning or has entered approved work, and `## Phase` tells the workflow whether approved work is in `implementation`, `testing`, or `review`.
 
 ## General Plan Rules
 - Every session plan must be fully self-contained. Do not rely on external articles, prior chat context, or undocumented repository knowledge.
@@ -22,7 +22,8 @@ The session plan is also the workflow state. `## Plan approval` tells the workfl
 - Explicit review-only sessions are outside this session-plan workflow: the session-start hook classifies them from the initial user prompt, does not create `plans/active/session-<session_id>.md`, and the stop hook later exits without workflow coordination when both `plans/active/session-<session_id>.md` and `plans/completed/session-<session_id>.md` are absent.
 - While `## Plan approval` is `unapproved`, the builder stays in planning, keeps `## Phase` at `planning`, revises the plan with the user, and does not implement code yet.
 - When the user explicitly approves the plan, the builder updates `## Plan approval` to `approved`, sets `## Phase` to `implementation`, and starts implementation from the same plan.
-- When the user explicitly requests review during implementation, the builder updates `## Phase` from `implementation` to `review` and stops immediately so the review-phase stop-hook gates take over.
+- After implementation formatting/build checks pass, the builder updates `## Phase` from `implementation` to `testing` and stops immediately so the testing-phase stop-hook gate takes over.
+- After testing-phase final tests pass, the builder updates `## Phase` from `testing` to `review` and stops immediately so the review-phase stop-hook gate takes over.
 - Workflow helpers derive the active session strictly from each hook payload; do not rely on repository-global pointer files.
 - When implementing from a session plan, proceed to the next milestone or unchecked subtask without asking the user for "next steps" unless a real blocker remains.
 - Keep the plan synchronized with reality at every stop point. If a partially completed task needs to be split into "done" and "remaining" work, update the plan immediately.
@@ -34,17 +35,18 @@ The session plan is also the workflow state. `## Plan approval` tells the workfl
 ## Working Rules
 - Narrative sections such as Goal, Constraints, Repo facts / assumptions, and Acceptance criteria should be written in plain prose first. Use bullets only when they make the plan clearer.
 - When Rust formatting is needed, use `cargo +nightly fmt --all`.
-- After each subtask, run the most relevant unit tests immediately so bugs are caught with the smallest possible change scope.
+- After each subtask, run the narrowest relevant local validation immediately so bugs are caught with the smallest possible change scope.
 - Do not run integration tests unless the user has explicitly requested them in the current session; otherwise keep validation scoped to the narrowest relevant tests and record that limitation in the plan when it matters.
 - Each subtask must be small enough that implementation plus debugging fits within one context window.
 - If multiple subtasks do not touch the same files and do not require shared context, the builder should actively parallelize them with sub agents.
 - Session-specific plans are living documents and must be updated throughout the task.
-- Completed subtasks must remain preserved as historical record. If tests fail or review finds problems later, add NEW follow-up subtasks instead of rewriting prior completed work.
+- Completed subtasks must remain preserved as historical record. If build checks, tests, or review find problems later, add NEW follow-up subtasks instead of rewriting prior completed work.
 - Completed checkboxes must never be rewritten back into unchecked boxes.
 - While `## Plan approval` is `unapproved`, the stop hook does no workflow coordination beyond allowing the stop.
 - Once `## Plan approval` is `approved`, the stop hook first reevaluates the current session plan. If unchecked implementation work remains, it blocks the current turn with an actionable resume message.
-- When approved work is in `implementation`, the stop hook runs only the selected final tests after all tracked checkboxes are checked. Passing tests allow the stop without launching the reviewer or archiving the session.
-- When approved work is in `review`, the stop hook runs the selected final tests and then the reviewer checks. Only failed final tests or non-accepting reviewer results append new follow-up tasks and then block the turn so the same session can continue.
+- When approved work is in `implementation`, the stop hook runs only formatting and build checks after all tracked checkboxes are checked. Passing checks allow the stop without running unit tests, launching the reviewer, or archiving the session.
+- When approved work is in `testing`, the stop hook runs the selected final tests after all tracked checkboxes are checked. Failed final tests append new follow-up tasks and then block the turn so the same session can continue.
+- When approved work is in `review`, the stop hook runs the reviewer check after all tracked checkboxes are checked. Non-accepting reviewer results append new follow-up tasks and then block the turn so the same session can continue.
 - Acceptance criteria must describe observable behavior, not only internal code structure.
 - Per-subtask and final validation entries must name the exact command that was run and enough result detail to distinguish success from failure.
 - When work spans multiple files or subsystems, the plan should briefly orient the reader by naming the affected paths and how they fit together.
@@ -85,7 +87,7 @@ Describe the concrete user-visible outcome for this session.
 - Record the most relevant validation command and result immediately after each completed subtask.
 
 ## Final validation
-- Record whether the implementation-phase stop hook passed its selected tests, and then record the review-phase final test gate plus repeated review gate here.
+- Record whether the implementation-phase stop hook passed formatting/build checks, whether the testing-phase final test gate passed, and whether the review-phase reviewer accepted here.
 
 ## Decision log
 - Append important decisions with timestamps.
@@ -96,11 +98,11 @@ Describe the concrete user-visible outcome for this session.
 
 ## Subtask Rules
 - `## Plan approval` must contain exactly one machine-readable value: `approved` or `unapproved`.
-- `## Phase` must contain exactly one machine-readable value: `planning`, `implementation`, or `review`.
+- `## Phase` must contain exactly one machine-readable value: `planning`, `implementation`, `testing`, or `review`.
 - `## Phase` must stay `planning` while `## Plan approval` is `unapproved`.
-- When `## Plan approval` is `approved`, `## Phase` must be `implementation` or `review`.
+- When `## Plan approval` is `approved`, `## Phase` must be `implementation`, `testing`, or `review`.
 - Both `## Ordered subtasks` and `## Follow-up subtasks (append-only)` must use markdown checkboxes.
-- If tests fail or review finds problems after some tasks were completed, add NEW unchecked items under `## Follow-up subtasks (append-only)`.
+- If build checks, tests, or review find problems after some tasks were completed, add NEW unchecked items under `## Follow-up subtasks (append-only)`.
 - Do not rewrite or delete completed historical subtasks.
 - Do not remove prior reviewer or validation obligations from the plan. Add new unchecked follow-up items instead.
-- Assume the stop hook may block the turn multiple times in one completion cycle after the plan is approved, and may rerun the reviewer multiple times once the phase is `review`; keep the plan accurate enough that the same session can resume from the file alone.
+- Assume the stop hook may block the turn multiple times in one completion cycle after the plan is approved, may rerun selected final tests while the phase is `testing`, and may rerun the reviewer multiple times once the phase is `review`; keep the plan accurate enough that the same session can resume from the file alone.

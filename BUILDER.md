@@ -25,26 +25,36 @@ At the start of each turn:
 - Read the session plan and work through subtasks in order.
 - If the current work touches CUDA, GPU kernels, GPU wrappers, GPU tests, or GPU-facing performance-sensitive behavior, read [GPU.md](GPU.md) and follow its principles.
 - When Rust formatting is needed, use `cargo +nightly fmt --all`.
-- After finishing a subtask, run its related tests immediately.
+- After finishing a subtask, run the narrowest relevant local validation immediately.
 - Do not run integration tests unless the user has explicitly instructed you to do so in the current session. Until then, keep validation limited to the narrowest relevant tests.
 - Only after the related tests pass, mark that subtask checkbox as checked.
 - Update the per-subtask validation, progress log, and decision log as work proceeds.
-- If final tests or reviewer feedback create new obligations, do NOT rewrite existing subtasks or erase completed checkmarks.
+- If build checks, testing, or reviewer feedback create new obligations, do NOT rewrite existing subtasks or erase completed checkmarks.
 - Instead, append NEW unchecked follow-up subtasks under `## Follow-up subtasks (append-only)` and continue implementing those follow-up subtasks.
-- Expect the outer stop hook to block the current turn when the approved session plan still has unchecked work or when final-test failures append new follow-up tasks. If all tracked checkboxes are already checked and the selected final tests pass, the implementation-phase stop hook may accept without running the reviewer.
-- If the user explicitly says to perform review while the session is in `implementation`, update `## Phase` to `review`, record that transition in the plan log, and stop immediately so the next stop-hook pass runs the review-phase gates instead of continuing normal implementation.
+- Expect the outer stop hook to block the current turn when the approved session plan still has unchecked work or when implementation formatting/build checks append new follow-up tasks. If all tracked checkboxes are already checked and formatting/build checks pass or are not selected, the implementation-phase stop hook may accept without running unit tests or the reviewer.
+- When implementation is complete and formatting/build checks have passed, update `## Phase` to `testing`, record that transition in the plan log, and stop so the testing-phase stop hook runs the selected final tests.
 - If independent subtasks do not share files or mutable context, parallelize them with sub agents.
 - If subtasks share files or shared mutable context, do not parallelize them.
 
+## Testing
+- Testing corresponds to `## Plan approval` being `approved` and `## Phase` being `testing`.
+- Treat this as the unit-test gate between implementation and review.
+- Keep using the same approved session plan. Do not reset `## Phase` back to `implementation`.
+- Expect the outer stop hook to run the selected final tests using the same changed-file selection policy as `scripts/run_tests.sh`.
+- If testing-phase final tests fail, append NEW unchecked follow-up subtasks and return to implementation work for those follow-ups.
+- When testing-phase final tests pass or are not selected, update `## Phase` to `review`, record that transition in the plan log, and stop so the review-phase stop hook runs the read-only reviewer.
+
 ## Review
 - Review corresponds to `## Plan approval` being `approved` and `## Phase` being `review`.
-- Treat this as the post-implementation acceptance loop: address only the concrete follow-up work created by review-phase tests or reviewer feedback, keeping completed historical subtasks intact.
+- Treat this as the post-testing acceptance loop: address only the concrete follow-up work created by reviewer feedback, keeping completed historical subtasks intact.
 - Keep using the same approved session plan. Do not reset `## Phase` back to `implementation`.
-- Expect the outer stop hook to run the selected final tests and then the hooks-disabled read-only reviewer on every stop while the phase remains `review`.
-- If review-phase final tests fail or the reviewer returns `revision`, append NEW unchecked follow-up subtasks and continue until the review-phase stop hook can finish with reviewer `accept`.
+- Expect the outer stop hook to run the hooks-disabled read-only reviewer on every stop while the phase remains `review`.
+- If the reviewer returns `revision`, append NEW unchecked follow-up subtasks and continue until the review-phase stop hook can finish with reviewer `accept`.
+- If reviewer follow-up work changes code or testable behavior, move the plan back to `testing` before final review so the selected final tests run again.
 
 ## Strong Rule
 - Do not end the turn before the job is actually complete.
 - In planning, complete the turn only after the plan has been updated and the user has been asked for approval or revisions.
-- In implementation, the outer stop hook owns the selected final tests and does not run the reviewer. Builder turns should stop only after the plan's tracked checkboxes are fully satisfied and current test feedback has been incorporated.
-- In review, the outer stop hook owns the final `scripts/run_tests.sh` selection plus the reviewer acceptance loop. Builder turns should stop only after the plan's tracked checkboxes are fully satisfied and current feedback has been incorporated; if those gates reveal remaining work, the stop hook blocks the turn so the same session can continue addressing it.
+- In implementation, the outer stop hook owns formatting/build checks and does not run unit tests or the reviewer. Builder turns should stop only after the plan's tracked checkboxes are fully satisfied and current build feedback has been incorporated.
+- In testing, the outer stop hook owns the final `scripts/run_tests.sh` selection and does not run the reviewer. Builder turns should stop only after the plan's tracked checkboxes are fully satisfied and current test feedback has been incorporated.
+- In review, the outer stop hook owns the reviewer acceptance loop. Builder turns should stop only after the plan's tracked checkboxes are fully satisfied and current reviewer feedback has been incorporated; if those gates reveal remaining work, the stop hook blocks the turn so the same session can continue addressing it.

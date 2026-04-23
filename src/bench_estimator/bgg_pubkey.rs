@@ -9,6 +9,7 @@ use crate::{
     slot_transfer::SlotTransferEvaluator,
 };
 use num_bigint::BigUint;
+use num_traits::ToPrimitive;
 use tracing::debug;
 
 use super::{
@@ -36,18 +37,49 @@ impl SampleAuxBenchEstimate {
         )
     }
 
+    pub fn from_chunk_with_big_count(
+        latency: f64,
+        total_chunk_count: BigUint,
+        chunk_compact_bytes: usize,
+        base_compact_bytes: BigUint,
+    ) -> Self {
+        let total_time = total_chunk_count
+            .to_f64()
+            .map(|chunk_count| latency * chunk_count)
+            .unwrap_or(f64::INFINITY);
+        Self {
+            total_time,
+            latency,
+            compact_bytes: base_compact_bytes +
+                BigUint::from(chunk_compact_bytes) * total_chunk_count,
+        }
+    }
+
+    pub fn from_chunk_big_count(
+        latency: f64,
+        total_chunk_count: BigUint,
+        chunk_compact_bytes: usize,
+    ) -> Self {
+        Self::from_chunk_with_big_count(
+            latency,
+            total_chunk_count,
+            chunk_compact_bytes,
+            BigUint::default(),
+        )
+    }
+
     pub fn from_chunk_with_base(
         latency: f64,
         total_chunk_count: usize,
         chunk_compact_bytes: usize,
         base_compact_bytes: BigUint,
     ) -> Self {
-        Self {
-            total_time: latency * total_chunk_count as f64,
+        Self::from_chunk_with_big_count(
             latency,
-            compact_bytes: base_compact_bytes +
-                BigUint::from(chunk_compact_bytes) * BigUint::from(total_chunk_count),
-        }
+            BigUint::from(total_chunk_count),
+            chunk_compact_bytes,
+            base_compact_bytes,
+        )
     }
 }
 
@@ -367,6 +399,16 @@ mod tests {
     use tempfile::tempdir;
 
     struct DummyPublicLutEstimator;
+
+    #[test]
+    fn sample_aux_big_chunk_counts_do_not_overflow() {
+        let total_chunk_count = BigUint::from(usize::MAX) * BigUint::from(2u8);
+        let estimate =
+            SampleAuxBenchEstimate::from_chunk_big_count(0.25, total_chunk_count.clone(), 3);
+        assert!(estimate.total_time.is_finite());
+        assert_eq!(estimate.latency, 0.25);
+        assert_eq!(estimate.compact_bytes, total_chunk_count * BigUint::from(3u8));
+    }
 
     impl PublicLutSampleAuxBenchEstimator<DCRTPolyMatrix> for DummyPublicLutEstimator {
         type Params = <DCRTPoly as Poly>::Params;

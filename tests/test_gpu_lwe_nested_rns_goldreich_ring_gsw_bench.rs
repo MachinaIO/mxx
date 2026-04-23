@@ -224,7 +224,7 @@ impl GoldreichRingGswBenchConfig {
     fn bench_dir_base(&self, crt_depth: usize) -> String {
         self.dir_name_override.clone().unwrap_or_else(|| {
             format!(
-                "test_data/test_gpu_lwe_goldreich_ring_gsw_bench_ring{}_in{}_out{}_active{}_crt{}_depth{}",
+                "test_data/test_gpu_lwe_nested_rns_goldreich_ring_gsw_bench_ring{}_in{}_out{}_active{}_crt{}_depth{}",
                 self.ring_dim,
                 self.input_size,
                 self.output_size,
@@ -592,7 +592,7 @@ fn build_lwe_pubkey_plt_evaluator(
 }
 
 #[tokio::test]
-async fn test_gpu_lwe_goldreich_ring_gsw_bench() {
+async fn test_gpu_lwe_nested_rns_goldreich_ring_gsw_bench() {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
     gpu_device_sync();
 
@@ -608,9 +608,9 @@ async fn test_gpu_lwe_goldreich_ring_gsw_bench() {
         detected_gpu_ids.len(),
         "detected GPU count and ids length must match"
     );
-    let single_gpu_id = *detected_gpu_ids
-        .first()
-        .expect("at least one GPU device is required for test_gpu_lwe_goldreich_ring_gsw_bench");
+    let single_gpu_id = *detected_gpu_ids.first().expect(
+        "at least one GPU device is required for test_gpu_lwe_nested_rns_goldreich_ring_gsw_bench",
+    );
     let params = GpuDCRTPolyParams::new_with_gpu(
         cpu_params.ring_dimension(),
         moduli,
@@ -786,13 +786,13 @@ async fn test_gpu_lwe_goldreich_ring_gsw_bench() {
     );
     let (_poly_bench_public_lut_one, poly_bench_shared_input) =
         constant_and_shared_benchmark_pubkeys(&poly_bench_pubkeys);
-    let poly_bench_b_matrix = poly_bench_shared_input.matrix.clone();
     let poly_bench_pubkey_plt_evaluator = build_lwe_pubkey_plt_evaluator(
         &params,
         DEFAULT_BENCH_SEED,
         cfg.d_secret,
         poly_bench_dir.clone(),
     );
+    let poly_bench_pubkey_plt_matrix = Arc::clone(&poly_bench_pubkey_plt_evaluator.pub_matrix);
     let poly_bench_pubkey_slot_evaluator = GpuPubKeySlotEvaluator::new(
         DEFAULT_BENCH_SEED,
         cfg.d_secret,
@@ -839,6 +839,9 @@ async fn test_gpu_lwe_goldreich_ring_gsw_bench() {
             .load_slot_secret_mats_checkpoint(&params)
             .expect("one-slot slot secret matrix checkpoints must exist for poly benchmark"),
     );
+    let poly_bench_b0_matrix = poly_bench_pubkey_slot_evaluator
+        .load_b0_matrix_checkpoint(&params)
+        .expect("one-slot b0 matrix checkpoint must exist for poly benchmark");
     let bench_slot_checkpoint_prefix = poly_bench_pubkey_slot_evaluator.checkpoint_prefix(&params);
     drop(poly_bench_pubkey_plt_evaluator);
     drop(poly_bench_pubkey_slot_evaluator);
@@ -871,11 +874,11 @@ async fn test_gpu_lwe_goldreich_ring_gsw_bench() {
         GpuPolyPltEvaluator::build_c_b_compact_bytes_by_slot::<GpuDCRTPolyUniformSampler>(
             &params,
             &bench_s_vec,
-            &poly_bench_b_matrix,
+            poly_bench_pubkey_plt_matrix.as_ref(),
             &bench_slot_secret_mats,
             Some(cfg.error_sigma),
         );
-    let mut bench_slot_c_b0 = bench_s_vec.clone() * &poly_bench_b_matrix;
+    let mut bench_slot_c_b0 = bench_s_vec.clone() * &poly_bench_b0_matrix;
     if cfg.error_sigma != 0.0 {
         let slot_c_b0_error = uniform_sampler.sample_uniform(
             &params,

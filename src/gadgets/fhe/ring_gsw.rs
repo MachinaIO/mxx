@@ -2744,7 +2744,7 @@ mod tests {
         let crt_depth = 1usize;
         let ring_dim = 1u32 << 16;
         let num_slots = 1usize << 16;
-        let limb_bit_size = 3usize;
+        let limb_bit_size = 7usize;
 
         let mul1_disk_dir = tempdir().expect("create temp dir for disk-backed sub-circuits");
         let mut circuit = PolyCircuit::<DCRTPoly>::new();

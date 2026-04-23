@@ -24,8 +24,12 @@
 //! XOR composition balanced instead of chaining it left-to-right.
 use crate::{
     circuit::{BatchedWire, PolyCircuit},
-    gadgets::fhe::ring_gsw_nested_rns::{
-        NestedRnsRingGswCiphertext as RingGswCiphertext, NestedRnsRingGswContext as RingGswContext,
+    gadgets::{
+        arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner},
+        fhe::{
+            ring_gsw::{RingGswCiphertext, RingGswContext},
+            ring_gsw_nested_rns::NestedRnsRingGswCiphertext,
+        },
     },
     poly::Poly,
 };
@@ -55,8 +59,11 @@ pub trait BooleanCiphertext<P: Poly>: Clone {
     fn from_sub_circuit_outputs(template: &Self, outputs: &[BatchedWire]) -> Self;
 }
 
-impl<P: Poly + 'static> BooleanCiphertext<P> for RingGswCiphertext<P> {
-    type Context = RingGswContext<P>;
+impl<P: Poly + 'static, A> BooleanCiphertext<P> for RingGswCiphertext<P, A>
+where
+    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
+{
+    type Context = RingGswContext<P, A>;
 
     fn context(&self) -> &Arc<Self::Context> {
         &self.ctx
@@ -316,7 +323,7 @@ impl GoldreichGraph {
 /// dimensions. Those values are setup-time constants rather than runtime circuit inputs; the only
 /// runtime inputs to [`GoldreichFhePrg::evaluate`] are encrypted secret bits.
 #[derive(Debug, Clone)]
-pub struct GoldreichFhePrg<P: Poly, C: BooleanCiphertext<P> = RingGswCiphertext<P>> {
+pub struct GoldreichFhePrg<P: Poly, C: BooleanCiphertext<P> = NestedRnsRingGswCiphertext<P>> {
     pub ring_gsw: Arc<C::Context>,
     pub input_size: usize,
     pub output_size: usize,
@@ -459,7 +466,7 @@ where
 /// `2n` distinct Goldreich graphs from a public seed, registers one reusable CBD coefficient
 /// sub-circuit for that `n`, and then evaluates one centered-binomial-style error ciphertext per
 /// output position.
-pub struct GoldreichFheCbdError<P: Poly, C: BooleanCiphertext<P> = RingGswCiphertext<P>> {
+pub struct GoldreichFheCbdError<P: Poly, C: BooleanCiphertext<P> = NestedRnsRingGswCiphertext<P>> {
     pub uniform_prg: GoldreichFhePrg<P, C>,
     pub cbd_n: usize,
     uniform_graphs: Vec<GoldreichGraph>,

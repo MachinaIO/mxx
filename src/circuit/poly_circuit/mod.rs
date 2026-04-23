@@ -414,12 +414,6 @@ pub(crate) struct GroupedExecutionPlan {
     pub(crate) reachable_input_gate_ids: Vec<GateId>,
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub(crate) struct NonFreeDepthCacheKey {
-    circuit_key: usize,
-    input_levels: Box<[u32]>,
-}
-
 #[derive(Clone)]
 pub struct PolyCircuit<P: Poly> {
     pub(crate) gates: BTreeMap<GateId, PolyGate>,

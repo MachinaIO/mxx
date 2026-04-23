@@ -224,7 +224,7 @@ impl GoldreichRingGswBenchConfig {
     fn bench_dir_base(&self, crt_depth: usize) -> String {
         self.dir_name_override.clone().unwrap_or_else(|| {
             format!(
-                "test_data/test_gpu_lwe_goldreich_ring_gsw_bench_ring{}_in{}_out{}_active{}_crt{}_depth{}",
+                "test_data/test_gpu_lwe_nested_rns_goldreich_ring_gsw_bench_ring{}_in{}_out{}_active{}_crt{}_depth{}",
                 self.ring_dim,
                 self.input_size,
                 self.output_size,
@@ -592,7 +592,7 @@ fn build_lwe_pubkey_plt_evaluator(
 }
 
 #[tokio::test]
-async fn test_gpu_lwe_goldreich_ring_gsw_bench() {
+async fn test_gpu_lwe_nested_rns_goldreich_ring_gsw_bench() {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
     gpu_device_sync();
 
@@ -608,9 +608,9 @@ async fn test_gpu_lwe_goldreich_ring_gsw_bench() {
         detected_gpu_ids.len(),
         "detected GPU count and ids length must match"
     );
-    let single_gpu_id = *detected_gpu_ids
-        .first()
-        .expect("at least one GPU device is required for test_gpu_lwe_goldreich_ring_gsw_bench");
+    let single_gpu_id = *detected_gpu_ids.first().expect(
+        "at least one GPU device is required for test_gpu_lwe_nested_rns_goldreich_ring_gsw_bench",
+    );
     let params = GpuDCRTPolyParams::new_with_gpu(
         cpu_params.ring_dimension(),
         moduli,

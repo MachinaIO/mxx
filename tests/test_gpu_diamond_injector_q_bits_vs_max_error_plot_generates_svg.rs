@@ -1,30 +1,47 @@
+#![cfg(feature = "gpu")]
+
+use bigdecimal::BigDecimal;
 use keccak_asm::Keccak256;
 use mxx::{
-    input_injector::DiamondInjector,
-    matrix::dcrt_poly::DCRTPolyMatrix,
-    poly::dcrt::params::DCRTPolyParams,
+    bgg::{encoding::BggEncoding, public_key::BggPublicKey},
+    element::PolyElem,
+    input_injector::{DiamondInjector, InputInjector},
+    matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
+    poly::{
+        Poly, PolyParams,
+        dcrt::{
+            gpu::{GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync},
+            params::DCRTPolyParams,
+        },
+    },
     sampler::{
-        hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
-        uniform::DCRTPolyUniformSampler,
+        DistType, PolyHashSampler,
+        gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
+        trapdoor::GpuDCRTPolyTrapdoorSampler,
     },
     utils::bigdecimal_bits_ceil,
 };
+use num_bigint::{BigInt, BigUint};
+use num_traits::Zero;
+use rand::Rng;
 use std::{
     env,
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
 };
+use tempfile::tempdir;
 use tracing::info;
 
 type TestInjector = DiamondInjector<
-    DCRTPolyMatrix,
-    DCRTPolyUniformSampler,
-    DCRTPolyHashSampler<Keccak256>,
-    DCRTPolyTrapdoorSampler,
+    GpuDCRTPolyMatrix,
+    GpuDCRTPolyUniformSampler,
+    GpuDCRTPolyHashSampler<Keccak256>,
+    GpuDCRTPolyTrapdoorSampler,
 >;
 
-const DIAMOND_INJECTOR_HASH_KEY: [u8; 32] = [29u8; 32];
 const DIAMOND_INJECTOR_DECODER_COUNT: usize = 1;
 const DIAMOND_INJECTOR_TRAPDOOR_SIGMA: f64 = 4.578;
 const DIAMOND_INJECTOR_ERROR_SIGMA: f64 = 4.578;
@@ -37,8 +54,10 @@ const DEFAULT_MAX_CRT_DEPTH: usize = 64;
 
 #[derive(Debug, Clone)]
 struct ErrorPoint {
+    crt_depth: usize,
     q_bits: usize,
     max_error_bits: u64,
+    max_error: BigDecimal,
 }
 
 fn env_or_default_u32(key: &str, default: u32) -> u32 {
@@ -71,6 +90,252 @@ fn normalize_bits(value: f64, min: f64, max: f64) -> f64 {
 fn u64_to_usize(value: u64, context: &str) -> usize {
     usize::try_from(value)
         .unwrap_or_else(|_| panic!("{context}={value} must fit into usize for SVG plotting"))
+}
+
+fn gpu_params_for_crt_depth(
+    ring_dim: u32,
+    crt_depth: usize,
+    crt_bits: usize,
+    base_bits: u32,
+    gpu_ids: &[i32],
+) -> GpuDCRTPolyParams {
+    let cpu_params = DCRTPolyParams::new(ring_dim, crt_depth, crt_bits, base_bits);
+    let (moduli, _, _) = cpu_params.to_crt();
+    GpuDCRTPolyParams::new_with_gpu(
+        cpu_params.ring_dimension(),
+        moduli,
+        cpu_params.base_bits(),
+        gpu_ids.to_vec(),
+        Some(gpu_ids.len() as u32),
+    )
+}
+
+fn sample_pubkey(
+    params: &GpuDCRTPolyParams,
+    hash_key: [u8; 32],
+    tag: &str,
+) -> BggPublicKey<GpuDCRTPolyMatrix> {
+    let matrix = GpuDCRTPolyHashSampler::<Keccak256>::new().sample_hash(
+        params,
+        hash_key,
+        tag,
+        1,
+        params.modulus_digits(),
+        DistType::FinRingDist,
+    );
+    BggPublicKey::new(matrix, true)
+}
+
+fn secret_checkpoint_id(level: usize, digit_value: usize) -> String {
+    format!("diamond_secret_{level}_{digit_value}")
+}
+
+fn read_checkpoint_matrix(
+    params: &GpuDCRTPolyParams,
+    dir_path: &Path,
+    id: &str,
+) -> GpuDCRTPolyMatrix {
+    let path = dir_path.join(format!("{id}.matrixbin"));
+    let bytes = fs::read(&path).unwrap_or_else(|e| {
+        panic!("failed to read DiamondInjector checkpoint {}: {e}", path.display())
+    });
+    GpuDCRTPolyMatrix::from_compact_bytes(params, &bytes)
+}
+
+fn reconstruct_secret_product(
+    params: &GpuDCRTPolyParams,
+    dir_path: &Path,
+    input_digits: &[u32],
+) -> GpuDCRTPolyMatrix {
+    let mut secret_product = read_checkpoint_matrix(params, dir_path, "diamond_secret_epsilon");
+    for (digit_idx, digit_value) in input_digits.iter().copied().enumerate() {
+        let digit_secret = read_checkpoint_matrix(
+            params,
+            dir_path,
+            &secret_checkpoint_id(digit_idx + 1, digit_value as usize),
+        );
+        secret_product = secret_product * digit_secret;
+    }
+    secret_product
+}
+
+fn centered_abs(value: &BigUint, modulus: &BigUint, half_modulus: &BigUint) -> BigUint {
+    if value > half_modulus { modulus - value } else { value.clone() }
+}
+
+fn matrix_centered_max_abs(params: &GpuDCRTPolyParams, matrix: &GpuDCRTPolyMatrix) -> BigUint {
+    let modulus: Arc<BigUint> = params.modulus();
+    let half_modulus = modulus.as_ref() >> 1usize;
+    let mut max_abs = BigUint::zero();
+    for row_idx in 0..matrix.row_size() {
+        for col_idx in 0..matrix.col_size() {
+            for coeff in matrix.entry(row_idx, col_idx).coeffs() {
+                let abs = centered_abs(coeff.value(), modulus.as_ref(), &half_modulus);
+                if abs > max_abs {
+                    max_abs = abs;
+                }
+            }
+        }
+    }
+    max_abs
+}
+
+fn assert_residual_below_bound(
+    label: &str,
+    params: &GpuDCRTPolyParams,
+    residual: &GpuDCRTPolyMatrix,
+    max_error: &BigDecimal,
+) {
+    let residual_abs = matrix_centered_max_abs(params, residual);
+    let residual_error = BigDecimal::from(BigInt::from(residual_abs.clone()));
+    info!(
+        "diamond injector residual check: {label}, residual_bits={}, max_error_bits={}",
+        bigdecimal_bits_ceil(&residual_error),
+        bigdecimal_bits_ceil(max_error)
+    );
+    assert!(
+        residual_error < *max_error,
+        "{label} residual error {} must be less than simulated max_error {}",
+        residual_abs,
+        max_error
+    );
+}
+
+fn assert_encoding_residual_below_bound(
+    label: &str,
+    params: &GpuDCRTPolyParams,
+    encoding: &BggEncoding<GpuDCRTPolyMatrix>,
+    secret_product: &GpuDCRTPolyMatrix,
+    pubkey: &BggPublicKey<GpuDCRTPolyMatrix>,
+    plaintext: <GpuDCRTPolyMatrix as PolyMatrix>::P,
+    max_error: &BigDecimal,
+) {
+    let gadget = GpuDCRTPolyMatrix::gadget_matrix(params, 1);
+    let s_times_pubkey = secret_product.clone() * &pubkey.matrix;
+    let s_times_plaintext_gadget = (secret_product.clone() * gadget) * plaintext;
+    let residual = encoding.vector.clone() - s_times_pubkey + s_times_plaintext_gadget;
+    assert_residual_below_bound(label, params, &residual, max_error);
+}
+
+fn assert_decoder_residual_below_bound(
+    label: &str,
+    params: &GpuDCRTPolyParams,
+    decoder: &BggEncoding<GpuDCRTPolyMatrix>,
+    secret_product: &GpuDCRTPolyMatrix,
+    pubkey: &BggPublicKey<GpuDCRTPolyMatrix>,
+    max_error: &BigDecimal,
+) {
+    let residual = decoder.vector.clone() - (secret_product.clone() * &pubkey.matrix);
+    assert_residual_below_bound(label, params, &residual, max_error);
+}
+
+fn verify_gpu_online_eval_errors_below_simulation(
+    hash_key: [u8; 32],
+    ring_dim: u32,
+    crt_bits: usize,
+    base_bits: u32,
+    input_count: usize,
+    input_base: usize,
+    digit_bits: u32,
+    crossing_point: &ErrorPoint,
+    gpu_ids: &[i32],
+) {
+    assert!(
+        input_base <= u32::MAX as usize,
+        "input_base must fit into u32 because online_eval receives u32 input digits"
+    );
+
+    let params =
+        gpu_params_for_crt_depth(ring_dim, crossing_point.crt_depth, crt_bits, base_bits, gpu_ids);
+    let dir =
+        tempdir().expect("temporary DiamondInjector preprocessing directory should be created");
+    let injector = TestInjector::new(
+        params.clone(),
+        hash_key,
+        input_count,
+        input_base,
+        DIAMOND_INJECTOR_DECODER_COUNT,
+        DIAMOND_INJECTOR_TRAPDOOR_SIGMA,
+        DIAMOND_INJECTOR_ERROR_SIGMA,
+        dir.path().to_path_buf(),
+    );
+
+    let one_pubkey = sample_pubkey(&params, hash_key, "diamond_plot_one_pubkey");
+    let input_pubkeys = (0..input_count)
+        .map(|digit_idx| {
+            sample_pubkey(&params, hash_key, &format!("diamond_plot_input_pubkey_{digit_idx}"))
+        })
+        .collect::<Vec<_>>();
+    let decoder_pubkeys = (0..DIAMOND_INJECTOR_DECODER_COUNT)
+        .map(|decoder_idx| {
+            sample_pubkey(&params, hash_key, &format!("diamond_plot_decoder_pubkey_{decoder_idx}"))
+        })
+        .collect::<Vec<_>>();
+    let mut rng = rand::rng();
+    let input_digits =
+        (0..input_count).map(|_| rng.random_range(0..input_base) as u32).collect::<Vec<_>>();
+
+    gpu_device_sync();
+    info!(
+        "diamond injector gpu preprocess: starting, crt_depth={}, q_bits={}, input_count={}, digit_bits={}",
+        crossing_point.crt_depth, crossing_point.q_bits, input_count, digit_bits
+    );
+    let preprocess_started = Instant::now();
+    injector.preprocess(&one_pubkey, &input_pubkeys, &decoder_pubkeys);
+    gpu_device_sync();
+    info!(
+        "diamond injector gpu preprocess: finished, elapsed_s={:.3}",
+        preprocess_started.elapsed().as_secs_f64()
+    );
+
+    gpu_device_sync();
+    info!(
+        "diamond injector gpu online_eval: starting, crt_depth={}, q_bits={}",
+        crossing_point.crt_depth, crossing_point.q_bits
+    );
+    let online_started = Instant::now();
+    let (one_output, input_outputs, decoder_outputs) =
+        injector.online_eval(&input_digits, &one_pubkey, &input_pubkeys, &decoder_pubkeys);
+    gpu_device_sync();
+    info!(
+        "diamond injector gpu online_eval: finished, elapsed_s={:.3}",
+        online_started.elapsed().as_secs_f64()
+    );
+
+    let secret_product = reconstruct_secret_product(&params, dir.path(), &input_digits);
+    assert_encoding_residual_below_bound(
+        "one",
+        &params,
+        &one_output,
+        &secret_product,
+        &one_pubkey,
+        <GpuDCRTPolyMatrix as PolyMatrix>::P::const_one(&params),
+        &crossing_point.max_error,
+    );
+    for (digit_idx, output) in input_outputs.iter().enumerate() {
+        assert_encoding_residual_below_bound(
+            &format!("input_digit_{digit_idx}"),
+            &params,
+            output,
+            &secret_product,
+            &input_pubkeys[digit_idx],
+            <GpuDCRTPolyMatrix as PolyMatrix>::P::from_usize_to_constant(
+                &params,
+                input_digits[digit_idx] as usize,
+            ),
+            &crossing_point.max_error,
+        );
+    }
+    for (decoder_idx, output) in decoder_outputs.iter().enumerate() {
+        assert_decoder_residual_below_bound(
+            &format!("decoder_{decoder_idx}"),
+            &params,
+            output,
+            &secret_product,
+            &decoder_pubkeys[decoder_idx],
+            &crossing_point.max_error,
+        );
+    }
 }
 
 fn write_svg_plot(
@@ -392,10 +657,18 @@ fn write_svg_plot(
 }
 
 #[test]
-fn test_diamond_injector_q_bits_vs_max_error_plot_generates_svg() {
+fn test_gpu_diamond_injector_q_bits_vs_max_error_plot_generates_svg() {
     let _ = tracing_subscriber::fmt::try_init();
+    gpu_device_sync();
+
+    let gpu_ids = detected_gpu_device_ids();
+    assert!(
+        !gpu_ids.is_empty(),
+        "at least one GPU device is required for the DiamondInjector plot integration test"
+    );
 
     let ring_dim = env_or_default_u32("DIAMOND_INJECTOR_RING_DIM", DEFAULT_RING_DIM);
+    let hash_key: [u8; 32] = rand::random();
     let crt_bits = env_or_default_usize("DIAMOND_INJECTOR_CRT_BITS", DEFAULT_CRT_BITS);
     let input_count = env_or_default_usize("DIAMOND_INJECTOR_INPUT_COUNT", DEFAULT_INPUT_COUNT);
     let digit_bits = env_or_default_u32("DIAMOND_INJECTOR_DIGIT_BITS", DEFAULT_DIGIT_BITS);
@@ -417,10 +690,10 @@ fn test_diamond_injector_q_bits_vs_max_error_plot_generates_svg() {
 
     let mut points = Vec::with_capacity(max_crt_depth - min_crt_depth + 1);
     for crt_depth in min_crt_depth..=max_crt_depth {
-        let params = DCRTPolyParams::new(ring_dim, crt_depth, crt_bits, base_bits);
+        let params = gpu_params_for_crt_depth(ring_dim, crt_depth, crt_bits, base_bits, &gpu_ids);
         let injector = TestInjector::new(
             params,
-            DIAMOND_INJECTOR_HASH_KEY,
+            hash_key,
             input_count,
             input_base,
             DIAMOND_INJECTOR_DECODER_COUNT,
@@ -453,7 +726,7 @@ fn test_diamond_injector_q_bits_vs_max_error_plot_generates_svg() {
             bigdecimal_bits_ceil(&max_error),
         );
 
-        points.push(ErrorPoint { q_bits, max_error_bits });
+        points.push(ErrorPoint { crt_depth, q_bits, max_error_bits, max_error });
     }
 
     write_svg_plot(&points, &output_path, ring_dim, crt_bits, base_bits, input_count, digit_bits);
@@ -469,7 +742,7 @@ fn test_diamond_injector_q_bits_vs_max_error_plot_generates_svg() {
             written.contains("stroke-dasharray=\"10 8\""),
         "generated plot should be a readable SVG with the expected title"
     );
-    if let Some(highlighted_point) =
+    let crossing_point = if let Some(highlighted_point) =
         points.iter().find(|point| point.q_bits as u64 > point.max_error_bits)
     {
         assert!(
@@ -494,6 +767,7 @@ fn test_diamond_injector_q_bits_vs_max_error_plot_generates_svg() {
                 written.contains(&format!(">{x_window_end}<")),
             "generated plot should center the x-axis window on the highlighted point with +- 3 major ticks"
         );
+        highlighted_point
     } else {
         assert!(
             !written.contains("q_bits="),
@@ -503,10 +777,24 @@ fn test_diamond_injector_q_bits_vs_max_error_plot_generates_svg() {
             !written.contains("max_error_bits="),
             "generated plot should not add a max_error_bits caption unless a point falls below the y=x guideline"
         );
-    }
+        panic!("expected at least one crt_depth where q_bits > max_error_bits");
+    };
     info!(
         "diamond injector error plot saved to {} with {} points",
         output_path.display(),
         points.len()
     );
+
+    verify_gpu_online_eval_errors_below_simulation(
+        hash_key,
+        ring_dim,
+        crt_bits,
+        base_bits,
+        input_count,
+        input_base,
+        digit_bits,
+        crossing_point,
+        &gpu_ids,
+    );
+    gpu_device_sync();
 }

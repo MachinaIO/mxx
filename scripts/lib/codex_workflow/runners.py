@@ -82,6 +82,11 @@ class FinalTestRunner(Protocol):
         ...
 
 
+class BuildCheckRunner(Protocol):
+    def run(self, label: str) -> FinalTestResult:
+        ...
+
+
 class CodexExecRunner:
     def __init__(self, paths: RepoPaths, session_id: str) -> None:
         self.paths = paths
@@ -180,6 +185,38 @@ class ShellFinalTestRunner:
             command.append("--rust")
         elif not run_python and not run_rust:
             raise ValueError("ShellFinalTestRunner.run requires at least one test suite.")
+        with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open(
+            "w", encoding="utf-8"
+        ) as stderr_handle:
+            completed = subprocess.run(
+                command,
+                cwd=self.paths.repo_root,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                text=True,
+                check=False,
+            )
+        summary = summarize_logs(stdout_path, stderr_path)
+        return FinalTestResult(
+            ok=completed.returncode == 0,
+            summary=summary,
+            returncode=completed.returncode,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        )
+
+
+class ShellBuildCheckRunner:
+    def __init__(self, paths: RepoPaths, session_id: str) -> None:
+        self.paths = paths
+        self.session_id = session_id
+
+    def run(self, label: str) -> FinalTestResult:
+        run_id = uuid.uuid4().hex
+        safe_label = _sanitize_label(label)
+        stdout_path = self.paths.active_revision_logs_dir / f"{self.session_id}-{safe_label}-{run_id}.stdout.log"
+        stderr_path = self.paths.active_revision_logs_dir / f"{self.session_id}-{safe_label}-{run_id}.stderr.log"
+        command = [str(self.paths.scripts_dir / "run_build_checks.sh")]
         with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open(
             "w", encoding="utf-8"
         ) as stderr_handle:

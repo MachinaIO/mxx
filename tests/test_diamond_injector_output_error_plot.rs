@@ -93,21 +93,53 @@ fn write_svg_plot(
     let available_plot_width = width - left_margin - right;
     let available_plot_height = height - top - bottom;
 
-    let min_q_bits = points.iter().map(|point| point.q_bits).min().expect("points are non-empty");
-    let max_q_bits = points.iter().map(|point| point.q_bits).max().expect("points are non-empty");
-    let min_error_bits =
-        points.iter().map(|point| point.max_error_bits).min().expect("points are non-empty");
-    let max_error_bits =
-        points.iter().map(|point| point.max_error_bits).max().expect("points are non-empty");
     let major_tick_bits =
         u64::try_from(crt_bits).expect("crt_bits must fit into u64 for plot tick computation");
     assert!(major_tick_bits > 0, "crt_bits must be positive for plot tick computation");
     let minor_tick_bits = major_tick_bits as f64 / 8.0;
 
-    let x_min_bits = (min_q_bits as u64 / major_tick_bits) * major_tick_bits;
-    let x_max_bits = (max_q_bits as u64).div_ceil(major_tick_bits) * major_tick_bits;
-    let x_max_bits =
-        if x_min_bits == x_max_bits { x_max_bits + major_tick_bits } else { x_max_bits };
+    let highlighted_point = points.iter().find(|point| point.q_bits as u64 > point.max_error_bits);
+    let x_window_radius_bits = major_tick_bits
+        .checked_mul(3)
+        .expect("3 * crt_bits must fit into u64 for plot tick computation");
+    let (x_min_bits, x_max_bits) = if let Some(point) = highlighted_point {
+        let center_bits = point.q_bits as u64;
+        (
+            center_bits.saturating_sub(x_window_radius_bits),
+            center_bits
+                .checked_add(x_window_radius_bits)
+                .expect("x-axis window upper bound must fit into u64"),
+        )
+    } else {
+        let min_q_bits =
+            points.iter().map(|point| point.q_bits).min().expect("points are non-empty");
+        let max_q_bits =
+            points.iter().map(|point| point.q_bits).max().expect("points are non-empty");
+        let x_min_bits = (min_q_bits as u64 / major_tick_bits) * major_tick_bits;
+        let x_max_bits = (max_q_bits as u64).div_ceil(major_tick_bits) * major_tick_bits;
+        let x_max_bits =
+            if x_min_bits == x_max_bits { x_max_bits + major_tick_bits } else { x_max_bits };
+        (x_min_bits, x_max_bits)
+    };
+    let visible_points = points
+        .iter()
+        .filter(|point| {
+            let q_bits = point.q_bits as u64;
+            x_min_bits <= q_bits && q_bits <= x_max_bits
+        })
+        .collect::<Vec<_>>();
+    let plotted_points =
+        if visible_points.is_empty() { points.iter().collect::<Vec<_>>() } else { visible_points };
+    let min_error_bits = plotted_points
+        .iter()
+        .map(|point| point.max_error_bits)
+        .min()
+        .expect("plotted points must be non-empty");
+    let max_error_bits = plotted_points
+        .iter()
+        .map(|point| point.max_error_bits)
+        .max()
+        .expect("plotted points must be non-empty");
     let y_min_bits = (min_error_bits / major_tick_bits) * major_tick_bits;
     let y_max_bits = (max_error_bits.div_ceil(major_tick_bits) + 1) * major_tick_bits;
     let y_max_bits =
@@ -122,6 +154,12 @@ fn write_svg_plot(
     let plot_height = (pixels_per_major * y_major_tick_count as f64).round() as i32;
     let plot_left = left_margin + (available_plot_width - plot_width) / 2;
     let plot_top = top + (available_plot_height - plot_height) / 2;
+    let input_bits = input_count
+        .checked_mul(
+            usize::try_from(digit_bits)
+                .expect("digit_bits must fit into usize for plot subtitle computation"),
+        )
+        .expect("input_count * digit_bits overflow in plot subtitle computation");
 
     let x_min_bits_f64 = x_min_bits as f64;
     let x_max_bits_f64 = x_max_bits as f64;
@@ -163,7 +201,7 @@ fn write_svg_plot(
     .expect("svg title should format");
     writeln!(
         svg,
-        r##"<text x="{x}" y="60" font-size="16" font-family="monospace" text-anchor="middle" fill="#444444">ring_dim={ring_dim}, crt_bits={crt_bits}, base_bits={base_bits}, input_count={input_count}, digit_bits={digit_bits}</text>"##,
+        r##"<text x="{x}" y="60" font-size="16" font-family="monospace" text-anchor="middle" fill="#444444">ring_dim={ring_dim}, crt_bits={crt_bits}, base_bits={base_bits}, input_bits={input_bits}, input_count={input_count}, digit_bits={digit_bits}</text>"##,
         x = width / 2
     )
     .expect("svg subtitle should format");
@@ -271,29 +309,51 @@ fn write_svg_plot(
     let guideline_start_bits = std::cmp::max(x_min_bits, y_min_bits);
     let guideline_end_bits = std::cmp::min(x_max_bits, y_max_bits);
     if guideline_start_bits < guideline_end_bits {
+        let guideline_x1 = x_at_bits(guideline_start_bits as f64);
+        let guideline_y1 = y_at_bits(guideline_start_bits as f64);
+        let guideline_x2 = x_at_bits(guideline_end_bits as f64);
+        let guideline_y2 = y_at_bits(guideline_end_bits as f64);
+        let guideline_mid_x = (guideline_x1 + guideline_x2) / 2;
+        let guideline_label_y = plot_top + 24;
         writeln!(
             svg,
             r##"<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#111111" stroke-width="2" stroke-dasharray="10 8"/>"##,
-            x1 = x_at_bits(guideline_start_bits as f64),
-            y1 = y_at_bits(guideline_start_bits as f64),
-            x2 = x_at_bits(guideline_end_bits as f64),
-            y2 = y_at_bits(guideline_end_bits as f64)
+            x1 = guideline_x1,
+            y1 = guideline_y1,
+            x2 = guideline_x2,
+            y2 = guideline_y2
         )
         .expect("svg y=x guideline should format");
+        writeln!(
+            svg,
+            r##"<text x="{x}" y="{y}" font-size="13" font-family="monospace" text-anchor="middle" fill="#111111">max_error_bits &gt; q_bits</text>"##,
+            x = (plot_left + guideline_mid_x) / 2,
+            y = guideline_label_y
+        )
+        .expect("svg left-of-guideline label should format");
+        writeln!(
+            svg,
+            r##"<text x="{x}" y="{y}" font-size="13" font-family="monospace" text-anchor="middle" fill="#111111">max_error_bits &lt; q_bits</text>"##,
+            x = (guideline_mid_x + plot_left + plot_width) / 2,
+            y = guideline_label_y
+        )
+        .expect("svg right-of-guideline label should format");
     }
 
-    let polyline_points = points
+    let polyline_points = plotted_points
         .iter()
         .map(|point| format!("{},{}", x_at(point.q_bits), y_at(point.max_error_bits)))
         .collect::<Vec<_>>()
         .join(" ");
-    writeln!(
-        svg,
-        r##"<polyline fill="none" stroke="#2563eb" stroke-width="3" points="{polyline_points}"/>"##
-    )
-    .expect("svg polyline should format");
+    if plotted_points.len() >= 2 {
+        writeln!(
+            svg,
+            r##"<polyline fill="none" stroke="#2563eb" stroke-width="3" points="{polyline_points}"/>"##
+        )
+        .expect("svg polyline should format");
+    }
 
-    for point in points {
+    for point in &plotted_points {
         let x = x_at(point.q_bits);
         let y = y_at(point.max_error_bits);
         writeln!(
@@ -303,16 +363,15 @@ fn write_svg_plot(
         .expect("svg point should format");
     }
 
-    if let Some(first_below_diagonal) =
-        points.iter().find(|point| point.max_error_bits < point.q_bits as u64)
-    {
-        let x = x_at(first_below_diagonal.q_bits);
-        let y = y_at(first_below_diagonal.max_error_bits);
+    if let Some(highlighted_point) = highlighted_point {
+        let x = x_at(highlighted_point.q_bits);
+        let y = y_at(highlighted_point.max_error_bits);
         writeln!(
             svg,
-            r##"<text x="{x}" y="{y}" font-size="13" font-family="monospace" text-anchor="middle" fill="#1d4ed8">q_bits={q_bits}</text>"##,
+            r##"<text x="{x}" y="{y}" font-size="13" font-family="monospace" text-anchor="middle" fill="#1d4ed8"><tspan x="{x}" dy="0">q_bits={q_bits}</tspan><tspan x="{x}" dy="14">max_error_bits={max_error_bits}</tspan></text>"##,
             y = y + 18,
-            q_bits = first_below_diagonal.q_bits
+            q_bits = highlighted_point.q_bits,
+            max_error_bits = highlighted_point.max_error_bits
         )
         .expect("svg diagonal-crossing caption should format");
     }
@@ -405,21 +464,44 @@ fn test_diamond_injector_q_bits_vs_max_error_plot_generates_svg() {
         written.contains("<svg") &&
             written.contains("DiamondInjector q_bits vs max_error_bits") &&
             written.contains("stroke=\"#9ca3af\"") &&
-            !written.contains("error_bits=") &&
+            written.contains("max_error_bits &gt; q_bits") &&
+            written.contains("max_error_bits &lt; q_bits") &&
             written.contains("stroke-dasharray=\"10 8\""),
         "generated plot should be a readable SVG with the expected title"
     );
-    if let Some(first_below_diagonal) =
-        points.iter().find(|point| point.max_error_bits < point.q_bits as u64)
+    if let Some(highlighted_point) =
+        points.iter().find(|point| point.q_bits as u64 > point.max_error_bits)
     {
         assert!(
-            written.contains(&format!("q_bits={}", first_below_diagonal.q_bits)),
+            written.contains(&format!("q_bits={}", highlighted_point.q_bits)),
             "generated plot should annotate the first point below the y=x guideline"
+        );
+        assert!(
+            written.contains(&format!("max_error_bits={}", highlighted_point.max_error_bits)),
+            "generated plot should annotate the highlighted point with its max_error_bits value"
+        );
+        let major_tick_bits =
+            u64::try_from(crt_bits).expect("crt_bits must fit into u64 for plot window checks");
+        let x_window_radius_bits = major_tick_bits
+            .checked_mul(3)
+            .expect("3 * crt_bits must fit into u64 for plot window checks");
+        let x_window_start = (highlighted_point.q_bits as u64).saturating_sub(x_window_radius_bits);
+        let x_window_end = (highlighted_point.q_bits as u64)
+            .checked_add(x_window_radius_bits)
+            .expect("plot window upper bound must fit into u64");
+        assert!(
+            written.contains(&format!(">{x_window_start}<")) &&
+                written.contains(&format!(">{x_window_end}<")),
+            "generated plot should center the x-axis window on the highlighted point with +- 3 major ticks"
         );
     } else {
         assert!(
             !written.contains("q_bits="),
             "generated plot should not add a q_bits caption unless a point falls below the y=x guideline"
+        );
+        assert!(
+            !written.contains("max_error_bits="),
+            "generated plot should not add a max_error_bits caption unless a point falls below the y=x guideline"
         );
     }
     info!(

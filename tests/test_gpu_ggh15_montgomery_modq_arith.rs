@@ -36,9 +36,9 @@ use rayon::prelude::*;
 use std::{env, fs, path::Path, sync::Arc, time::Instant};
 use tracing::info;
 
-const DEFAULT_RING_DIM: u32 = 1 << 8;
-const DEFAULT_CRT_BITS: usize = 24;
-const DEFAULT_BASE_BITS: u32 = 12;
+const DEFAULT_RING_DIM: u32 = 1 << 16;
+const DEFAULT_CRT_BITS: usize = 32;
+const DEFAULT_BASE_BITS: u32 = 16;
 const DEFAULT_MAX_CRT_DEPTH: usize = 64;
 const DEFAULT_ERROR_SIGMA: f64 = 4.0;
 const DEFAULT_D_SECRET: usize = 1;

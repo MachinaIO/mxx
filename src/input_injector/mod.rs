@@ -86,7 +86,10 @@ where
     ) -> Self {
         assert!(base > 0, "DiamondInjector base must be positive");
         assert!(error_sigma >= 0.0, "DiamondInjector error_sigma must be nonnegative");
+        #[cfg(feature = "gpu")]
         let gpu_device_ids = params.device_ids();
+        #[cfg(not(feature = "gpu"))]
+        let gpu_device_ids = Vec::new();
         Self {
             params,
             gpu_device_ids,

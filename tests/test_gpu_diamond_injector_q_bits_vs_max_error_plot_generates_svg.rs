@@ -99,14 +99,15 @@ fn gpu_params_for_crt_depth(
     base_bits: u32,
     gpu_ids: &[i32],
 ) -> GpuDCRTPolyParams {
+    assert!(!gpu_ids.is_empty(), "at least one GPU id is required");
     let cpu_params = DCRTPolyParams::new(ring_dim, crt_depth, crt_bits, base_bits);
     let (moduli, _, _) = cpu_params.to_crt();
     GpuDCRTPolyParams::new_with_gpu(
         cpu_params.ring_dimension(),
         moduli,
         cpu_params.base_bits(),
-        gpu_ids.to_vec(),
-        Some(gpu_ids.len() as u32),
+        vec![gpu_ids[0]],
+        Some(1),
     )
 }
 
@@ -258,7 +259,8 @@ fn verify_gpu_online_eval_errors_below_simulation(
         DIAMOND_INJECTOR_TRAPDOOR_SIGMA,
         DIAMOND_INJECTOR_ERROR_SIGMA,
         dir.path().to_path_buf(),
-    );
+    )
+    .with_gpu_device_ids(gpu_ids.to_vec());
 
     let one_pubkey = sample_pubkey(&params, hash_key, "diamond_plot_one_pubkey");
     let input_pubkeys = (0..input_count)
@@ -700,7 +702,8 @@ fn test_gpu_diamond_injector_q_bits_vs_max_error_plot_generates_svg() {
             DIAMOND_INJECTOR_TRAPDOOR_SIGMA,
             DIAMOND_INJECTOR_ERROR_SIGMA,
             std::env::temp_dir(),
-        );
+        )
+        .with_gpu_device_ids(gpu_ids.clone());
         let simulated = injector.simulate_output_error_bounds();
         let max_input_error = simulated
             .input_errors

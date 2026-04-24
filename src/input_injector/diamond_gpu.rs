@@ -119,14 +119,6 @@ fn preprocess_progress_label(completed_tasks: usize, total_tasks: usize) -> Stri
     format!("{}/{} ({} %)", completed_tasks, total_tasks, percent)
 }
 
-fn effective_device_ids<P>(params: &P) -> Vec<i32>
-where
-    P: PolyParams,
-{
-    let device_ids = params.device_ids();
-    if device_ids.is_empty() { vec![0] } else { device_ids }
-}
-
 fn concat_chunk_bytes_on_base<M, B>(params: &<M::P as Poly>::Params, chunk_bytes: Vec<B>) -> M
 where
     M: PolyMatrix + Send,
@@ -159,13 +151,21 @@ where
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
 {
+    fn effective_gpu_device_ids(&self) -> Vec<i32> {
+        if !self.gpu_device_ids.is_empty() {
+            return self.gpu_device_ids.clone();
+        }
+        let device_ids = self.params.device_ids();
+        if device_ids.is_empty() { vec![0] } else { device_ids }
+    }
+
     fn prepare_gpu_k_stage_shared(
         &self,
         source_b_bytes: &[u8],
         source_trapdoor_bytes: &[u8],
         target_b_bytes: &[u8],
     ) -> Vec<GpuDiamondKStageShared<M, TS::Trapdoor>> {
-        effective_device_ids(&self.params)
+        self.effective_gpu_device_ids()
             .into_par_iter()
             .map(|device_id| {
                 let local_params = self.params.params_for_device(device_id);
@@ -192,7 +192,7 @@ where
         source_b_bytes: &[u8],
         source_trapdoor_bytes: &[u8],
     ) -> Vec<GpuDiamondOutputStageShared<M, TS::Trapdoor>> {
-        effective_device_ids(&self.params)
+        self.effective_gpu_device_ids()
             .into_par_iter()
             .map(|device_id| {
                 let local_params = self.params.params_for_device(device_id);
@@ -217,7 +217,7 @@ where
         &self,
         family_specs: &HashMap<DiamondEvalFamily, DiamondEvalFamilySpec>,
     ) -> Vec<GpuDiamondEvalShared<M>> {
-        effective_device_ids(&self.params)
+        self.effective_gpu_device_ids()
             .into_par_iter()
             .map(|device_id| {
                 let local_params = self.params.params_for_device(device_id);
@@ -1310,8 +1310,8 @@ mod tests {
             cpu_params.ring_dimension(),
             moduli,
             cpu_params.base_bits(),
-            gpu_ids.clone(),
-            Some(gpu_ids.len() as u32),
+            vec![gpu_ids[0]],
+            Some(1),
         );
 
         let hash_key = [11u8; 32];
@@ -1329,7 +1329,8 @@ mod tests {
             4.578,
             0.0,
             dir.path().to_path_buf(),
-        );
+        )
+        .with_gpu_device_ids(gpu_ids.clone());
 
         let one_pubkey = sample_pubkey(&params, hash_key, "diamond_gpu_one_pubkey");
         let input_pubkeys = (0..input_count)

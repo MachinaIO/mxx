@@ -47,6 +47,7 @@ where
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
 {
     pub params: <M::P as Poly>::Params,
+    pub gpu_device_ids: Vec<i32>,
     pub hash_key: [u8; 32],
     pub input_count: usize,
     pub base: usize,
@@ -85,8 +86,10 @@ where
     ) -> Self {
         assert!(base > 0, "DiamondInjector base must be positive");
         assert!(error_sigma >= 0.0, "DiamondInjector error_sigma must be nonnegative");
+        let gpu_device_ids = params.device_ids();
         Self {
             params,
+            gpu_device_ids,
             hash_key,
             input_count,
             base,
@@ -98,6 +101,14 @@ where
             _hs: PhantomData,
             _ts: PhantomData,
         }
+    }
+
+    /// Keep ordinary matrix sampling/loading on the base params while letting
+    /// the GPU helpers distribute independent work across explicit single-GPU
+    /// local params derived from these device ids.
+    pub fn with_gpu_device_ids(mut self, gpu_device_ids: Vec<i32>) -> Self {
+        self.gpu_device_ids = gpu_device_ids;
+        self
     }
 
     fn ensure_dir(&self) {

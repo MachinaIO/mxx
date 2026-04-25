@@ -1388,6 +1388,42 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         collapsed.as_single_wire()
     }
 
+    fn collapse_slots_to_single_poly_at_slot(
+        wire: GateId,
+        num_slots: usize,
+        output_slot: usize,
+        circuit: &mut PolyCircuit<P>,
+    ) -> GateId {
+        assert!(
+            output_slot < num_slots,
+            "Ring-GSW decrypt output_slot {} must be less than num_slots {}",
+            output_slot,
+            num_slots
+        );
+        if output_slot == 0 {
+            return Self::collapse_slots_to_single_poly(wire, num_slots, circuit);
+        }
+
+        let zeroed_src_slots = |src_slot: usize| {
+            let mut src_slots = vec![(0u32, Some(0u32)); num_slots];
+            src_slots[output_slot] =
+                (u32::try_from(src_slot).expect("source slot index must fit in u32"), None);
+            src_slots
+        };
+        let mut collapsed_terms = (0..num_slots)
+            .map(|slot| {
+                let transferred = circuit.slot_transfer_gate(wire, &zeroed_src_slots(slot));
+                if slot == 0 { transferred } else { circuit.rotate_gate(transferred, slot as u64) }
+            })
+            .collect::<Vec<_>>();
+        let mut collapsed =
+            collapsed_terms.drain(..1).next().expect("slot-collapsing requires at least one slot");
+        for term in collapsed_terms {
+            collapsed = circuit.add_gate(collapsed, term);
+        }
+        collapsed.as_single_wire()
+    }
+
     fn assert_consistent(&self) {
         let width = self.rows[0].len();
         assert!(width > 0, "RingGswCiphertext width must be positive");
@@ -1500,8 +1536,27 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
     where
         M: PolyMatrix<P = P>,
     {
+        self.decrypt_to_slot::<M>(wire_secret_key, plaintext_modulus, 0, circuit)
+    }
+
+    pub fn decrypt_to_slot<M>(
+        &self,
+        wire_secret_key: GateId,
+        plaintext_modulus: BigUint,
+        output_slot: usize,
+        circuit: &mut PolyCircuit<P>,
+    ) -> GateId
+    where
+        M: PolyMatrix<P = P>,
+    {
         self.assert_consistent();
         assert!(!plaintext_modulus.is_zero(), "plaintext_modulus must be positive");
+        assert!(
+            output_slot < self.ctx.num_slots,
+            "Ring-GSW decrypt output_slot {} must be less than num_slots {}",
+            output_slot,
+            self.ctx.num_slots
+        );
         let gadget_len = self.gadget_len();
         assert_eq!(
             self.width(),
@@ -1572,8 +1627,12 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             let level_base = q_idx * (p_depth + 1);
             let (ys, w) = prepared_top.decomposition_terms_for_level(q_idx, circuit);
             for p_idx in 0..p_depth {
-                let collapsed =
-                    Self::collapse_slots_to_single_poly(ys[p_idx], self.ctx.num_slots, circuit);
+                let collapsed = Self::collapse_slots_to_single_poly_at_slot(
+                    ys[p_idx],
+                    self.ctx.num_slots,
+                    output_slot,
+                    circuit,
+                );
                 let top_times_secret = circuit.mul_gate(collapsed, wire_secret_key);
                 let gadget_scalar = &gadget_constants[level_base + p_idx];
                 if gadget_scalar.is_zero() {
@@ -1583,7 +1642,12 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                     circuit.large_scalar_mul(top_times_secret, std::slice::from_ref(gadget_scalar)),
                 );
             }
-            let collapsed_w = Self::collapse_slots_to_single_poly(w, self.ctx.num_slots, circuit);
+            let collapsed_w = Self::collapse_slots_to_single_poly_at_slot(
+                w,
+                self.ctx.num_slots,
+                output_slot,
+                circuit,
+            );
             let w_times_secret = circuit.mul_gate(collapsed_w, wire_secret_key);
             let gadget_scalar = &gadget_constants[level_base + p_depth];
             if gadget_scalar.is_zero() {
@@ -1597,9 +1661,10 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         for term in weighted_top_terms {
             sum = circuit.add_gate(sum, term);
         }
-        let reconstructed_bottom = Self::collapse_slots_to_single_poly(
+        let reconstructed_bottom = Self::collapse_slots_to_single_poly_at_slot(
             bottom_entry.reconstruct(circuit),
             self.ctx.num_slots,
+            output_slot,
             circuit,
         );
         circuit.add_gate(sum, reconstructed_bottom).as_single_wire()

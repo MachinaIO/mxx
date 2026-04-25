@@ -466,21 +466,21 @@ where
 /// `2n` distinct Goldreich graphs from a public seed, registers one reusable CBD coefficient
 /// sub-circuit for that `n`, and then evaluates one centered-binomial-style error ciphertext per
 /// output position.
-pub struct GoldreichFheCbdError<P: Poly, C: BooleanCiphertext<P> = NestedRnsRingGswCiphertext<P>> {
+pub struct GoldreichFheCbdPrg<P: Poly, C: BooleanCiphertext<P> = NestedRnsRingGswCiphertext<P>> {
     pub uniform_prg: GoldreichFhePrg<P, C>,
     pub cbd_n: usize,
     uniform_graphs: Vec<GoldreichGraph>,
-    cbd_error_sub_circuit_id: usize,
+    cbd_prf_sub_circuit_id: usize,
     cbd_output_templates: Vec<C>,
 }
 
-impl<P: Poly, C: BooleanCiphertext<P>> GoldreichFheCbdError<P, C> {
+impl<P: Poly, C: BooleanCiphertext<P>> GoldreichFheCbdPrg<P, C> {
     pub fn uniform_graphs(&self) -> &[GoldreichGraph] {
         &self.uniform_graphs
     }
 }
 
-impl<P: Poly + 'static, C> GoldreichFheCbdError<P, C>
+impl<P: Poly + 'static, C> GoldreichFheCbdPrg<P, C>
 where
     C: BooleanCiphertext<P>,
 {
@@ -528,19 +528,19 @@ where
             generation,
             2 * cbd_n,
         );
-        let (cbd_error_sub_circuit, cbd_output_templates) =
-            goldreich_cbd_error_sub_circuit(&uniform_prg, &uniform_graphs, cbd_n, circuit);
-        let cbd_error_sub_circuit_id = circuit.register_sub_circuit(cbd_error_sub_circuit);
-        Self { uniform_prg, cbd_n, uniform_graphs, cbd_error_sub_circuit_id, cbd_output_templates }
+        let (cbd_prf_sub_circuit, cbd_output_templates) =
+            goldreich_cbd_prf_sub_circuit(&uniform_prg, &uniform_graphs, cbd_n, circuit);
+        let cbd_prf_sub_circuit_id = circuit.register_sub_circuit(cbd_prf_sub_circuit);
+        Self { uniform_prg, cbd_n, uniform_graphs, cbd_prf_sub_circuit_id, cbd_output_templates }
     }
 
-    pub fn evaluate_cbd_error(&self, input_bits: &[C], circuit: &mut PolyCircuit<P>) -> Vec<C> {
+    pub fn evaluate_cbd_prf(&self, input_bits: &[C], circuit: &mut PolyCircuit<P>) -> Vec<C> {
         self.uniform_prg.validate_input_bits(input_bits);
         let mut cbd_inputs = Vec::with_capacity(input_bits.len());
         for input_bit in input_bits {
             cbd_inputs.extend(input_bit.sub_circuit_wires());
         }
-        let outputs = circuit.call_sub_circuit(self.cbd_error_sub_circuit_id, &cbd_inputs);
+        let outputs = circuit.call_sub_circuit(self.cbd_prf_sub_circuit_id, &cbd_inputs);
         let mut next_output_start = 0usize;
         self.cbd_output_templates
             .iter()
@@ -613,7 +613,7 @@ where
     current_layer.pop().expect("pairwise reduction must leave one term")
 }
 
-fn goldreich_cbd_error_sub_circuit<P, C>(
+fn goldreich_cbd_prf_sub_circuit<P, C>(
     uniform_prg: &GoldreichFhePrg<P, C>,
     uniform_graphs: &[GoldreichGraph],
     cbd_n: usize,
@@ -910,7 +910,7 @@ mod tests {
         value.rem_euclid(modulus) as u64
     }
 
-    fn evaluate_plaintext_cbd_error(
+    fn evaluate_plaintext_cbd_prf(
         graphs: &[GoldreichGraph],
         input_bits: &[u64],
         cbd_n: usize,
@@ -1122,23 +1122,23 @@ mod tests {
     }
 
     #[test]
-    fn test_goldreich_cbd_error_uses_distinct_uniform_graphs() {
+    fn test_goldreich_cbd_prf_uses_distinct_uniform_graphs() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (_params, ring_gsw) = create_test_context(&mut circuit);
-        let cbd_error: GoldreichFheCbdError<DCRTPoly> =
-            GoldreichFheCbdError::setup(&mut circuit, ring_gsw, 5, 3, sample_graph_seed(), 2);
+        let cbd_prf: GoldreichFheCbdPrg<DCRTPoly> =
+            GoldreichFheCbdPrg::setup(&mut circuit, ring_gsw, 5, 3, sample_graph_seed(), 2);
 
         assert_eq!(
-            cbd_error.uniform_graphs().len(),
+            cbd_prf.uniform_graphs().len(),
             4,
             "CBD setup must derive exactly 2 * cbd_n distinct Goldreich graphs"
         );
-        for left in 0..cbd_error.uniform_graphs().len() {
-            for right in left + 1..cbd_error.uniform_graphs().len() {
+        for left in 0..cbd_prf.uniform_graphs().len() {
+            for right in left + 1..cbd_prf.uniform_graphs().len() {
                 assert!(
                     !same_graph_structure(
-                        &cbd_error.uniform_graphs()[left],
-                        &cbd_error.uniform_graphs()[right],
+                        &cbd_prf.uniform_graphs()[left],
+                        &cbd_prf.uniform_graphs()[right],
                     ),
                     "CBD setup must use distinct Goldreich graphs for different sampled bits"
                 );
@@ -1148,11 +1148,11 @@ mod tests {
 
     #[sequential_test::sequential]
     #[test]
-    fn test_goldreich_cbd_error_output_decrypts_to_plaintext_reference() {
+    fn test_goldreich_cbd_prf_output_decrypts_to_plaintext_reference() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ring_gsw) = create_test_context(&mut circuit);
         let cbd_n = 1usize;
-        let cbd_error: GoldreichFheCbdError<DCRTPoly> = GoldreichFheCbdError::setup(
+        let cbd_prf: GoldreichFheCbdPrg<DCRTPoly> = GoldreichFheCbdPrg::setup(
             &mut circuit,
             ring_gsw.clone(),
             5,
@@ -1160,10 +1160,10 @@ mod tests {
             sample_graph_seed(),
             cbd_n,
         );
-        let encrypted_inputs = (0..cbd_error.uniform_prg.input_size)
+        let encrypted_inputs = (0..cbd_prf.uniform_prg.input_size)
             .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
             .collect::<Vec<_>>();
-        let encrypted_outputs = cbd_error.evaluate_cbd_error(&encrypted_inputs, &mut circuit);
+        let encrypted_outputs = cbd_prf.evaluate_cbd_prf(&encrypted_inputs, &mut circuit);
         let reconstructed_outputs = encrypted_outputs
             .iter()
             .flat_map(|ciphertext| ciphertext.reconstruct(&mut circuit))
@@ -1182,9 +1182,9 @@ mod tests {
             b"goldreich_cbd_ring_gsw_public_key",
             None,
         );
-        let plaintext_inputs = sample_binary_vector(cbd_error.uniform_prg.input_size);
+        let plaintext_inputs = sample_binary_vector(cbd_prf.uniform_prg.input_size);
         let expected_coefficients =
-            evaluate_plaintext_cbd_error(cbd_error.uniform_graphs(), &plaintext_inputs, cbd_n);
+            evaluate_plaintext_cbd_prf(cbd_prf.uniform_graphs(), &plaintext_inputs, cbd_n);
         let native_inputs = plaintext_inputs
             .par_iter()
             .enumerate()
@@ -1220,7 +1220,7 @@ mod tests {
 
         assert_eq!(
             reconstructed_ciphertexts.len(),
-            cbd_error.uniform_prg.output_size,
+            cbd_prf.uniform_prg.output_size,
             "homomorphic Goldreich CBD evaluation must reconstruct one ciphertext per error coefficient"
         );
         reconstructed_ciphertexts

@@ -381,7 +381,7 @@ mod tests {
             circuit,
             &params,
             p_moduli_bits,
-            1,
+            2,
             scale,
             false,
             Some(active_levels),

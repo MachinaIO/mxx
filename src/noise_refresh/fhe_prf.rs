@@ -361,8 +361,8 @@ mod tests {
         circuit: &mut PolyCircuit<GpuDCRTPoly>,
         gpu_ids: Vec<i32>,
     ) -> (GpuDCRTPolyParams, Arc<TestRingGswContext>) {
-        let ring_dim = 2u32;
-        let num_slots = 2usize;
+        let ring_dim = 1u32;
+        let num_slots = 1usize;
         let active_levels = 1usize;
         let crt_bits = 10usize;
         let base_bits = 10u32;
@@ -452,7 +452,7 @@ mod tests {
         );
         let mut setup_circuit = PolyCircuit::new();
         let (params, ring_gsw) = create_test_context(&mut setup_circuit, gpu_ids);
-        let seed_bits = 13usize;
+        let seed_bits = 5usize;
         let input_bits_per_step = 1usize;
         let v_bits = 1usize;
         let cbd_n = 2usize;

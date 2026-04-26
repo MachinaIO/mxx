@@ -1,4 +1,7 @@
 use super::*;
+use num_traits::ToPrimitive;
+
+type ScopedGateKey = BigUint;
 
 impl<P: Poly> PolyCircuit<P> {
     pub fn eval<E, PE>(
@@ -20,7 +23,8 @@ impl<P: Poly> PolyCircuit<P> {
         let one = Arc::new(E::from_compact(params, one_compact.as_ref()));
         let input_compacts =
             inputs.into_iter().map(|input| Arc::new(input.to_compact())).collect::<Vec<_>>();
-        let scoped_gate_ids = self.build_scoped_gate_id_map(call_id_base, gate_id_base);
+        let scoped_gate_ids = self.build_scoped_gate_id_map(&call_id_base, &gate_id_base);
+        let call_prefix = ScopedGateKey::from(0u32);
         let outputs = self.eval_scoped(
             params,
             &one,
@@ -29,19 +33,19 @@ impl<P: Poly> PolyCircuit<P> {
             &[],
             plt_evaluator,
             slot_transfer_evaluator,
-            0,
-            call_id_base,
-            gate_id_base,
+            &call_prefix,
+            &call_id_base,
+            &gate_id_base,
             &scoped_gate_ids,
             parallel_gates,
         );
         outputs.into_iter().map(|value| E::from_compact(params, value.as_ref())).collect()
     }
 
-    fn eval_gate_id_bases(&self) -> (u128, u128) {
+    fn eval_gate_id_bases(&self) -> (ScopedGateKey, ScopedGateKey) {
         let max_calls = self.max_sub_circuit_calls();
         let max_gates = self.max_gate_count();
-        ((max_calls as u128) + 1, (max_gates as u128) + 1)
+        (ScopedGateKey::from(max_calls) + 1u32, ScopedGateKey::from(max_gates) + 1u32)
     }
 
     fn max_sub_circuit_calls(&self) -> usize {
@@ -64,43 +68,39 @@ impl<P: Poly> PolyCircuit<P> {
 
     fn collect_scoped_gate_keys(
         &self,
-        call_prefix: u128,
-        call_id_base: u128,
-        gate_id_base: u128,
-        scoped_keys: &mut BTreeSet<u128>,
+        call_prefix: &ScopedGateKey,
+        call_id_base: &ScopedGateKey,
+        gate_id_base: &ScopedGateKey,
+        scoped_keys: &mut BTreeSet<ScopedGateKey>,
     ) {
         for gate in self.gates.values() {
             match &gate.gate_type {
                 PolyGateType::SlotTransfer { .. } |
                 PolyGateType::SlotReduce { .. } |
                 PolyGateType::PubLut { .. } => {
-                    let scoped_key = call_prefix
-                        .checked_mul(gate_id_base)
-                        .and_then(|base| base.checked_add(gate.gate_id.0 as u128))
-                        .expect("scoped gate key overflow");
+                    let scoped_key = Self::scoped_key(call_prefix, gate_id_base, gate.gate_id.0);
                     scoped_keys.insert(scoped_key);
                 }
                 _ => {}
             }
         }
         for call in self.sub_circuit_calls.values() {
-            let child_prefix = call_prefix
-                .checked_mul(call_id_base)
-                .and_then(|base| base.checked_add((call.scoped_call_id as u128) + 1))
-                .expect("sub-circuit call prefix overflow");
+            let child_prefix = Self::scoped_key(call_prefix, call_id_base, call.scoped_call_id + 1);
             self.with_sub_circuit(call.sub_circuit_id, |sub| {
-                sub.collect_scoped_gate_keys(child_prefix, call_id_base, gate_id_base, scoped_keys);
+                sub.collect_scoped_gate_keys(
+                    &child_prefix,
+                    call_id_base,
+                    gate_id_base,
+                    scoped_keys,
+                );
             });
         }
         for call in self.summed_sub_circuit_calls.values() {
             for scoped_call_id in &call.scoped_call_ids {
-                let child_prefix = call_prefix
-                    .checked_mul(call_id_base)
-                    .and_then(|base| base.checked_add((*scoped_call_id as u128) + 1))
-                    .expect("summed sub-circuit call prefix overflow");
+                let child_prefix = Self::scoped_key(call_prefix, call_id_base, *scoped_call_id + 1);
                 self.with_sub_circuit(call.sub_circuit_id, |sub| {
                     sub.collect_scoped_gate_keys(
-                        child_prefix,
+                        &child_prefix,
                         call_id_base,
                         gate_id_base,
                         scoped_keys,
@@ -112,18 +112,24 @@ impl<P: Poly> PolyCircuit<P> {
 
     fn build_scoped_gate_id_map(
         &self,
-        call_id_base: u128,
-        gate_id_base: u128,
-    ) -> HashMap<u128, GateId> {
+        call_id_base: &ScopedGateKey,
+        gate_id_base: &ScopedGateKey,
+    ) -> HashMap<ScopedGateKey, GateId> {
         let mut scoped_keys = BTreeSet::new();
-        self.collect_scoped_gate_keys(0, call_id_base, gate_id_base, &mut scoped_keys);
+        let root_prefix = ScopedGateKey::from(0u32);
+        self.collect_scoped_gate_keys(&root_prefix, call_id_base, gate_id_base, &mut scoped_keys);
 
         let mut scoped_gate_ids = HashMap::with_capacity(scoped_keys.len());
         let mut max_direct_gate_id = 0usize;
         let mut overflow_keys = Vec::new();
+        let max_usize_key = ScopedGateKey::from(usize::MAX);
         for scoped_key in scoped_keys {
-            if scoped_key <= usize::MAX as u128 {
-                let gate_id = GateId(scoped_key as usize);
+            if scoped_key <= max_usize_key {
+                let gate_id = GateId(
+                    scoped_key
+                        .to_usize()
+                        .expect("scoped gate id must fit in usize after bounds check"),
+                );
                 max_direct_gate_id = max_direct_gate_id.max(gate_id.0);
                 scoped_gate_ids.insert(scoped_key, gate_id);
             } else {
@@ -143,16 +149,23 @@ impl<P: Poly> PolyCircuit<P> {
         scoped_gate_ids
     }
 
+    fn scoped_key(
+        call_prefix: &ScopedGateKey,
+        key_base: &ScopedGateKey,
+        component: usize,
+    ) -> ScopedGateKey {
+        let mut key = call_prefix * key_base;
+        key += ScopedGateKey::from(component);
+        key
+    }
+
     fn scoped_gate_id(
-        scoped_gate_ids: &HashMap<u128, GateId>,
-        call_prefix: u128,
+        scoped_gate_ids: &HashMap<ScopedGateKey, GateId>,
+        call_prefix: &ScopedGateKey,
         gate_id: GateId,
-        gate_id_base: u128,
+        gate_id_base: &ScopedGateKey,
     ) -> GateId {
-        let scoped_key = call_prefix
-            .checked_mul(gate_id_base)
-            .and_then(|base| base.checked_add(gate_id.0 as u128))
-            .expect("scoped gate key overflow");
+        let scoped_key = Self::scoped_key(call_prefix, gate_id_base, gate_id.0);
         *scoped_gate_ids.get(&scoped_key).expect("missing precomputed scoped gate id")
     }
 
@@ -165,10 +178,10 @@ impl<P: Poly> PolyCircuit<P> {
         param_bindings: &[SubCircuitParamValue],
         plt_evaluator: Option<&PE>,
         slot_transfer_evaluator: Option<&dyn SlotTransferEvaluator<E>>,
-        call_prefix: u128,
-        call_id_base: u128,
-        gate_id_base: u128,
-        scoped_gate_ids: &HashMap<u128, GateId>,
+        call_prefix: &ScopedGateKey,
+        call_id_base: &ScopedGateKey,
+        gate_id_base: &ScopedGateKey,
+        scoped_gate_ids: &HashMap<ScopedGateKey, GateId>,
         parallel_gates: Option<usize>,
     ) -> Vec<Arc<E::Compact>>
     where
@@ -391,10 +404,8 @@ impl<P: Poly> PolyCircuit<P> {
                         .expect("sub-circuit call missing")
                         .clone();
                     let param_bindings = self.binding_set(call.binding_set_id);
-                    let child_prefix = call_prefix
-                        .checked_mul(call_id_base)
-                        .and_then(|base| base.checked_add((call.scoped_call_id as u128) + 1))
-                        .expect("sub-circuit call prefix overflow");
+                    let child_prefix =
+                        Self::scoped_key(call_prefix, call_id_base, call.scoped_call_id + 1);
                     let sub_inputs =
                         self.with_sub_circuit_call_inputs(&call, |shared_prefix, suffix| {
                             let mut inputs = Vec::with_capacity(
@@ -418,7 +429,7 @@ impl<P: Poly> PolyCircuit<P> {
                             param_bindings.as_ref(),
                             plt_evaluator,
                             slot_transfer_evaluator,
-                            child_prefix,
+                            &child_prefix,
                             call_id_base,
                             gate_id_base,
                             scoped_gate_ids,
@@ -449,10 +460,8 @@ impl<P: Poly> PolyCircuit<P> {
                         .zip(call.scoped_call_ids.iter())
                     {
                         let bound_params = self.binding_set(*binding_set_id);
-                        let child_prefix = call_prefix
-                            .checked_mul(call_id_base)
-                            .and_then(|base| base.checked_add((*scoped_call_id as u128) + 1))
-                            .expect("summed sub-circuit call prefix overflow");
+                        let child_prefix =
+                            Self::scoped_key(call_prefix, call_id_base, *scoped_call_id + 1);
                         let sub_inputs = self
                             .input_set(*input_set_id)
                             .as_ref()
@@ -473,7 +482,7 @@ impl<P: Poly> PolyCircuit<P> {
                                     bound_params.as_ref(),
                                     plt_evaluator,
                                     slot_transfer_evaluator,
-                                    child_prefix,
+                                    &child_prefix,
                                     call_id_base,
                                     gate_id_base,
                                     scoped_gate_ids,

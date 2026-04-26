@@ -192,6 +192,7 @@ enum LoadedGateInputs<E: Evaluable> {
     SkipExisting,
     Unary(E),
     Binary(E, E),
+    Many(Vec<E>),
 }
 
 #[cfg(feature = "gpu")]

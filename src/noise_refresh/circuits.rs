@@ -420,12 +420,11 @@ fn sum_gate_ids<P: Poly>(circuit: &mut PolyCircuit<P>, values: &[GateId]) -> Gat
     rest.iter().fold(*first, |acc, value| circuit.add_gate(acc, *value).as_single_wire())
 }
 
-fn decrypt_ring_gsw_coeff_chunk_sum<P, A, M>(
+fn decrypt_ring_gsw_coeff_slot_batch_sum<P, A, M>(
     circuit: &mut PolyCircuit<P>,
-    encrypted_coeffs: &[RingGswCiphertext<P, A>],
+    encrypted_coeff_chunks_by_slot: &[&[RingGswCiphertext<P, A>]],
     decryption_key: GateId,
     plaintext_modulus: BigUint,
-    output_slot: usize,
 ) -> GateId
 where
     P: Poly + 'static,
@@ -433,43 +432,53 @@ where
     M: PolyMatrix<P = P>,
 {
     assert!(!plaintext_modulus.is_zero(), "plaintext_modulus must be positive");
-    // This helper handles one error chunk of length `ring_dim`.  Each ciphertext decrypts one
-    // coefficient under the same plaintext modulus `q_j`; after decryption the coefficient is moved
-    // into its polynomial position by multiplying with `X^k`.
-    let first_ctx: Arc<RingGswContext<P, A>> = encrypted_coeffs
+    // This helper handles one logical error chunk across all output slots.  Each output slot owns
+    // `ring_dim` encrypted coefficient ciphertexts.  For a fixed coefficient index, `decrypt_batch`
+    // decrypts the ciphertext from every output slot at once and returns one slotwise wire whose
+    // slot `i` contains the coefficient for output slot `i`.  Multiplying by `X^k` and summing over
+    // coefficient indices reconstructs all `ring_dim` output polynomials inside one wire.
+    let first_ctx: Arc<RingGswContext<P, A>> = encrypted_coeff_chunks_by_slot
         .first()
+        .and_then(|chunk| chunk.first())
         .expect("at least one encrypted coefficient is required")
         .ctx
         .clone();
     let ring_dim = first_ctx.params.ring_dimension() as usize;
     assert_eq!(
-        encrypted_coeffs.len(),
+        encrypted_coeff_chunks_by_slot.len(),
         ring_dim,
-        "encrypted coefficient chunk length {} must match ring_dim {}",
-        encrypted_coeffs.len(),
+        "encrypted coefficient slot batch length {} must match ring_dim {}",
+        encrypted_coeff_chunks_by_slot.len(),
         ring_dim
     );
-    for (idx, ciphertext) in encrypted_coeffs.iter().enumerate() {
-        assert!(
-            Arc::ptr_eq(&ciphertext.ctx, &first_ctx),
-            "encrypted coefficient {idx} must share the first Ring-GSW context"
+    for (slot_idx, encrypted_coeffs) in encrypted_coeff_chunks_by_slot.iter().enumerate() {
+        assert_eq!(
+            encrypted_coeffs.len(),
+            ring_dim,
+            "encrypted coefficient chunk for slot {slot_idx} must have ring_dim entries"
         );
+        for (coeff_idx, ciphertext) in encrypted_coeffs.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(&ciphertext.ctx, &first_ctx),
+                "encrypted coefficient ({slot_idx}, {coeff_idx}) must share the first Ring-GSW context"
+            );
+        }
     }
 
-    let terms = encrypted_coeffs
-        .iter()
-        .enumerate()
-        .map(|(coeff_idx, ciphertext)| {
-            // Decrypt the coefficient, place it at coefficient index `coeff_idx`, and later sum all
-            // coefficient terms into a single polynomial wire.
-            let decrypted = ciphertext.decrypt_to_slot::<M>(
+    let terms = (0..ring_dim)
+        .map(|coeff_idx| {
+            let ciphertexts = encrypted_coeff_chunks_by_slot
+                .iter()
+                .map(|chunk| &chunk[coeff_idx])
+                .collect::<Vec<_>>();
+            let decrypted_coeff_batch = RingGswCiphertext::decrypt_batch::<M>(
+                ciphertexts.as_slice(),
                 decryption_key,
                 plaintext_modulus.clone(),
-                output_slot,
                 circuit,
             );
             let scalar = monomial_scalar(ring_dim, coeff_idx);
-            circuit.small_scalar_mul(decrypted, &scalar).as_single_wire()
+            circuit.small_scalar_mul(decrypted_coeff_batch, &scalar).as_single_wire()
         })
         .collect::<Vec<_>>();
     sum_gate_ids(circuit, &terms)
@@ -481,7 +490,27 @@ fn decrypt_ring_gsw_bit_chunk_sum<P, A, M>(
     decryption_key: GateId,
     bit_size: usize,
     scale: &BigUint,
-    output_slot: usize,
+) -> GateId
+where
+    P: Poly + 'static,
+    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
+    M: PolyMatrix<P = P>,
+{
+    decrypt_ring_gsw_bit_slot_batch_sum::<P, A, M>(
+        circuit,
+        &[encrypted_bits],
+        decryption_key,
+        bit_size,
+        scale,
+    )
+}
+
+fn decrypt_ring_gsw_bit_slot_batch_sum<P, A, M>(
+    circuit: &mut PolyCircuit<P>,
+    encrypted_bit_chunks_by_slot: &[&[RingGswCiphertext<P, A>]],
+    decryption_key: GateId,
+    bit_size: usize,
+    scale: &BigUint,
 ) -> GateId
 where
     P: Poly + 'static,
@@ -489,43 +518,49 @@ where
     M: PolyMatrix<P = P>,
 {
     let plaintext_moduli = ring_gsw_noise_refresh_plaintext_moduli(bit_size, scale);
-    // One mask chunk has layout `[coeff_0 bits..., coeff_1 bits..., ...]`, where each coefficient
-    // owns `bit_size` encrypted bits.  The final output is one polynomial wire, so the circuit
-    // first collapses the bits for each coefficient and then places that coefficient sum at
-    // `X^k`.
-    let first_ctx: Arc<RingGswContext<P, A>> =
-        encrypted_bits.first().expect("at least one encrypted bit is required").ctx.clone();
+    let first_ctx: Arc<RingGswContext<P, A>> = encrypted_bit_chunks_by_slot
+        .first()
+        .and_then(|chunk| chunk.first())
+        .expect("at least one encrypted bit is required")
+        .ctx
+        .clone();
     let ring_dim = first_ctx.params.ring_dimension() as usize;
     let expected_len = ring_dim.checked_mul(bit_size).expect("Ring-GSW bit chunk length overflow");
-    assert_eq!(
-        encrypted_bits.len(),
-        expected_len,
-        "encrypted bit chunk length {} must equal ring_dim * bit_size {}",
-        encrypted_bits.len(),
-        expected_len
+    assert!(
+        encrypted_bit_chunks_by_slot.len() <= ring_dim,
+        "encrypted bit slot batch length {} must be at most ring_dim {}",
+        encrypted_bit_chunks_by_slot.len(),
+        ring_dim
     );
-    for (idx, ciphertext) in encrypted_bits.iter().enumerate() {
-        assert!(
-            Arc::ptr_eq(&ciphertext.ctx, &first_ctx),
-            "encrypted bit ciphertext {idx} must share the first Ring-GSW context"
+    for (slot_idx, encrypted_bits) in encrypted_bit_chunks_by_slot.iter().enumerate() {
+        assert_eq!(
+            encrypted_bits.len(),
+            expected_len,
+            "encrypted bit chunk for slot {slot_idx} must equal ring_dim * bit_size"
         );
+        for (idx, ciphertext) in encrypted_bits.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(&ciphertext.ctx, &first_ctx),
+                "encrypted bit ciphertext ({slot_idx}, {idx}) must share the first Ring-GSW context"
+            );
+        }
     }
 
-    let coeff_terms = encrypted_bits
-        .chunks_exact(bit_size)
-        .enumerate()
-        .map(|(coeff_idx, bit_ciphertexts)| {
+    let coeff_terms = (0..ring_dim)
+        .map(|coeff_idx| {
             // For a fixed coefficient, decrypt every bit under its bit-dependent plaintext modulus
             // `scale / 2^j`, sum those decrypted bit contributions, and then move the coefficient
             // aggregate into the polynomial slot for this coefficient.
-            let bit_terms = bit_ciphertexts
-                .iter()
-                .enumerate()
-                .map(|(bit_idx, ciphertext)| {
-                    ciphertext.decrypt_to_slot::<M>(
+            let bit_terms = (0..bit_size)
+                .map(|bit_idx| {
+                    let ciphertexts = encrypted_bit_chunks_by_slot
+                        .iter()
+                        .map(|chunk| &chunk[coeff_idx * bit_size + bit_idx])
+                        .collect::<Vec<_>>();
+                    RingGswCiphertext::decrypt_batch::<M>(
+                        ciphertexts.as_slice(),
                         decryption_key,
                         plaintext_moduli[bit_idx].clone(),
-                        output_slot,
                         circuit,
                     )
                 })
@@ -610,7 +645,6 @@ where
                 decryption_key,
                 bit_size,
                 scale,
-                0,
             )
         })
         .collect::<Vec<_>>();
@@ -726,11 +760,9 @@ where
     //     * ring_dim extra output groups
     //     * ring_dim
     //
-    // The extra `ring_dim` factor is interpreted as `ring_dim` slot chunks.  Slot chunk `i`
-    // contains the same old `ring_dim`-sized coefficient chunks, and every decrypt inside that
-    // chunk writes to decrypt output slot `i`.  The decoded error output count is
-    // `seed_bits * input_bits_per_step * crt_depth * ciphertext_wire_count * log_base_q *
-    // ring_dim`.
+    // The extra `ring_dim` factor is interpreted as `ring_dim` slot chunks.  The chunks are decoded
+    // together with `decrypt_batch`, so one output wire carries all `ring_dim` slot results instead
+    // of exposing one separate wire per slot.
     let expanded_seed_bits = seed_bits
         .checked_mul(input_bits_per_step)
         .expect("seed_bits * input_bits_per_step overflow");
@@ -755,24 +787,28 @@ where
         expanded_seed_bits
             .checked_mul(crt_depth)
             .and_then(|value| value.checked_mul(base_error_chunks_per_seed))
-            .and_then(|value| value.checked_mul(ring_dim))
             .expect("decrypted error output count overflow"),
     );
     for seed_errors in errors.chunks_exact(errors_per_seed) {
-        for (output_slot, slot_errors) in seed_errors.chunks_exact(error_slot_chunk_len).enumerate()
-        {
-            for error_chunk in slot_errors.chunks_exact(ring_dim) {
-                for &q_j in &q_moduli {
-                    // Each error chunk already represents all coefficients of one polynomial.  The
-                    // decrypt helper places every coefficient in its monomial slot and sums them.
-                    decrypted_errors.push(decrypt_ring_gsw_coeff_chunk_sum::<P, A, M>(
-                        &mut circuit,
-                        error_chunk,
-                        decryption_key,
-                        BigUint::from(q_j),
-                        output_slot,
-                    ));
-                }
+        let slot_error_chunks = seed_errors.chunks_exact(error_slot_chunk_len).collect::<Vec<_>>();
+        for base_chunk_idx in 0..base_error_chunks_per_seed {
+            let error_chunks_by_slot = slot_error_chunks
+                .iter()
+                .map(|slot_errors| {
+                    let start = base_chunk_idx * ring_dim;
+                    &slot_errors[start..start + ring_dim]
+                })
+                .collect::<Vec<_>>();
+            for &q_j in &q_moduli {
+                // Each coefficient position is decrypted across all slot chunks in one
+                // `decrypt_batch` call, then the coefficient terms are recombined into one
+                // slotwise polynomial wire.
+                decrypted_errors.push(decrypt_ring_gsw_coeff_slot_batch_sum::<P, A, M>(
+                    &mut circuit,
+                    error_chunks_by_slot.as_slice(),
+                    decryption_key,
+                    BigUint::from(q_j),
+                ));
             }
         }
     }
@@ -788,8 +824,8 @@ where
     //     * v_bits
     //
     // Unlike errors, masks already contain a distinct `ring_dim * v_bits` ciphertext block for
-    // every CRT level.  The extra `ring_dim` factor is again interpreted as slot chunks: mask slot
-    // chunk `i` is decrypted into output slot `i`.
+    // every CRT level.  The extra `ring_dim` factor is again interpreted as slot chunks and decoded
+    // together with `decrypt_batch`.
     let expected_mask_count = expanded_seed_bits
         .checked_mul(ciphertext_wire_count)
         .and_then(|value| value.checked_mul(ring_dim))
@@ -806,11 +842,6 @@ where
     let full_q: Arc<BigUint> = ring_gsw.params.modulus().into();
     let base_mask_group_count =
         ciphertext_wire_count.checked_mul(log_base_q).expect("base mask group count overflow");
-    let mask_group_count = expanded_seed_bits
-        .checked_mul(ciphertext_wire_count)
-        .and_then(|value| value.checked_mul(log_base_q))
-        .and_then(|value| value.checked_mul(ring_dim))
-        .expect("mask group count overflow");
     let mask_q_chunk_len = ring_dim.checked_mul(v_bits).expect("mask q chunk length overflow");
     let mask_group_len =
         mask_q_chunk_len.checked_mul(crt_depth).expect("mask group length overflow");
@@ -819,24 +850,31 @@ where
     let masks_per_seed =
         mask_slot_chunk_len.checked_mul(ring_dim).expect("masks per seed overflow");
     let mut decrypted_masks = Vec::with_capacity(
-        mask_group_count.checked_mul(crt_depth).expect("decrypted mask output count overflow"),
+        expanded_seed_bits
+            .checked_mul(base_mask_group_count)
+            .and_then(|value| value.checked_mul(crt_depth))
+            .expect("decrypted mask output count overflow"),
     );
     for seed_masks in masks.chunks_exact(masks_per_seed) {
-        for (output_slot, slot_masks) in seed_masks.chunks_exact(mask_slot_chunk_len).enumerate() {
-            for mask_group in slot_masks.chunks_exact(mask_group_len) {
-                for mask_q_chunk in mask_group.chunks_exact(mask_q_chunk_len) {
-                    // `decrypt_ring_gsw_bit_chunk_sum` performs the bit-wise and coefficient-wise
-                    // collapse for one CRT-specific mask chunk and returns a single polynomial
-                    // wire.
-                    decrypted_masks.push(decrypt_ring_gsw_bit_chunk_sum::<P, A, M>(
-                        &mut circuit,
-                        mask_q_chunk,
-                        decryption_key,
-                        v_bits,
-                        full_q.as_ref(),
-                        output_slot,
-                    ));
-                }
+        let slot_mask_chunks = seed_masks.chunks_exact(mask_slot_chunk_len).collect::<Vec<_>>();
+        for base_group_idx in 0..base_mask_group_count {
+            for crt_idx in 0..crt_depth {
+                let mask_q_chunks_by_slot = slot_mask_chunks
+                    .iter()
+                    .map(|slot_masks| {
+                        let start = base_group_idx * mask_group_len + crt_idx * mask_q_chunk_len;
+                        &slot_masks[start..start + mask_q_chunk_len]
+                    })
+                    .collect::<Vec<_>>();
+                // The bit-wise and coefficient-wise collapse is performed across all slot chunks,
+                // producing one slotwise polynomial wire for this CRT-specific mask group.
+                decrypted_masks.push(decrypt_ring_gsw_bit_slot_batch_sum::<P, A, M>(
+                    &mut circuit,
+                    mask_q_chunks_by_slot.as_slice(),
+                    decryption_key,
+                    v_bits,
+                    full_q.as_ref(),
+                ));
             }
         }
     }

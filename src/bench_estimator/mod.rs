@@ -333,6 +333,10 @@ pub trait BenchEstimator<E: Evaluable> {
                 let src_slots = src_slots.resolve_slot_transfer(param_bindings);
                 self.estimate_slot_transfer(src_slots.as_ref())
             }
+            PolyGateType::SlotReduce { num_slots, .. } => {
+                let src_slots = vec![(0u32, None); *num_slots];
+                self.estimate_slot_transfer(&src_slots)
+            }
             PolyGateType::PubLut { lut_id } => {
                 self.estimate_public_lookup(lut_id.resolve_public_lookup(param_bindings))
             }

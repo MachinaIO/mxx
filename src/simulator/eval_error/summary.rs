@@ -117,6 +117,24 @@ impl PolyCircuit<DCRTPoly> {
                     .expect("slot transfer evaluator missing")
                     .slot_transfer_affine(input.as_ref(), src_slots.as_ref(), gate_id)
             }
+            PolyGateType::SlotReduce { .. } => {
+                let mut inputs = gate.input_gates.iter().copied().map(|input_id| {
+                    self.clone_error_norm_summary_expr_for_leaf_replay_gate(
+                        input_id,
+                        gate_exprs,
+                        input_gate_positions,
+                    )
+                });
+                let mut sum = inputs
+                    .next()
+                    .expect("SlotReduce must have at least one input")
+                    .as_ref()
+                    .clone();
+                for input in inputs {
+                    sum = sum.add_bound(input.as_ref());
+                }
+                sum
+            }
             PolyGateType::PubLut { lut_id } => {
                 let lut_id = lut_id.resolve_public_lookup(param_bindings);
                 let input = self.clone_error_norm_summary_expr_for_leaf_replay_gate(
@@ -305,9 +323,9 @@ impl PolyCircuit<DCRTPoly> {
                             PolyGateType::Mul |
                             PolyGateType::SmallScalarMul { .. } |
                             PolyGateType::LargeScalarMul { .. } => acc.0.push(gate_id),
-                            PolyGateType::SlotTransfer { .. } | PolyGateType::PubLut { .. } => {
-                                acc.1.push(gate_id)
-                            }
+                            PolyGateType::SlotTransfer { .. } |
+                            PolyGateType::SlotReduce { .. } |
+                            PolyGateType::PubLut { .. } => acc.1.push(gate_id),
                             PolyGateType::SubCircuitOutput { .. } |
                             PolyGateType::SummedSubCircuitOutput { .. } => {
                                 unreachable!(
@@ -913,6 +931,22 @@ impl PolyCircuit<DCRTPoly> {
                             .clone() *
                             &scalar_poly
                     }
+                    PolyGateType::SlotReduce { .. } => {
+                        let mut inputs = gate.input_gates.iter().copied().map(|input_id| {
+                            plaintext_norms
+                                .get(&input_id)
+                                .unwrap_or_else(|| {
+                                    panic!("missing plaintext norm for gate {}", input_id)
+                                })
+                                .clone()
+                        });
+                        let mut sum =
+                            inputs.next().expect("SlotReduce must have at least one input");
+                        for input in inputs {
+                            sum = &sum + &input;
+                        }
+                        sum
+                    }
                     PolyGateType::PubLut { lut_id } => {
                         let lut_id = lut_id.resolve_public_lookup(param_bindings);
                         let plt = self.lookup_table(lut_id);
@@ -1175,9 +1209,9 @@ impl PolyCircuit<DCRTPoly> {
                             PolyGateType::Mul |
                             PolyGateType::SmallScalarMul { .. } |
                             PolyGateType::LargeScalarMul { .. } => acc.0.push(gate_id),
-                            PolyGateType::SlotTransfer { .. } | PolyGateType::PubLut { .. } => {
-                                acc.1.push(gate_id)
-                            }
+                            PolyGateType::SlotTransfer { .. } |
+                            PolyGateType::SlotReduce { .. } |
+                            PolyGateType::PubLut { .. } => acc.1.push(gate_id),
                             PolyGateType::SubCircuitOutput { .. } |
                             PolyGateType::SummedSubCircuitOutput { .. } => {
                                 unreachable!(

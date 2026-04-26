@@ -23,6 +23,7 @@ pub enum PolyGateKind {
     SmallScalarMul,
     LargeScalarMul,
     SlotTransfer,
+    SlotReduce,
     PubLut,
     SubCircuitOutput,
     SummedSubCircuitOutput,
@@ -264,6 +265,7 @@ pub enum PolyGateType {
     SmallScalarMul { scalar: GateParamSource<Vec<u32>> },
     LargeScalarMul { scalar: GateParamSource<Vec<BigUint>> },
     SlotTransfer { src_slots: GateParamSource<SlotTransferSpec> },
+    SlotReduce { num_slots: usize, input_count: usize },
     PubLut { lut_id: GateParamSource<usize> },
     SubCircuitOutput { call_id: usize, output_idx: usize, num_inputs: usize },
     SummedSubCircuitOutput { summed_call_id: usize, output_idx: usize, num_inputs: usize },
@@ -277,6 +279,7 @@ impl PolyGateType {
             PolyGateType::LargeScalarMul { .. } |
             PolyGateType::SlotTransfer { .. } |
             PolyGateType::PubLut { .. } => 1,
+            PolyGateType::SlotReduce { input_count, .. } => *input_count,
             PolyGateType::SubCircuitOutput { num_inputs, .. } |
             PolyGateType::SummedSubCircuitOutput { num_inputs, .. } => *num_inputs,
             PolyGateType::Add | PolyGateType::Sub | PolyGateType::Mul => 2,
@@ -292,6 +295,7 @@ impl PolyGateType {
             PolyGateType::SmallScalarMul { .. } => PolyGateKind::SmallScalarMul,
             PolyGateType::LargeScalarMul { .. } => PolyGateKind::LargeScalarMul,
             PolyGateType::SlotTransfer { .. } => PolyGateKind::SlotTransfer,
+            PolyGateType::SlotReduce { .. } => PolyGateKind::SlotReduce,
             PolyGateType::PubLut { .. } => PolyGateKind::PubLut,
             PolyGateType::SubCircuitOutput { .. } => PolyGateKind::SubCircuitOutput,
             PolyGateType::SummedSubCircuitOutput { .. } => PolyGateKind::SummedSubCircuitOutput,

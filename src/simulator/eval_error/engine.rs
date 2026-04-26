@@ -75,9 +75,9 @@ impl PolyCircuit<DCRTPoly> {
                             PolyGateType::Mul |
                             PolyGateType::SmallScalarMul { .. } |
                             PolyGateType::LargeScalarMul { .. } => acc.0.push(gate_id),
-                            PolyGateType::SlotTransfer { .. } | PolyGateType::PubLut { .. } => {
-                                acc.1.push(gate_id)
-                            }
+                            PolyGateType::SlotTransfer { .. } |
+                            PolyGateType::SlotReduce { .. } |
+                            PolyGateType::PubLut { .. } => acc.1.push(gate_id),
                             PolyGateType::SubCircuitOutput { .. } |
                             PolyGateType::SummedSubCircuitOutput { .. } => {
                                 unreachable!(

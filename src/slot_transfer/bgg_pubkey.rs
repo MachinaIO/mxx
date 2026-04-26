@@ -112,7 +112,6 @@ where
     chunk
 }
 
-#[cfg(not(feature = "gpu"))]
 pub(crate) fn left_mul_chunked_checkpoint_column<M>(
     params: &<M::P as Poly>::Params,
     dir: &std::path::Path,
@@ -133,6 +132,8 @@ where
 pub struct BggPublicKeySTGateState {
     pub input_pubkey_bytes: Vec<u8>,
     pub src_slots: Vec<(u32, Option<u32>)>,
+    pub slot_reduce_input_pubkey_bytes: Option<Vec<Vec<u8>>>,
+    pub slot_reduce_num_slots: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -287,6 +288,52 @@ where
             None => rhs_chunk,
         };
         let mut target_chunk = lhs_chunk - rhs_chunk;
+        target_chunk.add_in_place(&self.sample_error_matrix(params, self.secret_size, col_len));
+        target_chunk
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn build_slot_reduce_gate_target_chunk(
+        &self,
+        params: &<M::P as Poly>::Params,
+        gate_id: GateId,
+        input_pubkey_bytes: &[u8],
+        dst_slot: usize,
+        slot_secret_mats: &[Vec<u8>],
+        slot_a_bytes_by_slot: &[Vec<u8>],
+        num_slots: usize,
+        chunk_idx: usize,
+    ) -> M {
+        let m_g = self.secret_size * params.modulus_digits();
+        let (col_start, col_len) = column_chunk_bounds(m_g, chunk_idx);
+        let s_dst = M::from_compact_bytes(params, slot_secret_mats[dst_slot].as_ref());
+        let lhs_chunk = s_dst.clone() *
+            &HS::new().sample_hash_columns(
+                params,
+                self.hash_key,
+                format!("slot_reduce_gate_a_out_{}", gate_id),
+                self.secret_size,
+                m_g,
+                col_start,
+                col_len,
+                DistType::FinRingDist,
+            );
+
+        let a_in = M::from_compact_bytes(params, input_pubkey_bytes);
+        let mut rhs_acc = M::zero(params, self.secret_size, col_len);
+        for src_slot in 0..num_slots {
+            let s_src = M::from_compact_bytes(params, slot_secret_mats[src_slot].as_ref());
+            let a_dst = M::from_compact_bytes(params, slot_a_bytes_by_slot[dst_slot].as_ref());
+            let lhs_input = s_src * &a_in;
+            let a_dst_chunk = a_dst.slice_columns(col_start, col_start + col_len).decompose();
+            let mut monomial = vec![0u32; params.ring_dimension() as usize];
+            monomial[src_slot] = 1;
+            let scalar_poly = M::P::from_u32s(params, &monomial);
+            let rhs_chunk = (lhs_input * a_dst_chunk) * &scalar_poly;
+            rhs_acc.add_in_place(&rhs_chunk);
+        }
+
+        let mut target_chunk = lhs_chunk - &rhs_acc;
         target_chunk.add_in_place(&self.sample_error_matrix(params, self.secret_size, col_len));
         target_chunk
     }
@@ -535,6 +582,8 @@ where
             BggPublicKeySTGateState {
                 input_pubkey_bytes: input.matrix.to_compact_bytes(),
                 src_slots: src_slots.to_vec(),
+                slot_reduce_input_pubkey_bytes: None,
+                slot_reduce_num_slots: None,
             },
         );
     }
@@ -680,11 +729,39 @@ where
         let m_g = self.secret_size * params.modulus_digits();
         let chunk_count = column_chunk_count(m_g);
         let trap_sampler = TS::new(params, self.trapdoor_sigma);
+        let slot_reduce_inputs = state.slot_reduce_input_pubkey_bytes.as_ref();
+        let slot_reduce_num_slots = state.slot_reduce_num_slots;
         let a_in = M::from_compact_bytes(params, &state.input_pubkey_bytes);
         slot_chunk
             .par_iter()
             .copied()
             .map(|(dst_slot, (src_slot_u32, scalar))| {
+                if let (Some(input_pubkey_bytes), Some(num_slots)) =
+                    (slot_reduce_inputs, slot_reduce_num_slots)
+                {
+                    assert!(
+                        dst_slot < input_pubkey_bytes.len(),
+                        "slot_reduce dst_slot {} exceeds input count {}",
+                        dst_slot,
+                        input_pubkey_bytes.len()
+                    );
+                    let preimage_chunks = (0..chunk_count)
+                        .map(|chunk_idx| {
+                            let target_chunk = self.build_slot_reduce_gate_target_chunk(
+                                params,
+                                gate_id,
+                                &input_pubkey_bytes[dst_slot],
+                                dst_slot,
+                                slot_secret_mats,
+                                slot_a_bytes_by_slot,
+                                num_slots,
+                                chunk_idx,
+                            );
+                            trap_sampler.preimage(params, b0_trapdoor, b0_matrix, &target_chunk)
+                        })
+                        .collect::<Vec<_>>();
+                    return (dst_slot, preimage_chunks);
+                }
                 let src_slot =
                     usize::try_from(src_slot_u32).expect("source slot index must fit in usize");
                 assert!(
@@ -1068,6 +1145,8 @@ where
         let state = BggPublicKeySTGateState {
             input_pubkey_bytes: M::gadget_matrix(params, self.secret_size).into_compact_bytes(),
             src_slots: vec![(0u32, None)],
+            slot_reduce_input_pubkey_bytes: None,
+            slot_reduce_num_slots: None,
         };
         let start = Instant::now();
         let a_in = M::from_compact_bytes(params, &state.input_pubkey_bytes);
@@ -1121,6 +1200,57 @@ where
         );
         BggPublicKey { matrix: a_out, reveal_plaintext: true }
     }
+
+    fn slot_reduce(
+        &self,
+        params: &<M::P as Poly>::Params,
+        inputs: &[BggPublicKey<M>],
+        num_slots: usize,
+        gate_id: GateId,
+    ) -> BggPublicKey<M> {
+        assert!(num_slots > 0, "slot_reduce requires num_slots > 0");
+        assert!(!inputs.is_empty(), "slot_reduce requires at least one input");
+        assert!(
+            inputs.len() <= num_slots,
+            "slot_reduce input count {} exceeds num_slots {}",
+            inputs.len(),
+            num_slots
+        );
+        for input in inputs {
+            assert_eq!(
+                input.matrix.row_size(),
+                self.secret_size,
+                "slot_reduce input public key row size must match evaluator secret_size"
+            );
+            assert_eq!(
+                input.matrix.col_size(),
+                self.secret_size * params.modulus_digits(),
+                "slot_reduce input public key column size must match gadget width"
+            );
+        }
+        self.gate_states.insert(
+            gate_id,
+            BggPublicKeySTGateState {
+                input_pubkey_bytes: inputs[0].matrix.to_compact_bytes(),
+                src_slots: (0..inputs.len()).map(|_| (0u32, None)).collect(),
+                slot_reduce_input_pubkey_bytes: Some(
+                    inputs.iter().map(|input| input.matrix.to_compact_bytes()).collect(),
+                ),
+                slot_reduce_num_slots: Some(num_slots),
+            },
+        );
+
+        let hash_sampler = HS::new();
+        let a_out = hash_sampler.sample_hash(
+            params,
+            self.hash_key,
+            format!("slot_reduce_gate_a_out_{}", gate_id),
+            self.secret_size,
+            self.secret_size * params.modulus_digits(),
+            DistType::FinRingDist,
+        );
+        BggPublicKey { matrix: a_out, reveal_plaintext: true }
+    }
 }
 
 #[cfg(test)]
@@ -1132,7 +1262,10 @@ mod tests {
         circuit::PolyCircuit,
         lookup::{PltEvaluator, PublicLut},
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
-        poly::{Poly, PolyParams, dcrt::params::DCRTPolyParams},
+        poly::{
+            Poly, PolyParams,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
         sampler::{
             DistType, PolyHashSampler, hash::DCRTPolyHashSampler,
             trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
@@ -1358,6 +1491,211 @@ mod tests {
         let stored = evaluator.gate_state(transferred_gate).expect("missing stored gate state");
         assert_eq!(stored.input_pubkey_bytes, input_pubkey.matrix.to_compact_bytes());
         assert_eq!(stored.src_slots, src_slots);
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_slot_reduce_bgg_public_key_records_state_and_hashes_output_matrix() {
+        let params = DCRTPolyParams::default();
+        let hash_key = [0x64u8; 32];
+        let secret_size = 2usize;
+        let num_slots = 3usize;
+        let m_g = secret_size * params.modulus_digits();
+        let inputs = (0..2)
+            .map(|idx| {
+                BggPublicKey::new(
+                    DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
+                        &params,
+                        hash_key,
+                        format!("slot_reduce_pubkey_input_{idx}"),
+                        secret_size,
+                        m_g,
+                        DistType::FinRingDist,
+                    ),
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        let one = BggPublicKey::new(
+            DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
+                &params,
+                hash_key,
+                "slot_reduce_pubkey_one".to_string(),
+                secret_size,
+                m_g,
+                DistType::FinRingDist,
+            ),
+            true,
+        );
+
+        let mut circuit = PolyCircuit::new();
+        let input_wires = circuit.input(2).to_vec();
+        let reduced = circuit.slot_reduce_gate(&[input_wires[0], input_wires[1]], num_slots);
+        let reduced_gate = reduced.as_single_wire();
+        circuit.output(vec![reduced]);
+
+        let evaluator = BggPublicKeySTEvaluator::<
+            DCRTPolyMatrix,
+            DCRTPolyUniformSampler,
+            DCRTPolyHashSampler<Keccak256>,
+            DCRTPolyTrapdoorSampler,
+        >::new(
+            hash_key,
+            secret_size,
+            num_slots,
+            SIGMA,
+            0.0,
+            "test_data/test_slot_reduce_gate_state".into(),
+        );
+        let result = circuit.eval(
+            &params,
+            one,
+            inputs.clone(),
+            None::<&DummyPubKeyPltEvaluator>,
+            Some(&evaluator),
+            None,
+        );
+
+        assert_eq!(result.len(), 1);
+        let expected_matrix = DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
+            &params,
+            hash_key,
+            format!("slot_reduce_gate_a_out_{}", reduced_gate),
+            secret_size,
+            m_g,
+            DistType::FinRingDist,
+        );
+        assert_eq!(result[0], BggPublicKey::new(expected_matrix, true));
+
+        let stored = evaluator.gate_state(reduced_gate).expect("missing stored gate state");
+        assert_eq!(
+            stored.slot_reduce_input_pubkey_bytes,
+            Some(inputs.iter().map(|input| input.matrix.to_compact_bytes()).collect())
+        );
+        assert_eq!(stored.slot_reduce_num_slots, Some(num_slots));
+        assert_eq!(stored.src_slots, vec![(0u32, None); inputs.len()]);
+    }
+
+    #[tokio::test]
+    #[sequential_test::sequential]
+    async fn test_slot_reduce_bgg_public_key_samples_aux_matrices() {
+        let _storage_lock = storage_test_lock().await;
+
+        let params = DCRTPolyParams::default();
+        let hash_key = [0x65u8; 32];
+        let secret_size = 2usize;
+        let num_slots = 3usize;
+        let m_g = secret_size * params.modulus_digits();
+        let dir_path = "test_data/test_slot_reduce_aux";
+        let dir = Path::new(dir_path);
+        if dir.exists() {
+            fs::remove_dir_all(dir).unwrap();
+        }
+        fs::create_dir_all(dir).unwrap();
+        init_storage_system(dir.to_path_buf());
+
+        let inputs = (0..2)
+            .map(|idx| {
+                BggPublicKey::new(
+                    DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
+                        &params,
+                        hash_key,
+                        format!("slot_reduce_aux_input_{idx}"),
+                        secret_size,
+                        m_g,
+                        DistType::FinRingDist,
+                    ),
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        let one = BggPublicKey::new(
+            DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
+                &params,
+                hash_key,
+                "slot_reduce_aux_one".to_string(),
+                secret_size,
+                m_g,
+                DistType::FinRingDist,
+            ),
+            true,
+        );
+
+        let mut circuit = PolyCircuit::new();
+        let input_wires = circuit.input(2).to_vec();
+        let reduced = circuit.slot_reduce_gate(&[input_wires[0], input_wires[1]], num_slots);
+        let reduced_gate = reduced.as_single_wire();
+        circuit.output(vec![reduced]);
+
+        let evaluator =
+            BggPublicKeySTEvaluator::<
+                DCRTPolyMatrix,
+                DCRTPolyUniformSampler,
+                DCRTPolyHashSampler<Keccak256>,
+                DCRTPolyTrapdoorSampler,
+            >::new(hash_key, secret_size, num_slots, SIGMA, 0.0, dir.to_path_buf());
+        let result = circuit.eval(
+            &params,
+            one,
+            inputs.clone(),
+            None::<&DummyPubKeyPltEvaluator>,
+            Some(&evaluator),
+            None,
+        );
+        assert_eq!(result.len(), 1);
+
+        evaluator.sample_aux_matrices(&params);
+        wait_for_all_writes(dir.to_path_buf()).await.unwrap();
+
+        let checkpoint_prefix = evaluator.checkpoint_prefix(&params);
+        let b0_matrix = evaluator
+            .load_b0_matrix_checkpoint(&params)
+            .expect("b0 matrix checkpoint should exist after sample_aux_matrices");
+        let slot_secret_mats = evaluator
+            .load_slot_secret_mats_checkpoint(&params)
+            .expect("slot secret matrix checkpoints should exist after sample_aux_matrices");
+        let a_out = DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
+            &params,
+            hash_key,
+            format!("slot_reduce_gate_a_out_{}", reduced_gate),
+            secret_size,
+            m_g,
+            DistType::FinRingDist,
+        );
+        let gate_total_cols = secret_size * params.modulus_digits();
+        for dst_slot in 0..2 {
+            let gate_preimage = read_matrix_from_column_chunks::<DCRTPolyMatrix>(
+                &params,
+                dir,
+                &format!("{}_gate_preimage_{}_dst{}", checkpoint_prefix, reduced_gate, dst_slot),
+                gate_total_cols,
+            );
+            let s_dst =
+                DCRTPolyMatrix::from_compact_bytes(&params, slot_secret_mats[dst_slot].as_ref());
+            let a_dst = DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
+                &params,
+                hash_key,
+                format!("slot_transfer_slot_a_{}", dst_slot),
+                secret_size,
+                m_g,
+                DistType::FinRingDist,
+            );
+            let mut rhs_acc = DCRTPolyMatrix::zero(&params, secret_size, m_g);
+            for src_slot in 0..num_slots {
+                let s_src = DCRTPolyMatrix::from_compact_bytes(
+                    &params,
+                    slot_secret_mats[src_slot].as_ref(),
+                );
+                let mut monomial = vec![0u32; params.ring_dimension() as usize];
+                monomial[src_slot] = 1;
+                let scalar_poly = DCRTPoly::from_u32s(&params, &monomial);
+                rhs_acc.add_in_place(
+                    &(((s_src * &inputs[dst_slot].matrix) * a_dst.decompose()) * scalar_poly),
+                );
+            }
+            let expected_target = s_dst * &a_out - rhs_acc;
+            assert_eq!(b0_matrix.clone() * &gate_preimage, expected_target);
+        }
     }
 
     #[sequential_test::sequential]

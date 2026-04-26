@@ -71,7 +71,9 @@ impl<P: Poly> PolyCircuit<P> {
     ) {
         for gate in self.gates.values() {
             match &gate.gate_type {
-                PolyGateType::SlotTransfer { .. } | PolyGateType::PubLut { .. } => {
+                PolyGateType::SlotTransfer { .. } |
+                PolyGateType::SlotReduce { .. } |
+                PolyGateType::PubLut { .. } => {
                     let scoped_key = call_prefix
                         .checked_mul(gate_id_base)
                         .and_then(|base| base.checked_add(gate.gate_id.0 as u128))
@@ -337,6 +339,26 @@ impl<P: Poly> PolyCircuit<P> {
                             .to_compact(),
                     )
                 }
+                PolyGateType::SlotReduce { num_slots, .. } => {
+                    let inputs = gate
+                        .input_gates
+                        .iter()
+                        .map(|input_id| {
+                            let input =
+                                wires.get(input_id).expect("wire missing for SlotReduce").clone();
+                            E::from_compact(eval_params, input.as_ref())
+                        })
+                        .collect::<Vec<_>>();
+                    let evaluator =
+                        slot_transfer_evaluator.expect("slot transfer evaluator missing");
+                    let scoped_gate_id =
+                        Self::scoped_gate_id(scoped_gate_ids, call_prefix, gate_id, gate_id_base);
+                    Arc::new(
+                        evaluator
+                            .slot_reduce(eval_params, &inputs, *num_slots, scoped_gate_id)
+                            .to_compact(),
+                    )
+                }
                 PolyGateType::PubLut { lut_id } => {
                     let lut_id = lut_id.resolve_public_lookup(param_bindings);
                     let input = wires
@@ -536,6 +558,18 @@ impl<P: Poly> PolyCircuit<P> {
                             let input = E::from_compact(eval_params, input.as_ref());
                             LoadedGateInputs::Unary(input)
                         }
+                        PolyGateType::SlotReduce { .. } => LoadedGateInputs::Many(
+                            gate.input_gates
+                                .iter()
+                                .map(|input_id| {
+                                    let input = wires
+                                        .get(input_id)
+                                        .expect("wire missing for SlotReduce")
+                                        .clone();
+                                    E::from_compact(eval_params, input.as_ref())
+                                })
+                                .collect(),
+                        ),
                         PolyGateType::SubCircuitOutput { .. } |
                         PolyGateType::SummedSubCircuitOutput { .. } => {
                             panic!("sub-circuit output gate should not be in regular chunk path");
@@ -594,6 +628,25 @@ impl<P: Poly> PolyCircuit<P> {
                                 eval_params,
                                 &input,
                                 src_slots.as_ref(),
+                                scoped_gate_id,
+                            ))
+                        }
+                        (
+                            LoadedGateInputs::Many(inputs),
+                            PolyGateType::SlotReduce { num_slots, .. },
+                        ) => {
+                            let evaluator =
+                                slot_transfer_evaluator.expect("slot transfer evaluator missing");
+                            let scoped_gate_id = Self::scoped_gate_id(
+                                scoped_gate_ids,
+                                call_prefix,
+                                gate_id,
+                                gate_id_base,
+                            );
+                            ComputedGateValue::Value(evaluator.slot_reduce(
+                                eval_params,
+                                &inputs,
+                                *num_slots,
                                 scoped_gate_id,
                             ))
                         }

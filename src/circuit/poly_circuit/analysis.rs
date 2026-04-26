@@ -16,7 +16,7 @@ enum GroupedCallExecutionNodeId {
     SummedSubCircuitCall(usize),
 }
 
-const COMPAT_NON_FREE_DEPTH_KIND_ORDER: [PolyGateKind; 10] = [
+const COMPAT_NON_FREE_DEPTH_KIND_ORDER: [PolyGateKind; 11] = [
     PolyGateKind::Input,
     PolyGateKind::Add,
     PolyGateKind::Sub,
@@ -24,6 +24,7 @@ const COMPAT_NON_FREE_DEPTH_KIND_ORDER: [PolyGateKind; 10] = [
     PolyGateKind::SmallScalarMul,
     PolyGateKind::LargeScalarMul,
     PolyGateKind::SlotTransfer,
+    PolyGateKind::SlotReduce,
     PolyGateKind::PubLut,
     PolyGateKind::SubCircuitOutput,
     PolyGateKind::SummedSubCircuitOutput,
@@ -31,7 +32,7 @@ const COMPAT_NON_FREE_DEPTH_KIND_ORDER: [PolyGateKind; 10] = [
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct CompatNonFreeDepthContributionVector {
-    counts: [u32; 10],
+    counts: [u32; 11],
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -69,9 +70,10 @@ impl CompatNonFreeDepthContributionVector {
             PolyGateKind::SmallScalarMul => 4,
             PolyGateKind::LargeScalarMul => 5,
             PolyGateKind::SlotTransfer => 6,
-            PolyGateKind::PubLut => 7,
-            PolyGateKind::SubCircuitOutput => 8,
-            PolyGateKind::SummedSubCircuitOutput => 9,
+            PolyGateKind::SlotReduce => 7,
+            PolyGateKind::PubLut => 8,
+            PolyGateKind::SubCircuitOutput => 9,
+            PolyGateKind::SummedSubCircuitOutput => 10,
         }
     }
 }
@@ -236,7 +238,8 @@ impl<P: Poly> PolyCircuit<P> {
             PolyGateType::LargeScalarMul { .. } |
             PolyGateType::Mul |
             PolyGateType::PubLut { .. } |
-            PolyGateType::SlotTransfer { .. } => self
+            PolyGateType::SlotTransfer { .. } |
+            PolyGateType::SlotReduce { .. } => self
                 .gate(gate_id)
                 .input_gates
                 .iter()

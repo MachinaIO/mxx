@@ -396,6 +396,36 @@ impl<P: Poly> PolyCircuit<P> {
         ))
     }
 
+    pub fn slot_reduce_gate<I: Into<BatchedWire>>(
+        &mut self,
+        inputs: &[I],
+        num_slots: usize,
+    ) -> BatchedWire
+    where
+        I: Copy,
+    {
+        assert!(num_slots > 0, "slot_reduce_gate requires num_slots > 0");
+        assert!(!inputs.is_empty(), "slot_reduce_gate requires at least one input");
+        assert!(
+            inputs.len() <= num_slots,
+            "slot_reduce_gate input count {} exceeds num_slots {}",
+            inputs.len(),
+            num_slots
+        );
+        let input_gates = inputs
+            .iter()
+            .map(|input| {
+                let input = (*input).into();
+                debug_assert!(input.is_single_wire());
+                input.as_single_wire()
+            })
+            .collect::<Vec<_>>();
+        BatchedWire::single(self.new_gate_generic(
+            input_gates,
+            PolyGateType::SlotReduce { num_slots, input_count: inputs.len() },
+        ))
+    }
+
     fn new_gate_generic(&mut self, inputs: Vec<GateId>, gate_type: PolyGateType) -> GateId {
         #[cfg(debug_assertions)]
         {

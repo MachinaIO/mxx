@@ -18,4 +18,15 @@ pub trait SlotTransferEvaluator<E: Evaluable>: Send + Sync {
         src_slots: &[(u32, Option<u32>)],
         gate_id: GateId,
     ) -> E;
+
+    fn slot_reduce(
+        &self,
+        params: &E::Params,
+        inputs: &[E],
+        num_slots: usize,
+        gate_id: GateId,
+    ) -> E {
+        let _ = (params, inputs, num_slots, gate_id);
+        panic!("slot_reduce is not implemented for this SlotTransferEvaluator")
+    }
 }

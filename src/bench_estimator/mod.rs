@@ -313,6 +313,7 @@ pub trait BenchEstimator<E: Evaluable> {
     fn estimate_small_scalar_mul(&self, scalar: &[u32]) -> CircuitBenchEstimate;
     fn estimate_large_scalar_mul(&self, scalar: &[BigUint]) -> CircuitBenchEstimate;
     fn estimate_slot_transfer(&self, src_slots: &[(u32, Option<u32>)]) -> CircuitBenchEstimate;
+    fn estimate_slot_reduce(&self, input_count: usize, num_slots: usize) -> CircuitBenchEstimate;
     fn estimate_public_lookup(&self, lut_id: usize) -> CircuitBenchEstimate;
 
     fn estimate_gate_bench_with_bindings(
@@ -335,9 +336,8 @@ pub trait BenchEstimator<E: Evaluable> {
                 let src_slots = src_slots.resolve_slot_transfer(param_bindings);
                 self.estimate_slot_transfer(src_slots.as_ref())
             }
-            PolyGateType::SlotReduce { num_slots, .. } => {
-                let src_slots = vec![(0u32, None); *num_slots];
-                self.estimate_slot_transfer(&src_slots)
+            PolyGateType::SlotReduce { num_slots, input_count } => {
+                self.estimate_slot_reduce(*input_count, *num_slots)
             }
             PolyGateType::PubLut { lut_id } => {
                 self.estimate_public_lookup(lut_id.resolve_public_lookup(param_bindings))
@@ -764,6 +764,14 @@ mod tests {
             bench(6.0, 6.5, 17)
         }
 
+        fn estimate_slot_reduce(
+            &self,
+            _input_count: usize,
+            _num_slots: usize,
+        ) -> CircuitBenchEstimate {
+            bench(6.25, 6.75, 18)
+        }
+
         fn estimate_public_lookup(&self, _lut_id: usize) -> CircuitBenchEstimate {
             bench(7.0, 7.5, 19)
         }
@@ -802,6 +810,14 @@ mod tests {
         fn estimate_slot_transfer(
             &self,
             _src_slots: &[(u32, Option<u32>)],
+        ) -> CircuitBenchEstimate {
+            bench(0.0, 0.0, 0)
+        }
+
+        fn estimate_slot_reduce(
+            &self,
+            _input_count: usize,
+            _num_slots: usize,
         ) -> CircuitBenchEstimate {
             bench(0.0, 0.0, 0)
         }
@@ -852,6 +868,14 @@ mod tests {
         fn estimate_slot_transfer(
             &self,
             _src_slots: &[(u32, Option<u32>)],
+        ) -> CircuitBenchEstimate {
+            bench(0.0, 0.0, 0)
+        }
+
+        fn estimate_slot_reduce(
+            &self,
+            _input_count: usize,
+            _num_slots: usize,
         ) -> CircuitBenchEstimate {
             bench(0.0, 0.0, 0)
         }

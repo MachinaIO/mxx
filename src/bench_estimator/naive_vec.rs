@@ -91,6 +91,15 @@ where
         )
     }
 
+    fn estimate_slot_reduce(&self, input_count: usize, num_slots: usize) -> CircuitBenchEstimate {
+        assert!(input_count > 0, "slot_reduce input_count must be positive");
+        assert_eq!(
+            num_slots, self.num_slots,
+            "NaiveBGGVecBenchEstimator::estimate_slot_reduce requires num_slots == estimator num_slots"
+        );
+        scale_single_slot_estimate(self.inner.estimate_slot_reduce(1, num_slots), input_count)
+    }
+
     fn estimate_public_lookup(&self, lut_id: usize) -> CircuitBenchEstimate {
         scale_single_slot_estimate(self.inner.estimate_public_lookup(lut_id), self.num_slots)
     }
@@ -137,6 +146,15 @@ where
         )
     }
 
+    fn estimate_slot_reduce(&self, input_count: usize, num_slots: usize) -> CircuitBenchEstimate {
+        assert!(input_count > 0, "slot_reduce input_count must be positive");
+        assert_eq!(
+            num_slots, self.num_slots,
+            "NaiveBGGVecBenchEstimator::estimate_slot_reduce requires num_slots == estimator num_slots"
+        );
+        scale_single_slot_estimate(self.inner.estimate_slot_reduce(1, num_slots), input_count)
+    }
+
     fn estimate_public_lookup(&self, lut_id: usize) -> CircuitBenchEstimate {
         scale_single_slot_estimate(self.inner.estimate_public_lookup(lut_id), self.num_slots)
     }
@@ -157,6 +175,7 @@ mod tests {
             public_key::BggPublicKey,
             sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         },
+        circuit::PolyGateType,
         element::PolyElem,
         lookup::{
             PltEvaluator, PublicLut,
@@ -219,6 +238,15 @@ mod tests {
             CircuitBenchEstimate::new(7.0, 7.0).with_max_parallelism(1)
         }
 
+        fn estimate_slot_reduce(
+            &self,
+            input_count: usize,
+            _num_slots: usize,
+        ) -> CircuitBenchEstimate {
+            CircuitBenchEstimate::new(9.0 * input_count as f64, 9.0)
+                .with_max_parallelism(4 * input_count as u128)
+        }
+
         fn estimate_public_lookup(&self, _lut_id: usize) -> CircuitBenchEstimate {
             CircuitBenchEstimate::new(8.0, 8.0).with_max_parallelism(2)
         }
@@ -258,6 +286,14 @@ mod tests {
         fn estimate_slot_transfer(
             &self,
             _src_slots: &[(u32, Option<u32>)],
+        ) -> CircuitBenchEstimate {
+            CircuitBenchEstimate::new(0.0, 0.0)
+        }
+
+        fn estimate_slot_reduce(
+            &self,
+            _input_count: usize,
+            _num_slots: usize,
         ) -> CircuitBenchEstimate {
             CircuitBenchEstimate::new(0.0, 0.0)
         }
@@ -307,6 +343,23 @@ mod tests {
         assert_eq!(slot_transfer.latency, 7.0);
         assert_eq!(slot_transfer.total_time, 21.0);
         assert_eq!(slot_transfer.max_parallelism, 3);
+
+        let slot_reduce = <NaiveBGGVecBenchEstimator<_> as BenchEstimator<
+            NaiveBGGPublicKeyVec<DCRTPolyMatrix>,
+        >>::estimate_slot_reduce(&estimator, 2, 3);
+        assert_eq!(slot_reduce.latency, 9.0);
+        assert_eq!(slot_reduce.total_time, 18.0);
+        assert_eq!(slot_reduce.max_parallelism, 8);
+
+        let routed_slot_reduce = <NaiveBGGVecBenchEstimator<_> as BenchEstimator<
+            NaiveBGGPublicKeyVec<DCRTPolyMatrix>,
+        >>::estimate_gate_bench(
+            &estimator,
+            &PolyGateType::SlotReduce { num_slots: 3, input_count: 2 },
+        );
+        assert_eq!(routed_slot_reduce.latency, 9.0);
+        assert_eq!(routed_slot_reduce.total_time, 18.0);
+        assert_eq!(routed_slot_reduce.max_parallelism, 8);
     }
 
     #[tokio::test]

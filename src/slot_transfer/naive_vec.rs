@@ -3,6 +3,7 @@ use crate::{
     bgg::naive_vec::{NaiveBGGEncodingVec, NaiveBGGPublicKeyVec},
     circuit::{evaluable::Evaluable, gate::GateId},
     matrix::PolyMatrix,
+    poly::PolyParams,
     slot_transfer::SlotTransferEvaluator,
 };
 use rayon::prelude::*;
@@ -64,6 +65,58 @@ impl<M: PolyMatrix> SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>
                 .collect(),
         )
     }
+
+    fn slot_reduce(
+        &self,
+        params: &<NaiveBGGPublicKeyVec<M> as Evaluable>::Params,
+        inputs: &[NaiveBGGPublicKeyVec<M>],
+        num_slots: usize,
+        _gate_id: GateId,
+    ) -> NaiveBGGPublicKeyVec<M> {
+        assert!(num_slots > 0, "slot_reduce requires num_slots > 0");
+        assert!(!inputs.is_empty(), "slot_reduce requires at least one input");
+        assert!(
+            inputs.len() <= num_slots,
+            "slot_reduce input count {} exceeds num_slots {}",
+            inputs.len(),
+            num_slots
+        );
+        let ring_dim = params.ring_dimension() as usize;
+        assert!(
+            num_slots <= ring_dim,
+            "slot_reduce num_slots {} exceeds ring dimension {}",
+            num_slots,
+            ring_dim
+        );
+
+        NaiveBGGPublicKeyVec::new(
+            inputs
+                .par_iter()
+                .enumerate()
+                .map(|(input_idx, input)| {
+                    assert!(
+                        input.num_slots() >= num_slots,
+                        "slot_reduce input {} has {} slots, expected at least {}",
+                        input_idx,
+                        input.num_slots(),
+                        num_slots
+                    );
+                    let mut terms = (0..num_slots)
+                        .map(|src_slot| {
+                            let mut scalar = vec![0u32; ring_dim];
+                            scalar[src_slot] = 1;
+                            input.keys[src_slot].small_scalar_mul(params, &scalar)
+                        })
+                        .collect::<Vec<_>>();
+                    let mut reduced = terms.drain(..1).next().expect("slot_reduce needs a term");
+                    for term in terms {
+                        reduced = reduced + &term;
+                    }
+                    reduced
+                })
+                .collect(),
+        )
+    }
 }
 
 impl<M: PolyMatrix> SlotTransferEvaluator<NaiveBGGEncodingVec<M>>
@@ -88,6 +141,58 @@ impl<M: PolyMatrix> SlotTransferEvaluator<NaiveBGGEncodingVec<M>>
                         Some(scalar) => encoding.small_scalar_mul(params, &[*scalar]),
                         None => encoding.clone(),
                     }
+                })
+                .collect(),
+        )
+    }
+
+    fn slot_reduce(
+        &self,
+        params: &<NaiveBGGEncodingVec<M> as Evaluable>::Params,
+        inputs: &[NaiveBGGEncodingVec<M>],
+        num_slots: usize,
+        _gate_id: GateId,
+    ) -> NaiveBGGEncodingVec<M> {
+        assert!(num_slots > 0, "slot_reduce requires num_slots > 0");
+        assert!(!inputs.is_empty(), "slot_reduce requires at least one input");
+        assert!(
+            inputs.len() <= num_slots,
+            "slot_reduce input count {} exceeds num_slots {}",
+            inputs.len(),
+            num_slots
+        );
+        let ring_dim = params.ring_dimension() as usize;
+        assert!(
+            num_slots <= ring_dim,
+            "slot_reduce num_slots {} exceeds ring dimension {}",
+            num_slots,
+            ring_dim
+        );
+
+        NaiveBGGEncodingVec::new(
+            inputs
+                .par_iter()
+                .enumerate()
+                .map(|(input_idx, input)| {
+                    assert!(
+                        input.num_slots() >= num_slots,
+                        "slot_reduce input {} has {} slots, expected at least {}",
+                        input_idx,
+                        input.num_slots(),
+                        num_slots
+                    );
+                    let mut terms = (0..num_slots)
+                        .map(|src_slot| {
+                            let mut scalar = vec![0u32; ring_dim];
+                            scalar[src_slot] = 1;
+                            input.encodings[src_slot].small_scalar_mul(params, &scalar)
+                        })
+                        .collect::<Vec<_>>();
+                    let mut reduced = terms.drain(..1).next().expect("slot_reduce needs a term");
+                    for term in terms {
+                        reduced = reduced + &term;
+                    }
+                    reduced
                 })
                 .collect(),
         )

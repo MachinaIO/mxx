@@ -457,6 +457,84 @@ mod tests {
 
     #[sequential_test::sequential]
     #[test]
+    fn test_naive_bgg_public_key_vec_slot_reduce_matches_manual_reduction() {
+        let params = DCRTPolyParams::default();
+        let ring_dim = params.ring_dimension() as usize;
+        let num_slots = 3;
+        let hash_key = [0x45u8; 32];
+        let sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(hash_key, 2);
+        let keys = sampler.sample(&params, b"naive-pubkey-slot-reduce", &[true; 6]);
+        let inputs = vec![
+            NaiveBGGPublicKeyVec::new(keys[..num_slots].to_vec()),
+            NaiveBGGPublicKeyVec::new(keys[num_slots..2 * num_slots].to_vec()),
+        ];
+        let evaluator = NaiveBGGVecSlotTransferEvaluator::new();
+
+        let output = evaluator.slot_reduce(&params, &inputs, num_slots, GateId(9));
+
+        assert_eq!(output.num_slots(), inputs.len());
+        for (input_idx, input) in inputs.iter().enumerate() {
+            let mut terms = (0..num_slots)
+                .map(|slot_idx| {
+                    let mut scalar = vec![0u32; ring_dim];
+                    scalar[slot_idx] = 1;
+                    input.keys[slot_idx].small_scalar_mul(&params, &scalar)
+                })
+                .collect::<Vec<_>>();
+            let mut expected = terms.drain(..1).next().unwrap();
+            for term in terms {
+                expected = expected + &term;
+            }
+            assert_eq!(output.keys[input_idx], expected);
+        }
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_naive_bgg_encoding_vec_slot_reduce_matches_manual_reduction() {
+        let params = DCRTPolyParams::default();
+        let ring_dim = params.ring_dimension() as usize;
+        let num_slots = 3;
+        let hash_key = [0x46u8; 32];
+        let pubkey_sampler =
+            BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(hash_key, 2);
+        let pubkeys = pubkey_sampler.sample(&params, b"naive-encoding-slot-reduce", &[true; 6]);
+        let secrets = vec![create_bit_random_poly(&params); 2];
+        let plaintexts = (0..6)
+            .map(|value| DCRTPoly::from_usize_to_constant(&params, value + 1))
+            .collect::<Vec<_>>();
+        let encoding_sampler =
+            BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
+        let encodings = encoding_sampler.sample(&params, &pubkeys, &plaintexts);
+        let inputs = vec![
+            NaiveBGGEncodingVec::new(encodings[..num_slots].to_vec()),
+            NaiveBGGEncodingVec::new(encodings[num_slots..2 * num_slots].to_vec()),
+        ];
+        let evaluator = NaiveBGGVecSlotTransferEvaluator::new();
+
+        let output = evaluator.slot_reduce(&params, &inputs, num_slots, GateId(10));
+
+        assert_eq!(output.num_slots(), inputs.len());
+        for (input_idx, input) in inputs.iter().enumerate() {
+            let mut terms = (0..num_slots)
+                .map(|slot_idx| {
+                    let mut scalar = vec![0u32; ring_dim];
+                    scalar[slot_idx] = 1;
+                    input.encodings[slot_idx].small_scalar_mul(&params, &scalar)
+                })
+                .collect::<Vec<_>>();
+            let mut expected = terms.drain(..1).next().unwrap();
+            for term in terms {
+                expected = expected + &term;
+            }
+            assert_eq!(output.encodings[input_idx].vector, expected.vector);
+            assert_eq!(output.encodings[input_idx].pubkey, expected.pubkey);
+            assert_eq!(output.encodings[input_idx].plaintext, expected.plaintext);
+        }
+    }
+
+    #[sequential_test::sequential]
+    #[test]
     fn test_naive_bgg_public_key_vec_lwe_lookup_uses_slot_namespace() {
         let params = DCRTPolyParams::default();
         let plt = lsb_lut(&params);

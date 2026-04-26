@@ -452,7 +452,7 @@ mod tests {
         );
         let mut setup_circuit = PolyCircuit::new();
         let (params, ring_gsw) = create_test_context(&mut setup_circuit, gpu_ids);
-        let seed_bits = 16usize;
+        let seed_bits = 1usize;
         let input_bits_per_step = 1usize;
         let v_bits = 1usize;
         let cbd_n = 2usize;

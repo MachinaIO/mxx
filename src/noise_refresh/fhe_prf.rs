@@ -220,7 +220,7 @@ mod tests {
             sampler::{BGGPolyEncodingSampler, BGGPublicKeySampler},
         },
         circuit::{PolyCircuit, evaluable::PolyVec},
-        gadgets::arith::{DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPoly, NestedRnsPolyContext},
+        gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext},
         lookup::{
             lwe::{LWEBGGPolyEncodingPltEvaluator, LWEBGGPubKeyPltEvaluator},
             poly::PolyPltEvaluator,
@@ -381,7 +381,7 @@ mod tests {
             circuit,
             &params,
             p_moduli_bits,
-            DEFAULT_MAX_UNREDUCED_MULS,
+            1,
             scale,
             false,
             Some(active_levels),

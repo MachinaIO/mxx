@@ -965,12 +965,15 @@ where
     // The extra `ring_dim` factor is interpreted as `ring_dim` slot chunks.  The chunks are decoded
     // together with `decrypt_batch`, so one output wire carries all `ring_dim` slot results instead
     // of exposing one separate wire per slot.
-    let expected_error_count = expanded_seed_bits
+    let full_error_count = expanded_seed_bits
         .checked_mul(ciphertext_wire_count)
         .and_then(|value| value.checked_mul(ring_dim))
         .and_then(|value| value.checked_mul(log_base_q))
         .and_then(|value| value.checked_mul(ring_dim))
         .expect("Goldreich error ciphertext count overflow");
+    let expected_error_count = goldreich_limited_error_and_mask_counts
+        .map(|(error_count, _mask_count)| error_count)
+        .unwrap_or(full_error_count);
     assert_eq!(error_templates.len(), expected_error_count);
     let mut decrypted_errors = Vec::with_capacity(
         selected_output_chunk_count
@@ -1008,7 +1011,7 @@ where
     // Unlike errors, masks already contain a distinct `ring_dim * v_bits` ciphertext block for
     // every CRT level.  The extra `ring_dim` factor is again interpreted as slot chunks and decoded
     // together with `decrypt_batch`.
-    let expected_mask_count = expanded_seed_bits
+    let full_mask_count = expanded_seed_bits
         .checked_mul(ciphertext_wire_count)
         .and_then(|value| value.checked_mul(ring_dim))
         .and_then(|value| value.checked_mul(v_bits))
@@ -1016,6 +1019,9 @@ where
         .and_then(|value| value.checked_mul(crt_depth))
         .and_then(|value| value.checked_mul(ring_dim))
         .expect("Goldreich mask ciphertext count overflow");
+    let expected_mask_count = goldreich_limited_error_and_mask_counts
+        .map(|(_error_count, mask_count)| mask_count)
+        .unwrap_or(full_mask_count);
     assert_eq!(mask_templates.len(), expected_mask_count);
     let mut decrypted_masks = Vec::with_capacity(
         selected_output_chunk_count

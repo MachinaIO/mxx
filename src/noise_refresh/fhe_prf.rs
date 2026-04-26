@@ -254,7 +254,7 @@ mod tests {
     #[cfg(feature = "gpu")]
     use std::{path::Path, sync::Arc, time::Instant};
     #[cfg(feature = "gpu")]
-    use tracing::{debug, info};
+    use tracing::info;
 
     #[cfg(feature = "gpu")]
     fn log_relation_step(test_start: Instant, step_start: &mut Instant, label: &str) {
@@ -428,7 +428,7 @@ mod tests {
     #[sequential_test::sequential]
     #[ignore = "expensive Nested RNS BGG relation test; run explicitly when needed"]
     async fn fhe_prf_evaluable_for_step_fn_bgg_poly_encoding_matches_public_key_relation() {
-        let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+        let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
         let test_start = Instant::now();
         let mut step_start = test_start;
         info!(target: "noise_refresh::fhe_prf_relation", "relation test started");
@@ -539,7 +539,7 @@ mod tests {
             Some(1),
             Some(output_chunk_limit),
         );
-        debug!(
+        info!(
             target: "noise_refresh::fhe_prf_relation",
             output_count = pubkey_outputs.len(),
             first_col_size = pubkey_outputs.first().map(|pk| pk.matrix.col_size()).unwrap_or(0),
@@ -642,7 +642,7 @@ mod tests {
             Some(1),
             Some(output_chunk_limit),
         );
-        debug!(
+        info!(
             target: "noise_refresh::fhe_prf_relation",
             output_count = poly_encoding_outputs.len(),
             first_col_size = poly_encoding_outputs
@@ -693,7 +693,7 @@ mod tests {
             Some(&PolyVecSlotTransferEvaluator::new()),
             Some(1),
         );
-        debug!(
+        info!(
             target: "noise_refresh::fhe_prf_relation",
             output_count = reference_outputs.len(),
             "PolyVec reference outputs"

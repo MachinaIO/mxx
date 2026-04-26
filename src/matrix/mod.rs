@@ -174,8 +174,17 @@ pub trait PolyMatrix:
     }
     fn tensor(&self, other: &Self) -> Self;
     fn unit_column_vector(params: &<Self::P as Poly>::Params, size: usize, index: usize) -> Self {
+        Self::scaled_unit_column_vector(params, size, index, Self::P::const_one(params))
+    }
+    fn scaled_unit_column_vector(
+        params: &<Self::P as Poly>::Params,
+        size: usize,
+        index: usize,
+        scalar: Self::P,
+    ) -> Self {
+        assert!(index < size, "unit column index must be in range");
         let mut vec = vec![Self::P::const_zero(params); size];
-        vec[index] = Self::P::const_one(params);
+        vec[index] = scalar;
         Self::from_poly_vec_column(params, vec)
     }
     fn unit_row_vector(params: &<Self::P as Poly>::Params, size: usize, index: usize) -> Self {

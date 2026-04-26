@@ -5,7 +5,7 @@ pub use poly_vec::PolyVec;
 
 use num_bigint::BigUint;
 
-use crate::poly::Poly;
+use crate::{matrix::PolyMatrix, poly::Poly};
 use std::{
     fmt::Debug,
     ops::{Add, Mul, Sub},
@@ -37,4 +37,15 @@ pub trait Evaluable:
 
     fn small_scalar_mul(&self, params: &Self::Params, scalar: &[u32]) -> Self;
     fn large_scalar_mul(&self, params: &Self::Params, scalar: &[BigUint]) -> Self;
+    fn concat_columns(&self, others: &[Self]) -> Self {
+        let _ = others;
+        panic!("concat_columns is not implemented for this Evaluable type")
+    }
+    fn matrix_mul<M>(&self, params: &Self::Params, rhs_matrix: &M) -> Self
+    where
+        M: PolyMatrix<P = Self::P>,
+    {
+        let _ = (params, rhs_matrix);
+        panic!("matrix_mul is not implemented for this Evaluable type")
+    }
 }

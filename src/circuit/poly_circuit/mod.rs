@@ -416,6 +416,20 @@ pub(crate) struct GroupedExecutionPlan {
 }
 
 #[derive(Clone)]
+pub(crate) struct PolyCircuitRegistryHandles<P: Poly> {
+    pub(crate) lookup_registry: Arc<LookupRegistry<P>>,
+    pub(crate) binding_registry: Arc<BindingRegistry>,
+    pub(crate) input_set_registry: Arc<InputSetRegistry>,
+    pub(crate) sub_circuit_registry: Arc<SubCircuitRegistry<P>>,
+}
+
+impl<P: Poly> std::fmt::Debug for PolyCircuitRegistryHandles<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PolyCircuitRegistryHandles").finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
 pub struct PolyCircuit<P: Poly> {
     pub(crate) gates: BTreeMap<GateId, PolyGate>,
     pub(crate) print_value: BTreeMap<GateId, String>,

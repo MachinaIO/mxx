@@ -1,5 +1,5 @@
 use crate::{
-    circuit::{BatchedWire, PolyCircuit, gate::GateId},
+    circuit::{BatchedWire, PolyCircuit, PolyCircuitRegistryHandles, gate::GateId},
     gadgets::arith::{
         BinaryPlannerResult, DecomposeArithmeticGadget, ModularArithmeticContext,
         ModularArithmeticGadget, ModularArithmeticPlanner,
@@ -132,6 +132,7 @@ pub struct RingGswContext<P: Poly, A: DecomposeArithmeticGadget<P> + ModularArit
     pub(super) sub_entry_cache: DashMap<A::SubPlanKey, usize>,
     pub mul_subcircuit_id: usize,
     pub mul_output_metadata: A::Metadata,
+    pub(crate) circuit_registries: PolyCircuitRegistryHandles<P>,
 }
 
 impl<P: Poly, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>> RingGswContext<P, A> {
@@ -169,6 +170,10 @@ impl<P: Poly, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>> Rin
             ),
             None,
         )
+    }
+
+    pub(crate) fn fresh_circuit(&self) -> PolyCircuit<P> {
+        PolyCircuit::new_with_registry_handles(&self.circuit_registries)
     }
 }
 
@@ -286,6 +291,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             sub_entry_cache: DashMap::new(),
             mul_subcircuit_id,
             mul_output_metadata: A::metadata(&mul_output_template),
+            circuit_registries: circuit.registry_handles(),
         });
         debug!(
             "RingGswContext::from_arith_context completed: width={}, wrapper_prebuild_elapsed_ms={}, total_elapsed_ms={}",
@@ -1566,12 +1572,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let batch_secret_key = if ciphertexts.len() == 1 {
-            wire_secret_key
-        } else {
-            let src_slots = vec![(0u32, None); ciphertexts.len()];
-            circuit.slot_transfer_gate(wire_secret_key, &src_slots).as_single_wire()
-        };
+        let batch_secret_key = wire_secret_key;
 
         let mut prepared_tops = Vec::with_capacity(ciphertexts.len());
         let mut bottom_entries = Vec::with_capacity(ciphertexts.len());
@@ -1674,6 +1675,7 @@ mod tests {
     use super::*;
     use crate::{
         __PAIR, __TestState,
+        bgg::public_key::BggPublicKey,
         circuit::{PolyCircuit, evaluable::PolyVec},
         gadgets::{
             arith::{
@@ -1685,15 +1687,20 @@ mod tests {
                 decrypt_ciphertext, encrypt_plaintext_bit, sample_public_key, sample_secret_key,
             },
         },
-        lookup::{poly::PolyPltEvaluator, poly_vec::PolyVecPltEvaluator},
+        lookup::{PltEvaluator, PublicLut, poly::PolyPltEvaluator, poly_vec::PolyVecPltEvaluator},
         matrix::dcrt_poly::DCRTPolyMatrix,
         poly::{
             Poly, PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
-        slot_transfer::PolyVecSlotTransferEvaluator,
+        sampler::{
+            DistType, PolyHashSampler, hash::DCRTPolyHashSampler,
+            trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
+        },
+        slot_transfer::{PolyVecSlotTransferEvaluator, bgg_pubkey::BggPublicKeySTEvaluator},
     };
     use bigdecimal::BigDecimal;
+    use keccak_asm::Keccak256;
     use num_bigint::BigUint;
     use num_traits::ToPrimitive;
     use rand::Rng;
@@ -1709,9 +1716,27 @@ mod tests {
     const MONT_LIMB_BIT_SIZE: usize = 1;
     const MONT_CRT_BITS: usize = 10;
     const MONT_NUM_SLOTS: usize = 2;
+    const BGG_SIGMA: f64 = 4.578;
 
     type MontgomeryRingGswContext = super::RingGswContext<DCRTPoly, MontgomeryPoly<DCRTPoly>>;
     type MontgomeryRingGswCiphertext = super::RingGswCiphertext<DCRTPoly, MontgomeryPoly<DCRTPoly>>;
+
+    struct DummyBggPublicKeyPltEvaluator;
+
+    impl PltEvaluator<BggPublicKey<DCRTPolyMatrix>> for DummyBggPublicKeyPltEvaluator {
+        fn public_lookup(
+            &self,
+            _params: &DCRTPolyParams,
+            _plt: &PublicLut<DCRTPoly>,
+            _one: &BggPublicKey<DCRTPolyMatrix>,
+            input: &BggPublicKey<DCRTPolyMatrix>,
+            _gate_id: crate::circuit::gate::GateId,
+            _lut_id: usize,
+        ) -> BggPublicKey<DCRTPolyMatrix> {
+            input.clone()
+        }
+    }
+
     fn create_test_context_with(
         circuit: &mut PolyCircuit<DCRTPoly>,
         ring_dim: u32,
@@ -1800,6 +1825,44 @@ mod tests {
         let mut key = [0u8; 32];
         rng.fill(&mut key);
         key
+    }
+
+    fn sample_bgg_public_keys_for_circuit(
+        params: &DCRTPolyParams,
+        input_count: usize,
+        secret_size: usize,
+        hash_key: [u8; 32],
+        tag: &str,
+    ) -> (BggPublicKey<DCRTPolyMatrix>, Vec<BggPublicKey<DCRTPolyMatrix>>) {
+        let m_g = secret_size * params.modulus_digits();
+        let sampler = DCRTPolyHashSampler::<Keccak256>::new();
+        let one = BggPublicKey::new(
+            sampler.sample_hash(
+                params,
+                hash_key,
+                format!("{tag}_one"),
+                secret_size,
+                m_g,
+                DistType::FinRingDist,
+            ),
+            true,
+        );
+        let inputs = (0..input_count)
+            .map(|idx| {
+                BggPublicKey::new(
+                    DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
+                        params,
+                        hash_key,
+                        format!("{tag}_input_{idx}"),
+                        secret_size,
+                        m_g,
+                        DistType::FinRingDist,
+                    ),
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        (one, inputs)
     }
 
     fn eval_outputs<P: Poly + 'static>(
@@ -2237,6 +2300,68 @@ mod tests {
                 "decrypt_batch output slot {idx} should contain the decrypted plaintext"
             );
         }
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_ring_gsw_decrypt_batch_bgg_public_key_output_column_count() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let ciphertext_inputs = (0..params.ring_dimension())
+            .map(|_| RingGswCiphertext::input(ctx.clone(), None, &mut circuit))
+            .collect::<Vec<_>>();
+        let wire_secret_key = circuit.input(1).at(0).as_single_wire();
+        let ciphertext_refs = ciphertext_inputs.iter().collect::<Vec<_>>();
+        let decrypted_batch = RingGswCiphertext::decrypt_batch::<DCRTPolyMatrix>(
+            ciphertext_refs.as_slice(),
+            wire_secret_key,
+            BigUint::from(2u64),
+            &mut circuit,
+        );
+        circuit.output(vec![decrypted_batch]);
+
+        let secret_size = 2usize;
+        let hash_key = [0x7bu8; 32];
+        let m_g = params.modulus_digits();
+        let (one, inputs) = sample_bgg_public_keys_for_circuit(
+            &params,
+            circuit.num_input(),
+            secret_size,
+            hash_key,
+            "ring_gsw_decrypt_batch_bgg_column_count",
+        );
+        let evaluator = BggPublicKeySTEvaluator::<
+            DCRTPolyMatrix,
+            DCRTPolyUniformSampler,
+            DCRTPolyHashSampler<Keccak256>,
+            DCRTPolyTrapdoorSampler,
+        >::new(
+            hash_key,
+            secret_size,
+            ctx.num_slots,
+            BGG_SIGMA,
+            0.0,
+            "test_data/test_ring_gsw_decrypt_batch_bgg_column_count".into(),
+        );
+        let outputs = circuit.eval(
+            &params,
+            one.clone(),
+            inputs,
+            Some(&DummyBggPublicKeyPltEvaluator),
+            Some(&evaluator),
+            Some(1),
+        );
+        assert_eq!(outputs.len(), 1);
+        println!(
+            "ring_gsw decrypt_batch BGG shapes: secret_size={}, m_g={}, expected_gadget_cols={}, one_cols={}, output_cols={}",
+            secret_size,
+            m_g,
+            secret_size * m_g,
+            one.matrix.col_size(),
+            outputs[0].matrix.col_size()
+        );
+        assert_eq!(one.matrix.col_size(), secret_size * m_g);
+        assert_eq!(outputs[0].matrix.col_size(), secret_size * m_g);
     }
 
     #[sequential_test::sequential]

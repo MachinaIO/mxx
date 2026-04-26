@@ -29,6 +29,12 @@ impl<P: Poly> PolyCircuit<P> {
         }
     }
 
+    pub(crate) fn new_with_registry_handles(handles: &PolyCircuitRegistryHandles<P>) -> Self {
+        let mut circuit = Self::new();
+        circuit.inherit_registry_handles(handles);
+        circuit
+    }
+
     /// Get number of inputs
     pub fn num_input(&self) -> usize {
         self.num_input
@@ -108,6 +114,19 @@ impl<P: Poly> PolyCircuit<P> {
         for output in outputs.into_iter() {
             self.output_ids.extend(output.into().gate_ids());
         }
+    }
+
+    pub fn restrict_outputs_to_indices(&mut self, indices: &[usize]) {
+        let restricted = indices
+            .iter()
+            .map(|&idx| {
+                *self
+                    .output_ids
+                    .get(idx)
+                    .unwrap_or_else(|| panic!("output index {idx} is out of range"))
+            })
+            .collect::<Vec<_>>();
+        self.output_ids = restricted;
     }
 
     pub fn const_zero_gate(&mut self) -> BatchedWire {

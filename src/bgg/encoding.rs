@@ -198,4 +198,23 @@ impl<M: PolyMatrix> Evaluable for BggEncoding<M> {
         let plaintext = self.plaintext.clone().map(|p| p * scalar);
         Self { vector, pubkey, plaintext }
     }
+
+    fn concat_columns(&self, others: &[Self]) -> Self {
+        let vector = self.concat_vector(others);
+        let pubkey = self.pubkey.concat_columns(
+            &others.iter().map(|encoding| encoding.pubkey.clone()).collect::<Vec<_>>(),
+        );
+        Self { vector, pubkey, plaintext: None }
+    }
+
+    fn matrix_mul<Rhs>(&self, params: &Self::Params, rhs_matrix: &Rhs) -> Self
+    where
+        Rhs: PolyMatrix<P = Self::P>,
+    {
+        let rhs_matrix = M::from_compact_bytes(params, &rhs_matrix.to_compact_bytes());
+        let vector = self.vector.mul_decompose(&rhs_matrix);
+        let pubkey_matrix = self.pubkey.matrix.mul_decompose(&rhs_matrix);
+        let pubkey = BggPublicKey::new(pubkey_matrix, self.pubkey.reveal_plaintext);
+        Self { vector, pubkey, plaintext: None }
+    }
 }

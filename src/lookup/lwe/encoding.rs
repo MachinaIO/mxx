@@ -24,7 +24,8 @@ use std::{
 use tracing::debug;
 
 use super::{
-    derive_a_lt_matrix, derive_k_low, derive_k_low_chunk, read_k_high_chunk, read_k_high_row,
+    derive_a_lt_matrix_for_slot, derive_k_low_chunk_for_slot, derive_k_low_for_slot,
+    read_k_high_chunk_for_slot, read_k_high_row_for_slot,
 };
 
 #[derive(Debug, Clone)]
@@ -55,6 +56,26 @@ where
         gate_id: GateId,
         lut_id: usize,
     ) -> BggEncoding<M> {
+        self.public_lookup_for_slot(params, plt, input, gate_id, lut_id, None)
+    }
+}
+
+impl<M, SH> LWEBGGEncodingPltEvaluator<M, SH>
+where
+    M: PolyMatrix + Send + Sync + 'static,
+    SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    M::P: 'static,
+    for<'a, 'b> &'a M: std::ops::Mul<&'b M, Output = M>,
+{
+    pub fn public_lookup_for_slot(
+        &self,
+        params: &<BggEncoding<M> as Evaluable>::Params,
+        plt: &PublicLut<<BggEncoding<M> as Evaluable>::P>,
+        input: &BggEncoding<M>,
+        gate_id: GateId,
+        lut_id: usize,
+        slot_idx: Option<usize>,
+    ) -> BggEncoding<M> {
         #[cfg(feature = "gpu")]
         {
             return public_lookup_slot_gpu::<M, SH>(
@@ -68,6 +89,7 @@ where
                 input.plaintext.as_ref().expect("the BGG encoding should revealed plaintext"),
                 gate_id,
                 lut_id,
+                slot_idx,
             );
         }
 
@@ -84,6 +106,7 @@ where
                 input.plaintext.as_ref().expect("the BGG encoding should revealed plaintext"),
                 gate_id,
                 lut_id,
+                slot_idx,
             );
         }
     }
@@ -101,6 +124,7 @@ pub(crate) fn public_lookup_slot_cpu<M, SH>(
     input_plaintext: &M::P,
     gate_id: GateId,
     lut_id: usize,
+    slot_idx: Option<usize>,
 ) -> BggEncoding<M>
 where
     M: PolyMatrix + Send + Sync + 'static,
@@ -116,14 +140,20 @@ where
     let k_usize = usize::try_from(k).expect("LUT row index must fit in usize");
     let y_k_poly = M::P::from_elem_to_constant(params, &y_k);
     debug!("Performing public lookup, k={k}");
-    let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, hash_key, gate_id);
+    let a_lt = derive_a_lt_matrix_for_slot::<M, SH>(params, row_size, hash_key, gate_id, slot_idx);
     let pubkey = BggPublicKey::new(a_lt, true);
     let k_high = timed_read(
-        &format!("K_H_{gate_id}_{lut_id}_{k}"),
-        || read_k_high_row::<M>(params, dir_path, gate_id, lut_id, row_size, k_usize),
+        &format!("K_H_{gate_id}_{lut_id}_{k}_slot{}", slot_idx.unwrap_or(0)),
+        || {
+            read_k_high_row_for_slot::<M>(
+                params, dir_path, gate_id, lut_id, row_size, k_usize, slot_idx,
+            )
+        },
         &mut std::time::Duration::default(),
     );
-    let k_low = derive_k_low::<M, SH>(params, row_size, hash_key, gate_id, lut_id, k_usize);
+    let k_low = derive_k_low_for_slot::<M, SH>(
+        params, row_size, hash_key, gate_id, lut_id, k_usize, slot_idx,
+    );
     let mut vector = c_b * &k_high;
     vector.add_in_place(&(input_vector.clone() * &k_low));
     BggEncoding::new(vector, pubkey, Some(y_k_poly))
@@ -149,15 +179,53 @@ where
     M::P: 'static,
     for<'a, 'b> &'a M: std::ops::Mul<&'b M, Output = M>,
 {
+    public_lookup_output_chunk_cpu_for_slot::<M, SH>(
+        params,
+        plt,
+        dir_path,
+        hash_key,
+        row_size,
+        c_b,
+        input_vector,
+        input_plaintext,
+        gate_id,
+        lut_id,
+        chunk_idx,
+        None,
+    )
+}
+
+#[cfg_attr(feature = "gpu", allow(dead_code))]
+pub(crate) fn public_lookup_output_chunk_cpu_for_slot<M, SH>(
+    params: &<BggEncoding<M> as Evaluable>::Params,
+    plt: &PublicLut<<BggEncoding<M> as Evaluable>::P>,
+    dir_path: &Path,
+    hash_key: [u8; 32],
+    row_size: usize,
+    c_b: &M,
+    input_vector: &M,
+    input_plaintext: &M::P,
+    gate_id: GateId,
+    lut_id: usize,
+    chunk_idx: usize,
+    slot_idx: Option<usize>,
+) -> M
+where
+    M: PolyMatrix + Send + Sync + 'static,
+    SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    M::P: 'static,
+    for<'a, 'b> &'a M: std::ops::Mul<&'b M, Output = M>,
+{
     let z_u64 = input_plaintext.const_coeff_u64();
     let (k, _) = plt
         .get(params, z_u64)
         .unwrap_or_else(|| panic!("{:?} is not exist in public lookup f", z_u64));
     let k_usize = usize::try_from(k).expect("LUT row index must fit in usize");
-    let k_high_chunk =
-        read_k_high_chunk::<M>(params, dir_path, gate_id, lut_id, row_size, k_usize, chunk_idx);
-    let k_low_chunk = derive_k_low_chunk::<M, SH>(
-        params, row_size, hash_key, gate_id, lut_id, k_usize, chunk_idx,
+    let k_high_chunk = read_k_high_chunk_for_slot::<M>(
+        params, dir_path, gate_id, lut_id, row_size, k_usize, chunk_idx, slot_idx,
+    );
+    let k_low_chunk = derive_k_low_chunk_for_slot::<M, SH>(
+        params, row_size, hash_key, gate_id, lut_id, k_usize, chunk_idx, slot_idx,
     );
     let mut vector = c_b * &k_high_chunk;
     vector.add_in_place(&(input_vector.clone() * &k_low_chunk));
@@ -191,6 +259,7 @@ pub(crate) fn public_lookup_slot_gpu<M, SH>(
     input_plaintext: &M::P,
     gate_id: GateId,
     lut_id: usize,
+    slot_idx: Option<usize>,
 ) -> BggEncoding<M>
 where
     M: PolyMatrix + Send + Sync + 'static,
@@ -209,5 +278,6 @@ where
         input_plaintext,
         gate_id,
         lut_id,
+        slot_idx,
     )
 }

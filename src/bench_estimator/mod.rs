@@ -2,6 +2,7 @@ pub mod bgg_poly_encoding;
 pub mod bgg_pubkey;
 #[cfg(feature = "gpu")]
 mod gpu;
+pub mod naive_vec;
 
 pub use bgg_poly_encoding::*;
 pub use bgg_pubkey::*;
@@ -9,6 +10,7 @@ pub use bgg_pubkey::*;
 pub(crate) use gpu::benchmark_gate_operation;
 #[cfg(feature = "gpu")]
 pub use gpu::*;
+pub use naive_vec::*;
 
 use std::{
     collections::HashMap,

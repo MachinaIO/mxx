@@ -1,5 +1,6 @@
 pub mod digits_to_int;
 pub mod encoding;
+pub mod naive_vec;
 pub mod poly_encoding;
 pub mod public_key;
 pub mod sampler;

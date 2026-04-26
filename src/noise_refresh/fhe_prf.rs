@@ -364,8 +364,8 @@ mod tests {
         let ring_dim = 2u32;
         let num_slots = 2usize;
         let active_levels = 1usize;
-        let crt_bits = 8usize;
-        let base_bits = 8u32;
+        let crt_bits = 10usize;
+        let base_bits = 10u32;
         let p_moduli_bits = 5usize;
         let scale = 1u64 << 5;
         let cpu_params = DCRTPolyParams::new(ring_dim, active_levels, crt_bits, base_bits);

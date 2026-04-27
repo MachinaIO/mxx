@@ -174,7 +174,7 @@ mod tests {
             "chosen v_bits must make every binary mask value smaller than q/(2*q_max)"
         );
 
-        let seed_bits = 6usize;
+        let seed_bits = 8usize;
         let cbd_n = 2usize;
         let output_scope_idx = 0usize;
         let graph_seed = [9u8; 32];
@@ -224,7 +224,7 @@ mod tests {
             b"noise_refresh_formatter_public_key",
             None,
         );
-        let seed_plaintexts = vec![1, 0, 1, 1, 0, 1];
+        let seed_plaintexts = vec![1, 0, 1, 1, 0, 1, 0, 1];
         let native_seed_ciphertexts = seed_plaintexts
             .iter()
             .copied()

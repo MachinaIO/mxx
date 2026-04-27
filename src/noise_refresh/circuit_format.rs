@@ -331,10 +331,10 @@ mod tests {
     const RING_DIM: u32 = 2;
     const NUM_SLOTS: usize = RING_DIM as usize;
     const ACTIVE_LEVELS: usize = 2;
-    const CRT_BITS: usize = 20;
-    const BASE_BITS: u32 = 10;
-    const P_MODULI_BITS: usize = 7;
-    const SCALE: u64 = 1 << 6;
+    const CRT_BITS: usize = 6;
+    const BASE_BITS: u32 = 3;
+    const P_MODULI_BITS: usize = 5;
+    const SCALE: u64 = 1 << 4;
 
     fn create_test_context(
         circuit: &mut PolyCircuit<GpuDCRTPoly>,

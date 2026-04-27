@@ -331,9 +331,9 @@ mod tests {
     const RING_DIM: u32 = 2;
     const NUM_SLOTS: usize = RING_DIM as usize;
     const ACTIVE_LEVELS: usize = 2;
-    const CRT_BITS: usize = 6;
-    const BASE_BITS: u32 = 3;
-    const P_MODULI_BITS: usize = 5;
+    const CRT_BITS: usize = 8;
+    const BASE_BITS: u32 = 4;
+    const P_MODULI_BITS: usize = 4;
     const SCALE: u64 = 1 << 4;
 
     fn create_test_context(

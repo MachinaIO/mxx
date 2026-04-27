@@ -268,6 +268,76 @@ where
     circuit
 }
 
+/// Builds an all-CRT formatter for one gadget digit of one refreshed wire.
+///
+/// The full formatter is a Cartesian product over gadget digits and CRT levels.  This helper
+/// isolates one gadget-digit slice while still evaluating every CRT level for that digit, which is
+/// the smallest unit that can be rounded and CRT-recombined back to a native error coefficient.
+/// It is useful for tests and benchmarks that need the real Ring-GSW decrypt/rounding behavior but
+/// cannot afford to materialize every independent digit slice at once.
+///
+/// Inputs are ordered as:
+/// 1. `ring_dim` error coefficient ciphertexts for the selected gadget digit.
+/// 2. `crt_depth * ring_dim * v_bits` mask bit ciphertexts, grouped by CRT level, coefficient, then
+///    bit index.
+///
+/// Outputs are `crt_depth` slotwise polynomial wires.  Output `i` is the selected digit's
+/// `error + mask` polynomial decoded at CRT modulus `q_i`.
+pub fn build_refreshed_wire_digit_all_crt_formatter<P, A, M>(
+    ring_gsw: Arc<RingGswContext<P, A>>,
+    v_bits: usize,
+) -> PolyCircuit<P>
+where
+    P: Poly + 'static,
+    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
+    M: PolyMatrix<P = P>,
+{
+    assert!(v_bits > 0, "v_bits must be positive");
+    let (q_moduli, _crt_bits, q_moduli_depth) = ring_gsw.params.to_crt();
+
+    let mut circuit = ring_gsw.fresh_circuit();
+    let decryption_key = GateId(0);
+    let ring_dim = ring_gsw.params.ring_dimension() as usize;
+    let mask_q_chunk_len = ring_dim.checked_mul(v_bits).expect("mask q chunk length overflow");
+    let full_modulus = ring_gsw.params.modulus();
+    let full_modulus: Arc<BigUint> = full_modulus.into();
+    let mask_plaintext_moduli =
+        mask_plaintext_moduli_from_full_modulus(full_modulus.as_ref(), v_bits);
+
+    let errors = (0..ring_dim)
+        .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
+        .collect::<Vec<_>>();
+    let masks = (0..q_moduli_depth * mask_q_chunk_len)
+        .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
+        .collect::<Vec<_>>();
+
+    let mut outputs = Vec::with_capacity(q_moduli_depth);
+    for (crt_idx, &q_i) in q_moduli.iter().enumerate() {
+        let decrypted_error = decrypt_error_coefficients_as_polynomial::<P, A, M>(
+            &mut circuit,
+            &errors,
+            decryption_key,
+            BigUint::from(q_i),
+        );
+
+        let mask_start =
+            crt_idx.checked_mul(mask_q_chunk_len).expect("CRT mask slice start overflow");
+        let mask_end =
+            mask_start.checked_add(mask_q_chunk_len).expect("CRT mask slice end overflow");
+        let decrypted_mask = decrypt_bit_decomposed_polynomial::<P, A, M>(
+            &mut circuit,
+            &masks[mask_start..mask_end],
+            decryption_key,
+            &mask_plaintext_moduli,
+        );
+
+        outputs.push(circuit.add_gate(decrypted_error, decrypted_mask).as_single_wire());
+    }
+
+    circuit.output(outputs);
+    circuit
+}
+
 /// Derives mask bit plaintext moduli from the full coefficient modulus.
 ///
 /// Bit indices are zero-based: bit `0` uses plaintext modulus `q`, bit `1` uses `q/2`, and so on.
@@ -294,12 +364,12 @@ fn mask_plaintext_moduli_from_full_modulus(
 
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
-    use super::build_refreshed_wire_all_crt_formatter;
+    use super::build_refreshed_wire_digit_all_crt_formatter;
     use crate::{
         __PAIR, __TestState,
         circuit::{PolyCircuit, evaluable::PolyVec},
         gadgets::{
-            arith::{NestedRnsPoly, NestedRnsPolyContext},
+            arith::{DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPoly, NestedRnsPolyContext},
             fhe::{
                 ring_gsw::RingGswCiphertext,
                 ring_gsw_nested_rns::{
@@ -333,8 +403,8 @@ mod tests {
     const ACTIVE_LEVELS: usize = 2;
     const CRT_BITS: usize = 10;
     const BASE_BITS: u32 = 5;
-    const P_MODULI_BITS: usize = 12;
-    const MAX_UNREDUCED_MULS: usize = 1;
+    const P_MODULI_BITS: usize = 6;
+    const MAX_UNREDUCED_MULS: usize = DEFAULT_MAX_UNREDUCED_MULS;
     const SCALE: u64 = 1 << 4;
 
     fn create_test_context(
@@ -462,7 +532,7 @@ mod tests {
         )
     }
 
-    fn native_formatter_material(
+    fn native_single_digit_formatter_material(
         cpu_params: &DCRTPolyParams,
         gpu_params: &GpuDCRTPolyParams,
         ring_gsw: &Arc<NestedRnsRingGswContext<GpuDCRTPoly>>,
@@ -503,13 +573,21 @@ mod tests {
             evaluate_plaintext_cbd_prf(cbd_prf.uniform_graphs(), seed_plaintexts, cbd_n);
         assert_eq!(expected_errors.len(), output_sizes.cbd_values);
 
+        let ring_dim = gpu_params.ring_dimension() as usize;
+        let log_base_q = gpu_params.modulus_digits();
+        let selected_digit_idx = 0usize;
+        assert!(selected_digit_idx < log_base_q);
+
         let q: Arc<BigUint> = gpu_params.modulus().into();
-        let mut material = expected_errors
+        let selected_error_start = selected_digit_idx * ring_dim;
+        let mut material = expected_errors[selected_error_start..selected_error_start + ring_dim]
             .iter()
             .enumerate()
             .map(|(idx, &error)| {
                 let plaintext = centered_to_mod_q(error, &q);
-                let tag = format!("noise_refresh_formatter_native_error_{idx}_{error}");
+                let tag = format!(
+                    "noise_refresh_formatter_native_digit_{selected_digit_idx}_error_{idx}_{error}"
+                );
                 encrypt_constant_for_formatter(
                     cpu_params,
                     ring_gsw.as_ref(),
@@ -539,16 +617,32 @@ mod tests {
         );
         let mask_bits = evaluate_plaintext_graph(mask_prg.graph(), seed_plaintexts);
         assert_eq!(mask_bits.len(), output_sizes.mask_bits);
-        material.extend(mask_bits.iter().enumerate().map(|(idx, &mask_bit)| {
-            let tag = format!("noise_refresh_formatter_native_mask_{idx}_{mask_bit}");
-            encrypt_constant_for_formatter(
-                cpu_params,
-                ring_gsw.as_ref(),
-                public_key,
-                &BigUint::from(mask_bit),
-                tag.as_bytes(),
-            )
-        }));
+
+        let mask_q_chunk_len = ring_dim.checked_mul(v_bits).expect("mask chunk length overflow");
+        for crt_idx in 0..crt_depth {
+            let mask_start = crt_idx
+                .checked_mul(log_base_q)
+                .and_then(|value| value.checked_mul(mask_q_chunk_len))
+                .and_then(|value| {
+                    value.checked_add(selected_digit_idx.checked_mul(mask_q_chunk_len)?)
+                })
+                .expect("selected mask slice start overflow");
+            let mask_end = mask_start.checked_add(mask_q_chunk_len).expect("mask slice overflow");
+            material.extend(mask_bits[mask_start..mask_end].iter().enumerate().map(
+                |(idx, &mask_bit)| {
+                    let tag = format!(
+                        "noise_refresh_formatter_native_digit_{selected_digit_idx}_crt_{crt_idx}_mask_{idx}_{mask_bit}"
+                    );
+                    encrypt_constant_for_formatter(
+                        cpu_params,
+                        ring_gsw.as_ref(),
+                        public_key,
+                        &BigUint::from(mask_bit),
+                        tag.as_bytes(),
+                    )
+                },
+            ));
+        }
 
         (material, expected_errors)
     }
@@ -576,7 +670,7 @@ mod tests {
             "chosen v_bits must make every binary mask value smaller than q/(2*q_max)"
         );
 
-        let formatter_circuit = build_refreshed_wire_all_crt_formatter::<
+        let formatter_circuit = build_refreshed_wire_digit_all_crt_formatter::<
             GpuDCRTPoly,
             NestedRnsPoly<GpuDCRTPoly>,
             GpuDCRTPolyMatrix,
@@ -595,7 +689,7 @@ mod tests {
         let graph_seed = [9u8; 32];
         let output_scope_idx = 0usize;
         let cbd_n = 2usize;
-        let (native_material, expected_errors) = native_formatter_material(
+        let (native_material, expected_errors) = native_single_digit_formatter_material(
             &cpu_params,
             &gpu_params,
             &ring_gsw,
@@ -630,7 +724,7 @@ mod tests {
             Some(&slot_transfer_evaluator),
             Some(1),
         );
-        assert_eq!(outputs.len(), crt_depth * gpu_params.modulus_digits());
+        assert_eq!(outputs.len(), crt_depth);
 
         let decoded_polys = outputs
             .iter()
@@ -638,23 +732,21 @@ mod tests {
             .collect::<Vec<_>>();
         let reconst_coeffs = gpu_params.reconst_coeffs();
         let ring_dim = gpu_params.ring_dimension() as usize;
-        for digit_idx in 0..gpu_params.modulus_digits() {
-            for coeff_idx in 0..ring_dim {
-                let mut reconstructed = BigUint::zero();
-                for (crt_idx, &q_i) in q_moduli.iter().enumerate() {
-                    let output_idx = crt_idx * gpu_params.modulus_digits() + digit_idx;
-                    let output_coeffs = decoded_polys[output_idx].coeffs_biguints();
-                    let residue = round_scaled_crt_residue(&output_coeffs[coeff_idx], q_i, &q);
-                    reconstructed += residue * &reconst_coeffs[crt_idx];
-                }
-                reconstructed %= q.as_ref();
-                let expected_idx = digit_idx * ring_dim + coeff_idx;
-                assert_eq!(
-                    reconstructed,
-                    centered_to_mod_q(expected_errors[expected_idx], &q),
-                    "CRT-reconstructed formatter output should recover native CBD error at digit {digit_idx}, coeff {coeff_idx}"
-                );
+        let selected_digit_idx = 0usize;
+        for coeff_idx in 0..ring_dim {
+            let mut reconstructed = BigUint::zero();
+            for (crt_idx, &q_i) in q_moduli.iter().enumerate() {
+                let output_coeffs = decoded_polys[crt_idx].coeffs_biguints();
+                let residue = round_scaled_crt_residue(&output_coeffs[coeff_idx], q_i, &q);
+                reconstructed += residue * &reconst_coeffs[crt_idx];
             }
+            reconstructed %= q.as_ref();
+            let expected_idx = selected_digit_idx * ring_dim + coeff_idx;
+            assert_eq!(
+                reconstructed,
+                centered_to_mod_q(expected_errors[expected_idx], &q),
+                "CRT-reconstructed formatter output should recover native CBD error at digit {selected_digit_idx}, coeff {coeff_idx}"
+            );
         }
     }
 }

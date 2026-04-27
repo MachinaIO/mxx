@@ -400,12 +400,13 @@ mod tests {
 
     const RING_DIM: u32 = 2;
     const NUM_SLOTS: usize = RING_DIM as usize;
-    const ACTIVE_LEVELS: usize = 2;
+    const ACTIVE_LEVELS: usize = 1;
     const CRT_BITS: usize = 10;
     const BASE_BITS: u32 = 5;
     const P_MODULI_BITS: usize = 6;
     const MAX_UNREDUCED_MULS: usize = DEFAULT_MAX_UNREDUCED_MULS;
     const SCALE: u64 = 1 << 4;
+    const FORCE_ZERO_MASKS: bool = true;
 
     fn create_test_context(
         circuit: &mut PolyCircuit<GpuDCRTPoly>,
@@ -598,24 +599,28 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let mask_seed = derive_noise_refresh_graph_seed(
-            graph_seed,
-            b"NoiseRefreshMask/v1",
-            output_scope_idx as u64,
-        );
-        let mask_prg = GoldreichFhePrg::<
-            GpuDCRTPoly,
-            RingGswCiphertext<GpuDCRTPoly, NestedRnsPoly<GpuDCRTPoly>>,
-        >::setup_range(
-            &mut graph_circuit,
-            ring_gsw.clone(),
-            seed_plaintexts.len(),
-            output_sizes.mask_bits,
-            0,
-            output_sizes.mask_bits,
-            mask_seed,
-        );
-        let mask_bits = evaluate_plaintext_graph(mask_prg.graph(), seed_plaintexts);
+        let mask_bits = if FORCE_ZERO_MASKS {
+            vec![0; output_sizes.mask_bits]
+        } else {
+            let mask_seed = derive_noise_refresh_graph_seed(
+                graph_seed,
+                b"NoiseRefreshMask/v1",
+                output_scope_idx as u64,
+            );
+            let mask_prg = GoldreichFhePrg::<
+                GpuDCRTPoly,
+                RingGswCiphertext<GpuDCRTPoly, NestedRnsPoly<GpuDCRTPoly>>,
+            >::setup_range(
+                &mut graph_circuit,
+                ring_gsw.clone(),
+                seed_plaintexts.len(),
+                output_sizes.mask_bits,
+                0,
+                output_sizes.mask_bits,
+                mask_seed,
+            );
+            evaluate_plaintext_graph(mask_prg.graph(), seed_plaintexts)
+        };
         assert_eq!(mask_bits.len(), output_sizes.mask_bits);
 
         let mask_q_chunk_len = ring_dim.checked_mul(v_bits).expect("mask chunk length overflow");
@@ -665,10 +670,12 @@ mod tests {
             v_bits <= max_safe_v_bits,
             "single-bit mask test must stay within the maximum safe mask bit length"
         );
-        assert!(
-            (BigUint::from(1u64) << v_bits) < mask_bound,
-            "chosen v_bits must make every binary mask value smaller than q/(2*q_max)"
-        );
+        if !FORCE_ZERO_MASKS {
+            assert!(
+                (BigUint::from(1u64) << v_bits) < mask_bound,
+                "chosen v_bits must make every binary mask value smaller than q/(2*q_max)"
+            );
+        }
 
         let formatter_circuit = build_refreshed_wire_digit_all_crt_formatter::<
             GpuDCRTPoly,

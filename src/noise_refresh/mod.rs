@@ -168,7 +168,7 @@ mod tests {
         let max_safe_v_bits = usize::try_from(mask_bound.bits().saturating_sub(1))
             .expect("mask bit length must fit in usize")
             .max(1);
-        let v_bits = max_safe_v_bits.min(2);
+        let v_bits = max_safe_v_bits;
         assert!(
             (BigUint::from(1u64) << v_bits) < mask_bound,
             "chosen v_bits must make every binary mask value smaller than q/(2*q_max)"

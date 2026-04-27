@@ -331,8 +331,8 @@ mod tests {
     const RING_DIM: u32 = 2;
     const NUM_SLOTS: usize = RING_DIM as usize;
     const ACTIVE_LEVELS: usize = 2;
-    const CRT_BITS: usize = 8;
-    const BASE_BITS: u32 = 4;
+    const CRT_BITS: usize = 10;
+    const BASE_BITS: u32 = 5;
     const P_MODULI_BITS: usize = 6;
     const SCALE: u64 = 1 << 4;
 

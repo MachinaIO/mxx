@@ -364,7 +364,7 @@ fn mask_plaintext_moduli_from_full_modulus(
 
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
-    use super::build_refreshed_wire_digit_all_crt_formatter;
+    use super::{build_refreshed_wire_digit_all_crt_formatter, ciphertext_wires};
     use crate::{
         __PAIR, __TestState,
         circuit::{PolyCircuit, evaluable::PolyVec},
@@ -432,6 +432,48 @@ mod tests {
             None,
         ));
         (cpu_params, gpu_params, ring_gsw)
+    }
+
+    /// Builds the relation-test main circuit with one shared mask ciphertext input.
+    ///
+    /// The production formatter subcircuit still has the ordinary input contract: it receives one
+    /// independent mask ciphertext for every CRT/coefficient/bit position.  This test wrapper keeps
+    /// that contract intact but aliases all those formal mask inputs to a single main-circuit mask
+    /// ciphertext.  The resulting test still exercises the same formatter decrypt/add/round path,
+    /// while avoiding the GPU materialization cost of many distinct native mask ciphertext inputs.
+    fn build_shared_mask_formatter_test_circuit(
+        ring_gsw: Arc<NestedRnsRingGswContext<GpuDCRTPoly>>,
+        v_bits: usize,
+    ) -> PolyCircuit<GpuDCRTPoly> {
+        let mut circuit = ring_gsw.fresh_circuit();
+        let ring_dim = ring_gsw.params.ring_dimension() as usize;
+        let (_q_moduli, _crt_bits, crt_depth) = ring_gsw.params.to_crt();
+        let errors = (0..ring_dim)
+            .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
+            .collect::<Vec<_>>();
+        let shared_mask = RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit);
+
+        let formatter = build_refreshed_wire_digit_all_crt_formatter::<
+            GpuDCRTPoly,
+            NestedRnsPoly<GpuDCRTPoly>,
+            GpuDCRTPolyMatrix,
+        >(ring_gsw.clone(), v_bits);
+        let formatter_id = circuit.register_sub_circuit(formatter);
+
+        let mut formatter_inputs =
+            ciphertext_wires::<GpuDCRTPoly, NestedRnsPoly<GpuDCRTPoly>>(&errors);
+        let shared_mask_wires = shared_mask.sub_circuit_wires();
+        let mask_ciphertext_count = crt_depth
+            .checked_mul(ring_dim)
+            .and_then(|value| value.checked_mul(v_bits))
+            .expect("shared-mask formatter input count overflow");
+        for _ in 0..mask_ciphertext_count {
+            formatter_inputs.extend(shared_mask_wires.iter().copied());
+        }
+
+        let outputs = circuit.call_sub_circuit(formatter_id, formatter_inputs);
+        circuit.output(outputs);
+        circuit
     }
 
     fn evaluate_plaintext_graph(graph: &GoldreichGraph, input_bits: &[u64]) -> Vec<u64> {
@@ -533,7 +575,7 @@ mod tests {
         )
     }
 
-    fn native_single_digit_formatter_material(
+    fn native_shared_mask_formatter_material(
         cpu_params: &DCRTPolyParams,
         gpu_params: &GpuDCRTPolyParams,
         ring_gsw: &Arc<NestedRnsRingGswContext<GpuDCRTPoly>>,
@@ -611,39 +653,21 @@ mod tests {
             &mut graph_circuit,
             ring_gsw.clone(),
             seed_plaintexts.len(),
-            output_sizes.mask_bits,
+            1,
             0,
-            output_sizes.mask_bits,
+            1,
             mask_seed,
         );
         let mask_bits = evaluate_plaintext_graph(mask_prg.graph(), seed_plaintexts);
-        assert_eq!(mask_bits.len(), output_sizes.mask_bits);
-
-        let mask_q_chunk_len = ring_dim.checked_mul(v_bits).expect("mask chunk length overflow");
-        for crt_idx in 0..crt_depth {
-            let mask_start = crt_idx
-                .checked_mul(log_base_q)
-                .and_then(|value| value.checked_mul(mask_q_chunk_len))
-                .and_then(|value| {
-                    value.checked_add(selected_digit_idx.checked_mul(mask_q_chunk_len)?)
-                })
-                .expect("selected mask slice start overflow");
-            let mask_end = mask_start.checked_add(mask_q_chunk_len).expect("mask slice overflow");
-            material.extend(mask_bits[mask_start..mask_end].iter().enumerate().map(
-                |(idx, &mask_bit)| {
-                    let tag = format!(
-                        "noise_refresh_formatter_native_digit_{selected_digit_idx}_crt_{crt_idx}_mask_{idx}_{mask_bit}"
-                    );
-                    encrypt_constant_for_formatter(
-                        cpu_params,
-                        ring_gsw.as_ref(),
-                        public_key,
-                        &BigUint::from(mask_bit),
-                        tag.as_bytes(),
-                    )
-                },
-            ));
-        }
+        assert_eq!(mask_bits.len(), 1);
+        let shared_mask_bit = mask_bits[0];
+        material.push(encrypt_constant_for_formatter(
+            cpu_params,
+            ring_gsw.as_ref(),
+            public_key,
+            &BigUint::from(shared_mask_bit),
+            format!("noise_refresh_formatter_native_shared_mask_{shared_mask_bit}").as_bytes(),
+        ));
 
         (material, expected_errors)
     }
@@ -671,11 +695,7 @@ mod tests {
             "chosen v_bits must make every binary mask value smaller than q/(2*q_max)"
         );
 
-        let formatter_circuit = build_refreshed_wire_digit_all_crt_formatter::<
-            GpuDCRTPoly,
-            NestedRnsPoly<GpuDCRTPoly>,
-            GpuDCRTPolyMatrix,
-        >(ring_gsw.clone(), v_bits);
+        let formatter_circuit = build_shared_mask_formatter_test_circuit(ring_gsw.clone(), v_bits);
         let secret_key = DCRTPoly::const_one(&cpu_params);
         let public_key = sample_public_key(
             &cpu_params,
@@ -690,7 +710,7 @@ mod tests {
         let graph_seed = [9u8; 32];
         let output_scope_idx = 0usize;
         let cbd_n = 2usize;
-        let (native_material, expected_errors) = native_single_digit_formatter_material(
+        let (native_material, expected_errors) = native_shared_mask_formatter_material(
             &cpu_params,
             &gpu_params,
             &ring_gsw,

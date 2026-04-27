@@ -333,7 +333,7 @@ mod tests {
     const ACTIVE_LEVELS: usize = 2;
     const CRT_BITS: usize = 8;
     const BASE_BITS: u32 = 4;
-    const P_MODULI_BITS: usize = 4;
+    const P_MODULI_BITS: usize = 6;
     const SCALE: u64 = 1 << 4;
 
     fn create_test_context(

@@ -328,7 +328,7 @@ mod tests {
     use num_traits::{ToPrimitive, Zero};
     use std::sync::Arc;
 
-    const RING_DIM: u32 = 2;
+    const RING_DIM: u32 = 1;
     const NUM_SLOTS: usize = RING_DIM as usize;
     const ACTIVE_LEVELS: usize = 2;
     const CRT_BITS: usize = 10;

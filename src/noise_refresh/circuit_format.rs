@@ -299,7 +299,7 @@ mod tests {
         __PAIR, __TestState,
         circuit::{PolyCircuit, evaluable::PolyVec},
         gadgets::{
-            arith::{DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPoly, NestedRnsPolyContext},
+            arith::{NestedRnsPoly, NestedRnsPolyContext},
             fhe::{
                 ring_gsw::RingGswCiphertext,
                 ring_gsw_nested_rns::{
@@ -328,12 +328,13 @@ mod tests {
     use num_traits::{ToPrimitive, Zero};
     use std::sync::Arc;
 
-    const RING_DIM: u32 = 1;
+    const RING_DIM: u32 = 2;
     const NUM_SLOTS: usize = RING_DIM as usize;
     const ACTIVE_LEVELS: usize = 2;
     const CRT_BITS: usize = 10;
     const BASE_BITS: u32 = 5;
     const P_MODULI_BITS: usize = 6;
+    const MAX_UNREDUCED_MULS: usize = 1;
     const SCALE: u64 = 1 << 4;
 
     fn create_test_context(
@@ -346,7 +347,7 @@ mod tests {
             circuit,
             &gpu_params,
             P_MODULI_BITS,
-            DEFAULT_MAX_UNREDUCED_MULS,
+            MAX_UNREDUCED_MULS,
             SCALE,
             false,
             Some(ACTIVE_LEVELS),

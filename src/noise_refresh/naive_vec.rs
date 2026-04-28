@@ -1,4 +1,7 @@
 use crate::{
+    bench_estimator::{
+        BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary, benchmark_gate_operation,
+    },
     bgg::naive_vec::{NaiveBGGEncodingVec, NaiveBGGPublicKeyVec},
     circuit::{BatchedWire, PolyCircuit, evaluable::Evaluable},
     gadgets::{
@@ -22,6 +25,108 @@ use crate::{
 use num_bigint::BigUint;
 use rayon::prelude::*;
 use std::{marker::PhantomData, sync::Arc};
+use tracing::debug;
+
+const NATIVE_BENCH_ITERATIONS: usize = 1;
+
+fn scaled_estimate_summary(unit: CircuitBenchEstimate, task_count: usize) -> CircuitBenchSummary {
+    let total_time = unit.total_time * task_count as f64;
+    let max_parallelism = unit
+        .max_parallelism
+        .checked_mul(task_count as u128)
+        .expect("noise-refresh benchmark parallelism overflowed while scaling a stage");
+    let summary = CircuitBenchSummary::new(total_time, unit.latency, max_parallelism);
+    #[cfg(feature = "gpu")]
+    {
+        summary.with_peak_vram(unit.peak_vram)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        summary
+    }
+}
+
+fn estimate_summary(unit: CircuitBenchEstimate) -> CircuitBenchSummary {
+    scaled_estimate_summary(unit, 1)
+}
+
+fn scaled_summary(summary: CircuitBenchSummary, task_count: usize) -> CircuitBenchSummary {
+    let total_time = summary.total_time * task_count as f64;
+    let max_parallelism = summary
+        .max_parallelism
+        .checked_mul(task_count as u128)
+        .expect("noise-refresh benchmark parallelism overflowed while scaling a summary");
+    let scaled = CircuitBenchSummary::new(total_time, summary.latency, max_parallelism);
+    #[cfg(feature = "gpu")]
+    {
+        scaled.with_peak_vram(summary.peak_vram)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        scaled
+    }
+}
+
+fn sequential_summaries(parts: &[CircuitBenchSummary]) -> CircuitBenchSummary {
+    let total_time = parts.iter().map(|part| part.total_time).sum::<f64>();
+    let latency = parts.iter().map(|part| part.latency).sum::<f64>();
+    let max_parallelism = parts.iter().map(|part| part.max_parallelism).max().unwrap_or(0);
+    let summary = CircuitBenchSummary::new(total_time, latency, max_parallelism);
+    #[cfg(feature = "gpu")]
+    {
+        summary.with_peak_vram(parts.iter().map(|part| part.peak_vram).max().unwrap_or(0))
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        summary
+    }
+}
+
+fn measured_crt_recompose_unit_summary<M>(params: &<M::P as Poly>::Params) -> CircuitBenchSummary
+where
+    M: PolyMatrix,
+{
+    let (q_moduli, _crt_bits, crt_depth) = params.to_crt();
+    let q: Arc<BigUint> = params.modulus().into();
+    let log_base_q = params.modulus_digits();
+    let ring_dim = params.ring_dimension() as usize;
+    let crt_values = q_moduli
+        .iter()
+        .take(crt_depth)
+        .enumerate()
+        .map(|(crt_idx, &q_i)| {
+            let scale = q.as_ref() / BigUint::from(q_i);
+            let row = (0..log_base_q)
+                .map(|digit_idx| {
+                    let coeffs = (0..ring_dim)
+                        .map(|coeff_idx| {
+                            let base = BigUint::from((1 + crt_idx + digit_idx + coeff_idx) as u64);
+                            (base * &scale) % q.as_ref()
+                        })
+                        .collect::<Vec<_>>();
+                    M::P::from_biguints(params, &coeffs)
+                })
+                .collect::<Vec<_>>();
+            M::from_poly_vec_row(params, row)
+        })
+        .collect::<Vec<_>>();
+    let bench = benchmark_gate_operation(NATIVE_BENCH_ITERATIONS, || {
+        crt_recompose_rows::<M>(params, &crt_values, 1)
+    });
+    let summary = CircuitBenchSummary::new(bench.time, bench.time, 1);
+    #[cfg(feature = "gpu")]
+    {
+        summary.with_peak_vram(bench.peak_vram)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        summary
+    }
+}
+
+fn expand_batched_wires(wires: &[BatchedWire]) -> Vec<BatchedWire> {
+    wires.iter().flat_map(|wire| (0..wire.len()).map(|idx| wire.at(idx))).collect()
+}
 
 /// Naive-vector implementation of one-wire noise refresh.
 ///
@@ -74,6 +179,179 @@ where
 
     fn params(&self) -> &<M::P as Poly>::Params {
         &self.ring_gsw.params
+    }
+
+    /// Estimates the preprocessing side of the current naive-vector implementation.
+    ///
+    /// This models the same work as `preprocess`: evaluate the PRG/decrypt/merge material circuit
+    /// under public-key evaluators, transform each decoded material output into a one-column
+    /// contribution, collapse the per-slot matrices, and combine those columns with the
+    /// `NaiveBGGPublicKeyVec` one and refreshed-input public keys.  The returned value is only the
+    /// total preprocessing summary; stage estimates are emitted with `debug!` for inspection.
+    ///
+    /// `BenchEstimator` does not expose an arbitrary `matrix_mul(rhs_matrix)` primitive, so this
+    /// model uses scalar BGG `estimate_large_scalar_mul(&[1])` as the cost proxy for each public
+    /// matrix multiplication.  Both operations are dominated by gadget decomposition of the
+    /// right-hand target.
+    pub fn estimate_preprocess_bench<PKBE>(
+        &self,
+        public_key_estimator: &PKBE,
+    ) -> CircuitBenchSummary
+    where
+        PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + Sync,
+    {
+        let num_slots = self.params().ring_dimension() as usize;
+        let (_q_moduli, _crt_bits, crt_depth) = self.params().to_crt();
+        let log_base_q = self.params().modulus_digits();
+        let combine_task_count =
+            num_slots.checked_mul(crt_depth).expect("noise-refresh combine task count overflow");
+
+        let material_circuit = build_noise_refresh_material_circuit::<M::P, A, M>(
+            self.ring_gsw.clone(),
+            self.seed_bits,
+            self.v_bits,
+            self.graph_seed,
+            self.cbd_n,
+            num_slots,
+        );
+        let public_material_summary =
+            public_key_estimator.estimate_circuit_bench(&material_circuit);
+
+        let scalar_target = [BigUint::from(1u32)];
+        let pk_matrix_mul = public_key_estimator.estimate_large_scalar_mul(&scalar_target);
+        let pk_add = public_key_estimator.estimate_add();
+        let pk_sub = public_key_estimator.estimate_sub();
+        let collapse_add_count = log_base_q
+            .checked_mul(num_slots.saturating_sub(1))
+            .expect("noise-refresh collapse add count overflow");
+        let preprocess_combine_unit = sequential_summaries(&[
+            // Compute the public-key one-term for the naive slot vector:
+            // `one.keys[slot_idx].matrix_mul((q / q_i) * A')`.
+            estimate_summary(pk_matrix_mul),
+            // Compute the refreshed-input public-key term for the naive slot vector:
+            // `refreshed_input.keys[slot_idx].matrix_mul((q / q_i) * G)`.
+            estimate_summary(pk_matrix_mul),
+            // Apply the one-column target to each of the `log_base_q` decoded material columns.
+            scaled_estimate_summary(pk_matrix_mul, log_base_q),
+            // For each decoded material column, `collapse_slot_matrices` sums `num_slots`
+            // rotated slot matrices into one polynomial column; `concat_owned_columns` then only
+            // lays those columns side by side and is not modeled as arithmetic.
+            scaled_estimate_summary(pk_add, collapse_add_count),
+            // Add the refreshed-input term and the decoded refresh term.
+            estimate_summary(pk_add),
+            // Subtract the one-term so the public refresh matrix has the intended sign.
+            estimate_summary(pk_sub),
+        ]);
+
+        let preprocess_combine_stage = scaled_summary(preprocess_combine_unit, combine_task_count);
+        let preprocess_summary =
+            sequential_summaries(&[public_material_summary, preprocess_combine_stage]);
+
+        debug!(
+            v_bits = self.v_bits,
+            num_slots,
+            crt_depth,
+            log_base_q,
+            combine_task_count,
+            ?public_material_summary,
+            ?preprocess_combine_unit,
+            ?preprocess_combine_stage,
+            ?preprocess_summary,
+            "estimated naive-vector noise-refresh preprocess benchmark"
+        );
+
+        preprocess_summary
+    }
+
+    /// Estimates the online-evaluation side of the current naive-vector implementation.
+    ///
+    /// This models the same work as `online_eval`: evaluate the PRG/decrypt/merge material circuit
+    /// under encoding evaluators, combine each `(slot_idx, crt_idx)` decoded material vector with
+    /// the `NaiveBGGEncodingVec` one, refreshed input, and decoder terms, then round and CRT
+    /// recompose one final row per slot.  The returned value is only the total online summary;
+    /// stage estimates are emitted with `debug!` for inspection.
+    pub fn estimate_online_eval_bench<EncBE>(
+        &self,
+        encoding_estimator: &EncBE,
+    ) -> CircuitBenchSummary
+    where
+        EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
+    {
+        let num_slots = self.params().ring_dimension() as usize;
+        let (_q_moduli, _crt_bits, crt_depth) = self.params().to_crt();
+        let log_base_q = self.params().modulus_digits();
+        let combine_task_count =
+            num_slots.checked_mul(crt_depth).expect("noise-refresh combine task count overflow");
+
+        let material_circuit = build_noise_refresh_material_circuit::<M::P, A, M>(
+            self.ring_gsw.clone(),
+            self.seed_bits,
+            self.v_bits,
+            self.graph_seed,
+            self.cbd_n,
+            num_slots,
+        );
+        let online_material_summary = encoding_estimator.estimate_circuit_bench(&material_circuit);
+
+        let scalar_target = [BigUint::from(1u32)];
+        let enc_matrix_mul = encoding_estimator.estimate_large_scalar_mul(&scalar_target);
+        let enc_add = encoding_estimator.estimate_add();
+        let enc_sub = encoding_estimator.estimate_sub();
+        let collapse_add_count = log_base_q
+            .checked_mul(num_slots.saturating_sub(1))
+            .expect("noise-refresh collapse add count overflow");
+        let online_combine_unit = sequential_summaries(&[
+            // Compute the encoding one-term for the naive slot vector:
+            // `one.encodings[slot_idx].matrix_mul((q / q_i) * A')`.
+            estimate_summary(enc_matrix_mul),
+            // Compute the refreshed-input encoding term for the naive slot vector:
+            // `refreshed_input.encodings[slot_idx].matrix_mul((q / q_i) * G)`.
+            estimate_summary(enc_matrix_mul),
+            // Apply the one-column target to each of the `log_base_q` decoded material columns.
+            scaled_estimate_summary(enc_matrix_mul, log_base_q),
+            // For each decoded material column, `collapse_slot_matrices` sums `num_slots`
+            // rotated slot vectors into one polynomial column; `concat_owned_columns` then only
+            // lays those columns side by side and is not modeled as arithmetic.
+            scaled_estimate_summary(enc_add, collapse_add_count),
+            // Add the refreshed-input term and the decoded refresh term.
+            estimate_summary(enc_add),
+            // Subtract the one-term to leave the desired positive `A'` contribution after
+            // decoding.
+            estimate_summary(enc_sub),
+            // Subtract the caller-provided decoder for this `(slot_idx, crt_idx)` level.
+            estimate_summary(enc_sub),
+        ]);
+
+        // Measure the native `crt_recompose_rows` work for one final slot row directly.  This is
+        // not a BGG encoding gate: it performs coefficient rounding, reconstruction-coefficient
+        // multiplication, and CRT-level accumulation on raw `M` matrices.
+        let online_crt_recompose_unit = measured_crt_recompose_unit_summary::<M>(self.params());
+
+        let online_combine_stage = scaled_summary(online_combine_unit, combine_task_count);
+        let online_crt_stage = scaled_summary(online_crt_recompose_unit, num_slots);
+        let online_summary = sequential_summaries(&[
+            online_material_summary,
+            online_combine_stage,
+            online_crt_stage,
+        ]);
+
+        debug!(
+            v_bits = self.v_bits,
+            num_slots,
+            crt_depth,
+            log_base_q,
+            combine_task_count,
+            crt_recompose_task_count = num_slots,
+            ?online_material_summary,
+            ?online_combine_unit,
+            ?online_combine_stage,
+            ?online_crt_recompose_unit,
+            ?online_crt_stage,
+            ?online_summary,
+            "estimated naive-vector noise-refresh online benchmark"
+        );
+
+        online_summary
     }
 }
 
@@ -155,23 +433,21 @@ where
                 // The one-term is evaluated with the natural `+(q/q_i) * A'` target, then
                 // subtracted from the accumulated refresh matrix below. In the online path this
                 // subtraction makes `online_terms - decoder` leave a positive `+(q/q_i) * A'`.
-                let one_term = one
+                let one_term = one.keys[slot_idx]
                     .matrix_mul(
                         self.params(),
                         &(a_prime.clone() * constant_poly::<M>(self.params(), q_over_qi.clone())),
                     )
-                    .keys[slot_idx]
                     .matrix
                     .clone();
                 // The refreshed input target is positive `+(q/q_i) * G`, so online subtraction of
                 // the decoder cancels the public `sA_x` part and leaves `-xG`.
-                let input_term = refreshed_input
+                let input_term = refreshed_input.keys[slot_idx]
                     .matrix_mul(
                         self.params(),
                         &(M::gadget_matrix(self.params(), 1) *
                             constant_poly::<M>(self.params(), q_over_qi)),
                     )
-                    .keys[slot_idx]
                     .matrix
                     .clone();
                 let columns = (0..log_base_q)
@@ -269,24 +545,22 @@ where
                 // subtract the resulting one-term from the online accumulation. Since BGG
                 // encodings have the form `sA - plaintext * target + error`, the final
                 // `online_terms - decoder` leaves `+(q/q_i) * A'`.
-                let one_term = one
+                let one_term = one.encodings[slot_idx]
                     .matrix_mul(
                         self.params(),
                         &(a_prime.clone() * constant_poly::<M>(self.params(), q_over_qi.clone())),
                     )
-                    .encodings[slot_idx]
                     .vector
                     .clone();
                 // The positive gadget target leaves the desired `-(q/q_i) * xG` after decoder
                 // subtraction.  Together with the `+A'` term and the decoded `+new_error`, the
                 // rounded CRT recomposition recovers `A' - xG + new_error`.
-                let input_term = refreshed_input
+                let input_term = refreshed_input.encodings[slot_idx]
                     .matrix_mul(
                         self.params(),
                         &(M::gadget_matrix(self.params(), 1) *
                             constant_poly::<M>(self.params(), q_over_qi)),
                     )
-                    .encodings[slot_idx]
                     .vector
                     .clone();
                 let columns = (0..log_base_q)
@@ -344,7 +618,8 @@ where
         let mut template_circuit = ring_gsw.fresh_circuit();
         RingGswCiphertext::input(ring_gsw.clone(), None, &mut template_circuit)
     };
-    let ciphertext_wire_count = ciphertext_template.sub_circuit_wires().len();
+    let ciphertext_wire_count =
+        ciphertext_template.sub_circuit_wires().iter().map(|wire| wire.len()).sum::<usize>();
     let decrypt_sub_id = circuit.register_sub_circuit(
         build_refreshed_wire_digit_all_crt_decrypt::<P, A, M>(ring_gsw.clone(), v_bits),
     );
@@ -364,7 +639,8 @@ where
                 cbd_n,
                 slot_idx,
             ));
-        let prg_outputs = circuit.call_sub_circuit(prg_sub_id, seed_wires.clone());
+        let prg_outputs =
+            expand_batched_wires(&circuit.call_sub_circuit(prg_sub_id, seed_wires.clone()));
         let logical_outputs = prg_outputs
             .chunks_exact(ciphertext_wire_count)
             .map(|chunk| RingGswCiphertext::from_sub_circuit_outputs(&ciphertext_template, chunk))
@@ -533,6 +809,246 @@ mod tests {
                     "recomposed value mismatch at row {row}, column {col}"
                 );
             }
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    mod gpu_bench_tests {
+        use super::*;
+        use crate::{
+            bench_estimator::{
+                BggEncodingBenchEstimator, BggPublicKeyBenchEstimator, BggPublicKeyBenchSamples,
+                naive_vec::NaiveBGGVecBenchEstimator,
+            },
+            bgg::public_key::BggPublicKey,
+            circuit::{PolyCircuit, gate::GateId},
+            element::PolyElem,
+            gadgets::{
+                arith::nested_rns::{NestedRnsPoly, NestedRnsPolyContext},
+                fhe::ring_gsw::RingGswContext,
+            },
+            lookup::{PublicLut, lwe::LWEBGGPubKeyPltEvaluator},
+            matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix,
+            poly::{
+                Poly,
+                dcrt::{
+                    gpu::{GpuDCRTPoly, GpuDCRTPolyParams},
+                    params::DCRTPolyParams,
+                },
+            },
+            sampler::{
+                PolyTrapdoorSampler,
+                gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
+                trapdoor::GpuDCRTPolyTrapdoorSampler,
+            },
+            slot_transfer::bgg_pubkey::BggPublicKeySTEvaluator,
+        };
+        use keccak_asm::Keccak256;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        fn gpu_test_params() -> GpuDCRTPolyParams {
+            let cpu_params = DCRTPolyParams::new(2, 1, 12, 6);
+            let (q_moduli, _crt_bits, _crt_depth) = cpu_params.to_crt();
+            GpuDCRTPolyParams::new(cpu_params.ring_dimension(), q_moduli, cpu_params.base_bits())
+        }
+
+        fn gpu_noise_refresher() -> NoiseRefresherNaiveVec<
+            GpuDCRTPolyMatrix,
+            NestedRnsPoly<GpuDCRTPoly>,
+            GpuDCRTPolyHashSampler<Keccak256>,
+        > {
+            let params = gpu_test_params();
+            let mut circuit = PolyCircuit::<GpuDCRTPoly>::new();
+            let active_levels = 1;
+            let nested_rns = Arc::new(NestedRnsPolyContext::setup(
+                &mut circuit,
+                &params,
+                6,
+                1,
+                1 << 8,
+                false,
+                Some(active_levels),
+            ));
+            let ring_gsw = Arc::new(RingGswContext::from_arith_context(
+                &mut circuit,
+                &params,
+                params.ring_dimension() as usize,
+                nested_rns,
+                Some(active_levels),
+                None,
+            ));
+            NoiseRefresherNaiveVec::new(ring_gsw, 5, 1, [0x42; 32], 1, [0x24; 32])
+        }
+
+        fn public_key_vec_bench_estimator(
+            params: &GpuDCRTPolyParams,
+            num_slots: usize,
+        ) -> NaiveBGGVecBenchEstimator<
+            BggPublicKeyBenchEstimator<
+                GpuDCRTPolyMatrix,
+                LWEBGGPubKeyPltEvaluator<
+                    GpuDCRTPolyMatrix,
+                    GpuDCRTPolyHashSampler<Keccak256>,
+                    GpuDCRTPolyTrapdoorSampler,
+                >,
+                BggPublicKeySTEvaluator<
+                    GpuDCRTPolyMatrix,
+                    GpuDCRTPolyUniformSampler,
+                    GpuDCRTPolyHashSampler<Keccak256>,
+                    GpuDCRTPolyTrapdoorSampler,
+                >,
+            >,
+        > {
+            let key_matrix = GpuDCRTPolyMatrix::gadget_matrix(params, 1);
+            let key_a = BggPublicKey::new(key_matrix.clone(), true);
+            let key_b = BggPublicKey::new(key_matrix, true);
+            let small_scalar = [3u32];
+            let large_scalar = [BigUint::from(5u32)];
+            let public_lut = PublicLut::new(
+                params,
+                2,
+                |params: &GpuDCRTPolyParams, input| {
+                    Some((input, <GpuDCRTPoly as Poly>::Elem::constant(&params.modulus(), input)))
+                },
+                Some((1, <GpuDCRTPoly as Poly>::Elem::constant(&params.modulus(), 1))),
+            );
+            let slot_transfer_src_slots = [(0u32, None)];
+            let samples = BggPublicKeyBenchSamples {
+                params,
+                add_lhs: &key_a,
+                add_rhs: &key_b,
+                sub_lhs: &key_a,
+                sub_rhs: &key_b,
+                mul_lhs: &key_a,
+                mul_rhs: &key_b,
+                small_scalar_input: &key_a,
+                small_scalar: &small_scalar,
+                large_scalar_input: &key_a,
+                large_scalar: &large_scalar,
+                public_lut_one: &key_a,
+                public_lut_input: &key_b,
+                public_lut: &public_lut,
+                public_lut_gate_id: GateId(17),
+                public_lut_id: 7,
+                slot_transfer_input: &key_a,
+                slot_transfer_src_slots: &slot_transfer_src_slots,
+                slot_transfer_gate_id: GateId(19),
+            };
+            let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(params, 4.578);
+            let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(params, 1);
+            let eval_dir = tempdir().expect("temporary benchmark evaluator directory");
+            let plt_eval = LWEBGGPubKeyPltEvaluator::<
+                GpuDCRTPolyMatrix,
+                GpuDCRTPolyHashSampler<Keccak256>,
+                GpuDCRTPolyTrapdoorSampler,
+            >::new(
+                [0x31; 32],
+                trapdoor_sampler,
+                Arc::new(pub_matrix),
+                Arc::new(trapdoor),
+                eval_dir.path().to_path_buf(),
+            );
+            let estimator_trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(params, 4.578);
+            let (estimator_trapdoor, estimator_pub_matrix) =
+                estimator_trapdoor_sampler.trapdoor(params, 1);
+            let plt_estimator = LWEBGGPubKeyPltEvaluator::<
+                GpuDCRTPolyMatrix,
+                GpuDCRTPolyHashSampler<Keccak256>,
+                GpuDCRTPolyTrapdoorSampler,
+            >::new(
+                [0x31; 32],
+                estimator_trapdoor_sampler,
+                Arc::new(estimator_pub_matrix),
+                Arc::new(estimator_trapdoor),
+                eval_dir.path().to_path_buf(),
+            );
+            let st_eval = BggPublicKeySTEvaluator::<
+                GpuDCRTPolyMatrix,
+                GpuDCRTPolyUniformSampler,
+                GpuDCRTPolyHashSampler<Keccak256>,
+                GpuDCRTPolyTrapdoorSampler,
+            >::new(
+                [0x32; 32], 1, num_slots, 4.578, 0.0, eval_dir.path().to_path_buf()
+            );
+            let st_estimator =
+                BggPublicKeySTEvaluator::<
+                    GpuDCRTPolyMatrix,
+                    GpuDCRTPolyUniformSampler,
+                    GpuDCRTPolyHashSampler<Keccak256>,
+                    GpuDCRTPolyTrapdoorSampler,
+                >::new(
+                    [0x32; 32], 1, num_slots, 4.578, 0.0, eval_dir.path().to_path_buf()
+                );
+            let scalar_estimator = BggPublicKeyBenchEstimator::benchmark(
+                &samples,
+                &plt_eval,
+                &st_eval,
+                plt_estimator,
+                st_estimator,
+                1,
+            );
+            NaiveBGGVecBenchEstimator::new(scalar_estimator, num_slots)
+        }
+
+        fn encoding_vec_bench_estimator(
+            params: &GpuDCRTPolyParams,
+            num_slots: usize,
+        ) -> NaiveBGGVecBenchEstimator<BggEncodingBenchEstimator<GpuDCRTPolyMatrix>> {
+            let scalar_estimator = BggEncodingBenchEstimator::benchmark(params, 1);
+            NaiveBGGVecBenchEstimator::new(scalar_estimator, num_slots)
+        }
+
+        #[test]
+        fn noise_refresh_naive_vec_bench_preprcess() {
+            let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+            let refresher = gpu_noise_refresher();
+            let num_slots = refresher.params().ring_dimension() as usize;
+            let material_estimator = public_key_vec_bench_estimator(refresher.params(), num_slots);
+
+            let summary = refresher.estimate_preprocess_bench(&material_estimator);
+            tracing::info!(
+                ?summary,
+                total_time = summary.total_time,
+                latency = summary.latency,
+                max_parallelism = summary.max_parallelism,
+                "naive-vector noise-refresh preprocess benchmark summary"
+            );
+
+            assert!(summary.total_time.is_finite());
+            assert!(summary.total_time > 0.0);
+            assert!(summary.latency.is_finite());
+            assert!(summary.latency > 0.0);
+            assert!(summary.max_parallelism > 0);
+        }
+
+        #[test]
+        fn noise_refresh_naive_vec_bench_online_eval() {
+            let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+            let refresher = gpu_noise_refresher();
+            let num_slots = refresher.params().ring_dimension() as usize;
+            let material_estimator = encoding_vec_bench_estimator(refresher.params(), num_slots);
+
+            let summary = refresher.estimate_online_eval_bench(&material_estimator);
+            tracing::info!(
+                ?summary,
+                total_time = summary.total_time,
+                latency = summary.latency,
+                max_parallelism = summary.max_parallelism,
+                "naive-vector noise-refresh online benchmark summary"
+            );
+
+            assert!(summary.total_time.is_finite());
+            assert!(summary.total_time > 0.0);
+            assert!(summary.latency.is_finite());
+            assert!(summary.latency > 0.0);
+            assert!(summary.max_parallelism > 0);
+
+            let crt_unit =
+                measured_crt_recompose_unit_summary::<GpuDCRTPolyMatrix>(refresher.params());
+            assert!(crt_unit.total_time.is_finite());
+            assert!(crt_unit.latency.is_finite());
+            assert!(crt_unit.max_parallelism > 0);
         }
     }
 }

@@ -1,9 +1,11 @@
+pub mod bgg_encoding;
 pub mod bgg_poly_encoding;
 pub mod bgg_pubkey;
 #[cfg(feature = "gpu")]
 mod gpu;
 pub mod naive_vec;
 
+pub use bgg_encoding::*;
 pub use bgg_poly_encoding::*;
 pub use bgg_pubkey::*;
 #[cfg(feature = "gpu")]

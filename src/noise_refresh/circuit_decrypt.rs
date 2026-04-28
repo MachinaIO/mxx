@@ -136,7 +136,7 @@ where
     assert!(!plaintext_modulus.is_zero(), "CRT plaintext modulus must be positive");
 
     let mut circuit = ring_gsw.fresh_circuit();
-    let decryption_key = GateId(0);
+    let decryption_key = circuit.input(1).at(0).as_single_wire();
     let ring_dim = ring_gsw.params.ring_dimension() as usize;
     let log_base_q = ring_gsw.params.modulus_digits();
     let mask_q_chunk_len = ring_dim.checked_mul(v_bits).expect("mask q chunk length overflow");
@@ -194,7 +194,7 @@ where
     let (q_moduli, _crt_bits, q_moduli_depth) = ring_gsw.params.to_crt();
 
     let mut circuit = ring_gsw.fresh_circuit();
-    let decryption_key = GateId(0);
+    let decryption_key = circuit.input(1).at(0).as_single_wire();
     let ring_dim = ring_gsw.params.ring_dimension() as usize;
     let mask_q_chunk_len = ring_dim.checked_mul(v_bits).expect("mask q chunk length overflow");
     let full_modulus = ring_gsw.params.modulus();

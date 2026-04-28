@@ -1,9 +1,9 @@
 //! Goldreich PRG material generation for the noise-refresh protocol.
 //!
 //! This module owns only the first phase of the step function: expanding encrypted seed bits into
-//! encrypted PRG material.  It does not decrypt or combine that material.  The formatting phase in
-//! `circuit_format` can consume the material produced here, but it can also consume benchmark or
-//! fixture material with the same layout.
+//! encrypted PRG material.  It does not decrypt or combine that material.  The decrypt phase in
+//! `circuit_decrypt` can consume the material produced here, and `circuit_merge` can also consume
+//! benchmark or fixture material that has already been decoded into the same slotwise layout.
 //!
 //! The generated logical output order is always CBD `errors`, then `masks`.  Each logical
 //! ciphertext is flattened only at the `PolyCircuit` boundary via

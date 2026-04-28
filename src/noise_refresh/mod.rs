@@ -2,6 +2,7 @@ pub mod circuit_decrypt;
 pub mod circuit_merge;
 pub mod circuit_prg;
 pub mod naive_vec;
+pub mod simulation;
 
 use crate::{
     circuit::evaluable::Evaluable, lookup::PltEvaluator, matrix::PolyMatrix,
@@ -9,6 +10,7 @@ use crate::{
 };
 
 pub use naive_vec::NoiseRefresherNaiveVec;
+pub use simulation::{NoiseRefreshErrorSimulation, simulate_noise_refresh_error_growth};
 
 /// Refreshes the noise of one slotwise encoding wire.
 ///
@@ -43,6 +45,9 @@ where
 
     /// Computes the online refreshed encoding vector directly as a matrix.
     ///
+    /// `decoders` is ordered by `slot_idx * crt_depth + crt_idx`. Each decoder is subtracted from
+    /// the matching CRT-level online term before rounding and CRT recomposition.
+    ///
     /// The output matrix has one row per logical slot/reference wire and `m_g` columns. Each row is
     /// reconstructed from the per-CRT `q/q_i`-scaled terms by coefficient-wise rounding followed by
     /// CRT recomposition.
@@ -53,6 +58,7 @@ where
         refreshed_input: &E,
         enc_seeds: &[E],
         decryption_key: &E,
+        decoders: &[M],
         plt_evaluator: &PE,
         slot_transfer_evaluator: &ST,
     ) -> M

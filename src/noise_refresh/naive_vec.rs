@@ -20,7 +20,6 @@ use crate::{
     slot_transfer::SlotTransferEvaluator,
 };
 use num_bigint::BigUint;
-use num_traits::Zero;
 use rayon::prelude::*;
 use std::{marker::PhantomData, sync::Arc};
 
@@ -76,55 +75,6 @@ where
     fn params(&self) -> &<M::P as Poly>::Params {
         &self.ring_gsw.params
     }
-
-    fn num_slots_from_public_key(input: &NaiveBGGPublicKeyVec<M>) -> usize {
-        input.num_slots()
-    }
-
-    fn num_slots_from_encoding(input: &NaiveBGGEncodingVec<M>) -> usize {
-        input.num_slots()
-    }
-
-    fn build_eval_circuit(&self, num_slots: usize) -> PolyCircuit<M::P> {
-        build_noise_refresh_material_circuit::<M::P, A, M>(
-            self.ring_gsw.clone(),
-            self.seed_bits,
-            self.v_bits,
-            self.graph_seed,
-            self.cbd_n,
-            num_slots,
-        )
-    }
-
-    fn sample_a_prime(&self, refresh_id: &[u8]) -> M
-    where
-        HS: PolyHashSampler<[u8; 32], M = M>,
-    {
-        HS::new().sample_hash(
-            self.params(),
-            self.hash_key,
-            refresh_id,
-            1,
-            self.params().modulus_digits(),
-            DistType::FinRingDist,
-        )
-    }
-
-    fn scaled_gadget_target(&self, crt_idx: usize) -> M {
-        let (q_over_qi, _reconst_coeff) = self.params().to_crt_coeffs(crt_idx);
-        M::gadget_matrix(self.params(), 1) * constant_poly::<M>(self.params(), q_over_qi)
-    }
-
-    fn neg_scaled_a_prime(&self, a_prime: &M, crt_idx: usize) -> M {
-        let (q_over_qi, _reconst_coeff) = self.params().to_crt_coeffs(crt_idx);
-        let modulus: Arc<BigUint> = self.params().modulus().into();
-        let scalar = if (&q_over_qi % modulus.as_ref()).is_zero() {
-            BigUint::zero()
-        } else {
-            modulus.as_ref() - (&q_over_qi % modulus.as_ref())
-        };
-        a_prime.clone() * constant_poly::<M>(self.params(), scalar)
-    }
 }
 
 impl<M, A, HS> NoiseRefresher<NaiveBGGPublicKeyVec<M>, NaiveBGGEncodingVec<M>, M>
@@ -150,7 +100,7 @@ where
         ST: SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>,
     {
         assert_eq!(enc_seeds.len(), self.seed_bits, "encrypted seed count mismatch");
-        let num_slots = Self::num_slots_from_public_key(refreshed_input);
+        let num_slots = refreshed_input.num_slots();
         assert_eq!(
             num_slots,
             self.params().ring_dimension() as usize,
@@ -162,7 +112,14 @@ where
             one.assert_compatible(seed);
         }
 
-        let circuit = self.build_eval_circuit(num_slots);
+        let circuit = build_noise_refresh_material_circuit::<M::P, A, M>(
+            self.ring_gsw.clone(),
+            self.seed_bits,
+            self.v_bits,
+            self.graph_seed,
+            self.cbd_n,
+            num_slots,
+        );
         let mut inputs = enc_seeds.to_vec();
         inputs.push(decryption_key.clone());
         let decoded = circuit.eval(
@@ -173,16 +130,65 @@ where
             Some(slot_transfer_evaluator as &dyn SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>),
             None,
         );
-        let decoded = apply_unit_column_to_public_keys(self.params(), decoded);
-        let a_prime = self.sample_a_prime(refresh_id);
-        let refresh_matrices = combine_public_refresh_matrices(
-            self,
-            &a_prime,
-            one,
-            refreshed_input,
-            &decoded,
-            num_slots,
+        let unit_column_target = M::identity(self.params(), 1, None);
+        let decoded = decoded
+            .into_par_iter()
+            .map(|value| value.matrix_mul(self.params(), &unit_column_target))
+            .collect::<Vec<_>>();
+        let a_prime = HS::new().sample_hash(
+            self.params(),
+            self.hash_key,
+            refresh_id,
+            1,
+            self.params().modulus_digits(),
+            DistType::FinRingDist,
         );
+        let (_q_moduli, _crt_bits, crt_depth) = self.params().to_crt();
+        let log_base_q = self.params().modulus_digits();
+        assert_eq!(decoded.len(), num_slots * crt_depth * log_base_q);
+        let refresh_matrices = (0..num_slots * crt_depth)
+            .into_par_iter()
+            .map(|flat_idx| {
+                let slot_idx = flat_idx / crt_depth;
+                let crt_idx = flat_idx % crt_depth;
+                let (q_over_qi, _reconst_coeff) = self.params().to_crt_coeffs(crt_idx);
+                // The one-term is evaluated with the natural `+(q/q_i) * A'` target, then
+                // subtracted from the accumulated refresh matrix below. In the online path this
+                // subtraction makes `online_terms - decoder` leave a positive `+(q/q_i) * A'`.
+                let one_term = one
+                    .matrix_mul(
+                        self.params(),
+                        &(a_prime.clone() * constant_poly::<M>(self.params(), q_over_qi.clone())),
+                    )
+                    .keys[slot_idx]
+                    .matrix
+                    .clone();
+                // The refreshed input target is positive `+(q/q_i) * G`, so online subtraction of
+                // the decoder cancels the public `sA_x` part and leaves `-xG`.
+                let input_term = refreshed_input
+                    .matrix_mul(
+                        self.params(),
+                        &(M::gadget_matrix(self.params(), 1) *
+                            constant_poly::<M>(self.params(), q_over_qi)),
+                    )
+                    .keys[slot_idx]
+                    .matrix
+                    .clone();
+                let columns = (0..log_base_q)
+                    .map(|digit_idx| {
+                        let idx =
+                            slot_idx * crt_depth * log_base_q + crt_idx * log_base_q + digit_idx;
+                        collapse_slot_matrices(
+                            self.params(),
+                            decoded[idx].num_slots(),
+                            |slot_idx| decoded[idx].keys[slot_idx].matrix.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let refresh_term = concat_owned_columns(columns);
+                input_term + &refresh_term - &one_term
+            })
+            .collect();
         (a_prime, refresh_matrices)
     }
 
@@ -193,6 +199,7 @@ where
         refreshed_input: &NaiveBGGEncodingVec<M>,
         enc_seeds: &[NaiveBGGEncodingVec<M>],
         decryption_key: &NaiveBGGEncodingVec<M>,
+        decoders: &[M],
         plt_evaluator: &PE,
         slot_transfer_evaluator: &ST,
     ) -> M
@@ -201,7 +208,7 @@ where
         ST: SlotTransferEvaluator<NaiveBGGEncodingVec<M>>,
     {
         assert_eq!(enc_seeds.len(), self.seed_bits, "encrypted seed count mismatch");
-        let num_slots = Self::num_slots_from_encoding(refreshed_input);
+        let num_slots = refreshed_input.num_slots();
         assert_eq!(
             num_slots,
             self.params().ring_dimension() as usize,
@@ -213,7 +220,14 @@ where
             one.assert_compatible(seed);
         }
 
-        let circuit = self.build_eval_circuit(num_slots);
+        let circuit = build_noise_refresh_material_circuit::<M::P, A, M>(
+            self.ring_gsw.clone(),
+            self.seed_bits,
+            self.v_bits,
+            self.graph_seed,
+            self.cbd_n,
+            num_slots,
+        );
         let mut inputs = enc_seeds.to_vec();
         inputs.push(decryption_key.clone());
         let decoded = circuit.eval(
@@ -224,16 +238,72 @@ where
             Some(slot_transfer_evaluator as &dyn SlotTransferEvaluator<NaiveBGGEncodingVec<M>>),
             None,
         );
-        let decoded = apply_unit_column_to_encodings(self.params(), decoded);
-        let a_prime = self.sample_a_prime(refresh_id);
-        let crt_level_vectors = combine_encoding_refresh_vectors(
-            self,
-            &a_prime,
-            one,
-            refreshed_input,
-            &decoded,
-            num_slots,
+        let unit_column_target = M::identity(self.params(), 1, None);
+        let decoded = decoded
+            .into_par_iter()
+            .map(|value| value.matrix_mul(self.params(), &unit_column_target))
+            .collect::<Vec<_>>();
+        let a_prime = HS::new().sample_hash(
+            self.params(),
+            self.hash_key,
+            refresh_id,
+            1,
+            self.params().modulus_digits(),
+            DistType::FinRingDist,
         );
+        let (_q_moduli, _crt_bits, crt_depth) = self.params().to_crt();
+        let log_base_q = self.params().modulus_digits();
+        assert_eq!(decoded.len(), num_slots * crt_depth * log_base_q);
+        assert_eq!(
+            decoders.len(),
+            num_slots * crt_depth,
+            "decoder count must equal num_slots * crt_depth"
+        );
+        let crt_level_vectors = (0..num_slots * crt_depth)
+            .into_par_iter()
+            .map(|flat_idx| {
+                let slot_idx = flat_idx / crt_depth;
+                let crt_idx = flat_idx % crt_depth;
+                let (q_over_qi, _reconst_coeff) = self.params().to_crt_coeffs(crt_idx);
+                // This mirrors preprocessing: evaluate the natural `+(q/q_i) * A'` target and
+                // subtract the resulting one-term from the online accumulation. Since BGG
+                // encodings have the form `sA - plaintext * target + error`, the final
+                // `online_terms - decoder` leaves `+(q/q_i) * A'`.
+                let one_term = one
+                    .matrix_mul(
+                        self.params(),
+                        &(a_prime.clone() * constant_poly::<M>(self.params(), q_over_qi.clone())),
+                    )
+                    .encodings[slot_idx]
+                    .vector
+                    .clone();
+                // The positive gadget target leaves the desired `-(q/q_i) * xG` after decoder
+                // subtraction.  Together with the `+A'` term and the decoded `+new_error`, the
+                // rounded CRT recomposition recovers `A' - xG + new_error`.
+                let input_term = refreshed_input
+                    .matrix_mul(
+                        self.params(),
+                        &(M::gadget_matrix(self.params(), 1) *
+                            constant_poly::<M>(self.params(), q_over_qi)),
+                    )
+                    .encodings[slot_idx]
+                    .vector
+                    .clone();
+                let columns = (0..log_base_q)
+                    .map(|digit_idx| {
+                        let idx =
+                            slot_idx * crt_depth * log_base_q + crt_idx * log_base_q + digit_idx;
+                        collapse_slot_matrices(
+                            self.params(),
+                            decoded[idx].num_slots(),
+                            |slot_idx| decoded[idx].encodings[slot_idx].vector.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let refresh_term = concat_owned_columns(columns);
+                input_term + &refresh_term - &one_term - &decoders[flat_idx]
+            })
+            .collect::<Vec<_>>();
         crt_recompose_rows(self.params(), &crt_level_vectors, num_slots)
     }
 }
@@ -243,7 +313,7 @@ where
 /// Input order is all encrypted seed ciphertexts followed by one decryption-key wire. Output order
 /// is `slot_idx * crt_depth * log_base_q + crt_idx * log_base_q + digit_idx`; every output is a
 /// decoded `error + mask` polynomial wire for one reference slot, CRT level, and gadget digit.
-fn build_noise_refresh_material_circuit<P, A, M>(
+pub(crate) fn build_noise_refresh_material_circuit<P, A, M>(
     ring_gsw: Arc<RingGswContext<P, A>>,
     seed_bits: usize,
     v_bits: usize,
@@ -339,173 +409,19 @@ where
     circuit
 }
 
-fn apply_unit_column_to_public_keys<M>(
+fn collapse_slot_matrices<M, F>(
     params: &<M::P as Poly>::Params,
-    decoded: Vec<NaiveBGGPublicKeyVec<M>>,
-) -> Vec<NaiveBGGPublicKeyVec<M>>
-where
-    M: PolyMatrix,
-{
-    let target = M::identity(params, 1, None);
-    decoded.into_par_iter().map(|value| value.matrix_mul(params, &target)).collect()
-}
-
-fn apply_unit_column_to_encodings<M>(
-    params: &<M::P as Poly>::Params,
-    decoded: Vec<NaiveBGGEncodingVec<M>>,
-) -> Vec<NaiveBGGEncodingVec<M>>
-where
-    M: PolyMatrix,
-{
-    let target = M::identity(params, 1, None);
-    decoded.into_par_iter().map(|value| value.matrix_mul(params, &target)).collect()
-}
-
-fn combine_public_refresh_matrices<M, A, HS>(
-    refresher: &NoiseRefresherNaiveVec<M, A, HS>,
-    a_prime: &M,
-    one: &NaiveBGGPublicKeyVec<M>,
-    refreshed_input: &NaiveBGGPublicKeyVec<M>,
-    decoded: &[NaiveBGGPublicKeyVec<M>],
     num_slots: usize,
-) -> Vec<M>
-where
-    M: PolyMatrix,
-    M::P: 'static,
-    A: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
-    HS: Send + Sync,
-{
-    let (_q_moduli, _crt_bits, crt_depth) = refresher.params().to_crt();
-    let log_base_q = refresher.params().modulus_digits();
-    assert_eq!(decoded.len(), num_slots * crt_depth * log_base_q);
-
-    (0..num_slots * crt_depth)
-        .into_par_iter()
-        .map(|flat_idx| {
-            let slot_idx = flat_idx / crt_depth;
-            let crt_idx = flat_idx % crt_depth;
-            let one_term = one
-                .matrix_mul(refresher.params(), &refresher.neg_scaled_a_prime(a_prime, crt_idx))
-                .keys[slot_idx]
-                .matrix
-                .clone();
-            let input_term = refreshed_input
-                .matrix_mul(refresher.params(), &refresher.scaled_gadget_target(crt_idx))
-                .keys[slot_idx]
-                .matrix
-                .clone();
-            let refresh_term =
-                decoded_digit_columns(refresher.params(), decoded, slot_idx, crt_idx);
-            one_term + &input_term + &refresh_term
-        })
-        .collect()
-}
-
-fn combine_encoding_refresh_vectors<M, A, HS>(
-    refresher: &NoiseRefresherNaiveVec<M, A, HS>,
-    a_prime: &M,
-    one: &NaiveBGGEncodingVec<M>,
-    refreshed_input: &NaiveBGGEncodingVec<M>,
-    decoded: &[NaiveBGGEncodingVec<M>],
-    num_slots: usize,
-) -> Vec<M>
-where
-    M: PolyMatrix,
-    M::P: 'static,
-    A: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
-    HS: Send + Sync,
-{
-    let (_q_moduli, _crt_bits, crt_depth) = refresher.params().to_crt();
-    let log_base_q = refresher.params().modulus_digits();
-    assert_eq!(decoded.len(), num_slots * crt_depth * log_base_q);
-
-    (0..num_slots * crt_depth)
-        .into_par_iter()
-        .map(|flat_idx| {
-            let slot_idx = flat_idx / crt_depth;
-            let crt_idx = flat_idx % crt_depth;
-            let one_term = one
-                .matrix_mul(refresher.params(), &refresher.neg_scaled_a_prime(a_prime, crt_idx))
-                .encodings[slot_idx]
-                .vector
-                .clone();
-            let input_term = refreshed_input
-                .matrix_mul(refresher.params(), &refresher.scaled_gadget_target(crt_idx))
-                .encodings[slot_idx]
-                .vector
-                .clone();
-            let refresh_term =
-                decoded_encoding_digit_columns(refresher.params(), decoded, slot_idx, crt_idx);
-            one_term + &input_term + &refresh_term
-        })
-        .collect()
-}
-
-fn decoded_digit_columns<M>(
-    params: &<M::P as Poly>::Params,
-    decoded: &[NaiveBGGPublicKeyVec<M>],
-    slot_idx: usize,
-    crt_idx: usize,
+    matrix_at_slot: F,
 ) -> M
 where
     M: PolyMatrix,
-{
-    let (_q_moduli, _crt_bits, crt_depth) = params.to_crt();
-    let log_base_q = params.modulus_digits();
-    let columns = (0..log_base_q)
-        .map(|digit_idx| {
-            let idx = slot_idx * crt_depth * log_base_q + crt_idx * log_base_q + digit_idx;
-            collapse_public_key_slots(params, &decoded[idx])
-        })
-        .collect::<Vec<_>>();
-    concat_owned_columns(columns)
-}
-
-fn decoded_encoding_digit_columns<M>(
-    params: &<M::P as Poly>::Params,
-    decoded: &[NaiveBGGEncodingVec<M>],
-    slot_idx: usize,
-    crt_idx: usize,
-) -> M
-where
-    M: PolyMatrix,
-{
-    let (_q_moduli, _crt_bits, crt_depth) = params.to_crt();
-    let log_base_q = params.modulus_digits();
-    let columns = (0..log_base_q)
-        .map(|digit_idx| {
-            let idx = slot_idx * crt_depth * log_base_q + crt_idx * log_base_q + digit_idx;
-            collapse_encoding_slots(params, &decoded[idx])
-        })
-        .collect::<Vec<_>>();
-    concat_owned_columns(columns)
-}
-
-fn collapse_public_key_slots<M>(
-    params: &<M::P as Poly>::Params,
-    input: &NaiveBGGPublicKeyVec<M>,
-) -> M
-where
-    M: PolyMatrix,
+    F: Fn(usize) -> M,
 {
     let ring_dim = params.ring_dimension() as usize;
-    assert_eq!(input.num_slots(), ring_dim);
+    assert_eq!(num_slots, ring_dim);
     (0..ring_dim)
-        .map(|slot_idx| input.keys[slot_idx].matrix.clone() * monomial_poly::<M>(params, slot_idx))
-        .reduce(|acc, term| acc + &term)
-        .expect("ring_dim must be positive")
-}
-
-fn collapse_encoding_slots<M>(params: &<M::P as Poly>::Params, input: &NaiveBGGEncodingVec<M>) -> M
-where
-    M: PolyMatrix,
-{
-    let ring_dim = params.ring_dimension() as usize;
-    assert_eq!(input.num_slots(), ring_dim);
-    (0..ring_dim)
-        .map(|slot_idx| {
-            input.encodings[slot_idx].vector.clone() * monomial_poly::<M>(params, slot_idx)
-        })
+        .map(|slot_idx| matrix_at_slot(slot_idx) * M::P::const_rotate_poly(params, slot_idx))
         .reduce(|acc, term| acc + &term)
         .expect("ring_dim must be positive")
 }
@@ -516,13 +432,32 @@ where
 {
     let (q_moduli, _crt_bits, crt_depth) = params.to_crt();
     assert_eq!(crt_values.len(), num_slots * crt_depth);
+    let q: Arc<BigUint> = params.modulus().into();
+    let half_q = q.as_ref() / BigUint::from(2u64);
     let reconst_coeffs = params.reconst_coeffs();
     let rows = (0..num_slots)
         .map(|slot_idx| {
             let mut row = M::zero(params, 1, params.modulus_digits());
             for crt_idx in 0..crt_depth {
                 let level = &crt_values[slot_idx * crt_depth + crt_idx];
-                let rounded = round_scaled_matrix_to_crt(params, level, q_moduli[crt_idx]);
+                let (level_rows, level_cols) = level.size();
+                let q_i_big = BigUint::from(q_moduli[crt_idx]);
+                let mut rounded = M::zero(params, level_rows, level_cols);
+                for level_row in 0..level_rows {
+                    for level_col in 0..level_cols {
+                        let rounded_coeffs = level
+                            .entry(level_row, level_col)
+                            .coeffs_biguints()
+                            .into_iter()
+                            .map(|coeff| ((&q_i_big * coeff + &half_q) / q.as_ref()) % &q_i_big)
+                            .collect::<Vec<_>>();
+                        rounded.set_entry(
+                            level_row,
+                            level_col,
+                            M::P::from_biguints(params, &rounded_coeffs),
+                        );
+                    }
+                }
                 row.add_in_place(
                     &(rounded * constant_poly::<M>(params, reconst_coeffs[crt_idx].clone())),
                 );
@@ -530,29 +465,9 @@ where
             row
         })
         .collect::<Vec<_>>();
-    concat_owned_rows(rows)
-}
-
-fn round_scaled_matrix_to_crt<M>(params: &<M::P as Poly>::Params, matrix: &M, q_i: u64) -> M
-where
-    M: PolyMatrix,
-{
-    let (rows, cols) = matrix.size();
-    let q: Arc<BigUint> = params.modulus().into();
-    let half_q = q.as_ref() / BigUint::from(2u64);
-    let q_i_big = BigUint::from(q_i);
-    let mut out = M::zero(params, rows, cols);
-    for row in 0..rows {
-        for col in 0..cols {
-            let coeffs = matrix.entry(row, col).coeffs_biguints();
-            let rounded = coeffs
-                .into_iter()
-                .map(|coeff| ((&q_i_big * coeff + &half_q) / q.as_ref()) % &q_i_big)
-                .collect::<Vec<_>>();
-            out.set_entry(row, col, M::P::from_biguints(params, &rounded));
-        }
-    }
-    out
+    let mut rows = rows;
+    let first = rows.remove(0);
+    first.concat_rows_owned(rows)
 }
 
 fn concat_owned_columns<M: PolyMatrix>(mut matrices: Vec<M>) -> M {
@@ -560,23 +475,11 @@ fn concat_owned_columns<M: PolyMatrix>(mut matrices: Vec<M>) -> M {
     first.concat_columns_owned(matrices)
 }
 
-fn concat_owned_rows<M: PolyMatrix>(mut matrices: Vec<M>) -> M {
-    let first = matrices.remove(0);
-    first.concat_rows_owned(matrices)
-}
-
 fn constant_poly<M>(params: &<M::P as Poly>::Params, value: BigUint) -> M::P
 where
     M: PolyMatrix,
 {
     M::P::from_biguint_to_constant(params, value)
-}
-
-fn monomial_poly<M>(params: &<M::P as Poly>::Params, exponent: usize) -> M::P
-where
-    M: PolyMatrix,
-{
-    M::P::const_rotate_poly(params, exponent)
 }
 
 #[cfg(test)]

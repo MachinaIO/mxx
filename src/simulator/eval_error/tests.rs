@@ -158,7 +158,7 @@ fn test_wire_norm_simulator_mul_binary_tree_plaintext_one_matches_generic_eval()
     let tree_height = 10usize;
     let input_size = 1usize << tree_height;
     let input_plaintext_norm = BigDecimal::one();
-    let ring_dim_sqrt = BigDecimal::from(1u64 << 8);
+    let ring_dim_sqrt = BigDecimal::from(1u64 << 16);
     let base = BigDecimal::from(14u64);
     let secret_size = 1usize;
     let log_base_q = 2usize * 30;

@@ -2064,7 +2064,6 @@ mod tests {
         );
         let secret_key = sample_secret_key(&params);
         let public_key_hash_key = sample_hash_key();
-        let randomizer_hash_key = sample_hash_key();
         let public_key = sample_public_key(
             &params,
             ctx.width(),
@@ -2073,14 +2072,7 @@ mod tests {
             b"ring_gsw_public_key_full_coeff_encoding",
             None,
         );
-        let ciphertext = encrypt_plaintext_bit(
-            &params,
-            ctx.nested_rns.as_ref(),
-            &public_key,
-            1,
-            randomizer_hash_key,
-            b"ring_gsw_ciphertext_inputs_full_coeff_encoding",
-        );
+        let ciphertext = encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, true);
 
         let inputs = ciphertext_inputs_from_native::<DCRTPoly>(
             &params,
@@ -2175,7 +2167,6 @@ mod tests {
         circuit.output(vec![decrypted_input]);
         let secret_key = sample_secret_key(&params);
         let public_key_hash_key = sample_hash_key();
-        let randomizer_hash_key = sample_hash_key();
         let public_key = sample_public_key(
             &params,
             ctx.width(),
@@ -2186,16 +2177,10 @@ mod tests {
         );
         let q_modulus = BigUint::from(ctx.nested_rns.q_moduli()[0]);
 
-        for (plaintext, tag) in [(0u64, b"roundtrip_zero".as_slice()), (1u64, b"roundtrip_one")] {
-            let ciphertext = encrypt_plaintext_bit(
-                &params,
-                ctx.nested_rns.as_ref(),
-                &public_key,
-                plaintext,
-                randomizer_hash_key,
-                tag,
-            );
-            let expected = expected_coeffs(plaintext);
+        for plaintext in [false, true] {
+            let ciphertext =
+                encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, plaintext);
+            let expected = expected_coeffs(plaintext as u64);
             let decrypted =
                 decrypt_ciphertext(&params, ctx.nested_rns.as_ref(), &ciphertext, &secret_key, 2);
             assert_eq!(
@@ -2219,7 +2204,7 @@ mod tests {
             assert_eq!(outputs[0].len(), 1);
             assert_eq!(
                 rounded_coeffs(&outputs[0].as_slice()[0], 2, &q_modulus),
-                expected_coeffs(plaintext),
+                expected_coeffs(plaintext as u64),
                 "in-circuit Ring-GSW decrypt should recover the plaintext exactly when e = 0"
             );
         }
@@ -2250,7 +2235,6 @@ mod tests {
 
         let secret_key = sample_secret_key(&params);
         let public_key_hash_key = sample_hash_key();
-        let randomizer_hash_key = sample_hash_key();
         let public_key = sample_public_key(
             &params,
             ctx.width(),
@@ -2268,14 +2252,11 @@ mod tests {
             .copied()
             .enumerate()
             .map(|(idx, plaintext)| {
-                let tag = format!("decrypt_batch_ring_dim_ciphertext_{idx}_{plaintext}");
                 let ciphertext = encrypt_plaintext_bit(
                     &params,
                     ctx.nested_rns.as_ref(),
                     &public_key,
-                    plaintext,
-                    randomizer_hash_key,
-                    tag.as_bytes(),
+                    plaintext != 0,
                 );
                 let native_decrypted = decrypt_ciphertext(
                     &params,
@@ -2403,7 +2384,6 @@ mod tests {
 
         let secret_key = sample_secret_key(&params);
         let public_key_hash_key = sample_hash_key();
-        let randomizer_hash_key = sample_hash_key();
         let public_key = sample_public_key(
             &params,
             lhs.width(),
@@ -2418,22 +2398,10 @@ mod tests {
         let expected = (x1 + x2) % plaintext_modulus;
         let lhs_tag = format!("add_circuit_lhs_{x1}_{x2}");
         let rhs_tag = format!("add_circuit_rhs_{x1}_{x2}");
-        let lhs_native = encrypt_plaintext_bit(
-            &params,
-            ctx.nested_rns.as_ref(),
-            &public_key,
-            x1,
-            randomizer_hash_key,
-            lhs_tag.as_bytes(),
-        );
-        let rhs_native = encrypt_plaintext_bit(
-            &params,
-            ctx.nested_rns.as_ref(),
-            &public_key,
-            x2,
-            randomizer_hash_key,
-            rhs_tag.as_bytes(),
-        );
+        let lhs_native =
+            encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, x1 != 0);
+        let rhs_native =
+            encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, x2 != 0);
 
         let inputs = [
             ciphertext_inputs_from_native(
@@ -2482,7 +2450,6 @@ mod tests {
 
         let secret_key = sample_secret_key(&params);
         let public_key_hash_key = sample_hash_key();
-        let randomizer_hash_key = sample_hash_key();
         let public_key = sample_public_key(
             &params,
             lhs.width(),
@@ -2497,22 +2464,10 @@ mod tests {
         let expected = (x1 + plaintext_modulus - x2) % plaintext_modulus;
         let lhs_tag = format!("sub_circuit_lhs_{x1}_{x2}");
         let rhs_tag = format!("sub_circuit_rhs_{x1}_{x2}");
-        let lhs_native = encrypt_plaintext_bit(
-            &params,
-            ctx.nested_rns.as_ref(),
-            &public_key,
-            x1,
-            randomizer_hash_key,
-            lhs_tag.as_bytes(),
-        );
-        let rhs_native = encrypt_plaintext_bit(
-            &params,
-            ctx.nested_rns.as_ref(),
-            &public_key,
-            x2,
-            randomizer_hash_key,
-            rhs_tag.as_bytes(),
-        );
+        let lhs_native =
+            encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, x1 != 0);
+        let rhs_native =
+            encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, x2 != 0);
 
         let inputs = [
             ciphertext_inputs_from_native(
@@ -2561,7 +2516,6 @@ mod tests {
 
         let secret_key = sample_secret_key(&params);
         let public_key_hash_key = sample_hash_key();
-        let randomizer_hash_key = sample_hash_key();
         let public_key = sample_public_key(
             &params,
             lhs.width(),
@@ -2576,22 +2530,10 @@ mod tests {
         let expected = (x1 * x2) % plaintext_modulus;
         let lhs_tag = format!("mul_circuit_lhs_{x1}_{x2}");
         let rhs_tag = format!("mul_circuit_rhs_{x1}_{x2}");
-        let lhs_native = encrypt_plaintext_bit(
-            &params,
-            ctx.nested_rns.as_ref(),
-            &public_key,
-            x1,
-            randomizer_hash_key,
-            lhs_tag.as_bytes(),
-        );
-        let rhs_native = encrypt_plaintext_bit(
-            &params,
-            ctx.nested_rns.as_ref(),
-            &public_key,
-            x2,
-            randomizer_hash_key,
-            rhs_tag.as_bytes(),
-        );
+        let lhs_native =
+            encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, x1 != 0);
+        let rhs_native =
+            encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, x2 != 0);
 
         let inputs = [
             ciphertext_inputs_from_native(
@@ -2642,7 +2584,6 @@ mod tests {
 
         let secret_key = sample_secret_key(&params);
         let public_key_hash_key = sample_hash_key();
-        let randomizer_hash_key = sample_hash_key();
         let public_key = sample_public_key(
             &params,
             lhs.width(),
@@ -2659,30 +2600,12 @@ mod tests {
         let lhs_tag = format!("chain_mul_circuit_lhs_{x1}_{x2}_{x3}");
         let rhs1_tag = format!("chain_mul_circuit_rhs1_{x1}_{x2}_{x3}");
         let rhs2_tag = format!("chain_mul_circuit_rhs2_{x1}_{x2}_{x3}");
-        let lhs_native = encrypt_plaintext_bit(
-            &params,
-            ctx.nested_rns.as_ref(),
-            &public_key,
-            x1,
-            randomizer_hash_key,
-            lhs_tag.as_bytes(),
-        );
-        let rhs1_native = encrypt_plaintext_bit(
-            &params,
-            ctx.nested_rns.as_ref(),
-            &public_key,
-            x2,
-            randomizer_hash_key,
-            rhs1_tag.as_bytes(),
-        );
-        let rhs2_native = encrypt_plaintext_bit(
-            &params,
-            ctx.nested_rns.as_ref(),
-            &public_key,
-            x3,
-            randomizer_hash_key,
-            rhs2_tag.as_bytes(),
-        );
+        let lhs_native =
+            encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, x1 != 0);
+        let rhs1_native =
+            encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, x2 != 0);
+        let rhs2_native =
+            encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, x3 != 0);
 
         let inputs = [
             ciphertext_inputs_from_native(

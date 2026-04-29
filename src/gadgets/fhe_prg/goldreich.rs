@@ -1262,7 +1262,6 @@ mod tests {
         let plaintext_modulus = 2u64;
         let secret_key = sample_secret_key(&params);
         let public_key_hash_key = sample_hash_key();
-        let randomizer_hash_key = sample_hash_key();
         let public_key = sample_public_key(
             &params,
             ring_gsw.width(),
@@ -1276,16 +1275,8 @@ mod tests {
         let native_inputs = plaintext_inputs
             .par_iter()
             .enumerate()
-            .map(|(idx, bit)| {
-                let tag = format!("goldreich_input_bit_{idx}");
-                encrypt_plaintext_bit(
-                    &params,
-                    ring_gsw.nested_rns.as_ref(),
-                    &public_key,
-                    *bit,
-                    randomizer_hash_key,
-                    tag.as_bytes(),
-                )
+            .map(|(_idx, bit)| {
+                encrypt_plaintext_bit(&params, ring_gsw.nested_rns.as_ref(), &public_key, *bit != 0)
             })
             .collect::<Vec<_>>();
 
@@ -1381,7 +1372,6 @@ mod tests {
         let plaintext_modulus = (2 * cbd_n + 1) as u64;
         let secret_key = sample_secret_key(&params);
         let public_key_hash_key = sample_hash_key();
-        let randomizer_hash_key = sample_hash_key();
         let public_key = sample_public_key(
             &params,
             ring_gsw.width(),
@@ -1396,16 +1386,8 @@ mod tests {
         let native_inputs = plaintext_inputs
             .par_iter()
             .enumerate()
-            .map(|(idx, bit)| {
-                let tag = format!("goldreich_cbd_input_bit_{idx}");
-                encrypt_plaintext_bit(
-                    &params,
-                    ring_gsw.nested_rns.as_ref(),
-                    &public_key,
-                    *bit,
-                    randomizer_hash_key,
-                    tag.as_bytes(),
-                )
+            .map(|(_idx, bit)| {
+                encrypt_plaintext_bit(&params, ring_gsw.nested_rns.as_ref(), &public_key, *bit != 0)
             })
             .collect::<Vec<_>>();
 

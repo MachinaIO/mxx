@@ -2,10 +2,12 @@ use crate::{
     bgg::{
         encoding::{BggEncoding, BggEncodingCompact},
         public_key::{BggPublicKey, BggPublicKeyCompact},
+        sampler::{BGGEncodingSampler, BGGPublicKeySampler},
     },
-    circuit::evaluable::Evaluable,
+    circuit::evaluable::{Evaluable, PolyVec},
     matrix::PolyMatrix,
     poly::Poly,
+    sampler::{PolyHashSampler, PolyUniformSampler},
 };
 use num_bigint::BigUint;
 use rayon::prelude::*;
@@ -43,6 +45,118 @@ pub struct NaiveBGGEncodingVec<M: PolyMatrix> {
 #[derive(Debug, Clone)]
 pub struct NaiveBGGEncodingVecCompact<M: PolyMatrix> {
     encodings: Vec<BggEncodingCompact<M>>,
+}
+
+#[derive(Clone)]
+pub struct NaiveBGGPublicKeyVecSampler<K: AsRef<[u8]>, S: PolyHashSampler<K>> {
+    scalar_sampler: BGGPublicKeySampler<K, S>,
+    num_slots: usize,
+}
+
+#[derive(Clone)]
+pub struct NaiveBGGEncodingVecSampler<S: PolyUniformSampler> {
+    scalar_sampler: BGGEncodingSampler<S>,
+    num_slots: usize,
+}
+
+impl<K, S> NaiveBGGPublicKeyVecSampler<K, S>
+where
+    K: AsRef<[u8]>,
+    S: PolyHashSampler<K>,
+{
+    pub fn new(hash_key: [u8; 32], d: usize, num_slots: usize) -> Self {
+        assert!(num_slots > 0, "NaiveBGGPublicKeyVecSampler requires at least one slot");
+        Self { scalar_sampler: BGGPublicKeySampler::<K, S>::new(hash_key, d), num_slots }
+    }
+
+    pub fn sample(
+        &self,
+        params: &<<<S as PolyHashSampler<K>>::M as PolyMatrix>::P as Poly>::Params,
+        tag: &[u8],
+        reveal_plaintexts: &[bool],
+    ) -> Vec<NaiveBGGPublicKeyVec<S::M>> {
+        let scalar_reveal_plaintexts = std::iter::repeat_n(true, self.num_slots - 1)
+            .chain(
+                reveal_plaintexts
+                    .iter()
+                    .flat_map(|reveal_plaintext| vec![*reveal_plaintext; self.num_slots]),
+            )
+            .collect::<Vec<_>>();
+        let scalar_keys = self.scalar_sampler.sample(params, tag, &scalar_reveal_plaintexts);
+        let mut outputs = Vec::with_capacity(1 + reveal_plaintexts.len());
+        outputs.extend(
+            scalar_keys
+                .chunks(self.num_slots)
+                .map(|chunk| NaiveBGGPublicKeyVec::new(chunk.to_vec())),
+        );
+        outputs
+    }
+}
+
+impl<S> NaiveBGGEncodingVecSampler<S>
+where
+    S: PolyUniformSampler + Sync,
+{
+    pub fn new(
+        params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
+        secrets: &[<S::M as PolyMatrix>::P],
+        gauss_sigma: Option<f64>,
+        num_slots: usize,
+    ) -> Self {
+        assert!(num_slots > 0, "NaiveBGGEncodingVecSampler requires at least one slot");
+        Self {
+            scalar_sampler: BGGEncodingSampler::<S>::new(params, secrets, gauss_sigma),
+            num_slots,
+        }
+    }
+
+    pub fn sample(
+        &self,
+        params: &<<<S as PolyUniformSampler>::M as PolyMatrix>::P as Poly>::Params,
+        public_keys: &[NaiveBGGPublicKeyVec<S::M>],
+        plaintexts: &[PolyVec<<S::M as PolyMatrix>::P>],
+    ) -> Vec<NaiveBGGEncodingVec<S::M>> {
+        assert_eq!(
+            public_keys.len(),
+            1 + plaintexts.len(),
+            "NaiveBGGEncodingVecSampler public key vector count must match plaintext vectors plus one"
+        );
+        public_keys.par_iter().for_each(|public_key| {
+            debug_assert_eq!(
+                public_key.num_slots(),
+                self.num_slots,
+                "NaiveBGGEncodingVecSampler public key slot count mismatch"
+            );
+        });
+        plaintexts.par_iter().for_each(|plaintext| {
+            debug_assert_eq!(
+                plaintext.len(),
+                self.num_slots,
+                "NaiveBGGEncodingVecSampler plaintext slot count mismatch"
+            );
+        });
+
+        let scalar_public_keys = public_keys
+            .iter()
+            .flat_map(|public_key| public_key.keys.iter().cloned())
+            .collect::<Vec<_>>();
+        let mut scalar_plaintexts =
+            Vec::with_capacity(self.num_slots - 1 + plaintexts.len() * self.num_slots);
+        scalar_plaintexts.extend(
+            std::iter::repeat_with(|| <S::M as PolyMatrix>::P::const_one(params))
+                .take(self.num_slots - 1),
+        );
+        scalar_plaintexts
+            .extend(plaintexts.iter().flat_map(|plaintext| plaintext.as_slice().iter().cloned()));
+        let scalar_encodings =
+            self.scalar_sampler.sample(params, &scalar_public_keys, &scalar_plaintexts);
+        (0..public_keys.len())
+            .map(|encoding_idx| {
+                let start = encoding_idx * self.num_slots;
+                NaiveBGGEncodingVec::new(scalar_encodings[start..start + self.num_slots].to_vec())
+            })
+            .collect()
+    }
 }
 
 impl<M: PolyMatrix> NaiveBGGPublicKeyVec<M> {
@@ -361,7 +475,6 @@ mod tests {
     use super::*;
     use crate::{
         __PAIR, __TestState,
-        bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         circuit::{PolyCircuit, gate::GateId},
         element::PolyElem,
         lookup::{
@@ -414,9 +527,10 @@ mod tests {
     fn test_naive_bgg_public_key_vec_slot_transfer_shuffles_slots() {
         let params = DCRTPolyParams::default();
         let hash_key = [0x41u8; 32];
-        let sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(hash_key, 2);
-        let keys = sampler.sample(&params, b"naive-pubkey-st", &[true, true, true]);
-        let input = NaiveBGGPublicKeyVec::new(keys[1..].to_vec());
+        let sampler =
+            NaiveBGGPublicKeyVecSampler::<_, DCRTPolyHashSampler<Keccak256>>::new(hash_key, 2, 3);
+        let keys = sampler.sample(&params, b"naive-pubkey-st", &[true]);
+        let input = keys[1].clone();
         let evaluator = NaiveBGGVecSlotTransferEvaluator::new();
 
         let output = evaluator.slot_transfer(&params, &input, &[(2, None), (0, None)], GateId(7));
@@ -428,22 +542,60 @@ mod tests {
 
     #[sequential_test::sequential]
     #[test]
+    fn test_naive_bgg_public_key_vec_sampler_matches_scalar_flatten_layout() {
+        let params = DCRTPolyParams::default();
+        let hash_key = [0x47u8; 32];
+        let d = 2;
+        let num_slots = 3;
+        let reveal_plaintexts = [true, false];
+        let vector_sampler = NaiveBGGPublicKeyVecSampler::<_, DCRTPolyHashSampler<Keccak256>>::new(
+            hash_key, d, num_slots,
+        );
+        let vector_keys =
+            vector_sampler.sample(&params, b"naive-pubkey-vector-layout", &reveal_plaintexts);
+
+        let scalar_reveal_plaintexts = std::iter::repeat_n(true, num_slots - 1)
+            .chain(
+                reveal_plaintexts
+                    .iter()
+                    .flat_map(|reveal_plaintext| vec![*reveal_plaintext; num_slots]),
+            )
+            .collect::<Vec<_>>();
+        let scalar_sampler =
+            BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(hash_key, d);
+        let scalar_keys = scalar_sampler.sample(
+            &params,
+            b"naive-pubkey-vector-layout",
+            &scalar_reveal_plaintexts,
+        );
+
+        assert_eq!(vector_keys.len(), 1 + reveal_plaintexts.len());
+        for (vector_idx, vector_key) in vector_keys.iter().enumerate() {
+            let start = vector_idx * num_slots;
+            assert_eq!(vector_key.keys, scalar_keys[start..start + num_slots]);
+        }
+        assert_ne!(vector_keys[0].keys[0], vector_keys[0].keys[1]);
+        assert_ne!(vector_keys[0].keys[1], vector_keys[0].keys[2]);
+    }
+
+    #[sequential_test::sequential]
+    #[test]
     fn test_naive_bgg_encoding_vec_slot_transfer_shuffles_slots() {
         let params = DCRTPolyParams::default();
         let hash_key = [0x42u8; 32];
         let pubkey_sampler =
-            BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(hash_key, 2);
-        let pubkeys = pubkey_sampler.sample(&params, b"naive-encoding-st", &[true, true, true]);
+            NaiveBGGPublicKeyVecSampler::<_, DCRTPolyHashSampler<Keccak256>>::new(hash_key, 2, 3);
+        let pubkeys = pubkey_sampler.sample(&params, b"naive-encoding-st", &[true]);
         let secrets = vec![create_bit_random_poly(&params); 2];
-        let plaintexts = vec![
+        let plaintexts = vec![PolyVec::new(vec![
             DCRTPoly::from_usize_to_constant(&params, 3),
             DCRTPoly::from_usize_to_constant(&params, 4),
             DCRTPoly::from_usize_to_constant(&params, 5),
-        ];
+        ])];
         let encoding_sampler =
-            BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
+            NaiveBGGEncodingVecSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None, 3);
         let encodings = encoding_sampler.sample(&params, &pubkeys, &plaintexts);
-        let input = NaiveBGGEncodingVec::new(encodings[1..].to_vec());
+        let input = encodings[1].clone();
         let evaluator = NaiveBGGVecSlotTransferEvaluator::new();
 
         let output = evaluator.slot_transfer(&params, &input, &[(1, None), (2, None)], GateId(8));
@@ -457,17 +609,76 @@ mod tests {
 
     #[sequential_test::sequential]
     #[test]
+    fn test_naive_bgg_encoding_vec_sampler_matches_scalar_flatten_layout() {
+        let params = DCRTPolyParams::default();
+        let hash_key = [0x48u8; 32];
+        let d = 2;
+        let num_slots = 3;
+        let reveal_plaintexts = [true, true];
+        let pubkey_sampler = NaiveBGGPublicKeyVecSampler::<_, DCRTPolyHashSampler<Keccak256>>::new(
+            hash_key, d, num_slots,
+        );
+        let pubkeys =
+            pubkey_sampler.sample(&params, b"naive-encoding-vector-layout", &reveal_plaintexts);
+        let secrets = vec![create_bit_random_poly(&params); d];
+        let plaintexts = (0..reveal_plaintexts.len())
+            .map(|chunk_idx| {
+                PolyVec::new(
+                    (0..num_slots)
+                        .map(|slot_idx| {
+                            DCRTPoly::from_usize_to_constant(
+                                &params,
+                                10 + chunk_idx * num_slots + slot_idx,
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let vector_sampler = NaiveBGGEncodingVecSampler::<DCRTPolyUniformSampler>::new(
+            &params, &secrets, None, num_slots,
+        );
+        let vector_encodings = vector_sampler.sample(&params, &pubkeys, &plaintexts);
+
+        let scalar_public_keys = pubkeys
+            .iter()
+            .flat_map(|public_key| public_key.keys.iter().cloned())
+            .collect::<Vec<_>>();
+        let mut scalar_plaintexts =
+            Vec::with_capacity(num_slots - 1 + plaintexts.len() * num_slots);
+        scalar_plaintexts
+            .extend(std::iter::repeat_with(|| DCRTPoly::const_one(&params)).take(num_slots - 1));
+        scalar_plaintexts
+            .extend(plaintexts.iter().flat_map(|plaintext| plaintext.as_slice().iter().cloned()));
+        let scalar_sampler =
+            BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
+        let scalar_encodings =
+            scalar_sampler.sample(&params, &scalar_public_keys, &scalar_plaintexts);
+
+        assert_eq!(vector_encodings.len(), 1 + plaintexts.len());
+        for (vector_idx, vector_encoding) in vector_encodings.iter().enumerate() {
+            let start = vector_idx * num_slots;
+            for (slot_idx, encoding) in vector_encoding.encodings.iter().enumerate() {
+                let expected = &scalar_encodings[start + slot_idx];
+                assert_eq!(encoding.vector, expected.vector);
+                assert_eq!(encoding.pubkey, expected.pubkey);
+                assert_eq!(encoding.plaintext, expected.plaintext);
+            }
+        }
+    }
+
+    #[sequential_test::sequential]
+    #[test]
     fn test_naive_bgg_public_key_vec_slot_reduce_matches_manual_reduction() {
         let params = DCRTPolyParams::default();
         let ring_dim = params.ring_dimension() as usize;
         let num_slots = 3;
         let hash_key = [0x45u8; 32];
-        let sampler = BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(hash_key, 2);
-        let keys = sampler.sample(&params, b"naive-pubkey-slot-reduce", &[true; 6]);
-        let inputs = vec![
-            NaiveBGGPublicKeyVec::new(keys[..num_slots].to_vec()),
-            NaiveBGGPublicKeyVec::new(keys[num_slots..2 * num_slots].to_vec()),
-        ];
+        let sampler = NaiveBGGPublicKeyVecSampler::<_, DCRTPolyHashSampler<Keccak256>>::new(
+            hash_key, 2, num_slots,
+        );
+        let keys = sampler.sample(&params, b"naive-pubkey-slot-reduce", &[true; 2]);
+        let inputs = keys[1..].to_vec();
         let evaluator = NaiveBGGVecSlotTransferEvaluator::new();
 
         let output = evaluator.slot_reduce(&params, &inputs, num_slots, GateId(9));
@@ -496,20 +707,30 @@ mod tests {
         let ring_dim = params.ring_dimension() as usize;
         let num_slots = 3;
         let hash_key = [0x46u8; 32];
-        let pubkey_sampler =
-            BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(hash_key, 2);
-        let pubkeys = pubkey_sampler.sample(&params, b"naive-encoding-slot-reduce", &[true; 6]);
+        let pubkey_sampler = NaiveBGGPublicKeyVecSampler::<_, DCRTPolyHashSampler<Keccak256>>::new(
+            hash_key, 2, num_slots,
+        );
+        let pubkeys = pubkey_sampler.sample(&params, b"naive-encoding-slot-reduce", &[true; 2]);
         let secrets = vec![create_bit_random_poly(&params); 2];
-        let plaintexts = (0..6)
-            .map(|value| DCRTPoly::from_usize_to_constant(&params, value + 1))
+        let plaintexts = (0..2)
+            .map(|chunk_idx| {
+                PolyVec::new(
+                    (0..num_slots)
+                        .map(|slot_idx| {
+                            DCRTPoly::from_usize_to_constant(
+                                &params,
+                                chunk_idx * num_slots + slot_idx + 1,
+                            )
+                        })
+                        .collect(),
+                )
+            })
             .collect::<Vec<_>>();
-        let encoding_sampler =
-            BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
+        let encoding_sampler = NaiveBGGEncodingVecSampler::<DCRTPolyUniformSampler>::new(
+            &params, &secrets, None, num_slots,
+        );
         let encodings = encoding_sampler.sample(&params, &pubkeys, &plaintexts);
-        let inputs = vec![
-            NaiveBGGEncodingVec::new(encodings[..num_slots].to_vec()),
-            NaiveBGGEncodingVec::new(encodings[num_slots..2 * num_slots].to_vec()),
-        ];
+        let inputs = encodings[1..].to_vec();
         let evaluator = NaiveBGGVecSlotTransferEvaluator::new();
 
         let output = evaluator.slot_reduce(&params, &inputs, num_slots, GateId(10));
@@ -540,9 +761,14 @@ mod tests {
         let plt = lsb_lut(&params);
         let hash_key = [0x44u8; 32];
         let d = 2;
-        let pubkey_sampler =
-            BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(hash_key, d);
-        let pubkeys = pubkey_sampler.sample(&params, b"naive-lwe-slot-namespace", &[true; 4]);
+        let two_slot_pubkey_sampler =
+            NaiveBGGPublicKeyVecSampler::<_, DCRTPolyHashSampler<Keccak256>>::new(hash_key, d, 2);
+        let two_slot_pubkeys =
+            two_slot_pubkey_sampler.sample(&params, b"naive-lwe-slot-namespace-2", &[true]);
+        let three_slot_pubkey_sampler =
+            NaiveBGGPublicKeyVecSampler::<_, DCRTPolyHashSampler<Keccak256>>::new(hash_key, d, 3);
+        let three_slot_pubkeys =
+            three_slot_pubkey_sampler.sample(&params, b"naive-lwe-slot-namespace-3", &[true]);
         let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
         let (b_trapdoor, b) = trapdoor_sampler.trapdoor(&params, d);
         let evaluator = NaiveLWEBGGPublicKeyVecPltEvaluator::new(LWEBGGPubKeyPltEvaluator::<
@@ -557,18 +783,19 @@ mod tests {
             "test_data/test_naive_bgg_slot_namespace".into(),
         ));
 
-        let two_slot_one = NaiveBGGPublicKeyVec::new(vec![pubkeys[0].clone(); 2]);
-        let two_slot_input = NaiveBGGPublicKeyVec::new(pubkeys[1..3].to_vec());
-        let three_slot_one = NaiveBGGPublicKeyVec::new(vec![pubkeys[0].clone(); 3]);
-        let three_slot_input = NaiveBGGPublicKeyVec::new(pubkeys[1..4].to_vec());
-
-        let two_slot_output =
-            evaluator.public_lookup(&params, &plt, &two_slot_one, &two_slot_input, GateId(1), 0);
+        let two_slot_output = evaluator.public_lookup(
+            &params,
+            &plt,
+            &two_slot_pubkeys[0],
+            &two_slot_pubkeys[1],
+            GateId(1),
+            0,
+        );
         let three_slot_output = evaluator.public_lookup(
             &params,
             &plt,
-            &three_slot_one,
-            &three_slot_input,
+            &three_slot_pubkeys[0],
+            &three_slot_pubkeys[1],
             GateId(0),
             0,
         );
@@ -592,16 +819,19 @@ mod tests {
         let d = 2;
         let num_slots = 2;
         let hash_key = [0x43u8; 32];
-        let pubkey_sampler =
-            BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(hash_key, d);
+        let pubkey_sampler = NaiveBGGPublicKeyVecSampler::<_, DCRTPolyHashSampler<Keccak256>>::new(
+            hash_key, d, num_slots,
+        );
         let secrets = vec![create_bit_random_poly(&params); d];
-        let plaintexts = vec![
+        let plaintext_slots = vec![
             DCRTPoly::from_usize_to_constant(&params, 5),
             DCRTPoly::from_usize_to_constant(&params, 6),
         ];
-        let pubkeys = pubkey_sampler.sample(&params, b"naive-lwe-plt", &[true, true]);
-        let encoding_sampler =
-            BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
+        let plaintexts = vec![PolyVec::new(plaintext_slots.clone())];
+        let pubkeys = pubkey_sampler.sample(&params, b"naive-lwe-plt", &[true]);
+        let encoding_sampler = NaiveBGGEncodingVecSampler::<DCRTPolyUniformSampler>::new(
+            &params, &secrets, None, num_slots,
+        );
         let encodings = encoding_sampler.sample(&params, &pubkeys, &plaintexts);
 
         let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
@@ -623,12 +853,10 @@ mod tests {
                 Arc::new(b_trapdoor),
                 dir_path.into(),
             ));
-        let one_pubkey = NaiveBGGPublicKeyVec::new(vec![pubkeys[0].clone(); num_slots]);
-        let input_pubkey = NaiveBGGPublicKeyVec::new(pubkeys[1..].to_vec());
         let result_pubkey = circuit.eval(
             &params,
-            one_pubkey,
-            vec![input_pubkey],
+            pubkeys[0].clone(),
+            vec![pubkeys[1].clone()],
             Some(&pubkey_evaluator),
             None,
             None,
@@ -645,12 +873,10 @@ mod tests {
             >::new(
                 hash_key, dir_path.into(), c_b
             ));
-        let one_encoding = NaiveBGGEncodingVec::new(vec![encodings[0].clone(); num_slots]);
-        let input_encoding = NaiveBGGEncodingVec::new(encodings[1..].to_vec());
         let result_encoding = circuit.eval(
             &params,
-            one_encoding,
-            vec![input_encoding],
+            encodings[0].clone(),
+            vec![encodings[1].clone()],
             Some(&encoding_evaluator),
             None,
             None,
@@ -663,7 +889,7 @@ mod tests {
                 result_encoding[0].encodings[slot_idx].pubkey,
                 result_pubkey[0].keys[slot_idx]
             );
-            let expected_bit = plaintexts[slot_idx].const_coeff_u64() & 1;
+            let expected_bit = plaintext_slots[slot_idx].const_coeff_u64() & 1;
             let expected_plaintext =
                 DCRTPoly::from_usize_to_constant(&params, expected_bit as usize);
             assert_eq!(

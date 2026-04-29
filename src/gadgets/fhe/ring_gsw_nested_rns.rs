@@ -100,27 +100,22 @@ pub fn sample_public_key<B: AsRef<[u8]>>(
     secret_key: &DCRTPoly,
     hash_key: [u8; 32],
     tag: B,
-    error: Option<&[DCRTPoly]>,
+    error_sigma: Option<f64>,
 ) -> NativeRingGswCiphertext {
     assert!(width > 0, "Ring-GSW public-key width must be positive");
-    if let Some(error) = error {
-        assert_eq!(
-            error.len(),
-            width,
-            "Ring-GSW public-key error length {} must match width {}",
-            error.len(),
-            width
-        );
-    }
     let hash_sampler = DCRTPolyHashSampler::<Keccak256>::new();
     let a =
         hash_sampler.sample_hash(params, hash_key, tag, 1, width, DistType::FinRingDist).get_row(0);
+    let error = error_sigma.filter(|sigma| *sigma != 0.0).map(|sigma| {
+        let uniform_sampler = DCRTPolyUniformSampler::new();
+        uniform_sampler.sample_uniform(params, 1, width, DistType::GaussDist { sigma }).get_row(0)
+    });
     let b = a
         .par_iter()
         .enumerate()
         .map(|(idx, entry)| {
             let base = -(secret_key.clone() * entry);
-            match error {
+            match &error {
                 Some(error) => base + error[idx].clone(),
                 None => base,
             }
@@ -129,29 +124,21 @@ pub fn sample_public_key<B: AsRef<[u8]>>(
     [a, b]
 }
 
-pub fn encrypt_plaintext_bit<B: AsRef<[u8]>>(
+pub fn encrypt_plaintext_bit(
     params: &DCRTPolyParams,
     ctx: &NestedRnsPolyContext,
     public_key: &NativeRingGswCiphertext,
-    plaintext: u64,
-    randomizer_key: [u8; 32],
-    randomizer_tag: B,
+    plaintext: bool,
 ) -> NativeRingGswCiphertext {
     let width = public_key[0].len();
     assert_eq!(public_key[1].len(), width, "Ring-GSW public key rows must have the same width");
-    let hash_sampler = DCRTPolyHashSampler::<Keccak256>::new();
-    let randomizer = hash_sampler.sample_hash(
-        params,
-        randomizer_key,
-        randomizer_tag,
-        width,
-        width,
-        DistType::BitDist,
-    );
+    let uniform_sampler = DCRTPolyUniformSampler::new();
+    let randomizer = uniform_sampler.sample_uniform(params, width, width, DistType::BitDist);
     let public_matrix =
         DCRTPolyMatrix::from_poly_vec(params, vec![public_key[0].clone(), public_key[1].clone()]);
     let gadget_matrix = native_gadget_matrix(params, ctx);
-    let plaintext_poly = DCRTPoly::from_biguint_to_constant(params, BigUint::from(plaintext));
+    let plaintext_poly =
+        DCRTPoly::from_biguint_to_constant(params, BigUint::from(plaintext as u64));
     let ciphertext = (public_matrix * randomizer) + (gadget_matrix * plaintext_poly);
     [ciphertext.get_row(0), ciphertext.get_row(1)]
 }

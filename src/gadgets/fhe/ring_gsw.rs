@@ -2305,7 +2305,10 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        circuit_inputs.push(PolyVec::new(vec![secret_key.clone()]));
+        // `decrypt_batch` assumes the decryption-key wire already carries the same secret key in
+        // every slot.  This matches the production noise-refresh callers, where the packed
+        // ciphertext batch and the key wire have the same slot arity.
+        circuit_inputs.push(PolyVec::new(vec![secret_key.clone(); ctx.num_slots]));
 
         let outputs = eval_outputs(&params, NUM_SLOTS, &circuit, circuit_inputs);
         assert_eq!(outputs.len(), 1);

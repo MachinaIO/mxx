@@ -366,7 +366,9 @@ fn probe_crt_depth_for_goldreich_ring_gsw_bench(
     let max_decryption_error = max_bigdecimal(
         encrypted_outputs
             .par_iter()
-            .map(|ciphertext| ciphertext.estimate_decryption_error_norm(cfg.error_sigma))
+            .map(|ciphertext| {
+                ciphertext.estimate_decryption_error_norm(cfg.error_sigma).poly_norm.norm
+            })
             .collect::<Vec<_>>(),
     );
     debug!("max_decryption_error_bits={}", bigdecimal_bits_ceil(&max_decryption_error));
@@ -628,7 +630,9 @@ async fn test_gpu_lwe_nested_rns_goldreich_ring_gsw_bench() {
     let max_selected_decryption_error = max_bigdecimal(
         encrypted_outputs
             .iter()
-            .map(|ciphertext| ciphertext.estimate_decryption_error_norm(cfg.error_sigma))
+            .map(|ciphertext| {
+                ciphertext.estimate_decryption_error_norm(cfg.error_sigma).poly_norm.norm
+            })
             .collect::<Vec<_>>(),
     );
     let ring_gsw_q = ring_gsw_q_modulus(ctx.as_ref());

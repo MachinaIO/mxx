@@ -1440,7 +1440,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
 impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>>
     RingGswCiphertext<P, A>
 {
-    pub fn estimate_decryption_error_norm(&self, error_sigma: f64) -> BigDecimal {
+    pub fn estimate_decryption_error_norm(&self, error_sigma: f64) -> PolyMatrixNorm {
         self.assert_consistent();
         assert!(error_sigma.is_finite(), "error_sigma must be finite");
         assert!(error_sigma >= 0.0, "error_sigma must be non-negative");
@@ -1474,8 +1474,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             bottom_half_randomizer.nrow,
             sigma,
         );
-        let final_error = public_key_error * (bottom_half_randomizer * p_max_matrix);
-        final_error.poly_norm.norm
+        public_key_error * (bottom_half_randomizer * p_max_matrix)
     }
 
     pub fn decrypt<M>(
@@ -2022,6 +2021,24 @@ mod tests {
         assert_eq!(input.randomizer_norm.ncol, ctx.width());
         assert_eq!(input.randomizer_norm.poly_norm.norm, BigDecimal::from(1u64));
         assert_eq!(input.max_plaintext, BigUint::from(1u64));
+    }
+
+    #[test]
+    fn test_ring_gsw_decryption_error_estimate_returns_one_by_one_matrix_norm() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_params, ctx) = create_test_context(&mut circuit);
+        let input = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+
+        let estimated = input.estimate_decryption_error_norm(BGG_SIGMA);
+        assert_eq!(estimated.nrow, 1);
+        assert_eq!(estimated.ncol, 1);
+        assert_eq!(estimated.ctx(), ctx.randomizer_norm_ctx.as_ref());
+        assert!(estimated.poly_norm.norm > BigDecimal::from(0u64));
+
+        let zero_sigma = input.estimate_decryption_error_norm(0.0);
+        assert_eq!(zero_sigma.nrow, 1);
+        assert_eq!(zero_sigma.ncol, 1);
+        assert_eq!(zero_sigma.poly_norm.norm, BigDecimal::from(0u64));
     }
 
     #[test]

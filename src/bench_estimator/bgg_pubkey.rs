@@ -347,6 +347,11 @@ where
         per_gate_time_estimate(self.slot_transfer_time, self.slot_transfer_peak_vram)
     }
 
+    fn estimate_slot_reduce(&self, input_count: usize, num_slots: usize) -> CircuitBenchEstimate {
+        let _ = (input_count, num_slots);
+        per_gate_time_estimate(self.slot_transfer_time, self.slot_transfer_peak_vram)
+    }
+
     fn estimate_public_lookup(&self, lut_id: usize) -> CircuitBenchEstimate {
         let _ = lut_id;
         per_gate_time_estimate(self.public_lut_time, self.public_lut_peak_vram)

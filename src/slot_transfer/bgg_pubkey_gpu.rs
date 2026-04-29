@@ -406,6 +406,70 @@ where
         target_chunk
     }
 
+    fn build_slot_reduce_gate_target_chunk_gpu(
+        &self,
+        shared: &GpuSlotGateDeviceShared<M, TS::Trapdoor>,
+        gate_id: GateId,
+        input_pubkey_bytes: &[u8],
+        dst_slot: usize,
+        slot_secret_bytes_by_slot: &HashMap<usize, Vec<u8>>,
+        slot_a_bytes_by_slot: &HashMap<usize, Vec<u8>>,
+        num_slots: usize,
+        chunk_idx: usize,
+    ) -> M {
+        let m_g = self.secret_size * shared.params.modulus_digits();
+        let (col_start, col_len) = column_chunk_bounds(m_g, chunk_idx);
+        let s_dst = M::from_compact_bytes(
+            &shared.params,
+            slot_secret_bytes_by_slot
+                .get(&dst_slot)
+                .unwrap_or_else(|| panic!("missing dst slot secret bytes for dst_slot={dst_slot}")),
+        );
+        let lhs_chunk = s_dst.clone() *
+            &HS::new().sample_hash_columns(
+                &shared.params,
+                self.hash_key,
+                format!("slot_reduce_gate_a_out_{}", gate_id),
+                self.secret_size,
+                m_g,
+                col_start,
+                col_len,
+                DistType::FinRingDist,
+            );
+
+        let a_in = M::from_compact_bytes(&shared.params, input_pubkey_bytes);
+        let a_dst = M::from_compact_bytes(
+            &shared.params,
+            slot_a_bytes_by_slot
+                .get(&dst_slot)
+                .unwrap_or_else(|| panic!("missing dst slot a bytes for dst_slot={dst_slot}")),
+        );
+        let a_dst_chunk = a_dst.slice_columns(col_start, col_start + col_len).decompose();
+        let mut rhs_acc = M::zero(&shared.params, self.secret_size, col_len);
+        for src_slot in 0..num_slots {
+            let s_src = M::from_compact_bytes(
+                &shared.params,
+                slot_secret_bytes_by_slot.get(&src_slot).unwrap_or_else(|| {
+                    panic!("missing src slot secret bytes for src_slot={src_slot}")
+                }),
+            );
+            let lhs_input = s_src * &a_in;
+            let mut monomial = vec![0u32; shared.params.ring_dimension() as usize];
+            monomial[src_slot] = 1;
+            let scalar_poly = M::P::from_u32s(&shared.params, &monomial);
+            let rhs_chunk = (lhs_input * a_dst_chunk.clone()) * &scalar_poly;
+            rhs_acc.add_in_place(&rhs_chunk);
+        }
+
+        let mut target_chunk = lhs_chunk - &rhs_acc;
+        target_chunk.add_in_place(&self.sample_error_matrix(
+            &shared.params,
+            self.secret_size,
+            col_len,
+        ));
+        target_chunk
+    }
+
     fn sample_slot_b0_batch_gpu(
         &self,
         shared_by_device: &[GpuSlotAuxB0DeviceShared<M, TS::Trapdoor>],
@@ -781,6 +845,33 @@ where
                 .enumerate()
                 .map(|(device_idx, ((dst_slot, (src_slot_u32, scalar)), chunk_idx))| {
                     let shared = &shared_by_device[device_idx];
+                    if let (Some(input_pubkey_bytes), Some(num_slots)) =
+                        (state.slot_reduce_input_pubkey_bytes.as_ref(), state.slot_reduce_num_slots)
+                    {
+                        assert!(
+                            *dst_slot < input_pubkey_bytes.len(),
+                            "slot_reduce dst_slot {} exceeds input count {}",
+                            dst_slot,
+                            input_pubkey_bytes.len()
+                        );
+                        let target_chunk = self.build_slot_reduce_gate_target_chunk_gpu(
+                            shared,
+                            gate_id,
+                            &input_pubkey_bytes[*dst_slot],
+                            *dst_slot,
+                            &slot_secret_bytes_by_slot,
+                            &slot_a_bytes_by_slot,
+                            num_slots,
+                            *chunk_idx,
+                        );
+                        return GpuPreimageRequest {
+                            entry_idx: device_idx,
+                            params: &shared.params,
+                            trapdoor: &shared.b0_trapdoor,
+                            public_matrix: &shared.b0_matrix,
+                            target: target_chunk,
+                        };
+                    }
                     let a_in = M::from_compact_bytes(&shared.params, &state.input_pubkey_bytes);
                     let src_slot = usize::try_from(*src_slot_u32)
                         .expect("source slot index must fit in usize");
@@ -863,18 +954,27 @@ where
         slot_secret_mats: &[Vec<u8>],
         slot_a_bytes_by_slot: &[Vec<u8>],
         slot_chunk: &[(usize, (u32, Option<u32>))],
+        slot_reduce_num_slots: Option<usize>,
     ) -> PreparedGateBatch<M> {
         let mut slot_secret_bytes_by_slot = HashMap::<usize, Vec<u8>>::new();
         let mut slot_a_bytes_by_slot_map = HashMap::<usize, Vec<u8>>::new();
         for (dst_slot, (src_slot_u32, _)) in slot_chunk.iter().copied() {
-            let src_slot =
-                usize::try_from(src_slot_u32).expect("source slot index must fit in usize");
             slot_secret_bytes_by_slot
                 .entry(dst_slot)
                 .or_insert_with(|| slot_secret_mats[dst_slot].clone());
-            slot_secret_bytes_by_slot
-                .entry(src_slot)
-                .or_insert_with(|| slot_secret_mats[src_slot].clone());
+            if let Some(num_slots) = slot_reduce_num_slots {
+                for src_slot in 0..num_slots {
+                    slot_secret_bytes_by_slot
+                        .entry(src_slot)
+                        .or_insert_with(|| slot_secret_mats[src_slot].clone());
+                }
+            } else {
+                let src_slot =
+                    usize::try_from(src_slot_u32).expect("source slot index must fit in usize");
+                slot_secret_bytes_by_slot
+                    .entry(src_slot)
+                    .or_insert_with(|| slot_secret_mats[src_slot].clone());
+            }
             slot_a_bytes_by_slot_map
                 .entry(dst_slot)
                 .or_insert_with(|| slot_a_bytes_by_slot[dst_slot].clone());
@@ -940,6 +1040,7 @@ where
                         slot_secret_mats,
                         slot_a_bytes_by_slot,
                         &slot_chunk,
+                        state.slot_reduce_num_slots,
                     );
                     prepared_tx.send(prepared_batch).expect("gate pipeline compute stage dropped");
                 }
@@ -1104,6 +1205,8 @@ where
             input_pubkey_bytes: M::gadget_matrix(&gate_shared.params, self.secret_size)
                 .into_compact_bytes(),
             src_slots: vec![(0u32, None)],
+            slot_reduce_input_pubkey_bytes: None,
+            slot_reduce_num_slots: None,
         };
         let trap_sampler_gate = TS::new(&gate_shared.params, self.trapdoor_sigma);
         let start = Instant::now();

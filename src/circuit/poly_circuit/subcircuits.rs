@@ -2,7 +2,7 @@ use super::*;
 use std::path::Path;
 
 impl<P: Poly> PolyCircuit<P> {
-    fn inherit_shared_registries(
+    pub(crate) fn inherit_shared_registries(
         &mut self,
         lookup_registry: Arc<LookupRegistry<P>>,
         binding_registry: Arc<BindingRegistry>,
@@ -78,6 +78,24 @@ impl<P: Poly> PolyCircuit<P> {
             self.sub_circuit_registry = Arc::clone(&sub_circuit_registry);
         }
         self.allow_register_lookup = false;
+    }
+
+    pub(crate) fn registry_handles(&self) -> PolyCircuitRegistryHandles<P> {
+        PolyCircuitRegistryHandles {
+            lookup_registry: Arc::clone(&self.lookup_registry),
+            binding_registry: Arc::clone(&self.binding_registry),
+            input_set_registry: Arc::clone(&self.input_set_registry),
+            sub_circuit_registry: Arc::clone(&self.sub_circuit_registry),
+        }
+    }
+
+    pub(crate) fn inherit_registry_handles(&mut self, handles: &PolyCircuitRegistryHandles<P>) {
+        self.inherit_shared_registries(
+            Arc::clone(&handles.lookup_registry),
+            Arc::clone(&handles.binding_registry),
+            Arc::clone(&handles.input_set_registry),
+            Arc::clone(&handles.sub_circuit_registry),
+        );
     }
 
     fn import_sub_circuit_to_registry(

@@ -436,6 +436,7 @@ where
             &input_plaintext,
             gate_id,
             lut_id,
+            None,
         );
         output_vector_bytes.push(Arc::<[u8]>::from(slot_output.vector.into_compact_bytes()));
         output_plaintext_bytes.push(Arc::<[u8]>::from(

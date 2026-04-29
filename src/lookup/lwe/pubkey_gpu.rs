@@ -4,8 +4,8 @@ use crate::{
     bgg::public_key::BggPublicKey,
     element::PolyElem,
     lookup::lwe::{
-        column_chunk_bounds, column_chunk_id_prefix, derive_k_low_chunk, k_high_chunk_count,
-        k_high_row_checkpoint_prefix,
+        column_chunk_bounds, column_chunk_id_prefix, derive_k_low_chunk_for_slot,
+        k_high_chunk_count, k_high_row_checkpoint_prefix_for_slot,
     },
     poly::{Poly, PolyParams, dcrt::gpu::detected_gpu_device_ids},
     sampler::trapdoor::GpuPreimageRequest,
@@ -61,6 +61,7 @@ struct GpuLweChunkTask<P: Poly> {
     gate_id: GateId,
     lut_id: usize,
     lut_entry_idx: usize,
+    slot_idx: Option<usize>,
     x_k_usize: usize,
     chunk_idx: usize,
     input_pubkey_bytes: Arc<[u8]>,
@@ -205,7 +206,7 @@ where
     let gadget_chunk = shared_dev.gadget.slice_columns(col_start, col_start + col_len);
     let target_chunk = loaded.a_lt.slice_columns(col_start, col_start + col_len) -
         &(gadget_chunk * loaded.y_poly.clone());
-    let k_low_chunk = derive_k_low_chunk::<M, SH>(
+    let k_low_chunk = derive_k_low_chunk_for_slot::<M, SH>(
         &shared_dev.params,
         row_size,
         evaluator.hash_key,
@@ -213,6 +214,7 @@ where
         loaded.task.lut_id,
         loaded.task.lut_entry_idx,
         loaded.task.chunk_idx,
+        loaded.task.slot_idx,
     );
     target_chunk - &(ext_matrix * &k_low_chunk)
 }
@@ -267,10 +269,11 @@ where
         .map(|computed| {
             CompactBytesJob::new(
                 column_chunk_id_prefix(
-                    &k_high_row_checkpoint_prefix(
+                    &k_high_row_checkpoint_prefix_for_slot(
                         computed.task.gate_id,
                         computed.task.lut_id,
                         computed.task.lut_entry_idx,
+                        computed.task.slot_idx,
                     ),
                     computed.task.chunk_idx,
                 ),
@@ -392,7 +395,7 @@ fn store_chunk_tasks_gpu<M, SH, ST>(
 pub(super) fn sample_aux_matrices_gpu<M, SH, ST>(
     evaluator: &LWEBGGPubKeyPltEvaluator<M, SH, ST>,
     params: &<M::P as Poly>::Params,
-    gate_entries: Vec<(GateId, GateState<M>)>,
+    gate_entries: Vec<(LweLookupGateKey, GateState<M>)>,
     lut_entries: HashMap<usize, PublicLut<<BggPublicKey<M> as Evaluable>::P>>,
 ) where
     M: PolyMatrix + Send + Sync + 'static,
@@ -420,7 +423,9 @@ pub(super) fn sample_aux_matrices_gpu<M, SH, ST>(
 
     let task_builds = gate_entries
         .into_par_iter()
-        .map(|(gate_id, gate_state)| {
+        .map(|(gate_key, gate_state)| {
+            let gate_id = gate_key.gate_id();
+            let slot_idx = gate_key.slot_idx_option();
             let plt = lut_entries
                 .get(&gate_state.lut_id)
                 .unwrap_or_else(|| panic!("missing LUT state for lut_id {}", gate_state.lut_id));
@@ -442,6 +447,7 @@ pub(super) fn sample_aux_matrices_gpu<M, SH, ST>(
                         row_size,
                         params.modulus_digits(),
                         lut_entry_idx,
+                        slot_idx,
                     ) {
                         return (Vec::new(), 1usize);
                     }
@@ -451,6 +457,7 @@ pub(super) fn sample_aux_matrices_gpu<M, SH, ST>(
                             gate_id,
                             lut_id: gate_state.lut_id,
                             lut_entry_idx,
+                            slot_idx,
                             x_k_usize,
                             chunk_idx,
                             input_pubkey_bytes: Arc::clone(&input_pubkey_bytes),
@@ -559,6 +566,7 @@ where
                 gate_id: GateId(0),
                 lut_id: 0,
                 lut_entry_idx: 0,
+                slot_idx: None,
                 x_k_usize: 0,
                 chunk_idx: 0,
                 input_pubkey_bytes: Arc::clone(&input_pubkey_bytes),
@@ -634,6 +642,7 @@ where
                     row_size,
                     params.modulus_digits(),
                     lut_entry_idx,
+                    None,
                 ) {
                     return (Vec::new(), 1usize);
                 }
@@ -643,6 +652,7 @@ where
                         gate_id,
                         lut_id,
                         lut_entry_idx,
+                        slot_idx: None,
                         x_k_usize,
                         chunk_idx,
                         input_pubkey_bytes: Arc::clone(&input_pubkey_bytes),

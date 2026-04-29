@@ -55,6 +55,56 @@ impl<P: Poly> SlotTransferEvaluator<PolyVec<P>> for PolyVecSlotTransferEvaluator
                 .collect(),
         )
     }
+
+    fn slot_reduce(
+        &self,
+        params: &P::Params,
+        inputs: &[PolyVec<P>],
+        num_slots: usize,
+        _gate_id: GateId,
+    ) -> PolyVec<P> {
+        assert!(num_slots > 0, "slot_reduce requires num_slots > 0");
+        assert!(!inputs.is_empty(), "slot_reduce requires at least one input");
+        assert!(
+            inputs.len() <= num_slots,
+            "slot_reduce input count {} exceeds num_slots {}",
+            inputs.len(),
+            num_slots
+        );
+        assert!(
+            num_slots <= params.ring_dimension() as usize,
+            "slot count {} exceeds ring dimension {}",
+            num_slots,
+            params.ring_dimension()
+        );
+
+        let output_slots = inputs
+            .par_iter()
+            .enumerate()
+            .map(|(output_slot, input)| {
+                assert!(
+                    input.as_slice().len() >= num_slots,
+                    "slot_reduce input {} has {} slots, expected at least {}",
+                    output_slot,
+                    input.as_slice().len(),
+                    num_slots
+                );
+                let mut terms = (0..num_slots)
+                    .map(|src_slot| {
+                        let mut scalar = vec![0u32; params.ring_dimension() as usize];
+                        scalar[src_slot] = 1;
+                        input.as_slice()[src_slot].small_scalar_mul(params, &scalar)
+                    })
+                    .collect::<Vec<_>>();
+                let mut reduced = terms.drain(..1).next().expect("slot_reduce needs a term");
+                for term in terms {
+                    reduced = reduced + &term;
+                }
+                reduced
+            })
+            .collect::<Vec<_>>();
+        PolyVec::new(output_slots)
+    }
 }
 
 #[cfg(test)]
@@ -188,5 +238,42 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn test_slot_reduce_poly_vec_packs_reduced_inputs_by_output_slot() {
+        let params = DCRTPolyParams::new(8, 2, 17, 1);
+        let input_0 = PolyVec::new(vec![
+            DCRTPoly::from_usize_to_constant(&params, 2),
+            DCRTPoly::from_usize_to_constant(&params, 3),
+            DCRTPoly::from_usize_to_constant(&params, 5),
+        ]);
+        let input_1 = PolyVec::new(vec![
+            DCRTPoly::from_usize_to_constant(&params, 7),
+            DCRTPoly::from_usize_to_constant(&params, 11),
+            DCRTPoly::from_usize_to_constant(&params, 13),
+        ]);
+        let one = PolyVec::new(vec![DCRTPoly::const_one(&params); 3]);
+
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let inputs = circuit.input(2).to_vec();
+        let reduced = circuit.slot_reduce_gate(&[inputs[0], inputs[1]], 3);
+        circuit.output(vec![reduced]);
+
+        let slot_transfer_evaluator = PolyVecSlotTransferEvaluator::new();
+        let result = circuit.eval(
+            &params,
+            one,
+            vec![input_0, input_1],
+            None::<&PolyVecPltEvaluator>,
+            Some(&slot_transfer_evaluator),
+            None,
+        );
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].as_slice().len(), 2);
+        assert_eq!(result[0].as_slice()[0], DCRTPoly::from_u32s(&params, &[2, 3, 5]));
+        assert_eq!(result[0].as_slice()[1], DCRTPoly::from_u32s(&params, &[7, 11, 13]));
+        assert_eq!(circuit.count_gates_by_type_vec().get(&PolyGateKind::SlotReduce), Some(&1));
     }
 }

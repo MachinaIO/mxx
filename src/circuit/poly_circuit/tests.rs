@@ -1,7 +1,8 @@
 use super::*;
 use crate::{
+    circuit::PolyVec,
     element::PolyElem,
-    lookup::{PltEvaluator, poly::PolyPltEvaluator},
+    lookup::{PltEvaluator, poly::PolyPltEvaluator, poly_vec::PolyVecPltEvaluator},
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
@@ -9,6 +10,7 @@ use crate::{
     },
     rlwe_enc::rlwe_encrypt,
     sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
+    slot_transfer::PolyVecSlotTransferEvaluator,
     utils::{create_bit_random_poly, create_random_poly},
 };
 use num_bigint::BigUint;
@@ -1153,6 +1155,41 @@ fn test_non_free_depth_counts_slot_transfer_as_non_free() {
     circuit.output(vec![transferred]);
 
     assert_eq!(circuit.non_free_depth_contributions().get(&PolyGateKind::SlotTransfer), Some(&1));
+}
+
+#[test]
+fn test_deep_scoped_slot_transfer_gate_ids_do_not_overflow() {
+    let params = DCRTPolyParams::new(2, 1, 10, 1);
+
+    let mut leaf = PolyCircuit::<DCRTPoly>::new();
+    let leaf_input = leaf.input(1).as_single_wire();
+    let transferred = leaf.slot_transfer_gate(leaf_input, &[(0, None)]).as_single_wire();
+    leaf.output([transferred]);
+
+    let mut nested = leaf;
+    for _ in 0..140 {
+        let mut parent = PolyCircuit::<DCRTPoly>::new();
+        let parent_input = parent.input(1).as_single_wire();
+        let nested_id = parent.register_sub_circuit(nested);
+        let nested_output = parent.call_sub_circuit(nested_id, &[parent_input])[0];
+        parent.output([nested_output]);
+        nested = parent;
+    }
+
+    let slot_transfer_evaluator = PolyVecSlotTransferEvaluator::new();
+    let one = PolyVec::new(vec![DCRTPoly::const_one(&params)]);
+    let input = PolyVec::new(vec![DCRTPoly::from_u32s(&params, &[7])]);
+    let outputs = nested.eval::<PolyVec<DCRTPoly>, PolyVecPltEvaluator>(
+        &params,
+        one,
+        vec![input],
+        None,
+        Some(&slot_transfer_evaluator),
+        Some(1),
+    );
+
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].as_slice(), &[DCRTPoly::from_u32s(&params, &[7])]);
 }
 
 #[test]

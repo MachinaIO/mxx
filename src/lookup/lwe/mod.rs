@@ -1,6 +1,7 @@
 mod encoding;
 #[cfg(all(test, feature = "gpu"))]
 mod gpu_tests;
+mod naive_vec;
 mod poly_encoding;
 mod pubkey;
 mod utils;
@@ -12,13 +13,21 @@ pub(crate) use encoding::public_lookup_gpu_device_ids;
 #[cfg(all(test, feature = "gpu"))]
 #[allow(unused_imports)]
 pub(crate) use encoding::public_lookup_round_robin_device_slot;
+pub use naive_vec::{NaiveLWEBGGEncodingVecPltEvaluator, NaiveLWEBGGPublicKeyVecPltEvaluator};
 pub use poly_encoding::LWEBGGPolyEncodingPltEvaluator;
 pub use pubkey::LWEBGGPubKeyPltEvaluator;
+#[cfg(not(feature = "gpu"))]
+pub(crate) use utils::derive_k_low_chunk;
 pub(crate) use utils::{
     column_chunk_bounds, column_chunk_count, column_chunk_id_prefix, derive_a_lt_matrix,
-    derive_k_low, derive_k_low_chunk, k_high_checkpoint_prefix, k_high_chunk_count,
-    k_high_row_checkpoint_prefix, read_k_high_chunk, read_k_high_row,
+    derive_a_lt_matrix_for_slot, derive_k_low_chunk_for_slot, derive_k_low_for_slot,
+    k_high_checkpoint_prefix_for_slot, k_high_chunk_count, k_high_row_checkpoint_prefix_for_slot,
+    read_k_high_chunk_for_slot, read_k_high_row_for_slot,
 };
+#[cfg(test)]
+pub(crate) use utils::{derive_k_low, read_k_high_row};
+#[cfg(feature = "gpu")]
+pub(crate) use utils::{derive_k_low_chunk, read_k_high_chunk};
 
 #[cfg(test)]
 mod tests {

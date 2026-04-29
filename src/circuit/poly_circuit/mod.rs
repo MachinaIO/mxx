@@ -192,6 +192,7 @@ enum LoadedGateInputs<E: Evaluable> {
     SkipExisting,
     Unary(E),
     Binary(E, E),
+    Many(Vec<E>),
 }
 
 #[cfg(feature = "gpu")]
@@ -412,6 +413,20 @@ pub(crate) struct GroupedCallExecutionLayer {
 pub(crate) struct GroupedExecutionPlan {
     pub(crate) layers: Vec<GroupedCallExecutionLayer>,
     pub(crate) reachable_input_gate_ids: Vec<GateId>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PolyCircuitRegistryHandles<P: Poly> {
+    pub(crate) lookup_registry: Arc<LookupRegistry<P>>,
+    pub(crate) binding_registry: Arc<BindingRegistry>,
+    pub(crate) input_set_registry: Arc<InputSetRegistry>,
+    pub(crate) sub_circuit_registry: Arc<SubCircuitRegistry<P>>,
+}
+
+impl<P: Poly> std::fmt::Debug for PolyCircuitRegistryHandles<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PolyCircuitRegistryHandles").finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone)]

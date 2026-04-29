@@ -19,6 +19,7 @@ pub mod gadgets;
 pub mod input_injector;
 pub mod lookup;
 pub mod matrix;
+pub mod noise_refresh;
 pub(crate) mod openfhe_guard;
 pub mod poly;
 pub mod rlwe_enc;

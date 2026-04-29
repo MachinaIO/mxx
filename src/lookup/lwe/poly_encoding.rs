@@ -190,6 +190,7 @@ where
                         &x,
                         gate_id,
                         lut_id,
+                        None,
                     );
                     (
                         Arc::<[u8]>::from(slot_output.vector.into_compact_bytes()),

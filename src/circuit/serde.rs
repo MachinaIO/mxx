@@ -18,6 +18,7 @@ pub enum SerializablePolyGateType {
     SmallScalarMul { scalar: GateParamSource<Vec<u32>> },
     LargeScalarMul { scalar: GateParamSource<Vec<BigUint>> },
     SlotTransfer { src_slots: GateParamSource<SlotTransferSpec> },
+    SlotReduce { num_slots: usize, input_count: usize },
     Add,
     Sub,
     Mul,
@@ -34,6 +35,7 @@ impl SerializablePolyGateType {
             SerializablePolyGateType::LargeScalarMul { .. } |
             SerializablePolyGateType::SlotTransfer { .. } |
             SerializablePolyGateType::PubLut { .. } => 1,
+            SerializablePolyGateType::SlotReduce { input_count, .. } => *input_count,
             SerializablePolyGateType::SubCircuitOutput { num_inputs, .. } |
             SerializablePolyGateType::SummedSubCircuitOutput { num_inputs, .. } => *num_inputs,
             SerializablePolyGateType::Add |
@@ -213,6 +215,9 @@ impl SerializablePolyCircuit {
                             PolyGateType::SlotTransfer { src_slots } => {
                                 SerializablePolyGateType::SlotTransfer { src_slots }
                             }
+                            PolyGateType::SlotReduce { num_slots, input_count } => {
+                                SerializablePolyGateType::SlotReduce { num_slots, input_count }
+                            }
                             PolyGateType::Add => SerializablePolyGateType::Add,
                             PolyGateType::Sub => SerializablePolyGateType::Sub,
                             PolyGateType::Mul => SerializablePolyGateType::Mul,
@@ -345,6 +350,10 @@ impl SerializablePolyCircuit {
                                     SerializablePolyGateType::SlotTransfer { src_slots } => {
                                         PolyGateType::SlotTransfer { src_slots }
                                     }
+                                    SerializablePolyGateType::SlotReduce {
+                                        num_slots,
+                                        input_count,
+                                    } => PolyGateType::SlotReduce { num_slots, input_count },
                                     SerializablePolyGateType::Add => PolyGateType::Add,
                                     SerializablePolyGateType::Sub => PolyGateType::Sub,
                                     SerializablePolyGateType::Mul => PolyGateType::Mul,

@@ -3,7 +3,10 @@ use crate::{
     bgg::{encoding::BggEncoding, public_key::BggPublicKey},
     lookup::{
         PublicLut,
-        lwe::{derive_k_low_chunk, k_high_chunk_count, read_k_high_chunk},
+        lwe::{
+            derive_a_lt_matrix_for_slot, derive_k_low_chunk_for_slot, k_high_chunk_count,
+            read_k_high_chunk_for_slot,
+        },
     },
     poly::{Poly, PolyParams, dcrt::gpu::detected_gpu_device_ids},
 };
@@ -106,6 +109,7 @@ fn load_wave<M>(
     lut_id: usize,
     row_size: usize,
     lut_entry_idx: usize,
+    slot_idx: Option<usize>,
 ) -> Vec<LoadedLweContributionTask<M>>
 where
     M: PolyMatrix + Send + Sync + 'static,
@@ -118,7 +122,7 @@ where
         .into_par_iter()
         .map(|(device_slot, task)| {
             let rhs_chunk = match task.family {
-                ContributionFamily::KHigh => Some(read_k_high_chunk::<M>(
+                ContributionFamily::KHigh => Some(read_k_high_chunk_for_slot::<M>(
                     &shared[device_slot].params,
                     dir,
                     gate_id,
@@ -126,6 +130,7 @@ where
                     row_size,
                     lut_entry_idx,
                     task.chunk_idx,
+                    slot_idx,
                 )),
                 ContributionFamily::KLow => None,
             };
@@ -143,6 +148,7 @@ fn compute_wave<M, SH>(
     lut_id: usize,
     row_size: usize,
     lut_entry_idx: usize,
+    slot_idx: Option<usize>,
 ) -> Vec<ComputedLweContributionTask>
 where
     M: PolyMatrix + Send + Sync + 'static,
@@ -157,7 +163,7 @@ where
                 ContributionFamily::KHigh => {
                     loaded.rhs_chunk.expect("k_high contribution must load a checkpoint rhs chunk")
                 }
-                ContributionFamily::KLow => derive_k_low_chunk::<M, SH>(
+                ContributionFamily::KLow => derive_k_low_chunk_for_slot::<M, SH>(
                     &shared_dev.params,
                     row_size,
                     hash_key,
@@ -165,6 +171,7 @@ where
                     lut_id,
                     lut_entry_idx,
                     loaded.task.chunk_idx,
+                    slot_idx,
                 ),
             };
             let lhs = match loaded.task.family {
@@ -226,6 +233,7 @@ pub(crate) fn public_lookup_slot_gpu<M, SH>(
     input_plaintext: &M::P,
     gate_id: GateId,
     lut_id: usize,
+    slot_idx: Option<usize>,
 ) -> BggEncoding<M>
 where
     M: PolyMatrix + Send + Sync + 'static,
@@ -240,7 +248,7 @@ where
         .unwrap_or_else(|| panic!("{:?} is not exist in public lookup f", z_u64));
     let lut_entry_idx = usize::try_from(k).expect("LUT row index must fit in usize");
     let y_k_poly = M::P::from_elem_to_constant(params, &y_k);
-    let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, hash_key, gate_id);
+    let a_lt = derive_a_lt_matrix_for_slot::<M, SH>(params, row_size, hash_key, gate_id, slot_idx);
     let pubkey = BggPublicKey::new(a_lt, true);
 
     let shared = prepare_shared_by_device::<M>(params, c_b_compact_bytes);
@@ -278,6 +286,7 @@ where
         lut_id,
         row_size,
         lut_entry_idx,
+        slot_idx,
     );
     cursor += current_loaded.len();
     let mut completed_task_count = 0usize;
@@ -299,6 +308,7 @@ where
                         lut_id,
                         row_size,
                         lut_entry_idx,
+                        slot_idx,
                     )
                 },
                 || {
@@ -310,6 +320,7 @@ where
                         lut_id,
                         row_size,
                         lut_entry_idx,
+                        slot_idx,
                     )
                 },
             );
@@ -326,6 +337,7 @@ where
                     lut_id,
                     row_size,
                     lut_entry_idx,
+                    slot_idx,
                 ),
                 Vec::new(),
             )

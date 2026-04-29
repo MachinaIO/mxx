@@ -29,6 +29,12 @@ impl<P: Poly> PolyCircuit<P> {
         }
     }
 
+    pub(crate) fn new_with_registry_handles(handles: &PolyCircuitRegistryHandles<P>) -> Self {
+        let mut circuit = Self::new();
+        circuit.inherit_registry_handles(handles);
+        circuit
+    }
+
     /// Get number of inputs
     pub fn num_input(&self) -> usize {
         self.num_input
@@ -108,6 +114,19 @@ impl<P: Poly> PolyCircuit<P> {
         for output in outputs.into_iter() {
             self.output_ids.extend(output.into().gate_ids());
         }
+    }
+
+    pub fn restrict_outputs_to_indices(&mut self, indices: &[usize]) {
+        let restricted = indices
+            .iter()
+            .map(|&idx| {
+                *self
+                    .output_ids
+                    .get(idx)
+                    .unwrap_or_else(|| panic!("output index {idx} is out of range"))
+            })
+            .collect::<Vec<_>>();
+        self.output_ids = restricted;
     }
 
     pub fn const_zero_gate(&mut self) -> BatchedWire {
@@ -393,6 +412,36 @@ impl<P: Poly> PolyCircuit<P> {
         BatchedWire::single(self.new_gate_generic(
             vec![input.as_single_wire()],
             PolyGateType::SlotTransfer { src_slots: GateParamSource::Param(param_id) },
+        ))
+    }
+
+    pub fn slot_reduce_gate<I: Into<BatchedWire>>(
+        &mut self,
+        inputs: &[I],
+        num_slots: usize,
+    ) -> BatchedWire
+    where
+        I: Copy,
+    {
+        assert!(num_slots > 0, "slot_reduce_gate requires num_slots > 0");
+        assert!(!inputs.is_empty(), "slot_reduce_gate requires at least one input");
+        assert!(
+            inputs.len() <= num_slots,
+            "slot_reduce_gate input count {} exceeds num_slots {}",
+            inputs.len(),
+            num_slots
+        );
+        let input_gates = inputs
+            .iter()
+            .map(|input| {
+                let input = (*input).into();
+                debug_assert!(input.is_single_wire());
+                input.as_single_wire()
+            })
+            .collect::<Vec<_>>();
+        BatchedWire::single(self.new_gate_generic(
+            input_gates,
+            PolyGateType::SlotReduce { num_slots, input_count: inputs.len() },
         ))
     }
 

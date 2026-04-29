@@ -257,6 +257,41 @@ impl GoldreichGraph {
         Self { input_size, edges, graph_seed: Some(graph_seed), generation }
     }
 
+    /// Generates only one output interval of a conceptual full Goldreich graph.
+    ///
+    /// The selected range is domain-separated by `(conceptual_output_size, range_start,
+    /// range_len)`, then generated with exactly `range_len` public edges.  This keeps the cost and
+    /// capacity requirements proportional to the selected interval while preserving the important
+    /// indexing invariant: two ranges with the same width but different starts use different public
+    /// graph edges.
+    ///
+    /// TODO: This range-local generation does not verify collisions against every edge in the
+    /// conceptual full graph.  Doing so would require generating the full prefix or maintaining a
+    /// shared global duplicate-rejection state, which is currently too expensive for the large
+    /// noise-refresh mask/error offsets.  The range seed still domain-separates different output
+    /// intervals, but it does not provide the same global no-collision guarantee as full graph
+    /// generation.
+    pub fn generate_range(
+        input_size: usize,
+        conceptual_output_size: usize,
+        range_start: usize,
+        range_len: usize,
+        graph_seed: [u8; 32],
+        generation: GoldreichGraphGeneration,
+    ) -> Self {
+        validate_graph_dimensions(input_size, conceptual_output_size);
+        assert!(range_len > 0, "Goldreich graph output range length must be positive");
+        let range_end =
+            range_start.checked_add(range_len).expect("Goldreich graph output range end overflow");
+        assert!(
+            range_end <= conceptual_output_size,
+            "Goldreich graph output range [{range_start}, {range_end}) exceeds conceptual output size {conceptual_output_size}"
+        );
+        let range_seed =
+            derive_range_graph_seed(graph_seed, conceptual_output_size, range_start, range_len);
+        Self::generate(input_size, range_len, range_seed, generation)
+    }
+
     /// Validates an explicit public Goldreich graph against the same invariants as [`generate`].
     ///
     /// This is useful for tests or for callers that want to pin a hand-written public graph while
@@ -377,6 +412,51 @@ where
         )
     }
 
+    pub fn setup_range(
+        circuit: &mut PolyCircuit<P>,
+        ring_gsw: Arc<C::Context>,
+        input_size: usize,
+        conceptual_output_size: usize,
+        range_start: usize,
+        range_len: usize,
+        graph_seed: [u8; 32],
+    ) -> Self {
+        Self::setup_range_with_options(
+            circuit,
+            ring_gsw,
+            input_size,
+            conceptual_output_size,
+            range_start,
+            range_len,
+            graph_seed,
+            GoldreichGraphGeneration::default(),
+        )
+    }
+
+    pub fn setup_range_with_options(
+        circuit: &mut PolyCircuit<P>,
+        ring_gsw: Arc<C::Context>,
+        input_size: usize,
+        conceptual_output_size: usize,
+        range_start: usize,
+        range_len: usize,
+        graph_seed: [u8; 32],
+        generation: GoldreichGraphGeneration,
+    ) -> Self {
+        Self::from_public_graph(
+            circuit,
+            ring_gsw,
+            GoldreichGraph::generate_range(
+                input_size,
+                conceptual_output_size,
+                range_start,
+                range_len,
+                graph_seed,
+                generation,
+            ),
+        )
+    }
+
     /// Builds the PRG from an already validated public graph instead of generating one from a
     /// `graph_seed`.
     pub fn from_public_graph(
@@ -466,21 +546,21 @@ where
 /// `2n` distinct Goldreich graphs from a public seed, registers one reusable CBD coefficient
 /// sub-circuit for that `n`, and then evaluates one centered-binomial-style error ciphertext per
 /// output position.
-pub struct GoldreichFheCbdError<P: Poly, C: BooleanCiphertext<P> = NestedRnsRingGswCiphertext<P>> {
+pub struct GoldreichFheCbdPrg<P: Poly, C: BooleanCiphertext<P> = NestedRnsRingGswCiphertext<P>> {
     pub uniform_prg: GoldreichFhePrg<P, C>,
     pub cbd_n: usize,
     uniform_graphs: Vec<GoldreichGraph>,
-    cbd_error_sub_circuit_id: usize,
+    cbd_prf_sub_circuit_id: usize,
     cbd_output_templates: Vec<C>,
 }
 
-impl<P: Poly, C: BooleanCiphertext<P>> GoldreichFheCbdError<P, C> {
+impl<P: Poly, C: BooleanCiphertext<P>> GoldreichFheCbdPrg<P, C> {
     pub fn uniform_graphs(&self) -> &[GoldreichGraph] {
         &self.uniform_graphs
     }
 }
 
-impl<P: Poly + 'static, C> GoldreichFheCbdError<P, C>
+impl<P: Poly + 'static, C> GoldreichFheCbdPrg<P, C>
 where
     C: BooleanCiphertext<P>,
 {
@@ -528,19 +608,79 @@ where
             generation,
             2 * cbd_n,
         );
-        let (cbd_error_sub_circuit, cbd_output_templates) =
-            goldreich_cbd_error_sub_circuit(&uniform_prg, &uniform_graphs, cbd_n, circuit);
-        let cbd_error_sub_circuit_id = circuit.register_sub_circuit(cbd_error_sub_circuit);
-        Self { uniform_prg, cbd_n, uniform_graphs, cbd_error_sub_circuit_id, cbd_output_templates }
+        let (cbd_prf_sub_circuit, cbd_output_templates) =
+            goldreich_cbd_prf_sub_circuit(&uniform_prg, &uniform_graphs, cbd_n, circuit);
+        let cbd_prf_sub_circuit_id = circuit.register_sub_circuit(cbd_prf_sub_circuit);
+        Self { uniform_prg, cbd_n, uniform_graphs, cbd_prf_sub_circuit_id, cbd_output_templates }
     }
 
-    pub fn evaluate_cbd_error(&self, input_bits: &[C], circuit: &mut PolyCircuit<P>) -> Vec<C> {
+    pub fn setup_range(
+        circuit: &mut PolyCircuit<P>,
+        ring_gsw: Arc<C::Context>,
+        input_size: usize,
+        conceptual_output_size: usize,
+        range_start: usize,
+        range_len: usize,
+        graph_seed: [u8; 32],
+        cbd_n: usize,
+    ) -> Self {
+        Self::setup_range_with_options(
+            circuit,
+            ring_gsw,
+            input_size,
+            conceptual_output_size,
+            range_start,
+            range_len,
+            graph_seed,
+            cbd_n,
+            GoldreichGraphGeneration::default(),
+        )
+    }
+
+    pub fn setup_range_with_options(
+        circuit: &mut PolyCircuit<P>,
+        ring_gsw: Arc<C::Context>,
+        input_size: usize,
+        conceptual_output_size: usize,
+        range_start: usize,
+        range_len: usize,
+        graph_seed: [u8; 32],
+        cbd_n: usize,
+        generation: GoldreichGraphGeneration,
+    ) -> Self {
+        assert!(cbd_n > 0, "Goldreich CBD evaluator requires cbd_n > 0");
+        let uniform_prg = GoldreichFhePrg::setup_range_with_options(
+            circuit,
+            ring_gsw,
+            input_size,
+            conceptual_output_size,
+            range_start,
+            range_len,
+            graph_seed,
+            generation,
+        );
+        let uniform_graphs = derive_distinct_goldreich_graph_ranges(
+            input_size,
+            conceptual_output_size,
+            range_start,
+            range_len,
+            graph_seed,
+            generation,
+            2 * cbd_n,
+        );
+        let (cbd_prf_sub_circuit, cbd_output_templates) =
+            goldreich_cbd_prf_sub_circuit(&uniform_prg, &uniform_graphs, cbd_n, circuit);
+        let cbd_prf_sub_circuit_id = circuit.register_sub_circuit(cbd_prf_sub_circuit);
+        Self { uniform_prg, cbd_n, uniform_graphs, cbd_prf_sub_circuit_id, cbd_output_templates }
+    }
+
+    pub fn evaluate_cbd_prf(&self, input_bits: &[C], circuit: &mut PolyCircuit<P>) -> Vec<C> {
         self.uniform_prg.validate_input_bits(input_bits);
         let mut cbd_inputs = Vec::with_capacity(input_bits.len());
         for input_bit in input_bits {
             cbd_inputs.extend(input_bit.sub_circuit_wires());
         }
-        let outputs = circuit.call_sub_circuit(self.cbd_error_sub_circuit_id, &cbd_inputs);
+        let outputs = circuit.call_sub_circuit(self.cbd_prf_sub_circuit_id, &cbd_inputs);
         let mut next_output_start = 0usize;
         self.cbd_output_templates
             .iter()
@@ -562,6 +702,24 @@ where
 fn validate_graph_dimensions(input_size: usize, output_size: usize) {
     assert!(input_size >= 5, "Goldreich graph input_size must be at least 5");
     assert!(output_size > 0, "Goldreich graph output_size must be positive");
+}
+
+fn derive_range_graph_seed(
+    graph_seed: [u8; 32],
+    conceptual_output_size: usize,
+    range_start: usize,
+    range_len: usize,
+) -> [u8; 32] {
+    let mut hasher = Keccak256::new();
+    hasher.update(b"GoldreichGraphRange/v1");
+    hasher.update(graph_seed);
+    hasher.update((conceptual_output_size as u128).to_le_bytes());
+    hasher.update((range_start as u128).to_le_bytes());
+    hasher.update((range_len as u128).to_le_bytes());
+    let digest = hasher.finalize();
+    let mut derived = [0u8; 32];
+    derived.copy_from_slice(digest.as_ref());
+    derived
 }
 
 fn binomial(n: usize, k: usize) -> u128 {
@@ -613,7 +771,7 @@ where
     current_layer.pop().expect("pairwise reduction must leave one term")
 }
 
-fn goldreich_cbd_error_sub_circuit<P, C>(
+fn goldreich_cbd_prf_sub_circuit<P, C>(
     uniform_prg: &GoldreichFhePrg<P, C>,
     uniform_graphs: &[GoldreichGraph],
     cbd_n: usize,
@@ -692,6 +850,36 @@ fn derive_distinct_goldreich_graphs(
         let candidate_seed = derive_graph_seed(graph_seed, counter);
         let candidate =
             GoldreichGraph::generate(input_size, output_size, candidate_seed, generation);
+        counter = counter.wrapping_add(1);
+        if graphs.iter().any(|existing| same_graph_structure(existing, &candidate)) {
+            continue;
+        }
+        graphs.push(candidate);
+    }
+    graphs
+}
+
+fn derive_distinct_goldreich_graph_ranges(
+    input_size: usize,
+    conceptual_output_size: usize,
+    range_start: usize,
+    range_len: usize,
+    graph_seed: [u8; 32],
+    generation: GoldreichGraphGeneration,
+    sample_count: usize,
+) -> Vec<GoldreichGraph> {
+    let mut graphs = Vec::with_capacity(sample_count);
+    let mut counter = 0u64;
+    while graphs.len() < sample_count {
+        let candidate_seed = derive_graph_seed(graph_seed, counter);
+        let candidate = GoldreichGraph::generate_range(
+            input_size,
+            conceptual_output_size,
+            range_start,
+            range_len,
+            candidate_seed,
+            generation,
+        );
         counter = counter.wrapping_add(1);
         if graphs.iter().any(|existing| same_graph_structure(existing, &candidate)) {
             continue;
@@ -910,7 +1098,7 @@ mod tests {
         value.rem_euclid(modulus) as u64
     }
 
-    fn evaluate_plaintext_cbd_error(
+    fn evaluate_plaintext_cbd_prf(
         graphs: &[GoldreichGraph],
         input_bits: &[u64],
         cbd_n: usize,
@@ -966,6 +1154,26 @@ mod tests {
         let lhs = GoldreichGraph::generate(8, 6, graph_seed, options);
         let rhs = GoldreichGraph::generate(8, 6, graph_seed, options);
         assert_eq!(lhs, rhs, "same graph_seed must reproduce the same public graph exactly");
+    }
+
+    #[test]
+    fn test_goldreich_graph_range_depends_on_start_without_generating_full_prefix() {
+        let graph_seed = sample_graph_seed();
+        let options = GoldreichGraphGeneration::default();
+        let first_range =
+            GoldreichGraph::generate_range(10, 1_000_000, 300_000, 4, graph_seed, options);
+        let repeated_first_range =
+            GoldreichGraph::generate_range(10, 1_000_000, 300_000, 4, graph_seed, options);
+        let second_range =
+            GoldreichGraph::generate_range(10, 1_000_000, 700_000, 4, graph_seed, options);
+
+        assert_eq!(first_range, repeated_first_range);
+        assert_eq!(first_range.edges.len(), 4);
+        assert_eq!(second_range.edges.len(), 4);
+        assert_ne!(
+            first_range.edges, second_range.edges,
+            "same-width ranges at different starts must use different Goldreich edges"
+        );
     }
 
     #[test]
@@ -1122,23 +1330,23 @@ mod tests {
     }
 
     #[test]
-    fn test_goldreich_cbd_error_uses_distinct_uniform_graphs() {
+    fn test_goldreich_cbd_prf_uses_distinct_uniform_graphs() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (_params, ring_gsw) = create_test_context(&mut circuit);
-        let cbd_error: GoldreichFheCbdError<DCRTPoly> =
-            GoldreichFheCbdError::setup(&mut circuit, ring_gsw, 5, 3, sample_graph_seed(), 2);
+        let cbd_prf: GoldreichFheCbdPrg<DCRTPoly> =
+            GoldreichFheCbdPrg::setup(&mut circuit, ring_gsw, 5, 3, sample_graph_seed(), 2);
 
         assert_eq!(
-            cbd_error.uniform_graphs().len(),
+            cbd_prf.uniform_graphs().len(),
             4,
             "CBD setup must derive exactly 2 * cbd_n distinct Goldreich graphs"
         );
-        for left in 0..cbd_error.uniform_graphs().len() {
-            for right in left + 1..cbd_error.uniform_graphs().len() {
+        for left in 0..cbd_prf.uniform_graphs().len() {
+            for right in left + 1..cbd_prf.uniform_graphs().len() {
                 assert!(
                     !same_graph_structure(
-                        &cbd_error.uniform_graphs()[left],
-                        &cbd_error.uniform_graphs()[right],
+                        &cbd_prf.uniform_graphs()[left],
+                        &cbd_prf.uniform_graphs()[right],
                     ),
                     "CBD setup must use distinct Goldreich graphs for different sampled bits"
                 );
@@ -1148,11 +1356,11 @@ mod tests {
 
     #[sequential_test::sequential]
     #[test]
-    fn test_goldreich_cbd_error_output_decrypts_to_plaintext_reference() {
+    fn test_goldreich_cbd_prf_output_decrypts_to_plaintext_reference() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, ring_gsw) = create_test_context(&mut circuit);
         let cbd_n = 1usize;
-        let cbd_error: GoldreichFheCbdError<DCRTPoly> = GoldreichFheCbdError::setup(
+        let cbd_prf: GoldreichFheCbdPrg<DCRTPoly> = GoldreichFheCbdPrg::setup(
             &mut circuit,
             ring_gsw.clone(),
             5,
@@ -1160,10 +1368,10 @@ mod tests {
             sample_graph_seed(),
             cbd_n,
         );
-        let encrypted_inputs = (0..cbd_error.uniform_prg.input_size)
+        let encrypted_inputs = (0..cbd_prf.uniform_prg.input_size)
             .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
             .collect::<Vec<_>>();
-        let encrypted_outputs = cbd_error.evaluate_cbd_error(&encrypted_inputs, &mut circuit);
+        let encrypted_outputs = cbd_prf.evaluate_cbd_prf(&encrypted_inputs, &mut circuit);
         let reconstructed_outputs = encrypted_outputs
             .iter()
             .flat_map(|ciphertext| ciphertext.reconstruct(&mut circuit))
@@ -1182,9 +1390,9 @@ mod tests {
             b"goldreich_cbd_ring_gsw_public_key",
             None,
         );
-        let plaintext_inputs = sample_binary_vector(cbd_error.uniform_prg.input_size);
+        let plaintext_inputs = sample_binary_vector(cbd_prf.uniform_prg.input_size);
         let expected_coefficients =
-            evaluate_plaintext_cbd_error(cbd_error.uniform_graphs(), &plaintext_inputs, cbd_n);
+            evaluate_plaintext_cbd_prf(cbd_prf.uniform_graphs(), &plaintext_inputs, cbd_n);
         let native_inputs = plaintext_inputs
             .par_iter()
             .enumerate()
@@ -1220,7 +1428,7 @@ mod tests {
 
         assert_eq!(
             reconstructed_ciphertexts.len(),
-            cbd_error.uniform_prg.output_size,
+            cbd_prf.uniform_prg.output_size,
             "homomorphic Goldreich CBD evaluation must reconstruct one ciphertext per error coefficient"
         );
         reconstructed_ciphertexts

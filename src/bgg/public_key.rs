@@ -138,4 +138,20 @@ impl<M: PolyMatrix> Evaluable for BggPublicKey<M> {
         let matrix = self.matrix.mul_decompose(&scalar_gadget);
         Self { matrix, reveal_plaintext: self.reveal_plaintext }
     }
+
+    fn concat_columns(&self, others: &[Self]) -> Self {
+        let matrix = self.concat_matrix(others);
+        let reveal_plaintext =
+            self.reveal_plaintext && others.iter().all(|key| key.reveal_plaintext);
+        Self { matrix, reveal_plaintext }
+    }
+
+    fn matrix_mul<Rhs>(&self, params: &Self::Params, rhs_matrix: &Rhs) -> Self
+    where
+        Rhs: PolyMatrix<P = Self::P>,
+    {
+        let rhs_matrix = M::from_compact_bytes(params, &rhs_matrix.to_compact_bytes());
+        let matrix = self.matrix.mul_decompose(&rhs_matrix);
+        Self { matrix, reveal_plaintext: self.reveal_plaintext }
+    }
 }

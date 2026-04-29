@@ -1,5 +1,5 @@
 use crate::{
-    circuit::{BatchedWire, PolyCircuit, gate::GateId},
+    circuit::{BatchedWire, PolyCircuit, PolyCircuitRegistryHandles, gate::GateId},
     gadgets::arith::{
         BinaryPlannerResult, DecomposeArithmeticGadget, ModularArithmeticContext,
         ModularArithmeticGadget, ModularArithmeticPlanner,
@@ -132,6 +132,7 @@ pub struct RingGswContext<P: Poly, A: DecomposeArithmeticGadget<P> + ModularArit
     pub(super) sub_entry_cache: DashMap<A::SubPlanKey, usize>,
     pub mul_subcircuit_id: usize,
     pub mul_output_metadata: A::Metadata,
+    pub(crate) circuit_registries: PolyCircuitRegistryHandles<P>,
 }
 
 impl<P: Poly, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>> RingGswContext<P, A> {
@@ -169,6 +170,10 @@ impl<P: Poly, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>> Rin
             ),
             None,
         )
+    }
+
+    pub(crate) fn fresh_circuit(&self) -> PolyCircuit<P> {
+        PolyCircuit::new_with_registry_handles(&self.circuit_registries)
     }
 }
 
@@ -286,6 +291,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             sub_entry_cache: DashMap::new(),
             mul_subcircuit_id,
             mul_output_metadata: A::metadata(&mul_output_template),
+            circuit_registries: circuit.registry_handles(),
         });
         debug!(
             "RingGswContext::from_arith_context completed: width={}, wrapper_prebuild_elapsed_ms={}, total_elapsed_ms={}",
@@ -1369,25 +1375,6 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         [row0, row1]
     }
 
-    fn collapse_slots_to_single_poly(
-        wire: GateId,
-        num_slots: usize,
-        circuit: &mut PolyCircuit<P>,
-    ) -> GateId {
-        let mut collapsed_terms = (0..num_slots)
-            .map(|slot| {
-                let transferred = circuit.slot_transfer_gate(wire, &[(slot as u32, None)]);
-                if slot == 0 { transferred } else { circuit.rotate_gate(transferred, slot as u64) }
-            })
-            .collect::<Vec<_>>();
-        let mut collapsed =
-            collapsed_terms.drain(..1).next().expect("slot-collapsing requires at least one slot");
-        for term in collapsed_terms {
-            collapsed = circuit.add_gate(collapsed, term);
-        }
-        collapsed.as_single_wire()
-    }
-
     fn assert_consistent(&self) {
         let width = self.rows[0].len();
         assert!(width > 0, "RingGswCiphertext width must be positive");
@@ -1453,7 +1440,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
 impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>>
     RingGswCiphertext<P, A>
 {
-    pub fn estimate_decryption_error_norm(&self, error_sigma: f64) -> BigDecimal {
+    pub fn estimate_decryption_error_norm(&self, error_sigma: f64) -> PolyMatrixNorm {
         self.assert_consistent();
         assert!(error_sigma.is_finite(), "error_sigma must be finite");
         assert!(error_sigma >= 0.0, "error_sigma must be non-negative");
@@ -1487,8 +1474,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             bottom_half_randomizer.nrow,
             sigma,
         );
-        let final_error = public_key_error * (bottom_half_randomizer * p_max_matrix);
-        final_error.poly_norm.norm
+        public_key_error * (bottom_half_randomizer * p_max_matrix)
     }
 
     pub fn decrypt<M>(
@@ -1500,22 +1486,46 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
     where
         M: PolyMatrix<P = P>,
     {
-        self.assert_consistent();
+        Self::decrypt_batch::<M>(&[self], wire_secret_key, plaintext_modulus, circuit)
+    }
+
+    pub fn decrypt_batch<M>(
+        ciphertexts: &[&Self],
+        wire_secret_key: GateId,
+        plaintext_modulus: BigUint,
+        circuit: &mut PolyCircuit<P>,
+    ) -> GateId
+    where
+        M: PolyMatrix<P = P>,
+    {
+        assert!(!ciphertexts.is_empty(), "Ring-GSW decrypt_batch requires ciphertexts");
+        let first = ciphertexts[0];
+        first.assert_consistent();
+        assert!(
+            ciphertexts.len() <= first.ctx.num_slots,
+            "Ring-GSW decrypt_batch input count {} exceeds num_slots {}",
+            ciphertexts.len(),
+            first.ctx.num_slots
+        );
         assert!(!plaintext_modulus.is_zero(), "plaintext_modulus must be positive");
-        let gadget_len = self.gadget_len();
+        ciphertexts.par_iter().copied().skip(1).for_each(|ciphertext| {
+            ciphertext.assert_compatible(first);
+        });
+
+        let gadget_len = first.gadget_len();
         assert_eq!(
-            self.width(),
+            first.width(),
             2 * gadget_len,
             "RingGswCiphertext width {} must equal 2 * gadget_len {}",
-            self.width(),
+            first.width(),
             gadget_len
         );
 
         let gadget_constants = A::gadget_matrix::<M>(
-            &self.ctx.params,
-            self.ctx.arith_ctx.as_ref(),
-            Some(self.ctx.active_levels),
-            Some(self.ctx.level_offset),
+            &first.ctx.params,
+            first.ctx.arith_ctx.as_ref(),
+            Some(first.ctx.active_levels),
+            Some(first.ctx.level_offset),
         )
         .get_row(0)
         .into_par_iter()
@@ -1529,18 +1539,18 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             gadget_len
         );
 
-        let active_q_moduli = self.rows[0][0].active_q_moduli();
+        let active_q_moduli = first.rows[0][0].active_q_moduli();
         let scaled = active_q_moduli
             .iter()
             .fold(BigUint::from(1u64), |acc, &q_i| acc * BigUint::from(q_i)) /
             &plaintext_modulus;
-        let scaled_poly = P::from_biguint_to_constant(&self.ctx.params, scaled);
+        let scaled_poly = P::from_biguint_to_constant(&first.ctx.params, scaled);
         let scaled_g_inverse_matrix = A::gadget_decomposed::<M>(
-            &self.ctx.params,
-            self.ctx.arith_ctx.as_ref(),
-            &M::from_poly_vec_column(&self.ctx.params, vec![scaled_poly]),
-            Some(self.ctx.active_levels),
-            Some(self.ctx.level_offset),
+            &first.ctx.params,
+            first.ctx.arith_ctx.as_ref(),
+            &M::from_poly_vec_column(&first.ctx.params, vec![scaled_poly]),
+            Some(first.ctx.active_levels),
+            Some(first.ctx.level_offset),
         );
         let (scaled_rows, scaled_cols) = scaled_g_inverse_matrix.size();
         assert_eq!(
@@ -1561,20 +1571,40 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let top_entry =
-            self.decrypt_linear_combination_row(&self.rows[0], &scaled_g_inverse, circuit);
-        let bottom_entry =
-            self.decrypt_linear_combination_row(&self.rows[1], &scaled_g_inverse, circuit);
-        let prepared_top = top_entry.prepare_for_reconstruct(circuit);
-        let p_depth = self.ctx.arith_ctx.decomposition_len().saturating_sub(1);
+        let batch_secret_key = wire_secret_key;
+
+        let mut prepared_tops = Vec::with_capacity(ciphertexts.len());
+        let mut bottom_entries = Vec::with_capacity(ciphertexts.len());
+        for ciphertext in ciphertexts {
+            let top_entry = ciphertext.decrypt_linear_combination_row(
+                &ciphertext.rows[0],
+                &scaled_g_inverse,
+                circuit,
+            );
+            let bottom_entry = ciphertext.decrypt_linear_combination_row(
+                &ciphertext.rows[1],
+                &scaled_g_inverse,
+                circuit,
+            );
+            prepared_tops.push(top_entry.prepare_for_reconstruct(circuit));
+            bottom_entries.push(bottom_entry);
+        }
+
+        let p_depth = first.ctx.arith_ctx.decomposition_len().saturating_sub(1);
         let mut weighted_top_terms = Vec::with_capacity(gadget_len);
-        for q_idx in 0..prepared_top.active_q_moduli().len() {
+        for q_idx in 0..prepared_tops[0].active_q_moduli().len() {
             let level_base = q_idx * (p_depth + 1);
-            let (ys, w) = prepared_top.decomposition_terms_for_level(q_idx, circuit);
+            let decomposed_by_ciphertext = prepared_tops
+                .iter()
+                .map(|prepared_top| prepared_top.decomposition_terms_for_level(q_idx, circuit))
+                .collect::<Vec<_>>();
             for p_idx in 0..p_depth {
-                let collapsed =
-                    Self::collapse_slots_to_single_poly(ys[p_idx], self.ctx.num_slots, circuit);
-                let top_times_secret = circuit.mul_gate(collapsed, wire_secret_key);
+                let inputs =
+                    decomposed_by_ciphertext.iter().map(|(ys, _)| ys[p_idx]).collect::<Vec<_>>();
+                let collapsed = circuit
+                    .slot_reduce_gate(inputs.as_slice(), first.ctx.num_slots)
+                    .as_single_wire();
+                let top_times_secret = circuit.mul_gate(collapsed, batch_secret_key);
                 let gadget_scalar = &gadget_constants[level_base + p_idx];
                 if gadget_scalar.is_zero() {
                     continue;
@@ -1583,8 +1613,10 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                     circuit.large_scalar_mul(top_times_secret, std::slice::from_ref(gadget_scalar)),
                 );
             }
-            let collapsed_w = Self::collapse_slots_to_single_poly(w, self.ctx.num_slots, circuit);
-            let w_times_secret = circuit.mul_gate(collapsed_w, wire_secret_key);
+            let inputs = decomposed_by_ciphertext.iter().map(|(_, w)| *w).collect::<Vec<_>>();
+            let collapsed_w =
+                circuit.slot_reduce_gate(inputs.as_slice(), first.ctx.num_slots).as_single_wire();
+            let w_times_secret = circuit.mul_gate(collapsed_w, batch_secret_key);
             let gadget_scalar = &gadget_constants[level_base + p_depth];
             if gadget_scalar.is_zero() {
                 continue;
@@ -1593,15 +1625,16 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 circuit.large_scalar_mul(w_times_secret, std::slice::from_ref(gadget_scalar)),
             );
         }
-        let mut sum = circuit.large_scalar_mul(wire_secret_key, &[BigUint::ZERO]);
+        let mut sum = circuit.large_scalar_mul(batch_secret_key, &[BigUint::ZERO]);
         for term in weighted_top_terms {
             sum = circuit.add_gate(sum, term);
         }
-        let reconstructed_bottom = Self::collapse_slots_to_single_poly(
-            bottom_entry.reconstruct(circuit),
-            self.ctx.num_slots,
-            circuit,
-        );
+        let bottom_inputs = bottom_entries
+            .into_iter()
+            .map(|bottom_entry| bottom_entry.reconstruct(circuit))
+            .collect::<Vec<_>>();
+        let reconstructed_bottom =
+            circuit.slot_reduce_gate(bottom_inputs.as_slice(), first.ctx.num_slots);
         circuit.add_gate(sum, reconstructed_bottom).as_single_wire()
     }
 
@@ -1641,6 +1674,7 @@ mod tests {
     use super::*;
     use crate::{
         __PAIR, __TestState,
+        bgg::public_key::BggPublicKey,
         circuit::{PolyCircuit, evaluable::PolyVec},
         gadgets::{
             arith::{
@@ -1652,15 +1686,20 @@ mod tests {
                 decrypt_ciphertext, encrypt_plaintext_bit, sample_public_key, sample_secret_key,
             },
         },
-        lookup::{poly::PolyPltEvaluator, poly_vec::PolyVecPltEvaluator},
+        lookup::{PltEvaluator, PublicLut, poly::PolyPltEvaluator, poly_vec::PolyVecPltEvaluator},
         matrix::dcrt_poly::DCRTPolyMatrix,
         poly::{
             Poly, PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
-        slot_transfer::PolyVecSlotTransferEvaluator,
+        sampler::{
+            DistType, PolyHashSampler, hash::DCRTPolyHashSampler,
+            trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
+        },
+        slot_transfer::{PolyVecSlotTransferEvaluator, bgg_pubkey::BggPublicKeySTEvaluator},
     };
     use bigdecimal::BigDecimal;
+    use keccak_asm::Keccak256;
     use num_bigint::BigUint;
     use num_traits::ToPrimitive;
     use rand::Rng;
@@ -1676,9 +1715,27 @@ mod tests {
     const MONT_LIMB_BIT_SIZE: usize = 1;
     const MONT_CRT_BITS: usize = 10;
     const MONT_NUM_SLOTS: usize = 2;
+    const BGG_SIGMA: f64 = 4.578;
 
     type MontgomeryRingGswContext = super::RingGswContext<DCRTPoly, MontgomeryPoly<DCRTPoly>>;
     type MontgomeryRingGswCiphertext = super::RingGswCiphertext<DCRTPoly, MontgomeryPoly<DCRTPoly>>;
+
+    struct DummyBggPublicKeyPltEvaluator;
+
+    impl PltEvaluator<BggPublicKey<DCRTPolyMatrix>> for DummyBggPublicKeyPltEvaluator {
+        fn public_lookup(
+            &self,
+            _params: &DCRTPolyParams,
+            _plt: &PublicLut<DCRTPoly>,
+            _one: &BggPublicKey<DCRTPolyMatrix>,
+            input: &BggPublicKey<DCRTPolyMatrix>,
+            _gate_id: crate::circuit::gate::GateId,
+            _lut_id: usize,
+        ) -> BggPublicKey<DCRTPolyMatrix> {
+            input.clone()
+        }
+    }
+
     fn create_test_context_with(
         circuit: &mut PolyCircuit<DCRTPoly>,
         ring_dim: u32,
@@ -1767,6 +1824,44 @@ mod tests {
         let mut key = [0u8; 32];
         rng.fill(&mut key);
         key
+    }
+
+    fn sample_bgg_public_keys_for_circuit(
+        params: &DCRTPolyParams,
+        input_count: usize,
+        secret_size: usize,
+        hash_key: [u8; 32],
+        tag: &str,
+    ) -> (BggPublicKey<DCRTPolyMatrix>, Vec<BggPublicKey<DCRTPolyMatrix>>) {
+        let m_g = secret_size * params.modulus_digits();
+        let sampler = DCRTPolyHashSampler::<Keccak256>::new();
+        let one = BggPublicKey::new(
+            sampler.sample_hash(
+                params,
+                hash_key,
+                format!("{tag}_one"),
+                secret_size,
+                m_g,
+                DistType::FinRingDist,
+            ),
+            true,
+        );
+        let inputs = (0..input_count)
+            .map(|idx| {
+                BggPublicKey::new(
+                    DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
+                        params,
+                        hash_key,
+                        format!("{tag}_input_{idx}"),
+                        secret_size,
+                        m_g,
+                        DistType::FinRingDist,
+                    ),
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        (one, inputs)
     }
 
     fn eval_outputs<P: Poly + 'static>(
@@ -1926,6 +2021,24 @@ mod tests {
         assert_eq!(input.randomizer_norm.ncol, ctx.width());
         assert_eq!(input.randomizer_norm.poly_norm.norm, BigDecimal::from(1u64));
         assert_eq!(input.max_plaintext, BigUint::from(1u64));
+    }
+
+    #[test]
+    fn test_ring_gsw_decryption_error_estimate_returns_one_by_one_matrix_norm() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_params, ctx) = create_test_context(&mut circuit);
+        let input = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+
+        let estimated = input.estimate_decryption_error_norm(BGG_SIGMA);
+        assert_eq!(estimated.nrow, 1);
+        assert_eq!(estimated.ncol, 1);
+        assert_eq!(estimated.ctx(), ctx.randomizer_norm_ctx.as_ref());
+        assert!(estimated.poly_norm.norm > BigDecimal::from(0u64));
+
+        let zero_sigma = input.estimate_decryption_error_norm(0.0);
+        assert_eq!(zero_sigma.nrow, 1);
+        assert_eq!(zero_sigma.ncol, 1);
+        assert_eq!(zero_sigma.poly_norm.norm, BigDecimal::from(0u64));
     }
 
     #[test]
@@ -2110,6 +2223,165 @@ mod tests {
                 "in-circuit Ring-GSW decrypt should recover the plaintext exactly when e = 0"
             );
         }
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_ring_gsw_decrypt_batch_with_ring_dim_ciphertexts_packs_decryptions_without_error() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        assert_eq!(
+            ctx.num_slots,
+            params.ring_dimension() as usize,
+            "this test exercises the ciphertext_count = ring_dim case"
+        );
+        let ciphertext_inputs = (0..params.ring_dimension())
+            .map(|_| RingGswCiphertext::input(ctx.clone(), None, &mut circuit))
+            .collect::<Vec<_>>();
+        let wire_secret_key = circuit.input(1).at(0).as_single_wire();
+        let ciphertext_refs = ciphertext_inputs.iter().collect::<Vec<_>>();
+        let decrypted_batch = RingGswCiphertext::decrypt_batch::<DCRTPolyMatrix>(
+            ciphertext_refs.as_slice(),
+            wire_secret_key,
+            BigUint::from(2u64),
+            &mut circuit,
+        );
+        circuit.output(vec![decrypted_batch]);
+
+        let secret_key = sample_secret_key(&params);
+        let public_key_hash_key = sample_hash_key();
+        let randomizer_hash_key = sample_hash_key();
+        let public_key = sample_public_key(
+            &params,
+            ctx.width(),
+            &secret_key,
+            public_key_hash_key,
+            b"ring_gsw_decrypt_batch_public_key",
+            None,
+        );
+        let q_modulus = BigUint::from(ctx.nested_rns.q_moduli()[0]);
+        let plaintexts = [0u64, 1, 1, 0];
+        assert_eq!(plaintexts.len(), params.ring_dimension() as usize);
+
+        let native_ciphertexts = plaintexts
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(idx, plaintext)| {
+                let tag = format!("decrypt_batch_ring_dim_ciphertext_{idx}_{plaintext}");
+                let ciphertext = encrypt_plaintext_bit(
+                    &params,
+                    ctx.nested_rns.as_ref(),
+                    &public_key,
+                    plaintext,
+                    randomizer_hash_key,
+                    tag.as_bytes(),
+                );
+                let native_decrypted = decrypt_ciphertext(
+                    &params,
+                    ctx.nested_rns.as_ref(),
+                    &ciphertext,
+                    &secret_key,
+                    2,
+                );
+                assert_eq!(
+                    rounded_coeffs(&native_decrypted, 2, &q_modulus),
+                    expected_coeffs(plaintext),
+                    "native Ring-GSW decrypt should recover plaintext {plaintext} at index {idx}"
+                );
+                ciphertext
+            })
+            .collect::<Vec<_>>();
+
+        let mut circuit_inputs = native_ciphertexts
+            .iter()
+            .flat_map(|ciphertext| {
+                ciphertext_inputs_from_native(
+                    &params,
+                    ctx.nested_rns.as_ref(),
+                    ciphertext,
+                    0,
+                    Some(ctx.active_levels),
+                )
+            })
+            .collect::<Vec<_>>();
+        // `decrypt_batch` assumes the decryption-key wire already carries the same secret key in
+        // every slot.  This matches the production noise-refresh callers, where the packed
+        // ciphertext batch and the key wire have the same slot arity.
+        circuit_inputs.push(PolyVec::new(vec![secret_key.clone(); ctx.num_slots]));
+
+        let outputs = eval_outputs(&params, NUM_SLOTS, &circuit, circuit_inputs);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].len(), params.ring_dimension() as usize);
+        for (idx, plaintext) in plaintexts.iter().copied().enumerate() {
+            assert_eq!(
+                rounded_coeffs(&outputs[0].as_slice()[idx], 2, &q_modulus),
+                expected_coeffs(plaintext),
+                "decrypt_batch output slot {idx} should contain the decrypted plaintext"
+            );
+        }
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_ring_gsw_decrypt_batch_bgg_public_key_output_column_count() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ctx) = create_test_context(&mut circuit);
+        let ciphertext_inputs = (0..params.ring_dimension())
+            .map(|_| RingGswCiphertext::input(ctx.clone(), None, &mut circuit))
+            .collect::<Vec<_>>();
+        let wire_secret_key = circuit.input(1).at(0).as_single_wire();
+        let ciphertext_refs = ciphertext_inputs.iter().collect::<Vec<_>>();
+        let decrypted_batch = RingGswCiphertext::decrypt_batch::<DCRTPolyMatrix>(
+            ciphertext_refs.as_slice(),
+            wire_secret_key,
+            BigUint::from(2u64),
+            &mut circuit,
+        );
+        circuit.output(vec![decrypted_batch]);
+
+        let secret_size = 2usize;
+        let hash_key = [0x7bu8; 32];
+        let m_g = params.modulus_digits();
+        let (one, inputs) = sample_bgg_public_keys_for_circuit(
+            &params,
+            circuit.num_input(),
+            secret_size,
+            hash_key,
+            "ring_gsw_decrypt_batch_bgg_column_count",
+        );
+        let evaluator = BggPublicKeySTEvaluator::<
+            DCRTPolyMatrix,
+            DCRTPolyUniformSampler,
+            DCRTPolyHashSampler<Keccak256>,
+            DCRTPolyTrapdoorSampler,
+        >::new(
+            hash_key,
+            secret_size,
+            ctx.num_slots,
+            BGG_SIGMA,
+            0.0,
+            "test_data/test_ring_gsw_decrypt_batch_bgg_column_count".into(),
+        );
+        let outputs = circuit.eval(
+            &params,
+            one.clone(),
+            inputs,
+            Some(&DummyBggPublicKeyPltEvaluator),
+            Some(&evaluator),
+            Some(1),
+        );
+        assert_eq!(outputs.len(), 1);
+        println!(
+            "ring_gsw decrypt_batch BGG shapes: secret_size={}, m_g={}, expected_gadget_cols={}, one_cols={}, output_cols={}",
+            secret_size,
+            m_g,
+            secret_size * m_g,
+            one.matrix.col_size(),
+            outputs[0].matrix.col_size()
+        );
+        assert_eq!(one.matrix.col_size(), secret_size * m_g);
+        assert_eq!(outputs[0].matrix.col_size(), secret_size * m_g);
     }
 
     #[sequential_test::sequential]

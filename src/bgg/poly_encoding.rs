@@ -459,6 +459,39 @@ impl<M: PolyMatrix> Evaluable for BggPolyEncoding<M> {
             plaintext_bytes,
         )
     }
+
+    fn concat_columns(&self, others: &[Self]) -> Self {
+        let vectors = self.concat_vector(others);
+        let vector_bytes = vectors
+            .into_iter()
+            .map(|vector| Arc::<[u8]>::from(vector.into_compact_bytes()))
+            .collect::<Vec<_>>();
+        let other_pubkeys =
+            others.iter().map(|encoding| encoding.pubkey.clone()).collect::<Vec<_>>();
+        let pubkey = self.pubkey.concat_columns(other_pubkeys.as_slice());
+        Self::new(self.params.clone(), vector_bytes, pubkey, None::<Vec<Arc<[u8]>>>)
+    }
+
+    fn matrix_mul<Rhs>(&self, params: &Self::Params, rhs_matrix: &Rhs) -> Self
+    where
+        Rhs: PolyMatrix<P = Self::P>,
+    {
+        let rhs_matrix_bytes = Arc::<[u8]>::from(rhs_matrix.to_compact_bytes());
+        let vector_bytes =
+            map_slots_with_params::<M, _, _>(params, self.num_slots(), |slot, local_params| {
+                let vector = M::from_compact_bytes(local_params, self.vector_bytes[slot].as_ref());
+                let rhs_matrix = M::from_compact_bytes(local_params, rhs_matrix_bytes.as_ref());
+                let out = vector.mul_decompose(&rhs_matrix);
+                drop(rhs_matrix);
+                Arc::<[u8]>::from(out.into_compact_bytes())
+            });
+        Self::new(
+            params.clone(),
+            vector_bytes,
+            self.pubkey.matrix_mul(params, rhs_matrix),
+            None::<Vec<Arc<[u8]>>>,
+        )
+    }
 }
 
 #[cfg(test)]

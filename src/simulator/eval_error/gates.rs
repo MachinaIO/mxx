@@ -147,6 +147,21 @@ impl PolyCircuit<DCRTPoly> {
                     gate_id,
                 )
             }
+            PolyGateType::SlotReduce { .. } => {
+                let mut inputs = gate.input_gates.iter().copied().map(|input_id| {
+                    self.clone_error_norm_value_for_gate(
+                        input_id,
+                        wires,
+                        input_gate_positions,
+                        input_values,
+                    )
+                });
+                let mut sum = inputs.next().expect("SlotReduce must have at least one input");
+                for input in inputs {
+                    sum = sum + &input;
+                }
+                sum
+            }
             PolyGateType::PubLut { lut_id } => {
                 let lut_id = lut_id.resolve_public_lookup(&[]);
                 let input = self.clone_error_norm_value_for_gate(
@@ -415,6 +430,30 @@ impl PolyCircuit<DCRTPoly> {
                 slot_transfer_evaluator
                     .expect("slot transfer evaluator missing")
                     .slot_transfer_affine(input.as_ref(), src_slots.as_ref(), gate_id)
+            }
+            PolyGateType::SlotReduce { .. } => {
+                let mut inputs = gate.input_gates.iter().copied().map(|input_id| {
+                    self.clone_error_norm_summary_expr_for_summary_gate_direct(
+                        input_id,
+                        gate_exprs,
+                        input_gate_positions,
+                        input_plaintext_norms,
+                        one_error,
+                        plt_evaluator,
+                        slot_transfer_evaluator,
+                        summary_cache,
+                        resolve_ctx,
+                    )
+                });
+                let mut sum = inputs
+                    .next()
+                    .expect("SlotReduce must have at least one input")
+                    .as_ref()
+                    .clone();
+                for input in inputs {
+                    sum = sum.add_bound(input.as_ref());
+                }
+                sum
             }
             PolyGateType::PubLut { lut_id } => {
                 let lut_id = lut_id.resolve_public_lookup(param_bindings);

@@ -453,6 +453,25 @@ where
         )
     }
 
+    fn estimate_slot_reduce(&self, input_count: usize, num_slots: usize) -> CircuitBenchEstimate {
+        assert!(input_count > 0, "slot_reduce input_count must be positive");
+        assert_eq!(
+            num_slots, self.num_slots,
+            "BggPolyEncodingBenchEstimator::estimate_slot_reduce requires num_slots == estimator num_slots"
+        );
+        measured_slot_gate_estimate(
+            self.slot_transfer_latency,
+            self.slot_transfer_total_time,
+            input_count,
+            self.slot_transfer_peak_vram,
+        )
+        .with_max_parallelism(
+            self.slot_transfer_max_parallelism
+                .checked_mul(input_count as u128)
+                .expect("slot reduce parallelism overflowed u128 while scaling by input count"),
+        )
+    }
+
     fn estimate_public_lookup(&self, _lut_id: usize) -> CircuitBenchEstimate {
         measured_slot_gate_estimate(
             self.public_lut_latency,

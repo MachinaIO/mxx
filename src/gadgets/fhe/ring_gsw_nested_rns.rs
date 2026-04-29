@@ -185,17 +185,20 @@ pub fn ciphertext_inputs_from_native<P: Poly>(
                     let encoded_len = coeff_encodings.first().map(|encoded| encoded.len()).expect(
                         "native Ring-GSW ciphertext polynomials must have at least one slot",
                     );
-                    (0..encoded_len)
-                        .into_par_iter()
-                        .map(|gate_idx| {
-                            PolyVec::new(
-                                coeff_encodings
-                                    .par_iter()
-                                    .map(|encoded| encoded[gate_idx].clone())
-                                    .collect::<Vec<_>>(),
-                            )
-                        })
-                        .collect::<Vec<_>>()
+                    let mut gate_encodings = (0..encoded_len)
+                        .map(|_| Vec::with_capacity(coeff_encodings.len()))
+                        .collect::<Vec<_>>();
+                    for encoded in coeff_encodings {
+                        assert_eq!(
+                            encoded.len(),
+                            encoded_len,
+                            "all nested-RNS coefficient encodings must have the same gate length"
+                        );
+                        for (gate_idx, gate_value) in encoded.into_iter().enumerate() {
+                            gate_encodings[gate_idx].push(gate_value);
+                        }
+                    }
+                    gate_encodings.into_iter().map(PolyVec::new).collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>()
         })

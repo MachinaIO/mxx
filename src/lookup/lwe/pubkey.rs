@@ -31,9 +31,30 @@ use std::{
 use tracing::{info, warn};
 
 use super::{
-    column_chunk_count, derive_a_lt_matrix, derive_k_low, k_high_checkpoint_prefix,
-    k_high_row_checkpoint_prefix,
+    column_chunk_count, derive_a_lt_matrix, derive_a_lt_matrix_for_slot, derive_k_low_for_slot,
+    k_high_checkpoint_prefix_for_slot, k_high_row_checkpoint_prefix_for_slot,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct LweLookupGateKey {
+    gate_id: GateId,
+    slot_idx: usize,
+}
+
+impl LweLookupGateKey {
+    pub(super) fn new(gate_id: GateId, slot_idx: Option<usize>) -> Self {
+        Self { gate_id, slot_idx: slot_idx.unwrap_or(0) }
+    }
+
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    pub(super) fn gate_id(self) -> GateId {
+        self.gate_id
+    }
+
+    pub(super) fn slot_idx_option(self) -> Option<usize> {
+        Some(self.slot_idx)
+    }
+}
 
 #[cfg(not(feature = "gpu"))]
 use super::{column_chunk_bounds, derive_k_low_chunk};
@@ -164,8 +185,9 @@ pub(super) fn k_high_row_checkpoint_complete(
     row_size: usize,
     modulus_digits: usize,
     lut_entry_idx: usize,
+    slot_idx: Option<usize>,
 ) -> bool {
-    let base_prefix = k_high_checkpoint_prefix(gate_id, lut_id);
+    let base_prefix = k_high_checkpoint_prefix_for_slot(gate_id, lut_id, slot_idx);
     if checkpoint_has_index(checkpoint_index, part_index_cache, &base_prefix, lut_entry_idx) {
         return true;
     }
@@ -181,7 +203,7 @@ pub(super) fn k_high_row_checkpoint_complete(
             checkpoint_index,
             part_index_cache,
             &super::column_chunk_id_prefix(
-                &k_high_row_checkpoint_prefix(gate_id, lut_id, lut_entry_idx),
+                &k_high_row_checkpoint_prefix_for_slot(gate_id, lut_id, lut_entry_idx, slot_idx),
                 chunk_idx,
             ),
             0,
@@ -202,7 +224,7 @@ where
     pub trapdoor: Arc<ST::Trapdoor>,
     pub dir_path: PathBuf,
     pub(super) lut_state: DashMap<usize, PublicLut<<BggPublicKey<M> as Evaluable>::P>>,
-    pub(super) gate_state: DashMap<GateId, GateState<M>>,
+    pub(super) gate_state: DashMap<LweLookupGateKey, GateState<M>>,
     _sh: PhantomData<SH>,
     _st: PhantomData<ST>,
 }
@@ -223,11 +245,38 @@ where
         gate_id: GateId,
         lut_id: usize,
     ) -> BggPublicKey<M> {
+        self.public_lookup_for_slot(params, plt, input, gate_id, lut_id, None)
+    }
+}
+
+impl<M, SH, ST> LWEBGGPubKeyPltEvaluator<M, SH, ST>
+where
+    M: PolyMatrix + Send + Sync + 'static,
+    SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    ST: PolyTrapdoorSampler<M = M> + Send + Sync,
+    M::P: 'static,
+{
+    pub fn public_lookup_for_slot(
+        &self,
+        params: &<BggPublicKey<M> as Evaluable>::Params,
+        plt: &PublicLut<<BggPublicKey<M> as Evaluable>::P>,
+        input: &BggPublicKey<M>,
+        gate_id: GateId,
+        lut_id: usize,
+        slot_idx: Option<usize>,
+    ) -> BggPublicKey<M> {
         let row_size = input.matrix.row_size();
-        let a_lt = derive_a_lt_matrix::<M, SH>(params, row_size, self.hash_key, gate_id);
+        let slot_key = LweLookupGateKey::new(gate_id, slot_idx);
+        let a_lt = derive_a_lt_matrix_for_slot::<M, SH>(
+            params,
+            row_size,
+            self.hash_key,
+            gate_id,
+            slot_key.slot_idx_option(),
+        );
         self.lut_state.entry(lut_id).or_insert_with(|| plt.clone());
         self.gate_state.insert(
-            gate_id,
+            slot_key,
             GateState {
                 lut_id,
                 input_pubkey_bytes: input.matrix.to_compact_bytes(),
@@ -278,11 +327,12 @@ where
             }
         }
 
-        let gate_ids: Vec<GateId> = self.gate_state.iter().map(|entry| *entry.key()).collect();
-        let mut gate_entries = Vec::with_capacity(gate_ids.len());
-        for gate_id in gate_ids {
-            if let Some((_, state)) = self.gate_state.remove(&gate_id) {
-                gate_entries.push((gate_id, state));
+        let gate_keys: Vec<LweLookupGateKey> =
+            self.gate_state.iter().map(|entry| *entry.key()).collect();
+        let mut gate_entries = Vec::with_capacity(gate_keys.len());
+        for gate_key in gate_keys {
+            if let Some((_, state)) = self.gate_state.remove(&gate_key) {
+                gate_entries.push((gate_key, state));
             }
         }
 
@@ -313,7 +363,7 @@ where
 fn sample_aux_matrices_cpu<M, SH, ST>(
     evaluator: &LWEBGGPubKeyPltEvaluator<M, SH, ST>,
     params: &<M::P as Poly>::Params,
-    gate_entries: Vec<(GateId, GateState<M>)>,
+    gate_entries: Vec<(LweLookupGateKey, GateState<M>)>,
     lut_entries: HashMap<usize, PublicLut<<BggPublicKey<M> as Evaluable>::P>>,
 ) where
     M: PolyMatrix + Send + Sync + 'static,
@@ -322,7 +372,9 @@ fn sample_aux_matrices_cpu<M, SH, ST>(
     M::P: 'static,
 {
     let total_gates = gate_entries.len();
-    for (gate_id, gate_state) in gate_entries {
+    for (gate_key, gate_state) in gate_entries {
+        let gate_id = gate_key.gate_id;
+        let slot_idx = gate_key.slot_idx_option();
         let plt = lut_entries.get(&gate_state.lut_id).unwrap_or_else(|| {
             panic!(
                 "LUT state for lut_id {} not found while sampling gate {}",
@@ -342,6 +394,7 @@ fn sample_aux_matrices_cpu<M, SH, ST>(
             &output_pubkey,
             gate_id,
             gate_state.lut_id,
+            slot_idx,
         );
         add_lookup_buffer(buffer);
     }
@@ -361,6 +414,7 @@ fn sample_k_high_buffer<M, SH, ST, P>(
     a_lt: &M,
     gate_id: GateId,
     lut_id: usize,
+    slot_idx: Option<usize>,
 ) -> BatchLookupBuffer
 where
     P: Poly + 'static,
@@ -392,8 +446,9 @@ where
                     let y_poly = P::from_elem_to_constant(params, &y_k);
                     let ext_matrix = a_z.clone() - &(gadget.clone() * x_poly);
                     let target = a_lt.clone() - &(gadget.clone() * y_poly);
-                    let k_low =
-                        derive_k_low::<M, SH>(params, row_size, hash_key, gate_id, lut_id, k_usize);
+                    let k_low = derive_k_low_for_slot::<M, SH>(
+                        params, row_size, hash_key, gate_id, lut_id, k_usize, slot_idx,
+                    );
                     let adjusted_target = target - &(ext_matrix * &k_low);
                     (k_usize, trap_sampler.preimage(params, trapdoor, pub_matrix, &adjusted_target))
                 })
@@ -412,8 +467,9 @@ where
                 let y_poly = P::from_elem_to_constant(params, &y_k);
                 let ext_matrix = a_z.clone() - &(gadget.clone() * x_poly);
                 let target = a_lt.clone() - &(gadget.clone() * y_poly);
-                let k_low =
-                    derive_k_low::<M, SH>(params, row_size, hash_key, gate_id, lut_id, k_usize);
+                let k_low = derive_k_low_for_slot::<M, SH>(
+                    params, row_size, hash_key, gate_id, lut_id, k_usize, slot_idx,
+                );
                 let adjusted_target = target - &(ext_matrix * &k_low);
                 (k_usize, trap_sampler.preimage(params, trapdoor, pub_matrix, &adjusted_target))
             })
@@ -421,7 +477,10 @@ where
         k_high_by_entry.append(&mut partial);
     }
     info!("finish collecting LWE k_high matrices for gate {}", gate_id);
-    get_lookup_buffer(k_high_by_entry, &k_high_checkpoint_prefix(gate_id, lut_id))
+    get_lookup_buffer(
+        k_high_by_entry,
+        &k_high_checkpoint_prefix_for_slot(gate_id, lut_id, slot_idx),
+    )
 }
 
 #[cfg(not(feature = "gpu"))]
@@ -542,6 +601,7 @@ where
             &a_lt,
             gate_id,
             lut_id,
+            None,
         );
         add_lookup_buffer(buffer);
     }

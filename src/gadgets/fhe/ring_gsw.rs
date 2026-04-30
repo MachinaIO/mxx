@@ -2867,8 +2867,8 @@ mod tests {
     #[ignore = "expensive circuit-structure reporting test; run with --ignored --nocapture"]
     fn test_nested_rns_ring_gsw_mul_large_circuit_metrics() {
         let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
-        let crt_bits = 24usize;
-        let crt_depth = 1usize;
+        let crt_bits = 28usize;
+        let crt_depth = 32usize;
         let ring_dim = 1u32 << 16;
         let num_slots = 1usize << 16;
         let p_moduli_bits = 7;
@@ -2936,11 +2936,11 @@ mod tests {
     #[ignore = "expensive circuit-structure reporting test; run with --ignored --nocapture"]
     fn test_carry_arith_ring_gsw_mul_large_circuit_metrics() {
         let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
-        let crt_bits = 32usize;
-        let crt_depth = 30usize;
+        let crt_bits = 28usize;
+        let crt_depth = 32usize;
         let ring_dim = 1u32 << 16;
         let num_slots = 1usize << 16;
-        let limb_bit_size = 1usize;
+        let limb_bit_size = 7usize;
 
         let mul1_disk_dir = tempdir().expect("create temp dir for disk-backed sub-circuits");
         let mut circuit = PolyCircuit::<DCRTPoly>::new();

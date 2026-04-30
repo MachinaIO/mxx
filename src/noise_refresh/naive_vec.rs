@@ -2,7 +2,11 @@ use crate::{
     bench_estimator::{
         BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary, benchmark_gate_operation,
     },
-    bgg::naive_vec::{NaiveBGGEncodingVec, NaiveBGGPublicKeyVec},
+    bgg::{
+        encoding::BggEncoding,
+        naive_vec::{NaiveBGGEncodingVec, NaiveBGGPublicKeyVec},
+        public_key::BggPublicKey,
+    },
     circuit::{BatchedWire, PolyCircuit, evaluable::Evaluable},
     gadgets::{
         arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner},
@@ -48,6 +52,14 @@ fn scaled_estimate_summary(unit: CircuitBenchEstimate, task_count: usize) -> Cir
 
 fn estimate_summary(unit: CircuitBenchEstimate) -> CircuitBenchSummary {
     scaled_estimate_summary(unit, 1)
+}
+
+fn refresh_slot_id(refresh_id: &[u8], label: &[u8], idx: usize) -> Vec<u8> {
+    let mut id = Vec::with_capacity(refresh_id.len() + label.len() + std::mem::size_of::<usize>());
+    id.extend_from_slice(refresh_id);
+    id.extend_from_slice(label);
+    id.extend_from_slice(&idx.to_le_bytes());
+    id
 }
 
 fn scaled_summary(summary: CircuitBenchSummary, task_count: usize) -> CircuitBenchSummary {
@@ -372,12 +384,11 @@ where
         decryption_key: &NaiveBGGPublicKeyVec<M>,
         plt_evaluator: &PE,
         slot_transfer_evaluator: &ST,
-    ) -> (M, Vec<M>)
+    ) -> (NaiveBGGPublicKeyVec<M>, Vec<NaiveBGGPublicKeyVec<M>>)
     where
         PE: PltEvaluator<NaiveBGGPublicKeyVec<M>>,
         ST: SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>,
     {
-        assert_eq!(enc_seeds.len(), self.seed_bits, "encrypted seed count mismatch");
         let num_slots = refreshed_input.num_slots();
         assert_eq!(
             num_slots,
@@ -397,6 +408,11 @@ where
             self.graph_seed,
             self.cbd_n,
             num_slots,
+        );
+        assert_eq!(
+            enc_seeds.len() + 1,
+            circuit.num_input(),
+            "encrypted seed wire count must match the flattened noise-refresh circuit inputs"
         );
         let mut inputs = enc_seeds.to_vec();
         inputs.push(decryption_key.clone());
@@ -413,59 +429,84 @@ where
             .into_par_iter()
             .map(|value| value.matrix_mul(self.params(), &unit_column_target))
             .collect::<Vec<_>>();
-        let a_prime = HS::new().sample_hash(
+        let hash_sampler = HS::new();
+        let a_prime = NaiveBGGPublicKeyVec::new(
             self.params(),
-            self.hash_key,
-            refresh_id,
-            1,
-            self.params().modulus_digits(),
-            DistType::FinRingDist,
+            (0..num_slots)
+                .into_par_iter()
+                .map(|slot_idx| {
+                    let slot_refresh_id = refresh_slot_id(refresh_id, b":a_prime:", slot_idx);
+                    BggPublicKey::new(
+                        hash_sampler.sample_hash(
+                            self.params(),
+                            self.hash_key,
+                            &slot_refresh_id,
+                            1,
+                            self.params().modulus_digits(),
+                            DistType::FinRingDist,
+                        ),
+                        true,
+                    )
+                })
+                .collect::<Vec<_>>(),
         );
         let (_q_moduli, _crt_bits, crt_depth) = self.params().to_crt();
         let log_base_q = self.params().modulus_digits();
         assert_eq!(decoded.len(), num_slots * crt_depth * log_base_q);
-        let refresh_matrices = (0..num_slots * crt_depth)
+        let refresh_keys = (0..crt_depth)
             .into_par_iter()
-            .map(|flat_idx| {
-                let slot_idx = flat_idx / crt_depth;
-                let crt_idx = flat_idx % crt_depth;
-                let (q_over_qi, _reconst_coeff) = self.params().to_crt_coeffs(crt_idx);
-                // The one-term is evaluated with the natural `+(q/q_i) * A'` target, then
-                // subtracted from the accumulated refresh matrix below. In the online path this
-                // subtraction makes `online_terms - decoder` leave a positive `+(q/q_i) * A'`.
-                let one_term = one.keys[slot_idx]
-                    .matrix_mul(
-                        self.params(),
-                        &(a_prime.clone() * constant_poly::<M>(self.params(), q_over_qi.clone())),
-                    )
-                    .matrix
-                    .clone();
-                // The refreshed input target is positive `+(q/q_i) * G`, so online subtraction of
-                // the decoder cancels the public `sA_x` part and leaves `-xG`.
-                let input_term = refreshed_input.keys[slot_idx]
-                    .matrix_mul(
-                        self.params(),
-                        &(M::gadget_matrix(self.params(), 1) *
-                            constant_poly::<M>(self.params(), q_over_qi)),
-                    )
-                    .matrix
-                    .clone();
-                let columns = (0..log_base_q)
-                    .map(|digit_idx| {
-                        let idx =
-                            slot_idx * crt_depth * log_base_q + crt_idx * log_base_q + digit_idx;
-                        collapse_slot_matrices(
-                            self.params(),
-                            decoded[idx].num_slots(),
-                            |slot_idx| decoded[idx].keys[slot_idx].matrix.clone(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let refresh_term = concat_owned_columns(columns);
-                input_term + &refresh_term - &one_term
+            .map(|crt_idx| {
+                NaiveBGGPublicKeyVec::new(
+                    self.params(),
+                    (0..num_slots)
+                        .map(|slot_idx| {
+                            let (q_over_qi, _reconst_coeff) = self.params().to_crt_coeffs(crt_idx);
+                            let one_key = one.key(slot_idx);
+                            let a_prime_key = a_prime.key(slot_idx);
+                            let refreshed_input_key = refreshed_input.key(slot_idx);
+                            // The one-term is evaluated with the natural `+(q/q_i) * A'` target,
+                            // then subtracted from the accumulated refresh matrix below. In the
+                            // online path this subtraction makes `online_terms - decoder` leave a
+                            // positive `+(q/q_i) * A'`.
+                            let one_term = one_key
+                                .matrix_mul(
+                                    self.params(),
+                                    &(a_prime_key.matrix.clone() *
+                                        constant_poly::<M>(self.params(), q_over_qi.clone())),
+                                )
+                                .matrix
+                                .clone();
+                            // The refreshed input target is positive `+(q/q_i) * G`, so online
+                            // subtraction of the decoder cancels the public `sA_x` part and
+                            // leaves `-xG`.
+                            let input_term = refreshed_input_key
+                                .matrix_mul(
+                                    self.params(),
+                                    &(M::gadget_matrix(self.params(), 1) *
+                                        constant_poly::<M>(self.params(), q_over_qi)),
+                                )
+                                .matrix
+                                .clone();
+                            let columns = (0..log_base_q)
+                                .map(|digit_idx| {
+                                    let idx = slot_idx * crt_depth * log_base_q +
+                                        crt_idx * log_base_q +
+                                        digit_idx;
+                                    collapse_slot_matrices(
+                                        self.params(),
+                                        decoded[idx].num_slots(),
+                                        |slot_idx| decoded[idx].key(slot_idx).matrix.clone(),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            let refresh_term = concat_owned_columns(columns);
+                            BggPublicKey::new(input_term + &refresh_term - &one_term, true)
+                        })
+                        .collect::<Vec<_>>(),
+                )
             })
-            .collect();
-        (a_prime, refresh_matrices)
+            .collect::<Vec<_>>();
+        (a_prime, refresh_keys)
     }
 
     fn online_eval<PE, ST>(
@@ -478,12 +519,11 @@ where
         decoders: &[M],
         plt_evaluator: &PE,
         slot_transfer_evaluator: &ST,
-    ) -> M
+    ) -> NaiveBGGEncodingVec<M>
     where
         PE: PltEvaluator<NaiveBGGEncodingVec<M>>,
         ST: SlotTransferEvaluator<NaiveBGGEncodingVec<M>>,
     {
-        assert_eq!(enc_seeds.len(), self.seed_bits, "encrypted seed count mismatch");
         let num_slots = refreshed_input.num_slots();
         assert_eq!(
             num_slots,
@@ -504,6 +544,11 @@ where
             self.cbd_n,
             num_slots,
         );
+        assert_eq!(
+            enc_seeds.len() + 1,
+            circuit.num_input(),
+            "encrypted seed wire count must match the flattened noise-refresh circuit inputs"
+        );
         let mut inputs = enc_seeds.to_vec();
         inputs.push(decryption_key.clone());
         let decoded = circuit.eval(
@@ -519,13 +564,26 @@ where
             .into_par_iter()
             .map(|value| value.matrix_mul(self.params(), &unit_column_target))
             .collect::<Vec<_>>();
-        let a_prime = HS::new().sample_hash(
+        let hash_sampler = HS::new();
+        let a_prime = NaiveBGGPublicKeyVec::new(
             self.params(),
-            self.hash_key,
-            refresh_id,
-            1,
-            self.params().modulus_digits(),
-            DistType::FinRingDist,
+            (0..num_slots)
+                .into_par_iter()
+                .map(|slot_idx| {
+                    let slot_refresh_id = refresh_slot_id(refresh_id, b":a_prime:", slot_idx);
+                    BggPublicKey::new(
+                        hash_sampler.sample_hash(
+                            self.params(),
+                            self.hash_key,
+                            &slot_refresh_id,
+                            1,
+                            self.params().modulus_digits(),
+                            DistType::FinRingDist,
+                        ),
+                        true,
+                    )
+                })
+                .collect::<Vec<_>>(),
         );
         let (_q_moduli, _crt_bits, crt_depth) = self.params().to_crt();
         let log_base_q = self.params().modulus_digits();
@@ -545,17 +603,21 @@ where
                 // subtract the resulting one-term from the online accumulation. Since BGG
                 // encodings have the form `sA - plaintext * target + error`, the final
                 // `online_terms - decoder` leaves `+(q/q_i) * A'`.
-                let one_term = one.encodings[slot_idx]
+                let a_prime_key = a_prime.key(slot_idx);
+                let one_term = one
+                    .encoding(slot_idx)
                     .matrix_mul(
                         self.params(),
-                        &(a_prime.clone() * constant_poly::<M>(self.params(), q_over_qi.clone())),
+                        &(a_prime_key.matrix.clone() *
+                            constant_poly::<M>(self.params(), q_over_qi.clone())),
                     )
                     .vector
                     .clone();
                 // The positive gadget target leaves the desired `-(q/q_i) * xG` after decoder
                 // subtraction.  Together with the `+A'` term and the decoded `+new_error`, the
                 // rounded CRT recomposition recovers `A' - xG + new_error`.
-                let input_term = refreshed_input.encodings[slot_idx]
+                let input_term = refreshed_input
+                    .encoding(slot_idx)
                     .matrix_mul(
                         self.params(),
                         &(M::gadget_matrix(self.params(), 1) *
@@ -570,7 +632,7 @@ where
                         collapse_slot_matrices(
                             self.params(),
                             decoded[idx].num_slots(),
-                            |slot_idx| decoded[idx].encodings[slot_idx].vector.clone(),
+                            |slot_idx| decoded[idx].encoding(slot_idx).vector.clone(),
                         )
                     })
                     .collect::<Vec<_>>();
@@ -578,7 +640,19 @@ where
                 input_term + &refresh_term - &one_term - &decoders[flat_idx]
             })
             .collect::<Vec<_>>();
-        crt_recompose_rows(self.params(), &crt_level_vectors, num_slots)
+        let refreshed: M = crt_recompose_rows(self.params(), &crt_level_vectors, num_slots);
+        NaiveBGGEncodingVec::new(
+            self.params(),
+            (0..num_slots)
+                .map(|slot_idx| {
+                    BggEncoding::new(
+                        refreshed.slice_rows(slot_idx, slot_idx + 1),
+                        a_prime.key(slot_idx),
+                        None,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
     }
 }
 

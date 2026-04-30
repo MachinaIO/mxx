@@ -11,7 +11,10 @@ use crate::{
 };
 use num_bigint::BigUint;
 use rayon::prelude::*;
-use std::ops::{Add, Mul, Sub};
+use std::{
+    ops::{Add, Mul, Sub},
+    sync::Arc,
+};
 
 /// A deliberately simple slotwise BGG public-key container.
 ///
@@ -21,7 +24,8 @@ use std::ops::{Add, Mul, Sub};
 /// key evaluators for each slot independently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NaiveBGGPublicKeyVec<M: PolyMatrix> {
-    pub keys: Vec<BggPublicKey<M>>,
+    params: Arc<<M::P as Poly>::Params>,
+    keys: Vec<BggPublicKeyCompact<M>>,
 }
 
 /// Backward-compatible spelling for the user-facing name in the design note.
@@ -39,7 +43,8 @@ pub struct NaiveBGGPublicKeyVecCompact<M: PolyMatrix> {
 /// number of logical slots.
 #[derive(Debug, Clone)]
 pub struct NaiveBGGEncodingVec<M: PolyMatrix> {
-    pub encodings: Vec<BggEncoding<M>>,
+    params: Arc<<M::P as Poly>::Params>,
+    encodings: Vec<BggEncodingCompact<M>>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,20 +80,25 @@ where
         tag: &[u8],
         reveal_plaintexts: &[bool],
     ) -> Vec<NaiveBGGPublicKeyVec<S::M>> {
-        let scalar_reveal_plaintexts = std::iter::repeat_n(true, self.num_slots - 1)
-            .chain(
-                reveal_plaintexts
-                    .iter()
-                    .flat_map(|reveal_plaintext| vec![*reveal_plaintext; self.num_slots]),
-            )
-            .collect::<Vec<_>>();
-        let scalar_keys = self.scalar_sampler.sample(params, tag, &scalar_reveal_plaintexts);
         let mut outputs = Vec::with_capacity(1 + reveal_plaintexts.len());
-        outputs.extend(
-            scalar_keys
-                .chunks(self.num_slots)
-                .map(|chunk| NaiveBGGPublicKeyVec::new(chunk.to_vec())),
-        );
+        for output_idx in 0..=reveal_plaintexts.len() {
+            let reveal_plaintext =
+                if output_idx == 0 { true } else { reveal_plaintexts[output_idx - 1] };
+            let keys = (0..self.num_slots).map(|slot_idx| {
+                let mut slot_tag = tag.to_vec();
+                slot_tag.extend_from_slice(&(output_idx as u64).to_le_bytes());
+                slot_tag.extend_from_slice(&(slot_idx as u64).to_le_bytes());
+                let mut sampled = if output_idx == 0 {
+                    self.scalar_sampler.sample(params, &slot_tag, &[])
+                } else {
+                    self.scalar_sampler.sample(params, &slot_tag, &[reveal_plaintext])
+                };
+                let key =
+                    sampled.pop().expect("BGG public key sampler must return at least one key");
+                key.to_compact()
+            });
+            outputs.push(NaiveBGGPublicKeyVec::from_compact_slots(params, keys));
+        }
         outputs
     }
 }
@@ -136,37 +146,66 @@ where
             );
         });
 
-        let scalar_public_keys = public_keys
-            .iter()
-            .flat_map(|public_key| public_key.keys.iter().cloned())
-            .collect::<Vec<_>>();
-        let mut scalar_plaintexts =
-            Vec::with_capacity(self.num_slots - 1 + plaintexts.len() * self.num_slots);
-        scalar_plaintexts.extend(
-            std::iter::repeat_with(|| <S::M as PolyMatrix>::P::const_one(params))
-                .take(self.num_slots - 1),
-        );
-        scalar_plaintexts
-            .extend(plaintexts.iter().flat_map(|plaintext| plaintext.as_slice().iter().cloned()));
-        let scalar_encodings =
-            self.scalar_sampler.sample(params, &scalar_public_keys, &scalar_plaintexts);
+        let one = &public_keys[0];
         (0..public_keys.len())
             .map(|encoding_idx| {
-                let start = encoding_idx * self.num_slots;
-                NaiveBGGEncodingVec::new(scalar_encodings[start..start + self.num_slots].to_vec())
+                let encodings = (0..self.num_slots).map(|slot_idx| {
+                    let one_key = one.key(slot_idx);
+                    let encoding = if encoding_idx == 0 {
+                        let mut sampled = self.scalar_sampler.sample(params, &[one_key], &[]);
+                        sampled
+                            .pop()
+                            .expect("BGG encoding sampler must return a constant-one encoding")
+                    } else {
+                        let input_key = public_keys[encoding_idx].key(slot_idx);
+                        let slot_plaintext =
+                            plaintexts[encoding_idx - 1].as_slice()[slot_idx].clone();
+                        let sampled = self.scalar_sampler.sample(
+                            params,
+                            &[one_key, input_key],
+                            &[slot_plaintext],
+                        );
+                        sampled
+                            .into_iter()
+                            .nth(1)
+                            .expect("BGG encoding sampler must return a plaintext encoding")
+                    };
+                    encoding.to_compact()
+                });
+                NaiveBGGEncodingVec::from_compact_slots(params, encodings)
             })
             .collect()
     }
 }
 
 impl<M: PolyMatrix> NaiveBGGPublicKeyVec<M> {
-    pub fn new(keys: Vec<BggPublicKey<M>>) -> Self {
+    pub fn new(params: &<M::P as Poly>::Params, keys: Vec<BggPublicKey<M>>) -> Self {
+        Self::from_compact_slots(params, keys.into_iter().map(Evaluable::to_compact))
+    }
+
+    pub fn from_compact_slots<I>(params: &<M::P as Poly>::Params, keys: I) -> Self
+    where
+        I: IntoIterator<Item = BggPublicKeyCompact<M>>,
+    {
+        let keys = keys.into_iter().collect::<Vec<_>>();
         assert!(!keys.is_empty(), "NaiveBGGPublicKeyVec requires at least one slot");
-        Self { keys }
+        Self { params: Arc::new(params.clone()), keys }
     }
 
     pub fn num_slots(&self) -> usize {
         self.keys.len()
+    }
+
+    pub fn key(&self, slot_idx: usize) -> BggPublicKey<M> {
+        BggPublicKey::from_compact(self.params.as_ref(), &self.keys[slot_idx])
+    }
+
+    pub fn keys(&self) -> Vec<BggPublicKey<M>> {
+        self.keys.iter().map(|key| BggPublicKey::from_compact(self.params.as_ref(), key)).collect()
+    }
+
+    fn params(&self) -> &<M::P as Poly>::Params {
+        self.params.as_ref()
     }
 
     pub(crate) fn assert_compatible(&self, other: &Self) {
@@ -181,13 +220,36 @@ impl<M: PolyMatrix> NaiveBGGPublicKeyVec<M> {
 }
 
 impl<M: PolyMatrix> NaiveBGGEncodingVec<M> {
-    pub fn new(encodings: Vec<BggEncoding<M>>) -> Self {
+    pub fn new(params: &<M::P as Poly>::Params, encodings: Vec<BggEncoding<M>>) -> Self {
+        Self::from_compact_slots(params, encodings.into_iter().map(Evaluable::to_compact))
+    }
+
+    pub fn from_compact_slots<I>(params: &<M::P as Poly>::Params, encodings: I) -> Self
+    where
+        I: IntoIterator<Item = BggEncodingCompact<M>>,
+    {
+        let encodings = encodings.into_iter().collect::<Vec<_>>();
         assert!(!encodings.is_empty(), "NaiveBGGEncodingVec requires at least one slot");
-        Self { encodings }
+        Self { params: Arc::new(params.clone()), encodings }
     }
 
     pub fn num_slots(&self) -> usize {
         self.encodings.len()
+    }
+
+    pub fn encoding(&self, slot_idx: usize) -> BggEncoding<M> {
+        BggEncoding::from_compact(self.params.as_ref(), &self.encodings[slot_idx])
+    }
+
+    pub fn encodings(&self) -> Vec<BggEncoding<M>> {
+        self.encodings
+            .iter()
+            .map(|encoding| BggEncoding::from_compact(self.params.as_ref(), encoding))
+            .collect()
+    }
+
+    fn params(&self) -> &<M::P as Poly>::Params {
+        self.params.as_ref()
     }
 
     pub(crate) fn assert_compatible(&self, other: &Self) {
@@ -214,13 +276,18 @@ impl<M: PolyMatrix> Add<&Self> for NaiveBGGPublicKeyVec<M> {
 
     fn add(self, other: &Self) -> Self {
         self.assert_compatible(other);
-        Self::new(
-            self.keys
-                .into_par_iter()
-                .zip(other.keys.par_iter())
-                .map(|(lhs, rhs)| lhs + rhs)
-                .collect(),
-        )
+        let params = self.params.clone();
+        let keys = self
+            .keys
+            .into_par_iter()
+            .zip(other.keys.par_iter())
+            .map(|(lhs, rhs)| {
+                let lhs = BggPublicKey::from_compact(params.as_ref(), &lhs);
+                let rhs = BggPublicKey::from_compact(params.as_ref(), rhs);
+                (lhs + &rhs).to_compact()
+            })
+            .collect::<Vec<_>>();
+        Self::from_compact_slots(params.as_ref(), keys)
     }
 }
 
@@ -237,13 +304,18 @@ impl<M: PolyMatrix> Sub<&Self> for NaiveBGGPublicKeyVec<M> {
 
     fn sub(self, other: &Self) -> Self {
         self.assert_compatible(other);
-        Self::new(
-            self.keys
-                .into_par_iter()
-                .zip(other.keys.par_iter())
-                .map(|(lhs, rhs)| lhs - rhs)
-                .collect(),
-        )
+        let params = self.params.clone();
+        let keys = self
+            .keys
+            .into_par_iter()
+            .zip(other.keys.par_iter())
+            .map(|(lhs, rhs)| {
+                let lhs = BggPublicKey::from_compact(params.as_ref(), &lhs);
+                let rhs = BggPublicKey::from_compact(params.as_ref(), rhs);
+                (lhs - &rhs).to_compact()
+            })
+            .collect::<Vec<_>>();
+        Self::from_compact_slots(params.as_ref(), keys)
     }
 }
 
@@ -260,13 +332,18 @@ impl<M: PolyMatrix> Mul<&Self> for NaiveBGGPublicKeyVec<M> {
 
     fn mul(self, other: &Self) -> Self {
         self.assert_compatible(other);
-        Self::new(
-            self.keys
-                .into_par_iter()
-                .zip(other.keys.par_iter())
-                .map(|(lhs, rhs)| lhs * rhs)
-                .collect(),
-        )
+        let params = self.params.clone();
+        let keys = self
+            .keys
+            .into_par_iter()
+            .zip(other.keys.par_iter())
+            .map(|(lhs, rhs)| {
+                let lhs = BggPublicKey::from_compact(params.as_ref(), &lhs);
+                let rhs = BggPublicKey::from_compact(params.as_ref(), rhs);
+                (lhs * &rhs).to_compact()
+            })
+            .collect::<Vec<_>>();
+        Self::from_compact_slots(params.as_ref(), keys)
     }
 }
 
@@ -276,13 +353,11 @@ impl<M: PolyMatrix> Evaluable for NaiveBGGPublicKeyVec<M> {
     type Params = <M::P as Poly>::Params;
 
     fn to_compact(self) -> Self::Compact {
-        NaiveBGGPublicKeyVecCompact {
-            keys: self.keys.into_iter().map(Evaluable::to_compact).collect(),
-        }
+        NaiveBGGPublicKeyVecCompact { keys: self.keys }
     }
 
     fn from_compact(params: &Self::Params, compact: &Self::Compact) -> Self {
-        Self::new(compact.keys.iter().map(|key| BggPublicKey::from_compact(params, key)).collect())
+        Self::from_compact_slots(params, compact.keys.clone())
     }
 
     #[cfg(feature = "gpu")]
@@ -291,29 +366,48 @@ impl<M: PolyMatrix> Evaluable for NaiveBGGPublicKeyVec<M> {
     }
 
     fn small_scalar_mul(&self, params: &Self::Params, scalar: &[u32]) -> Self {
-        Self::new(self.keys.par_iter().map(|key| key.small_scalar_mul(params, scalar)).collect())
+        Self::from_compact_slots(
+            params,
+            self.keys
+                .par_iter()
+                .map(|key| {
+                    BggPublicKey::from_compact(params, key)
+                        .small_scalar_mul(params, scalar)
+                        .to_compact()
+                })
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn large_scalar_mul(&self, params: &Self::Params, scalar: &[BigUint]) -> Self {
-        Self::new(self.keys.par_iter().map(|key| key.large_scalar_mul(params, scalar)).collect())
+        Self::from_compact_slots(
+            params,
+            self.keys
+                .par_iter()
+                .map(|key| {
+                    BggPublicKey::from_compact(params, key)
+                        .large_scalar_mul(params, scalar)
+                        .to_compact()
+                })
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn concat_columns(&self, others: &[Self]) -> Self {
         for other in others {
             self.assert_compatible(other);
         }
-        Self::new(
+        Self::from_compact_slots(
+            self.params(),
             (0..self.num_slots())
                 .into_par_iter()
                 .map(|slot_idx| {
-                    self.keys[slot_idx].concat_columns(
-                        &others
-                            .iter()
-                            .map(|other| other.keys[slot_idx].clone())
-                            .collect::<Vec<_>>(),
-                    )
+                    let key = self.key(slot_idx);
+                    let other_keys =
+                        others.iter().map(|other| other.key(slot_idx)).collect::<Vec<_>>();
+                    key.concat_columns(&other_keys).to_compact()
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
         )
     }
 
@@ -321,7 +415,17 @@ impl<M: PolyMatrix> Evaluable for NaiveBGGPublicKeyVec<M> {
     where
         Rhs: PolyMatrix<P = Self::P>,
     {
-        Self::new(self.keys.par_iter().map(|key| key.matrix_mul(params, rhs_matrix)).collect())
+        Self::from_compact_slots(
+            params,
+            self.keys
+                .par_iter()
+                .map(|key| {
+                    BggPublicKey::from_compact(params, key)
+                        .matrix_mul(params, rhs_matrix)
+                        .to_compact()
+                })
+                .collect::<Vec<_>>(),
+        )
     }
 }
 
@@ -338,13 +442,18 @@ impl<M: PolyMatrix> Add<&Self> for NaiveBGGEncodingVec<M> {
 
     fn add(self, other: &Self) -> Self {
         self.assert_compatible(other);
-        Self::new(
-            self.encodings
-                .into_par_iter()
-                .zip(other.encodings.par_iter())
-                .map(|(lhs, rhs)| lhs + rhs)
-                .collect(),
-        )
+        let params = self.params.clone();
+        let encodings = self
+            .encodings
+            .into_par_iter()
+            .zip(other.encodings.par_iter())
+            .map(|(lhs, rhs)| {
+                let lhs = BggEncoding::from_compact(params.as_ref(), &lhs);
+                let rhs = BggEncoding::from_compact(params.as_ref(), rhs);
+                (lhs + &rhs).to_compact()
+            })
+            .collect::<Vec<_>>();
+        Self::from_compact_slots(params.as_ref(), encodings)
     }
 }
 
@@ -361,13 +470,18 @@ impl<M: PolyMatrix> Sub<&Self> for NaiveBGGEncodingVec<M> {
 
     fn sub(self, other: &Self) -> Self {
         self.assert_compatible(other);
-        Self::new(
-            self.encodings
-                .into_par_iter()
-                .zip(other.encodings.par_iter())
-                .map(|(lhs, rhs)| lhs - rhs)
-                .collect(),
-        )
+        let params = self.params.clone();
+        let encodings = self
+            .encodings
+            .into_par_iter()
+            .zip(other.encodings.par_iter())
+            .map(|(lhs, rhs)| {
+                let lhs = BggEncoding::from_compact(params.as_ref(), &lhs);
+                let rhs = BggEncoding::from_compact(params.as_ref(), rhs);
+                (lhs - &rhs).to_compact()
+            })
+            .collect::<Vec<_>>();
+        Self::from_compact_slots(params.as_ref(), encodings)
     }
 }
 
@@ -384,13 +498,18 @@ impl<M: PolyMatrix> Mul<&Self> for NaiveBGGEncodingVec<M> {
 
     fn mul(self, other: &Self) -> Self {
         self.assert_compatible(other);
-        Self::new(
-            self.encodings
-                .into_par_iter()
-                .zip(other.encodings.par_iter())
-                .map(|(lhs, rhs)| lhs * rhs)
-                .collect(),
-        )
+        let params = self.params.clone();
+        let encodings = self
+            .encodings
+            .into_par_iter()
+            .zip(other.encodings.par_iter())
+            .map(|(lhs, rhs)| {
+                let lhs = BggEncoding::from_compact(params.as_ref(), &lhs);
+                let rhs = BggEncoding::from_compact(params.as_ref(), rhs);
+                (lhs * &rhs).to_compact()
+            })
+            .collect::<Vec<_>>();
+        Self::from_compact_slots(params.as_ref(), encodings)
     }
 }
 
@@ -400,19 +519,11 @@ impl<M: PolyMatrix> Evaluable for NaiveBGGEncodingVec<M> {
     type Params = <M::P as Poly>::Params;
 
     fn to_compact(self) -> Self::Compact {
-        NaiveBGGEncodingVecCompact {
-            encodings: self.encodings.into_iter().map(Evaluable::to_compact).collect(),
-        }
+        NaiveBGGEncodingVecCompact { encodings: self.encodings }
     }
 
     fn from_compact(params: &Self::Params, compact: &Self::Compact) -> Self {
-        Self::new(
-            compact
-                .encodings
-                .iter()
-                .map(|encoding| BggEncoding::from_compact(params, encoding))
-                .collect(),
-        )
+        Self::from_compact_slots(params, compact.encodings.clone())
     }
 
     #[cfg(feature = "gpu")]
@@ -421,20 +532,30 @@ impl<M: PolyMatrix> Evaluable for NaiveBGGEncodingVec<M> {
     }
 
     fn small_scalar_mul(&self, params: &Self::Params, scalar: &[u32]) -> Self {
-        Self::new(
+        Self::from_compact_slots(
+            params,
             self.encodings
                 .par_iter()
-                .map(|encoding| encoding.small_scalar_mul(params, scalar))
-                .collect(),
+                .map(|encoding| {
+                    BggEncoding::from_compact(params, encoding)
+                        .small_scalar_mul(params, scalar)
+                        .to_compact()
+                })
+                .collect::<Vec<_>>(),
         )
     }
 
     fn large_scalar_mul(&self, params: &Self::Params, scalar: &[BigUint]) -> Self {
-        Self::new(
+        Self::from_compact_slots(
+            params,
             self.encodings
                 .par_iter()
-                .map(|encoding| encoding.large_scalar_mul(params, scalar))
-                .collect(),
+                .map(|encoding| {
+                    BggEncoding::from_compact(params, encoding)
+                        .large_scalar_mul(params, scalar)
+                        .to_compact()
+                })
+                .collect::<Vec<_>>(),
         )
     }
 
@@ -442,18 +563,17 @@ impl<M: PolyMatrix> Evaluable for NaiveBGGEncodingVec<M> {
         for other in others {
             self.assert_compatible(other);
         }
-        Self::new(
+        Self::from_compact_slots(
+            self.params(),
             (0..self.num_slots())
                 .into_par_iter()
                 .map(|slot_idx| {
-                    self.encodings[slot_idx].concat_columns(
-                        &others
-                            .iter()
-                            .map(|other| other.encodings[slot_idx].clone())
-                            .collect::<Vec<_>>(),
-                    )
+                    let encoding = self.encoding(slot_idx);
+                    let other_encodings =
+                        others.iter().map(|other| other.encoding(slot_idx)).collect::<Vec<_>>();
+                    encoding.concat_columns(&other_encodings).to_compact()
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
         )
     }
 
@@ -461,11 +581,16 @@ impl<M: PolyMatrix> Evaluable for NaiveBGGEncodingVec<M> {
     where
         Rhs: PolyMatrix<P = Self::P>,
     {
-        Self::new(
+        Self::from_compact_slots(
+            params,
             self.encodings
                 .par_iter()
-                .map(|encoding| encoding.matrix_mul(params, rhs_matrix))
-                .collect(),
+                .map(|encoding| {
+                    BggEncoding::from_compact(params, encoding)
+                        .matrix_mul(params, rhs_matrix)
+                        .to_compact()
+                })
+                .collect::<Vec<_>>(),
         )
     }
 }
@@ -536,8 +661,8 @@ mod tests {
         let output = evaluator.slot_transfer(&params, &input, &[(2, None), (0, None)], GateId(7));
 
         assert_eq!(output.num_slots(), 2);
-        assert_eq!(output.keys[0], input.keys[2]);
-        assert_eq!(output.keys[1], input.keys[0]);
+        assert_eq!(output.key(0), input.key(2));
+        assert_eq!(output.key(1), input.key(0));
     }
 
     #[sequential_test::sequential]
@@ -554,28 +679,27 @@ mod tests {
         let vector_keys =
             vector_sampler.sample(&params, b"naive-pubkey-vector-layout", &reveal_plaintexts);
 
-        let scalar_reveal_plaintexts = std::iter::repeat_n(true, num_slots - 1)
-            .chain(
-                reveal_plaintexts
-                    .iter()
-                    .flat_map(|reveal_plaintext| vec![*reveal_plaintext; num_slots]),
-            )
-            .collect::<Vec<_>>();
         let scalar_sampler =
             BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(hash_key, d);
-        let scalar_keys = scalar_sampler.sample(
-            &params,
-            b"naive-pubkey-vector-layout",
-            &scalar_reveal_plaintexts,
-        );
 
         assert_eq!(vector_keys.len(), 1 + reveal_plaintexts.len());
         for (vector_idx, vector_key) in vector_keys.iter().enumerate() {
-            let start = vector_idx * num_slots;
-            assert_eq!(vector_key.keys, scalar_keys[start..start + num_slots]);
+            let reveal_plaintext =
+                if vector_idx == 0 { true } else { reveal_plaintexts[vector_idx - 1] };
+            for slot_idx in 0..num_slots {
+                let mut slot_tag = b"naive-pubkey-vector-layout".to_vec();
+                slot_tag.extend_from_slice(&(vector_idx as u64).to_le_bytes());
+                slot_tag.extend_from_slice(&(slot_idx as u64).to_le_bytes());
+                let expected = if vector_idx == 0 {
+                    scalar_sampler.sample(&params, &slot_tag, &[]).pop().unwrap()
+                } else {
+                    scalar_sampler.sample(&params, &slot_tag, &[reveal_plaintext]).pop().unwrap()
+                };
+                assert_eq!(vector_key.key(slot_idx), expected);
+            }
         }
-        assert_ne!(vector_keys[0].keys[0], vector_keys[0].keys[1]);
-        assert_ne!(vector_keys[0].keys[1], vector_keys[0].keys[2]);
+        assert_ne!(vector_keys[0].key(0), vector_keys[0].key(1));
+        assert_ne!(vector_keys[0].key(1), vector_keys[0].key(2));
     }
 
     #[sequential_test::sequential]
@@ -601,10 +725,10 @@ mod tests {
         let output = evaluator.slot_transfer(&params, &input, &[(1, None), (2, None)], GateId(8));
 
         assert_eq!(output.num_slots(), 2);
-        assert_eq!(output.encodings[0].vector, input.encodings[1].vector);
-        assert_eq!(output.encodings[1].vector, input.encodings[2].vector);
-        assert_eq!(output.encodings[0].plaintext, input.encodings[1].plaintext);
-        assert_eq!(output.encodings[1].plaintext, input.encodings[2].plaintext);
+        assert_eq!(output.encoding(0).vector, input.encoding(1).vector);
+        assert_eq!(output.encoding(1).vector, input.encoding(2).vector);
+        assert_eq!(output.encoding(0).plaintext, input.encoding(1).plaintext);
+        assert_eq!(output.encoding(1).plaintext, input.encoding(2).plaintext);
     }
 
     #[sequential_test::sequential]
@@ -640,26 +764,25 @@ mod tests {
         );
         let vector_encodings = vector_sampler.sample(&params, &pubkeys, &plaintexts);
 
-        let scalar_public_keys = pubkeys
-            .iter()
-            .flat_map(|public_key| public_key.keys.iter().cloned())
-            .collect::<Vec<_>>();
-        let mut scalar_plaintexts =
-            Vec::with_capacity(num_slots - 1 + plaintexts.len() * num_slots);
-        scalar_plaintexts
-            .extend(std::iter::repeat_with(|| DCRTPoly::const_one(&params)).take(num_slots - 1));
-        scalar_plaintexts
-            .extend(plaintexts.iter().flat_map(|plaintext| plaintext.as_slice().iter().cloned()));
         let scalar_sampler =
             BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
-        let scalar_encodings =
-            scalar_sampler.sample(&params, &scalar_public_keys, &scalar_plaintexts);
 
         assert_eq!(vector_encodings.len(), 1 + plaintexts.len());
         for (vector_idx, vector_encoding) in vector_encodings.iter().enumerate() {
-            let start = vector_idx * num_slots;
-            for (slot_idx, encoding) in vector_encoding.encodings.iter().enumerate() {
-                let expected = &scalar_encodings[start + slot_idx];
+            for slot_idx in 0..num_slots {
+                let one_key = pubkeys[0].key(slot_idx);
+                let expected = if vector_idx == 0 {
+                    scalar_sampler.sample(&params, &[one_key], &[]).pop().unwrap()
+                } else {
+                    let input_key = pubkeys[vector_idx].key(slot_idx);
+                    let plaintext = plaintexts[vector_idx - 1].as_slice()[slot_idx].clone();
+                    scalar_sampler
+                        .sample(&params, &[one_key, input_key], &[plaintext])
+                        .into_iter()
+                        .nth(1)
+                        .unwrap()
+                };
+                let encoding = vector_encoding.encoding(slot_idx);
                 assert_eq!(encoding.vector, expected.vector);
                 assert_eq!(encoding.pubkey, expected.pubkey);
                 assert_eq!(encoding.plaintext, expected.plaintext);
@@ -689,14 +812,14 @@ mod tests {
                 .map(|slot_idx| {
                     let mut scalar = vec![0u32; ring_dim];
                     scalar[slot_idx] = 1;
-                    input.keys[slot_idx].small_scalar_mul(&params, &scalar)
+                    input.key(slot_idx).small_scalar_mul(&params, &scalar)
                 })
                 .collect::<Vec<_>>();
             let mut expected = terms.drain(..1).next().unwrap();
             for term in terms {
                 expected = expected + &term;
             }
-            assert_eq!(output.keys[input_idx], expected);
+            assert_eq!(output.key(input_idx), expected);
         }
     }
 
@@ -741,16 +864,16 @@ mod tests {
                 .map(|slot_idx| {
                     let mut scalar = vec![0u32; ring_dim];
                     scalar[slot_idx] = 1;
-                    input.encodings[slot_idx].small_scalar_mul(&params, &scalar)
+                    input.encoding(slot_idx).small_scalar_mul(&params, &scalar)
                 })
                 .collect::<Vec<_>>();
             let mut expected = terms.drain(..1).next().unwrap();
             for term in terms {
                 expected = expected + &term;
             }
-            assert_eq!(output.encodings[input_idx].vector, expected.vector);
-            assert_eq!(output.encodings[input_idx].pubkey, expected.pubkey);
-            assert_eq!(output.encodings[input_idx].plaintext, expected.plaintext);
+            assert_eq!(output.encoding(input_idx).vector, expected.vector);
+            assert_eq!(output.encoding(input_idx).pubkey, expected.pubkey);
+            assert_eq!(output.encoding(input_idx).plaintext, expected.plaintext);
         }
     }
 
@@ -800,7 +923,7 @@ mod tests {
             0,
         );
 
-        assert_ne!(two_slot_output.keys[0], three_slot_output.keys[2]);
+        assert_ne!(two_slot_output.key(0), three_slot_output.key(2));
     }
 
     #[tokio::test]
@@ -886,14 +1009,15 @@ mod tests {
 
         for slot_idx in 0..num_slots {
             assert_eq!(
-                result_encoding[0].encodings[slot_idx].pubkey,
-                result_pubkey[0].keys[slot_idx]
+                result_encoding[0].encoding(slot_idx).pubkey,
+                result_pubkey[0].key(slot_idx)
             );
             let expected_bit = plaintext_slots[slot_idx].const_coeff_u64() & 1;
             let expected_plaintext =
                 DCRTPoly::from_usize_to_constant(&params, expected_bit as usize);
             assert_eq!(
-                result_encoding[0].encodings[slot_idx]
+                result_encoding[0]
+                    .encoding(slot_idx)
                     .plaintext
                     .as_ref()
                     .expect("lookup output plaintext should be revealed"),

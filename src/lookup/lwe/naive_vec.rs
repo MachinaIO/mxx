@@ -56,19 +56,21 @@ where
         input.assert_compatible(one);
         let num_slots = input.num_slots();
         NaiveBGGPublicKeyVec::new(
+            params,
             (0..num_slots)
                 .into_par_iter()
                 .map(|slot_idx| {
+                    let input_key = input.key(slot_idx);
                     self.inner.public_lookup_for_slot(
                         params,
                         plt,
-                        &input.keys[slot_idx],
+                        &input_key,
                         gate_id,
                         lut_id,
                         Some(slot_idx),
                     )
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
         )
     }
 }
@@ -157,19 +159,21 @@ where
         input.assert_compatible(one);
         let num_slots = input.num_slots();
         NaiveBGGEncodingVec::new(
+            params,
             (0..num_slots)
                 .into_par_iter()
                 .map(|slot_idx| {
+                    let input_encoding = input.encoding(slot_idx);
                     self.inner.public_lookup_for_slot(
                         params,
                         plt,
-                        &input.encodings[slot_idx],
+                        &input_encoding,
                         gate_id,
                         lut_id,
                         Some(slot_idx),
                     )
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
         )
     }
 }

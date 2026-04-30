@@ -50,19 +50,19 @@ impl<M: PolyMatrix> SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>
         _gate_id: GateId,
     ) -> NaiveBGGPublicKeyVec<M> {
         NaiveBGGPublicKeyVec::new(
+            params,
             src_slots
                 .par_iter()
                 .map(|(src_slot, scalar)| {
-                    let key = input
-                        .keys
-                        .get(*src_slot as usize)
-                        .unwrap_or_else(|| panic!("source slot {} out of range", src_slot));
+                    let src_slot = *src_slot as usize;
+                    assert!(src_slot < input.num_slots(), "source slot {} out of range", src_slot);
+                    let key = input.key(src_slot);
                     match scalar {
                         Some(scalar) => key.small_scalar_mul(params, &[*scalar]),
-                        None => key.clone(),
+                        None => key,
                     }
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
         )
     }
 
@@ -90,6 +90,7 @@ impl<M: PolyMatrix> SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>
         );
 
         NaiveBGGPublicKeyVec::new(
+            params,
             inputs
                 .par_iter()
                 .enumerate()
@@ -105,7 +106,7 @@ impl<M: PolyMatrix> SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>
                         .map(|src_slot| {
                             let mut scalar = vec![0u32; ring_dim];
                             scalar[src_slot] = 1;
-                            input.keys[src_slot].small_scalar_mul(params, &scalar)
+                            input.key(src_slot).small_scalar_mul(params, &scalar)
                         })
                         .collect::<Vec<_>>();
                     let mut reduced = terms.drain(..1).next().expect("slot_reduce needs a term");
@@ -114,7 +115,7 @@ impl<M: PolyMatrix> SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>
                     }
                     reduced
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
         )
     }
 }
@@ -130,19 +131,19 @@ impl<M: PolyMatrix> SlotTransferEvaluator<NaiveBGGEncodingVec<M>>
         _gate_id: GateId,
     ) -> NaiveBGGEncodingVec<M> {
         NaiveBGGEncodingVec::new(
+            params,
             src_slots
                 .par_iter()
                 .map(|(src_slot, scalar)| {
-                    let encoding = input
-                        .encodings
-                        .get(*src_slot as usize)
-                        .unwrap_or_else(|| panic!("source slot {} out of range", src_slot));
+                    let src_slot = *src_slot as usize;
+                    assert!(src_slot < input.num_slots(), "source slot {} out of range", src_slot);
+                    let encoding = input.encoding(src_slot);
                     match scalar {
                         Some(scalar) => encoding.small_scalar_mul(params, &[*scalar]),
-                        None => encoding.clone(),
+                        None => encoding,
                     }
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
         )
     }
 
@@ -170,6 +171,7 @@ impl<M: PolyMatrix> SlotTransferEvaluator<NaiveBGGEncodingVec<M>>
         );
 
         NaiveBGGEncodingVec::new(
+            params,
             inputs
                 .par_iter()
                 .enumerate()
@@ -185,7 +187,7 @@ impl<M: PolyMatrix> SlotTransferEvaluator<NaiveBGGEncodingVec<M>>
                         .map(|src_slot| {
                             let mut scalar = vec![0u32; ring_dim];
                             scalar[src_slot] = 1;
-                            input.encodings[src_slot].small_scalar_mul(params, &scalar)
+                            input.encoding(src_slot).small_scalar_mul(params, &scalar)
                         })
                         .collect::<Vec<_>>();
                     let mut reduced = terms.drain(..1).next().expect("slot_reduce needs a term");
@@ -194,7 +196,7 @@ impl<M: PolyMatrix> SlotTransferEvaluator<NaiveBGGEncodingVec<M>>
                     }
                     reduced
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
         )
     }
 }

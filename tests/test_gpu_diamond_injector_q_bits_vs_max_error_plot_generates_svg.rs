@@ -263,9 +263,11 @@ fn verify_gpu_online_eval_errors_below_simulation(
     .with_gpu_device_ids(gpu_ids.to_vec());
 
     let one_pubkey = sample_pubkey(&params, hash_key, "diamond_plot_one_pubkey");
-    let input_pubkeys = (0..input_count)
-        .map(|digit_idx| {
-            sample_pubkey(&params, hash_key, &format!("diamond_plot_input_pubkey_{digit_idx}"))
+    let batch_bits =
+        usize::try_from(digit_bits).expect("digit_bits must fit into usize for input pubkeys");
+    let input_pubkeys = (0..input_count * batch_bits)
+        .map(|bit_idx| {
+            sample_pubkey(&params, hash_key, &format!("diamond_plot_input_pubkey_{bit_idx}"))
         })
         .collect::<Vec<_>>();
     let decoder_pubkeys = (0..DIAMOND_INJECTOR_DECODER_COUNT)
@@ -314,19 +316,22 @@ fn verify_gpu_online_eval_errors_below_simulation(
         <GpuDCRTPolyMatrix as PolyMatrix>::P::const_one(&params),
         &crossing_point.max_error,
     );
-    for (digit_idx, output) in input_outputs.iter().enumerate() {
-        assert_encoding_residual_below_bound(
-            &format!("input_digit_{digit_idx}"),
-            &params,
-            output,
-            &secret_product,
-            &input_pubkeys[digit_idx],
-            <GpuDCRTPolyMatrix as PolyMatrix>::P::from_usize_to_constant(
+    assert_eq!(input_outputs.len(), input_count * batch_bits);
+    for digit_idx in 0..input_count {
+        for bit_idx in 0..batch_bits {
+            let output_idx = digit_idx * batch_bits + bit_idx;
+            let output = &input_outputs[output_idx];
+            let bit_value = ((input_digits[digit_idx] as usize) >> bit_idx) & 1;
+            assert_encoding_residual_below_bound(
+                &format!("input_bit_{output_idx}"),
                 &params,
-                input_digits[digit_idx] as usize,
-            ),
-            &crossing_point.max_error,
-        );
+                output,
+                &secret_product,
+                &input_pubkeys[output_idx],
+                <GpuDCRTPolyMatrix as PolyMatrix>::P::from_usize_to_constant(&params, bit_value),
+                &crossing_point.max_error,
+            );
+        }
     }
     for (decoder_idx, output) in decoder_outputs.iter().enumerate() {
         assert_decoder_residual_below_bound(

@@ -91,7 +91,7 @@ where
             ctx.clone(),
             self.state_row_size(),
             self.state_row_size(),
-            BigDecimal::from(self.base.saturating_sub(1).max(1) as u64),
+            BigDecimal::from(1u64),
             Some(DIAMOND_SECRET_SIZE),
         );
         debug!(
@@ -131,11 +131,13 @@ where
                         secret_factor.clone() * &transition_target_error
                 })
                 .collect::<Vec<_>>();
-            let born_secret_factor = secret_state_factors[0].clone() * &special_selector;
-            let born_state_error = state_errors[0].clone() * &transition_preimage +
-                secret_state_factors[0].clone() * &transition_target_error;
-            next_secret_factors.push(born_secret_factor);
-            next_state_errors.push(born_state_error);
+            for _ in 0..self.batch_bits() {
+                let born_secret_factor = secret_state_factors[0].clone() * &special_selector;
+                let born_state_error = state_errors[0].clone() * &transition_preimage +
+                    secret_state_factors[0].clone() * &transition_target_error;
+                next_secret_factors.push(born_secret_factor);
+                next_state_errors.push(born_state_error);
+            }
             secret_state_factors = next_secret_factors;
             state_errors = next_state_errors;
             debug!(
@@ -147,8 +149,8 @@ where
         }
 
         let one_error = state_errors[0].clone() * &output_preimage;
-        let input_errors = (0..self.input_count)
-            .map(|input_idx| state_errors[input_idx + 1].clone() * &output_preimage)
+        let input_errors = (0..self.input_bit_count())
+            .map(|bit_idx| state_errors[bit_idx + 1].clone() * &output_preimage)
             .collect::<Vec<_>>();
         let decoder_errors = vec![one_error.clone(); self.decoder_count];
         debug!(

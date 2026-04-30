@@ -336,7 +336,7 @@ where
                             })
                             .as_ref(),
                     );
-                    let ext_matrix = if state_idx == level {
+                    let ext_matrix = if self.new_bit_idx_for_state(level, state_idx).is_some() {
                         self.sample_w_block_with_params(&shared.params, 0, level - 1)
                     } else {
                         self.sample_w_block_with_params(&shared.params, state_idx, level - 1)
@@ -937,6 +937,7 @@ where
         let preprocess_started = Instant::now();
         let state_cols = self.state_col_size(&self.params);
         let output_cols = self.gadget_col_size(&self.params);
+        let input_bit_count = self.input_bit_count();
         info!("diamond injector gpu preprocess: starting");
 
         // Persist the empty-prefix seed once. This seed is not a trapdoor
@@ -973,7 +974,7 @@ where
                 .collect::<HashMap<_, _>>();
             let mut stage_tasks = Vec::new();
             for digit_value in 0..self.base {
-                for state_idx in 0..=level {
+                for state_idx in 0..self.expanded_state_count_after_level(level) {
                     for chunk_idx in 0..column_chunk_count(state_cols) {
                         let task = DiamondPreprocessChunkTask::K {
                             level,
@@ -1011,10 +1012,10 @@ where
         }
 
         // Process every L_j chunk using only the final source trapdoor. The
-        // one/input public keys stay on CPU as compact bytes and are loaded per
+        // one/bit input public keys stay on CPU as compact bytes and are loaded per
         // task immediately before building the target chunk.
         let mut l_tasks = Vec::new();
-        for input_idx in 0..=self.input_count {
+        for input_idx in 0..=input_bit_count {
             for chunk_idx in 0..column_chunk_count(output_cols) {
                 let task = DiamondPreprocessChunkTask::L { input_idx, chunk_idx };
                 if !self.matrix_exists(&self.preprocess_chunk_id(&task)) {
@@ -1127,9 +1128,9 @@ where
             // Schedule one matrix-product family per active branch. The helper
             // below splits the right-hand-side chunks across devices and then
             // reassembles each branch on CPU from compact bytes.
-            let family_specs = (0..=level)
+            let family_specs = (0..self.expanded_state_count_after_level(level))
                 .map(|state_idx| {
-                    let lhs_bytes = if state_idx == level {
+                    let lhs_bytes = if self.new_bit_idx_for_state(level, state_idx).is_some() {
                         prev_p0_bytes.clone()
                     } else {
                         Arc::<[u8]>::from(prev_states[state_idx].to_compact_bytes())
@@ -1145,7 +1146,7 @@ where
                 })
                 .collect::<HashMap<_, _>>();
             let outputs = self.gpu_left_mul_families(family_specs);
-            states = (0..=level)
+            states = (0..self.expanded_state_count_after_level(level))
                 .map(|state_idx| {
                     outputs
                         .get(&DiamondEvalFamily::State(state_idx))
@@ -1170,14 +1171,16 @@ where
                 rhs_chunk_bytes: self.read_chunk_bytes(&self.l_id(0), output_cols),
             },
         );
-        // Turn each digit-specific branch into the encoding for the digit that
-        // was chosen at that position.
-        for input_idx in 0..self.input_count {
+        // Turn each bit-specific branch into the encoding for the chosen bit.
+        for bit_output_idx in 0..self.input_bit_count() {
+            let digit_idx = bit_output_idx / self.batch_bits();
+            let bit_idx = bit_output_idx % self.batch_bits();
+            let state_idx = self.bit_state_idx(digit_idx, bit_idx);
             family_specs.insert(
-                DiamondEvalFamily::Input(input_idx),
+                DiamondEvalFamily::Input(bit_output_idx),
                 DiamondEvalFamilySpec {
-                    lhs_bytes: Arc::<[u8]>::from(states[input_idx + 1].to_compact_bytes()),
-                    rhs_chunk_bytes: self.read_chunk_bytes(&self.l_id(input_idx + 1), output_cols),
+                    lhs_bytes: Arc::<[u8]>::from(states[state_idx].to_compact_bytes()),
+                    rhs_chunk_bytes: self.read_chunk_bytes(&self.l_id(state_idx), output_cols),
                 },
             );
         }
@@ -1205,16 +1208,24 @@ where
             .iter()
             .copied()
             .enumerate()
-            .map(|(input_idx, digit_value)| {
+            .flat_map(|(digit_idx, digit_value)| {
+                (0..self.batch_bits())
+                    .map(move |bit_idx| (digit_idx, digit_value as usize, bit_idx))
+            })
+            .map(|(digit_idx, digit_value, bit_idx)| {
+                let bit_output_idx = self.bit_pubkey_idx(digit_idx, bit_idx);
                 self.build_output_encoding(
                     outputs
-                        .get(&DiamondEvalFamily::Input(input_idx))
+                        .get(&DiamondEvalFamily::Input(bit_output_idx))
                         .unwrap_or_else(|| {
-                            panic!("missing gpu online_eval input output {}", input_idx)
+                            panic!("missing gpu online_eval input output {}", bit_output_idx)
                         })
                         .clone(),
-                    input_digit_pubkeys[input_idx].clone(),
-                    Some(M::P::from_usize_to_constant(&self.params, digit_value as usize)),
+                    input_digit_pubkeys[bit_output_idx].clone(),
+                    Some(M::P::from_usize_to_constant(
+                        &self.params,
+                        self.digit_bit_value(digit_value, bit_idx),
+                    )),
                 )
             })
             .collect::<Vec<_>>();
@@ -1317,6 +1328,7 @@ mod tests {
         let hash_key = [11u8; 32];
         let input_count = 3;
         let base = 4;
+        let batch_bits = 2;
         let decoder_count = 2;
         let dir = tempdir().expect("temporary directory should be created");
 
@@ -1333,9 +1345,9 @@ mod tests {
         .with_gpu_device_ids(gpu_ids.clone());
 
         let one_pubkey = sample_pubkey(&params, hash_key, "diamond_gpu_one_pubkey");
-        let input_pubkeys = (0..input_count)
-            .map(|digit_idx| {
-                sample_pubkey(&params, hash_key, &format!("diamond_gpu_input_pubkey_{digit_idx}"))
+        let input_pubkeys = (0..input_count * batch_bits)
+            .map(|bit_idx| {
+                sample_pubkey(&params, hash_key, &format!("diamond_gpu_input_pubkey_{bit_idx}"))
             })
             .collect::<Vec<_>>();
         let decoder_pubkeys = (0..decoder_count)
@@ -1353,6 +1365,8 @@ mod tests {
         let digits = vec![2u32, 1u32, 3u32];
         let (one_output, digit_outputs, decoder_outputs) =
             injector.online_eval(&digits, &one_pubkey, &input_pubkeys, &decoder_pubkeys);
+        assert_eq!(digit_outputs.len(), input_count * batch_bits);
+        assert_eq!(decoder_outputs.len(), decoder_count);
 
         let mut secret_matrix = injector.read_matrix(injector.secret_epsilon_id());
         for (digit_idx, digit_value) in digits.iter().copied().enumerate() {
@@ -1366,12 +1380,17 @@ mod tests {
         assert_eq!(one_output.vector, secret_matrix.clone() * (&one_pubkey.matrix - &gadget));
         assert_eq!(one_output.plaintext, Some(TestPoly::const_one(&params)));
 
-        for (digit_idx, output) in digit_outputs.iter().enumerate() {
-            let plaintext = TestPoly::from_usize_to_constant(&params, digits[digit_idx] as usize);
-            let expected = secret_matrix.clone() * &input_pubkeys[digit_idx].matrix -
-                (secret_times_gadget.clone() * plaintext.clone());
-            assert_eq!(output.vector, expected);
-            assert_eq!(output.plaintext, Some(plaintext));
+        for digit_idx in 0..input_count {
+            for bit_idx in 0..batch_bits {
+                let output_idx = digit_idx * batch_bits + bit_idx;
+                let output = &digit_outputs[output_idx];
+                let bit_value = ((digits[digit_idx] as usize) >> bit_idx) & 1;
+                let plaintext = TestPoly::from_usize_to_constant(&params, bit_value);
+                let expected = secret_matrix.clone() * &input_pubkeys[output_idx].matrix -
+                    (secret_times_gadget.clone() * plaintext.clone());
+                assert_eq!(output.vector, expected);
+                assert_eq!(output.plaintext, Some(plaintext));
+            }
         }
 
         for (decoder_idx, output) in decoder_outputs.iter().enumerate() {

@@ -10,7 +10,7 @@ use mxx::{
         ModularArithmeticContext, MontgomeryPoly, MontgomeryPolyContext, encode_montgomery_poly,
     },
     lookup::{
-        ggh15_eval::{GGH15BGGEncodingPltEvaluator, GGH15BGGPubKeyPltEvaluator},
+        lwe::{LWEBGGEncodingPltEvaluator, LWEBGGPubKeyPltEvaluator},
         poly::PolyPltEvaluator,
     },
     matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
@@ -23,11 +23,11 @@ use mxx::{
         },
     },
     sampler::{
-        DistType, PolyUniformSampler,
+        DistType, PolyTrapdoorSampler, PolyUniformSampler,
         gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
         trapdoor::GpuDCRTPolyTrapdoorSampler,
     },
-    simulator::{SimulatorContext, error_norm::NormPltGGH15Evaluator},
+    simulator::{SimulatorContext, error_norm::NormPltLWEEvaluator},
     storage::write::{init_storage_system, wait_for_all_writes},
     utils::{bigdecimal_bits_ceil, gen_biguint_for_modulus},
 };
@@ -83,33 +83,32 @@ fn env_or_parse_f64(key: &str, default: f64) -> f64 {
 
 impl MontgomeryModqArithConfig {
     fn from_env() -> Self {
-        let ring_dim = env_or_parse_u32("GGH15_MONTGOMERY_MODQ_ARITH_RING_DIM", DEFAULT_RING_DIM);
-        let crt_bits = env_or_parse_usize("GGH15_MONTGOMERY_MODQ_ARITH_CRT_BITS", DEFAULT_CRT_BITS);
-        let base_bits =
-            env_or_parse_u32("GGH15_MONTGOMERY_MODQ_ARITH_BASE_BITS", DEFAULT_BASE_BITS);
+        let ring_dim = env_or_parse_u32("LWE_MONTGOMERY_MODQ_ARITH_RING_DIM", DEFAULT_RING_DIM);
+        let crt_bits = env_or_parse_usize("LWE_MONTGOMERY_MODQ_ARITH_CRT_BITS", DEFAULT_CRT_BITS);
+        let base_bits = env_or_parse_u32("LWE_MONTGOMERY_MODQ_ARITH_BASE_BITS", DEFAULT_BASE_BITS);
         let max_crt_depth =
-            env_or_parse_usize("GGH15_MONTGOMERY_MODQ_ARITH_MAX_CRT_DEPTH", DEFAULT_MAX_CRT_DEPTH);
+            env_or_parse_usize("LWE_MONTGOMERY_MODQ_ARITH_MAX_CRT_DEPTH", DEFAULT_MAX_CRT_DEPTH);
         let error_sigma =
-            env_or_parse_f64("GGH15_MONTGOMERY_MODQ_ARITH_ERROR_SIGMA", DEFAULT_ERROR_SIGMA);
-        let d_secret = env_or_parse_usize("GGH15_MONTGOMERY_MODQ_ARITH_D_SECRET", DEFAULT_D_SECRET);
-        let height = env_or_parse_usize("GGH15_MONTGOMERY_MODQ_ARITH_HEIGHT", DEFAULT_HEIGHT);
+            env_or_parse_f64("LWE_MONTGOMERY_MODQ_ARITH_ERROR_SIGMA", DEFAULT_ERROR_SIGMA);
+        let d_secret = env_or_parse_usize("LWE_MONTGOMERY_MODQ_ARITH_D_SECRET", DEFAULT_D_SECRET);
+        let height = env_or_parse_usize("LWE_MONTGOMERY_MODQ_ARITH_HEIGHT", DEFAULT_HEIGHT);
         let limb_bit_size =
-            env_or_parse_usize("GGH15_MONTGOMERY_MODQ_ARITH_LIMB_BIT_SIZE", DEFAULT_LIMB_BIT_SIZE);
-        let dir_name_override = env::var("GGH15_MONTGOMERY_MODQ_ARITH_DIR_NAME")
+            env_or_parse_usize("LWE_MONTGOMERY_MODQ_ARITH_LIMB_BIT_SIZE", DEFAULT_LIMB_BIT_SIZE);
+        let dir_name_override = env::var("LWE_MONTGOMERY_MODQ_ARITH_DIR_NAME")
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
 
-        assert!(ring_dim > 0, "GGH15_MONTGOMERY_MODQ_ARITH_RING_DIM must be > 0");
-        assert!(crt_bits > 0, "GGH15_MONTGOMERY_MODQ_ARITH_CRT_BITS must be > 0");
-        assert!(base_bits > 0, "GGH15_MONTGOMERY_MODQ_ARITH_BASE_BITS must be > 0");
-        assert!(max_crt_depth > 0, "GGH15_MONTGOMERY_MODQ_ARITH_MAX_CRT_DEPTH must be > 0");
-        assert!(error_sigma > 0.0, "GGH15_MONTGOMERY_MODQ_ARITH_ERROR_SIGMA must be > 0");
-        assert!(d_secret > 0, "GGH15_MONTGOMERY_MODQ_ARITH_D_SECRET must be > 0");
-        assert!(height > 0, "GGH15_MONTGOMERY_MODQ_ARITH_HEIGHT must be > 0");
+        assert!(ring_dim > 0, "LWE_MONTGOMERY_MODQ_ARITH_RING_DIM must be > 0");
+        assert!(crt_bits > 0, "LWE_MONTGOMERY_MODQ_ARITH_CRT_BITS must be > 0");
+        assert!(base_bits > 0, "LWE_MONTGOMERY_MODQ_ARITH_BASE_BITS must be > 0");
+        assert!(max_crt_depth > 0, "LWE_MONTGOMERY_MODQ_ARITH_MAX_CRT_DEPTH must be > 0");
+        assert!(error_sigma > 0.0, "LWE_MONTGOMERY_MODQ_ARITH_ERROR_SIGMA must be > 0");
+        assert!(d_secret > 0, "LWE_MONTGOMERY_MODQ_ARITH_D_SECRET must be > 0");
+        assert!(height > 0, "LWE_MONTGOMERY_MODQ_ARITH_HEIGHT must be > 0");
         assert!(
             limb_bit_size > 0 && limb_bit_size < 32,
-            "GGH15_MONTGOMERY_MODQ_ARITH_LIMB_BIT_SIZE must be in 1..32"
+            "LWE_MONTGOMERY_MODQ_ARITH_LIMB_BIT_SIZE must be in 1..32"
         );
 
         Self {
@@ -128,7 +127,7 @@ impl MontgomeryModqArithConfig {
     fn dir_name(&self) -> String {
         self.dir_name_override
             .clone()
-            .unwrap_or_else(|| "test_data/test_gpu_ggh15_montgomery_modq_arith".to_string())
+            .unwrap_or_else(|| "test_data/test_gpu_lwe_montgomery_modq_arith".to_string())
     }
 }
 
@@ -218,8 +217,7 @@ fn find_crt_depth_for_modq_arith(cfg: &MontgomeryModqArithConfig) -> (usize, DCR
             log_base_q,
             log_base_q_small,
         ));
-        let plt_evaluator =
-            NormPltGGH15Evaluator::new(ctx.clone(), &error_sigma, &error_sigma, None);
+        let plt_evaluator = NormPltLWEEvaluator::new(ctx.clone(), &error_sigma);
 
         let out_errors = circuit.simulate_max_error_norm(
             ctx,
@@ -257,7 +255,7 @@ fn find_crt_depth_for_modq_arith(cfg: &MontgomeryModqArithConfig) -> (usize, DCR
 }
 
 #[tokio::test]
-async fn test_gpu_ggh15_montgomery_modq_arith() {
+async fn test_gpu_lwe_montgomery_modq_arith() {
     let _ = tracing_subscriber::fmt::try_init();
     gpu_device_sync();
     let cfg = MontgomeryModqArithConfig::from_env();
@@ -265,7 +263,7 @@ async fn test_gpu_ggh15_montgomery_modq_arith() {
 
     let num_inputs = 1usize
         .checked_shl(cfg.height as u32)
-        .expect("GGH15_MONTGOMERY_MODQ_ARITH_HEIGHT is too large");
+        .expect("LWE_MONTGOMERY_MODQ_ARITH_HEIGHT is too large");
     let depth_search_start = Instant::now();
     let (crt_depth, cpu_params) = find_crt_depth_for_modq_arith(&cfg);
     info!("crt depth search elapsed_ms={:.3}", depth_search_start.elapsed().as_secs_f64() * 1000.0);
@@ -276,7 +274,7 @@ async fn test_gpu_ggh15_montgomery_modq_arith() {
     let single_gpu_id = *detected_gpu_params
         .gpu_ids()
         .first()
-        .expect("at least one GPU device is required for test_gpu_ggh15_montgomery_modq_arith");
+        .expect("at least one GPU device is required for test_gpu_lwe_montgomery_modq_arith");
     let params = GpuDCRTPolyParams::new_with_gpu(
         cpu_params.ring_dimension(),
         moduli,
@@ -404,13 +402,16 @@ async fn test_gpu_ggh15_montgomery_modq_arith() {
     );
 
     let pk_evaluator_setup_start = Instant::now();
+    let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, trapdoor_sigma);
+    let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(&params, cfg.d_secret);
+    let trapdoor = Arc::new(trapdoor);
+    let pub_matrix = Arc::new(pub_matrix);
     let pk_evaluator =
-        GGH15BGGPubKeyPltEvaluator::<
+        LWEBGGPubKeyPltEvaluator::<
             GpuDCRTPolyMatrix,
-            GpuDCRTPolyUniformSampler,
             GpuDCRTPolyHashSampler<Keccak256>,
             GpuDCRTPolyTrapdoorSampler,
-        >::new(seed, cfg.d_secret, trapdoor_sigma, cfg.error_sigma, dir.to_path_buf());
+        >::new(seed, trapdoor_sampler, pub_matrix.clone(), trapdoor, dir.to_path_buf());
     info!(
         "pk evaluator setup elapsed_ms={:.3}",
         pk_evaluator_setup_start.elapsed().as_secs_f64() * 1000.0
@@ -438,27 +439,22 @@ async fn test_gpu_ggh15_montgomery_modq_arith() {
         wait_writes_start.elapsed().as_secs_f64() * 1000.0
     );
 
-    let b0_matrix = pk_evaluator
-        .load_b0_matrix_checkpoint(&params)
-        .expect("b0 matrix checkpoint should exist after sample_aux_matrices");
-    let mut c_b0 = s_vec.clone() * &b0_matrix;
+    let mut c_b = s_vec.clone() * pub_matrix.as_ref();
     if cfg.error_sigma != 0.0 {
-        let c_b0_error = uniform_sampler.sample_uniform(
+        let c_b_error = uniform_sampler.sample_uniform(
             &params,
-            c_b0.row_size(),
-            c_b0.col_size(),
+            c_b.row_size(),
+            c_b.col_size(),
             DistType::GaussDist { sigma: cfg.error_sigma },
         );
-        c_b0 = c_b0 + c_b0_error;
+        c_b = c_b + c_b_error;
     }
-    drop(b0_matrix);
-    let checkpoint_prefix = pk_evaluator.checkpoint_prefix(&params);
     drop(pk_evaluator);
 
-    let enc_evaluator = GGH15BGGEncodingPltEvaluator::<
+    let enc_evaluator = LWEBGGEncodingPltEvaluator::<
         GpuDCRTPolyMatrix,
         GpuDCRTPolyHashSampler<Keccak256>,
-    >::new(seed, dir.to_path_buf(), checkpoint_prefix, &params, c_b0);
+    >::new(seed, dir.to_path_buf(), c_b);
 
     let encodings_restore_start = Instant::now();
     let mut encodings: Vec<_> = encodings_compact

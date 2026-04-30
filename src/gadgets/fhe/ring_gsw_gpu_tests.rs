@@ -3,7 +3,6 @@ use crate::{
     gadgets::fhe::ring_gsw_nested_rns::active_q_modulus,
     matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix,
     poly::dcrt::gpu::{GpuDCRTPoly, GpuDCRTPolyParams},
-    sampler::{DistType, PolyUniformSampler},
 };
 use bigdecimal::BigDecimal;
 use num_bigint::BigUint;

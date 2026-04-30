@@ -379,7 +379,16 @@ async fn test_lwe_modq_arith() {
     pk_evaluator.sample_aux_matrices(&params);
     wait_for_all_writes(dir.to_path_buf()).await.unwrap();
 
-    let p = s_vec.clone() * pub_matrix.as_ref();
+    let mut p = s_vec.clone() * pub_matrix.as_ref();
+    if ERROR_SIGMA != 0.0 {
+        let p_error = uniform_sampler.sample_uniform(
+            &params,
+            p.row_size(),
+            p.col_size(),
+            DistType::GaussDist { sigma: ERROR_SIGMA },
+        );
+        p = p + p_error;
+    }
     let enc_evaluator =
         LWEBGGEncodingPltEvaluator::<DCRTPolyMatrix, DCRTPolyHashSampler<Keccak256>>::new(
             seed,

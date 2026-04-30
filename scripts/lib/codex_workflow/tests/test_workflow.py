@@ -21,6 +21,7 @@ from codex_workflow.plan import (
     render_session_plan,
 )
 from codex_workflow.runners import (
+    CodexExecRunner,
     FinalTestResult,
     ShellBuildCheckRunner,
     ShellFinalTestRunner,
@@ -891,6 +892,30 @@ class WorkflowHarnessTests(unittest.TestCase):
 
         command = run_mock.call_args.args[0]
         self.assertEqual(command, [str(self.paths.scripts_dir / "run_build_checks.sh")])
+
+    def test_codex_exec_runner_uses_landlock_read_only_sandbox(self) -> None:
+        runner = CodexExecRunner(self.paths, "review-sandbox")
+
+        def fake_run(command: list[str], **_: object) -> object:
+            output_path = Path(command[command.index("-o") + 1])
+            output_path.write_text('{"result":"accept"}\n', encoding="utf-8")
+            completed = mock.Mock()
+            completed.returncode = 0
+            return completed
+
+        with mock.patch("codex_workflow.runners.subprocess.run", side_effect=fake_run) as run_mock:
+            result = runner.run(
+                prompt="review",
+                schema_path=self.paths.schemas_dir / "review-decision.schema.json",
+                label="final-review",
+            )
+
+        self.assertTrue(result.ok)
+        command = run_mock.call_args.args[0]
+        self.assertIn("--sandbox", command)
+        self.assertEqual(command[command.index("--sandbox") + 1], "read-only")
+        self.assertIn("--enable", command)
+        self.assertEqual(command[command.index("--enable") + 1], "use_legacy_landlock")
 
     def test_summarize_logs_prefers_stdout_when_it_contains_test_failure_and_stderr_only_has_compile_noise(
         self,

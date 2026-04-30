@@ -943,7 +943,8 @@ where
         // Persist the empty-prefix seed once. This seed is not a trapdoor
         // preimage; it is the initial encoding that online evaluation uses as
         // p_{epsilon,0} before any digit transition is applied.
-        let secret_epsilon_bytes = self.load_or_sample_secret_mask_bytes(self.secret_epsilon_id());
+        let secret_epsilon_bytes =
+            self.load_or_sample_secret_epsilon_bytes(self.secret_epsilon_id());
         if !self.matrix_exists(self.p_epsilon_id()) {
             let (b0_bytes, _) = self.load_or_sample_b_checkpoint_bytes(0);
             let b0_matrix = M::from_compact_bytes(&self.params, &b0_bytes);
@@ -966,7 +967,7 @@ where
                 .map(|digit_value| {
                     (
                         digit_value,
-                        Arc::<[u8]>::from(self.load_or_sample_secret_mask_bytes(
+                        Arc::<[u8]>::from(self.load_or_sample_digit_secret_mask_bytes(
                             &self.digit_secret_id(level, digit_value),
                         )),
                     )
@@ -1369,10 +1370,19 @@ mod tests {
         assert_eq!(decoder_outputs.len(), decoder_count);
 
         let mut secret_matrix = injector.read_matrix(injector.secret_epsilon_id());
+        assert_eq!(secret_matrix.size(), (1, super::super::DIAMOND_SECRET_SIZE));
+        assert_eq!(secret_matrix.entry(0, 1), TestPoly::const_minus_one(&params));
         for (digit_idx, digit_value) in digits.iter().copied().enumerate() {
-            secret_matrix = secret_matrix *
-                injector
-                    .read_matrix(&injector.digit_secret_id(digit_idx + 1, digit_value as usize));
+            let secret_mask = injector
+                .read_matrix(&injector.digit_secret_id(digit_idx + 1, digit_value as usize));
+            assert_eq!(
+                secret_mask.size(),
+                (super::super::DIAMOND_SECRET_SIZE, super::super::DIAMOND_SECRET_SIZE)
+            );
+            assert_eq!(secret_mask.entry(0, 1), TestPoly::const_zero(&params));
+            assert_eq!(secret_mask.entry(1, 0), TestPoly::const_zero(&params));
+            assert_eq!(secret_mask.entry(1, 1), TestPoly::const_one(&params));
+            secret_matrix = secret_matrix * secret_mask;
         }
         let gadget = GpuDCRTPolyMatrix::gadget_matrix(&params, super::super::DIAMOND_SECRET_SIZE);
         let secret_times_gadget = secret_matrix.clone() * &gadget;

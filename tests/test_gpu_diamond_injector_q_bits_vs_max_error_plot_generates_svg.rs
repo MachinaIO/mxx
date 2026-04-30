@@ -43,12 +43,13 @@ type TestInjector = DiamondInjector<
 >;
 
 const DIAMOND_INJECTOR_DECODER_COUNT: usize = 1;
+const DIAMOND_INJECTOR_SECRET_SIZE: usize = 2;
 const DIAMOND_INJECTOR_TRAPDOOR_SIGMA: f64 = 4.578;
 const DIAMOND_INJECTOR_ERROR_SIGMA: f64 = 4.578;
 const DEFAULT_RING_DIM: u32 = 1u32 << 16;
-const DEFAULT_CRT_BITS: usize = 32;
-const DEFAULT_INPUT_COUNT: usize = 32;
-const DEFAULT_DIGIT_BITS: u32 = 8;
+const DEFAULT_CRT_BITS: usize = 28;
+const DEFAULT_INPUT_COUNT: usize = 8;
+const DEFAULT_DIGIT_BITS: u32 = 1;
 const DEFAULT_MIN_CRT_DEPTH: usize = 10;
 const DEFAULT_MAX_CRT_DEPTH: usize = 64;
 
@@ -120,15 +121,15 @@ fn sample_pubkey(
         params,
         hash_key,
         tag,
-        1,
-        params.modulus_digits(),
+        DIAMOND_INJECTOR_SECRET_SIZE,
+        DIAMOND_INJECTOR_SECRET_SIZE * params.modulus_digits(),
         DistType::FinRingDist,
     );
     BggPublicKey::new(matrix, true)
 }
 
 fn secret_checkpoint_id(level: usize, digit_value: usize) -> String {
-    format!("diamond_secret_{level}_{digit_value}")
+    format!("diamond_secret_tensor_v2_{level}_{digit_value}")
 }
 
 fn read_checkpoint_matrix(
@@ -148,7 +149,8 @@ fn reconstruct_secret_product(
     dir_path: &Path,
     input_digits: &[u32],
 ) -> GpuDCRTPolyMatrix {
-    let mut secret_product = read_checkpoint_matrix(params, dir_path, "diamond_secret_epsilon");
+    let mut secret_product =
+        read_checkpoint_matrix(params, dir_path, "diamond_secret_epsilon_tensor_v2");
     for (digit_idx, digit_value) in input_digits.iter().copied().enumerate() {
         let digit_secret = read_checkpoint_matrix(
             params,
@@ -211,7 +213,7 @@ fn assert_encoding_residual_below_bound(
     plaintext: <GpuDCRTPolyMatrix as PolyMatrix>::P,
     max_error: &BigDecimal,
 ) {
-    let gadget = GpuDCRTPolyMatrix::gadget_matrix(params, 1);
+    let gadget = GpuDCRTPolyMatrix::gadget_matrix(params, DIAMOND_INJECTOR_SECRET_SIZE);
     let s_times_pubkey = secret_product.clone() * &pubkey.matrix;
     let s_times_plaintext_gadget = (secret_product.clone() * gadget) * plaintext;
     let residual = encoding.vector.clone() - s_times_pubkey + s_times_plaintext_gadget;

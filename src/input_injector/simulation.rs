@@ -42,10 +42,9 @@ where
             .sqrt()
             .expect("sqrt(ring_dimension) failed");
         let base = BigDecimal::from(BigInt::from(BigUint::from(1u64) << self.params.base_bits()));
-        // The shared simulator context tracks the ring/base geometry and the
-        // gadget width `m_g = log_base_q` because Diamond input insertion now
-        // fixes the secret size to 1. The state basis is still wider than
-        // `ctx.m_b`, so the concrete matrix dimensions stay explicit below.
+        // The shared simulator context tracks the two-row BGG+ output secret.
+        // Branch states are four-row tensor states, so concrete state
+        // dimensions stay explicit below.
         let ctx = Arc::new(SimulatorContext::new(
             ring_dim_sqrt,
             base,
@@ -57,12 +56,8 @@ where
         let gadget_cols = self.gadget_col_size(&self.params);
         let initial_sigma = BigDecimal::from_f64(self.error_sigma)
             .expect("DiamondInjector error_sigma must be finite");
-        let initial_state_error = PolyMatrixNorm::sample_gauss(
-            ctx.clone(),
-            DIAMOND_SECRET_SIZE,
-            state_cols,
-            initial_sigma,
-        );
+        let initial_state_error =
+            PolyMatrixNorm::sample_gauss(ctx.clone(), 1, state_cols, initial_sigma);
         let preimage_norm = compute_preimage_norm(
             &ctx.ring_dim_sqrt,
             ctx.m_g as u64,
@@ -104,13 +99,8 @@ where
             "diamond input-insertion simulator parameters",
         );
 
-        let mut secret_state_factors = vec![PolyMatrixNorm::new(
-            ctx,
-            DIAMOND_SECRET_SIZE,
-            self.state_row_size(),
-            BigDecimal::from(1u64),
-            None,
-        )];
+        let mut secret_state_factors =
+            vec![PolyMatrixNorm::new(ctx, 1, self.state_row_size(), BigDecimal::from(1u64), None)];
         let mut state_errors = vec![initial_state_error];
         debug!(
             ?secret_state_factors,

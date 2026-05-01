@@ -701,7 +701,8 @@ fn test_register_and_call_parameterized_sub_circuit() {
     let input_poly = create_random_poly(&params);
 
     let mut sub_circuit = PolyCircuit::new();
-    let scalar_param = sub_circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul);
+    let scalar_param = sub_circuit
+        .register_sub_circuit_param(SubCircuitParamSpec::SmallScalarMul { max_scalar: 3 });
     let sub_inputs = sub_circuit.input(1).to_vec();
     let scaled = sub_circuit.small_scalar_mul_param(sub_inputs[0], scalar_param);
     sub_circuit.output(vec![scaled]);
@@ -736,7 +737,8 @@ fn test_register_and_call_parameterized_sub_circuit() {
 #[test]
 fn test_parameterized_sub_circuit_reuses_identical_binding_sets() {
     let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
-    let scalar_param = sub_circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul);
+    let scalar_param = sub_circuit
+        .register_sub_circuit_param(SubCircuitParamSpec::SmallScalarMul { max_scalar: 9 });
     let sub_inputs = sub_circuit.input(1).to_vec();
     let scaled = sub_circuit.small_scalar_mul_param(sub_inputs[0], scalar_param);
     sub_circuit.output(vec![scaled]);
@@ -745,17 +747,17 @@ fn test_parameterized_sub_circuit_reuses_identical_binding_sets() {
     let main_inputs = main_circuit.input(1).to_vec();
     let sub_id = main_circuit.register_sub_circuit(sub_circuit);
 
-    let _ = main_circuit.call_sub_circuit_with_bindings(
+    main_circuit.call_sub_circuit_with_bindings(
         sub_id,
         &[main_inputs[0]],
         &[SubCircuitParamValue::SmallScalarMul(vec![7])],
     );
-    let _ = main_circuit.call_sub_circuit_with_bindings(
+    main_circuit.call_sub_circuit_with_bindings(
         sub_id,
         &[main_inputs[0]],
         &[SubCircuitParamValue::SmallScalarMul(vec![7])],
     );
-    let _ = main_circuit.call_sub_circuit_with_bindings(
+    main_circuit.call_sub_circuit_with_bindings(
         sub_id,
         &[main_inputs[0]],
         &[SubCircuitParamValue::SmallScalarMul(vec![9])],
@@ -770,9 +772,48 @@ fn test_parameterized_sub_circuit_reuses_identical_binding_sets() {
 }
 
 #[test]
+#[should_panic(expected = "exceeds declared max")]
+fn test_parameterized_sub_circuit_rejects_binding_above_declared_max() {
+    let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
+    let scalar_param = sub_circuit
+        .register_sub_circuit_param(SubCircuitParamSpec::SmallScalarMul { max_scalar: 3 });
+    let sub_inputs = sub_circuit.input(1).to_vec();
+    let scaled = sub_circuit.small_scalar_mul_param(sub_inputs[0], scalar_param);
+    sub_circuit.output(vec![scaled]);
+
+    let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
+    let main_inputs = main_circuit.input(1).to_vec();
+    let sub_id = main_circuit.register_sub_circuit(sub_circuit);
+    main_circuit.call_sub_circuit_with_bindings(
+        sub_id,
+        &[main_inputs[0]],
+        &[SubCircuitParamValue::SmallScalarMul(vec![4])],
+    );
+}
+
+#[test]
+fn test_register_sub_circuit_with_max_plaintext_norms_preserves_ranges() {
+    let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
+    let sub_inputs = sub_circuit.input(4).to_vec();
+    sub_circuit.output(sub_inputs.clone());
+
+    let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
+    let ranges = vec![
+        SubCircuitInputMaxPlaintextNormRange::new(0, 2, BigUint::from(7u64)),
+        SubCircuitInputMaxPlaintextNormRange::new(2, 4, BigUint::from(31u64)),
+    ];
+    let sub_id =
+        main_circuit.register_sub_circuit_with_max_plaintext_norms(sub_circuit, ranges.clone());
+
+    let registered = main_circuit.registered_sub_circuit_ref(sub_id);
+    assert_eq!(registered.sub_circuit_input_max_plaintext_norm_ranges(), Some(ranges.as_slice()));
+}
+
+#[test]
 fn test_register_sub_circuit_reuses_child_binding_sets_without_duplication() {
     let mut leaf_circuit = PolyCircuit::<DCRTPoly>::new();
-    let scalar_param = leaf_circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul);
+    let scalar_param = leaf_circuit
+        .register_sub_circuit_param(SubCircuitParamSpec::SmallScalarMul { max_scalar: 11 });
     let leaf_inputs = leaf_circuit.input(1).to_vec();
     let scaled = leaf_circuit.small_scalar_mul_param(leaf_inputs[0], scalar_param);
     leaf_circuit.output(vec![scaled]);
@@ -780,12 +821,12 @@ fn test_register_sub_circuit_reuses_child_binding_sets_without_duplication() {
     let mut middle_circuit = PolyCircuit::<DCRTPoly>::new();
     let middle_inputs = middle_circuit.input(1).to_vec();
     let leaf_id = middle_circuit.register_sub_circuit(leaf_circuit);
-    let _ = middle_circuit.call_sub_circuit_with_bindings(
+    middle_circuit.call_sub_circuit_with_bindings(
         leaf_id,
         &[middle_inputs[0]],
         &[SubCircuitParamValue::SmallScalarMul(vec![11])],
     );
-    let _ = middle_circuit.call_sub_circuit_with_bindings(
+    middle_circuit.call_sub_circuit_with_bindings(
         leaf_id,
         &[middle_inputs[0]],
         &[SubCircuitParamValue::SmallScalarMul(vec![11])],
@@ -795,7 +836,7 @@ fn test_register_sub_circuit_reuses_child_binding_sets_without_duplication() {
     let mut main_circuit = PolyCircuit::<DCRTPoly>::new();
     let main_inputs = main_circuit.input(1).to_vec();
     let middle_id = main_circuit.register_sub_circuit(middle_circuit);
-    let _ = main_circuit.call_sub_circuit(middle_id, &[main_inputs[0]]);
+    main_circuit.call_sub_circuit(middle_id, &[main_inputs[0]]);
 
     assert_eq!(main_circuit.binding_registry.binding_sets.len(), 2);
     let registered_middle = main_circuit.registered_sub_circuit_ref(middle_id);
@@ -808,7 +849,8 @@ fn test_register_and_call_summed_parameterized_sub_circuit() {
     let input_poly = create_random_poly(&params);
 
     let mut sub_circuit = PolyCircuit::new();
-    let scalar_param = sub_circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul);
+    let scalar_param = sub_circuit
+        .register_sub_circuit_param(SubCircuitParamSpec::SmallScalarMul { max_scalar: 3 });
     let sub_inputs = sub_circuit.input(1).to_vec();
     let scaled = sub_circuit.small_scalar_mul_param(sub_inputs[0], scalar_param);
     sub_circuit.output(vec![scaled]);

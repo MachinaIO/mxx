@@ -10,7 +10,7 @@ mod poly;
 mod tests;
 
 use crate::{
-    circuit::{BatchedWire, PolyCircuit, SubCircuitParamKind, SubCircuitParamValue, gate::GateId},
+    circuit::{BatchedWire, PolyCircuit, SubCircuitParamSpec, SubCircuitParamValue, gate::GateId},
     gadgets::conv_mul::{
         negacyclic_conv_mul_right_decomposed_term_many_subcircuit, negacyclic_conv_mul_right_sparse,
     },

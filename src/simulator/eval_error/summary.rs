@@ -760,7 +760,6 @@ impl PolyCircuit<DCRTPoly> {
         &self,
         sub_circuit_id: usize,
         input_plaintext_norms: Arc<[PolyNorm]>,
-        param_bindings: Arc<[SubCircuitParamValue]>,
         one_error: &ErrorNorm,
         plt_evaluator: Option<&P>,
         slot_transfer_evaluator: Option<&dyn AffineSlotTransferEvaluator>,
@@ -768,11 +767,34 @@ impl PolyCircuit<DCRTPoly> {
         visiting: &mut HashSet<ErrorNormSummaryBuildKey>,
     ) -> ErrorNormSubCircuitSummaryCacheKey {
         let sub_circuit = self.registered_sub_circuit_ref(sub_circuit_id);
+        let norm_ctx = input_plaintext_norms
+            .first()
+            .map(|norm| norm.ctx.clone())
+            .unwrap_or_else(|| one_error.plaintext_norm.ctx.clone());
+        let (input_plaintext_norms, key_mode) = normalize_sub_circuit_input_plaintext_norms(
+            sub_circuit.as_ref(),
+            input_plaintext_norms.as_ref(),
+            None,
+            &norm_ctx,
+            &format!("summary registration sub_circuit_id={sub_circuit_id}"),
+        );
+        let param_bindings = sub_circuit.simulator_param_bindings();
         let cache_key = error_norm_sub_circuit_summary_cache_key(
             Arc::as_ptr(&sub_circuit) as usize,
             sub_circuit_id,
-            &input_plaintext_norms,
+            input_plaintext_norms.as_ref(),
         );
+        let cache_key =
+            if matches!(key_mode, ErrorNormPreparedSummaryKeyMode::ExcludeInputPlaintextNorms) {
+                error_norm_sub_circuit_summary_cache_key_with_mode(
+                    Arc::as_ptr(&sub_circuit) as usize,
+                    sub_circuit_id,
+                    input_plaintext_norms.as_ref(),
+                    key_mode,
+                )
+            } else {
+                cache_key
+            };
         let binding_sig = Arc::as_ptr(&param_bindings).cast::<u8>() as usize;
         let build_key = ErrorNormSummaryBuildKey { cache_key: cache_key.clone(), binding_sig };
         if registry.nodes.contains_key(&cache_key) {
@@ -788,8 +810,8 @@ impl PolyCircuit<DCRTPoly> {
         visiting.insert(build_key.clone());
         let (output_plaintext_norms, direct_call_keys) =
             sub_circuit.as_ref().compute_error_norm_plaintext_norms_for_summary(
-                &input_plaintext_norms,
-                &param_bindings,
+                input_plaintext_norms.as_ref(),
+                param_bindings.as_ref(),
                 one_error,
                 plt_evaluator,
                 slot_transfer_evaluator,
@@ -970,7 +992,7 @@ impl PolyCircuit<DCRTPoly> {
                 let shared_prefix_set_id = self.sub_circuit_call_shared_prefix_set_id(call_id);
                 self.with_sub_circuit_call_by_id(
                     call_id,
-                    |sub_id, bindings, _shared_prefix, suffix, output_gate_ids| {
+                    |sub_id, _, _shared_prefix, suffix, output_gate_ids| {
                         let input_plaintext_profile = if let Some(input_set_id) = shared_prefix_set_id {
                             let prefix_norms = shared_prefix_plaintext_norms
                                 .entry(input_set_id)
@@ -1024,7 +1046,6 @@ impl PolyCircuit<DCRTPoly> {
                         let child_key = self.register_error_norm_summary_node(
                             sub_id,
                             Arc::from(input_plaintext_profile.materialize()),
-                            bindings.clone(),
                             one_error,
                             _plt_evaluator,
                             _slot_transfer_evaluator,
@@ -1047,22 +1068,15 @@ impl PolyCircuit<DCRTPoly> {
             }
 
             for summed_call_id in summed_sub_circuit_call_ids {
-                let (sub_id, call_input_set_ids, call_binding_set_ids, output_gate_ids) = self
+                let (sub_id, call_input_set_ids, output_gate_ids) = self
                     .with_summed_sub_circuit_call_by_id(
                         summed_call_id,
-                        |sub_id, call_input_set_ids, call_binding_set_ids, output_gate_ids| {
-                            (
-                                sub_id,
-                                call_input_set_ids.to_vec(),
-                                call_binding_set_ids.to_vec(),
-                                output_gate_ids.to_vec(),
-                            )
+                        |sub_id, call_input_set_ids, _, output_gate_ids| {
+                            (sub_id, call_input_set_ids.to_vec(), output_gate_ids.to_vec())
                         },
                     );
                 let mut output_accum: Vec<Option<PolyNorm>> = vec![None; output_gate_ids.len()];
-                for (input_set_id, binding_set_id) in
-                    call_input_set_ids.into_iter().zip(call_binding_set_ids.into_iter())
-                {
+                for input_set_id in call_input_set_ids {
                     let input_ids = self.input_set(input_set_id);
                     let child_inputs = input_ids
                         .iter()
@@ -1079,7 +1093,6 @@ impl PolyCircuit<DCRTPoly> {
                     let child_key = self.register_error_norm_summary_node(
                         sub_id,
                         Arc::from(child_inputs),
-                        self.binding_set(binding_set_id),
                         one_error,
                         _plt_evaluator,
                         _slot_transfer_evaluator,
@@ -1624,12 +1637,7 @@ impl PolyCircuit<DCRTPoly> {
                         summed_call_id,
                         self.with_summed_sub_circuit_call_by_id(
                             *summed_call_id,
-                            |_sub_circuit_id,
-                             call_input_set_ids,
-                             _call_binding_set_ids,
-                             _output_gate_ids| {
-                                call_input_set_ids.len()
-                            },
+                            |_, call_input_set_ids, _, _| call_input_set_ids.len(),
                         ),
                         prepared_summed_call_count,
                         prepare_summed_sub_calls_start.elapsed().as_millis(),
@@ -1893,14 +1901,27 @@ impl PolyCircuit<DCRTPoly> {
         let mut unique_request_index_by_key =
             HashMap::<ErrorNormSubCircuitSummaryCacheKey, usize>::new();
         let mut request_unique_indices = Vec::with_capacity(requests.len());
-        let mut unique_requests = Vec::<(usize, Arc<[SubCircuitParamValue]>, Vec<PolyNorm>)>::new();
+        let mut unique_requests = Vec::<(usize, Vec<PolyNorm>)>::new();
         for request in requests {
             let materialized_input_plaintext_norms = request.input_plaintext_profile.materialize();
             let sub_circuit = self.registered_sub_circuit_ref(request.sub_circuit_id);
-            let cache_key = error_norm_sub_circuit_summary_cache_key(
+            let norm_ctx = materialized_input_plaintext_norms
+                .first()
+                .map(|norm| norm.ctx.clone())
+                .unwrap_or_else(|| one_error.plaintext_norm.ctx.clone());
+            let (normalized_input_plaintext_norms, key_mode) =
+                normalize_sub_circuit_input_plaintext_norms(
+                    sub_circuit.as_ref(),
+                    &materialized_input_plaintext_norms,
+                    request.input_max_plaintext_norm_ranges.as_deref(),
+                    &norm_ctx,
+                    &format!("prepared summary request sub_circuit_id={}", request.sub_circuit_id),
+                );
+            let cache_key = error_norm_sub_circuit_summary_cache_key_with_mode(
                 Arc::as_ptr(&sub_circuit) as usize,
                 request.sub_circuit_id,
-                &materialized_input_plaintext_norms,
+                normalized_input_plaintext_norms.as_ref(),
+                key_mode,
             );
             let unique_idx =
                 if let Some(&existing_idx) = unique_request_index_by_key.get(&cache_key) {
@@ -1910,8 +1931,7 @@ impl PolyCircuit<DCRTPoly> {
                     unique_request_index_by_key.insert(cache_key, next_idx);
                     unique_requests.push((
                         request.sub_circuit_id,
-                        request.param_bindings,
-                        materialized_input_plaintext_norms,
+                        normalized_input_plaintext_norms.as_ref().to_vec(),
                     ));
                     next_idx
                 };
@@ -1937,7 +1957,7 @@ impl PolyCircuit<DCRTPoly> {
         let mut registry = ErrorNormSummaryRegistry::default();
         let mut visiting = HashSet::<ErrorNormSummaryBuildKey>::new();
 
-        for (_unique_idx, (sub_circuit_id, param_bindings, materialized_input_plaintext_norms)) in
+        for (_unique_idx, (sub_circuit_id, materialized_input_plaintext_norms)) in
             unique_requests.iter().enumerate()
         {
             let _profile_inputs = materialized_input_plaintext_norms.len();
@@ -1972,7 +1992,6 @@ impl PolyCircuit<DCRTPoly> {
             self.register_error_norm_summary_node(
                 *sub_circuit_id,
                 Arc::from(materialized_input_plaintext_norms.clone()),
-                Arc::clone(param_bindings),
                 one_error,
                 plt_evaluator,
                 slot_transfer_evaluator,
@@ -1995,7 +2014,7 @@ impl PolyCircuit<DCRTPoly> {
         request_unique_indices
             .into_iter()
             .map(|unique_idx| {
-                let (sub_circuit_id, _param_bindings, materialized_input_plaintext_norms) =
+                let (sub_circuit_id, materialized_input_plaintext_norms) =
                     &unique_requests[unique_idx];
                 let sub_circuit = self.registered_sub_circuit_ref(*sub_circuit_id);
                 let cache_key = error_norm_sub_circuit_summary_cache_key(
@@ -2049,9 +2068,7 @@ impl PolyCircuit<DCRTPoly> {
         let mut grouped_idx_by_key = HashMap::<ErrorNormSubCircuitSummaryCacheKey, usize>::new();
         let mut grouped_requests = Vec::<ErrorNormPreparedSubCircuitSummaryRequest>::new();
         let mut grouped_input_set_counts = Vec::<HashMap<usize, usize>>::new();
-        for (&input_set_id, &binding_set_id) in
-            call_input_set_ids.iter().zip(call_binding_set_ids.iter())
-        {
+        for &input_set_id in call_input_set_ids {
             // Streaming the profiles keeps duplicate summed-call inputs from materializing
             // tens of thousands of identical plaintext-profile vectors at once.
             let input_ids = self.input_set(input_set_id);
@@ -2079,10 +2096,10 @@ impl PolyCircuit<DCRTPoly> {
                 grouped_idx_by_key.insert(cache_key, next_idx);
                 grouped_requests.push(ErrorNormPreparedSubCircuitSummaryRequest {
                     sub_circuit_id,
-                    param_bindings: self.binding_set(binding_set_id),
                     input_plaintext_profile: ErrorNormInputPlaintextProfile::flat_from_vec(
                         input_plaintext_profile,
                     ),
+                    input_max_plaintext_norm_ranges: None,
                 });
                 grouped_input_set_counts.push(HashMap::new());
                 next_idx
@@ -2170,7 +2187,7 @@ impl PolyCircuit<DCRTPoly> {
             PolyGateType::SubCircuitOutput { call_id, output_idx, .. } => self
                 .with_sub_circuit_call_by_id(
                     call_id,
-                    |sub_circuit_id, param_bindings, shared_prefix, suffix, _output_gate_ids| {
+                    |sub_circuit_id, param_bindings, shared_prefix, suffix, _| {
                         let child_key = resolve_ctx
                             .direct_call_keys
                             .get(&call_id)
@@ -2253,7 +2270,7 @@ impl PolyCircuit<DCRTPoly> {
             PolyGateType::SummedSubCircuitOutput { summed_call_id, output_idx, .. } => self
                 .with_summed_sub_circuit_call_by_id(
                     summed_call_id,
-                    |sub_circuit_id, call_input_set_ids, call_binding_set_ids, _output_gate_ids| {
+                    |sub_circuit_id, call_input_set_ids, call_binding_set_ids, _| {
                         let grouped_summary_requests = self
                             .build_grouped_summed_sub_circuit_summary_requests_direct(
                                 sub_circuit_id,

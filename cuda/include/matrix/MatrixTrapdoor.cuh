@@ -2,6 +2,8 @@
 
 #include "matrix/Matrix.cuh"
 
+typedef struct GpuP1CovarianceCache GpuP1CovarianceCache;
+
 int launch_gauss_samp_gq_arb_base_multi_kernel(
     const std::vector<const uint64_t *> &src_ptrs,
     const std::vector<uint64_t *> &dst_ptrs,
@@ -76,6 +78,23 @@ extern "C"
         double sigma,
         double s,
         double dgg_stddev,
+        uint64_t seed,
+        GpuMatrix *out);
+
+    int gpu_matrix_create_p1_covariance_cache(
+        const GpuMatrix *a_mat,
+        const GpuMatrix *b_mat,
+        const GpuMatrix *d_mat,
+        double sigma,
+        double s,
+        double dgg_stddev,
+        GpuP1CovarianceCache **out_cache);
+
+    void gpu_matrix_destroy_p1_covariance_cache(GpuP1CovarianceCache *cache);
+
+    int gpu_matrix_sample_p1_full_cached(
+        const GpuP1CovarianceCache *cache,
+        const GpuMatrix *tp2,
         uint64_t seed,
         GpuMatrix *out);
 

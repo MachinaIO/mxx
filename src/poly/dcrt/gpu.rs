@@ -38,6 +38,12 @@ pub(crate) struct GpuMatrixOpaque {
 
 #[allow(non_camel_case_types)]
 #[repr(C)]
+pub(crate) struct GpuP1CovarianceCacheOpaque {
+    _private: [u8; 0],
+}
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
 pub(crate) struct GpuEventSetOpaque {
     _private: [u8; 0],
 }
@@ -173,14 +179,19 @@ unsafe extern "C" {
         seed: u64,
         out: *mut GpuMatrixOpaque,
     ) -> c_int;
-    pub(crate) fn gpu_matrix_sample_p1_full(
+    pub(crate) fn gpu_matrix_create_p1_covariance_cache(
         a_mat: *const GpuMatrixOpaque,
         b_mat: *const GpuMatrixOpaque,
         d_mat: *const GpuMatrixOpaque,
-        tp2: *const GpuMatrixOpaque,
         sigma: f64,
         s: f64,
         dgg_stddev: f64,
+        out_cache: *mut *mut GpuP1CovarianceCacheOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_destroy_p1_covariance_cache(cache: *mut GpuP1CovarianceCacheOpaque);
+    pub(crate) fn gpu_matrix_sample_p1_full_cached(
+        cache: *const GpuP1CovarianceCacheOpaque,
+        tp2: *const GpuMatrixOpaque,
         seed: u64,
         out: *mut GpuMatrixOpaque,
     ) -> c_int;

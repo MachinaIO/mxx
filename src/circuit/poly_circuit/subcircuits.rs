@@ -263,6 +263,7 @@ impl<P: Poly> PolyCircuit<P> {
             sub_circuit_id: call.sub_circuit_id,
             inputs: self.collect_sub_circuit_call_inputs(call),
             param_bindings: self.binding_set(call.binding_set_id),
+            input_max_plaintext_norm_ranges: call.input_max_plaintext_norm_ranges.clone(),
             output_gate_ids: call.output_gate_ids.clone(),
         }
     }
@@ -293,6 +294,7 @@ impl<P: Poly> PolyCircuit<P> {
             sub_circuit_id: call.sub_circuit_id,
             call_inputs,
             param_bindings,
+            input_max_plaintext_norm_ranges: call.input_max_plaintext_norm_ranges.clone(),
             output_gate_ids: call.output_gate_ids.clone(),
         }
     }
@@ -314,9 +316,9 @@ impl<P: Poly> PolyCircuit<P> {
         )
     }
 
-    pub fn register_sub_circuit_param(&mut self, kind: SubCircuitParamKind) -> usize {
+    pub fn register_sub_circuit_param(&mut self, spec: SubCircuitParamSpec) -> usize {
         let param_id = self.sub_circuit_params.len();
-        self.sub_circuit_params.push(kind);
+        self.sub_circuit_params.push(spec);
         param_id
     }
 
@@ -328,13 +330,119 @@ impl<P: Poly> PolyCircuit<P> {
         let actual = self
             .sub_circuit_params
             .get(param_id)
-            .copied()
+            .map(SubCircuitParamSpec::kind)
             .unwrap_or_else(|| panic!("sub-circuit parameter {param_id} is out of range"));
         assert_eq!(
             actual, expected,
             "sub-circuit parameter kind mismatch for param {param_id}: expected {:?}, got {:?}",
             expected, actual
         );
+    }
+
+    pub(crate) fn simulator_param_bindings(&self) -> Arc<[SubCircuitParamValue]> {
+        Arc::from(
+            self.sub_circuit_params
+                .iter()
+                .map(SubCircuitParamSpec::simulator_binding)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    pub(crate) fn sub_circuit_input_max_plaintext_norm_ranges(
+        &self,
+    ) -> Option<&[SubCircuitInputMaxPlaintextNormRange]> {
+        self.sub_circuit_input_max_plaintext_norm_ranges.as_deref()
+    }
+
+    pub(crate) fn sub_circuit_call_input_max_plaintext_norm_ranges(
+        &self,
+        call_id: usize,
+    ) -> Option<&[SubCircuitInputMaxPlaintextNormRange]> {
+        self.sub_circuit_calls
+            .get(&call_id)
+            .expect("sub-circuit call missing")
+            .input_max_plaintext_norm_ranges
+            .as_deref()
+    }
+
+    pub(crate) fn summed_sub_circuit_call_input_max_plaintext_norm_ranges(
+        &self,
+        summed_call_id: usize,
+    ) -> Option<&[SubCircuitInputMaxPlaintextNormRange]> {
+        self.summed_sub_circuit_calls
+            .get(&summed_call_id)
+            .expect("summed sub-circuit call missing")
+            .input_max_plaintext_norm_ranges
+            .as_deref()
+    }
+
+    fn validate_sub_circuit_input_max_plaintext_norm_ranges(
+        &self,
+        ranges: &[SubCircuitInputMaxPlaintextNormRange],
+        context: &str,
+    ) {
+        let mut expected_start = 0usize;
+        for range in ranges {
+            assert!(
+                !range.is_empty(),
+                "{context}: sub-circuit plaintext range [{}, {}) must not be empty",
+                range.start,
+                range.end
+            );
+            assert_eq!(
+                range.start, expected_start,
+                "{context}: sub-circuit plaintext ranges must be contiguous and sorted"
+            );
+            assert!(
+                range.end <= self.num_input(),
+                "{context}: sub-circuit plaintext range [{}, {}) exceeds num_input={}",
+                range.start,
+                range.end,
+                self.num_input()
+            );
+            expected_start = range.end;
+        }
+        assert_eq!(
+            expected_start,
+            self.num_input(),
+            "{context}: sub-circuit plaintext ranges must cover every input wire"
+        );
+    }
+
+    fn normalized_sub_circuit_input_max_plaintext_norm_ranges<I>(
+        &self,
+        circuit_id: usize,
+        ranges: Option<I>,
+        context: &str,
+    ) -> Option<Arc<[SubCircuitInputMaxPlaintextNormRange]>>
+    where
+        I: IntoIterator<Item = SubCircuitInputMaxPlaintextNormRange>,
+    {
+        let ranges = ranges?;
+        let ranges = Arc::from(ranges.into_iter().collect::<Vec<_>>());
+        let stored = self.sub_circuit_registry.get(circuit_id);
+        stored.validate_sub_circuit_input_max_plaintext_norm_ranges(&ranges, context);
+        Some(ranges)
+    }
+
+    fn validate_sub_circuit_param_bindings(
+        &self,
+        circuit_id: usize,
+        param_bindings: &[SubCircuitParamValue],
+        context: &str,
+    ) {
+        let stored = self.sub_circuit_registry.get(circuit_id);
+        let expected_param_specs = &stored.sub_circuit_params;
+        assert_eq!(
+            param_bindings.len(),
+            expected_param_specs.len(),
+            "{context}: sub-circuit parameter count mismatch"
+        );
+        for (param_idx, (binding, expected_spec)) in
+            param_bindings.iter().zip(expected_param_specs.iter()).enumerate()
+        {
+            expected_spec.validate_binding(binding, param_idx);
+        }
     }
 
     pub(crate) fn direct_sub_circuit_ids(&self) -> BTreeSet<usize> {
@@ -406,12 +514,54 @@ impl<P: Poly> PolyCircuit<P> {
         self.sub_circuit_registry.register_arc(sub_circuit)
     }
 
+    pub fn register_sub_circuit_with_max_plaintext_norms<T, I>(
+        &mut self,
+        sub_circuit: T,
+        max_plaintext_norm_ranges: I,
+    ) -> usize
+    where
+        T: Into<Arc<Self>>,
+        I: IntoIterator<Item = SubCircuitInputMaxPlaintextNormRange>,
+    {
+        let mut sub_circuit = sub_circuit.into();
+        let ranges = Arc::from(max_plaintext_norm_ranges.into_iter().collect::<Vec<_>>());
+        {
+            let sub_circuit_mut = Arc::make_mut(&mut sub_circuit);
+            sub_circuit_mut.inherit_registries_from_parent(self);
+            sub_circuit_mut.validate_sub_circuit_input_max_plaintext_norm_ranges(
+                &ranges,
+                "sub-circuit registration",
+            );
+            sub_circuit_mut.sub_circuit_input_max_plaintext_norm_ranges = Some(ranges);
+        }
+        self.sub_circuit_registry.register_arc(sub_circuit)
+    }
+
     pub fn call_sub_circuit<I, W>(&mut self, circuit_id: usize, inputs: I) -> Vec<BatchedWire>
     where
         I: IntoIterator<Item = W>,
         W: Into<BatchedWire>,
     {
         self.call_sub_circuit_with_bindings(circuit_id, inputs, &[])
+    }
+
+    pub fn call_sub_circuit_with_max_plaintext_norms<I, W, R>(
+        &mut self,
+        circuit_id: usize,
+        inputs: I,
+        input_max_plaintext_norm_ranges: R,
+    ) -> Vec<BatchedWire>
+    where
+        I: IntoIterator<Item = W>,
+        W: Into<BatchedWire>,
+        R: IntoIterator<Item = SubCircuitInputMaxPlaintextNormRange>,
+    {
+        self.call_sub_circuit_with_bindings_and_max_plaintext_norms(
+            circuit_id,
+            inputs,
+            &[],
+            input_max_plaintext_norm_ranges,
+        )
     }
 
     pub fn call_sub_circuit_with_shared_input_prefix_and_bindings<I, W>(
@@ -425,11 +575,55 @@ impl<P: Poly> PolyCircuit<P> {
         I: IntoIterator<Item = W>,
         W: Into<BatchedWire>,
     {
-        self.call_sub_circuit_with_prefix_and_bindings(
+        self.call_sub_circuit_with_prefix_and_bindings_and_max_plaintext_norms(
             circuit_id,
             Some(shared_input_prefix_set_id),
             input_suffix,
             param_bindings,
+            Option::<Vec<SubCircuitInputMaxPlaintextNormRange>>::None,
+        )
+    }
+
+    pub fn call_sub_circuit_with_shared_input_prefix_and_bindings_and_max_plaintext_norms<I, W, R>(
+        &mut self,
+        circuit_id: usize,
+        shared_input_prefix_set_id: usize,
+        input_suffix: I,
+        param_bindings: &[SubCircuitParamValue],
+        input_max_plaintext_norm_ranges: R,
+    ) -> Vec<BatchedWire>
+    where
+        I: IntoIterator<Item = W>,
+        W: Into<BatchedWire>,
+        R: IntoIterator<Item = SubCircuitInputMaxPlaintextNormRange>,
+    {
+        self.call_sub_circuit_with_prefix_and_bindings_and_max_plaintext_norms(
+            circuit_id,
+            Some(shared_input_prefix_set_id),
+            input_suffix,
+            param_bindings,
+            Some(input_max_plaintext_norm_ranges),
+        )
+    }
+
+    pub fn call_sub_circuit_with_bindings_and_max_plaintext_norms<I, W, R>(
+        &mut self,
+        circuit_id: usize,
+        inputs: I,
+        param_bindings: &[SubCircuitParamValue],
+        input_max_plaintext_norm_ranges: R,
+    ) -> Vec<BatchedWire>
+    where
+        I: IntoIterator<Item = W>,
+        W: Into<BatchedWire>,
+        R: IntoIterator<Item = SubCircuitInputMaxPlaintextNormRange>,
+    {
+        self.call_sub_circuit_with_prefix_and_bindings_and_max_plaintext_norms(
+            circuit_id,
+            None,
+            inputs,
+            param_bindings,
+            Some(input_max_plaintext_norm_ranges),
         )
     }
 
@@ -443,42 +637,47 @@ impl<P: Poly> PolyCircuit<P> {
         I: IntoIterator<Item = W>,
         W: Into<BatchedWire>,
     {
-        self.call_sub_circuit_with_prefix_and_bindings(circuit_id, None, inputs, param_bindings)
+        self.call_sub_circuit_with_prefix_and_bindings_and_max_plaintext_norms(
+            circuit_id,
+            None,
+            inputs,
+            param_bindings,
+            Option::<Vec<SubCircuitInputMaxPlaintextNormRange>>::None,
+        )
     }
 
-    fn call_sub_circuit_with_prefix_and_bindings<I, W>(
+    fn call_sub_circuit_with_prefix_and_bindings_and_max_plaintext_norms<I, W, R>(
         &mut self,
         circuit_id: usize,
         shared_input_prefix_set_id: Option<usize>,
         input_suffix: I,
         param_bindings: &[SubCircuitParamValue],
+        input_max_plaintext_norm_ranges: Option<R>,
     ) -> Vec<BatchedWire>
     where
         I: IntoIterator<Item = W>,
         W: Into<BatchedWire>,
+        R: IntoIterator<Item = SubCircuitInputMaxPlaintextNormRange>,
     {
         let input_suffix = input_suffix.into_iter().map(Into::into).collect::<Vec<_>>();
         let total_num_inputs = shared_input_prefix_set_id
             .map(|input_set_id| batched_wire_slice_len(self.input_set(input_set_id).as_ref()))
             .unwrap_or(0) +
             batched_wire_slice_len(&input_suffix);
-        #[cfg(debug_assertions)]
-        {
-            let stored = self.sub_circuit_registry.get(circuit_id);
-            let num_inputs = stored.num_input();
-            assert_eq!(total_num_inputs, num_inputs);
-            let expected_param_kinds = &stored.sub_circuit_params;
-            assert_eq!(param_bindings.len(), expected_param_kinds.len());
-            for (param_idx, (binding, expected_kind)) in
-                param_bindings.iter().zip(expected_param_kinds.iter()).enumerate()
-            {
-                assert_eq!(
-                    binding.kind(),
-                    *expected_kind,
-                    "sub-circuit parameter kind mismatch at binding {param_idx}"
-                );
-            }
-        }
+        let stored = self.sub_circuit_registry.get(circuit_id);
+        let num_inputs = stored.num_input();
+        assert_eq!(total_num_inputs, num_inputs);
+        self.validate_sub_circuit_param_bindings(
+            circuit_id,
+            param_bindings,
+            "direct sub-circuit call",
+        );
+        let input_max_plaintext_norm_ranges = self
+            .normalized_sub_circuit_input_max_plaintext_norm_ranges(
+                circuit_id,
+                input_max_plaintext_norm_ranges,
+                "direct sub-circuit call",
+            );
         let num_outputs = self.sub_circuit_num_output(circuit_id);
         let call_id = self.sub_circuit_calls.len();
         let binding_set_id = self.binding_registry.register(param_bindings);
@@ -497,6 +696,7 @@ impl<P: Poly> PolyCircuit<P> {
             shared_input_prefix_set_id,
             input_suffix,
             binding_set_id,
+            input_max_plaintext_norm_ranges,
             scoped_call_id,
             output_gate_ids: output_gate_ids.clone(),
             num_outputs,
@@ -511,6 +711,24 @@ impl<P: Poly> PolyCircuit<P> {
         call_input_set_ids: Vec<usize>,
         call_binding_set_ids: Vec<usize>,
     ) -> Vec<BatchedWire> {
+        self.call_sub_circuit_sum_many_with_binding_set_ids_and_max_plaintext_norms(
+            circuit_id,
+            call_input_set_ids,
+            call_binding_set_ids,
+            Option::<Vec<SubCircuitInputMaxPlaintextNormRange>>::None,
+        )
+    }
+
+    pub fn call_sub_circuit_sum_many_with_binding_set_ids_and_max_plaintext_norms<R>(
+        &mut self,
+        circuit_id: usize,
+        call_input_set_ids: Vec<usize>,
+        call_binding_set_ids: Vec<usize>,
+        input_max_plaintext_norm_ranges: Option<R>,
+    ) -> Vec<BatchedWire>
+    where
+        R: IntoIterator<Item = SubCircuitInputMaxPlaintextNormRange>,
+    {
         assert!(
             !call_input_set_ids.is_empty(),
             "summed sub-circuit call requires at least one inner call"
@@ -520,11 +738,9 @@ impl<P: Poly> PolyCircuit<P> {
             call_binding_set_ids.len(),
             "summed sub-circuit call requires one binding set per inner call"
         );
-        #[cfg(debug_assertions)]
         {
             let stored = self.sub_circuit_registry.get(circuit_id);
-            let (num_inputs, expected_param_kinds) =
-                (stored.num_input(), &stored.sub_circuit_params);
+            let num_inputs = stored.num_input();
             for (call_idx, (input_set_id, binding_set_id)) in
                 call_input_set_ids.iter().zip(call_binding_set_ids.iter()).enumerate()
             {
@@ -535,22 +751,19 @@ impl<P: Poly> PolyCircuit<P> {
                     "summed sub-circuit input count mismatch at inner call {call_idx}"
                 );
                 let bindings = self.binding_set(*binding_set_id);
-                assert_eq!(
-                    bindings.len(),
-                    expected_param_kinds.len(),
-                    "summed sub-circuit parameter count mismatch at inner call {call_idx}"
+                self.validate_sub_circuit_param_bindings(
+                    circuit_id,
+                    bindings.as_ref(),
+                    "summed sub-circuit call",
                 );
-                for (param_idx, (binding, expected_kind)) in
-                    bindings.iter().zip(expected_param_kinds.iter()).enumerate()
-                {
-                    assert_eq!(
-                        binding.kind(),
-                        *expected_kind,
-                        "summed sub-circuit parameter kind mismatch at inner call {call_idx}, binding {param_idx}"
-                    );
-                }
             }
         }
+        let input_max_plaintext_norm_ranges = self
+            .normalized_sub_circuit_input_max_plaintext_norm_ranges(
+                circuit_id,
+                input_max_plaintext_norm_ranges,
+                "summed sub-circuit call",
+            );
         let num_outputs = self.sub_circuit_num_output(circuit_id);
         let summed_call_id = self.summed_sub_circuit_calls.len();
         let scoped_call_ids = (0..call_input_set_ids.len())
@@ -579,6 +792,7 @@ impl<P: Poly> PolyCircuit<P> {
                 sub_circuit_id: circuit_id,
                 call_input_set_ids,
                 call_binding_set_ids,
+                input_max_plaintext_norm_ranges,
                 scoped_call_ids,
                 output_gate_ids: output_gate_ids.clone(),
                 num_outputs,

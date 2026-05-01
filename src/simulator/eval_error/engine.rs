@@ -204,7 +204,7 @@ impl PolyCircuit<DCRTPoly> {
                         |(
                             call_id,
                             sub_circuit_id,
-                            param_bindings,
+                            _param_bindings,
                             shared_prefix_set_id,
                             suffix_plaintext_norms,
                         )| {
@@ -237,8 +237,10 @@ impl PolyCircuit<DCRTPoly> {
                                 call_id,
                                 ErrorNormPreparedSubCircuitSummaryRequest {
                                     sub_circuit_id,
-                                    param_bindings,
                                     input_plaintext_profile,
+                                    input_max_plaintext_norm_ranges: self
+                                        .sub_circuit_call_input_max_plaintext_norm_ranges(call_id)
+                                        .map(|ranges| Arc::from(ranges.to_vec())),
                                 },
                             )
                         },
@@ -447,7 +449,7 @@ impl PolyCircuit<DCRTPoly> {
                                         .iter()
                                         .copied()
                                         .zip(call_binding_set_ids[batch_start..batch_end].iter().copied())
-                                        .map(|(input_set_id, binding_set_id)| {
+                                        .map(|(input_set_id, _binding_set_id)| {
                                             let input_plaintext_norms = self
                                                 .collect_error_norm_plaintext_norms_for_value_input_set(
                                                     self.input_set(input_set_id).as_ref(),
@@ -457,11 +459,15 @@ impl PolyCircuit<DCRTPoly> {
                                                 );
                                             ErrorNormPreparedSubCircuitSummaryRequest {
                                                 sub_circuit_id,
-                                                param_bindings: self.binding_set(binding_set_id),
                                                 input_plaintext_profile:
                                                     ErrorNormInputPlaintextProfile::flat_from_vec(
                                                         input_plaintext_norms,
                                                     ),
+                                                input_max_plaintext_norm_ranges: self
+                                                    .summed_sub_circuit_call_input_max_plaintext_norm_ranges(
+                                                        *summed_call_id,
+                                                    )
+                                                    .map(|ranges| Arc::from(ranges.to_vec())),
                                             }
                                         })
                                         .collect::<Vec<_>>();

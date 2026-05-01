@@ -706,16 +706,25 @@ impl NestedRnsPolyContext {
         let inputs = circuit.input(p_moduli_depth);
         let x = inputs;
         let scalar_y_param_ids = (0..p_moduli_depth)
-            .map(|_| {
+            .map(|p_idx| {
+                let max_scalar =
+                    u32::try_from(p_moduli[p_idx] - 1).expect("p modulus must fit in u32");
                 (0..p_moduli_depth)
                     .map(|_| {
-                        circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul)
+                        circuit.register_sub_circuit_param(SubCircuitParamSpec::SmallScalarMul {
+                            max_scalar,
+                        })
                     })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         let scalar_v_param_ids = (0..p_moduli_depth)
-            .map(|_| circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul))
+            .map(|p_idx| {
+                let max_scalar =
+                    u32::try_from(p_moduli[p_idx] - 1).expect("p modulus must fit in u32");
+                circuit
+                    .register_sub_circuit_param(SubCircuitParamSpec::SmallScalarMul { max_scalar })
+            })
             .collect::<Vec<_>>();
 
         let ys = (0..p_moduli_depth)
@@ -755,7 +764,11 @@ impl NestedRnsPolyContext {
         let (left, right) = inputs.split_at(p_moduli_depth);
         let one = circuit.const_one_gate();
         let offset_param_ids = (0..p_moduli_depth)
-            .map(|_| circuit.register_sub_circuit_param(SubCircuitParamKind::LargeScalarMul))
+            .map(|_| {
+                circuit.register_sub_circuit_param(SubCircuitParamSpec::LargeScalarMul {
+                    max_scalar: BigUint::from(u128::MAX),
+                })
+            })
             .collect::<Vec<_>>();
         let outputs = (0..p_moduli_depth)
             .map(|p_idx| {

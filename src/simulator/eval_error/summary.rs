@@ -760,7 +760,7 @@ impl PolyCircuit<DCRTPoly> {
         &self,
         sub_circuit_id: usize,
         input_plaintext_norms: Arc<[PolyNorm]>,
-        param_bindings: Arc<[SubCircuitParamValue]>,
+        _param_bindings: Arc<[SubCircuitParamValue]>,
         one_error: &ErrorNorm,
         plt_evaluator: Option<&P>,
         slot_transfer_evaluator: Option<&dyn AffineSlotTransferEvaluator>,
@@ -768,11 +768,34 @@ impl PolyCircuit<DCRTPoly> {
         visiting: &mut HashSet<ErrorNormSummaryBuildKey>,
     ) -> ErrorNormSubCircuitSummaryCacheKey {
         let sub_circuit = self.registered_sub_circuit_ref(sub_circuit_id);
+        let norm_ctx = input_plaintext_norms
+            .first()
+            .map(|norm| norm.ctx.clone())
+            .unwrap_or_else(|| one_error.plaintext_norm.ctx.clone());
+        let (input_plaintext_norms, key_mode) = normalize_sub_circuit_input_plaintext_norms(
+            sub_circuit.as_ref(),
+            input_plaintext_norms.as_ref(),
+            None,
+            &norm_ctx,
+            &format!("summary registration sub_circuit_id={sub_circuit_id}"),
+        );
+        let param_bindings = sub_circuit.simulator_param_bindings();
         let cache_key = error_norm_sub_circuit_summary_cache_key(
             Arc::as_ptr(&sub_circuit) as usize,
             sub_circuit_id,
-            &input_plaintext_norms,
+            input_plaintext_norms.as_ref(),
         );
+        let cache_key =
+            if matches!(key_mode, ErrorNormPreparedSummaryKeyMode::ExcludeInputPlaintextNorms) {
+                error_norm_sub_circuit_summary_cache_key_with_mode(
+                    Arc::as_ptr(&sub_circuit) as usize,
+                    sub_circuit_id,
+                    input_plaintext_norms.as_ref(),
+                    key_mode,
+                )
+            } else {
+                cache_key
+            };
         let binding_sig = Arc::as_ptr(&param_bindings).cast::<u8>() as usize;
         let build_key = ErrorNormSummaryBuildKey { cache_key: cache_key.clone(), binding_sig };
         if registry.nodes.contains_key(&cache_key) {
@@ -788,8 +811,8 @@ impl PolyCircuit<DCRTPoly> {
         visiting.insert(build_key.clone());
         let (output_plaintext_norms, direct_call_keys) =
             sub_circuit.as_ref().compute_error_norm_plaintext_norms_for_summary(
-                &input_plaintext_norms,
-                &param_bindings,
+                input_plaintext_norms.as_ref(),
+                param_bindings.as_ref(),
                 one_error,
                 plt_evaluator,
                 slot_transfer_evaluator,
@@ -1897,10 +1920,23 @@ impl PolyCircuit<DCRTPoly> {
         for request in requests {
             let materialized_input_plaintext_norms = request.input_plaintext_profile.materialize();
             let sub_circuit = self.registered_sub_circuit_ref(request.sub_circuit_id);
-            let cache_key = error_norm_sub_circuit_summary_cache_key(
+            let norm_ctx = materialized_input_plaintext_norms
+                .first()
+                .map(|norm| norm.ctx.clone())
+                .unwrap_or_else(|| one_error.plaintext_norm.ctx.clone());
+            let (normalized_input_plaintext_norms, key_mode) =
+                normalize_sub_circuit_input_plaintext_norms(
+                    sub_circuit.as_ref(),
+                    &materialized_input_plaintext_norms,
+                    request.input_max_plaintext_norm_ranges.as_deref(),
+                    &norm_ctx,
+                    &format!("prepared summary request sub_circuit_id={}", request.sub_circuit_id),
+                );
+            let cache_key = error_norm_sub_circuit_summary_cache_key_with_mode(
                 Arc::as_ptr(&sub_circuit) as usize,
                 request.sub_circuit_id,
-                &materialized_input_plaintext_norms,
+                normalized_input_plaintext_norms.as_ref(),
+                key_mode,
             );
             let unique_idx =
                 if let Some(&existing_idx) = unique_request_index_by_key.get(&cache_key) {
@@ -1910,8 +1946,8 @@ impl PolyCircuit<DCRTPoly> {
                     unique_request_index_by_key.insert(cache_key, next_idx);
                     unique_requests.push((
                         request.sub_circuit_id,
-                        request.param_bindings,
-                        materialized_input_plaintext_norms,
+                        sub_circuit.simulator_param_bindings(),
+                        normalized_input_plaintext_norms.as_ref().to_vec(),
                     ));
                     next_idx
                 };
@@ -2049,7 +2085,7 @@ impl PolyCircuit<DCRTPoly> {
         let mut grouped_idx_by_key = HashMap::<ErrorNormSubCircuitSummaryCacheKey, usize>::new();
         let mut grouped_requests = Vec::<ErrorNormPreparedSubCircuitSummaryRequest>::new();
         let mut grouped_input_set_counts = Vec::<HashMap<usize, usize>>::new();
-        for (&input_set_id, &binding_set_id) in
+        for (&input_set_id, &_binding_set_id) in
             call_input_set_ids.iter().zip(call_binding_set_ids.iter())
         {
             // Streaming the profiles keeps duplicate summed-call inputs from materializing
@@ -2079,10 +2115,10 @@ impl PolyCircuit<DCRTPoly> {
                 grouped_idx_by_key.insert(cache_key, next_idx);
                 grouped_requests.push(ErrorNormPreparedSubCircuitSummaryRequest {
                     sub_circuit_id,
-                    param_bindings: self.binding_set(binding_set_id),
                     input_plaintext_profile: ErrorNormInputPlaintextProfile::flat_from_vec(
                         input_plaintext_profile,
                     ),
+                    input_max_plaintext_norm_ranges: None,
                 });
                 grouped_input_set_counts.push(HashMap::new());
                 next_idx

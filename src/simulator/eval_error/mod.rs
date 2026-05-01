@@ -4,8 +4,8 @@ use super::{
 use crate::{
     circuit::{
         BatchedWire, Evaluable, GroupedCallExecutionLayer, PolyCircuit, PolyGateType,
-        SubCircuitParamValue, batched_wire_slice_at, batched_wire_slice_len, gate::GateId,
-        iter_batched_wire_gates,
+        SubCircuitInputMaxPlaintextNormRange, SubCircuitParamValue, batched_wire_slice_at,
+        batched_wire_slice_len, gate::GateId, iter_batched_wire_gates,
     },
     element::PolyElem,
     lookup::{PltEvaluator, PublicLut, commit_eval::compute_padded_len},
@@ -73,6 +73,12 @@ struct ErrorNormSubCircuitSummaryCacheKey {
     input_plaintext_norms: Vec<ErrorNormPolyNormKey>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorNormPreparedSummaryKeyMode {
+    IncludeNormalizedInputPlaintextNorms,
+    ExcludeInputPlaintextNorms,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 /// Cycle-detection key for the recursive summary builder.
 ///
@@ -136,6 +142,108 @@ fn error_norm_sub_circuit_summary_cache_key(
         sub_circuit_id,
         input_plaintext_norms: input_plaintext_norms.iter().map(error_norm_poly_norm_key).collect(),
     }
+}
+
+fn error_norm_sub_circuit_summary_cache_key_with_mode(
+    circuit_key: usize,
+    sub_circuit_id: usize,
+    input_plaintext_norms: &[PolyNorm],
+    key_mode: ErrorNormPreparedSummaryKeyMode,
+) -> ErrorNormSubCircuitSummaryCacheKey {
+    match key_mode {
+        ErrorNormPreparedSummaryKeyMode::IncludeNormalizedInputPlaintextNorms => {
+            error_norm_sub_circuit_summary_cache_key(
+                circuit_key,
+                sub_circuit_id,
+                input_plaintext_norms,
+            )
+        }
+        ErrorNormPreparedSummaryKeyMode::ExcludeInputPlaintextNorms => {
+            ErrorNormSubCircuitSummaryCacheKey {
+                circuit_key,
+                sub_circuit_id,
+                input_plaintext_norms: Vec::new(),
+            }
+        }
+    }
+}
+
+fn validate_input_plaintext_norms_against_ranges(
+    ranges: &[SubCircuitInputMaxPlaintextNormRange],
+    actual_input_plaintext_norms: &[PolyNorm],
+    norm_ctx: &Arc<SimulatorContext>,
+    context: &str,
+) -> Arc<[PolyNorm]> {
+    if actual_input_plaintext_norms.is_empty() {
+        let mut normalized = Vec::with_capacity(ranges.last().map(|range| range.end).unwrap_or(0));
+        for range in ranges {
+            let max_norm_bd = BigDecimal::from(num_bigint::BigInt::from(range.norm.clone()));
+            normalized.extend(
+                std::iter::repeat_with(|| PolyNorm::new(Arc::clone(norm_ctx), max_norm_bd.clone()))
+                    .take(range.len()),
+            );
+        }
+        return Arc::from(normalized);
+    }
+
+    let expected_len = ranges.last().map(|range| range.end).unwrap_or(0);
+    assert_eq!(
+        actual_input_plaintext_norms.len(),
+        expected_len,
+        "{context}: sub-circuit plaintext envelope length mismatch"
+    );
+    let mut normalized = Vec::with_capacity(actual_input_plaintext_norms.len());
+    for range in ranges {
+        let max_norm_bd = BigDecimal::from(num_bigint::BigInt::from(range.norm.clone()));
+        for (offset, actual_norm) in
+            actual_input_plaintext_norms[range.start..range.end].iter().enumerate()
+        {
+            assert!(
+                actual_norm.norm <= max_norm_bd,
+                "{context}: input plaintext norm at index {} exceeds declared max (actual={}, max={})",
+                range.start + offset,
+                actual_norm.norm,
+                max_norm_bd
+            );
+            normalized.push(PolyNorm::new(Arc::clone(norm_ctx), max_norm_bd.clone()));
+        }
+    }
+    Arc::from(normalized)
+}
+
+fn normalize_sub_circuit_input_plaintext_norms(
+    sub_circuit: &PolyCircuit<DCRTPoly>,
+    actual_input_plaintext_norms: &[PolyNorm],
+    call_input_max_plaintext_norm_ranges: Option<&[SubCircuitInputMaxPlaintextNormRange]>,
+    norm_ctx: &Arc<SimulatorContext>,
+    context: &str,
+) -> (Arc<[PolyNorm]>, ErrorNormPreparedSummaryKeyMode) {
+    if let Some(ranges) = sub_circuit.sub_circuit_input_max_plaintext_norm_ranges() {
+        return (
+            validate_input_plaintext_norms_against_ranges(
+                ranges,
+                actual_input_plaintext_norms,
+                norm_ctx,
+                context,
+            ),
+            ErrorNormPreparedSummaryKeyMode::ExcludeInputPlaintextNorms,
+        );
+    }
+    if let Some(ranges) = call_input_max_plaintext_norm_ranges {
+        return (
+            validate_input_plaintext_norms_against_ranges(
+                ranges,
+                actual_input_plaintext_norms,
+                norm_ctx,
+                context,
+            ),
+            ErrorNormPreparedSummaryKeyMode::IncludeNormalizedInputPlaintextNorms,
+        );
+    }
+    (
+        Arc::from(actual_input_plaintext_norms.to_vec()),
+        ErrorNormPreparedSummaryKeyMode::IncludeNormalizedInputPlaintextNorms,
+    )
 }
 
 /// Return the largest plaintext-profile bit width in one summary request.
@@ -1444,8 +1552,8 @@ impl ErrorNormInputPlaintextProfile {
 /// compressed the relevant input plaintext norms.
 struct ErrorNormPreparedSubCircuitSummaryRequest {
     sub_circuit_id: usize,
-    param_bindings: Arc<[SubCircuitParamValue]>,
     input_plaintext_profile: ErrorNormInputPlaintextProfile,
+    input_max_plaintext_norm_ranges: Option<Arc<[SubCircuitInputMaxPlaintextNormRange]>>,
 }
 
 mod engine;

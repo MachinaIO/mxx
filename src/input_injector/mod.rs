@@ -17,13 +17,14 @@ mod simulation;
 
 pub use simulation::DiamondInputErrorSimulation;
 
-const DIAMOND_SECRET_SIZE: usize = 1;
+const DIAMOND_PREFIX_SIZE: usize = 2;
+const DIAMOND_SECRET_SIZE: usize = 2;
 
 pub trait InputInjector<K, E> {
     /// Precompute and persist the auxiliary matrices needed to inject one
-    /// constant value, every input digit position, and every decoder output.
+    /// constant value, every input bit position, and every decoder output.
     fn preprocess(&self, one: &K, input_digits: &[K], decoders: &[K]);
-    /// Rebuild the final injected encodings for one, the chosen input digits,
+    /// Rebuild the final injected encodings for one, the chosen input bits,
     /// and the decoder outputs from the persisted preprocessing artifacts.
     fn online_eval(
         &self,
@@ -185,7 +186,9 @@ where
     }
 
     fn state_row_size(&self) -> usize {
-        DIAMOND_SECRET_SIZE.checked_mul(2).expect("DiamondInjector state row size overflow")
+        DIAMOND_PREFIX_SIZE
+            .checked_mul(DIAMOND_SECRET_SIZE)
+            .expect("DiamondInjector state row size overflow")
     }
 
     fn gadget_col_size(&self, params: &<M::P as Poly>::Params) -> usize {
@@ -211,43 +214,48 @@ where
     }
 
     fn secret_epsilon_id(&self) -> &'static str {
-        "diamond_secret_epsilon"
+        "diamond_secret_epsilon_tensor_v2"
     }
 
     fn digit_secret_id(&self, level: usize, digit_value: usize) -> String {
-        format!("diamond_secret_{level}_{digit_value}")
+        format!("diamond_secret_tensor_v2_{level}_{digit_value}")
     }
 
     fn b_matrix_id(&self, level: usize) -> String {
-        format!("diamond_b_{level}")
+        format!("diamond_b_tensor_v2_{level}")
     }
 
     fn b_trapdoor_id(&self, level: usize) -> String {
-        format!("diamond_b_{level}_trapdoor")
+        format!("diamond_b_tensor_v2_{level}_trapdoor")
     }
 
     fn p_epsilon_id(&self) -> &'static str {
-        "diamond_p_epsilon_0"
+        "diamond_p_epsilon_tensor_v2_0"
     }
 
     fn k_id(&self, level: usize, digit_value: usize, state_idx: usize) -> String {
-        format!("diamond_k_{level}_{digit_value}_{state_idx}")
+        format!("diamond_k_bit_tensor_v2_{level}_{digit_value}_{state_idx}")
     }
 
     fn l_id(&self, input_idx: usize) -> String {
-        format!("diamond_l_{input_idx}")
+        format!("diamond_l_bit_tensor_v2_{input_idx}")
     }
 
     fn m_id(&self, decoder_idx: usize) -> String {
-        format!("diamond_m_{decoder_idx}")
+        format!("diamond_m_tensor_v2_{decoder_idx}")
     }
 
-    fn sample_secret_mask_with_params(&self, params: &<M::P as Poly>::Params) -> M {
-        US::new().sample_uniform(
+    fn sample_secret_epsilon_with_params(&self, params: &<M::P as Poly>::Params) -> M {
+        let s = US::new().sample_uniform(params, 1, 1, DistType::TernaryDist).entry(0, 0);
+        M::from_poly_vec_row(params, vec![s, M::P::const_minus_one(params)])
+    }
+
+    fn sample_digit_secret_mask_with_params(&self, params: &<M::P as Poly>::Params) -> M {
+        let s_prime = US::new().sample_uniform(params, 1, 1, DistType::TernaryDist).entry(0, 0);
+        let zero = M::P::const_zero(params);
+        M::from_poly_vec(
             params,
-            DIAMOND_SECRET_SIZE,
-            DIAMOND_SECRET_SIZE,
-            DistType::TernaryDist,
+            vec![vec![s_prime, zero.clone()], vec![zero, M::P::const_one(params)]],
         )
     }
 
@@ -269,12 +277,80 @@ where
         }
     }
 
+    fn batch_bits(&self) -> usize {
+        assert!(
+            self.base >= 2 && self.base.is_power_of_two(),
+            "DiamondInjector base must be a power of two greater than one for bit batching"
+        );
+        self.base.trailing_zeros() as usize
+    }
+
+    fn input_bit_count(&self) -> usize {
+        self.input_count
+            .checked_mul(self.batch_bits())
+            .expect("DiamondInjector input bit count overflow")
+    }
+
+    fn expanded_state_count_after_level(&self, level: usize) -> usize {
+        1usize
+            .checked_add(
+                level
+                    .checked_mul(self.batch_bits())
+                    .expect("DiamondInjector expanded state count overflow"),
+            )
+            .expect("DiamondInjector expanded state count overflow")
+    }
+
+    fn first_bit_state_idx_for_level(&self, level: usize) -> usize {
+        assert!(level > 0, "DiamondInjector level must be positive for bit state indexing");
+        1usize
+            .checked_add(
+                (level - 1)
+                    .checked_mul(self.batch_bits())
+                    .expect("DiamondInjector bit state index overflow"),
+            )
+            .expect("DiamondInjector bit state index overflow")
+    }
+
+    fn bit_state_idx(&self, input_idx: usize, bit_idx: usize) -> usize {
+        assert!(bit_idx < self.batch_bits(), "DiamondInjector bit index out of range");
+        1usize
+            .checked_add(
+                input_idx
+                    .checked_mul(self.batch_bits())
+                    .expect("DiamondInjector bit state index overflow"),
+            )
+            .and_then(|idx| idx.checked_add(bit_idx))
+            .expect("DiamondInjector bit state index overflow")
+    }
+
+    fn bit_pubkey_idx(&self, input_idx: usize, bit_idx: usize) -> usize {
+        assert!(bit_idx < self.batch_bits(), "DiamondInjector bit index out of range");
+        input_idx
+            .checked_mul(self.batch_bits())
+            .and_then(|idx| idx.checked_add(bit_idx))
+            .expect("DiamondInjector bit public key index overflow")
+    }
+
+    fn new_bit_idx_for_state(&self, level: usize, state_idx: usize) -> Option<usize> {
+        let first = self.first_bit_state_idx_for_level(level);
+        let end =
+            first.checked_add(self.batch_bits()).expect("DiamondInjector bit state index overflow");
+        if (first..end).contains(&state_idx) { Some(state_idx - first) } else { None }
+    }
+
+    fn digit_bit_value(&self, digit_value: usize, bit_idx: usize) -> usize {
+        assert!(bit_idx < self.batch_bits(), "DiamondInjector bit index out of range");
+        (digit_value >> bit_idx) & 1
+    }
+
     fn validate_lengths(&self, input_pubkeys: &[BggPublicKey<M>], decoders: &[BggPublicKey<M>]) {
+        let expected_input_bits = self.input_bit_count();
         assert_eq!(
             input_pubkeys.len(),
-            self.input_count,
-            "DiamondInjector expected {} input public keys but received {}",
-            self.input_count,
+            expected_input_bits,
+            "DiamondInjector expected {} bit input public keys but received {}",
+            expected_input_bits,
             input_pubkeys.len()
         );
         assert_eq!(
@@ -306,24 +382,45 @@ where
     }
 
     #[cfg(not(feature = "gpu"))]
-    fn load_or_sample_secret_mask(&self, id: &str) -> M {
-        // Checkpoint the small ternary matrix that drives either the initial
-        // state or one digit/value-specific transition.
+    fn load_or_sample_secret_epsilon(&self, id: &str) -> M {
         if self.matrix_exists(id) {
             self.read_matrix(id)
         } else {
-            let secret = self.sample_secret_mask_with_params(&self.params);
+            let secret = self.sample_secret_epsilon_with_params(&self.params);
+            self.write_matrix(id, &secret);
+            secret
+        }
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn load_or_sample_digit_secret_mask(&self, id: &str) -> M {
+        if self.matrix_exists(id) {
+            self.read_matrix(id)
+        } else {
+            let secret = self.sample_digit_secret_mask_with_params(&self.params);
             self.write_matrix(id, &secret);
             secret
         }
     }
 
     #[cfg(feature = "gpu")]
-    fn load_or_sample_secret_mask_bytes(&self, id: &str) -> Vec<u8> {
+    fn load_or_sample_secret_epsilon_bytes(&self, id: &str) -> Vec<u8> {
         if self.matrix_exists(id) {
             self.read_matrix_bytes(id)
         } else {
-            let secret = self.sample_secret_mask_with_params(&self.params);
+            let secret = self.sample_secret_epsilon_with_params(&self.params);
+            let bytes = secret.to_compact_bytes();
+            self.write_matrix_bytes(id, &bytes);
+            bytes
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn load_or_sample_digit_secret_mask_bytes(&self, id: &str) -> Vec<u8> {
+        if self.matrix_exists(id) {
+            self.read_matrix_bytes(id)
+        } else {
+            let secret = self.sample_digit_secret_mask_with_params(&self.params);
             let bytes = secret.to_compact_bytes();
             self.write_matrix_bytes(id, &bytes);
             bytes
@@ -420,7 +517,7 @@ where
     ) -> M {
         // Materialize a column slice of the effective public matrix
         // (B_level | W_{block_idx, level}). Transition matrices, one-outputs,
-        // digit-outputs, and decoder outputs are all sampled against this
+        // bit-outputs, and decoder outputs are all sampled against this
         // concatenated view.
         let total_cols = self.state_col_size(params);
         let b_cols = self.b_public_col_size(params);
@@ -458,21 +555,22 @@ where
     fn special_transition_selector_with_params(
         &self,
         params: &<M::P as Poly>::Params,
-        digit_value: usize,
+        bit_value: usize,
         secret_mask: &M,
     ) -> M {
-        let digit = M::P::from_usize_to_constant(params, digit_value);
-        // The newly created branch for the current digit must carry both a
-        // constant term and the chosen digit value. Because the code multiplies
-        // states from the left, the selector is written in row-vector form.
+        let bit = M::P::from_usize_to_constant(params, bit_value);
+        // Newly born bit branches use H_x tensor diag(s', 1): the empty
+        // prefix (1, 0) becomes (1, x), while the two-component secret becomes
+        // (s * s', -1).
         let zero_block = M::zero(params, DIAMOND_SECRET_SIZE, DIAMOND_SECRET_SIZE);
-        let top = secret_mask.concat_columns(&[&(secret_mask.clone() * &digit)]);
+        let bit_mask = secret_mask.clone() * &bit;
+        let top = secret_mask.concat_columns(&[&bit_mask]);
         let bottom = zero_block.clone().concat_columns(&[&zero_block]);
         top.concat_rows(&[&bottom])
     }
 
     fn initial_selector_with_params(&self, params: &<M::P as Poly>::Params, secret_mask: &M) -> M {
-        let zero_block = M::zero(params, DIAMOND_SECRET_SIZE, DIAMOND_SECRET_SIZE);
+        let zero_block = M::zero(params, 1, DIAMOND_SECRET_SIZE);
         secret_mask.concat_columns(&[&zero_block])
     }
 
@@ -484,7 +582,7 @@ where
         let mut p_epsilon = selector * b0_matrix.concat_columns(&[&w00]);
         p_epsilon.add_in_place(&self.sample_error_matrix_with_dims(
             &self.params,
-            DIAMOND_SECRET_SIZE,
+            1,
             self.state_col_size(&self.params),
         ));
         p_epsilon
@@ -502,17 +600,13 @@ where
     ) -> M {
         // Build one chunk of the target matrix whose preimage becomes a
         // transition matrix. Existing branches use the identity-style selector,
-        // while the newly born branch for the current digit uses the special
-        // selector above so the chosen digit value is embedded into that path.
-        let public_chunk = self.state_public_chunk_with_params(
-            params,
-            b_matrix,
-            state_idx.min(level),
-            level,
-            chunk_idx,
-        );
-        let selector = if state_idx == level {
-            self.special_transition_selector_with_params(params, digit_value, secret_mask)
+        // while each newly born branch for the current digit uses the special
+        // selector above so one chosen bit is embedded into that path.
+        let public_chunk =
+            self.state_public_chunk_with_params(params, b_matrix, state_idx, level, chunk_idx);
+        let selector = if let Some(bit_idx) = self.new_bit_idx_for_state(level, state_idx) {
+            let bit_value = self.digit_bit_value(digit_value, bit_idx);
+            self.special_transition_selector_with_params(params, bit_value, secret_mask)
         } else {
             self.transition_selector_with_params(params, secret_mask)
         };
@@ -551,8 +645,8 @@ where
         gadget: &M,
         chunk_idx: usize,
     ) -> M {
-        // Build one chunk of the final matrix that turns a digit-specific
-        // branch into a BGG encoding under that digit position's public key.
+        // Build one chunk of the final matrix that turns a bit-specific branch
+        // into a BGG encoding under that bit position's public key.
         let total_cols = self.gadget_col_size(params);
         let (col_start, col_len) = column_chunk_bounds(total_cols, chunk_idx);
         let col_end = col_start + col_len;
@@ -648,7 +742,7 @@ where
 
             // Sample the empty-prefix seed once and persist it if it does not
             // already exist.
-            let secret_epsilon = self.load_or_sample_secret_mask(self.secret_epsilon_id());
+            let secret_epsilon = self.load_or_sample_secret_epsilon(self.secret_epsilon_id());
             if !self.matrix_exists(self.p_epsilon_id()) {
                 self.write_matrix(
                     self.p_epsilon_id(),
@@ -658,6 +752,7 @@ where
 
             let state_cols = self.state_col_size(&self.params);
             let output_cols = self.gadget_col_size(&self.params);
+            let input_bit_count = self.input_bit_count();
 
             // For each level, each digit value, and each active branch, sample
             // the transition preimage that advances the state machine by one
@@ -665,15 +760,16 @@ where
             // never need to keep the full transition matrix in memory.
             for level in 1..=self.input_count {
                 for digit_value in 0..self.base {
-                    let secret_mask =
-                        self.load_or_sample_secret_mask(&self.digit_secret_id(level, digit_value));
+                    let secret_mask = self.load_or_sample_digit_secret_mask(
+                        &self.digit_secret_id(level, digit_value),
+                    );
                     let prev_ext_w0 = self.sample_w_block_with_params(&self.params, 0, level - 1);
-                    for state_idx in 0..=level {
+                    for state_idx in 0..self.expanded_state_count_after_level(level) {
                         let k_id = self.k_id(level, digit_value, state_idx);
                         if self.has_all_chunks(&k_id, state_cols) {
                             continue;
                         }
-                        let ext_matrix = if state_idx == level {
+                        let ext_matrix = if self.new_bit_idx_for_state(level, state_idx).is_some() {
                             &prev_ext_w0
                         } else {
                             &self.sample_w_block_with_params(&self.params, state_idx, level - 1)
@@ -706,8 +802,8 @@ where
             }
 
             // Sample the final projection matrices that turn the completed
-            // branches into one-output and digit-output encodings.
-            for input_idx in 0..=self.input_count {
+            // branches into one-output and bit-output encodings.
+            for input_idx in 0..=input_bit_count {
                 let l_id = self.l_id(input_idx);
                 if self.has_all_chunks(&l_id, output_cols) {
                     continue;
@@ -810,12 +906,13 @@ where
                 let level = digit_idx + 1;
                 let prev_states = std::mem::take(&mut states);
                 let prev_p0 = prev_states[0].clone();
-                let mut next_states = Vec::with_capacity(level + 1);
+                let mut next_states =
+                    Vec::with_capacity(self.expanded_state_count_after_level(level));
                 // Advance every currently alive branch through the transition
                 // matrix for the chosen digit, and spawn the new branch that
-                // records the current digit position.
-                for state_idx in 0..=level {
-                    let lhs = if state_idx == level {
+                // records each bit of the current digit.
+                for state_idx in 0..self.expanded_state_count_after_level(level) {
+                    let lhs = if self.new_bit_idx_for_state(level, state_idx).is_some() {
                         prev_p0.clone()
                     } else {
                         prev_states[state_idx].clone()
@@ -835,22 +932,29 @@ where
                 Some(M::P::const_one(&self.params)),
             );
 
-            // Turn each digit-specific branch into the encoding for the digit
-            // that was chosen at that position.
-            let digit_outputs = input_digits
-                .iter()
-                .copied()
-                .enumerate()
-                .map(|(digit_idx, digit_value)| {
+            // Turn each bit-specific branch into the encoding for that bit of
+            // the chosen batched digit.
+            let digit_outputs = (0..self.input_count)
+                .flat_map(|digit_idx| {
+                    let digit_value = input_digits[digit_idx] as usize;
+                    (0..self.batch_bits()).map(move |bit_idx| (digit_idx, digit_value, bit_idx))
+                })
+                .map(|(digit_idx, digit_value, bit_idx)| {
+                    let bit_output_idx = self.bit_pubkey_idx(digit_idx, bit_idx);
+                    let state_idx = self.bit_state_idx(digit_idx, bit_idx);
+                    let plaintext = M::P::from_usize_to_constant(
+                        &self.params,
+                        self.digit_bit_value(digit_value, bit_idx),
+                    );
                     let vector = self.left_mul_checkpointed_cpu(
-                        &states[digit_idx + 1],
-                        &self.l_id(digit_idx + 1),
+                        &states[state_idx],
+                        &self.l_id(state_idx),
                         output_cols,
                     );
                     self.build_output_encoding(
                         vector,
-                        input_digit_pubkeys[digit_idx].clone(),
-                        Some(M::P::from_usize_to_constant(&self.params, digit_value as usize)),
+                        input_digit_pubkeys[bit_output_idx].clone(),
+                        Some(plaintext),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -931,6 +1035,7 @@ mod tests {
         let hash_key = [7u8; 32];
         let input_count = 3;
         let base = 4;
+        let batch_bits = 2;
         let decoder_count = 2;
         let dir = tempdir().expect("temporary directory should be created");
 
@@ -946,9 +1051,9 @@ mod tests {
         );
 
         let one_pubkey = sample_pubkey(&params, hash_key, "diamond_one_pubkey");
-        let input_pubkeys = (0..input_count)
-            .map(|digit_idx| {
-                sample_pubkey(&params, hash_key, &format!("diamond_input_pubkey_{digit_idx}"))
+        let input_pubkeys = (0..input_count * batch_bits)
+            .map(|bit_idx| {
+                sample_pubkey(&params, hash_key, &format!("diamond_input_pubkey_{bit_idx}"))
             })
             .collect::<Vec<_>>();
         let decoder_pubkeys = (0..decoder_count)
@@ -963,14 +1068,20 @@ mod tests {
         let (one_output, digit_outputs, decoder_outputs) =
             injector.online_eval(&digits, &one_pubkey, &input_pubkeys, &decoder_pubkeys);
 
-        assert_eq!(digit_outputs.len(), input_count);
+        assert_eq!(digit_outputs.len(), input_count * batch_bits);
         assert_eq!(decoder_outputs.len(), decoder_count);
 
         let mut secret_matrix = injector.read_matrix(injector.secret_epsilon_id());
+        assert_eq!(secret_matrix.size(), (1, DIAMOND_SECRET_SIZE));
+        assert_eq!(secret_matrix.entry(0, 1), TestPoly::const_minus_one(&params));
         for (digit_idx, digit_value) in digits.iter().copied().enumerate() {
-            secret_matrix = secret_matrix *
-                injector
-                    .read_matrix(&injector.digit_secret_id(digit_idx + 1, digit_value as usize));
+            let secret_mask = injector
+                .read_matrix(&injector.digit_secret_id(digit_idx + 1, digit_value as usize));
+            assert_eq!(secret_mask.size(), (DIAMOND_SECRET_SIZE, DIAMOND_SECRET_SIZE));
+            assert_eq!(secret_mask.entry(0, 1), TestPoly::const_zero(&params));
+            assert_eq!(secret_mask.entry(1, 0), TestPoly::const_zero(&params));
+            assert_eq!(secret_mask.entry(1, 1), TestPoly::const_one(&params));
+            secret_matrix = secret_matrix * secret_mask;
         }
         let gadget = DCRTPolyMatrix::gadget_matrix(&params, DIAMOND_SECRET_SIZE);
         let secret_times_gadget = secret_matrix.clone() * &gadget;
@@ -978,12 +1089,17 @@ mod tests {
         assert_eq!(one_output.vector, secret_matrix.clone() * (&one_pubkey.matrix - &gadget));
         assert_eq!(one_output.plaintext, Some(TestPoly::const_one(&params)));
 
-        for (digit_idx, output) in digit_outputs.iter().enumerate() {
-            let plaintext = TestPoly::from_usize_to_constant(&params, digits[digit_idx] as usize);
-            let expected = secret_matrix.clone() * &input_pubkeys[digit_idx].matrix -
-                (secret_times_gadget.clone() * &plaintext);
-            assert_eq!(output.vector, expected);
-            assert_eq!(output.plaintext, Some(plaintext));
+        for digit_idx in 0..input_count {
+            for bit_idx in 0..batch_bits {
+                let output_idx = digit_idx * batch_bits + bit_idx;
+                let output = &digit_outputs[output_idx];
+                let bit_value = ((digits[digit_idx] as usize) >> bit_idx) & 1;
+                let plaintext = TestPoly::from_usize_to_constant(&params, bit_value);
+                let expected = secret_matrix.clone() * &input_pubkeys[output_idx].matrix -
+                    (secret_times_gadget.clone() * &plaintext);
+                assert_eq!(output.vector, expected);
+                assert_eq!(output.plaintext, Some(plaintext));
+            }
         }
 
         for (decoder_idx, output) in decoder_outputs.iter().enumerate() {
@@ -1005,6 +1121,7 @@ mod tests {
             3.0,
             std::env::temp_dir(),
         );
+        let batch_bits = injector.batch_bits();
 
         let simulated = injector.simulate_output_error_bounds();
         let state_cols = injector.state_col_size(&params);
@@ -1022,12 +1139,8 @@ mod tests {
         ));
         let initial_sigma =
             BigDecimal::from_f64(injector.error_sigma).expect("error_sigma must be finite");
-        let expected_initial = PolyMatrixNorm::sample_gauss(
-            ctx.clone(),
-            DIAMOND_SECRET_SIZE,
-            state_cols,
-            initial_sigma,
-        );
+        let expected_initial =
+            PolyMatrixNorm::sample_gauss(ctx.clone(), 1, state_cols, initial_sigma);
         let expected_transition_target_error = PolyMatrixNorm::sample_gauss(
             ctx.clone(),
             injector.state_row_size(),
@@ -1060,12 +1173,12 @@ mod tests {
             ctx.clone(),
             injector.state_row_size(),
             injector.state_row_size(),
-            BigDecimal::from(injector.base.saturating_sub(1).max(1) as u64),
+            BigDecimal::from(1u64),
             Some(DIAMOND_SECRET_SIZE),
         );
         let expected_initial_secret_factor = PolyMatrixNorm::new(
             ctx.clone(),
-            DIAMOND_SECRET_SIZE,
+            1,
             injector.state_row_size(),
             BigDecimal::from(1u64),
             None,
@@ -1088,11 +1201,13 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
 
-                let born_secret = prev_secret[0].clone() * &expected_special_selector;
-                let born_state_error = prev_state_errors[0].clone() * &expected_transition +
-                    prev_secret[0].clone() * &expected_transition_target_error;
-                next_secret.push(born_secret);
-                next_state_errors.push(born_state_error);
+                for _ in 0..batch_bits {
+                    let born_secret = prev_secret[0].clone() * &expected_special_selector;
+                    let born_state_error = prev_state_errors[0].clone() * &expected_transition +
+                        prev_secret[0].clone() * &expected_transition_target_error;
+                    next_secret.push(born_secret);
+                    next_state_errors.push(born_state_error);
+                }
 
                 (next_secret, next_state_errors)
             };
@@ -1104,9 +1219,10 @@ mod tests {
             expected_state_errors = next_state_errors;
         }
 
-        let expected_inputs = (0..injector.input_count)
-            .map(|input_idx| expected_state_errors[input_idx + 1].clone() * &expected_output)
+        let expected_inputs = (0..injector.input_bit_count())
+            .map(|bit_idx| expected_state_errors[bit_idx + 1].clone() * &expected_output)
             .collect::<Vec<_>>();
+        assert_eq!(simulated.input_errors.len(), injector.input_bit_count());
         assert_eq!(simulated.input_errors, expected_inputs);
 
         let expected_decoders =
@@ -1153,7 +1269,8 @@ mod tests {
         let max_error = std::cmp::max(max_input_error.clone(), max_decoder_error.clone());
 
         println!(
-            "diamond injector output-error metrics: ring_dim={ring_dim}, crt_depth={crt_depth}, crt_bits={crt_bits}, base_bits={base_bits}, digit_bits={digit_bits}, input_base={input_base}, input_count={input_count}, decoder_count={decoder_count}, fixed_secret_size=1"
+            "diamond injector output-error metrics: ring_dim={ring_dim}, crt_depth={crt_depth}, crt_bits={crt_bits}, base_bits={base_bits}, digit_bits={digit_bits}, input_base={input_base}, input_count={input_count}, decoder_count={decoder_count}, output_secret_size={DIAMOND_SECRET_SIZE}, state_row_size={}",
+            injector.state_row_size()
         );
         println!(
             "diamond injector output-error bits: max_input={}, max_decoder={}, max_total={}",

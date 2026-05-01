@@ -173,3 +173,166 @@ where
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{NaiveLWEBGGEncodingVecPltEvaluator, NaiveLWEBGGPublicKeyVecPltEvaluator};
+    use crate::{
+        __PAIR, __TestState,
+        bgg::{
+            naive_vec::{NaiveBGGEncodingVec, NaiveBGGPublicKeyVec},
+            sampler::{BGGEncodingSampler, BGGPublicKeySampler},
+        },
+        circuit::PolyCircuit,
+        element::PolyElem,
+        lookup::{
+            PublicLut,
+            lwe::{LWEBGGEncodingPltEvaluator, LWEBGGPubKeyPltEvaluator},
+        },
+        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        poly::{
+            Poly, PolyParams,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
+        sampler::{
+            PolyTrapdoorSampler, hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
+            uniform::DCRTPolyUniformSampler,
+        },
+        storage::write::{init_storage_system, storage_test_lock, wait_for_all_writes},
+        utils::create_bit_random_poly,
+    };
+    use keccak_asm::Keccak256;
+    use std::{fs, path::Path, sync::Arc};
+
+    const SIGMA: f64 = 4.578;
+
+    fn lsb_lut(params: &DCRTPolyParams) -> PublicLut<DCRTPoly> {
+        PublicLut::new(
+            params,
+            16,
+            |params: &DCRTPolyParams, input| {
+                Some((input & 1, <DCRTPoly as Poly>::Elem::constant(&params.modulus(), input & 1)))
+            },
+            Some((1, <DCRTPoly as Poly>::Elem::constant(&params.modulus(), 1))),
+        )
+    }
+
+    fn prepare_clean_storage(dir_path: &str) {
+        let dir = Path::new(dir_path);
+        if dir.exists() {
+            fs::remove_dir_all(dir).unwrap();
+        }
+        fs::create_dir_all(dir).unwrap();
+        init_storage_system(dir.to_path_buf());
+    }
+
+    #[tokio::test]
+    #[sequential_test::sequential]
+    async fn test_naive_lwe_bgg_vec_lookup_output_vectors_match_plaintext_relation() {
+        let _storage_lock = storage_test_lock().await;
+        let params = DCRTPolyParams::default();
+        let plt = lsb_lut(&params);
+
+        let mut circuit = PolyCircuit::new();
+        let input = circuit.input(1).as_single_wire();
+        let plt_id = circuit.register_public_lookup(plt);
+        let output = circuit.public_lookup_gate(input, plt_id);
+        circuit.output(vec![output]);
+
+        let d = 2;
+        let num_slots = 2;
+        let hash_key = [0x46u8; 32];
+        let pubkey_sampler =
+            BGGPublicKeySampler::<_, DCRTPolyHashSampler<Keccak256>>::new(hash_key, d);
+        let secrets = vec![create_bit_random_poly(&params); d];
+        let plaintexts = vec![
+            DCRTPoly::from_usize_to_constant(&params, 5),
+            DCRTPoly::from_usize_to_constant(&params, 6),
+        ];
+        let pubkeys = pubkey_sampler.sample(&params, b"naive-lwe-output-relation", &[true, true]);
+        let encoding_sampler =
+            BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
+        let encodings = encoding_sampler.sample(&params, &pubkeys, &plaintexts);
+        let secret_vec = DCRTPolyMatrix::from_poly_vec_row(&params, secrets);
+        let gadget = DCRTPolyMatrix::gadget_matrix(&params, d);
+        for slot_idx in 0..num_slots {
+            assert_eq!(
+                encodings[slot_idx + 1].vector,
+                secret_vec.clone() * encodings[slot_idx + 1].pubkey.matrix.clone() -
+                    secret_vec.clone() *
+                        (gadget.clone() * encodings[slot_idx + 1].plaintext.clone().unwrap())
+            );
+        }
+
+        let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let (b_trapdoor, b) = trapdoor_sampler.trapdoor(&params, d);
+        let c_b = secret_vec.clone() * &b;
+        let dir_path = "test_data/test_naive_lwe_bgg_vec_lookup_output_relation";
+        prepare_clean_storage(dir_path);
+
+        let pubkey_evaluator =
+            NaiveLWEBGGPublicKeyVecPltEvaluator::new(LWEBGGPubKeyPltEvaluator::<
+                DCRTPolyMatrix,
+                DCRTPolyHashSampler<Keccak256>,
+                DCRTPolyTrapdoorSampler,
+            >::new(
+                hash_key,
+                trapdoor_sampler,
+                Arc::new(b),
+                Arc::new(b_trapdoor),
+                dir_path.into(),
+            ));
+        let one_pubkey = NaiveBGGPublicKeyVec::new(vec![pubkeys[0].clone(); num_slots]);
+        let input_pubkey = NaiveBGGPublicKeyVec::new(pubkeys[1..].to_vec());
+        let result_pubkey = circuit.eval(
+            &params,
+            one_pubkey,
+            vec![input_pubkey],
+            Some(&pubkey_evaluator),
+            None,
+            None,
+        );
+        pubkey_evaluator.sample_aux_matrices(&params);
+        wait_for_all_writes(Path::new(dir_path).to_path_buf()).await.unwrap();
+
+        let encoding_evaluator =
+            NaiveLWEBGGEncodingVecPltEvaluator::new(LWEBGGEncodingPltEvaluator::<
+                DCRTPolyMatrix,
+                DCRTPolyHashSampler<Keccak256>,
+            >::new(
+                hash_key, dir_path.into(), c_b
+            ));
+        let one_encoding = NaiveBGGEncodingVec::new(vec![encodings[0].clone(); num_slots]);
+        let input_encoding = NaiveBGGEncodingVec::new(encodings[1..].to_vec());
+        let result_encoding = circuit.eval(
+            &params,
+            one_encoding,
+            vec![input_encoding],
+            Some(&encoding_evaluator),
+            None,
+            None,
+        );
+
+        assert_eq!(result_pubkey.len(), 1);
+        assert_eq!(result_encoding.len(), 1);
+        for slot_idx in 0..num_slots {
+            let output_encoding = &result_encoding[0].encodings[slot_idx];
+            let output_pubkey = &result_pubkey[0].keys[slot_idx];
+            assert_eq!(output_encoding.pubkey, output_pubkey.clone());
+
+            let expected_bit = plaintexts[slot_idx].const_coeff_u64() & 1;
+            let expected_output = DCRTPoly::from_usize_to_constant(&params, expected_bit as usize);
+            assert_eq!(
+                output_encoding
+                    .plaintext
+                    .as_ref()
+                    .expect("lookup output plaintext should be revealed"),
+                &expected_output
+            );
+
+            let expected_vector = secret_vec.clone() * output_pubkey.matrix.clone() -
+                secret_vec.clone() * (gadget.clone() * expected_output);
+            assert_eq!(output_encoding.vector, expected_vector);
+        }
+    }
+}

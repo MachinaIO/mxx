@@ -40,7 +40,6 @@ pub enum SubCircuitParamKind {
     SmallScalarMul,
     LargeScalarMul,
     SlotTransfer,
-    PubLut,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +141,16 @@ impl SlotTransferSpec {
             _ => None,
         }
     }
+
+    pub fn max_scalar_bound(&self) -> u32 {
+        match self {
+            Self::Explicit(values) => {
+                values.iter().map(|(_, scalar)| scalar.unwrap_or(1)).max().unwrap_or(1)
+            }
+            Self::Rotation { .. } => 1,
+            Self::Repeated { prefix_scalar, .. } => prefix_scalar.map_or(1, |scalar| scalar.max(1)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,7 +158,70 @@ pub enum SubCircuitParamValue {
     SmallScalarMul(Vec<u32>),
     LargeScalarMul(Vec<BigUint>),
     SlotTransfer(SlotTransferSpec),
-    PubLut(usize),
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubCircuitParamSpec {
+    SmallScalarMul { max_scalar: u32 },
+    LargeScalarMul { max_scalar: BigUint },
+    SlotTransfer { max_scalar: u32 },
+}
+
+impl SubCircuitParamSpec {
+    pub fn kind(&self) -> SubCircuitParamKind {
+        match self {
+            Self::SmallScalarMul { .. } => SubCircuitParamKind::SmallScalarMul,
+            Self::LargeScalarMul { .. } => SubCircuitParamKind::LargeScalarMul,
+            Self::SlotTransfer { .. } => SubCircuitParamKind::SlotTransfer,
+        }
+    }
+
+    pub fn simulator_binding(&self) -> SubCircuitParamValue {
+        match self {
+            Self::SmallScalarMul { max_scalar } => {
+                SubCircuitParamValue::SmallScalarMul(vec![*max_scalar])
+            }
+            Self::LargeScalarMul { max_scalar } => {
+                SubCircuitParamValue::LargeScalarMul(vec![max_scalar.clone()])
+            }
+            Self::SlotTransfer { max_scalar } => SubCircuitParamValue::SlotTransfer(
+                SlotTransferSpec::explicit(vec![(0, Some(*max_scalar))]),
+            ),
+        }
+    }
+
+    pub fn validate_binding(&self, binding: &SubCircuitParamValue, param_id: usize) {
+        match (self, binding) {
+            (Self::SmallScalarMul { max_scalar }, SubCircuitParamValue::SmallScalarMul(values)) => {
+                if let Some(actual_max) = values.iter().copied().max() {
+                    assert!(
+                        actual_max <= *max_scalar,
+                        "sub-circuit SmallScalarMul binding {param_id} exceeds declared max: actual={actual_max}, max={max_scalar}"
+                    );
+                }
+            }
+            (Self::LargeScalarMul { max_scalar }, SubCircuitParamValue::LargeScalarMul(values)) => {
+                if let Some(actual_max) = values.iter().max() {
+                    assert!(
+                        actual_max <= max_scalar,
+                        "sub-circuit LargeScalarMul binding {param_id} exceeds declared max: actual={actual_max}, max={max_scalar}"
+                    );
+                }
+            }
+            (Self::SlotTransfer { max_scalar }, SubCircuitParamValue::SlotTransfer(value)) => {
+                let actual_max = value.max_scalar_bound();
+                assert!(
+                    actual_max <= *max_scalar,
+                    "sub-circuit SlotTransfer binding {param_id} exceeds declared max: actual={actual_max}, max={max_scalar}"
+                );
+            }
+            (expected, actual) => panic!(
+                "sub-circuit parameter kind mismatch for param {param_id}: expected {:?}, got {:?}",
+                expected.kind(),
+                actual.kind()
+            ),
+        }
+    }
 }
 
 impl SubCircuitParamValue {
@@ -158,7 +230,6 @@ impl SubCircuitParamValue {
             Self::SmallScalarMul(_) => SubCircuitParamKind::SmallScalarMul,
             Self::LargeScalarMul(_) => SubCircuitParamKind::LargeScalarMul,
             Self::SlotTransfer(_) => SubCircuitParamKind::SlotTransfer,
-            Self::PubLut(_) => SubCircuitParamKind::PubLut,
         }
     }
 }
@@ -227,18 +298,12 @@ impl GateParamSource<SlotTransferSpec> {
 }
 
 impl GateParamSource<usize> {
-    pub fn resolve_public_lookup(&self, bindings: &[SubCircuitParamValue]) -> usize {
+    pub fn resolve_public_lookup(&self, _bindings: &[SubCircuitParamValue]) -> usize {
         match self {
-            Self::Const(value) => *value,
-            Self::Param(param_id) => match bindings.get(*param_id) {
-                Some(SubCircuitParamValue::PubLut(value)) => *value,
-                Some(other) => panic!(
-                    "sub-circuit parameter kind mismatch for PubLut: expected {:?}, got {:?}",
-                    SubCircuitParamKind::PubLut,
-                    other.kind()
-                ),
-                None => panic!("missing sub-circuit parameter binding {param_id}"),
-            },
+            Self::Const(lut_id) => *lut_id,
+            Self::Param(param_id) => {
+                panic!("parameterized public lookup id {param_id} is not supported")
+            }
         }
     }
 }

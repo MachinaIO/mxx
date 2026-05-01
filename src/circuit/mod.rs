@@ -6,6 +6,6 @@ pub mod serde;
 pub use evaluable::*;
 pub use gate::{
     GateParamSource, PolyGate, PolyGateKind, PolyGateType, SlotTransferSpec, SubCircuitParamKind,
-    SubCircuitParamValue,
+    SubCircuitParamSpec, SubCircuitParamValue,
 };
 pub use poly_circuit::*;

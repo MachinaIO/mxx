@@ -18,7 +18,7 @@ mod montgomery;
 mod nested_rns;
 
 use crate::{
-    circuit::{BatchedWire, PolyCircuit, SubCircuitParamKind, SubCircuitParamValue, gate::GateId},
+    circuit::{BatchedWire, PolyCircuit, SubCircuitParamSpec, SubCircuitParamValue, gate::GateId},
     gadgets::arith::{ModularArithmeticContext, ModularArithmeticGadget},
     poly::{Poly, PolyParams},
 };
@@ -28,6 +28,8 @@ use std::{sync::Arc, time::Instant};
 use tracing::debug;
 
 pub trait NegacyclicConvolutionContext<P: Poly>: ModularArithmeticContext<P> {
+    fn q_level_diagonal_product_param_specs(&self) -> Vec<SubCircuitParamSpec>;
+
     fn q_level_diagonal_product_param_bindings(
         &self,
         diagonal: usize,
@@ -130,11 +132,15 @@ fn q_level_diagonal_product_subcircuit<P: Poly + 'static, C: NegacyclicConvoluti
     let mut circuit = source_circuit.fresh_sub_circuit();
     let ctx = Arc::new(template_ctx.clone());
     let p_moduli_depth = ctx.q_level_row_width();
-    let lhs_slot_transfer_param_ids = (0..p_moduli_depth)
-        .map(|_| circuit.register_sub_circuit_param(SubCircuitParamKind::SlotTransfer))
+    let param_specs = ctx.q_level_diagonal_product_param_specs();
+    assert_eq!(param_specs.len(), p_moduli_depth + 1);
+    let lhs_slot_transfer_param_ids = param_specs[..p_moduli_depth]
+        .iter()
+        .cloned()
+        .map(|spec| circuit.register_sub_circuit_param(spec))
         .collect::<Vec<_>>();
     let rhs_slot_transfer_param_id =
-        circuit.register_sub_circuit_param(SubCircuitParamKind::SlotTransfer);
+        circuit.register_sub_circuit_param(param_specs[p_moduli_depth].clone());
     let lhs_row = circuit.input(p_moduli_depth).to_vec();
     let rhs_row = circuit.input(p_moduli_depth).to_vec();
     let lhs_transferred = lhs_row

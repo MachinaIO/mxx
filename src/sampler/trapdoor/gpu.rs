@@ -1,9 +1,11 @@
 use crate::{
     matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
     poly::{Poly, PolyParams, dcrt::gpu::GpuDCRTPolyParams},
-    sampler::{DistType, PolyTrapdoorSampler, PolyUniformSampler, gpu::GpuDCRTPolyUniformSampler},
+    sampler::{
+        DistType, PolyTrapdoorSampler, PolyUniformSampler,
+        gpu::{GpuDCRTPolyUniformSampler, random_gpu_rng_seed},
+    },
 };
-use rand::{Rng, rng};
 use rayon::prelude::*;
 use std::{
     sync::{Arc, Mutex},
@@ -291,10 +293,9 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             "gpu preimage: computed perturbed_syndrome"
         );
 
-        let mut rng = rng();
-        let z_seed: u64 = rng.random();
         let gauss_start = Instant::now();
-        let z_hat_mat = perturbed_syndrome.gauss_samp_gq_arb_base(self.c, self.sigma, z_seed);
+        let z_hat_mat =
+            perturbed_syndrome.gauss_samp_gq_arb_base(self.c, self.sigma, random_gpu_rng_seed());
         tracing::debug!(
             elapsed_ms = gauss_start.elapsed().as_secs_f64() * 1_000.0,
             "gpu preimage: sampled z_hat_mat with gauss_samp_gq_arb_base"
@@ -457,15 +458,17 @@ fn sample_pert_square_mat_gpu_native_parts(
 
     // Keep perturbation generation on device: this sampler uses the full
     // 2d x 2d covariance induced by (A, B, D) and Tp2.
-    let mut prng = rng();
-    let p1_seed: u64 = prng.random();
     debug_assert_eq!(
         (c, s, dgg_stddev),
         p1_covariance_parameters(params, d, dgg_stddev),
         "cached p1 covariance parameters must match the current preimage parameters",
     );
     let p1_covariance_cache = get_or_create_p1_covariance_cache(trapdoor, c, s, dgg_stddev);
-    let p1 = GpuDCRTPolyMatrix::sample_p1_full_cached(p1_covariance_cache.as_ref(), tp2, p1_seed);
+    let p1 = GpuDCRTPolyMatrix::sample_p1_full_cached(
+        p1_covariance_cache.as_ref(),
+        tp2,
+        random_gpu_rng_seed(),
+    );
     tracing::debug!("gpu preimage sample_pert: sampled p1");
 
     GpuPerturbationSamples { p1, p2 }

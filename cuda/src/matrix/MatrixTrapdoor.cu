@@ -1,5 +1,7 @@
 constexpr size_t kSampleP1LocalMaxM = 8;
 
+using gpu_chacha::GpuRngSeed;
+
 namespace
 {
     struct ThreadLocalOwnerLinkEventState
@@ -207,7 +209,7 @@ __global__ void matrix_sample_p1_integer_cached_kernel_small(
     int64_t *sampled_out,
     uint64_t modulus,
     double c_scale,
-    uint64_t seed)
+    GpuRngSeed seed)
 {
     const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const size_t total_samples = cols * n;
@@ -290,7 +292,7 @@ __global__ void matrix_sample_p1_integer_cached_kernel_large(
     int64_t *sampled_out,
     uint64_t modulus,
     double c_scale,
-    uint64_t seed)
+    GpuRngSeed seed)
 {
     const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= sample_count)
@@ -378,7 +380,7 @@ __global__ void matrix_sample_p1_integer_kernel_small(
     double sigma,
     double s,
     double dgg_stddev,
-    uint64_t seed)
+    GpuRngSeed seed)
 {
     const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const size_t total_samples = cols * n;
@@ -536,7 +538,7 @@ __global__ void matrix_sample_p1_integer_kernel_large(
     double sigma,
     double s,
     double dgg_stddev,
-    uint64_t seed)
+    GpuRngSeed seed)
 {
     const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= sample_count)
@@ -708,7 +710,7 @@ __global__ void matrix_gauss_samp_gq_arb_base_sample_kernel(
     uint32_t digits_per_tower,
     double c,
     uint32_t tower_idx,
-    uint64_t seed)
+    GpuRngSeed seed)
 {
     size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t total = poly_count * n;
@@ -907,7 +909,7 @@ int launch_gauss_samp_gq_arb_base_sample_kernel(
     uint32_t digits_per_tower,
     double c,
     uint32_t tower_idx,
-    uint64_t seed,
+    GpuRngSeed seed,
     int device,
     cudaStream_t stream)
 {
@@ -1049,7 +1051,7 @@ int launch_sample_p1_integer_kernel(
     double sigma,
     double s,
     double dgg_stddev,
-    uint64_t seed,
+    GpuRngSeed seed,
     cudaStream_t stream,
     int device_id,
     int64_t **sampled_out_device,
@@ -1407,7 +1409,7 @@ int launch_sample_p1_integer_cached_kernel(
     const GpuP1CovarianceCache *cache,
     size_t cols,
     int64_t **sampled_out_device,
-    uint64_t seed,
+    GpuRngSeed seed,
     cudaStream_t stream,
     int device_id,
     cudaEvent_t sampled_ready_event)
@@ -1672,7 +1674,7 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
     uint32_t base_bits,
     double c,
     double dgg_stddev,
-    uint64_t seed,
+    GpuRngSeed seed,
     GpuMatrix *out)
 {
     (void)dgg_stddev;
@@ -2474,7 +2476,7 @@ extern "C" void gpu_matrix_destroy_p1_covariance_cache(GpuP1CovarianceCache *cac
 extern "C" int gpu_matrix_sample_p1_full_cached(
     const GpuP1CovarianceCache *cache,
     const GpuMatrix *tp2,
-    uint64_t seed,
+    GpuRngSeed seed,
     GpuMatrix *out)
 {
     if (!cache || !tp2 || !out)
@@ -2923,7 +2925,7 @@ extern "C" int gpu_matrix_sample_p1_full(
     double sigma,
     double s,
     double dgg_stddev,
-    uint64_t seed,
+    GpuRngSeed seed,
     GpuMatrix *out)
 {
     if (!a_mat || !b_mat || !d_mat || !tp2 || !out)

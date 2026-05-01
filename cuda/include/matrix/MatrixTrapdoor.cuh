@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ChaCha.cuh"
 #include "matrix/Matrix.cuh"
 
 typedef struct GpuP1CovarianceCache GpuP1CovarianceCache;
@@ -15,7 +16,7 @@ int launch_gauss_samp_gq_arb_base_multi_kernel(
     const std::vector<uint32_t> &digit_indices,
     double c,
     const std::vector<uint32_t> &tower_indices,
-    uint64_t seed,
+    gpu_chacha::GpuRngSeed seed,
     const std::vector<uint64_t> &out_moduli,
     int device,
     cudaStream_t stream);
@@ -40,7 +41,7 @@ int launch_sample_p1_integer_kernel(
     double sigma,
     double s,
     double dgg_stddev,
-    uint64_t seed,
+    gpu_chacha::GpuRngSeed seed,
     cudaStream_t stream,
     int device_id,
     int64_t **sampled_out_device,
@@ -67,7 +68,7 @@ extern "C"
         uint32_t base_bits,
         double c,
         double dgg_stddev,
-        uint64_t seed,
+        gpu_chacha::GpuRngSeed seed,
         GpuMatrix *out);
 
     int gpu_matrix_sample_p1_full(
@@ -78,7 +79,7 @@ extern "C"
         double sigma,
         double s,
         double dgg_stddev,
-        uint64_t seed,
+        gpu_chacha::GpuRngSeed seed,
         GpuMatrix *out);
 
     int gpu_matrix_create_p1_covariance_cache(
@@ -95,7 +96,7 @@ extern "C"
     int gpu_matrix_sample_p1_full_cached(
         const GpuP1CovarianceCache *cache,
         const GpuMatrix *tp2,
-        uint64_t seed,
+        gpu_chacha::GpuRngSeed seed,
         GpuMatrix *out);
 
 #ifdef __cplusplus

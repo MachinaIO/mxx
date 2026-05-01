@@ -2612,7 +2612,7 @@ int launch_sample_p1_integer_kernel(
     double sigma,
     double s,
     double dgg_stddev,
-    uint64_t seed,
+    gpu_chacha::GpuRngSeed seed,
     cudaStream_t stream,
     int device_id,
     int64_t **sampled_out_device,

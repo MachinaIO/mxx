@@ -7,14 +7,6 @@ namespace gpu_chacha
         return (x << n) | (x >> (32U - n));
     }
 
-    __device__ __forceinline__ uint64_t splitmix64_next(uint64_t &state)
-    {
-        uint64_t z = (state += 0x9e3779b97f4a7c15ULL);
-        z = (z ^ (z >> 30U)) * 0xbf58476d1ce4e5b9ULL;
-        z = (z ^ (z >> 27U)) * 0x94d049bb133111ebULL;
-        return z ^ (z >> 31U);
-    }
-
     __device__ __forceinline__ void quarter_round(
         uint32_t &a,
         uint32_t &b,
@@ -67,9 +59,51 @@ namespace gpu_chacha
         }
     }
 
+    __device__ __forceinline__ void hchacha20(
+        const uint32_t key[8],
+        const uint32_t nonce[4],
+        uint32_t out_key[8])
+    {
+        uint32_t x[16];
+        x[0] = 0x61707865U;
+        x[1] = 0x3320646eU;
+        x[2] = 0x79622d32U;
+        x[3] = 0x6b206574U;
+        for (uint32_t i = 0; i < 8; ++i)
+        {
+            x[4 + i] = key[i];
+        }
+        for (uint32_t i = 0; i < 4; ++i)
+        {
+            x[12 + i] = nonce[i];
+        }
+
+        for (uint32_t round = 0; round < 10; ++round)
+        {
+            quarter_round(x[0], x[4], x[8], x[12]);
+            quarter_round(x[1], x[5], x[9], x[13]);
+            quarter_round(x[2], x[6], x[10], x[14]);
+            quarter_round(x[3], x[7], x[11], x[15]);
+
+            quarter_round(x[0], x[5], x[10], x[15]);
+            quarter_round(x[1], x[6], x[11], x[12]);
+            quarter_round(x[2], x[7], x[8], x[13]);
+            quarter_round(x[3], x[4], x[9], x[14]);
+        }
+
+        out_key[0] = x[0];
+        out_key[1] = x[1];
+        out_key[2] = x[2];
+        out_key[3] = x[3];
+        out_key[4] = x[12];
+        out_key[5] = x[13];
+        out_key[6] = x[14];
+        out_key[7] = x[15];
+    }
+
     __device__ __forceinline__ void rng_init(
         DeviceChaChaRng &rng,
-        uint64_t seed,
+        const GpuRngSeed &seed,
         uint64_t stream0,
         uint64_t stream1,
         uint64_t stream2,
@@ -80,25 +114,31 @@ namespace gpu_chacha
         rng.state[2] = 0x79622d32U;
         rng.state[3] = 0x6b206574U;
 
-        uint64_t mix = seed ^ 0x243f6a8885a308d3ULL;
-        mix ^= (stream0 + 0x9e3779b97f4a7c15ULL);
-        mix ^= (stream1 + 0xbf58476d1ce4e5b9ULL);
-        mix ^= (stream2 + 0x94d049bb133111ebULL);
-        mix ^= (domain_tag + 0xd6e8feb86659fd93ULL);
-
+        uint32_t base_key[8];
         for (uint32_t i = 0; i < 4; ++i)
         {
-            const uint64_t v = splitmix64_next(mix);
-            rng.state[4 + 2 * i] = static_cast<uint32_t>(v);
-            rng.state[5 + 2 * i] = static_cast<uint32_t>(v >> 32U);
+            const uint64_t word = seed.words[i];
+            base_key[2 * i] = static_cast<uint32_t>(word);
+            base_key[2 * i + 1] = static_cast<uint32_t>(word >> 32U);
         }
 
-        const uint64_t n0 = splitmix64_next(mix);
-        const uint64_t n1 = splitmix64_next(mix);
-        rng.state[12] = 0U;
-        rng.state[13] = static_cast<uint32_t>(n0);
-        rng.state[14] = static_cast<uint32_t>(n0 >> 32U);
-        rng.state[15] = static_cast<uint32_t>(n1);
+        uint32_t hnonce[4] = {
+            static_cast<uint32_t>(domain_tag),
+            static_cast<uint32_t>(domain_tag >> 32U),
+            static_cast<uint32_t>(stream2),
+            static_cast<uint32_t>(stream2 >> 32U),
+        };
+        uint32_t subkey[8];
+        hchacha20(base_key, hnonce, subkey);
+        for (uint32_t i = 0; i < 8; ++i)
+        {
+            rng.state[4 + i] = subkey[i];
+        }
+
+        rng.state[12] = static_cast<uint32_t>(stream0);
+        rng.state[13] = static_cast<uint32_t>(stream0 >> 32U);
+        rng.state[14] = static_cast<uint32_t>(stream1);
+        rng.state[15] = static_cast<uint32_t>(stream1 >> 32U);
 
         rng.block_idx = 8U;
     }
@@ -107,6 +147,10 @@ namespace gpu_chacha
     {
         chacha20_block(rng.state, rng.block);
         rng.state[12] += 1U;
+        if (rng.state[12] == 0U)
+        {
+            rng.state[13] += 1U;
+        }
         rng.block_idx = 0U;
     }
 

@@ -9,10 +9,10 @@ use crate::{
                 GPU_MATRIX_DIST_BIT, GPU_MATRIX_DIST_GAUSS, GPU_MATRIX_DIST_TERNARY,
                 GPU_MATRIX_DIST_UNIFORM, GPU_POLY_FORMAT_COEFF, GPU_POLY_FORMAT_EVAL, GpuDCRTPoly,
                 GpuDCRTPolyParams, GpuEventSetOpaque, GpuMatrixOpaque, GpuP1CovarianceCacheOpaque,
-                check_status, gpu_event_set_destroy, gpu_event_set_wait, gpu_matrix_add,
-                gpu_matrix_add_block, gpu_matrix_copy, gpu_matrix_copy_block, gpu_matrix_create,
-                gpu_matrix_create_p1_covariance_cache, gpu_matrix_decompose_base,
-                gpu_matrix_decompose_base_small, gpu_matrix_destroy,
+                GpuRngSeed, check_status, gpu_event_set_destroy, gpu_event_set_wait,
+                gpu_matrix_add, gpu_matrix_add_block, gpu_matrix_copy, gpu_matrix_copy_block,
+                gpu_matrix_create, gpu_matrix_create_p1_covariance_cache,
+                gpu_matrix_decompose_base, gpu_matrix_decompose_base_small, gpu_matrix_destroy,
                 gpu_matrix_destroy_p1_covariance_cache, gpu_matrix_equal, gpu_matrix_fill_gadget,
                 gpu_matrix_fill_small_decomposed_identity_chunk, gpu_matrix_fill_small_gadget,
                 gpu_matrix_gauss_samp_gq_arb_base, gpu_matrix_intt_all,
@@ -396,7 +396,7 @@ impl GpuDCRTPolyMatrix {
         ncol: usize,
         dist: GpuMatrixSampleDist,
         sigma: f64,
-        seed: u64,
+        seed: GpuRngSeed,
     ) -> Self {
         let out = Self::new_empty(params, nrow, ncol);
         if nrow == 0 || ncol == 0 {
@@ -415,7 +415,7 @@ impl GpuDCRTPolyMatrix {
         col_len: usize,
         dist: GpuMatrixSampleDist,
         sigma: f64,
-        seed: u64,
+        seed: GpuRngSeed,
     ) -> Self {
         let col_end = col_start
             .checked_add(col_len)
@@ -445,7 +445,7 @@ impl GpuDCRTPolyMatrix {
         out
     }
 
-    pub fn gauss_samp_gq_arb_base(mut self, c: f64, dgg_stddev: f64, seed: u64) -> Self {
+    pub fn gauss_samp_gq_arb_base(mut self, c: f64, dgg_stddev: f64, seed: GpuRngSeed) -> Self {
         let log_base_q = self.params.modulus_digits();
         let out_nrow = self.nrow.saturating_mul(log_base_q);
         let out = Self::new_empty(&self.params, out_nrow, self.ncol);
@@ -500,7 +500,7 @@ impl GpuDCRTPolyMatrix {
     pub(crate) fn sample_p1_full_cached(
         cache: &GpuP1CovarianceCache,
         mut tp2: Self,
-        seed: u64,
+        seed: GpuRngSeed,
     ) -> Self {
         let out = Self::new_empty(&tp2.params, tp2.nrow, tp2.ncol);
         if tp2.nrow == 0 || tp2.ncol == 0 {
@@ -1775,6 +1775,12 @@ mod tests {
         GpuDCRTPolyParams::new(params.ring_dimension(), moduli, params.base_bits())
     }
 
+    fn gpu_test_seed(base: u64, offset: u64) -> GpuRngSeed {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&base.wrapping_add(offset).to_le_bytes());
+        GpuRngSeed::from_bytes(bytes)
+    }
+
     #[test]
     #[sequential]
     fn test_gpu_matrix_compact_cross_device_roundtrip_invariant() {
@@ -2214,8 +2220,11 @@ mod tests {
         let c = (base as f64 + 1.0) * 4.578;
         let gadget = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, matrix.row_size());
         for offset in 0..16u64 {
-            let sampled =
-                matrix.clone().gauss_samp_gq_arb_base(c, 4.578, 0x1234_5678_9abc_def0u64 + offset);
+            let sampled = matrix.clone().gauss_samp_gq_arb_base(
+                c,
+                4.578,
+                gpu_test_seed(0x1234_5678_9abc_def0u64, offset),
+            );
             let reconstructed = &gadget * &sampled;
             assert_eq!(reconstructed, matrix);
         }
@@ -2231,8 +2240,11 @@ mod tests {
         let varied_matrix = GpuDCRTPolyMatrix::from_poly_vec(&gpu_params, vec![vec![varied_poly]]);
         let varied_gadget = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, 1);
         for offset in 0..16u64 {
-            let sampled =
-                varied_matrix.clone().gauss_samp_gq_arb_base(c, 4.578, 0x00de_adbe_efu64 + offset);
+            let sampled = varied_matrix.clone().gauss_samp_gq_arb_base(
+                c,
+                4.578,
+                gpu_test_seed(0x00de_adbe_efu64, offset),
+            );
             let reconstructed = &varied_gadget * &sampled;
             assert_eq!(reconstructed, varied_matrix);
         }
@@ -2259,7 +2271,7 @@ mod tests {
             let sampled = wide_matrix.clone().gauss_samp_gq_arb_base(
                 c,
                 4.578,
-                0x55aa_aa55_1357_2468u64 + offset,
+                gpu_test_seed(0x55aa_aa55_1357_2468u64, offset),
             );
             let reconstructed = &wide_gadget * &sampled;
             assert_eq!(reconstructed, wide_matrix);
@@ -2284,7 +2296,7 @@ mod tests {
             let sampled = random_matrix.clone().gauss_samp_gq_arb_base(
                 c,
                 4.578,
-                0x0f0f_f0f0_2468_1357u64 + offset,
+                gpu_test_seed(0x0f0f_f0f0_2468_1357u64, offset),
             );
             let reconstructed = &random_gadget * &sampled;
             if reconstructed != random_matrix {

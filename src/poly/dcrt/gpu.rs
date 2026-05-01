@@ -42,6 +42,24 @@ pub(crate) struct GpuP1CovarianceCacheOpaque {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct GpuRngSeed {
+    words: [u64; 4],
+}
+
+impl GpuRngSeed {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        let mut words = [0u64; 4];
+        for (word, chunk) in words.iter_mut().zip(bytes.chunks_exact(8)) {
+            let mut word_bytes = [0u8; 8];
+            word_bytes.copy_from_slice(chunk);
+            *word = u64::from_le_bytes(word_bytes);
+        }
+        Self { words }
+    }
+}
+
 #[allow(non_camel_case_types)]
 #[repr(C)]
 pub(crate) struct GpuEventSetOpaque {
@@ -176,7 +194,7 @@ unsafe extern "C" {
         base_bits: u32,
         c: f64,
         dgg_stddev: f64,
-        seed: u64,
+        seed: GpuRngSeed,
         out: *mut GpuMatrixOpaque,
     ) -> c_int;
     pub(crate) fn gpu_matrix_create_p1_covariance_cache(
@@ -192,20 +210,20 @@ unsafe extern "C" {
     pub(crate) fn gpu_matrix_sample_p1_full_cached(
         cache: *const GpuP1CovarianceCacheOpaque,
         tp2: *const GpuMatrixOpaque,
-        seed: u64,
+        seed: GpuRngSeed,
         out: *mut GpuMatrixOpaque,
     ) -> c_int;
     pub(crate) fn gpu_matrix_sample_distribution(
         out: *mut GpuMatrixOpaque,
         dist_type: c_int,
         sigma: f64,
-        seed: u64,
+        seed: GpuRngSeed,
     ) -> c_int;
     pub(crate) fn gpu_matrix_sample_distribution_columns(
         out: *mut GpuMatrixOpaque,
         dist_type: c_int,
         sigma: f64,
-        seed: u64,
+        seed: GpuRngSeed,
         full_ncol: usize,
         col_offset: usize,
     ) -> c_int;

@@ -69,6 +69,7 @@ const DEFAULT_P_MODULI_BITS: usize = 7;
 const DEFAULT_MAX_UNREDUCED_MULS: usize = 4;
 const DEFAULT_SCALE: u64 = 1 << 8;
 const DEFAULT_BASE_BITS: u32 = 14;
+const DEFAULT_MIN_CRT_DEPTH: usize = 1;
 const DEFAULT_MAX_CRT_DEPTH: usize = 64;
 const DEFAULT_ERROR_SIGMA: f64 = 4.0;
 const DEFAULT_D_SECRET: usize = 1;
@@ -100,6 +101,7 @@ struct GoldreichRingGswBenchConfig {
     max_unreduced_muls: usize,
     scale: u64,
     base_bits: u32,
+    min_crt_depth: usize,
     max_crt_depth: usize,
     error_sigma: f64,
     d_secret: usize,
@@ -156,6 +158,8 @@ impl GoldreichRingGswBenchConfig {
         let scale = env_or_parse_u64("LWE_GOLDREICH_RING_GSW_BENCH_SCALE", DEFAULT_SCALE);
         let base_bits =
             env_or_parse_u32("LWE_GOLDREICH_RING_GSW_BENCH_BASE_BITS", DEFAULT_BASE_BITS);
+        let min_crt_depth =
+            env_or_parse_usize("LWE_GOLDREICH_RING_GSW_BENCH_MIN_CRT_DEPTH", DEFAULT_MIN_CRT_DEPTH);
         let max_crt_depth =
             env_or_parse_usize("LWE_GOLDREICH_RING_GSW_BENCH_MAX_CRT_DEPTH", DEFAULT_MAX_CRT_DEPTH);
         let error_sigma =
@@ -191,7 +195,12 @@ impl GoldreichRingGswBenchConfig {
         );
         assert!(scale > 0, "LWE_GOLDREICH_RING_GSW_BENCH_SCALE must be > 0");
         assert!(base_bits > 0, "LWE_GOLDREICH_RING_GSW_BENCH_BASE_BITS must be > 0");
+        assert!(min_crt_depth > 0, "LWE_GOLDREICH_RING_GSW_BENCH_MIN_CRT_DEPTH must be > 0");
         assert!(max_crt_depth > 0, "LWE_GOLDREICH_RING_GSW_BENCH_MAX_CRT_DEPTH must be > 0");
+        assert!(
+            min_crt_depth <= max_crt_depth,
+            "LWE_GOLDREICH_RING_GSW_BENCH_MIN_CRT_DEPTH must be <= LWE_GOLDREICH_RING_GSW_BENCH_MAX_CRT_DEPTH"
+        );
         assert!(error_sigma >= 0.0, "LWE_GOLDREICH_RING_GSW_BENCH_ERROR_SIGMA must be >= 0");
         assert!(d_secret > 0, "LWE_GOLDREICH_RING_GSW_BENCH_D_SECRET must be > 0");
         assert!(bench_iterations > 0, "LWE_GOLDREICH_RING_GSW_BENCH_BENCH_ITERATIONS must be > 0");
@@ -208,6 +217,7 @@ impl GoldreichRingGswBenchConfig {
             max_unreduced_muls,
             scale,
             base_bits,
+            min_crt_depth,
             max_crt_depth,
             error_sigma,
             d_secret,
@@ -467,8 +477,7 @@ fn find_crt_depth_for_goldreich_ring_gsw_bench(
         return (requested_crt_depth, params);
     }
 
-    let min_crt_depth = 1usize;
-    let mut low = min_crt_depth;
+    let mut low = cfg.min_crt_depth;
     let mut high = cfg.max_crt_depth;
     while low < high {
         let mid = low + (high - low) / 2;
@@ -501,8 +510,8 @@ fn find_crt_depth_for_goldreich_ring_gsw_bench(
     }
 
     panic!(
-        "crt_depth satisfying the LWE error threshold was not found up to LWE_GOLDREICH_RING_GSW_BENCH_MAX_CRT_DEPTH ({})",
-        cfg.max_crt_depth
+        "crt_depth satisfying the LWE error threshold was not found in LWE_GOLDREICH_RING_GSW_BENCH_MIN_CRT_DEPTH..=LWE_GOLDREICH_RING_GSW_BENCH_MAX_CRT_DEPTH ({}..={})",
+        cfg.min_crt_depth, cfg.max_crt_depth
     );
 }
 

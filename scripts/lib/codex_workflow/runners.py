@@ -104,6 +104,12 @@ class CodexExecRunner:
             "--skip-git-repo-check",
             "--disable",
             "codex_hooks",
+            # The default Linux bubblewrap backend can fail inside the desktop hook
+            # environment before commands run (`bwrap: loopback: Failed RTM_NEWADDR`).
+            # Landlock preserves read-only command sandboxing without requiring that
+            # loopback setup.
+            "--enable",
+            "use_legacy_landlock",
             "--sandbox",
             "read-only",
             "--output-schema",

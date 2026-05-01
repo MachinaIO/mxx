@@ -223,17 +223,19 @@ impl NestedRnsPolyContext {
     fn register_local_support_subcircuits<P: Poly + 'static>(
         circuit: &mut PolyCircuit<P>,
         p_moduli: &[u64],
+        p_max: u64,
+        trace_capacity_bound: &BigUint,
         lut_mod_p_ids: &[usize],
         lut_x_to_y_ids: &[usize],
         lut_x_to_real_ids: &[usize],
         lut_real_to_v_id: usize,
     ) -> NestedRnsRegisteredSubcircuitIds {
-        let p_moduli_depth = p_moduli.len();
         NestedRnsRegisteredSubcircuitIds {
             add_without_reduce_id: circuit
                 .register_sub_circuit(Self::add_without_reduce_subcircuit::<P>(p_moduli)),
-            sub_with_trace_offsets_id: circuit
-                .register_sub_circuit(Self::sub_with_trace_offsets_subcircuit::<P>(p_moduli_depth)),
+            sub_with_trace_offsets_id: circuit.register_sub_circuit(
+                Self::sub_with_trace_offsets_subcircuit::<P>(p_moduli, p_max, trace_capacity_bound),
+            ),
             lazy_reduce_id: circuit
                 .register_sub_circuit(Self::lazy_reduce_subcircuit::<P>(p_moduli, lut_mod_p_ids)),
             decomposition_terms_id: circuit.register_sub_circuit(
@@ -325,6 +327,8 @@ impl NestedRnsPolyContext {
             let registered_ids = Self::register_local_support_subcircuits::<P>(
                 circuit,
                 &p_moduli,
+                max_p_modulus,
+                &lut_mod_p_max_map_size,
                 &lut_mod_p_ids,
                 &lut_x_to_y_ids,
                 &lut_x_to_real_ids,
@@ -507,6 +511,8 @@ impl NestedRnsPolyContext {
         let registered_ids = Self::register_local_support_subcircuits::<P>(
             circuit,
             &p_moduli,
+            max_p_modulus,
+            &lut_mod_p_max_map_size,
             &lut_mod_p_ids,
             &lut_x_to_y_ids,
             &lut_x_to_real_ids,
@@ -706,16 +712,25 @@ impl NestedRnsPolyContext {
         let inputs = circuit.input(p_moduli_depth);
         let x = inputs;
         let scalar_y_param_ids = (0..p_moduli_depth)
-            .map(|_| {
+            .map(|p_idx| {
+                let max_scalar =
+                    u32::try_from(p_moduli[p_idx] - 1).expect("p modulus must fit in u32");
                 (0..p_moduli_depth)
                     .map(|_| {
-                        circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul)
+                        circuit.register_sub_circuit_param(SubCircuitParamSpec::SmallScalarMul {
+                            max_scalar,
+                        })
                     })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         let scalar_v_param_ids = (0..p_moduli_depth)
-            .map(|_| circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul))
+            .map(|p_idx| {
+                let max_scalar =
+                    u32::try_from(p_moduli[p_idx] - 1).expect("p modulus must fit in u32");
+                circuit
+                    .register_sub_circuit_param(SubCircuitParamSpec::SmallScalarMul { max_scalar })
+            })
             .collect::<Vec<_>>();
 
         let ys = (0..p_moduli_depth)
@@ -749,13 +764,24 @@ impl NestedRnsPolyContext {
         circuit
     }
 
-    fn sub_with_trace_offsets_subcircuit<P: Poly>(p_moduli_depth: usize) -> PolyCircuit<P> {
+    fn sub_with_trace_offsets_subcircuit<P: Poly>(
+        p_moduli: &[u64],
+        p_max: u64,
+        trace_capacity_bound: &BigUint,
+    ) -> PolyCircuit<P> {
         let mut circuit = PolyCircuit::<P>::new();
+        let p_moduli_depth = p_moduli.len();
         let inputs = circuit.input(2 * p_moduli_depth);
         let (left, right) = inputs.split_at(p_moduli_depth);
         let one = circuit.const_one_gate();
+        let max_trace = trace_capacity_bound - BigUint::from(1u64);
+        let max_offset_multiplier = (&max_trace + BigUint::from(p_max - 1)) / BigUint::from(p_max);
         let offset_param_ids = (0..p_moduli_depth)
-            .map(|_| circuit.register_sub_circuit_param(SubCircuitParamKind::LargeScalarMul))
+            .map(|p_idx| {
+                circuit.register_sub_circuit_param(SubCircuitParamSpec::LargeScalarMul {
+                    max_scalar: &max_offset_multiplier * BigUint::from(p_moduli[p_idx]),
+                })
+            })
             .collect::<Vec<_>>();
         let outputs = (0..p_moduli_depth)
             .map(|p_idx| {

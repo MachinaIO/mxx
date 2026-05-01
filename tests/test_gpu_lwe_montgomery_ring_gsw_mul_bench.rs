@@ -77,6 +77,7 @@ const DEFAULT_D_SECRET: usize = 1;
 const DEFAULT_BENCH_ITERATIONS: usize = 1;
 const DEFAULT_BENCH_SEED: [u8; 32] = [0u8; 32];
 const TRAPDOOR_SIGMA: f64 = 4.578;
+const ERROR_SIM_ACTIVE_LEVELS: usize = 1;
 
 type GpuMatrix = GpuDCRTPolyMatrix;
 type GpuHashSampler = GpuDCRTPolyHashSampler<Keccak256>;
@@ -244,6 +245,13 @@ fn ring_gsw_q_modulus<P: Poly + 'static>(ctx: &RingGswContext<P>) -> BigUint {
         .fold(BigUint::from(1u64), |acc, &q_i| acc * BigUint::from(q_i))
 }
 
+fn corrected_max_eval_error_for_active_levels(
+    simulated_error: &BigDecimal,
+    requested_active_levels: usize,
+) -> BigDecimal {
+    simulated_error * BigDecimal::from_biguint(BigUint::from(requested_active_levels), 0)
+}
+
 fn max_bigdecimal<I>(values: I) -> BigDecimal
 where
     I: IntoIterator<Item = BigDecimal>,
@@ -272,11 +280,10 @@ impl CrtDepthProbe {
 fn build_ring_gsw_mul_circuit<P: Poly + 'static>(
     params: &P::Params,
     cfg: &RingGswMulBenchConfig,
+    active_levels: usize,
 ) -> (PolyCircuit<P>, Arc<RingGswContext<P>>, Vec<RingGswCiphertext<P>>) {
     let build_start = Instant::now();
     let mut circuit = PolyCircuit::<P>::new();
-    let (_, _, crt_depth) = params.to_crt();
-    let active_levels = cfg.active_levels_for_crt_depth(crt_depth);
     let montgomery =
         Arc::new(MontgomeryPolyContext::setup(&mut circuit, params, cfg.limb_bits, false));
     let ctx = Arc::new(RingGswContext::from_arith_context(
@@ -310,10 +317,17 @@ fn probe_crt_depth_for_ring_gsw_mul_bench(
     let params = DCRTPolyParams::new(cfg.ring_dim, crt_depth, cfg.crt_bits, cfg.base_bits);
     let (_, _, actual_crt_depth) = params.to_crt();
     let active_levels = cfg.active_levels_for_crt_depth(actual_crt_depth);
+    assert!(
+        ERROR_SIM_ACTIVE_LEVELS <= actual_crt_depth,
+        "error simulation requires crt_depth >= ERROR_SIM_ACTIVE_LEVELS: crt_depth={}, ERROR_SIM_ACTIVE_LEVELS={}",
+        actual_crt_depth,
+        ERROR_SIM_ACTIVE_LEVELS
+    );
     let (active_q_moduli, active_q, _) = active_q_moduli_and_modulus(&params, active_levels);
     let full_q = params.modulus();
     let q_max = *active_q_moduli.iter().max().expect("active_q_moduli must not be empty");
-    let (circuit, ctx, encrypted_outputs) = build_ring_gsw_mul_circuit::<DCRTPoly>(&params, cfg);
+    let (circuit, ctx, encrypted_outputs) =
+        build_ring_gsw_mul_circuit::<DCRTPoly>(&params, cfg, ERROR_SIM_ACTIVE_LEVELS);
     let log_base_q = params.modulus_digits();
     let log_base_q_small = log_base_q / actual_crt_depth;
     let sim_ctx = Arc::new(SimulatorContext::new(
@@ -343,6 +357,8 @@ fn probe_crt_depth_for_ring_gsw_mul_bench(
             .map(|error| error.matrix_norm.poly_norm.norm.clone())
             .collect::<Vec<_>>(),
     );
+    let corrected_max_eval_error =
+        corrected_max_eval_error_for_active_levels(&max_eval_error, active_levels);
     let ring_gsw_q = ring_gsw_q_modulus(ctx.as_ref());
     let ring_gsw_threshold = &ring_gsw_q / BigUint::from(2u64);
     let ring_gsw_threshold_bd = BigDecimal::from_biguint(ring_gsw_threshold.clone(), 0);
@@ -354,14 +370,15 @@ fn probe_crt_depth_for_ring_gsw_mul_bench(
             })
             .collect::<Vec<_>>(),
     );
-    let eval_ok = max_eval_error < threshold_bd;
+    let eval_ok = corrected_max_eval_error < threshold_bd;
     let decryption_ok = max_decryption_error < ring_gsw_threshold_bd;
     let non_free_depth = circuit.non_free_depth();
     let non_free_depth_contributions = circuit.non_free_depth_contributions();
     info!(
-        "ring_gsw_mul crt_depth={} active_levels={} active_q_bits={} full_q_bits={} ring_gsw_q_bits={} non_free_depth={} non_free_depth_contributions={:?} num_inputs={} output_polys={} max_eval_error_bits={} eval_threshold_bits={} max_decryption_error_bits={} decryption_threshold_bits={} eval_ok={} decryption_ok={}",
+        "ring_gsw_mul crt_depth={} active_levels={} error_sim_active_levels={} active_q_bits={} full_q_bits={} ring_gsw_q_bits={} non_free_depth={} non_free_depth_contributions={:?} num_inputs={} output_polys={} sim_max_eval_error_bits={} max_eval_error_bits={} eval_threshold_bits={} max_decryption_error_bits={} decryption_threshold_bits={} eval_ok={} decryption_ok={}",
         crt_depth,
         active_levels,
+        ERROR_SIM_ACTIVE_LEVELS,
         active_q.bits(),
         full_q.bits(),
         ring_gsw_q.bits(),
@@ -370,6 +387,7 @@ fn probe_crt_depth_for_ring_gsw_mul_bench(
         circuit.num_input(),
         out_errors.len(),
         bigdecimal_bits_ceil(&max_eval_error),
+        bigdecimal_bits_ceil(&corrected_max_eval_error),
         bigdecimal_bits_ceil(&BigDecimal::from_biguint(threshold, 0)),
         bigdecimal_bits_ceil(&max_decryption_error),
         bigdecimal_bits_ceil(&BigDecimal::from_biguint(ring_gsw_threshold, 0)),
@@ -397,7 +415,13 @@ fn find_crt_depth_for_ring_gsw_mul_bench(cfg: &RingGswMulBenchConfig) -> (usize,
         return (requested_crt_depth, params);
     }
 
-    let mut low = 1usize;
+    let min_crt_depth =
+        env_or_parse_usize("LWE_MONTGOMERY_RING_GSW_MUL_BENCH_MIN_CRT_DEPTH", 1usize);
+    assert!(
+        min_crt_depth <= cfg.max_crt_depth,
+        "LWE_MONTGOMERY_RING_GSW_MUL_BENCH_MIN_CRT_DEPTH must be <= LWE_MONTGOMERY_RING_GSW_MUL_BENCH_MAX_CRT_DEPTH"
+    );
+    let mut low = min_crt_depth;
     let mut high = cfg.max_crt_depth;
     while low < high {
         let mid = low + (high - low) / 2;
@@ -543,7 +567,7 @@ async fn test_gpu_lwe_montgomery_ring_gsw_mul_bench() {
     let active_levels = cfg.active_levels_for_crt_depth(actual_crt_depth);
     let (active_q_moduli, active_q, _) = active_q_moduli_and_modulus(&params, active_levels);
     let (circuit, ctx, encrypted_outputs) =
-        build_ring_gsw_mul_circuit::<GpuDCRTPoly>(&params, &cfg);
+        build_ring_gsw_mul_circuit::<GpuDCRTPoly>(&params, &cfg, active_levels);
     let max_selected_decryption_error = max_bigdecimal(
         encrypted_outputs
             .iter()

@@ -677,6 +677,48 @@ where
     assert!(num_slots > 0, "num_slots must be positive");
     let ring_dim = ring_gsw.params.ring_dimension() as usize;
     assert_eq!(num_slots, ring_dim, "num_slots must match ring_dim");
+
+    let mut circuit = ring_gsw.fresh_circuit();
+    let seed_inputs = (0..seed_bits)
+        .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
+        .collect::<Vec<_>>();
+    let decryption_key = circuit.input(1).at(0).as_single_wire();
+    let seed_wires =
+        seed_inputs.iter().flat_map(RingGswCiphertext::sub_circuit_wires).collect::<Vec<_>>();
+    let mut shared_inputs = seed_wires.clone();
+    shared_inputs.push(BatchedWire::single(decryption_key));
+    let mut outputs = Vec::new();
+    for slot_idx in 0..num_slots {
+        let slot_sub_id =
+            circuit.register_sub_circuit(build_noise_refresh_slot_material_circuit::<P, A, M>(
+                ring_gsw.clone(),
+                seed_bits,
+                v_bits,
+                graph_seed,
+                cbd_n,
+                slot_idx,
+            ));
+        outputs.extend(circuit.call_sub_circuit(slot_sub_id, shared_inputs.clone()));
+    }
+    circuit.output(outputs);
+    circuit
+}
+
+fn build_noise_refresh_slot_material_circuit<P, A, M>(
+    ring_gsw: Arc<RingGswContext<P, A>>,
+    seed_bits: usize,
+    v_bits: usize,
+    graph_seed: [u8; 32],
+    cbd_n: usize,
+    slot_idx: usize,
+) -> PolyCircuit<P>
+where
+    P: Poly + 'static,
+    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
+    M: PolyMatrix<P = P>,
+{
+    let ring_dim = ring_gsw.params.ring_dimension() as usize;
+    assert!(slot_idx < ring_dim, "slot_idx must be in range");
     let log_base_q = ring_gsw.params.modulus_digits();
     let (_q_moduli, _crt_bits, crt_depth) = ring_gsw.params.to_crt();
     let output_sizes =
@@ -701,61 +743,54 @@ where
         .register_sub_circuit(build_refreshed_wire_digit_all_crt_merge::<P>(&ring_gsw.params));
     let seed_wires =
         seed_inputs.iter().flat_map(RingGswCiphertext::sub_circuit_wires).collect::<Vec<_>>();
-    let mut outputs = Vec::with_capacity(num_slots * crt_depth * log_base_q);
+    let prg_sub_id =
+        circuit.register_sub_circuit(build_goldreich_encrypted_seeds_with_output::<P, A>(
+            ring_gsw.clone(),
+            seed_bits,
+            v_bits,
+            graph_seed,
+            cbd_n,
+            slot_idx,
+        ));
+    let prg_outputs =
+        expand_batched_wires(&circuit.call_sub_circuit(prg_sub_id, seed_wires.clone()));
+    let logical_outputs = prg_outputs
+        .chunks_exact(ciphertext_wire_count)
+        .map(|chunk| RingGswCiphertext::from_sub_circuit_outputs(&ciphertext_template, chunk))
+        .collect::<Vec<_>>();
+    assert_eq!(logical_outputs.len(), output_sizes.total);
+    let (errors, masks) = logical_outputs.split_at(output_sizes.cbd_values);
+    let mut by_crt_digit = vec![vec![BatchedWire::single(decryption_key); log_base_q]; crt_depth];
 
-    for slot_idx in 0..num_slots {
-        let prg_sub_id =
-            circuit.register_sub_circuit(build_goldreich_encrypted_seeds_with_output::<P, A>(
-                ring_gsw.clone(),
-                seed_bits,
-                v_bits,
-                graph_seed,
-                cbd_n,
-                slot_idx,
-            ));
-        let prg_outputs =
-            expand_batched_wires(&circuit.call_sub_circuit(prg_sub_id, seed_wires.clone()));
-        let logical_outputs = prg_outputs
-            .chunks_exact(ciphertext_wire_count)
-            .map(|chunk| RingGswCiphertext::from_sub_circuit_outputs(&ciphertext_template, chunk))
-            .collect::<Vec<_>>();
-        assert_eq!(logical_outputs.len(), output_sizes.total);
-        let (errors, masks) = logical_outputs.split_at(output_sizes.cbd_values);
-        let mut by_crt_digit =
-            vec![vec![BatchedWire::single(decryption_key); log_base_q]; crt_depth];
+    for digit_idx in 0..log_base_q {
+        let mut decrypt_inputs = Vec::new();
+        decrypt_inputs.push(BatchedWire::single(decryption_key));
 
-        for digit_idx in 0..log_base_q {
-            let mut decrypt_inputs = Vec::new();
-            decrypt_inputs.push(BatchedWire::single(decryption_key));
+        let error_start = digit_idx * ring_dim;
+        decrypt_inputs.extend(
+            errors[error_start..error_start + ring_dim]
+                .iter()
+                .flat_map(RingGswCiphertext::sub_circuit_wires),
+        );
 
-            let error_start = digit_idx * ring_dim;
+        for crt_idx in 0..crt_depth {
+            let mask_start = crt_idx * log_base_q * mask_q_chunk_len + digit_idx * mask_q_chunk_len;
             decrypt_inputs.extend(
-                errors[error_start..error_start + ring_dim]
+                masks[mask_start..mask_start + mask_q_chunk_len]
                     .iter()
                     .flat_map(RingGswCiphertext::sub_circuit_wires),
             );
-
-            for crt_idx in 0..crt_depth {
-                let mask_start =
-                    crt_idx * log_base_q * mask_q_chunk_len + digit_idx * mask_q_chunk_len;
-                decrypt_inputs.extend(
-                    masks[mask_start..mask_start + mask_q_chunk_len]
-                        .iter()
-                        .flat_map(RingGswCiphertext::sub_circuit_wires),
-                );
-            }
-
-            let decrypt_outputs = circuit.call_sub_circuit(decrypt_sub_id, decrypt_inputs);
-            let merge_outputs = circuit.call_sub_circuit(merge_sub_id, decrypt_outputs);
-            assert_eq!(merge_outputs.len(), crt_depth);
-            for (crt_idx, output) in merge_outputs.into_iter().enumerate() {
-                by_crt_digit[crt_idx][digit_idx] = output;
-            }
         }
-        outputs.extend(by_crt_digit.into_iter().flatten());
+
+        let decrypt_outputs = circuit.call_sub_circuit(decrypt_sub_id, decrypt_inputs);
+        let merge_outputs = circuit.call_sub_circuit(merge_sub_id, decrypt_outputs);
+        assert_eq!(merge_outputs.len(), crt_depth);
+        for (crt_idx, output) in merge_outputs.into_iter().enumerate() {
+            by_crt_digit[crt_idx][digit_idx] = output;
+        }
     }
 
-    circuit.output(outputs);
+    circuit.output(by_crt_digit.into_iter().flatten());
     circuit
 }
 

@@ -494,24 +494,38 @@ where
     ) -> Vec<C> {
         debug_assert_eq!(graph.input_size, self.input_size);
         debug_assert_eq!(graph.output_size(), self.output_size);
+        let (predicate_sub_circuit_id, output_template) =
+            self.register_tsa_predicate_sub_circuit(circuit);
         graph
             .edges
             .iter()
             .map(|edge| {
-                let and_term =
-                    input_bits[edge.and_inputs[0]].and(&input_bits[edge.and_inputs[1]], circuit);
-                reduce_ciphertext_terms_pairwise(
-                    vec![
-                        input_bits[edge.xor_inputs[0]].clone(),
-                        input_bits[edge.xor_inputs[1]].clone(),
-                        input_bits[edge.xor_inputs[2]].clone(),
-                        and_term,
-                    ],
-                    circuit,
-                    |lhs: &C, rhs: &C, circuit| lhs.xor(rhs, circuit),
-                )
+                let mut inputs = Vec::new();
+                inputs.extend(input_bits[edge.xor_inputs[0]].sub_circuit_wires());
+                inputs.extend(input_bits[edge.xor_inputs[1]].sub_circuit_wires());
+                inputs.extend(input_bits[edge.xor_inputs[2]].sub_circuit_wires());
+                inputs.extend(input_bits[edge.and_inputs[0]].sub_circuit_wires());
+                inputs.extend(input_bits[edge.and_inputs[1]].sub_circuit_wires());
+                let outputs = circuit.call_sub_circuit(predicate_sub_circuit_id, inputs);
+                C::from_sub_circuit_outputs(&output_template, &outputs)
             })
             .collect::<Vec<_>>()
+    }
+
+    fn register_tsa_predicate_sub_circuit(&self, circuit: &mut PolyCircuit<P>) -> (usize, C) {
+        let mut sub_circuit = circuit.fresh_sub_circuit();
+        let inputs = (0..5)
+            .map(|_| C::sub_circuit_input(Arc::clone(&self.ring_gsw), &mut sub_circuit))
+            .collect::<Vec<_>>();
+        let and_term = inputs[3].and(&inputs[4], &mut sub_circuit);
+        let output = reduce_ciphertext_terms_pairwise(
+            vec![inputs[0].clone(), inputs[1].clone(), inputs[2].clone(), and_term],
+            &mut sub_circuit,
+            |lhs: &C, rhs: &C, circuit| lhs.xor(rhs, circuit),
+        );
+        sub_circuit.output(output.sub_circuit_wires());
+        let sub_circuit_id = circuit.register_sub_circuit(sub_circuit);
+        (sub_circuit_id, output)
     }
 
     /// Homomorphically evaluates all TSA predicate edges on encrypted input bits and returns

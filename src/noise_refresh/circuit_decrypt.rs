@@ -117,6 +117,42 @@ where
     sum_gate_ids(circuit, &bit_terms)
 }
 
+/// Decrypts one bit-decomposed scalar mask.
+///
+/// This is the coefficient-free counterpart of `decrypt_bit_decomposed_polynomial`: bit `j` is
+/// decrypted with plaintext modulus `q / 2^j`, so Ring-GSW contributes `2^j * bit_j`, and the
+/// returned wire is the ordinary binary sum of the encrypted mask bits.
+pub fn decrypt_bit_decomposed_scalar<P, A, M>(
+    circuit: &mut PolyCircuit<P>,
+    encrypted_bits: &[RingGswCiphertext<P, A>],
+    decryption_key: GateId,
+    plaintext_moduli: &[BigUint],
+) -> GateId
+where
+    P: Poly + 'static,
+    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
+    M: PolyMatrix<P = P>,
+{
+    assert!(!encrypted_bits.is_empty(), "at least one encrypted bit is required");
+    assert_eq!(
+        encrypted_bits.len(),
+        plaintext_moduli.len(),
+        "encrypted scalar bit count must match plaintext modulus count"
+    );
+    assert!(
+        plaintext_moduli.iter().all(|modulus| !modulus.is_zero()),
+        "all bit plaintext moduli must be positive"
+    );
+    let bit_terms = encrypted_bits
+        .iter()
+        .zip(plaintext_moduli.iter())
+        .map(|(encrypted_bit, plaintext_modulus)| {
+            encrypted_bit.decrypt::<M>(decryption_key, plaintext_modulus.clone(), circuit)
+        })
+        .collect::<Vec<_>>();
+    sum_gate_ids(circuit, &bit_terms)
+}
+
 /// Builds one CRT-specific decrypt subcircuit for one refreshed wire.
 ///
 /// Inputs are all error ciphertexts for one refresh wire and only the mask ciphertexts for the

@@ -89,6 +89,15 @@ pub trait PolyMatrix:
         self.clone().into_compact_bytes()
     }
     fn from_compact_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self;
+    fn into_cpu_staging_bytes(self) -> Vec<u8> {
+        self.into_compact_bytes()
+    }
+    fn to_cpu_staging_bytes(&self) -> Vec<u8> {
+        self.clone().into_cpu_staging_bytes()
+    }
+    fn from_cpu_staging_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self {
+        Self::from_compact_bytes(params, bytes)
+    }
     fn zero_compact_bytes(
         params: &<Self::P as Poly>::Params,
         nrow: usize,

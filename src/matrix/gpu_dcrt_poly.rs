@@ -69,6 +69,55 @@ impl Drop for GpuP1CovarianceCache {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuDCRTMatrixRnsSnapshot {
+    nrow: usize,
+    ncol: usize,
+    level: usize,
+    is_ntt: bool,
+    bytes_per_poly: usize,
+    bytes: Vec<u8>,
+}
+
+impl GpuDCRTMatrixRnsSnapshot {
+    pub fn nrow(&self) -> usize {
+        self.nrow
+    }
+
+    pub fn ncol(&self) -> usize {
+        self.ncol
+    }
+
+    pub fn level(&self) -> usize {
+        self.level
+    }
+
+    pub fn is_ntt(&self) -> bool {
+        self.is_ntt
+    }
+
+    pub fn bytes_per_poly(&self) -> usize {
+        self.bytes_per_poly
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn validate_for_params(&self, params: &GpuDCRTPolyParams) {
+        assert!(self.level < params.crt_depth(), "invalid RNS snapshot level");
+        let expected_bytes_per_poly = rns_bytes_len_for_level(params, self.level);
+        assert_eq!(
+            self.bytes_per_poly, expected_bytes_per_poly,
+            "RNS snapshot bytes_per_poly mismatch"
+        );
+        let poly_count = self.nrow.checked_mul(self.ncol).expect("RNS snapshot shape overflow");
+        let expected_len =
+            poly_count.checked_mul(self.bytes_per_poly).expect("RNS snapshot byte length overflow");
+        assert_eq!(self.bytes.len(), expected_len, "RNS snapshot byte length mismatch");
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum GpuMatrixSampleDist {
     Uniform,
@@ -588,6 +637,54 @@ impl GpuDCRTPolyMatrix {
         self.is_ntt = format == GPU_POLY_FORMAT_EVAL;
     }
 
+    pub fn to_rns_snapshot(&self) -> GpuDCRTMatrixRnsSnapshot {
+        let bytes_per_poly = rns_bytes_len_for_level(&self.params, self.level);
+        let poly_count = self.nrow.checked_mul(self.ncol).expect("matrix shape overflow");
+        let mut bytes = vec![0u8; poly_count.saturating_mul(bytes_per_poly)];
+        let format = if self.is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
+        self.store_rns_bytes(&mut bytes, bytes_per_poly, format);
+        GpuDCRTMatrixRnsSnapshot {
+            nrow: self.nrow,
+            ncol: self.ncol,
+            level: self.level,
+            is_ntt: self.is_ntt,
+            bytes_per_poly,
+            bytes,
+        }
+    }
+
+    pub fn from_rns_snapshot(
+        params: &GpuDCRTPolyParams,
+        snapshot: &GpuDCRTMatrixRnsSnapshot,
+    ) -> Self {
+        snapshot.validate_for_params(params);
+        let mut out = Self::new_empty_with_state(
+            params,
+            snapshot.nrow,
+            snapshot.ncol,
+            snapshot.level,
+            snapshot.is_ntt,
+        );
+        if !snapshot.bytes.is_empty() {
+            let format = if snapshot.is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
+            out.load_rns_bytes(&snapshot.bytes, snapshot.bytes_per_poly, format);
+        }
+        out
+    }
+
+    pub fn load_rns_snapshot(&mut self, snapshot: &GpuDCRTMatrixRnsSnapshot) {
+        snapshot.validate_for_params(&self.params);
+        assert_eq!(self.nrow, snapshot.nrow, "RNS snapshot row count mismatch");
+        assert_eq!(self.ncol, snapshot.ncol, "RNS snapshot column count mismatch");
+        assert_eq!(self.level, snapshot.level, "RNS snapshot level mismatch");
+        assert_eq!(self.is_ntt, snapshot.is_ntt, "RNS snapshot format mismatch");
+        if snapshot.bytes.is_empty() {
+            return;
+        }
+        let format = if snapshot.is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
+        self.load_rns_bytes(&snapshot.bytes, snapshot.bytes_per_poly, format);
+    }
+
     fn cpu_params(&self) -> DCRTPolyParams {
         DCRTPolyParams::new(
             self.params.ring_dimension(),
@@ -919,6 +1016,41 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             out.is_ntt = true;
         }
         out
+    }
+
+    fn into_cpu_staging_bytes(self) -> Vec<u8> {
+        let snapshot = self.to_rns_snapshot();
+        bincode::encode_to_vec(
+            (
+                1u8,
+                snapshot.nrow,
+                snapshot.ncol,
+                snapshot.level,
+                snapshot.is_ntt,
+                snapshot.bytes_per_poly,
+                snapshot.bytes,
+            ),
+            bincode::config::standard(),
+        )
+        .expect("Failed to serialize GPU matrix RNS staging bytes")
+    }
+
+    fn from_cpu_staging_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self {
+        let (version, nrow, ncol, level, is_ntt, bytes_per_poly, payload): (
+            u8,
+            usize,
+            usize,
+            usize,
+            bool,
+            usize,
+            Vec<u8>,
+        ) = bincode::decode_from_slice(bytes, bincode::config::standard())
+            .expect("Failed to deserialize GPU matrix RNS staging bytes")
+            .0;
+        assert_eq!(version, 1, "Unsupported GPU matrix RNS staging version: {version}");
+        let snapshot =
+            GpuDCRTMatrixRnsSnapshot { nrow, ncol, level, is_ntt, bytes_per_poly, bytes: payload };
+        Self::from_rns_snapshot(params, &snapshot)
     }
 
     fn zero_compact_bytes(
@@ -1736,8 +1868,13 @@ fn block_offsets(range: Range<usize>, block: usize) -> Vec<usize> {
 }
 
 fn rns_bytes_len(params: &GpuDCRTPolyParams) -> usize {
-    let n = params.ring_dimension() as usize;
     let level = params.crt_depth().saturating_sub(1);
+    rns_bytes_len_for_level(params, level)
+}
+
+fn rns_bytes_len_for_level(params: &GpuDCRTPolyParams, level: usize) -> usize {
+    assert!(level < params.crt_depth(), "invalid RNS byte length level");
+    let n = params.ring_dimension() as usize;
     (level + 1).saturating_mul(n).saturating_mul(std::mem::size_of::<u64>())
 }
 

@@ -1,6 +1,6 @@
 #![cfg(feature = "gpu")]
 
-#[path = "common/ring_gsw_montgomery.rs"]
+#[path = "common/ring_gsw_montgomery_gpu.rs"]
 mod ring_gsw_montgomery;
 
 use bigdecimal::{BigDecimal, FromPrimitive};

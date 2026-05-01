@@ -153,7 +153,7 @@ where
     }
 
     pub fn secret_size(&self) -> usize {
-        2
+        1
     }
 
     pub fn debug_reuse_single_prg_sample(&self) -> bool {
@@ -564,7 +564,7 @@ where
             .expect("AKY24 PRF mask final decrypt must produce one output")
             .matrix
             .clone();
-        let selector = M::unit_column_vector(&params.poly_params, params.secret_size(), 1);
+        let selector = g_inverse_identity_selector::<M>(&params.poly_params);
         let mask_target = target.mul_decompose(&selector);
         info!(refresh_preimages = refresh_preimages.len(), "AKY24 PRF mask keygen finished");
         (mask_target, refresh_preimages)
@@ -793,7 +793,7 @@ where
             .first()
             .map(|encoding_vec| encoding_vec.encoding(0))
             .expect("AKY24 PRF mask final decrypt must produce one output encoding");
-        let selector = M::unit_column_vector(&params.poly_params, params.secret_size(), 1);
+        let selector = g_inverse_identity_selector::<M>(&params.poly_params);
         let mask_message = evaluated_encoding.vector.mul_decompose(&selector);
         info!("AKY24 PRF mask dec finished");
         mask_message
@@ -852,9 +852,7 @@ where
         let uniform_sampler = US::new();
         debug!("AKY24 enc sampling secret");
         let secret = uniform_sampler.sample_poly(&params.poly_params, &DistType::TernaryDist);
-        let minus_one =
-            M::P::const_zero(&params.poly_params) - M::P::const_one(&params.poly_params);
-        let secret_polys = vec![secret.clone(), minus_one.clone()];
+        let secret_polys = vec![secret.clone()];
         let secret_vec = M::from_poly_vec_row(&params.poly_params, secret_polys.clone());
         debug!(
             b_cols = enc_key.b_matrix.col_size(),
@@ -944,7 +942,7 @@ where
         let prf_seed_bits = params.prf_seed_bits();
         let mut plaintext_inputs =
             Vec::with_capacity(1 + message_ciphertext_inputs.len() * (1 + prf_seed_bits));
-        plaintext_inputs.push(PolyVec::new(vec![fhe_decryption_key_poly; num_slots]));
+        plaintext_inputs.push(PolyVec::new(vec![M::P::const_zero(&params.poly_params); num_slots]));
         plaintext_inputs.extend(message_ciphertext_inputs);
         info!(prf_seed_bits, "AKY24 enc sampling private PRF seed ciphertexts");
         for seed_bit_idx in 0..prf_seed_bits {
@@ -973,12 +971,23 @@ where
         );
         let encoding_sampler = NaiveBGGEncodingVecSampler::<US>::new(
             &params.poly_params,
-            &[secret, minus_one],
+            &secret_polys,
             params.encoding_error_sigma,
             num_slots,
         );
-        let encodings =
+        let mut encodings =
             encoding_sampler.sample(&params.poly_params, &bgg_public_keys, &plaintext_inputs);
+        let gadget = M::gadget_matrix(&params.poly_params, params.secret_size());
+        let decryption_key_gadget = gadget * &fhe_decryption_key_poly;
+        let decryption_key_encodings = encodings[1]
+            .encodings()
+            .into_iter()
+            .map(|mut encoding| {
+                encoding.vector = encoding.vector - &decryption_key_gadget;
+                encoding
+            })
+            .collect::<Vec<_>>();
+        encodings[1] = NaiveBGGEncodingVec::new(&params.poly_params, decryption_key_encodings);
 
         info!(encoding_count = encodings.len(), "AKY24 enc finished");
         Aky24Ciphertext {
@@ -1051,12 +1060,12 @@ where
             evaluated_cols = evaluated_target.col_size(),
             "AKY24 keygen circuit evaluation finished"
         );
-        let selector = M::unit_column_vector(&params.poly_params, params.secret_size(), 1);
+        let selector = g_inverse_identity_selector::<M>(&params.poly_params);
         let preimage_target = evaluated_target.mul_decompose(&selector);
         debug!(
             target_rows = preimage_target.row_size(),
             target_cols = preimage_target.col_size(),
-            "AKY24 keygen applied G^-1((0,1)^T) to evaluated public key"
+            "AKY24 keygen applied G^-1(1) to evaluated public key"
         );
         let public_prf_seed =
             (0..params.public_prf_seed_bits()).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
@@ -1134,7 +1143,7 @@ where
                     .first()
                     .map(|encoding_vec| encoding_vec.encoding(0))
                     .expect("AKY24 DebugIdentity evaluation must produce one output encoding");
-                let selector = M::unit_column_vector(&params.poly_params, params.secret_size(), 1);
+                let selector = g_inverse_identity_selector::<M>(&params.poly_params);
                 let evaluated_message = evaluated_encoding.vector.mul_decompose(&selector);
                 let mask_message = self.dec_prf_mask_encoding(
                     params,
@@ -1211,6 +1220,13 @@ where
     }
     info!(?func, "AKY24 build_func_circuit finished");
     circuit
+}
+
+fn g_inverse_identity_selector<M>(params: &<M::P as Poly>::Params) -> M
+where
+    M: PolyMatrix,
+{
+    M::identity(params, 1, None)
 }
 
 fn build_ring_gsw_context<M, TD>(
@@ -1642,7 +1658,7 @@ mod tests {
             );
         info!("AKY24 GPU test sampling setup B trapdoor material");
         let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&poly_params, 4.578);
-        let (b_trapdoor, b_matrix) = trapdoor_sampler.trapdoor(&poly_params, 2);
+        let (b_trapdoor, b_matrix) = trapdoor_sampler.trapdoor(&poly_params, 1);
         info!(ring_gsw_width, "AKY24 GPU test building AKY24 params");
         let params = Aky24Params::<GpuDCRTPolyMatrix, _>::new(
             poly_params.clone(),

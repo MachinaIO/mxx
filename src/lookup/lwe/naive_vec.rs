@@ -180,8 +180,9 @@ mod tests {
     use crate::{
         __PAIR, __TestState,
         bgg::{
+            encoding::BggEncoding,
             naive_vec::{NaiveBGGEncodingVec, NaiveBGGPublicKeyVec},
-            sampler::{BGGEncodingSampler, BGGPublicKeySampler},
+            sampler::BGGPublicKeySampler,
         },
         circuit::PolyCircuit,
         element::PolyElem,
@@ -196,7 +197,6 @@ mod tests {
         },
         sampler::{
             PolyTrapdoorSampler, hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
-            uniform::DCRTPolyUniformSampler,
         },
         storage::write::{init_storage_system, storage_test_lock, wait_for_all_writes},
         utils::create_bit_random_poly,
@@ -211,7 +211,7 @@ mod tests {
             params,
             16,
             |params: &DCRTPolyParams, input| {
-                Some((input & 1, <DCRTPoly as Poly>::Elem::constant(&params.modulus(), input & 1)))
+                Some((input, <DCRTPoly as Poly>::Elem::constant(&params.modulus(), input & 1)))
             },
             Some((1, <DCRTPoly as Poly>::Elem::constant(&params.modulus(), 1))),
         )
@@ -250,19 +250,21 @@ mod tests {
             DCRTPoly::from_usize_to_constant(&params, 6),
         ];
         let pubkeys = pubkey_sampler.sample(&params, b"naive-lwe-output-relation", &[true, true]);
-        let encoding_sampler =
-            BGGEncodingSampler::<DCRTPolyUniformSampler>::new(&params, &secrets, None);
-        let encodings = encoding_sampler.sample(&params, &pubkeys, &plaintexts);
         let secret_vec = DCRTPolyMatrix::from_poly_vec_row(&params, secrets);
         let gadget = DCRTPolyMatrix::gadget_matrix(&params, d);
-        for slot_idx in 0..num_slots {
-            assert_eq!(
-                encodings[slot_idx + 1].vector,
-                secret_vec.clone() * encodings[slot_idx + 1].pubkey.matrix.clone() -
+        let encoding_plaintexts = [&[DCRTPoly::const_one(&params)], plaintexts.as_slice()].concat();
+        let encodings = pubkeys
+            .iter()
+            .zip(encoding_plaintexts)
+            .map(|(pubkey, plaintext)| {
+                BggEncoding::new(
                     secret_vec.clone() *
-                        (gadget.clone() * encodings[slot_idx + 1].plaintext.clone().unwrap())
-            );
-        }
+                        (pubkey.matrix.clone() - &(gadget.clone() * plaintext.clone())),
+                    pubkey.clone(),
+                    Some(plaintext),
+                )
+            })
+            .collect::<Vec<_>>();
 
         let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
         let (b_trapdoor, b) = trapdoor_sampler.trapdoor(&params, d);
@@ -331,8 +333,8 @@ mod tests {
             );
 
             let expected_vector = secret_vec.clone() * output_pubkey.matrix.clone() -
-                secret_vec.clone() * (gadget.clone() * expected_output);
-            assert_eq!(output_encoding.vector, expected_vector);
+                (secret_vec.clone() * (gadget.clone() * expected_output));
+            assert!(output_encoding.vector == expected_vector, "output slot {slot_idx}");
         }
     }
 }

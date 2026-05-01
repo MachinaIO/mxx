@@ -17,14 +17,16 @@ use crate::{
         write::{add_lookup_buffer, get_lookup_buffer, get_lookup_buffer_bytes},
     },
 };
-#[cfg(feature = "gpu")]
-use crate::{matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix, sampler::trapdoor::GpuDCRTTrapdoor};
 use rayon::prelude::*;
 use std::{
     marker::PhantomData,
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+#[cfg(feature = "gpu")]
+#[path = "debug_gpu.rs"]
+mod gpu;
 
 const DEFAULT_CHECKPOINT_PREFIX: &str = "DEBUG_NAIVE_BGG_PUBLIC_LUT";
 
@@ -41,20 +43,6 @@ impl DebugTrapdoorPreimage<crate::matrix::dcrt_poly::DCRTPolyMatrix> for DCRTTra
         let decomposed = target.decompose();
         let r_part = self.r_cpu() * &decomposed;
         let e_part = self.e_cpu() * &decomposed;
-        r_part.concat_rows(&[&e_part, &decomposed])
-    }
-}
-
-#[cfg(feature = "gpu")]
-impl DebugTrapdoorPreimage<GpuDCRTPolyMatrix> for GpuDCRTTrapdoor {
-    fn debug_preimage(
-        &self,
-        _params: &<<GpuDCRTPolyMatrix as PolyMatrix>::P as Poly>::Params,
-        target: &GpuDCRTPolyMatrix,
-    ) -> GpuDCRTPolyMatrix {
-        let decomposed = target.decompose();
-        let r_part = &self.r * &decomposed;
-        let e_part = &self.e * &decomposed;
         r_part.concat_rows(&[&e_part, &decomposed])
     }
 }

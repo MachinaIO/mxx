@@ -236,7 +236,7 @@ fn test_wire_norm_slot_transfer_matches_bgg_poly_encoding_bound() {
     let out = evaluator.slot_transfer(&(), &input, &src_slots, GateId(0));
 
     let b0_preimage_norm =
-        compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, Some(1));
+        compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, Some(1), None);
     let s_vec = PolyMatrixNorm::new(ctx.clone(), 1, ctx.secret_size, BigDecimal::one(), None);
     let gate_preimage =
         PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, b0_preimage_norm.clone(), None);
@@ -250,7 +250,7 @@ fn test_wire_norm_slot_transfer_matches_bgg_poly_encoding_bound() {
     let slot_preimage_b0 =
         PolyMatrixNorm::new(ctx.clone(), ctx.m_b, 2 * ctx.m_b, b0_preimage_norm.clone(), None);
     let b1_preimage_norm =
-        compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, Some(2));
+        compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, Some(2), None);
     let slot_preimage_b1 =
         PolyMatrixNorm::new(ctx.clone(), ctx.m_b * 2, ctx.m_g, b1_preimage_norm.clone(), None);
     let slot_preimage_b0_target_error = PolyMatrixNorm::new(

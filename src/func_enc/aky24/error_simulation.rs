@@ -162,7 +162,7 @@ impl Aky24DecErrorSimulationInputs {
             ctx.clone(),
             ctx.m_b,
             func.output_size(),
-            compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None),
+            compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None, None),
             None,
         );
         Self {
@@ -459,12 +459,16 @@ where
 /// The search is binary over the inclusive range `[min_crt_depth, max_crt_depth]`. For each
 /// candidate depth it first calls `max_safe_aky24_prf_mask_output_coeff_bits`; `None` is treated as
 /// a correctness failure and moves the search to larger CRT depths. If mask-bit search succeeds,
-/// this function re-runs the full error simulation at the discovered mask width and checks every
-/// per-round noise-refresh error/mask pair plus the final decode error/mask pair with
+/// the returned simulation for the best mask width is checked against every per-round
+/// noise-refresh error/mask pair plus the final decode error/mask pair with
 /// `validate_error_bound_security_margin`. Any failed margin check is treated as a security failure
 /// and also moves the search to larger CRT depths. Passing candidates are recorded and the search
 /// continues toward smaller CRT depths.
-pub fn aky24_find_crt_depth<TD, PE, ST, BuildCandidate>(
+///
+/// `build_evaluators` is called for every candidate because changing `crt_depth` changes the
+/// simulator context carried by `ErrorNorm`; reusing one evaluator across candidates with different
+/// contexts would make matrix-norm arithmetic invalid.
+pub fn aky24_find_crt_depth<TD, PE, ST, BuildCandidate, BuildEvaluators>(
     min_crt_depth: usize,
     max_crt_depth: usize,
     max_prf_mask_output_coeff_bits: usize,
@@ -472,14 +476,14 @@ pub fn aky24_find_crt_depth<TD, PE, ST, BuildCandidate>(
     ring_gsw_error_sigma: f64,
     num_slots: usize,
     mut build_candidate: BuildCandidate,
-    plt_evaluator: &PE,
-    slot_transfer_evaluator: &ST,
+    mut build_evaluators: BuildEvaluators,
 ) -> Option<Aky24CrtDepthSearchResult>
 where
     TD: Clone,
     PE: PltEvaluator<ErrorNorm>,
     ST: SlotTransferEvaluator<ErrorNorm>,
     BuildCandidate: FnMut(usize) -> Aky24CrtDepthSearchCandidate<TD>,
+    BuildEvaluators: FnMut(&Aky24CrtDepthSearchCandidate<TD>) -> (PE, ST),
 {
     info!(
         min_crt_depth,
@@ -497,6 +501,7 @@ where
         let crt_depth = low + (high - low) / 2;
         info!(crt_depth, low, high, "evaluating AKY24 CRT-depth candidate");
         let candidate = build_candidate(crt_depth);
+        let (plt_evaluator, slot_transfer_evaluator) = build_evaluators(&candidate);
         let Some(mask_search) = max_safe_aky24_prf_mask_output_coeff_bits(
             &candidate.params,
             candidate.inputs.clone(),
@@ -506,8 +511,8 @@ where
             candidate.one.clone(),
             candidate.decryption_key.clone(),
             &candidate.decoders,
-            plt_evaluator,
-            slot_transfer_evaluator,
+            &plt_evaluator,
+            &slot_transfer_evaluator,
             max_prf_mask_output_coeff_bits,
         ) else {
             info!(crt_depth, "AKY24 CRT-depth candidate failed correctness mask-bit search");
@@ -819,32 +824,9 @@ mod tests {
     #[test]
     #[ignore = "expensive CRT-depth smoke test; run explicitly when changing search orchestration"]
     fn test_aky24_find_crt_depth_returns_candidate() {
-        let plt_evaluator = {
-            let params = test_params();
-            let inputs =
-                Aky24DecErrorSimulationInputs::new_from_params(&params, Aky24Func::DebugIdentity);
-            crate::simulator::error_norm::NormPltLWEEvaluator::new(
-                inputs.c_b0_error_norm.clone_ctx(),
-                &BigDecimal::from(0u32),
-            )
-        };
-        let slot_transfer_evaluator = {
-            let params = test_params();
-            let inputs =
-                Aky24DecErrorSimulationInputs::new_from_params(&params, Aky24Func::DebugIdentity);
-            TestSlotTransferEvaluator {
-                transfer: crate::simulator::error_norm::NormBggPolyEncodingSTEvaluator::new(
-                    inputs.c_b0_error_norm.clone_ctx(),
-                    0.0,
-                    &BigDecimal::from(0u32),
-                    None,
-                ),
-            }
-        };
-
         let result = aky24_find_crt_depth(
             1,
-            1,
+            2,
             1,
             0,
             0.0,
@@ -885,8 +867,23 @@ mod tests {
                     decoders: vec![decoder],
                 }
             },
-            &plt_evaluator,
-            &slot_transfer_evaluator,
+            |candidate| {
+                let ctx = candidate.inputs.c_b0_error_norm.clone_ctx();
+                (
+                    crate::simulator::error_norm::NormPltLWEEvaluator::new(
+                        ctx.clone(),
+                        &BigDecimal::from(0u32),
+                    ),
+                    TestSlotTransferEvaluator {
+                        transfer: crate::simulator::error_norm::NormBggPolyEncodingSTEvaluator::new(
+                            ctx,
+                            0.0,
+                            &BigDecimal::from(0u32),
+                            None,
+                        ),
+                    },
+                )
+            },
         );
         assert!(result.is_some(), "AKY24 CRT-depth search should find a test candidate");
     }

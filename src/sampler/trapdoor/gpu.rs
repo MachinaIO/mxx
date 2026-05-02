@@ -687,14 +687,15 @@ mod tests {
         assert!(larger_s > default_s);
     }
 
-    #[test]
-    #[sequential]
-    fn test_gpu_preimage_coefficients_below_compute_preimage_norm() {
+    fn assert_gpu_preimage_reconstructs_target_and_respects_norm_bound(
+        sigma: f64,
+        bound_sigma: Option<f64>,
+    ) {
         gpu_device_sync();
         let size = 2usize;
         let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
         let params = gpu_params_from_cpu(&cpu_params);
-        let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, sigma);
         let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();
 
@@ -704,7 +705,8 @@ mod tests {
             .expect("ring dimension sqrt should exist");
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
         let m_g = (size * params.modulus_digits()) as u64;
-        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None, None);
+        let preimage_norm_bound =
+            compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None, bound_sigma);
         let modulus = params.modulus();
 
         for sample_idx in 0..4usize {
@@ -734,6 +736,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_preimage_coefficients_below_compute_preimage_norm() {
+        assert_gpu_preimage_reconstructs_target_and_respects_norm_bound(SIGMA, None);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_preimage_coefficients_below_compute_preimage_norm_non_default_sigma() {
+        let sigma = SIGMA * 1.25;
+        assert_gpu_preimage_reconstructs_target_and_respects_norm_bound(sigma, Some(sigma));
     }
 
     #[test]

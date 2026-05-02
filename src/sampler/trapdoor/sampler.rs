@@ -623,12 +623,13 @@ mod test {
         assert!(larger_s > default_s);
     }
 
-    #[test]
-    #[sequential_test::sequential]
-    fn test_preimage_coefficients_below_compute_preimage_norm() {
+    fn assert_preimage_reconstructs_target_and_respects_norm_bound(
+        sigma: f64,
+        bound_sigma: Option<f64>,
+    ) {
         let size = 2usize;
         let params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
-        let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, sigma);
         let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
         let uniform_sampler = DCRTPolyUniformSampler::new();
 
@@ -638,7 +639,8 @@ mod test {
             .expect("ring dimension sqrt should exist");
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
         let m_g = (size * params.modulus_digits()) as u64;
-        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None, None);
+        let preimage_norm_bound =
+            compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None, bound_sigma);
         let modulus = params.modulus();
 
         for sample_idx in 0..4usize {
@@ -668,6 +670,19 @@ mod test {
                 }
             }
         }
+    }
+
+    #[test]
+    #[sequential_test::sequential]
+    fn test_preimage_coefficients_below_compute_preimage_norm() {
+        assert_preimage_reconstructs_target_and_respects_norm_bound(SIGMA, None);
+    }
+
+    #[test]
+    #[sequential_test::sequential]
+    fn test_preimage_coefficients_below_compute_preimage_norm_non_default_sigma() {
+        let sigma = SIGMA * 1.25;
+        assert_preimage_reconstructs_target_and_respects_norm_bound(sigma, Some(sigma));
     }
 
     #[test]

@@ -63,6 +63,7 @@ where
             ctx.m_g as u64,
             &ctx.base,
             Some(self.state_row_size() / DIAMOND_SECRET_SIZE),
+            None,
         );
         let transition_preimage =
             PolyMatrixNorm::new(ctx.clone(), state_cols, state_cols, preimage_norm.clone(), None);

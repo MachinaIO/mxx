@@ -3,6 +3,7 @@ use std::{marker::PhantomData, sync::Arc};
 use crate::{
     bench_estimator::{
         BenchEstimator, BenchOperationMeasurement, CircuitBenchEstimate, benchmark_gate_operation,
+        column_parallel_gate_estimate,
     },
     bgg::{poly_encoding::BggPolyEncoding, public_key::BggPublicKey},
     circuit::{Evaluable, gate::GateId},
@@ -30,6 +31,29 @@ fn measured_slot_gate_estimate(
     peak_vram: usize,
 ) -> CircuitBenchEstimate {
     CircuitBenchEstimate::new(total_time * num_slots as f64, latency).with_peak_vram(peak_vram)
+}
+
+fn per_slot_column_parallel_gate_estimate(
+    total_time: f64,
+    num_slots: usize,
+    peak_vram: usize,
+    rhs_column_count: usize,
+) -> CircuitBenchEstimate {
+    let slot_estimate = column_parallel_gate_estimate(total_time, peak_vram, rhs_column_count);
+    let total_time = slot_estimate.total_time * num_slots as f64;
+    let max_parallelism = slot_estimate.max_parallelism.checked_mul(num_slots as u128).expect(
+        "BGG poly encoding column-parallel gate parallelism overflowed while scaling by slot count",
+    );
+    let estimate = CircuitBenchEstimate::new(total_time, slot_estimate.latency)
+        .with_max_parallelism(max_parallelism);
+    #[cfg(feature = "gpu")]
+    {
+        estimate.with_peak_vram(slot_estimate.peak_vram)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        estimate
+    }
 }
 
 fn benchmark_single_slot_operation<R, F>(iterations: usize, f: F) -> BenchOperationMeasurement
@@ -269,10 +293,12 @@ where
     pub sub_peak_vram: usize,
     pub mul_time: f64,
     pub mul_peak_vram: usize,
+    pub mul_rhs_column_count: usize,
     pub small_scalar_mul_time: f64,
     pub small_scalar_mul_peak_vram: usize,
     pub large_scalar_mul_time: f64,
     pub large_scalar_mul_peak_vram: usize,
+    pub large_scalar_mul_rhs_column_count: usize,
     pub public_lut_latency: f64,
     pub public_lut_max_parallelism: u128,
     pub public_lut_total_time: f64,
@@ -346,6 +372,7 @@ where
         let mul_bench = benchmark_single_slot_operation(iterations, || {
             samples.mul_lhs.clone() * samples.mul_rhs
         });
+        let mul_rhs_column_count = samples.mul_rhs.pubkey.matrix.col_size();
         debug!("BggPolyEncodingBenchEstimator::benchmark mul_bench={:?}", mul_bench);
         let small_scalar_mul_bench = benchmark_single_slot_operation(iterations, || {
             samples.small_scalar_input.small_scalar_mul(samples.params, samples.small_scalar)
@@ -357,6 +384,7 @@ where
         let large_scalar_mul_bench = benchmark_single_slot_operation(iterations, || {
             samples.large_scalar_input.large_scalar_mul(samples.params, samples.large_scalar)
         });
+        let large_scalar_mul_rhs_column_count = samples.large_scalar_input.pubkey.matrix.col_size();
         debug!(
             "BggPolyEncodingBenchEstimator::benchmark large_scalar_mul_bench={:?}",
             large_scalar_mul_bench
@@ -381,10 +409,12 @@ where
             sub_peak_vram: sub_bench.peak_vram,
             mul_time: mul_bench.time,
             mul_peak_vram: mul_bench.peak_vram,
+            mul_rhs_column_count,
             small_scalar_mul_time: small_scalar_mul_bench.time,
             small_scalar_mul_peak_vram: small_scalar_mul_bench.peak_vram,
             large_scalar_mul_time: large_scalar_mul_bench.time,
             large_scalar_mul_peak_vram: large_scalar_mul_bench.peak_vram,
+            large_scalar_mul_rhs_column_count,
             public_lut_latency: public_lut_bench.latency,
             public_lut_max_parallelism: public_lut_bench.max_parallelism,
             public_lut_total_time: public_lut_bench.total_time,
@@ -415,7 +445,12 @@ where
     }
 
     fn estimate_mul(&self) -> CircuitBenchEstimate {
-        per_slot_gate_estimate(self.mul_time, self.num_slots, self.mul_peak_vram)
+        per_slot_column_parallel_gate_estimate(
+            self.mul_time,
+            self.num_slots,
+            self.mul_peak_vram,
+            self.mul_rhs_column_count,
+        )
     }
 
     fn estimate_small_scalar_mul(&self, _scalar: &[u32]) -> CircuitBenchEstimate {
@@ -427,10 +462,11 @@ where
     }
 
     fn estimate_large_scalar_mul(&self, _scalar: &[BigUint]) -> CircuitBenchEstimate {
-        per_slot_gate_estimate(
+        per_slot_column_parallel_gate_estimate(
             self.large_scalar_mul_time,
             self.num_slots,
             self.large_scalar_mul_peak_vram,
+            self.large_scalar_mul_rhs_column_count,
         )
     }
 
@@ -510,10 +546,12 @@ mod tests {
             sub_peak_vram: 73,
             mul_time: 3.0,
             mul_peak_vram: 79,
+            mul_rhs_column_count: 3,
             small_scalar_mul_time: 4.0,
             small_scalar_mul_peak_vram: 83,
             large_scalar_mul_time: 5.0,
             large_scalar_mul_peak_vram: 89,
+            large_scalar_mul_rhs_column_count: 5,
             public_lut_latency: 6.0,
             public_lut_max_parallelism: 2,
             public_lut_total_time: 12.0,
@@ -551,8 +589,9 @@ mod tests {
         let mul = estimator.estimate_mul();
         assert_eq!(
             mul,
-            CircuitBenchEstimate::new(9.0, 3.0).with_peak_vram(estimator.mul_peak_vram)
+            CircuitBenchEstimate::new(9.0, 1.0).with_peak_vram(estimator.mul_peak_vram.div_ceil(3))
         );
+        assert_eq!(mul.max_parallelism, 3 * estimator.num_slots as u128);
 
         let small_scalar = estimator.estimate_small_scalar_mul(&[3u32, 5u32]);
         assert_eq!(
@@ -564,9 +603,10 @@ mod tests {
         let large_scalar = estimator.estimate_large_scalar_mul(&[BigUint::from(7u32)]);
         assert_eq!(
             large_scalar,
-            CircuitBenchEstimate::new(15.0, 5.0)
-                .with_peak_vram(estimator.large_scalar_mul_peak_vram)
+            CircuitBenchEstimate::new(15.0, 1.0)
+                .with_peak_vram(estimator.large_scalar_mul_peak_vram.div_ceil(5))
         );
+        assert_eq!(large_scalar.max_parallelism, 5 * estimator.num_slots as u128);
 
         let public_lookup = estimator.estimate_public_lookup(7);
         assert_eq!(

@@ -46,6 +46,20 @@ const E_B_SIGMA: f64 = 4.0;
 const E_INIT_NORM: u32 = 1 << 14;
 
 #[test]
+fn test_compute_preimage_norm_uses_optional_sigma() {
+    let ctx = make_ctx();
+    let default_norm =
+        compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None, None);
+    let explicit_default_norm =
+        compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None, Some(4.578));
+    let larger_sigma_norm =
+        compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None, Some(6.0));
+
+    assert_eq!(default_norm, explicit_default_norm);
+    assert!(larger_sigma_norm > default_norm);
+}
+
+#[test]
 fn test_wire_norm_addition() {
     let ctx = make_ctx();
     let mut circuit = PolyCircuit::<DCRTPoly>::new();

@@ -1,7 +1,10 @@
 use std::marker::PhantomData;
 
 use crate::{
-    bench_estimator::{BenchEstimator, CircuitBenchEstimate, benchmark_gate_operation},
+    bench_estimator::{
+        BenchEstimator, CircuitBenchEstimate, benchmark_gate_operation,
+        column_parallel_gate_estimate,
+    },
     bgg::{encoding::BggEncoding, public_key::BggPublicKey},
     circuit::Evaluable,
     matrix::PolyMatrix,
@@ -30,10 +33,12 @@ where
     pub sub_peak_vram: usize,
     pub mul_time: f64,
     pub mul_peak_vram: usize,
+    pub mul_rhs_column_count: usize,
     pub small_scalar_mul_time: f64,
     pub small_scalar_mul_peak_vram: usize,
     pub large_scalar_mul_time: f64,
     pub large_scalar_mul_peak_vram: usize,
+    pub large_scalar_mul_rhs_column_count: usize,
     pub public_lut_time: f64,
     pub public_lut_peak_vram: usize,
     pub slot_transfer_time: f64,
@@ -56,11 +61,13 @@ where
         let add = benchmark_gate_operation(iterations, || enc_a.clone() + &enc_b);
         let sub = benchmark_gate_operation(iterations, || enc_a.clone() - &enc_b);
         let mul = benchmark_gate_operation(iterations, || enc_a.clone() * &enc_b);
+        let mul_rhs_column_count = enc_b.pubkey.matrix.col_size();
         let small_scalar_mul =
             benchmark_gate_operation(iterations, || enc_a.small_scalar_mul(params, &[3u32]));
         let large_scalar_mul = benchmark_gate_operation(iterations, || {
             enc_a.large_scalar_mul(params, &[BigUint::from(5u32)])
         });
+        let large_scalar_mul_rhs_column_count = enc_a.pubkey.matrix.col_size();
 
         // Scalar `BggEncoding` does not have its own slot-transfer or public-LUT benchmark
         // evaluator. The naive-vector wrapper supplies the slot structure, so these single-scalar
@@ -78,10 +85,12 @@ where
             sub_peak_vram: sub.peak_vram,
             mul_time: mul.time,
             mul_peak_vram: mul.peak_vram,
+            mul_rhs_column_count,
             small_scalar_mul_time: small_scalar_mul.time,
             small_scalar_mul_peak_vram: small_scalar_mul.peak_vram,
             large_scalar_mul_time: large_scalar_mul.time,
             large_scalar_mul_peak_vram: large_scalar_mul.peak_vram,
+            large_scalar_mul_rhs_column_count,
             public_lut_time: public_lut.time,
             public_lut_peak_vram: public_lut.peak_vram,
             slot_transfer_time: slot_transfer.time,
@@ -108,7 +117,7 @@ where
     }
 
     fn estimate_mul(&self) -> CircuitBenchEstimate {
-        per_gate_time_estimate(self.mul_time, self.mul_peak_vram)
+        column_parallel_gate_estimate(self.mul_time, self.mul_peak_vram, self.mul_rhs_column_count)
     }
 
     fn estimate_small_scalar_mul(&self, _scalar: &[u32]) -> CircuitBenchEstimate {
@@ -116,7 +125,11 @@ where
     }
 
     fn estimate_large_scalar_mul(&self, _scalar: &[BigUint]) -> CircuitBenchEstimate {
-        per_gate_time_estimate(self.large_scalar_mul_time, self.large_scalar_mul_peak_vram)
+        column_parallel_gate_estimate(
+            self.large_scalar_mul_time,
+            self.large_scalar_mul_peak_vram,
+            self.large_scalar_mul_rhs_column_count,
+        )
     }
 
     fn estimate_slot_transfer(&self, src_slots: &[(u32, Option<u32>)]) -> CircuitBenchEstimate {
@@ -158,10 +171,12 @@ mod tests {
             sub_peak_vram: 0,
             mul_time: 3.0,
             mul_peak_vram: 0,
+            mul_rhs_column_count: 3,
             small_scalar_mul_time: 4.0,
             small_scalar_mul_peak_vram: 0,
             large_scalar_mul_time: 5.0,
             large_scalar_mul_peak_vram: 0,
+            large_scalar_mul_rhs_column_count: 5,
             public_lut_time: 6.0,
             public_lut_peak_vram: 0,
             slot_transfer_time: 7.0,
@@ -172,6 +187,14 @@ mod tests {
         let add = <BggEncodingBenchEstimator<DCRTPolyMatrix> as BenchEstimator<
             BggEncoding<DCRTPolyMatrix>,
         >>::estimate_add(&estimator);
+        let mul = <BggEncodingBenchEstimator<DCRTPolyMatrix> as BenchEstimator<
+            BggEncoding<DCRTPolyMatrix>,
+        >>::estimate_mul(&estimator);
+        let large_scalar_mul = <BggEncodingBenchEstimator<DCRTPolyMatrix> as BenchEstimator<
+            BggEncoding<DCRTPolyMatrix>,
+        >>::estimate_large_scalar_mul(
+            &estimator, &[num_bigint::BigUint::from(7u32)]
+        );
         let public_lookup = <BggEncodingBenchEstimator<DCRTPolyMatrix> as BenchEstimator<
             BggEncoding<DCRTPolyMatrix>,
         >>::estimate_public_lookup(&estimator, 0);
@@ -181,6 +204,12 @@ mod tests {
         assert!(public_lookup.total_time.is_finite());
         assert!(public_lookup.latency.is_finite());
         assert_eq!(add.total_time, 1.0);
+        assert_eq!(mul.total_time, 3.0);
+        assert_eq!(mul.latency, 1.0);
+        assert_eq!(mul.max_parallelism, 3);
+        assert_eq!(large_scalar_mul.total_time, 5.0);
+        assert_eq!(large_scalar_mul.latency, 1.0);
+        assert_eq!(large_scalar_mul.max_parallelism, 5);
         assert_eq!(public_lookup.total_time, 6.0);
     }
 }

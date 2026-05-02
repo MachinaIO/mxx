@@ -21,7 +21,7 @@ impl NormBggPolyEncodingSTEvaluator {
         );
 
         let b0_preimage_norm =
-            compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, Some(1));
+            compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, Some(1), None);
         info!(
             "{}",
             format!(
@@ -73,7 +73,7 @@ impl NormBggPolyEncodingSTEvaluator {
             PolyMatrixNorm::new(ctx.clone(), ctx.m_b, 2 * ctx.m_b, b0_preimage_norm.clone(), None);
         log_matrix_norm_bits("slot_preimage_b0", &slot_preimage_b0);
         let b1_preimage_norm =
-            compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, Some(2));
+            compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, Some(2), None);
         // `preimage_b1` targets the `B1` basis, whose trapdoor size is `2 * secret_size`.
         let slot_preimage_b1 =
             PolyMatrixNorm::new(ctx.clone(), ctx.m_b * 2, ctx.m_g, b1_preimage_norm.clone(), None);
@@ -184,7 +184,7 @@ pub struct NormPltLWEEvaluator {
 impl NormPltLWEEvaluator {
     pub fn new(ctx: Arc<SimulatorContext>, e_b_sigma: &BigDecimal) -> Self {
         let k_high_norm =
-            compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None);
+            compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None, None);
         let k_high_norm_bits = bigdecimal_bits_ceil(&k_high_norm);
         let k_low = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g);
         info!("{}", format!("preimage norm bits {}", k_high_norm_bits));
@@ -265,7 +265,7 @@ impl NormPltGGH15Evaluator {
         let gaussian_bound = gaussian_tail_bound_factor();
 
         let preimage_norm =
-            compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None);
+            compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None, None);
         info!("{}", format!("preimage norm bits {}", bigdecimal_bits_ceil(&preimage_norm)));
         let e_b_init =
             PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_b, e_b_sigma * &gaussian_bound, None);
@@ -506,7 +506,7 @@ impl NormPltCommitEvaluator {
             padded_len, lut_vector_len
         );
         let preimage_norm =
-            compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None);
+            compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None, None);
         let t_bottom = PolyMatrixNorm::new(
             ctx.clone(),
             ctx.m_b,
@@ -628,10 +628,11 @@ pub fn compute_preimage_norm(
     m_g: u64,
     base: &BigDecimal,
     b_nrow: Option<usize>,
+    sigma: Option<f64>,
 ) -> BigDecimal {
     let c_0 = BigDecimal::from_f64(1.8).unwrap();
     let c_1 = BigDecimal::from_f64(4.7).unwrap();
-    let sigma = BigDecimal::from_f64(4.578).unwrap();
+    let sigma = BigDecimal::from_f64(sigma.unwrap_or(4.578)).unwrap();
     let two_sqrt = BigDecimal::from(2).sqrt().unwrap();
     let m_g_sqrt = BigDecimal::from(m_g).sqrt().expect("sqrt(m_g) failed");
     let b_nrow = b_nrow.unwrap_or(1);

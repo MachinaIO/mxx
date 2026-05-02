@@ -12,8 +12,19 @@ use std::{
     time::Instant,
 };
 
-const SIGMA: f64 = 4.578;
 const SPECTRAL_CONSTANT: f64 = 1.8;
+
+fn preimage_c(base: u32, sigma: f64) -> f64 {
+    (base as f64 + 1.0) * sigma
+}
+
+fn preimage_smoothing_parameter(base: u32, sigma: f64, d: usize, n: usize, k: usize) -> f64 {
+    SPECTRAL_CONSTANT *
+        (base as f64 + 1.0) *
+        sigma *
+        sigma *
+        (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7)
+}
 
 fn coeff_cached_matrix(src: &GpuDCRTPolyMatrix) -> GpuDCRTPolyMatrix {
     src.clone().into_coeff_domain()
@@ -126,12 +137,8 @@ fn p1_covariance_parameters(
     let base = 1 << params.base_bits();
     let n = params.ring_dimension() as usize;
     let k = params.modulus_digits();
-    let c = (base as f64 + 1.0) * SIGMA;
-    let s = SPECTRAL_CONSTANT *
-        (base as f64 + 1.0) *
-        SIGMA *
-        SIGMA *
-        (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+    let c = preimage_c(base, dgg_stddev);
+    let s = preimage_smoothing_parameter(base, dgg_stddev, d, n, k);
     (c, s, dgg_stddev)
 }
 
@@ -188,7 +195,7 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
 
     fn new(params: &<<Self::M as PolyMatrix>::P as Poly>::Params, sigma: f64) -> Self {
         let base = 1 << params.base_bits();
-        let c = (base as f64 + 1.0) * SIGMA;
+        let c = preimage_c(base, sigma);
         Self { sigma, base, c }
     }
 
@@ -238,11 +245,7 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         let param_start = Instant::now();
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
-        let s = SPECTRAL_CONSTANT *
-            (self.base as f64 + 1.0) *
-            SIGMA *
-            SIGMA *
-            (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+        let s = preimage_smoothing_parameter(self.base, self.sigma, d, n, k);
         let dgg_large_std = (s * s - self.c * self.c).sqrt();
         tracing::debug!(
             elapsed_ms = param_start.elapsed().as_secs_f64() * 1_000.0,
@@ -406,11 +409,7 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         let target_ncol = target.col_size();
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
-        let s = SPECTRAL_CONSTANT *
-            (self.base as f64 + 1.0) *
-            SIGMA *
-            SIGMA *
-            (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+        let s = preimage_smoothing_parameter(self.base, self.sigma, d, n, k);
 
         let dist = DistType::GaussDist { sigma: s };
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();
@@ -665,12 +664,38 @@ mod tests {
 
     #[test]
     #[sequential]
-    fn test_gpu_preimage_coefficients_below_compute_preimage_norm() {
+    fn test_gpu_preimage_sampler_parameters_follow_instance_sigma() {
+        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
+        let params = gpu_params_from_cpu(&cpu_params);
+        let base = 1u32 << params.base_bits();
+        let default_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let larger_sigma = SIGMA * 1.5;
+        let larger_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, larger_sigma);
+        let n = params.ring_dimension() as usize;
+        let k = params.modulus_digits();
+        let size = 2usize;
+        let default_s = preimage_smoothing_parameter(base, default_sampler.sigma, size, n, k);
+        let larger_s = preimage_smoothing_parameter(base, larger_sampler.sigma, size, n, k);
+
+        assert_eq!(default_sampler.c, preimage_c(base, SIGMA));
+        assert_eq!(larger_sampler.c, preimage_c(base, larger_sigma));
+        assert_eq!(
+            p1_covariance_parameters(&params, size, larger_sigma),
+            (larger_sampler.c, larger_s, larger_sigma)
+        );
+        assert!(larger_sampler.c > default_sampler.c);
+        assert!(larger_s > default_s);
+    }
+
+    fn assert_gpu_preimage_reconstructs_target_and_respects_norm_bound(
+        sigma: f64,
+        bound_sigma: Option<f64>,
+    ) {
         gpu_device_sync();
         let size = 2usize;
         let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
         let params = gpu_params_from_cpu(&cpu_params);
-        let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, sigma);
         let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();
 
@@ -680,7 +705,8 @@ mod tests {
             .expect("ring dimension sqrt should exist");
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
         let m_g = (size * params.modulus_digits()) as u64;
-        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None);
+        let preimage_norm_bound =
+            compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None, bound_sigma);
         let modulus = params.modulus();
 
         for sample_idx in 0..4usize {
@@ -714,6 +740,19 @@ mod tests {
 
     #[test]
     #[sequential]
+    fn test_gpu_preimage_coefficients_below_compute_preimage_norm() {
+        assert_gpu_preimage_reconstructs_target_and_respects_norm_bound(SIGMA, None);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_preimage_coefficients_below_compute_preimage_norm_non_default_sigma() {
+        let sigma = SIGMA * 1.25;
+        assert_gpu_preimage_reconstructs_target_and_respects_norm_bound(sigma, Some(sigma));
+    }
+
+    #[test]
+    #[sequential]
     fn test_gpu_p_hat_coefficients_below_compute_preimage_norm() {
         gpu_device_sync();
         let size = 2usize;
@@ -728,24 +767,21 @@ mod tests {
             .expect("ring dimension sqrt should exist");
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
         let m_g = (size * params.modulus_digits()) as u64;
-        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None);
+        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None, None);
         let modulus = params.modulus();
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
-        let s = SPECTRAL_CONSTANT *
-            ((1u32 << params.base_bits()) as f64 + 1.0) *
-            SIGMA *
-            SIGMA *
-            (((size * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
-        let dgg_large_std =
-            (s * s - (((1u32 << params.base_bits()) as f64 + 1.0) * SIGMA).powi(2)).sqrt();
+        let base_u32 = 1u32 << params.base_bits();
+        let c = preimage_c(base_u32, SIGMA);
+        let s = preimage_smoothing_parameter(base_u32, SIGMA, size, n, k);
+        let dgg_large_std = (s * s - c.powi(2)).sqrt();
 
         for sample_idx in 0..4usize {
             let p_hat = sample_pert_square_mat_gpu_native(
                 &params,
                 &trapdoor,
                 s,
-                ((1u32 << params.base_bits()) as f64 + 1.0) * SIGMA,
+                c,
                 SIGMA,
                 dgg_large_std,
                 size,
@@ -795,7 +831,7 @@ mod tests {
             .expect("ring dimension sqrt should exist");
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << base_params.base_bits(), 0);
         let m_g = (size * base_params.modulus_digits()) as u64;
-        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None);
+        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None, None);
         let modulus = base_params.modulus();
 
         struct DeviceCase {

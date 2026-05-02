@@ -1,4 +1,5 @@
 using gpu_chacha::DeviceChaChaRng;
+using gpu_chacha::GpuRngSeed;
 using gpu_chacha::rng_init;
 using gpu_chacha::rng_next_u64;
 
@@ -220,7 +221,7 @@ __global__ void matrix_sample_distribution_multi_limb_kernel(
     uint32_t limb_idx,
     int dist_type,
     double sigma,
-    uint64_t seed)
+    GpuRngSeed seed)
 {
     size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t total = poly_count * n;
@@ -309,7 +310,7 @@ int launch_sample_distribution_multi_limb_kernel(
     uint32_t limb_idx,
     int dist_type,
     double sigma,
-    uint64_t seed,
+    GpuRngSeed seed,
     cudaStream_t stream,
     const GpuMatrix *,
     const dim3 *)
@@ -352,7 +353,7 @@ static int gpu_matrix_sample_distribution_impl(
     GpuMatrix *out,
     int dist_type,
     double sigma,
-    uint64_t seed,
+    GpuRngSeed seed,
     size_t full_ncol,
     size_t col_offset)
 {
@@ -474,7 +475,7 @@ extern "C" int gpu_matrix_sample_distribution(
     GpuMatrix *out,
     int dist_type,
     double sigma,
-    uint64_t seed)
+    GpuRngSeed seed)
 {
     return gpu_matrix_sample_distribution_impl(out, dist_type, sigma, seed, out ? out->cols : 0, 0);
 }
@@ -483,7 +484,7 @@ extern "C" int gpu_matrix_sample_distribution_columns(
     GpuMatrix *out,
     int dist_type,
     double sigma,
-    uint64_t seed,
+    GpuRngSeed seed,
     size_t full_ncol,
     size_t col_offset)
 {

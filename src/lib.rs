@@ -18,6 +18,7 @@ pub mod env;
 pub mod func_enc;
 pub mod gadgets;
 pub mod input_injector;
+pub mod io;
 pub mod lookup;
 pub mod matrix;
 pub mod noise_refresh;

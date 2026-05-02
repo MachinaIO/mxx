@@ -220,6 +220,21 @@ fn assert_encoding_residual_below_bound(
     assert_residual_below_bound(label, params, &residual, max_error);
 }
 
+fn assert_k_encoding_residual_below_bound(
+    params: &GpuDCRTPolyParams,
+    encoding: &BggEncoding<GpuDCRTPolyMatrix>,
+    secret_product: &GpuDCRTPolyMatrix,
+    pubkey: &BggPublicKey<GpuDCRTPolyMatrix>,
+    plaintext: <GpuDCRTPolyMatrix as PolyMatrix>::P,
+    max_error: &BigDecimal,
+) {
+    let gadget = GpuDCRTPolyMatrix::gadget_matrix(params, DIAMOND_INJECTOR_SECRET_SIZE);
+    let s_times_pubkey = secret_product.clone() * &pubkey.matrix;
+    let plaintext_gadget = gadget * plaintext;
+    let residual = encoding.vector.clone() - s_times_pubkey + plaintext_gadget;
+    assert_residual_below_bound("k", params, &residual, max_error);
+}
+
 fn assert_decoder_residual_below_bound(
     label: &str,
     params: &GpuDCRTPolyParams,
@@ -320,8 +335,7 @@ fn verify_gpu_online_eval_errors_below_simulation(
         &crossing_point.max_error,
     );
     let k_pubkey = sample_pubkey(&params, hash_key, "diamond_a_k_public_key");
-    assert_encoding_residual_below_bound(
-        "k",
+    assert_k_encoding_residual_below_bound(
         &params,
         &k_output,
         &secret_product,

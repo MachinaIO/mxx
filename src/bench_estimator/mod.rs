@@ -149,6 +149,23 @@ impl CircuitBenchSummary {
     }
 }
 
+pub(crate) fn column_parallel_gate_estimate(
+    total_time: f64,
+    peak_vram: usize,
+    rhs_column_count: usize,
+) -> CircuitBenchEstimate {
+    assert!(rhs_column_count > 0, "column-parallel gate estimates require at least one RHS column");
+    const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
+    const NANOS_PER_SECOND_U128: u128 = 1_000_000_000;
+
+    let total_nanos = (total_time * NANOS_PER_SECOND).ceil() as u128;
+    let latency =
+        total_nanos.div_ceil(rhs_column_count as u128) as f64 / NANOS_PER_SECOND_U128 as f64;
+    CircuitBenchEstimate::new(total_time, latency)
+        .with_max_parallelism(rhs_column_count as u128)
+        .with_peak_vram(peak_vram.div_ceil(rhs_column_count))
+}
+
 fn bench_summary_cache_get(
     summary_cache: &BenchSummaryCache,
     cache_key: &BenchSummaryCacheKey,
@@ -698,7 +715,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary, measure_samples_with_interval,
+        BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary, column_parallel_gate_estimate,
+        measure_samples_with_interval,
     };
     use crate::{
         __PAIR, __TestState,
@@ -727,6 +745,17 @@ mod tests {
         peak_vram: usize,
     ) -> CircuitBenchSummary {
         CircuitBenchSummary::new(total_time, latency, max_parallelism).with_peak_vram(peak_vram)
+    }
+
+    #[test]
+    fn column_parallel_gate_estimate_uses_ceiling_division_for_latency() {
+        let estimate = column_parallel_gate_estimate(0.000000010, 10, 3);
+
+        assert_eq!(estimate.total_time, 0.000000010);
+        assert_eq!(estimate.latency, 0.000000004);
+        assert_eq!(estimate.max_parallelism, 3);
+        #[cfg(feature = "gpu")]
+        assert_eq!(estimate.peak_vram, 4);
     }
 
     struct TestBenchEstimator;

@@ -21,9 +21,20 @@ use std::{
 };
 use tracing::debug;
 
-const SIGMA: f64 = 4.578;
 const SPECTRAL_CONSTANT: f64 = 1.8;
 static GAUSS_SAMP_GQ_ARB_BASE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn preimage_c(base: u32, sigma: f64) -> f64 {
+    (base as f64 + 1.0) * sigma
+}
+
+fn preimage_smoothing_parameter(base: u32, sigma: f64, d: usize, n: usize, k: usize) -> f64 {
+    SPECTRAL_CONSTANT *
+        (base as f64 + 1.0) *
+        sigma *
+        sigma *
+        (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7)
+}
 
 #[derive(Debug, Clone)]
 pub struct DCRTPolyTrapdoorSampler {
@@ -38,7 +49,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
 
     fn new(params: &<<Self::M as PolyMatrix>::P as Poly>::Params, sigma: f64) -> Self {
         let base = 1 << params.base_bits();
-        let c = (base as f64 + 1.0) * SIGMA;
+        let c = preimage_c(base, sigma);
         Self { sigma, base, c }
     }
 
@@ -95,11 +106,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
 
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
-        let s = SPECTRAL_CONSTANT *
-            (self.base as f64 + 1.0) *
-            SIGMA *
-            SIGMA *
-            (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+        let s = preimage_smoothing_parameter(self.base, self.sigma, d, n, k);
         let dgg_large_std = (s * s - self.c * self.c).sqrt();
         let peikert = dgg_large_std < KARNEY_THRESHOLD;
         let (dgg_large_mean, dgg_large_table) = if dgg_large_std > KARNEY_THRESHOLD {
@@ -202,11 +209,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         let target_ncol = target.col_size();
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
-        let s = SPECTRAL_CONSTANT *
-            (self.base as f64 + 1.0) *
-            SIGMA *
-            SIGMA *
-            (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+        let s = preimage_smoothing_parameter(self.base, self.sigma, d, n, k);
         let dist = DistType::GaussDist { sigma: s };
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let preimage_right = uniform_sampler.sample_uniform(params, ext_ncol, target_ncol, dist);
@@ -602,6 +605,26 @@ mod test {
 
     #[test]
     #[sequential_test::sequential]
+    fn test_preimage_sampler_parameters_follow_instance_sigma() {
+        let params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
+        let base = 1u32 << params.base_bits();
+        let default_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let larger_sigma = SIGMA * 1.5;
+        let larger_sampler = DCRTPolyTrapdoorSampler::new(&params, larger_sigma);
+        let n = params.ring_dimension() as usize;
+        let k = params.modulus_digits();
+        let size = 2usize;
+        let default_s = preimage_smoothing_parameter(base, default_sampler.sigma, size, n, k);
+        let larger_s = preimage_smoothing_parameter(base, larger_sampler.sigma, size, n, k);
+
+        assert_eq!(default_sampler.c, preimage_c(base, SIGMA));
+        assert_eq!(larger_sampler.c, preimage_c(base, larger_sigma));
+        assert!(larger_sampler.c > default_sampler.c);
+        assert!(larger_s > default_s);
+    }
+
+    #[test]
+    #[sequential_test::sequential]
     fn test_preimage_coefficients_below_compute_preimage_norm() {
         let size = 2usize;
         let params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
@@ -615,7 +638,7 @@ mod test {
             .expect("ring dimension sqrt should exist");
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
         let m_g = (size * params.modulus_digits()) as u64;
-        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None);
+        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None, None);
         let modulus = params.modulus();
 
         for sample_idx in 0..4usize {
@@ -661,17 +684,13 @@ mod test {
             .expect("ring dimension sqrt should exist");
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
         let m_g = (size * params.modulus_digits()) as u64;
-        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None);
+        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None, None);
         let modulus = params.modulus();
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
         let base = 1u32 << params.base_bits();
-        let c = (base as f64 + 1.0) * SIGMA;
-        let s = SPECTRAL_CONSTANT *
-            (base as f64 + 1.0) *
-            SIGMA *
-            SIGMA *
-            (((size * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+        let c = preimage_c(base, SIGMA);
+        let s = preimage_smoothing_parameter(base, SIGMA, size, n, k);
         let dgg_large_std = (s * s - c * c).sqrt();
         let peikert = dgg_large_std < KARNEY_THRESHOLD;
         let (dgg_large_mean, dgg_large_table) = if dgg_large_std > KARNEY_THRESHOLD {

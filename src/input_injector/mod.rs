@@ -1152,6 +1152,7 @@ mod tests {
             ctx.m_g as u64,
             &ctx.base,
             Some(injector.state_row_size() / DIAMOND_SECRET_SIZE),
+            None,
         );
         let expected_transition = PolyMatrixNorm::new(
             ctx.clone(),

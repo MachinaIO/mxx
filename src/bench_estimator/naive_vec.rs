@@ -1,5 +1,5 @@
 use crate::{
-    bench_estimator::{BenchEstimator, CircuitBenchEstimate},
+    bench_estimator::{BenchEstimator, CircuitBenchEstimate, benchmark_gate_operation},
     bgg::{
         encoding::BggEncoding,
         naive_vec::{NaiveBGGEncodingVec, NaiveBGGPublicKeyVec},
@@ -32,6 +32,60 @@ fn scale_single_slot_estimate(
     }
 }
 
+fn scale_single_slot_estimate_with_io(
+    estimate: CircuitBenchEstimate,
+    unit_count: usize,
+    loads_per_unit: usize,
+    stores_per_unit: usize,
+    slot_load: CircuitBenchEstimate,
+    slot_store: CircuitBenchEstimate,
+) -> CircuitBenchEstimate {
+    let unit_count_f64 = unit_count as f64;
+    let loads_f64 = loads_per_unit as f64;
+    let stores_f64 = stores_per_unit as f64;
+    let total_time = estimate.total_time * unit_count_f64 +
+        slot_load.total_time * loads_f64 * unit_count_f64 +
+        slot_store.total_time * stores_f64 * unit_count_f64;
+    let latency =
+        estimate.latency + slot_load.latency * loads_f64 + slot_store.latency * stores_f64;
+    let max_parallelism = estimate
+        .max_parallelism
+        .checked_mul(unit_count as u128)
+        .and_then(|value| {
+            value.checked_add(
+                slot_load
+                    .max_parallelism
+                    .checked_mul(loads_per_unit as u128)?
+                    .checked_mul(unit_count as u128)?,
+            )
+        })
+        .and_then(|value| {
+            value.checked_add(
+                slot_store
+                    .max_parallelism
+                    .checked_mul(stores_per_unit as u128)?
+                    .checked_mul(unit_count as u128)?,
+            )
+        })
+        .expect("naive BGG vector benchmark parallelism overflowed while adding slot IO");
+    let scaled =
+        CircuitBenchEstimate::new(total_time, latency).with_max_parallelism(max_parallelism);
+    #[cfg(feature = "gpu")]
+    {
+        scaled.with_peak_vram(estimate.peak_vram.max(slot_load.peak_vram).max(slot_store.peak_vram))
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        scaled
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct NaiveBGGVecSlotIoBenchEstimates {
+    pub load: CircuitBenchEstimate,
+    pub store: CircuitBenchEstimate,
+}
+
 /// Bench estimator for naive slotwise BGG vectors.
 ///
 /// The wrapped scalar estimator is expected to measure or estimate one ordinary BGG slot. This
@@ -41,12 +95,77 @@ fn scale_single_slot_estimate(
 pub struct NaiveBGGVecBenchEstimator<BE> {
     pub inner: BE,
     pub num_slots: usize,
+    pub slot_io: NaiveBGGVecSlotIoBenchEstimates,
 }
 
 impl<BE> NaiveBGGVecBenchEstimator<BE> {
     pub fn new(inner: BE, num_slots: usize) -> Self {
         assert!(num_slots > 0, "num_slots must be positive");
-        Self { inner, num_slots }
+        Self { inner, num_slots, slot_io: NaiveBGGVecSlotIoBenchEstimates::default() }
+    }
+
+    pub fn with_slot_io_estimates(
+        inner: BE,
+        num_slots: usize,
+        slot_io: NaiveBGGVecSlotIoBenchEstimates,
+    ) -> Self {
+        assert!(num_slots > 0, "num_slots must be positive");
+        Self { inner, num_slots, slot_io }
+    }
+
+    fn scale_with_io(
+        &self,
+        estimate: CircuitBenchEstimate,
+        unit_count: usize,
+        loads_per_unit: usize,
+        stores_per_unit: usize,
+    ) -> CircuitBenchEstimate {
+        scale_single_slot_estimate_with_io(
+            estimate,
+            unit_count,
+            loads_per_unit,
+            stores_per_unit,
+            self.slot_io.load,
+            self.slot_io.store,
+        )
+    }
+}
+
+pub fn benchmark_public_key_vec_slot_io<M>(
+    params: &<M::P as crate::poly::Poly>::Params,
+    sample: &NaiveBGGPublicKeyVec<M>,
+    iterations: usize,
+) -> NaiveBGGVecSlotIoBenchEstimates
+where
+    M: PolyMatrix,
+{
+    let materialized = sample.key(0);
+    let load = benchmark_gate_operation(iterations, || sample.key(0));
+    let store = benchmark_gate_operation(iterations, || {
+        NaiveBGGPublicKeyVec::new(params, vec![materialized.clone()])
+    });
+    NaiveBGGVecSlotIoBenchEstimates {
+        load: CircuitBenchEstimate::new(load.time, load.time).with_peak_vram(load.peak_vram),
+        store: CircuitBenchEstimate::new(store.time, store.time).with_peak_vram(store.peak_vram),
+    }
+}
+
+pub fn benchmark_encoding_vec_slot_io<M>(
+    params: &<M::P as crate::poly::Poly>::Params,
+    sample: &NaiveBGGEncodingVec<M>,
+    iterations: usize,
+) -> NaiveBGGVecSlotIoBenchEstimates
+where
+    M: PolyMatrix,
+{
+    let materialized = sample.encoding(0);
+    let load = benchmark_gate_operation(iterations, || sample.encoding(0));
+    let store = benchmark_gate_operation(iterations, || {
+        NaiveBGGEncodingVec::new(params, vec![materialized.clone()])
+    });
+    NaiveBGGVecSlotIoBenchEstimates {
+        load: CircuitBenchEstimate::new(load.time, load.time).with_peak_vram(load.peak_vram),
+        store: CircuitBenchEstimate::new(store.time, store.time).with_peak_vram(store.peak_vram),
     }
 }
 
@@ -60,23 +179,23 @@ where
     }
 
     fn estimate_add(&self) -> CircuitBenchEstimate {
-        scale_single_slot_estimate(self.inner.estimate_add(), self.num_slots)
+        self.scale_with_io(self.inner.estimate_add(), self.num_slots, 2, 1)
     }
 
     fn estimate_sub(&self) -> CircuitBenchEstimate {
-        scale_single_slot_estimate(self.inner.estimate_sub(), self.num_slots)
+        self.scale_with_io(self.inner.estimate_sub(), self.num_slots, 2, 1)
     }
 
     fn estimate_mul(&self) -> CircuitBenchEstimate {
-        scale_single_slot_estimate(self.inner.estimate_mul(), self.num_slots)
+        self.scale_with_io(self.inner.estimate_mul(), self.num_slots, 2, 1)
     }
 
     fn estimate_small_scalar_mul(&self, scalar: &[u32]) -> CircuitBenchEstimate {
-        scale_single_slot_estimate(self.inner.estimate_small_scalar_mul(scalar), self.num_slots)
+        self.scale_with_io(self.inner.estimate_small_scalar_mul(scalar), self.num_slots, 1, 1)
     }
 
     fn estimate_large_scalar_mul(&self, scalar: &[BigUint]) -> CircuitBenchEstimate {
-        scale_single_slot_estimate(self.inner.estimate_large_scalar_mul(scalar), self.num_slots)
+        self.scale_with_io(self.inner.estimate_large_scalar_mul(scalar), self.num_slots, 1, 1)
     }
 
     fn estimate_slot_transfer(&self, src_slots: &[(u32, Option<u32>)]) -> CircuitBenchEstimate {
@@ -85,10 +204,7 @@ where
             self.num_slots,
             "NaiveBGGVecBenchEstimator::estimate_slot_transfer requires src_slots.len() == num_slots"
         );
-        scale_single_slot_estimate(
-            self.inner.estimate_slot_transfer(&src_slots[..1]),
-            self.num_slots,
-        )
+        self.scale_with_io(self.inner.estimate_slot_transfer(&src_slots[..1]), self.num_slots, 1, 1)
     }
 
     fn estimate_slot_reduce(&self, input_count: usize, num_slots: usize) -> CircuitBenchEstimate {
@@ -97,11 +213,11 @@ where
             num_slots, self.num_slots,
             "NaiveBGGVecBenchEstimator::estimate_slot_reduce requires num_slots == estimator num_slots"
         );
-        scale_single_slot_estimate(self.inner.estimate_slot_reduce(1, num_slots), input_count)
+        self.scale_with_io(self.inner.estimate_slot_reduce(1, num_slots), input_count, num_slots, 1)
     }
 
     fn estimate_public_lookup(&self, lut_id: usize) -> CircuitBenchEstimate {
-        scale_single_slot_estimate(self.inner.estimate_public_lookup(lut_id), self.num_slots)
+        self.scale_with_io(self.inner.estimate_public_lookup(lut_id), self.num_slots, 1, 1)
     }
 }
 
@@ -115,23 +231,23 @@ where
     }
 
     fn estimate_add(&self) -> CircuitBenchEstimate {
-        scale_single_slot_estimate(self.inner.estimate_add(), self.num_slots)
+        self.scale_with_io(self.inner.estimate_add(), self.num_slots, 2, 1)
     }
 
     fn estimate_sub(&self) -> CircuitBenchEstimate {
-        scale_single_slot_estimate(self.inner.estimate_sub(), self.num_slots)
+        self.scale_with_io(self.inner.estimate_sub(), self.num_slots, 2, 1)
     }
 
     fn estimate_mul(&self) -> CircuitBenchEstimate {
-        scale_single_slot_estimate(self.inner.estimate_mul(), self.num_slots)
+        self.scale_with_io(self.inner.estimate_mul(), self.num_slots, 2, 1)
     }
 
     fn estimate_small_scalar_mul(&self, scalar: &[u32]) -> CircuitBenchEstimate {
-        scale_single_slot_estimate(self.inner.estimate_small_scalar_mul(scalar), self.num_slots)
+        self.scale_with_io(self.inner.estimate_small_scalar_mul(scalar), self.num_slots, 1, 1)
     }
 
     fn estimate_large_scalar_mul(&self, scalar: &[BigUint]) -> CircuitBenchEstimate {
-        scale_single_slot_estimate(self.inner.estimate_large_scalar_mul(scalar), self.num_slots)
+        self.scale_with_io(self.inner.estimate_large_scalar_mul(scalar), self.num_slots, 1, 1)
     }
 
     fn estimate_slot_transfer(&self, src_slots: &[(u32, Option<u32>)]) -> CircuitBenchEstimate {
@@ -140,10 +256,7 @@ where
             self.num_slots,
             "NaiveBGGVecBenchEstimator::estimate_slot_transfer requires src_slots.len() == num_slots"
         );
-        scale_single_slot_estimate(
-            self.inner.estimate_slot_transfer(&src_slots[..1]),
-            self.num_slots,
-        )
+        self.scale_with_io(self.inner.estimate_slot_transfer(&src_slots[..1]), self.num_slots, 1, 1)
     }
 
     fn estimate_slot_reduce(&self, input_count: usize, num_slots: usize) -> CircuitBenchEstimate {
@@ -152,17 +265,17 @@ where
             num_slots, self.num_slots,
             "NaiveBGGVecBenchEstimator::estimate_slot_reduce requires num_slots == estimator num_slots"
         );
-        scale_single_slot_estimate(self.inner.estimate_slot_reduce(1, num_slots), input_count)
+        self.scale_with_io(self.inner.estimate_slot_reduce(1, num_slots), input_count, num_slots, 1)
     }
 
     fn estimate_public_lookup(&self, lut_id: usize) -> CircuitBenchEstimate {
-        scale_single_slot_estimate(self.inner.estimate_public_lookup(lut_id), self.num_slots)
+        self.scale_with_io(self.inner.estimate_public_lookup(lut_id), self.num_slots, 1, 1)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::NaiveBGGVecBenchEstimator;
+    use super::{NaiveBGGVecBenchEstimator, NaiveBGGVecSlotIoBenchEstimates};
     use crate::{
         __PAIR, __TestState,
         bench_estimator::{
@@ -362,6 +475,40 @@ mod tests {
         assert_eq!(routed_slot_reduce.max_parallelism, 8);
     }
 
+    #[test]
+    fn test_naive_bgg_vec_bench_estimator_adds_slot_load_and_store_time() {
+        let slot_io = NaiveBGGVecSlotIoBenchEstimates {
+            load: CircuitBenchEstimate::new(0.5, 0.5).with_max_parallelism(1),
+            store: CircuitBenchEstimate::new(0.25, 0.25).with_max_parallelism(1),
+        };
+        let estimator = NaiveBGGVecBenchEstimator::with_slot_io_estimates(
+            DummyScalarBenchEstimator,
+            3,
+            slot_io,
+        );
+
+        let add = <NaiveBGGVecBenchEstimator<_> as BenchEstimator<
+            NaiveBGGPublicKeyVec<DCRTPolyMatrix>,
+        >>::estimate_add(&estimator);
+        assert_eq!(add.latency, 3.25);
+        assert_eq!(add.total_time, 9.75);
+        assert_eq!(add.max_parallelism, 12);
+
+        let public_lookup = <NaiveBGGVecBenchEstimator<_> as BenchEstimator<
+            NaiveBGGPublicKeyVec<DCRTPolyMatrix>,
+        >>::estimate_public_lookup(&estimator, 0);
+        assert_eq!(public_lookup.latency, 8.75);
+        assert_eq!(public_lookup.total_time, 26.25);
+        assert_eq!(public_lookup.max_parallelism, 12);
+
+        let slot_reduce = <NaiveBGGVecBenchEstimator<_> as BenchEstimator<
+            NaiveBGGPublicKeyVec<DCRTPolyMatrix>,
+        >>::estimate_slot_reduce(&estimator, 2, 3);
+        assert_eq!(slot_reduce.latency, 10.75);
+        assert_eq!(slot_reduce.total_time, 21.5);
+        assert_eq!(slot_reduce.max_parallelism, 16);
+    }
+
     #[tokio::test]
     #[sequential]
     async fn test_naive_encoding_public_lut_estimate_uses_slot_zero_dummy_aux() {
@@ -420,8 +567,8 @@ mod tests {
             >::new(
                 hash_key, dir_path.into(), c_b
             ));
-        let one = NaiveBGGEncodingVec::new(vec![encodings[0].clone()]);
-        let input = NaiveBGGEncodingVec::new(vec![encodings[1].clone()]);
+        let one = NaiveBGGEncodingVec::new(&params, vec![encodings[0].clone()]);
+        let input = NaiveBGGEncodingVec::new(&params, vec![encodings[1].clone()]);
         let public_lookup_bench = benchmark_gate_operation(1, || {
             encoding_evaluator.public_lookup(
                 &params,

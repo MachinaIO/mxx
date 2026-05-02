@@ -139,10 +139,11 @@ where
         input.assert_compatible(one);
         let num_slots = input.num_slots();
         NaiveBGGPublicKeyVec::new(
+            params,
             (0..num_slots)
                 .into_par_iter()
                 .map(|slot_idx| {
-                    let input_key = &input.keys[slot_idx];
+                    let input_key = input.key(slot_idx);
                     let row_size = input_key.matrix.row_size();
                     self.assert_b0_row_size(row_size);
                     let a_lt = derive_a_lt_matrix_for_slot::<M, SH>(
@@ -154,7 +155,7 @@ where
                     );
                     BggPublicKey::new(a_lt, true)
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
         )
     }
 }
@@ -232,22 +233,24 @@ where
         let c_b0 = M::from_compact_bytes(params, self.c_b0_compact_bytes.as_ref());
         let num_slots = input.num_slots();
         NaiveBGGEncodingVec::new(
+            params,
             (0..num_slots)
                 .into_par_iter()
                 .map(|slot_idx| {
+                    let input_encoding = input.encoding(slot_idx);
                     public_lookup_for_slot::<M, SH, ST>(
                         params,
                         plt,
                         self.hash_key,
                         &b0_trapdoor,
                         &c_b0,
-                        &input.encodings[slot_idx],
+                        &input_encoding,
                         gate_id,
                         lut_id,
                         slot_idx,
                     )
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
         )
     }
 }
@@ -274,9 +277,9 @@ where
     let input_plaintext =
         input.plaintext.as_ref().expect("debug lookup requires revealed input plaintext");
     let x_u64 = input_plaintext.const_coeff_u64();
-    let x_usize = usize::try_from(x_u64).expect("LUT input must fit in usize");
     let (k, y_k) =
         plt.get(params, x_u64).unwrap_or_else(|| panic!("{x_u64:?} is not in public lookup f"));
+    let x_usize = usize::try_from(x_u64).expect("LUT input must fit in usize");
     let k_usize = usize::try_from(k).expect("LUT row index must fit in usize");
     let row_size = input.pubkey.matrix.row_size();
     let gadget = M::gadget_matrix(params, row_size);
@@ -440,8 +443,8 @@ mod tests {
             DCRTPolyHashSampler<Keccak256>,
             DCRTPolyTrapdoorSampler,
         >::new(hash_key, b0_trapdoor, b0_matrix, dir_path.into());
-        let one_pubkey = NaiveBGGPublicKeyVec::new(vec![pubkeys[0].clone(); num_slots]);
-        let input_pubkey = NaiveBGGPublicKeyVec::new(pubkeys[1..].to_vec());
+        let one_pubkey = NaiveBGGPublicKeyVec::new(&params, vec![pubkeys[0].clone(); num_slots]);
+        let input_pubkey = NaiveBGGPublicKeyVec::new(&params, pubkeys[1..].to_vec());
         let result_pubkey = circuit.eval(
             &params,
             one_pubkey,
@@ -463,8 +466,8 @@ mod tests {
             DCRTPolyTrapdoorSampler,
         >::new(hash_key, dir_path.into(), c_b0);
 
-        let one_encoding = NaiveBGGEncodingVec::new(vec![encodings[0].clone(); num_slots]);
-        let input_encoding = NaiveBGGEncodingVec::new(encodings[1..].to_vec());
+        let one_encoding = NaiveBGGEncodingVec::new(&params, vec![encodings[0].clone(); num_slots]);
+        let input_encoding = NaiveBGGEncodingVec::new(&params, encodings[1..].to_vec());
         let result_encoding = circuit.eval(
             &params,
             one_encoding,
@@ -478,8 +481,8 @@ mod tests {
         assert_eq!(result_encoding.len(), 1);
         let gadget = DCRTPolyMatrix::gadget_matrix(&params, d);
         for slot_idx in 0..num_slots {
-            let output_encoding = &result_encoding[0].encodings[slot_idx];
-            let output_pubkey = &result_pubkey[0].keys[slot_idx];
+            let output_encoding = result_encoding[0].encoding(slot_idx);
+            let output_pubkey = result_pubkey[0].key(slot_idx);
             assert_eq!(output_encoding.pubkey, output_pubkey.clone());
 
             let expected_bit = plaintexts[slot_idx].const_coeff_u64() & 1;

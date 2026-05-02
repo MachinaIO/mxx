@@ -172,6 +172,27 @@ pub(crate) fn iter_batched_wire_gates(
     batches.iter().copied().flat_map(BatchedWire::gate_ids)
 }
 
+pub(crate) fn merge_contiguous_batched_wires<I, W>(batches: I) -> Vec<BatchedWire>
+where
+    I: IntoIterator<Item = W>,
+    W: Into<BatchedWire>,
+{
+    let mut merged = Vec::<BatchedWire>::new();
+    for batch in batches.into_iter().map(Into::into) {
+        if batch.is_empty() {
+            continue;
+        }
+        if let Some(last) = merged.last_mut() {
+            if last.end() == batch.start() {
+                *last = BatchedWire::new(last.start(), batch.end());
+                continue;
+            }
+        }
+        merged.push(batch);
+    }
+    merged
+}
+
 pub(crate) fn batched_wire_slice_at(batches: &[BatchedWire], idx: usize) -> GateId {
     let mut offset = idx;
     for batch in batches {

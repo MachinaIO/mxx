@@ -56,19 +56,21 @@ where
         input.assert_compatible(one);
         let num_slots = input.num_slots();
         NaiveBGGPublicKeyVec::new(
+            params,
             (0..num_slots)
                 .into_par_iter()
                 .map(|slot_idx| {
+                    let input_key = input.key(slot_idx);
                     self.inner.public_lookup_for_slot(
                         params,
                         plt,
-                        &input.keys[slot_idx],
+                        &input_key,
                         gate_id,
                         lut_id,
                         Some(slot_idx),
                     )
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
         )
     }
 }
@@ -157,19 +159,21 @@ where
         input.assert_compatible(one);
         let num_slots = input.num_slots();
         NaiveBGGEncodingVec::new(
+            params,
             (0..num_slots)
                 .into_par_iter()
                 .map(|slot_idx| {
+                    let input_encoding = input.encoding(slot_idx);
                     self.inner.public_lookup_for_slot(
                         params,
                         plt,
-                        &input.encodings[slot_idx],
+                        &input_encoding,
                         gate_id,
                         lut_id,
                         Some(slot_idx),
                     )
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
         )
     }
 }
@@ -284,8 +288,8 @@ mod tests {
                 Arc::new(b_trapdoor),
                 dir_path.into(),
             ));
-        let one_pubkey = NaiveBGGPublicKeyVec::new(vec![pubkeys[0].clone(); num_slots]);
-        let input_pubkey = NaiveBGGPublicKeyVec::new(pubkeys[1..].to_vec());
+        let one_pubkey = NaiveBGGPublicKeyVec::new(&params, vec![pubkeys[0].clone(); num_slots]);
+        let input_pubkey = NaiveBGGPublicKeyVec::new(&params, pubkeys[1..].to_vec());
         let result_pubkey = circuit.eval(
             &params,
             one_pubkey,
@@ -304,8 +308,8 @@ mod tests {
             >::new(
                 hash_key, dir_path.into(), c_b
             ));
-        let one_encoding = NaiveBGGEncodingVec::new(vec![encodings[0].clone(); num_slots]);
-        let input_encoding = NaiveBGGEncodingVec::new(encodings[1..].to_vec());
+        let one_encoding = NaiveBGGEncodingVec::new(&params, vec![encodings[0].clone(); num_slots]);
+        let input_encoding = NaiveBGGEncodingVec::new(&params, encodings[1..].to_vec());
         let result_encoding = circuit.eval(
             &params,
             one_encoding,
@@ -318,8 +322,8 @@ mod tests {
         assert_eq!(result_pubkey.len(), 1);
         assert_eq!(result_encoding.len(), 1);
         for slot_idx in 0..num_slots {
-            let output_encoding = &result_encoding[0].encodings[slot_idx];
-            let output_pubkey = &result_pubkey[0].keys[slot_idx];
+            let output_encoding = result_encoding[0].encoding(slot_idx);
+            let output_pubkey = result_pubkey[0].key(slot_idx);
             assert_eq!(output_encoding.pubkey, output_pubkey.clone());
 
             let expected_bit = plaintexts[slot_idx].const_coeff_u64() & 1;

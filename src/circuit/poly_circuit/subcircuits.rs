@@ -174,7 +174,7 @@ impl<P: Poly> PolyCircuit<P> {
         I: IntoIterator<Item = W>,
         W: Into<BatchedWire>,
     {
-        let batches = input_ids.into_iter().map(Into::into).collect::<Vec<_>>();
+        let batches = merge_contiguous_batched_wires(input_ids);
         self.input_set_registry.register(&batches)
     }
 
@@ -659,7 +659,7 @@ impl<P: Poly> PolyCircuit<P> {
         W: Into<BatchedWire>,
         R: IntoIterator<Item = SubCircuitInputMaxPlaintextNormRange>,
     {
-        let input_suffix = input_suffix.into_iter().map(Into::into).collect::<Vec<_>>();
+        let input_suffix = merge_contiguous_batched_wires(input_suffix);
         let total_num_inputs = shared_input_prefix_set_id
             .map(|input_set_id| batched_wire_slice_len(self.input_set(input_set_id).as_ref()))
             .unwrap_or(0) +

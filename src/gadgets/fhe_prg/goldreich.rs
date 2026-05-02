@@ -494,24 +494,72 @@ where
     ) -> Vec<C> {
         debug_assert_eq!(graph.input_size, self.input_size);
         debug_assert_eq!(graph.output_size(), self.output_size);
-        graph
+        let (prg_sub_circuit_id, output_templates) =
+            self.register_uniform_prg_sub_circuit(circuit, graph);
+        let inputs =
+            input_bits.iter().flat_map(|input| input.sub_circuit_wires()).collect::<Vec<_>>();
+        let outputs = circuit.call_sub_circuit(prg_sub_circuit_id, inputs);
+        let mut offset = 0;
+        output_templates
+            .iter()
+            .map(|template| {
+                let output_wire_count =
+                    template.sub_circuit_wires().into_iter().map(BatchedWire::len).sum::<usize>();
+                let output = C::from_sub_circuit_outputs(
+                    template,
+                    &outputs[offset..offset + output_wire_count],
+                );
+                offset += output_wire_count;
+                output
+            })
+            .collect::<Vec<_>>()
+    }
+
+    fn register_uniform_prg_sub_circuit(
+        &self,
+        circuit: &mut PolyCircuit<P>,
+        graph: &GoldreichGraph,
+    ) -> (usize, Vec<C>) {
+        let mut sub_circuit = circuit.fresh_sub_circuit();
+        let inputs = (0..self.input_size)
+            .map(|_| C::sub_circuit_input(Arc::clone(&self.ring_gsw), &mut sub_circuit))
+            .collect::<Vec<_>>();
+        let (predicate_sub_circuit_id, output_template) =
+            self.register_tsa_predicate_sub_circuit(&mut sub_circuit);
+        let outputs = graph
             .edges
             .iter()
             .map(|edge| {
-                let and_term =
-                    input_bits[edge.and_inputs[0]].and(&input_bits[edge.and_inputs[1]], circuit);
-                reduce_ciphertext_terms_pairwise(
-                    vec![
-                        input_bits[edge.xor_inputs[0]].clone(),
-                        input_bits[edge.xor_inputs[1]].clone(),
-                        input_bits[edge.xor_inputs[2]].clone(),
-                        and_term,
-                    ],
-                    circuit,
-                    |lhs: &C, rhs: &C, circuit| lhs.xor(rhs, circuit),
-                )
+                let mut predicate_inputs = Vec::new();
+                predicate_inputs.extend(inputs[edge.xor_inputs[0]].sub_circuit_wires());
+                predicate_inputs.extend(inputs[edge.xor_inputs[1]].sub_circuit_wires());
+                predicate_inputs.extend(inputs[edge.xor_inputs[2]].sub_circuit_wires());
+                predicate_inputs.extend(inputs[edge.and_inputs[0]].sub_circuit_wires());
+                predicate_inputs.extend(inputs[edge.and_inputs[1]].sub_circuit_wires());
+                let predicate_outputs =
+                    sub_circuit.call_sub_circuit(predicate_sub_circuit_id, predicate_inputs);
+                C::from_sub_circuit_outputs(&output_template, &predicate_outputs)
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        sub_circuit.output(outputs.iter().flat_map(|output| output.sub_circuit_wires()));
+        let sub_circuit_id = circuit.register_sub_circuit(sub_circuit);
+        (sub_circuit_id, outputs)
+    }
+
+    fn register_tsa_predicate_sub_circuit(&self, circuit: &mut PolyCircuit<P>) -> (usize, C) {
+        let mut sub_circuit = circuit.fresh_sub_circuit();
+        let inputs = (0..5)
+            .map(|_| C::sub_circuit_input(Arc::clone(&self.ring_gsw), &mut sub_circuit))
+            .collect::<Vec<_>>();
+        let and_term = inputs[3].and(&inputs[4], &mut sub_circuit);
+        let output = reduce_ciphertext_terms_pairwise(
+            vec![inputs[0].clone(), inputs[1].clone(), inputs[2].clone(), and_term],
+            &mut sub_circuit,
+            |lhs: &C, rhs: &C, circuit| lhs.xor(rhs, circuit),
+        );
+        sub_circuit.output(output.sub_circuit_wires());
+        let sub_circuit_id = circuit.register_sub_circuit(sub_circuit);
+        (sub_circuit_id, output)
     }
 
     /// Homomorphically evaluates all TSA predicate edges on encrypted input bits and returns
@@ -1262,7 +1310,6 @@ mod tests {
         let plaintext_modulus = 2u64;
         let secret_key = sample_secret_key(&params);
         let public_key_hash_key = sample_hash_key();
-        let randomizer_hash_key = sample_hash_key();
         let public_key = sample_public_key(
             &params,
             ring_gsw.width(),
@@ -1276,16 +1323,8 @@ mod tests {
         let native_inputs = plaintext_inputs
             .par_iter()
             .enumerate()
-            .map(|(idx, bit)| {
-                let tag = format!("goldreich_input_bit_{idx}");
-                encrypt_plaintext_bit(
-                    &params,
-                    ring_gsw.nested_rns.as_ref(),
-                    &public_key,
-                    *bit,
-                    randomizer_hash_key,
-                    tag.as_bytes(),
-                )
+            .map(|(_idx, bit)| {
+                encrypt_plaintext_bit(&params, ring_gsw.nested_rns.as_ref(), &public_key, *bit != 0)
             })
             .collect::<Vec<_>>();
 
@@ -1381,7 +1420,6 @@ mod tests {
         let plaintext_modulus = (2 * cbd_n + 1) as u64;
         let secret_key = sample_secret_key(&params);
         let public_key_hash_key = sample_hash_key();
-        let randomizer_hash_key = sample_hash_key();
         let public_key = sample_public_key(
             &params,
             ring_gsw.width(),
@@ -1396,16 +1434,8 @@ mod tests {
         let native_inputs = plaintext_inputs
             .par_iter()
             .enumerate()
-            .map(|(idx, bit)| {
-                let tag = format!("goldreich_cbd_input_bit_{idx}");
-                encrypt_plaintext_bit(
-                    &params,
-                    ring_gsw.nested_rns.as_ref(),
-                    &public_key,
-                    *bit,
-                    randomizer_hash_key,
-                    tag.as_bytes(),
-                )
+            .map(|(_idx, bit)| {
+                encrypt_plaintext_bit(&params, ring_gsw.nested_rns.as_ref(), &public_key, *bit != 0)
             })
             .collect::<Vec<_>>();
 

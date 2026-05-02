@@ -3,7 +3,6 @@ use crate::{
     gadgets::fhe::ring_gsw_nested_rns::active_q_modulus,
     matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix,
     poly::dcrt::gpu::{GpuDCRTPoly, GpuDCRTPolyParams},
-    sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
 };
 use bigdecimal::BigDecimal;
 use num_bigint::BigUint;
@@ -65,17 +64,6 @@ fn rounded_coeffs_mod_plaintext<P: Poly>(
         .into_iter()
         .map(|coeff| coeff % plaintext_modulus)
         .collect()
-}
-
-fn sample_public_key_error(
-    params: &DCRTPolyParams,
-    width: usize,
-    error_sigma: f64,
-) -> Vec<DCRTPoly> {
-    let uniform_sampler = DCRTPolyUniformSampler::new();
-    uniform_sampler
-        .sample_uniform(params, 1, width, DistType::GaussDist { sigma: error_sigma })
-        .get_row(0)
 }
 
 fn centered_mod_distance(value: &BigUint, expected: &BigUint, modulus: &BigUint) -> BigUint {
@@ -159,37 +147,21 @@ fn test_ring_gsw_add_circuit_decrypts_to_expected_integer_sum_with_noisy_public_
     let secret_key = sample_secret_key(&cpu_params);
     let gpu_secret_key = gpu_poly_from_cpu(&gpu_params, &secret_key);
     let public_key_hash_key = sample_hash_key();
-    let randomizer_hash_key = sample_hash_key();
-    let public_key_error = sample_public_key_error(&cpu_params, lhs.width(), error_sigma);
     let public_key = sample_public_key(
         &cpu_params,
         lhs.width(),
         &secret_key,
         public_key_hash_key,
         b"ring_gsw_public_key_with_error",
-        Some(&public_key_error),
+        Some(error_sigma),
     );
 
     let (x1, x2) = sample_binary_input_pair();
     let expected = (x1 + x2) % plaintext_modulus;
-    let lhs_tag = format!("add_circuit_noisy_lhs_{x1}_{x2}");
-    let rhs_tag = format!("add_circuit_noisy_rhs_{x1}_{x2}");
-    let lhs_native = encrypt_plaintext_bit(
-        &cpu_params,
-        ctx.nested_rns.as_ref(),
-        &public_key,
-        x1,
-        randomizer_hash_key,
-        lhs_tag.as_bytes(),
-    );
-    let rhs_native = encrypt_plaintext_bit(
-        &cpu_params,
-        ctx.nested_rns.as_ref(),
-        &public_key,
-        x2,
-        randomizer_hash_key,
-        rhs_tag.as_bytes(),
-    );
+    let lhs_native =
+        encrypt_plaintext_bit(&cpu_params, ctx.nested_rns.as_ref(), &public_key, x1 != 0);
+    let rhs_native =
+        encrypt_plaintext_bit(&cpu_params, ctx.nested_rns.as_ref(), &public_key, x2 != 0);
 
     let inputs = [
         ciphertext_inputs_from_native::<GpuDCRTPoly>(
@@ -276,37 +248,21 @@ fn test_ring_gsw_sub_circuit_decrypts_to_expected_integer_difference_with_noisy_
     let secret_key = sample_secret_key(&cpu_params);
     let gpu_secret_key = gpu_poly_from_cpu(&gpu_params, &secret_key);
     let public_key_hash_key = sample_hash_key();
-    let randomizer_hash_key = sample_hash_key();
-    let public_key_error = sample_public_key_error(&cpu_params, lhs.width(), error_sigma);
     let public_key = sample_public_key(
         &cpu_params,
         lhs.width(),
         &secret_key,
         public_key_hash_key,
         b"ring_gsw_public_key_with_error",
-        Some(&public_key_error),
+        Some(error_sigma),
     );
 
     let (x1, x2) = sample_binary_input_pair();
     let expected = (x1 + plaintext_modulus - x2) % plaintext_modulus;
-    let lhs_tag = format!("sub_circuit_noisy_lhs_{x1}_{x2}");
-    let rhs_tag = format!("sub_circuit_noisy_rhs_{x1}_{x2}");
-    let lhs_native = encrypt_plaintext_bit(
-        &cpu_params,
-        ctx.nested_rns.as_ref(),
-        &public_key,
-        x1,
-        randomizer_hash_key,
-        lhs_tag.as_bytes(),
-    );
-    let rhs_native = encrypt_plaintext_bit(
-        &cpu_params,
-        ctx.nested_rns.as_ref(),
-        &public_key,
-        x2,
-        randomizer_hash_key,
-        rhs_tag.as_bytes(),
-    );
+    let lhs_native =
+        encrypt_plaintext_bit(&cpu_params, ctx.nested_rns.as_ref(), &public_key, x1 != 0);
+    let rhs_native =
+        encrypt_plaintext_bit(&cpu_params, ctx.nested_rns.as_ref(), &public_key, x2 != 0);
 
     let inputs = [
         ciphertext_inputs_from_native::<GpuDCRTPoly>(
@@ -394,37 +350,21 @@ fn test_ring_gsw_mul_circuit_decrypts_to_expected_integer_product_with_noisy_pub
     let secret_key = sample_secret_key(&cpu_params);
     let gpu_secret_key = gpu_poly_from_cpu(&gpu_params, &secret_key);
     let public_key_hash_key = sample_hash_key();
-    let randomizer_hash_key = sample_hash_key();
-    let public_key_error = sample_public_key_error(&cpu_params, lhs.width(), error_sigma);
     let public_key = sample_public_key(
         &cpu_params,
         lhs.width(),
         &secret_key,
         public_key_hash_key,
         b"ring_gsw_public_key_with_error",
-        Some(&public_key_error),
+        Some(error_sigma),
     );
 
     let (x1, x2) = sample_binary_input_pair();
     let expected = (x1 * x2) % plaintext_modulus;
-    let lhs_tag = format!("mul_circuit_noisy_lhs_{x1}_{x2}");
-    let rhs_tag = format!("mul_circuit_noisy_rhs_{x1}_{x2}");
-    let lhs_native = encrypt_plaintext_bit(
-        &cpu_params,
-        ctx.nested_rns.as_ref(),
-        &public_key,
-        x1,
-        randomizer_hash_key,
-        lhs_tag.as_bytes(),
-    );
-    let rhs_native = encrypt_plaintext_bit(
-        &cpu_params,
-        ctx.nested_rns.as_ref(),
-        &public_key,
-        x2,
-        randomizer_hash_key,
-        rhs_tag.as_bytes(),
-    );
+    let lhs_native =
+        encrypt_plaintext_bit(&cpu_params, ctx.nested_rns.as_ref(), &public_key, x1 != 0);
+    let rhs_native =
+        encrypt_plaintext_bit(&cpu_params, ctx.nested_rns.as_ref(), &public_key, x2 != 0);
 
     let inputs = [
         ciphertext_inputs_from_native::<GpuDCRTPoly>(
@@ -513,47 +453,24 @@ fn test_ring_gsw_chained_mul_circuit_decrypts_to_expected_integer_product_with_n
     let secret_key = sample_secret_key(&cpu_params);
     let gpu_secret_key = gpu_poly_from_cpu(&gpu_params, &secret_key);
     let public_key_hash_key = sample_hash_key();
-    let randomizer_hash_key = sample_hash_key();
-    let public_key_error = sample_public_key_error(&cpu_params, lhs.width(), error_sigma);
     let public_key = sample_public_key(
         &cpu_params,
         lhs.width(),
         &secret_key,
         public_key_hash_key,
         b"ring_gsw_public_key_with_error",
-        Some(&public_key_error),
+        Some(error_sigma),
     );
 
     let (x1, x2) = sample_binary_input_pair();
     let x3 = rand::rng().random_range(0..2u64);
     let expected = (x1 * x2 * x3) % plaintext_modulus;
-    let lhs_tag = format!("chain_mul_circuit_noisy_lhs_{x1}_{x2}_{x3}");
-    let rhs1_tag = format!("chain_mul_circuit_noisy_rhs1_{x1}_{x2}_{x3}");
-    let rhs2_tag = format!("chain_mul_circuit_noisy_rhs2_{x1}_{x2}_{x3}");
-    let lhs_native = encrypt_plaintext_bit(
-        &cpu_params,
-        ctx.nested_rns.as_ref(),
-        &public_key,
-        x1,
-        randomizer_hash_key,
-        lhs_tag.as_bytes(),
-    );
-    let rhs1_native = encrypt_plaintext_bit(
-        &cpu_params,
-        ctx.nested_rns.as_ref(),
-        &public_key,
-        x2,
-        randomizer_hash_key,
-        rhs1_tag.as_bytes(),
-    );
-    let rhs2_native = encrypt_plaintext_bit(
-        &cpu_params,
-        ctx.nested_rns.as_ref(),
-        &public_key,
-        x3,
-        randomizer_hash_key,
-        rhs2_tag.as_bytes(),
-    );
+    let lhs_native =
+        encrypt_plaintext_bit(&cpu_params, ctx.nested_rns.as_ref(), &public_key, x1 != 0);
+    let rhs1_native =
+        encrypt_plaintext_bit(&cpu_params, ctx.nested_rns.as_ref(), &public_key, x2 != 0);
+    let rhs2_native =
+        encrypt_plaintext_bit(&cpu_params, ctx.nested_rns.as_ref(), &public_key, x3 != 0);
 
     let inputs = [
         ciphertext_inputs_from_native::<GpuDCRTPoly>(

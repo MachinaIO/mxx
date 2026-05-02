@@ -196,6 +196,8 @@ impl<P: Poly> PolyCircuit<P> {
 
         let wires: DashMap<GateId, Arc<E::Compact>> = DashMap::new();
         let levels = self.compute_levels();
+        let scheduled_gate_ids: HashSet<GateId> =
+            levels.iter().flat_map(|level| level.iter().copied()).collect();
         debug!("{}", format!("Levels: {levels:?}"));
         debug!("Levels are computed");
         let output_set: HashSet<GateId> = self.output_ids.iter().copied().collect();
@@ -448,6 +450,9 @@ impl<P: Poly> PolyCircuit<P> {
                         if sibling_gate_id == gate_id {
                             continue;
                         }
+                        if !scheduled_gate_ids.contains(&sibling_gate_id) {
+                            continue;
+                        }
                         let sibling_gate =
                             self.gates.get(&sibling_gate_id).expect("gate not found").clone();
                         release_consumed_inputs(&sibling_gate);
@@ -519,6 +524,9 @@ impl<P: Poly> PolyCircuit<P> {
                     }
                     for sibling_gate_id in call.output_gate_ids.iter().copied() {
                         if sibling_gate_id == gate_id {
+                            continue;
+                        }
+                        if !scheduled_gate_ids.contains(&sibling_gate_id) {
                             continue;
                         }
                         let sibling_gate =

@@ -14,7 +14,7 @@ use crate::{
     gadgets::{
         arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner},
         fhe::ring_gsw::{RingGswCiphertext, RingGswContext},
-        fhe_prg::goldreich::{GoldreichFheCbdPrg, GoldreichFhePrg},
+        fhe_prg::goldreich::{GoldreichFheCbdPrg, evaluate_goldreich_uniform_range},
     },
     poly::{Poly, PolyParams},
 };
@@ -248,17 +248,15 @@ where
     );
     let mask_seed =
         derive_noise_refresh_graph_seed(graph_seed, b"NoiseRefreshMask/v1", scope_counter);
-    let mask_prg = GoldreichFhePrg::setup_range(
+    let masks = evaluate_goldreich_uniform_range(
         circuit,
         ring_gsw.clone(),
-        input_size,
+        encrypted_seeds,
         output_sizes.mask_bits,
         0,
         output_sizes.mask_bits,
         mask_seed,
     );
-    let masks = mask_prg.evaluate_uniform(encrypted_seeds, circuit);
-
     let cbd_seed =
         derive_noise_refresh_graph_seed(graph_seed, b"NoiseRefreshCBD/v1", scope_counter);
     let cbd_prf = GoldreichFheCbdPrg::setup_range(
@@ -274,7 +272,7 @@ where
     let errors = cbd_prf.evaluate_cbd_prf(encrypted_seeds, circuit);
     debug_assert_eq!(errors.len() + masks.len(), output_sizes.cbd_values + output_sizes.mask_bits);
 
-    let _ = (mask_prg, cbd_prf);
+    let _ = cbd_prf;
     GoldreichNoiseRefreshMaterial { errors, masks }
 }
 
@@ -340,16 +338,15 @@ where
     let masks = mask_ranges
         .iter()
         .flat_map(|&(mask_start, mask_len)| {
-            let mask_prg = GoldreichFhePrg::setup_range(
+            evaluate_goldreich_uniform_range(
                 circuit,
                 ring_gsw.clone(),
-                input_size,
+                encrypted_seeds,
                 output_sizes.mask_bits,
                 mask_start,
                 mask_len,
                 mask_seed,
-            );
-            mask_prg.evaluate_uniform(encrypted_seeds, circuit)
+            )
         })
         .collect::<Vec<_>>();
     debug_assert_eq!(

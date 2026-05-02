@@ -42,6 +42,10 @@ use crate::{
     slot_transfer::SlotTransferEvaluator,
 };
 
+pub mod dec_bench;
+pub mod error_simulation;
+pub mod keygen_bench;
+
 #[cfg(test)]
 use crate::gadgets::fhe::ring_gsw_nested_rns::{active_q_modulus, decrypt_ciphertext};
 
@@ -538,7 +542,7 @@ where
             }
         } else {
             mask_inputs.extend(mask_output_wires);
-        }
+        };
         let mask_circuit = build_prf_mask_circuit(params);
         debug!(
             input_count = mask_inputs.len(),

@@ -70,6 +70,7 @@ where
     pub noise_refresh_v_bits: usize,
     pub noise_refresh_cbd_n: usize,
     pub noise_refresh_hash_key: [u8; 32],
+    #[cfg(test)]
     debug_reuse_single_prg_sample: bool,
     _m: PhantomData<M>,
 }
@@ -127,7 +128,8 @@ where
             noise_refresh_v_bits,
             noise_refresh_cbd_n,
             noise_refresh_hash_key,
-            debug_reuse_single_prg_sample: cfg!(test),
+            #[cfg(test)]
+            debug_reuse_single_prg_sample: true,
             _m: PhantomData,
         }
     }

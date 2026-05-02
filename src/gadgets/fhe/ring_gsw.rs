@@ -1788,7 +1788,8 @@ mod tests {
         crt_bits: usize,
         limb_bit_size: usize,
     ) -> (DCRTPolyParams, Arc<MontgomeryRingGswContext>) {
-        let params = DCRTPolyParams::new(ring_dim, active_levels, crt_bits, BASE_BITS);
+        let params =
+            DCRTPolyParams::new(ring_dim, active_levels, crt_bits, crt_bits.div_ceil(2) as u32);
         let montgomery =
             Arc::new(MontgomeryPolyContext::setup(circuit, &params, limb_bit_size, false));
         let ctx = Arc::new(super::RingGswContext::from_arith_context(
@@ -2866,8 +2867,8 @@ mod tests {
     #[ignore = "expensive circuit-structure reporting test; run with --ignored --nocapture"]
     fn test_nested_rns_ring_gsw_mul_large_circuit_metrics() {
         let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
-        let crt_bits = 24usize;
-        let crt_depth = 1usize;
+        let crt_bits = 28usize;
+        let crt_depth = 32usize;
         let ring_dim = 1u32 << 16;
         let num_slots = 1usize << 16;
         let p_moduli_bits = 7;
@@ -2935,8 +2936,8 @@ mod tests {
     #[ignore = "expensive circuit-structure reporting test; run with --ignored --nocapture"]
     fn test_carry_arith_ring_gsw_mul_large_circuit_metrics() {
         let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
-        let crt_bits = 24usize;
-        let crt_depth = 1usize;
+        let crt_bits = 28usize;
+        let crt_depth = 32usize;
         let ring_dim = 1u32 << 16;
         let num_slots = 1usize << 16;
         let limb_bit_size = 7usize;

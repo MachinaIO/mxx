@@ -13,18 +13,12 @@ use mxx::{
     },
     circuit::{PolyCircuit, PolyGateKind, evaluable::PolyVec},
     gadgets::{
-        arith::{MontgomeryPoly, MontgomeryPolyContext},
-        fhe::{
-            ring_gsw::{
-                RingGswCiphertext as GenericRingGswCiphertext,
-                RingGswContext as GenericRingGswContext,
-            },
-            ring_gsw_montgomery_gpu::{
-                encrypt_montgomery_plaintext_bit, montgomery_ciphertext_inputs_from_native,
-                sample_montgomery_public_key, sample_montgomery_secret_key,
-            },
+        arith::NestedRnsPolyContext,
+        fhe::ring_gsw_nested_rns::{
+            NestedRnsRingGswCiphertext as RingGswCiphertext,
+            NestedRnsRingGswContext as RingGswContext, ciphertext_inputs_from_native,
+            encrypt_plaintext_bit, sample_public_key, sample_secret_key,
         },
-        fhe_prg::goldreich::GoldreichFhePrg,
     },
     lookup::{
         lwe::{
@@ -70,16 +64,15 @@ use std::{
 use tracing::{debug, info};
 
 const DEFAULT_RING_DIM: u32 = 1 << 16;
-const DEFAULT_INPUT_SIZE: usize = 5;
-const DEFAULT_OUTPUT_SIZE: usize = 1;
 const DEFAULT_CRT_BITS: usize = 28;
-const DEFAULT_LIMB_BITS: usize = 7;
+const DEFAULT_P_MODULI_BITS: usize = 7;
+const DEFAULT_MAX_UNREDUCED_MULS: usize = 4;
+const DEFAULT_SCALE: u64 = 1 << 8;
 const DEFAULT_BASE_BITS: u32 = 14;
 const DEFAULT_MAX_CRT_DEPTH: usize = 64;
 const DEFAULT_ERROR_SIGMA: f64 = 4.0;
 const DEFAULT_D_SECRET: usize = 1;
 const DEFAULT_BENCH_ITERATIONS: usize = 1;
-const DEFAULT_GRAPH_SEED: [u8; 32] = [0u8; 32];
 const DEFAULT_BENCH_SEED: [u8; 32] = [0u8; 32];
 const TRAPDOOR_SIGMA: f64 = 4.578;
 const ERROR_SIM_ACTIVE_LEVELS: usize = 1;
@@ -89,16 +82,14 @@ type GpuHashSampler = GpuDCRTPolyHashSampler<Keccak256>;
 type GpuPubKeyPltEvaluator =
     NaiveLWEBGGPublicKeyVecPltEvaluator<GpuMatrix, GpuHashSampler, GpuDCRTPolyTrapdoorSampler>;
 type GpuEncodingPltEvaluator = NaiveLWEBGGEncodingVecPltEvaluator<GpuMatrix, GpuHashSampler>;
-type RingGswCiphertext<P> = GenericRingGswCiphertext<P, MontgomeryPoly<P>>;
-type RingGswContext<P> = GenericRingGswContext<P, MontgomeryPoly<P>>;
 
 #[derive(Debug, Clone)]
-struct GoldreichRingGswBenchConfig {
+struct RingGswMulBenchConfig {
     ring_dim: u32,
-    input_size: usize,
-    output_size: usize,
     crt_bits: usize,
-    limb_bits: usize,
+    p_moduli_bits: usize,
+    max_unreduced_muls: usize,
+    scale: u64,
     base_bits: u32,
     max_crt_depth: usize,
     error_sigma: f64,
@@ -111,6 +102,13 @@ struct GoldreichRingGswBenchConfig {
 fn env_or_parse_u32(key: &str, default: u32) -> u32 {
     match env::var(key) {
         Ok(raw) => raw.parse::<u32>().unwrap_or_else(|e| panic!("{key} must be a valid u32: {e}")),
+        Err(_) => default,
+    }
+}
+
+fn env_or_parse_u64(key: &str, default: u64) -> u64 {
+    match env::var(key) {
+        Ok(raw) => raw.parse::<u64>().unwrap_or_else(|e| panic!("{key} must be a valid u64: {e}")),
         Err(_) => default,
     }
 }
@@ -131,63 +129,74 @@ fn env_or_parse_f64(key: &str, default: f64) -> f64 {
     }
 }
 
-impl GoldreichRingGswBenchConfig {
+impl RingGswMulBenchConfig {
     fn from_env() -> Self {
-        let ring_dim = env_or_parse_u32("LWE_GOLDREICH_RING_GSW_BENCH_RING_DIM", DEFAULT_RING_DIM);
-        let input_size =
-            env_or_parse_usize("LWE_GOLDREICH_RING_GSW_BENCH_INPUT_SIZE", DEFAULT_INPUT_SIZE);
-        let output_size =
-            env_or_parse_usize("LWE_GOLDREICH_RING_GSW_BENCH_OUTPUT_SIZE", DEFAULT_OUTPUT_SIZE);
+        let ring_dim =
+            env_or_parse_u32("LWE_NESTED_RNS_RING_GSW_MUL_BENCH_RING_DIM", DEFAULT_RING_DIM);
         let crt_bits =
-            env_or_parse_usize("LWE_GOLDREICH_RING_GSW_BENCH_CRT_BITS", DEFAULT_CRT_BITS);
-        let limb_bits =
-            env_or_parse_usize("LWE_GOLDREICH_RING_GSW_BENCH_LIMB_BITS", DEFAULT_LIMB_BITS);
+            env_or_parse_usize("LWE_NESTED_RNS_RING_GSW_MUL_BENCH_CRT_BITS", DEFAULT_CRT_BITS);
+        let p_moduli_bits = env_or_parse_usize(
+            "LWE_NESTED_RNS_RING_GSW_MUL_BENCH_P_MODULI_BITS",
+            DEFAULT_P_MODULI_BITS,
+        );
+        let max_unreduced_muls = env_or_parse_usize(
+            "LWE_NESTED_RNS_RING_GSW_MUL_BENCH_MAX_UNREDUCED_MULS",
+            DEFAULT_MAX_UNREDUCED_MULS,
+        );
+        let scale = env_or_parse_u64("LWE_NESTED_RNS_RING_GSW_MUL_BENCH_SCALE", DEFAULT_SCALE);
         let base_bits =
-            env_or_parse_u32("LWE_GOLDREICH_RING_GSW_BENCH_BASE_BITS", DEFAULT_BASE_BITS);
-        let max_crt_depth =
-            env_or_parse_usize("LWE_GOLDREICH_RING_GSW_BENCH_MAX_CRT_DEPTH", DEFAULT_MAX_CRT_DEPTH);
+            env_or_parse_u32("LWE_NESTED_RNS_RING_GSW_MUL_BENCH_BASE_BITS", DEFAULT_BASE_BITS);
+        let max_crt_depth = env_or_parse_usize(
+            "LWE_NESTED_RNS_RING_GSW_MUL_BENCH_MAX_CRT_DEPTH",
+            DEFAULT_MAX_CRT_DEPTH,
+        );
         let error_sigma =
-            env_or_parse_f64("LWE_GOLDREICH_RING_GSW_BENCH_ERROR_SIGMA", DEFAULT_ERROR_SIGMA);
+            env_or_parse_f64("LWE_NESTED_RNS_RING_GSW_MUL_BENCH_ERROR_SIGMA", DEFAULT_ERROR_SIGMA);
         let d_secret =
-            env_or_parse_usize("LWE_GOLDREICH_RING_GSW_BENCH_D_SECRET", DEFAULT_D_SECRET);
+            env_or_parse_usize("LWE_NESTED_RNS_RING_GSW_MUL_BENCH_D_SECRET", DEFAULT_D_SECRET);
         let bench_iterations = env_or_parse_usize(
-            "LWE_GOLDREICH_RING_GSW_BENCH_BENCH_ITERATIONS",
+            "LWE_NESTED_RNS_RING_GSW_MUL_BENCH_BENCH_ITERATIONS",
             DEFAULT_BENCH_ITERATIONS,
         );
-        let active_levels_override = env::var("LWE_GOLDREICH_RING_GSW_BENCH_ACTIVE_LEVELS")
+        let active_levels_override = env::var("LWE_NESTED_RNS_RING_GSW_MUL_BENCH_ACTIVE_LEVELS")
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .map(|value| {
                 value.parse::<usize>().unwrap_or_else(|e| {
-                    panic!("LWE_GOLDREICH_RING_GSW_BENCH_ACTIVE_LEVELS must be a valid usize: {e}")
+                    panic!(
+                        "LWE_NESTED_RNS_RING_GSW_MUL_BENCH_ACTIVE_LEVELS must be a valid usize: {e}"
+                    )
                 })
             });
-        let dir_name_override = env::var("LWE_GOLDREICH_RING_GSW_BENCH_DIR_NAME")
+        let dir_name_override = env::var("LWE_NESTED_RNS_RING_GSW_MUL_BENCH_DIR_NAME")
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
 
-        assert!(ring_dim > 0, "LWE_GOLDREICH_RING_GSW_BENCH_RING_DIM must be > 0");
-        assert!(input_size >= 5, "LWE_GOLDREICH_RING_GSW_BENCH_INPUT_SIZE must be at least 5");
-        assert!(output_size > 0, "LWE_GOLDREICH_RING_GSW_BENCH_OUTPUT_SIZE must be > 0");
-        assert!(crt_bits > 0, "LWE_GOLDREICH_RING_GSW_BENCH_CRT_BITS must be > 0");
-        assert!(limb_bits > 0, "LWE_GOLDREICH_RING_GSW_BENCH_LIMB_BITS must be > 0");
-        assert!(base_bits > 0, "LWE_GOLDREICH_RING_GSW_BENCH_BASE_BITS must be > 0");
-        assert!(max_crt_depth > 0, "LWE_GOLDREICH_RING_GSW_BENCH_MAX_CRT_DEPTH must be > 0");
-        assert!(error_sigma >= 0.0, "LWE_GOLDREICH_RING_GSW_BENCH_ERROR_SIGMA must be >= 0");
-        assert!(d_secret > 0, "LWE_GOLDREICH_RING_GSW_BENCH_D_SECRET must be > 0");
-        assert!(bench_iterations > 0, "LWE_GOLDREICH_RING_GSW_BENCH_BENCH_ITERATIONS must be > 0");
-        if let Some(active_levels) = active_levels_override {
-            assert!(active_levels > 0, "LWE_GOLDREICH_RING_GSW_BENCH_ACTIVE_LEVELS must be > 0");
-        }
+        assert!(ring_dim > 0, "LWE_NESTED_RNS_RING_GSW_MUL_BENCH_RING_DIM must be > 0");
+        assert!(crt_bits > 0, "LWE_NESTED_RNS_RING_GSW_MUL_BENCH_CRT_BITS must be > 0");
+        assert!(p_moduli_bits > 0, "LWE_NESTED_RNS_RING_GSW_MUL_BENCH_P_MODULI_BITS must be > 0");
+        assert!(
+            max_unreduced_muls > 0,
+            "LWE_NESTED_RNS_RING_GSW_MUL_BENCH_MAX_UNREDUCED_MULS must be > 0"
+        );
+        assert!(scale > 0, "LWE_NESTED_RNS_RING_GSW_MUL_BENCH_SCALE must be > 0");
+        assert!(base_bits > 0, "LWE_NESTED_RNS_RING_GSW_MUL_BENCH_BASE_BITS must be > 0");
+        assert!(max_crt_depth > 0, "LWE_NESTED_RNS_RING_GSW_MUL_BENCH_MAX_CRT_DEPTH must be > 0");
+        assert!(error_sigma >= 0.0, "LWE_NESTED_RNS_RING_GSW_MUL_BENCH_ERROR_SIGMA must be >= 0");
+        assert!(d_secret > 0, "LWE_NESTED_RNS_RING_GSW_MUL_BENCH_D_SECRET must be > 0");
+        assert!(
+            bench_iterations > 0,
+            "LWE_NESTED_RNS_RING_GSW_MUL_BENCH_BENCH_ITERATIONS must be > 0"
+        );
 
         Self {
             ring_dim,
-            input_size,
-            output_size,
             crt_bits,
-            limb_bits,
+            p_moduli_bits,
+            max_unreduced_muls,
+            scale,
             base_bits,
             max_crt_depth,
             error_sigma,
@@ -205,28 +214,17 @@ impl GoldreichRingGswBenchConfig {
     fn bench_dir_base(&self, crt_depth: usize) -> String {
         self.dir_name_override.clone().unwrap_or_else(|| {
             format!(
-                "test_data/test_gpu_lwe_montgomery_goldreich_ring_gsw_bench_ring{}_in{}_out{}_active{}_crt{}_depth{}",
-                self.ring_dim,
-                self.input_size,
-                self.output_size,
-                crt_depth,
-                self.crt_bits,
-                crt_depth
+                "test_data/test_gpu_lwe_nested_rns_ring_gsw_mul_bench_ring{}_active{}_crt{}_depth{}",
+                self.ring_dim, crt_depth, self.crt_bits, crt_depth
             )
         })
     }
 
-    fn pubkey_bench_dir(&self, crt_depth: usize) -> PathBuf {
-        Path::new(&self.bench_dir_base(crt_depth)).join("pubkey")
-    }
-}
-
-impl GoldreichRingGswBenchConfig {
     fn active_levels_for_crt_depth(&self, crt_depth: usize) -> usize {
         let active_levels = self.active_levels_override.unwrap_or(crt_depth);
         assert!(
             active_levels <= crt_depth,
-            "LWE_GOLDREICH_RING_GSW_BENCH_ACTIVE_LEVELS exceeds crt_depth: active_levels={}, crt_depth={}",
+            "LWE_NESTED_RNS_RING_GSW_MUL_BENCH_ACTIVE_LEVELS exceeds crt_depth: active_levels={}, crt_depth={}",
             active_levels,
             crt_depth
         );
@@ -298,8 +296,44 @@ impl CrtDepthProbe {
     }
 }
 
-fn probe_crt_depth_for_goldreich_ring_gsw_bench(
-    cfg: &GoldreichRingGswBenchConfig,
+fn build_ring_gsw_mul_circuit<P: Poly + 'static>(
+    params: &P::Params,
+    cfg: &RingGswMulBenchConfig,
+    active_levels: usize,
+) -> (PolyCircuit<P>, Arc<RingGswContext<P>>, Vec<RingGswCiphertext<P>>) {
+    let build_start = Instant::now();
+    let mut circuit = PolyCircuit::<P>::new();
+    let nested_rns = Arc::new(NestedRnsPolyContext::setup(
+        &mut circuit,
+        params,
+        cfg.p_moduli_bits,
+        cfg.max_unreduced_muls,
+        cfg.scale,
+        false,
+        Some(active_levels),
+    ));
+    let ctx = Arc::new(RingGswContext::from_arith_context(
+        &mut circuit,
+        params,
+        cfg.num_slots(),
+        nested_rns,
+        Some(active_levels),
+        None,
+    ));
+    let lhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+    let rhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
+    let product = lhs.mul(&rhs, &mut circuit);
+    let reconstructed_outputs = product.reconstruct(&mut circuit);
+    circuit.output(reconstructed_outputs);
+    info!(
+        "ring_gsw mul circuit build elapsed_ms={:.3} encrypted_outputs=1",
+        build_start.elapsed().as_secs_f64() * 1000.0
+    );
+    (circuit, ctx, vec![product])
+}
+
+fn probe_crt_depth_for_ring_gsw_mul_bench(
+    cfg: &RingGswMulBenchConfig,
     crt_depth: usize,
     ring_dim_sqrt: &BigDecimal,
     base: &BigDecimal,
@@ -319,7 +353,7 @@ fn probe_crt_depth_for_goldreich_ring_gsw_bench(
     let full_q = params.modulus();
     let q_max = *active_q_moduli.iter().max().expect("active_q_moduli must not be empty");
     let (circuit, ctx, encrypted_outputs) =
-        build_goldreich_ring_gsw_circuit::<DCRTPoly>(&params, cfg, ERROR_SIM_ACTIVE_LEVELS);
+        build_ring_gsw_mul_circuit::<DCRTPoly>(&params, cfg, ERROR_SIM_ACTIVE_LEVELS);
     let log_base_q = params.modulus_digits();
     let log_base_q_small = log_base_q / actual_crt_depth;
     let sim_ctx = Arc::new(SimulatorContext::new(
@@ -340,7 +374,7 @@ fn probe_crt_depth_for_goldreich_ring_gsw_bench(
         Some(&plt_evaluator),
         Some(&slot_transfer_evaluator),
     );
-    debug!("simulate_max_error_norm finished output_errors={}", out_errors.len());
+    debug!("ring_gsw_mul simulate_max_error_norm finished output_errors={}", out_errors.len());
     let threshold = full_q.as_ref() / BigUint::from(2u64 * q_max);
     let threshold_bd = BigDecimal::from_biguint(threshold.clone(), 0);
     let max_eval_error = max_bigdecimal(
@@ -351,11 +385,6 @@ fn probe_crt_depth_for_goldreich_ring_gsw_bench(
     );
     let corrected_max_eval_error =
         corrected_max_eval_error_for_active_levels(&max_eval_error, active_levels);
-    debug!(
-        "sim_max_eval_error_bits={} corrected_max_eval_error_bits={}",
-        bigdecimal_bits_ceil(&max_eval_error),
-        bigdecimal_bits_ceil(&corrected_max_eval_error)
-    );
     let ring_gsw_q = ring_gsw_q_modulus(ctx.as_ref());
     let ring_gsw_threshold = &ring_gsw_q / BigUint::from(2u64);
     let ring_gsw_threshold_bd = BigDecimal::from_biguint(ring_gsw_threshold.clone(), 0);
@@ -367,14 +396,12 @@ fn probe_crt_depth_for_goldreich_ring_gsw_bench(
             })
             .collect::<Vec<_>>(),
     );
-    debug!("max_decryption_error_bits={}", bigdecimal_bits_ceil(&max_decryption_error));
     let eval_ok = corrected_max_eval_error < threshold_bd;
     let decryption_ok = max_decryption_error < ring_gsw_threshold_bd;
-
     let non_free_depth = circuit.non_free_depth();
     let non_free_depth_contributions = circuit.non_free_depth_contributions();
     info!(
-        "crt_depth={} active_levels={} error_sim_active_levels={} active_q_bits={} full_q_bits={} ring_gsw_q_bits={} non_free_depth={} non_free_depth_contributions={:?} num_inputs={} output_polys={} sim_max_eval_error_bits={} max_eval_error_bits={} eval_threshold_bits={} max_decryption_error_bits={} decryption_threshold_bits={} eval_ok={} decryption_ok={}",
+        "ring_gsw_mul crt_depth={} active_levels={} error_sim_active_levels={} active_q_bits={} full_q_bits={} ring_gsw_q_bits={} non_free_depth={} non_free_depth_contributions={:?} num_inputs={} output_polys={} sim_max_eval_error_bits={} max_eval_error_bits={} eval_threshold_bits={} max_decryption_error_bits={} decryption_threshold_bits={} eval_ok={} decryption_ok={}",
         crt_depth,
         active_levels,
         ERROR_SIM_ACTIVE_LEVELS,
@@ -397,52 +424,7 @@ fn probe_crt_depth_for_goldreich_ring_gsw_bench(
     CrtDepthProbe { params, eval_ok }
 }
 
-fn build_goldreich_ring_gsw_circuit<P: Poly + 'static>(
-    params: &P::Params,
-    cfg: &GoldreichRingGswBenchConfig,
-    active_levels: usize,
-) -> (PolyCircuit<P>, Arc<RingGswContext<P>>, Vec<RingGswCiphertext<P>>) {
-    let build_start = Instant::now();
-    let mut circuit = PolyCircuit::<P>::new();
-    let montgomery =
-        Arc::new(MontgomeryPolyContext::setup(&mut circuit, params, cfg.limb_bits, false));
-    let ctx = Arc::new(RingGswContext::from_arith_context(
-        &mut circuit,
-        params,
-        cfg.num_slots(),
-        montgomery,
-        Some(active_levels),
-        None,
-    ));
-    let goldreich = GoldreichFhePrg::setup(
-        &mut circuit,
-        ctx.clone(),
-        cfg.input_size,
-        cfg.output_size,
-        DEFAULT_GRAPH_SEED,
-    );
-    let encrypted_inputs = (0..goldreich.input_size)
-        .map(|_| RingGswCiphertext::input(ctx.clone(), None, &mut circuit))
-        .collect::<Vec<_>>();
-    let encrypted_outputs = goldreich.evaluate_uniform(&encrypted_inputs, &mut circuit);
-    let reconstructed_outputs = encrypted_outputs
-        .iter()
-        .flat_map(|ciphertext| ciphertext.reconstruct(&mut circuit))
-        .collect::<Vec<_>>();
-    circuit.output(reconstructed_outputs);
-    info!(
-        "goldreich ring_gsw circuit build elapsed_ms={:.3} input_size={} output_size={} encrypted_outputs={}",
-        build_start.elapsed().as_secs_f64() * 1000.0,
-        cfg.input_size,
-        cfg.output_size,
-        encrypted_outputs.len()
-    );
-    (circuit, ctx, encrypted_outputs)
-}
-
-fn find_crt_depth_for_goldreich_ring_gsw_bench(
-    cfg: &GoldreichRingGswBenchConfig,
-) -> (usize, DCRTPolyParams) {
+fn find_crt_depth_for_ring_gsw_mul_bench(cfg: &RingGswMulBenchConfig) -> (usize, DCRTPolyParams) {
     let ring_dim_sqrt = BigDecimal::from_u32(cfg.ring_dim).unwrap().sqrt().unwrap();
     let base = BigDecimal::from_biguint(BigUint::from(1u32) << cfg.base_bits, 0);
     let error_sigma = BigDecimal::from_f64(cfg.error_sigma).expect("valid error sigma");
@@ -459,16 +441,17 @@ fn find_crt_depth_for_goldreich_ring_gsw_bench(
         return (requested_crt_depth, params);
     }
 
-    let min_crt_depth = env_or_parse_usize("LWE_GOLDREICH_RING_GSW_BENCH_MIN_CRT_DEPTH", 1usize);
+    let min_crt_depth =
+        env_or_parse_usize("LWE_NESTED_RNS_RING_GSW_MUL_BENCH_MIN_CRT_DEPTH", 1usize);
     assert!(
         min_crt_depth <= cfg.max_crt_depth,
-        "LWE_GOLDREICH_RING_GSW_BENCH_MIN_CRT_DEPTH must be <= LWE_GOLDREICH_RING_GSW_BENCH_MAX_CRT_DEPTH"
+        "LWE_NESTED_RNS_RING_GSW_MUL_BENCH_MIN_CRT_DEPTH must be <= LWE_NESTED_RNS_RING_GSW_MUL_BENCH_MAX_CRT_DEPTH"
     );
     let mut low = min_crt_depth;
     let mut high = cfg.max_crt_depth;
     while low < high {
         let mid = low + (high - low) / 2;
-        let probe = probe_crt_depth_for_goldreich_ring_gsw_bench(
+        let probe = probe_crt_depth_for_ring_gsw_mul_bench(
             cfg,
             mid,
             &ring_dim_sqrt,
@@ -483,7 +466,7 @@ fn find_crt_depth_for_goldreich_ring_gsw_bench(
         }
     }
 
-    let probe = probe_crt_depth_for_goldreich_ring_gsw_bench(
+    let probe = probe_crt_depth_for_ring_gsw_mul_bench(
         cfg,
         low,
         &ring_dim_sqrt,
@@ -492,12 +475,12 @@ fn find_crt_depth_for_goldreich_ring_gsw_bench(
         &e_init_norm,
     );
     if probe.search_ok() {
-        info!("selected crt_depth={} for Goldreich Ring-GSW benchmark search", low);
+        info!("selected crt_depth={} for nested-RNS Ring-GSW multiplication benchmark search", low);
         return (low, probe.params);
     }
 
     panic!(
-        "crt_depth satisfying the LWE error threshold was not found up to LWE_GOLDREICH_RING_GSW_BENCH_MAX_CRT_DEPTH ({})",
+        "crt_depth satisfying the LWE error threshold was not found up to LWE_NESTED_RNS_RING_GSW_MUL_BENCH_MAX_CRT_DEPTH ({})",
         cfg.max_crt_depth
     );
 }
@@ -578,14 +561,14 @@ fn verify_naive_encoding_outputs(
 }
 
 #[tokio::test]
-async fn test_gpu_lwe_montgomery_goldreich_ring_gsw_bench() {
+async fn test_gpu_lwe_nested_rns_ring_gsw_mul_bench() {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
     gpu_device_sync();
 
-    let cfg = GoldreichRingGswBenchConfig::from_env();
-    info!("goldreich ring_gsw bench config: {:?}", cfg);
+    let cfg = RingGswMulBenchConfig::from_env();
+    info!("nested-RNS ring_gsw mul bench config: {:?}", cfg);
 
-    let (crt_depth, cpu_params) = find_crt_depth_for_goldreich_ring_gsw_bench(&cfg);
+    let (crt_depth, cpu_params) = find_crt_depth_for_ring_gsw_mul_bench(&cfg);
     let (moduli, _, _) = cpu_params.to_crt();
     let detected_gpu_ids = detected_gpu_device_ids();
     let detected_gpu_count = detected_gpu_device_count();
@@ -595,7 +578,7 @@ async fn test_gpu_lwe_montgomery_goldreich_ring_gsw_bench() {
         "detected GPU count and ids length must match"
     );
     let single_gpu_id = *detected_gpu_ids.first().expect(
-        "at least one GPU device is required for test_gpu_lwe_montgomery_goldreich_ring_gsw_bench",
+        "at least one GPU device is required for test_gpu_lwe_nested_rns_ring_gsw_mul_bench",
     );
     let params = GpuDCRTPolyParams::new_with_gpu(
         cpu_params.ring_dimension(),
@@ -610,7 +593,7 @@ async fn test_gpu_lwe_montgomery_goldreich_ring_gsw_bench() {
     let active_levels = cfg.active_levels_for_crt_depth(actual_crt_depth);
     let (active_q_moduli, active_q, _) = active_q_moduli_and_modulus(&params, active_levels);
     let (circuit, ctx, encrypted_outputs) =
-        build_goldreich_ring_gsw_circuit::<GpuDCRTPoly>(&params, &cfg, active_levels);
+        build_ring_gsw_mul_circuit::<GpuDCRTPoly>(&params, &cfg, active_levels);
     let max_selected_decryption_error = max_bigdecimal(
         encrypted_outputs
             .iter()
@@ -626,27 +609,25 @@ async fn test_gpu_lwe_montgomery_goldreich_ring_gsw_bench() {
     let total_slot_transfer_gates =
         gate_counts.get(&PolyGateKind::SlotTransfer).copied().unwrap_or(0);
     info!(
-        "forcing single GPU for benchmark path: eval_gpu_id={} detected_gpu_count={} detected_gpu_ids={:?}",
+        "forcing single GPU for ring_gsw mul benchmark path: eval_gpu_id={} detected_gpu_count={} detected_gpu_ids={:?}",
         single_gpu_id, detected_gpu_count, detected_gpu_ids
     );
     info!(
-        "selected crt_depth={} actual_crt_depth={} ring_dim={} num_slots={} input_size={} output_size={} active_levels={} crt_bits={} limb_bits={} base_bits={} q_moduli={:?}",
+        "ring_gsw_mul selected crt_depth={} actual_crt_depth={} ring_dim={} num_slots={} active_levels={} crt_bits={} p_moduli_bits={} base_bits={} q_moduli={:?}",
         crt_depth,
         actual_crt_depth,
         params.ring_dimension(),
         cfg.num_slots(),
-        cfg.input_size,
-        cfg.output_size,
         active_levels,
         cfg.crt_bits,
-        cfg.limb_bits,
+        cfg.p_moduli_bits,
         cfg.base_bits,
         all_q_moduli
     );
     let non_free_depth = circuit.non_free_depth();
     let non_free_depth_contributions = circuit.non_free_depth_contributions();
     info!(
-        "circuit non_free_depth={} non_free_depth_contributions={:?} gate_counts={:?} num_inputs={} encrypted_outputs={} reconstructed_output_polys={}",
+        "ring_gsw_mul circuit non_free_depth={} non_free_depth_contributions={:?} gate_counts={:?} num_inputs={} encrypted_outputs={} reconstructed_output_polys={}",
         non_free_depth,
         non_free_depth_contributions,
         gate_counts,
@@ -655,13 +636,15 @@ async fn test_gpu_lwe_montgomery_goldreich_ring_gsw_bench() {
         encrypted_outputs.len() * 2 * ctx.width()
     );
     info!(
-        "active_q_bits={} active_q_moduli_len={} ring_gsw_q_bits={} selected_max_decryption_error_bits={}",
+        "ring_gsw_mul active_q_bits={} active_q_moduli_len={} ring_gsw_q_bits={} selected_max_decryption_error_bits={}",
         active_q.bits(),
         active_q_moduli.len(),
         ring_gsw_q.bits(),
         bigdecimal_bits_ceil(&max_selected_decryption_error)
     );
-    let pubkey_bench_dir = cfg.pubkey_bench_dir(crt_depth);
+
+    let mul_bench_dir = Path::new(&cfg.bench_dir_base(crt_depth)).join("ring_gsw_mul");
+    let pubkey_bench_dir = mul_bench_dir.join("pubkey");
     ensure_dir_exists(&pubkey_bench_dir);
     init_storage_system(pubkey_bench_dir.clone());
     let pubkey_bench_plt_evaluator = build_lwe_pubkey_vec_plt_evaluator(
@@ -687,7 +670,7 @@ async fn test_gpu_lwe_montgomery_goldreich_ring_gsw_bench() {
             GpuMatrix,
         >>::sample_aux_matrices_gate_time(&pubkey_bench_slot_evaluator, &params);
     info!(
-        "naive pubkey vec sample_aux estimates: public_lut={:?} slot_transfer_slot_time={:?} slot_transfer_gate_time={:?} slot_transfer_gates={}",
+        "ring_gsw_mul naive pubkey vec sample_aux estimates: public_lut={:?} slot_transfer_slot_time={:?} slot_transfer_gate_time={:?} slot_transfer_gates={}",
         pubkey_public_lut_aux_estimate,
         pubkey_slot_transfer_aux_slot_time,
         pubkey_slot_transfer_aux_gate_time,
@@ -701,7 +684,7 @@ async fn test_gpu_lwe_montgomery_goldreich_ring_gsw_bench() {
         NaiveBGGVecBenchEstimator::new(encoding_scalar_bench, cfg.num_slots());
     let poly_circuit_bench = encoding_vec_bench_estimator.estimate_circuit_bench(&circuit);
     info!(
-        "naive bgg encoding vec circuit bench estimate: total_time={:.6} latency={:.6} max_parallelism={} peak_vram={}",
+        "ring_gsw_mul naive bgg encoding vec circuit bench estimate: total_time={:.6} latency={:.6} max_parallelism={} peak_vram={}",
         poly_circuit_bench.total_time,
         poly_circuit_bench.latency,
         poly_circuit_bench.max_parallelism,
@@ -714,40 +697,45 @@ async fn test_gpu_lwe_montgomery_goldreich_ring_gsw_bench() {
     gpu_device_sync();
 
     if cfg.ring_dim <= (1 << 10) {
-        let eval_dir = Path::new(&cfg.bench_dir_base(crt_depth)).join("actual_naive_vec");
+        let eval_dir = mul_bench_dir.join("actual_naive_vec");
         if eval_dir.exists() {
             fs::remove_dir_all(&eval_dir).expect("failed to clear actual naive vector eval dir");
         }
         fs::create_dir_all(&eval_dir).expect("failed to create actual naive vector eval dir");
         init_storage_system(eval_dir.clone());
 
-        let plaintext_bits =
-            (0..cfg.input_size).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
-        let ring_gsw_secret_key = sample_montgomery_secret_key(&params);
-        let ring_gsw_public_key = sample_montgomery_public_key(
-            &params,
+        let secret_key = sample_secret_key(&cpu_params);
+        let public_key = sample_public_key(
+            &cpu_params,
             ctx.width(),
-            &ring_gsw_secret_key,
+            &secret_key,
             DEFAULT_BENCH_SEED,
-            b"LWE_MONTGOMERY_GOLDREICH_RING_GSW_ACTUAL_RING_GSW_PK",
+            b"lwe_nested_ring_gsw_mul_public_key",
             Some(cfg.error_sigma),
         );
-        let plaintext_inputs = plaintext_bits
-            .iter()
-            .flat_map(|bit| {
-                let native = encrypt_montgomery_plaintext_bit(
-                    &params,
-                    ctx.as_ref(),
-                    &ring_gsw_public_key,
-                    *bit,
-                );
-                montgomery_ciphertext_inputs_from_native(&params, ctx.as_ref(), &native)
-            })
-            .collect::<Vec<_>>();
+        let lhs_bit = rand::random::<bool>();
+        let rhs_bit = rand::random::<bool>();
+        let plaintext_inputs = [
+            ciphertext_inputs_from_native::<GpuDCRTPoly>(
+                &params,
+                ctx.nested_rns.as_ref(),
+                &encrypt_plaintext_bit(&cpu_params, ctx.nested_rns.as_ref(), &public_key, lhs_bit),
+                ctx.level_offset,
+                Some(ctx.active_levels),
+            ),
+            ciphertext_inputs_from_native::<GpuDCRTPoly>(
+                &params,
+                ctx.nested_rns.as_ref(),
+                &encrypt_plaintext_bit(&cpu_params, ctx.nested_rns.as_ref(), &public_key, rhs_bit),
+                ctx.level_offset,
+                Some(ctx.active_levels),
+            ),
+        ]
+        .concat();
         assert_eq!(
             plaintext_inputs.len(),
             circuit.num_input(),
-            "small-ring plaintext input count must match the Goldreich Ring-GSW circuit input count"
+            "small-ring plaintext input count must match the Ring-GSW multiplication circuit input count"
         );
 
         let poly_vec_plt_evaluator = PolyVecPltEvaluator { plt_evaluator: PolyPltEvaluator::new() };
@@ -769,7 +757,7 @@ async fn test_gpu_lwe_montgomery_goldreich_ring_gsw_bench() {
         let reveal_plaintexts = vec![true; circuit.num_input()];
         let pubkeys = pubkey_sampler.sample(
             &params,
-            b"LWE_MONTGOMERY_GOLDREICH_RING_GSW_ACTUAL_PUBKEY",
+            b"LWE_NESTED_RNS_RING_GSW_MUL_ACTUAL_PUBKEY",
             &reveal_plaintexts,
         );
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();

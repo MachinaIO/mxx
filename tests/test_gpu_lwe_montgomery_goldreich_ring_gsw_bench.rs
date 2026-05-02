@@ -1,8 +1,5 @@
 #![cfg(feature = "gpu")]
 
-#[path = "common/ring_gsw_montgomery_gpu.rs"]
-mod ring_gsw_montgomery;
-
 use bigdecimal::{BigDecimal, FromPrimitive};
 use keccak_asm::Keccak256;
 use mxx::{
@@ -17,8 +14,15 @@ use mxx::{
     circuit::{PolyCircuit, PolyGateKind, evaluable::PolyVec},
     gadgets::{
         arith::{MontgomeryPoly, MontgomeryPolyContext},
-        fhe::ring_gsw::{
-            RingGswCiphertext as GenericRingGswCiphertext, RingGswContext as GenericRingGswContext,
+        fhe::{
+            ring_gsw::{
+                RingGswCiphertext as GenericRingGswCiphertext,
+                RingGswContext as GenericRingGswContext,
+            },
+            ring_gsw_montgomery_gpu::{
+                encrypt_montgomery_plaintext_bit, montgomery_ciphertext_inputs_from_native,
+                sample_montgomery_public_key, sample_montgomery_secret_key,
+            },
         },
         fhe_prg::goldreich::GoldreichFhePrg,
     },
@@ -57,9 +61,6 @@ use mxx::{
 };
 use num_bigint::BigUint;
 use rayon::prelude::*;
-use ring_gsw_montgomery::{
-    montgomery_ciphertext_inputs_from_native, montgomery_ring_gsw_plaintext_ciphertext,
-};
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -722,13 +723,23 @@ async fn test_gpu_lwe_montgomery_goldreich_ring_gsw_bench() {
 
         let plaintext_bits =
             (0..cfg.input_size).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
+        let ring_gsw_secret_key = sample_montgomery_secret_key(&params);
+        let ring_gsw_public_key = sample_montgomery_public_key(
+            &params,
+            ctx.width(),
+            &ring_gsw_secret_key,
+            DEFAULT_BENCH_SEED,
+            b"LWE_MONTGOMERY_GOLDREICH_RING_GSW_ACTUAL_RING_GSW_PK",
+            Some(cfg.error_sigma),
+        );
         let plaintext_inputs = plaintext_bits
             .iter()
             .flat_map(|bit| {
-                let native = montgomery_ring_gsw_plaintext_ciphertext(
+                let native = encrypt_montgomery_plaintext_bit(
                     &params,
                     ctx.as_ref(),
-                    if *bit { 1 } else { 0 },
+                    &ring_gsw_public_key,
+                    *bit,
                 );
                 montgomery_ciphertext_inputs_from_native(&params, ctx.as_ref(), &native)
             })

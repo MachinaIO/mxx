@@ -16,10 +16,14 @@ use tracing::debug;
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Error-growth summary for Diamond input insertion.
 ///
-/// The simulator exposes only the final input and decoder output bounds. The
-/// intermediate selector, preimage, and state values are emitted with
-/// `tracing::debug!` while the recurrence runs.
+/// The simulator exposes the final one, k-input, bit-input, and decoder output
+/// bounds. The intermediate selector, preimage, and state values are emitted
+/// with `tracing::debug!` while the recurrence runs.
 pub struct DiamondInputErrorSimulation {
+    /// Final propagated error for the one-output encoding.
+    pub one_error: PolyMatrixNorm,
+    /// Final propagated error for the additional k-output encoding.
+    pub k_error: PolyMatrixNorm,
     /// Final propagated error for each input-digit output.
     pub input_errors: Vec<PolyMatrixNorm>,
     /// Final propagated error for each decoder output.
@@ -35,16 +39,12 @@ where
 {
     /// Simulate how the original Gaussian error in `p_{epsilon,0}` and the
     /// injected Gaussian target errors in `K_{i,b,j}` contribute to the final
-    /// input and decoder outputs. The final `one` bound is logged at debug
-    /// level instead of being returned.
+    /// one, k-input, bit-input, and decoder outputs.
     pub fn simulate_output_error_bounds(&self) -> DiamondInputErrorSimulation {
         let ring_dim_sqrt = BigDecimal::from(self.params.ring_dimension() as u64)
             .sqrt()
             .expect("sqrt(ring_dimension) failed");
         let base = BigDecimal::from(BigInt::from(BigUint::from(1u64) << self.params.base_bits()));
-        // The shared simulator context tracks the two-row BGG+ output secret.
-        // Branch states are four-row tensor states, so concrete state
-        // dimensions stay explicit below.
         let ctx = Arc::new(SimulatorContext::new(
             ring_dim_sqrt,
             base,
@@ -82,6 +82,13 @@ where
             BigDecimal::from(1u64),
             None,
         );
+        let base_selector = PolyMatrixNorm::new(
+            ctx.clone(),
+            self.state_row_size(),
+            self.state_row_size(),
+            BigDecimal::from(1u64),
+            None,
+        );
         let special_selector = PolyMatrixNorm::new(
             ctx.clone(),
             self.state_row_size(),
@@ -95,6 +102,7 @@ where
             ?output_preimage,
             ?transition_target_error,
             ?regular_selector,
+            ?base_selector,
             ?special_selector,
             "diamond input-insertion simulator parameters",
         );
@@ -111,7 +119,11 @@ where
         for level in 1..=self.input_count {
             let mut next_secret_factors = secret_state_factors
                 .iter()
-                .map(|secret_factor| secret_factor.clone() * &regular_selector)
+                .enumerate()
+                .map(|(state_idx, secret_factor)| {
+                    let selector = if state_idx == 0 { &base_selector } else { &regular_selector };
+                    secret_factor.clone() * selector
+                })
                 .collect::<Vec<_>>();
             let mut next_state_errors = secret_state_factors
                 .iter()
@@ -139,17 +151,19 @@ where
         }
 
         let one_error = state_errors[0].clone() * &output_preimage;
+        let k_error = state_errors[0].clone() * &output_preimage;
         let input_errors = (0..self.input_bit_count())
             .map(|bit_idx| state_errors[bit_idx + 1].clone() * &output_preimage)
             .collect::<Vec<_>>();
         let decoder_errors = vec![one_error.clone(); self.decoder_count];
         debug!(
             ?one_error,
+            ?k_error,
             ?input_errors,
             ?decoder_errors,
             "diamond input-insertion simulator final output bounds",
         );
 
-        DiamondInputErrorSimulation { input_errors, decoder_errors }
+        DiamondInputErrorSimulation { one_error, k_error, input_errors, decoder_errors }
     }
 }

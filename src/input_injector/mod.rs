@@ -18,12 +18,12 @@ mod simulation;
 pub use simulation::DiamondInputErrorSimulation;
 
 const DIAMOND_PREFIX_SIZE: usize = 2;
-const DIAMOND_SECRET_SIZE: usize = 2;
+const DIAMOND_SECRET_SIZE: usize = 1;
 
-pub trait InputInjector<K, E> {
+pub trait InputInjector<K, E, P> {
     /// Precompute and persist the auxiliary matrices needed to inject one
     /// constant value, every input bit position, and every decoder output.
-    fn preprocess(&self, one: &K, input_digits: &[K], decoders: &[K]);
+    fn preprocess(&self, one: &K, input_digits: &[K], decoders: &[K], k: &P);
     /// Rebuild the final injected encodings for one, the chosen input bits,
     /// and the decoder outputs from the persisted preprocessing artifacts.
     fn online_eval(
@@ -32,7 +32,7 @@ pub trait InputInjector<K, E> {
         one: &K,
         input_digit_pubkeys: &[K],
         decoders: &[K],
-    ) -> (E, Vec<E>, Vec<E>);
+    ) -> (E, E, Vec<E>, Vec<E>);
 }
 
 #[derive(Debug, Clone)]
@@ -214,49 +214,53 @@ where
     }
 
     fn secret_epsilon_id(&self) -> &'static str {
-        "diamond_secret_epsilon_tensor_v2"
+        "diamond_secret_epsilon_tensor"
     }
 
     fn digit_secret_id(&self, level: usize, digit_value: usize) -> String {
-        format!("diamond_secret_tensor_v2_{level}_{digit_value}")
+        format!("diamond_secret_tensor_{level}_{digit_value}")
     }
 
     fn b_matrix_id(&self, level: usize) -> String {
-        format!("diamond_b_tensor_v2_{level}")
+        format!("diamond_b_tensor_{level}")
     }
 
     fn b_trapdoor_id(&self, level: usize) -> String {
-        format!("diamond_b_tensor_v2_{level}_trapdoor")
+        format!("diamond_b_tensor_{level}_trapdoor")
     }
 
     fn p_epsilon_id(&self) -> &'static str {
-        "diamond_p_epsilon_tensor_v2_0"
+        "diamond_p_epsilon_tensor_0"
+    }
+
+    fn k_plaintext_id(&self) -> &'static str {
+        "diamond_k_plaintext"
     }
 
     fn k_id(&self, level: usize, digit_value: usize, state_idx: usize) -> String {
-        format!("diamond_k_bit_tensor_v2_{level}_{digit_value}_{state_idx}")
+        format!("diamond_k_bit_tensor_{level}_{digit_value}_{state_idx}")
     }
 
     fn l_id(&self, input_idx: usize) -> String {
-        format!("diamond_l_bit_tensor_v2_{input_idx}")
+        format!("diamond_l_bit_tensor_{input_idx}")
+    }
+
+    fn n_id(&self) -> &'static str {
+        "diamond_n_k_tensor"
     }
 
     fn m_id(&self, decoder_idx: usize) -> String {
-        format!("diamond_m_tensor_v2_{decoder_idx}")
+        format!("diamond_m_tensor_{decoder_idx}")
     }
 
     fn sample_secret_epsilon_with_params(&self, params: &<M::P as Poly>::Params) -> M {
         let s = US::new().sample_uniform(params, 1, 1, DistType::TernaryDist).entry(0, 0);
-        M::from_poly_vec_row(params, vec![s, M::P::const_minus_one(params)])
+        M::from_poly_vec_row(params, vec![s])
     }
 
     fn sample_digit_secret_mask_with_params(&self, params: &<M::P as Poly>::Params) -> M {
         let s_prime = US::new().sample_uniform(params, 1, 1, DistType::TernaryDist).entry(0, 0);
-        let zero = M::P::const_zero(params);
-        M::from_poly_vec(
-            params,
-            vec![vec![s_prime, zero.clone()], vec![zero, M::P::const_one(params)]],
-        )
+        M::from_poly_vec_row(params, vec![s_prime])
     }
 
     fn sample_error_matrix_with_dims(
@@ -552,6 +556,18 @@ where
         top.concat_rows(&[&bottom])
     }
 
+    fn k_transition_selector_with_params(
+        &self,
+        params: &<M::P as Poly>::Params,
+        secret_mask: &M,
+    ) -> M {
+        let zero = M::P::const_zero(params);
+        M::from_poly_vec(
+            params,
+            vec![vec![secret_mask.entry(0, 0), zero.clone()], vec![zero, M::P::const_one(params)]],
+        )
+    }
+
     fn special_transition_selector_with_params(
         &self,
         params: &<M::P as Poly>::Params,
@@ -559,9 +575,8 @@ where
         secret_mask: &M,
     ) -> M {
         let bit = M::P::from_usize_to_constant(params, bit_value);
-        // Newly born bit branches use H_x tensor diag(s', 1): the empty
-        // prefix (1, 0) becomes (1, x), while the two-component secret becomes
-        // (s * s', -1).
+        // Newly born bit branches use H_x tensor s': the empty prefix
+        // component becomes (s', x * s') while the lower row remains zero.
         let zero_block = M::zero(params, DIAMOND_SECRET_SIZE, DIAMOND_SECRET_SIZE);
         let bit_mask = secret_mask.clone() * &bit;
         let top = secret_mask.concat_columns(&[&bit_mask]);
@@ -569,15 +584,11 @@ where
         top.concat_rows(&[&bottom])
     }
 
-    fn initial_selector_with_params(&self, params: &<M::P as Poly>::Params, secret_mask: &M) -> M {
-        let zero_block = M::zero(params, 1, DIAMOND_SECRET_SIZE);
-        secret_mask.concat_columns(&[&zero_block])
-    }
-
-    fn build_initial_encoding(&self, b0_matrix: &M, secret_epsilon: &M) -> M {
+    fn build_initial_encoding(&self, b0_matrix: &M, secret_epsilon: &M, k: &M::P) -> M {
         // Build the state that represents the empty input prefix. It is the
         // only online-evaluation seed that exists before any digit is chosen.
-        let selector = self.initial_selector_with_params(&self.params, secret_epsilon);
+        let selector =
+            M::from_poly_vec_row(&self.params, vec![secret_epsilon.entry(0, 0), k.clone()]);
         let w00 = self.sample_w_block_with_params(&self.params, 0, 0);
         let mut p_epsilon = selector * b0_matrix.concat_columns(&[&w00]);
         p_epsilon.add_in_place(&self.sample_error_matrix_with_dims(
@@ -607,6 +618,8 @@ where
         let selector = if let Some(bit_idx) = self.new_bit_idx_for_state(level, state_idx) {
             let bit_value = self.digit_bit_value(digit_value, bit_idx);
             self.special_transition_selector_with_params(params, bit_value, secret_mask)
+        } else if state_idx == 0 {
+            self.k_transition_selector_with_params(params, secret_mask)
         } else {
             self.transition_selector_with_params(params, secret_mask)
         };
@@ -618,6 +631,18 @@ where
             col_len,
         ));
         target
+    }
+
+    fn sample_k_pubkey_with_params(&self, params: &<M::P as Poly>::Params) -> BggPublicKey<M> {
+        let matrix = HS::new().sample_hash(
+            params,
+            self.hash_key,
+            "diamond_a_k_public_key",
+            DIAMOND_SECRET_SIZE,
+            self.gadget_col_size(params),
+            DistType::FinRingDist,
+        );
+        BggPublicKey::new(matrix, true)
     }
 
     fn build_one_target_chunk_with_params(
@@ -653,6 +678,21 @@ where
         let pubkey_chunk = pubkey.matrix.slice_columns(col_start, col_end);
         let gadget_chunk = gadget.slice_columns(col_start, col_end);
         let neg_gadget_chunk = -gadget_chunk;
+        pubkey_chunk.concat_rows(&[&neg_gadget_chunk])
+    }
+
+    fn build_k_output_target_chunk_with_params(
+        &self,
+        params: &<M::P as Poly>::Params,
+        pubkey: &BggPublicKey<M>,
+        gadget: &M,
+        chunk_idx: usize,
+    ) -> M {
+        let total_cols = self.gadget_col_size(params);
+        let (col_start, col_len) = column_chunk_bounds(total_cols, chunk_idx);
+        let col_end = col_start + col_len;
+        let pubkey_chunk = pubkey.matrix.slice_columns(col_start, col_end);
+        let neg_gadget_chunk = -gadget.slice_columns(col_start, col_end);
         pubkey_chunk.concat_rows(&[&neg_gadget_chunk])
     }
 
@@ -698,7 +738,7 @@ where
     }
 }
 
-impl<M, US, HS, TS> InputInjector<BggPublicKey<M>, BggEncoding<M>>
+impl<M, US, HS, TS> InputInjector<BggPublicKey<M>, BggEncoding<M>, M::P>
     for DiamondInjector<M, US, HS, TS>
 where
     M: PolyMatrix,
@@ -711,10 +751,11 @@ where
         one: &BggPublicKey<M>,
         input_digits: &[BggPublicKey<M>],
         decoders: &[BggPublicKey<M>],
+        k: &M::P,
     ) {
         #[cfg(feature = "gpu")]
         {
-            self.preprocess_gpu(one, input_digits, decoders);
+            self.preprocess_gpu(one, input_digits, decoders, k);
             return;
         }
 
@@ -727,6 +768,7 @@ where
                 base: self.base,
                 decoder_count: self.decoder_count,
             });
+            self.write_bytes(self.k_plaintext_id(), &k.to_compact_bytes());
 
             let trap_sampler = TS::new(&self.params, self.trapdoor_sigma);
             let gadget = M::gadget_matrix(&self.params, DIAMOND_SECRET_SIZE);
@@ -746,7 +788,7 @@ where
             if !self.matrix_exists(self.p_epsilon_id()) {
                 self.write_matrix(
                     self.p_epsilon_id(),
-                    &self.build_initial_encoding(&b_checkpoints[0], &secret_epsilon),
+                    &self.build_initial_encoding(&b_checkpoints[0], &secret_epsilon, k),
                 );
             }
 
@@ -841,6 +883,32 @@ where
                 }
             }
 
+            let k_pubkey = self.sample_k_pubkey_with_params(&self.params);
+            let n_id = self.n_id();
+            if !self.has_all_chunks(n_id, output_cols) {
+                let ext_matrix = self.sample_w_block_with_params(&self.params, 0, self.input_count);
+                for chunk_idx in 0..column_chunk_count(output_cols) {
+                    let chunk_id = self.chunk_id(n_id, chunk_idx);
+                    if self.matrix_exists(&chunk_id) {
+                        continue;
+                    }
+                    let target_chunk = self.build_k_output_target_chunk_with_params(
+                        &self.params,
+                        &k_pubkey,
+                        &gadget,
+                        chunk_idx,
+                    );
+                    let n_chunk = trap_sampler.preimage_extend(
+                        &self.params,
+                        &trapdoors[self.input_count],
+                        &b_checkpoints[self.input_count],
+                        &ext_matrix,
+                        &target_chunk,
+                    );
+                    self.write_matrix(&chunk_id, &n_chunk);
+                }
+            }
+
             // Sample the final projection matrices that turn the surviving base
             // branch into each decoder output.
             let ext_w0_final = self.sample_w_block_with_params(&self.params, 0, self.input_count);
@@ -878,7 +946,7 @@ where
         one: &BggPublicKey<M>,
         input_digit_pubkeys: &[BggPublicKey<M>],
         decoders: &[BggPublicKey<M>],
-    ) -> (BggEncoding<M>, Vec<BggEncoding<M>>, Vec<BggEncoding<M>>) {
+    ) -> (BggEncoding<M>, BggEncoding<M>, Vec<BggEncoding<M>>, Vec<BggEncoding<M>>) {
         #[cfg(feature = "gpu")]
         {
             return self.online_eval_gpu(input_digits, one, input_digit_pubkeys, decoders);
@@ -932,6 +1000,12 @@ where
                 Some(M::P::const_one(&self.params)),
             );
 
+            let k_pubkey = self.sample_k_pubkey_with_params(&self.params);
+            let k_plaintext =
+                M::P::from_compact_bytes(&self.params, &self.read_bytes(self.k_plaintext_id()));
+            let k_vector = self.left_mul_checkpointed_cpu(&states[0], self.n_id(), output_cols);
+            let k_output = self.build_output_encoding(k_vector, k_pubkey, Some(k_plaintext));
+
             // Turn each bit-specific branch into the encoding for that bit of
             // the chosen batched digit.
             let digit_outputs = (0..self.input_count)
@@ -974,7 +1048,7 @@ where
                 })
                 .collect::<Vec<_>>();
 
-            (one_output, digit_outputs, decoder_outputs)
+            (one_output, k_output, digit_outputs, decoder_outputs)
         }
     }
 }
@@ -1061,11 +1135,12 @@ mod tests {
                 sample_pubkey(&params, hash_key, &format!("diamond_decoder_pubkey_{decoder_idx}"))
             })
             .collect::<Vec<_>>();
+        let k = TestPoly::from_usize_to_constant(&params, 3);
 
-        injector.preprocess(&one_pubkey, &input_pubkeys, &decoder_pubkeys);
+        injector.preprocess(&one_pubkey, &input_pubkeys, &decoder_pubkeys, &k);
 
         let digits = vec![1u32, 3u32, 2u32];
-        let (one_output, digit_outputs, decoder_outputs) =
+        let (one_output, k_output, digit_outputs, decoder_outputs) =
             injector.online_eval(&digits, &one_pubkey, &input_pubkeys, &decoder_pubkeys);
 
         assert_eq!(digit_outputs.len(), input_count * batch_bits);
@@ -1073,14 +1148,10 @@ mod tests {
 
         let mut secret_matrix = injector.read_matrix(injector.secret_epsilon_id());
         assert_eq!(secret_matrix.size(), (1, DIAMOND_SECRET_SIZE));
-        assert_eq!(secret_matrix.entry(0, 1), TestPoly::const_minus_one(&params));
         for (digit_idx, digit_value) in digits.iter().copied().enumerate() {
             let secret_mask = injector
                 .read_matrix(&injector.digit_secret_id(digit_idx + 1, digit_value as usize));
             assert_eq!(secret_mask.size(), (DIAMOND_SECRET_SIZE, DIAMOND_SECRET_SIZE));
-            assert_eq!(secret_mask.entry(0, 1), TestPoly::const_zero(&params));
-            assert_eq!(secret_mask.entry(1, 0), TestPoly::const_zero(&params));
-            assert_eq!(secret_mask.entry(1, 1), TestPoly::const_one(&params));
             secret_matrix = secret_matrix * secret_mask;
         }
         let gadget = DCRTPolyMatrix::gadget_matrix(&params, DIAMOND_SECRET_SIZE);
@@ -1088,6 +1159,14 @@ mod tests {
 
         assert_eq!(one_output.vector, secret_matrix.clone() * (&one_pubkey.matrix - &gadget));
         assert_eq!(one_output.plaintext, Some(TestPoly::const_one(&params)));
+
+        let k_pubkey = injector.sample_k_pubkey_with_params(&params);
+        assert_eq!(
+            k_output.vector,
+            secret_matrix.clone() * &k_pubkey.matrix - (gadget.clone() * &k)
+        );
+        assert_eq!(k_output.pubkey.matrix, k_pubkey.matrix);
+        assert_eq!(k_output.plaintext, Some(k.clone()));
 
         for digit_idx in 0..input_count {
             for bit_idx in 0..batch_bits {
@@ -1169,6 +1248,13 @@ mod tests {
             BigDecimal::from(1u64),
             None,
         );
+        let expected_base_selector = PolyMatrixNorm::new(
+            ctx.clone(),
+            injector.state_row_size(),
+            injector.state_row_size(),
+            BigDecimal::from(1u64),
+            None,
+        );
         let expected_special_selector = PolyMatrixNorm::new(
             ctx.clone(),
             injector.state_row_size(),
@@ -1190,7 +1276,15 @@ mod tests {
             |prev_secret: &[PolyMatrixNorm], prev_state_errors: &[PolyMatrixNorm]| {
                 let mut next_secret = prev_secret
                     .iter()
-                    .map(|secret| secret.clone() * &expected_regular_selector)
+                    .enumerate()
+                    .map(|(state_idx, secret)| {
+                        let selector = if state_idx == 0 {
+                            &expected_base_selector
+                        } else {
+                            &expected_regular_selector
+                        };
+                        secret.clone() * selector
+                    })
                     .collect::<Vec<_>>();
                 let mut next_state_errors = prev_secret
                     .iter()
@@ -1225,8 +1319,11 @@ mod tests {
         assert_eq!(simulated.input_errors.len(), injector.input_bit_count());
         assert_eq!(simulated.input_errors, expected_inputs);
 
-        let expected_decoders =
-            vec![expected_state_errors[0].clone() * &expected_output; injector.decoder_count];
+        let expected_base_output = expected_state_errors[0].clone() * &expected_output;
+        assert_eq!(simulated.one_error, expected_base_output.clone());
+        assert_eq!(simulated.k_error, expected_base_output.clone());
+
+        let expected_decoders = vec![expected_base_output.clone(); injector.decoder_count];
         assert_eq!(simulated.decoder_errors, expected_decoders);
     }
 
@@ -1266,7 +1363,12 @@ mod tests {
             .map(|norm| norm.poly_norm.norm.clone())
             .max()
             .expect("decoder error list must be non-empty");
-        let max_error = std::cmp::max(max_input_error.clone(), max_decoder_error.clone());
+        let max_base_error =
+            std::cmp::max(simulated.one_error.poly_norm.norm, simulated.k_error.poly_norm.norm);
+        let max_error = std::cmp::max(
+            max_base_error.clone(),
+            std::cmp::max(max_input_error.clone(), max_decoder_error.clone()),
+        );
 
         println!(
             "diamond injector output-error metrics: ring_dim={ring_dim}, crt_depth={crt_depth}, crt_bits={crt_bits}, base_bits={base_bits}, digit_bits={digit_bits}, input_base={input_base}, input_count={input_count}, decoder_count={decoder_count}, output_secret_size={DIAMOND_SECRET_SIZE}, state_row_size={}",

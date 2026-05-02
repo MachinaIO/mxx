@@ -43,7 +43,7 @@ type TestInjector = DiamondInjector<
 >;
 
 const DIAMOND_INJECTOR_DECODER_COUNT: usize = 1;
-const DIAMOND_INJECTOR_SECRET_SIZE: usize = 2;
+const DIAMOND_INJECTOR_SECRET_SIZE: usize = 1;
 const DIAMOND_INJECTOR_TRAPDOOR_SIGMA: f64 = 4.578;
 const DIAMOND_INJECTOR_ERROR_SIGMA: f64 = 4.578;
 const DEFAULT_RING_DIM: u32 = 1u32 << 16;
@@ -129,7 +129,7 @@ fn sample_pubkey(
 }
 
 fn secret_checkpoint_id(level: usize, digit_value: usize) -> String {
-    format!("diamond_secret_tensor_v2_{level}_{digit_value}")
+    format!("diamond_secret_tensor_{level}_{digit_value}")
 }
 
 fn read_checkpoint_matrix(
@@ -150,7 +150,7 @@ fn reconstruct_secret_product(
     input_digits: &[u32],
 ) -> GpuDCRTPolyMatrix {
     let mut secret_product =
-        read_checkpoint_matrix(params, dir_path, "diamond_secret_epsilon_tensor_v2");
+        read_checkpoint_matrix(params, dir_path, "diamond_secret_epsilon_tensor");
     for (digit_idx, digit_value) in input_digits.iter().copied().enumerate() {
         let digit_secret = read_checkpoint_matrix(
             params,
@@ -277,6 +277,7 @@ fn verify_gpu_online_eval_errors_below_simulation(
             sample_pubkey(&params, hash_key, &format!("diamond_plot_decoder_pubkey_{decoder_idx}"))
         })
         .collect::<Vec<_>>();
+    let k = <GpuDCRTPolyMatrix as PolyMatrix>::P::from_usize_to_constant(&params, 3);
     let mut rng = rand::rng();
     let input_digits =
         (0..input_count).map(|_| rng.random_range(0..input_base) as u32).collect::<Vec<_>>();
@@ -287,7 +288,7 @@ fn verify_gpu_online_eval_errors_below_simulation(
         crossing_point.crt_depth, crossing_point.q_bits, input_count, digit_bits
     );
     let preprocess_started = Instant::now();
-    injector.preprocess(&one_pubkey, &input_pubkeys, &decoder_pubkeys);
+    injector.preprocess(&one_pubkey, &input_pubkeys, &decoder_pubkeys, &k);
     gpu_device_sync();
     info!(
         "diamond injector gpu preprocess: finished, elapsed_s={:.3}",
@@ -300,7 +301,7 @@ fn verify_gpu_online_eval_errors_below_simulation(
         crossing_point.crt_depth, crossing_point.q_bits
     );
     let online_started = Instant::now();
-    let (one_output, input_outputs, decoder_outputs) =
+    let (one_output, k_output, input_outputs, decoder_outputs) =
         injector.online_eval(&input_digits, &one_pubkey, &input_pubkeys, &decoder_pubkeys);
     gpu_device_sync();
     info!(
@@ -316,6 +317,16 @@ fn verify_gpu_online_eval_errors_below_simulation(
         &secret_product,
         &one_pubkey,
         <GpuDCRTPolyMatrix as PolyMatrix>::P::const_one(&params),
+        &crossing_point.max_error,
+    );
+    let k_pubkey = sample_pubkey(&params, hash_key, "diamond_a_k_public_key");
+    assert_encoding_residual_below_bound(
+        "k",
+        &params,
+        &k_output,
+        &secret_product,
+        &k_pubkey,
+        k,
         &crossing_point.max_error,
     );
     assert_eq!(input_outputs.len(), input_count * batch_bits);
@@ -724,13 +735,19 @@ fn test_gpu_diamond_injector_q_bits_vs_max_error_plot_generates_svg() {
             .map(|norm| norm.poly_norm.norm.clone())
             .max()
             .expect("decoder error list must be non-empty");
-        let max_error = std::cmp::max(max_input_error.clone(), max_decoder_error.clone());
+        let max_base_error =
+            std::cmp::max(simulated.one_error.poly_norm.norm, simulated.k_error.poly_norm.norm);
+        let max_error = std::cmp::max(
+            max_base_error.clone(),
+            std::cmp::max(max_input_error.clone(), max_decoder_error.clone()),
+        );
         let max_error_bits = bigdecimal_bits_ceil(&max_error);
         let q_bits =
             crt_bits.checked_mul(crt_depth).expect("q_bits overflow in DiamondInjector plot test");
 
         info!(
-            "diamond injector plot point: crt_depth={crt_depth}, q_bits={q_bits}, max_input_bits={}, max_decoder_bits={}, max_total_bits={}",
+            "diamond injector plot point: crt_depth={crt_depth}, q_bits={q_bits}, max_base_bits={}, max_input_bits={}, max_decoder_bits={}, max_total_bits={}",
+            bigdecimal_bits_ceil(&max_base_error),
             bigdecimal_bits_ceil(&max_input_error),
             bigdecimal_bits_ceil(&max_decoder_error),
             bigdecimal_bits_ceil(&max_error),

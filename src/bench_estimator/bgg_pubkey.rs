@@ -13,7 +13,8 @@ use num_traits::ToPrimitive;
 use tracing::debug;
 
 use super::{
-    BenchEstimator, CircuitBenchEstimate, benchmark_gate_operation, measure_bench_operation,
+    BenchEstimator, CircuitBenchEstimate, benchmark_gate_operation, column_parallel_gate_estimate,
+    measure_bench_operation,
 };
 
 pub(crate) fn per_gate_time_estimate(time: f64, peak_vram: usize) -> CircuitBenchEstimate {
@@ -166,10 +167,12 @@ where
     pub sub_peak_vram: usize,
     pub mul_time: f64,
     pub mul_peak_vram: usize,
+    pub mul_rhs_column_count: usize,
     pub small_scalar_mul_time: f64,
     pub small_scalar_mul_peak_vram: usize,
     pub large_scalar_mul_time: f64,
     pub large_scalar_mul_peak_vram: usize,
+    pub large_scalar_mul_rhs_column_count: usize,
     pub public_lut_time: f64,
     pub public_lut_peak_vram: usize,
     pub slot_transfer_time: f64,
@@ -205,6 +208,7 @@ where
         debug!("BggPublicKeyBenchEstimator::benchmark sub_bench={:?}", sub_bench);
         let mul_bench =
             benchmark_gate_operation(iterations, || samples.mul_lhs.clone() * samples.mul_rhs);
+        let mul_rhs_column_count = samples.mul_rhs.matrix.col_size();
         debug!("BggPublicKeyBenchEstimator::benchmark mul_bench={:?}", mul_bench);
         let small_scalar_mul_bench = benchmark_gate_operation(iterations, || {
             samples.small_scalar_input.small_scalar_mul(samples.params, samples.small_scalar)
@@ -216,6 +220,7 @@ where
         let large_scalar_mul_bench = benchmark_gate_operation(iterations, || {
             samples.large_scalar_input.large_scalar_mul(samples.params, samples.large_scalar)
         });
+        let large_scalar_mul_rhs_column_count = samples.large_scalar_input.matrix.col_size();
         debug!(
             "BggPublicKeyBenchEstimator::benchmark large_scalar_mul_bench={:?}",
             large_scalar_mul_bench
@@ -253,10 +258,12 @@ where
             sub_peak_vram: sub_bench.peak_vram,
             mul_time: mul_bench.time,
             mul_peak_vram: mul_bench.peak_vram,
+            mul_rhs_column_count,
             small_scalar_mul_time: small_scalar_mul_bench.time,
             small_scalar_mul_peak_vram: small_scalar_mul_bench.peak_vram,
             large_scalar_mul_time: large_scalar_mul_bench.time,
             large_scalar_mul_peak_vram: large_scalar_mul_bench.peak_vram,
+            large_scalar_mul_rhs_column_count,
             public_lut_time: public_lut_bench.time,
             public_lut_peak_vram: public_lut_bench.peak_vram,
             slot_transfer_time: slot_transfer_bench.time,
@@ -331,7 +338,7 @@ where
     }
 
     fn estimate_mul(&self) -> CircuitBenchEstimate {
-        per_gate_time_estimate(self.mul_time, self.mul_peak_vram)
+        column_parallel_gate_estimate(self.mul_time, self.mul_peak_vram, self.mul_rhs_column_count)
     }
 
     fn estimate_small_scalar_mul(&self, _scalar: &[u32]) -> CircuitBenchEstimate {
@@ -339,7 +346,11 @@ where
     }
 
     fn estimate_large_scalar_mul(&self, _scalar: &[num_bigint::BigUint]) -> CircuitBenchEstimate {
-        per_gate_time_estimate(self.large_scalar_mul_time, self.large_scalar_mul_peak_vram)
+        column_parallel_gate_estimate(
+            self.large_scalar_mul_time,
+            self.large_scalar_mul_peak_vram,
+            self.large_scalar_mul_rhs_column_count,
+        )
     }
 
     fn estimate_slot_transfer(&self, src_slots: &[(u32, Option<u32>)]) -> CircuitBenchEstimate {
@@ -515,10 +526,12 @@ mod tests {
             sub_peak_vram: 43,
             mul_time: 3.0,
             mul_peak_vram: 47,
+            mul_rhs_column_count: 3,
             small_scalar_mul_time: 4.0,
             small_scalar_mul_peak_vram: 53,
             large_scalar_mul_time: 5.0,
             large_scalar_mul_peak_vram: 59,
+            large_scalar_mul_rhs_column_count: 4,
             public_lut_time: 6.0,
             public_lut_peak_vram: 61,
             slot_transfer_time: 7.0,
@@ -576,8 +589,18 @@ mod tests {
         );
         assert_eq!(
             estimator.estimate_mul(),
-            CircuitBenchEstimate::new(estimator.mul_time, estimator.mul_time)
-                .with_peak_vram(estimator.mul_peak_vram)
+            CircuitBenchEstimate::new(estimator.mul_time, estimator.mul_time / 3.0)
+                .with_max_parallelism(3)
+                .with_peak_vram(estimator.mul_peak_vram.div_ceil(3))
+        );
+        assert_eq!(
+            estimator.estimate_large_scalar_mul(&[BigUint::from(7u32)]),
+            CircuitBenchEstimate::new(
+                estimator.large_scalar_mul_time,
+                estimator.large_scalar_mul_time / 4.0
+            )
+            .with_max_parallelism(4)
+            .with_peak_vram(estimator.large_scalar_mul_peak_vram.div_ceil(4))
         );
         assert!(estimator.public_lut_time >= 0.0);
         assert!(estimator.slot_transfer_time >= 0.0);

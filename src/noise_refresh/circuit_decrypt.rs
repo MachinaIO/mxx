@@ -10,6 +10,7 @@ use crate::{
     gadgets::{
         arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner},
         fhe::ring_gsw::{RingGswCiphertext, RingGswContext},
+        fhe_prg::goldreich::{decrypt_bit_decomposed_scalar_outputs, sum_gate_ids},
     },
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
@@ -17,12 +18,6 @@ use crate::{
 use num_bigint::BigUint;
 use num_traits::Zero;
 use std::sync::Arc;
-
-/// Adds a nonempty list of scalar wires with the circuit's ordinary addition gate.
-fn sum_gate_ids<P: Poly>(circuit: &mut PolyCircuit<P>, values: &[GateId]) -> GateId {
-    let (first, rest) = values.split_first().expect("at least one gate is required");
-    rest.iter().fold(*first, |acc, value| circuit.add_gate(acc, *value).as_single_wire())
-}
 
 /// Decrypts one coefficient-level error polynomial.
 ///
@@ -133,24 +128,12 @@ where
     A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
     M: PolyMatrix<P = P>,
 {
-    assert!(!encrypted_bits.is_empty(), "at least one encrypted bit is required");
-    assert_eq!(
-        encrypted_bits.len(),
-        plaintext_moduli.len(),
-        "encrypted scalar bit count must match plaintext modulus count"
-    );
-    assert!(
-        plaintext_moduli.iter().all(|modulus| !modulus.is_zero()),
-        "all bit plaintext moduli must be positive"
-    );
-    let bit_terms = encrypted_bits
-        .iter()
-        .zip(plaintext_moduli.iter())
-        .map(|(encrypted_bit, plaintext_modulus)| {
-            encrypted_bit.decrypt::<M>(decryption_key, plaintext_modulus.clone(), circuit)
-        })
-        .collect::<Vec<_>>();
-    sum_gate_ids(circuit, &bit_terms)
+    decrypt_bit_decomposed_scalar_outputs::<P, A, M>(
+        circuit,
+        encrypted_bits,
+        decryption_key,
+        plaintext_moduli,
+    )
 }
 
 /// Builds one CRT-specific decrypt subcircuit for one refreshed wire.

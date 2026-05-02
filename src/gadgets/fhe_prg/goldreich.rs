@@ -23,7 +23,7 @@
 //! `PolyCircuit` is deeper than the abstract Boolean circuit. The implementation therefore keeps
 //! XOR composition balanced instead of chaining it left-to-right.
 use crate::{
-    circuit::{BatchedWire, PolyCircuit},
+    circuit::{BatchedWire, PolyCircuit, gate::GateId},
     gadgets::{
         arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner},
         fhe::{
@@ -31,10 +31,13 @@ use crate::{
             ring_gsw_nested_rns::NestedRnsRingGswCiphertext,
         },
     },
+    matrix::PolyMatrix,
     poly::Poly,
 };
 use digest::Digest;
 use keccak_asm::Keccak256;
+use num_bigint::BigUint;
+use num_traits::Zero;
 use rayon::prelude::*;
 use std::{collections::HashSet, sync::Arc};
 use tracing::debug;
@@ -587,6 +590,81 @@ where
     }
 }
 
+/// Adds a nonempty list of scalar wires with the circuit's ordinary addition gate.
+pub(crate) fn sum_gate_ids<P: Poly>(circuit: &mut PolyCircuit<P>, values: &[GateId]) -> GateId {
+    let (first, rest) = values.split_first().expect("at least one gate is required");
+    rest.iter().fold(*first, |acc, value| circuit.add_gate(acc, *value).as_single_wire())
+}
+
+/// Homomorphically evaluates a selected interval of a conceptual Goldreich PRG output.
+///
+/// This helper centralizes the common `setup_range` followed by `evaluate_uniform` pattern used by
+/// callers that only need a contiguous subset of a larger conceptual Goldreich output stream.  The
+/// returned ciphertexts stay encrypted; callers that need a decoded scalar should evaluate this
+/// circuit first, then feed the resulting ciphertexts into
+/// [`decrypt_bit_decomposed_scalar_outputs`] in a separate runtime-safe decrypt circuit.
+pub fn evaluate_goldreich_uniform_range<P, A>(
+    circuit: &mut PolyCircuit<P>,
+    ring_gsw: Arc<RingGswContext<P, A>>,
+    encrypted_seeds: &[RingGswCiphertext<P, A>],
+    conceptual_output_bits: usize,
+    range_start: usize,
+    range_len: usize,
+    graph_seed: [u8; 32],
+) -> Vec<RingGswCiphertext<P, A>>
+where
+    P: Poly + 'static,
+    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
+{
+    let goldreich = GoldreichFhePrg::setup_range(
+        circuit,
+        ring_gsw,
+        encrypted_seeds.len(),
+        conceptual_output_bits,
+        range_start,
+        range_len,
+        graph_seed,
+    );
+    goldreich.evaluate_uniform(encrypted_seeds, circuit)
+}
+
+/// Decrypts encrypted Boolean bits and returns their binary linear recomposition.
+///
+/// Bit `j` is decrypted with `plaintext_moduli[j]`.  The Ring-GSW plaintext modulus selection is
+/// responsible for making that decrypt contribute the intended binary weight, so the circuit only
+/// needs to add the decrypted terms.  This is the scalar counterpart of the bit-decomposed
+/// polynomial mask decode used by noise refresh.
+pub fn decrypt_bit_decomposed_scalar_outputs<P, A, M>(
+    circuit: &mut PolyCircuit<P>,
+    encrypted_bits: &[RingGswCiphertext<P, A>],
+    decryption_key: GateId,
+    plaintext_moduli: &[BigUint],
+) -> GateId
+where
+    P: Poly + 'static,
+    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
+    M: PolyMatrix<P = P>,
+{
+    assert!(!encrypted_bits.is_empty(), "at least one encrypted bit is required");
+    assert_eq!(
+        encrypted_bits.len(),
+        plaintext_moduli.len(),
+        "encrypted scalar bit count must match plaintext modulus count"
+    );
+    assert!(
+        plaintext_moduli.iter().all(|modulus| !modulus.is_zero()),
+        "all bit plaintext moduli must be positive"
+    );
+    let bit_terms = encrypted_bits
+        .iter()
+        .zip(plaintext_moduli.iter())
+        .map(|(encrypted_bit, plaintext_modulus)| {
+            encrypted_bit.decrypt::<M>(decryption_key, plaintext_modulus.clone(), circuit)
+        })
+        .collect::<Vec<_>>();
+    sum_gate_ids(circuit, &bit_terms)
+}
+
 /// Fixed-`n` CBD-style error evaluator built from setup-time Goldreich uniform samplers.
 ///
 /// The wrapped [`GoldreichFhePrg`] remains responsible for evaluating one public Goldreich graph
@@ -1017,7 +1095,7 @@ mod tests {
         __PAIR, __TestState,
         circuit::{PolyCircuit, evaluable::PolyVec},
         gadgets::{
-            arith::{DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPolyContext},
+            arith::{DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPoly, NestedRnsPolyContext},
             fhe::ring_gsw_nested_rns::{
                 NativeRingGswCiphertext, NestedRnsRingGswContext as RingGswContext,
                 ciphertext_from_outputs, ciphertext_inputs_from_native, decrypt_ciphertext,
@@ -1025,6 +1103,7 @@ mod tests {
             },
         },
         lookup::{poly::PolyPltEvaluator, poly_vec::PolyVecPltEvaluator},
+        matrix::dcrt_poly::DCRTPolyMatrix,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         slot_transfer::PolyVecSlotTransferEvaluator,
     };
@@ -1139,6 +1218,10 @@ mod tests {
         let mut coeffs = vec![0u64; NUM_SLOTS];
         coeffs[0] = expected;
         coeffs
+    }
+
+    fn mask_plaintext_moduli_for_test(full_modulus: &BigUint, bit_size: usize) -> Vec<BigUint> {
+        (0..bit_size).map(|bit_idx| full_modulus >> bit_idx).collect()
     }
 
     fn centered_mod_u64(value: i64, plaintext_modulus: u64) -> u64 {
@@ -1365,6 +1448,168 @@ mod tests {
                     "Goldreich Ring-GSW output bit {idx} must decrypt to the plaintext TSA result"
                 );
             },
+        );
+    }
+
+    #[sequential_test::sequential]
+    #[test]
+    fn test_evaluate_goldreich_uniform_range_decrypts_to_plaintext_range_reference() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ring_gsw) = create_test_context(&mut circuit);
+        let graph_seed = sample_graph_seed();
+        let input_size = 6usize;
+        let conceptual_output_bits = 8usize;
+        let range_start = 3usize;
+        let range_len = 2usize;
+        let encrypted_inputs = (0..input_size)
+            .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
+            .collect::<Vec<_>>();
+        let encrypted_outputs = evaluate_goldreich_uniform_range(
+            &mut circuit,
+            ring_gsw.clone(),
+            &encrypted_inputs,
+            conceptual_output_bits,
+            range_start,
+            range_len,
+            graph_seed,
+        );
+        let reconstructed_outputs = encrypted_outputs
+            .iter()
+            .flat_map(|ciphertext| ciphertext.reconstruct(&mut circuit))
+            .collect::<Vec<_>>();
+        circuit.output(reconstructed_outputs);
+
+        let plaintext_modulus = 2u64;
+        let secret_key = sample_secret_key(&params);
+        let public_key_hash_key = sample_hash_key();
+        let public_key = sample_public_key(
+            &params,
+            ring_gsw.width(),
+            &secret_key,
+            public_key_hash_key,
+            b"goldreich_uniform_range_public_key",
+            None,
+        );
+        let plaintext_inputs = sample_binary_vector(input_size);
+        let expected_graph = GoldreichGraph::generate_range(
+            input_size,
+            conceptual_output_bits,
+            range_start,
+            range_len,
+            graph_seed,
+            GoldreichGraphGeneration::default(),
+        );
+        let expected_bits = evaluate_plaintext_goldreich(&expected_graph, &plaintext_inputs);
+        let native_inputs = plaintext_inputs
+            .par_iter()
+            .map(|bit| {
+                encrypt_plaintext_bit(&params, ring_gsw.nested_rns.as_ref(), &public_key, *bit != 0)
+            })
+            .collect::<Vec<_>>();
+
+        let circuit_inputs = native_inputs
+            .iter()
+            .flat_map(|ciphertext| {
+                ciphertext_inputs_from_native(
+                    &params,
+                    ring_gsw.nested_rns.as_ref(),
+                    ciphertext,
+                    0,
+                    Some(ring_gsw.active_levels),
+                )
+            })
+            .collect::<Vec<_>>();
+        let outputs = eval_outputs(&params, &circuit, circuit_inputs);
+        let reconstructed_ciphertexts =
+            ciphertexts_from_outputs(&params, &outputs, ring_gsw.width());
+        let q_modulus = BigUint::from(ring_gsw.nested_rns.q_moduli()[0]);
+
+        assert_eq!(
+            reconstructed_ciphertexts.len(),
+            range_len,
+            "range helper must reconstruct one ciphertext per selected Goldreich output bit"
+        );
+        reconstructed_ciphertexts
+            .par_iter()
+            .zip(expected_bits.par_iter())
+            .enumerate()
+            .for_each(|(idx, (ciphertext, expected_bit))| {
+                let decrypted = decrypt_ciphertext(
+                    &params,
+                    ring_gsw.nested_rns.as_ref(),
+                    ciphertext,
+                    &secret_key,
+                    plaintext_modulus,
+                );
+                assert_eq!(
+                    rounded_coeffs(&decrypted, plaintext_modulus, &q_modulus),
+                    expected_coeffs(*expected_bit),
+                    "Goldreich range helper output bit {idx} must decrypt to the plaintext range reference"
+                );
+            });
+    }
+
+    #[test]
+    fn test_decrypt_bit_decomposed_scalar_outputs_recomposes_binary_sum() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ring_gsw) = create_test_context(&mut circuit);
+        let bit_size = 2usize;
+        let encrypted_bits = (0..bit_size)
+            .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
+            .collect::<Vec<_>>();
+        let secret_key_wire = circuit.input(1).at(0).as_single_wire();
+        let q_modulus = BigUint::from(ring_gsw.nested_rns.q_moduli()[0]);
+        let plaintext_moduli = mask_plaintext_moduli_for_test(&q_modulus, bit_size);
+        let decrypted_mask =
+            decrypt_bit_decomposed_scalar_outputs::<
+                DCRTPoly,
+                NestedRnsPoly<DCRTPoly>,
+                DCRTPolyMatrix,
+            >(&mut circuit, &encrypted_bits, secret_key_wire, &plaintext_moduli);
+        circuit.output(vec![decrypted_mask]);
+
+        let secret_key = sample_secret_key(&params);
+        let public_key_hash_key = sample_hash_key();
+        let public_key = sample_public_key(
+            &params,
+            ring_gsw.width(),
+            &secret_key,
+            public_key_hash_key,
+            b"goldreich_scalar_decrypt_public_key",
+            None,
+        );
+        let plaintext_bits = [1u64, 1u64];
+        let expected_mask =
+            plaintext_bits.iter().enumerate().map(|(bit_idx, bit)| bit << bit_idx).sum::<u64>();
+        let native_inputs = plaintext_bits
+            .iter()
+            .map(|bit| {
+                encrypt_plaintext_bit(&params, ring_gsw.nested_rns.as_ref(), &public_key, *bit != 0)
+            })
+            .collect::<Vec<_>>();
+        let mut circuit_inputs = native_inputs
+            .iter()
+            .flat_map(|ciphertext| {
+                ciphertext_inputs_from_native(
+                    &params,
+                    ring_gsw.nested_rns.as_ref(),
+                    ciphertext,
+                    0,
+                    Some(ring_gsw.active_levels),
+                )
+            })
+            .collect::<Vec<_>>();
+        circuit_inputs.push(PolyVec::new(vec![secret_key]));
+
+        let outputs = eval_outputs(&params, &circuit, circuit_inputs);
+        assert_eq!(
+            rounded_coeffs(
+                outputs[0].as_slice().first().expect("scalar helper must output one polynomial"),
+                q_modulus.to_u64().expect("test q modulus must fit in u64"),
+                &q_modulus,
+            ),
+            expected_coeffs(expected_mask),
+            "scalar decrypt helper must recompose bit ciphertexts as an ordinary binary integer"
         );
     }
 

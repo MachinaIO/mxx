@@ -40,7 +40,10 @@ where
     /// Simulate how the original Gaussian error in `p_{epsilon,0}` and the
     /// injected Gaussian target errors in `K_{i,b,j}` contribute to the final
     /// one, k-input, bit-input, and decoder outputs.
-    pub fn simulate_output_error_bounds(&self) -> DiamondInputErrorSimulation {
+    pub fn simulate_output_error_bounds(
+        &self,
+        decoder_count: usize,
+    ) -> DiamondInputErrorSimulation {
         let ring_dim_sqrt = BigDecimal::from(self.params.ring_dimension() as u64)
             .sqrt()
             .expect("sqrt(ring_dimension) failed");
@@ -156,7 +159,7 @@ where
         let input_errors = (0..self.input_bit_count())
             .map(|bit_idx| state_errors[bit_idx + 1].clone() * &output_preimage)
             .collect::<Vec<_>>();
-        let decoder_errors = vec![one_error.clone(); self.decoder_count];
+        let decoder_errors = vec![one_error.clone(); decoder_count];
         debug!(
             ?one_error,
             ?k_error,

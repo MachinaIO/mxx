@@ -162,7 +162,7 @@ impl Aky24DecErrorSimulationInputs {
             ctx.clone(),
             ctx.m_b,
             func.output_size(),
-            compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None),
+            compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None, None),
             None,
         );
         Self {

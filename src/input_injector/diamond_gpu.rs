@@ -7,7 +7,7 @@ use crate::{
     slot_transfer::bgg_pubkey::column_chunk_count,
 };
 use rayon::prelude::*;
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Instant};
 use tracing::{debug, info};
 
 struct GpuDiamondKStageShared<M, T>
@@ -249,22 +249,26 @@ where
         }
     }
 
-    fn read_chunk_bytes(&self, id: &str, total_cols: usize) -> Vec<Arc<[u8]>> {
+    fn read_chunk_bytes(&self, dir_path: &Path, id: &str, total_cols: usize) -> Vec<Arc<[u8]>> {
         (0..column_chunk_count(total_cols))
             .map(|chunk_idx| {
-                Arc::<[u8]>::from(self.read_matrix_bytes(&self.chunk_id(id, chunk_idx)))
+                Arc::<[u8]>::from(self.read_matrix_bytes(dir_path, &self.chunk_id(id, chunk_idx)))
             })
             .collect()
     }
 
-    fn store_preprocess_wave(&self, outputs: Vec<ComputedDiamondPreprocessChunk<M>>) -> usize {
+    fn store_preprocess_wave(
+        &self,
+        dir_path: &Path,
+        outputs: Vec<ComputedDiamondPreprocessChunk<M>>,
+    ) -> usize {
         outputs
             .into_par_iter()
             .map(|output| {
                 let store_started = Instant::now();
                 let chunk_id = self.preprocess_chunk_id(&output.task);
                 let bytes = output.output.into_compact_bytes();
-                self.write_matrix_bytes(&chunk_id, &bytes);
+                self.write_matrix_bytes(dir_path, &chunk_id, &bytes);
                 debug!(
                     ?output.task,
                     chunk_id,
@@ -280,6 +284,8 @@ where
 
     fn preprocess_k_stage_gpu(
         &self,
+        dir_path: &Path,
+        hash_key: [u8; 32],
         level: usize,
         tasks: Vec<DiamondPreprocessChunkTask>,
         source_b_bytes: &[u8],
@@ -340,12 +346,18 @@ where
                             .as_ref(),
                     );
                     let ext_matrix = if self.new_bit_idx_for_state(level, state_idx).is_some() {
-                        self.sample_w_block_with_params(&shared.params, 0, level - 1)
+                        self.sample_w_block_with_params(&shared.params, hash_key, 0, level - 1)
                     } else {
-                        self.sample_w_block_with_params(&shared.params, state_idx, level - 1)
+                        self.sample_w_block_with_params(
+                            &shared.params,
+                            hash_key,
+                            state_idx,
+                            level - 1,
+                        )
                     };
                     let target = self.build_k_target_chunk_with_params(
                         &shared.params,
+                        hash_key,
                         level,
                         digit_value,
                         state_idx,
@@ -415,7 +427,7 @@ where
                 },
                 || {
                     previous_outputs_to_store
-                        .map(|outputs| self.store_preprocess_wave(outputs))
+                        .map(|outputs| self.store_preprocess_wave(dir_path, outputs))
                         .unwrap_or(0)
                 },
             );
@@ -435,7 +447,7 @@ where
             next_wave_idx += 1;
         }
         if let Some(outputs) = previous_outputs {
-            completed_tasks += self.store_preprocess_wave(outputs);
+            completed_tasks += self.store_preprocess_wave(dir_path, outputs);
         }
 
         info!(
@@ -451,6 +463,8 @@ where
 
     fn preprocess_l_stage_gpu(
         &self,
+        dir_path: &Path,
+        hash_key: [u8; 32],
         tasks: Vec<DiamondPreprocessChunkTask>,
         source_b_bytes: &[u8],
         source_trapdoor_bytes: &[u8],
@@ -492,6 +506,7 @@ where
                     };
                     let ext_matrix = self.sample_w_block_with_params(
                         &shared.params,
+                        hash_key,
                         input_idx,
                         self.input_count,
                     );
@@ -586,7 +601,7 @@ where
                 },
                 || {
                     previous_outputs_to_store
-                        .map(|outputs| self.store_preprocess_wave(outputs))
+                        .map(|outputs| self.store_preprocess_wave(dir_path, outputs))
                         .unwrap_or(0)
                 },
             );
@@ -605,7 +620,7 @@ where
             next_wave_idx += 1;
         }
         if let Some(outputs) = previous_outputs {
-            completed_tasks += self.store_preprocess_wave(outputs);
+            completed_tasks += self.store_preprocess_wave(dir_path, outputs);
         }
 
         info!(
@@ -620,6 +635,8 @@ where
 
     fn preprocess_n_stage_gpu(
         &self,
+        dir_path: &Path,
+        hash_key: [u8; 32],
         tasks: Vec<DiamondPreprocessChunkTask>,
         source_b_bytes: &[u8],
         source_trapdoor_bytes: &[u8],
@@ -656,8 +673,12 @@ where
                         DiamondPreprocessChunkTask::N { chunk_idx } => chunk_idx,
                         _ => panic!("non-N task scheduled in N stage: {:?}", task),
                     };
-                    let ext_matrix =
-                        self.sample_w_block_with_params(&shared.params, 0, self.input_count);
+                    let ext_matrix = self.sample_w_block_with_params(
+                        &shared.params,
+                        hash_key,
+                        0,
+                        self.input_count,
+                    );
                     let k_pubkey = BggPublicKey::new(
                         M::from_compact_bytes(&shared.params, k_pubkey_bytes.as_ref()),
                         false,
@@ -729,7 +750,7 @@ where
                 },
                 || {
                     previous_outputs_to_store
-                        .map(|outputs| self.store_preprocess_wave(outputs))
+                        .map(|outputs| self.store_preprocess_wave(dir_path, outputs))
                         .unwrap_or(0)
                 },
             );
@@ -748,7 +769,7 @@ where
             next_wave_idx += 1;
         }
         if let Some(outputs) = previous_outputs {
-            completed_tasks += self.store_preprocess_wave(outputs);
+            completed_tasks += self.store_preprocess_wave(dir_path, outputs);
         }
 
         info!(
@@ -763,6 +784,8 @@ where
 
     fn preprocess_m_stage_gpu(
         &self,
+        dir_path: &Path,
+        hash_key: [u8; 32],
         tasks: Vec<DiamondPreprocessChunkTask>,
         source_b_bytes: &[u8],
         source_trapdoor_bytes: &[u8],
@@ -801,8 +824,12 @@ where
                         }
                         _ => panic!("non-M task scheduled in M stage: {:?}", task),
                     };
-                    let ext_matrix =
-                        self.sample_w_block_with_params(&shared.params, 0, self.input_count);
+                    let ext_matrix = self.sample_w_block_with_params(
+                        &shared.params,
+                        hash_key,
+                        0,
+                        self.input_count,
+                    );
                     let decoder_pubkey = BggPublicKey::new(
                         M::from_compact_bytes(
                             &shared.params,
@@ -875,7 +902,7 @@ where
                 },
                 || {
                     previous_outputs_to_store
-                        .map(|outputs| self.store_preprocess_wave(outputs))
+                        .map(|outputs| self.store_preprocess_wave(dir_path, outputs))
                         .unwrap_or(0)
                 },
             );
@@ -894,7 +921,7 @@ where
             next_wave_idx += 1;
         }
         if let Some(outputs) = previous_outputs {
-            completed_tasks += self.store_preprocess_wave(outputs);
+            completed_tasks += self.store_preprocess_wave(dir_path, outputs);
         }
 
         info!(
@@ -1068,19 +1095,25 @@ where
 
     pub(super) fn preprocess_gpu(
         &self,
+        dir_path: &Path,
+        hash_key: [u8; 32],
         one: &BggPublicKey<M>,
+        k_pubkey: &BggPublicKey<M>,
         input_digits: &[BggPublicKey<M>],
         decoders: &[BggPublicKey<M>],
         k: &M::P,
     ) {
-        self.validate_lengths(input_digits, decoders);
-        self.ensure_dir();
-        self.write_metadata(&super::DiamondInjectorMetadata {
-            input_count: self.input_count,
-            base: self.base,
-            decoder_count: self.decoder_count,
-        });
-        self.write_bytes(self.k_plaintext_id(), &k.to_compact_bytes());
+        self.validate_lengths(input_digits);
+        self.ensure_dir(dir_path);
+        self.write_metadata(
+            dir_path,
+            &super::DiamondInjectorMetadata {
+                input_count: self.input_count,
+                base: self.base,
+                decoder_count: decoders.len(),
+            },
+        );
+        self.write_bytes(dir_path, self.k_plaintext_id(), &k.to_compact_bytes());
 
         let preprocess_started = Instant::now();
         let state_cols = self.state_col_size(&self.params);
@@ -1092,13 +1125,13 @@ where
         // preimage; it is the initial encoding that online evaluation uses as
         // p_{epsilon,0} before any digit transition is applied.
         let secret_epsilon_bytes =
-            self.load_or_sample_secret_epsilon_bytes(self.secret_epsilon_id());
-        if !self.matrix_exists(self.p_epsilon_id()) {
-            let (b0_bytes, _) = self.load_or_sample_b_checkpoint_bytes(0);
+            self.load_or_sample_secret_epsilon_bytes(dir_path, self.secret_epsilon_id());
+        if !self.matrix_exists(dir_path, self.p_epsilon_id()) {
+            let (b0_bytes, _) = self.load_or_sample_b_checkpoint_bytes(dir_path, 0);
             let b0_matrix = M::from_compact_bytes(&self.params, &b0_bytes);
             let secret_epsilon = M::from_compact_bytes(&self.params, &secret_epsilon_bytes);
-            let p_epsilon = self.build_initial_encoding(&b0_matrix, &secret_epsilon, k);
-            self.write_matrix(self.p_epsilon_id(), &p_epsilon);
+            let p_epsilon = self.build_initial_encoding(hash_key, &b0_matrix, &secret_epsilon, k);
+            self.write_matrix(dir_path, self.p_epsilon_id(), &p_epsilon);
             drop(p_epsilon);
             drop(secret_epsilon);
             drop(b0_matrix);
@@ -1116,6 +1149,7 @@ where
                     (
                         digit_value,
                         Arc::<[u8]>::from(self.load_or_sample_digit_secret_mask_bytes(
+                            dir_path,
                             &self.digit_secret_id(level, digit_value),
                         )),
                     )
@@ -1131,7 +1165,7 @@ where
                             state_idx,
                             chunk_idx,
                         };
-                        if !self.matrix_exists(&self.preprocess_chunk_id(&task)) {
+                        if !self.matrix_exists(dir_path, &self.preprocess_chunk_id(&task)) {
                             stage_tasks.push(task);
                         }
                     }
@@ -1139,8 +1173,8 @@ where
             }
             total_tasks += stage_tasks.len();
             let (source_b_bytes, source_trapdoor_bytes) =
-                self.load_or_sample_b_checkpoint_bytes(level - 1);
-            let (target_b_bytes, _) = self.load_or_sample_b_checkpoint_bytes(level);
+                self.load_or_sample_b_checkpoint_bytes(dir_path, level - 1);
+            let (target_b_bytes, _) = self.load_or_sample_b_checkpoint_bytes(dir_path, level);
             if stage_tasks.is_empty() {
                 info!(
                     level,
@@ -1149,6 +1183,8 @@ where
                 );
             } else {
                 completed_tasks += self.preprocess_k_stage_gpu(
+                    dir_path,
+                    hash_key,
                     level,
                     stage_tasks,
                     &source_b_bytes,
@@ -1166,7 +1202,7 @@ where
         for input_idx in 0..=input_bit_count {
             for chunk_idx in 0..column_chunk_count(output_cols) {
                 let task = DiamondPreprocessChunkTask::L { input_idx, chunk_idx };
-                if !self.matrix_exists(&self.preprocess_chunk_id(&task)) {
+                if !self.matrix_exists(dir_path, &self.preprocess_chunk_id(&task)) {
                     l_tasks.push(task);
                 }
             }
@@ -1179,13 +1215,15 @@ where
             );
         } else {
             let (source_b_bytes, source_trapdoor_bytes) =
-                self.load_or_sample_b_checkpoint_bytes(self.input_count);
+                self.load_or_sample_b_checkpoint_bytes(dir_path, self.input_count);
             let one_bytes = Arc::<[u8]>::from(one.matrix.to_compact_bytes());
             let input_pubkey_bytes = input_digits
                 .iter()
                 .map(|pubkey| Arc::<[u8]>::from(pubkey.matrix.to_compact_bytes()))
                 .collect::<Vec<_>>();
             completed_tasks += self.preprocess_l_stage_gpu(
+                dir_path,
+                hash_key,
                 l_tasks,
                 &source_b_bytes,
                 &source_trapdoor_bytes,
@@ -1197,7 +1235,7 @@ where
         let mut n_tasks = Vec::new();
         for chunk_idx in 0..column_chunk_count(output_cols) {
             let task = DiamondPreprocessChunkTask::N { chunk_idx };
-            if !self.matrix_exists(&self.preprocess_chunk_id(&task)) {
+            if !self.matrix_exists(dir_path, &self.preprocess_chunk_id(&task)) {
                 n_tasks.push(task);
             }
         }
@@ -1209,9 +1247,10 @@ where
             );
         } else {
             let (source_b_bytes, source_trapdoor_bytes) =
-                self.load_or_sample_b_checkpoint_bytes(self.input_count);
-            let k_pubkey = self.sample_k_pubkey_with_params(&self.params);
+                self.load_or_sample_b_checkpoint_bytes(dir_path, self.input_count);
             completed_tasks += self.preprocess_n_stage_gpu(
+                dir_path,
+                hash_key,
                 n_tasks,
                 &source_b_bytes,
                 &source_trapdoor_bytes,
@@ -1223,10 +1262,10 @@ where
         // Decoder public keys are kept as CPU-side compact bytes and materialized
         // on a device only for the task that needs them.
         let mut m_tasks = Vec::new();
-        for decoder_idx in 0..self.decoder_count {
+        for decoder_idx in 0..decoders.len() {
             for chunk_idx in 0..column_chunk_count(output_cols) {
                 let task = DiamondPreprocessChunkTask::M { decoder_idx, chunk_idx };
-                if !self.matrix_exists(&self.preprocess_chunk_id(&task)) {
+                if !self.matrix_exists(dir_path, &self.preprocess_chunk_id(&task)) {
                     m_tasks.push(task);
                 }
             }
@@ -1239,12 +1278,14 @@ where
             );
         } else {
             let (source_b_bytes, source_trapdoor_bytes) =
-                self.load_or_sample_b_checkpoint_bytes(self.input_count);
+                self.load_or_sample_b_checkpoint_bytes(dir_path, self.input_count);
             let decoder_pubkey_bytes = decoders
                 .iter()
                 .map(|pubkey| Arc::<[u8]>::from(pubkey.matrix.to_compact_bytes()))
                 .collect::<Vec<_>>();
             completed_tasks += self.preprocess_m_stage_gpu(
+                dir_path,
+                hash_key,
                 m_tasks,
                 &source_b_bytes,
                 &source_trapdoor_bytes,
@@ -1270,21 +1311,30 @@ where
 
     pub(super) fn online_eval_gpu(
         &self,
+        dir_path: &Path,
+        preprocess_out: &[u8; 32],
         input_digits: &[u32],
         one: &BggPublicKey<M>,
+        k_pubkey: &BggPublicKey<M>,
         input_digit_pubkeys: &[BggPublicKey<M>],
         decoders: &[BggPublicKey<M>],
     ) -> (BggEncoding<M>, BggEncoding<M>, Vec<BggEncoding<M>>, Vec<BggEncoding<M>>) {
-        self.validate_lengths(input_digit_pubkeys, decoders);
+        self.validate_lengths(input_digit_pubkeys);
         self.validate_digits(input_digits);
-        let metadata = self.read_metadata();
+        assert_eq!(
+            self.read_bytes(dir_path, self.preprocess_hash_key_id()).as_slice(),
+            preprocess_out,
+            "DiamondInjector gpu online_eval preprocess hash key mismatch"
+        );
+        let metadata = self.read_metadata(dir_path);
         assert_eq!(
             metadata.input_count, self.input_count,
             "DiamondInjector metadata input count mismatch"
         );
         assert_eq!(metadata.base, self.base, "DiamondInjector metadata base mismatch");
         assert_eq!(
-            metadata.decoder_count, self.decoder_count,
+            metadata.decoder_count,
+            decoders.len(),
             "DiamondInjector metadata decoder count mismatch"
         );
 
@@ -1292,7 +1342,7 @@ where
         let state_cols = self.state_col_size(&self.params);
         let output_cols = self.gadget_col_size(&self.params);
         // Start from the persisted empty-prefix seed.
-        let mut states = vec![self.read_matrix(self.p_epsilon_id())];
+        let mut states = vec![self.read_matrix(dir_path, self.p_epsilon_id())];
 
         for (digit_idx, digit_value) in input_digits.iter().copied().enumerate() {
             let level = digit_idx + 1;
@@ -1313,7 +1363,7 @@ where
                         DiamondEvalFamily::State(state_idx),
                         DiamondEvalFamilySpec {
                             lhs_bytes,
-                            rhs_chunk_bytes: self.read_chunk_bytes(&rhs_id, state_cols),
+                            rhs_chunk_bytes: self.read_chunk_bytes(dir_path, &rhs_id, state_cols),
                         },
                     )
                 })
@@ -1341,14 +1391,14 @@ where
             DiamondEvalFamily::One,
             DiamondEvalFamilySpec {
                 lhs_bytes: p0_bytes.clone(),
-                rhs_chunk_bytes: self.read_chunk_bytes(&self.l_id(0), output_cols),
+                rhs_chunk_bytes: self.read_chunk_bytes(dir_path, &self.l_id(0), output_cols),
             },
         );
         family_specs.insert(
             DiamondEvalFamily::KOutput,
             DiamondEvalFamilySpec {
                 lhs_bytes: p0_bytes.clone(),
-                rhs_chunk_bytes: self.read_chunk_bytes(self.n_id(), output_cols),
+                rhs_chunk_bytes: self.read_chunk_bytes(dir_path, self.n_id(), output_cols),
             },
         );
         // Turn each bit-specific branch into the encoding for the chosen bit.
@@ -1360,17 +1410,25 @@ where
                 DiamondEvalFamily::Input(bit_output_idx),
                 DiamondEvalFamilySpec {
                     lhs_bytes: Arc::<[u8]>::from(states[state_idx].to_compact_bytes()),
-                    rhs_chunk_bytes: self.read_chunk_bytes(&self.l_id(state_idx), output_cols),
+                    rhs_chunk_bytes: self.read_chunk_bytes(
+                        dir_path,
+                        &self.l_id(state_idx),
+                        output_cols,
+                    ),
                 },
             );
         }
         // Turn the surviving base branch into every decoder output.
-        for decoder_idx in 0..self.decoder_count {
+        for decoder_idx in 0..decoders.len() {
             family_specs.insert(
                 DiamondEvalFamily::Decoder(decoder_idx),
                 DiamondEvalFamilySpec {
                     lhs_bytes: p0_bytes.clone(),
-                    rhs_chunk_bytes: self.read_chunk_bytes(&self.m_id(decoder_idx), output_cols),
+                    rhs_chunk_bytes: self.read_chunk_bytes(
+                        dir_path,
+                        &self.m_id(decoder_idx),
+                        output_cols,
+                    ),
                 },
             );
         }
@@ -1384,15 +1442,16 @@ where
             one.clone(),
             Some(M::P::const_one(&self.params)),
         );
-        let k_pubkey = self.sample_k_pubkey_with_params(&self.params);
-        let k_plaintext =
-            M::P::from_compact_bytes(&self.params, &self.read_bytes(self.k_plaintext_id()));
+        let k_plaintext = M::P::from_compact_bytes(
+            &self.params,
+            &self.read_bytes(dir_path, self.k_plaintext_id()),
+        );
         let k_output = self.build_output_encoding(
             outputs
                 .get(&DiamondEvalFamily::KOutput)
                 .unwrap_or_else(|| panic!("missing gpu online_eval k output"))
                 .clone(),
-            k_pubkey,
+            k_pubkey.clone(),
             Some(k_plaintext),
         );
         let digit_outputs = input_digits
@@ -1523,19 +1582,11 @@ mod tests {
         let decoder_count = 2;
         let dir = tempdir().expect("temporary directory should be created");
 
-        let injector = TestInjector::new(
-            params.clone(),
-            hash_key,
-            input_count,
-            base,
-            decoder_count,
-            4.578,
-            0.0,
-            dir.path().to_path_buf(),
-        )
-        .with_gpu_device_ids(gpu_ids.clone());
+        let injector = TestInjector::new(params.clone(), input_count, base, 4.578, 0.0)
+            .with_gpu_device_ids(gpu_ids.clone());
 
         let one_pubkey = sample_pubkey(&params, hash_key, "diamond_gpu_one_pubkey");
+        let k_pubkey = sample_pubkey(&params, hash_key, "diamond_gpu_k_pubkey");
         let input_pubkeys = (0..input_count * batch_bits)
             .map(|bit_idx| {
                 sample_pubkey(&params, hash_key, &format!("diamond_gpu_input_pubkey_{bit_idx}"))
@@ -1552,19 +1603,35 @@ mod tests {
             .collect::<Vec<_>>();
         let k = TestPoly::from_usize_to_constant(&params, 3);
 
-        injector.preprocess(&one_pubkey, &input_pubkeys, &decoder_pubkeys, &k);
+        let preprocess_out = injector.preprocess(
+            dir.path(),
+            &one_pubkey,
+            &k_pubkey,
+            &input_pubkeys,
+            &decoder_pubkeys,
+            &k,
+        );
 
         let digits = vec![2u32, 1u32, 3u32];
-        let (one_output, k_output, digit_outputs, decoder_outputs) =
-            injector.online_eval(&digits, &one_pubkey, &input_pubkeys, &decoder_pubkeys);
+        let (one_output, k_output, digit_outputs, decoder_outputs) = injector.online_eval(
+            dir.path(),
+            &preprocess_out,
+            &digits,
+            &one_pubkey,
+            &k_pubkey,
+            &input_pubkeys,
+            &decoder_pubkeys,
+        );
         assert_eq!(digit_outputs.len(), input_count * batch_bits);
         assert_eq!(decoder_outputs.len(), decoder_count);
 
-        let mut secret_matrix = injector.read_matrix(injector.secret_epsilon_id());
+        let mut secret_matrix = injector.read_matrix(dir.path(), injector.secret_epsilon_id());
         assert_eq!(secret_matrix.size(), (1, super::super::DIAMOND_SECRET_SIZE));
         for (digit_idx, digit_value) in digits.iter().copied().enumerate() {
-            let secret_mask = injector
-                .read_matrix(&injector.digit_secret_id(digit_idx + 1, digit_value as usize));
+            let secret_mask = injector.read_matrix(
+                dir.path(),
+                &injector.digit_secret_id(digit_idx + 1, digit_value as usize),
+            );
             assert_eq!(
                 secret_mask.size(),
                 (super::super::DIAMOND_SECRET_SIZE, super::super::DIAMOND_SECRET_SIZE)
@@ -1577,7 +1644,6 @@ mod tests {
         assert_eq!(one_output.vector, secret_matrix.clone() * (&one_pubkey.matrix - &gadget));
         assert_eq!(one_output.plaintext, Some(TestPoly::const_one(&params)));
 
-        let k_pubkey = injector.sample_k_pubkey_with_params(&params);
         assert_eq!(
             k_output.vector,
             secret_matrix.clone() * &k_pubkey.matrix - (gadget.clone() * &k)

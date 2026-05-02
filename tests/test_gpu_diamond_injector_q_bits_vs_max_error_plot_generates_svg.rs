@@ -269,17 +269,15 @@ fn verify_gpu_online_eval_errors_below_simulation(
         tempdir().expect("temporary DiamondInjector preprocessing directory should be created");
     let injector = TestInjector::new(
         params.clone(),
-        hash_key,
         input_count,
         input_base,
-        DIAMOND_INJECTOR_DECODER_COUNT,
         DIAMOND_INJECTOR_TRAPDOOR_SIGMA,
         DIAMOND_INJECTOR_ERROR_SIGMA,
-        dir.path().to_path_buf(),
     )
     .with_gpu_device_ids(gpu_ids.to_vec());
 
     let one_pubkey = sample_pubkey(&params, hash_key, "diamond_plot_one_pubkey");
+    let k_pubkey = sample_pubkey(&params, hash_key, "diamond_plot_k_pubkey");
     let batch_bits =
         usize::try_from(digit_bits).expect("digit_bits must fit into usize for input pubkeys");
     let input_pubkeys = (0..input_count * batch_bits)
@@ -303,7 +301,14 @@ fn verify_gpu_online_eval_errors_below_simulation(
         crossing_point.crt_depth, crossing_point.q_bits, input_count, digit_bits
     );
     let preprocess_started = Instant::now();
-    injector.preprocess(&one_pubkey, &input_pubkeys, &decoder_pubkeys, &k);
+    let preprocess_out = injector.preprocess(
+        dir.path(),
+        &one_pubkey,
+        &k_pubkey,
+        &input_pubkeys,
+        &decoder_pubkeys,
+        &k,
+    );
     gpu_device_sync();
     info!(
         "diamond injector gpu preprocess: finished, elapsed_s={:.3}",
@@ -316,8 +321,15 @@ fn verify_gpu_online_eval_errors_below_simulation(
         crossing_point.crt_depth, crossing_point.q_bits
     );
     let online_started = Instant::now();
-    let (one_output, k_output, input_outputs, decoder_outputs) =
-        injector.online_eval(&input_digits, &one_pubkey, &input_pubkeys, &decoder_pubkeys);
+    let (one_output, k_output, input_outputs, decoder_outputs) = injector.online_eval(
+        dir.path(),
+        &preprocess_out,
+        &input_digits,
+        &one_pubkey,
+        &k_pubkey,
+        &input_pubkeys,
+        &decoder_pubkeys,
+    );
     gpu_device_sync();
     info!(
         "diamond injector gpu online_eval: finished, elapsed_s={:.3}",
@@ -334,7 +346,6 @@ fn verify_gpu_online_eval_errors_below_simulation(
         <GpuDCRTPolyMatrix as PolyMatrix>::P::const_one(&params),
         &crossing_point.max_error,
     );
-    let k_pubkey = sample_pubkey(&params, hash_key, "diamond_a_k_public_key");
     assert_k_encoding_residual_below_bound(
         &params,
         &k_output,
@@ -727,16 +738,13 @@ fn test_gpu_diamond_injector_q_bits_vs_max_error_plot_generates_svg() {
         let params = gpu_params_for_crt_depth(ring_dim, crt_depth, crt_bits, base_bits, &gpu_ids);
         let injector = TestInjector::new(
             params,
-            hash_key,
             input_count,
             input_base,
-            DIAMOND_INJECTOR_DECODER_COUNT,
             DIAMOND_INJECTOR_TRAPDOOR_SIGMA,
             DIAMOND_INJECTOR_ERROR_SIGMA,
-            std::env::temp_dir(),
         )
         .with_gpu_device_ids(gpu_ids.clone());
-        let simulated = injector.simulate_output_error_bounds();
+        let simulated = injector.simulate_output_error_bounds(DIAMOND_INJECTOR_DECODER_COUNT);
         let max_input_error = simulated
             .input_errors
             .iter()

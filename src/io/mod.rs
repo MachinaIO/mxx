@@ -1,17 +1,23 @@
-/// Interface for indistinguishability obfuscation schemes.
-pub trait IndisObf {
-    /// Function type accepted by the obfuscator.
-    type Func;
-    /// Obfuscated representation produced by the obfuscator.
-    type Obfuscation;
-    /// Input type accepted by evaluation.
+pub mod diamond_io;
+
+use std::path::Path;
+
+pub use diamond_io::{DiamondIO, DiamondIOFuncType, DiamondIOObf};
+
+/// Common interface for indistinguishability obfuscation schemes.
+pub trait Obfuscation {
+    /// User-facing function descriptor accepted by the obfuscator.
+    type FuncType;
+    /// Persistable obfuscation object produced by preprocessing the function.
+    type Obf;
+    /// Plain input type accepted by online evaluation.
     type Input;
-    /// Output type returned by evaluation.
+    /// Plain output type returned by online evaluation.
     type Output;
 
-    /// Obfuscate `func`.
-    fn obfuscation(&self, func: Self::Func) -> Self::Obfuscation;
+    /// Obfuscate `func`, storing any large preprocessing artifacts under `dir_path`.
+    fn obfuscation(&self, dir_path: &Path, func: Self::FuncType) -> Self::Obf;
 
-    /// Evaluate `obf` on `input`.
-    fn eval(&self, obf: &Self::Obfuscation, input: Self::Input) -> Self::Output;
+    /// Evaluate `obf` on `input`, reading persisted artifacts from `dir_path`.
+    fn eval(&self, dir_path: &Path, obf: &Self::Obf, input: Self::Input) -> Self::Output;
 }

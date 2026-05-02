@@ -224,6 +224,7 @@ where
         graph_seed,
         cbd_n,
         num_slots,
+        false,
     );
     let mut inputs = enc_seeds.to_vec();
     inputs.push(decryption_key.clone());

@@ -2,32 +2,182 @@ use crate::{
     bench_estimator::{
         BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary, benchmark_gate_operation,
     },
-    bgg::naive_vec::{NaiveBGGEncodingVec, NaiveBGGPublicKeyVec},
+    bgg::{
+        encoding::BggEncoding,
+        naive_vec::{NaiveBGGEncodingVec, NaiveBGGPublicKeyVec},
+        public_key::BggPublicKey,
+    },
     circuit::{BatchedWire, PolyCircuit, evaluable::Evaluable},
     gadgets::{
-        arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner},
-        fhe::ring_gsw::{RingGswCiphertext, RingGswContext},
+        arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner, NestedRnsPolyContext},
+        fhe::{
+            ring_gsw::{RingGswCiphertext, RingGswContext},
+            ring_gsw_nested_rns::{
+                ciphertext_inputs_from_native, encrypt_plaintext_bit, sample_public_key,
+            },
+        },
     },
     lookup::PltEvaluator,
     matrix::PolyMatrix,
     noise_refresh::{
-        NoiseRefresher,
-        circuit_decrypt::build_refreshed_wire_digit_all_crt_decrypt,
+        NoiseRefresher, circuit_decrypt::build_refreshed_wire_digit_all_crt_decrypt,
         circuit_merge::build_refreshed_wire_digit_all_crt_merge,
-        circuit_prg::{
-            build_goldreich_encrypted_seeds_with_output, goldreich_noise_refresh_output_sizes,
-        },
+        circuit_prg::build_goldreich_encrypted_seed_material_ranges,
     },
-    poly::{Poly, PolyParams},
+    poly::{
+        Poly, PolyParams,
+        dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+    },
     sampler::{DistType, PolyHashSampler},
     slot_transfer::SlotTransferEvaluator,
 };
 use num_bigint::BigUint;
 use rayon::prelude::*;
 use std::{marker::PhantomData, sync::Arc};
-use tracing::debug;
+use tracing::{debug, info};
 
 const NATIVE_BENCH_ITERATIONS: usize = 1;
+
+pub fn debug_sample_prg_public_key_wires<M, HS>(
+    params: &<M::P as Poly>::Params,
+    hash_key: [u8; 32],
+    secret_size: usize,
+    label: &[u8],
+    round_idx: usize,
+    output_offset: usize,
+    wire_count: usize,
+    num_slots: usize,
+) -> Vec<NaiveBGGPublicKeyVec<M>>
+where
+    M: PolyMatrix,
+    HS: PolyHashSampler<[u8; 32], M = M>,
+{
+    let cols = secret_size * params.modulus_digits();
+    (0..wire_count)
+        .into_par_iter()
+        .map(|wire_idx| {
+            let hash_sampler = HS::new();
+            let keys = (0..num_slots)
+                .map(|slot_idx| {
+                    let mut tag =
+                        Vec::with_capacity(label.len() + 3 * std::mem::size_of::<usize>() + 1);
+                    tag.extend_from_slice(label);
+                    tag.extend_from_slice(&round_idx.to_le_bytes());
+                    tag.extend_from_slice(&output_offset.to_le_bytes());
+                    tag.extend_from_slice(&wire_idx.to_le_bytes());
+                    tag.extend_from_slice(&slot_idx.to_le_bytes());
+                    BggPublicKey::new(
+                        hash_sampler.sample_hash(
+                            params,
+                            hash_key,
+                            &tag,
+                            secret_size,
+                            cols,
+                            DistType::FinRingDist,
+                        ),
+                        true,
+                    )
+                })
+                .collect::<Vec<_>>();
+            NaiveBGGPublicKeyVec::new(params, keys)
+        })
+        .collect()
+}
+
+pub fn debug_sample_prg_plaintext_wires<P>(
+    params: &P::Params,
+    native_params: &DCRTPolyParams,
+    ring_gsw_context: &NestedRnsPolyContext,
+    ring_gsw_width: usize,
+    native_fhe_decryption_key: &DCRTPoly,
+    hash_key: [u8; 32],
+    label: &[u8],
+    wire_count: usize,
+    level_offset: usize,
+    enable_levels: Option<usize>,
+) -> Vec<crate::circuit::evaluable::PolyVec<P>>
+where
+    P: Poly,
+{
+    let public_key = sample_public_key(
+        native_params,
+        ring_gsw_width,
+        native_fhe_decryption_key,
+        hash_key,
+        label,
+        None,
+    );
+    (0..wire_count)
+        .flat_map(|_| {
+            let bit = rand::random::<bool>();
+            let ciphertext =
+                encrypt_plaintext_bit(native_params, ring_gsw_context, &public_key, bit);
+            ciphertext_inputs_from_native::<P>(
+                params,
+                ring_gsw_context,
+                &ciphertext,
+                level_offset,
+                enable_levels,
+            )
+        })
+        .take(wire_count)
+        .collect()
+}
+
+pub fn debug_sample_prg_encoding_wires<M, HS>(
+    params: &<M::P as Poly>::Params,
+    hash_key: [u8; 32],
+    secret: &[M::P],
+    plaintexts: &[crate::circuit::evaluable::PolyVec<M::P>],
+    label: &[u8],
+    round_idx: usize,
+    output_offset: usize,
+    num_slots: usize,
+) -> Vec<NaiveBGGEncodingVec<M>>
+where
+    M: PolyMatrix,
+    HS: PolyHashSampler<[u8; 32], M = M>,
+{
+    let public_keys = debug_sample_prg_public_key_wires::<M, HS>(
+        params,
+        hash_key,
+        secret.len(),
+        label,
+        round_idx,
+        output_offset,
+        plaintexts.len(),
+        num_slots,
+    );
+    let secret_vec = M::from_poly_vec_row(params, secret.to_vec());
+    let secret_gadget = secret_vec.clone() * M::gadget_matrix(params, secret.len());
+    let secret_vec_bytes = Arc::<[u8]>::from(secret_vec.into_compact_bytes());
+    let secret_gadget_bytes = Arc::<[u8]>::from(secret_gadget.into_compact_bytes());
+    plaintexts
+        .par_iter()
+        .zip(public_keys.into_par_iter())
+        .map(|(plaintext, public_key_vec)| {
+            let secret_vec = M::from_compact_bytes(params, secret_vec_bytes.as_ref());
+            let secret_gadget = M::from_compact_bytes(params, secret_gadget_bytes.as_ref());
+            assert_eq!(
+                plaintext.len(),
+                num_slots,
+                "debug PRG plaintext slot count must match public-key slot count"
+            );
+            let encodings = (0..num_slots)
+                .map(|slot_idx| {
+                    let public_key = public_key_vec.key(slot_idx);
+                    let slot_plaintext = plaintext.as_slice()[slot_idx].clone();
+                    let encoded_plaintext =
+                        M::from_poly_vec_row(params, vec![slot_plaintext.clone()]);
+                    let vector = secret_vec.clone() * public_key.matrix.clone() -
+                        encoded_plaintext.tensor(&secret_gadget);
+                    BggEncoding::new(vector, public_key, Some(slot_plaintext))
+                })
+                .collect::<Vec<_>>();
+            NaiveBGGEncodingVec::new(params, encodings)
+        })
+        .collect()
+}
 
 fn scaled_estimate_summary(unit: CircuitBenchEstimate, task_count: usize) -> CircuitBenchSummary {
     let total_time = unit.total_time * task_count as f64;
@@ -50,6 +200,80 @@ fn estimate_summary(unit: CircuitBenchEstimate) -> CircuitBenchSummary {
     scaled_estimate_summary(unit, 1)
 }
 
+fn refresh_slot_id(refresh_id: &[u8], label: &[u8], idx: usize) -> Vec<u8> {
+    let mut id = Vec::with_capacity(refresh_id.len() + label.len() + std::mem::size_of::<usize>());
+    id.extend_from_slice(refresh_id);
+    id.extend_from_slice(label);
+    id.extend_from_slice(&idx.to_le_bytes());
+    id
+}
+
+fn debug_sample_decoded_refresh_terms<M, HS>(
+    params: &<M::P as Poly>::Params,
+    hash_key: [u8; 32],
+    label: &[u8],
+    num_slots: usize,
+    crt_depth: usize,
+    secret_size: usize,
+) -> Vec<M>
+where
+    M: PolyMatrix,
+    HS: PolyHashSampler<[u8; 32], M = M>,
+{
+    let log_base_q = params.modulus_digits();
+    let cols = secret_size
+        .checked_mul(log_base_q)
+        .expect("debug decoded refresh material column count overflow");
+    (0..num_slots * crt_depth)
+        .into_par_iter()
+        .map(|flat_idx| {
+            let hash_sampler = HS::new();
+            let mut tag = Vec::with_capacity(label.len() + std::mem::size_of::<usize>());
+            tag.extend_from_slice(label);
+            tag.extend_from_slice(&flat_idx.to_le_bytes());
+            hash_sampler.sample_hash(
+                params,
+                hash_key,
+                &tag,
+                secret_size,
+                cols,
+                DistType::FinRingDist,
+            )
+        })
+        .collect()
+}
+
+fn debug_sample_decoded_refresh_encoding_terms<M, HS>(
+    params: &<M::P as Poly>::Params,
+    hash_key: [u8; 32],
+    label: &[u8],
+    num_slots: usize,
+    crt_depth: usize,
+    secret: &[M::P],
+) -> Vec<M>
+where
+    M: PolyMatrix,
+    HS: PolyHashSampler<[u8; 32], M = M>,
+{
+    let public_terms = debug_sample_decoded_refresh_terms::<M, HS>(
+        params,
+        hash_key,
+        label,
+        num_slots,
+        crt_depth,
+        secret.len(),
+    );
+    let secret_vec = M::from_poly_vec_row(params, secret.to_vec());
+    let secret_vec_bytes = Arc::<[u8]>::from(secret_vec.into_compact_bytes());
+    public_terms
+        .into_par_iter()
+        .map(|public_term| {
+            let secret_vec = M::from_compact_bytes(params, secret_vec_bytes.as_ref());
+            secret_vec * public_term
+        })
+        .collect()
+}
+
 fn scaled_summary(summary: CircuitBenchSummary, task_count: usize) -> CircuitBenchSummary {
     let total_time = summary.total_time * task_count as f64;
     let max_parallelism = summary
@@ -65,6 +289,10 @@ fn scaled_summary(summary: CircuitBenchSummary, task_count: usize) -> CircuitBen
     {
         scaled
     }
+}
+
+fn expand_batched_wires(wires: &[BatchedWire]) -> Vec<BatchedWire> {
+    wires.iter().flat_map(|wire| (0..wire.len()).map(|idx| wire.at(idx))).collect()
 }
 
 fn sequential_summaries(parts: &[CircuitBenchSummary]) -> CircuitBenchSummary {
@@ -124,10 +352,6 @@ where
     }
 }
 
-fn expand_batched_wires(wires: &[BatchedWire]) -> Vec<BatchedWire> {
-    wires.iter().flat_map(|wire| (0..wire.len()).map(|idx| wire.at(idx))).collect()
-}
-
 /// Naive-vector implementation of one-wire noise refresh.
 ///
 /// The type is intentionally specialized to `NaiveBGGPublicKeyVec` and `NaiveBGGEncodingVec`.
@@ -146,6 +370,9 @@ where
     graph_seed: [u8; 32],
     cbd_n: usize,
     hash_key: [u8; 32],
+    debug_reuse_single_material: bool,
+    debug_secret: Option<Vec<M::P>>,
+    material_circuit: Arc<PolyCircuit<M::P>>,
     _hash_sampler: PhantomData<HS>,
 }
 
@@ -166,6 +393,17 @@ where
         assert!(seed_bits > 0, "seed_bits must be positive");
         assert!(v_bits > 0, "v_bits must be positive");
         assert!(cbd_n > 0, "cbd_n must be positive");
+        let debug_reuse_single_material = cfg!(test);
+        let num_slots = ring_gsw.params.ring_dimension() as usize;
+        let material_circuit = Arc::new(build_noise_refresh_material_circuit::<M::P, A, M>(
+            ring_gsw.clone(),
+            seed_bits,
+            v_bits,
+            graph_seed,
+            cbd_n,
+            num_slots,
+            debug_reuse_single_material,
+        ));
         Self {
             ring_gsw,
             seed_bits,
@@ -173,8 +411,33 @@ where
             graph_seed,
             cbd_n,
             hash_key,
+            debug_reuse_single_material,
+            debug_secret: None,
+            material_circuit,
             _hash_sampler: PhantomData,
         }
+    }
+
+    pub fn with_debug_reuse_single_material(mut self, enabled: bool) -> Self {
+        self.debug_reuse_single_material = cfg!(test) && enabled;
+        let num_slots = self.ring_gsw.params.ring_dimension() as usize;
+        self.material_circuit = Arc::new(build_noise_refresh_material_circuit::<M::P, A, M>(
+            self.ring_gsw.clone(),
+            self.seed_bits,
+            self.v_bits,
+            self.graph_seed,
+            self.cbd_n,
+            num_slots,
+            self.debug_reuse_single_material,
+        ));
+        self
+    }
+
+    pub fn with_debug_secret(mut self, secret: Option<Vec<M::P>>) -> Self {
+        if cfg!(test) {
+            self.debug_secret = secret;
+        }
+        self
     }
 
     fn params(&self) -> &<M::P as Poly>::Params {
@@ -213,6 +476,7 @@ where
             self.graph_seed,
             self.cbd_n,
             num_slots,
+            self.debug_reuse_single_material,
         );
         let public_material_summary =
             public_key_estimator.estimate_circuit_bench(&material_circuit);
@@ -290,6 +554,7 @@ where
             self.graph_seed,
             self.cbd_n,
             num_slots,
+            self.debug_reuse_single_material,
         );
         let online_material_summary = encoding_estimator.estimate_circuit_bench(&material_circuit);
 
@@ -355,6 +620,556 @@ where
     }
 }
 
+impl<M, A, HS> NoiseRefresherNaiveVec<M, A, HS>
+where
+    M: PolyMatrix + 'static,
+    M::P: 'static,
+    A: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+{
+    pub fn preprocess_many<PE, ST>(
+        &self,
+        refresh_ids: &[Vec<u8>],
+        one: &NaiveBGGPublicKeyVec<M>,
+        refreshed_inputs: &[NaiveBGGPublicKeyVec<M>],
+        enc_seeds: &[NaiveBGGPublicKeyVec<M>],
+        decryption_key: &NaiveBGGPublicKeyVec<M>,
+        plt_evaluator: &PE,
+        slot_transfer_evaluator: &ST,
+    ) -> Vec<(NaiveBGGPublicKeyVec<M>, Vec<NaiveBGGPublicKeyVec<M>>)>
+    where
+        PE: PltEvaluator<NaiveBGGPublicKeyVec<M>>,
+        ST: SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>,
+    {
+        info!(
+            target: "mxx::func_enc::aky24",
+            refresh_id_count = refresh_ids.len(),
+            refreshed_input_count = refreshed_inputs.len(),
+            seed_wire_count = enc_seeds.len(),
+            "naive-vector noise-refresh preprocess_many entered"
+        );
+        assert_eq!(
+            refresh_ids.len(),
+            refreshed_inputs.len(),
+            "refresh id count must match refreshed input count"
+        );
+        let num_slots = refreshed_inputs
+            .first()
+            .expect("preprocess_many requires at least one refreshed input")
+            .num_slots();
+        assert_eq!(
+            num_slots,
+            self.params().ring_dimension() as usize,
+            "Naive noise refresh currently expects one logical slot per ring coefficient"
+        );
+        debug!(
+            target: "mxx::func_enc::aky24",
+            "naive-vector noise-refresh preprocess_many checking refreshed input slots"
+        );
+        refreshed_inputs.par_iter().for_each(|input| one.assert_compatible(input));
+        one.assert_compatible(decryption_key);
+        debug!(
+            target: "mxx::func_enc::aky24",
+            "naive-vector noise-refresh preprocess_many checking encrypted seed slots"
+        );
+        enc_seeds.par_iter().for_each(|seed| one.assert_compatible(seed));
+
+        let (_q_moduli, _crt_bits, crt_depth) = self.params().to_crt();
+        let log_base_q = self.params().modulus_digits();
+        let secret_size = one.key(0).matrix.row_size();
+        if self.debug_reuse_single_material {
+            info!(
+                target: "mxx::func_enc::aky24",
+                num_slots,
+                crt_depth,
+                log_base_q,
+                "naive-vector noise-refresh preprocess_many sampling debug decoded material"
+            );
+            let decoded_refresh_terms = debug_sample_decoded_refresh_terms::<M, HS>(
+                self.params(),
+                self.hash_key,
+                b"noise-refresh-debug-material",
+                num_slots,
+                crt_depth,
+                secret_size,
+            );
+            return refresh_ids
+                .par_iter()
+                .zip(refreshed_inputs.par_iter())
+                .map(|(refresh_id, refreshed_input)| {
+                    self.preprocess_from_decoded(
+                        refresh_id,
+                        one,
+                        refreshed_input,
+                        &decoded_refresh_terms,
+                    )
+                })
+                .collect();
+        }
+
+        debug!(
+            target: "mxx::func_enc::aky24",
+            seed_wire_count = enc_seeds.len(),
+            refreshed_input_count = refreshed_inputs.len(),
+            "naive-vector noise-refresh preprocess_many cloning encrypted seed inputs"
+        );
+        let material_seed_bits = if self.debug_reuse_single_material { 5 } else { self.seed_bits };
+        let seed_wire_count = enc_seeds
+            .len()
+            .checked_div(self.seed_bits)
+            .expect("noise-refresh seed bit count must be positive");
+        assert_eq!(
+            seed_wire_count * self.seed_bits,
+            enc_seeds.len(),
+            "noise-refresh encrypted seed wire count must be divisible by seed_bits"
+        );
+        let material_seed_wire_count = material_seed_bits
+            .checked_mul(seed_wire_count)
+            .expect("noise-refresh material seed wire count overflow");
+        info!(
+            target: "mxx::func_enc::aky24",
+            num_slots,
+            seed_bits = self.seed_bits,
+            material_seed_bits,
+            v_bits = self.v_bits,
+            cbd_n = self.cbd_n,
+            "naive-vector noise-refresh preprocess_many preparing decoded material"
+        );
+        let started = std::time::Instant::now();
+        let mut inputs =
+            enc_seeds[..material_seed_wire_count].par_iter().cloned().collect::<Vec<_>>();
+        inputs.push(decryption_key.clone());
+        info!(
+            target: "mxx::func_enc::aky24",
+            input_count = inputs.len(),
+            output_count = self.material_circuit.num_output(),
+            "naive-vector noise-refresh preprocess_many evaluating cached material circuit once"
+        );
+        let decoded = self.material_circuit.eval(
+            self.params(),
+            one.clone(),
+            inputs,
+            Some(plt_evaluator),
+            Some(slot_transfer_evaluator as &dyn SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>),
+            None,
+        );
+        debug!(
+            target: "mxx::func_enc::aky24",
+            decoded_count = decoded.len(),
+            refreshed_input_count = refreshed_inputs.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "naive-vector noise-refresh preprocess_many material circuit evaluated"
+        );
+        if let Some(first_decoded) = decoded.first() {
+            if first_decoded.num_slots() > 0 {
+                let first_key = first_decoded.key(0);
+                info!(
+                    target: "mxx::func_enc::aky24",
+                    decoded_slots = first_decoded.num_slots(),
+                    decoded_rows = first_key.matrix.row_size(),
+                    decoded_cols = first_key.matrix.col_size(),
+                    "naive-vector noise-refresh preprocess_many first decoded material shape"
+                );
+            }
+        }
+        let decoded_row_size = decoded
+            .first()
+            .and_then(|value| (value.num_slots() > 0).then(|| value.key(0).matrix.row_size()))
+            .expect("noise-refresh decoded public material must be nonempty");
+        let unit_column_target =
+            M::unit_column_vector(self.params(), decoded_row_size, decoded_row_size - 1);
+        let decoded = decoded
+            .into_iter()
+            .map(|value| value.matrix_mul(self.params(), &unit_column_target))
+            .collect::<Vec<_>>();
+        let decoded_refresh_terms = decoded_refresh_terms_public(
+            self.params(),
+            &decoded,
+            num_slots,
+            crt_depth,
+            log_base_q,
+            secret_size,
+        );
+        refresh_ids
+            .par_iter()
+            .zip(refreshed_inputs.par_iter())
+            .map(|(refresh_id, refreshed_input)| {
+                self.preprocess_from_decoded(
+                    refresh_id,
+                    one,
+                    refreshed_input,
+                    &decoded_refresh_terms,
+                )
+            })
+            .collect()
+    }
+
+    pub fn online_eval_many<PE, ST>(
+        &self,
+        refresh_ids: &[Vec<u8>],
+        one: &NaiveBGGEncodingVec<M>,
+        refreshed_inputs: &[NaiveBGGEncodingVec<M>],
+        enc_seeds: &[NaiveBGGEncodingVec<M>],
+        decryption_key: &NaiveBGGEncodingVec<M>,
+        decoder_sets: &[Vec<M>],
+        plt_evaluator: &PE,
+        slot_transfer_evaluator: &ST,
+    ) -> Vec<NaiveBGGEncodingVec<M>>
+    where
+        PE: PltEvaluator<NaiveBGGEncodingVec<M>>,
+        ST: SlotTransferEvaluator<NaiveBGGEncodingVec<M>>,
+    {
+        info!(
+            target: "mxx::func_enc::aky24",
+            refresh_id_count = refresh_ids.len(),
+            refreshed_input_count = refreshed_inputs.len(),
+            seed_wire_count = enc_seeds.len(),
+            decoder_set_count = decoder_sets.len(),
+            "naive-vector noise-refresh online_eval_many entered"
+        );
+        assert_eq!(
+            refresh_ids.len(),
+            refreshed_inputs.len(),
+            "refresh id count must match refreshed input count"
+        );
+        assert_eq!(
+            refresh_ids.len(),
+            decoder_sets.len(),
+            "refresh id count must match decoder set count"
+        );
+        let num_slots = refreshed_inputs
+            .first()
+            .expect("online_eval_many requires at least one refreshed input")
+            .num_slots();
+        assert_eq!(
+            num_slots,
+            self.params().ring_dimension() as usize,
+            "Naive noise refresh currently expects one logical slot per ring coefficient"
+        );
+        debug!(
+            target: "mxx::func_enc::aky24",
+            "naive-vector noise-refresh online_eval_many checking refreshed input slots"
+        );
+        refreshed_inputs.par_iter().for_each(|input| one.assert_compatible(input));
+        one.assert_compatible(decryption_key);
+        debug!(
+            target: "mxx::func_enc::aky24",
+            "naive-vector noise-refresh online_eval_many checking encrypted seed slots"
+        );
+        enc_seeds.par_iter().for_each(|seed| one.assert_compatible(seed));
+
+        let (_q_moduli, _crt_bits, crt_depth) = self.params().to_crt();
+        let log_base_q = self.params().modulus_digits();
+        let secret_size = one.encoding(0).pubkey.matrix.row_size();
+        if self.debug_reuse_single_material {
+            info!(
+                target: "mxx::func_enc::aky24",
+                num_slots,
+                crt_depth,
+                log_base_q,
+                "naive-vector noise-refresh online_eval_many sampling debug decoded material"
+            );
+            let secret = self
+                .debug_secret
+                .as_ref()
+                .expect("debug noise-refresh encoding material requires the BGG secret");
+            assert_eq!(
+                secret.len(),
+                secret_size,
+                "debug noise-refresh secret size must match encoding secret size"
+            );
+            let decoded_refresh_terms = debug_sample_decoded_refresh_encoding_terms::<M, HS>(
+                self.params(),
+                self.hash_key,
+                b"noise-refresh-debug-material",
+                num_slots,
+                crt_depth,
+                secret,
+            );
+            return refresh_ids
+                .par_iter()
+                .zip(refreshed_inputs.par_iter())
+                .zip(decoder_sets.par_iter())
+                .map(|((refresh_id, refreshed_input), decoders)| {
+                    self.online_from_decoded(
+                        refresh_id,
+                        one,
+                        refreshed_input,
+                        &decoded_refresh_terms,
+                        decoders,
+                    )
+                })
+                .collect();
+        }
+
+        debug!(
+            target: "mxx::func_enc::aky24",
+            seed_wire_count = enc_seeds.len(),
+            refreshed_input_count = refreshed_inputs.len(),
+            "naive-vector noise-refresh online_eval_many cloning encrypted seed inputs"
+        );
+        let material_seed_bits = if self.debug_reuse_single_material { 5 } else { self.seed_bits };
+        let seed_wire_count = enc_seeds
+            .len()
+            .checked_div(self.seed_bits)
+            .expect("noise-refresh seed bit count must be positive");
+        assert_eq!(
+            seed_wire_count * self.seed_bits,
+            enc_seeds.len(),
+            "noise-refresh encrypted seed wire count must be divisible by seed_bits"
+        );
+        let material_seed_wire_count = material_seed_bits
+            .checked_mul(seed_wire_count)
+            .expect("noise-refresh material seed wire count overflow");
+        info!(
+            target: "mxx::func_enc::aky24",
+            num_slots,
+            seed_bits = self.seed_bits,
+            material_seed_bits,
+            v_bits = self.v_bits,
+            cbd_n = self.cbd_n,
+            "naive-vector noise-refresh online_eval_many preparing decoded material"
+        );
+        let started = std::time::Instant::now();
+        let mut inputs =
+            enc_seeds[..material_seed_wire_count].par_iter().cloned().collect::<Vec<_>>();
+        inputs.push(decryption_key.clone());
+        info!(
+            target: "mxx::func_enc::aky24",
+            input_count = inputs.len(),
+            output_count = self.material_circuit.num_output(),
+            "naive-vector noise-refresh online_eval_many evaluating cached material circuit once"
+        );
+        let decoded = self.material_circuit.eval(
+            self.params(),
+            one.clone(),
+            inputs,
+            Some(plt_evaluator),
+            Some(slot_transfer_evaluator as &dyn SlotTransferEvaluator<NaiveBGGEncodingVec<M>>),
+            None,
+        );
+        debug!(
+            target: "mxx::func_enc::aky24",
+            decoded_count = decoded.len(),
+            refreshed_input_count = refreshed_inputs.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "naive-vector noise-refresh online_eval_many material circuit evaluated"
+        );
+        if let Some(first_decoded) = decoded.first() {
+            if first_decoded.num_slots() > 0 {
+                let first_encoding = first_decoded.encoding(0);
+                info!(
+                    target: "mxx::func_enc::aky24",
+                    decoded_slots = first_decoded.num_slots(),
+                    decoded_rows = first_encoding.vector.row_size(),
+                    decoded_cols = first_encoding.vector.col_size(),
+                    "naive-vector noise-refresh online_eval_many first decoded material shape"
+                );
+            }
+        }
+        let decoded_row_size = decoded
+            .first()
+            .and_then(|value| {
+                (value.num_slots() > 0).then(|| value.encoding(0).pubkey.matrix.row_size())
+            })
+            .expect("noise-refresh decoded encoding material must be nonempty");
+        let unit_column_target =
+            M::unit_column_vector(self.params(), decoded_row_size, decoded_row_size - 1);
+        let decoded = decoded
+            .into_iter()
+            .map(|value| value.matrix_mul(self.params(), &unit_column_target))
+            .collect::<Vec<_>>();
+        let decoded_refresh_terms = decoded_refresh_terms_encoding(
+            self.params(),
+            &decoded,
+            num_slots,
+            crt_depth,
+            log_base_q,
+            secret_size,
+        );
+        refresh_ids
+            .par_iter()
+            .zip(refreshed_inputs.par_iter())
+            .zip(decoder_sets.par_iter())
+            .map(|((refresh_id, refreshed_input), decoders)| {
+                self.online_from_decoded(
+                    refresh_id,
+                    one,
+                    refreshed_input,
+                    &decoded_refresh_terms,
+                    decoders,
+                )
+            })
+            .collect()
+    }
+
+    fn preprocess_from_decoded(
+        &self,
+        refresh_id: &[u8],
+        one: &NaiveBGGPublicKeyVec<M>,
+        refreshed_input: &NaiveBGGPublicKeyVec<M>,
+        decoded_refresh_terms: &[M],
+    ) -> (NaiveBGGPublicKeyVec<M>, Vec<NaiveBGGPublicKeyVec<M>>) {
+        let num_slots = refreshed_input.num_slots();
+        let secret_size = one.key(0).matrix.row_size();
+        let hash_sampler = HS::new();
+        let a_prime = NaiveBGGPublicKeyVec::new(
+            self.params(),
+            (0..num_slots)
+                .into_par_iter()
+                .map(|slot_idx| {
+                    let slot_refresh_id = refresh_slot_id(refresh_id, b":a_prime:", slot_idx);
+                    BggPublicKey::new(
+                        hash_sampler.sample_hash(
+                            self.params(),
+                            self.hash_key,
+                            &slot_refresh_id,
+                            secret_size,
+                            secret_size * self.params().modulus_digits(),
+                            DistType::FinRingDist,
+                        ),
+                        true,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let (_q_moduli, _crt_bits, crt_depth) = self.params().to_crt();
+        assert_eq!(decoded_refresh_terms.len(), num_slots * crt_depth);
+        let refresh_keys = (0..crt_depth)
+            .into_par_iter()
+            .map(|crt_idx| {
+                NaiveBGGPublicKeyVec::new(
+                    self.params(),
+                    (0..num_slots)
+                        .map(|slot_idx| {
+                            let (q_over_qi, _reconst_coeff) = self.params().to_crt_coeffs(crt_idx);
+                            let one_key = one.key(slot_idx);
+                            let a_prime_key = a_prime.key(slot_idx);
+                            let refreshed_input_key = refreshed_input.key(slot_idx);
+                            // The one-term is evaluated with the natural `+(q/q_i) * A'` target,
+                            // then subtracted from the accumulated refresh matrix below. In the
+                            // online path this subtraction makes `online_terms - decoder` leave a
+                            // positive `+(q/q_i) * A'`.
+                            let one_term = one_key
+                                .matrix_mul(
+                                    self.params(),
+                                    &(a_prime_key.matrix.clone() *
+                                        constant_poly::<M>(self.params(), q_over_qi.clone())),
+                                )
+                                .matrix
+                                .clone();
+                            // The refreshed input target is positive `+(q/q_i) * G`, so online
+                            // subtraction of the decoder cancels the public `sA_x` part and
+                            // leaves `-xG`.
+                            let input_term = refreshed_input_key
+                                .matrix_mul(
+                                    self.params(),
+                                    &(M::gadget_matrix(self.params(), secret_size) *
+                                        constant_poly::<M>(self.params(), q_over_qi)),
+                                )
+                                .matrix
+                                .clone();
+                            let refresh_term =
+                                decoded_refresh_terms[slot_idx * crt_depth + crt_idx].clone();
+                            BggPublicKey::new(input_term + &refresh_term - &one_term, true)
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        (a_prime, refresh_keys)
+    }
+
+    fn online_from_decoded(
+        &self,
+        refresh_id: &[u8],
+        one: &NaiveBGGEncodingVec<M>,
+        refreshed_input: &NaiveBGGEncodingVec<M>,
+        decoded_refresh_terms: &[M],
+        decoders: &[M],
+    ) -> NaiveBGGEncodingVec<M> {
+        let num_slots = refreshed_input.num_slots();
+        let secret_size = one.encoding(0).pubkey.matrix.row_size();
+        let hash_sampler = HS::new();
+        let a_prime = NaiveBGGPublicKeyVec::new(
+            self.params(),
+            (0..num_slots)
+                .into_par_iter()
+                .map(|slot_idx| {
+                    let slot_refresh_id = refresh_slot_id(refresh_id, b":a_prime:", slot_idx);
+                    BggPublicKey::new(
+                        hash_sampler.sample_hash(
+                            self.params(),
+                            self.hash_key,
+                            &slot_refresh_id,
+                            secret_size,
+                            secret_size * self.params().modulus_digits(),
+                            DistType::FinRingDist,
+                        ),
+                        true,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let (_q_moduli, _crt_bits, crt_depth) = self.params().to_crt();
+        assert_eq!(decoded_refresh_terms.len(), num_slots * crt_depth);
+        assert_eq!(
+            decoders.len(),
+            num_slots * crt_depth,
+            "decoder count must equal num_slots * crt_depth"
+        );
+        let crt_level_vectors = (0..num_slots * crt_depth)
+            .into_par_iter()
+            .map(|flat_idx| {
+                let slot_idx = flat_idx / crt_depth;
+                let crt_idx = flat_idx % crt_depth;
+                let (q_over_qi, _reconst_coeff) = self.params().to_crt_coeffs(crt_idx);
+                // This mirrors preprocessing: evaluate the natural `+(q/q_i) * A'` target and
+                // subtract the resulting one-term from the online accumulation. Since BGG
+                // encodings have the form `sA - plaintext * target + error`, the final
+                // `online_terms - decoder` leaves `+(q/q_i) * A'`.
+                let a_prime_key = a_prime.key(slot_idx);
+                let one_term = one
+                    .encoding(slot_idx)
+                    .matrix_mul(
+                        self.params(),
+                        &(a_prime_key.matrix.clone() *
+                            constant_poly::<M>(self.params(), q_over_qi.clone())),
+                    )
+                    .vector
+                    .clone();
+                // The positive gadget target leaves the desired `-(q/q_i) * xG` after decoder
+                // subtraction.  Together with the `+A'` term and the decoded `+new_error`, the
+                // rounded CRT recomposition recovers `A' - xG + new_error`.
+                let input_term = refreshed_input
+                    .encoding(slot_idx)
+                    .matrix_mul(
+                        self.params(),
+                        &(M::gadget_matrix(self.params(), secret_size) *
+                            constant_poly::<M>(self.params(), q_over_qi)),
+                    )
+                    .vector
+                    .clone();
+                let refresh_term = decoded_refresh_terms[slot_idx * crt_depth + crt_idx].clone();
+                input_term + &refresh_term - &one_term - &decoders[flat_idx]
+            })
+            .collect::<Vec<_>>();
+        let refreshed: M = crt_recompose_rows(self.params(), &crt_level_vectors, num_slots);
+        NaiveBGGEncodingVec::new(
+            self.params(),
+            (0..num_slots)
+                .map(|slot_idx| {
+                    BggEncoding::new(
+                        refreshed.slice_rows(slot_idx, slot_idx + 1),
+                        a_prime.key(slot_idx),
+                        None,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
 impl<M, A, HS> NoiseRefresher<NaiveBGGPublicKeyVec<M>, NaiveBGGEncodingVec<M>, M>
     for NoiseRefresherNaiveVec<M, A, HS>
 where
@@ -372,100 +1187,23 @@ where
         decryption_key: &NaiveBGGPublicKeyVec<M>,
         plt_evaluator: &PE,
         slot_transfer_evaluator: &ST,
-    ) -> (M, Vec<M>)
+    ) -> (NaiveBGGPublicKeyVec<M>, Vec<NaiveBGGPublicKeyVec<M>>)
     where
         PE: PltEvaluator<NaiveBGGPublicKeyVec<M>>,
         ST: SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>,
     {
-        assert_eq!(enc_seeds.len(), self.seed_bits, "encrypted seed count mismatch");
-        let num_slots = refreshed_input.num_slots();
-        assert_eq!(
-            num_slots,
-            self.params().ring_dimension() as usize,
-            "Naive noise refresh currently expects one logical slot per ring coefficient"
-        );
-        one.assert_compatible(refreshed_input);
-        one.assert_compatible(decryption_key);
-        for seed in enc_seeds {
-            one.assert_compatible(seed);
-        }
-
-        let circuit = build_noise_refresh_material_circuit::<M::P, A, M>(
-            self.ring_gsw.clone(),
-            self.seed_bits,
-            self.v_bits,
-            self.graph_seed,
-            self.cbd_n,
-            num_slots,
-        );
-        let mut inputs = enc_seeds.to_vec();
-        inputs.push(decryption_key.clone());
-        let decoded = circuit.eval(
-            self.params(),
-            one.clone(),
-            inputs,
-            Some(plt_evaluator),
-            Some(slot_transfer_evaluator as &dyn SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>),
-            None,
-        );
-        let unit_column_target = M::identity(self.params(), 1, None);
-        let decoded = decoded
-            .into_par_iter()
-            .map(|value| value.matrix_mul(self.params(), &unit_column_target))
-            .collect::<Vec<_>>();
-        let a_prime = HS::new().sample_hash(
-            self.params(),
-            self.hash_key,
-            refresh_id,
-            1,
-            self.params().modulus_digits(),
-            DistType::FinRingDist,
-        );
-        let (_q_moduli, _crt_bits, crt_depth) = self.params().to_crt();
-        let log_base_q = self.params().modulus_digits();
-        assert_eq!(decoded.len(), num_slots * crt_depth * log_base_q);
-        let refresh_matrices = (0..num_slots * crt_depth)
-            .into_par_iter()
-            .map(|flat_idx| {
-                let slot_idx = flat_idx / crt_depth;
-                let crt_idx = flat_idx % crt_depth;
-                let (q_over_qi, _reconst_coeff) = self.params().to_crt_coeffs(crt_idx);
-                // The one-term is evaluated with the natural `+(q/q_i) * A'` target, then
-                // subtracted from the accumulated refresh matrix below. In the online path this
-                // subtraction makes `online_terms - decoder` leave a positive `+(q/q_i) * A'`.
-                let one_term = one.keys[slot_idx]
-                    .matrix_mul(
-                        self.params(),
-                        &(a_prime.clone() * constant_poly::<M>(self.params(), q_over_qi.clone())),
-                    )
-                    .matrix
-                    .clone();
-                // The refreshed input target is positive `+(q/q_i) * G`, so online subtraction of
-                // the decoder cancels the public `sA_x` part and leaves `-xG`.
-                let input_term = refreshed_input.keys[slot_idx]
-                    .matrix_mul(
-                        self.params(),
-                        &(M::gadget_matrix(self.params(), 1) *
-                            constant_poly::<M>(self.params(), q_over_qi)),
-                    )
-                    .matrix
-                    .clone();
-                let columns = (0..log_base_q)
-                    .map(|digit_idx| {
-                        let idx =
-                            slot_idx * crt_depth * log_base_q + crt_idx * log_base_q + digit_idx;
-                        collapse_slot_matrices(
-                            self.params(),
-                            decoded[idx].num_slots(),
-                            |slot_idx| decoded[idx].keys[slot_idx].matrix.clone(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let refresh_term = concat_owned_columns(columns);
-                input_term + &refresh_term - &one_term
-            })
-            .collect();
-        (a_prime, refresh_matrices)
+        self.preprocess_many(
+            &[refresh_id.to_vec()],
+            one,
+            std::slice::from_ref(refreshed_input),
+            enc_seeds,
+            decryption_key,
+            plt_evaluator,
+            slot_transfer_evaluator,
+        )
+        .into_iter()
+        .next()
+        .expect("single preprocess call must produce one result")
     }
 
     fn online_eval<PE, ST>(
@@ -478,107 +1216,24 @@ where
         decoders: &[M],
         plt_evaluator: &PE,
         slot_transfer_evaluator: &ST,
-    ) -> M
+    ) -> NaiveBGGEncodingVec<M>
     where
         PE: PltEvaluator<NaiveBGGEncodingVec<M>>,
         ST: SlotTransferEvaluator<NaiveBGGEncodingVec<M>>,
     {
-        assert_eq!(enc_seeds.len(), self.seed_bits, "encrypted seed count mismatch");
-        let num_slots = refreshed_input.num_slots();
-        assert_eq!(
-            num_slots,
-            self.params().ring_dimension() as usize,
-            "Naive noise refresh currently expects one logical slot per ring coefficient"
-        );
-        one.assert_compatible(refreshed_input);
-        one.assert_compatible(decryption_key);
-        for seed in enc_seeds {
-            one.assert_compatible(seed);
-        }
-
-        let circuit = build_noise_refresh_material_circuit::<M::P, A, M>(
-            self.ring_gsw.clone(),
-            self.seed_bits,
-            self.v_bits,
-            self.graph_seed,
-            self.cbd_n,
-            num_slots,
-        );
-        let mut inputs = enc_seeds.to_vec();
-        inputs.push(decryption_key.clone());
-        let decoded = circuit.eval(
-            self.params(),
-            one.clone(),
-            inputs,
-            Some(plt_evaluator),
-            Some(slot_transfer_evaluator as &dyn SlotTransferEvaluator<NaiveBGGEncodingVec<M>>),
-            None,
-        );
-        let unit_column_target = M::identity(self.params(), 1, None);
-        let decoded = decoded
-            .into_par_iter()
-            .map(|value| value.matrix_mul(self.params(), &unit_column_target))
-            .collect::<Vec<_>>();
-        let a_prime = HS::new().sample_hash(
-            self.params(),
-            self.hash_key,
-            refresh_id,
-            1,
-            self.params().modulus_digits(),
-            DistType::FinRingDist,
-        );
-        let (_q_moduli, _crt_bits, crt_depth) = self.params().to_crt();
-        let log_base_q = self.params().modulus_digits();
-        assert_eq!(decoded.len(), num_slots * crt_depth * log_base_q);
-        assert_eq!(
-            decoders.len(),
-            num_slots * crt_depth,
-            "decoder count must equal num_slots * crt_depth"
-        );
-        let crt_level_vectors = (0..num_slots * crt_depth)
-            .into_par_iter()
-            .map(|flat_idx| {
-                let slot_idx = flat_idx / crt_depth;
-                let crt_idx = flat_idx % crt_depth;
-                let (q_over_qi, _reconst_coeff) = self.params().to_crt_coeffs(crt_idx);
-                // This mirrors preprocessing: evaluate the natural `+(q/q_i) * A'` target and
-                // subtract the resulting one-term from the online accumulation. Since BGG
-                // encodings have the form `sA - plaintext * target + error`, the final
-                // `online_terms - decoder` leaves `+(q/q_i) * A'`.
-                let one_term = one.encodings[slot_idx]
-                    .matrix_mul(
-                        self.params(),
-                        &(a_prime.clone() * constant_poly::<M>(self.params(), q_over_qi.clone())),
-                    )
-                    .vector
-                    .clone();
-                // The positive gadget target leaves the desired `-(q/q_i) * xG` after decoder
-                // subtraction.  Together with the `+A'` term and the decoded `+new_error`, the
-                // rounded CRT recomposition recovers `A' - xG + new_error`.
-                let input_term = refreshed_input.encodings[slot_idx]
-                    .matrix_mul(
-                        self.params(),
-                        &(M::gadget_matrix(self.params(), 1) *
-                            constant_poly::<M>(self.params(), q_over_qi)),
-                    )
-                    .vector
-                    .clone();
-                let columns = (0..log_base_q)
-                    .map(|digit_idx| {
-                        let idx =
-                            slot_idx * crt_depth * log_base_q + crt_idx * log_base_q + digit_idx;
-                        collapse_slot_matrices(
-                            self.params(),
-                            decoded[idx].num_slots(),
-                            |slot_idx| decoded[idx].encodings[slot_idx].vector.clone(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let refresh_term = concat_owned_columns(columns);
-                input_term + &refresh_term - &one_term - &decoders[flat_idx]
-            })
-            .collect::<Vec<_>>();
-        crt_recompose_rows(self.params(), &crt_level_vectors, num_slots)
+        self.online_eval_many(
+            &[refresh_id.to_vec()],
+            one,
+            std::slice::from_ref(refreshed_input),
+            enc_seeds,
+            decryption_key,
+            &[decoders.to_vec()],
+            plt_evaluator,
+            slot_transfer_evaluator,
+        )
+        .into_iter()
+        .next()
+        .expect("single online_eval call must produce one result")
     }
 }
 
@@ -594,6 +1249,7 @@ pub(crate) fn build_noise_refresh_material_circuit<P, A, M>(
     graph_seed: [u8; 32],
     cbd_n: usize,
     num_slots: usize,
+    debug_reuse_single_material: bool,
 ) -> PolyCircuit<P>
 where
     P: Poly + 'static,
@@ -603,17 +1259,19 @@ where
     assert!(num_slots > 0, "num_slots must be positive");
     let ring_dim = ring_gsw.params.ring_dimension() as usize;
     assert_eq!(num_slots, ring_dim, "num_slots must match ring_dim");
-    let log_base_q = ring_gsw.params.modulus_digits();
-    let (_q_moduli, _crt_bits, crt_depth) = ring_gsw.params.to_crt();
-    let output_sizes =
-        goldreich_noise_refresh_output_sizes(ring_dim, log_base_q, crt_depth, v_bits);
-    let mask_q_chunk_len = ring_dim.checked_mul(v_bits).expect("mask chunk length overflow");
 
     let mut circuit = ring_gsw.fresh_circuit();
-    let seed_inputs = (0..seed_bits)
+    let material_seed_bits = if debug_reuse_single_material { 5 } else { seed_bits };
+    assert!(
+        seed_bits >= material_seed_bits,
+        "noise-refresh material seed bits must not exceed configured seed bits"
+    );
+    let seed_inputs = (0..material_seed_bits)
         .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
         .collect::<Vec<_>>();
     let decryption_key = circuit.input(1).at(0).as_single_wire();
+    let seed_wires =
+        seed_inputs.iter().flat_map(RingGswCiphertext::sub_circuit_wires).collect::<Vec<_>>();
     let ciphertext_template = {
         let mut template_circuit = ring_gsw.fresh_circuit();
         RingGswCiphertext::input(ring_gsw.clone(), None, &mut template_circuit)
@@ -625,19 +1283,22 @@ where
     );
     let merge_sub_id = circuit
         .register_sub_circuit(build_refreshed_wire_digit_all_crt_merge::<P>(&ring_gsw.params));
-    let seed_wires =
-        seed_inputs.iter().flat_map(RingGswCiphertext::sub_circuit_wires).collect::<Vec<_>>();
-    let mut outputs = Vec::with_capacity(num_slots * crt_depth * log_base_q);
-
-    for slot_idx in 0..num_slots {
+    let mut outputs = Vec::new();
+    let log_base_q = ring_gsw.params.modulus_digits();
+    let (_q_moduli, _crt_bits, crt_depth) = ring_gsw.params.to_crt();
+    let mask_q_chunk_len = ring_dim.checked_mul(v_bits).expect("mask q chunk length overflow");
+    let debug_material = if debug_reuse_single_material {
         let prg_sub_id =
-            circuit.register_sub_circuit(build_goldreich_encrypted_seeds_with_output::<P, A>(
+            circuit.register_sub_circuit(build_goldreich_encrypted_seed_material_ranges::<P, A>(
                 ring_gsw.clone(),
-                seed_bits,
+                material_seed_bits,
                 v_bits,
                 graph_seed,
                 cbd_n,
-                slot_idx,
+                0,
+                0,
+                1,
+                &[(0, 1)],
             ));
         let prg_outputs =
             expand_batched_wires(&circuit.call_sub_circuit(prg_sub_id, seed_wires.clone()));
@@ -645,31 +1306,84 @@ where
             .chunks_exact(ciphertext_wire_count)
             .map(|chunk| RingGswCiphertext::from_sub_circuit_outputs(&ciphertext_template, chunk))
             .collect::<Vec<_>>();
-        assert_eq!(logical_outputs.len(), output_sizes.total);
-        let (errors, masks) = logical_outputs.split_at(output_sizes.cbd_values);
+        assert_eq!(
+            logical_outputs.len(),
+            2,
+            "debug noise-refresh material must contain one error and one mask ciphertext"
+        );
+        Some((logical_outputs[0].clone(), logical_outputs[1].clone()))
+    } else {
+        None
+    };
+    if let Some((debug_error, debug_mask)) = debug_material.as_ref() {
+        let mut decrypt_inputs = Vec::new();
+        decrypt_inputs.push(BatchedWire::single(decryption_key));
+        for _ in 0..ring_dim {
+            decrypt_inputs.extend(debug_error.sub_circuit_wires());
+        }
+        for _ in 0..crt_depth * mask_q_chunk_len {
+            decrypt_inputs.extend(debug_mask.sub_circuit_wires());
+        }
+        let decrypt_outputs = circuit.call_sub_circuit(decrypt_sub_id, decrypt_inputs);
+        let merge_outputs = circuit.call_sub_circuit(merge_sub_id, decrypt_outputs);
+        assert_eq!(merge_outputs.len(), crt_depth);
+        for _slot_idx in 0..num_slots {
+            for crt_output in merge_outputs.iter().take(crt_depth) {
+                for _digit_idx in 0..log_base_q {
+                    outputs.push(crt_output.clone());
+                }
+            }
+        }
+        circuit.output(outputs);
+        return circuit;
+    }
+
+    for slot_idx in 0..num_slots {
         let mut by_crt_digit =
             vec![vec![BatchedWire::single(decryption_key); log_base_q]; crt_depth];
-
         for digit_idx in 0..log_base_q {
+            let material;
+            let error_start = digit_idx * ring_dim;
+            let mask_ranges = (0..crt_depth)
+                .map(|crt_idx| {
+                    (
+                        crt_idx * log_base_q * mask_q_chunk_len + digit_idx * mask_q_chunk_len,
+                        mask_q_chunk_len,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let prg_sub_id = circuit.register_sub_circuit(
+                build_goldreich_encrypted_seed_material_ranges::<P, A>(
+                    ring_gsw.clone(),
+                    material_seed_bits,
+                    v_bits,
+                    graph_seed,
+                    cbd_n,
+                    slot_idx,
+                    error_start,
+                    ring_dim,
+                    &mask_ranges,
+                ),
+            );
+            let prg_outputs =
+                expand_batched_wires(&circuit.call_sub_circuit(prg_sub_id, seed_wires.clone()));
+            material = prg_outputs
+                .chunks_exact(ciphertext_wire_count)
+                .map(|chunk| {
+                    RingGswCiphertext::from_sub_circuit_outputs(&ciphertext_template, chunk)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                material.len(),
+                ring_dim + crt_depth * mask_q_chunk_len,
+                "noise-refresh ranged material output size mismatch"
+            );
+            let (errors, masks) = material.split_at(ring_dim);
+
             let mut decrypt_inputs = Vec::new();
             decrypt_inputs.push(BatchedWire::single(decryption_key));
-
-            let error_start = digit_idx * ring_dim;
-            decrypt_inputs.extend(
-                errors[error_start..error_start + ring_dim]
-                    .iter()
-                    .flat_map(RingGswCiphertext::sub_circuit_wires),
-            );
-
-            for crt_idx in 0..crt_depth {
-                let mask_start =
-                    crt_idx * log_base_q * mask_q_chunk_len + digit_idx * mask_q_chunk_len;
-                decrypt_inputs.extend(
-                    masks[mask_start..mask_start + mask_q_chunk_len]
-                        .iter()
-                        .flat_map(RingGswCiphertext::sub_circuit_wires),
-                );
-            }
+            decrypt_inputs.extend(errors.iter().flat_map(RingGswCiphertext::sub_circuit_wires));
+            decrypt_inputs.extend(masks.iter().flat_map(RingGswCiphertext::sub_circuit_wires));
 
             let decrypt_outputs = circuit.call_sub_circuit(decrypt_sub_id, decrypt_inputs);
             let merge_outputs = circuit.call_sub_circuit(merge_sub_id, decrypt_outputs);
@@ -680,7 +1394,6 @@ where
         }
         outputs.extend(by_crt_digit.into_iter().flatten());
     }
-
     circuit.output(outputs);
     circuit
 }
@@ -702,18 +1415,112 @@ where
         .expect("ring_dim must be positive")
 }
 
+fn decoded_refresh_terms_public<M>(
+    params: &<M::P as Poly>::Params,
+    decoded: &[NaiveBGGPublicKeyVec<M>],
+    num_slots: usize,
+    crt_depth: usize,
+    log_base_q: usize,
+    secret_size: usize,
+) -> Vec<M>
+where
+    M: PolyMatrix,
+{
+    assert_eq!(
+        decoded.len(),
+        num_slots * crt_depth * log_base_q,
+        "decoded public material count must equal num_slots * crt_depth * log_base_q",
+    );
+    (0..num_slots * crt_depth)
+        .into_par_iter()
+        .map(|flat_idx| {
+            let slot_idx = flat_idx / crt_depth;
+            let crt_idx = flat_idx % crt_depth;
+            let digit_terms = (0..log_base_q)
+                .map(|digit_idx| {
+                    let decoded_idx =
+                        slot_idx * crt_depth * log_base_q + crt_idx * log_base_q + digit_idx;
+                    let projected_digit =
+                        collapse_slot_matrices(params, decoded[decoded_idx].num_slots(), |idx| {
+                            decoded[decoded_idx].key(idx).matrix.clone()
+                        });
+                    embed_projected_digit_matrix(
+                        params,
+                        projected_digit,
+                        secret_size,
+                        log_base_q,
+                        digit_idx,
+                    )
+                })
+                .collect::<Vec<_>>();
+            sum_owned_matrices(digit_terms)
+        })
+        .collect()
+}
+
+fn decoded_refresh_terms_encoding<M>(
+    params: &<M::P as Poly>::Params,
+    decoded: &[NaiveBGGEncodingVec<M>],
+    num_slots: usize,
+    crt_depth: usize,
+    log_base_q: usize,
+    secret_size: usize,
+) -> Vec<M>
+where
+    M: PolyMatrix,
+{
+    assert_eq!(
+        decoded.len(),
+        num_slots * crt_depth * log_base_q,
+        "decoded encoding material count must equal num_slots * crt_depth * log_base_q",
+    );
+    (0..num_slots * crt_depth)
+        .into_par_iter()
+        .map(|flat_idx| {
+            let slot_idx = flat_idx / crt_depth;
+            let crt_idx = flat_idx % crt_depth;
+            let digit_terms = (0..log_base_q)
+                .map(|digit_idx| {
+                    let decoded_idx =
+                        slot_idx * crt_depth * log_base_q + crt_idx * log_base_q + digit_idx;
+                    let projected_digit =
+                        collapse_slot_matrices(params, decoded[decoded_idx].num_slots(), |idx| {
+                            decoded[decoded_idx].encoding(idx).vector.clone()
+                        });
+                    embed_projected_digit_matrix(
+                        params,
+                        projected_digit,
+                        secret_size,
+                        log_base_q,
+                        digit_idx,
+                    )
+                })
+                .collect::<Vec<_>>();
+            sum_owned_matrices(digit_terms)
+        })
+        .collect()
+}
+
 fn crt_recompose_rows<M>(params: &<M::P as Poly>::Params, crt_values: &[M], num_slots: usize) -> M
 where
     M: PolyMatrix,
 {
     let (q_moduli, _crt_bits, crt_depth) = params.to_crt();
     assert_eq!(crt_values.len(), num_slots * crt_depth);
+    let output_cols = crt_values
+        .first()
+        .expect("CRT recomposition requires at least one level vector")
+        .col_size();
+    debug_assert!(
+        crt_values.iter().all(|value| value.row_size() == 1 && value.col_size() == output_cols),
+        "CRT recomposition level vectors must be one-row matrices with a consistent column count"
+    );
     let q: Arc<BigUint> = params.modulus().into();
     let half_q = q.as_ref() / BigUint::from(2u64);
     let reconst_coeffs = params.reconst_coeffs();
     let rows = (0..num_slots)
         .map(|slot_idx| {
-            let mut row = M::zero(params, 1, params.modulus_digits());
+            let mut row = M::zero(params, 1, output_cols);
             for crt_idx in 0..crt_depth {
                 let level = &crt_values[slot_idx * crt_depth + crt_idx];
                 let (level_rows, level_cols) = level.size();
@@ -749,6 +1556,43 @@ where
 fn concat_owned_columns<M: PolyMatrix>(mut matrices: Vec<M>) -> M {
     let first = matrices.remove(0);
     first.concat_columns_owned(matrices)
+}
+
+fn sum_owned_matrices<M: PolyMatrix>(matrices: Vec<M>) -> M {
+    matrices
+        .into_iter()
+        .reduce(|acc, matrix| acc + &matrix)
+        .expect("at least one matrix is required")
+}
+
+fn embed_projected_digit_matrix<M>(
+    params: &<M::P as Poly>::Params,
+    projected_digit: M,
+    secret_size: usize,
+    log_base_q: usize,
+    digit_idx: usize,
+) -> M
+where
+    M: PolyMatrix,
+{
+    assert_eq!(
+        projected_digit.col_size(),
+        1,
+        "projected decoded noise-refresh digit must have one column"
+    );
+    assert!(digit_idx < log_base_q, "digit index must be in range");
+    let row_size = projected_digit.row_size();
+    let zero_column = M::zero(params, row_size, 1);
+    let columns = (0..secret_size * log_base_q)
+        .map(|col_idx| {
+            if col_idx % log_base_q == digit_idx {
+                projected_digit.clone()
+            } else {
+                zero_column.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    concat_owned_columns(columns)
 }
 
 fn constant_poly<M>(params: &<M::P as Poly>::Params, value: BigUint) -> M::P

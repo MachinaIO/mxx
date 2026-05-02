@@ -548,8 +548,8 @@ fn verify_naive_encoding_outputs(
         assert_eq!(encoding_vec.num_slots(), pubkey_vec.num_slots());
         assert_eq!(encoding_vec.num_slots(), expected_vec.len());
         for slot in 0..encoding_vec.num_slots() {
-            let encoding = &encoding_vec.encodings[slot];
-            assert_eq!(encoding.pubkey, pubkey_vec.keys[slot]);
+            let encoding = encoding_vec.encoding(slot);
+            assert_eq!(encoding.pubkey, pubkey_vec.key(slot));
             let expected = &expected_vec.as_slice()[slot];
             assert_eq!(
                 encoding.plaintext.as_ref().expect("naive BGG output plaintext should be revealed"),

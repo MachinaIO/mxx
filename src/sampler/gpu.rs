@@ -3,7 +3,10 @@ use crate::{
         PolyMatrix,
         gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuMatrixSampleDist},
     },
-    poly::{Poly, dcrt::gpu::GpuDCRTPolyParams},
+    poly::{
+        Poly,
+        dcrt::gpu::{GpuDCRTPolyParams, GpuRngSeed},
+    },
     sampler::{DistType, PolyHashSampler, PolyUniformSampler},
 };
 use digest::OutputSizeUser;
@@ -112,22 +115,30 @@ where
     }
 }
 
-fn hash_seed_for_matrix<H: digest::Digest>(key: [u8; 32], tag: &[u8]) -> u64 {
-    let mut hasher = H::new();
-    hasher.update(b"GpuDCRTPolyHashSampler/v1");
-    hasher.update(key);
-    hasher.update(tag);
-    let digest = hasher.finalize();
-    let mut seed_bytes = [0u8; 8];
-    let take = digest.len().min(seed_bytes.len());
-    seed_bytes[..take].copy_from_slice(&digest[..take]);
-    if take == 0 {
-        return 0;
+fn hash_seed_for_matrix<H: digest::Digest>(key: [u8; 32], tag: &[u8]) -> GpuRngSeed {
+    let mut seed_bytes = [0u8; 32];
+    let mut written = 0usize;
+    let mut counter = 0u32;
+    while written < seed_bytes.len() {
+        let mut hasher = H::new();
+        hasher.update(b"GpuDCRTPolyHashSampler/v2");
+        hasher.update(key);
+        hasher.update(tag);
+        hasher.update(counter.to_le_bytes());
+        let digest = hasher.finalize();
+        assert!(!digest.is_empty(), "digest output must not be empty");
+        let take = (seed_bytes.len() - written).min(digest.len());
+        seed_bytes[written..written + take].copy_from_slice(&digest[..take]);
+        written += take;
+        counter = counter.wrapping_add(1);
     }
-    for i in take..seed_bytes.len() {
-        seed_bytes[i] = digest[i % take];
-    }
-    u64::from_le_bytes(seed_bytes)
+    GpuRngSeed::from_bytes(seed_bytes)
+}
+
+pub(crate) fn random_gpu_rng_seed() -> GpuRngSeed {
+    let mut seed_bytes = [0u8; 32];
+    rng().fill(&mut seed_bytes);
+    GpuRngSeed::from_bytes(seed_bytes)
 }
 
 fn sample_gpu_matrix_native(
@@ -136,9 +147,7 @@ fn sample_gpu_matrix_native(
     ncol: usize,
     dist: DistType,
 ) -> GpuDCRTPolyMatrix {
-    let mut prng = rng();
-    let seed: u64 = prng.random();
-    sample_gpu_matrix_with_seed(params, nrow, ncol, dist, seed)
+    sample_gpu_matrix_with_seed(params, nrow, ncol, dist, random_gpu_rng_seed())
 }
 
 fn sample_gpu_matrix_with_seed(
@@ -146,7 +155,7 @@ fn sample_gpu_matrix_with_seed(
     nrow: usize,
     ncol: usize,
     dist: DistType,
-    seed: u64,
+    seed: GpuRngSeed,
 ) -> GpuDCRTPolyMatrix {
     if nrow == 0 || ncol == 0 {
         return GpuDCRTPolyMatrix::zero(params, nrow, ncol);
@@ -194,7 +203,7 @@ fn sample_gpu_matrix_with_seed_columns(
     col_start: usize,
     col_len: usize,
     dist: DistType,
-    seed: u64,
+    seed: GpuRngSeed,
 ) -> GpuDCRTPolyMatrix {
     if nrow == 0 || col_len == 0 {
         return GpuDCRTPolyMatrix::zero(params, nrow, col_len);
@@ -363,7 +372,7 @@ mod tests {
             4,
             5,
             DistType::GaussDist { sigma },
-            0x1234_5678_9abc_def0,
+            GpuRngSeed::from_bytes([0x5au8; 32]),
         );
 
         let bound = sigma * 6.0;

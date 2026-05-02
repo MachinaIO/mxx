@@ -444,6 +444,14 @@ impl<P: Poly> PolyCircuit<P> {
                     {
                         wires.insert(gate_id, value);
                     }
+                    for sibling_gate_id in call.output_gate_ids.iter().copied() {
+                        if sibling_gate_id == gate_id {
+                            continue;
+                        }
+                        let sibling_gate =
+                            self.gates.get(&sibling_gate_id).expect("gate not found").clone();
+                        release_consumed_inputs(&sibling_gate);
+                    }
                     sub_outputs[*output_idx].clone()
                 }
                 PolyGateType::SummedSubCircuitOutput { summed_call_id, .. } => {
@@ -508,6 +516,14 @@ impl<P: Poly> PolyCircuit<P> {
                         call.output_gate_ids.iter().copied().zip(accumulated)
                     {
                         wires.insert(output_gate_id, Arc::new(output.to_compact()));
+                    }
+                    for sibling_gate_id in call.output_gate_ids.iter().copied() {
+                        if sibling_gate_id == gate_id {
+                            continue;
+                        }
+                        let sibling_gate =
+                            self.gates.get(&sibling_gate_id).expect("gate not found").clone();
+                        release_consumed_inputs(&sibling_gate);
                     }
                     wires
                         .get(&gate_id)
@@ -745,20 +761,36 @@ impl<P: Poly> PolyCircuit<P> {
                 }
             }
             if !subcircuit_gates.is_empty() {
+                let mut seen_subcircuit_calls = HashSet::<(bool, usize)>::new();
+                let representative_subcircuit_gates = subcircuit_gates
+                    .iter()
+                    .copied()
+                    .filter(|gate_id| {
+                        match self.gates.get(gate_id).expect("gate not found").gate_type {
+                            PolyGateType::SubCircuitOutput { call_id, .. } => {
+                                seen_subcircuit_calls.insert((false, call_id))
+                            }
+                            PolyGateType::SummedSubCircuitOutput { summed_call_id, .. } => {
+                                seen_subcircuit_calls.insert((true, summed_call_id))
+                            }
+                            _ => false,
+                        }
+                    })
+                    .collect::<Vec<_>>();
                 #[cfg(feature = "gpu")]
                 {
                     let (eval_params, eval_one) = shard_params_and_one
                         .first()
                         .expect("at least one eval shard context required");
-                    subcircuit_gates
-                        .iter()
+                    representative_subcircuit_gates
+                        .par_iter()
                         .copied()
                         .for_each(|gate_id| eval_gate(gate_id, eval_params, eval_one));
                 }
                 #[cfg(not(feature = "gpu"))]
                 {
-                    subcircuit_gates
-                        .iter()
+                    representative_subcircuit_gates
+                        .par_iter()
                         .copied()
                         .for_each(|gate_id| eval_gate(gate_id, params, one));
                 }

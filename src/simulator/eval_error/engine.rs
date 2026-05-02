@@ -174,7 +174,7 @@ impl PolyCircuit<DCRTPoly> {
                             self.sub_circuit_call_shared_prefix_set_id(*call_id);
                         self.with_sub_circuit_call_by_id(
                             *call_id,
-                            |sub_circuit_id, param_bindings, _shared_prefix, suffix, _| {
+                            |sub_circuit_id, _, _shared_prefix, suffix, _| {
                                 let suffix_plaintext_norms = suffix
                                     .par_iter()
                                     .flat_map_iter(|batch| batch.gate_ids())
@@ -190,7 +190,6 @@ impl PolyCircuit<DCRTPoly> {
                                 (
                                     *call_id,
                                     sub_circuit_id,
-                                    param_bindings,
                                     shared_prefix_set_id,
                                     suffix_plaintext_norms,
                                 )
@@ -204,7 +203,6 @@ impl PolyCircuit<DCRTPoly> {
                         |(
                             call_id,
                             sub_circuit_id,
-                            param_bindings,
                             shared_prefix_set_id,
                             suffix_plaintext_norms,
                         )| {
@@ -237,8 +235,10 @@ impl PolyCircuit<DCRTPoly> {
                                 call_id,
                                 ErrorNormPreparedSubCircuitSummaryRequest {
                                     sub_circuit_id,
-                                    param_bindings,
                                     input_plaintext_profile,
+                                    input_max_plaintext_norm_ranges: self
+                                        .sub_circuit_call_input_max_plaintext_norm_ranges(call_id)
+                                        .map(|ranges| Arc::from(ranges.to_vec())),
                                 },
                             )
                         },
@@ -284,12 +284,7 @@ impl PolyCircuit<DCRTPoly> {
                                         }
                                         self.with_sub_circuit_call_by_id(
                                             *call_id,
-                                            |actual_sub_circuit_id,
-                                             _param_bindings,
-                                             shared_prefix,
-                                             suffix,
-                                             output_gate_ids| {
-                                                let _ = actual_sub_circuit_id;
+                                            |_, _, shared_prefix, suffix, output_gate_ids| {
                                                 assert_eq!(
                                                     output_gate_ids.len(),
                                                     summary.output_len(),
@@ -427,7 +422,7 @@ impl PolyCircuit<DCRTPoly> {
                 for summed_call_id in summed_call_chunk {
                     self.with_summed_sub_circuit_call_by_id(
                         *summed_call_id,
-                        |sub_circuit_id, call_input_set_ids, call_binding_set_ids, output_gate_ids| {
+                        |sub_circuit_id, call_input_set_ids, _, output_gate_ids| {
                             prepared_summed_call_count += 1;
                             let output_range =
                                 BatchedWire::from_batches(output_gate_ids.iter().copied());
@@ -446,8 +441,7 @@ impl PolyCircuit<DCRTPoly> {
                                     let batch_requests = call_input_set_ids[batch_start..batch_end]
                                         .iter()
                                         .copied()
-                                        .zip(call_binding_set_ids[batch_start..batch_end].iter().copied())
-                                        .map(|(input_set_id, binding_set_id)| {
+                                        .map(|input_set_id| {
                                             let input_plaintext_norms = self
                                                 .collect_error_norm_plaintext_norms_for_value_input_set(
                                                     self.input_set(input_set_id).as_ref(),
@@ -457,11 +451,15 @@ impl PolyCircuit<DCRTPoly> {
                                                 );
                                             ErrorNormPreparedSubCircuitSummaryRequest {
                                                 sub_circuit_id,
-                                                param_bindings: self.binding_set(binding_set_id),
                                                 input_plaintext_profile:
                                                     ErrorNormInputPlaintextProfile::flat_from_vec(
                                                         input_plaintext_norms,
                                                     ),
+                                                input_max_plaintext_norm_ranges: self
+                                                    .summed_sub_circuit_call_input_max_plaintext_norm_ranges(
+                                                        *summed_call_id,
+                                                    )
+                                                    .map(|ranges| Arc::from(ranges.to_vec())),
                                             }
                                         })
                                         .collect::<Vec<_>>();

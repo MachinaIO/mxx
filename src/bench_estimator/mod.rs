@@ -981,8 +981,9 @@ mod tests {
     #[sequential]
     fn test_estimate_circuit_bench_reuses_cached_subcircuit_summary_across_param_bindings() {
         let mut sub_circuit = PolyCircuit::<DCRTPoly>::new();
-        let scalar_param = sub_circuit
-            .register_sub_circuit_param(crate::circuit::SubCircuitParamKind::SmallScalarMul);
+        let scalar_param = sub_circuit.register_sub_circuit_param(
+            crate::circuit::SubCircuitParamSpec::SmallScalarMul { max_scalar: 3 },
+        );
         let sub_inputs = sub_circuit.input(1).to_vec();
         let scaled = sub_circuit.small_scalar_mul_param(sub_inputs[0], scalar_param);
         sub_circuit.output(vec![scaled]);

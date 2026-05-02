@@ -1,11 +1,16 @@
 use crate::{
     matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
     poly::{Poly, PolyParams, dcrt::gpu::GpuDCRTPolyParams},
-    sampler::{DistType, PolyTrapdoorSampler, PolyUniformSampler, gpu::GpuDCRTPolyUniformSampler},
+    sampler::{
+        DistType, PolyTrapdoorSampler, PolyUniformSampler,
+        gpu::{GpuDCRTPolyUniformSampler, random_gpu_rng_seed},
+    },
 };
-use rand::{Rng, rng};
 use rayon::prelude::*;
-use std::time::Instant;
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 const SIGMA: f64 = 4.578;
 const SPECTRAL_CONSTANT: f64 = 1.8;
@@ -19,14 +24,35 @@ struct GpuPerturbationSamples {
     p2: GpuDCRTPolyMatrix,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
+struct GpuP1CovarianceCacheEntry {
+    c: f64,
+    s: f64,
+    dgg_stddev: f64,
+    cache: Arc<crate::matrix::gpu_dcrt_poly::GpuP1CovarianceCache>,
+}
+
+#[derive(Debug, Clone)]
 pub struct GpuDCRTTrapdoor {
     pub r: GpuDCRTPolyMatrix,
     pub e: GpuDCRTPolyMatrix,
     a_mat_coeff: GpuDCRTPolyMatrix,
     b_mat_coeff: GpuDCRTPolyMatrix,
     d_mat_coeff: GpuDCRTPolyMatrix,
+    p1_covariance_cache: Arc<Mutex<Option<GpuP1CovarianceCacheEntry>>>,
 }
+
+impl PartialEq for GpuDCRTTrapdoor {
+    fn eq(&self, other: &Self) -> bool {
+        self.r == other.r &&
+            self.e == other.e &&
+            self.a_mat_coeff == other.a_mat_coeff &&
+            self.b_mat_coeff == other.b_mat_coeff &&
+            self.d_mat_coeff == other.d_mat_coeff
+    }
+}
+
+impl Eq for GpuDCRTTrapdoor {}
 
 impl GpuDCRTTrapdoor {
     pub fn new(params: &GpuDCRTPolyParams, size: usize, sigma: f64) -> Self {
@@ -38,7 +64,8 @@ impl GpuDCRTTrapdoor {
         let a_mat_coeff = coeff_cached_matrix(&(&r * &r.transpose()));
         let b_mat_coeff = coeff_cached_matrix(&(&r * &e.transpose()));
         let d_mat_coeff = coeff_cached_matrix(&(&e * &e.transpose()));
-        Self { r, e, a_mat_coeff, b_mat_coeff, d_mat_coeff }
+        let p1_covariance_cache = Arc::new(Mutex::new(None));
+        Self { r, e, a_mat_coeff, b_mat_coeff, d_mat_coeff, p1_covariance_cache }
     }
 
     pub fn to_compact_bytes(&self) -> Vec<u8> {
@@ -86,8 +113,53 @@ impl GpuDCRTTrapdoor {
         let a_mat_coeff = coeff_cached_matrix(&(&r * &r.transpose()));
         let b_mat_coeff = coeff_cached_matrix(&(&r * &e.transpose()));
         let d_mat_coeff = coeff_cached_matrix(&(&e * &e.transpose()));
-        Some(Self { r, e, a_mat_coeff, b_mat_coeff, d_mat_coeff })
+        let p1_covariance_cache = Arc::new(Mutex::new(None));
+        Some(Self { r, e, a_mat_coeff, b_mat_coeff, d_mat_coeff, p1_covariance_cache })
     }
+}
+
+fn p1_covariance_parameters(
+    params: &GpuDCRTPolyParams,
+    d: usize,
+    dgg_stddev: f64,
+) -> (f64, f64, f64) {
+    let base = 1 << params.base_bits();
+    let n = params.ring_dimension() as usize;
+    let k = params.modulus_digits();
+    let c = (base as f64 + 1.0) * SIGMA;
+    let s = SPECTRAL_CONSTANT *
+        (base as f64 + 1.0) *
+        SIGMA *
+        SIGMA *
+        (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+    (c, s, dgg_stddev)
+}
+
+fn get_or_create_p1_covariance_cache(
+    trapdoor: &GpuDCRTTrapdoor,
+    c: f64,
+    s: f64,
+    dgg_stddev: f64,
+) -> Arc<crate::matrix::gpu_dcrt_poly::GpuP1CovarianceCache> {
+    let mut guard = trapdoor.p1_covariance_cache.lock().expect("p1 cache mutex poisoned");
+    if let Some(entry) = guard.as_ref() &&
+        entry.c == c &&
+        entry.s == s &&
+        entry.dgg_stddev == dgg_stddev
+    {
+        return entry.cache.clone();
+    }
+
+    let cache = Arc::new(GpuDCRTPolyMatrix::create_p1_covariance_cache(
+        &trapdoor.a_mat_coeff,
+        &trapdoor.b_mat_coeff,
+        &trapdoor.d_mat_coeff,
+        c,
+        s,
+        dgg_stddev,
+    ));
+    *guard = Some(GpuP1CovarianceCacheEntry { c, s, dgg_stddev, cache: cache.clone() });
+    cache
 }
 
 #[derive(Debug, Clone)]
@@ -221,10 +293,9 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             "gpu preimage: computed perturbed_syndrome"
         );
 
-        let mut rng = rng();
-        let z_seed: u64 = rng.random();
         let gauss_start = Instant::now();
-        let z_hat_mat = perturbed_syndrome.gauss_samp_gq_arb_base(self.c, self.sigma, z_seed);
+        let z_hat_mat =
+            perturbed_syndrome.gauss_samp_gq_arb_base(self.c, self.sigma, random_gpu_rng_seed());
         tracing::debug!(
             elapsed_ms = gauss_start.elapsed().as_secs_f64() * 1_000.0,
             "gpu preimage: sampled z_hat_mat with gauss_samp_gq_arb_base"
@@ -387,17 +458,16 @@ fn sample_pert_square_mat_gpu_native_parts(
 
     // Keep perturbation generation on device: this sampler uses the full
     // 2d x 2d covariance induced by (A, B, D) and Tp2.
-    let mut prng = rng();
-    let p1_seed: u64 = prng.random();
-    let p1 = GpuDCRTPolyMatrix::sample_p1_full(
-        &trapdoor.a_mat_coeff,
-        &trapdoor.b_mat_coeff,
-        &trapdoor.d_mat_coeff,
+    debug_assert_eq!(
+        (c, s, dgg_stddev),
+        p1_covariance_parameters(params, d, dgg_stddev),
+        "cached p1 covariance parameters must match the current preimage parameters",
+    );
+    let p1_covariance_cache = get_or_create_p1_covariance_cache(trapdoor, c, s, dgg_stddev);
+    let p1 = GpuDCRTPolyMatrix::sample_p1_full_cached(
+        p1_covariance_cache.as_ref(),
         tp2,
-        c,
-        s,
-        dgg_stddev,
-        p1_seed,
+        random_gpu_rng_seed(),
     );
     tracing::debug!("gpu preimage sample_pert: sampled p1");
 
@@ -538,6 +608,32 @@ mod tests {
         let preimage = trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &target);
         let product = &public_matrix * &preimage;
         assert_eq!(product, target);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_preimage_reuses_trapdoor_cache_for_distinct_targets() {
+        gpu_device_sync();
+        let size = 3usize;
+        let cpu_params = gpu_test_params();
+        let params = gpu_params_from_cpu(&cpu_params);
+        let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+        let uniform_sampler = GpuDCRTPolyUniformSampler::new();
+
+        let first_target =
+            uniform_sampler.sample_uniform(&params, size, size, DistType::FinRingDist);
+        let second_target =
+            uniform_sampler.sample_uniform(&params, size, size, DistType::FinRingDist);
+        assert_ne!(first_target, second_target, "targets should differ");
+
+        let first_preimage =
+            trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &first_target);
+        let second_preimage =
+            trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &second_target);
+
+        assert_eq!(&public_matrix * &first_preimage, first_target);
+        assert_eq!(&public_matrix * &second_preimage, second_target);
     }
 
     #[test]

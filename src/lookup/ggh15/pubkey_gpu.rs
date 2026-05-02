@@ -156,7 +156,7 @@ where
         let needs_cross_device_copy =
             device_ids.iter().any(|&device_id| device_id != source_device_id);
         let b1_trapdoor_bytes = needs_cross_device_copy.then(|| TS::trapdoor_to_bytes(b1_trapdoor));
-        let b1_matrix_bytes = needs_cross_device_copy.then(|| b1_matrix.to_compact_bytes());
+        let b1_matrix_bytes = needs_cross_device_copy.then(|| b1_matrix.to_cpu_staging_bytes());
 
         device_ids
             .into_iter()
@@ -181,7 +181,10 @@ where
                                 "failed to deserialize trapdoor for preloaded LUT device resources",
                             ),
                         ),
-                        DeviceReplica::Owned(M::from_compact_bytes(&local_params, matrix_bytes)),
+                        DeviceReplica::Owned(M::from_cpu_staging_bytes(
+                            &local_params,
+                            matrix_bytes,
+                        )),
                     )
                 };
                 GpuLutBaseDeviceShared {
@@ -241,8 +244,8 @@ where
         let needs_cross_device_copy =
             device_ids.iter().any(|&device_id| device_id != source_device_id);
         let b0_trapdoor_bytes = needs_cross_device_copy.then(|| TS::trapdoor_to_bytes(b0_trapdoor));
-        let b0_matrix_bytes = needs_cross_device_copy.then(|| b0_matrix.to_compact_bytes());
-        let b1_matrix_bytes = needs_cross_device_copy.then(|| b1_matrix.to_compact_bytes());
+        let b0_matrix_bytes = needs_cross_device_copy.then(|| b0_matrix.to_cpu_staging_bytes());
+        let b1_matrix_bytes = needs_cross_device_copy.then(|| b1_matrix.to_cpu_staging_bytes());
 
         device_ids
             .into_iter()
@@ -272,8 +275,14 @@ where
                                     "failed to deserialize b0 trapdoor for preloaded gate device resources",
                                 ),
                             ),
-                            DeviceReplica::Owned(M::from_compact_bytes(&local_params, b0_bytes)),
-                            DeviceReplica::Owned(M::from_compact_bytes(&local_params, b1_bytes)),
+                            DeviceReplica::Owned(M::from_cpu_staging_bytes(
+                                &local_params,
+                                b0_bytes,
+                            )),
+                            DeviceReplica::Owned(M::from_cpu_staging_bytes(
+                                &local_params,
+                                b1_bytes,
+                            )),
                         )
                     };
                 GpuGateBaseDeviceShared {
@@ -301,14 +310,14 @@ where
             .expect("gpu params must include at least one device id");
         let needs_cross_device_copy =
             base_shared.iter().any(|device_shared| device_shared.device_id != source_device_id);
-        let bytes = needs_cross_device_copy.then(|| matrix.to_compact_bytes());
+        let bytes = needs_cross_device_copy.then(|| matrix.to_cpu_staging_bytes());
         base_shared
             .iter()
             .map(|device_shared| {
                 if device_shared.device_id == source_device_id {
                     DeviceReplica::Borrowed(matrix)
                 } else {
-                    DeviceReplica::Owned(M::from_compact_bytes(
+                    DeviceReplica::Owned(M::from_cpu_staging_bytes(
                         &device_shared.params,
                         bytes.as_ref().expect(
                             "cross-device gate replica requested without serialized source bytes",

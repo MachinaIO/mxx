@@ -1,6 +1,9 @@
 use super::{NegacyclicConvolutionContext, RingGswConvolution};
 use crate::{
-    circuit::{BatchedWire, PolyCircuit, SlotTransferSpec, SubCircuitParamValue, gate::GateId},
+    circuit::{
+        BatchedWire, PolyCircuit, SlotTransferSpec, SubCircuitParamSpec, SubCircuitParamValue,
+        gate::GateId,
+    },
     gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext},
     poly::Poly,
 };
@@ -8,6 +11,19 @@ use num_bigint::BigUint;
 use rayon::prelude::*;
 
 impl<P: Poly + 'static> NegacyclicConvolutionContext<P> for NestedRnsPolyContext {
+    fn q_level_diagonal_product_param_specs(&self) -> Vec<SubCircuitParamSpec> {
+        let mut specs = self
+            .p_moduli
+            .iter()
+            .map(|&p_i| SubCircuitParamSpec::SlotTransfer {
+                max_scalar: u32::try_from(p_i - 1)
+                    .expect("signed slot-transfer scalar must fit in u32"),
+            })
+            .collect::<Vec<_>>();
+        specs.push(SubCircuitParamSpec::SlotTransfer { max_scalar: 1 });
+        specs
+    }
+
     fn q_level_diagonal_product_param_bindings(
         &self,
         diagonal: usize,

@@ -18,7 +18,7 @@ use crate::poly::dcrt::gpu::detected_gpu_device_ids;
 use crate::{
     circuit::{
         Evaluable, GateParamSource, PolyGate, PolyGateKind, PolyGateType, SlotTransferSpec,
-        SubCircuitParamKind, SubCircuitParamValue, gate::GateId,
+        SubCircuitParamKind, SubCircuitParamSpec, SubCircuitParamValue, gate::GateId,
     },
     lookup::{PltEvaluator, PublicLut},
     poly::Poly,
@@ -170,6 +170,27 @@ pub(crate) fn iter_batched_wire_gates(
     batches: &[BatchedWire],
 ) -> impl Iterator<Item = GateId> + '_ {
     batches.iter().copied().flat_map(BatchedWire::gate_ids)
+}
+
+pub(crate) fn merge_contiguous_batched_wires<I, W>(batches: I) -> Vec<BatchedWire>
+where
+    I: IntoIterator<Item = W>,
+    W: Into<BatchedWire>,
+{
+    let mut merged = Vec::<BatchedWire>::new();
+    for batch in batches.into_iter().map(Into::into) {
+        if batch.is_empty() {
+            continue;
+        }
+        if let Some(last) = merged.last_mut() {
+            if last.end() == batch.start() {
+                *last = BatchedWire::new(last.start(), batch.end());
+                continue;
+            }
+        }
+        merged.push(batch);
+    }
+    merged
 }
 
 pub(crate) fn batched_wire_slice_at(batches: &[BatchedWire], idx: usize) -> GateId {
@@ -371,6 +392,7 @@ pub(crate) struct SubCircuitCall {
     pub(crate) shared_input_prefix_set_id: Option<usize>,
     pub(crate) input_suffix: Vec<BatchedWire>,
     pub(crate) binding_set_id: usize,
+    pub(crate) input_max_plaintext_norm_ranges: Option<Arc<[SubCircuitInputMaxPlaintextNormRange]>>,
     pub(crate) scoped_call_id: usize,
     pub(crate) output_gate_ids: Vec<GateId>,
     pub(crate) num_outputs: usize,
@@ -381,6 +403,7 @@ pub(crate) struct SubCircuitCallInfo {
     pub(crate) sub_circuit_id: usize,
     pub(crate) inputs: Vec<BatchedWire>,
     pub(crate) param_bindings: Arc<[SubCircuitParamValue]>,
+    pub(crate) input_max_plaintext_norm_ranges: Option<Arc<[SubCircuitInputMaxPlaintextNormRange]>>,
     pub(crate) output_gate_ids: Vec<GateId>,
 }
 
@@ -389,6 +412,7 @@ pub(crate) struct SummedSubCircuitCall {
     pub(crate) sub_circuit_id: usize,
     pub(crate) call_input_set_ids: Vec<usize>,
     pub(crate) call_binding_set_ids: Vec<usize>,
+    pub(crate) input_max_plaintext_norm_ranges: Option<Arc<[SubCircuitInputMaxPlaintextNormRange]>>,
     pub(crate) scoped_call_ids: Vec<usize>,
     pub(crate) output_gate_ids: Vec<GateId>,
     pub(crate) num_outputs: usize,
@@ -399,6 +423,7 @@ pub(crate) struct SummedSubCircuitCallInfo {
     pub(crate) sub_circuit_id: usize,
     pub(crate) call_inputs: Vec<Vec<BatchedWire>>,
     pub(crate) param_bindings: Vec<Arc<[SubCircuitParamValue]>>,
+    pub(crate) input_max_plaintext_norm_ranges: Option<Arc<[SubCircuitInputMaxPlaintextNormRange]>>,
     pub(crate) output_gate_ids: Vec<GateId>,
 }
 
@@ -435,7 +460,9 @@ pub struct PolyCircuit<P: Poly> {
     pub(crate) print_value: BTreeMap<GateId, String>,
     pub(crate) sub_circuit_calls: BTreeMap<usize, SubCircuitCall>,
     pub(crate) summed_sub_circuit_calls: BTreeMap<usize, SummedSubCircuitCall>,
-    pub(crate) sub_circuit_params: Vec<SubCircuitParamKind>,
+    pub(crate) sub_circuit_params: Vec<SubCircuitParamSpec>,
+    pub(crate) sub_circuit_input_max_plaintext_norm_ranges:
+        Option<Arc<[SubCircuitInputMaxPlaintextNormRange]>>,
     pub(crate) output_ids: Vec<GateId>,
     pub(crate) num_input: usize,
     pub(crate) gate_counts: HashMap<PolyGateKind, usize>,
@@ -455,6 +482,8 @@ impl<P: Poly> PartialEq for PolyCircuit<P> {
             self.sub_circuit_calls == other.sub_circuit_calls &&
             self.summed_sub_circuit_calls == other.summed_sub_circuit_calls &&
             self.sub_circuit_params == other.sub_circuit_params &&
+            self.sub_circuit_input_max_plaintext_norm_ranges ==
+                other.sub_circuit_input_max_plaintext_norm_ranges &&
             self.output_ids == other.output_ids &&
             self.gate_counts == other.gate_counts &&
             self.num_input == other.num_input &&
@@ -486,6 +515,10 @@ impl<P: Poly> std::fmt::Debug for PolyCircuit<P> {
             .field("num_inputs", &self.num_input)
             .field("num_outputs", &self.output_ids.len())
             .field("num_sub_circuit_params", &self.sub_circuit_params.len())
+            .field(
+                "sub_circuit_input_max_plaintext_norm_ranges",
+                &self.sub_circuit_input_max_plaintext_norm_ranges,
+            )
             .field("sub_circuit_calls", &self.sub_circuit_calls)
             .field("summed_sub_circuit_calls", &self.summed_sub_circuit_calls)
             .field("direct_sub_circuit_ids", &direct_sub_circuit_ids)
@@ -502,5 +535,46 @@ impl<P: Poly> std::fmt::Debug for PolyCircuit<P> {
 impl<P: Poly> Default for PolyCircuit<P> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, ::serde::Serialize, ::serde::Deserialize)]
+pub struct SubCircuitInputMaxPlaintextNormRange {
+    pub start: usize,
+    pub end: usize,
+    pub norm: BigUint,
+}
+
+impl SubCircuitInputMaxPlaintextNormRange {
+    pub fn new(start: usize, end: usize, norm: BigUint) -> Self {
+        assert!(start <= end, "sub-circuit plaintext range start must not exceed end");
+        Self { start, end, norm }
+    }
+
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+
+    pub fn compress(norms: &[BigUint]) -> Vec<Self> {
+        if norms.is_empty() {
+            return Vec::new();
+        }
+        let mut ranges = Vec::new();
+        let mut current_start = 0usize;
+        let mut current_norm = norms[0].clone();
+        for (idx, norm) in norms.iter().enumerate().skip(1) {
+            if *norm == current_norm {
+                continue;
+            }
+            ranges.push(Self::new(current_start, idx, current_norm));
+            current_start = idx;
+            current_norm = norm.clone();
+        }
+        ranges.push(Self::new(current_start, norms.len(), current_norm));
+        ranges
     }
 }

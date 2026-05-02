@@ -122,7 +122,7 @@ where
     let trapdoor_bytes =
         needs_cross_device_copy.then(|| ST::trapdoor_to_bytes(evaluator.trapdoor.as_ref()));
     let pub_matrix_bytes =
-        needs_cross_device_copy.then(|| evaluator.pub_matrix.as_ref().to_compact_bytes());
+        needs_cross_device_copy.then(|| evaluator.pub_matrix.as_ref().to_cpu_staging_bytes());
 
     device_ids
         .into_iter()
@@ -145,7 +145,7 @@ where
                         .expect("cross-device trapdoor bytes must exist for LWE GPU sampling"),
                 )
                 .expect("failed to deserialize LWE trapdoor replica");
-                let pub_matrix = M::from_compact_bytes(
+                let pub_matrix = M::from_cpu_staging_bytes(
                     &local_params,
                     pub_matrix_bytes
                         .as_ref()

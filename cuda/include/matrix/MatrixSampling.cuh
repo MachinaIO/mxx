@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ChaCha.cuh"
 #include "matrix/Matrix.cuh"
 
 int launch_sample_distribution_multi_limb_kernel(
@@ -13,7 +14,7 @@ int launch_sample_distribution_multi_limb_kernel(
     const std::vector<uint32_t> &limb_indices,
     int dist_type,
     double sigma,
-    uint64_t seed,
+    gpu_chacha::GpuRngSeed seed,
     cudaStream_t stream);
 
 #ifdef __cplusplus
@@ -25,13 +26,13 @@ extern "C"
         GpuMatrix *out,
         int dist_type,
         double sigma,
-        uint64_t seed);
+        gpu_chacha::GpuRngSeed seed);
 
     int gpu_matrix_sample_distribution_columns(
         GpuMatrix *out,
         int dist_type,
         double sigma,
-        uint64_t seed,
+        gpu_chacha::GpuRngSeed seed,
         size_t full_ncol,
         size_t col_offset);
 

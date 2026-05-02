@@ -1,5 +1,7 @@
-use std::{marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, sync::Arc, time::Instant};
 
+use digest::Digest;
+use keccak_asm::Keccak256;
 use num_bigint::BigUint;
 use tracing::{debug, info};
 
@@ -11,7 +13,10 @@ use crate::{
     circuit::{Evaluable, PolyCircuit, evaluable::PolyVec, gate::GateId},
     func_enc::FuncEnc,
     gadgets::{
-        arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner, NestedRnsPolyContext},
+        arith::{
+            DecomposeArithmeticGadget, ModularArithmeticPlanner, NestedRnsPoly,
+            NestedRnsPolyContext,
+        },
         fhe::{
             ring_gsw::RingGswCiphertext,
             ring_gsw_nested_rns::{
@@ -19,9 +24,16 @@ use crate::{
                 sample_public_key,
             },
         },
+        fhe_prg::goldreich::GoldreichFhePrg,
     },
     lookup::{PltEvaluator, PublicLut},
     matrix::PolyMatrix,
+    noise_refresh::{
+        NoiseRefresherNaiveVec,
+        circuit_decrypt::{decrypt_bit_decomposed_scalar, mask_plaintext_moduli_from_full_modulus},
+        debug_sample_prg_encoding_wires, debug_sample_prg_plaintext_wires,
+        debug_sample_prg_public_key_wires,
+    },
     poly::{
         Poly, PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
@@ -51,6 +63,15 @@ where
     pub b_error_sigma: Option<f64>,
     pub b_matrix: M,
     pub b_trapdoor: TD,
+    pub prf_seed_bits: usize,
+    pub prf_mask_output_coeff_bits: usize,
+    pub public_prf_seed_bits: Option<usize>,
+    pub goldreich_graph_seed: [u8; 32],
+    pub noise_refresh_v_bits: usize,
+    pub noise_refresh_cbd_n: usize,
+    pub noise_refresh_hash_key: [u8; 32],
+    #[allow(dead_code)]
+    debug_reuse_single_prg_sample: bool,
     _m: PhantomData<M>,
 }
 
@@ -71,7 +92,21 @@ where
         encoding_error_sigma: Option<f64>,
         b_matrix: M,
         b_trapdoor: TD,
+        prf_seed_bits: usize,
+        prf_mask_output_coeff_bits: usize,
+        public_prf_seed_bits: Option<usize>,
+        goldreich_graph_seed: [u8; 32],
+        noise_refresh_v_bits: usize,
+        noise_refresh_cbd_n: usize,
+        noise_refresh_hash_key: [u8; 32],
     ) -> Self {
+        assert!(noise_refresh_v_bits > 0, "noise_refresh_v_bits must be positive");
+        assert!(noise_refresh_cbd_n > 0, "noise_refresh_cbd_n must be positive");
+        assert!(prf_seed_bits > 0, "prf_seed_bits must be positive");
+        assert!(prf_mask_output_coeff_bits > 0, "prf_mask_output_coeff_bits must be positive");
+        if let Some(public_prf_seed_bits) = public_prf_seed_bits {
+            assert!(public_prf_seed_bits > 0, "public_prf_seed_bits must be positive");
+        }
         Self {
             poly_params,
             native_poly_params,
@@ -86,6 +121,14 @@ where
             b_error_sigma: encoding_error_sigma,
             b_matrix,
             b_trapdoor,
+            prf_seed_bits,
+            prf_mask_output_coeff_bits,
+            public_prf_seed_bits,
+            goldreich_graph_seed,
+            noise_refresh_v_bits,
+            noise_refresh_cbd_n,
+            noise_refresh_hash_key,
+            debug_reuse_single_prg_sample: cfg!(test),
             _m: PhantomData,
         }
     }
@@ -98,8 +141,37 @@ where
         self.poly_params.ring_dimension() as usize
     }
 
+    pub fn prf_seed_bits(&self) -> usize {
+        self.prf_seed_bits
+    }
+
+    pub fn prf_mask_output_coeff_bits(&self) -> usize {
+        self.prf_mask_output_coeff_bits
+    }
+
+    pub fn public_prf_seed_bits(&self) -> usize {
+        self.public_prf_seed_bits.unwrap_or(128)
+    }
+
     pub fn secret_size(&self) -> usize {
-        2
+        1
+    }
+
+    pub fn debug_reuse_single_prg_sample(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.debug_reuse_single_prg_sample
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_debug_reuse_single_prg_sample(mut self, enabled: bool) -> Self {
+        self.debug_reuse_single_prg_sample = enabled;
+        self
     }
 
     pub fn gadget_columns(&self) -> usize {
@@ -127,6 +199,34 @@ where
 pub struct Aky24Ciphertext<M: PolyMatrix> {
     pub c_b: M,
     pub encodings: Vec<NaiveBGGEncodingVec<M>>,
+    #[cfg(test)]
+    debug_secret: Option<Vec<M::P>>,
+    #[cfg(test)]
+    debug_native_fhe_decryption_key: Option<DCRTPoly>,
+}
+
+impl<M: PolyMatrix> Aky24Ciphertext<M> {
+    fn debug_secret(&self) -> Option<&[M::P]> {
+        #[cfg(test)]
+        {
+            self.debug_secret.as_deref()
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
+    fn debug_native_fhe_decryption_key(&self) -> Option<&DCRTPoly> {
+        #[cfg(test)]
+        {
+            self.debug_native_fhe_decryption_key.as_ref()
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,7 +245,10 @@ impl Aky24Func {
 #[derive(Debug, Clone)]
 pub struct Aky24FuncKey<M: PolyMatrix> {
     pub func: Aky24Func,
-    pub preimage: M,
+    pub preimage_compact_bytes: Vec<u8>,
+    pub public_prf_seed: Vec<bool>,
+    pub prf_refresh_preimage_compact_bytes: Vec<Vec<u8>>,
+    _m: PhantomData<M>,
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +292,512 @@ where
             enc_slot_transfer_evaluator,
             _m: PhantomData,
         }
+    }
+}
+
+impl<M, SH, US, TS, PKPE, PKST, ENCPE, ENCST> Aky24FuncEnc<M, SH, US, TS, PKPE, PKST, ENCPE, ENCST>
+where
+    M: PolyMatrix + Send + Sync + 'static,
+    M::P: 'static,
+    SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    US: PolyUniformSampler<M = M> + Send + Sync,
+    TS: PolyTrapdoorSampler<M = M> + Send + Sync,
+    PKPE: PltEvaluator<NaiveBGGPublicKeyVec<M>>,
+    PKST: SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>,
+    ENCPE: PltEvaluator<NaiveBGGEncodingVec<M>>,
+    ENCST: SlotTransferEvaluator<NaiveBGGEncodingVec<M>>,
+    TS::Trapdoor: Clone,
+{
+    fn keygen_prf_mask_target(
+        &self,
+        params: &Aky24Params<M, TS::Trapdoor>,
+        msk: &Aky24MasterKey<M, TS>,
+        trapdoor_sampler: &TS,
+        public_prf_seed: &[bool],
+        one: NaiveBGGPublicKeyVec<M>,
+        decryption_key: NaiveBGGPublicKeyVec<M>,
+        mut seed_wires: Vec<NaiveBGGPublicKeyVec<M>>,
+        wire_count: usize,
+    ) -> (M, Vec<Vec<u8>>) {
+        let prf_seed_bits = params.prf_seed_bits();
+        let pk_lookup_evaluator = self
+            .pk_lookup_evaluator
+            .as_ref()
+            .expect("AKY24 PRF mask keygen requires a public-key lookup evaluator");
+        let pk_slot_transfer_evaluator = self
+            .pk_slot_transfer_evaluator
+            .as_ref()
+            .expect("AKY24 PRF mask keygen requires a public-key slot-transfer evaluator");
+        let mut refresh_context_circuit = PolyCircuit::new();
+        let noise_refresher = NoiseRefresherNaiveVec::<M, NestedRnsPoly<M::P>, SH>::new(
+            build_ring_gsw_context(params, &mut refresh_context_circuit),
+            prf_seed_bits,
+            params.noise_refresh_v_bits,
+            params.goldreich_graph_seed,
+            params.noise_refresh_cbd_n,
+            params.noise_refresh_hash_key,
+        );
+        let mut refresh_preimages = Vec::new();
+        info!(
+            seed_bits = prf_seed_bits,
+            wire_count, "AKY24 PRF mask keygen starting PRG/noise-refresh rounds"
+        );
+        for (round_idx, selected_bit) in public_prf_seed.iter().copied().enumerate() {
+            let selected_half_start = if selected_bit { prf_seed_bits } else { 0 };
+            let generated_seed_bits =
+                if params.debug_reuse_single_prg_sample() { 1 } else { prf_seed_bits };
+            debug!(
+                round_idx,
+                selected_bit,
+                seed_wire_count = seed_wires.len(),
+                generated_seed_bits,
+                "AKY24 PRF mask keygen evaluating selected PRG half in one circuit"
+            );
+            let mut next_seed_wires = Vec::with_capacity(prf_seed_bits * wire_count);
+            let started = Instant::now();
+            let selected_half_wires = if params.debug_reuse_single_prg_sample() {
+                debug_sample_prg_public_key_wires::<M, SH>(
+                    &params.poly_params,
+                    params.noise_refresh_hash_key,
+                    params.secret_size(),
+                    b"aky24-selected-half",
+                    round_idx,
+                    selected_half_start,
+                    generated_seed_bits * wire_count,
+                    one.num_slots(),
+                )
+            } else {
+                let prg_circuit = build_goldreich_prg_range_circuit(
+                    params,
+                    round_idx,
+                    2 * prf_seed_bits,
+                    selected_half_start,
+                    generated_seed_bits,
+                );
+                prg_circuit.eval(
+                    &params.poly_params,
+                    one.clone(),
+                    seed_wires.clone(),
+                    self.pk_lookup_evaluator.as_ref(),
+                    self.pk_slot_transfer_evaluator.as_ref().map(|evaluator| {
+                        evaluator as &dyn SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>
+                    }),
+                    None,
+                )
+            };
+            debug!(
+                round_idx,
+                prg_output_count = selected_half_wires.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "AKY24 PRF mask keygen evaluated selected-half PRG circuit"
+            );
+            assert_eq!(
+                selected_half_wires.len(),
+                generated_seed_bits * wire_count,
+                "AKY24 selected-half PRG circuit must return the generated Ring-GSW ciphertext count"
+            );
+            let refresh_ids = (0..selected_half_wires.len())
+                .map(|wire_idx| {
+                    aky24_refresh_id(&public_prf_seed, round_idx, selected_bit, wire_idx)
+                })
+                .collect::<Vec<_>>();
+            debug!(
+                round_idx,
+                refreshed_input_count = selected_half_wires.len(),
+                "AKY24 PRF mask keygen round-wide noise-refresh preprocess started"
+            );
+            let started = Instant::now();
+            let refreshed_outputs = noise_refresher.preprocess_many(
+                &refresh_ids,
+                &one,
+                &selected_half_wires,
+                &seed_wires,
+                &decryption_key,
+                pk_lookup_evaluator,
+                pk_slot_transfer_evaluator,
+            );
+            debug!(
+                round_idx,
+                refreshed_output_count = refreshed_outputs.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "AKY24 PRF mask keygen round-wide noise-refresh preprocess finished"
+            );
+            for (wire_idx, (a_prime, refresh_keys)) in refreshed_outputs.into_iter().enumerate() {
+                // `preprocess` returns one slotwise refresh target per CRT level. Store
+                // matching preimages in the decoder order expected by
+                // `online_eval`: `slot_idx * crt_depth + refresh_crt_idx`.
+                for slot_idx in 0..a_prime.num_slots() {
+                    for (refresh_crt_idx, refresh_crt_key) in refresh_keys.iter().enumerate() {
+                        let refresh_key_slot = refresh_crt_key.key(slot_idx);
+                        debug!(
+                            round_idx,
+                            wire_idx,
+                            slot_idx,
+                            refresh_crt_idx,
+                            target_rows = refresh_key_slot.matrix.row_size(),
+                            target_cols = refresh_key_slot.matrix.col_size(),
+                            "AKY24 PRF mask keygen refresh preimage sampling started"
+                        );
+                        let started = Instant::now();
+                        let preimage = trapdoor_sampler.preimage(
+                            &params.poly_params,
+                            &msk.b_trapdoor,
+                            &msk.b_matrix,
+                            &refresh_key_slot.matrix,
+                        );
+                        debug!(
+                            round_idx,
+                            wire_idx,
+                            slot_idx,
+                            refresh_crt_idx,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "AKY24 PRF mask keygen refresh preimage sampling finished"
+                        );
+                        refresh_preimages.push(preimage.into_compact_bytes());
+                    }
+                }
+                next_seed_wires.push(a_prime);
+            }
+            if params.debug_reuse_single_prg_sample() {
+                assert_eq!(
+                    next_seed_wires.len(),
+                    wire_count,
+                    "debug selected-half PRG reuse expects one generated Ring-GSW ciphertext"
+                );
+                let reused_seed_wires = next_seed_wires;
+                next_seed_wires = Vec::with_capacity(prf_seed_bits * wire_count);
+                for _ in 0..prf_seed_bits {
+                    next_seed_wires.extend(reused_seed_wires.iter().cloned());
+                }
+            }
+            seed_wires = next_seed_wires;
+            info!(round_idx, "AKY24 PRF mask keygen finished refresh round");
+        }
+
+        let mask_output_bits = params.prf_mask_output_coeff_bits();
+        let generated_mask_output_bits =
+            if params.debug_reuse_single_prg_sample() { 1 } else { mask_output_bits };
+        debug!(
+            mask_output_bits,
+            generated_mask_output_bits,
+            seed_wire_count = seed_wires.len(),
+            "AKY24 PRF mask keygen evaluating final mask expansion PRG circuit"
+        );
+        let started = Instant::now();
+        let mask_output_wires = if params.debug_reuse_single_prg_sample() {
+            debug_sample_prg_public_key_wires::<M, SH>(
+                &params.poly_params,
+                params.noise_refresh_hash_key,
+                params.secret_size(),
+                b"aky24-final-mask",
+                public_prf_seed.len(),
+                0,
+                generated_mask_output_bits * wire_count,
+                one.num_slots(),
+            )
+        } else {
+            let mask_prg_circuit = build_goldreich_prg_circuit(
+                params,
+                public_prf_seed.len(),
+                generated_mask_output_bits,
+            );
+            mask_prg_circuit.eval(
+                &params.poly_params,
+                one.clone(),
+                seed_wires,
+                self.pk_lookup_evaluator.as_ref(),
+                self.pk_slot_transfer_evaluator.as_ref().map(|evaluator| {
+                    evaluator as &dyn SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>
+                }),
+                None,
+            )
+        };
+        debug!(
+            mask_output_wire_count = mask_output_wires.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "AKY24 PRF mask keygen evaluated final mask expansion PRG circuit"
+        );
+        assert_eq!(
+            mask_output_wires.len(),
+            generated_mask_output_bits * wire_count,
+            "AKY24 final mask PRG output must match the generated Ring-GSW ciphertext count"
+        );
+
+        let mut mask_inputs = Vec::with_capacity(1 + mask_output_wires.len());
+        mask_inputs
+            .push(NaiveBGGPublicKeyVec::new(&params.poly_params, vec![decryption_key.key(0)]));
+        if params.debug_reuse_single_prg_sample() {
+            assert_eq!(
+                mask_output_wires.len(),
+                wire_count,
+                "debug PRF mask reuse expects one generated Ring-GSW ciphertext"
+            );
+            for _ in 0..mask_output_bits {
+                mask_inputs.extend(mask_output_wires.iter().cloned());
+            }
+        } else {
+            mask_inputs.extend(mask_output_wires);
+        }
+        let mask_circuit = build_prf_mask_circuit(params);
+        debug!(
+            input_count = mask_inputs.len(),
+            "AKY24 PRF mask keygen evaluating final scalar mask decrypt circuit"
+        );
+        let started = Instant::now();
+        let evaluated = mask_circuit.eval(
+            &params.poly_params,
+            one,
+            mask_inputs,
+            self.pk_lookup_evaluator.as_ref(),
+            self.pk_slot_transfer_evaluator
+                .as_ref()
+                .map(|evaluator| evaluator as &dyn SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>),
+            None,
+        );
+        debug!(
+            evaluated_count = evaluated.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "AKY24 PRF mask keygen evaluated final scalar mask decrypt circuit"
+        );
+        let target = evaluated
+            .first()
+            .map(|keys| keys.key(0))
+            .expect("AKY24 PRF mask final decrypt must produce one output")
+            .matrix
+            .clone();
+        let selector = g_inverse_identity_selector::<M>(&params.poly_params);
+        let mask_target = target.mul_decompose(&selector);
+        info!(refresh_preimages = refresh_preimages.len(), "AKY24 PRF mask keygen finished");
+        (mask_target, refresh_preimages)
+    }
+
+    fn dec_prf_mask_encoding(
+        &self,
+        params: &Aky24Params<M, TS::Trapdoor>,
+        ct: &Aky24Ciphertext<M>,
+        fsk: &Aky24FuncKey<M>,
+        one: &NaiveBGGEncodingVec<M>,
+        decryption_key: &NaiveBGGEncodingVec<M>,
+        mut seed_wires: Vec<NaiveBGGEncodingVec<M>>,
+        wire_count: usize,
+    ) -> M {
+        let prf_seed_bits = params.prf_seed_bits();
+        let enc_lookup_evaluator = self
+            .enc_lookup_evaluator
+            .as_ref()
+            .expect("AKY24 PRF mask dec requires an encoding lookup evaluator");
+        let enc_slot_transfer_evaluator = self
+            .enc_slot_transfer_evaluator
+            .as_ref()
+            .expect("AKY24 PRF mask dec requires an encoding slot-transfer evaluator");
+        let mut refresh_context_circuit = PolyCircuit::new();
+        let noise_refresher = NoiseRefresherNaiveVec::<M, NestedRnsPoly<M::P>, SH>::new(
+            build_ring_gsw_context(params, &mut refresh_context_circuit),
+            prf_seed_bits,
+            params.noise_refresh_v_bits,
+            params.goldreich_graph_seed,
+            params.noise_refresh_cbd_n,
+            params.noise_refresh_hash_key,
+        )
+        .with_debug_secret(ct.debug_secret().map(|secret| secret.to_vec()));
+        let (_, _crt_bits, crt_depth) = params.poly_params.to_crt();
+        let generated_seed_bits_per_round =
+            if params.debug_reuse_single_prg_sample() { 1 } else { prf_seed_bits };
+        let decoder_count = generated_seed_bits_per_round
+            .checked_mul(wire_count)
+            .and_then(|count| count.checked_mul(one.num_slots()))
+            .and_then(|count| count.checked_mul(crt_depth))
+            .and_then(|count| count.checked_mul(fsk.public_prf_seed.len()))
+            .expect("AKY24 PRF mask decoder count overflow");
+        assert_eq!(
+            fsk.prf_refresh_preimage_compact_bytes.len(),
+            decoder_count,
+            "AKY24 PRF mask refresh preimage count mismatch"
+        );
+        let mut preimage_cursor = 0;
+        for (round_idx, selected_bit) in fsk.public_prf_seed.iter().copied().enumerate() {
+            let selected_half_start = if selected_bit { prf_seed_bits } else { 0 };
+            let generated_seed_bits =
+                if params.debug_reuse_single_prg_sample() { 1 } else { prf_seed_bits };
+            let mut next_seed_wires = Vec::with_capacity(prf_seed_bits * wire_count);
+            let selected_half_wires = if params.debug_reuse_single_prg_sample() {
+                let plaintext_wires = debug_sample_prg_plaintext_wires::<M::P>(
+                    &params.poly_params,
+                    &params.native_poly_params,
+                    params.ring_gsw_context.as_ref(),
+                    params.ring_gsw_width,
+                    ct.debug_native_fhe_decryption_key()
+                        .expect("debug PRG encoding sampling requires the native FHE key"),
+                    params.noise_refresh_hash_key,
+                    b"aky24-selected-half-native",
+                    generated_seed_bits * wire_count,
+                    params.ring_gsw_level_offset,
+                    params.ring_gsw_enable_levels,
+                );
+                debug_sample_prg_encoding_wires::<M, SH>(
+                    &params.poly_params,
+                    params.noise_refresh_hash_key,
+                    ct.debug_secret().expect("debug PRG encoding sampling requires the BGG secret"),
+                    &plaintext_wires,
+                    b"aky24-selected-half",
+                    round_idx,
+                    selected_half_start,
+                    one.num_slots(),
+                )
+            } else {
+                let prg_circuit = build_goldreich_prg_range_circuit(
+                    params,
+                    round_idx,
+                    2 * prf_seed_bits,
+                    selected_half_start,
+                    generated_seed_bits,
+                );
+                prg_circuit.eval(
+                    &params.poly_params,
+                    one.clone(),
+                    seed_wires.clone(),
+                    self.enc_lookup_evaluator.as_ref(),
+                    self.enc_slot_transfer_evaluator.as_ref().map(|evaluator| {
+                        evaluator as &dyn SlotTransferEvaluator<NaiveBGGEncodingVec<M>>
+                    }),
+                    None,
+                )
+            };
+            assert_eq!(
+                selected_half_wires.len(),
+                generated_seed_bits * wire_count,
+                "AKY24 selected-half PRG circuit must return the generated Ring-GSW ciphertext count"
+            );
+            let refresh_ids = (0..selected_half_wires.len())
+                .map(|wire_idx| {
+                    aky24_refresh_id(&fsk.public_prf_seed, round_idx, selected_bit, wire_idx)
+                })
+                .collect::<Vec<_>>();
+            let mut decoder_sets = Vec::with_capacity(selected_half_wires.len());
+            for _ in selected_half_wires.iter() {
+                let per_wire_decoder_count = one.num_slots() * crt_depth;
+                let decoders = fsk.prf_refresh_preimage_compact_bytes
+                    [preimage_cursor..preimage_cursor + per_wire_decoder_count]
+                    .iter()
+                    .map(|preimage_bytes| {
+                        let preimage =
+                            M::from_compact_bytes(&params.poly_params, preimage_bytes.as_slice());
+                        ct.c_b.clone() * &preimage
+                    })
+                    .collect::<Vec<_>>();
+                preimage_cursor += per_wire_decoder_count;
+                decoder_sets.push(decoders);
+            }
+            next_seed_wires.extend(noise_refresher.online_eval_many(
+                &refresh_ids,
+                one,
+                &selected_half_wires,
+                &seed_wires,
+                decryption_key,
+                &decoder_sets,
+                enc_lookup_evaluator,
+                enc_slot_transfer_evaluator,
+            ));
+            if params.debug_reuse_single_prg_sample() {
+                assert_eq!(
+                    next_seed_wires.len(),
+                    wire_count,
+                    "debug selected-half PRG reuse expects one generated Ring-GSW ciphertext"
+                );
+                let reused_seed_wires = next_seed_wires;
+                next_seed_wires = Vec::with_capacity(prf_seed_bits * wire_count);
+                for _ in 0..prf_seed_bits {
+                    next_seed_wires.extend(reused_seed_wires.iter().cloned());
+                }
+            }
+            seed_wires = next_seed_wires;
+            info!(round_idx, "AKY24 PRF mask dec finished refresh round");
+        }
+
+        let mask_output_bits = params.prf_mask_output_coeff_bits();
+        let generated_mask_output_bits =
+            if params.debug_reuse_single_prg_sample() { 1 } else { mask_output_bits };
+        let mask_output_wires = if params.debug_reuse_single_prg_sample() {
+            let plaintext_wires = debug_sample_prg_plaintext_wires::<M::P>(
+                &params.poly_params,
+                &params.native_poly_params,
+                params.ring_gsw_context.as_ref(),
+                params.ring_gsw_width,
+                ct.debug_native_fhe_decryption_key()
+                    .expect("debug PRG encoding sampling requires the native FHE key"),
+                params.noise_refresh_hash_key,
+                b"aky24-final-mask-native",
+                generated_mask_output_bits * wire_count,
+                params.ring_gsw_level_offset,
+                params.ring_gsw_enable_levels,
+            );
+            debug_sample_prg_encoding_wires::<M, SH>(
+                &params.poly_params,
+                params.noise_refresh_hash_key,
+                ct.debug_secret().expect("debug PRG encoding sampling requires the BGG secret"),
+                &plaintext_wires,
+                b"aky24-final-mask",
+                fsk.public_prf_seed.len(),
+                0,
+                one.num_slots(),
+            )
+        } else {
+            let mask_prg_circuit = build_goldreich_prg_circuit(
+                params,
+                fsk.public_prf_seed.len(),
+                generated_mask_output_bits,
+            );
+            mask_prg_circuit.eval(
+                &params.poly_params,
+                one.clone(),
+                seed_wires,
+                self.enc_lookup_evaluator.as_ref(),
+                self.enc_slot_transfer_evaluator.as_ref().map(|evaluator| {
+                    evaluator as &dyn SlotTransferEvaluator<NaiveBGGEncodingVec<M>>
+                }),
+                None,
+            )
+        };
+        assert_eq!(
+            mask_output_wires.len(),
+            generated_mask_output_bits * wire_count,
+            "AKY24 final mask PRG output must match the generated Ring-GSW ciphertext count"
+        );
+
+        let mut mask_inputs = Vec::with_capacity(1 + mask_output_wires.len());
+        mask_inputs
+            .push(NaiveBGGEncodingVec::new(&params.poly_params, vec![decryption_key.encoding(0)]));
+        if params.debug_reuse_single_prg_sample() {
+            assert_eq!(
+                mask_output_wires.len(),
+                wire_count,
+                "debug PRF mask reuse expects one generated Ring-GSW ciphertext"
+            );
+            for _ in 0..mask_output_bits {
+                mask_inputs.extend(mask_output_wires.iter().cloned());
+            }
+        } else {
+            mask_inputs.extend(mask_output_wires);
+        }
+        let mask_circuit = build_prf_mask_circuit(params);
+        let evaluated = mask_circuit.eval(
+            &params.poly_params,
+            one.clone(),
+            mask_inputs,
+            self.enc_lookup_evaluator.as_ref(),
+            self.enc_slot_transfer_evaluator
+                .as_ref()
+                .map(|evaluator| evaluator as &dyn SlotTransferEvaluator<NaiveBGGEncodingVec<M>>),
+            None,
+        );
+        let evaluated_encoding = evaluated
+            .first()
+            .map(|encoding_vec| encoding_vec.encoding(0))
+            .expect("AKY24 PRF mask final decrypt must produce one output encoding");
+        let selector = g_inverse_identity_selector::<M>(&params.poly_params);
+        let mask_message = evaluated_encoding.vector.mul_decompose(&selector);
+        info!("AKY24 PRF mask dec finished");
+        mask_message
     }
 }
 
@@ -244,10 +853,8 @@ where
         let uniform_sampler = US::new();
         debug!("AKY24 enc sampling secret");
         let secret = uniform_sampler.sample_poly(&params.poly_params, &DistType::TernaryDist);
-        let minus_one =
-            M::P::const_zero(&params.poly_params) - M::P::const_one(&params.poly_params);
-        let secret_vec =
-            M::from_poly_vec_row(&params.poly_params, vec![secret.clone(), minus_one.clone()]);
+        let secret_polys = vec![secret.clone()];
+        let secret_vec = M::from_poly_vec_row(&params.poly_params, secret_polys.clone());
         debug!(
             b_cols = enc_key.b_matrix.col_size(),
             b_error_sigma = ?params.b_error_sigma,
@@ -333,9 +940,29 @@ where
             plaintext_input_count = 1 + message_ciphertext_inputs.len(),
             "AKY24 enc converted Ring-GSW ciphertext inputs"
         );
-        let mut plaintext_inputs = Vec::with_capacity(1 + message_ciphertext_inputs.len());
-        plaintext_inputs.push(PolyVec::new(vec![fhe_decryption_key_poly; num_slots]));
+        let prf_seed_bits = params.prf_seed_bits();
+        let mut plaintext_inputs =
+            Vec::with_capacity(1 + message_ciphertext_inputs.len() * (1 + prf_seed_bits));
+        plaintext_inputs.push(PolyVec::new(vec![M::P::const_zero(&params.poly_params); num_slots]));
         plaintext_inputs.extend(message_ciphertext_inputs);
+        info!(prf_seed_bits, "AKY24 enc sampling private PRF seed ciphertexts");
+        for seed_bit_idx in 0..prf_seed_bits {
+            let seed_bit = rand::random::<bool>();
+            debug!(seed_bit_idx, seed_bit, "AKY24 enc encrypting private PRF seed bit");
+            let native_seed_ciphertext = encrypt_plaintext_bit(
+                &params.native_poly_params,
+                params.ring_gsw_context.as_ref(),
+                &ring_gsw_public_key,
+                seed_bit,
+            );
+            plaintext_inputs.extend(ciphertext_inputs_from_native::<M::P>(
+                &params.poly_params,
+                params.ring_gsw_context.as_ref(),
+                &native_seed_ciphertext,
+                params.ring_gsw_level_offset,
+                params.ring_gsw_enable_levels,
+            ));
+        }
         info!("AKY24 enc sampling BGG public keys");
         let bgg_public_keys = sample_bgg_public_keys::<M, SH>(params, enc_key.bgg_hash_key);
 
@@ -345,16 +972,41 @@ where
         );
         let encoding_sampler = NaiveBGGEncodingVecSampler::<US>::new(
             &params.poly_params,
-            &[secret, minus_one],
+            &secret_polys,
             params.encoding_error_sigma,
             num_slots,
         );
         let mut encodings =
             encoding_sampler.sample(&params.poly_params, &bgg_public_keys, &plaintext_inputs);
-        encodings[1] = NaiveBGGEncodingVec::new(vec![encodings[1].encodings[0].clone()]);
+        let gadget = M::gadget_matrix(&params.poly_params, params.secret_size());
+        let decryption_key_gadget = gadget * &fhe_decryption_key_poly;
+        let decryption_key_encodings = encodings[1]
+            .encodings()
+            .into_iter()
+            .map(|mut encoding| {
+                encoding.vector = encoding.vector - &decryption_key_gadget;
+                encoding
+            })
+            .collect::<Vec<_>>();
+        encodings[1] = NaiveBGGEncodingVec::new(&params.poly_params, decryption_key_encodings);
 
         info!(encoding_count = encodings.len(), "AKY24 enc finished");
-        Aky24Ciphertext { c_b, encodings }
+        Aky24Ciphertext {
+            c_b,
+            encodings,
+            #[cfg(test)]
+            debug_secret: if params.debug_reuse_single_prg_sample() {
+                Some(secret_polys)
+            } else {
+                None
+            },
+            #[cfg(test)]
+            debug_native_fhe_decryption_key: if params.debug_reuse_single_prg_sample() {
+                Some(native_fhe_decryption_key)
+            } else {
+                None
+            },
+        }
     }
 
     fn keygen(
@@ -367,27 +1019,40 @@ where
         info!("AKY24 keygen building function circuit");
         let circuit = build_func_circuit(params, func);
         info!("AKY24 keygen sampling BGG public keys");
-        let mut bgg_public_keys = sample_bgg_public_keys::<M, SH>(params, msk.bgg_hash_key);
-        bgg_public_keys[1] = NaiveBGGPublicKeyVec::new(vec![bgg_public_keys[1].keys[0].clone()]);
+        let bgg_public_keys = sample_bgg_public_keys::<M, SH>(params, msk.bgg_hash_key);
+        let one = bgg_public_keys[0].clone();
+        let decryption_key = bgg_public_keys[1].clone();
+        let prf_seed_bits = params.prf_seed_bits();
+        let wire_count = public_key_wire_count(&bgg_public_keys, prf_seed_bits);
+        let message_start = 2;
+        let seed_start = message_start + wire_count;
+        let message_wires = bgg_public_keys[message_start..seed_start].to_vec();
+        let seed_wires =
+            bgg_public_keys[seed_start..seed_start + prf_seed_bits * wire_count].to_vec();
+        let function_decryption_key =
+            NaiveBGGPublicKeyVec::new(&params.poly_params, vec![decryption_key.key(0)]);
         let pk_slot_transfer_evaluator = self
             .pk_slot_transfer_evaluator
             .as_ref()
             .map(|evaluator| evaluator as &dyn SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>);
+        let mut function_inputs = Vec::with_capacity(1 + message_wires.len());
+        function_inputs.push(function_decryption_key);
+        function_inputs.extend(message_wires);
         info!(
-            input_count = bgg_public_keys.len().saturating_sub(1),
+            input_count = function_inputs.len(),
             "AKY24 keygen evaluating function circuit over BGG public keys"
         );
         let evaluated_public_keys = circuit.eval(
             &params.poly_params,
-            bgg_public_keys[0].clone(),
-            bgg_public_keys[1..].to_vec(),
+            one.clone(),
+            function_inputs,
             self.pk_lookup_evaluator.as_ref(),
             pk_slot_transfer_evaluator,
             None,
         );
         let evaluated_target = evaluated_public_keys
             .first()
-            .and_then(|keys| keys.keys.first())
+            .map(|keys| keys.key(0))
             .expect("AKY24 keygen circuit evaluation must produce an evaluated target")
             .matrix
             .clone();
@@ -396,24 +1061,42 @@ where
             evaluated_cols = evaluated_target.col_size(),
             "AKY24 keygen circuit evaluation finished"
         );
-        let selector = M::unit_column_vector(&params.poly_params, params.secret_size(), 1);
+        let selector = g_inverse_identity_selector::<M>(&params.poly_params);
         let preimage_target = evaluated_target.mul_decompose(&selector);
         debug!(
             target_rows = preimage_target.row_size(),
             target_cols = preimage_target.col_size(),
-            "AKY24 keygen applied G^-1((0,1)^T) to evaluated public key"
+            "AKY24 keygen applied G^-1(1) to evaluated public key"
         );
+        let public_prf_seed =
+            (0..params.public_prf_seed_bits()).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
         let trapdoor_sampler = TS::new(&params.poly_params, params.trapdoor_sigma);
-        info!("AKY24 keygen sampling trapdoor preimage");
+        let (mask_preimage_target, prf_refresh_preimages) = self.keygen_prf_mask_target(
+            params,
+            msk,
+            &trapdoor_sampler,
+            &public_prf_seed,
+            one,
+            decryption_key,
+            seed_wires,
+            wire_count,
+        );
+        let combined_preimage_target = preimage_target + mask_preimage_target;
+        info!("AKY24 keygen sampling trapdoor preimage for function output plus PRF mask");
         let preimage = trapdoor_sampler.preimage(
             &params.poly_params,
             &msk.b_trapdoor,
             &msk.b_matrix,
-            &preimage_target,
+            &combined_preimage_target,
         );
-
-        info!(?func, "AKY24 keygen finished");
-        Aky24FuncKey { func: *func, preimage }
+        info!(?func, prf_refresh_preimages = prf_refresh_preimages.len(), "AKY24 keygen finished");
+        Aky24FuncKey {
+            func: *func,
+            preimage_compact_bytes: preimage.into_compact_bytes(),
+            public_prf_seed,
+            prf_refresh_preimage_compact_bytes: prf_refresh_preimages,
+            _m: PhantomData,
+        }
     }
 
     fn dec(
@@ -424,7 +1107,19 @@ where
     ) -> Self::Output {
         info!(func = ?fsk.func, encoding_count = ct.encodings.len(), "AKY24 dec started");
         let one = ct.encodings.first().expect("AKY24 ciphertext must include a one encoding");
-        let inputs = ct.encodings.iter().skip(1).cloned().collect::<Vec<_>>();
+        let decryption_key =
+            ct.encodings.get(1).expect("AKY24 ciphertext must include a decryption-key encoding");
+        let prf_seed_bits = params.prf_seed_bits();
+        let wire_count = encoding_wire_count(&ct.encodings, prf_seed_bits);
+        let message_start = 2;
+        let seed_start = message_start + wire_count;
+        let message_wires = ct.encodings[message_start..seed_start].to_vec();
+        let seed_wires = ct.encodings[seed_start..seed_start + prf_seed_bits * wire_count].to_vec();
+        let function_decryption_key =
+            NaiveBGGEncodingVec::new(&params.poly_params, vec![decryption_key.encoding(0)]);
+        let mut inputs = Vec::with_capacity(1 + message_wires.len());
+        inputs.push(function_decryption_key);
+        inputs.extend(message_wires);
         info!("AKY24 dec building function circuit");
         let circuit = build_func_circuit(params, &fsk.func);
         info!(
@@ -447,11 +1142,23 @@ where
                 info!("AKY24 dec circuit evaluation finished; decoding DebugIdentity output");
                 let evaluated_encoding = evaluated_encodings
                     .first()
-                    .and_then(|encoding_vec| encoding_vec.encodings.first())
+                    .map(|encoding_vec| encoding_vec.encoding(0))
                     .expect("AKY24 DebugIdentity evaluation must produce one output encoding");
-                let selector = M::unit_column_vector(&params.poly_params, params.secret_size(), 1);
+                let selector = g_inverse_identity_selector::<M>(&params.poly_params);
                 let evaluated_message = evaluated_encoding.vector.mul_decompose(&selector);
-                let noisy_plaintext = evaluated_message - &(ct.c_b.clone() * &fsk.preimage);
+                let mask_message = self.dec_prf_mask_encoding(
+                    params,
+                    ct,
+                    fsk,
+                    one,
+                    decryption_key,
+                    seed_wires,
+                    wire_count,
+                );
+                let combined_message = evaluated_message + mask_message;
+                let output_preimage =
+                    M::from_compact_bytes(&params.poly_params, &fsk.preimage_compact_bytes);
+                let noisy_plaintext = combined_message - &(ct.c_b.clone() * &output_preimage);
                 assert_eq!(
                     noisy_plaintext.size(),
                     (1, 1),
@@ -514,6 +1221,207 @@ where
     }
     info!(?func, "AKY24 build_func_circuit finished");
     circuit
+}
+
+fn g_inverse_identity_selector<M>(params: &<M::P as Poly>::Params) -> M
+where
+    M: PolyMatrix,
+{
+    M::identity(params, 1, None)
+}
+
+fn build_ring_gsw_context<M, TD>(
+    params: &Aky24Params<M, TD>,
+    circuit: &mut PolyCircuit<M::P>,
+) -> Arc<NestedRnsRingGswContext<M::P>>
+where
+    M: PolyMatrix,
+    M::P: 'static,
+{
+    let nested_rns_context = Arc::new(NestedRnsPolyContext::setup(
+        circuit,
+        &params.poly_params,
+        params.ring_gsw_context.p_moduli_bits,
+        params.ring_gsw_context.max_unreduced_muls,
+        params.ring_gsw_context.scale,
+        false,
+        params.ring_gsw_enable_levels,
+    ));
+    Arc::new(NestedRnsRingGswContext::<M::P>::from_arith_context(
+        circuit,
+        &params.poly_params,
+        params.n(),
+        nested_rns_context,
+        params.ring_gsw_enable_levels,
+        Some(params.ring_gsw_level_offset),
+    ))
+}
+
+fn build_goldreich_prg_circuit<M, TD>(
+    params: &Aky24Params<M, TD>,
+    round_idx: usize,
+    output_bits: usize,
+) -> PolyCircuit<M::P>
+where
+    M: PolyMatrix,
+    M::P: 'static,
+{
+    let prf_seed_bits = params.prf_seed_bits();
+    assert!(
+        prf_seed_bits >= 5,
+        "AKY24 Goldreich PRF seed bit length must be at least 5 for the Goldreich graph"
+    );
+    assert!(output_bits > 0, "AKY24 Goldreich PRF output bit length must be positive");
+    let mut circuit = PolyCircuit::new();
+    let ring_gsw_context = build_ring_gsw_context(params, &mut circuit);
+    let seed_ciphertexts = (0..prf_seed_bits)
+        .map(|_| {
+            RingGswCiphertext::input(
+                ring_gsw_context.clone(),
+                Some(BigUint::from(1u64)),
+                &mut circuit,
+            )
+        })
+        .collect::<Vec<_>>();
+    let goldreich = GoldreichFhePrg::setup(
+        &mut circuit,
+        ring_gsw_context,
+        prf_seed_bits,
+        output_bits,
+        derive_goldreich_graph_seed(params.goldreich_graph_seed, round_idx),
+    );
+    let outputs = goldreich.evaluate_uniform(&seed_ciphertexts, &mut circuit);
+    circuit.output(outputs.iter().flat_map(|output| output.sub_circuit_wires()));
+    circuit
+}
+
+fn build_goldreich_prg_range_circuit<M, TD>(
+    params: &Aky24Params<M, TD>,
+    round_idx: usize,
+    conceptual_output_bits: usize,
+    range_start: usize,
+    range_len: usize,
+) -> PolyCircuit<M::P>
+where
+    M: PolyMatrix,
+    M::P: 'static,
+{
+    let prf_seed_bits = params.prf_seed_bits();
+    assert!(
+        prf_seed_bits >= 5,
+        "AKY24 Goldreich PRF seed bit length must be at least 5 for the Goldreich graph"
+    );
+    assert!(conceptual_output_bits > 0, "AKY24 Goldreich PRF output bit length must be positive");
+    assert!(range_len > 0, "AKY24 Goldreich PRF output range length must be positive");
+    assert!(
+        range_start + range_len <= conceptual_output_bits,
+        "AKY24 Goldreich PRF output range must fit in the conceptual output"
+    );
+    let mut circuit = PolyCircuit::new();
+    let ring_gsw_context = build_ring_gsw_context(params, &mut circuit);
+    let seed_ciphertexts = (0..prf_seed_bits)
+        .map(|_| {
+            RingGswCiphertext::input(
+                ring_gsw_context.clone(),
+                Some(BigUint::from(1u64)),
+                &mut circuit,
+            )
+        })
+        .collect::<Vec<_>>();
+    let goldreich = GoldreichFhePrg::setup_range(
+        &mut circuit,
+        ring_gsw_context,
+        prf_seed_bits,
+        conceptual_output_bits,
+        range_start,
+        range_len,
+        derive_goldreich_graph_seed(params.goldreich_graph_seed, round_idx),
+    );
+    let outputs = goldreich.evaluate_uniform(&seed_ciphertexts, &mut circuit);
+    circuit.output(outputs.iter().flat_map(|output| output.sub_circuit_wires()));
+    circuit
+}
+
+fn build_prf_mask_circuit<M, TD>(params: &Aky24Params<M, TD>) -> PolyCircuit<M::P>
+where
+    M: PolyMatrix,
+    M::P: 'static,
+{
+    let mut circuit = PolyCircuit::new();
+    let ring_gsw_context = build_ring_gsw_context(params, &mut circuit);
+    let fhe_decryption_key = circuit.input(1).at(0).as_single_wire();
+    let q: Arc<BigUint> = params.poly_params.modulus().into();
+    let mask_output_bits = params.prf_mask_output_coeff_bits();
+    let plaintext_moduli = mask_plaintext_moduli_from_full_modulus(q.as_ref(), mask_output_bits);
+    let encrypted_bits = (0..mask_output_bits)
+        .map(|_| {
+            RingGswCiphertext::input(
+                ring_gsw_context.clone(),
+                Some(BigUint::from(1u64)),
+                &mut circuit,
+            )
+        })
+        .collect::<Vec<_>>();
+    let decrypted = decrypt_bit_decomposed_scalar::<M::P, NestedRnsPoly<M::P>, M>(
+        &mut circuit,
+        &encrypted_bits,
+        fhe_decryption_key,
+        &plaintext_moduli,
+    );
+    circuit.output(vec![decrypted]);
+    circuit
+}
+
+fn derive_goldreich_graph_seed(base_seed: [u8; 32], round_idx: usize) -> [u8; 32] {
+    let mut hasher = Keccak256::new();
+    hasher.update(b"AKY24GoldreichPrfGraph/v1");
+    hasher.update(base_seed);
+    hasher.update(round_idx.to_le_bytes());
+    hasher.finalize().into()
+}
+
+fn aky24_refresh_id(
+    public_seed: &[bool],
+    round_idx: usize,
+    selected_bit: bool,
+    wire_idx: usize,
+) -> Vec<u8> {
+    let mut id = Vec::with_capacity(16 + 16 + public_seed.len());
+    id.extend_from_slice(b"AKY24PrfRefresh/v1");
+    id.extend(public_seed.iter().map(|bit| u8::from(*bit)));
+    id.extend_from_slice(&round_idx.to_le_bytes());
+    id.push(u8::from(selected_bit));
+    id.extend_from_slice(&wire_idx.to_le_bytes());
+    id
+}
+
+fn encoding_wire_count<M>(encodings: &[NaiveBGGEncodingVec<M>], seed_bits: usize) -> usize
+where
+    M: PolyMatrix,
+{
+    assert!(
+        encodings.len() >= 2,
+        "AKY24 ciphertext must contain one encoding and decryption-key encoding"
+    );
+    let payload_count = encodings.len() - 2;
+    assert!(
+        payload_count.is_multiple_of(seed_bits + 1),
+        "AKY24 ciphertext payload count must be one message ciphertext plus seed ciphertexts"
+    );
+    payload_count / (seed_bits + 1)
+}
+
+fn public_key_wire_count<M>(keys: &[NaiveBGGPublicKeyVec<M>], seed_bits: usize) -> usize
+where
+    M: PolyMatrix,
+{
+    assert!(keys.len() >= 2, "AKY24 public keys must contain one and decryption-key keys");
+    let payload_count = keys.len() - 2;
+    assert!(
+        payload_count.is_multiple_of(seed_bits + 1),
+        "AKY24 public-key payload count must be one message ciphertext plus seed ciphertexts"
+    );
+    payload_count / (seed_bits + 1)
 }
 
 pub struct NoCircuitEvaluator;
@@ -584,13 +1492,16 @@ where
         .first()
         .map(PolyVec::len)
         .expect("Ring-GSW ciphertext input conversion must produce at least one input");
+    let ciphertext_input_count = shape_ciphertext_inputs.len();
+    let ring_gsw_ciphertext_count = 1 + params.prf_seed_bits();
     info!(
         num_slots,
-        ciphertext_input_count = shape_ciphertext_inputs.len(),
+        ciphertext_input_count,
+        ring_gsw_ciphertext_count,
         "AKY24 sample_bgg_public_keys inferred BGG vector shape"
     );
     let reveal_plaintexts = std::iter::once(false)
-        .chain(std::iter::repeat_n(true, shape_ciphertext_inputs.len()))
+        .chain(std::iter::repeat_n(true, ciphertext_input_count * ring_gsw_ciphertext_count))
         .collect::<Vec<_>>();
     let public_key_sampler = NaiveBGGPublicKeyVecSampler::<[u8; 32], SH>::new(
         bgg_hash_key,
@@ -624,9 +1535,8 @@ mod tests {
     use crate::{
         __PAIR, __TestState,
         gadgets::arith::ModularArithmeticContext,
-        lookup::lwe::{
-            LWEBGGEncodingPltEvaluator, LWEBGGPubKeyPltEvaluator,
-            NaiveLWEBGGEncodingVecPltEvaluator, NaiveLWEBGGPublicKeyVecPltEvaluator,
+        lookup::debug::{
+            DebugNaiveBGGEncodingVecPltEvaluator, DebugNaiveBGGPublicKeyVecPltEvaluator,
         },
         matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix,
         poly::dcrt::gpu::{GpuDCRTPoly, GpuDCRTPolyParams},
@@ -647,13 +1557,17 @@ mod tests {
         GpuDCRTPolyHashSampler<Keccak256>,
         GpuDCRTPolyUniformSampler,
         GpuDCRTPolyTrapdoorSampler,
-        NaiveLWEBGGPublicKeyVecPltEvaluator<
+        DebugNaiveBGGPublicKeyVecPltEvaluator<
             GpuDCRTPolyMatrix,
             GpuDCRTPolyHashSampler<Keccak256>,
             GpuDCRTPolyTrapdoorSampler,
         >,
         NaiveBGGVecSlotTransferEvaluator,
-        NaiveLWEBGGEncodingVecPltEvaluator<GpuDCRTPolyMatrix, GpuDCRTPolyHashSampler<Keccak256>>,
+        DebugNaiveBGGEncodingVecPltEvaluator<
+            GpuDCRTPolyMatrix,
+            GpuDCRTPolyHashSampler<Keccak256>,
+            GpuDCRTPolyTrapdoorSampler,
+        >,
         NaiveBGGVecSlotTransferEvaluator,
     >;
 
@@ -702,6 +1616,27 @@ mod tests {
         );
         let native_poly_params = DCRTPolyParams::new(ring_dim, active_levels, crt_bits, base_bits);
         let poly_params = gpu_params_from_cpu(&native_poly_params);
+        let q: Arc<BigUint> = poly_params.modulus().into();
+        let prf_mask_output_bound = q.as_ref() / 4u32;
+        let prf_mask_output_coeff_bits = prf_mask_output_bound.bits().saturating_sub(1) as usize;
+        assert!(
+            prf_mask_output_coeff_bits > 0,
+            "AKY24 test requires a positive PRF mask output coefficient bit size"
+        );
+        let max_prf_mask = (BigUint::from(1u64) << prf_mask_output_coeff_bits) - 1u32;
+        assert!(
+            max_prf_mask <= prf_mask_output_bound,
+            "AKY24 test PRF mask range must stay below floor(q/4)"
+        );
+        let prf_seed_bits = prf_mask_output_coeff_bits.max(5);
+        let public_prf_seed_bits = 3;
+        info!(
+            prf_seed_bits,
+            public_prf_seed_bits,
+            prf_mask_output_coeff_bits,
+            ?prf_mask_output_bound,
+            "AKY24 GPU test configured PRF mask output coefficient range"
+        );
         let mut setup_circuit = PolyCircuit::<GpuDCRTPoly>::new();
         info!("AKY24 GPU test setting up nested-RNS context");
         let ring_gsw_context = Arc::new(NestedRnsPolyContext::setup(
@@ -724,7 +1659,7 @@ mod tests {
             );
         info!("AKY24 GPU test sampling setup B trapdoor material");
         let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&poly_params, 4.578);
-        let (b_trapdoor, b_matrix) = trapdoor_sampler.trapdoor(&poly_params, 2);
+        let (b_trapdoor, b_matrix) = trapdoor_sampler.trapdoor(&poly_params, 1);
         info!(ring_gsw_width, "AKY24 GPU test building AKY24 params");
         let params = Aky24Params::<GpuDCRTPolyMatrix, _>::new(
             poly_params.clone(),
@@ -739,6 +1674,13 @@ mod tests {
             None,
             b_matrix,
             b_trapdoor,
+            prf_seed_bits,
+            prf_mask_output_coeff_bits,
+            Some(public_prf_seed_bits),
+            [0x42; 32],
+            1,
+            1,
+            [0x24; 32],
         );
         let mut scheme = TestFuncEnc::new(None, None, None, None);
         info!("AKY24 GPU test running setup");
@@ -747,18 +1689,16 @@ mod tests {
         info!(dir_path, "AKY24 GPU test preparing lookup storage");
         prepare_clean_storage(dir_path);
         info!("AKY24 GPU test installing public-key lookup evaluator");
-        scheme.pk_lookup_evaluator =
-            Some(NaiveLWEBGGPublicKeyVecPltEvaluator::new(LWEBGGPubKeyPltEvaluator::<
-                GpuDCRTPolyMatrix,
-                GpuDCRTPolyHashSampler<Keccak256>,
-                _,
-            >::new(
-                enc_key.bgg_hash_key,
-                trapdoor_sampler,
-                Arc::new(master_key.b_matrix.clone()),
-                Arc::new(master_key.b_trapdoor.clone()),
-                dir_path.into(),
-            )));
+        scheme.pk_lookup_evaluator = Some(DebugNaiveBGGPublicKeyVecPltEvaluator::<
+            GpuDCRTPolyMatrix,
+            GpuDCRTPolyHashSampler<Keccak256>,
+            GpuDCRTPolyTrapdoorSampler,
+        >::new(
+            enc_key.bgg_hash_key,
+            master_key.b_trapdoor.clone(),
+            master_key.b_matrix.clone(),
+            dir_path.into(),
+        ));
         scheme.pk_slot_transfer_evaluator = Some(NaiveBGGVecSlotTransferEvaluator::new());
         scheme.enc_slot_transfer_evaluator = Some(NaiveBGGVecSlotTransferEvaluator::new());
         let msg = rand::random::<bool>();
@@ -766,14 +1706,11 @@ mod tests {
         let ciphertext = scheme.enc(&params, &enc_key, &msg);
         info!("AKY24 GPU test installing encoding lookup evaluator");
         scheme.enc_lookup_evaluator =
-            Some(NaiveLWEBGGEncodingVecPltEvaluator::new(LWEBGGEncodingPltEvaluator::<
+            Some(DebugNaiveBGGEncodingVecPltEvaluator::<
                 GpuDCRTPolyMatrix,
                 GpuDCRTPolyHashSampler<Keccak256>,
-            >::new(
-                enc_key.bgg_hash_key,
-                dir_path.into(),
-                ciphertext.c_b.clone(),
-            )));
+                GpuDCRTPolyTrapdoorSampler,
+            >::new(enc_key.bgg_hash_key, dir_path.into(), ciphertext.c_b.clone()));
         info!("AKY24 GPU test running keygen");
         let func_key = scheme.keygen(&params, &master_key, &Aky24Func::DebugIdentity);
         info!("AKY24 GPU test sampling lookup auxiliary matrices");
@@ -787,7 +1724,9 @@ mod tests {
         info!("AKY24 GPU test running dec");
         let output = scheme.dec(&params, &ciphertext, &func_key);
 
-        let Aky24Output::DebugIdentity { decrypted } = output;
+        let Aky24Output::DebugIdentity { decrypted } = output else {
+            panic!("AKY24 DebugIdentity test must return DebugIdentity output");
+        };
         info!(msg, decrypted, "AKY24 GPU DebugIdentity roundtrip test finished");
         assert_eq!(decrypted, msg);
     }

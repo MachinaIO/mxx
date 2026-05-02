@@ -17,6 +17,7 @@ impl<P: Poly> PolyCircuit<P> {
             sub_circuit_calls: BTreeMap::new(),
             summed_sub_circuit_calls: BTreeMap::new(),
             sub_circuit_params: vec![],
+            sub_circuit_input_max_plaintext_norm_ranges: None,
             output_ids: vec![],
             num_input: 0,
             gate_counts,
@@ -369,20 +370,6 @@ impl<P: Poly> PolyCircuit<P> {
         BatchedWire::single(self.new_gate_generic(
             vec![input.as_single_wire()],
             PolyGateType::PubLut { lut_id: GateParamSource::Const(lut_id) },
-        ))
-    }
-
-    pub fn public_lookup_gate_param<I: Into<BatchedWire>>(
-        &mut self,
-        input: I,
-        param_id: usize,
-    ) -> BatchedWire {
-        let input = input.into();
-        debug_assert!(input.is_single_wire());
-        self.expect_sub_circuit_param_kind(param_id, SubCircuitParamKind::PubLut);
-        BatchedWire::single(self.new_gate_generic(
-            vec![input.as_single_wire()],
-            PolyGateType::PubLut { lut_id: GateParamSource::Param(param_id) },
         ))
     }
 

@@ -15,7 +15,7 @@ pub struct BggPublicKey<M: PolyMatrix> {
     pub reveal_plaintext: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BggPublicKeyCompact<M: PolyMatrix> {
     pub matrix_bytes: Vec<u8>,
     pub reveal_plaintext: bool,

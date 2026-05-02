@@ -1,7 +1,7 @@
 use crate::{
     circuit::{
         BatchedWire, GateParamSource, PolyCircuit, PolyGate, PolyGateType, SubCircuitCall,
-        SubCircuitParamKind, SubCircuitParamValue,
+        SubCircuitParamSpec, SubCircuitParamValue,
         gate::{GateId, SlotTransferSpec},
     },
     poly::Poly,
@@ -22,7 +22,7 @@ pub enum SerializablePolyGateType {
     Add,
     Sub,
     Mul,
-    PubLut { lut_id: GateParamSource<usize> },
+    PubLut { lut_id: usize },
     SubCircuitOutput { call_id: usize, output_idx: usize, num_inputs: usize },
     SummedSubCircuitOutput { summed_call_id: usize, output_idx: usize, num_inputs: usize },
 }
@@ -68,6 +68,8 @@ pub struct SerializableSubCircuitCall {
     pub shared_input_prefix: Option<Vec<BatchedWire>>,
     pub input_suffix: Vec<BatchedWire>,
     pub param_bindings: Vec<SubCircuitParamValue>,
+    pub input_max_plaintext_norm_ranges:
+        Option<Vec<crate::circuit::SubCircuitInputMaxPlaintextNormRange>>,
     pub scoped_call_id: usize,
     pub output_gate_ids: Vec<GateId>,
     pub num_outputs: usize,
@@ -78,6 +80,8 @@ pub struct SerializableSummedSubCircuitCall {
     pub sub_circuit_id: usize,
     pub call_inputs: Vec<Vec<BatchedWire>>,
     pub param_bindings: Vec<Vec<SubCircuitParamValue>>,
+    pub input_max_plaintext_norm_ranges:
+        Option<Vec<crate::circuit::SubCircuitInputMaxPlaintextNormRange>>,
     pub scoped_call_ids: Vec<usize>,
     pub output_gate_ids: Vec<GateId>,
     pub num_outputs: usize,
@@ -89,7 +93,9 @@ pub struct SerializablePolyCircuit {
     sub_circuits: BTreeMap<usize, Box<SerializablePolyCircuit>>,
     sub_circuit_calls: BTreeMap<usize, SerializableSubCircuitCall>,
     summed_sub_circuit_calls: BTreeMap<usize, SerializableSummedSubCircuitCall>,
-    sub_circuit_params: Vec<SubCircuitParamKind>,
+    sub_circuit_params: Vec<SubCircuitParamSpec>,
+    sub_circuit_input_max_plaintext_norm_ranges:
+        Option<Vec<crate::circuit::SubCircuitInputMaxPlaintextNormRange>>,
     output_ids: Vec<GateId>,
     num_input: usize,
     next_scoped_call_id: usize,
@@ -120,7 +126,10 @@ impl SerializablePolyCircuit {
         sub_circuits: BTreeMap<usize, Box<SerializablePolyCircuit>>,
         sub_circuit_calls: BTreeMap<usize, SerializableSubCircuitCall>,
         summed_sub_circuit_calls: BTreeMap<usize, SerializableSummedSubCircuitCall>,
-        sub_circuit_params: Vec<SubCircuitParamKind>,
+        sub_circuit_params: Vec<SubCircuitParamSpec>,
+        sub_circuit_input_max_plaintext_norm_ranges: Option<
+            Vec<crate::circuit::SubCircuitInputMaxPlaintextNormRange>,
+        >,
         output_ids: Vec<GateId>,
         num_input: usize,
         next_scoped_call_id: usize,
@@ -131,6 +140,7 @@ impl SerializablePolyCircuit {
             sub_circuit_calls,
             summed_sub_circuit_calls,
             sub_circuit_params,
+            sub_circuit_input_max_plaintext_norm_ranges,
             output_ids,
             num_input,
             next_scoped_call_id,
@@ -156,6 +166,10 @@ impl SerializablePolyCircuit {
                         shared_input_prefix,
                         input_suffix: call.input_suffix.clone(),
                         param_bindings,
+                        input_max_plaintext_norm_ranges: call
+                            .input_max_plaintext_norm_ranges
+                            .as_ref()
+                            .map(|ranges| ranges.as_ref().to_vec()),
                         scoped_call_id: call.scoped_call_id,
                         output_gate_ids: call.output_gate_ids.clone(),
                         num_outputs: call.num_outputs,
@@ -189,6 +203,10 @@ impl SerializablePolyCircuit {
                         sub_circuit_id: call.sub_circuit_id,
                         call_inputs,
                         param_bindings,
+                        input_max_plaintext_norm_ranges: call
+                            .input_max_plaintext_norm_ranges
+                            .as_ref()
+                            .map(|ranges| ranges.as_ref().to_vec()),
                         scoped_call_ids: call.scoped_call_ids.clone(),
                         output_gate_ids: call.output_gate_ids.clone(),
                         num_outputs: call.num_outputs,
@@ -222,6 +240,9 @@ impl SerializablePolyCircuit {
                             PolyGateType::Sub => SerializablePolyGateType::Sub,
                             PolyGateType::Mul => SerializablePolyGateType::Mul,
                             PolyGateType::PubLut { lut_id } => {
+                                let GateParamSource::Const(lut_id) = lut_id else {
+                                    panic!("parameterized public lookup ids are not serializable");
+                                };
                                 SerializablePolyGateType::PubLut { lut_id }
                             }
                             PolyGateType::SubCircuitOutput { call_id, output_idx, num_inputs } => {
@@ -274,6 +295,10 @@ impl SerializablePolyCircuit {
             calls_vec.into_iter().collect(),
             summed_calls_vec.into_iter().collect(),
             circuit.sub_circuit_params,
+            circuit
+                .sub_circuit_input_max_plaintext_norm_ranges
+                .as_ref()
+                .map(|ranges| ranges.as_ref().to_vec()),
             circuit.output_ids,
             circuit.num_input,
             circuit.next_scoped_call_id,
@@ -358,7 +383,9 @@ impl SerializablePolyCircuit {
                                     SerializablePolyGateType::Sub => PolyGateType::Sub,
                                     SerializablePolyGateType::Mul => PolyGateType::Mul,
                                     SerializablePolyGateType::PubLut { lut_id } => {
-                                        PolyGateType::PubLut { lut_id }
+                                        PolyGateType::PubLut {
+                                            lut_id: GateParamSource::Const(lut_id),
+                                        }
                                     }
                                     SerializablePolyGateType::SubCircuitOutput {
                                         call_id,
@@ -425,6 +452,9 @@ impl SerializablePolyCircuit {
                         shared_input_prefix_set_id,
                         input_suffix: call.input_suffix,
                         binding_set_id,
+                        input_max_plaintext_norm_ranges: call
+                            .input_max_plaintext_norm_ranges
+                            .map(Arc::from),
                         scoped_call_id: call.scoped_call_id,
                         output_gate_ids: call.output_gate_ids,
                         num_outputs: call.num_outputs,
@@ -451,6 +481,9 @@ impl SerializablePolyCircuit {
                         sub_circuit_id: call.sub_circuit_id,
                         call_input_set_ids,
                         call_binding_set_ids,
+                        input_max_plaintext_norm_ranges: call
+                            .input_max_plaintext_norm_ranges
+                            .map(Arc::from),
                         scoped_call_ids: call.scoped_call_ids,
                         output_gate_ids: call.output_gate_ids,
                         num_outputs: call.num_outputs,
@@ -459,6 +492,8 @@ impl SerializablePolyCircuit {
             })
             .collect();
         circuit.sub_circuit_params = self.sub_circuit_params;
+        circuit.sub_circuit_input_max_plaintext_norm_ranges =
+            self.sub_circuit_input_max_plaintext_norm_ranges.map(Arc::from);
         circuit.num_input = self.num_input;
         circuit.output_ids = self.output_ids;
         circuit.next_scoped_call_id = self.next_scoped_call_id;
@@ -593,8 +628,8 @@ mod tests {
     #[test]
     fn test_serialization_roundtrip_with_parameterized_sub_circuit() {
         let mut sub_circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
-        let scalar_param =
-            sub_circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul);
+        let scalar_param = sub_circuit
+            .register_sub_circuit_param(SubCircuitParamSpec::SmallScalarMul { max_scalar: 5 });
         let sub_inputs = sub_circuit.input(1).to_vec();
         let scaled = sub_circuit.small_scalar_mul_param(sub_inputs[0], scalar_param);
         sub_circuit.output(vec![scaled]);
@@ -617,8 +652,8 @@ mod tests {
     #[test]
     fn test_serialization_roundtrip_with_summed_sub_circuit() {
         let mut sub_circuit: PolyCircuit<DCRTPoly> = PolyCircuit::new();
-        let scalar_param =
-            sub_circuit.register_sub_circuit_param(SubCircuitParamKind::SmallScalarMul);
+        let scalar_param = sub_circuit
+            .register_sub_circuit_param(SubCircuitParamSpec::SmallScalarMul { max_scalar: 3 });
         let sub_inputs = sub_circuit.input(1).to_vec();
         let scaled = sub_circuit.small_scalar_mul_param(sub_inputs[0], scalar_param);
         sub_circuit.output(vec![scaled]);

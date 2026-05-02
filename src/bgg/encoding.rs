@@ -20,7 +20,7 @@ pub struct BggEncoding<M: PolyMatrix> {
     pub plaintext: Option<<M as PolyMatrix>::P>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BggEncodingCompact<M: PolyMatrix> {
     pub vector_bytes: Vec<u8>,
     pub pubkey: BggPublicKeyCompact<M>,

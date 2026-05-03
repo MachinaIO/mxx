@@ -13,7 +13,8 @@ use std::{
 
 pub use super::eval_error::{
     AffinePltEvaluator, AffineSlotTransferEvaluator, NormBggPolyEncodingSTEvaluator,
-    NormPltCommitEvaluator, NormPltGGH15Evaluator, NormPltLWEEvaluator, compute_preimage_norm,
+    NormNaiveBggEncodingVecSTEvaluator, NormPltCommitEvaluator, NormPltGGH15Evaluator,
+    NormPltLWEEvaluator, compute_preimage_norm,
 };
 
 // Note: h_norm and plaintext_norm computed here can be larger than the modulus .

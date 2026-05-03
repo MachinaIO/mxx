@@ -4,14 +4,20 @@ use bigdecimal::{BigDecimal, FromPrimitive};
 use keccak_asm::Keccak256;
 use mxx::{
     bench_estimator::{
-        BenchEstimator, BggEncodingBenchEstimator, NaiveBGGVecBenchEstimator,
-        PublicLutSampleAuxBenchEstimator, SlotTransferSampleAuxBenchEstimator,
+        BenchEstimator, BggEncodingBenchEstimator, BggPublicKeyBenchEstimator,
+        BggPublicKeyBenchSamples, NaiveBGGVecBenchEstimator, PublicLutSampleAuxBenchEstimator,
+        SlotTransferSampleAuxBenchEstimator,
     },
-    bgg::naive_vec::{
-        NaiveBGGEncodingVec, NaiveBGGEncodingVecSampler, NaiveBGGPublicKeyVec,
-        NaiveBGGPublicKeyVecSampler,
+    bgg::{
+        naive_vec::{
+            NaiveBGGEncodingVec, NaiveBGGEncodingVecSampler, NaiveBGGPublicKeyVec,
+            NaiveBGGPublicKeyVecSampler,
+        },
+        public_key::BggPublicKey,
+        sampler::BGGPublicKeySampler,
     },
-    circuit::{PolyCircuit, PolyGateKind, evaluable::PolyVec},
+    circuit::{PolyCircuit, PolyGateKind, evaluable::PolyVec, gate::GateId},
+    element::PolyElem,
     gadgets::{
         arith::{MontgomeryPoly, MontgomeryPolyContext},
         fhe::{
@@ -27,6 +33,7 @@ use mxx::{
         fhe_prg::goldreich::GoldreichFhePrg,
     },
     lookup::{
+        PublicLut,
         lwe::{
             LWEBGGEncodingPltEvaluator, LWEBGGPubKeyPltEvaluator,
             NaiveLWEBGGEncodingVecPltEvaluator, NaiveLWEBGGPublicKeyVecPltEvaluator,
@@ -53,9 +60,12 @@ use mxx::{
     },
     simulator::{
         SimulatorContext,
-        error_norm::{NormBggPolyEncodingSTEvaluator, NormPltLWEEvaluator},
+        error_norm::{NormNaiveBggEncodingVecSTEvaluator, NormPltLWEEvaluator},
     },
-    slot_transfer::{NaiveBGGVecSlotTransferEvaluator, PolyVecSlotTransferEvaluator},
+    slot_transfer::{
+        NaiveBGGVecSlotTransferEvaluator, PolyVecSlotTransferEvaluator,
+        bgg_pubkey::BggPublicKeySTEvaluator,
+    },
     storage::write::{init_storage_system, wait_for_all_writes},
     utils::bigdecimal_bits_ceil,
 };
@@ -88,6 +98,14 @@ type GpuMatrix = GpuDCRTPolyMatrix;
 type GpuHashSampler = GpuDCRTPolyHashSampler<Keccak256>;
 type GpuPubKeyPltEvaluator =
     NaiveLWEBGGPublicKeyVecPltEvaluator<GpuMatrix, GpuHashSampler, GpuDCRTPolyTrapdoorSampler>;
+type GpuScalarPubKeyPltEvaluator =
+    LWEBGGPubKeyPltEvaluator<GpuMatrix, GpuHashSampler, GpuDCRTPolyTrapdoorSampler>;
+type GpuPubKeySlotEvaluator = BggPublicKeySTEvaluator<
+    GpuMatrix,
+    GpuDCRTPolyUniformSampler,
+    GpuHashSampler,
+    GpuDCRTPolyTrapdoorSampler,
+>;
 type GpuEncodingPltEvaluator = NaiveLWEBGGEncodingVecPltEvaluator<GpuMatrix, GpuHashSampler>;
 type RingGswCiphertext<P> = GenericRingGswCiphertext<P, MontgomeryPoly<P>>;
 type RingGswContext<P> = GenericRingGswContext<P, MontgomeryPoly<P>>;
@@ -318,8 +336,8 @@ fn probe_crt_depth_for_goldreich_ring_gsw_bench(
     let (active_q_moduli, active_q, _) = active_q_moduli_and_modulus(&params, active_levels);
     let full_q = params.modulus();
     let q_max = *active_q_moduli.iter().max().expect("active_q_moduli must not be empty");
-    let (circuit, ctx, encrypted_outputs) =
-        build_goldreich_ring_gsw_circuit::<DCRTPoly>(&params, cfg, ERROR_SIM_ACTIVE_LEVELS);
+    let (circuit, ctx) =
+        build_goldreich_ring_gsw_probe_circuit::<DCRTPoly>(&params, cfg, ERROR_SIM_ACTIVE_LEVELS);
     let log_base_q = params.modulus_digits();
     let log_base_q_small = log_base_q / actual_crt_depth;
     let sim_ctx = Arc::new(SimulatorContext::new(
@@ -330,8 +348,7 @@ fn probe_crt_depth_for_goldreich_ring_gsw_bench(
         log_base_q_small,
     ));
     let plt_evaluator = NormPltLWEEvaluator::new(sim_ctx.clone(), error_sigma);
-    let slot_transfer_evaluator =
-        NormBggPolyEncodingSTEvaluator::new(sim_ctx.clone(), cfg.error_sigma, error_sigma, None);
+    let slot_transfer_evaluator = NormNaiveBggEncodingVecSTEvaluator::new();
     let out_errors = circuit.simulate_max_error_norm(
         sim_ctx,
         BigDecimal::from(1u64),
@@ -357,24 +374,12 @@ fn probe_crt_depth_for_goldreich_ring_gsw_bench(
         bigdecimal_bits_ceil(&corrected_max_eval_error)
     );
     let ring_gsw_q = ring_gsw_q_modulus(ctx.as_ref());
-    let ring_gsw_threshold = &ring_gsw_q / BigUint::from(2u64);
-    let ring_gsw_threshold_bd = BigDecimal::from_biguint(ring_gsw_threshold.clone(), 0);
-    let max_decryption_error = max_bigdecimal(
-        encrypted_outputs
-            .par_iter()
-            .map(|ciphertext| {
-                ciphertext.estimate_decryption_error_norm(cfg.error_sigma).poly_norm.norm
-            })
-            .collect::<Vec<_>>(),
-    );
-    debug!("max_decryption_error_bits={}", bigdecimal_bits_ceil(&max_decryption_error));
     let eval_ok = corrected_max_eval_error < threshold_bd;
-    let decryption_ok = max_decryption_error < ring_gsw_threshold_bd;
 
     let non_free_depth = circuit.non_free_depth();
     let non_free_depth_contributions = circuit.non_free_depth_contributions();
     info!(
-        "crt_depth={} active_levels={} error_sim_active_levels={} active_q_bits={} full_q_bits={} ring_gsw_q_bits={} non_free_depth={} non_free_depth_contributions={:?} num_inputs={} output_polys={} sim_max_eval_error_bits={} max_eval_error_bits={} eval_threshold_bits={} max_decryption_error_bits={} decryption_threshold_bits={} eval_ok={} decryption_ok={}",
+        "crt_depth={} active_levels={} error_sim_active_levels={} active_q_bits={} full_q_bits={} ring_gsw_q_bits={} non_free_depth={} non_free_depth_contributions={:?} num_inputs={} output_polys={} sim_max_eval_error_bits={} max_eval_error_bits={} eval_threshold_bits={} eval_ok={}",
         crt_depth,
         active_levels,
         ERROR_SIM_ACTIVE_LEVELS,
@@ -388,10 +393,7 @@ fn probe_crt_depth_for_goldreich_ring_gsw_bench(
         bigdecimal_bits_ceil(&max_eval_error),
         bigdecimal_bits_ceil(&corrected_max_eval_error),
         bigdecimal_bits_ceil(&BigDecimal::from_biguint(threshold, 0)),
-        bigdecimal_bits_ceil(&max_decryption_error),
-        bigdecimal_bits_ceil(&BigDecimal::from_biguint(ring_gsw_threshold, 0)),
-        eval_ok,
-        decryption_ok
+        eval_ok
     );
 
     CrtDepthProbe { params, eval_ok }
@@ -438,6 +440,49 @@ fn build_goldreich_ring_gsw_circuit<P: Poly + 'static>(
         encrypted_outputs.len()
     );
     (circuit, ctx, encrypted_outputs)
+}
+
+fn build_goldreich_ring_gsw_probe_circuit<P: Poly + 'static>(
+    params: &P::Params,
+    cfg: &GoldreichRingGswBenchConfig,
+    active_levels: usize,
+) -> (PolyCircuit<P>, Arc<RingGswContext<P>>) {
+    let build_start = Instant::now();
+    let mut circuit = PolyCircuit::<P>::new();
+    let montgomery =
+        Arc::new(MontgomeryPolyContext::setup(&mut circuit, params, cfg.limb_bits, false));
+    let ctx = Arc::new(RingGswContext::from_arith_context(
+        &mut circuit,
+        params,
+        cfg.num_slots(),
+        montgomery,
+        Some(active_levels),
+        None,
+    ));
+    let goldreich = GoldreichFhePrg::setup(
+        &mut circuit,
+        ctx.clone(),
+        cfg.input_size,
+        cfg.output_size,
+        DEFAULT_GRAPH_SEED,
+    );
+    let encrypted_inputs = (0..goldreich.input_size)
+        .map(|_| RingGswCiphertext::input(ctx.clone(), None, &mut circuit))
+        .collect::<Vec<_>>();
+    let encrypted_outputs = goldreich.evaluate_uniform(&encrypted_inputs, &mut circuit);
+    let reconstructed_outputs = encrypted_outputs
+        .iter()
+        .flat_map(|ciphertext| ciphertext.reconstruct(&mut circuit))
+        .collect::<Vec<_>>();
+    circuit.output(reconstructed_outputs);
+    info!(
+        "goldreich ring_gsw circuit build elapsed_ms={:.3} input_size={} output_size={} encrypted_outputs={}",
+        build_start.elapsed().as_secs_f64() * 1000.0,
+        cfg.input_size,
+        cfg.output_size,
+        encrypted_outputs.len()
+    );
+    (circuit, ctx)
 }
 
 fn find_crt_depth_for_goldreich_ring_gsw_bench(
@@ -521,6 +566,84 @@ fn build_lwe_pubkey_vec_plt_evaluator(
         Arc::new(trapdoor),
         dir_path,
     ))
+}
+
+fn build_lwe_scalar_pubkey_plt_evaluator(
+    params: &GpuDCRTPolyParams,
+    hash_key: [u8; 32],
+    d_secret: usize,
+    dir_path: PathBuf,
+) -> GpuScalarPubKeyPltEvaluator {
+    let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(params, TRAPDOOR_SIGMA);
+    let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(params, d_secret);
+    GpuScalarPubKeyPltEvaluator::new(
+        hash_key,
+        trapdoor_sampler,
+        Arc::new(pub_matrix),
+        Arc::new(trapdoor),
+        dir_path,
+    )
+}
+
+fn build_benchmark_public_lut(params: &GpuDCRTPolyParams) -> PublicLut<GpuDCRTPoly> {
+    PublicLut::<GpuDCRTPoly>::new(
+        params,
+        16,
+        move |params, x| {
+            if x >= 16 {
+                return None;
+            }
+            let y_elem = <<GpuDCRTPoly as Poly>::Elem as PolyElem>::constant(
+                &params.modulus(),
+                (x + 1) % 16,
+            );
+            Some((x, y_elem))
+        },
+        None,
+    )
+}
+
+fn build_benchmark_public_lookup_gate(
+    params: &GpuDCRTPolyParams,
+) -> (PublicLut<GpuDCRTPoly>, usize, GateId) {
+    let lut = build_benchmark_public_lut(params);
+    let mut circuit = PolyCircuit::<GpuDCRTPoly>::new();
+    let input = circuit.input(1);
+    let lut_id = circuit.register_public_lookup(lut.clone());
+    let gate_id = circuit.public_lookup_gate(input, lut_id).as_single_wire();
+    (lut, lut_id, gate_id)
+}
+
+fn build_benchmark_slot_transfer_gate(src_slots: &[(u32, Option<u32>)]) -> GateId {
+    let mut circuit = PolyCircuit::<GpuDCRTPoly>::new();
+    let input = circuit.input(1);
+    circuit.slot_transfer_gate(input, src_slots).as_single_wire()
+}
+
+fn identity_slot_transfer_plan(num_slots: usize) -> Vec<(u32, Option<u32>)> {
+    (0..num_slots).map(|slot| (slot as u32, None)).collect()
+}
+
+fn sample_benchmark_pubkeys(
+    params: &GpuDCRTPolyParams,
+    seed: [u8; 32],
+    d_secret: usize,
+    non_constant_key_count: usize,
+    tag: &[u8],
+) -> Vec<BggPublicKey<GpuMatrix>> {
+    let sampler = BGGPublicKeySampler::<_, GpuHashSampler>::new(seed, d_secret);
+    let reveal_plaintexts = vec![true; non_constant_key_count];
+    sampler.sample(params, tag, &reveal_plaintexts)
+}
+
+fn constant_and_shared_benchmark_pubkeys(
+    pubkeys: &[BggPublicKey<GpuMatrix>],
+) -> (&BggPublicKey<GpuMatrix>, &BggPublicKey<GpuMatrix>) {
+    assert!(
+        pubkeys.len() >= 2,
+        "benchmark pubkeys must contain the constant-one key and at least one reusable input key"
+    );
+    (&pubkeys[0], &pubkeys[1])
 }
 
 fn round_div_biguint(value: &BigUint, divisor: &BigUint) -> BigUint {
@@ -620,6 +743,9 @@ async fn test_gpu_lwe_montgomery_goldreich_ring_gsw_bench() {
             .collect::<Vec<_>>(),
     );
     let ring_gsw_q = ring_gsw_q_modulus(ctx.as_ref());
+    let ring_gsw_threshold = &ring_gsw_q / BigUint::from(2u64);
+    let ring_gsw_threshold_bd = BigDecimal::from_biguint(ring_gsw_threshold.clone(), 0);
+    let selected_decryption_ok = max_selected_decryption_error < ring_gsw_threshold_bd;
     let gate_counts = circuit.count_gates_by_type_vec();
     let total_lut_entries = circuit.total_registered_public_lut_entries();
     let total_public_lut_gates = gate_counts.get(&PolyGateKind::PubLut).copied().unwrap_or(0);
@@ -655,11 +781,13 @@ async fn test_gpu_lwe_montgomery_goldreich_ring_gsw_bench() {
         encrypted_outputs.len() * 2 * ctx.width()
     );
     info!(
-        "active_q_bits={} active_q_moduli_len={} ring_gsw_q_bits={} selected_max_decryption_error_bits={}",
+        "active_q_bits={} active_q_moduli_len={} ring_gsw_q_bits={} selected_max_decryption_error_bits={} selected_decryption_threshold_bits={} selected_decryption_ok={}",
         active_q.bits(),
         active_q_moduli.len(),
         ring_gsw_q.bits(),
-        bigdecimal_bits_ceil(&max_selected_decryption_error)
+        bigdecimal_bits_ceil(&max_selected_decryption_error),
+        bigdecimal_bits_ceil(&BigDecimal::from_biguint(ring_gsw_threshold, 0)),
+        selected_decryption_ok
     );
     let pubkey_bench_dir = cfg.pubkey_bench_dir(crt_depth);
     ensure_dir_exists(&pubkey_bench_dir);
@@ -694,6 +822,85 @@ async fn test_gpu_lwe_montgomery_goldreich_ring_gsw_bench() {
         total_slot_transfer_gates
     );
     gpu_device_sync();
+
+    let (pubkey_bench_lut, pubkey_bench_public_lut_id, pubkey_bench_public_lut_gate_id) =
+        build_benchmark_public_lookup_gate(&params);
+    let pubkey_bench_slot_transfer_src_slots = identity_slot_transfer_plan(cfg.num_slots());
+    let pubkey_bench_slot_transfer_gate_id =
+        build_benchmark_slot_transfer_gate(&pubkey_bench_slot_transfer_src_slots);
+    let pubkey_bench_public_keys = sample_benchmark_pubkeys(
+        &params,
+        DEFAULT_BENCH_SEED,
+        cfg.d_secret,
+        1,
+        b"LWE_MONTGOMERY_GOLDREICH_RING_GSW_PUBKEY_BENCH",
+    );
+    let (pubkey_bench_public_lut_one, pubkey_bench_shared_input) =
+        constant_and_shared_benchmark_pubkeys(&pubkey_bench_public_keys);
+    let pubkey_scalar_bench_plt_evaluator = build_lwe_scalar_pubkey_plt_evaluator(
+        &params,
+        DEFAULT_BENCH_SEED,
+        cfg.d_secret,
+        pubkey_bench_dir.clone(),
+    );
+    let pubkey_scalar_bench_slot_evaluator = GpuPubKeySlotEvaluator::new(
+        DEFAULT_BENCH_SEED,
+        cfg.d_secret,
+        cfg.num_slots(),
+        TRAPDOOR_SIGMA,
+        cfg.error_sigma,
+        pubkey_bench_dir.clone(),
+    );
+    let pubkey_scalar_bench = BggPublicKeyBenchEstimator::benchmark(
+        &BggPublicKeyBenchSamples {
+            params: &params,
+            add_lhs: pubkey_bench_shared_input,
+            add_rhs: pubkey_bench_shared_input,
+            sub_lhs: pubkey_bench_shared_input,
+            sub_rhs: pubkey_bench_shared_input,
+            mul_lhs: pubkey_bench_shared_input,
+            mul_rhs: pubkey_bench_shared_input,
+            small_scalar_input: pubkey_bench_shared_input,
+            small_scalar: &[3u32, 5u32],
+            large_scalar_input: pubkey_bench_shared_input,
+            large_scalar: &[BigUint::from(7u32)],
+            public_lut_one: pubkey_bench_public_lut_one,
+            public_lut_input: pubkey_bench_shared_input,
+            public_lut: &pubkey_bench_lut,
+            public_lut_id: pubkey_bench_public_lut_id,
+            public_lut_gate_id: pubkey_bench_public_lut_gate_id,
+            slot_transfer_input: pubkey_bench_shared_input,
+            slot_transfer_src_slots: &pubkey_bench_slot_transfer_src_slots,
+            slot_transfer_gate_id: pubkey_bench_slot_transfer_gate_id,
+        },
+        &pubkey_scalar_bench_plt_evaluator,
+        &pubkey_scalar_bench_slot_evaluator,
+        build_lwe_pubkey_vec_plt_evaluator(
+            &params,
+            DEFAULT_BENCH_SEED,
+            cfg.d_secret,
+            pubkey_bench_dir.clone(),
+        ),
+        GpuPubKeySlotEvaluator::new(
+            DEFAULT_BENCH_SEED,
+            cfg.d_secret,
+            cfg.num_slots(),
+            TRAPDOOR_SIGMA,
+            cfg.error_sigma,
+            pubkey_bench_dir.clone(),
+        ),
+        cfg.bench_iterations,
+    );
+    let pubkey_vec_bench_estimator =
+        NaiveBGGVecBenchEstimator::new(pubkey_scalar_bench, cfg.num_slots());
+    let pubkey_circuit_bench = pubkey_vec_bench_estimator.estimate_circuit_bench(&circuit);
+    info!(
+        "naive bgg pubkey vec circuit bench estimate: total_time={:.6} latency={:.6} max_parallelism={} peak_vram={}",
+        pubkey_circuit_bench.total_time,
+        pubkey_circuit_bench.latency,
+        pubkey_circuit_bench.max_parallelism,
+        pubkey_circuit_bench.peak_vram
+    );
 
     let encoding_scalar_bench =
         BggEncodingBenchEstimator::<GpuMatrix>::benchmark(&params, cfg.bench_iterations);

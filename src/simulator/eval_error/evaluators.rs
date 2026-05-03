@@ -175,6 +175,59 @@ impl AffineSlotTransferEvaluator for NormBggPolyEncodingSTEvaluator {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NormNaiveBggEncodingVecSTEvaluator;
+
+impl NormNaiveBggEncodingVecSTEvaluator {
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn max_slot_scalar(src_slots: &[(u32, Option<u32>)]) -> u32 {
+        src_slots.iter().map(|(_, scalar)| scalar.unwrap_or(1)).max().unwrap_or(1)
+    }
+}
+
+impl SlotTransferEvaluator<ErrorNorm> for NormNaiveBggEncodingVecSTEvaluator {
+    fn slot_transfer(
+        &self,
+        _: &(),
+        input: &ErrorNorm,
+        src_slots: &[(u32, Option<u32>)],
+        _: GateId,
+    ) -> ErrorNorm {
+        input.small_scalar_mul(&(), &[Self::max_slot_scalar(src_slots)])
+    }
+
+    fn slot_reduce(&self, _: &(), inputs: &[ErrorNorm], num_slots: usize, _: GateId) -> ErrorNorm {
+        assert!(num_slots > 0, "slot_reduce requires num_slots > 0");
+        assert!(!inputs.is_empty(), "slot_reduce requires at least one input");
+        assert!(
+            inputs.len() <= num_slots,
+            "slot_reduce input count {} exceeds num_slots {}",
+            inputs.len(),
+            num_slots
+        );
+
+        let mut sum = inputs[0].clone();
+        for input in &inputs[1..] {
+            sum = sum + input;
+        }
+        sum
+    }
+}
+
+impl AffineSlotTransferEvaluator for NormNaiveBggEncodingVecSTEvaluator {
+    fn slot_transfer_affine(
+        &self,
+        input: &ErrorNormSummaryExpr,
+        src_slots: &[(u32, Option<u32>)],
+        _: GateId,
+    ) -> ErrorNormSummaryExpr {
+        input.small_scalar_mul_bound(&[Self::max_slot_scalar(src_slots)])
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NormPltLWEEvaluator {
     pub e_b_times_k_high: PolyMatrixNorm,

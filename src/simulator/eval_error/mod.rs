@@ -1564,8 +1564,8 @@ mod store;
 mod summary;
 
 pub use evaluators::{
-    NormBggPolyEncodingSTEvaluator, NormPltCommitEvaluator, NormPltGGH15Evaluator,
-    NormPltLWEEvaluator, compute_preimage_norm,
+    NormBggPolyEncodingSTEvaluator, NormNaiveBggEncodingVecSTEvaluator, NormPltCommitEvaluator,
+    NormPltGGH15Evaluator, NormPltLWEEvaluator, compute_preimage_norm,
 };
 
 #[cfg(test)]

@@ -48,7 +48,7 @@ use mxx::{
     },
     simulator::{
         SimulatorContext,
-        error_norm::{NormBggPolyEncodingSTEvaluator, NormPltLWEEvaluator},
+        error_norm::{NormNaiveBggEncodingVecSTEvaluator, NormPltLWEEvaluator},
     },
     slot_transfer::{NaiveBGGVecSlotTransferEvaluator, PolyVecSlotTransferEvaluator},
     storage::write::{init_storage_system, wait_for_all_writes},
@@ -356,8 +356,7 @@ fn probe_crt_depth_for_goldreich_ring_gsw_bench(
         log_base_q_small,
     ));
     let plt_evaluator = NormPltLWEEvaluator::new(sim_ctx.clone(), error_sigma);
-    let slot_transfer_evaluator =
-        NormBggPolyEncodingSTEvaluator::new(sim_ctx.clone(), cfg.error_sigma, error_sigma, None);
+    let slot_transfer_evaluator = NormNaiveBggEncodingVecSTEvaluator::new();
     let out_errors = circuit.simulate_max_error_norm(
         sim_ctx,
         BigDecimal::from(1u64),

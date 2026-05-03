@@ -330,6 +330,48 @@ fn test_wire_norm_slot_transfer_bound_is_independent_of_slot_count() {
 }
 
 #[test]
+fn test_wire_norm_naive_bgg_encoding_vec_slot_transfer_is_free() {
+    let ctx = make_ctx();
+    let evaluator = NormNaiveBggEncodingVecSTEvaluator::new();
+    let input = ErrorNorm::new(
+        PolyNorm::new(ctx.clone(), BigDecimal::from(5u64)),
+        PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, BigDecimal::from(7u64), None),
+    );
+    let src_slots = [(2, None), (0, Some(3)), (1, Some(2))];
+
+    let out = evaluator.slot_transfer(&(), &input, &src_slots, GateId(0));
+
+    assert_eq!(out, input.small_scalar_mul(&(), &[3]));
+}
+
+#[test]
+fn test_wire_norm_naive_bgg_encoding_vec_slot_transfer_affine_path_is_free() {
+    let ctx = make_ctx();
+    let mut circuit = PolyCircuit::<DCRTPoly>::new();
+    let inputs = circuit.input(1).to_vec();
+    let out_gate = circuit.slot_transfer_gate(inputs[0], &[(2, None), (0, Some(4)), (1, Some(2))]);
+    circuit.output(vec![out_gate.as_single_wire()]);
+
+    let evaluator = NormNaiveBggEncodingVecSTEvaluator::new();
+    let input_bound = BigDecimal::from(5u64);
+    let e_init_norm = BigDecimal::from(E_INIT_NORM);
+    let out = circuit.simulate_max_error_norm(
+        ctx.clone(),
+        input_bound.clone(),
+        1,
+        &e_init_norm,
+        None::<&NormPltLWEEvaluator>,
+        Some(&evaluator),
+    );
+    let input = ErrorNorm::new(
+        PolyNorm::new(ctx.clone(), input_bound),
+        PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, e_init_norm, None),
+    );
+
+    assert_eq!(out, vec![input.small_scalar_mul(&(), &[4])]);
+}
+
+#[test]
 fn test_wire_norm_lwe_plt_bounds() {
     // Build a tiny LUT on DCRTPoly where the maximum output coeff is known (e.g., 7)
     let params = DCRTPolyParams::default();

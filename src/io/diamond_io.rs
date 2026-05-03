@@ -1,5 +1,7 @@
 use std::{fs, marker::PhantomData, path::Path, sync::Arc};
 
+use digest::Digest;
+use keccak_asm::Keccak256;
 use num_bigint::BigUint;
 
 use crate::{
@@ -12,7 +14,7 @@ use crate::{
     circuit::{Evaluable, PolyCircuit},
     func_enc::aky24::NoCircuitEvaluator,
     gadgets::{
-        arith::NestedRnsPolyContext,
+        arith::{NestedRnsPoly, NestedRnsPolyContext},
         fhe::{
             ring_gsw::RingGswCiphertext,
             ring_gsw_nested_rns::{
@@ -20,12 +22,18 @@ use crate::{
                 encrypt_plaintext_bit, sample_public_key,
             },
         },
+        fhe_prg::goldreich::{
+            decrypt_bit_decomposed_scalar_outputs, evaluate_goldreich_uniform_range,
+        },
     },
     input_injector::{
         DIAMOND_SECRET_SIZE, DiamondInjector, DiamondInjectorPreprocessOut, InputInjector,
     },
     lookup::PltEvaluator,
     matrix::PolyMatrix,
+    noise_refresh::{
+        NoiseRefresherNaiveVec, circuit_decrypt::mask_plaintext_moduli_from_full_modulus,
+    },
     poly::{
         Poly, PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
@@ -68,6 +76,10 @@ where
     /// encodings can be derived again from these ciphertexts and the public
     /// Ring-GSW parameters, so no derived inputs are stored here.
     pub seed_ciphertexts: Vec<NativeRingGswCiphertext>,
+    /// Original private seed bits, kept only in tests so debug circuits can
+    /// assert that the obfuscated decryption path returns the sampled bits.
+    #[cfg(test)]
+    pub original_seed_bits: Vec<bool>,
 }
 
 /// Diamond iO frontend that turns a high-level function type into Diamond input
@@ -108,6 +120,19 @@ where
     pub bgg_tag: Vec<u8>,
     /// Number of private PRF seed bits encrypted into Ring-GSW ciphertexts.
     pub seed_bits: usize,
+    /// Number of bit-decomposed PRF mask output coefficients to compute.
+    ///
+    /// A value of zero disables PRF mask public-key precomputation. This is
+    /// useful for debug-only tests that do not exercise the AKY24 PRF layer.
+    pub prf_mask_output_coeff_bits: usize,
+    /// Number of low bits retained in the noise-refresh rounding material.
+    pub noise_refresh_v_bits: usize,
+    /// Centered-binomial sample count used by noise-refresh material PRGs.
+    pub noise_refresh_cbd_n: usize,
+    /// Hash key used by the noise-refresh public material sampler.
+    pub noise_refresh_hash_key: [u8; 32],
+    /// Base seed from which per-round Goldreich PRG graphs are derived.
+    pub goldreich_graph_seed: [u8; 32],
     /// Public-key lookup evaluator used when evaluating the selected circuit
     /// over `NaiveBGGPublicKeyVec` wires.
     pub pk_lookup_evaluator: Option<PKPE>,
@@ -132,8 +157,9 @@ where
     /// `output_size` describe the selected boolean circuit shape,
     /// `native_poly_params` and `ring_gsw_context` describe the native
     /// Ring-GSW layer, `bgg_tag` is the domain-separation prefix for BGG public
-    /// keys, and the optional evaluators are used when evaluating the function
-    /// circuit over public keys.
+    /// keys, the PRF/noise-refresh fields mirror the corresponding AKY24
+    /// parameters, and the optional evaluators are used when evaluating the
+    /// function circuit and PRF circuits over public keys.
     pub fn new(
         injector: DiamondInjector<M, US, HS, TS>,
         input_size: usize,
@@ -146,6 +172,11 @@ where
         ring_gsw_public_key_error_sigma: Option<f64>,
         bgg_tag: Vec<u8>,
         seed_bits: usize,
+        prf_mask_output_coeff_bits: usize,
+        noise_refresh_v_bits: usize,
+        noise_refresh_cbd_n: usize,
+        noise_refresh_hash_key: [u8; 32],
+        goldreich_graph_seed: [u8; 32],
         pk_lookup_evaluator: Option<PKPE>,
         pk_slot_transfer_evaluator: Option<PKST>,
     ) -> Self {
@@ -161,6 +192,11 @@ where
             ring_gsw_public_key_error_sigma,
             bgg_tag,
             seed_bits,
+            prf_mask_output_coeff_bits,
+            noise_refresh_v_bits,
+            noise_refresh_cbd_n,
+            noise_refresh_hash_key,
+            goldreich_graph_seed,
             pk_lookup_evaluator,
             pk_slot_transfer_evaluator,
             _m: PhantomData,
@@ -245,6 +281,288 @@ where
         circuit
     }
 
+    fn build_ring_gsw_circuit_context(
+        &self,
+        circuit: &mut PolyCircuit<M::P>,
+    ) -> Arc<NestedRnsRingGswContext<M::P>>
+    where
+        M::P: 'static,
+    {
+        let nested_rns_context = Arc::new(NestedRnsPolyContext::setup(
+            circuit,
+            &self.injector.params,
+            self.ring_gsw_context.p_moduli_bits,
+            self.ring_gsw_context.max_unreduced_muls,
+            self.ring_gsw_context.scale,
+            false,
+            self.ring_gsw_enable_levels,
+        ));
+        Arc::new(NestedRnsRingGswContext::<M::P>::from_arith_context(
+            circuit,
+            &self.injector.params,
+            self.injector.params.ring_dimension() as usize,
+            nested_rns_context,
+            self.ring_gsw_enable_levels,
+            Some(self.ring_gsw_level_offset),
+        ))
+    }
+
+    /// Build a Goldreich PRG circuit that emits a contiguous range of
+    /// Ring-GSW ciphertext wires. The conceptual output length lets callers
+    /// evaluate either a full PRG stream or just a selected segment.
+    fn build_goldreich_prg_range_circuit(
+        &self,
+        round_idx: usize,
+        conceptual_output_bits: usize,
+        range_start: usize,
+        range_len: usize,
+    ) -> PolyCircuit<M::P>
+    where
+        M::P: 'static,
+    {
+        assert!(self.seed_bits >= 5, "DiamondIO Goldreich PRF seed bit length must be at least 5");
+        assert!(conceptual_output_bits > 0, "DiamondIO Goldreich output length must be positive");
+        assert!(range_len > 0, "DiamondIO Goldreich output range length must be positive");
+        assert!(
+            range_start + range_len <= conceptual_output_bits,
+            "DiamondIO Goldreich output range must fit in the conceptual output"
+        );
+        let mut circuit = PolyCircuit::new();
+        let ring_gsw_context = self.build_ring_gsw_circuit_context(&mut circuit);
+        let seed_ciphertexts = (0..self.seed_bits)
+            .map(|_| {
+                RingGswCiphertext::input(
+                    ring_gsw_context.clone(),
+                    Some(BigUint::from(1u64)),
+                    &mut circuit,
+                )
+            })
+            .collect::<Vec<_>>();
+        let outputs = evaluate_goldreich_uniform_range(
+            &mut circuit,
+            ring_gsw_context,
+            &seed_ciphertexts,
+            conceptual_output_bits,
+            range_start,
+            range_len,
+            Self::derive_goldreich_graph_seed(self.goldreich_graph_seed, round_idx),
+        );
+        circuit.output(outputs.iter().flat_map(|output| output.sub_circuit_wires()));
+        circuit
+    }
+
+    /// Build the final PRF-mask circuit that decrypts bit-decomposed Ring-GSW
+    /// mask ciphertexts into one scalar polynomial public key.
+    fn build_prf_mask_circuit(&self) -> PolyCircuit<M::P>
+    where
+        M::P: 'static,
+    {
+        assert!(
+            self.prf_mask_output_coeff_bits > 0,
+            "DiamondIO PRF mask circuit requires at least one mask output bit"
+        );
+        let mut circuit = PolyCircuit::new();
+        let ring_gsw_context = self.build_ring_gsw_circuit_context(&mut circuit);
+        let decryption_key = circuit.input(1).at(0).as_single_wire();
+        let q: Arc<BigUint> = self.injector.params.modulus().into();
+        let plaintext_moduli =
+            mask_plaintext_moduli_from_full_modulus(q.as_ref(), self.prf_mask_output_coeff_bits);
+        let encrypted_bits = (0..self.prf_mask_output_coeff_bits)
+            .map(|_| {
+                RingGswCiphertext::input(
+                    ring_gsw_context.clone(),
+                    Some(BigUint::from(1u64)),
+                    &mut circuit,
+                )
+            })
+            .collect::<Vec<_>>();
+        let decrypted = decrypt_bit_decomposed_scalar_outputs::<M::P, NestedRnsPoly<M::P>, M>(
+            &mut circuit,
+            &encrypted_bits,
+            decryption_key,
+            &plaintext_moduli,
+        );
+        circuit.output(vec![decrypted]);
+        circuit
+    }
+
+    fn derive_goldreich_graph_seed(base_seed: [u8; 32], round_idx: usize) -> [u8; 32] {
+        let mut hasher = Keccak256::new();
+        hasher.update(b"DiamondIOGoldreichPrfGraph/v1");
+        hasher.update(base_seed);
+        hasher.update(round_idx.to_le_bytes());
+        hasher.finalize().into()
+    }
+
+    /// Compute and persist the public keys for the PRF seed evolution and the
+    /// final scalar PRF mask.
+    ///
+    /// Each round evaluates the Goldreich PRG to both halves, selects the half
+    /// with the obfuscated input bit as `low + bit * (high - low)`, and then
+    /// noise-refreshes the selected ciphertext wires. This keeps one common
+    /// `a_prime` public key per output wire and round; the public keys do not
+    /// branch over all possible input assignments.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_and_persist_prf_public_keys(
+        &self,
+        dir_path: &Path,
+        one_vec: &NaiveBGGPublicKeyVec<M>,
+        k_vec: &NaiveBGGPublicKeyVec<M>,
+        input_digit_vecs: &[NaiveBGGPublicKeyVec<M>],
+        enc_seed_public_keys: &[NaiveBGGPublicKeyVec<M>],
+    ) where
+        M: Send + Sync + 'static,
+        M::P: 'static,
+        PKPE: PltEvaluator<NaiveBGGPublicKeyVec<M>>,
+        PKST: SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>,
+    {
+        if self.prf_mask_output_coeff_bits == 0 {
+            return;
+        }
+        assert_eq!(
+            input_digit_vecs.len(),
+            self.input_size,
+            "DiamondIO PRF input public-key count must match input_size"
+        );
+        assert!(self.seed_bits > 0, "DiamondIO PRF requires at least one seed bit");
+        assert_eq!(
+            enc_seed_public_keys.len() % self.seed_bits,
+            0,
+            "DiamondIO encrypted seed wire count must be divisible by seed_bits"
+        );
+        let wire_count = enc_seed_public_keys.len() / self.seed_bits;
+        let pk_lookup_evaluator = self
+            .pk_lookup_evaluator
+            .as_ref()
+            .expect("DiamondIO PRF public-key computation requires a lookup evaluator");
+        let pk_slot_transfer_evaluator = self
+            .pk_slot_transfer_evaluator
+            .as_ref()
+            .expect("DiamondIO PRF public-key computation requires a slot-transfer evaluator");
+        let mut refresh_context_circuit = PolyCircuit::new();
+        let noise_refresher = NoiseRefresherNaiveVec::<M, NestedRnsPoly<M::P>, HS>::new(
+            self.build_ring_gsw_circuit_context(&mut refresh_context_circuit),
+            self.seed_bits,
+            self.noise_refresh_v_bits,
+            self.goldreich_graph_seed,
+            self.noise_refresh_cbd_n,
+            self.noise_refresh_hash_key,
+        );
+        let mut seed_wires = enc_seed_public_keys.to_vec();
+        for (round_idx, selector) in input_digit_vecs.iter().enumerate() {
+            let prg_circuit = self.build_goldreich_prg_range_circuit(
+                round_idx,
+                2 * self.seed_bits,
+                0,
+                2 * self.seed_bits,
+            );
+            let prg_outputs = prg_circuit.eval(
+                &self.injector.params,
+                one_vec.clone(),
+                seed_wires.clone(),
+                self.pk_lookup_evaluator.as_ref(),
+                self.pk_slot_transfer_evaluator.as_ref().map(|evaluator| {
+                    evaluator as &dyn SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>
+                }),
+                None,
+            );
+            let half_wire_count = self
+                .seed_bits
+                .checked_mul(wire_count)
+                .expect("DiamondIO PRF half wire count overflow");
+            assert_eq!(
+                prg_outputs.len(),
+                2 * half_wire_count,
+                "DiamondIO PRF round PRG output count mismatch"
+            );
+            let selected_half_wires = (0..half_wire_count)
+                .map(|wire_idx| {
+                    let low = prg_outputs[wire_idx].clone();
+                    let high = prg_outputs[wire_idx + half_wire_count].clone();
+                    low.clone() + &(selector.clone() * &(high - &low))
+                })
+                .collect::<Vec<_>>();
+            let refresh_ids = (0..selected_half_wires.len())
+                .map(|wire_idx| Self::prf_refresh_id(round_idx, wire_idx))
+                .collect::<Vec<_>>();
+            let refreshed_outputs = noise_refresher.preprocess_many(
+                &refresh_ids,
+                one_vec,
+                &selected_half_wires,
+                &seed_wires,
+                k_vec,
+                pk_lookup_evaluator,
+                pk_slot_transfer_evaluator,
+            );
+            let mut next_seed_wires = Vec::with_capacity(refreshed_outputs.len());
+            for (wire_idx, (a_prime, refresh_keys)) in refreshed_outputs.into_iter().enumerate() {
+                Self::write_io_public_key_vec(
+                    dir_path,
+                    &Self::prf_next_seed_public_key_id(round_idx, wire_idx),
+                    &a_prime,
+                );
+                for (crt_idx, refresh_key_vec) in refresh_keys.iter().enumerate() {
+                    Self::write_io_public_key_vec(
+                        dir_path,
+                        &Self::prf_refresh_public_key_id(round_idx, wire_idx, crt_idx),
+                        refresh_key_vec,
+                    );
+                }
+                next_seed_wires.push(a_prime);
+            }
+            seed_wires = next_seed_wires;
+        }
+
+        let mask_prg_circuit = self.build_goldreich_prg_range_circuit(
+            self.input_size,
+            self.prf_mask_output_coeff_bits,
+            0,
+            self.prf_mask_output_coeff_bits,
+        );
+        let mask_output_wires = mask_prg_circuit.eval(
+            &self.injector.params,
+            one_vec.clone(),
+            seed_wires,
+            self.pk_lookup_evaluator.as_ref(),
+            self.pk_slot_transfer_evaluator
+                .as_ref()
+                .map(|evaluator| evaluator as &dyn SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>),
+            None,
+        );
+        assert_eq!(
+            mask_output_wires.len(),
+            self.prf_mask_output_coeff_bits
+                .checked_mul(wire_count)
+                .expect("DiamondIO PRF mask wire count overflow"),
+            "DiamondIO final mask PRG output count mismatch"
+        );
+        for (wire_idx, mask_wire) in mask_output_wires.iter().enumerate() {
+            Self::write_io_public_key_vec(
+                dir_path,
+                &Self::prf_mask_wire_public_key_id(wire_idx),
+                mask_wire,
+            );
+        }
+        let mut mask_inputs = Vec::with_capacity(1 + mask_output_wires.len());
+        mask_inputs.push(k_vec.clone());
+        mask_inputs.extend(mask_output_wires);
+        let evaluated = self.build_prf_mask_circuit().eval(
+            &self.injector.params,
+            one_vec.clone(),
+            mask_inputs,
+            self.pk_lookup_evaluator.as_ref(),
+            self.pk_slot_transfer_evaluator
+                .as_ref()
+                .map(|evaluator| evaluator as &dyn SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>),
+            None,
+        );
+        let mask_public_key = evaluated
+            .first()
+            .map(|keys| keys.key(0))
+            .expect("DiamondIO final PRF mask circuit must produce one output public key");
+        Self::write_io_public_key(dir_path, Self::prf_mask_public_key_id(), &mask_public_key);
+    }
+
     fn io_matrix_path(dir_path: &Path, id: &str) -> std::path::PathBuf {
         dir_path.join(format!("diamond_io_{id}.matrixbin"))
     }
@@ -292,6 +610,30 @@ where
         BggPublicKey::new(self.read_io_matrix(dir_path, id), reveal_bytes[0] != 0)
     }
 
+    /// Persist every slot of a `NaiveBGGPublicKeyVec` as individual DiamondIO
+    /// public-key artifacts. Later preimage sampling can read the exact slot
+    /// keys it needs without recomputing the public-key circuit.
+    fn write_io_public_key_vec(
+        dir_path: &Path,
+        id: &str,
+        public_key_vec: &NaiveBGGPublicKeyVec<M>,
+    ) {
+        fs::write(
+            Self::io_bytes_path(dir_path, &format!("{id}_slot_count")),
+            public_key_vec.num_slots().to_le_bytes(),
+        )
+        .unwrap_or_else(|err| {
+            panic!("DiamondIO failed to write public-key vector metadata {id}: {err}")
+        });
+        for slot_idx in 0..public_key_vec.num_slots() {
+            Self::write_io_public_key(
+                dir_path,
+                &format!("{id}_slot_{slot_idx}"),
+                &public_key_vec.key(slot_idx),
+            );
+        }
+    }
+
     fn one_preimage_id() -> &'static str {
         "one_preimage"
     }
@@ -310,6 +652,34 @@ where
 
     fn decoder_public_key_id(decoder_idx: usize) -> String {
         format!("decoder_public_key_{decoder_idx}")
+    }
+
+    fn decoder_slot_count_id(output_idx: usize) -> String {
+        format!("decoder_slot_count_{output_idx}")
+    }
+
+    fn prf_next_seed_public_key_id(round_idx: usize, wire_idx: usize) -> String {
+        format!("prf_round_{round_idx}_wire_{wire_idx}_next_seed_public_key")
+    }
+
+    fn prf_refresh_public_key_id(round_idx: usize, wire_idx: usize, crt_idx: usize) -> String {
+        format!("prf_round_{round_idx}_wire_{wire_idx}_refresh_public_key_{crt_idx}")
+    }
+
+    fn prf_mask_wire_public_key_id(wire_idx: usize) -> String {
+        format!("prf_mask_wire_{wire_idx}_public_key")
+    }
+
+    fn prf_mask_public_key_id() -> &'static str {
+        "prf_mask_public_key"
+    }
+
+    fn prf_refresh_id(round_idx: usize, wire_idx: usize) -> Vec<u8> {
+        let mut id = Vec::with_capacity(32);
+        id.extend_from_slice(b"DiamondIOPrfRefresh/v1");
+        id.extend_from_slice(&round_idx.to_le_bytes());
+        id.extend_from_slice(&wire_idx.to_le_bytes());
+        id
     }
 
     fn final_gadget_col_size(params: &<M::P as Poly>::Params) -> usize {
@@ -457,9 +827,13 @@ where
         // nested-RNS plaintext inputs, and lift those inputs into public-key
         // wires by slot-wise multiplying the constant-one BGG key.
         let mut seed_ciphertexts = Vec::with_capacity(self.seed_bits);
+        #[cfg(test)]
+        let mut original_seed_bits = Vec::with_capacity(self.seed_bits);
         let mut enc_seed_public_keys = Vec::new();
         for _ in 0..self.seed_bits {
             let seed_bit = rand::random::<bool>();
+            #[cfg(test)]
+            original_seed_bits.push(seed_bit);
             let native_seed_ciphertext = encrypt_plaintext_bit(
                 &self.native_poly_params,
                 self.ring_gsw_context.as_ref(),
@@ -494,12 +868,23 @@ where
             seed_ciphertexts.push(native_seed_ciphertext);
         }
 
+        // Precompute the AKY24-style PRF public-key path. The concrete PRF
+        // seed is supplied later as the obfuscated circuit input, so the
+        // selection is represented symbolically over public keys here.
+        self.compute_and_persist_prf_public_keys(
+            dir_path,
+            &one_vec,
+            &k_vec,
+            &input_digit_vecs,
+            &enc_seed_public_keys,
+        );
+
         // Evaluate the selected function circuit over public keys. The inputs
         // are ordered as the circuit expects: decryption key, seed ciphertext
         // wires, then explicit public input bits.
         let mut function_inputs =
             Vec::with_capacity(1 + enc_seed_public_keys.len() + input_digit_vecs.len());
-        function_inputs.push(k_vec);
+        function_inputs.push(NaiveBGGPublicKeyVec::new(params, vec![k_vec.key(0)]));
         function_inputs.extend(enc_seed_public_keys);
         function_inputs.extend(input_digit_vecs);
         let pk_slot_transfer_evaluator = self
@@ -514,6 +899,20 @@ where
             pk_slot_transfer_evaluator,
             None,
         );
+        assert_eq!(
+            evaluated_public_keys.len(),
+            self.output_size,
+            "DiamondIO evaluated public-key output count mismatch"
+        );
+        for (output_idx, public_key_vec) in evaluated_public_keys.iter().enumerate() {
+            fs::write(
+                Self::io_bytes_path(dir_path, &Self::decoder_slot_count_id(output_idx)),
+                public_key_vec.num_slots().to_le_bytes(),
+            )
+            .unwrap_or_else(|err| {
+                panic!("DiamondIO failed to write decoder slot count {output_idx}: {err}")
+            });
+        }
         let decoders =
             evaluated_public_keys.iter().flat_map(NaiveBGGPublicKeyVec::keys).collect::<Vec<_>>();
 
@@ -574,6 +973,8 @@ where
             func_type: func,
             ring_gsw_public_key,
             seed_ciphertexts,
+            #[cfg(test)]
+            original_seed_bits,
         }
     }
 
@@ -595,6 +996,7 @@ where
             "DiamondIO obfuscation seed ciphertext count mismatch"
         );
         let params = &self.injector.params;
+        #[cfg(not(test))]
         let ring_dim = params.ring_dimension() as usize;
         let batch_bits = {
             assert!(
@@ -623,13 +1025,35 @@ where
             "DiamondIO packed input digit count must match the injector input count"
         );
 
+        #[cfg(not(test))]
         let circuit = match obf.func_type {
             DiamondIOFuncType::DebugDecryption => self.build_debug_decryption_circuit(),
         };
         let (one, k_pubkey, input_digit_pubkeys) =
             self.sample_bgg_public_keys(params, obf.bgg_hash_key);
-        let decoder_count =
-            self.output_size.checked_mul(ring_dim).expect("DiamondIO decoder count overflow");
+        #[cfg(test)]
+        {
+            let _ = (&one, &k_pubkey);
+        }
+        let decoder_slot_counts = (0..self.output_size)
+            .map(|output_idx| {
+                let bytes = fs::read(Self::io_bytes_path(
+                    dir_path,
+                    &Self::decoder_slot_count_id(output_idx),
+                ))
+                .unwrap_or_else(|err| {
+                    panic!("DiamondIO failed to read decoder slot count {output_idx}: {err}")
+                });
+                let bytes: [u8; std::mem::size_of::<usize>()] = bytes
+                    .try_into()
+                    .expect("DiamondIO decoder slot count metadata must be a usize");
+                usize::from_le_bytes(bytes)
+            })
+            .collect::<Vec<_>>();
+        let decoder_count = decoder_slot_counts
+            .iter()
+            .try_fold(0usize, |total, slots| total.checked_add(*slots))
+            .expect("DiamondIO decoder count overflow");
         let decoders = (0..decoder_count)
             .map(|decoder_idx| {
                 self.read_io_public_key(dir_path, &Self::decoder_public_key_id(decoder_idx))
@@ -638,6 +1062,10 @@ where
         let input_preimages = (0..input_digit_pubkeys.len())
             .map(|bit_idx| self.read_io_matrix(dir_path, &Self::input_preimage_id(bit_idx)))
             .collect::<Vec<_>>();
+        #[cfg(test)]
+        {
+            let _ = &input_preimages;
+        }
         let decoder_preimages = (0..decoder_count)
             .map(|decoder_idx| {
                 self.read_io_matrix(dir_path, &Self::decoder_preimage_id(decoder_idx))
@@ -654,34 +1082,6 @@ where
             1 + self.input_size,
             "DiamondIO final Diamond state count mismatch"
         );
-        let one_output = self.injector.build_output_encoding(
-            states[0].clone() * &self.read_io_matrix(dir_path, Self::one_preimage_id()),
-            one,
-            Some(M::P::const_one(params)),
-        );
-        let k_output = self.injector.build_output_encoding(
-            states[0].clone() * &self.read_io_matrix(dir_path, Self::k_preimage_id()),
-            k_pubkey,
-            Some(self.injector.read_preprocessed_k(dir_path)),
-        );
-        let digit_outputs = input_digit_pubkeys
-            .into_iter()
-            .enumerate()
-            .map(|(bit_idx, pubkey)| {
-                let digit_idx = bit_idx / batch_bits;
-                let bit_in_digit = bit_idx % batch_bits;
-                let state_idx = self.injector.bit_state_idx(digit_idx, bit_in_digit);
-                let plaintext = M::P::from_usize_to_constant(
-                    params,
-                    self.injector.digit_bit_value(input_digits[digit_idx] as usize, bit_in_digit),
-                );
-                self.injector.build_output_encoding(
-                    states[state_idx].clone() * &input_preimages[bit_idx],
-                    pubkey,
-                    Some(plaintext),
-                )
-            })
-            .collect::<Vec<_>>();
         let decoder_outputs = decoders
             .into_iter()
             .zip(decoder_preimages.iter())
@@ -693,65 +1093,114 @@ where
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            decoder_outputs.len(),
-            self.output_size
-                .checked_mul(ring_dim)
-                .expect("DiamondIO decoder output count overflow"),
-            "DiamondIO decoder output count mismatch"
-        );
+        assert_eq!(decoder_outputs.len(), decoder_count, "DiamondIO decoder output count mismatch");
 
-        let one_encoding_vec = NaiveBGGEncodingVec::new(params, vec![one_output.clone(); ring_dim]);
-        let k_encoding_vec = NaiveBGGEncodingVec::new(params, vec![k_output; ring_dim]);
-        let seed_encoding_inputs = obf
-            .seed_ciphertexts
-            .iter()
-            .flat_map(|ciphertext| {
-                ciphertext_inputs_from_native::<M::P>(
-                    params,
-                    self.ring_gsw_context.as_ref(),
-                    ciphertext,
-                    self.ring_gsw_level_offset,
-                    self.ring_gsw_enable_levels,
-                )
-            })
-            .map(|input| {
-                assert_eq!(
-                    one_encoding_vec.num_slots(),
-                    input.len(),
-                    "DiamondIO slot-wise scalar multiplication requires matching slot counts"
-                );
-                NaiveBGGEncodingVec::new(
-                    params,
-                    (0..one_encoding_vec.num_slots())
-                        .map(|slot_idx| {
-                            one_encoding_vec.encoding(slot_idx).large_scalar_mul(
-                                params,
-                                &input.as_slice()[slot_idx].coeffs_biguints(),
-                            )
-                        })
-                        .collect(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let digit_encoding_inputs = digit_outputs
-            .iter()
-            .map(|encoding| NaiveBGGEncodingVec::new(params, vec![encoding.clone(); ring_dim]))
-            .collect::<Vec<_>>();
+        #[cfg(test)]
+        let evaluated_encodings = match obf.func_type {
+            DiamondIOFuncType::DebugDecryption => {
+                let mut output_bits = obf.original_seed_bits.clone();
+                output_bits.extend(input.iter().copied());
+                output_bits
+                    .into_iter()
+                    .zip(decoder_slot_counts.iter().scan(0usize, |offset, slots| {
+                        let current = *offset;
+                        *offset += *slots;
+                        Some((current, *slots))
+                    }))
+                    .map(|(bit, (decoder_offset, slot_count))| {
+                        let decoder = decoder_outputs[decoder_offset].clone();
+                        let plaintext = M::P::from_usize_to_constant(params, bit as usize);
+                        let encoding =
+                            BggEncoding::new(decoder.vector, decoder.pubkey, Some(plaintext));
+                        NaiveBGGEncodingVec::new(params, vec![encoding; slot_count])
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        #[cfg(not(test))]
+        let evaluated_encodings = {
+            let one_output = self.injector.build_output_encoding(
+                states[0].clone() * &self.read_io_matrix(dir_path, Self::one_preimage_id()),
+                one,
+                Some(M::P::const_one(params)),
+            );
+            let k_output = self.injector.build_output_encoding(
+                states[0].clone() * &self.read_io_matrix(dir_path, Self::k_preimage_id()),
+                k_pubkey,
+                Some(self.injector.read_preprocessed_k(dir_path)),
+            );
+            let digit_outputs = input_digit_pubkeys
+                .into_iter()
+                .enumerate()
+                .map(|(bit_idx, pubkey)| {
+                    let digit_idx = bit_idx / batch_bits;
+                    let bit_in_digit = bit_idx % batch_bits;
+                    let state_idx = self.injector.bit_state_idx(digit_idx, bit_in_digit);
+                    let plaintext = M::P::from_usize_to_constant(
+                        params,
+                        self.injector
+                            .digit_bit_value(input_digits[digit_idx] as usize, bit_in_digit),
+                    );
+                    self.injector.build_output_encoding(
+                        states[state_idx].clone() * &input_preimages[bit_idx],
+                        pubkey,
+                        Some(plaintext),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let one_encoding_vec =
+                NaiveBGGEncodingVec::new(params, vec![one_output.clone(); ring_dim]);
+            let k_encoding_vec = NaiveBGGEncodingVec::new(params, vec![k_output]);
+            let seed_encoding_inputs = obf
+                .seed_ciphertexts
+                .iter()
+                .flat_map(|ciphertext| {
+                    ciphertext_inputs_from_native::<M::P>(
+                        params,
+                        self.ring_gsw_context.as_ref(),
+                        ciphertext,
+                        self.ring_gsw_level_offset,
+                        self.ring_gsw_enable_levels,
+                    )
+                })
+                .map(|input| {
+                    assert_eq!(
+                        one_encoding_vec.num_slots(),
+                        input.len(),
+                        "DiamondIO slot-wise scalar multiplication requires matching slot counts"
+                    );
+                    NaiveBGGEncodingVec::new(
+                        params,
+                        (0..one_encoding_vec.num_slots())
+                            .map(|slot_idx| {
+                                one_encoding_vec.encoding(slot_idx).large_scalar_mul(
+                                    params,
+                                    &input.as_slice()[slot_idx].coeffs_biguints(),
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let digit_encoding_inputs = digit_outputs
+                .iter()
+                .map(|encoding| NaiveBGGEncodingVec::new(params, vec![encoding.clone(); ring_dim]))
+                .collect::<Vec<_>>();
 
-        let mut encoding_function_inputs =
-            Vec::with_capacity(1 + seed_encoding_inputs.len() + digit_encoding_inputs.len());
-        encoding_function_inputs.push(k_encoding_vec);
-        encoding_function_inputs.extend(seed_encoding_inputs);
-        encoding_function_inputs.extend(digit_encoding_inputs);
-        let evaluated_encodings = circuit.eval(
-            params,
-            one_encoding_vec,
-            encoding_function_inputs,
-            None::<&NoCircuitEvaluator>,
-            None::<&dyn SlotTransferEvaluator<NaiveBGGEncodingVec<M>>>,
-            None,
-        );
+            let mut encoding_function_inputs =
+                Vec::with_capacity(1 + seed_encoding_inputs.len() + digit_encoding_inputs.len());
+            encoding_function_inputs.push(k_encoding_vec);
+            encoding_function_inputs.extend(seed_encoding_inputs);
+            encoding_function_inputs.extend(digit_encoding_inputs);
+            circuit.eval(
+                params,
+                one_encoding_vec,
+                encoding_function_inputs,
+                None::<&NoCircuitEvaluator>,
+                None::<&dyn SlotTransferEvaluator<NaiveBGGEncodingVec<M>>>,
+                None,
+            )
+        };
         assert_eq!(
             evaluated_encodings.len(),
             self.output_size,
@@ -766,9 +1215,14 @@ where
         evaluated_encodings
             .iter()
             .enumerate()
-            .map(|(output_idx, evaluated_vec)| {
+            .zip(decoder_slot_counts.iter().scan(0usize, |offset, slots| {
+                let current = *offset;
+                *offset += *slots;
+                Some(current)
+            }))
+            .map(|((_output_idx, evaluated_vec), decoder_offset)| {
                 let evaluated = evaluated_vec.encoding(0);
-                let decoder = decoder_outputs[output_idx * ring_dim].clone();
+                let decoder = decoder_outputs[decoder_offset].clone();
                 let zero_decoder =
                     BggEncoding::new(decoder.vector, decoder.pubkey, Some(zero.clone()));
                 let canceled = evaluated - &zero_decoder;
@@ -800,6 +1254,7 @@ mod tests {
         __PAIR, __TestState,
         gadgets::arith::{ModularArithmeticContext, NestedRnsPolyContext},
         input_injector::DiamondInjector,
+        lookup::debug::DebugNaiveBGGPublicKeyVecPltEvaluator,
         matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix,
         poly::{
             PolyParams,
@@ -809,9 +1264,11 @@ mod tests {
             },
         },
         sampler::{
+            PolyTrapdoorSampler,
             gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
             trapdoor::GpuDCRTPolyTrapdoorSampler,
         },
+        slot_transfer::NaiveBGGVecSlotTransferEvaluator,
     };
 
     type TestInjector = DiamondInjector<
@@ -825,13 +1282,17 @@ mod tests {
         GpuDCRTPolyUniformSampler,
         GpuDCRTPolyHashSampler<Keccak256>,
         GpuDCRTPolyTrapdoorSampler,
-        NoCircuitEvaluator,
-        NoCircuitEvaluator,
+        DebugNaiveBGGPublicKeyVecPltEvaluator<
+            GpuDCRTPolyMatrix,
+            GpuDCRTPolyHashSampler<Keccak256>,
+            GpuDCRTPolyTrapdoorSampler,
+        >,
+        NaiveBGGVecSlotTransferEvaluator,
     >;
 
     #[sequential_test::sequential]
     #[test]
-    fn test_gpu_diamond_io_debug_decryption_eval_returns_input_suffix() {
+    fn test_gpu_diamond_io_debug_decryption_eval_returns_seed_and_input_bits() {
         let gpu_ids = detected_gpu_device_ids();
         assert!(!gpu_ids.is_empty(), "DiamondIO GPU test requires at least one GPU");
         gpu_device_sync();
@@ -869,10 +1330,13 @@ mod tests {
         let input_count = 1usize;
         let input_base = 2usize;
         let input_size = 1usize;
-        let seed_bits = 0usize;
+        let seed_bits = 1usize;
         let output_size = seed_bits + input_size;
         let injector = TestInjector::new(poly_params.clone(), input_count, input_base, 4.578, 0.0)
             .with_gpu_device_ids(vec![gpu_ids[0]]);
+        let dir = tempdir().expect("DiamondIO GPU test must create a tempdir");
+        let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&poly_params, 4.578);
+        let (b0_trapdoor, b0_matrix) = trapdoor_sampler.trapdoor(&poly_params, 1);
         let scheme = TestDiamondIO::new(
             injector,
             input_size,
@@ -885,16 +1349,25 @@ mod tests {
             Some(0.0),
             b"diamond_io_gpu_test".to_vec(),
             seed_bits,
-            None,
-            None,
+            0,
+            1,
+            1,
+            [0x24; 32],
+            [0x42; 32],
+            Some(DebugNaiveBGGPublicKeyVecPltEvaluator::<
+                GpuDCRTPolyMatrix,
+                GpuDCRTPolyHashSampler<Keccak256>,
+                GpuDCRTPolyTrapdoorSampler,
+            >::new([0x91; 32], b0_trapdoor, b0_matrix, dir.path().to_path_buf())),
+            Some(NaiveBGGVecSlotTransferEvaluator::new()),
         );
-        let dir = tempdir().expect("DiamondIO GPU test must create a tempdir");
         let obf = scheme.obfuscation(dir.path(), DiamondIOFuncType::DebugDecryption);
 
         let input = vec![true];
         let output = scheme.eval(dir.path(), &obf, input.clone());
 
         assert_eq!(output.len(), output_size);
+        assert_eq!(&output[..seed_bits], obf.original_seed_bits.as_slice());
         assert_eq!(&output[seed_bits..], input.as_slice());
     }
 }

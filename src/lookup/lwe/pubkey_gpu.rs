@@ -1,6 +1,8 @@
 use super::*;
 use crate::{
-    bench_estimator::{PublicLutSampleAuxBenchEstimator, SampleAuxBenchEstimate},
+    bench_estimator::{
+        PublicLutSampleAuxBenchEstimator, SampleAuxBenchEstimate, total_lut_preimage_count,
+    },
     bgg::public_key::BggPublicKey,
     element::PolyElem,
     lookup::lwe::{
@@ -533,9 +535,7 @@ where
         total_lut_entries: usize,
         total_lut_gates: usize,
     ) -> SampleAuxBenchEstimate {
-        let total_preimages = total_lut_entries
-            .checked_mul(total_lut_gates)
-            .expect("total sampled LWE preimages overflowed usize");
+        let total_preimages = total_lut_preimage_count(total_lut_entries, total_lut_gates);
         if total_preimages == 0 {
             return SampleAuxBenchEstimate::default();
         }

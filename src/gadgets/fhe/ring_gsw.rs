@@ -374,7 +374,21 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             circuit.register_sub_circuit(Arc::clone(&super_batch_subcircuit));
         let width_tail_columns = width % super_batch_columns;
         let width_tail_subcircuit_id = if width_tail_columns > 0 {
-            let width_tail_batch_tail_columns = width_tail_columns % batch_columns;
+            let width_tail_batch_columns = batch_columns.min(width_tail_columns);
+            let width_tail_batch_subcircuit = if width_tail_batch_columns == batch_columns {
+                Arc::clone(&batch_subcircuit)
+            } else {
+                Arc::new(Self::mul_columns_batch_subcircuit(
+                    source_circuit,
+                    template_ctx,
+                    active_levels,
+                    level_offset,
+                    width,
+                    width_tail_batch_columns,
+                    Arc::clone(&mul_column_subcircuit),
+                ))
+            };
+            let width_tail_batch_tail_columns = width_tail_columns % width_tail_batch_columns;
             let width_tail_batch_tail_subcircuit = (width_tail_batch_tail_columns > 0).then(|| {
                 Arc::new(Self::mul_columns_batch_subcircuit(
                     source_circuit,
@@ -393,8 +407,8 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 level_offset,
                 width,
                 width_tail_columns,
-                batch_columns,
-                Arc::clone(&batch_subcircuit),
+                width_tail_batch_columns,
+                width_tail_batch_subcircuit,
                 width_tail_batch_tail_subcircuit,
             ))))
         } else {
@@ -2860,6 +2874,24 @@ mod tests {
             expected_coeffs_for_slots(expected, ctx.num_slots),
             "Montgomery-backed chained Ring-GSW multiplication should decrypt to the plaintext-modulus product for x1={x1}, x2={x2}, x3={x3}",
         );
+    }
+
+    #[test]
+    fn test_nested_rns_ring_gsw_mul_context_handles_width_tail_narrower_than_batch() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let active_levels = 15usize;
+
+        let (_params, ctx) = create_test_context_with(
+            &mut circuit,
+            NUM_SLOTS as u32,
+            NUM_SLOTS,
+            active_levels,
+            CRT_BITS,
+            P_MODULI_BITS,
+            DEFAULT_MAX_UNREDUCED_MULS,
+        );
+
+        assert_eq!(ctx.width() % (MUL_COLUMN_SUBCIRCUIT_BATCH * MUL_COLUMN_SUBCIRCUIT_BATCH), 2);
     }
 
     #[sequential_test::sequential]

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bench on Runpod"
+  short_description: "Run mxx commands on Runpod GPUs."
+  default_prompt: "Run an mxx command on Runpod using the bench-on-runpod workflow."

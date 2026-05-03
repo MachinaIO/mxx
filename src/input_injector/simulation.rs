@@ -14,20 +14,18 @@ use std::sync::Arc;
 use tracing::debug;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Error-growth summary for Diamond input insertion.
+/// Error-growth summary for Diamond state insertion.
 ///
-/// The simulator exposes the final one, k-input, bit-input, and decoder output
-/// bounds. The intermediate selector, preimage, and state values are emitted
-/// with `tracing::debug!` while the recurrence runs.
+/// The simulator exposes the final Diamond state bounds and the generic
+/// one-step final projection preimage bound. Callers that own output
+/// projections can combine these values for their concrete one, k, input, or
+/// decoder outputs.
 pub struct DiamondInputErrorSimulation {
-    /// Final propagated error for the one-output encoding.
-    pub one_error: PolyMatrixNorm,
-    /// Final propagated error for the additional k-output encoding.
-    pub k_error: PolyMatrixNorm,
-    /// Final propagated error for each input-digit output.
-    pub input_errors: Vec<PolyMatrixNorm>,
-    /// Final propagated error for each decoder output.
-    pub decoder_errors: Vec<PolyMatrixNorm>,
+    /// Final propagated error for each Diamond state branch.
+    pub state_errors: Vec<PolyMatrixNorm>,
+    /// Generic final projection preimage norm from the final state basis to a
+    /// single BGG output public key.
+    pub output_preimage: PolyMatrixNorm,
 }
 
 impl<M, US, HS, TS> DiamondInjector<M, US, HS, TS>
@@ -39,11 +37,8 @@ where
 {
     /// Simulate how the original Gaussian error in `p_{epsilon,0}` and the
     /// injected Gaussian target errors in `K_{i,b,j}` contribute to the final
-    /// one, k-input, bit-input, and decoder outputs.
-    pub fn simulate_output_error_bounds(
-        &self,
-        decoder_count: usize,
-    ) -> DiamondInputErrorSimulation {
+    /// Diamond states.
+    pub fn simulate_output_error_bounds(&self) -> DiamondInputErrorSimulation {
         let ring_dim_sqrt = BigDecimal::from(self.params.ring_dimension() as u64)
             .sqrt()
             .expect("sqrt(ring_dimension) failed");
@@ -154,20 +149,12 @@ where
             );
         }
 
-        let one_error = state_errors[0].clone() * &output_preimage;
-        let k_error = state_errors[0].clone() * &output_preimage;
-        let input_errors = (0..self.input_bit_count())
-            .map(|bit_idx| state_errors[bit_idx + 1].clone() * &output_preimage)
-            .collect::<Vec<_>>();
-        let decoder_errors = vec![one_error.clone(); decoder_count];
         debug!(
-            ?one_error,
-            ?k_error,
-            ?input_errors,
-            ?decoder_errors,
-            "diamond input-insertion simulator final output bounds",
+            ?state_errors,
+            ?output_preimage,
+            "diamond input-insertion simulator final state bounds",
         );
 
-        DiamondInputErrorSimulation { one_error, k_error, input_errors, decoder_errors }
+        DiamondInputErrorSimulation { state_errors, output_preimage }
     }
 }

@@ -85,6 +85,7 @@ struct MontgomeryModqArithConfig {
     crt_bits: usize,
     base_bits: u32,
     max_crt_depth: usize,
+    active_levels: Option<usize>,
     error_sigma: f64,
     d_secret: usize,
     height: usize,
@@ -170,6 +171,16 @@ impl MontgomeryModqArithConfig {
         let base_bits = env_or_parse_u32("LWE_MONTGOMERY_MODQ_ARITH_BASE_BITS", DEFAULT_BASE_BITS);
         let max_crt_depth =
             env_or_parse_usize("LWE_MONTGOMERY_MODQ_ARITH_MAX_CRT_DEPTH", DEFAULT_MAX_CRT_DEPTH);
+        let active_levels = env::var("LWE_MONTGOMERY_MODQ_ARITH_Q_LEVEL").ok().map(|raw| {
+            let level = raw
+                .parse::<usize>()
+                .expect("LWE_MONTGOMERY_MODQ_ARITH_Q_LEVEL must be a positive integer");
+            assert!(
+                level > 0,
+                "LWE_MONTGOMERY_MODQ_ARITH_Q_LEVEL must be greater than or equal to 1"
+            );
+            level
+        });
         let error_sigma =
             env_or_parse_f64("LWE_MONTGOMERY_MODQ_ARITH_ERROR_SIGMA", DEFAULT_ERROR_SIGMA);
         let d_secret = env_or_parse_usize("LWE_MONTGOMERY_MODQ_ARITH_D_SECRET", DEFAULT_D_SECRET);
@@ -203,6 +214,7 @@ impl MontgomeryModqArithConfig {
             crt_bits,
             base_bits,
             max_crt_depth,
+            active_levels,
             error_sigma,
             d_secret,
             height,
@@ -235,16 +247,6 @@ impl MontgomeryModqArithConfig {
             )
         })
     }
-}
-
-fn q_level_from_env() -> Option<usize> {
-    env::var("LWE_MONTGOMERY_MODQ_ARITH_Q_LEVEL").ok().map(|raw| {
-        let level = raw
-            .parse::<usize>()
-            .expect("LWE_MONTGOMERY_MODQ_ARITH_Q_LEVEL must be a positive integer");
-        assert!(level > 0, "LWE_MONTGOMERY_MODQ_ARITH_Q_LEVEL must be greater than or equal to 1");
-        level
-    })
 }
 
 fn active_q_moduli_and_modulus<T: PolyParams>(
@@ -588,7 +590,7 @@ async fn test_gpu_lwe_montgomery_modq_arith() {
     let cfg = MontgomeryModqArithConfig::from_env();
     info!("montgomery modq arith test config: {:?}", cfg);
 
-    let q_level = q_level_from_env();
+    let q_level = cfg.active_levels;
     let num_inputs = 1usize
         .checked_shl(cfg.height as u32)
         .expect("LWE_MONTGOMERY_MODQ_ARITH_HEIGHT is too large");
@@ -625,9 +627,10 @@ async fn test_gpu_lwe_montgomery_modq_arith() {
     info!("forcing single GPU for this test: gpu_id={}", single_gpu_id);
     info!("found crt_depth={}", crt_depth);
     info!(
-        "selected crt_depth={} actual_crt_depth={} ring_dim={} crt_bits={} base_bits={} q_level={:?} active_levels={} limb_bit_size={} q_moduli={:?}",
+        "selected crt_depth={} actual_crt_depth={} cfg_active_levels={:?} ring_dim={} crt_bits={} base_bits={} q_level={:?} active_levels={} limb_bit_size={} q_moduli={:?}",
         crt_depth,
         actual_crt_depth,
+        cfg.active_levels,
         params.ring_dimension(),
         cfg.crt_bits,
         cfg.base_bits,

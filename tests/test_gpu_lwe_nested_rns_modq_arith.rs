@@ -90,6 +90,7 @@ struct ModqArithConfig {
     scale: u64,
     base_bits: u32,
     max_crt_depth: usize,
+    active_levels: Option<usize>,
     error_sigma: f64,
     d_secret: usize,
     height: usize,
@@ -184,6 +185,16 @@ impl ModqArithConfig {
         let base_bits = env_or_parse_u32("LWE_NESTED_RNS_MODQ_ARITH_BASE_BITS", DEFAULT_BASE_BITS);
         let max_crt_depth =
             env_or_parse_usize("LWE_NESTED_RNS_MODQ_ARITH_MAX_CRT_DEPTH", DEFAULT_MAX_CRT_DEPTH);
+        let active_levels = std::env::var("LWE_NESTED_RNS_MODQ_ARITH_Q_LEVEL").ok().map(|raw| {
+            let level = raw
+                .parse::<usize>()
+                .expect("LWE_NESTED_RNS_MODQ_ARITH_Q_LEVEL must be a positive integer");
+            assert!(
+                level > 0,
+                "LWE_NESTED_RNS_MODQ_ARITH_Q_LEVEL must be greater than or equal to 1"
+            );
+            level
+        });
         let error_sigma =
             env_or_parse_f64("LWE_NESTED_RNS_MODQ_ARITH_ERROR_SIGMA", DEFAULT_ERROR_SIGMA);
         let d_secret = env_or_parse_usize("LWE_NESTED_RNS_MODQ_ARITH_D_SECRET", DEFAULT_D_SECRET);
@@ -214,6 +225,7 @@ impl ModqArithConfig {
             scale,
             base_bits,
             max_crt_depth,
+            active_levels,
             error_sigma,
             d_secret,
             height,
@@ -245,16 +257,6 @@ impl ModqArithConfig {
             )
         })
     }
-}
-
-fn q_level_from_env() -> Option<usize> {
-    std::env::var("LWE_NESTED_RNS_MODQ_ARITH_Q_LEVEL").ok().map(|raw| {
-        let level = raw
-            .parse::<usize>()
-            .expect("LWE_NESTED_RNS_MODQ_ARITH_Q_LEVEL must be a positive integer");
-        assert!(level > 0, "LWE_NESTED_RNS_MODQ_ARITH_Q_LEVEL must be greater than or equal to 1");
-        level
-    })
 }
 
 fn active_q_moduli_and_modulus<T: PolyParams>(
@@ -575,7 +577,7 @@ async fn test_gpu_lwe_nested_rns_modq_arith() {
     let cfg = ModqArithConfig::from_env();
     info!("nested_rns modq arith test config: {:?}", cfg);
 
-    let q_level = q_level_from_env();
+    let q_level = cfg.active_levels;
     let num_inputs = 1usize
         .checked_shl(cfg.height as u32)
         .expect("LWE_NESTED_RNS_MODQ_ARITH_HEIGHT is too large");
@@ -622,9 +624,10 @@ async fn test_gpu_lwe_nested_rns_modq_arith() {
     );
     info!("found crt_depth={}", crt_depth);
     info!(
-        "selected crt_depth={} actual_crt_depth={} ring_dim={} crt_bits={} base_bits={} q_level={:?} active_levels={} q_moduli={:?}",
+        "selected crt_depth={} actual_crt_depth={} cfg_active_levels={:?} ring_dim={} crt_bits={} base_bits={} q_level={:?} active_levels={} q_moduli={:?}",
         crt_depth,
         actual_crt_depth,
+        cfg.active_levels,
         params.ring_dimension(),
         cfg.crt_bits,
         cfg.base_bits,

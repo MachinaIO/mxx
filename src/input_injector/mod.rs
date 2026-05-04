@@ -1092,6 +1092,7 @@ mod tests {
         }
 
         assert_eq!(simulated.state_errors, expected_state_errors);
+        assert_eq!(simulated.secret_state_factors, expected_secret_factors);
         assert_eq!(simulated.output_preimage, expected_output);
     }
 

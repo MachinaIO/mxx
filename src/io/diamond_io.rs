@@ -46,7 +46,10 @@ use crate::{
 use super::Obfuscation;
 
 mod circuits;
+pub mod simulation;
 mod utils;
+
+pub use simulation::{DiamondIOErrorSimulation, DiamondIOPrfRoundErrorSimulation};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Function families supported by the Diamond iO wrapper.

@@ -22,6 +22,7 @@ use crate::{
             decrypt_bit_decomposed_polynomial, mask_plaintext_moduli_from_full_modulus,
         },
         simulate_noise_refresh_error_growth,
+        simulation::validate_error_bound_security_margin,
     },
     poly::{
         PolyParams,
@@ -60,6 +61,114 @@ pub struct DiamondIOPrfRoundErrorSimulation {
     pub noise_refresh: NoiseRefreshErrorSimulation,
 }
 
+/// Largest safe PRF mask bit-width together with the simulation that certified it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiamondIOPrfMaskOutputCoeffBitsSearchResult {
+    /// Largest PRF mask coefficient bit-width satisfying the final decode margin.
+    pub prf_mask_output_coeff_bits: usize,
+    /// Error simulation evaluated with `prf_mask_output_coeff_bits`.
+    pub simulation: DiamondIOErrorSimulation,
+}
+
+/// Successful DiamondIO CRT-depth search result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiamondIOCrtDepthSearchResult {
+    /// Smallest CRT depth found by the search.
+    pub crt_depth: usize,
+    /// Largest PRF mask coefficient bit-width that was safe at `crt_depth`.
+    pub prf_mask_output_coeff_bits: usize,
+    /// Final noisy-plaintext error bound certified for the selected candidate.
+    pub total_noisy_plaintext_error: PolyMatrixNorm,
+    /// Representative input-injection contribution used to seed the DiamondIO simulation.
+    ///
+    /// This is `input_injection.state_errors[0] * input_injection.output_preimage`, matching the
+    /// projected state error used as the `one`, decryption-key, and decoder input bound.
+    pub input_injection_projection_error: PolyMatrixNorm,
+}
+
+/// Finds the smallest CRT depth whose correctness and security checks pass.
+///
+/// The search is binary over the inclusive range `[min_crt_depth, max_crt_depth]`. For each
+/// candidate depth, `build_candidate` must construct a DiamondIO instance with matching polynomial
+/// parameters and Ring-GSW context. The candidate first runs
+/// `DiamondIO::max_safe_prf_mask_output_coeff_bits`; if no mask width is valid, the search moves to
+/// larger CRT depths. If mask search succeeds, the certified simulation is checked with
+/// `validate_error_bound_security_margin` for both the final noisy-plaintext bound and every
+/// noise-refresh pre-rounding bound. Passing candidates are recorded and the search continues
+/// toward smaller CRT depths.
+pub fn diamond_io_find_crt_depth<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST, PE, ST, BuildCandidate>(
+    min_crt_depth: usize,
+    max_crt_depth: usize,
+    max_prf_mask_output_coeff_bits: usize,
+    security_bit: usize,
+    func_type: DiamondIOFuncType,
+    mut build_candidate: BuildCandidate,
+    plt_evaluator: &PE,
+    slot_transfer_evaluator: &ST,
+) -> Option<DiamondIOCrtDepthSearchResult>
+where
+    M: PolyMatrix,
+    US: PolyUniformSampler<M = M> + Send + Sync,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    TS: PolyTrapdoorSampler<M = M> + Send + Sync,
+    PE: PltEvaluator<ErrorNorm>,
+    ST: SlotTransferEvaluator<ErrorNorm>,
+    BuildCandidate: FnMut(usize) -> DiamondIO<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
+{
+    info!(
+        min_crt_depth,
+        max_crt_depth,
+        max_prf_mask_output_coeff_bits,
+        security_bit,
+        "starting DiamondIO CRT-depth search"
+    );
+    assert!(min_crt_depth > 0, "minimum CRT depth must be positive");
+    assert!(min_crt_depth <= max_crt_depth, "CRT-depth search range must be non-empty");
+    let mut low = min_crt_depth;
+    let mut high = max_crt_depth;
+    let mut found = Vec::new();
+    while low <= high {
+        let crt_depth = low + (high - low) / 2;
+        info!(crt_depth, low, high, "evaluating DiamondIO CRT-depth candidate");
+        let candidate = build_candidate(crt_depth);
+        let Some(mask_search) = candidate.max_safe_prf_mask_output_coeff_bits(
+            func_type,
+            plt_evaluator,
+            slot_transfer_evaluator,
+            max_prf_mask_output_coeff_bits,
+        ) else {
+            info!(crt_depth, "DiamondIO CRT-depth candidate failed correctness mask-bit search");
+            low = crt_depth + 1;
+            continue;
+        };
+        let mask_bits = mask_search.prf_mask_output_coeff_bits;
+        let cpu_params = cpu_params_from_poly_params(&candidate.injector.params);
+        if diamond_io_security_margins_hold(
+            &cpu_params,
+            &mask_search.simulation,
+            mask_bits,
+            security_bit,
+        ) {
+            info!(crt_depth, mask_bits, "DiamondIO CRT-depth candidate passed");
+            found.push(DiamondIOCrtDepthSearchResult {
+                crt_depth,
+                prf_mask_output_coeff_bits: mask_bits,
+                total_noisy_plaintext_error: mask_search.simulation.noisy_plaintext_error.clone(),
+                input_injection_projection_error: diamond_io_input_injection_projection_error(
+                    &mask_search.simulation.input_injection,
+                ),
+            });
+            high = crt_depth - 1;
+        } else {
+            info!(crt_depth, mask_bits, "DiamondIO CRT-depth candidate failed security margins");
+            low = crt_depth + 1;
+        }
+    }
+    let result = found.into_iter().min_by_key(|candidate| candidate.crt_depth);
+    info!(found = result.is_some(), "finished DiamondIO CRT-depth search");
+    result
+}
+
 impl<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST> DiamondIO<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>
 where
     M: PolyMatrix,
@@ -82,6 +191,86 @@ where
         PE: PltEvaluator<ErrorNorm>,
         ST: SlotTransferEvaluator<ErrorNorm>,
     {
+        self.simulate_error_growth_with_prf_mask_output_coeff_bits(
+            func_type,
+            self.prf_mask_output_coeff_bits,
+            plt_evaluator,
+            slot_transfer_evaluator,
+        )
+    }
+
+    /// Search for the largest PRF mask coefficient bit-width that satisfies the final decode
+    /// margin.
+    ///
+    /// Each candidate bit-width is evaluated with a fresh DiamondIO error simulation, so the
+    /// returned simulation accounts for that candidate's final PRF mask PRG and mask
+    /// decrypt/recomposition error. A candidate is valid exactly when
+    /// `noisy_plaintext_error + 2^candidate < q / 4`.
+    pub fn max_safe_prf_mask_output_coeff_bits<PE, ST>(
+        &self,
+        func_type: DiamondIOFuncType,
+        plt_evaluator: &PE,
+        slot_transfer_evaluator: &ST,
+        max_bits: usize,
+    ) -> Option<DiamondIOPrfMaskOutputCoeffBitsSearchResult>
+    where
+        PE: PltEvaluator<ErrorNorm>,
+        ST: SlotTransferEvaluator<ErrorNorm>,
+    {
+        let cpu_params = cpu_params_from_poly_params(&self.injector.params);
+        let max_candidate = max_bits.min(cpu_params.modulus_bits());
+        let mut low = 1usize;
+        let mut high = max_candidate;
+        let mut best = None;
+        info!(max_bits, max_candidate, "starting DiamondIO PRF mask bit search");
+        while low <= high {
+            let candidate = low + (high - low) / 2;
+            info!(candidate, low, high, "evaluating DiamondIO PRF mask bit candidate");
+            let simulation = self.simulate_error_growth_with_prf_mask_output_coeff_bits(
+                func_type,
+                candidate,
+                plt_evaluator,
+                slot_transfer_evaluator,
+            )?;
+            let q: Arc<BigUint> = cpu_params.modulus().into();
+            let quarter_q = biguint_to_decimal(&(q.as_ref() / 4u32));
+            let mask_value = biguint_to_decimal(&(BigUint::from(1u32) << candidate));
+            let valid = &simulation.noisy_plaintext_error.poly_norm.norm + &mask_value < quarter_q;
+            debug!(
+                candidate,
+                valid,
+                noisy_plaintext_error = %simulation.noisy_plaintext_error.poly_norm.norm,
+                mask_value = %mask_value,
+                quarter_q = %quarter_q,
+                "DiamondIO PRF mask bit candidate evaluated"
+            );
+            if valid {
+                best = Some(DiamondIOPrfMaskOutputCoeffBitsSearchResult {
+                    prf_mask_output_coeff_bits: candidate,
+                    simulation,
+                });
+                low = candidate + 1;
+            } else if candidate == 1 {
+                break;
+            } else {
+                high = candidate - 1;
+            }
+        }
+        info!(found = best.is_some(), "finished DiamondIO PRF mask bit search");
+        best
+    }
+
+    fn simulate_error_growth_with_prf_mask_output_coeff_bits<PE, ST>(
+        &self,
+        func_type: DiamondIOFuncType,
+        prf_mask_output_coeff_bits: usize,
+        plt_evaluator: &PE,
+        slot_transfer_evaluator: &ST,
+    ) -> Option<DiamondIOErrorSimulation>
+    where
+        PE: PltEvaluator<ErrorNorm>,
+        ST: SlotTransferEvaluator<ErrorNorm>,
+    {
         assert_eq!(
             self.input_size,
             self.injector.input_count * self.injector.batch_bits(),
@@ -89,7 +278,7 @@ where
         );
         assert!(self.seed_bits > 0, "DiamondIO error simulation requires seed_bits > 0");
         assert!(
-            self.prf_mask_output_coeff_bits > 0,
+            prf_mask_output_coeff_bits > 0,
             "DiamondIO error simulation requires prf_mask_output_coeff_bits > 0"
         );
 
@@ -103,13 +292,7 @@ where
         );
         let ctx = simulator_context(&cpu_params);
         let input_injection = self.injector.simulate_output_error_bounds();
-        let projection_preimage = input_injection.output_preimage.clone();
-        let projected_state_error = input_injection
-            .state_errors
-            .first()
-            .expect("DiamondIO input injection must produce a base final state error")
-            .clone() *
-            &projection_preimage;
+        let projected_state_error = diamond_io_input_injection_projection_error(&input_injection);
         info!(
             state_count = input_injection.state_errors.len(),
             projected_state_error_bits =
@@ -207,7 +390,7 @@ where
             self.input_size,
             self.output_size
                 .checked_mul(cpu_params.ring_dimension() as usize)
-                .and_then(|count| count.checked_mul(self.prf_mask_output_coeff_bits))
+                .and_then(|count| count.checked_mul(prf_mask_output_coeff_bits))
                 .expect("DiamondIO final mask PRG conceptual output count overflow"),
             0,
             one.clone(),
@@ -217,6 +400,7 @@ where
         );
         let final_mask_error = self.simulate_final_mask_error(
             &cpu_params,
+            prf_mask_output_coeff_bits,
             final_mask_prg_output,
             one.clone(),
             decryption_key.clone(),
@@ -390,6 +574,7 @@ where
     fn simulate_final_mask_error<PE, ST>(
         &self,
         params: &DCRTPolyParams,
+        prf_mask_output_coeff_bits: usize,
         final_mask_prg_output: ErrorNorm,
         one: ErrorNorm,
         decryption_key: ErrorNorm,
@@ -400,9 +585,8 @@ where
         PE: PltEvaluator<ErrorNorm>,
         ST: SlotTransferEvaluator<ErrorNorm>,
     {
-        let circuit = self.build_cpu_prf_mask_circuit(params);
-        let encrypted_bit_count =
-            params.ring_dimension() as usize * self.prf_mask_output_coeff_bits;
+        let circuit = self.build_cpu_prf_mask_circuit(params, prf_mask_output_coeff_bits);
+        let encrypted_bit_count = params.ring_dimension() as usize * prf_mask_output_coeff_bits;
         let wire_count = ring_gsw_wire_count(circuit.num_input() - 1, encrypted_bit_count);
         let mut inputs = Vec::with_capacity(circuit.num_input());
         inputs.push(decryption_key);
@@ -427,7 +611,11 @@ where
         outputs.remove(0)
     }
 
-    fn build_cpu_prf_mask_circuit(&self, params: &DCRTPolyParams) -> PolyCircuit<DCRTPoly> {
+    fn build_cpu_prf_mask_circuit(
+        &self,
+        params: &DCRTPolyParams,
+        prf_mask_output_coeff_bits: usize,
+    ) -> PolyCircuit<DCRTPoly> {
         let mut circuit = PolyCircuit::new();
         let (_, _, crt_depth) = params.to_crt();
         let active_levels =
@@ -436,9 +624,8 @@ where
         let decryption_key = circuit.input(1).at(0).as_single_wire();
         let q: Arc<BigUint> = params.modulus().into();
         let plaintext_moduli =
-            mask_plaintext_moduli_from_full_modulus(q.as_ref(), self.prf_mask_output_coeff_bits);
-        let encrypted_bit_count =
-            params.ring_dimension() as usize * self.prf_mask_output_coeff_bits;
+            mask_plaintext_moduli_from_full_modulus(q.as_ref(), prf_mask_output_coeff_bits);
+        let encrypted_bit_count = params.ring_dimension() as usize * prf_mask_output_coeff_bits;
         let encrypted_bits = (0..encrypted_bit_count)
             .map(|_| {
                 RingGswCiphertext::input(
@@ -574,6 +761,80 @@ fn simulator_context(params: &DCRTPolyParams) -> Arc<SimulatorContext> {
         params.modulus_digits(),
         params.modulus_digits(),
     ))
+}
+
+fn biguint_to_decimal(value: &BigUint) -> BigDecimal {
+    BigDecimal::from(BigInt::from(value.clone()))
+}
+
+fn diamond_io_input_injection_projection_error(
+    input_injection: &DiamondInputErrorSimulation,
+) -> PolyMatrixNorm {
+    input_injection
+        .state_errors
+        .first()
+        .expect("DiamondIO input injection must produce a base final state error")
+        .clone() *
+        &input_injection.output_preimage
+}
+
+fn diamond_io_security_margins_hold(
+    params: &DCRTPolyParams,
+    simulation: &DiamondIOErrorSimulation,
+    prf_mask_output_coeff_bits: usize,
+    security_bit: usize,
+) -> bool {
+    let Some(final_threshold) = diamond_io_final_decode_margin(params, prf_mask_output_coeff_bits)
+    else {
+        return false;
+    };
+    if !validate_error_bound_security_margin(
+        &final_threshold,
+        &simulation.noisy_plaintext_error.poly_norm.norm,
+        security_bit,
+    ) {
+        return false;
+    }
+    simulation.prf_refreshes.iter().all(|refresh| {
+        let Some(threshold) =
+            diamond_io_noise_refresh_pre_round_margin(params, refresh.noise_refresh.v_bits)
+        else {
+            return false;
+        };
+        let worst_error = refresh
+            .noise_refresh
+            .pre_round_outputs
+            .iter()
+            .map(|error| error.poly_norm.norm.clone())
+            .max_by(|lhs, rhs| {
+                lhs.partial_cmp(rhs).expect("noise-refresh pre-rounding norms must be comparable")
+            })
+            .expect("noise-refresh simulation must produce at least one pre-round output");
+        validate_error_bound_security_margin(&threshold, &worst_error, security_bit)
+    })
+}
+
+fn diamond_io_final_decode_margin(
+    params: &DCRTPolyParams,
+    prf_mask_output_coeff_bits: usize,
+) -> Option<BigDecimal> {
+    let q: Arc<BigUint> = params.modulus().into();
+    let threshold = biguint_to_decimal(&(q.as_ref() / 4u32));
+    let mask = biguint_to_decimal(&(BigUint::from(1u32) << prf_mask_output_coeff_bits));
+    (threshold > mask).then_some(threshold - mask)
+}
+
+fn diamond_io_noise_refresh_pre_round_margin(
+    params: &DCRTPolyParams,
+    v_bits: usize,
+) -> Option<BigDecimal> {
+    let (q_moduli, _crt_bits, _crt_depth) = params.to_crt();
+    let q_max = q_moduli.iter().copied().max().expect("CRT modulus list must be nonempty");
+    let full_q: Arc<BigUint> = params.modulus().into();
+    let threshold =
+        biguint_to_decimal(full_q.as_ref()) / (BigDecimal::from(2u32) * BigDecimal::from(q_max));
+    let mask = biguint_to_decimal(&(BigUint::from(1u32) << v_bits));
+    (threshold > mask).then_some(threshold - mask)
 }
 
 fn eval_first_error_output<PE>(

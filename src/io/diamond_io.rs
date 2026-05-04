@@ -49,7 +49,11 @@ mod circuits;
 pub mod simulation;
 mod utils;
 
-pub use simulation::{DiamondIOErrorSimulation, DiamondIOPrfRoundErrorSimulation};
+pub use simulation::{
+    DiamondIOCrtDepthSearchResult, DiamondIOErrorSimulation,
+    DiamondIOPrfMaskOutputCoeffBitsSearchResult, DiamondIOPrfRoundErrorSimulation,
+    diamond_io_find_crt_depth,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Function families supported by the Diamond iO wrapper.

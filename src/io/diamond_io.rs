@@ -420,29 +420,26 @@ where
             self.debug_encrypt_random_prg_wires().then_some(&mut debug_prg_ciphertexts);
         #[cfg(not(test))]
         let debug_prg_ciphertext_sink: Option<&mut Vec<NativeRingGswCiphertext>> = None;
-        // TEMP DIAGNOSTIC: comment out the PRF public-key path, including
-        // noise refresh and final-mask public-key generation, while comparing
-        // the current uncommitted behavior against the latest passing commit.
-        // let final_prf_mask_public_key_vecs = self.compute_prf_mask_public_key(
-        //     Some(dir_path),
-        //     Some(&preprocess_out),
-        //     &one_vec,
-        //     &k_vec,
-        //     &input_digit_vecs,
-        //     &enc_seed_public_keys,
-        //     self.debug_encrypt_random_prg_wires().then_some(&ring_gsw_public_key),
-        //     debug_prg_ciphertext_sink,
-        // );
-        // assert_eq!(
-        //     final_prf_mask_public_key_vecs.len(),
-        //     self.output_size,
-        //     "DiamondIO must sample one final PRF mask public key per output"
-        // );
-        // info!(
-        //     final_prf_mask_count = final_prf_mask_public_key_vecs.len(),
-        //     elapsed_ms = prf_started.elapsed().as_millis(),
-        //     "DiamondIO obfuscation PRF public-key path finished"
-        // );
+        let final_prf_mask_public_key_vecs = self.compute_prf_mask_public_key(
+            Some(dir_path),
+            Some(&preprocess_out),
+            &one_vec,
+            &k_vec,
+            &input_digit_vecs,
+            &enc_seed_public_keys,
+            self.debug_encrypt_random_prg_wires().then_some(&ring_gsw_public_key),
+            debug_prg_ciphertext_sink,
+        );
+        assert_eq!(
+            final_prf_mask_public_key_vecs.len(),
+            self.output_size,
+            "DiamondIO must sample one final PRF mask public key per output"
+        );
+        info!(
+            final_prf_mask_count = final_prf_mask_public_key_vecs.len(),
+            elapsed_ms = prf_started.elapsed().as_millis(),
+            "DiamondIO obfuscation PRF public-key path finished"
+        );
 
         // Evaluate the selected function circuit over public keys. The inputs
         // are ordered as the circuit expects: decryption key followed by seed
@@ -503,13 +500,28 @@ where
         }
         let identity_selector = M::identity(params, DIAMOND_SECRET_SIZE, None).slice_columns(0, 1);
         let mut decoder_idx = 0usize;
-        for public_key_vec in evaluated_public_keys.iter().step_by(2) {
-            let function_outputs = public_key_vec.keys();
-            for function_output in function_outputs {
-                // Decoder preimages target only the final scalar plaintext
-                // coordinate. With the PRF mask path commented out for this
-                // diagnostic pass, the target is just the function output.
-                let top = function_output.matrix.mul_decompose(&identity_selector);
+        for ((output_idx, public_key_pair), mask_vec) in evaluated_public_keys
+            .chunks_exact(2)
+            .enumerate()
+            .zip(final_prf_mask_public_key_vecs.iter())
+        {
+            let function_outputs = public_key_pair[0].keys();
+            let mask_outputs = mask_vec.keys();
+            assert!(
+                function_outputs.len() == 1 || function_outputs.len() == mask_outputs.len(),
+                "DiamondIO function output {output_idx} must be scalar or match the PRF mask slot count"
+            );
+            for slot_idx in 0..mask_outputs.len() {
+                // Decoder preimages target the masked secret-dependent branch.
+                // The split Ring-GSW public-bottom branch is not decoded here;
+                // eval later adds its revealed plaintext directly.
+                let function_output = if function_outputs.len() == 1 {
+                    function_outputs[0].clone()
+                } else {
+                    function_outputs[slot_idx].clone()
+                };
+                let masked_output = function_output + &mask_outputs[slot_idx];
+                let top = masked_output.matrix.mul_decompose(&identity_selector);
                 let bottom = M::zero(params, DIAMOND_SECRET_SIZE, top.col_size());
                 let target = top.concat_rows(&[&bottom]);
                 let final_w_block_col_size = DIAMOND_SECRET_SIZE
@@ -538,9 +550,8 @@ where
         }
         assert_eq!(
             decoder_idx,
-            evaluated_public_keys
+            final_prf_mask_public_key_vecs
                 .iter()
-                .step_by(2)
                 .map(NaiveBGGPublicKeyVec::num_slots)
                 .sum::<usize>(),
             "DiamondIO decoder preimage count must match secret-dependent evaluated public-key slots"
@@ -846,32 +857,28 @@ where
         let debug_prg_ciphertexts = obf.debug_prg_ciphertexts.as_slice();
         #[cfg(not(test))]
         let debug_prg_ciphertexts: &[NativeRingGswCiphertext] = &[];
-        // TEMP DIAGNOSTIC: comment out the eval-side PRF encoding path,
-        // including noise-refresh decoder consumption and final-mask encoding
-        // evaluation, to isolate why the current uncommitted test diverges
-        // from the latest passing commit.
-        // let prf_eval_started = Instant::now();
-        // let final_prf_mask_encodings = self.compute_prf_mask_encoding(
-        //     dir_path,
-        //     &states,
-        //     &one_encoding_vec,
-        //     &k_encoding_vec,
-        //     &digit_encoding_inputs,
-        //     seed_encoding_inputs.clone(),
-        //     debug_prg_ciphertexts,
-        //     &enc_lookup_evaluator,
-        //     enc_slot_transfer_evaluator,
-        // );
-        // assert_eq!(
-        //     final_prf_mask_encodings.len(),
-        //     self.output_size,
-        //     "DiamondIO eval must compute one final PRF mask encoding per output"
-        // );
-        // info!(
-        //     final_prf_mask_count = final_prf_mask_encodings.len(),
-        //     elapsed_ms = prf_eval_started.elapsed().as_millis(),
-        //     "DiamondIO eval PRF mask encoding path finished"
-        // );
+        let prf_eval_started = Instant::now();
+        let final_prf_mask_encodings = self.compute_prf_mask_encoding(
+            dir_path,
+            &states,
+            &one_encoding_vec,
+            &k_encoding_vec,
+            &digit_encoding_inputs,
+            seed_encoding_inputs.clone(),
+            debug_prg_ciphertexts,
+            &enc_lookup_evaluator,
+            enc_slot_transfer_evaluator,
+        );
+        assert_eq!(
+            final_prf_mask_encodings.len(),
+            self.output_size,
+            "DiamondIO eval must compute one final PRF mask encoding per output"
+        );
+        info!(
+            final_prf_mask_count = final_prf_mask_encodings.len(),
+            elapsed_ms = prf_eval_started.elapsed().as_millis(),
+            "DiamondIO eval PRF mask encoding path finished"
+        );
         let function_eval_started = Instant::now();
         let mut encoding_function_inputs = Vec::with_capacity(1 + seed_encoding_inputs.len());
         encoding_function_inputs.push(NaiveBGGEncodingVec::new(params, vec![k_output]));
@@ -895,35 +902,32 @@ where
             2 * self.output_size,
             "DiamondIO evaluated encoding count mismatch"
         );
-        // TEMP DIAGNOSTIC: this mapping expands function outputs to the
-        // final-mask slot layout and is therefore disabled with the
-        // eval-side PRF mask path above.
-        // let evaluated_encodings = evaluated_encodings
-        //     .chunks_exact(2)
-        //     .enumerate()
-        //     .flat_map(|(output_idx, output_pair)| {
-        //         let mask = &final_prf_mask_encodings[output_idx];
-        //         let function_encodings = output_pair[0].encodings();
-        //         assert!(
-        //             function_encodings.len() == 1 || function_encodings.len() ==
-        // mask.num_slots(),             "DiamondIO function output {output_idx} must be scalar
-        // or match the PRF mask slot count"         );
-        //         let masked_secret_dependent = NaiveBGGEncodingVec::new(
-        //             params,
-        //             (0..mask.num_slots())
-        //                 .map(|slot_idx| {
-        //                     let output = if function_encodings.len() == 1 {
-        //                         function_encodings[0].clone()
-        //                     } else {
-        //                         function_encodings[slot_idx].clone()
-        //                     };
-        //                     output + &mask.encoding(slot_idx)
-        //                 })
-        //                 .collect(),
-        //         );
-        //         [masked_secret_dependent, output_pair[1].clone()]
-        //     })
-        //     .collect::<Vec<_>>();
+        let evaluated_encodings = evaluated_encodings
+            .chunks_exact(2)
+            .enumerate()
+            .flat_map(|(output_idx, output_pair)| {
+                let mask = &final_prf_mask_encodings[output_idx];
+                let function_encodings = output_pair[0].encodings();
+                assert!(
+                    function_encodings.len() == 1 || function_encodings.len() == mask.num_slots(),
+                    "DiamondIO function output {output_idx} must be scalar or match the PRF mask slot count"
+                );
+                let masked_secret_dependent = NaiveBGGEncodingVec::new(
+                    params,
+                    (0..mask.num_slots())
+                        .map(|slot_idx| {
+                            let output = if function_encodings.len() == 1 {
+                                function_encodings[0].clone()
+                            } else {
+                                function_encodings[slot_idx].clone()
+                            };
+                            output + &mask.encoding(slot_idx)
+                        })
+                        .collect(),
+                );
+                [masked_secret_dependent, output_pair[1].clone()]
+            })
+            .collect::<Vec<_>>();
         // Decoder cancellation only needs the projected vector
         // `state * preimage`. The matching public key was already fixed when
         // the preimage was sampled during obfuscation, so eval does not rebuild

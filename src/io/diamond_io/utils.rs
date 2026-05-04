@@ -392,7 +392,7 @@ where
     /// `a_prime` public key per output wire and round; the public keys do not
     /// branch over all possible input assignments.
     #[allow(clippy::too_many_arguments)]
-    fn compute_prf_mask_public_key(
+    pub(super) fn compute_prf_mask_public_key(
         &self,
         dir_path: Option<&Path>,
         preprocess_out: Option<&DiamondInjectorPreprocessOut<M, TS::Trapdoor>>,
@@ -723,7 +723,7 @@ where
     /// matching mask to the corresponding function output slot before
     /// canceling against the combined decoder.
     #[allow(clippy::too_many_arguments)]
-    fn compute_prf_mask_encoding(
+    pub(super) fn compute_prf_mask_encoding(
         &self,
         dir_path: &Path,
         states: &[M],

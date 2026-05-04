@@ -66,6 +66,9 @@ const DEFAULT_BENCH_ITERATIONS: usize = 1;
 const DEFAULT_BENCH_SEED: [u8; 32] = [0u8; 32];
 const TRAPDOOR_SIGMA: f64 = 4.578;
 const ERROR_SIM_ACTIVE_LEVELS: usize = 1;
+const ACTUAL_HASH_KEY_CHECKPOINT_FILE: &str = "actual_lwe_hash_key.bin";
+const ACTUAL_TRAPDOOR_CHECKPOINT_FILE: &str = "actual_lwe_trapdoor.bin";
+const ACTUAL_PUB_MATRIX_CHECKPOINT_FILE: &str = "actual_lwe_pub_matrix.bin";
 
 type GpuMatrix = GpuDCRTPolyMatrix;
 type GpuHashSampler = GpuDCRTPolyHashSampler<Keccak256>;
@@ -77,6 +80,7 @@ type GpuPubKeySlotEvaluator = BggPublicKeySTEvaluator<
     GpuHashSampler,
     GpuDCRTPolyTrapdoorSampler,
 >;
+type GpuTrapdoor = <GpuDCRTPolyTrapdoorSampler as PolyTrapdoorSampler>::Trapdoor;
 
 #[derive(Debug, Clone)]
 struct ModqArithConfig {
@@ -120,6 +124,53 @@ fn env_or_parse_f64(key: &str, default: f64) -> f64 {
     match env::var(key) {
         Ok(raw) => raw.parse::<f64>().unwrap_or_else(|e| panic!("{key} must be a valid f64: {e}")),
         Err(_) => default,
+    }
+}
+
+fn load_or_create_actual_lwe_checkpoint(
+    params: &GpuDCRTPolyParams,
+    d_secret: usize,
+    dir: &Path,
+) -> ([u8; 32], GpuDCRTPolyTrapdoorSampler, GpuTrapdoor, GpuMatrix) {
+    fs::create_dir_all(dir).expect("failed to create actual LWE checkpoint dir");
+
+    let hash_key_path = dir.join(ACTUAL_HASH_KEY_CHECKPOINT_FILE);
+    let hash_key = match fs::read(&hash_key_path) {
+        Ok(bytes) => {
+            let hash_key: [u8; 32] = bytes
+                .try_into()
+                .expect("actual LWE hash key checkpoint must contain exactly 32 bytes");
+            info!("loaded actual LWE hash key checkpoint from {}", hash_key_path.display());
+            hash_key
+        }
+        Err(_) => {
+            fs::write(&hash_key_path, DEFAULT_BENCH_SEED)
+                .expect("failed to write actual LWE hash key checkpoint");
+            info!("wrote actual LWE hash key checkpoint to {}", hash_key_path.display());
+            DEFAULT_BENCH_SEED
+        }
+    };
+
+    let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(params, TRAPDOOR_SIGMA);
+    let trapdoor_path = dir.join(ACTUAL_TRAPDOOR_CHECKPOINT_FILE);
+    let pub_matrix_path = dir.join(ACTUAL_PUB_MATRIX_CHECKPOINT_FILE);
+    match (fs::read(&trapdoor_path), fs::read(&pub_matrix_path)) {
+        (Ok(trapdoor_bytes), Ok(pub_matrix_bytes)) => {
+            let trapdoor = GpuDCRTPolyTrapdoorSampler::trapdoor_from_bytes(params, &trapdoor_bytes)
+                .expect("failed to decode actual LWE trapdoor checkpoint");
+            let pub_matrix = GpuMatrix::from_compact_bytes(params, &pub_matrix_bytes);
+            info!("loaded actual LWE trapdoor/pub_matrix checkpoints from {}", dir.display());
+            (hash_key, trapdoor_sampler, trapdoor, pub_matrix)
+        }
+        _ => {
+            let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(params, d_secret);
+            fs::write(&trapdoor_path, GpuDCRTPolyTrapdoorSampler::trapdoor_to_bytes(&trapdoor))
+                .expect("failed to write actual LWE trapdoor checkpoint");
+            fs::write(&pub_matrix_path, pub_matrix.to_compact_bytes())
+                .expect("failed to write actual LWE pub_matrix checkpoint");
+            info!("wrote actual LWE trapdoor/pub_matrix checkpoints to {}", dir.display());
+            (hash_key, trapdoor_sampler, trapdoor, pub_matrix)
+        }
     }
 }
 
@@ -743,13 +794,19 @@ async fn test_gpu_lwe_nested_rns_modq_arith() {
         "all-one multiplication tree output should reconstruct to 1"
     );
 
+    let actual_eval_dir = dir.join("actual_scalar_bgg");
+    let (actual_hash_key, trapdoor_sampler, trapdoor, pub_matrix) =
+        load_or_create_actual_lwe_checkpoint(&params, cfg.d_secret, &actual_eval_dir);
+    let trapdoor = Arc::new(trapdoor);
+    let pub_matrix = Arc::new(pub_matrix);
+
     let uniform_sampler = GpuDCRTPolyUniformSampler::new();
     let secrets =
         uniform_sampler.sample_uniform(&params, 1, cfg.d_secret, DistType::TernaryDist).get_row(0);
     let secret_vec = GpuDCRTPolyMatrix::from_poly_vec_row(&params, secrets.clone());
 
     let pubkey_sampler =
-        BGGPublicKeySampler::<_, GpuHashSampler>::new(DEFAULT_BENCH_SEED, cfg.d_secret);
+        BGGPublicKeySampler::<_, GpuHashSampler>::new(actual_hash_key, cfg.d_secret);
     let reveal_plaintexts = vec![true; circuit.num_input()];
     let mut pubkeys = pubkey_sampler.sample(
         &params,
@@ -766,22 +823,18 @@ async fn test_gpu_lwe_nested_rns_modq_arith() {
     drop(plaintext_inputs);
     drop(secrets);
 
-    let actual_eval_dir = dir.join("actual_scalar_bgg");
     fs::create_dir_all(&actual_eval_dir).expect("failed to create actual scalar BGG eval dir");
     init_storage_system(actual_eval_dir.clone());
 
-    let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, TRAPDOOR_SIGMA);
-    let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(&params, cfg.d_secret);
-    let pub_matrix = Arc::new(pub_matrix);
     let pubkey_evaluator = LWEBGGPubKeyPltEvaluator::<
         GpuDCRTPolyMatrix,
         GpuDCRTPolyHashSampler<Keccak256>,
         GpuDCRTPolyTrapdoorSampler,
     >::new(
-        DEFAULT_BENCH_SEED,
+        actual_hash_key,
         trapdoor_sampler,
         Arc::clone(&pub_matrix),
-        Arc::new(trapdoor),
+        trapdoor,
         actual_eval_dir.clone(),
     );
 
@@ -812,7 +865,7 @@ async fn test_gpu_lwe_nested_rns_modq_arith() {
     let encoding_evaluator = LWEBGGEncodingPltEvaluator::<
         GpuDCRTPolyMatrix,
         GpuDCRTPolyHashSampler<Keccak256>,
-    >::new(DEFAULT_BENCH_SEED, actual_eval_dir, c_b);
+    >::new(actual_hash_key, actual_eval_dir, c_b);
 
     let input_encodings = encodings.split_off(1);
     let one_encoding = encodings.pop().expect("encodings must contain one entry for const one");

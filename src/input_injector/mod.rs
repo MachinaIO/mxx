@@ -688,6 +688,18 @@ where
         let plaintext = if pubkey.reveal_plaintext { plaintext } else { None };
         BggEncoding::new(vector, pubkey, plaintext)
     }
+
+    #[cfg(test)]
+    pub fn debug_final_secret_matrix(&self, dir_path: &Path, input_digits: &[u32]) -> M {
+        self.validate_digits(input_digits);
+        let mut secret_matrix = self.read_matrix(dir_path, self.secret_epsilon_id());
+        for (digit_idx, digit_value) in input_digits.iter().copied().enumerate() {
+            let secret_mask = self
+                .read_matrix(dir_path, &self.digit_secret_id(digit_idx + 1, digit_value as usize));
+            secret_matrix = secret_matrix * secret_mask;
+        }
+        secret_matrix
+    }
 }
 
 impl<M, US, HS, TS> InputInjector<M::P> for DiamondInjector<M, US, HS, TS>

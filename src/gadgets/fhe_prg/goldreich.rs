@@ -611,7 +611,9 @@ where
         .iter()
         .zip(plaintext_moduli.iter())
         .map(|(encrypted_bit, plaintext_modulus)| {
-            encrypted_bit.decrypt::<M>(decryption_key, plaintext_modulus.clone(), circuit)
+            encrypted_bit
+                .decrypt::<M>(decryption_key, plaintext_modulus.clone(), circuit)
+                .add_in_circuit(circuit)
         })
         .collect::<Vec<_>>();
     sum_gate_ids(circuit, &bit_terms)

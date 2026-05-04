@@ -57,6 +57,7 @@ where
         plaintext_modulus,
         circuit,
     )
+    .add_in_circuit(circuit)
 }
 
 /// Decrypts one bit-decomposed mask polynomial.
@@ -107,6 +108,7 @@ where
                 plaintext_moduli[bit_idx].clone(),
                 circuit,
             )
+            .add_in_circuit(circuit)
         })
         .collect::<Vec<_>>();
     sum_gate_ids(circuit, &bit_terms)

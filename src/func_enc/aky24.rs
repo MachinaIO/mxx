@@ -603,8 +603,7 @@ where
             params.goldreich_graph_seed,
             params.noise_refresh_cbd_n,
             params.noise_refresh_hash_key,
-        )
-        .with_debug_secret(ct.debug_secret().map(|secret| secret.to_vec()));
+        );
         let (_, _crt_bits, crt_depth) = params.poly_params.to_crt();
         let generated_seed_bits_per_round =
             if params.debug_reuse_single_prg_sample() { 1 } else { prf_seed_bits };
@@ -1219,8 +1218,9 @@ where
             let fhe_decryption_key = circuit.input(1).at(0).as_single_wire();
             let ciphertext =
                 RingGswCiphertext::input(ring_gsw_context, Some(BigUint::from(1u64)), &mut circuit);
-            let decrypted =
-                ciphertext.decrypt::<M>(fhe_decryption_key, BigUint::from(2u64), &mut circuit);
+            let decrypted = ciphertext
+                .decrypt::<M>(fhe_decryption_key, BigUint::from(2u64), &mut circuit)
+                .add_in_circuit(&mut circuit);
             circuit.output(vec![decrypted]);
         }
     }
@@ -1529,7 +1529,9 @@ where
 {
     let mut circuit = PolyCircuit::new();
     let secret_key = circuit.input(1).at(0).as_single_wire();
-    let decrypted = ciphertext.decrypt::<M>(secret_key, BigUint::from(2u64), &mut circuit);
+    let decrypted = ciphertext
+        .decrypt::<M>(secret_key, BigUint::from(2u64), &mut circuit)
+        .add_in_circuit(&mut circuit);
     circuit.output(vec![decrypted]);
     circuit
 }

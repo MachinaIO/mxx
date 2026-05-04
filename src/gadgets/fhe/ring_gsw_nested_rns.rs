@@ -244,7 +244,7 @@ pub fn decrypt_ciphertext(
     secret_key: &DCRTPoly,
     plaintext_modulus: u64,
 ) -> DCRTPoly {
-    let q = active_q_modulus(ctx);
+    let q = ctx.q_moduli().iter().fold(BigUint::from(1u64), |acc, &q_i| acc * BigUint::from(q_i));
     let scaled = &q / BigUint::from(plaintext_modulus);
     let zero_poly = DCRTPoly::const_zero(params);
     let scaled_poly = DCRTPoly::from_biguint_to_constant(params, scaled);

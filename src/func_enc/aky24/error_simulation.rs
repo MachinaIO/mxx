@@ -7,19 +7,21 @@ use num_traits::FromPrimitive;
 use crate::{
     circuit::PolyCircuit,
     func_enc::aky24::{
-        Aky24Func, Aky24Params, build_func_circuit, build_goldreich_prg_range_circuit,
-        build_prf_mask_circuit, build_ring_gsw_context,
+        Aky24Func, Aky24Params, build_func_circuit,
+        build_goldreich_prg_range_circuit_with_enable_levels, build_prf_mask_circuit,
+        build_ring_gsw_context,
     },
     lookup::PltEvaluator,
     matrix::dcrt_poly::DCRTPolyMatrix,
     noise_refresh::simulation::{
-        NoiseRefreshErrorSimulation, simulate_noise_refresh_error_growth,
-        validate_error_bound_security_margin,
+        NoiseRefreshErrorSimulation, simulate_noise_refresh_error_growth_for_v_bits,
+        validate_error_bound_security_margin, validate_noise_refresh_v_bits,
     },
     poly::{PolyParams, dcrt::poly::DCRTPoly},
     simulator::{
         SimulatorContext,
         error_norm::{ErrorNorm, compute_preimage_norm},
+        memory::log_process_memory,
         poly_matrix_norm::PolyMatrixNorm,
         poly_norm::PolyNorm,
     },
@@ -180,7 +182,8 @@ impl Aky24DecErrorSimulationInputs {
 /// Error size is independent of the public PRF-seed value, so the top-level simulator always uses
 /// the first half of the conceptual `2 * prf_seed_bits` PRG output. The top-level simulator feeds
 /// this helper uniform seed input norms, so output symmetry makes this representative `ErrorNorm`
-/// a bound for every generated seed bit in that half.
+/// a bound for every generated seed bit in that half. The expensive PRG circuit is simulated with
+/// one active level and then linearly extrapolated to the configured active-level count.
 pub fn simulate_representative_prf_enc_seed_error<TD, PE>(
     params: &Aky24Params<DCRTPolyMatrix, TD>,
     round_idx: usize,
@@ -192,17 +195,34 @@ pub fn simulate_representative_prf_enc_seed_error<TD, PE>(
 where
     PE: PltEvaluator<ErrorNorm>,
 {
-    let circuit =
-        build_goldreich_prg_range_circuit(params, round_idx, 2 * params.prf_seed_bits(), 0, 1);
+    let circuit = build_goldreich_prg_range_circuit_with_enable_levels(
+        params,
+        round_idx,
+        2 * params.prf_seed_bits(),
+        0,
+        1,
+        Some(1),
+    );
     let wire_count = ring_gsw_wire_count(circuit.num_input(), params.prf_seed_bits());
     let seed_wire_errors = expand_logical_bit_errors(&seed_wires, wire_count);
-    eval_first_error_output(circuit, one, seed_wire_errors, plt_evaluator, slot_transfer_evaluator)
+    extrapolate_prg_error_to_configured_active_levels(
+        params,
+        eval_first_error_output(
+            circuit,
+            one,
+            seed_wire_errors,
+            plt_evaluator,
+            slot_transfer_evaluator,
+        ),
+    )
 }
 
 /// Simulates the first output of the final AKY24 PRF-mask expansion PRG.
 ///
 /// This is the PRG call that expands the final refreshed private seed into encrypted mask bits.
-/// Output symmetry lets the first mask-bit error stand for all generated mask bits.
+/// Output symmetry lets the first mask-bit error stand for all generated mask bits. As with the
+/// seed-update PRG, the circuit is simulated with one active level and linearly extrapolated to the
+/// configured active-level count.
 pub fn simulate_final_mask_prg_error<TD, PE>(
     params: &Aky24Params<DCRTPolyMatrix, TD>,
     round_idx: usize,
@@ -215,11 +235,26 @@ pub fn simulate_final_mask_prg_error<TD, PE>(
 where
     PE: PltEvaluator<ErrorNorm>,
 {
-    let circuit =
-        build_goldreich_prg_range_circuit(params, round_idx, conceptual_output_bits, 0, 1);
+    let circuit = build_goldreich_prg_range_circuit_with_enable_levels(
+        params,
+        round_idx,
+        conceptual_output_bits,
+        0,
+        1,
+        Some(1),
+    );
     let wire_count = ring_gsw_wire_count(circuit.num_input(), params.prf_seed_bits());
     let seed_wire_errors = expand_logical_bit_errors(&seed_wires, wire_count);
-    eval_first_error_output(circuit, one, seed_wire_errors, plt_evaluator, slot_transfer_evaluator)
+    extrapolate_prg_error_to_configured_active_levels(
+        params,
+        eval_first_error_output(
+            circuit,
+            one,
+            seed_wire_errors,
+            plt_evaluator,
+            slot_transfer_evaluator,
+        ),
+    )
 }
 
 /// Runs the top-level AKY24 decryption error simulation.
@@ -296,14 +331,14 @@ where
             Some(slot_transfer_evaluator),
         );
         let mut refresh_context_circuit = PolyCircuit::new();
-        let refresh = simulate_noise_refresh_error_growth(
+        let refresh = simulate_noise_refresh_error_growth_for_v_bits(
             build_ring_gsw_context(params, &mut refresh_context_circuit),
             params.prf_seed_bits(),
+            params.noise_refresh_v_bits,
             params.goldreich_graph_seed,
             params.noise_refresh_cbd_n,
             ring_gsw_error_sigma,
             num_slots,
-            secret_norm,
             one.clone(),
             prg_output_error,
             &current_seed_errors,
@@ -311,7 +346,31 @@ where
             decoders,
             plt_evaluator,
             slot_transfer_evaluator,
-        )?;
+        );
+        let worst_pre_rounding = refresh
+            .pre_round_outputs
+            .iter()
+            .max_by(|lhs, rhs| {
+                lhs.poly_norm
+                    .norm
+                    .partial_cmp(&rhs.poly_norm.norm)
+                    .expect("noise-refresh pre-rounding norms must be comparable")
+            })
+            .expect("noise-refresh simulation must produce at least one pre-round output");
+        if !validate_noise_refresh_v_bits(
+            &params.poly_params,
+            params.noise_refresh_v_bits,
+            secret_norm,
+            worst_pre_rounding,
+        ) {
+            info!(
+                round_idx,
+                v_bits = params.noise_refresh_v_bits,
+                worst_pre_rounding_norm = %worst_pre_rounding.poly_norm.norm,
+                "AKY24 configured noise-refresh v_bits failed rounding-bound validation"
+            );
+            return None;
+        }
         debug!(
             round_idx,
             v_bits = refresh.v_bits,
@@ -358,20 +417,14 @@ where
         mask_circuit.num_input(),
         "AKY24 PRF mask error-simulation input count must match the mask decrypt circuit"
     );
-    let mut mask_outputs = mask_circuit.eval(
-        &(),
+    let mask_output = eval_first_error_output(
+        mask_circuit,
         one,
         mask_inputs,
         Some(plt_evaluator),
         Some(slot_transfer_evaluator),
-        None,
     );
-    assert_eq!(
-        mask_outputs.len(),
-        1,
-        "AKY24 PRF mask error simulation must produce exactly one output"
-    );
-    let final_mask_encoding_error = mask_outputs.remove(0).matrix_norm;
+    let final_mask_encoding_error = mask_output.matrix_norm;
     let final_mask_error = final_mask_encoding_error.clone() *
         PolyMatrixNorm::gadget_decomposed(final_mask_encoding_error.clone_ctx(), 1);
     let decoder_error = inputs.c_b0_error_norm * &inputs.output_preimage_norm;
@@ -430,7 +483,7 @@ where
         )?;
         let q: Arc<BigUint> = candidate_params.poly_params.modulus().into();
         let quarter_q = biguint_to_decimal(&(q.as_ref() / 4u32));
-        let mask_value = biguint_to_decimal(&(BigUint::from(1u32) << candidate));
+        let mask_value = biguint_to_decimal(&((BigUint::from(1u32) << candidate) - 1u32));
         let valid = &simulation.error_bound.poly_norm.norm + &mask_value < quarter_q;
         debug!(
             candidate,
@@ -592,7 +645,7 @@ fn aky24_final_decode_margin(
 ) -> Option<BigDecimal> {
     let q: Arc<BigUint> = params.modulus().into();
     let threshold = biguint_to_decimal(&(q.as_ref() / 4u32));
-    let mask = biguint_to_decimal(&(BigUint::from(1u32) << prf_mask_output_coeff_bits));
+    let mask = biguint_to_decimal(&((BigUint::from(1u32) << prf_mask_output_coeff_bits) - 1u32));
     (threshold > mask).then_some(threshold - mask)
 }
 
@@ -677,13 +730,40 @@ where
         "AKY24 first-output error-simulation helper must expose at least one output"
     );
     circuit.restrict_outputs_to_indices(&[0]);
+    log_process_memory("before AKY24 first-output error circuit eval");
     let mut outputs = circuit.eval(&(), one, inputs, plt_evaluator, slot_transfer_evaluator, None);
+    drop(circuit);
+    log_process_memory("after AKY24 first-output error circuit eval");
     assert_eq!(
         outputs.len(),
         1,
         "AKY24 first-output error simulation must produce exactly one output"
     );
     outputs.remove(0)
+}
+
+/// Scales a one-active-level PRG error simulation to the configured active-level count.
+///
+/// This mirrors the GPU Goldreich benchmark correction model: the PRG circuit is evaluated once at
+/// one active level, and the resulting bound is multiplied by the number of active levels requested
+/// by the AKY24 Ring-GSW context.
+fn extrapolate_prg_error_to_configured_active_levels<TD>(
+    params: &Aky24Params<DCRTPolyMatrix, TD>,
+    error: ErrorNorm,
+) -> ErrorNorm {
+    let (_q_moduli, _crt_bits, crt_depth) = params.poly_params.to_crt();
+    let active_levels =
+        params.ring_gsw_enable_levels.unwrap_or_else(|| crt_depth - params.ring_gsw_level_offset);
+    assert!(active_levels > 0, "AKY24 Ring-GSW active level count must be positive");
+    assert!(
+        params.ring_gsw_level_offset + active_levels <= crt_depth,
+        "AKY24 Ring-GSW active levels must fit in the CRT depth"
+    );
+    if active_levels == 1 {
+        return error;
+    }
+    let scale = BigDecimal::from(active_levels as u64);
+    ErrorNorm::new(error.plaintext_norm * &scale, error.matrix_norm * &scale)
 }
 
 /// Repeats one logical Ring-GSW ciphertext error bound for every flattened circuit input wire.
@@ -800,8 +880,14 @@ mod tests {
     #[test]
     fn test_error_simulation_expands_logical_bits_to_flat_ring_gsw_inputs() {
         let params = test_params();
-        let selected_prg =
-            build_goldreich_prg_range_circuit(&params, 0, 2 * params.prf_seed_bits(), 0, 1);
+        let selected_prg = build_goldreich_prg_range_circuit_with_enable_levels(
+            &params,
+            0,
+            2 * params.prf_seed_bits(),
+            0,
+            1,
+            params.ring_gsw_enable_levels,
+        );
         let prg_wire_count = ring_gsw_wire_count(selected_prg.num_input(), params.prf_seed_bits());
         assert!(prg_wire_count > 1, "test must exercise flattened Ring-GSW inputs");
 
@@ -822,6 +908,42 @@ mod tests {
     }
 
     #[test]
+    fn test_prg_error_simulation_uses_one_active_level_circuit() {
+        let params = test_params_with_crt_depth(2);
+        let full_circuit = build_goldreich_prg_range_circuit_with_enable_levels(
+            &params,
+            0,
+            2 * params.prf_seed_bits(),
+            0,
+            1,
+            params.ring_gsw_enable_levels,
+        );
+        let one_level_circuit = build_goldreich_prg_range_circuit_with_enable_levels(
+            &params,
+            0,
+            2 * params.prf_seed_bits(),
+            0,
+            1,
+            Some(1),
+        );
+        assert!(
+            one_level_circuit.num_input() < full_circuit.num_input(),
+            "PRG error simulation should build the representative circuit with fewer one-level wires"
+        );
+
+        let inputs =
+            Aky24DecErrorSimulationInputs::new_from_params(&params, Aky24Func::DebugIdentity);
+        let ctx = inputs.c_b0_error_norm.clone_ctx();
+        let error = ErrorNorm::new(
+            PolyNorm::new(ctx.clone(), BigDecimal::from(3u32)),
+            PolyMatrixNorm::new(ctx, 1, 1, BigDecimal::from(5u32), None),
+        );
+        let scaled = extrapolate_prg_error_to_configured_active_levels(&params, error);
+        assert_eq!(scaled.plaintext_norm.norm, BigDecimal::from(6u32));
+        assert_eq!(scaled.matrix_norm.poly_norm.norm, BigDecimal::from(10u32));
+    }
+
+    #[test]
     #[ignore = "expensive CRT-depth smoke test; run explicitly when changing search orchestration"]
     fn test_aky24_find_crt_depth_returns_candidate() {
         let result = aky24_find_crt_depth(
@@ -833,7 +955,7 @@ mod tests {
             2,
             |crt_depth| {
                 let mut params = test_params_with_crt_depth(crt_depth);
-                params.public_prf_seed_bits = Some(0);
+                params.public_prf_seed_bits = Some(1);
                 let inputs = Aky24DecErrorSimulationInputs::new_from_params(
                     &params,
                     Aky24Func::DebugIdentity,
@@ -858,13 +980,14 @@ mod tests {
                     PolyNorm::one(ctx.clone()),
                     PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, BigDecimal::from(0u32), None),
                 );
+                let decoder_count = 2 * crt_depth;
                 Aky24CrtDepthSearchCandidate {
                     params,
                     inputs,
                     secret_norm,
                     one,
                     decryption_key,
-                    decoders: vec![decoder],
+                    decoders: vec![decoder; decoder_count],
                 }
             },
             |candidate| {

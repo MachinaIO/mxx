@@ -1,4 +1,5 @@
 use crate::{
+    circuit::{BatchedWire, PolyCircuit},
     gadgets::{
         arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner},
         fhe::ring_gsw::{RingGswCiphertext, RingGswContext},
@@ -6,13 +7,17 @@ use crate::{
     lookup::PltEvaluator,
     matrix::dcrt_poly::DCRTPolyMatrix,
     noise_refresh::{
-        circuit_prg::{
-            evaluate_goldreich_noise_refresh_material, goldreich_noise_refresh_output_sizes,
+        circuit_decrypt::{
+            decrypt_bit_decomposed_polynomial, decrypt_error_coefficients_as_polynomial,
+            mask_plaintext_moduli_from_full_modulus,
         },
-        naive_vec::build_noise_refresh_material_circuit,
+        circuit_prg::evaluate_goldreich_noise_refresh_material_ranges,
     },
     poly::{PolyParams, dcrt::poly::DCRTPoly},
-    simulator::{SimulatorContext, error_norm::ErrorNorm, poly_matrix_norm::PolyMatrixNorm},
+    simulator::{
+        SimulatorContext, error_norm::ErrorNorm, memory::log_process_memory,
+        poly_matrix_norm::PolyMatrixNorm,
+    },
     slot_transfer::SlotTransferEvaluator,
 };
 use bigdecimal::BigDecimal;
@@ -256,18 +261,66 @@ where
         "decoder norm count must equal num_slots * crt_depth"
     );
 
-    let circuit = build_noise_refresh_material_circuit::<DCRTPoly, A, DCRTPolyMatrix>(
-        ring_gsw.clone(),
+    let active_level_scale = ring_gsw.active_levels;
+    let material_ring_gsw = one_active_level_ring_gsw_context(&ring_gsw);
+    info!(
+        original_active_levels = active_level_scale,
+        material_active_levels = material_ring_gsw.active_levels,
+        "noise-refresh material PRG error simulation using one-active-level extrapolation"
+    );
+
+    let expected_material_outputs = num_slots
+        .checked_mul(crt_depth)
+        .and_then(|value| value.checked_mul(log_base_q))
+        .expect("noise-refresh material output count overflow");
+    info!(
+        expected_material_outputs,
+        crt_depth, log_base_q, "building representative noise-refresh material error circuit"
+    );
+    let circuit = build_representative_noise_refresh_material_circuit::<A>(
+        material_ring_gsw.clone(),
         seed_bits,
         v_bits,
         graph_seed,
         cbd_n,
         num_slots,
-        false,
     );
-    let mut inputs = enc_seeds.to_vec();
+    assert_eq!(
+        circuit.num_output(),
+        1,
+        "noise-refresh representative material circuit must expose one output"
+    );
+    let seed_input_count =
+        circuit.num_input().checked_sub(1).expect("material circuit must include decryption key");
+    assert_eq!(
+        seed_input_count % seed_bits,
+        0,
+        "material circuit seed inputs must be divisible by seed_bits"
+    );
+    let seed_wire_count = seed_input_count / seed_bits;
+    debug!(
+        logical_seed_bits = enc_seeds.len(),
+        seed_wire_count,
+        circuit_input_count = circuit.num_input(),
+        "expanding logical encrypted seed norms to material circuit inputs"
+    );
+    info!(
+        circuit_inputs = circuit.num_input(),
+        seed_wire_count, "representative noise-refresh material circuit built"
+    );
+    let mut inputs = enc_seeds
+        .iter()
+        .flat_map(|seed| std::iter::repeat_n(seed.clone(), seed_wire_count))
+        .collect::<Vec<_>>();
     inputs.push(decryption_key.clone());
-    let material_outputs = circuit.eval(
+    assert_eq!(
+        inputs.len(),
+        circuit.num_input(),
+        "expanded noise-refresh material input count mismatch"
+    );
+    info!("evaluating representative noise-refresh material error circuit");
+    log_process_memory("before representative noise-refresh material error circuit eval");
+    let mut representative_material_outputs = circuit.eval(
         &(),
         one.clone(),
         inputs,
@@ -275,33 +328,42 @@ where
         Some(slot_transfer_evaluator as &dyn SlotTransferEvaluator<ErrorNorm>),
         None,
     );
+    drop(circuit);
+    log_process_memory("after representative noise-refresh material error circuit eval");
     debug!(
-        outputs = material_outputs.len(),
-        "noise-refresh material circuit error evaluation finished"
+        outputs = representative_material_outputs.len(),
+        "noise-refresh representative material circuit error evaluation finished"
     );
     assert_eq!(
-        material_outputs.len(),
-        num_slots * crt_depth * log_base_q,
-        "noise-refresh error simulator output layout mismatch"
+        representative_material_outputs.len(),
+        1,
+        "noise-refresh representative material circuit must evaluate one output"
     );
-    let material_decryption_errors = material_decryption_error_norms(
-        ring_gsw,
-        seed_bits,
-        v_bits,
-        graph_seed,
-        cbd_n,
-        ring_gsw_error_sigma,
-        num_slots,
-        one.clone_ctx(),
+    extrapolate_material_outputs_to_active_levels(
+        &mut representative_material_outputs,
+        active_level_scale,
     );
-    debug!(
-        outputs = material_decryption_errors.len(),
-        "noise-refresh material decryption error norms computed"
+    info!(active_level_scale, "representative noise-refresh material output extrapolated");
+    let representative_material_output = representative_material_outputs.remove(0);
+    info!("computing representative noise-refresh material decryption-error norm");
+    let mut representative_material_decryption_error =
+        representative_material_decryption_error_norm(
+            material_ring_gsw,
+            seed_bits,
+            v_bits,
+            graph_seed,
+            cbd_n,
+            ring_gsw_error_sigma,
+            num_slots,
+            one.clone_ctx(),
+        );
+    extrapolate_matrix_norms_to_active_levels(
+        std::slice::from_mut(&mut representative_material_decryption_error),
+        active_level_scale,
     );
-    assert_eq!(
-        material_decryption_errors.len(),
-        material_outputs.len(),
-        "Ring-GSW decryption-error layout must match material output layout"
+    info!(
+        outputs = expected_material_outputs,
+        "noise-refresh representative material decryption error norm expanded"
     );
 
     let ctx = one.clone_ctx();
@@ -310,6 +372,10 @@ where
     let input_term = refreshed_input.matrix_norm.clone() *
         PolyMatrixNorm::gadget_decomposed(ctx.clone(), log_base_q);
 
+    info!(
+        pre_round_output_count = num_slots * crt_depth,
+        "combining representative noise-refresh pre-round output norms"
+    );
     let pre_round_outputs = (0..num_slots * crt_depth)
         .into_par_iter()
         .map(|flat_idx| {
@@ -319,13 +385,13 @@ where
             let mut refresh_nrow = None;
             let mut refresh_ncol = 0usize;
             for digit_idx in 0..log_base_q {
-                let material_idx =
+                let _material_idx =
                     slot_idx * crt_depth * log_base_q + crt_idx * log_base_q + digit_idx;
-                let decoded_column = material_outputs[material_idx].matrix_norm.clone() *
+                let decoded_column = representative_material_output.matrix_norm.clone() *
                     PolyMatrixNorm::gadget_decomposed(ctx.clone(), 1);
                 let collapsed_column =
                     (1..num_slots).fold(decoded_column.clone(), |acc, _| acc + &decoded_column);
-                let collapsed_column = collapsed_column + &material_decryption_errors[material_idx];
+                let collapsed_column = collapsed_column + &representative_material_decryption_error;
                 refresh_nrow = Some(collapsed_column.nrow);
                 refresh_ncol += collapsed_column.ncol;
                 refresh_entry_norm += collapsed_column.poly_norm.norm;
@@ -340,7 +406,12 @@ where
             input_term.clone() + &refresh_term + &one_term + &decoders[flat_idx].matrix_norm
         })
         .collect::<Vec<_>>();
+    info!(
+        pre_round_output_count = pre_round_outputs.len(),
+        "finished combining representative noise-refresh pre-round output norms"
+    );
 
+    info!(rounded_error_count = num_slots, "building noise-refresh rounded error norms");
     let rounded_errors = (0..num_slots)
         .into_par_iter()
         .map(|_| {
@@ -364,7 +435,196 @@ fn worst_pre_rounding_error(simulation: &NoiseRefreshErrorSimulation) -> &PolyMa
         .expect("simulation must produce at least one pre-round output")
 }
 
-fn material_decryption_error_norms<A>(
+fn one_active_level_ring_gsw_context<A>(
+    ring_gsw: &Arc<RingGswContext<DCRTPoly, A>>,
+) -> Arc<RingGswContext<DCRTPoly, A>>
+where
+    A: DecomposeArithmeticGadget<DCRTPoly> + ModularArithmeticPlanner<DCRTPoly>,
+{
+    if ring_gsw.active_levels == 1 {
+        return ring_gsw.clone();
+    }
+    let mut circuit = ring_gsw.fresh_circuit();
+    Arc::new(RingGswContext::from_arith_context(
+        &mut circuit,
+        &ring_gsw.params,
+        ring_gsw.num_slots,
+        ring_gsw.arith_ctx.clone(),
+        Some(1),
+        Some(ring_gsw.level_offset),
+    ))
+}
+
+fn extrapolate_material_outputs_to_active_levels(outputs: &mut [ErrorNorm], active_levels: usize) {
+    assert!(active_levels > 0, "active-level extrapolation scale must be positive");
+    if active_levels == 1 {
+        return;
+    }
+    let scale = BigDecimal::from(active_levels as u64);
+    for output in outputs {
+        output.plaintext_norm = output.plaintext_norm.clone() * &scale;
+        output.matrix_norm = output.matrix_norm.clone() * &scale;
+    }
+}
+
+fn extrapolate_matrix_norms_to_active_levels(norms: &mut [PolyMatrixNorm], active_levels: usize) {
+    assert!(active_levels > 0, "active-level extrapolation scale must be positive");
+    if active_levels == 1 {
+        return;
+    }
+    let scale = BigDecimal::from(active_levels as u64);
+    for norm in norms {
+        *norm = norm.clone() * &scale;
+    }
+}
+
+fn build_representative_noise_refresh_material_circuit<A>(
+    ring_gsw: Arc<RingGswContext<DCRTPoly, A>>,
+    seed_bits: usize,
+    v_bits: usize,
+    graph_seed: [u8; 32],
+    cbd_n: usize,
+    num_slots: usize,
+) -> PolyCircuit<DCRTPoly>
+where
+    A: DecomposeArithmeticGadget<DCRTPoly> + ModularArithmeticPlanner<DCRTPoly>,
+{
+    let ring_dim = ring_gsw.params.ring_dimension() as usize;
+    assert_eq!(num_slots, ring_dim, "num_slots must match ring_dim");
+
+    let mut circuit = ring_gsw.fresh_circuit();
+    let seed_inputs = (0..seed_bits)
+        .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
+        .collect::<Vec<_>>();
+    let decryption_key = circuit.input(1).at(0).as_single_wire();
+    let seed_wires =
+        seed_inputs.iter().flat_map(RingGswCiphertext::sub_circuit_wires).collect::<Vec<_>>();
+    let ciphertext_template = {
+        let mut template_circuit = ring_gsw.fresh_circuit();
+        RingGswCiphertext::input(ring_gsw.clone(), None, &mut template_circuit)
+    };
+    let ciphertext_wire_count =
+        ciphertext_template.sub_circuit_wires().iter().map(|wire| wire.len()).sum::<usize>();
+    let mask_q_chunk_len = ring_dim.checked_mul(v_bits).expect("mask q chunk length overflow");
+    let (q_moduli, _crt_bits, _crt_depth) = ring_gsw.params.to_crt();
+    info!(
+        ring_dim,
+        seed_bits,
+        v_bits,
+        error_range_len = ring_dim,
+        mask_range_len = mask_q_chunk_len,
+        "building representative Goldreich PRG material subcircuit"
+    );
+    let prg_sub_id =
+        circuit.register_sub_circuit(build_representative_noise_refresh_prg_circuit::<A>(
+            ring_gsw.clone(),
+            seed_bits,
+            v_bits,
+            graph_seed,
+            cbd_n,
+            ring_dim,
+            mask_q_chunk_len,
+        ));
+    info!("calling representative Goldreich PRG material subcircuit");
+    let prg_outputs = expand_batched_wires(&circuit.call_sub_circuit(prg_sub_id, seed_wires));
+    info!(
+        prg_output_wires = prg_outputs.len(),
+        "representative Goldreich PRG material subcircuit called"
+    );
+    let material = prg_outputs
+        .chunks_exact(ciphertext_wire_count)
+        .map(|chunk| RingGswCiphertext::from_sub_circuit_outputs(&ciphertext_template, chunk))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        material.len(),
+        ring_dim + mask_q_chunk_len,
+        "representative noise-refresh material output size mismatch"
+    );
+    let (errors, masks) = material.split_at(ring_dim);
+
+    info!(
+        error_ciphertexts = errors.len(),
+        mask_ciphertexts = masks.len(),
+        "building representative error+mask decrypt/merge wires"
+    );
+    let decoded_error = decrypt_error_coefficients_as_polynomial::<DCRTPoly, A, DCRTPolyMatrix>(
+        &mut circuit,
+        errors,
+        decryption_key,
+        BigUint::from(q_moduli[0]),
+    );
+    let full_modulus = ring_gsw.params.modulus();
+    let full_modulus: Arc<BigUint> = full_modulus.into();
+    let mask_plaintext_moduli =
+        mask_plaintext_moduli_from_full_modulus(full_modulus.as_ref(), v_bits);
+    let decoded_mask = decrypt_bit_decomposed_polynomial::<DCRTPoly, A, DCRTPolyMatrix>(
+        &mut circuit,
+        masks,
+        decryption_key,
+        &mask_plaintext_moduli,
+    );
+    let decoded = circuit.add_gate(decoded_error, decoded_mask).as_single_wire();
+    circuit.output([decoded]);
+    info!(
+        circuit_inputs = circuit.num_input(),
+        circuit_outputs = circuit.num_output(),
+        "representative error+mask decrypt/merge circuit built"
+    );
+    circuit
+}
+
+fn build_representative_noise_refresh_prg_circuit<A>(
+    ring_gsw: Arc<RingGswContext<DCRTPoly, A>>,
+    seed_bits: usize,
+    v_bits: usize,
+    graph_seed: [u8; 32],
+    cbd_n: usize,
+    error_range_len: usize,
+    mask_range_len: usize,
+) -> PolyCircuit<DCRTPoly>
+where
+    A: DecomposeArithmeticGadget<DCRTPoly> + ModularArithmeticPlanner<DCRTPoly>,
+{
+    let mut circuit = ring_gsw.fresh_circuit();
+    let encrypted_seeds = (0..seed_bits)
+        .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
+        .collect::<Vec<_>>();
+    info!(
+        seed_bits,
+        error_range_len, mask_range_len, "generating representative Goldreich PRG material ranges"
+    );
+    let material = evaluate_goldreich_noise_refresh_material_ranges(
+        &mut circuit,
+        ring_gsw,
+        &encrypted_seeds,
+        v_bits,
+        graph_seed,
+        cbd_n,
+        0,
+        0,
+        error_range_len,
+        &[(0, mask_range_len)],
+    );
+    info!(
+        error_ciphertexts = material.errors.len(),
+        mask_ciphertexts = material.masks.len(),
+        "representative Goldreich PRG material ranges generated"
+    );
+    circuit.output(
+        material
+            .errors
+            .iter()
+            .chain(material.masks.iter())
+            .flat_map(RingGswCiphertext::sub_circuit_wires),
+    );
+    circuit
+}
+
+fn expand_batched_wires(wires: &[BatchedWire]) -> Vec<BatchedWire> {
+    wires.iter().flat_map(|wire| (0..wire.len()).map(|idx| wire.at(idx))).collect()
+}
+
+fn representative_material_decryption_error_norm<A>(
     ring_gsw: Arc<RingGswContext<DCRTPoly, A>>,
     seed_bits: usize,
     v_bits: usize,
@@ -373,7 +633,7 @@ fn material_decryption_error_norms<A>(
     ring_gsw_error_sigma: f64,
     num_slots: usize,
     output_ctx: Arc<SimulatorContext>,
-) -> Vec<PolyMatrixNorm>
+) -> PolyMatrixNorm
 where
     A: DecomposeArithmeticGadget<DCRTPoly> + ModularArithmeticPlanner<DCRTPoly>,
 {
@@ -388,71 +648,64 @@ where
     // decoded-column norm.
     let ring_dim = ring_gsw.params.ring_dimension() as usize;
     assert_eq!(num_slots, ring_dim, "num_slots must match ring_dim");
-    let (_q_moduli, _crt_bits, crt_depth) = ring_gsw.params.to_crt();
-    let log_base_q = ring_gsw.params.modulus_digits();
-    let output_sizes =
-        goldreich_noise_refresh_output_sizes(ring_dim, log_base_q, crt_depth, v_bits);
     let mask_q_chunk_len = ring_dim.checked_mul(v_bits).expect("mask q chunk length overflow");
 
     let zero = || PolyMatrixNorm::new(output_ctx.clone(), 1, 1, BigDecimal::from(0u32), None);
-    (0..num_slots)
-        .into_par_iter()
-        .flat_map_iter(|slot_idx| {
-            let mut circuit = ring_gsw.fresh_circuit();
-            let encrypted_seeds = (0..seed_bits)
-                .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
-                .collect::<Vec<_>>();
-            let material = evaluate_goldreich_noise_refresh_material(
-                &mut circuit,
-                ring_gsw.clone(),
-                &encrypted_seeds,
-                v_bits,
-                graph_seed,
-                cbd_n,
-                slot_idx as u64,
+    let mut circuit = ring_gsw.fresh_circuit();
+    let encrypted_seeds = (0..seed_bits)
+        .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
+        .collect::<Vec<_>>();
+    info!(
+        ring_dim,
+        mask_q_chunk_len, "estimating representative Ring-GSW ciphertext decrypt error material"
+    );
+    let material = evaluate_goldreich_noise_refresh_material_ranges(
+        &mut circuit,
+        ring_gsw,
+        &encrypted_seeds,
+        v_bits,
+        graph_seed,
+        cbd_n,
+        0,
+        0,
+        ring_dim,
+        &[(0, mask_q_chunk_len)],
+    );
+    assert_eq!(material.errors.len(), ring_dim);
+    assert_eq!(material.masks.len(), mask_q_chunk_len);
+    info!(
+        error_ciphertexts = material.errors.len(),
+        mask_ciphertexts = material.masks.len(),
+        "representative Ring-GSW ciphertext decrypt error material generated"
+    );
+
+    let mut collapsed_norm = zero();
+    for coeff_idx in 0..ring_dim {
+        let error_norm =
+            material.errors[coeff_idx].estimate_decryption_error_norm(ring_gsw_error_sigma);
+        let mut coeff_norm = PolyMatrixNorm::new(
+            output_ctx.clone(),
+            error_norm.nrow,
+            error_norm.ncol,
+            error_norm.poly_norm.norm,
+            error_norm.zero_rows,
+        );
+
+        let mask_start = coeff_idx * v_bits;
+        for mask_bit in &material.masks[mask_start..mask_start + v_bits] {
+            let mask_norm = mask_bit.estimate_decryption_error_norm(ring_gsw_error_sigma);
+            coeff_norm += PolyMatrixNorm::new(
+                output_ctx.clone(),
+                mask_norm.nrow,
+                mask_norm.ncol,
+                mask_norm.poly_norm.norm,
+                mask_norm.zero_rows,
             );
-            assert_eq!(material.errors.len(), output_sizes.cbd_values);
-            assert_eq!(material.masks.len(), output_sizes.mask_bits);
-
-            (0..crt_depth * log_base_q)
-                .into_par_iter()
-                .map(|flat_idx| {
-                    let crt_idx = flat_idx / log_base_q;
-                    let digit_idx = flat_idx % log_base_q;
-                    let mut collapsed_norm = zero();
-                    for coeff_idx in 0..ring_dim {
-                        let error_idx = digit_idx * ring_dim + coeff_idx;
-                        let error_norm = material.errors[error_idx]
-                            .estimate_decryption_error_norm(ring_gsw_error_sigma);
-                        let mut coeff_norm = PolyMatrixNorm::new(
-                            output_ctx.clone(),
-                            error_norm.nrow,
-                            error_norm.ncol,
-                            error_norm.poly_norm.norm,
-                            error_norm.zero_rows,
-                        );
-
-                        let mask_start = crt_idx * log_base_q * mask_q_chunk_len +
-                            digit_idx * mask_q_chunk_len +
-                            coeff_idx * v_bits;
-                        for mask_bit in &material.masks[mask_start..mask_start + v_bits] {
-                            let mask_norm =
-                                mask_bit.estimate_decryption_error_norm(ring_gsw_error_sigma);
-                            coeff_norm += PolyMatrixNorm::new(
-                                output_ctx.clone(),
-                                mask_norm.nrow,
-                                mask_norm.ncol,
-                                mask_norm.poly_norm.norm,
-                                mask_norm.zero_rows,
-                            );
-                        }
-                        collapsed_norm += coeff_norm;
-                    }
-                    collapsed_norm
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
+        }
+        collapsed_norm += coeff_norm;
+    }
+    info!("representative Ring-GSW ciphertext decrypt error norm estimated");
+    collapsed_norm
 }
 
 fn biguint_to_decimal(value: &BigUint) -> BigDecimal {

@@ -151,6 +151,14 @@ impl SlotTransferEvaluator<ErrorNorm> for NormBggPolyEncodingSTEvaluator {
         let matrix_norm = &self.const_term + &input_vector_term + &transfer_plaintext_term;
         ErrorNorm { matrix_norm, plaintext_norm }
     }
+
+    fn slot_reduce(&self, _: &(), inputs: &[ErrorNorm], _: usize, _: GateId) -> ErrorNorm {
+        inputs
+            .iter()
+            .cloned()
+            .reduce(|acc, input| &acc + &input)
+            .expect("slot_reduce input must be non-empty")
+    }
 }
 
 impl AffineSlotTransferEvaluator for NormBggPolyEncodingSTEvaluator {

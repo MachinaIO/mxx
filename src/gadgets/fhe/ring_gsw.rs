@@ -374,7 +374,21 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             circuit.register_sub_circuit(Arc::clone(&super_batch_subcircuit));
         let width_tail_columns = width % super_batch_columns;
         let width_tail_subcircuit_id = if width_tail_columns > 0 {
-            let width_tail_batch_tail_columns = width_tail_columns % batch_columns;
+            let width_tail_batch_columns = batch_columns.min(width_tail_columns);
+            let width_tail_batch_subcircuit = if width_tail_batch_columns == batch_columns {
+                Arc::clone(&batch_subcircuit)
+            } else {
+                Arc::new(Self::mul_columns_batch_subcircuit(
+                    source_circuit,
+                    template_ctx,
+                    active_levels,
+                    level_offset,
+                    width,
+                    width_tail_batch_columns,
+                    Arc::clone(&mul_column_subcircuit),
+                ))
+            };
+            let width_tail_batch_tail_columns = width_tail_columns % width_tail_batch_columns;
             let width_tail_batch_tail_subcircuit = (width_tail_batch_tail_columns > 0).then(|| {
                 Arc::new(Self::mul_columns_batch_subcircuit(
                     source_circuit,
@@ -393,8 +407,8 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 level_offset,
                 width,
                 width_tail_columns,
-                batch_columns,
-                Arc::clone(&batch_subcircuit),
+                width_tail_batch_columns,
+                width_tail_batch_subcircuit,
                 width_tail_batch_tail_subcircuit,
             ))))
         } else {
@@ -1521,16 +1535,12 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             gadget_len
         );
 
-        let gadget_constants = A::gadget_matrix::<M>(
+        let gadget_constants = A::gadget_row_coefficients(
             &first.ctx.params,
             first.ctx.arith_ctx.as_ref(),
             Some(first.ctx.active_levels),
             Some(first.ctx.level_offset),
-        )
-        .get_row(0)
-        .into_par_iter()
-        .map(|entry| entry.coeffs_biguints()[0].clone())
-        .collect::<Vec<_>>();
+        );
         assert_eq!(
             gadget_constants.len(),
             gadget_len,
@@ -1544,33 +1554,20 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             .iter()
             .fold(BigUint::from(1u64), |acc, &q_i| acc * BigUint::from(q_i)) /
             &plaintext_modulus;
-        let scaled_poly = P::from_biguint_to_constant(&first.ctx.params, scaled);
-        let scaled_g_inverse_matrix = A::gadget_decomposed::<M>(
+        let scaled_g_inverse = A::gadget_decomposed_scalar_coefficients(
             &first.ctx.params,
             first.ctx.arith_ctx.as_ref(),
-            &M::from_poly_vec_column(&first.ctx.params, vec![scaled_poly]),
+            &scaled,
             Some(first.ctx.active_levels),
             Some(first.ctx.level_offset),
         );
-        let (scaled_rows, scaled_cols) = scaled_g_inverse_matrix.size();
         assert_eq!(
-            scaled_cols, 1,
-            "scaled gadget decomposition column count {} must equal 1",
-            scaled_cols
+            scaled_g_inverse.len(),
+            gadget_len,
+            "scaled gadget decomposition row count {} must match gadget_len {}",
+            scaled_g_inverse.len(),
+            gadget_len
         );
-        let scaled_g_inverse = (0..scaled_rows)
-            .map(|row_idx| {
-                let coeff = scaled_g_inverse_matrix.entry(row_idx, 0).coeffs_biguints()[0].clone();
-                active_q_moduli
-                    .iter()
-                    .map(|&q_i| {
-                        (&coeff % BigUint::from(q_i))
-                            .to_u64()
-                            .expect("scaled gadget decomposition residue must fit in u64")
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
         let batch_secret_key = wire_secret_key;
 
         let mut prepared_tops = Vec::with_capacity(ciphertexts.len());

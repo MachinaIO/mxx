@@ -163,7 +163,7 @@ pub(crate) fn resolve_nested_rns_active_window(
 ///
 /// Matrix/gadget encoders use these coefficients to rebuild one sparse q-level into the ambient
 /// modulus exactly the same way `NestedRnsPoly::reconstruct` does at the circuit level.
-fn nested_rns_level_reconstruction_coeffs(active_q_moduli: &[u64]) -> Vec<BigUint> {
+pub(crate) fn nested_rns_level_reconstruction_coeffs(active_q_moduli: &[u64]) -> Vec<BigUint> {
     let active_modulus =
         active_q_moduli.iter().fold(BigUint::from(1u64), |acc, &q_i| acc * BigUint::from(q_i));
     active_q_moduli

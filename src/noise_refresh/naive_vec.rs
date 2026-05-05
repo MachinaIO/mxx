@@ -200,6 +200,94 @@ fn estimate_summary(unit: CircuitBenchEstimate) -> CircuitBenchSummary {
     scaled_estimate_summary(unit, 1)
 }
 
+/// Estimates the full material circuit without constructing every slot/digit PRG subcircuit.
+///
+/// The concrete material circuit runs the same full-active-level PRG, decrypt, and merge
+/// subcircuits once for every `(slot, digit)` pair. Benchmark estimation only needs the repeated
+/// subcircuit summaries, so this helper measures one representative pair and scales the total work
+/// by the concrete pair count while preserving the one-pair latency.
+fn estimate_noise_refresh_material_circuit_bench<M, A, E, BE>(
+    ring_gsw: Arc<RingGswContext<M::P, A>>,
+    seed_bits: usize,
+    v_bits: usize,
+    graph_seed: [u8; 32],
+    cbd_n: usize,
+    num_slots: usize,
+    debug_reuse_single_material: bool,
+    estimator: &BE,
+) -> CircuitBenchSummary
+where
+    M: PolyMatrix,
+    M::P: 'static,
+    A: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
+    E: Evaluable<P = M::P>,
+    BE: BenchEstimator<E> + Sync,
+{
+    if debug_reuse_single_material {
+        let material_circuit = build_noise_refresh_material_circuit::<M::P, A, M>(
+            ring_gsw, seed_bits, v_bits, graph_seed, cbd_n, num_slots, true,
+        );
+        return estimator.estimate_circuit_bench(&material_circuit);
+    }
+
+    let ring_dim = ring_gsw.params.ring_dimension() as usize;
+    assert_eq!(num_slots, ring_dim, "num_slots must match ring_dim");
+    let log_base_q = ring_gsw.params.modulus_digits();
+    let (_q_moduli, _crt_bits, crt_depth) = ring_gsw.params.to_crt();
+    let material_seed_bits = seed_bits;
+    let ciphertext_wire_count = {
+        let mut circuit = ring_gsw.fresh_circuit();
+        RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit)
+            .sub_circuit_wires()
+            .iter()
+            .map(|wire| wire.len())
+            .sum::<usize>()
+    };
+    let main_input_count = material_seed_bits
+        .checked_mul(ciphertext_wire_count)
+        .and_then(|count| count.checked_add(1))
+        .expect("noise-refresh material benchmark input count overflow");
+    let mask_q_chunk_len = ring_dim.checked_mul(v_bits).expect("mask q chunk length overflow");
+    let mask_ranges = (0..crt_depth)
+        .map(|crt_idx| (crt_idx * log_base_q * mask_q_chunk_len, mask_q_chunk_len))
+        .collect::<Vec<_>>();
+    let prg_circuit = build_goldreich_encrypted_seed_material_ranges::<M::P, A>(
+        ring_gsw.clone(),
+        material_seed_bits,
+        v_bits,
+        graph_seed,
+        cbd_n,
+        0,
+        0,
+        ring_dim,
+        &mask_ranges,
+    );
+    let decrypt_circuit =
+        build_refreshed_wire_digit_all_crt_decrypt::<M::P, A, M>(ring_gsw.clone(), v_bits);
+    let merge_circuit = build_refreshed_wire_digit_all_crt_merge::<M::P>(&ring_gsw.params);
+    let task_count =
+        num_slots.checked_mul(log_base_q).expect("noise-refresh material task count overflow");
+    let main_inputs = scaled_estimate_summary(estimator.estimate_input(), main_input_count);
+    let per_slot_digit = sequential_summaries(&[
+        estimator.estimate_circuit_bench(&prg_circuit),
+        estimator.estimate_circuit_bench(&decrypt_circuit),
+        estimator.estimate_circuit_bench(&merge_circuit),
+    ]);
+    let material_summary =
+        sequential_summaries(&[main_inputs, scaled_summary(per_slot_digit, task_count)]);
+    debug!(
+        num_slots,
+        crt_depth,
+        log_base_q,
+        v_bits,
+        task_count,
+        main_input_count,
+        ?material_summary,
+        "estimated noise-refresh material benchmark from representative full-active-level subcircuits"
+    );
+    material_summary
+}
+
 fn refresh_slot_id(refresh_id: &[u8], label: &[u8], idx: usize) -> Vec<u8> {
     let mut id = Vec::with_capacity(refresh_id.len() + label.len() + std::mem::size_of::<usize>());
     id.extend_from_slice(refresh_id);
@@ -469,7 +557,7 @@ where
         let combine_task_count =
             num_slots.checked_mul(crt_depth).expect("noise-refresh combine task count overflow");
 
-        let material_circuit = build_noise_refresh_material_circuit::<M::P, A, M>(
+        let public_material_summary = estimate_noise_refresh_material_circuit_bench::<M, A, _, _>(
             self.ring_gsw.clone(),
             self.seed_bits,
             self.v_bits,
@@ -477,9 +565,8 @@ where
             self.cbd_n,
             num_slots,
             self.debug_reuse_single_material,
+            public_key_estimator,
         );
-        let public_material_summary =
-            public_key_estimator.estimate_circuit_bench(&material_circuit);
 
         let scalar_target = [BigUint::from(1u32)];
         let pk_matrix_mul = public_key_estimator.estimate_large_scalar_mul(&scalar_target);
@@ -547,7 +634,7 @@ where
         let combine_task_count =
             num_slots.checked_mul(crt_depth).expect("noise-refresh combine task count overflow");
 
-        let material_circuit = build_noise_refresh_material_circuit::<M::P, A, M>(
+        let online_material_summary = estimate_noise_refresh_material_circuit_bench::<M, A, _, _>(
             self.ring_gsw.clone(),
             self.seed_bits,
             self.v_bits,
@@ -555,8 +642,8 @@ where
             self.cbd_n,
             num_slots,
             self.debug_reuse_single_material,
+            encoding_estimator,
         );
-        let online_material_summary = encoding_estimator.estimate_circuit_bench(&material_circuit);
 
         let scalar_target = [BigUint::from(1u32)];
         let enc_matrix_mul = encoding_estimator.estimate_large_scalar_mul(&scalar_target);

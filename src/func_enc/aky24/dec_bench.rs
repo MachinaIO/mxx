@@ -4,7 +4,7 @@ use crate::{
     func_enc::aky24::{
         Aky24Func, Aky24Params, build_func_circuit, build_goldreich_prg_circuit,
         build_goldreich_prg_range_circuit, build_prf_mask_circuit, build_ring_gsw_context,
-        keygen_bench::{scale_estimate, scale_summary, sequential_summaries},
+        keygen_bench::{scale_estimate, scale_summary_with_latency, sequential_summaries},
     },
     gadgets::arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner, NestedRnsPoly},
     matrix::PolyMatrix,
@@ -98,12 +98,18 @@ impl<'a, EncBE> Aky24DecBenchEstimator<'a, EncBE> {
         assert!(shape.wire_count > 0, "wire_count must be positive");
         assert!(shape.public_prf_seed_bits > 0, "public_prf_seed_bits must be positive");
 
+        tracing::info!("AKY24 dec benchmark estimating function circuit");
         let function_circuit =
             self.encoding_estimator.estimate_circuit_bench(&build_func_circuit(params, func));
+        tracing::info!("AKY24 dec benchmark estimating selected-half PRG");
         let selected_half_prg = self.estimate_selected_half_prg(params, shape);
+        tracing::info!("AKY24 dec benchmark estimating noise-refresh online");
         let noise_refresh_online = self.estimate_noise_refresh_online::<M, SH, TD>(params, shape);
+        tracing::info!("AKY24 dec benchmark estimating final mask PRG");
         let final_mask_prg = self.estimate_final_mask_prg(params, shape);
+        tracing::info!("AKY24 dec benchmark estimating final mask decrypt");
         let final_mask_decrypt = self.estimate_final_mask_decrypt(params);
+        tracing::info!("AKY24 dec benchmark estimating final decode");
         let final_decode = self.estimate_final_decode();
         let total = sequential_summaries(&[
             function_circuit,
@@ -126,8 +132,9 @@ impl<'a, EncBE> Aky24DecBenchEstimator<'a, EncBE> {
 
     /// Estimates all selected-half PRG evaluations performed during PRF seed traversal.
     ///
-    /// A representative range circuit is measured and then scaled by public PRF rounds. The
-    /// circuit already contains all flattened Ring-GSW input wires.
+    /// A single representative output-bit range circuit is measured and then scaled by public PRF
+    /// rounds and generated seed bits. The circuit still uses the configured full-active-level
+    /// Ring-GSW arithmetic.
     fn estimate_selected_half_prg<M, TD>(
         &self,
         params: &Aky24Params<M, TD>,
@@ -138,17 +145,15 @@ impl<'a, EncBE> Aky24DecBenchEstimator<'a, EncBE> {
         M::P: 'static,
         EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
     {
-        let generated_seed_bits =
-            if params.debug_reuse_single_prg_sample() { 1 } else { params.prf_seed_bits() };
-        let circuit = build_goldreich_prg_range_circuit(
-            params,
-            0,
-            2 * params.prf_seed_bits(),
-            0,
-            generated_seed_bits,
-        );
+        let generated_seed_bits = params.prf_seed_bits();
+        let circuit =
+            build_goldreich_prg_range_circuit(params, 0, 2 * params.prf_seed_bits(), 0, 1);
         let unit = self.encoding_estimator.estimate_circuit_bench(&circuit);
-        scale_summary(unit, shape.public_prf_seed_bits)
+        scale_summary_with_latency(
+            unit,
+            shape.public_prf_seed_bits * generated_seed_bits,
+            shape.public_prf_seed_bits,
+        )
     }
 
     /// Estimates the online side of all AKY24 noise-refresh calls during decryption.
@@ -166,8 +171,7 @@ impl<'a, EncBE> Aky24DecBenchEstimator<'a, EncBE> {
         EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
         NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
     {
-        let generated_seed_bits =
-            if params.debug_reuse_single_prg_sample() { 1 } else { params.prf_seed_bits() };
+        let generated_seed_bits = params.prf_seed_bits();
         let mut circuit = crate::circuit::PolyCircuit::new();
         let refresher = NoiseRefresherNaiveVec::<M, NestedRnsPoly<M::P>, SH>::new(
             build_ring_gsw_context(params, &mut circuit),
@@ -178,13 +182,18 @@ impl<'a, EncBE> Aky24DecBenchEstimator<'a, EncBE> {
             params.noise_refresh_hash_key,
         );
         let unit = refresher.estimate_online_eval_bench(self.encoding_estimator);
-        scale_summary(unit, shape.public_prf_seed_bits * generated_seed_bits * shape.wire_count)
+        scale_summary_with_latency(
+            unit,
+            shape.public_prf_seed_bits * generated_seed_bits * shape.wire_count,
+            shape.public_prf_seed_bits,
+        )
     }
 
     /// Estimates the final PRG expansion from refreshed seed encodings to PRF mask bits.
     ///
-    /// The representative final-mask PRG circuit already contains all flattened Ring-GSW seed
-    /// input wires and mask output wires.
+    /// A single representative final-mask output bit circuit is measured and then scaled by the
+    /// configured `prf_mask_output_coeff_bits`. The circuit still uses the configured
+    /// full-active-level Ring-GSW arithmetic.
     fn estimate_final_mask_prg<M, TD>(
         &self,
         params: &Aky24Params<M, TD>,
@@ -195,17 +204,10 @@ impl<'a, EncBE> Aky24DecBenchEstimator<'a, EncBE> {
         M::P: 'static,
         EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
     {
-        let generated_mask_output_bits = if params.debug_reuse_single_prg_sample() {
-            1
-        } else {
-            params.prf_mask_output_coeff_bits()
-        };
-        let circuit = build_goldreich_prg_circuit(
-            params,
-            shape.public_prf_seed_bits,
-            generated_mask_output_bits,
-        );
-        self.encoding_estimator.estimate_circuit_bench(&circuit)
+        let generated_mask_output_bits = params.prf_mask_output_coeff_bits();
+        let circuit = build_goldreich_prg_circuit(params, shape.public_prf_seed_bits, 1);
+        let unit = self.encoding_estimator.estimate_circuit_bench(&circuit);
+        scale_summary_with_latency(unit, generated_mask_output_bits, 1)
     }
 
     /// Estimates the final scalar mask-decrypt circuit evaluated during decryption.

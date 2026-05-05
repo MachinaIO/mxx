@@ -90,13 +90,19 @@ impl<'a, PKBE> Aky24KeygenBenchEstimator<'a, PKBE> {
         assert!(shape.wire_count > 0, "wire_count must be positive");
         assert!(shape.public_prf_seed_bits > 0, "public_prf_seed_bits must be positive");
 
+        tracing::info!("AKY24 keygen benchmark estimating function circuit");
         let function_circuit =
             self.public_key_estimator.estimate_circuit_bench(&build_func_circuit(params, func));
+        tracing::info!("AKY24 keygen benchmark estimating selected-half PRG");
         let selected_half_prg = self.estimate_selected_half_prg(params, shape);
+        tracing::info!("AKY24 keygen benchmark estimating noise-refresh preprocess");
         let noise_refresh_preprocess =
             self.estimate_noise_refresh_preprocess::<M, SH, TD>(params, shape);
+        tracing::info!("AKY24 keygen benchmark estimating final mask PRG");
         let final_mask_prg = self.estimate_final_mask_prg(params, shape);
+        tracing::info!("AKY24 keygen benchmark estimating final mask decrypt");
         let final_mask_decrypt = self.estimate_final_mask_decrypt(params);
+        tracing::info!("AKY24 keygen benchmark estimating trapdoor preimages");
         let trapdoor_preimages = self.estimate_trapdoor_preimages(params, shape);
         let total = sequential_summaries(&[
             function_circuit,
@@ -119,8 +125,9 @@ impl<'a, PKBE> Aky24KeygenBenchEstimator<'a, PKBE> {
 
     /// Estimates all selected-half PRG evaluations used while walking the public PRF seed.
     ///
-    /// A single representative range circuit is measured and then scaled by the number of public
-    /// PRF rounds. The circuit already contains all flattened Ring-GSW input wires.
+    /// A single representative output-bit range circuit is measured and then scaled by the number
+    /// of public PRF rounds and generated seed bits. The circuit still uses the configured
+    /// full-active-level Ring-GSW arithmetic.
     fn estimate_selected_half_prg<M, TD>(
         &self,
         params: &Aky24Params<M, TD>,
@@ -131,17 +138,15 @@ impl<'a, PKBE> Aky24KeygenBenchEstimator<'a, PKBE> {
         M::P: 'static,
         PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + Sync,
     {
-        let generated_seed_bits =
-            if params.debug_reuse_single_prg_sample() { 1 } else { params.prf_seed_bits() };
-        let circuit = build_goldreich_prg_range_circuit(
-            params,
-            0,
-            2 * params.prf_seed_bits(),
-            0,
-            generated_seed_bits,
-        );
+        let generated_seed_bits = params.prf_seed_bits();
+        let circuit =
+            build_goldreich_prg_range_circuit(params, 0, 2 * params.prf_seed_bits(), 0, 1);
         let unit = self.public_key_estimator.estimate_circuit_bench(&circuit);
-        scale_summary(unit, shape.public_prf_seed_bits)
+        scale_summary_with_latency(
+            unit,
+            shape.public_prf_seed_bits * generated_seed_bits,
+            shape.public_prf_seed_bits,
+        )
     }
 
     /// Estimates the public-key preprocessing side of all AKY24 noise-refresh calls.
@@ -159,8 +164,7 @@ impl<'a, PKBE> Aky24KeygenBenchEstimator<'a, PKBE> {
         PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + Sync,
         NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
     {
-        let generated_seed_bits =
-            if params.debug_reuse_single_prg_sample() { 1 } else { params.prf_seed_bits() };
+        let generated_seed_bits = params.prf_seed_bits();
         let mut circuit = crate::circuit::PolyCircuit::new();
         let refresher = NoiseRefresherNaiveVec::<M, NestedRnsPoly<M::P>, SH>::new(
             build_ring_gsw_context(params, &mut circuit),
@@ -171,13 +175,18 @@ impl<'a, PKBE> Aky24KeygenBenchEstimator<'a, PKBE> {
             params.noise_refresh_hash_key,
         );
         let unit = refresher.estimate_preprocess_bench(self.public_key_estimator);
-        scale_summary(unit, shape.public_prf_seed_bits * generated_seed_bits * shape.wire_count)
+        scale_summary_with_latency(
+            unit,
+            shape.public_prf_seed_bits * generated_seed_bits * shape.wire_count,
+            shape.public_prf_seed_bits,
+        )
     }
 
     /// Estimates the final PRG expansion from the refreshed seed to PRF mask bits.
     ///
-    /// The circuit output size is `prf_mask_output_coeff_bits` in normal mode and one bit in the
-    /// debug reuse mode used by tests.
+    /// A single representative mask-output bit circuit is measured and then scaled by the
+    /// configured `prf_mask_output_coeff_bits`. The circuit still uses the configured
+    /// full-active-level Ring-GSW arithmetic.
     fn estimate_final_mask_prg<M, TD>(
         &self,
         params: &Aky24Params<M, TD>,
@@ -188,17 +197,10 @@ impl<'a, PKBE> Aky24KeygenBenchEstimator<'a, PKBE> {
         M::P: 'static,
         PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + Sync,
     {
-        let generated_mask_output_bits = if params.debug_reuse_single_prg_sample() {
-            1
-        } else {
-            params.prf_mask_output_coeff_bits()
-        };
-        let circuit = build_goldreich_prg_circuit(
-            params,
-            shape.public_prf_seed_bits,
-            generated_mask_output_bits,
-        );
-        self.public_key_estimator.estimate_circuit_bench(&circuit)
+        let generated_mask_output_bits = params.prf_mask_output_coeff_bits();
+        let circuit = build_goldreich_prg_circuit(params, shape.public_prf_seed_bits, 1);
+        let unit = self.public_key_estimator.estimate_circuit_bench(&circuit);
+        scale_summary_with_latency(unit, generated_mask_output_bits, 1)
     }
 
     /// Estimates the final scalar mask-decrypt circuit evaluated during keygen.
@@ -226,8 +228,7 @@ impl<'a, PKBE> Aky24KeygenBenchEstimator<'a, PKBE> {
     where
         M: PolyMatrix,
     {
-        let generated_seed_bits =
-            if params.debug_reuse_single_prg_sample() { 1 } else { params.prf_seed_bits() };
+        let generated_seed_bits = params.prf_seed_bits();
         let (_, _, crt_depth) = params.poly_params.to_crt();
         let refresh_preimages = shape
             .public_prf_seed_bits
@@ -257,12 +258,26 @@ pub(super) fn scale_estimate(estimate: CircuitBenchEstimate, count: usize) -> Ci
 /// This helper is used for PRG, refresh, and decrypt stages where a representative circuit or stage
 /// estimate is repeated many times with independent inputs.
 pub(super) fn scale_summary(summary: CircuitBenchSummary, count: usize) -> CircuitBenchSummary {
-    let total_time = summary.total_time * count as f64;
+    scale_summary_with_latency(summary, count, 1)
+}
+
+/// Scales total work and latency by separate counts.
+///
+/// This is used when a stage has many independent per-wire tasks but fewer serial latency steps.
+/// For example, AKY24 noise refresh has one serial step per public PRF round, while the generated
+/// seed bits and flattened Ring-GSW wires inside that round can be modeled as parallel work.
+pub(super) fn scale_summary_with_latency(
+    summary: CircuitBenchSummary,
+    total_count: usize,
+    latency_count: usize,
+) -> CircuitBenchSummary {
+    let total_time = summary.total_time * total_count as f64;
+    let latency = summary.latency * latency_count as f64;
     let max_parallelism = summary
         .max_parallelism
-        .checked_mul(count as u128)
+        .checked_mul(total_count as u128)
         .expect("AKY24 benchmark parallelism overflow while scaling summary");
-    let scaled = CircuitBenchSummary::new(total_time, summary.latency, max_parallelism);
+    let scaled = CircuitBenchSummary::new(total_time, latency, max_parallelism);
     #[cfg(feature = "gpu")]
     {
         scaled.with_peak_vram(summary.peak_vram)

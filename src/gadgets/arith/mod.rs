@@ -184,6 +184,13 @@ pub trait DecomposeArithmeticGadget<P: Poly>: ModularArithmeticGadget<P> {
         level_offset: Option<usize>,
     ) -> M;
 
+    fn gadget_row_coefficients(
+        params: &P::Params,
+        ctx: &Self::Context,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+    ) -> Vec<BigUint>;
+
     fn gadget_decomposed<M: PolyMatrix<P = P>>(
         params: &P::Params,
         ctx: &Self::Context,
@@ -191,6 +198,14 @@ pub trait DecomposeArithmeticGadget<P: Poly>: ModularArithmeticGadget<P> {
         enable_levels: Option<usize>,
         level_offset: Option<usize>,
     ) -> M;
+
+    fn gadget_decomposed_scalar_coefficients(
+        params: &P::Params,
+        ctx: &Self::Context,
+        target: &BigUint,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+    ) -> Vec<Vec<u64>>;
 
     fn gadget_decomposition_norm_bound(
         ctx: &Self::Context,

@@ -966,6 +966,27 @@ impl<P: Poly + 'static> DecomposeArithmeticGadget<P> for MontgomeryPoly<P> {
         M::from_poly_vec_row(params, row)
     }
 
+    fn gadget_row_coefficients(
+        _params: &P::Params,
+        ctx: &Self::Context,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+    ) -> Vec<BigUint> {
+        let level_offset = level_offset.unwrap_or(0);
+        let active_levels = ctx.active_levels(enable_levels, Some(level_offset));
+        let radix = Self::digit_radix(ctx);
+        (0..active_levels * ctx.num_limbs)
+            .into_par_iter()
+            .map(|entry_idx| {
+                let q_idx = entry_idx / ctx.num_limbs;
+                let digit_idx = entry_idx % ctx.num_limbs;
+                let value = radix
+                    .pow(u32::try_from(digit_idx).expect("Montgomery digit index must fit in u32"));
+                ctx.sparse_native_constant(enable_levels, level_offset, q_idx, &value)
+            })
+            .collect()
+    }
+
     fn gadget_decomposed<M: PolyMatrix<P = P>>(
         params: &P::Params,
         ctx: &Self::Context,
@@ -1022,6 +1043,35 @@ impl<P: Poly + 'static> DecomposeArithmeticGadget<P> for MontgomeryPoly<P> {
         }
 
         M::from_poly_vec(params, decomposed)
+    }
+
+    fn gadget_decomposed_scalar_coefficients(
+        _params: &P::Params,
+        ctx: &Self::Context,
+        target: &BigUint,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+    ) -> Vec<Vec<u64>> {
+        let level_offset = level_offset.unwrap_or(0);
+        let active_q_moduli = &ctx.q_moduli[ctx.active_range(enable_levels, level_offset)];
+        let mut rows = Vec::with_capacity(active_q_moduli.len() * ctx.num_limbs);
+        for (q_idx, &q_i) in active_q_moduli.iter().enumerate() {
+            let residue = target % BigUint::from(q_i);
+            for digit in Self::decompose_regular_value(ctx, &residue) {
+                let coeff = ctx.sparse_native_constant(enable_levels, level_offset, q_idx, &digit);
+                rows.push(
+                    active_q_moduli
+                        .iter()
+                        .map(|&q_j| {
+                            (&coeff % BigUint::from(q_j))
+                                .to_u64()
+                                .expect("decomposition residue must fit in u64")
+                        })
+                        .collect(),
+                );
+            }
+        }
+        rows
     }
 
     fn gadget_decomposition_norm_bound(

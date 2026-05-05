@@ -722,6 +722,13 @@ where
         let mask_output_bits = params.prf_mask_output_coeff_bits();
         let generated_mask_output_bits =
             if params.debug_reuse_single_prg_sample() { 1 } else { mask_output_bits };
+        info!(
+            mask_output_bits,
+            generated_mask_output_bits,
+            seed_wire_count = seed_wires.len(),
+            "AKY24 PRF mask dec evaluating final mask expansion PRG circuit"
+        );
+        let started = Instant::now();
         let mask_output_wires = if params.debug_reuse_single_prg_sample() {
             let plaintext_wires = debug_sample_prg_plaintext_wires::<M::P>(
                 &params.poly_params,
@@ -763,6 +770,11 @@ where
                 None,
             )
         };
+        info!(
+            mask_output_wire_count = mask_output_wires.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "AKY24 PRF mask dec evaluated final mask expansion PRG circuit"
+        );
         assert_eq!(
             mask_output_wires.len(),
             generated_mask_output_bits * wire_count,
@@ -785,6 +797,11 @@ where
             mask_inputs.extend(mask_output_wires);
         }
         let mask_circuit = build_prf_mask_circuit(params);
+        info!(
+            input_count = mask_inputs.len(),
+            "AKY24 PRF mask dec evaluating final scalar mask decrypt circuit"
+        );
+        let started = Instant::now();
         let evaluated = mask_circuit.eval(
             &params.poly_params,
             one.clone(),
@@ -794,6 +811,11 @@ where
                 .as_ref()
                 .map(|evaluator| evaluator as &dyn SlotTransferEvaluator<NaiveBGGEncodingVec<M>>),
             None,
+        );
+        info!(
+            evaluated_count = evaluated.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "AKY24 PRF mask dec evaluated final scalar mask decrypt circuit"
         );
         let evaluated_encoding = evaluated
             .first()
@@ -1243,6 +1265,18 @@ where
     M: PolyMatrix,
     M::P: 'static,
 {
+    build_ring_gsw_context_with_enable_levels(params, circuit, params.ring_gsw_enable_levels)
+}
+
+fn build_ring_gsw_context_with_enable_levels<M, TD>(
+    params: &Aky24Params<M, TD>,
+    circuit: &mut PolyCircuit<M::P>,
+    enable_levels: Option<usize>,
+) -> Arc<NestedRnsRingGswContext<M::P>>
+where
+    M: PolyMatrix,
+    M::P: 'static,
+{
     let nested_rns_context = Arc::new(NestedRnsPolyContext::setup(
         circuit,
         &params.poly_params,
@@ -1250,14 +1284,14 @@ where
         params.ring_gsw_context.max_unreduced_muls,
         params.ring_gsw_context.scale,
         false,
-        params.ring_gsw_enable_levels,
+        enable_levels,
     ));
     Arc::new(NestedRnsRingGswContext::<M::P>::from_arith_context(
         circuit,
         &params.poly_params,
         params.n(),
         nested_rns_context,
-        params.ring_gsw_enable_levels,
+        enable_levels,
         Some(params.ring_gsw_level_offset),
     ))
 }
@@ -1311,6 +1345,28 @@ where
     M: PolyMatrix,
     M::P: 'static,
 {
+    build_goldreich_prg_range_circuit_with_enable_levels(
+        params,
+        round_idx,
+        conceptual_output_bits,
+        range_start,
+        range_len,
+        params.ring_gsw_enable_levels,
+    )
+}
+
+fn build_goldreich_prg_range_circuit_with_enable_levels<M, TD>(
+    params: &Aky24Params<M, TD>,
+    round_idx: usize,
+    conceptual_output_bits: usize,
+    range_start: usize,
+    range_len: usize,
+    enable_levels: Option<usize>,
+) -> PolyCircuit<M::P>
+where
+    M: PolyMatrix,
+    M::P: 'static,
+{
     let prf_seed_bits = params.prf_seed_bits();
     assert!(
         prf_seed_bits >= 5,
@@ -1323,7 +1379,8 @@ where
         "AKY24 Goldreich PRF output range must fit in the conceptual output"
     );
     let mut circuit = PolyCircuit::new();
-    let ring_gsw_context = build_ring_gsw_context(params, &mut circuit);
+    let ring_gsw_context =
+        build_ring_gsw_context_with_enable_levels(params, &mut circuit, enable_levels);
     let seed_ciphertexts = (0..prf_seed_bits)
         .map(|_| {
             RingGswCiphertext::input(

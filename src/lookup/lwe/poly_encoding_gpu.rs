@@ -377,10 +377,7 @@ where
         .max(k_low_compute_bench.peak_vram)
         .max(stage2_bench.peak_vram);
 
-    let max_parallelism = u128::try_from(
-        output_chunk_count.checked_mul(2).expect("stage-1 task count overflowed usize"),
-    )
-    .expect("stage-1 task count overflowed u128");
+    let max_parallelism = (output_chunk_count as u128) * 2;
     PolyEncodingChunkBenchMeasurement::new(
         latency * max_parallelism as f64,
         latency,

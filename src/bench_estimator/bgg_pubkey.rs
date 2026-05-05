@@ -21,6 +21,10 @@ pub(crate) fn per_gate_time_estimate(time: f64, peak_vram: usize) -> CircuitBenc
     CircuitBenchEstimate::new(time, time).with_peak_vram(peak_vram)
 }
 
+pub(crate) fn total_lut_preimage_count(total_lut_entries: usize, total_lut_gates: usize) -> u128 {
+    (total_lut_entries as u128) * (total_lut_gates as u128)
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SampleAuxBenchEstimate {
     pub total_time: f64,
@@ -371,7 +375,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::BggPublicKeyBenchEstimator;
+    use super::{BggPublicKeyBenchEstimator, total_lut_preimage_count};
     use crate::{
         __PAIR, __TestState,
         bench_estimator::{
@@ -424,6 +428,14 @@ mod tests {
         assert!(estimate.total_time.is_finite());
         assert_eq!(estimate.latency, 0.25);
         assert_eq!(estimate.compact_bytes, total_chunk_count * BigUint::from(3u8));
+    }
+
+    #[test]
+    fn total_lut_preimage_count_uses_u128_for_large_estimates() {
+        assert_eq!(
+            total_lut_preimage_count(usize::MAX, usize::MAX),
+            (usize::MAX as u128) * (usize::MAX as u128)
+        );
     }
 
     impl PublicLutSampleAuxBenchEstimator<DCRTPolyMatrix> for DummyPublicLutEstimator {

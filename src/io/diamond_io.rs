@@ -45,10 +45,16 @@ use crate::{
 
 use super::Obfuscation;
 
+pub mod bench_estimator;
 mod circuits;
 pub mod simulation;
 mod utils;
 
+#[cfg(feature = "gpu")]
+pub use bench_estimator::GpuDCRTPolyMatrixNativeBenchEstimator;
+pub use bench_estimator::{
+    DiamondIOBenchEstimate, DiamondIOBenchEstimator, DiamondIONativeBenchEstimator,
+};
 pub use simulation::{
     DiamondIOCrtDepthSearchResult, DiamondIOErrorSimulation,
     DiamondIOPrfMaskOutputCoeffBitsSearchResult, DiamondIOPrfRoundErrorSimulation,

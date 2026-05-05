@@ -1,6 +1,7 @@
 use crate::{
     bench_estimator::{
-        BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary, benchmark_gate_operation,
+        BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary, PublicKeyAuxBenchEstimator,
+        benchmark_gate_operation, estimate_public_key_circuit_bench_with_aux,
     },
     bgg::{
         encoding::BggEncoding,
@@ -177,6 +178,13 @@ where
             NaiveBGGEncodingVec::new(params, encodings)
         })
         .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct NoiseRefreshBenchEstimateParts {
+    pub(crate) material: CircuitBenchSummary,
+    pub(crate) per_refresh: CircuitBenchSummary,
+    pub(crate) total: CircuitBenchSummary,
 }
 
 fn scaled_estimate_summary(unit: CircuitBenchEstimate, task_count: usize) -> CircuitBenchSummary {
@@ -369,6 +377,40 @@ where
     }
 }
 
+fn measured_a_prime_hash_sampling_unit_summary<M, HS>(
+    params: &<M::P as Poly>::Params,
+    hash_key: [u8; 32],
+    secret_size: usize,
+) -> CircuitBenchSummary
+where
+    M: PolyMatrix,
+    HS: PolyHashSampler<[u8; 32], M = M>,
+{
+    let log_base_q = params.modulus_digits();
+    let bench = benchmark_gate_operation(NATIVE_BENCH_ITERATIONS, || {
+        let matrix = HS::new().sample_hash(
+            params,
+            hash_key,
+            b"noise-refresh-bench-a-prime",
+            secret_size,
+            secret_size
+                .checked_mul(log_base_q)
+                .expect("noise-refresh a_prime benchmark column count overflow"),
+            DistType::FinRingDist,
+        );
+        matrix.into_compact_bytes()
+    });
+    let summary = CircuitBenchSummary::new(bench.time, bench.time, 1);
+    #[cfg(feature = "gpu")]
+    {
+        summary.with_peak_vram(bench.peak_vram)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        summary
+    }
+}
+
 /// Naive-vector implementation of one-wire noise refresh.
 ///
 /// The type is intentionally specialized to `NaiveBGGPublicKeyVec` and `NaiveBGGEncodingVec`.
@@ -469,11 +511,28 @@ where
         public_key_estimator: &PKBE,
     ) -> CircuitBenchSummary
     where
-        PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + Sync,
+        PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + PublicKeyAuxBenchEstimator<M::P> + Sync,
+        HS: PolyHashSampler<[u8; 32], M = M>,
+    {
+        self.estimate_preprocess_bench_parts(public_key_estimator).total
+    }
+
+    pub(crate) fn estimate_preprocess_bench_parts<PKBE>(
+        &self,
+        public_key_estimator: &PKBE,
+    ) -> NoiseRefreshBenchEstimateParts
+    where
+        PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + PublicKeyAuxBenchEstimator<M::P> + Sync,
+        HS: PolyHashSampler<[u8; 32], M = M>,
     {
         let num_slots = self.params().ring_dimension() as usize;
         let (_q_moduli, _crt_bits, crt_depth) = self.params().to_crt();
         let log_base_q = self.params().modulus_digits();
+        // The naive-vector refresh paths used by AKY24 and DiamondIO refresh scalar BGG wires:
+        // `one.key(0).matrix.row_size()` and `refreshed_input.key(0).matrix.row_size()` are one in
+        // those call sites. The estimator has no concrete `one` vector, so it measures the same
+        // scalar `A'` hash shape directly.
+        let secret_size = 1usize;
         let combine_task_count =
             num_slots.checked_mul(crt_depth).expect("noise-refresh combine task count overflow");
 
@@ -486,13 +545,23 @@ where
             num_slots,
             self.debug_reuse_single_material,
         );
-        let public_material_summary =
-            public_key_estimator.estimate_circuit_bench(&material_circuit);
+        let public_material_summary = estimate_public_key_circuit_bench_with_aux::<
+            NaiveBGGPublicKeyVec<M>,
+            PKBE,
+        >(
+            public_key_estimator, self.params(), &material_circuit
+        );
 
         let scalar_target = [BigUint::from(1u32)];
         let pk_matrix_mul = public_key_estimator.estimate_large_scalar_mul(&scalar_target);
         let pk_add = public_key_estimator.estimate_add();
         let pk_sub = public_key_estimator.estimate_sub();
+        let a_prime_sampling_unit = measured_a_prime_hash_sampling_unit_summary::<M, HS>(
+            self.params(),
+            self.hash_key,
+            secret_size,
+        );
+        let a_prime_sampling_stage = scaled_summary(a_prime_sampling_unit, num_slots);
         let collapse_add_count = log_base_q
             .checked_mul(num_slots.saturating_sub(1))
             .expect("noise-refresh collapse add count overflow");
@@ -515,7 +584,10 @@ where
             estimate_summary(pk_sub),
         ]);
 
-        let preprocess_combine_stage = scaled_summary(preprocess_combine_unit, combine_task_count);
+        let preprocess_combine_stage = sequential_summaries(&[
+            a_prime_sampling_stage,
+            scaled_summary(preprocess_combine_unit, combine_task_count),
+        ]);
         let preprocess_summary =
             sequential_summaries(&[public_material_summary, preprocess_combine_stage]);
 
@@ -525,6 +597,8 @@ where
             crt_depth,
             log_base_q,
             combine_task_count,
+            ?a_prime_sampling_unit,
+            ?a_prime_sampling_stage,
             ?public_material_summary,
             ?preprocess_combine_unit,
             ?preprocess_combine_stage,
@@ -532,7 +606,11 @@ where
             "estimated naive-vector noise-refresh preprocess benchmark"
         );
 
-        preprocess_summary
+        NoiseRefreshBenchEstimateParts {
+            material: public_material_summary,
+            per_refresh: preprocess_combine_stage,
+            total: preprocess_summary,
+        }
     }
 
     /// Estimates the online-evaluation side of the current naive-vector implementation.
@@ -548,10 +626,25 @@ where
     ) -> CircuitBenchSummary
     where
         EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
+        HS: PolyHashSampler<[u8; 32], M = M>,
+    {
+        self.estimate_online_eval_bench_parts(encoding_estimator).total
+    }
+
+    pub(crate) fn estimate_online_eval_bench_parts<EncBE>(
+        &self,
+        encoding_estimator: &EncBE,
+    ) -> NoiseRefreshBenchEstimateParts
+    where
+        EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
+        HS: PolyHashSampler<[u8; 32], M = M>,
     {
         let num_slots = self.params().ring_dimension() as usize;
         let (_q_moduli, _crt_bits, crt_depth) = self.params().to_crt();
         let log_base_q = self.params().modulus_digits();
+        // See the preprocessing estimator above: online refresh recomputes the same scalar `A'`
+        // matrices from `(refresh_id, slot_idx)` and therefore pays the same hash-sampling unit.
+        let secret_size = 1usize;
         let combine_task_count =
             num_slots.checked_mul(crt_depth).expect("noise-refresh combine task count overflow");
 
@@ -570,6 +663,12 @@ where
         let enc_matrix_mul = encoding_estimator.estimate_large_scalar_mul(&scalar_target);
         let enc_add = encoding_estimator.estimate_add();
         let enc_sub = encoding_estimator.estimate_sub();
+        let a_prime_sampling_unit = measured_a_prime_hash_sampling_unit_summary::<M, HS>(
+            self.params(),
+            self.hash_key,
+            secret_size,
+        );
+        let a_prime_sampling_stage = scaled_summary(a_prime_sampling_unit, num_slots);
         let collapse_add_count = log_base_q
             .checked_mul(num_slots.saturating_sub(1))
             .expect("noise-refresh collapse add count overflow");
@@ -600,13 +699,13 @@ where
         // multiplication, and CRT-level accumulation on raw `M` matrices.
         let online_crt_recompose_unit = measured_crt_recompose_unit_summary::<M>(self.params());
 
-        let online_combine_stage = scaled_summary(online_combine_unit, combine_task_count);
-        let online_crt_stage = scaled_summary(online_crt_recompose_unit, num_slots);
-        let online_summary = sequential_summaries(&[
-            online_material_summary,
-            online_combine_stage,
-            online_crt_stage,
+        let online_combine_stage = sequential_summaries(&[
+            a_prime_sampling_stage,
+            scaled_summary(online_combine_unit, combine_task_count),
         ]);
+        let online_crt_stage = scaled_summary(online_crt_recompose_unit, num_slots);
+        let online_per_refresh = sequential_summaries(&[online_combine_stage, online_crt_stage]);
+        let online_summary = sequential_summaries(&[online_material_summary, online_per_refresh]);
 
         debug!(
             v_bits = self.v_bits,
@@ -615,6 +714,8 @@ where
             log_base_q,
             combine_task_count,
             crt_recompose_task_count = num_slots,
+            ?a_prime_sampling_unit,
+            ?a_prime_sampling_stage,
             ?online_material_summary,
             ?online_combine_unit,
             ?online_combine_stage,
@@ -624,7 +725,11 @@ where
             "estimated naive-vector noise-refresh online benchmark"
         );
 
-        online_summary
+        NoiseRefreshBenchEstimateParts {
+            material: online_material_summary,
+            per_refresh: online_per_refresh,
+            total: online_summary,
+        }
     }
 }
 

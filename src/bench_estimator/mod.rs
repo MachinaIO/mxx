@@ -37,8 +37,8 @@ use tracing::debug;
 
 use crate::{
     circuit::{
-        Evaluable, GroupedCallExecutionLayer, GroupedExecutionPlan, PolyCircuit, PolyGateType,
-        SubCircuitParamValue,
+        Evaluable, GroupedCallExecutionLayer, GroupedExecutionPlan, PolyCircuit, PolyGateKind,
+        PolyGateType, SubCircuitParamValue,
     },
     poly::Poly,
 };
@@ -396,6 +396,49 @@ pub trait BenchEstimator<E: Evaluable> {
             start.elapsed().as_secs_f64() * 1000.0
         );
         estimate
+    }
+}
+
+pub trait PublicKeyAuxBenchEstimator<P: Poly> {
+    fn estimate_public_lut_sample_aux_matrices_for_circuit(
+        &self,
+        params: &P::Params,
+        circuit: &PolyCircuit<P>,
+    ) -> SampleAuxBenchEstimate;
+}
+
+pub(crate) fn estimate_public_key_circuit_bench_with_aux<E, B>(
+    estimator: &B,
+    params: &<E::P as Poly>::Params,
+    circuit: &PolyCircuit<E::P>,
+) -> CircuitBenchSummary
+where
+    E: Evaluable,
+    B: BenchEstimator<E> + PublicKeyAuxBenchEstimator<E::P> + Sync,
+{
+    let circuit_eval = estimator.estimate_circuit_bench(circuit);
+    let aux = estimator.estimate_public_lut_sample_aux_matrices_for_circuit(params, circuit);
+    let aux_summary = aux.to_summary();
+    debug!(
+        public_lut_gate_count =
+            circuit.count_gates_by_type_vec().get(&PolyGateKind::PubLut).copied().unwrap_or(0),
+        public_lut_entry_count = circuit.total_registered_public_lut_entries(),
+        ?aux,
+        ?aux_summary,
+        "estimated public-key circuit Public LUT auxiliary sampling"
+    );
+    let summary = CircuitBenchSummary::new(
+        circuit_eval.total_time + aux_summary.total_time,
+        circuit_eval.latency + aux_summary.latency,
+        circuit_eval.max_parallelism.max(aux_summary.max_parallelism),
+    );
+    #[cfg(feature = "gpu")]
+    {
+        summary.with_peak_vram(circuit_eval.peak_vram.max(aux_summary.peak_vram))
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        summary
     }
 }
 

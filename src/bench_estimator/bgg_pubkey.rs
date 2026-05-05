@@ -13,8 +13,8 @@ use num_traits::ToPrimitive;
 use tracing::debug;
 
 use super::{
-    BenchEstimator, CircuitBenchEstimate, benchmark_gate_operation, column_parallel_gate_estimate,
-    measure_bench_operation,
+    BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary, PublicKeyAuxBenchEstimator,
+    benchmark_gate_operation, column_parallel_gate_estimate, measure_bench_operation,
 };
 
 pub(crate) fn per_gate_time_estimate(time: f64, peak_vram: usize) -> CircuitBenchEstimate {
@@ -85,6 +85,15 @@ impl SampleAuxBenchEstimate {
             chunk_compact_bytes,
             base_compact_bytes,
         )
+    }
+
+    pub(crate) fn to_summary(&self) -> CircuitBenchSummary {
+        let max_parallelism = if self.total_time <= 0.0 || self.latency <= 0.0 {
+            0
+        } else {
+            (self.total_time / self.latency).ceil() as u128
+        };
+        CircuitBenchSummary::new(self.total_time, self.latency, max_parallelism)
     }
 }
 
@@ -370,6 +379,33 @@ where
     fn estimate_public_lookup(&self, lut_id: usize) -> CircuitBenchEstimate {
         let _ = lut_id;
         per_gate_time_estimate(self.public_lut_time, self.public_lut_peak_vram)
+    }
+}
+
+impl<M, PLE, STE> PublicKeyAuxBenchEstimator<M::P> for BggPublicKeyBenchEstimator<M, PLE, STE>
+where
+    M: PolyMatrix,
+    PLE: PublicLutSampleAuxBenchEstimator<M, Params = <M::P as Poly>::Params>,
+    STE: SlotTransferSampleAuxBenchEstimator<M, Params = <M::P as Poly>::Params>,
+{
+    fn estimate_public_lut_sample_aux_matrices_for_circuit(
+        &self,
+        params: &<M::P as Poly>::Params,
+        circuit: &crate::circuit::PolyCircuit<M::P>,
+    ) -> SampleAuxBenchEstimate {
+        let total_lut_gates = circuit
+            .count_gates_by_type_vec()
+            .get(&crate::circuit::PolyGateKind::PubLut)
+            .copied()
+            .unwrap_or(0);
+        if total_lut_gates == 0 {
+            return SampleAuxBenchEstimate::default();
+        }
+        self.estimate_public_lut_sample_aux_matrices(
+            params,
+            circuit.total_registered_public_lut_entries(),
+            total_lut_gates,
+        )
     }
 }
 

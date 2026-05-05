@@ -9,6 +9,7 @@ use crate::{
     gadgets::arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner, NestedRnsPoly},
     matrix::PolyMatrix,
     noise_refresh::NoiseRefresherNaiveVec,
+    sampler::PolyHashSampler,
 };
 
 /// Shape parameters needed to estimate AKY24 decryption.
@@ -93,6 +94,7 @@ impl<'a, EncBE> Aky24DecBenchEstimator<'a, EncBE> {
         M: PolyMatrix + Send + Sync + 'static,
         M::P: 'static,
         EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
+        SH: PolyHashSampler<[u8; 32], M = M>,
         NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
     {
         assert!(shape.wire_count > 0, "wire_count must be positive");
@@ -164,6 +166,7 @@ impl<'a, EncBE> Aky24DecBenchEstimator<'a, EncBE> {
         M: PolyMatrix + Send + Sync + 'static,
         M::P: 'static,
         EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
+        SH: PolyHashSampler<[u8; 32], M = M>,
         NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
     {
         let generated_seed_bits =

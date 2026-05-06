@@ -13,7 +13,11 @@ pub use naive_vec::{
     NoiseRefresherNaiveVec, debug_sample_prg_encoding_wires, debug_sample_prg_plaintext_wires,
     debug_sample_prg_public_key_wires,
 };
-pub use simulation::{NoiseRefreshErrorSimulation, simulate_noise_refresh_error_growth};
+pub use simulation::{
+    NoiseRefreshErrorSimulation, simulate_noise_refresh_error_growth,
+    simulate_symmetric_noise_refresh_error_growth,
+    simulate_symmetric_noise_refresh_error_growth_for_v_bits,
+};
 
 /// Refreshes the noise of one slotwise encoding wire.
 ///

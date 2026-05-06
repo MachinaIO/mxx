@@ -17,11 +17,7 @@ use crate::{
     lookup::PltEvaluator,
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     noise_refresh::{
-        NoiseRefreshErrorSimulation,
-        circuit_decrypt::{
-            decrypt_bit_decomposed_polynomial, mask_plaintext_moduli_from_full_modulus,
-        },
-        simulate_noise_refresh_error_growth,
+        NoiseRefreshErrorSimulation, simulate_symmetric_noise_refresh_error_growth,
         simulation::validate_error_bound_security_margin,
     },
     poly::{
@@ -84,6 +80,20 @@ pub struct DiamondIOCrtDepthSearchResult {
     /// This is `input_injection.state_errors[0] * input_injection.output_preimage`, matching the
     /// projected state error used as the `one`, decryption-key, and decoder input bound.
     pub input_injection_projection_error: PolyMatrixNorm,
+}
+
+#[derive(Debug, Clone)]
+struct DiamondIOMaskIndependentErrorPrefix {
+    cpu_params: DCRTPolyParams,
+    ctx: Arc<SimulatorContext>,
+    input_injection: DiamondInputErrorSimulation,
+    prf_refreshes: Vec<DiamondIOPrfRoundErrorSimulation>,
+    one: ErrorNorm,
+    decryption_key: ErrorNorm,
+    final_decoder_error: ErrorNorm,
+    final_seed_errors: Vec<ErrorNorm>,
+    function_secret_error: ErrorNorm,
+    public_bottom_decryption_error: PolyMatrixNorm,
 }
 
 /// Finds the smallest CRT depth whose correctness and security checks pass.
@@ -202,10 +212,9 @@ where
     /// Search for the largest PRF mask coefficient bit-width that satisfies the final decode
     /// margin.
     ///
-    /// Each candidate bit-width is evaluated with a fresh DiamondIO error simulation, so the
-    /// returned simulation accounts for that candidate's final PRF mask PRG and mask
-    /// decrypt/recomposition error. A candidate is valid exactly when
-    /// `noisy_plaintext_error + 2^candidate < q / 4`.
+    /// The mask-independent prefix and final-mask representative PRG are cached across candidates.
+    /// The remaining per-candidate work accounts for that bit width's mask decrypt/recomposition
+    /// error. A candidate is valid exactly when `noisy_plaintext_error + 2^candidate < q / 4`.
     pub fn max_safe_prf_mask_output_coeff_bits<PE, ST>(
         &self,
         func_type: DiamondIOFuncType,
@@ -223,16 +232,59 @@ where
         let mut high = max_candidate;
         let mut best = None;
         info!(max_bits, max_candidate, "starting DiamondIO PRF mask bit search");
+        let prefix = self.simulate_mask_independent_error_prefix(
+            func_type,
+            plt_evaluator,
+            slot_transfer_evaluator,
+        )?;
+        info!(
+            prf_rounds = prefix.prf_refreshes.len(),
+            "DiamondIO PRF mask bit search cached mask-independent prefix"
+        );
+        let cached_final_mask_prg_output = self.simulate_representative_prg_output(
+            &prefix.cpu_params,
+            self.input_size,
+            self.output_size
+                .checked_mul(prefix.cpu_params.ring_dimension() as usize)
+                .and_then(|count| count.checked_mul(max_candidate))
+                .expect("DiamondIO final mask PRG conceptual output count overflow"),
+            0,
+            prefix.one.clone(),
+            prefix.final_seed_errors.clone(),
+            plt_evaluator,
+            slot_transfer_evaluator,
+        );
+        info!(
+            max_candidate,
+            final_mask_prg_bits =
+                bigdecimal_bits_ceil(&cached_final_mask_prg_output.matrix_norm.poly_norm.norm),
+            "DiamondIO PRF mask bit search cached final-mask representative PRG"
+        );
+        let cached_final_mask_base_error = self.simulate_final_mask_base_error(
+            &prefix.cpu_params,
+            cached_final_mask_prg_output.clone(),
+            prefix.one.clone(),
+            prefix.decryption_key.clone(),
+            plt_evaluator,
+            slot_transfer_evaluator,
+        );
+        info!(
+            final_mask_base_bits =
+                bigdecimal_bits_ceil(&cached_final_mask_base_error.matrix_norm.poly_norm.norm),
+            "DiamondIO PRF mask bit search cached final-mask representative decrypt"
+        );
         while low <= high {
             let candidate = low + (high - low) / 2;
             info!(candidate, low, high, "evaluating DiamondIO PRF mask bit candidate");
-            let simulation = self.simulate_error_growth_with_prf_mask_output_coeff_bits(
-                func_type,
+            let simulation = self.finish_error_growth_from_mask_independent_prefix(
+                &prefix,
                 candidate,
+                Some(cached_final_mask_prg_output.clone()),
+                Some(cached_final_mask_base_error.clone()),
                 plt_evaluator,
                 slot_transfer_evaluator,
-            )?;
-            let q: Arc<BigUint> = cpu_params.modulus().into();
+            );
+            let q: Arc<BigUint> = prefix.cpu_params.modulus().into();
             let quarter_q = biguint_to_decimal(&(q.as_ref() / 4u32));
             let mask_value = biguint_to_decimal(&(BigUint::from(1u32) << candidate));
             let valid = &simulation.noisy_plaintext_error.poly_norm.norm + &mask_value < quarter_q;
@@ -282,6 +334,38 @@ where
             "DiamondIO error simulation requires prf_mask_output_coeff_bits > 0"
         );
 
+        let prefix = self.simulate_mask_independent_error_prefix(
+            func_type,
+            plt_evaluator,
+            slot_transfer_evaluator,
+        )?;
+        Some(self.finish_error_growth_from_mask_independent_prefix(
+            &prefix,
+            prf_mask_output_coeff_bits,
+            None,
+            None,
+            plt_evaluator,
+            slot_transfer_evaluator,
+        ))
+    }
+
+    fn simulate_mask_independent_error_prefix<PE, ST>(
+        &self,
+        func_type: DiamondIOFuncType,
+        plt_evaluator: &PE,
+        slot_transfer_evaluator: &ST,
+    ) -> Option<DiamondIOMaskIndependentErrorPrefix>
+    where
+        PE: PltEvaluator<ErrorNorm>,
+        ST: SlotTransferEvaluator<ErrorNorm>,
+    {
+        assert_eq!(
+            self.input_size,
+            self.injector.input_count * self.injector.batch_bits(),
+            "DiamondIO input_size must match the injector bit input count"
+        );
+        assert!(self.seed_bits > 0, "DiamondIO error simulation requires seed_bits > 0");
+
         let cpu_params = cpu_params_from_poly_params(&self.injector.params);
         let (_, _, crt_depth) = cpu_params.to_crt();
         let full_active_levels =
@@ -303,20 +387,45 @@ where
 
         let one = ErrorNorm::new(PolyNorm::one(ctx.clone()), projected_state_error.clone());
         let decryption_key = ErrorNorm::new(PolyNorm::one(ctx.clone()), projected_state_error);
-        let decoder_error = ErrorNorm::new(PolyNorm::one(ctx.clone()), one.matrix_norm.clone());
-        // Noise-refresh online decoding material is indexed by `(slot_idx, crt_idx)`.
-        // DiamondIO persists one refresh decoder for every slot and every CRT
-        // level, so the simulator supplies the representative decoder bound in
-        // the same `slot_idx * crt_depth + crt_idx` layout expected by
-        // `simulate_noise_refresh_error_growth`.
-        let decoders =
-            vec![decoder_error.clone(); cpu_params.ring_dimension() as usize * crt_depth];
+        let refresh_decoder_error =
+            ErrorNorm::new(PolyNorm::one(ctx.clone()), one.matrix_norm.clone());
+        let final_decoder_projection_error =
+            diamond_io_input_injection_scalar_projection_error(&input_injection);
+        let final_decoder_error =
+            ErrorNorm::new(PolyNorm::one(ctx.clone()), final_decoder_projection_error);
         let seed_wire_error = self.initial_seed_wire_error(&cpu_params, &one);
         let mut seed_errors = vec![seed_wire_error.clone(); self.seed_bits];
         let mut prf_refreshes = Vec::with_capacity(self.input_size);
+        let mut steady_prf_round_cache: Option<(
+            ErrorNorm,
+            NoiseRefreshErrorSimulation,
+            ErrorNorm,
+        )> = None;
 
         for round_idx in 0..self.input_size {
-            let low = self.simulate_representative_prg_output(
+            if round_idx > 1 {
+                if let Some((selected, refresh, refreshed_seed)) = &steady_prf_round_cache {
+                    seed_errors = vec![refreshed_seed.clone(); self.seed_bits];
+                    info!(
+                        round_idx,
+                        v_bits = refresh.v_bits,
+                        refreshed_seed_error_bits =
+                            bigdecimal_bits_ceil(&refreshed_seed.matrix_norm.poly_norm.norm),
+                        "DiamondIO reusing steady-state PRF refresh error simulation"
+                    );
+                    prf_refreshes.push(DiamondIOPrfRoundErrorSimulation {
+                        round_idx,
+                        representative_selected_prg_output: selected.clone(),
+                        noise_refresh: refresh.clone(),
+                    });
+                    continue;
+                }
+            }
+            // Low and high halves are both one representative Goldreich PRG output evaluated from
+            // the same seed-error profile. The selected output circuit below only needs an
+            // ErrorNorm bound for each encoded branch, so the symmetric high branch can reuse the
+            // low branch bound instead of evaluating the same one-bit PRG circuit twice.
+            let representative_branch = self.simulate_representative_prg_output(
                 &cpu_params,
                 round_idx,
                 2 * self.seed_bits,
@@ -326,19 +435,25 @@ where
                 plt_evaluator,
                 slot_transfer_evaluator,
             );
-            let high = self.simulate_representative_prg_output(
-                &cpu_params,
+            debug!(
                 round_idx,
-                2 * self.seed_bits,
-                self.seed_bits,
-                one.clone(),
-                seed_errors.clone(),
-                plt_evaluator,
-                slot_transfer_evaluator,
+                high_range_start = self.seed_bits,
+                "DiamondIO reusing representative PRG branch error for symmetric high half"
             );
+            let material_branch = representative_branch.clone();
+            let low = representative_branch.clone();
+            let high = representative_branch;
             let selected = simulate_selected_half_error_norm(one.clone(), low, high, one.clone());
+            let material_wire_error = scale_error_norm(
+                // Noise-refresh material is generated from the same encrypted seed profile by a
+                // one-output Goldreich PRG. CBD material combines `2 * cbd_n` uniform branches, so
+                // scaling the active-level-extrapolated representative branch is a conservative
+                // bound for both CBD error and mask material wires.
+                material_branch,
+                &BigDecimal::from((2 * self.noise_refresh_cbd_n) as u64),
+            );
             let mut refresh_context_circuit = PolyCircuit::<DCRTPoly>::new();
-            let refresh = simulate_noise_refresh_error_growth(
+            let refresh = simulate_symmetric_noise_refresh_error_growth(
                 self.build_cpu_ring_gsw_context(
                     &cpu_params,
                     &mut refresh_context_circuit,
@@ -353,7 +468,8 @@ where
                 selected.clone(),
                 &seed_errors,
                 decryption_key.clone(),
-                &decoders,
+                refresh_decoder_error.clone(),
+                Some(material_wire_error),
                 plt_evaluator,
                 slot_transfer_evaluator,
             )?;
@@ -380,71 +496,150 @@ where
             );
             prf_refreshes.push(DiamondIOPrfRoundErrorSimulation {
                 round_idx,
-                representative_selected_prg_output: selected,
-                noise_refresh: refresh,
+                representative_selected_prg_output: selected.clone(),
+                noise_refresh: refresh.clone(),
             });
+            if round_idx >= 1 {
+                // After the first refresh, every subsequent seed wire has the same rounded CBD
+                // error bound. The Goldreich graph seed changes with the round index, but ErrorNorm
+                // sees the same one-output circuit shape and the same symmetric seed-error profile,
+                // so the representative selected PRG output and refresh result can be reused for
+                // later rounds.
+                steady_prf_round_cache = Some((selected, refresh, refreshed_seed));
+            }
         }
 
-        let final_mask_prg_output = self.simulate_representative_prg_output(
-            &cpu_params,
-            self.input_size,
-            self.output_size
-                .checked_mul(cpu_params.ring_dimension() as usize)
-                .and_then(|count| count.checked_mul(prf_mask_output_coeff_bits))
-                .expect("DiamondIO final mask PRG conceptual output count overflow"),
-            0,
-            one.clone(),
-            seed_errors,
-            plt_evaluator,
-            slot_transfer_evaluator,
-        );
-        let final_mask_error = self.simulate_final_mask_error(
-            &cpu_params,
-            prf_mask_output_coeff_bits,
-            final_mask_prg_output,
-            one.clone(),
-            decryption_key.clone(),
-            plt_evaluator,
-            slot_transfer_evaluator,
-        );
         let (function_secret_error, function_public_bottom_error) = self
             .simulate_representative_function_output(
                 func_type,
                 &cpu_params,
                 one.clone(),
-                decryption_key,
-                seed_wire_error,
+                decryption_key.clone(),
+                seed_wire_error.clone(),
                 plt_evaluator,
                 slot_transfer_evaluator,
             );
-        let evaluated_secret_dependent = function_secret_error + &final_mask_error;
-        let projected_evaluated_error = evaluated_secret_dependent.matrix_norm.clone() *
-            PolyMatrixNorm::gadget_decomposed(ctx.clone(), 1);
+        info!(
+            function_secret_bits =
+                bigdecimal_bits_ceil(&function_secret_error.matrix_norm.poly_norm.norm),
+            function_public_bottom_plaintext_bits =
+                bigdecimal_bits_ceil(&function_public_bottom_error.plaintext_norm.norm),
+            function_public_bottom_encoding_bits =
+                bigdecimal_bits_ceil(&function_public_bottom_error.matrix_norm.poly_norm.norm),
+            "DiamondIO representative function output error simulation finished"
+        );
         let public_bottom_decryption_error =
             self.simulate_public_bottom_decryption_error(&cpu_params, ctx.clone());
-        let projection_residual_error = projected_evaluated_error.clone() +
-            &function_public_bottom_error.matrix_norm +
-            &public_bottom_decryption_error;
-        let noisy_plaintext_error = projection_residual_error.clone() + &decoder_error.matrix_norm;
+        info!(
+            prf_rounds = prf_refreshes.len(),
+            "DiamondIO mask-independent error simulation prefix finished"
+        );
+
+        Some(DiamondIOMaskIndependentErrorPrefix {
+            cpu_params,
+            ctx,
+            input_injection,
+            prf_refreshes,
+            one,
+            decryption_key,
+            final_decoder_error,
+            final_seed_errors: seed_errors,
+            function_secret_error,
+            public_bottom_decryption_error,
+        })
+    }
+
+    fn finish_error_growth_from_mask_independent_prefix<PE, ST>(
+        &self,
+        prefix: &DiamondIOMaskIndependentErrorPrefix,
+        prf_mask_output_coeff_bits: usize,
+        cached_final_mask_prg_output: Option<ErrorNorm>,
+        cached_final_mask_base_error: Option<ErrorNorm>,
+        plt_evaluator: &PE,
+        slot_transfer_evaluator: &ST,
+    ) -> DiamondIOErrorSimulation
+    where
+        PE: PltEvaluator<ErrorNorm>,
+        ST: SlotTransferEvaluator<ErrorNorm>,
+    {
+        assert!(
+            prf_mask_output_coeff_bits > 0,
+            "DiamondIO error simulation requires prf_mask_output_coeff_bits > 0"
+        );
+        let final_mask_prg_output = cached_final_mask_prg_output.unwrap_or_else(|| {
+            self.simulate_representative_prg_output(
+                &prefix.cpu_params,
+                self.input_size,
+                self.output_size
+                    .checked_mul(prefix.cpu_params.ring_dimension() as usize)
+                    .and_then(|count| count.checked_mul(prf_mask_output_coeff_bits))
+                    .expect("DiamondIO final mask PRG conceptual output count overflow"),
+                0,
+                prefix.one.clone(),
+                prefix.final_seed_errors.clone(),
+                plt_evaluator,
+                slot_transfer_evaluator,
+            )
+        });
+        info!(
+            prf_mask_output_coeff_bits,
+            final_mask_prg_bits =
+                bigdecimal_bits_ceil(&final_mask_prg_output.matrix_norm.poly_norm.norm),
+            "DiamondIO final mask representative PRG error simulation finished"
+        );
+        let final_mask_base_error = cached_final_mask_base_error.unwrap_or_else(|| {
+            self.simulate_final_mask_base_error(
+                &prefix.cpu_params,
+                final_mask_prg_output,
+                prefix.one.clone(),
+                prefix.decryption_key.clone(),
+                plt_evaluator,
+                slot_transfer_evaluator,
+            )
+        });
+        let final_mask_error = scale_error_norm(
+            final_mask_base_error,
+            &BigDecimal::from(prf_mask_output_coeff_bits as u64),
+        );
+        assert_same_matrix_shape(
+            &final_mask_error.matrix_norm,
+            &prefix.function_secret_error.matrix_norm,
+            "final mask and function secret-dependent representative errors must share the pre-projection BGG encoding shape",
+        );
+        let evaluated_secret_dependent = prefix.function_secret_error.clone() + &final_mask_error;
+        let projected_evaluated_error = evaluated_secret_dependent.matrix_norm.clone() *
+            PolyMatrixNorm::gadget_decomposed(prefix.ctx.clone(), 1);
+        assert_same_matrix_shape(
+            &prefix.public_bottom_decryption_error,
+            &projected_evaluated_error,
+            "public-bottom decryption error must be a representative final scalar residual error",
+        );
+        let projection_residual_error =
+            projected_evaluated_error.clone() + &prefix.public_bottom_decryption_error;
+        assert_same_matrix_shape(
+            &prefix.final_decoder_error.matrix_norm,
+            &projection_residual_error,
+            "decoder projection error must be a representative final scalar residual error",
+        );
+        let noisy_plaintext_error =
+            projection_residual_error.clone() + &prefix.final_decoder_error.matrix_norm;
         info!(
             projected_evaluated_bits =
                 bigdecimal_bits_ceil(&projected_evaluated_error.poly_norm.norm),
-            public_bottom_bits =
-                bigdecimal_bits_ceil(&function_public_bottom_error.matrix_norm.poly_norm.norm),
             public_bottom_decryption_bits =
-                bigdecimal_bits_ceil(&public_bottom_decryption_error.poly_norm.norm),
+                bigdecimal_bits_ceil(&prefix.public_bottom_decryption_error.poly_norm.norm),
             projection_residual_bits =
                 bigdecimal_bits_ceil(&projection_residual_error.poly_norm.norm),
             noisy_plaintext_bits = bigdecimal_bits_ceil(&noisy_plaintext_error.poly_norm.norm),
             "DiamondIO final output error simulation finished"
         );
 
-        Some(DiamondIOErrorSimulation {
-            input_injection,
-            prf_refreshes,
+        DiamondIOErrorSimulation {
+            input_injection: prefix.input_injection.clone(),
+            prf_refreshes: prefix.prf_refreshes.clone(),
             projection_residual_error,
             noisy_plaintext_error,
-        })
+        }
     }
 
     fn initial_seed_wire_error(&self, _params: &DCRTPolyParams, one: &ErrorNorm) -> ErrorNorm {
@@ -482,7 +677,12 @@ where
         Arc::new(NestedRnsRingGswContext::<DCRTPoly>::from_arith_context(
             circuit,
             params,
-            params.ring_dimension() as usize,
+            // Error simulation evaluates one representative Ring-GSW ciphertext at a time.  The
+            // polynomial ring dimension is still carried by `params`; `num_slots = 1` only avoids
+            // constructing the production batch of per-coefficient input wires.  Callers that need
+            // the full coefficient or slot collapse scale it explicitly in the surrounding norm
+            // calculation.
+            1,
             nested_rns_context,
             Some(active_levels),
             Some(self.ring_gsw_level_offset),
@@ -571,10 +771,9 @@ where
         circuit
     }
 
-    fn simulate_final_mask_error<PE, ST>(
+    fn simulate_final_mask_base_error<PE, ST>(
         &self,
         params: &DCRTPolyParams,
-        prf_mask_output_coeff_bits: usize,
         final_mask_prg_output: ErrorNorm,
         one: ErrorNorm,
         decryption_key: ErrorNorm,
@@ -585,15 +784,35 @@ where
         PE: PltEvaluator<ErrorNorm>,
         ST: SlotTransferEvaluator<ErrorNorm>,
     {
-        let circuit = self.build_cpu_prf_mask_circuit(params, prf_mask_output_coeff_bits);
-        let encrypted_bit_count = params.ring_dimension() as usize * prf_mask_output_coeff_bits;
-        let wire_count = ring_gsw_wire_count(circuit.num_input() - 1, encrypted_bit_count);
+        let mut circuit = PolyCircuit::new();
+        let (_, _, crt_depth) = params.to_crt();
+        let full_active_levels =
+            self.ring_gsw_enable_levels.unwrap_or_else(|| crt_depth - self.ring_gsw_level_offset);
+        let ring_gsw_context = self.build_cpu_ring_gsw_context(params, &mut circuit, 1);
+        let decryption_key_wire = circuit.input(1).at(0).as_single_wire();
+        let encrypted_bit = RingGswCiphertext::input(
+            ring_gsw_context.clone(),
+            Some(BigUint::from(1u64)),
+            &mut circuit,
+        );
+        // The exact final-mask plaintext modulus changes public constants, but the representative
+        // ErrorNorm growth is the same one-bit decrypt/recompose circuit. The caller applies the
+        // PRF mask coefficient bit-width as an external linear scale.
+        let representative_plaintext_modulus = BigUint::from(2u64);
+        let decrypted = encrypted_bit.decrypt::<DCRTPolyMatrix>(
+            decryption_key_wire,
+            representative_plaintext_modulus,
+            &mut circuit,
+        );
+        let output =
+            circuit.add_gate(decrypted.secret_dependent, decrypted.public_bottom).as_single_wire();
+        circuit.output(vec![output]);
+        let wire_count = circuit.num_input() - 1;
+        let coefficient_scale = BigDecimal::from(params.ring_dimension() as u64);
+        let final_mask_prg_output = scale_error_norm(final_mask_prg_output, &coefficient_scale);
         let mut inputs = Vec::with_capacity(circuit.num_input());
         inputs.push(decryption_key);
-        inputs.extend(expand_logical_errors(
-            &vec![final_mask_prg_output; encrypted_bit_count],
-            wire_count,
-        ));
+        inputs.extend(std::iter::repeat_n(final_mask_prg_output, wire_count));
         assert_eq!(
             inputs.len(),
             circuit.num_input(),
@@ -608,40 +827,7 @@ where
             None,
         );
         assert_eq!(outputs.len(), 1, "DiamondIO final mask circuit must produce one output");
-        outputs.remove(0)
-    }
-
-    fn build_cpu_prf_mask_circuit(
-        &self,
-        params: &DCRTPolyParams,
-        prf_mask_output_coeff_bits: usize,
-    ) -> PolyCircuit<DCRTPoly> {
-        let mut circuit = PolyCircuit::new();
-        let (_, _, crt_depth) = params.to_crt();
-        let active_levels =
-            self.ring_gsw_enable_levels.unwrap_or_else(|| crt_depth - self.ring_gsw_level_offset);
-        let ring_gsw_context = self.build_cpu_ring_gsw_context(params, &mut circuit, active_levels);
-        let decryption_key = circuit.input(1).at(0).as_single_wire();
-        let q: Arc<BigUint> = params.modulus().into();
-        let plaintext_moduli =
-            mask_plaintext_moduli_from_full_modulus(q.as_ref(), prf_mask_output_coeff_bits);
-        let encrypted_bit_count = params.ring_dimension() as usize * prf_mask_output_coeff_bits;
-        let encrypted_bits = (0..encrypted_bit_count)
-            .map(|_| {
-                RingGswCiphertext::input(
-                    ring_gsw_context.clone(),
-                    Some(BigUint::from(1u64)),
-                    &mut circuit,
-                )
-            })
-            .collect::<Vec<_>>();
-        let decrypted = decrypt_bit_decomposed_polynomial::<
-            DCRTPoly,
-            crate::gadgets::arith::NestedRnsPoly<DCRTPoly>,
-            DCRTPolyMatrix,
-        >(&mut circuit, &encrypted_bits, decryption_key, &plaintext_moduli);
-        circuit.output(vec![decrypted]);
-        circuit
+        extrapolate_error_norm_matrix_to_active_levels(outputs.remove(0), full_active_levels)
     }
 
     fn simulate_representative_function_output<PE, ST>(
@@ -667,7 +853,7 @@ where
         let mut inputs = Vec::with_capacity(circuit.num_input());
         inputs.push(decryption_key);
         inputs.extend(std::iter::repeat_n(seed_wire_error, seed_wire_count));
-        let outputs = circuit.eval(
+        let mut outputs = circuit.eval(
             &(),
             one,
             inputs,
@@ -676,6 +862,13 @@ where
             None,
         );
         assert_eq!(outputs.len(), 2, "DiamondIO representative function output must be a pair");
+        let (_, _, crt_depth) = params.to_crt();
+        let full_active_levels =
+            self.ring_gsw_enable_levels.unwrap_or_else(|| crt_depth - self.ring_gsw_level_offset);
+        for output in &mut outputs {
+            *output =
+                extrapolate_error_norm_matrix_to_active_levels(output.clone(), full_active_levels);
+        }
         (outputs[0].clone(), outputs[1].clone())
     }
 
@@ -685,10 +878,7 @@ where
         representative_seed_bits: usize,
     ) -> PolyCircuit<DCRTPoly> {
         let mut circuit = PolyCircuit::new();
-        let (_, _, crt_depth) = params.to_crt();
-        let active_levels =
-            self.ring_gsw_enable_levels.unwrap_or_else(|| crt_depth - self.ring_gsw_level_offset);
-        let ring_gsw_context = self.build_cpu_ring_gsw_context(params, &mut circuit, active_levels);
+        let ring_gsw_context = self.build_cpu_ring_gsw_context(params, &mut circuit, 1);
         let decryption_key = circuit.input(1).at(0).as_single_wire();
         let mut outputs = Vec::with_capacity(2 * representative_seed_bits);
         for _ in 0..representative_seed_bits {
@@ -716,14 +906,20 @@ where
     ) -> PolyMatrixNorm {
         let mut circuit = PolyCircuit::new();
         let (_, _, crt_depth) = params.to_crt();
-        let active_levels =
+        let full_active_levels =
             self.ring_gsw_enable_levels.unwrap_or_else(|| crt_depth - self.ring_gsw_level_offset);
-        let ring_gsw_context = self.build_cpu_ring_gsw_context(params, &mut circuit, active_levels);
+        let ring_gsw_context = self.build_cpu_ring_gsw_context(params, &mut circuit, 1);
         let ciphertext =
             RingGswCiphertext::input(ring_gsw_context, Some(BigUint::from(1u64)), &mut circuit);
         let raw = ciphertext
             .estimate_decryption_error_norm(self.ring_gsw_public_key_error_sigma.unwrap_or(0.0));
-        PolyMatrixNorm::new(output_ctx, 1, 1, raw.poly_norm.norm, None)
+        PolyMatrixNorm::new(
+            output_ctx,
+            1,
+            1,
+            raw.poly_norm.norm * BigDecimal::from(full_active_levels as u64),
+            None,
+        )
     }
 
     fn derive_diamond_goldreich_graph_seed(&self, round_idx: usize) -> [u8; 32] {
@@ -776,6 +972,23 @@ fn diamond_io_input_injection_projection_error(
         .expect("DiamondIO input injection must produce a base final state error")
         .clone() *
         &input_injection.output_preimage
+}
+
+fn diamond_io_input_injection_scalar_projection_error(
+    input_injection: &DiamondInputErrorSimulation,
+) -> PolyMatrixNorm {
+    let state_error = input_injection
+        .state_errors
+        .first()
+        .expect("DiamondIO input injection must produce a base final state error");
+    let scalar_output_preimage = PolyMatrixNorm::new(
+        input_injection.output_preimage.clone_ctx(),
+        input_injection.output_preimage.nrow,
+        1,
+        input_injection.output_preimage.poly_norm.norm.clone(),
+        None,
+    );
+    state_error.clone() * &scalar_output_preimage
 }
 
 fn diamond_io_security_margins_hold(
@@ -888,6 +1101,38 @@ fn simulate_selected_half_error_norm(
 fn expand_logical_errors(logical_errors: &[ErrorNorm], wire_count: usize) -> Vec<ErrorNorm> {
     assert!(wire_count > 0, "Ring-GSW wire count must be positive");
     logical_errors.iter().flat_map(|error| std::iter::repeat_n(error.clone(), wire_count)).collect()
+}
+
+fn scale_error_norm(input: ErrorNorm, scale: &BigDecimal) -> ErrorNorm {
+    ErrorNorm {
+        plaintext_norm: input.plaintext_norm * scale,
+        matrix_norm: input.matrix_norm * scale,
+    }
+}
+
+fn assert_same_matrix_shape(lhs: &PolyMatrixNorm, rhs: &PolyMatrixNorm, message: &str) {
+    assert!(lhs.ctx() == rhs.ctx(), "{message}: simulator contexts must match");
+    assert_eq!(
+        (lhs.nrow, lhs.ncol),
+        (rhs.nrow, rhs.ncol),
+        "{message}: left shape {:?} must match right shape {:?}",
+        (lhs.nrow, lhs.ncol),
+        (rhs.nrow, rhs.ncol)
+    );
+}
+
+fn extrapolate_error_norm_matrix_to_active_levels(
+    mut input: ErrorNorm,
+    active_levels: usize,
+) -> ErrorNorm {
+    assert!(active_levels > 0, "active-level extrapolation scale must be positive");
+    if active_levels > 1 {
+        // Active-level extrapolation models the ciphertext-side Ring-GSW contribution. The
+        // plaintext norm is a bound on the represented value flowing through the circuit, so it is
+        // not scaled by the number of CRT levels.
+        input.matrix_norm = input.matrix_norm * BigDecimal::from(active_levels as u64);
+    }
+    input
 }
 
 fn ring_gsw_wire_count(flat_input_count: usize, logical_bit_count: usize) -> usize {

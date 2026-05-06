@@ -10,6 +10,7 @@ use mxx::{
     bgg::{public_key::BggPublicKey, sampler::BGGPublicKeySampler},
     circuit::{PolyCircuit, gate::GateId},
     element::PolyElem,
+    func_enc::aky24::NoCircuitEvaluator,
     gadgets::arith::{ModularArithmeticContext, NestedRnsPolyContext},
     input_injector::DiamondInjector,
     io::diamond_io::{
@@ -23,7 +24,7 @@ use mxx::{
             NaiveLWEBGGEncodingVecPltEvaluator, NaiveLWEBGGPublicKeyVecPltEvaluator,
         },
     },
-    matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix,
+    matrix::{dcrt_poly::DCRTPolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
         dcrt::{
@@ -35,7 +36,9 @@ use mxx::{
     sampler::{
         PolyTrapdoorSampler,
         gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
-        trapdoor::GpuDCRTPolyTrapdoorSampler,
+        hash::DCRTPolyHashSampler,
+        trapdoor::{DCRTPolyTrapdoorSampler, GpuDCRTPolyTrapdoorSampler},
+        uniform::DCRTPolyUniformSampler,
     },
     simulator::error_norm::{ErrorNorm, NormNaiveBggEncodingVecSTEvaluator, NormPltLWEEvaluator},
     slot_transfer::{NaiveBGGVecSlotTransferEvaluator, bgg_pubkey::BggPublicKeySTEvaluator},
@@ -50,10 +53,11 @@ use std::{
 };
 use tempfile::tempdir;
 use tracing::info;
+use tracing_subscriber::prelude::*;
 
 const DEFAULT_RING_DIM: u32 = 1 << 16;
 const DEFAULT_INPUT_SIZE: usize = 5;
-const DEFAULT_SEED_BITS: usize = 1;
+const DEFAULT_SEED_BITS: usize = 5;
 const DEFAULT_CRT_BITS: usize = 28;
 const DEFAULT_BASE_BITS: u32 = 14;
 const DEFAULT_P_MODULI_BITS: usize = 7;
@@ -72,6 +76,20 @@ const DEFAULT_HASH_KEY: [u8; 32] = [0x42; 32];
 
 type GpuMatrix = GpuDCRTPolyMatrix;
 type GpuHashSampler = GpuDCRTPolyHashSampler<Keccak256>;
+type CpuMatrix = DCRTPolyMatrix;
+type CpuHashSampler = DCRTPolyHashSampler<Keccak256>;
+type CpuInjector =
+    DiamondInjector<CpuMatrix, DCRTPolyUniformSampler, CpuHashSampler, DCRTPolyTrapdoorSampler>;
+type CpuDiamondIO = DiamondIO<
+    CpuMatrix,
+    DCRTPolyUniformSampler,
+    CpuHashSampler,
+    DCRTPolyTrapdoorSampler,
+    NoCircuitEvaluator,
+    NoCircuitEvaluator,
+    NoCircuitEvaluator,
+    NoCircuitEvaluator,
+>;
 type GpuInjector = DiamondInjector<
     GpuMatrix,
     GpuDCRTPolyUniformSampler,
@@ -282,7 +300,7 @@ fn gpu_params_for_crt_depth(
         moduli,
         cpu_params.base_bits(),
         vec![gpu_id],
-        Some(crt_depth as u32),
+        Some(1),
     );
     assert_eq!(gpu_params.modulus(), cpu_params.modulus());
     (cpu_params, gpu_params)
@@ -294,6 +312,23 @@ fn build_ring_gsw_context(
     active_levels: usize,
 ) -> Arc<NestedRnsPolyContext> {
     let mut setup_circuit = PolyCircuit::<GpuDCRTPoly>::new();
+    Arc::new(NestedRnsPolyContext::setup(
+        &mut setup_circuit,
+        params,
+        cfg.p_moduli_bits,
+        cfg.max_unreduced_muls,
+        cfg.scale,
+        false,
+        Some(active_levels),
+    ))
+}
+
+fn build_cpu_ring_gsw_context(
+    params: &DCRTPolyParams,
+    cfg: &DiamondIOGpuBenchConfig,
+    active_levels: usize,
+) -> Arc<NestedRnsPolyContext> {
+    let mut setup_circuit = PolyCircuit::<DCRTPoly>::new();
     Arc::new(NestedRnsPolyContext::setup(
         &mut setup_circuit,
         params,
@@ -408,6 +443,55 @@ fn build_diamond_io(
             )
         })),
         Some(NaiveBGGVecSlotTransferEvaluator::new()),
+    )
+}
+
+fn build_cpu_diamond_io_for_search(
+    cfg: &DiamondIOGpuBenchConfig,
+    crt_depth: usize,
+    prf_mask_output_coeff_bits: usize,
+) -> CpuDiamondIO {
+    let params = DCRTPolyParams::new(cfg.ring_dim, crt_depth, cfg.crt_bits, cfg.base_bits);
+    let (_, _, actual_crt_depth) = params.to_crt();
+    assert_eq!(actual_crt_depth, crt_depth, "DCRTPolyParams returned an unexpected CRT depth");
+    let ring_gsw_context = build_cpu_ring_gsw_context(&params, cfg, crt_depth);
+    let ring_gsw_level_offset = 0usize;
+    let ring_gsw_enable_levels = Some(crt_depth);
+    let ring_gsw_width = 2 *
+        <NestedRnsPolyContext as ModularArithmeticContext<DCRTPoly>>::gadget_len(
+            ring_gsw_context.as_ref(),
+            ring_gsw_enable_levels,
+            Some(ring_gsw_level_offset),
+        );
+    let injector = CpuInjector::new(
+        params.clone(),
+        cfg.input_size,
+        cfg.input_base(),
+        cfg.trapdoor_sigma,
+        cfg.error_sigma,
+    );
+    DiamondIO::new(
+        injector,
+        cfg.input_size,
+        cfg.output_size(),
+        params,
+        ring_gsw_context,
+        ring_gsw_width,
+        ring_gsw_level_offset,
+        ring_gsw_enable_levels,
+        Some(cfg.error_sigma),
+        b"test_gpu_diamond_io_cpu_search".to_vec(),
+        cfg.seed_bits,
+        prf_mask_output_coeff_bits,
+        cfg.noise_refresh_v_bits,
+        cfg.noise_refresh_cbd_n,
+        [0x24; 32],
+        [0x25; 32],
+        None,
+        None,
+        None,
+        None,
+        None,
     )
 }
 
@@ -549,7 +633,16 @@ fn build_public_key_bench_estimator(
 #[tokio::test]
 #[sequential_test::sequential]
 async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
-    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+    let log_filter = tracing_subscriber::filter::Targets::new()
+        .with_target("test_gpu_diamond_io", tracing_subscriber::filter::LevelFilter::INFO)
+        .with_target("mxx::io::diamond_io", tracing_subscriber::filter::LevelFilter::INFO)
+        .with_target("mxx::noise_refresh", tracing_subscriber::filter::LevelFilter::INFO)
+        .with_target("mxx::storage::write", tracing_subscriber::filter::LevelFilter::INFO)
+        .with_default(tracing_subscriber::filter::LevelFilter::WARN);
+    let _ = tracing_subscriber::registry()
+        .with(log_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .try_init();
     gpu_device_sync();
 
     let cfg = DiamondIOGpuBenchConfig::from_env();
@@ -568,12 +661,10 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
         cfg.security_bits,
         DiamondIOFuncType::DebugDecryption,
         |crt_depth| {
-            build_diamond_io(
+            build_cpu_diamond_io_for_search(
                 &cfg,
                 crt_depth,
                 cfg.prf_mask_output_coeff_bits_search_bound(),
-                gpu_id,
-                temp_dir.path().to_path_buf(),
             )
         },
         &plt_evaluator,

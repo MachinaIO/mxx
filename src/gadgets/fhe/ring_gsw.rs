@@ -2903,6 +2903,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_nested_rns_ring_gsw_mul_context_handles_width_tail_narrower_than_batch() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let active_levels = 15usize;
+
+        let (_params, ctx) = create_test_context_with(
+            &mut circuit,
+            NUM_SLOTS as u32,
+            NUM_SLOTS,
+            active_levels,
+            CRT_BITS,
+            P_MODULI_BITS,
+            DEFAULT_MAX_UNREDUCED_MULS,
+        );
+
+        assert_eq!(ctx.width() % (MUL_COLUMN_SUBCIRCUIT_BATCH * MUL_COLUMN_SUBCIRCUIT_BATCH), 2);
+    }
+
     #[sequential_test::sequential]
     #[test]
     #[ignore = "expensive circuit-structure reporting test; run with --ignored --nocapture"]

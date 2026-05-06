@@ -13,12 +13,16 @@ use num_traits::ToPrimitive;
 use tracing::debug;
 
 use super::{
-    BenchEstimator, CircuitBenchEstimate, benchmark_gate_operation, column_parallel_gate_estimate,
-    measure_bench_operation,
+    BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary, PublicKeyAuxBenchEstimator,
+    benchmark_gate_operation, column_parallel_gate_estimate, measure_bench_operation,
 };
 
 pub(crate) fn per_gate_time_estimate(time: f64, peak_vram: usize) -> CircuitBenchEstimate {
     CircuitBenchEstimate::new(time, time).with_peak_vram(peak_vram)
+}
+
+pub(crate) fn total_lut_preimage_count(total_lut_entries: usize, total_lut_gates: usize) -> u128 {
+    (total_lut_entries as u128) * (total_lut_gates as u128)
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -81,6 +85,15 @@ impl SampleAuxBenchEstimate {
             chunk_compact_bytes,
             base_compact_bytes,
         )
+    }
+
+    pub(crate) fn to_summary(&self) -> CircuitBenchSummary {
+        let max_parallelism = if self.total_time <= 0.0 || self.latency <= 0.0 {
+            0
+        } else {
+            (self.total_time / self.latency).ceil() as u128
+        };
+        CircuitBenchSummary::new(self.total_time, self.latency, max_parallelism)
     }
 }
 
@@ -369,9 +382,36 @@ where
     }
 }
 
+impl<M, PLE, STE> PublicKeyAuxBenchEstimator<M::P> for BggPublicKeyBenchEstimator<M, PLE, STE>
+where
+    M: PolyMatrix,
+    PLE: PublicLutSampleAuxBenchEstimator<M, Params = <M::P as Poly>::Params>,
+    STE: SlotTransferSampleAuxBenchEstimator<M, Params = <M::P as Poly>::Params>,
+{
+    fn estimate_public_lut_sample_aux_matrices_for_circuit(
+        &self,
+        params: &<M::P as Poly>::Params,
+        circuit: &crate::circuit::PolyCircuit<M::P>,
+    ) -> SampleAuxBenchEstimate {
+        let total_lut_gates = circuit
+            .count_gates_by_type_vec()
+            .get(&crate::circuit::PolyGateKind::PubLut)
+            .copied()
+            .unwrap_or(0);
+        if total_lut_gates == 0 {
+            return SampleAuxBenchEstimate::default();
+        }
+        self.estimate_public_lut_sample_aux_matrices(
+            params,
+            circuit.total_registered_public_lut_entries(),
+            total_lut_gates,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::BggPublicKeyBenchEstimator;
+    use super::{BggPublicKeyBenchEstimator, total_lut_preimage_count};
     use crate::{
         __PAIR, __TestState,
         bench_estimator::{
@@ -424,6 +464,14 @@ mod tests {
         assert!(estimate.total_time.is_finite());
         assert_eq!(estimate.latency, 0.25);
         assert_eq!(estimate.compact_bytes, total_chunk_count * BigUint::from(3u8));
+    }
+
+    #[test]
+    fn total_lut_preimage_count_uses_u128_for_large_estimates() {
+        assert_eq!(
+            total_lut_preimage_count(usize::MAX, usize::MAX),
+            (usize::MAX as u128) * (usize::MAX as u128)
+        );
     }
 
     impl PublicLutSampleAuxBenchEstimator<DCRTPolyMatrix> for DummyPublicLutEstimator {

@@ -23,6 +23,13 @@ use tracing::debug;
 pub struct DiamondInputErrorSimulation {
     /// Final propagated error for each Diamond state branch.
     pub state_errors: Vec<PolyMatrixNorm>,
+    /// Final secret-selector norm for each Diamond state branch.
+    ///
+    /// These factors model the product of the secret transition matrices that
+    /// multiply the sampled Gaussian target errors. Callers that need a bound
+    /// on the final online secret, such as noise-refresh rounding analysis,
+    /// should use the factor for the branch they decode from.
+    pub secret_state_factors: Vec<PolyMatrixNorm>,
     /// Generic final projection preimage norm from the final state basis to a
     /// single BGG output public key.
     pub output_preimage: PolyMatrixNorm,
@@ -150,11 +157,12 @@ where
         }
 
         debug!(
+            ?secret_state_factors,
             ?state_errors,
             ?output_preimage,
             "diamond input-insertion simulator final state bounds",
         );
 
-        DiamondInputErrorSimulation { state_errors, output_preimage }
+        DiamondInputErrorSimulation { state_errors, secret_state_factors, output_preimage }
     }
 }

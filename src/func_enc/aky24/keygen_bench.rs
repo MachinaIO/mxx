@@ -1,5 +1,8 @@
 use crate::{
-    bench_estimator::{BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary},
+    bench_estimator::{
+        BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary, PublicKeyAuxBenchEstimator,
+        estimate_public_key_circuit_bench_with_aux,
+    },
     bgg::naive_vec::NaiveBGGPublicKeyVec,
     func_enc::aky24::{
         Aky24Func, Aky24Params, build_func_circuit, build_goldreich_prg_circuit,
@@ -9,6 +12,7 @@ use crate::{
     matrix::PolyMatrix,
     noise_refresh::NoiseRefresherNaiveVec,
     poly::PolyParams,
+    sampler::PolyHashSampler,
 };
 
 /// Shape parameters that are not directly inferable from `Aky24Params` for keygen estimation.
@@ -85,13 +89,19 @@ impl<'a, PKBE> Aky24KeygenBenchEstimator<'a, PKBE> {
         M: PolyMatrix + Send + Sync + 'static,
         M::P: 'static,
         PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + Sync,
+        PKBE: PublicKeyAuxBenchEstimator<M::P>,
+        SH: PolyHashSampler<[u8; 32], M = M>,
         NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
     {
         assert!(shape.wire_count > 0, "wire_count must be positive");
         assert!(shape.public_prf_seed_bits > 0, "public_prf_seed_bits must be positive");
 
         let function_circuit =
-            self.public_key_estimator.estimate_circuit_bench(&build_func_circuit(params, func));
+            estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
+                self.public_key_estimator,
+                &params.poly_params,
+                &build_func_circuit(params, func),
+            );
         let selected_half_prg = self.estimate_selected_half_prg(params, shape);
         let noise_refresh_preprocess =
             self.estimate_noise_refresh_preprocess::<M, SH, TD>(params, shape);
@@ -130,6 +140,7 @@ impl<'a, PKBE> Aky24KeygenBenchEstimator<'a, PKBE> {
         M: PolyMatrix + Send + Sync + 'static,
         M::P: 'static,
         PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + Sync,
+        PKBE: PublicKeyAuxBenchEstimator<M::P>,
     {
         let generated_seed_bits =
             if params.debug_reuse_single_prg_sample() { 1 } else { params.prf_seed_bits() };
@@ -140,7 +151,11 @@ impl<'a, PKBE> Aky24KeygenBenchEstimator<'a, PKBE> {
             0,
             generated_seed_bits,
         );
-        let unit = self.public_key_estimator.estimate_circuit_bench(&circuit);
+        let unit = estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
+            self.public_key_estimator,
+            &params.poly_params,
+            &circuit,
+        );
         scale_summary(unit, shape.public_prf_seed_bits)
     }
 
@@ -157,6 +172,8 @@ impl<'a, PKBE> Aky24KeygenBenchEstimator<'a, PKBE> {
         M: PolyMatrix + Send + Sync + 'static,
         M::P: 'static,
         PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + Sync,
+        PKBE: PublicKeyAuxBenchEstimator<M::P>,
+        SH: PolyHashSampler<[u8; 32], M = M>,
         NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
     {
         let generated_seed_bits =
@@ -187,6 +204,7 @@ impl<'a, PKBE> Aky24KeygenBenchEstimator<'a, PKBE> {
         M: PolyMatrix + Send + Sync + 'static,
         M::P: 'static,
         PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + Sync,
+        PKBE: PublicKeyAuxBenchEstimator<M::P>,
     {
         let generated_mask_output_bits = if params.debug_reuse_single_prg_sample() {
             1
@@ -198,7 +216,11 @@ impl<'a, PKBE> Aky24KeygenBenchEstimator<'a, PKBE> {
             shape.public_prf_seed_bits,
             generated_mask_output_bits,
         );
-        self.public_key_estimator.estimate_circuit_bench(&circuit)
+        estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
+            self.public_key_estimator,
+            &params.poly_params,
+            &circuit,
+        )
     }
 
     /// Estimates the final scalar mask-decrypt circuit evaluated during keygen.
@@ -209,9 +231,14 @@ impl<'a, PKBE> Aky24KeygenBenchEstimator<'a, PKBE> {
         M: PolyMatrix + Send + Sync + 'static,
         M::P: 'static,
         PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + Sync,
+        PKBE: PublicKeyAuxBenchEstimator<M::P>,
     {
         let circuit = build_prf_mask_circuit(params);
-        self.public_key_estimator.estimate_circuit_bench(&circuit)
+        estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
+            self.public_key_estimator,
+            &params.poly_params,
+            &circuit,
+        )
     }
 
     /// Estimates all trapdoor preimage samplings performed by keygen.

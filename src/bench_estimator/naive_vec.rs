@@ -1,11 +1,15 @@
 use crate::{
-    bench_estimator::{BenchEstimator, CircuitBenchEstimate, benchmark_gate_operation},
+    bench_estimator::{
+        BenchEstimator, CircuitBenchEstimate, PublicKeyAuxBenchEstimator, SampleAuxBenchEstimate,
+        benchmark_gate_operation,
+    },
     bgg::{
         encoding::BggEncoding,
         naive_vec::{NaiveBGGEncodingVec, NaiveBGGPublicKeyVec},
         public_key::BggPublicKey,
     },
     matrix::PolyMatrix,
+    poly::Poly,
 };
 use num_bigint::BigUint;
 
@@ -29,6 +33,20 @@ fn scale_single_slot_estimate(
     #[cfg(not(feature = "gpu"))]
     {
         scaled
+    }
+}
+
+fn scale_single_slot_sample_aux(
+    estimate: SampleAuxBenchEstimate,
+    num_slots: usize,
+) -> SampleAuxBenchEstimate {
+    SampleAuxBenchEstimate {
+        total_time: estimate.total_time * num_slots as f64,
+        // Public LUT auxiliary matrices for different naive-vector slots are independent. With
+        // enough GPUs, all slots can be sampled in the same wave, so latency stays at the scalar
+        // slot latency while total work and persisted compact bytes scale by slot count.
+        latency: estimate.latency,
+        compact_bytes: estimate.compact_bytes * BigUint::from(num_slots),
     }
 }
 
@@ -218,6 +236,23 @@ where
 
     fn estimate_public_lookup(&self, lut_id: usize) -> CircuitBenchEstimate {
         self.scale_with_io(self.inner.estimate_public_lookup(lut_id), self.num_slots, 1, 1)
+    }
+}
+
+impl<P, BE> PublicKeyAuxBenchEstimator<P> for NaiveBGGVecBenchEstimator<BE>
+where
+    P: Poly,
+    BE: PublicKeyAuxBenchEstimator<P>,
+{
+    fn estimate_public_lut_sample_aux_matrices_for_circuit(
+        &self,
+        params: &P::Params,
+        circuit: &crate::circuit::PolyCircuit<P>,
+    ) -> SampleAuxBenchEstimate {
+        scale_single_slot_sample_aux(
+            self.inner.estimate_public_lut_sample_aux_matrices_for_circuit(params, circuit),
+            self.num_slots,
+        )
     }
 }
 

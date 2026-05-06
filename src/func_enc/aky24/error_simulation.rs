@@ -38,8 +38,6 @@ pub struct Aky24CrtDepthSearchCandidate<TD> {
     pub params: Aky24Params<DCRTPolyMatrix, TD>,
     /// Decryption error-simulation inputs that use the same simulator context as `params`.
     pub inputs: Aky24DecErrorSimulationInputs,
-    /// Bound for the secret term used by the noise-refresh rounding check.
-    pub secret_norm: PolyMatrixNorm,
     /// Error-norm representation of the circuit constant one.
     pub one: ErrorNorm,
     /// Error bound for the Ring-GSW decryption-key input.
@@ -235,7 +233,6 @@ pub fn simulate_aky24_dec_error<TD, PE, ST>(
     inputs: Aky24DecErrorSimulationInputs,
     ring_gsw_error_sigma: f64,
     num_slots: usize,
-    secret_norm: &PolyMatrixNorm,
     one: ErrorNorm,
     decryption_key: ErrorNorm,
     decoders: &[ErrorNorm],
@@ -303,7 +300,6 @@ where
             params.noise_refresh_cbd_n,
             ring_gsw_error_sigma,
             num_slots,
-            secret_norm,
             one.clone(),
             prg_output_error,
             &current_seed_errors,
@@ -393,7 +389,6 @@ pub fn max_safe_aky24_prf_mask_output_coeff_bits<TD, PE, ST>(
     inputs: Aky24DecErrorSimulationInputs,
     ring_gsw_error_sigma: f64,
     num_slots: usize,
-    secret_norm: &PolyMatrixNorm,
     one: ErrorNorm,
     decryption_key: ErrorNorm,
     decoders: &[ErrorNorm],
@@ -421,7 +416,6 @@ where
             inputs.clone(),
             ring_gsw_error_sigma,
             num_slots,
-            secret_norm,
             one.clone(),
             decryption_key.clone(),
             decoders,
@@ -502,7 +496,6 @@ where
             candidate.inputs.clone(),
             ring_gsw_error_sigma,
             num_slots,
-            &candidate.secret_norm,
             candidate.one.clone(),
             candidate.decryption_key.clone(),
             &candidate.decoders,
@@ -521,7 +514,6 @@ where
         if aky24_security_margins_hold(
             &checked_params,
             &mask_search.simulation,
-            &candidate.secret_norm,
             mask_bits,
             security_bit,
         ) {
@@ -547,7 +539,6 @@ where
 fn aky24_security_margins_hold<TD>(
     params: &Aky24Params<DCRTPolyMatrix, TD>,
     simulation: &Aky24DecErrorSimulation,
-    secret_norm: &PolyMatrixNorm,
     prf_mask_output_coeff_bits: usize,
     security_bit: usize,
 ) -> bool {
@@ -564,8 +555,7 @@ fn aky24_security_margins_hold<TD>(
         return false;
     }
     simulation.prf_seed_bit_refreshes.iter().all(|refresh| {
-        let Some(threshold) =
-            noise_refresh_pre_round_margin(&params.poly_params, secret_norm, refresh.v_bits)
+        let Some(threshold) = noise_refresh_pre_round_margin(&params.poly_params, refresh.v_bits)
         else {
             return false;
         };
@@ -593,7 +583,6 @@ fn aky24_final_decode_margin(
 
 fn noise_refresh_pre_round_margin(
     params: &<DCRTPoly as crate::poly::Poly>::Params,
-    secret_norm: &PolyMatrixNorm,
     v_bits: usize,
 ) -> Option<BigDecimal> {
     let (q_moduli, _crt_bits, _crt_depth) = params.to_crt();
@@ -602,8 +591,7 @@ fn noise_refresh_pre_round_margin(
     let threshold =
         biguint_to_decimal(full_q.as_ref()) / (BigDecimal::from(2u32) * BigDecimal::from(q_max));
     let mask = biguint_to_decimal(&(BigUint::from(1u32) << v_bits));
-    let used_margin = &secret_norm.poly_norm.norm + mask;
-    (threshold > used_margin).then_some(threshold - used_margin)
+    (threshold > mask).then_some(threshold - mask)
 }
 
 /// Evaluates the AKY24 function circuit and returns the first decoded output's matrix error.
@@ -865,13 +853,6 @@ mod tests {
                     PolyNorm::one(ctx.clone()),
                     PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, BigDecimal::from(0u32), None),
                 );
-                let secret_norm = PolyMatrixNorm::new(
-                    ctx.clone(),
-                    1,
-                    ctx.secret_size,
-                    BigDecimal::from(0u32),
-                    None,
-                );
                 let decoder = ErrorNorm::new(
                     PolyNorm::one(ctx.clone()),
                     PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, BigDecimal::from(0u32), None),
@@ -879,7 +860,6 @@ mod tests {
                 Aky24CrtDepthSearchCandidate {
                     params,
                     inputs,
-                    secret_norm,
                     one,
                     decryption_key,
                     decoders: vec![decoder],

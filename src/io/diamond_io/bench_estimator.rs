@@ -6,7 +6,9 @@ mod bench_estimator_shape;
 mod bench_estimator_utils;
 
 use num_bigint::BigUint;
-use tracing::debug;
+use std::time::Instant;
+
+use tracing::{debug, info};
 
 use crate::{
     bench_estimator::{
@@ -151,12 +153,12 @@ where
             .expect("DiamondIO benchmark gadget column count overflow");
 
         // Mirrors `DiamondInjector::load_or_sample_b_checkpoint`: sample one trapdoor/public
-        // matrix pair for the Diamond state row size, then serialize both artifacts because the
-        // concrete preprocessing path persists them as checkpoint files.
-        let trapdoor_checkpoint = bench_estimate(iterations, || {
+        // matrix pair for the Diamond state row size. Storage bytes are estimated separately, so
+        // avoid materializing compact CPU bytes here; doing so can exceed the Runpod cgroup memory
+        // limit before the estimator reaches the actual DiamondIO cost composition.
+        let trapdoor_checkpoint = bench_estimate_named("trapdoor_checkpoint", iterations, || {
             let trap_sampler = TS::new(params, diamond.injector.trapdoor_sigma);
-            let (trapdoor, matrix) = trap_sampler.trapdoor(params, state_row_size);
-            (TS::trapdoor_to_bytes(&trapdoor), matrix.to_compact_bytes())
+            trap_sampler.trapdoor(params, state_row_size)
         });
 
         let trap_sampler = TS::new(params, diamond.injector.trapdoor_sigma);
@@ -175,76 +177,77 @@ where
         // Mirrors one chunked `preimage_extend` call in Diamond input injection and final decoder
         // preprocessing. The target has one maximum-size persisted chunk; narrower tail chunks are
         // conservatively charged at this same unit cost by the higher-level estimator.
-        let trapdoor_preimage_extend = bench_estimate(iterations, || {
-            let preimage = trap_sampler.preimage_extend(
-                params,
-                &trapdoor,
-                &public_matrix,
-                &ext_matrix,
-                &transition_target,
-            );
-            preimage.to_compact_bytes()
-        });
+        let trapdoor_preimage_extend =
+            bench_estimate_named("trapdoor_preimage_extend", iterations, || {
+                trap_sampler.preimage_extend(
+                    params,
+                    &trapdoor,
+                    &public_matrix,
+                    &ext_matrix,
+                    &transition_target,
+                )
+            });
 
         let final_output_target = M::zero(params, state_row_size, gadget_col_size);
-        let final_output_preimage_extend = bench_estimate(iterations, || {
-            let preimage = trap_sampler.preimage_extend(
-                params,
-                &trapdoor,
-                &public_matrix,
-                &ext_matrix,
-                &final_output_target,
-            );
-            preimage.to_compact_bytes()
-        });
+        let final_output_preimage_extend =
+            bench_estimate_named("final_output_preimage_extend", iterations, || {
+                trap_sampler.preimage_extend(
+                    params,
+                    &trapdoor,
+                    &public_matrix,
+                    &ext_matrix,
+                    &final_output_target,
+                )
+            });
 
         let lookup_bridge_target = M::zero(params, state_row_size, shape.lookup_bridge_cols);
-        let lookup_bridge_preimage_extend = bench_estimate(iterations, || {
-            let preimage = trap_sampler.preimage_extend(
-                params,
-                &trapdoor,
-                &public_matrix,
-                &ext_matrix,
-                &lookup_bridge_target,
-            );
-            preimage.to_compact_bytes()
-        });
+        let lookup_bridge_preimage_extend =
+            bench_estimate_named("lookup_bridge_preimage_extend", iterations, || {
+                trap_sampler.preimage_extend(
+                    params,
+                    &trapdoor,
+                    &public_matrix,
+                    &ext_matrix,
+                    &lookup_bridge_target,
+                )
+            });
 
-        let full_w_block_hash_sample = bench_estimate(iterations, || {
-            let matrix = HS::new().sample_hash(
-                params,
-                [0x52u8; 32],
-                b"diamond_io_bench_full_w_block_hash",
-                state_row_size,
-                gadget_col_size,
-                DistType::FinRingDist,
-            );
-            matrix.to_compact_bytes()
-        });
+        let full_w_block_hash_sample =
+            bench_estimate_named("full_w_block_hash_sample", iterations, || {
+                HS::new().sample_hash(
+                    params,
+                    [0x52u8; 32],
+                    b"diamond_io_bench_full_w_block_hash",
+                    state_row_size,
+                    gadget_col_size,
+                    DistType::FinRingDist,
+                )
+            });
 
-        let transition_w_chunk_hash_sample = bench_estimate(iterations, || {
-            let matrix = HS::new().sample_hash_columns(
-                params,
-                [0x53u8; 32],
-                b"diamond_io_bench_transition_w_chunk_hash",
-                state_row_size,
-                gadget_col_size,
-                0,
-                shape.transition_w_hash_max_col_len,
-                DistType::FinRingDist,
-            );
-            matrix.to_compact_bytes()
-        });
+        let transition_w_chunk_hash_sample =
+            bench_estimate_named("transition_w_chunk_hash_sample", iterations, || {
+                HS::new().sample_hash_columns(
+                    params,
+                    [0x53u8; 32],
+                    b"diamond_io_bench_transition_w_chunk_hash",
+                    state_row_size,
+                    gadget_col_size,
+                    0,
+                    shape.transition_w_hash_max_col_len,
+                    DistType::FinRingDist,
+                )
+            });
 
         let mut bgg_public_key_tag = diamond.bgg_tag.clone();
         bgg_public_key_tag.extend_from_slice(b":public_keys");
-        let bgg_public_key_sample = bench_estimate(iterations, || {
-            BGGPublicKeySampler::<[u8; 32], HS>::new([0x5au8; 32], 1).sample(
-                params,
-                &bgg_public_key_tag,
-                &[],
-            )
-        });
+        let bgg_public_key_sample =
+            bench_estimate_named("bgg_public_key_sample", iterations, || {
+                BGGPublicKeySampler::<[u8; 32], HS>::new([0x5au8; 32], 1).sample(
+                    params,
+                    &bgg_public_key_tag,
+                    &[],
+                )
+            });
 
         let native_secret =
             sample_native_ternary_secret::<M, US>(params, &diamond.native_poly_params);
@@ -257,18 +260,19 @@ where
             diamond.ring_gsw_public_key_error_sigma,
         );
 
-        let ring_gsw_public_key_sample = bench_estimate(iterations, || {
-            sample_public_key(
-                &diamond.native_poly_params,
-                diamond.ring_gsw_width,
-                &native_secret,
-                [0x6du8; 32],
-                b"diamond_io_bench_ring_gsw_public_key",
-                diamond.ring_gsw_public_key_error_sigma,
-            )
-        });
+        let ring_gsw_public_key_sample =
+            bench_estimate_named("ring_gsw_public_key_sample", iterations, || {
+                sample_public_key(
+                    &diamond.native_poly_params,
+                    diamond.ring_gsw_width,
+                    &native_secret,
+                    [0x6du8; 32],
+                    b"diamond_io_bench_ring_gsw_public_key",
+                    diamond.ring_gsw_public_key_error_sigma,
+                )
+            });
 
-        let ring_gsw_encrypt_bit = bench_estimate(iterations, || {
+        let ring_gsw_encrypt_bit = bench_estimate_named("ring_gsw_encrypt_bit", iterations, || {
             encrypt_plaintext_bit(
                 &diamond.native_poly_params,
                 diamond.ring_gsw_context.as_ref(),
@@ -935,6 +939,22 @@ where
     let measurement = benchmark_gate_operation(iterations.max(1), op);
     CircuitBenchEstimate::new(measurement.time, measurement.time)
         .with_peak_vram(measurement.peak_vram)
+}
+
+fn bench_estimate_named<R, F>(name: &'static str, iterations: usize, op: F) -> CircuitBenchEstimate
+where
+    F: FnMut() -> R,
+{
+    info!(unit = name, iterations, "starting DiamondIO benchmark unit cost");
+    let start = Instant::now();
+    let estimate = bench_estimate(iterations, op);
+    info!(
+        unit = name,
+        elapsed = ?start.elapsed(),
+        ?estimate,
+        "finished DiamondIO benchmark unit cost"
+    );
+    estimate
 }
 
 fn sample_native_ternary_secret<M, US>(
